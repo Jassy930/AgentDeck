@@ -1,8 +1,16 @@
-//! RuntimeEnvelope v2 中立契约 —— contract / deny-unknown / limits 测试。
+//! RuntimeEnvelope v3 中立契约 —— contract / deny-unknown / limits 测试。
 //!
-//! RuntimeEnvelope v2 是 UDS 与解密后远程链路的共同业务 wire（design §8.2.2）。
-//! 本 task 只冻结中立契约与构造校验；configuration/store 执行语义属于 P3.9-C0-B。
+//! 文件名保留 `runtime_v2_contract` 以避免无价值的测试目标重命名；current wire 已升为 v3。
+//! RuntimeEnvelope v3 是 UDS 与解密后远程链路的共同业务 wire（design §8.2.2）。
 
+use agentdeck_protocol::relay_v2::enrollment::EnrollmentBundleV2;
+use agentdeck_protocol::relay_v2::id::{MachineRouteId, RelayServerId};
+use agentdeck_protocol::relay_v2::{
+    Ed25519Signature, RELAY_PROTOCOL_VERSION, RELAY_RECEIPT_FORMAT_VERSION,
+    RELAY_RECEIPT_KEY_GENERATION_MVP, RelayAdminPurgeReadbackV1, RelayAdminPurgeReceiptTbsV1,
+    RelayAdminPurgeReceiptV1, RelayAdminPurgeTombstoneV1, RelayMachineTombstoneKindV1,
+    RelayReceiptKeyId, RootKeyId, TrustEpoch, admin_purge_tombstone_hash, purge_request_hash,
+};
 use agentdeck_protocol::runtime::command::{
     LocalOnlyAdministration, MAX_PROMPT_BYTES, PromptPayload, QueryReceiptSelector,
     SendPromptRequest,
@@ -27,10 +35,12 @@ use agentdeck_protocol::runtime::{
     ConversationConfiguration, ConversationConfigurationState, ConversationMetadataMutation,
     ConversationMetadataMutationRequest, ConversationMetadataReceipt, MAX_JSON_PART_BYTES,
     MAX_JSON_TRANSFER_PARTS, MAX_RUNTIME_JSON_FRAME_BYTES, MAX_RUNTIME_REQUEST_BYTES,
-    RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeEvent, RuntimeEventBody, RuntimeMessage,
-    RuntimeReply, RuntimeRequest, RuntimeSizeError, RuntimeStreamItem, RuntimeTransferCarrierV1,
-    RuntimeTransferChannel, StageUpgradeReceipt, StageUpgradeRequest, SubscriptionReceipt,
-    TransferEnvelope, VendorConfigurationSnapshot, ensure_request_within_limit,
+    MachineEnrollRequest, MachineRemoteFailureCode, MachineRemoteLifecycle, MachineRemoteStatus,
+    MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeEvent,
+    RuntimeEventBody, RuntimeMessage, RuntimeReply, RuntimeRequest, RuntimeSizeError,
+    RuntimeStreamItem, RuntimeTransferCarrierV1, RuntimeTransferChannel, StageUpgradeReceipt,
+    StageUpgradeRequest, SubscriptionReceipt, TransferEnvelope, TrustResetRequest,
+    UninstallPurgePlanV1, VendorConfigurationSnapshot, ensure_request_within_limit,
 };
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, ActionKind, ActionRequest, ActionRequestVendor, AgentItem,
@@ -142,7 +152,92 @@ fn hex(bytes: &[u8]) -> String {
 
 fn runtime_fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../protocol/agentdeck/fixtures/runtime-v2-wire.jsonl")
+        .join("../protocol/agentdeck/fixtures/runtime-v3-wire.jsonl")
+}
+
+fn sample_enrollment_bundle() -> EnrollmentBundleV2 {
+    serde_json::from_value(serde_json::json!({
+        "version": 2,
+        "publicWssUrl": "wss://relay.example.test/",
+        "relayServerId": "IiIiIiIiIiIiIiIiIiIiIg==",
+        "receiptVerifyKey": {
+            "receiptFormatVersion": 1,
+            "relayServerId": "IiIiIiIiIiIiIiIiIiIiIg==",
+            "keyGeneration": 1,
+            "keyId": "9uiDt7VE9fLhOJ4F1EvvLCH5R+HGrCJpMfGxejtfq3M=",
+            "publicKey": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM="
+        },
+        "code": "REREREREREREREREREREREREREREREREREREREREREQ=",
+        "spkiPins": ["-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s"],
+        "expiresAtMs": 1_700_000_000_000u64
+    }))
+    .expect("valid shared enrollment bundle fixture")
+}
+
+fn sample_admin_purge_receipt() -> RelayAdminPurgeReceiptV1 {
+    let relay_server_id = RelayServerId::from_bytes([0x22; 16]);
+    let machine_route = MachineRouteId::from_bytes([0x33; 16]);
+    let root_key_id = RootKeyId::from_bytes([0x55; 16]);
+    let root_fingerprint = [0x44; 32];
+    let trust_epoch = TrustEpoch::new(7);
+    let enrollment_receipt_hash = [0x66; 32];
+    let purge_request_hash = purge_request_hash(machine_route, root_fingerprint).unwrap();
+    let tombstone_kind = RelayMachineTombstoneKindV1::RootLostAdminPurge;
+    let readback = RelayAdminPurgeReadbackV1 {
+        active_machine_routes: 0,
+        retired_tombstones: 1,
+        consumed_enrollment_records: 0,
+        device_grants: 0,
+        revocations: 0,
+        streams: 0,
+        frames: 0,
+        subscriptions: 0,
+        retirement_hash: None,
+        retirement_terminal_present: false,
+    };
+    let tombstone_hash = admin_purge_tombstone_hash(&RelayAdminPurgeTombstoneV1 {
+        relay_server_id,
+        machine_route,
+        root_key_id,
+        root_fingerprint,
+        trust_epoch,
+        enrollment_receipt_hash,
+        purge_request_hash,
+        tombstone_kind,
+        readback: readback.clone(),
+    })
+    .unwrap();
+    RelayAdminPurgeReceiptV1::from_tbs(
+        RelayAdminPurgeReceiptTbsV1 {
+            receipt_format_version: RELAY_RECEIPT_FORMAT_VERSION,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            relay_server_id,
+            receipt_key_generation: RELAY_RECEIPT_KEY_GENERATION_MVP,
+            receipt_key_id: RelayReceiptKeyId::from_bytes([0x77; 32]),
+            machine_route,
+            root_key_id,
+            root_fingerprint,
+            trust_epoch,
+            enrollment_receipt_hash,
+            purge_request_hash,
+            tombstone_kind,
+            readback,
+            tombstone_hash,
+        },
+        Ed25519Signature([0x88; 64]),
+    )
+    .unwrap()
+}
+
+fn sample_uninstall_purge_plan() -> UninstallPurgePlanV1 {
+    UninstallPurgePlanV1::new(
+        PathBuf::from("/Applications/AgentDeck.app/Contents/Helpers/agentdeck-finalizer"),
+        "1.2.3".to_owned(),
+        ArtifactSha256::new("ab".repeat(32)).unwrap(),
+        "REALTEAM42".to_owned(),
+        "REALTEAM42.com.agentdeck.agentdeckd.stable".to_owned(),
+    )
+    .unwrap()
 }
 
 fn render_runtime_wire_fixture() -> String {
@@ -342,7 +437,41 @@ fn render_runtime_wire_fixture() -> String {
         ),
         (
             "requestTrustReset",
-            RuntimeRequest::TrustReset {
+            RuntimeRequest::TrustReset(
+                TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None).unwrap(),
+            ),
+        ),
+        (
+            "requestTrustResetWithAdminPurgeReceipt",
+            RuntimeRequest::TrustReset(
+                TrustResetRequest::new(
+                    LocalOnlyAdministration::LocalOnly,
+                    Some(Box::new(sample_admin_purge_receipt())),
+                )
+                .unwrap(),
+            ),
+        ),
+        (
+            "requestTrustResetForUninstallPurge",
+            RuntimeRequest::TrustReset(
+                TrustResetRequest::for_uninstall_purge(
+                    LocalOnlyAdministration::LocalOnly,
+                    sample_uninstall_purge_plan(),
+                    None,
+                )
+                .unwrap(),
+            ),
+        ),
+        (
+            "requestMachineEnroll",
+            RuntimeRequest::MachineEnroll(MachineEnrollRequest {
+                bundle: sample_enrollment_bundle(),
+                scope: LocalOnlyAdministration::LocalOnly,
+            }),
+        ),
+        (
+            "requestMachineRemoteStatus",
+            RuntimeRequest::MachineRemoteStatus {
                 scope: LocalOnlyAdministration::LocalOnly,
             },
         ),
@@ -606,6 +735,20 @@ fn render_runtime_wire_fixture() -> String {
                     requested_at_ms: 234,
                 }],
             },
+        ),
+        (
+            "replyMachineRemoteStatus",
+            RuntimeReply::MachineRemoteStatus(
+                MachineRemoteStatus::new(
+                    MachineRemoteLifecycle::Active,
+                    Some(RelayServerId::from_bytes([0x22; 16])),
+                    Some(MachineRouteId::from_bytes([0x33; 16])),
+                    Some(MachineRootFingerprint::from_bytes([0x44; 32])),
+                    Some(7),
+                    None,
+                )
+                .unwrap(),
+            ),
         ),
         (
             "replyFailure",
@@ -1207,13 +1350,13 @@ fn render_runtime_wire_fixture() -> String {
 }
 
 #[test]
-fn runtime_v2_wire_fixture_is_rust_produced_and_in_sync() {
+fn runtime_v3_wire_fixture_is_rust_produced_and_in_sync() {
     let expected = render_runtime_wire_fixture();
     let path = runtime_fixture_path();
     if std::env::var("UPDATE_WIRE_FIXTURES").as_deref() == Ok("1") {
         fs::create_dir_all(path.parent().expect("runtime fixture has parent directory"))
             .expect("create runtime fixture directory");
-        fs::write(&path, expected.as_bytes()).expect("write runtime v2 wire fixture");
+        fs::write(&path, expected.as_bytes()).expect("write runtime v3 wire fixture");
     }
     let committed = fs::read(&path).unwrap_or_else(|error| {
         panic!(
@@ -1236,17 +1379,133 @@ fn runtime_v2_wire_fixture_is_rust_produced_and_in_sync() {
 }
 
 #[test]
-fn runtime_protocol_version_is_two_and_independent() {
-    assert_eq!(RUNTIME_PROTOCOL_VERSION, 2);
+fn runtime_protocol_version_is_three_and_independent() {
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 3);
     // 与 local IPC PROTOCOL_VERSION=2 彼此独立、不联动。
     assert_eq!(agentdeck_protocol::PROTOCOL_VERSION, 2);
+}
+
+#[test]
+fn trust_reset_keeps_root_present_wire_and_strictly_types_root_lost_receipt() {
+    let root_present = RuntimeRequest::TrustReset(
+        TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None).unwrap(),
+    );
+    let root_present_json = serde_json::to_value(root_present).unwrap();
+    assert_eq!(
+        root_present_json,
+        serde_json::json!({"request":"trustReset","scope":"localOnly"})
+    );
+
+    let root_lost = RuntimeRequest::TrustReset(
+        TrustResetRequest::new(
+            LocalOnlyAdministration::LocalOnly,
+            Some(Box::new(sample_admin_purge_receipt())),
+        )
+        .unwrap(),
+    );
+    let root_lost_json = serde_json::to_value(root_lost).unwrap();
+    assert!(root_lost_json["adminPurgeReceipt"].is_object());
+    let decoded: RuntimeRequest = serde_json::from_value(root_lost_json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), root_lost_json);
+
+    let mut unknown = root_lost_json.clone();
+    unknown["adminPurgeReceipt"]["opaqueProof"] = serde_json::json!("forbidden");
+    assert!(serde_json::from_value::<RuntimeRequest>(unknown).is_err());
+
+    let mut bad_shape = root_lost_json.clone();
+    bad_shape["adminPurgeReceipt"]["readback"]["retiredTombstones"] = serde_json::json!(2);
+    assert!(serde_json::from_value::<RuntimeRequest>(bad_shape).is_err());
+
+    let mut bad_base64 = root_lost_json;
+    bad_base64["adminPurgeReceipt"]["signature"] = serde_json::json!("AA==");
+    assert!(serde_json::from_value::<RuntimeRequest>(bad_base64).is_err());
+
+    let uninstall = RuntimeRequest::TrustReset(
+        TrustResetRequest::for_uninstall_purge(
+            LocalOnlyAdministration::LocalOnly,
+            sample_uninstall_purge_plan(),
+            None,
+        )
+        .unwrap(),
+    );
+    let uninstall_json = serde_json::to_value(uninstall).unwrap();
+    assert_eq!(uninstall_json["uninstallPurge"], true);
+    assert!(uninstall_json["uninstallPurgePlan"].is_object());
+    let mut invalid_uninstall = uninstall_json;
+    invalid_uninstall["uninstallPurge"] = serde_json::json!("true");
+    assert!(serde_json::from_value::<RuntimeRequest>(invalid_uninstall).is_err());
+
+    let mut missing_plan = serde_json::json!({
+        "request": "trustReset",
+        "scope": "localOnly",
+        "uninstallPurge": true,
+    });
+    assert!(serde_json::from_value::<RuntimeRequest>(missing_plan.clone()).is_err());
+    missing_plan["uninstallPurge"] = serde_json::json!(false);
+    missing_plan["uninstallPurgePlan"] =
+        serde_json::to_value(sample_uninstall_purge_plan()).unwrap();
+    assert!(serde_json::from_value::<RuntimeRequest>(missing_plan).is_err());
+}
+
+#[test]
+fn uninstall_purge_plan_id_is_deterministic_bound_and_strict() {
+    let first = sample_uninstall_purge_plan();
+    let second = sample_uninstall_purge_plan();
+    assert_eq!(first.plan_id(), second.plan_id());
+    assert_eq!(first.version(), 1);
+    assert_eq!(
+        first.helper_path(),
+        PathBuf::from("/Applications/AgentDeck.app/Contents/Helpers/agentdeck-finalizer")
+    );
+    assert_eq!(first.helper_version(), "1.2.3");
+    assert_eq!(first.helper_sha256().as_str(), "ab".repeat(32));
+    assert_eq!(first.team_identifier(), "REALTEAM42");
+    assert_eq!(
+        first.keychain_access_group(),
+        "REALTEAM42.com.agentdeck.agentdeckd.stable"
+    );
+
+    let changed = UninstallPurgePlanV1::new(
+        first.helper_path().to_path_buf(),
+        "1.2.4".to_owned(),
+        first.helper_sha256().clone(),
+        first.team_identifier().to_owned(),
+        first.keychain_access_group().to_owned(),
+    )
+    .unwrap();
+    assert_ne!(first.plan_id(), changed.plan_id());
+
+    let wire = serde_json::to_value(&first).unwrap();
+    let decoded: UninstallPurgePlanV1 = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(decoded, first);
+
+    let mut mismatched_id = wire.clone();
+    mismatched_id["planId"] = serde_json::json!("EREREREREREREREREREREQ==");
+    assert!(serde_json::from_value::<UninstallPurgePlanV1>(mismatched_id).is_err());
+    let mut unknown = wire;
+    unknown["future"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<UninstallPurgePlanV1>(unknown).is_err());
+
+    for path in ["relative/helper", "/tmp/../helper", "/tmp//helper", "/"] {
+        assert!(
+            UninstallPurgePlanV1::new(
+                PathBuf::from(path),
+                "1.2.3".to_owned(),
+                ArtifactSha256::new("ab".repeat(32)).unwrap(),
+                "REALTEAM42".to_owned(),
+                "REALTEAM42.com.agentdeck.agentdeckd.stable".to_owned(),
+            )
+            .is_err(),
+            "unsafe helper path accepted: {path}"
+        );
+    }
 }
 
 #[test]
 fn envelope_round_trips_a_request() {
     let env = envelope(RuntimeMessage::Request(sample_send_prompt()));
     let json = serde_json::to_value(&env).unwrap();
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 3);
     assert_eq!(json["messageId"], "m1");
     // wire round-trip (composite DTOs embed non-PartialEq trunk types).
     let back: RuntimeEnvelope = serde_json::from_value(json.clone()).unwrap();
@@ -1301,7 +1560,7 @@ fn runtime_request_covers_all_brief_variants() {
     // brief Step 3 + P3.9-C0-A1: hello/describeAgents/catalog/subscribe/start/configure/
     // updateMetadata/sendPrompt/resolveApproval/retryApproval/cancelQueued/cancelActive/
     // queryReceipt/stageUpgrade/createPairInvite/listPendingPairings/confirmPairing/
-    // cancelPairing/revoke/trust-reset。
+    // cancelPairing/revoke/trust-reset/machine-enroll/machine-remote-status。
     let convo = ConversationId::new("c1");
     let variants = vec![
         RuntimeRequest::Hello(runtime::command::HelloParams {
@@ -1398,11 +1657,33 @@ fn runtime_request_covers_all_brief_variants() {
         RuntimeRequest::Revoke(runtime::command::RevokeRequest {
             target: runtime::command::RevokeTarget::SelfDevice,
         }),
-        RuntimeRequest::TrustReset {
+        RuntimeRequest::TrustReset(
+            TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None).unwrap(),
+        ),
+        RuntimeRequest::TrustReset(
+            TrustResetRequest::new(
+                LocalOnlyAdministration::LocalOnly,
+                Some(Box::new(sample_admin_purge_receipt())),
+            )
+            .unwrap(),
+        ),
+        RuntimeRequest::TrustReset(
+            TrustResetRequest::for_uninstall_purge(
+                LocalOnlyAdministration::LocalOnly,
+                sample_uninstall_purge_plan(),
+                None,
+            )
+            .unwrap(),
+        ),
+        RuntimeRequest::MachineEnroll(MachineEnrollRequest {
+            bundle: sample_enrollment_bundle(),
+            scope: LocalOnlyAdministration::LocalOnly,
+        }),
+        RuntimeRequest::MachineRemoteStatus {
             scope: LocalOnlyAdministration::LocalOnly,
         },
     ];
-    assert_eq!(variants.len(), 22);
+    assert_eq!(variants.len(), 26);
     for v in variants {
         let json = serde_json::to_value(&v).unwrap();
         assert!(
@@ -1902,6 +2183,137 @@ fn snapshot_rejects_configuration_and_capabilities_agent_mismatch() {
 fn local_only_admin_marker_serializes() {
     let v = serde_json::to_value(LocalOnlyAdministration::LocalOnly).unwrap();
     assert_eq!(v, serde_json::json!("localOnly"));
+}
+
+#[test]
+fn machine_remote_status_freezes_all_lifecycles_and_minimal_fields() {
+    let cases = [
+        (MachineRemoteLifecycle::Unenrolled, "unenrolled"),
+        (
+            MachineRemoteLifecycle::EnrollmentPrepared,
+            "enrollmentPrepared",
+        ),
+        (
+            MachineRemoteLifecycle::EnrollmentResponseValidated,
+            "enrollmentResponseValidated",
+        ),
+        (MachineRemoteLifecycle::Active, "active"),
+        (MachineRemoteLifecycle::RetirePending, "retirePending"),
+        (MachineRemoteLifecycle::RelayCommitted, "relayCommitted"),
+        (
+            MachineRemoteLifecycle::PurgeReadbackAbsent,
+            "purgeReadbackAbsent",
+        ),
+        (MachineRemoteLifecycle::LocalDeleted, "localDeleted"),
+        (MachineRemoteLifecycle::Blocked, "blocked"),
+    ];
+    for (lifecycle, expected) in cases {
+        assert_eq!(serde_json::to_value(lifecycle).unwrap(), expected);
+    }
+
+    let status = MachineRemoteStatus::new(
+        MachineRemoteLifecycle::Active,
+        Some(RelayServerId::from_bytes([0x11; 16])),
+        Some(MachineRouteId::from_bytes([0x22; 16])),
+        Some(MachineRootFingerprint::from_bytes([0x33; 32])),
+        Some(4),
+        None,
+    )
+    .unwrap();
+    let encoded = serde_json::to_value(&status).unwrap();
+    assert_eq!(
+        encoded
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "lifecycle".to_owned(),
+            "machineRoute".to_owned(),
+            "relayServerId".to_owned(),
+            "rootFingerprint".to_owned(),
+            "trustEpoch".to_owned(),
+        ])
+    );
+    let decoded: MachineRemoteStatus = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+}
+
+#[test]
+fn machine_remote_status_rejects_unknown_or_sensitive_fields() {
+    let base = serde_json::json!({
+        "lifecycle": "blocked",
+        "failureCode": "daemon.remote.blocked"
+    });
+    serde_json::from_value::<MachineRemoteStatus>(base.clone()).expect("minimal blocked status");
+
+    for forbidden in [
+        "code",
+        "origin",
+        "spkiPins",
+        "linkCert",
+        "dataCert",
+        "purgeProof",
+        "retirementProof",
+        "message",
+        "detail",
+    ] {
+        let mut value = base.clone();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert(forbidden.to_owned(), serde_json::json!("forbidden"));
+        assert!(
+            serde_json::from_value::<MachineRemoteStatus>(value).is_err(),
+            "status must reject sensitive or narrative field `{forbidden}`"
+        );
+    }
+
+    for invalid in [
+        serde_json::json!({ "lifecycle": "active" }),
+        serde_json::json!({
+            "lifecycle": "unenrolled",
+            "relayServerId": "EREREREREREREREREREREQ=="
+        }),
+        serde_json::json!({
+            "lifecycle": "active",
+            "relayServerId": "EREREREREREREREREREREQ==",
+            "machineRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+            "rootFingerprint": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+            "trustEpoch": 1,
+            "failureCode": "daemon.remote.unexpected"
+        }),
+        serde_json::json!({ "lifecycle": "blocked" }),
+        serde_json::json!({
+            "lifecycle": "blocked",
+            "relayServerId": "EREREREREREREREREREREQ==",
+            "failureCode": "daemon.remote.blocked"
+        }),
+        serde_json::json!({
+            "lifecycle": "blocked",
+            "failureCode": "Not A Stable Code"
+        }),
+        serde_json::json!({
+            "lifecycle": "active",
+            "relayServerId": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "machineRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+            "rootFingerprint": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+            "trustEpoch": 1
+        }),
+    ] {
+        assert!(serde_json::from_value::<MachineRemoteStatus>(invalid).is_err());
+    }
+
+    assert!(MachineRemoteFailureCode::new("").is_err());
+    assert!(MachineRemoteFailureCode::new("Daemon.Remote.Blocked").is_err());
+    assert!(MachineRemoteFailureCode::new("a".repeat(129)).is_err());
+    assert_eq!(
+        MachineRemoteFailureCode::new("daemon.remote.blocked")
+            .unwrap()
+            .as_str(),
+        "daemon.remote.blocked"
+    );
 }
 
 #[test]

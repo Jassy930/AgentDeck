@@ -511,7 +511,7 @@
       )
       XCTAssertEqual(
         String(decoding: output, as: UTF8.self),
-        #"{"agents":[],"ok":true,"protocolVersion":2,"reply":"selfcheck"}"# + "\n"
+        #"{"agents":[],"ok":true,"protocolVersion":3,"reply":"selfcheck"}"# + "\n"
       )
       XCTAssertTrue(errorOutput.isEmpty)
       XCTAssertEqual(evidence.request, "describeAgents")
@@ -902,7 +902,7 @@
           body["message"] as? String == "request",
           let payload = body["payload"] as? [String: Any],
           payload["request"] as? String == "hello",
-          payload["runtimeProtocolVersion"] as? Int == 2
+          payload["runtimeProtocolVersion"] as? Int == Int(runtimeProtocolVersionCurrent)
         else {
           throw RuntimeEnvelopeClientFailure(
             code: "test.runtime_smoke.hello_invalid",
@@ -911,11 +911,14 @@
         }
         try Self.writeObject(
           [
-            "version": 2,
+            "version": Int(runtimeProtocolVersionCurrent),
             "messageId": messageID,
             "body": [
               "message": "reply",
-              "payload": ["reply": "hello", "runtimeProtocolVersion": 2],
+              "payload": [
+                "reply": "hello",
+                "runtimeProtocolVersion": Int(runtimeProtocolVersionCurrent),
+              ],
             ],
           ],
           to: connection
@@ -954,7 +957,7 @@
         helloBody["message"] as? String == "request",
         let helloPayload = helloBody["payload"] as? [String: Any],
         helloPayload["request"] as? String == "hello",
-        helloPayload["runtimeProtocolVersion"] as? Int == 2
+        helloPayload["runtimeProtocolVersion"] as? Int == Int(runtimeProtocolVersionCurrent)
       else {
         throw RuntimeEnvelopeClientFailure(
           code: "test.runtime_smoke.hello_invalid",
@@ -963,11 +966,14 @@
       }
       try Self.writeObject(
         [
-          "version": 2,
+          "version": Int(runtimeProtocolVersionCurrent),
           "messageId": helloMessageID,
           "body": [
             "message": "reply",
-            "payload": ["reply": "hello", "runtimeProtocolVersion": 2],
+            "payload": [
+              "reply": "hello",
+              "runtimeProtocolVersion": Int(runtimeProtocolVersionCurrent),
+            ],
           ],
         ],
         to: connection
@@ -988,7 +994,7 @@
       }
       try Self.writeObject(
         [
-          "version": 2,
+          "version": Int(runtimeProtocolVersionCurrent),
           "messageId": describeMessageID,
           "body": [
             "message": "reply",

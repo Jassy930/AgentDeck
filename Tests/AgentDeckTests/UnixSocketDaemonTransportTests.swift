@@ -21,7 +21,7 @@ final class UnixSocketDaemonTransportTests: XCTestCase {
     defer { Darwin.close(connection) }
 
     try transport.sendFrame(
-      #"{"version":2,"messageId":"hello","body":{"request":{"hello":{"runtimeProtocolVersion":2}}}}"#
+      #"{"version":3,"messageId":"hello","body":{"request":{"hello":{"runtimeProtocolVersion":3}}}}"#
     )
 
     let preface = try XCTUnwrap(peer.readLine(from: connection))
@@ -36,7 +36,7 @@ final class UnixSocketDaemonTransportTests: XCTestCase {
     )
     XCTAssertEqual(
       try peer.readLine(from: connection),
-      #"{"version":2,"messageId":"hello","body":{"request":{"hello":{"runtimeProtocolVersion":2}}}}"#
+      #"{"version":3,"messageId":"hello","body":{"request":{"hello":{"runtimeProtocolVersion":3}}}}"#
     )
     transport.close()
   }

@@ -1,6 +1,6 @@
 //! P1.1 中立性守护 —— 参照现有 `neutrality_tests.rs` 的属性名扫描做法。
 //!
-//! RuntimeEnvelope v2 是稳定中立身份层（design RC-9）。守护点：
+//! RuntimeEnvelope v3 是稳定中立身份层（design RC-9）。守护点：
 //! - 任何属性名都不得以 vendor 前缀开头（codex/openai/anthropic/claude）。
 //! - 任何属性名都不得使用 vendor thread/session 身份词
 //!   （threadId/sessionId/vendorThreadId/resumeReference 等）——稳定身份只能
@@ -105,7 +105,7 @@ fn local_administration_requests_are_marked_local_only() {
         "LocalOnlyAdministration marker description must appear in the runtime schema"
     );
 
-    // 结构化检查：三个 admin 变体都带 `scope` 属性。
+    // 结构化检查：所有 machine-wide admin 变体都带 `scope` 属性。
     let req_schema = serde_json::to_value(schemars::schema_for!(
         agentdeck_protocol::runtime::command::RuntimeRequest
     ))
@@ -117,6 +117,9 @@ fn local_administration_requests_are_marked_local_only() {
         "listPendingPairings",
         "confirmPairing",
         "cancelPairing",
+        "machineEnroll",
+        "machineRemoteStatus",
+        "trustReset",
         "stageUpgrade",
     ] {
         let variant = variants
@@ -124,11 +127,35 @@ fn local_administration_requests_are_marked_local_only() {
             .find(|v| v["properties"]["request"]["enum"][0] == tag)
             .unwrap_or_else(|| panic!("missing variant `{tag}`"));
         assert!(
-            variant["properties"]
-                .as_object()
-                .unwrap()
-                .contains_key("scope"),
+            every_schema_branch_has_property(&req_schema, variant, "scope"),
             "admin variant `{tag}` must carry a local-only `scope` marker"
         );
     }
+}
+
+fn every_schema_branch_has_property(
+    root: &serde_json::Value,
+    schema: &serde_json::Value,
+    property: &str,
+) -> bool {
+    if schema["properties"]
+        .as_object()
+        .is_some_and(|properties| properties.contains_key(property))
+    {
+        return true;
+    }
+    if let Some(reference) = schema["$ref"].as_str() {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| root.pointer(pointer))
+            .is_some_and(|target| every_schema_branch_has_property(root, target, property));
+    }
+    ["allOf", "anyOf", "oneOf"].into_iter().any(|keyword| {
+        schema[keyword].as_array().is_some_and(|branches| {
+            !branches.is_empty()
+                && branches
+                    .iter()
+                    .all(|branch| every_schema_branch_has_property(root, branch, property))
+        })
+    })
 }

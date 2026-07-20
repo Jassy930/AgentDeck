@@ -332,6 +332,63 @@ impl<V> ArtifactInstaller<V, NoopInstallObserver> {
 }
 
 impl<V: ArtifactVerifier, O: InstallObserver> ArtifactInstaller<V, O> {
+    /// 对已安装 helper 做 existing-only 预检；不复制、不修复、不改权限。
+    /// path entry、fd hash、production signature、protocol/Team/access-group 必须同时
+    /// 满足冻结 expectation；version 使用已签名 helper 的自描述值并独立校验安全形状，
+    /// 允许新 CLI 清理仍在运行的上一版兼容 helper。
+    pub fn verify_existing_artifact(&self, path: &Path) -> Result<InstalledArtifact, InstallError> {
+        let mut file = open_artifact(path)?;
+        let attestation = self.verifier.verify(path)?;
+        let fd_hash = hash_open_file(&mut file, path)?;
+        validate_version(&attestation.version)?;
+        if attestation.signature != ArtifactSignature::Production {
+            return Err(InstallError::AdHocSignatureRejected);
+        }
+        if attestation.protocol_version != self.expectation.protocol_version {
+            return Err(InstallError::ProtocolMismatch {
+                expected: self.expectation.protocol_version,
+                observed: attestation.protocol_version,
+            });
+        }
+        if attestation.sha256 != fd_hash
+            || self
+                .expectation
+                .expected_sha256
+                .is_some_and(|expected| expected != fd_hash)
+        {
+            return Err(InstallError::HashMismatch);
+        }
+        if attestation.team_identifier != self.expectation.team_identifier {
+            return Err(InstallError::TeamIdentifierMismatch);
+        }
+        if attestation.keychain_access_groups.as_slice()
+            != [self.expectation.keychain_access_group.as_str()]
+        {
+            return Err(InstallError::AccessGroupMismatch);
+        }
+        Ok(InstalledArtifact {
+            path: path.to_path_buf(),
+            version: attestation.version,
+            protocol_version: attestation.protocol_version,
+            sha256: fd_hash,
+            team_identifier: attestation.team_identifier,
+            keychain_access_group: self.expectation.keychain_access_group.clone(),
+        })
+    }
+
+    /// 完整 install layout 已不存在时的 production recovery source。只从当前
+    /// `AgentDeck.app/Contents/Helpers/agentdeck` 推导 sibling `agentdeckd`，随后复用
+    /// existing-only production attestation；不复制、不安装、不重建旧 purge plan。
+    pub fn verify_bundled_daemon_recovery_source(&self) -> Result<InstalledArtifact, InstallError> {
+        let cli = std::env::current_exe().map_err(|source| InstallError::Io {
+            operation: "resolve current executable",
+            path: PathBuf::from(CLI_BASENAME),
+            source,
+        })?;
+        let source = bundled_daemon_source(&cli)?;
+        self.verify_existing_artifact(&source)
+    }
+
     /// production 唯一来源入口：读取当前 executable，并要求 exact bundle layout。
     pub fn install_bundled_daemon(
         &self,

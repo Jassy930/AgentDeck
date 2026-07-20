@@ -19,14 +19,20 @@ use agentdeckd::config::{
 use agentdeckd::diag;
 use agentdeckd::local::listener::{BoundLocalListener, LocalListenerError};
 use agentdeckd::local::stdio_compat::{self, StdioCompatError};
+use agentdeckd::purge_finalizer::{
+    PurgeStoppedPermit, RunningFinalizerIdentity, prove_purge_terminal_absence, run_purge_finalizer,
+};
 use agentdeckd::record;
 use agentdeckd::remote::bootstrap::{RemoteBootstrapOutcome, reconcile_machine_identity};
+use agentdeckd::remote::manager::RemoteManager;
 use agentdeckd::runtime::singleton::SingletonGuard;
 use agentdeckd::runtime::store::{RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle};
 use agentdeckd::runtime::{AgentRouter, RuntimeCore};
 use agentdeckd::security::{
     KeyStore, StorageKek, key_store_for_config, load_or_create_storage_kek,
 };
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 
 #[derive(Debug, Default)]
 struct CliArgs {
@@ -41,6 +47,9 @@ struct CliArgs {
     exec_gate: bool,
     production_execution_probe: bool,
     production_execution_cancel_probe: bool,
+    purge_finalizer: bool,
+    purge_terminal_proof: bool,
+    purge_plan_id: Option<[u8; 16]>,
     show_version: bool,
     show_help: bool,
 }
@@ -54,6 +63,8 @@ enum CliError {
     ConflictingOneShotModes,
     DiagnosticsStartupFlagsForbidden,
     ExecGateModeConflict,
+    PurgeFinalizerArgumentsInvalid,
+    PurgeTerminalProofArgumentsInvalid,
 }
 
 #[derive(Debug)]
@@ -117,6 +128,10 @@ impl CliError {
                 "daemon.cli.diagnostics_startup_flags_forbidden"
             }
             Self::ExecGateModeConflict => "daemon.cli.exec_gate_mode_conflict",
+            Self::PurgeFinalizerArgumentsInvalid => "daemon.cli.purge_finalizer_arguments_invalid",
+            Self::PurgeTerminalProofArgumentsInvalid => {
+                "daemon.cli.purge_terminal_proof_arguments_invalid"
+            }
         }
     }
 }
@@ -144,6 +159,11 @@ impl fmt::Display for CliError {
             Self::ExecGateModeConflict => {
                 formatter.write_str("--exec-gate is an internal exclusive submode")
             }
+            Self::PurgeFinalizerArgumentsInvalid => formatter.write_str(
+                "--purge-finalizer requires one canonical --purge-plan-id and no other mode",
+            ),
+            Self::PurgeTerminalProofArgumentsInvalid => formatter
+                .write_str("--purge-terminal-proof is exclusive and accepts no other arguments"),
         }
     }
 }
@@ -182,6 +202,37 @@ where
             out.diagnostics_report = true;
         } else if argument == OsStr::new("--exec-gate") {
             out.exec_gate = true;
+        } else if argument == OsStr::new("--purge-finalizer") {
+            if out.purge_finalizer {
+                return Err(CliError::PurgeFinalizerArgumentsInvalid);
+            }
+            out.purge_finalizer = true;
+        } else if argument == OsStr::new("--purge-terminal-proof") {
+            if out.purge_terminal_proof {
+                return Err(CliError::PurgeTerminalProofArgumentsInvalid);
+            }
+            out.purge_terminal_proof = true;
+        } else if argument == OsStr::new("--purge-plan-id") {
+            if out.purge_plan_id.is_some() {
+                return Err(CliError::PurgeFinalizerArgumentsInvalid);
+            }
+            let value = it
+                .next()
+                .ok_or(CliError::MissingValue {
+                    flag: "--purge-plan-id",
+                })?
+                .into_string()
+                .map_err(|_| CliError::PurgeFinalizerArgumentsInvalid)?;
+            let decoded = STANDARD
+                .decode(value.as_bytes())
+                .map_err(|_| CliError::PurgeFinalizerArgumentsInvalid)?;
+            let plan_id: [u8; 16] = decoded
+                .try_into()
+                .map_err(|_| CliError::PurgeFinalizerArgumentsInvalid)?;
+            if plan_id == [0; 16] || STANDARD.encode(plan_id) != value {
+                return Err(CliError::PurgeFinalizerArgumentsInvalid);
+            }
+            out.purge_plan_id = Some(plan_id);
         } else if cfg!(debug_assertions) && argument == OsStr::new("--production-execution-probe") {
             out.production_execution_probe = true;
         } else if cfg!(debug_assertions)
@@ -200,6 +251,46 @@ where
 }
 
 fn validate_cli_args(args: &CliArgs) -> Result<(), CliError> {
+    if args.purge_terminal_proof {
+        if args.purge_finalizer
+            || args.purge_plan_id.is_some()
+            || args.profile.is_some()
+            || args.data_dir.is_some()
+            || args.ephemeral
+            || args.no_remote
+            || args.stdio_compat
+            || args.selfcheck
+            || args.diagnostics_report
+            || args.exec_gate
+            || args.production_execution_probe
+            || args.production_execution_cancel_probe
+            || args.show_version
+            || args.show_help
+        {
+            return Err(CliError::PurgeTerminalProofArgumentsInvalid);
+        }
+        return Ok(());
+    }
+    if args.purge_finalizer || args.purge_plan_id.is_some() {
+        if !args.purge_finalizer
+            || args.purge_plan_id.is_none()
+            || args.profile.is_some()
+            || args.data_dir.is_some()
+            || args.ephemeral
+            || args.no_remote
+            || args.stdio_compat
+            || args.selfcheck
+            || args.diagnostics_report
+            || args.exec_gate
+            || args.production_execution_probe
+            || args.production_execution_cancel_probe
+            || args.show_version
+            || args.show_help
+        {
+            return Err(CliError::PurgeFinalizerArgumentsInvalid);
+        }
+        return Ok(());
+    }
     if args.exec_gate
         && (args.profile.is_some()
             || args.data_dir.is_some()
@@ -240,6 +331,97 @@ fn validate_cli_args(args: &CliArgs) -> Result<(), CliError> {
         return Err(CliError::DiagnosticsStartupFlagsForbidden);
     }
     Ok(())
+}
+
+fn run_purge_finalizer_one_shot(plan_id: [u8; 16]) -> ExitCode {
+    // finalizer 必须在普通 StorageKEK load/create、DB open、record namespace 与 UDS
+    // bootstrap 前分流；它只 existing-load marker/key items，并持有 stopped permit。
+    let config = match DaemonConfig::resolve(DaemonStartupOptions {
+        ephemeral: false,
+        no_remote: false,
+        stdio_compat: false,
+        profile: Some(DaemonProfile::Stable),
+        stable_keychain_access_group: compiled_stable_keychain_access_group(),
+    }) {
+        Ok(config) => config,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(1);
+        }
+    };
+    let identity = match RunningFinalizerIdentity::production() {
+        Ok(identity) => identity,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(1);
+        }
+    };
+    let stopped = match PurgeStoppedPermit::acquire(config.paths()) {
+        Ok(stopped) => stopped,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(1);
+        }
+    };
+    let key_store = match key_store_for_config(&config) {
+        Ok(store) => store,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(1);
+        }
+    };
+    match run_purge_finalizer(
+        key_store.as_ref(),
+        config.paths(),
+        &identity,
+        &stopped,
+        plan_id,
+    ) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_purge_terminal_proof_one_shot() -> ExitCode {
+    // 必须在普通 StorageKEK load/create、DB open、record namespace 与 UDS bootstrap
+    // 前分流；这里只构造 existing backend 并执行只读 all-absent proof。
+    let config = match DaemonConfig::resolve(DaemonStartupOptions {
+        ephemeral: false,
+        no_remote: false,
+        stdio_compat: false,
+        profile: Some(DaemonProfile::Stable),
+        stable_keychain_access_group: compiled_stable_keychain_access_group(),
+    }) {
+        Ok(config) => config,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(1);
+        }
+    };
+    let stopped = match PurgeStoppedPermit::acquire(config.paths()) {
+        Ok(stopped) => stopped,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(1);
+        }
+    };
+    let key_store = match key_store_for_config(&config) {
+        Ok(store) => store,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(1);
+        }
+    };
+    match prove_purge_terminal_absence(key_store.as_ref(), config.paths(), &stopped) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => {
+            print_typed_error(error.code(), &error);
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn apply_legacy_diagnostics_env(args: &CliArgs) {
@@ -464,7 +646,7 @@ async fn wait_for_shutdown_signal(
 fn run_main_loop(
     config: &DaemonConfig,
     singleton: &SingletonGuard,
-    key_store: &dyn KeyStore,
+    key_store: Arc<dyn KeyStore>,
     storage_kek: StorageKek,
 ) -> Result<(), MainLoopFailure> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -478,22 +660,23 @@ fn run_main_loop(
         let store = RuntimeStoreHandle::open(RuntimeStoreConfig::new(runtime_db), storage_kek)
             .await
             .map_err(MainLoopFailure::store)?;
-        let remote_identity = match reconcile_machine_identity(config, &store, key_store).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let failure = MainLoopFailure::store(error);
-                let shutdown = store.shutdown().await;
-                diag::log(
-                    "daemon_stop",
-                    &format!(
-                        "agentdeckd machine identity bootstrap failed: \
+        let remote_identity =
+            match reconcile_machine_identity(config, &store, key_store.as_ref()).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let failure = MainLoopFailure::store(error);
+                    let shutdown = store.shutdown().await;
+                    diag::log(
+                        "daemon_stop",
+                        &format!(
+                            "agentdeckd machine identity bootstrap failed: \
                          code={} storeShutdown={shutdown:?}",
-                        failure.code
-                    ),
-                );
-                return Err(failure);
-            }
-        };
+                            failure.code
+                        ),
+                    );
+                    return Err(failure);
+                }
+            };
         match &remote_identity {
             RemoteBootstrapOutcome::Disabled => {
                 diag::log("remote_identity", "status=disabled");
@@ -508,14 +691,21 @@ fn run_main_loop(
                 );
             }
         }
+        let remote_manager = Arc::new(RemoteManager::new(
+            store.clone(),
+            key_store.clone(),
+            config.clone(),
+            remote_identity,
+        ));
         let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
         let (upgrade_exit, mut upgrade_exit_receiver) = tokio::sync::mpsc::unbounded_channel();
         let core =
             match RuntimeCore::new_production(store.clone(), router.clone()).and_then(|core| {
-                core.with_versioned_daemon_upgrade(
-                    config.paths().data_dir.join("bin"),
-                    upgrade_exit,
-                )
+                core.with_remote_administration(remote_manager.clone())
+                    .with_versioned_daemon_upgrade(
+                        config.paths().data_dir.join("bin"),
+                        upgrade_exit,
+                    )
             }) {
                 Ok(core) => Arc::new(core),
                 Err(error) => {
@@ -558,49 +748,63 @@ fn run_main_loop(
                     .await
                     .map_err(MainLoopFailure::local)?;
                     let socket = listener.local_ready_permit().socket_path().to_path_buf();
-                    // P4 将按值消费该 capability 启动唯一 RemoteTransport；P3.8 先把
-                    // stable-only mint 边界接入真实 bootstrap，并保持到 local stop 后。
                     let remote_start_permit = listener.take_remote_start_permit();
-                    let armed_remote = match (remote_identity, remote_start_permit) {
-                        (RemoteBootstrapOutcome::Active(identity), Some(permit)) => {
-                            Some(identity.arm(permit))
-                        }
-                        (RemoteBootstrapOutcome::Active(identity), None) => {
-                            drop(identity);
-                            diag::log(
-                                "remote_identity",
-                                "status=blocked code=daemon.remote.identity.start_permit_missing",
-                            );
-                            None
-                        }
-                        (RemoteBootstrapOutcome::Disabled, _permit) => None,
-                        (RemoteBootstrapOutcome::Blocked(block), _permit) => {
-                            diag::log(
-                                "remote_identity",
-                                &format!("status=blocked code={}", block.code()),
-                            );
-                            None
-                        }
-                    };
+                    let arm_handle = remote_start_permit.map(|permit| {
+                        let remote = remote_manager.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = remote.arm(permit).await {
+                                diag::log(
+                                    "remote_manager",
+                                    &format!("status=blocked code={}", error.code()),
+                                );
+                            }
+                        })
+                    });
+                    let arm_task = Arc::new(tokio::sync::Mutex::new(arm_handle));
                     diag::log(
                         "runtime_local_ready",
                         &format!(
                             "socket={} remotePermit={}",
                             socket.display(),
-                            armed_remote.is_some()
+                            arm_task.lock().await.is_some()
                         ),
                     );
+                    let remote_for_signal = remote_manager.clone();
+                    let arm_task_for_signal = arm_task.clone();
                     let serve_result = listener
-                        .serve_until(wait_for_shutdown_signal(&mut upgrade_exit_receiver))
+                        .serve_until(async {
+                            let signal = wait_for_shutdown_signal(&mut upgrade_exit_receiver).await;
+                            // signal/upgrade 固定先停 remote session/owner，再允许 local
+                            // listener 广播 shutdown 并 join accepted actors。
+                            remote_for_signal.shutdown().await;
+                            let arm = arm_task_for_signal.lock().await.take();
+                            if let Some(handle) = arm
+                                && handle.await.is_err()
+                            {
+                                diag::log(
+                                    "remote_manager",
+                                    "status=blocked code=daemon.remote.supervisor_task_failed",
+                                );
+                            }
+                            signal
+                        })
                         .await
                         .map_err(MainLoopFailure::local);
-                    // P4.1 明确证明 active key owner 覆盖 RemoteStartPermit 与完整
-                    // local serve 生命周期；P4.2 将在同一 owner 内加入 transport。
-                    drop(armed_remote);
+                    // listener 自身错误也必须回收 remote；spawned arm task 始终 join。
+                    remote_manager.shutdown().await;
+                    let arm = arm_task.lock().await.take();
+                    if let Some(handle) = arm
+                        && handle.await.is_err()
+                    {
+                        diag::log(
+                            "remote_manager",
+                            "status=blocked code=daemon.remote.supervisor_task_failed",
+                        );
+                    }
                     serve_result
                 }
                 LocalIngressMode::StdioCompat => {
-                    drop(remote_identity);
+                    remote_manager.shutdown().await;
                     let compatibility = stdio_compat::run_after_recovery(
                         config,
                         recovery_ready_permit,
@@ -634,6 +838,20 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    if args.purge_terminal_proof || args.purge_finalizer || args.purge_plan_id.is_some() {
+        if let Err(error) = validate_cli_args(&args) {
+            print_typed_error(error.code(), &error);
+            return ExitCode::from(2);
+        }
+        if args.purge_terminal_proof {
+            return run_purge_terminal_proof_one_shot();
+        }
+        return run_purge_finalizer_one_shot(
+            args.purge_plan_id
+                .expect("validated purge finalizer requires plan id"),
+        );
+    }
 
     if args.exec_gate {
         if let Err(error) = validate_cli_args(&args) {
@@ -697,8 +915,8 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let key_store = match key_store_for_config(&config) {
-        Ok(store) => store,
+    let key_store: Arc<dyn KeyStore> = match key_store_for_config(&config) {
+        Ok(store) => Arc::from(store),
         Err(error) => {
             print_typed_error(error.code(), &error);
             return ExitCode::from(1);
@@ -720,7 +938,7 @@ fn main() -> ExitCode {
         drop(storage_kek);
         run_selfcheck(&config)
     } else {
-        match run_main_loop(&config, &singleton_guard, &*key_store, storage_kek) {
+        match run_main_loop(&config, &singleton_guard, key_store.clone(), storage_kek) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 print_typed_error(&error.code, &error);
@@ -798,6 +1016,95 @@ mod tests {
         ]))
         .expect("parse diagnostics");
         assert!(validate_cli_args(&diagnostics).is_ok());
+    }
+
+    #[test]
+    fn purge_finalizer_requires_canonical_exact_exclusive_plan_id() {
+        let encoded = STANDARD.encode([7_u8; 16]);
+        let args = parse_args(vec![
+            OsString::from("agentdeckd"),
+            OsString::from("--purge-finalizer"),
+            OsString::from("--purge-plan-id"),
+            OsString::from(&encoded),
+        ])
+        .expect("parse finalizer args");
+        assert_eq!(args.purge_plan_id, Some([7_u8; 16]));
+        assert!(validate_cli_args(&args).is_ok());
+
+        for values in [
+            vec!["agentdeckd", "--purge-finalizer"],
+            vec!["agentdeckd", "--purge-plan-id", encoded.as_str()],
+            vec![
+                "agentdeckd",
+                "--purge-finalizer",
+                "--purge-plan-id",
+                encoded.as_str(),
+                "--selfcheck",
+            ],
+        ] {
+            let parsed = parse_args(values.into_iter().map(OsString::from));
+            match parsed {
+                Ok(args) => assert!(matches!(
+                    validate_cli_args(&args),
+                    Err(CliError::PurgeFinalizerArgumentsInvalid)
+                )),
+                Err(error) => assert!(matches!(error, CliError::PurgeFinalizerArgumentsInvalid)),
+            }
+        }
+
+        let zero = STANDARD.encode([0_u8; 16]);
+        let error = parse_args(vec![
+            OsString::from("agentdeckd"),
+            OsString::from("--purge-finalizer"),
+            OsString::from("--purge-plan-id"),
+            OsString::from(zero),
+        ])
+        .expect_err("zero plan id");
+        assert!(matches!(error, CliError::PurgeFinalizerArgumentsInvalid));
+    }
+
+    #[test]
+    fn purge_terminal_proof_is_exclusive_and_accepts_no_plan() {
+        let args = parse_args(os_args(&["agentdeckd", "--purge-terminal-proof"]))
+            .expect("parse terminal proof");
+        assert!(args.purge_terminal_proof);
+        assert!(validate_cli_args(&args).is_ok());
+
+        let encoded = STANDARD.encode([7_u8; 16]);
+        for values in [
+            vec![
+                "agentdeckd",
+                "--purge-terminal-proof",
+                "--purge-terminal-proof",
+            ],
+            vec![
+                "agentdeckd",
+                "--purge-terminal-proof",
+                "--purge-finalizer",
+                "--purge-plan-id",
+                encoded.as_str(),
+            ],
+            vec![
+                "agentdeckd",
+                "--purge-terminal-proof",
+                "--purge-plan-id",
+                encoded.as_str(),
+            ],
+            vec!["agentdeckd", "--purge-terminal-proof", "--selfcheck"],
+            vec!["agentdeckd", "--purge-terminal-proof", "--help"],
+        ] {
+            let parsed = parse_args(values.into_iter().map(OsString::from));
+            match parsed {
+                Ok(args) => assert!(matches!(
+                    validate_cli_args(&args),
+                    Err(CliError::PurgeTerminalProofArgumentsInvalid)
+                )),
+                Err(error) => assert!(matches!(
+                    error,
+                    CliError::PurgeTerminalProofArgumentsInvalid
+                )),
+            }
+        }
     }
 
     #[cfg(unix)]

@@ -237,14 +237,21 @@ async fn real_uds_two_connections_handshake_and_disconnect_isolation() {
     let mut first = Client::connect(&root.socket(), "123e4567-e89b-12d3-a456-426614174001").await;
     let mut second = Client::connect(&root.socket(), "123e4567-e89b-12d3-a456-426614174002").await;
 
-    first.write_envelope(&hello("hello-first", 2)).await;
-    second.write_envelope(&hello("hello-second", 2)).await;
+    first
+        .write_envelope(&hello("hello-first", RUNTIME_PROTOCOL_VERSION))
+        .await;
+    second
+        .write_envelope(&hello("hello-second", RUNTIME_PROTOCOL_VERSION))
+        .await;
     assert_hello_reply(first.read_envelope().await, "hello-first");
     assert_hello_reply(second.read_envelope().await, "hello-second");
 
     drop(first);
     second
-        .write_envelope(&hello("hello-second-after-sibling-eof", 2))
+        .write_envelope(&hello(
+            "hello-second-after-sibling-eof",
+            RUNTIME_PROTOCOL_VERSION,
+        ))
         .await;
     assert_hello_reply(
         second.read_envelope().await,
@@ -308,7 +315,9 @@ async fn inner_hello_mismatch_is_a_core_reply_and_connection_remains_usable() {
         "inner-mismatch",
         DAEMON_RUNTIME_PROTOCOL_MISMATCH,
     );
-    client.write_envelope(&hello("inner-retry", 2)).await;
+    client
+        .write_envelope(&hello("inner-retry", RUNTIME_PROTOCOL_VERSION))
+        .await;
     assert_hello_reply(client.read_envelope().await, "inner-retry");
     drop(client);
 

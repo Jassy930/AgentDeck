@@ -12,7 +12,7 @@ final class RuntimeSelfcheckRunnerTests: XCTestCase {
     XCTAssertEqual(execution.exitCode, 0)
     XCTAssertEqual(
       String(decoding: execution.stdout, as: UTF8.self),
-      #"{"agents":["claude_code","codex"],"ok":true,"protocolVersion":2,"reply":"selfcheck"}"#
+      #"{"agents":["claude_code","codex"],"ok":true,"protocolVersion":3,"reply":"selfcheck"}"#
         + "\n"
     )
     XCTAssertTrue(execution.stderr.isEmpty)
@@ -23,7 +23,9 @@ final class RuntimeSelfcheckRunnerTests: XCTestCase {
   }
 
   func testWrongReplyFailsTypedAndStillClosesExactlyOnce() async {
-    let wire = RuntimeSelfcheckFakeWire(reply: .hello(runtimeProtocolVersion: 2))
+    let wire = RuntimeSelfcheckFakeWire(
+      reply: .hello(runtimeProtocolVersion: runtimeProtocolVersionCurrent)
+    )
     let execution = await RuntimeSelfcheckRunner(wireFactory: { wire }).run()
 
     XCTAssertEqual(execution.exitCode, 1)
@@ -58,7 +60,7 @@ final class RuntimeSelfcheckRunnerTests: XCTestCase {
 
   func testSocketOrHelloFailurePreservesExactClientCodeAndCloses() async {
     let wire = RuntimeSelfcheckFakeWire(
-      reply: .hello(runtimeProtocolVersion: 2),
+      reply: .hello(runtimeProtocolVersion: runtimeProtocolVersionCurrent),
       startFailure: RuntimeEnvelopeClientFailure(
         code: "daemon.client.socket_missing",
         message: "canonical shared-daemon socket is missing"

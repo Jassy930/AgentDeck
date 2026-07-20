@@ -7,10 +7,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use agentdeck_protocol::relay_v2::{MachineRouteId, RelayServerId};
 use agentdeck_protocol::runtime::catalog::{CatalogSnapshot, ConversationEntry};
 use agentdeck_protocol::runtime::command::HelloParams;
 use agentdeck_protocol::runtime::configuration::{
@@ -28,7 +29,8 @@ use agentdeck_protocol::runtime::receipt::{
     CommandReceipt, CommandStatus, CommandStatusReceipt, ConversationStartReceipt,
 };
 use agentdeck_protocol::runtime::{
-    BackfillChunk, BackfillRange, ConversationSnapshot, QueryReceiptSelector,
+    BackfillChunk, BackfillRange, ConversationSnapshot, MachineRemoteFailureCode,
+    MachineRemoteLifecycle, MachineRemoteStatus, MachineRootFingerprint, QueryReceiptSelector,
     RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeEvent, RuntimeEventBody, RuntimeInnerCursor,
     RuntimeMessage, RuntimeReply, RuntimeRequest, RuntimeSyncComplete, SnapshotItem, StreamCursor,
     SubscriptionReceipt,
@@ -37,7 +39,7 @@ use agentdeck_protocol::{
     AgentKind, CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort, CodexSandboxMode,
     SessionCapabilities, VendorCapabilities,
 };
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentdeck")
@@ -133,6 +135,43 @@ fn write_reply(writer: &mut UnixStream, message_id: MessageId, reply: RuntimeRep
     writer.flush().expect("flush Runtime reply");
 }
 
+fn machine_status(lifecycle: MachineRemoteLifecycle, failure: Option<&str>) -> MachineRemoteStatus {
+    MachineRemoteStatus::new(
+        lifecycle,
+        Some(RelayServerId::from_bytes([0x22; 16])),
+        Some(MachineRouteId::from_bytes([0x33; 16])),
+        Some(MachineRootFingerprint::from_bytes([0x44; 32])),
+        Some(7),
+        failure.map(|code| MachineRemoteFailureCode::new(code).expect("stable failure code")),
+    )
+    .expect("valid machine status")
+}
+
+fn runtime_fixture_payload(case_name: &str) -> serde_json::Value {
+    include_str!("../../protocol/agentdeck/fixtures/runtime-v3-wire.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("fixture JSON"))
+        .find(|case| case["case"] == case_name)
+        .unwrap_or_else(|| panic!("missing fixture {case_name}"))["value"]["body"]["payload"]
+        .clone()
+}
+
+fn private_json_file(value: &serde_json::Value) -> NamedTempFile {
+    let mut file = NamedTempFile::new().expect("temporary JSON input");
+    serde_json::to_writer(file.as_file_mut(), value).expect("write JSON input");
+    file.as_file_mut().flush().expect("flush JSON input");
+    fs::set_permissions(file.path(), fs::Permissions::from_mode(0o600)).expect("private JSON mode");
+    file
+}
+
+fn remote_process_test_guard() -> MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("remote process test guard")
+}
+
 fn accept_with_timeout(listener: &UnixListener, timeout: Duration) -> std::io::Result<UnixStream> {
     listener
         .set_nonblocking(true)
@@ -204,6 +243,215 @@ fn fake_runtime_listener_accept_is_bounded() {
         .expect_err("unused fake listener must time out");
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn remote_machine_status_uses_runtime_uds_and_outputs_only_allowlisted_admin_action() {
+    let _guard = remote_process_test_guard();
+    let server = TestRuntimeServer::bind();
+    let temp_root = server.root.path().to_path_buf();
+    let server_thread = thread::spawn(move || {
+        let (mut reader, mut writer, _) = accept_hello(&server.listener);
+        let request = read_envelope(&mut reader);
+        assert!(matches!(
+            request.body,
+            RuntimeMessage::Request(RuntimeRequest::MachineRemoteStatus { .. })
+        ));
+        write_reply(
+            &mut writer,
+            request.message_id,
+            RuntimeReply::MachineRemoteStatus(machine_status(
+                MachineRemoteLifecycle::Blocked,
+                Some("daemon.remote.trust_reset.admin_receipt_required"),
+            )),
+        );
+    });
+    let output = runtime_command(&temp_root)
+        .args(["remote", "machine", "status"])
+        .output()
+        .expect("run machine status");
+    server_thread.join().expect("Runtime server thread");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = stdout_json(&output);
+    assert_eq!(json["operation"], "remote.machine.status");
+    assert_eq!(json["status"]["lifecycle"], "blocked");
+    assert_eq!(
+        json["relayAdminPurge"]["ndjson"]["command"],
+        serde_json::Value::Null
+    );
+    let ndjson = json["relayAdminPurge"]["ndjson"]
+        .as_str()
+        .expect("NDJSON string");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(ndjson).unwrap()["command"],
+        "machine_purge"
+    );
+}
+
+#[test]
+fn remote_machine_enroll_imports_private_bundle_over_runtime_uds_without_echoing_secrets() {
+    let _guard = remote_process_test_guard();
+    let bundle = private_json_file(&runtime_fixture_payload("requestMachineEnroll")["bundle"]);
+    let server = TestRuntimeServer::bind();
+    let temp_root = server.root.path().to_path_buf();
+    let server_thread = thread::spawn(move || {
+        let (mut reader, mut writer, _) = accept_hello(&server.listener);
+        let request = read_envelope(&mut reader);
+        let RuntimeMessage::Request(RuntimeRequest::MachineEnroll(enroll)) = request.body else {
+            panic!("expected MachineEnroll request")
+        };
+        assert_eq!(enroll.bundle.version, 2);
+        write_reply(
+            &mut writer,
+            request.message_id,
+            RuntimeReply::MachineRemoteStatus(machine_status(MachineRemoteLifecycle::Active, None)),
+        );
+    });
+    let output = runtime_command(&temp_root)
+        .args([
+            "remote",
+            "machine",
+            "enroll",
+            "--bundle-file",
+            bundle.path().to_str().expect("UTF-8 bundle path"),
+        ])
+        .output()
+        .expect("run machine enroll");
+    server_thread.join().expect("Runtime server thread");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("status JSON");
+    assert_eq!(json["operation"], "remote.machine.enroll");
+    assert_eq!(json["status"]["lifecycle"], "active");
+    for forbidden in [
+        "code",
+        "spkiPins",
+        "receiptVerifyKey",
+        "linkCert",
+        "dataCert",
+    ] {
+        assert!(!stdout.contains(forbidden), "leaked {forbidden}: {stdout}");
+    }
+}
+
+#[test]
+fn remote_trust_reset_maps_runtime_failure_through_status_fallback() {
+    let _guard = remote_process_test_guard();
+    let server = TestRuntimeServer::bind();
+    let temp_root = server.root.path().to_path_buf();
+    let server_thread = thread::spawn(move || {
+        let (mut reader, mut writer, _) = accept_hello(&server.listener);
+        let reset = read_envelope(&mut reader);
+        let RuntimeMessage::Request(RuntimeRequest::TrustReset(request)) = reset.body else {
+            panic!("expected TrustReset request")
+        };
+        assert!(!request.uninstall_purge());
+        assert!(request.uninstall_purge_plan().is_none());
+        assert!(request.admin_purge_receipt().is_none());
+        write_reply(
+            &mut writer,
+            reset.message_id,
+            RuntimeReply::Failure(RuntimeFailure::new(
+                "daemon.remote.trust_reset.admin_receipt_required",
+                "portable Relay admin receipt required",
+            )),
+        );
+        let status = read_envelope(&mut reader);
+        assert!(matches!(
+            status.body,
+            RuntimeMessage::Request(RuntimeRequest::MachineRemoteStatus { .. })
+        ));
+        write_reply(
+            &mut writer,
+            status.message_id,
+            RuntimeReply::MachineRemoteStatus(machine_status(
+                MachineRemoteLifecycle::Blocked,
+                Some("daemon.remote.trust_reset.admin_receipt_required"),
+            )),
+        );
+    });
+    let output = runtime_command(&temp_root)
+        .args(["remote", "trust-reset"])
+        .output()
+        .expect("run trust reset");
+    server_thread.join().expect("Runtime server thread");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = stdout_json(&output);
+    assert_eq!(
+        json["requestFailureCode"],
+        "daemon.remote.trust_reset.admin_receipt_required"
+    );
+    assert_eq!(json["status"]["lifecycle"], "blocked");
+    assert!(json["relayAdminPurge"].is_object());
+}
+
+#[test]
+fn remote_machine_success_rejects_every_non_status_reply() {
+    let _guard = remote_process_test_guard();
+    let server = TestRuntimeServer::bind();
+    let temp_root = server.root.path().to_path_buf();
+    let server_thread = thread::spawn(move || {
+        let (mut reader, mut writer, _) = accept_hello(&server.listener);
+        let request = read_envelope(&mut reader);
+        write_reply(
+            &mut writer,
+            request.message_id,
+            RuntimeReply::Hello(HelloParams {
+                runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            }),
+        );
+    });
+    let output = runtime_command(&temp_root)
+        .args(["remote", "machine", "status"])
+        .output()
+        .expect("run machine status");
+    server_thread.join().expect("Runtime server thread");
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        stdout_json(&output)["error"]["code"],
+        "daemon.client.unexpected_reply"
+    );
+}
+
+#[test]
+fn remote_machine_runtime_failure_preserves_stable_code_and_failure_exit() {
+    let _guard = remote_process_test_guard();
+    let server = TestRuntimeServer::bind();
+    let temp_root = server.root.path().to_path_buf();
+    let server_thread = thread::spawn(move || {
+        let (mut reader, mut writer, _) = accept_hello(&server.listener);
+        let request = read_envelope(&mut reader);
+        write_reply(
+            &mut writer,
+            request.message_id,
+            RuntimeReply::Failure(RuntimeFailure::new(
+                "daemon.remote.administration.unavailable",
+                "remote administration unavailable",
+            )),
+        );
+    });
+    let output = runtime_command(&temp_root)
+        .args(["remote", "machine", "status"])
+        .output()
+        .expect("run machine status");
+    server_thread.join().expect("Runtime server thread");
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(
+        stdout_json(&output)["error"]["code"],
+        "daemon.remote.administration.unavailable"
+    );
 }
 
 #[test]

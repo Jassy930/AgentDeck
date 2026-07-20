@@ -1,7 +1,7 @@
 import Foundation
 
-// Runtime v2 changed outer 与 JSON transfer model。稳定且 wire 未变化的 leaf DTO
-// 继续复用 RuntimeWireTypes.swift；current facade 与 compact codec 在 A2c2 收口。
+// Runtime v3 current outer 保留 V2 类型名以维持源码兼容；稳定 leaf DTO 继续复用
+// RuntimeWireTypes.swift，current facade 与 compact codec 只接受 v3。
 
 public enum RuntimeV2WireError: Error, Equatable, Sendable {
     case invalidIdentity
@@ -13,8 +13,13 @@ public enum RuntimeV2WireError: Error, Equatable, Sendable {
 }
 
 public let runtimeProtocolVersionV2: UInt16 = 2
-public let runtimeProtocolVersionCurrent: UInt16 = runtimeProtocolVersionV2
+public let runtimeProtocolVersionV3: UInt16 = 3
+public let runtimeProtocolVersionCurrent: UInt16 = runtimeProtocolVersionV3
 public typealias RuntimeWireCodec = RuntimeV2WireCodec
+public typealias RuntimeRequestV3 = RuntimeRequestV2
+public typealias RuntimeReplyV3 = RuntimeReplyV2
+public typealias RuntimeEnvelopeV3 = RuntimeEnvelopeV2
+public typealias RuntimeV3WireCodec = RuntimeV2WireCodec
 
 private func runtimeV2ValidateIdentity(_ value: String) throws {
     guard !value.isEmpty, value.utf8.count <= 1024 else {
@@ -30,7 +35,7 @@ private func runtimeV2InvalidTag(
     .dataCorruptedError(
         forKey: runtimeV2Key(field),
         in: container,
-        debugDescription: "unsupported Runtime v2 \(field) \(value)"
+        debugDescription: "unsupported Runtime v3 \(field) \(value)"
     )
 }
 
@@ -142,7 +147,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
             throw DecodingError.dataCorruptedError(
                 forKey: .transferID,
                 in: container,
-                debugDescription: "Runtime v2 transferId must contain 1...1024 UTF-8 bytes"
+                debugDescription: "Runtime v3 transferId must contain 1...1024 UTF-8 bytes"
             )
         }
         transferID = RuntimeTransferID(rawValue: rawTransferID)
@@ -157,7 +162,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
             throw DecodingError.dataCorrupted(
                 .init(
                     codingPath: decoder.codingPath,
-                    debugDescription: "invalid Runtime v2 transfer bounds",
+                    debugDescription: "invalid Runtime v3 transfer bounds",
                     underlyingError: error
                 )
             )
@@ -172,7 +177,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
                 self,
                 .init(
                     codingPath: encoder.codingPath,
-                    debugDescription: "invalid Runtime v2 transfer bounds",
+                    debugDescription: "invalid Runtime v3 transfer bounds",
                     underlyingError: error
                 )
             )
@@ -198,7 +203,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
                 self,
                 .init(
                     codingPath: container.codingPath,
-                    debugDescription: "invalid Runtime v2 transfer bounds",
+                    debugDescription: "invalid Runtime v3 transfer bounds",
                     underlyingError: error
                 )
             )
@@ -256,7 +261,7 @@ public struct RuntimeTransferCarrierV2: Sendable {
         channel: RuntimeTransferChannelV2,
         transfer: TransferEnvelopeV2
     ) {
-        runtimeVersion = runtimeProtocolVersionV2
+        runtimeVersion = runtimeProtocolVersionCurrent
         self.messageID = messageID
         self.channel = channel
         self.transfer = transfer
@@ -273,7 +278,7 @@ public struct RuntimeTransferCarrierV2: Sendable {
         part: Data
     ) throws {
         try runtimeV2ValidateIdentity(messageID.rawValue)
-        runtimeVersion = runtimeProtocolVersionV2
+        runtimeVersion = runtimeProtocolVersionCurrent
         self.messageID = messageID
         self.channel = channel
         transfer = try TransferEnvelopeV2(
@@ -342,7 +347,14 @@ public enum RuntimeRequestV2: Codable, Sendable {
     case confirmPairing(pairingID: RuntimePairingID, scope: RuntimeLocalOnlyAdministrationV1)
     case cancelPairing(pairingID: RuntimePairingID, scope: RuntimeLocalOnlyAdministrationV1)
     case revoke(target: RuntimeRevokeTargetV1)
-    case trustReset(scope: RuntimeLocalOnlyAdministrationV1)
+  case machineEnroll(RuntimeMachineEnrollRequestV3)
+  case machineRemoteStatus(scope: RuntimeLocalOnlyAdministrationV1)
+    case trustReset(
+      scope: RuntimeLocalOnlyAdministrationV1,
+      uninstallPurge: Bool = false,
+      uninstallPurgePlan: RuntimeUninstallPurgePlanV1? = nil,
+      adminPurgeReceipt: RuntimeRelayAdminPurgeReceiptV1? = nil
+    )
     case stageUpgrade(RuntimeStageUpgradeRequestV2)
 
     public init(from decoder: Decoder) throws {
@@ -552,12 +564,45 @@ public enum RuntimeRequestV2: Codable, Sendable {
                     forKey: runtimeV2Key("target")
                 )
             )
+    case "machineEnroll":
+      self = .machineEnroll(try RuntimeMachineEnrollRequestV3(flattenedFrom: decoder))
+    case "machineRemoteStatus":
+      try runtimeV2RejectUnknownKeys(decoder, allowed: ["request", "scope"])
+      self = .machineRemoteStatus(
+        scope: try container.decode(
+          RuntimeLocalOnlyAdministrationV1.self,
+          forKey: runtimeV2Key("scope")
+        )
+      )
         case "trustReset":
-            try runtimeV2RejectUnknownKeys(decoder, allowed: ["request", "scope"])
+            try runtimeV2RejectUnknownKeys(
+              decoder,
+              allowed: [
+                "request", "scope", "uninstallPurge", "uninstallPurgePlan",
+                "adminPurgeReceipt",
+              ]
+            )
+            let uninstallPurge = try container.decodeIfPresent(
+              Bool.self,
+              forKey: runtimeV2Key("uninstallPurge")
+            ) ?? false
+            let uninstallPurgePlan = try container.decodeIfPresent(
+              RuntimeUninstallPurgePlanV1.self,
+              forKey: runtimeV2Key("uninstallPurgePlan")
+            )
+            guard uninstallPurge == (uninstallPurgePlan != nil) else {
+              throw RuntimeV3MirrorError.invalidUninstallPurgePlan
+            }
             self = .trustReset(
                 scope: try container.decode(
                     RuntimeLocalOnlyAdministrationV1.self,
                     forKey: runtimeV2Key("scope")
+                ),
+                uninstallPurge: uninstallPurge,
+                uninstallPurgePlan: uninstallPurgePlan,
+                adminPurgeReceipt: try container.decodeIfPresent(
+                  RuntimeRelayAdminPurgeReceiptV1.self,
+                  forKey: runtimeV2Key("adminPurgeReceipt")
                 )
             )
         case "stageUpgrade":
@@ -668,9 +713,33 @@ public enum RuntimeRequestV2: Codable, Sendable {
         case .revoke(let target):
             try container.encode("revoke", forKey: runtimeV2Key("request"))
             try container.encode(target, forKey: runtimeV2Key("target"))
-        case .trustReset(let scope):
+    case .machineEnroll(let request):
+      try request.encodeFlattenedFields(into: &container)
+    case .machineRemoteStatus(let scope):
+      try container.encode("machineRemoteStatus", forKey: runtimeV2Key("request"))
+      try container.encode(scope, forKey: runtimeV2Key("scope"))
+        case .trustReset(
+          let scope,
+          let uninstallPurge,
+          let uninstallPurgePlan,
+          let adminPurgeReceipt
+        ):
+            guard uninstallPurge == (uninstallPurgePlan != nil) else {
+              throw RuntimeV3MirrorError.invalidUninstallPurgePlan
+            }
             try container.encode("trustReset", forKey: runtimeV2Key("request"))
             try container.encode(scope, forKey: runtimeV2Key("scope"))
+            if uninstallPurge {
+              try container.encode(true, forKey: runtimeV2Key("uninstallPurge"))
+            }
+            try container.encodeIfPresent(
+              uninstallPurgePlan,
+              forKey: runtimeV2Key("uninstallPurgePlan")
+            )
+            try container.encodeIfPresent(
+              adminPurgeReceipt,
+              forKey: runtimeV2Key("adminPurgeReceipt")
+            )
         case .stageUpgrade(let request):
             try request.encodeFlattenedFields(into: &container)
         }
@@ -699,6 +768,7 @@ public enum RuntimeReplyV2: Codable, Sendable {
     case transferPart(TransferEnvelopeV2)
     case pairInvite(RuntimePairInviteV1)
     case pendingPairings([RuntimePendingPairingV1])
+  case machineRemoteStatus(RuntimeMachineRemoteStatusV3)
     case failure(RuntimeFailureV1)
 
     public init(from decoder: Decoder) throws {
@@ -766,6 +836,8 @@ public enum RuntimeReplyV2: Codable, Sendable {
                     forKey: runtimeV2Key("pairings")
                 )
             )
+    case "machineRemoteStatus":
+      self = .machineRemoteStatus(try RuntimeMachineRemoteStatusV3(flattenedFrom: decoder))
         case "failure":
             try runtimeV2RejectUnknownKeys(
                 decoder,
@@ -883,6 +955,8 @@ public enum RuntimeReplyV2: Codable, Sendable {
         case .pendingPairings(let pairings):
             try container.encode("pendingPairings", forKey: runtimeV2Key("reply"))
             try container.encode(pairings, forKey: runtimeV2Key("pairings"))
+    case .machineRemoteStatus(let status):
+      try status.encodeFlattenedFields(into: &container)
         case .failure(let failure):
             try container.encode("failure", forKey: runtimeV2Key("reply"))
             try container.encode(failure.code, forKey: runtimeV2Key("code"))
@@ -1002,7 +1076,7 @@ public enum RuntimeMessageV2: Codable, Sendable {
             throw DecodingError.dataCorruptedError(
                 forKey: .message,
                 in: container,
-                debugDescription: "unsupported Runtime v2 message \(value)"
+                debugDescription: "unsupported Runtime v3 message \(value)"
             )
         }
     }
@@ -1047,7 +1121,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
         )
         let container = try decoder.container(keyedBy: CodingKeys.self)
         version = try container.decode(UInt16.self, forKey: .version)
-        guard version == runtimeProtocolVersionV2 else {
+        guard version == runtimeProtocolVersionCurrent else {
             throw DecodingError.dataCorruptedError(
                 forKey: .version,
                 in: container,
@@ -1061,7 +1135,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
             throw DecodingError.dataCorruptedError(
                 forKey: .messageID,
                 in: container,
-                debugDescription: "Runtime v2 messageId must contain 1...1024 UTF-8 bytes"
+                debugDescription: "Runtime v3 messageId must contain 1...1024 UTF-8 bytes"
             )
         }
         messageID = RuntimeMessageID(rawValue: rawMessageID)
@@ -1069,7 +1143,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
     }
 
     public func encode(to encoder: Encoder) throws {
-        guard version == runtimeProtocolVersionV2 else {
+        guard version == runtimeProtocolVersionCurrent else {
             throw EncodingError.invalidValue(
                 version,
                 .init(
@@ -1085,7 +1159,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
                 messageID.rawValue,
                 .init(
                     codingPath: encoder.codingPath + [CodingKeys.messageID],
-                    debugDescription: "Runtime v2 messageId must contain 1...1024 UTF-8 bytes"
+                    debugDescription: "Runtime v3 messageId must contain 1...1024 UTF-8 bytes"
                 )
             )
         }
@@ -1096,7 +1170,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
     }
 }
 
-// MARK: - Current Runtime v2 wire entry points
+// MARK: - Current Runtime v3 wire entry points
 
 public enum RuntimeV2WireCodec {
     public static let maxRequestBytes = 1024 * 1024
@@ -1149,7 +1223,7 @@ public enum RuntimeV2WireCodec {
             throw RuntimeV2WireError.invalidTransferCarrier
         }
         let version = try reader.readUInt16()
-        guard version == runtimeProtocolVersionV2 else {
+        guard version == runtimeProtocolVersionCurrent else {
             throw RuntimeV2WireError.unsupportedVersion
         }
         guard let channel = RuntimeTransferChannelV2(rawValue: try reader.readUInt8()) else {
@@ -1193,7 +1267,7 @@ public enum RuntimeV2WireCodec {
     }
 
     public static func encode(_ value: RuntimeTransferCarrierV2) throws -> Data {
-        guard value.runtimeVersion == runtimeProtocolVersionV2 else {
+        guard value.runtimeVersion == runtimeProtocolVersionCurrent else {
             throw RuntimeV2WireError.unsupportedVersion
         }
         try value.transfer.validate(profile: .compact)

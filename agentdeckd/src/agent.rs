@@ -120,7 +120,7 @@ impl fmt::Debug for ExecutionId {
 }
 
 /// RuntimeCore 交给 adapter 的冷准备请求。只含 exact execution、绝对 cwd、
-/// 已通过 Runtime v2 256 KiB gate 的 prompt，以及 Store 按 command pin 认证并
+/// 已通过 Runtime v3 256 KiB gate 的 prompt，以及 Store 按 command pin 认证并
 /// 冻结的 configuration revision/value；不携带 session/thread 或 vendor identity。
 /// revision 0 只表达上层已实体化的 migration-era frozen defaults，adapter 不自行
 /// 查询 current head，也不解释 missing configuration。
@@ -1555,7 +1555,7 @@ pub trait Agent: Send + Sync + 'static {
     /// minimal capabilities + log a diagnostic.
     fn capabilities(&self) -> SessionCapabilities;
 
-    /// 返回该 adapter 冻结的 Runtime v2 新会话默认配置。
+    /// 返回该 adapter 冻结的 Runtime v3 新会话默认配置。
     ///
     /// 威胁场景：若 daemon 在 adapter 缺失或构造错误时回退到共享默认值，会把
     /// 一个 vendor 的权限配置绑定给另一个 vendor。该方法因此是 required，且

@@ -140,7 +140,9 @@ version = "0.1.0"
 dependencies = [
  "agentdeck-crypto",
  "agentdeck-protocol",
+ "agentdeck-relay-client",
  "async-trait",
+ "base64",
  "chacha20poly1305",
  "criterion",
  "getrandom 0.4.3",
@@ -154,6 +156,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "url",
  "uuid",
  "which",
  "zeroize",

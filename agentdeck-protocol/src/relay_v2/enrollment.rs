@@ -8,12 +8,97 @@
 //! bundle SPKI pin 验证（design §12.1）。
 
 use crate::e2ee::Enc;
+use crate::relay_v2::admin_receipt::RelayReceiptVerifyKeyV1;
 use crate::relay_v2::auth::{PublicKeyBytes, SignedCertificate};
 use crate::relay_v2::id::{MachineRouteId, RelayServerId, b64_32};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
+
+/// Relay admin 与 daemon/CLI 共用的 enrollment bundle wire 版本。
+pub const ENROLLMENT_BUNDLE_VERSION: u16 = 2;
+
+fn deserialize_enrollment_bundle_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u16::deserialize(deserializer)?;
+    if version == ENROLLMENT_BUNDLE_VERSION {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(
+            "unsupported enrollment bundle version",
+        ))
+    }
+}
+
+/// URL-safe、无 padding 的 32-byte digest wire DTO。
+///
+/// Enrollment bundle 用它携带 `SHA-256(DER SPKI)` pin；Relay admin 也复用同一
+/// wire 表示承载本机确认 fingerprint/hash，避免复制可漂移的 JSON primitive。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(transparent)]
+pub struct Digest32(#[schemars(with = "String")] pub [u8; 32]);
+
+impl std::fmt::Debug for Digest32 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Digest32(<redacted>)")
+    }
+}
+
+impl Serialize for Digest32 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&URL_SAFE_NO_PAD.encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Digest32 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(value.as_bytes())
+            .map_err(serde::de::Error::custom)?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("expected a 32-byte digest"))?;
+        Ok(Self(bytes))
+    }
+}
+
+/// 本机 admin 创建、经用户控制的带外通道交给 daemon/CLI 的 enrollment bundle。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnrollmentBundleV2 {
+    #[serde(deserialize_with = "deserialize_enrollment_bundle_version")]
+    #[schemars(range(min = 2, max = 2))]
+    pub version: u16,
+    pub public_wss_url: String,
+    pub relay_server_id: RelayServerId,
+    pub receipt_verify_key: RelayReceiptVerifyKeyV1,
+    pub code: EnrollmentCode,
+    pub spki_pins: Vec<Digest32>,
+    pub expires_at_ms: u64,
+}
+
+impl std::fmt::Debug for EnrollmentBundleV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnrollmentBundleV2")
+            .field("version", &self.version)
+            .field("relay_server_id", &self.relay_server_id.redacted())
+            .field("secret_material", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
 
 /// enrollment code 是 secret，不能复用通用 base64 helper 的普通 String/Vec 临时分配。
 mod secret_b64_32 {
@@ -119,12 +204,76 @@ pub struct MachineEnrollmentResponseV1 {
     pub receipt_hash: [u8; 32],
 }
 
+/// Enrollment response 在持久化/比对 canonical terminal 前的绑定校验错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MachineEnrollmentResponseError {
+    #[error("machine enrollment response required field is all-zero: {0}")]
+    ZeroBoundField(&'static str),
+}
+
 impl std::fmt::Debug for MachineEnrollmentResponseV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("MachineEnrollmentResponseV1")
             .field("enrollment_receipt", &"<redacted>")
             .finish()
+    }
+}
+
+impl MachineEnrollmentResponseV1 {
+    /// 构造一个已验证的 response；保留公开字段以兼容既有 wire DTO 调用方。
+    pub fn new(
+        relay_server_id: RelayServerId,
+        machine_route: MachineRouteId,
+        trust_epoch: u64,
+        receipt_hash: [u8; 32],
+    ) -> Result<Self, MachineEnrollmentResponseError> {
+        let response = Self {
+            relay_server_id,
+            machine_route,
+            trust_epoch,
+            receipt_hash,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn validate(&self) -> Result<(), MachineEnrollmentResponseError> {
+        if self.relay_server_id.as_bytes() == &[0; 16] {
+            return Err(MachineEnrollmentResponseError::ZeroBoundField(
+                "relayServerId",
+            ));
+        }
+        if self.machine_route.as_bytes() == &[0; 16] {
+            return Err(MachineEnrollmentResponseError::ZeroBoundField(
+                "machineRoute",
+            ));
+        }
+        if self.trust_epoch == 0 {
+            return Err(MachineEnrollmentResponseError::ZeroBoundField("trustEpoch"));
+        }
+        if self.receipt_hash == [0; 32] {
+            return Err(MachineEnrollmentResponseError::ZeroBoundField(
+                "receiptHash",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 与 JSON 字段顺序无关的 deterministic response terminal bytes。
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, MachineEnrollmentResponseError> {
+        self.validate()?;
+        let mut encoder = Enc::new();
+        encoder.domain(b"AgentDeck/MachineEnrollmentResponseV1\0");
+        encoder.bytes(self.relay_server_id.as_bytes());
+        encoder.bytes(self.machine_route.as_bytes());
+        encoder.u64(self.trust_epoch);
+        encoder.bytes(&self.receipt_hash);
+        Ok(encoder.finish())
+    }
+
+    pub fn canonical_sha256(&self) -> Result<[u8; 32], MachineEnrollmentResponseError> {
+        Ok(Sha256::digest(self.canonical_bytes()?).into())
     }
 }
 

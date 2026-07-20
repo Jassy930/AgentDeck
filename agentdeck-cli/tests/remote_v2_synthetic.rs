@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentdeck_crypto::sha256;
+use agentdeck_crypto::{SigningKey, ValidatedRelayReceiptSignerIdentityV1, sha256};
 use agentdeck_protocol::relay_v2::EnrollmentCode;
 use agentdeck_relay::config::{
-    RelayV2AdminConfig, RelayV2ServerConfig, RelayV2StoreSettings, RelayV2TlsPaths,
-    RelayV2TransportMode,
+    RelayReceiptSigningKeyPath, RelayV2AdminConfig, RelayV2ServerConfig, RelayV2StoreSettings,
+    RelayV2TlsPaths, RelayV2TransportMode,
 };
-use agentdeck_relay::v2::admin::protocol::{ADMIN_PROTOCOL_VERSION, Digest32, EnrollmentBundleV1};
+use agentdeck_relay::v2::admin::protocol::{ADMIN_PROTOCOL_VERSION, Digest32, EnrollmentBundleV2};
 use agentdeck_relay::v2::server::RelayV2ServerHandle;
 use agentdeck_relay::v2::server::tls::{TlsIdentityPaths, load_tls_identity};
 use agentdeck_relay::v2::store::{
@@ -60,7 +60,7 @@ async fn prepare_real_relay(
 ) -> (
     RelayV2ServerHandle,
     RelayV2StoreSettings,
-    EnrollmentBundleV1,
+    EnrollmentBundleV2,
     PathBuf,
 ) {
     let public_port = reserve_loopback_port();
@@ -88,10 +88,23 @@ async fn prepare_real_relay(
     rand::rngs::OsRng.fill_bytes(&mut code_bytes);
     let code = EnrollmentCode(code_bytes);
     let expires_at_ms = unix_now_ms().saturating_add(5 * 60 * 1_000);
+    let receipt_seed = [0x71_u8; 32];
+    let canonical_temp =
+        std::fs::canonicalize(temp.path()).expect("canonicalize temporary Relay directory");
+    std::fs::set_permissions(&canonical_temp, std::fs::Permissions::from_mode(0o700))
+        .expect("secure temporary Relay directory");
+    let receipt_signing_key = canonical_temp.join("receipt-signing.seed");
+    std::fs::write(&receipt_signing_key, receipt_seed).expect("write receipt signer seed");
+    std::fs::set_permissions(&receipt_signing_key, std::fs::Permissions::from_mode(0o600))
+        .expect("secure receipt signer seed");
+    let receipt_signer_identity = ValidatedRelayReceiptSignerIdentityV1::from_signing_key(
+        &SigningKey::from_seed(&receipt_seed),
+    )
+    .expect("valid receipt signer identity");
     let seed_store = RelayStoreHandle::open(
         store_settings
             .clone()
-            .into_store_config()
+            .into_store_config(receipt_signer_identity)
             .expect("store config"),
     )
     .await
@@ -119,15 +132,21 @@ async fn prepare_real_relay(
             public_wss_url: public_wss_url.clone(),
             spki_pins: vec![pin],
         }),
+        receipt_signing_key: RelayReceiptSigningKeyPath::new(receipt_signing_key),
         log_level: "warn".to_owned(),
     };
     let handle = RelayV2ServerHandle::start(config)
         .await
         .expect("start real DirectTLS Relay v2");
-    let bundle = EnrollmentBundleV1 {
+    let bundle = EnrollmentBundleV2 {
         version: ADMIN_PROTOCOL_VERSION,
         public_wss_url,
         relay_server_id,
+        receipt_verify_key: receipt_signer_identity
+            .bind_to_relay(relay_server_id)
+            .expect("bind receipt signer to Relay")
+            .wire_anchor()
+            .clone(),
         code,
         spki_pins: vec![Digest32(pin)],
         expires_at_ms,
@@ -213,7 +232,12 @@ async fn remote_synthetic_drives_a_real_direct_tls_relay_and_persists_the_full_f
     let readback_store = RelayStoreHandle::open(
         store_settings
             .clone()
-            .into_store_config()
+            .into_store_config(
+                ValidatedRelayReceiptSignerIdentityV1::from_signing_key(&SigningKey::from_seed(
+                    &[0x71; 32],
+                ))
+                .expect("valid readback receipt signer identity"),
+            )
             .expect("readback config"),
     )
     .await

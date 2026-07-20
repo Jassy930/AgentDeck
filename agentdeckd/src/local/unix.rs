@@ -428,11 +428,169 @@ fn map_writer_join(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use tokio::io::AsyncReadExt;
+    use agentdeck_protocol::runtime::command::{HelloParams, MachineEnrollRequest};
+    use agentdeck_protocol::runtime::identity::MessageId;
+    use agentdeck_protocol::runtime::{
+        LocalOnlyAdministration, MachineRemoteLifecycle, MachineRemoteStatus,
+        RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeRequest,
+        TrustResetRequest,
+    };
+    use async_trait::async_trait;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     use super::*;
+    use crate::runtime::remote_administration::{RemoteAdministration, RemoteAdministrationError};
+    use crate::runtime::store::{RuntimeStoreConfig, RuntimeStoreHandle};
+    use crate::runtime::{AgentRouter, RuntimeCore};
+    use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
+
+    #[derive(Default)]
+    struct UdsRemoteAdministration {
+        status_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RemoteAdministration for UdsRemoteAdministration {
+        async fn enroll(
+            &self,
+            _request: MachineEnrollRequest,
+        ) -> Result<MachineRemoteStatus, RemoteAdministrationError> {
+            unreachable!("UDS status test never enrolls")
+        }
+
+        async fn status(&self) -> Result<MachineRemoteStatus, RemoteAdministrationError> {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+            MachineRemoteStatus::new(
+                MachineRemoteLifecycle::Unenrolled,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .map_err(|_| RemoteAdministrationError::new("daemon.remote.test.invalid_status"))
+        }
+
+        async fn trust_reset(
+            &self,
+            _request: TrustResetRequest,
+        ) -> Result<MachineRemoteStatus, RemoteAdministrationError> {
+            unreachable!("UDS status test never resets trust")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_same_uid_uds_dispatches_machine_status_through_neutral_service() {
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        let root = Path::new("/tmp").join(format!(
+            "agentdeck-remote-admin-uds-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).expect("create UDS test root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("secure UDS test root");
+        }
+        let keys = MemoryKeyStore::new();
+        let kek = load_or_create_storage_kek(&keys, &root.join("key-state.db"))
+            .expect("create UDS test StorageKEK");
+        let store = RuntimeStoreHandle::open(RuntimeStoreConfig::new(root.join("runtime.db")), kek)
+            .await
+            .expect("open UDS test Store");
+        let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+        let administration = Arc::new(UdsRemoteAdministration::default());
+        let core = Arc::new(
+            RuntimeCore::new(store, router, [0xA9; 32])
+                .expect("construct UDS test Core")
+                .with_remote_administration(administration.clone()),
+        );
+        core.recover().await.expect("recover UDS test Core");
+
+        let socket = root.join("runtime.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind real UDS");
+        let server_core = core.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept real UDS");
+            serve_accepted_stream(stream, server_core).await
+        });
+        let stream = UnixStream::connect(&socket)
+            .await
+            .expect("connect real UDS");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let preface = serde_json::json!({
+            "localProtocolVersion": 1,
+            "clientInstallationId": "123e4567-e89b-12d3-a456-426614174099"
+        });
+        writer
+            .write_all(&serde_json::to_vec(&preface).unwrap())
+            .await
+            .unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        let hello = RuntimeEnvelope {
+            version: RUNTIME_PROTOCOL_VERSION,
+            message_id: MessageId::new("remote-admin-hello"),
+            body: RuntimeMessage::Request(RuntimeRequest::Hello(HelloParams {
+                runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            })),
+        };
+        writer
+            .write_all(&hello.to_json_bytes_checked().unwrap())
+            .await
+            .unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).await.unwrap();
+        let reply: RuntimeEnvelope = serde_json::from_slice(&line).expect("decode Hello reply");
+        assert!(matches!(
+            reply.body,
+            RuntimeMessage::Reply(RuntimeReply::Hello(_))
+        ));
+
+        let status = RuntimeEnvelope {
+            version: RUNTIME_PROTOCOL_VERSION,
+            message_id: MessageId::new("remote-admin-status"),
+            body: RuntimeMessage::Request(RuntimeRequest::MachineRemoteStatus {
+                scope: LocalOnlyAdministration::LocalOnly,
+            }),
+        };
+        writer
+            .write_all(&status.to_json_bytes_checked().unwrap())
+            .await
+            .unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.flush().await.unwrap();
+        line.clear();
+        reader.read_until(b'\n', &mut line).await.unwrap();
+        let reply: RuntimeEnvelope = serde_json::from_slice(&line).expect("decode status reply");
+        assert!(matches!(
+            reply.body,
+            RuntimeMessage::Reply(RuntimeReply::MachineRemoteStatus(MachineRemoteStatus {
+                lifecycle: MachineRemoteLifecycle::Unenrolled,
+                ..
+            }))
+        ));
+        assert_eq!(administration.status_calls.load(Ordering::SeqCst), 1);
+
+        drop((writer, reader));
+        server
+            .await
+            .expect("join real UDS actor")
+            .expect("serve real UDS actor");
+        core.shutdown().await.expect("shutdown UDS test Core");
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn core_cancellation_exits_writer_without_ack_or_hello_ready() {

@@ -280,7 +280,7 @@ final class RelayCryptoVectorTests: XCTestCase {
             objectType: .relayGrant,
             signatureFormatVersion: 1,
             relayProtocolVersion: 2,
-            runtimeProtocolVersion: 2,
+            runtimeProtocolVersion: 3,
             e2eeFormatVersion: 1,
             relayServerID: Data(repeating: 0x88, count: 16),
             machineRoute: Data(repeating: 0x11, count: 16),

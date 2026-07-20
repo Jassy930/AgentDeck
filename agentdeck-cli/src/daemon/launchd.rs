@@ -6,7 +6,7 @@ use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
@@ -21,6 +21,7 @@ pub const LAUNCH_AGENT_LABEL: &str = "com.agentdeck.agentdeckd";
 const PLIST_BASENAME: &str = "com.agentdeck.agentdeckd.plist";
 const CURRENT_BASENAME: &str = "current";
 const DAEMON_BASENAME: &str = "agentdeckd";
+const PURGE_RETAINED_HELPER_BASENAME: &str = "purge-retained-agentdeckd-v1";
 const LAUNCH_AGENT_PLIST_TEMPLATE: &str =
     include_str!("../../../packaging/com.agentdeck.agentdeckd.plist.in");
 
@@ -108,6 +109,11 @@ impl DaemonInstallPaths {
     #[must_use]
     pub fn version_daemon(&self, version: &str) -> PathBuf {
         self.version_directory(version).join(DAEMON_BASENAME)
+    }
+
+    #[must_use]
+    pub fn purge_retained_helper(&self) -> PathBuf {
+        self.data_root.join(PURGE_RETAINED_HELPER_BASENAME)
     }
 }
 
@@ -244,6 +250,7 @@ impl<R: LaunchctlRunner> DaemonLifecycle<R> {
     ) -> Result<DaemonInstallOutcome, LifecycleError> {
         let version = installer.expected_version();
         validate_version_component(version)?;
+        require_purge_retained_anchor_absent(&self.paths)?;
         self.prepare_install_directories(version)?;
         let version_directory = self.paths.version_directory(version);
         let artifact = match injected_source {
@@ -301,11 +308,13 @@ impl<R: LaunchctlRunner> DaemonLifecycle<R> {
     }
 
     /// 默认只卸载 LaunchAgent 与 binaries；Runtime DB/Keychain/data root 始终保留。
-    /// `--purge` 在 P4 trust-reset 完成前必须零副作用拒绝。
+    /// 完整 purge 只能走上层 `PurgeCoordinator`；这个低层生命周期入口始终拒绝，
+    /// 防止调用方绕过 trust-reset/marker/stopped-daemon 两阶段门禁。
     pub fn uninstall(&self, purge: bool) -> Result<(), LifecycleError> {
         if purge {
             return Err(LifecycleError::PurgeRemoteNotReady);
         }
+        require_purge_retained_anchor_absent(&self.paths)?;
         // SAFETY: geteuid has no preconditions and only reads process credentials.
         let uid = unsafe { libc::geteuid() };
         if let Some(readback) = self.runner.readback(uid)? {
@@ -315,22 +324,7 @@ impl<R: LaunchctlRunner> DaemonLifecycle<R> {
         if self.runner.readback(uid)?.is_some() {
             return Err(LifecycleError::StillLoaded);
         }
-        remove_file_if_present(self.paths.plist())?;
-        if self.paths.bin_root.exists() {
-            let metadata = std::fs::symlink_metadata(&self.paths.bin_root)
-                .map_err(|source| io("inspect daemon bin root", &self.paths.bin_root, source))?;
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(LifecycleError::UnsafePath {
-                    path: self.paths.bin_root.clone(),
-                    reason: "bin root is not a directory",
-                });
-            }
-            std::fs::remove_dir_all(&self.paths.bin_root)
-                .map_err(|source| io("remove daemon binaries", &self.paths.bin_root, source))?;
-            sync_parent(&self.paths.bin_root)?;
-        }
-        sync_parent(self.paths.plist())?;
-        Ok(())
+        remove_install_layout_exact(&self.paths)
     }
 
     fn prepare_install_directories(&self, version: &str) -> Result<(), LifecycleError> {
@@ -350,6 +344,8 @@ pub enum LifecycleError {
     UnsupportedPlatform,
     #[error("unsafe daemon install path {path}: {reason}")]
     UnsafePath { path: PathBuf, reason: &'static str },
+    #[error("daemon purge recovery must finish before install lifecycle mutation")]
+    PurgeRecoveryRequired,
     #[error("launchctl {operation} failed: {detail}")]
     Launchctl {
         operation: &'static str,
@@ -380,6 +376,7 @@ impl LifecycleError {
             Self::Installation(error) => error.code(),
             Self::UnsupportedPlatform => "daemon.install.unsupported_platform",
             Self::UnsafePath { .. } => "daemon.install.path_unsafe",
+            Self::PurgeRecoveryRequired => "daemon.install.purge_recovery_required",
             Self::Launchctl { .. } => "daemon.launchctl.failed",
             Self::StillLoaded => "daemon.uninstall.still_loaded",
             Self::LoadedServiceMismatch => "daemon.launchctl.loaded_service_mismatch",
@@ -490,7 +487,9 @@ fn set_current(paths: &DaemonInstallPaths, version: &str) -> Result<(), Lifecycl
         .map_err(|source| io("sync daemon bin root", &paths.bin_root, source))
 }
 
-fn read_current_version(paths: &DaemonInstallPaths) -> Result<Option<String>, LifecycleError> {
+pub(super) fn read_current_version(
+    paths: &DaemonInstallPaths,
+) -> Result<Option<String>, LifecycleError> {
     let link = paths.current_link();
     let metadata = match std::fs::symlink_metadata(&link) {
         Ok(metadata) => metadata,
@@ -519,7 +518,7 @@ fn read_current_version(paths: &DaemonInstallPaths) -> Result<Option<String>, Li
     Ok(Some(version.to_owned()))
 }
 
-fn validate_loaded_service(
+pub(super) fn validate_loaded_service(
     paths: &DaemonInstallPaths,
     readback: &LaunchAgentReadback,
 ) -> Result<(), LifecycleError> {
@@ -668,14 +667,421 @@ fn regular_file_if_present(path: &Path) -> Result<bool, LifecycleError> {
     }
 }
 
-fn remove_file_if_present(path: &Path) -> Result<(), LifecycleError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {
-            std::fs::remove_file(path).map_err(|source| io("remove installed file", path, source))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(io("inspect installed file", path, source)),
+/// 只删除完整预检过的固定 install layout。目录枚举只用于冻结 exact version
+/// components；任何未知 entry、symlink/hardlink、owner/mode 异常都在首笔删除前拒绝。
+pub(super) fn remove_install_layout_exact(
+    paths: &DaemonInstallPaths,
+) -> Result<(), LifecycleError> {
+    #[derive(Clone)]
+    struct VersionEntry {
+        directory: PathBuf,
+        helper: PathBuf,
     }
+
+    require_purge_retained_anchor_absent(paths)?;
+    let plist_present = exact_regular_if_present(paths.plist(), 0o600)?;
+    let bin_metadata = match std::fs::symlink_metadata(paths.bin_root()) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if plist_present {
+                std::fs::remove_file(paths.plist())
+                    .map_err(|source| io("remove daemon plist", paths.plist(), source))?;
+                ensure_absent(paths.plist())?;
+                sync_parent(paths.plist())?;
+            }
+            return Ok(());
+        }
+        Err(source) => return Err(io("inspect daemon bin root", paths.bin_root(), source)),
+    };
+    validate_owned_directory(paths.bin_root(), &bin_metadata, 0o700)?;
+
+    let mut current = None;
+    let mut versions = Vec::new();
+    for entry in std::fs::read_dir(paths.bin_root())
+        .map_err(|source| io("read daemon bin root", paths.bin_root(), source))?
+    {
+        let entry =
+            entry.map_err(|source| io("read daemon bin entry", paths.bin_root(), source))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| LifecycleError::UnsafePath {
+                path: entry.path(),
+                reason: "install entry is not UTF-8",
+            })?;
+        if name == CURRENT_BASENAME {
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .map_err(|source| io("inspect current symlink", &entry.path(), source))?;
+            if !metadata.file_type().is_symlink()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+            {
+                return Err(unsafe_path(entry.path(), "current symlink is unsafe"));
+            }
+            let target = std::fs::read_link(entry.path())
+                .map_err(|source| io("read current symlink", &entry.path(), source))?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| unsafe_path(entry.path(), "current target is not UTF-8"))?;
+            validate_version_component(target)?;
+            if Path::new(target).components().count() != 1 {
+                return Err(unsafe_path(
+                    entry.path(),
+                    "current target is not one component",
+                ));
+            }
+            current = Some((entry.path(), target.to_owned()));
+            continue;
+        }
+        validate_version_component(&name)?;
+        if versions.len() >= 32 {
+            return Err(unsafe_path(entry.path(), "too many installed versions"));
+        }
+        let directory = entry.path();
+        let metadata = std::fs::symlink_metadata(&directory)
+            .map_err(|source| io("inspect version directory", &directory, source))?;
+        validate_owned_directory(&directory, &metadata, 0o700)?;
+        let helper = directory.join(DAEMON_BASENAME);
+        if !exact_regular_if_present(&helper, 0o500)? {
+            return Err(unsafe_path(helper, "version helper is missing"));
+        }
+        let children = std::fs::read_dir(&directory)
+            .map_err(|source| io("read version directory", &directory, source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| io("read version entry", &directory, source))?;
+        if children.len() != 1 || children[0].file_name() != DAEMON_BASENAME {
+            return Err(unsafe_path(
+                directory,
+                "version directory has unknown entries",
+            ));
+        }
+        versions.push((name, VersionEntry { directory, helper }));
+    }
+    if current
+        .as_ref()
+        .is_some_and(|(_, target)| !versions.iter().any(|(version, _)| version == target))
+    {
+        return Err(unsafe_path(
+            paths.current_link(),
+            "current target is not an installed version",
+        ));
+    }
+
+    if plist_present {
+        std::fs::remove_file(paths.plist())
+            .map_err(|source| io("remove daemon plist", paths.plist(), source))?;
+        ensure_absent(paths.plist())?;
+    }
+    if let Some((link, _)) = current {
+        std::fs::remove_file(&link)
+            .map_err(|source| io("remove current symlink", &link, source))?;
+        ensure_absent(&link)?;
+    }
+    for (_, version) in versions {
+        std::fs::remove_file(&version.helper)
+            .map_err(|source| io("remove version helper", &version.helper, source))?;
+        ensure_absent(&version.helper)?;
+        std::fs::remove_dir(&version.directory)
+            .map_err(|source| io("remove version directory", &version.directory, source))?;
+        ensure_absent(&version.directory)?;
+    }
+    std::fs::remove_dir(paths.bin_root())
+        .map_err(|source| io("remove daemon bin root", paths.bin_root(), source))?;
+    ensure_absent(paths.bin_root())?;
+    sync_parent(paths.bin_root())?;
+    sync_parent(paths.plist())
+}
+
+fn require_purge_retained_anchor_absent(paths: &DaemonInstallPaths) -> Result<(), LifecycleError> {
+    match std::fs::symlink_metadata(paths.purge_retained_helper()) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(LifecycleError::PurgeRecoveryRequired),
+        Err(source) => Err(io(
+            "inspect purge retained helper",
+            &paths.purge_retained_helper(),
+            source,
+        )),
+    }
+}
+
+/// finalizer 成功后把最后一个已签名 helper 原子移到固定 flat crash anchor。
+/// rename 前完整验证 terminal install layout；destination 必须 absent，绝不覆盖。
+pub(super) fn publish_purge_retained_helper(
+    paths: &DaemonInstallPaths,
+    version: &str,
+) -> Result<PathBuf, LifecycleError> {
+    validate_version_component(version)?;
+    ensure_absent(paths.plist())?;
+    ensure_absent(&paths.current_link())?;
+    ensure_absent(&paths.purge_retained_helper())?;
+
+    let bin_metadata = std::fs::symlink_metadata(paths.bin_root())
+        .map_err(|source| io("inspect daemon bin root", paths.bin_root(), source))?;
+    validate_owned_directory(paths.bin_root(), &bin_metadata, 0o700)?;
+    let versions = std::fs::read_dir(paths.bin_root())
+        .map_err(|source| io("read daemon bin root", paths.bin_root(), source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| io("read daemon bin entry", paths.bin_root(), source))?;
+    let version_directory = paths.version_directory(version);
+    if versions.len() != 1 || versions[0].path() != version_directory {
+        return Err(unsafe_path(
+            paths.bin_root().to_path_buf(),
+            "purge retained version is not unique",
+        ));
+    }
+    let version_metadata = std::fs::symlink_metadata(&version_directory).map_err(|source| {
+        io(
+            "inspect retained version directory",
+            &version_directory,
+            source,
+        )
+    })?;
+    validate_owned_directory(&version_directory, &version_metadata, 0o700)?;
+    let helper = paths.version_daemon(version);
+    if !exact_regular_if_present(&helper, 0o500)? {
+        return Err(unsafe_path(helper, "purge retained helper is missing"));
+    }
+    let children = std::fs::read_dir(&version_directory)
+        .map_err(|source| {
+            io(
+                "read retained version directory",
+                &version_directory,
+                source,
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| io("read retained version entry", &version_directory, source))?;
+    if children.len() != 1 || children[0].path() != helper {
+        return Err(unsafe_path(
+            version_directory,
+            "purge retained version contains unknown entries",
+        ));
+    }
+    let before = std::fs::symlink_metadata(&helper)
+        .map_err(|source| io("inspect purge retained helper", &helper, source))?;
+    let anchor = paths.purge_retained_helper();
+    std::fs::rename(&helper, &anchor)
+        .map_err(|source| io("publish purge retained helper", &anchor, source))?;
+    let after = std::fs::symlink_metadata(&anchor)
+        .map_err(|source| io("read back purge retained helper", &anchor, source))?;
+    if !same_regular_identity(&before, &after, 0o500) {
+        return Err(unsafe_path(
+            anchor,
+            "purge retained helper identity changed during publish",
+        ));
+    }
+    ensure_absent(&helper)?;
+    // rename 同时改变 source version directory 与 destination data_root；两个目录
+    // 都必须在返回前 fsync。若任一 sync 失败，anchor 仍保留且公开 retry 可重新证明。
+    sync_parent(&helper)?;
+    sync_parent(&paths.purge_retained_helper())?;
+    Ok(paths.purge_retained_helper())
+}
+
+/// 只读验证 flat crash anchor 及 rename 后可能残留的空 version/bin prefix。
+pub(super) fn validate_purge_retained_anchor_layout(
+    paths: &DaemonInstallPaths,
+    version: &str,
+) -> Result<(), LifecycleError> {
+    validate_version_component(version)?;
+    ensure_absent(paths.plist())?;
+    ensure_absent(&paths.current_link())?;
+    if !exact_regular_if_present(&paths.purge_retained_helper(), 0o500)? {
+        return Err(unsafe_path(
+            paths.purge_retained_helper(),
+            "purge retained anchor is missing",
+        ));
+    }
+    ensure_absent(&paths.version_daemon(version))?;
+    let bin_metadata = match std::fs::symlink_metadata(paths.bin_root()) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(io("inspect daemon bin root", paths.bin_root(), source)),
+    };
+    validate_owned_directory(paths.bin_root(), &bin_metadata, 0o700)?;
+    let entries = std::fs::read_dir(paths.bin_root())
+        .map_err(|source| io("read daemon bin root", paths.bin_root(), source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| io("read daemon bin entry", paths.bin_root(), source))?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let version_directory = paths.version_directory(version);
+    if entries.len() != 1 || entries[0].path() != version_directory {
+        return Err(unsafe_path(
+            paths.bin_root().to_path_buf(),
+            "purge retained anchor has ambiguous bin residue",
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&version_directory).map_err(|source| {
+        io(
+            "inspect retained version residue",
+            &version_directory,
+            source,
+        )
+    })?;
+    validate_owned_directory(&version_directory, &metadata, 0o700)?;
+    if std::fs::read_dir(&version_directory)
+        .map_err(|source| io("read retained version residue", &version_directory, source))?
+        .next()
+        .is_some()
+    {
+        return Err(unsafe_path(
+            version_directory,
+            "purge retained version residue is not empty",
+        ));
+    }
+    Ok(())
+}
+
+/// 在 anchor 已通过 helper terminal proof 后清理空目录 prefix，最后一个 mutating
+/// syscall 才 unlink flat anchor。任一中间 crash 都仍保留可执行恢复锚点。
+pub(super) fn finish_purge_retained_cleanup_exact(
+    paths: &DaemonInstallPaths,
+    version: &str,
+) -> Result<(), LifecycleError> {
+    validate_purge_retained_anchor_layout(paths, version)?;
+    if paths.bin_root().exists() {
+        let version_directory = paths.version_directory(version);
+        if version_directory.exists() {
+            std::fs::remove_dir(&version_directory).map_err(|source| {
+                io(
+                    "remove retained version residue",
+                    &version_directory,
+                    source,
+                )
+            })?;
+            ensure_absent(&version_directory)?;
+        }
+        std::fs::remove_dir(paths.bin_root())
+            .map_err(|source| io("remove daemon bin root", paths.bin_root(), source))?;
+        ensure_absent(paths.bin_root())?;
+        sync_parent(paths.bin_root())?;
+    }
+    if !exact_regular_if_present(&paths.purge_retained_helper(), 0o500)? {
+        return Err(unsafe_path(
+            paths.purge_retained_helper(),
+            "purge retained anchor changed before unlink",
+        ));
+    }
+    std::fs::remove_file(paths.purge_retained_helper()).map_err(|source| {
+        io(
+            "remove purge retained helper",
+            &paths.purge_retained_helper(),
+            source,
+        )
+    })?;
+    ensure_absent(&paths.purge_retained_helper())?;
+    sync_parent(&paths.purge_retained_helper())
+}
+
+/// 全 absent retry 的 durability barrier。只打开已验证的稳定 data root，不创建、
+/// chmod 或跟随 symlink；sync 后调用方必须再次读回完整 terminal absence。
+pub(super) fn sync_purge_data_root_exact(paths: &DaemonInstallPaths) -> Result<(), LifecycleError> {
+    let before = std::fs::symlink_metadata(paths.data_root())
+        .map_err(|source| io("inspect purge data root", paths.data_root(), source))?;
+    validate_owned_directory(paths.data_root(), &before, 0o700)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(paths.data_root())
+        .map_err(|source| io("open purge data root for sync", paths.data_root(), source))?;
+    let opened = directory
+        .metadata()
+        .map_err(|source| io("inspect opened purge data root", paths.data_root(), source))?;
+    validate_owned_directory(paths.data_root(), &opened, 0o700)?;
+    if before.dev() != opened.dev()
+        || before.ino() != opened.ino()
+        || before.uid() != opened.uid()
+        || before.nlink() != opened.nlink()
+        || before.permissions().mode() & 0o7777 != opened.permissions().mode() & 0o7777
+    {
+        return Err(unsafe_path(
+            paths.data_root().to_path_buf(),
+            "purge data root identity changed before sync",
+        ));
+    }
+    directory
+        .sync_all()
+        .map_err(|source| io("sync purge data root", paths.data_root(), source))?;
+    let after = std::fs::symlink_metadata(paths.data_root())
+        .map_err(|source| io("read back purge data root sync", paths.data_root(), source))?;
+    validate_owned_directory(paths.data_root(), &after, 0o700)?;
+    if opened.dev() != after.dev()
+        || opened.ino() != after.ino()
+        || opened.uid() != after.uid()
+        || opened.nlink() != after.nlink()
+        || opened.permissions().mode() & 0o7777 != after.permissions().mode() & 0o7777
+    {
+        return Err(unsafe_path(
+            paths.data_root().to_path_buf(),
+            "purge data root identity changed after sync",
+        ));
+    }
+    Ok(())
+}
+
+fn same_regular_identity(before: &std::fs::Metadata, after: &std::fs::Metadata, mode: u32) -> bool {
+    before.file_type().is_file()
+        && after.file_type().is_file()
+        && !before.file_type().is_symlink()
+        && !after.file_type().is_symlink()
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.uid() == unsafe { libc::geteuid() }
+        && after.uid() == unsafe { libc::geteuid() }
+        && before.nlink() == 1
+        && after.nlink() == 1
+        && before.permissions().mode() & 0o7777 == mode
+        && after.permissions().mode() & 0o7777 == mode
+}
+
+fn exact_regular_if_present(path: &Path, mode: u32) -> Result<bool, LifecycleError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(io("inspect installed file", path, source)),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o7777 != mode
+    {
+        return Err(unsafe_path(path.to_path_buf(), "installed file is unsafe"));
+    }
+    Ok(true)
+}
+
+fn validate_owned_directory(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    mode: u32,
+) -> Result<(), LifecycleError> {
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() == 0
+        || metadata.permissions().mode() & 0o7777 != mode
+    {
+        return Err(unsafe_path(
+            path.to_path_buf(),
+            "installed directory is unsafe",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_absent(path: &Path) -> Result<(), LifecycleError> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(unsafe_path(path.to_path_buf(), "deletion readback failed")),
+        Err(source) => Err(io("read back deletion", path, source)),
+    }
+}
+
+fn unsafe_path(path: PathBuf, reason: &'static str) -> LifecycleError {
+    LifecycleError::UnsafePath { path, reason }
 }
 
 fn sync_parent(path: &Path) -> Result<(), LifecycleError> {
@@ -1164,6 +1570,92 @@ mod tests {
                 "bootout",
                 "print"
             ]
+        );
+    }
+
+    #[test]
+    fn install_rejects_flat_purge_anchor_before_directories_or_launchctl() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        fs::create_dir(&home).expect("home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).expect("home mode");
+        let source = source(root.path());
+        let paths = DaemonInstallPaths::injected_for_test(home).expect("paths");
+        fs::create_dir_all(paths.data_root()).expect("data root");
+        fs::set_permissions(paths.data_root(), fs::Permissions::from_mode(0o700))
+            .expect("data root mode");
+        fs::write(paths.purge_retained_helper(), b"retained").expect("anchor");
+        fs::set_permissions(
+            paths.purge_retained_helper(),
+            fs::Permissions::from_mode(0o500),
+        )
+        .expect("anchor mode");
+        let anchor_before = fs::read(paths.purge_retained_helper()).expect("anchor baseline");
+        let runner = FakeLaunchctl::for_paths(&paths);
+        let lifecycle = DaemonLifecycle::injected_for_test(paths.clone(), runner.clone());
+
+        let error = lifecycle
+            .install_from_source_for_test(&installer("1.2.3"), &source)
+            .expect_err("purge anchor blocks install");
+
+        assert_eq!(error.code(), "daemon.install.purge_recovery_required");
+        assert!(runner.calls().is_empty());
+        assert!(!paths.bin_root().exists());
+        assert!(!paths.plist().exists());
+        assert_eq!(
+            fs::read(paths.purge_retained_helper()).expect("anchor readback"),
+            anchor_before
+        );
+    }
+
+    #[test]
+    fn default_and_low_level_uninstall_reject_anchor_before_launchctl_or_mutation() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        fs::create_dir(&home).expect("home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).expect("home mode");
+        let source = source(root.path());
+        let paths = DaemonInstallPaths::injected_for_test(home).expect("paths");
+        let runner = FakeLaunchctl::for_paths(&paths);
+        let lifecycle = DaemonLifecycle::injected_for_test(paths.clone(), runner.clone());
+        lifecycle
+            .install_from_source_for_test(&installer("1.2.3"), &source)
+            .expect("install");
+        fs::write(paths.purge_retained_helper(), b"retained").expect("anchor");
+        fs::set_permissions(
+            paths.purge_retained_helper(),
+            fs::Permissions::from_mode(0o500),
+        )
+        .expect("anchor mode");
+        let calls_before = runner.calls();
+        let helper_before = fs::read(paths.version_daemon("1.2.3")).expect("helper baseline");
+        let plist_before = fs::read(paths.plist()).expect("plist baseline");
+
+        let error = lifecycle
+            .uninstall(false)
+            .expect_err("default uninstall cannot consume purge anchor");
+        assert_eq!(error.code(), "daemon.install.purge_recovery_required");
+        assert_eq!(runner.calls(), calls_before);
+        assert_eq!(
+            fs::read(paths.version_daemon("1.2.3")).expect("helper readback"),
+            helper_before
+        );
+        assert_eq!(
+            fs::read(paths.plist()).expect("plist readback"),
+            plist_before
+        );
+
+        let error = super::remove_install_layout_exact(&paths)
+            .expect_err("low-level cleanup independently rejects purge anchor");
+        assert_eq!(error.code(), "daemon.install.purge_recovery_required");
+        assert_eq!(runner.calls(), calls_before);
+        assert_eq!(
+            fs::read(paths.version_daemon("1.2.3")).expect("helper second readback"),
+            helper_before
+        );
+        assert_eq!(
+            fs::read(paths.plist()).expect("plist second readback"),
+            plist_before
         );
     }
 

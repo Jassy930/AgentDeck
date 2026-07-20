@@ -5,20 +5,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use agentdeck_protocol::relay_v2::enrollment::EnrollmentBundleV2;
+use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::failure::{
     DAEMON_COMMAND_HISTORY_ONLY, DAEMON_COMMAND_NOT_FOUND,
     DAEMON_CONVERSATION_CONFIGURATION_CONFLICT, DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
 };
 use agentdeck_protocol::runtime::identity::{
-    ApprovalId, ConversationId, EventId, IdempotencyKey, MessageId,
+    ApprovalId, ConversationId, DeviceHandle, EventId, GrantSerial, IdempotencyKey, MessageId,
 };
 use agentdeck_protocol::runtime::{
     ArtifactSha256, ClaudeCodeConversationConfiguration, CodexConversationConfiguration,
     ConfigurationReceipt, ConfigureConversationRequest, ConversationConfiguration,
     ConversationMetadataMutation, ConversationMetadataMutationRequest, ConversationMetadataReceipt,
-    ConversationStart, LocalOnlyAdministration, MAX_RUNTIME_JSON_FRAME_BYTES, PromptPayload,
-    QueryReceiptSelector, RuntimeEvent, RuntimeEventBody, RuntimeMessage, RuntimeStreamItem,
-    SendPromptRequest, StageUpgradeReceipt, StageUpgradeRequest, VendorConfigurationSnapshot,
+    ConversationStart, LocalOnlyAdministration, MAX_RUNTIME_JSON_FRAME_BYTES, MachineEnrollRequest,
+    PromptPayload, QueryReceiptSelector, RuntimeEvent, RuntimeEventBody, RuntimeMessage,
+    RuntimeStreamItem, SendPromptRequest, StageUpgradeReceipt, StageUpgradeRequest,
+    TrustResetRequest, VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode, CodexApprovalPolicy,
@@ -29,10 +32,54 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::*;
+use crate::runtime::remote_administration::{RemoteAdministration, RemoteAdministrationError};
 use crate::runtime::store::{ImportNativeProjection, ImportNativeProjectionOutcome};
 use crate::security::{MemoryKeyStore, SecretBytes, StorageKek, load_or_create_storage_kek};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Default)]
+struct CountingRemoteAdministration {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl RemoteAdministration for CountingRemoteAdministration {
+    async fn enroll(
+        &self,
+        _request: MachineEnrollRequest,
+    ) -> Result<agentdeck_protocol::runtime::MachineRemoteStatus, RemoteAdministrationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(unenrolled_remote_status())
+    }
+
+    async fn status(
+        &self,
+    ) -> Result<agentdeck_protocol::runtime::MachineRemoteStatus, RemoteAdministrationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(unenrolled_remote_status())
+    }
+
+    async fn trust_reset(
+        &self,
+        _request: TrustResetRequest,
+    ) -> Result<agentdeck_protocol::runtime::MachineRemoteStatus, RemoteAdministrationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(unenrolled_remote_status())
+    }
+}
+
+fn unenrolled_remote_status() -> agentdeck_protocol::runtime::MachineRemoteStatus {
+    agentdeck_protocol::runtime::MachineRemoteStatus::new(
+        agentdeck_protocol::runtime::MachineRemoteLifecycle::Unenrolled,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("valid unenrolled status")
+}
 
 async fn wait_until_principal_revoking(principal: &AuthenticatedPrincipal) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -667,6 +714,135 @@ async fn runtime_core_issues_explicit_local_control_without_upgrading_read_only_
         "a read-only lease cannot be upgraded to local-control"
     );
     core.shutdown().await.expect("shutdown cold core");
+}
+
+fn dormant_machine_administration_requests() -> Vec<RuntimeRequest> {
+    let bundle: EnrollmentBundleV2 = serde_json::from_value(serde_json::json!({
+        "version": 2,
+        "publicWssUrl": "wss://relay.example.test/",
+        "relayServerId": "IiIiIiIiIiIiIiIiIiIiIg==",
+        "receiptVerifyKey": {
+            "receiptFormatVersion": 1,
+            "relayServerId": "IiIiIiIiIiIiIiIiIiIiIg==",
+            "keyGeneration": 1,
+            "keyId": "9uiDt7VE9fLhOJ4F1EvvLCH5R+HGrCJpMfGxejtfq3M=",
+            "publicKey": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM="
+        },
+        "code": "REREREREREREREREREREREREREREREREREREREREREQ=",
+        "spkiPins": ["-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s"],
+        "expiresAtMs": 1_700_000_000_000u64
+    }))
+    .expect("valid enrollment bundle");
+    vec![
+        RuntimeRequest::CreatePairInvite(
+            agentdeck_protocol::runtime::command::CreatePairInviteRequest {
+                display_name: "fixture machine".to_owned(),
+                ttl_secs: 300,
+                scope: LocalOnlyAdministration::LocalOnly,
+            },
+        ),
+        RuntimeRequest::ListPendingPairings {
+            scope: LocalOnlyAdministration::LocalOnly,
+        },
+        RuntimeRequest::ConfirmPairing {
+            pairing_id: agentdeck_protocol::runtime::identity::PairingId::new("pairing-1"),
+            scope: LocalOnlyAdministration::LocalOnly,
+        },
+        RuntimeRequest::CancelPairing {
+            pairing_id: agentdeck_protocol::runtime::identity::PairingId::new("pairing-1"),
+            scope: LocalOnlyAdministration::LocalOnly,
+        },
+        RuntimeRequest::MachineEnroll(MachineEnrollRequest {
+            bundle,
+            scope: LocalOnlyAdministration::LocalOnly,
+        }),
+        RuntimeRequest::MachineRemoteStatus {
+            scope: LocalOnlyAdministration::LocalOnly,
+        },
+        RuntimeRequest::TrustReset(
+            TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                .expect("valid trust reset"),
+        ),
+        RuntimeRequest::Revoke(RevokeRequest {
+            target: RevokeTarget::Device {
+                device: DeviceHandle::new("device-1"),
+                grant_serial: GrantSerial::new(7),
+                scope: LocalOnlyAdministration::LocalOnly,
+            },
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn dormant_machine_administration_requires_local_control_before_feature_gate() {
+    let root = TestRoot::new("dormant-machine-admin-gate");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let remote_administration = Arc::new(CountingRemoteAdministration::default());
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xA1; 32])
+            .expect("construct RuntimeCore")
+            .with_remote_administration(remote_administration.clone()),
+    );
+    core.recover().await.expect("recover");
+
+    let read_only = connect_local(&core, 0x41).await;
+    let (local_control, _control_writes) = connect_local_control_with_sink(&core, 0x42);
+    let remote = core
+        .principal_issuer
+        .issue_test_remote([0x51; 16], [0x52; 16], 1, [0x53; 32])
+        .expect("issue remote principal");
+    let (remote_sink, _remote_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    let remote = core
+        .connect(remote, ConnectionSink::new(remote_sink))
+        .expect("connect remote principal");
+
+    for request in dormant_machine_administration_requests() {
+        let is_remote_administration = matches!(
+            &request,
+            RuntimeRequest::MachineEnroll(_)
+                | RuntimeRequest::MachineRemoteStatus { .. }
+                | RuntimeRequest::TrustReset(_)
+        );
+        for connection in [read_only, remote] {
+            let calls = remote_administration.calls.load(Ordering::SeqCst);
+            let reply = core.handle(connection, request.clone()).await;
+            assert!(matches!(
+                reply,
+                RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+                    if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
+            ));
+            assert_eq!(
+                remote_administration.calls.load(Ordering::SeqCst),
+                calls,
+                "permission rejection must happen before remote service"
+            );
+        }
+        let reply = core.handle(local_control, request).await;
+        if is_remote_administration {
+            assert!(matches!(reply, RuntimeReply::MachineRemoteStatus(_)));
+        } else {
+            assert!(matches!(
+                reply,
+                RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+                    if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+            ));
+        }
+    }
+
+    let self_revoke = RuntimeRequest::Revoke(RevokeRequest {
+        target: RevokeTarget::SelfDevice,
+    });
+    for connection in [read_only, remote, local_control] {
+        let reply = core.handle(connection, self_revoke.clone()).await;
+        assert!(matches!(
+            reply,
+            RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+                if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+        ));
+    }
+
+    core.shutdown().await.expect("shutdown core");
 }
 
 fn synthetic_runtime_id(kind: RuntimeIdKind, seed: u8) -> RuntimeId {

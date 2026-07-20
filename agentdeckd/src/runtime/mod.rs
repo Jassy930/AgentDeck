@@ -23,6 +23,7 @@ pub mod production_execution_probe;
 pub(crate) mod publication;
 mod read_pool;
 pub mod recovery;
+pub(crate) mod remote_administration;
 pub mod router;
 pub mod singleton;
 pub mod snapshot;

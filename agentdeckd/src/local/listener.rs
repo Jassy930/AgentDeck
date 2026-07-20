@@ -143,6 +143,24 @@ pub struct RemoteStartPermit {
     _listener_fd: ListenerFdIdentity,
 }
 
+#[cfg(test)]
+pub(crate) fn remote_start_permit_for_test() -> RemoteStartPermit {
+    RemoteStartPermit {
+        _entry: EntryIdentity {
+            device: 1,
+            inode: 1,
+            uid: 1,
+            mode: libc::S_IFSOCK as u32 | 0o600,
+            links: 1,
+        },
+        _listener_fd: ListenerFdIdentity {
+            _device: 1,
+            _inode: 2,
+            _links: 0,
+        },
+    }
+}
+
 impl std::fmt::Debug for RemoteStartPermit {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RemoteStartPermit(..)")

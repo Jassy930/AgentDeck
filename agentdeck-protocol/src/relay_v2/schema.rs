@@ -24,6 +24,8 @@ pub fn relay_v2_schema() -> serde_json::Value {
             "RelayGrant": serde_json::to_value(schema_for!(auth::RelayGrant)).unwrap(),
             "SignedCertificate": serde_json::to_value(schema_for!(auth::SignedCertificate)).unwrap(),
             "DeviceRevocation": serde_json::to_value(schema_for!(auth::DeviceRevocation)).unwrap(),
+            "Digest32": serde_json::to_value(schema_for!(enrollment::Digest32)).unwrap(),
+            "EnrollmentBundleV2": serde_json::to_value(schema_for!(enrollment::EnrollmentBundleV2)).unwrap(),
             "MachineEnrollmentRequestV1": serde_json::to_value(schema_for!(enrollment::MachineEnrollmentRequestV1)).unwrap(),
             "MachineEnrollmentResponseV1": serde_json::to_value(schema_for!(enrollment::MachineEnrollmentResponseV1)).unwrap(),
             "RelayReceiptVerifyKeyV1": serde_json::to_value(schema_for!(admin_receipt::RelayReceiptVerifyKeyV1)).unwrap(),

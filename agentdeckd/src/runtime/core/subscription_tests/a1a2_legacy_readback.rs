@@ -183,11 +183,11 @@ fn assert_no_private_handle(bytes: &[u8]) {
 
 #[tokio::test]
 #[ignore = "A1a2 manual real-writer gate; requires AGENTDECK_A1A2_FIXTURE_DIR"]
-async fn reads_runtime_v1_v4_sample_as_v2_without_rewrite() {
+async fn reads_runtime_v1_v4_sample_as_v3_without_rewrite() {
     // 威胁场景：只用合成 JSON 证明 dual-decode 会漏掉真实 v4 AEAD/AAD/token、
     // read-pool lease 与 paced transfer handoff 的组合错误，甚至在 open 时静默 reseal。
-    assert_eq!(RUNTIME_PROTOCOL_VERSION, 2);
-    assert_eq!(RUNTIME_SCHEMA_VERSION, 8);
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 3);
+    assert_eq!(RUNTIME_SCHEMA_VERSION, 9);
     assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
     let artifact = PathBuf::from(
         std::env::var_os("AGENTDECK_A1A2_FIXTURE_DIR")
@@ -382,7 +382,7 @@ async fn reads_runtime_v1_v4_sample_as_v2_without_rewrite() {
     assert_eq!(
         after.immutable_sha256(),
         before.immutable_sha256(),
-        "v4→current v8 migration/readback must not normalize or reseal immutable rows"
+        "v4→current v9 migration/readback must not normalize or reseal immutable rows"
     );
     println!(
         "wrapped_key_bundle_sha256={}",

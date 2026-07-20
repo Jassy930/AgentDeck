@@ -83,6 +83,24 @@ pub enum RuntimeStoreOperation {
     PrepareMachineIdentityAfterCommit,
     ActivateMachineIdentityBeforeCommit,
     ActivateMachineIdentityAfterCommit,
+    PrepareMachineEnrollmentBeforeCommit,
+    PrepareMachineEnrollmentAfterCommit,
+    RecordValidatedEnrollmentResponseBeforeCommit,
+    RecordValidatedEnrollmentResponseAfterCommit,
+    ActivateMachineEnrollmentBeforeCommit,
+    ActivateMachineEnrollmentAfterCommit,
+    PrepareMachineRetirementBeforeCommit,
+    PrepareMachineRetirementAfterCommit,
+    RecordMachineRetirementTerminalBeforeCommit,
+    RecordMachineRetirementTerminalAfterCommit,
+    ConfirmMachinePurgeReadbackAbsentBeforeCommit,
+    ConfirmMachinePurgeReadbackAbsentAfterCommit,
+    RecordRootLostMachinePurgeBeforeCommit,
+    RecordRootLostMachinePurgeAfterCommit,
+    FinalizeMachineLocalDeletionBeforeCommit,
+    FinalizeMachineLocalDeletionAfterCommit,
+    ReplaceLocalDeletedEnrollmentBeforeCommit,
+    ReplaceLocalDeletedEnrollmentAfterCommit,
     StreamNotificationReadback,
     RecordEnrollmentReceiptBeforeCommit,
     RecordEnrollmentReceiptAfterCommit,
@@ -363,6 +381,305 @@ pub enum ActivateMachineIdentityOutcome {
     Replayed { state: MachineIdentityStateRecord },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineRemoteLifecycle {
+    EnrollmentPrepared,
+    EnrollmentResponseValidated,
+    Active,
+    RetirePending,
+    RelayCommitted,
+    PurgeReadbackAbsent,
+    LocalDeleted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineTrustResetKind {
+    RootPresent,
+    RootLost,
+}
+
+pub const MACHINE_CLEANUP_WITNESS_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Error)]
+pub enum MachineCleanupWitnessError {
+    #[error("machine cleanup witness required binding is all-zero: {0}")]
+    ZeroBinding(&'static str),
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct MachineCleanupWitnessV1 {
+    reset_kind: MachineTrustResetKind,
+    relay_server_id: agentdeck_protocol::relay_v2::RelayServerId,
+    machine_route: agentdeck_protocol::relay_v2::MachineRouteId,
+    root_key_id: agentdeck_protocol::relay_v2::RootKeyId,
+    root_fingerprint: [u8; 32],
+    trust_epoch: agentdeck_protocol::relay_v2::TrustEpoch,
+    purge_proof_hash: [u8; 32],
+}
+
+impl MachineCleanupWitnessV1 {
+    pub fn new(
+        reset_kind: MachineTrustResetKind,
+        relay_server_id: agentdeck_protocol::relay_v2::RelayServerId,
+        machine_route: agentdeck_protocol::relay_v2::MachineRouteId,
+        root_key_id: agentdeck_protocol::relay_v2::RootKeyId,
+        root_fingerprint: [u8; 32],
+        trust_epoch: agentdeck_protocol::relay_v2::TrustEpoch,
+        purge_proof_hash: [u8; 32],
+    ) -> Result<Self, MachineCleanupWitnessError> {
+        for (value, field) in [
+            (&relay_server_id.as_bytes()[..], "relayServerId"),
+            (&machine_route.as_bytes()[..], "machineRoute"),
+            (&root_key_id.as_bytes()[..], "rootKeyId"),
+            (&root_fingerprint[..], "rootFingerprint"),
+            (&purge_proof_hash[..], "purgeProofHash"),
+        ] {
+            if value.iter().all(|byte| *byte == 0) {
+                return Err(MachineCleanupWitnessError::ZeroBinding(field));
+            }
+        }
+        if trust_epoch.value() == 0 {
+            return Err(MachineCleanupWitnessError::ZeroBinding("trustEpoch"));
+        }
+        Ok(Self {
+            reset_kind,
+            relay_server_id,
+            machine_route,
+            root_key_id,
+            root_fingerprint,
+            trust_epoch,
+            purge_proof_hash,
+        })
+    }
+
+    #[must_use]
+    pub const fn reset_kind(&self) -> MachineTrustResetKind {
+        self.reset_kind
+    }
+
+    #[must_use]
+    pub const fn purge_proof_hash(&self) -> [u8; 32] {
+        self.purge_proof_hash
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(139);
+        bytes.extend_from_slice(b"AgentDeck/MachineCleanupWitnessV1\0");
+        bytes.push(MACHINE_CLEANUP_WITNESS_VERSION);
+        bytes.push(match self.reset_kind {
+            MachineTrustResetKind::RootPresent => 0,
+            MachineTrustResetKind::RootLost => 1,
+        });
+        bytes.extend_from_slice(self.relay_server_id.as_bytes());
+        bytes.extend_from_slice(self.machine_route.as_bytes());
+        bytes.extend_from_slice(self.root_key_id.as_bytes());
+        bytes.extend_from_slice(&self.root_fingerprint);
+        bytes.extend_from_slice(&self.trust_epoch.value().to_be_bytes());
+        bytes.extend_from_slice(&self.purge_proof_hash);
+        bytes
+    }
+
+    #[must_use]
+    pub fn canonical_sha256(&self) -> [u8; 32] {
+        Sha256::digest(self.canonical_bytes()).into()
+    }
+}
+
+impl std::fmt::Debug for MachineCleanupWitnessV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MachineCleanupWitnessV1([REDACTED])")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MachineRemoteStateRecord {
+    pub lifecycle: MachineRemoteLifecycle,
+    pub relay_server_id: [u8; 16],
+    pub machine_route: [u8; 16],
+    pub root_key_id: [u8; 16],
+    pub root_fingerprint: [u8; 32],
+    pub trust_epoch: u64,
+    pub request_hash: [u8; 32],
+    pub response_hash: Option<[u8; 32]>,
+    pub enrollment_receipt_hash: Option<[u8; 32]>,
+    pub receipt_verify_key_hash: [u8; 32],
+    pub sealed_state_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MachineEnrollmentConnectionMaterial {
+    pub public_wss_url: String,
+    pub relay_server_id: agentdeck_protocol::relay_v2::RelayServerId,
+    pub receipt_verify_key: agentdeck_protocol::relay_v2::RelayReceiptVerifyKeyV1,
+    pub spki_pins: Vec<agentdeck_protocol::relay_v2::Digest32>,
+    pub expires_at_ms: u64,
+}
+
+/// Restart-safe enrollment owner。Prepared/Validated 的 code 只存在于 owned transient
+/// request；该类型不实现 Clone，Debug 永远不展开 request、pin 或证书内容。
+pub struct PreparedMachineEnrollmentState {
+    pub record: MachineRemoteStateRecord,
+    pub connection: MachineEnrollmentConnectionMaterial,
+    pub request: agentdeck_protocol::relay_v2::MachineEnrollmentRequestV1,
+}
+
+pub struct ValidatedMachineEnrollmentState {
+    pub record: MachineRemoteStateRecord,
+    pub connection: MachineEnrollmentConnectionMaterial,
+    pub request: agentdeck_protocol::relay_v2::MachineEnrollmentRequestV1,
+    pub response: agentdeck_protocol::relay_v2::MachineEnrollmentResponseV1,
+}
+
+pub struct ActiveMachineEnrollmentState {
+    pub record: MachineRemoteStateRecord,
+    pub connection: MachineEnrollmentConnectionMaterial,
+    pub binding: MachineIdentityBinding,
+    pub link_cert: agentdeck_protocol::relay_v2::SignedCertificate,
+    pub data_cert: agentdeck_protocol::relay_v2::SignedCertificate,
+    /// sealed Prepared payload 的 canonical hash；用于显式 enroll retry 的 exact-input
+    /// 比较，不回显 enrollment code。
+    pub prepare_input_hash: [u8; 32],
+    pub response: agentdeck_protocol::relay_v2::MachineEnrollmentResponseV1,
+}
+
+pub struct MachineRetirementRequestMaterial {
+    pub retirement: agentdeck_protocol::relay_v2::frame::RetireMachine,
+    pub canonical_bytes: Vec<u8>,
+    pub canonical_hash: [u8; 32],
+}
+
+pub struct MachineRetirementTerminalMaterial {
+    pub committed: agentdeck_protocol::relay_v2::frame::RetirementCommitted,
+    pub canonical_frame_bytes: Vec<u8>,
+    pub canonical_frame_hash: [u8; 32],
+}
+
+pub struct MachineRootLostPurgeMaterial {
+    pub receipt: agentdeck_protocol::relay_v2::RelayAdminPurgeReceiptV1,
+    pub canonical_bytes: Vec<u8>,
+    pub canonical_hash: [u8; 32],
+}
+
+pub struct RetirePendingMachineEnrollmentState {
+    pub record: MachineRemoteStateRecord,
+    pub connection: MachineEnrollmentConnectionMaterial,
+    pub binding: MachineIdentityBinding,
+    pub link_cert: agentdeck_protocol::relay_v2::SignedCertificate,
+    pub retirement: MachineRetirementRequestMaterial,
+}
+
+pub struct RelayCommittedMachineEnrollmentState {
+    pub record: MachineRemoteStateRecord,
+    pub retirement: MachineRetirementRequestMaterial,
+    pub terminal: MachineRetirementTerminalMaterial,
+}
+
+pub enum MachinePurgeReadbackProof {
+    RootPresent {
+        retirement: MachineRetirementRequestMaterial,
+        terminal: MachineRetirementTerminalMaterial,
+    },
+    RootLost {
+        purge: MachineRootLostPurgeMaterial,
+    },
+}
+
+pub struct PurgeReadbackAbsentMachineEnrollmentState {
+    pub record: MachineRemoteStateRecord,
+    /// 来自已认证 Store 上下文，不接受调用方自报；用于绑定本地密钥目录清理。
+    pub database_id: [u8; 16],
+    /// purge sealed payload 中保留的最后一个已认证 machine identity binding。
+    pub binding: MachineIdentityBinding,
+    pub reset_kind: MachineTrustResetKind,
+    pub proof: MachinePurgeReadbackProof,
+}
+
+pub struct LocalDeletedMachineEnrollmentState {
+    pub record: MachineRemoteStateRecord,
+    pub reset_kind: MachineTrustResetKind,
+    pub previous_prepare_input_hash: [u8; 32],
+    pub purge_proof_hash: [u8; 32],
+    pub cleanup_witness_hash: [u8; 32],
+}
+
+pub enum MachineEnrollmentState {
+    EnrollmentPrepared(Box<PreparedMachineEnrollmentState>),
+    EnrollmentResponseValidated(Box<ValidatedMachineEnrollmentState>),
+    Active(Box<ActiveMachineEnrollmentState>),
+    RetirePending(Box<RetirePendingMachineEnrollmentState>),
+    RelayCommitted(Box<RelayCommittedMachineEnrollmentState>),
+    PurgeReadbackAbsent(Box<PurgeReadbackAbsentMachineEnrollmentState>),
+    LocalDeleted(Box<LocalDeletedMachineEnrollmentState>),
+}
+
+impl std::fmt::Debug for MachineEnrollmentState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match self {
+            Self::EnrollmentPrepared(_) => "enrollmentPrepared",
+            Self::EnrollmentResponseValidated(_) => "enrollmentResponseValidated",
+            Self::Active(_) => "active",
+            Self::RetirePending(_) => "retirePending",
+            Self::RelayCommitted(_) => "relayCommitted",
+            Self::PurgeReadbackAbsent(_) => "purgeReadbackAbsent",
+            Self::LocalDeleted(_) => "localDeleted",
+        };
+        formatter
+            .debug_struct("MachineEnrollmentState")
+            .field("state", &state)
+            .field("material", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub enum PrepareMachineEnrollmentOutcome {
+    Prepared { state: MachineEnrollmentState },
+    Replayed { state: MachineEnrollmentState },
+}
+
+#[derive(Debug)]
+pub enum RecordValidatedEnrollmentResponseOutcome {
+    Recorded { state: MachineEnrollmentState },
+    Replayed { state: MachineEnrollmentState },
+}
+
+#[derive(Debug)]
+pub enum ActivateMachineEnrollmentOutcome {
+    Activated { state: MachineEnrollmentState },
+    Replayed { state: MachineEnrollmentState },
+}
+
+#[derive(Debug)]
+pub enum PrepareMachineRetirementOutcome {
+    Prepared { state: MachineEnrollmentState },
+    Replayed { state: MachineEnrollmentState },
+}
+
+#[derive(Debug)]
+pub enum RecordMachineRetirementTerminalOutcome {
+    Recorded { state: MachineEnrollmentState },
+    Replayed { state: MachineEnrollmentState },
+}
+
+#[derive(Debug)]
+pub enum ConfirmMachinePurgeReadbackAbsentOutcome {
+    Confirmed { state: MachineEnrollmentState },
+    Replayed { state: MachineEnrollmentState },
+}
+
+#[derive(Debug)]
+pub enum RecordRootLostMachinePurgeOutcome {
+    Recorded { state: MachineEnrollmentState },
+    Replayed { state: MachineEnrollmentState },
+}
+
+#[derive(Debug)]
+pub enum FinalizeMachineLocalDeletionOutcome {
+    Finalized { state: MachineEnrollmentState },
+    Replayed { state: MachineEnrollmentState },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MachineEnrollmentReceiptRecord {
     pub relay_server_id: [u8; 16],
@@ -446,6 +763,15 @@ pub enum RuntimeCommitOperation {
     MigrateSchema,
     PrepareMachineIdentity,
     ActivateMachineIdentity,
+    PrepareMachineEnrollment,
+    RecordValidatedEnrollmentResponse,
+    ActivateMachineEnrollment,
+    PrepareMachineRetirement,
+    RecordMachineRetirementTerminal,
+    ConfirmMachinePurgeReadbackAbsent,
+    RecordRootLostMachinePurge,
+    FinalizeMachineLocalDeletion,
+    ReplaceLocalDeletedEnrollment,
     RecordEnrollmentReceipt,
     CreateConversation,
     ConfigureConversation,
@@ -1426,6 +1752,8 @@ pub enum RuntimeStoreError {
     MachineIdentityMissing,
     #[error("runtime machine identity binding conflicts with the authenticated singleton")]
     MachineIdentityConflict,
+    #[error("runtime machine enrollment input conflicts with the authenticated lifecycle")]
+    MachineRemoteConflict,
     #[error("runtime store {lane:?} lane is full")]
     WorkerBusy { lane: RuntimeStoreLane },
     #[error("runtime store worker stopped before replying")]
@@ -1632,6 +1960,7 @@ impl RuntimeStoreError {
             Self::IdKindMismatch { .. }
             | Self::MachineIdentityMissing
             | Self::MachineIdentityConflict
+            | Self::MachineRemoteConflict
             | Self::ConversationNotFound
             | Self::ConversationConflict
             | Self::ConfigurationAgentMismatch

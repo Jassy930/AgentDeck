@@ -477,14 +477,15 @@ fn runtime_ledger_token(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read Runtime admin command ledger fixture");
-    let machine_identity_count: i64 = connection
+    let (machine_identity_count, machine_remote_state_count): (i64, i64) = connection
         .query_row(
-            "SELECT machine_identity_count FROM runtime_meta WHERE singleton = 1",
+            "SELECT machine_identity_count, machine_remote_state_count
+             FROM runtime_meta WHERE singleton = 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .expect("read Runtime machine identity ledger fixture");
-    let mut message = Vec::with_capacity(392);
+        .expect("read Runtime machine identity and remote ledger fixture");
+    let mut message = Vec::with_capacity(400);
     message.extend_from_slice(&database_id);
     match catalog_high_water {
         None => message.push(0),
@@ -578,8 +579,13 @@ fn runtime_ledger_token(
             .expect("fixture machine identity count is non-negative")
             .to_be_bytes(),
     );
+    message.extend_from_slice(
+        &u64::try_from(machine_remote_state_count)
+            .expect("fixture machine remote state count is non-negative")
+            .to_be_bytes(),
+    );
     *key_bundle
-        .blind_index(b"runtime.meta.ledger.v8", &message)
+        .blind_index(b"runtime.meta.ledger.v9", &message)
         .expect("authenticate Runtime boundary ledger")
         .as_bytes()
 }

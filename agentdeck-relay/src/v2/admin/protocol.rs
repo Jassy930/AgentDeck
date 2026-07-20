@@ -2,68 +2,18 @@
 
 use std::fmt;
 
+pub use agentdeck_protocol::relay_v2::{Digest32, EnrollmentBundleV2};
 use agentdeck_protocol::relay_v2::{
-    EnrollmentCode, MachineRouteId, RelayAdminPurgeReceiptV1, RelayReceiptVerifyKeyV1,
-    RelayServerId,
+    ENROLLMENT_BUNDLE_VERSION, MachineRouteId, RelayAdminPurgeReceiptV1, RelayServerId,
 };
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::v2::store::{
     MachineInventoryEntry, MachineInventoryPage, MachineReadback, PurgeReadback,
 };
 
-pub const ADMIN_PROTOCOL_VERSION: u16 = 2;
+pub const ADMIN_PROTOCOL_VERSION: u16 = ENROLLMENT_BUNDLE_VERSION;
 pub const MAX_ADMIN_LINE_BYTES: usize = 64 * 1024;
-
-fn deserialize_admin_protocol_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let version = u16::deserialize(deserializer)?;
-    if version == ADMIN_PROTOCOL_VERSION {
-        Ok(version)
-    } else {
-        Err(serde::de::Error::custom(
-            "unsupported admin protocol version",
-        ))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Digest32(pub [u8; 32]);
-
-impl fmt::Debug for Digest32 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Digest32(<redacted>)")
-    }
-}
-
-impl Serialize for Digest32 {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&URL_SAFE_NO_PAD.encode(self.0))
-    }
-}
-
-impl<'de> Deserialize<'de> for Digest32 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        let bytes = URL_SAFE_NO_PAD
-            .decode(value.as_bytes())
-            .map_err(serde::de::Error::custom)?;
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected a 32-byte digest"))?;
-        Ok(Self(bytes))
-    }
-}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -159,31 +109,6 @@ impl fmt::Debug for AdminResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdminFailure {
     pub code: String,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EnrollmentBundleV2 {
-    #[serde(deserialize_with = "deserialize_admin_protocol_version")]
-    pub version: u16,
-    pub public_wss_url: String,
-    pub relay_server_id: RelayServerId,
-    pub receipt_verify_key: RelayReceiptVerifyKeyV1,
-    pub code: EnrollmentCode,
-    pub spki_pins: Vec<Digest32>,
-    pub expires_at_ms: u64,
-}
-
-impl fmt::Debug for EnrollmentBundleV2 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("EnrollmentBundleV2")
-            .field("version", &self.version)
-            .field("relay_server_id", &self.relay_server_id.redacted())
-            .field("secret_material", &"<redacted>")
-            .field("expires_at_ms", &self.expires_at_ms)
-            .finish()
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,8 +223,8 @@ impl From<MachineReadback> for MachineReadbackResult {
 #[cfg(test)]
 mod tests {
     use agentdeck_protocol::relay_v2::{
-        PublicKeyBytes, RELAY_RECEIPT_FORMAT_VERSION, RELAY_RECEIPT_KEY_GENERATION_MVP,
-        RelayReceiptKeyId,
+        EnrollmentCode, PublicKeyBytes, RELAY_RECEIPT_FORMAT_VERSION,
+        RELAY_RECEIPT_KEY_GENERATION_MVP, RelayReceiptKeyId, RelayReceiptVerifyKeyV1,
     };
 
     use super::*;

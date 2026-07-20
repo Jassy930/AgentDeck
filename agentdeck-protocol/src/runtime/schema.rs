@@ -1,6 +1,6 @@
-//! Runtime v2 聚合 JSON Schema（独立于 local IPC / Relay v2 / E2EE schema）。
+//! Runtime v3 聚合 JSON Schema（独立于 local IPC / Relay v2 / E2EE schema）。
 //!
-//! 通过 `runtime_schema()` 聚合所有 Runtime v2 公共类型，快照写到
+//! 通过 `runtime_schema()` 聚合所有 Runtime v3 公共类型，快照写到
 //! `protocol/agentdeck/runtime-protocol.schema.json`，由 `runtime_schema_matches_committed_snapshot`
 //! 守护，用 `UPDATE_RUNTIME_SCHEMA=1` 重生成（模式仿照 local IPC 的
 //! `schema_matches_committed_snapshot`）。
@@ -39,7 +39,7 @@ impl<T: JsonSchema> JsonSchema for RequiredNullable<T> {
     }
 }
 
-/// Runtime v2 所有公共 wire 类型的聚合 schema。
+/// Runtime v3 所有公共 wire 类型的聚合 schema。
 pub fn runtime_schema() -> serde_json::Value {
     let mut properties = serde_json::Map::new();
     macro_rules! add {
@@ -112,9 +112,23 @@ pub fn runtime_schema() -> serde_json::Value {
     add!("ConversationStart", command::ConversationStart);
     add!("QueryReceiptSelector", command::QueryReceiptSelector);
     add!("LocalOnlyAdministration", command::LocalOnlyAdministration);
+    add!("MachineEnrollRequest", command::MachineEnrollRequest);
+    add!("TrustResetRequest", command::TrustResetRequest);
+    add!("UninstallPurgePlanV1", command::UninstallPurgePlanV1);
+    add!(
+        "RelayAdminPurgeReceiptV1",
+        crate::relay_v2::RelayAdminPurgeReceiptV1
+    );
     add!("RuntimeFailure", crate::runtime::failure::RuntimeFailure);
     add!("PairInvite", envelope::PairInvite);
     add!("PendingPairing", envelope::PendingPairing);
+    add!("MachineRemoteLifecycle", envelope::MachineRemoteLifecycle);
+    add!(
+        "MachineRemoteFailureCode",
+        envelope::MachineRemoteFailureCode
+    );
+    add!("MachineRootFingerprint", envelope::MachineRootFingerprint);
+    add!("MachineRemoteStatus", envelope::MachineRemoteStatus);
     add!(
         "CatalogPageCursor",
         crate::runtime::identity::CatalogPageCursor

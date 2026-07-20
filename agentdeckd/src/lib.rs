@@ -14,6 +14,7 @@ pub mod diag;
 pub mod exec_gate;
 pub mod ipc;
 pub mod local;
+pub mod purge_finalizer;
 pub mod record;
 pub mod remote;
 pub mod runtime;

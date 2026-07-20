@@ -1116,13 +1116,9 @@ async fn stable_private_material_never_enters_runtime_artifacts_or_identity_logs
         .map(|offset| start + offset)
         .expect("find production main-loop end");
     let main_loop = &main_source[start..end];
-    assert_eq!(main_loop.matches("\"remote_identity\"").count(), 5);
-    for allowed in [
-        "status=disabled",
-        "status=active",
-        "status=blocked code={}",
-        "status=blocked code=daemon.remote.identity.start_permit_missing",
-    ] {
+    assert_eq!(main_loop.matches("\"remote_identity\"").count(), 3);
+    assert_eq!(main_loop.matches("\"remote_manager\"").count(), 3);
+    for allowed in ["status=disabled", "status=active", "status=blocked code={}"] {
         assert!(
             main_loop.contains(allowed),
             "remote identity log call graph must retain code-only fragment {allowed}"

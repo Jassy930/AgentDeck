@@ -24,22 +24,26 @@ use crate::runtime::events::{
     StoreWatchToken, StreamBarrierRegistration,
 };
 use crate::runtime::model::{
-    AcceptCommand, AcceptOutcome, ActivateMachineIdentityOutcome, ApprovalMutationOutcome,
-    AuthorizeExecutionRelease, BeginApprovalAttempt, BeginApprovalAttemptOutcome, ClaimApproval,
-    CommandReceiptRecord, CommandReceiptSelector, CompleteCommand, CompleteOutcome,
-    ConversationRecord, CreateConversationOutcome, ExecutionFence, ExecutionFenceRecord,
-    ExpireApproval, MAX_ADAPTER_STATE_REFERENCE_BYTES, MAX_APPROVAL_STATUS_DETAIL_BYTES,
-    MAX_COMMAND_PAYLOAD_BYTES, MAX_CONVERSATION_DESCRIPTOR_BYTES,
+    AcceptCommand, AcceptOutcome, ActivateMachineEnrollmentOutcome, ActivateMachineIdentityOutcome,
+    ApprovalMutationOutcome, AuthorizeExecutionRelease, BeginApprovalAttempt,
+    BeginApprovalAttemptOutcome, ClaimApproval, CommandReceiptRecord, CommandReceiptSelector,
+    CompleteCommand, CompleteOutcome, ConfirmMachinePurgeReadbackAbsentOutcome, ConversationRecord,
+    CreateConversationOutcome, ExecutionFence, ExecutionFenceRecord, ExpireApproval,
+    FinalizeMachineLocalDeletionOutcome, MAX_ADAPTER_STATE_REFERENCE_BYTES,
+    MAX_APPROVAL_STATUS_DETAIL_BYTES, MAX_COMMAND_PAYLOAD_BYTES, MAX_CONVERSATION_DESCRIPTOR_BYTES,
     MAX_CRITICAL_COMMAND_RECORD_BYTES, MAX_EXECUTION_FENCE_BYTES, MAX_EXECUTION_NONCE_BYTES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_RUNTIME_BUSY_TIMEOUT_MS, MAX_RUNTIME_STORE_COMMAND_CAPACITY,
-    MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY, MachineEnrollmentReceiptRecord, MachineIdentityBinding,
-    MachineIdentityStateRecord, MarkApprovalApplied, MarkApprovalDeliveryFailed,
-    MarkConversationRecoveryBlocked, NewConversation, PrepareMachineIdentityOutcome,
-    QueryCommandReceipt, RUNTIME_STORE_SHUTDOWN_GRACE_MS, RecoveryCompletion, RecoveryCursor,
-    RecoveryPage, RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery,
-    RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreLane, RuntimeStoreOperation,
-    RuntimeStoreSnapshot, StartCommand, StartOutcome, TerminateAcceptedCommand,
-    TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    MAX_RUNTIME_STORE_LANE_BYTE_CAPACITY, MachineEnrollmentReceiptRecord, MachineEnrollmentState,
+    MachineIdentityBinding, MachineIdentityStateRecord, MachineTrustResetKind, MarkApprovalApplied,
+    MarkApprovalDeliveryFailed, MarkConversationRecoveryBlocked, NewConversation,
+    PrepareMachineEnrollmentOutcome, PrepareMachineIdentityOutcome,
+    PrepareMachineRetirementOutcome, QueryCommandReceipt, RUNTIME_STORE_SHUTDOWN_GRACE_MS,
+    RecordMachineRetirementTerminalOutcome, RecordRootLostMachinePurgeOutcome,
+    RecordValidatedEnrollmentResponseOutcome, RecoveryCompletion, RecoveryCursor, RecoveryPage,
+    RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery, RuntimeStoreConfig,
+    RuntimeStoreError, RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot, StartCommand,
+    StartOutcome, TerminateAcceptedCommand, TerminateAcceptedOutcome,
+    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
 use crate::runtime::read_pool::{
     DEFAULT_RUNTIME_READ_CONCURRENCY, MAX_RUNTIME_READ_PAGE_BYTES, ReadMemoryLease, ReadPool,
@@ -75,8 +79,8 @@ use super::stream::{
 };
 use super::{
     AuthenticatedConversationSnapshotContext, PreparedConversationSnapshotWrite, SnapshotOrigin,
-    StoreConversationSnapshotError, admin, approval, journal, machine_identity, native_projection,
-    sqlite, stream,
+    StoreConversationSnapshotError, admin, approval, journal, machine_identity, machine_remote,
+    native_projection, sqlite, stream,
 };
 
 mod stream_pipeline;
@@ -815,6 +819,12 @@ impl RuntimeStoreHandle {
         self.identity_derivation.derive_machine_trust_domain()
     }
 
+    /// 只供 daemon-private machine re-enrollment 把新 Keychain guard 绑定到
+    /// 已认证 Store 实例；不是 wire/database locator API。
+    pub(crate) const fn authenticated_database_id(&self) -> [u8; 16] {
+        self.database_id
+    }
+
     pub(in crate::runtime) fn derive_native_history_command_id(
         &self,
         conversation_id: RuntimeId,
@@ -913,6 +923,177 @@ impl RuntimeStoreHandle {
             RuntimeStoreLane::Safety,
             memory_charge(size_of::<SafetyCommand>(), &[])?,
             |reply| SafetyCommand::ActivateMachineIdentity { binding, reply },
+        )
+        .await?
+    }
+
+    pub async fn load_machine_enrollment_state(
+        &self,
+    ) -> Result<Option<MachineEnrollmentState>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadMachineEnrollmentState { reply },
+        )
+        .await?
+    }
+
+    pub async fn prepare_machine_enrollment(
+        &self,
+        bundle: agentdeck_protocol::relay_v2::EnrollmentBundleV2,
+        machine_route: agentdeck_protocol::relay_v2::MachineRouteId,
+        binding: MachineIdentityBinding,
+        link_cert: agentdeck_protocol::relay_v2::SignedCertificate,
+        data_cert: agentdeck_protocol::relay_v2::SignedCertificate,
+    ) -> Result<PrepareMachineEnrollmentOutcome, RuntimeStoreError> {
+        let prepared =
+            machine_remote::prepare_write(bundle, machine_route, binding, link_cert, data_cert)?;
+        let retained = prepared.retained_capacity();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::PrepareMachineEnrollment {
+                prepared: Box::new(prepared),
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub async fn record_validated_enrollment_response(
+        &self,
+        expected_request_hash: [u8; 32],
+        response: agentdeck_protocol::relay_v2::MachineEnrollmentResponseV1,
+    ) -> Result<RecordValidatedEnrollmentResponseOutcome, RuntimeStoreError> {
+        let prepared = machine_remote::prepare_response_write(expected_request_hash, response)?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::RecordValidatedEnrollmentResponse { prepared, reply },
+        )
+        .await?
+    }
+
+    pub async fn activate_machine_enrollment(
+        &self,
+        expected_request_hash: [u8; 32],
+        expected_response_hash: [u8; 32],
+    ) -> Result<ActivateMachineEnrollmentOutcome, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::ActivateMachineEnrollment {
+                expected_request_hash,
+                expected_response_hash,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub async fn prepare_machine_retirement(
+        &self,
+        retirement: agentdeck_protocol::relay_v2::frame::RetireMachine,
+    ) -> Result<PrepareMachineRetirementOutcome, RuntimeStoreError> {
+        let prepared = machine_remote::prepare_retirement_write(retirement)?;
+        let retained = prepared.retained_capacity();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::PrepareMachineRetirement { prepared, reply },
+        )
+        .await?
+    }
+
+    pub async fn record_machine_retirement_terminal(
+        &self,
+        canonical_frame_bytes: Vec<u8>,
+        canonical_frame_hash: [u8; 32],
+    ) -> Result<RecordMachineRetirementTerminalOutcome, RuntimeStoreError> {
+        let prepared =
+            machine_remote::prepare_terminal_write(canonical_frame_bytes, canonical_frame_hash)?;
+        let retained = prepared.retained_capacity();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::RecordMachineRetirementTerminal { prepared, reply },
+        )
+        .await?
+    }
+
+    pub async fn confirm_machine_purge_readback_absent(
+        &self,
+        canonical_frame_bytes: Vec<u8>,
+        canonical_frame_hash: [u8; 32],
+    ) -> Result<ConfirmMachinePurgeReadbackAbsentOutcome, RuntimeStoreError> {
+        let prepared =
+            machine_remote::prepare_terminal_write(canonical_frame_bytes, canonical_frame_hash)?;
+        let retained = prepared.retained_capacity();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::ConfirmMachinePurgeReadbackAbsent { prepared, reply },
+        )
+        .await?
+    }
+
+    pub async fn record_root_lost_machine_purge(
+        &self,
+        receipt: agentdeck_protocol::relay_v2::RelayAdminPurgeReceiptV1,
+    ) -> Result<RecordRootLostMachinePurgeOutcome, RuntimeStoreError> {
+        let prepared = machine_remote::prepare_root_lost_purge_write(receipt)?;
+        let retained = prepared.retained_capacity();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::RecordRootLostMachinePurge {
+                prepared: Box::new(prepared),
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub async fn finalize_machine_local_deletion(
+        &self,
+        expected_reset_kind: MachineTrustResetKind,
+        expected_purge_proof_hash: [u8; 32],
+        cleanup_witness_hash: [u8; 32],
+    ) -> Result<FinalizeMachineLocalDeletionOutcome, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::FinalizeMachineLocalDeletion {
+                expected_reset_kind,
+                expected_purge_proof_hash,
+                cleanup_witness_hash,
+                reply,
+            },
         )
         .await?
     }
@@ -2364,6 +2545,41 @@ enum SafetyCommand {
         binding: MachineIdentityBinding,
         reply: oneshot::Sender<Result<ActivateMachineIdentityOutcome, RuntimeStoreError>>,
     },
+    PrepareMachineEnrollment {
+        prepared: Box<machine_remote::PreparedMachineEnrollmentWrite>,
+        reply: oneshot::Sender<Result<PrepareMachineEnrollmentOutcome, RuntimeStoreError>>,
+    },
+    RecordValidatedEnrollmentResponse {
+        prepared: machine_remote::ValidatedEnrollmentResponseWrite,
+        reply: oneshot::Sender<Result<RecordValidatedEnrollmentResponseOutcome, RuntimeStoreError>>,
+    },
+    ActivateMachineEnrollment {
+        expected_request_hash: [u8; 32],
+        expected_response_hash: [u8; 32],
+        reply: oneshot::Sender<Result<ActivateMachineEnrollmentOutcome, RuntimeStoreError>>,
+    },
+    PrepareMachineRetirement {
+        prepared: machine_remote::PreparedMachineRetirementWrite,
+        reply: oneshot::Sender<Result<PrepareMachineRetirementOutcome, RuntimeStoreError>>,
+    },
+    RecordMachineRetirementTerminal {
+        prepared: machine_remote::PreparedRetirementTerminalWrite,
+        reply: oneshot::Sender<Result<RecordMachineRetirementTerminalOutcome, RuntimeStoreError>>,
+    },
+    ConfirmMachinePurgeReadbackAbsent {
+        prepared: machine_remote::PreparedRetirementTerminalWrite,
+        reply: oneshot::Sender<Result<ConfirmMachinePurgeReadbackAbsentOutcome, RuntimeStoreError>>,
+    },
+    RecordRootLostMachinePurge {
+        prepared: Box<machine_remote::PreparedRootLostPurgeWrite>,
+        reply: oneshot::Sender<Result<RecordRootLostMachinePurgeOutcome, RuntimeStoreError>>,
+    },
+    FinalizeMachineLocalDeletion {
+        expected_reset_kind: MachineTrustResetKind,
+        expected_purge_proof_hash: [u8; 32],
+        cleanup_witness_hash: [u8; 32],
+        reply: oneshot::Sender<Result<FinalizeMachineLocalDeletionOutcome, RuntimeStoreError>>,
+    },
     RecordEnrollmentReceipt {
         receipt: MachineEnrollmentReceiptRecord,
         reply: oneshot::Sender<Result<MachineEnrollmentReceiptRecord, RuntimeStoreError>>,
@@ -2468,6 +2684,9 @@ enum ReadCommand {
     },
     LoadMachineIdentityState {
         reply: oneshot::Sender<Result<Option<MachineIdentityStateRecord>, RuntimeStoreError>>,
+    },
+    LoadMachineEnrollmentState {
+        reply: oneshot::Sender<Result<Option<MachineEnrollmentState>, RuntimeStoreError>>,
     },
     LoadPendingAdminUpgrades {
         cursor: Option<admin::AdminUpgradeRecoveryCursor>,
@@ -3180,6 +3399,30 @@ fn handle_safety(
             SafetyCommand::ActivateMachineIdentity { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            SafetyCommand::PrepareMachineEnrollment { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::RecordValidatedEnrollmentResponse { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::ActivateMachineEnrollment { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::PrepareMachineRetirement { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::RecordMachineRetirementTerminal { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::ConfirmMachinePurgeReadbackAbsent { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::RecordRootLostMachinePurge { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::FinalizeMachineLocalDeletion { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             SafetyCommand::RecordEnrollmentReceipt { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -3253,6 +3496,62 @@ fn handle_safety(
         SafetyCommand::ActivateMachineIdentity { binding, reply } => {
             let _ = reply.send(machine_identity::activate_machine_identity(
                 state, config, binding,
+            ));
+        }
+        SafetyCommand::PrepareMachineEnrollment { prepared, reply } => {
+            let _ = reply.send(machine_remote::prepare_machine_enrollment(
+                state, config, *prepared,
+            ));
+        }
+        SafetyCommand::RecordValidatedEnrollmentResponse { prepared, reply } => {
+            let _ = reply.send(machine_remote::record_validated_enrollment_response(
+                state, config, prepared,
+            ));
+        }
+        SafetyCommand::ActivateMachineEnrollment {
+            expected_request_hash,
+            expected_response_hash,
+            reply,
+        } => {
+            let _ = reply.send(machine_remote::activate_machine_enrollment(
+                state,
+                config,
+                expected_request_hash,
+                expected_response_hash,
+            ));
+        }
+        SafetyCommand::PrepareMachineRetirement { prepared, reply } => {
+            let _ = reply.send(machine_remote::prepare_machine_retirement(
+                state, config, prepared,
+            ));
+        }
+        SafetyCommand::RecordMachineRetirementTerminal { prepared, reply } => {
+            let _ = reply.send(machine_remote::record_machine_retirement_terminal(
+                state, config, prepared,
+            ));
+        }
+        SafetyCommand::ConfirmMachinePurgeReadbackAbsent { prepared, reply } => {
+            let _ = reply.send(machine_remote::confirm_machine_purge_readback_absent(
+                state, config, prepared,
+            ));
+        }
+        SafetyCommand::RecordRootLostMachinePurge { prepared, reply } => {
+            let _ = reply.send(machine_remote::record_root_lost_machine_purge(
+                state, config, *prepared,
+            ));
+        }
+        SafetyCommand::FinalizeMachineLocalDeletion {
+            expected_reset_kind,
+            expected_purge_proof_hash,
+            cleanup_witness_hash,
+            reply,
+        } => {
+            let _ = reply.send(machine_remote::finalize_machine_local_deletion(
+                state,
+                config,
+                expected_reset_kind,
+                expected_purge_proof_hash,
+                cleanup_witness_hash,
             ));
         }
         SafetyCommand::RecordEnrollmentReceipt { receipt, reply } => {
@@ -3452,6 +3751,13 @@ fn handle_read(
         }
         ReadCommand::LoadMachineIdentityState { reply } => {
             let _ = reply.send(machine_identity::load_machine_identity_state(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            ));
+        }
+        ReadCommand::LoadMachineEnrollmentState { reply } => {
+            let _ = reply.send(machine_remote::load_machine_enrollment_state(
                 &state.connection,
                 &state.key_bundle,
                 state.database_id,

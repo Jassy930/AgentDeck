@@ -143,7 +143,7 @@ fn runtime_bootstrap_quiesces_owned_resources_before_releasing_singleton() {
         "singleton lifetime",
         main_source,
         &[
-            "match run_main_loop(&config, &singleton_guard, &*key_store, storage_kek)",
+            "match run_main_loop(&config, &singleton_guard, key_store.clone(), storage_kek)",
             "drop((key_store, singleton_guard))",
         ],
     );

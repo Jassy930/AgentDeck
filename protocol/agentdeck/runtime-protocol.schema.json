@@ -4640,6 +4640,217 @@
       "title": "LocalOnlyAdministration",
       "type": "string"
     },
+    "MachineEnrollRequest": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "EnrollmentBundleV2": {
+          "additionalProperties": false,
+          "description": "本机 admin 创建、经用户控制的带外通道交给 daemon/CLI 的 enrollment bundle。",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "publicWssUrl": {
+              "type": "string"
+            },
+            "receiptVerifyKey": {
+              "$ref": "#/definitions/RelayReceiptVerifyKeyV1"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "spkiPins": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "version": {
+              "format": "uint16",
+              "maximum": 2.0,
+              "minimum": 2.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "code",
+            "expiresAtMs",
+            "publicWssUrl",
+            "receiptVerifyKey",
+            "relayServerId",
+            "spkiPins",
+            "version"
+          ],
+          "type": "object"
+        },
+        "LocalOnlyAdministration": {
+          "description": "local-only administration 信任边界标记。\n\n携带此标记的请求是 **local-only administration**：daemon 必须拒绝任何不是来自 same-UID UDS `LocalPrincipal` 的调用。它显式记录在类型、文档与 schema 中， 让客户端与审阅者都能确认该请求永不允许远端或 Relay 管理员发起。",
+          "enum": [
+            "localOnly"
+          ],
+          "type": "string"
+        },
+        "RelayReceiptVerifyKeyV1": {
+          "additionalProperties": false,
+          "description": "Enrollment 必须在 TLS CA/SPKI 校验完成后持久化的 Relay receipt trust anchor。\n\n`key_id` 与 public key 一起 pin；后续 receipt 必须同时匹配 RelayServerId、generation 和 key ID。MVP 固定 generation 1，若需要轮换必须更换 RelayServerId/重新 enrollment。",
+          "properties": {
+            "keyGeneration": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "keyId": {
+              "type": "string"
+            },
+            "publicKey": {
+              "type": "string"
+            },
+            "receiptFormatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "keyGeneration",
+            "keyId",
+            "publicKey",
+            "receiptFormatVersion",
+            "relayServerId"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "由 same-UID 本机管理员提交的 machine enrollment 请求。\n\nbundle 是 Relay admin 与 daemon/CLI 共用的严格共享 DTO；Runtime 只承载它， 不复制 enrollment JSON 形状，也不在公开 status 中回显 code、origin 或 pinset。",
+      "properties": {
+        "bundle": {
+          "$ref": "#/definitions/EnrollmentBundleV2"
+        },
+        "scope": {
+          "$ref": "#/definitions/LocalOnlyAdministration"
+        }
+      },
+      "required": [
+        "bundle",
+        "scope"
+      ],
+      "title": "MachineEnrollRequest",
+      "type": "object"
+    },
+    "MachineRemoteFailureCode": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "可公开读回的稳定 failure code；禁止自由文本、空值与无界字符串。",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z0-9._-]+$",
+      "title": "MachineRemoteFailureCode",
+      "type": "string"
+    },
+    "MachineRemoteLifecycle": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "machine remote 生命周期；不携带任何 enrollment secret、证书或 purge proof。",
+      "enum": [
+        "unenrolled",
+        "enrollmentPrepared",
+        "enrollmentResponseValidated",
+        "active",
+        "retirePending",
+        "relayCommitted",
+        "purgeReadbackAbsent",
+        "localDeleted",
+        "blocked"
+      ],
+      "title": "MachineRemoteLifecycle",
+      "type": "string"
+    },
+    "MachineRemoteStatus": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "MachineRemoteFailureCode": {
+          "description": "可公开读回的稳定 failure code；禁止自由文本、空值与无界字符串。",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z0-9._-]+$",
+          "type": "string"
+        },
+        "MachineRemoteLifecycle": {
+          "description": "machine remote 生命周期；不携带任何 enrollment secret、证书或 purge proof。",
+          "enum": [
+            "unenrolled",
+            "enrollmentPrepared",
+            "enrollmentResponseValidated",
+            "active",
+            "retirePending",
+            "relayCommitted",
+            "purgeReadbackAbsent",
+            "localDeleted",
+            "blocked"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "failureCode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MachineRemoteFailureCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lifecycle": {
+          "$ref": "#/definitions/MachineRemoteLifecycle"
+        },
+        "machineRoute": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "relayServerId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rootFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "lifecycle"
+      ],
+      "title": "MachineRemoteStatus",
+      "type": "object"
+    },
+    "MachineRootFingerprint": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "String",
+      "type": "string"
+    },
     "PairInvite": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "additionalProperties": false,
@@ -4749,6 +4960,161 @@
         }
       ],
       "title": "QueryReceiptSelector"
+    },
+    "RelayAdminPurgeReceiptV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "RelayAdminPurgeReadbackV1": {
+          "additionalProperties": false,
+          "description": "Relay purge transaction 后的精确 root-lost readback。\n\n唯一有效形状为 active machine routes 0、retired tombstones 1、其余 durable route/data counts 0，且没有 MachineRoot retirement hash/terminal。",
+          "properties": {
+            "activeMachineRoutes": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "consumedEnrollmentRecords": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "deviceGrants": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "frames": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retiredTombstones": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retirementHash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retirementTerminalPresent": {
+              "type": "boolean"
+            },
+            "revocations": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "streams": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "subscriptions": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "activeMachineRoutes",
+            "consumedEnrollmentRecords",
+            "deviceGrants",
+            "frames",
+            "retiredTombstones",
+            "retirementTerminalPresent",
+            "revocations",
+            "streams",
+            "subscriptions"
+          ],
+          "type": "object"
+        },
+        "RelayMachineTombstoneKindV1": {
+          "description": "portable proof 中可签名的 tombstone 类型。MVP 只有 root-lost admin purge； root-present retirement 继续使用 MachineRoot-signed `RetireMachine` terminal。",
+          "enum": [
+            "rootLostAdminPurge"
+          ],
+          "type": "string"
+        }
+      },
+      "description": "Relay receipt signer 输出的 portable root-lost purge proof。",
+      "properties": {
+        "enrollmentReceiptHash": {
+          "type": "string"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "purgeRequestHash": {
+          "type": "string"
+        },
+        "readback": {
+          "$ref": "#/definitions/RelayAdminPurgeReadbackV1"
+        },
+        "receiptFormatVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "receiptKeyGeneration": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "receiptKeyId": {
+          "type": "string"
+        },
+        "relayProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "relayServerId": {
+          "type": "string"
+        },
+        "rootFingerprint": {
+          "type": "string"
+        },
+        "rootKeyId": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string"
+        },
+        "tombstoneHash": {
+          "type": "string"
+        },
+        "tombstoneKind": {
+          "$ref": "#/definitions/RelayMachineTombstoneKindV1"
+        },
+        "trustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "enrollmentReceiptHash",
+        "machineRoute",
+        "purgeRequestHash",
+        "readback",
+        "receiptFormatVersion",
+        "receiptKeyGeneration",
+        "receiptKeyId",
+        "relayProtocolVersion",
+        "relayServerId",
+        "rootFingerprint",
+        "rootKeyId",
+        "signature",
+        "tombstoneHash",
+        "tombstoneKind",
+        "trustEpoch"
+      ],
+      "title": "RelayAdminPurgeReceiptV1",
+      "type": "object"
     },
     "RevocationReceipt": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -5795,12 +6161,141 @@
           ],
           "type": "string"
         },
+        "EnrollmentBundleV2": {
+          "additionalProperties": false,
+          "description": "本机 admin 创建、经用户控制的带外通道交给 daemon/CLI 的 enrollment bundle。",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "publicWssUrl": {
+              "type": "string"
+            },
+            "receiptVerifyKey": {
+              "$ref": "#/definitions/RelayReceiptVerifyKeyV1"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "spkiPins": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "version": {
+              "format": "uint16",
+              "maximum": 2.0,
+              "minimum": 2.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "code",
+            "expiresAtMs",
+            "publicWssUrl",
+            "receiptVerifyKey",
+            "relayServerId",
+            "spkiPins",
+            "version"
+          ],
+          "type": "object"
+        },
+        "FinalizerTrustResetRequestSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "adminPurgeReceipt": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RelayAdminPurgeReceiptV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "scope": {
+              "$ref": "#/definitions/LocalOnlyAdministration"
+            },
+            "uninstallPurge": {
+              "$ref": "#/definitions/UninstallPurgeTrue"
+            },
+            "uninstallPurgePlan": {
+              "$ref": "#/definitions/UninstallPurgePlanV1"
+            }
+          },
+          "required": [
+            "scope",
+            "uninstallPurge",
+            "uninstallPurgePlan"
+          ],
+          "type": "object"
+        },
         "LocalOnlyAdministration": {
           "description": "local-only administration 信任边界标记。\n\n携带此标记的请求是 **local-only administration**：daemon 必须拒绝任何不是来自 same-UID UDS `LocalPrincipal` 的调用。它显式记录在类型、文档与 schema 中， 让客户端与审阅者都能确认该请求永不允许远端或 Relay 管理员发起。",
           "enum": [
             "localOnly"
           ],
           "type": "string"
+        },
+        "MachineRemoteFailureCode": {
+          "description": "可公开读回的稳定 failure code；禁止自由文本、空值与无界字符串。",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z0-9._-]+$",
+          "type": "string"
+        },
+        "MachineRemoteLifecycle": {
+          "description": "machine remote 生命周期；不携带任何 enrollment secret、证书或 purge proof。",
+          "enum": [
+            "unenrolled",
+            "enrollmentPrepared",
+            "enrollmentResponseValidated",
+            "active",
+            "retirePending",
+            "relayCommitted",
+            "purgeReadbackAbsent",
+            "localDeleted",
+            "blocked"
+          ],
+          "type": "string"
+        },
+        "OrdinaryTrustResetRequestSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "adminPurgeReceipt": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RelayAdminPurgeReceiptV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "scope": {
+              "$ref": "#/definitions/LocalOnlyAdministration"
+            },
+            "uninstallPurge": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/UninstallPurgeFalse"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "scope"
+          ],
+          "type": "object"
         },
         "PendingPairing": {
           "additionalProperties": false,
@@ -5860,6 +6355,190 @@
         "PromptPayload": {
           "description": "已校验的 prompt 明文（≤ 256 KiB UTF-8）。构造与 wire 反序列化都强制上限。",
           "type": "string"
+        },
+        "RelayAdminPurgeReadbackV1": {
+          "additionalProperties": false,
+          "description": "Relay purge transaction 后的精确 root-lost readback。\n\n唯一有效形状为 active machine routes 0、retired tombstones 1、其余 durable route/data counts 0，且没有 MachineRoot retirement hash/terminal。",
+          "properties": {
+            "activeMachineRoutes": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "consumedEnrollmentRecords": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "deviceGrants": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "frames": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retiredTombstones": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retirementHash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retirementTerminalPresent": {
+              "type": "boolean"
+            },
+            "revocations": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "streams": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "subscriptions": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "activeMachineRoutes",
+            "consumedEnrollmentRecords",
+            "deviceGrants",
+            "frames",
+            "retiredTombstones",
+            "retirementTerminalPresent",
+            "revocations",
+            "streams",
+            "subscriptions"
+          ],
+          "type": "object"
+        },
+        "RelayAdminPurgeReceiptV1": {
+          "additionalProperties": false,
+          "description": "Relay receipt signer 输出的 portable root-lost purge proof。",
+          "properties": {
+            "enrollmentReceiptHash": {
+              "type": "string"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "purgeRequestHash": {
+              "type": "string"
+            },
+            "readback": {
+              "$ref": "#/definitions/RelayAdminPurgeReadbackV1"
+            },
+            "receiptFormatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "receiptKeyGeneration": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "receiptKeyId": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "rootFingerprint": {
+              "type": "string"
+            },
+            "rootKeyId": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "tombstoneHash": {
+              "type": "string"
+            },
+            "tombstoneKind": {
+              "$ref": "#/definitions/RelayMachineTombstoneKindV1"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "enrollmentReceiptHash",
+            "machineRoute",
+            "purgeRequestHash",
+            "readback",
+            "receiptFormatVersion",
+            "receiptKeyGeneration",
+            "receiptKeyId",
+            "relayProtocolVersion",
+            "relayServerId",
+            "rootFingerprint",
+            "rootKeyId",
+            "signature",
+            "tombstoneHash",
+            "tombstoneKind",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "RelayMachineTombstoneKindV1": {
+          "description": "portable proof 中可签名的 tombstone 类型。MVP 只有 root-lost admin purge； root-present retirement 继续使用 MachineRoot-signed `RetireMachine` terminal。",
+          "enum": [
+            "rootLostAdminPurge"
+          ],
+          "type": "string"
+        },
+        "RelayReceiptVerifyKeyV1": {
+          "additionalProperties": false,
+          "description": "Enrollment 必须在 TLS CA/SPKI 校验完成后持久化的 Relay receipt trust anchor。\n\n`key_id` 与 public key 一起 pin；后续 receipt 必须同时匹配 RelayServerId、generation 和 key ID。MVP 固定 generation 1，若需要轮换必须更换 RelayServerId/重新 enrollment。",
+          "properties": {
+            "keyGeneration": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "keyId": {
+              "type": "string"
+            },
+            "publicKey": {
+              "type": "string"
+            },
+            "receiptFormatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "keyGeneration",
+            "keyId",
+            "publicKey",
+            "receiptFormatVersion",
+            "relayServerId"
+          ],
+          "type": "object"
         },
         "RevokeTarget": {
           "description": "撤销目标：设备只能 revoke self；撤销其他设备是 local-only administration。",
@@ -7466,6 +8145,62 @@
             },
             {
               "additionalProperties": false,
+              "description": "machine enrollment / status / trust-reset 的最小生命周期读回。",
+              "properties": {
+                "failureCode": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/definitions/MachineRemoteFailureCode"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "lifecycle": {
+                  "$ref": "#/definitions/MachineRemoteLifecycle"
+                },
+                "machineRoute": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "relayServerId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reply": {
+                  "enum": [
+                    "machineRemoteStatus"
+                  ],
+                  "type": "string"
+                },
+                "rootFingerprint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "trustEpoch": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "lifecycle",
+                "reply"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
               "description": "类型化业务失败。",
               "properties": {
                 "code": {
@@ -8093,11 +8828,35 @@
             },
             {
               "additionalProperties": false,
-              "description": "machine trust reset —— local-only administration。",
+              "description": "使用共享 enrollment bundle 登记本机 —— local-only administration。",
+              "properties": {
+                "bundle": {
+                  "$ref": "#/definitions/EnrollmentBundleV2"
+                },
+                "request": {
+                  "enum": [
+                    "machineEnroll"
+                  ],
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/definitions/LocalOnlyAdministration"
+                }
+              },
+              "required": [
+                "bundle",
+                "request",
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "读取最小 machine remote lifecycle —— local-only administration。",
               "properties": {
                 "request": {
                   "enum": [
-                    "trustReset"
+                    "machineRemoteStatus"
                   ],
                   "type": "string"
                 },
@@ -8108,6 +8867,30 @@
               "required": [
                 "request",
                 "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/OrdinaryTrustResetRequestSchema"
+                },
+                {
+                  "$ref": "#/definitions/FinalizerTrustResetRequestSchema"
+                }
+              ],
+              "description": "machine trust reset —— local-only administration。\n\n`admin_purge_receipt` 仅用于 MachineRoot 已丢失的路径；有 root 时必须为 `None`，并保持既有 `{request, scope}` wire 逐字节不变。portable proof 使用 Relay/daemon 共用的严格 DTO，不接受 raw JSON 或 opaque bytes。",
+              "properties": {
+                "request": {
+                  "enum": [
+                    "trustReset"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "request"
               ],
               "type": "object"
             },
@@ -8496,6 +9279,72 @@
           ],
           "type": "object"
         },
+        "UninstallPurgeFalse": {
+          "enum": [
+            false
+          ],
+          "type": "boolean"
+        },
+        "UninstallPurgePlanV1": {
+          "additionalProperties": false,
+          "description": "CLI 预检 helper 后交给 daemon finalizer 的确定性 attestation plan。\n\n`planId = SHA256(domain || canonical attestation fields)[0..16]`。相同 helper attestation 在 CLI crash/retry 后得到同一 marker identity；任一字段变化都会得到 不同 ID，并由 daemon existing-only marker fail-close。",
+          "properties": {
+            "helperPath": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "helperSha256": {
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "helperVersion": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._+-]+$",
+              "type": "string"
+            },
+            "keychainAccessGroup": {
+              "maxLength": 255,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9.]+$",
+              "type": "string"
+            },
+            "planId": {
+              "type": "string"
+            },
+            "teamIdentifier": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]+$",
+              "type": "string"
+            },
+            "version": {
+              "format": "uint16",
+              "maximum": 1.0,
+              "minimum": 1.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "helperPath",
+            "helperSha256",
+            "helperVersion",
+            "keychainAccessGroup",
+            "planId",
+            "teamIdentifier",
+            "version"
+          ],
+          "type": "object"
+        },
+        "UninstallPurgeTrue": {
+          "enum": [
+            true
+          ],
+          "type": "boolean"
+        },
         "VendorCapabilities": {
           "oneOf": [
             {
@@ -8658,7 +9507,7 @@
           ]
         }
       },
-      "description": "Runtime v2 顶层封装。\n\n未派生 `PartialEq`：`RuntimeMessage` 传递内嵌未派生 `PartialEq` 的中立 trunk 类型； 本 task 不改动 trunk，契约测试以 wire round-trip 覆盖。",
+      "description": "Runtime v3 顶层封装。\n\n未派生 `PartialEq`：`RuntimeMessage` 传递内嵌未派生 `PartialEq` 的中立 trunk 类型； 本 task 不改动 trunk，契约测试以 wire round-trip 覆盖。",
       "properties": {
         "body": {
           "$ref": "#/definitions/RuntimeMessage"
@@ -12302,12 +13151,141 @@
           ],
           "type": "string"
         },
+        "EnrollmentBundleV2": {
+          "additionalProperties": false,
+          "description": "本机 admin 创建、经用户控制的带外通道交给 daemon/CLI 的 enrollment bundle。",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "publicWssUrl": {
+              "type": "string"
+            },
+            "receiptVerifyKey": {
+              "$ref": "#/definitions/RelayReceiptVerifyKeyV1"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "spkiPins": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "version": {
+              "format": "uint16",
+              "maximum": 2.0,
+              "minimum": 2.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "code",
+            "expiresAtMs",
+            "publicWssUrl",
+            "receiptVerifyKey",
+            "relayServerId",
+            "spkiPins",
+            "version"
+          ],
+          "type": "object"
+        },
+        "FinalizerTrustResetRequestSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "adminPurgeReceipt": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RelayAdminPurgeReceiptV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "scope": {
+              "$ref": "#/definitions/LocalOnlyAdministration"
+            },
+            "uninstallPurge": {
+              "$ref": "#/definitions/UninstallPurgeTrue"
+            },
+            "uninstallPurgePlan": {
+              "$ref": "#/definitions/UninstallPurgePlanV1"
+            }
+          },
+          "required": [
+            "scope",
+            "uninstallPurge",
+            "uninstallPurgePlan"
+          ],
+          "type": "object"
+        },
         "LocalOnlyAdministration": {
           "description": "local-only administration 信任边界标记。\n\n携带此标记的请求是 **local-only administration**：daemon 必须拒绝任何不是来自 same-UID UDS `LocalPrincipal` 的调用。它显式记录在类型、文档与 schema 中， 让客户端与审阅者都能确认该请求永不允许远端或 Relay 管理员发起。",
           "enum": [
             "localOnly"
           ],
           "type": "string"
+        },
+        "MachineRemoteFailureCode": {
+          "description": "可公开读回的稳定 failure code；禁止自由文本、空值与无界字符串。",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z0-9._-]+$",
+          "type": "string"
+        },
+        "MachineRemoteLifecycle": {
+          "description": "machine remote 生命周期；不携带任何 enrollment secret、证书或 purge proof。",
+          "enum": [
+            "unenrolled",
+            "enrollmentPrepared",
+            "enrollmentResponseValidated",
+            "active",
+            "retirePending",
+            "relayCommitted",
+            "purgeReadbackAbsent",
+            "localDeleted",
+            "blocked"
+          ],
+          "type": "string"
+        },
+        "OrdinaryTrustResetRequestSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "adminPurgeReceipt": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RelayAdminPurgeReceiptV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "scope": {
+              "$ref": "#/definitions/LocalOnlyAdministration"
+            },
+            "uninstallPurge": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/UninstallPurgeFalse"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "scope"
+          ],
+          "type": "object"
         },
         "PendingPairing": {
           "additionalProperties": false,
@@ -12367,6 +13345,190 @@
         "PromptPayload": {
           "description": "已校验的 prompt 明文（≤ 256 KiB UTF-8）。构造与 wire 反序列化都强制上限。",
           "type": "string"
+        },
+        "RelayAdminPurgeReadbackV1": {
+          "additionalProperties": false,
+          "description": "Relay purge transaction 后的精确 root-lost readback。\n\n唯一有效形状为 active machine routes 0、retired tombstones 1、其余 durable route/data counts 0，且没有 MachineRoot retirement hash/terminal。",
+          "properties": {
+            "activeMachineRoutes": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "consumedEnrollmentRecords": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "deviceGrants": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "frames": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retiredTombstones": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retirementHash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retirementTerminalPresent": {
+              "type": "boolean"
+            },
+            "revocations": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "streams": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "subscriptions": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "activeMachineRoutes",
+            "consumedEnrollmentRecords",
+            "deviceGrants",
+            "frames",
+            "retiredTombstones",
+            "retirementTerminalPresent",
+            "revocations",
+            "streams",
+            "subscriptions"
+          ],
+          "type": "object"
+        },
+        "RelayAdminPurgeReceiptV1": {
+          "additionalProperties": false,
+          "description": "Relay receipt signer 输出的 portable root-lost purge proof。",
+          "properties": {
+            "enrollmentReceiptHash": {
+              "type": "string"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "purgeRequestHash": {
+              "type": "string"
+            },
+            "readback": {
+              "$ref": "#/definitions/RelayAdminPurgeReadbackV1"
+            },
+            "receiptFormatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "receiptKeyGeneration": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "receiptKeyId": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "rootFingerprint": {
+              "type": "string"
+            },
+            "rootKeyId": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "tombstoneHash": {
+              "type": "string"
+            },
+            "tombstoneKind": {
+              "$ref": "#/definitions/RelayMachineTombstoneKindV1"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "enrollmentReceiptHash",
+            "machineRoute",
+            "purgeRequestHash",
+            "readback",
+            "receiptFormatVersion",
+            "receiptKeyGeneration",
+            "receiptKeyId",
+            "relayProtocolVersion",
+            "relayServerId",
+            "rootFingerprint",
+            "rootKeyId",
+            "signature",
+            "tombstoneHash",
+            "tombstoneKind",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "RelayMachineTombstoneKindV1": {
+          "description": "portable proof 中可签名的 tombstone 类型。MVP 只有 root-lost admin purge； root-present retirement 继续使用 MachineRoot-signed `RetireMachine` terminal。",
+          "enum": [
+            "rootLostAdminPurge"
+          ],
+          "type": "string"
+        },
+        "RelayReceiptVerifyKeyV1": {
+          "additionalProperties": false,
+          "description": "Enrollment 必须在 TLS CA/SPKI 校验完成后持久化的 Relay receipt trust anchor。\n\n`key_id` 与 public key 一起 pin；后续 receipt 必须同时匹配 RelayServerId、generation 和 key ID。MVP 固定 generation 1，若需要轮换必须更换 RelayServerId/重新 enrollment。",
+          "properties": {
+            "keyGeneration": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "keyId": {
+              "type": "string"
+            },
+            "publicKey": {
+              "type": "string"
+            },
+            "receiptFormatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "keyGeneration",
+            "keyId",
+            "publicKey",
+            "receiptFormatVersion",
+            "relayServerId"
+          ],
+          "type": "object"
         },
         "RevokeTarget": {
           "description": "撤销目标：设备只能 revoke self；撤销其他设备是 local-only administration。",
@@ -13911,6 +15073,62 @@
             },
             {
               "additionalProperties": false,
+              "description": "machine enrollment / status / trust-reset 的最小生命周期读回。",
+              "properties": {
+                "failureCode": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/definitions/MachineRemoteFailureCode"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "lifecycle": {
+                  "$ref": "#/definitions/MachineRemoteLifecycle"
+                },
+                "machineRoute": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "relayServerId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reply": {
+                  "enum": [
+                    "machineRemoteStatus"
+                  ],
+                  "type": "string"
+                },
+                "rootFingerprint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "trustEpoch": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "lifecycle",
+                "reply"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
               "description": "类型化业务失败。",
               "properties": {
                 "code": {
@@ -14538,11 +15756,35 @@
             },
             {
               "additionalProperties": false,
-              "description": "machine trust reset —— local-only administration。",
+              "description": "使用共享 enrollment bundle 登记本机 —— local-only administration。",
+              "properties": {
+                "bundle": {
+                  "$ref": "#/definitions/EnrollmentBundleV2"
+                },
+                "request": {
+                  "enum": [
+                    "machineEnroll"
+                  ],
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/definitions/LocalOnlyAdministration"
+                }
+              },
+              "required": [
+                "bundle",
+                "request",
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "读取最小 machine remote lifecycle —— local-only administration。",
               "properties": {
                 "request": {
                   "enum": [
-                    "trustReset"
+                    "machineRemoteStatus"
                   ],
                   "type": "string"
                 },
@@ -14553,6 +15795,30 @@
               "required": [
                 "request",
                 "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/OrdinaryTrustResetRequestSchema"
+                },
+                {
+                  "$ref": "#/definitions/FinalizerTrustResetRequestSchema"
+                }
+              ],
+              "description": "machine trust reset —— local-only administration。\n\n`admin_purge_receipt` 仅用于 MachineRoot 已丢失的路径；有 root 时必须为 `None`，并保持既有 `{request, scope}` wire 逐字节不变。portable proof 使用 Relay/daemon 共用的严格 DTO，不接受 raw JSON 或 opaque bytes。",
+              "properties": {
+                "request": {
+                  "enum": [
+                    "trustReset"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "request"
               ],
               "type": "object"
             },
@@ -14940,6 +16206,72 @@
             "elapsedMs"
           ],
           "type": "object"
+        },
+        "UninstallPurgeFalse": {
+          "enum": [
+            false
+          ],
+          "type": "boolean"
+        },
+        "UninstallPurgePlanV1": {
+          "additionalProperties": false,
+          "description": "CLI 预检 helper 后交给 daemon finalizer 的确定性 attestation plan。\n\n`planId = SHA256(domain || canonical attestation fields)[0..16]`。相同 helper attestation 在 CLI crash/retry 后得到同一 marker identity；任一字段变化都会得到 不同 ID，并由 daemon existing-only marker fail-close。",
+          "properties": {
+            "helperPath": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "helperSha256": {
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "helperVersion": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._+-]+$",
+              "type": "string"
+            },
+            "keychainAccessGroup": {
+              "maxLength": 255,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9.]+$",
+              "type": "string"
+            },
+            "planId": {
+              "type": "string"
+            },
+            "teamIdentifier": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]+$",
+              "type": "string"
+            },
+            "version": {
+              "format": "uint16",
+              "maximum": 1.0,
+              "minimum": 1.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "helperPath",
+            "helperSha256",
+            "helperVersion",
+            "keychainAccessGroup",
+            "planId",
+            "teamIdentifier",
+            "version"
+          ],
+          "type": "object"
+        },
+        "UninstallPurgeTrue": {
+          "enum": [
+            true
+          ],
+          "type": "boolean"
         },
         "VendorCapabilities": {
           "oneOf": [
@@ -16066,6 +17398,28 @@
             "modified",
             "deleted",
             "renamed"
+          ],
+          "type": "string"
+        },
+        "MachineRemoteFailureCode": {
+          "description": "可公开读回的稳定 failure code；禁止自由文本、空值与无界字符串。",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z0-9._-]+$",
+          "type": "string"
+        },
+        "MachineRemoteLifecycle": {
+          "description": "machine remote 生命周期；不携带任何 enrollment secret、证书或 purge proof。",
+          "enum": [
+            "unenrolled",
+            "enrollmentPrepared",
+            "enrollmentResponseValidated",
+            "active",
+            "retirePending",
+            "relayCommitted",
+            "purgeReadbackAbsent",
+            "localDeleted",
+            "blocked"
           ],
           "type": "string"
         },
@@ -17939,6 +19293,62 @@
         },
         {
           "additionalProperties": false,
+          "description": "machine enrollment / status / trust-reset 的最小生命周期读回。",
+          "properties": {
+            "failureCode": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/MachineRemoteFailureCode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "lifecycle": {
+              "$ref": "#/definitions/MachineRemoteLifecycle"
+            },
+            "machineRoute": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "relayServerId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reply": {
+              "enum": [
+                "machineRemoteStatus"
+              ],
+              "type": "string"
+            },
+            "rootFingerprint": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "lifecycle",
+            "reply"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "类型化业务失败。",
           "properties": {
             "code": {
@@ -18151,6 +19561,81 @@
             }
           ]
         },
+        "EnrollmentBundleV2": {
+          "additionalProperties": false,
+          "description": "本机 admin 创建、经用户控制的带外通道交给 daemon/CLI 的 enrollment bundle。",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "publicWssUrl": {
+              "type": "string"
+            },
+            "receiptVerifyKey": {
+              "$ref": "#/definitions/RelayReceiptVerifyKeyV1"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "spkiPins": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "version": {
+              "format": "uint16",
+              "maximum": 2.0,
+              "minimum": 2.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "code",
+            "expiresAtMs",
+            "publicWssUrl",
+            "receiptVerifyKey",
+            "relayServerId",
+            "spkiPins",
+            "version"
+          ],
+          "type": "object"
+        },
+        "FinalizerTrustResetRequestSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "adminPurgeReceipt": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RelayAdminPurgeReceiptV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "scope": {
+              "$ref": "#/definitions/LocalOnlyAdministration"
+            },
+            "uninstallPurge": {
+              "$ref": "#/definitions/UninstallPurgeTrue"
+            },
+            "uninstallPurgePlan": {
+              "$ref": "#/definitions/UninstallPurgePlanV1"
+            }
+          },
+          "required": [
+            "scope",
+            "uninstallPurge",
+            "uninstallPurgePlan"
+          ],
+          "type": "object"
+        },
         "LocalOnlyAdministration": {
           "description": "local-only administration 信任边界标记。\n\n携带此标记的请求是 **local-only administration**：daemon 必须拒绝任何不是来自 same-UID UDS `LocalPrincipal` 的调用。它显式记录在类型、文档与 schema 中， 让客户端与审阅者都能确认该请求永不允许远端或 Relay 管理员发起。",
           "enum": [
@@ -18158,9 +19643,225 @@
           ],
           "type": "string"
         },
+        "OrdinaryTrustResetRequestSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "adminPurgeReceipt": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RelayAdminPurgeReceiptV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "scope": {
+              "$ref": "#/definitions/LocalOnlyAdministration"
+            },
+            "uninstallPurge": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/UninstallPurgeFalse"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "scope"
+          ],
+          "type": "object"
+        },
         "PromptPayload": {
           "description": "已校验的 prompt 明文（≤ 256 KiB UTF-8）。构造与 wire 反序列化都强制上限。",
           "type": "string"
+        },
+        "RelayAdminPurgeReadbackV1": {
+          "additionalProperties": false,
+          "description": "Relay purge transaction 后的精确 root-lost readback。\n\n唯一有效形状为 active machine routes 0、retired tombstones 1、其余 durable route/data counts 0，且没有 MachineRoot retirement hash/terminal。",
+          "properties": {
+            "activeMachineRoutes": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "consumedEnrollmentRecords": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "deviceGrants": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "frames": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retiredTombstones": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retirementHash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retirementTerminalPresent": {
+              "type": "boolean"
+            },
+            "revocations": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "streams": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "subscriptions": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "activeMachineRoutes",
+            "consumedEnrollmentRecords",
+            "deviceGrants",
+            "frames",
+            "retiredTombstones",
+            "retirementTerminalPresent",
+            "revocations",
+            "streams",
+            "subscriptions"
+          ],
+          "type": "object"
+        },
+        "RelayAdminPurgeReceiptV1": {
+          "additionalProperties": false,
+          "description": "Relay receipt signer 输出的 portable root-lost purge proof。",
+          "properties": {
+            "enrollmentReceiptHash": {
+              "type": "string"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "purgeRequestHash": {
+              "type": "string"
+            },
+            "readback": {
+              "$ref": "#/definitions/RelayAdminPurgeReadbackV1"
+            },
+            "receiptFormatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "receiptKeyGeneration": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "receiptKeyId": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "rootFingerprint": {
+              "type": "string"
+            },
+            "rootKeyId": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "tombstoneHash": {
+              "type": "string"
+            },
+            "tombstoneKind": {
+              "$ref": "#/definitions/RelayMachineTombstoneKindV1"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "enrollmentReceiptHash",
+            "machineRoute",
+            "purgeRequestHash",
+            "readback",
+            "receiptFormatVersion",
+            "receiptKeyGeneration",
+            "receiptKeyId",
+            "relayProtocolVersion",
+            "relayServerId",
+            "rootFingerprint",
+            "rootKeyId",
+            "signature",
+            "tombstoneHash",
+            "tombstoneKind",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "RelayMachineTombstoneKindV1": {
+          "description": "portable proof 中可签名的 tombstone 类型。MVP 只有 root-lost admin purge； root-present retirement 继续使用 MachineRoot-signed `RetireMachine` terminal。",
+          "enum": [
+            "rootLostAdminPurge"
+          ],
+          "type": "string"
+        },
+        "RelayReceiptVerifyKeyV1": {
+          "additionalProperties": false,
+          "description": "Enrollment 必须在 TLS CA/SPKI 校验完成后持久化的 Relay receipt trust anchor。\n\n`key_id` 与 public key 一起 pin；后续 receipt 必须同时匹配 RelayServerId、generation 和 key ID。MVP 固定 generation 1，若需要轮换必须更换 RelayServerId/重新 enrollment。",
+          "properties": {
+            "keyGeneration": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "keyId": {
+              "type": "string"
+            },
+            "publicKey": {
+              "type": "string"
+            },
+            "receiptFormatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "keyGeneration",
+            "keyId",
+            "publicKey",
+            "receiptFormatVersion",
+            "relayServerId"
+          ],
+          "type": "object"
         },
         "RevokeTarget": {
           "description": "撤销目标：设备只能 revoke self；撤销其他设备是 local-only administration。",
@@ -18323,6 +20024,72 @@
               "type": "object"
             }
           ]
+        },
+        "UninstallPurgeFalse": {
+          "enum": [
+            false
+          ],
+          "type": "boolean"
+        },
+        "UninstallPurgePlanV1": {
+          "additionalProperties": false,
+          "description": "CLI 预检 helper 后交给 daemon finalizer 的确定性 attestation plan。\n\n`planId = SHA256(domain || canonical attestation fields)[0..16]`。相同 helper attestation 在 CLI crash/retry 后得到同一 marker identity；任一字段变化都会得到 不同 ID，并由 daemon existing-only marker fail-close。",
+          "properties": {
+            "helperPath": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "helperSha256": {
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "helperVersion": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._+-]+$",
+              "type": "string"
+            },
+            "keychainAccessGroup": {
+              "maxLength": 255,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9.]+$",
+              "type": "string"
+            },
+            "planId": {
+              "type": "string"
+            },
+            "teamIdentifier": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]+$",
+              "type": "string"
+            },
+            "version": {
+              "format": "uint16",
+              "maximum": 1.0,
+              "minimum": 1.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "helperPath",
+            "helperSha256",
+            "helperVersion",
+            "keychainAccessGroup",
+            "planId",
+            "teamIdentifier",
+            "version"
+          ],
+          "type": "object"
+        },
+        "UninstallPurgeTrue": {
+          "enum": [
+            true
+          ],
+          "type": "boolean"
         },
         "VendorConfigurationSnapshot": {
           "oneOf": [
@@ -18962,11 +20729,35 @@
         },
         {
           "additionalProperties": false,
-          "description": "machine trust reset —— local-only administration。",
+          "description": "使用共享 enrollment bundle 登记本机 —— local-only administration。",
+          "properties": {
+            "bundle": {
+              "$ref": "#/definitions/EnrollmentBundleV2"
+            },
+            "request": {
+              "enum": [
+                "machineEnroll"
+              ],
+              "type": "string"
+            },
+            "scope": {
+              "$ref": "#/definitions/LocalOnlyAdministration"
+            }
+          },
+          "required": [
+            "bundle",
+            "request",
+            "scope"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "读取最小 machine remote lifecycle —— local-only administration。",
           "properties": {
             "request": {
               "enum": [
-                "trustReset"
+                "machineRemoteStatus"
               ],
               "type": "string"
             },
@@ -18977,6 +20768,30 @@
           "required": [
             "request",
             "scope"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OrdinaryTrustResetRequestSchema"
+            },
+            {
+              "$ref": "#/definitions/FinalizerTrustResetRequestSchema"
+            }
+          ],
+          "description": "machine trust reset —— local-only administration。\n\n`admin_purge_receipt` 仅用于 MachineRoot 已丢失的路径；有 root 时必须为 `None`，并保持既有 `{request, scope}` wire 逐字节不变。portable proof 使用 Relay/daemon 共用的严格 DTO，不接受 raw JSON 或 opaque bytes。",
+          "properties": {
+            "request": {
+              "enum": [
+                "trustReset"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "request"
           ],
           "type": "object"
         },
@@ -21589,8 +23404,364 @@
       ],
       "title": "TransferEnvelope",
       "type": "object"
+    },
+    "TrustResetRequest": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OrdinaryTrustResetRequestSchema"
+        },
+        {
+          "$ref": "#/definitions/FinalizerTrustResetRequestSchema"
+        }
+      ],
+      "definitions": {
+        "FinalizerTrustResetRequestSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "adminPurgeReceipt": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RelayAdminPurgeReceiptV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "scope": {
+              "$ref": "#/definitions/LocalOnlyAdministration"
+            },
+            "uninstallPurge": {
+              "$ref": "#/definitions/UninstallPurgeTrue"
+            },
+            "uninstallPurgePlan": {
+              "$ref": "#/definitions/UninstallPurgePlanV1"
+            }
+          },
+          "required": [
+            "scope",
+            "uninstallPurge",
+            "uninstallPurgePlan"
+          ],
+          "type": "object"
+        },
+        "LocalOnlyAdministration": {
+          "description": "local-only administration 信任边界标记。\n\n携带此标记的请求是 **local-only administration**：daemon 必须拒绝任何不是来自 same-UID UDS `LocalPrincipal` 的调用。它显式记录在类型、文档与 schema 中， 让客户端与审阅者都能确认该请求永不允许远端或 Relay 管理员发起。",
+          "enum": [
+            "localOnly"
+          ],
+          "type": "string"
+        },
+        "OrdinaryTrustResetRequestSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "adminPurgeReceipt": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RelayAdminPurgeReceiptV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "scope": {
+              "$ref": "#/definitions/LocalOnlyAdministration"
+            },
+            "uninstallPurge": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/UninstallPurgeFalse"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "scope"
+          ],
+          "type": "object"
+        },
+        "RelayAdminPurgeReadbackV1": {
+          "additionalProperties": false,
+          "description": "Relay purge transaction 后的精确 root-lost readback。\n\n唯一有效形状为 active machine routes 0、retired tombstones 1、其余 durable route/data counts 0，且没有 MachineRoot retirement hash/terminal。",
+          "properties": {
+            "activeMachineRoutes": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "consumedEnrollmentRecords": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "deviceGrants": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "frames": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retiredTombstones": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "retirementHash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retirementTerminalPresent": {
+              "type": "boolean"
+            },
+            "revocations": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "streams": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "subscriptions": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "activeMachineRoutes",
+            "consumedEnrollmentRecords",
+            "deviceGrants",
+            "frames",
+            "retiredTombstones",
+            "retirementTerminalPresent",
+            "revocations",
+            "streams",
+            "subscriptions"
+          ],
+          "type": "object"
+        },
+        "RelayAdminPurgeReceiptV1": {
+          "additionalProperties": false,
+          "description": "Relay receipt signer 输出的 portable root-lost purge proof。",
+          "properties": {
+            "enrollmentReceiptHash": {
+              "type": "string"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "purgeRequestHash": {
+              "type": "string"
+            },
+            "readback": {
+              "$ref": "#/definitions/RelayAdminPurgeReadbackV1"
+            },
+            "receiptFormatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "receiptKeyGeneration": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "receiptKeyId": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "rootFingerprint": {
+              "type": "string"
+            },
+            "rootKeyId": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "tombstoneHash": {
+              "type": "string"
+            },
+            "tombstoneKind": {
+              "$ref": "#/definitions/RelayMachineTombstoneKindV1"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "enrollmentReceiptHash",
+            "machineRoute",
+            "purgeRequestHash",
+            "readback",
+            "receiptFormatVersion",
+            "receiptKeyGeneration",
+            "receiptKeyId",
+            "relayProtocolVersion",
+            "relayServerId",
+            "rootFingerprint",
+            "rootKeyId",
+            "signature",
+            "tombstoneHash",
+            "tombstoneKind",
+            "trustEpoch"
+          ],
+          "type": "object"
+        },
+        "RelayMachineTombstoneKindV1": {
+          "description": "portable proof 中可签名的 tombstone 类型。MVP 只有 root-lost admin purge； root-present retirement 继续使用 MachineRoot-signed `RetireMachine` terminal。",
+          "enum": [
+            "rootLostAdminPurge"
+          ],
+          "type": "string"
+        },
+        "UninstallPurgeFalse": {
+          "enum": [
+            false
+          ],
+          "type": "boolean"
+        },
+        "UninstallPurgePlanV1": {
+          "additionalProperties": false,
+          "description": "CLI 预检 helper 后交给 daemon finalizer 的确定性 attestation plan。\n\n`planId = SHA256(domain || canonical attestation fields)[0..16]`。相同 helper attestation 在 CLI crash/retry 后得到同一 marker identity；任一字段变化都会得到 不同 ID，并由 daemon existing-only marker fail-close。",
+          "properties": {
+            "helperPath": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "helperSha256": {
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "helperVersion": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._+-]+$",
+              "type": "string"
+            },
+            "keychainAccessGroup": {
+              "maxLength": 255,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9.]+$",
+              "type": "string"
+            },
+            "planId": {
+              "type": "string"
+            },
+            "teamIdentifier": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]+$",
+              "type": "string"
+            },
+            "version": {
+              "format": "uint16",
+              "maximum": 1.0,
+              "minimum": 1.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "helperPath",
+            "helperSha256",
+            "helperVersion",
+            "keychainAccessGroup",
+            "planId",
+            "teamIdentifier",
+            "version"
+          ],
+          "type": "object"
+        },
+        "UninstallPurgeTrue": {
+          "enum": [
+            true
+          ],
+          "type": "boolean"
+        }
+      },
+      "title": "TrustResetRequest"
+    },
+    "UninstallPurgePlanV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "CLI 预检 helper 后交给 daemon finalizer 的确定性 attestation plan。\n\n`planId = SHA256(domain || canonical attestation fields)[0..16]`。相同 helper attestation 在 CLI crash/retry 后得到同一 marker identity；任一字段变化都会得到 不同 ID，并由 daemon existing-only marker fail-close。",
+      "properties": {
+        "helperPath": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "helperSha256": {
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "helperVersion": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._+-]+$",
+          "type": "string"
+        },
+        "keychainAccessGroup": {
+          "maxLength": 255,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9.]+$",
+          "type": "string"
+        },
+        "planId": {
+          "type": "string"
+        },
+        "teamIdentifier": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9]+$",
+          "type": "string"
+        },
+        "version": {
+          "format": "uint16",
+          "maximum": 1.0,
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "helperPath",
+        "helperSha256",
+        "helperVersion",
+        "keychainAccessGroup",
+        "planId",
+        "teamIdentifier",
+        "version"
+      ],
+      "title": "UninstallPurgePlanV1",
+      "type": "object"
     }
   },
-  "title": "AgentDeck Runtime Protocol v2",
+  "title": "AgentDeck Runtime Protocol v3",
   "type": "object"
 }

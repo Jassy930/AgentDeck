@@ -194,7 +194,7 @@ pub(super) fn load_revision(
             Err(RuntimeStoreError::UnknownOrCorruptSchema)
         };
     }
-    if !matches!(version, 5..=8) {
+    if !(5..=super::schema::RUNTIME_SCHEMA_VERSION).contains(&version) {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
 

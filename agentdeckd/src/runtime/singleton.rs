@@ -94,6 +94,12 @@ pub struct SingletonGuard {
     data_dir: File,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SingletonAcquireMode {
+    CreateOrOpen,
+    ExistingOnly,
+}
+
 impl fmt::Debug for SingletonGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -105,17 +111,32 @@ impl fmt::Debug for SingletonGuard {
 
 impl SingletonGuard {
     pub fn acquire(paths: &DaemonPaths) -> Result<Self, SingletonError> {
+        Self::acquire_with_mode(paths, SingletonAcquireMode::CreateOrOpen)
+    }
+
+    /// one-shot recovery/finalizer 专用。这里只观察安装期已经存在的 data-dir 与
+    /// singleton lock；拒绝路径不得 mkdir、O_CREAT 或收紧旧目录权限。
+    pub(crate) fn acquire_existing(paths: &DaemonPaths) -> Result<Self, SingletonError> {
+        Self::acquire_with_mode(paths, SingletonAcquireMode::ExistingOnly)
+    }
+
+    fn acquire_with_mode(
+        paths: &DaemonPaths,
+        mode: SingletonAcquireMode,
+    ) -> Result<Self, SingletonError> {
         #[cfg(not(unix))]
         {
-            let _ = paths;
+            let _ = (paths, mode);
             return Err(SingletonError::UnsupportedPlatform);
         }
 
         #[cfg(unix)]
         {
-            paths.prepare_data_dir_entry()?;
-            let data_dir = open_data_dir(paths)?;
-            let (file, lock_name) = open_lock_file_at(paths, &data_dir)?;
+            if mode == SingletonAcquireMode::CreateOrOpen {
+                paths.prepare_data_dir_entry()?;
+            }
+            let data_dir = open_data_dir(paths, mode)?;
+            let (file, lock_name) = open_lock_file_at(paths, &data_dir, mode)?;
             validate_open_lock(paths, &data_dir, &file, &lock_name)?;
 
             // SAFETY: flock accepts a live file descriptor. LOCK_NB makes startup bounded;
@@ -195,7 +216,7 @@ impl SingletonGuard {
 }
 
 #[cfg(unix)]
-fn open_data_dir(paths: &DaemonPaths) -> Result<File, SingletonError> {
+fn open_data_dir(paths: &DaemonPaths, mode: SingletonAcquireMode) -> Result<File, SingletonError> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
 
@@ -221,7 +242,9 @@ fn open_data_dir(paths: &DaemonPaths) -> Result<File, SingletonError> {
     }
     // SAFETY: fd was returned uniquely by open and is transferred to File exactly once.
     let file = unsafe { File::from_raw_fd(fd) };
-    harden_stable_data_dir(paths, &file)?;
+    if mode == SingletonAcquireMode::CreateOrOpen {
+        harden_stable_data_dir(paths, &file)?;
+    }
     validate_data_dir(paths, &file)?;
     Ok(file)
 }
@@ -329,11 +352,21 @@ fn lock_name(paths: &DaemonPaths) -> Result<std::ffi::CString, SingletonError> {
 fn open_lock_file_at(
     paths: &DaemonPaths,
     directory: &File,
+    mode: SingletonAcquireMode,
 ) -> Result<(File, std::ffi::CString), SingletonError> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
     let name = lock_name(paths)?;
     let base_flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    if mode == SingletonAcquireMode::ExistingOnly {
+        // SAFETY: validated directory/name are live; deliberately no O_CREAT/fchmod.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), base_flags) };
+        if fd < 0 {
+            return Err(map_open_error(&paths.lock, io::Error::last_os_error()));
+        }
+        // SAFETY: fd is live and transferred to File exactly once.
+        return Ok((unsafe { File::from_raw_fd(fd) }, name));
+    }
     // SAFETY: directory and name are live; mode is used only with O_CREAT.
     let mut fd = unsafe {
         libc::openat(

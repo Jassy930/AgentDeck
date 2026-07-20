@@ -29,12 +29,14 @@ use super::cipher::{KeyWrapAad, RuntimeKeyBundle, WRAPPED_KEY_BUNDLE_V1_LEN};
 use super::schema::{
     EXPECTED_TABLES, EXPECTED_TABLES_V1, EXPECTED_TABLES_V2, EXPECTED_TABLES_V3,
     EXPECTED_TABLES_V4, EXPECTED_TABLES_V5, EXPECTED_TABLES_V6, EXPECTED_TABLES_V7,
-    RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_DDL_V1, RUNTIME_KEY_GENERATION, RUNTIME_MIGRATION_V2,
-    RUNTIME_MIGRATION_V3, RUNTIME_MIGRATION_V4, RUNTIME_MIGRATION_V5, RUNTIME_MIGRATION_V6,
-    RUNTIME_MIGRATION_V7, RUNTIME_MIGRATION_V8, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION,
-    RUNTIME_SCHEMA_VERSION_V5, RUNTIME_SCHEMA_VERSION_V6, RUNTIME_SCHEMA_VERSION_V7,
+    EXPECTED_TABLES_V8, RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_DDL_V1, RUNTIME_KEY_GENERATION,
+    RUNTIME_MIGRATION_V2, RUNTIME_MIGRATION_V3, RUNTIME_MIGRATION_V4, RUNTIME_MIGRATION_V5,
+    RUNTIME_MIGRATION_V6, RUNTIME_MIGRATION_V7, RUNTIME_MIGRATION_V8, RUNTIME_MIGRATION_V9,
+    RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V5,
+    RUNTIME_SCHEMA_VERSION_V6, RUNTIME_SCHEMA_VERSION_V7, RUNTIME_SCHEMA_VERSION_V8,
     schema_signature, schema_signature_v1, schema_signature_v2, schema_signature_v3,
     schema_signature_v4, schema_signature_v5, schema_signature_v6, schema_signature_v7,
+    schema_signature_v8,
 };
 
 const DATABASE_MODE: u32 = 0o600;
@@ -1863,13 +1865,96 @@ mod migration_tests {
         (before, authenticated_before, receipt_before)
     }
 
+    async fn build_populated_strict_v8_fixture(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+    ) -> (
+        CipherEvidence,
+        Vec<(String, Vec<Vec<u8>>)>,
+        Vec<EnrollmentReceiptRawEvidence>,
+    ) {
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(keys, &root.database()).expect("create strict v8 KEK"),
+        )
+        .await
+        .expect("create current fixture for v8 projection");
+        store.shutdown().await.expect("shutdown current v8 source");
+
+        let mut connection =
+            Connection::open(root.database()).expect("open current fixture for v8 projection");
+        let meta = read_meta(&connection)
+            .expect("read current meta for v8 projection")
+            .expect("current meta exists");
+        assert_eq!(meta.ledger.machine_identity_count, 0);
+        assert_eq!(meta.ledger.machine_remote_state_count, 0);
+        let storage_kek =
+            load_or_create_storage_kek(keys, &root.database()).expect("reload current fixture KEK");
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &meta.database_id,
+            },
+            &meta.wrapped_key_bundle,
+        )
+        .expect("unwrap current fixture key bundle");
+        let token = runtime_ledger_token_v8(&key_bundle, meta.database_id, &meta.ledger)
+            .expect("authenticate strict v8 ledger");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin exact v8 projection");
+        transaction
+            .execute_batch(
+                "DROP TABLE machine_remote_state;
+                 ALTER TABLE runtime_meta DROP COLUMN machine_remote_state_count;",
+            )
+            .expect("remove v9-only physical shape");
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE runtime_meta
+                     SET schema_version = 8, schema_signature = ?1, metadata_token = ?2
+                     WHERE singleton = 1 AND schema_version = 9",
+                    params![&schema_signature_v8()[..], &token[..]],
+                )
+                .expect("publish authenticated strict v8 meta"),
+            1
+        );
+        transaction
+            .execute(
+                "INSERT INTO machine_enrollment_receipts (
+                     relay_server_id, machine_route, root_fingerprint
+                 ) VALUES (?1, ?2, ?3)",
+                params![&[0x91_u8; 16][..], &[0x92_u8; 16][..], &[0x93_u8; 32][..]],
+            )
+            .expect("insert strict v8 rescue receipt");
+        transaction.commit().expect("commit exact v8 projection");
+        assert_eq!(
+            schema_manifest(&connection).expect("read strict v8 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V8).expect("build exact v8 manifest")
+        );
+        drop(connection);
+        let before = cipher_evidence(&root.database());
+        let authenticated_before = {
+            let connection =
+                Connection::open(root.database()).expect("open strict v8 authenticated evidence");
+            authenticated_blob_evidence(&connection)
+        };
+        let receipt_before = Connection::open(root.database())
+            .map(|connection| enrollment_receipt_raw_evidence(&connection))
+            .expect("read strict v8 receipt evidence");
+        (before, authenticated_before, receipt_before)
+    }
+
     async fn build_populated_strict_v5_fixture_with_metadata_mutation(
         root: &TestRoot,
         keys: &MemoryKeyStore,
         apply_metadata_mutation: bool,
     ) -> (CipherEvidence, Vec<(String, Vec<Vec<u8>>)>, RuntimeId) {
         let store = RuntimeStoreHandle::open(
-            RuntimeStoreConfig::new(root.database()),
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
             load_or_create_storage_kek(keys, &root.database()).expect("create populated v6 KEK"),
         )
         .await
@@ -1964,7 +2049,9 @@ mod migration_tests {
             .expect("publish populated v5 meta");
         connection
             .execute_batch(
-                "DROP TABLE machine_identity_state;
+                "DROP TABLE machine_remote_state;
+                 ALTER TABLE runtime_meta DROP COLUMN machine_remote_state_count;
+                 DROP TABLE machine_identity_state;
                  ALTER TABLE runtime_meta DROP COLUMN machine_identity_count;
                  DROP TABLE admin_commands;
                  ALTER TABLE runtime_meta DROP COLUMN admin_command_charged_bytes;
@@ -2307,14 +2394,14 @@ mod migration_tests {
         let key_bundle = RuntimeKeyBundle::fresh(RUNTIME_KEY_GENERATION).expect("fresh test keys");
         let database_id = [0x47; 16];
         let ledger = RuntimeLedger::default();
-        let baseline_v8 = runtime_ledger_token(&key_bundle, database_id, &ledger)
+        let baseline_v8 = runtime_ledger_token_v8(&key_bundle, database_id, &ledger)
             .expect("authenticate baseline v8 ledger");
         let baseline_v7 = runtime_ledger_token_v7(&key_bundle, database_id, &ledger)
             .expect("authenticate baseline v7 ledger");
         let mut changed = ledger;
         changed.machine_identity_count = 1;
         assert_ne!(
-            runtime_ledger_token(&key_bundle, database_id, &changed)
+            runtime_ledger_token_v8(&key_bundle, database_id, &changed)
                 .expect("authenticate changed v8 ledger"),
             baseline_v8
         );
@@ -2323,6 +2410,30 @@ mod migration_tests {
                 .expect("authenticate legacy v7 projection"),
             baseline_v7,
             "v7 token must ignore v8-only machine identity count while authenticating migration"
+        );
+    }
+
+    #[test]
+    fn v9_ledger_token_authenticates_remote_state_count_without_changing_v8_domain() {
+        let key_bundle = RuntimeKeyBundle::fresh(RUNTIME_KEY_GENERATION).expect("fresh test keys");
+        let database_id = [0x48; 16];
+        let ledger = RuntimeLedger::default();
+        let baseline_v9 = runtime_ledger_token(&key_bundle, database_id, &ledger)
+            .expect("authenticate baseline v9 ledger");
+        let baseline_v8 = runtime_ledger_token_v8(&key_bundle, database_id, &ledger)
+            .expect("authenticate baseline v8 ledger");
+        let mut changed = ledger;
+        changed.machine_remote_state_count = 1;
+        assert_ne!(
+            runtime_ledger_token(&key_bundle, database_id, &changed)
+                .expect("authenticate changed v9 ledger"),
+            baseline_v9
+        );
+        assert_eq!(
+            runtime_ledger_token_v8(&key_bundle, database_id, &changed)
+                .expect("authenticate legacy v8 projection"),
+            baseline_v8,
+            "v8 token must ignore v9-only machine remote state count while authenticating migration"
         );
     }
 
@@ -2627,24 +2738,24 @@ mod migration_tests {
     }
 
     #[tokio::test]
-    async fn fresh_v8_has_exact_empty_machine_identity_manifest_and_reopens_without_migration() {
-        let root = TestRoot::new("v8-fresh-machine-identity-manifest");
+    async fn fresh_v9_has_exact_empty_remote_manifest_and_reopens_without_migration() {
+        let root = TestRoot::new("v9-fresh-machine-remote-manifest");
         let keys = MemoryKeyStore::new();
         let store = RuntimeStoreHandle::open(
             RuntimeStoreConfig::new(root.database()),
-            load_or_create_storage_kek(&keys, &root.database()).expect("create fresh v8 KEK"),
+            load_or_create_storage_kek(&keys, &root.database()).expect("create fresh v9 KEK"),
         )
         .await
-        .expect("open fresh v8 store");
-        let snapshot = store.inspect().await.expect("inspect fresh v8 store");
+        .expect("open fresh v9 store");
+        let snapshot = store.inspect().await.expect("inspect fresh v9 store");
         assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION);
         assert_eq!(snapshot.table_names, EXPECTED_TABLES);
-        store.shutdown().await.expect("shutdown fresh v8 store");
+        store.shutdown().await.expect("shutdown fresh v9 store");
 
-        let connection = Connection::open(root.database()).expect("inspect fresh v8 database");
+        let connection = Connection::open(root.database()).expect("inspect fresh v9 database");
         assert_eq!(
-            schema_manifest(&connection).expect("read fresh v8 manifest"),
-            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v8 manifest")
+            schema_manifest(&connection).expect("read fresh v9 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v9 manifest")
         );
         let empty_admin: (i64, i64, i64, i64) = connection
             .query_row(
@@ -2655,7 +2766,7 @@ mod migration_tests {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
-            .expect("read fresh v8 admin totals");
+            .expect("read fresh v9 admin totals");
         assert_eq!(empty_admin, (0, 0, 0, 0));
         let empty_identity: (i64, i64) = connection
             .query_row(
@@ -2665,53 +2776,124 @@ mod migration_tests {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("read fresh v8 identity totals");
+            .expect("read fresh v9 identity totals");
         assert_eq!(empty_identity, (0, 0));
+        let empty_remote: (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM machine_remote_state),
+                        machine_remote_state_count
+                 FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read fresh v9 remote totals");
+        assert_eq!(empty_remote, (0, 0));
         drop(connection);
 
         let reopened = RuntimeStoreHandle::open(
             RuntimeStoreConfig::new(root.database()),
-            load_or_create_storage_kek(&keys, &root.database()).expect("reload fresh v8 KEK"),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload fresh v9 KEK"),
         )
         .await
-        .expect("reopen fresh v8 store without migration");
+        .expect("reopen fresh v9 store without migration");
         reopened
             .shutdown()
             .await
-            .expect("shutdown reopened v8 store");
+            .expect("shutdown reopened v9 store");
     }
 
     #[tokio::test]
-    async fn populated_v6_migrates_to_v8_without_rewrapping_or_reencrypting_existing_rows() {
-        let root = TestRoot::new("v6-populated-to-v8");
+    async fn v9_unaccounted_machine_remote_row_fails_full_open_without_artifact_rewrite() {
+        let root = TestRoot::new("v9-unaccounted-machine-remote-row");
+        let keys = MemoryKeyStore::new();
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database()).expect("create remote audit KEK"),
+        )
+        .await
+        .expect("open remote audit fixture");
+        store
+            .shutdown()
+            .await
+            .expect("shutdown remote audit fixture");
+
+        let connection =
+            Connection::open(root.database()).expect("open remote audit tamper writer");
+        assert_eq!(
+            connection
+                .execute(
+                    "INSERT INTO machine_remote_state (
+                         singleton, lifecycle, reset_kind, database_id, relay_server_id,
+                         machine_route, root_key_id, root_fingerprint, trust_epoch,
+                         request_hash, response_hash, enrollment_receipt_hash,
+                         receipt_verify_key_hash, sealed_state, sealed_state_bytes, metadata_token
+                     ) VALUES (
+                         1, 'enrollmentPrepared', NULL, ?1, ?2, ?3, ?4, ?5,
+                         '00000000000000000001', ?6, NULL, NULL, ?7, ?8, 40, ?9
+                     )",
+                    params![
+                        &[0x21_u8; 16][..],
+                        &[0x22_u8; 16][..],
+                        &[0x23_u8; 16][..],
+                        &[0x24_u8; 16][..],
+                        &[0x25_u8; 32][..],
+                        &[0x26_u8; 32][..],
+                        &[0x27_u8; 32][..],
+                        &[0x28_u8; 40][..],
+                        &[0x29_u8; 32][..],
+                    ],
+                )
+                .expect("insert structurally valid unauthenticated remote row"),
+            1
+        );
+        drop(connection);
+        let tampered = artifact_evidence(&root.database());
+
+        let error = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload remote audit KEK"),
+        )
+        .await
+        .expect_err("unaccounted remote row must fail full audit");
+        assert!(matches!(error, RuntimeStoreError::UnknownOrCorruptSchema));
+        assert_eq!(
+            artifact_evidence(&root.database()),
+            tampered,
+            "rejected remote row must not rewrite main/WAL/SHM/journal artifacts"
+        );
+    }
+
+    #[tokio::test]
+    async fn populated_v6_migrates_to_v9_without_rewrapping_or_reencrypting_existing_rows() {
+        let root = TestRoot::new("v6-populated-to-v9");
         let keys = MemoryKeyStore::new();
         let (before, authenticated_before) = build_populated_strict_v6_fixture(&root, &keys).await;
 
         let store = RuntimeStoreHandle::open(
-            RuntimeStoreConfig::new(root.database()),
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
             load_or_create_storage_kek(&keys, &root.database()).expect("reload strict v6 KEK"),
         )
         .await
-        .expect("migrate populated strict v6 fixture to v8");
-        let snapshot = store.inspect().await.expect("inspect migrated v8 store");
+        .expect("migrate populated strict v6 fixture to v9");
+        let snapshot = store.inspect().await.expect("inspect migrated v9 store");
         assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION);
         assert_eq!(snapshot.table_names, EXPECTED_TABLES);
-        store.shutdown().await.expect("shutdown migrated v8 store");
+        store.shutdown().await.expect("shutdown migrated v9 store");
 
         assert_eq!(
             cipher_evidence(&root.database()),
             before,
-            "v6 to v8 must preserve wrapped keys and existing ciphertext byte-exact"
+            "v6 to v9 must preserve wrapped keys and existing ciphertext byte-exact"
         );
-        let connection = Connection::open(root.database()).expect("inspect migrated v8 database");
+        let connection = Connection::open(root.database()).expect("inspect migrated v9 database");
         assert_eq!(
             authenticated_blob_evidence(&connection),
             authenticated_before,
-            "v6 to v8 must preserve every existing non-meta token and ciphertext byte-exact"
+            "v6 to v9 must preserve every existing non-meta token and ciphertext byte-exact"
         );
         assert_eq!(
-            schema_manifest(&connection).expect("read migrated v8 manifest"),
-            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v8 manifest")
+            schema_manifest(&connection).expect("read migrated v9 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v9 manifest")
         );
         let empty_admin: (i64, i64, i64, i64) = connection
             .query_row(
@@ -2722,13 +2904,13 @@ mod migration_tests {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
-            .expect("read migrated v8 admin totals");
+            .expect("read migrated v9 admin totals");
         assert_eq!(empty_admin, (0, 0, 0, 0));
     }
 
     #[tokio::test]
-    async fn populated_v7_migrates_to_v8_with_byte_exact_existing_authenticated_rows() {
-        let root = TestRoot::new("v7-populated-to-v8");
+    async fn populated_v7_migrates_to_v9_with_byte_exact_existing_authenticated_rows() {
+        let root = TestRoot::new("v7-populated-to-v9");
         let keys = MemoryKeyStore::new();
         let (before, authenticated_before, receipt_before) =
             build_populated_strict_v7_fixture(&root, &keys).await;
@@ -2749,35 +2931,35 @@ mod migration_tests {
         );
 
         let store = RuntimeStoreHandle::open(
-            RuntimeStoreConfig::new(root.database()),
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
             load_or_create_storage_kek(&keys, &root.database()).expect("reload strict v7 KEK"),
         )
         .await
-        .expect("migrate populated strict v7 fixture to v8");
-        let snapshot = store.inspect().await.expect("inspect migrated v8 store");
+        .expect("migrate populated strict v7 fixture to v9");
+        let snapshot = store.inspect().await.expect("inspect migrated v9 store");
         assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION);
         assert_eq!(snapshot.table_names, EXPECTED_TABLES);
-        store.shutdown().await.expect("shutdown migrated v8 store");
+        store.shutdown().await.expect("shutdown migrated v9 store");
 
         assert_eq!(
             cipher_evidence(&root.database()),
             before,
-            "v7 to v8 must preserve wrapped keys and ciphertext byte-exact"
+            "v7 to v9 must preserve wrapped keys and ciphertext byte-exact"
         );
-        let connection = Connection::open(root.database()).expect("inspect v7-to-v8 database");
+        let connection = Connection::open(root.database()).expect("inspect v7-to-v9 database");
         assert_eq!(
             authenticated_blob_evidence(&connection),
             authenticated_before,
-            "v7 to v8 must preserve every existing non-meta token and ciphertext byte-exact"
+            "v7 to v9 must preserve every existing non-meta token and ciphertext byte-exact"
         );
         assert_eq!(
             enrollment_receipt_raw_evidence(&connection),
             receipt_before,
-            "v7 to v8 must preserve every rescue receipt column byte-exact"
+            "v7 to v9 must preserve every rescue receipt column byte-exact"
         );
         assert_eq!(
-            schema_manifest(&connection).expect("read migrated v8 manifest"),
-            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v8 manifest")
+            schema_manifest(&connection).expect("read migrated v9 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v9 manifest")
         );
         let identity_totals: (i64, i64) = connection
             .query_row(
@@ -2791,29 +2973,107 @@ mod migration_tests {
         drop(connection);
         let rescue_after = artifact_evidence(&root.database());
         assert_eq!(
-            read_rescue_index(&root.database()).expect("read migrated v8 rescue index"),
+            read_rescue_index(&root.database()).expect("read migrated v9 rescue index"),
             expected_receipts
         );
         assert_eq!(
             artifact_evidence(&root.database()),
             rescue_after,
-            "migrated v8 rescue read must not rewrite runtime artifacts"
+            "migrated v9 rescue read must not rewrite runtime artifacts"
         );
     }
 
     #[tokio::test]
-    async fn v8_unauthenticated_admin_row_fails_closed_before_runtime_artifact_rewrite() {
-        let root = TestRoot::new("v8-nonempty-admin-fail-close");
+    async fn populated_v8_migrates_to_v9_with_byte_exact_receipts_and_crypto_context() {
+        let root = TestRoot::new("v8-populated-to-v9");
+        let keys = MemoryKeyStore::new();
+        let (before, authenticated_before, receipt_before) =
+            build_populated_strict_v8_fixture(&root, &keys).await;
+        let expected_receipts = vec![MachineEnrollmentReceiptRecord {
+            relay_server_id: [0x91; 16],
+            machine_route: [0x92; 16],
+            root_fingerprint: [0x93; 32],
+        }];
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        let rescue_before = artifact_evidence(&root.database());
+        assert_eq!(
+            read_rescue_index(&root.database()).expect("read strict v8 rescue index"),
+            expected_receipts
+        );
+        assert_eq!(
+            artifact_evidence(&root.database()),
+            rescue_before,
+            "v8 rescue read must not migrate or rewrite artifacts"
+        );
+
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload strict v8 KEK"),
+        )
+        .await
+        .expect("migrate populated strict v8 fixture to v9");
+        let snapshot = store.inspect().await.expect("inspect migrated v9 store");
+        assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION);
+        assert_eq!(snapshot.table_names, EXPECTED_TABLES);
+        store.shutdown().await.expect("shutdown migrated v9 store");
+
+        assert_eq!(
+            cipher_evidence(&root.database()),
+            before,
+            "v8 to v9 must preserve wrapped keys and ciphertext byte-exact"
+        );
+        let connection = Connection::open(root.database()).expect("inspect v8-to-v9 database");
+        assert_eq!(
+            authenticated_blob_evidence(&connection),
+            authenticated_before,
+            "v8 to v9 must preserve every existing non-meta token and ciphertext byte-exact"
+        );
+        assert_eq!(
+            enrollment_receipt_raw_evidence(&connection),
+            receipt_before,
+            "v8 to v9 must preserve every rescue receipt column byte-exact"
+        );
+        assert_eq!(
+            schema_manifest(&connection).expect("read migrated v9 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v9 manifest")
+        );
+        let remote_totals: (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM machine_remote_state),
+                        machine_remote_state_count
+                 FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated remote totals");
+        assert_eq!(remote_totals, (0, 0));
+        drop(connection);
+
+        let rescue_after = artifact_evidence(&root.database());
+        assert_eq!(
+            read_rescue_index(&root.database()).expect("read migrated v9 rescue index"),
+            expected_receipts
+        );
+        assert_eq!(
+            artifact_evidence(&root.database()),
+            rescue_after,
+            "migrated v9 rescue read must not rewrite runtime artifacts"
+        );
+    }
+
+    #[tokio::test]
+    async fn v9_unauthenticated_admin_row_fails_closed_before_runtime_artifact_rewrite() {
+        let root = TestRoot::new("v9-nonempty-admin-fail-close");
         let keys = MemoryKeyStore::new();
         let store = RuntimeStoreHandle::open(
             RuntimeStoreConfig::new(root.database()),
-            load_or_create_storage_kek(&keys, &root.database()).expect("create v8 guard KEK"),
+            load_or_create_storage_kek(&keys, &root.database()).expect("create v9 guard KEK"),
         )
         .await
-        .expect("open v8 guard fixture");
-        store.shutdown().await.expect("shutdown v8 guard fixture");
+        .expect("open v9 guard fixture");
+        store.shutdown().await.expect("shutdown v9 guard fixture");
 
-        let connection = Connection::open(root.database()).expect("open v8 admin tamper fixture");
+        let connection = Connection::open(root.database()).expect("open v9 admin tamper fixture");
         assert_eq!(
             connection
                 .execute(
@@ -2839,7 +3099,7 @@ mod migration_tests {
 
         let error = RuntimeStoreHandle::open(
             RuntimeStoreConfig::new(root.database()),
-            load_or_create_storage_kek(&keys, &root.database()).expect("reload v8 guard KEK"),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload v9 guard KEK"),
         )
         .await
         .expect_err("A2 streaming audit must reject an unauthenticated admin row");
@@ -2850,7 +3110,7 @@ mod migration_tests {
         assert_eq!(
             artifact_evidence(&root.database()),
             artifacts_before,
-            "rejected v8 admin row must not rewrite main/WAL/SHM/journal artifacts"
+            "rejected v9 admin row must not rewrite main/WAL/SHM/journal artifacts"
         );
     }
 
@@ -2943,7 +3203,10 @@ mod migration_tests {
                 LegacySchemaVersion::V2 => "v2",
                 LegacySchemaVersion::V3 => "v3",
                 LegacySchemaVersion::V4 => "v4",
-                LegacySchemaVersion::V5 | LegacySchemaVersion::V6 | LegacySchemaVersion::V7 => {
+                LegacySchemaVersion::V5
+                | LegacySchemaVersion::V6
+                | LegacySchemaVersion::V7
+                | LegacySchemaVersion::V8 => {
                     unreachable!("table only covers legacy v1-v4")
                 }
             };
@@ -2962,7 +3225,10 @@ mod migration_tests {
                 LegacySchemaVersion::V4 => {
                     build_populated_strict_v4_fixture(&root, &keys).await;
                 }
-                LegacySchemaVersion::V5 | LegacySchemaVersion::V6 | LegacySchemaVersion::V7 => {
+                LegacySchemaVersion::V5
+                | LegacySchemaVersion::V6
+                | LegacySchemaVersion::V7
+                | LegacySchemaVersion::V8 => {
                     unreachable!("table only covers legacy v1-v4")
                 }
             }
@@ -4139,6 +4405,8 @@ mod migration_tests {
 
     struct MigrationLowDisk;
 
+    struct MigrationGenerousDisk;
+
     struct TamperAfterLegacyAuthentication {
         tampered: AtomicBool,
     }
@@ -4154,6 +4422,31 @@ mod migration_tests {
                 shm_bytes: 0,
                 filesystem_total_bytes: 4 * 1024 * 1024 * 1024,
                 filesystem_available_bytes: 1,
+            })
+        }
+    }
+
+    impl RuntimeCapacityProbe for MigrationGenerousDisk {
+        fn observe(
+            &self,
+            database_path: &Path,
+        ) -> Result<RuntimeCapacityObservation, RuntimeCapacityProbeError> {
+            let artifact_bytes = |path: &Path| -> Result<u64, RuntimeCapacityProbeError> {
+                match fs::metadata(path) {
+                    Ok(metadata) => Ok(metadata.len()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                    Err(source) => Err(RuntimeCapacityProbeError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    }),
+                }
+            };
+            Ok(RuntimeCapacityObservation {
+                main_bytes: artifact_bytes(database_path)?,
+                wal_bytes: artifact_bytes(&sidecar(database_path, "-wal"))?,
+                shm_bytes: artifact_bytes(&sidecar(database_path, "-shm"))?,
+                filesystem_total_bytes: 1024 * 1024 * 1024 * 1024,
+                filesystem_available_bytes: 1024 * 1024 * 1024 * 1024,
             })
         }
     }
@@ -4674,6 +4967,7 @@ pub(crate) struct RuntimeLedger {
     pub admin_command_pending_count: u64,
     pub admin_command_charged_bytes: u64,
     pub machine_identity_count: u64,
+    pub machine_remote_state_count: u64,
     pub accepted_count: u64,
     pub accepted_payload_bytes: u64,
     pub started_without_fence_count: u64,
@@ -4690,6 +4984,7 @@ enum SchemaState {
     LegacyV5(MetaRow, StoreFileIdentity),
     LegacyV6(MetaRow, StoreFileIdentity),
     LegacyV7(MetaRow, StoreFileIdentity),
+    LegacyV8(MetaRow, StoreFileIdentity),
     Current(MetaRow, StoreFileIdentity),
 }
 
@@ -4702,6 +4997,7 @@ enum LegacySchemaVersion {
     V5,
     V6,
     V7,
+    V8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4836,6 +5132,14 @@ where
             identity,
             LegacySchemaVersion::V7,
         ),
+        SchemaState::LegacyV8(meta, identity) => open_legacy(
+            config,
+            storage_path,
+            &storage_kek,
+            meta,
+            identity,
+            LegacySchemaVersion::V8,
+        ),
         SchemaState::Current(meta, identity) => open_current(
             config,
             storage_path,
@@ -4901,6 +5205,7 @@ fn open_fresh(
         transaction.execute_batch(RUNTIME_MIGRATION_V6)?;
         transaction.execute_batch(RUNTIME_MIGRATION_V7)?;
         transaction.execute_batch(RUNTIME_MIGRATION_V8)?;
+        transaction.execute_batch(RUNTIME_MIGRATION_V9)?;
         transaction.execute(
             "INSERT INTO runtime_meta (
                  singleton, schema_family, schema_version, schema_signature,
@@ -5054,6 +5359,7 @@ fn open_legacy(
         LegacySchemaVersion::V5 => verify_runtime_ledger_token_v5(&key_bundle, &inspected)?,
         LegacySchemaVersion::V6 => verify_runtime_ledger_token_v6(&key_bundle, &inspected)?,
         LegacySchemaVersion::V7 => verify_runtime_ledger_token_v7(&key_bundle, &inspected)?,
+        LegacySchemaVersion::V8 => verify_runtime_ledger_token_v8(&key_bundle, &inspected)?,
     }
 
     validate_database_file(&storage_path)?;
@@ -5071,6 +5377,7 @@ fn open_legacy(
         LegacySchemaVersion::V5 => read_and_validate_legacy_v5_schema(&connection)?,
         LegacySchemaVersion::V6 => read_and_validate_legacy_v6_schema(&connection)?,
         LegacySchemaVersion::V7 => read_and_validate_legacy_v7_schema(&connection)?,
+        LegacySchemaVersion::V8 => read_and_validate_legacy_v8_schema(&connection)?,
     };
     if !same_meta(&inspected, &current) {
         return Err(RuntimeStoreError::SchemaInspectionRaced);
@@ -5093,7 +5400,8 @@ fn open_legacy(
         | LegacySchemaVersion::V4
         | LegacySchemaVersion::V5
         | LegacySchemaVersion::V6
-        | LegacySchemaVersion::V7 => {
+        | LegacySchemaVersion::V7
+        | LegacySchemaVersion::V8 => {
             super::journal::validate_store_integrity(
                 &connection,
                 &key_bundle,
@@ -5113,7 +5421,10 @@ fn open_legacy(
     // 改写 main/WAL/SHM。
     let v5_projection = if matches!(
         legacy_version,
-        LegacySchemaVersion::V5 | LegacySchemaVersion::V6 | LegacySchemaVersion::V7
+        LegacySchemaVersion::V5
+            | LegacySchemaVersion::V6
+            | LegacySchemaVersion::V7
+            | LegacySchemaVersion::V8
     ) {
         0
     } else {
@@ -5121,7 +5432,10 @@ fn open_legacy(
     };
     let migration_projection = match legacy_version {
         LegacySchemaVersion::V4 => v5_projection,
-        LegacySchemaVersion::V5 | LegacySchemaVersion::V6 | LegacySchemaVersion::V7 => 0,
+        LegacySchemaVersion::V5
+        | LegacySchemaVersion::V6
+        | LegacySchemaVersion::V7
+        | LegacySchemaVersion::V8 => 0,
         LegacySchemaVersion::V1 | LegacySchemaVersion::V2 | LegacySchemaVersion::V3 => {
             super::stream::migration_projection_bytes(&connection)?
                 .checked_add(v5_projection)
@@ -5146,6 +5460,7 @@ fn open_legacy(
         LegacySchemaVersion::V5 => schema_signature_v5(),
         LegacySchemaVersion::V6 => schema_signature_v6(),
         LegacySchemaVersion::V7 => schema_signature_v7(),
+        LegacySchemaVersion::V8 => schema_signature_v8(),
     };
     let new_signature = schema_signature();
     let old_token = match legacy_version {
@@ -5170,6 +5485,9 @@ fn open_legacy(
         LegacySchemaVersion::V7 => {
             runtime_ledger_token_v7(&key_bundle, current.database_id, &current.ledger)?
         }
+        LegacySchemaVersion::V8 => {
+            runtime_ledger_token_v8(&key_bundle, current.database_id, &current.ledger)?
+        }
     };
     let mut transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // 容量 probe 与 BEGIN 之间不能沿用先前认证结果：同 UID 的另一 SQLite
@@ -5184,6 +5502,7 @@ fn open_legacy(
         LegacySchemaVersion::V5 => read_and_validate_legacy_v5_schema(&transaction)?,
         LegacySchemaVersion::V6 => read_and_validate_legacy_v6_schema(&transaction)?,
         LegacySchemaVersion::V7 => read_and_validate_legacy_v7_schema(&transaction)?,
+        LegacySchemaVersion::V8 => read_and_validate_legacy_v8_schema(&transaction)?,
     };
     if !same_meta(&current, &locked) {
         return Err(RuntimeStoreError::SchemaInspectionRaced);
@@ -5207,6 +5526,7 @@ fn open_legacy(
         LegacySchemaVersion::V5 => verify_runtime_ledger_token_v5(&key_bundle, &locked)?,
         LegacySchemaVersion::V6 => verify_runtime_ledger_token_v6(&key_bundle, &locked)?,
         LegacySchemaVersion::V7 => verify_runtime_ledger_token_v7(&key_bundle, &locked)?,
+        LegacySchemaVersion::V8 => verify_runtime_ledger_token_v8(&key_bundle, &locked)?,
     }
     if legacy_version != LegacySchemaVersion::V1 {
         super::journal::validate_store_integrity(&transaction, &key_bundle, locked.database_id)?;
@@ -5226,6 +5546,7 @@ fn open_legacy(
             | LegacySchemaVersion::V5
             | LegacySchemaVersion::V6
             | LegacySchemaVersion::V7
+            | LegacySchemaVersion::V8
     ) {
         current.ledger.clone()
     } else {
@@ -5239,7 +5560,10 @@ fn open_legacy(
     };
     if !matches!(
         legacy_version,
-        LegacySchemaVersion::V5 | LegacySchemaVersion::V6 | LegacySchemaVersion::V7
+        LegacySchemaVersion::V5
+            | LegacySchemaVersion::V6
+            | LegacySchemaVersion::V7
+            | LegacySchemaVersion::V8
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V5)?;
         super::configuration::materialize_legacy_v4_states(
@@ -5250,14 +5574,20 @@ fn open_legacy(
     }
     if !matches!(
         legacy_version,
-        LegacySchemaVersion::V6 | LegacySchemaVersion::V7
+        LegacySchemaVersion::V6 | LegacySchemaVersion::V7 | LegacySchemaVersion::V8
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V6)?;
     }
-    if legacy_version != LegacySchemaVersion::V7 {
+    if !matches!(
+        legacy_version,
+        LegacySchemaVersion::V7 | LegacySchemaVersion::V8
+    ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V7)?;
     }
-    transaction.execute_batch(RUNTIME_MIGRATION_V8)?;
+    if legacy_version != LegacySchemaVersion::V8 {
+        transaction.execute_batch(RUNTIME_MIGRATION_V8)?;
+    }
+    transaction.execute_batch(RUNTIME_MIGRATION_V9)?;
     let new_token = runtime_ledger_token(&key_bundle, current.database_id, &migrated_ledger)?;
     if transaction.execute(
         "UPDATE runtime_meta
@@ -5275,9 +5605,10 @@ fn open_legacy(
              command_configuration_pin_count = ?20,
              metadata_mutation_count = ?21, active_metadata_mutation_count = ?22,
              metadata_mutation_charged_bytes = ?23,
-             machine_identity_count = ?24, metadata_token = ?25
-         WHERE singleton = 1 AND schema_version = ?26 AND schema_signature = ?27
-           AND metadata_token = ?28",
+             machine_identity_count = ?24, machine_remote_state_count = ?25,
+             metadata_token = ?26
+         WHERE singleton = 1 AND schema_version = ?27 AND schema_signature = ?28
+           AND metadata_token = ?29",
         params![
             i64::from(RUNTIME_SCHEMA_VERSION),
             &new_signature[..],
@@ -5324,6 +5655,8 @@ fn open_legacy(
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             i64::try_from(migrated_ledger.machine_identity_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(migrated_ledger.machine_remote_state_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             &new_token[..],
             match legacy_version {
                 LegacySchemaVersion::V1 => 1_i64,
@@ -5333,6 +5666,7 @@ fn open_legacy(
                 LegacySchemaVersion::V5 => 5_i64,
                 LegacySchemaVersion::V6 => 6_i64,
                 LegacySchemaVersion::V7 => 7_i64,
+                LegacySchemaVersion::V8 => 8_i64,
             },
             &old_signature[..],
             &old_token[..],
@@ -5492,11 +5826,21 @@ fn inspect_schema(path: &Path, storage_kek: &StorageKek) -> Result<SchemaState, 
                     )?;
                     SchemaState::LegacyV7(legacy, identity.clone())
                 }
+                RUNTIME_SCHEMA_VERSION_V8 if family == RUNTIME_SCHEMA_FAMILY => {
+                    let legacy = read_and_validate_legacy_v8_schema(connection)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V8,
+                    )?;
+                    SchemaState::LegacyV8(legacy, identity.clone())
+                }
                 RUNTIME_SCHEMA_VERSION if family == RUNTIME_SCHEMA_FAMILY => {
                     let current = read_and_validate_current_schema(connection)?;
                     // WAL recovery 的 schema inspection 已在私有 rescue 副本上看到完整
                     // committed state。必须在碰原库 RW handle 前认证 configuration state/pin：
-                    // 否则 corrupt current v8 虽会 fail-close，RW connection drop 仍可能把
+                    // 否则 corrupt current v9 虽会 fail-close，RW connection drop 仍可能把
                     // 原 WAL checkpoint 进 main，破坏“拒绝即零改写”的证据边界。
                     validate_current_before_read_write_open(connection, storage_kek, &current)?;
                     SchemaState::Current(current, identity.clone())
@@ -5548,6 +5892,7 @@ fn validate_legacy_before_read_write_open(
         LegacySchemaVersion::V5 => verify_runtime_ledger_token_v5(&key_bundle, legacy)?,
         LegacySchemaVersion::V6 => verify_runtime_ledger_token_v6(&key_bundle, legacy)?,
         LegacySchemaVersion::V7 => verify_runtime_ledger_token_v7(&key_bundle, legacy)?,
+        LegacySchemaVersion::V8 => verify_runtime_ledger_token_v8(&key_bundle, legacy)?,
     }
     if legacy_version == LegacySchemaVersion::V5 {
         reject_legacy_v5_native_projection(connection)?;
@@ -5567,7 +5912,8 @@ fn validate_legacy_before_read_write_open(
         | LegacySchemaVersion::V4
         | LegacySchemaVersion::V5
         | LegacySchemaVersion::V6
-        | LegacySchemaVersion::V7 => {
+        | LegacySchemaVersion::V7
+        | LegacySchemaVersion::V8 => {
             super::journal::validate_store_integrity(connection, &key_bundle, legacy.database_id)?;
         }
     }
@@ -5788,6 +6134,28 @@ fn read_and_validate_legacy_v7_schema(
         || meta.metadata_token.len() != 32
         || table_names(connection)? != EXPECTED_TABLES_V7
         || schema_manifest(connection)? != expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V7)?
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(meta)
+}
+
+fn read_and_validate_legacy_v8_schema(
+    connection: &Connection,
+) -> Result<MetaRow, RuntimeStoreError> {
+    let Some(meta) =
+        read_meta_v8(connection).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+    else {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    };
+    if meta.family != RUNTIME_SCHEMA_FAMILY
+        || meta.version != RUNTIME_SCHEMA_VERSION_V8
+        || meta.signature != schema_signature_v8()
+        || meta.key_generation != RUNTIME_KEY_GENERATION
+        || meta.wrapped_key_bundle.len() != WRAPPED_KEY_BUNDLE_V1_LEN
+        || meta.metadata_token.len() != 32
+        || table_names(connection)? != EXPECTED_TABLES_V8
+        || schema_manifest(connection)? != expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V8)?
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
@@ -6653,7 +7021,7 @@ fn read_meta_v7(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Er
     Ok(Some(meta))
 }
 
-fn read_meta(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
+fn read_meta_v8(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
     let Some(mut meta) = read_meta_v7(connection)? else {
         return Ok(None);
     };
@@ -6670,6 +7038,26 @@ fn read_meta(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error
         ));
     }
     meta.ledger.machine_identity_count = count;
+    Ok(Some(meta))
+}
+
+fn read_meta(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
+    let Some(mut meta) = read_meta_v8(connection)? else {
+        return Ok(None);
+    };
+    let raw: i64 = connection.query_row(
+        "SELECT machine_remote_state_count FROM runtime_meta WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let count = sqlite_nonnegative_u64(51, raw)?;
+    if count > 1 {
+        return Err(rusqlite::Error::IntegralValueOutOfRange(
+            51,
+            i64::try_from(count).unwrap_or(i64::MAX),
+        ));
+    }
+    meta.ledger.machine_remote_state_count = count;
     Ok(Some(meta))
 }
 
@@ -6976,6 +7364,7 @@ fn read_meta_with_sql(
                         admin_command_pending_count: 0,
                         admin_command_charged_bytes: 0,
                         machine_identity_count: 0,
+                        machine_remote_state_count: 0,
                         accepted_count,
                         accepted_payload_bytes,
                         started_without_fence_count,
@@ -7057,6 +7446,15 @@ fn expected_schema_manifest(version: u32) -> Result<Vec<SchemaObject>, RuntimeSt
             connection.execute_batch(RUNTIME_MIGRATION_V6)?;
             connection.execute_batch(RUNTIME_MIGRATION_V7)?;
         }
+        RUNTIME_SCHEMA_VERSION_V8 => {
+            connection.execute_batch(RUNTIME_MIGRATION_V2)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V3)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V4)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V5)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V6)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V7)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V8)?;
+        }
         RUNTIME_SCHEMA_VERSION => {
             connection.execute_batch(RUNTIME_MIGRATION_V2)?;
             connection.execute_batch(RUNTIME_MIGRATION_V3)?;
@@ -7065,6 +7463,7 @@ fn expected_schema_manifest(version: u32) -> Result<Vec<SchemaObject>, RuntimeSt
             connection.execute_batch(RUNTIME_MIGRATION_V6)?;
             connection.execute_batch(RUNTIME_MIGRATION_V7)?;
             connection.execute_batch(RUNTIME_MIGRATION_V8)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V9)?;
         }
         _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
     }
@@ -7233,7 +7632,7 @@ fn runtime_ledger_token_v7(
     Ok(*token.as_bytes())
 }
 
-fn runtime_ledger_token(
+fn runtime_ledger_token_v8(
     key_bundle: &RuntimeKeyBundle,
     database_id: [u8; 16],
     ledger: &RuntimeLedger,
@@ -7242,6 +7641,19 @@ fn runtime_ledger_token(
     message.reserve(std::mem::size_of::<u64>());
     message.extend_from_slice(&ledger.machine_identity_count.to_be_bytes());
     let token = key_bundle.blind_index(super::schema::RUNTIME_LEDGER_DOMAIN_V8, &message)?;
+    Ok(*token.as_bytes())
+}
+
+fn runtime_ledger_token(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &RuntimeLedger,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let mut message = runtime_ledger_message_v7(database_id, ledger);
+    message.reserve(2 * std::mem::size_of::<u64>());
+    message.extend_from_slice(&ledger.machine_identity_count.to_be_bytes());
+    message.extend_from_slice(&ledger.machine_remote_state_count.to_be_bytes());
+    let token = key_bundle.blind_index(super::schema::RUNTIME_LEDGER_DOMAIN_V9, &message)?;
     Ok(*token.as_bytes())
 }
 
@@ -7401,6 +7813,17 @@ fn verify_runtime_ledger_token_v7(
     Ok(())
 }
 
+fn verify_runtime_ledger_token_v8(
+    key_bundle: &RuntimeKeyBundle,
+    meta: &MetaRow,
+) -> Result<(), RuntimeStoreError> {
+    let expected = runtime_ledger_token_v8(key_bundle, meta.database_id, &meta.ledger)?;
+    if meta.metadata_token.as_slice() != expected {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
 pub(crate) fn load_runtime_ledger(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
@@ -7417,6 +7840,7 @@ pub(crate) fn load_runtime_ledger(
         RUNTIME_SCHEMA_VERSION_V5 => read_meta_v5(connection)?,
         RUNTIME_SCHEMA_VERSION_V6 => read_meta_v6(connection)?,
         RUNTIME_SCHEMA_VERSION_V7 => read_meta_v7(connection)?,
+        RUNTIME_SCHEMA_VERSION_V8 => read_meta_v8(connection)?,
         RUNTIME_SCHEMA_VERSION => read_meta(connection)?,
         _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
     }
@@ -7431,6 +7855,7 @@ pub(crate) fn load_runtime_ledger(
         RUNTIME_SCHEMA_VERSION_V5 => verify_runtime_ledger_token_v5(key_bundle, &meta)?,
         RUNTIME_SCHEMA_VERSION_V6 => verify_runtime_ledger_token_v6(key_bundle, &meta)?,
         RUNTIME_SCHEMA_VERSION_V7 => verify_runtime_ledger_token_v7(key_bundle, &meta)?,
+        RUNTIME_SCHEMA_VERSION_V8 => verify_runtime_ledger_token_v8(key_bundle, &meta)?,
         RUNTIME_SCHEMA_VERSION => verify_runtime_ledger_token(key_bundle, &meta)?,
         _ => unreachable!("version matched above"),
     }
@@ -7523,11 +7948,11 @@ fn update_runtime_ledger_inner(
              native_metadata_effect_released_count = ?35,
              admin_command_count = ?36, admin_command_pending_count = ?37,
              admin_command_charged_bytes = ?38,
-             machine_identity_count = ?39,
-             accepted_count = ?40, accepted_payload_bytes = ?41,
-             started_without_fence_count = ?42, started_without_release_count = ?43,
-             started_released_count = ?44, metadata_token = ?45
-         WHERE singleton = 1 AND metadata_token = ?46",
+             machine_identity_count = ?39, machine_remote_state_count = ?40,
+             accepted_count = ?41, accepted_payload_bytes = ?42,
+             started_without_fence_count = ?43, started_without_release_count = ?44,
+             started_released_count = ?45, metadata_token = ?46
+         WHERE singleton = 1 AND metadata_token = ?47",
         params![
             next.catalog_high_water.as_deref(),
             i64::try_from(next.conversation_count)
@@ -7604,6 +8029,8 @@ fn update_runtime_ledger_inner(
             i64::try_from(next.admin_command_charged_bytes)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             i64::try_from(next.machine_identity_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.machine_remote_state_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             i64::try_from(next.accepted_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
@@ -7761,6 +8188,9 @@ pub(crate) fn read_rescue_index(
         }
         (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION_V7) => {
             read_and_validate_legacy_v7_schema(connection)?;
+        }
+        (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION_V8) => {
+            read_and_validate_legacy_v8_schema(connection)?;
         }
         (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION) => {
             read_and_validate_current_schema(connection)?;

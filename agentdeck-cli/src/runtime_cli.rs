@@ -1,4 +1,4 @@
-//! Runtime v2 canonical CLI facade。
+//! Runtime v3 canonical CLI facade。
 //!
 //! 本模块只接受 canonical conversation/command/event identity，并通过
 //! [`RuntimeUnixClient`] 与 shared daemon 通信。Legacy SessionStart/SessionContinue、
@@ -21,9 +21,10 @@ use agentdeck_protocol::runtime::{
     ClaudeCodeConversationConfiguration, CodexConversationConfiguration, CommandReceipt,
     ConfigurationReceipt, ConfigureConversationRequest, ConversationConfiguration,
     ConversationMetadataMutation, ConversationMetadataMutationRequest, ConversationMetadataReceipt,
-    ConversationSnapshot, ConversationStart, IdempotencyKey, PromptPayload, RuntimeEventBody,
-    RuntimeFailure, RuntimeInnerCursor, RuntimeReply, RuntimeRequest, RuntimeSubscriptionTarget,
-    SendPromptRequest, StreamCursor, SubscriptionReceipt, VendorConfigurationSnapshot,
+    ConversationSnapshot, ConversationStart, IdempotencyKey, MachineRemoteStatus, PromptPayload,
+    RuntimeEventBody, RuntimeFailure, RuntimeInnerCursor, RuntimeReply, RuntimeRequest,
+    RuntimeSubscriptionTarget, SendPromptRequest, StreamCursor, SubscriptionReceipt,
+    VendorConfigurationSnapshot,
 };
 #[cfg(debug_assertions)]
 use agentdeck_protocol::runtime::{QueryReceiptSelector, SnapshotItem};
@@ -47,13 +48,13 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1024;
 pub fn validate_runtime_globals(profile: &str, data_dir: Option<&str>) -> Result<(), CliError> {
     if profile != "stable" {
         return Err(CliError::Usage(
-            "Runtime v2 commands only use the canonical stable shared-daemon namespace; --profile must be stable"
+            "Runtime v3 commands only use the canonical stable shared-daemon namespace; --profile must be stable"
                 .to_owned(),
         ));
     }
     if data_dir.is_some() {
         return Err(CliError::Usage(
-            "--data-dir is diagnostics-only and cannot override a Runtime v2 endpoint".to_owned(),
+            "--data-dir is diagnostics-only and cannot override a Runtime v3 endpoint".to_owned(),
         ));
     }
     Ok(())
@@ -629,6 +630,21 @@ pub async fn handle_metadata(
         _ => Err(protocol_error(
             REPLY_IDENTITY_MISMATCH,
             "metadata receipt conversationId does not match the request",
+        )),
+    }
+}
+
+/// 执行一条本机 machine administration 请求，并且只接受严格
+/// `MachineRemoteStatus` terminal。Runtime Failure 保留 daemon 稳定 code；任何其他
+/// reply/transfer 都 fail-close。
+pub async fn request_machine_remote_status(
+    client: &RuntimeUnixClient,
+    request: RuntimeRequest,
+) -> Result<MachineRemoteStatus, CliError> {
+    match unary_reply(client, request).await? {
+        RuntimeReply::MachineRemoteStatus(status) => Ok(status),
+        _ => Err(unexpected(
+            "machine administration did not return MachineRemoteStatus",
         )),
     }
 }

@@ -1,4 +1,4 @@
-//! RuntimeEnvelope v2 —— UDS 与解密后远程链路的共同**中立业务 wire**（design §8.2）。
+//! RuntimeEnvelope v3 —— UDS 与解密后远程链路的共同**中立业务 wire**（design §8.2）。
 //!
 //! 本模块与 local IPC（`PROTOCOL_VERSION = 2`，见 crate 根）及 Relay v2
 //! 彼此独立、版本轴不联动：`RUNTIME_PROTOCOL_VERSION` 与
@@ -28,12 +28,15 @@ pub mod upgrade;
 
 /// Runtime 契约产物版本；独立于 local IPC `PROTOCOL_VERSION` 与 Relay
 /// `RELAY_PROTOCOL_VERSION`。改动 Runtime wire 形态时手动 +1 并重生成快照。
-pub const RUNTIME_PROTOCOL_VERSION: u16 = 2;
+pub const RUNTIME_PROTOCOL_VERSION: u16 = 3;
 
+pub use crate::relay_v2::RelayAdminPurgeReceiptV1;
 pub use catalog::{CatalogChange, CatalogDelta, CatalogError, CatalogSnapshot, ConversationEntry};
 pub use command::{
-    ConversationStart, LocalOnlyAdministration, MAX_PROMPT_BYTES, PromptError, PromptPayload,
-    QueryReceiptSelector, RuntimeRequest, SendPromptRequest,
+    ConversationStart, HelloParams, LocalOnlyAdministration, MAX_PROMPT_BYTES,
+    MachineEnrollRequest, PromptError, PromptPayload, QueryReceiptSelector, RuntimeRequest,
+    SendPromptRequest, TrustResetRequest, UNINSTALL_PURGE_PLAN_VERSION, UninstallPurgePlanError,
+    UninstallPurgePlanV1,
 };
 pub use configuration::{
     AgentDescription, AgentDescriptions, ClaudeCodeConversationConfiguration,
@@ -42,9 +45,10 @@ pub use configuration::{
     VendorConfigurationSnapshot,
 };
 pub use envelope::{
-    MAX_RUNTIME_JSON_FRAME_BYTES, MAX_RUNTIME_REQUEST_BYTES, PairInvite, PendingPairing,
-    RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeSizeError, RuntimeStreamItem,
-    ensure_request_within_limit,
+    MAX_RUNTIME_JSON_FRAME_BYTES, MAX_RUNTIME_REQUEST_BYTES, MachineRemoteFailureCode,
+    MachineRemoteLifecycle, MachineRemoteStatus, MachineRemoteStatusError, MachineRootFingerprint,
+    PairInvite, PendingPairing, RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeSizeError,
+    RuntimeStreamItem, ensure_request_within_limit,
 };
 pub use event::{RuntimeEvent, RuntimeEventBody, RuntimeEventError};
 pub use failure::RuntimeFailure;

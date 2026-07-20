@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentdeck_crypto::{
-    AeadReceivingKey, AeadSendingKey, SecretAeadKey, SenderCounter, SigningKey, open_symmetric,
-    seal_symmetric, sha256, sign_authentication_transcript, sign_sealed, sign_tbs, verify_sealed,
+    AeadReceivingKey, AeadSendingKey, SecretAeadKey, SenderCounter, SigningKey,
+    ValidatedRelayReceiptVerifyKey, open_symmetric, seal_symmetric, sha256,
+    sign_authentication_transcript, sign_sealed, sign_tbs, verify_sealed,
 };
 use agentdeck_protocol::e2ee::{
     E2EE_FORMAT_VERSION, KeyId, KeyPurpose, OuterContextV1, OuterFrameKind, SealedPayloadKind,
@@ -22,20 +23,19 @@ use agentdeck_protocol::relay_v2::frame::{
     Subscribe,
 };
 use agentdeck_protocol::relay_v2::{
-    DeviceRevocation, DeviceRouteId, Ed25519Signature, EnrollmentCode, GrantSerial, LinkGeneration,
-    MachineEnrollmentRequestV1, MachineRouteId, OpaqueRouteFrame, PublicKeyBytes,
-    RELAY_PROTOCOL_VERSION, RelayFrameBody, RelayGrant, RelayServerId, RequestRouteId, RootKeyId,
-    SignedCertificate, StreamCursor, StreamGenerationId, StreamRouteId, TrustEpoch, encode,
+    DeviceRevocation, DeviceRouteId, ENROLLMENT_BUNDLE_VERSION, Ed25519Signature,
+    EnrollmentBundleV2, GrantSerial, LinkGeneration, MachineEnrollmentRequestV1, MachineRouteId,
+    OpaqueRouteFrame, PublicKeyBytes, RELAY_PROTOCOL_VERSION, RelayFrameBody, RelayGrant,
+    RelayServerId, RequestRouteId, RootKeyId, SignedCertificate, StreamCursor, StreamGenerationId,
+    StreamRouteId, TrustEpoch, encode,
 };
 use agentdeck_relay_client::{
     EnrollmentClientConfig, LinkAuthenticator, RelayClient, RelayClientConfig, RelayClientError,
     RelayEnrollmentClient, RelayTlsPolicy,
 };
 use async_trait::async_trait;
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngCore as _;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use zeroize::Zeroizing;
 
 #[cfg(unix)]
@@ -61,17 +61,6 @@ impl SyntheticError {
     pub fn code(&self) -> &'static str {
         self.0
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EnrollmentBundle {
-    version: u16,
-    public_wss_url: String,
-    relay_server_id: RelayServerId,
-    code: EnrollmentCode,
-    spki_pins: Vec<String>,
-    expires_at_ms: u64,
 }
 
 struct MachineAuthenticator {
@@ -153,6 +142,9 @@ pub async fn run(bundle_path: &Path) -> Result<SyntheticReport, SyntheticError> 
         .map_err(|_| SyntheticError("remote.synthetic.bundle_invalid"))?;
     let client_config = RelayClientConfig::new(&bundle.public_wss_url, bundle.relay_server_id, tls)
         .map_err(|_| SyntheticError("remote.synthetic.bundle_invalid"))?;
+    if client_config.origin() != bundle.public_wss_url {
+        return Err(SyntheticError("remote.synthetic.bundle_invalid"));
+    }
 
     let machine_route = MachineRouteId::random();
     let root_key_id = RootKeyId::random();
@@ -408,7 +400,7 @@ pub async fn run(bundle_path: &Path) -> Result<SyntheticReport, SyntheticError> 
     })
 }
 
-fn load_bundle(path: &Path) -> Result<EnrollmentBundle, SyntheticError> {
+fn load_bundle(path: &Path) -> Result<EnrollmentBundleV2, SyntheticError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -433,32 +425,33 @@ fn load_bundle(path: &Path) -> Result<EnrollmentBundle, SyntheticError> {
     if bytes.len() as u64 > BUNDLE_MAX_BYTES {
         return Err(SyntheticError("remote.synthetic.bundle_invalid"));
     }
-    let bundle: EnrollmentBundle = serde_json::from_slice(&bytes)
+    let bundle: EnrollmentBundleV2 = serde_json::from_slice(&bytes)
         .map_err(|_| SyntheticError("remote.synthetic.bundle_invalid"))?;
-    if bundle.version != 1 || bundle.expires_at_ms <= unix_now_ms() {
+    if bundle.version != ENROLLMENT_BUNDLE_VERSION
+        || bundle.expires_at_ms <= unix_now_ms()
+        || bundle.relay_server_id.as_bytes() == &[0; 16]
+        || bundle.code.0 == [0; 32]
+    {
+        return Err(SyntheticError("remote.synthetic.bundle_invalid"));
+    }
+    let receipt_verify_key = ValidatedRelayReceiptVerifyKey::new(bundle.receipt_verify_key.clone())
+        .map_err(|_| SyntheticError("remote.synthetic.bundle_invalid"))?;
+    if receipt_verify_key.wire_anchor().relay_server_id != bundle.relay_server_id {
         return Err(SyntheticError("remote.synthetic.bundle_invalid"));
     }
     Ok(bundle)
 }
 
-fn decode_pins(values: &[String]) -> Result<Vec<[u8; 32]>, SyntheticError> {
-    if !(1..=2).contains(&values.len()) {
+fn decode_pins(
+    values: &[agentdeck_protocol::relay_v2::Digest32],
+) -> Result<Vec<[u8; 32]>, SyntheticError> {
+    if !(1..=2).contains(&values.len())
+        || values.iter().any(|value| value.0 == [0; 32])
+        || (values.len() == 2 && values[0] == values[1])
+    {
         return Err(SyntheticError("remote.synthetic.bundle_invalid"));
     }
-    let mut pins = Vec::with_capacity(values.len());
-    for value in values {
-        let decoded = URL_SAFE_NO_PAD
-            .decode(value.as_bytes())
-            .map_err(|_| SyntheticError("remote.synthetic.bundle_invalid"))?;
-        let pin: [u8; 32] = decoded
-            .try_into()
-            .map_err(|_| SyntheticError("remote.synthetic.bundle_invalid"))?;
-        if URL_SAFE_NO_PAD.encode(pin) != *value || pins.contains(&pin) {
-            return Err(SyntheticError("remote.synthetic.bundle_invalid"));
-        }
-        pins.push(pin);
-    }
-    Ok(pins)
+    Ok(values.iter().map(|value| value.0).collect())
 }
 
 fn random_bytes<const N: usize>() -> Result<Vec<u8>, SyntheticError> {

@@ -40,6 +40,93 @@
       "title": "DeviceRevocation",
       "type": "object"
     },
+    "Digest32": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "String",
+      "type": "string"
+    },
+    "EnrollmentBundleV2": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "RelayReceiptVerifyKeyV1": {
+          "additionalProperties": false,
+          "description": "Enrollment 必须在 TLS CA/SPKI 校验完成后持久化的 Relay receipt trust anchor。\n\n`key_id` 与 public key 一起 pin；后续 receipt 必须同时匹配 RelayServerId、generation 和 key ID。MVP 固定 generation 1，若需要轮换必须更换 RelayServerId/重新 enrollment。",
+          "properties": {
+            "keyGeneration": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "keyId": {
+              "type": "string"
+            },
+            "publicKey": {
+              "type": "string"
+            },
+            "receiptFormatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "keyGeneration",
+            "keyId",
+            "publicKey",
+            "receiptFormatVersion",
+            "relayServerId"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "本机 admin 创建、经用户控制的带外通道交给 daemon/CLI 的 enrollment bundle。",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "expiresAtMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "publicWssUrl": {
+          "type": "string"
+        },
+        "receiptVerifyKey": {
+          "$ref": "#/definitions/RelayReceiptVerifyKeyV1"
+        },
+        "relayServerId": {
+          "type": "string"
+        },
+        "spkiPins": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "version": {
+          "format": "uint16",
+          "maximum": 2.0,
+          "minimum": 2.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "code",
+        "expiresAtMs",
+        "publicWssUrl",
+        "receiptVerifyKey",
+        "relayServerId",
+        "spkiPins",
+        "version"
+      ],
+      "title": "EnrollmentBundleV2",
+      "type": "object"
+    },
     "MachineEnrollmentRequestV1": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "additionalProperties": false,

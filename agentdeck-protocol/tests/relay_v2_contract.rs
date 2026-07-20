@@ -499,7 +499,7 @@ fn relay_protocol_version_is_two_and_independent() {
     assert_eq!(E2EE_FORMAT_VERSION, 1);
     // 版本轴彼此独立：local IPC=2、Relay=2、Runtime=2、E2EE=1。
     assert_eq!(agentdeck_protocol::PROTOCOL_VERSION, 2);
-    assert_eq!(RUNTIME_PROTOCOL_VERSION, 2);
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 3);
 }
 
 #[test]

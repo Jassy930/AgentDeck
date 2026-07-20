@@ -94,7 +94,7 @@ enum DaemonOp {
     Install,
     Status,
     Uninstall {
-        /// P4 trust-reset gate; currently typed fail-close with zero deletion
+        /// Complete remote trust-reset, then remove all local AgentDeck daemon data
         #[arg(long)]
         purge: bool,
     },
@@ -112,7 +112,7 @@ enum ProtocolOp {
     Schema,
     /// Print the local IPC protocol version
     Version,
-    /// Print the Runtime v2 aggregate JSON Schema
+    /// Print the Runtime v3 aggregate JSON Schema
     #[command(name = "runtime-schema")]
     RuntimeSchema,
     /// Print the Relay v2 aggregate JSON Schema
@@ -257,6 +257,17 @@ enum RuntimeSmokeOp {
 
 #[derive(Subcommand)]
 enum RemoteOp {
+    /// Same-UID machine enrollment and status over the canonical Runtime UDS
+    Machine {
+        #[command(subcommand)]
+        op: RemoteMachineOp,
+    },
+    /// Run ordinary machine trust-reset over the canonical Runtime UDS
+    TrustReset {
+        /// Portable Relay admin purge receipt for the MachineRoot-lost path
+        #[arg(long)]
+        admin_purge_receipt_file: Option<PathBuf>,
+    },
     /// Real WSS/SPKI + ephemeral machine/device Relay v2 self-check
     Synthetic {
         #[arg(long)]
@@ -310,6 +321,17 @@ enum RemoteOp {
         relay: String,
         machine_id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum RemoteMachineOp {
+    /// Enroll this machine from a strict Relay admin bundle file
+    Enroll {
+        #[arg(long)]
+        bundle_file: PathBuf,
+    },
+    /// Read the authenticated machine remote lifecycle
+    Status,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -555,7 +577,23 @@ async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
                 Ok(())
             }
         },
-        Cmd::Remote { .. } => unreachable!("remote dispatch exits before Runtime dispatch"),
+        Cmd::Remote { op } => {
+            runtime_cli::validate_runtime_globals(&cli.profile, cli.data_dir.as_deref())?;
+            let plan = match op {
+                RemoteOp::Machine {
+                    op: RemoteMachineOp::Enroll { bundle_file },
+                } => remote::RuntimeRemotePlan::machine_enroll(bundle_file)?,
+                RemoteOp::Machine {
+                    op: RemoteMachineOp::Status,
+                } => remote::RuntimeRemotePlan::machine_status(),
+                RemoteOp::TrustReset {
+                    admin_purge_receipt_file,
+                } => remote::RuntimeRemotePlan::trust_reset(admin_purge_receipt_file.as_deref())?,
+                _ => unreachable!("legacy remote dispatch exits before Runtime dispatch"),
+            };
+            let client = connect_runtime(cli).await?;
+            remote::run_runtime(&client, plan, pretty).await
+        }
     }
 }
 
@@ -565,11 +603,6 @@ async fn handle_daemon(cli: &Cli, op: &DaemonOp) -> Result<(), CliError> {
     if cli.runtime_temp_root_for_test.is_some() {
         return Err(CliError::Usage(
             "daemon production commands reject the ephemeral Runtime test root".to_owned(),
-        ));
-    }
-    if matches!(op, DaemonOp::Uninstall { purge: true }) {
-        return Err(daemon_cli_error(
-            agentdeck_cli::daemon::launchd::LifecycleError::PurgeRemoteNotReady,
         ));
     }
     let lifecycle =
@@ -589,8 +622,32 @@ async fn handle_daemon(cli: &Cli, op: &DaemonOp) -> Result<(), CliError> {
             serde_json::json!({"daemon":{"plistInstalled":status.plist_installed,"currentVersion":status.current_version,"launchdLoaded":status.launchd_loaded,"pid":status.pid,"runningProgram":status.running_program}})
         }
         DaemonOp::Uninstall { purge } => {
-            lifecycle.uninstall(*purge).map_err(daemon_cli_error)?;
-            serde_json::json!({"daemon":{"state":"uninstalled","dataPreserved":true}})
+            if *purge {
+                let installer =
+                    agentdeck_cli::daemon::launchd::DaemonLifecycle::production_installer(None)
+                        .map_err(daemon_cli_error)?;
+                let launchctl = agentdeck_cli::daemon::launchd::ProcessLaunchctlRunner;
+                let runtime = agentdeck_cli::daemon::purge::StablePurgeRuntimeClient;
+                let sockets = agentdeck_cli::daemon::purge::FilesystemSocketProbe;
+                let processes = agentdeck_cli::daemon::purge::SystemProcessProbe;
+                let helper = agentdeck_cli::daemon::purge::ProcessPurgeHelperRunner;
+                agentdeck_cli::daemon::purge::PurgeCoordinator::new(
+                    lifecycle.paths(),
+                    &launchctl,
+                    &installer,
+                    &runtime,
+                    &sockets,
+                    &processes,
+                    &helper,
+                )
+                .run()
+                .await
+                .map_err(purge_cli_error)?;
+                serde_json::json!({"daemon":{"state":"purged","dataPreserved":false}})
+            } else {
+                lifecycle.uninstall(false).map_err(daemon_cli_error)?;
+                serde_json::json!({"daemon":{"state":"uninstalled","dataPreserved":true}})
+            }
         }
     };
     println!("{}", render(&value, cli.pretty));
@@ -798,6 +855,13 @@ fn daemon_cli_error(error: agentdeck_cli::daemon::launchd::LifecycleError) -> Cl
     }
 }
 
+fn purge_cli_error(error: agentdeck_cli::daemon::purge::PurgeCliError) -> CliError {
+    CliError::Session {
+        code: Some(error.code().to_owned()),
+        message: error.to_string(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = match Cli::try_parse() {
@@ -820,14 +884,15 @@ async fn main() {
     };
     if let Cmd::Remote { op } = &cli.command {
         let arg = match op {
-            RemoteOp::Synthetic { bundle } => remote::RemoteOpArg::Synthetic {
+            RemoteOp::Machine { .. } | RemoteOp::TrustReset { .. } => None,
+            RemoteOp::Synthetic { bundle } => Some(remote::RemoteOpArg::Synthetic {
                 bundle: bundle.clone(),
-            },
+            }),
             RemoteOp::Pair {
                 legacy_secret: Some(_),
                 ..
             }
-            | RemoteOp::Smoke => remote::RemoteOpArg::LegacyV1,
+            | RemoteOp::Smoke => Some(remote::RemoteOpArg::LegacyV1),
             RemoteOp::Pair { .. }
             | RemoteOp::Machines { .. }
             | RemoteOp::Sessions { .. }
@@ -835,19 +900,101 @@ async fn main() {
             | RemoteOp::Send { .. }
             | RemoteOp::Approve { .. }
             | RemoteOp::Deny { .. }
-            | RemoteOp::Ping { .. } => remote::RemoteOpArg::PersistentUnsupported,
+            | RemoteOp::Ping { .. } => Some(remote::RemoteOpArg::PersistentUnsupported),
         };
-        let code = remote::run(arg, &cli.profile, cli.data_dir.as_deref()).await;
-        if code == std::process::ExitCode::SUCCESS {
-            return;
+        if let Some(arg) = arg {
+            let code = remote::run(arg, &cli.profile, cli.data_dir.as_deref()).await;
+            if code == std::process::ExitCode::SUCCESS {
+                return;
+            }
+            std::process::exit(1);
         }
-        std::process::exit(1);
     }
 
     if let Err(error) = run_non_remote(&cli).await {
         eprintln!("agentdeck: {}", error.message());
         println!("{}", render(&output::error_envelope(&error), cli.pretty));
         std::process::exit(error.exit_code());
+    }
+}
+
+#[cfg(test)]
+mod remote_machine_cli_tests {
+    use super::*;
+
+    #[test]
+    fn exact_machine_enroll_status_and_trust_reset_commands_parse() {
+        let enroll = Cli::try_parse_from([
+            "agentdeck",
+            "remote",
+            "machine",
+            "enroll",
+            "--bundle-file",
+            "/private/tmp/enrollment.json",
+        ])
+        .expect("parse machine enroll");
+        assert!(matches!(
+            enroll.command,
+            Cmd::Remote {
+                op: RemoteOp::Machine {
+                    op: RemoteMachineOp::Enroll { bundle_file }
+                }
+            } if bundle_file == PathBuf::from("/private/tmp/enrollment.json")
+        ));
+
+        let status = Cli::try_parse_from(["agentdeck", "remote", "machine", "status"])
+            .expect("parse machine status");
+        assert!(matches!(
+            status.command,
+            Cmd::Remote {
+                op: RemoteOp::Machine {
+                    op: RemoteMachineOp::Status
+                }
+            }
+        ));
+
+        let ordinary = Cli::try_parse_from(["agentdeck", "remote", "trust-reset"])
+            .expect("parse ordinary trust reset");
+        assert!(matches!(
+            ordinary.command,
+            Cmd::Remote {
+                op: RemoteOp::TrustReset {
+                    admin_purge_receipt_file: None
+                }
+            }
+        ));
+
+        let root_lost = Cli::try_parse_from([
+            "agentdeck",
+            "remote",
+            "trust-reset",
+            "--admin-purge-receipt-file",
+            "/private/tmp/purge-receipt.json",
+        ])
+        .expect("parse root-lost trust reset");
+        assert!(matches!(
+            root_lost.command,
+            Cmd::Remote {
+                op: RemoteOp::TrustReset {
+                    admin_purge_receipt_file: Some(path)
+                }
+            } if path == PathBuf::from("/private/tmp/purge-receipt.json")
+        ));
+    }
+
+    #[test]
+    fn machine_commands_reject_missing_or_opaque_input_flags() {
+        assert!(Cli::try_parse_from(["agentdeck", "remote", "machine", "enroll"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "agentdeck",
+                "remote",
+                "trust-reset",
+                "--admin-purge-receipt",
+                "opaque",
+            ])
+            .is_err()
+        );
     }
 }
 
@@ -927,20 +1074,6 @@ mod daemon_cli_tests {
         assert!(matches!(
             handle_daemon(&cli, op).await,
             Err(CliError::Usage(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn purge_rejects_before_constructing_any_production_lifecycle() {
-        let cli = Cli::try_parse_from(["agentdeck", "daemon", "uninstall", "--purge"])
-            .expect("parse purge");
-        let Cmd::Daemon { op } = &cli.command else {
-            panic!("daemon command")
-        };
-        assert!(matches!(
-            handle_daemon(&cli, op).await,
-            Err(CliError::Session { code: Some(code), .. })
-                if code == "daemon.purge.remote_not_ready"
         ));
     }
 

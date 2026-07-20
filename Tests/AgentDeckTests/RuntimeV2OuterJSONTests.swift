@@ -5,13 +5,13 @@ import XCTest
 final class RuntimeV2OuterJSONTests: XCTestCase {
     func testRustJSONFixturesDecodeAndReencodeSemantically() throws {
         let fixtures = try loadFixtures()
-        XCTAssertEqual(fixtures.count, 98)
-        XCTAssertEqual(Set(fixtures.map(\.name)).count, 98)
+        XCTAssertEqual(fixtures.count, 103)
+        XCTAssertEqual(Set(fixtures.map(\.name)).count, 103)
 
         let envelopes = fixtures.filter { $0.wireType == "runtimeEnvelope" }
         let transfers = fixtures.filter { $0.wireType == "transferEnvelope" }
         let compact = fixtures.filter { $0.wireType == "runtimeTransferCarrierV1" }
-        XCTAssertEqual(envelopes.count, 96)
+        XCTAssertEqual(envelopes.count, 101)
         XCTAssertEqual(transfers.count, 1)
         XCTAssertEqual(compact.count, 1)
         XCTAssertEqual(Set(fixtures.filter { $0.wireType != "runtimeTransferCarrierV1" }.map(\.name)), Set(Self.expectedTypedPaths.keys))
@@ -25,7 +25,7 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
             let output = try JSONEncoder().encode(decoded)
             try assertJSONSemanticallyEqual(input, output, caseName: fixture.name)
         }
-        XCTAssertEqual(outerCounts, ["request": 25, "reply": 45, "stream": 26])
+        XCTAssertEqual(outerCounts, ["request": 29, "reply": 46, "stream": 26])
 
         let transfer = try XCTUnwrap(transfers.first)
         let input = try jsonData(transfer.value)
@@ -82,7 +82,7 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
         let v1Egress = RuntimeEnvelopeV2(
             version: 1,
             messageID: RuntimeMessageID(rawValue: "version-one-egress"),
-            body: .request(.hello(runtimeProtocolVersion: 2))
+      body: .request(.hello(runtimeProtocolVersion: runtimeProtocolVersionCurrent))
         )
         XCTAssertThrowsError(try JSONEncoder().encode(v1Egress)) { error in
             XCTAssertTrue(error is EncodingError)
@@ -157,9 +157,9 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
         _ = try decodeEnvelope(wire)
 
         let invalidMessageEgress = RuntimeEnvelopeV2(
-            version: 2,
+            version: runtimeProtocolVersionCurrent,
             messageID: RuntimeMessageID(rawValue: String(repeating: "中", count: 342)),
-            body: .request(.hello(runtimeProtocolVersion: 2))
+      body: .request(.hello(runtimeProtocolVersion: runtimeProtocolVersionCurrent))
         )
         XCTAssertThrowsError(try JSONEncoder().encode(invalidMessageEgress)) { error in
             XCTAssertTrue(error is EncodingError)
@@ -362,7 +362,7 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
             part: Data(repeating: 0x5a, count: TransferEnvelopeV2.maxJSONPartBytes)
         )
         let envelope = RuntimeEnvelopeV2(
-            version: 2,
+            version: runtimeProtocolVersionCurrent,
             messageID: RuntimeMessageID(rawValue: String(repeating: "m", count: 1024)),
             body: .reply(.transferPart(transfer))
         )
@@ -398,6 +398,10 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
         "requestCancelPairing": "request.cancelPairing",
         "requestRevoke": "request.revoke.selfDevice",
         "requestTrustReset": "request.trustReset",
+        "requestTrustResetWithAdminPurgeReceipt": "request.trustReset",
+        "requestTrustResetForUninstallPurge": "request.trustReset",
+        "requestMachineEnroll": "request.machineEnroll",
+        "requestMachineRemoteStatus": "request.machineRemoteStatus",
         "requestStageUpgrade": "request.stageUpgrade",
         "replyHello": "reply.hello",
         "replyAgents": "reply.agents",
@@ -420,6 +424,7 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
         "replySyncComplete": "reply.syncComplete",
         "replyPairInvite": "reply.pairInvite",
         "replyPendingPairings": "reply.pendingPairings",
+        "replyMachineRemoteStatus": "reply.machineRemoteStatus.active",
         "replyFailure": "reply.failure",
         "streamCatalogDelta": "stream.catalogDelta.removed",
         "streamCatalogUpsert": "stream.catalogDelta.upserted",
@@ -531,6 +536,8 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
             case .selfDevice: "request.revoke.selfDevice"
             case .device: "request.revoke.device"
             }
+        case .machineEnroll: "request.machineEnroll"
+        case .machineRemoteStatus: "request.machineRemoteStatus"
         case .trustReset: "request.trustReset"
         case .stageUpgrade: "request.stageUpgrade"
         }
@@ -606,6 +613,8 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
         case .transferPart: "reply.transferPart"
         case .pairInvite: "reply.pairInvite"
         case .pendingPairings: "reply.pendingPairings"
+    case .machineRemoteStatus(let status):
+      "reply.machineRemoteStatus.\(status.lifecycle.rawValue)"
         case .failure: "reply.failure"
         }
     }
@@ -687,7 +696,7 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
 
     private func loadFixtures() throws -> [Fixture] {
         let data = try Data(contentsOf: repositoryRoot
-            .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v2-wire.jsonl"))
+            .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v3-wire.jsonl"))
         let text = try XCTUnwrap(String(data: data, encoding: .utf8))
         return try text.split(separator: "\n").map { line in
             let object = try XCTUnwrap(

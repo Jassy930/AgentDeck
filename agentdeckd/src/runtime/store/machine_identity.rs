@@ -3,7 +3,7 @@
 //! 本模块只持久化 public key/fingerprint 与单调元数据；私钥 seed、HPKE IKM、
 //! StorageKEK、CounterGuard material 和 certificate 永不进入 Runtime DB。
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::runtime::model::{
@@ -30,6 +30,13 @@ impl MachineIdentityLifecycle {
         match self {
             Self::Preparing => 0,
             Self::Active => 1,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Active => "active",
         }
     }
 }
@@ -74,7 +81,7 @@ fn decode_u64(value: &str) -> Result<u64, RuntimeStoreError> {
     Ok(decoded)
 }
 
-fn validate_binding(binding: &MachineIdentityBinding) -> Result<(), RuntimeStoreError> {
+pub(super) fn validate_binding(binding: &MachineIdentityBinding) -> Result<(), RuntimeStoreError> {
     if binding.root_key_id == [0; 16]
         || binding.trust_epoch == 0
         || binding.link_generation == 0
@@ -104,6 +111,48 @@ fn validate_binding(binding: &MachineIdentityBinding) -> Result<(), RuntimeStore
         if &expected != fingerprint {
             return Err(RuntimeStoreError::MachineIdentityConflict);
         }
+    }
+    Ok(())
+}
+
+fn insert_row(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    record: &MachineIdentityStateRecord,
+) -> Result<(), RuntimeStoreError> {
+    let token = row_token(key_bundle, record)?;
+    let binding = &record.binding;
+    if connection.execute(
+        "INSERT INTO machine_identity_state (
+             singleton, identity_state, database_id, root_key_id, trust_epoch,
+             link_generation, data_generation, key_directory_revision,
+             root_public_key, root_fingerprint,
+             machine_hpke_public_key, machine_hpke_fingerprint,
+             link_sign_public_key, link_sign_fingerprint,
+             data_sign_public_key, data_sign_fingerprint, metadata_token
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                   ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            record.lifecycle.as_str(),
+            &record.database_id[..],
+            &binding.root_key_id[..],
+            super::sequence::encode_sequence(binding.trust_epoch),
+            super::sequence::encode_sequence(binding.link_generation),
+            super::sequence::encode_sequence(binding.data_generation),
+            super::sequence::encode_sequence(binding.key_directory_revision),
+            &binding.root_public_key[..],
+            &binding.root_fingerprint[..],
+            &binding.machine_hpke_public_key[..],
+            &binding.machine_hpke_fingerprint[..],
+            &binding.link_sign_public_key[..],
+            &binding.link_sign_fingerprint[..],
+            &binding.data_sign_public_key[..],
+            &binding.data_sign_fingerprint[..],
+            &token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::MachineIdentityConflict);
     }
     Ok(())
 }
@@ -245,6 +294,65 @@ pub(super) fn validate_v8_integrity(
     Ok(())
 }
 
+pub(super) fn delete_active_for_local_deleted(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    expected_binding: &MachineIdentityBinding,
+) -> Result<(), RuntimeStoreError> {
+    let current = load_machine_identity_state(transaction, key_bundle, database_id)?
+        .ok_or(RuntimeStoreError::MachineIdentityMissing)?;
+    if current.lifecycle != MachineIdentityLifecycle::Active || &current.binding != expected_binding
+    {
+        return Err(RuntimeStoreError::MachineIdentityConflict);
+    }
+    let token = row_token(key_bundle, &current)?;
+    if transaction.execute(
+        "DELETE FROM machine_identity_state
+         WHERE singleton = 1 AND identity_state = 'active' AND metadata_token = ?1",
+        params![&token[..]],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::MachineIdentityConflict);
+    }
+    let ledger = super::sqlite::load_runtime_ledger(transaction, key_bundle, database_id)?;
+    if ledger.machine_identity_count != 1 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let mut next = ledger.clone();
+    next.machine_identity_count = 0;
+    let _ =
+        super::sqlite::update_runtime_ledger(transaction, key_bundle, database_id, &ledger, &next)?;
+    Ok(())
+}
+
+pub(super) fn insert_active_replacement(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    binding: MachineIdentityBinding,
+) -> Result<MachineIdentityStateRecord, RuntimeStoreError> {
+    validate_binding(&binding)?;
+    if load_machine_identity_state(transaction, key_bundle, database_id)?.is_some() {
+        return Err(RuntimeStoreError::MachineIdentityConflict);
+    }
+    let record = MachineIdentityStateRecord {
+        database_id,
+        lifecycle: MachineIdentityLifecycle::Active,
+        binding,
+    };
+    insert_row(transaction, key_bundle, &record)?;
+    let ledger = super::sqlite::load_runtime_ledger(transaction, key_bundle, database_id)?;
+    if ledger.machine_identity_count != 0 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let mut next = ledger.clone();
+    next.machine_identity_count = 1;
+    let _ =
+        super::sqlite::update_runtime_ledger(transaction, key_bundle, database_id, &ledger, &next)?;
+    Ok(record)
+}
+
 fn replay_prepare(
     state: Option<MachineIdentityStateRecord>,
     binding: &MachineIdentityBinding,
@@ -263,6 +371,13 @@ pub(super) fn prepare_machine_identity(
     config: &RuntimeStoreConfig,
     binding: MachineIdentityBinding,
 ) -> Result<PrepareMachineIdentityOutcome, RuntimeStoreError> {
+    if super::machine_remote::blocks_standalone_identity_prepare(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+    )? {
+        return Err(RuntimeStoreError::MachineRemoteConflict);
+    }
     validate_binding(&binding)?;
     if let Some(outcome) = replay_prepare(
         load_machine_identity_state(&state.connection, &state.key_bundle, state.database_id)?,
@@ -291,36 +406,7 @@ pub(super) fn prepare_machine_identity(
         lifecycle: MachineIdentityLifecycle::Preparing,
         binding,
     };
-    let token = row_token(&state.key_bundle, &record)?;
-    let binding = &record.binding;
-    transaction.execute(
-        "INSERT INTO machine_identity_state (
-             singleton, identity_state, database_id, root_key_id, trust_epoch,
-             link_generation, data_generation, key_directory_revision,
-             root_public_key, root_fingerprint,
-             machine_hpke_public_key, machine_hpke_fingerprint,
-             link_sign_public_key, link_sign_fingerprint,
-             data_sign_public_key, data_sign_fingerprint, metadata_token
-         ) VALUES (1, 'preparing', ?1, ?2, ?3, ?4, ?5, ?6,
-                   ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        params![
-            &record.database_id[..],
-            &binding.root_key_id[..],
-            super::sequence::encode_sequence(binding.trust_epoch),
-            super::sequence::encode_sequence(binding.link_generation),
-            super::sequence::encode_sequence(binding.data_generation),
-            super::sequence::encode_sequence(binding.key_directory_revision),
-            &binding.root_public_key[..],
-            &binding.root_fingerprint[..],
-            &binding.machine_hpke_public_key[..],
-            &binding.machine_hpke_fingerprint[..],
-            &binding.link_sign_public_key[..],
-            &binding.link_sign_fingerprint[..],
-            &binding.data_sign_public_key[..],
-            &binding.data_sign_fingerprint[..],
-            &token[..],
-        ],
-    )?;
+    insert_row(&transaction, &state.key_bundle, &record)?;
     let ledger =
         super::sqlite::load_runtime_ledger(&transaction, &state.key_bundle, state.database_id)?;
     if ledger.machine_identity_count != 0 {

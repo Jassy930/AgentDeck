@@ -17,7 +17,9 @@ path = "src/main.rs"
 [dependencies]
 agentdeck-crypto = { path = "../agentdeck-crypto" }
 agentdeck-protocol = { path = "../agentdeck-protocol" }
+agentdeck-relay-client = { path = "../agentdeck-relay-client" }
 async-trait = "0.1"
+base64 = "0.22"
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 getrandom = "0.4"
 hmac = "0.12"
@@ -28,6 +30,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "process", "io-util", "time", "io-std", "signal", "net"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 # Used by claude_code adapter preflight (spec § 5.8 cc-not-installed
 # check). Kept as a runtime dep — also re-exported for tests via the

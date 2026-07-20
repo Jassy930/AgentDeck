@@ -226,6 +226,16 @@ fn main_recovers_before_either_local_ingress_and_orders_uds_permits() {
     assert!(recovery < bind && bind < remote && remote < listener);
     assert!(recovery < compatibility);
     let production_main = between(main, "fn run_main_loop(", "fn main()");
+    let signal = position(
+        production_main,
+        "wait_for_shutdown_signal(&mut upgrade_exit_receiver).await",
+    );
+    let remote_shutdown = position(production_main, "remote_for_signal.shutdown().await");
+    let remote_join = position(production_main, "handle.await.is_err()");
+    let core_shutdown = position(production_main, "let shutdown = core.shutdown().await");
+    assert!(
+        signal < remote_shutdown && remote_shutdown < remote_join && remote_join < core_shutdown
+    );
     assert!(
         !production_main.contains("RuntimeHub::new(router)"),
         "production main must not expose legacy adapter spawn ingress"

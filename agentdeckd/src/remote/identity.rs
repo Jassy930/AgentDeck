@@ -12,6 +12,7 @@ use agentdeck_protocol::e2ee::{KeyId, KeyPurpose};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::runtime::store::{MachineIdentityBinding, MachineTrustResetKind};
 use crate::security::{KeyStore, KeyStoreError, SecretBytes};
 
 pub const MACHINE_ROOT_SIGN_ACCOUNT: &str = "machine-root-sign.v1";
@@ -61,6 +62,12 @@ pub enum MachineIdentityError {
     RootFingerprintMismatch,
     #[error("deleted machine identity item {account} is still present")]
     DeleteReadbackFailed { account: String },
+    #[error("machine identity cleanup binding does not match account {account}")]
+    CleanupBindingMismatch { account: &'static str },
+    #[error("machine identity cleanup observed a partially missing local state")]
+    CleanupPartialState,
+    #[error("machine identity cleanup contains a duplicate counter guard axis")]
+    CleanupCounterAxisDuplicate,
 }
 
 impl MachineIdentityError {
@@ -82,6 +89,13 @@ impl MachineIdentityError {
             Self::CounterRegression { .. } => "daemon.remote.identity.counter_regression",
             Self::RootFingerprintMismatch => "daemon.remote.identity.fingerprint_mismatch",
             Self::DeleteReadbackFailed { .. } => "daemon.remote.identity.delete_failed",
+            Self::CleanupBindingMismatch { .. } => {
+                "daemon.remote.identity.cleanup_binding_mismatch"
+            }
+            Self::CleanupPartialState => "daemon.remote.identity.cleanup_partial_state",
+            Self::CleanupCounterAxisDuplicate => {
+                "daemon.remote.identity.cleanup_counter_axis_duplicate"
+            }
         }
     }
 }
@@ -270,6 +284,12 @@ impl fmt::Debug for CounterGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MachineIdentityCleanupOutcome {
+    Deleted,
+    AlreadyAbsent,
+}
+
 /// Existing-only load。Active/Preparing reconciliation 使用本入口；缺任一 item 都失败且零写。
 pub fn load_machine_key_material(
     key_store: &dyn KeyStore,
@@ -443,6 +463,203 @@ pub fn delete_counter_guard(
     let account = counter_guard_account(key_id);
     delete_exact(key_store, &account)?;
     Ok(true)
+}
+
+/// 只消费 Store 已认证的 machine binding、database ID 与 active counter axes。
+///
+/// 所有现存 item 都会在第一笔删除前完成 existing-only 校验。Root-present 只接受固定
+/// 删除顺序产生的 prefix-absent 形态；Root-lost 已由 portable admin purge receipt
+/// 授权，允许任意 item 已缺失，但所有剩余 material 仍须逐项匹配。Root 永远最后删除。
+pub(super) fn cleanup_machine_identity(
+    key_store: &dyn KeyStore,
+    database_id: [u8; 16],
+    binding: &MachineIdentityBinding,
+    reset_kind: MachineTrustResetKind,
+    counter_guard_axes: &[KeyId],
+) -> Result<MachineIdentityCleanupOutcome, MachineIdentityError> {
+    let _lock = lock_keystore_io()?;
+    ensure_unique_counter_axes(counter_guard_axes)?;
+
+    let raw = load_raw_material_unlocked(key_store)?;
+    validate_present_raw_material(&raw)?;
+    let directory_guard = load_key_directory_guard_unlocked(key_store)?;
+    let counter_guards = counter_guard_axes
+        .iter()
+        .copied()
+        .map(|key_id| load_counter_guard_unlocked(key_store, key_id).map(|guard| (key_id, guard)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    validate_cleanup_binding(binding)?;
+    if let Some(directory_guard) = directory_guard {
+        let expected_guard = KeyDirectoryGuard::new(
+            database_id,
+            binding.root_fingerprint,
+            binding.key_directory_revision,
+        );
+        if directory_guard != expected_guard {
+            return Err(MachineIdentityError::CleanupBindingMismatch {
+                account: KEY_DIRECTORY_GUARD_ACCOUNT,
+            });
+        }
+    }
+    validate_cleanup_material(&raw, binding)?;
+
+    let all_keys_absent =
+        raw.root.is_none() && raw.hpke.is_none() && raw.link.is_none() && raw.data.is_none();
+    let all_counters_absent = counter_guards.iter().all(|(_, guard)| guard.is_none());
+    if all_keys_absent && directory_guard.is_none() && all_counters_absent {
+        return Ok(MachineIdentityCleanupOutcome::AlreadyAbsent);
+    }
+
+    // 删除序列是 counters → data → link → hpke → directory guard → root。
+    // Root-present crash/retry 只接受该序列产生的 `absent* present*` 前缀；任何
+    // 跳序缺失都在下一笔 mutation 前 fail-close。Root-lost 已先验证 portable
+    // admin receipt，可以 existing-only 清除任意 surviving item，不补建缺失项。
+    let mut presence = counter_guards
+        .iter()
+        .map(|(_, guard)| guard.is_some())
+        .collect::<Vec<_>>();
+    presence.extend([
+        raw.data.is_some(),
+        raw.link.is_some(),
+        raw.hpke.is_some(),
+        directory_guard.is_some(),
+    ]);
+    if reset_kind == MachineTrustResetKind::RootPresent {
+        presence.push(raw.root.is_some());
+        if !is_legal_cleanup_prefix(&presence) {
+            return Err(MachineIdentityError::CleanupPartialState);
+        }
+    }
+
+    for (key_id, guard) in &counter_guards {
+        if guard.is_some() {
+            delete_exact(key_store, &counter_guard_account(*key_id))?;
+        }
+    }
+    // 非 root key 先删；任何时候都把 root 留作最后一项。
+    if raw.data.is_some() {
+        delete_exact(key_store, MACHINE_DATA_SIGN_ACCOUNT)?;
+    }
+    if raw.link.is_some() {
+        delete_exact(key_store, MACHINE_LINK_SIGN_ACCOUNT)?;
+    }
+    if raw.hpke.is_some() {
+        delete_exact(key_store, MACHINE_HPKE_ACCOUNT)?;
+    }
+    if directory_guard.is_some() {
+        delete_exact(key_store, KEY_DIRECTORY_GUARD_ACCOUNT)?;
+    }
+    if raw.root.is_some() {
+        delete_exact(key_store, MACHINE_ROOT_SIGN_ACCOUNT)?;
+    }
+
+    Ok(MachineIdentityCleanupOutcome::Deleted)
+}
+
+fn is_legal_cleanup_prefix(presence: &[bool]) -> bool {
+    let mut saw_present = false;
+    for is_present in presence {
+        if *is_present {
+            saw_present = true;
+        } else if saw_present {
+            return false;
+        }
+    }
+    true
+}
+
+fn ensure_unique_counter_axes(counter_guard_axes: &[KeyId]) -> Result<(), MachineIdentityError> {
+    for (index, key_id) in counter_guard_axes.iter().enumerate() {
+        if counter_guard_axes[..index].contains(key_id) {
+            return Err(MachineIdentityError::CleanupCounterAxisDuplicate);
+        }
+    }
+    Ok(())
+}
+
+fn validate_cleanup_binding(binding: &MachineIdentityBinding) -> Result<(), MachineIdentityError> {
+    for (account, public_key, fingerprint) in [
+        (
+            MACHINE_ROOT_SIGN_ACCOUNT,
+            &binding.root_public_key,
+            binding.root_fingerprint,
+        ),
+        (
+            MACHINE_HPKE_ACCOUNT,
+            &binding.machine_hpke_public_key,
+            binding.machine_hpke_fingerprint,
+        ),
+        (
+            MACHINE_LINK_SIGN_ACCOUNT,
+            &binding.link_sign_public_key,
+            binding.link_sign_fingerprint,
+        ),
+        (
+            MACHINE_DATA_SIGN_ACCOUNT,
+            &binding.data_sign_public_key,
+            binding.data_sign_fingerprint,
+        ),
+    ] {
+        if sha256(public_key) != fingerprint {
+            return Err(MachineIdentityError::CleanupBindingMismatch { account });
+        }
+    }
+    Ok(())
+}
+
+fn validate_cleanup_material(
+    raw: &RawMaterial,
+    binding: &MachineIdentityBinding,
+) -> Result<(), MachineIdentityError> {
+    if let Some(root) = &raw.root {
+        ensure_cleanup_public_matches(
+            MACHINE_ROOT_SIGN_ACCOUNT,
+            signing_public(root),
+            binding.root_public_key,
+            binding.root_fingerprint,
+        )?;
+    }
+    if let Some(hpke) = &raw.hpke {
+        let (_, hpke_public) = HpkePrivateKey::derive_keypair(hpke.as_ref());
+        ensure_cleanup_public_matches(
+            MACHINE_HPKE_ACCOUNT,
+            array32(hpke_public.to_bytes(), MACHINE_HPKE_ACCOUNT)?,
+            binding.machine_hpke_public_key,
+            binding.machine_hpke_fingerprint,
+        )?;
+    }
+    if let Some(link) = &raw.link {
+        ensure_cleanup_public_matches(
+            MACHINE_LINK_SIGN_ACCOUNT,
+            signing_public(link),
+            binding.link_sign_public_key,
+            binding.link_sign_fingerprint,
+        )?;
+    }
+    if let Some(data) = &raw.data {
+        ensure_cleanup_public_matches(
+            MACHINE_DATA_SIGN_ACCOUNT,
+            signing_public(data),
+            binding.data_sign_public_key,
+            binding.data_sign_fingerprint,
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_cleanup_public_matches(
+    account: &'static str,
+    actual_public_key: [u8; 32],
+    expected_public_key: [u8; 32],
+    expected_fingerprint: [u8; 32],
+) -> Result<(), MachineIdentityError> {
+    if actual_public_key != expected_public_key
+        || sha256(&actual_public_key) != expected_fingerprint
+    {
+        return Err(MachineIdentityError::CleanupBindingMismatch { account });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

@@ -12,6 +12,7 @@ mod execution_event;
 pub mod identity;
 mod journal;
 mod machine_identity;
+mod machine_remote;
 mod metadata;
 #[cfg(test)]
 mod native_metadata_effect_tests;
@@ -36,25 +37,35 @@ mod worker;
 use crate::runtime::events::SnapshotBuildPinCleanup;
 
 pub use crate::runtime::model::{
-    AcceptCommand, AcceptOutcome, AcceptedTerminationReason, ActivateMachineIdentityOutcome,
-    AdminCommandLimitScope, AuthorizeExecutionRelease, CommandExecutionConfiguration,
-    CommandReceiptRecord, CommandReceiptSelector, CommandRecord, CommandState, CommandTerminal,
-    CompleteCommand, CompleteOutcome, ConfigurationLimitScope, ConversationDescriptor,
-    ConversationLifecycle, ConversationRecord, ConversationRecoveryRecord,
+    AcceptCommand, AcceptOutcome, AcceptedTerminationReason, ActivateMachineEnrollmentOutcome,
+    ActivateMachineIdentityOutcome, ActiveMachineEnrollmentState, AdminCommandLimitScope,
+    AuthorizeExecutionRelease, CommandExecutionConfiguration, CommandReceiptRecord,
+    CommandReceiptSelector, CommandRecord, CommandState, CommandTerminal, CompleteCommand,
+    CompleteOutcome, ConfigurationLimitScope, ConfirmMachinePurgeReadbackAbsentOutcome,
+    ConversationDescriptor, ConversationLifecycle, ConversationRecord, ConversationRecoveryRecord,
     CreateConversationOutcome, EventRecord, ExecutionFence, ExecutionFenceRecord,
-    ExecutionIntentRecord, IdempotencyOwner, MAX_CONVERSATION_DESCRIPTOR_BYTES,
+    ExecutionIntentRecord, FinalizeMachineLocalDeletionOutcome, IdempotencyOwner,
+    LocalDeletedMachineEnrollmentState, MAX_CONVERSATION_DESCRIPTOR_BYTES,
     MAX_NATIVE_NONLIVE_IDENTITIES, MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_CONVERSATIONS,
-    MAX_RUNTIME_LIVE_CONVERSATIONS, MAX_RUNTIME_PHYSICAL_CONVERSATIONS,
-    MachineEnrollmentReceiptRecord, MachineIdentityBinding, MachineIdentityLifecycle,
-    MachineIdentityStateRecord, MarkConversationRecoveryBlocked, NewConversation,
-    PrepareMachineIdentityOutcome, QueryCommandReceipt, QueueScope, RecoverStartedCommand,
-    RecoveryBlockedCommandBinding, RecoveryCompletion, RecoveryCursor, RecoveryFenceBinding,
-    RecoveryPage, RecoveryState, RuntimeClock, RuntimeClockError, RuntimeCommitOperation,
-    RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreFaultInjector, RuntimeStoreLane,
-    RuntimeStoreOperation, RuntimeStoreSnapshot, SanitizedTerminalFailure, StartCommand,
-    StartOutcome, StartedBeforeReleaseTermination, StartedRecoveryRecord, SystemRuntimeClock,
-    TerminalState, TerminateAcceptedCommand, TerminateAcceptedOutcome,
-    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    MAX_RUNTIME_LIVE_CONVERSATIONS, MAX_RUNTIME_PHYSICAL_CONVERSATIONS, MachineCleanupWitnessError,
+    MachineCleanupWitnessV1, MachineEnrollmentConnectionMaterial, MachineEnrollmentReceiptRecord,
+    MachineEnrollmentState, MachineIdentityBinding, MachineIdentityLifecycle,
+    MachineIdentityStateRecord, MachinePurgeReadbackProof, MachineRemoteLifecycle,
+    MachineRemoteStateRecord, MachineRetirementRequestMaterial, MachineRetirementTerminalMaterial,
+    MachineRootLostPurgeMaterial, MachineTrustResetKind, MarkConversationRecoveryBlocked,
+    NewConversation, PrepareMachineEnrollmentOutcome, PrepareMachineIdentityOutcome,
+    PrepareMachineRetirementOutcome, PreparedMachineEnrollmentState,
+    PurgeReadbackAbsentMachineEnrollmentState, QueryCommandReceipt, QueueScope,
+    RecordMachineRetirementTerminalOutcome, RecordRootLostMachinePurgeOutcome,
+    RecordValidatedEnrollmentResponseOutcome, RecoverStartedCommand, RecoveryBlockedCommandBinding,
+    RecoveryCompletion, RecoveryCursor, RecoveryFenceBinding, RecoveryPage, RecoveryState,
+    RelayCommittedMachineEnrollmentState, RetirePendingMachineEnrollmentState, RuntimeClock,
+    RuntimeClockError, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
+    RuntimeStoreFaultInjector, RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot,
+    SanitizedTerminalFailure, StartCommand, StartOutcome, StartedBeforeReleaseTermination,
+    StartedRecoveryRecord, SystemRuntimeClock, TerminalState, TerminateAcceptedCommand,
+    TerminateAcceptedOutcome, TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    ValidatedMachineEnrollmentState,
 };
 pub use admin::{
     AcceptAdminUpgradeOutcome, AdminUpgradeCommand, AdminUpgradeRecoveryCursor,
@@ -65,6 +76,7 @@ pub(crate) use configuration::MAX_CONFIGURATION_CANONICAL_BYTES;
 pub use configuration::{ConfigurationRecord, ConfigureConversation, ConfigureConversationOutcome};
 pub use execution_event::{AppendExecutionEvent, AppendExecutionEventOutcome};
 pub use identity::{RuntimeId, RuntimeIdKind, RuntimeIdSource};
+pub(crate) use machine_remote::prepare_input_hash_for_bundle as machine_enrollment_prepare_input_hash;
 pub(crate) use metadata::{
     ClaimNativeMetadataMutationOutcome, NativeMetadataMutationClaim,
     NativeMetadataMutationReadback, NativeMetadataMutationStatus,

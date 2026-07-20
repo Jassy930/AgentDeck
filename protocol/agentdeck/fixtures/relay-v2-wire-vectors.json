@@ -697,5 +697,5 @@
     }
   ],
   "relayProtocolVersion": 2,
-  "runtimeProtocolVersion": 2
+  "runtimeProtocolVersion": 3
 }

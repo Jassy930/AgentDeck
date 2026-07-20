@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-use agentdeck_protocol::runtime::command::{HelloParams, QueryReceiptSelector};
+use agentdeck_protocol::runtime::command::{HelloParams, QueryReceiptSelector, RevokeTarget};
 use agentdeck_protocol::runtime::failure::{
     DAEMON_AUTHORIZATION_PERMISSION_DENIED, DAEMON_AUTHORIZATION_REVOKED,
     DAEMON_COMMAND_HISTORY_ONLY, DAEMON_COMMAND_NOT_FOUND,
@@ -55,6 +55,9 @@ use super::read_pool::{DEFAULT_RUNTIME_READ_CONCURRENCY, ReadPool, ReadPoolError
 use super::recovery::{
     RecoveryOptions, RecoveryReadyPermit, RuntimeRecoveryCoordinator, RuntimeRecoveryError,
     RuntimeRecoveryInstallError,
+};
+use super::remote_administration::{
+    DisabledRemoteAdministration, RemoteAdministration, RemoteAdministrationError,
 };
 use super::router::AgentRouter;
 use super::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
@@ -104,6 +107,7 @@ pub struct RuntimeCore {
     native_projector_enabled: bool,
     native_mutations: NativeMutationCoordinator,
     upgrade: Arc<dyn UpgradeService>,
+    remote_administration: Arc<dyn RemoteAdministration>,
     recovery_identity: Arc<()>,
     recovery: RuntimeRecoveryCoordinator,
     read_pool: ReadPool,
@@ -174,6 +178,17 @@ impl RuntimeCore {
         Ok(self)
     }
 
+    /// production composition 注入 daemon-private remote owner。默认保持 Disabled；
+    /// 本入口只替换中立 capability，不把 Relay transport 暴露给 Core。
+    #[doc(hidden)]
+    pub fn with_remote_administration(
+        mut self,
+        remote_administration: Arc<dyn RemoteAdministration>,
+    ) -> Self {
+        self.remote_administration = remote_administration;
+        self
+    }
+
     fn with_execution_coordinator(
         store: RuntimeStoreHandle,
         router: Arc<AgentRouter>,
@@ -240,6 +255,7 @@ impl RuntimeCore {
             native_projector_enabled: enable_native_projector,
             native_mutations,
             upgrade: Arc::new(DisabledUpgradeService),
+            remote_administration: Arc::new(DisabledRemoteAdministration),
             recovery_identity,
             recovery,
             read_pool: ReadPool::new(DEFAULT_RUNTIME_READ_CONCURRENCY)?,
@@ -360,7 +376,7 @@ impl RuntimeCore {
         }
     }
 
-    /// 所有 Runtime v2 transport 共用的完整 envelope 入口。directed reply 严格复用
+    /// 所有 Runtime v3 transport 共用的完整 envelope 入口。directed reply 严格复用
     /// 原 request messageId，并进入 connection-owned reply pump；本方法不等待 socket。
     pub async fn handle_envelope(
         &self,
@@ -1129,12 +1145,43 @@ impl RuntimeCore {
             // Catalog page 可能超过单 frame 上限，必须携带原 messageId 进入
             // handle_envelope 的 tracked paced egress；direct handle 禁止返回大 DTO。
             RuntimeRequest::Catalog(_) => Err(RuntimeCoreError::InvalidRequest),
+            RuntimeRequest::MachineEnroll(request) => {
+                let _authorization = principal.try_enter_local_administration()?;
+                self.remote_administration
+                    .enroll(request)
+                    .await
+                    .map(RuntimeReply::MachineRemoteStatus)
+                    .map_err(remote_administration_error)
+            }
+            RuntimeRequest::MachineRemoteStatus { .. } => {
+                let _authorization = principal.try_enter_local_administration()?;
+                self.remote_administration
+                    .status()
+                    .await
+                    .map(RuntimeReply::MachineRemoteStatus)
+                    .map_err(remote_administration_error)
+            }
+            RuntimeRequest::TrustReset(request) => {
+                let _authorization = principal.try_enter_local_administration()?;
+                self.remote_administration
+                    .trust_reset(request)
+                    .await
+                    .map(RuntimeReply::MachineRemoteStatus)
+                    .map_err(remote_administration_error)
+            }
             RuntimeRequest::CreatePairInvite(_)
             | RuntimeRequest::ListPendingPairings { .. }
             | RuntimeRequest::ConfirmPairing { .. }
-            | RuntimeRequest::CancelPairing { .. }
-            | RuntimeRequest::Revoke(_)
-            | RuntimeRequest::TrustReset { .. } => Err(RuntimeCoreError::FeatureUnavailable),
+            | RuntimeRequest::CancelPairing { .. } => {
+                let _authorization = principal.try_enter_local_administration()?;
+                Err(RuntimeCoreError::FeatureUnavailable)
+            }
+            RuntimeRequest::Revoke(request) => {
+                if matches!(request.target, RevokeTarget::Device { .. }) {
+                    let _authorization = principal.try_enter_local_administration()?;
+                }
+                Err(RuntimeCoreError::FeatureUnavailable)
+            }
             RuntimeRequest::StageUpgrade(_) => {
                 let failure = match principal.try_enter_local_administration() {
                     Ok(_authorization) => RuntimeCoreError::FeatureUnavailable,
@@ -1446,6 +1493,8 @@ pub(crate) enum RuntimeCoreError {
     HistoryOnlyCommand,
     #[error("runtime command identity was not found")]
     CommandNotFound,
+    #[error("remote administration failed: {0:?}")]
+    RemoteAdministration(RemoteAdministrationError),
     #[error(transparent)]
     HistoryReceipt(#[from] HistoryOnlyReceiptError),
     #[error(transparent)]
@@ -1509,6 +1558,9 @@ impl RuntimeCoreError {
                 DAEMON_COMMAND_NOT_FOUND,
                 "runtime command identity was not found",
             ),
+            Self::RemoteAdministration(error) => {
+                RuntimeFailure::new(error.code(), "machine remote administration failed")
+            }
             Self::HistoryReceipt(_) => RuntimeFailure::new(
                 DAEMON_RUNTIME_READ_UNAVAILABLE,
                 "runtime history receipt index is unavailable",
@@ -1585,6 +1637,10 @@ impl RuntimeCoreError {
             ),
         }
     }
+}
+
+fn remote_administration_error(error: RemoteAdministrationError) -> RuntimeCoreError {
+    RuntimeCoreError::RemoteAdministration(error)
 }
 
 impl From<super::connection::PrincipalAccessError> for RuntimeCoreError {

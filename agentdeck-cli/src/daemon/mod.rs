@@ -2,3 +2,4 @@
 
 pub mod artifact;
 pub mod launchd;
+pub mod purge;

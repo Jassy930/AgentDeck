@@ -3584,6 +3584,7 @@ fn copy_ledger(ledger: &RuntimeLedger) -> RuntimeLedger {
         admin_command_pending_count: ledger.admin_command_pending_count,
         admin_command_charged_bytes: ledger.admin_command_charged_bytes,
         machine_identity_count: ledger.machine_identity_count,
+        machine_remote_state_count: ledger.machine_remote_state_count,
         accepted_count: ledger.accepted_count,
         accepted_payload_bytes: ledger.accepted_payload_bytes,
         started_without_fence_count: ledger.started_without_fence_count,

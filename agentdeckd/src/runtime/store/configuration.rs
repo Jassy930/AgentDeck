@@ -21,7 +21,9 @@ use crate::runtime::model::{
 
 use super::cipher::{ROW_BLOB_V1_OVERHEAD_LEN, RowAad, RuntimeKeyBundle};
 use super::identity::{RuntimeId, RuntimeIdKind};
-use super::schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY};
+use super::schema::{
+    RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION,
+};
 use super::sequence::{SequenceScope, decode_sequence, encode_sequence, next_sequence};
 use super::sqlite::{RuntimeLedger, RuntimeSqlite, SafetyReserveProjection};
 
@@ -2135,7 +2137,7 @@ pub(super) fn validate_v5_integrity(
             Err(RuntimeStoreError::UnknownOrCorruptSchema)
         };
     }
-    if !matches!(version, 5..=8) {
+    if !(5..=RUNTIME_SCHEMA_VERSION).contains(&version) {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
 
@@ -2155,7 +2157,7 @@ pub(super) fn validate_v5_integrity(
             row.get::<_, Vec<u8>>(6)?,
         ))
     })?;
-    let physical_limit = if matches!(version, 6..=8) {
+    let physical_limit = if (6..=RUNTIME_SCHEMA_VERSION).contains(&version) {
         MAX_RUNTIME_PHYSICAL_CONVERSATIONS
     } else {
         MAX_RUNTIME_CONVERSATIONS

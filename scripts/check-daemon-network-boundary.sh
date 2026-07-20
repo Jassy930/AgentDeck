@@ -12,18 +12,66 @@ fail() {
   exit 1
 }
 
-# 威胁场景：开启 Tokio net 以承载本机 UDS 时，transitive dependency 顺带把
-# HTTP/WebSocket client/server 栈拉进 daemon，使 P4 前就能建立未受许可的远程链路。
-dependency_tree="$(cargo tree -p agentdeckd -e normal --prefix none)"
-if banned_dependencies="$(printf '%s\n' "$dependency_tree" \
-  | rg '^(axum|reqwest|hyper|hyper-util|tokio-tungstenite|tungstenite|quinn|h3)( |$)' || true)" \
-  && [[ -n "$banned_dependencies" ]]; then
-  fail 'agentdeckd dependency tree contains a banned network stack' "$banned_dependencies"
+# 威胁场景：P4.2 引入唯一 outbound client 后，其他 daemon direct dependency 或
+# transitive branch 顺带取得 HTTP/WebSocket client/server 栈，绕过 remote/ 的 typed owner。
+# `--no-dedupe --prefix depth` 让每个 transitive occurrence 都能归属到 depth=1 owner；
+# 所有受关注网络 crate 的 depth=1 owner 必须精确为 agentdeck-relay-client。
+network_dependency_violations() {
+  awk '
+  function package_name(line, depth_text) {
+    depth_text = line
+    sub(/[^0-9].*$/, "", depth_text)
+    return substr(line, length(depth_text) + 1)
+  }
+  function is_network(package) {
+    return package ~ /^(axum|reqwest|hyper|hyper-util|tokio-tungstenite|tungstenite|quinn|h3)( |$)/
+  }
+  {
+    depth_text = $0
+    sub(/[^0-9].*$/, "", depth_text)
+    depth = depth_text + 0
+    package = package_name($0)
+    if (depth == 1) {
+      owner = package
+    }
+    if (is_network(package) && (depth <= 1 || owner !~ /^agentdeck-relay-client( |$)/)) {
+      print "owner=" owner " dependency=" package
+    }
+  }
+  '
+}
+
+allowed_dependency_sentinel=$'0agentdeckd v0\n1agentdeck-relay-client v0\n2tokio-tungstenite v0\n3tungstenite v0'
+direct_dependency_sentinel=$'0agentdeckd v0\n1tokio-tungstenite v0'
+wrong_owner_sentinel=$'0agentdeckd v0\n1unrelated-client v0\n2hyper v0'
+if [[ -n "$(network_dependency_violations <<<"$allowed_dependency_sentinel")" ]]; then
+  fail 'network dependency owner parser rejected its approved Relay client sentinel'
+fi
+for sentinel in "$direct_dependency_sentinel" "$wrong_owner_sentinel"; do
+  if [[ -z "$(network_dependency_violations <<<"$sentinel")" ]]; then
+    fail 'network dependency owner parser accepted a forbidden sentinel' "$sentinel"
+  fi
+done
+
+dependency_tree="$(cargo tree -p agentdeckd -e normal --no-dedupe --prefix depth)"
+dependency_violations="$(network_dependency_violations <<<"$dependency_tree" || true)"
+if [[ -n "$dependency_violations" ]]; then
+  fail 'daemon network dependencies must be owned by agentdeck-relay-client' \
+    "$dependency_violations"
+fi
+if ! rg -q '^1agentdeck-relay-client( |$)' <<<"$dependency_tree"; then
+  fail 'agentdeckd must use the single approved agentdeck-relay-client dependency'
 fi
 
 if outside_local="$(rg -n 'tokio::net' agentdeckd/src \
   | rg -v '^agentdeckd/src/local/' || true)" && [[ -n "$outside_local" ]]; then
-  fail 'tokio::net is only allowed under agentdeckd/src/local during P3' "$outside_local"
+  fail 'tokio::net is only allowed under agentdeckd/src/local; remote must use the Relay client' "$outside_local"
+fi
+
+if outside_remote_client="$(rg -n '\bagentdeck_relay_client\b' agentdeckd/src \
+  | rg -v '^agentdeckd/src/remote/' || true)" && [[ -n "$outside_remote_client" ]]; then
+  fail 'agentdeck-relay-client imports are only allowed under agentdeckd/src/remote' \
+    "$outside_remote_client"
 fi
 
 # Grouped imports make the owning module ambiguous to line-based path filtering. Keep the
@@ -45,8 +93,8 @@ if grouped_unix_import="$(rg -n -U "$grouped_unix_pattern" agentdeckd/src || tru
     "$grouped_unix_import"
 fi
 
-# P3 pathname networking is local-only. P4 may extend this exact allowlist to remote/;
-# adapters and RuntimeCore must never gain transport ownership by accident. Type-token
+# Pathname networking remains local-only；P4 remote/ 只能消费 typed Relay client，不能直接
+# 创建 socket。adapters 和 RuntimeCore 不能取得 transport ownership。Type-token
 # scanning deliberately catches rustfmt grouped imports and aliases, not only fully-qualified
 # paths. Wildcard net imports and direct socket2/mio use are forbidden because they would
 # bypass the file-level allowlist.
@@ -163,4 +211,4 @@ if adapter_transport="$(rg -n -U \
   fail 'vendor adapters must not import local/remote/Relay transport' "$adapter_transport"
 fi
 
-printf 'ok: agentdeckd P3 network boundary is local UDS only\n'
+printf 'ok: agentdeckd network boundary is local UDS plus remote/-owned Relay client only\n'

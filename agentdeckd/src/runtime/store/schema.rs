@@ -9,7 +9,8 @@ pub const RUNTIME_SCHEMA_VERSION_V5: u32 = 5;
 pub const RUNTIME_SCHEMA_VERSION_V6: u32 = 6;
 pub const RUNTIME_SCHEMA_VERSION_V7: u32 = 7;
 pub const RUNTIME_SCHEMA_VERSION_V8: u32 = 8;
-pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V8;
+pub const RUNTIME_SCHEMA_VERSION_V9: u32 = 9;
+pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V9;
 /// 行密文与 wrapped key bundle 的 AAD context 版本。
 ///
 /// physical schema migration 只增表/增认证计数，不得让既有行重新加密或重新包装。
@@ -55,6 +56,8 @@ pub const RUNTIME_LEDGER_DOMAIN_V6: &[u8] = b"runtime.meta.ledger.v6";
 pub const RUNTIME_LEDGER_DOMAIN_V7: &[u8] = b"runtime.meta.ledger.v7";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const RUNTIME_LEDGER_DOMAIN_V8: &[u8] = b"runtime.meta.ledger.v8";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V9: &[u8] = b"runtime.meta.ledger.v9";
 pub const EXPECTED_TABLES_V1: [&str; 7] = [
     "commands",
     "conversations",
@@ -202,10 +205,54 @@ pub const EXPECTED_TABLES_V8: [&str; 24] = [
     "runtime_meta",
     "snapshots",
 ];
-pub const EXPECTED_TABLES: [&str; 24] = EXPECTED_TABLES_V8;
+pub const EXPECTED_TABLES_V9: [&str; 25] = [
+    "admin_commands",
+    "approval_ledger",
+    "catalog_journal",
+    "claude_code_adapter_state",
+    "codex_adapter_state",
+    "command_configuration_pins",
+    "commands",
+    "configuration_journal",
+    "conversation_state",
+    "conversations",
+    "event_journal",
+    "event_retention",
+    "event_stream_index",
+    "execution_fences",
+    "execution_intents",
+    "machine_enrollment_receipts",
+    "machine_identity_state",
+    "machine_remote_state",
+    "metadata_mutation_ledger",
+    "native_metadata_effect_fences",
+    "native_projection_state",
+    "publication_outbox",
+    "publication_streams",
+    "runtime_meta",
+    "snapshots",
+];
+pub const EXPECTED_TABLES: [&str; 25] = EXPECTED_TABLES_V9;
 
 pub fn schema_signature() -> [u8; 32] {
-    schema_signature_v8()
+    schema_signature_v9()
+}
+
+pub fn schema_signature_v9() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V4.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V5.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V6.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V7.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V8.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V9.as_bytes());
+        digest.finalize().into()
+    })
 }
 
 pub fn schema_signature_v8() -> [u8; 32] {
@@ -1486,6 +1533,96 @@ CREATE TABLE machine_identity_state (
 );
 "#;
 
+/// P4.2-A additive v9 physical shape。
+///
+/// 只追加 authenticated remote lifecycle singleton 与 0/1 ledger count；状态内容只允许存在于
+/// 有界 sealed blob，既有 row、ciphertext、metadata token、wrapped key bundle 与 crypto context
+/// 均不改写。
+pub const RUNTIME_MIGRATION_V9: &str = r#"
+ALTER TABLE runtime_meta ADD COLUMN machine_remote_state_count INTEGER NOT NULL DEFAULT 0
+    CHECK(machine_remote_state_count BETWEEN 0 AND 1);
+
+CREATE TABLE machine_remote_state (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    lifecycle TEXT NOT NULL CHECK(lifecycle IN (
+        'enrollmentPrepared',
+        'enrollmentResponseValidated',
+        'active',
+        'retirePending',
+        'relayCommitted',
+        'purgeReadbackAbsent',
+        'localDeleted'
+    )),
+    reset_kind TEXT CHECK(reset_kind IS NULL OR reset_kind IN ('rootPresent', 'rootLost')),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    relay_server_id BLOB NOT NULL CHECK(
+        typeof(relay_server_id) = 'blob' AND length(relay_server_id) = 16
+        AND relay_server_id <> X'00000000000000000000000000000000'
+    ),
+    machine_route BLOB NOT NULL CHECK(
+        typeof(machine_route) = 'blob' AND length(machine_route) = 16
+        AND machine_route <> X'00000000000000000000000000000000'
+    ),
+    root_key_id BLOB NOT NULL CHECK(
+        typeof(root_key_id) = 'blob' AND length(root_key_id) = 16
+        AND root_key_id <> X'00000000000000000000000000000000'
+    ),
+    root_fingerprint BLOB NOT NULL
+        CHECK(typeof(root_fingerprint) = 'blob' AND length(root_fingerprint) = 32
+              AND root_fingerprint <> X'0000000000000000000000000000000000000000000000000000000000000000'),
+    trust_epoch TEXT NOT NULL CHECK(
+        typeof(trust_epoch) = 'text' AND length(trust_epoch) = 20
+        AND trust_epoch NOT GLOB '*[^0-9]*'
+        AND trust_epoch > '00000000000000000000'
+        AND trust_epoch <= '18446744073709551615'
+    ),
+    request_hash BLOB NOT NULL
+        CHECK(typeof(request_hash) = 'blob' AND length(request_hash) = 32
+              AND request_hash <> X'0000000000000000000000000000000000000000000000000000000000000000'),
+    response_hash BLOB CHECK(
+        response_hash IS NULL
+        OR (typeof(response_hash) = 'blob' AND length(response_hash) = 32
+            AND response_hash <> X'0000000000000000000000000000000000000000000000000000000000000000')
+    ),
+    enrollment_receipt_hash BLOB CHECK(
+        enrollment_receipt_hash IS NULL
+        OR (typeof(enrollment_receipt_hash) = 'blob' AND length(enrollment_receipt_hash) = 32
+            AND enrollment_receipt_hash <> X'0000000000000000000000000000000000000000000000000000000000000000')
+    ),
+    receipt_verify_key_hash BLOB NOT NULL
+        CHECK(typeof(receipt_verify_key_hash) = 'blob' AND length(receipt_verify_key_hash) = 32
+              AND receipt_verify_key_hash <> X'0000000000000000000000000000000000000000000000000000000000000000'),
+    sealed_state BLOB NOT NULL CHECK(
+        typeof(sealed_state) = 'blob' AND length(sealed_state) BETWEEN 40 AND 65576
+    ),
+    sealed_state_bytes INTEGER NOT NULL CHECK(
+        typeof(sealed_state_bytes) = 'integer'
+        AND sealed_state_bytes BETWEEN 40 AND 65576
+        AND sealed_state_bytes = length(sealed_state)
+    ),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    CHECK(
+        (lifecycle IN ('enrollmentPrepared', 'enrollmentResponseValidated', 'active')
+            AND reset_kind IS NULL)
+        OR (lifecycle IN (
+                'retirePending', 'relayCommitted', 'purgeReadbackAbsent', 'localDeleted'
+            ) AND reset_kind IS NOT NULL AND reset_kind = 'rootPresent')
+        OR (lifecycle IN ('purgeReadbackAbsent', 'localDeleted')
+            AND reset_kind IS NOT NULL AND reset_kind = 'rootLost')
+    ),
+    CHECK(
+        (lifecycle = 'enrollmentPrepared'
+            AND response_hash IS NULL AND enrollment_receipt_hash IS NULL)
+        OR (lifecycle = 'enrollmentResponseValidated'
+            AND response_hash IS NOT NULL AND enrollment_receipt_hash IS NULL)
+        OR (lifecycle IN (
+                'active', 'retirePending', 'relayCommitted', 'purgeReadbackAbsent', 'localDeleted'
+            ) AND response_hash IS NOT NULL AND enrollment_receipt_hash IS NOT NULL)
+    )
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1673,7 +1810,7 @@ mod tests {
 
     #[test]
     fn stream_schema_advances_to_v4_with_six_bounded_store_tables() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V8);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V9);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         for table in [
             "event_stream_index",
@@ -1689,7 +1826,7 @@ mod tests {
 
     #[test]
     fn approval_physical_schema_remains_v3_compatible_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V8);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V9);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V3.len(), 10);
         assert!(EXPECTED_TABLES_V3.contains(&"approval_ledger"));
@@ -1749,9 +1886,17 @@ mod tests {
         connection
     }
 
+    fn v9_structural_connection() -> Connection {
+        let connection = v8_structural_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V9)
+            .expect("apply v9 structural migration");
+        connection
+    }
+
     #[test]
     fn v6_adds_projection_and_effect_fence_sidecars_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V8);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V9);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V6, 6);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V5.len(), 20);
@@ -1782,7 +1927,7 @@ mod tests {
 
     #[test]
     fn v7_adds_machine_wide_admin_command_ledger_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V8);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V9);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V7, 7);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V7.len(), 23);
@@ -1847,12 +1992,11 @@ mod tests {
 
     #[test]
     fn v8_adds_authenticated_machine_identity_singleton_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V8);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V8, 8);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V8.len(), 24);
-        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V8);
-        assert_eq!(schema_signature(), schema_signature_v8());
+        assert_ne!(EXPECTED_TABLES.as_slice(), EXPECTED_TABLES_V8.as_slice());
+        assert_ne!(schema_signature(), schema_signature_v8());
         assert_ne!(schema_signature_v7(), schema_signature_v8());
         assert_eq!(RUNTIME_LEDGER_DOMAIN_V8, b"runtime.meta.ledger.v8");
 
@@ -1908,6 +2052,173 @@ mod tests {
                 "v8 identity row must not contain {forbidden} material"
             );
         }
+    }
+
+    #[test]
+    fn v9_adds_bounded_authenticated_machine_remote_singleton_without_rotating_crypto_context() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V9);
+        assert_eq!(RUNTIME_SCHEMA_VERSION_V9, 9);
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        assert_eq!(EXPECTED_TABLES_V8.len(), 24);
+        assert_eq!(EXPECTED_TABLES_V9.len(), 25);
+        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V9);
+        assert_eq!(schema_signature(), schema_signature_v9());
+        assert_ne!(schema_signature_v8(), schema_signature_v9());
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V9, b"runtime.meta.ledger.v9");
+
+        let connection = v9_structural_connection();
+        assert_eq!(table_names(&connection), EXPECTED_TABLES_V9);
+        assert_eq!(
+            table_columns(&connection, "runtime_meta")
+                .last()
+                .map(String::as_str),
+            Some("machine_remote_state_count")
+        );
+        assert_eq!(
+            table_columns(&connection, "machine_remote_state"),
+            [
+                "singleton",
+                "lifecycle",
+                "reset_kind",
+                "database_id",
+                "relay_server_id",
+                "machine_route",
+                "root_key_id",
+                "root_fingerprint",
+                "trust_epoch",
+                "request_hash",
+                "response_hash",
+                "enrollment_receipt_hash",
+                "receipt_verify_key_hash",
+                "sealed_state",
+                "sealed_state_bytes",
+                "metadata_token",
+            ]
+        );
+        assert!(
+            explicit_indexes(&connection, "machine_remote_state").is_empty(),
+            "singleton remote row needs no secondary index"
+        );
+        assert!(foreign_key_columns(&connection, "machine_remote_state").is_empty());
+        let sql = table_sql(&connection, "machine_remote_state");
+        for forbidden in [
+            "enrollment_code",
+            "origin",
+            "pinset",
+            "certificate",
+            "purge_proof",
+            "private_key",
+        ] {
+            assert!(
+                !sql.to_ascii_lowercase().contains(forbidden),
+                "v9 remote row must not persist plaintext {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn v9_machine_remote_state_enforces_lifecycle_hash_and_reset_combinations() {
+        let connection = v9_structural_connection();
+        let database_id = [0x11_u8; 16];
+        let relay_server_id = [0x12_u8; 16];
+        let machine_route = [0x13_u8; 16];
+        let root_key_id = [0x14_u8; 16];
+        let root_fingerprint = [0x15_u8; 32];
+        let request_hash = [0x16_u8; 32];
+        let response_hash = [0x17_u8; 32];
+        let receipt_hash = [0x18_u8; 32];
+        let verify_key_hash = [0x19_u8; 32];
+        let sealed_state = [0x1A_u8; 40];
+        let metadata_token = [0x1B_u8; 32];
+        let insert = |lifecycle: &str,
+                      reset_kind: Option<&str>,
+                      response_present: bool,
+                      receipt_present: bool| {
+            connection.execute(
+                "INSERT INTO machine_remote_state (
+                     singleton, lifecycle, reset_kind, database_id, relay_server_id,
+                     machine_route, root_key_id, root_fingerprint, trust_epoch,
+                     request_hash, response_hash, enrollment_receipt_hash,
+                     receipt_verify_key_hash, sealed_state, sealed_state_bytes, metadata_token
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 40, ?14)",
+                params![
+                    lifecycle,
+                    reset_kind,
+                    &database_id[..],
+                    &relay_server_id[..],
+                    &machine_route[..],
+                    &root_key_id[..],
+                    &root_fingerprint[..],
+                    "00000000000000000001",
+                    &request_hash[..],
+                    response_present.then_some(&response_hash[..]),
+                    receipt_present.then_some(&receipt_hash[..]),
+                    &verify_key_hash[..],
+                    &sealed_state[..],
+                    &metadata_token[..],
+                ],
+            )
+        };
+
+        for (lifecycle, reset_kind, response_present, receipt_present) in [
+            ("enrollmentPrepared", None, false, false),
+            ("enrollmentResponseValidated", None, true, false),
+            ("active", None, true, true),
+            ("retirePending", Some("rootPresent"), true, true),
+            ("relayCommitted", Some("rootPresent"), true, true),
+            ("purgeReadbackAbsent", Some("rootLost"), true, true),
+            ("localDeleted", Some("rootPresent"), true, true),
+        ] {
+            insert(lifecycle, reset_kind, response_present, receipt_present)
+                .unwrap_or_else(|error| panic!("valid {lifecycle}/{reset_kind:?}: {error}"));
+            connection
+                .execute("DELETE FROM machine_remote_state", [])
+                .expect("clear valid remote state");
+        }
+
+        for (lifecycle, reset_kind, response_present, receipt_present) in [
+            ("enrollmentPrepared", Some("rootPresent"), false, false),
+            ("enrollmentPrepared", None, true, false),
+            ("enrollmentResponseValidated", None, false, false),
+            ("active", None, true, false),
+            ("retirePending", Some("rootLost"), true, true),
+            ("relayCommitted", None, true, true),
+        ] {
+            assert!(
+                insert(lifecycle, reset_kind, response_present, receipt_present).is_err(),
+                "invalid {lifecycle}/{reset_kind:?} combination must be rejected"
+            );
+        }
+
+        insert("active", None, true, true).expect("insert active hash constraint fixture");
+        for column in [
+            "root_fingerprint",
+            "request_hash",
+            "response_hash",
+            "enrollment_receipt_hash",
+            "receipt_verify_key_hash",
+        ] {
+            assert!(
+                connection
+                    .execute(
+                        &format!(
+                            "UPDATE machine_remote_state SET {column} = zeroblob(32) WHERE singleton = 1"
+                        ),
+                        [],
+                    )
+                    .is_err(),
+                "all-zero {column} must be rejected"
+            );
+        }
+        assert!(
+            connection
+                .execute(
+                    "UPDATE machine_remote_state SET sealed_state_bytes = 40.5 WHERE singleton = 1",
+                    [],
+                )
+                .is_err(),
+            "sealed_state_bytes must remain an integer"
+        );
     }
 
     #[test]

@@ -23,13 +23,6 @@ fn error_code(output: &Output) -> String {
 }
 
 #[test]
-fn purge_is_typed_fail_close_before_any_lifecycle_mutation() {
-    let output = output(&["daemon", "uninstall", "--purge"]);
-    assert_eq!(output.status.code(), Some(5));
-    assert_eq!(error_code(&output), "daemon.purge.remote_not_ready");
-}
-
-#[test]
 fn production_daemon_commands_reject_the_ephemeral_runtime_seam_without_mutation() {
     let root = tempfile::tempdir().expect("private Runtime harness root");
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
