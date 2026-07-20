@@ -48,8 +48,8 @@ use super::config::{
 };
 use super::enrollment::{FrozenMachineEnrollment, MachineEnrollmentError};
 use super::pairing::{
-    PairingCoordinatorHandle, PairingCoordinatorOwner, PairingInviteContext,
-    unavailable as pairing_unavailable,
+    PairingCoordinatorHandle, PairingCoordinatorOwner, PairingDrainStartError,
+    PairingInviteContext, unavailable as pairing_unavailable,
 };
 use super::transport::{PairingRuntimeParts, RemoteTransport, RemoteTransportConnectError};
 use super::trust_reset::{MachineTrustResetWorkflow, MachineTrustResetWorkflowError};
@@ -61,6 +61,7 @@ const REMOTE_SHUTTING_DOWN: &str = "daemon.remote.shutting_down";
 const REMOTE_STATE_CONFLICT: &str = "daemon.remote.enrollment.state_conflict";
 const PAIRING_DRAIN_WAIT_DEADLINE: Duration = Duration::from_secs(10);
 const PAIRING_DRAIN_PENDING: &str = "daemon.pairing.drain_pending";
+const PAIRING_ACTIVE: &str = "daemon.pairing.active";
 const ROOT_PRESENT_RECEIPT_FORBIDDEN: &str =
     "daemon.remote.trust_reset.root_present_receipt_forbidden";
 const ROOT_LOST_RECEIPT_REQUIRED: &str = "daemon.remote.trust_reset.admin_receipt_required";
@@ -68,7 +69,14 @@ const PURGE_FINALIZER_UNAVAILABLE: &str = "daemon.purge.finalizer_unavailable";
 const PURGE_RECOVERY_REQUIRED: &str = "daemon.purge.recovery_required";
 
 enum PairingDrainWaitError {
+    NotEnqueued(PairingAdministrationError),
+    Unconfirmed(PairingAdministrationError),
     Actor(PairingAdministrationError),
+    Pending,
+    ShuttingDown,
+}
+
+enum PairingCommandWaitError {
     Pending,
     ShuttingDown,
 }
@@ -728,6 +736,30 @@ impl RemoteManager {
         }
     }
 
+    async fn await_pairing_command<F, T>(
+        &self,
+        deadline: tokio::time::Instant,
+        operation: F,
+    ) -> Result<T, PairingCommandWaitError>
+    where
+        F: Future<Output = T>,
+    {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        if *shutdown_rx.borrow() {
+            return Err(PairingCommandWaitError::ShuttingDown);
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                Err(PairingCommandWaitError::ShuttingDown)
+            }
+            result = tokio::time::timeout_at(deadline, operation) => {
+                result.map_err(|_| PairingCommandWaitError::Pending)
+            }
+        }
+    }
+
     async fn await_pairing_drain(
         &self,
         handle: &PairingCoordinatorHandle,
@@ -735,24 +767,45 @@ impl RemoteManager {
     ) -> Result<(), PairingDrainWaitError> {
         // deadline 只终止本次 administration 等待；被丢弃的 reply receiver 会由
         // actor 清理，durable Running drain 保持不变，后续 retry 可挂接新 waiter。
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        if *shutdown_rx.borrow() {
-            return Err(PairingDrainWaitError::ShuttingDown);
-        }
-        tokio::select! {
-            biased;
-            changed = shutdown_rx.changed() => {
-                let _ = changed;
-                Err(PairingDrainWaitError::ShuttingDown)
+        match self
+            .await_pairing_command(deadline, handle.begin_drain())
+            .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(PairingDrainStartError::NotEnqueued(error))) => {
+                Err(PairingDrainWaitError::NotEnqueued(error))
             }
-            result = tokio::time::timeout_at(deadline, handle.begin_drain()) => {
-                match result {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(error)) => Err(PairingDrainWaitError::Actor(error)),
-                    Err(_) => Err(PairingDrainWaitError::Pending),
-                }
+            Ok(Err(PairingDrainStartError::Unconfirmed(error))) => {
+                Err(PairingDrainWaitError::Unconfirmed(error))
             }
+            Ok(Err(PairingDrainStartError::Actor(error))) => {
+                Err(PairingDrainWaitError::Actor(error))
+            }
+            Err(PairingCommandWaitError::Pending) => Err(PairingDrainWaitError::Pending),
+            Err(PairingCommandWaitError::ShuttingDown) => Err(PairingDrainWaitError::ShuttingDown),
         }
+    }
+
+    async fn resume_pairing_before_deadline(
+        &self,
+        handle: &PairingCoordinatorHandle,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), RemoteAdministrationError> {
+        match self
+            .await_pairing_command(deadline, handle.resume_after_failed_drain())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(PairingCommandWaitError::Pending) => Err(admin_error(PAIRING_DRAIN_PENDING)),
+            Err(PairingCommandWaitError::ShuttingDown) => Err(admin_error(REMOTE_SHUTTING_DOWN)),
+        }
+    }
+
+    async fn has_unowned_pairing_work(&self) -> Result<bool, RemoteAdministrationError> {
+        let pairings = self.store.list_pairing_recovery().await?;
+        let revocation_targets = self.store.list_revocation_drain_targets().await?;
+        let revocations = self.store.list_revocation_recovery().await?;
+        Ok(!pairings.is_empty() || !revocation_targets.is_empty() || !revocations.is_empty())
     }
 
     async fn finish_purge_authorization(
@@ -1117,12 +1170,22 @@ impl RemoteAdministration for RemoteManager {
                 && pairing.is_none();
             (portable_root_lost, pairing)
         };
+        let pairing_deadline = pairing
+            .as_ref()
+            .map(|_| tokio::time::Instant::now() + PAIRING_DRAIN_WAIT_DEADLINE);
         if let Some(handle) = pairing.as_ref() {
-            let deadline = tokio::time::Instant::now() + PAIRING_DRAIN_WAIT_DEADLINE;
+            let deadline = pairing_deadline.expect("pairing handle has a drain deadline");
             match self.await_pairing_drain(handle, deadline).await {
                 Ok(()) => {}
+                Err(
+                    PairingDrainWaitError::NotEnqueued(error)
+                    | PairingDrainWaitError::Unconfirmed(error),
+                ) => {
+                    return Err(admin_error(error.code()));
+                }
                 Err(PairingDrainWaitError::Actor(error)) => {
-                    let _ = handle.resume_after_failed_drain().await;
+                    self.resume_pairing_before_deadline(handle, deadline)
+                        .await?;
                     return Err(admin_error(error.code()));
                 }
                 Err(PairingDrainWaitError::Pending) => {
@@ -1132,9 +1195,9 @@ impl RemoteAdministration for RemoteManager {
                     return Err(admin_error(REMOTE_SHUTTING_DOWN));
                 }
             }
-        } else if !portable_root_lost && !self.store.list_pairing_recovery().await?.is_empty() {
+        } else if !portable_root_lost && self.has_unowned_pairing_work().await? {
             // 无 portable absent proof 时不能跳过 PairRoute close/revoke cleanup。
-            return Err(admin_error("daemon.pairing.active"));
+            return Err(admin_error(PAIRING_ACTIVE));
         }
         let result = {
             let mut state = self.state.lock().await;
@@ -1147,7 +1210,11 @@ impl RemoteAdministration for RemoteManager {
                 Ok(Some(MachineEnrollmentState::Active(_)))
             )
         {
-            let _ = handle.resume_after_failed_drain().await;
+            self.resume_pairing_before_deadline(
+                handle,
+                pairing_deadline.expect("pairing handle has a drain deadline"),
+            )
+            .await?;
         }
         result
     }

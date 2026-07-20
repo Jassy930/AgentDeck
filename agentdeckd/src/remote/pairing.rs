@@ -146,6 +146,27 @@ pub(crate) struct PairingCoordinatorHandle {
     command_tx: mpsc::Sender<PairingCommand>,
 }
 
+/// BeginDrain 的调用边界必须保留命令是否真正进入 actor，以及 actor 是否明确回错。
+/// 未入队或 reply 被丢弃都没有足够证据证明 drain 进入 Failed，调用方不得据此 Resume。
+#[derive(Debug)]
+pub(crate) enum PairingDrainStartError {
+    NotEnqueued(PairingAdministrationError),
+    Unconfirmed(PairingAdministrationError),
+    Actor(PairingAdministrationError),
+}
+
+impl PairingDrainStartError {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn code(&self) -> &str {
+        match self {
+            Self::NotEnqueued(error) | Self::Unconfirmed(error) | Self::Actor(error) => {
+                error.code()
+            }
+        }
+    }
+}
+
 impl fmt::Debug for PairingCoordinatorHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PairingCoordinatorHandle([REDACTED])")
@@ -169,12 +190,19 @@ impl PairingCoordinatorHandle {
         reply_rx.await.map_err(|_| pairing_error(PAIRING_STOPPED))?
     }
 
-    pub(crate) async fn begin_drain(&self) -> Result<(), PairingAdministrationError> {
+    pub(crate) async fn begin_drain(&self) -> Result<(), PairingDrainStartError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .try_send(PairingCommand::BeginDrain { reply: reply_tx })
-            .map_err(command_send_error)?;
-        reply_rx.await.map_err(|_| pairing_error(PAIRING_STOPPED))?
+            .map_err(command_send_error)
+            .map_err(PairingDrainStartError::NotEnqueued)?;
+        match reply_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(PairingDrainStartError::Actor(error)),
+            Err(_) => Err(PairingDrainStartError::Unconfirmed(pairing_error(
+                PAIRING_STOPPED,
+            ))),
+        }
     }
 
     pub(crate) async fn cancel(
@@ -326,6 +354,65 @@ impl PairingCoordinatorHandle {
                     },
                 }
             }
+        });
+        Self { command_tx }
+    }
+
+    #[cfg(test)]
+    pub(super) fn saturated_drain_test_double(
+        release: oneshot::Receiver<()>,
+        observed_stale_command: oneshot::Sender<bool>,
+    ) -> Self {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (reply, _ignored) = oneshot::channel();
+        command_tx
+            .try_send(PairingCommand::BeginDrain { reply })
+            .expect("prefill saturated pairing command queue");
+        tokio::spawn(async move {
+            let _ = release.await;
+            let _ = command_rx.recv().await;
+            let stale = matches!(
+                tokio::time::timeout(Duration::from_millis(50), command_rx.recv()).await,
+                Ok(Some(_))
+            );
+            let _ = observed_stale_command.send(stale);
+        });
+        Self { command_tx }
+    }
+
+    #[cfg(test)]
+    pub(super) fn blocked_resume_test_double(
+        begin_entered: oneshot::Sender<()>,
+        begin_release: oneshot::Receiver<Result<(), PairingAdministrationError>>,
+        saturated: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+        observed_stale_command: oneshot::Sender<bool>,
+    ) -> Self {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let filler_tx = command_tx.clone();
+        tokio::spawn(async move {
+            let Some(PairingCommand::BeginDrain { reply }) = command_rx.recv().await else {
+                return;
+            };
+            let _ = begin_entered.send(());
+            let begin_result = begin_release
+                .await
+                .unwrap_or_else(|_| Err(pairing_error(PAIRING_STOPPED)));
+            let (filler_reply, _ignored) = oneshot::channel();
+            filler_tx
+                .try_send(PairingCommand::BeginDrain {
+                    reply: filler_reply,
+                })
+                .expect("saturate queue before manager attempts Resume");
+            let _ = saturated.send(());
+            let _ = reply.send(begin_result);
+            let _ = release.await;
+            let _ = command_rx.recv().await;
+            let stale = matches!(
+                tokio::time::timeout(Duration::from_millis(50), command_rx.recv()).await,
+                Ok(Some(_))
+            );
+            let _ = observed_stale_command.send(stale);
         });
         Self { command_tx }
     }

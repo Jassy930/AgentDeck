@@ -30,6 +30,10 @@ mod pairing_authorization;
 mod pairing_delivery;
 #[cfg(test)]
 mod pairing_delivery_tests;
+#[cfg(test)]
+pub(crate) use pairing_delivery_tests::{
+    active_authorization_store_for_test, revoking_authorization_store_for_test,
+};
 pub(crate) mod pairing_grant;
 mod pairing_grant_allocation;
 #[cfg(test)]

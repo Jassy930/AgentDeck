@@ -459,6 +459,25 @@ async fn finish_fixture(manager: RemoteManager, fixture: ManagerFixture) {
     let _ = fs::remove_dir_all(fixture.root);
 }
 
+async fn finish_split_store_fixture(
+    manager: RemoteManager,
+    authorization_store: RuntimeStoreHandle,
+    fixture: ManagerFixture,
+) {
+    manager.shutdown().await;
+    drop(manager);
+    authorization_store
+        .shutdown()
+        .await
+        .expect("shutdown authorization-only Store");
+    fixture
+        .store
+        .shutdown()
+        .await
+        .expect("shutdown identity fixture Store");
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
 #[derive(Default)]
 struct RecordingPurgeSink {
     intent_calls: AtomicUsize,
@@ -849,6 +868,349 @@ async fn trust_reset_drain_waits_for_actor_without_holding_manager_mutex_and_res
     let manager = match Arc::try_unwrap(manager) {
         Ok(manager) => manager,
         Err(_) => panic!("all trust-reset mutex test owners must be joined"),
+    };
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_reset_saturated_drain_returns_busy_without_stale_resume() {
+    let mut fixture = active_fixture("saturated-drain").await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (stale_tx, stale_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test = Some(
+            crate::remote::pairing::PairingCoordinatorHandle::saturated_drain_test_double(
+                release_rx, stale_tx,
+            ),
+        );
+    }
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.trust_reset(
+            TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                .expect("ordinary root-present reset"),
+        ),
+    )
+    .await
+    .expect("full pairing command queue must return immediately")
+    .expect_err("saturated BeginDrain must fail closed");
+    assert_eq!(error.code(), "daemon.pairing.actor_busy");
+    release_tx.send(()).expect("release saturated queue");
+    assert!(
+        !stale_rx
+            .await
+            .expect("observe commands after releasing queue"),
+        "BeginDrain that was never enqueued must not create a stale Resume"
+    );
+    assert!(matches!(
+        fixture.store.load_machine_enrollment_state().await.unwrap(),
+        Some(MachineEnrollmentState::Active(_))
+    ));
+
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn actor_failed_drain_resume_uses_original_absolute_deadline() {
+    let mut fixture = active_fixture("failed-drain-resume-deadline").await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let (begin_entered_tx, begin_entered_rx) = tokio::sync::oneshot::channel();
+    let (begin_release_tx, begin_release_rx) = tokio::sync::oneshot::channel();
+    let (saturated_tx, saturated_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (stale_tx, stale_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test = Some(
+            crate::remote::pairing::PairingCoordinatorHandle::blocked_resume_test_double(
+                begin_entered_tx,
+                begin_release_rx,
+                saturated_tx,
+                release_rx,
+                stale_tx,
+            ),
+        );
+    }
+
+    let operation_manager = Arc::clone(&manager);
+    let operation = tokio::spawn(async move {
+        operation_manager
+            .trust_reset(
+                TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                    .expect("ordinary root-present reset"),
+            )
+            .await
+    });
+    begin_entered_rx.await.expect("actor receives BeginDrain");
+    tokio::time::advance(Duration::from_secs(9)).await;
+    begin_release_tx
+        .send(Err(
+            crate::runtime::pairing_administration::PairingAdministrationError::new(
+                "daemon.runtime.store_unavailable",
+            ),
+        ))
+        .expect("release actor failure near the absolute deadline");
+    saturated_rx
+        .await
+        .expect("queue is saturated before manager Resume");
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for _ in 0..10 {
+        if operation.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        operation.is_finished(),
+        "Resume must use the one second remaining on the original deadline"
+    );
+    assert_eq!(
+        operation
+            .await
+            .expect("join failed-drain trust-reset")
+            .expect_err("unconfirmed Resume must fail closed")
+            .code(),
+        "daemon.pairing.drain_pending"
+    );
+    tokio::time::resume();
+    release_tx.send(()).expect("release blocked Resume queue");
+    assert!(
+        !stale_rx.await.expect("observe post-deadline queue"),
+        "timed-out Resume send must be canceled before capacity returns"
+    );
+
+    let manager = match Arc::try_unwrap(manager) {
+        Ok(manager) => manager,
+        Err(_) => panic!("deadline test drops manager task"),
+    };
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cancels_actor_failure_resume_before_it_is_enqueued() {
+    let mut fixture = active_fixture("failed-drain-resume-shutdown").await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let (begin_entered_tx, begin_entered_rx) = tokio::sync::oneshot::channel();
+    let (begin_release_tx, begin_release_rx) = tokio::sync::oneshot::channel();
+    let (saturated_tx, saturated_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (stale_tx, stale_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test = Some(
+            crate::remote::pairing::PairingCoordinatorHandle::blocked_resume_test_double(
+                begin_entered_tx,
+                begin_release_rx,
+                saturated_tx,
+                release_rx,
+                stale_tx,
+            ),
+        );
+    }
+
+    let operation_manager = Arc::clone(&manager);
+    let operation = tokio::spawn(async move {
+        operation_manager
+            .trust_reset(
+                TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                    .expect("ordinary root-present reset"),
+            )
+            .await
+    });
+    begin_entered_rx.await.expect("actor receives BeginDrain");
+    begin_release_tx
+        .send(Err(
+            crate::runtime::pairing_administration::PairingAdministrationError::new(
+                "daemon.runtime.store_unavailable",
+            ),
+        ))
+        .expect("release actor failure");
+    saturated_rx
+        .await
+        .expect("queue is saturated before manager Resume");
+    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .expect("shutdown must cancel blocked Resume");
+    assert_eq!(
+        operation
+            .await
+            .expect("join shutdown-canceled trust-reset")
+            .expect_err("shutdown must win over actor failure")
+            .code(),
+        REMOTE_SHUTTING_DOWN
+    );
+    release_tx.send(()).expect("release blocked Resume queue");
+    assert!(
+        !stale_rx.await.expect("observe post-shutdown queue"),
+        "shutdown-canceled Resume must not enqueue after capacity returns"
+    );
+
+    let manager = match Arc::try_unwrap(manager) {
+        Ok(manager) => manager,
+        Err(_) => panic!("shutdown test drops manager task"),
+    };
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn post_workflow_failure_resume_is_bounded_by_drain_deadline() {
+    let mut fixture = active_fixture("post-resume-deadline").await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let (begin_entered_tx, begin_entered_rx) = tokio::sync::oneshot::channel();
+    let (begin_release_tx, begin_release_rx) = tokio::sync::oneshot::channel();
+    let (saturated_tx, saturated_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (stale_tx, stale_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test = Some(
+            crate::remote::pairing::PairingCoordinatorHandle::blocked_resume_test_double(
+                begin_entered_tx,
+                begin_release_rx,
+                saturated_tx,
+                release_rx,
+                stale_tx,
+            ),
+        );
+    }
+
+    let operation_manager = Arc::clone(&manager);
+    let operation = tokio::spawn(async move {
+        operation_manager
+            .trust_reset(
+                TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                    .expect("ordinary root-present reset"),
+            )
+            .await
+    });
+    begin_entered_rx.await.expect("actor receives BeginDrain");
+    begin_release_tx.send(Ok(())).expect("complete drain");
+    saturated_rx
+        .await
+        .expect("queue is saturated before post-workflow Resume");
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::resume();
+    let result = tokio::time::timeout(Duration::from_secs(1), operation)
+        .await
+        .expect("post-workflow Resume must stop at the original drain deadline")
+        .expect("join post-workflow trust-reset");
+    assert_eq!(
+        result
+            .expect_err("unconfirmed post-workflow Resume must fail closed")
+            .code(),
+        "daemon.pairing.drain_pending"
+    );
+    release_tx.send(()).expect("release blocked Resume queue");
+    assert!(
+        !stale_rx.await.expect("observe post-deadline queue"),
+        "timed-out post-workflow Resume must not enqueue later"
+    );
+    assert!(matches!(
+        fixture.store.load_machine_enrollment_state().await.unwrap(),
+        Some(MachineEnrollmentState::Active(_))
+    ));
+
+    let manager = match Arc::try_unwrap(manager) {
+        Ok(manager) => manager,
+        Err(_) => panic!("deadline test drops manager task"),
+    };
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cancels_post_workflow_failure_resume() {
+    let mut fixture = active_fixture("post-workflow-resume-shutdown").await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let (begin_entered_tx, begin_entered_rx) = tokio::sync::oneshot::channel();
+    let (begin_release_tx, begin_release_rx) = tokio::sync::oneshot::channel();
+    let (saturated_tx, saturated_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (stale_tx, stale_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test = Some(
+            crate::remote::pairing::PairingCoordinatorHandle::blocked_resume_test_double(
+                begin_entered_tx,
+                begin_release_rx,
+                saturated_tx,
+                release_rx,
+                stale_tx,
+            ),
+        );
+    }
+
+    let operation_manager = Arc::clone(&manager);
+    let operation = tokio::spawn(async move {
+        operation_manager
+            .trust_reset(
+                TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                    .expect("ordinary root-present reset"),
+            )
+            .await
+    });
+    begin_entered_rx.await.expect("actor receives BeginDrain");
+    begin_release_tx.send(Ok(())).expect("complete drain");
+    saturated_rx
+        .await
+        .expect("queue is saturated before post-workflow Resume");
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .expect("shutdown must cancel post-workflow Resume");
+    assert_eq!(
+        operation
+            .await
+            .expect("join shutdown-canceled post-workflow trust-reset")
+            .expect_err("shutdown must win over workflow failure")
+            .code(),
+        REMOTE_SHUTTING_DOWN
+    );
+    release_tx.send(()).expect("release blocked Resume queue");
+    assert!(
+        !stale_rx.await.expect("observe post-shutdown queue"),
+        "shutdown-canceled post-workflow Resume must not enqueue later"
+    );
+
+    let manager = match Arc::try_unwrap(manager) {
+        Ok(manager) => manager,
+        Err(_) => panic!("shutdown test drops manager task"),
     };
     finish_fixture(manager, fixture).await;
 }
@@ -1908,6 +2270,158 @@ async fn root_lost_without_receipt_returns_blocked_old_axes_and_zero_network() {
         Some(MachineEnrollmentState::Active(_))
     ));
     finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test]
+async fn no_pairing_owner_rejects_active_authorization_before_retirement_or_network() {
+    let mut fixture = active_fixture("ownerless-active").await;
+    let authorization_store = crate::runtime::store::active_authorization_store_for_test(
+        &fixture.root.join("authorization-active.db"),
+    )
+    .await;
+    assert!(
+        authorization_store
+            .list_pairing_recovery()
+            .await
+            .expect("read ownerless pairing recovery")
+            .is_empty(),
+        "the regression fixture must contain no remote_pairings rows"
+    );
+    let before_targets = authorization_store
+        .list_revocation_drain_targets()
+        .await
+        .expect("read active authorization target");
+    assert_eq!(before_targets.len(), 1);
+    let before_grant = before_targets[0].grant().clone();
+    assert!(
+        authorization_store
+            .list_revocation_recovery()
+            .await
+            .expect("read active authorization recovery")
+            .is_empty()
+    );
+
+    let manager = RemoteManager::new(
+        authorization_store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        assert!(state.pairing.is_none());
+        assert!(state.pairing_handle_for_test.is_none());
+        assert!(state.transport.is_none());
+        assert!(state.connect_retry.is_none());
+        assert!(state.start_permit.is_none());
+    }
+
+    let error = manager
+        .trust_reset(
+            TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                .expect("ordinary root-present reset"),
+        )
+        .await
+        .expect_err("ownerless active authorization must block retirement");
+    assert_eq!(error.code(), "daemon.pairing.active");
+    assert!(matches!(
+        authorization_store
+            .load_machine_enrollment_state()
+            .await
+            .expect("read post-preflight enrollment"),
+        Some(MachineEnrollmentState::Active(_))
+    ));
+    let after_targets = authorization_store
+        .list_revocation_drain_targets()
+        .await
+        .expect("read post-preflight authorization target");
+    assert_eq!(after_targets.len(), 1);
+    assert_eq!(after_targets[0].grant(), &before_grant);
+    let state = manager.state.lock().await;
+    assert!(state.transport.is_none());
+    assert!(state.connect_retry.is_none());
+    assert!(state.start_permit.is_none());
+    drop(state);
+
+    finish_split_store_fixture(manager, authorization_store, fixture).await;
+}
+
+#[tokio::test]
+async fn no_pairing_owner_rejects_revoking_authorization_before_retirement_or_network() {
+    let mut fixture = active_fixture("ownerless-revoking").await;
+    let authorization_store = crate::runtime::store::revoking_authorization_store_for_test(
+        &fixture.root.join("authorization-revoking.db"),
+    )
+    .await;
+    assert!(
+        authorization_store
+            .list_pairing_recovery()
+            .await
+            .expect("read ownerless pairing recovery")
+            .is_empty(),
+        "the regression fixture must contain no remote_pairings rows"
+    );
+    assert!(
+        authorization_store
+            .list_revocation_drain_targets()
+            .await
+            .expect("read revoking drain targets")
+            .is_empty()
+    );
+    let before_recovery = authorization_store
+        .list_revocation_recovery()
+        .await
+        .expect("read ownerless revocation recovery");
+    assert_eq!(before_recovery.len(), 1);
+    let before_frame = before_recovery[0].canonical_next_frame().to_vec();
+    let before_revocation = before_recovery[0].revocation().clone();
+
+    let manager = RemoteManager::new(
+        authorization_store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        assert!(state.pairing.is_none());
+        assert!(state.pairing_handle_for_test.is_none());
+        assert!(state.transport.is_none());
+        assert!(state.connect_retry.is_none());
+        assert!(state.start_permit.is_none());
+    }
+
+    let error = manager
+        .trust_reset(
+            TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                .expect("ordinary root-present reset"),
+        )
+        .await
+        .expect_err("ownerless revocation recovery must block retirement");
+    assert_eq!(error.code(), "daemon.pairing.active");
+    assert!(matches!(
+        authorization_store
+            .load_machine_enrollment_state()
+            .await
+            .expect("read post-preflight enrollment"),
+        Some(MachineEnrollmentState::Active(_))
+    ));
+    let after_recovery = authorization_store
+        .list_revocation_recovery()
+        .await
+        .expect("read post-preflight revocation recovery");
+    assert_eq!(after_recovery.len(), 1);
+    assert_eq!(after_recovery[0].canonical_next_frame(), before_frame);
+    assert_eq!(after_recovery[0].revocation(), &before_revocation);
+    let state = manager.state.lock().await;
+    assert!(state.transport.is_none());
+    assert!(state.connect_retry.is_none());
+    assert!(state.start_permit.is_none());
+    drop(state);
+
+    finish_split_store_fixture(manager, authorization_store, fixture).await;
 }
 
 #[tokio::test]

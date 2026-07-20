@@ -1,19 +1,23 @@
 //! P4.3 G3 PairResponseReceived Store 子片 focused tests。
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use agentdeck_crypto::{SigningKey, sign_pair_response_received};
+use agentdeck_crypto::{SigningKey, sign_pair_response_received, sign_tbs};
 use agentdeck_protocol::e2ee::PairResponseReceivedV1;
 use agentdeck_protocol::relay_v2::frame::{
     GrantCommitted, OpaqueRouteFrame, PairRouteCloseOutcome, PairRouteClosed, RelayFrameBody,
 };
-use agentdeck_protocol::relay_v2::{Ed25519Signature, RELAY_PROTOCOL_VERSION, encode};
+use agentdeck_protocol::relay_v2::{
+    DeviceRevocation, Ed25519Signature, RELAY_PROTOCOL_VERSION, encode,
+};
 use agentdeck_protocol::runtime::{PairingReceipt, PairingState};
 
 use crate::remote::access::{PairResponseAccessBinding, VerifiedPairResponseReceipt};
 use crate::runtime::model::{
-    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
+    MachineEnrollmentState, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
+    RuntimeStoreOperation,
 };
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
@@ -26,12 +30,14 @@ use super::pairing_grant::PairingGrantPreparation;
 use super::pairing_grant_commit::{AcknowledgeGrantCommitted, GrantCommittedRecovery};
 use super::pairing_grant_tests::{awaiting_pairing, grant_input};
 use super::pairing_grant_tx::ConfirmPairingGrantOutcome;
+use super::pairing_revocation::{BeginDeviceRevocation, BeginDeviceRevocationOutcome};
 use super::pairing_terminal::RECEIPT_RETENTION_MS;
 use super::pairing_tests::{
     GenerousCapacity, NOW_MS, OneShotFault, TestClock, TestRoot, artifact_bytes, make_active,
 };
 
 const DEVICE_SIGN_SEED: [u8; 32] = [0xa4; 32];
+const ROOT_SIGN_SEED: [u8; 32] = [0x41; 32];
 
 fn grant_committed_frame(recovery: &super::pairing_grant_tx::GrantPreparingRecovery) -> Vec<u8> {
     encode(&OpaqueRouteFrame {
@@ -132,6 +138,89 @@ fn delivery_counts(database: &std::path::Path) -> (u64, u64, u64, u64) {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("read delivery evidence")
+}
+
+async fn authorization_only_store_for_test(database: &Path, revoking: bool) -> RuntimeStoreHandle {
+    let keys = MemoryKeyStore::new();
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(database.to_path_buf()).with_clock(TestClock(clock.clone())),
+        load_or_create_storage_kek(&keys, database).expect("create authorization test StorageKEK"),
+    )
+    .await
+    .expect("open authorization-only test Store");
+    let (preparation, committed) = prepare_committed(&store, &clock).await;
+    let proof = verified_receipt(&committed);
+    clock.store(NOW_MS + 2, Ordering::SeqCst);
+    let close = match store
+        .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
+            preparation.pairing_id(),
+            &proof,
+        ))
+        .await
+        .expect("deliver authorization-only test grant")
+    {
+        AcknowledgePairResponseReceivedOutcome::Delivered { close } => close,
+        other => panic!("fresh test grant must deliver: {other:?}"),
+    };
+    store
+        .acknowledge_pair_route_close(
+            preparation.pairing_id(),
+            close_terminal(close.pair_route(), PairRouteCloseOutcome::Closed),
+        )
+        .await
+        .expect("scrub authorization-only pairing row");
+    assert!(
+        store
+            .list_pairing_recovery()
+            .await
+            .expect("read scrubbed pairing recovery")
+            .is_empty()
+    );
+
+    if revoking {
+        let Some(MachineEnrollmentState::Active(active)) = store
+            .load_machine_enrollment_state()
+            .await
+            .expect("load authorization-only active enrollment")
+        else {
+            panic!("authorization-only test Store must remain Active")
+        };
+        let grant = committed.relay_grant();
+        let mut revocation = DeviceRevocation {
+            machine_route: grant.machine_route,
+            device_route: grant.device_route,
+            grant_serial: grant.grant_serial,
+            root_key_id: grant.root_key_id,
+            trust_epoch: grant.trust_epoch,
+            signature: Ed25519Signature([0; 64]),
+        };
+        revocation.signature = sign_tbs(
+            &SigningKey::from_seed(&ROOT_SIGN_SEED),
+            &revocation.to_be_signed_v1(
+                committed.invite().relay_server_id,
+                active.binding.root_fingerprint,
+            ),
+        )
+        .into();
+        clock.store(NOW_MS + 3, Ordering::SeqCst);
+        assert!(matches!(
+            store
+                .begin_device_revocation(BeginDeviceRevocation::local(revocation))
+                .await
+                .expect("begin authorization-only test revocation"),
+            BeginDeviceRevocationOutcome::Prepared { .. }
+        ));
+    }
+    store
+}
+
+pub(crate) async fn active_authorization_store_for_test(database: &Path) -> RuntimeStoreHandle {
+    authorization_only_store_for_test(database, false).await
+}
+
+pub(crate) async fn revoking_authorization_store_for_test(database: &Path) -> RuntimeStoreHandle {
+    authorization_only_store_for_test(database, true).await
 }
 
 #[tokio::test]
