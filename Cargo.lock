@@ -107,6 +107,7 @@ dependencies = [
  "ureq",
  "url",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

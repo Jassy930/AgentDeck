@@ -4,6 +4,8 @@ mod connection;
 mod enrollment;
 mod health;
 mod preupgrade;
+// P4.2 内部 prerequisite：下一子片才接入 config/server/store composition。
+pub(crate) mod receipt_signer;
 pub mod tls;
 
 use std::net::SocketAddr;

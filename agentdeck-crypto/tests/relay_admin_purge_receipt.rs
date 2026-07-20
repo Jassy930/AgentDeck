@@ -1,8 +1,8 @@
 //! P4.2 dedicated Relay receipt signer/verification tests。
 
 use agentdeck_crypto::{
-    CryptoError, SigningKey, ValidatedRelayReceiptVerifyKey, sign_relay_admin_purge_receipt,
-    verify_relay_admin_purge_receipt,
+    CryptoError, SigningKey, ValidatedRelayReceiptSignerIdentityV1, ValidatedRelayReceiptVerifyKey,
+    sign_relay_admin_purge_receipt, verify_relay_admin_purge_receipt,
 };
 use agentdeck_protocol::relay_v2::{
     MachineRouteId, PublicKeyBytes, RELAY_PROTOCOL_VERSION, RELAY_RECEIPT_FORMAT_VERSION,
@@ -111,6 +111,28 @@ fn expectation_for(tbs: &RelayAdminPurgeReceiptTbsV1) -> RelayAdminPurgeReceiptE
 
 fn expectation() -> RelayAdminPurgeReceiptExpectationV1 {
     expectation_for(&tbs())
+}
+
+#[test]
+fn dedicated_signer_identity_projects_only_public_material_and_binds_real_relay_id() {
+    let signing = SigningKey::from_seed(&[0x42; 32]);
+    let identity = ValidatedRelayReceiptSignerIdentityV1::from_signing_key(&signing)
+        .expect("signing key produces a validated public identity");
+    assert_eq!(
+        identity.receipt_format_version(),
+        RELAY_RECEIPT_FORMAT_VERSION
+    );
+    assert_eq!(identity.key_generation(), RELAY_RECEIPT_KEY_GENERATION_MVP);
+    let expected = wire_key(&signing);
+    assert_eq!(identity.key_id(), expected.key_id);
+    assert_eq!(identity.public_key(), expected.public_key);
+
+    let anchor = identity
+        .bind_to_relay(expected.relay_server_id)
+        .expect("real Relay identity completes the validated anchor");
+    assert_eq!(anchor.wire_anchor(), &expected);
+    let debug = format!("{identity:?}");
+    assert!(!debug.contains("42424242"));
 }
 
 #[test]

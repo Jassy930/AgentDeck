@@ -5,8 +5,9 @@
 use agentdeck_protocol::e2ee::tbs::ToBeSignedV1;
 use agentdeck_protocol::relay_v2::auth::{AuthenticationTranscriptV1, Ed25519Signature};
 use agentdeck_protocol::relay_v2::{
+    PublicKeyBytes, RELAY_RECEIPT_FORMAT_VERSION, RELAY_RECEIPT_KEY_GENERATION_MVP,
     RelayAdminPurgeReceiptError, RelayAdminPurgeReceiptExpectationV1, RelayAdminPurgeReceiptTbsV1,
-    RelayAdminPurgeReceiptV1, RelayReceiptVerifyKeyV1,
+    RelayAdminPurgeReceiptV1, RelayReceiptKeyId, RelayReceiptVerifyKeyV1, RelayServerId,
 };
 use ed25519_dalek::{Signature, Signer};
 
@@ -77,6 +78,75 @@ impl VerifyingKey {
         ed25519_dalek::VerifyingKey::from_bytes(bytes)
             .map(VerifyingKey)
             .map_err(|_| CryptoError::InvalidKey("ed25519 verifying key"))
+    }
+}
+
+/// 已由专用 Ed25519 私钥投影并完成 point/low-order preflight、但尚未绑定
+/// `RelayServerId` 的 receipt signer 公共身份。
+///
+/// 该 capability 只含公开材料，可安全交给 Store；私钥仍留在 Relay server/admin
+/// composition。Store 取得真实 Relay identity 后必须调用 [`Self::bind_to_relay`]，
+/// 再持久化返回 wrapper 中的完整 wire anchor。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedRelayReceiptSignerIdentityV1 {
+    key_id: RelayReceiptKeyId,
+    public_key: PublicKeyBytes,
+}
+
+impl std::fmt::Debug for ValidatedRelayReceiptSignerIdentityV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ValidatedRelayReceiptSignerIdentityV1")
+            .field("receipt_format_version", &RELAY_RECEIPT_FORMAT_VERSION)
+            .field("key_generation", &RELAY_RECEIPT_KEY_GENERATION_MVP)
+            .field("key_id", &self.key_id.redacted())
+            .field("public_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ValidatedRelayReceiptSignerIdentityV1 {
+    /// 从调用方实际持有的 dedicated signing key 只投影公开身份。
+    pub fn from_signing_key(signing_key: &SigningKey) -> Result<Self, CryptoError> {
+        let public_key = PublicKeyBytes(signing_key.verifying_key().to_bytes());
+        let verifying_key = VerifyingKey::from_bytes(&public_key.0)?;
+        if verifying_key.0.is_weak() {
+            return Err(CryptoError::InvalidKey("weak ed25519 verifying key"));
+        }
+        Ok(Self {
+            key_id: RelayReceiptKeyId::from_public_key(&public_key),
+            public_key,
+        })
+    }
+
+    pub const fn receipt_format_version(&self) -> u16 {
+        RELAY_RECEIPT_FORMAT_VERSION
+    }
+
+    pub const fn key_generation(&self) -> u64 {
+        RELAY_RECEIPT_KEY_GENERATION_MVP
+    }
+
+    pub const fn key_id(&self) -> RelayReceiptKeyId {
+        self.key_id
+    }
+
+    pub const fn public_key(&self) -> PublicKeyBytes {
+        self.public_key
+    }
+
+    /// 以 Store 已持久化或刚生成的 Relay identity 构造完整 validated anchor。
+    pub fn bind_to_relay(
+        &self,
+        relay_server_id: RelayServerId,
+    ) -> Result<ValidatedRelayReceiptVerifyKey, CryptoError> {
+        ValidatedRelayReceiptVerifyKey::new(RelayReceiptVerifyKeyV1 {
+            receipt_format_version: RELAY_RECEIPT_FORMAT_VERSION,
+            relay_server_id,
+            key_generation: RELAY_RECEIPT_KEY_GENERATION_MVP,
+            key_id: self.key_id,
+            public_key: self.public_key,
+        })
     }
 }
 
