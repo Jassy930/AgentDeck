@@ -72,13 +72,28 @@ impl HpkePrivateKey {
             .map(HpkePrivateKey)
             .map_err(|_| CryptoError::InvalidKey("hpke private key"))
     }
+
+    /// 从已导入的 X25519 私钥确定性投影对应公钥。
+    #[must_use]
+    pub fn public_key(&self) -> HpkePublicKey {
+        HpkePublicKey(<Kem as KemTrait>::sk_to_pk(&self.0))
+    }
 }
 
 /// HPKE Base 封装结果：`enc`（encapsulated ephemeral 公钥）+ AEAD `ciphertext`（含 tag）。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HpkeEnvelopeV1 {
     pub enc: Vec<u8>,
     pub ciphertext: Vec<u8>,
+}
+
+impl std::fmt::Debug for HpkeEnvelopeV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HpkeEnvelopeV1")
+            .field("encrypted_material", &"<redacted>")
+            .finish()
+    }
 }
 
 /// HPKE Base mode 单发封装（design §7.1）。`rng` 为 `hpke` 重导出的 `rand_core::CryptoRng`；

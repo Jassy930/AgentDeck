@@ -1,28 +1,46 @@
-//! MachineLink 的 control-only Relay transport。
+//! MachineLink 的 typed Relay transport。
 //!
-//! 本模块不持有业务执行 core，也不公开 raw frame send/recv。唯一上行是 root-signed
-//! `RetireMachine`；下行只交付 retirement terminal、安全 failure code 与 restart notice。
+//! 本模块不持有业务执行 core，也不公开 raw frame send/recv。主 control lane 只承载
+//! root-signed retirement；一次性取出的 bounded pairing lane 只承载显式配对/授权 frame。
+//! 两条 typed lane 复用唯一 Relay session/supervisor，均不向执行 core 派发业务 frame。
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
-use agentdeck_crypto::sha256;
+use agentdeck_crypto::rand_core::SeedableRng;
+use agentdeck_crypto::{
+    HpkePublicKey, SecretAeadKey, seal_key_directory_entry as crypto_seal_key_directory_entry,
+    sha256,
+};
+use agentdeck_protocol::e2ee::{
+    DeviceAuthorizationV1, KeyDirectoryEntry, KeyDirectorySignatureContextV1, KeyDirectoryV1,
+    KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1, PairRequestInfoV1,
+    PairResponseInfoV1, PairResponsePlaintextV1, PairResponseV1, PairingControlEnvelopeV1,
+};
 use agentdeck_protocol::relay_v2::frame::{
-    AuthProof, Authenticate, Challenge, RetireMachine, RetirementCommitted, ServerRestarting,
+    AcceptedRef, AuthProof, Authenticate, Challenge, ClosePairRoute, GrantCommitted, InstallGrant,
+    OpenPairRoute, PairData, PairRouteClosed, PairRouteOpened, RetireMachine, RetirementCommitted,
+    RevocationCommitted, RevokeDevice, RouteAccepted, ServerRestarting,
 };
 use agentdeck_protocol::relay_v2::{
-    AuthenticationRole, AuthenticationTranscriptV1, MachineRouteId, OpaqueRouteFrame,
-    RELAY_PROTOCOL_VERSION, RelayFrameBody, SignedCertificate, encode,
+    AuthenticationRole, AuthenticationTranscriptV1, DeviceRevocation, DeviceRouteId, GrantSerial,
+    MAX_FRAME_BYTES, MachineRouteId, OpaqueRouteFrame, PairRouteId, RELAY_PROTOCOL_VERSION,
+    RelayFrameBody, SignedCertificate, encode,
 };
 use agentdeck_relay_client::{LinkAuthenticator, RelayClient, RelayClientConfig, RelayClientError};
 use async_trait::async_trait;
+use rand_chacha::ChaCha20Rng;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 use crate::local::listener::RemoteStartPermit;
 
-use super::bootstrap::{ArmedRemoteIdentity, MachineLinkIdentityOwner};
+use super::bootstrap::{
+    ArmedRemoteIdentity, MachineLinkIdentityOwner, MachinePairingAnchor, MachinePairingError,
+};
 use super::certificate::MachineCertificateError;
 use super::trust_reset::{FrozenMachineRetirement, MachineRetirementError};
 
@@ -41,6 +59,59 @@ trait MachineLinkOwner: Send + Sync {
         machine_route: MachineRouteId,
         expected_trust_epoch: u64,
     ) -> Result<FrozenMachineRetirement, MachineRetirementError>;
+
+    fn pairing_anchor(
+        &self,
+        relay_server_id: agentdeck_protocol::relay_v2::RelayServerId,
+        machine_route: MachineRouteId,
+        data_certificate: &SignedCertificate,
+    ) -> Result<MachinePairingAnchor, MachinePairingError>;
+
+    fn seal_pair_pending(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairRequestInfoV1,
+        context: &OuterContextV1,
+        request_hash: [u8; 32],
+        signer: &MachineDataSignerBindingV1,
+        rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<PairingControlEnvelopeV1, MachinePairingError>;
+
+    fn sign_relay_grant(
+        &self,
+        anchor: &MachinePairingAnchor,
+        grant: agentdeck_protocol::relay_v2::RelayGrant,
+    ) -> Result<agentdeck_protocol::relay_v2::RelayGrant, MachinePairingError>;
+
+    fn sign_device_authorization(
+        &self,
+        anchor: &MachinePairingAnchor,
+        grant: &agentdeck_protocol::relay_v2::RelayGrant,
+        authorization: DeviceAuthorizationV1,
+    ) -> Result<DeviceAuthorizationV1, MachinePairingError>;
+
+    fn sign_key_directory(
+        &self,
+        anchor: &MachinePairingAnchor,
+        context: &KeyDirectorySignatureContextV1,
+        directory: KeyDirectoryV1,
+    ) -> Result<KeyDirectoryV1, MachinePairingError>;
+
+    fn seal_pair_response(
+        &self,
+        anchor: &MachinePairingAnchor,
+        recipient: &HpkePublicKey,
+        info: &PairResponseInfoV1,
+        context: &OuterContextV1,
+        plaintext: &PairResponsePlaintextV1,
+        rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<PairResponseV1, MachinePairingError>;
+
+    fn sign_device_revocation(
+        &self,
+        anchor: &MachinePairingAnchor,
+        revocation: DeviceRevocation,
+    ) -> Result<DeviceRevocation, MachinePairingError>;
 }
 
 impl MachineLinkOwner for MachineLinkIdentityOwner {
@@ -74,6 +145,88 @@ impl MachineLinkOwner for MachineLinkIdentityOwner {
             machine_route,
             expected_trust_epoch,
         )
+    }
+
+    fn pairing_anchor(
+        &self,
+        relay_server_id: agentdeck_protocol::relay_v2::RelayServerId,
+        machine_route: MachineRouteId,
+        data_certificate: &SignedCertificate,
+    ) -> Result<MachinePairingAnchor, MachinePairingError> {
+        MachineLinkIdentityOwner::pairing_anchor(
+            self,
+            relay_server_id,
+            machine_route,
+            data_certificate,
+        )
+    }
+
+    fn seal_pair_pending(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairRequestInfoV1,
+        context: &OuterContextV1,
+        request_hash: [u8; 32],
+        signer: &MachineDataSignerBindingV1,
+        rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<PairingControlEnvelopeV1, MachinePairingError> {
+        MachineLinkIdentityOwner::seal_pair_pending(
+            self,
+            recipient,
+            info,
+            context,
+            request_hash,
+            signer,
+            rng,
+        )
+    }
+
+    fn sign_relay_grant(
+        &self,
+        anchor: &MachinePairingAnchor,
+        grant: agentdeck_protocol::relay_v2::RelayGrant,
+    ) -> Result<agentdeck_protocol::relay_v2::RelayGrant, MachinePairingError> {
+        MachineLinkIdentityOwner::sign_relay_grant(self, anchor, grant)
+    }
+
+    fn sign_device_authorization(
+        &self,
+        anchor: &MachinePairingAnchor,
+        grant: &agentdeck_protocol::relay_v2::RelayGrant,
+        authorization: DeviceAuthorizationV1,
+    ) -> Result<DeviceAuthorizationV1, MachinePairingError> {
+        MachineLinkIdentityOwner::sign_device_authorization(self, anchor, grant, authorization)
+    }
+
+    fn sign_key_directory(
+        &self,
+        anchor: &MachinePairingAnchor,
+        context: &KeyDirectorySignatureContextV1,
+        directory: KeyDirectoryV1,
+    ) -> Result<KeyDirectoryV1, MachinePairingError> {
+        MachineLinkIdentityOwner::sign_key_directory(self, anchor, context, directory)
+    }
+
+    fn seal_pair_response(
+        &self,
+        anchor: &MachinePairingAnchor,
+        recipient: &HpkePublicKey,
+        info: &PairResponseInfoV1,
+        context: &OuterContextV1,
+        plaintext: &PairResponsePlaintextV1,
+        rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<PairResponseV1, MachinePairingError> {
+        MachineLinkIdentityOwner::seal_pair_response(
+            self, anchor, recipient, info, context, plaintext, rng,
+        )
+    }
+
+    fn sign_device_revocation(
+        &self,
+        anchor: &MachinePairingAnchor,
+        revocation: DeviceRevocation,
+    ) -> Result<DeviceRevocation, MachinePairingError> {
+        MachineLinkIdentityOwner::sign_device_revocation(self, anchor, revocation)
     }
 }
 
@@ -130,6 +283,44 @@ impl MachineLinkAuthenticator {
         self.owner
             .freeze_retirement(relay_server_id, self.machine_route, expected_trust_epoch)
             .map_err(RemoteTransportError::Retirement)
+    }
+
+    fn bind_pairing_anchor(
+        &self,
+        data_certificate: &SignedCertificate,
+    ) -> Result<MachinePairingAnchor, MachinePairingError> {
+        let relay_server_id = self.authenticated_relay_id()?;
+        self.owner
+            .pairing_anchor(relay_server_id, self.machine_route, data_certificate)
+    }
+
+    fn verify_pairing_anchor(
+        &self,
+        expected: &MachinePairingAnchor,
+    ) -> Result<(), MachinePairingError> {
+        if expected.machine_route != self.machine_route
+            || expected.relay_server_id != self.authenticated_relay_id()?
+        {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        let observed = self.owner.pairing_anchor(
+            expected.relay_server_id,
+            expected.machine_route,
+            &expected.data_certificate,
+        )?;
+        if observed != *expected {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        Ok(())
+    }
+
+    fn authenticated_relay_id(
+        &self,
+    ) -> Result<agentdeck_protocol::relay_v2::RelayServerId, MachinePairingError> {
+        self.authenticated_relay
+            .lock()
+            .map_err(|_| MachinePairingError::ContextMismatch)?
+            .ok_or(MachinePairingError::ContextMismatch)
     }
 }
 
@@ -332,6 +523,376 @@ impl fmt::Debug for RemoteControl {
     }
 }
 
+/// Pairing lane 唯一允许向上游交付的 typed event。
+///
+/// `PairFrameAccepted` 只证明 Relay writer 接受了对应 PairData，绝不是 endpoint
+/// delivery 或 `PairResponseReceived` 证明。
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum PairingTransportEvent {
+    PairRouteOpened(PairRouteOpened),
+    PairData(PairData),
+    PairFrameAccepted(RouteAccepted),
+    PairRouteClosed(PairRouteClosed),
+    GrantCommitted(GrantCommitted),
+    RevocationCommitted(RevocationCommitted),
+}
+
+impl fmt::Debug for PairingTransportEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::PairRouteOpened(_) => "PairRouteOpened",
+            Self::PairData(_) => "PairData",
+            Self::PairFrameAccepted(_) => "PairFrameAcceptedNotDelivered",
+            Self::PairRouteClosed(_) => "PairRouteClosed",
+            Self::GrantCommitted(_) => "GrantCommitted",
+            Self::RevocationCommitted(_) => "RevocationCommitted",
+        };
+        formatter.write_str("PairingTransportEvent::")?;
+        formatter.write_str(name)?;
+        formatter.write_str("([REDACTED])")
+    }
+}
+
+/// 构造 PairInvite 时可复制的 frozen public machine context；不含任何私钥。
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PairingInviteAnchor {
+    inner: MachinePairingAnchor,
+}
+
+impl PairingInviteAnchor {
+    #[must_use]
+    pub(crate) const fn relay_server_id(&self) -> agentdeck_protocol::relay_v2::RelayServerId {
+        self.inner.relay_server_id
+    }
+
+    #[must_use]
+    pub(crate) const fn machine_route(&self) -> MachineRouteId {
+        self.inner.machine_route
+    }
+
+    #[must_use]
+    pub(crate) const fn root_public_key(&self) -> agentdeck_protocol::relay_v2::PublicKeyBytes {
+        self.inner.root_public_key
+    }
+
+    #[must_use]
+    pub(crate) const fn root_fingerprint(&self) -> [u8; 32] {
+        self.inner.root_fingerprint
+    }
+
+    #[must_use]
+    pub(crate) const fn root_key_id(&self) -> agentdeck_protocol::relay_v2::RootKeyId {
+        self.inner.root_key_id
+    }
+
+    #[must_use]
+    pub(crate) const fn trust_epoch(&self) -> agentdeck_protocol::relay_v2::TrustEpoch {
+        self.inner.trust_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn data_generation(&self) -> agentdeck_protocol::relay_v2::LinkGeneration {
+        self.inner.data_generation
+    }
+
+    #[must_use]
+    pub(crate) const fn data_sign_certificate(&self) -> &SignedCertificate {
+        &self.inner.data_certificate
+    }
+}
+
+impl fmt::Debug for PairingInviteAnchor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingInviteAnchor([REDACTED])")
+    }
+}
+
+/// 只经 Weak 委托同一 transport generation key owner 的 pairing authority。
+/// 它没有 raw sign/key getter，shutdown/reclaim 销毁 owner 后所有入口固定 fail-close。
+pub(crate) struct PairingMachineAuthority {
+    owner: Weak<MachineLinkAuthenticator>,
+    anchor: MachinePairingAnchor,
+    data_signer: MachineDataSignerBindingV1,
+}
+
+impl PairingMachineAuthority {
+    pub(crate) fn invite_anchor(&self) -> Result<PairingInviteAnchor, RemoteTransportError> {
+        self.verified_owner()?;
+        Ok(PairingInviteAnchor {
+            inner: self.anchor.clone(),
+        })
+    }
+
+    /// 使用可失败系统熵封装 PairPending。production surface 不接受调用方 RNG；
+    /// getrandom 失败在进入 HPKE 前返回 typed failure。
+    pub(crate) fn seal_pair_pending(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairRequestInfoV1,
+        context: &OuterContextV1,
+        request_hash: [u8; 32],
+    ) -> Result<PairingControlEnvelopeV1, RemoteTransportError> {
+        self.seal_pair_pending_with_entropy_source(
+            recipient,
+            info,
+            context,
+            request_hash,
+            |bytes| getrandom::fill(bytes).map_err(|_| ()),
+        )
+    }
+
+    fn seal_pair_pending_with_entropy_source<F>(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairRequestInfoV1,
+        context: &OuterContextV1,
+        request_hash: [u8; 32],
+        source: F,
+    ) -> Result<PairingControlEnvelopeV1, RemoteTransportError>
+    where
+        F: FnMut(&mut [u8]) -> Result<(), ()>,
+    {
+        if info.relay_server_id != self.anchor.relay_server_id {
+            return Err(pairing_authority_mismatch());
+        }
+        let owner = self.verified_owner()?;
+        let mut rng = pairing_crypto_rng(source)?;
+        owner
+            .owner
+            .seal_pair_pending(
+                recipient,
+                info,
+                context,
+                request_hash,
+                &self.data_signer,
+                &mut rng,
+            )
+            .map_err(map_pairing_authority_error)
+    }
+
+    #[cfg(test)]
+    fn seal_pair_pending_with_rng_for_test<R: agentdeck_crypto::rand_core::CryptoRng>(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairRequestInfoV1,
+        context: &OuterContextV1,
+        request_hash: [u8; 32],
+        rng: &mut R,
+    ) -> Result<PairingControlEnvelopeV1, RemoteTransportError> {
+        if info.relay_server_id != self.anchor.relay_server_id {
+            return Err(pairing_authority_mismatch());
+        }
+        let owner = self.verified_owner()?;
+        owner
+            .owner
+            .seal_pair_pending(
+                recipient,
+                info,
+                context,
+                request_hash,
+                &self.data_signer,
+                rng,
+            )
+            .map_err(map_pairing_authority_error)
+    }
+
+    pub(crate) fn sign_relay_grant(
+        &self,
+        grant: agentdeck_protocol::relay_v2::RelayGrant,
+    ) -> Result<agentdeck_protocol::relay_v2::RelayGrant, RemoteTransportError> {
+        let owner = self.verified_owner()?;
+        owner
+            .owner
+            .sign_relay_grant(&self.anchor, grant)
+            .map_err(map_pairing_authority_error)
+    }
+
+    pub(crate) fn sign_device_authorization(
+        &self,
+        grant: &agentdeck_protocol::relay_v2::RelayGrant,
+        authorization: DeviceAuthorizationV1,
+    ) -> Result<DeviceAuthorizationV1, RemoteTransportError> {
+        let owner = self.verified_owner()?;
+        owner
+            .owner
+            .sign_device_authorization(&self.anchor, grant, authorization)
+            .map_err(map_pairing_authority_error)
+    }
+
+    /// 使用当前 MachineDataSign 对严格目录签名，不暴露 raw signing capability。
+    pub(crate) fn sign_key_directory(
+        &self,
+        context: &KeyDirectorySignatureContextV1,
+        directory: KeyDirectoryV1,
+    ) -> Result<KeyDirectoryV1, RemoteTransportError> {
+        let owner = self.verified_owner()?;
+        owner
+            .owner
+            .sign_key_directory(&self.anchor, context, directory)
+            .map_err(map_pairing_authority_error)
+    }
+
+    /// 使用可失败系统熵把固定 32-byte 对称 key 封装为 typed directory entry。
+    /// production surface 不接受调用方 RNG。
+    pub(crate) fn seal_key_directory_entry(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        key: &SecretAeadKey,
+    ) -> Result<KeyDirectoryEntry, RemoteTransportError> {
+        self.seal_key_directory_entry_with_entropy_source(recipient, info, context, key, |bytes| {
+            getrandom::fill(bytes).map_err(|_| ())
+        })
+    }
+
+    fn seal_key_directory_entry_with_entropy_source<F>(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        key: &SecretAeadKey,
+        source: F,
+    ) -> Result<KeyDirectoryEntry, RemoteTransportError>
+    where
+        F: FnMut(&mut [u8]) -> Result<(), ()>,
+    {
+        self.validate_key_update_axes(info)?;
+        let _owner = self.verified_owner()?;
+        let mut rng = pairing_crypto_rng(source)?;
+        crypto_seal_key_directory_entry(recipient, info, context, key, &mut rng)
+            .map_err(|_| supervisor_failure("remote.transport.pairing_crypto_failed"))
+    }
+
+    #[cfg(test)]
+    fn seal_key_directory_entry_with_rng_for_test<R: agentdeck_crypto::rand_core::CryptoRng>(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        key: &SecretAeadKey,
+        rng: &mut R,
+    ) -> Result<KeyDirectoryEntry, RemoteTransportError> {
+        self.validate_key_update_axes(info)?;
+        let _owner = self.verified_owner()?;
+        crypto_seal_key_directory_entry(recipient, info, context, key, rng)
+            .map_err(|_| supervisor_failure("remote.transport.pairing_crypto_failed"))
+    }
+
+    fn validate_key_update_axes(&self, info: &KeyUpdateInfoV1) -> Result<(), RemoteTransportError> {
+        if info.relay_server_id != self.anchor.relay_server_id
+            || info.machine_route != self.anchor.machine_route
+            || info.root_trust_epoch != self.anchor.trust_epoch
+        {
+            return Err(pairing_authority_mismatch());
+        }
+        Ok(())
+    }
+
+    /// PairResponse 与 PairPending 共用相同的 fail-close 系统熵边界。
+    pub(crate) fn seal_pair_response(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairResponseInfoV1,
+        context: &OuterContextV1,
+        plaintext: &PairResponsePlaintextV1,
+    ) -> Result<PairResponseV1, RemoteTransportError> {
+        self.seal_pair_response_with_entropy_source(recipient, info, context, plaintext, |bytes| {
+            getrandom::fill(bytes).map_err(|_| ())
+        })
+    }
+
+    fn seal_pair_response_with_entropy_source<F>(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairResponseInfoV1,
+        context: &OuterContextV1,
+        plaintext: &PairResponsePlaintextV1,
+        source: F,
+    ) -> Result<PairResponseV1, RemoteTransportError>
+    where
+        F: FnMut(&mut [u8]) -> Result<(), ()>,
+    {
+        let owner = self.verified_owner()?;
+        let mut rng = pairing_crypto_rng(source)?;
+        owner
+            .owner
+            .seal_pair_response(&self.anchor, recipient, info, context, plaintext, &mut rng)
+            .map_err(map_pairing_authority_error)
+    }
+
+    #[cfg(test)]
+    fn seal_pair_response_with_rng_for_test<R: agentdeck_crypto::rand_core::CryptoRng>(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairResponseInfoV1,
+        context: &OuterContextV1,
+        plaintext: &PairResponsePlaintextV1,
+        rng: &mut R,
+    ) -> Result<PairResponseV1, RemoteTransportError> {
+        let owner = self.verified_owner()?;
+        owner
+            .owner
+            .seal_pair_response(&self.anchor, recipient, info, context, plaintext, rng)
+            .map_err(map_pairing_authority_error)
+    }
+
+    pub(crate) fn sign_device_revocation(
+        &self,
+        revocation: DeviceRevocation,
+    ) -> Result<DeviceRevocation, RemoteTransportError> {
+        let owner = self.verified_owner()?;
+        owner
+            .owner
+            .sign_device_revocation(&self.anchor, revocation)
+            .map_err(map_pairing_authority_error)
+    }
+
+    fn verified_owner(&self) -> Result<Arc<MachineLinkAuthenticator>, RemoteTransportError> {
+        let owner = self.owner.upgrade().ok_or(RemoteTransportError::Closed)?;
+        owner
+            .verify_pairing_anchor(&self.anchor)
+            .map_err(map_pairing_authority_error)?;
+        Ok(owner)
+    }
+}
+
+/// 先以 fallible OS source 取得 256-bit seed，再交给 rand_core 0.10 的成熟
+/// ChaCha20 CSPRNG。production 不使用 hpke 内部会 panic 的 `UnwrapErr(SysRng)`。
+fn pairing_crypto_rng<F>(mut source: F) -> Result<ChaCha20Rng, RemoteTransportError>
+where
+    F: FnMut(&mut [u8]) -> Result<(), ()>,
+{
+    let mut seed = Zeroizing::new([0_u8; 32]);
+    source(seed.as_mut()).map_err(|()| RemoteTransportError::PairingEntropyUnavailable)?;
+    Ok(ChaCha20Rng::from_seed(*seed))
+}
+
+impl fmt::Debug for PairingMachineAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingMachineAuthority([REDACTED])")
+    }
+}
+
+pub(crate) struct PairingRuntimeParts {
+    pub(crate) lane: PairingTransportLane,
+    pub(crate) authority: PairingMachineAuthority,
+}
+
+impl fmt::Debug for PairingRuntimeParts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingRuntimeParts([REDACTED])")
+    }
+}
+
+fn map_pairing_authority_error(error: MachinePairingError) -> RemoteTransportError {
+    supervisor_failure(error.code())
+}
+
+fn pairing_authority_mismatch() -> RemoteTransportError {
+    supervisor_failure("remote.transport.pairing_authority_mismatch")
+}
+
 #[derive(Debug, Error)]
 pub enum RemoteTransportError {
     #[error("Relay client failed: {0}")]
@@ -346,6 +907,20 @@ pub enum RemoteTransportError {
     StartPermitUnavailable,
     #[error("Relay still holds the machine authenticator")]
     AuthenticatorStillShared,
+    #[error("pairing transport lane has already been taken")]
+    PairingLaneUnavailable,
+    #[error("pairing frame does not match the frozen machine/pair/device/serial binding")]
+    PairingBindingMismatch,
+    #[error("pairing transport binding capacity is exhausted")]
+    PairingCapacity,
+    #[error("pairing event consumer is lagged or unavailable")]
+    PairingLagged,
+    #[error("pairing transport generation is exhausted")]
+    PairingGenerationExhausted,
+    #[error("pairing transport could not obtain cryptographic entropy")]
+    PairingEntropyUnavailable,
+    #[error("remote supervisor failed: {code}")]
+    SupervisorFailed { code: String },
     #[error("machine retirement construction failed: {0}")]
     Retirement(#[from] MachineRetirementError),
 }
@@ -360,9 +935,20 @@ impl RemoteTransportError {
             Self::Closed => "remote.transport.closed",
             Self::StartPermitUnavailable => "remote.transport.start_permit_unavailable",
             Self::AuthenticatorStillShared => "remote.transport.authenticator_still_shared",
+            Self::PairingLaneUnavailable => "remote.transport.pairing_lane_unavailable",
+            Self::PairingBindingMismatch => "remote.transport.pairing_binding_mismatch",
+            Self::PairingCapacity => "remote.transport.pairing_capacity",
+            Self::PairingLagged => "remote.transport.pairing_lagged",
+            Self::PairingGenerationExhausted => "remote.transport.pairing_generation_exhausted",
+            Self::PairingEntropyUnavailable => "remote.transport.pairing_entropy_unavailable",
+            Self::SupervisorFailed { code } => code,
             Self::Retirement(error) => error.code(),
         }
     }
+}
+
+fn supervisor_failure(code: impl Into<String>) -> RemoteTransportError {
+    RemoteTransportError::SupervisorFailed { code: code.into() }
 }
 
 /// 初次 Relay connect 失败时保留的唯一重试状态。Debug/Display 只公开稳定 code；
@@ -493,10 +1079,540 @@ async fn connect_preserving_ownership<P>(
     }
 }
 
-/// 持有 RemoteStartPermit/active link key owner 的唯一 control-only transport。
+const PAIRING_EVENT_CHANNEL_CAPACITY: usize = 8;
+const PAIRING_BINDING_CAPACITY: usize = 8;
+const PAIRING_COMPLETED_BINDING_CAPACITY: usize = 8;
+const INITIAL_PAIRING_GENERATION: u64 = 1;
+
+#[derive(Clone)]
+enum PairingCommand {
+    Open(OpenPairRoute),
+    Data(PairData),
+    InstallGrant(InstallGrant),
+    Close(ClosePairRoute),
+    RevokeDevice(RevokeDevice),
+}
+
+impl PairingCommand {
+    fn frame(&self) -> OpaqueRouteFrame {
+        let body = match self {
+            Self::Open(frame) => RelayFrameBody::OpenPairRoute(frame.clone()),
+            Self::Data(frame) => RelayFrameBody::PairData(frame.clone()),
+            Self::InstallGrant(frame) => RelayFrameBody::InstallGrant(frame.clone()),
+            Self::Close(frame) => RelayFrameBody::ClosePairRoute(frame.clone()),
+            Self::RevokeDevice(frame) => RelayFrameBody::RevokeDevice(frame.clone()),
+        };
+        OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PairRouteBinding {
+    pair_route: PairRouteId,
+    absolute_expiry_ms: Option<u64>,
+    opened: bool,
+    closing: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct GrantBinding {
+    device_route: DeviceRouteId,
+    grant_serial: GrantSerial,
+    grant_hash: [u8; 32],
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RevocationBinding {
+    revocation: DeviceRevocation,
+}
+
+#[derive(Clone, Default)]
+struct PairingBindings {
+    routes: Vec<PairRouteBinding>,
+    grants: Vec<GrantBinding>,
+    revocations: Vec<RevocationBinding>,
+    completed_routes: Vec<PairRouteId>,
+    completed_grants: Vec<GrantBinding>,
+    completed_revocations: Vec<RevocationBinding>,
+}
+
+impl PairingBindings {
+    fn prepare_outbound(
+        &self,
+        machine_route: MachineRouteId,
+        command: &PairingCommand,
+    ) -> Result<Self, RemoteTransportError> {
+        let frame = command.frame();
+        if encode(&frame).len() > MAX_FRAME_BYTES {
+            return Err(RemoteTransportError::Client(RelayClientError::Failure {
+                code: "relay.client.frame_too_large".to_owned(),
+            }));
+        }
+
+        let mut next = self.clone();
+        match command {
+            PairingCommand::Open(open) => {
+                if open.machine_route != machine_route {
+                    return Err(RemoteTransportError::RouteMismatch);
+                }
+                if is_zero_pair_route(open.pair_route) || open.absolute_expiry_ms == 0 {
+                    return Err(RemoteTransportError::PairingBindingMismatch);
+                }
+                if let Some(bound) = next
+                    .routes
+                    .iter_mut()
+                    .find(|bound| bound.pair_route == open.pair_route)
+                {
+                    if bound.absolute_expiry_ms != Some(open.absolute_expiry_ms) || bound.closing {
+                        return Err(RemoteTransportError::PairingBindingMismatch);
+                    }
+                } else {
+                    ensure_pairing_capacity(next.routes.len())?;
+                    next.routes.push(PairRouteBinding {
+                        pair_route: open.pair_route,
+                        absolute_expiry_ms: Some(open.absolute_expiry_ms),
+                        opened: false,
+                        closing: false,
+                    });
+                }
+            }
+            PairingCommand::Data(data) => {
+                let Some(bound) = next
+                    .routes
+                    .iter()
+                    .find(|bound| bound.pair_route == data.pair_route)
+                else {
+                    return Err(RemoteTransportError::PairingBindingMismatch);
+                };
+                if !bound.opened || bound.closing {
+                    return Err(RemoteTransportError::PairingBindingMismatch);
+                }
+            }
+            PairingCommand::InstallGrant(install) => {
+                let grant = &install.grant;
+                if grant.machine_route != machine_route {
+                    return Err(RemoteTransportError::RouteMismatch);
+                }
+                if is_zero_device_route(grant.device_route) || grant.grant_serial.value() == 0 {
+                    return Err(RemoteTransportError::PairingBindingMismatch);
+                }
+                let expected = GrantBinding {
+                    device_route: grant.device_route,
+                    grant_serial: grant.grant_serial,
+                    grant_hash: grant.canonical_sha256(),
+                };
+                if let Some(bound) = next
+                    .grants
+                    .iter()
+                    .find(|bound| bound.device_route == grant.device_route)
+                {
+                    if bound.grant_serial != expected.grant_serial
+                        || bound.grant_hash != expected.grant_hash
+                    {
+                        return Err(RemoteTransportError::PairingBindingMismatch);
+                    }
+                } else {
+                    ensure_pairing_capacity(next.grants.len())?;
+                    next.grants.push(expected);
+                }
+            }
+            PairingCommand::Close(close) => {
+                if close.machine_route != machine_route {
+                    return Err(RemoteTransportError::RouteMismatch);
+                }
+                if is_zero_pair_route(close.pair_route) {
+                    return Err(RemoteTransportError::PairingBindingMismatch);
+                }
+                if let Some(bound) = next
+                    .routes
+                    .iter_mut()
+                    .find(|bound| bound.pair_route == close.pair_route)
+                {
+                    bound.closing = true;
+                } else {
+                    // Durable terminal close outbox must be replayable after daemon restart.
+                    ensure_pairing_capacity(next.routes.len())?;
+                    next.routes.push(PairRouteBinding {
+                        pair_route: close.pair_route,
+                        absolute_expiry_ms: None,
+                        opened: false,
+                        closing: true,
+                    });
+                }
+            }
+            PairingCommand::RevokeDevice(revoke) => {
+                let revocation = &revoke.revocation;
+                if revocation.machine_route != machine_route {
+                    return Err(RemoteTransportError::RouteMismatch);
+                }
+                if is_zero_device_route(revocation.device_route)
+                    || revocation.grant_serial.value() == 0
+                {
+                    return Err(RemoteTransportError::PairingBindingMismatch);
+                }
+                if let Some(bound) = next
+                    .revocations
+                    .iter()
+                    .find(|bound| bound.revocation.device_route == revocation.device_route)
+                {
+                    if bound.revocation != *revocation {
+                        return Err(RemoteTransportError::PairingBindingMismatch);
+                    }
+                } else {
+                    ensure_pairing_capacity(next.revocations.len())?;
+                    next.revocations.push(RevocationBinding {
+                        revocation: revocation.clone(),
+                    });
+                }
+            }
+        }
+        Ok(next)
+    }
+
+    fn accept_opened(
+        &mut self,
+        machine_route: MachineRouteId,
+        opened: PairRouteOpened,
+    ) -> Result<PairingTransportEvent, RemoteTransportError> {
+        let Some(bound) = self
+            .routes
+            .iter_mut()
+            .find(|bound| bound.pair_route == opened.pair_route)
+        else {
+            return Err(RemoteTransportError::FrameForbidden);
+        };
+        if opened.machine_route != machine_route
+            || bound.absolute_expiry_ms != Some(opened.absolute_expiry_ms)
+            || bound.closing
+        {
+            return Err(RemoteTransportError::PairingBindingMismatch);
+        }
+        bound.opened = true;
+        Ok(PairingTransportEvent::PairRouteOpened(opened))
+    }
+
+    fn accept_data(&self, data: PairData) -> Result<PairingTransportEvent, RemoteTransportError> {
+        let Some(bound) = self
+            .routes
+            .iter()
+            .find(|bound| bound.pair_route == data.pair_route)
+        else {
+            return Err(RemoteTransportError::FrameForbidden);
+        };
+        if !bound.opened || bound.closing {
+            return Err(RemoteTransportError::PairingBindingMismatch);
+        }
+        Ok(PairingTransportEvent::PairData(data))
+    }
+
+    fn accept_pair_frame(
+        &self,
+        accepted: RouteAccepted,
+    ) -> Result<PairingTransportEvent, RemoteTransportError> {
+        let AcceptedRef::PairFrame { pair_route } = accepted.accepted else {
+            return Err(RemoteTransportError::FrameForbidden);
+        };
+        let Some(bound) = self
+            .routes
+            .iter()
+            .find(|bound| bound.pair_route == pair_route)
+        else {
+            return Err(RemoteTransportError::FrameForbidden);
+        };
+        if !bound.opened || bound.closing {
+            return Err(RemoteTransportError::PairingBindingMismatch);
+        }
+        Ok(PairingTransportEvent::PairFrameAccepted(accepted))
+    }
+
+    fn accept_closed(
+        &mut self,
+        closed: PairRouteClosed,
+    ) -> Result<PairingTransportEvent, RemoteTransportError> {
+        if let Some(index) = self
+            .routes
+            .iter()
+            .position(|bound| bound.pair_route == closed.pair_route)
+        {
+            if !self.routes[index].closing {
+                return Err(RemoteTransportError::PairingBindingMismatch);
+            }
+            self.routes.swap_remove(index);
+            remember_completed(&mut self.completed_routes, closed.pair_route);
+            return Ok(PairingTransportEvent::PairRouteClosed(closed));
+        }
+        if self.completed_routes.contains(&closed.pair_route) {
+            return Ok(PairingTransportEvent::PairRouteClosed(closed));
+        }
+        Err(RemoteTransportError::FrameForbidden)
+    }
+
+    fn accept_grant(
+        &mut self,
+        committed: GrantCommitted,
+    ) -> Result<PairingTransportEvent, RemoteTransportError> {
+        let expected = GrantBinding {
+            device_route: committed.device_route,
+            grant_serial: committed.grant_serial,
+            grant_hash: committed.grant_hash,
+        };
+        if let Some(index) = self
+            .grants
+            .iter()
+            .position(|bound| bound.device_route == committed.device_route)
+        {
+            if self.grants[index] != expected {
+                if self.completed_grants.contains(&expected) {
+                    return Ok(PairingTransportEvent::GrantCommitted(committed));
+                }
+                return Err(RemoteTransportError::PairingBindingMismatch);
+            }
+            let completed = self.grants.swap_remove(index);
+            remember_completed(&mut self.completed_grants, completed);
+            return Ok(PairingTransportEvent::GrantCommitted(committed));
+        }
+        if self.completed_grants.contains(&expected) {
+            return Ok(PairingTransportEvent::GrantCommitted(committed));
+        }
+        if self
+            .completed_grants
+            .iter()
+            .any(|bound| bound.device_route == committed.device_route)
+        {
+            return Err(RemoteTransportError::PairingBindingMismatch);
+        }
+        Err(RemoteTransportError::FrameForbidden)
+    }
+
+    fn accept_revocation(
+        &mut self,
+        committed: RevocationCommitted,
+    ) -> Result<PairingTransportEvent, RemoteTransportError> {
+        let expected = RevocationBinding {
+            revocation: committed.signed_revocation.clone(),
+        };
+        let exact_terminal = committed.device_route == expected.revocation.device_route
+            && committed.grant_serial == expected.revocation.grant_serial
+            && expected.revocation.machine_route != MachineRouteId::from_bytes([0; 16]);
+        if !exact_terminal {
+            return Err(RemoteTransportError::PairingBindingMismatch);
+        }
+        if let Some(index) = self
+            .revocations
+            .iter()
+            .position(|bound| bound.revocation.device_route == committed.device_route)
+        {
+            if self.revocations[index] != expected {
+                if self.completed_revocations.contains(&expected) {
+                    return Ok(PairingTransportEvent::RevocationCommitted(committed));
+                }
+                return Err(RemoteTransportError::PairingBindingMismatch);
+            }
+            let completed = self.revocations.swap_remove(index);
+            remember_completed(&mut self.completed_revocations, completed);
+            return Ok(PairingTransportEvent::RevocationCommitted(committed));
+        }
+        if self.completed_revocations.contains(&expected) {
+            return Ok(PairingTransportEvent::RevocationCommitted(committed));
+        }
+        if self
+            .completed_revocations
+            .iter()
+            .any(|bound| bound.revocation.device_route == committed.device_route)
+        {
+            return Err(RemoteTransportError::PairingBindingMismatch);
+        }
+        Err(RemoteTransportError::FrameForbidden)
+    }
+}
+
+fn remember_completed<T: PartialEq>(completed: &mut Vec<T>, value: T) {
+    if completed.contains(&value) {
+        return;
+    }
+    if completed.len() == PAIRING_COMPLETED_BINDING_CAPACITY {
+        completed.remove(0);
+    }
+    completed.push(value);
+}
+
+fn ensure_pairing_capacity(current: usize) -> Result<(), RemoteTransportError> {
+    if current >= PAIRING_BINDING_CAPACITY {
+        Err(RemoteTransportError::PairingCapacity)
+    } else {
+        Ok(())
+    }
+}
+
+fn is_zero_pair_route(route: PairRouteId) -> bool {
+    route.as_bytes() == &[0; 16]
+}
+
+fn is_zero_device_route(route: DeviceRouteId) -> bool {
+    route.as_bytes() == &[0; 16]
+}
+
+/// 一次性从 [`RemoteTransport`] 取出的 bounded pairing lane。
+///
+/// 它只持有唯一 supervisor 的 typed command handle 与唯一 event receiver；不持有
+/// authenticator、start permit、RelayClient 或 raw frame API。
+pub(crate) struct PairingTransportLane {
+    command_tx: mpsc::Sender<SupervisorCommand>,
+    event_rx: mpsc::Receiver<PairingTransportSignal>,
+    health_rx: watch::Receiver<Option<String>>,
+    enabled: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    authority_anchor: Option<MachinePairingAnchor>,
+}
+
+struct PairingTransportSignal {
+    generation: u64,
+    event: Result<PairingTransportEvent, SafeFailure>,
+}
+
+impl PairingTransportLane {
+    pub(crate) async fn send_open_pair_route(
+        &self,
+        frame: OpenPairRoute,
+    ) -> Result<(), RemoteTransportError> {
+        self.send_command(PairingCommand::Open(frame)).await
+    }
+
+    pub(crate) async fn send_pair_data(&self, frame: PairData) -> Result<(), RemoteTransportError> {
+        self.send_command(PairingCommand::Data(frame)).await
+    }
+
+    pub(crate) async fn send_install_grant(
+        &self,
+        frame: InstallGrant,
+    ) -> Result<(), RemoteTransportError> {
+        let anchor = self.authority_anchor()?;
+        if frame.grant.machine_route != anchor.machine_route {
+            return Err(RemoteTransportError::RouteMismatch);
+        }
+        if is_zero_device_route(frame.grant.device_route) || frame.grant.grant_serial.value() == 0 {
+            return Err(RemoteTransportError::PairingBindingMismatch);
+        }
+        anchor
+            .verify_relay_grant(&frame.grant)
+            .map_err(map_pairing_authority_error)?;
+        self.send_command(PairingCommand::InstallGrant(frame)).await
+    }
+
+    pub(crate) async fn send_close_pair_route(
+        &self,
+        frame: ClosePairRoute,
+    ) -> Result<(), RemoteTransportError> {
+        self.send_command(PairingCommand::Close(frame)).await
+    }
+
+    pub(crate) async fn send_revoke_device(
+        &self,
+        frame: RevokeDevice,
+    ) -> Result<(), RemoteTransportError> {
+        let anchor = self.authority_anchor()?;
+        if frame.revocation.machine_route != anchor.machine_route {
+            return Err(RemoteTransportError::RouteMismatch);
+        }
+        if is_zero_device_route(frame.revocation.device_route)
+            || frame.revocation.grant_serial.value() == 0
+        {
+            return Err(RemoteTransportError::PairingBindingMismatch);
+        }
+        anchor
+            .verify_device_revocation(&frame.revocation)
+            .map_err(map_pairing_authority_error)?;
+        self.send_command(PairingCommand::RevokeDevice(frame)).await
+    }
+
+    /// 复用唯一 supervisor/session 重拨；成功后清空易失 pairing bindings，调用方须按
+    /// durable outbox exact reopen/replay。
+    pub(crate) async fn reconnect(&self) -> Result<(), RemoteTransportError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SupervisorCommand::Reconnect {
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| RemoteTransportError::Closed)?;
+        response_rx
+            .await
+            .map_err(|_| RemoteTransportError::Closed)?
+    }
+
+    async fn send_command(&self, command: PairingCommand) -> Result<(), RemoteTransportError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SupervisorCommand::Pairing {
+                command,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| RemoteTransportError::Closed)?;
+        response_rx
+            .await
+            .map_err(|_| RemoteTransportError::Closed)?
+    }
+
+    pub(crate) async fn next_event(
+        &mut self,
+    ) -> Result<Option<PairingTransportEvent>, RemoteTransportError> {
+        loop {
+            if let Some(code) = self.health_rx.borrow().clone() {
+                return Err(supervisor_failure(code));
+            }
+            tokio::select! {
+                biased;
+                changed = self.health_rx.changed() => {
+                    if changed.is_err() {
+                        return Err(RemoteTransportError::Closed);
+                    }
+                }
+                event = self.event_rx.recv() => {
+                    return match event {
+                        Some(signal)
+                            if signal.generation != self.generation.load(Ordering::Acquire) =>
+                        {
+                            continue;
+                        }
+                        Some(PairingTransportSignal { event: Ok(event), .. }) => Ok(Some(event)),
+                        Some(PairingTransportSignal { event: Err(failure), .. }) => {
+                            Err(supervisor_failure(failure.code))
+                        }
+                        None => Err(RemoteTransportError::Closed),
+                    };
+                }
+            }
+        }
+    }
+
+    fn authority_anchor(&self) -> Result<&MachinePairingAnchor, RemoteTransportError> {
+        self.authority_anchor
+            .as_ref()
+            .ok_or_else(pairing_authority_mismatch)
+    }
+}
+
+impl fmt::Debug for PairingTransportLane {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingTransportLane([REDACTED])")
+    }
+}
+
+impl Drop for PairingTransportLane {
+    fn drop(&mut self) {
+        self.enabled.store(false, Ordering::Release);
+    }
+}
+
+/// 持有 RemoteStartPermit/active link key owner 的唯一 transport。
 pub struct RemoteTransport {
     machine_route: MachineRouteId,
     supervisor: Option<ControlSupervisor>,
+    pairing_lane: Option<PairingTransportLane>,
     authenticator: Option<Arc<MachineLinkAuthenticator>>,
     start_permit: Option<RemoteStartPermit>,
 }
@@ -505,8 +1621,12 @@ const CONTROL_CHANNEL_CAPACITY: usize = 8;
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 
 enum SupervisorCommand {
-    Send {
-        frame: Box<OpaqueRouteFrame>,
+    SendRetirement {
+        retirement: RetireMachine,
+        response: oneshot::Sender<Result<(), RemoteTransportError>>,
+    },
+    Pairing {
+        command: PairingCommand,
         response: oneshot::Sender<Result<(), RemoteTransportError>>,
     },
     Reconnect {
@@ -514,48 +1634,69 @@ enum SupervisorCommand {
     },
 }
 
-#[derive(Clone)]
-enum SupervisorHealth {
-    Connected,
-    Failed(String),
-}
-
 struct ControlSupervisor {
     command_tx: mpsc::Sender<SupervisorCommand>,
     control_rx: mpsc::Receiver<Result<Option<RemoteControl>, RemoteTransportError>>,
     cancel_tx: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
-    health: Arc<Mutex<SupervisorHealth>>,
+    health_rx: watch::Receiver<Option<String>>,
+}
+
+struct SupervisorSignals {
+    control_tx: mpsc::Sender<Result<Option<RemoteControl>, RemoteTransportError>>,
+    pairing_tx: mpsc::Sender<PairingTransportSignal>,
+    pairing_enabled: Arc<AtomicBool>,
+    pairing_generation: Arc<AtomicU64>,
+    health: watch::Sender<Option<String>>,
 }
 
 impl ControlSupervisor {
-    fn start(machine_route: MachineRouteId, session: Box<dyn ControlSession>) -> Self {
+    fn start(
+        machine_route: MachineRouteId,
+        session: Box<dyn ControlSession>,
+    ) -> (Self, PairingTransportLane) {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
+        let (pairing_tx, pairing_rx) = mpsc::channel(PAIRING_EVENT_CHANNEL_CAPACITY);
+        let pairing_enabled = Arc::new(AtomicBool::new(false));
+        let pairing_generation = Arc::new(AtomicU64::new(INITIAL_PAIRING_GENERATION));
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let health = Arc::new(Mutex::new(SupervisorHealth::Connected));
+        let (health_tx, health_rx) = watch::channel(None);
         let task = tokio::spawn(run_control_supervisor(
             machine_route,
             session,
             command_rx,
-            control_tx,
+            SupervisorSignals {
+                control_tx,
+                pairing_tx,
+                pairing_enabled: Arc::clone(&pairing_enabled),
+                pairing_generation: Arc::clone(&pairing_generation),
+                health: health_tx,
+            },
             cancel_rx,
-            Arc::clone(&health),
         ));
-        Self {
-            command_tx,
-            control_rx,
-            cancel_tx,
-            task: Some(task),
-            health,
-        }
+        let pairing_lane = PairingTransportLane {
+            command_tx: command_tx.clone(),
+            event_rx: pairing_rx,
+            health_rx: health_rx.clone(),
+            enabled: pairing_enabled,
+            generation: pairing_generation,
+            authority_anchor: None,
+        };
+        (
+            Self {
+                command_tx,
+                control_rx,
+                cancel_tx,
+                task: Some(task),
+                health_rx,
+            },
+            pairing_lane,
+        )
     }
 
     fn failure_code(&self) -> Option<String> {
-        match &*self.health.lock().expect("lock remote supervisor health") {
-            SupervisorHealth::Connected => None,
-            SupervisorHealth::Failed(code) => Some(code.clone()),
-        }
+        self.health_rx.borrow().clone()
     }
 
     async fn shutdown(mut self) {
@@ -581,13 +1722,20 @@ async fn run_control_supervisor(
     machine_route: MachineRouteId,
     mut session: Box<dyn ControlSession>,
     mut command_rx: mpsc::Receiver<SupervisorCommand>,
-    control_tx: mpsc::Sender<Result<Option<RemoteControl>, RemoteTransportError>>,
+    signals: SupervisorSignals,
     mut cancel_rx: watch::Receiver<bool>,
-    health: Arc<Mutex<SupervisorHealth>>,
 ) {
+    let SupervisorSignals {
+        control_tx,
+        pairing_tx,
+        pairing_enabled,
+        pairing_generation,
+        health,
+    } = signals;
     let mut reader_enabled = true;
     let mut session_shutdown = false;
     let mut pending_control = None;
+    let mut pairing_bindings = PairingBindings::default();
 
     loop {
         if *cancel_rx.borrow() {
@@ -610,6 +1758,11 @@ async fn run_control_supervisor(
                         &mut reader_enabled,
                         session_shutdown,
                         &health,
+                        machine_route,
+                        PairingSupervisorState {
+                            generation: &pairing_generation,
+                            bindings: &mut pairing_bindings,
+                        },
                     ).await;
                     pending_control = Some(control);
                 }
@@ -637,6 +1790,11 @@ async fn run_control_supervisor(
                         &mut reader_enabled,
                         session_shutdown,
                         &health,
+                        machine_route,
+                        PairingSupervisorState {
+                            generation: &pairing_generation,
+                            bindings: &mut pairing_bindings,
+                        },
                     ).await;
                 }
             }
@@ -658,12 +1816,55 @@ async fn run_control_supervisor(
                     &mut reader_enabled,
                     session_shutdown,
                     &health,
+                    machine_route,
+                    PairingSupervisorState {
+                        generation: &pairing_generation,
+                        bindings: &mut pairing_bindings,
+                    },
                 ).await;
             }
             received = session.next() => {
                 match received {
-                    Ok(Some(frame)) => match decode_control(machine_route, frame) {
-                        Ok(control) => pending_control = Some(Ok(Some(control))),
+                    Ok(Some(frame)) => match decode_inbound(machine_route, &mut pairing_bindings, frame) {
+                        Ok(InboundDispatch::Control(control)) => {
+                            pending_control = Some(Ok(Some(control)));
+                        }
+                        Ok(InboundDispatch::Pairing(event)) => {
+                            if !pairing_enabled.load(Ordering::Acquire)
+                                || pairing_tx
+                                    .try_send(PairingTransportSignal {
+                                        generation: pairing_generation.load(Ordering::Acquire),
+                                        event: Ok(event),
+                                    })
+                                    .is_err()
+                            {
+                                let error = RemoteTransportError::PairingLagged;
+                                set_supervisor_failure(&health, error.code());
+                                reader_enabled = false;
+                                session.shutdown().await;
+                                session_shutdown = true;
+                                pending_control = Some(Err(error));
+                            }
+                        }
+                        Ok(InboundDispatch::Shared { control, pairing_failure }) => {
+                            pending_control = Some(Ok(Some(control)));
+                            if pairing_enabled.load(Ordering::Acquire)
+                                && pairing_tx
+                                    .try_send(PairingTransportSignal {
+                                        generation: pairing_generation.load(Ordering::Acquire),
+                                        event: Err(pairing_failure),
+                                    })
+                                    .is_err()
+                            {
+                                set_supervisor_failure(
+                                    &health,
+                                    RemoteTransportError::PairingLagged.code(),
+                                );
+                                reader_enabled = false;
+                                session.shutdown().await;
+                                session_shutdown = true;
+                            }
+                        }
                         Err(error) => {
                             set_supervisor_failure(&health, error.code());
                             reader_enabled = false;
@@ -692,21 +1893,34 @@ async fn run_control_supervisor(
     }
 }
 
+struct PairingSupervisorState<'a> {
+    generation: &'a AtomicU64,
+    bindings: &'a mut PairingBindings,
+}
+
 async fn handle_supervisor_command(
     command: SupervisorCommand,
     session: &mut dyn ControlSession,
     reader_enabled: &mut bool,
     session_shutdown: bool,
-    health: &Arc<Mutex<SupervisorHealth>>,
+    health: &watch::Sender<Option<String>>,
+    machine_route: MachineRouteId,
+    pairing: PairingSupervisorState<'_>,
 ) {
     match command {
-        SupervisorCommand::Send { frame, response } => {
+        SupervisorCommand::SendRetirement {
+            retirement,
+            response,
+        } => {
             if session_shutdown || !*reader_enabled {
                 let _ = response.send(Err(RemoteTransportError::Closed));
                 return;
             }
             let result = session
-                .send(*frame)
+                .send(OpaqueRouteFrame {
+                    version: RELAY_PROTOCOL_VERSION,
+                    body: RelayFrameBody::RetireMachine(retirement),
+                })
                 .await
                 .map_err(RemoteTransportError::Client);
             if let Err(error) = &result {
@@ -715,42 +1929,102 @@ async fn handle_supervisor_command(
             }
             let _ = response.send(result);
         }
+        SupervisorCommand::Pairing { command, response } => {
+            if session_shutdown {
+                let _ = response.send(Err(RemoteTransportError::Closed));
+                return;
+            }
+            if !*reader_enabled {
+                let error = health
+                    .borrow()
+                    .clone()
+                    .map(supervisor_failure)
+                    .unwrap_or(RemoteTransportError::Closed);
+                let _ = response.send(Err(error));
+                return;
+            }
+            let next_bindings = match pairing.bindings.prepare_outbound(machine_route, &command) {
+                Ok(next) => next,
+                Err(error) => {
+                    let _ = response.send(Err(error));
+                    return;
+                }
+            };
+            let result = session
+                .send(command.frame())
+                .await
+                .map_err(RemoteTransportError::Client);
+            match &result {
+                Ok(()) => *pairing.bindings = next_bindings,
+                Err(error) => {
+                    set_supervisor_failure(health, error.code());
+                    *reader_enabled = false;
+                }
+            }
+            let _ = response.send(result);
+        }
         SupervisorCommand::Reconnect { response } => {
             if session_shutdown {
                 let _ = response.send(Err(RemoteTransportError::Closed));
                 return;
             }
-            let result = session
-                .reconnect()
-                .await
-                .map_err(RemoteTransportError::Client);
+            let next_generation = pairing
+                .generation
+                .load(Ordering::Acquire)
+                .checked_add(1)
+                .ok_or(RemoteTransportError::PairingGenerationExhausted);
+            let result = match next_generation {
+                Ok(next_generation) => session
+                    .reconnect()
+                    .await
+                    .map(|()| next_generation)
+                    .map_err(RemoteTransportError::Client),
+                Err(error) => Err(error),
+            };
             match &result {
-                Ok(()) => {
+                Ok(next_generation) => {
                     *reader_enabled = true;
-                    *health.lock().expect("lock remote supervisor health") =
-                        SupervisorHealth::Connected;
+                    *pairing.bindings = PairingBindings::default();
+                    pairing
+                        .generation
+                        .store(*next_generation, Ordering::Release);
+                    health.send_replace(None);
                 }
                 Err(error) => {
                     *reader_enabled = false;
                     set_supervisor_failure(health, error.code());
                 }
             }
-            let _ = response.send(result);
+            let _ = response.send(result.map(|_| ()));
         }
     }
 }
 
-fn set_supervisor_failure(health: &Arc<Mutex<SupervisorHealth>>, code: &str) {
-    *health.lock().expect("lock remote supervisor health") =
-        SupervisorHealth::Failed(code.to_owned());
+fn set_supervisor_failure(health: &watch::Sender<Option<String>>, code: &str) {
+    health.send_replace(Some(code.to_owned()));
 }
 
-fn decode_control(
+enum InboundDispatch {
+    Control(RemoteControl),
+    Pairing(PairingTransportEvent),
+    Shared {
+        control: RemoteControl,
+        pairing_failure: SafeFailure,
+    },
+}
+
+fn decode_inbound(
     machine_route: MachineRouteId,
+    pairing_bindings: &mut PairingBindings,
     frame: OpaqueRouteFrame,
-) -> Result<RemoteControl, RemoteTransportError> {
+) -> Result<InboundDispatch, RemoteTransportError> {
     if frame.version != RELAY_PROTOCOL_VERSION {
         return Err(RemoteTransportError::FrameForbidden);
+    }
+    if encode(&frame).len() > MAX_FRAME_BYTES {
+        return Err(RemoteTransportError::Client(RelayClientError::Failure {
+            code: "relay.client.frame_too_large".to_owned(),
+        }));
     }
     let retirement_bytes =
         matches!(&frame.body, RelayFrameBody::RetirementCommitted(_)).then(|| encode(&frame));
@@ -760,20 +2034,45 @@ fn decode_control(
         {
             let canonical_frame_bytes =
                 retirement_bytes.ok_or(RemoteTransportError::FrameForbidden)?;
-            Ok(RemoteControl::RetirementTerminal(RetirementTerminal {
-                committed,
-                canonical_frame_hash: sha256(&canonical_frame_bytes),
-                canonical_frame_bytes,
-            }))
+            Ok(InboundDispatch::Control(RemoteControl::RetirementTerminal(
+                RetirementTerminal {
+                    committed,
+                    canonical_frame_hash: sha256(&canonical_frame_bytes),
+                    canonical_frame_bytes,
+                },
+            )))
         }
         RelayFrameBody::Error(failure) if failure.has_safe_code() => {
-            Ok(RemoteControl::SafeFailure(SafeFailure {
-                code: failure.code,
-            }))
+            let safe = SafeFailure { code: failure.code };
+            Ok(InboundDispatch::Shared {
+                control: RemoteControl::SafeFailure(safe.clone()),
+                pairing_failure: safe,
+            })
         }
-        RelayFrameBody::ServerRestarting(restarting) => {
-            Ok(RemoteControl::ServerRestarting(restarting))
-        }
+        RelayFrameBody::ServerRestarting(restarting) => Ok(InboundDispatch::Shared {
+            control: RemoteControl::ServerRestarting(restarting),
+            pairing_failure: SafeFailure {
+                code: "remote.transport.server_restarting".to_owned(),
+            },
+        }),
+        RelayFrameBody::PairRouteOpened(opened) => pairing_bindings
+            .accept_opened(machine_route, opened)
+            .map(InboundDispatch::Pairing),
+        RelayFrameBody::PairData(data) => pairing_bindings
+            .accept_data(data)
+            .map(InboundDispatch::Pairing),
+        RelayFrameBody::RouteAccepted(accepted) => pairing_bindings
+            .accept_pair_frame(accepted)
+            .map(InboundDispatch::Pairing),
+        RelayFrameBody::PairRouteClosed(closed) => pairing_bindings
+            .accept_closed(closed)
+            .map(InboundDispatch::Pairing),
+        RelayFrameBody::GrantCommitted(committed) => pairing_bindings
+            .accept_grant(committed)
+            .map(InboundDispatch::Pairing),
+        RelayFrameBody::RevocationCommitted(committed) => pairing_bindings
+            .accept_revocation(committed)
+            .map(InboundDispatch::Pairing),
         _ => Err(RemoteTransportError::FrameForbidden),
     }
 }
@@ -785,9 +2084,11 @@ impl RemoteTransport {
         authenticator: Arc<MachineLinkAuthenticator>,
         start_permit: Option<RemoteStartPermit>,
     ) -> Self {
+        let (supervisor, pairing_lane) = ControlSupervisor::start(machine_route, session);
         Self {
             machine_route,
-            supervisor: Some(ControlSupervisor::start(machine_route, session)),
+            supervisor: Some(supervisor),
+            pairing_lane: Some(pairing_lane),
             authenticator: Some(authenticator),
             start_permit,
         }
@@ -846,11 +2147,8 @@ impl RemoteTransport {
         let (response_tx, response_rx) = oneshot::channel();
         supervisor
             .command_tx
-            .send(SupervisorCommand::Send {
-                frame: Box::new(OpaqueRouteFrame {
-                    version: RELAY_PROTOCOL_VERSION,
-                    body: RelayFrameBody::RetireMachine(retirement),
-                }),
+            .send(SupervisorCommand::SendRetirement {
+                retirement,
                 response: response_tx,
             })
             .await
@@ -858,6 +2156,52 @@ impl RemoteTransport {
         response_rx
             .await
             .map_err(|_| RemoteTransportError::Closed)?
+    }
+
+    /// 原子取出同一 transport generation 的唯一 pairing lane 与 Weak authority。
+    /// data cert 全轴验证失败不会消费 lane；shutdown 后 authority 不延长 key owner 生命周期。
+    pub(crate) fn take_pairing_runtime(
+        &mut self,
+        data_certificate: SignedCertificate,
+    ) -> Result<PairingRuntimeParts, RemoteTransportError> {
+        if self.supervisor.is_none() {
+            return Err(RemoteTransportError::Closed);
+        }
+        if self.pairing_lane.is_none() {
+            return Err(RemoteTransportError::PairingLaneUnavailable);
+        }
+        let authenticator = self
+            .authenticator
+            .as_ref()
+            .ok_or(RemoteTransportError::Closed)?;
+        let anchor = authenticator
+            .bind_pairing_anchor(&data_certificate)
+            .map_err(map_pairing_authority_error)?;
+        let data_signer = MachineDataSignerBindingV1::from_certificate(&data_certificate)
+            .map_err(|_| supervisor_failure("remote.transport.pairing_crypto_failed"))?;
+        let owner = Arc::downgrade(authenticator);
+        let mut lane = self
+            .pairing_lane
+            .take()
+            .ok_or(RemoteTransportError::PairingLaneUnavailable)?;
+        lane.authority_anchor = Some(anchor.clone());
+        lane.enabled.store(true, Ordering::Release);
+        Ok(PairingRuntimeParts {
+            lane,
+            authority: PairingMachineAuthority {
+                owner,
+                anchor,
+                data_signer,
+            },
+        })
+    }
+
+    #[cfg(test)]
+    fn take_pairing_lane(
+        &mut self,
+        data_certificate: SignedCertificate,
+    ) -> Result<PairingTransportLane, RemoteTransportError> {
+        Ok(self.take_pairing_runtime(data_certificate)?.lane)
     }
 
     /// 在已经完成 MachineLink authentication 后，沿保留的 owner 冻结同 route 的
@@ -911,6 +2255,7 @@ impl RemoteTransport {
     /// 旧 key owner 与 start permit。需要同 daemon re-enroll 时必须改用 consuming reclaim。
     pub async fn shutdown(&mut self) {
         shutdown_supervisor_and_owner(&mut self.supervisor, &mut self.authenticator).await;
+        self.pairing_lane = None;
         self.start_permit = None;
     }
 
@@ -975,29 +2320,98 @@ impl fmt::Debug for RemoteTransport {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::convert::Infallible;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
     use agentdeck_crypto::{
-        SignatureBytes, SigningKey, sign_authentication_transcript, sign_tbs,
-        verify_authentication_transcript, verify_tbs,
+        HpkePrivateKey, SecretAeadKey, SignatureBytes, SigningKey, open_key_directory_entry,
+        open_pair_pending, open_pair_response, sign_authentication_transcript, sign_tbs,
+        verify_authentication_transcript, verify_device_authorization, verify_key_directory,
+        verify_tbs,
+    };
+    use agentdeck_protocol::e2ee::{
+        AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
+        E2EE_FORMAT_VERSION, KeyDirectoryEntry, KeyDirectoryV1, KeyId, KeyPurpose, OuterContextV1,
+        OuterFrameKind, PairRequestInfoV1, PairResponseInfoV1, PairResponsePlaintextV1,
     };
     use agentdeck_protocol::relay_v2::frame::{
-        AcceptedRef, GrantCommitted, PairData, Ping, Publish, Reply, RevocationCommitted,
-        RouteAccepted, SealedBlob, Send,
+        AcceptedRef, ClosePairRoute, GrantCommitted, InstallGrant, OpenPairRoute, PairData,
+        PairRouteCloseOutcome, PairRouteClosed, PairRouteOpened, Ping, Publish, Reply,
+        RevocationCommitted, RevokeDevice, RouteAccepted, SealedBlob, Send,
     };
     use agentdeck_protocol::relay_v2::{
         ConnectionInstanceId, DeviceRevocation, DeviceRouteId, Ed25519Signature, GrantSerial,
-        LinkGeneration, PairRouteId, RelayFailure, RelayServerId, RequestRouteId, RootKeyId,
-        StreamGenerationId, StreamRouteId, TrustEpoch,
+        KeyDirectoryRevision, LinkGeneration, PairRouteId, PublicKeyBytes, RELAY_PROTOCOL_VERSION,
+        RelayFailure, RelayGrant, RelayServerId, RequestRouteId, RootKeyId, StreamGenerationId,
+        StreamRouteId, TrustEpoch,
     };
+    use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
     use agentdeck_relay_client::RelayTlsPolicy;
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::remote::bootstrap::validate_pairing_device_sign_key;
 
     const RELAY: RelayServerId = RelayServerId::from_bytes([0x11; 16]);
     const ROUTE: MachineRouteId = MachineRouteId::from_bytes([0x22; 16]);
+
+    struct DeterministicRng {
+        seed: [u8; 32],
+        counter: u64,
+        block: [u8; 32],
+        offset: usize,
+    }
+
+    impl DeterministicRng {
+        fn new(seed: [u8; 32]) -> Self {
+            Self {
+                seed,
+                counter: 0,
+                block: [0; 32],
+                offset: 32,
+            }
+        }
+
+        fn fill(&mut self, output: &mut [u8]) {
+            for byte in output {
+                if self.offset == self.block.len() {
+                    let mut input = b"AgentDeck/RemotePairingAuthorityTestRng\0".to_vec();
+                    input.extend_from_slice(&self.seed);
+                    input.extend_from_slice(&self.counter.to_be_bytes());
+                    self.block = sha256(&input);
+                    self.counter += 1;
+                    self.offset = 0;
+                }
+                *byte = self.block[self.offset];
+                self.offset += 1;
+            }
+        }
+    }
+
+    impl TryRng for DeterministicRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            let mut bytes = [0; 4];
+            self.fill(&mut bytes);
+            Ok(u32::from_le_bytes(bytes))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            let mut bytes = [0; 8];
+            self.fill(&mut bytes);
+            Ok(u64::from_le_bytes(bytes))
+        }
+
+        fn try_fill_bytes(&mut self, output: &mut [u8]) -> Result<(), Self::Error> {
+            self.fill(output);
+            Ok(())
+        }
+    }
+
+    impl TryCryptoRng for DeterministicRng {}
 
     struct FakeOwner {
         signing_key: SigningKey,
@@ -1064,6 +2478,219 @@ mod tests {
                     retirement,
                 ),
             )
+        }
+
+        fn pairing_anchor(
+            &self,
+            relay_server_id: RelayServerId,
+            machine_route: MachineRouteId,
+            data_certificate: &SignedCertificate,
+        ) -> Result<MachinePairingAnchor, MachinePairingError> {
+            let data = SigningKey::from_seed(&[0x33; 32]);
+            let expected_root_fingerprint =
+                sha256(&self.root_signing_key.verifying_key().to_bytes());
+            let certificate_error =
+                if data_certificate.cert_role != agentdeck_protocol::relay_v2::CertRole::Data {
+                    Some(MachineCertificateError::RoleMismatch)
+                } else if data_certificate.subject_pubkey.0 != data.verifying_key().to_bytes() {
+                    Some(MachineCertificateError::SubjectMismatch)
+                } else if data_certificate.root_key_id != RootKeyId::from_bytes([0x61; 16]) {
+                    Some(MachineCertificateError::RootKeyIdMismatch)
+                } else if data_certificate.trust_epoch != TrustEpoch::new(3) {
+                    Some(MachineCertificateError::TrustEpochMismatch)
+                } else if data_certificate.generation != LinkGeneration::new(9) {
+                    Some(MachineCertificateError::GenerationMismatch)
+                } else if data_certificate.not_after_ms.is_some() {
+                    Some(MachineCertificateError::UnexpectedExpiry)
+                } else {
+                    let tbs = data_certificate.to_be_signed_v1(
+                        relay_server_id,
+                        machine_route,
+                        expected_root_fingerprint,
+                    );
+                    verify_tbs(
+                        &self.root_signing_key.verifying_key(),
+                        &tbs,
+                        &SignatureBytes::from(data_certificate.signature),
+                    )
+                    .err()
+                    .map(|_| MachineCertificateError::SignatureInvalid)
+                };
+            if let Some(error) = certificate_error {
+                return Err(MachinePairingError::Certificate(error));
+            }
+            let (_, hpke_public) = agentdeck_crypto::HpkePrivateKey::derive_keypair(&[0x34; 32]);
+            Ok(MachinePairingAnchor {
+                relay_server_id,
+                machine_route,
+                root_public_key: PublicKeyBytes(self.root_signing_key.verifying_key().to_bytes()),
+                root_fingerprint: expected_root_fingerprint,
+                root_key_id: data_certificate.root_key_id,
+                trust_epoch: data_certificate.trust_epoch,
+                machine_hpke_public_key: PublicKeyBytes(
+                    hpke_public.to_bytes().try_into().expect("32-byte HPKE key"),
+                ),
+                data_generation: data_certificate.generation,
+                data_certificate: data_certificate.clone(),
+            })
+        }
+
+        fn seal_pair_pending(
+            &self,
+            recipient: &HpkePublicKey,
+            info: &PairRequestInfoV1,
+            context: &OuterContextV1,
+            request_hash: [u8; 32],
+            signer: &MachineDataSignerBindingV1,
+            mut rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+        ) -> Result<PairingControlEnvelopeV1, MachinePairingError> {
+            Ok(agentdeck_crypto::seal_pair_pending(
+                recipient,
+                info,
+                context,
+                request_hash,
+                &SigningKey::from_seed(&[0x33; 32]),
+                signer,
+                &mut rng,
+            )?)
+        }
+
+        fn sign_relay_grant(
+            &self,
+            anchor: &MachinePairingAnchor,
+            mut grant: RelayGrant,
+        ) -> Result<RelayGrant, MachinePairingError> {
+            if grant.signature.0 != [0; 64]
+                || grant.machine_route != anchor.machine_route
+                || grant.device_route.as_bytes() == &[0; 16]
+                || grant.grant_serial.value() == 0
+                || grant.root_key_id != anchor.root_key_id
+                || grant.trust_epoch != anchor.trust_epoch
+            {
+                return Err(MachinePairingError::ContextMismatch);
+            }
+            validate_pairing_device_sign_key(anchor.relay_server_id, grant.device_sign_pubkey)?;
+            grant.signature = sign_tbs(
+                &self.root_signing_key,
+                &grant.to_be_signed_v1(anchor.relay_server_id, anchor.root_fingerprint),
+            )
+            .into();
+            Ok(grant)
+        }
+
+        fn sign_device_authorization(
+            &self,
+            anchor: &MachinePairingAnchor,
+            grant: &RelayGrant,
+            authorization: DeviceAuthorizationV1,
+        ) -> Result<DeviceAuthorizationV1, MachinePairingError> {
+            if grant.machine_route != anchor.machine_route
+                || grant.device_route.as_bytes() == &[0; 16]
+                || grant.grant_serial.value() == 0
+                || grant.root_key_id != anchor.root_key_id
+                || grant.trust_epoch != anchor.trust_epoch
+                || grant.signature.0 == [0; 64]
+            {
+                return Err(MachinePairingError::ContextMismatch);
+            }
+            validate_pairing_device_sign_key(anchor.relay_server_id, grant.device_sign_pubkey)?;
+            verify_tbs(
+                &self.root_signing_key.verifying_key(),
+                &grant.to_be_signed_v1(anchor.relay_server_id, anchor.root_fingerprint),
+                &SignatureBytes::from(grant.signature),
+            )?;
+            Ok(agentdeck_crypto::sign_device_authorization(
+                &self.root_signing_key,
+                anchor.relay_server_id,
+                grant,
+                authorization,
+            )?)
+        }
+
+        fn sign_key_directory(
+            &self,
+            anchor: &MachinePairingAnchor,
+            context: &KeyDirectorySignatureContextV1,
+            directory: KeyDirectoryV1,
+        ) -> Result<KeyDirectoryV1, MachinePairingError> {
+            if context.relay_server_id != anchor.relay_server_id
+                || context.machine_route != anchor.machine_route
+                || context.root_trust_epoch != anchor.trust_epoch
+                || context.device_route.as_bytes() == &[0; 16]
+                || context.grant_serial.value() == 0
+            {
+                return Err(MachinePairingError::ContextMismatch);
+            }
+            let data = SigningKey::from_seed(&[0x33; 32]);
+            let signer = MachineDataSignerBindingV1::from_certificate(&anchor.data_certificate)
+                .map_err(|_| MachinePairingError::Crypto)?;
+            Ok(agentdeck_crypto::sign_key_directory(
+                &data, &signer, context, directory,
+            )?)
+        }
+
+        fn seal_pair_response(
+            &self,
+            anchor: &MachinePairingAnchor,
+            recipient: &HpkePublicKey,
+            info: &PairResponseInfoV1,
+            context: &OuterContextV1,
+            plaintext: &PairResponsePlaintextV1,
+            mut rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+        ) -> Result<PairResponseV1, MachinePairingError> {
+            if info.relay_server_id != anchor.relay_server_id
+                || info.machine_route != anchor.machine_route
+                || info.root_trust_epoch != anchor.trust_epoch
+                || plaintext.relay_grant.machine_route != anchor.machine_route
+                || plaintext.relay_grant.device_route.as_bytes() == &[0; 16]
+                || plaintext.relay_grant.grant_serial.value() == 0
+                || plaintext.relay_grant.root_key_id != anchor.root_key_id
+                || plaintext.relay_grant.trust_epoch != anchor.trust_epoch
+                || plaintext.relay_grant.signature.0 == [0; 64]
+            {
+                return Err(MachinePairingError::ContextMismatch);
+            }
+            validate_pairing_device_sign_key(
+                anchor.relay_server_id,
+                plaintext.relay_grant.device_sign_pubkey,
+            )?;
+            let data = SigningKey::from_seed(&[0x33; 32]);
+            let signer = MachineDataSignerBindingV1::from_certificate(&anchor.data_certificate)
+                .map_err(|_| MachinePairingError::Crypto)?;
+            Ok(agentdeck_crypto::seal_pair_response(
+                recipient,
+                info,
+                context,
+                plaintext,
+                agentdeck_crypto::PairResponseSealAuthority {
+                    machine_data_signing_key: &data,
+                    signer: &signer,
+                    machine_root_verifying_key: &self.root_signing_key.verifying_key(),
+                },
+                &mut rng,
+            )?)
+        }
+
+        fn sign_device_revocation(
+            &self,
+            anchor: &MachinePairingAnchor,
+            mut revocation: DeviceRevocation,
+        ) -> Result<DeviceRevocation, MachinePairingError> {
+            if revocation.machine_route != anchor.machine_route
+                || revocation.device_route.as_bytes() == &[0; 16]
+                || revocation.grant_serial.value() == 0
+                || revocation.root_key_id != anchor.root_key_id
+                || revocation.trust_epoch != anchor.trust_epoch
+                || revocation.signature.0 != [0; 64]
+            {
+                return Err(MachinePairingError::ContextMismatch);
+            }
+            revocation.signature = sign_tbs(
+                &self.root_signing_key,
+                &revocation.to_be_signed_v1(anchor.relay_server_id, anchor.root_fingerprint),
+            )
+            .into();
+            Ok(revocation)
         }
     }
 
@@ -1222,6 +2849,7 @@ mod tests {
         owner_drops: Arc<AtomicUsize>,
         link_verifying_key: agentdeck_crypto::VerifyingKey,
         link_cert: SignedCertificate,
+        data_cert: SignedCertificate,
         challenge: Challenge,
     }
 
@@ -1233,6 +2861,7 @@ mod tests {
         let link = SigningKey::from_seed(&[0x32; 32]);
         let link_verifying_key = link.verifying_key();
         let link_cert = signed_link_certificate(&root, &link);
+        let data_cert = signed_data_certificate(&root, RELAY, ROUTE);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let owner_drops = Arc::new(AtomicUsize::new(0));
         let owner = FakeOwner {
@@ -1280,6 +2909,7 @@ mod tests {
             owner_drops,
             link_verifying_key,
             link_cert,
+            data_cert,
             challenge,
         }
     }
@@ -1299,6 +2929,33 @@ mod tests {
         certificate.signature = sign_tbs(
             root,
             &certificate.to_be_signed_v1(RELAY, ROUTE, sha256(&root.verifying_key().to_bytes())),
+        )
+        .into();
+        certificate
+    }
+
+    fn signed_data_certificate(
+        root: &SigningKey,
+        relay_server_id: RelayServerId,
+        machine_route: MachineRouteId,
+    ) -> SignedCertificate {
+        let data = SigningKey::from_seed(&[0x33; 32]);
+        let mut certificate = SignedCertificate {
+            subject_pubkey: PublicKeyBytes(data.verifying_key().to_bytes()),
+            cert_role: agentdeck_protocol::relay_v2::CertRole::Data,
+            generation: LinkGeneration::new(9),
+            root_key_id: RootKeyId::from_bytes([0x61; 16]),
+            trust_epoch: TrustEpoch::new(3),
+            not_after_ms: None,
+            signature: Ed25519Signature([0; 64]),
+        };
+        certificate.signature = sign_tbs(
+            root,
+            &certificate.to_be_signed_v1(
+                relay_server_id,
+                machine_route,
+                sha256(&root.verifying_key().to_bytes()),
+            ),
         )
         .into();
         certificate
@@ -1324,6 +2981,214 @@ mod tests {
             trust_epoch: TrustEpoch::new(4),
             signature: Ed25519Signature([0x71; 64]),
         }
+    }
+
+    fn open_pair_route(pair_route: PairRouteId, absolute_expiry_ms: u64) -> OpenPairRoute {
+        OpenPairRoute {
+            machine_route: ROUTE,
+            pair_route,
+            absolute_expiry_ms,
+        }
+    }
+
+    fn relay_grant(
+        device_route: DeviceRouteId,
+        serial: u64,
+    ) -> agentdeck_protocol::relay_v2::RelayGrant {
+        let root = SigningKey::from_seed(&[0x31; 32]);
+        let device = SigningKey::from_seed(&[0x91; 32]);
+        let mut grant = RelayGrant {
+            machine_route: ROUTE,
+            device_route,
+            device_sign_pubkey: PublicKeyBytes(device.verifying_key().to_bytes()),
+            grant_serial: GrantSerial::new(serial),
+            root_key_id: RootKeyId::from_bytes([0x61; 16]),
+            trust_epoch: TrustEpoch::new(3),
+            signature: Ed25519Signature([0; 64]),
+        };
+        grant.signature = sign_tbs(
+            &root,
+            &grant.to_be_signed_v1(RELAY, sha256(&root.verifying_key().to_bytes())),
+        )
+        .into();
+        grant
+    }
+
+    fn device_revocation(device_route: DeviceRouteId, serial: u64) -> DeviceRevocation {
+        let root = SigningKey::from_seed(&[0x31; 32]);
+        let mut revocation = DeviceRevocation {
+            machine_route: ROUTE,
+            device_route,
+            grant_serial: GrantSerial::new(serial),
+            root_key_id: RootKeyId::from_bytes([0x61; 16]),
+            trust_epoch: TrustEpoch::new(3),
+            signature: Ed25519Signature([0; 64]),
+        };
+        revocation.signature = sign_tbs(
+            &root,
+            &revocation.to_be_signed_v1(RELAY, sha256(&root.verifying_key().to_bytes())),
+        )
+        .into();
+        revocation
+    }
+
+    fn pairing_outer_context(kind: OuterFrameKind, pair_route: PairRouteId) -> OuterContextV1 {
+        OuterContextV1 {
+            frame_kind: kind,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            machine_route: None,
+            device_route: None,
+            stream_route: None,
+            request_route: None,
+            pair_route: Some(pair_route),
+            stream_generation: None,
+            stream_cursor: None,
+            stream_seq: None,
+            message_key_epoch: 0,
+        }
+    }
+
+    fn pairing_request_info(pair_route: PairRouteId) -> PairRequestInfoV1 {
+        PairRequestInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_server_id: RELAY,
+            pair_route,
+            invite_hash: [0x81; 32],
+            expiry_ms: 1_700_000_300_000,
+        }
+    }
+
+    fn unsigned_pairing_grant(device_signing_key: &SigningKey) -> RelayGrant {
+        RelayGrant {
+            machine_route: ROUTE,
+            device_route: DeviceRouteId::from_bytes([0x71; 16]),
+            device_sign_pubkey: PublicKeyBytes(device_signing_key.verifying_key().to_bytes()),
+            grant_serial: GrantSerial::new(7),
+            root_key_id: RootKeyId::from_bytes([0x61; 16]),
+            trust_epoch: TrustEpoch::new(3),
+            signature: Ed25519Signature([0; 64]),
+        }
+    }
+
+    fn unsigned_device_authorization(
+        grant: &RelayGrant,
+        device_hpke_public_key: PublicKeyBytes,
+    ) -> DeviceAuthorizationV1 {
+        DeviceAuthorizationV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            grant_hash: grant.canonical_sha256(),
+            machine_route: grant.machine_route,
+            device_route: grant.device_route,
+            device_sign_fingerprint: sha256(&grant.device_sign_pubkey.0),
+            grant_serial: grant.grant_serial,
+            device_hpke_pubkey: device_hpke_public_key,
+            capabilities: vec![AuthorizationCapabilityV1::Catalog],
+            permissions: vec![AuthorizationPermissionV1::CatalogRead],
+            root_key_id: grant.root_key_id,
+            trust_epoch: grant.trust_epoch,
+            signature: Ed25519Signature([0; 64]),
+        }
+    }
+
+    fn pairing_response_info(
+        pair_route: PairRouteId,
+        request_hash: [u8; 32],
+        grant: &RelayGrant,
+    ) -> PairResponseInfoV1 {
+        PairResponseInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_server_id: RELAY,
+            pair_route,
+            invite_hash: [0x81; 32],
+            expiry_ms: 1_700_000_300_000,
+            request_hash,
+            machine_route: grant.machine_route,
+            device_route: grant.device_route,
+            grant_serial: grant.grant_serial,
+            root_trust_epoch: grant.trust_epoch,
+        }
+    }
+
+    fn bootstrap_key_directory(device_route: DeviceRouteId) -> KeyDirectoryV1 {
+        KeyDirectoryV1 {
+            revision: KeyDirectoryRevision::new(1),
+            entries: vec![
+                KeyDirectoryEntry {
+                    key_id: KeyId {
+                        purpose: KeyPurpose::Catalog,
+                        epoch: 1,
+                    },
+                    device_route,
+                    stream_route: None,
+                    enc: vec![0x82; 32],
+                    wrapped_key: vec![0x83; 48],
+                },
+                KeyDirectoryEntry {
+                    key_id: KeyId {
+                        purpose: KeyPurpose::DeviceCommandTx,
+                        epoch: 1,
+                    },
+                    device_route,
+                    stream_route: None,
+                    enc: vec![0x85; 32],
+                    wrapped_key: vec![0x86; 48],
+                },
+                KeyDirectoryEntry {
+                    key_id: KeyId {
+                        purpose: KeyPurpose::DeviceReplyTx,
+                        epoch: 1,
+                    },
+                    device_route,
+                    stream_route: None,
+                    enc: vec![0x87; 32],
+                    wrapped_key: vec![0x88; 48],
+                },
+            ],
+            signature: Ed25519Signature([0; 64]),
+        }
+    }
+
+    fn unsigned_pairing_revocation(grant: &RelayGrant) -> DeviceRevocation {
+        DeviceRevocation {
+            machine_route: grant.machine_route,
+            device_route: grant.device_route,
+            grant_serial: grant.grant_serial,
+            root_key_id: grant.root_key_id,
+            trust_epoch: grant.trust_epoch,
+            signature: Ed25519Signature([0; 64]),
+        }
+    }
+
+    async fn open_bound_route(
+        lane: &mut PairingTransportLane,
+        harness: &Harness,
+        pair_route: PairRouteId,
+        absolute_expiry_ms: u64,
+    ) {
+        lane.send_open_pair_route(open_pair_route(pair_route, absolute_expiry_ms))
+            .await
+            .expect("send typed open");
+        harness.push_incoming(frame(RelayFrameBody::PairRouteOpened(PairRouteOpened {
+            machine_route: ROUTE,
+            pair_route,
+            absolute_expiry_ms,
+        })));
+        let event = lane
+            .next_event()
+            .await
+            .expect("opened event")
+            .expect("event");
+        assert!(matches!(
+            event,
+            PairingTransportEvent::PairRouteOpened(PairRouteOpened {
+                machine_route: ROUTE,
+                pair_route: observed,
+                absolute_expiry_ms: observed_expiry,
+            }) if observed == pair_route && observed_expiry == absolute_expiry_ms
+        ));
     }
 
     #[tokio::test]
@@ -1659,6 +3524,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn untaken_pairing_lane_does_not_backpressure_the_existing_control_surface() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        for index in 0..12 {
+            fixture
+                .harness
+                .push_incoming(frame(RelayFrameBody::Error(RelayFailure::new(
+                    "relay.store.unavailable",
+                    format!("secret-{index}"),
+                ))));
+            let Some(RemoteControl::SafeFailure(failure)) =
+                fixture.transport.next_control().await.unwrap()
+            else {
+                panic!("safe control event");
+            };
+            assert_eq!(failure.code(), "relay.store.unavailable");
+        }
+        assert_eq!(fixture.transport.observed_failure_code(), None);
+        fixture.transport.shutdown().await;
+        assert_eq!(fixture.harness.shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn connected_transport_freezes_bound_retirement_until_shutdown() {
         let mut fixture = connected_fixture(Vec::new(), None).await;
         let frozen = fixture
@@ -1986,5 +3873,1046 @@ mod tests {
             .code(),
             "remote.transport.start_permit_unavailable"
         );
+    }
+
+    #[tokio::test]
+    async fn pairing_lane_is_taken_once_and_open_reuses_the_only_session() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .expect("take sole pairing lane");
+        assert_eq!(
+            fixture
+                .transport
+                .take_pairing_lane(fixture.data_cert.clone())
+                .expect_err("second take must fail")
+                .code(),
+            "remote.transport.pairing_lane_unavailable"
+        );
+
+        let pair_route = PairRouteId::from_bytes([0xa1; 16]);
+        open_bound_route(&mut lane, &fixture.harness, pair_route, 10_000).await;
+        assert_eq!(fixture.harness.connects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.harness.sent.lock().expect("lock sent frames")[0],
+            frame(RelayFrameBody::OpenPairRoute(open_pair_route(
+                pair_route, 10_000
+            )))
+        );
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_runtime_take_is_atomic_binds_data_certificate_and_is_single_use() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let runtime = fixture
+            .transport
+            .take_pairing_runtime(fixture.data_cert.clone())
+            .expect("take paired lane and authority atomically");
+        let anchor = runtime
+            .authority
+            .invite_anchor()
+            .expect("live authority anchor");
+        assert_eq!(anchor.relay_server_id(), RELAY);
+        assert_eq!(anchor.machine_route(), ROUTE);
+        assert_eq!(anchor.data_sign_certificate(), &fixture.data_cert);
+        assert_eq!(anchor.root_key_id(), fixture.data_cert.root_key_id);
+        assert_eq!(anchor.trust_epoch(), fixture.data_cert.trust_epoch);
+        assert_eq!(anchor.data_generation(), fixture.data_cert.generation);
+        assert_eq!(
+            fixture
+                .transport
+                .take_pairing_runtime(fixture.data_cert.clone())
+                .expect_err("runtime parts are single-take")
+                .code(),
+            "remote.transport.pairing_lane_unavailable"
+        );
+        drop(runtime);
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_authority_produces_verifiable_typed_crypto_artifacts() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let runtime = fixture
+            .transport
+            .take_pairing_runtime(fixture.data_cert.clone())
+            .expect("take pairing authority");
+        let pair_route = PairRouteId::from_bytes([0xb1; 16]);
+        let request_hash = [0xb2; 32];
+        let request_info = pairing_request_info(pair_route);
+        let request_context = pairing_outer_context(OuterFrameKind::PairPending, pair_route);
+        let signer = MachineDataSignerBindingV1::from_certificate(&fixture.data_cert)
+            .expect("validated data signer binding");
+        let machine_data = SigningKey::from_seed(&[0x33; 32]);
+        let machine_root = SigningKey::from_seed(&[0x31; 32]);
+        let (device_hpke_private, device_hpke_public) = HpkePrivateKey::derive_keypair(&[0xb3; 32]);
+        let mut pending_rng = DeterministicRng::new([0xb4; 32]);
+        let pending = runtime
+            .authority
+            .seal_pair_pending_with_rng_for_test(
+                &device_hpke_public,
+                &request_info,
+                &request_context,
+                request_hash,
+                &mut pending_rng,
+            )
+            .expect("seal typed PairPending");
+        assert_eq!(
+            open_pair_pending(
+                &device_hpke_private,
+                &request_info,
+                &request_context,
+                &pending,
+                &machine_data.verifying_key(),
+                &signer,
+            )
+            .expect("open and verify PairPending")
+            .request_hash,
+            request_hash
+        );
+
+        let device_signing = SigningKey::from_seed(&[0xb5; 32]);
+        let grant = runtime
+            .authority
+            .sign_relay_grant(unsigned_pairing_grant(&device_signing))
+            .expect("sign typed RelayGrant");
+        verify_tbs(
+            &machine_root.verifying_key(),
+            &grant.to_be_signed_v1(RELAY, sha256(&machine_root.verifying_key().to_bytes())),
+            &SignatureBytes::from(grant.signature),
+        )
+        .expect("verify root-signed RelayGrant");
+
+        let device_hpke_public_key = PublicKeyBytes(
+            device_hpke_public
+                .to_bytes()
+                .try_into()
+                .expect("32-byte DeviceHPKE public key"),
+        );
+        let authorization = runtime
+            .authority
+            .sign_device_authorization(
+                &grant,
+                unsigned_device_authorization(&grant, device_hpke_public_key),
+            )
+            .expect("sign typed DeviceAuthorization");
+        verify_device_authorization(&machine_root.verifying_key(), RELAY, &grant, &authorization)
+            .expect("verify root-signed DeviceAuthorization");
+
+        let key_context = KeyDirectorySignatureContextV1 {
+            relay_server_id: RELAY,
+            machine_route: grant.machine_route,
+            device_route: grant.device_route,
+            grant_serial: grant.grant_serial,
+            root_trust_epoch: grant.trust_epoch,
+        };
+        let key_update_context = OuterContextV1 {
+            frame_kind: OuterFrameKind::KeyUpdate,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            machine_route: Some(grant.machine_route),
+            device_route: Some(grant.device_route),
+            stream_route: None,
+            request_route: None,
+            pair_route: None,
+            stream_generation: None,
+            stream_cursor: None,
+            stream_seq: None,
+            message_key_epoch: 1,
+        };
+        let mut entries = Vec::new();
+        for (purpose, seed) in [
+            (KeyPurpose::Catalog, 0xc1),
+            (KeyPurpose::DeviceCommandTx, 0xc2),
+            (KeyPurpose::DeviceReplyTx, 0xc3),
+        ] {
+            let info = KeyUpdateInfoV1 {
+                e2ee_format_version: E2EE_FORMAT_VERSION,
+                runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+                relay_server_id: RELAY,
+                machine_route: grant.machine_route,
+                device_route: grant.device_route,
+                stream_route: None,
+                grant_serial: grant.grant_serial,
+                root_trust_epoch: grant.trust_epoch,
+                key_directory_revision: KeyDirectoryRevision::new(1),
+                key_purpose: purpose,
+                key_epoch: 1,
+            };
+            let mut rng = DeterministicRng::new([seed; 32]);
+            let entry = runtime
+                .authority
+                .seal_key_directory_entry_with_rng_for_test(
+                    &device_hpke_public,
+                    &info,
+                    &key_update_context,
+                    &SecretAeadKey::from_bytes([seed.wrapping_add(1); 32]),
+                    &mut rng,
+                )
+                .expect("wrap typed bootstrap key");
+            assert!(
+                open_key_directory_entry(&device_hpke_private, &info, &key_update_context, &entry,)
+                    .is_ok()
+            );
+            entries.push(entry);
+        }
+        let mut unsigned_directory = bootstrap_key_directory(grant.device_route);
+        unsigned_directory.entries = entries;
+        let key_directory = runtime
+            .authority
+            .sign_key_directory(&key_context, unsigned_directory)
+            .expect("sign strict bootstrap key directory");
+        verify_key_directory(
+            &machine_data.verifying_key(),
+            &signer,
+            &key_context,
+            &key_directory,
+        )
+        .expect("verify MachineData-signed key directory");
+
+        let response_info = pairing_response_info(pair_route, request_hash, &grant);
+        let response_context = pairing_outer_context(OuterFrameKind::PairResponse, pair_route);
+        let plaintext = PairResponsePlaintextV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            request_hash,
+            relay_grant: grant.clone(),
+            device_authorization: authorization,
+            key_directory,
+        };
+        let mut response_rng = DeterministicRng::new([0xb6; 32]);
+        let response = runtime
+            .authority
+            .seal_pair_response_with_rng_for_test(
+                &device_hpke_public,
+                &response_info,
+                &response_context,
+                &plaintext,
+                &mut response_rng,
+            )
+            .expect("seal typed PairResponse");
+        assert_eq!(
+            open_pair_response(
+                &device_hpke_private,
+                &response_info,
+                &response_context,
+                &response,
+                &machine_data.verifying_key(),
+                &signer,
+                &machine_root.verifying_key(),
+            )
+            .expect("open and verify PairResponse"),
+            plaintext
+        );
+
+        let revocation = runtime
+            .authority
+            .sign_device_revocation(unsigned_pairing_revocation(&grant))
+            .expect("sign typed DeviceRevocation");
+        verify_tbs(
+            &machine_root.verifying_key(),
+            &revocation.to_be_signed_v1(RELAY, sha256(&machine_root.verifying_key().to_bytes())),
+            &SignatureBytes::from(revocation.signature),
+        )
+        .expect("verify root-signed DeviceRevocation");
+
+        drop(runtime);
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_authority_entropy_failure_is_typed_and_never_panics() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let runtime = fixture
+            .transport
+            .take_pairing_runtime(fixture.data_cert.clone())
+            .expect("take pairing authority");
+        let pair_route = PairRouteId::from_bytes([0xb7; 16]);
+        let request_info = pairing_request_info(pair_route);
+        let request_context = pairing_outer_context(OuterFrameKind::PairPending, pair_route);
+        let (_, recipient) = HpkePrivateKey::derive_keypair(&[0xb8; 32]);
+        let calls = std::cell::Cell::new(0_usize);
+
+        let error = runtime
+            .authority
+            .seal_pair_pending_with_entropy_source(
+                &recipient,
+                &request_info,
+                &request_context,
+                [0xb9; 32],
+                |destination| {
+                    calls.set(calls.get() + 1);
+                    destination.fill(0xa5);
+                    Err(())
+                },
+            )
+            .expect_err("OS entropy failure must discard the HPKE artifact");
+        assert_eq!(calls.get(), 1, "authority requests one 256-bit CSPRNG seed");
+        assert_eq!(error.code(), "remote.transport.pairing_entropy_unavailable");
+
+        calls.set(0);
+        let key_info = KeyUpdateInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_server_id: RELAY,
+            machine_route: ROUTE,
+            device_route: DeviceRouteId::from_bytes([0xba; 16]),
+            stream_route: None,
+            grant_serial: GrantSerial::new(7),
+            root_trust_epoch: TrustEpoch::new(3),
+            key_directory_revision: KeyDirectoryRevision::new(1),
+            key_purpose: KeyPurpose::Catalog,
+            key_epoch: 1,
+        };
+        let key_context = OuterContextV1 {
+            frame_kind: OuterFrameKind::KeyUpdate,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            machine_route: Some(ROUTE),
+            device_route: Some(key_info.device_route),
+            stream_route: None,
+            request_route: None,
+            pair_route: None,
+            stream_generation: None,
+            stream_cursor: None,
+            stream_seq: None,
+            message_key_epoch: 1,
+        };
+        let error = runtime
+            .authority
+            .seal_key_directory_entry_with_entropy_source(
+                &recipient,
+                &key_info,
+                &key_context,
+                &SecretAeadKey::from_bytes([0xbb; 32]),
+                |destination| {
+                    calls.set(calls.get() + 1);
+                    destination.fill(0xa5);
+                    Err(())
+                },
+            )
+            .expect_err("key-wrap entropy failure must discard the HPKE artifact");
+        assert_eq!(calls.get(), 1, "key wrap requests one 256-bit CSPRNG seed");
+        assert_eq!(error.code(), "remote.transport.pairing_entropy_unavailable");
+
+        drop(runtime);
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_runtime_rejects_wrong_data_cert_role_relay_and_route_without_consuming_lane() {
+        let root = SigningKey::from_seed(&[0x31; 32]);
+        for (certificate, expected) in [
+            (
+                {
+                    let mut certificate = signed_data_certificate(&root, RELAY, ROUTE);
+                    certificate.cert_role = agentdeck_protocol::relay_v2::CertRole::Link;
+                    certificate
+                },
+                "daemon.remote.certificate.role_mismatch",
+            ),
+            (
+                signed_data_certificate(&root, RelayServerId::from_bytes([0xee; 16]), ROUTE),
+                "daemon.remote.certificate.signature_invalid",
+            ),
+            (
+                signed_data_certificate(&root, RELAY, MachineRouteId::from_bytes([0xef; 16])),
+                "daemon.remote.certificate.signature_invalid",
+            ),
+        ] {
+            let mut fixture = connected_fixture(Vec::new(), None).await;
+            assert_eq!(
+                fixture
+                    .transport
+                    .take_pairing_runtime(certificate)
+                    .expect_err("wrong data cert context")
+                    .code(),
+                expected
+            );
+            let runtime = fixture
+                .transport
+                .take_pairing_runtime(fixture.data_cert.clone())
+                .expect("failed validation must not consume the lane");
+            drop(runtime);
+            fixture.transport.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pairing_authority_weak_owner_does_not_block_reclaim_and_fails_after_shutdown() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let runtime = fixture
+            .transport
+            .take_pairing_runtime(fixture.data_cert.clone())
+            .unwrap();
+        let mut start_permit = Some(0xa5_u8);
+        let reclaimed = shutdown_and_take_start_permit(
+            &mut fixture.transport.supervisor,
+            &mut fixture.transport.authenticator,
+            &mut start_permit,
+        )
+        .await
+        .expect("Weak authority must not keep the authenticator shared");
+        assert_eq!(reclaimed, 0xa5);
+        assert_eq!(
+            runtime.authority.invite_anchor().unwrap_err().code(),
+            "remote.transport.closed"
+        );
+        assert_eq!(fixture.owner_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pairing_lane_typed_reconnect_forwards_and_clears_ephemeral_route_binding() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let PairingRuntimeParts {
+            mut lane,
+            authority: _,
+        } = fixture
+            .transport
+            .take_pairing_runtime(fixture.data_cert.clone())
+            .unwrap();
+        let pair_route = PairRouteId::from_bytes([0xad; 16]);
+        open_bound_route(&mut lane, &fixture.harness, pair_route, 10_009).await;
+        lane.reconnect().await.expect("typed reconnect forwarding");
+        assert_eq!(fixture.harness.reconnects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            lane.send_pair_data(PairData {
+                pair_route,
+                sealed_blob: SealedBlob(vec![1]),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            "remote.transport.pairing_binding_mismatch"
+        );
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_data_and_route_accepted_are_typed_but_not_delivery_proof() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        let pair_route = PairRouteId::from_bytes([0xa2; 16]);
+        open_bound_route(&mut lane, &fixture.harness, pair_route, 10_001).await;
+
+        let data = PairData {
+            pair_route,
+            sealed_blob: SealedBlob(vec![1, 2, 3]),
+        };
+        lane.send_pair_data(data.clone()).await.expect("send data");
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::PairData(data.clone())));
+        assert!(matches!(
+            lane.next_event().await.unwrap(),
+            Some(PairingTransportEvent::PairData(observed)) if observed == data
+        ));
+
+        let accepted = RouteAccepted {
+            accepted: AcceptedRef::PairFrame { pair_route },
+        };
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::RouteAccepted(accepted.clone())));
+        let event = lane.next_event().await.unwrap().unwrap();
+        assert!(matches!(
+            &event,
+            PairingTransportEvent::PairFrameAccepted(observed) if observed == &accepted
+        ));
+        assert!(
+            !format!("{event:?}").contains("delivered"),
+            "Relay writer acceptance is never endpoint delivery proof"
+        );
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_close_accepts_closed_and_already_absent_for_the_bound_route() {
+        for outcome in [
+            PairRouteCloseOutcome::Closed,
+            PairRouteCloseOutcome::AlreadyAbsent,
+        ] {
+            let mut fixture = connected_fixture(Vec::new(), None).await;
+            let mut lane = fixture
+                .transport
+                .take_pairing_lane(fixture.data_cert.clone())
+                .unwrap();
+            let pair_route = PairRouteId::from_bytes([0xa3; 16]);
+            open_bound_route(&mut lane, &fixture.harness, pair_route, 10_002).await;
+            lane.send_close_pair_route(ClosePairRoute {
+                machine_route: ROUTE,
+                pair_route,
+            })
+            .await
+            .expect("send close");
+            let closed = PairRouteClosed {
+                pair_route,
+                outcome,
+            };
+            fixture
+                .harness
+                .push_incoming(frame(RelayFrameBody::PairRouteClosed(closed.clone())));
+            assert!(matches!(
+                lane.next_event().await.unwrap(),
+                Some(PairingTransportEvent::PairRouteClosed(observed)) if observed == closed
+            ));
+            fixture.transport.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pairing_grant_and_revocation_terminals_match_device_serial_and_frozen_bytes() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        let device_route = DeviceRouteId::from_bytes([0xb1; 16]);
+        let grant = relay_grant(device_route, 7);
+        lane.send_install_grant(InstallGrant {
+            grant: grant.clone(),
+        })
+        .await
+        .expect("send grant");
+        let grant_commit = GrantCommitted {
+            device_route,
+            grant_serial: grant.grant_serial,
+            grant_hash: grant.canonical_sha256(),
+        };
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::GrantCommitted(grant_commit.clone())));
+        assert!(matches!(
+            lane.next_event().await.unwrap(),
+            Some(PairingTransportEvent::GrantCommitted(observed)) if observed == grant_commit
+        ));
+
+        let revocation = device_revocation(device_route, 7);
+        lane.send_revoke_device(RevokeDevice {
+            revocation: revocation.clone(),
+        })
+        .await
+        .expect("send revoke");
+        let revoke_commit = RevocationCommitted {
+            device_route,
+            grant_serial: revocation.grant_serial,
+            signed_revocation: revocation,
+        };
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::RevocationCommitted(
+                revoke_commit.clone(),
+            )));
+        assert!(matches!(
+            lane.next_event().await.unwrap(),
+            Some(PairingTransportEvent::RevocationCommitted(observed)) if observed == revoke_commit
+        ));
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_exact_duplicate_terminal_acks_are_idempotent_within_the_generation() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+
+        let pair_route = PairRouteId::from_bytes([0xc1; 16]);
+        open_bound_route(&mut lane, &fixture.harness, pair_route, 10_011).await;
+        let close = ClosePairRoute {
+            machine_route: ROUTE,
+            pair_route,
+        };
+        lane.send_close_pair_route(close.clone()).await.unwrap();
+        lane.send_close_pair_route(close).await.unwrap();
+        for outcome in [
+            PairRouteCloseOutcome::Closed,
+            PairRouteCloseOutcome::AlreadyAbsent,
+        ] {
+            fixture
+                .harness
+                .push_incoming(frame(RelayFrameBody::PairRouteClosed(PairRouteClosed {
+                    pair_route,
+                    outcome,
+                })));
+            assert!(matches!(
+                lane.next_event().await.unwrap(),
+                Some(PairingTransportEvent::PairRouteClosed(PairRouteClosed {
+                    pair_route: observed,
+                    outcome: observed_outcome,
+                })) if observed == pair_route && observed_outcome == outcome
+            ));
+        }
+
+        let device_route = DeviceRouteId::from_bytes([0xc2; 16]);
+        let grant = relay_grant(device_route, 11);
+        let install = InstallGrant {
+            grant: grant.clone(),
+        };
+        lane.send_install_grant(install.clone()).await.unwrap();
+        lane.send_install_grant(install).await.unwrap();
+        let grant_commit = GrantCommitted {
+            device_route,
+            grant_serial: grant.grant_serial,
+            grant_hash: grant.canonical_sha256(),
+        };
+        for _ in 0..2 {
+            fixture
+                .harness
+                .push_incoming(frame(RelayFrameBody::GrantCommitted(grant_commit.clone())));
+            assert!(matches!(
+                lane.next_event().await.unwrap(),
+                Some(PairingTransportEvent::GrantCommitted(observed)) if observed == grant_commit
+            ));
+        }
+
+        let revocation = device_revocation(device_route, 11);
+        let revoke = RevokeDevice {
+            revocation: revocation.clone(),
+        };
+        lane.send_revoke_device(revoke.clone()).await.unwrap();
+        lane.send_revoke_device(revoke).await.unwrap();
+        let revoke_commit = RevocationCommitted {
+            device_route,
+            grant_serial: revocation.grant_serial,
+            signed_revocation: revocation,
+        };
+        for _ in 0..2 {
+            fixture
+                .harness
+                .push_incoming(frame(RelayFrameBody::RevocationCommitted(
+                    revoke_commit.clone(),
+                )));
+            assert!(matches!(
+                lane.next_event().await.unwrap(),
+                Some(PairingTransportEvent::RevocationCommitted(observed))
+                    if observed == revoke_commit
+            ));
+        }
+
+        assert_eq!(fixture.transport.observed_failure_code(), None);
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_outbound_rejects_wrong_machine_pair_device_serial_and_oversize() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        let pair_route = PairRouteId::from_bytes([0xa4; 16]);
+        let other_pair = PairRouteId::from_bytes([0xa5; 16]);
+        let mut wrong_open = open_pair_route(pair_route, 10_003);
+        wrong_open.machine_route = MachineRouteId::from_bytes([0xff; 16]);
+        assert_eq!(
+            lane.send_open_pair_route(wrong_open)
+                .await
+                .unwrap_err()
+                .code(),
+            "remote.transport.route_mismatch"
+        );
+        assert_eq!(
+            lane.send_pair_data(PairData {
+                pair_route: other_pair,
+                sealed_blob: SealedBlob(vec![1]),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            "remote.transport.pairing_binding_mismatch"
+        );
+
+        let mut wrong_grant = relay_grant(DeviceRouteId::from_bytes([0xb2; 16]), 8);
+        wrong_grant.machine_route = MachineRouteId::from_bytes([0xfe; 16]);
+        assert_eq!(
+            lane.send_install_grant(InstallGrant { grant: wrong_grant })
+                .await
+                .unwrap_err()
+                .code(),
+            "remote.transport.route_mismatch"
+        );
+        let zero_serial = device_revocation(DeviceRouteId::from_bytes([0xb3; 16]), 0);
+        assert_eq!(
+            lane.send_revoke_device(RevokeDevice {
+                revocation: zero_serial,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            "remote.transport.pairing_binding_mismatch"
+        );
+        assert_eq!(
+            lane.send_pair_data(PairData {
+                pair_route,
+                sealed_blob: SealedBlob(vec![0; agentdeck_protocol::relay_v2::MAX_FRAME_BYTES]),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            "relay.client.frame_too_large"
+        );
+        assert!(fixture.harness.sent.lock().expect("lock sent").is_empty());
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_lane_rejects_unsigned_wrong_root_and_wrong_trust_authority() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        let device_route = DeviceRouteId::from_bytes([0xc3; 16]);
+
+        let mut unsigned_grant = relay_grant(device_route, 12);
+        unsigned_grant.signature = Ed25519Signature([0; 64]);
+        assert_eq!(
+            lane.send_install_grant(InstallGrant {
+                grant: unsigned_grant,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            "remote.transport.pairing_authority_mismatch"
+        );
+
+        let mut wrong_root_grant = relay_grant(device_route, 12);
+        wrong_root_grant.signature = Ed25519Signature([0xd1; 64]);
+        assert_eq!(
+            lane.send_install_grant(InstallGrant {
+                grant: wrong_root_grant,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            "remote.transport.pairing_crypto_failed"
+        );
+
+        let mut wrong_trust_grant = relay_grant(device_route, 12);
+        wrong_trust_grant.trust_epoch = TrustEpoch::new(4);
+        assert_eq!(
+            lane.send_install_grant(InstallGrant {
+                grant: wrong_trust_grant,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            "remote.transport.pairing_authority_mismatch"
+        );
+
+        let mut unsigned_revocation = device_revocation(device_route, 12);
+        unsigned_revocation.signature = Ed25519Signature([0; 64]);
+        assert_eq!(
+            lane.send_revoke_device(RevokeDevice {
+                revocation: unsigned_revocation,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            "remote.transport.pairing_authority_mismatch"
+        );
+
+        assert!(fixture.harness.sent.lock().expect("lock sent").is_empty());
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_inbound_wrong_open_grant_or_revocation_binding_fails_closed() {
+        let mut open_fixture = connected_fixture(Vec::new(), None).await;
+        let mut open_lane = open_fixture
+            .transport
+            .take_pairing_lane(open_fixture.data_cert.clone())
+            .unwrap();
+        let pair_route = PairRouteId::from_bytes([0xa6; 16]);
+        open_lane
+            .send_open_pair_route(open_pair_route(pair_route, 10_004))
+            .await
+            .unwrap();
+        open_fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::PairRouteOpened(PairRouteOpened {
+                machine_route: ROUTE,
+                pair_route,
+                absolute_expiry_ms: 10_005,
+            })));
+        assert_eq!(
+            open_lane.next_event().await.unwrap_err().code(),
+            "remote.transport.pairing_binding_mismatch"
+        );
+        assert_eq!(open_fixture.harness.shutdowns.load(Ordering::SeqCst), 1);
+        open_fixture.transport.shutdown().await;
+
+        let mut grant_fixture = connected_fixture(Vec::new(), None).await;
+        let mut grant_lane = grant_fixture
+            .transport
+            .take_pairing_lane(grant_fixture.data_cert.clone())
+            .unwrap();
+        let device_route = DeviceRouteId::from_bytes([0xb4; 16]);
+        let grant = relay_grant(device_route, 9);
+        grant_lane
+            .send_install_grant(InstallGrant {
+                grant: grant.clone(),
+            })
+            .await
+            .unwrap();
+        grant_fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::GrantCommitted(GrantCommitted {
+                device_route,
+                grant_serial: GrantSerial::new(10),
+                grant_hash: grant.canonical_sha256(),
+            })));
+        assert_eq!(
+            grant_lane.next_event().await.unwrap_err().code(),
+            "remote.transport.pairing_binding_mismatch"
+        );
+        grant_fixture.transport.shutdown().await;
+
+        let mut revoke_fixture = connected_fixture(Vec::new(), None).await;
+        let mut revoke_lane = revoke_fixture
+            .transport
+            .take_pairing_lane(revoke_fixture.data_cert.clone())
+            .unwrap();
+        let revocation = device_revocation(device_route, 9);
+        revoke_lane
+            .send_revoke_device(RevokeDevice {
+                revocation: revocation.clone(),
+            })
+            .await
+            .unwrap();
+        let mut changed = revocation;
+        changed.signature = Ed25519Signature([0xee; 64]);
+        revoke_fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::RevocationCommitted(
+                RevocationCommitted {
+                    device_route,
+                    grant_serial: GrantSerial::new(9),
+                    signed_revocation: changed,
+                },
+            )));
+        assert_eq!(
+            revoke_lane.next_event().await.unwrap_err().code(),
+            "remote.transport.pairing_binding_mismatch"
+        );
+        revoke_fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_ninth_unconsumed_event_fails_closed_with_stable_lag_code() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        let pair_route = PairRouteId::from_bytes([0xa7; 16]);
+        lane.send_open_pair_route(open_pair_route(pair_route, 10_006))
+            .await
+            .unwrap();
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::PairRouteOpened(PairRouteOpened {
+                machine_route: ROUTE,
+                pair_route,
+                absolute_expiry_ms: 10_006,
+            })));
+        for value in 0..8 {
+            fixture
+                .harness
+                .push_incoming(frame(RelayFrameBody::PairData(PairData {
+                    pair_route,
+                    sealed_blob: SealedBlob(vec![value]),
+                })));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if fixture.transport.observed_failure_code().as_deref()
+                    == Some("remote.transport.pairing_lagged")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lag must be observed without polling the lane");
+        assert_eq!(
+            lane.next_event().await.unwrap_err().code(),
+            "remote.transport.pairing_lagged"
+        );
+        assert_eq!(fixture.harness.shutdowns.load(Ordering::SeqCst), 1);
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_safe_failure_and_restart_wake_waiter_without_leaking_detail() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::Error(RelayFailure::new(
+                "relay.pair.conflict",
+                "secret pairing detail",
+            ))));
+        let error = lane.next_event().await.unwrap_err();
+        assert_eq!(error.code(), "relay.pair.conflict");
+        assert!(!format!("{error:?}").contains("secret pairing detail"));
+        assert!(matches!(
+            fixture.transport.next_control().await.unwrap(),
+            Some(RemoteControl::SafeFailure(_))
+        ));
+
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::ServerRestarting(ServerRestarting {
+                drain_deadline_ms: 123,
+            })));
+        assert_eq!(
+            lane.next_event().await.unwrap_err().code(),
+            "remote.transport.server_restarting"
+        );
+        assert!(matches!(
+            fixture.transport.next_control().await.unwrap(),
+            Some(RemoteControl::ServerRestarting(_))
+        ));
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_reader_error_wakes_waiter_and_reconnect_keeps_the_same_lane() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        fixture.harness.push_error("relay.client.connection_lost");
+        assert_eq!(
+            lane.next_event().await.unwrap_err().code(),
+            "relay.client.connection_lost"
+        );
+        fixture
+            .transport
+            .reconnect()
+            .await
+            .expect("reconnect generation");
+        let pair_route = PairRouteId::from_bytes([0xa8; 16]);
+        open_bound_route(&mut lane, &fixture.harness, pair_route, 10_007).await;
+        assert_eq!(fixture.harness.reconnects.load(Ordering::SeqCst), 1);
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_reconnect_discards_queued_events_from_the_old_generation() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        let pair_route = PairRouteId::from_bytes([0xc4; 16]);
+        lane.send_open_pair_route(open_pair_route(pair_route, 10_012))
+            .await
+            .unwrap();
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::PairRouteOpened(PairRouteOpened {
+                machine_route: ROUTE,
+                pair_route,
+                absolute_expiry_ms: 10_012,
+            })));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while lane.event_rx.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old generation event entered the bounded lane");
+
+        fixture.harness.push_error("relay.client.connection_lost");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while lane.health_rx.borrow().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old generation failure became observable");
+        lane.reconnect()
+            .await
+            .expect("reconnect pairing generation");
+        lane.send_open_pair_route(open_pair_route(pair_route, 10_012))
+            .await
+            .expect("durable outbox reopens exact route");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), lane.next_event(),)
+                .await
+                .is_err(),
+            "queued PairRouteOpened from the old generation cannot satisfy reopen"
+        );
+
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::PairRouteOpened(PairRouteOpened {
+                machine_route: ROUTE,
+                pair_route,
+                absolute_expiry_ms: 10_012,
+            })));
+        assert!(matches!(
+            lane.next_event().await.unwrap(),
+            Some(PairingTransportEvent::PairRouteOpened(PairRouteOpened {
+                pair_route: observed,
+                ..
+            })) if observed == pair_route
+        ));
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_taken_pairing_lane_and_retirement_surface_does_not_regress() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        let committed = RetirementCommitted {
+            machine_route: ROUTE,
+            trust_epoch: TrustEpoch::new(4),
+            retire_hash: retirement().canonical_sha256(),
+        };
+        fixture
+            .transport
+            .send_retirement(retirement())
+            .await
+            .expect("retirement still uses the same supervisor");
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::RetirementCommitted(
+                committed.clone(),
+            )));
+        assert!(matches!(
+            fixture.transport.next_control().await.unwrap(),
+            Some(RemoteControl::RetirementTerminal(terminal)) if terminal.committed() == &committed
+        ));
+
+        let waiter = tokio::spawn(async move { lane.next_event().await });
+        tokio::task::yield_now().await;
+        fixture.transport.shutdown().await;
+        assert_eq!(
+            waiter
+                .await
+                .expect("join pairing waiter")
+                .unwrap_err()
+                .code(),
+            "remote.transport.closed"
+        );
+        assert_eq!(fixture.harness.shutdowns.load(Ordering::SeqCst), 1);
     }
 }

@@ -50,6 +50,10 @@ use super::native_metadata::{
     NativeMutationCoordinator, NativeMutationCoordinatorError, NativeMutationOutcome,
 };
 use super::native_projector::NativeProjector;
+use super::pairing_administration::{
+    DisabledPairingAdministration, PairingAdministration, PairingAdministrationError,
+    PairingPendingSink, RuntimePairingPendingSink,
+};
 use super::process_identity::SystemProcessGroupController;
 use super::read_pool::{DEFAULT_RUNTIME_READ_CONCURRENCY, ReadPool, ReadPoolError};
 use super::recovery::{
@@ -58,6 +62,9 @@ use super::recovery::{
 };
 use super::remote_administration::{
     DisabledRemoteAdministration, RemoteAdministration, RemoteAdministrationError,
+};
+use super::revocation_administration::{
+    DisabledRevocationAdministration, RevocationAdministration, RevocationAdministrationError,
 };
 use super::router::AgentRouter;
 use super::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
@@ -108,6 +115,8 @@ pub struct RuntimeCore {
     native_mutations: NativeMutationCoordinator,
     upgrade: Arc<dyn UpgradeService>,
     remote_administration: Arc<dyn RemoteAdministration>,
+    pairing_administration: Arc<dyn PairingAdministration>,
+    revocation_administration: Arc<dyn RevocationAdministration>,
     recovery_identity: Arc<()>,
     recovery: RuntimeRecoveryCoordinator,
     read_pool: ReadPool,
@@ -189,6 +198,35 @@ impl RuntimeCore {
         self
     }
 
+    /// production composition 注入 daemon-private pairing owner。Core 只保留中立
+    /// local administration capability，不取得 Relay/crypto/Store 状态机类型。
+    #[doc(hidden)]
+    pub fn with_pairing_administration(
+        mut self,
+        pairing_administration: Arc<dyn PairingAdministration>,
+    ) -> Self {
+        self.pairing_administration = pairing_administration;
+        self
+    }
+
+    /// production composition 注入 daemon-private revocation owner。Core 只保留
+    /// DeviceHandle/GrantSerial 中立 capability，不取得 auth ledger 或 Relay 类型。
+    #[doc(hidden)]
+    pub fn with_revocation_administration(
+        mut self,
+        revocation_administration: Arc<dyn RevocationAdministration>,
+    ) -> Self {
+        self.revocation_administration = revocation_administration;
+        self
+    }
+
+    /// 返回只持有 bounded connection registry 的弱耦合 pending sink；RemoteManager
+    /// 可在 Core 被 `Arc` 包装后单次安装，不形成 Core↔manager 强引用环。
+    #[doc(hidden)]
+    pub fn pairing_pending_sink(&self) -> Arc<dyn PairingPendingSink> {
+        Arc::new(RuntimePairingPendingSink::new(self.connections.clone()))
+    }
+
     fn with_execution_coordinator(
         store: RuntimeStoreHandle,
         router: Arc<AgentRouter>,
@@ -256,6 +294,8 @@ impl RuntimeCore {
             native_mutations,
             upgrade: Arc::new(DisabledUpgradeService),
             remote_administration: Arc::new(DisabledRemoteAdministration),
+            pairing_administration: Arc::new(DisabledPairingAdministration),
+            revocation_administration: Arc::new(DisabledRevocationAdministration),
             recovery_identity,
             recovery,
             read_pool: ReadPool::new(DEFAULT_RUNTIME_READ_CONCURRENCY)?,
@@ -376,7 +416,7 @@ impl RuntimeCore {
         }
     }
 
-    /// 所有 Runtime v3 transport 共用的完整 envelope 入口。directed reply 严格复用
+    /// 所有 Runtime v4 transport 共用的完整 envelope 入口。directed reply 严格复用
     /// 原 request messageId，并进入 connection-owned reply pump；本方法不等待 socket。
     pub async fn handle_envelope(
         &self,
@@ -1169,19 +1209,72 @@ impl RuntimeCore {
                     .map(RuntimeReply::MachineRemoteStatus)
                     .map_err(remote_administration_error)
             }
-            RuntimeRequest::CreatePairInvite(_)
-            | RuntimeRequest::ListPendingPairings { .. }
-            | RuntimeRequest::ConfirmPairing { .. }
-            | RuntimeRequest::CancelPairing { .. } => {
-                let _authorization = principal.try_enter_local_administration()?;
-                Err(RuntimeCoreError::FeatureUnavailable)
+            RuntimeRequest::CreatePairInvite(request) => {
+                let authorization = principal.try_enter_local_administration()?;
+                let owner = principal.idempotency_owner();
+                let result = self
+                    .pairing_administration
+                    .create(owner, request)
+                    .await
+                    .map(RuntimeReply::PairInvite)
+                    .map_err(pairing_administration_error);
+                drop(authorization);
+                result
             }
-            RuntimeRequest::Revoke(request) => {
-                if matches!(request.target, RevokeTarget::Device { .. }) {
-                    let _authorization = principal.try_enter_local_administration()?;
+            RuntimeRequest::ListPendingPairings { .. } => {
+                let authorization = principal.try_enter_local_administration()?;
+                let result = self
+                    .pairing_administration
+                    .list()
+                    .await
+                    .map(|pairings| RuntimeReply::PendingPairings { pairings })
+                    .map_err(pairing_administration_error);
+                drop(authorization);
+                result
+            }
+            RuntimeRequest::ConfirmPairing { pairing_id, .. } => {
+                let authorization = principal.try_enter_local_administration()?;
+                let pairing_id = parse_pairing_id(&pairing_id)?;
+                let result = self
+                    .pairing_administration
+                    .confirm(pairing_id)
+                    .await
+                    .map(RuntimeReply::Pairing)
+                    .map_err(pairing_administration_error);
+                drop(authorization);
+                result
+            }
+            RuntimeRequest::CancelPairing { pairing_id, .. } => {
+                let authorization = principal.try_enter_local_administration()?;
+                let pairing_id = parse_pairing_id(&pairing_id)?;
+                let result = self
+                    .pairing_administration
+                    .cancel(pairing_id)
+                    .await
+                    .map(RuntimeReply::Pairing)
+                    .map_err(pairing_administration_error);
+                drop(authorization);
+                result
+            }
+            RuntimeRequest::Revoke(request) => match request.target {
+                RevokeTarget::Device {
+                    device,
+                    grant_serial,
+                    ..
+                } => {
+                    let authorization = principal.try_enter_local_administration()?;
+                    let result = self
+                        .revocation_administration
+                        .revoke_device(device, grant_serial)
+                        .await
+                        .map(RuntimeReply::Revocation)
+                        .map_err(revocation_administration_error);
+                    drop(authorization);
+                    result
                 }
-                Err(RuntimeCoreError::FeatureUnavailable)
-            }
+                // SelfDevice 属后续 authenticated RemoteLink；本地管理 seam 不得代办。
+                RevokeTarget::SelfDevice => Err(RuntimeCoreError::FeatureUnavailable),
+            },
             RuntimeRequest::StageUpgrade(_) => {
                 let failure = match principal.try_enter_local_administration() {
                     Ok(_authorization) => RuntimeCoreError::FeatureUnavailable,
@@ -1495,6 +1588,10 @@ pub(crate) enum RuntimeCoreError {
     CommandNotFound,
     #[error("remote administration failed: {0:?}")]
     RemoteAdministration(RemoteAdministrationError),
+    #[error("pairing administration failed: {0:?}")]
+    PairingAdministration(PairingAdministrationError),
+    #[error("revocation administration failed: {0:?}")]
+    RevocationAdministration(RevocationAdministrationError),
     #[error(transparent)]
     HistoryReceipt(#[from] HistoryOnlyReceiptError),
     #[error(transparent)]
@@ -1560,6 +1657,12 @@ impl RuntimeCoreError {
             ),
             Self::RemoteAdministration(error) => {
                 RuntimeFailure::new(error.code(), "machine remote administration failed")
+            }
+            Self::PairingAdministration(error) => {
+                RuntimeFailure::new(error.code(), "pairing administration failed")
+            }
+            Self::RevocationAdministration(error) => {
+                RuntimeFailure::new(error.code(), "device revocation administration failed")
             }
             Self::HistoryReceipt(_) => RuntimeFailure::new(
                 DAEMON_RUNTIME_READ_UNAVAILABLE,
@@ -1641,6 +1744,14 @@ impl RuntimeCoreError {
 
 fn remote_administration_error(error: RemoteAdministrationError) -> RuntimeCoreError {
     RuntimeCoreError::RemoteAdministration(error)
+}
+
+fn pairing_administration_error(error: PairingAdministrationError) -> RuntimeCoreError {
+    RuntimeCoreError::PairingAdministration(error)
+}
+
+fn revocation_administration_error(error: RevocationAdministrationError) -> RuntimeCoreError {
+    RuntimeCoreError::RevocationAdministration(error)
 }
 
 impl From<super::connection::PrincipalAccessError> for RuntimeCoreError {
@@ -1786,6 +1897,13 @@ fn parse_turn_id(value: &TurnId) -> Result<RuntimeId, RuntimeCoreError> {
 
 fn parse_approval_id(value: &ApprovalId) -> Result<RuntimeId, RuntimeCoreError> {
     RuntimeId::parse_canonical(RuntimeIdKind::Approval, value.as_str())
+        .map_err(|_| RuntimeCoreError::InvalidRequest)
+}
+
+fn parse_pairing_id(
+    value: &agentdeck_protocol::runtime::identity::PairingId,
+) -> Result<RuntimeId, RuntimeCoreError> {
+    RuntimeId::parse_canonical(RuntimeIdKind::Pairing, value.as_str())
         .map_err(|_| RuntimeCoreError::InvalidRequest)
 }
 

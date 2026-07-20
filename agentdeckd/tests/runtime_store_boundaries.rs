@@ -120,6 +120,9 @@ fn runtime_id(kind: RuntimeIdKind, sequence: u32) -> RuntimeId {
         RuntimeIdKind::Turn => 4,
         RuntimeIdKind::Event => 5,
         RuntimeIdKind::Approval => 8,
+        RuntimeIdKind::Pairing => 9,
+        RuntimeIdKind::PairRoute => 10,
+        RuntimeIdKind::RemoteOutbox => 11,
         RuntimeIdKind::AdapterState => 6,
         RuntimeIdKind::DaemonBoot => 7,
     };

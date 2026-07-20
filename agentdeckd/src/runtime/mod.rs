@@ -16,6 +16,7 @@ pub mod model;
 pub mod namespace;
 pub(crate) mod native_metadata;
 mod native_projector;
+pub(crate) mod pairing_administration;
 pub mod process_identity;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
@@ -24,6 +25,7 @@ pub(crate) mod publication;
 mod read_pool;
 pub mod recovery;
 pub(crate) mod remote_administration;
+pub(crate) mod revocation_administration;
 pub mod router;
 pub mod singleton;
 pub mod snapshot;
@@ -39,4 +41,10 @@ pub use connection::{
 pub(crate) use conversation::tests::FakeCoordinator;
 pub use core::{RecoveryReport, RuntimeCore};
 pub use hub::RuntimeHub;
+#[doc(hidden)]
+pub use pairing_administration::{
+    PairingAdministration, PairingAdministrationError, PairingPendingSink,
+};
+#[doc(hidden)]
+pub use revocation_administration::{RevocationAdministration, RevocationAdministrationError};
 pub use router::AgentRouter;

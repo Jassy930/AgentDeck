@@ -2,6 +2,7 @@
 //! 可观察 typed error，绝不静默）。
 
 use agentdeck_protocol::e2ee::E2eeError;
+use agentdeck_protocol::e2ee::PairingError;
 use agentdeck_protocol::relay_v2::RelayAdminPurgeReceiptError;
 
 /// Relay E2EE 密码学操作的 typed 错误。
@@ -19,6 +20,9 @@ pub enum CryptoError {
     /// Portable Relay admin receipt 的 shape / trust-anchor binding 非法。
     #[error("invalid Relay admin purge receipt: {0}")]
     InvalidRelayAdminPurgeReceipt(#[from] RelayAdminPurgeReceiptError),
+    /// Pairing DTO/canonical/context 结构非法。
+    #[error("invalid pairing material: {0}")]
+    InvalidPairing(#[from] PairingError),
     /// HPKE seal/open 失败（封装/解封装错误）。
     #[error("HPKE operation failed: {0}")]
     Hpke(&'static str),

@@ -26,6 +26,11 @@ impl SecretBytes {
         &self.0
     }
 
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) fn retained_capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
     fn expose_secret_mut(&mut self) -> &mut [u8] {
         &mut self.0
     }

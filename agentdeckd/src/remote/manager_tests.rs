@@ -2,23 +2,27 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentdeck_crypto::{
-    SigningKey, ValidatedRelayReceiptSignerIdentityV1, sha256, sign_relay_admin_purge_receipt,
+    HpkePrivateKey, SigningKey, ValidatedRelayReceiptSignerIdentityV1, sha256,
+    sign_relay_admin_purge_receipt,
 };
+use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, PairInviteV1};
 use agentdeck_protocol::relay_v2::frame::{RelayFrameBody, RetirementCommitted};
 use agentdeck_protocol::relay_v2::{
     Digest32, ENROLLMENT_BUNDLE_VERSION, EnrollmentBundleV2, EnrollmentCode,
-    MachineEnrollmentResponseV1, MachineRouteId, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION,
-    RELAY_RECEIPT_FORMAT_VERSION, RELAY_RECEIPT_KEY_GENERATION_MVP, RelayAdminPurgeReadbackV1,
-    RelayAdminPurgeReceiptTbsV1, RelayAdminPurgeReceiptV1, RelayAdminPurgeTombstoneV1,
-    RelayMachineTombstoneKindV1, RelayServerId, RootKeyId, TrustEpoch, admin_purge_tombstone_hash,
-    encode, enrollment_receipt_hash, purge_request_hash,
+    MachineEnrollmentResponseV1, MachineRouteId, OpaqueRouteFrame, PairRouteId, PublicKeyBytes,
+    RELAY_PROTOCOL_VERSION, RELAY_RECEIPT_FORMAT_VERSION, RELAY_RECEIPT_KEY_GENERATION_MVP,
+    RelayAdminPurgeReadbackV1, RelayAdminPurgeReceiptTbsV1, RelayAdminPurgeReceiptV1,
+    RelayAdminPurgeTombstoneV1, RelayMachineTombstoneKindV1, RelayServerId, RootKeyId, TrustEpoch,
+    admin_purge_tombstone_hash, encode, enrollment_receipt_hash, purge_request_hash,
 };
+use agentdeck_protocol::runtime::identity::{DeviceHandle, GrantSerial};
 use agentdeck_protocol::runtime::{
     ArtifactSha256, LocalOnlyAdministration, MachineEnrollRequest,
-    MachineRemoteLifecycle as WireLifecycle, TrustResetRequest, UninstallPurgePlanV1,
+    MachineRemoteLifecycle as WireLifecycle, RevocationReceipt, TrustResetRequest,
+    UninstallPurgePlanV1,
 };
 use agentdeck_relay_client::{RelayClientConfig, RelayClientError};
 
@@ -34,13 +38,16 @@ use crate::remote::identity::{
     MACHINE_LINK_SIGN_ACCOUNT, MACHINE_ROOT_SIGN_ACCOUNT,
 };
 use crate::remote::workflow::{EnrollmentEndpoint, MachineEnrollmentWorkflow};
+use crate::runtime::RevocationAdministration;
 use crate::runtime::remote_administration::RemoteAdministration;
+use crate::runtime::store::IdempotencyOwner;
+use crate::runtime::store::pairing::{PreparePairingInvite, PreparePairingInviteOutcome};
 use crate::runtime::store::{
     ActiveMachineEnrollmentState, LocalDeletedMachineEnrollmentState, MachineEnrollmentState,
     MachineRemoteLifecycle, MachineRemoteStateRecord, MachineTrustResetKind, RuntimeStoreConfig,
     RuntimeStoreHandle,
 };
-use crate::security::{KeyStore, MemoryKeyStore, load_or_create_storage_kek};
+use crate::security::{KeyStore, MemoryKeyStore, SecretBytes, load_or_create_storage_kek};
 
 use super::{
     PurgePlanSink, PurgeReservationResume, REMOTE_DISABLED, REMOTE_SHUTTING_DOWN, RemoteManager,
@@ -312,6 +319,72 @@ fn portable_admin_purge_receipt(active: &ActiveMachineEnrollmentState) -> RelayA
         .expect("sign manager portable purge receipt")
 }
 
+async fn seed_open_pairing_recovery(
+    store: &RuntimeStoreHandle,
+    active: &ActiveMachineEnrollmentState,
+) {
+    let private_bytes = [0x71; 32];
+    let private = HpkePrivateKey::from_bytes(&private_bytes).expect("valid manager test HPKE key");
+    let public: [u8; 32] = private
+        .public_key()
+        .to_bytes()
+        .try_into()
+        .expect("X25519 public key is 32 bytes");
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("manager test clock after epoch")
+            .as_millis(),
+    )
+    .expect("manager test clock fits u64");
+    let current_pin = active
+        .connection
+        .spki_pins
+        .first()
+        .expect("active enrollment has a pin")
+        .0;
+    let next_pin = active
+        .connection
+        .spki_pins
+        .get(1)
+        .map_or(current_pin, |pin| pin.0);
+    let invite = PairInviteV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        pair_route: PairRouteId::from_bytes([0x72; 16]),
+        invite_secret: [0x73; 32],
+        invite_hpke_pubkey: PublicKeyBytes(public),
+        wss_url: active.connection.public_wss_url.clone(),
+        relay_server_id: active.connection.relay_server_id,
+        current_spki_pin: current_pin,
+        next_spki_pin: next_pin,
+        expires_at_ms: now_ms + 300_000,
+        machine_root_pubkey: PublicKeyBytes(active.binding.root_public_key),
+        machine_root_fingerprint: active.binding.root_fingerprint,
+        data_sign_cert: active.data_cert.clone(),
+        machine_display_name: "root-lost-pairing".to_owned(),
+    }
+    .canonical_bytes()
+    .expect("canonical manager PairInvite");
+    let outcome = store
+        .prepare_pairing_invite(PreparePairingInvite::new(
+            IdempotencyOwner::Local {
+                machine_trust_domain: active.binding.root_fingerprint,
+                uid: 501,
+                client_installation_id: [0x74; 16],
+            },
+            "root-lost-pairing".to_owned(),
+            SecretBytes::new(invite),
+            SecretBytes::new(private_bytes.to_vec()),
+        ))
+        .await
+        .expect("seed durable PairRoute open recovery");
+    assert!(matches!(
+        outcome,
+        PreparePairingInviteOutcome::Prepared { .. }
+    ));
+}
+
 async fn prepare_retirement(fixture: &ManagerFixture) {
     let active = active_state(&fixture.store).await;
     let frozen = fixture
@@ -550,6 +623,26 @@ fn stopped_status_overrides_transient_failure_and_invalid_codes_are_sanitized() 
     assert_eq!(error.code(), REMOTE_DISABLED);
 }
 
+#[tokio::test]
+async fn transient_pairing_transport_health_clears_back_to_active_without_sticky_block() {
+    let fixture = active_fixture("pairing-health").await;
+    let durable = fixture.store.load_machine_enrollment_state().await.unwrap();
+    let blocked =
+        status_from_state(durable.as_ref(), Some("remote.transport.closed"), false).unwrap();
+    assert_eq!(blocked.lifecycle, WireLifecycle::Blocked);
+    assert_eq!(
+        blocked.failure_code.unwrap().as_str(),
+        "remote.transport.closed"
+    );
+
+    let recovered = status_from_state(durable.as_ref(), None, false).unwrap();
+    assert_eq!(recovered.lifecycle, WireLifecycle::Active);
+    assert!(recovered.failure_code.is_none());
+
+    fixture.store.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_offline_connect_keeps_exact_retry_owner_until_joined_shutdown() {
     let mut fixture = active_fixture("active-offline").await;
@@ -644,6 +737,120 @@ async fn shutdown_cancels_trust_reset_wait_before_taking_manager_mutex() {
     drop(manager);
     fixture.store.shutdown().await.unwrap();
     let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_waits_for_actor_without_holding_manager_mutex() {
+    let mut fixture = active_fixture("revocation-manager-mutex").await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let device = DeviceHandle::new("device-11111111111111111111111111111111");
+    let serial = GrantSerial::new(7);
+    let expected = RevocationReceipt::Committed {
+        grant_serial: serial,
+    };
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test = Some(
+            crate::remote::pairing::PairingCoordinatorHandle::revocation_test_double(
+                entered_tx,
+                release_rx,
+                expected.clone(),
+            ),
+        );
+    }
+
+    let operation_manager = Arc::clone(&manager);
+    let operation_device = device.clone();
+    let operation = tokio::spawn(async move {
+        operation_manager
+            .revoke_device(operation_device, serial)
+            .await
+    });
+    let observed = entered_rx.await.expect("actor receives revocation command");
+    assert_eq!(observed, (device, serial));
+    let guard = tokio::time::timeout(Duration::from_millis(100), manager.state.lock())
+        .await
+        .expect("manager mutex must be free while Relay ACK is pending");
+    drop(guard);
+    release_tx.send(()).expect("release fake actor ACK");
+    assert_eq!(operation.await.unwrap().unwrap(), expected);
+
+    let manager = match Arc::try_unwrap(manager) {
+        Ok(manager) => manager,
+        Err(_) => panic!("revocation test drops all manager owners"),
+    };
+    drop(manager);
+    fixture.store.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_reset_drain_waits_for_actor_without_holding_manager_mutex_and_resumes_failure() {
+    let mut fixture = active_fixture("drain-manager-mutex").await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test = Some(
+            crate::remote::pairing::PairingCoordinatorHandle::drain_test_double(
+                entered_tx, release_rx, resumed_tx,
+            ),
+        );
+    }
+
+    let operation_manager = Arc::clone(&manager);
+    let operation = tokio::spawn(async move {
+        operation_manager
+            .trust_reset(
+                TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                    .expect("ordinary root-present reset"),
+            )
+            .await
+    });
+    entered_rx
+        .await
+        .expect("pairing actor receives drain command");
+    let guard = tokio::time::timeout(Duration::from_millis(100), manager.state.lock())
+        .await
+        .expect("manager mutex must be free while pairing ACKs remain pending");
+    drop(guard);
+
+    release_tx
+        .send(Err(
+            crate::runtime::pairing_administration::PairingAdministrationError::new(
+                "daemon.runtime.store_unavailable",
+            ),
+        ))
+        .expect("release failed drain");
+    resumed_rx
+        .await
+        .expect("failed drain must be resumed before returning");
+    assert_eq!(
+        operation.await.unwrap().unwrap_err().code(),
+        "daemon.runtime.store_unavailable"
+    );
+
+    let manager = match Arc::try_unwrap(manager) {
+        Ok(manager) => manager,
+        Err(_) => panic!("all trust-reset mutex test owners must be joined"),
+    };
+    finish_fixture(manager, fixture).await;
 }
 
 #[tokio::test]
@@ -1488,6 +1695,66 @@ async fn root_lost_without_receipt_returns_blocked_old_axes_and_zero_network() {
     assert!(matches!(
         fixture.store.load_machine_enrollment_state().await.unwrap(),
         Some(MachineEnrollmentState::Active(_))
+    ));
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test]
+async fn portable_root_lost_receipt_bypasses_pair_route_recovery_and_scrubs_before_cleanup() {
+    let mut fixture = active_fixture("root-lost-pairing-recovery").await;
+    let active = active_state(&fixture.store).await;
+    seed_open_pairing_recovery(&fixture.store, &active).await;
+    let receipt = portable_admin_purge_receipt(&active);
+    assert_eq!(
+        fixture
+            .store
+            .list_pairing_recovery()
+            .await
+            .expect("read seeded pairing recovery")
+            .len(),
+        1
+    );
+
+    fixture
+        .keys
+        .delete(MACHINE_ROOT_SIGN_ACCOUNT)
+        .expect("simulate root loss with durable pairing recovery");
+    drop(fixture.identity.take());
+    let bootstrap =
+        reconcile_machine_identity(&fixture.config, &fixture.store, fixture.keys.as_ref())
+            .await
+            .expect("root-lost pairing bootstrap is remote-only blocked");
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        bootstrap,
+    )
+    .with_purge_plan_sink(Arc::new(RecordingPurgeSink::default()));
+    manager
+        .arm(remote_start_permit_for_test())
+        .await
+        .expect_err("root-lost state cannot start transport or pairing actor");
+
+    let request =
+        TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, Some(Box::new(receipt)))
+            .expect("typed portable root-lost request");
+    let status = manager
+        .trust_reset(request)
+        .await
+        .expect("signed absent proof atomically supersedes pending PairRoute close");
+    assert_eq!(status.lifecycle, WireLifecycle::LocalDeleted);
+    assert!(
+        fixture
+            .store
+            .list_pairing_recovery()
+            .await
+            .expect("read post-cleanup pairing recovery")
+            .is_empty()
+    );
+    assert!(matches!(
+        fixture.store.load_machine_enrollment_state().await.unwrap(),
+        Some(MachineEnrollmentState::LocalDeleted(_))
     ));
     finish_fixture(manager, fixture).await;
 }

@@ -1,6 +1,6 @@
 //! P1.1 中立性守护 —— 参照现有 `neutrality_tests.rs` 的属性名扫描做法。
 //!
-//! RuntimeEnvelope v3 是稳定中立身份层（design RC-9）。守护点：
+//! RuntimeEnvelope v4 是稳定中立身份层（design RC-9）。守护点：
 //! - 任何属性名都不得以 vendor 前缀开头（codex/openai/anthropic/claude）。
 //! - 任何属性名都不得使用 vendor thread/session 身份词
 //!   （threadId/sessionId/vendorThreadId/resumeReference 等）——稳定身份只能

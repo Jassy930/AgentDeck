@@ -201,10 +201,10 @@ fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
             continue;
         };
         // Capture threadId from any event that carries it
-        if thread_id.is_empty() {
-            if let Some(tid) = val.get("threadId").and_then(|v| v.as_str()) {
-                thread_id = tid.to_string();
-            }
+        if thread_id.is_empty()
+            && let Some(tid) = val.get("threadId").and_then(|v| v.as_str())
+        {
+            thread_id = tid.to_string();
         }
         let ev_type = val.get("type").and_then(|t| t.as_str());
         let is_complete = ev_type == Some("turnComplete");

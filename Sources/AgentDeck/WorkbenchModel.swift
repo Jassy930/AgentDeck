@@ -395,6 +395,8 @@ final class WorkbenchModel {
       return nil
     case .transferPart:
       throw WorkbenchModelError.unexpectedTransferPart
+    case .pairingPending:
+      return nil
     }
   }
 

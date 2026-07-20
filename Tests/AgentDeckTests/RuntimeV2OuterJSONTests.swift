@@ -5,13 +5,13 @@ import XCTest
 final class RuntimeV2OuterJSONTests: XCTestCase {
     func testRustJSONFixturesDecodeAndReencodeSemantically() throws {
         let fixtures = try loadFixtures()
-        XCTAssertEqual(fixtures.count, 103)
-        XCTAssertEqual(Set(fixtures.map(\.name)).count, 103)
+        XCTAssertEqual(fixtures.count, 110)
+        XCTAssertEqual(Set(fixtures.map(\.name)).count, 110)
 
         let envelopes = fixtures.filter { $0.wireType == "runtimeEnvelope" }
         let transfers = fixtures.filter { $0.wireType == "transferEnvelope" }
         let compact = fixtures.filter { $0.wireType == "runtimeTransferCarrierV1" }
-        XCTAssertEqual(envelopes.count, 101)
+        XCTAssertEqual(envelopes.count, 108)
         XCTAssertEqual(transfers.count, 1)
         XCTAssertEqual(compact.count, 1)
         XCTAssertEqual(Set(fixtures.filter { $0.wireType != "runtimeTransferCarrierV1" }.map(\.name)), Set(Self.expectedTypedPaths.keys))
@@ -25,7 +25,7 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
             let output = try JSONEncoder().encode(decoded)
             try assertJSONSemanticallyEqual(input, output, caseName: fixture.name)
         }
-        XCTAssertEqual(outerCounts, ["request": 29, "reply": 46, "stream": 26])
+        XCTAssertEqual(outerCounts, ["request": 29, "reply": 52, "stream": 27])
 
         let transfer = try XCTUnwrap(transfers.first)
         let input = try jsonData(transfer.value)
@@ -89,7 +89,7 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
         }
     }
 
-    func testCatalogPageCursorIsRequiredNullableAndPairTTLDefaultsOnlyWhenMissing() throws {
+    func testCatalogPageCursorIsRequiredNullableAndPairInviteUsesFixedTTL() throws {
         var catalog = try objectValue(try fixture(named: "requestCatalog").value)
         var body = try dictionary(catalog["body"])
         var payload = try dictionary(body["payload"])
@@ -110,13 +110,14 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
         var invite = try objectValue(try fixture(named: "requestCreatePairInvite").value)
         body = try dictionary(invite["body"])
         payload = try dictionary(body["payload"])
-        payload.removeValue(forKey: "ttlSecs")
+        XCTAssertNil(payload["ttlSecs"])
+        payload.removeValue(forKey: "idempotencyKey")
         body["payload"] = payload
         invite["body"] = body
-        let defaulted = try encodedObject(try decodeEnvelope(invite))
-        XCTAssertEqual(try payloadObject(defaulted)["ttlSecs"] as? Int, 300)
+        XCTAssertThrowsError(try decodeEnvelope(invite))
 
-        payload["ttlSecs"] = NSNull()
+        payload["idempotencyKey"] = "pair-invite-required-key"
+        payload["ttlSecs"] = 300
         body["payload"] = payload
         invite["body"] = body
         XCTAssertThrowsError(try decodeEnvelope(invite))
@@ -424,10 +425,17 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
         "replySyncComplete": "reply.syncComplete",
         "replyPairInvite": "reply.pairInvite",
         "replyPendingPairings": "reply.pendingPairings",
+        "replyPairingConfirmed": "reply.pairing.confirmed",
+        "replyPairingCanceled": "reply.pairing.canceled",
+        "replyPairingExpired": "reply.pairing.expired",
+        "replyPairingReplayed": "reply.pairing.replayed.grantCommitted",
+        "replyPairingAlreadyHandled": "reply.pairing.alreadyHandled.canceled",
+        "replyPairingFailed": "reply.pairing.failed",
         "replyMachineRemoteStatus": "reply.machineRemoteStatus.active",
         "replyFailure": "reply.failure",
         "streamCatalogDelta": "stream.catalogDelta.removed",
         "streamCatalogUpsert": "stream.catalogDelta.upserted",
+        "streamPairingPending": "stream.pairingPending",
         "eventCapabilitiesMulti": "stream.event.capabilities",
         "eventConfigurationChanged": "stream.event.configurationChanged",
         "eventCodexVendorPanel": "stream.event.vendorPanel.codex.placeholder",
@@ -613,6 +621,16 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
         case .transferPart: "reply.transferPart"
         case .pairInvite: "reply.pairInvite"
         case .pendingPairings: "reply.pendingPairings"
+        case .pairing(let receipt):
+            switch receipt {
+            case .confirmed: "reply.pairing.confirmed"
+            case .canceled: "reply.pairing.canceled"
+            case .expired: "reply.pairing.expired"
+            case .replayed(_, _, let state): "reply.pairing.replayed.\(state.rawValue)"
+            case .alreadyHandled(_, _, let state):
+                "reply.pairing.alreadyHandled.\(state.rawValue)"
+            case .failed: "reply.pairing.failed"
+            }
     case .machineRemoteStatus(let status):
       "reply.machineRemoteStatus.\(status.lifecycle.rawValue)"
         case .failure: "reply.failure"
@@ -628,6 +646,7 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
             }
         case .event(let event): try eventPath(event.body)
         case .transferPart: "stream.transferPart"
+        case .pairingPending: "stream.pairingPending"
         }
     }
 
@@ -696,7 +715,7 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
 
     private func loadFixtures() throws -> [Fixture] {
         let data = try Data(contentsOf: repositoryRoot
-            .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v3-wire.jsonl"))
+            .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v4-wire.jsonl"))
         let text = try XCTUnwrap(String(data: data, encoding: .utf8))
         return try text.split(separator: "\n").map { line in
             let object = try XCTUnwrap(

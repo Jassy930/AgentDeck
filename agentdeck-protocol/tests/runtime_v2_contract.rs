@@ -1,15 +1,19 @@
-//! RuntimeEnvelope v3 中立契约 —— contract / deny-unknown / limits 测试。
+//! RuntimeEnvelope v4 中立契约 —— contract / deny-unknown / limits 测试。
 //!
-//! 文件名保留 `runtime_v2_contract` 以避免无价值的测试目标重命名；current wire 已升为 v3。
-//! RuntimeEnvelope v3 是 UDS 与解密后远程链路的共同业务 wire（design §8.2.2）。
+//! 文件名保留 `runtime_v2_contract` 以避免无价值的测试目标重命名；current wire 已升为 v4。
+//! RuntimeEnvelope v4 是 UDS 与解密后远程链路的共同业务 wire（design §8.2.2）。
 
+use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, PairInviteV1};
 use agentdeck_protocol::relay_v2::enrollment::EnrollmentBundleV2;
-use agentdeck_protocol::relay_v2::id::{MachineRouteId, RelayServerId};
+use agentdeck_protocol::relay_v2::id::{
+    LinkGeneration, MachineRouteId, PairRouteId, RelayServerId,
+};
 use agentdeck_protocol::relay_v2::{
-    Ed25519Signature, RELAY_PROTOCOL_VERSION, RELAY_RECEIPT_FORMAT_VERSION,
-    RELAY_RECEIPT_KEY_GENERATION_MVP, RelayAdminPurgeReadbackV1, RelayAdminPurgeReceiptTbsV1,
-    RelayAdminPurgeReceiptV1, RelayAdminPurgeTombstoneV1, RelayMachineTombstoneKindV1,
-    RelayReceiptKeyId, RootKeyId, TrustEpoch, admin_purge_tombstone_hash, purge_request_hash,
+    CertRole, Ed25519Signature, PublicKeyBytes, RELAY_PROTOCOL_VERSION,
+    RELAY_RECEIPT_FORMAT_VERSION, RELAY_RECEIPT_KEY_GENERATION_MVP, RelayAdminPurgeReadbackV1,
+    RelayAdminPurgeReceiptTbsV1, RelayAdminPurgeReceiptV1, RelayAdminPurgeTombstoneV1,
+    RelayMachineTombstoneKindV1, RelayReceiptKeyId, RootKeyId, SignedCertificate, TrustEpoch,
+    admin_purge_tombstone_hash, purge_request_hash,
 };
 use agentdeck_protocol::runtime::command::{
     LocalOnlyAdministration, MAX_PROMPT_BYTES, PromptPayload, QueryReceiptSelector,
@@ -23,7 +27,8 @@ use agentdeck_protocol::runtime::identity::{
 };
 use agentdeck_protocol::runtime::receipt::{
     ApprovalDeliveryState, ApprovalReceipt, CancellationReceipt, CommandReceipt, CommandStatus,
-    CommandStatusReceipt, ConversationStartReceipt, RevocationReceipt,
+    CommandStatusReceipt, ConversationStartReceipt, PairingDecision, PairingReceipt, PairingState,
+    RevocationReceipt,
 };
 use agentdeck_protocol::runtime::sync::{
     BackfillChunk, BackfillRange, BackfillRequest, ConversationSnapshot, RuntimeInnerCursor,
@@ -152,7 +157,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn runtime_fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../protocol/agentdeck/fixtures/runtime-v3-wire.jsonl")
+        .join("../protocol/agentdeck/fixtures/runtime-v4-wire.jsonl")
 }
 
 fn sample_enrollment_bundle() -> EnrollmentBundleV2 {
@@ -172,6 +177,33 @@ fn sample_enrollment_bundle() -> EnrollmentBundleV2 {
         "expiresAtMs": 1_700_000_000_000u64
     }))
     .expect("valid shared enrollment bundle fixture")
+}
+
+fn sample_pair_invite(machine_display_name: impl Into<String>) -> PairInviteV1 {
+    PairInviteV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        pair_route: PairRouteId::from_bytes([0x91; 16]),
+        invite_secret: [0x92; 32],
+        invite_hpke_pubkey: PublicKeyBytes([0x93; 32]),
+        wss_url: "wss://relay.example.test/".to_owned(),
+        relay_server_id: RelayServerId::from_bytes([0x94; 16]),
+        current_spki_pin: [0x95; 32],
+        next_spki_pin: [0x96; 32],
+        expires_at_ms: 1_700_000_300_000,
+        machine_root_pubkey: PublicKeyBytes([0x97; 32]),
+        machine_root_fingerprint: Sha256::digest([0x97; 32]).into(),
+        data_sign_cert: SignedCertificate {
+            subject_pubkey: PublicKeyBytes([0x99; 32]),
+            cert_role: CertRole::Data,
+            generation: LinkGeneration::new(2),
+            root_key_id: RootKeyId::from_bytes([0x9a; 16]),
+            trust_epoch: TrustEpoch::new(7),
+            not_after_ms: Some(1_800_000_000_000),
+            signature: Ed25519Signature([0x9b; 64]),
+        },
+        machine_display_name: machine_display_name.into(),
+    }
 }
 
 fn sample_admin_purge_receipt() -> RelayAdminPurgeReceiptV1 {
@@ -405,7 +437,7 @@ fn render_runtime_wire_fixture() -> String {
             "requestCreatePairInvite",
             RuntimeRequest::CreatePairInvite(runtime::command::CreatePairInviteRequest {
                 display_name: "fixture machine".into(),
-                ttl_secs: 300,
+                idempotency_key: IdempotencyKey::new("pair-invite-request-1"),
                 scope: LocalOnlyAdministration::LocalOnly,
             }),
         ),
@@ -722,8 +754,7 @@ fn render_runtime_wire_fixture() -> String {
             "replyPairInvite",
             RuntimeReply::PairInvite(runtime::envelope::PairInvite {
                 pairing_id: PairingId::new("pairing-invite-1"),
-                display_name: "fixture machine".into(),
-                expires_at_ms: 456,
+                invite: Box::new(sample_pair_invite("fixture machine")),
             }),
         ),
         (
@@ -731,10 +762,55 @@ fn render_runtime_wire_fixture() -> String {
             RuntimeReply::PendingPairings {
                 pairings: vec![runtime::envelope::PendingPairing {
                     pairing_id: PairingId::new("pairing-pending-1"),
-                    device_fingerprint: "fixture fingerprint".into(),
+                    request_hash: [0xa1; 32],
+                    device_sign_fingerprint: [0xa2; 32],
                     requested_at_ms: 234,
+                    expires_at_ms: 456,
                 }],
             },
+        ),
+        (
+            "replyPairingConfirmed",
+            RuntimeReply::Pairing(PairingReceipt::Confirmed {
+                pairing_id: PairingId::new("pairing-confirmed-1"),
+            }),
+        ),
+        (
+            "replyPairingCanceled",
+            RuntimeReply::Pairing(PairingReceipt::Canceled {
+                pairing_id: PairingId::new("pairing-canceled-1"),
+            }),
+        ),
+        (
+            "replyPairingExpired",
+            RuntimeReply::Pairing(PairingReceipt::Expired {
+                pairing_id: PairingId::new("pairing-expired-1"),
+            }),
+        ),
+        (
+            "replyPairingReplayed",
+            RuntimeReply::Pairing(PairingReceipt::Replayed {
+                pairing_id: PairingId::new("pairing-replayed-1"),
+                decision: PairingDecision::Confirm,
+                state: PairingState::GrantCommitted,
+            }),
+        ),
+        (
+            "replyPairingAlreadyHandled",
+            RuntimeReply::Pairing(PairingReceipt::AlreadyHandled {
+                pairing_id: PairingId::new("pairing-handled-1"),
+                winner: PairingDecision::Cancel,
+                state: PairingState::Canceled,
+            }),
+        ),
+        (
+            "replyPairingFailed",
+            RuntimeReply::Pairing(PairingReceipt::Failed {
+                failure: RuntimeFailure::new(
+                    "daemon.pairing.state_conflict",
+                    "pairing state conflict",
+                ),
+            }),
         ),
         (
             "replyMachineRemoteStatus",
@@ -1327,6 +1403,20 @@ fn render_runtime_wire_fixture() -> String {
             RuntimeMessage::Stream(RuntimeStreamItem::TransferPart(transfer.clone())),
         ),
     ));
+    cases.push(fixture_case(
+        "streamPairingPending",
+        "runtimeEnvelope",
+        &envelope_with_id(
+            "message-pairing-pending-stream-1",
+            RuntimeMessage::Stream(RuntimeStreamItem::PairingPending(runtime::PendingPairing {
+                pairing_id: PairingId::new("pairing-pending-stream-1"),
+                request_hash: [0xb1; 32],
+                device_sign_fingerprint: [0xb2; 32],
+                requested_at_ms: 1_700_000_000_000,
+                expires_at_ms: 1_700_000_300_000,
+            })),
+        ),
+    ));
     let compact = RuntimeTransferCarrierV1::new(
         MessageId::new("message-transfer-compact-1"),
         RuntimeTransferChannel::Stream,
@@ -1350,7 +1440,7 @@ fn render_runtime_wire_fixture() -> String {
 }
 
 #[test]
-fn runtime_v3_wire_fixture_is_rust_produced_and_in_sync() {
+fn runtime_v4_wire_fixture_is_rust_produced_and_in_sync() {
     let expected = render_runtime_wire_fixture();
     let path = runtime_fixture_path();
     if std::env::var("UPDATE_WIRE_FIXTURES").as_deref() == Ok("1") {
@@ -1379,10 +1469,135 @@ fn runtime_v3_wire_fixture_is_rust_produced_and_in_sync() {
 }
 
 #[test]
-fn runtime_protocol_version_is_three_and_independent() {
-    assert_eq!(RUNTIME_PROTOCOL_VERSION, 3);
+fn runtime_protocol_version_is_four_and_independent() {
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 4);
     // 与 local IPC PROTOCOL_VERSION=2 彼此独立、不联动。
     assert_eq!(agentdeck_protocol::PROTOCOL_VERSION, 2);
+}
+
+#[test]
+fn runtime_v4_is_a_hard_cutover_for_root_signed_tbs() {
+    let invite = sample_pair_invite("hard-cutover");
+    let current = invite.data_sign_cert.to_be_signed_v1(
+        invite.relay_server_id,
+        MachineRouteId::from_bytes([0xc1; 16]),
+        invite.machine_root_fingerprint,
+    );
+    assert_eq!(current.runtime_protocol_version, 4);
+    let mut legacy_v3 = current.clone();
+    legacy_v3.runtime_protocol_version = 3;
+    assert_ne!(
+        current.encode(),
+        legacy_v3.encode(),
+        "v3-signed cert/grant material must not verify in the Runtime v4 trust domain"
+    );
+}
+
+#[test]
+fn runtime_v4_pairing_wire_is_strict_and_redacted() {
+    fn schema_has_property(value: &serde_json::Value, property: &str) -> bool {
+        match value {
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| schema_has_property(value, property)),
+            serde_json::Value::Object(object) => {
+                object
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|properties| properties.contains_key(property))
+                    || object
+                        .values()
+                        .any(|value| schema_has_property(value, property))
+            }
+            _ => false,
+        }
+    }
+
+    let create = RuntimeRequest::CreatePairInvite(runtime::CreatePairInviteRequest {
+        display_name: "Fixture Mac".to_owned(),
+        idempotency_key: IdempotencyKey::new("pair-create-1"),
+        scope: LocalOnlyAdministration::LocalOnly,
+    });
+    let create_json = serde_json::to_value(&create).unwrap();
+    assert_eq!(create_json["idempotencyKey"], "pair-create-1");
+    assert!(create_json.get("ttlSecs").is_none());
+    let mut caller_ttl = create_json;
+    caller_ttl["ttlSecs"] = serde_json::json!(300);
+    assert!(serde_json::from_value::<RuntimeRequest>(caller_ttl).is_err());
+    for invalid_name in [
+        "".to_owned(),
+        " leading".to_owned(),
+        "trailing ".to_owned(),
+        "bad\nname".to_owned(),
+        "x".repeat(129),
+    ] {
+        let invalid = serde_json::json!({
+            "request": "createPairInvite",
+            "displayName": invalid_name,
+            "idempotencyKey": "pair-create-invalid",
+            "scope": "localOnly",
+        });
+        assert!(serde_json::from_value::<RuntimeRequest>(invalid).is_err());
+    }
+
+    let create_schema = serde_json::to_value(schemars::schema_for!(
+        runtime::command::CreatePairInviteRequest
+    ))
+    .unwrap();
+    assert!(schema_has_property(&create_schema, "displayName"));
+    assert!(schema_has_property(&create_schema, "idempotencyKey"));
+    assert!(!schema_has_property(&create_schema, "display_name"));
+    assert!(!schema_has_property(&create_schema, "idempotency_key"));
+    assert_eq!(create_schema["additionalProperties"], false);
+
+    let receipt_schema = serde_json::to_value(schemars::schema_for!(PairingReceipt)).unwrap();
+    assert!(schema_has_property(&receipt_schema, "pairingId"));
+    assert!(!schema_has_property(&receipt_schema, "pairing_id"));
+
+    let reply = RuntimeReply::PairInvite(runtime::PairInvite {
+        pairing_id: PairingId::new("pairing-redacted-1"),
+        invite: Box::new(sample_pair_invite("Secret Fixture Mac")),
+    });
+    let debug = format!("{reply:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("Secret Fixture Mac"));
+    assert!(!debug.contains("relay.example.test"));
+
+    let pending = RuntimeStreamItem::PairingPending(runtime::PendingPairing {
+        pairing_id: PairingId::new("pairing-pending-strict-1"),
+        request_hash: [0xd1; 32],
+        device_sign_fingerprint: [0xd2; 32],
+        requested_at_ms: 10,
+        expires_at_ms: 20,
+    });
+    let pending_json = serde_json::to_value(&pending).unwrap();
+    let back: RuntimeStreamItem = serde_json::from_value(pending_json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(back).unwrap(), pending_json);
+    let mut short_hash = pending_json;
+    short_hash["requestHash"] = serde_json::json!("AA==");
+    assert!(serde_json::from_value::<RuntimeStreamItem>(short_hash).is_err());
+
+    for state in [
+        PairingState::RouteOpening,
+        PairingState::Unused,
+        PairingState::Preparing,
+        PairingState::AwaitingLocalConfirmation,
+        PairingState::GrantPreparing,
+        PairingState::GrantCommitted,
+        PairingState::OrphanRevoking,
+        PairingState::Delivered,
+        PairingState::Expired,
+        PairingState::Canceled,
+        PairingState::ClosedTombstone,
+    ] {
+        let receipt = RuntimeReply::Pairing(PairingReceipt::Replayed {
+            pairing_id: PairingId::new("pairing-state-1"),
+            decision: PairingDecision::Confirm,
+            state,
+        });
+        let wire = serde_json::to_value(&receipt).unwrap();
+        serde_json::from_value::<RuntimeReply>(wire).unwrap();
+    }
 }
 
 #[test]
@@ -1505,7 +1720,7 @@ fn uninstall_purge_plan_id_is_deterministic_bound_and_strict() {
 fn envelope_round_trips_a_request() {
     let env = envelope(RuntimeMessage::Request(sample_send_prompt()));
     let json = serde_json::to_value(&env).unwrap();
-    assert_eq!(json["version"], 3);
+    assert_eq!(json["version"], 4);
     assert_eq!(json["messageId"], "m1");
     // wire round-trip (composite DTOs embed non-PartialEq trunk types).
     let back: RuntimeEnvelope = serde_json::from_value(json.clone()).unwrap();
@@ -1640,7 +1855,7 @@ fn runtime_request_covers_all_brief_variants() {
         ),
         RuntimeRequest::CreatePairInvite(runtime::command::CreatePairInviteRequest {
             display_name: "MacBook".into(),
-            ttl_secs: 300,
+            idempotency_key: IdempotencyKey::new("pair-invite-1"),
             scope: LocalOnlyAdministration::LocalOnly,
         }),
         RuntimeRequest::ListPendingPairings {
@@ -1848,8 +2063,7 @@ fn runtime_json_frame_must_be_strictly_smaller_than_one_mib() {
         envelope(RuntimeMessage::Reply(RuntimeReply::PairInvite(
             runtime::PairInvite {
                 pairing_id: PairingId::new("pairing-frame-boundary"),
-                display_name,
-                expires_at_ms: 0,
+                invite: Box::new(sample_pair_invite(display_name)),
             },
         )))
     }
@@ -2681,11 +2895,11 @@ fn runtime_envelope_rejects_wrong_version_on_ingress_and_egress() {
         },
     )));
     let mut wire = serde_json::to_value(&valid).unwrap();
-    wire["version"] = serde_json::json!(1);
+    wire["version"] = serde_json::json!(3);
     assert!(serde_json::from_value::<RuntimeEnvelope>(wire).is_err());
 
     let invalid = RuntimeEnvelope {
-        version: 1,
+        version: 3,
         message_id: MessageId::new("message-wrong-version"),
         body: valid.body,
     };
@@ -2807,7 +3021,7 @@ fn compact_transfer_carrier_rejects_wrong_channel_and_trailing_bytes() {
 fn json_uds_transfer_part_has_separate_limit_and_fits_full_frame() {
     assert_eq!(MAX_JSON_PART_BYTES, 700 * 1024);
     assert_eq!(MAX_RUNTIME_JSON_FRAME_BYTES, 1024 * 1024);
-    assert!(MAX_JSON_PART_BYTES < runtime::MAX_PART_BYTES);
+    const { assert!(MAX_JSON_PART_BYTES < runtime::MAX_PART_BYTES) };
     let part = vec![0xA5; MAX_JSON_PART_BYTES];
     let transfer = TransferEnvelope::new_json(
         TransferId::new("t".repeat(1024)),

@@ -18,6 +18,8 @@ pub mod canonical;
 pub mod counter;
 pub mod error;
 pub mod hpke;
+pub mod key_directory;
+pub mod pairing;
 pub mod replay;
 pub mod sealed_blob;
 pub mod signature;
@@ -33,6 +35,16 @@ pub use aead::{
 pub use canonical::sha256;
 pub use error::CryptoError;
 pub use hpke::{HpkeEnvelopeV1, HpkePrivateKey, HpkePublicKey, hpke_open_base, hpke_seal_base};
+pub use key_directory::{
+    open_key_directory_entry, seal_key_directory_entry, sign_key_directory, verify_key_directory,
+};
+pub use pairing::{
+    PairResponseSealAuthority, VerifiedPairRequestV1, open_pair_pending, open_pair_request,
+    open_pair_request_verified, open_pair_response, open_pair_response_received, seal_pair_pending,
+    seal_pair_request, seal_pair_response, seal_pair_response_received, sign_device_authorization,
+    sign_pair_response_received, verify_device_authorization, verify_pair_response_envelope,
+    verify_pair_response_received,
+};
 pub use sealed_blob::{sign_sealed, verify_sealed};
 pub use signature::{
     SignatureBytes, SigningKey, ValidatedRelayReceiptSignerIdentityV1,

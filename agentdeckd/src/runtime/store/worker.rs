@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
+use agentdeck_protocol::runtime::identity::{DeviceHandle, GrantSerial as RuntimeGrantSerial};
 use agentdeck_protocol::runtime::{ConversationConfigurationState, RuntimeEvent};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -80,7 +81,9 @@ use super::stream::{
 use super::{
     AuthenticatedConversationSnapshotContext, PreparedConversationSnapshotWrite, SnapshotOrigin,
     StoreConversationSnapshotError, admin, approval, journal, machine_identity, machine_remote,
-    native_projection, sqlite, stream,
+    native_projection, pairing, pairing_delivery, pairing_grant, pairing_grant_allocation,
+    pairing_grant_commit, pairing_grant_tx, pairing_receipt_retention, pairing_revocation,
+    pairing_revocation_ack, pairing_terminal, sqlite, stream,
 };
 
 mod stream_pipeline;
@@ -935,6 +938,459 @@ impl RuntimeStoreHandle {
             &self.lifecycle,
             RuntimeStoreLane::Read,
             |reply| ReadCommand::LoadMachineEnrollmentState { reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn prepare_pairing_invite(
+        &self,
+        input: pairing::PreparePairingInvite,
+    ) -> Result<pairing::PreparePairingInviteOutcome, RuntimeStoreError> {
+        let prepared = pairing::prepare_write(input)?;
+        let retained = prepared.retained_bytes();
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            memory_charge(size_of::<NormalCommand>(), &[retained])?,
+            |reply| NormalCommand::PreparePairingInvite { prepared, reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn acknowledge_pair_route_open(
+        &self,
+        pairing_id: RuntimeId,
+        canonical_terminal: Vec<u8>,
+    ) -> Result<pairing::AcknowledgePairRouteOpenOutcome, RuntimeStoreError> {
+        let retained = canonical_terminal.capacity();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::AcknowledgePairRouteOpen {
+                pairing_id,
+                canonical_terminal,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn accept_pair_request(
+        &self,
+        input: pairing::AcceptPairRequest,
+    ) -> Result<pairing::AcceptPairRequestOutcome, RuntimeStoreError> {
+        let retained = input.retained_bytes();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::AcceptPairRequest { input, reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn commit_pair_pending(
+        &self,
+        input: pairing::CommitPairPending,
+    ) -> Result<pairing::CommitPairPendingOutcome, RuntimeStoreError> {
+        let retained = input.retained_bytes();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::CommitPairPending { input, reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn confirm_pairing_grant(
+        &self,
+        input: pairing_grant::ConfirmPairingGrant,
+    ) -> Result<pairing_grant_tx::ConfirmPairingGrantOutcome, RuntimeStoreError> {
+        let prepared = pairing_grant_tx::prepare(input)?;
+        let retained = prepared.retained_bytes();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::ConfirmPairingGrant { prepared, reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the G2 Store capability.
+    pub(crate) async fn acknowledge_grant_committed(
+        &self,
+        input: pairing_grant_commit::AcknowledgeGrantCommitted,
+    ) -> Result<pairing_grant_commit::AcknowledgeGrantCommittedOutcome, RuntimeStoreError> {
+        let prepared = pairing_grant_commit::prepare_for_dispatch(input)?;
+        let retained = prepared.retained_bytes();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::AcknowledgeGrantCommitted { prepared, reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn acknowledge_pair_response_received(
+        &self,
+        input: pairing_delivery::AcknowledgePairResponseReceived,
+    ) -> Result<pairing_delivery::AcknowledgePairResponseReceivedOutcome, RuntimeStoreError> {
+        let retained = input.retained_bytes();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::AcknowledgePairResponseReceived { input, reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn terminalize_pairing(
+        &self,
+        pairing_id: RuntimeId,
+        action: pairing_terminal::PairingTerminalAction,
+    ) -> Result<pairing_terminal::PairingTerminalizeOutcome, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::TerminalizePairing {
+                pairing_id,
+                action,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn terminalize_due_pairings(
+        &self,
+    ) -> Result<Vec<pairing_terminal::PairingTerminalizeOutcome>, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::TerminalizeDuePairings { reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn acknowledge_pair_route_close(
+        &self,
+        pairing_id: RuntimeId,
+        canonical_terminal: Vec<u8>,
+    ) -> Result<pairing_terminal::AcknowledgePairRouteCloseOutcome, RuntimeStoreError> {
+        let retained = canonical_terminal.capacity();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::AcknowledgePairRouteClose {
+                pairing_id,
+                canonical_terminal,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    /// 冻结 startup/周期维护本轮最多 64 行的 authenticated receipt page。
+    pub(crate) async fn plan_expired_pairing_receipt_purge(
+        &self,
+    ) -> Result<Option<pairing_receipt_retention::PairingReceiptPurgePlan>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::PlanPairingReceiptPurge { reply },
+        )
+        .await?
+    }
+
+    /// 只应用调用方持有的冻结页；COMMIT unknown 必须用同一个 plan exact retry。
+    pub(crate) async fn apply_pairing_receipt_purge(
+        &self,
+        plan: pairing_receipt_retention::PairingReceiptPurgePlan,
+    ) -> Result<pairing_receipt_retention::PairingReceiptPurgeOutcome, RuntimeStoreError> {
+        let retained = plan.retained_bytes();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::ApplyPairingReceiptPurge { plan, reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn load_pairing_invite(
+        &self,
+        pairing_id: RuntimeId,
+    ) -> Result<Option<pairing::PairingInviteRecord>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadPairingInvite { pairing_id, reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn replay_pair_request(
+        &self,
+        pairing_id: RuntimeId,
+        canonical_request: crate::security::SecretBytes,
+    ) -> Result<pairing::PairingInviteRecord, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ReplayPairRequest {
+                pairing_id,
+                canonical_request,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn list_pairing_recovery(
+        &self,
+    ) -> Result<Vec<pairing::PairingInviteRecord>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ListPairingRecovery { reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 grant coordinator consumes the staged Store capability.
+    pub(crate) async fn list_grant_preparing_recovery(
+        &self,
+    ) -> Result<Vec<pairing_grant_tx::GrantPreparingRecovery>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ListGrantPreparingRecovery { reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the G2 recovery projection.
+    pub(crate) async fn list_grant_committed_recovery(
+        &self,
+    ) -> Result<Vec<pairing_grant_commit::GrantCommittedRecovery>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ListGrantCommittedRecovery { reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn load_grant_allocation(
+        &self,
+        pairing_id: RuntimeId,
+        device_sign_fingerprint: [u8; 32],
+    ) -> Result<pairing_grant_allocation::GrantAllocationProjection, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadGrantAllocation {
+                pairing_id,
+                device_sign_fingerprint,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn load_revocation_target(
+        &self,
+        device: &DeviceHandle,
+        grant_serial: RuntimeGrantSerial,
+    ) -> Result<Option<pairing_revocation::RevocationTargetStatus>, RuntimeStoreError> {
+        let device = device.clone();
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadRevocationTarget {
+                device,
+                grant_serial,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn list_due_orphan_revocation_targets(
+        &self,
+    ) -> Result<Vec<pairing_revocation::RevocationTarget>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ListDueOrphanRevocationTargets { reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn list_revocation_drain_targets(
+        &self,
+    ) -> Result<Vec<pairing_revocation::RevocationTarget>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ListRevocationDrainTargets { reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn begin_device_revocation(
+        &self,
+        input: pairing_revocation::BeginDeviceRevocation,
+    ) -> Result<pairing_revocation::BeginDeviceRevocationOutcome, RuntimeStoreError> {
+        let prepared = pairing_revocation::prepare_begin_for_dispatch(input)?;
+        let retained = prepared.retained_bytes();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::BeginDeviceRevocation { prepared, reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn acknowledge_orphan_grant_committed(
+        &self,
+        pairing_id: RuntimeId,
+        canonical_terminal: Vec<u8>,
+    ) -> Result<pairing_revocation_ack::AcknowledgeOrphanGrantCommittedOutcome, RuntimeStoreError>
+    {
+        let prepared =
+            pairing_revocation_ack::prepare_orphan_grant_committed(pairing_id, canonical_terminal)?;
+        let retained = prepared.retained_bytes();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::AcknowledgeOrphanGrantCommitted { prepared, reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn list_revocation_recovery(
+        &self,
+    ) -> Result<Vec<pairing_revocation::DeviceRevocationRecovery>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ListRevocationRecovery { reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn acknowledge_revocation_committed(
+        &self,
+        input: pairing_revocation_ack::AcknowledgeRevocationCommitted,
+    ) -> Result<pairing_revocation_ack::AcknowledgeRevocationCommittedOutcome, RuntimeStoreError>
+    {
+        let prepared = pairing_revocation_ack::prepare_revocation_committed(input)?;
+        let retained = prepared.retained_bytes();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::AcknowledgeRevocationCommitted { prepared, reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 grant builder consumes the daemon-private singleton.
+    pub(crate) async fn load_global_key_state(
+        &self,
+    ) -> Result<Option<pairing_grant::GlobalKeyStateV1>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadGlobalKeyState { reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn list_pairing_terminal_recovery(
+        &self,
+    ) -> Result<Vec<pairing_terminal::PairingTerminalRecovery>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ListPairingTerminalRecovery { reply },
+        )
+        .await?
+    }
+
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    pub(crate) async fn list_pending_pairings(
+        &self,
+    ) -> Result<Vec<agentdeck_protocol::runtime::PendingPairing>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ListPendingPairings { reply },
         )
         .await?
     }
@@ -2415,6 +2871,11 @@ impl AcceptCommandReply {
 }
 
 enum NormalCommand {
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    PreparePairingInvite {
+        prepared: pairing::PreparedPairingInviteWrite,
+        reply: oneshot::Sender<Result<pairing::PreparePairingInviteOutcome, RuntimeStoreError>>,
+    },
     ImportNativeProjection {
         prepared: native_projection::PreparedNativeProjectionImport,
         epoch_source: Arc<AtomicU64>,
@@ -2537,6 +2998,93 @@ enum NormalCommand {
 }
 
 enum SafetyCommand {
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    AcknowledgePairRouteOpen {
+        pairing_id: RuntimeId,
+        canonical_terminal: Vec<u8>,
+        reply: oneshot::Sender<Result<pairing::AcknowledgePairRouteOpenOutcome, RuntimeStoreError>>,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    AcceptPairRequest {
+        input: pairing::AcceptPairRequest,
+        reply: oneshot::Sender<Result<pairing::AcceptPairRequestOutcome, RuntimeStoreError>>,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    CommitPairPending {
+        input: pairing::CommitPairPending,
+        reply: oneshot::Sender<Result<pairing::CommitPairPendingOutcome, RuntimeStoreError>>,
+    },
+    #[allow(dead_code)] // P4 grant coordinator consumes the staged Store capability.
+    ConfirmPairingGrant {
+        prepared: pairing_grant::PreparedConfirmPairingGrant,
+        reply: oneshot::Sender<
+            Result<pairing_grant_tx::ConfirmPairingGrantOutcome, RuntimeStoreError>,
+        >,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the G2 Store capability.
+    AcknowledgeGrantCommitted {
+        prepared: pairing_grant_commit::PreparedGrantCommitted,
+        reply: oneshot::Sender<
+            Result<pairing_grant_commit::AcknowledgeGrantCommittedOutcome, RuntimeStoreError>,
+        >,
+    },
+    BeginDeviceRevocation {
+        prepared: pairing_revocation::PreparedDeviceRevocation,
+        reply: oneshot::Sender<
+            Result<pairing_revocation::BeginDeviceRevocationOutcome, RuntimeStoreError>,
+        >,
+    },
+    AcknowledgeOrphanGrantCommitted {
+        prepared: pairing_revocation_ack::PreparedOrphanGrantCommitted,
+        reply: oneshot::Sender<
+            Result<
+                pairing_revocation_ack::AcknowledgeOrphanGrantCommittedOutcome,
+                RuntimeStoreError,
+            >,
+        >,
+    },
+    AcknowledgeRevocationCommitted {
+        prepared: pairing_revocation_ack::PreparedRevocationCommitted,
+        reply: oneshot::Sender<
+            Result<
+                pairing_revocation_ack::AcknowledgeRevocationCommittedOutcome,
+                RuntimeStoreError,
+            >,
+        >,
+    },
+    AcknowledgePairResponseReceived {
+        input: pairing_delivery::AcknowledgePairResponseReceived,
+        reply: oneshot::Sender<
+            Result<pairing_delivery::AcknowledgePairResponseReceivedOutcome, RuntimeStoreError>,
+        >,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    TerminalizePairing {
+        pairing_id: RuntimeId,
+        action: pairing_terminal::PairingTerminalAction,
+        reply:
+            oneshot::Sender<Result<pairing_terminal::PairingTerminalizeOutcome, RuntimeStoreError>>,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    TerminalizeDuePairings {
+        reply: oneshot::Sender<
+            Result<Vec<pairing_terminal::PairingTerminalizeOutcome>, RuntimeStoreError>,
+        >,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    AcknowledgePairRouteClose {
+        pairing_id: RuntimeId,
+        canonical_terminal: Vec<u8>,
+        reply: oneshot::Sender<
+            Result<pairing_terminal::AcknowledgePairRouteCloseOutcome, RuntimeStoreError>,
+        >,
+    },
+    ApplyPairingReceiptPurge {
+        plan: pairing_receipt_retention::PairingReceiptPurgePlan,
+        reply: oneshot::Sender<
+            Result<pairing_receipt_retention::PairingReceiptPurgeOutcome, RuntimeStoreError>,
+        >,
+    },
     PrepareMachineIdentity {
         binding: MachineIdentityBinding,
         reply: oneshot::Sender<Result<PrepareMachineIdentityOutcome, RuntimeStoreError>>,
@@ -2687,6 +3235,81 @@ enum ReadCommand {
     },
     LoadMachineEnrollmentState {
         reply: oneshot::Sender<Result<Option<MachineEnrollmentState>, RuntimeStoreError>>,
+    },
+    PlanPairingReceiptPurge {
+        reply: oneshot::Sender<
+            Result<Option<pairing_receipt_retention::PairingReceiptPurgePlan>, RuntimeStoreError>,
+        >,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    LoadPairingInvite {
+        pairing_id: RuntimeId,
+        reply: oneshot::Sender<Result<Option<pairing::PairingInviteRecord>, RuntimeStoreError>>,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    ReplayPairRequest {
+        pairing_id: RuntimeId,
+        canonical_request: crate::security::SecretBytes,
+        reply: oneshot::Sender<Result<pairing::PairingInviteRecord, RuntimeStoreError>>,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    ListPairingRecovery {
+        reply: oneshot::Sender<Result<Vec<pairing::PairingInviteRecord>, RuntimeStoreError>>,
+    },
+    #[allow(dead_code)] // P4 grant coordinator consumes the staged Store capability.
+    ListGrantPreparingRecovery {
+        reply: oneshot::Sender<
+            Result<Vec<pairing_grant_tx::GrantPreparingRecovery>, RuntimeStoreError>,
+        >,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the G2 recovery projection.
+    ListGrantCommittedRecovery {
+        reply: oneshot::Sender<
+            Result<Vec<pairing_grant_commit::GrantCommittedRecovery>, RuntimeStoreError>,
+        >,
+    },
+    LoadGrantAllocation {
+        pairing_id: RuntimeId,
+        device_sign_fingerprint: [u8; 32],
+        reply: oneshot::Sender<
+            Result<pairing_grant_allocation::GrantAllocationProjection, RuntimeStoreError>,
+        >,
+    },
+    LoadRevocationTarget {
+        device: DeviceHandle,
+        grant_serial: RuntimeGrantSerial,
+        reply: oneshot::Sender<
+            Result<Option<pairing_revocation::RevocationTargetStatus>, RuntimeStoreError>,
+        >,
+    },
+    ListDueOrphanRevocationTargets {
+        reply:
+            oneshot::Sender<Result<Vec<pairing_revocation::RevocationTarget>, RuntimeStoreError>>,
+    },
+    ListRevocationDrainTargets {
+        reply:
+            oneshot::Sender<Result<Vec<pairing_revocation::RevocationTarget>, RuntimeStoreError>>,
+    },
+    ListRevocationRecovery {
+        reply: oneshot::Sender<
+            Result<Vec<pairing_revocation::DeviceRevocationRecovery>, RuntimeStoreError>,
+        >,
+    },
+    #[allow(dead_code)] // P4 grant builder consumes the daemon-private singleton.
+    LoadGlobalKeyState {
+        reply: oneshot::Sender<Result<Option<pairing_grant::GlobalKeyStateV1>, RuntimeStoreError>>,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    ListPairingTerminalRecovery {
+        reply: oneshot::Sender<
+            Result<Vec<pairing_terminal::PairingTerminalRecovery>, RuntimeStoreError>,
+        >,
+    },
+    #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
+    ListPendingPairings {
+        reply: oneshot::Sender<
+            Result<Vec<agentdeck_protocol::runtime::PendingPairing>, RuntimeStoreError>,
+        >,
     },
     LoadPendingAdminUpgrades {
         cursor: Option<admin::AdminUpgradeRecoveryCursor>,
@@ -3034,6 +3657,9 @@ fn handle_normal(
     } = queued;
     if state.recovery_scan.is_some() {
         match command {
+            NormalCommand::PreparePairingInvite { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             NormalCommand::ImportNativeProjection { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -3134,6 +3760,14 @@ fn handle_normal(
         return;
     }
     match command {
+        NormalCommand::PreparePairingInvite { prepared, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| pairing::prepare_pairing_invite(state, config, prepared, now));
+            let _ = reply.send(result);
+        }
         NormalCommand::ImportNativeProjection {
             prepared,
             epoch_source,
@@ -3393,6 +4027,45 @@ fn handle_safety(
     } = queued;
     if state.recovery_scan.is_some() {
         match command {
+            SafetyCommand::AcknowledgePairRouteOpen { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::AcceptPairRequest { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::CommitPairPending { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::ConfirmPairingGrant { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::AcknowledgeGrantCommitted { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::BeginDeviceRevocation { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::AcknowledgeOrphanGrantCommitted { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::AcknowledgeRevocationCommitted { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::AcknowledgePairResponseReceived { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::TerminalizePairing { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::TerminalizeDuePairings { reply } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::AcknowledgePairRouteClose { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::ApplyPairingReceiptPurge { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             SafetyCommand::PrepareMachineIdentity { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -3488,6 +4161,138 @@ fn handle_safety(
         return;
     }
     match command {
+        SafetyCommand::AcknowledgePairRouteOpen {
+            pairing_id,
+            canonical_terminal,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    pairing::acknowledge_pair_route_open(
+                        state,
+                        config,
+                        pairing_id,
+                        canonical_terminal,
+                        now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        SafetyCommand::AcceptPairRequest { input, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| pairing::accept_pair_request(state, config, input, now));
+            let _ = reply.send(result);
+        }
+        SafetyCommand::CommitPairPending { input, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| pairing::commit_pair_pending(state, config, input, now));
+            let _ = reply.send(result);
+        }
+        SafetyCommand::ConfirmPairingGrant { prepared, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    pairing_grant_tx::confirm_pairing_grant(state, config, prepared, now)
+                });
+            let _ = reply.send(result);
+        }
+        SafetyCommand::AcknowledgeGrantCommitted { prepared, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    pairing_grant_commit::acknowledge_grant_committed(state, config, prepared, now)
+                });
+            let _ = reply.send(result);
+        }
+        SafetyCommand::BeginDeviceRevocation { prepared, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    pairing_revocation::begin_device_revocation(state, config, prepared, now)
+                });
+            let _ = reply.send(result);
+        }
+        SafetyCommand::AcknowledgeOrphanGrantCommitted { prepared, reply } => {
+            let _ = reply.send(pairing_revocation_ack::acknowledge_orphan_grant_committed(
+                state, config, prepared,
+            ));
+        }
+        SafetyCommand::AcknowledgeRevocationCommitted { prepared, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    pairing_revocation_ack::acknowledge_revocation_committed(
+                        state, config, prepared, now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        SafetyCommand::AcknowledgePairResponseReceived { input, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    pairing_delivery::acknowledge_pair_response_received(state, config, input, now)
+                });
+            let _ = reply.send(result);
+        }
+        SafetyCommand::TerminalizePairing {
+            pairing_id,
+            action,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    pairing_terminal::terminalize_pairing(state, config, pairing_id, action, now)
+                });
+            let _ = reply.send(result);
+        }
+        SafetyCommand::TerminalizeDuePairings { reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| pairing_terminal::terminalize_due_pairings(state, config, now));
+            let _ = reply.send(result);
+        }
+        SafetyCommand::AcknowledgePairRouteClose {
+            pairing_id,
+            canonical_terminal,
+            reply,
+        } => {
+            let _ = reply.send(pairing_terminal::acknowledge_pair_route_close(
+                state,
+                config,
+                pairing_id,
+                canonical_terminal,
+            ));
+        }
+        SafetyCommand::ApplyPairingReceiptPurge { plan, reply } => {
+            let _ = reply.send(pairing_receipt_retention::apply_pairing_receipt_purge(
+                state, config, plan,
+            ));
+        }
         SafetyCommand::PrepareMachineIdentity { binding, reply } => {
             let _ = reply.send(machine_identity::prepare_machine_identity(
                 state, config, binding,
@@ -3758,6 +4563,147 @@ fn handle_read(
         }
         ReadCommand::LoadMachineEnrollmentState { reply } => {
             let _ = reply.send(machine_remote::load_machine_enrollment_state(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            ));
+        }
+        ReadCommand::PlanPairingReceiptPurge { reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    pairing_receipt_retention::plan_expired_pairing_receipts(
+                        &state.connection,
+                        &state.key_bundle,
+                        state.database_id,
+                        now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        ReadCommand::LoadPairingInvite { pairing_id, reply } => {
+            let _ = reply.send(pairing::load_pairing_invite(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+                pairing_id,
+            ));
+        }
+        ReadCommand::ReplayPairRequest {
+            pairing_id,
+            canonical_request,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    pairing::replay_pair_request(
+                        &state.connection,
+                        &state.key_bundle,
+                        state.database_id,
+                        pairing_id,
+                        canonical_request,
+                        now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        ReadCommand::ListPairingRecovery { reply } => {
+            let _ = reply.send(pairing::list_pairing_recovery(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            ));
+        }
+        ReadCommand::ListGrantPreparingRecovery { reply } => {
+            let _ = reply.send(pairing_grant_tx::list_grant_preparing_recovery(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            ));
+        }
+        ReadCommand::ListGrantCommittedRecovery { reply } => {
+            let _ = reply.send(pairing_grant_commit::list_grant_committed_recovery(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            ));
+        }
+        ReadCommand::LoadGrantAllocation {
+            pairing_id,
+            device_sign_fingerprint,
+            reply,
+        } => {
+            let _ = reply.send(pairing_grant_allocation::load_grant_allocation(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+                pairing_id,
+                device_sign_fingerprint,
+            ));
+        }
+        ReadCommand::LoadRevocationTarget {
+            device,
+            grant_serial,
+            reply,
+        } => {
+            let _ = reply.send(pairing_revocation::load_revocation_target(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+                &device,
+                grant_serial,
+            ));
+        }
+        ReadCommand::ListDueOrphanRevocationTargets { reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    pairing_revocation::list_due_orphan_revocation_targets(
+                        &state.connection,
+                        &state.key_bundle,
+                        state.database_id,
+                        now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        ReadCommand::ListRevocationDrainTargets { reply } => {
+            let _ = reply.send(pairing_revocation::list_revocation_drain_targets(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            ));
+        }
+        ReadCommand::ListRevocationRecovery { reply } => {
+            let _ = reply.send(pairing_revocation::list_revocation_recovery(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            ));
+        }
+        ReadCommand::LoadGlobalKeyState { reply } => {
+            let _ = reply.send(pairing_grant_tx::load_global_key_state_for_use(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            ));
+        }
+        ReadCommand::ListPairingTerminalRecovery { reply } => {
+            let _ = reply.send(pairing_terminal::list_pairing_terminal_recovery(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            ));
+        }
+        ReadCommand::ListPendingPairings { reply } => {
+            let _ = reply.send(pairing::list_pending_pairings(
                 &state.connection,
                 &state.key_bundle,
                 state.database_id,

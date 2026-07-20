@@ -1169,6 +1169,8 @@ final class SessionModel {
         refreshHistoryPresentation()
       case .transferPart:
         break
+      case .pairingPending:
+        break
       }
     case .synchronizedReply(.syncComplete):
       refreshHistoryPresentation()

@@ -17,72 +17,91 @@
         "inviteHpkePubkey": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
         "inviteSecret": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
         "machineDisplayName": "Fixture Machine",
-        "machineRootFingerprint": "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY=",
+        "machineRootFingerprint": "+EnWcyX6zwQXe8ZjstxUQFGDHFie9YHUEvLrpEg053w=",
         "machineRootPubkey": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=",
         "nextSpkiPin": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
         "pairRoute": "VVVVVVVVVVVVVVVVVVVVVQ==",
         "relayProtocolVersion": 2,
         "relayServerId": "iIiIiIiIiIiIiIiIiIiIiA==",
-        "wssUrl": "wss://relay.example.test/v2"
+        "wssUrl": "wss://relay.example.test/"
       },
       "wireType": "PairInviteV1"
     },
     {
       "case": "pairRequest",
       "value": {
-        "deviceHpkePubkey": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=",
-        "deviceSignPubkey": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
-        "formatVersion": 1,
-        "inviteSecret": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
-        "proofSignature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
-        "sealedAuthorizationRequest": "CQoL"
+        "ciphertext": "CQoL",
+        "deviceProofSignature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
+        "enc": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        "formatVersion": 1
       },
       "wireType": "PairRequestV1"
     },
     {
       "case": "pairResponse",
       "value": {
-        "keyDirectory": {
-          "entries": [
-            {
-              "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
-              "enc": "wcI=",
-              "keyId": {
-                "epoch": 4,
-                "purpose": "conversationDek"
-              },
-              "wrappedKey": "0dLT"
-            }
-          ],
-          "revision": 2,
-          "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA=="
-        },
-        "relayGrant": {
+        "ciphertext": "DQ4=",
+        "enc": "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw=",
+        "formatVersion": 1,
+        "info": {
           "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
-          "deviceSignPubkey": "oKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKA=",
+          "e2eeFormatVersion": 1,
+          "expiryMs": 1700000300000,
           "grantSerial": 9,
+          "inviteHash": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
           "machineRoute": "EREREREREREREREREREREQ==",
-          "rootKeyId": "d3d3d3d3d3d3d3d3d3d3dw==",
-          "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
-          "trustEpoch": 3
+          "pairRoute": "VVVVVVVVVVVVVVVVVVVVVQ==",
+          "relayServerId": "iIiIiIiIiIiIiIiIiIiIiA==",
+          "requestHash": "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE=",
+          "rootTrustEpoch": 3,
+          "runtimeProtocolVersion": 4
         },
-        "requestHash": "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw=",
-        "sealedDeviceAuthorization": "DQ4=",
-        "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA=="
+        "machineDataSignature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA=="
       },
       "wireType": "PairResponseV1"
+    },
+    {
+      "case": "pairPending",
+      "value": {
+        "requestHash": "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE=",
+        "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA=="
+      },
+      "wireType": "PairPendingV1"
+    },
+    {
+      "case": "pairingControlEnvelope",
+      "value": {
+        "ciphertext": "NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU=",
+        "enc": "NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ=",
+        "formatVersion": 1
+      },
+      "wireType": "PairingControlEnvelopeV1"
+    },
+    {
+      "case": "pairResponseReceived",
+      "value": {
+        "grantHash": "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjI=",
+        "requestHash": "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE=",
+        "responseHash": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+        "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA=="
+      },
+      "wireType": "PairResponseReceivedV1"
     },
     {
       "case": "deviceAuthorization",
       "value": {
         "capabilities": [
-          "view",
-          "respond"
+          "approval"
         ],
         "deviceHpkePubkey": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=",
+        "deviceRoute": "IiIiIiIiIiIiIiIiIiIiIg==",
+        "deviceSignFingerprint": "VF6fPq8roogxAWN/Tbhicz7O25PtMKQCaIhz7fPCVvY=",
+        "formatVersion": 1,
+        "grantHash": "ZNNWyY0di1FBtlj5DjvJKodATsD7gOToVLDCyP+/7vE=",
         "grantSerial": 9,
+        "machineRoute": "EREREREREREREREREREREQ==",
         "permissions": [
-          "approval.resolve"
+          "approvalResolve"
         ],
         "rootKeyId": "d3d3d3d3d3d3d3d3d3d3dw==",
         "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA==",
@@ -101,6 +120,7 @@
               "epoch": 4,
               "purpose": "conversationDek"
             },
+            "streamRoute": "MzMzMzMzMzMzMzMzMzMzMw==",
             "wrappedKey": "0dLT"
           }
         ],
@@ -697,5 +717,5 @@
     }
   ],
   "relayProtocolVersion": 2,
-  "runtimeProtocolVersion": 3
+  "runtimeProtocolVersion": 4
 }

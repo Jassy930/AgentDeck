@@ -13,8 +13,9 @@ use agentdeck_protocol::e2ee::keys::{
     KeyUpdateV1,
 };
 use agentdeck_protocol::e2ee::pairing::{
-    DeviceAuthorizationV1, PairInviteV1, PairPendingV1, PairRequestInfoV1, PairRequestV1,
-    PairResponseInfoV1, PairResponseReceivedV1, PairResponseV1,
+    AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1, PairInviteV1,
+    PairPendingV1, PairRequestInfoV1, PairRequestV1, PairResponseInfoV1, PairResponseReceivedV1,
+    PairResponseV1,
 };
 use agentdeck_protocol::e2ee::payload::{
     SealedBlobSignatureVerifier, SealedPayloadKind, SealedPayloadV1, UnsignedSealedBlobV1,
@@ -32,6 +33,7 @@ use agentdeck_protocol::relay_v2::id::{
 use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use agentdeck_protocol::runtime::identity::ConversationId;
 use agentdeck_protocol::runtime::sync::RuntimeInnerCursor;
+use sha2::{Digest, Sha256};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -276,7 +278,7 @@ fn tbs_binds_object_type_and_route() {
     assert_ne!(tbs_sample().encode(), other2.encode());
 }
 
-const GOLDEN_TBS: &str = "4167656e744465636b2f546f42655369676e65645631000200010002000300010000001088888888888888888888888888888888000000101111111111111111111111111111111101222222222222222222222222222222220000000000000006646576696365000000200f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f00000010777777777777777777777777777777770000000000000003000000000000000900000000200e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e";
+const GOLDEN_TBS: &str = "4167656e744465636b2f546f42655369676e65645631000200010002000400010000001088888888888888888888888888888888000000101111111111111111111111111111111101222222222222222222222222222222220000000000000006646576696365000000200f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f00000010777777777777777777777777777777770000000000000003000000000000000900000000200e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e";
 
 #[test]
 fn fixture_tbs_golden() {
@@ -294,6 +296,7 @@ fn outer_sample() -> OuterContextV1 {
         device_route: None,
         stream_route: Some(StreamRouteId::from_bytes([0x33; 16])),
         request_route: None,
+        pair_route: None,
         stream_generation: Some(StreamGenerationId::from_bytes([0x66; 16])),
         stream_cursor: Some(StreamCursor::At(7)),
         stream_seq: Some(7),
@@ -341,9 +344,9 @@ fn pair_request_info_excludes_unassigned_device_route_and_serial() {
     let _ = info.encode();
 }
 
-const GOLDEN_PAIR_REQUEST_INFO: &str = "4167656e744465636b2f5061697252657175657374496e666f56310000010003000000108888888888888888888888888888888800000010555555555555555555555555555555550000002001010101010101010101010101010101010101010101010101010101010101010000018bcfe56800";
-const GOLDEN_PAIR_RESPONSE_INFO: &str = "4167656e744465636b2f50616972526573706f6e7365496e666f56310000010003000000108888888888888888888888888888888800000010555555555555555555555555555555550000002001010101010101010101010101010101010101010101010101010101010101010000002002020202020202020202020202020202020202020202020202020202020202020000001011111111111111111111111111111111000000102222222222222222222222222222222200000000000000090000000000000003";
-const GOLDEN_KEY_UPDATE_INFO: &str = "4167656e744465636b2f4b6579557064617465496e666f5631000001000300000010111111111111111111111111111111110000001022222222222222222222222222222222000000000000000900000000000000030000000000000002010000000000000004";
+const GOLDEN_PAIR_REQUEST_INFO: &str = "4167656e744465636b2f5061697252657175657374496e666f56310000010004000000108888888888888888888888888888888800000010555555555555555555555555555555550000002001010101010101010101010101010101010101010101010101010101010101010000018bcfe56800";
+const GOLDEN_PAIR_RESPONSE_INFO: &str = "4167656e744465636b2f50616972526573706f6e7365496e666f56310000010004000000108888888888888888888888888888888800000010555555555555555555555555555555550000002001010101010101010101010101010101010101010101010101010101010101010000018bcfe568000000002002020202020202020202020202020202020202020202020202020202020202020000001011111111111111111111111111111111000000102222222222222222222222222222222200000000000000090000000000000003";
+const GOLDEN_KEY_UPDATE_INFO: &str = "4167656e744465636b2f4b6579557064617465496e666f563100000100040000001088888888888888888888888888888888000000101111111111111111111111111111111100000010222222222222222222222222222222220133333333333333333333333333333333000000000000000900000000000000030000000000000002010000000000000004";
 
 #[test]
 fn fixture_pair_request_info_golden() {
@@ -370,6 +373,7 @@ fn fixture_pair_response_info_golden() {
         relay_server_id: rs(),
         pair_route: pr(),
         invite_hash: [0x01; 32],
+        expiry_ms: 1_700_000_000_000,
         request_hash: [0x02; 32],
         machine_route: mr(),
         device_route: dr(),
@@ -388,8 +392,10 @@ fn fixture_key_update_info_golden() {
     let info = KeyUpdateInfoV1 {
         e2ee_format_version: 1,
         runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        relay_server_id: rs(),
         machine_route: mr(),
         device_route: dr(),
+        stream_route: Some(StreamRouteId::from_bytes([0x33; 16])),
         grant_serial: GrantSerial::new(9),
         root_trust_epoch: TrustEpoch::new(3),
         key_directory_revision: KeyDirectoryRevision::new(2),
@@ -438,6 +444,7 @@ fn key_directory() -> KeyDirectoryV1 {
                 epoch: 1,
             },
             device_route: dr(),
+            stream_route: None,
             enc: vec![0x01, 0x02],
             wrapped_key: vec![0x03, 0x04],
         }],
@@ -453,13 +460,13 @@ fn pairing_dtos_round_trip() {
         pair_route: pr(),
         invite_secret: [0x10; 32],
         invite_hpke_pubkey: pk(),
-        wss_url: "wss://relay.example/ws".into(),
+        wss_url: "wss://relay.example/".into(),
         relay_server_id: rs(),
         current_spki_pin: [0x20; 32],
         next_spki_pin: [0x21; 32],
         expires_at_ms: 1_700_000_000_000,
         machine_root_pubkey: pk(),
-        machine_root_fingerprint: [0x30; 32],
+        machine_root_fingerprint: Sha256::digest(pk().0).into(),
         data_sign_cert: cert(),
         machine_display_name: "Jassy MacBook".into(),
     };
@@ -469,11 +476,9 @@ fn pairing_dtos_round_trip() {
 
     let req = PairRequestV1 {
         format_version: E2EE_FORMAT_VERSION,
-        invite_secret: [0x10; 32],
-        device_sign_pubkey: pk(),
-        device_hpke_pubkey: pk(),
-        sealed_authorization_request: vec![0xAA, 0xBB],
-        proof_signature: sig(),
+        enc: vec![0x10; 32],
+        ciphertext: vec![0xAA, 0xBB],
+        device_proof_signature: sig(),
     };
     let back: PairRequestV1 = serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
     assert_eq!(back, req);
@@ -487,10 +492,15 @@ fn pairing_dtos_round_trip() {
     assert_eq!(back, pending);
 
     let authz = DeviceAuthorizationV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        grant_hash: relay_grant().canonical_sha256(),
+        machine_route: mr(),
+        device_route: dr(),
+        device_sign_fingerprint: [0x31; 32],
         grant_serial: GrantSerial::new(9),
         device_hpke_pubkey: pk(),
-        capabilities: vec!["approval".into()],
-        permissions: vec!["read".into(), "write".into()],
+        capabilities: vec![AuthorizationCapabilityV1::Approval],
+        permissions: vec![AuthorizationPermissionV1::ApprovalResolve],
         root_key_id: rk(),
         trust_epoch: TrustEpoch::new(3),
         signature: sig(),
@@ -500,11 +510,23 @@ fn pairing_dtos_round_trip() {
     assert_eq!(back, authz);
 
     let resp = PairResponseV1 {
-        request_hash: [0x02; 32],
-        relay_grant: relay_grant(),
-        sealed_device_authorization: vec![0xCC, 0xDD],
-        key_directory: key_directory(),
-        signature: sig(),
+        format_version: E2EE_FORMAT_VERSION,
+        info: PairResponseInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_server_id: rs(),
+            pair_route: pr(),
+            invite_hash: [0x01; 32],
+            expiry_ms: 1_700_000_000_000,
+            request_hash: [0x02; 32],
+            machine_route: mr(),
+            device_route: dr(),
+            grant_serial: GrantSerial::new(9),
+            root_trust_epoch: TrustEpoch::new(3),
+        },
+        enc: vec![0xCC; 32],
+        ciphertext: vec![0xDD; 48],
+        machine_data_signature: sig(),
     };
     let back: PairResponseV1 =
         serde_json::from_value(serde_json::to_value(&resp).unwrap()).unwrap();
@@ -531,11 +553,9 @@ fn pairing_invite_and_request_debug_redact_secrets_and_payloads() {
     };
     let request = PairRequestV1 {
         format_version: 1,
-        invite_secret: [0x12; 32],
-        device_sign_pubkey: PublicKeyBytes([0x19; 32]),
-        device_hpke_pubkey: PublicKeyBytes([0x1a; 32]),
-        sealed_authorization_request: b"secret-authorization".to_vec(),
-        proof_signature: Ed25519Signature([0x1b; 64]),
+        enc: vec![0x19; 32],
+        ciphertext: b"secret-authorization".to_vec(),
+        device_proof_signature: Ed25519Signature([0x1b; 64]),
     };
     let rendered = format!("{invite:?} {request:?}");
     assert!(rendered.contains("<redacted>"));
@@ -577,6 +597,7 @@ fn key_dtos_round_trip() {
             epoch: 5,
         },
         device_route: dr(),
+        stream_route: None,
         enc: vec![0x01],
         wrapped_key: vec![0x02],
         signature: sig(),

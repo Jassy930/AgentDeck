@@ -1,6 +1,6 @@
 import Foundation
 
-// Runtime v3 current DTO 保留 V2 类型名以维持源码兼容。稳定且 wire 未变化的 leaf 继续复用
+// Runtime v4 current DTO 保留 V2 类型名以维持源码兼容。稳定且 wire 未变化的 leaf 继续复用
 // RuntimeWireTypes.swift；本文件提供严格的 configuration/metadata/upgrade/receipt/machine mirror。
 
 public enum RuntimeV2MirrorError: Error, Equatable, Sendable {
@@ -43,7 +43,7 @@ func runtimeV2RejectUnknownKeys(_ decoder: Decoder, allowed: Set<String>) throws
         throw DecodingError.dataCorruptedError(
             forKey: unknown,
             in: container,
-            debugDescription: "unknown Runtime v3 field \(unknown.stringValue)"
+            debugDescription: "unknown Runtime v4 field \(unknown.stringValue)"
         )
     }
 }
@@ -60,6 +60,16 @@ func runtimeV2DecodeRequiredNullable<T: Decodable>(
         )
     }
     return try container.decodeIfPresent(type, forKey: key)
+}
+
+func runtimeV4ValidatePairingDisplayName(_ value: String) throws {
+    guard !value.isEmpty,
+          value.utf8.count <= 128,
+          value.trimmingCharacters(in: .whitespacesAndNewlines) == value,
+          !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+    else {
+        throw RuntimeV3MirrorError.invalidPairingPayload
+    }
 }
 
 protocol RuntimeV2FlattenedPayload: Codable, Sendable {
@@ -80,7 +90,7 @@ func runtimeV2ValidateDiscriminator(
         throw DecodingError.dataCorruptedError(
             forKey: runtimeV2Key(key),
             in: container,
-            debugDescription: "unexpected Runtime v3 discriminator \(received)"
+            debugDescription: "unexpected Runtime v4 discriminator \(received)"
         )
     }
 }
@@ -1312,6 +1322,489 @@ public struct ConversationStartReceiptV2: RuntimeV2FlattenedPayload {
     }
 }
 
+// MARK: - Runtime v4 pairing administration
+
+public enum RuntimePairingCertRoleV1: String, Codable, Sendable {
+  case link
+  case data
+}
+
+public struct RuntimePairingSignedCertificateV1: Codable, Sendable {
+  public let subjectPubkey: Data
+  public let certRole: RuntimePairingCertRoleV1
+  public let generation: UInt64
+  public let rootKeyID: Data
+  public let trustEpoch: UInt64
+  public let notAfterMs: UInt64?
+  public let signature: Data
+
+  private enum CodingKeys: String, CodingKey, CaseIterable {
+    case subjectPubkey, certRole, generation
+    case rootKeyID = "rootKeyId"
+    case trustEpoch, notAfterMs, signature
+  }
+
+  public init(
+    subjectPubkey: Data,
+    certRole: RuntimePairingCertRoleV1,
+    generation: UInt64,
+    rootKeyID: Data,
+    trustEpoch: UInt64,
+    notAfterMs: UInt64?,
+    signature: Data
+  ) throws {
+    try runtimeV3RequireData(subjectPubkey, count: 32)
+    try runtimeV3RequireData(rootKeyID, count: 16)
+    try runtimeV3RequireData(signature, count: 64)
+    self.subjectPubkey = subjectPubkey
+    self.certRole = certRole
+    self.generation = generation
+    self.rootKeyID = rootKeyID
+    self.trustEpoch = trustEpoch
+    self.notAfterMs = notAfterMs
+    self.signature = signature
+  }
+
+  public init(from decoder: Decoder) throws {
+    try runtimeV2RejectUnknownKeys(
+      decoder,
+      allowed: Set(CodingKeys.allCases.map(\.rawValue))
+    )
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    try self.init(
+      subjectPubkey: container.decode(Data.self, forKey: .subjectPubkey),
+      certRole: container.decode(RuntimePairingCertRoleV1.self, forKey: .certRole),
+      generation: container.decode(UInt64.self, forKey: .generation),
+      rootKeyID: container.decode(Data.self, forKey: .rootKeyID),
+      trustEpoch: container.decode(UInt64.self, forKey: .trustEpoch),
+      notAfterMs: container.decodeIfPresent(UInt64.self, forKey: .notAfterMs),
+      signature: container.decode(Data.self, forKey: .signature)
+    )
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    _ = try RuntimePairingSignedCertificateV1(
+      subjectPubkey: subjectPubkey,
+      certRole: certRole,
+      generation: generation,
+      rootKeyID: rootKeyID,
+      trustEpoch: trustEpoch,
+      notAfterMs: notAfterMs,
+      signature: signature
+    )
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(subjectPubkey, forKey: .subjectPubkey)
+    try container.encode(certRole, forKey: .certRole)
+    try container.encode(generation, forKey: .generation)
+    try container.encode(rootKeyID, forKey: .rootKeyID)
+    try container.encode(trustEpoch, forKey: .trustEpoch)
+    try container.encodeIfPresent(notAfterMs, forKey: .notAfterMs)
+    try container.encode(signature, forKey: .signature)
+  }
+}
+
+/// Runtime v4 经 same-UID UDS 返回的完整带外 PairInviteV1。
+public struct RuntimePairInvitePayloadV1: Codable, Sendable {
+  public let formatVersion: UInt16
+  public let relayProtocolVersion: UInt16
+  public let pairRoute: Data
+  public let inviteSecret: Data
+  public let inviteHPKEPubkey: Data
+  public let wssURL: String
+  public let relayServerID: Data
+  public let currentSPKIPin: Data
+  public let nextSPKIPin: Data
+  public let expiresAtMs: UInt64
+  public let machineRootPubkey: Data
+  public let machineRootFingerprint: Data
+  public let dataSignCert: RuntimePairingSignedCertificateV1
+  public let machineDisplayName: String
+
+  private enum CodingKeys: String, CodingKey, CaseIterable {
+    case formatVersion, relayProtocolVersion, pairRoute, inviteSecret
+    case inviteHPKEPubkey = "inviteHpkePubkey"
+    case wssURL = "wssUrl"
+    case relayServerID = "relayServerId"
+    case currentSPKIPin = "currentSpkiPin"
+    case nextSPKIPin = "nextSpkiPin"
+    case expiresAtMs, machineRootPubkey, machineRootFingerprint, dataSignCert, machineDisplayName
+  }
+
+  public init(
+    formatVersion: UInt16,
+    relayProtocolVersion: UInt16,
+    pairRoute: Data,
+    inviteSecret: Data,
+    inviteHPKEPubkey: Data,
+    wssURL: String,
+    relayServerID: Data,
+    currentSPKIPin: Data,
+    nextSPKIPin: Data,
+    expiresAtMs: UInt64,
+    machineRootPubkey: Data,
+    machineRootFingerprint: Data,
+    dataSignCert: RuntimePairingSignedCertificateV1,
+    machineDisplayName: String
+  ) throws {
+    try runtimeV4ValidatePairingDisplayName(machineDisplayName)
+    let components = URLComponents(string: wssURL)
+    guard formatVersion == 1, relayProtocolVersion == 2,
+      !wssURL.isEmpty, wssURL.utf8.count <= 2 * 1024, !wssURL.utf8.contains(0),
+      components?.scheme == "wss", components?.host != nil,
+      components?.user == nil, components?.password == nil, components?.query == nil,
+      components?.fragment == nil, components?.port != 0, components?.percentEncodedPath == "/",
+      components?.string == wssURL,
+      expiresAtMs > 0,
+      dataSignCert.certRole == .data,
+      dataSignCert.generation > 0,
+      dataSignCert.trustEpoch > 0,
+      dataSignCert.notAfterMs != 0
+    else {
+      throw RuntimeV3MirrorError.invalidPairingPayload
+    }
+    try runtimeV3RequireData(pairRoute, count: 16, nonzero: true)
+    try runtimeV3RequireData(inviteSecret, count: 32, nonzero: true)
+    try runtimeV3RequireData(inviteHPKEPubkey, count: 32, nonzero: true)
+    try runtimeV3RequireData(relayServerID, count: 16, nonzero: true)
+    try runtimeV3RequireData(currentSPKIPin, count: 32, nonzero: true)
+    try runtimeV3RequireData(nextSPKIPin, count: 32, nonzero: true)
+    try runtimeV3RequireData(machineRootPubkey, count: 32, nonzero: true)
+    try runtimeV3RequireData(machineRootFingerprint, count: 32, nonzero: true)
+    guard runtimeV3SHA256(machineRootPubkey) == machineRootFingerprint else {
+      throw RuntimeV3MirrorError.invalidPairingPayload
+    }
+    try runtimeV3RequireData(dataSignCert.subjectPubkey, count: 32, nonzero: true)
+    try runtimeV3RequireData(dataSignCert.rootKeyID, count: 16, nonzero: true)
+    try runtimeV3RequireData(dataSignCert.signature, count: 64, nonzero: true)
+    self.formatVersion = formatVersion
+    self.relayProtocolVersion = relayProtocolVersion
+    self.pairRoute = pairRoute
+    self.inviteSecret = inviteSecret
+    self.inviteHPKEPubkey = inviteHPKEPubkey
+    self.wssURL = wssURL
+    self.relayServerID = relayServerID
+    self.currentSPKIPin = currentSPKIPin
+    self.nextSPKIPin = nextSPKIPin
+    self.expiresAtMs = expiresAtMs
+    self.machineRootPubkey = machineRootPubkey
+    self.machineRootFingerprint = machineRootFingerprint
+    self.dataSignCert = dataSignCert
+    self.machineDisplayName = machineDisplayName
+  }
+
+  public init(from decoder: Decoder) throws {
+    try runtimeV2RejectUnknownKeys(
+      decoder,
+      allowed: Set(CodingKeys.allCases.map(\.rawValue))
+    )
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    try self.init(
+      formatVersion: container.decode(UInt16.self, forKey: .formatVersion),
+      relayProtocolVersion: container.decode(UInt16.self, forKey: .relayProtocolVersion),
+      pairRoute: container.decode(Data.self, forKey: .pairRoute),
+      inviteSecret: container.decode(Data.self, forKey: .inviteSecret),
+      inviteHPKEPubkey: container.decode(Data.self, forKey: .inviteHPKEPubkey),
+      wssURL: container.decode(String.self, forKey: .wssURL),
+      relayServerID: container.decode(Data.self, forKey: .relayServerID),
+      currentSPKIPin: container.decode(Data.self, forKey: .currentSPKIPin),
+      nextSPKIPin: container.decode(Data.self, forKey: .nextSPKIPin),
+      expiresAtMs: container.decode(UInt64.self, forKey: .expiresAtMs),
+      machineRootPubkey: container.decode(Data.self, forKey: .machineRootPubkey),
+      machineRootFingerprint: container.decode(Data.self, forKey: .machineRootFingerprint),
+      dataSignCert: container.decode(RuntimePairingSignedCertificateV1.self, forKey: .dataSignCert),
+      machineDisplayName: container.decode(String.self, forKey: .machineDisplayName)
+    )
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    _ = try RuntimePairInvitePayloadV1(
+      formatVersion: formatVersion,
+      relayProtocolVersion: relayProtocolVersion,
+      pairRoute: pairRoute,
+      inviteSecret: inviteSecret,
+      inviteHPKEPubkey: inviteHPKEPubkey,
+      wssURL: wssURL,
+      relayServerID: relayServerID,
+      currentSPKIPin: currentSPKIPin,
+      nextSPKIPin: nextSPKIPin,
+      expiresAtMs: expiresAtMs,
+      machineRootPubkey: machineRootPubkey,
+      machineRootFingerprint: machineRootFingerprint,
+      dataSignCert: dataSignCert,
+      machineDisplayName: machineDisplayName
+    )
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(formatVersion, forKey: .formatVersion)
+    try container.encode(relayProtocolVersion, forKey: .relayProtocolVersion)
+    try container.encode(pairRoute, forKey: .pairRoute)
+    try container.encode(inviteSecret, forKey: .inviteSecret)
+    try container.encode(inviteHPKEPubkey, forKey: .inviteHPKEPubkey)
+    try container.encode(wssURL, forKey: .wssURL)
+    try container.encode(relayServerID, forKey: .relayServerID)
+    try container.encode(currentSPKIPin, forKey: .currentSPKIPin)
+    try container.encode(nextSPKIPin, forKey: .nextSPKIPin)
+    try container.encode(expiresAtMs, forKey: .expiresAtMs)
+    try container.encode(machineRootPubkey, forKey: .machineRootPubkey)
+    try container.encode(machineRootFingerprint, forKey: .machineRootFingerprint)
+    try container.encode(dataSignCert, forKey: .dataSignCert)
+    try container.encode(machineDisplayName, forKey: .machineDisplayName)
+  }
+}
+
+public struct RuntimePairInviteV4: Codable, Sendable {
+  public let pairingID: RuntimePairingID
+  public let invite: RuntimePairInvitePayloadV1
+
+  public init(pairingID: RuntimePairingID, invite: RuntimePairInvitePayloadV1) {
+    self.pairingID = pairingID
+    self.invite = invite
+  }
+
+  public init(from decoder: Decoder) throws {
+    try self.init(decodingFieldsFrom: decoder, allowed: ["pairingId", "invite"])
+  }
+
+  init(flattenedFrom decoder: Decoder) throws {
+    try runtimeV2ValidateDiscriminator(decoder, key: "reply", expected: "pairInvite")
+    try self.init(decodingFieldsFrom: decoder, allowed: ["reply", "pairingId", "invite"])
+  }
+
+  private init(decodingFieldsFrom decoder: Decoder, allowed: Set<String>) throws {
+    try runtimeV2RejectUnknownKeys(decoder, allowed: allowed)
+    let container = try decoder.container(keyedBy: RuntimeV2CodingKey.self)
+    self.init(
+      pairingID: try container.decode(RuntimePairingID.self, forKey: runtimeV2Key("pairingId")),
+      invite: try container.decode(RuntimePairInvitePayloadV1.self, forKey: runtimeV2Key("invite"))
+    )
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: RuntimeV2CodingKey.self)
+    try encodeFields(into: &container)
+  }
+
+  func encodeFields(into container: inout KeyedEncodingContainer<RuntimeV2CodingKey>) throws {
+    try container.encode(pairingID, forKey: runtimeV2Key("pairingId"))
+    try container.encode(invite, forKey: runtimeV2Key("invite"))
+  }
+}
+
+public struct RuntimePendingPairingV4: Codable, Sendable {
+  public let pairingID: RuntimePairingID
+  public let requestHash: Data
+  public let deviceSignFingerprint: Data
+  public let requestedAtMs: UInt64
+  public let expiresAtMs: UInt64
+
+  public init(
+    pairingID: RuntimePairingID,
+    requestHash: Data,
+    deviceSignFingerprint: Data,
+    requestedAtMs: UInt64,
+    expiresAtMs: UInt64
+  ) throws {
+    try runtimeV3RequireData(requestHash, count: 32, nonzero: true)
+    try runtimeV3RequireData(deviceSignFingerprint, count: 32, nonzero: true)
+    guard requestedAtMs <= expiresAtMs else {
+      throw RuntimeV3MirrorError.invalidPairingPayload
+    }
+    self.pairingID = pairingID
+    self.requestHash = requestHash
+    self.deviceSignFingerprint = deviceSignFingerprint
+    self.requestedAtMs = requestedAtMs
+    self.expiresAtMs = expiresAtMs
+  }
+
+  public init(from decoder: Decoder) throws {
+    try self.init(decodingFieldsFrom: decoder, allowed: Self.wireKeys)
+  }
+
+  init(flattenedFrom decoder: Decoder) throws {
+    try runtimeV2ValidateDiscriminator(decoder, key: "stream", expected: "pairingPending")
+    try self.init(decodingFieldsFrom: decoder, allowed: Self.wireKeys.union(["stream"]))
+  }
+
+  private init(decodingFieldsFrom decoder: Decoder, allowed: Set<String>) throws {
+    try runtimeV2RejectUnknownKeys(decoder, allowed: allowed)
+    let container = try decoder.container(keyedBy: RuntimeV2CodingKey.self)
+    try self.init(
+      pairingID: container.decode(RuntimePairingID.self, forKey: runtimeV2Key("pairingId")),
+      requestHash: container.decode(Data.self, forKey: runtimeV2Key("requestHash")),
+      deviceSignFingerprint: container.decode(
+        Data.self,
+        forKey: runtimeV2Key("deviceSignFingerprint")
+      ),
+      requestedAtMs: container.decode(UInt64.self, forKey: runtimeV2Key("requestedAtMs")),
+      expiresAtMs: container.decode(UInt64.self, forKey: runtimeV2Key("expiresAtMs"))
+    )
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: RuntimeV2CodingKey.self)
+    try encodeFields(into: &container)
+  }
+
+  func encodeFields(into container: inout KeyedEncodingContainer<RuntimeV2CodingKey>) throws {
+    try runtimeV3RequireData(requestHash, count: 32, nonzero: true)
+    try runtimeV3RequireData(deviceSignFingerprint, count: 32, nonzero: true)
+    guard requestedAtMs <= expiresAtMs else {
+      throw RuntimeV3MirrorError.invalidPairingPayload
+    }
+    try container.encode(pairingID, forKey: runtimeV2Key("pairingId"))
+    try container.encode(requestHash, forKey: runtimeV2Key("requestHash"))
+    try container.encode(
+      deviceSignFingerprint,
+      forKey: runtimeV2Key("deviceSignFingerprint")
+    )
+    try container.encode(requestedAtMs, forKey: runtimeV2Key("requestedAtMs"))
+    try container.encode(expiresAtMs, forKey: runtimeV2Key("expiresAtMs"))
+  }
+
+  private static let wireKeys: Set<String> = [
+    "pairingId", "requestHash", "deviceSignFingerprint", "requestedAtMs", "expiresAtMs",
+  ]
+}
+
+public enum RuntimePairingDecisionV4: String, Codable, Sendable {
+  case confirm
+  case cancel
+  case expire
+}
+
+public enum RuntimePairingStateV4: String, Codable, Sendable {
+  case routeOpening
+  case unused
+  case preparing
+  case awaitingLocalConfirmation
+  case grantPreparing
+  case grantCommitted
+  case orphanRevoking
+  case delivered
+  case expired
+  case canceled
+  case closedTombstone
+}
+
+public enum RuntimePairingReceiptV4: Codable, Sendable {
+  case confirmed(RuntimePairingID)
+  case canceled(RuntimePairingID)
+  case expired(RuntimePairingID)
+  case replayed(RuntimePairingID, decision: RuntimePairingDecisionV4, state: RuntimePairingStateV4)
+  case alreadyHandled(
+    RuntimePairingID,
+    winner: RuntimePairingDecisionV4,
+    state: RuntimePairingStateV4
+  )
+  case failed(RuntimeFailureV1)
+
+  public init(from decoder: Decoder) throws {
+    try self.init(decodingFieldsFrom: decoder, flattened: false)
+  }
+
+  init(flattenedFrom decoder: Decoder) throws {
+    try runtimeV2ValidateDiscriminator(decoder, key: "reply", expected: "pairing")
+    try self.init(decodingFieldsFrom: decoder, flattened: true)
+  }
+
+  private init(decodingFieldsFrom decoder: Decoder, flattened: Bool) throws {
+    let container = try decoder.container(keyedBy: RuntimeV2CodingKey.self)
+    let status = try container.decode(String.self, forKey: runtimeV2Key("status"))
+    let outer: Set<String> = flattened ? ["reply"] : []
+    switch status {
+    case "confirmed", "canceled", "expired":
+      try runtimeV2RejectUnknownKeys(
+        decoder,
+        allowed: Set(["status", "pairingId"]).union(outer)
+      )
+      let pairingID = try container.decode(
+        RuntimePairingID.self,
+        forKey: runtimeV2Key("pairingId")
+      )
+      switch status {
+      case "confirmed": self = .confirmed(pairingID)
+      case "canceled": self = .canceled(pairingID)
+      default: self = .expired(pairingID)
+      }
+    case "replayed":
+      try runtimeV2RejectUnknownKeys(
+        decoder,
+        allowed: Set(["status", "pairingId", "decision", "state"]).union(outer)
+      )
+      self = .replayed(
+        try container.decode(RuntimePairingID.self, forKey: runtimeV2Key("pairingId")),
+        decision: try container.decode(
+          RuntimePairingDecisionV4.self,
+          forKey: runtimeV2Key("decision")
+        ),
+        state: try container.decode(RuntimePairingStateV4.self, forKey: runtimeV2Key("state"))
+      )
+    case "alreadyHandled":
+      try runtimeV2RejectUnknownKeys(
+        decoder,
+        allowed: Set(["status", "pairingId", "winner", "state"]).union(outer)
+      )
+      self = .alreadyHandled(
+        try container.decode(RuntimePairingID.self, forKey: runtimeV2Key("pairingId")),
+        winner: try container.decode(
+          RuntimePairingDecisionV4.self,
+          forKey: runtimeV2Key("winner")
+        ),
+        state: try container.decode(RuntimePairingStateV4.self, forKey: runtimeV2Key("state"))
+      )
+    case "failed":
+      try runtimeV2RejectUnknownKeys(
+        decoder,
+        allowed: Set(["status", "failure"]).union(outer)
+      )
+      self = .failed(
+        try container.decode(RuntimeFailureV1.self, forKey: runtimeV2Key("failure"))
+      )
+    default:
+      throw DecodingError.dataCorruptedError(
+        forKey: runtimeV2Key("status"),
+        in: container,
+        debugDescription: "unsupported Runtime v4 pairing status \(status)"
+      )
+    }
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: RuntimeV2CodingKey.self)
+    try encodeFields(into: &container)
+  }
+
+  func encodeFields(into container: inout KeyedEncodingContainer<RuntimeV2CodingKey>) throws {
+    switch self {
+    case .confirmed(let pairingID):
+      try encodeSimple("confirmed", pairingID: pairingID, into: &container)
+    case .canceled(let pairingID):
+      try encodeSimple("canceled", pairingID: pairingID, into: &container)
+    case .expired(let pairingID):
+      try encodeSimple("expired", pairingID: pairingID, into: &container)
+    case .replayed(let pairingID, let decision, let state):
+      try encodeSimple("replayed", pairingID: pairingID, into: &container)
+      try container.encode(decision, forKey: runtimeV2Key("decision"))
+      try container.encode(state, forKey: runtimeV2Key("state"))
+    case .alreadyHandled(let pairingID, let winner, let state):
+      try encodeSimple("alreadyHandled", pairingID: pairingID, into: &container)
+      try container.encode(winner, forKey: runtimeV2Key("winner"))
+      try container.encode(state, forKey: runtimeV2Key("state"))
+    case .failed(let failure):
+      try container.encode("failed", forKey: runtimeV2Key("status"))
+      try container.encode(failure, forKey: runtimeV2Key("failure"))
+    }
+  }
+
+  private func encodeSimple(
+    _ status: String,
+    pairingID: RuntimePairingID,
+    into container: inout KeyedEncodingContainer<RuntimeV2CodingKey>
+  ) throws {
+    try container.encode(status, forKey: runtimeV2Key("status"))
+    try container.encode(pairingID, forKey: runtimeV2Key("pairingId"))
+  }
+}
+
 // MARK: - Runtime v3 machine administration
 
 public enum RuntimeV3MirrorError: Error, Equatable, Sendable {
@@ -1323,6 +1816,7 @@ public enum RuntimeV3MirrorError: Error, Equatable, Sendable {
   case invalidUninstallPurgePlan
   case invalidMachineRemoteStatus
   case zeroMachineRemoteBinding
+  case invalidPairingPayload
 }
 
 private func runtimeV3RequireData(

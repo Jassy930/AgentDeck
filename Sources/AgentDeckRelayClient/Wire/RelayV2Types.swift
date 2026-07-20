@@ -1,6 +1,9 @@
+import CryptoKit
 import Foundation
 
 public let relayProtocolVersionV2: UInt16 = 2
+/// E2EE info 中独立携带的当前 Runtime wire 版本；不改变 Relay v2 版本轴。
+public let relayE2ECurrentRuntimeProtocolVersionV4: UInt16 = 4
 
 public enum RelayWireCodecError: Error, Equatable, Sendable {
     case oversize
@@ -14,6 +17,7 @@ public enum RelayWireCodecError: Error, Equatable, Sendable {
     case invalidUTF8
     case invalidLength(field: String, expected: Int, actual: Int)
     case invalidVersion(field: String, expected: UInt16, actual: UInt16)
+    case invalidValue(field: String)
     case unknownField(String)
 }
 
@@ -317,7 +321,10 @@ public struct RelayV2Failure: Codable, Equatable, Sendable {
 public enum RelayEndpointWireType: String, Sendable {
     case pairInvite = "PairInviteV1"
     case pairRequest = "PairRequestV1"
+    case pairPending = "PairPendingV1"
+    case pairingControlEnvelope = "PairingControlEnvelopeV1"
     case pairResponse = "PairResponseV1"
+    case pairResponseReceived = "PairResponseReceivedV1"
     case deviceAuthorization = "DeviceAuthorizationV1"
     case keyDirectory = "KeyDirectoryV1"
     case keyUpdate = "KeyUpdateV1"
@@ -369,42 +376,96 @@ public struct RelayPairInviteV1: Codable, Sendable {
 
 public struct RelayPairRequestV1: Codable, Sendable {
     public var formatVersion: UInt16
-    public var inviteSecret: Data
-    public var deviceSignPubkey: Data
-    public var deviceHpkePubkey: Data
-    public var sealedAuthorizationRequest: Data
-    public var proofSignature: Data
+    public var enc: Data
+    public var ciphertext: Data
+    public var deviceProofSignature: Data
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case formatVersion, inviteSecret, deviceSignPubkey, deviceHpkePubkey
-        case sealedAuthorizationRequest, proofSignature
+        case formatVersion, enc, ciphertext, deviceProofSignature
     }
 
     public init(from decoder: Decoder) throws {
         try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
         let container = try decoder.container(keyedBy: CodingKeys.self)
         formatVersion = try container.decode(UInt16.self, forKey: .formatVersion)
-        inviteSecret = try container.decode(Data.self, forKey: .inviteSecret)
-        deviceSignPubkey = try container.decode(Data.self, forKey: .deviceSignPubkey)
-        deviceHpkePubkey = try container.decode(Data.self, forKey: .deviceHpkePubkey)
-        sealedAuthorizationRequest = try container.decode(
-            Data.self,
-            forKey: .sealedAuthorizationRequest
-        )
-        proofSignature = try container.decode(Data.self, forKey: .proofSignature)
+        enc = try container.decode(Data.self, forKey: .enc)
+        ciphertext = try container.decode(Data.self, forKey: .ciphertext)
+        deviceProofSignature = try container.decode(Data.self, forKey: .deviceProofSignature)
     }
 }
 
+public struct RelayPairPendingV1: Codable, Sendable {
+    public var requestHash: Data
+    public var signature: Data
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case requestHash, signature
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        requestHash = try container.decode(Data.self, forKey: .requestHash)
+        signature = try container.decode(Data.self, forKey: .signature)
+    }
+}
+
+public struct RelayPairingControlEnvelopeV1: Codable, Sendable {
+    public var formatVersion: UInt16
+    public var enc: Data
+    public var ciphertext: Data
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case formatVersion, enc, ciphertext
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try container.decode(UInt16.self, forKey: .formatVersion)
+        enc = try container.decode(Data.self, forKey: .enc)
+        ciphertext = try container.decode(Data.self, forKey: .ciphertext)
+    }
+}
+
+public enum RelayAuthorizationCapabilityV1: String, Codable, CaseIterable, Sendable {
+    case catalog
+    case conversation
+    case prompt
+    case command
+    case approval
+    case metadata
+    case selfRevocation
+}
+
+public enum RelayAuthorizationPermissionV1: String, Codable, CaseIterable, Sendable {
+    case catalogRead
+    case conversationRead
+    case conversationStart
+    case promptSend
+    case commandCancel
+    case approvalResolve
+    case approvalRetry
+    case metadataWrite
+    case revokeSelf
+}
+
 public struct RelayDeviceAuthorizationV1: Codable, Sendable {
+    public var formatVersion: UInt16
+    public var grantHash: Data
+    public var machineRoute: Data
+    public var deviceRoute: Data
+    public var deviceSignFingerprint: Data
     public var grantSerial: UInt64
     public var deviceHpkePubkey: Data
-    public var capabilities: [String]
-    public var permissions: [String]
+    public var capabilities: [RelayAuthorizationCapabilityV1]
+    public var permissions: [RelayAuthorizationPermissionV1]
     public var rootKeyId: Data
     public var trustEpoch: UInt64
     public var signature: Data
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
+        case formatVersion, grantHash, machineRoute, deviceRoute, deviceSignFingerprint
         case grantSerial, deviceHpkePubkey, capabilities, permissions
         case rootKeyId, trustEpoch, signature
     }
@@ -412,10 +473,21 @@ public struct RelayDeviceAuthorizationV1: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try container.decode(UInt16.self, forKey: .formatVersion)
+        grantHash = try container.decode(Data.self, forKey: .grantHash)
+        machineRoute = try container.decode(Data.self, forKey: .machineRoute)
+        deviceRoute = try container.decode(Data.self, forKey: .deviceRoute)
+        deviceSignFingerprint = try container.decode(Data.self, forKey: .deviceSignFingerprint)
         grantSerial = try container.decode(UInt64.self, forKey: .grantSerial)
         deviceHpkePubkey = try container.decode(Data.self, forKey: .deviceHpkePubkey)
-        capabilities = try container.decode([String].self, forKey: .capabilities)
-        permissions = try container.decode([String].self, forKey: .permissions)
+        capabilities = try container.decode(
+            [RelayAuthorizationCapabilityV1].self,
+            forKey: .capabilities
+        )
+        permissions = try container.decode(
+            [RelayAuthorizationPermissionV1].self,
+            forKey: .permissions
+        )
         rootKeyId = try container.decode(Data.self, forKey: .rootKeyId)
         trustEpoch = try container.decode(UInt64.self, forKey: .trustEpoch)
         signature = try container.decode(Data.self, forKey: .signature)
@@ -425,11 +497,12 @@ public struct RelayDeviceAuthorizationV1: Codable, Sendable {
 public struct RelayKeyDirectoryEntryV1: Codable, Sendable {
     public var keyId: KeyIDV1
     public var deviceRoute: Data
+    public var streamRoute: Data?
     public var enc: Data
     public var wrappedKey: Data
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case keyId, deviceRoute, enc, wrappedKey
+        case keyId, deviceRoute, streamRoute, enc, wrappedKey
     }
 
     public init(from decoder: Decoder) throws {
@@ -437,6 +510,7 @@ public struct RelayKeyDirectoryEntryV1: Codable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         keyId = try container.decode(KeyIDV1.self, forKey: .keyId)
         deviceRoute = try container.decode(Data.self, forKey: .deviceRoute)
+        streamRoute = try container.decodeIfPresent(Data.self, forKey: .streamRoute)
         enc = try container.decode(Data.self, forKey: .enc)
         wrappedKey = try container.decode(Data.self, forKey: .wrappedKey)
     }
@@ -460,27 +534,82 @@ public struct RelayKeyDirectoryV1: Codable, Sendable {
     }
 }
 
-public struct RelayPairResponseV1: Codable, Sendable {
+/// PairResponse 解密前必须可见、同时由 HPKE info 与 MachineDataSign 绑定的路由轴。
+/// Relay 只能看到其本来就持有的随机 route/serial；机器名与授权正文仍在 ciphertext 内。
+public struct RelayPairResponseInfoV1: Codable, Sendable {
+    public var e2eeFormatVersion: UInt16
+    public var runtimeProtocolVersion: UInt16
+    public var relayServerId: Data
+    public var pairRoute: Data
+    public var inviteHash: Data
+    public var expiryMs: UInt64
     public var requestHash: Data
-    public var relayGrant: RelayV2Grant
-    public var sealedDeviceAuthorization: Data
-    public var keyDirectory: RelayKeyDirectoryV1
+    public var machineRoute: Data
+    public var deviceRoute: Data
+    public var grantSerial: UInt64
+    public var rootTrustEpoch: UInt64
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case e2eeFormatVersion, runtimeProtocolVersion, relayServerId, pairRoute
+        case inviteHash, expiryMs, requestHash, machineRoute, deviceRoute
+        case grantSerial, rootTrustEpoch
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        e2eeFormatVersion = try container.decode(UInt16.self, forKey: .e2eeFormatVersion)
+        runtimeProtocolVersion = try container.decode(UInt16.self, forKey: .runtimeProtocolVersion)
+        relayServerId = try container.decode(Data.self, forKey: .relayServerId)
+        pairRoute = try container.decode(Data.self, forKey: .pairRoute)
+        inviteHash = try container.decode(Data.self, forKey: .inviteHash)
+        expiryMs = try container.decode(UInt64.self, forKey: .expiryMs)
+        requestHash = try container.decode(Data.self, forKey: .requestHash)
+        machineRoute = try container.decode(Data.self, forKey: .machineRoute)
+        deviceRoute = try container.decode(Data.self, forKey: .deviceRoute)
+        grantSerial = try container.decode(UInt64.self, forKey: .grantSerial)
+        rootTrustEpoch = try container.decode(UInt64.self, forKey: .rootTrustEpoch)
+    }
+}
+
+public struct RelayPairResponseV1: Codable, Sendable {
+    public var formatVersion: UInt16
+    public var info: RelayPairResponseInfoV1
+    public var enc: Data
+    public var ciphertext: Data
+    public var machineDataSignature: Data
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case formatVersion, info, enc, ciphertext, machineDataSignature
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try container.decode(UInt16.self, forKey: .formatVersion)
+        info = try container.decode(RelayPairResponseInfoV1.self, forKey: .info)
+        enc = try container.decode(Data.self, forKey: .enc)
+        ciphertext = try container.decode(Data.self, forKey: .ciphertext)
+        machineDataSignature = try container.decode(Data.self, forKey: .machineDataSignature)
+    }
+}
+
+public struct RelayPairResponseReceivedV1: Codable, Sendable {
+    public var requestHash: Data
+    public var grantHash: Data
+    public var responseHash: Data
     public var signature: Data
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case requestHash, relayGrant, sealedDeviceAuthorization, keyDirectory, signature
+        case requestHash, grantHash, responseHash, signature
     }
 
     public init(from decoder: Decoder) throws {
         try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
         let container = try decoder.container(keyedBy: CodingKeys.self)
         requestHash = try container.decode(Data.self, forKey: .requestHash)
-        relayGrant = try container.decode(RelayV2Grant.self, forKey: .relayGrant)
-        sealedDeviceAuthorization = try container.decode(
-            Data.self,
-            forKey: .sealedDeviceAuthorization
-        )
-        keyDirectory = try container.decode(RelayKeyDirectoryV1.self, forKey: .keyDirectory)
+        grantHash = try container.decode(Data.self, forKey: .grantHash)
+        responseHash = try container.decode(Data.self, forKey: .responseHash)
         signature = try container.decode(Data.self, forKey: .signature)
     }
 }
@@ -489,12 +618,13 @@ public struct RelayKeyUpdateV1: Codable, Sendable {
     public var keyDirectoryRevision: UInt64
     public var keyId: KeyIDV1
     public var deviceRoute: Data
+    public var streamRoute: Data?
     public var enc: Data
     public var wrappedKey: Data
     public var signature: Data
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case keyDirectoryRevision, keyId, deviceRoute, enc, wrappedKey, signature
+        case keyDirectoryRevision, keyId, deviceRoute, streamRoute, enc, wrappedKey, signature
     }
 
     public init(from decoder: Decoder) throws {
@@ -503,6 +633,7 @@ public struct RelayKeyUpdateV1: Codable, Sendable {
         keyDirectoryRevision = try container.decode(UInt64.self, forKey: .keyDirectoryRevision)
         keyId = try container.decode(KeyIDV1.self, forKey: .keyId)
         deviceRoute = try container.decode(Data.self, forKey: .deviceRoute)
+        streamRoute = try container.decodeIfPresent(Data.self, forKey: .streamRoute)
         enc = try container.decode(Data.self, forKey: .enc)
         wrappedKey = try container.decode(Data.self, forKey: .wrappedKey)
         signature = try container.decode(Data.self, forKey: .signature)
@@ -600,7 +731,10 @@ public struct RelaySealedPayloadV1: Codable, Sendable {
 public enum RelayEndpointPayloadV1: Sendable {
     case pairInvite(RelayPairInviteV1)
     case pairRequest(RelayPairRequestV1)
+    case pairPending(RelayPairPendingV1)
+    case pairingControlEnvelope(RelayPairingControlEnvelopeV1)
     case pairResponse(RelayPairResponseV1)
+    case pairResponseReceived(RelayPairResponseReceivedV1)
     case deviceAuthorization(RelayDeviceAuthorizationV1)
     case keyDirectory(RelayKeyDirectoryV1)
     case keyUpdate(RelayKeyUpdateV1)
@@ -1215,6 +1349,13 @@ public struct RelayV2OutboundFrame: Sendable {
         pairRoute: Data,
         payload: RelayEndpointPayloadV1
     ) throws -> Self {
+        switch payload {
+        case .pairRequest, .pairingControlEnvelope, .pairResponse:
+            break
+        case .pairInvite, .pairPending, .pairResponseReceived, .deviceAuthorization,
+             .keyDirectory, .keyUpdate, .epochBarrier, .sealedPayload:
+            throw RelayWireCodecError.invalidValue(field: "PairData.payload")
+        }
         return Self(
             body: .pairData(
                 pairRoute: pairRoute,
@@ -1752,8 +1893,18 @@ public enum RelayV2JSONCodec {
             payload = .pairInvite(try decoder.decode(RelayPairInviteV1.self, from: data))
         case .pairRequest:
             payload = .pairRequest(try decoder.decode(RelayPairRequestV1.self, from: data))
+        case .pairPending:
+            payload = .pairPending(try decoder.decode(RelayPairPendingV1.self, from: data))
+        case .pairingControlEnvelope:
+            payload = .pairingControlEnvelope(
+                try decoder.decode(RelayPairingControlEnvelopeV1.self, from: data)
+            )
         case .pairResponse:
             payload = .pairResponse(try decoder.decode(RelayPairResponseV1.self, from: data))
+        case .pairResponseReceived:
+            payload = .pairResponseReceived(
+                try decoder.decode(RelayPairResponseReceivedV1.self, from: data)
+            )
         case .deviceAuthorization:
             payload = .deviceAuthorization(
                 try decoder.decode(RelayDeviceAuthorizationV1.self, from: data)
@@ -1777,7 +1928,10 @@ public enum RelayV2JSONCodec {
         switch payload {
         case .pairInvite(let value): return try encoder.encode(value)
         case .pairRequest(let value): return try encoder.encode(value)
+        case .pairPending(let value): return try encoder.encode(value)
+        case .pairingControlEnvelope(let value): return try encoder.encode(value)
         case .pairResponse(let value): return try encoder.encode(value)
+        case .pairResponseReceived(let value): return try encoder.encode(value)
         case .deviceAuthorization(let value): return try encoder.encode(value)
         case .keyDirectory(let value): return try encoder.encode(value)
         case .keyUpdate(let value): return try encoder.encode(value)
@@ -1807,29 +1961,44 @@ public enum RelayV2JSONCodec {
         case .pairRequest:
             try exactKeys(
                 object,
-                allowed: [
-                    "formatVersion", "inviteSecret", "deviceSignPubkey", "deviceHpkePubkey",
-                    "sealedAuthorizationRequest", "proofSignature",
-                ],
+                allowed: ["formatVersion", "enc", "ciphertext", "deviceProofSignature"],
                 path: path
             )
+        case .pairPending:
+            try exactKeys(object, allowed: ["requestHash", "signature"], path: path)
+        case .pairingControlEnvelope:
+            try exactKeys(object, allowed: ["formatVersion", "enc", "ciphertext"], path: path)
         case .pairResponse:
             try exactKeys(
                 object,
-                allowed: [
-                    "requestHash", "relayGrant", "sealedDeviceAuthorization", "keyDirectory",
-                    "signature",
-                ],
+                allowed: ["formatVersion", "info", "enc", "ciphertext", "machineDataSignature"],
                 path: path
             )
-            try validateGrant(object["relayGrant"], path: "\(path).relayGrant")
-            try validateKeyDirectory(object["keyDirectory"], path: "\(path).keyDirectory")
+            guard let info = object["info"] as? [String: Any] else {
+                throw RelayWireCodecError.invalidValue(field: "\(path).info")
+            }
+            try exactKeys(
+                info,
+                allowed: [
+                    "e2eeFormatVersion", "runtimeProtocolVersion", "relayServerId",
+                    "pairRoute", "inviteHash", "expiryMs", "requestHash", "machineRoute",
+                    "deviceRoute", "grantSerial", "rootTrustEpoch",
+                ],
+                path: "\(path).info"
+            )
+        case .pairResponseReceived:
+            try exactKeys(
+                object,
+                allowed: ["requestHash", "grantHash", "responseHash", "signature"],
+                path: path
+            )
         case .deviceAuthorization:
             try exactKeys(
                 object,
                 allowed: [
-                    "grantSerial", "deviceHpkePubkey", "capabilities", "permissions",
-                    "rootKeyId", "trustEpoch", "signature",
+                    "formatVersion", "grantHash", "machineRoute", "deviceRoute",
+                    "deviceSignFingerprint", "grantSerial", "deviceHpkePubkey",
+                    "capabilities", "permissions", "rootKeyId", "trustEpoch", "signature",
                 ],
                 path: path
             )
@@ -1839,8 +2008,8 @@ public enum RelayV2JSONCodec {
             try exactKeys(
                 object,
                 allowed: [
-                    "keyDirectoryRevision", "keyId", "deviceRoute", "enc", "wrappedKey",
-                    "signature",
+                    "keyDirectoryRevision", "keyId", "deviceRoute", "streamRoute", "enc",
+                    "wrappedKey", "signature",
                 ],
                 path: path
             )
@@ -1899,7 +2068,7 @@ public enum RelayV2JSONCodec {
             let entryPath = "\(path).entries[\(index)]"
             try exactKeys(
                 entry,
-                allowed: ["keyId", "deviceRoute", "enc", "wrappedKey"],
+                allowed: ["keyId", "deviceRoute", "streamRoute", "enc", "wrappedKey"],
                 path: entryPath
             )
             try validateKeyID(entry["keyId"], path: "\(entryPath).keyId")
@@ -1922,37 +2091,90 @@ public enum RelayV2JSONCodec {
                 expected: relayProtocolVersionV2,
                 field: "relayProtocolVersion"
             )
-            try require(value.pairRoute, count: 16, field: "pairRoute")
-            try require(value.inviteSecret, count: 32, field: "inviteSecret")
-            try require(value.inviteHpkePubkey, count: 32, field: "inviteHpkePubkey")
-            try require(value.relayServerId, count: 16, field: "relayServerId")
-            try require(value.currentSpkiPin, count: 32, field: "currentSpkiPin")
-            try require(value.nextSpkiPin, count: 32, field: "nextSpkiPin")
-            try require(value.machineRootPubkey, count: 32, field: "machineRootPubkey")
-            try require(
+            try requireNonzero(value.pairRoute, count: 16, field: "pairRoute")
+            try requireNonzero(value.inviteSecret, count: 32, field: "inviteSecret")
+            try requireNonzero(value.inviteHpkePubkey, count: 32, field: "inviteHpkePubkey")
+            try requireNonzero(value.relayServerId, count: 16, field: "relayServerId")
+            try requireNonzero(value.currentSpkiPin, count: 32, field: "currentSpkiPin")
+            try requireNonzero(value.nextSpkiPin, count: 32, field: "nextSpkiPin")
+            try requireNonzero(value.machineRootPubkey, count: 32, field: "machineRootPubkey")
+            try requireNonzero(
                 value.machineRootFingerprint,
                 count: 32,
                 field: "machineRootFingerprint"
             )
+            guard Data(SHA256.hash(data: value.machineRootPubkey)) == value.machineRootFingerprint,
+                  value.expiresAtMs > 0,
+                  value.dataSignCert.certRole == .data,
+                  value.dataSignCert.generation > 0,
+                  value.dataSignCert.trustEpoch > 0,
+                  value.dataSignCert.notAfterMs != 0
+            else {
+                throw RelayWireCodecError.invalidValue(field: "PairInviteV1")
+            }
+            try validatePairingDisplayName(value.machineDisplayName)
+            try validatePairingWSSURL(value.wssUrl)
             try validateCertificateLengths(value.dataSignCert)
         case .pairRequest(let value):
             try requireVersion(value.formatVersion, expected: 1, field: "formatVersion")
-            try require(value.inviteSecret, count: 32, field: "inviteSecret")
-            try require(value.deviceSignPubkey, count: 32, field: "deviceSignPubkey")
-            try require(value.deviceHpkePubkey, count: 32, field: "deviceHpkePubkey")
-            try require(value.proofSignature, count: 64, field: "proofSignature")
+            try requireNonzero(value.enc, count: 32, field: "enc")
+            try requireBoundedCiphertext(value.ciphertext, field: "ciphertext")
+            try requireNonzero(
+                value.deviceProofSignature,
+                count: 64,
+                field: "deviceProofSignature"
+            )
+        case .pairPending(let value):
+            try requireNonzero(value.requestHash, count: 32, field: "requestHash")
+            try requireNonzero(value.signature, count: 64, field: "signature")
+        case .pairingControlEnvelope(let value):
+            try requireVersion(value.formatVersion, expected: 1, field: "formatVersion")
+            try requireNonzero(value.enc, count: 32, field: "enc")
+            try requireBoundedCiphertext(value.ciphertext, field: "ciphertext")
         case .pairResponse(let value):
-            try require(value.requestHash, count: 32, field: "requestHash")
-            try validateGrantLengths(value.relayGrant)
-            try validateDirectoryLengths(value.keyDirectory)
-            try require(value.signature, count: 64, field: "signature")
+            try requireVersion(value.formatVersion, expected: 1, field: "formatVersion")
+            try requireVersion(
+                value.info.e2eeFormatVersion,
+                expected: 1,
+                field: "info.e2eeFormatVersion"
+            )
+            try requireVersion(
+                value.info.runtimeProtocolVersion,
+                expected: relayE2ECurrentRuntimeProtocolVersionV4,
+                field: "info.runtimeProtocolVersion"
+            )
+            try requireNonzero(value.info.relayServerId, count: 16, field: "info.relayServerId")
+            try requireNonzero(value.info.pairRoute, count: 16, field: "info.pairRoute")
+            try requireNonzero(value.info.inviteHash, count: 32, field: "info.inviteHash")
+            guard value.info.expiryMs > 0 else {
+                throw RelayWireCodecError.invalidValue(field: "info.expiryMs")
+            }
+            try requireNonzero(value.info.requestHash, count: 32, field: "info.requestHash")
+            try requireNonzero(value.info.machineRoute, count: 16, field: "info.machineRoute")
+            try requireNonzero(value.info.deviceRoute, count: 16, field: "info.deviceRoute")
+            guard value.info.grantSerial > 0, value.info.rootTrustEpoch > 0 else {
+                throw RelayWireCodecError.invalidValue(field: "info.monotonicAxes")
+            }
+            try requireNonzero(value.enc, count: 32, field: "enc")
+            try requireBoundedCiphertext(value.ciphertext, field: "ciphertext")
+            try requireNonzero(
+                value.machineDataSignature,
+                count: 64,
+                field: "machineDataSignature"
+            )
+        case .pairResponseReceived(let value):
+            try requireNonzero(value.requestHash, count: 32, field: "requestHash")
+            try requireNonzero(value.grantHash, count: 32, field: "grantHash")
+            try requireNonzero(value.responseHash, count: 32, field: "responseHash")
+            try requireNonzero(value.signature, count: 64, field: "signature")
         case .deviceAuthorization(let value):
-            try require(value.deviceHpkePubkey, count: 32, field: "deviceHpkePubkey")
-            try require(value.rootKeyId, count: 16, field: "rootKeyId")
-            try require(value.signature, count: 64, field: "signature")
+            try validateDeviceAuthorization(value)
         case .keyDirectory(let value): try validateDirectoryLengths(value)
         case .keyUpdate(let value):
             try require(value.deviceRoute, count: 16, field: "deviceRoute")
+            if let streamRoute = value.streamRoute {
+                try require(streamRoute, count: 16, field: "streamRoute")
+            }
             try require(value.signature, count: 64, field: "signature")
         case .epochBarrier(let value):
             try require(value.streamGeneration, count: 16, field: "streamGeneration")
@@ -1962,9 +2184,9 @@ public enum RelayV2JSONCodec {
     }
 
     private static func validateCertificateLengths(_ value: RelayV2SignedCertificate) throws {
-        try require(value.subjectPubkey, count: 32, field: "subjectPubkey")
-        try require(value.rootKeyId, count: 16, field: "rootKeyId")
-        try require(value.signature, count: 64, field: "signature")
+        try requireNonzero(value.subjectPubkey, count: 32, field: "subjectPubkey")
+        try requireNonzero(value.rootKeyId, count: 16, field: "rootKeyId")
+        try requireNonzero(value.signature, count: 64, field: "signature")
     }
 
     private static func validateGrantLengths(_ value: RelayV2Grant) throws {
@@ -1979,6 +2201,9 @@ public enum RelayV2JSONCodec {
         try require(value.signature, count: 64, field: "keyDirectory.signature")
         for entry in value.entries {
             try require(entry.deviceRoute, count: 16, field: "keyDirectory.deviceRoute")
+            if let streamRoute = entry.streamRoute {
+                try require(streamRoute, count: 16, field: "keyDirectory.streamRoute")
+            }
         }
     }
 
@@ -1989,6 +2214,112 @@ public enum RelayV2JSONCodec {
                 expected: count,
                 actual: value.count
             )
+        }
+    }
+
+    private static func requireNonzero(_ value: Data, count: Int, field: String) throws {
+        try require(value, count: count, field: field)
+        guard !value.allSatisfy({ $0 == 0 }) else {
+            throw RelayWireCodecError.invalidValue(field: field)
+        }
+    }
+
+    private static func requireBoundedCiphertext(_ value: Data, field: String) throws {
+        guard !value.isEmpty, value.count <= 256 * 1024 else {
+            throw RelayWireCodecError.invalidValue(field: field)
+        }
+    }
+
+    private static func validatePairingDisplayName(_ value: String) throws {
+        guard !value.isEmpty,
+              value.utf8.count <= 128,
+              value.trimmingCharacters(in: .whitespacesAndNewlines) == value,
+              !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else {
+            throw RelayWireCodecError.invalidValue(field: "machineDisplayName")
+        }
+    }
+
+    private static func validatePairingWSSURL(_ value: String) throws {
+        let components = URLComponents(string: value)
+        guard value.utf8.count <= 2 * 1024,
+              components?.scheme == "wss",
+              components?.host != nil,
+              components?.user == nil,
+              components?.password == nil,
+              components?.query == nil,
+              components?.fragment == nil,
+              components?.port != 0,
+              components?.percentEncodedPath == "/",
+              components?.string == value
+        else {
+            throw RelayWireCodecError.invalidValue(field: "wssUrl")
+        }
+    }
+
+    private static func validateDeviceAuthorization(
+        _ value: RelayDeviceAuthorizationV1
+    ) throws {
+        try requireVersion(value.formatVersion, expected: 1, field: "formatVersion")
+        try requireNonzero(value.grantHash, count: 32, field: "grantHash")
+        try requireNonzero(value.machineRoute, count: 16, field: "machineRoute")
+        try requireNonzero(value.deviceRoute, count: 16, field: "deviceRoute")
+        try requireNonzero(
+            value.deviceSignFingerprint,
+            count: 32,
+            field: "deviceSignFingerprint"
+        )
+        guard value.grantSerial > 0, value.trustEpoch > 0 else {
+            throw RelayWireCodecError.invalidValue(field: "DeviceAuthorizationV1")
+        }
+        try requireNonzero(value.deviceHpkePubkey, count: 32, field: "deviceHpkePubkey")
+        try requireNonzero(value.rootKeyId, count: 16, field: "rootKeyId")
+        try requireNonzero(value.signature, count: 64, field: "signature")
+        guard !value.capabilities.isEmpty,
+              value.capabilities.count <= RelayAuthorizationCapabilityV1.allCases.count,
+              value.capabilities == value.capabilities.sorted(by: capabilityPrecedes),
+              Set(value.capabilities.map(\.rawValue)).count == value.capabilities.count,
+              !value.permissions.isEmpty,
+              value.permissions.count <= RelayAuthorizationPermissionV1.allCases.count,
+              value.permissions == value.permissions.sorted(by: permissionPrecedes),
+              Set(value.permissions.map(\.rawValue)).count == value.permissions.count,
+              value.permissions.allSatisfy({ permission in
+                  value.capabilities.contains(requiredCapability(for: permission))
+              })
+        else {
+            throw RelayWireCodecError.invalidValue(
+                field: "DeviceAuthorizationV1.authorization"
+            )
+        }
+    }
+
+    private static func capabilityPrecedes(
+        _ lhs: RelayAuthorizationCapabilityV1,
+        _ rhs: RelayAuthorizationCapabilityV1
+    ) -> Bool {
+        RelayAuthorizationCapabilityV1.allCases.firstIndex(of: lhs)!
+            < RelayAuthorizationCapabilityV1.allCases.firstIndex(of: rhs)!
+    }
+
+    private static func permissionPrecedes(
+        _ lhs: RelayAuthorizationPermissionV1,
+        _ rhs: RelayAuthorizationPermissionV1
+    ) -> Bool {
+        RelayAuthorizationPermissionV1.allCases.firstIndex(of: lhs)!
+            < RelayAuthorizationPermissionV1.allCases.firstIndex(of: rhs)!
+    }
+
+    private static func requiredCapability(
+        for permission: RelayAuthorizationPermissionV1
+    ) -> RelayAuthorizationCapabilityV1 {
+        switch permission {
+        case .catalogRead: .catalog
+        case .conversationRead, .conversationStart: .conversation
+        case .promptSend: .prompt
+        case .commandCancel: .command
+        case .approvalResolve, .approvalRetry: .approval
+        case .metadataWrite: .metadata
+        case .revokeSelf: .selfRevocation
         }
     }
 

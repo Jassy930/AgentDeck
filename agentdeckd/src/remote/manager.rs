@@ -5,16 +5,17 @@
 //! [`RemoteStartPermit`] 才能 arm。所有失败只阻断 remote，本地 Runtime 继续服务。
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::relay_v2::{
     ENROLLMENT_BUNDLE_VERSION, EnrollmentBundleV2, MachineEnrollmentRequestV1, MachineRouteId,
 };
+use agentdeck_protocol::runtime::identity::{DeviceHandle, GrantSerial};
 use agentdeck_protocol::runtime::{
     MachineEnrollRequest, MachineRemoteFailureCode,
     MachineRemoteLifecycle as WireMachineRemoteLifecycle, MachineRemoteStatus,
-    MachineRootFingerprint, TrustResetRequest, UninstallPurgePlanV1,
+    MachineRootFingerprint, RevocationReceipt, TrustResetRequest, UninstallPurgePlanV1,
 };
 use async_trait::async_trait;
 use tokio::sync::{Mutex, watch};
@@ -32,6 +33,10 @@ use crate::runtime::store::{
     MachineRemoteStateRecord, RuntimeStoreError, RuntimeStoreHandle,
     machine_enrollment_prepare_input_hash,
 };
+use crate::runtime::{
+    PairingAdministration, PairingAdministrationError, PairingPendingSink,
+    RevocationAdministration, RevocationAdministrationError,
+};
 use crate::security::KeyStore;
 
 use super::bootstrap::{
@@ -42,7 +47,10 @@ use super::config::{
     EnrollmentConfigError, ValidatedEnrollmentConfig, validate_sealed_relay_connection,
 };
 use super::enrollment::{FrozenMachineEnrollment, MachineEnrollmentError};
-use super::transport::{RemoteTransport, RemoteTransportConnectError};
+use super::pairing::{
+    PairingCoordinatorOwner, PairingInviteContext, unavailable as pairing_unavailable,
+};
+use super::transport::{PairingRuntimeParts, RemoteTransport, RemoteTransportConnectError};
 use super::trust_reset::{MachineTrustResetWorkflow, MachineTrustResetWorkflowError};
 use super::workflow::MachineEnrollmentWorkflow;
 
@@ -230,6 +238,7 @@ pub struct RemoteManager {
     config: DaemonConfig,
     purge_plan_sink: Arc<dyn PurgePlanSink>,
     enrollment_workflow: MachineEnrollmentWorkflow,
+    pairing_pending_sink: OnceLock<Arc<dyn PairingPendingSink>>,
     shutdown_tx: watch::Sender<bool>,
     state: Mutex<RemoteManagerState>,
 }
@@ -242,6 +251,9 @@ struct RemoteManagerState {
     identity: Option<Box<ActiveMachineIdentity>>,
     start_permit: Option<RemoteStartPermit>,
     transport: Option<RemoteTransport>,
+    pairing: Option<PairingCoordinatorOwner>,
+    #[cfg(test)]
+    pairing_handle_for_test: Option<super::pairing::PairingCoordinatorHandle>,
     connect_retry: Option<RemoteTransportConnectError>,
     blocked_code: Option<String>,
 }
@@ -275,6 +287,7 @@ impl RemoteManager {
             config,
             purge_plan_sink,
             enrollment_workflow: MachineEnrollmentWorkflow::new(),
+            pairing_pending_sink: OnceLock::new(),
             shutdown_tx: watch::channel(false).0,
             state: Mutex::new(RemoteManagerState {
                 enabled,
@@ -284,6 +297,9 @@ impl RemoteManager {
                 identity,
                 start_permit: None,
                 transport: None,
+                pairing: None,
+                #[cfg(test)]
+                pairing_handle_for_test: None,
                 connect_retry: None,
                 blocked_code,
             }),
@@ -294,6 +310,12 @@ impl RemoteManager {
     pub fn with_purge_plan_sink(mut self, sink: Arc<dyn PurgePlanSink>) -> Self {
         self.purge_plan_sink = sink;
         self
+    }
+
+    /// RuntimeCore 构造后、remote arm 前单次安装 local-only pending sink。
+    /// sink 只持 connection registry，不反向持有 Core 或 manager。
+    pub fn install_pairing_pending_sink(&self, sink: Arc<dyn PairingPendingSink>) -> bool {
+        self.pairing_pending_sink.set(sink).is_ok()
     }
 
     #[cfg(test)]
@@ -339,6 +361,7 @@ impl RemoteManager {
         self.shutdown_tx.send_replace(true);
         let mut state = self.state.lock().await;
         state.stopped = true;
+        stop_pairing_actor(&mut state).await;
         if let Some(mut transport) = state.transport.take() {
             transport.shutdown().await;
         }
@@ -382,7 +405,7 @@ impl RemoteManager {
                 let record = pending.record.clone();
                 let binding = pending.binding.clone();
                 let link_cert = pending.link_cert.clone();
-                self.connect_parts(state, record, binding, connection, link_cert)
+                self.connect_parts(state, record, binding, connection, link_cert, None)
                     .await?;
                 self.await_trust_reset(
                     MachineTrustResetWorkflow::new()
@@ -759,6 +782,7 @@ impl RemoteManager {
         if state.connect_retry.is_some() {
             return Err(admin_error(REMOTE_STATE_CONFLICT));
         }
+        stop_pairing_actor(state).await;
         if let Some(transport) = state.transport.take() {
             let permit = transport
                 .shutdown_and_reclaim_start_permit()
@@ -776,12 +800,14 @@ impl RemoteManager {
         state: &mut RemoteManagerState,
         active: ActiveMachineEnrollmentState,
     ) -> Result<(), RemoteAdministrationError> {
+        let data_cert = active.data_cert;
         self.connect_parts(
             state,
             active.record,
             active.binding,
             active.connection,
             active.link_cert,
+            Some(data_cert),
         )
         .await
     }
@@ -793,6 +819,7 @@ impl RemoteManager {
         binding: crate::runtime::store::MachineIdentityBinding,
         connection: MachineEnrollmentConnectionMaterial,
         link_cert: agentdeck_protocol::relay_v2::SignedCertificate,
+        data_cert: Option<agentdeck_protocol::relay_v2::SignedCertificate>,
     ) -> Result<(), RemoteAdministrationError> {
         if state.transport.is_some() {
             return Ok(());
@@ -826,6 +853,7 @@ impl RemoteManager {
             .identity
             .take()
             .expect("identity presence checked under the manager mutex");
+        let pairing_connection = connection.clone();
         match RemoteTransport::connect(
             identity.arm(permit),
             client_config,
@@ -834,11 +862,25 @@ impl RemoteManager {
         )
         .await
         {
-            Ok(transport) => {
+            Ok(mut transport) => {
+                let pairing_start = if let Some(data_cert) = data_cert {
+                    self.start_pairing_actor(state, &mut transport, pairing_connection, data_cert)
+                        .await
+                } else {
+                    Ok(())
+                };
                 state.transport = Some(transport);
                 state.connect_retry = None;
-                state.blocked_code = None;
-                Ok(())
+                match pairing_start {
+                    Ok(()) => {
+                        state.blocked_code = None;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        state.blocked_code = Some(error.code().to_owned());
+                        Err(error)
+                    }
+                }
             }
             Err(error) => {
                 let code = error.code().to_owned();
@@ -858,10 +900,31 @@ impl RemoteManager {
             .take()
             .ok_or_else(|| admin_error(REMOTE_STATE_CONFLICT))?;
         match retry.retry().await {
-            Ok(transport) => {
+            Ok(mut transport) => {
+                let pairing_start = match self.store.load_machine_enrollment_state().await? {
+                    Some(MachineEnrollmentState::Active(active)) => {
+                        self.start_pairing_actor(
+                            state,
+                            &mut transport,
+                            active.connection,
+                            active.data_cert,
+                        )
+                        .await
+                    }
+                    Some(MachineEnrollmentState::RetirePending(_)) => Ok(()),
+                    _ => Err(admin_error(REMOTE_STATE_CONFLICT)),
+                };
                 state.transport = Some(transport);
-                state.blocked_code = None;
-                Ok(())
+                match pairing_start {
+                    Ok(()) => {
+                        state.blocked_code = None;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        state.blocked_code = Some(error.code().to_owned());
+                        Err(error)
+                    }
+                }
             }
             Err(error) => {
                 let code = error.code().to_owned();
@@ -872,12 +935,53 @@ impl RemoteManager {
         }
     }
 
+    async fn start_pairing_actor(
+        &self,
+        state: &mut RemoteManagerState,
+        transport: &mut RemoteTransport,
+        connection: MachineEnrollmentConnectionMaterial,
+        data_cert: agentdeck_protocol::relay_v2::SignedCertificate,
+    ) -> Result<(), RemoteAdministrationError> {
+        if state.pairing.is_some() {
+            return Err(admin_error(REMOTE_STATE_CONFLICT));
+        }
+        let pending_sink = self
+            .pairing_pending_sink
+            .get()
+            .cloned()
+            .ok_or_else(|| admin_error("daemon.pairing.sink_unavailable"))?;
+        let PairingRuntimeParts { lane, authority } = transport
+            .take_pairing_runtime(data_cert)
+            .map_err(|error| admin_error(error.code()))?;
+        let invite_anchor = authority
+            .invite_anchor()
+            .map_err(|error| admin_error(error.code()))?;
+        let invite_context = PairingInviteContext::new(
+            connection.public_wss_url,
+            &connection.spki_pins,
+            invite_anchor.clone(),
+        )
+        .map_err(|error| admin_error(error.code()))?;
+        let (owner, ready) = PairingCoordinatorOwner::start(
+            self.store.clone(),
+            lane,
+            authority,
+            invite_anchor,
+            invite_context,
+            pending_sink,
+        )
+        .await;
+        state.pairing = Some(owner);
+        ready.map_err(|error| admin_error(error.code()))
+    }
+
     async fn cleanup(
         &self,
         state: &mut RemoteManagerState,
     ) -> Result<(), RemoteAdministrationError> {
         state.identity = None;
         state.connect_retry = None;
+        stop_pairing_actor(state).await;
         let transport = state.transport.take();
         match MachineCleanupWorkflow::new()
             .run(&self.store, self.key_store.as_ref(), transport)
@@ -964,8 +1068,151 @@ impl RemoteAdministration for RemoteManager {
         &self,
         request: TrustResetRequest,
     ) -> Result<MachineRemoteStatus, RemoteAdministrationError> {
-        let mut state = self.state.lock().await;
-        self.trust_reset_locked(&mut state, request).await
+        let (portable_root_lost, pairing) = {
+            let state = self.state.lock().await;
+            require_running_armed(&state)?;
+            let pairing = state.pairing.as_ref().map(PairingCoordinatorOwner::handle);
+            #[cfg(test)]
+            let pairing = state.pairing_handle_for_test.clone().or(pairing);
+            let portable_root_lost = request.admin_purge_receipt().is_some()
+                && state.identity.is_none()
+                && state.transport.is_none()
+                && state.connect_retry.is_none()
+                && pairing.is_none();
+            (portable_root_lost, pairing)
+        };
+        if let Some(handle) = pairing.as_ref() {
+            if let Err(error) = handle.begin_drain().await {
+                let _ = handle.resume_after_failed_drain().await;
+                return Err(admin_error(error.code()));
+            }
+        } else if !portable_root_lost && !self.store.list_pairing_recovery().await?.is_empty() {
+            // 无 portable absent proof 时不能跳过 PairRoute close/revoke cleanup。
+            return Err(admin_error("daemon.pairing.active"));
+        }
+        let result = {
+            let mut state = self.state.lock().await;
+            self.trust_reset_locked(&mut state, request).await
+        };
+        if result.is_err()
+            && let Some(handle) = pairing.as_ref()
+            && matches!(
+                self.store.load_machine_enrollment_state().await,
+                Ok(Some(MachineEnrollmentState::Active(_)))
+            )
+        {
+            let _ = handle.resume_after_failed_drain().await;
+        }
+        result
+    }
+}
+
+#[async_trait]
+impl PairingAdministration for RemoteManager {
+    async fn create(
+        &self,
+        owner: crate::runtime::store::IdempotencyOwner,
+        request: agentdeck_protocol::runtime::CreatePairInviteRequest,
+    ) -> Result<agentdeck_protocol::runtime::PairInvite, PairingAdministrationError> {
+        let handle = {
+            let state = self.state.lock().await;
+            require_running_armed(&state)
+                .map_err(|error| PairingAdministrationError::new(error.code()))?;
+            state
+                .pairing
+                .as_ref()
+                .map(PairingCoordinatorOwner::handle)
+                .ok_or_else(pairing_unavailable)?
+        };
+        // 不持 manager mutex 等 Store/Relay ACK，避免阻塞 status/shutdown/reset。
+        handle.create(owner, request).await
+    }
+
+    async fn list(
+        &self,
+    ) -> Result<Vec<agentdeck_protocol::runtime::PendingPairing>, PairingAdministrationError> {
+        let store = {
+            let state = self.state.lock().await;
+            require_running_armed(&state)
+                .map_err(|error| PairingAdministrationError::new(error.code()))?;
+            if state.pairing.is_none() {
+                return Err(pairing_unavailable());
+            }
+            self.store.clone()
+        };
+        // 不持 manager mutex 等 authenticated Store readback。
+        store
+            .list_pending_pairings()
+            .await
+            .map_err(|error| PairingAdministrationError::new(error.code()))
+    }
+
+    async fn confirm(
+        &self,
+        pairing_id: crate::runtime::store::RuntimeId,
+    ) -> Result<agentdeck_protocol::runtime::PairingReceipt, PairingAdministrationError> {
+        let handle = {
+            let state = self.state.lock().await;
+            require_running_armed(&state)
+                .map_err(|error| PairingAdministrationError::new(error.code()))?;
+            state
+                .pairing
+                .as_ref()
+                .map(PairingCoordinatorOwner::handle)
+                .ok_or_else(pairing_unavailable)?
+        };
+        // Grant freeze、Store CAS 与 InstallGrant send 均不得占用 manager mutex。
+        handle.confirm(pairing_id).await
+    }
+
+    async fn cancel(
+        &self,
+        pairing_id: crate::runtime::store::RuntimeId,
+    ) -> Result<agentdeck_protocol::runtime::PairingReceipt, PairingAdministrationError> {
+        let handle = {
+            let state = self.state.lock().await;
+            require_running_armed(&state)
+                .map_err(|error| PairingAdministrationError::new(error.code()))?;
+            state
+                .pairing
+                .as_ref()
+                .map(PairingCoordinatorOwner::handle)
+                .ok_or_else(pairing_unavailable)?
+        };
+        // Store CAS 与 Close send 均不得占用 manager mutex。
+        handle.cancel(pairing_id).await
+    }
+}
+
+#[async_trait]
+impl RevocationAdministration for RemoteManager {
+    async fn revoke_device(
+        &self,
+        device: DeviceHandle,
+        grant_serial: GrantSerial,
+    ) -> Result<RevocationReceipt, RevocationAdministrationError> {
+        let handle = {
+            let state = self.state.lock().await;
+            require_running_armed(&state)
+                .map_err(|error| RevocationAdministrationError::new(error.code()))?;
+            let handle = state.pairing.as_ref().map(PairingCoordinatorOwner::handle);
+            #[cfg(test)]
+            let handle = state.pairing_handle_for_test.clone().or(handle);
+            handle.ok_or_else(|| {
+                RevocationAdministrationError::new("daemon.revocation.administration.unavailable")
+            })?
+        };
+        // 不持 manager mutex 等 durable revoke COMMIT、Relay terminal 或重连。
+        handle
+            .revoke_device(device, grant_serial)
+            .await
+            .map_err(|error| RevocationAdministrationError::new(error.code()))
+    }
+}
+
+async fn stop_pairing_actor(state: &mut RemoteManagerState) {
+    if let Some(mut pairing) = state.pairing.take() {
+        pairing.shutdown().await;
     }
 }
 

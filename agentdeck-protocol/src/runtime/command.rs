@@ -1,4 +1,4 @@
-//! Runtime v3 device/local → daemon 请求（design §8 / §13.2）。
+//! Runtime v4 device/local → daemon 请求（design §8 / §13.2）。
 //!
 //! `RuntimeRequest` 是解密后设备/本地统一规范化的业务请求（RC-2 传输平权）。
 //! pending pairing 的 list/confirm/cancel 以及 create/trust-reset/device-revoke 是
@@ -6,6 +6,7 @@
 //! 任何 `RemotePrincipal`、PairingAccess 或 Relay 管理员都无权调用（design §6.2/§6.3/§6.5）。
 //! 本 task 只定义契约与标注，不实现执行语义。
 
+use crate::e2ee::pairing::{PAIRING_MAX_DISPLAY_NAME_BYTES, validate_pairing_display_name};
 use crate::relay_v2::enrollment::EnrollmentBundleV2;
 use crate::relay_v2::{RelayAdminPurgeReceiptError, RelayAdminPurgeReceiptV1};
 use crate::runtime::configuration::ConfigureConversationRequest;
@@ -28,6 +29,8 @@ use std::path::{Component, Path, PathBuf};
 
 /// prompt 明文 UTF-8 最大字节数（design §8.8：256 KiB）。
 pub const MAX_PROMPT_BYTES: usize = 256 * 1024;
+/// PairInvite 的固定 5 分钟 TTL；不接受 wire caller 覆盖。
+pub const PAIR_INVITE_TTL_SECS: u32 = 300;
 pub const UNINSTALL_PURGE_PLAN_VERSION: u16 = 1;
 pub const MAX_UNINSTALL_HELPER_PATH_BYTES: usize = 1024;
 pub const MAX_UNINSTALL_HELPER_VERSION_BYTES: usize = 128;
@@ -150,20 +153,61 @@ pub enum QueryReceiptSelector {
 }
 
 /// 创建 PairInvite —— local-only administration（design §6.2）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreatePairInviteRequest {
     /// 仅供人识别的机器显示名；存在于带外邀请中，不进入 Relay 明文。
+    #[schemars(length(min = 1, max = 128))]
     pub display_name: String,
-    /// 邀请 TTL（秒）；design 固定 5 分钟单次。
-    #[serde(default = "default_pair_ttl_secs")]
-    pub ttl_secs: u32,
+    /// caller-scoped retry key；丢失 reply 后重试必须读回同一份 durable invite。
+    pub idempotency_key: IdempotencyKey,
     /// local-only administration 标记。
     pub scope: LocalOnlyAdministration,
 }
 
-fn default_pair_ttl_secs() -> u32 {
-    300
+impl Serialize for CreatePairInviteRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        validate_pairing_display_name(&self.display_name).map_err(serde::ser::Error::custom)?;
+        debug_assert_eq!(PAIRING_MAX_DISPLAY_NAME_BYTES, 128);
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire<'a> {
+            display_name: &'a str,
+            idempotency_key: &'a IdempotencyKey,
+            scope: LocalOnlyAdministration,
+        }
+        Wire {
+            display_name: &self.display_name,
+            idempotency_key: &self.idempotency_key,
+            scope: self.scope,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CreatePairInviteRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            display_name: String,
+            idempotency_key: IdempotencyKey,
+            scope: LocalOnlyAdministration,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        validate_pairing_display_name(&wire.display_name).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            display_name: wire.display_name,
+            idempotency_key: wire.idempotency_key,
+            scope: wire.scope,
+        })
+    }
 }
 
 /// 由 same-UID 本机管理员提交的 machine enrollment 请求。

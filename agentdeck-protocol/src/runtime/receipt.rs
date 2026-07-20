@@ -5,7 +5,9 @@
 //! - `resolveApproval → ApprovalReceipt::Claimed/Applied/AlreadyHandled(state)/DeliveryFailed/Expired`。
 
 use crate::runtime::failure::RuntimeFailure;
-use crate::runtime::identity::{ApprovalId, CommandId, ConversationId, GrantSerial, TurnId};
+use crate::runtime::identity::{
+    ApprovalId, CommandId, ConversationId, GrantSerial, PairingId, TurnId,
+};
 use crate::trunk::ActionDecisionKind;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -143,4 +145,75 @@ pub enum RevocationReceipt {
     Committed { grant_serial: GrantSerial },
     /// 撤销失败。
     Failed { failure: RuntimeFailure },
+}
+
+/// 本地配对裁决；只描述 first-valid CAS 的赢家，不承载 Relay/crypto transport 状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PairingDecision {
+    Confirm,
+    Cancel,
+    Expire,
+}
+
+/// 本机 durable pairing state 的中立读回。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PairingState {
+    RouteOpening,
+    Unused,
+    Preparing,
+    AwaitingLocalConfirmation,
+    GrantPreparing,
+    GrantCommitted,
+    /// grant 已冻结/提交但未收到有效 endpoint receipt，正在 durable revoke orphan grant。
+    OrphanRevoking,
+    Delivered,
+    Expired,
+    Canceled,
+    /// PairRoute Close ACK 后保留的不含 secret 幂等 tombstone。
+    ClosedTombstone,
+}
+
+/// confirm/cancel/expiry 的 canonical durable 回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum PairingReceipt {
+    Confirmed {
+        #[serde(rename = "pairingId")]
+        #[schemars(rename = "pairingId")]
+        pairing_id: PairingId,
+    },
+    Canceled {
+        #[serde(rename = "pairingId")]
+        #[schemars(rename = "pairingId")]
+        pairing_id: PairingId,
+    },
+    Expired {
+        #[serde(rename = "pairingId")]
+        #[schemars(rename = "pairingId")]
+        pairing_id: PairingId,
+    },
+    Replayed {
+        #[serde(rename = "pairingId")]
+        #[schemars(rename = "pairingId")]
+        pairing_id: PairingId,
+        decision: PairingDecision,
+        state: PairingState,
+    },
+    AlreadyHandled {
+        #[serde(rename = "pairingId")]
+        #[schemars(rename = "pairingId")]
+        pairing_id: PairingId,
+        winner: PairingDecision,
+        state: PairingState,
+    },
+    Failed {
+        failure: RuntimeFailure,
+    },
 }

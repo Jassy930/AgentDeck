@@ -24,12 +24,13 @@ chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 getrandom = "0.4"
 hmac = "0.12"
 libc = "0.2"
+rand_chacha = "0.10"
 rusqlite = { version = "0.32", features = ["blob", "bundled", "limits"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "process", "io-util", "time", "io-std", "signal", "net"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "process", "io-util", "time", "test-util", "io-std", "signal", "net"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 # Used by claude_code adapter preflight (spec § 5.8 cc-not-installed
@@ -43,7 +44,11 @@ security-framework = { version = "3.7", features = ["OSX_10_15"] }
 security-framework-sys = "2.17"
 
 [dev-dependencies]
+agentdeck-cli = { path = "../agentdeck-cli" }
+agentdeck-relay = { path = "../agentdeck-relay", features = ["server", "tls"] }
 criterion = { version = "0.5", features = ["html_reports"] }
+rcgen = "0.13"
+tempfile = "3"
 which = "6"
 
 [[bench]]

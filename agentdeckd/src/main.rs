@@ -699,28 +699,51 @@ fn run_main_loop(
         ));
         let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
         let (upgrade_exit, mut upgrade_exit_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let core =
-            match RuntimeCore::new_production(store.clone(), router.clone()).and_then(|core| {
+        let core = match RuntimeCore::new_production(store.clone(), router.clone()).and_then(
+            |core| {
                 core.with_remote_administration(remote_manager.clone())
+                    .with_pairing_administration(remote_manager.clone())
+                    .with_revocation_administration(remote_manager.clone())
                     .with_versioned_daemon_upgrade(
                         config.paths().data_dir.join("bin"),
                         upgrade_exit,
                     )
-            }) {
-                Ok(core) => Arc::new(core),
-                Err(error) => {
+            },
+        ) {
+            Ok(core) => {
+                if !remote_manager.install_pairing_pending_sink(core.pairing_pending_sink()) {
+                    drop(core);
                     drop(router);
+                    let failure = MainLoopFailure {
+                        code: "daemon.pairing.sink_already_installed".to_owned(),
+                        message: "pairing administration bootstrap failed".to_owned(),
+                    };
                     let shutdown = store.shutdown().await;
                     diag::log(
                         "daemon_stop",
                         &format!(
-                            "agentdeckd bootstrap failed before RuntimeCore ownership: \
-                         error={error:?} storeShutdown={shutdown:?}"
+                            "agentdeckd pairing composition failed before RuntimeCore ownership: \
+                                 code={} storeShutdown={shutdown:?}",
+                            failure.code
                         ),
                     );
-                    return Err(MainLoopFailure::runtime(error));
+                    return Err(failure);
                 }
-            };
+                Arc::new(core)
+            }
+            Err(error) => {
+                drop(router);
+                let shutdown = store.shutdown().await;
+                diag::log(
+                    "daemon_stop",
+                    &format!(
+                        "agentdeckd bootstrap failed before RuntimeCore ownership: \
+                         error={error:?} storeShutdown={shutdown:?}"
+                    ),
+                );
+                return Err(MainLoopFailure::runtime(error));
+            }
+        };
         drop(router);
         drop(store);
 
@@ -1124,5 +1147,23 @@ mod tests {
             args.data_dir.expect("data dir").as_os_str().as_bytes(),
             path.as_os_str().as_bytes()
         );
+    }
+
+    #[test]
+    fn production_composition_installs_pairing_capability_and_sink_before_remote_arm() {
+        let source = include_str!("main.rs");
+        let pairing_admin = source
+            .find(".with_pairing_administration(remote_manager.clone())")
+            .expect("production Core must receive pairing administration");
+        let revocation_admin = source
+            .find(".with_revocation_administration(remote_manager.clone())")
+            .expect("production Core must receive revocation administration");
+        let sink = source
+            .find("install_pairing_pending_sink(core.pairing_pending_sink())")
+            .expect("production manager must receive the Core local-only sink");
+        let arm = source
+            .find("remote.arm(permit).await")
+            .expect("production remote arm boundary");
+        assert!(pairing_admin < revocation_admin && revocation_admin < sink && sink < arm);
     }
 }

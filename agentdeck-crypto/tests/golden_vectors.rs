@@ -24,15 +24,20 @@ use agentdeck_crypto::{
     open_sealed_payload, open_symmetric, seal_symmetric, sha256, sign_sealed, sign_tbs,
     verify_sealed, verify_tbs,
 };
+use agentdeck_protocol::e2ee::PairingControlEnvelopeV1;
 use agentdeck_protocol::e2ee::context::{OuterContextV1, OuterFrameKind};
 use agentdeck_protocol::e2ee::keys::{KeyId, KeyPurpose, KeyUpdateInfoV1};
-use agentdeck_protocol::e2ee::pairing::{PairRequestInfoV1, PairResponseInfoV1};
+use agentdeck_protocol::e2ee::pairing::{
+    MachineDataSignerBindingV1, PairPendingV1, PairRequestInfoV1, PairRequestV1,
+    PairResponseInfoV1, PairResponseReceivedV1, PairResponseV1,
+};
 use agentdeck_protocol::e2ee::payload::SealedPayloadKind;
 use agentdeck_protocol::e2ee::tbs::{SignedObjectType, ToBeSignedV1};
 use agentdeck_protocol::relay_v2::StreamCursor;
+use agentdeck_protocol::relay_v2::auth::Ed25519Signature;
 use agentdeck_protocol::relay_v2::id::{
-    DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, PairRouteId, RelayServerId,
-    RootKeyId, StreamGenerationId, StreamRouteId, TrustEpoch,
+    DeviceRouteId, GrantSerial, KeyDirectoryRevision, LinkGeneration, MachineRouteId, PairRouteId,
+    RelayServerId, RootKeyId, StreamGenerationId, StreamRouteId, TrustEpoch,
 };
 use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use serde_json::json;
@@ -163,6 +168,7 @@ fn outer_sample() -> OuterContextV1 {
         device_route: None,
         stream_route: Some(StreamRouteId::from_bytes([0x33; 16])),
         request_route: None,
+        pair_route: None,
         stream_generation: Some(StreamGenerationId::from_bytes([0x66; 16])),
         stream_cursor: Some(StreamCursor::At(7)),
         stream_seq: Some(7),
@@ -209,6 +215,7 @@ fn pair_response_info() -> PairResponseInfoV1 {
         relay_server_id: rs(),
         pair_route: pr(),
         invite_hash: [0x01; 32],
+        expiry_ms: 1_700_000_000_000,
         request_hash: [0x02; 32],
         machine_route: mr(),
         device_route: dr(),
@@ -217,12 +224,31 @@ fn pair_response_info() -> PairResponseInfoV1 {
     }
 }
 
+fn pairing_context(kind: OuterFrameKind) -> OuterContextV1 {
+    OuterContextV1 {
+        frame_kind: kind,
+        relay_protocol_version: 2,
+        e2ee_format_version: 1,
+        machine_route: None,
+        device_route: None,
+        stream_route: None,
+        request_route: None,
+        pair_route: Some(pr()),
+        stream_generation: None,
+        stream_cursor: None,
+        stream_seq: None,
+        message_key_epoch: 0,
+    }
+}
+
 fn key_update_info() -> KeyUpdateInfoV1 {
     KeyUpdateInfoV1 {
         e2ee_format_version: 1,
         runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        relay_server_id: rs(),
         machine_route: mr(),
         device_route: dr(),
+        stream_route: Some(StreamRouteId::from_bytes([0x33; 16])),
         grant_serial: GrantSerial::new(9),
         root_trust_epoch: TrustEpoch::new(3),
         key_directory_revision: KeyDirectoryRevision::new(2),
@@ -279,6 +305,77 @@ fn build_vectors() -> serde_json::Value {
     let envelope = hpke_seal_base(&hpke_pub, &hpke_info, &hpke_aad, HPKE_PLAINTEXT, &mut rng)
         .expect("hpke_seal_base");
 
+    // Pairing canonical envelopes / dedicated TBS（P4.3）。
+    let pair_request = PairRequestV1 {
+        format_version: 1,
+        enc: vec![0x91; 32],
+        ciphertext: vec![0x92; 48],
+        device_proof_signature: Ed25519Signature([0x93; 64]),
+    };
+    let pair_request_tbs = pair_request
+        .proof_tbs(
+            &pair_request_info(),
+            &pairing_context(OuterFrameKind::PairRequest),
+            [0x94; 32],
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+    let pair_response = PairResponseV1 {
+        format_version: 1,
+        info: pair_response_info(),
+        enc: vec![0xa1; 32],
+        ciphertext: vec![0xa2; 64],
+        machine_data_signature: Ed25519Signature([0xa3; 64]),
+    };
+    let data_signer = MachineDataSignerBindingV1 {
+        signing_key_fingerprint: [0xa4; 32],
+        generation: LinkGeneration::new(2),
+        certificate_sha256: [0xa5; 32],
+    };
+    let pair_response_tbs = pair_response
+        .signature_tbs(
+            &pair_response_info(),
+            &pairing_context(OuterFrameKind::PairResponse),
+            &data_signer,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+    let pair_pending = PairPendingV1 {
+        request_hash: [0x02; 32],
+        signature: Ed25519Signature([0xb1; 64]),
+    };
+    let pair_pending_tbs = pair_pending
+        .signature_tbs(
+            &pair_request_info(),
+            &pairing_context(OuterFrameKind::PairPending),
+            &data_signer,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+    let pair_received = PairResponseReceivedV1 {
+        request_hash: [0x02; 32],
+        grant_hash: [0xb2; 32],
+        response_hash: [0xb3; 32],
+        signature: Ed25519Signature([0xb4; 64]),
+    };
+    let pair_received_tbs = pair_received
+        .receipt_tbs(
+            &pair_response_info(),
+            &pairing_context(OuterFrameKind::PairResponseReceived),
+            [0xb5; 32],
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+    let control_envelope = PairingControlEnvelopeV1 {
+        format_version: 1,
+        enc: vec![0xc1; 32],
+        ciphertext: vec![0xc2; 80],
+    };
+
     json!({
         "version": 1,
         "description": "AgentDeck Relay E2EE deterministic golden vectors v1 (Rust source of truth; Swift mirror in P1.6). Fixed cipher suite: Ed25519; HPKE Base X25519+HKDF-SHA256+ChaCha20Poly1305; RFC 8439 ChaCha20-Poly1305.",
@@ -305,6 +402,22 @@ fn build_vectors() -> serde_json::Value {
             "pairRequestInfoHex": hex(&pair_request_info().encode()),
             "pairResponseInfoHex": hex(&pair_response_info().encode()),
             "keyUpdateInfoHex": hex(&key_update_info().encode()),
+        },
+        "pairing_canonical": {
+            "name": "pairing_canonical",
+            "description": "P4.3 complete pairing envelopes and type-specific detached TBS. Envelope hashes include signatures; TBS excludes its own signature.",
+            "pairRequestCanonicalHex": hex(&pair_request.canonical_bytes().unwrap()),
+            "pairRequestHashHex": hex(&pair_request.canonical_sha256().unwrap()),
+            "pairRequestTbsHex": hex(&pair_request_tbs),
+            "pairResponseCanonicalHex": hex(&pair_response.canonical_bytes().unwrap()),
+            "pairResponseHashHex": hex(&pair_response.canonical_sha256().unwrap()),
+            "pairResponseTbsHex": hex(&pair_response_tbs),
+            "pairPendingCanonicalHex": hex(&pair_pending.canonical_bytes().unwrap()),
+            "pairPendingTbsHex": hex(&pair_pending_tbs),
+            "pairResponseReceivedCanonicalHex": hex(&pair_received.canonical_bytes().unwrap()),
+            "pairResponseReceivedTbsHex": hex(&pair_received_tbs),
+            "pairingControlEnvelopeCanonicalHex": hex(&control_envelope.canonical_bytes().unwrap()),
+            "pairingControlEnvelopeHashHex": hex(&control_envelope.canonical_sha256().unwrap()),
         },
         "ed25519": {
             "name": "ed25519",
@@ -368,8 +481,9 @@ fn outer_sample_for_key_update() -> OuterContextV1 {
         e2ee_format_version: 1,
         machine_route: Some(mr()),
         device_route: Some(dr()),
-        stream_route: None,
+        stream_route: Some(StreamRouteId::from_bytes([0x33; 16])),
         request_route: None,
+        pair_route: None,
         stream_generation: None,
         stream_cursor: None,
         stream_seq: None,

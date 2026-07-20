@@ -186,7 +186,7 @@ fn assert_no_private_handle(bytes: &[u8]) {
 async fn reads_runtime_v1_v4_sample_as_v3_without_rewrite() {
     // 威胁场景：只用合成 JSON 证明 dual-decode 会漏掉真实 v4 AEAD/AAD/token、
     // read-pool lease 与 paced transfer handoff 的组合错误，甚至在 open 时静默 reseal。
-    assert_eq!(RUNTIME_PROTOCOL_VERSION, 3);
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 4);
     assert_eq!(RUNTIME_SCHEMA_VERSION, 9);
     assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
     let artifact = PathBuf::from(

@@ -89,6 +89,32 @@ pub enum RuntimeStoreOperation {
     RecordValidatedEnrollmentResponseAfterCommit,
     ActivateMachineEnrollmentBeforeCommit,
     ActivateMachineEnrollmentAfterCommit,
+    PreparePairingInviteBeforeCommit,
+    PreparePairingInviteAfterCommit,
+    AcknowledgePairRouteOpenBeforeCommit,
+    AcknowledgePairRouteOpenAfterCommit,
+    AcceptPairRequestBeforeCommit,
+    AcceptPairRequestAfterCommit,
+    CommitPairPendingBeforeCommit,
+    CommitPairPendingAfterCommit,
+    ConfirmPairingGrantBeforeCommit,
+    ConfirmPairingGrantAfterCommit,
+    AcknowledgeGrantCommittedBeforeCommit,
+    AcknowledgeGrantCommittedAfterCommit,
+    AcknowledgePairResponseReceivedBeforeCommit,
+    AcknowledgePairResponseReceivedAfterCommit,
+    BeginDeviceRevocationBeforeCommit,
+    BeginDeviceRevocationAfterCommit,
+    AcknowledgeOrphanGrantCommittedBeforeCommit,
+    AcknowledgeOrphanGrantCommittedAfterCommit,
+    AcknowledgeRevocationCommittedBeforeCommit,
+    AcknowledgeRevocationCommittedAfterCommit,
+    TerminalizePairingBeforeCommit,
+    TerminalizePairingAfterCommit,
+    AcknowledgePairRouteCloseBeforeCommit,
+    AcknowledgePairRouteCloseAfterCommit,
+    PurgePairingReceiptsBeforeCommit,
+    PurgePairingReceiptsAfterCommit,
     PrepareMachineRetirementBeforeCommit,
     PrepareMachineRetirementAfterCommit,
     RecordMachineRetirementTerminalBeforeCommit,
@@ -766,6 +792,19 @@ pub enum RuntimeCommitOperation {
     PrepareMachineEnrollment,
     RecordValidatedEnrollmentResponse,
     ActivateMachineEnrollment,
+    PreparePairingInvite,
+    AcknowledgePairRouteOpen,
+    AcceptPairRequest,
+    CommitPairPending,
+    ConfirmPairingGrant,
+    AcknowledgeGrantCommitted,
+    AcknowledgePairResponseReceived,
+    BeginDeviceRevocation,
+    AcknowledgeOrphanGrantCommitted,
+    AcknowledgeRevocationCommitted,
+    TerminalizePairing,
+    AcknowledgePairRouteClose,
+    PurgePairingReceipts,
     PrepareMachineRetirement,
     RecordMachineRetirementTerminal,
     ConfirmMachinePurgeReadbackAbsent,
@@ -1754,6 +1793,16 @@ pub enum RuntimeStoreError {
     MachineIdentityConflict,
     #[error("runtime machine enrollment input conflicts with the authenticated lifecycle")]
     MachineRemoteConflict,
+    #[error("runtime pairing input or lifecycle conflicts with the authenticated record")]
+    PairingConflict,
+    #[error("runtime pairing grant route was explicitly revoked and cannot be reinstalled")]
+    GrantRouteRevoked,
+    #[error("runtime pairing grant serial is exhausted and requires a machine trust reset")]
+    GrantSerialTrustResetRequired,
+    #[error("runtime pairing invite expired before this operation")]
+    PairingExpired,
+    #[error("runtime active pairing directory reached its hard limit")]
+    PairingLimit,
     #[error("runtime store {lane:?} lane is full")]
     WorkerBusy { lane: RuntimeStoreLane },
     #[error("runtime store worker stopped before replying")]
@@ -1961,6 +2010,7 @@ impl RuntimeStoreError {
             | Self::MachineIdentityMissing
             | Self::MachineIdentityConflict
             | Self::MachineRemoteConflict
+            | Self::PairingConflict
             | Self::ConversationNotFound
             | Self::ConversationConflict
             | Self::ConfigurationAgentMismatch
@@ -1986,12 +2036,18 @@ impl RuntimeStoreError {
             | Self::PublicationMismatch
             | Self::IdGeneration(_)
             | Self::Sequence(_) => "daemon.runtime.invalid_state",
+            Self::GrantRouteRevoked => "daemon.pairing.grant_route_revoked",
+            Self::GrantSerialTrustResetRequired => {
+                "daemon.pairing.grant_serial_trust_reset_required"
+            }
             Self::ConversationLimit => "daemon.runtime.actor_unavailable",
             Self::ConfigurationLimit { .. }
             | Self::CommandConfigurationPinLimit
             | Self::MetadataMutationLimit { .. }
             | Self::NativeProjectionLimit { .. }
             | Self::AdminCommandLimit { .. } => "daemon.runtime.store_full",
+            Self::PairingLimit => "daemon.runtime.store_full",
+            Self::PairingExpired => "daemon.pairing.expired",
             Self::ConfigurationRequired => DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
             Self::ConfigurationConflict { .. } => DAEMON_CONVERSATION_CONFIGURATION_CONFLICT,
             Self::MetadataMutationPending => DAEMON_CONVERSATION_METADATA_MUTATION_PENDING,

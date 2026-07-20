@@ -45,6 +45,45 @@ const ROW_METADATA_DOMAIN: &[u8] = b"machine.remote.metadata.v1";
 const ROW_PRIMARY_KEY: &[u8] = b"singleton=1";
 const ROW_COLUMN: &[u8] = b"sealed_state";
 
+/// Trust reset 的临时 Store 栅栏。
+///
+/// P4.3 coordinator 完成 terminal close/revoke/scrub 前，任何仍有授权力或秘密材料的
+/// v10 remote row 都必须阻止 machine trust lifecycle 前进。无秘密的 pairing receipt
+/// tombstone 刻意不在这里：它只用于防止 pairing ID/route 复用，不具有授权力。
+fn require_remote_security_state_empty(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+) -> Result<(), RuntimeStoreError> {
+    let ledger = super::sqlite::load_runtime_ledger(connection, key_bundle, database_id)?;
+    let physical: (i64, i64, i64, i64) = connection.query_row(
+        "SELECT (SELECT COUNT(*) FROM remote_pairings),
+                (SELECT COUNT(*) FROM remote_control_outbox),
+                (SELECT COUNT(*) FROM remote_authorization_ledger),
+                (SELECT COUNT(*) FROM remote_key_directory)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let ledger_occupied = ledger.remote_pairing_count != 0
+        || ledger.remote_pairing_sealed_bytes != 0
+        || ledger.remote_authorization_count != 0
+        || ledger.remote_authorization_preparing_count != 0
+        || ledger.remote_authorization_active_count != 0
+        || ledger.remote_authorization_revoking_count != 0
+        || ledger.remote_authorization_revoked_count != 0
+        || ledger.remote_authorization_sealed_bytes != 0
+        || ledger.remote_key_directory_count != 0
+        || ledger.remote_key_directory_sealed_bytes != 0
+        || ledger.remote_control_outbox_count != 0
+        || ledger.remote_control_outbox_pending_count != 0
+        || ledger.remote_control_outbox_acknowledged_count != 0
+        || ledger.remote_control_outbox_sealed_bytes != 0;
+    if physical != (0, 0, 0, 0) || ledger_occupied {
+        return Err(RuntimeStoreError::MachineRemoteConflict);
+    }
+    Ok(())
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredConnectionV1 {
@@ -583,6 +622,7 @@ fn replace_local_deleted_enrollment(
     current: AuthenticatedRow,
     prepared: PreparedMachineEnrollmentWrite,
 ) -> Result<PrepareMachineEnrollmentOutcome, RuntimeStoreError> {
+    require_remote_security_state_empty(&state.connection, &state.key_bundle, state.database_id)?;
     let LoadedPayload::LocalDeleted(tombstone) = &current.payload else {
         return Err(RuntimeStoreError::MachineRemoteConflict);
     };
@@ -624,6 +664,7 @@ fn replace_local_deleted_enrollment(
     let transaction = state
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_remote_security_state_empty(&transaction, &state.key_bundle, state.database_id)?;
     validate_locator_absent(&transaction, &current.record)?;
     super::machine_identity::insert_active_replacement(
         &transaction,
@@ -888,6 +929,9 @@ pub(super) fn prepare_machine_retirement(
         RemoteTransition {
             previous_lifecycle: MachineRemoteLifecycle::Active,
             reset_kind: MachineTrustResetKind::RootPresent,
+            remote_cleanup: Some(
+                reset_cleanup::RemoteSecurityCleanupMode::RootPresentAfterRevocation,
+            ),
             before_operation: RuntimeStoreOperation::PrepareMachineRetirementBeforeCommit,
             after_operation: RuntimeStoreOperation::PrepareMachineRetirementAfterCommit,
             commit_operation: RuntimeCommitOperation::PrepareMachineRetirement,
@@ -936,6 +980,7 @@ pub(super) fn record_machine_retirement_terminal(
         RemoteTransition {
             previous_lifecycle: MachineRemoteLifecycle::RetirePending,
             reset_kind: MachineTrustResetKind::RootPresent,
+            remote_cleanup: None,
             before_operation: RuntimeStoreOperation::RecordMachineRetirementTerminalBeforeCommit,
             after_operation: RuntimeStoreOperation::RecordMachineRetirementTerminalAfterCommit,
             commit_operation: RuntimeCommitOperation::RecordMachineRetirementTerminal,
@@ -985,6 +1030,7 @@ pub(super) fn confirm_machine_purge_readback_absent(
         RemoteTransition {
             previous_lifecycle: MachineRemoteLifecycle::RelayCommitted,
             reset_kind: MachineTrustResetKind::RootPresent,
+            remote_cleanup: None,
             before_operation: RuntimeStoreOperation::ConfirmMachinePurgeReadbackAbsentBeforeCommit,
             after_operation: RuntimeStoreOperation::ConfirmMachinePurgeReadbackAbsentAfterCommit,
             commit_operation: RuntimeCommitOperation::ConfirmMachinePurgeReadbackAbsent,
@@ -1038,6 +1084,9 @@ pub(super) fn record_root_lost_machine_purge(
         RemoteTransition {
             previous_lifecycle: MachineRemoteLifecycle::Active,
             reset_kind: MachineTrustResetKind::RootLost,
+            remote_cleanup: Some(
+                reset_cleanup::RemoteSecurityCleanupMode::RootLostAfterPurgeReadback,
+            ),
             before_operation: RuntimeStoreOperation::RecordRootLostMachinePurgeBeforeCommit,
             after_operation: RuntimeStoreOperation::RecordRootLostMachinePurgeAfterCommit,
             commit_operation: RuntimeCommitOperation::RecordRootLostMachinePurge,
@@ -1060,6 +1109,7 @@ pub(super) fn finalize_machine_local_deletion(
     }
     let current = load_authenticated_row(&state.connection, &state.key_bundle, state.database_id)?
         .ok_or(RuntimeStoreError::MachineRemoteConflict)?;
+    require_remote_security_state_empty(&state.connection, &state.key_bundle, state.database_id)?;
     if let LoadedPayload::LocalDeleted(payload) = &current.payload {
         if MachineTrustResetKind::from(payload.reset_kind) == expected_reset_kind
             && payload.purge_proof_hash == expected_purge_proof_hash
@@ -1178,7 +1228,11 @@ pub(super) fn finalize_machine_local_deletion(
     })
 }
 
+mod reset_cleanup;
 mod storage;
+
+#[cfg(test)]
+mod reset_guard_tests;
 
 use storage::*;
 pub(super) use storage::{

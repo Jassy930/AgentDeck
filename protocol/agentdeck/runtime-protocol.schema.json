@@ -4631,6 +4631,47 @@
       "title": "ConversationStartReceipt",
       "type": "object"
     },
+    "CreatePairInviteRequest": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "LocalOnlyAdministration": {
+          "description": "local-only administration 信任边界标记。\n\n携带此标记的请求是 **local-only administration**：daemon 必须拒绝任何不是来自 same-UID UDS `LocalPrincipal` 的调用。它显式记录在类型、文档与 schema 中， 让客户端与审阅者都能确认该请求永不允许远端或 Relay 管理员发起。",
+          "enum": [
+            "localOnly"
+          ],
+          "type": "string"
+        }
+      },
+      "description": "创建 PairInvite —— local-only administration（design §6.2）。",
+      "properties": {
+        "displayName": {
+          "description": "仅供人识别的机器显示名；存在于带外邀请中，不进入 Relay 明文。",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "description": "caller-scoped retry key；丢失 reply 后重试必须读回同一份 durable invite。",
+          "type": "string"
+        },
+        "scope": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/LocalOnlyAdministration"
+            }
+          ],
+          "description": "local-only administration 标记。"
+        }
+      },
+      "required": [
+        "displayName",
+        "idempotencyKey",
+        "scope"
+      ],
+      "title": "CreatePairInviteRequest",
+      "type": "object"
+    },
     "LocalOnlyAdministration": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "local-only administration 信任边界标记。\n\n携带此标记的请求是 **local-only administration**：daemon 必须拒绝任何不是来自 same-UID UDS `LocalPrincipal` 的调用。它显式记录在类型、文档与 schema 中， 让客户端与审阅者都能确认该请求永不允许远端或 Relay 管理员发起。",
@@ -4854,9 +4895,411 @@
     "PairInvite": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "additionalProperties": false,
-      "description": "createPairInvite 回执中的邀请引用（不含 P1.1 不涉及的 crypto secret/relay 材料）。",
+      "definitions": {
+        "CertRole": {
+          "description": "证书角色：日常连接 auth（Link）或 daemon 下行数据来源签名（Data）。",
+          "enum": [
+            "link",
+            "data"
+          ],
+          "type": "string"
+        },
+        "PairInviteV1": {
+          "additionalProperties": false,
+          "description": "被控机器创建的带外配对邀请。完整值是 bearer secret，Debug 一律全量脱敏。",
+          "properties": {
+            "currentSpkiPin": {
+              "type": "string"
+            },
+            "dataSignCert": {
+              "$ref": "#/definitions/SignedCertificate"
+            },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "formatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "inviteHpkePubkey": {
+              "type": "string"
+            },
+            "inviteSecret": {
+              "type": "string"
+            },
+            "machineDisplayName": {
+              "type": "string"
+            },
+            "machineRootFingerprint": {
+              "type": "string"
+            },
+            "machineRootPubkey": {
+              "type": "string"
+            },
+            "nextSpkiPin": {
+              "type": "string"
+            },
+            "pairRoute": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "wssUrl": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "currentSpkiPin",
+            "dataSignCert",
+            "expiresAtMs",
+            "formatVersion",
+            "inviteHpkePubkey",
+            "inviteSecret",
+            "machineDisplayName",
+            "machineRootFingerprint",
+            "machineRootPubkey",
+            "nextSpkiPin",
+            "pairRoute",
+            "relayProtocolVersion",
+            "relayServerId",
+            "wssUrl"
+          ],
+          "type": "object"
+        },
+        "SignedCertificate": {
+          "additionalProperties": false,
+          "description": "MachineRoot 签发的 link / data 证书（design §6.6）。",
+          "properties": {
+            "certRole": {
+              "$ref": "#/definitions/CertRole"
+            },
+            "generation": {
+              "description": "单调 cert generation；回退值一律拒绝。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "notAfterMs": {
+              "description": "可选有效期（grant 类默认无过期，cert 可带）。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "rootKeyId": {
+              "description": "machine trust anchor 的 root key ID。",
+              "type": "string"
+            },
+            "signature": {
+              "description": "MachineRoot 对 cert `ToBeSignedV1` 的签名。",
+              "type": "string"
+            },
+            "subjectPubkey": {
+              "description": "被证明的日常签名公钥（MachineLinkSign / MachineDataSign）。",
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "certRole",
+            "generation",
+            "rootKeyId",
+            "signature",
+            "subjectPubkey",
+            "trustEpoch"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "createPairInvite 回执。完整 bearer invite 只经 same-UID UDS 返回，并继续由 `PairInviteV1` 的 redacted Debug/strict wire 约束保护。",
       "properties": {
-        "displayName": {
+        "invite": {
+          "$ref": "#/definitions/PairInviteV1"
+        },
+        "pairingId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "invite",
+        "pairingId"
+      ],
+      "title": "PairInvite",
+      "type": "object"
+    },
+    "PairingDecision": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "本地配对裁决；只描述 first-valid CAS 的赢家，不承载 Relay/crypto transport 状态。",
+      "enum": [
+        "confirm",
+        "cancel",
+        "expire"
+      ],
+      "title": "PairingDecision",
+      "type": "string"
+    },
+    "PairingReceipt": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "PairingDecision": {
+          "description": "本地配对裁决；只描述 first-valid CAS 的赢家，不承载 Relay/crypto transport 状态。",
+          "enum": [
+            "confirm",
+            "cancel",
+            "expire"
+          ],
+          "type": "string"
+        },
+        "PairingState": {
+          "description": "本机 durable pairing state 的中立读回。",
+          "oneOf": [
+            {
+              "enum": [
+                "routeOpening",
+                "unused",
+                "preparing",
+                "awaitingLocalConfirmation",
+                "grantPreparing",
+                "grantCommitted",
+                "delivered",
+                "expired",
+                "canceled"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "grant 已冻结/提交但未收到有效 endpoint receipt，正在 durable revoke orphan grant。",
+              "enum": [
+                "orphanRevoking"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "PairRoute Close ACK 后保留的不含 secret 幂等 tombstone。",
+              "enum": [
+                "closedTombstone"
+              ],
+              "type": "string"
+            }
+          ]
+        },
+        "RuntimeFailure": {
+          "additionalProperties": false,
+          "description": "类型化业务失败：wire 上仍是稳定 `code` 字符串，`message` 供人读， `diagnostic_ref` 用于关联日志但不得泄漏完整业务 ID（design §14）。",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "diagnosticRef": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "confirm/cancel/expiry 的 canonical durable 回执。",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "pairingId": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "confirmed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "pairingId",
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "pairingId": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "canceled"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "pairingId",
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "pairingId": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "expired"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "pairingId",
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "decision": {
+              "$ref": "#/definitions/PairingDecision"
+            },
+            "pairingId": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/definitions/PairingState"
+            },
+            "status": {
+              "enum": [
+                "replayed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "decision",
+            "pairingId",
+            "state",
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "pairingId": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/definitions/PairingState"
+            },
+            "status": {
+              "enum": [
+                "alreadyHandled"
+              ],
+              "type": "string"
+            },
+            "winner": {
+              "$ref": "#/definitions/PairingDecision"
+            }
+          },
+          "required": [
+            "pairingId",
+            "state",
+            "status",
+            "winner"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "failure": {
+              "$ref": "#/definitions/RuntimeFailure"
+            },
+            "status": {
+              "enum": [
+                "failed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "failure",
+            "status"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "PairingReceipt"
+    },
+    "PairingState": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "本机 durable pairing state 的中立读回。",
+      "oneOf": [
+        {
+          "enum": [
+            "routeOpening",
+            "unused",
+            "preparing",
+            "awaitingLocalConfirmation",
+            "grantPreparing",
+            "grantCommitted",
+            "delivered",
+            "expired",
+            "canceled"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "grant 已冻结/提交但未收到有效 endpoint receipt，正在 durable revoke orphan grant。",
+          "enum": [
+            "orphanRevoking"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "PairRoute Close ACK 后保留的不含 secret 幂等 tombstone。",
+          "enum": [
+            "closedTombstone"
+          ],
+          "type": "string"
+        }
+      ],
+      "title": "PairingState"
+    },
+    "PendingPairing": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "一个待本地确认的 pending pairing（local-only administration 列表项）。",
+      "properties": {
+        "deviceSignFingerprint": {
+          "description": "DeviceSign 公钥 fingerprint；本地 UI 显示供用户确认（design §6.3）。",
           "type": "string"
         },
         "expiresAtMs": {
@@ -4866,26 +5309,9 @@
         },
         "pairingId": {
           "type": "string"
-        }
-      },
-      "required": [
-        "displayName",
-        "expiresAtMs",
-        "pairingId"
-      ],
-      "title": "PairInvite",
-      "type": "object"
-    },
-    "PendingPairing": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "additionalProperties": false,
-      "description": "一个待本地确认的 pending pairing（local-only administration 列表项）。",
-      "properties": {
-        "deviceFingerprint": {
-          "description": "设备指纹；本地 UI 显示供用户确认（design §6.3）。",
-          "type": "string"
         },
-        "pairingId": {
+        "requestHash": {
+          "description": "已冻结 PairRequest 的 SHA-256；绑定 pending/confirm/replay。",
           "type": "string"
         },
         "requestedAtMs": {
@@ -4895,8 +5321,10 @@
         }
       },
       "required": [
-        "deviceFingerprint",
+        "deviceSignFingerprint",
+        "expiresAtMs",
         "pairingId",
+        "requestHash",
         "requestedAtMs"
       ],
       "title": "PendingPairing",
@@ -5773,6 +6201,14 @@
           ],
           "type": "object"
         },
+        "CertRole": {
+          "description": "证书角色：日常连接 auth（Link）或 daemon 下行数据来源签名（Data）。",
+          "enum": [
+            "link",
+            "data"
+          ],
+          "type": "string"
+        },
         "ClaudeCodeConversationConfiguration": {
           "additionalProperties": false,
           "properties": {
@@ -6297,15 +6733,137 @@
           ],
           "type": "object"
         },
+        "PairInviteV1": {
+          "additionalProperties": false,
+          "description": "被控机器创建的带外配对邀请。完整值是 bearer secret，Debug 一律全量脱敏。",
+          "properties": {
+            "currentSpkiPin": {
+              "type": "string"
+            },
+            "dataSignCert": {
+              "$ref": "#/definitions/SignedCertificate"
+            },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "formatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "inviteHpkePubkey": {
+              "type": "string"
+            },
+            "inviteSecret": {
+              "type": "string"
+            },
+            "machineDisplayName": {
+              "type": "string"
+            },
+            "machineRootFingerprint": {
+              "type": "string"
+            },
+            "machineRootPubkey": {
+              "type": "string"
+            },
+            "nextSpkiPin": {
+              "type": "string"
+            },
+            "pairRoute": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "wssUrl": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "currentSpkiPin",
+            "dataSignCert",
+            "expiresAtMs",
+            "formatVersion",
+            "inviteHpkePubkey",
+            "inviteSecret",
+            "machineDisplayName",
+            "machineRootFingerprint",
+            "machineRootPubkey",
+            "nextSpkiPin",
+            "pairRoute",
+            "relayProtocolVersion",
+            "relayServerId",
+            "wssUrl"
+          ],
+          "type": "object"
+        },
+        "PairingDecision": {
+          "description": "本地配对裁决；只描述 first-valid CAS 的赢家，不承载 Relay/crypto transport 状态。",
+          "enum": [
+            "confirm",
+            "cancel",
+            "expire"
+          ],
+          "type": "string"
+        },
+        "PairingState": {
+          "description": "本机 durable pairing state 的中立读回。",
+          "oneOf": [
+            {
+              "enum": [
+                "routeOpening",
+                "unused",
+                "preparing",
+                "awaitingLocalConfirmation",
+                "grantPreparing",
+                "grantCommitted",
+                "delivered",
+                "expired",
+                "canceled"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "grant 已冻结/提交但未收到有效 endpoint receipt，正在 durable revoke orphan grant。",
+              "enum": [
+                "orphanRevoking"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "PairRoute Close ACK 后保留的不含 secret 幂等 tombstone。",
+              "enum": [
+                "closedTombstone"
+              ],
+              "type": "string"
+            }
+          ]
+        },
         "PendingPairing": {
           "additionalProperties": false,
           "description": "一个待本地确认的 pending pairing（local-only administration 列表项）。",
           "properties": {
-            "deviceFingerprint": {
-              "description": "设备指纹；本地 UI 显示供用户确认（design §6.3）。",
+            "deviceSignFingerprint": {
+              "description": "DeviceSign 公钥 fingerprint；本地 UI 显示供用户确认（design §6.3）。",
               "type": "string"
             },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
             "pairingId": {
+              "type": "string"
+            },
+            "requestHash": {
+              "description": "已冻结 PairRequest 的 SHA-256；绑定 pending/confirm/replay。",
               "type": "string"
             },
             "requestedAtMs": {
@@ -6315,8 +6873,10 @@
             }
           },
           "required": [
-            "deviceFingerprint",
+            "deviceSignFingerprint",
+            "expiresAtMs",
             "pairingId",
+            "requestHash",
             "requestedAtMs"
           ],
           "type": "object"
@@ -8094,13 +8654,8 @@
               "additionalProperties": false,
               "description": "createPairInvite 回执 —— local-only administration。",
               "properties": {
-                "displayName": {
-                  "type": "string"
-                },
-                "expiresAtMs": {
-                  "format": "uint64",
-                  "minimum": 0.0,
-                  "type": "integer"
+                "invite": {
+                  "$ref": "#/definitions/PairInviteV1"
                 },
                 "pairingId": {
                   "type": "string"
@@ -8113,8 +8668,7 @@
                 }
               },
               "required": [
-                "displayName",
-                "expiresAtMs",
+                "invite",
                 "pairingId",
                 "reply"
               ],
@@ -8139,6 +8693,154 @@
               },
               "required": [
                 "pairings",
+                "reply"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "confirmPairing/cancelPairing 的 canonical durable 回执。",
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pairingId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "confirmed"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pairingId",
+                    "status"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pairingId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "canceled"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pairingId",
+                    "status"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pairingId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "expired"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pairingId",
+                    "status"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "decision": {
+                      "$ref": "#/definitions/PairingDecision"
+                    },
+                    "pairingId": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "$ref": "#/definitions/PairingState"
+                    },
+                    "status": {
+                      "enum": [
+                        "replayed"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "decision",
+                    "pairingId",
+                    "state",
+                    "status"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pairingId": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "$ref": "#/definitions/PairingState"
+                    },
+                    "status": {
+                      "enum": [
+                        "alreadyHandled"
+                      ],
+                      "type": "string"
+                    },
+                    "winner": {
+                      "$ref": "#/definitions/PairingDecision"
+                    }
+                  },
+                  "required": [
+                    "pairingId",
+                    "state",
+                    "status",
+                    "winner"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "failure": {
+                      "$ref": "#/definitions/RuntimeFailure"
+                    },
+                    "status": {
+                      "enum": [
+                        "failed"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "failure",
+                    "status"
+                  ],
+                  "type": "object"
+                }
+              ],
+              "properties": {
+                "reply": {
+                  "enum": [
+                    "pairing"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
                 "reply"
               ],
               "type": "object"
@@ -8707,6 +9409,12 @@
               "properties": {
                 "displayName": {
                   "description": "仅供人识别的机器显示名；存在于带外邀请中，不进入 Relay 明文。",
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "idempotencyKey": {
+                  "description": "caller-scoped retry key；丢失 reply 后重试必须读回同一份 durable invite。",
                   "type": "string"
                 },
                 "request": {
@@ -8722,17 +9430,11 @@
                     }
                   ],
                   "description": "local-only administration 标记。"
-                },
-                "ttlSecs": {
-                  "default": 300,
-                  "description": "邀请 TTL（秒）；design 固定 5 分钟单次。",
-                  "format": "uint32",
-                  "minimum": 0.0,
-                  "type": "integer"
                 }
               },
               "required": [
                 "displayName",
+                "idempotencyKey",
                 "request",
                 "scope"
               ],
@@ -9075,6 +9777,48 @@
                 "transferId"
               ],
               "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "只允许 daemon 向 local-control UDS connection 投递的待确认配对事件。",
+              "properties": {
+                "deviceSignFingerprint": {
+                  "description": "DeviceSign 公钥 fingerprint；本地 UI 显示供用户确认（design §6.3）。",
+                  "type": "string"
+                },
+                "expiresAtMs": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                "pairingId": {
+                  "type": "string"
+                },
+                "requestHash": {
+                  "description": "已冻结 PairRequest 的 SHA-256；绑定 pending/confirm/replay。",
+                  "type": "string"
+                },
+                "requestedAtMs": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                "stream": {
+                  "enum": [
+                    "pairingPending"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "deviceSignFingerprint",
+                "expiresAtMs",
+                "pairingId",
+                "requestHash",
+                "requestedAtMs",
+                "stream"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -9153,6 +9897,56 @@
             "canceled"
           ],
           "type": "string"
+        },
+        "SignedCertificate": {
+          "additionalProperties": false,
+          "description": "MachineRoot 签发的 link / data 证书（design §6.6）。",
+          "properties": {
+            "certRole": {
+              "$ref": "#/definitions/CertRole"
+            },
+            "generation": {
+              "description": "单调 cert generation；回退值一律拒绝。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "notAfterMs": {
+              "description": "可选有效期（grant 类默认无过期，cert 可带）。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "rootKeyId": {
+              "description": "machine trust anchor 的 root key ID。",
+              "type": "string"
+            },
+            "signature": {
+              "description": "MachineRoot 对 cert `ToBeSignedV1` 的签名。",
+              "type": "string"
+            },
+            "subjectPubkey": {
+              "description": "被证明的日常签名公钥（MachineLinkSign / MachineDataSign）。",
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "certRole",
+            "generation",
+            "rootKeyId",
+            "signature",
+            "subjectPubkey",
+            "trustEpoch"
+          ],
+          "type": "object"
         },
         "SnapshotItem": {
           "description": "snapshot barrier 内的一项。",
@@ -9507,7 +10301,7 @@
           ]
         }
       },
-      "description": "Runtime v3 顶层封装。\n\n未派生 `PartialEq`：`RuntimeMessage` 传递内嵌未派生 `PartialEq` 的中立 trunk 类型； 本 task 不改动 trunk，契约测试以 wire round-trip 覆盖。",
+      "description": "Runtime v4 顶层封装。\n\n未派生 `PartialEq`：`RuntimeMessage` 传递内嵌未派生 `PartialEq` 的中立 trunk 类型； 本 task 不改动 trunk，契约测试以 wire round-trip 覆盖。",
       "properties": {
         "body": {
           "$ref": "#/definitions/RuntimeMessage"
@@ -12763,6 +13557,14 @@
           ],
           "type": "object"
         },
+        "CertRole": {
+          "description": "证书角色：日常连接 auth（Link）或 daemon 下行数据来源签名（Data）。",
+          "enum": [
+            "link",
+            "data"
+          ],
+          "type": "string"
+        },
         "ClaudeCodeConversationConfiguration": {
           "additionalProperties": false,
           "properties": {
@@ -13287,15 +14089,137 @@
           ],
           "type": "object"
         },
+        "PairInviteV1": {
+          "additionalProperties": false,
+          "description": "被控机器创建的带外配对邀请。完整值是 bearer secret，Debug 一律全量脱敏。",
+          "properties": {
+            "currentSpkiPin": {
+              "type": "string"
+            },
+            "dataSignCert": {
+              "$ref": "#/definitions/SignedCertificate"
+            },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "formatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "inviteHpkePubkey": {
+              "type": "string"
+            },
+            "inviteSecret": {
+              "type": "string"
+            },
+            "machineDisplayName": {
+              "type": "string"
+            },
+            "machineRootFingerprint": {
+              "type": "string"
+            },
+            "machineRootPubkey": {
+              "type": "string"
+            },
+            "nextSpkiPin": {
+              "type": "string"
+            },
+            "pairRoute": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "wssUrl": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "currentSpkiPin",
+            "dataSignCert",
+            "expiresAtMs",
+            "formatVersion",
+            "inviteHpkePubkey",
+            "inviteSecret",
+            "machineDisplayName",
+            "machineRootFingerprint",
+            "machineRootPubkey",
+            "nextSpkiPin",
+            "pairRoute",
+            "relayProtocolVersion",
+            "relayServerId",
+            "wssUrl"
+          ],
+          "type": "object"
+        },
+        "PairingDecision": {
+          "description": "本地配对裁决；只描述 first-valid CAS 的赢家，不承载 Relay/crypto transport 状态。",
+          "enum": [
+            "confirm",
+            "cancel",
+            "expire"
+          ],
+          "type": "string"
+        },
+        "PairingState": {
+          "description": "本机 durable pairing state 的中立读回。",
+          "oneOf": [
+            {
+              "enum": [
+                "routeOpening",
+                "unused",
+                "preparing",
+                "awaitingLocalConfirmation",
+                "grantPreparing",
+                "grantCommitted",
+                "delivered",
+                "expired",
+                "canceled"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "grant 已冻结/提交但未收到有效 endpoint receipt，正在 durable revoke orphan grant。",
+              "enum": [
+                "orphanRevoking"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "PairRoute Close ACK 后保留的不含 secret 幂等 tombstone。",
+              "enum": [
+                "closedTombstone"
+              ],
+              "type": "string"
+            }
+          ]
+        },
         "PendingPairing": {
           "additionalProperties": false,
           "description": "一个待本地确认的 pending pairing（local-only administration 列表项）。",
           "properties": {
-            "deviceFingerprint": {
-              "description": "设备指纹；本地 UI 显示供用户确认（design §6.3）。",
+            "deviceSignFingerprint": {
+              "description": "DeviceSign 公钥 fingerprint；本地 UI 显示供用户确认（design §6.3）。",
               "type": "string"
             },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
             "pairingId": {
+              "type": "string"
+            },
+            "requestHash": {
+              "description": "已冻结 PairRequest 的 SHA-256；绑定 pending/confirm/replay。",
               "type": "string"
             },
             "requestedAtMs": {
@@ -13305,8 +14229,10 @@
             }
           },
           "required": [
-            "deviceFingerprint",
+            "deviceSignFingerprint",
+            "expiresAtMs",
             "pairingId",
+            "requestHash",
             "requestedAtMs"
           ],
           "type": "object"
@@ -15022,13 +15948,8 @@
               "additionalProperties": false,
               "description": "createPairInvite 回执 —— local-only administration。",
               "properties": {
-                "displayName": {
-                  "type": "string"
-                },
-                "expiresAtMs": {
-                  "format": "uint64",
-                  "minimum": 0.0,
-                  "type": "integer"
+                "invite": {
+                  "$ref": "#/definitions/PairInviteV1"
                 },
                 "pairingId": {
                   "type": "string"
@@ -15041,8 +15962,7 @@
                 }
               },
               "required": [
-                "displayName",
-                "expiresAtMs",
+                "invite",
                 "pairingId",
                 "reply"
               ],
@@ -15067,6 +15987,154 @@
               },
               "required": [
                 "pairings",
+                "reply"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "confirmPairing/cancelPairing 的 canonical durable 回执。",
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pairingId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "confirmed"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pairingId",
+                    "status"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pairingId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "canceled"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pairingId",
+                    "status"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pairingId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "enum": [
+                        "expired"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pairingId",
+                    "status"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "decision": {
+                      "$ref": "#/definitions/PairingDecision"
+                    },
+                    "pairingId": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "$ref": "#/definitions/PairingState"
+                    },
+                    "status": {
+                      "enum": [
+                        "replayed"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "decision",
+                    "pairingId",
+                    "state",
+                    "status"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pairingId": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "$ref": "#/definitions/PairingState"
+                    },
+                    "status": {
+                      "enum": [
+                        "alreadyHandled"
+                      ],
+                      "type": "string"
+                    },
+                    "winner": {
+                      "$ref": "#/definitions/PairingDecision"
+                    }
+                  },
+                  "required": [
+                    "pairingId",
+                    "state",
+                    "status",
+                    "winner"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "failure": {
+                      "$ref": "#/definitions/RuntimeFailure"
+                    },
+                    "status": {
+                      "enum": [
+                        "failed"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "failure",
+                    "status"
+                  ],
+                  "type": "object"
+                }
+              ],
+              "properties": {
+                "reply": {
+                  "enum": [
+                    "pairing"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
                 "reply"
               ],
               "type": "object"
@@ -15635,6 +16703,12 @@
               "properties": {
                 "displayName": {
                   "description": "仅供人识别的机器显示名；存在于带外邀请中，不进入 Relay 明文。",
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "idempotencyKey": {
+                  "description": "caller-scoped retry key；丢失 reply 后重试必须读回同一份 durable invite。",
                   "type": "string"
                 },
                 "request": {
@@ -15650,17 +16724,11 @@
                     }
                   ],
                   "description": "local-only administration 标记。"
-                },
-                "ttlSecs": {
-                  "default": 300,
-                  "description": "邀请 TTL（秒）；design 固定 5 分钟单次。",
-                  "format": "uint32",
-                  "minimum": 0.0,
-                  "type": "integer"
                 }
               },
               "required": [
                 "displayName",
+                "idempotencyKey",
                 "request",
                 "scope"
               ],
@@ -16003,6 +17071,48 @@
                 "transferId"
               ],
               "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "只允许 daemon 向 local-control UDS connection 投递的待确认配对事件。",
+              "properties": {
+                "deviceSignFingerprint": {
+                  "description": "DeviceSign 公钥 fingerprint；本地 UI 显示供用户确认（design §6.3）。",
+                  "type": "string"
+                },
+                "expiresAtMs": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                "pairingId": {
+                  "type": "string"
+                },
+                "requestHash": {
+                  "description": "已冻结 PairRequest 的 SHA-256；绑定 pending/confirm/replay。",
+                  "type": "string"
+                },
+                "requestedAtMs": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                "stream": {
+                  "enum": [
+                    "pairingPending"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "deviceSignFingerprint",
+                "expiresAtMs",
+                "pairingId",
+                "requestHash",
+                "requestedAtMs",
+                "stream"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -16081,6 +17191,56 @@
             "canceled"
           ],
           "type": "string"
+        },
+        "SignedCertificate": {
+          "additionalProperties": false,
+          "description": "MachineRoot 签发的 link / data 证书（design §6.6）。",
+          "properties": {
+            "certRole": {
+              "$ref": "#/definitions/CertRole"
+            },
+            "generation": {
+              "description": "单调 cert generation；回退值一律拒绝。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "notAfterMs": {
+              "description": "可选有效期（grant 类默认无过期，cert 可带）。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "rootKeyId": {
+              "description": "machine trust anchor 的 root key ID。",
+              "type": "string"
+            },
+            "signature": {
+              "description": "MachineRoot 对 cert `ToBeSignedV1` 的签名。",
+              "type": "string"
+            },
+            "subjectPubkey": {
+              "description": "被证明的日常签名公钥（MachineLinkSign / MachineDataSign）。",
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "certRole",
+            "generation",
+            "rootKeyId",
+            "signature",
+            "subjectPubkey",
+            "trustEpoch"
+          ],
+          "type": "object"
         },
         "SnapshotItem": {
           "description": "snapshot barrier 内的一项。",
@@ -17058,6 +18218,14 @@
           ],
           "type": "object"
         },
+        "CertRole": {
+          "description": "证书角色：日常连接 auth（Link）或 daemon 下行数据来源签名（Data）。",
+          "enum": [
+            "link",
+            "data"
+          ],
+          "type": "string"
+        },
         "ClaudeCodeConversationConfiguration": {
           "additionalProperties": false,
           "properties": {
@@ -17423,15 +18591,137 @@
           ],
           "type": "string"
         },
+        "PairInviteV1": {
+          "additionalProperties": false,
+          "description": "被控机器创建的带外配对邀请。完整值是 bearer secret，Debug 一律全量脱敏。",
+          "properties": {
+            "currentSpkiPin": {
+              "type": "string"
+            },
+            "dataSignCert": {
+              "$ref": "#/definitions/SignedCertificate"
+            },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "formatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "inviteHpkePubkey": {
+              "type": "string"
+            },
+            "inviteSecret": {
+              "type": "string"
+            },
+            "machineDisplayName": {
+              "type": "string"
+            },
+            "machineRootFingerprint": {
+              "type": "string"
+            },
+            "machineRootPubkey": {
+              "type": "string"
+            },
+            "nextSpkiPin": {
+              "type": "string"
+            },
+            "pairRoute": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "wssUrl": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "currentSpkiPin",
+            "dataSignCert",
+            "expiresAtMs",
+            "formatVersion",
+            "inviteHpkePubkey",
+            "inviteSecret",
+            "machineDisplayName",
+            "machineRootFingerprint",
+            "machineRootPubkey",
+            "nextSpkiPin",
+            "pairRoute",
+            "relayProtocolVersion",
+            "relayServerId",
+            "wssUrl"
+          ],
+          "type": "object"
+        },
+        "PairingDecision": {
+          "description": "本地配对裁决；只描述 first-valid CAS 的赢家，不承载 Relay/crypto transport 状态。",
+          "enum": [
+            "confirm",
+            "cancel",
+            "expire"
+          ],
+          "type": "string"
+        },
+        "PairingState": {
+          "description": "本机 durable pairing state 的中立读回。",
+          "oneOf": [
+            {
+              "enum": [
+                "routeOpening",
+                "unused",
+                "preparing",
+                "awaitingLocalConfirmation",
+                "grantPreparing",
+                "grantCommitted",
+                "delivered",
+                "expired",
+                "canceled"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "grant 已冻结/提交但未收到有效 endpoint receipt，正在 durable revoke orphan grant。",
+              "enum": [
+                "orphanRevoking"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "PairRoute Close ACK 后保留的不含 secret 幂等 tombstone。",
+              "enum": [
+                "closedTombstone"
+              ],
+              "type": "string"
+            }
+          ]
+        },
         "PendingPairing": {
           "additionalProperties": false,
           "description": "一个待本地确认的 pending pairing（local-only administration 列表项）。",
           "properties": {
-            "deviceFingerprint": {
-              "description": "设备指纹；本地 UI 显示供用户确认（design §6.3）。",
+            "deviceSignFingerprint": {
+              "description": "DeviceSign 公钥 fingerprint；本地 UI 显示供用户确认（design §6.3）。",
               "type": "string"
             },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
             "pairingId": {
+              "type": "string"
+            },
+            "requestHash": {
+              "description": "已冻结 PairRequest 的 SHA-256；绑定 pending/confirm/replay。",
               "type": "string"
             },
             "requestedAtMs": {
@@ -17441,8 +18731,10 @@
             }
           },
           "required": [
-            "deviceFingerprint",
+            "deviceSignFingerprint",
+            "expiresAtMs",
             "pairingId",
+            "requestHash",
             "requestedAtMs"
           ],
           "type": "object"
@@ -17859,6 +19151,56 @@
             "canceled"
           ],
           "type": "string"
+        },
+        "SignedCertificate": {
+          "additionalProperties": false,
+          "description": "MachineRoot 签发的 link / data 证书（design §6.6）。",
+          "properties": {
+            "certRole": {
+              "$ref": "#/definitions/CertRole"
+            },
+            "generation": {
+              "description": "单调 cert generation；回退值一律拒绝。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "notAfterMs": {
+              "description": "可选有效期（grant 类默认无过期，cert 可带）。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "rootKeyId": {
+              "description": "machine trust anchor 的 root key ID。",
+              "type": "string"
+            },
+            "signature": {
+              "description": "MachineRoot 对 cert `ToBeSignedV1` 的签名。",
+              "type": "string"
+            },
+            "subjectPubkey": {
+              "description": "被证明的日常签名公钥（MachineLinkSign / MachineDataSign）。",
+              "type": "string"
+            },
+            "trustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "certRole",
+            "generation",
+            "rootKeyId",
+            "signature",
+            "subjectPubkey",
+            "trustEpoch"
+          ],
+          "type": "object"
         },
         "SnapshotItem": {
           "description": "snapshot barrier 内的一项。",
@@ -19242,13 +20584,8 @@
           "additionalProperties": false,
           "description": "createPairInvite 回执 —— local-only administration。",
           "properties": {
-            "displayName": {
-              "type": "string"
-            },
-            "expiresAtMs": {
-              "format": "uint64",
-              "minimum": 0.0,
-              "type": "integer"
+            "invite": {
+              "$ref": "#/definitions/PairInviteV1"
             },
             "pairingId": {
               "type": "string"
@@ -19261,8 +20598,7 @@
             }
           },
           "required": [
-            "displayName",
-            "expiresAtMs",
+            "invite",
             "pairingId",
             "reply"
           ],
@@ -19287,6 +20623,154 @@
           },
           "required": [
             "pairings",
+            "reply"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "confirmPairing/cancelPairing 的 canonical durable 回执。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "pairingId": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "confirmed"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pairingId",
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "pairingId": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "canceled"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pairingId",
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "pairingId": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "expired"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pairingId",
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "decision": {
+                  "$ref": "#/definitions/PairingDecision"
+                },
+                "pairingId": {
+                  "type": "string"
+                },
+                "state": {
+                  "$ref": "#/definitions/PairingState"
+                },
+                "status": {
+                  "enum": [
+                    "replayed"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "decision",
+                "pairingId",
+                "state",
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "pairingId": {
+                  "type": "string"
+                },
+                "state": {
+                  "$ref": "#/definitions/PairingState"
+                },
+                "status": {
+                  "enum": [
+                    "alreadyHandled"
+                  ],
+                  "type": "string"
+                },
+                "winner": {
+                  "$ref": "#/definitions/PairingDecision"
+                }
+              },
+              "required": [
+                "pairingId",
+                "state",
+                "status",
+                "winner"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "failure": {
+                  "$ref": "#/definitions/RuntimeFailure"
+                },
+                "status": {
+                  "enum": [
+                    "failed"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "failure",
+                "status"
+              ],
+              "type": "object"
+            }
+          ],
+          "properties": {
+            "reply": {
+              "enum": [
+                "pairing"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
             "reply"
           ],
           "type": "object"
@@ -20608,6 +22092,12 @@
           "properties": {
             "displayName": {
               "description": "仅供人识别的机器显示名；存在于带外邀请中，不进入 Relay 明文。",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "idempotencyKey": {
+              "description": "caller-scoped retry key；丢失 reply 后重试必须读回同一份 durable invite。",
               "type": "string"
             },
             "request": {
@@ -20623,17 +22113,11 @@
                 }
               ],
               "description": "local-only administration 标记。"
-            },
-            "ttlSecs": {
-              "default": 300,
-              "description": "邀请 TTL（秒）；design 固定 5 分钟单次。",
-              "format": "uint32",
-              "minimum": 0.0,
-              "type": "integer"
             }
           },
           "required": [
             "displayName",
+            "idempotencyKey",
             "request",
             "scope"
           ],
@@ -22317,6 +23801,48 @@
             "transferId"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "只允许 daemon 向 local-control UDS connection 投递的待确认配对事件。",
+          "properties": {
+            "deviceSignFingerprint": {
+              "description": "DeviceSign 公钥 fingerprint；本地 UI 显示供用户确认（design §6.3）。",
+              "type": "string"
+            },
+            "expiresAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "pairingId": {
+              "type": "string"
+            },
+            "requestHash": {
+              "description": "已冻结 PairRequest 的 SHA-256；绑定 pending/confirm/replay。",
+              "type": "string"
+            },
+            "requestedAtMs": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "stream": {
+              "enum": [
+                "pairingPending"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "deviceSignFingerprint",
+            "expiresAtMs",
+            "pairingId",
+            "requestHash",
+            "requestedAtMs",
+            "stream"
+          ],
+          "type": "object"
         }
       ],
       "title": "RuntimeStreamItem"
@@ -23762,6 +25288,6 @@
       "type": "object"
     }
   },
-  "title": "AgentDeck Runtime Protocol v3",
+  "title": "AgentDeck Runtime Protocol v4",
   "type": "object"
 }

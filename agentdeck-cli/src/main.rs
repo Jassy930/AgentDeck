@@ -112,7 +112,7 @@ enum ProtocolOp {
     Schema,
     /// Print the local IPC protocol version
     Version,
-    /// Print the Runtime v3 aggregate JSON Schema
+    /// Print the Runtime v4 aggregate JSON Schema
     #[command(name = "runtime-schema")]
     RuntimeSchema,
     /// Print the Relay v2 aggregate JSON Schema
@@ -262,6 +262,18 @@ enum RemoteOp {
         #[command(subcommand)]
         op: RemoteMachineOp,
     },
+    /// Same-UID pairing administration over the canonical Runtime UDS
+    Pairing {
+        #[command(subcommand)]
+        op: RemotePairingOp,
+    },
+    /// Revoke one exact device grant over the same-UID Runtime UDS
+    Revoke {
+        #[arg(long)]
+        device: String,
+        #[arg(long)]
+        grant_serial: u64,
+    },
     /// Run ordinary machine trust-reset over the canonical Runtime UDS
     TrustReset {
         /// Portable Relay admin purge receipt for the MachineRoot-lost path
@@ -332,6 +344,23 @@ enum RemoteMachineOp {
     },
     /// Read the authenticated machine remote lifecycle
     Status,
+}
+
+#[derive(Subcommand)]
+enum RemotePairingOp {
+    /// Create a five-minute out-of-band PairInvite after Relay open ACK
+    Invite {
+        #[arg(long)]
+        display_name: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// List requests waiting for same-UID fingerprint confirmation
+    Pending,
+    /// Confirm one pending request
+    Approve { pairing_id: String },
+    /// Cancel one pending request
+    Cancel { pairing_id: String },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -586,6 +615,29 @@ async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
                 RemoteOp::Machine {
                     op: RemoteMachineOp::Status,
                 } => remote::RuntimeRemotePlan::machine_status(),
+                RemoteOp::Pairing {
+                    op:
+                        RemotePairingOp::Invite {
+                            display_name,
+                            idempotency_key,
+                        },
+                } => remote::RuntimeRemotePlan::create_pair_invite(
+                    display_name.clone(),
+                    idempotency_key.clone(),
+                )?,
+                RemoteOp::Pairing {
+                    op: RemotePairingOp::Pending,
+                } => remote::RuntimeRemotePlan::pairing_pending(),
+                RemoteOp::Pairing {
+                    op: RemotePairingOp::Approve { pairing_id },
+                } => remote::RuntimeRemotePlan::pairing_approve(pairing_id.clone())?,
+                RemoteOp::Pairing {
+                    op: RemotePairingOp::Cancel { pairing_id },
+                } => remote::RuntimeRemotePlan::pairing_cancel(pairing_id.clone())?,
+                RemoteOp::Revoke {
+                    device,
+                    grant_serial,
+                } => remote::RuntimeRemotePlan::revoke_device(device.clone(), *grant_serial)?,
                 RemoteOp::TrustReset {
                     admin_purge_receipt_file,
                 } => remote::RuntimeRemotePlan::trust_reset(admin_purge_receipt_file.as_deref())?,
@@ -884,7 +936,10 @@ async fn main() {
     };
     if let Cmd::Remote { op } = &cli.command {
         let arg = match op {
-            RemoteOp::Machine { .. } | RemoteOp::TrustReset { .. } => None,
+            RemoteOp::Machine { .. }
+            | RemoteOp::Pairing { .. }
+            | RemoteOp::Revoke { .. }
+            | RemoteOp::TrustReset { .. } => None,
             RemoteOp::Synthetic { bundle } => Some(remote::RemoteOpArg::Synthetic {
                 bundle: bundle.clone(),
             }),
@@ -939,7 +994,7 @@ mod remote_machine_cli_tests {
                 op: RemoteOp::Machine {
                     op: RemoteMachineOp::Enroll { bundle_file }
                 }
-            } if bundle_file == PathBuf::from("/private/tmp/enrollment.json")
+            } if bundle_file.as_path() == std::path::Path::new("/private/tmp/enrollment.json")
         ));
 
         let status = Cli::try_parse_from(["agentdeck", "remote", "machine", "status"])
@@ -978,7 +1033,7 @@ mod remote_machine_cli_tests {
                 op: RemoteOp::TrustReset {
                     admin_purge_receipt_file: Some(path)
                 }
-            } if path == PathBuf::from("/private/tmp/purge-receipt.json")
+            } if path.as_path() == std::path::Path::new("/private/tmp/purge-receipt.json")
         ));
     }
 
@@ -992,6 +1047,100 @@ mod remote_machine_cli_tests {
                 "trust-reset",
                 "--admin-purge-receipt",
                 "opaque",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pairing_administration_commands_are_explicit_and_uds_only() {
+        let invite = Cli::try_parse_from([
+            "agentdeck",
+            "remote",
+            "pairing",
+            "invite",
+            "--display-name",
+            "workstation",
+            "--idempotency-key",
+            "invite-1",
+        ])
+        .expect("parse pairing invite");
+        assert!(matches!(
+            invite.command,
+            Cmd::Remote {
+                op: RemoteOp::Pairing {
+                    op: RemotePairingOp::Invite {
+                        display_name,
+                        idempotency_key,
+                    }
+                }
+            } if display_name == "workstation" && idempotency_key == "invite-1"
+        ));
+
+        assert!(matches!(
+            Cli::try_parse_from(["agentdeck", "remote", "pairing", "pending"])
+                .expect("parse pairing pending")
+                .command,
+            Cmd::Remote {
+                op: RemoteOp::Pairing {
+                    op: RemotePairingOp::Pending
+                }
+            }
+        ));
+        let pairing_id = "11111111-1111-1111-1111-111111111111";
+        for verb in ["approve", "cancel"] {
+            let parsed = Cli::try_parse_from(["agentdeck", "remote", "pairing", verb, pairing_id])
+                .expect("parse pairing decision");
+            assert!(matches!(
+                parsed.command,
+                Cmd::Remote {
+                    op: RemoteOp::Pairing {
+                        op: RemotePairingOp::Approve { pairing_id: ref value }
+                            | RemotePairingOp::Cancel { pairing_id: ref value }
+                    }
+                } if value == pairing_id
+            ));
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "agentdeck",
+                "remote",
+                "pairing",
+                "invite",
+                "--display-name",
+                "workstation",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["agentdeck", "remote", "pairing", "approve",]).is_err());
+
+        assert!(matches!(
+            Cli::try_parse_from([
+                "agentdeck",
+                "remote",
+                "revoke",
+                "--device",
+                "device-11111111111111111111111111111111",
+                "--grant-serial",
+                "7",
+            ])
+            .expect("parse exact device revocation")
+            .command,
+            Cmd::Remote {
+                op: RemoteOp::Revoke {
+                    device,
+                    grant_serial: 7,
+                }
+            } if device == "device-11111111111111111111111111111111"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "agentdeck",
+                "remote",
+                "revoke",
+                "--device",
+                "device-11111111111111111111111111111111",
             ])
             .is_err()
         );

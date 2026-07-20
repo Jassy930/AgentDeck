@@ -523,7 +523,7 @@ final class RuntimeV2SnapshotBackfillTests: XCTestCase {
     }
 
     private var rustFixtureURL: URL {
-        repositoryRoot.appendingPathComponent("protocol/agentdeck/fixtures/runtime-v3-wire.jsonl")
+        repositoryRoot.appendingPathComponent("protocol/agentdeck/fixtures/runtime-v4-wire.jsonl")
     }
 
     private func allSwiftSourceFiles() throws -> [URL] {

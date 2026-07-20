@@ -1,0 +1,434 @@
+//! P4.3 G3 PairResponseReceived Store 子片 focused tests。
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use agentdeck_crypto::{SigningKey, sign_pair_response_received};
+use agentdeck_protocol::e2ee::PairResponseReceivedV1;
+use agentdeck_protocol::relay_v2::frame::{
+    GrantCommitted, OpaqueRouteFrame, PairRouteCloseOutcome, PairRouteClosed, RelayFrameBody,
+};
+use agentdeck_protocol::relay_v2::{Ed25519Signature, RELAY_PROTOCOL_VERSION, encode};
+
+use crate::remote::access::{PairResponseAccessBinding, VerifiedPairResponseReceipt};
+use crate::runtime::model::{
+    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
+};
+use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
+
+use super::RuntimeStoreHandle;
+use super::pairing::PairingInviteLifecycle;
+use super::pairing_delivery::{
+    AcknowledgePairResponseReceived, AcknowledgePairResponseReceivedOutcome,
+};
+use super::pairing_grant::PairingGrantPreparation;
+use super::pairing_grant_commit::{AcknowledgeGrantCommitted, GrantCommittedRecovery};
+use super::pairing_grant_tests::{awaiting_pairing, grant_input};
+use super::pairing_grant_tx::ConfirmPairingGrantOutcome;
+use super::pairing_tests::{
+    GenerousCapacity, NOW_MS, OneShotFault, TestClock, TestRoot, artifact_bytes, make_active,
+};
+
+const DEVICE_SIGN_SEED: [u8; 32] = [0xa4; 32];
+
+fn grant_committed_frame(recovery: &super::pairing_grant_tx::GrantPreparingRecovery) -> Vec<u8> {
+    encode(&OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::GrantCommitted(GrantCommitted {
+            device_route: recovery.device_route(),
+            grant_serial: recovery.grant_serial(),
+            grant_hash: recovery.grant_hash(),
+        }),
+    })
+}
+
+fn close_terminal(
+    pair_route: agentdeck_protocol::relay_v2::PairRouteId,
+    outcome: PairRouteCloseOutcome,
+) -> Vec<u8> {
+    encode(&OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::PairRouteClosed(PairRouteClosed {
+            pair_route,
+            outcome,
+        }),
+    })
+}
+
+async fn prepare_committed(
+    store: &RuntimeStoreHandle,
+    clock: &AtomicU64,
+) -> (PairingGrantPreparation, GrantCommittedRecovery) {
+    let (binding, data_cert) = make_active(store).await;
+    let preparation = awaiting_pairing(store, &binding, &data_cert).await;
+    let confirmed = store
+        .confirm_pairing_grant(grant_input(&preparation, &binding, &data_cert))
+        .await
+        .expect("confirm grant before delivery");
+    let installing = match confirmed {
+        ConfirmPairingGrantOutcome::Confirmed { recovery, .. } => recovery,
+        other => panic!("fresh confirm must freeze grant: {other:?}"),
+    };
+    clock.store(NOW_MS + 1, Ordering::SeqCst);
+    let committed = store
+        .acknowledge_grant_committed(AcknowledgeGrantCommitted::new(
+            preparation.pairing_id(),
+            grant_committed_frame(&installing),
+        ))
+        .await
+        .expect("commit grant before delivery");
+    let recovery = match committed {
+        super::pairing_grant_commit::AcknowledgeGrantCommittedOutcome::Committed { recovery } => {
+            recovery
+        }
+        other => panic!("fresh GrantCommitted ACK must transition: {other:?}"),
+    };
+    (preparation, recovery)
+}
+
+fn verified_receipt(recovery: &GrantCommittedRecovery) -> VerifiedPairResponseReceipt {
+    let binding = PairResponseAccessBinding::from_frozen(
+        recovery.invite(),
+        recovery.request_hash(),
+        recovery.relay_grant(),
+        recovery.pair_response(),
+    )
+    .expect("rebuild authenticated response binding");
+    let receipt = sign_pair_response_received(
+        &SigningKey::from_seed(&DEVICE_SIGN_SEED),
+        binding.info(),
+        binding.receipt_context(),
+        PairResponseReceivedV1 {
+            request_hash: recovery.request_hash(),
+            grant_hash: recovery.grant_hash(),
+            response_hash: recovery.response_hash(),
+            signature: Ed25519Signature([0; 64]),
+        },
+    )
+    .expect("sign endpoint receipt");
+    binding
+        .verify_signed_receipt(
+            &receipt
+                .canonical_bytes()
+                .expect("canonical endpoint receipt"),
+        )
+        .expect("verify endpoint receipt")
+}
+
+fn delivery_counts(database: &std::path::Path) -> (u64, u64, u64, u64) {
+    rusqlite::Connection::open(database)
+        .expect("open delivery evidence DB")
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM remote_pairings WHERE lifecycle = 'delivered'),
+                 (SELECT COUNT(*) FROM remote_pairing_receipts WHERE action = 'confirmed'),
+                 (SELECT COUNT(*) FROM remote_control_outbox
+                    WHERE operation_kind = 'closePairRoute'),
+                 remote_control_outbox_count
+             FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read delivery evidence")
+}
+
+#[tokio::test]
+async fn valid_receipt_atomically_delivers_replays_and_scrubs_only_after_close_ack() {
+    let root = TestRoot::new("pairing-delivery-happy");
+    let keys = MemoryKeyStore::new();
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let config = || {
+        RuntimeStoreConfig::new(root.database())
+            .with_capacity_probe(GenerousCapacity)
+            .with_clock(TestClock(clock.clone()))
+    };
+    let store = RuntimeStoreHandle::open(
+        config(),
+        load_or_create_storage_kek(&keys, &root.database()).expect("load StorageKEK"),
+    )
+    .await
+    .expect("open delivery store");
+    let (preparation, committed) = prepare_committed(&store, &clock).await;
+    let proof = verified_receipt(&committed);
+
+    clock.store(NOW_MS + 2, Ordering::SeqCst);
+    let delivered = store
+        .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
+            preparation.pairing_id(),
+            &proof,
+        ))
+        .await
+        .expect("commit endpoint delivery");
+    let close = match delivered {
+        AcknowledgePairResponseReceivedOutcome::Delivered { close } => close,
+        other => panic!("first valid receipt must deliver: {other:?}"),
+    };
+    assert_eq!(close.pairing_id(), preparation.pairing_id());
+    assert_eq!(close.pair_route(), committed.invite().pair_route);
+    assert_eq!(delivery_counts(&root.database()), (1, 1, 1, 1));
+    assert_eq!(
+        store
+            .load_pairing_invite(preparation.pairing_id())
+            .await
+            .expect("load delivered pairing")
+            .expect("secret row retained before Close ACK")
+            .lifecycle(),
+        PairingInviteLifecycle::Delivered
+    );
+    assert!(
+        store
+            .list_grant_committed_recovery()
+            .await
+            .expect("committed recovery after delivery")
+            .is_empty()
+    );
+
+    let before_replay = artifact_bytes(&root.database());
+    assert!(matches!(
+        store
+            .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
+                preparation.pairing_id(),
+                &proof,
+            ))
+            .await
+            .expect("exact delivery replay"),
+        AcknowledgePairResponseReceivedOutcome::Replayed { close: _ }
+    ));
+    assert_eq!(artifact_bytes(&root.database()), before_replay);
+
+    store
+        .acknowledge_pair_route_close(
+            preparation.pairing_id(),
+            close_terminal(close.pair_route(), PairRouteCloseOutcome::Closed),
+        )
+        .await
+        .expect("acknowledge ClosePairRoute");
+    assert_eq!(delivery_counts(&root.database()), (0, 1, 0, 0));
+    assert!(
+        store
+            .load_pairing_invite(preparation.pairing_id())
+            .await
+            .expect("load scrubbed pairing")
+            .is_none()
+    );
+    store.shutdown().await.expect("shutdown delivery store");
+
+    let reopened = RuntimeStoreHandle::open(
+        config(),
+        load_or_create_storage_kek(&keys, &root.database()).expect("reload StorageKEK"),
+    )
+    .await
+    .expect("reopen scrubbed delivery store");
+    assert!(matches!(
+        reopened
+            .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
+                preparation.pairing_id(),
+                &proof,
+            ))
+            .await,
+        Err(RuntimeStoreError::PairingConflict)
+    ));
+    reopened.shutdown().await.expect("shutdown reopened store");
+}
+
+#[tokio::test]
+async fn receipt_for_unknown_pairing_and_expired_receipt_are_zero_write_conflicts() {
+    let root = TestRoot::new("pairing-delivery-conflicts");
+    let keys = MemoryKeyStore::new();
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let config = RuntimeStoreConfig::new(root.database())
+        .with_capacity_probe(GenerousCapacity)
+        .with_clock(TestClock(clock.clone()));
+    let store = RuntimeStoreHandle::open(
+        config,
+        load_or_create_storage_kek(&keys, &root.database()).expect("load StorageKEK"),
+    )
+    .await
+    .expect("open conflict store");
+    let (preparation, committed) = prepare_committed(&store, &clock).await;
+    let proof = verified_receipt(&committed);
+
+    let before_unknown = artifact_bytes(&root.database());
+    let unknown =
+        super::identity::RuntimeId::from_bytes(super::identity::RuntimeIdKind::Pairing, [0xee; 16])
+            .expect("nonzero pairing id");
+    assert!(matches!(
+        store
+            .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
+                unknown, &proof,
+            ))
+            .await,
+        Err(RuntimeStoreError::PairingConflict)
+    ));
+    assert_eq!(artifact_bytes(&root.database()), before_unknown);
+
+    clock.store(committed.invite().expires_at_ms, Ordering::SeqCst);
+    let before_expired = artifact_bytes(&root.database());
+    assert!(matches!(
+        store
+            .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
+                preparation.pairing_id(),
+                &proof,
+            ))
+            .await,
+        Err(RuntimeStoreError::PairingExpired)
+    ));
+    assert_eq!(artifact_bytes(&root.database()), before_expired);
+    store.shutdown().await.expect("shutdown conflict store");
+}
+
+#[tokio::test]
+async fn delivery_commit_fault_boundaries_converge_by_restart_and_exact_retry() {
+    for (label, operation, committed) in [
+        (
+            "pairing-delivery-before-commit",
+            RuntimeStoreOperation::AcknowledgePairResponseReceivedBeforeCommit,
+            false,
+        ),
+        (
+            "pairing-delivery-after-commit",
+            RuntimeStoreOperation::AcknowledgePairResponseReceivedAfterCommit,
+            true,
+        ),
+    ] {
+        let root = TestRoot::new(label);
+        let keys = MemoryKeyStore::new();
+        let clock = Arc::new(AtomicU64::new(NOW_MS));
+        let config = || {
+            RuntimeStoreConfig::new(root.database())
+                .with_capacity_probe(GenerousCapacity)
+                .with_clock(TestClock(clock.clone()))
+        };
+        let setup = RuntimeStoreHandle::open(
+            config(),
+            load_or_create_storage_kek(&keys, &root.database()).expect("load StorageKEK"),
+        )
+        .await
+        .expect("open delivery fault setup");
+        let (preparation, recovery) = prepare_committed(&setup, &clock).await;
+        let proof = verified_receipt(&recovery);
+        clock.store(NOW_MS + 2, Ordering::SeqCst);
+        setup.shutdown().await.expect("shutdown delivery setup");
+
+        let faulted = RuntimeStoreHandle::open(
+            config().with_fault_injector(Arc::new(OneShotFault {
+                operation,
+                fired: AtomicBool::new(false),
+            })),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload StorageKEK"),
+        )
+        .await
+        .expect("open faulted delivery store");
+        let error = faulted
+            .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
+                preparation.pairing_id(),
+                &proof,
+            ))
+            .await
+            .expect_err("delivery fault must surface");
+        assert_eq!(
+            matches!(
+                error,
+                RuntimeStoreError::CommitOutcomeUnknown {
+                    operation: RuntimeCommitOperation::AcknowledgePairResponseReceived,
+                }
+            ),
+            committed
+        );
+        assert_eq!(
+            faulted
+                .list_pairing_terminal_recovery()
+                .await
+                .expect("read close recovery after delivery fault")
+                .len(),
+            usize::from(committed)
+        );
+        assert_eq!(
+            faulted
+                .list_grant_committed_recovery()
+                .await
+                .expect("read response recovery after delivery fault")
+                .len(),
+            usize::from(!committed)
+        );
+        faulted.shutdown().await.expect("shutdown faulted store");
+
+        let reopened = RuntimeStoreHandle::open(
+            config(),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload StorageKEK"),
+        )
+        .await
+        .expect("reopen delivery fault store");
+        let retry = reopened
+            .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
+                preparation.pairing_id(),
+                &proof,
+            ))
+            .await
+            .expect("exact delivery retry after restart");
+        assert!(matches!(
+            (committed, retry),
+            (
+                true,
+                AcknowledgePairResponseReceivedOutcome::Replayed { .. }
+            ) | (
+                false,
+                AcknowledgePairResponseReceivedOutcome::Delivered { .. }
+            )
+        ));
+        assert_eq!(delivery_counts(&root.database()), (1, 1, 1, 1));
+        reopened.shutdown().await.expect("shutdown recovered store");
+    }
+}
+
+#[tokio::test]
+async fn offline_delivered_lifecycle_tamper_fails_full_open_without_rewriting_artifacts() {
+    let root = TestRoot::new("pairing-delivery-offline-tamper");
+    let keys = MemoryKeyStore::new();
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let config = || {
+        RuntimeStoreConfig::new(root.database())
+            .with_capacity_probe(GenerousCapacity)
+            .with_clock(TestClock(clock.clone()))
+    };
+    let store = RuntimeStoreHandle::open(
+        config(),
+        load_or_create_storage_kek(&keys, &root.database()).expect("load StorageKEK"),
+    )
+    .await
+    .expect("open tamper setup");
+    let (preparation, recovery) = prepare_committed(&store, &clock).await;
+    let proof = verified_receipt(&recovery);
+    clock.store(NOW_MS + 2, Ordering::SeqCst);
+    store
+        .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
+            preparation.pairing_id(),
+            &proof,
+        ))
+        .await
+        .expect("deliver before offline tamper");
+    store.shutdown().await.expect("shutdown tamper setup");
+
+    let connection = rusqlite::Connection::open(root.database()).expect("open offline writer");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE remote_pairings SET lifecycle = 'grantCommitted'
+                 WHERE pairing_id = ?1 AND lifecycle = 'delivered'",
+                [&preparation.pairing_id().as_bytes()[..]],
+            )
+            .expect("tamper delivered lifecycle without KEK"),
+        1
+    );
+    drop(connection);
+    let tampered = artifact_bytes(&root.database());
+
+    let error = RuntimeStoreHandle::open(
+        config(),
+        load_or_create_storage_kek(&keys, &root.database()).expect("reload StorageKEK"),
+    )
+    .await
+    .expect_err("offline lifecycle tamper must fail full open");
+    assert!(matches!(error, RuntimeStoreError::UnknownOrCorruptSchema));
+    assert_eq!(artifact_bytes(&root.database()), tampered);
+}

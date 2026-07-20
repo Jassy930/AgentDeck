@@ -6,7 +6,8 @@ final class RuntimeV2PublicAPITests: XCTestCase {
   func testCurrentCompactCodecIsAvailableWithoutTestableImport() throws {
     XCTAssertEqual(runtimeProtocolVersionV2, 2)
     XCTAssertEqual(runtimeProtocolVersionV3, 3)
-    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV3)
+    XCTAssertEqual(runtimeProtocolVersionV4, 4)
+    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV4)
 
     let carrier = try RuntimeTransferCarrierV2(
       messageID: RuntimeMessageID(rawValue: "public-message"),

@@ -78,7 +78,7 @@ mod neutrality_tests;
 mod tests {
     #[test]
     fn protocol_version_is_positive() {
-        assert!(super::PROTOCOL_VERSION >= 1);
+        const { assert!(super::PROTOCOL_VERSION >= 1) };
     }
 
     #[test]

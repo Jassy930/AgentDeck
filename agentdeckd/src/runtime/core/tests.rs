@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Barrier, Mutex as StdMutex};
 
 use agentdeck_protocol::relay_v2::enrollment::EnrollmentBundleV2;
 use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
@@ -13,15 +13,17 @@ use agentdeck_protocol::runtime::failure::{
 };
 use agentdeck_protocol::runtime::identity::{
     ApprovalId, ConversationId, DeviceHandle, EventId, GrantSerial, IdempotencyKey, MessageId,
+    PairingId,
 };
 use agentdeck_protocol::runtime::{
     ArtifactSha256, ClaudeCodeConversationConfiguration, CodexConversationConfiguration,
     ConfigurationReceipt, ConfigureConversationRequest, ConversationConfiguration,
     ConversationMetadataMutation, ConversationMetadataMutationRequest, ConversationMetadataReceipt,
     ConversationStart, LocalOnlyAdministration, MAX_RUNTIME_JSON_FRAME_BYTES, MachineEnrollRequest,
-    PromptPayload, QueryReceiptSelector, RuntimeEvent, RuntimeEventBody, RuntimeMessage,
-    RuntimeStreamItem, SendPromptRequest, StageUpgradeReceipt, StageUpgradeRequest,
-    TrustResetRequest, VendorConfigurationSnapshot,
+    PairInvite, PairingReceipt, PendingPairing, PromptPayload, QueryReceiptSelector,
+    RevocationReceipt, RuntimeEvent, RuntimeEventBody, RuntimeMessage, RuntimeStreamItem,
+    SendPromptRequest, StageUpgradeReceipt, StageUpgradeRequest, TrustResetRequest,
+    VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode, CodexApprovalPolicy,
@@ -32,7 +34,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::*;
+use crate::runtime::pairing_administration::{PairingAdministration, PairingAdministrationError};
 use crate::runtime::remote_administration::{RemoteAdministration, RemoteAdministrationError};
+use crate::runtime::revocation_administration::{
+    RevocationAdministration, RevocationAdministrationError,
+};
 use crate::runtime::store::{ImportNativeProjection, ImportNativeProjectionOutcome};
 use crate::security::{MemoryKeyStore, SecretBytes, StorageKek, load_or_create_storage_kek};
 
@@ -66,6 +72,95 @@ impl RemoteAdministration for CountingRemoteAdministration {
     ) -> Result<agentdeck_protocol::runtime::MachineRemoteStatus, RemoteAdministrationError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(unenrolled_remote_status())
+    }
+}
+
+#[derive(Default)]
+struct CountingPairingAdministration {
+    calls: AtomicUsize,
+    create_owner: StdMutex<Option<crate::runtime::store::IdempotencyOwner>>,
+}
+
+#[async_trait::async_trait]
+impl PairingAdministration for CountingPairingAdministration {
+    async fn create(
+        &self,
+        owner: crate::runtime::store::IdempotencyOwner,
+        _request: agentdeck_protocol::runtime::CreatePairInviteRequest,
+    ) -> Result<PairInvite, PairingAdministrationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.create_owner.lock().expect("lock pairing owner") = Some(owner);
+        Err(PairingAdministrationError::new(
+            "daemon.pairing.test_create",
+        ))
+    }
+
+    async fn list(&self) -> Result<Vec<PendingPairing>, PairingAdministrationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(PairingAdministrationError::new("daemon.pairing.test_list"))
+    }
+
+    async fn confirm(
+        &self,
+        _pairing_id: RuntimeId,
+    ) -> Result<PairingReceipt, PairingAdministrationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(PairingAdministrationError::new(
+            "daemon.pairing.test_confirm",
+        ))
+    }
+
+    async fn cancel(
+        &self,
+        _pairing_id: RuntimeId,
+    ) -> Result<PairingReceipt, PairingAdministrationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(PairingAdministrationError::new(
+            "daemon.pairing.test_cancel",
+        ))
+    }
+}
+
+struct CountingRevocationAdministration {
+    calls: AtomicUsize,
+    observed: StdMutex<Vec<(DeviceHandle, GrantSerial)>>,
+    failure_code: Option<&'static str>,
+}
+
+impl CountingRevocationAdministration {
+    fn succeeding() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            observed: StdMutex::new(Vec::new()),
+            failure_code: None,
+        }
+    }
+
+    fn failing(code: &'static str) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            observed: StdMutex::new(Vec::new()),
+            failure_code: Some(code),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RevocationAdministration for CountingRevocationAdministration {
+    async fn revoke_device(
+        &self,
+        device: DeviceHandle,
+        grant_serial: GrantSerial,
+    ) -> Result<RevocationReceipt, RevocationAdministrationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.observed
+            .lock()
+            .expect("lock observed revocation targets")
+            .push((device, grant_serial));
+        match self.failure_code {
+            Some(code) => Err(RevocationAdministrationError::new(code)),
+            None => Ok(RevocationReceipt::Committed { grant_serial }),
+        }
     }
 }
 
@@ -737,7 +832,7 @@ fn dormant_machine_administration_requests() -> Vec<RuntimeRequest> {
         RuntimeRequest::CreatePairInvite(
             agentdeck_protocol::runtime::command::CreatePairInviteRequest {
                 display_name: "fixture machine".to_owned(),
-                ttl_secs: 300,
+                idempotency_key: IdempotencyKey::new("pair-invite-dormant-1"),
                 scope: LocalOnlyAdministration::LocalOnly,
             },
         ),
@@ -745,11 +840,15 @@ fn dormant_machine_administration_requests() -> Vec<RuntimeRequest> {
             scope: LocalOnlyAdministration::LocalOnly,
         },
         RuntimeRequest::ConfirmPairing {
-            pairing_id: agentdeck_protocol::runtime::identity::PairingId::new("pairing-1"),
+            pairing_id: agentdeck_protocol::runtime::identity::PairingId::new(
+                "11111111-1111-1111-1111-111111111111",
+            ),
             scope: LocalOnlyAdministration::LocalOnly,
         },
         RuntimeRequest::CancelPairing {
-            pairing_id: agentdeck_protocol::runtime::identity::PairingId::new("pairing-1"),
+            pairing_id: agentdeck_protocol::runtime::identity::PairingId::new(
+                "11111111-1111-1111-1111-111111111111",
+            ),
             scope: LocalOnlyAdministration::LocalOnly,
         },
         RuntimeRequest::MachineEnroll(MachineEnrollRequest {
@@ -804,6 +903,19 @@ async fn dormant_machine_administration_requires_local_control_before_feature_ga
                 | RuntimeRequest::MachineRemoteStatus { .. }
                 | RuntimeRequest::TrustReset(_)
         );
+        let is_pairing_administration = matches!(
+            &request,
+            RuntimeRequest::CreatePairInvite(_)
+                | RuntimeRequest::ListPendingPairings { .. }
+                | RuntimeRequest::ConfirmPairing { .. }
+                | RuntimeRequest::CancelPairing { .. }
+        );
+        let is_revocation_administration = matches!(
+            &request,
+            RuntimeRequest::Revoke(RevokeRequest {
+                target: RevokeTarget::Device { .. }
+            })
+        );
         for connection in [read_only, remote] {
             let calls = remote_administration.calls.load(Ordering::SeqCst);
             let reply = core.handle(connection, request.clone()).await;
@@ -821,6 +933,18 @@ async fn dormant_machine_administration_requires_local_control_before_feature_ga
         let reply = core.handle(local_control, request).await;
         if is_remote_administration {
             assert!(matches!(reply, RuntimeReply::MachineRemoteStatus(_)));
+        } else if is_pairing_administration {
+            assert!(matches!(
+                reply,
+                RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+                    if code == "daemon.pairing.administration.unavailable"
+            ));
+        } else if is_revocation_administration {
+            assert!(matches!(
+                reply,
+                RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+                    if code == "daemon.revocation.administration.unavailable"
+            ));
         } else {
             assert!(matches!(
                 reply,
@@ -842,6 +966,331 @@ async fn dormant_machine_administration_requires_local_control_before_feature_ga
         ));
     }
 
+    core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn pairing_administration_is_local_control_only_and_binds_create_owner() {
+    let root = TestRoot::new("pairing-admin-local-control");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let pairing = Arc::new(CountingPairingAdministration::default());
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xA2; 32])
+            .expect("construct RuntimeCore")
+            .with_pairing_administration(pairing.clone()),
+    );
+    core.recover().await.expect("recover");
+
+    let read_only = connect_local(&core, 0x61).await;
+    let (local_control, _control_writes) = connect_local_control_with_sink(&core, 0x62);
+    let remote = core
+        .principal_issuer
+        .issue_test_remote([0x63; 16], [0x64; 16], 1, [0x65; 32])
+        .expect("issue remote principal");
+    let (remote_sink, _remote_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    let remote = core
+        .connect(remote, ConnectionSink::new(remote_sink))
+        .expect("connect remote principal");
+
+    for request in dormant_machine_administration_requests()
+        .into_iter()
+        .filter(|request| {
+            matches!(
+                request,
+                RuntimeRequest::CreatePairInvite(_)
+                    | RuntimeRequest::ListPendingPairings { .. }
+                    | RuntimeRequest::ConfirmPairing { .. }
+                    | RuntimeRequest::CancelPairing { .. }
+            )
+        })
+    {
+        for connection in [read_only, remote] {
+            let before = pairing.calls.load(Ordering::SeqCst);
+            assert!(matches!(
+                core.handle(connection, request.clone()).await,
+                RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+                    if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
+            ));
+            assert_eq!(pairing.calls.load(Ordering::SeqCst), before);
+        }
+        let before = pairing.calls.load(Ordering::SeqCst);
+        let reply = core.handle(local_control, request).await;
+        assert!(matches!(reply, RuntimeReply::Failure(_)));
+        assert_eq!(pairing.calls.load(Ordering::SeqCst), before + 1);
+    }
+
+    assert_eq!(
+        pairing
+            .create_owner
+            .lock()
+            .expect("lock pairing owner")
+            .as_ref(),
+        Some(&crate::runtime::store::IdempotencyOwner::Local {
+            machine_trust_domain: [0xA2; 32],
+            uid: 501,
+            client_installation_id: [0x62; 16],
+        })
+    );
+    let before = pairing.calls.load(Ordering::SeqCst);
+    assert!(matches!(
+        core.handle(
+            local_control,
+            RuntimeRequest::ConfirmPairing {
+                pairing_id: PairingId::new("not-a-canonical-pairing-id"),
+                scope: LocalOnlyAdministration::LocalOnly,
+            },
+        )
+        .await,
+        RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+            if code == DAEMON_RUNTIME_INVALID_REQUEST
+    ));
+    assert_eq!(pairing.calls.load(Ordering::SeqCst), before);
+    core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn revocation_administration_is_local_control_only_and_receives_exact_target() {
+    let root = TestRoot::new("revocation-admin-local-control");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let revocation = Arc::new(CountingRevocationAdministration::succeeding());
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xB1; 32])
+            .expect("construct RuntimeCore")
+            .with_revocation_administration(revocation.clone()),
+    );
+    core.recover().await.expect("recover");
+
+    let read_only = connect_local(&core, 0x81).await;
+    let (local_control, _control_writes) = connect_local_control_with_sink(&core, 0x82);
+    let remote_principal = core
+        .principal_issuer
+        .issue_test_remote([0x83; 16], [0x84; 16], 9, [0x85; 32])
+        .expect("issue remote principal");
+    let (remote_sink, _remote_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    let remote = core
+        .connect(remote_principal, ConnectionSink::new(remote_sink))
+        .expect("connect remote principal");
+    let device = DeviceHandle::new("device-handle-exact-01");
+    let grant_serial = GrantSerial::new(42);
+    let request = RuntimeRequest::Revoke(RevokeRequest {
+        target: RevokeTarget::Device {
+            device: device.clone(),
+            grant_serial,
+            scope: LocalOnlyAdministration::LocalOnly,
+        },
+    });
+
+    for connection in [read_only, remote] {
+        assert!(matches!(
+            core.handle(connection, request.clone()).await,
+            RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+                if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
+        ));
+        assert_eq!(
+            revocation.calls.load(Ordering::SeqCst),
+            0,
+            "authorization rejection must happen before revocation backend"
+        );
+    }
+    assert!(matches!(
+        core.handle(local_control, request).await,
+        RuntimeReply::Revocation(RevocationReceipt::Committed {
+            grant_serial: observed
+        }) if observed == grant_serial
+    ));
+    assert_eq!(revocation.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        revocation
+            .observed
+            .lock()
+            .expect("lock observed revocation targets")
+            .as_slice(),
+        &[(device, grant_serial)]
+    );
+    core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn revocation_backend_failure_maps_stable_bounded_code() {
+    let root = TestRoot::new("revocation-admin-failure");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let revocation = Arc::new(CountingRevocationAdministration::failing(
+        "daemon.revocation.test_backend",
+    ));
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xB2; 32])
+            .expect("construct RuntimeCore")
+            .with_revocation_administration(revocation.clone()),
+    );
+    core.recover().await.expect("recover");
+    let (local_control, _control_writes) = connect_local_control_with_sink(&core, 0x86);
+    let reply = core
+        .handle(
+            local_control,
+            RuntimeRequest::Revoke(RevokeRequest {
+                target: RevokeTarget::Device {
+                    device: DeviceHandle::new("device-failure-01"),
+                    grant_serial: GrantSerial::new(43),
+                    scope: LocalOnlyAdministration::LocalOnly,
+                },
+            }),
+        )
+        .await;
+    assert!(matches!(
+        reply,
+        RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+            if code == "daemon.revocation.test_backend"
+    ));
+    assert_eq!(revocation.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        RevocationAdministrationError::new("INVALID CODE").code(),
+        "daemon.revocation.administration.unavailable"
+    );
+    assert_eq!(
+        RevocationAdministrationError::new("x".repeat(129)).code(),
+        "daemon.revocation.administration.unavailable"
+    );
+    core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn disabled_revocation_administration_fails_closed_for_local_control() {
+    let root = TestRoot::new("revocation-admin-disabled");
+    let core = core(&root).await;
+    core.recover().await.expect("recover");
+    let (local_control, _control_writes) = connect_local_control_with_sink(&core, 0x87);
+    assert!(matches!(
+        core.handle(
+            local_control,
+            RuntimeRequest::Revoke(RevokeRequest {
+                target: RevokeTarget::Device {
+                    device: DeviceHandle::new("device-disabled-01"),
+                    grant_serial: GrantSerial::new(44),
+                    scope: LocalOnlyAdministration::LocalOnly,
+                },
+            }),
+        )
+        .await,
+        RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+            if code == "daemon.revocation.administration.unavailable"
+    ));
+    core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn revocation_self_device_remains_feature_unavailable_without_backend_call() {
+    let root = TestRoot::new("revocation-self-device-gated");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let revocation = Arc::new(CountingRevocationAdministration::succeeding());
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xB3; 32])
+            .expect("construct RuntimeCore")
+            .with_revocation_administration(revocation.clone()),
+    );
+    core.recover().await.expect("recover");
+    let read_only = connect_local(&core, 0x88).await;
+    let (local_control, _control_writes) = connect_local_control_with_sink(&core, 0x89);
+    let remote_principal = core
+        .principal_issuer
+        .issue_test_remote([0x8a; 16], [0x8b; 16], 10, [0x8c; 32])
+        .expect("issue remote principal");
+    let (remote_sink, _remote_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    let remote = core
+        .connect(remote_principal, ConnectionSink::new(remote_sink))
+        .expect("connect remote principal");
+    let request = RuntimeRequest::Revoke(RevokeRequest {
+        target: RevokeTarget::SelfDevice,
+    });
+
+    for connection in [read_only, remote, local_control] {
+        assert!(matches!(
+            core.handle(connection, request.clone()).await,
+            RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+                if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+        ));
+    }
+    assert_eq!(
+        revocation.calls.load(Ordering::SeqCst),
+        0,
+        "SelfDevice must not enter the local revocation backend"
+    );
+    core.shutdown().await.expect("shutdown core");
+}
+
+#[test]
+fn revocation_seam_has_no_pairing_access_or_relay_type_ingress() {
+    let seam = include_str!("../revocation_administration.rs");
+    let core = include_str!("../core.rs");
+    for forbidden in ["PairingAccess", "relay_v2", "crate::remote"] {
+        assert!(
+            !seam.contains(forbidden),
+            "revocation seam must not mention {forbidden}"
+        );
+    }
+    assert!(
+        !core.contains("PairingAccess"),
+        "PairingAccess has no RuntimeCore/ConnectionId ingress and cannot call the backend"
+    );
+}
+
+#[tokio::test]
+async fn pairing_pending_sink_only_targets_current_local_control_connections() {
+    let root = TestRoot::new("pairing-pending-local-control");
+    let core = core(&root).await;
+    core.recover().await.expect("recover");
+
+    let read_only_principal = core
+        .issue_verified_local_principal(501, [0x71; 16])
+        .expect("issue read-only principal");
+    let (read_only_sink, mut read_only_writes) =
+        mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    core.connect(read_only_principal, ConnectionSink::new(read_only_sink))
+        .expect("connect read-only principal");
+
+    let (local_control, mut control_writes) = connect_local_control_with_sink(&core, 0x72);
+    let remote_principal = core
+        .principal_issuer
+        .issue_test_remote([0x73; 16], [0x74; 16], 1, [0x75; 32])
+        .expect("issue remote principal");
+    let (remote_sink, mut remote_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    core.connect(remote_principal, ConnectionSink::new(remote_sink))
+        .expect("connect remote principal");
+
+    let pending = PendingPairing {
+        pairing_id: PairingId::new("76767676-7676-7676-7676-767676767676"),
+        request_hash: [0x77; 32],
+        device_sign_fingerprint: [0x78; 32],
+        requested_at_ms: 100,
+        expires_at_ms: 200,
+    };
+    let sink = core.pairing_pending_sink();
+    assert_eq!(sink.publish(pending.clone()).expect("publish pending"), 1);
+    let write = tokio::time::timeout(std::time::Duration::from_secs(1), control_writes.recv())
+        .await
+        .expect("local control write deadline")
+        .expect("local control stream write");
+    let envelope: RuntimeEnvelope =
+        serde_json::from_slice(write.bytes()).expect("decode pending envelope");
+    assert!(matches!(
+        envelope.body,
+        RuntimeMessage::Stream(RuntimeStreamItem::PairingPending(value)) if value == pending
+    ));
+    write.acknowledge().expect("ack pending write");
+    assert!(matches!(
+        read_only_writes.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        remote_writes.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    core.disconnect(local_control).await;
+    assert_eq!(sink.publish(pending).expect("publish without control"), 0);
     core.shutdown().await.expect("shutdown core");
 }
 

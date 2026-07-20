@@ -78,18 +78,17 @@ fn run_session(agent: &str, extra_args: &[&str], prompt: &str) -> (String, Strin
             continue;
         };
         // Capture threadId
-        if thread_id.is_empty() {
-            if let Some(tid) = val.get("threadId").and_then(|v| v.as_str()) {
-                thread_id = tid.to_string();
-            }
+        if thread_id.is_empty()
+            && let Some(tid) = val.get("threadId").and_then(|v| v.as_str())
+        {
+            thread_id = tid.to_string();
         }
         // Capture agentKind from sessionStarted
-        if agent_kind_out.is_empty() {
-            if val.get("type").and_then(|t| t.as_str()) == Some("sessionStarted") {
-                if let Some(ak) = val.get("agentKind").and_then(|v| v.as_str()) {
-                    agent_kind_out = ak.to_string();
-                }
-            }
+        if agent_kind_out.is_empty()
+            && val.get("type").and_then(|t| t.as_str()) == Some("sessionStarted")
+            && let Some(ak) = val.get("agentKind").and_then(|v| v.as_str())
+        {
+            agent_kind_out = ak.to_string();
         }
         let ev_type = val.get("type").and_then(|t| t.as_str());
         if ev_type == Some("turnComplete") || ev_type == Some("error") {

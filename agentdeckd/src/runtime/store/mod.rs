@@ -21,6 +21,71 @@ mod native_projection;
 mod native_projection_import_tests;
 #[cfg(test)]
 mod native_projection_lifecycle_tests;
+#[allow(
+    dead_code,
+    reason = "P4 pairing coordinator consumes the S1 Store capability"
+)]
+pub(crate) mod pairing;
+mod pairing_authorization;
+mod pairing_delivery;
+#[cfg(test)]
+mod pairing_delivery_tests;
+pub(crate) mod pairing_grant;
+mod pairing_grant_allocation;
+#[cfg(test)]
+mod pairing_grant_allocation_tests;
+mod pairing_grant_commit;
+#[cfg(test)]
+mod pairing_grant_commit_tests;
+mod pairing_grant_renewal;
+#[cfg(test)]
+mod pairing_grant_tests;
+#[cfg(test)]
+pub(crate) use pairing_grant_tests::grant_input_with as grant_input_with_for_test;
+mod pairing_grant_tx;
+pub(crate) use pairing_delivery::{
+    AcknowledgePairResponseReceived, AcknowledgePairResponseReceivedOutcome,
+};
+mod pairing_revocation;
+mod pairing_revocation_ack;
+#[allow(
+    unused_imports,
+    reason = "G4 Store capability keeps the target projection nameable for later RemoteLink gates"
+)]
+pub(crate) use pairing_revocation::{
+    BeginDeviceRevocation, BeginDeviceRevocationOutcome, DeviceRevocationRecovery,
+    RevocationRecoveryPhase, RevocationTarget, RevocationTargetStatus,
+};
+pub(crate) use pairing_revocation_ack::{
+    AcknowledgeOrphanGrantCommittedOutcome, AcknowledgeRevocationCommitted,
+    AcknowledgeRevocationCommittedOutcome,
+};
+mod pairing_receipt_retention;
+#[cfg(test)]
+mod pairing_revocation_tests;
+#[allow(
+    unused_imports,
+    reason = "startup/maintenance caller consumes the bounded receipt purge outcome"
+)]
+pub(crate) use pairing_receipt_retention::{PairingReceiptPurgeOutcome, PairingReceiptPurgePlan};
+#[cfg(test)]
+mod pairing_receipt_retention_tests;
+pub(crate) use pairing_grant_allocation::GrantAllocationProjection;
+#[allow(
+    unused_imports,
+    reason = "C5 coordinator consumes the frozen G2 Store API"
+)]
+pub(crate) use pairing_grant_commit::{
+    AcknowledgeGrantCommitted, AcknowledgeGrantCommittedOutcome, GrantCommittedRecovery,
+};
+pub(crate) use pairing_grant_tx::{ConfirmPairingGrantOutcome, GrantPreparingRecovery};
+pub(crate) mod pairing_terminal;
+#[cfg(test)]
+mod pairing_terminal_tests;
+#[cfg(test)]
+mod pairing_tests;
+#[cfg(test)]
+pub(crate) use pairing_tests::{RELAY as PAIRING_TEST_RELAY, make_active as make_active_for_test};
 mod persisted_event;
 mod publication;
 pub mod queue;

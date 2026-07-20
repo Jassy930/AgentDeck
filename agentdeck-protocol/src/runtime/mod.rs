@@ -1,4 +1,4 @@
-//! RuntimeEnvelope v3 —— UDS 与解密后远程链路的共同**中立业务 wire**（design §8.2）。
+//! RuntimeEnvelope v4 —— UDS 与解密后远程链路的共同**中立业务 wire**（design §8.2）。
 //!
 //! 本模块与 local IPC（`PROTOCOL_VERSION = 2`，见 crate 根）及 Relay v2
 //! 彼此独立、版本轴不联动：`RUNTIME_PROTOCOL_VERSION` 与
@@ -28,15 +28,15 @@ pub mod upgrade;
 
 /// Runtime 契约产物版本；独立于 local IPC `PROTOCOL_VERSION` 与 Relay
 /// `RELAY_PROTOCOL_VERSION`。改动 Runtime wire 形态时手动 +1 并重生成快照。
-pub const RUNTIME_PROTOCOL_VERSION: u16 = 3;
+pub const RUNTIME_PROTOCOL_VERSION: u16 = 4;
 
 pub use crate::relay_v2::RelayAdminPurgeReceiptV1;
 pub use catalog::{CatalogChange, CatalogDelta, CatalogError, CatalogSnapshot, ConversationEntry};
 pub use command::{
-    ConversationStart, HelloParams, LocalOnlyAdministration, MAX_PROMPT_BYTES,
-    MachineEnrollRequest, PromptError, PromptPayload, QueryReceiptSelector, RuntimeRequest,
-    SendPromptRequest, TrustResetRequest, UNINSTALL_PURGE_PLAN_VERSION, UninstallPurgePlanError,
-    UninstallPurgePlanV1,
+    ConversationStart, CreatePairInviteRequest, HelloParams, LocalOnlyAdministration,
+    MAX_PROMPT_BYTES, MachineEnrollRequest, PAIR_INVITE_TTL_SECS, PromptError, PromptPayload,
+    QueryReceiptSelector, RuntimeRequest, SendPromptRequest, TrustResetRequest,
+    UNINSTALL_PURGE_PLAN_VERSION, UninstallPurgePlanError, UninstallPurgePlanV1,
 };
 pub use configuration::{
     AgentDescription, AgentDescriptions, ClaudeCodeConversationConfiguration,
@@ -59,7 +59,8 @@ pub use metadata::{
 };
 pub use receipt::{
     ApprovalDeliveryState, ApprovalReceipt, CancellationReceipt, CommandReceipt, CommandStatus,
-    CommandStatusReceipt, ConversationStartReceipt, RevocationReceipt,
+    CommandStatusReceipt, ConversationStartReceipt, PairingDecision, PairingReceipt, PairingState,
+    RevocationReceipt,
 };
 pub use schema::runtime_schema;
 pub use sync::{

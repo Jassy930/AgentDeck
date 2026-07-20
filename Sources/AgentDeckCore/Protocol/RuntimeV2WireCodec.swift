@@ -1,7 +1,7 @@
 import Foundation
 
-// Runtime v3 current outer 保留 V2 类型名以维持源码兼容；稳定 leaf DTO 继续复用
-// RuntimeWireTypes.swift，current facade 与 compact codec 只接受 v3。
+// Runtime v4 current outer 保留 V2 类型名以维持源码兼容；稳定 leaf DTO 继续复用
+// RuntimeWireTypes.swift，current facade 与 compact codec 只接受 v4。
 
 public enum RuntimeV2WireError: Error, Equatable, Sendable {
     case invalidIdentity
@@ -14,12 +14,17 @@ public enum RuntimeV2WireError: Error, Equatable, Sendable {
 
 public let runtimeProtocolVersionV2: UInt16 = 2
 public let runtimeProtocolVersionV3: UInt16 = 3
-public let runtimeProtocolVersionCurrent: UInt16 = runtimeProtocolVersionV3
+public let runtimeProtocolVersionV4: UInt16 = 4
+public let runtimeProtocolVersionCurrent: UInt16 = runtimeProtocolVersionV4
 public typealias RuntimeWireCodec = RuntimeV2WireCodec
 public typealias RuntimeRequestV3 = RuntimeRequestV2
 public typealias RuntimeReplyV3 = RuntimeReplyV2
 public typealias RuntimeEnvelopeV3 = RuntimeEnvelopeV2
 public typealias RuntimeV3WireCodec = RuntimeV2WireCodec
+public typealias RuntimeRequestV4 = RuntimeRequestV2
+public typealias RuntimeReplyV4 = RuntimeReplyV2
+public typealias RuntimeEnvelopeV4 = RuntimeEnvelopeV2
+public typealias RuntimeV4WireCodec = RuntimeV2WireCodec
 
 private func runtimeV2ValidateIdentity(_ value: String) throws {
     guard !value.isEmpty, value.utf8.count <= 1024 else {
@@ -35,7 +40,7 @@ private func runtimeV2InvalidTag(
     .dataCorruptedError(
         forKey: runtimeV2Key(field),
         in: container,
-        debugDescription: "unsupported Runtime v3 \(field) \(value)"
+        debugDescription: "unsupported Runtime v4 \(field) \(value)"
     )
 }
 
@@ -147,7 +152,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
             throw DecodingError.dataCorruptedError(
                 forKey: .transferID,
                 in: container,
-                debugDescription: "Runtime v3 transferId must contain 1...1024 UTF-8 bytes"
+                debugDescription: "Runtime v4 transferId must contain 1...1024 UTF-8 bytes"
             )
         }
         transferID = RuntimeTransferID(rawValue: rawTransferID)
@@ -162,7 +167,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
             throw DecodingError.dataCorrupted(
                 .init(
                     codingPath: decoder.codingPath,
-                    debugDescription: "invalid Runtime v3 transfer bounds",
+                    debugDescription: "invalid Runtime v4 transfer bounds",
                     underlyingError: error
                 )
             )
@@ -177,7 +182,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
                 self,
                 .init(
                     codingPath: encoder.codingPath,
-                    debugDescription: "invalid Runtime v3 transfer bounds",
+                    debugDescription: "invalid Runtime v4 transfer bounds",
                     underlyingError: error
                 )
             )
@@ -203,7 +208,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
                 self,
                 .init(
                     codingPath: container.codingPath,
-                    debugDescription: "invalid Runtime v3 transfer bounds",
+                    debugDescription: "invalid Runtime v4 transfer bounds",
                     underlyingError: error
                 )
             )
@@ -340,7 +345,7 @@ public enum RuntimeRequestV2: Codable, Sendable {
     case queryReceipt(RuntimeReceiptSelectorV1)
     case createPairInvite(
         displayName: String,
-        ttlSecs: UInt32,
+        idempotencyKey: RuntimeIdempotencyKey,
         scope: RuntimeLocalOnlyAdministrationV1
     )
     case listPendingPairings(scope: RuntimeLocalOnlyAdministrationV1)
@@ -516,17 +521,19 @@ public enum RuntimeRequestV2: Codable, Sendable {
         case "createPairInvite":
             try runtimeV2RejectUnknownKeys(
                 decoder,
-                allowed: ["request", "displayName", "ttlSecs", "scope"]
+                allowed: ["request", "displayName", "idempotencyKey", "scope"]
             )
-            let ttlSecs: UInt32
-            if container.contains(runtimeV2Key("ttlSecs")) {
-                ttlSecs = try container.decode(UInt32.self, forKey: runtimeV2Key("ttlSecs"))
-            } else {
-                ttlSecs = 300
-            }
+            let displayName = try container.decode(
+                String.self,
+                forKey: runtimeV2Key("displayName")
+            )
+            try runtimeV4ValidatePairingDisplayName(displayName)
             self = .createPairInvite(
-                displayName: try container.decode(String.self, forKey: runtimeV2Key("displayName")),
-                ttlSecs: ttlSecs,
+                displayName: displayName,
+                idempotencyKey: try container.decode(
+                    RuntimeIdempotencyKey.self,
+                    forKey: runtimeV2Key("idempotencyKey")
+                ),
                 scope: try container.decode(
                     RuntimeLocalOnlyAdministrationV1.self,
                     forKey: runtimeV2Key("scope")
@@ -694,10 +701,11 @@ public enum RuntimeRequestV2: Codable, Sendable {
                 try container.encode(conversationID, forKey: runtimeV2Key("conversationId"))
                 try container.encode(idempotencyKey, forKey: runtimeV2Key("idempotencyKey"))
             }
-        case .createPairInvite(let displayName, let ttlSecs, let scope):
+        case .createPairInvite(let displayName, let idempotencyKey, let scope):
+            try runtimeV4ValidatePairingDisplayName(displayName)
             try container.encode("createPairInvite", forKey: runtimeV2Key("request"))
             try container.encode(displayName, forKey: runtimeV2Key("displayName"))
-            try container.encode(ttlSecs, forKey: runtimeV2Key("ttlSecs"))
+            try container.encode(idempotencyKey, forKey: runtimeV2Key("idempotencyKey"))
             try container.encode(scope, forKey: runtimeV2Key("scope"))
         case .listPendingPairings(let scope):
             try container.encode("listPendingPairings", forKey: runtimeV2Key("request"))
@@ -766,8 +774,9 @@ public enum RuntimeReplyV2: Codable, Sendable {
     case backfill(RuntimeBackfillChunkV2)
     case syncComplete(RuntimeSyncCompleteV1)
     case transferPart(TransferEnvelopeV2)
-    case pairInvite(RuntimePairInviteV1)
-    case pendingPairings([RuntimePendingPairingV1])
+    case pairInvite(RuntimePairInviteV4)
+    case pendingPairings([RuntimePendingPairingV4])
+    case pairing(RuntimePairingReceiptV4)
   case machineRemoteStatus(RuntimeMachineRemoteStatusV3)
     case failure(RuntimeFailureV1)
 
@@ -827,15 +836,17 @@ public enum RuntimeReplyV2: Codable, Sendable {
                 )
             )
         case "pairInvite":
-            self = .pairInvite(try RuntimePairInviteV1(from: decoder))
+            self = .pairInvite(try RuntimePairInviteV4(flattenedFrom: decoder))
         case "pendingPairings":
             try runtimeV2RejectUnknownKeys(decoder, allowed: ["reply", "pairings"])
             self = .pendingPairings(
                 try container.decode(
-                    [RuntimePendingPairingV1].self,
+                    [RuntimePendingPairingV4].self,
                     forKey: runtimeV2Key("pairings")
                 )
             )
+        case "pairing":
+            self = .pairing(try RuntimePairingReceiptV4(flattenedFrom: decoder))
     case "machineRemoteStatus":
       self = .machineRemoteStatus(try RuntimeMachineRemoteStatusV3(flattenedFrom: decoder))
         case "failure":
@@ -949,12 +960,13 @@ public enum RuntimeReplyV2: Codable, Sendable {
             )
         case .pairInvite(let invite):
             try container.encode("pairInvite", forKey: runtimeV2Key("reply"))
-            try container.encode(invite.pairingID, forKey: runtimeV2Key("pairingId"))
-            try container.encode(invite.displayName, forKey: runtimeV2Key("displayName"))
-            try container.encode(invite.expiresAtMs, forKey: runtimeV2Key("expiresAtMs"))
+            try invite.encodeFields(into: &container)
         case .pendingPairings(let pairings):
             try container.encode("pendingPairings", forKey: runtimeV2Key("reply"))
             try container.encode(pairings, forKey: runtimeV2Key("pairings"))
+        case .pairing(let receipt):
+            try container.encode("pairing", forKey: runtimeV2Key("reply"))
+            try receipt.encodeFields(into: &container)
     case .machineRemoteStatus(let status):
       try status.encodeFlattenedFields(into: &container)
         case .failure(let failure):
@@ -1011,6 +1023,7 @@ public enum RuntimeStreamItemV2: Codable, Sendable {
     case event(RuntimeEventV2)
     case catalogDelta(RuntimeCatalogDeltaV2)
     case transferPart(TransferEnvelopeV2)
+    case pairingPending(RuntimePendingPairingV4)
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: RuntimeV2CodingKey.self)
@@ -1028,6 +1041,8 @@ public enum RuntimeStreamItemV2: Codable, Sendable {
                     expected: "transferPart"
                 )
             )
+        case "pairingPending":
+            self = .pairingPending(try RuntimePendingPairingV4(flattenedFrom: decoder))
         default:
             throw runtimeV2InvalidTag(stream, field: "stream", container: container)
         }
@@ -1046,6 +1061,9 @@ public enum RuntimeStreamItemV2: Codable, Sendable {
                 value: "transferPart",
                 into: &container
             )
+        case .pairingPending(let pending):
+            try container.encode("pairingPending", forKey: runtimeV2Key("stream"))
+            try pending.encodeFields(into: &container)
         }
     }
 }
@@ -1076,7 +1094,7 @@ public enum RuntimeMessageV2: Codable, Sendable {
             throw DecodingError.dataCorruptedError(
                 forKey: .message,
                 in: container,
-                debugDescription: "unsupported Runtime v3 message \(value)"
+                debugDescription: "unsupported Runtime v4 message \(value)"
             )
         }
     }
@@ -1135,7 +1153,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
             throw DecodingError.dataCorruptedError(
                 forKey: .messageID,
                 in: container,
-                debugDescription: "Runtime v3 messageId must contain 1...1024 UTF-8 bytes"
+                debugDescription: "Runtime v4 messageId must contain 1...1024 UTF-8 bytes"
             )
         }
         messageID = RuntimeMessageID(rawValue: rawMessageID)
@@ -1159,7 +1177,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
                 messageID.rawValue,
                 .init(
                     codingPath: encoder.codingPath + [CodingKeys.messageID],
-                    debugDescription: "Runtime v3 messageId must contain 1...1024 UTF-8 bytes"
+                    debugDescription: "Runtime v4 messageId must contain 1...1024 UTF-8 bytes"
                 )
             )
         }
@@ -1170,7 +1188,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
     }
 }
 
-// MARK: - Current Runtime v3 wire entry points
+// MARK: - Current Runtime v4 wire entry points
 
 public enum RuntimeV2WireCodec {
     public static let maxRequestBytes = 1024 * 1024

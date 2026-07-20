@@ -325,7 +325,7 @@ private enum RuntimeEnvelopeTransferProgress {
   case alreadyComplete
 }
 
-/// Runtime v3 JSON/UDS actor client。所有 pending、reply/stream queue、transfer reassembly
+/// Runtime v4 JSON/UDS actor client。所有 pending、reply/stream queue、transfer reassembly
 /// 与首故障都由单一 actor 拥有；transport callback 先进入有界 AsyncStream，保持 reader
 /// 交付顺序后再触碰 actor 状态。
 actor RuntimeEnvelopeClient {
@@ -485,7 +485,7 @@ actor RuntimeEnvelopeClient {
       default:
         let failure = failure(
           "daemon.client.hello_invalid",
-          "first correlated terminal is not Runtime v3 Hello"
+          "first correlated terminal is not Runtime v4 Hello"
         )
         failConnection(failure)
         throw failure
@@ -796,7 +796,7 @@ actor RuntimeEnvelopeClient {
         failConnection(
           failure(
             "daemon.client.frame_invalid",
-            "Runtime v3 envelope decode failed: \(error)"
+            "Runtime v4 envelope decode failed: \(error)"
           )
         )
       }

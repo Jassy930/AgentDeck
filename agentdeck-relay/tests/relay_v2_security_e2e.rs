@@ -551,6 +551,7 @@ async fn production_wss_keeps_endpoint_plaintext_out_of_relay_observable_surface
         device_route: None,
         stream_route: Some(route),
         request_route: None,
+        pair_route: None,
         stream_generation: Some(generation),
         stream_cursor: None,
         stream_seq: Some(0),

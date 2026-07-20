@@ -72,6 +72,7 @@ enum AppRuntimeReplyKind: String, Equatable, Sendable {
   case transferPart
   case pairInvite
   case pendingPairings
+  case pairing
   case machineRemoteStatus
   case failure
 }
@@ -930,6 +931,7 @@ actor AppRuntimeCoordinator {
     case .transferPart: .transferPart
     case .pairInvite: .pairInvite
     case .pendingPairings: .pendingPairings
+    case .pairing: .pairing
     case .machineRemoteStatus: .machineRemoteStatus
     case .failure: .failure
     }

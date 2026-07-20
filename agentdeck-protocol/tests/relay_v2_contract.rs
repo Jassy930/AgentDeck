@@ -7,8 +7,10 @@
 //! - 公开授权对象（RelayGrant / SignedCertificate / DeviceRevocation）与 enrollment DTO。
 
 use agentdeck_protocol::e2ee::{
-    DeviceAuthorizationV1, E2EE_FORMAT_VERSION, EpochBarrierV1, KeyDirectoryEntry, KeyDirectoryV1,
-    KeyId, KeyPurpose, KeyUpdateV1, PairInviteV1, PairRequestV1, PairResponseV1, SealedPayloadKind,
+    AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
+    E2EE_FORMAT_VERSION, EpochBarrierV1, KeyDirectoryEntry, KeyDirectoryV1, KeyId, KeyPurpose,
+    KeyUpdateV1, PairInviteV1, PairPendingV1, PairRequestV1, PairResponseInfoV1,
+    PairResponseReceivedV1, PairResponseV1, PairingControlEnvelopeV1, SealedPayloadKind,
     SealedPayloadV1, UnsignedSealedBlobV1,
 };
 use agentdeck_protocol::relay_v2::auth::{
@@ -150,10 +152,27 @@ fn key_directory() -> KeyDirectoryV1 {
                 epoch: 4,
             },
             device_route: dr(),
+            stream_route: Some(sr()),
             enc: vec![0xC1, 0xC2],
             wrapped_key: vec![0xD1, 0xD2, 0xD3],
         }],
         signature: sig(),
+    }
+}
+
+fn pair_response_info() -> PairResponseInfoV1 {
+    PairResponseInfoV1 {
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        relay_server_id: rs(),
+        pair_route: pr(),
+        invite_hash: [0x01; 32],
+        expiry_ms: 1_700_000_300_000,
+        request_hash: [0x31; 32],
+        machine_route: mr(),
+        device_route: dr(),
+        grant_serial: GrantSerial::new(9),
+        root_trust_epoch: TrustEpoch::new(3),
     }
 }
 
@@ -321,40 +340,59 @@ fn endpoint_wire_vectors() -> Vec<serde_json::Value> {
         pair_route: pr(),
         invite_secret: [0x01; 32],
         invite_hpke_pubkey: PublicKeyBytes([0x02; 32]),
-        wss_url: "wss://relay.example.test/v2".into(),
+        wss_url: "wss://relay.example.test/".into(),
         relay_server_id: rs(),
         current_spki_pin: [0x03; 32],
         next_spki_pin: [0x04; 32],
         expires_at_ms: 1_700_000_300_000,
         machine_root_pubkey: PublicKeyBytes([0x05; 32]),
-        machine_root_fingerprint: [0x06; 32],
+        machine_root_fingerprint: Sha256::digest([0x05; 32]).into(),
         data_sign_cert: data_cert(),
         machine_display_name: "Fixture Machine".into(),
     };
     let pair_request = PairRequestV1 {
         format_version: E2EE_FORMAT_VERSION,
-        invite_secret: [0x01; 32],
-        device_sign_pubkey: PublicKeyBytes([0x07; 32]),
-        device_hpke_pubkey: PublicKeyBytes([0x08; 32]),
-        sealed_authorization_request: vec![0x09, 0x0A, 0x0B],
-        proof_signature: sig(),
+        enc: vec![0x07; 32],
+        ciphertext: vec![0x09, 0x0A, 0x0B],
+        device_proof_signature: sig(),
     };
+    let relay_grant = grant();
     let authorization = DeviceAuthorizationV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        grant_hash: relay_grant.canonical_sha256(),
+        machine_route: relay_grant.machine_route,
+        device_route: relay_grant.device_route,
+        device_sign_fingerprint: Sha256::digest(relay_grant.device_sign_pubkey.0).into(),
         grant_serial: GrantSerial::new(9),
         device_hpke_pubkey: PublicKeyBytes([0x08; 32]),
-        capabilities: vec!["view".into(), "respond".into()],
-        permissions: vec!["approval.resolve".into()],
+        capabilities: vec![AuthorizationCapabilityV1::Approval],
+        permissions: vec![AuthorizationPermissionV1::ApprovalResolve],
         root_key_id: rk(),
         trust_epoch: TrustEpoch::new(3),
         signature: sig(),
     };
     let directory = key_directory();
     let pair_response = PairResponseV1 {
-        request_hash: [0x0C; 32],
-        relay_grant: grant(),
-        sealed_device_authorization: vec![0x0D, 0x0E],
-        key_directory: directory.clone(),
+        format_version: E2EE_FORMAT_VERSION,
+        info: pair_response_info(),
+        enc: vec![0x0C; 32],
+        ciphertext: vec![0x0D, 0x0E],
+        machine_data_signature: sig(),
+    };
+    let pair_pending = PairPendingV1 {
+        request_hash: [0x31; 32],
         signature: sig(),
+    };
+    let pair_response_received = PairResponseReceivedV1 {
+        request_hash: [0x31; 32],
+        grant_hash: [0x32; 32],
+        response_hash: [0x33; 32],
+        signature: sig(),
+    };
+    let pairing_control_envelope = PairingControlEnvelopeV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        enc: vec![0x34; 32],
+        ciphertext: vec![0x35; 80],
     };
     let key_update = KeyUpdateV1 {
         key_directory_revision: KeyDirectoryRevision::new(3),
@@ -363,6 +401,7 @@ fn endpoint_wire_vectors() -> Vec<serde_json::Value> {
             epoch: 5,
         },
         device_route: dr(),
+        stream_route: None,
         enc: vec![0x0F, 0x10],
         wrapped_key: vec![0x11, 0x12, 0x13],
         signature: sig(),
@@ -399,6 +438,21 @@ fn endpoint_wire_vectors() -> Vec<serde_json::Value> {
             "case": "pairResponse",
             "wireType": "PairResponseV1",
             "value": serde_json::to_value(pair_response).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "pairPending",
+            "wireType": "PairPendingV1",
+            "value": serde_json::to_value(pair_pending).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "pairingControlEnvelope",
+            "wireType": "PairingControlEnvelopeV1",
+            "value": serde_json::to_value(pairing_control_envelope).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "pairResponseReceived",
+            "wireType": "PairResponseReceivedV1",
+            "value": serde_json::to_value(pair_response_received).unwrap(),
         }),
         serde_json::json!({
             "case": "deviceAuthorization",
@@ -497,9 +551,9 @@ fn relay_v2_wire_fixture_is_rust_produced_and_in_sync() {
 fn relay_protocol_version_is_two_and_independent() {
     assert_eq!(RELAY_PROTOCOL_VERSION, 2);
     assert_eq!(E2EE_FORMAT_VERSION, 1);
-    // 版本轴彼此独立：local IPC=2、Relay=2、Runtime=2、E2EE=1。
+    // 版本轴彼此独立：local IPC=2、Relay=2、Runtime=4、E2EE=1。
     assert_eq!(agentdeck_protocol::PROTOCOL_VERSION, 2);
-    assert_eq!(RUNTIME_PROTOCOL_VERSION, 3);
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 4);
 }
 
 #[test]

@@ -10,7 +10,8 @@ pub const RUNTIME_SCHEMA_VERSION_V6: u32 = 6;
 pub const RUNTIME_SCHEMA_VERSION_V7: u32 = 7;
 pub const RUNTIME_SCHEMA_VERSION_V8: u32 = 8;
 pub const RUNTIME_SCHEMA_VERSION_V9: u32 = 9;
-pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V9;
+pub const RUNTIME_SCHEMA_VERSION_V10: u32 = 10;
+pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V10;
 /// 行密文与 wrapped key bundle 的 AAD context 版本。
 ///
 /// physical schema migration 只增表/增认证计数，不得让既有行重新加密或重新包装。
@@ -58,6 +59,8 @@ pub const RUNTIME_LEDGER_DOMAIN_V7: &[u8] = b"runtime.meta.ledger.v7";
 pub const RUNTIME_LEDGER_DOMAIN_V8: &[u8] = b"runtime.meta.ledger.v8";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const RUNTIME_LEDGER_DOMAIN_V9: &[u8] = b"runtime.meta.ledger.v9";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V10: &[u8] = b"runtime.meta.ledger.v10";
 pub const EXPECTED_TABLES_V1: [&str; 7] = [
     "commands",
     "conversations",
@@ -232,10 +235,60 @@ pub const EXPECTED_TABLES_V9: [&str; 25] = [
     "runtime_meta",
     "snapshots",
 ];
-pub const EXPECTED_TABLES: [&str; 25] = EXPECTED_TABLES_V9;
+pub const EXPECTED_TABLES_V10: [&str; 30] = [
+    "admin_commands",
+    "approval_ledger",
+    "catalog_journal",
+    "claude_code_adapter_state",
+    "codex_adapter_state",
+    "command_configuration_pins",
+    "commands",
+    "configuration_journal",
+    "conversation_state",
+    "conversations",
+    "event_journal",
+    "event_retention",
+    "event_stream_index",
+    "execution_fences",
+    "execution_intents",
+    "machine_enrollment_receipts",
+    "machine_identity_state",
+    "machine_remote_state",
+    "metadata_mutation_ledger",
+    "native_metadata_effect_fences",
+    "native_projection_state",
+    "publication_outbox",
+    "publication_streams",
+    "remote_authorization_ledger",
+    "remote_control_outbox",
+    "remote_key_directory",
+    "remote_pairing_receipts",
+    "remote_pairings",
+    "runtime_meta",
+    "snapshots",
+];
+pub const EXPECTED_TABLES: [&str; 30] = EXPECTED_TABLES_V10;
 
 pub fn schema_signature() -> [u8; 32] {
-    schema_signature_v9()
+    schema_signature_v10()
+}
+
+pub fn schema_signature_v10() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V4.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V5.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V6.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V7.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V8.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V9.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V10.as_bytes());
+        digest.finalize().into()
+    })
 }
 
 pub fn schema_signature_v9() -> [u8; 32] {
@@ -1623,6 +1676,337 @@ CREATE TABLE machine_remote_state (
 );
 "#;
 
+/// P4.3-A additive v10 physical shape。
+///
+/// 只追加 authenticated pairing/auth/key-directory/control-outbox 表及对应 ledger totals；
+/// 既有 row、ciphertext、metadata token、wrapped key bundle 与 crypto context 均不改写。
+pub const RUNTIME_MIGRATION_V10: &str = r#"
+ALTER TABLE runtime_meta ADD COLUMN remote_pairing_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_pairing_count BETWEEN 0 AND 8);
+ALTER TABLE runtime_meta ADD COLUMN remote_pairing_sealed_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_pairing_sealed_bytes BETWEEN 0 AND 67108864);
+ALTER TABLE runtime_meta ADD COLUMN remote_pairing_receipt_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_pairing_receipt_count BETWEEN 0 AND 65536);
+ALTER TABLE runtime_meta ADD COLUMN remote_pairing_receipt_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_pairing_receipt_bytes BETWEEN 0 AND 67108864);
+
+ALTER TABLE runtime_meta ADD COLUMN remote_authorization_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_authorization_count BETWEEN 0 AND 256);
+ALTER TABLE runtime_meta ADD COLUMN remote_authorization_preparing_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_authorization_preparing_count BETWEEN 0 AND 256);
+ALTER TABLE runtime_meta ADD COLUMN remote_authorization_active_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_authorization_active_count BETWEEN 0 AND 256);
+ALTER TABLE runtime_meta ADD COLUMN remote_authorization_revoking_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_authorization_revoking_count BETWEEN 0 AND 256);
+ALTER TABLE runtime_meta ADD COLUMN remote_authorization_revoked_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_authorization_revoked_count BETWEEN 0 AND 256);
+ALTER TABLE runtime_meta ADD COLUMN remote_authorization_sealed_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_authorization_sealed_bytes BETWEEN 0 AND 67108864);
+
+ALTER TABLE runtime_meta ADD COLUMN remote_key_directory_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_key_directory_count BETWEEN 0 AND 1);
+ALTER TABLE runtime_meta ADD COLUMN remote_key_directory_sealed_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_key_directory_sealed_bytes BETWEEN 0 AND 67108864);
+
+ALTER TABLE runtime_meta ADD COLUMN remote_control_outbox_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_control_outbox_count BETWEEN 0 AND 1024);
+ALTER TABLE runtime_meta ADD COLUMN remote_control_outbox_pending_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_control_outbox_pending_count BETWEEN 0 AND 1024);
+ALTER TABLE runtime_meta ADD COLUMN remote_control_outbox_acknowledged_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_control_outbox_acknowledged_count BETWEEN 0 AND 1024);
+ALTER TABLE runtime_meta ADD COLUMN remote_control_outbox_sealed_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_control_outbox_sealed_bytes BETWEEN 0 AND 67108864);
+
+CREATE TABLE remote_pairings (
+    pairing_id BLOB PRIMARY KEY NOT NULL CHECK(
+        typeof(pairing_id) = 'blob' AND length(pairing_id) = 16
+        AND pairing_id <> X'00000000000000000000000000000000'
+    ),
+    machine_remote_singleton INTEGER NOT NULL DEFAULT 1
+        CHECK(machine_remote_singleton = 1),
+    lifecycle TEXT NOT NULL CHECK(lifecycle IN (
+        'routeOpening', 'unused', 'preparing', 'awaitingLocalConfirmation',
+        'grantPreparing', 'grantCommitted', 'orphanRevoking',
+        'delivered', 'expired', 'canceled'
+    )),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    relay_server_id BLOB NOT NULL CHECK(
+        typeof(relay_server_id) = 'blob' AND length(relay_server_id) = 16
+        AND relay_server_id <> X'00000000000000000000000000000000'
+    ),
+    machine_route BLOB NOT NULL CHECK(
+        typeof(machine_route) = 'blob' AND length(machine_route) = 16
+        AND machine_route <> X'00000000000000000000000000000000'
+    ),
+    pair_route BLOB NOT NULL UNIQUE CHECK(
+        typeof(pair_route) = 'blob' AND length(pair_route) = 16
+        AND pair_route <> X'00000000000000000000000000000000'
+    ),
+    expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms > 0),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0 AND created_at_ms < expires_at_ms),
+    state_changed_at_ms INTEGER NOT NULL CHECK(state_changed_at_ms >= created_at_ms),
+    request_hash BLOB CHECK(
+        request_hash IS NULL OR (typeof(request_hash) = 'blob' AND length(request_hash) = 32
+            AND request_hash <> X'0000000000000000000000000000000000000000000000000000000000000000')
+    ),
+    device_sign_fingerprint BLOB CHECK(
+        device_sign_fingerprint IS NULL OR (
+            typeof(device_sign_fingerprint) = 'blob' AND length(device_sign_fingerprint) = 32
+            AND device_sign_fingerprint <> X'0000000000000000000000000000000000000000000000000000000000000000'
+        )
+    ),
+    grant_hash BLOB CHECK(
+        grant_hash IS NULL OR (typeof(grant_hash) = 'blob' AND length(grant_hash) = 32
+            AND grant_hash <> X'0000000000000000000000000000000000000000000000000000000000000000')
+    ),
+    response_hash BLOB CHECK(
+        response_hash IS NULL OR (typeof(response_hash) = 'blob' AND length(response_hash) = 32
+            AND response_hash <> X'0000000000000000000000000000000000000000000000000000000000000000')
+    ),
+    sealed_state BLOB NOT NULL CHECK(
+        typeof(sealed_state) = 'blob' AND length(sealed_state) BETWEEN 40 AND 8388648
+    ),
+    sealed_state_bytes INTEGER NOT NULL CHECK(
+        typeof(sealed_state_bytes) = 'integer' AND sealed_state_bytes = length(sealed_state)
+    ),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    FOREIGN KEY(machine_remote_singleton) REFERENCES machine_remote_state(singleton)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CHECK((request_hash IS NULL AND device_sign_fingerprint IS NULL)
+          OR (request_hash IS NOT NULL AND device_sign_fingerprint IS NOT NULL)),
+    CHECK(grant_hash IS NULL OR request_hash IS NOT NULL),
+    CHECK(response_hash IS NULL OR grant_hash IS NOT NULL),
+    CHECK((lifecycle IN ('routeOpening', 'unused')
+            AND request_hash IS NULL AND grant_hash IS NULL AND response_hash IS NULL)
+          OR (lifecycle IN ('preparing', 'awaitingLocalConfirmation')
+            AND request_hash IS NOT NULL AND grant_hash IS NULL AND response_hash IS NULL)
+          OR (lifecycle IN ('grantPreparing', 'grantCommitted', 'orphanRevoking', 'delivered')
+            AND request_hash IS NOT NULL AND grant_hash IS NOT NULL AND response_hash IS NOT NULL)
+          OR lifecycle IN ('expired', 'canceled'))
+);
+CREATE INDEX idx_remote_pairings_recovery
+    ON remote_pairings(lifecycle, expires_at_ms, pairing_id);
+
+CREATE TABLE remote_pairing_receipts (
+    pairing_id BLOB PRIMARY KEY NOT NULL CHECK(
+        typeof(pairing_id) = 'blob' AND length(pairing_id) = 16
+        AND pairing_id <> X'00000000000000000000000000000000'
+    ),
+    machine_remote_singleton INTEGER NOT NULL DEFAULT 1 CHECK(machine_remote_singleton = 1),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    relay_server_id BLOB NOT NULL CHECK(
+        typeof(relay_server_id) = 'blob' AND length(relay_server_id) = 16
+        AND relay_server_id <> X'00000000000000000000000000000000'
+    ),
+    machine_route BLOB NOT NULL CHECK(
+        typeof(machine_route) = 'blob' AND length(machine_route) = 16
+        AND machine_route <> X'00000000000000000000000000000000'
+    ),
+    pair_route BLOB NOT NULL UNIQUE CHECK(
+        typeof(pair_route) = 'blob' AND length(pair_route) = 16
+        AND pair_route <> X'00000000000000000000000000000000'
+    ),
+    idempotency_token BLOB NOT NULL CHECK(
+        typeof(idempotency_token) = 'blob' AND length(idempotency_token) = 32
+        AND idempotency_token <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    input_hash BLOB NOT NULL CHECK(
+        typeof(input_hash) = 'blob' AND length(input_hash) = 32
+        AND input_hash <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    action TEXT NOT NULL CHECK(action IN ('confirmed', 'canceled', 'expired')),
+    request_hash BLOB CHECK(
+        request_hash IS NULL OR (typeof(request_hash) = 'blob' AND length(request_hash) = 32
+            AND request_hash <> X'0000000000000000000000000000000000000000000000000000000000000000')
+    ),
+    receipt_hash BLOB NOT NULL CHECK(
+        typeof(receipt_hash) = 'blob' AND length(receipt_hash) = 32
+        AND receipt_hash <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    canonical_receipt BLOB NOT NULL CHECK(
+        typeof(canonical_receipt) = 'blob' AND length(canonical_receipt) BETWEEN 1 AND 65536
+    ),
+    receipt_bytes INTEGER NOT NULL CHECK(
+        typeof(receipt_bytes) = 'integer' AND receipt_bytes = length(canonical_receipt)
+    ),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+    retain_until_ms INTEGER NOT NULL CHECK(
+        retain_until_ms >= created_at_ms + 2592000000
+        AND created_at_ms <= 9223372034262775807
+    ),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    FOREIGN KEY(machine_remote_singleton) REFERENCES machine_remote_state(singleton)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CHECK(action <> 'confirmed' OR request_hash IS NOT NULL)
+);
+CREATE UNIQUE INDEX idx_remote_pairing_receipts_idempotency
+    ON remote_pairing_receipts(idempotency_token);
+CREATE INDEX idx_remote_pairing_receipts_retention
+    ON remote_pairing_receipts(retain_until_ms, pairing_id);
+
+CREATE TABLE remote_authorization_ledger (
+    device_route BLOB NOT NULL CHECK(
+        typeof(device_route) = 'blob' AND length(device_route) = 16
+        AND device_route <> X'00000000000000000000000000000000'
+    ),
+    grant_serial TEXT NOT NULL CHECK(
+        typeof(grant_serial) = 'text' AND length(grant_serial) = 20
+        AND grant_serial NOT GLOB '*[^0-9]*'
+        AND grant_serial > '00000000000000000000'
+        AND grant_serial <= '18446744073709551615'
+    ),
+    machine_remote_singleton INTEGER NOT NULL DEFAULT 1 CHECK(machine_remote_singleton = 1),
+    lifecycle TEXT NOT NULL CHECK(
+        lifecycle IN ('grantPreparing', 'active', 'superseded', 'revoking', 'revoked')
+    ),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    device_sign_fingerprint BLOB NOT NULL CHECK(
+        typeof(device_sign_fingerprint) = 'blob' AND length(device_sign_fingerprint) = 32
+        AND device_sign_fingerprint <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    grant_hash BLOB NOT NULL CHECK(
+        typeof(grant_hash) = 'blob' AND length(grant_hash) = 32
+        AND grant_hash <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    authorization_hash BLOB NOT NULL CHECK(
+        typeof(authorization_hash) = 'blob' AND length(authorization_hash) = 32
+        AND authorization_hash <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    key_directory_revision TEXT NOT NULL CHECK(
+        typeof(key_directory_revision) = 'text' AND length(key_directory_revision) = 20
+        AND key_directory_revision NOT GLOB '*[^0-9]*'
+        AND key_directory_revision > '00000000000000000000'
+        AND key_directory_revision <= '18446744073709551615'
+    ),
+    sealed_authorization BLOB NOT NULL CHECK(
+        typeof(sealed_authorization) = 'blob' AND length(sealed_authorization) BETWEEN 40 AND 262184
+    ),
+    sealed_authorization_bytes INTEGER NOT NULL CHECK(
+        typeof(sealed_authorization_bytes) = 'integer'
+        AND sealed_authorization_bytes = length(sealed_authorization)
+    ),
+    revocation_hash BLOB CHECK(
+        revocation_hash IS NULL OR (typeof(revocation_hash) = 'blob' AND length(revocation_hash) = 32
+            AND revocation_hash <> X'0000000000000000000000000000000000000000000000000000000000000000')
+    ),
+    sealed_revocation BLOB CHECK(
+        sealed_revocation IS NULL OR (typeof(sealed_revocation) = 'blob' AND length(sealed_revocation) BETWEEN 40 AND 65576)
+    ),
+    sealed_revocation_bytes INTEGER CHECK(
+        (sealed_revocation IS NULL AND sealed_revocation_bytes IS NULL)
+        OR (sealed_revocation IS NOT NULL AND typeof(sealed_revocation_bytes) = 'integer'
+            AND sealed_revocation_bytes = length(sealed_revocation))
+    ),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+    state_changed_at_ms INTEGER NOT NULL CHECK(state_changed_at_ms >= created_at_ms),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    PRIMARY KEY(device_route, grant_serial),
+    FOREIGN KEY(machine_remote_singleton) REFERENCES machine_remote_state(singleton)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CHECK((lifecycle IN ('grantPreparing', 'active', 'superseded')
+            AND revocation_hash IS NULL AND sealed_revocation IS NULL)
+          OR (lifecycle IN ('revoking', 'revoked')
+            AND revocation_hash IS NOT NULL AND sealed_revocation IS NOT NULL))
+);
+CREATE UNIQUE INDEX idx_remote_authorization_current
+    ON remote_authorization_ledger(device_route)
+    WHERE lifecycle IN ('grantPreparing', 'active', 'revoking');
+CREATE INDEX idx_remote_authorization_recovery
+    ON remote_authorization_ledger(lifecycle, state_changed_at_ms, device_route, grant_serial);
+
+CREATE TABLE remote_key_directory (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    machine_identity_singleton INTEGER NOT NULL DEFAULT 1 CHECK(machine_identity_singleton = 1),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    revision TEXT NOT NULL CHECK(
+        typeof(revision) = 'text' AND length(revision) = 20
+        AND revision NOT GLOB '*[^0-9]*'
+        AND revision > '00000000000000000000'
+        AND revision <= '18446744073709551615'
+    ),
+    directory_hash BLOB NOT NULL CHECK(
+        typeof(directory_hash) = 'blob' AND length(directory_hash) = 32
+        AND directory_hash <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    sealed_directory BLOB NOT NULL CHECK(
+        typeof(sealed_directory) = 'blob' AND length(sealed_directory) BETWEEN 40 AND 67108864
+    ),
+    sealed_directory_bytes INTEGER NOT NULL CHECK(
+        typeof(sealed_directory_bytes) = 'integer'
+        AND sealed_directory_bytes = length(sealed_directory)
+    ),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    FOREIGN KEY(machine_identity_singleton) REFERENCES machine_identity_state(singleton)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+CREATE TABLE remote_control_outbox (
+    outbox_id BLOB PRIMARY KEY NOT NULL CHECK(
+        typeof(outbox_id) = 'blob' AND length(outbox_id) = 16
+        AND outbox_id <> X'00000000000000000000000000000000'
+    ),
+    operation_kind TEXT NOT NULL CHECK(operation_kind IN (
+        'openPairRoute', 'closePairRoute', 'installGrant', 'revokeDevice'
+    )),
+    operation_key BLOB NOT NULL CHECK(
+        typeof(operation_key) = 'blob' AND length(operation_key) = 32
+        AND operation_key <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    lifecycle TEXT NOT NULL CHECK(lifecycle IN ('prepared', 'acknowledged')),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    pairing_id BLOB,
+    device_route BLOB,
+    grant_serial TEXT,
+    frame_hash BLOB NOT NULL CHECK(
+        typeof(frame_hash) = 'blob' AND length(frame_hash) = 32
+        AND frame_hash <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    sealed_frame BLOB NOT NULL CHECK(
+        typeof(sealed_frame) = 'blob' AND length(sealed_frame) BETWEEN 40 AND 4194344
+    ),
+    sealed_frame_bytes INTEGER NOT NULL CHECK(
+        typeof(sealed_frame_bytes) = 'integer' AND sealed_frame_bytes = length(sealed_frame)
+    ),
+    terminal_hash BLOB CHECK(
+        terminal_hash IS NULL OR (typeof(terminal_hash) = 'blob' AND length(terminal_hash) = 32
+            AND terminal_hash <> X'0000000000000000000000000000000000000000000000000000000000000000')
+    ),
+    sealed_terminal BLOB CHECK(
+        sealed_terminal IS NULL OR (typeof(sealed_terminal) = 'blob' AND length(sealed_terminal) BETWEEN 40 AND 4194344)
+    ),
+    sealed_terminal_bytes INTEGER CHECK(
+        (sealed_terminal IS NULL AND sealed_terminal_bytes IS NULL)
+        OR (sealed_terminal IS NOT NULL AND typeof(sealed_terminal_bytes) = 'integer'
+            AND sealed_terminal_bytes = length(sealed_terminal))
+    ),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+    state_changed_at_ms INTEGER NOT NULL CHECK(state_changed_at_ms >= created_at_ms),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    UNIQUE(operation_kind, operation_key),
+    FOREIGN KEY(pairing_id) REFERENCES remote_pairings(pairing_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY(device_route, grant_serial)
+        REFERENCES remote_authorization_ledger(device_route, grant_serial)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CHECK(pairing_id IS NULL OR (typeof(pairing_id) = 'blob' AND length(pairing_id) = 16)),
+    CHECK(device_route IS NULL OR (typeof(device_route) = 'blob' AND length(device_route) = 16)),
+    CHECK(grant_serial IS NULL OR (
+        typeof(grant_serial) = 'text' AND length(grant_serial) = 20
+        AND grant_serial NOT GLOB '*[^0-9]*'
+        AND grant_serial > '00000000000000000000'
+        AND grant_serial <= '18446744073709551615'
+    )),
+    CHECK((operation_kind IN ('openPairRoute', 'closePairRoute')
+            AND pairing_id IS NOT NULL AND device_route IS NULL AND grant_serial IS NULL)
+          OR (operation_kind IN ('installGrant', 'revokeDevice')
+            AND device_route IS NOT NULL AND grant_serial IS NOT NULL)),
+    CHECK((lifecycle = 'prepared' AND terminal_hash IS NULL AND sealed_terminal IS NULL)
+          OR (lifecycle = 'acknowledged' AND terminal_hash IS NOT NULL AND sealed_terminal IS NOT NULL))
+);
+CREATE INDEX idx_remote_control_outbox_recovery
+    ON remote_control_outbox(lifecycle, operation_kind, created_at_ms, outbox_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1810,7 +2194,7 @@ mod tests {
 
     #[test]
     fn stream_schema_advances_to_v4_with_six_bounded_store_tables() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V9);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V10);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         for table in [
             "event_stream_index",
@@ -1826,7 +2210,7 @@ mod tests {
 
     #[test]
     fn approval_physical_schema_remains_v3_compatible_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V9);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V10);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V3.len(), 10);
         assert!(EXPECTED_TABLES_V3.contains(&"approval_ledger"));
@@ -1894,9 +2278,17 @@ mod tests {
         connection
     }
 
+    fn v10_structural_connection() -> Connection {
+        let connection = v9_structural_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V10)
+            .expect("apply v10 structural migration");
+        connection
+    }
+
     #[test]
     fn v6_adds_projection_and_effect_fence_sidecars_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V9);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V10);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V6, 6);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V5.len(), 20);
@@ -1927,7 +2319,7 @@ mod tests {
 
     #[test]
     fn v7_adds_machine_wide_admin_command_ledger_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V9);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V10);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V7, 7);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V7.len(), 23);
@@ -2056,13 +2448,12 @@ mod tests {
 
     #[test]
     fn v9_adds_bounded_authenticated_machine_remote_singleton_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V9);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V9, 9);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V8.len(), 24);
         assert_eq!(EXPECTED_TABLES_V9.len(), 25);
-        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V9);
-        assert_eq!(schema_signature(), schema_signature_v9());
+        assert_ne!(EXPECTED_TABLES.as_slice(), EXPECTED_TABLES_V9.as_slice());
+        assert_ne!(schema_signature(), schema_signature_v9());
         assert_ne!(schema_signature_v8(), schema_signature_v9());
         assert_eq!(RUNTIME_LEDGER_DOMAIN_V9, b"runtime.meta.ledger.v9");
 
@@ -2114,6 +2505,262 @@ mod tests {
                 "v9 remote row must not persist plaintext {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn v10_adds_five_bounded_remote_security_tables_without_rotating_crypto_context() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V10);
+        assert_eq!(RUNTIME_SCHEMA_VERSION_V10, 10);
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        assert_eq!(EXPECTED_TABLES_V9.len(), 25);
+        assert_eq!(EXPECTED_TABLES_V10.len(), 30);
+        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V10);
+        assert_eq!(schema_signature(), schema_signature_v10());
+        assert_ne!(schema_signature_v9(), schema_signature_v10());
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V10, b"runtime.meta.ledger.v10");
+
+        let connection = v10_structural_connection();
+        assert_eq!(table_names(&connection), EXPECTED_TABLES_V10);
+        assert_eq!(
+            &table_columns(&connection, "runtime_meta")
+                [table_columns(&connection, "runtime_meta").len() - 16..],
+            [
+                "remote_pairing_count",
+                "remote_pairing_sealed_bytes",
+                "remote_pairing_receipt_count",
+                "remote_pairing_receipt_bytes",
+                "remote_authorization_count",
+                "remote_authorization_preparing_count",
+                "remote_authorization_active_count",
+                "remote_authorization_revoking_count",
+                "remote_authorization_revoked_count",
+                "remote_authorization_sealed_bytes",
+                "remote_key_directory_count",
+                "remote_key_directory_sealed_bytes",
+                "remote_control_outbox_count",
+                "remote_control_outbox_pending_count",
+                "remote_control_outbox_acknowledged_count",
+                "remote_control_outbox_sealed_bytes",
+            ]
+        );
+        for table in [
+            "remote_pairings",
+            "remote_pairing_receipts",
+            "remote_authorization_ledger",
+            "remote_key_directory",
+            "remote_control_outbox",
+        ] {
+            let sql = table_sql(&connection, table).to_ascii_lowercase();
+            assert!(
+                sql.contains("metadata_token"),
+                "{table} must be row-authenticated"
+            );
+            assert!(
+                sql.contains("database_id"),
+                "{table} must bind the runtime database"
+            );
+        }
+        assert!(!table_sql(&connection, "remote_pairings").contains("receiptTombstone"));
+        assert!(!table_sql(&connection, "remote_pairings").contains("sealed_receipt"));
+        assert!(table_sql(&connection, "remote_pairings").contains("orphanRevoking"));
+        assert!(table_sql(&connection, "remote_pairing_receipts").contains("2592000000"));
+        let receipt_columns = table_columns(&connection, "remote_pairing_receipts");
+        assert!(receipt_columns.contains(&"idempotency_token".to_owned()));
+        assert!(receipt_columns.contains(&"input_hash".to_owned()));
+        assert!(!receipt_columns.contains(&"owner".to_owned()));
+        assert!(!receipt_columns.contains(&"idempotency_key".to_owned()));
+        let authorization_sql = table_sql(&connection, "remote_authorization_ledger");
+        assert!(authorization_sql.contains("'superseded'"));
+        assert!(
+            authorization_sql.contains("lifecycle IN ('grantPreparing', 'active', 'superseded')")
+        );
+        let authorization_columns = table_columns(&connection, "remote_authorization_ledger");
+        assert!(authorization_columns.contains(&"sealed_authorization".to_owned()));
+        assert!(!authorization_columns.contains(&"device_sign_public_key".to_owned()));
+        assert!(!authorization_columns.contains(&"device_hpke_public_key".to_owned()));
+        assert_eq!(
+            explicit_indexes(&connection, "remote_pairings"),
+            ["idx_remote_pairings_recovery"]
+        );
+        assert_eq!(
+            explicit_indexes(&connection, "remote_pairing_receipts"),
+            [
+                "idx_remote_pairing_receipts_idempotency",
+                "idx_remote_pairing_receipts_retention",
+            ]
+        );
+        assert_eq!(
+            explicit_indexes(&connection, "remote_authorization_ledger"),
+            [
+                "idx_remote_authorization_current",
+                "idx_remote_authorization_recovery",
+            ]
+        );
+        let current_authorization = index_shape(
+            &connection,
+            "remote_authorization_ledger",
+            "idx_remote_authorization_current",
+        );
+        assert!(current_authorization.unique);
+        assert!(current_authorization.partial);
+        assert_eq!(current_authorization.columns, ["device_route"]);
+        assert!(
+            current_authorization
+                .sql
+                .contains("WHERE lifecycle IN ('grantPreparing', 'active', 'revoking')")
+        );
+        assert!(!current_authorization.sql.contains("superseded"));
+        assert!(!current_authorization.sql.contains("revoked"));
+        let outbox_fks = foreign_key_columns(&connection, "remote_control_outbox");
+        assert_eq!(outbox_fks.len(), 3);
+        assert!(
+            outbox_fks.iter().all(|foreign| {
+                foreign.on_update == "RESTRICT" && foreign.on_delete == "RESTRICT"
+            })
+        );
+        assert!(outbox_fks.iter().any(|foreign| {
+            foreign.target_table == "remote_pairings" && foreign.source_column == "pairing_id"
+        }));
+        assert_eq!(
+            outbox_fks
+                .iter()
+                .filter(|foreign| foreign.target_table == "remote_authorization_ledger")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn v10_close_ack_must_remove_outbox_before_secret_row_and_keeps_receipt_tombstone() {
+        let mut connection = v10_structural_connection();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("enable foreign keys");
+        let transaction = connection
+            .transaction()
+            .expect("begin close ACK transaction");
+        transaction
+            .execute(
+                "INSERT INTO machine_remote_state (
+                     singleton, lifecycle, reset_kind, database_id, relay_server_id, machine_route,
+                     root_key_id, root_fingerprint, trust_epoch, request_hash, response_hash,
+                     enrollment_receipt_hash, receipt_verify_key_hash, sealed_state,
+                     sealed_state_bytes, metadata_token
+                 ) VALUES (1, 'enrollmentPrepared', NULL, ?1, ?2, ?3, ?4, ?5,
+                           '00000000000000000001', ?6, NULL, NULL, ?7, ?8, 40, ?9)",
+                params![
+                    &[1_u8; 16],
+                    &[2_u8; 16],
+                    &[3_u8; 16],
+                    &[4_u8; 16],
+                    &[5_u8; 32],
+                    &[6_u8; 32],
+                    &[7_u8; 32],
+                    &[8_u8; 40],
+                    &[9_u8; 32],
+                ],
+            )
+            .expect("insert machine parent");
+        transaction
+            .execute(
+                "INSERT INTO remote_pairings (
+                     pairing_id, lifecycle, database_id, relay_server_id, machine_route,
+                     pair_route, expires_at_ms, created_at_ms, state_changed_at_ms,
+                     request_hash, device_sign_fingerprint, grant_hash, response_hash,
+                     sealed_state, sealed_state_bytes, metadata_token
+                 ) VALUES (?1, 'canceled', ?2, ?3, ?4, ?5, 301000, 1000, 1000,
+                           NULL, NULL, NULL, NULL, ?6, 40, ?7)",
+                params![
+                    &[10_u8; 16],
+                    &[1_u8; 16],
+                    &[2_u8; 16],
+                    &[3_u8; 16],
+                    &[11_u8; 16],
+                    &[12_u8; 40],
+                    &[13_u8; 32],
+                ],
+            )
+            .expect("insert terminal pairing secret row");
+        transaction
+            .execute(
+                "INSERT INTO remote_control_outbox (
+                     outbox_id, operation_kind, operation_key, lifecycle, database_id,
+                     pairing_id, device_route, grant_serial, frame_hash, sealed_frame,
+                     sealed_frame_bytes, terminal_hash, sealed_terminal,
+                     sealed_terminal_bytes, created_at_ms, state_changed_at_ms, metadata_token
+                 ) VALUES (?1, 'closePairRoute', ?2, 'prepared', ?3, ?4, NULL, NULL,
+                           ?5, ?6, 40, NULL, NULL, NULL, 1000, 1000, ?7)",
+                params![
+                    &[14_u8; 16],
+                    &[15_u8; 32],
+                    &[1_u8; 16],
+                    &[10_u8; 16],
+                    &[16_u8; 32],
+                    &[17_u8; 40],
+                    &[18_u8; 32],
+                ],
+            )
+            .expect("insert close outbox");
+        assert!(
+            transaction
+                .execute(
+                    "DELETE FROM remote_pairings WHERE pairing_id = ?1",
+                    params![&[10_u8; 16]],
+                )
+                .is_err(),
+            "RESTRICT must prevent scrubbing the secret row before close outbox resolution"
+        );
+        transaction
+            .execute(
+                "INSERT INTO remote_pairing_receipts (
+                     pairing_id, database_id, relay_server_id, machine_route, pair_route,
+                     idempotency_token, input_hash, action, request_hash, receipt_hash,
+                     canonical_receipt, receipt_bytes, created_at_ms, retain_until_ms,
+                     metadata_token
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'canceled', NULL, ?8, X'01', 1,
+                           1000, 2592001000, ?9)",
+                params![
+                    &[10_u8; 16],
+                    &[1_u8; 16],
+                    &[2_u8; 16],
+                    &[3_u8; 16],
+                    &[11_u8; 16],
+                    &[21_u8; 32],
+                    &[22_u8; 32],
+                    &[19_u8; 32],
+                    &[20_u8; 32],
+                ],
+            )
+            .expect("insert canonical receipt tombstone");
+        transaction
+            .execute(
+                "DELETE FROM remote_control_outbox WHERE outbox_id = ?1",
+                params![&[14_u8; 16]],
+            )
+            .expect("remove acknowledged close outbox first");
+        transaction
+            .execute(
+                "DELETE FROM remote_pairings WHERE pairing_id = ?1",
+                params![&[10_u8; 16]],
+            )
+            .expect("scrub pairing secret after close outbox removal");
+        transaction.commit().expect("commit close ACK ordering");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM remote_pairing_receipts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count receipt tombstones"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM remote_pairings", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count pairing secret rows"),
+            0
+        );
     }
 
     #[test]

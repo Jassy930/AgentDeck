@@ -47,6 +47,9 @@ fn bytes_and_canonical_uuid_text_roundtrip_strictly() {
         RuntimeIdKind::Command,
         RuntimeIdKind::Turn,
         RuntimeIdKind::Event,
+        RuntimeIdKind::Pairing,
+        RuntimeIdKind::PairRoute,
+        RuntimeIdKind::RemoteOutbox,
         RuntimeIdKind::AdapterState,
         RuntimeIdKind::DaemonBoot,
     ] {

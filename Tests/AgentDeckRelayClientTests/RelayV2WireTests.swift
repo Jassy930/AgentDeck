@@ -518,11 +518,12 @@ final class RelayV2WireTests: XCTestCase {
     func testEveryEndpointVariantDecodesStrictlyAndReencodesSemantically() throws {
         let vectors = try loadRelayVectors()
         let endpoints = try XCTUnwrap(vectors["endpointTypes"] as? [[String: Any]])
-        XCTAssertEqual(endpoints.count, 9)
+        XCTAssertEqual(endpoints.count, 12)
         XCTAssertEqual(
             Set(endpoints.compactMap { $0["wireType"] as? String }),
             [
                 "PairInviteV1", "PairRequestV1", "PairResponseV1",
+                "PairPendingV1", "PairingControlEnvelopeV1", "PairResponseReceivedV1",
                 "DeviceAuthorizationV1", "KeyDirectoryV1", "KeyUpdateV1",
                 "EpochBarrierV1", "SealedPayloadV1",
             ]
@@ -542,6 +543,158 @@ final class RelayV2WireTests: XCTestCase {
                 "Rust/Swift endpoint JSON drift for \(wireType.rawValue)"
             )
         }
+    }
+
+    func testPairingEndpointTamperingFailsClosed() throws {
+        let endpoints = try XCTUnwrap(
+            try loadRelayVectors()["endpointTypes"] as? [[String: Any]]
+        )
+
+        var pending = try endpointValue("PairPendingV1", in: endpoints)
+        pending["requestHash"] = Data(repeating: 0x31, count: 31).base64EncodedString()
+        assertEndpointDecodeRejected(.pairPending, value: pending)
+
+        pending = try endpointValue("PairPendingV1", in: endpoints)
+        pending["requestHash"] = Data(repeating: 0, count: 32).base64EncodedString()
+        assertEndpointDecodeRejected(.pairPending, value: pending)
+
+        var request = try endpointValue("PairRequestV1", in: endpoints)
+        request["enc"] = Data(repeating: 0x07, count: 31).base64EncodedString()
+        assertEndpointDecodeRejected(.pairRequest, value: request)
+
+        request = try endpointValue("PairRequestV1", in: endpoints)
+        request["ciphertext"] = Data().base64EncodedString()
+        assertEndpointDecodeRejected(.pairRequest, value: request)
+
+        request = try endpointValue("PairRequestV1", in: endpoints)
+        request["ciphertext"] = Data(repeating: 0x09, count: 256 * 1024 + 1)
+            .base64EncodedString()
+        assertEndpointDecodeRejected(.pairRequest, value: request)
+
+        request = try endpointValue("PairRequestV1", in: endpoints)
+        request["deviceProofSignature"] = Data(repeating: 0, count: 64)
+            .base64EncodedString()
+        assertEndpointDecodeRejected(.pairRequest, value: request)
+
+        var response = try endpointValue("PairResponseV1", in: endpoints)
+        response.removeValue(forKey: "info")
+        assertEndpointDecodeRejected(.pairResponse, value: response)
+
+        response = try endpointValue("PairResponseV1", in: endpoints)
+        var responseInfo = try XCTUnwrap(response["info"] as? [String: Any])
+        responseInfo["deviceRoute"] = Data(repeating: 0x44, count: 15).base64EncodedString()
+        response["info"] = responseInfo
+        assertEndpointDecodeRejected(.pairResponse, value: response)
+
+        response = try endpointValue("PairResponseV1", in: endpoints)
+        responseInfo = try XCTUnwrap(response["info"] as? [String: Any])
+        responseInfo["unexpected"] = true
+        response["info"] = responseInfo
+        assertEndpointDecodeRejected(.pairResponse, value: response)
+
+        var receipt = try endpointValue("PairResponseReceivedV1", in: endpoints)
+        receipt["grantHash"] = Data(repeating: 0, count: 32).base64EncodedString()
+        assertEndpointDecodeRejected(.pairResponseReceived, value: receipt)
+
+        receipt = try endpointValue("PairResponseReceivedV1", in: endpoints)
+        receipt["signature"] = Data(repeating: 0xB0, count: 63).base64EncodedString()
+        assertEndpointDecodeRejected(.pairResponseReceived, value: receipt)
+    }
+
+    func testPairDataCarriesOnlyRelayVisiblePairingEnvelopes() throws {
+        let endpoints = try XCTUnwrap(
+            try loadRelayVectors()["endpointTypes"] as? [[String: Any]]
+        )
+        let pairRoute = Data(repeating: 0x55, count: 16)
+
+        for wireType in [
+            RelayEndpointWireType.pairRequest,
+            .pairingControlEnvelope,
+            .pairResponse,
+        ] {
+            let value = try endpointValue(wireType.rawValue, in: endpoints)
+            let payload = try RelayV2JSONCodec.decodeEndpoint(
+                wireType,
+                from: JSONSerialization.data(withJSONObject: value)
+            )
+            XCTAssertNoThrow(
+                try RelayV2OutboundFrame.pairData(
+                    pairRoute: pairRoute,
+                    payload: payload
+                ),
+                wireType.rawValue
+            )
+        }
+
+        for wireType in [
+            RelayEndpointWireType.pairPending,
+            .pairResponseReceived,
+            .deviceAuthorization,
+        ] {
+            let value = try endpointValue(wireType.rawValue, in: endpoints)
+            let payload = try RelayV2JSONCodec.decodeEndpoint(
+                wireType,
+                from: JSONSerialization.data(withJSONObject: value)
+            )
+            XCTAssertThrowsError(
+                try RelayV2OutboundFrame.pairData(
+                    pairRoute: pairRoute,
+                    payload: payload
+                ),
+                wireType.rawValue
+            )
+        }
+    }
+
+    func testDeviceAuthorizationRequiresCanonicalBoundedAuthorizationSets() throws {
+        let endpoints = try XCTUnwrap(
+            try loadRelayVectors()["endpointTypes"] as? [[String: Any]]
+        )
+        let baseline = try endpointValue("DeviceAuthorizationV1", in: endpoints)
+
+        var unordered = baseline
+        unordered["capabilities"] = ["approval", "catalog"]
+        unordered["permissions"] = ["catalogRead", "approvalResolve"]
+        assertEndpointDecodeRejected(.deviceAuthorization, value: unordered)
+
+        var duplicate = baseline
+        duplicate["capabilities"] = ["approval", "approval"]
+        assertEndpointDecodeRejected(.deviceAuthorization, value: duplicate)
+
+        var permissionWithoutCapability = baseline
+        permissionWithoutCapability["permissions"] = ["promptSend"]
+        assertEndpointDecodeRejected(
+            .deviceAuthorization,
+            value: permissionWithoutCapability
+        )
+    }
+
+    func testPairInviteRequiresCanonicalRootWSSOrigin() throws {
+        let endpoints = try XCTUnwrap(
+            try loadRelayVectors()["endpointTypes"] as? [[String: Any]]
+        )
+        let baseline = try endpointValue("PairInviteV1", in: endpoints)
+
+        for invalidURL in [
+            "wss://relay.example.test/path",
+            "wss://user@relay.example.test/",
+            "wss://relay.example.test:0/",
+            "wss://relay.example.test/?query=1",
+            "wss://relay.example.test/#fragment",
+        ] {
+            var invite = baseline
+            invite["wssUrl"] = invalidURL
+            assertEndpointDecodeRejected(
+                .pairInvite,
+                value: invite,
+                message: invalidURL
+            )
+        }
+        var zeroCertExpiry = baseline
+        var certificate = try XCTUnwrap(zeroCertExpiry["dataSignCert"] as? [String: Any])
+        certificate["notAfterMs"] = 0
+        zeroCertExpiry["dataSignCert"] = certificate
+        assertEndpointDecodeRejected(.pairInvite, value: zeroCertExpiry)
     }
 
     func testEpochBarrierInnerCursorAndTransferPartKindMirrorRust() throws {
@@ -754,6 +907,34 @@ final class RelayV2WireTests: XCTestCase {
             throw RelayWireCodecError.unknownField("PairInviteV1")
         }
         return value
+    }
+
+    private func endpointValue(
+        _ wireType: String,
+        in endpoints: [[String: Any]]
+    ) throws -> [String: Any] {
+        let vector = try XCTUnwrap(
+            endpoints.first { ($0["wireType"] as? String) == wireType }
+        )
+        return try XCTUnwrap(vector["value"] as? [String: Any])
+    }
+
+    private func assertEndpointDecodeRejected(
+        _ wireType: RelayEndpointWireType,
+        value: [String: Any],
+        message: String = "",
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(
+            try RelayV2JSONCodec.decodeEndpoint(
+                wireType,
+                from: JSONSerialization.data(withJSONObject: value)
+            ),
+            message,
+            file: file,
+            line: line
+        )
     }
 
     private func lengthPrefixedPayload(in data: Data, after offset: Int) throws -> Data {

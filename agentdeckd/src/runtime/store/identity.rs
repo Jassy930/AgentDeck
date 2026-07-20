@@ -18,6 +18,9 @@ pub enum RuntimeIdKind {
     Turn,
     Event,
     Approval,
+    Pairing,
+    PairRoute,
+    RemoteOutbox,
     AdapterState,
     DaemonBoot,
 }
@@ -31,6 +34,9 @@ impl fmt::Display for RuntimeIdKind {
             Self::Turn => "turn",
             Self::Event => "event",
             Self::Approval => "approval",
+            Self::Pairing => "pairing",
+            Self::PairRoute => "pair-route",
+            Self::RemoteOutbox => "remote-outbox",
             Self::AdapterState => "adapter-state",
             Self::DaemonBoot => "daemon-boot",
         })

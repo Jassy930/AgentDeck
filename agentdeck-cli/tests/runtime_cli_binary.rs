@@ -148,7 +148,7 @@ fn machine_status(lifecycle: MachineRemoteLifecycle, failure: Option<&str>) -> M
 }
 
 fn runtime_fixture_payload(case_name: &str) -> serde_json::Value {
-    include_str!("../../protocol/agentdeck/fixtures/runtime-v3-wire.jsonl")
+    include_str!("../../protocol/agentdeck/fixtures/runtime-v4-wire.jsonl")
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("fixture JSON"))
         .find(|case| case["case"] == case_name)

@@ -3,10 +3,11 @@ import XCTest
 @testable import AgentDeckCore
 
 final class RuntimeV2WireCodecTests: XCTestCase {
-  func testCurrentFacadeIsV3AndRejectsV1IngressAndEgress() throws {
+  func testCurrentFacadeIsV4AndRejectsV1IngressAndEgress() throws {
     XCTAssertEqual(runtimeProtocolVersionV2, 2)
     XCTAssertEqual(runtimeProtocolVersionV3, 3)
-    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV3)
+    XCTAssertEqual(runtimeProtocolVersionV4, 4)
+    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV4)
     requireV2Codec(RuntimeWireCodec.self)
 
     let hello = try fixture(named: "requestHello")
@@ -32,15 +33,15 @@ final class RuntimeV2WireCodecTests: XCTestCase {
     )
     XCTAssertThrowsError(try RuntimeWireCodec.encode(v1Egress))
   }
-    func testCurrentCodecReadsAll103RustFixturesAndCompactIsByteExact() throws {
+    func testCurrentCodecReadsAll110RustFixturesAndCompactIsByteExact() throws {
         let fixtures = try loadFixtures()
-        XCTAssertEqual(fixtures.count, 103)
-        XCTAssertEqual(Set(fixtures.map(\.name)).count, 103)
+        XCTAssertEqual(fixtures.count, 110)
+        XCTAssertEqual(Set(fixtures.map(\.name)).count, 110)
 
         let envelopes = fixtures.filter { $0.wireType == "runtimeEnvelope" }
         let transfers = fixtures.filter { $0.wireType == "transferEnvelope" }
         let compact = fixtures.filter { $0.wireType == "runtimeTransferCarrierV1" }
-        XCTAssertEqual(envelopes.count, 101)
+        XCTAssertEqual(envelopes.count, 108)
         XCTAssertEqual(transfers.count, 1)
         XCTAssertEqual(compact.count, 1)
 
@@ -59,7 +60,7 @@ final class RuntimeV2WireCodecTests: XCTestCase {
                 caseName: fixture.name
             )
         }
-        XCTAssertEqual(counts, ["request": 29, "reply": 46, "stream": 26])
+        XCTAssertEqual(counts, ["request": 29, "reply": 52, "stream": 27])
 
         let transferFixture = try XCTUnwrap(transfers.first)
         let transferInput = try jsonData(transferFixture.value)
@@ -74,7 +75,7 @@ final class RuntimeV2WireCodecTests: XCTestCase {
         let compactHex = try XCTUnwrap(compactFixture.value as? String)
         let compactInput = try Data(hex: compactHex)
         let carrier = try RuntimeWireCodec.decodeTransferCarrier(compactInput)
-        XCTAssertEqual(carrier.runtimeVersion, 3)
+        XCTAssertEqual(carrier.runtimeVersion, 4)
         XCTAssertEqual(try RuntimeWireCodec.encode(carrier), compactInput)
     }
 
@@ -371,7 +372,7 @@ final class RuntimeV2WireCodecTests: XCTestCase {
             "Sources/AgentDeckCore/Protocol/RuntimeV2StreamTypes.swift",
             "Sources/AgentDeckCore/Protocol/RuntimeV2WireCodec.swift",
             "protocol/agentdeck/runtime-protocol.schema.json",
-            "protocol/agentdeck/fixtures/runtime-v3-wire.jsonl",
+            "protocol/agentdeck/fixtures/runtime-v4-wire.jsonl",
         ]
         for relativePath in noPrivateHandleFiles {
             let source = try String(
@@ -567,7 +568,7 @@ final class RuntimeV2WireCodecTests: XCTestCase {
 
     private func loadFixtures() throws -> [Fixture] {
         let data = try Data(contentsOf: repositoryRoot
-            .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v3-wire.jsonl"))
+            .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v4-wire.jsonl"))
         let text = try XCTUnwrap(String(data: data, encoding: .utf8))
         return try text.split(separator: "\n").map { line in
             let object = try XCTUnwrap(

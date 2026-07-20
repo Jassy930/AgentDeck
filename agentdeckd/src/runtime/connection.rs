@@ -168,6 +168,16 @@ impl AuthenticatedPrincipal {
         self.authorization.try_enter()
     }
 
+    pub(crate) fn may_receive_local_administration_stream(&self) -> bool {
+        self.is_local()
+            && self.authorization.local_administration
+            && self
+                .authorization
+                .state
+                .load(std::sync::atomic::Ordering::Acquire)
+                == PRINCIPAL_ACTIVE
+    }
+
     #[allow(dead_code)] // P4 durable revoke transaction 调用。
     pub(crate) async fn begin_revoke(&self) -> Result<(), PrincipalAccessError> {
         self.authorization.begin_revoke().await
@@ -1116,6 +1126,42 @@ impl ConnectionRegistry {
             }
         }
         queued
+    }
+
+    /// 向当前 local-control principals 广播一个已编码的管理 stream item。
+    ///
+    /// 快照只保留 opaque connection ID；真正入队仍逐连接复核 incarnation/budget。
+    /// 单个慢 writer 会由 `try_enqueue` fail-close，但不会阻断其他本机管理员或
+    /// durable pairing 的后续 `listPendingPairings` 读回。
+    pub(crate) fn try_enqueue_local_administration(
+        &self,
+        frame: EncodedRuntimeFrame,
+    ) -> Result<usize, ConnectionError> {
+        let recipients = self
+            .entries
+            .lock()
+            .map_err(|_| ConnectionError::RegistryPoisoned)?
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .principal
+                    .may_receive_local_administration_stream()
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        let mut delivered = 0_usize;
+        for recipient in recipients {
+            match self.try_enqueue(recipient, frame.clone()) {
+                Ok(()) => delivered += 1,
+                Err(
+                    ConnectionError::NotFound
+                    | ConnectionError::Lagged
+                    | ConnectionError::WriterTaskFailed,
+                ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(delivered)
     }
 
     /// paced producer 使用的异步 reservation。它只等待本 connection 的 frame/byte

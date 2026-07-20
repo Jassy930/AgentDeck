@@ -11,6 +11,7 @@
 pub mod context;
 pub mod keys;
 pub mod pairing;
+pub mod pairing_control;
 pub mod payload;
 pub mod schema;
 pub mod tbs;
@@ -172,15 +173,19 @@ pub(crate) mod b64_vec {
     }
 }
 
-pub use context::{OuterContextV1, OuterFrameKind};
+pub use context::{OuterContextError, OuterContextV1, OuterFrameKind};
 pub use keys::{
-    EpochBarrierV1, KeyDirectoryEntry, KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1,
-    KeyUpdateV1,
+    EpochBarrierV1, KeyDirectoryEntry, KeyDirectorySignatureContextV1, KeyDirectoryTbsV1,
+    KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1, KeyUpdateV1,
 };
 pub use pairing::{
-    DeviceAuthorizationV1, PairInviteV1, PairPendingV1, PairRequestInfoV1, PairRequestV1,
-    PairResponseInfoV1, PairResponseReceivedV1, PairResponseV1,
+    AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,
+    DeviceAuthorizationV1, MachineDataSignerBindingV1, PairInviteV1, PairPendingV1,
+    PairRequestInfoV1, PairRequestPlaintextV1, PairRequestV1, PairResponseInfoV1,
+    PairResponsePlaintextV1, PairResponseReceivedV1, PairResponseV1, PairingEnvelopeKindV1,
+    PairingEnvelopeTbsV1, PairingError,
 };
+pub use pairing_control::{PairPendingTbsV1, PairResponseReceivedTbsV1, PairingControlEnvelopeV1};
 pub use payload::{
     SealedBlobSignatureVerifier, SealedPayloadKind, SealedPayloadV1, SignedSealedBlobV1,
     UnsignedSealedBlobV1, VerifiedSealedBlobV1,

@@ -8,10 +8,22 @@
 
 use std::fmt;
 
-use agentdeck_crypto::{sha256, sign_authentication_transcript};
+use agentdeck_crypto::{
+    CryptoError, HpkePublicKey, PairResponseSealAuthority, SignatureBytes,
+    ValidatedRelayReceiptVerifyKey, VerifyingKey, seal_pair_pending, seal_pair_response, sha256,
+    sign_authentication_transcript, sign_device_authorization,
+    sign_key_directory as crypto_sign_key_directory, sign_tbs, verify_tbs,
+};
+use agentdeck_protocol::e2ee::{
+    DeviceAuthorizationV1, KeyDirectorySignatureContextV1, KeyDirectoryV1,
+    MachineDataSignerBindingV1, OuterContextV1, PairRequestInfoV1, PairResponseInfoV1,
+    PairResponsePlaintextV1, PairResponseV1, PairingControlEnvelopeV1,
+};
 use agentdeck_protocol::relay_v2::{
-    AuthenticationTranscriptV1, CertRole, Ed25519Signature, MachineRouteId, RelayServerId,
-    RootKeyId,
+    AuthenticationTranscriptV1, CertRole, DeviceRevocation, Ed25519Signature, LinkGeneration,
+    MachineRouteId, PublicKeyBytes, RELAY_RECEIPT_FORMAT_VERSION, RELAY_RECEIPT_KEY_GENERATION_MVP,
+    RelayGrant, RelayReceiptKeyId, RelayReceiptVerifyKeyV1, RelayServerId, RootKeyId,
+    SignedCertificate, TrustEpoch,
 };
 
 use crate::config::DaemonConfig;
@@ -42,6 +54,95 @@ const FRESH_DATA_GENERATION: u64 = 1;
 const FRESH_KEY_DIRECTORY_REVISION: u64 = 0;
 const ROOT_KEY_ID_ATTEMPTS: usize = 8;
 const REENROLL_ROOT_KEY_ID_DOMAIN: &[u8] = b"AgentDeck/ReenrollRootKeyIdV1\0";
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct MachinePairingAnchor {
+    pub(super) relay_server_id: RelayServerId,
+    pub(super) machine_route: MachineRouteId,
+    pub(super) root_public_key: PublicKeyBytes,
+    pub(super) root_fingerprint: [u8; 32],
+    pub(super) root_key_id: RootKeyId,
+    pub(super) trust_epoch: TrustEpoch,
+    pub(super) machine_hpke_public_key: PublicKeyBytes,
+    pub(super) data_generation: LinkGeneration,
+    pub(super) data_certificate: SignedCertificate,
+}
+
+impl fmt::Debug for MachinePairingAnchor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MachinePairingAnchor([REDACTED])")
+    }
+}
+
+impl MachinePairingAnchor {
+    /// pairing lane 在发往 Relay 前以同一 frozen public anchor 复核完整 grant。
+    /// 该入口不持有私钥，也不能签发或改写任何对象。
+    pub(super) fn verify_relay_grant(&self, grant: &RelayGrant) -> Result<(), MachinePairingError> {
+        validate_pairing_grant_axes(self, grant)?;
+        if grant.signature.0 == [0; 64] {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        verify_tbs(
+            &self.root_verifying_key()?,
+            &grant.to_be_signed_v1(self.relay_server_id, self.root_fingerprint),
+            &SignatureBytes::from(grant.signature),
+        )?;
+        Ok(())
+    }
+
+    /// pairing lane 在发往 Relay 前以同一 frozen public anchor 复核完整 revocation。
+    /// exact retry 可以复用同一签名，但 unsigned/wrong-root/wrong-trust 输入一律拒绝。
+    pub(super) fn verify_device_revocation(
+        &self,
+        revocation: &DeviceRevocation,
+    ) -> Result<(), MachinePairingError> {
+        validate_pairing_revocation_axes(self, revocation)?;
+        if revocation.signature.0 == [0; 64] {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        verify_tbs(
+            &self.root_verifying_key()?,
+            &revocation.to_be_signed_v1(self.relay_server_id, self.root_fingerprint),
+            &SignatureBytes::from(revocation.signature),
+        )?;
+        Ok(())
+    }
+
+    fn root_verifying_key(&self) -> Result<VerifyingKey, MachinePairingError> {
+        if sha256(&self.root_public_key.0) != self.root_fingerprint {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        Ok(VerifyingKey::from_bytes(&self.root_public_key.0)?)
+    }
+}
+
+pub(super) enum MachinePairingError {
+    Certificate(MachineCertificateError),
+    Crypto,
+    ContextMismatch,
+}
+
+impl MachinePairingError {
+    pub(super) fn code(&self) -> &'static str {
+        match self {
+            Self::Certificate(error) => error.code(),
+            Self::Crypto => "remote.transport.pairing_crypto_failed",
+            Self::ContextMismatch => "remote.transport.pairing_authority_mismatch",
+        }
+    }
+}
+
+impl From<MachineCertificateError> for MachinePairingError {
+    fn from(error: MachineCertificateError) -> Self {
+        Self::Certificate(error)
+    }
+}
+
+impl From<CryptoError> for MachinePairingError {
+    fn from(_error: CryptoError) -> Self {
+        Self::Crypto
+    }
+}
 
 /// P4.1 bootstrap 的三态结果。`Blocked` 只关闭 remote；本地 Runtime 继续启动。
 pub enum RemoteBootstrapOutcome {
@@ -363,6 +464,225 @@ impl MachineLinkIdentityOwner {
     ) -> Ed25519Signature {
         sign_authentication_transcript(self.identity.material.link_signing_key(), transcript).into()
     }
+
+    pub(super) fn pairing_anchor(
+        &self,
+        relay_server_id: RelayServerId,
+        machine_route: MachineRouteId,
+        data_certificate: &SignedCertificate,
+    ) -> Result<MachinePairingAnchor, MachinePairingError> {
+        self.identity.verify_certificate(
+            relay_server_id,
+            machine_route,
+            CertRole::Data,
+            data_certificate,
+        )?;
+        let binding = self.identity.binding();
+        Ok(MachinePairingAnchor {
+            relay_server_id,
+            machine_route,
+            root_public_key: PublicKeyBytes(binding.root_public_key),
+            root_fingerprint: binding.root_fingerprint,
+            root_key_id: RootKeyId::from_bytes(binding.root_key_id),
+            trust_epoch: TrustEpoch::new(binding.trust_epoch),
+            machine_hpke_public_key: PublicKeyBytes(binding.machine_hpke_public_key),
+            data_generation: LinkGeneration::new(binding.data_generation),
+            data_certificate: data_certificate.clone(),
+        })
+    }
+
+    pub(super) fn seal_pair_pending(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairRequestInfoV1,
+        context: &OuterContextV1,
+        request_hash: [u8; 32],
+        signer: &MachineDataSignerBindingV1,
+        mut rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<PairingControlEnvelopeV1, MachinePairingError> {
+        Ok(seal_pair_pending(
+            recipient,
+            info,
+            context,
+            request_hash,
+            self.identity.material.data_signing_key(),
+            signer,
+            &mut rng,
+        )?)
+    }
+
+    pub(super) fn sign_relay_grant(
+        &self,
+        anchor: &MachinePairingAnchor,
+        mut grant: RelayGrant,
+    ) -> Result<RelayGrant, MachinePairingError> {
+        if grant.signature.0 != [0; 64] {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        validate_pairing_grant_axes(anchor, &grant)?;
+        let tbs = grant.to_be_signed_v1(anchor.relay_server_id, anchor.root_fingerprint);
+        grant.signature = sign_tbs(self.identity.material.root_signing_key(), &tbs).into();
+        verify_tbs(
+            &self.identity.material.root_signing_key().verifying_key(),
+            &tbs,
+            &SignatureBytes::from(grant.signature),
+        )?;
+        Ok(grant)
+    }
+
+    pub(super) fn sign_device_authorization(
+        &self,
+        anchor: &MachinePairingAnchor,
+        grant: &RelayGrant,
+        authorization: DeviceAuthorizationV1,
+    ) -> Result<DeviceAuthorizationV1, MachinePairingError> {
+        validate_pairing_grant_axes(anchor, grant)?;
+        if grant.signature.0 == [0; 64] {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        let tbs = grant.to_be_signed_v1(anchor.relay_server_id, anchor.root_fingerprint);
+        verify_tbs(
+            &self.identity.material.root_signing_key().verifying_key(),
+            &tbs,
+            &SignatureBytes::from(grant.signature),
+        )?;
+        Ok(sign_device_authorization(
+            self.identity.material.root_signing_key(),
+            anchor.relay_server_id,
+            grant,
+            authorization,
+        )?)
+    }
+
+    /// 仅允许当前 MachineDataSign 对完整 typed key directory 签名。
+    pub(super) fn sign_key_directory(
+        &self,
+        anchor: &MachinePairingAnchor,
+        context: &KeyDirectorySignatureContextV1,
+        directory: KeyDirectoryV1,
+    ) -> Result<KeyDirectoryV1, MachinePairingError> {
+        if context.relay_server_id != anchor.relay_server_id
+            || context.machine_route != anchor.machine_route
+            || context.root_trust_epoch != anchor.trust_epoch
+            || context.device_route.as_bytes() == &[0; 16]
+            || context.grant_serial.value() == 0
+        {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        let signer = MachineDataSignerBindingV1::from_certificate(&anchor.data_certificate)
+            .map_err(|_| MachinePairingError::Crypto)?;
+        Ok(crypto_sign_key_directory(
+            self.identity.material.data_signing_key(),
+            &signer,
+            context,
+            directory,
+        )?)
+    }
+
+    pub(super) fn seal_pair_response(
+        &self,
+        anchor: &MachinePairingAnchor,
+        recipient: &HpkePublicKey,
+        info: &PairResponseInfoV1,
+        context: &OuterContextV1,
+        plaintext: &PairResponsePlaintextV1,
+        mut rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<PairResponseV1, MachinePairingError> {
+        if info.relay_server_id != anchor.relay_server_id
+            || info.machine_route != anchor.machine_route
+            || info.root_trust_epoch != anchor.trust_epoch
+        {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        validate_pairing_grant_axes(anchor, &plaintext.relay_grant)?;
+        if plaintext.relay_grant.signature.0 == [0; 64] {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        let signer = MachineDataSignerBindingV1::from_certificate(&anchor.data_certificate)
+            .map_err(|_| MachinePairingError::Crypto)?;
+        Ok(seal_pair_response(
+            recipient,
+            info,
+            context,
+            plaintext,
+            PairResponseSealAuthority {
+                machine_data_signing_key: self.identity.material.data_signing_key(),
+                signer: &signer,
+                machine_root_verifying_key: &self
+                    .identity
+                    .material
+                    .root_signing_key()
+                    .verifying_key(),
+            },
+            &mut rng,
+        )?)
+    }
+
+    pub(super) fn sign_device_revocation(
+        &self,
+        anchor: &MachinePairingAnchor,
+        mut revocation: DeviceRevocation,
+    ) -> Result<DeviceRevocation, MachinePairingError> {
+        if revocation.signature.0 != [0; 64] {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        validate_pairing_revocation_axes(anchor, &revocation)?;
+        let tbs = revocation.to_be_signed_v1(anchor.relay_server_id, anchor.root_fingerprint);
+        revocation.signature = sign_tbs(self.identity.material.root_signing_key(), &tbs).into();
+        verify_tbs(
+            &self.identity.material.root_signing_key().verifying_key(),
+            &tbs,
+            &SignatureBytes::from(revocation.signature),
+        )?;
+        Ok(revocation)
+    }
+}
+
+fn validate_pairing_grant_axes(
+    anchor: &MachinePairingAnchor,
+    grant: &RelayGrant,
+) -> Result<(), MachinePairingError> {
+    if grant.machine_route != anchor.machine_route
+        || grant.device_route.as_bytes() == &[0; 16]
+        || grant.grant_serial.value() == 0
+        || grant.root_key_id != anchor.root_key_id
+        || grant.trust_epoch != anchor.trust_epoch
+    {
+        return Err(MachinePairingError::ContextMismatch);
+    }
+    validate_pairing_device_sign_key(anchor.relay_server_id, grant.device_sign_pubkey)?;
+    Ok(())
+}
+
+fn validate_pairing_revocation_axes(
+    anchor: &MachinePairingAnchor,
+    revocation: &DeviceRevocation,
+) -> Result<(), MachinePairingError> {
+    if revocation.machine_route != anchor.machine_route
+        || revocation.device_route.as_bytes() == &[0; 16]
+        || revocation.grant_serial.value() == 0
+        || revocation.root_key_id != anchor.root_key_id
+        || revocation.trust_epoch != anchor.trust_epoch
+    {
+        return Err(MachinePairingError::ContextMismatch);
+    }
+    Ok(())
+}
+
+/// 复用 crypto crate 已有的 Ed25519 compressed-point/low-order preflight；这里只投影
+/// 临时 public verifier anchor，不持有或暴露任何 receipt/private capability。
+pub(super) fn validate_pairing_device_sign_key(
+    relay_server_id: RelayServerId,
+    public_key: PublicKeyBytes,
+) -> Result<(), MachinePairingError> {
+    ValidatedRelayReceiptVerifyKey::new(RelayReceiptVerifyKeyV1 {
+        receipt_format_version: RELAY_RECEIPT_FORMAT_VERSION,
+        relay_server_id,
+        key_generation: RELAY_RECEIPT_KEY_GENERATION_MVP,
+        key_id: RelayReceiptKeyId::from_public_key(&public_key),
+        public_key,
+    })?;
+    Ok(())
 }
 
 impl fmt::Debug for MachineLinkIdentityOwner {
@@ -773,8 +1093,55 @@ async fn settle_activate_unknown(
 
 #[cfg(test)]
 mod tests {
+    use agentdeck_protocol::relay_v2::{DeviceRouteId, GrantSerial};
+
     use super::*;
     use crate::security::MemoryKeyStore;
+
+    const TEST_RELAY: RelayServerId = RelayServerId::from_bytes([0x41; 16]);
+    const TEST_MACHINE: MachineRouteId = MachineRouteId::from_bytes([0x42; 16]);
+
+    fn pairing_owner() -> (
+        MachineLinkIdentityOwner,
+        MachinePairingAnchor,
+        agentdeck_crypto::VerifyingKey,
+    ) {
+        let keys = MemoryKeyStore::new();
+        let material = load_or_create_preparing_machine_key_material(&keys)
+            .expect("create machine key material");
+        let root_verifying_key = material.root_signing_key().verifying_key();
+        let binding = fresh_binding(&material, [0x43; 16]);
+        let identity = Box::new(ActiveMachineIdentity {
+            state: MachineIdentityStateRecord {
+                database_id: [0x44; 16],
+                lifecycle: MachineIdentityLifecycle::Active,
+                binding,
+            },
+            material,
+        });
+        let data_certificate = identity
+            .certificates(TEST_RELAY, TEST_MACHINE)
+            .expect("issue active certificates")
+            .data()
+            .clone();
+        let owner = MachineLinkIdentityOwner { identity };
+        let anchor = owner
+            .pairing_anchor(TEST_RELAY, TEST_MACHINE, &data_certificate)
+            .unwrap_or_else(|error| panic!("bind pairing authority: {}", error.code()));
+        (owner, anchor, root_verifying_key)
+    }
+
+    fn unsigned_grant(anchor: &MachinePairingAnchor, device_key: PublicKeyBytes) -> RelayGrant {
+        RelayGrant {
+            machine_route: anchor.machine_route,
+            device_route: DeviceRouteId::from_bytes([0x45; 16]),
+            device_sign_pubkey: device_key,
+            grant_serial: GrantSerial::new(7),
+            root_key_id: anchor.root_key_id,
+            trust_epoch: anchor.trust_epoch,
+            signature: Ed25519Signature([0; 64]),
+        }
+    }
 
     #[test]
     fn reenrollment_root_key_id_is_stable_for_same_database_and_key_material() {
@@ -813,5 +1180,97 @@ mod tests {
         .expect_err("all-zero draws must be exhausted without minting an ID");
         assert_eq!(error, RootKeyIdGenerationError::ZeroExhausted);
         assert_eq!(calls, ROOT_KEY_ID_ATTEMPTS);
+    }
+
+    #[test]
+    fn pairing_device_sign_preflight_rejects_zero_invalid_and_weak_points() {
+        let valid = PublicKeyBytes(
+            agentdeck_crypto::SigningKey::from_seed(&[0x51; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        validate_pairing_device_sign_key(TEST_RELAY, valid).unwrap_or_else(|error| {
+            panic!("valid DeviceSign key passes preflight: {}", error.code())
+        });
+
+        let mut weak = [0; 32];
+        weak[0] = 1;
+        for invalid in [
+            PublicKeyBytes([0; 32]),
+            PublicKeyBytes(weak),
+            PublicKeyBytes([
+                0x19, 0x46, 0x0c, 0x51, 0x3e, 0x55, 0x2e, 0xe0, 0x3a, 0x8f, 0xb9, 0x7b, 0xb5, 0xa8,
+                0x83, 0x01, 0x1f, 0x6d, 0x33, 0xe6, 0x37, 0xd2, 0x89, 0xf9, 0xd0, 0x29, 0x25, 0xba,
+                0xbf, 0xed, 0xfb, 0xfc,
+            ]),
+        ] {
+            assert_eq!(
+                validate_pairing_device_sign_key(TEST_RELAY, invalid)
+                    .expect_err("invalid DeviceSign key must fail closed")
+                    .code(),
+                "remote.transport.pairing_crypto_failed"
+            );
+        }
+    }
+
+    #[test]
+    fn pairing_root_authority_only_signs_unsigned_grants_and_revocations() {
+        let (owner, anchor, root_verifying_key) = pairing_owner();
+        let device_key = PublicKeyBytes(
+            agentdeck_crypto::SigningKey::from_seed(&[0x52; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let grant = owner
+            .sign_relay_grant(&anchor, unsigned_grant(&anchor, device_key))
+            .unwrap_or_else(|error| panic!("sign zero-signature grant: {}", error.code()));
+        verify_tbs(
+            &root_verifying_key,
+            &grant.to_be_signed_v1(anchor.relay_server_id, anchor.root_fingerprint),
+            &SignatureBytes::from(grant.signature),
+        )
+        .expect("verify signed grant");
+
+        let mut presigned_invalid_grant = unsigned_grant(&anchor, PublicKeyBytes([0; 32]));
+        presigned_invalid_grant.signature = Ed25519Signature([0x53; 64]);
+        assert_eq!(
+            owner
+                .sign_relay_grant(&anchor, presigned_invalid_grant)
+                .expect_err("pre-signed grant must be rejected before key preflight")
+                .code(),
+            "remote.transport.pairing_authority_mismatch"
+        );
+        assert_eq!(
+            owner
+                .sign_relay_grant(&anchor, grant.clone())
+                .expect_err("signed grant replay must not re-enter signing")
+                .code(),
+            "remote.transport.pairing_authority_mismatch"
+        );
+
+        let unsigned_revocation = DeviceRevocation {
+            machine_route: grant.machine_route,
+            device_route: grant.device_route,
+            grant_serial: grant.grant_serial,
+            root_key_id: grant.root_key_id,
+            trust_epoch: grant.trust_epoch,
+            signature: Ed25519Signature([0; 64]),
+        };
+        let revocation = owner
+            .sign_device_revocation(&anchor, unsigned_revocation)
+            .unwrap_or_else(|error| panic!("sign zero-signature revocation: {}", error.code()));
+        verify_tbs(
+            &root_verifying_key,
+            &revocation.to_be_signed_v1(anchor.relay_server_id, anchor.root_fingerprint),
+            &SignatureBytes::from(revocation.signature),
+        )
+        .expect("verify signed revocation");
+        assert_eq!(
+            owner
+                .sign_device_revocation(&anchor, revocation)
+                .expect_err("signed revocation replay must not re-enter signing")
+                .code(),
+            "remote.transport.pairing_authority_mismatch"
+        );
     }
 }

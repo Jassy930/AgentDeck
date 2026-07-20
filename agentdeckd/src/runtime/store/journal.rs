@@ -5450,7 +5450,11 @@ fn id_exists(transaction: &Transaction<'_>, id: RuntimeId) -> Result<bool, Runti
         RuntimeIdKind::Approval => {
             "SELECT EXISTS(SELECT 1 FROM approval_ledger WHERE approval_id = ?1)"
         }
-        RuntimeIdKind::Database | RuntimeIdKind::DaemonBoot => {
+        RuntimeIdKind::Database
+        | RuntimeIdKind::DaemonBoot
+        | RuntimeIdKind::Pairing
+        | RuntimeIdKind::PairRoute
+        | RuntimeIdKind::RemoteOutbox => {
             return Err(RuntimeStoreError::InvalidConfig(
                 "this runtime id kind is not allocated by the journal",
             ));
@@ -6456,6 +6460,27 @@ pub(crate) fn validate_store_integrity(
                 &ledger,
             )
         }
+        super::schema::RUNTIME_SCHEMA_VERSION_V9 => {
+            super::machine_identity::validate_v8_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )?;
+            super::machine_remote::validate_v9_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )?;
+            super::admin::validate_v7_integrity(connection, key_bundle, database_id, &ledger)?;
+            super::native_projection::validate_v6_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )
+        }
         super::schema::RUNTIME_SCHEMA_VERSION => {
             super::machine_identity::validate_v8_integrity(
                 connection,
@@ -6469,6 +6494,7 @@ pub(crate) fn validate_store_integrity(
                 database_id,
                 &ledger,
             )?;
+            super::pairing::validate_v10_integrity(connection, key_bundle, database_id, &ledger)?;
             super::admin::validate_v7_integrity(connection, key_bundle, database_id, &ledger)?;
             super::native_projection::validate_v6_integrity(
                 connection,

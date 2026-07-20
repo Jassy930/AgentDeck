@@ -12,9 +12,11 @@ use std::process::ExitCode;
 
 use agentdeck_cli::unix_transport::RuntimeUnixClient;
 use agentdeck_protocol::relay_v2::{EnrollmentBundleV2, RelayAdminPurgeReceiptV1};
+use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
+use agentdeck_protocol::runtime::identity::{DeviceHandle, GrantSerial, PairingId};
 use agentdeck_protocol::runtime::{
-    LocalOnlyAdministration, MachineEnrollRequest, MachineRemoteLifecycle, MachineRemoteStatus,
-    RuntimeRequest, TrustResetRequest,
+    CreatePairInviteRequest, IdempotencyKey, LocalOnlyAdministration, MachineEnrollRequest,
+    MachineRemoteLifecycle, MachineRemoteStatus, RuntimeReply, RuntimeRequest, TrustResetRequest,
 };
 use base64::{
     Engine as _,
@@ -36,6 +38,21 @@ pub enum RuntimeRemotePlan {
     MachineEnroll(EnrollmentBundleV2),
     MachineStatus,
     TrustReset(Option<Box<RelayAdminPurgeReceiptV1>>),
+    CreatePairInvite {
+        display_name: String,
+        idempotency_key: String,
+    },
+    PairingPending,
+    PairingApprove(PairingId),
+    PairingCancel(PairingId),
+    RevokeDevice(DeviceHandle, GrantSerial),
+}
+
+#[derive(Clone, Copy)]
+enum PairingReplyKind {
+    Invite,
+    Pending,
+    Decision,
 }
 
 impl std::fmt::Debug for RuntimeRemotePlan {
@@ -44,6 +61,11 @@ impl std::fmt::Debug for RuntimeRemotePlan {
             Self::MachineEnroll(_) => "RuntimeRemotePlan::MachineEnroll(<redacted>)",
             Self::MachineStatus => "RuntimeRemotePlan::MachineStatus",
             Self::TrustReset(_) => "RuntimeRemotePlan::TrustReset(<redacted>)",
+            Self::CreatePairInvite { .. } => "RuntimeRemotePlan::CreatePairInvite(<redacted>)",
+            Self::PairingPending => "RuntimeRemotePlan::PairingPending",
+            Self::PairingApprove(_) => "RuntimeRemotePlan::PairingApprove(<redacted>)",
+            Self::PairingCancel(_) => "RuntimeRemotePlan::PairingCancel(<redacted>)",
+            Self::RevokeDevice(_, _) => "RuntimeRemotePlan::RevokeDevice(<redacted>)",
         })
     }
 }
@@ -75,16 +97,72 @@ impl RuntimeRemotePlan {
         Ok(Self::TrustReset(receipt))
     }
 
+    pub fn create_pair_invite(
+        display_name: String,
+        idempotency_key: String,
+    ) -> Result<Self, CliError> {
+        agentdeck_protocol::e2ee::pairing::validate_pairing_display_name(&display_name)
+            .map_err(|error| CliError::Usage(error.to_string()))?;
+        validate_pairing_idempotency_key(&idempotency_key)?;
+        Ok(Self::CreatePairInvite {
+            display_name,
+            idempotency_key,
+        })
+    }
+
+    pub const fn pairing_pending() -> Self {
+        Self::PairingPending
+    }
+
+    pub fn pairing_approve(pairing_id: String) -> Result<Self, CliError> {
+        canonical_pairing_id(pairing_id).map(Self::PairingApprove)
+    }
+
+    pub fn pairing_cancel(pairing_id: String) -> Result<Self, CliError> {
+        canonical_pairing_id(pairing_id).map(Self::PairingCancel)
+    }
+
+    pub fn revoke_device(device: String, grant_serial: u64) -> Result<Self, CliError> {
+        if grant_serial == 0 {
+            return Err(CliError::Usage(
+                "remote revoke --grant-serial must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(Self::RevokeDevice(
+            canonical_device_handle(device)?,
+            GrantSerial::new(grant_serial),
+        ))
+    }
+
     const fn operation(&self) -> &'static str {
         match self {
             Self::MachineEnroll(_) => "remote.machine.enroll",
             Self::MachineStatus => "remote.machine.status",
             Self::TrustReset(_) => "remote.trustReset",
+            Self::CreatePairInvite { .. } => "remote.pairing.invite",
+            Self::PairingPending => "remote.pairing.pending",
+            Self::PairingApprove(_) => "remote.pairing.approve",
+            Self::PairingCancel(_) => "remote.pairing.cancel",
+            Self::RevokeDevice(_, _) => "remote.device.revoke",
         }
     }
 
     const fn exposes_admin_purge_template(&self) -> bool {
         matches!(self, Self::MachineStatus | Self::TrustReset(_))
+    }
+
+    const fn pairing_reply_kind(&self) -> Option<PairingReplyKind> {
+        match self {
+            Self::CreatePairInvite { .. } => Some(PairingReplyKind::Invite),
+            Self::PairingPending => Some(PairingReplyKind::Pending),
+            Self::PairingApprove(_) | Self::PairingCancel(_) => Some(PairingReplyKind::Decision),
+            Self::MachineEnroll(_) | Self::MachineStatus | Self::TrustReset(_) => None,
+            Self::RevokeDevice(_, _) => None,
+        }
+    }
+
+    const fn is_revocation(&self) -> bool {
+        matches!(self, Self::RevokeDevice(_, _))
     }
 
     fn into_request(self) -> Result<RuntimeRequest, CliError> {
@@ -103,6 +181,32 @@ impl RuntimeRemotePlan {
                     .map(RuntimeRequest::TrustReset)
                     .map_err(|_| input_invalid("admin purge receipt"))
             }
+            Self::CreatePairInvite {
+                display_name,
+                idempotency_key,
+            } => Ok(RuntimeRequest::CreatePairInvite(CreatePairInviteRequest {
+                display_name,
+                idempotency_key: IdempotencyKey::new(idempotency_key),
+                scope: LocalOnlyAdministration::LocalOnly,
+            })),
+            Self::PairingPending => Ok(RuntimeRequest::ListPendingPairings {
+                scope: LocalOnlyAdministration::LocalOnly,
+            }),
+            Self::PairingApprove(pairing_id) => Ok(RuntimeRequest::ConfirmPairing {
+                pairing_id,
+                scope: LocalOnlyAdministration::LocalOnly,
+            }),
+            Self::PairingCancel(pairing_id) => Ok(RuntimeRequest::CancelPairing {
+                pairing_id,
+                scope: LocalOnlyAdministration::LocalOnly,
+            }),
+            Self::RevokeDevice(device, grant_serial) => Ok(RuntimeRequest::Revoke(RevokeRequest {
+                target: RevokeTarget::Device {
+                    device,
+                    grant_serial,
+                    scope: LocalOnlyAdministration::LocalOnly,
+                },
+            })),
         }
     }
 }
@@ -113,6 +217,48 @@ pub async fn run_runtime(
     pretty: bool,
 ) -> Result<(), CliError> {
     let operation = plan.operation();
+    if plan.is_revocation() {
+        let receipt =
+            runtime_cli::request_revocation_administration(client, plan.into_request()?).await?;
+        println!(
+            "{}",
+            render(
+                &serde_json::json!({"operation": operation, "result": receipt}),
+                pretty,
+            )
+        );
+        return Ok(());
+    }
+    if let Some(expected) = plan.pairing_reply_kind() {
+        let reply =
+            runtime_cli::request_pairing_administration(client, plan.into_request()?).await?;
+        let result = match (expected, reply) {
+            (PairingReplyKind::Invite, RuntimeReply::PairInvite(value)) => {
+                serde_json::to_value(value)?
+            }
+            (PairingReplyKind::Pending, RuntimeReply::PendingPairings { pairings }) => {
+                serde_json::to_value(pairings)?
+            }
+            (PairingReplyKind::Decision, RuntimeReply::Pairing(receipt)) => {
+                serde_json::to_value(receipt)?
+            }
+            _ => {
+                return Err(CliError::Protocol {
+                    code: Some("daemon.client.pairing_reply_mismatch".to_owned()),
+                    message: "pairing administration reply does not match the requested operation"
+                        .to_owned(),
+                });
+            }
+        };
+        println!(
+            "{}",
+            render(
+                &serde_json::json!({"operation": operation, "result": result}),
+                pretty,
+            )
+        );
+        return Ok(());
+    }
     let expose_template = plan.exposes_admin_purge_template();
     let trust_reset = matches!(&plan, RuntimeRemotePlan::TrustReset(_));
     let request = plan.into_request()?;
@@ -145,6 +291,47 @@ pub async fn run_runtime(
     )?;
     println!("{}", render(&output, pretty));
     Ok(())
+}
+
+fn validate_pairing_idempotency_key(value: &str) -> Result<(), CliError> {
+    if value.is_empty() || value.len() > 1_024 || value.as_bytes().contains(&0) {
+        return Err(CliError::Usage(
+            "pairing invite --idempotency-key must contain 1 to 1024 UTF-8 bytes and no NUL"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_pairing_id(value: String) -> Result<PairingId, CliError> {
+    let parsed = uuid::Uuid::parse_str(&value)
+        .map_err(|_| CliError::Usage("PAIRING_ID must be a canonical UUID".to_owned()))?;
+    if parsed.is_nil() || parsed.hyphenated().to_string() != value {
+        return Err(CliError::Usage(
+            "PAIRING_ID must be a canonical non-zero lowercase UUID".to_owned(),
+        ));
+    }
+    Ok(PairingId::new(value))
+}
+
+fn canonical_device_handle(value: String) -> Result<DeviceHandle, CliError> {
+    let Some(encoded) = value.strip_prefix("device-") else {
+        return Err(CliError::Usage(
+            "remote revoke --device must be device- followed by 32 lowercase hex digits".to_owned(),
+        ));
+    };
+    if encoded.len() != 32
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || encoded.bytes().all(|byte| byte == b'0')
+    {
+        return Err(CliError::Usage(
+            "remote revoke --device must be device- followed by 32 lowercase nonzero hex digits"
+                .to_owned(),
+        ));
+    }
+    Ok(DeviceHandle::new(value))
 }
 
 fn read_strict_json_file<T: serde::de::DeserializeOwned>(
@@ -380,7 +567,7 @@ mod tests {
     use super::*;
 
     fn fixture_payload(case_name: &str) -> serde_json::Value {
-        include_str!("../../protocol/agentdeck/fixtures/runtime-v3-wire.jsonl")
+        include_str!("../../protocol/agentdeck/fixtures/runtime-v4-wire.jsonl")
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("fixture JSON"))
             .find(|case| case["case"] == case_name)
@@ -510,6 +697,92 @@ mod tests {
         let uid = unsafe { libc::geteuid() };
         assert!(safe_input_metadata(&metadata, uid));
         assert!(!safe_input_metadata(&metadata, uid.saturating_add(1)));
+    }
+
+    #[test]
+    fn pairing_plans_validate_local_inputs_and_build_only_v4_admin_requests() {
+        let invite = RuntimeRemotePlan::create_pair_invite(
+            "workstation".to_owned(),
+            "pairing-invite-1".to_owned(),
+        )
+        .expect("valid pairing invite plan");
+        assert!(matches!(
+            invite.into_request().expect("create invite request"),
+            RuntimeRequest::CreatePairInvite(CreatePairInviteRequest {
+                display_name,
+                idempotency_key,
+                scope: LocalOnlyAdministration::LocalOnly,
+            }) if display_name == "workstation" && idempotency_key.as_str() == "pairing-invite-1"
+        ));
+        assert!(matches!(
+            RuntimeRemotePlan::pairing_pending()
+                .into_request()
+                .expect("pending request"),
+            RuntimeRequest::ListPendingPairings {
+                scope: LocalOnlyAdministration::LocalOnly
+            }
+        ));
+
+        let pairing_id = "11111111-1111-1111-1111-111111111111";
+        assert!(matches!(
+            RuntimeRemotePlan::pairing_approve(pairing_id.to_owned())
+                .expect("approve plan")
+                .into_request()
+                .expect("approve request"),
+            RuntimeRequest::ConfirmPairing { pairing_id: value, .. }
+                if value.as_str() == pairing_id
+        ));
+        assert!(matches!(
+            RuntimeRemotePlan::pairing_cancel(pairing_id.to_owned())
+                .expect("cancel plan")
+                .into_request()
+                .expect("cancel request"),
+            RuntimeRequest::CancelPairing { pairing_id: value, .. }
+                if value.as_str() == pairing_id
+        ));
+
+        assert!(RuntimeRemotePlan::create_pair_invite("\n".to_owned(), "key".to_owned()).is_err());
+        assert!(
+            RuntimeRemotePlan::create_pair_invite("machine".to_owned(), String::new()).is_err()
+        );
+        assert!(
+            RuntimeRemotePlan::pairing_approve("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA".to_owned())
+                .is_err()
+        );
+        assert!(RuntimeRemotePlan::pairing_cancel(uuid::Uuid::nil().to_string()).is_err());
+    }
+
+    #[test]
+    fn revoke_plan_requires_exact_device_handle_and_nonzero_serial() {
+        let handle = "device-11111111111111111111111111111111";
+        assert!(matches!(
+            RuntimeRemotePlan::revoke_device(handle.to_owned(), 7)
+                .expect("valid revoke plan")
+                .into_request()
+                .expect("revoke request"),
+            RuntimeRequest::Revoke(RevokeRequest {
+                target: RevokeTarget::Device {
+                    device,
+                    grant_serial,
+                    scope: LocalOnlyAdministration::LocalOnly,
+                }
+            }) if device.as_str() == handle && grant_serial == GrantSerial::new(7)
+        ));
+        assert!(RuntimeRemotePlan::revoke_device(handle.to_owned(), 0).is_err());
+        assert!(
+            RuntimeRemotePlan::revoke_device(
+                "device-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeRemotePlan::revoke_device(
+                "device-00000000000000000000000000000000".to_owned(),
+                1
+            )
+            .is_err()
+        );
     }
 
     #[test]

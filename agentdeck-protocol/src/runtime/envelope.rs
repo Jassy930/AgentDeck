@@ -1,9 +1,10 @@
-//! Runtime v3 顶层 envelope（design §8.2）。
+//! Runtime v4 顶层 envelope（design §8.2）。
 //!
 //! `RuntimeEnvelope` 是 UDS 与解密后远程链路的共同业务 wire。它把三类业务消息
 //! （请求/回复/流）统一封装；限制值（如单个 `RuntimeRequest` ≤ 1 MiB）在契约层
 //! 以具名常量 + 构造校验承载。
 
+use crate::e2ee::PairInviteV1;
 use crate::relay_v2::id::{MachineRouteId, RelayServerId};
 use crate::runtime::catalog::{CatalogDelta, CatalogSnapshot};
 use crate::runtime::command::{HelloParams, RuntimeRequest};
@@ -14,7 +15,7 @@ use crate::runtime::identity::{MessageId, PairingId};
 use crate::runtime::metadata::ConversationMetadataReceipt;
 use crate::runtime::receipt::{
     ApprovalReceipt, CancellationReceipt, CommandReceipt, CommandStatusReceipt,
-    ConversationStartReceipt, RevocationReceipt,
+    ConversationStartReceipt, PairingReceipt, RevocationReceipt,
 };
 use crate::runtime::sync::{
     BackfillChunk, ConversationSnapshot, RuntimeSyncComplete, SubscriptionReceipt,
@@ -48,7 +49,7 @@ pub fn ensure_request_within_limit(encoded_len: usize) -> Result<(), RuntimeSize
     Ok(())
 }
 
-/// Runtime v3 顶层封装。
+/// Runtime v4 顶层封装。
 ///
 /// 未派生 `PartialEq`：`RuntimeMessage` 传递内嵌未派生 `PartialEq` 的中立 trunk 类型；
 /// 本 task 不改动 trunk，契约测试以 wire round-trip 覆盖。
@@ -192,6 +193,8 @@ pub enum RuntimeReply {
     PairInvite(PairInvite),
     /// listPendingPairings 回执 —— local-only administration。
     PendingPairings { pairings: Vec<PendingPairing> },
+    /// confirmPairing/cancelPairing 的 canonical durable 回执。
+    Pairing(PairingReceipt),
     /// machine enrollment / status / trust-reset 的最小生命周期读回。
     MachineRemoteStatus(MachineRemoteStatus),
     /// 类型化业务失败。
@@ -208,15 +211,17 @@ pub enum RuntimeStreamItem {
     CatalogDelta(CatalogDelta),
     /// 大 live item 的 compact-binary 分片模型。
     TransferPart(TransferEnvelope),
+    /// 只允许 daemon 向 local-control UDS connection 投递的待确认配对事件。
+    PairingPending(PendingPairing),
 }
 
-/// createPairInvite 回执中的邀请引用（不含 P1.1 不涉及的 crypto secret/relay 材料）。
+/// createPairInvite 回执。完整 bearer invite 只经 same-UID UDS 返回，并继续由
+/// `PairInviteV1` 的 redacted Debug/strict wire 约束保护。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PairInvite {
     pub pairing_id: PairingId,
-    pub display_name: String,
-    pub expires_at_ms: u64,
+    pub invite: Box<PairInviteV1>,
 }
 
 /// 一个待本地确认的 pending pairing（local-only administration 列表项）。
@@ -224,9 +229,16 @@ pub struct PairInvite {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PendingPairing {
     pub pairing_id: PairingId,
-    /// 设备指纹；本地 UI 显示供用户确认（design §6.3）。
-    pub device_fingerprint: String,
+    /// 已冻结 PairRequest 的 SHA-256；绑定 pending/confirm/replay。
+    #[serde(with = "crate::relay_v2::id::b64_32")]
+    #[schemars(with = "String")]
+    pub request_hash: [u8; 32],
+    /// DeviceSign 公钥 fingerprint；本地 UI 显示供用户确认（design §6.3）。
+    #[serde(with = "crate::relay_v2::id::b64_32")]
+    #[schemars(with = "String")]
+    pub device_sign_fingerprint: [u8; 32],
     pub requested_at_ms: u64,
+    pub expires_at_ms: u64,
 }
 
 /// machine remote 生命周期；不携带任何 enrollment secret、证书或 purge proof。

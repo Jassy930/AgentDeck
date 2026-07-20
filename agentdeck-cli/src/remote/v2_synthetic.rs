@@ -577,6 +577,7 @@ fn e2ee_stream_blob(
         device_route: None,
         stream_route: Some(stream_route),
         request_route: None,
+        pair_route: None,
         stream_generation: Some(generation),
         stream_cursor: None,
         stream_seq: Some(0),

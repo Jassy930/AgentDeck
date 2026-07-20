@@ -1,4 +1,4 @@
-//! Runtime v3 canonical CLI facade。
+//! Runtime v4 canonical CLI facade。
 //!
 //! 本模块只接受 canonical conversation/command/event identity，并通过
 //! [`RuntimeUnixClient`] 与 shared daemon 通信。Legacy SessionStart/SessionContinue、
@@ -48,13 +48,13 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1024;
 pub fn validate_runtime_globals(profile: &str, data_dir: Option<&str>) -> Result<(), CliError> {
     if profile != "stable" {
         return Err(CliError::Usage(
-            "Runtime v3 commands only use the canonical stable shared-daemon namespace; --profile must be stable"
+            "Runtime v4 commands only use the canonical stable shared-daemon namespace; --profile must be stable"
                 .to_owned(),
         ));
     }
     if data_dir.is_some() {
         return Err(CliError::Usage(
-            "--data-dir is diagnostics-only and cannot override a Runtime v3 endpoint".to_owned(),
+            "--data-dir is diagnostics-only and cannot override a Runtime v4 endpoint".to_owned(),
         ));
     }
     Ok(())
@@ -645,6 +645,35 @@ pub async fn request_machine_remote_status(
         RuntimeReply::MachineRemoteStatus(status) => Ok(status),
         _ => Err(unexpected(
             "machine administration did not return MachineRemoteStatus",
+        )),
+    }
+}
+
+/// 执行一条 same-UID pairing administration 请求，只接受三种 v4 pairing reply。
+/// Runtime Failure 保留 daemon 稳定 code；任何 machine/business reply 均 fail-close。
+pub async fn request_pairing_administration(
+    client: &RuntimeUnixClient,
+    request: RuntimeRequest,
+) -> Result<RuntimeReply, CliError> {
+    match unary_reply(client, request).await? {
+        reply @ (RuntimeReply::PairInvite(_)
+        | RuntimeReply::PendingPairings { .. }
+        | RuntimeReply::Pairing(_)) => Ok(reply),
+        _ => Err(unexpected(
+            "pairing administration returned an unrelated Runtime reply",
+        )),
+    }
+}
+
+/// 执行一条 same-UID 精确设备撤销，只接受中立 `RevocationReceipt`。
+pub async fn request_revocation_administration(
+    client: &RuntimeUnixClient,
+    request: RuntimeRequest,
+) -> Result<agentdeck_protocol::runtime::RevocationReceipt, CliError> {
+    match unary_reply(client, request).await? {
+        RuntimeReply::Revocation(receipt) => Ok(receipt),
+        _ => Err(unexpected(
+            "revocation administration returned an unrelated Runtime reply",
         )),
     }
 }
