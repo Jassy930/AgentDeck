@@ -306,6 +306,11 @@ async fn fresh_store_is_ready_only_after_exact_schema_and_pragmas_read_back() {
             "native_projection_state",
             "publication_outbox",
             "publication_streams",
+            "remote_authorization_ledger",
+            "remote_control_outbox",
+            "remote_key_directory",
+            "remote_pairing_receipts",
+            "remote_pairings",
             "runtime_meta",
             "snapshots",
         ]

@@ -1,4 +1,4 @@
-//! Command configuration pin 的 current-v9 篡改测试支撑。
+//! Command configuration pin 的 current-v10 篡改测试支撑。
 //!
 //! 所有 SQLite 读取都发生在 tamper 前：先用 production `RuntimeKeyBundle`
 //! 解包密钥并自证现有 pin/runtime ledger token，随后只执行一次定向写入。
@@ -18,7 +18,7 @@ use agentdeckd::security::StorageKek;
 use rusqlite::{Connection, params};
 
 const COMMAND_PIN_METADATA_DOMAIN: &[u8] = b"command.configuration.pin.metadata.v1";
-const RUNTIME_LEDGER_DOMAIN_V9: &[u8] = b"runtime.meta.ledger.v9";
+const RUNTIME_LEDGER_DOMAIN_V10: &[u8] = b"runtime.meta.ledger.v10";
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,6 +138,22 @@ struct Ledger {
     admin_command_charged_bytes: u64,
     machine_identity_count: u64,
     machine_remote_state_count: u64,
+    remote_pairing_count: u64,
+    remote_pairing_sealed_bytes: u64,
+    remote_pairing_receipt_count: u64,
+    remote_pairing_receipt_bytes: u64,
+    remote_authorization_count: u64,
+    remote_authorization_preparing_count: u64,
+    remote_authorization_active_count: u64,
+    remote_authorization_revoking_count: u64,
+    remote_authorization_revoked_count: u64,
+    remote_authorization_sealed_bytes: u64,
+    remote_key_directory_count: u64,
+    remote_key_directory_sealed_bytes: u64,
+    remote_control_outbox_count: u64,
+    remote_control_outbox_pending_count: u64,
+    remote_control_outbox_acknowledged_count: u64,
+    remote_control_outbox_sealed_bytes: u64,
     accepted_count: u64,
     accepted_payload_bytes: u64,
     started_without_fence_count: u64,
@@ -196,7 +212,7 @@ impl VerifiedTamperContext {
         assert_eq!(
             ledger_token,
             ledger_metadata_token(&key_bundle, database_id, &ledger),
-            "test helper must reproduce the existing production v9 ledger token"
+            "test helper must reproduce the existing production v10 ledger token"
         );
 
         let mut statement = connection
@@ -455,7 +471,16 @@ fn read_ledger(connection: &Connection) -> (Ledger, Vec<u8>) {
                     native_metadata_effect_unreleased_count,
                     native_metadata_effect_released_count, admin_command_count,
                     admin_command_pending_count, admin_command_charged_bytes,
-                    machine_identity_count, machine_remote_state_count, metadata_token
+                    machine_identity_count, machine_remote_state_count,
+                    remote_pairing_count, remote_pairing_sealed_bytes,
+                    remote_pairing_receipt_count, remote_pairing_receipt_bytes,
+                    remote_authorization_count, remote_authorization_preparing_count,
+                    remote_authorization_active_count, remote_authorization_revoking_count,
+                    remote_authorization_revoked_count, remote_authorization_sealed_bytes,
+                    remote_key_directory_count, remote_key_directory_sealed_bytes,
+                    remote_control_outbox_count, remote_control_outbox_pending_count,
+                    remote_control_outbox_acknowledged_count,
+                    remote_control_outbox_sealed_bytes, metadata_token
              FROM runtime_meta WHERE singleton = 1",
             [],
             |row| {
@@ -506,12 +531,28 @@ fn read_ledger(connection: &Connection) -> (Ledger, Vec<u8>) {
                         admin_command_charged_bytes: nonnegative(row.get(42)?, 42)?,
                         machine_identity_count: nonnegative(row.get(43)?, 43)?,
                         machine_remote_state_count: nonnegative(row.get(44)?, 44)?,
+                        remote_pairing_count: nonnegative(row.get(45)?, 45)?,
+                        remote_pairing_sealed_bytes: nonnegative(row.get(46)?, 46)?,
+                        remote_pairing_receipt_count: nonnegative(row.get(47)?, 47)?,
+                        remote_pairing_receipt_bytes: nonnegative(row.get(48)?, 48)?,
+                        remote_authorization_count: nonnegative(row.get(49)?, 49)?,
+                        remote_authorization_preparing_count: nonnegative(row.get(50)?, 50)?,
+                        remote_authorization_active_count: nonnegative(row.get(51)?, 51)?,
+                        remote_authorization_revoking_count: nonnegative(row.get(52)?, 52)?,
+                        remote_authorization_revoked_count: nonnegative(row.get(53)?, 53)?,
+                        remote_authorization_sealed_bytes: nonnegative(row.get(54)?, 54)?,
+                        remote_key_directory_count: nonnegative(row.get(55)?, 55)?,
+                        remote_key_directory_sealed_bytes: nonnegative(row.get(56)?, 56)?,
+                        remote_control_outbox_count: nonnegative(row.get(57)?, 57)?,
+                        remote_control_outbox_pending_count: nonnegative(row.get(58)?, 58)?,
+                        remote_control_outbox_acknowledged_count: nonnegative(row.get(59)?, 59)?,
+                        remote_control_outbox_sealed_bytes: nonnegative(row.get(60)?, 60)?,
                     },
-                    row.get(45)?,
+                    row.get(61)?,
                 ))
             },
         )
-        .expect("read current-v9 authenticated runtime ledger")
+        .expect("read current-v10 authenticated runtime ledger")
 }
 
 fn nonnegative(value: i64, column: usize) -> rusqlite::Result<u64> {
@@ -523,7 +564,7 @@ fn ledger_metadata_token(
     database_id: [u8; 16],
     ledger: &Ledger,
 ) -> Vec<u8> {
-    let mut message = Vec::with_capacity(400);
+    let mut message = Vec::with_capacity(528);
     message.extend_from_slice(&database_id);
     encode_optional_sequence(&mut message, ledger.catalog_high_water.as_deref());
     for value in [
@@ -586,9 +627,29 @@ fn ledger_metadata_token(
     }
     message.extend_from_slice(&ledger.machine_identity_count.to_be_bytes());
     message.extend_from_slice(&ledger.machine_remote_state_count.to_be_bytes());
+    for value in [
+        ledger.remote_pairing_count,
+        ledger.remote_pairing_sealed_bytes,
+        ledger.remote_pairing_receipt_count,
+        ledger.remote_pairing_receipt_bytes,
+        ledger.remote_authorization_count,
+        ledger.remote_authorization_preparing_count,
+        ledger.remote_authorization_active_count,
+        ledger.remote_authorization_revoking_count,
+        ledger.remote_authorization_revoked_count,
+        ledger.remote_authorization_sealed_bytes,
+        ledger.remote_key_directory_count,
+        ledger.remote_key_directory_sealed_bytes,
+        ledger.remote_control_outbox_count,
+        ledger.remote_control_outbox_pending_count,
+        ledger.remote_control_outbox_acknowledged_count,
+        ledger.remote_control_outbox_sealed_bytes,
+    ] {
+        message.extend_from_slice(&value.to_be_bytes());
+    }
     key_bundle
-        .blind_index(RUNTIME_LEDGER_DOMAIN_V9, &message)
-        .expect("compute current-v9 runtime ledger token")
+        .blind_index(RUNTIME_LEDGER_DOMAIN_V10, &message)
+        .expect("compute current-v10 runtime ledger token")
         .as_bytes()
         .to_vec()
 }

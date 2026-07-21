@@ -18,6 +18,8 @@ use agentdeck_protocol::runtime::{
     MachineRootFingerprint, RevocationReceipt, TrustResetRequest, UninstallPurgePlanV1,
 };
 use async_trait::async_trait;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio::sync::{Mutex, watch};
 
 use crate::config::DaemonConfig;
@@ -47,6 +49,8 @@ use super::config::{
     EnrollmentConfigError, ValidatedEnrollmentConfig, validate_sealed_relay_connection,
 };
 use super::enrollment::{FrozenMachineEnrollment, MachineEnrollmentError};
+#[cfg(test)]
+use super::pairing::await_pairing_startup;
 use super::pairing::{
     PairingCoordinatorHandle, PairingCoordinatorOwner, PairingDrainStartError,
     PairingInviteContext, unavailable as pairing_unavailable,
@@ -259,7 +263,16 @@ pub struct RemoteManager {
     pairing_pending_sink: OnceLock<Arc<dyn PairingPendingSink>>,
     shutdown_tx: watch::Sender<bool>,
     trust_reset_singleflight: Mutex<()>,
+    #[cfg(test)]
+    pairing_startup_for_test: Mutex<Option<PairingStartupTestHook>>,
     state: Mutex<RemoteManagerState>,
+}
+
+#[cfg(test)]
+struct PairingStartupTestHook {
+    owner: PairingCoordinatorOwner,
+    ready_rx: oneshot::Receiver<Result<(), PairingAdministrationError>>,
+    entered_tx: oneshot::Sender<()>,
 }
 
 struct RemoteManagerState {
@@ -309,6 +322,8 @@ impl RemoteManager {
             pairing_pending_sink: OnceLock::new(),
             shutdown_tx: watch::channel(false).0,
             trust_reset_singleflight: Mutex::new(()),
+            #[cfg(test)]
+            pairing_startup_for_test: Mutex::new(None),
             state: Mutex::new(RemoteManagerState {
                 enabled,
                 armed: false,
@@ -344,6 +359,21 @@ impl RemoteManager {
         self
     }
 
+    #[cfg(test)]
+    async fn install_pairing_startup_test_hook(
+        &self,
+        owner: PairingCoordinatorOwner,
+        ready_rx: oneshot::Receiver<Result<(), PairingAdministrationError>>,
+    ) -> oneshot::Receiver<()> {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        *self.pairing_startup_for_test.lock().await = Some(PairingStartupTestHook {
+            owner,
+            ready_rx,
+            entered_tx,
+        });
+        entered_rx
+    }
+
     /// 唯一启动边界。调用前 manager 的 network side effect 恒为零。
     /// remote 恢复失败只形成 blocked status，不影响已绑定的 local listener。
     pub async fn arm(&self, permit: RemoteStartPermit) -> Result<(), RemoteAdministrationError> {
@@ -366,8 +396,22 @@ impl RemoteManager {
                 return Err(error);
             }
         };
+        #[cfg(test)]
+        let pairing_startup_for_test = self.pairing_startup_for_test.lock().await.take();
+        #[cfg(test)]
+        if let Some(mut hook) = pairing_startup_for_test {
+            let _ = hook.entered_tx.send(());
+            let ready =
+                await_pairing_startup(&mut hook.owner, hook.ready_rx, self.shutdown_tx.subscribe())
+                    .await;
+            state.pairing = Some(hook.owner);
+            state.blocked_code = None;
+            return ready.map_err(|error| admin_error(error.code()));
+        }
         if let Err(error) = self.resume_on_startup(&mut state).await {
-            state.blocked_code = Some(error.code().to_owned());
+            // pairing health 由 owner watch 动态提供；不能把一次 startup local/transport
+            // 错误复制成永久 blocked_code，否则 actor 自愈后 status 仍会卡在 Blocked。
+            state.blocked_code = state.pairing.is_none().then(|| error.code().to_owned());
             return Err(error);
         }
         Ok(())
@@ -577,6 +621,11 @@ impl RemoteManager {
                 | MachineEnrollmentState::PurgeReadbackAbsent(_),
             ) => return Err(admin_error(REMOTE_STATE_CONFLICT)),
         }
+        require_pairing_owner_after_enroll(
+            state.transport.is_some(),
+            state.pairing.is_some(),
+            state.blocked_code.as_deref(),
+        )?;
         state.blocked_code = None;
         self.status_locked(state).await
     }
@@ -973,7 +1022,7 @@ impl RemoteManager {
                         Ok(())
                     }
                     Err(error) => {
-                        state.blocked_code = Some(error.code().to_owned());
+                        record_pairing_start_failure(state, &error);
                         Err(error)
                     }
                 }
@@ -1017,7 +1066,7 @@ impl RemoteManager {
                         Ok(())
                     }
                     Err(error) => {
-                        state.blocked_code = Some(error.code().to_owned());
+                        record_pairing_start_failure(state, &error);
                         Err(error)
                     }
                 }
@@ -1065,6 +1114,7 @@ impl RemoteManager {
             invite_anchor,
             invite_context,
             pending_sink,
+            self.shutdown_tx.subscribe(),
         )
         .await;
         state.pairing = Some(owner);
@@ -1112,6 +1162,12 @@ impl RemoteManager {
             .transport
             .as_ref()
             .and_then(RemoteTransport::observed_failure_code)
+            .or_else(|| {
+                state
+                    .pairing
+                    .as_ref()
+                    .and_then(PairingCoordinatorOwner::observed_failure_code)
+            })
             .or_else(|| state.blocked_code.clone());
         if !enabled || !self.config.remote_enabled() {
             return Err(admin_error(REMOTE_DISABLED));
@@ -1263,11 +1319,11 @@ impl PairingAdministration for RemoteManager {
             let state = self.state.lock().await;
             require_running_armed(&state)
                 .map_err(|error| PairingAdministrationError::new(error.code()))?;
-            state
-                .pairing
-                .as_ref()
-                .map(PairingCoordinatorOwner::handle)
-                .ok_or_else(pairing_unavailable)?
+            let pairing = state.pairing.as_ref().ok_or_else(pairing_unavailable)?;
+            if let Some(code) = pairing.local_blocked_code() {
+                return Err(PairingAdministrationError::new(code));
+            }
+            pairing.handle()
         };
         // 不持 manager mutex 等 Store/Relay ACK，避免阻塞 status/shutdown/reset。
         handle.create(owner, request).await
@@ -1280,8 +1336,9 @@ impl PairingAdministration for RemoteManager {
             let state = self.state.lock().await;
             require_running_armed(&state)
                 .map_err(|error| PairingAdministrationError::new(error.code()))?;
-            if state.pairing.is_none() {
-                return Err(pairing_unavailable());
+            let pairing = state.pairing.as_ref().ok_or_else(pairing_unavailable)?;
+            if let Some(code) = pairing.local_blocked_code() {
+                return Err(PairingAdministrationError::new(code));
             }
             self.store.clone()
         };
@@ -1300,11 +1357,11 @@ impl PairingAdministration for RemoteManager {
             let state = self.state.lock().await;
             require_running_armed(&state)
                 .map_err(|error| PairingAdministrationError::new(error.code()))?;
-            state
-                .pairing
-                .as_ref()
-                .map(PairingCoordinatorOwner::handle)
-                .ok_or_else(pairing_unavailable)?
+            let pairing = state.pairing.as_ref().ok_or_else(pairing_unavailable)?;
+            if let Some(code) = pairing.local_blocked_code() {
+                return Err(PairingAdministrationError::new(code));
+            }
+            pairing.handle()
         };
         // Grant freeze、Store CAS 与 InstallGrant send 均不得占用 manager mutex。
         handle.confirm(pairing_id).await
@@ -1318,11 +1375,11 @@ impl PairingAdministration for RemoteManager {
             let state = self.state.lock().await;
             require_running_armed(&state)
                 .map_err(|error| PairingAdministrationError::new(error.code()))?;
-            state
-                .pairing
-                .as_ref()
-                .map(PairingCoordinatorOwner::handle)
-                .ok_or_else(pairing_unavailable)?
+            let pairing = state.pairing.as_ref().ok_or_else(pairing_unavailable)?;
+            if let Some(code) = pairing.local_blocked_code() {
+                return Err(PairingAdministrationError::new(code));
+            }
+            pairing.handle()
         };
         // Store CAS 与 Close send 均不得占用 manager mutex。
         handle.cancel(pairing_id).await
@@ -1343,6 +1400,13 @@ impl RevocationAdministration for RemoteManager {
             let handle = state.pairing.as_ref().map(PairingCoordinatorOwner::handle);
             #[cfg(test)]
             let handle = state.pairing_handle_for_test.clone().or(handle);
+            if let Some(code) = state
+                .pairing
+                .as_ref()
+                .and_then(PairingCoordinatorOwner::local_blocked_code)
+            {
+                return Err(RevocationAdministrationError::new(code));
+            }
             handle.ok_or_else(|| {
                 RevocationAdministrationError::new("daemon.revocation.administration.unavailable")
             })?
@@ -1356,9 +1420,30 @@ impl RevocationAdministration for RemoteManager {
 }
 
 async fn stop_pairing_actor(state: &mut RemoteManagerState) {
-    if let Some(mut pairing) = state.pairing.take() {
+    if let Some(pairing) = state.pairing.as_mut() {
         pairing.shutdown().await;
     }
+    state.pairing.take();
+}
+
+fn record_pairing_start_failure(state: &mut RemoteManagerState, error: &RemoteAdministrationError) {
+    // owner 存在时 health watch 是暂态真源；owner 尚未建立时必须保留稳定 block，
+    // 否则 transport 已占有 permit、pairing 又 unavailable，status 却会误报 Active。
+    state.blocked_code = state.pairing.is_none().then(|| error.code().to_owned());
+}
+
+fn require_pairing_owner_after_enroll(
+    transport_present: bool,
+    pairing_present: bool,
+    blocked_code: Option<&str>,
+) -> Result<(), RemoteAdministrationError> {
+    if transport_present && !pairing_present {
+        let code = blocked_code
+            .map(str::to_owned)
+            .unwrap_or_else(|| pairing_unavailable().code().to_owned());
+        return Err(admin_error(code));
+    }
+    Ok(())
 }
 
 fn require_running_armed(state: &RemoteManagerState) -> Result<(), RemoteAdministrationError> {

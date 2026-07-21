@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use tokio::sync::Notify;
+
 use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
 use agentdeck_crypto::{
     HpkePublicKey, SigningKey, open_pair_response, seal_pair_request, seal_pair_response_received,
@@ -118,6 +120,17 @@ struct FakeStore {
     receipt_purge_calls: AtomicUsize,
     recovery_calls: AtomicUsize,
     fail_receipt_purge: AtomicBool,
+    receipt_purge_failure_code: StdMutex<Option<&'static str>>,
+    pending_receipt_purge: AtomicBool,
+    receipt_purge_entered: Notify,
+    receipt_purge_release: Notify,
+    receipt_purge_future_dropped: AtomicBool,
+    block_next_receipt_purge_failure: AtomicBool,
+    blocked_receipt_purge_entered: Notify,
+    blocked_receipt_purge_release: Notify,
+    pending_prepare: AtomicBool,
+    prepare_entered: Notify,
+    prepare_future_dropped: AtomicBool,
     fail_confirm: AtomicBool,
     commit_unknown_readback: AtomicBool,
     fail_grant_ack_before_commit: AtomicBool,
@@ -140,6 +153,17 @@ impl FakeStore {
             receipt_purge_calls: AtomicUsize::new(0),
             recovery_calls: AtomicUsize::new(0),
             fail_receipt_purge: AtomicBool::new(false),
+            receipt_purge_failure_code: StdMutex::new(None),
+            pending_receipt_purge: AtomicBool::new(false),
+            receipt_purge_entered: Notify::new(),
+            receipt_purge_release: Notify::new(),
+            receipt_purge_future_dropped: AtomicBool::new(false),
+            block_next_receipt_purge_failure: AtomicBool::new(false),
+            blocked_receipt_purge_entered: Notify::new(),
+            blocked_receipt_purge_release: Notify::new(),
+            pending_prepare: AtomicBool::new(false),
+            prepare_entered: Notify::new(),
+            prepare_future_dropped: AtomicBool::new(false),
             fail_confirm: AtomicBool::new(false),
             commit_unknown_readback: AtomicBool::new(false),
             fail_grant_ack_before_commit: AtomicBool::new(false),
@@ -169,6 +193,59 @@ impl FakeStore {
 
     fn fail_receipt_purge(&self, value: bool) {
         self.fail_receipt_purge.store(value, Ordering::SeqCst);
+        if !value {
+            *self.receipt_purge_failure_code.lock().unwrap() = None;
+        }
+    }
+
+    fn fail_receipt_purge_with(&self, code: &'static str) {
+        *self.receipt_purge_failure_code.lock().unwrap() = Some(code);
+        self.fail_receipt_purge.store(true, Ordering::SeqCst);
+    }
+
+    fn pend_receipt_purge(&self) {
+        self.pending_receipt_purge.store(true, Ordering::SeqCst);
+    }
+
+    fn release_pending_receipt_purge(&self) {
+        self.pending_receipt_purge.store(false, Ordering::SeqCst);
+        self.receipt_purge_release.notify_one();
+    }
+
+    async fn wait_for_receipt_purge(&self) {
+        if self.receipt_purge_calls() == 0 {
+            self.receipt_purge_entered.notified().await;
+        }
+    }
+
+    fn receipt_purge_future_dropped(&self) -> bool {
+        self.receipt_purge_future_dropped.load(Ordering::SeqCst)
+    }
+
+    fn block_next_receipt_purge_failure(&self, code: &'static str) {
+        *self.receipt_purge_failure_code.lock().unwrap() = Some(code);
+        self.block_next_receipt_purge_failure
+            .store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_for_blocked_receipt_purge(&self) {
+        self.blocked_receipt_purge_entered.notified().await;
+    }
+
+    fn release_blocked_receipt_purge(&self) {
+        self.blocked_receipt_purge_release.notify_one();
+    }
+
+    fn pend_prepare(&self) {
+        self.pending_prepare.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_for_prepare(&self) {
+        self.prepare_entered.notified().await;
+    }
+
+    fn prepare_future_dropped(&self) -> bool {
+        self.prepare_future_dropped.load(Ordering::SeqCst)
     }
 
     fn commit_unknown_readback(&self, value: bool) {
@@ -433,6 +510,19 @@ impl PairingStore for FakeStore {
         canonical_invite: SecretBytes,
         invite_hpke_private_key: SecretBytes,
     ) -> Result<DurableInvite, PairingAdministrationError> {
+        if self.pending_prepare.load(Ordering::SeqCst) {
+            struct PendingCallDrop<'a>(&'a AtomicBool);
+
+            impl Drop for PendingCallDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+
+            let _drop = PendingCallDrop(&self.prepare_future_dropped);
+            self.prepare_entered.notify_one();
+            return std::future::pending().await;
+        }
         let invite = PairInviteV1::from_canonical_bytes(canonical_invite.expose_secret())
             .map_err(|_| pairing_error(PAIRING_INVITE_INVALID))?;
         let private = HpkePrivateKey::from_bytes(invite_hpke_private_key.expose_secret())
@@ -1334,8 +1424,40 @@ impl PairingStore for FakeStore {
 
     async fn purge_expired_receipts(&self) -> Result<bool, PairingAdministrationError> {
         self.receipt_purge_calls.fetch_add(1, Ordering::SeqCst);
+        if self
+            .block_next_receipt_purge_failure
+            .swap(false, Ordering::SeqCst)
+        {
+            self.blocked_receipt_purge_entered.notify_one();
+            self.blocked_receipt_purge_release.notified().await;
+            let code = self
+                .receipt_purge_failure_code
+                .lock()
+                .unwrap()
+                .unwrap_or("daemon.runtime.store_unavailable");
+            return Err(pairing_error(code));
+        }
+        if self.pending_receipt_purge.load(Ordering::SeqCst) {
+            struct PendingCallDrop<'a>(&'a AtomicBool);
+
+            impl Drop for PendingCallDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+
+            let _drop = PendingCallDrop(&self.receipt_purge_future_dropped);
+            self.receipt_purge_entered.notify_waiters();
+            self.receipt_purge_release.notified().await;
+            return Ok(false);
+        }
         if self.fail_receipt_purge.load(Ordering::SeqCst) {
-            return Err(pairing_error("daemon.runtime.store_unavailable"));
+            let code = self
+                .receipt_purge_failure_code
+                .lock()
+                .unwrap()
+                .unwrap_or("daemon.runtime.store_unavailable");
+            return Err(pairing_error(code));
         }
         Ok(false)
     }
@@ -1675,6 +1797,7 @@ struct TestActor {
     handle: PairingCoordinatorHandle,
     cancel_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
+    health_rx: watch::Receiver<PairingCoordinatorHealth>,
     event_tx: mpsc::UnboundedSender<Result<PairingTransportEvent, PairingAdministrationError>>,
     sent_rx: mpsc::UnboundedReceiver<OpenPairRoute>,
     sent_data_rx: mpsc::UnboundedReceiver<PairData>,
@@ -1728,6 +1851,11 @@ async fn spawn_production_drain_actor(
     let (command_tx, command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = oneshot::channel();
+    let (health_tx, health_rx) = watch::channel(PairingCoordinatorHealth::Starting);
+    let (admission_tx, admission_rx) = watch::channel(PairingAdmissionFence {
+        epoch: 0,
+        failure_code: None,
+    });
     let actor = PairingCoordinator::new_for_test(
         store,
         Box::new(ProductionPairingLane(lane)),
@@ -1741,6 +1869,10 @@ async fn spawn_production_drain_actor(
         }),
         test_invite_context(),
         Arc::new(FakePendingSink::default()),
+        PairingCoordinatorSignals {
+            health_tx,
+            admission_tx: admission_tx.clone(),
+        },
     );
     let task = tokio::spawn(actor.run(command_rx, cancel_rx, ready_tx));
     ready_rx
@@ -1748,7 +1880,12 @@ async fn spawn_production_drain_actor(
         .expect("production-lane actor reports startup")
         .expect("empty production-lane actor starts");
     ProductionDrainActor {
-        handle: PairingCoordinatorHandle { command_tx },
+        handle: PairingCoordinatorHandle {
+            command_tx,
+            health_rx,
+            admission_rx,
+            _admission_tx: admission_tx.clone(),
+        },
         cancel_tx,
         task,
     }
@@ -1800,6 +1937,11 @@ async fn spawn_actor_with_startup_send_failure(
     let (command_tx, command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = oneshot::channel();
+    let (health_tx, health_rx) = watch::channel(PairingCoordinatorHealth::Starting);
+    let (admission_tx, admission_rx) = watch::channel(PairingAdmissionFence {
+        epoch: 0,
+        failure_code: None,
+    });
     let actor = PairingCoordinator::new_for_test(
         store,
         Box::new(lane),
@@ -1816,14 +1958,24 @@ async fn spawn_actor_with_startup_send_failure(
             published: Arc::clone(&published),
             fail: Arc::clone(&sink_fail),
         }),
+        PairingCoordinatorSignals {
+            health_tx,
+            admission_tx: admission_tx.clone(),
+        },
     );
     let task = tokio::spawn(actor.run(command_rx, cancel_rx, ready_tx));
     let ready = ready_rx.await.unwrap();
     (
         TestActor {
-            handle: PairingCoordinatorHandle { command_tx },
+            handle: PairingCoordinatorHandle {
+                command_tx,
+                health_rx: health_rx.clone(),
+                admission_rx,
+                _admission_tx: admission_tx.clone(),
+            },
             cancel_tx,
             task,
+            health_rx,
             event_tx,
             sent_rx,
             sent_data_rx,
@@ -1844,6 +1996,95 @@ async fn spawn_actor_with_startup_send_failure(
             sink_fail,
         },
         ready,
+    )
+}
+
+struct OwnerTestLane;
+
+#[async_trait]
+impl PairingLane for OwnerTestLane {
+    async fn send_open(&self, _frame: OpenPairRoute) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn send_data(&self, _frame: PairData) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn send_install(&self, _frame: InstallGrant) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn send_revoke(&self, _frame: RevokeDevice) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn send_close(&self, _frame: ClosePairRoute) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn reconnect(&self) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    fn yield_shared_control(&mut self) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn next_event(
+        &mut self,
+    ) -> Result<Option<PairingTransportEvent>, PairingAdministrationError> {
+        std::future::pending().await
+    }
+}
+
+fn test_owner(
+    store: Arc<FakeStore>,
+) -> (
+    PairingCoordinatorOwner,
+    oneshot::Receiver<Result<(), PairingAdministrationError>>,
+) {
+    let (command_tx, command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (health_tx, health_rx) = watch::channel(PairingCoordinatorHealth::Starting);
+    let (admission_tx, admission_rx) = watch::channel(PairingAdmissionFence {
+        epoch: 0,
+        failure_code: None,
+    });
+    let actor = PairingCoordinator::new_for_test(
+        store,
+        Box::new(OwnerTestLane),
+        Box::new(FakeAuthority {
+            seals: Arc::new(AtomicUsize::new(0)),
+            grant_freezes: Arc::new(AtomicUsize::new(0)),
+            grant_axes: Arc::new(StdMutex::new(Vec::new())),
+            fail_grant_freeze: Arc::new(AtomicBool::new(false)),
+            revocation_freezes: Arc::new(AtomicUsize::new(0)),
+            fail_revocation_freeze: Arc::new(AtomicBool::new(false)),
+        }),
+        test_invite_context(),
+        Arc::new(FakePendingSink::default()),
+        PairingCoordinatorSignals {
+            health_tx,
+            admission_tx: admission_tx.clone(),
+        },
+    );
+    let task = tokio::spawn(actor.run(command_rx, cancel_rx, ready_tx));
+    (
+        PairingCoordinatorOwner {
+            handle: PairingCoordinatorHandle {
+                command_tx,
+                health_rx: health_rx.clone(),
+                admission_rx,
+                _admission_tx: admission_tx.clone(),
+            },
+            cancel_tx,
+            task: Some(task),
+            health_rx,
+            shutdown_deadline: None,
+        },
+        ready_rx,
     )
 }
 
@@ -1898,6 +2139,11 @@ async fn spawn_store_backed_actor(
     let (command_tx, command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = oneshot::channel();
+    let (health_tx, health_rx) = watch::channel(PairingCoordinatorHealth::Starting);
+    let (admission_tx, admission_rx) = watch::channel(PairingAdmissionFence {
+        epoch: 0,
+        failure_code: None,
+    });
     let actor = PairingCoordinator::new_for_test(
         Arc::new(ProductionPairingStore(store)),
         Box::new(lane),
@@ -1911,6 +2157,10 @@ async fn spawn_store_backed_actor(
             published: Arc::clone(&published),
             fail: Arc::clone(&sink_fail),
         }),
+        PairingCoordinatorSignals {
+            health_tx,
+            admission_tx: admission_tx.clone(),
+        },
     );
     let task = tokio::spawn(actor.run(command_rx, cancel_rx, ready_tx));
     tokio::time::timeout(Duration::from_secs(5), ready_rx)
@@ -1919,9 +2169,15 @@ async fn spawn_store_backed_actor(
         .expect("store-backed actor startup channel must remain open")
         .expect("store-backed actor startup must succeed");
     TestActor {
-        handle: PairingCoordinatorHandle { command_tx },
+        handle: PairingCoordinatorHandle {
+            command_tx,
+            health_rx: health_rx.clone(),
+            admission_rx,
+            _admission_tx: admission_tx.clone(),
+        },
         cancel_tx,
         task,
+        health_rx,
         event_tx,
         sent_rx,
         sent_data_rx,
@@ -2753,6 +3009,89 @@ fn startup_ready_only_recovers_transport_and_relay_failures() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn owner_shutdown_reuses_absolute_deadline_and_joins_aborted_pending_store_actor() {
+    let store = Arc::new(FakeStore::default());
+    let (mut coordinator_owner, ready_rx) = test_owner(Arc::clone(&store));
+    ready_rx
+        .await
+        .expect("owner actor reports startup")
+        .expect("owner actor reaches Healthy before command");
+    assert_eq!(
+        *coordinator_owner.health_rx.borrow(),
+        PairingCoordinatorHealth::Healthy
+    );
+
+    store.pend_prepare();
+    let handle = coordinator_owner.handle();
+    let command = tokio::spawn(async move {
+        handle
+            .create(owner(), request("pending-store-shutdown"))
+            .await
+    });
+    store.wait_for_prepare().await;
+
+    let mut first_shutdown = Box::pin(coordinator_owner.shutdown());
+    tokio::select! {
+        biased;
+        () = &mut first_shutdown => panic!("pending Store handler must cross the first poll"),
+        () = tokio::task::yield_now() => {}
+    }
+    tokio::time::advance(PAIRING_ACTOR_SHUTDOWN_DEADLINE / 2).await;
+    drop(first_shutdown);
+    assert!(
+        coordinator_owner.task.is_some(),
+        "canceled shutdown must retain the JoinHandle"
+    );
+
+    let mut resumed_shutdown = Box::pin(coordinator_owner.shutdown());
+    tokio::select! {
+        biased;
+        () = &mut resumed_shutdown => panic!("absolute deadline has not elapsed yet"),
+        () = tokio::task::yield_now() => {}
+    }
+    tokio::time::advance(PAIRING_ACTOR_SHUTDOWN_DEADLINE / 2 + Duration::from_millis(1)).await;
+    resumed_shutdown.await;
+
+    assert!(
+        coordinator_owner.task.is_none(),
+        "abort must still be followed by a join"
+    );
+    assert!(
+        store.prepare_future_dropped(),
+        "joined actor must drop the pending Store future"
+    );
+    assert_eq!(
+        command
+            .await
+            .expect("pending command caller joins")
+            .expect_err("aborted actor fails the pending caller")
+            .code(),
+        PAIRING_STOPPED
+    );
+}
+
+#[tokio::test]
+async fn startup_ready_wait_is_canceled_before_manager_can_acquire_owner() {
+    let store = Arc::new(FakeStore::default());
+    store.pend_receipt_purge();
+    let (mut owner, ready_rx) = test_owner(Arc::clone(&store));
+    store.wait_for_receipt_purge().await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    shutdown_tx.send_replace(true);
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        await_pairing_startup(&mut owner, ready_rx, shutdown_rx),
+    )
+    .await
+    .expect("startup cancellation must be bounded")
+    .expect_err("shutdown must fail startup closed");
+    assert_eq!(error.code(), PAIRING_STOPPED);
+    assert!(owner.task.is_none(), "partial startup owner must be joined");
+    assert!(store.receipt_purge_future_dropped());
+}
+
 #[tokio::test]
 async fn receipt_retention_purge_failure_blocks_startup_before_recovery() {
     let store = Arc::new(FakeStore::default());
@@ -2768,6 +3107,160 @@ async fn receipt_retention_purge_failure_blocks_startup_before_recovery() {
     );
     assert_eq!(store.receipt_purge_calls(), 1);
     assert_eq!(store.recovery_calls(), 0);
+    actor.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn persistent_local_purge_failure_retries_without_recovery_reconnect_or_network() {
+    let store = Arc::new(FakeStore::default());
+    store.fail_receipt_purge_with("daemon.runtime.store_busy");
+    let (mut actor, ready) = spawn_actor_with_startup_send_failure(Arc::clone(&store), None).await;
+
+    assert_eq!(ready.unwrap_err().code(), "daemon.runtime.store_busy");
+    assert!(matches!(
+        &*actor.health_rx.borrow_and_update(),
+        PairingCoordinatorHealth::LocalBlocked(code) if code == "daemon.runtime.store_busy"
+    ));
+    tokio::time::advance(Duration::from_millis(1_100)).await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(store.receipt_purge_calls() >= 2);
+    assert_eq!(
+        store.recovery_calls(),
+        0,
+        "failed purge must fence recovery"
+    );
+    assert_eq!(actor.reconnects.load(Ordering::SeqCst), 0);
+    assert!(actor.sent_rx.try_recv().is_err());
+    assert!(actor.sent_data_rx.try_recv().is_err());
+    assert!(actor.sent_grant_rx.try_recv().is_err());
+    assert!(actor.sent_revoke_rx.try_recv().is_err());
+    assert!(actor.sent_close_rx.try_recv().is_err());
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(100),
+        actor.handle.create(owner(), request("local-blocked")),
+    )
+    .await
+    .expect("local block must reject commands within a fixed bound")
+    .unwrap_err();
+    assert_eq!(error.code(), "daemon.runtime.store_busy");
+    assert_eq!(store.count(), 0, "blocked command must not mutate Store");
+    assert_eq!(actor.reconnects.load(Ordering::SeqCst), 0);
+    actor.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_healthy_command_is_fenced_before_pending_local_recovery_and_never_executes() {
+    let store = Arc::new(FakeStore::default());
+    let mut actor = spawn_actor(Arc::clone(&store)).await;
+    store.block_next_receipt_purge_failure("daemon.runtime.store_busy");
+    tokio::time::advance(EXPIRY_RECONCILE_INTERVAL).await;
+    store.wait_for_blocked_receipt_purge().await;
+
+    let initial_capacity = actor.handle.command_tx.capacity();
+    let handle = actor.handle.clone();
+    let command = tokio::spawn(async move {
+        handle
+            .create(owner(), request("healthy-check-then-local-block"))
+            .await
+    });
+    for _ in 0..16 {
+        if actor.handle.command_tx.capacity() < initial_capacity {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        actor.handle.command_tx.capacity() < initial_capacity,
+        "command must be queued while the actor still reports Healthy"
+    );
+
+    store.pend_receipt_purge();
+    store.release_blocked_receipt_purge();
+    let error = tokio::time::timeout(Duration::from_millis(100), command)
+        .await
+        .expect("LocalBlocked fence must bound an already queued command")
+        .expect("queued command task joins")
+        .expect_err("queued stale command must fail closed");
+    assert_eq!(error.code(), "daemon.runtime.store_busy");
+    assert_eq!(store.count(), 0);
+    assert_eq!(actor.reconnects.load(Ordering::SeqCst), 0);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while store.receipt_purge_calls() < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("local retry must enter the next pending purge");
+    assert!(matches!(
+        &*actor.health_rx.borrow_and_update(),
+        PairingCoordinatorHealth::LocalBlocked(code) if code == "daemon.runtime.store_busy"
+    ));
+
+    store.release_pending_receipt_purge();
+    tokio::time::timeout(Duration::from_secs(1), actor.health_rx.changed())
+        .await
+        .expect("released local recovery must publish health")
+        .expect("health actor remains alive");
+    assert_eq!(
+        *actor.health_rx.borrow_and_update(),
+        PairingCoordinatorHealth::Healthy
+    );
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        store.count(),
+        0,
+        "stale command must not execute after recovery"
+    );
+    assert_eq!(actor.reconnects.load(Ordering::SeqCst), 0);
+    actor.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn transient_local_store_busy_runs_full_purge_then_recovery_and_clears_health() {
+    let store = Arc::new(FakeStore::default());
+    store.fail_receipt_purge_with("daemon.runtime.store_busy");
+    let (mut actor, ready) = spawn_actor_with_startup_send_failure(Arc::clone(&store), None).await;
+    assert_eq!(ready.unwrap_err().code(), "daemon.runtime.store_busy");
+    assert!(matches!(
+        &*actor.health_rx.borrow_and_update(),
+        PairingCoordinatorHealth::LocalBlocked(code) if code == "daemon.runtime.store_busy"
+    ));
+
+    let purge_calls_before_recovery = store.receipt_purge_calls();
+    store.fail_receipt_purge(false);
+    tokio::time::advance(RECONNECT_RETRY_DELAY).await;
+    tokio::time::timeout(Duration::from_secs(1), actor.health_rx.changed())
+        .await
+        .expect("local retry must publish recovered health")
+        .expect("health owner remains alive");
+    assert_eq!(
+        *actor.health_rx.borrow_and_update(),
+        PairingCoordinatorHealth::Healthy
+    );
+    assert!(
+        store.receipt_purge_calls() > purge_calls_before_recovery,
+        "local retry must re-enter purge before recovery"
+    );
+    assert_eq!(store.recovery_calls(), 1);
+    assert_eq!(actor.reconnects.load(Ordering::SeqCst), 0);
+
+    let handle = actor.handle.clone();
+    let create =
+        tokio::spawn(async move { handle.create(owner(), request("after-local-retry")).await });
+    let open = actor
+        .sent_rx
+        .recv()
+        .await
+        .expect("healthy actor sends OpenPairRoute");
+    actor.event_tx.send(Ok(opened(&open))).unwrap();
+    create.await.unwrap().unwrap();
     actor.stop().await;
 }
 
@@ -3095,7 +3588,11 @@ async fn running_drain_waiter_cap_is_non_resumable_until_completed_resume() {
         actor
             .handle
             .command_tx
-            .try_send(PairingCommand::BeginDrain { reply })
+            .try_send(
+                actor
+                    .handle
+                    .envelope(0, PairingCommand::BeginDrain { reply }),
+            )
             .expect("enqueue active drain waiter");
         drain_replies.push(result);
     }
@@ -3492,12 +3989,12 @@ async fn mixed_committed_delivered_and_standalone_authorizations_drain_serially(
 #[tokio::test]
 async fn failed_drain_resume_waits_for_capacity_and_only_closed_channel_stops_it() {
     let (command_tx, mut command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
-    let handle = PairingCoordinatorHandle { command_tx };
+    let handle = PairingCoordinatorHandle::for_test(command_tx);
     for _ in 0..PAIRING_COMMAND_CAPACITY {
         let (reply, _ignored) = oneshot::channel();
         handle
             .command_tx
-            .try_send(PairingCommand::BeginDrain { reply })
+            .try_send(handle.envelope(0, PairingCommand::BeginDrain { reply }))
             .unwrap();
     }
 
@@ -3510,8 +4007,8 @@ async fn failed_drain_resume_waits_for_capacity_and_only_closed_channel_stops_it
     );
 
     let mut draining = true;
-    while let Some(command) = command_rx.recv().await {
-        match command {
+    while let Some(envelope) = command_rx.recv().await {
+        match envelope.command {
             PairingCommand::BeginDrain { reply } => {
                 let _ = reply.send(Ok(()));
             }
@@ -3536,13 +4033,82 @@ async fn failed_drain_resume_waits_for_capacity_and_only_closed_channel_stops_it
 
     let (closed_tx, closed_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
     drop(closed_rx);
-    let error = PairingCoordinatorHandle {
-        command_tx: closed_tx,
-    }
-    .resume_after_failed_drain()
-    .await
-    .unwrap_err();
+    let error = PairingCoordinatorHandle::for_test(closed_tx)
+        .resume_after_failed_drain()
+        .await
+        .unwrap_err();
     assert_eq!(error.code(), PAIRING_STOPPED);
+}
+
+#[tokio::test]
+async fn completed_reply_wins_a_later_local_admission_fence() {
+    let (command_tx, mut command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
+    let (health_tx, health_rx) = watch::channel(PairingCoordinatorHealth::Healthy);
+    let (admission_tx, admission_rx) = watch::channel(PairingAdmissionFence {
+        epoch: 0,
+        failure_code: None,
+    });
+    let handle = PairingCoordinatorHandle {
+        command_tx,
+        health_rx,
+        admission_rx,
+        _admission_tx: admission_tx.clone(),
+    };
+    let caller = tokio::spawn(async move { handle.resume_after_failed_drain().await });
+    let envelope = command_rx.recv().await.expect("resume command is admitted");
+    assert_eq!(envelope.admission_epoch, 0);
+    let PairingCommand::ResumeAfterFailedDrain { reply } = envelope.command else {
+        panic!("expected failed-drain resume")
+    };
+    reply.send(Ok(())).expect("linearize successful reply");
+    health_tx.send_replace(PairingCoordinatorHealth::LocalBlocked(
+        "daemon.runtime.store_busy".to_owned(),
+    ));
+    admission_tx.send_replace(PairingAdmissionFence {
+        epoch: 1,
+        failure_code: Some("daemon.runtime.store_busy".to_owned()),
+    });
+
+    caller
+        .await
+        .expect("reply caller joins")
+        .expect("later health failure must not overwrite a completed reply");
+}
+
+#[tokio::test]
+async fn drain_admission_fence_is_unconfirmed_without_an_explicit_actor_failure() {
+    let (command_tx, mut command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
+    let (health_tx, health_rx) = watch::channel(PairingCoordinatorHealth::Healthy);
+    let (admission_tx, admission_rx) = watch::channel(PairingAdmissionFence {
+        epoch: 0,
+        failure_code: None,
+    });
+    let handle = PairingCoordinatorHandle {
+        command_tx,
+        health_rx,
+        admission_rx,
+        _admission_tx: admission_tx.clone(),
+    };
+    let caller = tokio::spawn(async move { handle.begin_drain().await });
+    let envelope = command_rx.recv().await.expect("drain command is admitted");
+    let PairingCommand::BeginDrain { reply } = envelope.command else {
+        panic!("expected begin drain")
+    };
+    health_tx.send_replace(PairingCoordinatorHealth::LocalBlocked(
+        "daemon.runtime.store_busy".to_owned(),
+    ));
+    admission_tx.send_replace(PairingAdmissionFence {
+        epoch: 1,
+        failure_code: Some("daemon.runtime.store_busy".to_owned()),
+    });
+    drop(reply);
+
+    let error = caller
+        .await
+        .expect("drain caller joins")
+        .expect_err("fenced drain must remain unconfirmed");
+    assert!(matches!(error, PairingDrainStartError::Unconfirmed(_)));
+    assert_eq!(error.code(), "daemon.runtime.store_busy");
 }
 
 #[tokio::test]

@@ -77,6 +77,7 @@ use super::transport::{
 const PAIRING_COMMAND_CAPACITY: usize = 8;
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const EXPIRY_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+const PAIRING_ACTOR_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 // Relay core 每秒刷新一次 actor-owned wall clock；再留一个 tick 的调度余量，避免
 // fresh invite 的精确 5 分钟上界被稍旧的 Relay clock 判为 too-far。
 const PAIR_INVITE_RELAY_TICK_GUARD_MS: u64 = 2_000;
@@ -96,6 +97,39 @@ const PAIRING_CANCELED: &str = "daemon.pairing.canceled";
 const PAIRING_EXPIRED: &str = "daemon.pairing.expired";
 const REVOCATION_TARGET_INVALID: &str = "daemon.revocation.target_invalid";
 const REVOCATION_RECOVERY_UNAVAILABLE: &str = "daemon.revocation.recovery_unavailable";
+
+/// manager 只观察可公开的 pairing actor 健康，不复制 actor 的重试所有权。
+/// LocalBlocked 只能执行本地 purge→recover；它绝不能触发 Relay reconnect。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PairingCoordinatorHealth {
+    Starting,
+    Healthy,
+    TransportRetry(String),
+    LocalBlocked(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PairingRecoveryState {
+    Healthy,
+    TransportRetry(String),
+    LocalRetry(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PairingAdmissionFence {
+    epoch: u64,
+    failure_code: Option<String>,
+}
+
+struct PairingCoordinatorSignals {
+    health_tx: watch::Sender<PairingCoordinatorHealth>,
+    admission_tx: watch::Sender<PairingAdmissionFence>,
+}
+
+struct PairingCommandEnvelope {
+    admission_epoch: u64,
+    command: PairingCommand,
+}
 
 /// 从 active enrollment 与当前 authenticated key owner 冻结出的 invite 公共上下文。
 /// 不含私钥或 invite secret；Debug 不展开 origin/pin/证书。
@@ -143,7 +177,10 @@ impl fmt::Debug for PairingInviteContext {
 /// 可复制的窄命令 handle。它不拥有 lane、authority 或 actor task。
 #[derive(Clone)]
 pub(crate) struct PairingCoordinatorHandle {
-    command_tx: mpsc::Sender<PairingCommand>,
+    command_tx: mpsc::Sender<PairingCommandEnvelope>,
+    health_rx: watch::Receiver<PairingCoordinatorHealth>,
+    admission_rx: watch::Receiver<PairingAdmissionFence>,
+    _admission_tx: watch::Sender<PairingAdmissionFence>,
 }
 
 /// BeginDrain 的调用边界必须保留命令是否真正进入 actor，以及 actor 是否明确回错。
@@ -181,29 +218,159 @@ impl fmt::Debug for PairingCoordinatorHandle {
 }
 
 impl PairingCoordinatorHandle {
+    #[cfg(test)]
+    fn for_test(command_tx: mpsc::Sender<PairingCommandEnvelope>) -> Self {
+        let (_health_tx, health_rx) = watch::channel(PairingCoordinatorHealth::Healthy);
+        let (admission_tx, admission_rx) = watch::channel(PairingAdmissionFence {
+            epoch: 0,
+            failure_code: None,
+        });
+        Self {
+            command_tx,
+            health_rx,
+            admission_rx,
+            _admission_tx: admission_tx,
+        }
+    }
+
+    fn begin_admission(&self) -> Result<u64, PairingAdministrationError> {
+        let health_error = || match &*self.health_rx.borrow() {
+            PairingCoordinatorHealth::Starting => Some(pairing_error(PAIRING_STOPPED)),
+            PairingCoordinatorHealth::LocalBlocked(code) => Some(pairing_error(code)),
+            PairingCoordinatorHealth::Healthy | PairingCoordinatorHealth::TransportRetry(_) => None,
+        };
+        if let Some(error) = health_error() {
+            return Err(error);
+        }
+        let epoch = self.admission_rx.borrow().epoch;
+        // 封闭 Healthy check 与 epoch snapshot 间发生 LocalBlocked 的窗口。
+        if let Some(error) = health_error() {
+            return Err(error);
+        }
+        Ok(epoch)
+    }
+
+    fn envelope(&self, admission_epoch: u64, command: PairingCommand) -> PairingCommandEnvelope {
+        PairingCommandEnvelope {
+            admission_epoch,
+            command,
+        }
+    }
+
+    async fn await_fenced_reply<T, E>(
+        &self,
+        admission_epoch: u64,
+        mut reply_rx: oneshot::Receiver<Result<T, E>>,
+    ) -> Result<Result<T, E>, PairingAdministrationError> {
+        let mut admission_rx = self.admission_rx.clone();
+        match reply_rx.try_recv() {
+            Ok(reply) => return Ok(reply),
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(oneshot::error::TryRecvError::Closed) => {
+                let fence = admission_rx.borrow_and_update().clone();
+                if fence.epoch != admission_epoch {
+                    return Err(pairing_error(
+                        fence.failure_code.as_deref().unwrap_or(PAIRING_STOPPED),
+                    ));
+                }
+                return Err(pairing_error(PAIRING_STOPPED));
+            }
+        }
+        let current = admission_rx.borrow_and_update().clone();
+        if current.epoch != admission_epoch {
+            return Err(pairing_error(
+                current.failure_code.as_deref().unwrap_or(PAIRING_STOPPED),
+            ));
+        }
+        tokio::select! {
+            biased;
+            reply = &mut reply_rx => match reply {
+                Ok(reply) => Ok(reply),
+                Err(_) => {
+                    let fence = admission_rx.borrow_and_update().clone();
+                    if fence.epoch != admission_epoch {
+                        Err(pairing_error(
+                            fence.failure_code.as_deref().unwrap_or(PAIRING_STOPPED),
+                        ))
+                    } else {
+                        Err(pairing_error(PAIRING_STOPPED))
+                    }
+                }
+            },
+            changed = admission_rx.changed() => {
+                if changed.is_err() {
+                    return Err(pairing_error(PAIRING_STOPPED));
+                }
+                let fence = admission_rx.borrow_and_update().clone();
+                Err(pairing_error(
+                    fence.failure_code.as_deref().unwrap_or(PAIRING_STOPPED),
+                ))
+            }
+        }
+    }
+
+    async fn send_fenced(
+        &self,
+        admission_epoch: u64,
+        command: PairingCommand,
+    ) -> Result<(), PairingAdministrationError> {
+        let mut admission_rx = self.admission_rx.clone();
+        let current = admission_rx.borrow_and_update().clone();
+        if current.epoch != admission_epoch {
+            return Err(pairing_error(
+                current.failure_code.as_deref().unwrap_or(PAIRING_STOPPED),
+            ));
+        }
+        tokio::select! {
+            biased;
+            result = self.command_tx.send(self.envelope(admission_epoch, command)) => {
+                result.map_err(|_| pairing_error(PAIRING_STOPPED))
+            }
+            changed = admission_rx.changed() => {
+                if changed.is_err() {
+                    return Err(pairing_error(PAIRING_STOPPED));
+                }
+                let fence = admission_rx.borrow_and_update().clone();
+                Err(pairing_error(
+                    fence.failure_code.as_deref().unwrap_or(PAIRING_STOPPED),
+                ))
+            }
+        }
+    }
+
     pub(crate) async fn create(
         &self,
         owner: IdempotencyOwner,
         request: CreatePairInviteRequest,
     ) -> Result<PairInvite, PairingAdministrationError> {
+        let admission_epoch = self.begin_admission()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
-            .try_send(PairingCommand::Create {
-                owner,
-                request,
-                reply: reply_tx,
-            })
+            .try_send(self.envelope(
+                admission_epoch,
+                PairingCommand::Create {
+                    owner,
+                    request,
+                    reply: reply_tx,
+                },
+            ))
             .map_err(command_send_error)?;
-        reply_rx.await.map_err(|_| pairing_error(PAIRING_STOPPED))?
+        self.await_fenced_reply(admission_epoch, reply_rx).await?
     }
 
     pub(crate) async fn begin_drain(&self) -> Result<(), PairingDrainStartError> {
+        let admission_epoch = self
+            .begin_admission()
+            .map_err(PairingDrainStartError::NotEnqueued)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
-            .try_send(PairingCommand::BeginDrain { reply: reply_tx })
+            .try_send(self.envelope(
+                admission_epoch,
+                PairingCommand::BeginDrain { reply: reply_tx },
+            ))
             .map_err(command_send_error)
             .map_err(PairingDrainStartError::NotEnqueued)?;
-        match reply_rx.await {
+        match self.await_fenced_reply(admission_epoch, reply_rx).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(PairingDrainActorError::Busy(error))) => {
                 Err(PairingDrainStartError::ActorBusy(error))
@@ -211,9 +378,9 @@ impl PairingCoordinatorHandle {
             Ok(Err(PairingDrainActorError::Failed(error))) => {
                 Err(PairingDrainStartError::ActorFailed(error))
             }
-            Err(_) => Err(PairingDrainStartError::Unconfirmed(pairing_error(
-                PAIRING_STOPPED,
-            ))),
+            // fence/closed reply 只证明结果未确认；只有 actor 显式回
+            // PairingDrainActorError::Failed 才允许 manager 执行 Resume。
+            Err(error) => Err(PairingDrainStartError::Unconfirmed(error)),
         }
     }
 
@@ -221,28 +388,36 @@ impl PairingCoordinatorHandle {
         &self,
         pairing_id: RuntimeId,
     ) -> Result<PairingReceipt, PairingAdministrationError> {
+        let admission_epoch = self.begin_admission()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
-            .try_send(PairingCommand::Cancel {
-                pairing_id,
-                reply: reply_tx,
-            })
+            .try_send(self.envelope(
+                admission_epoch,
+                PairingCommand::Cancel {
+                    pairing_id,
+                    reply: reply_tx,
+                },
+            ))
             .map_err(command_send_error)?;
-        reply_rx.await.map_err(|_| pairing_error(PAIRING_STOPPED))?
+        self.await_fenced_reply(admission_epoch, reply_rx).await?
     }
 
     pub(crate) async fn confirm(
         &self,
         pairing_id: RuntimeId,
     ) -> Result<PairingReceipt, PairingAdministrationError> {
+        let admission_epoch = self.begin_admission()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
-            .try_send(PairingCommand::Confirm {
-                pairing_id,
-                reply: reply_tx,
-            })
+            .try_send(self.envelope(
+                admission_epoch,
+                PairingCommand::Confirm {
+                    pairing_id,
+                    reply: reply_tx,
+                },
+            ))
             .map_err(command_send_error)?;
-        reply_rx.await.map_err(|_| pairing_error(PAIRING_STOPPED))?
+        self.await_fenced_reply(admission_epoch, reply_rx).await?
     }
 
     pub(crate) async fn revoke_device(
@@ -250,35 +425,43 @@ impl PairingCoordinatorHandle {
         device: DeviceHandle,
         grant_serial: RuntimeGrantSerial,
     ) -> Result<RevocationReceipt, PairingAdministrationError> {
+        let admission_epoch = self.begin_admission()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
-            .try_send(PairingCommand::RevokeDevice {
-                device,
-                grant_serial,
-                reply: reply_tx,
-            })
+            .try_send(self.envelope(
+                admission_epoch,
+                PairingCommand::RevokeDevice {
+                    device,
+                    grant_serial,
+                    reply: reply_tx,
+                },
+            ))
             .map_err(command_send_error)?;
-        reply_rx.await.map_err(|_| pairing_error(PAIRING_STOPPED))?
+        self.await_fenced_reply(admission_epoch, reply_rx).await?
     }
 
     pub(crate) async fn resume_after_failed_drain(&self) -> Result<(), PairingAdministrationError> {
+        let admission_epoch = self.begin_admission()?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(PairingCommand::ResumeAfterFailedDrain { reply: reply_tx })
-            .await
-            .map_err(|_| pairing_error(PAIRING_STOPPED))?;
-        reply_rx.await.map_err(|_| pairing_error(PAIRING_STOPPED))?
+        self.send_fenced(
+            admission_epoch,
+            PairingCommand::ResumeAfterFailedDrain { reply: reply_tx },
+        )
+        .await?;
+        self.await_fenced_reply(admission_epoch, reply_rx).await?
     }
 
     pub(crate) async fn resume_after_completed_drain(
         &self,
     ) -> Result<(), PairingAdministrationError> {
+        let admission_epoch = self.begin_admission()?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(PairingCommand::ResumeAfterCompletedDrain { reply: reply_tx })
-            .await
-            .map_err(|_| pairing_error(PAIRING_STOPPED))?;
-        reply_rx.await.map_err(|_| pairing_error(PAIRING_STOPPED))?
+        self.send_fenced(
+            admission_epoch,
+            PairingCommand::ResumeAfterCompletedDrain { reply: reply_tx },
+        )
+        .await?;
+        self.await_fenced_reply(admission_epoch, reply_rx).await?
     }
 
     #[cfg(test)]
@@ -287,13 +470,16 @@ impl PairingCoordinatorHandle {
         release: oneshot::Receiver<()>,
         receipt: RevocationReceipt,
     ) -> Self {
-        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel::<PairingCommandEnvelope>(1);
         tokio::spawn(async move {
-            let Some(PairingCommand::RevokeDevice {
+            let Some(envelope) = command_rx.recv().await else {
+                return;
+            };
+            let PairingCommand::RevokeDevice {
                 device,
                 grant_serial,
                 reply,
-            }) = command_rx.recv().await
+            } = envelope.command
             else {
                 return;
             };
@@ -301,7 +487,7 @@ impl PairingCoordinatorHandle {
             let _ = release.await;
             let _ = reply.send(Ok(receipt));
         });
-        Self { command_tx }
+        Self::for_test(command_tx)
     }
 
     #[cfg(test)]
@@ -311,9 +497,12 @@ impl PairingCoordinatorHandle {
         resumed: oneshot::Sender<()>,
         resume_result: Result<(), PairingAdministrationError>,
     ) -> Self {
-        let (command_tx, mut command_rx) = mpsc::channel(2);
+        let (command_tx, mut command_rx) = mpsc::channel::<PairingCommandEnvelope>(2);
         tokio::spawn(async move {
-            let Some(PairingCommand::BeginDrain { reply }) = command_rx.recv().await else {
+            let Some(envelope) = command_rx.recv().await else {
+                return;
+            };
+            let PairingCommand::BeginDrain { reply } = envelope.command else {
                 return;
             };
             let _ = entered.send(());
@@ -321,14 +510,16 @@ impl PairingCoordinatorHandle {
                 .await
                 .unwrap_or_else(|_| Err(pairing_error(PAIRING_STOPPED)));
             let _ = reply.send(result.map_err(PairingDrainActorError::Failed));
-            let Some(PairingCommand::ResumeAfterFailedDrain { reply }) = command_rx.recv().await
-            else {
+            let Some(envelope) = command_rx.recv().await else {
+                return;
+            };
+            let PairingCommand::ResumeAfterFailedDrain { reply } = envelope.command else {
                 return;
             };
             let _ = resumed.send(());
             let _ = reply.send(resume_result);
         });
-        Self { command_tx }
+        Self::for_test(command_tx)
     }
 
     #[cfg(test)]
@@ -338,7 +529,8 @@ impl PairingCoordinatorHandle {
         resumed: mpsc::UnboundedSender<()>,
         completed: Option<oneshot::Sender<()>>,
     ) -> Self {
-        let (command_tx, mut command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
+        let (command_tx, mut command_rx) =
+            mpsc::channel::<PairingCommandEnvelope>(PAIRING_COMMAND_CAPACITY);
         tokio::spawn(async move {
             let mut complete = *release.borrow();
             let mut completed = completed;
@@ -364,7 +556,7 @@ impl PairingCoordinatorHandle {
                             }
                         }
                     }
-                    command = command_rx.recv() => match command {
+                    envelope = command_rx.recv() => match envelope.map(|value| value.command) {
                         Some(PairingCommand::BeginDrain { reply }) => {
                             let _ = entered.send(());
                             waiters.retain(|waiter| !waiter.is_closed());
@@ -388,7 +580,7 @@ impl PairingCoordinatorHandle {
                 }
             }
         });
-        Self { command_tx }
+        Self::for_test(command_tx)
     }
 
     #[cfg(test)]
@@ -396,10 +588,12 @@ impl PairingCoordinatorHandle {
         release: oneshot::Receiver<()>,
         observed_stale_command: oneshot::Sender<bool>,
     ) -> Self {
-        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel::<PairingCommandEnvelope>(1);
+        let handle = Self::for_test(command_tx);
         let (reply, _ignored) = oneshot::channel();
-        command_tx
-            .try_send(PairingCommand::BeginDrain { reply })
+        handle
+            .command_tx
+            .try_send(handle.envelope(0, PairingCommand::BeginDrain { reply }))
             .expect("prefill saturated pairing command queue");
         tokio::spawn(async move {
             let _ = release.await;
@@ -410,7 +604,7 @@ impl PairingCoordinatorHandle {
             );
             let _ = observed_stale_command.send(stale);
         });
-        Self { command_tx }
+        handle
     }
 
     #[cfg(test)]
@@ -421,10 +615,14 @@ impl PairingCoordinatorHandle {
         release: oneshot::Receiver<()>,
         observed_stale_command: oneshot::Sender<bool>,
     ) -> Self {
-        let (command_tx, mut command_rx) = mpsc::channel(1);
-        let filler_tx = command_tx.clone();
+        let (command_tx, mut command_rx) = mpsc::channel::<PairingCommandEnvelope>(1);
+        let handle = Self::for_test(command_tx);
+        let filler = handle.clone();
         tokio::spawn(async move {
-            let Some(PairingCommand::BeginDrain { reply }) = command_rx.recv().await else {
+            let Some(envelope) = command_rx.recv().await else {
+                return;
+            };
+            let PairingCommand::BeginDrain { reply } = envelope.command else {
                 return;
             };
             let _ = begin_entered.send(());
@@ -432,10 +630,14 @@ impl PairingCoordinatorHandle {
                 .await
                 .unwrap_or_else(|_| Err(pairing_error(PAIRING_STOPPED)));
             let (filler_reply, _ignored) = oneshot::channel();
-            filler_tx
-                .try_send(PairingCommand::BeginDrain {
-                    reply: filler_reply,
-                })
+            filler
+                .command_tx
+                .try_send(filler.envelope(
+                    0,
+                    PairingCommand::BeginDrain {
+                        reply: filler_reply,
+                    },
+                ))
                 .expect("saturate queue before manager attempts Resume");
             let _ = saturated.send(());
             let _ = reply.send(begin_result.map_err(PairingDrainActorError::Failed));
@@ -447,7 +649,7 @@ impl PairingCoordinatorHandle {
             );
             let _ = observed_stale_command.send(stale);
         });
-        Self { command_tx }
+        handle
     }
 }
 
@@ -456,6 +658,8 @@ pub(crate) struct PairingCoordinatorOwner {
     handle: PairingCoordinatorHandle,
     cancel_tx: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
+    health_rx: watch::Receiver<PairingCoordinatorHealth>,
+    shutdown_deadline: Option<tokio::time::Instant>,
 }
 
 impl fmt::Debug for PairingCoordinatorOwner {
@@ -472,10 +676,16 @@ impl PairingCoordinatorOwner {
         invite_anchor: PairingInviteAnchor,
         invite_context: PairingInviteContext,
         pending_sink: Arc<dyn PairingPendingSink>,
+        shutdown_rx: watch::Receiver<bool>,
     ) -> (Self, Result<(), PairingAdministrationError>) {
         let (command_tx, command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = oneshot::channel();
+        let (health_tx, health_rx) = watch::channel(PairingCoordinatorHealth::Starting);
+        let (admission_tx, admission_rx) = watch::channel(PairingAdmissionFence {
+            epoch: 0,
+            failure_code: None,
+        });
         let task = tokio::spawn(
             PairingCoordinator::new(
                 Arc::new(ProductionPairingStore(store)),
@@ -484,17 +694,26 @@ impl PairingCoordinatorOwner {
                 invite_anchor,
                 invite_context,
                 pending_sink,
+                PairingCoordinatorSignals {
+                    health_tx,
+                    admission_tx: admission_tx.clone(),
+                },
             )
             .run(command_rx, cancel_rx, ready_tx),
         );
-        let owner = Self {
-            handle: PairingCoordinatorHandle { command_tx },
+        let mut owner = Self {
+            handle: PairingCoordinatorHandle {
+                command_tx,
+                health_rx: health_rx.clone(),
+                admission_rx,
+                _admission_tx: admission_tx.clone(),
+            },
             cancel_tx,
             task: Some(task),
+            health_rx,
+            shutdown_deadline: None,
         };
-        let ready = ready_rx
-            .await
-            .unwrap_or_else(|_| Err(pairing_error(PAIRING_STOPPED)));
+        let ready = await_pairing_startup(&mut owner, ready_rx, shutdown_rx).await;
         (owner, recoverable_startup_ready(ready))
     }
 
@@ -503,10 +722,148 @@ impl PairingCoordinatorOwner {
         self.handle.clone()
     }
 
+    #[must_use]
+    pub(crate) fn observed_failure_code(&self) -> Option<String> {
+        match &*self.health_rx.borrow() {
+            PairingCoordinatorHealth::Healthy => None,
+            PairingCoordinatorHealth::Starting => Some(PAIRING_STOPPED.to_owned()),
+            PairingCoordinatorHealth::TransportRetry(code)
+            | PairingCoordinatorHealth::LocalBlocked(code) => Some(code.clone()),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn local_blocked_code(&self) -> Option<String> {
+        match &*self.health_rx.borrow() {
+            PairingCoordinatorHealth::Starting => Some(PAIRING_STOPPED.to_owned()),
+            PairingCoordinatorHealth::LocalBlocked(code) => Some(code.clone()),
+            PairingCoordinatorHealth::Healthy | PairingCoordinatorHealth::TransportRetry(_) => None,
+        }
+    }
+
     pub(crate) async fn shutdown(&mut self) {
         self.cancel_tx.send_replace(true);
-        if let Some(task) = self.task.take() {
+        let deadline = *self
+            .shutdown_deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + PAIRING_ACTOR_SHUTDOWN_DEADLINE);
+        let Some(task) = self.task.as_mut() else {
+            return;
+        };
+        if tokio::time::timeout_at(deadline, &mut *task).await.is_err() {
+            task.abort();
             let _ = task.await;
+        }
+        self.task.take();
+    }
+
+    async fn abort_and_join(&mut self) {
+        self.cancel_tx.send_replace(true);
+        let Some(task) = self.task.as_mut() else {
+            return;
+        };
+        task.abort();
+        let _ = task.await;
+        self.task.take();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn health_test_double(
+        initial: PairingCoordinatorHealth,
+    ) -> (Self, watch::Sender<PairingCoordinatorHealth>) {
+        let (command_tx, mut command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (health_tx, health_rx) = watch::channel(initial);
+        let (_admission_tx, admission_rx) = watch::channel(PairingAdmissionFence {
+            epoch: 0,
+            failure_code: None,
+        });
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = cancel_rx.changed() => {
+                        if changed.is_err() || *cancel_rx.borrow() {
+                            break;
+                        }
+                    }
+                    command = command_rx.recv() => {
+                        if command.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        (
+            Self {
+                handle: PairingCoordinatorHandle {
+                    command_tx,
+                    health_rx: health_rx.clone(),
+                    admission_rx,
+                    _admission_tx,
+                },
+                cancel_tx,
+                task: Some(task),
+                health_rx,
+                shutdown_deadline: None,
+            },
+            health_tx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_startup_test_double() -> (
+        Self,
+        oneshot::Receiver<Result<(), PairingAdministrationError>>,
+    ) {
+        let (command_tx, _command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (_health_tx, health_rx) = watch::channel(PairingCoordinatorHealth::Starting);
+        let (_admission_tx, admission_rx) = watch::channel(PairingAdmissionFence {
+            epoch: 0,
+            failure_code: None,
+        });
+        let task = tokio::spawn(async move {
+            let _ready_tx = ready_tx;
+            std::future::pending::<()>().await;
+        });
+        (
+            Self {
+                handle: PairingCoordinatorHandle {
+                    command_tx,
+                    health_rx: health_rx.clone(),
+                    admission_rx,
+                    _admission_tx,
+                },
+                cancel_tx,
+                task: Some(task),
+                health_rx,
+                shutdown_deadline: None,
+            },
+            ready_rx,
+        )
+    }
+}
+
+pub(super) async fn await_pairing_startup(
+    owner: &mut PairingCoordinatorOwner,
+    ready_rx: oneshot::Receiver<Result<(), PairingAdministrationError>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), PairingAdministrationError> {
+    if *shutdown_rx.borrow() {
+        owner.abort_and_join().await;
+        return Err(pairing_error(PAIRING_STOPPED));
+    }
+    tokio::select! {
+        biased;
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+            owner.abort_and_join().await;
+            Err(pairing_error(PAIRING_STOPPED))
+        }
+        ready = ready_rx => {
+            ready.unwrap_or_else(|_| Err(pairing_error(PAIRING_STOPPED)))
         }
     }
 }
@@ -514,7 +871,7 @@ impl PairingCoordinatorOwner {
 impl Drop for PairingCoordinatorOwner {
     fn drop(&mut self) {
         self.cancel_tx.send_replace(true);
-        if let Some(task) = self.task.take() {
+        if let Some(task) = self.task.as_ref() {
             task.abort();
         }
     }
@@ -2435,7 +2792,10 @@ struct PairingCoordinator {
     routes: BTreeMap<[u8; 16], RuntimeId>,
     opened_routes: HashSet<[u8; 16]>,
     drain: PairingDrainState,
-    transport_failed: bool,
+    recovery_state: PairingRecoveryState,
+    health_tx: watch::Sender<PairingCoordinatorHealth>,
+    admission_epoch: u64,
+    admission_tx: watch::Sender<PairingAdmissionFence>,
 }
 
 impl PairingCoordinator {
@@ -2446,7 +2806,12 @@ impl PairingCoordinator {
         invite_anchor: PairingInviteAnchor,
         invite_context: PairingInviteContext,
         pending_sink: Arc<dyn PairingPendingSink>,
+        signals: PairingCoordinatorSignals,
     ) -> Self {
+        let PairingCoordinatorSignals {
+            health_tx,
+            admission_tx,
+        } = signals;
         Self {
             store,
             lane,
@@ -2461,7 +2826,10 @@ impl PairingCoordinator {
             routes: BTreeMap::new(),
             opened_routes: HashSet::new(),
             drain: PairingDrainState::Idle,
-            transport_failed: false,
+            recovery_state: PairingRecoveryState::Healthy,
+            health_tx,
+            admission_epoch: 0,
+            admission_tx,
         }
     }
 
@@ -2472,7 +2840,12 @@ impl PairingCoordinator {
         authority: Box<dyn PairingAuthority>,
         invite_context: PairingInviteContext,
         pending_sink: Arc<dyn PairingPendingSink>,
+        signals: PairingCoordinatorSignals,
     ) -> Self {
+        let PairingCoordinatorSignals {
+            health_tx,
+            admission_tx,
+        } = signals;
         Self {
             store,
             lane,
@@ -2484,50 +2857,70 @@ impl PairingCoordinator {
             routes: BTreeMap::new(),
             opened_routes: HashSet::new(),
             drain: PairingDrainState::Idle,
-            transport_failed: false,
+            recovery_state: PairingRecoveryState::Healthy,
+            health_tx,
+            admission_epoch: 0,
+            admission_tx,
         }
     }
 
     async fn run(
         mut self,
-        mut command_rx: mpsc::Receiver<PairingCommand>,
+        mut command_rx: mpsc::Receiver<PairingCommandEnvelope>,
         mut cancel_rx: watch::Receiver<bool>,
         ready: oneshot::Sender<Result<(), PairingAdministrationError>>,
     ) {
-        let mut reconnect_tick = tokio::time::interval_at(
+        let mut recovery_tick = tokio::time::interval_at(
             tokio::time::Instant::now() + RECONNECT_RETRY_DELAY,
             RECONNECT_RETRY_DELAY,
         );
-        reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut expiry_tick = tokio::time::interval_at(
             tokio::time::Instant::now() + EXPIRY_RECONCILE_INTERVAL,
             EXPIRY_RECONCILE_INTERVAL,
         );
         expiry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Retention 与恢复共用唯一 actor：启动只清一页，剩余页留给既有 expiry tick。
-        let startup = match self.store.purge_expired_receipts().await {
-            Ok(_) => self.recover_generation().await,
-            Err(error) => Err(error),
-        };
-        self.transport_failed = startup.is_err();
+        // 所有启动/本地重试都从 retention purge 开始；purge 失败时 recover 必须为零。
+        let startup = self.purge_then_recover_generation().await;
+        match &startup {
+            Ok(()) => self.set_healthy(),
+            Err(error) => self.set_failure(error),
+        }
         let _ = ready.send(startup);
         loop {
             if *cancel_rx.borrow() {
                 break;
             }
-            if self.transport_failed {
+            if let Some(error) = self.local_retry_error() {
+                while let Ok(envelope) = command_rx.try_recv() {
+                    Self::reject_command(envelope.command, error.clone());
+                }
                 tokio::select! {
                     biased;
                     changed = cancel_rx.changed() => {
                         if changed.is_err() || *cancel_rx.borrow() { break; }
                     }
-                    _ = reconnect_tick.tick() => {
+                    envelope = command_rx.recv() => {
+                        let Some(envelope) = envelope else { break; };
+                        Self::reject_command(envelope.command, error);
+                    }
+                    _ = recovery_tick.tick() => {
+                        self.try_local_recovery().await;
+                    }
+                }
+            } else if self.is_transport_retry() {
+                tokio::select! {
+                    biased;
+                    changed = cancel_rx.changed() => {
+                        if changed.is_err() || *cancel_rx.borrow() { break; }
+                    }
+                    _ = recovery_tick.tick() => {
                         self.try_reconnect().await;
                     }
                     _ = expiry_tick.tick() => self.handle_expiry_tick().await,
-                    command = command_rx.recv() => {
-                        let Some(command) = command else { break; };
-                        self.handle_command(command).await;
+                    envelope = command_rx.recv() => {
+                        let Some(envelope) = envelope else { break; };
+                        self.handle_command(envelope).await;
                     }
                 }
             } else {
@@ -2537,9 +2930,9 @@ impl PairingCoordinator {
                         if changed.is_err() || *cancel_rx.borrow() { break; }
                     }
                     _ = expiry_tick.tick() => self.handle_expiry_tick().await,
-                    command = command_rx.recv() => {
-                        let Some(command) = command else { break; };
-                        self.handle_command(command).await;
+                    envelope = command_rx.recv() => {
+                        let Some(envelope) = envelope else { break; };
+                        self.handle_command(envelope).await;
                     }
                     event = self.lane.next_event() => self.handle_event(event).await,
                 }
@@ -2549,8 +2942,87 @@ impl PairingCoordinator {
         self.fail_drain(pairing_error(PAIRING_STOPPED));
     }
 
-    async fn handle_command(&mut self, command: PairingCommand) {
+    fn set_healthy(&mut self) {
+        self.recovery_state = PairingRecoveryState::Healthy;
+        self.health_tx
+            .send_replace(PairingCoordinatorHealth::Healthy);
+    }
+
+    fn set_failure(&mut self, error: &PairingAdministrationError) {
+        let code = error.code().to_owned();
+        if is_transport_failure(error) {
+            self.recovery_state = PairingRecoveryState::TransportRetry(code.clone());
+            self.health_tx
+                .send_replace(PairingCoordinatorHealth::TransportRetry(code));
+        } else {
+            let entering_local_retry =
+                !matches!(self.recovery_state, PairingRecoveryState::LocalRetry(_));
+            self.recovery_state = PairingRecoveryState::LocalRetry(code.clone());
+            self.health_tx
+                .send_replace(PairingCoordinatorHealth::LocalBlocked(code.clone()));
+            if entering_local_retry {
+                self.admission_epoch = self.admission_epoch.saturating_add(1);
+            }
+            self.admission_tx.send_replace(PairingAdmissionFence {
+                epoch: self.admission_epoch,
+                failure_code: Some(code),
+            });
+        }
+    }
+
+    fn set_transport_failure(&mut self, error: &PairingAdministrationError) {
+        debug_assert!(is_transport_failure(error));
+        self.set_failure(error);
+    }
+
+    fn is_transport_retry(&self) -> bool {
+        matches!(self.recovery_state, PairingRecoveryState::TransportRetry(_))
+    }
+
+    fn is_healthy(&self) -> bool {
+        matches!(self.recovery_state, PairingRecoveryState::Healthy)
+    }
+
+    fn local_retry_error(&self) -> Option<PairingAdministrationError> {
+        match &self.recovery_state {
+            PairingRecoveryState::LocalRetry(code) => Some(pairing_error(code)),
+            PairingRecoveryState::Healthy | PairingRecoveryState::TransportRetry(_) => None,
+        }
+    }
+
+    fn reject_command(command: PairingCommand, error: PairingAdministrationError) {
         match command {
+            PairingCommand::Create { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            PairingCommand::Cancel { reply, .. } | PairingCommand::Confirm { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            PairingCommand::RevokeDevice { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            PairingCommand::BeginDrain { reply } => {
+                let _ = reply.send(Err(PairingDrainActorError::Failed(error)));
+            }
+            PairingCommand::ResumeAfterFailedDrain { reply }
+            | PairingCommand::ResumeAfterCompletedDrain { reply } => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    async fn handle_command(&mut self, envelope: PairingCommandEnvelope) {
+        if envelope.admission_epoch != self.admission_epoch {
+            let code = self
+                .admission_tx
+                .borrow()
+                .failure_code
+                .clone()
+                .unwrap_or_else(|| PAIRING_STOPPED.to_owned());
+            Self::reject_command(envelope.command, pairing_error(code));
+            return;
+        }
+        match envelope.command {
             PairingCommand::Create {
                 owner,
                 request,
@@ -2640,10 +3112,13 @@ impl PairingCoordinator {
             return;
         }
         self.waiters.entry(pairing_id).or_default().push(reply);
-        if self.transport_failed {
+        if self.is_transport_retry() {
             self.try_reconnect().await;
-            if self.transport_failed {
-                self.fail_pairing_waiters(pairing_id, pairing_error(PAIRING_TRANSPORT));
+            if !self.is_healthy() {
+                let error = self
+                    .local_retry_error()
+                    .unwrap_or_else(|| pairing_error(PAIRING_TRANSPORT));
+                self.fail_pairing_waiters(pairing_id, error);
             }
             return;
         }
@@ -2655,9 +3130,11 @@ impl PairingCoordinator {
             }
         };
         if let Err(error) = self.lane.send_open(open).await {
-            self.transport_failed = true;
-            self.fail_pairing_waiters(pairing_id, error);
-            self.try_reconnect().await;
+            self.set_failure(&error);
+            self.fail_pairing_waiters(pairing_id, error.clone());
+            if is_transport_failure(&error) {
+                self.try_reconnect().await;
+            }
         }
     }
 
@@ -2711,7 +3188,7 @@ impl PairingCoordinator {
             Ok(true) => self.complete_drain(),
             Ok(false) => {}
             Err(error) if is_transport_failure(&error) => {
-                self.transport_failed = true;
+                self.set_transport_failure(&error);
             }
             Err(error) => self.fail_drain(error),
         }
@@ -2843,7 +3320,7 @@ impl PairingCoordinator {
         let reply = outcome.reply.clone();
         if let Err(error) = self.apply_terminal(outcome).await {
             if is_transport_failure(&error) {
-                self.transport_failed = true;
+                self.set_transport_failure(&error);
             } else {
                 return Err(error);
             }
@@ -2905,7 +3382,7 @@ impl PairingCoordinator {
                     .await?;
                 if let Err(error) = self.apply_terminal(terminal).await {
                     if is_transport_failure(&error) {
-                        self.transport_failed = true;
+                        self.set_transport_failure(&error);
                     } else {
                         return Err(error);
                     }
@@ -3003,7 +3480,7 @@ impl PairingCoordinator {
         self.revocation_waiters.entry(key).or_default().push(reply);
         if let Err(error) = self.drive_next_revocation().await {
             if is_transport_failure(&error) {
-                self.transport_failed = true;
+                self.set_transport_failure(&error);
                 self.try_reconnect().await;
             } else {
                 self.fail_revocation_waiters(key, error);
@@ -3256,7 +3733,7 @@ impl PairingCoordinator {
             if !is_transport_failure(&error) {
                 return Err(error);
             }
-            self.transport_failed = true;
+            self.set_transport_failure(&error);
             self.try_reconnect().await;
         }
         Ok(())
@@ -3309,7 +3786,7 @@ impl PairingCoordinator {
             if !is_transport_failure(&error) {
                 return Err(error);
             }
-            self.transport_failed = true;
+            self.set_transport_failure(&error);
             self.try_reconnect().await;
         }
         Ok(())
@@ -3317,6 +3794,7 @@ impl PairingCoordinator {
 
     async fn handle_expiry_tick(&mut self) {
         if let Err(error) = self.store.purge_expired_receipts().await {
+            self.set_failure(&error);
             if matches!(self.drain, PairingDrainState::Running(_)) {
                 self.fail_drain(error);
             } else {
@@ -3338,7 +3816,7 @@ impl PairingCoordinator {
                 for outcome in outcomes {
                     if let Err(error) = self.apply_terminal(outcome).await {
                         if is_transport_failure(&error) {
-                            self.transport_failed = true;
+                            self.set_transport_failure(&error);
                         } else {
                             self.fail_waiters(error);
                         }
@@ -3350,7 +3828,7 @@ impl PairingCoordinator {
                             for close in terminals {
                                 if let Err(error) = self.send_recovered_close(close).await {
                                     if is_transport_failure(&error) {
-                                        self.transport_failed = true;
+                                        self.set_transport_failure(&error);
                                     } else {
                                         self.fail_waiters(error);
                                     }
@@ -3365,7 +3843,7 @@ impl PairingCoordinator {
         }
         if let Err(error) = self.replay_pending_grants().await {
             if is_transport_failure(&error) {
-                self.transport_failed = true;
+                self.set_transport_failure(&error);
             } else {
                 self.fail_waiters(error);
             }
@@ -3373,7 +3851,7 @@ impl PairingCoordinator {
         }
         if let Err(error) = self.drive_next_revocation().await {
             if is_transport_failure(&error) {
-                self.transport_failed = true;
+                self.set_transport_failure(&error);
             } else {
                 self.fail_waiters(error);
             }
@@ -3460,9 +3938,9 @@ impl PairingCoordinator {
             }
             Ok(Some(PairingTransportEvent::PairData(data))) => {
                 if let Err(error) = self.handle_pair_data(data).await
-                    && error.code().starts_with("remote.transport.")
+                    && is_transport_failure(&error)
                 {
-                    self.transport_failed = true;
+                    self.set_transport_failure(&error);
                     self.try_reconnect().await;
                 }
             }
@@ -3473,7 +3951,7 @@ impl PairingCoordinator {
                 if let Err(error) = self.handle_grant_committed(committed).await
                     && is_transport_failure(&error)
                 {
-                    self.transport_failed = true;
+                    self.set_transport_failure(&error);
                     self.try_reconnect().await;
                 }
             }
@@ -3481,17 +3959,27 @@ impl PairingCoordinator {
                 if let Err(error) = self.handle_revocation_committed(committed).await
                     && is_transport_failure(&error)
                 {
-                    self.transport_failed = true;
+                    self.set_transport_failure(&error);
                     self.try_reconnect().await;
                 }
             }
             Ok(Some(PairingTransportEvent::PairFrameAccepted(_))) => {
                 // RouteAccepted 只证明 Relay writer 接受，不能推进任何 durable terminal。
             }
-            Ok(None) | Err(_) => {
-                self.transport_failed = true;
-                self.fail_waiters(pairing_error(PAIRING_TRANSPORT));
+            Ok(None) => {
+                let error = pairing_error(PAIRING_TRANSPORT);
+                self.set_transport_failure(&error);
+                self.fail_waiters(error);
                 self.try_reconnect().await;
+            }
+            Err(error) => {
+                self.set_failure(&error);
+                if is_transport_failure(&error) {
+                    self.fail_waiters(pairing_error(PAIRING_TRANSPORT));
+                    self.try_reconnect().await;
+                } else {
+                    self.fail_waiters(error);
+                }
             }
         }
         self.check_drain_completion().await;
@@ -3499,8 +3987,9 @@ impl PairingCoordinator {
 
     async fn handle_opened(&mut self, opened: PairRouteOpened) {
         let Some(pairing_id) = self.routes.get(opened.pair_route.as_bytes()).copied() else {
-            self.transport_failed = true;
-            self.fail_waiters(pairing_error(PAIRING_TRANSPORT));
+            let error = pairing_error(PAIRING_TRANSPORT);
+            self.set_transport_failure(&error);
+            self.fail_waiters(error);
             return;
         };
         let canonical_terminal = encode(&OpaqueRouteFrame {
@@ -3522,9 +4011,9 @@ impl PairingCoordinator {
                     PairingInviteLifecycle::Preparing
                         | PairingInviteLifecycle::AwaitingLocalConfirmation
                 ) && let Err(error) = self.drive_pair_pending(invite).await
-                    && error.code().starts_with("remote.transport.")
+                    && is_transport_failure(&error)
                 {
-                    self.transport_failed = true;
+                    self.set_transport_failure(&error);
                     self.try_reconnect().await;
                 } else if lifecycle == PairingInviteLifecycle::GrantPreparing {
                     match self.recovered_grant(pairing_id).await {
@@ -3733,21 +4222,46 @@ impl PairingCoordinator {
     }
 
     async fn try_reconnect(&mut self) {
-        if self.lane.reconnect().await.is_err() {
-            self.transport_failed = true;
+        if !self.is_transport_retry() {
             return;
         }
-        match self.recover_generation().await {
-            Ok(()) => self.transport_failed = false,
+        if let Err(error) = self.lane.reconnect().await {
+            self.set_failure(&error);
+            return;
+        }
+        match self.purge_then_recover_generation().await {
+            Ok(()) => self.set_healthy(),
             Err(error) => {
                 if matches!(self.drain, PairingDrainState::Running(_))
                     && !is_transport_failure(&error)
                 {
-                    self.fail_drain(error);
+                    self.fail_drain(error.clone());
                 }
-                self.transport_failed = true;
+                self.set_failure(&error);
             }
         }
+    }
+
+    async fn try_local_recovery(&mut self) {
+        if self.local_retry_error().is_none() {
+            return;
+        }
+        match self.purge_then_recover_generation().await {
+            Ok(()) => self.set_healthy(),
+            Err(error) => {
+                if matches!(self.drain, PairingDrainState::Running(_))
+                    && !is_transport_failure(&error)
+                {
+                    self.fail_drain(error.clone());
+                }
+                self.set_failure(&error);
+            }
+        }
+    }
+
+    async fn purge_then_recover_generation(&mut self) -> Result<(), PairingAdministrationError> {
+        self.store.purge_expired_receipts().await?;
+        self.recover_generation().await
     }
 
     async fn recover_generation(&mut self) -> Result<(), PairingAdministrationError> {
@@ -4144,7 +4658,9 @@ fn recoverable_startup_ready(
 }
 
 fn is_transport_failure(error: &PairingAdministrationError) -> bool {
-    error.code().starts_with("remote.transport.") || error.code().starts_with("relay.")
+    error.code() == PAIRING_TRANSPORT
+        || error.code().starts_with("remote.transport.")
+        || error.code().starts_with("relay.")
 }
 
 pub(crate) fn unavailable() -> PairingAdministrationError {

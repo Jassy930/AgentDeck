@@ -39,7 +39,6 @@ use crate::remote::identity::{
     MACHINE_LINK_SIGN_ACCOUNT, MACHINE_ROOT_SIGN_ACCOUNT,
 };
 use crate::remote::workflow::{EnrollmentEndpoint, MachineEnrollmentWorkflow};
-use crate::runtime::RevocationAdministration;
 use crate::runtime::remote_administration::RemoteAdministration;
 use crate::runtime::store::IdempotencyOwner;
 use crate::runtime::store::pairing::{PreparePairingInvite, PreparePairingInviteOutcome};
@@ -48,11 +47,13 @@ use crate::runtime::store::{
     MachineRemoteLifecycle, MachineRemoteStateRecord, MachineTrustResetKind, RuntimeStoreConfig,
     RuntimeStoreHandle,
 };
+use crate::runtime::{PairingAdministration, RevocationAdministration};
 use crate::security::{KeyStore, MemoryKeyStore, SecretBytes, load_or_create_storage_kek};
 
 use super::{
     PurgePlanSink, PurgeReservationResume, REMOTE_DISABLED, REMOTE_SHUTTING_DOWN, RemoteManager,
-    admin_error, status_from_state,
+    admin_error, record_pairing_start_failure, require_pairing_owner_after_enroll,
+    status_from_state,
 };
 
 fn record(lifecycle: MachineRemoteLifecycle) -> MachineRemoteStateRecord {
@@ -669,21 +670,121 @@ fn stopped_status_overrides_transient_failure_and_invalid_codes_are_sanitized() 
 }
 
 #[tokio::test]
-async fn transient_pairing_transport_health_clears_back_to_active_without_sticky_block() {
-    let fixture = active_fixture("pairing-health").await;
-    let durable = fixture.store.load_machine_enrollment_state().await.unwrap();
-    let blocked =
-        status_from_state(durable.as_ref(), Some("remote.transport.closed"), false).unwrap();
+async fn pairing_start_failure_before_owner_remains_stably_blocked() {
+    let mut fixture = active_fixture("pairing-pre-owner").await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        assert!(state.pairing.is_none());
+        record_pairing_start_failure(&mut state, &admin_error("daemon.pairing.sink_unavailable"));
+    }
+
+    let blocked = manager.status().await.unwrap();
     assert_eq!(blocked.lifecycle, WireLifecycle::Blocked);
     assert_eq!(
         blocked.failure_code.unwrap().as_str(),
-        "remote.transport.closed"
+        "daemon.pairing.sink_unavailable"
     );
+    let retry_error =
+        require_pairing_owner_after_enroll(true, false, Some("daemon.pairing.sink_unavailable"))
+            .expect_err("Active retry must not clear a pre-owner pairing block");
+    assert_eq!(retry_error.code(), "daemon.pairing.sink_unavailable");
+    finish_fixture(manager, fixture).await;
+}
 
-    let recovered = status_from_state(durable.as_ref(), None, false).unwrap();
+#[tokio::test]
+async fn transient_pairing_store_health_clears_back_to_active_without_sticky_block() {
+    let mut fixture = active_fixture("pairing-health").await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+    let (owner, health_tx) = crate::remote::pairing::PairingCoordinatorOwner::health_test_double(
+        crate::remote::pairing::PairingCoordinatorHealth::LocalBlocked(
+            "daemon.runtime.store_busy".to_owned(),
+        ),
+    );
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing = Some(owner);
+        record_pairing_start_failure(&mut state, &admin_error("daemon.runtime.store_busy"));
+        assert!(state.blocked_code.is_none());
+    }
+
+    let blocked = manager.status().await.unwrap();
+    assert_eq!(blocked.lifecycle, WireLifecycle::Blocked);
+    assert_eq!(
+        blocked.failure_code.unwrap().as_str(),
+        "daemon.runtime.store_busy"
+    );
+    let blocked_list = tokio::time::timeout(Duration::from_millis(100), manager.list())
+        .await
+        .expect("local pairing block must reject commands within a fixed bound")
+        .expect_err("blocked manager list must fail closed");
+    assert_eq!(blocked_list.code(), "daemon.runtime.store_busy");
+
+    health_tx.send_replace(crate::remote::pairing::PairingCoordinatorHealth::Healthy);
+    let recovered = manager.status().await.unwrap();
     assert_eq!(recovered.lifecycle, WireLifecycle::Active);
     assert!(recovered.failure_code.is_none());
+    assert!(manager.list().await.unwrap().is_empty());
 
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cancels_pairing_startup_while_arm_holds_manager_mutex() {
+    let mut fixture = unenrolled_fixture("cancel-pair-start").await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let (owner, ready_rx) =
+        crate::remote::pairing::PairingCoordinatorOwner::pending_startup_test_double();
+    let startup_entered = manager
+        .install_pairing_startup_test_hook(owner, ready_rx)
+        .await;
+
+    let arm_manager = Arc::clone(&manager);
+    let arm = tokio::spawn(async move { arm_manager.arm(remote_start_permit_for_test()).await });
+    tokio::time::timeout(Duration::from_secs(1), startup_entered)
+        .await
+        .expect("arm must reach the pending ready wait")
+        .expect("startup hook remains installed");
+    assert!(
+        manager.state.try_lock().is_err(),
+        "arm must hold manager state while waiting for startup ready"
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .expect("shutdown watch must cancel startup before waiting for manager state");
+    let arm_error = arm
+        .await
+        .expect("arm task joins")
+        .expect_err("shutdown must fail pending startup closed");
+    assert_eq!(arm_error.code(), "daemon.pairing.actor_stopped");
+    {
+        let state = manager.state.lock().await;
+        assert!(state.stopped);
+        assert!(state.pairing.is_none());
+        assert!(state.transport.is_none());
+        assert!(state.start_permit.is_none());
+    }
+
+    let manager = Arc::try_unwrap(manager).unwrap_or_else(|_| panic!("all manager tasks joined"));
+    drop(manager);
     fixture.store.shutdown().await.unwrap();
     let _ = fs::remove_dir_all(fixture.root);
 }

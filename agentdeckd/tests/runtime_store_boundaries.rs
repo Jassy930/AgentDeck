@@ -271,6 +271,25 @@ type RawRuntimeLedger = (
     i64,
 );
 
+type RawRemoteLedger = (
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
 type RawCommandMetadata = (
     Vec<u8>,
     Vec<u8>,
@@ -488,7 +507,42 @@ fn runtime_ledger_token(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("read Runtime machine identity and remote ledger fixture");
-    let mut message = Vec::with_capacity(400);
+    let remote_ledger: RawRemoteLedger = connection
+        .query_row(
+            "SELECT remote_pairing_count, remote_pairing_sealed_bytes,
+                    remote_pairing_receipt_count, remote_pairing_receipt_bytes,
+                    remote_authorization_count, remote_authorization_preparing_count,
+                    remote_authorization_active_count, remote_authorization_revoking_count,
+                    remote_authorization_revoked_count, remote_authorization_sealed_bytes,
+                    remote_key_directory_count, remote_key_directory_sealed_bytes,
+                    remote_control_outbox_count, remote_control_outbox_pending_count,
+                    remote_control_outbox_acknowledged_count,
+                    remote_control_outbox_sealed_bytes
+             FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                ))
+            },
+        )
+        .expect("read Runtime remote security ledger fixture");
+    let mut message = Vec::with_capacity(528);
     message.extend_from_slice(&database_id);
     match catalog_high_water {
         None => message.push(0),
@@ -587,8 +641,32 @@ fn runtime_ledger_token(
             .expect("fixture machine remote state count is non-negative")
             .to_be_bytes(),
     );
+    for value in [
+        remote_ledger.0,
+        remote_ledger.1,
+        remote_ledger.2,
+        remote_ledger.3,
+        remote_ledger.4,
+        remote_ledger.5,
+        remote_ledger.6,
+        remote_ledger.7,
+        remote_ledger.8,
+        remote_ledger.9,
+        remote_ledger.10,
+        remote_ledger.11,
+        remote_ledger.12,
+        remote_ledger.13,
+        remote_ledger.14,
+        remote_ledger.15,
+    ] {
+        message.extend_from_slice(
+            &u64::try_from(value)
+                .expect("fixture remote ledger counter is non-negative")
+                .to_be_bytes(),
+        );
+    }
     *key_bundle
-        .blind_index(b"runtime.meta.ledger.v9", &message)
+        .blind_index(b"runtime.meta.ledger.v10", &message)
         .expect("authenticate Runtime boundary ledger")
         .as_bytes()
 }
@@ -1011,11 +1089,11 @@ async fn catalog_hwm_u64_max_returns_typed_exhaustion_and_inserts_no_additional_
                 [],
                 |row| row.get(0),
             )
-            .expect("read baseline v8 ledger token");
+            .expect("read baseline v10 ledger token");
         assert_eq!(
             runtime_ledger_token(&transaction, &key_bundle, database_id).as_slice(),
             stored_token,
-            "fixture v8 ledger encoder must match the store"
+            "fixture v10 ledger encoder must match the store"
         );
         assert_eq!(
             transaction

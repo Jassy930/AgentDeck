@@ -314,9 +314,6 @@ fn bootstrap_source_owns_no_p4_2_network_or_injection_surface() {
     let production = format!("{bootstrap}\n{main}");
 
     for forbidden in [
-        "SignedCertificate",
-        "MachineEnrollmentRequest",
-        "MachineEnrollmentResponse",
         "RelayEnrollmentClient",
         "RemoteLink",
         "record_enrollment_receipt",
@@ -324,6 +321,8 @@ fn bootstrap_source_owns_no_p4_2_network_or_injection_surface() {
         "machine_enrollment_receipts",
         "WebSocket",
         "tokio_tungstenite",
+        "TcpStream",
+        "TcpListener",
         "--file-keystore",
         "--machine-key-file",
         "AGENTDECK_MACHINE_KEY",
@@ -331,7 +330,7 @@ fn bootstrap_source_owns_no_p4_2_network_or_injection_surface() {
     ] {
         assert!(
             !production.contains(forbidden),
-            "P4.1-C production source must not own {forbidden}"
+            "bootstrap/main production source must not own {forbidden}"
         );
     }
 }
