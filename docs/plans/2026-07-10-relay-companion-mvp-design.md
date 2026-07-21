@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已由 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、`46c6bb8` 完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成 Task 门禁与双路 Approved。P4/P5/P6 当前分别为 2/7、0/9、0/4 Task 完成，下一项是 P4.3 PairInvite/DeviceGrant；production native metadata 与 provisioned signed Keychain/LaunchAgent 均为 post-MVP gated/BLOCKED（2026-07-20） |
+| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成。P4/P5/P6 当前分别为 3/7、0/9、0/4 Task 完成，下一项是 P4.4 MachineLink→RuntimeCore；production native metadata 与 provisioned signed Keychain/LaunchAgent 均为 post-MVP gated/BLOCKED（2026-07-21） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -56,9 +56,14 @@ BLOCKED contract、四 schema、network、docs、local smoke 与 diagnostics 全
 `916 passed / 3 ignored`，capacity 慢项 284.28s），两路独立终审均 Approved。P4.2 又由
 `a6842bc` 把 Runtime protocol additive 升至 v3、physical schema 升至 v9/25 表，并完成
 root-signed Link/Data cert、durable enrollment/receipt、control-only authenticated MachineLink、
-root-present/root-lost trust reset 与安全 uninstall purge；Task 门禁与双路终审 Approved。P4 当前为 2/7，
-下一项是 P4.3。P4.2 不拥有 PairInvite/DeviceGrant、业务 Runtime dispatch、E2EE publication、持久远程
-CLI 或 iOS 真实链路。CounterGuard 仍只是通用 IO，不代表 active symmetric key reservation、DB high-water
+root-present/root-lost trust reset 与安全 uninstall purge；Task 门禁与双路终审 Approved。P4.3 再把 Runtime
+protocol additive 升至 v4、physical schema 升至 v10/30 表，完成 PairInvite/PairRequest/PairPending、
+DeviceGrant/DeviceAuthorization/bootstrap KeyDirectory、本机 auth ledger、revoke、close outbox 与唯一 control
+owner handoff；`PairResponse.info` 绑定 response hash/HPKE/MachineDataSign/receipt 四轴，invite TTL 为 298 秒。
+`3b4b977` 进一步固定 cancel-safe actor join、startup shutdown watch、LocalRetry/TransportRetry、动态 health 与
+admission epoch fence；本地恢复不重拨 WSS，旧 epoch 命令恢复后零执行。
+P4 当前为 3/7，下一项是 P4.4。P4.3 不拥有业务 Runtime dispatch、E2EE publication、持久远程 CLI 或
+iOS 真实链路。CounterGuard 仍只是通用 IO，不代表 active symmetric key reservation、DB high-water
 绑定或整库回滚闭环已经完成。iOS 仍只有 fixture 驱动骨架。P3.1 provisioned signed Keychain/LaunchAgent
 roundtrip 继续按方案 b 保持 post-MVP BLOCKED gate。完整实施仍必须满足 §17 的 Definition of Done。
 
@@ -1586,7 +1591,10 @@ provisioned production-signed LaunchAgent/Keychain 仍按方案 b 保持 post-MV
   整库回滚闭环，这些仍属于后续 P4 Task。
 - P4.2 已首次签发 root-signed link/data cert、读写 enrollment receipt、执行 Relay machine enrollment，
   并建立第一条 control-only authenticated MachineLink/RemoteTransport；它拒绝业务 frame且不向
-  RuntimeCore dispatch。PairInvite/DeviceGrant 继续由 P4.3 拥有，业务 RemoteLink 属后续 Task。
+  RuntimeCore dispatch。
+- P4.3 已完成 PairInvite、byte-stable PairRequest/Response、DeviceGrant/DeviceAuthorization、bootstrap
+  KeyDirectory、本机 fingerprint confirmation/auth ledger、revoke 与 durable route outbox；shared control 的
+  activation/drain/handoff/singleflight 已收口。业务 RemoteLink 继续由 P4.4 拥有。
 - daemon WSS/E2EE、MachineDataSign、Catalog/events/commands/replay、key/counter crash recovery。
 - macOS persistent 远程 CLI 使用 Keychain 中的真实 grant/private keys 和 daemon receipts；Linux synthetic client 只用 ephemeral keys。
 

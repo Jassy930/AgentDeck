@@ -173,7 +173,7 @@ oracle。诊断日志同样只能记录 failure code、脱敏 route 短标识和
 P3.9 Runtime v2 hard cutover 后，Runtime v1 TBS 签发的 persisted cert/grant、control
 grant/revocation/retirement 都统一表现为 `relay.auth.invalid_grant`；旧 Link/Data cert 经公网
 enrollment 统一表现为 `relay.enrollment.rejected`。不要根据通用 code 猜具体失败字段，也不要自动降级。
-P4.2 current contract 已 additive 升为 Runtime v3，不提供 production v2/v3 双栈。开发环境发现旧凭据时，
+P4.2 曾 additive 升为 Runtime v3；P4.3 current contract 已再升为 Runtime v4，不提供 production v3/v4 双栈。开发环境发现旧凭据时，
 先用可信 Relay admin inventory 定位 realm：存在时执行 purge 并取得 portable signed receipt，不存在时记录
 可信 absent 结果；随后只用本页 P4.2 本地 trust-reset 命令重新 enroll。不得手改 SQLite/Keychain 代替。
 
@@ -678,7 +678,7 @@ P3.4 RuntimeCore 的 transport-neutral failure：
 | `daemon.runtime.not_ready` | Core 尚未完成 paged recovery，或正在 draining/stopped | 等待 daemon readiness；若 recovery 无法完成，按上节保留 DB/Keychain 证据并 fail-close |
 | `daemon.runtime.protocol_mismatch` | Runtime protocol 版本不兼容 | 升级客户端/daemon 到同一 Runtime protocol；不能回退 Relay/IPC 业务字段 |
 | `daemon.runtime.invalid_request` | ID 非 canonical UUID、Start key/cwd、Configure key 或 configuration agent kind 与 conversation 不匹配等规范化输入非法 | 修正原请求；不得由 daemon 猜 ID/path/agent kind 或替客户端补目标 |
-| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（例如 pairing、device revoke 或业务 RemoteLink），或当前 capability/构建不支持该请求 | 读取 capabilities/实施状态后等待对应 phase；`StageUpgrade` 已由 P3.10 接入，machine enroll/status/trust-reset 已由 P4.2 接入，正常失败必须保留各自更精确的 `daemon.upgrade.*` / `daemon.install.*` / `daemon.remote.*` / `daemon.purge.*` code。native metadata 使用 `daemon.conversation.metadata_unsupported`；不得用 compatibility path 或 fake coordinator 假成功 |
+| `daemon.runtime.feature_unavailable` | 请求属于尚未接线的后续 phase（当前主要是业务 RemoteLink），或当前 capability/构建不支持该请求 | 读取 capabilities/实施状态后等待对应 phase；`StageUpgrade` 已由 P3.10 接入，machine enroll/status/trust-reset 已由 P4.2 接入，pairing/device revoke 已由 P4.3 接入，正常失败必须保留各自更精确的 `daemon.upgrade.*` / `daemon.install.*` / `daemon.remote.*` / `daemon.pairing.*` / `daemon.purge.*` code。native metadata 使用 `daemon.conversation.metadata_unsupported`；不得用 compatibility path 或 fake coordinator 假成功 |
 | `daemon.authorization.revoked` | opaque principal lease 已 Revoking/Revoked 或 issuer registry 不可用 | 停止该 connection；remote 设备按 durable revocation/re-pair 流程处理，本地重新认证 peer credential |
 | `daemon.runtime.identity_unavailable` | machine trust/ID derivation domain 非法或 OS entropy 不可用 | 停止启动并检查 machine identity/系统熵；不得生成零 ID 或使用时间/PID 回退 |
 | `daemon.runtime.actor_unavailable` | conversation actor/execution control 已损坏或 recovery-blocked | 不自动重放 Started；保留 command/fence 证据，P3.7 按 orphan fencing 处理 |
@@ -717,7 +717,7 @@ P3.9-D（`b818f81`）又把 `agentdeck` Rust binary 默认入口与
 | --- | --- | --- |
 | `daemon.client.installation_home_failed` / `installation_parent_unsafe` / `installation_record_unsafe` / `installation_record_corrupt` / `installation_publish_unsupported` / `installation_io_failed` | passwd home 不可用，installation parent/record 的 type、owner、mode、nlink 不安全，record 非 canonical，或 no-replace/fsync I/O 失败 | 保留原 record 与目录；修复 OS account home/权限/文件系统，不删除或自动轮换 identity，不改用 `HOME` 覆盖 |
 | `daemon.client.socket_path_invalid` / `socket_missing` / `socket_parent_unsafe` / `socket_unsafe` / `connect_failed` / `socket_option_failed` | canonical UDS 路径非法或不存在，parent/socket 的 type、owner、mode、nlink 不满足，connect 或 socket option 失败 | GUI、Rust CLI 与 Swift selfcheck 都直接暴露该失败且零 fallback；核对 stable daemon/LaunchAgent、current-EUID installation 与 canonical path，不用 diagnostics/legacy stdio 成功覆盖 Runtime socket failure |
-| `daemon.client.preface_failed` / `encode_failed` / `hello_invalid` / `hello_order_invalid` / `sequence_required` / `message_id_duplicate` / `server_request_forbidden` / `reply_uncorrelated` | preface/Hello/首帧/messageId/reply sequence 编码或协议被破坏 | 关闭当前 fd，升级为同一 Runtime v3 candidate；若 daemon 返回 `daemon.runtime.protocol_mismatch`，client 会保留该精确 code，不包成通用错误 |
+| `daemon.client.preface_failed` / `encode_failed` / `hello_invalid` / `hello_order_invalid` / `sequence_required` / `message_id_duplicate` / `server_request_forbidden` / `reply_uncorrelated` | preface/Hello/首帧/messageId/reply sequence 编码或协议被破坏 | 关闭当前 fd，升级为同一 Runtime v4 candidate；若 daemon 返回 `daemon.runtime.protocol_mismatch`，client 会保留该精确 code，不包成通用错误 |
 | `daemon.client.connection_closed` / `read_failed` / `frame_invalid` / `frame_unterminated` / `frame_too_large` / `write_failed` / `write_timeout` / `write_handoff_incomplete` / `close_failed` | EOF、JSONL/1 MiB framing、read/write/flush/cancellation 或 close 失败 | 未见 terminal 的 sender close 必须按 failure 处理；App 先等待共享 close barrier，不能在 fault callback 内热重连。下一次用户操作才建新 wire；有副作用请求保守复用 exact Runtime request payload、stable idempotency key 与冻结 revision，让新 wire 自行分配 outer messageId 并由 daemon 裁决 durable outcome，不能把 EOF 当正常完成 |
 | `daemon.client.reply_backpressure` / `reply_sequence_backpressure` / `reply_timeout` / `reply_drain_expired` / `stream_backpressure` | pending/reply/stream 的 frame、retained-byte budget、absolute deadline 或 TTL 到界；Rust CLI 完整 reply sequence 共用一个 30 秒 deadline，中间帧不续期；Swift 普通 event/catalogDelta 与 transfer complete 都计入 stream byte budget | 关闭当前连接并有界重连；有副作用请求用原 idempotency key 重发 exact request，让 daemon 裁决 replay/conflict，或由同 owner 显式查询 durable receipt。先消费/取消旧 sequence，不扩大 channel 或并发生成新 messageId |
 | `daemon.client.transfer_backpressure` / `transfer_binding_mismatch` / `transfer_expired` / `transfer_incomplete` / `transfer_invalid` / `transfer_tombstone_desync` | transfer part 数量、byte/hash/binding/TTL/completed tombstone 不一致 | 丢弃当前重组状态并关闭连接；从 daemon cursor 重新同步，不接受 partial payload 或复用 transferId |
@@ -805,7 +805,8 @@ production-signed LaunchAgent/Keychain slot 继续精确返回 post-MVP
 automatic gate 正确，不表示 production signing PASS。P3.1 继续采用方案 b。P4.1 已由
 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、`46c6bb8` 完成 automatic Task 收口，
 P4.2 又由 `a6842bc` 完成 Link/Data cert、enrollment workflow、receipt IO、control-only
-RemoteTransport 与 trust reset。P4 当前为 2/7，下一项 P4.3 PairInvite/DeviceGrant。
+RemoteTransport 与 trust reset；P4.3 又完成 PairInvite/DeviceGrant/auth ledger/revoke/control handoff。P4 当前为
+3/7，下一项 P4.4 MachineLink→RuntimeCore。
 
 ### P4.1 machine identity / Keychain guard 排障
 
@@ -844,7 +845,8 @@ BLOCKED，不是 P4.1/P4.2 automatic PASS 证据。
 
 ### P4.2 machine enrollment / control-only transport / trust reset / purge 排障
 
-P4.2 current Runtime protocol 是 v3，physical schema 是 **v9 / 25 张表**。新增 authenticated
+P4.2 收口时 Runtime protocol 是 v3、physical schema 是 **v9 / 25 张表**；current P4.3 已升级为
+Runtime v4、schema v10/30 表。本节以下 enrollment/trust-reset lifecycle 仍保持兼容。P4.2 新增 authenticated
 `machine_remote_state` 与以下可公开的最小 lifecycle；status 只允许 Relay server ID、machine route、root
 fingerprint、trust epoch 和 bounded failure code，不得回显 code、origin/pin、cert、receipt、terminal 或 proof：
 
@@ -872,7 +874,7 @@ receipt trust-reset 不做网络或删除，只返回该安全操作提示。
 | `remote.local_input.unsafe` | bundle/receipt 不是 current-UID、single-link、no-follow、group/other 权限为零的 regular file | 修正可信原文件 owner/mode/nlink；禁止 symlink、hardlink、目录、FIFO 或宽权限副本 |
 | `remote.local_input.too_large` | 输入超过固定 64 KiB | 从可信 Relay 重新导出严格 DTO；禁止提高上界或截断 JSON |
 | `remote.local_input.invalid_json` | deny-unknown JSON、版本或 portable receipt shape/签名字段编码非法 | 不猜字段、不做宽松 decode；重新取得 current bundle/receipt |
-| `daemon.client.machine_status_invalid` | daemon 返回的 lifecycle/binding/failure-code 组合不满足 current Runtime v3 contract | 关闭 fd并升级 client/daemon到同一 candidate；不要展示部分 binding 或生成 purge 模板 |
+| `daemon.client.machine_status_invalid` | daemon 返回的 lifecycle/binding/failure-code 组合不满足 current Runtime v4 contract | 关闭 fd并升级 client/daemon到同一 candidate；不要展示部分 binding 或生成 purge 模板 |
 | `daemon.remote.administration.unavailable` | remote 显式禁用或未安装 production manager | 使用 stable remote-enabled daemon；ephemeral/no-remote 不得开启网络 |
 | `daemon.remote.start_not_armed` | recovery/UDS 尚未产生或 transport 已消费 `RemoteStartPermit` | 检查 startup ownership/order；不得绕过 permit直接连接 Relay |
 | `daemon.remote.shutting_down` | manager 正在停止 | 等待同一 daemon 完成 shutdown；不要并发 enroll/reset |
@@ -898,6 +900,33 @@ receipt trust-reset 不做网络或删除，只返回该安全操作提示。
 
 底层 `relay.client.*` / `relay.tls.*` code 继续按本页 Relay client/TLS 表处理。初次 connect 失败只保留一个不可
 Clone 的 exact retry state，重拨必须复用相同 authenticator、cert与 start permit；不得生成新 route/cert。
+
+#### P4.3 Pairing、grant 与 revoke
+
+Pairing 只允许 same-UID canonical Runtime v4 UDS 管理。invite absolute TTL 为 298 秒；RouteAccepted 不是
+grant/delivery 成功，只有 exact DeviceSign-signed `PairResponseReceived` 才能推进 delivered。错误后必须保留
+durable frozen state并用同一 idempotency key/pairing ID/grant serial 重试，不能重建 secret/grant：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `daemon.pairing.administration.unavailable` / `sink_unavailable` | production pairing coordinator 或 local pending sink 未安装 | 使用 stable remote-enabled daemon；不得用 diagnostics/fake coordinator 假成功 |
+| `daemon.pairing.actor_busy` / `actor_stopped` / `draining` | 有界 actor lane 已满、已停或正在 drain | 保留原请求，等待同一 actor/transport恢复后 exact retry；不要创建第二 coordinator |
+| `daemon.pairing.drain_pending` / `active` | pairing lane 未在 10 秒绝对 deadline 内收口，或 trust reset 与 active pairing 冲突 | 不 resume、不推进 retirement/cleanup；重试同一 Running drain，或先完成/取消 active pairing |
+| `daemon.pairing.invite_invalid` / `clock_invalid` / `entropy_unavailable` | invite binding、系统时钟或 CSPRNG 不满足 current contract | 网络前 fail-close；修复时钟/熵或重新生成新 invite，禁止延长旧 expiry |
+| `daemon.pairing.transport_unavailable` / `grant_recovery_unavailable` | 唯一 control transport 或 durable grant recovery row 暂不可用 | 保留 open/grant outbox并在同一 route/expiry/frozen bytes 上恢复；不要把 RouteAccepted 当成功 |
+| `daemon.pairing.request_invalid` / `pending.invalid` / `pending.identity_unavailable` / `pending.connection_unavailable` | PairRequest possession proof、local pending identity 或 directed local connection 无法验证 | 不产生 grant；重新建立 current local-control connection并让设备重发同一 canonical request |
+| `daemon.pairing.grant_request_invalid` / `grant_authority_mismatch` / `grant_allocation_invalid` / `key_state_conflict` | frozen request、machine authority、device route/serial 分配或 bootstrap KeyDirectory 不一致 | 保留 authenticated Store；不得任选一侧覆盖、换 route或重签部分对象 |
+| `daemon.pairing.grant_route_revoked` / `grant_serial_trust_reset_required` | 该 device route 已撤销，或 serial 到达不可安全递增边界 | 旧 route 不得复活；执行 machine trust reset/重新 enrollment 与重新 pairing |
+| `daemon.pairing.frozen_response_invalid` / `receipt_encoding_invalid` / `receipt_binding_mismatch` / `receipt_signature_invalid` | PairResponse 或 PairResponseReceived 的 canonical bytes/hash/TBS/signature 任一错绑 | 不推进 delivered、不擦除 secret；从 durable frozen artifact exact retry，禁止修改 receipt 字段 |
+| `daemon.pairing.terminal_invalid` / `already_completed` / `canceled` / `expired` | terminal 与 durable winner 不一致，或 pairing 已有 confirm/cancel/expiry 赢家 | 读取 canonical receipt；同动作只读 replay，输家不得逆转 first-valid CAS |
+| `daemon.pairing.revocation_authority_unavailable` / `revocation_authority_mismatch` / `revocation_grant_invalid` / `revocation_signing_failed` | revoke 所需 authority、exact grant/serial 或签名失败 | 保留 active/revoking ledger并 exact retry；不得跳到 revoked 或删除 device key |
+
+pairing startup/retention 遇到 `daemon.runtime.store_busy` / `store_unavailable` 等本地 Store code 时进入
+`LocalBlocked`：不得重拨 WSS，每轮只执行完整 `purge_expired_receipts → recover_generation`。status 以 actor
+health 为准，自愈后回到 Active；进入 block 前已排队的旧 admission epoch 命令必须有界失败，恢复后不得执行。
+
+P4.3 仍不处理业务 Runtime request/event。业务 frame 在 P4.4 接线前必须 fail-close；不得把 pairing/grant
+receipt 改写成 prompt/approval/command success。
 
 #### Trust reset 与本地 cleanup
 
@@ -927,7 +956,7 @@ portable receipt完成普通 trust-reset；`daemon uninstall --purge` 本身不�
 | `daemon.purge.daemon_not_running` / `pid_missing` / `pid_changed` / `daemon_still_running` / `socket_unsafe` | live daemon/PID/UDS无法建立稳定停止边界 | 停止操作并核对launchd、PID与socket identity；不得在进程仍可能运行时调用finalizer |
 | `daemon.purge.helper_missing` / `helper_unsafe` / `helper_mismatch` / `attestation_mismatch` / `attestation_changed` | retained helper不存在，或owner/mode/nlink/version/hash/signature发生变化 | 零删除；恢复同一已签名安装artifact，禁止换helper续做原plan |
 | `daemon.purge.namespace_invalid` / `install_layout_invalid` / `filesystem_unsafe` / `stopped_recovery_unsafe` / `stopped_permit_mismatch` | stable namespace、bin/current/plist/parent或stopped permit不满足exact安全布局 | 保留残余并修复真实安装布局；禁止symlink/hardlink/递归rm绕过 |
-| `daemon.purge.runtime_request_invalid` / `runtime_reply_invalid` / `runtime_readback_mismatch` | Runtime v3 purge request/reply不是exact plan或未读回`PurgeReadbackAbsent`+marker | 不bootout、不删文件；升级同一candidate并用原plan重试 |
+| `daemon.purge.runtime_request_invalid` / `runtime_reply_invalid` / `runtime_readback_mismatch` | current Runtime v4 purge request/reply不是exact plan或未读回`PurgeReadbackAbsent`+marker | 不bootout、不删文件；升级同一candidate并用原plan重试 |
 | `daemon.purge.key_item_conflict` / `storage_kek_missing` / `storage_kek_conflict` | machine key/guard/StorageKEK与frozen binding冲突或KEK在marker前已缺失 | 停止finalizer；DB absent或部分key absent不能补充授权 |
 | `daemon.purge.delete_readback_failed` / `cleanup_readback_failed` / `terminal_proof_failed` / `synchronization_failed` | 删除后仍可读、retained helper/bin仍存在、marker-missing终态证明或fsync失败 | 保留剩余artifact并exact retry；不得打印成功或假定最终一致 |
 | `daemon.purge.helper_failed` / `io_failed` | finalizer子进程或文件系统操作失败 | 读取稳定code与剩余exact paths，保持plan/marker；不要无计划续删 |

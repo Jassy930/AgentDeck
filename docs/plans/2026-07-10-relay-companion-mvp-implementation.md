@@ -6,7 +6,7 @@
 
 **Goal:** 交付一个真实可用的端到端 Companion MVP：每个被控 macOS 登录用户只有一个 `launchd` 常驻 `agentdeckd`，本地 App/CLI 与多个远程 macOS/iOS/CLI 客户端共享同一 RuntimeCore；Relay 严格最小可见，Codex 与 Claude Code 均通过真实链路完成浏览、prompt、审批、重连与多写者裁决。
 
-**Architecture:** P1–P3.8 先以 `RuntimeEnvelope v1` 建立 UDS/Core 基线；P3.9-C0 因新增 configuration、agent discovery 与 canonical metadata mutation，把共同业务 wire 原子升级为 `RuntimeEnvelope v2`，不提供 production v1/v2 双栈；P4.2 又 additive 升级为 Runtime v3，增加 local-only machine enrollment/status/trust-reset 与 uninstall purge plan，同样不保留 production v2/v3 双栈。`agentdeckd` 持有唯一 RuntimeCore、稳定 conversation 身份、SQLite journals、per-conversation actor、approval CAS 与两阶段 exec gate；Relay v2 只持有随机 route/stream/request 元数据、公开授权材料和 opaque sealed blob；Swift 的 `AgentDeckSessionSource` 统一本地与远程数据源，`AgentDeckRelayClient` 实现 WSS、CryptoKit、Keychain、replay 和 bounded stream。
+**Architecture:** P1–P3.8 先以 `RuntimeEnvelope v1` 建立 UDS/Core 基线；P3.9-C0 因新增 configuration、agent discovery 与 canonical metadata mutation，把共同业务 wire 原子升级为 `RuntimeEnvelope v2`，不提供 production v1/v2 双栈；P4.2 additive 升级为 Runtime v3，增加 local-only machine enrollment/status/trust-reset 与 uninstall purge plan；P4.3 再升级为 Runtime v4，增加 local-only pairing/revoke administration，同样不保留 production v3/v4 双栈。`agentdeckd` 持有唯一 RuntimeCore、稳定 conversation 身份、SQLite journals、per-conversation actor、approval CAS 与两阶段 exec gate；Relay v2 只持有随机 route/stream/request 元数据、公开授权材料和 opaque sealed blob；Swift 的 `AgentDeckSessionSource` 统一本地与远程数据源，`AgentDeckRelayClient` 实现 WSS、CryptoKit、Keychain、replay 和 bounded stream。
 
 **Tech Stack:** Rust 2024、Tokio、rusqlite/SQLite WAL、rustls、`hpke 0.14`、ChaCha20-Poly1305、Ed25519；Swift 6、Foundation/CryptoKit/URLSessionWebSocketTask、AppKit、UIKit、XCTest；macOS 15+、iOS 17+、XcodeGen、launchd、Linux systemd Relay。
 
@@ -153,12 +153,12 @@ pub enum StreamCursor { BeforeFirst, At(u64) }
 pub struct RuntimeEvent { pub conversation_id: ConversationId, pub event_id: EventId, pub event_seq: u64, pub item_id: Option<ItemId>, pub entity_id: Option<EntityId>, pub body: RuntimeEventBody }
 ```
 
-- [ ] Step 1: 写 contract/neutrality/limits tests。 覆盖 stable ID newtypes、deny-unknown、`BeforeFirst/At`、`next()`、RuntimeRequest 1 MiB、prompt 256 KiB、TransferEnvelope 的 1/64/65 parts、3.5 MiB/64 MiB、duplicate-same/duplicate-conflict、TTL/hash/reassembly cap，以及 `SessionCapabilities` 必须在 snapshot items 前；pending pairing 的 list/confirm/cancel DTO必须标为local-only administration。
-- [ ] Step 2: 运行 `cargo test -p agentdeck-protocol --test runtime_v1_contract`。 Expected: FAIL，缺少 `agentdeck_protocol::runtime`。
-- [ ] Step 3: 实现完整 DTO、构造校验和 `runtime_schema()`。 `RuntimeRequest` 必须覆盖 hello/catalog/subscribe/start/sendPrompt/resolveApproval/retryApproval/cancel/queryReceipt/createPairInvite/listPendingPairings/confirmPairing/cancelPairing/revoke/trust-reset；pending pairing admin请求只允许same-UID UDS `LocalPrincipal`，receipt 明确 `Accepted/Replayed/Failed` 与 approval 五种 delivery state。
-- [ ] Step 4: 运行 `UPDATE_RUNTIME_SCHEMA=1 cargo test -p agentdeck-protocol runtime_schema_matches_committed_snapshot`，再分别运行 `cargo test -p agentdeck-protocol --test runtime_v1_contract` 与 `cargo test -p agentdeck-protocol --test transfer_envelope`。 Expected: 全部PASS且生成独立Runtime schema。
-- [ ] Step 5: 运行 `cargo fmt --all --check` 与 `git diff --check`。
-- [ ] Step 6: 提交。 `git add agentdeck-protocol protocol/agentdeck/runtime-protocol.schema.json && git commit -m "feat(protocol): 定义 RuntimeEnvelope v1 中立契约"`
+- [x] Step 1: 写 contract/neutrality/limits tests。 覆盖 stable ID newtypes、deny-unknown、`BeforeFirst/At`、`next()`、RuntimeRequest 1 MiB、prompt 256 KiB、TransferEnvelope 的 1/64/65 parts、3.5 MiB/64 MiB、duplicate-same/duplicate-conflict、TTL/hash/reassembly cap，以及 `SessionCapabilities` 必须在 snapshot items 前；pending pairing 的 list/confirm/cancel DTO必须标为local-only administration。
+- [x] Step 2: 运行 `cargo test -p agentdeck-protocol --test runtime_v1_contract`。 Expected: FAIL，缺少 `agentdeck_protocol::runtime`。
+- [x] Step 3: 实现完整 DTO、构造校验和 `runtime_schema()`。 `RuntimeRequest` 必须覆盖 hello/catalog/subscribe/start/sendPrompt/resolveApproval/retryApproval/cancel/queryReceipt/createPairInvite/listPendingPairings/confirmPairing/cancelPairing/revoke/trust-reset；pending pairing admin请求只允许same-UID UDS `LocalPrincipal`，receipt 明确 `Accepted/Replayed/Failed` 与 approval 五种 delivery state。
+- [x] Step 4: 运行 `UPDATE_RUNTIME_SCHEMA=1 cargo test -p agentdeck-protocol runtime_schema_matches_committed_snapshot`，再分别运行 `cargo test -p agentdeck-protocol --test runtime_v1_contract` 与 `cargo test -p agentdeck-protocol --test transfer_envelope`。 Expected: 全部PASS且生成独立Runtime schema。
+- [x] Step 5: 运行 `cargo fmt --all --check` 与 `git diff --check`。
+- [x] Step 6: 提交。 `git add agentdeck-protocol protocol/agentdeck/runtime-protocol.schema.json && git commit -m "feat(protocol): 定义 RuntimeEnvelope v1 中立契约"`
 
 ### Task P1.2：定义 Relay v2 opaque contract、公开授权对象与 E2EE context
 
@@ -180,12 +180,12 @@ pub struct MachineEnrollmentRequestV1 { pub code: EnrollmentCode, pub machine_ro
 pub struct MachineEnrollmentResponseV1 { pub relay_server_id: RelayServerId, pub machine_route: MachineRouteId, pub trust_epoch: u64, pub receipt_hash: [u8; 32] }
 ```
 
-- [ ] Step 1: 写v2 schema、bad-frame corpus、binary codec与neutrality tests。 route/generation ID必须恰为128-bit随机值且不可比较/复用；trust epoch/link generation/grant serial/key revision是u64单调值，到MAX必须reset/rekey且禁止wrap；grant/cert/revocation/enrollment DTO有确定字段；production WS codec固定`ADRV2` magic + big-endian version/kind + length-prefixed字段，Rust↔Swift逐字节fixture覆盖每个family；3.5MiB part完整frame≤4MiB，4MiB+1解析前拒绝；schema扫描禁止业务字段与createdAt。
-- [ ] Step 2: 运行 `cargo test -p agentdeck-protocol --test relay_v2_contract`。 Expected: FAIL，缺少 `relay_v2` 与 `e2ee` module。
-- [ ] Step 3: 实现所有§10.1 family、受限pairing handshake role、TLS machine enrollment request/response、binary codec、TBS/OuterContext/三种HPKE info、公开grant/cert/revocation，以及版本化`PairInviteV1/PairRequestV1/PairPendingV1/PairResponseV1/PairResponseReceivedV1/DeviceAuthorizationV1/KeyDirectoryV1/KeyUpdateV1/EpochBarrierV1/SealedPayloadV1`。`PairResponseReceivedV1`由DeviceSign签名并绑定request/grant/response hash。E2EE type-state固定`UnsignedSealedBlobV1 → SignedSealedBlobV1 → VerifiedSealedBlobV1`，Publish/outbound只接收Signed，AEAD open只接收Verified；P1保留旧Relay v1 namespace。
-- [ ] Step 4: 运行 `UPDATE_RELAY_SCHEMA=1 UPDATE_E2EE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot`，再分别运行 `cargo test -p agentdeck-protocol --test relay_v2_contract`、`cargo test -p agentdeck-protocol --test relay_v2_neutrality`、`cargo test -p agentdeck-protocol --test e2ee_canonical_contract`。 Expected: Relay outer与endpoint E2EE snapshot彼此独立且PASS；旧IPC/Relay v1测试仍绿。
-- [ ] Step 5: 运行 `cargo fmt --all --check`、`git diff --check`。
-- [ ] Step 6: 提交。 `git add agentdeck-protocol protocol/agentdeck/relay-v2.schema.json protocol/agentdeck/e2ee-v1.schema.json && git commit -m "feat(protocol): 定义 Relay v2 与 E2EE 契约"`
+- [x] Step 1: 写v2 schema、bad-frame corpus、binary codec与neutrality tests。 route/generation ID必须恰为128-bit随机值且不可比较/复用；trust epoch/link generation/grant serial/key revision是u64单调值，到MAX必须reset/rekey且禁止wrap；grant/cert/revocation/enrollment DTO有确定字段；production WS codec固定`ADRV2` magic + big-endian version/kind + length-prefixed字段，Rust↔Swift逐字节fixture覆盖每个family；3.5MiB part完整frame≤4MiB，4MiB+1解析前拒绝；schema扫描禁止业务字段与createdAt。
+- [x] Step 2: 运行 `cargo test -p agentdeck-protocol --test relay_v2_contract`。 Expected: FAIL，缺少 `relay_v2` 与 `e2ee` module。
+- [x] Step 3: 实现所有§10.1 family、受限pairing handshake role、TLS machine enrollment request/response、binary codec、TBS/OuterContext/三种HPKE info、公开grant/cert/revocation，以及版本化`PairInviteV1/PairRequestV1/PairPendingV1/PairResponseV1/PairResponseReceivedV1/DeviceAuthorizationV1/KeyDirectoryV1/KeyUpdateV1/EpochBarrierV1/SealedPayloadV1`。`PairResponseReceivedV1`由DeviceSign签名并绑定request/grant/response hash。E2EE type-state固定`UnsignedSealedBlobV1 → SignedSealedBlobV1 → VerifiedSealedBlobV1`，Publish/outbound只接收Signed，AEAD open只接收Verified；P1保留旧Relay v1 namespace。
+- [x] Step 4: 运行 `UPDATE_RELAY_SCHEMA=1 UPDATE_E2EE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot`，再分别运行 `cargo test -p agentdeck-protocol --test relay_v2_contract`、`cargo test -p agentdeck-protocol --test relay_v2_neutrality`、`cargo test -p agentdeck-protocol --test e2ee_canonical_contract`。 Expected: Relay outer与endpoint E2EE snapshot彼此独立且PASS；旧IPC/Relay v1测试仍绿。
+- [x] Step 5: 运行 `cargo fmt --all --check`、`git diff --check`。
+- [x] Step 6: 提交。 `git add agentdeck-protocol protocol/agentdeck/relay-v2.schema.json protocol/agentdeck/e2ee-v1.schema.json && git commit -m "feat(protocol): 定义 Relay v2 与 E2EE 契约"`
 
 ### Task P1.3：拆分 IPC/Runtime/Relay/E2EE schema CLI
 
@@ -196,12 +196,12 @@ pub struct MachineEnrollmentResponseV1 { pub relay_server_id: RelayServerId, pub
 - Modify: `protocol/agentdeck/agentdeck-protocol.schema.json`
 - Modify: `protocol/agentdeck/README.md`
 
-- [ ] Step 1: 写CLI integration test。 分别执行`agentdeck protocol schema|runtime-schema|relay-schema|e2ee-schema`，断言stdout与四份snapshot byte-identical，并断言命令不尝试spawn daemon。
-- [ ] Step 2: 运行 `cargo test -p agentdeck-cli --test protocol_schema_exports`。 Expected: FAIL，三个新subcommand尚不存在。
-- [ ] Step 3: 把protocol command dispatch移到构造`Client`之前；四个subcommand直接调用各自schema函数。 从aggregate IPC schema删除Relay v1 entries但`PROTOCOL_VERSION`保持2；运行`UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot`更新IPC快照。
-- [ ] Step 4: 分别运行 `cargo run -q -p agentdeck-cli -- protocol schema | diff - protocol/agentdeck/agentdeck-protocol.schema.json`、`cargo run -q -p agentdeck-cli -- protocol runtime-schema | diff - protocol/agentdeck/runtime-protocol.schema.json`、`cargo run -q -p agentdeck-cli -- protocol relay-schema | diff - protocol/agentdeck/relay-v2.schema.json`、`cargo run -q -p agentdeck-cli -- protocol e2ee-schema | diff - protocol/agentdeck/e2ee-v1.schema.json`，再运行integration test。 Expected: 全部exit 0。
-- [ ] Step 5: 更新 `protocol/agentdeck/README.md` 的版本轴和 regeneration 命令；运行 docs gate。
-- [ ] Step 6: 提交。 `git add agentdeck-cli agentdeck-protocol protocol/agentdeck && git commit -m "feat(cli): 拆分四层协议 schema 导出"`
+- [x] Step 1: 写CLI integration test。 分别执行`agentdeck protocol schema|runtime-schema|relay-schema|e2ee-schema`，断言stdout与四份snapshot byte-identical，并断言命令不尝试spawn daemon。
+- [x] Step 2: 运行 `cargo test -p agentdeck-cli --test protocol_schema_exports`。 Expected: FAIL，三个新subcommand尚不存在。
+- [x] Step 3: 把protocol command dispatch移到构造`Client`之前；四个subcommand直接调用各自schema函数。 从aggregate IPC schema删除Relay v1 entries但`PROTOCOL_VERSION`保持2；运行`UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot`更新IPC快照。
+- [x] Step 4: 分别运行 `cargo run -q -p agentdeck-cli -- protocol schema | diff - protocol/agentdeck/agentdeck-protocol.schema.json`、`cargo run -q -p agentdeck-cli -- protocol runtime-schema | diff - protocol/agentdeck/runtime-protocol.schema.json`、`cargo run -q -p agentdeck-cli -- protocol relay-schema | diff - protocol/agentdeck/relay-v2.schema.json`、`cargo run -q -p agentdeck-cli -- protocol e2ee-schema | diff - protocol/agentdeck/e2ee-v1.schema.json`，再运行integration test。 Expected: 全部exit 0。
+- [x] Step 5: 更新 `protocol/agentdeck/README.md` 的版本轴和 regeneration 命令；运行 docs gate。
+- [x] Step 6: 提交。 `git add agentdeck-cli agentdeck-protocol protocol/agentdeck && git commit -m "feat(cli): 拆分四层协议 schema 导出"`
 
 ### Task P1.4：建立 Rust canonical/signature/HPKE/AEAD crate
 
@@ -225,12 +225,12 @@ pub fn verify_sealed(blob: SignedSealedBlobV1, key: &VerifyingKey, context: &Out
 pub fn open_symmetric(key: &AeadReceivingKey, context: &OuterContextV1, blob: VerifiedSealedBlobV1) -> Result<Vec<u8>, CryptoError>;
 ```
 
-- [ ] Step 1: 写fixed-seed golden tests。 固化长度前缀canonical bytes、SHA-256结果、Ed25519、HPKE Base、AEAD ciphertext/tag；nonce逐字节固定为`32-bit prefix || 64-bit big-endian counter`；复用prefix+counter、tamper任一路由/version/epoch/counter/hash/AAD或sender signature必须失败。
-- [ ] Step 2: 运行 `cargo test -p agentdeck-crypto --test golden_vectors`。 Expected: FAIL，workspace member 不存在。
-- [ ] Step 3: 新建crate，依赖方向固定为`agentdeck-crypto -> agentdeck-protocol`；HPKE固定为`hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }`，测试RNG实现该crate重导出的`rand_core` trait；允许HPKE与Ed25519依赖各自兼容的sha2底层版本，但禁止第二套HPKE/AEAD高层实现；所有secret wrapper zeroize-on-drop且Debug不输出材料。
-- [ ] Step 4: 运行 golden test 与 `cargo tree -p agentdeck-crypto`。 Expected: vectors PASS；不存在第二套 HPKE/AEAD 实现。
-- [ ] Step 5: 运行 `cargo fmt --all --check`、`cargo clippy -p agentdeck-crypto --all-targets -- -D warnings`。
-- [ ] Step 6: 提交。 `git add Cargo.toml Cargo.lock agentdeck-crypto protocol/agentdeck/crypto-vectors-v1.json && git commit -m "feat(crypto): 固化 Relay E2EE canonical 与密码套件"`
+- [x] Step 1: 写fixed-seed golden tests。 固化长度前缀canonical bytes、SHA-256结果、Ed25519、HPKE Base、AEAD ciphertext/tag；nonce逐字节固定为`32-bit prefix || 64-bit big-endian counter`；复用prefix+counter、tamper任一路由/version/epoch/counter/hash/AAD或sender signature必须失败。
+- [x] Step 2: 运行 `cargo test -p agentdeck-crypto --test golden_vectors`。 Expected: FAIL，workspace member 不存在。
+- [x] Step 3: 新建crate，依赖方向固定为`agentdeck-crypto -> agentdeck-protocol`；HPKE固定为`hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }`，测试RNG实现该crate重导出的`rand_core` trait；允许HPKE与Ed25519依赖各自兼容的sha2底层版本，但禁止第二套HPKE/AEAD高层实现；所有secret wrapper zeroize-on-drop且Debug不输出材料。
+- [x] Step 4: 运行 golden test 与 `cargo tree -p agentdeck-crypto`。 Expected: vectors PASS；不存在第二套 HPKE/AEAD 实现。
+- [x] Step 5: 运行 `cargo fmt --all --check`、`cargo clippy -p agentdeck-crypto --all-targets -- -D warnings`。
+- [x] Step 6: 提交。 `git add Cargo.toml Cargo.lock agentdeck-crypto protocol/agentdeck/crypto-vectors-v1.json && git commit -m "feat(crypto): 固化 Relay E2EE canonical 与密码套件"`
 
 ### Task P1.5：实现 crash-safe counter 与 replay window 纯状态机
 
@@ -248,12 +248,12 @@ pub struct ReplayWindow { high_water: Option<u64>, floor: u64, hashes: BTreeMap<
 impl ReplayWindow { pub fn observe(&mut self, counter: u64, ciphertext_hash: [u8; 32]) -> Result<ReplayDisposition, CryptoError>; }
 ```
 
-- [ ] Step 1: 写 block=1,024、near-u64-max、Keychain ahead/behind、window=4,096、exact duplicate、same counter/different hash、below-floor tests。
-- [ ] Step 2: 运行 `cargo test -p agentdeck-crypto --test counter_recovery --test replay_window`。 Expected: FAIL，module 不存在。
-- [ ] Step 3: 实现无 IO 的 deterministic state machines。 `NonceReuse` 只对窗口内同 counter 不同 hash；低于 floor 返回 `Stale`；DB 小于 guard 返回 `DbRollback`，不能产生可用 counter。
-- [ ] Step 4: 重跑两套 tests。 Expected: 全部 PASS，proptest/边界循环不 panic。
-- [ ] Step 5: 运行 crypto crate clippy 与 fmt。
-- [ ] Step 6: 提交。 `git add agentdeck-crypto && git commit -m "feat(crypto): 加入 counter guard 与 replay window 状态机"`
+- [x] Step 1: 写 block=1,024、near-u64-max、Keychain ahead/behind、window=4,096、exact duplicate、same counter/different hash、below-floor tests。
+- [x] Step 2: 运行 `cargo test -p agentdeck-crypto --test counter_recovery --test replay_window`。 Expected: FAIL，module 不存在。
+- [x] Step 3: 实现无 IO 的 deterministic state machines。 `NonceReuse` 只对窗口内同 counter 不同 hash；低于 floor 返回 `Stale`；DB 小于 guard 返回 `DbRollback`，不能产生可用 counter。
+- [x] Step 4: 重跑两套 tests。 Expected: 全部 PASS，proptest/边界循环不 panic。
+- [x] Step 5: 运行 crypto crate clippy 与 fmt。
+- [x] Step 6: 提交。 `git add agentdeck-crypto && git commit -m "feat(crypto): 加入 counter guard 与 replay window 状态机"`
 
 ### Task P1.6：建立 CryptoKit mirror 与 Rust↔Swift 互操作门禁
 
@@ -278,12 +278,12 @@ public enum RelayCrypto {
 }
 ```
 
-- [ ] Step 1: 写 Swift tests 读取同一 `crypto-vectors-v1.json`。 固定向量覆盖 canonical/TBS/AAD/signature/ChaChaPoly 与 Rust fixed HPKE→Swift open；动态 test 启动 `hpke_probe`，由 Rust 生成 recipient，Swift seal，Rust open 回显 plaintext。
-- [ ] Step 2: 运行 `swift test --filter RelayCryptoVectorTests`。 Expected: FAIL，target 与类型不存在。
-- [ ] Step 3: 在 Package 增加 `AgentDeckRelayClient` library/test target的最小 Crypto 部分；使用 `HPKE.Ciphersuite.Curve25519_SHA256_ChachaPoly`，不伪造可注入 RNG 的 Swift API。
-- [ ] Step 4: 运行 `bash scripts/verify-cross-language-crypto.sh`、`swift test --filter RelayCryptoVectorTests`、`cargo test -p agentdeck-crypto`。 Expected: 固定与动态双向门禁全部 PASS。
-- [ ] Step 5: 运行完整 `swift test` 与 `cargo test`，确认旧 v1 默认路径无回归。
-- [ ] Step 6: 提交。 `git add Package.swift Sources/AgentDeckRelayClient Tests/AgentDeckRelayClientTests agentdeck-crypto scripts/verify-cross-language-crypto.sh && git commit -m "feat(swift): 建立 CryptoKit 与 Rust E2EE 互操作门禁"`
+- [x] Step 1: 写 Swift tests 读取同一 `crypto-vectors-v1.json`。 固定向量覆盖 canonical/TBS/AAD/signature/ChaChaPoly 与 Rust fixed HPKE→Swift open；动态 test 启动 `hpke_probe`，由 Rust 生成 recipient，Swift seal，Rust open 回显 plaintext。
+- [x] Step 2: 运行 `swift test --filter RelayCryptoVectorTests`。 Expected: FAIL，target 与类型不存在。
+- [x] Step 3: 在 Package 增加 `AgentDeckRelayClient` library/test target的最小 Crypto 部分；使用 `HPKE.Ciphersuite.Curve25519_SHA256_ChachaPoly`，不伪造可注入 RNG 的 Swift API。
+- [x] Step 4: 运行 `bash scripts/verify-cross-language-crypto.sh`、`swift test --filter RelayCryptoVectorTests`、`cargo test -p agentdeck-crypto`。 Expected: 固定与动态双向门禁全部 PASS。
+- [x] Step 5: 运行完整 `swift test` 与 `cargo test`，确认旧 v1 默认路径无回归。
+- [x] Step 6: 提交。 `git add Package.swift Sources/AgentDeckRelayClient Tests/AgentDeckRelayClientTests agentdeck-crypto scripts/verify-cross-language-crypto.sh && git commit -m "feat(swift): 建立 CryptoKit 与 Rust E2EE 互操作门禁"`
 
 ### Task P1.7：建立 Swift Runtime v1 与 Relay v2 wire mirror
 
@@ -296,12 +296,12 @@ public enum RelayCrypto {
 - Create: `protocol/agentdeck/fixtures/relay-v2-wire-vectors.json`
 - Modify: `agentdeck-protocol/tests/{runtime_v1_contract,relay_v2_contract}.rs`
 
-- [ ] Step 1: 让Rust tests在`UPDATE_WIRE_FIXTURES=1`时生成fixture，默认只比较已提交内容；Runtime JSONL覆盖stable IDs/receipts/snapshot/transfer，Relay vector JSON记录每个outer family的input字段与`RelayWireCodecV2`期望hex bytes，并逐变体覆盖PairInvite/PairRequest/PairResponse/DeviceAuthorization/KeyDirectory/KeyUpdate/EpochBarrier/SealedPayload；Swift mirror扫描禁止业务字段和vendor resume reference。
-- [ ] Step 2: 运行 `swift test --filter RuntimeV1ProtocolTests` 与 `swift test --filter RelayV2WireTests`。 Expected: FAIL，Swift mirror不存在。
-- [ ] Step 3: 在AgentDeckCore手写中立Runtime Codable/Sendable mirror，在AgentDeckRelayClient手写opaque Relay mirror；字段名与deny-unknown行为以Rust fixtures为准。 不在Swift定义vendor resume reference，不把CryptoKit类型放进AgentDeckCore。
-- [ ] Step 4: 运行Rust fixture producers和两套Swift tests，再用`git diff --exit-code protocol/agentdeck/fixtures`检查稳定性。 Expected: Runtime decode→normalized JSON语义等价，Relay binary codec与canonical TBS/AAD逐字节一致，fixture无漂移。
-- [ ] Step 5: 运行 `swift test`、`cargo test -p agentdeck-protocol`。
-- [ ] Step 6: 提交。 `git add Sources Tests agentdeck-protocol protocol/agentdeck/fixtures && git commit -m "feat(protocol): 对齐 Swift Runtime 与 Relay v2 wire"`
+- [x] Step 1: 让Rust tests在`UPDATE_WIRE_FIXTURES=1`时生成fixture，默认只比较已提交内容；Runtime JSONL覆盖stable IDs/receipts/snapshot/transfer，Relay vector JSON记录每个outer family的input字段与`RelayWireCodecV2`期望hex bytes，并逐变体覆盖PairInvite/PairRequest/PairResponse/DeviceAuthorization/KeyDirectory/KeyUpdate/EpochBarrier/SealedPayload；Swift mirror扫描禁止业务字段和vendor resume reference。
+- [x] Step 2: 运行 `swift test --filter RuntimeV1ProtocolTests` 与 `swift test --filter RelayV2WireTests`。 Expected: FAIL，Swift mirror不存在。
+- [x] Step 3: 在AgentDeckCore手写中立Runtime Codable/Sendable mirror，在AgentDeckRelayClient手写opaque Relay mirror；字段名与deny-unknown行为以Rust fixtures为准。 不在Swift定义vendor resume reference，不把CryptoKit类型放进AgentDeckCore。
+- [x] Step 4: 运行Rust fixture producers和两套Swift tests，再用`git diff --exit-code protocol/agentdeck/fixtures`检查稳定性。 Expected: Runtime decode→normalized JSON语义等价，Relay binary codec与canonical TBS/AAD逐字节一致，fixture无漂移。
+- [x] Step 5: 运行 `swift test`、`cargo test -p agentdeck-protocol`。
+- [x] Step 6: 提交。 `git add Sources Tests agentdeck-protocol protocol/agentdeck/fixtures && git commit -m "feat(protocol): 对齐 Swift Runtime 与 Relay v2 wire"`
 
 ---
 
@@ -334,12 +334,12 @@ impl RelayStoreHandle {
 
 **SQLite schema:** `relay_meta`、`machine_routes`、`device_grants`、`revocations`、`streams`、`frames`、`subscriptions`、`enrollment_codes`；后者除code hash/expiry/consumed外还保存首次成功请求的`request_hash`与冻结`response_blob/receipt_hash`，用于COMMIT后响应丢失的同请求幂等取回。字段逐项采用设计§11.1，`received_at`/`size`只由Relay计算，`sealed_blob`原样保存，challenge/PairRoute/active writer不落盘。
 
-- [ ] Step 1: 写store integration tests。 覆盖fresh migration、higher schema reject、legacy schema签名触发reset、0700/0600、WAL/FULL/FK/5s、stream HWM=-1、第一帧0、duplicate-same/conflict、COMMIT fault、restart byte-identical sealedBlob、count/bytes/time/machine/global/disk-low cap；`replay_page`每页最多64 frames/8MiB并用opaque cursor继续，禁止一次物化64MiB retention。
-- [ ] Step 2: 运行 `cargo test -p agentdeck-relay --features server --test relay_v2_store -- --test-threads=1`。 Expected: FAIL，`v2::store` 不存在。
-- [ ] Step 3: 实现单 blocking worker 独占 `rusqlite::Connection`。 `publish` 在一个 `BEGIN IMMEDIATE` 中完成 generation/seq/hash 校验、insert、HWM/bytes、retention；所有方法返回 Result，禁止 `expect`/panic/eprintln-then-continue。
-- [ ] Step 4: 重跑 store test并用 `rg -n 'expect\(|unwrap\(' agentdeck-relay/src/v2/store` 人工复核。 Expected: tests PASS；生产 store 不含无解释的 panic path。
-- [ ] Step 5: 更新 `docs/AGENT_DIAGNOSTICS.md` 的 v2 store failure codes；运行 docs gate。
-- [ ] Step 6: 提交。 `git add agentdeck-relay docs/AGENT_DIAGNOSTICS.md && git commit -m "feat(relay): 建立 v2 SQLite store actor"`
+- [x] Step 1: 写store integration tests。 覆盖fresh migration、higher schema reject、legacy schema签名触发reset、0700/0600、WAL/FULL/FK/5s、stream HWM=-1、第一帧0、duplicate-same/conflict、COMMIT fault、restart byte-identical sealedBlob、count/bytes/time/machine/global/disk-low cap；`replay_page`每页最多64 frames/8MiB并用opaque cursor继续，禁止一次物化64MiB retention。
+- [x] Step 2: 运行 `cargo test -p agentdeck-relay --features server --test relay_v2_store -- --test-threads=1`。 Expected: FAIL，`v2::store` 不存在。
+- [x] Step 3: 实现单 blocking worker 独占 `rusqlite::Connection`。 `publish` 在一个 `BEGIN IMMEDIATE` 中完成 generation/seq/hash 校验、insert、HWM/bytes、retention；所有方法返回 Result，禁止 `expect`/panic/eprintln-then-continue。
+- [x] Step 4: 重跑 store test并用 `rg -n 'expect\(|unwrap\(' agentdeck-relay/src/v2/store` 人工复核。 Expected: tests PASS；生产 store 不含无解释的 panic path。
+- [x] Step 5: 更新 `docs/AGENT_DIAGNOSTICS.md` 的 v2 store failure codes；运行 docs gate。
+- [x] Step 6: 提交。 `git add agentdeck-relay docs/AGENT_DIAGNOSTICS.md && git commit -m "feat(relay): 建立 v2 SQLite store actor"`
 
 ### Task P2.2：实现 challenge、MachineLink/DeviceLink 鉴权与单调防回退
 
@@ -356,12 +356,12 @@ pub fn verify_authentication(frame: Authenticate, challenge: ConsumedChallenge, 
 pub fn authorize_pairing_route(hello: PairingHello, routes: &PairRouteView) -> Result<PairingAccess, RelayFailure>;
 ```
 
-- [ ] Step 1: 写challenge/auth tests。 覆盖replay、30s expiry、并发双消费、capacity/token bucket、connection/server/version/route/serial/cert hash transcript binding、同serial同hash幂等、同serial异hash、较低generation、cross-machine grant、revoked tombstone；未配对设备只能凭active pairRoute建立受TTL/rate限制的`PairingAccess`，且只能发送PairData/ClosePairRoute。
-- [ ] Step 2: 运行 auth e2e。 Expected: FAIL，auth v2 module 不存在。
-- [ ] Step 3: 实现内存 challenge registry、root/link/device 验签、持久最高 generation/serial gate和单 active generation CAS。 active connection replacement 只在新鉴权完全通过后发生。
-- [ ] Step 4: 重跑 auth e2e。 Expected: 所有恶意输入返回固定 `relay.auth.*`/`relay.route.*` code，不泄漏验签细节。
-- [ ] Step 5: 运行 `cargo clippy -p agentdeck-relay --features server --all-targets -- -D warnings`。
-- [ ] Step 6: 提交。 `git add agentdeck-relay && git commit -m "feat(relay): 加入 v2 challenge 与单调授权校验"`
+- [x] Step 1: 写challenge/auth tests。 覆盖replay、30s expiry、并发双消费、capacity/token bucket、connection/server/version/route/serial/cert hash transcript binding、同serial同hash幂等、同serial异hash、较低generation、cross-machine grant、revoked tombstone；未配对设备只能凭active pairRoute建立受TTL/rate限制的`PairingAccess`，且只能发送PairData/ClosePairRoute。
+- [x] Step 2: 运行 auth e2e。 Expected: FAIL，auth v2 module 不存在。
+- [x] Step 3: 实现内存 challenge registry、root/link/device 验签、持久最高 generation/serial gate和单 active generation CAS。 active connection replacement 只在新鉴权完全通过后发生。
+- [x] Step 4: 重跑 auth e2e。 Expected: 所有恶意输入返回固定 `relay.auth.*`/`relay.route.*` code，不泄漏验签细节。
+- [x] Step 5: 运行 `cargo clippy -p agentdeck-relay --features server --all-targets -- -D warnings`。
+- [x] Step 6: 提交。 `git add agentdeck-relay && git commit -m "feat(relay): 加入 v2 challenge 与单调授权校验"`
 
 ### Task P2.3：实现 stream router、replay、ACK/gap 与慢 writer 隔离
 
@@ -1075,7 +1075,7 @@ ignored/BLOCKED；P3.7 exec gate 主体、边界裁决、两个 prepare finding 
 `c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；P3.8 production UDS 与后续
 P3.9 shared-daemon client 与 P3.10 LaunchAgent Task 已完成；P3.10 code/test commit 为 `19622ab`，
 后续 Phase hardening code baseline 为 `9efb28d`，P3 automatic scope 已完成 6/6 Phase Exit；P4
-已由 P4.1/P4.2 推进到 2/7，下一项是 P4.3 PairInvite/DeviceGrant；E2EE/Relay Publish 仍未完成。
+已由 P4.1/P4.2/P4.3 推进到 3/7，下一项是 P4.4 MachineLink→RuntimeCore；E2EE/Relay Publish 仍未完成。
 
 ### Task P3.6-A：先冻结 Runtime/E2EE contract 与跨语言 wire
 
@@ -2468,7 +2468,7 @@ P3.9 固定以下迁移边界：
   真实 Codex/CC login 与 provisioned signed Keychain 继续是 post-MVP BLOCKED 槽位，不冒充本 Task 证据。
   P3.9 至此完成；P3.10 已由 `19622ab` 完成 Task 收口并通过完整 verifier 与双路 Task 终审；后续
   Phase review hardening 已由 `773a2b3` / `0057824` / `81cc314` / `9efb28d` 收口，P3 automatic scope
-  已完成 6/6 Phase Exit。后续 P4.1/P4.2 已完成，P4 当前为 2/7，下一项是 P4.3。
+  已完成 6/6 Phase Exit。后续 P4.1/P4.2/P4.3 已完成，P4 当前为 3/7，下一项是 P4.4。
 
 ### Task P3.10：实现 LaunchAgent 安装、versioned upgrade 与保留数据的 uninstall
 
@@ -2478,8 +2478,8 @@ P3.9 固定以下迁移边界：
 > code/test，并由 `19622ab` scoped commit。冻结 candidate 的完整
 > `bash scripts/verify-relay-companion-mvp.sh p3` 已 exit 0，两路 Task review 均 Approved、无 P0/P1/P2；
 > 隔离 ephemeral UDS 已完成 install→stage→ACK→idle→手动 current restart→Hello；后续 Phase review
-> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。后续 P4.1/P4.2 已完成，P4 当前为
-> 2/7，下一项是 P4.3。
+> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。后续 P4.1/P4.2/P4.3 已完成，P4 当前为
+> 3/7，下一项是 P4.4。
 
 **前置冻结：** local-only typed `StageUpgrade` request/reply、授权与错误语义已纳入 P3.9-C0-A 的 Runtime
 v2 contract；P3.9 的历史基线固定返回 typed feature-unavailable，P3.10 implementation 已用 durable/flush-ACK
@@ -2558,17 +2558,18 @@ focused tests + scoped Clippy/fmt，不做子片级双路终审、全量慢门�
 - [x] 四 schema、daemon network boundary、agent docs、local smoke、diagnostics 与 scoped diff/status 全绿；
   冻结 candidate 的两路 phase code review 均为 P0/P1/P2=0。
 - [x] P3 标记为 `complete (automatic scope)`；provisioned production-signed LaunchAgent/Keychain
-  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。后续 P4.1/P4.2 已完成，P4 当前为 2/7，
-  下一项是 P4.3。
+  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。后续 P4.1/P4.2/P4.3 已完成，P4 当前为 3/7，
+  下一项是 P4.4。
 
 ---
 
 ## Phase P4：Machine identity、Pairing 与 RemoteLink
 
-> **当前状态（2026-07-20）：2/7 Task 完成。** P4.1 machine identity/guard 与 P4.2
-> certificate/enrollment/control-only RemoteTransport/trust reset automatic scope 已完成 Task 级完整门禁与
-> 双路 Approved；下一项是 P4.3 PairInvite/DeviceGrant。P4.3–P4.7 与 P4 Phase Exit 仍未完成，其
-> checkbox 保持未勾。此前 0/7、1/7 分别是 P4.1/P4.2 开始前的历史基线。
+> **当前状态（2026-07-21）：3/7 Task 完成。** P4.1 machine identity/guard、P4.2
+> certificate/enrollment/control-only RemoteTransport/trust reset 与 P4.3 PairInvite/DeviceGrant/auth ledger
+> automatic scope 已完成 Task 级完整门禁与双路 Approved；下一项是 P4.4 MachineLink→RuntimeCore。
+> P4.4–P4.7 与 P4 Phase Exit 仍未完成，其 checkbox 保持未勾。此前 0/7、1/7、2/7 分别是
+> P4.1/P4.2/P4.3 开始前的历史基线。
 
 ### Task P4.1：扩展 macOS Keychain 为 Machine identity 与 CounterGuard（零 cert/enrollment/RemoteLink）
 
@@ -2803,6 +2804,11 @@ production-signed Keychain 槽位；继续精确记为 post-MVP BLOCKED，不计
 
 ### Task P4.3：实现 PairInvite、本机指纹确认、byte-stable PairRequest、DeviceGrant 与本机 auth ledger
 
+> **状态：Task complete。** 主体 code/test commit 为 `518380e`，后续 ownership/recovery hardening 为
+> `b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`，Runtime v4 gate repair 为 `fe3a9ad`，最终
+> shutdown/startup/local-recovery hardening 与 v10 inventory/ledger/cipher fixture gate 为 `3b4b977`。current Runtime
+> protocol 为 v4，physical schema 为 v10/30 表；下一项为 P4.4。
+
 **Files:**
 - Create: `agentdeckd/src/remote/{pairing,grants,access,key_directory}.rs`
 - Create: `agentdeckd/tests/pairing_state_machine.rs`
@@ -2823,12 +2829,39 @@ impl PairingCoordinator { pub async fn handle_pair_data(&self, context: PairRout
 pub struct VerifiedPairRequest { pub request_hash: [u8; 32], pub device_sign_key: PublicKeyBytes, pub device_hpke_key: PublicKeyBytes, pub authorization_request: AuthorizationRequest }
 ```
 
-- [ ] Step 1: 写pairing tests。create invite必须先持久化open outbox，再`OpenPairRoute`并等待Relay ACK，打开失败不返回invite；daemon/Relay重启用相同route/absolute expiry幂等重开。delivered/expired/canceled先持久化terminal close outbox，只有Closed/AlreadyAbsent ACK后擦除临时材料；逐个注入Open/Close ACK前后crash。覆盖5m/单次/最多8 invites及完整`routeOpening→unused→preparing(requestHash,frozenRequest)→awaitingLocalConfirmation→grantPreparing(frozenGrantArtifacts)→grantCommitted(encryptedResponse)→delivered|expired|canceled`；只有same-UID UDS LocalPrincipal能list/confirm/cancel，RemotePrincipal/PairingAccess/admin全部拒绝。本地看到DeviceSign fingerprint，确认前远端只有同requestHash的signed/encrypted PairPending且Relay无grant；两个LocalPrincipal的confirm-vs-cancel、confirm-vs-expiry做first-valid CAS，赢家canonical receipt、同动作retry replay、输家AlreadyHandled，grantPreparing后cancel不能逆转。另覆盖同requestHash byte-identical response、不同request拒、每个状态crash/restart；RouteAccepted不推进delivered，只有验过DeviceSign且匹配request/grant/response hash的PairResponseReceived才推进，回执丢失逐字节重发，TTL无回执撤销orphan grant；并覆盖RelayGrant最小字段、密文DeviceAuthorization、bootstrap KeyDirectory、serial renewal及撤销恢复。
-- [ ] Step 2: 运行 pairing state-machine test。 Expected: FAIL，pairing module不存在。
-- [ ] Step 3: 在remote::PairingCoordinator中解outer、绑定pair route/request context、验证DeviceSign possession proof后产生VerifiedPairRequest；RuntimeCore和adapter不得import`relay_v2::*`。create invite先持久化open outbox并经RemoteTransport open+ACK，恢复时以相同absolute expiry重开；PairRequest先持久化并发local-only pending事件，confirm/cancel/expiry由Runtime DB单事务CAS裁决，只有confirm赢家才冻结并签root-signed grant/auth。grantCommitted持续重发同一response，直到验证DeviceSign-signed PairResponseReceived；所有terminal先持久化close outbox、等Close ACK才擦除。实现invite secret/临时HPKE私钥包装、bootstrap key directory、InstallGrant commit handshake、本机auth ledger、durable revocation/route outbox；CLI增加`remote pairing pending|approve PAIRING_ID|cancel PAIRING_ID`且只走UDS，PairInvite机器名仅在带外编码。
-- [ ] Step 4: 重跑 tests并对PairRequest/Response做tamper corpus。 Expected: PASS；相同请求的frame bytes完全一致。
-- [ ] Step 5: fmt/clippy。
-- [ ] Step 6: 提交。 `git add agentdeckd agentdeck-cli && git commit -m "feat(remote): 实现本机确认的独立配对与授权账本"`
+- [x] Step 1: pairing tests 已覆盖 durable open/close outbox、crash/restart、最多 8 invite、完整状态机、
+  same-UID local-only 权限、first-valid CAS、只读 replay、orphan revoke、grant renewal 与撤销恢复。实际 invite
+  TTL 固定为 298 秒，为 Relay 300 秒 hard limit 保留 2 秒调度余量。
+- [x] Step 2: RED 已在 pairing module/store/actor 尚不存在时按内部 production 子片逐项取得；子片只运行
+  focused tests + scoped Clippy/fmt，不递归执行 Task 慢门禁或文档 commit。
+- [x] Step 3: 已实现 PairingCoordinator possession proof、durable PairPending、本机 confirm/cancel/expiry CAS、
+  root-signed DeviceGrant/DeviceAuthorization、bootstrap KeyDirectory、InstallGrant commit handshake、auth ledger、
+  revoke/route outbox，以及 UDS-only `remote pairing invite|pending|approve|cancel` / `remote revoke`。RuntimeCore
+  与 adapter 保持 relay wire 中立。
+- [x] Step 4: PairRequest/Response tamper corpus、同 request byte-stable response、RouteAccepted 非业务成功、
+  exact PairResponseReceived、GrantCommitted ACK 暂态失败后的相同 InstallGrant 重发均已 PASS。
+- [x] Step 5: focused fmt/diff/scoped strict Clippy 已 PASS；依赖树全目标 Clippy 的既有 Relay warning 不计入
+  本 Task scoped PASS，Task 最终门禁仍按 QUALITY 的固定命令读回。
+- [x] Step 6: 主体、四笔 ownership/recovery hardening、Runtime v4 gate repair 与最终 `3b4b977` 已精确提交；未使用
+  `git add -A`，未加入 co-author，文档只在 Task 收口统一提交。
+
+**Task 实际范围与刹车线：** 最终 `4fd8ed8..3b4b977` 覆盖 130 个非 lock 代码/测试/协议路径，另含
+`Cargo.lock`；不能沿用最初 Files 草案作为完成范围。`fe3a9ad` 消除 hard-coded v3，`3b4b977` 补齐
+cancel-safe join、startup shutdown watch、LocalRetry health/admission fence 与 v10 table/ledger/cipher fixture。最大
+production 子片为 Store pairing 1,792 additions，
+低于 1,800 预拆线；测试、fixture、schema snapshot 与文档 additions 不计 production 拆片线。
+
+**关键裁决：** `PairResponse.info` 同时绑定 canonical response hash、HPKE info、MachineDataSign TBS 与
+receipt TBS；confirm winner 支持只读幂等 replay；control activation gate、10 秒 drain deadline、shutdown
+cancellation、trust-reset singleflight、create/revoke canceled waiter 回收与 pairing→retirement handoff
+共同维持唯一 owner。Complete retry 必须重新 yield；Active 失败才 reacquire，RetirePending 保持 control owner。
+
+**Task focused 证据：** transport `39/39`、pairing actor `64/64`、manager `41/41`、trust reset `9/9`、
+Store pairing `68/68`、reset guard `5/5`、真实 TLS Relay + UDS + CLI pairing E2E `1/1`，以及 protocol/
+crypto/tamper/schema/network/fmt/diff gates 全绿。最终 `4fd8ed8..3b4b977` 的独立 spec/security 与 quality
+终审均为 P0/P1/P2=0、Approved。最终完整 daemon package exit 0：lib
+`1252 passed / 3 ignored`（765.48 秒），capacity `5/5`（331.47 秒），command-configuration
+`14/14`、current-v10 tamper `2/2`，其余 integration binary 与 doc-test 无失败。
 
 ### Task P4.4：把唯一 MachineLink transport 接入 RuntimeCore
 

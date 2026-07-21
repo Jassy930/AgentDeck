@@ -69,8 +69,10 @@
   `46c6bb8` 完成 machine identity、schema v8/24 表、key-directory guard、通用 CounterGuard IO 与
   bootstrap；P4.2 code/test 由 `a6842bc` 收口 Runtime v3、schema v9/25 表、root-signed
   Link/Data cert、durable enrollment/receipt、control-only authenticated MachineLink、两条 trust reset 与
-  安全 uninstall purge。P4–P6 当前为 2/7、0/9、0/4，下一项 P4.3 PairInvite/DeviceGrant。本 Task 不证明
-  pairing、业务 RemoteLink、E2EE publication、持久远程 CLI、iOS 真实链路或 production-signed
+  安全 uninstall purge。P4.3 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977`
+  收口 Runtime v4、schema v10/30 表、PairInvite/DeviceGrant/DeviceAuthorization/KeyDirectory、本机 auth
+  ledger、revoke 与 control handoff。P4–P6 当前为 3/7、0/9、0/4，下一项 P4.4 MachineLink→RuntimeCore。
+  本 Task 不证明业务 RemoteLink、E2EE publication、持久远程 CLI、iOS 真实链路或 production-signed
   LaunchAgent/Keychain PASS。通用 CounterGuard IO 仍不代表 active reservation 或整库回滚闭环已完成。
   P5 MVP 只以 iOS Simulator 自动 E2E 退出，本机第二客户端归 P6 synthetic DoD。
 
@@ -79,8 +81,8 @@
 - `../protocol/SPIKE_FINDINGS.md`：Codex app-server wire framing、方法和 schema 事实源。
 - `../protocol/CODEX_VERSION.txt`：生成当前 schema 时使用的 Codex 版本。
 - `../protocol/*.json`：官方 schema 快照。
-- `../protocol/agentdeck/`：AgentDeck 自身四条独立协议轴的 schema 与说明。当前 Runtime v3 fixture 为
-  `fixtures/runtime-v3-wire.jsonl`；各 `*.schema.json` 均由 schemars 从 Rust 类型派生生成（非手写），
+- `../protocol/agentdeck/`：AgentDeck 自身四条独立协议轴的 schema 与说明。当前 Runtime v4 fixture 为
+  `fixtures/runtime-v4-wire.jsonl`；各 `*.schema.json` 均由 schemars 从 Rust 类型派生生成（非手写），
   `README.md` 说明生成与更新流程。
 
 ## 更新规则

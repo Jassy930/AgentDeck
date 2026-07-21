@@ -71,8 +71,12 @@ signing 已完成。P4.1 已由 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、
 完成 machine identity、schema v8/24 表、key-directory guard、通用 CounterGuard IO 与 bootstrap；完整
 daemon package exit 0、两路终审 Approved。P4.2 code/test 由 `a6842bc` 收口 Runtime v3、
 schema v9/25 表、link/data cert、durable enrollment/receipt、control-only authenticated MachineLink、
-root-present/root-lost trust reset 与安全 uninstall purge。P4 当前为 2/7，下一项是 P4.3 PairInvite/
-DeviceGrant。P4.2 没有业务 Runtime dispatch，不代表 pairing、业务 RemoteLink、E2EE publication、持久
+root-present/root-lost trust reset 与安全 uninstall purge。P4.3 由 `518380e`、`b28f995`、`55be98f`、
+`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 收口 Runtime v4、schema v10/30 表、PairInvite/DeviceGrant/
+DeviceAuthorization/KeyDirectory、本机 auth ledger、revoke、control handoff 与 cancel-safe recovery。
+最终实际范围为 130 个非 lock 代码/测试/协议路径（另含 `Cargo.lock`），最大 production 子片 Store pairing
+为 1,792 additions。
+P4 当前为 3/7，下一项是 P4.4 MachineLink→RuntimeCore。P4.3 没有业务 Runtime dispatch，不代表业务 RemoteLink、E2EE publication、持久
 远程 CLI、iOS 真实链路或 production-signed Keychain/LaunchAgent PASS。通用 CounterGuard IO 仍不代表
 active symmetric key reservation、DB high-water 绑定或整库回滚闭环已完成。P4 E2EE/Relay Publish、
 P5 Simulator 自动 E2E 与 P6 本机第二客户端 synthetic DoD 均未完成；物理 iPhone/第二台 Mac 是

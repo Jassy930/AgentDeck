@@ -10,7 +10,7 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以 `docs/plans/2026-07-10-relay-companion-mvp-design.md`、`docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 和上位增量 `docs/plans/2026-07-18-relay-companion-mvp-course-correction.md` 为事实源。Relay 主线恢复 Task 粒度门禁；P3.9-C0-B3a/B3b/B4/B5/C0-C、P3.9-A/B/C3/D/E 已完成 Task 门禁和独立 `spec/security`、`quality` 终审。D code/test `b818f81` 完成普通 GUI、Rust CLI 与 Swift `main.swift --selfcheck` 的 OS-account shared-daemon UDS cutover；E code/test `d68cc02` 收口 exact/fresh retry、composer owner/LRU、history latest-intent、close barrier、有界 reconnect 与 64-slot subscription admission。P3.10 已由 `19622ab` 完成当时的 schema v7/admin ledger、flush-ACK-gated `StageUpgrade` 与 LaunchAgent lifecycle；Phase review 又由 `773a2b3`、`0057824`、`81cc314`、`9efb28d` 补齐安装 verifier 资源/进程组收口及 legacy v1–v6 pre-RW 全量认证（新增显式 v1–v4 committed-WAL 矩阵）。基于 code baseline `9efb28d` 的独立 `p3` Phase verifier 已 exit 0，四 schema/network/docs/smoke/diagnostics 全绿，双路 code review P0/P1/P2 = 0，故 P3 Phase complete（MVP automatic scope）。P3.1 继续采用方案 b：provisioned signed Keychain 保留 post-MVP ignored/BLOCKED，不阻塞主线，也不表示 stable production signing PASS。同 UID 在线攻击作为 residual risk 不再扩展。P4.1 已完成 machine identity/guard；P4.2 code/test 由 `a6842bc` 完成 Runtime v3、schema v9/25 表、certificate/enrollment/receipt、control-only RemoteTransport、两条 trust reset 与安全 uninstall purge。P4 当前为 2/7，下一项 P4.3 PairInvite/DeviceGrant；P4.2 不证明 pairing、业务 RemoteLink、E2EE、持久远程 CLI、iOS 真实链路或 production-signed PASS。P5 MVP 仅 iOS Simulator 自动 E2E，本机第二客户端归 P6 synthetic DoD；物理设备、公网与干净 Linux 证据为 post-MVP BLOCKED 槽位，不得冒充 PASS。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 以 `docs/plans/2026-07-10-relay-companion-mvp-design.md`、`docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 和上位增量 `docs/plans/2026-07-18-relay-companion-mvp-course-correction.md` 为事实源。Relay 主线恢复 Task 粒度门禁；P3.9-C0-B3a/B3b/B4/B5/C0-C、P3.9-A/B/C3/D/E 已完成 Task 门禁和独立 `spec/security`、`quality` 终审。D code/test `b818f81` 完成普通 GUI、Rust CLI 与 Swift `main.swift --selfcheck` 的 OS-account shared-daemon UDS cutover；E code/test `d68cc02` 收口 exact/fresh retry、composer owner/LRU、history latest-intent、close barrier、有界 reconnect 与 64-slot subscription admission。P3.10 已由 `19622ab` 完成当时的 schema v7/admin ledger、flush-ACK-gated `StageUpgrade` 与 LaunchAgent lifecycle；Phase review 又由 `773a2b3`、`0057824`、`81cc314`、`9efb28d` 补齐安装 verifier 资源/进程组收口及 legacy v1–v6 pre-RW 全量认证（新增显式 v1–v4 committed-WAL 矩阵）。基于 code baseline `9efb28d` 的独立 `p3` Phase verifier 已 exit 0，四 schema/network/docs/smoke/diagnostics 全绿，双路 code review P0/P1/P2 = 0，故 P3 Phase complete（MVP automatic scope）。P3.1 继续采用方案 b：provisioned signed Keychain 保留 post-MVP ignored/BLOCKED，不阻塞主线，也不表示 stable production signing PASS。同 UID 在线攻击作为 residual risk 不再扩展。P4.1 已完成 machine identity/guard；P4.2 code/test 由 `a6842bc` 完成 Runtime v3、schema v9/25 表、certificate/enrollment/receipt、control-only RemoteTransport、两条 trust reset 与安全 uninstall purge。P4.3 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成 Runtime v4、schema v10/30 表、PairInvite/DeviceGrant/DeviceAuthorization/KeyDirectory、本机 auth ledger、revoke、control handoff 与 cancel-safe recovery。P4 当前为 3/7，下一项 P4.4 业务 MachineLink→RuntimeCore dispatch；P4.3 不证明业务 RemoteLink、E2EE publication、持久远程 CLI、iOS 真实链路或 production-signed PASS。P5 MVP 仅 iOS Simulator 自动 E2E，本机第二客户端归 P6 synthetic DoD；物理设备、公网与干净 Linux 证据为 post-MVP BLOCKED 槽位，不得冒充 PASS。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
@@ -122,9 +122,10 @@ bash scripts/check-daemon-network-boundary.sh
 agentdeck remote synthetic --bundle /secure/path/machine-enrollment-bundle.json
 ```
 
-该命令只使用临时 machine/device identity，不建立持久状态。P4.2 已新增只走 canonical stable Runtime v3
-UDS 的 `remote machine enroll --bundle-file FILE`、`remote machine status` 与
-`remote trust-reset [--admin-purge-receipt-file FILE]`；P4.3–P4.6 完成前，其余
+该命令只使用临时 machine/device identity，不建立持久状态。P4.2/P4.3 已新增只走 canonical stable Runtime v4
+UDS 的 `remote machine enroll --bundle-file FILE`、`remote machine status`、
+`remote pairing invite|pending|approve|cancel`、`remote revoke` 与
+`remote trust-reset [--admin-purge-receipt-file FILE]`；P4.4–P4.6 完成前，其余
 `remote pair/machines/sessions/watch/send/...` 必须返回
 `remote.persistent.unsupported`。旧 v1 credential marker 只允许做 metadata
 存在性探测；production CLI 不读取、不删除、不拨号。需要清理时只能显式运行
@@ -272,8 +273,9 @@ transfer/publication 也尚无 production remote owner；Simulator fixture 不�
 P3.8-A 只接入 accepted-stream primitives；P3.8-B secure bind/permit、P3.9-C3 普通 GUI cutover 与 P3.9-D
 Rust CLI / Swift `--selfcheck` cutover 已完成；P3.10 LaunchAgent 已由 `19622ab` 完成 Task verifier 与双路
 Task review，Phase hardening 已收口到 `9efb28d`，独立 P3 Phase Exit 也已完成。P4.1 machine identity /
-guard 已完成；P4.2 又完成 cert、enrollment、receipt、control-only RemoteTransport 与 trust reset。
-业务 RemoteLink 仍未实现，下一项 P4.3 先完成 PairInvite/DeviceGrant。
+guard 已完成；P4.2 又完成 cert、enrollment、receipt、control-only RemoteTransport 与 trust reset；P4.3
+完成 PairInvite/DeviceGrant/DeviceAuthorization/KeyDirectory、本机 auth ledger 与 revoke。
+业务 RemoteLink 仍未实现，下一项 P4.4 把唯一 MachineLink 接入 RuntimeCore。
 
 ### Relay Companion MVP P3.7（exec-gate + typed production execution）
 
@@ -430,9 +432,9 @@ review 已通过；Phase review 的 `773a2b3` / `81cc314` / `9efb28d` 又固定 
 stdout+stderr 合计 256 KiB 上限与同 PGID 回收，超时/超限分别返回
 `daemon.install.verifier_timeout` / `daemon.install.verifier_output_too_large`；`0057824` 固定 legacy
 v1–v6 在原库 RW 前完成全量认证，新增显式 v1–v4 committed-WAL 篡改矩阵。基于 `9efb28d` 的独立
-P3 Phase Exit 已 exit 0，P3 automatic scope complete。P4.1 与 P4.2 已完成，P4 当前为 2/7；下一项
-P4.3 实现 PairInvite、DeviceGrant 与本机 auth ledger。P4.2 的 RemoteTransport 只处理
-enrollment/auth/control，不向 RuntimeCore 派发业务 frame。
+P3 Phase Exit 已 exit 0，P3 automatic scope complete。P4.1、P4.2 与 P4.3 已完成，P4 当前为 3/7；
+下一项 P4.4 把唯一 MachineLink transport 接入 RuntimeCore。P4.3 仍只处理 pairing/auth/control，
+不向 RuntimeCore 派发业务 frame。
 
 ### Relay Companion MVP P4.1（Machine identity + guards）
 
@@ -451,7 +453,7 @@ provisioned signed Keychain roundtrip 继续保持 post-MVP BLOCKED。
 
 ### Relay Companion MVP P4.2（certificate + enrollment + control-only RemoteTransport + trust reset）
 
-P4.2 code/test 由 `a6842bc` 收口。current Runtime protocol 为 v3，physical schema 为
+P4.2 code/test 由 `a6842bc` 收口。该 Task 收口时 Runtime protocol 为 v3，physical schema 为
 v9/25 表；本机管理命令固定为：
 
 ```bash
@@ -481,8 +483,32 @@ cargo fmt --all -- --check
 
 本 Task 的 automatic scope 只证明 root-signed Link/Data cert、durable enrollment/receipt、control-only
 MachineLink、root-present/root-lost trust reset、authenticated purge marker/finalizer 与 hermetic
-uninstall purge。它不证明 PairInvite/DeviceGrant、业务 RemoteLink、E2EE publication、持久远程 CLI、iOS
+uninstall purge。它不证明业务 RemoteLink、E2EE publication、持久远程 CLI、iOS
 真实链路或 production-signed LaunchAgent/Keychain PASS；后者继续保持 post-MVP BLOCKED。
+
+### Relay Companion MVP P4.3（PairInvite + DeviceGrant + auth ledger）
+
+current Runtime protocol 为 v4，physical schema 为 v10/30 表。本机管理命令固定为：
+
+```bash
+agentdeck remote pairing invite --display-name workstation --idempotency-key invite-001
+agentdeck remote pairing pending
+agentdeck remote pairing approve 11111111-1111-1111-1111-111111111111
+agentdeck remote pairing cancel 11111111-1111-1111-1111-111111111111
+agentdeck remote revoke --device <device-route-id> --grant-serial <serial>
+```
+
+focused 验证至少覆盖 transport、pairing actor、manager、trust reset、Store pairing/reset guard 与真实
+TLS Relay + UDS + CLI pairing E2E；Task 收口再运行上节完整 Rust/Swift/iOS 门禁、schema/network/docs/
+fmt/diff/status 与双路独立终审。`PairResponse.info` 必须同时绑定 response hash、HPKE info、
+MachineDataSign TBS 与 receipt TBS；invite TTL 固定 298 秒。confirm replay、InstallGrant exact retry、
+10 秒 pairing drain、shutdown cancellation、singleflight 与 caller cancellation 都不得降级。
+
+P4.3 最终 code/test 范围为 130 个非 lock 路径（另含 `Cargo.lock`）；`fe3a9ad` 与 `3b4b977` 补齐
+Runtime v4 inventory、cancel-safe shutdown/startup、LocalRetry health/admission fence 门禁。最大 production
+子片为 Store pairing 1,792 additions，低于 1,800
+预拆线；测试与文档不计 production 拆片线。P4.3 不证明业务 RemoteLink/E2EE publication、persistent
+remote CLI、iOS 真实链路或 production-signed PASS；下一项为 P4.4。
 
 ### Relay Companion MVP P3.9-C0-B3a（configuration pin / prompt admission）
 

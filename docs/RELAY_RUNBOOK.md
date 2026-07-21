@@ -4,8 +4,10 @@
 binary 已在 P2.9 原子切换为仅 Relay v2；P2.10 又以真实 Direct TLS/SPKI synthetic、
 安全扫描与故障注入门禁收口。P4.1 已完成 daemon machine identity/guard；P4.2 又以
 `a6842bc` 完成 Runtime v3、schema v9、certificate、durable enrollment/receipt、
-control-only RemoteTransport、两条 trust reset 与安全 uninstall purge 的 automatic scope。Pairing、业务
-RemoteLink、E2EE、持久远程 CLI 和 iOS 自动链路仍属于后续 Task。因此本页不是“公网 Companion 已上线”
+control-only RemoteTransport、两条 trust reset 与安全 uninstall purge；P4.3 又由 `518380e`、`b28f995`、
+`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成 Runtime v4、schema v10、本机确认 pairing、DeviceGrant/
+DeviceAuthorization/KeyDirectory、auth ledger 与 revoke。业务 RemoteLink、E2EE publication、持久远程 CLI
+和 iOS 自动链路仍属于后续 Task。因此本页不是“公网 Companion 已上线”
 或 production-signed LaunchAgent/Keychain 已 PASS 的证明。
 
 ## 部署不变量
@@ -81,7 +83,7 @@ InstallGrant、register/publish/subscribe replay、Send/Reply、signed revoke �
 
 ## 让 stable daemon 持久登记本机
 
-P4.2 的本机管理只走 same-UID canonical Runtime v3 UDS，不创建第二个 admin socket。bundle 必须是
+P4.2/P4.3 的本机管理只走 same-UID canonical Runtime v4 UDS，不创建第二个 admin socket。bundle 必须是
 current-UID、single-link、no-follow regular file，group/other 权限为零且不超过 64 KiB；推荐保持 `0600`：
 
 ```bash
@@ -96,10 +98,44 @@ authenticated **control-only** MachineLink；它处理 auth、server restart 与
 都必须关闭连接且不会进入 RuntimeCore。完全相同的 bundle 可用于 exact retry；不同 code/origin/pin/Relay/
 receipt anchor/expiry 会在网络前 conflict。
 
-除上述 `remote machine enroll|status` 与下文 `remote trust-reset` 外，P4.3–P4.6 尚未完成的持久
+P4.3 已提供下节 `remote pairing ...` 与 exact `remote revoke` 本机管理面；P4.4–P4.6 尚未完成的持久
 `remote pair/machines/sessions/watch/send/...` 仍返回 `remote.persistent.unsupported`。automatic gate 使用
 injected dev/ephemeral keystore 与 hermetic namespace；真实 production 命令仍要求 provisioned、release-signed
 daemon/CLI 与正确 entitlement，当前槽位保持 post-MVP BLOCKED，不能由 automatic PASS 代替。
+
+## 创建并本机确认 PairInvite
+
+stable daemon 已 Active 后，invite 必须先持久化 open outbox，并在 Relay 对同 route/absolute expiry 返回
+Open ACK 后才打印。daemon 使用 298 秒 TTL，为 Relay 300 秒硬上限保留 2 秒调度余量；不得延长、复活或
+复用旧 invite。显示名只进入带外 PairInvite，不进入 Relay durable store：
+
+```bash
+agentdeck remote pairing invite \
+  --display-name workstation \
+  --idempotency-key invite-001
+```
+
+设备提交 byte-stable PairRequest 后，本机只展示 canonical pairing ID 与 DeviceSign fingerprint。仅当前
+same-UID local principal 可以列出、确认或取消；远程 principal、PairingAccess 与 Relay 管理员都不能代办：
+
+```bash
+agentdeck remote pairing pending
+agentdeck remote pairing approve 11111111-1111-1111-1111-111111111111
+agentdeck remote pairing cancel 11111111-1111-1111-1111-111111111111
+```
+
+confirm/cancel/expiry 是 first-valid durable CAS；同动作重试只读回同一 canonical receipt。RouteAccepted 只
+表示 Relay transport 接受，不能当作 grant 或业务成功；只有验证 exact DeviceSign-signed
+`PairResponseReceived` 后才进入 delivered。GrantCommitted ACK 暂态失败会重发相同 InstallGrant；不要重建
+grant、修改 PairResponse 或手改 Store。撤销必须绑定 exact device route 与 grant serial：
+
+```bash
+agentdeck remote revoke --device <device-route-id> --grant-serial <serial>
+```
+
+pairing drain 与 retirement 共用唯一 control owner：drain 绝对 deadline 为 10 秒，可被 shutdown 取消；
+失败时保留 durable state并 exact retry。P4.3 仍不提供业务 Runtime dispatch、persistent remote device CLI
+或 iOS 真链路；下一项 P4.4 才把唯一 MachineLink 接入 RuntimeCore。
 
 ## 本机 inventory 与 readback
 
@@ -202,25 +238,25 @@ DB/main/WAL/SHM、machine Keychain items，最后删除 StorageKEK。每一步�
 并可在 crash 后 exact retry；“DB 已不存在”本身从来不是删除 Keychain 的授权。任一前置失败必须 fail-close，
 不得手工拆开顺序或以 `rm`/`security delete-*` 冒充完成。
 
-## Runtime v3 hard-cutover 开发凭据
+## Runtime v4 hard-cutover 开发凭据
 
-Runtime version 已绑定 MachineRoot TBS。P3.9 的 Runtime v1→v2 hard cutover 证据继续保留；P4.2 current
-contract 为 Runtime v3，不提供 production v2/v3 双栈。旧签名材料不会通过 current verifier：对外只返回
+Runtime version 已绑定 MachineRoot TBS。P3.9 的 Runtime v1→v2 与 P4.2 的 v2→v3 hard cutover 证据继续
+保留；P4.3 current contract 为 Runtime v4，不提供 production v3/v4 双栈。旧签名材料不会通过 current verifier：对外只返回
 通用 `relay.auth.invalid_grant` / `relay.enrollment.rejected`，不暴露失败字段。这是预期 hard cutover，不是可
 自动迁移的数据。
 
-P4 production pairing 投产前，任何曾生成 Runtime v1 签名材料的开发 trust realm 都必须按以下顺序处理：
+P4.3 pairing trust realm 使用前，任何曾生成 Runtime v1 签名材料的开发 trust realm 都必须按以下顺序处理：
 
 1. 先用可信 Relay admin inventory 查询旧 route/root fingerprint。
 2. realm 存在时执行 admin purge，并用同一 fingerprint readback，确认 active、grant、revocation、stream、
    frame、subscription 全为 0 且只剩 retired tombstone。若 inventory 可信确认 absent（例如从未 enrollment
    或开发 Store 已受控重建），记录 absent 结果；不得为了满足流程伪造 tombstone。
 3. 只有完成 present realm 的 purge/readback，或得到可信 absent 结果后，才删除对应本地开发 trust state。
-4. 生成新的 route/key，使用 current Runtime v3 重新 enroll，再让每台设备重新 pair；禁止恢复旧
+4. 生成新的 route/key，使用 current Runtime v4 重新 enroll，再让每台设备重新 pair；禁止恢复旧
    cert/grant 或自动降级 verifier。
 
 `scripts/reset-relay-v1-dev-state.sh` 只处理早期 Relay v1 DB/bearer credential，不处理 Relay v2 Store 中的
-历史 Runtime TBS 开发凭据。当前本地 trust-reset 必须走上述 Runtime v3 命令与 signed proof；不得手改
+历史 Runtime TBS 开发凭据。当前本地 trust-reset 必须走上述 Runtime v4 命令与 signed proof；不得手改
 SQLite、Keychain 或签名版本来伪造完成。
 
 ## 常见 failure code

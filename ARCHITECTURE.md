@@ -56,8 +56,8 @@ agentdeckd
 - `Sources/AgentDeck/`：macOS 原生 UI、会话模型、历史回放和本地交互。UI 只能通过 `CapabilityRouter` 消费 `SessionCapabilities` 决定渲染路径，禁止直接读 vendor 字段或硬编码 `if agentKind == .codex` 分支。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
-- `agentdeckd/src/local/`：当前为本地 Runtime v3 framing；它在 P3.9 Runtime v2 中立契约上 additive 增加
-  P4.2 local-only machine administration，不提供 production v2/v3 双栈。A1a main cutover / real-data reader
+- `agentdeckd/src/local/`：当前为本地 Runtime v4 framing；它在 P4.2 Runtime v3 machine administration 上
+  additive 增加 P4.3 local-only pairing/revoke administration，不提供 production v3/v4 双栈。A1a main cutover / real-data reader
   分别由 `c28a968` / `c36a4f9` 收口，A1b signed-material hard cutover 由 `ef830cd` 收口。
   same-EUID peer gate、每连接 Unix actor、retained-dirfd
   secure listener 与显式 stdio compatibility wrapper。listener 在 bind 时持有完成 recovery 的 Core，
@@ -470,7 +470,7 @@ conversation/key，不能伪造身份连续性。
   `Subscribe(BeforeFirst) → Snapshot/Backfill* → SyncComplete → Unsubscribe`；metadata mutation 使用 expected entry
   revision + stable idempotency key。机器输出只暴露 canonical conversation/command/turn/event/item/entity ID；
   `protocol` 与 synthetic/legacy remote 不连接 Runtime；P4.2 的 `remote machine enroll|status` 与
-  `remote trust-reset` 只连接 canonical Runtime v3 UDS。diagnostics one-shot 不得作为 UDS 失败 fallback；无
+  `remote trust-reset` / `remote pairing` / `remote revoke` 只连接 canonical Runtime v4 UDS。diagnostics one-shot 不得作为 UDS 失败 fallback；无
   current Runtime 映射的
   `persistApproval`、CC `worktree/sessionName` 在 clap/plan 构造阶段 typed reject。所有 usage error 都输出稳定
   JSON envelope；`--help` 仍保留成功的人读输出。
@@ -535,7 +535,7 @@ conversation/key，不能伪造身份连续性。
 
 ### Relay Companion MVP P4.2 machine administration / RemoteTransport / trust reset 不变量
 
-- P4.2 code/test 由 `a6842bc` 收口，P4 当前为 2/7，下一项 P4.3 PairInvite/DeviceGrant。
+- P4.2 code/test 由 `a6842bc` 收口；该 Task 当时把 P4 推进到 2/7。
   Runtime protocol additive 升为 v3；local IPC v2、Relay v2、E2EE v1 是独立版本轴，不联动升级。
 - Runtime physical schema 从 v8/24 表 additive 升为 v9/25 表。新增 authenticated singleton
   `machine_remote_state` 与 `runtime_meta.machine_remote_state_count`；sealed state 由 StorageKEK 保护，独立 row
@@ -552,7 +552,7 @@ conversation/key，不能伪造身份连续性。
   与 SPKI pin 必须先于 code/root/public material；root-signed Link/Data cert 绑定同一
   Relay/route/root/epoch/generation。`RemoteTransport` 不持有 `RuntimeCore`，只交付 retirement、安全 failure 与
   server-restarting control；收到任一业务 frame立即关闭，production business dispatch 恒为零。
-- 本机 `MachineEnroll`、`MachineRemoteStatus`、`TrustReset` 只允许 same-UID local principal 经 Runtime v3
+- 本机 `MachineEnroll`、`MachineRemoteStatus`、`TrustReset` 只允许 same-UID local principal 经 current Runtime v4
   canonical UDS 调用；RuntimeCore 只依赖 daemon-private neutral `RemoteAdministration` capability，不 import
   Relay wire。bundle/portable receipt 必须是 current-UID、single-link、no-follow 私有 regular file且最多 64 KiB。
 - root-present reset 必须经当前 authenticated transport 提交 frozen root-signed retirement。Relay 的
@@ -569,8 +569,35 @@ conversation/key，不能伪造身份连续性。
   DB artifacts → machine keys/guards → StorageKEK last`。每步按 frozen plan/namespace/helper identity 读回并可
   crash-retry；DB/marker 缺失本身不是删除 Keychain 的授权。
 - automatic gate 使用 injected dev/ephemeral keystore、signature verifier 与 hermetic install namespace。它不
-  证明 PairInvite/DeviceGrant、业务 RemoteLink、E2EE publication、持久远程 CLI、iOS 真实链路或
+  证明业务 RemoteLink、E2EE publication、持久远程 CLI、iOS 真实链路或
   production-signed LaunchAgent/Keychain；provisioned signed 槽位继续 post-MVP BLOCKED。
+
+### Relay Companion MVP P4.3 pairing / authorization ledger 不变量
+
+- P4.3 主体由 `518380e` 提交，`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f` 完成所有权与恢复收紧，
+  `fe3a9ad` 对齐 Runtime v4 门禁，`3b4b977` 收口 cancel-safe join、startup shutdown watch、
+  LocalRetry/TransportRetry、health/admission epoch fence 与 v10 inventory gate。current Runtime protocol
+  为 v4；physical schema 为 v10/30 表，在 v9
+  上新增 `remote_pairings`、`remote_pairing_receipts`、`remote_authorization_ledger`、
+  `remote_key_directory`、`remote_control_outbox` 五张 authenticated bounded 表，crypto context 仍为 v1。
+- PairInvite 必须先 durable prepare/open outbox，再经同一 control-only `RemoteTransport` 收到 Open ACK 后返回；
+  absolute TTL 固定 298 秒，不延长、不复活。terminal 先持久 close outbox，收到 Closed/AlreadyAbsent ACK 后
+  才擦除临时 secret；restart 只以同 route/expiry/frozen bytes exact retry。
+- PairRequest possession proof 验证后才生成 local-only `PairPending`。只有 same-UID local principal 可 list/
+  confirm/cancel/revoke；RemotePrincipal、PairingAccess 与 Relay 管理员均无该权限。confirm/cancel/expiry 是
+  first-valid durable CAS；同动作 retry 只读 replay canonical receipt，grantPreparing 后 cancel 不得逆转。
+- `PairResponse.info` 同时绑定 canonical response hash、HPKE info、MachineDataSign TBS 与 receipt TBS。
+  DeviceGrant、DeviceAuthorization、bootstrap KeyDirectory 与 InstallGrant 都冻结为 byte-stable artifact；只有
+  验证 exact DeviceSign-signed `PairResponseReceived` 才推进 delivered，RouteAccepted 从不代表业务成功。
+- shared control 只能有一个 owner。activation gate 覆盖 pairing lane 安装；pairing drain 使用 10 秒绝对
+  deadline并可被 shutdown 取消，完成后原子交给 retirement。Active 失败才 reacquire；RetirePending 保持
+  control owner。trust reset 是 singleflight；create/revoke caller 取消后 waiter 必须回收。
+- owner shutdown 保留 JoinHandle 并复用同一绝对 deadline，超时后 abort + join；startup 等 ready 时由
+  manager shutdown watch 抢占。本地恢复每轮固定 `purge_expired_receipts → recover_generation`，绝不触发
+  WSS reconnect；health/admission epoch 使 pre-owner 错误稳定 Blocked、暂态自愈清码，并阻止旧命令恢复后执行。
+- P4 当前完成 3/7，下一项 P4.4 把唯一 MachineLink 接入 `RuntimeCore`。P4.3 不拥有业务 Runtime dispatch、
+  E2EE publication/counter reservation、persistent remote CLI 或 iOS 真实链路；production-signed 槽位继续
+  post-MVP BLOCKED。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 
