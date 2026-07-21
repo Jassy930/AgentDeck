@@ -72,15 +72,20 @@ verify_schema_snapshots() {
 }
 
 verify_relay_selfcheck() {
-  local temp_root temp_dir status
+  local temp_root temp_dir receipt_signing_key status
   temp_root="${TMPDIR:-/tmp}"
   temp_root="${temp_root%/}"
   temp_dir="$(mktemp -d "$temp_root/agentdeck-relay-selfcheck.XXXXXX")"
   temp_dir="$(cd "$temp_dir" && pwd -P)"
+  chmod 0700 "$temp_dir"
+  receipt_signing_key="$temp_dir/receipt-signing-key.seed"
+  dd if=/dev/urandom of="$receipt_signing_key" bs=32 count=1 2>/dev/null
+  chmod 0600 "$receipt_signing_key"
   if cargo run -p agentdeck-relay --features server,tls -- \
     --selfcheck \
     --config agentdeck-relay/tests/fixtures/relay-selfcheck.toml \
-    --storage "$temp_dir/relay.db"; then
+    --storage "$temp_dir/relay.db" \
+    --receipt-signing-key "$receipt_signing_key"; then
     status=0
   else
     status=$?
