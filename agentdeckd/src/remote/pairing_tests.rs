@@ -2368,16 +2368,40 @@ async fn create_persists_before_send_and_returns_relay_tick_guarded_invite() {
 async fn caller_drop_does_not_cancel_durable_open_and_retry_replays_exact_invite() {
     let store = Arc::new(FakeStore::default());
     let mut actor = spawn_actor(Arc::clone(&store)).await;
-    let handle = actor.handle.clone();
-    let abandoned = tokio::spawn(async move { handle.create(owner(), request("retry")).await });
-    let open = actor.sent_rx.recv().await.unwrap();
-    abandoned.abort();
-    actor.event_tx.send(Ok(opened(&open))).unwrap();
+
+    let mut exact_open = None;
+    for _ in 0..PAIRING_COMMAND_CAPACITY {
+        let handle = actor.handle.clone();
+        let abandoned = tokio::spawn(async move { handle.create(owner(), request("retry")).await });
+        let open = tokio::time::timeout(Duration::from_secs(1), actor.sent_rx.recv())
+            .await
+            .expect("canceled exact retry must resend the durable Open")
+            .expect("actor keeps the Open lane alive");
+        if let Some(exact) = exact_open.as_ref() {
+            assert_eq!(&open, exact, "exact retry must not fork the Open frame");
+        } else {
+            exact_open = Some(open);
+        }
+        abandoned.abort();
+        assert!(abandoned.await.unwrap_err().is_cancelled());
+    }
+    let exact_open = exact_open.expect("at least one durable Open");
+    assert_eq!(
+        store.count(),
+        1,
+        "caller drop must keep one durable pairing"
+    );
 
     let handle = actor.handle.clone();
     let retry = tokio::spawn(async move { handle.create(owner(), request("retry")).await });
+    let replayed_open = tokio::time::timeout(Duration::from_secs(1), actor.sent_rx.recv())
+        .await
+        .expect("ninth exact retry must not be blocked by closed waiters")
+        .expect("actor keeps the Open lane alive");
+    assert_eq!(replayed_open, exact_open);
+    actor.event_tx.send(Ok(opened(&replayed_open))).unwrap();
     let response = retry.await.unwrap().unwrap();
-    assert_eq!(response.invite.pair_route, open.pair_route);
+    assert_eq!(response.invite.pair_route, exact_open.pair_route);
     assert_eq!(store.count(), 1);
     actor.stop().await;
 }
@@ -2745,7 +2769,7 @@ async fn pregrant_drain_is_nonblocking_rejects_new_authority_and_waits_for_close
     drain.await.unwrap().unwrap();
     assert_eq!(store.count(), 0);
     actor.handle.begin_drain().await.unwrap();
-    actor.handle.resume_after_failed_drain().await.unwrap();
+    actor.handle.resume_after_completed_drain().await.unwrap();
     let resumed_handle = actor.handle.clone();
     let resumed = tokio::spawn(async move {
         resumed_handle
@@ -2756,6 +2780,116 @@ async fn pregrant_drain_is_nonblocking_rejects_new_authority_and_waits_for_close
     actor.event_tx.send(Ok(opened(&reopened))).unwrap();
     resumed.await.unwrap().unwrap();
     actor.stop().await;
+}
+
+#[tokio::test]
+async fn running_drain_waiter_cap_is_non_resumable_until_completed_resume() {
+    let store = Arc::new(FakeStore::default());
+    let mut actor = spawn_actor(Arc::clone(&store)).await;
+    let create_handle = actor.handle.clone();
+    let create =
+        tokio::spawn(async move { create_handle.create(owner(), request("drain-cap")).await });
+    let open = actor.sent_rx.recv().await.unwrap();
+    let pairing_id = store.single_id();
+
+    let mut drain_replies = Vec::new();
+    for _ in 0..PAIRING_COMMAND_CAPACITY {
+        let (reply, result) = oneshot::channel();
+        actor
+            .handle
+            .command_tx
+            .try_send(PairingCommand::BeginDrain { reply })
+            .expect("enqueue active drain waiter");
+        drain_replies.push(result);
+    }
+    let close = actor.sent_close_rx.recv().await.unwrap();
+    assert_eq!(close.pair_route, open.pair_route);
+    assert_eq!(create.await.unwrap().unwrap_err().code(), PAIRING_CANCELED);
+
+    let mut all_waiters_admitted = false;
+    for _ in 0..32 {
+        let error = actor.handle.confirm(pairing_id).await.unwrap_err();
+        if error.code() == PAIRING_DRAINING {
+            all_waiters_admitted = true;
+            break;
+        }
+        assert_eq!(error.code(), PAIRING_BUSY);
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        all_waiters_admitted,
+        "barrier command must run after all eight drain waiters"
+    );
+
+    let ninth = actor.handle.begin_drain().await.unwrap_err();
+    assert!(matches!(ninth, PairingDrainStartError::ActorBusy(_)));
+    assert_eq!(ninth.code(), PAIRING_BUSY);
+
+    actor
+        .event_tx
+        .send(Ok(PairingTransportEvent::PairRouteClosed(
+            PairRouteClosed {
+                pair_route: close.pair_route,
+                outcome: PairRouteCloseOutcome::Closed,
+            },
+        )))
+        .unwrap();
+    for reply in drain_replies {
+        assert!(matches!(reply.await, Ok(Ok(()))));
+    }
+
+    assert_eq!(
+        actor
+            .handle
+            .resume_after_failed_drain()
+            .await
+            .unwrap_err()
+            .code(),
+        PAIRING_DRAINING
+    );
+    assert_eq!(
+        actor
+            .handle
+            .create(owner(), request("still-fenced"))
+            .await
+            .unwrap_err()
+            .code(),
+        PAIRING_DRAINING,
+        "wrong Resume must leave the Complete fence intact"
+    );
+    actor.handle.resume_after_completed_drain().await.unwrap();
+
+    let resumed_handle = actor.handle.clone();
+    let resumed = tokio::spawn(async move {
+        resumed_handle
+            .create(owner(), request("completed-resume"))
+            .await
+    });
+    let reopened = actor.sent_rx.recv().await.unwrap();
+    actor.event_tx.send(Ok(opened(&reopened))).unwrap();
+    resumed.await.unwrap().unwrap();
+    actor.stop().await;
+}
+
+#[test]
+fn drain_resume_compare_and_set_preserves_wrong_expected_state() {
+    let mut failed = PairingDrainState::Failed;
+    assert_eq!(
+        failed.resume_after_completed().unwrap_err().code(),
+        PAIRING_DRAINING
+    );
+    assert!(matches!(failed, PairingDrainState::Failed));
+    failed.resume_after_failed().unwrap();
+    assert!(matches!(failed, PairingDrainState::Idle));
+
+    let mut complete = PairingDrainState::Complete;
+    assert_eq!(
+        complete.resume_after_failed().unwrap_err().code(),
+        PAIRING_DRAINING
+    );
+    assert!(matches!(complete, PairingDrainState::Complete));
+    complete.resume_after_completed().unwrap();
+    assert!(matches!(complete, PairingDrainState::Idle));
 }
 
 #[tokio::test]
@@ -3088,6 +3222,9 @@ async fn failed_drain_resume_waits_for_capacity_and_only_closed_channel_stops_it
                 draining = false;
                 let _ = reply.send(Ok(()));
                 break;
+            }
+            PairingCommand::ResumeAfterCompletedDrain { .. } => {
+                panic!("unexpected completed drain resume")
             }
             PairingCommand::Create { .. }
             | PairingCommand::Cancel { .. }
@@ -4383,6 +4520,93 @@ async fn local_revocation_is_exact_commit_before_send_and_ack_before_receipt_and
         RevocationReceipt::Committed { .. }
     ));
     assert_eq!(actor.revocation_freezes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.lifecycle(pairing_id),
+        PairingInviteLifecycle::Canceled
+    );
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn canceled_revocation_waiters_do_not_block_exact_retry_or_fork_durable_work() {
+    let store = Arc::new(FakeStore::default());
+    let mut actor = spawn_actor(Arc::clone(&store)).await;
+    let (invite, pairing_id, _) =
+        create_committed_pairing(&mut actor, &store, "revoke-canceled-waiters", 0x86).await;
+    let grant = store
+        .state
+        .lock()
+        .unwrap()
+        .authorizations
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let device = device_handle_for_test(grant.device_route);
+
+    let mut exact_revoke = None;
+    for _ in 0..PAIRING_COMMAND_CAPACITY {
+        let handle = actor.handle.clone();
+        let retry_device = device.clone();
+        let abandoned = tokio::spawn(async move {
+            handle
+                .revoke_device(retry_device, RuntimeGrantSerial::new(1))
+                .await
+        });
+        let revoke = tokio::time::timeout(Duration::from_secs(1), actor.sent_revoke_rx.recv())
+            .await
+            .expect("canceled exact retry must resend the durable RevokeDevice")
+            .expect("actor keeps the revocation lane alive");
+        if let Some(exact) = exact_revoke.as_ref() {
+            assert_eq!(
+                &revoke, exact,
+                "exact retry must not fork the revocation frame"
+            );
+        } else {
+            exact_revoke = Some(revoke);
+        }
+        abandoned.abort();
+        assert!(abandoned.await.unwrap_err().is_cancelled());
+    }
+    let exact_revoke = exact_revoke.expect("at least one durable RevokeDevice");
+    assert_eq!(actor.revocation_freezes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.state.lock().unwrap().revocations.len(),
+        1,
+        "caller cancellation must not freeze a second durable revocation"
+    );
+
+    let handle = actor.handle.clone();
+    let retry_device = device.clone();
+    let retry = tokio::spawn(async move {
+        handle
+            .revoke_device(retry_device, RuntimeGrantSerial::new(1))
+            .await
+    });
+    let replayed_revoke = tokio::time::timeout(Duration::from_secs(1), actor.sent_revoke_rx.recv())
+        .await
+        .expect("ninth exact retry must not be blocked by closed waiters")
+        .expect("actor keeps the revocation lane alive");
+    assert_eq!(replayed_revoke, exact_revoke);
+    assert_eq!(actor.revocation_freezes.load(Ordering::SeqCst), 1);
+    assert_eq!(store.state.lock().unwrap().revocations.len(), 1);
+
+    actor
+        .event_tx
+        .send(Ok(PairingTransportEvent::RevocationCommitted(
+            revocation_committed(&replayed_revoke),
+        )))
+        .unwrap();
+    let close = actor.sent_close_rx.recv().await.unwrap();
+    assert_eq!(close.pair_route, invite.invite.pair_route);
+    assert!(matches!(
+        retry.await.unwrap().unwrap(),
+        RevocationReceipt::Committed { grant_serial }
+            if grant_serial == RuntimeGrantSerial::new(1)
+    ));
+    assert!(actor.sent_revoke_rx.try_recv().is_err());
+    assert_eq!(actor.revocation_freezes.load(Ordering::SeqCst), 1);
+    assert!(store.state.lock().unwrap().revocations.is_empty());
     assert_eq!(
         store.lifecycle(pairing_id),
         PairingInviteLifecycle::Canceled

@@ -152,7 +152,8 @@ pub(crate) struct PairingCoordinatorHandle {
 pub(crate) enum PairingDrainStartError {
     NotEnqueued(PairingAdministrationError),
     Unconfirmed(PairingAdministrationError),
-    Actor(PairingAdministrationError),
+    ActorBusy(PairingAdministrationError),
+    ActorFailed(PairingAdministrationError),
 }
 
 impl PairingDrainStartError {
@@ -160,11 +161,17 @@ impl PairingDrainStartError {
     #[must_use]
     pub(crate) fn code(&self) -> &str {
         match self {
-            Self::NotEnqueued(error) | Self::Unconfirmed(error) | Self::Actor(error) => {
-                error.code()
-            }
+            Self::NotEnqueued(error)
+            | Self::Unconfirmed(error)
+            | Self::ActorBusy(error)
+            | Self::ActorFailed(error) => error.code(),
         }
     }
+}
+
+enum PairingDrainActorError {
+    Busy(PairingAdministrationError),
+    Failed(PairingAdministrationError),
 }
 
 impl fmt::Debug for PairingCoordinatorHandle {
@@ -198,7 +205,12 @@ impl PairingCoordinatorHandle {
             .map_err(PairingDrainStartError::NotEnqueued)?;
         match reply_rx.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(PairingDrainStartError::Actor(error)),
+            Ok(Err(PairingDrainActorError::Busy(error))) => {
+                Err(PairingDrainStartError::ActorBusy(error))
+            }
+            Ok(Err(PairingDrainActorError::Failed(error))) => {
+                Err(PairingDrainStartError::ActorFailed(error))
+            }
             Err(_) => Err(PairingDrainStartError::Unconfirmed(pairing_error(
                 PAIRING_STOPPED,
             ))),
@@ -258,6 +270,17 @@ impl PairingCoordinatorHandle {
         reply_rx.await.map_err(|_| pairing_error(PAIRING_STOPPED))?
     }
 
+    pub(crate) async fn resume_after_completed_drain(
+        &self,
+    ) -> Result<(), PairingAdministrationError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(PairingCommand::ResumeAfterCompletedDrain { reply: reply_tx })
+            .await
+            .map_err(|_| pairing_error(PAIRING_STOPPED))?;
+        reply_rx.await.map_err(|_| pairing_error(PAIRING_STOPPED))?
+    }
+
     #[cfg(test)]
     pub(super) fn revocation_test_double(
         entered: oneshot::Sender<(DeviceHandle, RuntimeGrantSerial)>,
@@ -286,6 +309,7 @@ impl PairingCoordinatorHandle {
         entered: oneshot::Sender<()>,
         release: oneshot::Receiver<Result<(), PairingAdministrationError>>,
         resumed: oneshot::Sender<()>,
+        resume_result: Result<(), PairingAdministrationError>,
     ) -> Self {
         let (command_tx, mut command_rx) = mpsc::channel(2);
         tokio::spawn(async move {
@@ -296,13 +320,13 @@ impl PairingCoordinatorHandle {
             let result = release
                 .await
                 .unwrap_or_else(|_| Err(pairing_error(PAIRING_STOPPED)));
-            let _ = reply.send(result);
+            let _ = reply.send(result.map_err(PairingDrainActorError::Failed));
             let Some(PairingCommand::ResumeAfterFailedDrain { reply }) = command_rx.recv().await
             else {
                 return;
             };
             let _ = resumed.send(());
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(resume_result);
         });
         Self { command_tx }
     }
@@ -312,18 +336,21 @@ impl PairingCoordinatorHandle {
         entered: mpsc::UnboundedSender<()>,
         mut release: watch::Receiver<bool>,
         resumed: mpsc::UnboundedSender<()>,
+        completed: Option<oneshot::Sender<()>>,
     ) -> Self {
         let (command_tx, mut command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
         tokio::spawn(async move {
             let mut complete = *release.borrow();
-            let mut waiters: Vec<oneshot::Sender<Result<(), PairingAdministrationError>>> =
-                Vec::new();
+            let mut completed = completed;
+            let mut waiters: Vec<oneshot::Sender<Result<(), PairingDrainActorError>>> = Vec::new();
             loop {
                 tokio::select! {
                     changed = release.changed(), if !complete => {
                         if changed.is_err() {
                             for waiter in waiters.drain(..) {
-                                let _ = waiter.send(Err(pairing_error(PAIRING_STOPPED)));
+                                let _ = waiter.send(Err(PairingDrainActorError::Failed(
+                                    pairing_error(PAIRING_STOPPED),
+                                )));
                             }
                             return;
                         }
@@ -331,6 +358,9 @@ impl PairingCoordinatorHandle {
                             complete = true;
                             for waiter in waiters.drain(..) {
                                 let _ = waiter.send(Ok(()));
+                            }
+                            if let Some(completed) = completed.take() {
+                                let _ = completed.send(());
                             }
                         }
                     }
@@ -344,9 +374,12 @@ impl PairingCoordinatorHandle {
                                 for waiter in waiters.drain(..) {
                                     let _ = waiter.send(Ok(()));
                                 }
+                                if let Some(completed) = completed.take() {
+                                    let _ = completed.send(());
+                                }
                             }
                         }
-                        Some(PairingCommand::ResumeAfterFailedDrain { reply }) => {
+                        Some(PairingCommand::ResumeAfterCompletedDrain { reply }) => {
                             let _ = resumed.send(());
                             let _ = reply.send(Ok(()));
                         }
@@ -405,7 +438,7 @@ impl PairingCoordinatorHandle {
                 })
                 .expect("saturate queue before manager attempts Resume");
             let _ = saturated.send(());
-            let _ = reply.send(begin_result);
+            let _ = reply.send(begin_result.map_err(PairingDrainActorError::Failed));
             let _ = release.await;
             let _ = command_rx.recv().await;
             let stale = matches!(
@@ -507,16 +540,19 @@ enum PairingCommand {
         reply: oneshot::Sender<Result<RevocationReceipt, PairingAdministrationError>>,
     },
     BeginDrain {
-        reply: oneshot::Sender<Result<(), PairingAdministrationError>>,
+        reply: oneshot::Sender<Result<(), PairingDrainActorError>>,
     },
     ResumeAfterFailedDrain {
+        reply: oneshot::Sender<Result<(), PairingAdministrationError>>,
+    },
+    ResumeAfterCompletedDrain {
         reply: oneshot::Sender<Result<(), PairingAdministrationError>>,
     },
 }
 
 enum PairingDrainState {
     Idle,
-    Running(Vec<oneshot::Sender<Result<(), PairingAdministrationError>>>),
+    Running(Vec<oneshot::Sender<Result<(), PairingDrainActorError>>>),
     Failed,
     Complete,
 }
@@ -524,6 +560,22 @@ enum PairingDrainState {
 impl PairingDrainState {
     const fn is_active(&self) -> bool {
         !matches!(self, Self::Idle)
+    }
+
+    fn resume_after_failed(&mut self) -> Result<(), PairingAdministrationError> {
+        if !matches!(self, Self::Failed) {
+            return Err(pairing_error(PAIRING_DRAINING));
+        }
+        *self = Self::Idle;
+        Ok(())
+    }
+
+    fn resume_after_completed(&mut self) -> Result<(), PairingAdministrationError> {
+        if !matches!(self, Self::Complete) {
+            return Err(pairing_error(PAIRING_DRAINING));
+        }
+        *self = Self::Idle;
+        Ok(())
     }
 }
 
@@ -2516,6 +2568,9 @@ impl PairingCoordinator {
             PairingCommand::ResumeAfterFailedDrain { reply } => {
                 let _ = reply.send(self.resume_after_failed_drain());
             }
+            PairingCommand::ResumeAfterCompletedDrain { reply } => {
+                let _ = reply.send(self.resume_after_completed_drain());
+            }
         }
     }
 
@@ -2574,6 +2629,7 @@ impl PairingCoordinator {
             return;
         }
         let pairing_id = durable.pairing_id;
+        self.prune_closed_waiters();
         if self.waiters.values().map(Vec::len).sum::<usize>() >= PAIRING_COMMAND_CAPACITY {
             let _ = reply.send(Err(pairing_error(PAIRING_BUSY)));
             return;
@@ -2600,10 +2656,7 @@ impl PairingCoordinator {
         }
     }
 
-    async fn begin_drain(
-        &mut self,
-        reply: oneshot::Sender<Result<(), PairingAdministrationError>>,
-    ) {
+    async fn begin_drain(&mut self, reply: oneshot::Sender<Result<(), PairingDrainActorError>>) {
         match &mut self.drain {
             PairingDrainState::Idle => {
                 self.drain = PairingDrainState::Running(vec![reply]);
@@ -2611,14 +2664,18 @@ impl PairingCoordinator {
             PairingDrainState::Running(waiters) => {
                 waiters.retain(|waiter| !waiter.is_closed());
                 if waiters.len() >= PAIRING_COMMAND_CAPACITY {
-                    let _ = reply.send(Err(pairing_error(PAIRING_BUSY)));
+                    let _ = reply.send(Err(PairingDrainActorError::Busy(pairing_error(
+                        PAIRING_BUSY,
+                    ))));
                 } else {
                     waiters.push(reply);
                 }
                 return;
             }
             PairingDrainState::Failed => {
-                let _ = reply.send(Err(pairing_error(PAIRING_DRAINING)));
+                let _ = reply.send(Err(PairingDrainActorError::Failed(pairing_error(
+                    PAIRING_DRAINING,
+                ))));
                 return;
             }
             PairingDrainState::Complete => {
@@ -2630,11 +2687,11 @@ impl PairingCoordinator {
     }
 
     fn resume_after_failed_drain(&mut self) -> Result<(), PairingAdministrationError> {
-        if matches!(self.drain, PairingDrainState::Running(_)) {
-            return Err(pairing_error(PAIRING_DRAINING));
-        }
-        self.drain = PairingDrainState::Idle;
-        Ok(())
+        self.drain.resume_after_failed()
+    }
+
+    fn resume_after_completed_drain(&mut self) -> Result<(), PairingAdministrationError> {
+        self.drain.resume_after_completed()
     }
 
     async fn progress_drain(&mut self) {
@@ -2721,6 +2778,7 @@ impl PairingCoordinator {
     }
 
     async fn drain_is_complete(&mut self) -> Result<bool, PairingAdministrationError> {
+        self.prune_closed_waiters();
         if self.waiters.values().any(|waiters| !waiters.is_empty())
             || self
                 .revocation_waiters
@@ -2757,7 +2815,7 @@ impl PairingCoordinator {
             return;
         };
         for waiter in waiters {
-            let _ = waiter.send(Err(error.clone()));
+            let _ = waiter.send(Err(PairingDrainActorError::Failed(error.clone())));
         }
     }
 
@@ -2854,6 +2912,7 @@ impl PairingCoordinator {
             let _ = reply.send(Err(pairing_error(PAIRING_DRAINING)));
             return;
         }
+        self.prune_closed_waiters();
         if grant_serial.0 == 0
             || self
                 .revocation_waiters
@@ -3913,6 +3972,17 @@ impl PairingCoordinator {
         for key in revocations {
             self.fail_revocation_waiters(key, error.clone());
         }
+    }
+
+    fn prune_closed_waiters(&mut self) {
+        self.waiters.retain(|_, waiters| {
+            waiters.retain(|waiter| !waiter.is_closed());
+            !waiters.is_empty()
+        });
+        self.revocation_waiters.retain(|_, waiters| {
+            waiters.retain(|waiter| !waiter.is_closed());
+            !waiters.is_empty()
+        });
     }
 }
 

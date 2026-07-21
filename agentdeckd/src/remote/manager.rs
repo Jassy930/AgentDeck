@@ -71,7 +71,8 @@ const PURGE_RECOVERY_REQUIRED: &str = "daemon.purge.recovery_required";
 enum PairingDrainWaitError {
     NotEnqueued(PairingAdministrationError),
     Unconfirmed(PairingAdministrationError),
-    Actor(PairingAdministrationError),
+    ActorBusy(PairingAdministrationError),
+    ActorFailed(PairingAdministrationError),
     Pending,
     ShuttingDown,
 }
@@ -257,6 +258,7 @@ pub struct RemoteManager {
     enrollment_workflow: MachineEnrollmentWorkflow,
     pairing_pending_sink: OnceLock<Arc<dyn PairingPendingSink>>,
     shutdown_tx: watch::Sender<bool>,
+    trust_reset_singleflight: Mutex<()>,
     state: Mutex<RemoteManagerState>,
 }
 
@@ -306,6 +308,7 @@ impl RemoteManager {
             enrollment_workflow: MachineEnrollmentWorkflow::new(),
             pairing_pending_sink: OnceLock::new(),
             shutdown_tx: watch::channel(false).0,
+            trust_reset_singleflight: Mutex::new(()),
             state: Mutex::new(RemoteManagerState {
                 enabled,
                 armed: false,
@@ -778,24 +781,28 @@ impl RemoteManager {
             Ok(Err(PairingDrainStartError::Unconfirmed(error))) => {
                 Err(PairingDrainWaitError::Unconfirmed(error))
             }
-            Ok(Err(PairingDrainStartError::Actor(error))) => {
-                Err(PairingDrainWaitError::Actor(error))
+            Ok(Err(PairingDrainStartError::ActorBusy(error))) => {
+                Err(PairingDrainWaitError::ActorBusy(error))
+            }
+            Ok(Err(PairingDrainStartError::ActorFailed(error))) => {
+                Err(PairingDrainWaitError::ActorFailed(error))
             }
             Err(PairingCommandWaitError::Pending) => Err(PairingDrainWaitError::Pending),
             Err(PairingCommandWaitError::ShuttingDown) => Err(PairingDrainWaitError::ShuttingDown),
         }
     }
 
-    async fn resume_pairing_before_deadline(
+    async fn resume_pairing_before_deadline<F>(
         &self,
-        handle: &PairingCoordinatorHandle,
         deadline: tokio::time::Instant,
-    ) -> Result<(), RemoteAdministrationError> {
-        match self
-            .await_pairing_command(deadline, handle.resume_after_failed_drain())
-            .await
-        {
-            Ok(_) => Ok(()),
+        operation: F,
+    ) -> Result<(), RemoteAdministrationError>
+    where
+        F: Future<Output = Result<(), PairingAdministrationError>>,
+    {
+        match self.await_pairing_command(deadline, operation).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(admin_error(error.code())),
             Err(PairingCommandWaitError::Pending) => Err(admin_error(PAIRING_DRAIN_PENDING)),
             Err(PairingCommandWaitError::ShuttingDown) => Err(admin_error(REMOTE_SHUTTING_DOWN)),
         }
@@ -1157,6 +1164,13 @@ impl RemoteAdministration for RemoteManager {
         &self,
         request: TrustResetRequest,
     ) -> Result<MachineRemoteStatus, RemoteAdministrationError> {
+        // Drain 与后续 retirement/cleanup 是一个不可共享的 workflow。singleflight
+        // 独立于 state mutex，重复请求既不会挂接同一 Complete fence，也不会阻塞
+        // status/shutdown 取得 manager state。
+        let _singleflight = self
+            .trust_reset_singleflight
+            .try_lock()
+            .map_err(|_| admin_error(PAIRING_DRAIN_PENDING))?;
         let (portable_root_lost, pairing) = {
             let state = self.state.lock().await;
             require_running_armed(&state)?;
@@ -1183,9 +1197,15 @@ impl RemoteAdministration for RemoteManager {
                 ) => {
                     return Err(admin_error(error.code()));
                 }
-                Err(PairingDrainWaitError::Actor(error)) => {
-                    self.resume_pairing_before_deadline(handle, deadline)
-                        .await?;
+                Err(PairingDrainWaitError::ActorBusy(error)) => {
+                    return Err(admin_error(error.code()));
+                }
+                Err(PairingDrainWaitError::ActorFailed(error)) => {
+                    self.resume_pairing_before_deadline(
+                        deadline,
+                        handle.resume_after_failed_drain(),
+                    )
+                    .await?;
                     return Err(admin_error(error.code()));
                 }
                 Err(PairingDrainWaitError::Pending) => {
@@ -1211,8 +1231,8 @@ impl RemoteAdministration for RemoteManager {
             )
         {
             self.resume_pairing_before_deadline(
-                handle,
                 pairing_deadline.expect("pairing handle has a drain deadline"),
+                handle.resume_after_completed_drain(),
             )
             .await?;
         }
