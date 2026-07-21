@@ -93,15 +93,22 @@ agentdeck remote machine enroll \
 agentdeck remote machine status
 ```
 
-enroll 在发送 code、MachineRoot 或 Link/Data public material 前完成 CA/hostname/SPKI 校验。成功后只建立
-authenticated **control-only** MachineLink；它处理 auth、server restart 与 retirement control，任何业务 frame
-都必须关闭连接且不会进入 RuntimeCore。完全相同的 bundle 可用于 exact retry；不同 code/origin/pin/Relay/
-receipt anchor/expiry 会在网络前 conflict。
+enroll 在发送 code、MachineRoot 或 Link/Data public material 前完成 CA/hostname/SPKI 校验。P4.2 收口时
+只建立 authenticated **control-only** MachineLink；后续 P4.4 在同一 supervisor/session 上增加了唯一
+business ingress lane。完全相同的 bundle 可用于 exact retry；不同 code/origin/pin/Relay/receipt
+anchor/expiry 会在网络前 conflict。
 
-P4.3 已提供下节 `remote pairing ...` 与 exact `remote revoke` 本机管理面；P4.4–P4.6 尚未完成的持久
+P4.3 已提供下节 `remote pairing ...` 与 exact `remote revoke` 本机管理面；P4.5–P4.6 尚未完成的持久
 `remote pair/machines/sessions/watch/send/...` 仍返回 `remote.persistent.unsupported`。automatic gate 使用
 injected dev/ephemeral keystore 与 hermetic namespace；真实 production 命令仍要求 provisioned、release-signed
 daemon/CLI 与正确 entitlement，当前槽位保持 post-MVP BLOCKED，不能由 automatic PASS 代替。
+
+P4.4 仅完成 ingress/Core dispatch：Relay v2 outer、DeviceSign/AAD/replay/AEAD 和本机 auth-ledger
+exact recheck 全部通过后，才把 `RemotePrincipal` 交给 RuntimeCore。invalid grant/signature/AAD/
+replay 或 local revoke 后的旧 frame 会在 Core 前拒绝；`RouteAccepted` 仍不是 command success。
+当前 P4.5 `DirectedReplySealer` / `RemoteStreamPublisher` 未安装，manager 不领取可用的完整
+business lane，egress 按预期 fail-close。因此没有新增可操作的 persistent remote CLI 或端到端
+业务操作；不得为了调试绕过 admission、伪造 sealed reply/publish 或把 ingress PASS 当作远程 E2E。
 
 ## 创建并本机确认 PairInvite
 
@@ -134,8 +141,8 @@ agentdeck remote revoke --device <device-route-id> --grant-serial <serial>
 ```
 
 pairing drain 与 retirement 共用唯一 control owner：drain 绝对 deadline 为 10 秒，可被 shutdown 取消；
-失败时保留 durable state并 exact retry。P4.3 仍不提供业务 Runtime dispatch、persistent remote device CLI
-或 iOS 真链路；下一项 P4.4 才把唯一 MachineLink 接入 RuntimeCore。
+失败时保留 durable state并 exact retry。P4.3 本身不提供业务 Runtime dispatch；后续 P4.4 已接入
+严格 ingress/Core，但 persistent remote device CLI 与 iOS 真链路仍未完成，下一项为 P4.5。
 
 ## 本机 inventory 与 readback
 

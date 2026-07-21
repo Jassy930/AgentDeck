@@ -11,13 +11,14 @@
 
 ## 运行与诊断
 
-- `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2、P4.2 machine lifecycle/trust reset/
-  purge finalizer 与 daemon install/upgrade failure code、v1 marker 显式 reset 和排查流程。
-- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.10、P3 Phase、P4.1–P4.2
-  machine identity/enrollment/control-only transport、production UDS/client/install/smoke 与文档结构检查入口。
+- `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2、P4.2–P4.3 machine/pairing lifecycle、
+  P4.4 RemoteLink ingress 与 conversation-scoped recovery、daemon install/upgrade failure code、v1 marker
+  显式 reset 和排查流程。
+- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.10、P3 Phase、P4.1–P4.4
+  machine identity/enrollment/pairing/RemoteLink ingress、production UDS/client/install/smoke 与文档结构检查入口。
 - `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
-  enrollment、daemon 本机 status/trust-reset、安全 uninstall purge、fingerprint-bound readback 与
-  portable signed root-lost purge receipt 操作手册。
+  enrollment、daemon 本机 status/trust-reset、安全 uninstall purge、fingerprint-bound readback、
+  portable signed root-lost purge receipt，以及 P4.4 egress admission 仍关闭的部署边界。
 
 ## 计划与历史
 
@@ -71,9 +72,13 @@
   Link/Data cert、durable enrollment/receipt、control-only authenticated MachineLink、两条 trust reset 与
   安全 uninstall purge。P4.3 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977`
   收口 Runtime v4、schema v10/30 表、PairInvite/DeviceGrant/DeviceAuthorization/KeyDirectory、本机 auth
-  ledger、revoke 与 control handoff。P4–P6 当前为 3/7、0/9、0/4，下一项 P4.4 MachineLink→RuntimeCore。
-  本 Task 不证明业务 RemoteLink、E2EE publication、持久远程 CLI、iOS 真实链路或 production-signed
-  LaunchAgent/Keychain PASS。通用 CounterGuard IO 仍不代表 active reservation 或整库回滚闭环已完成。
+  ledger、revoke 与 control handoff。P4.4 code/test `cd7d9fb` 完成唯一 MachineLink business lane、Relay v2
+  outer→DeviceSign/AAD/replay/AEAD→Store exact auth recheck→`RemotePrincipal`→`RuntimeCore` dispatch，
+  以及 Active/Inactive/Unprovable 按 conversation 隔离的 recovery；`RouteAccepted` 不等于 command success，
+  `RemoteLink` 不持 canonical 业务状态。Runtime v4、schema v10/30 表不变。P4–P6 当前为 4/7、0/9、0/4，
+  下一项 P4.5。P4.5 directed sealer/stream publisher 尚未安装，production admission 保持关闭；本 Task
+  不证明 CounterGuard active reservation、MachineDataSign sealing、durable publication outbox、Relay
+  Publish/ACK、持久远程 CLI、Companion E2E 或 production-signed LaunchAgent/Keychain PASS。
   P5 MVP 只以 iOS Simulator 自动 E2E 退出，本机第二客户端归 P6 synthetic DoD。
 
 ## 协议资料

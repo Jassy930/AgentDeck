@@ -17,6 +17,8 @@ Runtime v4 又 additive 增加 P4.3 PairInvite、pending pairing、confirm/cance
 local-only administration。current Rust/Swift fixture 是 `runtime-v4-wire.jsonl`。冻结的
 `runtime-v1-wire.jsonl`、`runtime-v2-wire.jsonl` 与 `runtime-v3-wire.jsonl` 只作 compatibility 证据，不是 current Runtime
 contract gate。Runtime 版本提升不联动 local IPC v2、Relay v2 或 E2EE v1。
+P4.4 只在 Runtime v4 / Relay v2 / E2EE v1 上增加严格 decode、ingress 验证与 Core dispatch 接线；
+四条 schema 与版本常量均未变化。
 
 四个 `agentdeck protocol <op>` 子命令（连同 `protocol version`）都是纯本地
 计算：它们直接调用上表对应的聚合 schema 函数并原样打印，**不 spawn

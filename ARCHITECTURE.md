@@ -27,14 +27,14 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 └──────────────────────────┬──────────────────────────────────────┘
                            │ Layer A 中立事件主干（AgentItem）
                            │ Layer B Vendor 控件命名空间
-                           │ RuntimeEnvelope v3（OS-account canonical UDS）
+                           │ RuntimeEnvelope v4（OS-account canonical UDS）
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  agentdeckd (Rust daemon)                                       │
 │  RuntimeHub（admin/read stdio compatibility）                   │
 │       └─ production 拒绝 SessionStart / SessionContinue          │
 │  local::listener（retained-dirfd canonical UDS + supervisor）    │
-│       └─ same-EUID → preface → RuntimeEnvelope v3               │
+│       └─ same-EUID → preface → RuntimeEnvelope v4               │
 │  RuntimeCore（exec-gate + local connection actor 已就绪）        │
 │       └─→ AgentRouter（按 conversation.agentKind 路由）           │
 │            ├─ CodexAdapter      (capabilities = {...})          │
@@ -46,7 +46,7 @@ AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop
 codex app-server                       claude CLI (--print --stream-json)
 
 agentdeck-cli  (参考客户端 / 门控 E2E 驱动，不在 GUI 实时通路上)
-      │  RuntimeEnvelope v3 canonical UDS（无 spawn/fallback）
+      │  RuntimeEnvelope v4 canonical UDS（无 spawn/fallback）
       ▼
 agentdeckd
 ```
@@ -550,8 +550,8 @@ conversation/key，不能伪造身份连续性。
 - `RemoteManager` 只有在 recovery 完成、canonical same-UID UDS 已安全 bind 且消费同一
   `RemoteStartPermit` 后，才允许经纯 `agentdeck-relay-client` 发起 enrollment/auth/control outbound。CA、hostname
   与 SPKI pin 必须先于 code/root/public material；root-signed Link/Data cert 绑定同一
-  Relay/route/root/epoch/generation。`RemoteTransport` 不持有 `RuntimeCore`，只交付 retirement、安全 failure 与
-  server-restarting control；收到任一业务 frame立即关闭，production business dispatch 恒为零。
+  Relay/route/root/epoch/generation。P4.2 的 control surface 仍不持有 `RuntimeCore`；P4.4 由独立
+  `RemoteLink` 接管唯一 business lane，完成 ingress 验证、Store exact auth recheck 与 RuntimeCore dispatch。
 - 本机 `MachineEnroll`、`MachineRemoteStatus`、`TrustReset` 只允许 same-UID local principal 经 current Runtime v4
   canonical UDS 调用；RuntimeCore 只依赖 daemon-private neutral `RemoteAdministration` capability，不 import
   Relay wire。bundle/portable receipt 必须是 current-UID、single-link、no-follow 私有 regular file且最多 64 KiB。
@@ -568,8 +568,8 @@ conversation/key，不能伪造身份连续性。
   顺序固定为 `trust reset/readback → bootout + PID/UDS absent → retained helper → install files/plist → Runtime
   DB artifacts → machine keys/guards → StorageKEK last`。每步按 frozen plan/namespace/helper identity 读回并可
   crash-retry；DB/marker 缺失本身不是删除 Keychain 的授权。
-- automatic gate 使用 injected dev/ephemeral keystore、signature verifier 与 hermetic install namespace。它不
-  证明业务 RemoteLink、E2EE publication、持久远程 CLI、iOS 真实链路或
+- automatic gate 使用 injected dev/ephemeral keystore、signature verifier 与 hermetic install namespace。P4.4
+  已证明 business ingress/Core dispatch，但仍不证明 signed-sealed E2EE publication、持久远程 CLI、iOS 真实链路或
   production-signed LaunchAgent/Keychain；provisioned signed 槽位继续 post-MVP BLOCKED。
 
 ### Relay Companion MVP P4.3 pairing / authorization ledger 不变量
@@ -595,9 +595,25 @@ conversation/key，不能伪造身份连续性。
 - owner shutdown 保留 JoinHandle 并复用同一绝对 deadline，超时后 abort + join；startup 等 ready 时由
   manager shutdown watch 抢占。本地恢复每轮固定 `purge_expired_receipts → recover_generation`，绝不触发
   WSS reconnect；health/admission epoch 使 pre-owner 错误稳定 Blocked、暂态自愈清码，并阻止旧命令恢复后执行。
-- P4 当前完成 3/7，下一项 P4.4 把唯一 MachineLink 接入 `RuntimeCore`。P4.3 不拥有业务 Runtime dispatch、
-  E2EE publication/counter reservation、persistent remote CLI 或 iOS 真实链路；production-signed 槽位继续
-  post-MVP BLOCKED。
+- P4.3 本身不拥有业务 Runtime dispatch；后续 P4.4 已由 `cd7d9fb` 完成 ingress/Core。P4 当前完成 4/7，
+  下一项 P4.5。E2EE publication/counter reservation、persistent remote CLI 或 iOS 真实链路仍未完成；
+  production-signed 槽位继续 post-MVP BLOCKED。
+
+### Relay Companion MVP P4.4 MachineLink ingress / RuntimeCore 不变量
+
+- `RemoteLink` 只拥有 transport/dispatch 与有界 reply route，不持有 canonical conversation、command、approval
+  或 subscription 状态；这些状态只由 `RuntimeCore` 与 authenticated Runtime Store 裁决。
+- ingress 顺序固定为 Relay v2 outer → DeviceSign/AAD/replay/AEAD → local auth-ledger exact recheck →
+  `RemotePrincipal` → `RuntimeCore`。invalid grant/signature/AAD/replay、cross-store proof 与 local revoke 后残留
+  frame 必须在 Core 前拒绝；replay commit 不能早于 Core admission。
+- RouteAccepted 只代表 Relay transport 接纳，不代表 daemon 接受、Store commit 或 command success。directed
+  reply 绑定 exact generation/connection/message route，只有 socket flush 后才能 ACK；stale generation reply
+  必须丢弃并回收 route。
+- RemoteLink 只在 recovery 完成后启动；`RecoveryBlocked` 保持 conversation-scoped read-only，健康 sibling
+  继续服务。shutdown 使用绝对 deadline，超时必须 abort + join，不得 detached actor。
+- P4.4 只预留 `DirectedReplySealer` / `RemoteStreamPublisher` 接缝；真实 MachineDataSign/AEAD sealer、stream
+  publisher、counter reservation 与 durable publication outbox 属 P4.5。它们未安装时 production
+  `admission_ready=false`，不得 ACK、不得发送未 seal reply，也不得把 ingress PASS 写成 publication PASS。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 
@@ -1105,7 +1121,7 @@ Swift UI
   -> CapabilityRouter（按 SessionCapabilities 派发）
   -> WorkbenchModel / ThreadRuntimeModel / SessionModel / HistoryModel
   -> AgentDeck IPC models（来自 agentdeck-protocol v2）
-  -> AppRuntimeCoordinator / RuntimeEnvelope v3
+  -> AppRuntimeCoordinator / RuntimeEnvelope v4
   -> OSAccountRuntimeWireSession（canonical singleton UDS；无 spawn/fallback）
 
 daemon main
@@ -1117,14 +1133,15 @@ daemon main
   -> C0-C native metadata coordinator → authenticated fence substrate（live vendor post-MVP gated）
   -> P3.7 exec-gate / typed driver（普通 GUI、CLI/selfcheck 已由 P3.9-C3/D 接通）
   -> P4.2 RemoteManager → enrollment / control-only RemoteTransport → agentdeck-relay-client
-  -> transport-neutral P3.6 component → transfer / publication（业务 production owner 待 P4.4/P4.5）
+  -> P4.4 RemoteLink ingress / RuntimeCore dispatch → transport-neutral P3.6 component
+  -> P4.5 signed-sealed publication / counter recovery（production owner 待实现）
   -> AgentRouter → CodexAdapter / ClaudeCodeAdapter
   -> record / diag
   -> codex app-server child process / claude CLI child process
 
 agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
   -> agentdeck-protocol（共享类型）
-  -> RuntimeUnixClient / RuntimeEnvelope v3（canonical singleton UDS）
+  -> RuntimeUnixClient / RuntimeEnvelope v4（canonical singleton UDS）
   -> 同一 RuntimeCore；无 spawn/fallback，显式 diagnostics one-shot 与 compatibility stdio 在主路径外
 ```
 

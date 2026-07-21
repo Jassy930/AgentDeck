@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成。P4/P5/P6 当前分别为 3/7、0/9、0/4 Task 完成，下一项是 P4.4 MachineLink→RuntimeCore；production native metadata 与 provisioned signed Keychain/LaunchAgent 均为 post-MVP gated/BLOCKED（2026-07-21） |
+| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成；P4.4 MachineLink ingress/RuntimeCore dispatch 由 `cd7d9fb` 完成。P4/P5/P6 当前分别为 4/7、0/9、0/4 Task 完成，下一项是 P4.5 signed publication/counter recovery；production native metadata 与 provisioned signed Keychain/LaunchAgent 均为 post-MVP gated/BLOCKED（2026-07-22） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -62,8 +62,12 @@ DeviceGrant/DeviceAuthorization/bootstrap KeyDirectory、本机 auth ledger、re
 owner handoff；`PairResponse.info` 绑定 response hash/HPKE/MachineDataSign/receipt 四轴，invite TTL 为 298 秒。
 `3b4b977` 进一步固定 cancel-safe actor join、startup shutdown watch、LocalRetry/TransportRetry、动态 health 与
 admission epoch fence；本地恢复不重拨 WSS，旧 epoch 命令恢复后零执行。
-P4 当前为 3/7，下一项是 P4.4。P4.3 不拥有业务 Runtime dispatch、E2EE publication、持久远程 CLI 或
-iOS 真实链路。CounterGuard 仍只是通用 IO，不代表 active symmetric key reservation、DB high-water
+P4.4 由 `cd7d9fb` 完成唯一 MachineLink business ingress：Relay v2 outer、DeviceSign/AAD/
+replay/AEAD、local auth-ledger exact recheck 通过后，才以 `RemotePrincipal` 进入
+`RuntimeCore`；`RouteAccepted` 不代表 command success，恢复阻断仅限对应 conversation。P4 当前为
+4/7，下一项是 P4.5。P4.4 只留下 typed egress seam；MachineDataSign sealer、publisher、counter
+reservation、durable publication outbox、持久远程 CLI 或 iOS 真实链路仍未完成。CounterGuard 仍只是通用
+IO，不代表 active symmetric key reservation、DB high-water
 绑定或整库回滚闭环已经完成。iOS 仍只有 fixture 驱动骨架。P3.1 provisioned signed Keychain/LaunchAgent
 roundtrip 继续按方案 b 保持 post-MVP BLOCKED gate。完整实施仍必须满足 §17 的 Definition of Done。
 
@@ -1594,8 +1598,13 @@ provisioned production-signed LaunchAgent/Keychain 仍按方案 b 保持 post-MV
   RuntimeCore dispatch。
 - P4.3 已完成 PairInvite、byte-stable PairRequest/Response、DeviceGrant/DeviceAuthorization、bootstrap
   KeyDirectory、本机 fingerprint confirmation/auth ledger、revoke 与 durable route outbox；shared control 的
-  activation/drain/handoff/singleflight 已收口。业务 RemoteLink 继续由 P4.4 拥有。
-- daemon WSS/E2EE、MachineDataSign、Catalog/events/commands/replay、key/counter crash recovery。
+  activation/drain/handoff/singleflight 已收口。
+- P4.4 已把唯一 MachineLink business ingress 接入 RuntimeCore。`RemoteLink` 只持有易失
+  generation/replay/connection/reply-route，不持有 canonical conversation/command/receipt state；invalid
+  grant/signature/AAD/replay 及 local revoke 后的旧 frame 均在 Core 前拒绝，Active/Inactive/
+  Unprovable 恢复按 conversation 收敛。
+- P4.5 仍需完成 daemon WSS/E2EE 下行、MachineDataSign、Catalog/events/commands/replay、
+  key/counter crash recovery。当前 directed sealer/publisher 未安装，production admission 保持关闭。
 - macOS persistent 远程 CLI 使用 Keychain 中的真实 grant/private keys 和 daemon receipts；Linux synthetic client 只用 ephemeral keys。
 
 退出门禁：P4 的 machine identity、pairing、RemoteLink、远程 CLI 与 trust-reset/uninstall-purge 功能全部

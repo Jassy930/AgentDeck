@@ -1075,7 +1075,7 @@ ignored/BLOCKED；P3.7 exec gate 主体、边界裁决、两个 prepare finding 
 `c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；P3.8 production UDS 与后续
 P3.9 shared-daemon client 与 P3.10 LaunchAgent Task 已完成；P3.10 code/test commit 为 `19622ab`，
 后续 Phase hardening code baseline 为 `9efb28d`，P3 automatic scope 已完成 6/6 Phase Exit；P4
-已由 P4.1/P4.2/P4.3 推进到 3/7，下一项是 P4.4 MachineLink→RuntimeCore；E2EE/Relay Publish 仍未完成。
+已由 P4.1–P4.4 推进到 4/7，下一项是 P4.5 signed publication/counter recovery；E2EE/Relay Publish 仍未完成。
 
 ### Task P3.6-A：先冻结 Runtime/E2EE contract 与跨语言 wire
 
@@ -2468,7 +2468,7 @@ P3.9 固定以下迁移边界：
   真实 Codex/CC login 与 provisioned signed Keychain 继续是 post-MVP BLOCKED 槽位，不冒充本 Task 证据。
   P3.9 至此完成；P3.10 已由 `19622ab` 完成 Task 收口并通过完整 verifier 与双路 Task 终审；后续
   Phase review hardening 已由 `773a2b3` / `0057824` / `81cc314` / `9efb28d` 收口，P3 automatic scope
-  已完成 6/6 Phase Exit。后续 P4.1/P4.2/P4.3 已完成，P4 当前为 3/7，下一项是 P4.4。
+  已完成 6/6 Phase Exit。后续 P4.1–P4.4 已完成，P4 当前为 4/7，下一项是 P4.5。
 
 ### Task P3.10：实现 LaunchAgent 安装、versioned upgrade 与保留数据的 uninstall
 
@@ -2478,8 +2478,8 @@ P3.9 固定以下迁移边界：
 > code/test，并由 `19622ab` scoped commit。冻结 candidate 的完整
 > `bash scripts/verify-relay-companion-mvp.sh p3` 已 exit 0，两路 Task review 均 Approved、无 P0/P1/P2；
 > 隔离 ephemeral UDS 已完成 install→stage→ACK→idle→手动 current restart→Hello；后续 Phase review
-> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。后续 P4.1/P4.2/P4.3 已完成，P4 当前为
-> 3/7，下一项是 P4.4。
+> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。后续 P4.1–P4.4 已完成，P4 当前为
+> 4/7，下一项是 P4.5。
 
 **前置冻结：** local-only typed `StageUpgrade` request/reply、授权与错误语义已纳入 P3.9-C0-A 的 Runtime
 v2 contract；P3.9 的历史基线固定返回 typed feature-unavailable，P3.10 implementation 已用 durable/flush-ACK
@@ -2558,18 +2558,18 @@ focused tests + scoped Clippy/fmt，不做子片级双路终审、全量慢门�
 - [x] 四 schema、daemon network boundary、agent docs、local smoke、diagnostics 与 scoped diff/status 全绿；
   冻结 candidate 的两路 phase code review 均为 P0/P1/P2=0。
 - [x] P3 标记为 `complete (automatic scope)`；provisioned production-signed LaunchAgent/Keychain
-  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。后续 P4.1/P4.2/P4.3 已完成，P4 当前为 3/7，
-  下一项是 P4.4。
+  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。后续 P4.1–P4.4 已完成，P4 当前为 4/7，
+  下一项是 P4.5。
 
 ---
 
 ## Phase P4：Machine identity、Pairing 与 RemoteLink
 
-> **当前状态（2026-07-21）：3/7 Task 完成。** P4.1 machine identity/guard、P4.2
-> certificate/enrollment/control-only RemoteTransport/trust reset 与 P4.3 PairInvite/DeviceGrant/auth ledger
-> automatic scope 已完成 Task 级完整门禁与双路 Approved；下一项是 P4.4 MachineLink→RuntimeCore。
-> P4.4–P4.7 与 P4 Phase Exit 仍未完成，其 checkbox 保持未勾。此前 0/7、1/7、2/7 分别是
-> P4.1/P4.2/P4.3 开始前的历史基线。
+> **当前状态（2026-07-22）：4/7 Task 完成。** P4.1 machine identity/guard、P4.2
+> certificate/enrollment/control-only RemoteTransport/trust reset、P4.3 PairInvite/DeviceGrant/auth ledger 与
+> P4.4 MachineLink ingress/RuntimeCore dispatch automatic scope 已完成 Task 级完整门禁与双路 Approved；
+> 下一项是 P4.5 signed publication/counter recovery。P4.5–P4.7 与 P4 Phase Exit 仍未完成，其 checkbox
+> 保持未勾。此前 0/7、1/7、2/7、3/7 分别是 P4.1/P4.2/P4.3/P4.4 开始前的历史基线。
 
 ### Task P4.1：扩展 macOS Keychain 为 Machine identity 与 CounterGuard（零 cert/enrollment/RemoteLink）
 
@@ -2807,7 +2807,7 @@ production-signed Keychain 槽位；继续精确记为 post-MVP BLOCKED，不计
 > **状态：Task complete。** 主体 code/test commit 为 `518380e`，后续 ownership/recovery hardening 为
 > `b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`，Runtime v4 gate repair 为 `fe3a9ad`，最终
 > shutdown/startup/local-recovery hardening 与 v10 inventory/ledger/cipher fixture gate 为 `3b4b977`。current Runtime
-> protocol 为 v4，physical schema 为 v10/30 表；下一项为 P4.4。
+> protocol 为 v4，physical schema 为 v10/30 表；后续 P4.4 已由 `cd7d9fb` 完成，下一项为 P4.5。
 
 **Files:**
 - Create: `agentdeckd/src/remote/{pairing,grants,access,key_directory}.rs`
@@ -2865,28 +2865,60 @@ crypto/tamper/schema/network/fmt/diff gates 全绿。最终 `4fd8ed8..3b4b977` �
 
 ### Task P4.4：把唯一 MachineLink transport 接入 RuntimeCore
 
+> **状态：Task complete。** code/test commit 为 `cd7d9fb`。本 Task 完成唯一 MachineLink business
+> lane、完整 ingress 验证、local auth-ledger exact recheck、`RemotePrincipal` 与 `RuntimeCore` dispatch；
+> Runtime protocol 保持 v4，physical schema 保持 v10/30 表。P4.5 的 directed sealer 与 stream publisher
+> 尚未安装，production admission 保持关闭并 fail-close。
+
 **Files:**
 - Create: `agentdeckd/src/remote/{link,dispatch}.rs`
+- Create: `agentdeck-protocol/tests/p4_remote_link_protocol_contract.rs`
+- Create: `agentdeckd/src/runtime/store/remote_ingress_tests.rs`
 - Create: `agentdeckd/tests/machine_remote_link.rs`
-- Modify: `agentdeckd/src/{main,lib}.rs`
-- Modify: `agentdeckd/src/runtime/core.rs`
-- Modify: `agentdeckd/Cargo.toml`
-- Modify: `scripts/check-daemon-network-boundary.sh`
+- Modify: `agentdeck-protocol/src/e2ee/{context,payload}.rs`、`agentdeck-protocol/src/runtime/envelope.rs`
+- Modify: `agentdeckd/src/main.rs`
+- Modify: `agentdeckd/src/remote/{manager,manager_tests,mod,p44_remote_link_tests,p44_remote_transport_tests,transport}.rs`
+- Modify: `agentdeckd/src/runtime/{connection,conversation,core,model,recovery}.rs`、`agentdeckd/src/runtime/core/tests.rs`
+- Modify: `agentdeckd/src/runtime/store/{command_event,journal,mod,pairing_authorization,pairing_delivery_tests,pairing_grant_tests,pairing_revocation,pairing_tests,worker}.rs`、`agentdeckd/src/runtime/store/stream/tests.rs`
+- Modify: `agentdeckd/tests/{pairing_state_machine,runtime_approval,runtime_core,runtime_crash_recovery}.rs`
 
 **Boundary:**
 ```text
 sealed frame -> Relay v2 outer validation -> DeviceSign/AAD/replay/AEAD verification
              -> local grantSerial auth-ledger check -> RemotePrincipal
              -> RuntimeCore::handle -> RuntimeReply/Event
-             -> MachineDataSign + AEAD -> opaque Relay frame
+             -> P4.4 typed egress seam (production admission=false)
+             -> [P4.5 MachineDataSign + AEAD / Relay Publish]
 ```
 
-- [ ] Step 1: 写RemoteLink tests。 复用P4.2唯一machine WSS；重连challenge与active generation replacement；invalid grant/signature/AAD/replay在core前拒；local revoke后网络中旧frame不执行；RouteAccepted不产生command success；多个device进入同core。 recovery完成前RemoteLink不启动；RecoveryBlocked conversation只读，其他安全conversation可服务。
-- [ ] Step 2: 运行machine_remote_link test与boundary guard。 Expected: FAIL，transport已能鉴权但尚未派发Runtime业务。
-- [ ] Step 3: 依赖existing RemoteTransport与agentdeck-crypto实现RemoteLink supervisor/dispatch。 adapter目录不得importrelay/remote类型；RemoteLink不持有canonical业务state，只把已验证的RuntimeRequest规范化为RemotePrincipal后交RuntimeCore。
-- [ ] Step 4: 重跑tests和guard。 Expected: P4 guard只允许`agentdeckd/src/remote/`及client crate出现outbound WSS/HTTPS；仍禁止daemon axum、TCP listener、reqwest/server feature。
-- [ ] Step 5: 运行完整agentdeckd tests与clippy。
-- [ ] Step 6: 提交。 `git add agentdeckd scripts Cargo.lock && git commit -m "feat(remote): 接入唯一 outbound Machine RemoteLink"`
+- [x] Step 1: 写RemoteLink tests。 复用P4.2唯一machine WSS；重连challenge与active generation replacement；invalid grant/signature/AAD/replay在core前拒；local revoke后网络中旧frame不执行；RouteAccepted不产生command success；多个device进入同core。 recovery完成前RemoteLink不启动；RecoveryBlocked conversation只读，其他安全conversation可服务。
+- [x] Step 2: 运行machine_remote_link test与boundary guard。 Expected: FAIL，transport已能鉴权但尚未派发Runtime业务。
+- [x] Step 3: 已依赖 existing RemoteTransport 与 agentdeck-crypto 实现 RemoteLink supervisor/dispatch。
+  adapter 目录没有 import relay/remote 类型；RemoteLink 不持有 canonical 业务 state，只把完整验证后的
+  RuntimeRequest 规范化为 RemotePrincipal 后交 RuntimeCore。local revoke 后的旧 frame 在 Core 前拒绝。
+- [x] Step 4: tests 与 guard 已通过。network boundary 只允许 `agentdeckd/src/remote/` 及 client crate
+  outbound WSS/HTTPS；daemon 仍无 axum/TCP listener/reqwest/server feature。RouteAccepted 与 command
+  success 保持分离，RecoveryBlocked 只隔离对应 conversation。
+- [x] Step 5: 完整 daemon target inventory、Clippy、fmt、network、schema 与跨 crate 门禁已通过。
+  正式 `cargo test -q -p agentdeckd --locked -- --test-threads=1` exit 0，wall 1322.53 秒；
+  lib 为 `1291 passed / 3 ignored`（763.78 秒），`runtime_store_boundaries` 为 `5/5`（281.52 秒），
+  `runtime_stream` 为 `45/45`（41.64 秒），其余 integration target 无失败。quality 终审另按
+  target inventory 核对 1,853 个发现项已全覆盖：`1845 passed / 8 ignored / 0 failed`。relay-client
+  `18/18`、protocol `214/214`、crypto `50/50`、CLI `168/168`、Relay server+tls 顶层 `359 passed`、
+  Swift `541 XCTest + 35 Swift Testing`、iOS Simulator `20/20` 均为 exit 0。
+- [x] Step 6: 已精确提交 35 个 code/test 路径为 `cd7d9fb`，未使用 `git add -A`，未加入 co-author；
+  implementation 计划与其余 docs 保持在独立 Task 收口提交。
+
+**Task 边界与终审：** Relay v2 outer → DeviceSign/AAD/replay/AEAD → Store exact auth recheck →
+RemotePrincipal → RuntimeCore 是唯一 ingress；RemoteLink 只拥有 transport/dispatch 与有界 reply routing，
+不裁决 canonical 业务状态。P4.4 只预留 `DirectedReplySealer` / `RemoteStreamPublisher` 接缝，production
+`admission_ready=false`；不预留 counter、不 seal、不写 durable publication outbox。独立 `spec/security`
+与 `quality` 终审均为 P0/P1/P2=0、Approved。counter reservation、durable publication outbox、Relay
+Publish、persistent remote CLI 与 production-signed PASS 均仍属于 P4.5/P4.6 或 post-MVP gate。
+
+**Task 实际范围与刹车线：** `cd7d9fb` 精确覆盖 35 个 code/test 路径，未修改
+Cargo manifest、lockfile 或 network-boundary 脚本。最大 production 子片为 `remote/link.rs`
+1,038 additions，低于 1,800 行预拆线；测试、fixture 与文档不计 production 拆片线。
 
 ### Task P4.5：实现 key directory、MachineDataSign、publish/replay 与 counter crash recovery
 

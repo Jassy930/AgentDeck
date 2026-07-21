@@ -76,12 +76,19 @@ root-present/root-lost trust reset 与安全 uninstall purge。P4.3 由 `518380e
 DeviceAuthorization/KeyDirectory、本机 auth ledger、revoke、control handoff 与 cancel-safe recovery。
 最终实际范围为 130 个非 lock 代码/测试/协议路径（另含 `Cargo.lock`），最大 production 子片 Store pairing
 为 1,792 additions。
-P4 当前为 3/7，下一项是 P4.4 MachineLink→RuntimeCore。P4.3 没有业务 Runtime dispatch，不代表业务 RemoteLink、E2EE publication、持久
-远程 CLI、iOS 真实链路或 production-signed Keychain/LaunchAgent PASS。通用 CounterGuard IO 仍不代表
-active symmetric key reservation、DB high-water 绑定或整库回滚闭环已完成。P4 E2EE/Relay Publish、
-P5 Simulator 自动 E2E 与 P6 本机第二客户端 synthetic DoD 均未完成；物理 iPhone/第二台 Mac 是
-post-MVP BLOCKED 槽位。transfer/publication 也尚无 production remote owner；不能因 control-only
-transport、fake publication、store tests 或 Simulator fixture 改写尚未实现的自动链路状态。
+P4.4 code/test `cd7d9fb` 已收口唯一 MachineLink business lane：Relay v2 outer、DeviceSign/AAD/replay
+candidate/AEAD、Store exact-current auth-ledger recheck 后才把 `RuntimeRequest` 规范化为 `RemotePrincipal`
+并交给 `RuntimeCore`；`RouteAccepted` 不等于 command success。recovery 完成前 RemoteLink 不启动：Active
+可恢复、Inactive 在 actor install 前终止、Unprovable/legacy 只隔离对应 conversation。
+`RemoteLink` 只持易失 generation/replay/connection/reply-route，不持 canonical 业务状态。最大 production
+子片 `link.rs` 为 1,038 additions，低于 1,800 预拆线。
+P4 当前为 4/7，下一项是 P4.5 signed publication/counter recovery。P4.4 只预留
+`DirectedReplySealer` / `RemoteStreamPublisher` 接缝，production `admission_ready=false`；sealer/publisher、
+active symmetric key reservation、DB high-water 绑定、MachineDataSign sealing、durable publication outbox、
+Relay Publish/ACK、持久远程 CLI、Companion E2E 与 production-signed Keychain/LaunchAgent 均未完成。
+P5 Simulator 自动 E2E 与 P6 本机第二客户端 synthetic DoD 仍未完成；物理 iPhone/第二台 Mac 是
+post-MVP BLOCKED 槽位。不能因 ingress tests、fake publication、store tests 或 Simulator fixture 改写
+尚未实现的自动链路状态。
 
 ```text
 docs/plans/

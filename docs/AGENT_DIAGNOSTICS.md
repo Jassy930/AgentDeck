@@ -805,8 +805,9 @@ production-signed LaunchAgent/Keychain slot 继续精确返回 post-MVP
 automatic gate 正确，不表示 production signing PASS。P3.1 继续采用方案 b。P4.1 已由
 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、`46c6bb8` 完成 automatic Task 收口，
 P4.2 又由 `a6842bc` 完成 Link/Data cert、enrollment workflow、receipt IO、control-only
-RemoteTransport 与 trust reset；P4.3 又完成 PairInvite/DeviceGrant/auth ledger/revoke/control handoff。P4 当前为
-3/7，下一项 P4.4 MachineLink→RuntimeCore。
+RemoteTransport 与 trust reset；P4.3 又完成 PairInvite/DeviceGrant/auth ledger/revoke/control handoff；
+P4.4 由 `cd7d9fb` 完成 MachineLink ingress/RuntimeCore dispatch。P4 当前为 4/7，下一项 P4.5
+signed publication/counter recovery。
 
 ### P4.1 machine identity / Keychain guard 排障
 
@@ -925,8 +926,34 @@ pairing startup/retention 遇到 `daemon.runtime.store_busy` / `store_unavailabl
 `LocalBlocked`：不得重拨 WSS，每轮只执行完整 `purge_expired_receipts → recover_generation`。status 以 actor
 health 为准，自愈后回到 Active；进入 block 前已排队的旧 admission epoch 命令必须有界失败，恢复后不得执行。
 
-P4.3 仍不处理业务 Runtime request/event。业务 frame 在 P4.4 接线前必须 fail-close；不得把 pairing/grant
-receipt 改写成 prompt/approval/command success。
+P4.3 本身不处理业务 Runtime request/event；后续 P4.4 已接入严格验证后的 ingress。
+pairing/grant receipt 仍不得改写成 prompt/approval/command success。
+
+#### P4.4 MachineLink ingress / RuntimeCore dispatch
+
+P4.4 的唯一 ingress 顺序为 Relay v2 outer → DeviceSign/AAD/replay candidate/AEAD → Store
+exact-current auth-ledger recheck → `RemotePrincipal` → `RuntimeCore`。任一前置校验失败都不得
+调用 Core；local revoke 后网络中残留的旧 frame 必须在 Core 前拒绝。`RouteAccepted` 只是
+Relay transport 状态，不是 daemon acceptance、Store commit 或 command success。
+
+恢复分类保持 conversation-scoped：Active ADC2 exact binding 可继续恢复；Inactive ADC2 在
+actor install/start 前转为 `revokedBeforeStart`；Unprovable binding 或 legacy ADC1 只把对应
+conversation 置为 `RecoveryBlocked` 只读，其他安全 conversation 继续服务。RemoteLink 只持有
+易失 generation/replay/connection/reply-route，canonical conversation/command/receipt 仍只属于
+RuntimeCore/Store。
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `daemon.remote.ingress.invalid_outer` / `invalid_sealed_blob` / `invalid_key_binding` | Relay route/context、canonical sealed blob 或 DeviceCommandTx key epoch/revision 不匹配 | 在 Core 前拒绝；核对 current Relay v2 / E2EE v1 wire 与 key directory，禁止宽松 decode |
+| `daemon.remote.ingress.invalid_signature` / `replay_rejected` / `invalid_ciphertext` | DeviceSign、counter+ciphertext replay tuple 或 AEAD 验证失败 | 丢弃 frame 并保留 current replay window；不调用 Core、不返回业务成功 |
+| `daemon.remote.ingress.authorization_denied` | device/grant 不是 Active，或 crypto 后 exact-current auth-ledger recheck 因 revoke/renew/key revision 变化失败 | 保持 fail-close；读取本机 auth ledger，禁止缓存旧 grant 绕过 recheck |
+| `daemon.remote.ingress.invalid_runtime_request` | 解密 payload 不是 current Runtime v4 request | 拒绝且不猜测版本/类型；四个协议版本轴不得联动升级 |
+| `daemon.remote.link.generation_replaced` / `transport_failed` / `closed` | active business generation 被新连接替换，或 transport/actor 结束 | 丢弃 stale generation 的 reply route并由唯一 supervisor 有界恢复；不创建第二 owner |
+| `daemon.remote.link.core_unavailable` / `core_rejected` / `core_dispatch_capacity` | Core 不可用、拒绝 request 或有界 dispatch lane 已满 | 不把 RouteAccepted 提升为 command success；返回 typed failure 并保持有界背压 |
+| `daemon.remote.link.reply_route_unknown` / `reply_route_capacity` / `reply_authorization_mismatch` / `reply_seal_invalid` / `invalid_core_egress` | directed reply route 过期/满载、授权错绑、sealer 返回错绑 wire，或 Core 输出不是 Reply/Stream | drop write 且不 ACK；不换 route、不宽松校验 |
+| `daemon.remote.link.connection_capacity` / `replay_capacity` | 易失 connection/replay key 容量达到硬上限 | 拒绝新 admission，先收口旧 generation/connection；不扩展为无界缓存 |
+| `daemon.remote.link.reply_seal_unavailable` / `stream_publisher_unavailable` | P4.5 sealer/publisher 未安装 | 这是 P4.4 production 预期的 egress fail-close；不得伪造 sealed reply/publish 或开启 business admission |
+| `daemon.remote.link.shutdown_timed_out` | actor 未在绝对 shutdown deadline 内 quiesce | abort + join 并保留安全 durable state；禁止 detached task |
 
 #### Trust reset 与本地 cleanup
 
