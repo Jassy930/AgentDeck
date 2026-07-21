@@ -901,14 +901,15 @@ mod tests {
             .expect("commit Started before typed gate release");
 
         let ready = root.join("vendor.ready");
-        let finish = root.join("vendor.finish");
         let mut command_process = Command::new("/bin/sh");
         command_process
             .arg("-c")
-            .arg("printf ready > \"$1\"; while [ ! -e \"$2\" ]; do /bin/sleep 0.01; done")
+            // `exec` 保留 exact leader PID/start-time/PGID，且不创建短命 sleep
+            // grandchild。旧 fixture 在 full-suite 负载下偶尔让 shell 与 sleep 同时
+            // 退出成尚未被 init 回收的 group，误把测试夹具竞态报告成 CancelFailed。
+            .arg("printf ready > \"$1\"; exec /bin/sleep 3600")
             .arg("typed-release-vendor")
             .arg(&ready)
-            .arg(&finish)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1033,7 +1034,6 @@ mod tests {
             committed.release_authorized_at_ms
         );
 
-        fs::write(&finish, b"finish\n").expect("release typed vendor exit latch");
         let completed = tokio::time::timeout(Duration::from_secs(5), completion)
             .await
             .expect("typed completion timeout")
