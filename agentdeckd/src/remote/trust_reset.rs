@@ -268,7 +268,7 @@ impl TrustResetControlFailure {
         Self { code: code.into() }
     }
 
-    fn code(&self) -> &str {
+    pub(super) fn code(&self) -> &str {
         &self.code
     }
 }

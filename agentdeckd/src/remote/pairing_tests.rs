@@ -11,10 +11,12 @@ use agentdeck_protocol::e2ee::{
     MachineDataSignerBindingV1, PairRequestPlaintextV1, PairResponsePlaintextV1,
     PairResponseReceivedV1,
 };
-use agentdeck_protocol::relay_v2::frame::PairRouteCloseOutcome;
+use agentdeck_protocol::relay_v2::failure::RelayFailure;
+use agentdeck_protocol::relay_v2::frame::{PairRouteCloseOutcome, RetireMachine, ServerRestarting};
 use agentdeck_protocol::relay_v2::{
     CertRole, DeviceRouteId, Ed25519Signature, KeyDirectoryRevision, LinkGeneration,
-    MachineRouteId, RelayGrant, RootKeyId, TrustEpoch,
+    MachineRouteId, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, RelayGrant,
+    RootKeyId, TrustEpoch,
 };
 use agentdeck_protocol::runtime::{
     IdempotencyKey, LocalOnlyAdministration, PairingDecision, PairingReceipt, PairingState,
@@ -24,6 +26,9 @@ use agentdeck_protocol::runtime::{
 use crate::runtime::store::pairing_grant::GlobalKeyStateV1;
 use crate::runtime::store::{MachineIdentityBinding, RuntimeIdKind, RuntimeStoreConfig};
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
+
+use crate::remote::transport::{PairingTransportLane, active_pairing_transport_for_test};
+use crate::remote::trust_reset::TrustResetControlTransport;
 
 use super::*;
 
@@ -1345,6 +1350,8 @@ struct FakeLane {
     sent_close_tx: mpsc::UnboundedSender<ClosePairRoute>,
     order: Arc<StdMutex<Vec<&'static str>>>,
     reconnects: Arc<AtomicUsize>,
+    shared_control_yields: Arc<AtomicUsize>,
+    fail_shared_control_yield: Arc<AtomicBool>,
     fail_send: Arc<AtomicBool>,
     send_failure_code: &'static str,
     clear_send_failure_on_reconnect: bool,
@@ -1407,6 +1414,14 @@ impl PairingLane for FakeLane {
         self.order.lock().unwrap().push("reconnect");
         if self.clear_send_failure_on_reconnect {
             self.fail_send.store(false, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn yield_shared_control(&mut self) -> Result<(), PairingAdministrationError> {
+        self.shared_control_yields.fetch_add(1, Ordering::SeqCst);
+        if self.fail_shared_control_yield.load(Ordering::SeqCst) {
+            return Err(pairing_error("remote.transport.pairing_yield_failed"));
         }
         Ok(())
     }
@@ -1667,6 +1682,8 @@ struct TestActor {
     sent_revoke_rx: mpsc::UnboundedReceiver<RevokeDevice>,
     sent_close_rx: mpsc::UnboundedReceiver<ClosePairRoute>,
     reconnects: Arc<AtomicUsize>,
+    shared_control_yields: Arc<AtomicUsize>,
+    fail_shared_control_yield: Arc<AtomicBool>,
     seals: Arc<AtomicUsize>,
     grant_freezes: Arc<AtomicUsize>,
     grant_axes: Arc<StdMutex<Vec<(u64, u64)>>>,
@@ -1688,6 +1705,55 @@ impl TestActor {
     }
 }
 
+struct ProductionDrainActor {
+    handle: PairingCoordinatorHandle,
+    cancel_tx: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl ProductionDrainActor {
+    async fn stop(self) {
+        self.cancel_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), self.task)
+            .await
+            .expect("production-lane actor shutdown must be bounded")
+            .expect("production-lane actor task must join");
+    }
+}
+
+async fn spawn_production_drain_actor(
+    store: Arc<FakeStore>,
+    lane: PairingTransportLane,
+) -> ProductionDrainActor {
+    let (command_tx, command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let actor = PairingCoordinator::new_for_test(
+        store,
+        Box::new(ProductionPairingLane(lane)),
+        Box::new(FakeAuthority {
+            seals: Arc::new(AtomicUsize::new(0)),
+            grant_freezes: Arc::new(AtomicUsize::new(0)),
+            grant_axes: Arc::new(StdMutex::new(Vec::new())),
+            fail_grant_freeze: Arc::new(AtomicBool::new(false)),
+            revocation_freezes: Arc::new(AtomicUsize::new(0)),
+            fail_revocation_freeze: Arc::new(AtomicBool::new(false)),
+        }),
+        test_invite_context(),
+        Arc::new(FakePendingSink::default()),
+    );
+    let task = tokio::spawn(actor.run(command_rx, cancel_rx, ready_tx));
+    ready_rx
+        .await
+        .expect("production-lane actor reports startup")
+        .expect("empty production-lane actor starts");
+    ProductionDrainActor {
+        handle: PairingCoordinatorHandle { command_tx },
+        cancel_tx,
+        task,
+    }
+}
+
 async fn spawn_actor(store: Arc<FakeStore>) -> TestActor {
     let (actor, ready) = spawn_actor_with_startup_send_failure(store, None).await;
     ready.unwrap();
@@ -1705,6 +1771,8 @@ async fn spawn_actor_with_startup_send_failure(
     let (sent_revoke_tx, sent_revoke_rx) = mpsc::unbounded_channel();
     let (sent_close_tx, sent_close_rx) = mpsc::unbounded_channel();
     let reconnects = Arc::new(AtomicUsize::new(0));
+    let shared_control_yields = Arc::new(AtomicUsize::new(0));
+    let fail_shared_control_yield = Arc::new(AtomicBool::new(false));
     let seals = Arc::new(AtomicUsize::new(0));
     let grant_freezes = Arc::new(AtomicUsize::new(0));
     let grant_axes = Arc::new(StdMutex::new(Vec::new()));
@@ -1723,6 +1791,8 @@ async fn spawn_actor_with_startup_send_failure(
         sent_close_tx,
         order: Arc::clone(&store.order),
         reconnects: Arc::clone(&reconnects),
+        shared_control_yields: Arc::clone(&shared_control_yields),
+        fail_shared_control_yield: Arc::clone(&fail_shared_control_yield),
         fail_send: Arc::clone(&fail_send),
         send_failure_code: send_failure_code.unwrap_or("remote.transport.closed"),
         clear_send_failure_on_reconnect: true,
@@ -1761,6 +1831,8 @@ async fn spawn_actor_with_startup_send_failure(
             sent_revoke_rx,
             sent_close_rx,
             reconnects,
+            shared_control_yields,
+            fail_shared_control_yield,
             seals,
             grant_freezes,
             grant_axes,
@@ -1787,6 +1859,8 @@ async fn spawn_store_backed_actor(
     let (sent_revoke_tx, sent_revoke_rx) = mpsc::unbounded_channel();
     let (sent_close_tx, sent_close_rx) = mpsc::unbounded_channel();
     let reconnects = Arc::new(AtomicUsize::new(0));
+    let shared_control_yields = Arc::new(AtomicUsize::new(0));
+    let fail_shared_control_yield = Arc::new(AtomicBool::new(false));
     let seals = Arc::new(AtomicUsize::new(0));
     let grant_freezes = Arc::new(AtomicUsize::new(0));
     let grant_axes = Arc::new(StdMutex::new(Vec::new()));
@@ -1806,6 +1880,8 @@ async fn spawn_store_backed_actor(
         sent_close_tx,
         order,
         reconnects: Arc::clone(&reconnects),
+        shared_control_yields: Arc::clone(&shared_control_yields),
+        fail_shared_control_yield: Arc::clone(&fail_shared_control_yield),
         fail_send: Arc::clone(&fail_send),
         send_failure_code: "remote.transport.closed",
         clear_send_failure_on_reconnect: true,
@@ -1853,6 +1929,8 @@ async fn spawn_store_backed_actor(
         sent_revoke_rx,
         sent_close_rx,
         reconnects,
+        shared_control_yields,
+        fail_shared_control_yield,
         seals,
         grant_freezes,
         grant_axes,
@@ -2780,6 +2858,225 @@ async fn pregrant_drain_is_nonblocking_rejects_new_authority_and_waits_for_close
     actor.event_tx.send(Ok(opened(&reopened))).unwrap();
     resumed.await.unwrap().unwrap();
     actor.stop().await;
+}
+
+#[tokio::test]
+async fn completed_drain_yields_shared_control_before_replying_success() {
+    let store = Arc::new(FakeStore::default());
+    let actor = spawn_actor(store).await;
+
+    actor.handle.begin_drain().await.unwrap();
+    assert_eq!(actor.shared_control_yields.load(Ordering::SeqCst), 1);
+    actor
+        .handle
+        .begin_drain()
+        .await
+        .expect("Complete retry must re-yield before replying success");
+    assert_eq!(actor.shared_control_yields.load(Ordering::SeqCst), 2);
+    actor.handle.resume_after_completed_drain().await.unwrap();
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn complete_retry_yield_failure_is_non_resumable_and_preserves_complete() {
+    let store = Arc::new(FakeStore::default());
+    let actor = spawn_actor(store).await;
+    actor.handle.begin_drain().await.unwrap();
+    actor
+        .fail_shared_control_yield
+        .store(true, Ordering::SeqCst);
+
+    let error = actor
+        .handle
+        .begin_drain()
+        .await
+        .expect_err("Complete retry must expose the exact re-yield failure");
+    assert!(matches!(error, PairingDrainStartError::ActorBusy(_)));
+    assert_eq!(error.code(), "remote.transport.pairing_yield_failed");
+    assert_eq!(actor.shared_control_yields.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        actor
+            .handle
+            .resume_after_failed_drain()
+            .await
+            .unwrap_err()
+            .code(),
+        PAIRING_DRAINING,
+        "re-yield failure must leave the actor in Complete"
+    );
+
+    actor
+        .fail_shared_control_yield
+        .store(false, Ordering::SeqCst);
+    actor
+        .handle
+        .begin_drain()
+        .await
+        .expect("later retry may re-yield the preserved Complete fence");
+    assert_eq!(actor.shared_control_yields.load(Ordering::SeqCst), 3);
+    actor.handle.resume_after_completed_drain().await.unwrap();
+    actor.stop().await;
+}
+
+#[tokio::test]
+async fn shared_control_yield_failure_fails_drain_without_entering_complete() {
+    let store = Arc::new(FakeStore::default());
+    let actor = spawn_actor(store).await;
+    actor
+        .fail_shared_control_yield
+        .store(true, Ordering::SeqCst);
+
+    let error = actor
+        .handle
+        .begin_drain()
+        .await
+        .expect_err("yield failure must fail the drain waiter");
+    assert!(matches!(error, PairingDrainStartError::ActorFailed(_)));
+    assert_eq!(error.code(), "remote.transport.pairing_yield_failed");
+    assert_eq!(actor.shared_control_yields.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        actor
+            .handle
+            .resume_after_completed_drain()
+            .await
+            .unwrap_err()
+            .code(),
+        PAIRING_DRAINING
+    );
+    actor.handle.resume_after_failed_drain().await.unwrap();
+    actor.stop().await;
+}
+
+fn composition_retirement() -> RetireMachine {
+    RetireMachine {
+        machine_route: MACHINE_ROUTE,
+        root_key_id: RootKeyId::from_bytes([0x41; 16]),
+        trust_epoch: TrustEpoch::new(1),
+        signature: Ed25519Signature([0x42; 64]),
+    }
+}
+
+async fn assert_completed_drain_routes_retirement_failure(
+    body: RelayFrameBody,
+    expected_code: &str,
+) {
+    let store = Arc::new(FakeStore::default());
+    let (mut transport, lane, harness) = active_pairing_transport_for_test(MACHINE_ROUTE);
+    let actor = spawn_production_drain_actor(store, lane).await;
+    actor
+        .handle
+        .begin_drain()
+        .await
+        .expect("empty pairing drain completes after ownership yield");
+
+    let operation = tokio::spawn(async move {
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            transport.retire(composition_retirement()),
+        )
+        .await;
+        (result, transport)
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while harness.sent_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retirement request must be sent before the focused deadline");
+    harness
+        .push_frame(OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body,
+        })
+        .await;
+
+    let (result, mut transport) = operation.await.expect("join retirement operation");
+    let error = result
+        .expect("yielded control must return far below the ten second workflow deadline")
+        .expect_err("safe control terminal is a stable retirement failure");
+    assert_eq!(error.code(), expected_code);
+    assert_eq!(harness.reconnect_count(), 0);
+    assert_eq!(transport.observed_failure_code(), None);
+
+    actor.stop().await;
+    transport.shutdown().await;
+}
+
+#[tokio::test]
+async fn completed_drain_then_retirement_safe_error_returns_without_pairing_reconnect() {
+    assert_completed_drain_routes_retirement_failure(
+        RelayFrameBody::Error(RelayFailure::new(
+            "relay.retirement.unavailable",
+            "secret retirement detail",
+        )),
+        "relay.retirement.unavailable",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn completed_drain_then_retirement_restart_returns_without_pairing_reconnect() {
+    assert_completed_drain_routes_retirement_failure(
+        RelayFrameBody::ServerRestarting(ServerRestarting {
+            drain_deadline_ms: 500,
+        }),
+        "daemon.remote.trust_reset.relay_restarting",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn complete_retry_reyields_after_reacquire_when_completed_resume_did_not_apply() {
+    let store = Arc::new(FakeStore::default());
+    let (mut transport, lane, harness) = active_pairing_transport_for_test(MACHINE_ROUTE);
+    let actor = spawn_production_drain_actor(store, lane).await;
+    actor.handle.begin_drain().await.unwrap();
+    transport
+        .reacquire_pairing_shared_control()
+        .expect("Active workflow failure reacquires shared control before actor Resume");
+
+    actor
+        .handle
+        .begin_drain()
+        .await
+        .expect("retrying the preserved Complete fence must re-yield ownership");
+    let operation = tokio::spawn(async move {
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            transport.retire(composition_retirement()),
+        )
+        .await;
+        (result, transport)
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while harness.sent_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retry retirement request is sent");
+    harness
+        .push_frame(OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::Error(RelayFailure::new(
+                "relay.retirement.retry_unavailable",
+                "secret retry detail",
+            )),
+        })
+        .await;
+
+    let (result, mut transport) = operation.await.expect("join retry retirement");
+    assert_eq!(
+        result
+            .expect("re-yielded retry returns below the terminal deadline")
+            .expect_err("safe failure remains retryable")
+            .code(),
+        "relay.retirement.retry_unavailable"
+    );
+    assert_eq!(harness.reconnect_count(), 0);
+    actor.stop().await;
+    transport.shutdown().await;
 }
 
 #[tokio::test]

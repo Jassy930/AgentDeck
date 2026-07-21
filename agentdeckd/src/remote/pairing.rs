@@ -2263,6 +2263,7 @@ trait PairingLane: Send {
     async fn send_revoke(&self, frame: RevokeDevice) -> Result<(), PairingAdministrationError>;
     async fn send_close(&self, frame: ClosePairRoute) -> Result<(), PairingAdministrationError>;
     async fn reconnect(&self) -> Result<(), PairingAdministrationError>;
+    fn yield_shared_control(&mut self) -> Result<(), PairingAdministrationError>;
     async fn next_event(
         &mut self,
     ) -> Result<Option<PairingTransportEvent>, PairingAdministrationError>;
@@ -2306,6 +2307,10 @@ impl PairingLane for ProductionPairingLane {
 
     async fn reconnect(&self) -> Result<(), PairingAdministrationError> {
         self.0.reconnect().await.map_err(transport_error)
+    }
+
+    fn yield_shared_control(&mut self) -> Result<(), PairingAdministrationError> {
+        self.0.yield_shared_control().map_err(transport_error)
     }
 
     async fn next_event(
@@ -2679,7 +2684,11 @@ impl PairingCoordinator {
                 return;
             }
             PairingDrainState::Complete => {
-                let _ = reply.send(Ok(()));
+                let result = self
+                    .lane
+                    .yield_shared_control()
+                    .map_err(PairingDrainActorError::Busy);
+                let _ = reply.send(result);
                 return;
             }
         }
@@ -2798,6 +2807,10 @@ impl PairingCoordinator {
     }
 
     fn complete_drain(&mut self) {
+        if let Err(error) = self.lane.yield_shared_control() {
+            self.fail_drain(error);
+            return;
+        }
         let PairingDrainState::Running(waiters) =
             std::mem::replace(&mut self.drain, PairingDrainState::Complete)
         else {

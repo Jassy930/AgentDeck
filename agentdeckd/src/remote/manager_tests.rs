@@ -9,6 +9,7 @@ use agentdeck_crypto::{
     sign_relay_admin_purge_receipt,
 };
 use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, PairInviteV1};
+use agentdeck_protocol::relay_v2::failure::RelayFailure;
 use agentdeck_protocol::relay_v2::frame::{RelayFrameBody, RetirementCommitted};
 use agentdeck_protocol::relay_v2::{
     Digest32, ENROLLMENT_BUNDLE_VERSION, EnrollmentBundleV2, EnrollmentCode,
@@ -457,6 +458,31 @@ async fn finish_fixture(manager: RemoteManager, fixture: ManagerFixture) {
         .await
         .expect("shutdown manager fixture Store");
     let _ = fs::remove_dir_all(fixture.root);
+}
+
+async fn install_yielded_test_transport(
+    manager: &RemoteManager,
+) -> (
+    crate::remote::transport::PairingTransportLane,
+    Arc<crate::remote::transport::RemoteTransportTestHarness>,
+) {
+    let durable = manager
+        .store
+        .load_machine_enrollment_state()
+        .await
+        .expect("load test transport route")
+        .expect("test transport requires durable machine state");
+    let machine_route = MachineRouteId::from_bytes(match durable {
+        MachineEnrollmentState::Active(active) => active.record.machine_route,
+        MachineEnrollmentState::RetirePending(pending) => pending.record.machine_route,
+        _ => panic!("test transport requires Active or RetirePending"),
+    });
+    let (transport, mut lane, harness) =
+        crate::remote::transport::active_pairing_transport_for_test(machine_route);
+    lane.yield_shared_control()
+        .expect("fake completed drain yields shared control before manager workflow");
+    manager.state.lock().await.transport = Some(transport);
+    (lane, harness)
 }
 
 async fn finish_split_store_fixture(
@@ -1150,6 +1176,7 @@ async fn post_workflow_failure_resume_is_bounded_by_drain_deadline() {
         fixture.config.clone(),
         RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
     ));
+    let _pairing_lane = install_yielded_test_transport(&manager).await;
     let (begin_entered_tx, begin_entered_rx) = tokio::sync::oneshot::channel();
     let (begin_release_tx, begin_release_rx) = tokio::sync::oneshot::channel();
     let (saturated_tx, saturated_rx) = tokio::sync::oneshot::channel();
@@ -1221,6 +1248,7 @@ async fn shutdown_cancels_post_workflow_failure_resume() {
         fixture.config.clone(),
         RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
     ));
+    let _pairing_lane = install_yielded_test_transport(&manager).await;
     let (begin_entered_tx, begin_entered_rx) = tokio::sync::oneshot::channel();
     let (begin_release_tx, begin_release_rx) = tokio::sync::oneshot::channel();
     let (saturated_tx, saturated_rx) = tokio::sync::oneshot::channel();
@@ -1290,6 +1318,7 @@ async fn trust_reset_pending_drain_is_bounded_without_resuming_and_retry_joins_r
         fixture.config.clone(),
         RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
     ));
+    let _pairing_lane = install_yielded_test_transport(&manager).await;
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let (release_tx, release_rx) = tokio::sync::watch::channel(false);
     let (resumed_tx, mut resumed_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1395,9 +1424,9 @@ async fn trust_reset_pending_drain_is_bounded_without_resuming_and_retry_joins_r
     };
     assert_eq!(
         retry_result
-            .expect_err("fixture has no start permit after drain completes")
+            .expect_err("fixture transport has no retirement authenticator")
             .code(),
-        "daemon.remote.start_not_armed"
+        "remote.transport.closed"
     );
     resumed_rx
         .recv()
@@ -1423,6 +1452,7 @@ async fn trust_reset_singleflight_rejects_complete_drain_sharing_without_waiting
         fixture.config.clone(),
         RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
     ));
+    let _pairing_lane = install_yielded_test_transport(&manager).await;
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let (release_tx, release_rx) = tokio::sync::watch::channel(false);
     let (resumed_tx, mut resumed_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1486,8 +1516,8 @@ async fn trust_reset_singleflight_rejects_complete_drain_sharing_without_waiting
         .await
         .expect("first trust-reset must finish after state is released")
         .expect("join first trust-reset")
-        .expect_err("fixture has no start permit");
-    assert_eq!(first_error.code(), "daemon.remote.start_not_armed");
+        .expect_err("fixture transport has no retirement authenticator");
+    assert_eq!(first_error.code(), "remote.transport.closed");
     resumed_rx
         .recv()
         .await
@@ -1499,6 +1529,124 @@ async fn trust_reset_singleflight_rejects_complete_drain_sharing_without_waiting
     let manager = match Arc::try_unwrap(manager) {
         Ok(manager) => manager,
         Err(_) => panic!("singleflight test drops all manager owners"),
+    };
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retire_pending_network_failure_keeps_control_owner_and_does_not_resume_pairing() {
+    let mut fixture = active_fixture("retire-pending-no-reacquire").await;
+    prepare_retirement(&fixture).await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let (mut pairing_lane, harness) = install_yielded_test_transport(&manager).await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (resumed_tx, mut resumed_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test = Some(
+            crate::remote::pairing::PairingCoordinatorHandle::drain_test_double(
+                entered_tx,
+                release_rx,
+                resumed_tx,
+                Ok(()),
+            ),
+        );
+    }
+
+    let operation_manager = Arc::clone(&manager);
+    let operation = tokio::spawn(async move {
+        operation_manager
+            .trust_reset(
+                TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                    .expect("ordinary root-present retry"),
+            )
+            .await
+    });
+    entered_rx.await.expect("pairing actor receives BeginDrain");
+    release_tx.send(Ok(())).expect("complete pairing drain");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while harness.sent_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("RetirePending retry sends the frozen retirement");
+    harness
+        .push_frame(OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::Error(RelayFailure::new(
+                "relay.retirement.unavailable",
+                "secret retirement detail",
+            )),
+        })
+        .await;
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), operation)
+            .await
+            .expect("safe Relay failure returns without terminal timeout")
+            .expect("join RetirePending retry")
+            .expect_err("Relay failure keeps exact RetirePending retry")
+            .code(),
+        "relay.retirement.unavailable"
+    );
+    assert!(matches!(
+        fixture.store.load_machine_enrollment_state().await.unwrap(),
+        Some(MachineEnrollmentState::RetirePending(_))
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut resumed_rx)
+            .await
+            .is_err(),
+        "RetirePending failure must not resume the Complete pairing fence"
+    );
+
+    harness
+        .push_frame(OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::Error(RelayFailure::new(
+                "relay.control.retire_pending",
+                "secret retained control detail",
+            )),
+        })
+        .await;
+    let control = {
+        let mut state = manager.state.lock().await;
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            state
+                .transport
+                .as_mut()
+                .expect("RetirePending transport remains owned")
+                .next_control(),
+        )
+        .await
+        .expect("control owner remains readable")
+        .unwrap()
+    };
+    assert!(matches!(
+        control,
+        Some(crate::remote::transport::RemoteControl::SafeFailure(failure))
+            if failure.code() == "relay.control.retire_pending"
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), pairing_lane.next_event())
+            .await
+            .is_err(),
+        "RetirePending failure must not reacquire shared control for pairing"
+    );
+
+    drop(pairing_lane);
+    let manager = match Arc::try_unwrap(manager) {
+        Ok(manager) => manager,
+        Err(_) => panic!("RetirePending test drops operation owner"),
     };
     finish_fixture(manager, fixture).await;
 }

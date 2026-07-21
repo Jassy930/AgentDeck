@@ -1230,6 +1230,18 @@ impl RemoteAdministration for RemoteManager {
                 Ok(Some(MachineEnrollmentState::Active(_)))
             )
         {
+            {
+                let mut state = self.state.lock().await;
+                if state.stopped {
+                    return Err(admin_error(REMOTE_SHUTTING_DOWN));
+                }
+                state
+                    .transport
+                    .as_mut()
+                    .ok_or_else(|| admin_error(REMOTE_STATE_CONFLICT))?
+                    .reacquire_pairing_shared_control()
+                    .map_err(|error| admin_error(error.code()))?;
+            }
             self.resume_pairing_before_deadline(
                 pairing_deadline.expect("pairing handle has a drain deadline"),
                 handle.resume_after_completed_drain(),

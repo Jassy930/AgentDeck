@@ -1466,21 +1466,40 @@ fn is_zero_device_route(route: DeviceRouteId) -> bool {
 pub(crate) struct PairingTransportLane {
     command_tx: mpsc::Sender<SupervisorCommand>,
     event_rx: mpsc::Receiver<PairingTransportSignal>,
+    retained_events: VecDeque<PairingTransportSignal>,
     health_rx: watch::Receiver<Option<String>>,
     transition: Arc<Mutex<PairingTransition>>,
     generation: Arc<AtomicU64>,
     authority_anchor: Option<MachinePairingAnchor>,
 }
 
-struct PairingTransportSignal {
-    generation: u64,
-    event: Result<PairingTransportEvent, SafeFailure>,
+enum PairingTransportSignal {
+    Event {
+        generation: u64,
+        event: PairingTransportEvent,
+    },
+    SharedControl {
+        generation: u64,
+        control: Result<Option<RemoteControl>, RemoteTransportError>,
+        pairing_failure: SafeFailure,
+    },
+}
+
+impl PairingTransportSignal {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Event { generation, .. } | Self::SharedControl { generation, .. } => *generation,
+        }
+    }
 }
 
 #[derive(Default)]
 struct PairingTransition {
-    enabled: bool,
+    pairing_events_enabled: bool,
+    pairing_owns_shared_control: bool,
     pending_exclusive_control: bool,
+    retained_pairing_events: usize,
+    handed_off_control: VecDeque<Result<Option<RemoteControl>, RemoteTransportError>>,
 }
 
 impl PairingTransportLane {
@@ -1567,12 +1586,82 @@ impl PairingTransportLane {
             .map_err(|_| RemoteTransportError::Closed)?
     }
 
+    /// 在 pairing drain 完成线性化点，把 shared control 的唯一所有权交回 control surface。
+    /// 已进入 bounded pairing FIFO 的当前 generation shared control 会原值搬入有界 handoff；
+    /// typed pairing event 保持在本 lane，后续仍由 pairing actor 消费。
+    pub(crate) fn yield_shared_control(&mut self) -> Result<(), RemoteTransportError> {
+        let generation = self.generation.load(Ordering::Acquire);
+        let mut transition = self
+            .transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !transition.pairing_events_enabled {
+            return Err(RemoteTransportError::PairingLaneUnavailable);
+        }
+        if !transition.pairing_owns_shared_control {
+            return Ok(());
+        }
+
+        let queued = self.event_rx.len();
+        if transition
+            .retained_pairing_events
+            .checked_add(queued)
+            .is_none_or(|total| total > PAIRING_EVENT_CHANNEL_CAPACITY)
+            || transition
+                .handed_off_control
+                .len()
+                .checked_add(queued)
+                .is_none_or(|total| total > PAIRING_EVENT_CHANNEL_CAPACITY)
+        {
+            return Err(RemoteTransportError::PairingLagged);
+        }
+
+        while let Ok(signal) = self.event_rx.try_recv() {
+            if signal.generation() != generation {
+                continue;
+            }
+            match signal {
+                signal @ PairingTransportSignal::Event { .. } => {
+                    self.retained_events.push_back(signal);
+                    transition.retained_pairing_events += 1;
+                }
+                PairingTransportSignal::SharedControl { control, .. } => {
+                    transition.handed_off_control.push_back(control);
+                }
+            }
+        }
+        debug_assert!(
+            transition.retained_pairing_events <= PAIRING_EVENT_CHANNEL_CAPACITY,
+            "retained typed pairing events must remain bounded"
+        );
+        debug_assert!(
+            transition.handed_off_control.len() <= PAIRING_EVENT_CHANNEL_CAPACITY,
+            "shared control handoff must remain bounded"
+        );
+        transition.pairing_owns_shared_control = false;
+        Ok(())
+    }
+
     pub(crate) async fn next_event(
         &mut self,
     ) -> Result<Option<PairingTransportEvent>, RemoteTransportError> {
         loop {
             if let Some(code) = self.health_rx.borrow().clone() {
                 return Err(supervisor_failure(code));
+            }
+            if let Some(signal) = self.retained_events.pop_front() {
+                let mut transition = self
+                    .transition
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                debug_assert!(transition.retained_pairing_events > 0);
+                transition.retained_pairing_events =
+                    transition.retained_pairing_events.saturating_sub(1);
+                drop(transition);
+                if signal.generation() != self.generation.load(Ordering::Acquire) {
+                    continue;
+                }
+                return pairing_signal_event(signal);
             }
             tokio::select! {
                 biased;
@@ -1584,14 +1673,11 @@ impl PairingTransportLane {
                 event = self.event_rx.recv() => {
                     return match event {
                         Some(signal)
-                            if signal.generation != self.generation.load(Ordering::Acquire) =>
+                            if signal.generation() != self.generation.load(Ordering::Acquire) =>
                         {
                             continue;
                         }
-                        Some(PairingTransportSignal { event: Ok(event), .. }) => Ok(Some(event)),
-                        Some(PairingTransportSignal { event: Err(failure), .. }) => {
-                            Err(supervisor_failure(failure.code))
-                        }
+                        Some(signal) => pairing_signal_event(signal),
                         None => Err(RemoteTransportError::Closed),
                     };
                 }
@@ -1614,11 +1700,25 @@ impl fmt::Debug for PairingTransportLane {
 
 impl Drop for PairingTransportLane {
     fn drop(&mut self) {
+        let _ = self.yield_shared_control();
         let mut transition = self
             .transition
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        transition.enabled = false;
+        transition.pairing_events_enabled = false;
+        transition.pairing_owns_shared_control = false;
+        transition.retained_pairing_events = 0;
+    }
+}
+
+fn pairing_signal_event(
+    signal: PairingTransportSignal,
+) -> Result<Option<PairingTransportEvent>, RemoteTransportError> {
+    match signal {
+        PairingTransportSignal::Event { event, .. } => Ok(Some(event)),
+        PairingTransportSignal::SharedControl {
+            pairing_failure, ..
+        } => Err(supervisor_failure(pairing_failure.code)),
     }
 }
 
@@ -1652,6 +1752,7 @@ struct ControlSupervisor {
     command_tx: mpsc::Sender<SupervisorCommand>,
     control_rx: mpsc::Receiver<Result<Option<RemoteControl>, RemoteTransportError>>,
     retained_control: VecDeque<Result<Option<RemoteControl>, RemoteTransportError>>,
+    pairing_transition: Arc<Mutex<PairingTransition>>,
     cancel_tx: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
     health_rx: watch::Receiver<Option<String>>,
@@ -1693,8 +1794,9 @@ impl ControlSupervisor {
         let pairing_lane = PairingTransportLane {
             command_tx: command_tx.clone(),
             event_rx: pairing_rx,
+            retained_events: VecDeque::with_capacity(PAIRING_EVENT_CHANNEL_CAPACITY),
             health_rx: health_rx.clone(),
-            transition: pairing_transition,
+            transition: Arc::clone(&pairing_transition),
             generation: pairing_generation,
             authority_anchor: None,
         };
@@ -1703,6 +1805,7 @@ impl ControlSupervisor {
                 command_tx,
                 control_rx,
                 retained_control: VecDeque::with_capacity(CONTROL_CHANNEL_CAPACITY),
+                pairing_transition,
                 cancel_tx,
                 task: Some(task),
                 health_rx,
@@ -1719,25 +1822,67 @@ impl ControlSupervisor {
         &mut self,
         lane: &PairingTransportLane,
     ) -> Result<(), RemoteTransportError> {
-        let mut transition = lane
-            .transition
+        self.activate_pairing_transition(&lane.transition, false)
+    }
+
+    fn reacquire_pairing(&mut self) -> Result<(), RemoteTransportError> {
+        let transition = Arc::clone(&self.pairing_transition);
+        self.activate_pairing_transition(&transition, true)
+    }
+
+    fn activate_pairing_transition(
+        &mut self,
+        pairing_transition: &Mutex<PairingTransition>,
+        require_yielded_lane: bool,
+    ) -> Result<(), RemoteTransportError> {
+        let mut transition = pairing_transition
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if require_yielded_lane
+            && (!transition.pairing_events_enabled || transition.pairing_owns_shared_control)
+        {
+            return Err(RemoteTransportError::PairingActivationBlocked);
+        }
+        if transition.pending_exclusive_control {
+            return Err(RemoteTransportError::PairingActivationBlocked);
+        }
+        if self
+            .retained_control
+            .len()
+            .checked_add(self.control_rx.len())
+            .is_none_or(|total| total > CONTROL_CHANNEL_CAPACITY)
+        {
+            return Err(RemoteTransportError::PairingActivationBlocked);
+        }
         let mut queued = std::mem::take(&mut self.retained_control);
         while let Ok(control) = self.control_rx.try_recv() {
             queued.push_back(control);
         }
-        if transition.pending_exclusive_control
+        if transition
+            .handed_off_control
+            .iter()
+            .any(|control| !is_shared_control(control))
             || queued.iter().any(|control| !is_shared_control(control))
         {
             self.retained_control = queued;
             return Err(RemoteTransportError::PairingActivationBlocked);
         }
-        transition.enabled = true;
+        transition.handed_off_control.clear();
+        transition.pairing_events_enabled = true;
+        transition.pairing_owns_shared_control = true;
         Ok(())
     }
 
     async fn next_control(&mut self) -> Result<Option<RemoteControl>, RemoteTransportError> {
+        if let Some(control) = self
+            .pairing_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handed_off_control
+            .pop_front()
+        {
+            return control;
+        }
         if let Some(control) = self.retained_control.pop_front() {
             return control;
         }
@@ -1790,19 +1935,30 @@ async fn run_control_supervisor(
             break;
         }
         if let Some(control) = pending_control.take() {
-            let shared_dispatch = shared_control_pairing_failure(&control).and_then(|failure| {
+            let mut control = Some(control);
+            let shared_dispatch = {
                 let transition = pairing_transition
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                transition.enabled.then(|| {
-                    pairing_tx
-                        .try_send(PairingTransportSignal {
-                            generation: pairing_generation.load(Ordering::Acquire),
-                            event: Err(failure),
-                        })
-                        .is_err()
-                })
-            });
+                if transition.pairing_owns_shared_control {
+                    shared_control_pairing_failure(
+                        control.as_ref().expect("pending control remains available"),
+                    )
+                    .map(|pairing_failure| {
+                        try_send_pairing_signal(
+                            &pairing_tx,
+                            &transition,
+                            PairingTransportSignal::SharedControl {
+                                generation: pairing_generation.load(Ordering::Acquire),
+                                control: control.take().expect("shared control moves once"),
+                                pairing_failure,
+                            },
+                        )
+                    })
+                } else {
+                    None
+                }
+            };
             if let Some(dispatch_failed) = shared_dispatch {
                 if dispatch_failed {
                     set_supervisor_failure(&health, RemoteTransportError::PairingLagged.code());
@@ -1812,6 +1968,7 @@ async fn run_control_supervisor(
                 }
                 continue;
             }
+            let control = control.expect("control owner retains pending control");
             tokio::select! {
                 biased;
                 changed = cancel_rx.changed() => {
@@ -1839,26 +1996,30 @@ async fn run_control_supervisor(
                 permit = control_tx.reserve() => {
                     let Ok(permit) = permit else { break; };
                     let pairing_failure = shared_control_pairing_failure(&control);
+                    let mut control = Some(control);
                     let pairing_dispatch_failed = {
                         let mut transition = pairing_transition
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if transition.enabled {
+                        if transition.pairing_owns_shared_control {
                             if let Some(failure) = pairing_failure {
                                 drop(permit);
-                                pairing_tx
-                                    .try_send(PairingTransportSignal {
+                                try_send_pairing_signal(
+                                    &pairing_tx,
+                                    &transition,
+                                    PairingTransportSignal::SharedControl {
                                         generation: pairing_generation.load(Ordering::Acquire),
-                                        event: Err(failure),
-                                    })
-                                    .is_err()
+                                        control: control.take().expect("shared control moves once"),
+                                        pairing_failure: failure,
+                                    },
+                                )
                             } else {
-                                permit.send(control);
+                                permit.send(control.take().expect("exclusive control moves once"));
                                 transition.pending_exclusive_control = false;
                                 false
                             }
                         } else {
-                            permit.send(control);
+                            permit.send(control.take().expect("control moves once"));
                             transition.pending_exclusive_control = false;
                             false
                         }
@@ -1941,13 +2102,15 @@ async fn run_control_supervisor(
                                 let transition = pairing_transition
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                !transition.enabled
-                                    || pairing_tx
-                                    .try_send(PairingTransportSignal {
+                                !transition.pairing_events_enabled
+                                    || try_send_pairing_signal(
+                                        &pairing_tx,
+                                        &transition,
+                                        PairingTransportSignal::Event {
                                         generation: pairing_generation.load(Ordering::Acquire),
-                                        event: Ok(event),
-                                    })
-                                    .is_err()
+                                            event,
+                                        },
+                                    )
                             };
                             if dispatch_failed {
                                 let error = RemoteTransportError::PairingLagged;
@@ -1963,17 +2126,21 @@ async fn run_control_supervisor(
                             }
                         }
                         Ok(InboundDispatch::Shared { control, pairing_failure }) => {
+                            let mut control = Some(Ok(Some(control)));
                             let pairing_dispatch = {
                                 let transition = pairing_transition
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                transition.enabled.then(|| {
-                                    pairing_tx
-                                        .try_send(PairingTransportSignal {
+                                transition.pairing_owns_shared_control.then(|| {
+                                    try_send_pairing_signal(
+                                        &pairing_tx,
+                                        &transition,
+                                        PairingTransportSignal::SharedControl {
                                             generation: pairing_generation.load(Ordering::Acquire),
-                                            event: Err(pairing_failure),
-                                        })
-                                        .is_err()
+                                            control: control.take().expect("shared control moves once"),
+                                            pairing_failure,
+                                        },
+                                    )
                                 })
                             };
                             match pairing_dispatch {
@@ -1990,7 +2157,7 @@ async fn run_control_supervisor(
                                 None => replace_pending_control(
                                     &mut pending_control,
                                     &pairing_transition,
-                                    Ok(Some(control)),
+                                    control.take().expect("control owner retains shared control"),
                                 ),
                             }
                         }
@@ -2143,6 +2310,17 @@ async fn handle_supervisor_command(
 
 fn set_supervisor_failure(health: &watch::Sender<Option<String>>, code: &str) {
     health.send_replace(Some(code.to_owned()));
+}
+
+fn try_send_pairing_signal(
+    pairing_tx: &mpsc::Sender<PairingTransportSignal>,
+    transition: &PairingTransition,
+    signal: PairingTransportSignal,
+) -> bool {
+    if transition.retained_pairing_events >= pairing_tx.capacity() {
+        return true;
+    }
+    pairing_tx.try_send(signal).is_err()
 }
 
 fn shared_control_pairing_failure(
@@ -2401,6 +2579,16 @@ impl RemoteTransport {
             .await
     }
 
+    /// Root-present workflow 在 durable 仍为 Active 时恢复 pairing shared-control owner。
+    /// 与初次 activation 共用 fail-close gate：exclusive control 保留在 control surface，
+    /// 只有 stale shared backlog 可被清除。
+    pub(crate) fn reacquire_pairing_shared_control(&mut self) -> Result<(), RemoteTransportError> {
+        self.supervisor
+            .as_mut()
+            .ok_or(RemoteTransportError::Closed)?
+            .reacquire_pairing()
+    }
+
     pub async fn reconnect(&mut self) -> Result<(), RemoteTransportError> {
         let supervisor = self
             .supervisor
@@ -2489,6 +2677,104 @@ impl fmt::Debug for RemoteTransport {
             .field("connected", &self.supervisor.is_some())
             .finish()
     }
+}
+
+#[cfg(test)]
+pub(super) struct RemoteTransportTestHarness {
+    incoming_tx: mpsc::Sender<Result<Option<OpaqueRouteFrame>, RelayClientError>>,
+    sent: Arc<Mutex<Vec<OpaqueRouteFrame>>>,
+    reconnects: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl RemoteTransportTestHarness {
+    pub(super) async fn push_frame(&self, frame: OpaqueRouteFrame) {
+        self.incoming_tx
+            .send(Ok(Some(frame)))
+            .await
+            .expect("test control session remains open");
+    }
+
+    pub(super) fn sent_count(&self) -> usize {
+        self.sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    pub(super) fn reconnect_count(&self) -> usize {
+        self.reconnects.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+struct ChannelControlSession {
+    incoming_rx: mpsc::Receiver<Result<Option<OpaqueRouteFrame>, RelayClientError>>,
+    sent: Arc<Mutex<Vec<OpaqueRouteFrame>>>,
+    reconnects: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ControlSession for ChannelControlSession {
+    async fn send(&mut self, frame: OpaqueRouteFrame) -> Result<(), RelayClientError> {
+        self.sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(frame);
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<OpaqueRouteFrame>, RelayClientError> {
+        self.incoming_rx.recv().await.unwrap_or(Ok(None))
+    }
+
+    async fn reconnect(&mut self) -> Result<(), RelayClientError> {
+        self.reconnects.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) {}
+}
+
+#[cfg(test)]
+pub(super) fn active_pairing_transport_for_test(
+    machine_route: MachineRouteId,
+) -> (
+    RemoteTransport,
+    PairingTransportLane,
+    Arc<RemoteTransportTestHarness>,
+) {
+    let (incoming_tx, incoming_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let reconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let harness = Arc::new(RemoteTransportTestHarness {
+        incoming_tx,
+        sent: Arc::clone(&sent),
+        reconnects: Arc::clone(&reconnects),
+    });
+    let (mut supervisor, lane) = ControlSupervisor::start(
+        machine_route,
+        Box::new(ChannelControlSession {
+            incoming_rx,
+            sent,
+            reconnects,
+        }),
+    );
+    supervisor
+        .activate_pairing(&lane)
+        .expect("fresh test transport activates pairing");
+    (
+        RemoteTransport {
+            machine_route,
+            supervisor: Some(supervisor),
+            pairing_lane: None,
+            authenticator: None,
+            start_permit: None,
+        },
+        lane,
+        harness,
+    )
 }
 
 #[cfg(test)]
@@ -5065,6 +5351,335 @@ mod tests {
             .await
             .expect("retirement terminal must retain bounded backpressure")
             .expect("control lane remains healthy"),
+            Some(RemoteControl::RetirementTerminal(terminal))
+                if terminal.committed() == &committed
+        ));
+
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_yield_moves_queued_shared_control_once_and_preserves_typed_events() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        let pair_route = PairRouteId::from_bytes([0xba; 16]);
+        let absolute_expiry_ms = 10_015;
+        lane.send_open_pair_route(open_pair_route(pair_route, absolute_expiry_ms))
+            .await
+            .expect("bind typed open before ownership yield");
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::Error(RelayFailure::new(
+                "relay.retirement.unavailable",
+                "secret retirement detail",
+            ))));
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::PairRouteOpened(PairRouteOpened {
+                machine_route: ROUTE,
+                pair_route,
+                absolute_expiry_ms,
+            })));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while lane.event_rx.len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shared and typed events must both enter the bounded pairing lane");
+
+        lane.yield_shared_control()
+            .expect("drain completion atomically yields shared control ownership");
+
+        assert!(matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                fixture.transport.next_control(),
+            )
+            .await
+            .expect("queued shared control must be handed to retirement immediately")
+            .expect("control surface remains healthy"),
+            Some(RemoteControl::SafeFailure(failure))
+                if failure.code() == "relay.retirement.unavailable"
+        ));
+        assert!(matches!(
+            lane.next_event().await.unwrap(),
+            Some(PairingTransportEvent::PairRouteOpened(PairRouteOpened {
+                pair_route: observed,
+                ..
+            })) if observed == pair_route
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                fixture.transport.next_control(),
+            )
+            .await
+            .is_err(),
+            "yielded shared control must not be duplicated"
+        );
+
+        let post_yield_route = PairRouteId::from_bytes([0xbb; 16]);
+        let post_yield_expiry_ms = absolute_expiry_ms + 1;
+        lane.send_open_pair_route(open_pair_route(post_yield_route, post_yield_expiry_ms))
+            .await
+            .expect("typed pairing commands remain enabled after shared ownership yield");
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::PairRouteOpened(PairRouteOpened {
+                machine_route: ROUTE,
+                pair_route: post_yield_route,
+                absolute_expiry_ms: post_yield_expiry_ms,
+            })));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), lane.next_event())
+                .await
+                .expect("post-yield typed event remains readable")
+                .unwrap(),
+            Some(PairingTransportEvent::PairRouteOpened(PairRouteOpened {
+                pair_route: observed,
+                ..
+            })) if observed == post_yield_route
+        ));
+
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::ServerRestarting(ServerRestarting {
+                drain_deadline_ms: 321,
+            })));
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                fixture.transport.next_control(),
+            )
+            .await
+            .expect("post-yield restart must stay on the control surface")
+            .unwrap(),
+            Some(RemoteControl::ServerRestarting(ServerRestarting {
+                drain_deadline_ms: 321,
+            }))
+        );
+
+        fixture
+            .transport
+            .reacquire_pairing_shared_control()
+            .expect("Active recovery may reacquire after the control backlog is empty");
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::Error(RelayFailure::new(
+                "relay.pair.recovered",
+                "secret recovered detail",
+            ))));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), lane.next_event())
+                .await
+                .expect("reacquired pairing must receive fresh shared control")
+                .unwrap_err()
+                .code(),
+            "relay.pair.recovered"
+        );
+
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_yield_handoff_is_bounded_at_the_pairing_fifo_capacity() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        for index in 0..PAIRING_EVENT_CHANNEL_CAPACITY {
+            fixture
+                .harness
+                .push_incoming(frame(RelayFrameBody::Error(RelayFailure::new(
+                    "relay.handoff.capacity",
+                    format!("secret handoff detail {index}"),
+                ))));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while lane.event_rx.len() != PAIRING_EVENT_CHANNEL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pairing FIFO must reach its exact bounded capacity");
+
+        lane.yield_shared_control()
+            .expect("the exact capacity boundary must hand off without overflow");
+        assert_eq!(
+            lane.transition
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .handed_off_control
+                .len(),
+            PAIRING_EVENT_CHANNEL_CAPACITY
+        );
+        for _ in 0..PAIRING_EVENT_CHANNEL_CAPACITY {
+            assert!(matches!(
+                fixture.transport.next_control().await.unwrap(),
+                Some(RemoteControl::SafeFailure(failure))
+                    if failure.code() == "relay.handoff.capacity"
+            ));
+        }
+        assert_eq!(fixture.transport.observed_failure_code(), None);
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_reacquire_preserves_exclusive_control_and_keeps_control_ownership() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        lane.yield_shared_control().unwrap();
+
+        let retirement = retirement();
+        let committed = RetirementCommitted {
+            machine_route: ROUTE,
+            trust_epoch: retirement.trust_epoch,
+            retire_hash: retirement.canonical_sha256(),
+        };
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::RetirementCommitted(
+                committed.clone(),
+            )));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if fixture
+                    .transport
+                    .supervisor
+                    .as_ref()
+                    .expect("connected supervisor")
+                    .control_rx
+                    .len()
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exclusive terminal must become readable on the control surface");
+
+        assert_eq!(
+            fixture
+                .transport
+                .reacquire_pairing_shared_control()
+                .expect_err("exclusive control must fail-close pairing reacquire")
+                .code(),
+            "remote.transport.pairing_activation_blocked"
+        );
+        assert!(matches!(
+            fixture.transport.next_control().await.unwrap(),
+            Some(RemoteControl::RetirementTerminal(terminal))
+                if terminal.committed() == &committed
+        ));
+
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::Error(RelayFailure::new(
+                "relay.control.still_owned",
+                "secret control detail",
+            ))));
+        assert!(matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                fixture.transport.next_control(),
+            )
+            .await
+            .expect("failed reacquire must leave control readable")
+            .unwrap(),
+            Some(RemoteControl::SafeFailure(failure))
+                if failure.code() == "relay.control.still_owned"
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), lane.next_event())
+                .await
+                .is_err(),
+            "failed reacquire must not leak shared control back to pairing"
+        );
+
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_reacquire_blocks_pending_exclusive_before_it_enters_control_fifo() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        lane.yield_shared_control().unwrap();
+        for index in 0..CONTROL_CHANNEL_CAPACITY {
+            fixture
+                .harness
+                .push_incoming(frame(RelayFrameBody::Error(RelayFailure::new(
+                    "relay.control.backlog",
+                    format!("secret control backlog {index}"),
+                ))));
+        }
+        let retirement = retirement();
+        let committed = RetirementCommitted {
+            machine_route: ROUTE,
+            trust_epoch: retirement.trust_epoch,
+            retire_hash: retirement.canonical_sha256(),
+        };
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::RetirementCommitted(
+                committed.clone(),
+            )));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let supervisor = fixture
+                    .transport
+                    .supervisor
+                    .as_ref()
+                    .expect("connected supervisor");
+                let pending_exclusive = supervisor
+                    .pairing_transition
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pending_exclusive_control;
+                if supervisor.control_rx.len() == CONTROL_CHANNEL_CAPACITY && pending_exclusive {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exclusive terminal must wait behind the full bounded control FIFO");
+
+        assert_eq!(
+            fixture
+                .transport
+                .reacquire_pairing_shared_control()
+                .expect_err("pending exclusive control must block reacquire")
+                .code(),
+            "remote.transport.pairing_activation_blocked"
+        );
+        for _ in 0..CONTROL_CHANNEL_CAPACITY {
+            assert!(matches!(
+                fixture.transport.next_control().await.unwrap(),
+                Some(RemoteControl::SafeFailure(failure))
+                    if failure.code() == "relay.control.backlog"
+            ));
+        }
+        assert!(matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                fixture.transport.next_control(),
+            )
+            .await
+            .expect("pending exclusive terminal must become readable after capacity frees")
+            .unwrap(),
             Some(RemoteControl::RetirementTerminal(terminal))
                 if terminal.committed() == &committed
         ));
