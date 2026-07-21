@@ -495,11 +495,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_v3_performs_full_typed_envelope_decode() {
+    fn current_runtime_performs_full_typed_envelope_decode() {
         let decision = decode_runtime_frame(&hello_frame(RUNTIME_PROTOCOL_VERSION, "hello-1"));
 
         let RuntimeFrameDecision::Accept(envelope) = decision else {
-            panic!("valid v3 envelope must be accepted");
+            panic!("valid current-runtime envelope must be accepted");
         };
         assert!(matches!(
             envelope.body,
@@ -508,10 +508,14 @@ mod tests {
             }))
         ));
 
-        let invalid_typed_body =
-            br#"{"version":3,"messageId":"bad-body","body":{"futureShape":true}}"#;
+        let invalid_typed_body = serde_json::to_vec(&json!({
+            "version": RUNTIME_PROTOCOL_VERSION,
+            "messageId": "bad-body",
+            "body": { "futureShape": true },
+        }))
+        .expect("serialize invalid typed body");
         assert!(matches!(
-            decode_runtime_frame(invalid_typed_body),
+            decode_runtime_frame(&invalid_typed_body),
             RuntimeFrameDecision::Close
         ));
     }

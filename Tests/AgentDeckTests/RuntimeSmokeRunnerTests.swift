@@ -511,7 +511,7 @@
       )
       XCTAssertEqual(
         String(decoding: output, as: UTF8.self),
-        #"{"agents":[],"ok":true,"protocolVersion":3,"reply":"selfcheck"}"# + "\n"
+        #"{"agents":[],"ok":true,"protocolVersion":4,"reply":"selfcheck"}"# + "\n"
       )
       XCTAssertTrue(errorOutput.isEmpty)
       XCTAssertEqual(evidence.request, "describeAgents")
