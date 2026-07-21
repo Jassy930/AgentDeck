@@ -5,10 +5,12 @@
 //! transport 排序。所有 mutation 先过 recovery/lifecycle 与 authorization capability，
 //! 再进入 durable store/per-conversation actor。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
+use agentdeck_protocol::e2ee::AuthorizationPermissionV1;
 use agentdeck_protocol::runtime::command::{HelloParams, QueryReceiptSelector, RevokeTarget};
 use agentdeck_protocol::runtime::failure::{
     DAEMON_AUTHORIZATION_PERMISSION_DENIED, DAEMON_AUTHORIZATION_REVOKED,
@@ -20,7 +22,7 @@ use agentdeck_protocol::runtime::failure::{
     DAEMON_RUNTIME_READ_UNAVAILABLE,
 };
 use agentdeck_protocol::runtime::identity::{
-    ApprovalId, CommandId, ConversationId, IdempotencyKey, TurnId,
+    ApprovalId, CommandId, ConversationId, DeviceHandle, GrantSerial, IdempotencyKey, TurnId,
 };
 use agentdeck_protocol::runtime::{
     BackfillRequest, CancellationReceipt, CommandReceipt, CommandStatus, CommandStatusReceipt,
@@ -36,7 +38,7 @@ use super::catalog_snapshot::{CatalogSnapshotProvider, CatalogSnapshotProviderEr
 use super::connection::{
     AuthenticatedPrincipal, ConnectionError, ConnectionId, ConnectionRegistry, ConnectionSink,
     DEFAULT_CONNECTION_WRITER_BYTES, DEFAULT_CONNECTION_WRITER_FRAMES, EncodedRuntimeFrame,
-    FlushReceipt, PrincipalIssuer,
+    FlushReceipt, PrincipalAccessError, PrincipalIssuer,
 };
 use super::conversation::{
     ActiveCancelResult, ConversationError, ConversationRegistry, PromptAcceptResult,
@@ -69,10 +71,11 @@ use super::revocation_administration::{
 use super::router::AgentRouter;
 use super::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
 use super::store::{
-    CommandReceiptSelector, CommandState, ConfigureConversation, ConfigureConversationOutcome,
-    ConversationDescriptor, CreateConversationOutcome, NewConversation, QueryCommandReceipt,
-    RuntimeId, RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle, SnapshotOrigin,
-    UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
+    ActiveRemoteIngressProof, CommandReceiptSelector, CommandState, ConfigureConversation,
+    ConfigureConversationOutcome, ConversationDescriptor, CreateConversationOutcome,
+    CurrentRemoteAuthorizationProof, NewConversation, QueryCommandReceipt,
+    RemotePrincipalRegistration, RuntimeId, RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle,
+    SnapshotOrigin, UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
 };
 use super::subscription::coordinator::SubscriptionCoordinator;
 use super::upgrade::{
@@ -122,10 +125,31 @@ pub struct RuntimeCore {
     read_pool: ReadPool,
     #[allow(dead_code)] // P3.8 UDS peer credential adapter 才会成为 production caller。
     principal_issuer: PrincipalIssuer,
+    #[cfg(test)]
+    remote_registration_calls: AtomicUsize,
+    recovery_blocked_conversations: RwLock<HashSet<RuntimeId>>,
     lifecycle: AtomicU8,
     operation_tracker: Arc<RuntimeOperationTracker>,
     recovery_lock: Mutex<()>,
     shutdown_lock: Mutex<()>,
+}
+
+/// Active Store projection 已注册 exact shared lease，但尚未通过 final Store
+/// recheck/replay fence。本类型不暴露 principal 操作，只能在 activation 时消费一次。
+#[allow(
+    dead_code,
+    reason = "同一 P4.4 Task 的 outbound transport slice 消费 staged capability"
+)]
+pub(crate) struct RegisteredRemotePrincipal {
+    principal: AuthenticatedPrincipal,
+    registration: RemotePrincipalRegistration,
+    core_identity: Arc<()>,
+}
+
+impl std::fmt::Debug for RegisteredRemotePrincipal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RegisteredRemotePrincipal([REDACTED])")
+    }
 }
 
 impl RuntimeCore {
@@ -300,6 +324,9 @@ impl RuntimeCore {
             recovery,
             read_pool: ReadPool::new(DEFAULT_RUNTIME_READ_CONCURRENCY)?,
             principal_issuer: PrincipalIssuer::local_only(machine_trust_domain),
+            #[cfg(test)]
+            remote_registration_calls: AtomicUsize::new(0),
+            recovery_blocked_conversations: RwLock::new(HashSet::new()),
             lifecycle: AtomicU8::new(CORE_COLD),
             operation_tracker: Arc::new(RuntimeOperationTracker::default()),
             recovery_lock: Mutex::new(()),
@@ -364,6 +391,55 @@ impl RuntimeCore {
             .map_err(RuntimeCoreError::from)
     }
 
+    /// 完整 crypto 与 Store exact current recheck 通过后，注册/复用 exact shared lease。
+    /// 返回的 staged capability 仍不能直接进入 Core。
+    pub(crate) fn register_remote_principal(
+        &self,
+        proof: &ActiveRemoteIngressProof,
+    ) -> Result<RegisteredRemotePrincipal, RuntimeCoreError> {
+        #[cfg(test)]
+        self.remote_registration_calls
+            .fetch_add(1, Ordering::AcqRel);
+        let binding = proof.command_authorization_binding()?;
+        let (principal, registration) = proof.register_principal_lease(|| {
+            self.principal_issuer
+                .issue_verified_remote(binding)
+                .map_err(RuntimeCoreError::from)
+        })?;
+        Ok(RegisteredRemotePrincipal {
+            principal,
+            registration,
+            core_identity: self.recovery_identity.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remote_registration_calls_for_test(&self) -> usize {
+        self.remote_registration_calls.load(Ordering::Acquire)
+    }
+
+    /// 消费与 exact Current proof 同源的 staged lease；调用方只有在本 activation
+    /// 成功后才发布 replay candidate，随后方可进入 Core。其它 Active material、
+    /// 其它 Core 或已经 Revoking/Revoked 的 shared lease 均 fail-close。
+    #[allow(
+        dead_code,
+        reason = "同一 P4.4 Task 的 outbound transport slice 在 replay candidate 发布前调用"
+    )]
+    pub(crate) fn activate_registered_remote_principal(
+        &self,
+        registered: RegisteredRemotePrincipal,
+        proof: &CurrentRemoteAuthorizationProof,
+    ) -> Result<AuthenticatedPrincipal, RuntimeCoreError> {
+        if !Arc::ptr_eq(&registered.core_identity, &self.recovery_identity)
+            || !proof.confirms_registered(&registered.registration)
+        {
+            return Err(RuntimeCoreError::AuthorizationDenied);
+        }
+        let authorization = registered.principal.try_enter()?;
+        drop(authorization);
+        Ok(registered.principal)
+    }
+
     /// 连接只接收不可伪造的认证 capability；raw route/uid 字段不是本接口输入。
     pub fn connect(
         &self,
@@ -373,6 +449,12 @@ impl RuntimeCore {
         let _operation = self
             .try_enter_operation()
             .map_err(RuntimeCoreError::into_failure)?;
+        // 与 revoke 的 Active→Revoking CAS 线性化：已 Revoking/Revoked 的 lease
+        // 不能再登记 connection；已取得 guard 的并发 connect 会被 revoke 等待，
+        // 随后必然出现在 exact authorization connection 快照中。
+        let _authorization = principal
+            .try_enter()
+            .map_err(|error| RuntimeCoreError::from(error).into_failure())?;
         self.connections
             .connect(principal, sink)
             .map_err(|error| RuntimeCoreError::Connection(error).into_failure())
@@ -384,9 +466,6 @@ impl RuntimeCore {
         connection_id: ConnectionId,
         request: RuntimeRequest,
     ) -> RuntimeReply {
-        if let RuntimeRequest::Hello(params) = &request {
-            return self.handle_hello(params.clone());
-        }
         let operation = match self.try_enter_operation() {
             Ok(operation) => operation,
             Err(error) => return RuntimeReply::Failure(error.into_failure()),
@@ -401,9 +480,6 @@ impl RuntimeCore {
         connection_id: ConnectionId,
         request: RuntimeRequest,
     ) -> RuntimeReply {
-        if let RuntimeRequest::Hello(params) = &request {
-            return self.handle_hello(params.clone());
-        }
         let principal = match self.connections.principal(connection_id) {
             Ok(principal) => principal,
             Err(error) => {
@@ -543,6 +619,19 @@ impl RuntimeCore {
     ) -> Option<Result<(), RuntimeFailure>> {
         let stream_result = match request {
             RuntimeRequest::Catalog(request) => {
+                let _authorization = match principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::CatalogRead)
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Some(self.enqueue_stream_failure(
+                            operation,
+                            connection_id,
+                            message_id,
+                            RuntimeCoreError::from(error).into_failure(),
+                        ));
+                    }
+                };
                 match self
                     .subscriptions
                     .start_catalog_request(connection_id, message_id.clone(), request)
@@ -560,7 +649,9 @@ impl RuntimeCore {
                 }
             }
             RuntimeRequest::Subscribe { inner_cursor } => {
-                let _authorization = match principal.try_enter() {
+                let _authorization = match principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::ConversationRead)
+                {
                     Ok(value) => value,
                     Err(error) => {
                         return Some(self.enqueue_stream_failure(
@@ -601,7 +692,9 @@ impl RuntimeCore {
                 }
             }
             RuntimeRequest::Backfill(request) => {
-                let _authorization = match principal.try_enter() {
+                let _authorization = match principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::ConversationRead)
+                {
                     Ok(value) => value,
                     Err(error) => {
                         return Some(self.enqueue_stream_failure(
@@ -642,7 +735,9 @@ impl RuntimeCore {
                 }
             }
             RuntimeRequest::Unsubscribe { target } => {
-                let _authorization = match principal.try_enter() {
+                let _authorization = match principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::ConversationRead)
+                {
                     Ok(value) => value,
                     Err(error) => {
                         return Some(self.enqueue_stream_failure(
@@ -740,7 +835,8 @@ impl RuntimeCore {
         match request {
             RuntimeRequest::Hello(params) => Ok(self.handle_hello(params)),
             RuntimeRequest::DescribeAgents => {
-                let authorization = principal.try_enter()?;
+                let authorization = principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::CatalogRead)?;
                 let descriptions = self
                     .router
                     .agent_descriptions()
@@ -749,7 +845,8 @@ impl RuntimeCore {
                 Ok(RuntimeReply::Agents(descriptions))
             }
             RuntimeRequest::Start(start) => {
-                let _authorization = principal.try_enter()?;
+                let _authorization = principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::ConversationStart)?;
                 if validate_idempotency_key(&start.idempotency_key).is_err()
                     || !start.cwd.is_absolute()
                 {
@@ -795,7 +892,9 @@ impl RuntimeCore {
                 let receipt = match async {
                     validate_idempotency_key(&request.idempotency_key)?;
                     let conversation_id = parse_conversation_id(&request.conversation_id)?;
-                    let authorization = principal.try_enter()?;
+                    let authorization = principal
+                        .try_enter_runtime_permission(AuthorizationPermissionV1::MetadataWrite)?;
+                    self.ensure_conversation_mutation_allowed(conversation_id)?;
                     let owner = principal.idempotency_owner();
                     let outcome = self
                         .store
@@ -860,7 +959,9 @@ impl RuntimeCore {
                 let receipt = match async {
                     validate_idempotency_key(&request.idempotency_key)?;
                     let conversation_id = parse_conversation_id(&request.conversation_id)?;
-                    let authorization = principal.try_enter()?;
+                    let authorization = principal
+                        .try_enter_runtime_permission(AuthorizationPermissionV1::MetadataWrite)?;
+                    self.ensure_conversation_mutation_allowed(conversation_id)?;
                     let owner = principal.idempotency_owner();
                     let context = self
                         .store
@@ -975,7 +1076,9 @@ impl RuntimeCore {
                 let receipt = match async {
                     validate_idempotency_key(&request.idempotency_key)?;
                     let conversation_id = parse_conversation_id(&request.conversation_id)?;
-                    let authorization = principal.try_enter()?;
+                    let authorization = principal
+                        .try_enter_runtime_permission(AuthorizationPermissionV1::PromptSend)?;
+                    self.ensure_conversation_mutation_allowed(conversation_id)?;
                     // NativeProjected conversation 是经认证的只读历史投影。必须在 actor
                     // mailbox 前返回 typed failure；Store accept transaction 仍会独立
                     // 复核，防止 crate 内旁路或正常状态漂移越过此早期门禁。
@@ -1030,7 +1133,9 @@ impl RuntimeCore {
             } => {
                 let internal_conversation = parse_conversation_id(&conversation_id)?;
                 let internal_command = parse_command_id(&command_id)?;
-                let authorization = principal.try_enter()?;
+                let authorization = principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::CommandCancel)?;
+                self.ensure_conversation_mutation_allowed(internal_conversation)?;
                 let result = self
                     .conversations
                     .cancel_queued(
@@ -1058,7 +1163,9 @@ impl RuntimeCore {
             } => {
                 let internal_conversation = parse_conversation_id(&conversation_id)?;
                 let internal_turn = parse_turn_id(&turn_id)?;
-                let authorization = principal.try_enter()?;
+                let authorization = principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::CommandCancel)?;
+                self.ensure_conversation_mutation_allowed(internal_conversation)?;
                 match self
                     .conversations
                     .cancel_active(internal_conversation, internal_turn, authorization)
@@ -1082,6 +1189,9 @@ impl RuntimeCore {
                 let internal_conversation = parse_conversation_id(&conversation_id)?;
                 let internal_turn = parse_turn_id(&turn_id)?;
                 let internal_approval = parse_approval_id(&approval_id)?;
+                let _permission = principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::ApprovalResolve)?;
+                self.ensure_conversation_mutation_allowed(internal_conversation)?;
                 let authorization = principal.try_enter_approval()?;
                 authorization.require_resolve()?;
                 let receipt = self
@@ -1102,6 +1212,9 @@ impl RuntimeCore {
             } => {
                 let internal_conversation = parse_conversation_id(&conversation_id)?;
                 let internal_approval = parse_approval_id(&approval_id)?;
+                let _permission = principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::ApprovalRetry)?;
+                self.ensure_conversation_mutation_allowed(internal_conversation)?;
                 let authorization = principal.try_enter_approval()?;
                 authorization.require_retry()?;
                 let receipt = self
@@ -1111,7 +1224,8 @@ impl RuntimeCore {
                 Ok(RuntimeReply::Approval(receipt))
             }
             RuntimeRequest::QueryReceipt(selector) => {
-                let _authorization = principal.try_enter()?;
+                let _authorization = principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::ConversationRead)?;
                 let owner = principal.idempotency_owner();
                 let (conversation_id, query, history_selector) = match selector {
                     QueryReceiptSelector::Command {
@@ -1181,10 +1295,18 @@ impl RuntimeCore {
             }
             RuntimeRequest::Subscribe { .. }
             | RuntimeRequest::Unsubscribe { .. }
-            | RuntimeRequest::Backfill(_) => Err(RuntimeCoreError::InvalidRequest),
+            | RuntimeRequest::Backfill(_) => {
+                let _authorization = principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::ConversationRead)?;
+                Err(RuntimeCoreError::InvalidRequest)
+            }
             // Catalog page 可能超过单 frame 上限，必须携带原 messageId 进入
             // handle_envelope 的 tracked paced egress；direct handle 禁止返回大 DTO。
-            RuntimeRequest::Catalog(_) => Err(RuntimeCoreError::InvalidRequest),
+            RuntimeRequest::Catalog(_) => {
+                let _authorization = principal
+                    .try_enter_runtime_permission(AuthorizationPermissionV1::CatalogRead)?;
+                Err(RuntimeCoreError::InvalidRequest)
+            }
             RuntimeRequest::MachineEnroll(request) => {
                 let _authorization = principal.try_enter_local_administration()?;
                 self.remote_administration
@@ -1263,17 +1385,31 @@ impl RuntimeCore {
                     ..
                 } => {
                     let authorization = principal.try_enter_local_administration()?;
-                    let result = self
-                        .revocation_administration
-                        .revoke_device(device, grant_serial)
-                        .await
-                        .map(RuntimeReply::Revocation)
-                        .map_err(revocation_administration_error);
+                    let result = async {
+                        let remote_principal = self
+                            .begin_remote_principal_revoke(&device, grant_serial)
+                            .await?;
+                        let receipt = self
+                            .revocation_administration
+                            .revoke_device(device, grant_serial)
+                            .await
+                            .map_err(revocation_administration_error)?;
+                        if let Some(remote_principal) = remote_principal {
+                            self.finalize_remote_principal_revoke(remote_principal)
+                                .await?;
+                        }
+                        Ok(RuntimeReply::Revocation(receipt))
+                    }
+                    .await;
                     drop(authorization);
                     result
                 }
                 // SelfDevice 属后续 authenticated RemoteLink；本地管理 seam 不得代办。
-                RevokeTarget::SelfDevice => Err(RuntimeCoreError::FeatureUnavailable),
+                RevokeTarget::SelfDevice => {
+                    let _authorization = principal
+                        .try_enter_runtime_permission(AuthorizationPermissionV1::RevokeSelf)?;
+                    Err(RuntimeCoreError::FeatureUnavailable)
+                }
             },
             RuntimeRequest::StageUpgrade(_) => {
                 let failure = match principal.try_enter_local_administration() {
@@ -1285,6 +1421,24 @@ impl RuntimeCore {
                     failure,
                 }))
             }
+        }
+    }
+
+    /// RecoveryBlocked 是 conversation-scoped read-only policy，不是全 Core 故障。
+    /// 集合只由 authenticated startup recovery 发布；业务 mutation 在取得 exact
+    /// permission guard 后、触碰 Store/actor 前同步复核，确保拒绝零副作用。
+    fn ensure_conversation_mutation_allowed(
+        &self,
+        conversation_id: RuntimeId,
+    ) -> Result<(), RuntimeCoreError> {
+        let blocked = self
+            .recovery_blocked_conversations
+            .read()
+            .map_err(|_| RuntimeCoreError::RecoveryBlocked)?;
+        if blocked.contains(&conversation_id) {
+            Err(RuntimeCoreError::RecoveryBlocked)
+        } else {
+            Ok(())
         }
     }
 
@@ -1330,6 +1484,12 @@ impl RuntimeCore {
                     RuntimeCoreError::Conversation(error)
                 }
             })?;
+        let recovery_blocked_conversations =
+            recovered.blocked_conversation_ids().collect::<HashSet<_>>();
+        *self
+            .recovery_blocked_conversations
+            .write()
+            .map_err(|_| RuntimeCoreError::RecoveryBlocked)? = recovery_blocked_conversations;
         let report = RecoveryReport {
             conversations: u64::try_from(recovered.conversation_count())
                 .map_err(|_| RuntimeCoreError::RecoveryBlocked)?,
@@ -1360,6 +1520,79 @@ impl RuntimeCore {
         // 变成 partial-transfer/fail-close，并让 watch/pin 的释放依赖错误路径。
         let _ = self.subscriptions.disconnect(connection_id).await;
         let _ = self.connections.disconnect(connection_id).await;
+    }
+
+    /// Remote transport 的 deadline fallback：先同步撤销 connection admission 并
+    /// abort Core-owned writer。正常路径仍调用 [`Self::disconnect`] 收割 subscription；
+    /// 本入口只用于 Link actor 已被强制 join 后保证 stale principal 不再可写。
+    pub(crate) fn fail_close_connection_for_transport(&self, connection_id: ConnectionId) {
+        let _ = self.connections.fail_close(connection_id);
+    }
+
+    /// 两阶段 local revoke 的 pre-COMMIT fence。issuer registry 不依赖 active
+    /// connection；命中 exact target 时先把共享 lease 置为 Revoking、drain 所有
+    /// inflight guard，并终止 exact authorization 尚未 Started 的 Accepted。以上
+    /// actor fence 全部成功后才允许调用 durable owner。已完成 Revoked 的 retry
+    /// 当作无需重复 fence，仍允许 durable owner 做 exact replay。
+    async fn begin_remote_principal_revoke(
+        &self,
+        device: &DeviceHandle,
+        grant_serial: GrantSerial,
+    ) -> Result<Option<AuthenticatedPrincipal>, RuntimeCoreError> {
+        let principal = match self
+            .principal_issuer
+            .remote_principal_for_revoke(device, grant_serial)?
+        {
+            Some(principal) => principal,
+            None => {
+                // daemon 重启后，设备重连前仍可能存在 durable ADC2 Accepted。先从 Store
+                // 建立同一 exact lease，确保 issuer registry 为空时也能在 durable revoke
+                // 之前阻断这些命令。
+                let Some(proof) = self
+                    .store
+                    .load_active_remote_ingress_for_revoke(device, grant_serial)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                self.register_remote_principal(&proof)?.principal
+            }
+        };
+        match self
+            .conversations
+            .begin_principal_revocation(&principal)
+            .await
+        {
+            Ok(()) => {
+                self.conversations
+                    .terminate_principal_accepted(&principal)
+                    .await?;
+                Ok(Some(principal))
+            }
+            Err(ConversationError::Principal(PrincipalAccessError::Revoked)) => Ok(None),
+            Err(error) => Err(RuntimeCoreError::Conversation(error)),
+        }
+    }
+
+    /// durable revoke 成功后的 terminal publish。Accepted 已在 pre-COMMIT fence
+    /// 阶段终止；这里切连接并发布 Revoked。registry 清理即使报错，也不能把 lease
+    /// 回滚到 Active。
+    async fn finalize_remote_principal_revoke(
+        &self,
+        principal: AuthenticatedPrincipal,
+    ) -> Result<(), RuntimeCoreError> {
+        let authorization_key = principal.authorization_key();
+        let connections = self
+            .connections
+            .connections_for_authorization(&authorization_key);
+        if let Ok(connections) = &connections {
+            for connection_id in connections.iter().copied() {
+                self.disconnect(connection_id).await;
+            }
+        }
+        principal.finish_revoke();
+        connections.map_err(RuntimeCoreError::Connection)?;
+        Ok(())
     }
 
     /// 事件/异步 reply 的非阻塞投递入口。真正 transport flush ACK 前 Core 仍持有

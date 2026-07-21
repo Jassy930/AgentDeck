@@ -1,12 +1,14 @@
 //! MachineLink 的 typed Relay transport。
 //!
 //! 本模块不持有业务执行 core，也不公开 raw frame send/recv。主 control lane 只承载
-//! root-signed retirement；一次性取出的 bounded pairing lane 只承载显式配对/授权 frame。
-//! 两条 typed lane 复用唯一 Relay session/supervisor，均不向执行 core 派发业务 frame。
+//! root-signed retirement；一次性取出的 bounded pairing lane 只承载显式配对/授权 frame；
+//! bounded business lane 只承载 `Send`、request `RouteAccepted` 与 outbound `Reply`。
+//! 三条 typed lane 复用唯一 Relay session/supervisor；业务 lane 只做 transport/dispatch，
+//! 不认证 Runtime payload，也不持有 canonical 业务状态。
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use agentdeck_crypto::rand_core::SeedableRng;
@@ -21,19 +23,20 @@ use agentdeck_protocol::e2ee::{
 };
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, AuthProof, Authenticate, Challenge, ClosePairRoute, GrantCommitted, InstallGrant,
-    OpenPairRoute, PairData, PairRouteClosed, PairRouteOpened, RetireMachine, RetirementCommitted,
-    RevocationCommitted, RevokeDevice, RouteAccepted, ServerRestarting,
+    OpenPairRoute, PairData, PairRouteClosed, PairRouteOpened, Reply, RetireMachine,
+    RetirementCommitted, RevocationCommitted, RevokeDevice, RouteAccepted, Send as RouteSend,
+    ServerRestarting,
 };
 use agentdeck_protocol::relay_v2::{
     AuthenticationRole, AuthenticationTranscriptV1, DeviceRevocation, DeviceRouteId, GrantSerial,
     MAX_FRAME_BYTES, MachineRouteId, OpaqueRouteFrame, PairRouteId, RELAY_PROTOCOL_VERSION,
-    RelayFrameBody, SignedCertificate, encode,
+    RelayFrameBody, RequestRouteId, SignedCertificate, encode,
 };
 use agentdeck_relay_client::{LinkAuthenticator, RelayClient, RelayClientConfig, RelayClientError};
 use async_trait::async_trait;
 use rand_chacha::ChaCha20Rng;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
@@ -910,6 +913,8 @@ pub enum RemoteTransportError {
     AuthenticatorStillShared,
     #[error("pairing transport lane has already been taken")]
     PairingLaneUnavailable,
+    #[error("business transport lane is unavailable or has already been taken")]
+    BusinessLaneUnavailable,
     #[error("exclusive control is pending before pairing activation")]
     PairingActivationBlocked,
     #[error("pairing frame does not match the frozen machine/pair/device/serial binding")]
@@ -918,6 +923,10 @@ pub enum RemoteTransportError {
     PairingCapacity,
     #[error("pairing event consumer is lagged or unavailable")]
     PairingLagged,
+    #[error("business event consumer is lagged or exceeded its byte budget")]
+    BusinessLagged,
+    #[error("business reply belongs to a replaced transport generation")]
+    BusinessGenerationReplaced,
     #[error("pairing transport generation is exhausted")]
     PairingGenerationExhausted,
     #[error("pairing transport could not obtain cryptographic entropy")]
@@ -939,10 +948,13 @@ impl RemoteTransportError {
             Self::StartPermitUnavailable => "remote.transport.start_permit_unavailable",
             Self::AuthenticatorStillShared => "remote.transport.authenticator_still_shared",
             Self::PairingLaneUnavailable => "remote.transport.pairing_lane_unavailable",
+            Self::BusinessLaneUnavailable => "remote.transport.business_lane_unavailable",
             Self::PairingActivationBlocked => "remote.transport.pairing_activation_blocked",
             Self::PairingBindingMismatch => "remote.transport.pairing_binding_mismatch",
             Self::PairingCapacity => "remote.transport.pairing_capacity",
             Self::PairingLagged => "remote.transport.pairing_lagged",
+            Self::BusinessLagged => "remote.transport.business_lagged",
+            Self::BusinessGenerationReplaced => "remote.transport.business_generation_replaced",
             Self::PairingGenerationExhausted => "remote.transport.pairing_generation_exhausted",
             Self::PairingEntropyUnavailable => "remote.transport.pairing_entropy_unavailable",
             Self::SupervisorFailed { code } => code,
@@ -1086,6 +1098,8 @@ async fn connect_preserving_ownership<P>(
 const PAIRING_EVENT_CHANNEL_CAPACITY: usize = 8;
 const PAIRING_BINDING_CAPACITY: usize = 8;
 const PAIRING_COMPLETED_BINDING_CAPACITY: usize = 8;
+const BUSINESS_EVENT_CHANNEL_CAPACITY: usize = 512;
+const BUSINESS_EVENT_BYTES_CAPACITY: usize = 16 * 1024 * 1024;
 const INITIAL_PAIRING_GENERATION: u64 = 1;
 
 #[derive(Clone)]
@@ -1459,6 +1473,156 @@ fn is_zero_device_route(route: DeviceRouteId) -> bool {
     route.as_bytes() == &[0; 16]
 }
 
+fn is_zero_request_route(route: RequestRouteId) -> bool {
+    route.as_bytes() == &[0; 16]
+}
+
+fn business_reply_frame(reply: Reply) -> Result<OpaqueRouteFrame, RemoteTransportError> {
+    if is_zero_device_route(reply.device_route) || is_zero_request_route(reply.request_route) {
+        return Err(RemoteTransportError::FrameForbidden);
+    }
+    let frame = OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::Reply(reply),
+    };
+    if encode(&frame).len() > MAX_FRAME_BYTES {
+        return Err(RemoteTransportError::Client(RelayClientError::Failure {
+            code: "relay.client.frame_too_large".to_owned(),
+        }));
+    }
+    Ok(frame)
+}
+
+/// 唯一 MachineLink 上的 typed business ingress。
+///
+/// `RouteAccepted` 只表示 Relay writer 已接受 request route，不是业务内核回执。
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum BusinessTransportEvent {
+    Send(RouteSend),
+    RouteAccepted(RouteAccepted),
+    GenerationReplaced { previous: u64, current: u64 },
+}
+
+impl fmt::Debug for BusinessTransportEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send(_) => formatter.write_str("BusinessTransportEvent::Send([REDACTED])"),
+            Self::RouteAccepted(_) => formatter
+                .write_str("BusinessTransportEvent::RouteAcceptedNotCommandSuccess([REDACTED])"),
+            Self::GenerationReplaced { previous, current } => formatter
+                .debug_struct("BusinessTransportEvent::GenerationReplaced")
+                .field("previous", previous)
+                .field("current", current)
+                .finish(),
+        }
+    }
+}
+
+#[allow(dead_code)] // 下一内部子片由 RemoteLink actor 消费 bounded signal。
+struct BusinessTransportSignal {
+    generation: u64,
+    event: BusinessTransportEvent,
+    _bytes: OwnedSemaphorePermit,
+}
+
+/// 一次性从 [`RemoteTransport`] 取出的 bounded business lane。
+///
+/// lane 只持有唯一 supervisor 的 typed command handle 与 bounded event receiver；不持有
+/// authenticator、start permit、RelayClient、业务内核或 canonical 业务状态。
+#[allow(dead_code)] // 下一内部子片由 RemoteLink composition 领取并驱动。
+pub(crate) struct BusinessTransportLane {
+    command_tx: mpsc::Sender<SupervisorCommand>,
+    event_rx: mpsc::Receiver<BusinessTransportSignal>,
+    health_rx: watch::Receiver<Option<String>>,
+    generation: Arc<AtomicU64>,
+    generation_rx: watch::Receiver<u64>,
+    observed_generation: u64,
+    enabled: Arc<AtomicBool>,
+}
+
+#[allow(dead_code)] // 下一内部子片接入 RemoteLink ingress/reply pump。
+impl BusinessTransportLane {
+    /// 发送已经完成 endpoint sealing 的 directed reply；supervisor 的 session `send`
+    /// 只有在底层 writer flush 完成后才返回。
+    pub(crate) async fn send_reply(
+        &self,
+        expected_generation: u64,
+        reply: Reply,
+    ) -> Result<(), RemoteTransportError> {
+        business_reply_frame(reply.clone())?;
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SupervisorCommand::BusinessReply {
+                expected_generation,
+                reply,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| RemoteTransportError::Closed)?;
+        response_rx
+            .await
+            .map_err(|_| RemoteTransportError::Closed)?
+    }
+
+    pub(crate) async fn next_event(
+        &mut self,
+    ) -> Result<Option<BusinessTransportEvent>, RemoteTransportError> {
+        loop {
+            let transport_impaired = self.health_rx.borrow().is_some();
+            tokio::select! {
+                biased;
+                changed = self.health_rx.changed() => {
+                    if changed.is_err() {
+                        return Err(RemoteTransportError::Closed);
+                    }
+                }
+                changed = self.generation_rx.changed() => {
+                    if changed.is_err() {
+                        return Err(RemoteTransportError::Closed);
+                    }
+                    let current = *self.generation_rx.borrow_and_update();
+                    let previous = self.observed_generation;
+                    if current <= previous {
+                        continue;
+                    }
+                    self.observed_generation = current;
+                    return Ok(Some(BusinessTransportEvent::GenerationReplaced {
+                        previous,
+                        current,
+                    }));
+                }
+                signal = self.event_rx.recv() => {
+                    let Some(signal) = signal else {
+                        return Err(RemoteTransportError::Closed);
+                    };
+                    if transport_impaired
+                        || signal.generation != self.generation.load(Ordering::Acquire)
+                    {
+                        continue;
+                    }
+                    return Ok(Some(signal.event));
+                }
+            }
+        }
+    }
+
+    pub(crate) const fn current_generation(&self) -> u64 {
+        self.observed_generation
+    }
+}
+
+impl fmt::Debug for BusinessTransportLane {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BusinessTransportLane([REDACTED])")
+    }
+}
+
+impl Drop for BusinessTransportLane {
+    fn drop(&mut self) {
+        self.enabled.store(false, Ordering::Release);
+    }
+}
+
 /// 一次性从 [`RemoteTransport`] 取出的 bounded pairing lane。
 ///
 /// 它只持有唯一 supervisor 的 typed command handle 与唯一 event receiver；不持有
@@ -1727,6 +1891,7 @@ pub struct RemoteTransport {
     machine_route: MachineRouteId,
     supervisor: Option<ControlSupervisor>,
     pairing_lane: Option<PairingTransportLane>,
+    business_lane: Option<BusinessTransportLane>,
     authenticator: Option<Arc<MachineLinkAuthenticator>>,
     start_permit: Option<RemoteStartPermit>,
 }
@@ -1743,6 +1908,12 @@ enum SupervisorCommand {
         command: PairingCommand,
         response: oneshot::Sender<Result<(), RemoteTransportError>>,
     },
+    #[allow(dead_code)] // 下一内部子片由 RemoteLink reply pump 构造。
+    BusinessReply {
+        expected_generation: u64,
+        reply: Reply,
+        response: oneshot::Sender<Result<(), RemoteTransportError>>,
+    },
     Reconnect {
         response: oneshot::Sender<Result<(), RemoteTransportError>>,
     },
@@ -1753,6 +1924,8 @@ struct ControlSupervisor {
     control_rx: mpsc::Receiver<Result<Option<RemoteControl>, RemoteTransportError>>,
     retained_control: VecDeque<Result<Option<RemoteControl>, RemoteTransportError>>,
     pairing_transition: Arc<Mutex<PairingTransition>>,
+    #[allow(dead_code)] // 由下一内部子片的 take_business_lane activation 消费。
+    business_enabled: Arc<AtomicBool>,
     cancel_tx: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
     health_rx: watch::Receiver<Option<String>>,
@@ -1763,6 +1936,10 @@ struct SupervisorSignals {
     pairing_tx: mpsc::Sender<PairingTransportSignal>,
     pairing_transition: Arc<Mutex<PairingTransition>>,
     pairing_generation: Arc<AtomicU64>,
+    business_generation: watch::Sender<u64>,
+    business_tx: mpsc::Sender<BusinessTransportSignal>,
+    business_bytes: Arc<Semaphore>,
+    business_enabled: Arc<AtomicBool>,
     health: watch::Sender<Option<String>>,
 }
 
@@ -1770,12 +1947,17 @@ impl ControlSupervisor {
     fn start(
         machine_route: MachineRouteId,
         session: Box<dyn ControlSession>,
-    ) -> (Self, PairingTransportLane) {
+    ) -> (Self, PairingTransportLane, BusinessTransportLane) {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
         let (pairing_tx, pairing_rx) = mpsc::channel(PAIRING_EVENT_CHANNEL_CAPACITY);
+        let (business_tx, business_rx) = mpsc::channel(BUSINESS_EVENT_CHANNEL_CAPACITY);
         let pairing_transition = Arc::new(Mutex::new(PairingTransition::default()));
         let pairing_generation = Arc::new(AtomicU64::new(INITIAL_PAIRING_GENERATION));
+        let (business_generation, business_generation_rx) =
+            watch::channel(INITIAL_PAIRING_GENERATION);
+        let business_bytes = Arc::new(Semaphore::new(BUSINESS_EVENT_BYTES_CAPACITY));
+        let business_enabled = Arc::new(AtomicBool::new(false));
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (health_tx, health_rx) = watch::channel(None);
         let task = tokio::spawn(run_control_supervisor(
@@ -1787,6 +1969,10 @@ impl ControlSupervisor {
                 pairing_tx,
                 pairing_transition: Arc::clone(&pairing_transition),
                 pairing_generation: Arc::clone(&pairing_generation),
+                business_generation,
+                business_tx,
+                business_bytes,
+                business_enabled: Arc::clone(&business_enabled),
                 health: health_tx,
             },
             cancel_rx,
@@ -1797,8 +1983,17 @@ impl ControlSupervisor {
             retained_events: VecDeque::with_capacity(PAIRING_EVENT_CHANNEL_CAPACITY),
             health_rx: health_rx.clone(),
             transition: Arc::clone(&pairing_transition),
-            generation: pairing_generation,
+            generation: Arc::clone(&pairing_generation),
             authority_anchor: None,
+        };
+        let business_lane = BusinessTransportLane {
+            command_tx: command_tx.clone(),
+            event_rx: business_rx,
+            health_rx: health_rx.clone(),
+            generation: Arc::clone(&pairing_generation),
+            generation_rx: business_generation_rx,
+            observed_generation: INITIAL_PAIRING_GENERATION,
+            enabled: Arc::clone(&business_enabled),
         };
         (
             Self {
@@ -1806,12 +2001,27 @@ impl ControlSupervisor {
                 control_rx,
                 retained_control: VecDeque::with_capacity(CONTROL_CHANNEL_CAPACITY),
                 pairing_transition,
+                business_enabled,
                 cancel_tx,
                 task: Some(task),
                 health_rx,
             },
             pairing_lane,
+            business_lane,
         )
+    }
+
+    #[allow(dead_code)] // 下一内部子片由 RemoteLink composition 调用。
+    fn activate_business(&self, lane: &BusinessTransportLane) -> Result<(), RemoteTransportError> {
+        if !Arc::ptr_eq(&self.business_enabled, &lane.enabled)
+            || self
+                .business_enabled
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(RemoteTransportError::BusinessLaneUnavailable);
+        }
+        Ok(())
     }
 
     fn failure_code(&self) -> Option<String> {
@@ -1923,6 +2133,10 @@ async fn run_control_supervisor(
         pairing_tx,
         pairing_transition,
         pairing_generation,
+        business_generation,
+        business_tx,
+        business_bytes,
+        business_enabled,
         health,
     } = signals;
     let mut reader_enabled = true;
@@ -1986,9 +2200,11 @@ async fn run_control_supervisor(
                         session_shutdown,
                         &health,
                         machine_route,
-                        PairingSupervisorState {
+                        SupervisorState {
                             generation: &pairing_generation,
-                            bindings: &mut pairing_bindings,
+                            business_generation: &business_generation,
+                            pairing_bindings: &mut pairing_bindings,
+                            business_enabled: &business_enabled,
                         },
                     ).await;
                     pending_control = Some(control);
@@ -2055,9 +2271,11 @@ async fn run_control_supervisor(
                         session_shutdown,
                         &health,
                         machine_route,
-                        PairingSupervisorState {
+                        SupervisorState {
                             generation: &pairing_generation,
-                            bindings: &mut pairing_bindings,
+                            business_generation: &business_generation,
+                            pairing_bindings: &mut pairing_bindings,
+                            business_enabled: &business_enabled,
                         },
                     ).await;
                 }
@@ -2081,9 +2299,11 @@ async fn run_control_supervisor(
                     session_shutdown,
                     &health,
                     machine_route,
-                    PairingSupervisorState {
+                    SupervisorState {
                         generation: &pairing_generation,
-                        bindings: &mut pairing_bindings,
+                        business_generation: &business_generation,
+                        pairing_bindings: &mut pairing_bindings,
+                        business_enabled: &business_enabled,
                     },
                 ).await;
             }
@@ -2114,6 +2334,26 @@ async fn run_control_supervisor(
                             };
                             if dispatch_failed {
                                 let error = RemoteTransportError::PairingLagged;
+                                set_supervisor_failure(&health, error.code());
+                                reader_enabled = false;
+                                session.shutdown().await;
+                                session_shutdown = true;
+                                replace_pending_control(
+                                    &mut pending_control,
+                                    &pairing_transition,
+                                    Err(error),
+                                );
+                            }
+                        }
+                        Ok(InboundDispatch::Business { event, encoded_len }) => {
+                            if let Err(error) = try_send_business_signal(
+                                &business_tx,
+                                &business_bytes,
+                                &business_enabled,
+                                pairing_generation.load(Ordering::Acquire),
+                                event,
+                                encoded_len,
+                            ) {
                                 set_supervisor_failure(&health, error.code());
                                 reader_enabled = false;
                                 session.shutdown().await;
@@ -2201,9 +2441,11 @@ async fn run_control_supervisor(
     }
 }
 
-struct PairingSupervisorState<'a> {
+struct SupervisorState<'a> {
     generation: &'a AtomicU64,
-    bindings: &'a mut PairingBindings,
+    business_generation: &'a watch::Sender<u64>,
+    pairing_bindings: &'a mut PairingBindings,
+    business_enabled: &'a AtomicBool,
 }
 
 async fn handle_supervisor_command(
@@ -2213,7 +2455,7 @@ async fn handle_supervisor_command(
     session_shutdown: bool,
     health: &watch::Sender<Option<String>>,
     machine_route: MachineRouteId,
-    pairing: PairingSupervisorState<'_>,
+    state: SupervisorState<'_>,
 ) {
     match command {
         SupervisorCommand::SendRetirement {
@@ -2251,7 +2493,10 @@ async fn handle_supervisor_command(
                 let _ = response.send(Err(error));
                 return;
             }
-            let next_bindings = match pairing.bindings.prepare_outbound(machine_route, &command) {
+            let next_bindings = match state
+                .pairing_bindings
+                .prepare_outbound(machine_route, &command)
+            {
                 Ok(next) => next,
                 Err(error) => {
                     let _ = response.send(Err(error));
@@ -2263,11 +2508,45 @@ async fn handle_supervisor_command(
                 .await
                 .map_err(RemoteTransportError::Client);
             match &result {
-                Ok(()) => *pairing.bindings = next_bindings,
+                Ok(()) => *state.pairing_bindings = next_bindings,
                 Err(error) => {
                     set_supervisor_failure(health, error.code());
                     *reader_enabled = false;
                 }
+            }
+            let _ = response.send(result);
+        }
+        SupervisorCommand::BusinessReply {
+            expected_generation,
+            reply,
+            response,
+        } => {
+            if session_shutdown || !*reader_enabled {
+                let _ = response.send(Err(RemoteTransportError::Closed));
+                return;
+            }
+            if !state.business_enabled.load(Ordering::Acquire) {
+                let _ = response.send(Err(RemoteTransportError::BusinessLaneUnavailable));
+                return;
+            }
+            if state.generation.load(Ordering::Acquire) != expected_generation {
+                let _ = response.send(Err(RemoteTransportError::BusinessGenerationReplaced));
+                return;
+            }
+            let frame = match business_reply_frame(reply) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    let _ = response.send(Err(error));
+                    return;
+                }
+            };
+            let result = session
+                .send(frame)
+                .await
+                .map_err(RemoteTransportError::Client);
+            if let Err(error) = &result {
+                set_supervisor_failure(health, error.code());
+                *reader_enabled = false;
             }
             let _ = response.send(result);
         }
@@ -2276,7 +2555,7 @@ async fn handle_supervisor_command(
                 let _ = response.send(Err(RemoteTransportError::Closed));
                 return;
             }
-            let next_generation = pairing
+            let next_generation = state
                 .generation
                 .load(Ordering::Acquire)
                 .checked_add(1)
@@ -2292,10 +2571,9 @@ async fn handle_supervisor_command(
             match &result {
                 Ok(next_generation) => {
                     *reader_enabled = true;
-                    *pairing.bindings = PairingBindings::default();
-                    pairing
-                        .generation
-                        .store(*next_generation, Ordering::Release);
+                    *state.pairing_bindings = PairingBindings::default();
+                    state.generation.store(*next_generation, Ordering::Release);
+                    state.business_generation.send_replace(*next_generation);
                     health.send_replace(None);
                 }
                 Err(error) => {
@@ -2321,6 +2599,31 @@ fn try_send_pairing_signal(
         return true;
     }
     pairing_tx.try_send(signal).is_err()
+}
+
+fn try_send_business_signal(
+    business_tx: &mpsc::Sender<BusinessTransportSignal>,
+    byte_budget: &Arc<Semaphore>,
+    enabled: &AtomicBool,
+    generation: u64,
+    event: BusinessTransportEvent,
+    encoded_len: usize,
+) -> Result<(), RemoteTransportError> {
+    if !enabled.load(Ordering::Acquire) {
+        return Err(RemoteTransportError::BusinessLaneUnavailable);
+    }
+    let encoded_len =
+        u32::try_from(encoded_len).map_err(|_| RemoteTransportError::BusinessLagged)?;
+    let bytes = Arc::clone(byte_budget)
+        .try_acquire_many_owned(encoded_len)
+        .map_err(|_| RemoteTransportError::BusinessLagged)?;
+    business_tx
+        .try_send(BusinessTransportSignal {
+            generation,
+            event,
+            _bytes: bytes,
+        })
+        .map_err(|_| RemoteTransportError::BusinessLagged)
 }
 
 fn shared_control_pairing_failure(
@@ -2354,6 +2657,10 @@ fn replace_pending_control(
 enum InboundDispatch {
     Control(RemoteControl),
     Pairing(PairingTransportEvent),
+    Business {
+        event: BusinessTransportEvent,
+        encoded_len: usize,
+    },
     Shared {
         control: RemoteControl,
         pairing_failure: SafeFailure,
@@ -2368,13 +2675,15 @@ fn decode_inbound(
     if frame.version != RELAY_PROTOCOL_VERSION {
         return Err(RemoteTransportError::FrameForbidden);
     }
-    if encode(&frame).len() > MAX_FRAME_BYTES {
+    let canonical_frame_bytes = encode(&frame);
+    let encoded_len = canonical_frame_bytes.len();
+    if encoded_len > MAX_FRAME_BYTES {
         return Err(RemoteTransportError::Client(RelayClientError::Failure {
             code: "relay.client.frame_too_large".to_owned(),
         }));
     }
-    let retirement_bytes =
-        matches!(&frame.body, RelayFrameBody::RetirementCommitted(_)).then(|| encode(&frame));
+    let retirement_bytes = matches!(&frame.body, RelayFrameBody::RetirementCommitted(_))
+        .then_some(canonical_frame_bytes);
     match frame.body {
         RelayFrameBody::RetirementCommitted(committed)
             if committed.machine_route == machine_route =>
@@ -2408,9 +2717,20 @@ fn decode_inbound(
         RelayFrameBody::PairData(data) => pairing_bindings
             .accept_data(data)
             .map(InboundDispatch::Pairing),
-        RelayFrameBody::RouteAccepted(accepted) => pairing_bindings
-            .accept_pair_frame(accepted)
-            .map(InboundDispatch::Pairing),
+        RelayFrameBody::RouteAccepted(accepted) => match &accepted.accepted {
+            AcceptedRef::Request { request_route } if !is_zero_request_route(*request_route) => {
+                Ok(InboundDispatch::Business {
+                    event: BusinessTransportEvent::RouteAccepted(accepted),
+                    encoded_len,
+                })
+            }
+            AcceptedRef::PairFrame { .. } => pairing_bindings
+                .accept_pair_frame(accepted)
+                .map(InboundDispatch::Pairing),
+            AcceptedRef::Request { .. } | AcceptedRef::StreamFrame { .. } => {
+                Err(RemoteTransportError::FrameForbidden)
+            }
+        },
         RelayFrameBody::PairRouteClosed(closed) => pairing_bindings
             .accept_closed(closed)
             .map(InboundDispatch::Pairing),
@@ -2420,6 +2740,15 @@ fn decode_inbound(
         RelayFrameBody::RevocationCommitted(committed) => pairing_bindings
             .accept_revocation(committed)
             .map(InboundDispatch::Pairing),
+        RelayFrameBody::Send(send)
+            if !is_zero_device_route(send.device_route)
+                && !is_zero_request_route(send.request_route) =>
+        {
+            Ok(InboundDispatch::Business {
+                event: BusinessTransportEvent::Send(send),
+                encoded_len,
+            })
+        }
         _ => Err(RemoteTransportError::FrameForbidden),
     }
 }
@@ -2431,11 +2760,13 @@ impl RemoteTransport {
         authenticator: Arc<MachineLinkAuthenticator>,
         start_permit: Option<RemoteStartPermit>,
     ) -> Self {
-        let (supervisor, pairing_lane) = ControlSupervisor::start(machine_route, session);
+        let (supervisor, pairing_lane, business_lane) =
+            ControlSupervisor::start(machine_route, session);
         Self {
             machine_route,
             supervisor: Some(supervisor),
             pairing_lane: Some(pairing_lane),
+            business_lane: Some(business_lane),
             authenticator: Some(authenticator),
             start_permit,
         }
@@ -2503,6 +2834,26 @@ impl RemoteTransport {
         response_rx
             .await
             .map_err(|_| RemoteTransportError::Closed)?
+    }
+
+    /// 原子领取唯一 MachineLink supervisor 上的 bounded business lane。
+    /// 未领取或 lane drop 后收到业务 frame 都会关闭当前 transport generation。
+    #[allow(dead_code)] // 下一内部子片由 RemoteLink composition 领取。
+    pub(crate) fn take_business_lane(
+        &mut self,
+    ) -> Result<BusinessTransportLane, RemoteTransportError> {
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or(RemoteTransportError::Closed)?;
+        let lane = self
+            .business_lane
+            .as_ref()
+            .ok_or(RemoteTransportError::BusinessLaneUnavailable)?;
+        supervisor.activate_business(lane)?;
+        self.business_lane
+            .take()
+            .ok_or(RemoteTransportError::BusinessLaneUnavailable)
     }
 
     /// 原子取出同一 transport generation 的唯一 pairing lane 与 Weak authority。
@@ -2618,6 +2969,7 @@ impl RemoteTransport {
     pub async fn shutdown(&mut self) {
         shutdown_supervisor_and_owner(&mut self.supervisor, &mut self.authenticator).await;
         self.pairing_lane = None;
+        self.business_lane = None;
         self.start_permit = None;
     }
 
@@ -2680,17 +3032,31 @@ impl fmt::Debug for RemoteTransport {
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // link compile-RED fixture consumes flush controls in the next internal slice.
 pub(super) struct RemoteTransportTestHarness {
     incoming_tx: mpsc::Sender<Result<Option<OpaqueRouteFrame>, RelayClientError>>,
     sent: Arc<Mutex<Vec<OpaqueRouteFrame>>>,
     reconnects: Arc<std::sync::atomic::AtomicUsize>,
+    received: Arc<std::sync::atomic::AtomicUsize>,
+    send_started: Arc<std::sync::atomic::AtomicUsize>,
+    send_ready: watch::Sender<bool>,
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // link compile-RED fixture consumes flush controls in the next internal slice.
 impl RemoteTransportTestHarness {
     pub(super) async fn push_frame(&self, frame: OpaqueRouteFrame) {
         self.incoming_tx
             .send(Ok(Some(frame)))
+            .await
+            .expect("test control session remains open");
+    }
+
+    pub(super) async fn push_error(&self, code: &str) {
+        self.incoming_tx
+            .send(Err(RelayClientError::Failure {
+                code: code.to_owned(),
+            }))
             .await
             .expect("test control session remains open");
     }
@@ -2705,6 +3071,29 @@ impl RemoteTransportTestHarness {
     pub(super) fn reconnect_count(&self) -> usize {
         self.reconnects.load(Ordering::SeqCst)
     }
+
+    pub(super) fn received_count(&self) -> usize {
+        self.received.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn sent_frames(&self) -> Vec<OpaqueRouteFrame> {
+        self.sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(super) fn send_started_count(&self) -> usize {
+        self.send_started.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn hold_send_flush(&self) {
+        self.send_ready.send_replace(false);
+    }
+
+    pub(super) fn release_send_flush(&self) {
+        self.send_ready.send_replace(true);
+    }
 }
 
 #[cfg(test)]
@@ -2712,12 +3101,24 @@ struct ChannelControlSession {
     incoming_rx: mpsc::Receiver<Result<Option<OpaqueRouteFrame>, RelayClientError>>,
     sent: Arc<Mutex<Vec<OpaqueRouteFrame>>>,
     reconnects: Arc<std::sync::atomic::AtomicUsize>,
+    received: Arc<std::sync::atomic::AtomicUsize>,
+    send_started: Arc<std::sync::atomic::AtomicUsize>,
+    send_ready: watch::Receiver<bool>,
 }
 
 #[cfg(test)]
 #[async_trait]
 impl ControlSession for ChannelControlSession {
     async fn send(&mut self, frame: OpaqueRouteFrame) -> Result<(), RelayClientError> {
+        self.send_started.fetch_add(1, Ordering::SeqCst);
+        while !*self.send_ready.borrow() {
+            self.send_ready
+                .changed()
+                .await
+                .map_err(|_| RelayClientError::Failure {
+                    code: "relay.client.connection_closed".to_owned(),
+                })?;
+        }
         self.sent
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2726,7 +3127,11 @@ impl ControlSession for ChannelControlSession {
     }
 
     async fn next(&mut self) -> Result<Option<OpaqueRouteFrame>, RelayClientError> {
-        self.incoming_rx.recv().await.unwrap_or(Ok(None))
+        let frame = self.incoming_rx.recv().await.unwrap_or(Ok(None));
+        if matches!(frame, Ok(Some(_))) {
+            self.received.fetch_add(1, Ordering::SeqCst);
+        }
+        frame
     }
 
     async fn reconnect(&mut self) -> Result<(), RelayClientError> {
@@ -2748,17 +3153,26 @@ pub(super) fn active_pairing_transport_for_test(
     let (incoming_tx, incoming_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
     let sent = Arc::new(Mutex::new(Vec::new()));
     let reconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let send_started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (send_ready, send_ready_rx) = watch::channel(true);
     let harness = Arc::new(RemoteTransportTestHarness {
         incoming_tx,
         sent: Arc::clone(&sent),
         reconnects: Arc::clone(&reconnects),
+        received: Arc::clone(&received),
+        send_started: Arc::clone(&send_started),
+        send_ready,
     });
-    let (mut supervisor, lane) = ControlSupervisor::start(
+    let (mut supervisor, lane, business_lane) = ControlSupervisor::start(
         machine_route,
         Box::new(ChannelControlSession {
             incoming_rx,
             sent,
             reconnects,
+            received,
+            send_started,
+            send_ready: send_ready_rx,
         }),
     );
     supervisor
@@ -2769,6 +3183,7 @@ pub(super) fn active_pairing_transport_for_test(
             machine_route,
             supervisor: Some(supervisor),
             pairing_lane: None,
+            business_lane: Some(business_lane),
             authenticator: None,
             start_permit: None,
         },
@@ -4126,7 +4541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_business_family_is_forbidden_closed_and_never_dispatched() {
+    async fn untaken_business_lane_and_forbidden_families_fail_closed_without_dispatch() {
         let device_route = DeviceRouteId::from_bytes([0x81; 16]);
         let request_route = RequestRouteId::from_bytes([0x82; 16]);
         let stream_route = StreamRouteId::from_bytes([0x83; 16]);
@@ -4140,66 +4555,99 @@ mod tests {
             trust_epoch: TrustEpoch::new(4),
             signature: Ed25519Signature([0x86; 64]),
         };
-        let forbidden = vec![
-            frame(RelayFrameBody::RouteAccepted(RouteAccepted {
-                accepted: AcceptedRef::Request { request_route },
-            })),
-            frame(RelayFrameBody::Send(Send {
-                device_route,
-                request_route,
-                sealed_blob: SealedBlob(vec![1]),
-            })),
-            frame(RelayFrameBody::Reply(Reply {
-                device_route,
-                request_route,
-                sealed_blob: SealedBlob(vec![2]),
-            })),
-            frame(RelayFrameBody::Publish(Publish {
-                stream_route,
-                generation,
-                stream_seq: 0,
-                sealed_blob: SealedBlob(vec![3]),
-            })),
-            frame(RelayFrameBody::PairData(PairData {
-                pair_route,
-                sealed_blob: SealedBlob(vec![4]),
-            })),
-            frame(RelayFrameBody::GrantCommitted(GrantCommitted {
-                device_route,
-                grant_serial: GrantSerial::new(2),
-                grant_hash: [0x87; 32],
-            })),
-            frame(RelayFrameBody::RevocationCommitted(RevocationCommitted {
-                device_route,
-                grant_serial: GrantSerial::new(2),
-                signed_revocation: revocation,
-            })),
-            frame(RelayFrameBody::Ping(Ping { nonce: 7 })),
-            frame(RelayFrameBody::Error(RelayFailure::new(
-                "UNSAFE CODE",
-                "secret",
-            ))),
-            frame(RelayFrameBody::RetirementCommitted(RetirementCommitted {
-                machine_route: MachineRouteId::from_bytes([0x99; 16]),
-                trust_epoch: TrustEpoch::new(4),
-                retire_hash: [0x88; 32],
-            })),
-            OpaqueRouteFrame {
-                version: RELAY_PROTOCOL_VERSION + 1,
-                body: RelayFrameBody::ServerRestarting(ServerRestarting {
-                    drain_deadline_ms: 1,
-                }),
-            },
+        let cases = vec![
+            (
+                frame(RelayFrameBody::RouteAccepted(RouteAccepted {
+                    accepted: AcceptedRef::Request { request_route },
+                })),
+                "remote.transport.business_lane_unavailable",
+            ),
+            (
+                frame(RelayFrameBody::Send(Send {
+                    device_route,
+                    request_route,
+                    sealed_blob: SealedBlob(vec![1]),
+                })),
+                "remote.transport.business_lane_unavailable",
+            ),
+            (
+                frame(RelayFrameBody::Reply(Reply {
+                    device_route,
+                    request_route,
+                    sealed_blob: SealedBlob(vec![2]),
+                })),
+                "remote.transport.frame_forbidden",
+            ),
+            (
+                frame(RelayFrameBody::Publish(Publish {
+                    stream_route,
+                    generation,
+                    stream_seq: 0,
+                    sealed_blob: SealedBlob(vec![3]),
+                })),
+                "remote.transport.frame_forbidden",
+            ),
+            (
+                frame(RelayFrameBody::PairData(PairData {
+                    pair_route,
+                    sealed_blob: SealedBlob(vec![4]),
+                })),
+                "remote.transport.frame_forbidden",
+            ),
+            (
+                frame(RelayFrameBody::GrantCommitted(GrantCommitted {
+                    device_route,
+                    grant_serial: GrantSerial::new(2),
+                    grant_hash: [0x87; 32],
+                })),
+                "remote.transport.frame_forbidden",
+            ),
+            (
+                frame(RelayFrameBody::RevocationCommitted(RevocationCommitted {
+                    device_route,
+                    grant_serial: GrantSerial::new(2),
+                    signed_revocation: revocation,
+                })),
+                "remote.transport.frame_forbidden",
+            ),
+            (
+                frame(RelayFrameBody::Ping(Ping { nonce: 7 })),
+                "remote.transport.frame_forbidden",
+            ),
+            (
+                frame(RelayFrameBody::Error(RelayFailure::new(
+                    "UNSAFE CODE",
+                    "secret",
+                ))),
+                "remote.transport.frame_forbidden",
+            ),
+            (
+                frame(RelayFrameBody::RetirementCommitted(RetirementCommitted {
+                    machine_route: MachineRouteId::from_bytes([0x99; 16]),
+                    trust_epoch: TrustEpoch::new(4),
+                    retire_hash: [0x88; 32],
+                })),
+                "remote.transport.frame_forbidden",
+            ),
+            (
+                OpaqueRouteFrame {
+                    version: RELAY_PROTOCOL_VERSION + 1,
+                    body: RelayFrameBody::ServerRestarting(ServerRestarting {
+                        drain_deadline_ms: 1,
+                    }),
+                },
+                "remote.transport.frame_forbidden",
+            ),
         ];
 
-        for frame in forbidden {
+        for (frame, expected_code) in cases {
             let mut fixture = connected_fixture(vec![frame], None).await;
             let error = fixture
                 .transport
                 .next_control()
                 .await
                 .expect_err("business or malformed frame must fail closed");
-            assert_eq!(error.code(), "remote.transport.frame_forbidden");
+            assert_eq!(error.code(), expected_code);
             assert_eq!(fixture.harness.shutdowns.load(Ordering::SeqCst), 1);
             assert_eq!(
                 fixture.harness.business_dispatches.load(Ordering::SeqCst),

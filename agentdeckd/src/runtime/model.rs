@@ -7,6 +7,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentdeck_protocol::e2ee::AuthorizationPermissionV1;
+use agentdeck_protocol::relay_v2::{
+    DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId,
+};
 use agentdeck_protocol::runtime::ConversationConfiguration;
 use agentdeck_protocol::runtime::failure::{
     DAEMON_CONVERSATION_CONFIGURATION_CONFLICT, DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
@@ -1001,6 +1005,233 @@ pub struct AcceptCommand {
     pub payload: Vec<u8>,
 }
 
+const REMOTE_COMMAND_AUTHORIZATION_MAGIC: &[u8; 5] = b"ADRA1";
+
+/// ADC2 中冻结的 exact remote authorization。IdempotencyOwner 故意不含 serial，
+/// 以保持 renewal 后 exact retry 稳定；本 binding 则包含执行授权的全部轴。
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct RemoteCommandAuthorizationBinding {
+    machine_trust_domain: [u8; 32],
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+    grant_serial: GrantSerial,
+    device_sign_fingerprint: [u8; 32],
+    authorization_hash: [u8; 32],
+    key_directory_revision: KeyDirectoryRevision,
+    command_key_epoch: u64,
+    permissions: Vec<AuthorizationPermissionV1>,
+}
+
+impl std::fmt::Debug for RemoteCommandAuthorizationBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RemoteCommandAuthorizationBinding([REDACTED])")
+    }
+}
+
+impl RemoteCommandAuthorizationBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        machine_trust_domain: [u8; 32],
+        machine_route: MachineRouteId,
+        device_route: DeviceRouteId,
+        grant_serial: GrantSerial,
+        device_sign_fingerprint: [u8; 32],
+        authorization_hash: [u8; 32],
+        key_directory_revision: KeyDirectoryRevision,
+        command_key_epoch: u64,
+        permissions: Vec<AuthorizationPermissionV1>,
+    ) -> Result<Self, RuntimeStoreError> {
+        let value = Self {
+            machine_trust_domain,
+            machine_route,
+            device_route,
+            grant_serial,
+            device_sign_fingerprint,
+            authorization_hash,
+            key_directory_revision,
+            command_key_epoch,
+            permissions,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) const fn machine_trust_domain(&self) -> [u8; 32] {
+        self.machine_trust_domain
+    }
+
+    pub(crate) const fn machine_route(&self) -> MachineRouteId {
+        self.machine_route
+    }
+
+    pub(crate) const fn device_route(&self) -> DeviceRouteId {
+        self.device_route
+    }
+
+    pub(crate) const fn grant_serial(&self) -> GrantSerial {
+        self.grant_serial
+    }
+
+    pub(crate) const fn device_sign_fingerprint(&self) -> [u8; 32] {
+        self.device_sign_fingerprint
+    }
+
+    pub(crate) const fn authorization_hash(&self) -> [u8; 32] {
+        self.authorization_hash
+    }
+
+    pub(crate) const fn key_directory_revision(&self) -> KeyDirectoryRevision {
+        self.key_directory_revision
+    }
+
+    pub(crate) const fn command_key_epoch(&self) -> u64 {
+        self.command_key_epoch
+    }
+
+    pub(crate) fn permissions(&self) -> &[AuthorizationPermissionV1] {
+        &self.permissions
+    }
+
+    fn permission_bit(permission: AuthorizationPermissionV1) -> u16 {
+        1_u16
+            << match permission {
+                AuthorizationPermissionV1::CatalogRead => 0,
+                AuthorizationPermissionV1::ConversationRead => 1,
+                AuthorizationPermissionV1::ConversationStart => 2,
+                AuthorizationPermissionV1::PromptSend => 3,
+                AuthorizationPermissionV1::CommandCancel => 4,
+                AuthorizationPermissionV1::ApprovalResolve => 5,
+                AuthorizationPermissionV1::ApprovalRetry => 6,
+                AuthorizationPermissionV1::MetadataWrite => 7,
+                AuthorizationPermissionV1::RevokeSelf => 8,
+            }
+    }
+
+    fn permission_mask(&self) -> Result<u16, RuntimeStoreError> {
+        let mut mask = 0_u16;
+        for permission in &self.permissions {
+            let bit = Self::permission_bit(*permission);
+            if mask & bit != 0 {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            mask |= bit;
+        }
+        Ok(mask)
+    }
+
+    fn validate(&self) -> Result<(), RuntimeStoreError> {
+        if self.machine_trust_domain == [0; 32]
+            || self.machine_route.as_bytes() == &[0; 16]
+            || self.device_route.as_bytes() == &[0; 16]
+            || self.grant_serial.value() == 0
+            || self.device_sign_fingerprint == [0; 32]
+            || self.authorization_hash == [0; 32]
+            || self.key_directory_revision.value() == 0
+            || self.command_key_epoch == 0
+            || self.permissions.is_empty()
+            || self.permission_mask()? == 0
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, RuntimeStoreError> {
+        self.validate()?;
+        let mut encoded = Vec::with_capacity(159);
+        encoded.extend_from_slice(REMOTE_COMMAND_AUTHORIZATION_MAGIC);
+        encoded.extend_from_slice(&self.machine_trust_domain);
+        encoded.extend_from_slice(self.machine_route.as_bytes());
+        encoded.extend_from_slice(self.device_route.as_bytes());
+        encoded.extend_from_slice(&self.grant_serial.value().to_be_bytes());
+        encoded.extend_from_slice(&self.device_sign_fingerprint);
+        encoded.extend_from_slice(&self.authorization_hash);
+        encoded.extend_from_slice(&self.key_directory_revision.value().to_be_bytes());
+        encoded.extend_from_slice(&self.command_key_epoch.to_be_bytes());
+        encoded.extend_from_slice(&self.permission_mask()?.to_be_bytes());
+        Ok(encoded)
+    }
+
+    pub(crate) fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, RuntimeStoreError> {
+        if bytes.len() != 159 || bytes.get(..5) != Some(REMOTE_COMMAND_AUTHORIZATION_MAGIC) {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let fixed = |range: std::ops::Range<usize>| {
+            bytes
+                .get(range)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)
+        };
+        let machine_trust_domain = fixed(5..37)?
+            .try_into()
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let machine_route = MachineRouteId::from_bytes(
+            fixed(37..53)?
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        );
+        let device_route = DeviceRouteId::from_bytes(
+            fixed(53..69)?
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        );
+        let grant_serial = GrantSerial::new(u64::from_be_bytes(
+            fixed(69..77)?
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        ));
+        let device_sign_fingerprint = fixed(77..109)?
+            .try_into()
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let authorization_hash = fixed(109..141)?
+            .try_into()
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let key_directory_revision = KeyDirectoryRevision::new(u64::from_be_bytes(
+            fixed(141..149)?
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        ));
+        let command_key_epoch = u64::from_be_bytes(
+            fixed(149..157)?
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        );
+        let mask = u16::from_be_bytes(
+            fixed(157..159)?
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+        );
+        if mask == 0 || mask & !0x01ff != 0 {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let all = [
+            AuthorizationPermissionV1::CatalogRead,
+            AuthorizationPermissionV1::ConversationRead,
+            AuthorizationPermissionV1::ConversationStart,
+            AuthorizationPermissionV1::PromptSend,
+            AuthorizationPermissionV1::CommandCancel,
+            AuthorizationPermissionV1::ApprovalResolve,
+            AuthorizationPermissionV1::ApprovalRetry,
+            AuthorizationPermissionV1::MetadataWrite,
+            AuthorizationPermissionV1::RevokeSelf,
+        ];
+        let permissions = all
+            .into_iter()
+            .filter(|permission| mask & Self::permission_bit(*permission) != 0)
+            .collect();
+        Self::new(
+            machine_trust_domain,
+            machine_route,
+            device_route,
+            grant_serial,
+            device_sign_fingerprint,
+            authorization_hash,
+            key_directory_revision,
+            command_key_epoch,
+            permissions,
+        )
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct CommandRecord {
     pub conversation_id: RuntimeId,
@@ -1019,6 +1250,7 @@ pub struct CommandRecord {
     pub terminal_event_id: Option<RuntimeId>,
     pub payload: Vec<u8>,
     pub result: Option<Vec<u8>>,
+    pub(crate) remote_authorization: Option<RemoteCommandAuthorizationBinding>,
 }
 
 impl std::fmt::Debug for CommandRecord {
@@ -1036,7 +1268,16 @@ impl std::fmt::Debug for CommandRecord {
                 "result_bytes",
                 &self.result.as_ref().map(std::vec::Vec::len),
             )
+            .field("remote_authorization", &self.remote_authorization.is_some())
             .finish()
+    }
+}
+
+impl CommandRecord {
+    pub(crate) fn remote_authorization_binding(
+        &self,
+    ) -> Option<&RemoteCommandAuthorizationBinding> {
+        self.remote_authorization.as_ref()
     }
 }
 

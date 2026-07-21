@@ -41,10 +41,11 @@ use crate::runtime::model::{
     PrepareMachineRetirementOutcome, QueryCommandReceipt, RUNTIME_STORE_SHUTDOWN_GRACE_MS,
     RecordMachineRetirementTerminalOutcome, RecordRootLostMachinePurgeOutcome,
     RecordValidatedEnrollmentResponseOutcome, RecoveryCompletion, RecoveryCursor, RecoveryPage,
-    RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery, RuntimeStoreConfig,
-    RuntimeStoreError, RuntimeStoreLane, RuntimeStoreOperation, RuntimeStoreSnapshot, StartCommand,
-    StartOutcome, TerminateAcceptedCommand, TerminateAcceptedOutcome,
-    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
+    RegisterApproval, RegisterApprovalOutcome, RemoteCommandAuthorizationBinding,
+    RetryApprovalDelivery, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreLane,
+    RuntimeStoreOperation, RuntimeStoreSnapshot, StartCommand, StartOutcome,
+    TerminateAcceptedCommand, TerminateAcceptedOutcome, TerminateStartedBeforeRelease,
+    TerminateStartedBeforeReleaseOutcome,
 };
 use crate::runtime::read_pool::{
     DEFAULT_RUNTIME_READ_CONCURRENCY, MAX_RUNTIME_READ_PAGE_BYTES, ReadMemoryLease, ReadPool,
@@ -81,9 +82,9 @@ use super::stream::{
 use super::{
     AuthenticatedConversationSnapshotContext, PreparedConversationSnapshotWrite, SnapshotOrigin,
     StoreConversationSnapshotError, admin, approval, journal, machine_identity, machine_remote,
-    native_projection, pairing, pairing_delivery, pairing_grant, pairing_grant_allocation,
-    pairing_grant_commit, pairing_grant_tx, pairing_receipt_retention, pairing_revocation,
-    pairing_revocation_ack, pairing_terminal, sqlite, stream,
+    native_projection, pairing, pairing_authorization, pairing_delivery, pairing_grant,
+    pairing_grant_allocation, pairing_grant_commit, pairing_grant_tx, pairing_receipt_retention,
+    pairing_revocation, pairing_revocation_ack, pairing_terminal, sqlite, stream,
 };
 
 mod stream_pipeline;
@@ -822,6 +823,11 @@ impl RuntimeStoreHandle {
         self.identity_derivation.derive_machine_trust_domain()
     }
 
+    #[cfg(test)]
+    pub(crate) fn machine_trust_domain_for_test(&self) -> Result<[u8; 32], RuntimeStoreError> {
+        self.machine_trust_domain()
+    }
+
     /// 只供 daemon-private machine re-enrollment 把新 Keychain guard 绑定到
     /// 已认证 Store 实例；不是 wire/database locator API。
     pub(crate) const fn authenticated_database_id(&self) -> [u8; 16] {
@@ -1380,6 +1386,114 @@ impl RuntimeStoreHandle {
             &self.lifecycle,
             RuntimeStoreLane::Read,
             |reply| ReadCommand::LoadGlobalKeyState { reply },
+        )
+        .await?
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn align_active_authorization_revision_for_test(
+        &self,
+        device_route: agentdeck_protocol::relay_v2::DeviceRouteId,
+    ) -> Result<agentdeck_protocol::relay_v2::KeyDirectoryRevision, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::AlignActiveAuthorizationRevisionForTest {
+                device_route,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    /// 只读签发与 authenticated Active grant/key-directory exact 绑定的 ingress proof。
+    #[allow(dead_code, reason = "同一 P4.4 Task 的 RemoteLink ingress slice 消费")]
+    pub(crate) async fn load_active_remote_ingress(
+        &self,
+        machine_route: agentdeck_protocol::relay_v2::MachineRouteId,
+        device_route: agentdeck_protocol::relay_v2::DeviceRouteId,
+    ) -> Result<pairing_authorization::ActiveRemoteIngressProof, RuntimeStoreError> {
+        let machine_trust_domain = self.machine_trust_domain()?;
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadActiveRemoteIngress {
+                machine_trust_domain,
+                machine_route,
+                device_route,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    /// 仅用于在 local durable revoke 前建立 shared Core lease 的 exact Active proof。
+    /// 这样 restart/no-connection revoke 仍 fail-close，RuntimeCore 也不取得 Relay state。
+    pub(crate) async fn load_active_remote_ingress_for_revoke(
+        &self,
+        device: &DeviceHandle,
+        grant_serial: RuntimeGrantSerial,
+    ) -> Result<Option<pairing_authorization::ActiveRemoteIngressProof>, RuntimeStoreError> {
+        let machine_trust_domain = self.machine_trust_domain()?;
+        let device = device.clone();
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadActiveRemoteIngressForRevoke {
+                machine_trust_domain,
+                device,
+                grant_serial,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    /// crypto/replay 全链完成后的第二次 exact Active 复核。proof 若来自其它 Store、
+    /// 已被 renewal/revoke 替换或 key-directory 已变化，一律拒绝。
+    #[allow(
+        dead_code,
+        reason = "同一 P4.4 Task 的 RemoteLink final recheck slice 消费"
+    )]
+    pub(crate) async fn recheck_active_remote_ingress(
+        &self,
+        proof: &pairing_authorization::ActiveRemoteIngressProof,
+    ) -> Result<pairing_authorization::CurrentRemoteAuthorizationProof, RuntimeStoreError> {
+        let machine_trust_domain = self.machine_trust_domain()?;
+        let proof = proof.clone();
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::RecheckActiveRemoteIngress {
+                machine_trust_domain,
+                proof,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn classify_remote_command_authorization(
+        &self,
+        binding: &RemoteCommandAuthorizationBinding,
+    ) -> Result<pairing_authorization::RemoteCommandAuthorizationStatus, RuntimeStoreError> {
+        let machine_trust_domain = self.machine_trust_domain()?;
+        let binding = binding.clone();
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ClassifyRemoteCommandAuthorization {
+                machine_trust_domain,
+                binding,
+                reply,
+            },
         )
         .await?
     }
@@ -2202,7 +2316,7 @@ impl RuntimeStoreHandle {
         &self,
         input: AcceptCommand,
     ) -> Result<AcceptOutcome, RuntimeStoreError> {
-        let charge = accept_command_memory_charge(&input)?;
+        let charge = accept_command_memory_charge(&input, None)?;
         dispatch_with_budget(
             &self.normal_tx,
             &self.normal_budget,
@@ -2211,6 +2325,7 @@ impl RuntimeStoreHandle {
             charge,
             |reply| NormalCommand::AcceptCommand {
                 input,
+                remote_authorization: None,
                 reply: AcceptCommandReply::Direct(reply),
             },
         )
@@ -2223,8 +2338,9 @@ impl RuntimeStoreHandle {
         &self,
         input: AcceptCommand,
         authorization: AuthorizationGuard,
+        remote_authorization: Option<RemoteCommandAuthorizationBinding>,
     ) -> Result<AuthorizedAcceptOutcome, RuntimeStoreError> {
-        let charge = accept_command_memory_charge(&input)?;
+        let charge = accept_command_memory_charge(&input, remote_authorization.as_ref())?;
         dispatch_with_budget(
             &self.normal_tx,
             &self.normal_budget,
@@ -2233,10 +2349,34 @@ impl RuntimeStoreHandle {
             charge,
             |reply| NormalCommand::AcceptCommand {
                 input,
+                remote_authorization,
                 reply: AcceptCommandReply::Authorized {
                     authorization,
                     reply,
                 },
+            },
+        )
+        .await?
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn accept_remote_command_authorized(
+        &self,
+        input: AcceptCommand,
+        proof: &pairing_authorization::CurrentRemoteAuthorizationProof,
+    ) -> Result<AcceptOutcome, RuntimeStoreError> {
+        let remote_authorization = proof.command_authorization_binding()?;
+        let charge = accept_command_memory_charge(&input, Some(&remote_authorization))?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::AcceptCommand {
+                input,
+                remote_authorization: Some(remote_authorization),
+                reply: AcceptCommandReply::Direct(reply),
             },
         )
         .await?
@@ -2744,7 +2884,10 @@ async fn await_shutdown_quiescence(
     }
 }
 
-fn accept_command_memory_charge(input: &AcceptCommand) -> Result<u32, RuntimeStoreError> {
+fn accept_command_memory_charge(
+    input: &AcceptCommand,
+    remote_authorization: Option<&RemoteCommandAuthorizationBinding>,
+) -> Result<u32, RuntimeStoreError> {
     if input.idempotency_key.is_empty() || input.idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
         return Err(RuntimeStoreError::InvalidConfig(
             "idempotency key must contain 1 to 1024 UTF-8 bytes",
@@ -2753,7 +2896,11 @@ fn accept_command_memory_charge(input: &AcceptCommand) -> Result<u32, RuntimeSto
     validate_maximum(input.payload.len(), MAX_COMMAND_PAYLOAD_BYTES)?;
     memory_charge(
         size_of::<NormalCommand>(),
-        &[input.idempotency_key.capacity(), input.payload.capacity()],
+        &[
+            input.idempotency_key.capacity(),
+            input.payload.capacity(),
+            remote_authorization.map_or(0, |binding| binding.permissions().len()),
+        ],
     )
 }
 
@@ -2943,6 +3090,7 @@ enum NormalCommand {
     },
     AcceptCommand {
         input: AcceptCommand,
+        remote_authorization: Option<RemoteCommandAuthorizationBinding>,
         reply: AcceptCommandReply,
     },
     StartCommand {
@@ -3239,6 +3387,13 @@ enum SafetyCommand {
         blob_sha256: [u8; 32],
         reply: oneshot::Sender<Result<PublicationAcknowledgement, RuntimeStoreError>>,
     },
+    #[cfg(test)]
+    AlignActiveAuthorizationRevisionForTest {
+        device_route: agentdeck_protocol::relay_v2::DeviceRouteId,
+        reply: oneshot::Sender<
+            Result<agentdeck_protocol::relay_v2::KeyDirectoryRevision, RuntimeStoreError>,
+        >,
+    },
 }
 
 enum ReadCommand {
@@ -3320,6 +3475,38 @@ enum ReadCommand {
     #[allow(dead_code)] // P4 grant builder consumes the daemon-private singleton.
     LoadGlobalKeyState {
         reply: oneshot::Sender<Result<Option<pairing_grant::GlobalKeyStateV1>, RuntimeStoreError>>,
+    },
+    #[allow(dead_code)]
+    LoadActiveRemoteIngress {
+        machine_trust_domain: [u8; 32],
+        machine_route: agentdeck_protocol::relay_v2::MachineRouteId,
+        device_route: agentdeck_protocol::relay_v2::DeviceRouteId,
+        reply: oneshot::Sender<
+            Result<pairing_authorization::ActiveRemoteIngressProof, RuntimeStoreError>,
+        >,
+    },
+    LoadActiveRemoteIngressForRevoke {
+        machine_trust_domain: [u8; 32],
+        device: DeviceHandle,
+        grant_serial: RuntimeGrantSerial,
+        reply: oneshot::Sender<
+            Result<Option<pairing_authorization::ActiveRemoteIngressProof>, RuntimeStoreError>,
+        >,
+    },
+    #[allow(dead_code)]
+    RecheckActiveRemoteIngress {
+        machine_trust_domain: [u8; 32],
+        proof: pairing_authorization::ActiveRemoteIngressProof,
+        reply: oneshot::Sender<
+            Result<pairing_authorization::CurrentRemoteAuthorizationProof, RuntimeStoreError>,
+        >,
+    },
+    ClassifyRemoteCommandAuthorization {
+        machine_trust_domain: [u8; 32],
+        binding: RemoteCommandAuthorizationBinding,
+        reply: oneshot::Sender<
+            Result<pairing_authorization::RemoteCommandAuthorizationStatus, RuntimeStoreError>,
+        >,
     },
     #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
     ListPairingTerminalRecovery {
@@ -3882,9 +4069,14 @@ fn handle_normal(
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             let _ = reply.send(result);
         }
-        NormalCommand::AcceptCommand { input, reply } => {
+        NormalCommand::AcceptCommand {
+            input,
+            remote_authorization,
+            reply,
+        } => {
             let mut effects = CommandStreamEffects::default();
-            let result = journal::accept_command(state, config, input, &mut effects);
+            let result =
+                journal::accept_command(state, config, input, remote_authorization, &mut effects);
             let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
             reply.send(result);
         }
@@ -4176,6 +4368,10 @@ fn handle_safety(
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
             SafetyCommand::AcknowledgePublicationDelivery { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            #[cfg(test)]
+            SafetyCommand::AlignActiveAuthorizationRevisionForTest { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
         }
@@ -4557,6 +4753,20 @@ fn handle_safety(
                 });
             let _ = reply.send(result);
         }
+        #[cfg(test)]
+        SafetyCommand::AlignActiveAuthorizationRevisionForTest {
+            device_route,
+            reply,
+        } => {
+            let _ = reply.send(
+                pairing_authorization::align_active_authorization_revision_for_test(
+                    &mut state.connection,
+                    &state.key_bundle,
+                    state.database_id,
+                    device_route,
+                ),
+            );
+        }
     }
     drop(memory_permit);
 }
@@ -4724,6 +4934,66 @@ fn handle_read(
                 &state.key_bundle,
                 state.database_id,
             ));
+        }
+        ReadCommand::LoadActiveRemoteIngress {
+            machine_trust_domain,
+            machine_route,
+            device_route,
+            reply,
+        } => {
+            let _ = reply.send(pairing_authorization::load_active_remote_ingress(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+                machine_trust_domain,
+                machine_route,
+                device_route,
+            ));
+        }
+        ReadCommand::LoadActiveRemoteIngressForRevoke {
+            machine_trust_domain,
+            device,
+            grant_serial,
+            reply,
+        } => {
+            let _ = reply.send(
+                pairing_authorization::load_active_remote_ingress_for_revoke(
+                    &state.connection,
+                    &state.key_bundle,
+                    state.database_id,
+                    machine_trust_domain,
+                    &device,
+                    grant_serial,
+                ),
+            );
+        }
+        ReadCommand::RecheckActiveRemoteIngress {
+            machine_trust_domain,
+            proof,
+            reply,
+        } => {
+            let _ = reply.send(pairing_authorization::recheck_active_remote_ingress(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+                machine_trust_domain,
+                &proof,
+            ));
+        }
+        ReadCommand::ClassifyRemoteCommandAuthorization {
+            machine_trust_domain,
+            binding,
+            reply,
+        } => {
+            let _ = reply.send(
+                pairing_authorization::classify_remote_command_authorization(
+                    &state.connection,
+                    &state.key_bundle,
+                    state.database_id,
+                    machine_trust_domain,
+                    &binding,
+                ),
+            );
         }
         ReadCommand::ListPairingTerminalRecovery { reply } => {
             let _ = reply.send(pairing_terminal::list_pairing_terminal_recovery(

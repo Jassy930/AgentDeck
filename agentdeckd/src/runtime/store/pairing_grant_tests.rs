@@ -12,9 +12,10 @@ use agentdeck_crypto::{
     seal_pair_response, sha256, sign_device_authorization, sign_key_directory, sign_tbs,
 };
 use agentdeck_protocol::e2ee::{
-    DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1, KeyDirectoryV1,
-    KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind,
-    PairResponseInfoV1, PairResponsePlaintextV1,
+    AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
+    E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyUpdateInfoV1,
+    MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairResponseInfoV1,
+    PairResponsePlaintextV1,
 };
 use agentdeck_protocol::relay_v2::{
     DeviceRouteId, Ed25519Signature, GrantSerial, RELAY_PROTOCOL_VERSION, RelayGrant, RootKeyId,
@@ -33,6 +34,7 @@ use super::pairing_terminal::{PairingTerminalAction, PairingTerminalizeOutcome};
 use super::pairing_tests::{
     DeterministicRng, GenerousCapacity, NOW_MS, OneShotFault, TestClock, TestRoot, artifact_bytes,
     make_active, pending_envelope, prepare_unused_pairing, verified_request,
+    verified_request_with_authorization,
 };
 use super::sqlite::RuntimeLedger;
 
@@ -273,6 +275,54 @@ pub(super) async fn awaiting_pairing(
         "grant-confirm",
     )
     .await
+}
+
+pub(super) async fn awaiting_pairing_with_authorization(
+    store: &RuntimeStoreHandle,
+    binding: &crate::runtime::store::MachineIdentityBinding,
+    data_cert: &agentdeck_protocol::relay_v2::SignedCertificate,
+    capabilities: Vec<AuthorizationCapabilityV1>,
+    permissions: Vec<AuthorizationPermissionV1>,
+) -> PairingGrantPreparation {
+    let (pairing_id, invite) = prepare_unused_pairing(
+        store,
+        binding,
+        data_cert,
+        agentdeck_protocol::relay_v2::PairRouteId::from_bytes([0xa1; 16]),
+        0xa2,
+        0xa3,
+        "grant-confirm-authorized",
+    )
+    .await;
+    let verified = verified_request_with_authorization(
+        &invite,
+        0xa3,
+        0xa4,
+        0xa5,
+        0xa6,
+        capabilities,
+        permissions,
+    );
+    let request_hash = verified.request_hash();
+    store
+        .accept_pair_request(AcceptPairRequest::new(pairing_id, verified))
+        .await
+        .expect("accept authorized request");
+    store
+        .commit_pair_pending(CommitPairPending::new(
+            pairing_id,
+            request_hash,
+            pending_envelope(0xa7),
+        ))
+        .await
+        .expect("commit authorized pending");
+    store
+        .load_pairing_invite(pairing_id)
+        .await
+        .expect("load authorized awaiting pairing")
+        .expect("authorized pairing exists")
+        .into_grant_preparation()
+        .expect("authenticated authorized preparation")
 }
 
 #[allow(clippy::too_many_arguments)]

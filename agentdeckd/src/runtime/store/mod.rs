@@ -27,12 +27,22 @@ mod native_projection_lifecycle_tests;
 )]
 pub(crate) mod pairing;
 mod pairing_authorization;
+#[allow(
+    unused_imports,
+    reason = "P4.4 RemoteLink 与 P4.5 publisher 在后续同阶段 slice 消费这些 capability"
+)]
+pub(crate) use pairing_authorization::{
+    ActiveRemoteIngressProof, CurrentRemoteAuthorizationProof, RemoteCommandAuthorizationStatus,
+    RemotePrincipalRegistration, RemoteReplyAuthorization,
+};
 mod pairing_delivery;
 #[cfg(test)]
 mod pairing_delivery_tests;
 #[cfg(test)]
 pub(crate) use pairing_delivery_tests::{
-    active_authorization_store_for_test, revoking_authorization_store_for_test,
+    active_authorization_store_for_test, active_authorization_store_with_permissions_for_test,
+    revoking_authorization_store_for_test,
+    two_active_authorization_store_with_permissions_for_test,
 };
 pub(crate) mod pairing_grant;
 mod pairing_grant_allocation;
@@ -94,6 +104,8 @@ mod persisted_event;
 mod publication;
 pub mod queue;
 mod recovery;
+#[cfg(test)]
+mod remote_ingress_tests;
 pub(crate) mod retention;
 mod schema;
 pub(crate) mod sequence;

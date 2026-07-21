@@ -742,9 +742,10 @@ async fn blocked_conversation_does_not_globally_block_healthy_queue() {
 }
 
 #[tokio::test]
-async fn runtime_core_rejects_remote_accepted_before_installing_any_actor() {
-    // 威胁场景：P4 durable auth ledger 尚未接线，重启若仅凭 durable owner 近似
-    // 恢复 remote Accepted，会绕过原 grant serial/revocation lease 继续执行。
+async fn runtime_core_isolates_unprovable_remote_accepted_without_blocking_startup() {
+    // 旧 ADC1 remote owner 没有可向当前 auth ledger 证明的 binding。恢复必须把
+    // 该 conversation 持久化为 RecoveryBlocked 且不调度 Accepted，但不能再把
+    // conversation-scoped 故障扩大成整个 RuntimeCore startup 失败。
     let root = TestRoot::new("remote-auth-ledger");
     let staging_store = root.store().await;
     let conversation_id = runtime_id(RuntimeIdKind::Conversation, 0xA1);
@@ -776,13 +777,14 @@ async fn runtime_core_rejects_remote_accepted_before_installing_any_actor() {
     let store = root.store().await;
     let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
     let core = RuntimeCore::new(store, router, [0xA4; 32]).expect("construct recovery core");
-    let failure = core
+    let (report, _permit) = core
         .recover_for_startup()
         .await
-        .expect_err("remote Accepted must block startup before P4 auth ledger");
+        .expect("unprovable remote Accepted is isolated per conversation");
+    assert_eq!(report.conversations, 1);
     assert_eq!(
-        failure.code,
-        agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_RECOVERY_BLOCKED
+        report.accepted_commands, 0,
+        "RecoveryBlocked remote command must never reach an execution actor"
     );
     core.shutdown()
         .await

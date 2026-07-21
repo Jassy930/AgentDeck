@@ -415,6 +415,27 @@ pub(super) fn verified_request(
     device_hpke_seed: u8,
     rng_seed: u8,
 ) -> VerifiedPairRequestV1 {
+    verified_request_with_authorization(
+        canonical_invite,
+        invite_private_seed,
+        device_sign_seed,
+        device_hpke_seed,
+        rng_seed,
+        vec![AuthorizationCapabilityV1::Catalog],
+        vec![AuthorizationPermissionV1::CatalogRead],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verified_request_with_authorization(
+    canonical_invite: &[u8],
+    invite_private_seed: u8,
+    device_sign_seed: u8,
+    device_hpke_seed: u8,
+    rng_seed: u8,
+    capabilities: Vec<AuthorizationCapabilityV1>,
+    permissions: Vec<AuthorizationPermissionV1>,
+) -> VerifiedPairRequestV1 {
     let invite = PairInviteV1::from_canonical_bytes(canonical_invite).expect("parse invite");
     let invite_private =
         HpkePrivateKey::from_bytes(&[invite_private_seed; 32]).expect("invite private key");
@@ -433,8 +454,8 @@ pub(super) fn verified_request(
         authorization_request: AuthorizationRequestV1 {
             format_version: E2EE_FORMAT_VERSION,
             device_display_name: "Remote CLI".to_owned(),
-            capabilities: vec![AuthorizationCapabilityV1::Catalog],
-            permissions: vec![AuthorizationPermissionV1::CatalogRead],
+            capabilities,
+            permissions,
         },
     };
     let info = request_info(&invite);

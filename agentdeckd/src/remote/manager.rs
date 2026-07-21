@@ -5,7 +5,7 @@
 //! [`RemoteStartPermit`] 才能 arm。所有失败只阻断 remote，本地 Runtime 继续服务。
 
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentdeck_protocol::relay_v2::{
@@ -37,7 +37,7 @@ use crate::runtime::store::{
 };
 use crate::runtime::{
     PairingAdministration, PairingAdministrationError, PairingPendingSink,
-    RevocationAdministration, RevocationAdministrationError,
+    RevocationAdministration, RevocationAdministrationError, RuntimeCore,
 };
 use crate::security::KeyStore;
 
@@ -49,6 +49,10 @@ use super::config::{
     EnrollmentConfigError, ValidatedEnrollmentConfig, validate_sealed_relay_connection,
 };
 use super::enrollment::{FrozenMachineEnrollment, MachineEnrollmentError};
+use super::link::{
+    DirectedReplySealer, RemoteLinkOwner, RemoteStreamPublisher, UnavailableDirectedReplySealer,
+    UnavailableRemoteStreamPublisher,
+};
 #[cfg(test)]
 use super::pairing::await_pairing_startup;
 use super::pairing::{
@@ -261,6 +265,9 @@ pub struct RemoteManager {
     purge_plan_sink: Arc<dyn PurgePlanSink>,
     enrollment_workflow: MachineEnrollmentWorkflow,
     pairing_pending_sink: OnceLock<Arc<dyn PairingPendingSink>>,
+    runtime_core: OnceLock<Weak<RuntimeCore>>,
+    reply_sealer: Arc<dyn DirectedReplySealer>,
+    stream_publisher: Arc<dyn RemoteStreamPublisher>,
     shutdown_tx: watch::Sender<bool>,
     trust_reset_singleflight: Mutex<()>,
     #[cfg(test)]
@@ -283,6 +290,7 @@ struct RemoteManagerState {
     identity: Option<Box<ActiveMachineIdentity>>,
     start_permit: Option<RemoteStartPermit>,
     transport: Option<RemoteTransport>,
+    link: Option<RemoteLinkOwner>,
     pairing: Option<PairingCoordinatorOwner>,
     #[cfg(test)]
     pairing_handle_for_test: Option<super::pairing::PairingCoordinatorHandle>,
@@ -320,6 +328,9 @@ impl RemoteManager {
             purge_plan_sink,
             enrollment_workflow: MachineEnrollmentWorkflow::new(),
             pairing_pending_sink: OnceLock::new(),
+            runtime_core: OnceLock::new(),
+            reply_sealer: Arc::new(UnavailableDirectedReplySealer),
+            stream_publisher: Arc::new(UnavailableRemoteStreamPublisher),
             shutdown_tx: watch::channel(false).0,
             trust_reset_singleflight: Mutex::new(()),
             #[cfg(test)]
@@ -332,6 +343,7 @@ impl RemoteManager {
                 identity,
                 start_permit: None,
                 transport: None,
+                link: None,
                 pairing: None,
                 #[cfg(test)]
                 pairing_handle_for_test: None,
@@ -351,6 +363,12 @@ impl RemoteManager {
     /// sink 只持 connection registry，不反向持有 Core 或 manager。
     pub fn install_pairing_pending_sink(&self, sink: Arc<dyn PairingPendingSink>) -> bool {
         self.pairing_pending_sink.set(sink).is_ok()
+    }
+
+    /// Core 强持有 manager administration capability，因此这里只安装 Weak，避免
+    /// `RuntimeCore → RemoteManager → RemoteLink → RuntimeCore` 生命周期环。
+    pub fn install_runtime_core(&self, core: &Arc<RuntimeCore>) -> bool {
+        self.runtime_core.set(Arc::downgrade(core)).is_ok()
     }
 
     #[cfg(test)]
@@ -425,6 +443,13 @@ impl RemoteManager {
         self.shutdown_tx.send_replace(true);
         let mut state = self.state.lock().await;
         state.stopped = true;
+        if let Err(error) = stop_remote_link(&mut state).await {
+            crate::diag::log(
+                "remote_link_shutdown",
+                &format!("status=forced code={}", error.code()),
+            );
+            state.link.take();
+        }
         stop_pairing_actor(&mut state).await;
         if let Some(mut transport) = state.transport.take() {
             transport.shutdown().await;
@@ -927,6 +952,7 @@ impl RemoteManager {
         if state.connect_retry.is_some() {
             return Err(admin_error(REMOTE_STATE_CONFLICT));
         }
+        stop_remote_link(state).await?;
         stop_pairing_actor(state).await;
         if let Some(transport) = state.transport.take() {
             let permit = transport
@@ -1008,11 +1034,23 @@ impl RemoteManager {
         .await
         {
             Ok(mut transport) => {
-                let pairing_start = if let Some(data_cert) = data_cert {
-                    self.start_pairing_actor(state, &mut transport, pairing_connection, data_cert)
-                        .await
-                } else {
-                    Ok(())
+                let pairing_start = match data_cert {
+                    Some(data_cert) => {
+                        match self.start_remote_link(state, &mut transport, record.machine_route) {
+                            Ok(()) => {
+                                self.start_pairing_actor(
+                                    state,
+                                    &mut transport,
+                                    pairing_connection,
+                                    data_cert,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    // RetirePending deliberately has no data cert/business link.
+                    None => Ok(()),
                 };
                 state.transport = Some(transport);
                 state.connect_retry = None;
@@ -1048,13 +1086,22 @@ impl RemoteManager {
             Ok(mut transport) => {
                 let pairing_start = match self.store.load_machine_enrollment_state().await? {
                     Some(MachineEnrollmentState::Active(active)) => {
-                        self.start_pairing_actor(
+                        match self.start_remote_link(
                             state,
                             &mut transport,
-                            active.connection,
-                            active.data_cert,
-                        )
-                        .await
+                            active.record.machine_route,
+                        ) {
+                            Ok(()) => {
+                                self.start_pairing_actor(
+                                    state,
+                                    &mut transport,
+                                    active.connection,
+                                    active.data_cert,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        }
                     }
                     Some(MachineEnrollmentState::RetirePending(_)) => Ok(()),
                     _ => Err(admin_error(REMOTE_STATE_CONFLICT)),
@@ -1121,12 +1168,52 @@ impl RemoteManager {
         ready.map_err(|error| admin_error(error.code()))
     }
 
+    fn start_remote_link(
+        &self,
+        state: &mut RemoteManagerState,
+        transport: &mut RemoteTransport,
+        machine_route: [u8; 16],
+    ) -> Result<(), RemoteAdministrationError> {
+        if state.link.is_some() {
+            return Err(admin_error(REMOTE_STATE_CONFLICT));
+        }
+        // P4.4 production 尚未安装 P4.5 sealer/publisher。此时 pairing control lane
+        // 必须继续启动，但 business lane 不能被领取，更不能让 Core 先 durable accept
+        // 一个永远无法回执的请求。Owner::start 仍保留第二层 fail-close。
+        if !self.reply_sealer.admission_ready() || !self.stream_publisher.admission_ready() {
+            return Ok(());
+        }
+        let core = self
+            .runtime_core
+            .get()
+            .cloned()
+            .ok_or_else(|| admin_error("daemon.remote.runtime_core_unavailable"))?;
+        if core.upgrade().is_none() {
+            return Err(admin_error("daemon.remote.runtime_core_unavailable"));
+        }
+        let lane = transport
+            .take_business_lane()
+            .map_err(|error| admin_error(error.code()))?;
+        let owner = RemoteLinkOwner::start(
+            MachineRouteId::from_bytes(machine_route),
+            self.store.clone(),
+            lane,
+            core,
+            self.reply_sealer.clone(),
+            self.stream_publisher.clone(),
+        )
+        .map_err(|error| admin_error(error.code()))?;
+        state.link = Some(owner);
+        Ok(())
+    }
+
     async fn cleanup(
         &self,
         state: &mut RemoteManagerState,
     ) -> Result<(), RemoteAdministrationError> {
         state.identity = None;
         state.connect_retry = None;
+        stop_remote_link(state).await?;
         stop_pairing_actor(state).await;
         let transport = state.transport.take();
         match MachineCleanupWorkflow::new()
@@ -1424,6 +1511,16 @@ async fn stop_pairing_actor(state: &mut RemoteManagerState) {
         pairing.shutdown().await;
     }
     state.pairing.take();
+}
+
+async fn stop_remote_link(state: &mut RemoteManagerState) -> Result<(), RemoteAdministrationError> {
+    if let Some(link) = state.link.as_mut() {
+        link.shutdown()
+            .await
+            .map_err(|error| admin_error(error.code()))?;
+    }
+    state.link.take();
+    Ok(())
 }
 
 fn record_pairing_start_failure(state: &mut RemoteManagerState, error: &RemoteAdministrationError) {

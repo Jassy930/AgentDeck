@@ -711,25 +711,28 @@ fn run_main_loop(
             },
         ) {
             Ok(core) => {
-                if !remote_manager.install_pairing_pending_sink(core.pairing_pending_sink()) {
+                let core = Arc::new(core);
+                if !remote_manager.install_pairing_pending_sink(core.pairing_pending_sink())
+                    || !remote_manager.install_runtime_core(&core)
+                {
                     drop(core);
                     drop(router);
                     let failure = MainLoopFailure {
-                        code: "daemon.pairing.sink_already_installed".to_owned(),
-                        message: "pairing administration bootstrap failed".to_owned(),
+                        code: "daemon.remote.composition_already_installed".to_owned(),
+                        message: "remote Runtime composition bootstrap failed".to_owned(),
                     };
                     let shutdown = store.shutdown().await;
                     diag::log(
                         "daemon_stop",
                         &format!(
-                            "agentdeckd pairing composition failed before RuntimeCore ownership: \
+                            "agentdeckd remote composition failed before RuntimeCore ownership: \
                                  code={} storeShutdown={shutdown:?}",
                             failure.code
                         ),
                     );
                     return Err(failure);
                 }
-                Arc::new(core)
+                core
             }
             Err(error) => {
                 drop(router);

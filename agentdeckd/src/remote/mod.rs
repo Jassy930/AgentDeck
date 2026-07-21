@@ -8,11 +8,18 @@ pub mod bootstrap;
 pub mod certificate;
 pub mod cleanup;
 pub mod config;
+pub(crate) mod dispatch;
 pub mod enrollment;
 pub(crate) mod grants;
 pub mod identity;
+pub(crate) mod link;
 pub mod manager;
 pub(crate) mod pairing;
 pub mod transport;
 pub mod trust_reset;
 pub mod workflow;
+
+#[cfg(test)]
+mod p44_remote_link_tests;
+#[cfg(test)]
+mod p44_remote_transport_tests;

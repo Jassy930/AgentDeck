@@ -863,7 +863,9 @@ fn device_handle(device_route: DeviceRouteId) -> DeviceHandle {
     DeviceHandle::new(value)
 }
 
-fn device_route_from_handle(handle: &DeviceHandle) -> Result<DeviceRouteId, RuntimeStoreError> {
+pub(super) fn device_route_from_handle(
+    handle: &DeviceHandle,
+) -> Result<DeviceRouteId, RuntimeStoreError> {
     let encoded = handle
         .as_str()
         .strip_prefix(DEVICE_HANDLE_PREFIX)

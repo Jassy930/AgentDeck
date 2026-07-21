@@ -313,6 +313,7 @@ async fn cli_uds_real_relay_pairing_delivers_one_active_grant_and_closes_route()
         .with_revocation_administration(manager.clone());
     assert!(manager.install_pairing_pending_sink(core.pairing_pending_sink()));
     let core = Arc::new(core);
+    assert!(manager.install_runtime_core(&core));
     let (_, recovery_ready) = core
         .recover_for_startup()
         .await

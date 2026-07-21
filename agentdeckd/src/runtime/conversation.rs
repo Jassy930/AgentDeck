@@ -42,7 +42,8 @@ use super::execution::{
 };
 use super::model::{
     ApprovalMutationOutcome, ApprovalRecord, ApprovalState, ClaimApproval, ExpireApproval,
-    RegisterApproval, RegisterApprovalOutcome, RetryApprovalDelivery,
+    RegisterApproval, RegisterApprovalOutcome, RemoteCommandAuthorizationBinding,
+    RetryApprovalDelivery,
 };
 use super::native_metadata::{
     NativeMutationCoordinator, NativeMutationCoordinatorError, NativeMutationOutcome,
@@ -698,8 +699,29 @@ impl ConversationRegistry {
         &self,
         principal: &AuthenticatedPrincipal,
     ) -> Result<usize, ConversationError> {
-        principal.begin_revoke().await?;
+        self.begin_principal_revocation(principal).await?;
+        let result = self.terminate_principal_accepted(principal).await;
+        principal.finish_revoke();
+        result
+    }
+
+    /// 两阶段 durable revoke 的第一段：把共享 lease 置为 Revoking 并等待全部
+    /// in-flight guard。此步完成前不得开始 auth-ledger durable transition。
+    pub(crate) async fn begin_principal_revocation(
+        &self,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<(), ConversationError> {
+        principal.begin_revoke().await.map_err(Into::into)
+    }
+
+    /// durable Active→Revoking COMMIT 之后，终止 exact authorization 尚未 Started
+    /// 的 Accepted。Started action 不伪装撤回。
+    pub(crate) async fn terminate_principal_accepted(
+        &self,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<usize, ConversationError> {
         let key = principal.authorization_key();
+        let remote_authorization = principal.remote_command_authorization_binding();
         let handles: Vec<_> = self
             .actors
             .lock()
@@ -715,6 +737,7 @@ impl ConversationRegistry {
                 .control_tx
                 .try_send(ControlCommand::Revoke {
                     authorization_key: key.clone(),
+                    remote_authorization: remote_authorization.clone(),
                     reply,
                 })
                 .is_err()
@@ -735,9 +758,6 @@ impl ConversationRegistry {
                 }
             }
         }
-        // 即使个别 actor 已损坏也完成共享 lease 的 revoked 发布；runner 在 Started
-        // 前会重新 acquire 同一 lease，因此剩余 Accepted 保持 fail-closed。
-        principal.finish_revoke();
         match first_error {
             Some(error) => Err(error),
             None => Ok(terminated),
@@ -1066,6 +1086,7 @@ enum ControlCommand {
     #[allow(dead_code)] // P4 durable auth ledger 接线后成为 production control。
     Revoke {
         authorization_key: PrincipalAuthorizationKey,
+        remote_authorization: Option<RemoteCommandAuthorizationBinding>,
         reply: oneshot::Sender<Result<usize, ConversationError>>,
     },
 }
@@ -1479,9 +1500,12 @@ impl ConversationActor {
             }
             ControlCommand::Revoke {
                 authorization_key,
+                remote_authorization,
                 reply,
             } => {
-                let result = self.revoke_accepted(authorization_key).await;
+                let result = self
+                    .revoke_accepted(authorization_key, remote_authorization)
+                    .await;
                 let _ = reply.send(result);
             }
         }
@@ -1532,16 +1556,26 @@ impl ConversationActor {
     async fn revoke_accepted(
         &mut self,
         authorization_key: PrincipalAuthorizationKey,
+        remote_authorization: Option<RemoteCommandAuthorizationBinding>,
     ) -> Result<usize, ConversationError> {
+        let matches_authorization = |queued: &QueuedCommand| {
+            queued.authorization_key.as_ref() == Some(&authorization_key)
+                || remote_authorization.as_ref().is_some_and(|expected| {
+                    queued.command.remote_authorization_binding() == Some(expected)
+                })
+        };
         let mut targets: Vec<_> = self
             .pending
             .iter()
-            .filter(|queued| queued.authorization_key.as_ref() == Some(&authorization_key))
+            .filter(|queued| matches_authorization(queued))
             .map(|queued| queued.command.clone())
             .collect();
         if let Some(active) = &self.active
             && active.turn_id.is_none()
-            && active.authorization_key.as_ref() == Some(&authorization_key)
+            && (active.authorization_key.as_ref() == Some(&authorization_key)
+                || remote_authorization.as_ref().is_some_and(|expected| {
+                    active.command.remote_authorization_binding() == Some(expected)
+                }))
         {
             targets.push(active.command.clone());
         }
@@ -2861,6 +2895,7 @@ async fn prompt_admission_worker(
             reply,
         } = command;
         let authorization_key = principal.authorization_key();
+        let remote_authorization = principal.remote_command_authorization_binding();
         let outcome = store
             .accept_command_authorized(
                 AcceptCommand {
@@ -2871,6 +2906,7 @@ async fn prompt_admission_worker(
                     payload,
                 },
                 authorization_guard,
+                remote_authorization,
             )
             .await;
         if admission_tx
@@ -7837,6 +7873,96 @@ pub(crate) mod tests {
         assert_eq!(receipt.state, CommandState::RevokedBeforeStart);
 
         registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn restart_without_live_principal_revokes_recovered_adc2_by_exact_binding() {
+        let root = TestRoot::new("revoke-recovered-adc2");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 0x34).await;
+        let binding = RemoteCommandAuthorizationBinding::new(
+            [0xB3; 32],
+            agentdeck_protocol::relay_v2::MachineRouteId::from_bytes([0x31; 16]),
+            agentdeck_protocol::relay_v2::DeviceRouteId::from_bytes([0x32; 16]),
+            agentdeck_protocol::relay_v2::GrantSerial::new(7),
+            [0x33; 32],
+            [0x34; 32],
+            agentdeck_protocol::relay_v2::KeyDirectoryRevision::new(1),
+            1,
+            vec![agentdeck_protocol::e2ee::AuthorizationPermissionV1::PromptSend],
+        )
+        .expect("construct recovered ADC2 binding");
+
+        let first_issuer = PrincipalIssuer::local_only([0xB3; 32]);
+        let first_principal = first_issuer
+            .issue_verified_remote(binding.clone())
+            .expect("issue first-process remote principal");
+        let first_registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(DisabledExecutionCoordinator),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xD5),
+            1,
+        )
+        .expect("first registry");
+        first_registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("first actor");
+        let accepted = command(
+            &submit(
+                &first_registry,
+                conversation.conversation_id,
+                &first_principal,
+                "recovered-adc2",
+                "persist before restart",
+            )
+            .await,
+        );
+        first_registry
+            .shutdown()
+            .await
+            .expect("shutdown first-process actors");
+
+        let second_issuer = PrincipalIssuer::local_only([0xB3; 32]);
+        let recovered_principal = second_issuer
+            .issue_verified_remote(binding)
+            .expect("bootstrap restart principal from exact Store proof");
+        let second_registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(DisabledExecutionCoordinator),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xD6),
+            1,
+        )
+        .expect("second registry");
+        second_registry
+            .install(conversation.clone(), vec![accepted.clone()])
+            .await
+            .expect("install recovered ADC2 without live connection");
+        assert_eq!(
+            second_registry
+                .revoke_principal(&recovered_principal)
+                .await
+                .expect("revoke recovered exact authorization"),
+            1
+        );
+        let receipt = store
+            .query_command_receipt(QueryCommandReceipt {
+                expected_owner: recovered_principal.idempotency_owner(),
+                selector: CommandReceiptSelector::Command {
+                    conversation_id: conversation.conversation_id,
+                    command_id: accepted.command_id,
+                },
+            })
+            .await
+            .expect("query recovered revoked command");
+        assert_eq!(receipt.state, CommandState::RevokedBeforeStart);
+
+        second_registry
+            .shutdown()
+            .await
+            .expect("shutdown second-process actors");
         store.shutdown().await.expect("shutdown store");
     }
 

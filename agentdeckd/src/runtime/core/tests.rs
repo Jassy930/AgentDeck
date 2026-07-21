@@ -5,24 +5,28 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Barrier, Mutex as StdMutex};
 
+use agentdeck_protocol::e2ee::{AuthorizationCapabilityV1, AuthorizationPermissionV1};
 use agentdeck_protocol::relay_v2::enrollment::EnrollmentBundleV2;
-use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
+use agentdeck_protocol::relay_v2::{DeviceRouteId, MachineRouteId};
+use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::failure::{
     DAEMON_COMMAND_HISTORY_ONLY, DAEMON_COMMAND_NOT_FOUND,
     DAEMON_CONVERSATION_CONFIGURATION_CONFLICT, DAEMON_CONVERSATION_CONFIGURATION_REQUIRED,
+    DAEMON_RUNTIME_RECOVERY_BLOCKED,
 };
 use agentdeck_protocol::runtime::identity::{
     ApprovalId, ConversationId, DeviceHandle, EventId, GrantSerial, IdempotencyKey, MessageId,
     PairingId,
 };
 use agentdeck_protocol::runtime::{
-    ArtifactSha256, ClaudeCodeConversationConfiguration, CodexConversationConfiguration,
-    ConfigurationReceipt, ConfigureConversationRequest, ConversationConfiguration,
-    ConversationMetadataMutation, ConversationMetadataMutationRequest, ConversationMetadataReceipt,
-    ConversationStart, LocalOnlyAdministration, MAX_RUNTIME_JSON_FRAME_BYTES, MachineEnrollRequest,
-    PairInvite, PairingReceipt, PendingPairing, PromptPayload, QueryReceiptSelector,
-    RevocationReceipt, RuntimeEvent, RuntimeEventBody, RuntimeMessage, RuntimeStreamItem,
-    SendPromptRequest, StageUpgradeReceipt, StageUpgradeRequest, TrustResetRequest,
+    ArtifactSha256, BackfillRequest, ClaudeCodeConversationConfiguration,
+    CodexConversationConfiguration, ConfigurationReceipt, ConfigureConversationRequest,
+    ConversationConfiguration, ConversationMetadataMutation, ConversationMetadataMutationRequest,
+    ConversationMetadataReceipt, ConversationStart, LocalOnlyAdministration,
+    MAX_RUNTIME_JSON_FRAME_BYTES, MachineEnrollRequest, PairInvite, PairingReceipt, PendingPairing,
+    PromptPayload, QueryReceiptSelector, RevocationReceipt, RuntimeEvent, RuntimeEventBody,
+    RuntimeInnerCursor, RuntimeMessage, RuntimeStreamItem, RuntimeSubscriptionTarget,
+    SendPromptRequest, StageUpgradeReceipt, StageUpgradeRequest, StreamCursor, TrustResetRequest,
     VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::{
@@ -31,7 +35,7 @@ use agentdeck_protocol::{
 };
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use super::*;
 use crate::runtime::pairing_administration::{PairingAdministration, PairingAdministrationError};
@@ -39,7 +43,10 @@ use crate::runtime::remote_administration::{RemoteAdministration, RemoteAdminist
 use crate::runtime::revocation_administration::{
     RevocationAdministration, RevocationAdministrationError,
 };
-use crate::runtime::store::{ImportNativeProjection, ImportNativeProjectionOutcome};
+use crate::runtime::store::{
+    ImportNativeProjection, ImportNativeProjectionOutcome, MarkConversationRecoveryBlocked,
+    active_authorization_store_with_permissions_for_test,
+};
 use crate::security::{MemoryKeyStore, SecretBytes, StorageKek, load_or_create_storage_kek};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -160,6 +167,52 @@ impl RevocationAdministration for CountingRevocationAdministration {
         match self.failure_code {
             Some(code) => Err(RevocationAdministrationError::new(code)),
             None => Ok(RevocationReceipt::Committed { grant_serial }),
+        }
+    }
+}
+
+struct GatedRevocationAdministration {
+    entered: mpsc::UnboundedSender<(DeviceHandle, GrantSerial)>,
+    outcomes: TokioMutex<mpsc::UnboundedReceiver<Result<(), &'static str>>>,
+}
+
+type GatedRevocationHarness = (
+    Arc<GatedRevocationAdministration>,
+    mpsc::UnboundedReceiver<(DeviceHandle, GrantSerial)>,
+    mpsc::UnboundedSender<Result<(), &'static str>>,
+);
+
+impl GatedRevocationAdministration {
+    fn new() -> GatedRevocationHarness {
+        let (entered, entered_rx) = mpsc::unbounded_channel();
+        let (outcomes, outcome_rx) = mpsc::unbounded_channel();
+        (
+            Arc::new(Self {
+                entered,
+                outcomes: TokioMutex::new(outcome_rx),
+            }),
+            entered_rx,
+            outcomes,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl RevocationAdministration for GatedRevocationAdministration {
+    async fn revoke_device(
+        &self,
+        device: DeviceHandle,
+        grant_serial: GrantSerial,
+    ) -> Result<RevocationReceipt, RevocationAdministrationError> {
+        self.entered
+            .send((device, grant_serial))
+            .map_err(|_| RevocationAdministrationError::new("daemon.revocation.test_gate"))?;
+        match self.outcomes.lock().await.recv().await {
+            Some(Ok(())) => Ok(RevocationReceipt::Committed { grant_serial }),
+            Some(Err(code)) => Err(RevocationAdministrationError::new(code)),
+            None => Err(RevocationAdministrationError::new(
+                "daemon.revocation.test_gate",
+            )),
         }
     }
 }
@@ -864,7 +917,7 @@ fn dormant_machine_administration_requests() -> Vec<RuntimeRequest> {
         ),
         RuntimeRequest::Revoke(RevokeRequest {
             target: RevokeTarget::Device {
-                device: DeviceHandle::new("device-1"),
+                device: DeviceHandle::new(format!("device-{}", "11".repeat(16))),
                 grant_serial: GrantSerial::new(7),
                 scope: LocalOnlyAdministration::LocalOnly,
             },
@@ -1072,8 +1125,8 @@ async fn revocation_administration_is_local_control_only_and_receives_exact_targ
     let remote = core
         .connect(remote_principal, ConnectionSink::new(remote_sink))
         .expect("connect remote principal");
-    let device = DeviceHandle::new("device-handle-exact-01");
-    let grant_serial = GrantSerial::new(42);
+    let device = DeviceHandle::new(format!("device-{}", "84".repeat(16)));
+    let grant_serial = GrantSerial::new(9);
     let request = RuntimeRequest::Revoke(RevokeRequest {
         target: RevokeTarget::Device {
             device: device.clone(),
@@ -1132,7 +1185,7 @@ async fn revocation_backend_failure_maps_stable_bounded_code() {
             local_control,
             RuntimeRequest::Revoke(RevokeRequest {
                 target: RevokeTarget::Device {
-                    device: DeviceHandle::new("device-failure-01"),
+                    device: DeviceHandle::new(format!("device-{}", "b2".repeat(16))),
                     grant_serial: GrantSerial::new(43),
                     scope: LocalOnlyAdministration::LocalOnly,
                 },
@@ -1167,7 +1220,7 @@ async fn disabled_revocation_administration_fails_closed_for_local_control() {
             local_control,
             RuntimeRequest::Revoke(RevokeRequest {
                 target: RevokeTarget::Device {
-                    device: DeviceHandle::new("device-disabled-01"),
+                    device: DeviceHandle::new(format!("device-{}", "44".repeat(16))),
                     grant_serial: GrantSerial::new(44),
                     scope: LocalOnlyAdministration::LocalOnly,
                 },
@@ -1303,11 +1356,11 @@ fn synthetic_wire_id(kind: RuntimeIdKind, seed: u8) -> String {
 }
 
 #[tokio::test]
-async fn direct_hello_remains_available_while_core_is_cold() {
-    let root = TestRoot::new("cold-direct-hello");
+async fn hello_requires_ready_core_and_a_registered_connection() {
+    let root = TestRoot::new("hello-ready-registered");
     let core = core(&root).await;
 
-    let reply = core
+    let cold = core
         .handle(
             ConnectionId::from_test_bytes([0x31; 16]),
             RuntimeRequest::Hello(HelloParams {
@@ -1315,9 +1368,36 @@ async fn direct_hello_remains_available_while_core_is_cold() {
             }),
         )
         .await;
-
     assert!(matches!(
-        reply,
+        cold,
+        RuntimeReply::Failure(RuntimeFailure { code, .. })
+            if code == DAEMON_RUNTIME_NOT_READY
+    ));
+
+    core.recover().await.expect("recover Hello gate core");
+    let unknown = core
+        .handle(
+            ConnectionId::from_test_bytes([0x31; 16]),
+            RuntimeRequest::Hello(HelloParams {
+                runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            }),
+        )
+        .await;
+    assert!(matches!(
+        unknown,
+        RuntimeReply::Failure(RuntimeFailure { code, .. })
+            if code == DAEMON_RUNTIME_CONNECTION_UNAVAILABLE
+    ));
+
+    let connection = connect_local(&core, 0x31).await;
+    assert!(matches!(
+        core.handle(
+            connection,
+            RuntimeRequest::Hello(HelloParams {
+                runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            }),
+        )
+        .await,
         RuntimeReply::Hello(HelloParams {
             runtime_protocol_version: RUNTIME_PROTOCOL_VERSION
         })
@@ -4821,6 +4901,731 @@ async fn paced_reservation_wait_does_not_hold_core_shutdown_quiescence() {
         !blocked_delivered,
         "post-reserve rejected frame reached transport"
     );
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ConversationMutationDigest {
+    row: (String, String, Option<String>, Option<String>, i64, Vec<u8>),
+    configurations: i64,
+    metadata_mutations: i64,
+    commands: i64,
+    approvals: i64,
+}
+
+fn conversation_mutation_digest(
+    database: &Path,
+    conversation_id: RuntimeId,
+) -> ConversationMutationDigest {
+    let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open recovery policy evidence DB");
+    let key = &conversation_id.as_bytes()[..];
+    let row = connection
+        .query_row(
+            "SELECT lifecycle, catalog_revision, command_high_water, event_high_water,
+                    accepted_count, metadata_token
+             FROM conversations WHERE conversation_id = ?1",
+            [key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("read recovery policy conversation row");
+    let count = |table: &str| {
+        connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE conversation_id = ?1"),
+                [key],
+                |row| row.get(0),
+            )
+            .expect("count recovery policy rows")
+    };
+    ConversationMutationDigest {
+        row,
+        configurations: count("configuration_journal"),
+        metadata_mutations: count("metadata_mutation_ledger"),
+        commands: count("commands"),
+        approvals: count("approval_ledger"),
+    }
+}
+
+fn all_remote_capabilities() -> Vec<AuthorizationCapabilityV1> {
+    vec![
+        AuthorizationCapabilityV1::Catalog,
+        AuthorizationCapabilityV1::Conversation,
+        AuthorizationCapabilityV1::Prompt,
+        AuthorizationCapabilityV1::Command,
+        AuthorizationCapabilityV1::Approval,
+        AuthorizationCapabilityV1::Metadata,
+        AuthorizationCapabilityV1::SelfRevocation,
+    ]
+}
+
+fn all_remote_permissions() -> Vec<AuthorizationPermissionV1> {
+    vec![
+        AuthorizationPermissionV1::CatalogRead,
+        AuthorizationPermissionV1::ConversationRead,
+        AuthorizationPermissionV1::ConversationStart,
+        AuthorizationPermissionV1::PromptSend,
+        AuthorizationPermissionV1::CommandCancel,
+        AuthorizationPermissionV1::ApprovalResolve,
+        AuthorizationPermissionV1::ApprovalRetry,
+        AuthorizationPermissionV1::MetadataWrite,
+        AuthorizationPermissionV1::RevokeSelf,
+    ]
+}
+
+#[tokio::test]
+async fn canonical_remote_revoke_fences_accepted_before_durable_backend_and_retries() {
+    let root = TestRoot::new("canonical-remote-held-revoke");
+    let store = active_authorization_store_with_permissions_for_test(
+        &root.database(),
+        root.kek(),
+        all_remote_capabilities(),
+        all_remote_permissions(),
+    )
+    .await;
+    let trust_domain = store
+        .machine_trust_domain()
+        .expect("derive held revoke trust domain");
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let execution = super::super::conversation::tests::FakeCoordinator::held();
+    let (revocation, mut entered, outcomes) = GatedRevocationAdministration::new();
+    let core = Arc::new(
+        RuntimeCore::new_with_test_execution_coordinator(
+            store.clone(),
+            router,
+            trust_domain,
+            Arc::new(execution.clone()),
+        )
+        .expect("construct held revoke Core")
+        .with_revocation_administration(revocation),
+    );
+    core.recover().await.expect("recover held revoke Core");
+
+    let ingress = store
+        .load_active_remote_ingress(
+            MachineRouteId::from_bytes([0x32; 16]),
+            DeviceRouteId::from_bytes([0xd1; 16]),
+        )
+        .await
+        .expect("load held revoke ingress proof");
+    let registered = core
+        .register_remote_principal(&ingress)
+        .expect("register held revoke lease");
+    let current = store
+        .recheck_active_remote_ingress(&ingress)
+        .await
+        .expect("final-check held revoke authorization");
+    let principal = core
+        .activate_registered_remote_principal(registered, &current)
+        .expect("activate held revoke principal");
+    let owner = principal.idempotency_owner();
+    let (remote_sink, mut remote_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(8);
+    tokio::spawn(async move {
+        while let Some(write) = remote_writes.recv().await {
+            let _ = write.acknowledge();
+        }
+    });
+    let remote_connection = core
+        .connect(principal.clone(), ConnectionSink::new(remote_sink))
+        .expect("connect held revoke principal");
+    let (local_control, _control_writes) = connect_local_control_with_sink(&core, 0xe1);
+
+    let conversation = start_receipt(
+        core.handle(
+            remote_connection,
+            start_request("canonical-remote-held-revoke-start"),
+        )
+        .await,
+    );
+    configure_codex_revision_one(
+        &core,
+        remote_connection,
+        conversation.conversation_id.clone(),
+        "canonical-remote-held-revoke-configure",
+    )
+    .await;
+    let prompt = |key: &'static str, text: &'static str| {
+        RuntimeRequest::SendPrompt(SendPromptRequest {
+            conversation_id: conversation.conversation_id.clone(),
+            idempotency_key: IdempotencyKey::new(key),
+            expected_configuration_revision: 1,
+            prompt: PromptPayload::new(text).expect("valid held revoke prompt"),
+        })
+    };
+    let first_command = match core
+        .handle(
+            remote_connection,
+            prompt(
+                "canonical-remote-held-revoke-first",
+                "hold the first remote command",
+            ),
+        )
+        .await
+    {
+        RuntimeReply::Command(CommandReceipt::Accepted { command_id, .. }) => {
+            parse_command_id(&command_id).expect("parse first held revoke command")
+        }
+        other => panic!("expected first Accepted command, got {other:?}"),
+    };
+    execution.wait_for_starts(1).await;
+    let second_command = match core
+        .handle(
+            remote_connection,
+            prompt(
+                "canonical-remote-held-revoke-second",
+                "remain Accepted until revoke fences the queue",
+            ),
+        )
+        .await
+    {
+        RuntimeReply::Command(CommandReceipt::Accepted { command_id, .. }) => {
+            parse_command_id(&command_id).expect("parse second held revoke command")
+        }
+        other => panic!("expected second Accepted command, got {other:?}"),
+    };
+
+    let device = DeviceHandle::new(format!("device-{}", "d1".repeat(16)));
+    let grant_serial = GrantSerial::new(1);
+    let request = RuntimeRequest::Revoke(RevokeRequest {
+        target: RevokeTarget::Device {
+            device: device.clone(),
+            grant_serial,
+            scope: LocalOnlyAdministration::LocalOnly,
+        },
+    });
+    let first_revoke = {
+        let core = core.clone();
+        let request = request.clone();
+        tokio::spawn(async move { core.handle(local_control, request).await })
+    };
+    wait_until_principal_revoking(&principal).await;
+    assert!(matches!(
+        entered.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    execution.release(first_command);
+    let first_target = tokio::time::timeout(std::time::Duration::from_secs(3), entered.recv())
+        .await
+        .expect("durable revoke backend entry deadline")
+        .expect("durable revoke backend entry");
+    assert_eq!(first_target, (device.clone(), grant_serial));
+    let second_receipt = store
+        .query_command_receipt(QueryCommandReceipt {
+            expected_owner: owner.clone(),
+            selector: CommandReceiptSelector::Command {
+                conversation_id: parse_conversation_id(&conversation.conversation_id)
+                    .expect("parse held revoke conversation"),
+                command_id: second_command,
+            },
+        })
+        .await
+        .expect("query pre-COMMIT revoked command");
+    assert_eq!(second_receipt.state, CommandState::RevokedBeforeStart);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            execution.wait_for_starts(2),
+        )
+        .await
+        .is_err(),
+        "second Accepted command must never reach Started"
+    );
+
+    outcomes
+        .send(Err("daemon.revocation.test_transient"))
+        .expect("release first revoke with failure");
+    assert!(matches!(
+        first_revoke.await.expect("join first revoke"),
+        RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+            if code == "daemon.revocation.test_transient"
+    ));
+    assert!(matches!(
+        principal.try_enter(),
+        Err(PrincipalAccessError::Revoked)
+    ));
+    assert!(core.connections.principal(remote_connection).is_ok());
+
+    let retry = {
+        let core = core.clone();
+        let request = request.clone();
+        tokio::spawn(async move { core.handle(local_control, request).await })
+    };
+    let retry_target = tokio::time::timeout(std::time::Duration::from_secs(3), entered.recv())
+        .await
+        .expect("retry durable revoke backend entry deadline")
+        .expect("retry durable revoke backend entry");
+    assert_eq!(retry_target, (device, grant_serial));
+    outcomes
+        .send(Ok(()))
+        .expect("release retry revoke with success");
+    assert!(matches!(
+        retry.await.expect("join retry revoke"),
+        RuntimeReply::Revocation(RevocationReceipt::Committed {
+            grant_serial: committed,
+        }) if committed == grant_serial
+    ));
+    assert!(matches!(
+        core.connections.principal(remote_connection),
+        Err(ConnectionError::NotFound)
+    ));
+    let final_receipt = store
+        .query_command_receipt(QueryCommandReceipt {
+            expected_owner: owner,
+            selector: CommandReceiptSelector::Command {
+                conversation_id: parse_conversation_id(&conversation.conversation_id)
+                    .expect("parse final held revoke conversation"),
+                command_id: second_command,
+            },
+        })
+        .await
+        .expect("query final revoked command");
+    assert_eq!(final_receipt.state, CommandState::RevokedBeforeStart);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            execution.wait_for_starts(2),
+        )
+        .await
+        .is_err(),
+        "retry must not reactivate the revoked Accepted command"
+    );
+    core.shutdown().await.expect("shutdown held revoke Core");
+}
+
+#[tokio::test]
+async fn recovery_blocked_is_strictly_read_only_without_blocking_a_healthy_conversation() {
+    let root = TestRoot::new("remote-recovery-blocked-read-only");
+    let store = active_authorization_store_with_permissions_for_test(
+        &root.database(),
+        root.kek(),
+        all_remote_capabilities(),
+        all_remote_permissions(),
+    )
+    .await;
+    let blocked_id = synthetic_runtime_id(RuntimeIdKind::Conversation, 0xb1);
+    let healthy_id = synthetic_runtime_id(RuntimeIdKind::Conversation, 0xb2);
+    for (conversation_id, adapter_seed, title) in
+        [(blocked_id, 0xc1, "blocked"), (healthy_id, 0xc2, "healthy")]
+    {
+        store
+            .create_conversation(NewConversation {
+                conversation_id,
+                adapter_state_key: synthetic_runtime_id(RuntimeIdKind::AdapterState, adapter_seed),
+                descriptor: ConversationDescriptor {
+                    agent_kind: AgentKind::Codex,
+                    title: Some(title.to_owned()),
+                    cwd: PathBuf::from("/tmp/agentdeck-p44-recovery-policy"),
+                },
+            })
+            .await
+            .expect("create recovery policy conversation");
+    }
+    store
+        .mark_conversation_recovery_blocked(MarkConversationRecoveryBlocked {
+            conversation_id: blocked_id,
+            expected_command: None,
+        })
+        .await
+        .expect("mark one conversation RecoveryBlocked");
+    let trust_domain = store
+        .machine_trust_domain()
+        .expect("derive recovery policy trust domain");
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(
+        RuntimeCore::new(store.clone(), router, trust_domain)
+            .expect("construct recovery policy Core"),
+    );
+    core.recover().await.expect("recover mixed policy Core");
+    let ingress = store
+        .load_active_remote_ingress(
+            MachineRouteId::from_bytes([0x32; 16]),
+            DeviceRouteId::from_bytes([0xd1; 16]),
+        )
+        .await
+        .expect("load recovery policy ingress proof");
+    let registered = core
+        .register_remote_principal(&ingress)
+        .expect("register recovery policy remote lease");
+    let current = store
+        .recheck_active_remote_ingress(&ingress)
+        .await
+        .expect("final-check recovery policy authorization");
+    let principal = core
+        .activate_registered_remote_principal(registered, &current)
+        .expect("activate recovery policy remote principal");
+    let (sink, mut writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(64);
+    tokio::spawn(async move {
+        while let Some(write) = writes.recv().await {
+            let _ = write.acknowledge();
+        }
+    });
+    let connection = core
+        .connect(principal, ConnectionSink::new(sink))
+        .expect("connect recovery policy principal");
+    let blocked = ConversationId::new(blocked_id.to_canonical_string());
+    let healthy = ConversationId::new(healthy_id.to_canonical_string());
+
+    // Catalog、snapshot/subscribe、backfill 与 receipt query 均必须保留 read path。
+    for (message, request) in [
+        (
+            "blocked-catalog",
+            RuntimeRequest::Catalog(CatalogRequest { page_cursor: None }),
+        ),
+        (
+            "blocked-snapshot",
+            RuntimeRequest::Subscribe {
+                inner_cursor: RuntimeInnerCursor::Conversation {
+                    conversation_id: blocked.clone(),
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            },
+        ),
+        (
+            "blocked-backfill",
+            RuntimeRequest::Backfill(BackfillRequest::Conversation {
+                conversation_id: blocked.clone(),
+                after: StreamCursor::BeforeFirst,
+            }),
+        ),
+    ] {
+        core.handle_envelope(
+            connection,
+            RuntimeEnvelope {
+                version: RUNTIME_PROTOCOL_VERSION,
+                message_id: MessageId::new(message),
+                body: RuntimeMessage::Request(request),
+            },
+        )
+        .await
+        .expect("RecoveryBlocked read path remains routable");
+    }
+    let query = core
+        .handle(
+            connection,
+            RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+                conversation_id: blocked.clone(),
+                command_id: CommandId::new(synthetic_wire_id(RuntimeIdKind::Command, 0xd1)),
+            }),
+        )
+        .await;
+    assert!(
+        !reply_has_failure_code(&query, DAEMON_RUNTIME_RECOVERY_BLOCKED),
+        "receipt query is read-only and must remain available: {query:?}"
+    );
+
+    let before = conversation_mutation_digest(&root.database(), blocked_id);
+    let blocked_writes = vec![
+        RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+            blocked.clone(),
+            IdempotencyKey::new("blocked-configure"),
+            0,
+            codex_configuration(CodexReasoningEffort::Medium),
+        )),
+        RuntimeRequest::UpdateConversationMetadata(
+            ConversationMetadataMutationRequest::new(
+                blocked.clone(),
+                IdempotencyKey::new("blocked-metadata"),
+                0,
+                ConversationMetadataMutation::SetArchived { archived: true },
+            )
+            .expect("valid blocked metadata request"),
+        ),
+        RuntimeRequest::SendPrompt(SendPromptRequest {
+            conversation_id: blocked.clone(),
+            idempotency_key: IdempotencyKey::new("blocked-prompt"),
+            expected_configuration_revision: 0,
+            prompt: PromptPayload::new("must remain side-effect free")
+                .expect("valid blocked prompt"),
+        }),
+        RuntimeRequest::CancelQueued {
+            conversation_id: blocked.clone(),
+            command_id: CommandId::new(synthetic_wire_id(RuntimeIdKind::Command, 0xd2)),
+        },
+        RuntimeRequest::CancelActive {
+            conversation_id: blocked.clone(),
+            turn_id: TurnId::new(synthetic_wire_id(RuntimeIdKind::Turn, 0xd3)),
+        },
+        RuntimeRequest::ResolveApproval {
+            conversation_id: blocked.clone(),
+            turn_id: TurnId::new(synthetic_wire_id(RuntimeIdKind::Turn, 0xd4)),
+            approval_id: ApprovalId::new(synthetic_wire_id(RuntimeIdKind::Approval, 0xd5)),
+            decision: ActionDecision {
+                request_id: "blocked-resolve".to_owned(),
+                decision: ActionDecisionKind::Deny,
+                persist: false,
+            },
+        },
+        RuntimeRequest::RetryApproval {
+            conversation_id: blocked,
+            approval_id: ApprovalId::new(synthetic_wire_id(RuntimeIdKind::Approval, 0xd6)),
+        },
+    ];
+    for request in blocked_writes {
+        let reply = core.handle(connection, request).await;
+        assert!(
+            reply_has_failure_code(&reply, DAEMON_RUNTIME_RECOVERY_BLOCKED),
+            "RecoveryBlocked mutation did not fail with the strict read-only code: {reply:?}"
+        );
+        assert_eq!(
+            conversation_mutation_digest(&root.database(), blocked_id),
+            before,
+            "RecoveryBlocked rejection must be zero-side-effect"
+        );
+    }
+
+    let healthy_reply = core
+        .handle(
+            connection,
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                healthy.clone(),
+                IdempotencyKey::new("healthy-configure"),
+                0,
+                codex_configuration(CodexReasoningEffort::Medium),
+            )),
+        )
+        .await;
+    assert!(matches!(
+        healthy_reply,
+        RuntimeReply::Configuration(ConfigurationReceipt::Applied {
+            conversation_id,
+            configuration_revision: 1,
+        }) if conversation_id == healthy
+    ));
+    core.shutdown().await.expect("shutdown mixed policy Core");
+}
+
+fn remote_permission_capability(
+    permission: AuthorizationPermissionV1,
+) -> AuthorizationCapabilityV1 {
+    match permission {
+        AuthorizationPermissionV1::CatalogRead => AuthorizationCapabilityV1::Catalog,
+        AuthorizationPermissionV1::ConversationRead
+        | AuthorizationPermissionV1::ConversationStart => AuthorizationCapabilityV1::Conversation,
+        AuthorizationPermissionV1::PromptSend => AuthorizationCapabilityV1::Prompt,
+        AuthorizationPermissionV1::CommandCancel => AuthorizationCapabilityV1::Command,
+        AuthorizationPermissionV1::ApprovalResolve | AuthorizationPermissionV1::ApprovalRetry => {
+            AuthorizationCapabilityV1::Approval
+        }
+        AuthorizationPermissionV1::MetadataWrite => AuthorizationCapabilityV1::Metadata,
+        AuthorizationPermissionV1::RevokeSelf => AuthorizationCapabilityV1::SelfRevocation,
+    }
+}
+
+fn remote_permission_requests(
+    permission: AuthorizationPermissionV1,
+    seed: u8,
+) -> Vec<RuntimeRequest> {
+    let conversation =
+        ConversationId::new(synthetic_wire_id(RuntimeIdKind::Conversation, seed.max(1)));
+    match permission {
+        AuthorizationPermissionV1::CatalogRead => vec![
+            RuntimeRequest::DescribeAgents,
+            RuntimeRequest::Catalog(CatalogRequest { page_cursor: None }),
+        ],
+        AuthorizationPermissionV1::ConversationRead => vec![
+            RuntimeRequest::Subscribe {
+                inner_cursor: RuntimeInnerCursor::Conversation {
+                    conversation_id: conversation.clone(),
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            },
+            RuntimeRequest::Unsubscribe {
+                target: RuntimeSubscriptionTarget::Conversation {
+                    conversation_id: conversation.clone(),
+                },
+            },
+            RuntimeRequest::Backfill(BackfillRequest::Conversation {
+                conversation_id: conversation.clone(),
+                after: StreamCursor::BeforeFirst,
+            }),
+            RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
+                conversation_id: conversation,
+                command_id: CommandId::new(synthetic_wire_id(
+                    RuntimeIdKind::Command,
+                    seed.wrapping_add(1).max(1),
+                )),
+            }),
+        ],
+        AuthorizationPermissionV1::ConversationStart => {
+            vec![RuntimeRequest::Start(ConversationStart {
+                agent_kind: AgentKind::Codex,
+                idempotency_key: IdempotencyKey::new(format!("remote-start-{seed}")),
+                cwd: PathBuf::from("/tmp/agentdeck-p44-remote-permission"),
+                title: Some("remote permission".to_owned()),
+            })]
+        }
+        AuthorizationPermissionV1::PromptSend => {
+            vec![RuntimeRequest::SendPrompt(SendPromptRequest {
+                conversation_id: conversation,
+                idempotency_key: IdempotencyKey::new(format!("remote-prompt-{seed}")),
+                expected_configuration_revision: 1,
+                prompt: PromptPayload::new("permission matrix prompt")
+                    .expect("valid matrix prompt"),
+            })]
+        }
+        AuthorizationPermissionV1::CommandCancel => vec![
+            RuntimeRequest::CancelQueued {
+                conversation_id: conversation.clone(),
+                command_id: CommandId::new(synthetic_wire_id(
+                    RuntimeIdKind::Command,
+                    seed.wrapping_add(1).max(1),
+                )),
+            },
+            RuntimeRequest::CancelActive {
+                conversation_id: conversation,
+                turn_id: TurnId::new(synthetic_wire_id(
+                    RuntimeIdKind::Turn,
+                    seed.wrapping_add(2).max(1),
+                )),
+            },
+        ],
+        AuthorizationPermissionV1::ApprovalResolve => {
+            vec![RuntimeRequest::ResolveApproval {
+                conversation_id: conversation,
+                turn_id: TurnId::new(synthetic_wire_id(
+                    RuntimeIdKind::Turn,
+                    seed.wrapping_add(1).max(1),
+                )),
+                approval_id: ApprovalId::new(synthetic_wire_id(
+                    RuntimeIdKind::Approval,
+                    seed.wrapping_add(2).max(1),
+                )),
+                decision: ActionDecision {
+                    request_id: format!("remote-resolve-{seed}"),
+                    decision: ActionDecisionKind::Deny,
+                    persist: false,
+                },
+            }]
+        }
+        AuthorizationPermissionV1::ApprovalRetry => vec![RuntimeRequest::RetryApproval {
+            conversation_id: conversation,
+            approval_id: ApprovalId::new(synthetic_wire_id(
+                RuntimeIdKind::Approval,
+                seed.wrapping_add(1).max(1),
+            )),
+        }],
+        AuthorizationPermissionV1::MetadataWrite => vec![
+            RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+                conversation.clone(),
+                IdempotencyKey::new(format!("remote-configure-{seed}")),
+                0,
+                codex_configuration(CodexReasoningEffort::Medium),
+            )),
+            RuntimeRequest::UpdateConversationMetadata(
+                ConversationMetadataMutationRequest::new(
+                    conversation,
+                    IdempotencyKey::new(format!("remote-metadata-{seed}")),
+                    0,
+                    ConversationMetadataMutation::SetArchived { archived: true },
+                )
+                .expect("valid matrix metadata request"),
+            ),
+        ],
+        AuthorizationPermissionV1::RevokeSelf => {
+            vec![RuntimeRequest::Revoke(RevokeRequest {
+                target: RevokeTarget::SelfDevice,
+            })]
+        }
+    }
+}
+
+fn reply_has_failure_code(reply: &RuntimeReply, expected: &str) -> bool {
+    serde_json::to_value(reply)
+        .expect("serialize permission reply")
+        .to_string()
+        .contains(&format!("\"code\":\"{expected}\""))
+}
+
+#[tokio::test]
+async fn remote_principal_enforces_the_exact_nine_permission_table() {
+    const PERMISSIONS: [AuthorizationPermissionV1; 9] = [
+        AuthorizationPermissionV1::CatalogRead,
+        AuthorizationPermissionV1::ConversationRead,
+        AuthorizationPermissionV1::ConversationStart,
+        AuthorizationPermissionV1::PromptSend,
+        AuthorizationPermissionV1::CommandCancel,
+        AuthorizationPermissionV1::ApprovalResolve,
+        AuthorizationPermissionV1::ApprovalRetry,
+        AuthorizationPermissionV1::MetadataWrite,
+        AuthorizationPermissionV1::RevokeSelf,
+    ];
+    for (index, permission) in PERMISSIONS.into_iter().enumerate() {
+        let seed = u8::try_from(index + 1).expect("nine permission seeds");
+        let root = TestRoot::new(&format!("remote-permission-{permission:?}"));
+        let store = active_authorization_store_with_permissions_for_test(
+            &root.database(),
+            root.kek(),
+            vec![remote_permission_capability(permission)],
+            vec![permission],
+        )
+        .await;
+        let trust_domain = store
+            .machine_trust_domain()
+            .expect("derive permission fixture trust domain");
+        let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+        let core = Arc::new(
+            RuntimeCore::new(store.clone(), router, trust_domain)
+                .expect("construct remote permission Core"),
+        );
+        core.recover()
+            .await
+            .expect("recover remote permission Core");
+        let ingress = store
+            .load_active_remote_ingress(
+                MachineRouteId::from_bytes([0x32; 16]),
+                DeviceRouteId::from_bytes([0xd1; 16]),
+            )
+            .await
+            .expect("load single-permission ingress proof");
+        let registered = core
+            .register_remote_principal(&ingress)
+            .expect("register single-permission remote lease");
+        let current = store
+            .recheck_active_remote_ingress(&ingress)
+            .await
+            .expect("final-check single-permission authorization");
+        let principal = core
+            .activate_registered_remote_principal(registered, &current)
+            .expect("activate principal only after final Store proof");
+        let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(8);
+        tokio::spawn(async move {
+            while let Some(write) = receiver.recv().await {
+                let _ = write.acknowledge();
+            }
+        });
+        let connection = core
+            .connect(principal, ConnectionSink::new(sink))
+            .expect("connect remote permission principal");
+
+        for request in remote_permission_requests(permission, seed) {
+            let reply = core.handle(connection, request).await;
+            assert!(
+                !reply_has_failure_code(&reply, DAEMON_AUTHORIZATION_PERMISSION_DENIED),
+                "matching {permission:?} was rejected before its business handler: {reply:?}"
+            );
+        }
+
+        let denied = PERMISSIONS[(index + 1) % PERMISSIONS.len()];
+        for request in remote_permission_requests(denied, seed.wrapping_add(0x20)) {
+            let reply = core.handle(connection, request).await;
+            assert!(
+                reply_has_failure_code(&reply, DAEMON_AUTHORIZATION_PERMISSION_DENIED),
+                "{permission:?} unexpectedly authorized {denied:?}: {reply:?}"
+            );
+        }
+        core.shutdown()
+            .await
+            .expect("shutdown remote permission Core");
+    }
 }
 
 #[path = "subscription_tests.rs"]

@@ -93,6 +93,32 @@ pub enum OuterContextError {
 }
 
 impl OuterContextV1 {
+    /// device→daemon `Send` 的固定 AAD 形状。
+    ///
+    /// Uplink 不属于 stream，也不允许调用方把 generation/cursor/seq 或 pairing route
+    /// 混入认证上下文；machine/device/request route 与 command-key epoch 全部必须绑定。
+    pub const fn uplink_send(
+        machine_route: MachineRouteId,
+        device_route: DeviceRouteId,
+        request_route: RequestRouteId,
+        message_key_epoch: u64,
+    ) -> Self {
+        Self {
+            frame_kind: OuterFrameKind::UplinkSend,
+            relay_protocol_version: crate::relay_v2::RELAY_PROTOCOL_VERSION,
+            e2ee_format_version: crate::e2ee::E2EE_FORMAT_VERSION,
+            machine_route: Some(machine_route),
+            device_route: Some(device_route),
+            stream_route: None,
+            request_route: Some(request_route),
+            pair_route: None,
+            stream_generation: None,
+            stream_cursor: None,
+            stream_seq: None,
+            message_key_epoch,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), OuterContextError> {
         let pairing = matches!(
             self.frame_kind,

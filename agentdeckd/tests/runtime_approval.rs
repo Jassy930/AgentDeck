@@ -689,21 +689,56 @@ fn restart_never_resumes_active_approval_delivery() {
         "async fn classify_first_pass(",
     );
     assert_ordered(
-        "remote Accepted is rejected before any actor installation",
+        "remote Accepted authorization is persisted before any actor installation",
         coordinator,
         &[
             "let mut plans = self.classify_first_pass().await?",
-            "plan.contains_remote_accepted",
             "self.persist_safe_interruptions(&plans).await?",
-            ".verify_second_pass_and_install(&mut plans, install, !remote_accepted_unsupported)",
-            "if remote_accepted_unsupported",
+            ".verify_second_pass_and_install(&mut plans, install, true)",
+            "if !plans.is_empty()",
             "RuntimeRecoveryError::ReconciliationInvariant",
         ],
     );
-    assert_contract(
-        "remote Accepted rejection persists safe recovery work before returning",
+    let classification = section(
         RECOVERY_SOURCE,
-        &["async fn remote_accepted_rejection_persists_other_sticky_block_before_reopen()"],
+        "async fn classify_conversation(",
+        "async fn fence_process_group(",
+    );
+    assert_ordered(
+        "remote Accepted uses the durable authorization ledger",
+        classification,
+        &[
+            "command.remote_authorization_binding()",
+            ".classify_remote_command_authorization(binding)",
+            "RemoteCommandAuthorizationStatus::Inactive",
+            "revoke_before_start.push",
+            "RemoteCommandAuthorizationStatus::Unprovable",
+            "block_binding.get_or_insert(RecoveryBlockedCommandBinding::Accepted",
+            "let authorization_blocked = block_binding.is_some()",
+            "blocked: lifecycle_blocked || authorization_blocked",
+        ],
+    );
+    let persistence = section(
+        RECOVERY_SOURCE,
+        "async fn persist_safe_interruptions(",
+        "async fn verify_second_pass_and_install",
+    );
+    assert_ordered(
+        "inactive or unprovable remote Accepted closes before actor installation",
+        persistence,
+        &[
+            "for (command_id, expected_owner) in &plan.revoke_before_start",
+            "retry_terminate_accepted(",
+            "if plan.blocked",
+            "MarkConversationRecoveryBlocked",
+            ".or_else(|| plan.block_binding.clone())",
+            "retry_mark_recovery_blocked(&self.store, input).await?",
+        ],
+    );
+    assert_contract(
+        "unprovable remote Accepted remains conversation-scoped RecoveryBlocked",
+        RECOVERY_SOURCE,
+        &["async fn unprovable_remote_accepted_and_other_sticky_block_persist_before_reopen()"],
     );
     let blocked = section(
         CONVERSATION_SOURCE,

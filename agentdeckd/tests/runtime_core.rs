@@ -20,7 +20,29 @@ fn runtime_core_public_shape_is_transport_neutral_and_principal_is_opaque() {
     let read_pool =
         fs::read_to_string(root.join("src/runtime/read_pool.rs")).expect("read read pool");
 
-    for source in [&core, &connection, &conversation, &read_pool] {
+    let core_production = core
+        .split_once("\n#[cfg(test)]\n#[path = \"core/tests.rs\"]")
+        .expect("RuntimeCore test module boundary")
+        .0;
+    let connection_production = connection
+        .split_once("\n#[cfg(test)]\n#[path = \"connection/tests.rs\"]")
+        .expect("connection test module boundary")
+        .0;
+    let conversation_production = conversation
+        .split_once("\n#[cfg(test)]\npub(crate) mod tests {")
+        .expect("conversation test module boundary")
+        .0;
+    let read_pool_production = read_pool
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .expect("read pool test module boundary")
+        .0;
+
+    for source in [
+        core_production,
+        connection_production,
+        conversation_production,
+        read_pool_production,
+    ] {
         assert!(!source.contains("tokio::net"));
         assert!(!source.contains("relay_v2"));
         assert!(

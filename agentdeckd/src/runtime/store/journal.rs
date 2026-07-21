@@ -23,11 +23,11 @@ use crate::runtime::model::{
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_RECOVERY_PAGE_RETAINED_BYTES, MAX_RUNTIME_EVENT_BYTES,
     MAX_RUNTIME_PHYSICAL_CONVERSATIONS, MarkConversationRecoveryBlocked, NewConversation,
     QueryCommandReceipt, RecoverStartedCommand, RecoveryBlockedCommandBinding, RecoveryCompletion,
-    RecoveryCursor, RecoveryFenceBinding, RecoveryPage, RuntimeCommitOperation, RuntimeStoreConfig,
-    RuntimeStoreError, RuntimeStoreOperation, SanitizedTerminalFailure, StartCommand, StartOutcome,
-    StartedBeforeReleaseTermination, StartedRecoveryRecord, TerminalState,
-    TerminateAcceptedCommand, TerminateAcceptedOutcome, TerminateStartedBeforeRelease,
-    TerminateStartedBeforeReleaseOutcome,
+    RecoveryCursor, RecoveryFenceBinding, RecoveryPage, RemoteCommandAuthorizationBinding,
+    RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
+    SanitizedTerminalFailure, StartCommand, StartOutcome, StartedBeforeReleaseTermination,
+    StartedRecoveryRecord, TerminalState, TerminateAcceptedCommand, TerminateAcceptedOutcome,
+    TerminateStartedBeforeRelease, TerminateStartedBeforeReleaseOutcome,
 };
 use crate::security::SecretBytes;
 
@@ -52,7 +52,8 @@ const RUNTIME_WRITE_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024;
 /// AcceptCommand 准入时 authenticated command/pin/ledger/index metadata 的保守估算。
 const ACCEPT_COMMAND_AUTHENTICATED_METADATA_ADMISSION_ESTIMATE_BYTES: usize = 1024;
 
-const COMMAND_MAGIC: &[u8; 4] = b"ADC1";
+const COMMAND_MAGIC_V1: &[u8; 4] = b"ADC1";
+const COMMAND_MAGIC_V2: &[u8; 4] = b"ADC2";
 const INTENT_MAGIC: &[u8; 4] = b"ADI1";
 const FENCE_MAGIC: &[u8; 4] = b"ADF2";
 const EXPIRY_EVENT_MAGIC: &[u8; 4] = b"ADX1";
@@ -1275,12 +1276,41 @@ fn ensure_managed_command_admission(
     }
 }
 
+fn validate_remote_command_authorization(
+    owner: &IdempotencyOwner,
+    authorization: Option<&RemoteCommandAuthorizationBinding>,
+) -> Result<(), RuntimeStoreError> {
+    match (owner, authorization) {
+        (IdempotencyOwner::Local { .. }, None) => Ok(()),
+        // ADC1 remote row 只保留给保守的 legacy recovery；新的 production remote
+        // admission 必须通过 Store-issued proof 写入 ADC2。
+        (IdempotencyOwner::Remote { .. }, None) => Ok(()),
+        (IdempotencyOwner::Local { .. }, Some(_)) => Err(RuntimeStoreError::PairingConflict),
+        (
+            IdempotencyOwner::Remote {
+                machine_trust_domain,
+                device_route,
+                device_sign_fingerprint,
+            },
+            Some(binding),
+        ) if binding.machine_trust_domain() == *machine_trust_domain
+            && binding.device_route().as_bytes() == device_route
+            && binding.device_sign_fingerprint() == *device_sign_fingerprint =>
+        {
+            Ok(())
+        }
+        (IdempotencyOwner::Remote { .. }, Some(_)) => Err(RuntimeStoreError::PairingConflict),
+    }
+}
+
 pub(crate) fn accept_command(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
     input: AcceptCommand,
+    remote_authorization: Option<RemoteCommandAuthorizationBinding>,
     effects: &mut CommandStreamEffects,
 ) -> Result<AcceptOutcome, RuntimeStoreError> {
+    validate_remote_command_authorization(&input.owner, remote_authorization.as_ref())?;
     ensure_kind(input.conversation_id, RuntimeIdKind::Conversation)?;
     validate_payload_len(input.payload.len(), MAX_COMMAND_PAYLOAD_BYTES)?;
     if input.idempotency_key.is_empty() || input.idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
@@ -1313,6 +1343,10 @@ pub(crate) fn accept_command(
         input.expected_configuration_revision,
         &input.payload,
     )?;
+    let remote_authorization_bytes = remote_authorization
+        .as_ref()
+        .map(RemoteCommandAuthorizationBinding::canonical_bytes)
+        .transpose()?;
 
     let database_id = state.database_id;
     let preflight_ledger =
@@ -1360,6 +1394,7 @@ pub(crate) fn accept_command(
     let projected_write_bytes = projected_write_bytes(&[
         input.idempotency_key.len(),
         input.payload.len(),
+        remote_authorization_bytes.as_ref().map_or(0, Vec::len),
         ACCEPT_COMMAND_AUTHENTICATED_METADATA_ADMISSION_ESTIMATE_BYTES,
     ])?;
     let (preflight_conversation, _, _) = load_new_command_queue_state(
@@ -1435,14 +1470,25 @@ pub(crate) fn accept_command(
         .map(super::sequence::encode_sequence);
     let command_seq = next_sequence(SequenceScope::CommandSeq, previous.as_deref())?;
     let command_id = allocate_id(&transaction, config, RuntimeIdKind::Command)?;
-    let command_plaintext = Zeroizing::new(encode_fields(
-        COMMAND_MAGIC,
-        &[
-            owner_bytes.as_ref(),
-            input.idempotency_key.as_bytes(),
-            &input.payload,
-        ],
-    )?);
+    let command_plaintext = Zeroizing::new(match remote_authorization_bytes.as_deref() {
+        Some(binding) => encode_fields(
+            COMMAND_MAGIC_V2,
+            &[
+                owner_bytes.as_ref(),
+                input.idempotency_key.as_bytes(),
+                &input.payload,
+                binding,
+            ],
+        )?,
+        None => encode_fields(
+            COMMAND_MAGIC_V1,
+            &[
+                owner_bytes.as_ref(),
+                input.idempotency_key.as_bytes(),
+                &input.payload,
+            ],
+        )?,
+    });
     let sealed_command = seal(
         key_bundle,
         database_id,
@@ -1576,6 +1622,7 @@ pub(crate) fn accept_command(
             terminal_event_id: None,
             payload: input.payload,
             result: None,
+            remote_authorization,
         },
         queue_position: queue_admission.queue_position,
     })
@@ -4914,7 +4961,17 @@ fn load_command(
         &raw.sealed_command,
         MAX_CONVERSATION_DESCRIPTOR_BYTES,
     )?;
-    let fields = decode_fields(COMMAND_MAGIC, command_plaintext.expose_secret(), 3)?;
+    let (fields, remote_authorization) =
+        if command_plaintext.expose_secret().get(..4) == Some(COMMAND_MAGIC_V2) {
+            let fields = decode_fields(COMMAND_MAGIC_V2, command_plaintext.expose_secret(), 4)?;
+            let authorization = RemoteCommandAuthorizationBinding::from_canonical_bytes(fields[3])?;
+            (fields, Some(authorization))
+        } else {
+            (
+                decode_fields(COMMAND_MAGIC_V1, command_plaintext.expose_secret(), 3)?,
+                None,
+            )
+        };
     if fields[0].is_empty()
         || fields[1].is_empty()
         || fields[1].len() > MAX_IDEMPOTENCY_KEY_BYTES
@@ -4923,6 +4980,7 @@ fn load_command(
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     let owner = decode_canonical_owner(fields[0])?;
+    validate_remote_command_authorization(&owner, remote_authorization.as_ref())?;
     let conversation_id = runtime_id(RuntimeIdKind::Conversation, raw.conversation_id)?;
     let command_seq = decode_sequence(SequenceScope::CommandSeq, &raw.command_seq)?;
     let configuration_revision = super::command_configuration::load_revision(
@@ -5056,6 +5114,7 @@ fn load_command(
         terminal_event_id,
         payload: fields[2].to_vec(),
         result,
+        remote_authorization,
     })
 }
 

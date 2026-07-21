@@ -306,6 +306,7 @@ mod tests {
             terminal_event_id: None,
             payload: Vec::new(),
             result: None,
+            remote_authorization: None,
         }
     }
 

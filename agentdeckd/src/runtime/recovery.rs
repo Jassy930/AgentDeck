@@ -17,11 +17,12 @@ use super::process_identity::{
     ProcessGroupController, ProcessIdentity, ProcessObservation, ProcessSignal,
 };
 use super::store::{
-    CommandRecord, CommandTerminal, CompleteCommand, ConversationLifecycle, ConversationRecord,
-    ConversationRecoveryRecord, IdempotencyOwner, MarkConversationRecoveryBlocked,
-    RecoverStartedCommand, RecoveryBlockedCommandBinding, RecoveryFenceBinding, RuntimeId,
-    RuntimeStoreError, RuntimeStoreHandle, StartedBeforeReleaseTermination, StartedRecoveryRecord,
-    TerminateStartedBeforeRelease,
+    AcceptedTerminationReason, CommandRecord, CommandTerminal, CompleteCommand,
+    ConversationLifecycle, ConversationRecord, ConversationRecoveryRecord, IdempotencyOwner,
+    MarkConversationRecoveryBlocked, RecoverStartedCommand, RecoveryBlockedCommandBinding,
+    RecoveryFenceBinding, RemoteCommandAuthorizationStatus, RuntimeId, RuntimeStoreError,
+    RuntimeStoreHandle, StartedBeforeReleaseTermination, StartedRecoveryRecord,
+    TerminateAcceptedCommand, TerminateStartedBeforeRelease,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +115,14 @@ impl RuntimeRecoveryReport {
             .map(|outcome| outcome.durable_accepted_command_ids.len())
             .sum()
     }
+
+    pub(crate) fn blocked_conversation_ids(&self) -> impl Iterator<Item = RuntimeId> + '_ {
+        self.conversations
+            .iter()
+            .filter_map(|(conversation_id, outcome)| {
+                (outcome.state == ConversationRecoveryState::Blocked).then_some(*conversation_id)
+            })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -197,18 +206,12 @@ impl RuntimeRecoveryCoordinator {
         Fut: Future<Output = Result<(), E>>,
     {
         let mut plans = self.classify_first_pass().await?;
-        let remote_accepted_unsupported =
-            reject_remote_accepted && plans.values().any(|plan| plan.contains_remote_accepted);
+        let _ = reject_remote_accepted;
         self.persist_safe_interruptions(&plans).await?;
         let conversations = self
-            .verify_second_pass_and_install(&mut plans, install, !remote_accepted_unsupported)
+            .verify_second_pass_and_install(&mut plans, install, true)
             .await?;
         if !plans.is_empty() {
-            return Err(RuntimeRecoveryInstallError::Recovery(
-                RuntimeRecoveryError::ReconciliationInvariant,
-            ));
-        }
-        if remote_accepted_unsupported {
             return Err(RuntimeRecoveryInstallError::Recovery(
                 RuntimeRecoveryError::ReconciliationInvariant,
             ));
@@ -230,7 +233,7 @@ impl RuntimeRecoveryCoordinator {
             let page = self.store.load_recovery_page(cursor).await?;
             if let Some(recovery) = page.conversation {
                 let conversation_id = recovery.conversation.conversation_id;
-                let plan = self.classify_conversation(recovery).await;
+                let plan = self.classify_conversation(recovery).await?;
                 if plans.insert(conversation_id, plan).is_some() {
                     return Err(RuntimeRecoveryError::ReconciliationInvariant);
                 }
@@ -252,28 +255,58 @@ impl RuntimeRecoveryCoordinator {
     async fn classify_conversation(
         &self,
         recovery: ConversationRecoveryRecord,
-    ) -> ConversationPlan {
+    ) -> Result<ConversationPlan, RuntimeRecoveryError> {
         let lifecycle_blocked =
             recovery.conversation.lifecycle == ConversationLifecycle::RecoveryBlocked;
+        let mut block_binding = None;
+        let mut revoke_before_start = Vec::new();
+        for command in &recovery.accepted {
+            if !matches!(command.owner, IdempotencyOwner::Remote { .. }) {
+                continue;
+            }
+            let status = match command.remote_authorization_binding() {
+                Some(binding) => {
+                    self.store
+                        .classify_remote_command_authorization(binding)
+                        .await?
+                }
+                None => RemoteCommandAuthorizationStatus::Unprovable,
+            };
+            match status {
+                RemoteCommandAuthorizationStatus::Active => {}
+                RemoteCommandAuthorizationStatus::Inactive => {
+                    revoke_before_start.push((command.command_id, command.owner.clone()));
+                }
+                RemoteCommandAuthorizationStatus::Unprovable => {
+                    block_binding.get_or_insert(RecoveryBlockedCommandBinding::Accepted {
+                        command_id: command.command_id,
+                    });
+                }
+            }
+        }
         let durable_accepted_command_ids = recovery
             .accepted
             .iter()
+            .filter(|command| {
+                !revoke_before_start
+                    .iter()
+                    .any(|(command_id, _)| *command_id == command.command_id)
+            })
             .map(|command| command.command_id)
             .collect();
-        let contains_remote_accepted = recovery
-            .accepted
-            .iter()
-            .any(|command| matches!(command.owner, IdempotencyOwner::Remote { .. }));
+        let authorization_blocked = block_binding.is_some();
         let Some(started) = recovery.started else {
-            return ConversationPlan {
+            return Ok(ConversationPlan {
                 started: None,
-                blocked: lifecycle_blocked,
+                blocked: lifecycle_blocked || authorization_blocked,
                 durable_accepted_command_ids,
-                contains_remote_accepted,
-            };
+                block_binding,
+                revoke_before_start,
+            });
         };
         let interruption = PlannedInterruption::from_started(&started);
         let blocked = lifecycle_blocked
+            || authorization_blocked
             || match started.fence.as_ref() {
                 // Started without a durable fence means no process identity was promoted. The
                 // blocked gate's daemon-owned control pipe is gone after the crash, so there is
@@ -288,12 +321,13 @@ impl RuntimeRecoveryCoordinator {
                     Err(_) => true,
                 },
             };
-        ConversationPlan {
+        Ok(ConversationPlan {
             started: Some(interruption),
             blocked,
             durable_accepted_command_ids,
-            contains_remote_accepted,
-        }
+            block_binding,
+            revoke_before_start,
+        })
     }
 
     async fn fence_process_group(&self, identity: ProcessIdentity) -> bool {
@@ -344,13 +378,26 @@ impl RuntimeRecoveryCoordinator {
         plans: &BTreeMap<RuntimeId, ConversationPlan>,
     ) -> Result<(), RuntimeRecoveryError> {
         for (conversation_id, plan) in plans {
+            for (command_id, expected_owner) in &plan.revoke_before_start {
+                retry_terminate_accepted(
+                    &self.store,
+                    TerminateAcceptedCommand {
+                        conversation_id: *conversation_id,
+                        command_id: *command_id,
+                        expected_owner: expected_owner.clone(),
+                        reason: AcceptedTerminationReason::RevokedBeforeStart,
+                    },
+                )
+                .await?;
+            }
             if plan.blocked {
                 let input = MarkConversationRecoveryBlocked {
                     conversation_id: *conversation_id,
                     expected_command: plan
                         .started
                         .as_ref()
-                        .map(|interruption| interruption.binding.clone()),
+                        .map(|interruption| interruption.binding.clone())
+                        .or_else(|| plan.block_binding.clone()),
                 };
                 retry_mark_recovery_blocked(&self.store, input).await?;
                 continue;
@@ -459,7 +506,8 @@ struct ConversationPlan {
     started: Option<PlannedInterruption>,
     blocked: bool,
     durable_accepted_command_ids: Vec<RuntimeId>,
-    contains_remote_accepted: bool,
+    block_binding: Option<RecoveryBlockedCommandBinding>,
+    revoke_before_start: Vec<(RuntimeId, IdempotencyOwner)>,
 }
 
 #[derive(Eq, PartialEq)]
@@ -537,13 +585,7 @@ fn verify_conversation(
         .iter()
         .map(|command| command.command_id)
         .collect::<Vec<_>>();
-    let contains_remote_accepted = recovery
-        .accepted
-        .iter()
-        .any(|command| matches!(command.owner, IdempotencyOwner::Remote { .. }));
-    if durable_accepted_command_ids != plan.durable_accepted_command_ids
-        || contains_remote_accepted != plan.contains_remote_accepted
-    {
+    if durable_accepted_command_ids != plan.durable_accepted_command_ids {
         return Err(RuntimeRecoveryError::ReconciliationInvariant);
     }
     if plan.blocked {
@@ -635,6 +677,19 @@ async fn retry_terminate_before_release(
             .terminate_started_before_release(input)
             .await
             .map(|_| ()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn retry_terminate_accepted(
+    store: &RuntimeStoreHandle,
+    input: TerminateAcceptedCommand,
+) -> Result<(), RuntimeStoreError> {
+    match store.terminate_accepted_command(input.clone()).await {
+        Ok(_) => Ok(()),
+        Err(RuntimeStoreError::CommitOutcomeUnknown { .. }) => {
+            store.terminate_accepted_command(input).await.map(|_| ())
+        }
         Err(error) => Err(error),
     }
 }
@@ -870,10 +925,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_accepted_rejection_persists_other_sticky_block_before_reopen() {
-        // 威胁场景：同一第一遍 snapshot 同时含尚不支持恢复的 remote Accepted 与
-        // IdentityMismatch Started。若先返回 remote 错误，blocked binding 未落库；未来
-        // P4 移除 early reject 且旧进程已消失时，successor 会被误判可安全启动。
+    async fn unprovable_remote_accepted_and_other_sticky_block_persist_before_reopen() {
+        // 威胁场景：同一第一遍 snapshot 同时含 ADC1/unprovable remote Accepted 与
+        // IdentityMismatch Started。两者必须各自持久化 conversation-scoped block，不能
+        // 因其中一项提前返回而漏掉另一项，也不能阻断其它健康 conversation。
         let root = TestRoot::new();
         let store = root.store().await;
 
@@ -981,7 +1036,7 @@ mod tests {
                 kill_grace: Duration::from_millis(10),
             },
         );
-        let error = recovery
+        let (report, _permit) = recovery
             .reconcile_and_install(move |_conversation, _accepted| {
                 let installed = installed_for_closure.clone();
                 async move {
@@ -990,11 +1045,21 @@ mod tests {
                 }
             })
             .await
-            .expect_err("remote Accepted remains unsupported before P4 auth-ledger rebind");
-        assert!(matches!(
-            error,
-            RuntimeRecoveryInstallError::Recovery(RuntimeRecoveryError::ReconciliationInvariant)
-        ));
+            .expect("persist both conversation-scoped recovery blocks");
+        assert_eq!(
+            report
+                .conversation(remote_conversation_id)
+                .expect("first-process remote block")
+                .state(),
+            ConversationRecoveryState::Blocked
+        );
+        assert_eq!(
+            report
+                .conversation(blocked_conversation_id)
+                .expect("first-process identity block")
+                .state(),
+            ConversationRecoveryState::Blocked
+        );
         assert_eq!(installed.load(Ordering::SeqCst), 0);
         assert_eq!(first_processes.call_count(), 1);
         assert_eq!(
@@ -1035,8 +1100,11 @@ mod tests {
         let remote = report
             .conversation(remote_conversation_id)
             .expect("remote Accepted after reopen");
-        assert_eq!(remote.state(), ConversationRecoveryState::Ready);
-        assert_eq!(remote.accepted_command_ids(), &[remote_command.command_id]);
+        assert_eq!(remote.state(), ConversationRecoveryState::Blocked);
+        assert!(
+            remote.accepted_command_ids().is_empty(),
+            "sticky RecoveryBlocked 不得把 Accepted 重新交给 scheduler"
+        );
         assert_eq!(
             command_state(
                 &reopened,

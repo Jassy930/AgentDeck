@@ -5,12 +5,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use agentdeck_crypto::{SigningKey, sign_pair_response_received, sign_tbs};
-use agentdeck_protocol::e2ee::PairResponseReceivedV1;
+use agentdeck_protocol::e2ee::{
+    AuthorizationCapabilityV1, AuthorizationPermissionV1, PairResponseReceivedV1,
+};
 use agentdeck_protocol::relay_v2::frame::{
     GrantCommitted, OpaqueRouteFrame, PairRouteCloseOutcome, PairRouteClosed, RelayFrameBody,
 };
 use agentdeck_protocol::relay_v2::{
-    DeviceRevocation, Ed25519Signature, RELAY_PROTOCOL_VERSION, encode,
+    DeviceRevocation, DeviceRouteId, Ed25519Signature, GrantSerial, PairRouteId,
+    RELAY_PROTOCOL_VERSION, encode,
 };
 use agentdeck_protocol::runtime::{PairingReceipt, PairingState};
 
@@ -19,21 +22,24 @@ use crate::runtime::model::{
     MachineEnrollmentState, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
     RuntimeStoreOperation,
 };
-use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
+use crate::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
 use super::RuntimeStoreHandle;
-use super::pairing::PairingInviteLifecycle;
+use super::pairing::{AcceptPairRequest, CommitPairPending, PairingInviteLifecycle};
 use super::pairing_delivery::{
     AcknowledgePairResponseReceived, AcknowledgePairResponseReceivedOutcome,
 };
 use super::pairing_grant::PairingGrantPreparation;
 use super::pairing_grant_commit::{AcknowledgeGrantCommitted, GrantCommittedRecovery};
-use super::pairing_grant_tests::{awaiting_pairing, grant_input};
+use super::pairing_grant_tests::{
+    awaiting_pairing, awaiting_pairing_with_authorization, grant_input, grant_input_with, secret,
+};
 use super::pairing_grant_tx::ConfirmPairingGrantOutcome;
 use super::pairing_revocation::{BeginDeviceRevocation, BeginDeviceRevocationOutcome};
 use super::pairing_terminal::RECEIPT_RETENTION_MS;
 use super::pairing_tests::{
     GenerousCapacity, NOW_MS, OneShotFault, TestClock, TestRoot, artifact_bytes, make_active,
+    pending_envelope, prepare_unused_pairing, verified_request_with_authorization,
 };
 
 const DEVICE_SIGN_SEED: [u8; 32] = [0xa4; 32];
@@ -67,8 +73,31 @@ async fn prepare_committed(
     store: &RuntimeStoreHandle,
     clock: &AtomicU64,
 ) -> (PairingGrantPreparation, GrantCommittedRecovery) {
+    prepare_committed_with_authorization(store, clock, None).await
+}
+
+async fn prepare_committed_with_authorization(
+    store: &RuntimeStoreHandle,
+    clock: &AtomicU64,
+    authorization: Option<(
+        Vec<AuthorizationCapabilityV1>,
+        Vec<AuthorizationPermissionV1>,
+    )>,
+) -> (PairingGrantPreparation, GrantCommittedRecovery) {
     let (binding, data_cert) = make_active(store).await;
-    let preparation = awaiting_pairing(store, &binding, &data_cert).await;
+    let preparation = match authorization {
+        Some((capabilities, permissions)) => {
+            awaiting_pairing_with_authorization(
+                store,
+                &binding,
+                &data_cert,
+                capabilities,
+                permissions,
+            )
+            .await
+        }
+        None => awaiting_pairing(store, &binding, &data_cert).await,
+    };
     let confirmed = store
         .confirm_pairing_grant(grant_input(&preparation, &binding, &data_cert))
         .await
@@ -95,6 +124,13 @@ async fn prepare_committed(
 }
 
 fn verified_receipt(recovery: &GrantCommittedRecovery) -> VerifiedPairResponseReceipt {
+    verified_receipt_with_seed(recovery, DEVICE_SIGN_SEED)
+}
+
+fn verified_receipt_with_seed(
+    recovery: &GrantCommittedRecovery,
+    device_sign_seed: [u8; 32],
+) -> VerifiedPairResponseReceipt {
     let binding = PairResponseAccessBinding::from_frozen(
         recovery.invite(),
         recovery.request_hash(),
@@ -103,7 +139,7 @@ fn verified_receipt(recovery: &GrantCommittedRecovery) -> VerifiedPairResponseRe
     )
     .expect("rebuild authenticated response binding");
     let receipt = sign_pair_response_received(
-        &SigningKey::from_seed(&DEVICE_SIGN_SEED),
+        &SigningKey::from_seed(&device_sign_seed),
         binding.info(),
         binding.receipt_context(),
         PairResponseReceivedV1 {
@@ -142,14 +178,29 @@ fn delivery_counts(database: &std::path::Path) -> (u64, u64, u64, u64) {
 
 async fn authorization_only_store_for_test(database: &Path, revoking: bool) -> RuntimeStoreHandle {
     let keys = MemoryKeyStore::new();
+    let storage_kek =
+        load_or_create_storage_kek(&keys, database).expect("create authorization test StorageKEK");
+    authorization_store_for_test(database, storage_kek, None, revoking).await
+}
+
+async fn authorization_store_for_test(
+    database: &Path,
+    storage_kek: StorageKek,
+    authorization: Option<(
+        Vec<AuthorizationCapabilityV1>,
+        Vec<AuthorizationPermissionV1>,
+    )>,
+    revoking: bool,
+) -> RuntimeStoreHandle {
     let clock = Arc::new(AtomicU64::new(NOW_MS));
     let store = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(database.to_path_buf()).with_clock(TestClock(clock.clone())),
-        load_or_create_storage_kek(&keys, database).expect("create authorization test StorageKEK"),
+        storage_kek,
     )
     .await
     .expect("open authorization-only test Store");
-    let (preparation, committed) = prepare_committed(&store, &clock).await;
+    let (preparation, committed) =
+        prepare_committed_with_authorization(&store, &clock, authorization).await;
     let proof = verified_receipt(&committed);
     clock.store(NOW_MS + 2, Ordering::SeqCst);
     let close = match store
@@ -221,6 +272,171 @@ pub(crate) async fn active_authorization_store_for_test(database: &Path) -> Runt
 
 pub(crate) async fn revoking_authorization_store_for_test(database: &Path) -> RuntimeStoreHandle {
     authorization_only_store_for_test(database, true).await
+}
+
+pub(crate) async fn active_authorization_store_with_permissions_for_test(
+    database: &Path,
+    storage_kek: StorageKek,
+    capabilities: Vec<AuthorizationCapabilityV1>,
+    permissions: Vec<AuthorizationPermissionV1>,
+) -> RuntimeStoreHandle {
+    authorization_store_for_test(
+        database,
+        storage_kek,
+        Some((capabilities, permissions)),
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn two_active_authorization_store_with_permissions_for_test(
+    database: &Path,
+    storage_kek: StorageKek,
+    capabilities: Vec<AuthorizationCapabilityV1>,
+    permissions: Vec<AuthorizationPermissionV1>,
+) -> RuntimeStoreHandle {
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(database.to_path_buf()).with_clock(TestClock(clock.clone())),
+        storage_kek,
+    )
+    .await
+    .expect("open two-device authorization Store");
+    let (first_preparation, first_committed) = prepare_committed_with_authorization(
+        &store,
+        &clock,
+        Some((capabilities.clone(), permissions.clone())),
+    )
+    .await;
+    deliver_and_close_for_test(
+        &store,
+        &clock,
+        first_preparation,
+        first_committed,
+        DEVICE_SIGN_SEED,
+        NOW_MS + 2,
+    )
+    .await;
+
+    let (binding, data_cert) = make_active(&store).await;
+    let (pairing_id, invite) = prepare_unused_pairing(
+        &store,
+        &binding,
+        &data_cert,
+        PairRouteId::from_bytes([0xb1; 16]),
+        0xb2,
+        0xb3,
+        "p44-second-active-device",
+    )
+    .await;
+    let verified = verified_request_with_authorization(
+        &invite,
+        0xb3,
+        0xb4,
+        0xb5,
+        0xb6,
+        capabilities,
+        permissions,
+    );
+    let request_hash = verified.request_hash();
+    store
+        .accept_pair_request(AcceptPairRequest::new(pairing_id, verified))
+        .await
+        .expect("accept second authorized request");
+    store
+        .commit_pair_pending(CommitPairPending::new(
+            pairing_id,
+            request_hash,
+            pending_envelope(0xb7),
+        ))
+        .await
+        .expect("commit second authorized pending");
+    let preparation = store
+        .load_pairing_invite(pairing_id)
+        .await
+        .expect("load second awaiting pairing")
+        .expect("second pairing exists")
+        .into_grant_preparation()
+        .expect("second pairing is awaiting confirmation");
+    let second_route = DeviceRouteId::from_bytes([0xd2; 16]);
+    let global = store
+        .load_global_key_state()
+        .await
+        .expect("load first global key state")
+        .expect("first global key state exists")
+        .next_for_device(second_route, secret(0xe1), secret(0xe2), secret(0xe3))
+        .expect("append second device keys");
+    let confirmed = store
+        .confirm_pairing_grant(grant_input_with(
+            &preparation,
+            &binding,
+            &data_cert,
+            second_route,
+            GrantSerial::new(1),
+            global,
+            None,
+            0xe4,
+        ))
+        .await
+        .expect("confirm second device");
+    let installing = match confirmed {
+        ConfirmPairingGrantOutcome::Confirmed { recovery, .. } => recovery,
+        other => panic!("second device must confirm: {other:?}"),
+    };
+    clock.store(NOW_MS + 3, Ordering::SeqCst);
+    let committed = match store
+        .acknowledge_grant_committed(AcknowledgeGrantCommitted::new(
+            preparation.pairing_id(),
+            grant_committed_frame(&installing),
+        ))
+        .await
+        .expect("commit second grant")
+    {
+        super::pairing_grant_commit::AcknowledgeGrantCommittedOutcome::Committed { recovery } => {
+            recovery
+        }
+        other => panic!("second GrantCommitted must transition: {other:?}"),
+    };
+    deliver_and_close_for_test(
+        &store,
+        &clock,
+        preparation,
+        committed,
+        [0xb4; 32],
+        NOW_MS + 4,
+    )
+    .await;
+    store
+}
+
+async fn deliver_and_close_for_test(
+    store: &RuntimeStoreHandle,
+    clock: &AtomicU64,
+    preparation: PairingGrantPreparation,
+    committed: GrantCommittedRecovery,
+    device_sign_seed: [u8; 32],
+    now_ms: u64,
+) {
+    let proof = verified_receipt_with_seed(&committed, device_sign_seed);
+    clock.store(now_ms, Ordering::SeqCst);
+    let close = match store
+        .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
+            preparation.pairing_id(),
+            &proof,
+        ))
+        .await
+        .expect("deliver active test grant")
+    {
+        AcknowledgePairResponseReceivedOutcome::Delivered { close } => close,
+        other => panic!("fresh active test grant must deliver: {other:?}"),
+    };
+    store
+        .acknowledge_pair_route_close(
+            preparation.pairing_id(),
+            close_terminal(close.pair_route(), PairRouteCloseOutcome::Closed),
+        )
+        .await
+        .expect("scrub delivered pairing row");
 }
 
 #[tokio::test]

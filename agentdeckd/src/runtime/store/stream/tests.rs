@@ -265,6 +265,7 @@ fn create_conversation_with_event(
             expected_configuration_revision: 1,
             payload: b"retention prompt".to_vec(),
         },
+        None,
         &mut effects,
     )
     .expect("accept retention command")

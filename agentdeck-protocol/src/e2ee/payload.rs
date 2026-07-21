@@ -25,7 +25,7 @@
 //! ```
 
 use crate::e2ee::context::OuterContextV1;
-use crate::e2ee::keys::KeyId;
+use crate::e2ee::keys::{KeyId, KeyPurpose};
 use crate::e2ee::{E2eeError, Enc};
 use crate::relay_v2::auth::{Ed25519Signature, PublicKeyBytes};
 use schemars::JsonSchema;
@@ -89,6 +89,10 @@ impl SealedPayloadKind {
 }
 
 const SEALED_PAYLOAD_MAGIC: &[u8; 5] = b"ADSP1";
+const SEALED_BLOB_DOMAIN: &[u8] = b"AgentDeck/SealedBlobV1\0";
+const SEALED_BLOB_NONCE_BYTES: usize = 12;
+const SEALED_BLOB_TAG_BYTES: usize = 16;
+const SEALED_BLOB_SIGNATURE_BYTES: usize = 64;
 
 /// 密文内 payload（业务类型 + 原始业务 bytes，整体由 AEAD 保护）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -186,7 +190,7 @@ impl UnsignedSealedBlobV1 {
     /// 确定性 canonical 编码（进入签名 preimage / wire）。
     fn canonical(&self) -> Vec<u8> {
         let mut e = Enc::new();
-        e.domain(b"AgentDeck/SealedBlobV1\0");
+        e.domain(SEALED_BLOB_DOMAIN);
         e.u16(self.format_version);
         e.u8(self.key_id.purpose.tag());
         e.u64(self.key_id.epoch);
@@ -251,6 +255,106 @@ impl SignedSealedBlobV1 {
         out
     }
 
+    /// Relay `SealedBlob` 的严格 canonical 逆解码入口。
+    ///
+    /// 在复制 ciphertext 前先完成总长、固定字段、所有长度前缀与 trailing 检查；成功
+    /// materialize 后再逐字节重编码核对，避免接受同一对象的第二种 wire 表示。
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, E2eeError> {
+        let minimum_bytes = SEALED_BLOB_DOMAIN.len()
+            + 2
+            + 1
+            + 8
+            + 8
+            + 8
+            + 4
+            + SEALED_BLOB_NONCE_BYTES
+            + 4
+            + SEALED_BLOB_TAG_BYTES
+            + SEALED_BLOB_SIGNATURE_BYTES;
+        if bytes.len() < minimum_bytes || bytes.len() >= crate::relay_v2::MAX_FRAME_BYTES {
+            return Err(E2eeError::BadCiphertext);
+        }
+
+        let mut cursor = 0;
+        if take_wire(bytes, &mut cursor, SEALED_BLOB_DOMAIN.len())? != SEALED_BLOB_DOMAIN {
+            return Err(E2eeError::BadCiphertext);
+        }
+        let format_version = take_wire_u16(bytes, &mut cursor)?;
+        if format_version != super::E2EE_FORMAT_VERSION {
+            return Err(E2eeError::BadCiphertext);
+        }
+        let purpose = match take_wire_u8(bytes, &mut cursor)? {
+            0 => KeyPurpose::Catalog,
+            1 => KeyPurpose::ConversationDek,
+            2 => KeyPurpose::DeviceCommandTx,
+            3 => KeyPurpose::DeviceReplyTx,
+            _ => return Err(E2eeError::BadCiphertext),
+        };
+        let key_id_epoch = take_wire_u64(bytes, &mut cursor)?;
+        let key_epoch = take_wire_u64(bytes, &mut cursor)?;
+        let key_directory_revision = take_wire_u64(bytes, &mut cursor)?;
+        if key_id_epoch == 0
+            || key_epoch == 0
+            || key_id_epoch != key_epoch
+            || key_directory_revision == 0
+        {
+            return Err(E2eeError::BadCiphertext);
+        }
+
+        let nonce_len = usize::try_from(take_wire_u32(bytes, &mut cursor)?)
+            .map_err(|_| E2eeError::BadCiphertext)?;
+        if nonce_len != SEALED_BLOB_NONCE_BYTES {
+            return Err(E2eeError::BadCiphertext);
+        }
+        let nonce: [u8; SEALED_BLOB_NONCE_BYTES] = take_wire(bytes, &mut cursor, nonce_len)?
+            .try_into()
+            .map_err(|_| E2eeError::BadCiphertext)?;
+
+        let ciphertext_len = usize::try_from(take_wire_u32(bytes, &mut cursor)?)
+            .map_err(|_| E2eeError::BadCiphertext)?;
+        if ciphertext_len < SEALED_BLOB_TAG_BYTES {
+            return Err(E2eeError::BadCiphertext);
+        }
+        let remaining = bytes
+            .len()
+            .checked_sub(cursor)
+            .ok_or(E2eeError::BadCiphertext)?;
+        if ciphertext_len
+            .checked_add(SEALED_BLOB_SIGNATURE_BYTES)
+            .ok_or(E2eeError::BadCiphertext)?
+            != remaining
+        {
+            return Err(E2eeError::BadCiphertext);
+        }
+        let ciphertext = take_wire(bytes, &mut cursor, ciphertext_len)?;
+        let signature: [u8; SEALED_BLOB_SIGNATURE_BYTES] =
+            take_wire(bytes, &mut cursor, SEALED_BLOB_SIGNATURE_BYTES)?
+                .try_into()
+                .map_err(|_| E2eeError::BadCiphertext)?;
+        if cursor != bytes.len() || signature.iter().all(|byte| *byte == 0) {
+            return Err(E2eeError::BadCiphertext);
+        }
+
+        let decoded = Self {
+            inner: UnsignedSealedBlobV1 {
+                format_version,
+                key_id: KeyId {
+                    purpose,
+                    epoch: key_id_epoch,
+                },
+                key_epoch,
+                key_directory_revision,
+                nonce,
+                ciphertext: ciphertext.to_vec(),
+            },
+            signature: Ed25519Signature(signature),
+        };
+        if decoded.to_wire_bytes() != bytes {
+            return Err(E2eeError::BadCiphertext);
+        }
+        Ok(decoded)
+    }
+
     /// 无 crypto verifier 的验证入口——**恒 fail-closed**。
     ///
     /// 真实 Ed25519 验签经 [`SignedSealedBlobV1::verify_with`] 由 `agentdeck-crypto`
@@ -279,6 +383,45 @@ impl SignedSealedBlobV1 {
         verifier.verify_sealed_tbs(&tbs, &self.signature)?;
         Ok(VerifiedSealedBlobV1 { inner: self })
     }
+}
+
+fn take_wire<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], E2eeError> {
+    let end = cursor
+        .checked_add(length)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(E2eeError::BadCiphertext)?;
+    let value = &bytes[*cursor..end];
+    *cursor = end;
+    Ok(value)
+}
+
+fn take_wire_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, E2eeError> {
+    Ok(take_wire(bytes, cursor, 1)?[0])
+}
+
+fn take_wire_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, E2eeError> {
+    let value: [u8; 2] = take_wire(bytes, cursor, 2)?
+        .try_into()
+        .map_err(|_| E2eeError::BadCiphertext)?;
+    Ok(u16::from_be_bytes(value))
+}
+
+fn take_wire_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, E2eeError> {
+    let value: [u8; 4] = take_wire(bytes, cursor, 4)?
+        .try_into()
+        .map_err(|_| E2eeError::BadCiphertext)?;
+    Ok(u32::from_be_bytes(value))
+}
+
+fn take_wire_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, E2eeError> {
+    let value: [u8; 8] = take_wire(bytes, cursor, 8)?
+        .try_into()
+        .map_err(|_| E2eeError::BadCiphertext)?;
+    Ok(u64::from_be_bytes(value))
 }
 
 /// P1.4 verifier-hook（design RC-15）：由 `agentdeck-crypto` 用 ed25519-dalek 实现真实的

@@ -41,6 +41,17 @@ pub enum RuntimeSizeError {
     Encode(String),
 }
 
+/// RemoteLink 解密后的 Runtime ingress 错误。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeDecodeError {
+    #[error("runtime JSON frame exceeds {MAX_RUNTIME_JSON_FRAME_BYTES} bytes (1 MiB)")]
+    FrameTooLarge,
+    #[error("failed to decode runtime envelope: {0}")]
+    Decode(String),
+    #[error("remote runtime ingress accepts Request envelopes only")]
+    NotRequest,
+}
+
 /// 校验一个已编码 `RuntimeRequest` 的字节数不超过 1 MiB（不 panic）。
 pub fn ensure_request_within_limit(encoded_len: usize) -> Result<(), RuntimeSizeError> {
     if encoded_len >= MAX_RUNTIME_REQUEST_BYTES {
@@ -87,6 +98,22 @@ impl RuntimeEnvelope {
             return Err(RuntimeSizeError::FrameTooLarge);
         }
         Ok(bytes)
+    }
+
+    /// 解密后的 remote Runtime ingress 唯一受检入口。
+    ///
+    /// raw frame 必须严格小于 1 MiB；随后复用 `RuntimeEnvelope` 的 deny-unknown、
+    /// duplicate-field 与 current-version 反序列化约束，并只允许 client→daemon Request。
+    pub fn from_json_bytes_checked(bytes: &[u8]) -> Result<Self, RuntimeDecodeError> {
+        if bytes.len() >= MAX_RUNTIME_JSON_FRAME_BYTES {
+            return Err(RuntimeDecodeError::FrameTooLarge);
+        }
+        let envelope: Self = serde_json::from_slice(bytes)
+            .map_err(|error| RuntimeDecodeError::Decode(error.to_string()))?;
+        if !matches!(&envelope.body, RuntimeMessage::Request(_)) {
+            return Err(RuntimeDecodeError::NotRequest);
+        }
+        Ok(envelope)
     }
 }
 

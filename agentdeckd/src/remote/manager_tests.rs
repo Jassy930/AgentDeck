@@ -505,6 +505,39 @@ async fn finish_split_store_fixture(
     let _ = fs::remove_dir_all(fixture.root);
 }
 
+#[tokio::test]
+async fn unavailable_p4_5_egress_keeps_business_lane_unclaimed_for_pairing_only_startup() {
+    let mut fixture = active_fixture("p44-egress-gated").await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(
+            fixture
+                .identity
+                .take()
+                .expect("active fixture owns machine identity"),
+        ),
+    );
+    let machine_route = MachineRouteId::from_bytes([0x22; 16]);
+    let (mut transport, _pairing_lane, _harness) =
+        crate::remote::transport::active_pairing_transport_for_test(machine_route);
+
+    {
+        let mut state = manager.state.lock().await;
+        manager
+            .start_remote_link(&mut state, &mut transport, *machine_route.as_bytes())
+            .expect("P4.5-unavailable business ingress is gated without failing pairing startup");
+        assert!(state.link.is_none());
+    }
+    let _business = transport
+        .take_business_lane()
+        .expect("readiness gate must run before claiming the unique business lane");
+
+    transport.shutdown().await;
+    finish_fixture(manager, fixture).await;
+}
+
 #[derive(Default)]
 struct RecordingPurgeSink {
     intent_calls: AtomicUsize,

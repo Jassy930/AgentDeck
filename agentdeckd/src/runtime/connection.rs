@@ -9,10 +9,13 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
 
+use agentdeck_protocol::e2ee::AuthorizationPermissionV1;
 use agentdeck_protocol::runtime::RuntimeEnvelope;
+use agentdeck_protocol::runtime::identity::{DeviceHandle, GrantSerial};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use zeroize::Zeroizing;
 
+use crate::runtime::model::RemoteCommandAuthorizationBinding;
 use crate::runtime::store::IdempotencyOwner;
 
 pub const DEFAULT_CONNECTION_WRITER_FRAMES: usize = 512;
@@ -59,7 +62,59 @@ struct AuthorizationLease {
     inflight: std::sync::atomic::AtomicUsize,
     quiesced: tokio::sync::Notify,
     approval_permissions: ApprovalPermissionGrant,
+    remote_permissions: Option<RemotePermissionGrant>,
+    remote_command_authorization: Option<RemoteCommandAuthorizationBinding>,
     local_administration: bool,
+}
+
+/// Store-authenticated remote permission allowlist。固定 bitset 避免把 grant 的
+/// 可变长 wire `Vec` 留在 Core lease 内，也让相同完整身份的重复签发可以做 exact
+/// permission conflict 检查。`None` 只表示已通过 same-EUID issuer 的 local
+/// principal；remote principal 必须始终携带 `Some`（允许为空集合）。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RemotePermissionGrant(u16);
+
+impl RemotePermissionGrant {
+    #[cfg(test)]
+    const ALL: Self = Self((1 << 9) - 1);
+
+    fn from_permissions(permissions: &[AuthorizationPermissionV1]) -> Self {
+        let mut bits = 0_u16;
+        for permission in permissions {
+            bits |= permission_bit(*permission);
+        }
+        Self(bits)
+    }
+
+    const fn allows(self, permission: AuthorizationPermissionV1) -> bool {
+        self.0 & permission_bit(permission) != 0
+    }
+
+    const fn approval_permissions(self) -> ApprovalPermissionGrant {
+        match (
+            self.allows(AuthorizationPermissionV1::ApprovalResolve),
+            self.allows(AuthorizationPermissionV1::ApprovalRetry),
+        ) {
+            (false, false) => ApprovalPermissionGrant::None,
+            (true, false) => ApprovalPermissionGrant::ResolveOnly,
+            (false, true) => ApprovalPermissionGrant::RetryOnly,
+            (true, true) => ApprovalPermissionGrant::ResolveAndRetry,
+        }
+    }
+}
+
+const fn permission_bit(permission: AuthorizationPermissionV1) -> u16 {
+    1 << match permission {
+        AuthorizationPermissionV1::CatalogRead => 0,
+        AuthorizationPermissionV1::ConversationRead => 1,
+        AuthorizationPermissionV1::ConversationStart => 2,
+        AuthorizationPermissionV1::PromptSend => 3,
+        AuthorizationPermissionV1::CommandCancel => 4,
+        AuthorizationPermissionV1::ApprovalResolve => 5,
+        AuthorizationPermissionV1::ApprovalRetry => 6,
+        AuthorizationPermissionV1::MetadataWrite => 7,
+        AuthorizationPermissionV1::RevokeSelf => 8,
+    }
 }
 
 #[allow(dead_code)] // P3.5 Core resolve/retry 接线后构造非 None grants。
@@ -120,6 +175,14 @@ impl AuthenticatedPrincipal {
         PrincipalAuthorizationKey(self.identity.clone())
     }
 
+    /// Durable prompt admission 只能冻结 Store proof 产生的 exact ADC2 binding。
+    /// local principal 与历史 test-only raw remote issuer 都不伪造该能力。
+    pub(crate) fn remote_command_authorization_binding(
+        &self,
+    ) -> Option<RemoteCommandAuthorizationBinding> {
+        self.authorization.remote_command_authorization.clone()
+    }
+
     /// 向调用方自己的 domain-separated buffer 写入完整 authorization identity。
     /// remote 必含 machine route 与 grant serial；不能退化成故意跨 renewal 稳定的
     /// idempotency owner。
@@ -154,6 +217,23 @@ impl AuthenticatedPrincipal {
     }
 
     pub(crate) fn try_enter(&self) -> Result<AuthorizationGuard, PrincipalAccessError> {
+        self.authorization.try_enter()
+    }
+
+    /// Runtime business authorization 的唯一 permission gate。local principal 已由
+    /// same-EUID transport issuer 认证，继续保持既有完整业务能力；remote principal
+    /// 必须同时命中 Store proof 固化进 lease 的九项 allowlist。
+    pub(crate) fn try_enter_runtime_permission(
+        &self,
+        permission: AuthorizationPermissionV1,
+    ) -> Result<AuthorizationGuard, PrincipalAccessError> {
+        if self
+            .authorization
+            .remote_permissions
+            .is_some_and(|permissions| !permissions.allows(permission))
+        {
+            return Err(PrincipalAccessError::PermissionDenied);
+        }
         self.authorization.try_enter()
     }
 
@@ -235,12 +315,19 @@ impl fmt::Debug for PrincipalAuthorizationKey {
 }
 
 impl AuthorizationLease {
-    fn new(approval_permissions: ApprovalPermissionGrant, local_administration: bool) -> Self {
+    fn new(
+        approval_permissions: ApprovalPermissionGrant,
+        remote_permissions: Option<RemotePermissionGrant>,
+        remote_command_authorization: Option<RemoteCommandAuthorizationBinding>,
+        local_administration: bool,
+    ) -> Self {
         Self {
             state: std::sync::atomic::AtomicU8::new(PRINCIPAL_ACTIVE),
             inflight: std::sync::atomic::AtomicUsize::new(0),
             quiesced: tokio::sync::Notify::new(),
             approval_permissions,
+            remote_permissions,
+            remote_command_authorization,
             local_administration,
         }
     }
@@ -267,14 +354,17 @@ impl AuthorizationLease {
     async fn begin_revoke(&self) -> Result<(), PrincipalAccessError> {
         use std::sync::atomic::Ordering;
 
-        self.state
-            .compare_exchange(
-                PRINCIPAL_ACTIVE,
-                PRINCIPAL_REVOKING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_| PrincipalAccessError::Revoked)?;
+        match self.state.compare_exchange(
+            PRINCIPAL_ACTIVE,
+            PRINCIPAL_REVOKING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(PRINCIPAL_ACTIVE) | Err(PRINCIPAL_REVOKING) => {}
+            Ok(_) => unreachable!("compare_exchange success must return Active"),
+            Err(PRINCIPAL_REVOKED) => return Err(PrincipalAccessError::Revoked),
+            Err(_) => return Err(PrincipalAccessError::Revoked),
+        }
         loop {
             // `notify_waiters` 不保留 permit：先注册并 enable waiter，再复查 inflight，
             // 消除“最后一个 guard 在 load 与 notified 之间 drop”的 lost wakeup。
@@ -471,7 +561,9 @@ impl PrincipalIssuer {
                 client_installation_id,
             },
             ApprovalPermissionGrant::None,
+            None,
             false,
+            None,
         )
     }
 
@@ -489,7 +581,9 @@ impl PrincipalIssuer {
                 client_installation_id,
             },
             ApprovalPermissionGrant::ResolveAndRetry,
+            None,
             true,
+            None,
         )
     }
 
@@ -507,8 +601,70 @@ impl PrincipalIssuer {
                 client_installation_id,
             },
             permissions,
+            None,
             false,
+            None,
         )
+    }
+
+    /// 只接受 Store-issued `ActiveRemoteIngressProof` 解出的完整字段。调用方不能
+    /// 省略 trust domain、grant serial 或 permissions；相同完整 identity 的 lease
+    /// 复用还会 exact 比较 permission bitset，防止 stale proof 静默升级/降级。
+    pub(crate) fn issue_verified_remote(
+        &self,
+        binding: RemoteCommandAuthorizationBinding,
+    ) -> Result<AuthenticatedPrincipal, PrincipalAccessError> {
+        let machine_trust_domain = binding.machine_trust_domain();
+        if machine_trust_domain != self.machine_trust_domain {
+            return Err(PrincipalAccessError::PermissionDenied);
+        }
+        let remote_permissions = RemotePermissionGrant::from_permissions(binding.permissions());
+        self.issue(
+            PrincipalIdentity::Remote {
+                machine_trust_domain,
+                machine_route: *binding.machine_route().as_bytes(),
+                device_route: *binding.device_route().as_bytes(),
+                grant_serial: binding.grant_serial().value(),
+                device_sign_fingerprint: binding.device_sign_fingerprint(),
+            },
+            remote_permissions.approval_permissions(),
+            Some(remote_permissions),
+            false,
+            Some(binding),
+        )
+    }
+
+    /// local durable revoke 用 canonical DeviceHandle + serial 找回 issuer registry 中
+    /// 的 exact remote lease。lookup 不依赖 active connection，因此离线设备同样能先
+    /// 进入 Revoking；不存在或非 canonical handle 返回 `None`，绝不近似匹配。
+    pub(crate) fn remote_principal_for_revoke(
+        &self,
+        device: &DeviceHandle,
+        grant_serial: GrantSerial,
+    ) -> Result<Option<AuthenticatedPrincipal>, PrincipalAccessError> {
+        let Some(device_route) = parse_canonical_device_handle(device) else {
+            return Ok(None);
+        };
+        let leases = self
+            .leases
+            .lock()
+            .map_err(|_| PrincipalAccessError::RegistryUnavailable)?;
+        Ok(leases
+            .iter()
+            .find(|(identity, _)| {
+                matches!(
+                    identity,
+                    PrincipalIdentity::Remote {
+                        device_route: candidate_route,
+                        grant_serial: candidate_serial,
+                        ..
+                    } if *candidate_route == device_route && *candidate_serial == grant_serial.0
+                )
+            })
+            .map(|(identity, authorization)| AuthenticatedPrincipal {
+                identity: Arc::new(identity.clone()),
+                authorization: authorization.clone(),
+            }))
     }
 
     #[cfg(test)]
@@ -528,7 +684,9 @@ impl PrincipalIssuer {
                 device_sign_fingerprint,
             },
             ApprovalPermissionGrant::None,
+            Some(RemotePermissionGrant::ALL),
             false,
+            None,
         )
     }
 
@@ -550,7 +708,9 @@ impl PrincipalIssuer {
                 device_sign_fingerprint,
             },
             permissions,
+            Some(RemotePermissionGrant::ALL),
             false,
+            None,
         )
     }
 
@@ -558,7 +718,9 @@ impl PrincipalIssuer {
         &self,
         identity: PrincipalIdentity,
         approval_permissions: ApprovalPermissionGrant,
+        remote_permissions: Option<RemotePermissionGrant>,
         local_administration: bool,
+        remote_command_authorization: Option<RemoteCommandAuthorizationBinding>,
     ) -> Result<AuthenticatedPrincipal, PrincipalAccessError> {
         let mut leases = self
             .leases
@@ -567,6 +729,8 @@ impl PrincipalIssuer {
         let authorization = match leases.get(&identity).cloned() {
             Some(lease) => {
                 if lease.approval_permissions != approval_permissions
+                    || lease.remote_permissions != remote_permissions
+                    || lease.remote_command_authorization != remote_command_authorization
                     || lease.local_administration != local_administration
                 {
                     return Err(PrincipalAccessError::PermissionConflict);
@@ -579,6 +743,8 @@ impl PrincipalIssuer {
                 }
                 let lease = Arc::new(AuthorizationLease::new(
                     approval_permissions,
+                    remote_permissions,
+                    remote_command_authorization,
                     local_administration,
                 ));
                 leases.insert(identity.clone(), lease.clone());
@@ -590,6 +756,25 @@ impl PrincipalIssuer {
             authorization,
         })
     }
+}
+
+fn parse_canonical_device_handle(handle: &DeviceHandle) -> Option<[u8; 16]> {
+    let encoded = handle.as_str().strip_prefix("device-")?;
+    if encoded.len() != 32 {
+        return None;
+    }
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    let encoded = encoded.as_bytes();
+    let mut route = [0_u8; 16];
+    for (index, value) in route.iter_mut().enumerate() {
+        let offset = index * 2;
+        *value = (nibble(encoded[offset])? << 4) | nibble(encoded[offset + 1])?;
+    }
+    (route != [0; 16]).then_some(route)
 }
 
 /// 单次连接随机 identity；连接重建必然获得新 generation/id。
@@ -607,7 +792,7 @@ impl ConnectionId {
     }
 
     #[cfg(test)]
-    pub(super) const fn from_test_bytes(bytes: [u8; 16]) -> Self {
+    pub(crate) const fn from_test_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
 }
@@ -1071,6 +1256,22 @@ impl ConnectionRegistry {
             .get(&id)
             .map(|entry| entry.principal.clone())
             .ok_or(ConnectionError::NotFound)
+    }
+
+    /// Durable local revoke 在 lease 进入 Revoked 后用 exact authorization identity
+    /// 取得应切断的 connection 快照。只返回 opaque IDs；真正 subscription/job/writer
+    /// 清理由 RuntimeCore 复用标准 disconnect 顺序完成。
+    pub(crate) fn connections_for_authorization(
+        &self,
+        key: &PrincipalAuthorizationKey,
+    ) -> Result<Vec<ConnectionId>, ConnectionError> {
+        Ok(self
+            .entries
+            .lock()
+            .map_err(|_| ConnectionError::RegistryPoisoned)?
+            .iter()
+            .filter_map(|(id, entry)| entry.principal.authorization_key().eq(key).then_some(*id))
+            .collect())
     }
 
     /// 只做同步 `try_send`。任一 frame/byte 上限命中即移除并 abort 当前连接，
