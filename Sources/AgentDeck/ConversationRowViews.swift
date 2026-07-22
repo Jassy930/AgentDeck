@@ -39,7 +39,12 @@ import AgentDeckCore
 @MainActor
 protocol ConversationDisclosureStateStore: AnyObject {
     func isItemExpanded(_ itemId: String) -> Bool
+    func isItemCollapsed(_ itemId: String) -> Bool
     func setItem(_ itemId: String, expanded: Bool)
+}
+
+extension ConversationDisclosureStateStore {
+    func isItemCollapsed(_ itemId: String) -> Bool { false }
 }
 
 // MARK: - Shared metrics & helpers
@@ -276,25 +281,50 @@ final class MessageCellView: ConversationRowCellView {
 /// auto-expanded while a turn is running. The body is small secondary-coloured
 /// streaming text.
 final class ReasoningCellView: ConversationRowCellView {
-    override var verticalPadding: CGFloat { 8 }
+    override var verticalPadding: CGFloat { 6 }
 
-    private let disclosure = ConversationRowControls.disclosureButton(title: "Reasoning")
+    private let headerRow = NSStackView()
+    private let disclosure = ConversationRowControls.disclosureButton(title: "")
+    private let titleLabel = ConversationRowControls.label(
+        font: ConversationRowMetrics.monoCaptionFont,
+        color: DesignTokens.text3,
+        selectable: false
+    )
     private let streamingView = StreamingTextContainerView()
     private var bodyConstraints: [NSLayoutConstraint] = []
+    private var itemId = ""
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         applyVerticalPadding()
-        disclosure.title = "Reasoning"
-        disclosure.font = ConversationRowMetrics.calloutFont
+        headerRow.orientation = .horizontal
+        headerRow.alignment = .centerY
+        headerRow.spacing = 6
+        headerRow.translatesAutoresizingMaskIntoConstraints = false
+
+        titleLabel.stringValue = "思考过程"
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+        titleLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         disclosure.target = self
         disclosure.action = #selector(toggle)
+        disclosure.toolTip = "展开思考过程"
+        disclosure.setAccessibilityLabel("思考过程")
+        disclosure.setContentHuggingPriority(.required, for: .horizontal)
+        disclosure.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        headerRow.addArrangedSubview(disclosure)
+        headerRow.addArrangedSubview(titleLabel)
         streamingView.translatesAutoresizingMaskIntoConstraints = false
-        contentStack.addArrangedSubview(disclosure)
+        contentStack.addArrangedSubview(headerRow)
         contentStack.addArrangedSubview(streamingView)
         bodyConstraints = [
+            headerRow.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor),
             streamingView.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor),
             streamingView.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor),
+            disclosure.widthAnchor.constraint(equalToConstant: 16),
+            disclosure.heightAnchor.constraint(equalToConstant: 16),
         ]
         NSLayoutConstraint.activate(bodyConstraints)
     }
@@ -302,15 +332,20 @@ final class ReasoningCellView: ConversationRowCellView {
     required init?(coder: NSCoder) { super.init(coder: coder) }
 
     @objc private func toggle() {
-        setExpanded(disclosure.state == .on)
+        let expanded = disclosure.state == .on
+        setExpanded(expanded)
+        disclosureStore?.setItem(itemId, expanded: expanded)
     }
 
     private func setExpanded(_ expanded: Bool) {
         disclosure.state = expanded ? .on : .off
+        disclosure.toolTip = expanded ? "收起思考过程" : "展开思考过程"
+        disclosure.setAccessibilityHelp(disclosure.toolTip)
         streamingView.isHidden = !expanded
     }
 
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
+        itemId = row.item.id
         streamingView.bindBuffer(
             to: row.item.textBuffer,
             font: .systemFont(ofSize: NSFont.smallSystemFontSize),
@@ -318,7 +353,11 @@ final class ReasoningCellView: ConversationRowCellView {
         )
         // Default-collapsed; auto-expand while the selected turn is running
         // (mirrors `model.shouldShowReasoningExpanded`).
-        setExpanded(model.shouldShowReasoningExpanded)
+        let explicitlyCollapsed = disclosureStore?.isItemCollapsed(itemId) ?? false
+        let expanded = !explicitlyCollapsed
+            && (model.shouldShowReasoningExpanded
+                || (disclosureStore?.isItemExpanded(itemId) ?? false))
+        setExpanded(expanded)
     }
 }
 

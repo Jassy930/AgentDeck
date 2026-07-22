@@ -12,7 +12,7 @@ final class ConversationDisclosurePersistenceTests: XCTestCase {
 
     private func makeModel(withShellOutput output: String) -> SessionModel {
         let model = SessionModel()
-        var user = UIItem(id: "u1", lifecycle: "completed", kind: "user", text: "run it")
+        let user = UIItem(id: "u1", lifecycle: "completed", kind: "user", text: "run it")
         user.textBuffer.replace(with: "run it")
         var shell = UIItem(id: "s1", lifecycle: "completed", kind: "shell")
         shell.command = "ls -la"
@@ -70,6 +70,57 @@ final class ConversationDisclosurePersistenceTests: XCTestCase {
         XCTAssertTrue((vc as ConversationDisclosureStateStore).isItemExpanded("s1"))
         let afterReconfigure = tableView.delegate?.tableView?(tableView, heightOfRow: shellRow) ?? 0
         XCTAssertEqual(afterReconfigure, expandedHeight, accuracy: 0.5, "重配后行高保持展开高度")
+    }
+
+    /// 不同会话的历史回放都可能生成相同的 `ai-1` / `s1` item ID；切换
+    /// viewport 时必须丢弃上一会话的 disclosure 状态，不能串到新会话。
+    func testViewportChangeClearsDisclosureStateForCollidingItemIds() async {
+        let model = makeModel(withShellOutput: "line1\nline2\n")
+        let reasoning = UIItem(id: "r1", lifecycle: "completed", kind: "reasoning", text: "thinking")
+        reasoning.textBuffer.replace(with: "thinking")
+        model.items.append(reasoning)
+        let vc = ConversationViewController(model: model)
+        _ = vc.view
+        let store = vc as ConversationDisclosureStateStore
+
+        store.setItem("s1", expanded: true)
+        store.setItem("r1", expanded: false)
+        XCTAssertTrue(store.isItemExpanded("s1"))
+        XCTAssertTrue(store.isItemCollapsed("r1"))
+
+        model.conversationViewportIdentity = "history:codex:other-thread:1"
+        for _ in 0..<50 {
+            if !store.isItemExpanded("s1"), !store.isItemCollapsed("r1") { break }
+            await Task.yield()
+        }
+
+        XCTAssertFalse(
+            store.isItemExpanded("s1"),
+            "切换会话后，同名 item 不应继承上一会话的展开状态"
+        )
+        XCTAssertFalse(
+            store.isItemCollapsed("r1"),
+            "切换会话后，同名 reasoning 不应继承上一会话的收起覆盖"
+        )
+    }
+
+    /// 新建空会话也属于 viewport 切换。即使新 rows 为空，table 仍必须
+    /// 显式 reload，不能把旧会话的 cell 留在屏幕上。
+    func testViewportChangeFromPopulatedConversationReloadsToEmptyTable() async throws {
+        let model = makeModel(withShellOutput: "line1\nline2\n")
+        let vc = ConversationViewController(model: model)
+        _ = vc.view
+        let tableView = try XCTUnwrap(firstTableView(in: vc.view))
+        tableView.reloadData()
+        XCTAssertGreaterThan(tableView.numberOfRows, 0)
+
+        model.startNewSessionFromCurrentProject()
+        for _ in 0..<50 {
+            if tableView.numberOfRows == 0 { break }
+            await Task.yield()
+        }
+
+        XCTAssertEqual(tableView.numberOfRows, 0, "新建空会话后不应残留旧会话行")
     }
 
     private func firstTableView(in view: NSView) -> NSTableView? {

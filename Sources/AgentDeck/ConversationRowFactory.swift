@@ -115,9 +115,9 @@ enum ConversationRowFactory {
                              ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutFont))
 
         case "reasoning":
-            // padding(.vertical, 8) + the "Reasoning" disclosure header. The
+            // padding(.vertical, 6) + the reasoning disclosure header. The
             // streamed body is collapsed by default, so it is NOT counted here.
-            let pad: CGFloat = 8 * 2
+            let pad: CGFloat = 6 * 2
             return pad + disclosureHeaderHeight
 
         case "shell":

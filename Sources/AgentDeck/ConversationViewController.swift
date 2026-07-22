@@ -84,6 +84,14 @@ final class ConversationViewController: NSViewController {
     /// the streaming reconfigure path (C1): a cell restores its expanded state
     /// from this set in `configure` instead of hard-resetting to collapsed.
     private var expandedItemIds: Set<String> = []
+    /// Reasoning auto-expands while a turn runs, so an explicit user collapse
+    /// needs a separate override instead of being indistinguishable from the
+    /// default "not manually expanded" state.
+    private var collapsedReasoningItemIds: Set<String> = []
+    /// 会话切换会重用同一个 controller，而不同 runtime 的合成 item ID
+    /// 都可能从 `ai-1` 开始。用 viewport identity 识别切换并清空 disclosure
+    /// 状态，避免上一个会话的展开/收起选择串到下一个会话。
+    private var displayedConversationViewportIdentity: String?
 
     // MARK: Views
 
@@ -214,6 +222,7 @@ final class ConversationViewController: NSViewController {
         self.view = root
         refreshEnvironmentPanelPresentation()
 
+        displayedConversationViewportIdentity = model.conversationViewportIdentity
         rebuildRows()
         bindModel()
         observeBoundsChanges()
@@ -317,6 +326,7 @@ final class ConversationViewController: NSViewController {
             _ = self.model.selectedItems
             _ = self.model.selectedPhase
             _ = self.model.shouldShowReasoningExpanded
+            _ = self.model.conversationViewportIdentity
             _ = self.model.scrollToLatestRequest
             _ = self.model.selectedActionRequest
             _ = self.model.selectedErrorMessage
@@ -330,8 +340,16 @@ final class ConversationViewController: NSViewController {
 
     private func modelDidChange() {
         refreshEnvironmentPanelPresentation()
+        let viewportChanged = displayedConversationViewportIdentity
+            != model.conversationViewportIdentity
         let previousExpansion = lastReasoningExpanded
         let previousSignatures = displayedRowSignatures
+        if viewportChanged {
+            displayedConversationViewportIdentity = model.conversationViewportIdentity
+            expandedItemIds.removeAll()
+            collapsedReasoningItemIds.removeAll()
+            cache.invalidateAll()
+        }
         rebuildRows()
         // The reasoning rows auto-expand/collapse with the running phase; their
         // height changes when that flips, so drop their cached heights.
@@ -340,7 +358,11 @@ final class ConversationViewController: NSViewController {
             invalidateReasoningHeights()
         }
 
-        applyRowUpdate(previousSignatures: previousSignatures, reasoningFlipped: reasoningFlipped)
+        applyRowUpdate(
+            previousSignatures: previousSignatures,
+            reasoningFlipped: reasoningFlipped,
+            forceFullReload: viewportChanged
+        )
 
         refreshFooter()
         inputBar.refreshQueuedCount()
@@ -369,8 +391,17 @@ final class ConversationViewController: NSViewController {
     ///   so the reload no longer destroys user state.
     private func applyRowUpdate(
         previousSignatures: [(id: String, version: Int)],
-        reasoningFlipped: Bool
+        reasoningFlipped: Bool,
+        forceFullReload: Bool = false
     ) {
+        if forceFullReload {
+            // 即使新 viewport 为空也必须 reload，否则旧会话的可见 cell 会残留。
+            tableView.reloadData()
+            if !rows.isEmpty {
+                tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<rows.count))
+            }
+            return
+        }
         let diff = ConversationRowsDiff.decide(
             previous: previousSignatures,
             next: displayedRowSignatures
@@ -609,7 +640,7 @@ final class ConversationViewController: NSViewController {
         version = version &* 31 &+ item.outputBuffer.text.utf8.count
         version = version &* 31 &+ item.diffBuffer.text.utf8.count
         version = version &* 31 &+ item.descriptionText.utf8.count
-        if row.item.kind == "reasoning", model.shouldShowReasoningExpanded {
+        if row.item.kind == "reasoning", isReasoningExpanded(item.id) {
             version = version &* 31 &+ 1  // distinct key for the expanded body
         }
         // A collapsible row that the user expanded measures taller (its body is
@@ -628,16 +659,21 @@ final class ConversationViewController: NSViewController {
     /// which expands when `model.shouldShowReasoningExpanded` is true.
     private func computeHeight(for row: ConversationDisplayRow, width: CGFloat) -> CGFloat {
         var height = ConversationRowFactory.height(for: row, width: width)
-        if row.item.kind == "reasoning", model.shouldShowReasoningExpanded {
+        if row.item.kind == "reasoning", isReasoningExpanded(row.item.id) {
             height += reasoningExpandedBodyHeight(for: row, width: width)
         }
         // The factory counts only the collapsed disclosure header for shell /
         // fileEdit / toolCall rows; when the user has expanded one, add its body
         // (output / diff / JSON payload) so the row reserves room for it. (C1)
-        if expandedItemIds.contains(row.item.id) {
+        if row.item.kind != "reasoning", expandedItemIds.contains(row.item.id) {
             height += disclosureBodyHeight(for: row, width: width)
         }
         return height
+    }
+
+    private func isReasoningExpanded(_ itemId: String) -> Bool {
+        !collapsedReasoningItemIds.contains(itemId)
+            && (model.shouldShowReasoningExpanded || expandedItemIds.contains(itemId))
     }
 
     /// Height of an expanded shell-output / fileEdit-diff body, measured the
@@ -746,12 +782,27 @@ extension ConversationViewController: ConversationDisclosureStateStore {
         expandedItemIds.contains(itemId)
     }
 
+    func isItemCollapsed(_ itemId: String) -> Bool {
+        collapsedReasoningItemIds.contains(itemId)
+    }
+
     /// Persist the toggle, then re-measure the affected row so the table opens /
     /// closes room for the disclosure body. The cell itself already showed /
     /// hid the body; this only updates the reserved height.
     func setItem(_ itemId: String, expanded: Bool) {
+        let isReasoning = rows.contains {
+            $0.item.id == itemId && $0.item.kind == "reasoning"
+        }
         let changed: Bool
-        if expanded {
+        if isReasoning, expanded {
+            let inserted = expandedItemIds.insert(itemId).inserted
+            let removed = collapsedReasoningItemIds.remove(itemId) != nil
+            changed = inserted || removed
+        } else if isReasoning {
+            let removed = expandedItemIds.remove(itemId) != nil
+            let inserted = collapsedReasoningItemIds.insert(itemId).inserted
+            changed = removed || inserted
+        } else if expanded {
             changed = expandedItemIds.insert(itemId).inserted
         } else {
             changed = expandedItemIds.remove(itemId) != nil
