@@ -243,6 +243,21 @@ struct ToolPresentationToolStatusTests {
         item.statusName = "inProgress"
         #expect(ToolPresentation.toolStatusSummary(item) == "进行中")
     }
+
+    @Test("collaboration events describe activity without inventing run status")
+    func collaborationActivityEventIsLocalized() {
+        for (activityEvent, expected) in [
+            ("started", "已开始工作"),
+            ("interacted", "已更新"),
+            ("interrupted", "已中断"),
+        ] {
+            var item = makeItem(lifecycle: "completed")
+            item.activityKind = "collaboration"
+            item.activityEvent = activityEvent
+            #expect(ToolPresentation.toolStatus(item) == activityEvent)
+            #expect(ToolPresentation.toolStatusSummary(item) == expected)
+        }
+    }
 }
 
 @Suite("ToolPresentation.toolMetadata")

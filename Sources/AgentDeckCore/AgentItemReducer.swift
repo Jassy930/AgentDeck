@@ -86,6 +86,8 @@ public enum AgentItemReducer {
             ui.savedPath = savedPath ?? ""
             ui.path = originalPath ?? savedPath ?? ""
         case .toolCall(let name, let args, let result, let meta):
+            ui.activityKind = stringExtension("activityKind", from: meta) ?? ""
+            ui.activityEvent = stringExtension("activityEvent", from: meta) ?? ""
             ui.tool = name
             ui.server = stringExtension("server", from: meta) ?? ""
             ui.namespace = stringExtension("namespace", from: meta) ?? ""

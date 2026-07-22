@@ -29,6 +29,14 @@ public struct UIItem: Identifiable {
     public var actions: [HistoryToolAction] = []
     public var changes: [HistoryFileChange] = []
     public var fragments: [HistoryHookFragment] = []
+    /// Adapter-provided neutral semantic used to route execution-like records
+    /// without teaching shared UI code any vendor item names.
+    public var activityKind: String = ""
+    /// Neutral event description for activity rows (for example a
+    /// collaboration starting, updating, or being interrupted). This is kept
+    /// separate from execution status so historical activity is never
+    /// misrepresented as a currently running tool.
+    public var activityEvent: String = ""
     public var toolKind: String = ""
     public var server: String = ""
     public var namespace: String = ""

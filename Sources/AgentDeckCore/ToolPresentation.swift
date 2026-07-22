@@ -112,6 +112,10 @@ public enum ToolPresentation {
     /// the neutral lifecycle value carried by legacy history items.
     public static func toolStatus(_ item: UIItem) -> String {
         if item.success == false || !item.errorText.isEmpty { return "failed" }
+        if item.activityKind.caseInsensitiveCompare("collaboration") == .orderedSame,
+           !item.activityEvent.isEmpty {
+            return item.activityEvent
+        }
         if !item.statusName.isEmpty { return item.statusName }
         if item.success == true || !item.result.isEmpty { return "completed" }
         return item.lifecycle
@@ -124,6 +128,9 @@ public enum ToolPresentation {
         let rawStatus = toolStatus(item)
         let localized: String
         switch rawStatus.lowercased() {
+        case "started": localized = "已开始工作"
+        case "interacted": localized = "已更新"
+        case "interrupted": localized = "已中断"
         case "running", "starting", "inprogress", "in_progress", "in progress": localized = "进行中"
         case "pending", "queued": localized = "等待中"
         case "completed", "complete", "done", "success", "succeeded": localized = "已完成"
