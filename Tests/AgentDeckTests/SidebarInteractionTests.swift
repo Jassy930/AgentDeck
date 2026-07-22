@@ -94,6 +94,80 @@ final class SidebarInteractionTests: XCTestCase {
         XCTAssertEqual(requestCount, 1, "The visible New conversation action must invoke the real session flow")
     }
 
+    func testProjectHeaderRefreshLoadsHistoryAndExposesAccessibility() throws {
+        let model = PreviewBootstrap.makeSessionModel()
+        let vc = HistorySidebarViewController(model: model)
+        _ = vc.view
+
+        let refreshButton = try XCTUnwrap(
+            vc.view.descendant(id: "sidebar-project-refresh-history") as? NSButton
+        )
+        XCTAssertFalse(refreshButton.isHidden)
+        XCTAssertTrue(refreshButton.isEnabled)
+        XCTAssertNotEqual(refreshButton.focusRingType, .none)
+        XCTAssertEqual(refreshButton.toolTip, "刷新 Codex 与 Claude Code 会话")
+        XCTAssertEqual(refreshButton.accessibilityLabel(), "刷新会话")
+        XCTAssertEqual(refreshButton.accessibilityHelp(), "重新加载 Codex 与 Claude Code 会话")
+        XCTAssertTrue(model.historyGroups.isEmpty)
+
+        refreshButton.performClick(nil)
+
+        XCTAssertFalse(model.historyGroups.isEmpty, "项目栏刷新按钮必须调用全量历史加载")
+        XCTAssertNil(model.historyErrorMessage)
+    }
+
+    func testProjectHeaderRefreshStaysVisibleAndDisablesWhileLoading() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        model.isLoadingHistory = true
+        let vc = HistorySidebarViewController(model: model)
+        _ = vc.view
+
+        let refreshButton = try XCTUnwrap(
+            vc.view.descendant(id: "sidebar-project-refresh-history") as? NSButton
+        )
+        let loadingIndicator = try XCTUnwrap(
+            vc.view.descendant(id: "sidebar-history-loading") as? NSProgressIndicator
+        )
+        XCTAssertFalse(refreshButton.isHidden)
+        XCTAssertFalse(refreshButton.isEnabled)
+        XCTAssertEqual(refreshButton.toolTip, "正在刷新 Codex 与 Claude Code 会话")
+        XCTAssertEqual(refreshButton.accessibilityHelp(), "正在加载 Codex 与 Claude Code 会话")
+        XCTAssertFalse(loadingIndicator.isHidden)
+        XCTAssertEqual(loadingIndicator.accessibilityLabel(), "正在刷新 Codex 与 Claude Code 会话")
+
+        model.isLoadingHistory = false
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+
+        XCTAssertFalse(refreshButton.isHidden)
+        XCTAssertTrue(refreshButton.isEnabled)
+        XCTAssertTrue(loadingIndicator.isHidden)
+    }
+
+    func testProjectHeaderActionsFitAtMinimumSidebarWidth() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let vc = HistorySidebarViewController(model: model)
+        let window = NSWindow(contentViewController: vc)
+        window.setContentSize(NSSize(width: 200, height: 640))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+
+        let refreshButton = try XCTUnwrap(
+            vc.view.descendant(id: "sidebar-project-refresh-history") as? NSButton
+        )
+        let newSessionButton = try XCTUnwrap(
+            vc.view.descendant(id: "sidebar-project-new-session") as? NSButton
+        )
+        let refreshFrame = refreshButton.convert(refreshButton.bounds, to: vc.view)
+        let newSessionFrame = newSessionButton.convert(newSessionButton.bounds, to: vc.view)
+
+        XCTAssertGreaterThan(refreshFrame.width, 0)
+        XCTAssertGreaterThan(newSessionFrame.width, 0)
+        XCTAssertGreaterThanOrEqual(refreshFrame.minX, vc.view.bounds.minX)
+        XCTAssertLessThanOrEqual(newSessionFrame.maxX, vc.view.bounds.maxX + 0.5)
+        XCTAssertLessThanOrEqual(refreshFrame.maxX, newSessionFrame.minX)
+    }
+
     func testSearchActionExpandsFiltersAndClearsOnCollapse() throws {
         let (vc, outlineView, model) = makeSidebar([
             thread("t1", "拆分登录", cwd: "/p/refactor-auth"),

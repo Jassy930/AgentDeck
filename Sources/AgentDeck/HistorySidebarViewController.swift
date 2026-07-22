@@ -52,6 +52,21 @@ final class HistorySidebarViewController: NSViewController {
         return btn
     }()
 
+    private let refreshHistoryButton: NSButton = {
+        let btn = NSButton()
+        btn.bezelStyle = .inline
+        btn.isBordered = false
+        btn.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+        btn.imagePosition = .imageOnly
+        btn.toolTip = "刷新 Codex 与 Claude Code 会话"
+        btn.contentTintColor = DesignTokens.text3
+        btn.setAccessibilityIdentifier("sidebar-project-refresh-history")
+        btn.setAccessibilityLabel("刷新会话")
+        btn.setAccessibilityHelp("重新加载 Codex 与 Claude Code 会话")
+        btn.translatesAutoresizingMaskIntoConstraints = false
+        return btn
+    }()
+
     private lazy var topNewSessionButton = makeTopActionButton(
         symbol: "square.and.pencil",
         title: "新对话",
@@ -85,6 +100,8 @@ final class HistorySidebarViewController: NSViewController {
         pi.controlSize = .small
         pi.isIndeterminate = true
         pi.isHidden = true
+        pi.setAccessibilityIdentifier("sidebar-history-loading")
+        pi.setAccessibilityLabel("正在刷新 Codex 与 Claude Code 会话")
         pi.translatesAutoresizingMaskIntoConstraints = false
         return pi
     }()
@@ -218,7 +235,11 @@ final class HistorySidebarViewController: NSViewController {
         // Header row
         newSessionButton.target = self
         newSessionButton.action = #selector(handleNewSession)
-        let headerRow = NSStackView(views: [headerLabel, NSView(), newSessionButton])
+        refreshHistoryButton.target = self
+        refreshHistoryButton.action = #selector(handleRefreshHistory)
+        let headerRow = NSStackView(
+            views: [headerLabel, NSView(), refreshHistoryButton, newSessionButton]
+        )
         headerRow.orientation = .horizontal
         headerRow.spacing = 8
         headerRow.translatesAutoresizingMaskIntoConstraints = false
@@ -500,6 +521,15 @@ final class HistorySidebarViewController: NSViewController {
 
         loadingIndicator.isHidden = !loading
         if loading { loadingIndicator.startAnimation(nil) } else { loadingIndicator.stopAnimation(nil) }
+        refreshHistoryButton.isEnabled = !loading
+        refreshHistoryButton.toolTip = loading
+            ? "正在刷新 Codex 与 Claude Code 会话"
+            : "刷新 Codex 与 Claude Code 会话"
+        refreshHistoryButton.setAccessibilityHelp(
+            loading
+                ? "正在加载 Codex 与 Claude Code 会话"
+                : "重新加载 Codex 与 Claude Code 会话"
+        )
 
         errorLabel.isHidden = !hasError
         if let err = model.historyErrorMessage { errorLabel.stringValue = err }
@@ -517,6 +547,10 @@ final class HistorySidebarViewController: NSViewController {
 
     @objc private func handleNewSession() {
         onNewSessionRequested?()
+    }
+
+    @objc private func handleRefreshHistory() {
+        model.loadHistory()
     }
 
     @objc private func handleSearchToggle() {
