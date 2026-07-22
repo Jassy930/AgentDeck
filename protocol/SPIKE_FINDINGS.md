@@ -1,7 +1,8 @@
 # 协议 Spike 发现（Step 0,Eng D7）
 
-实测日期：2026-05-19
-codex 版本：codex-cli 0.130.0（已固定在 `CODEX_VERSION.txt`）
+首次 framing 实测日期：2026-05-19
+schema 最近刷新日期：2026-07-22
+codex 版本：codex-cli 0.145.0（已固定在 `CODEX_VERSION.txt`）
 
 ## D7 核心问题：wire framing 是什么？
 
@@ -22,8 +23,8 @@ fixture：`../spike/initialize-response.jsonl`（initialize 真实响应）。
 ## 零逆向：官方 schema 可直接生成
 
 `codex app-server generate-json-schema --out DIR` 生成完整官方协议
-schema（35 个 JSON + v1/v2 目录）。`generate-ts --out DIR` 生成
-TypeScript binding。**不需要逆向协议。**
+schema；`generate-ts --out DIR` 可生成 TypeScript binding。**不需要逆向
+协议。**根目录文件数会随 Codex 版本变化，不作长期合约。
 
 固化进项目的关键 schema（`protocol/`）：
 - `JSONRPCMessage.json` — 消息信封（Request/Notification/Response/Error）
@@ -32,7 +33,11 @@ TypeScript binding。**不需要逆向协议。**
 - `ServerRequest.json` — 服务端发起的请求（approval 在这里）
 - `codex_app_server_protocol.v2.schemas.json` — v2 完整 schema
 
-## 关键方法确认（client-methods.txt 完整）
+`client-methods.txt` 从 `ClientRequest.json` 的
+`oneOf[*].properties.method.enum[0]` 确定性派生，不手写。0.145.0 共
+89 个方法；派生命令见 `docs/QUALITY.md`。
+
+## 关键方法确认
 
 - `initialize` — 握手（实测：传 clientInfo，返 userAgent/codexHome/platform）
 - `thread/start` — 启动会话
@@ -40,12 +45,13 @@ TypeScript binding。**不需要逆向协议。**
 - `turn/interrupt` / `turn/steer` — 打断/引导当前 turn（D9 状态机 cancel 用）
 - **`thread/fork`** — 确实存在（D8 fork 能力的协议依据，v0.2）
 - `thread/resume` — 恢复会话（对应研究里的 resume 痛点）
+- `thread/list` / `thread/read` — 列出本机会话并读取持久化 turns/items
 - `thread/shellCommand`、`thread/compact/start`、`thread/rollback` 等
 
 ## approval 协议（D8 验证）
 
 ServerRequest 里有具体 approval 类型，**带结构化元数据**（非字符串猜命令）：
-- `CommandExecutionRequestApprovalParams`（14933 bytes — 信息丰富）
+- `CommandExecutionRequestApprovalParams`（信息丰富）
 - `ExecCommandApprovalParams`、`ApplyPatchApprovalParams`、
   `FileChangeRequestApprovalParams`、`PermissionsRequestApprovalParams`
 
@@ -53,8 +59,7 @@ ServerRequest 里有具体 approval 类型，**带结构化元数据**（非字�
 是带类型的结构化对象，daemon 可据此映射中立 `AgentActionRequest` 并
 判定危险等级，无需字符串猜命令。
 
-`codex app-server generate-json-schema --experimental` 也生成了对应 response
-schema：
+0.145.0 的默认官方生成物已包含对应 response schema：
 - `CommandExecutionRequestApprovalResponse`：`{"decision":"accept|decline|cancel|acceptForSession|..."}`
 - `FileChangeRequestApprovalResponse`：`{"decision":"accept|decline|cancel|acceptForSession"}`
 - `PermissionsRequestApprovalResponse`：`{"permissions": GrantedPermissionProfile, "scope": "turn|session", "strictAutoReview": ...}`
