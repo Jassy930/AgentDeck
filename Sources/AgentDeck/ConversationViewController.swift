@@ -79,6 +79,13 @@ final class ConversationViewController: NSViewController {
     /// and only re-measures the rows whose content actually grew.
     private var displayedRowSignatures: [(id: String, version: Int)] = []
 
+    /// Static presentation fields (tool status, duration, payload, command,
+    /// path, etc.) do not flow through `StreamingTextBuffer`. Keep a separate
+    /// version sequence so an in-place start → result update reconfigures only
+    /// the affected visible row, while pure 30fps buffer growth still avoids a
+    /// cell reload and only re-measures height.
+    private var displayedRowConfigurationVersions: [Int] = []
+
     /// Per-item disclosure expansion state for the collapsible tool rows
     /// (shell output / fileEdit diff). Held here so it SURVIVES cell reuse and
     /// the streaming reconfigure path (C1): a cell restores its expanded state
@@ -344,6 +351,7 @@ final class ConversationViewController: NSViewController {
             != model.conversationViewportIdentity
         let previousExpansion = lastReasoningExpanded
         let previousSignatures = displayedRowSignatures
+        let previousConfigurationVersions = displayedRowConfigurationVersions
         if viewportChanged {
             displayedConversationViewportIdentity = model.conversationViewportIdentity
             expandedItemIds.removeAll()
@@ -360,6 +368,7 @@ final class ConversationViewController: NSViewController {
 
         applyRowUpdate(
             previousSignatures: previousSignatures,
+            previousConfigurationVersions: previousConfigurationVersions,
             reasoningFlipped: reasoningFlipped,
             forceFullReload: viewportChanged
         )
@@ -391,6 +400,7 @@ final class ConversationViewController: NSViewController {
     ///   so the reload no longer destroys user state.
     private func applyRowUpdate(
         previousSignatures: [(id: String, version: Int)],
+        previousConfigurationVersions: [Int],
         reasoningFlipped: Bool,
         forceFullReload: Bool = false
     ) {
@@ -409,6 +419,15 @@ final class ConversationViewController: NSViewController {
         switch diff {
         case .sameRows(let changedIndexes):
             var heightIndexes = IndexSet(changedIndexes)
+            var reloadIndexes = IndexSet(
+                rows.indices.filter { index in
+                    guard previousConfigurationVersions.indices.contains(index),
+                          displayedRowConfigurationVersions.indices.contains(index)
+                    else { return true }
+                    return previousConfigurationVersions[index]
+                        != displayedRowConfigurationVersions[index]
+                }
+            )
             if reasoningFlipped {
                 // The reasoning rows toggle their visible body with the running
                 // phase; reload just those so `configure` re-applies the
@@ -418,13 +437,17 @@ final class ConversationViewController: NSViewController {
                         .filter { $0.element.item.kind == "reasoning" }
                         .map(\.offset)
                 )
-                if !reasoningIndexes.isEmpty {
-                    tableView.reloadData(
-                        forRowIndexes: reasoningIndexes,
-                        columnIndexes: IndexSet(integer: 0)
-                    )
-                    heightIndexes.formUnion(reasoningIndexes)
+                reloadIndexes.formUnion(reasoningIndexes)
+            }
+            if !reloadIndexes.isEmpty {
+                for index in reloadIndexes where rows.indices.contains(index) {
+                    cache.invalidate(rowId: rows[index].id)
                 }
+                tableView.reloadData(
+                    forRowIndexes: reloadIndexes,
+                    columnIndexes: IndexSet(integer: 0)
+                )
+                heightIndexes.formUnion(reloadIndexes)
             }
             if !heightIndexes.isEmpty {
                 tableView.noteHeightOfRows(withIndexesChanged: heightIndexes)
@@ -449,6 +472,7 @@ final class ConversationViewController: NSViewController {
         let turns = makeConversationTurns(from: model.selectedItems)
         rows = ConversationDisplayRowBuilder.rows(from: turns)
         displayedRowSignatures = rows.map { ($0.id, contentVersion(for: $0)) }
+        displayedRowConfigurationVersions = rows.map(configurationVersion(for:))
         lastReasoningExpanded = model.shouldShowReasoningExpanded
     }
 
@@ -651,6 +675,56 @@ final class ConversationViewController: NSViewController {
             version = version &* 31 &+ 2
         }
         return version
+    }
+
+    /// Version of values copied into static AppKit controls during `configure`.
+    /// Streaming buffers are deliberately excluded: their views are already
+    /// bound to the same buffer object and update without cell reconfiguration.
+    private func configurationVersion(for row: ConversationDisplayRow) -> Int {
+        let item = row.item
+        var hasher = Hasher()
+        hasher.combine(item.kind)
+
+        switch item.kind {
+        case "shell":
+            hasher.combine(item.command)
+            hasher.combine(item.statusName)
+            hasher.combine(item.cwdText)
+            hasher.combine(item.durationMs)
+            hasher.combine(item.sourceName)
+            hasher.combine(item.processId)
+            hasher.combine(item.exitCode)
+            hasher.combine(!item.output.isEmpty)
+        case "fileEdit":
+            hasher.combine(item.path)
+            hasher.combine(item.statusName)
+            hasher.combine(!item.diff.isEmpty)
+        case "webSearch":
+            hasher.combine(item.action)
+            hasher.combine(item.query)
+            hasher.combine(item.actionQuery)
+            hasher.combine(item.queries)
+            hasher.combine(item.url)
+            hasher.combine(item.pattern)
+        case "toolCall":
+            hasher.combine(item.server)
+            hasher.combine(item.namespace)
+            hasher.combine(item.tool)
+            hasher.combine(item.action)
+            hasher.combine(item.arguments)
+            hasher.combine(item.result)
+            hasher.combine(item.errorText)
+            hasher.combine(item.success)
+            hasher.combine(item.statusName)
+            hasher.combine(item.durationMs)
+            hasher.combine(item.resourceUri)
+        default:
+            // Message/reasoning/shell-output/diff bodies update through their
+            // bound buffers. Other static kinds keep the existing structural
+            // reload behavior and do not need per-flush reconfiguration here.
+            break
+        }
+        return hasher.finalize()
     }
 
     /// Row height = factory height, plus — for reasoning rows that are
