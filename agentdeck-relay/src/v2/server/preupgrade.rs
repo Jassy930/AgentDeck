@@ -337,7 +337,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for UpgradeBoundedIo<T> {
 #[cfg(feature = "tls")]
 enum LazyTlsState {
     Handshake(Pin<Box<dyn Future<Output = io::Result<TlsStream<TcpStream>>> + Send>>),
-    Streaming(TlsStream<TcpStream>),
+    Streaming(Box<TlsStream<TcpStream>>),
     Failed,
 }
 
@@ -374,7 +374,9 @@ impl AsyncRead for LazyTlsIo {
         loop {
             match &mut self.state {
                 LazyTlsState::Handshake(handshake) => match handshake.as_mut().poll(context) {
-                    Poll::Ready(Ok(stream)) => self.state = LazyTlsState::Streaming(stream),
+                    Poll::Ready(Ok(stream)) => {
+                        self.state = LazyTlsState::Streaming(Box::new(stream));
+                    }
                     Poll::Ready(Err(error)) => {
                         self.state = LazyTlsState::Failed;
                         return Poll::Ready(Err(error));
@@ -382,7 +384,7 @@ impl AsyncRead for LazyTlsIo {
                     Poll::Pending => return Poll::Pending,
                 },
                 LazyTlsState::Streaming(stream) => {
-                    return Pin::new(stream).poll_read(context, buffer);
+                    return Pin::new(stream.as_mut()).poll_read(context, buffer);
                 }
                 LazyTlsState::Failed => return Poll::Ready(Err(Self::failed())),
             }
@@ -400,7 +402,9 @@ impl AsyncWrite for LazyTlsIo {
         loop {
             match &mut self.state {
                 LazyTlsState::Handshake(handshake) => match handshake.as_mut().poll(context) {
-                    Poll::Ready(Ok(stream)) => self.state = LazyTlsState::Streaming(stream),
+                    Poll::Ready(Ok(stream)) => {
+                        self.state = LazyTlsState::Streaming(Box::new(stream));
+                    }
                     Poll::Ready(Err(error)) => {
                         self.state = LazyTlsState::Failed;
                         return Poll::Ready(Err(error));
@@ -408,7 +412,7 @@ impl AsyncWrite for LazyTlsIo {
                     Poll::Pending => return Poll::Pending,
                 },
                 LazyTlsState::Streaming(stream) => {
-                    return Pin::new(stream).poll_write(context, bytes);
+                    return Pin::new(stream.as_mut()).poll_write(context, bytes);
                 }
                 LazyTlsState::Failed => return Poll::Ready(Err(Self::failed())),
             }
@@ -422,14 +426,18 @@ impl AsyncWrite for LazyTlsIo {
         loop {
             match &mut self.state {
                 LazyTlsState::Handshake(handshake) => match handshake.as_mut().poll(context) {
-                    Poll::Ready(Ok(stream)) => self.state = LazyTlsState::Streaming(stream),
+                    Poll::Ready(Ok(stream)) => {
+                        self.state = LazyTlsState::Streaming(Box::new(stream));
+                    }
                     Poll::Ready(Err(error)) => {
                         self.state = LazyTlsState::Failed;
                         return Poll::Ready(Err(error));
                     }
                     Poll::Pending => return Poll::Pending,
                 },
-                LazyTlsState::Streaming(stream) => return Pin::new(stream).poll_flush(context),
+                LazyTlsState::Streaming(stream) => {
+                    return Pin::new(stream.as_mut()).poll_flush(context);
+                }
                 LazyTlsState::Failed => return Poll::Ready(Err(Self::failed())),
             }
         }
@@ -440,7 +448,7 @@ impl AsyncWrite for LazyTlsIo {
         context: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
         match &mut self.state {
-            LazyTlsState::Streaming(stream) => Pin::new(stream).poll_shutdown(context),
+            LazyTlsState::Streaming(stream) => Pin::new(stream.as_mut()).poll_shutdown(context),
             LazyTlsState::Handshake(_) | LazyTlsState::Failed => Poll::Ready(Ok(())),
         }
     }

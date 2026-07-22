@@ -670,9 +670,11 @@ impl Fixture {
     async fn new_with_fault_injector(fault_injector: Arc<dyn FaultInjector>) -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = store_path(&temp);
-        let mut retention = RetentionLimits::default();
-        retention.disk_reserve_bytes = 0;
-        retention.disk_reserve_percent = 0;
+        let retention = RetentionLimits {
+            disk_reserve_bytes: 0,
+            disk_reserve_percent: 0,
+            ..RetentionLimits::default()
+        };
         let config = test_store_config(db_path.clone())
             .with_clock(Arc::new(FixedStoreClock))
             .with_disk_space_probe(Arc::new(PlentyOfDisk))
@@ -2072,9 +2074,7 @@ async fn online_request_target_first_backpressure_and_stale_origin_are_fail_clos
 
     let mut target_slow = Fixture::new().await;
     let device_route = target_slow.realms[0].devices[0].route;
-    let mut slow_machine = target_slow
-        .connect_machine_with_writer(0, tiny.clone())
-        .await;
+    let mut slow_machine = target_slow.connect_machine_with_writer(0, tiny).await;
     let mut device = target_slow.connect_device(0, 0).await;
     let first = send_frame(device_route, request_route(0x21), vec![1]);
     assert_queued_request(

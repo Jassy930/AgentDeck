@@ -2029,13 +2029,13 @@ impl RelayCoreActor {
                         ) {
                             return;
                         }
-                        if let Some(next) = next {
-                            if self.launch_replay_start(&ticket.access, next).is_err() {
-                                self.close_connection(
-                                    ticket.connection,
-                                    WriterCloseReason::Disconnected,
-                                );
-                            }
+                        if let Some(next) = next
+                            && self.launch_replay_start(&ticket.access, next).is_err()
+                        {
+                            self.close_connection(
+                                ticket.connection,
+                                WriterCloseReason::Disconnected,
+                            );
                         }
                     }
                     Err(_) => {
