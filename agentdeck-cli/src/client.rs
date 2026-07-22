@@ -17,12 +17,14 @@
 //!
 //! Admin replies for `History` commands wrap the typed `HistoryResponse`
 //! envelope under `"response"` within `{"reply":"history","response":{...}}`.
+//! A failed request uses the same terminal reply with a typed `"error"`
+//! field, which is surfaced immediately with its daemon error code.
 
 use crate::output::CliError;
 use crate::transport::{AsyncProcessTransport, ProcessTransport, SyncTransport, split_async};
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, ClientCommand, HistoryRequest, HistoryResponse, ServerEvent,
-    SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
+    ActionDecision, AgentKind, ClientCommand, HistoryRequest, HistoryResponse, ProtocolError,
+    ServerEvent, SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
 };
 use tokio::sync::mpsc;
 
@@ -58,10 +60,19 @@ fn parse_daemon_line(raw: &str) -> DaemonLine {
 /// Send a `ClientCommand` and wait for the admin reply JSON whose `"reply"`
 /// field matches `expected_reply`. Skips `ServerEvent` lines encountered
 /// while waiting (they belong to concurrent sessions).
-fn admin_round_trip(
-    transport: &mut ProcessTransport,
+fn admin_round_trip<T: SyncTransport>(
+    transport: &mut T,
     cmd: &ClientCommand,
     expected_reply: &str,
+) -> Result<serde_json::Value, CliError> {
+    admin_round_trip_matching(transport, cmd, expected_reply, None)
+}
+
+fn admin_round_trip_matching<T: SyncTransport>(
+    transport: &mut T,
+    cmd: &ClientCommand,
+    expected_reply: &str,
+    expected_request_id: Option<&str>,
 ) -> Result<serde_json::Value, CliError> {
     let line = serde_json::to_string(cmd)?;
     transport.send_line(&line)?;
@@ -73,7 +84,23 @@ fn admin_round_trip(
         match parse_daemon_line(&raw) {
             DaemonLine::AdminReply(v) => {
                 let got = v.get("reply").and_then(|r| r.as_str()).unwrap_or("");
-                if got == expected_reply {
+                let request_matches = expected_request_id.is_none_or(|expected| {
+                    v.get("requestId").and_then(|id| id.as_str()) == Some(expected)
+                });
+                if got == expected_reply && request_matches {
+                    if let Some(error_value) = v.get("error").filter(|value| !value.is_null()) {
+                        let error = serde_json::from_value::<ProtocolError>(error_value.clone())
+                            .map_err(|source| CliError::Protocol {
+                                code: None,
+                                message: format!(
+                                    "invalid error field in {expected_reply} reply: {source}"
+                                ),
+                            })?;
+                        return Err(CliError::Protocol {
+                            code: Some(error.code),
+                            message: error.message,
+                        });
+                    }
                     return Ok(v);
                 }
                 // Different admin reply: might be from a concurrent command;
@@ -98,6 +125,7 @@ fn admin_round_trip(
 
 pub struct Client {
     transport: ProcessTransport,
+    next_history_request_id: u64,
 }
 
 impl Client {
@@ -105,7 +133,10 @@ impl Client {
     pub fn connect(profile: &str, data_dir: Option<&str>) -> Result<Self, CliError> {
         let transport = ProcessTransport::spawn(profile, data_dir)
             .map_err(|e| CliError::Transport(e.to_string()))?;
-        Ok(Self { transport })
+        Ok(Self {
+            transport,
+            next_history_request_id: 1,
+        })
     }
 
     pub fn ping(&mut self) -> Result<(), CliError> {
@@ -191,7 +222,21 @@ impl Client {
     }
 
     pub fn history(&mut self, req: HistoryRequest) -> Result<HistoryResponse, CliError> {
-        let v = admin_round_trip(&mut self.transport, &ClientCommand::History(req), "history")?;
+        let request_id = format!(
+            "cli-history-{}-{}",
+            std::process::id(),
+            self.next_history_request_id
+        );
+        self.next_history_request_id =
+            self.next_history_request_id
+                .checked_add(1)
+                .ok_or_else(|| CliError::Protocol {
+                    code: None,
+                    message: "history request id exhausted".into(),
+                })?;
+        let command = ClientCommand::History(req.with_request_id(request_id.clone()));
+        let v =
+            admin_round_trip_matching(&mut self.transport, &command, "history", Some(&request_id))?;
         let resp_val = v
             .get("response")
             .cloned()
@@ -322,37 +367,6 @@ mod tests {
         .to_string()
     }
 
-    fn admin_round_trip_fake(
-        fake: &mut FakeTransport,
-        cmd: &ClientCommand,
-        expected: &str,
-    ) -> Result<serde_json::Value, CliError> {
-        let line = serde_json::to_string(cmd).unwrap();
-        fake.send_line(&line).unwrap();
-        loop {
-            let raw = fake.recv_line().unwrap();
-            let Some(raw) = raw else {
-                return Err(CliError::NoResponse);
-            };
-            match parse_daemon_line(&raw) {
-                DaemonLine::AdminReply(v) => {
-                    let got = v.get("reply").and_then(|r| r.as_str()).unwrap_or("");
-                    if got == expected {
-                        return Ok(v);
-                    }
-                }
-                DaemonLine::Event(ServerEvent::Error { error, .. }) => {
-                    return Err(CliError::Protocol {
-                        code: Some(error.code),
-                        message: error.message,
-                    });
-                }
-                DaemonLine::Event(_) => continue,
-                DaemonLine::Unknown => continue,
-            }
-        }
-    }
-
     #[test]
     fn parse_daemon_line_discriminates_event_vs_admin() {
         // ServerEvent has "type"
@@ -383,7 +397,7 @@ mod tests {
             different_reply,
             ping_reply(),
         ]);
-        let v = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap();
+        let v = admin_round_trip(&mut fake, &ClientCommand::Ping, "ping").unwrap();
         assert_eq!(v["reply"], "ping");
         assert_eq!(v["ok"], true);
     }
@@ -391,14 +405,14 @@ mod tests {
     #[test]
     fn admin_round_trip_fake_returns_no_response_on_eof() {
         let mut fake = FakeTransport::new(vec![]);
-        let err = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
+        let err = admin_round_trip(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
         assert_eq!(err.exit_code(), 3);
     }
 
     #[test]
     fn admin_round_trip_fake_propagates_error_event() {
         let mut fake = FakeTransport::new(vec![error_event("daemon failed")]);
-        let err = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
+        let err = admin_round_trip(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
         assert_eq!(err.exit_code(), 3);
         assert!(err.message().contains("daemon failed"));
     }
@@ -406,7 +420,7 @@ mod tests {
     #[test]
     fn selfcheck_ok_true_returns_value() {
         let mut fake = FakeTransport::new(vec![selfcheck_reply()]);
-        let v = admin_round_trip_fake(&mut fake, &ClientCommand::Selfcheck, "selfcheck").unwrap();
+        let v = admin_round_trip(&mut fake, &ClientCommand::Selfcheck, "selfcheck").unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["protocolVersion"], 2);
     }
@@ -427,6 +441,70 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
         let resp: HistoryResponse = serde_json::from_value(v["response"].clone()).unwrap();
         assert!(matches!(resp, HistoryResponse::List(ref items) if items.is_empty()));
+    }
+
+    #[test]
+    fn admin_round_trip_propagates_history_admin_error_without_waiting() {
+        let error_reply = serde_json::json!({
+            "reply": "history",
+            "requestId": "history-request-42",
+            "error": {
+                "code": "history-all-sources-failed",
+                "message": "all registered history sources failed",
+                "diagnosticRef": null,
+            }
+        })
+        .to_string();
+        let success_reply = r#"{"reply":"history","requestId":"history-request-42","response":{"kind":"list","value":[]}}"#.to_string();
+        let mut fake = FakeTransport::new(vec![error_reply, success_reply.clone()]);
+
+        let err = admin_round_trip_matching(
+            &mut fake,
+            &ClientCommand::History(HistoryRequest::List {
+                request_id: Some("history-request-42".into()),
+                agent_kind: None,
+                cwd_filter: None,
+                limit: None,
+            }),
+            "history",
+            Some("history-request-42"),
+        )
+        .unwrap_err();
+
+        match err {
+            CliError::Protocol { code, message } => {
+                assert_eq!(code.as_deref(), Some("history-all-sources-failed"));
+                assert_eq!(message, "all registered history sources failed");
+            }
+            other => panic!("expected CliError::Protocol, got {other:?}"),
+        }
+        assert_eq!(
+            fake.recv_line().unwrap().as_deref(),
+            Some(success_reply.as_str()),
+            "the matching error reply must terminate the round trip immediately"
+        );
+    }
+
+    #[test]
+    fn correlated_history_round_trip_skips_stale_reply_with_same_discriminator() {
+        let stale =
+            r#"{"reply":"history","requestId":"old","response":{"kind":"list","value":[]}}"#
+                .to_string();
+        let current =
+            r#"{"reply":"history","requestId":"current","response":{"kind":"list","value":[]}}"#
+                .to_string();
+        let mut fake = FakeTransport::new(vec![stale, current]);
+        let command = ClientCommand::History(HistoryRequest::List {
+            request_id: Some("current".into()),
+            agent_kind: None,
+            cwd_filter: None,
+            limit: None,
+        });
+
+        let reply = admin_round_trip_matching(&mut fake, &command, "history", Some("current"))
+            .expect("current history reply");
+
+        assert_eq!(reply["requestId"], "current");
     }
 
     #[test]
@@ -463,7 +541,7 @@ mod tests {
         })
         .to_string();
         let mut fake = FakeTransport::new(vec![raw]);
-        let err = admin_round_trip_fake(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
+        let err = admin_round_trip(&mut fake, &ClientCommand::Ping, "ping").unwrap_err();
         match err {
             CliError::Protocol { code, message } => {
                 assert_eq!(code.as_deref(), Some("cc-not-installed"));
