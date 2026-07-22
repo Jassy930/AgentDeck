@@ -8,6 +8,7 @@ enum DaemonError: Error, CustomStringConvertible {
     case disconnected
     case malformedReply(String)
     case adminReplyMismatch(expected: String, got: String)
+    case remoteProtocol(code: String, message: String, diagnosticRef: String?)
 
     var description: String {
         switch self {
@@ -16,6 +17,9 @@ enum DaemonError: Error, CustomStringConvertible {
         case .disconnected: return "agentdeckd disconnected (EOF on its stdout)"
         case .malformedReply(let s): return "malformed reply from agentdeckd: \(s)"
         case .adminReplyMismatch(let e, let g): return "expected admin reply '\(e)', got '\(g)'"
+        case .remoteProtocol(let code, let message, let diagnosticRef):
+            let suffix = diagnosticRef.map { " (diagnostic: \($0))" } ?? ""
+            return "agentdeckd error [\(code)]: \(message)\(suffix)"
         }
     }
 }
@@ -129,21 +133,34 @@ final class DaemonRouter: @unchecked Sendable {
         global?(event)
     }
 
-    /// Wait for next admin reply line whose `"reply"` field matches
-    /// `expectedReply`. Other admin replies are skipped and re-enqueued for
-    /// subsequent waiters. Returns nil if the transport disconnects.
-    func waitForAdminReply(expectedReply: String, timeoutSeconds: TimeInterval = 10) -> String? {
+    /// Wait for the next admin reply whose discriminator and optional request
+    /// id match. Replies for other discriminators stay queued; a reply with
+    /// the expected discriminator but a different request id is stale and is
+    /// discarded so it cannot satisfy a later round-trip.
+    func waitForAdminReply(
+        expectedReply: String,
+        expectedRequestId: String? = nil,
+        timeoutSeconds: TimeInterval = 10
+    ) -> String? {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         cond.lock()
         defer { cond.unlock() }
         while true {
-            for (index, line) in pendingAdminReplies.enumerated() {
+            var index = 0
+            while index < pendingAdminReplies.count {
+                let line = pendingAdminReplies[index]
                 if let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                    let reply = obj["reply"] as? String,
                    reply == expectedReply {
+                    if let expectedRequestId,
+                       obj["requestId"] as? String != expectedRequestId {
+                        pendingAdminReplies.remove(at: index)
+                        continue
+                    }
                     pendingAdminReplies.remove(at: index)
                     return line
                 }
+                index += 1
             }
             if isClosed { return nil }
             let remaining = deadline.timeIntervalSinceNow
@@ -165,9 +182,18 @@ final class DaemonRouter: @unchecked Sendable {
 /// v2 daemon client. Speaks `ClientCommand` outward, parses `ServerEvent`
 /// inward, plus admin reply side-channel.
 final class DaemonClient {
+    /// The daemon bounds a complete history operation at 32 seconds. Keep a
+    /// three-second transport grace window so a terminal reply can still cross
+    /// stdout and the Swift reader without being misclassified as a timeout.
+    static let historyTimeoutSeconds: TimeInterval = 35
+
     private let profile: AgentDeckProfile
     private let transport: DaemonTransport
     private let router = DaemonRouter()
+    /// Keep history round-trips single-flight to bound daemon work. The wire
+    /// request id additionally prevents a reply that arrives after a client
+    /// timeout from satisfying the next history request.
+    private let historyRoundTripLock = NSLock()
     private let encoder: JSONEncoder = {
         let e = JSONEncoder()
         e.outputFormatting = []
@@ -254,6 +280,20 @@ final class DaemonClient {
     ) -> [String: String] {
         var env = base
         env["AGENTDECK_PROFILE"] = profile.rawValue
+        var pathEntries: [String] = []
+        if let home = base["HOME"], !home.isEmpty {
+            pathEntries.append(contentsOf: ["\(home)/.local/bin", "\(home)/.bun/bin"])
+        }
+        pathEntries.append(contentsOf: [
+            "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+        ])
+        if let inheritedPath = base["PATH"] {
+            pathEntries.append(contentsOf: inheritedPath.split(separator: ":").map(String.init))
+        }
+        env["PATH"] = pathEntries.reduce(into: [String]()) { unique, entry in
+            guard !entry.isEmpty, !unique.contains(entry) else { return }
+            unique.append(entry)
+        }.joined(separator: ":")
         return env
     }
 
@@ -278,9 +318,18 @@ final class DaemonClient {
 
     /// Send a command and wait for the matching admin reply line.
     @discardableResult
-    func adminRoundTrip(_ command: ClientCommand, expectedReply: String, timeoutSeconds: TimeInterval = 10) throws -> [String: Any] {
+    func adminRoundTrip(
+        _ command: ClientCommand,
+        expectedReply: String,
+        expectedRequestId: String? = nil,
+        timeoutSeconds: TimeInterval = 10
+    ) throws -> [String: Any] {
         try send(command)
-        guard let line = router.waitForAdminReply(expectedReply: expectedReply, timeoutSeconds: timeoutSeconds) else {
+        guard let line = router.waitForAdminReply(
+            expectedReply: expectedReply,
+            expectedRequestId: expectedRequestId,
+            timeoutSeconds: timeoutSeconds
+        ) else {
             if !transport.isAlive {
                 throw DaemonError.disconnected
             }
@@ -327,7 +376,25 @@ final class DaemonClient {
     }
 
     func history(_ req: HistoryRequest) throws -> HistoryResponse {
-        let reply = try adminRoundTrip(.history(req), expectedReply: "history")
+        historyRoundTripLock.lock()
+        defer { historyRoundTripLock.unlock() }
+
+        let requestId = UUID().uuidString
+        let reply = try adminRoundTrip(
+            .history(req.withRequestId(requestId)),
+            expectedReply: "history",
+            expectedRequestId: requestId,
+            timeoutSeconds: Self.historyTimeoutSeconds
+        )
+        if let error = reply["error"] {
+            let data = try JSONSerialization.data(withJSONObject: error)
+            let protocolError = try JSONDecoder().decode(ProtocolError.self, from: data)
+            throw DaemonError.remoteProtocol(
+                code: protocolError.code,
+                message: protocolError.message,
+                diagnosticRef: protocolError.diagnosticRef
+            )
+        }
         guard let response = reply["response"] else {
             throw DaemonError.malformedReply("missing response field in history reply")
         }

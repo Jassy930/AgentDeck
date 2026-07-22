@@ -18,6 +18,11 @@ final class WorkbenchModel {
         self.actionDecider = actionDecider ?? (turnStarter as? RuntimeActionDeciding) ?? NoopRuntimeActionDecider()
     }
 
+    static func historySessionId(for identity: HistoryThreadIdentity) -> String {
+        let encodedThreadId = Data(identity.threadId.utf8).base64EncodedString()
+        return "history:\(identity.agentKind.rawValue):\(encodedThreadId)"
+    }
+
     var selectedRuntime: ThreadRuntimeModel? {
         guard let selectedSessionId else { return nil }
         return runtimes[selectedSessionId]
@@ -50,6 +55,15 @@ final class WorkbenchModel {
         runtimes[sessionId]
     }
 
+    func runtime(forHistory identity: HistoryThreadIdentity) -> ThreadRuntimeModel? {
+        if let restored = runtimes[Self.historySessionId(for: identity)] {
+            return restored
+        }
+        return runtimes.values.first { runtime in
+            runtime.agentKind == identity.agentKind && runtime.threadId == identity.threadId
+        }
+    }
+
     func selectRuntime(sessionId: String) {
         guard runtimes[sessionId] != nil else { return }
         selectedSessionId = sessionId
@@ -63,12 +77,23 @@ final class WorkbenchModel {
         runtimes[runtime.id] = runtime
     }
 
+    /// Remove only the hydrated runtime for this persisted identity. The
+    /// agent kind is part of the key, so a Codex archive cannot evict a
+    /// Claude Code runtime that happens to use the same raw thread id.
+    func removeHistoryRuntime(for identity: HistoryThreadIdentity) {
+        let sessionId = Self.historySessionId(for: identity)
+        runtimes.removeValue(forKey: sessionId)
+        if selectedSessionId == sessionId {
+            selectedSessionId = nil
+        }
+    }
+
     func applyHistoryThreadDetail(_ detail: HistoryThreadDetail) {
-        let sessionId = detail.thread.id
-        let agentKind = inferAgentKind(from: detail.thread)
+        let identity = HistoryThreadIdentity(detail.thread)
+        let sessionId = Self.historySessionId(for: identity)
         let runtime = ThreadRuntimeModel(
             id: sessionId,
-            agentKind: agentKind,
+            agentKind: identity.agentKind,
             threadId: detail.thread.id,
             cwd: URL(fileURLWithPath: detail.thread.cwd)
         )
@@ -190,14 +215,6 @@ final class WorkbenchModel {
         }
     }
 
-    /// Legacy `HistoryThreadSummary.source/modelProvider` mapping — v0.2 we
-    /// default to `.codex` for backward-compat with persisted v0.1 records,
-    /// but cross-agent history lookup (T6.5) replaces this with a real lookup.
-    private func inferAgentKind(from thread: HistoryThreadSummary) -> AgentKind {
-        let src = thread.source.lowercased()
-        if src.contains("claude") { return .claudeCode }
-        return .codex
-    }
 }
 
 @MainActor

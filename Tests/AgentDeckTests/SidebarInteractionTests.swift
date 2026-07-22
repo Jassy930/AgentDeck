@@ -94,7 +94,7 @@ final class SidebarInteractionTests: XCTestCase {
         XCTAssertEqual(requestCount, 1, "The visible New conversation action must invoke the real session flow")
     }
 
-    func testProjectHeaderRefreshLoadsHistoryAndExposesAccessibility() throws {
+    func testProjectHeaderRefreshLoadsHistoryAndExposesAccessibility() async throws {
         let model = PreviewBootstrap.makeSessionModel()
         let vc = HistorySidebarViewController(model: model)
         _ = vc.view
@@ -112,6 +112,9 @@ final class SidebarInteractionTests: XCTestCase {
 
         refreshButton.performClick(nil)
 
+        XCTAssertTrue(model.isLoadingHistory)
+        let didFinish = await waitUntil { !model.isLoadingHistory }
+        XCTAssertTrue(didFinish, "项目栏刷新触发的异步历史加载应在超时前完成")
         XCTAssertFalse(model.historyGroups.isEmpty, "项目栏刷新按钮必须调用全量历史加载")
         XCTAssertNil(model.historyErrorMessage)
     }

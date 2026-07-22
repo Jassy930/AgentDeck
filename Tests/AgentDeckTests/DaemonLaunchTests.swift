@@ -67,6 +67,20 @@ final class DaemonLocatorTests: XCTestCase {
         XCTAssertEqual(located, developmentDaemon.standardizedFileURL.path)
     }
 
+    func testDaemonEnvironmentRepairsLaunchServicesPathForBothVendorCLIs() {
+        let environment = DaemonClient.daemonEnvironment(
+            profile: .dev,
+            base: ["HOME": "/Users/example", "PATH": "/custom/bin:/usr/bin"]
+        )
+
+        XCTAssertEqual(environment["AGENTDECK_PROFILE"], "dev")
+        XCTAssertEqual(
+            environment["PATH"],
+            "/Users/example/.local/bin:/Users/example/.bun/bin:/opt/homebrew/bin:"
+                + "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/custom/bin"
+        )
+    }
+
     private func makeExecutable(at url: URL) throws -> URL {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
@@ -110,9 +124,20 @@ private final class RetryStartTransport: DaemonTransport {
     }
 
     func send(_ line: String) throws {
-        incomingHandler?(
-            #"{"reply":"history","response":{"kind":"list","value":[]}}"#
-        )
+        guard let command = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              let requestId = command["requestId"] as? String else {
+            return
+        }
+        let reply: [String: Any] = [
+            "reply": "history",
+            "requestId": requestId,
+            "response": ["kind": "list", "value": []],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: reply),
+              let line = String(data: data, encoding: .utf8) else {
+            return
+        }
+        incomingHandler?(line)
     }
 
     func setIncomingHandler(_ handler: @escaping (String) -> Void) {
@@ -135,7 +160,7 @@ final class HistoryDaemonLaunchTests: XCTestCase {
         XCTAssertEqual(model.historyErrorMessage, "failed to spawn agentdeckd: launch-fixture")
     }
 
-    func testSuccessfulRetryClearsOnlyDaemonLaunchFailureState() {
+    func testSuccessfulRetryClearsOnlyDaemonLaunchFailureState() async {
         let transport = RetryStartTransport()
         let client = DaemonClient(transport: transport)
         let model = SessionModel(client: client)
@@ -151,9 +176,13 @@ final class HistoryDaemonLaunchTests: XCTestCase {
         XCTAssertEqual(model.phase, .idle)
         XCTAssertNil(model.errorMessage)
         XCTAssertNil(model.historyErrorMessage)
+        XCTAssertTrue(model.isLoadingHistory)
+        let didFinish = await waitUntil { !model.isLoadingHistory }
+        XCTAssertTrue(didFinish)
+        XCTAssertNil(model.historyErrorMessage)
     }
 
-    func testSuccessfulRetryPreservesIndependentGlobalFailureState() {
+    func testSuccessfulRetryPreservesIndependentGlobalFailureState() async {
         let transport = RetryStartTransport()
         let client = DaemonClient(transport: transport)
         let model = SessionModel(client: client)
@@ -166,6 +195,8 @@ final class HistoryDaemonLaunchTests: XCTestCase {
         XCTAssertEqual(transport.startAttempts, 2)
         XCTAssertEqual(model.phase, .failed)
         XCTAssertEqual(model.errorMessage, "independent failure")
+        let didFinish = await waitUntil { !model.isLoadingHistory }
+        XCTAssertTrue(didFinish)
         XCTAssertNil(model.historyErrorMessage)
     }
 }

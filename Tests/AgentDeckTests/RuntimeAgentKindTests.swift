@@ -121,4 +121,62 @@ final class RuntimeAgentKindTests: XCTestCase {
         XCTAssertEqual(workbench.runtime(sessionId: "daemon-session")?.threadId, "thread-1")
         XCTAssertEqual(workbench.runtime(sessionId: "daemon-session")?.items.first?.text, "hello")
     }
+
+    func testReplayTurnsMatchesSingleStoreReducerResults() {
+        let agentItems: [AgentItem] = [
+            .userMessage(text: "question", meta: AgentItemMeta()),
+            .assistantMessage(text: "answer", meta: AgentItemMeta()),
+            .shell(
+                command: "pwd",
+                status: .completed,
+                exitCode: 0,
+                durationMs: 12,
+                meta: AgentItemMeta()
+            ),
+            .raw(rawKind: "fixture", rawPayload: "raw payload", meta: AgentItemMeta()),
+        ]
+        var expected = AgentItemStore()
+        for (index, item) in agentItems.enumerated() {
+            AgentItemReducer.apply(item, itemId: "ai-\(index + 1)", into: &expected)
+        }
+        let runtime = ThreadRuntimeModel(
+            id: "history",
+            agentKind: .codex,
+            cwd: URL(fileURLWithPath: "/tmp")
+        )
+
+        runtime.applyReplayTurns([
+            HistoryTurn(items: Array(agentItems.prefix(2))),
+            HistoryTurn(items: Array(agentItems.suffix(2))),
+        ])
+
+        XCTAssertEqual(runtime.itemIndexById, expected.itemIndexById)
+        XCTAssertEqual(runtime.items.map(\.id), expected.items.map(\.id))
+        XCTAssertEqual(runtime.items.map(\.kind), expected.items.map(\.kind))
+        XCTAssertEqual(runtime.items.map(\.text), expected.items.map(\.text))
+        XCTAssertEqual(runtime.items.map(\.command), expected.items.map(\.command))
+        XCTAssertEqual(runtime.items.map(\.statusName), expected.items.map(\.statusName))
+    }
+
+    func testReplayTurnsBuildsLargeHistoryInOneCompleteStore() {
+        let count = 4_000
+        let items: [AgentItem] = (0..<count).map { index in
+            .assistantMessage(text: "message-\(index)", meta: AgentItemMeta())
+        }
+        let runtime = ThreadRuntimeModel(
+            id: "large-history",
+            agentKind: .claudeCode,
+            cwd: URL(fileURLWithPath: "/tmp")
+        )
+
+        runtime.applyReplayTurns([HistoryTurn(items: items)])
+
+        XCTAssertEqual(runtime.items.count, count)
+        XCTAssertEqual(runtime.itemIndexById.count, count)
+        XCTAssertEqual(runtime.items.first?.id, "ai-1")
+        XCTAssertEqual(runtime.items.first?.text, "message-0")
+        XCTAssertEqual(runtime.items.last?.id, "ai-4000")
+        XCTAssertEqual(runtime.items.last?.text, "message-3999")
+        XCTAssertEqual(runtime.itemIndexById["ai-4000"], 3_999)
+    }
 }

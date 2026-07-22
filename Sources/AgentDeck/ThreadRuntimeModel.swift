@@ -146,13 +146,15 @@ final class ThreadRuntimeModel {
 
     func applyReplayTurns(_ turns: [HistoryTurn]) {
         markUpdated()
-        itemIndexById.removeAll(keepingCapacity: true)
-        items.removeAll(keepingCapacity: true)
+        var store = AgentItemStore()
         for turn in turns {
             for item in turn.items {
-                applyAgentItem(item)
+                agentItemSeq += 1
+                AgentItemReducer.apply(item, itemId: "ai-\(agentItemSeq)", into: &store)
             }
         }
+        items = store.items
+        itemIndexById = store.itemIndexById
         errorMessage = nil
         phase = .ready
     }

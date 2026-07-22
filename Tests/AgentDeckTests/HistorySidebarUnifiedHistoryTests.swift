@@ -29,10 +29,10 @@ final class HistorySidebarUnifiedHistoryTests: XCTestCase {
             agentKind: .claudeCode
         )
         let presentation = HistoryThreadRowPresentation(
-            threadId: thread.id,
-            selectedThreadId: nil,
-            openingThreadId: nil,
-            hoveredThreadId: nil,
+            threadIdentity: HistoryThreadIdentity(thread),
+            selectedThreadIdentity: nil,
+            openingThreadIdentity: nil,
+            hoveredThreadIdentity: nil,
             runtimePhase: nil
         )
 
@@ -57,6 +57,31 @@ final class HistorySidebarUnifiedHistoryTests: XCTestCase {
         XCTAssertTrue(row.toolTip?.contains(thread.displayTitle) == true)
         XCTAssertEqual(row.accessibilityLabel(), thread.displayTitle)
         XCTAssertTrue((row.accessibilityValue() as? String)?.contains(thread.status) == true)
+    }
+
+    func testSameRawThreadIdDoesNotShareSelectionOpeningOrRuntimePhaseAcrossAgents() {
+        let codexIdentity = HistoryThreadIdentity(agentKind: .codex, threadId: "shared")
+        let claudeIdentity = HistoryThreadIdentity(agentKind: .claudeCode, threadId: "shared")
+
+        let codex = HistoryThreadRowPresentation(
+            threadIdentity: codexIdentity,
+            selectedThreadIdentity: claudeIdentity,
+            openingThreadIdentity: codexIdentity,
+            hoveredThreadIdentity: nil,
+            runtimePhase: .running
+        )
+        let claude = HistoryThreadRowPresentation(
+            threadIdentity: claudeIdentity,
+            selectedThreadIdentity: claudeIdentity,
+            openingThreadIdentity: codexIdentity,
+            hoveredThreadIdentity: nil,
+            runtimePhase: .ready
+        )
+
+        XCTAssertEqual(codex.visualState, .opening)
+        XCTAssertEqual(codex.runtimePhase, .running)
+        XCTAssertEqual(claude.visualState, .selected)
+        XCTAssertEqual(claude.runtimePhase, .ready)
     }
 
     private static func allViews(_ root: NSView) -> [NSView] {

@@ -2,6 +2,20 @@ import Foundation
 import AgentDeckCore
 import Observation
 
+struct HistoryThreadIdentity: Hashable, Sendable {
+    let agentKind: AgentKind
+    let threadId: String
+
+    init(agentKind: AgentKind, threadId: String) {
+        self.agentKind = agentKind
+        self.threadId = threadId
+    }
+
+    init(_ thread: HistoryThreadSummary) {
+        self.init(agentKind: thread.agentKind, threadId: thread.id)
+    }
+}
+
 struct HistoryOpenTiming: Equatable {
     let threadId: String
     let itemCount: Int
@@ -11,8 +25,8 @@ struct HistoryOpenTiming: Equatable {
 }
 
 /// Session view model. `@MainActor` + `@Observable`. v2 (Task 6A): pure
-/// orchestrator over `WorkbenchModel`; the cross-agent history layer is
-/// pending Task 6.5 and is currently a stub.
+/// orchestrator over `WorkbenchModel`; persisted Codex and Claude Code history
+/// is loaded through the daemon's neutral history contract.
 @MainActor
 @Observable
 final class SessionModel {
@@ -75,23 +89,40 @@ final class SessionModel {
     }
     private var legacyQueuedPrompts: [String] = []
 
-    /// v2 cross-agent history — stub until Task 6.5 wires daemon history.
-    /// Existing UI references this; we keep the API so the UI compiles.
+    /// v2 cross-agent history mirrored from the daemon's merged catalogue.
     private(set) var historyThreads: [HistoryThreadSummary] = []
     var historyGroups: [HistoryProjectGroup] {
         HistoryProjectGroup.group(combinedHistoryThreads())
     }
     var historyErrorMessage: String?
     var isLoadingHistory = false
-    var openingHistoryThreadId: String?
+    private(set) var openingHistoryThreadIdentity: HistoryThreadIdentity?
+    var openingHistoryThreadId: String? { openingHistoryThreadIdentity?.threadId }
     var lastHistoryOpenTiming: HistoryOpenTiming?
     var historySearchTerm = ""
     /// 右上环境面板数据源。真实 app 默认 nil（不显示且不预留面板空间）；
     /// preview 引导层注入 mock 值。不经 IPC——面板暂无 daemon 后端。
     var environmentInfo: EnvironmentInfo?
-    var selectedHistoryThreadId: String?
+    var selectedHistoryThreadIdentity: HistoryThreadIdentity?
+    var selectedHistoryThreadId: String? { selectedHistoryThreadIdentity?.threadId }
+    var selectedSidebarThreadIdentity: HistoryThreadIdentity? {
+        if let selectedHistoryThreadIdentity {
+            return selectedHistoryThreadIdentity
+        }
+        guard let runtime = workbench.selectedRuntime else { return nil }
+        if let threadId = runtime.threadId {
+            let persistedIdentity = HistoryThreadIdentity(
+                agentKind: runtime.agentKind,
+                threadId: threadId
+            )
+            if historyThreads.contains(where: { HistoryThreadIdentity($0) == persistedIdentity }) {
+                return persistedIdentity
+            }
+        }
+        return HistoryThreadIdentity(agentKind: runtime.agentKind, threadId: runtime.id)
+    }
     var selectedSidebarThreadId: String? {
-        selectedHistoryThreadId ?? workbench.selectedSessionId
+        selectedSidebarThreadIdentity?.threadId
     }
     var conversationViewportIdentity = "live:0"
     var scrollToLatestRequest = 0
@@ -111,6 +142,7 @@ final class SessionModel {
     private var daemonStarted = false
     private var daemonLaunchFailureMessage: String?
     private var conversationViewportRevision = 0
+    private var historyNavigationGeneration: UInt64 = 0
 
     init(
         client: DaemonClient? = nil,
@@ -201,6 +233,7 @@ final class SessionModel {
         guard !trimmed.isEmpty else { return }
 
         if workbench.selectedRuntime != nil {
+            invalidatePendingHistoryNavigation()
             let oldCount = selectedItems.count
             if let sessionStart {
                 workbench.submit(trimmed, sessionStart: sessionStart)
@@ -216,7 +249,8 @@ final class SessionModel {
         guard !trimmed.isEmpty, let cwd else { return }
 
         let sessionId = "live-\(UUID().uuidString)"
-        selectedHistoryThreadId = nil
+        invalidatePendingHistoryNavigation()
+        selectedHistoryThreadIdentity = nil
         workbench.ensureRuntime(sessionId: sessionId, agentKind: agentKind, threadId: nil, cwd: cwd)
         workbench.selectRuntime(sessionId: sessionId)
         let oldCount = selectedItems.count
@@ -271,14 +305,29 @@ final class SessionModel {
         historyThreads = threads
     }
 
+    func runtime(for thread: HistoryThreadSummary) -> ThreadRuntimeModel? {
+        if thread.source == "live",
+           let runtime = workbench.runtime(sessionId: thread.id),
+           runtime.agentKind == thread.agentKind {
+            return runtime
+        }
+        return workbench.runtime(forHistory: HistoryThreadIdentity(thread))
+    }
+
     private func combinedHistoryThreads() -> [HistoryThreadSummary] {
-        let persistedIds = Set(historyThreads.map(\.id))
+        var seen = Set<HistoryThreadIdentity>()
+        let persistedThreads = historyThreads.filter { thread in
+            seen.insert(HistoryThreadIdentity(thread)).inserted
+        }
         let liveThreads = workbench.runtimeList.compactMap { runtime -> HistoryThreadSummary? in
-            if persistedIds.contains(runtime.id) { return nil }
-            if let threadId = runtime.threadId, persistedIds.contains(threadId) { return nil }
+            let identity = HistoryThreadIdentity(
+                agentKind: runtime.agentKind,
+                threadId: runtime.threadId ?? runtime.id
+            )
+            guard seen.insert(identity).inserted else { return nil }
             return liveHistoryThreadSummary(for: runtime)
         }
-        return historyThreads + liveThreads
+        return persistedThreads + liveThreads
     }
 
     private func liveHistoryThreadSummary(for runtime: ThreadRuntimeModel) -> HistoryThreadSummary {
@@ -322,73 +371,100 @@ final class SessionModel {
             historyErrorMessage = "no daemon client"
             return
         }
-        guard ensureHistoryDaemonStarted() else { return }
         isLoadingHistory = true
         historyErrorMessage = nil
-        let cwdFilter = currentProjectOnly ? cwd?.path : nil
-        do {
-            let response = try client.history(.list(agentKind: nil, cwdFilter: cwdFilter, limit: nil))
-            if case .list(let items) = response {
-                let summaries = items.map { item in
-                    HistoryThreadSummary(
-                        id: item.threadId,
-                        name: item.title,
-                        preview: item.title ?? "",
-                        cwd: item.cwd,
-                        createdAt: Int(item.lastActiveMs / 1000),
-                        updatedAt: Int(item.lastActiveMs / 1000),
-                        status: item.archived ? "archived" : "ready",
-                        modelProvider: item.agentKind == .codex ? "openai" : "anthropic",
-                        source: item.agentKind == .codex ? "codex" : "claude_code",
-                        agentKind: item.agentKind
-                    )
-                }
-                setHistoryThreads(summaries)
-            }
-        } catch {
-            historyErrorMessage = "\(error)"
+        guard ensureHistoryDaemonStarted() else {
+            isLoadingHistory = false
+            return
         }
-        isLoadingHistory = false
+        let cwdFilter = currentProjectOnly ? cwd?.path : nil
+        DispatchQueue.global(qos: .userInitiated).async { [weak client] in
+            guard let client else { return }
+            let result = Result<HistoryResponse, Error> {
+                try client.history(.list(agentKind: nil, cwdFilter: cwdFilter, limit: nil))
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                defer { self.isLoadingHistory = false }
+                switch result {
+                case .success(let response):
+                    guard case .list(let items) = response else {
+                        self.historyErrorMessage = "malformed reply from agentdeckd: expected history list response"
+                        return
+                    }
+                    let summaries = items.map { item in
+                        HistoryThreadSummary(
+                            id: item.threadId,
+                            name: item.title,
+                            preview: item.title ?? "",
+                            cwd: item.cwd,
+                            createdAt: Int(item.lastActiveMs / 1000),
+                            updatedAt: Int(item.lastActiveMs / 1000),
+                            status: item.archived ? "archived" : "ready",
+                            modelProvider: item.agentKind == .codex ? "openai" : "anthropic",
+                            source: item.agentKind == .codex ? "codex" : "claude_code",
+                            agentKind: item.agentKind
+                        )
+                    }
+                    self.setHistoryThreads(summaries)
+                case .failure(let error):
+                    self.historyErrorMessage = "\(error)"
+                }
+            }
+        }
     }
 
     func openHistoryThread(_ thread: HistoryThreadSummary) {
-        if thread.source == "live", let runtime = workbench.runtime(sessionId: thread.id) {
+        let identity = HistoryThreadIdentity(thread)
+        let navigationGeneration = beginHistoryNavigation()
+
+        if thread.source == "live",
+           let runtime = workbench.runtime(sessionId: thread.id),
+           runtime.agentKind == thread.agentKind {
             cwd = runtime.cwd
-            selectedHistoryThreadId = nil
-            resetConversationViewport(prefix: "live:\(thread.id)")
+            selectedHistoryThreadIdentity = nil
+            resetConversationViewport(prefix: "live:\(thread.agentKind.rawValue):\(thread.id)")
             workbench.selectRuntime(sessionId: thread.id)
             return
         }
         guard let client else { return }
         guard ensureHistoryDaemonStarted() else { return }
-        openingHistoryThreadId = thread.id
+        openingHistoryThreadIdentity = identity
         historyErrorMessage = nil
         lastHistoryOpenTiming = nil
-        let agentKind: AgentKind = thread.agentKind
         let startedAt = Date()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self, weak client] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak client] in
             guard let client else { return }
             let result = Result<HistoryResponse, Error> {
-                try client.history(.read(threadId: thread.id, agentKind: agentKind))
+                try client.history(.read(threadId: identity.threadId, agentKind: identity.agentKind))
             }
             let readFinishedAt = Date()
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.openingHistoryThreadId == thread.id else { return }
-                self.openingHistoryThreadId = nil
+                guard let self,
+                      self.historyNavigationGeneration == navigationGeneration,
+                      self.openingHistoryThreadIdentity == identity else {
+                    return
+                }
+                self.openingHistoryThreadIdentity = nil
                 switch result {
                 case .success(let response):
-                    if case .read(let detail) = response {
-                        let applyStartedAt = Date()
-                        self.applyHistoryReadResponse(detail, originalThread: thread)
-                        let appliedAt = Date()
-                        self.lastHistoryOpenTiming = HistoryOpenTiming(
-                            threadId: thread.id,
-                            itemCount: detail.turns.reduce(0) { $0 + $1.items.count },
-                            readMilliseconds: Self.milliseconds(from: startedAt, to: readFinishedAt),
-                            applyMilliseconds: Self.milliseconds(from: applyStartedAt, to: appliedAt),
-                            totalMilliseconds: Self.milliseconds(from: startedAt, to: appliedAt)
-                        )
+                    guard case .read(let detail) = response,
+                          detail.threadId == identity.threadId,
+                          detail.agentKind == identity.agentKind else {
+                        self.historyErrorMessage =
+                            "malformed reply from agentdeckd: expected matching history read response"
+                        return
                     }
+                    let applyStartedAt = Date()
+                    self.applyHistoryReadResponse(detail, originalThread: thread)
+                    let appliedAt = Date()
+                    self.lastHistoryOpenTiming = HistoryOpenTiming(
+                        threadId: thread.id,
+                        itemCount: detail.turns.reduce(0) { $0 + $1.items.count },
+                        readMilliseconds: Self.milliseconds(from: startedAt, to: readFinishedAt),
+                        applyMilliseconds: Self.milliseconds(from: applyStartedAt, to: appliedAt),
+                        totalMilliseconds: Self.milliseconds(from: startedAt, to: appliedAt)
+                    )
                 case .failure(let error):
                     self.historyErrorMessage = "\(error)"
                 }
@@ -397,31 +473,40 @@ final class SessionModel {
     }
 
     func applyHistoryReadResponse(_ response: HistoryReadResponse, originalThread thread: HistoryThreadSummary) {
+        let identity = HistoryThreadIdentity(thread)
+        guard response.threadId == identity.threadId,
+              response.agentKind == identity.agentKind else {
+            historyErrorMessage =
+                "malformed reply from agentdeckd: expected matching history read response"
+            return
+        }
         cwd = URL(fileURLWithPath: thread.cwd)
-        selectedHistoryThreadId = thread.id
-        resetConversationViewport(prefix: "history:\(thread.id)")
+        selectedHistoryThreadIdentity = identity
+        resetConversationViewport(prefix: "history:\(identity.agentKind.rawValue):\(identity.threadId)")
+        let sessionId = WorkbenchModel.historySessionId(for: identity)
         let runtime = ThreadRuntimeModel(
-            id: thread.id,
+            id: sessionId,
             agentKind: response.agentKind,
             threadId: thread.id,
             cwd: URL(fileURLWithPath: thread.cwd)
         )
         runtime.applyReplayTurns(response.turns)
         workbench.installRuntime(runtime)
-        workbench.selectRuntime(sessionId: thread.id)
+        workbench.selectRuntime(sessionId: sessionId)
     }
 
     func applyHistoryThreadDetail(_ detail: HistoryThreadDetail) {
+        let identity = HistoryThreadIdentity(detail.thread)
         cwd = URL(fileURLWithPath: detail.thread.cwd)
-        selectedHistoryThreadId = detail.thread.id
-        resetConversationViewport(prefix: "history:\(detail.thread.id)")
+        selectedHistoryThreadIdentity = identity
+        resetConversationViewport(prefix: "history:\(identity.agentKind.rawValue):\(identity.threadId)")
         workbench.applyHistoryThreadDetail(detail)
     }
 
     func startNewSessionFromCurrentProject() {
-        selectedHistoryThreadId = nil
+        invalidatePendingHistoryNavigation()
+        selectedHistoryThreadIdentity = nil
         workbench.selectedSessionId = nil
-        openingHistoryThreadId = nil
         resetConversationViewport(prefix: "live")
         items.removeAll()
         errorMessage = nil
@@ -439,29 +524,73 @@ final class SessionModel {
         conversationViewportIdentity = "\(prefix):\(conversationViewportRevision)"
     }
 
+    @discardableResult
+    private func beginHistoryNavigation() -> UInt64 {
+        historyNavigationGeneration &+= 1
+        openingHistoryThreadIdentity = nil
+        return historyNavigationGeneration
+    }
+
+    private func invalidatePendingHistoryNavigation() {
+        _ = beginHistoryNavigation()
+    }
+
     func archiveHistoryThread(_ thread: HistoryThreadSummary) {
         guard let client, ensureHistoryDaemonStarted() else { return }
-        let agentKind: AgentKind = thread.agentKind
-        do {
-            _ = try client.history(.archive(threadId: thread.id, agentKind: agentKind))
-            if selectedHistoryThreadId == thread.id {
-                startNewSessionFromCurrentProject()
-            }
-            loadHistory()
-        } catch {
-            historyErrorMessage = "\(error)"
-        }
+        performHistoryMutation(
+            .archive(threadId: thread.id, agentKind: thread.agentKind),
+            target: HistoryThreadIdentity(thread),
+            client: client,
+            clearsSelectedThreadOnAck: true
+        )
     }
 
     func renameHistoryThread(_ thread: HistoryThreadSummary, name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let client, ensureHistoryDaemonStarted() else { return }
-        let agentKind: AgentKind = thread.agentKind
-        do {
-            _ = try client.history(.rename(threadId: thread.id, agentKind: agentKind, title: trimmed))
-            loadHistory()
-        } catch {
-            historyErrorMessage = "\(error)"
+        performHistoryMutation(
+            .rename(threadId: thread.id, agentKind: thread.agentKind, title: trimmed),
+            target: HistoryThreadIdentity(thread),
+            client: client,
+            clearsSelectedThreadOnAck: false
+        )
+    }
+
+    private func performHistoryMutation(
+        _ request: HistoryRequest,
+        target: HistoryThreadIdentity,
+        client: DaemonClient,
+        clearsSelectedThreadOnAck: Bool
+    ) {
+        historyErrorMessage = nil
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak client] in
+            guard let client else { return }
+            let result = Result<Void, Error> {
+                let response = try client.history(request)
+                guard case .ack = response else {
+                    throw DaemonError.malformedReply("expected history ack response")
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+
+                switch result {
+                case .success:
+                    // Resolve selection by stable identity at completion time.
+                    // The outline item is a value snapshot and may have been
+                    // replaced or removed while the daemon request was pending.
+                    if clearsSelectedThreadOnAck {
+                        self.workbench.removeHistoryRuntime(for: target)
+                        if self.selectedHistoryThreadIdentity == target {
+                            self.startNewSessionFromCurrentProject()
+                        }
+                    }
+                    self.loadHistory()
+                case .failure(let error):
+                    self.historyErrorMessage = "\(error)"
+                }
+            }
         }
     }
 

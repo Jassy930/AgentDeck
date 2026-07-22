@@ -23,6 +23,20 @@ final class FakeTransport: DaemonTransport {
     func sent(containing needle: String) -> Bool { sentLines.contains { $0.contains(needle) } }
 }
 
+/// 等待 MainActor 模型状态异步收口，同时把执行机会让给主队列。
+@MainActor
+func waitUntil(
+    timeout: Duration = .seconds(2),
+    condition: @MainActor () -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !condition(), clock.now < deadline {
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    return condition()
+}
+
 // MARK: - Spy 替身：捕获交互出口
 
 @MainActor
