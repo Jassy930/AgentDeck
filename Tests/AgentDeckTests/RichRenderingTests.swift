@@ -75,10 +75,11 @@ struct RichRenderingTests {
         let middleY = TurnJumpRailLayout.turnY(index: 1, count: 3, height: height)
         let latestY = TurnJumpRailLayout.latestY(height: height)
 
-        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: 14, y: firstY), count: 3, height: height) == .turn(0))
-        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: 14, y: middleY + 9), count: 3, height: height) == .turn(1))
-        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: 14, y: latestY), count: 3, height: height) == .latest)
-        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: 14, y: height - 40), count: 3, height: height) == nil)
+        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: 1, y: firstY), count: 3, height: height) == .turn(0))
+        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: TurnJumpRailLayout.width - 1, y: middleY + 6), count: 3, height: height) == .turn(1))
+        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: TurnJumpRailLayout.centerX, y: latestY), count: 3, height: height) == .latest)
+        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: TurnJumpRailLayout.width + 1, y: firstY), count: 3, height: height) == nil)
+        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: TurnJumpRailLayout.centerX, y: height - 45), count: 3, height: height) == nil)
     }
 
     @Test("turn jump rail keeps fixed spacing centered when it fits")
