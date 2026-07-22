@@ -235,6 +235,69 @@ final class RuntimeAgentKindTests: XCTestCase {
         XCTAssertEqual(item.success, false)
     }
 
+    func testToolReducerPreservesNeutralCollaborationActivityBoundary() throws {
+        let meta = AgentItemMeta(vendorExtensions: [
+            "activityKind": AnyCodable("collaboration"),
+            "activityEvent": AnyCodable("interacted"),
+            "status": AnyCodable("completed"),
+        ])
+        let agentItem = AgentItem.toolCall(
+            name: "spawnAgent",
+            args: AnyCodable([
+                "prompt": "审查工具展示",
+                "model": "gpt-5",
+                "reasoningEffort": "high",
+                "senderThreadId": "parent-1",
+                "receiverThreadIds": ["child-1"],
+            ] as [String: Any]),
+            result: AnyCodable([
+                "agentsStates": [
+                    "child-1": ["status": "completed"],
+                ],
+            ] as [String: Any]),
+            meta: meta
+        )
+        var store = AgentItemStore()
+
+        AgentItemReducer.apply(agentItem, itemId: "collab-1", into: &store)
+
+        let item = try XCTUnwrap(store.items.first)
+        XCTAssertEqual(item.kind, "toolCall")
+        XCTAssertEqual(item.activityKind, "collaboration")
+        XCTAssertEqual(item.activityEvent, "interacted")
+        XCTAssertEqual(item.tool, "spawnAgent")
+        XCTAssertEqual(ToolPresentation.toolStatusSummary(item), "已更新")
+        XCTAssertFalse(ToolActivityGroupPresentation.isGroupable(item))
+    }
+
+    func testToolReducerRoutesNeutralContextMaintenanceToCompactSystemRow() throws {
+        let meta = AgentItemMeta(vendorExtensions: [
+            "activityKind": AnyCodable("contextMaintenance"),
+        ])
+        let agentItem = AgentItem.toolCall(
+            name: "contextCompaction",
+            args: AnyCodable(NSNull()),
+            result: nil,
+            meta: meta
+        )
+        var store = AgentItemStore()
+
+        AgentItemReducer.apply(agentItem, itemId: "compact-1", into: &store)
+
+        let item = try XCTUnwrap(store.items.first)
+        let row = ConversationDisplayRow(
+            role: .assistantItem,
+            turnId: "turn-maintenance",
+            item: item,
+            firstInTurn: true,
+            lastInTurn: true
+        )
+        XCTAssertEqual(item.kind, "toolCall")
+        XCTAssertEqual(item.activityKind, "contextMaintenance")
+        XCTAssertEqual(row.presentationKind, "contextCompaction")
+        XCTAssertFalse(ToolActivityGroupPresentation.isGroupable(item))
+    }
+
     func testToolReducerPreservesClaudeCodeFailureMetadata() throws {
         let meta = AgentItemMeta(vendorExtensions: [
             "toolUseId": AnyCodable("tool-use-1"),

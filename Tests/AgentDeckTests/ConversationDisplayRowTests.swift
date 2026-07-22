@@ -35,6 +35,13 @@ enum ConversationDisplayRowTestSupport {
 
 final class ConversationDisplayRowTests: XCTestCase {
 
+    private func tool(_ id: String, name: String = "Read") -> UIItem {
+        var item = UIItem(id: id, lifecycle: "completed", kind: "toolCall")
+        item.tool = name
+        item.statusName = "completed"
+        return item
+    }
+
     func testUserThenAssistantItemsFlattenInOrderWithBoundaries() {
         let turns = ConversationDisplayRowTestSupport.sampleTurns()
         let rows = ConversationDisplayRowBuilder.rows(from: turns)
@@ -147,5 +154,177 @@ final class ConversationDisplayRowTests: XCTestCase {
         XCTAssertEqual(rows[0].turnId, rows[1].turnId)
         XCTAssertEqual(rows[2].turnId, rows[3].turnId)
         XCTAssertNotEqual(rows[0].turnId, rows[2].turnId)
+    }
+
+    func testToolGroupingDefaultsOffForSharedAndIOSCallers() {
+        let turn = ConversationTurn(
+            id: "turn-default",
+            user: nil,
+            assistantItems: [tool("t1"), tool("t2")]
+        )
+
+        let rows = ConversationDisplayRowBuilder.rows(from: [turn])
+
+        XCTAssertEqual(rows.map(\.item.id), ["t1", "t2"])
+        XCTAssertTrue(rows.allSatisfy { $0.toolActivityGroup == nil })
+    }
+
+    func testTwoConsecutiveToolActivitiesCollapseIntoOneStableSummaryRow() throws {
+        let turn = ConversationTurn(
+            id: "turn-group",
+            user: nil,
+            assistantItems: [tool("t1"), tool("t2", name: "Grep")]
+        )
+
+        let rows = ConversationDisplayRowBuilder.rows(
+            from: [turn],
+            toolGrouping: .consecutiveActivity
+        )
+
+        XCTAssertEqual(rows.count, 1)
+        let group = try XCTUnwrap(rows[0].toolActivityGroup)
+        XCTAssertEqual(group.activityItems.map(\.id), ["t1", "t2"])
+        XCTAssertEqual(group.disclosureId, "tool-group:turn-group:t1")
+        XCTAssertEqual(rows[0].presentationKind, "toolActivityGroup")
+        XCTAssertTrue(rows[0].firstInTurn)
+        XCTAssertTrue(rows[0].lastInTurn)
+    }
+
+    func testReasoningBetweenToolActivitiesIsPreservedInsideGroup() throws {
+        let reasoning = UIItem(
+            id: "r-middle",
+            lifecycle: "completed",
+            kind: "reasoning",
+            text: "检查下一步"
+        )
+        let turn = ConversationTurn(
+            id: "turn-reasoning",
+            user: nil,
+            assistantItems: [tool("t1"), reasoning, tool("t2")]
+        )
+
+        let rows = ConversationDisplayRowBuilder.rows(
+            from: [turn],
+            toolGrouping: .consecutiveActivity
+        )
+
+        let group = try XCTUnwrap(rows.first?.toolActivityGroup)
+        XCTAssertEqual(group.members.map(\.id), ["t1", "r-middle", "t2"])
+        XCTAssertEqual(group.activityItems.map(\.id), ["t1", "t2"])
+    }
+
+    func testLeadingAndTrailingReasoningRemainOutsideCollapsedGroup() throws {
+        let leading = UIItem(id: "r-leading", lifecycle: "completed", kind: "reasoning")
+        let middle = UIItem(id: "r-middle", lifecycle: "completed", kind: "reasoning")
+        let trailing = UIItem(id: "r-trailing", lifecycle: "completed", kind: "reasoning")
+        let turn = ConversationTurn(
+            id: "turn-trim",
+            user: nil,
+            assistantItems: [leading, tool("t1"), middle, tool("t2"), trailing]
+        )
+
+        let rows = ConversationDisplayRowBuilder.rows(
+            from: [turn],
+            toolGrouping: .consecutiveActivity
+        )
+
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertEqual(rows[0].item.id, "r-leading")
+        XCTAssertNotNil(rows[1].toolActivityGroup)
+        XCTAssertEqual(rows[2].item.id, "r-trailing")
+        XCTAssertEqual(try XCTUnwrap(rows[1].toolActivityGroup).members.map(\.id), ["t1", "r-middle", "t2"])
+    }
+
+    func testMessageAndTurnBoundariesPreventGrouping() {
+        let message = UIItem(
+            id: "message",
+            lifecycle: "completed",
+            kind: "message",
+            text: "阶段说明"
+        )
+        let firstTurn = ConversationTurn(
+            id: "turn-boundary-1",
+            user: nil,
+            assistantItems: [tool("t1"), message, tool("t2")]
+        )
+        let secondTurn = ConversationTurn(
+            id: "turn-boundary-2",
+            user: nil,
+            assistantItems: [tool("t3")]
+        )
+
+        let rows = ConversationDisplayRowBuilder.rows(
+            from: [firstTurn, secondTurn],
+            toolGrouping: .consecutiveActivity
+        )
+
+        XCTAssertEqual(rows.map(\.item.id), ["t1", "message", "t2", "t3"])
+        XCTAssertTrue(rows.allSatisfy { $0.toolActivityGroup == nil })
+    }
+
+    func testNeutralCollaborationActivityPreventsCrossBoundaryGrouping() {
+        var collaboration = tool("collab", name: "spawnAgent")
+        collaboration.activityKind = "collaboration"
+        let turn = ConversationTurn(
+            id: "turn-collaboration-boundary",
+            user: nil,
+            assistantItems: [tool("t1"), collaboration, tool("t2")]
+        )
+
+        let rows = ConversationDisplayRowBuilder.rows(
+            from: [turn],
+            toolGrouping: .consecutiveActivity
+        )
+
+        XCTAssertEqual(rows.map(\.item.id), ["t1", "collab", "t2"])
+        XCTAssertTrue(rows.allSatisfy { $0.toolActivityGroup == nil })
+    }
+
+    func testExpandingGroupRestoresOriginalRowsInOrderAndBoundaries() throws {
+        let reasoning = UIItem(id: "r1", lifecycle: "completed", kind: "reasoning")
+        let turn = ConversationTurn(
+            id: "turn-expanded",
+            user: nil,
+            assistantItems: [tool("t1"), reasoning, tool("t2")]
+        )
+        let disclosureId = "tool-group:turn-expanded:t1"
+
+        let rows = ConversationDisplayRowBuilder.rows(
+            from: [turn],
+            toolGrouping: .consecutiveActivity,
+            expandedToolGroupIds: [disclosureId]
+        )
+
+        XCTAssertEqual(rows.count, 4)
+        XCTAssertEqual(try XCTUnwrap(rows[0].toolActivityGroup).disclosureId, disclosureId)
+        XCTAssertEqual(rows.dropFirst().map(\.item.id), ["t1", "r1", "t2"])
+        XCTAssertEqual(Set(rows.map(\.id)).count, rows.count)
+        XCTAssertTrue(rows[0].firstInTurn)
+        XCTAssertFalse(rows[0].lastInTurn)
+        XCTAssertTrue(rows[3].lastInTurn)
+    }
+
+    func testAppendingActivityKeepsGroupAndDisclosureIdentityStable() throws {
+        let first = ConversationTurn(
+            id: "turn-live",
+            user: nil,
+            assistantItems: [tool("t1"), tool("t2")]
+        )
+        let appended = ConversationTurn(
+            id: "turn-live",
+            user: nil,
+            assistantItems: [tool("t1"), tool("t2"), tool("t3")]
+        )
+
+        let before = try XCTUnwrap(ConversationDisplayRowBuilder.rows(
+            from: [first], toolGrouping: .consecutiveActivity
+        ).first)
+        let after = try XCTUnwrap(ConversationDisplayRowBuilder.rows(
+            from: [appended], toolGrouping: .consecutiveActivity
+        ).first)
+
+        XCTAssertEqual(before.id, after.id)
+        XCTAssertEqual(before.toolActivityGroup?.disclosureId, after.toolActivityGroup?.disclosureId)
+        XCTAssertEqual(after.toolActivityGroup?.activityItems.count, 3)
     }
 }
