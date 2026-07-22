@@ -8,7 +8,7 @@ import AgentDeckCore
 // flight (Eng I1), and a send button.
 //
 //   ┌──────────────────────────────────────────────────────────┐
-//   │ Ask Codex to…                          [2 queued]   [ ↩ ] │
+//   │ Ask Codex to…                          [2 queued]   [ ↑ ] │
 //   └──────────────────────────────────────────────────────────┘
 //
 // Enter submits → `SessionModel.submit(text)`; Shift+Enter inserts a newline
@@ -51,7 +51,6 @@ final class InputBarView: NSView {
         field.setContentHuggingPriority(.required, for: .horizontal)
         return field
     }()
-    private let attachButton = NSButton()
     // 设计系统：权限徽章 = 橙色胶囊（盾牌图标 + workspace-write），effort = 灰色胶囊（high）。
     private let approvalBadge = InputBarView.badgePill(
         icon: "shield.lefthalf.filled", text: "workspace-write",
@@ -61,7 +60,6 @@ final class InputBarView: NSView {
         icon: nil, text: "high",
         fg: DesignTokens.text2, bg: DesignTokens.surface2,
         border: DesignTokens.border)
-    private let microphoneButton = NSButton()
     private let sendButton = NSButton()
 
     private var scrollHeightConstraint: NSLayoutConstraint!
@@ -165,22 +163,9 @@ final class InputBarView: NSView {
         // Placeholder overlays the text view's first line.
         scrollView.addSubview(placeholderLabel)
 
-        attachButton.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "添加上下文")
-        attachButton.toolTip = "添加上下文"
-        attachButton.bezelStyle = .inline
-        attachButton.isBordered = false
-        attachButton.contentTintColor = DesignTokens.text2
-        attachButton.translatesAutoresizingMaskIntoConstraints = false
-
-        microphoneButton.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "语音输入")
-        microphoneButton.toolTip = "语音输入"
-        microphoneButton.bezelStyle = .inline
-        microphoneButton.isBordered = false
-        microphoneButton.contentTintColor = DesignTokens.text2
-        microphoneButton.translatesAutoresizingMaskIntoConstraints = false
-
         sendButton.setAccessibilityIdentifier("composer-send")
         sendButton.image = NSImage(systemSymbolName: "arrow.up", accessibilityDescription: "发送")
+        sendButton.toolTip = "发送（Return）"
         // 浅色圆底上箭头需深色，否则模板图默认取浅色前景 → 白底白箭头看不见。
         sendButton.contentTintColor = CodexDesktopChrome.windowBackground
         sendButton.bezelStyle = .inline
@@ -191,7 +176,7 @@ final class InputBarView: NSView {
         sendButton.setContentHuggingPriority(.required, for: .horizontal)
         sendButton.wantsLayer = true
         sendButton.layer?.backgroundColor = DesignTokens.text.cgColor
-        sendButton.layer?.cornerRadius = 15
+        sendButton.layer?.cornerRadius = 22
 
         // 设计系统：左侧徽章成组（权限 / Plan Mode / 队列 / effort）。
         // 用 NSStackView 让隐藏项自动折叠，避免占位造成的空隙。
@@ -199,13 +184,21 @@ final class InputBarView: NSView {
         badgeStack.orientation = .horizontal
         badgeStack.alignment = .centerY
         badgeStack.spacing = 8
+        badgeStack.detachesHiddenViews = true
+        // 窄窗口下不能让徽章的 intrinsic width 挤坏右侧发送按钮。允许 stack
+        // 按信息优先级自动摘除低优先级项：先 effort，再 Plan Mode；队列状态和
+        // 权限徽章尽量保留。发送按钮的 required 44pt 约束始终不参与压缩。
+        badgeStack.setClippingResistancePriority(.defaultLow, for: .horizontal)
+        badgeStack.setVisibilityPriority(.mustHold, for: approvalBadge)
+        badgeStack.setVisibilityPriority(.init(rawValue: 930), for: queuedLabel)
+        badgeStack.setVisibilityPriority(.init(rawValue: 920), for: planModeBadge)
+        badgeStack.setVisibilityPriority(.init(rawValue: 910), for: effortBadge)
+        badgeStack.setAccessibilityIdentifier("composer-badges")
         badgeStack.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(composerChrome)
         composerChrome.addSubview(scrollView)
-        composerChrome.addSubview(attachButton)
         composerChrome.addSubview(badgeStack)
-        composerChrome.addSubview(microphoneButton)
         composerChrome.addSubview(sendButton)
 
         scrollHeightConstraint = scrollView.heightAnchor.constraint(equalToConstant: minHeight)
@@ -221,28 +214,18 @@ final class InputBarView: NSView {
             scrollView.trailingAnchor.constraint(equalTo: composerChrome.trailingAnchor, constant: -14),
             scrollHeightConstraint,
 
-            attachButton.leadingAnchor.constraint(equalTo: composerChrome.leadingAnchor, constant: 12),
-            attachButton.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 13),
-            attachButton.bottomAnchor.constraint(equalTo: composerChrome.bottomAnchor, constant: -12),
-            attachButton.widthAnchor.constraint(equalToConstant: 28),
-            attachButton.heightAnchor.constraint(equalToConstant: 28),
+            // 只呈现已接通的控件：徽章组靠左，发送按钮靠右。
+            // 未实现的附件/语音入口不占位，避免把装饰误认为可操作能力。
+            badgeStack.leadingAnchor.constraint(equalTo: composerChrome.leadingAnchor, constant: 14),
+            badgeStack.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
+            badgeStack.trailingAnchor.constraint(lessThanOrEqualTo: sendButton.leadingAnchor, constant: -12),
 
-            // 设计系统：徽章组紧挨 + 号成组在左，尾部不越过 mic
-            badgeStack.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 10),
-            badgeStack.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            badgeStack.trailingAnchor.constraint(lessThanOrEqualTo: microphoneButton.leadingAnchor, constant: -10),
-
-            // mic / send 独立锚定到右侧
-            microphoneButton.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -10),
-            microphoneButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            microphoneButton.widthAnchor.constraint(equalToConstant: 24),
-            microphoneButton.heightAnchor.constraint(equalToConstant: 24),
-
-            sendButton.leadingAnchor.constraint(equalTo: microphoneButton.trailingAnchor, constant: 10),
+            sendButton.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 10),
+            sendButton.bottomAnchor.constraint(equalTo: composerChrome.bottomAnchor, constant: -10),
             sendButton.trailingAnchor.constraint(equalTo: composerChrome.trailingAnchor, constant: -12),
-            sendButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            sendButton.widthAnchor.constraint(equalToConstant: 30),
-            sendButton.heightAnchor.constraint(equalToConstant: 30),
+            sendButton.centerYAnchor.constraint(equalTo: badgeStack.centerYAnchor),
+            sendButton.widthAnchor.constraint(equalToConstant: 44),
+            sendButton.heightAnchor.constraint(equalToConstant: 44),
 
             placeholderLabel.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor, constant: 4),
             placeholderLabel.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: verticalTextInset),

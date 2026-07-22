@@ -1,6 +1,21 @@
 import AppKit
 import AgentDeckCore
 
+/// 与设计系统 `.wb-stream` / `.wb-col` / `.wb-composer` 对齐的主内容布局度量。
+/// inspector 有数据且空间足够时，正文和 composer 都在
+/// `24 ... (width - 290)` 区域内居中；无数据或窄于响应式门槛时，左右各保留
+/// 24pt，避免一个不可见或放不下的面板继续挤压正文。
+enum ConversationLayoutMetrics {
+    static let contentMaxWidth: CGFloat = 620
+    /// 窄窗仍需留给 composer 的最低可用宽度；低于这一门槛时优先折叠 inspector。
+    static let contentMinimumWidth: CGFloat = 252
+    static let horizontalInset: CGFloat = 24
+    static let inspectorReserve: CGFloat = 290
+    static let minimumInspectorPaneWidth = horizontalInset + inspectorReserve + contentMinimumWidth
+    static let environmentTop: CGFloat = 12
+    static let environmentTrailing: CGFloat = 20
+}
+
 // MARK: - ConversationViewController (Task 8)
 //
 // Assembles the conversation pane from the pieces built in Tasks 2–7:
@@ -76,6 +91,12 @@ final class ConversationViewController: NSViewController {
     private let tableView = NSTableView()
     private lazy var inputBar = InputBarView(model: model)
     private lazy var environmentPanel = CodexEnvironmentPanelView(model: model)
+    private let contentRegionGuide = NSLayoutGuide()
+    private let contentColumnGuide = NSLayoutGuide()
+    private var contentTrailingWithoutInspector: NSLayoutConstraint?
+    private var contentTrailingWithInspector: NSLayoutConstraint?
+    private var environmentPanelConstraints: [NSLayoutConstraint] = []
+    private var isEnvironmentPanelPresented: Bool?
     private let errorCell = ErrorCellView()
     private let warningCell = WarningCellView()
     private let approvalCard = ApprovalCardView()
@@ -121,49 +142,77 @@ final class ConversationViewController: NSViewController {
         configureScrollView()
         configureFooter()
 
+        root.addLayoutGuide(contentRegionGuide)
+        root.addLayoutGuide(contentColumnGuide)
         root.addSubview(scrollView)
-        root.addSubview(environmentPanel)
         root.addSubview(footerStack)
         root.addSubview(inputBar)
 
-        // Fill the available pane width (capped below at ≤ 900 / ≤ 860) rather
-        // than *demanding* a fixed 900/860. A fixed `equalToConstant` makes the
-        // content view's Auto Layout `fittingSize` want that exact width; since
-        // the window is created via `NSWindow(contentViewController:)`, the
-        // window resizes to satisfy that fitting size — so opening a session
-        // (empty pane → conversation pane) grew the window from ~920 to ~1620pt.
-        // Expanding relative to the pane width keeps the transcript at its 900pt
-        // cap on wide windows while letting `fittingSize` stay small, so the
-        // window no longer jumps. (systematic-debugging: window↔fitting tie.)
-        let preferredTranscriptWidth = scrollView.widthAnchor.constraint(equalTo: root.widthAnchor)
-        preferredTranscriptWidth.priority = .defaultHigh
-        let preferredInputWidth = inputBar.widthAnchor.constraint(equalTo: root.widthAnchor)
-        preferredInputWidth.priority = .defaultHigh
+        scrollView.setAccessibilityIdentifier("conversation-transcript")
+        footerStack.setAccessibilityIdentifier("conversation-footer")
+        inputBar.setAccessibilityIdentifier("conversation-input-bar")
+
+        // `.wb-col` 与 `.wb-composer` 共用同一个内容列：最大 620pt，在可用区域内
+        // 居中。`width == region.width` 只有 defaultHigh，620pt 上限不会反向撑大
+        // contentViewController 的 fittingSize，保留“打开会话不放大窗口”的不变量。
+        let preferredColumnWidth = contentColumnGuide.widthAnchor.constraint(
+            equalTo: contentRegionGuide.widthAnchor
+        )
+        preferredColumnWidth.priority = .defaultHigh
+
+        let withoutInspector = contentRegionGuide.trailingAnchor.constraint(
+            equalTo: root.trailingAnchor,
+            constant: -ConversationLayoutMetrics.horizontalInset
+        )
+        let withInspector = contentRegionGuide.trailingAnchor.constraint(
+            equalTo: root.trailingAnchor,
+            constant: -ConversationLayoutMetrics.inspectorReserve
+        )
+        contentTrailingWithoutInspector = withoutInspector
+        contentTrailingWithInspector = withInspector
+
+        environmentPanelConstraints = [
+            environmentPanel.topAnchor.constraint(
+                equalTo: root.topAnchor,
+                constant: ConversationLayoutMetrics.environmentTop
+            ),
+            environmentPanel.trailingAnchor.constraint(
+                equalTo: root.trailingAnchor,
+                constant: -ConversationLayoutMetrics.environmentTrailing
+            ),
+        ]
 
         NSLayoutConstraint.activate([
+            contentRegionGuide.leadingAnchor.constraint(
+                equalTo: root.leadingAnchor,
+                constant: ConversationLayoutMetrics.horizontalInset
+            ),
+
+            contentColumnGuide.centerXAnchor.constraint(equalTo: contentRegionGuide.centerXAnchor),
+            contentColumnGuide.leadingAnchor.constraint(greaterThanOrEqualTo: contentRegionGuide.leadingAnchor),
+            contentColumnGuide.trailingAnchor.constraint(lessThanOrEqualTo: contentRegionGuide.trailingAnchor),
+            contentColumnGuide.widthAnchor.constraint(greaterThanOrEqualToConstant: 1),
+            contentColumnGuide.widthAnchor.constraint(
+                lessThanOrEqualToConstant: ConversationLayoutMetrics.contentMaxWidth
+            ),
+            preferredColumnWidth,
+
             scrollView.topAnchor.constraint(equalTo: root.topAnchor),
-            scrollView.centerXAnchor.constraint(equalTo: root.centerXAnchor, constant: -70),
-            preferredTranscriptWidth,
-            scrollView.widthAnchor.constraint(lessThanOrEqualToConstant: 900),
-            scrollView.leadingAnchor.constraint(greaterThanOrEqualTo: root.leadingAnchor, constant: 34),
-            scrollView.trailingAnchor.constraint(lessThanOrEqualTo: environmentPanel.leadingAnchor, constant: -24),
+            scrollView.leadingAnchor.constraint(equalTo: contentColumnGuide.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: contentColumnGuide.trailingAnchor),
 
             footerStack.topAnchor.constraint(equalTo: scrollView.bottomAnchor),
-            footerStack.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
-            footerStack.widthAnchor.constraint(equalTo: inputBar.widthAnchor),
+            footerStack.leadingAnchor.constraint(equalTo: contentColumnGuide.leadingAnchor),
+            footerStack.trailingAnchor.constraint(equalTo: contentColumnGuide.trailingAnchor),
 
             inputBar.topAnchor.constraint(equalTo: footerStack.bottomAnchor),
-            inputBar.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
-            preferredInputWidth,
-            inputBar.widthAnchor.constraint(lessThanOrEqualToConstant: 860),
-            inputBar.leadingAnchor.constraint(greaterThanOrEqualTo: root.leadingAnchor, constant: 34),
+            inputBar.leadingAnchor.constraint(equalTo: contentColumnGuide.leadingAnchor),
+            inputBar.trailingAnchor.constraint(equalTo: contentColumnGuide.trailingAnchor),
             inputBar.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
-
-            environmentPanel.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
-            environmentPanel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
         ])
 
         self.view = root
+        refreshEnvironmentPanelPresentation()
 
         rebuildRows()
         bindModel()
@@ -182,10 +231,14 @@ final class ConversationViewController: NSViewController {
 
     override func viewDidLayout() {
         super.viewDidLayout()
+        // environmentInfo 有值也不能在窄窗强占 290pt；先按本轮真实宽度决定
+        // inspector 是否参与布局，再测量正文列宽。
+        refreshEnvironmentPanelPresentation()
         let width = columnWidth
         guard abs(width - lastLaidOutColumnWidth) > 0.5 else { return }
         lastLaidOutColumnWidth = width
         cache.invalidateAll()
+        refreshFooter()
         if !rows.isEmpty {
             tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<rows.count))
         }
@@ -269,12 +322,14 @@ final class ConversationViewController: NSViewController {
             _ = self.model.selectedErrorMessage
             _ = self.model.selectedWarningMessage
             _ = self.model.queuedPrompts
+            _ = self.model.environmentInfo
         }, onChange: { [weak self] in
             self?.modelDidChange()
         })
     }
 
     private func modelDidChange() {
+        refreshEnvironmentPanelPresentation()
         let previousExpansion = lastReasoningExpanded
         let previousSignatures = displayedRowSignatures
         rebuildRows()
@@ -393,7 +448,38 @@ final class ConversationViewController: NSViewController {
     }
 
     private var footerWidth: CGFloat {
-        max(view.bounds.width, 1)
+        max(footerStack.bounds.width, scrollView.bounds.width, 1)
+    }
+
+    /// `environmentInfo == nil` 表示真实应用没有可展示的数据源。即使有数据，
+    /// 窄窗不足以同时保留 252pt composer 和 inspector 时也会响应式折叠。
+    /// 折叠时把面板移出层级并停用 root 约束，让 260pt 面板不参与 fittingSize，
+    /// 同时把内容区域的 trailing reserve 从 290pt 恢复为普通 24pt。
+    private func refreshEnvironmentPanelPresentation() {
+        guard isViewLoaded else { return }
+        let shouldShow = model.environmentInfo != nil
+            && view.bounds.width >= ConversationLayoutMetrics.minimumInspectorPaneWidth
+        guard isEnvironmentPanelPresented != shouldShow else { return }
+        isEnvironmentPanelPresented = shouldShow
+
+        if shouldShow {
+            contentTrailingWithoutInspector?.isActive = false
+            contentTrailingWithInspector?.isActive = true
+            if environmentPanel.superview == nil {
+                view.addSubview(environmentPanel)
+                NSLayoutConstraint.activate(environmentPanelConstraints)
+            }
+            environmentPanel.isHidden = false
+        } else {
+            contentTrailingWithInspector?.isActive = false
+            contentTrailingWithoutInspector?.isActive = true
+            environmentPanel.isHidden = true
+            if environmentPanel.superview != nil {
+                NSLayoutConstraint.deactivate(environmentPanelConstraints)
+                environmentPanel.removeFromSuperview()
+            }
+        }
+        view.needsLayout = true
     }
 
     // MARK: Scroll spy

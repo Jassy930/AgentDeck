@@ -40,6 +40,45 @@ final class ComposerInteractionTests: XCTestCase {
         XCTAssertTrue(c.bar.button(id: "composer-send")!.isEnabled, "有文本时发送按钮应启用")
     }
 
+    func testComposerOnlyExposesImplementedActionWithUsableHitTarget() throws {
+        let c = makeComposer()
+        let buttons = c.bar.allDescendants(ofType: NSButton.self)
+        let send = try XCTUnwrap(c.bar.button(id: "composer-send"))
+
+        XCTAssertEqual(buttons, [send], "未接通的附件和语音入口不应伪装成可点击按钮")
+        XCTAssertGreaterThanOrEqual(send.frame.width, 44)
+        XCTAssertGreaterThanOrEqual(send.frame.height, 44)
+    }
+
+    func testNarrowComposerKeepsSendAvailableWhenBadgesNeedMoreSpace() throws {
+        let spy = SpyTurnStarter()
+        let model = SessionModel(turnStarter: spy)
+        model.cwd = URL(fileURLWithPath: "/tmp/agentdeck-e2e")
+        model.queuedPrompts = Array(repeating: "queued", count: 999)
+
+        let bar = InputBarView(model: model)
+        bar.applyState(planMode: true)
+        bar.frame = NSRect(x: 0, y: 0, width: 252, height: bar.fittingSize.height)
+        bar.layoutSubtreeIfNeeded()
+
+        let send = try XCTUnwrap(bar.button(id: "composer-send"))
+        let badges = try XCTUnwrap(bar.descendant(id: "composer-badges"))
+        let textView = try XCTUnwrap(bar.firstDescendant(ofType: InputTextView.self))
+
+        XCTAssertEqual(send.frame.width, 44, accuracy: 0.5)
+        XCTAssertGreaterThanOrEqual(send.frame.height, 44)
+        XCTAssertEqual(send.frame.maxX, bar.bounds.maxX - 12, accuracy: 0.5)
+        XCTAssertLessThanOrEqual(badges.frame.maxX, send.frame.minX - 12 + 0.5)
+        XCTAssertGreaterThanOrEqual(badges.frame.minX, 13.5)
+        XCTAssertFalse(bar.hasAmbiguousLayout)
+        XCTAssertFalse(badges.hasAmbiguousLayout)
+
+        type("窄窗口仍可发送", into: textView)
+        XCTAssertTrue(send.isEnabled)
+        send.performClick(nil)
+        XCTAssertEqual(spy.lastPrompt, "窄窗口仍可发送")
+    }
+
     func testClickSendSubmitsAndClears() {
         let c = makeComposer()
         type("拆分登录模块", into: c.tv)
