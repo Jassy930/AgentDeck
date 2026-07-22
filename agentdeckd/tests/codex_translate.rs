@@ -184,12 +184,10 @@ fn fixture_replay_unknown_item_type_falls_back_to_raw_not_silently_dropped() {
         } => {
             assert_eq!(raw_kind, "someBrandNewCodexThing");
             assert_eq!(*agent_kind, AgentKind::Codex);
-            // The vendor JSON IS allowed to appear inside Raw.raw_payload —
-            // that's the contract for unknown types (preserve everything so
-            // diagnostics see it). What's NOT allowed is the trunk fields
-            // leaking vendor strings.
-            assert!(raw_payload.contains("someBrandNewCodexThing"));
-            assert!(raw_payload.contains("hidden"));
+            // K9/N4: the safe type identifier remains visible, but arbitrary
+            // vendor JSON must stay inside the adapter.
+            assert_eq!(raw_payload, "[vendor payload withheld]");
+            assert!(!raw_payload.contains("hidden"));
         }
         other => panic!("expected Raw AgentItem, got {other:?}"),
     }

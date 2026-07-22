@@ -165,33 +165,41 @@ fn e2e_cross_history_merged_list_contains_both_agents() {
     );
 
     let items = json["value"].as_array().expect("value must be an array");
-    let agent_kinds: Vec<&str> = items
-        .iter()
-        .filter_map(|item| item.get("agentKind").and_then(|v| v.as_str()))
-        .collect();
-
-    // Note: Codex history list is stubbed empty in v0.2 (see agentdeckd/src/codex/history.rs
-    // TODO(v0.3)). The fan-out merge still works — CC entries appear in the merged list
-    // alongside a silent empty contribution from Codex. This test therefore verifies:
-    //   1. The merged list request succeeds (kind=list, valid JSON).
-    //   2. CC entries are present (from the just-run CC session).
-    //   3. All items carry a valid agentKind field.
-    //
-    // When Codex history is wired in v0.3, this assertion can be upgraded to also
-    // require "codex" in agent_kinds.
+    let contains_thread = |thread_id: &str, agent_kind: &str| {
+        items.iter().any(|item| {
+            item.get("threadId").and_then(|value| value.as_str()) == Some(thread_id)
+                && item.get("agentKind").and_then(|value| value.as_str()) == Some(agent_kind)
+        })
+    };
     assert!(
-        agent_kinds.contains(&"claude_code"),
-        "merged history must contain at least one claude_code entry; kinds seen: {agent_kinds:?}"
+        contains_thread(&codex_tid, "codex"),
+        "merged history must contain the Codex thread created by this test: {codex_tid}"
     );
-    // Verify all items have a recognized agentKind
-    for kind in &agent_kinds {
+    assert!(
+        contains_thread(&cc_tid, "claude_code"),
+        "merged history must contain the Claude Code thread created by this test: {cc_tid}"
+    );
+
+    for (thread_id, agent) in [(&codex_tid, "codex"), (&cc_tid, "claude-code")] {
+        let read = run_cli(&["history", "read", thread_id, "--agent", agent]);
         assert!(
-            *kind == "codex" || *kind == "claude_code",
-            "unknown agentKind in merged history: {kind}"
+            read.status.success(),
+            "history read failed for {agent} thread {thread_id}\nstderr: {}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+        let detail: serde_json::Value =
+            serde_json::from_slice(&read.stdout).expect("history read output must be valid JSON");
+        assert_eq!(detail["kind"], "read");
+        assert_eq!(detail["value"]["threadId"], thread_id.as_str());
+        assert!(
+            detail["value"]["turns"]
+                .as_array()
+                .is_some_and(|turns| !turns.is_empty()),
+            "history read must return at least one persisted turn for {thread_id}"
         );
     }
     eprintln!(
-        "merged history OK: {} total items (codex_stub_empty+CC), codex_tid={codex_tid}, cc_tid={cc_tid}",
+        "merged history OK: {} total items, codex_tid={codex_tid}, cc_tid={cc_tid}",
         items.len()
     );
 }
