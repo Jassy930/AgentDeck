@@ -148,4 +148,33 @@ final class ToolCallCellViewTests: XCTestCase {
         XCTAssertTrue(visibleLabels.contains("确认 AgentDeck 窗口"))
         XCTAssertTrue(visibleLabels.contains("失败 · 136ms"))
     }
+
+    func testCollaborationActivityUsesCompactNameAndEventDescription() {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        var item = UIItem(
+            id: "subagent-activity",
+            lifecycle: "completed",
+            kind: "toolCall"
+        )
+        item.tool = "Schema mapping check"
+        item.activityKind = "collaboration"
+        item.activityEvent = "interacted"
+        let row = ConversationDisplayRow(
+            role: .assistantItem,
+            turnId: "turn-collaboration",
+            item: item,
+            firstInTurn: true,
+            lastInTurn: true
+        )
+
+        let cell = ToolCallCellView()
+        cell.configure(row: row, width: 720, model: model)
+
+        let visibleLabels = cell.allDescendants(ofType: NSTextField.self)
+            .filter { !$0.isHidden }
+            .map(\.stringValue)
+        XCTAssertTrue(visibleLabels.contains("Schema mapping check"))
+        XCTAssertTrue(visibleLabels.contains("已更新"))
+        XCTAssertFalse(visibleLabels.contains("已完成"))
+    }
 }

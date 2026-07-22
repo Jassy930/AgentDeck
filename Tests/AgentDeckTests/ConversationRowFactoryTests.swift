@@ -52,6 +52,25 @@ extension ConversationDisplayRowTestSupport {
         ]
         return kinds.map { assistantRow(kind: $0, text: "text") }
     }
+
+    static func toolActivityGroupRow(count: Int = 2) -> ConversationDisplayRow {
+        let tools = (0..<count).map { index -> UIItem in
+            var item = UIItem(
+                id: "group-tool-\(index)",
+                lifecycle: "completed",
+                kind: "toolCall"
+            )
+            item.tool = "Read"
+            item.statusName = "completed"
+            item.arguments = #"{"file_path":"/tmp/file.swift"}"#
+            return item
+        }
+        let turn = ConversationTurn(id: "turn-group", user: nil, assistantItems: tools)
+        return ConversationDisplayRowBuilder.rows(
+            from: [turn],
+            toolGrouping: .consecutiveActivity
+        )[0]
+    }
 }
 
 // MARK: - Tests
@@ -101,6 +120,82 @@ final class ConversationRowFactoryTests: XCTestCase {
         let row = ConversationDisplayRowTestSupport.userPromptRow()
         let cell = ConversationRowFactory.makeCell(for: row)
         XCTAssertTrue(cell is UserPromptCellView)
+    }
+
+    func testToolActivityGroupUsesDedicatedReuseIdentifierAndCell() {
+        let row = ConversationDisplayRowTestSupport.toolActivityGroupRow()
+        let cell = ConversationRowFactory.makeCell(for: row)
+
+        XCTAssertEqual(
+            ConversationRowFactory.reuseIdentifier(for: row).rawValue,
+            "assistant.toolActivityGroup"
+        )
+        XCTAssertTrue(cell is ToolActivityGroupCellView)
+    }
+
+    func testNeutralContextMaintenanceUsesExistingCompactSystemCell() throws {
+        var item = UIItem(
+            id: "maintenance-1",
+            lifecycle: "completed",
+            kind: "toolCall"
+        )
+        item.activityKind = "contextMaintenance"
+        let row = ConversationDisplayRow(
+            role: .assistantItem,
+            turnId: "turn-maintenance",
+            item: item,
+            firstInTurn: true,
+            lastInTurn: true
+        )
+
+        let cell = ConversationRowFactory.makeCell(for: row)
+        XCTAssertEqual(
+            ConversationRowFactory.reuseIdentifier(for: row).rawValue,
+            "assistant.contextCompaction"
+        )
+        let contextCell = try XCTUnwrap(cell as? ContextCompactionCellView)
+        contextCell.configure(
+            row: row,
+            width: 620,
+            model: SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        )
+        XCTAssertTrue(
+            contextCell.allDescendants(ofType: NSTextField.self)
+                .contains { $0.stringValue == "上下文已压缩" }
+        )
+    }
+
+    func testFileEditCellUsesAvailableTranscriptWidth() throws {
+        let row = ConversationDisplayRowTestSupport.assistantRow(kind: "fileEdit") { item in
+            item.path = "/tmp/agentdeck-worktree/Sources/AgentDeck/ConversationRowViews.swift"
+            item.statusName = "modified"
+        }
+        let width: CGFloat = 720
+        let cell = try XCTUnwrap(
+            ConversationRowFactory.makeCell(for: row) as? FileEditCellView
+        )
+        cell.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: width,
+            height: ConversationRowFactory.height(for: row, width: width)
+        )
+        cell.configure(
+            row: row,
+            width: width,
+            model: SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        )
+        cell.layoutSubtreeIfNeeded()
+
+        XCTAssertGreaterThan(
+            cell.contentStack.frame.width,
+            width - 60,
+            "文件路径行应占用正文可用宽度，不能退化成按路径分隔符竖排"
+        )
+        let pathLabel = try XCTUnwrap(
+            cell.contentStack.arrangedSubviews.first as? NSTextField
+        )
+        XCTAssertGreaterThan(pathLabel.frame.width, width - 60)
     }
 
     func testHeightIsPositiveForMessage() {
@@ -171,6 +266,22 @@ final class ConversationRowFactoryTests: XCTestCase {
             ConversationRowFactory.height(for: long, width: 400),
             accuracy: 0.1,
             "payload 只应影响展开态高度"
+        )
+    }
+
+    func testCollapsedToolActivityGroupHeightDoesNotGrowWithMemberCount() {
+        let two = ConversationDisplayRowTestSupport.toolActivityGroupRow(count: 2)
+        let twenty = ConversationDisplayRowTestSupport.toolActivityGroupRow(count: 20)
+
+        XCTAssertEqual(
+            ConversationRowFactory.height(for: two, width: 400),
+            ConversationRowFactory.height(for: twenty, width: 400),
+            accuracy: 0.1
+        )
+        XCTAssertLessThanOrEqual(
+            ConversationRowFactory.height(for: twenty, width: 400),
+            32,
+            "折叠组只能占一个紧凑摘要行"
         )
     }
 }

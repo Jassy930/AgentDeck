@@ -91,6 +91,13 @@ final class ConversationViewController: NSViewController {
     /// the streaming reconfigure path (C1): a cell restores its expanded state
     /// from this set in `configure` instead of hard-resetting to collapsed.
     private var expandedItemIds: Set<String> = []
+    /// Group disclosure is structural (it inserts/removes the original member
+    /// rows), so keep it separate from per-item payload disclosure state.
+    private var expandedToolGroupIds: Set<String> = []
+    /// Distinguishes a newly formed live group from one the user deliberately
+    /// collapsed. A new group inherits expansion when its former singleton was
+    /// already open; later model flushes must not reopen a manually closed one.
+    private var knownToolGroupIds: Set<String> = []
     /// Reasoning auto-expands while a turn runs, so an explicit user collapse
     /// needs a separate override instead of being indistinguishable from the
     /// default "not manually expanded" state.
@@ -355,6 +362,8 @@ final class ConversationViewController: NSViewController {
         if viewportChanged {
             displayedConversationViewportIdentity = model.conversationViewportIdentity
             expandedItemIds.removeAll()
+            expandedToolGroupIds.removeAll()
+            knownToolGroupIds.removeAll()
             collapsedReasoningItemIds.removeAll()
             cache.invalidateAll()
         }
@@ -470,7 +479,32 @@ final class ConversationViewController: NSViewController {
 
     private func rebuildRows() {
         let turns = makeConversationTurns(from: model.selectedItems)
-        rows = ConversationDisplayRowBuilder.rows(from: turns)
+        var rebuilt = ConversationDisplayRowBuilder.rows(
+            from: turns,
+            toolGrouping: .consecutiveActivity,
+            expandedToolGroupIds: expandedToolGroupIds
+        )
+
+        // If an expanded singleton receives a second execution item and turns
+        // into a group, keep the user's open detail visible exactly once. A
+        // known group that the user collapsed stays collapsed on later flushes.
+        var inheritedExpansion = false
+        for group in rebuilt.compactMap(\.toolActivityGroup) {
+            if !knownToolGroupIds.contains(group.disclosureId),
+               group.activityItems.contains(where: { expandedItemIds.contains($0.id) }) {
+                inheritedExpansion = expandedToolGroupIds.insert(group.disclosureId).inserted
+                    || inheritedExpansion
+            }
+            knownToolGroupIds.insert(group.disclosureId)
+        }
+        if inheritedExpansion {
+            rebuilt = ConversationDisplayRowBuilder.rows(
+                from: turns,
+                toolGrouping: .consecutiveActivity,
+                expandedToolGroupIds: expandedToolGroupIds
+            )
+        }
+        rows = rebuilt
         displayedRowSignatures = rows.map { ($0.id, contentVersion(for: $0)) }
         displayedRowConfigurationVersions = rows.map(configurationVersion(for:))
         lastReasoningExpanded = model.shouldShowReasoningExpanded
@@ -659,6 +693,9 @@ final class ConversationViewController: NSViewController {
     /// expansion state for reasoning). Combined with rowId × width, this keeps
     /// the cache fresh without per-token invalidation.
     private func contentVersion(for row: ConversationDisplayRow) -> Int {
+        // The collapsed group header has a fixed one-line height; membership,
+        // summary and status changes belong to configurationVersion instead.
+        if row.toolActivityGroup != nil { return 0 }
         let item = row.item
         var version = item.textBuffer.text.utf8.count
         version = version &* 31 &+ item.outputBuffer.text.utf8.count
@@ -666,6 +703,18 @@ final class ConversationViewController: NSViewController {
         version = version &* 31 &+ item.descriptionText.utf8.count
         if row.item.kind == "reasoning", isReasoningExpanded(item.id) {
             version = version &* 31 &+ 1  // distinct key for the expanded body
+        }
+        if item.kind == "toolCall", expandedItemIds.contains(item.id) {
+            // Group members can stay hidden while a running tool updates its
+            // payload. Include a deterministic digest of the raw payload in
+            // the expanded row's height key so reopening the group cannot hit
+            // a stale height cached before the hidden update.
+            for payloadPart in [item.arguments, item.result, item.errorText] {
+                version = version &* 31 &+ payloadPart.utf8.count
+                for byte in payloadPart.utf8 {
+                    version = (version ^ Int(byte)) &* 16_777_619
+                }
+            }
         }
         // A collapsible row that the user expanded measures taller (its body is
         // included). Fold the expanded flag into the version so the height cache
@@ -683,7 +732,16 @@ final class ConversationViewController: NSViewController {
     private func configurationVersion(for row: ConversationDisplayRow) -> Int {
         let item = row.item
         var hasher = Hasher()
-        hasher.combine(item.kind)
+        hasher.combine(row.presentationKind)
+
+        if let group = row.toolActivityGroup {
+            hasher.combine(group.disclosureId)
+            hasher.combine(group.members.map(\.id))
+            hasher.combine(ToolActivityGroupPresentation.summary(group.members))
+            hasher.combine(ToolActivityGroupPresentation.statusSummary(group.members))
+            hasher.combine(ToolActivityGroupPresentation.semanticStatus(group.members))
+            return hasher.finalize()
+        }
 
         switch item.kind {
         case "shell":
@@ -711,6 +769,8 @@ final class ConversationViewController: NSViewController {
             hasher.combine(item.namespace)
             hasher.combine(item.tool)
             hasher.combine(item.action)
+            hasher.combine(item.activityKind)
+            hasher.combine(item.activityEvent)
             hasher.combine(item.arguments)
             hasher.combine(item.result)
             hasher.combine(item.errorText)
@@ -739,7 +799,9 @@ final class ConversationViewController: NSViewController {
         // The factory counts only the collapsed disclosure header for shell /
         // fileEdit / toolCall rows; when the user has expanded one, add its body
         // (output / diff / JSON payload) so the row reserves room for it. (C1)
-        if row.item.kind != "reasoning", expandedItemIds.contains(row.item.id) {
+        if row.toolActivityGroup == nil,
+           row.item.kind != "reasoning",
+           expandedItemIds.contains(row.item.id) {
             height += disclosureBodyHeight(for: row, width: width)
         }
         return height
@@ -853,7 +915,7 @@ extension ConversationViewController: NSTableViewDelegate {
 
 extension ConversationViewController: ConversationDisclosureStateStore {
     func isItemExpanded(_ itemId: String) -> Bool {
-        expandedItemIds.contains(itemId)
+        expandedItemIds.contains(itemId) || expandedToolGroupIds.contains(itemId)
     }
 
     func isItemCollapsed(_ itemId: String) -> Bool {
@@ -864,6 +926,49 @@ extension ConversationViewController: ConversationDisclosureStateStore {
     /// closes room for the disclosure body. The cell itself already showed /
     /// hid the body; this only updates the reserved height.
     func setItem(_ itemId: String, expanded: Bool) {
+        if let groupIndex = rows.firstIndex(where: {
+            $0.toolActivityGroup?.disclosureId == itemId
+        }), let group = rows[groupIndex].toolActivityGroup {
+            knownToolGroupIds.insert(itemId)
+            let changed = expanded
+                ? expandedToolGroupIds.insert(itemId).inserted
+                : expandedToolGroupIds.remove(itemId) != nil
+            guard changed else { return }
+
+            // Keep the table's existing row views and apply the exact member
+            // insertion/removal. A synchronous full `reloadData()` from inside
+            // the disclosure button action can leave recycled row layers at
+            // their pre-reload coordinates until a later structural refresh,
+            // which makes expanded history rows visibly overlap.
+            let memberIndexes = IndexSet(
+                integersIn: (groupIndex + 1)..<(groupIndex + 1 + group.members.count)
+            )
+            cache.invalidate(rowId: rows[groupIndex].id)
+            rebuildRows()
+
+            tableView.beginUpdates()
+            if expanded {
+                tableView.insertRows(at: memberIndexes, withAnimation: [])
+            } else {
+                tableView.removeRows(at: memberIndexes, withAnimation: [])
+            }
+            tableView.endUpdates()
+            tableView.reloadData(
+                forRowIndexes: IndexSet(integer: groupIndex),
+                columnIndexes: IndexSet(integer: 0)
+            )
+
+            var heightIndexes = IndexSet(integer: groupIndex)
+            if expanded { heightIndexes.formUnion(memberIndexes) }
+            tableView.noteHeightOfRows(withIndexesChanged: heightIndexes)
+            tableView.needsLayout = true
+            tableView.layoutSubtreeIfNeeded()
+            tableView.needsDisplay = true
+            tableView.displayIfNeeded()
+            recomputeTopVisibleTurn()
+            return
+        }
+
         let isReasoning = rows.contains {
             $0.item.id == itemId && $0.item.kind == "reasoning"
         }
@@ -884,7 +989,8 @@ extension ConversationViewController: ConversationDisclosureStateStore {
         guard changed else { return }
 
         var indexes = IndexSet()
-        for (offset, row) in rows.enumerated() where row.item.id == itemId {
+        for (offset, row) in rows.enumerated()
+        where row.toolActivityGroup == nil && row.item.id == itemId {
             cache.invalidate(rowId: row.id)
             // Keep the cached signature in sync so the next streaming flush sees
             // the new expanded version and does not force a redundant reload.

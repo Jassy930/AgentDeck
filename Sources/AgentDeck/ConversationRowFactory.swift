@@ -22,7 +22,7 @@ enum ConversationRowFactory {
         case .userPrompt:
             return NSUserInterfaceItemIdentifier("userPrompt")
         case .assistantItem:
-            return NSUserInterfaceItemIdentifier("assistant.\(row.item.kind)")
+            return NSUserInterfaceItemIdentifier("assistant.\(row.presentationKind)")
         }
     }
 
@@ -44,7 +44,7 @@ enum ConversationRowFactory {
         case .userPrompt:
             return UserPromptCellView()
         case .assistantItem:
-            return makeAssistantCell(kind: row.item.kind)
+            return makeAssistantCell(kind: row.presentationKind)
         }
     }
 
@@ -58,6 +58,7 @@ enum ConversationRowFactory {
         case "webSearch": return WebSearchCellView()
         case "plan", "reviewMode": return LabelledBlockCellView()
         case "hookPrompt": return HookPromptCellView()
+        case "toolActivityGroup": return ToolActivityGroupCellView()
         case "toolCall": return ToolCallCellView()
         case "collabAgentToolCall": return CollabAgentCellView()
         case "media": return MediaCellView()
@@ -104,7 +105,7 @@ enum ConversationRowFactory {
         let item = row.item
         let contentW = max(width - ConversationRowCellView.horizontalInset * 2, 1)
 
-        switch item.kind {
+        switch row.presentationKind {
         case "message":
             // padding(.vertical, 4) + streaming RICH markdown. Measured from the
             // SAME markdown attributed string the cell renders (design §5), so
@@ -183,6 +184,16 @@ enum ConversationRowFactory {
                 h += textHeight(fragment.text, font: ConversationRowMetrics.calloutFont, width: contentW)
             }
             return h
+
+        case "toolActivityGroup":
+            // One semantic summary line; member rows are inserted only when
+            // the group disclosure is expanded by the controller.
+            let compactVerticalPadding: CGFloat = 6 * 2
+            let compactHeaderHeight = max(
+                ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutMediumFont),
+                18
+            )
+            return compactVerticalPadding + compactHeaderHeight
 
         case "toolCall":
             // Collapsed tool calls are always one compact summary line. The

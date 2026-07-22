@@ -484,6 +484,14 @@ final class FileEditCellView: ConversationRowCellView {
         contentStack.addArrangedSubview(statusLabel)
         contentStack.addArrangedSubview(disclosure)
         contentStack.addArrangedSubview(diffView)
+        // A multiline NSTextField has no reliable horizontal intrinsic width.
+        // Without an exact trailing edge, a file row created by an inserted
+        // tool-group member can collapse to the width of "modified" and render
+        // an absolute path almost vertically until the next full table reload.
+        contentStack.trailingAnchor.constraint(
+            equalTo: trailingAnchor,
+            constant: -ConversationRowCellView.horizontalInset
+        ).isActive = true
         pin(pathLabel)
         pin(statusLabel)
         pin(diffView)
@@ -512,6 +520,7 @@ final class FileEditCellView: ConversationRowCellView {
         itemId = item.id
 
         pathLabel.stringValue = item.path
+        pathLabel.toolTip = item.path
         pathLabel.preferredMaxLayoutWidth = contentWidth(forRowWidth: width)
 
         statusLabel.stringValue = item.statusName
@@ -716,6 +725,148 @@ final class HookPromptCellView: ConversationRowCellView {
     }
 }
 
+/// A semantic summary for a burst of execution records. The controller keeps
+/// the group as one virtualized row while collapsed and restores the original
+/// rows underneath it when expanded, so every tool's payload and intermediate
+/// reasoning remain available without nesting table cells inside one giant row.
+final class ToolActivityGroupCellView: ConversationRowCellView {
+    override var verticalPadding: CGFloat { 6 }
+
+    private let summaryRow = NSStackView()
+    private let disclosure = ConversationRowControls.disclosureButton(title: "")
+    private let icon = NSImageView()
+    private let summaryLabel = ConversationRowControls.label(
+        font: ConversationRowMetrics.calloutMediumFont,
+        color: DesignTokens.text2,
+        selectable: false
+    )
+    private let spacer = NSView()
+    private let statusLabel = ConversationRowControls.label(
+        font: ConversationRowMetrics.monoCaptionFont,
+        color: DesignTokens.text3,
+        selectable: false
+    )
+
+    private var disclosureId = ""
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        applyVerticalPadding()
+
+        summaryRow.orientation = .horizontal
+        summaryRow.alignment = .centerY
+        summaryRow.spacing = 7
+        summaryRow.translatesAutoresizingMaskIntoConstraints = false
+
+        disclosure.target = self
+        disclosure.action = #selector(toggle)
+        disclosure.setContentHuggingPriority(.required, for: .horizontal)
+        disclosure.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.imageScaling = .scaleProportionallyDown
+        icon.contentTintColor = DesignTokens.text3
+        icon.setAccessibilityElement(false)
+
+        summaryLabel.maximumNumberOfLines = 1
+        summaryLabel.lineBreakMode = .byTruncatingTail
+        summaryLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        summaryLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        statusLabel.maximumNumberOfLines = 1
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.setContentHuggingPriority(.required, for: .horizontal)
+        statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        summaryRow.addArrangedSubview(disclosure)
+        summaryRow.addArrangedSubview(icon)
+        summaryRow.addArrangedSubview(summaryLabel)
+        summaryRow.addArrangedSubview(spacer)
+        summaryRow.addArrangedSubview(statusLabel)
+        contentStack.addArrangedSubview(summaryRow)
+
+        NSLayoutConstraint.activate([
+            contentStack.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -ConversationRowCellView.horizontalInset
+            ),
+            summaryRow.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor),
+            summaryRow.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor),
+            summaryRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 18),
+            disclosure.widthAnchor.constraint(equalToConstant: 16),
+            disclosure.heightAnchor.constraint(equalToConstant: 16),
+            icon.widthAnchor.constraint(equalToConstant: 14),
+            icon.heightAnchor.constraint(equalToConstant: 14),
+        ])
+    }
+
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+
+    @objc private func toggle() {
+        disclosureStore?.setItem(disclosureId, expanded: disclosure.state == .on)
+    }
+
+    override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
+        guard let group = row.toolActivityGroup else {
+            disclosureId = ""
+            summaryLabel.stringValue = "工具活动"
+            statusLabel.stringValue = ""
+            statusLabel.isHidden = true
+            disclosure.isHidden = true
+            return
+        }
+
+        disclosureId = group.disclosureId
+        let summary = ToolActivityGroupPresentation.summary(group.members)
+        let semanticStatus = ToolActivityGroupPresentation.semanticStatus(group.members)
+        let status = ToolActivityGroupPresentation.statusSummary(group.members)
+        let expanded = disclosureStore?.isItemExpanded(group.disclosureId) ?? false
+
+        disclosure.isHidden = false
+        disclosure.state = expanded ? .on : .off
+        disclosure.toolTip = expanded ? "收起工具活动详情" : "展开工具活动详情"
+        disclosure.setAccessibilityLabel(disclosure.toolTip)
+
+        icon.image = Self.icon(for: ToolActivityGroupPresentation.primaryCategory(in: group.members))
+        summaryLabel.stringValue = summary
+        summaryLabel.toolTip = summary
+        statusLabel.stringValue = status
+        statusLabel.textColor = Self.statusColor(for: semanticStatus)
+        statusLabel.isHidden = status.isEmpty
+
+        let state = expanded ? "已展开" : "已折叠"
+        setAccessibilityLabel([summary, status, state].filter { !$0.isEmpty }.joined(separator: "，"))
+    }
+
+    private static func icon(for category: ToolActivityCategory) -> NSImage? {
+        let symbol: String
+        switch category {
+        case .read: symbol = "book"
+        case .command: symbol = "terminal"
+        case .edit: symbol = "square.and.pencil"
+        case .search: symbol = "magnifyingglass"
+        case .image: symbol = "photo.on.rectangle"
+        case .tool: symbol = "wrench"
+        case .mixed: symbol = "list.bullet.rectangle"
+        }
+        return NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            ?? NSImage(systemSymbolName: "wrench.and.screwdriver", accessibilityDescription: nil)
+    }
+
+    private static func statusColor(for status: String) -> NSColor {
+        switch status.lowercased() {
+        case "running", "starting", "pending": return DesignTokens.running
+        case "completed", "complete", "done", "success": return DesignTokens.success
+        case "failed", "failure", "error": return DesignTokens.danger
+        default: return DesignTokens.text3
+        }
+    }
+}
+
 /// Compact tool-call row: one collapsed summary line (icon + tool + target +
 /// status + disclosure) and the full payload beneath it only when expanded.
 /// Keeping the tool name and target on the first line makes adjacent `Read`
@@ -838,7 +989,7 @@ final class ToolCallCellView: ConversationRowCellView {
         let semanticStatus = ToolPresentation.toolStatus(item)
         let status = ToolPresentation.toolStatusSummary(item)
 
-        icon.image = Self.toolIcon(for: toolName)
+        icon.image = Self.toolIcon(for: toolName, activityKind: item.activityKind)
         nameLabel.stringValue = toolName
         nameLabel.toolTip = toolName
         contextLabel.stringValue = context
@@ -866,10 +1017,12 @@ final class ToolCallCellView: ConversationRowCellView {
         setAccessibilityLabel(accessibilityParts.joined(separator: ", "))
     }
 
-    private static func toolIcon(for name: String) -> NSImage? {
+    private static func toolIcon(for name: String, activityKind: String) -> NSImage? {
         let lowered = name.lowercased()
         let preferredSymbol: String
-        if lowered.contains("read") {
+        if activityKind.caseInsensitiveCompare("collaboration") == .orderedSame {
+            preferredSymbol = "person.2"
+        } else if lowered.contains("read") {
             preferredSymbol = "doc.text.magnifyingglass"
         } else if ["grep", "glob", "search", "find"].contains(where: lowered.contains) {
             preferredSymbol = "magnifyingglass"
@@ -1042,7 +1195,7 @@ final class MediaCellView: ConversationRowCellView {
 /// Ports "contextCompaction": a lone tool header (no body).
 final class ContextCompactionCellView: ConversationRowCellView {
     private let header = ToolHeaderView(
-        systemImage: "arrow.down.right.and.arrow.up.left", title: "Context compacted")
+        systemImage: "arrow.down.right.and.arrow.up.left", title: "上下文已压缩")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1053,7 +1206,7 @@ final class ContextCompactionCellView: ConversationRowCellView {
     required init?(coder: NSCoder) { super.init(coder: coder) }
 
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
-        header.update(systemImage: "arrow.down.right.and.arrow.up.left", title: "Context compacted")
+        header.update(systemImage: "arrow.down.right.and.arrow.up.left", title: "上下文已压缩")
     }
 }
 

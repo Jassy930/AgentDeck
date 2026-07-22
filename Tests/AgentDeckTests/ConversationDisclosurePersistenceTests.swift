@@ -123,6 +123,199 @@ final class ConversationDisclosurePersistenceTests: XCTestCase {
         XCTAssertEqual(tableView.numberOfRows, 0, "新建空会话后不应残留旧会话行")
     }
 
+    func testToolActivityGroupDefaultsCollapsedAndExpansionRestoresOriginalRows() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let user = UIItem(id: "u-group", lifecycle: "completed", kind: "user", text: "执行检查")
+        var first = UIItem(id: "tool-1", lifecycle: "completed", kind: "toolCall")
+        first.tool = "Read"
+        first.statusName = "completed"
+        first.arguments = "{\"payload\":\"\(String(repeating: "long payload ", count: 80))\"}"
+        let reasoning = UIItem(
+            id: "reasoning-middle",
+            lifecycle: "completed",
+            kind: "reasoning",
+            text: "继续检查"
+        )
+        var second = UIItem(id: "tool-2", lifecycle: "completed", kind: "toolCall")
+        second.tool = "Grep"
+        second.statusName = "completed"
+        model.items = [user, first, reasoning, second]
+
+        let controller = ConversationViewController(model: model)
+        _ = controller.view
+        let table = try XCTUnwrap(firstTableView(in: controller.view))
+        let store = controller as ConversationDisclosureStateStore
+        let groupId = "tool-group:u-group:tool-1"
+
+        table.reloadData()
+        XCTAssertEqual(table.numberOfRows, 2, "折叠态应只保留用户行和一个摘要行")
+        XCTAssertFalse(store.isItemExpanded(groupId))
+        let collapsedHeight = table.delegate?.tableView?(table, heightOfRow: 1) ?? 0
+
+        store.setItem(groupId, expanded: true)
+        XCTAssertTrue(store.isItemExpanded(groupId))
+        XCTAssertEqual(
+            table.numberOfRows,
+            5,
+            "展开后应恢复摘要 + 两个工具 + 中间 reasoning"
+        )
+
+        store.setItem("tool-1", expanded: true)
+        let expandedMemberHeight = table.delegate?.tableView?(table, heightOfRow: 2) ?? 0
+        XCTAssertGreaterThan(expandedMemberHeight, collapsedHeight)
+        store.setItem(groupId, expanded: false)
+        XCTAssertEqual(table.numberOfRows, 2)
+        let recollapsedHeight = table.delegate?.tableView?(table, heightOfRow: 1) ?? 0
+        XCTAssertEqual(
+            recollapsedHeight,
+            collapsedHeight,
+            accuracy: 0.5,
+            "组标题不能继承首个工具已展开 payload 的不可见高度"
+        )
+        store.setItem(groupId, expanded: true)
+        XCTAssertTrue(store.isItemExpanded("tool-1"), "重新展开组后应保留单项 payload 状态")
+    }
+
+    func testExpandedToolGroupRowsReceiveDistinctNonOverlappingFrames() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let user = UIItem(
+            id: "u-group-layout",
+            lifecycle: "completed",
+            kind: "user",
+            text: "执行布局检查"
+        )
+        var first = UIItem(id: "layout-tool-1", lifecycle: "completed", kind: "toolCall")
+        first.tool = "Read"
+        first.statusName = "completed"
+        first.arguments = #"{"file_path":"/tmp/first.swift"}"#
+        let reasoning = UIItem(
+            id: "layout-reasoning",
+            lifecycle: "completed",
+            kind: "reasoning",
+            text: "继续检查"
+        )
+        var second = UIItem(id: "layout-tool-2", lifecycle: "completed", kind: "toolCall")
+        second.tool = "Grep"
+        second.statusName = "completed"
+        second.arguments = #"{"pattern":"activity"}"#
+        model.items = [user, first, reasoning, second]
+
+        let controller = ConversationViewController(model: model)
+        let window = NSWindow(contentViewController: controller)
+        window.setContentSize(NSSize(width: 720, height: 560))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+
+        let table = try XCTUnwrap(firstTableView(in: controller.view))
+        table.reloadData()
+        table.layoutSubtreeIfNeeded()
+        let store = controller as ConversationDisclosureStateStore
+        store.setItem("tool-group:u-group-layout:layout-tool-1", expanded: true)
+        table.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(table.numberOfRows, 5)
+        let frames = try (1..<5).map { row -> NSRect in
+            let rowView = try XCTUnwrap(
+                table.rowView(atRow: row, makeIfNecessary: true),
+                "展开成员 row=\(row) 应有独立 row view"
+            )
+            XCTAssertGreaterThan(rowView.frame.height, 0)
+            return rowView.frame
+        }
+        for (previous, next) in zip(frames, frames.dropFirst()) {
+            XCTAssertLessThanOrEqual(
+                previous.maxY,
+                next.minY + 0.5,
+                "展开后的行 frame 不得重叠"
+            )
+        }
+    }
+
+    func testHiddenExpandedToolPayloadGrowthInvalidatesHeightBeforeGroupReopens() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let user = UIItem(
+            id: "u-hidden-payload",
+            lifecycle: "completed",
+            kind: "user",
+            text: "执行缓存检查"
+        )
+        var first = UIItem(
+            id: "hidden-tool-1",
+            lifecycle: "completed",
+            kind: "toolCall"
+        )
+        first.tool = "Read"
+        first.statusName = "running"
+        first.arguments = #"{"path":"/tmp/short.swift"}"#
+        var second = UIItem(
+            id: "hidden-tool-2",
+            lifecycle: "completed",
+            kind: "toolCall"
+        )
+        second.tool = "Grep"
+        second.statusName = "completed"
+        second.arguments = #"{"pattern":"cache"}"#
+        model.items = [user, first, second]
+
+        let controller = ConversationViewController(model: model)
+        let window = NSWindow(contentViewController: controller)
+        window.setContentSize(NSSize(width: 720, height: 560))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+
+        let table = try XCTUnwrap(firstTableView(in: controller.view))
+        let store = controller as ConversationDisclosureStateStore
+        let groupId = "tool-group:u-hidden-payload:hidden-tool-1"
+        table.reloadData()
+
+        store.setItem(groupId, expanded: true)
+        store.setItem("hidden-tool-1", expanded: true)
+        table.layoutSubtreeIfNeeded()
+        XCTAssertEqual(table.numberOfRows, 4)
+        let initialHeight = table.delegate?.tableView?(table, heightOfRow: 2) ?? 0
+
+        store.setItem(groupId, expanded: false)
+        XCTAssertEqual(table.numberOfRows, 2)
+
+        var longerFirst = first
+        longerFirst.arguments = "{\"paths\":[\n" + (0..<36)
+            .map { "  \"/tmp/generated/very-long-path-\($0).swift\"" }
+            .joined(separator: ",\n") + "\n]}"
+        model.items = [user, longerFirst, second]
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+        XCTAssertEqual(table.numberOfRows, 2, "payload flush 期间工具成员仍应保持隐藏")
+
+        store.setItem(groupId, expanded: true)
+        table.layoutSubtreeIfNeeded()
+        XCTAssertEqual(table.numberOfRows, 4)
+        XCTAssertTrue(store.isItemExpanded("hidden-tool-1"))
+
+        let updatedHeight = table.delegate?.tableView?(table, heightOfRow: 2) ?? 0
+        XCTAssertGreaterThan(
+            updatedHeight,
+            initialHeight + 20,
+            "同 ID payload 在组折叠期间增长后，重新展开必须重新测量成员高度"
+        )
+
+        let frames = try (1..<4).map { row -> NSRect in
+            let rowView = try XCTUnwrap(
+                table.rowView(atRow: row, makeIfNecessary: true),
+                "重新展开后的 row=\(row) 应有独立 row view"
+            )
+            XCTAssertGreaterThan(rowView.frame.height, 0)
+            return rowView.frame
+        }
+        for (previous, next) in zip(frames, frames.dropFirst()) {
+            XCTAssertLessThanOrEqual(
+                previous.maxY,
+                next.minY + 0.5,
+                "payload 增长后重新展开的成员 frame 不得重叠"
+            )
+        }
+    }
+
     private func firstTableView(in view: NSView) -> NSTableView? {
         if let table = view as? NSTableView { return table }
         for sub in view.subviews {
