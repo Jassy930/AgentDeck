@@ -9,7 +9,7 @@ use agentdeck_protocol::AgentKind;
 use super::*;
 use crate::runtime::store::{
     ConversationDescriptor, FreezePublicationRequest, NewConversation, PublicationPayloadKind,
-    PublicationScope, RuntimeClock, RuntimeClockError, RuntimeId, RuntimeIdKind,
+    PublicationScope, RuntimeClock, RuntimeClockError, RuntimeId, RuntimeIdKind, RuntimeIdSource,
     RuntimeStoreConfig, RuntimeStoreFaultInjector, RuntimeStoreOperation,
 };
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
@@ -62,6 +62,26 @@ impl RuntimeClock for ManualClock {
     }
 }
 
+struct SequenceIdSource(VecDeque<RuntimeId>);
+
+impl RuntimeIdSource for SequenceIdSource {
+    fn next_id(
+        &mut self,
+        kind: RuntimeIdKind,
+    ) -> Result<RuntimeId, crate::runtime::store::identity::RuntimeIdError> {
+        let id = self.0.pop_front().expect("publication runtime id");
+        if id.kind() != kind {
+            return Err(
+                crate::runtime::store::identity::RuntimeIdError::SourceKindMismatch {
+                    kind,
+                    actual: id.kind(),
+                },
+            );
+        }
+        Ok(id)
+    }
+}
+
 struct OneShotFault {
     operation: RuntimeStoreOperation,
     fired: AtomicBool,
@@ -93,6 +113,22 @@ struct OneShotSafetyBusy(AtomicBool);
 impl RuntimeStoreFaultInjector for OneShotSafetyBusy {
     fn before_operation(&self, operation: RuntimeStoreOperation) -> Result<(), RuntimeStoreError> {
         if operation == RuntimeStoreOperation::CommitPublicationBeforeCommit
+            && !self.0.swap(true, Ordering::SeqCst)
+        {
+            Err(RuntimeStoreError::WorkerBusy {
+                lane: RuntimeStoreLane::Safety,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct OneShotAckSafetyBusy(AtomicBool);
+
+impl RuntimeStoreFaultInjector for OneShotAckSafetyBusy {
+    fn before_operation(&self, operation: RuntimeStoreOperation) -> Result<(), RuntimeStoreError> {
+        if operation == RuntimeStoreOperation::AcknowledgePublicationBeforeCommit
             && !self.0.swap(true, Ordering::SeqCst)
         {
             Err(RuntimeStoreError::WorkerBusy {
@@ -224,6 +260,23 @@ async fn open_store(
     (root, store)
 }
 
+async fn open_store_with_ids(
+    label: &str,
+    ids: impl IntoIterator<Item = RuntimeId>,
+) -> (TestRoot, RuntimeStoreHandle) {
+    let root = TestRoot::new(label);
+    let keys = MemoryKeyStore::new();
+    let kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
+        .expect("create deterministic publication test KEK");
+    let config = RuntimeStoreConfig::new(root.database())
+        .with_clock(ManualClock::new(1_000))
+        .with_id_source(SequenceIdSource(ids.into_iter().collect()));
+    let store = RuntimeStoreHandle::open(config, kek)
+        .await
+        .expect("open deterministic publication store");
+    (root, store)
+}
+
 fn id(kind: RuntimeIdKind, seed: u8) -> RuntimeId {
     RuntimeId::from_bytes(kind, [seed; 16]).expect("runtime id")
 }
@@ -328,6 +381,20 @@ async fn publication_freezes_generation_seq_counter_blob_and_inner_range_atomica
     );
     dispatcher.notify_frozen_stream(stream_id);
     assert_eq!(dispatcher.drive_round().await.unwrap().committed, 1);
+    let stream = store
+        .load_publication_stream_record(stream_id)
+        .await
+        .expect("read locally acknowledged stream");
+    assert_eq!(stream.committed_high_water, Some(0));
+    assert_eq!(stream.acknowledged_high_water, Some(0));
+    assert!(
+        store
+            .load_frozen_publication(frozen.publication_id)
+            .await
+            .expect("read exact outbox after local ACK")
+            .is_none(),
+        "Relay COMMIT must be followed by an exact local ACK that deletes the frozen row"
+    );
     drop(dispatcher);
     store.shutdown().await.expect("shutdown store");
 }
@@ -380,6 +447,10 @@ async fn read_pool_busy_defers_without_terminalizing_and_retries_on_next_drive()
         .expect("transient ReadPool busy must not terminalize the stream");
     assert_eq!((deferred.loaded, deferred.committed), (0, 0));
     assert_eq!(
+        deferred.transient_store_busy, 1,
+        "the owner must distinguish retryable read backpressure from terminal zero progress"
+    );
+    assert_eq!(
         dispatcher.state(stream_id),
         Some(DispatcherStreamState::Ready)
     );
@@ -413,7 +484,7 @@ async fn publication_after_commit_unknown_replays_byte_identical_blob() {
     ));
     let (_root, store) = open_store("commit-unknown", Some(fault)).await;
     let (stream_id, generation) = create_stream(&store, 0x21, PublicationScope::Catalog).await;
-    freeze(
+    let frozen = freeze(
         &store,
         stream_id,
         generation,
@@ -434,6 +505,13 @@ async fn publication_after_commit_unknown_replays_byte_identical_blob() {
     let second = dispatcher.drive_round().await.unwrap();
     assert_eq!(second.committed, 1);
     assert_eq!(transport.sent().len(), 1, "store retry must not republish");
+    assert!(
+        store
+            .load_frozen_publication(frozen.publication_id)
+            .await
+            .expect("read commit-unknown local ACK")
+            .is_none()
+    );
     drop(dispatcher);
     store.shutdown().await.expect("shutdown store");
 }
@@ -479,6 +557,125 @@ async fn safety_lane_busy_retries_exact_commit_without_republishing() {
     );
 
     drop(dispatcher);
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn local_ack_after_commit_unknown_retries_without_republishing() {
+    let fault = Arc::new(OneShotFault::new(
+        RuntimeStoreOperation::AcknowledgePublicationAfterCommit,
+    ));
+    let (_root, store) = open_store("ack-after-commit-unknown", Some(fault)).await;
+    let (stream_id, generation) = create_stream(&store, 0x2a, PublicationScope::Catalog).await;
+    let frozen = freeze(
+        &store,
+        stream_id,
+        generation,
+        0x2a,
+        0,
+        None,
+        0,
+        PublicationPayloadKind::Catalog,
+        b"local ACK outcome exact retry".to_vec(),
+    )
+    .await;
+    let transport = Arc::new(ScriptedTransport::new([TransportPlan::ExactCommit]));
+    let mut dispatcher = PublicationDispatcher::open(store.clone(), transport.clone())
+        .await
+        .expect("discover publication before ACK outcome unknown");
+
+    let _ = dispatcher
+        .drive_round()
+        .await
+        .expect("Relay COMMIT followed by local ACK outcome unknown");
+    let _ = dispatcher
+        .drive_round()
+        .await
+        .expect("retry exact local ACK tombstone");
+
+    assert_eq!(
+        transport.sent().len(),
+        1,
+        "local ACK retry must not republish"
+    );
+    assert!(
+        store
+            .load_frozen_publication(frozen.publication_id)
+            .await
+            .expect("read ACK-unknown frozen row")
+            .is_none()
+    );
+    let stream = store
+        .load_publication_stream_record(stream_id)
+        .await
+        .expect("read ACK-unknown stream");
+    assert_eq!(stream.committed_high_water, Some(0));
+    assert_eq!(stream.acknowledged_high_water, Some(0));
+
+    drop(dispatcher);
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn restart_repairs_committed_unacknowledged_row_without_transport_publish() {
+    let fault = Arc::new(OneShotAckSafetyBusy(AtomicBool::new(false)));
+    let (_root, store) = open_store("restart-ack-repair", Some(fault)).await;
+    let (stream_id, generation) = create_stream(&store, 0x2b, PublicationScope::Catalog).await;
+    let frozen = freeze(
+        &store,
+        stream_id,
+        generation,
+        0x2b,
+        0,
+        None,
+        0,
+        PublicationPayloadKind::Catalog,
+        b"committed local ACK repair".to_vec(),
+    )
+    .await;
+    let first_transport = Arc::new(ScriptedTransport::new([TransportPlan::ExactCommit]));
+    let mut first = PublicationDispatcher::open(store.clone(), first_transport.clone())
+        .await
+        .expect("open first dispatcher");
+    let _ = first
+        .drive_round()
+        .await
+        .expect("Relay commit survives transient local ACK busy");
+    assert_eq!(first_transport.sent().len(), 1);
+    assert!(
+        store
+            .load_frozen_publication(frozen.publication_id)
+            .await
+            .expect("read committed-unacknowledged row")
+            .is_some()
+    );
+    drop(first);
+
+    let recovery_transport = Arc::new(ScriptedTransport::new([]));
+    let mut recovered = PublicationDispatcher::open(store.clone(), recovery_transport.clone())
+        .await
+        .expect("discover committed-unacknowledged row");
+    let _ = recovered
+        .drive_round()
+        .await
+        .expect("repair exact local ACK without network");
+
+    assert!(recovery_transport.sent().is_empty());
+    assert!(
+        store
+            .load_frozen_publication(frozen.publication_id)
+            .await
+            .expect("read repaired outbox")
+            .is_none()
+    );
+    let stream = store
+        .load_publication_stream_record(stream_id)
+        .await
+        .expect("read repaired stream");
+    assert_eq!(stream.committed_high_water, Some(0));
+    assert_eq!(stream.acknowledged_high_water, Some(0));
+
+    drop(recovered);
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -612,12 +809,19 @@ async fn publication_restart_retries_frozen_rows_without_resealing() {
 
 #[tokio::test]
 async fn publication_dispatch_is_fair_with_one_inflight_per_stream() {
-    let (_root, store) = open_store("fair-dispatch", None).await;
+    let ids = [0x51_u8, 0x61, 0x71].into_iter().flat_map(|seed| {
+        [
+            id(RuntimeIdKind::RemoteOutbox, seed),
+            id(RuntimeIdKind::RemoteOutbox, seed.wrapping_add(2)),
+            id(RuntimeIdKind::RemoteOutbox, seed.wrapping_add(1)),
+        ]
+    });
+    let (_root, store) = open_store_with_ids("fair-dispatch", ids).await;
     let mut stream_ids = Vec::new();
     for seed in [0x51, 0x61, 0x71] {
-        let conversation = create_conversation(&store, seed).await;
-        let (stream_id, generation) =
-            create_stream(&store, seed, PublicationScope::Conversation(conversation)).await;
+        create_conversation(&store, seed).await;
+        let stream_id = [seed; 16];
+        let generation = [seed.wrapping_add(1); 16];
         freeze(
             &store,
             stream_id,

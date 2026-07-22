@@ -25,6 +25,8 @@ pub enum OuterFrameKind {
     KeyUpdate,
     PairPending,
     PairResponseReceived,
+    /// DeviceReplyTx counter recovery 的独立 DeviceHPKE reply；不使用 reply AEAD key/counter。
+    DeviceKeyRecovery,
 }
 
 impl OuterFrameKind {
@@ -39,6 +41,7 @@ impl OuterFrameKind {
             OuterFrameKind::KeyUpdate => 6,
             OuterFrameKind::PairPending => 7,
             OuterFrameKind::PairResponseReceived => 8,
+            OuterFrameKind::DeviceKeyRecovery => 9,
         }
     }
 }
@@ -116,6 +119,32 @@ impl OuterContextV1 {
             stream_cursor: None,
             stream_seq: None,
             message_key_epoch,
+        }
+    }
+
+    /// daemon→device counter recovery 的固定 AAD 形状。
+    ///
+    /// 该 carrier 由 DeviceHPKE 一次性保护，故 `message_key_epoch` 固定为 0；唯一
+    /// `request_route` 同时承担 reply correlation 与 anti-replay 绑定。stream/pair/cursor
+    /// 轴全部为空，避免它伪装成普通 DeviceReplyTx 或 stream publication。
+    pub const fn device_key_recovery(
+        machine_route: MachineRouteId,
+        device_route: DeviceRouteId,
+        request_route: RequestRouteId,
+    ) -> Self {
+        Self {
+            frame_kind: OuterFrameKind::DeviceKeyRecovery,
+            relay_protocol_version: crate::relay_v2::RELAY_PROTOCOL_VERSION,
+            e2ee_format_version: crate::e2ee::E2EE_FORMAT_VERSION,
+            machine_route: Some(machine_route),
+            device_route: Some(device_route),
+            stream_route: None,
+            request_route: Some(request_route),
+            pair_route: None,
+            stream_generation: None,
+            stream_cursor: None,
+            stream_seq: None,
+            message_key_epoch: 0,
         }
     }
 

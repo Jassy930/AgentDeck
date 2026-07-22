@@ -28,7 +28,9 @@ pub(in crate::runtime::store) fn authenticate_directory(
 
 /// Dispatcher restart 枚举必须先认证完整 stream/outbox directory 与 ledger，不能用
 /// 未认证的 `SELECT DISTINCT publication_stream_id` 作为恢复信任根。NeedsSnapshot/
-/// Retired stream 只要仍有 reserved > committed 的 frozen row，也必须继续返回。
+/// Retired stream 只要仍有 `reserved > acknowledged` 的 frozen row，也必须继续返回：
+/// `committed > acknowledged` 表示 Relay COMMIT 已落库、daemon local ACK 尚待精确修复，
+/// 恢复只能删本地 outbox，绝不能重新触达 transport。
 pub(in crate::runtime::store) fn load_pending_publication_stream_ids(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
@@ -38,13 +40,13 @@ pub(in crate::runtime::store) fn load_pending_publication_stream_ids(
     Ok(
         authenticate_directory_records(connection, key_bundle, &ledger)?
             .into_iter()
-            .filter(|stream| stream.reserved_high_water > stream.committed_high_water)
+            .filter(|stream| stream.reserved_high_water > stream.acknowledged_high_water)
             .map(|stream| stream.publication_stream_id)
             .collect(),
     )
 }
 
-pub(super) fn authenticate_directory_records(
+pub(in crate::runtime::store) fn authenticate_directory_records(
     transaction: &Connection,
     key_bundle: &RuntimeKeyBundle,
     ledger: &RuntimeLedger,
@@ -159,6 +161,7 @@ pub(super) fn authenticate_directory_records(
             .remove(&stream.publication_stream_id)
             .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
             .finish(&stream)?;
+        authenticate_rotation_inner_baseline(transaction, key_bundle, &stream)?;
         if stream.state == PublicationStreamState::Active
             && active_by_target.insert(stream.scope, ()).is_some()
         {
@@ -260,9 +263,8 @@ impl PublicationOutboxAccumulator {
             || self
                 .previous_sender_counter
                 .is_some_and(|counter| Some(counter) != stream.sender_counter_high_water)
-            || stream.committed_high_water.is_none() && stream.committed_inner_cursor.is_some()
-            || stream.acknowledged_high_water.is_none()
-                && stream.acknowledged_inner_cursor.is_some()
+            || stream.committed_high_water.is_none()
+                && stream.committed_inner_cursor != stream.acknowledged_inner_cursor
             || stream
                 .acknowledged_inner_cursor
                 .zip(stream.committed_inner_cursor)
@@ -289,6 +291,48 @@ impl PublicationOutboxAccumulator {
         }
         Ok(())
     }
+}
+
+/// Generation rotation 后，outer 从 BeforeFirst 重新开始，但 inner 必须保留旧
+/// generation 已 COMMIT+ACK 的 H。该非对称 cut 只能由 authenticated rotation
+/// lineage 与覆盖 H 的 ready snapshot 共同证明；否则 open/recovery 必须 fail-close。
+/// 一旦新 generation ACK 了首帧，常规 outbox/hash 链继续承担完整性证明。
+fn authenticate_rotation_inner_baseline(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    stream: &PublicationStreamRecord,
+) -> Result<(), RuntimeStoreError> {
+    let Some(inner_baseline) = stream.acknowledged_inner_cursor else {
+        return Ok(());
+    };
+    if stream.acknowledged_high_water.is_some() {
+        return Ok(());
+    }
+    if stream.rotation_serial == 0
+        || stream.last_rotation_request_digest.is_none()
+        || stream.committed_inner_cursor.is_none()
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let covered = match stream.scope {
+        PublicationScope::Catalog => super::super::snapshot::authenticated_catalog_snapshot_covers(
+            connection,
+            key_bundle,
+            inner_baseline,
+        )?,
+        PublicationScope::Conversation(conversation_id) => {
+            super::super::snapshot::authenticated_conversation_snapshot_covers(
+                connection,
+                key_bundle,
+                conversation_id,
+                inner_baseline,
+            )?
+        }
+    };
+    if !covered {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
 }
 
 struct RawOutboxDirectoryRow {

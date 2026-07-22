@@ -12,6 +12,20 @@ use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
+type DurableCatalogEvidence = (
+    Vec<u8>,
+    Option<String>,
+    i64,
+    i64,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    i64,
+    i64,
+    i64,
+    Vec<u8>,
+);
+
 fn open_test_state(label: &str) -> (PathBuf, RuntimeStoreConfig, RuntimeSqlite) {
     let root = std::env::temp_dir().join(format!(
         "agentdeck-snapshot-{label}-{}-{}",
@@ -280,6 +294,95 @@ fn catalog_refresh_preflight_authenticates_exact_source_and_delta_metadata_witho
         preflight_catalog_snapshot_refresh(&state, Some(&wrong_source), StreamCursor::At(0),),
         Err(RuntimeStoreError::InvalidStateTransition)
     ));
+
+    drop(state);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn transition_catalog_materialization_rebuilds_h_below_d_without_rewriting_durable_state() {
+    let (root, config, mut state) = open_test_state("transition-catalog-d-above-h");
+    let config = config.with_capacity_probe(super::super::pairing_tests::GenerousCapacity);
+    let first_id = create_directory_conversation(&mut state, &config, 0x32);
+    let at_h = refresh_catalog_snapshot(&mut state, &config, None, StreamCursor::At(0))
+        .expect("persist catalog baseline at frozen H");
+    create_directory_conversation(&mut state, &config, 0x33);
+    let durable_d = refresh_catalog_snapshot(&mut state, &config, Some(&at_h), StreamCursor::At(1))
+        .expect("advance the unique durable catalog baseline to D above H");
+    assert_eq!(durable_d.base, StreamCursor::At(1));
+
+    let durable_before: DurableCatalogEvidence = state
+        .connection
+        .query_row(
+            "SELECT s.snapshot_id, s.base_cursor, s.item_count,
+                    s.logical_snapshot_bytes, s.content_sha256,
+                    s.sealed_snapshot_sha256, s.sealed_snapshot,
+                    m.snapshot_count, m.snapshot_bytes,
+                    m.catalog_delta_count, m.metadata_token
+             FROM snapshots s CROSS JOIN runtime_meta m
+             WHERE s.target_scope = 'catalog' AND m.singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .expect("capture exact durable D row and ledger");
+
+    let preflight =
+        preflight_transition_catalog_snapshot(&state, Some(&durable_d), StreamCursor::At(0))
+            .expect("preflight transition-only H below durable D");
+    assert_eq!(preflight.frozen, StreamCursor::At(0));
+    assert!(preflight.usable_baseline.is_none());
+    let materialized = materialize_transition_catalog_snapshot(&state, &preflight, [0x34; 16])
+        .expect("read-only rebuild exact transition catalog H");
+    assert_eq!(materialized.reference.base, StreamCursor::At(0));
+    assert_eq!(materialized.entries.len(), 1);
+    assert_eq!(
+        materialized.entries[0].conversation_id.as_str(),
+        first_id.to_canonical_string()
+    );
+
+    let durable_after = state
+        .connection
+        .query_row(
+            "SELECT s.snapshot_id, s.base_cursor, s.item_count,
+                    s.logical_snapshot_bytes, s.content_sha256,
+                    s.sealed_snapshot_sha256, s.sealed_snapshot,
+                    m.snapshot_count, m.snapshot_bytes,
+                    m.catalog_delta_count, m.metadata_token
+             FROM snapshots s CROSS JOIN runtime_meta m
+             WHERE s.target_scope = 'catalog' AND m.singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Vec<u8>>(10)?,
+                ))
+            },
+        )
+        .expect("read durable D row and ledger after transition materialization");
+    assert_eq!(durable_after, durable_before);
 
     drop(state);
     let _ = fs::remove_dir_all(root);

@@ -49,6 +49,7 @@ dependencies = [
  "agentdeck-protocol",
  "chacha20poly1305",
  "ed25519-dalek",
+ "hmac 0.12.1",
  "hpke",
  "serde_json",
  "sha2 0.10.9",

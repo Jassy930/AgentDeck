@@ -60,6 +60,7 @@ use super::command_event::StartEventSource;
 use super::configuration::{
     self, ConfigureConversation, ConfigureConversationOutcome, PreparedConfigurationRequest,
 };
+use super::directed_reply::{DirectedReplyTransactionOutcome, DirectedReplyTransactionRequest};
 use super::execution_event::PreparedExecutionEvent;
 use super::identity::{
     MAX_RUNTIME_ID_COLLISION_ATTEMPTS, RuntimeId, RuntimeIdError, RuntimeIdKind,
@@ -71,8 +72,14 @@ use super::metadata::{
     UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
 };
 use super::publication::{
-    FreezePublicationRequest, FrozenPublication, PublicationAcknowledgement, PublicationBarrierCut,
-    PublicationScope, PublicationStreamRecord, RotatePublicationStreamRequest,
+    FreezePublicationRequest, FreezeSignedPublicationRequest, FrozenPublication,
+    PublicationAcknowledgement, PublicationBarrierCut, PublicationScope, PublicationStreamRecord,
+    RotatePublicationStreamRequest, SharedPublicationPreflight, SharedPublicationPreflightRequest,
+    SharedPublicationStreamProposal,
+};
+use super::remote_counter::{
+    ActiveSenderCounterBinding, CounterRecoveryStageOutcome, CounterRecoveryStageRequest,
+    RemoteCounterGapRequest, RemoteCounterRecord, RemoteCounterRetirementRequest,
 };
 use super::snapshot::{ReadySnapshotReference, StoredCatalogSnapshot, StoredConversationSnapshot};
 use super::stream::{
@@ -81,12 +88,14 @@ use super::stream::{
 };
 use super::{
     AuthenticatedConversationSnapshotContext, PreparedConversationSnapshotWrite, SnapshotOrigin,
-    StoreConversationSnapshotError, admin, approval, journal, machine_identity, machine_remote,
-    native_projection, pairing, pairing_authorization, pairing_delivery, pairing_grant,
-    pairing_grant_allocation, pairing_grant_commit, pairing_grant_tx, pairing_receipt_retention,
-    pairing_revocation, pairing_revocation_ack, pairing_terminal, sqlite, stream,
+    StoreConversationSnapshotError, admin, approval, journal, key_transition, machine_identity,
+    machine_remote, native_projection, pairing, pairing_authorization, pairing_delivery,
+    pairing_grant, pairing_grant_allocation, pairing_grant_commit, pairing_grant_tx,
+    pairing_receipt_retention, pairing_revocation, pairing_revocation_ack, pairing_terminal,
+    remote_replay, retired_key, sqlite, stream, transition_material,
 };
 
+mod key_transition_commands;
 mod stream_pipeline;
 #[cfg(test)]
 mod test_admission;
@@ -97,7 +106,8 @@ use validation::{memory_charge, validate_maximum, validate_nonempty_maximum};
 #[cfg(test)]
 use stream_pipeline::decision_requires_snapshot_source;
 use stream_pipeline::{
-    register_stream_barrier_on_worker, send_snapshot_build_pin_reply, send_stream_barrier_reply,
+    register_stream_barrier_on_worker, register_transition_snapshot_barrier_on_worker,
+    send_snapshot_build_pin_reply, send_stream_barrier_reply,
 };
 
 const LIFECYCLE_RUNNING: u8 = 0;
@@ -819,7 +829,7 @@ impl RuntimeStoreHandle {
         }
     }
 
-    pub(in crate::runtime) fn machine_trust_domain(&self) -> Result<[u8; 32], RuntimeStoreError> {
+    pub(crate) fn machine_trust_domain(&self) -> Result<[u8; 32], RuntimeStoreError> {
         self.identity_derivation.derive_machine_trust_domain()
     }
 
@@ -1390,25 +1400,6 @@ impl RuntimeStoreHandle {
         .await?
     }
 
-    #[cfg(test)]
-    pub(crate) async fn align_active_authorization_revision_for_test(
-        &self,
-        device_route: agentdeck_protocol::relay_v2::DeviceRouteId,
-    ) -> Result<agentdeck_protocol::relay_v2::KeyDirectoryRevision, RuntimeStoreError> {
-        dispatch_with_budget(
-            &self.safety_tx,
-            &self.safety_budget,
-            &self.lifecycle,
-            RuntimeStoreLane::Safety,
-            memory_charge(size_of::<SafetyCommand>(), &[])?,
-            |reply| SafetyCommand::AlignActiveAuthorizationRevisionForTest {
-                device_route,
-                reply,
-            },
-        )
-        .await?
-    }
-
     /// 只读签发与 authenticated Active grant/key-directory exact 绑定的 ingress proof。
     #[allow(dead_code, reason = "同一 P4.4 Task 的 RemoteLink ingress slice 消费")]
     pub(crate) async fn load_active_remote_ingress(
@@ -1494,6 +1485,371 @@ impl RuntimeStoreHandle {
                 binding,
                 reply,
             },
+        )
+        .await?
+    }
+
+    pub(crate) async fn admit_remote_replay(
+        &self,
+        admission: remote_replay::RemoteReplayAdmission,
+    ) -> Result<remote_replay::RemoteReplayStoreDecision, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::AdmitRemoteReplay { admission, reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn contains_remote_replay_scope(
+        &self,
+        scope: [u8; remote_replay::REMOTE_REPLAY_SCOPE_BYTES],
+    ) -> Result<bool, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::ContainsRemoteReplayScope { scope, reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn load_remote_counter_record(
+        &self,
+        scope_token: [u8; 32],
+        key_id: agentdeck_protocol::e2ee::KeyId,
+    ) -> Result<RemoteCounterRecord, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadRemoteCounterRecord {
+                scope_token,
+                key_id,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn record_remote_counter_gap(
+        &self,
+        request: RemoteCounterGapRequest,
+    ) -> Result<RemoteCounterRecord, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::RecordRemoteCounterGap { request, reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn retire_remote_counter(
+        &self,
+        request: RemoteCounterRetirementRequest,
+    ) -> Result<RemoteCounterRecord, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::RetireRemoteCounter { request, reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn stage_remote_counter_recovery(
+        &self,
+        request: CounterRecoveryStageRequest,
+    ) -> Result<CounterRecoveryStageOutcome, RuntimeStoreError> {
+        let machine_trust_domain = self.machine_trust_domain()?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::StageRemoteCounterRecovery {
+                machine_trust_domain,
+                request,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn mark_remote_counter_recovery_business_ready(
+        &self,
+        operation_id: [u8; 16],
+    ) -> Result<RemoteCounterRecord, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::MarkRemoteCounterRecoveryBusinessReady {
+                operation_id,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn has_retired_remote_counter(&self) -> Result<bool, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::HasRetiredRemoteCounter { reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn remote_counter_scope_allowed(
+        &self,
+        scope_token: [u8; 32],
+    ) -> Result<bool, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::RemoteCounterScopeAllowed { scope_token, reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn load_active_sender_counter_bindings(
+        &self,
+    ) -> Result<Vec<ActiveSenderCounterBinding>, RuntimeStoreError> {
+        let machine_trust_domain = self.machine_trust_domain()?;
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadActiveSenderCounterBindings {
+                machine_trust_domain,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn register_remote_counter_guard_scope(
+        &self,
+        scope_token: [u8; 32],
+    ) -> Result<(), RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::RegisterRemoteCounterGuardScope { scope_token, reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn mark_remote_counter_guard_scope_materialized(
+        &self,
+        scope_token: [u8; 32],
+    ) -> Result<(), RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::MarkRemoteCounterGuardScopeMaterialized { scope_token, reply },
+        )
+        .await?
+    }
+
+    #[allow(
+        dead_code,
+        reason = "token-only manifest view remains available for focused diagnostics/tests"
+    )]
+    pub(crate) async fn load_remote_counter_guard_manifest(
+        &self,
+    ) -> Result<Vec<[u8; 32]>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadRemoteCounterGuardManifest { reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn load_remote_counter_guard_cleanup_manifest(
+        &self,
+    ) -> Result<super::remote_counter_guard_manifest::CounterGuardCleanupManifest, RuntimeStoreError>
+    {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadRemoteCounterGuardCleanupManifest { reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn seal_directed_reply_transaction(
+        &self,
+        request: DirectedReplyTransactionRequest,
+    ) -> Result<DirectedReplyTransactionOutcome, RuntimeStoreError> {
+        let retained = request.sealer_retained_bytes;
+        let machine_trust_domain = self.machine_trust_domain()?;
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::SealDirectedReply {
+                machine_trust_domain,
+                request,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn retire_remote_replay_scope(
+        &self,
+        scope: [u8; remote_replay::REMOTE_REPLAY_SCOPE_BYTES],
+        retired_at_ms: u64,
+    ) -> Result<(), RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::RetireRemoteReplayScope {
+                scope,
+                retired_at_ms,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn pin_retired_remote_replay_scope(
+        &self,
+        scope: [u8; remote_replay::REMOTE_REPLAY_SCOPE_BYTES],
+        pin_id: [u8; 16],
+    ) -> Result<(), RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::PinRetiredRemoteReplayScope {
+                scope,
+                pin_id,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn release_retired_remote_replay_pin(
+        &self,
+        scope: [u8; remote_replay::REMOTE_REPLAY_SCOPE_BYTES],
+        pin_id: [u8; 16],
+    ) -> Result<(), RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::ReleaseRetiredRemoteReplayPin {
+                scope,
+                pin_id,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    pub(crate) async fn gc_retired_remote_replay(
+        &self,
+        now_ms: u64,
+    ) -> Result<u64, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::GcRetiredRemoteReplay { now_ms, reply },
+        )
+        .await?
+    }
+
+    #[allow(
+        dead_code,
+        reason = "P4.5 publisher/replay/snapshot coordinators consume the durable owner seam"
+    )]
+    pub(crate) async fn acquire_retired_shared_key_owner(
+        &self,
+        owner: super::RetiredSharedKeyOwner,
+    ) -> Result<super::RetiredKeyMutationOutcome, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::AcquireRetiredSharedKeyOwner { owner, reply },
+        )
+        .await?
+    }
+
+    #[allow(
+        dead_code,
+        reason = "P4.5 publisher/replay/snapshot coordinators consume the durable owner seam"
+    )]
+    pub(crate) async fn release_retired_shared_key_owner(
+        &self,
+        owner: super::RetiredSharedKeyOwner,
+    ) -> Result<super::RetiredKeyMutationOutcome, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::ReleaseRetiredSharedKeyOwner { owner, reply },
+        )
+        .await?
+    }
+
+    #[allow(
+        dead_code,
+        reason = "P4.5 maintenance coordinator consumes the retired shared-key GC seam"
+    )]
+    pub(crate) async fn gc_expired_retired_shared_keys(
+        &self,
+        now_ms: u64,
+    ) -> Result<super::RetiredKeyGcOutcome, RuntimeStoreError> {
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[])?,
+            |reply| SafetyCommand::GcExpiredRetiredSharedKeys { now_ms, reply },
         )
         .await?
     }
@@ -1801,8 +2157,8 @@ impl RuntimeStoreHandle {
         input: NewConversation,
     ) -> Result<ConversationRecord, RuntimeStoreError> {
         match self.create_conversation_idempotent(input).await? {
-            CreateConversationOutcome::Created { conversation }
-            | CreateConversationOutcome::Replayed { conversation } => Ok(conversation),
+            CreateConversationOutcome::Created { conversation, .. }
+            | CreateConversationOutcome::Replayed { conversation, .. } => Ok(conversation),
         }
     }
 
@@ -3137,6 +3493,21 @@ enum NormalCommand {
             Result<super::snapshot::CatalogSnapshotRefreshPreflight, RuntimeStoreError>,
         >,
     },
+    PreflightTransitionCatalogSnapshot {
+        observed_reference: Option<super::snapshot::ReadySnapshotReference>,
+        frozen: agentdeck_protocol::runtime::StreamCursor,
+        reply: oneshot::Sender<
+            Result<super::snapshot::CatalogTransitionSnapshotPreflight, RuntimeStoreError>,
+        >,
+    },
+    MaterializeTransitionCatalogSnapshot {
+        preflight: super::snapshot::CatalogTransitionSnapshotPreflight,
+        ephemeral_id: [u8; 16],
+        build_permit: SharedSnapshotBuildPermit,
+        reply: oneshot::Sender<
+            Result<super::snapshot::EphemeralCatalogMaterialization, RuntimeStoreError>,
+        >,
+    },
     RefreshCatalogSnapshot {
         source: Option<super::snapshot::ReadySnapshotReference>,
         frozen_base: agentdeck_protocol::runtime::StreamCursor,
@@ -3150,6 +3521,11 @@ enum NormalCommand {
         generation: [u8; 16],
         reply: oneshot::Sender<Result<PublicationStreamRecord, RuntimeStoreError>>,
     },
+    PreflightSharedPublication {
+        request: SharedPublicationPreflightRequest,
+        proposal: SharedPublicationStreamProposal,
+        reply: oneshot::Sender<Result<SharedPublicationPreflight, RuntimeStoreError>>,
+    },
     RotatePublicationStream {
         request: RotatePublicationStreamRequest,
         reply: oneshot::Sender<Result<PublicationStreamRecord, RuntimeStoreError>>,
@@ -3157,6 +3533,101 @@ enum NormalCommand {
     FreezePublication {
         request: FreezePublicationRequest,
         reply: oneshot::Sender<Result<FrozenPublication, RuntimeStoreError>>,
+    },
+    FreezeSignedPublication {
+        request: FreezeSignedPublicationRequest,
+        reply: oneshot::Sender<Result<FrozenPublication, RuntimeStoreError>>,
+    },
+    BeginKeyTransition {
+        input: key_transition::BeginKeyTransition,
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
+    },
+    #[cfg(test)]
+    MarkKeyTransitionRotated {
+        operation_id: [u8; 16],
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
+    },
+    FreezeKeyUpdates {
+        operation_id: [u8; 16],
+        updates: Vec<key_transition::FrozenKeyUpdate>,
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
+    },
+    FreezeKeyBarriers {
+        operation_id: [u8; 16],
+        cuts: Vec<key_transition::KeyTransitionStreamCut>,
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
+    },
+    MarkKeyBarriersCommitted {
+        operation_id: [u8; 16],
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
+    },
+    AcknowledgeKeyUpdate {
+        input: key_transition::AcknowledgeKeyUpdate,
+        reply: oneshot::Sender<Result<key_transition::KeyUpdateRecord, RuntimeStoreError>>,
+    },
+    AcknowledgeStreamApplied {
+        input: key_transition::AcknowledgeStreamApplied,
+        reply: oneshot::Sender<Result<key_transition::KeyUpdateRecord, RuntimeStoreError>>,
+    },
+    ResolveTransitionSnapshotPermit {
+        machine_trust_domain: [u8; 32],
+        request: key_transition::TransitionSnapshotRequest,
+        reply: oneshot::Sender<Result<key_transition::TransitionSnapshotPermit, RuntimeStoreError>>,
+    },
+    MarkTransitionSnapshotFlushed {
+        flush: key_transition::TransitionSnapshotFlush,
+        reply: oneshot::Sender<
+            Result<key_transition::TransitionSnapshotFlushRecord, RuntimeStoreError>,
+        >,
+    },
+    CompleteKeyTransition {
+        operation_id: [u8; 16],
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
+    },
+    TryCompleteKeyTransition {
+        operation_id: [u8; 16],
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionCompletion, RuntimeStoreError>>,
+    },
+    CancelKeyTransition {
+        operation_id: [u8; 16],
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
+    },
+    GcExpiredKeyTransitions {
+        limits: key_transition::KeyTransitionGcLimits,
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionGcOutcome, RuntimeStoreError>>,
+    },
+    CheckRemoteTransitionIngress {
+        class: key_transition::RemoteTransitionIngressClass,
+        reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
+    },
+    LoadActiveKeyTransition {
+        reply: oneshot::Sender<
+            Result<Option<key_transition::KeyTransitionRecovery>, RuntimeStoreError>,
+        >,
+    },
+    LoadTransitionMaterialProjection {
+        machine_trust_domain: [u8; 32],
+        reply: oneshot::Sender<
+            Result<Option<transition_material::TransitionMaterialProjection>, RuntimeStoreError>,
+        >,
+    },
+    LoadTransitionCommittedCuts {
+        operation_id: [u8; 16],
+        reply: oneshot::Sender<
+            Result<Vec<transition_material::TransitionCommittedCutProjection>, RuntimeStoreError>,
+        >,
+    },
+    LoadKeyUpdateForSync {
+        query: key_transition::KeySyncRead,
+        reply: oneshot::Sender<Result<key_transition::FrozenKeyUpdate, RuntimeStoreError>>,
+    },
+    ResolveKeyUpdateAck {
+        query: key_transition::KeyUpdateAckResolve,
+        reply: oneshot::Sender<Result<key_transition::KeyUpdateAckBinding, RuntimeStoreError>>,
+    },
+    ResolveStreamAppliedAck {
+        query: key_transition::StreamAppliedAckResolve,
+        reply: oneshot::Sender<Result<key_transition::StreamAppliedAckBinding, RuntimeStoreError>>,
     },
 }
 
@@ -3268,6 +3739,10 @@ enum SafetyCommand {
         expected_request_hash: [u8; 32],
         expected_response_hash: [u8; 32],
         reply: oneshot::Sender<Result<ActivateMachineEnrollmentOutcome, RuntimeStoreError>>,
+    },
+    FinalizeKeyDirectoryRotation {
+        operation_id: [u8; 16],
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
     },
     PrepareMachineRetirement {
         prepared: machine_remote::PreparedMachineRetirementWrite,
@@ -3387,12 +3862,82 @@ enum SafetyCommand {
         blob_sha256: [u8; 32],
         reply: oneshot::Sender<Result<PublicationAcknowledgement, RuntimeStoreError>>,
     },
-    #[cfg(test)]
-    AlignActiveAuthorizationRevisionForTest {
-        device_route: agentdeck_protocol::relay_v2::DeviceRouteId,
+    AdmitRemoteReplay {
+        admission: remote_replay::RemoteReplayAdmission,
+        reply: oneshot::Sender<Result<remote_replay::RemoteReplayStoreDecision, RuntimeStoreError>>,
+    },
+    ApplyPendingReplayRetirement {
         reply: oneshot::Sender<
-            Result<agentdeck_protocol::relay_v2::KeyDirectoryRevision, RuntimeStoreError>,
+            Result<key_transition::ReplayRetirementApplyOutcome, RuntimeStoreError>,
         >,
+    },
+    ApplyCounterRetirementAfterGuardReadback {
+        machine_trust_domain: [u8; 32],
+        plan: key_transition::CounterRetirementPlan,
+        reply: oneshot::Sender<
+            Result<key_transition::CounterRetirementApplyOutcome, RuntimeStoreError>,
+        >,
+    },
+    RetireRemoteReplayScope {
+        scope: [u8; remote_replay::REMOTE_REPLAY_SCOPE_BYTES],
+        retired_at_ms: u64,
+        reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
+    },
+    PinRetiredRemoteReplayScope {
+        scope: [u8; remote_replay::REMOTE_REPLAY_SCOPE_BYTES],
+        pin_id: [u8; 16],
+        reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
+    },
+    ReleaseRetiredRemoteReplayPin {
+        scope: [u8; remote_replay::REMOTE_REPLAY_SCOPE_BYTES],
+        pin_id: [u8; 16],
+        reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
+    },
+    GcRetiredRemoteReplay {
+        now_ms: u64,
+        reply: oneshot::Sender<Result<u64, RuntimeStoreError>>,
+    },
+    AcquireRetiredSharedKeyOwner {
+        owner: super::RetiredSharedKeyOwner,
+        reply: oneshot::Sender<Result<super::RetiredKeyMutationOutcome, RuntimeStoreError>>,
+    },
+    ReleaseRetiredSharedKeyOwner {
+        owner: super::RetiredSharedKeyOwner,
+        reply: oneshot::Sender<Result<super::RetiredKeyMutationOutcome, RuntimeStoreError>>,
+    },
+    GcExpiredRetiredSharedKeys {
+        now_ms: u64,
+        reply: oneshot::Sender<Result<super::RetiredKeyGcOutcome, RuntimeStoreError>>,
+    },
+    RecordRemoteCounterGap {
+        request: RemoteCounterGapRequest,
+        reply: oneshot::Sender<Result<RemoteCounterRecord, RuntimeStoreError>>,
+    },
+    RetireRemoteCounter {
+        request: RemoteCounterRetirementRequest,
+        reply: oneshot::Sender<Result<RemoteCounterRecord, RuntimeStoreError>>,
+    },
+    StageRemoteCounterRecovery {
+        machine_trust_domain: [u8; 32],
+        request: CounterRecoveryStageRequest,
+        reply: oneshot::Sender<Result<CounterRecoveryStageOutcome, RuntimeStoreError>>,
+    },
+    MarkRemoteCounterRecoveryBusinessReady {
+        operation_id: [u8; 16],
+        reply: oneshot::Sender<Result<RemoteCounterRecord, RuntimeStoreError>>,
+    },
+    RegisterRemoteCounterGuardScope {
+        scope_token: [u8; 32],
+        reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
+    },
+    MarkRemoteCounterGuardScopeMaterialized {
+        scope_token: [u8; 32],
+        reply: oneshot::Sender<Result<(), RuntimeStoreError>>,
+    },
+    SealDirectedReply {
+        machine_trust_domain: [u8; 32],
+        request: DirectedReplyTransactionRequest,
+        reply: oneshot::Sender<Result<DirectedReplyTransactionOutcome, RuntimeStoreError>>,
     },
 }
 
@@ -3405,6 +3950,47 @@ enum ReadCommand {
     },
     LoadMachineEnrollmentState {
         reply: oneshot::Sender<Result<Option<MachineEnrollmentState>, RuntimeStoreError>>,
+    },
+    ContainsRemoteReplayScope {
+        scope: [u8; remote_replay::REMOTE_REPLAY_SCOPE_BYTES],
+        reply: oneshot::Sender<Result<bool, RuntimeStoreError>>,
+    },
+    LoadRemoteCounterRecord {
+        scope_token: [u8; 32],
+        key_id: agentdeck_protocol::e2ee::KeyId,
+        reply: oneshot::Sender<Result<RemoteCounterRecord, RuntimeStoreError>>,
+    },
+    HasRetiredRemoteCounter {
+        reply: oneshot::Sender<Result<bool, RuntimeStoreError>>,
+    },
+    RemoteCounterScopeAllowed {
+        scope_token: [u8; 32],
+        reply: oneshot::Sender<Result<bool, RuntimeStoreError>>,
+    },
+    LoadActiveSenderCounterBindings {
+        machine_trust_domain: [u8; 32],
+        reply: oneshot::Sender<Result<Vec<ActiveSenderCounterBinding>, RuntimeStoreError>>,
+    },
+    LoadPendingCounterRetirementPlan {
+        machine_trust_domain: [u8; 32],
+        reply: oneshot::Sender<
+            Result<Option<key_transition::CounterRetirementPlan>, RuntimeStoreError>,
+        >,
+    },
+    #[allow(
+        dead_code,
+        reason = "token-only manifest view remains available for focused diagnostics/tests"
+    )]
+    LoadRemoteCounterGuardManifest {
+        reply: oneshot::Sender<Result<Vec<[u8; 32]>, RuntimeStoreError>>,
+    },
+    LoadRemoteCounterGuardCleanupManifest {
+        reply: oneshot::Sender<
+            Result<
+                super::remote_counter_guard_manifest::CounterGuardCleanupManifest,
+                RuntimeStoreError,
+            >,
+        >,
     },
     PlanPairingReceiptPurge {
         reply: oneshot::Sender<
@@ -3584,6 +4170,12 @@ enum ReadCommand {
     },
     RegisterStreamBarrier {
         request: RegisterStreamBarrier,
+        reply: oneshot::Sender<Result<StreamBarrierRegistration, RuntimeStoreError>>,
+    },
+    RegisterTransitionSnapshotBarrier {
+        permit: key_transition::TransitionSnapshotPermit,
+        generation: crate::runtime::events::WatchGeneration,
+        machine_trust_domain: [u8; 32],
         reply: oneshot::Sender<Result<StreamBarrierRegistration, RuntimeStoreError>>,
     },
     ReleaseStreamWatch {
@@ -3947,6 +4539,17 @@ fn handle_normal(
             NormalCommand::PreflightCatalogSnapshotRefresh { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            NormalCommand::PreflightTransitionCatalogSnapshot { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::MaterializeTransitionCatalogSnapshot {
+                build_permit,
+                reply,
+                ..
+            } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+                drop(build_permit);
+            }
             NormalCommand::RefreshCatalogSnapshot {
                 build_permit,
                 reply,
@@ -3958,10 +4561,65 @@ fn handle_normal(
             NormalCommand::CreatePublicationStream { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            NormalCommand::PreflightSharedPublication { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             NormalCommand::RotatePublicationStream { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
             NormalCommand::FreezePublication { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::FreezeSignedPublication { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            #[cfg(test)]
+            NormalCommand::MarkKeyTransitionRotated { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::BeginKeyTransition { reply, .. }
+            | NormalCommand::FreezeKeyUpdates { reply, .. }
+            | NormalCommand::FreezeKeyBarriers { reply, .. }
+            | NormalCommand::MarkKeyBarriersCommitted { reply, .. }
+            | NormalCommand::CompleteKeyTransition { reply, .. }
+            | NormalCommand::CancelKeyTransition { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::TryCompleteKeyTransition { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::GcExpiredKeyTransitions { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::AcknowledgeKeyUpdate { reply, .. }
+            | NormalCommand::AcknowledgeStreamApplied { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::ResolveTransitionSnapshotPermit { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::MarkTransitionSnapshotFlushed { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::CheckRemoteTransitionIngress { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::LoadActiveKeyTransition { reply } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::LoadTransitionMaterialProjection { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::LoadTransitionCommittedCuts { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::LoadKeyUpdateForSync { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::ResolveKeyUpdateAck { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::ResolveStreamAppliedAck { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
         }
@@ -4167,6 +4825,30 @@ fn handle_normal(
                 frozen_base,
             ));
         }
+        NormalCommand::PreflightTransitionCatalogSnapshot {
+            observed_reference,
+            frozen,
+            reply,
+        } => {
+            let _ = reply.send(super::snapshot::preflight_transition_catalog_snapshot(
+                state,
+                observed_reference.as_ref(),
+                frozen,
+            ));
+        }
+        NormalCommand::MaterializeTransitionCatalogSnapshot {
+            preflight,
+            ephemeral_id,
+            build_permit,
+            reply,
+        } => {
+            let _ = reply.send(super::snapshot::materialize_transition_catalog_snapshot(
+                state,
+                &preflight,
+                ephemeral_id,
+            ));
+            drop(build_permit);
+        }
         NormalCommand::RefreshCatalogSnapshot {
             source,
             frozen_base,
@@ -4205,6 +4887,22 @@ fn handle_normal(
                 });
             let _ = reply.send(result);
         }
+        NormalCommand::PreflightSharedPublication {
+            request,
+            proposal,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    super::publication::preflight_shared_publication(
+                        state, config, &request, proposal, now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
         NormalCommand::RotatePublicationStream { request, reply } => {
             let result = config
                 .clock
@@ -4224,6 +4922,216 @@ fn handle_normal(
                     super::publication::freeze_publication(state, config, request, now)
                 });
             let _ = reply.send(result);
+        }
+        NormalCommand::FreezeSignedPublication { request, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    super::publication::freeze_signed_publication(state, config, request, now)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::BeginKeyTransition { mut input, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    input.created_at_ms = now;
+                    key_transition::begin_key_transition(state, config, input)
+                });
+            let _ = reply.send(result);
+        }
+        #[cfg(test)]
+        NormalCommand::MarkKeyTransitionRotated {
+            operation_id,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    key_transition::mark_rotated_preparing_updates(state, config, operation_id, now)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::FreezeKeyUpdates {
+            operation_id,
+            updates,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    key_transition::freeze_key_updates(state, config, operation_id, updates, now)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::FreezeKeyBarriers {
+            operation_id,
+            cuts,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    key_transition::freeze_key_barriers(state, config, operation_id, cuts, now)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::MarkKeyBarriersCommitted {
+            operation_id,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    key_transition::mark_key_barriers_committed(state, config, operation_id, now)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::AcknowledgeKeyUpdate { mut input, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    input.acknowledged_at_ms = now;
+                    key_transition::acknowledge_key_update(state, config, input)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::AcknowledgeStreamApplied { mut input, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    input.acknowledged_at_ms = now;
+                    key_transition::acknowledge_stream_applied(state, config, input)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::ResolveTransitionSnapshotPermit {
+            machine_trust_domain,
+            request,
+            reply,
+        } => {
+            let _ = reply.send(key_transition::resolve_transition_snapshot_permit(
+                state,
+                machine_trust_domain,
+                request,
+            ));
+        }
+        NormalCommand::MarkTransitionSnapshotFlushed { flush, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    key_transition::mark_transition_snapshot_flushed(state, config, flush, now)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::CompleteKeyTransition {
+            operation_id,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    key_transition::complete_key_transition(state, config, operation_id, now)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::TryCompleteKeyTransition {
+            operation_id,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    key_transition::try_complete_key_transition(state, config, operation_id, now)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::CancelKeyTransition {
+            operation_id,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    key_transition::cancel_key_transition(state, config, operation_id, now)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::GcExpiredKeyTransitions { limits, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    key_transition::gc_expired_key_transitions(state, config, now, limits)
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::CheckRemoteTransitionIngress { class, reply } => {
+            let _ = reply.send(key_transition::ensure_remote_ingress_allowed(state, class));
+        }
+        NormalCommand::LoadActiveKeyTransition { reply } => {
+            let _ = reply.send(key_transition::load_active_key_transition(state));
+        }
+        NormalCommand::LoadTransitionMaterialProjection {
+            machine_trust_domain,
+            reply,
+        } => {
+            let _ = reply.send(transition_material::load_transition_material_projection(
+                state,
+                machine_trust_domain,
+            ));
+        }
+        NormalCommand::LoadTransitionCommittedCuts {
+            operation_id,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    transition_material::prepare_transition_committed_cuts_projection(
+                        state,
+                        config,
+                        operation_id,
+                        now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::LoadKeyUpdateForSync { query, reply } => {
+            let _ = reply.send(key_transition::load_key_update_for_sync(state, query));
+        }
+        NormalCommand::ResolveKeyUpdateAck { query, reply } => {
+            let _ = reply.send(key_transition::resolve_key_update_ack(state, query));
+        }
+        NormalCommand::ResolveStreamAppliedAck { query, reply } => {
+            let _ = reply.send(key_transition::resolve_stream_applied_ack(state, query));
         }
     }
     drop(memory_permit);
@@ -4293,6 +5201,9 @@ fn handle_safety(
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
             SafetyCommand::ActivateMachineEnrollment { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::FinalizeKeyDirectoryRotation { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
             SafetyCommand::PrepareMachineRetirement { reply, .. } => {
@@ -4370,8 +5281,55 @@ fn handle_safety(
             SafetyCommand::AcknowledgePublicationDelivery { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
-            #[cfg(test)]
-            SafetyCommand::AlignActiveAuthorizationRevisionForTest { reply, .. } => {
+            SafetyCommand::AdmitRemoteReplay { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::ApplyPendingReplayRetirement { reply } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::ApplyCounterRetirementAfterGuardReadback { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::RetireRemoteReplayScope { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::PinRetiredRemoteReplayScope { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::ReleaseRetiredRemoteReplayPin { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::GcRetiredRemoteReplay { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::AcquireRetiredSharedKeyOwner { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::ReleaseRetiredSharedKeyOwner { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::GcExpiredRetiredSharedKeys { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::RecordRemoteCounterGap { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::RetireRemoteCounter { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::StageRemoteCounterRecovery { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::MarkRemoteCounterRecoveryBusinessReady { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::RegisterRemoteCounterGuardScope { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::MarkRemoteCounterGuardScopeMaterialized { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            SafetyCommand::SealDirectedReply { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
         }
@@ -4541,6 +5499,16 @@ fn handle_safety(
                 config,
                 expected_request_hash,
                 expected_response_hash,
+            ));
+        }
+        SafetyCommand::FinalizeKeyDirectoryRotation {
+            operation_id,
+            reply,
+        } => {
+            let _ = reply.send(key_transition::finalize_key_directory_rotation(
+                state,
+                config,
+                operation_id,
             ));
         }
         SafetyCommand::PrepareMachineRetirement { prepared, reply } => {
@@ -4753,19 +5721,129 @@ fn handle_safety(
                 });
             let _ = reply.send(result);
         }
-        #[cfg(test)]
-        SafetyCommand::AlignActiveAuthorizationRevisionForTest {
-            device_route,
+        SafetyCommand::AdmitRemoteReplay { admission, reply } => {
+            let _ = reply.send(remote_replay::admit(state, config, admission));
+        }
+        SafetyCommand::ApplyPendingReplayRetirement { reply } => {
+            let _ = reply.send(key_transition::apply_pending_replay_retirement(
+                state, config,
+            ));
+        }
+        SafetyCommand::ApplyCounterRetirementAfterGuardReadback {
+            machine_trust_domain,
+            plan,
             reply,
         } => {
-            let _ = reply.send(
-                pairing_authorization::align_active_authorization_revision_for_test(
-                    &mut state.connection,
-                    &state.key_bundle,
-                    state.database_id,
-                    device_route,
-                ),
-            );
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    key_transition::apply_counter_retirement_after_guard_readback(
+                        state,
+                        config,
+                        machine_trust_domain,
+                        &plan,
+                        now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        SafetyCommand::RetireRemoteReplayScope {
+            scope,
+            retired_at_ms,
+            reply,
+        } => {
+            let _ = reply.send(remote_replay::retire_scope(
+                state,
+                config,
+                scope,
+                retired_at_ms,
+            ));
+        }
+        SafetyCommand::PinRetiredRemoteReplayScope {
+            scope,
+            pin_id,
+            reply,
+        } => {
+            let _ = reply.send(remote_replay::pin_retired_scope(
+                state, config, scope, pin_id,
+            ));
+        }
+        SafetyCommand::ReleaseRetiredRemoteReplayPin {
+            scope,
+            pin_id,
+            reply,
+        } => {
+            let _ = reply.send(remote_replay::release_retired_pin(
+                state, config, scope, pin_id,
+            ));
+        }
+        SafetyCommand::GcRetiredRemoteReplay { now_ms, reply } => {
+            let _ = reply.send(remote_replay::gc_retired(state, config, now_ms));
+        }
+        SafetyCommand::AcquireRetiredSharedKeyOwner { owner, reply } => {
+            let _ = reply.send(retired_key::acquire_owner(state, config, owner));
+        }
+        SafetyCommand::ReleaseRetiredSharedKeyOwner { owner, reply } => {
+            let _ = reply.send(retired_key::release_owner(state, config, owner));
+        }
+        SafetyCommand::GcExpiredRetiredSharedKeys { now_ms, reply } => {
+            let _ = reply.send(retired_key::gc_expired(state, config, now_ms));
+        }
+        SafetyCommand::RecordRemoteCounterGap { request, reply } => {
+            let _ = reply.send(super::remote_counter::record_gap(state, config, request));
+        }
+        SafetyCommand::RetireRemoteCounter { request, reply } => {
+            let _ = reply.send(super::remote_counter::retire(state, config, request));
+        }
+        SafetyCommand::StageRemoteCounterRecovery {
+            machine_trust_domain,
+            request,
+            reply,
+        } => {
+            let _ = reply.send(super::remote_counter::stage_recovery(
+                state,
+                config,
+                machine_trust_domain,
+                request,
+            ));
+        }
+        SafetyCommand::MarkRemoteCounterRecoveryBusinessReady {
+            operation_id,
+            reply,
+        } => {
+            let _ = reply.send(super::remote_counter::mark_recovery_business_ready(
+                state,
+                config,
+                operation_id,
+            ));
+        }
+        SafetyCommand::RegisterRemoteCounterGuardScope { scope_token, reply } => {
+            let _ = reply.send(super::remote_counter_guard_manifest::register(
+                state,
+                config,
+                scope_token,
+            ));
+        }
+        SafetyCommand::MarkRemoteCounterGuardScopeMaterialized { scope_token, reply } => {
+            let _ = reply.send(super::remote_counter_guard_manifest::mark_materialized(
+                state,
+                config,
+                scope_token,
+            ));
+        }
+        SafetyCommand::SealDirectedReply {
+            machine_trust_domain,
+            request,
+            reply,
+        } => {
+            let _ = reply.send(super::directed_reply::seal_transaction(
+                state,
+                config,
+                machine_trust_domain,
+                request,
+            ));
         }
     }
     drop(memory_permit);
@@ -4799,6 +5877,93 @@ fn handle_read(
                 &state.key_bundle,
                 state.database_id,
             ));
+        }
+        ReadCommand::ContainsRemoteReplayScope { scope, reply } => {
+            let result = if state.recovery_scan.is_some() {
+                Err(RuntimeStoreError::RecoveryInProgress)
+            } else {
+                remote_replay::contains_scope(state, scope)
+            };
+            let _ = reply.send(result);
+        }
+        ReadCommand::LoadRemoteCounterRecord {
+            scope_token,
+            key_id,
+            reply,
+        } => {
+            let result = if state.recovery_scan.is_some() {
+                Err(RuntimeStoreError::RecoveryInProgress)
+            } else {
+                super::remote_counter::load_record(state, scope_token, key_id)
+            };
+            let _ = reply.send(result);
+        }
+        ReadCommand::HasRetiredRemoteCounter { reply } => {
+            let result = if state.recovery_scan.is_some() {
+                Err(RuntimeStoreError::RecoveryInProgress)
+            } else {
+                super::remote_counter::has_retired(state)
+            };
+            let _ = reply.send(result);
+        }
+        ReadCommand::RemoteCounterScopeAllowed { scope_token, reply } => {
+            let result = if state.recovery_scan.is_some() {
+                Err(RuntimeStoreError::RecoveryInProgress)
+            } else {
+                super::remote_counter::scope_allowed(state, scope_token)
+            };
+            let _ = reply.send(result);
+        }
+        ReadCommand::LoadActiveSenderCounterBindings {
+            machine_trust_domain,
+            reply,
+        } => {
+            let result = if state.recovery_scan.is_some() {
+                Err(RuntimeStoreError::RecoveryInProgress)
+            } else {
+                super::remote_counter::load_active_sender_counter_bindings(
+                    state,
+                    machine_trust_domain,
+                )
+            };
+            let _ = reply.send(result);
+        }
+        ReadCommand::LoadPendingCounterRetirementPlan {
+            machine_trust_domain,
+            reply,
+        } => {
+            let result = if state.recovery_scan.is_some() {
+                Err(RuntimeStoreError::RecoveryInProgress)
+            } else {
+                config
+                    .clock
+                    .now_ms()
+                    .map_err(RuntimeStoreError::from)
+                    .and_then(|now| {
+                        key_transition::load_pending_counter_retirement_plan(
+                            state,
+                            machine_trust_domain,
+                            now,
+                        )
+                    })
+            };
+            let _ = reply.send(result);
+        }
+        ReadCommand::LoadRemoteCounterGuardManifest { reply } => {
+            let result = if state.recovery_scan.is_some() {
+                Err(RuntimeStoreError::RecoveryInProgress)
+            } else {
+                super::remote_counter_guard_manifest::load(state)
+            };
+            let _ = reply.send(result);
+        }
+        ReadCommand::LoadRemoteCounterGuardCleanupManifest { reply } => {
+            let result = if state.recovery_scan.is_some() {
+                Err(RuntimeStoreError::RecoveryInProgress)
+            } else {
+                super::remote_counter_guard_manifest::load_for_cleanup(state)
+            };
+            let _ = reply.send(result);
         }
         ReadCommand::PlanPairingReceiptPurge { reply } => {
             let result = config
@@ -5155,6 +6320,22 @@ fn handle_read(
         }
         ReadCommand::RegisterStreamBarrier { request, reply } => {
             let result = register_stream_barrier_on_worker(state, config, commit_hub, request);
+            send_stream_barrier_reply(reply, result, state, commit_hub);
+        }
+        ReadCommand::RegisterTransitionSnapshotBarrier {
+            permit,
+            generation,
+            machine_trust_domain,
+            reply,
+        } => {
+            let result = register_transition_snapshot_barrier_on_worker(
+                state,
+                config,
+                commit_hub,
+                permit,
+                generation,
+                machine_trust_domain,
+            );
             send_stream_barrier_reply(reply, result, state, commit_hub);
         }
         ReadCommand::ReleaseStreamWatch { token, reply } => {

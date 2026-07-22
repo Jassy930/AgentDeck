@@ -9,7 +9,7 @@ mod macos_keychain;
 
 pub use key_store::{
     KeyStore, KeyStoreError, MemoryKeyStore, STORAGE_KEK_ACCOUNT, SecretBytes, StorageKek,
-    StorageKekError, load_or_create_storage_kek,
+    StorageKekError, load_existing_storage_kek, load_or_create_storage_kek,
 };
 pub use macos_keychain::MacOsKeychainStore;
 

@@ -120,9 +120,28 @@ fn subscription_and_barrier_quotas_fail_before_spawning_tasks() {
         1,
     );
 
+    assert!(
+        registry
+            .release_snapshot_sender(&second, 2)
+            .expect("release snapshot sender before barrier")
+    );
+    assert_eq!(
+        registry.admit_live_enqueue(&second, 2),
+        Err(SubscriptionRegistryError::BarrierActive),
+        "释放 snapshot sender 不得提前放行 live enqueue"
+    );
+    assert_usage(
+        &registry,
+        Usage {
+            live: 2,
+            barriers: 1,
+            snapshot_senders: 0,
+        },
+        1,
+    );
     registry
         .complete_barrier(&second, 2)
-        .expect("release snapshot sender");
+        .expect("release second barrier");
     let third = registry
         .reserve(connection(2), target(3), false, 2)
         .expect("reach global live cap");

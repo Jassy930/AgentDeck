@@ -6,32 +6,42 @@
 //! 三条 typed lane 复用唯一 Relay session/supervisor；业务 lane 只做 transport/dispatch，
 //! 不认证 Runtime payload，也不持有 canonical 业务状态。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use agentdeck_crypto::rand_core::SeedableRng;
+#[cfg(test)]
+use agentdeck_crypto::{
+    DeviceKeyRecoverySealAuthority,
+    seal_device_key_recovery_reply as crypto_seal_device_key_recovery_reply,
+};
 use agentdeck_crypto::{
     HpkePublicKey, SecretAeadKey, seal_key_directory_entry as crypto_seal_key_directory_entry,
     sha256,
 };
 use agentdeck_protocol::e2ee::{
-    DeviceAuthorizationV1, KeyDirectoryEntry, KeyDirectorySignatureContextV1, KeyDirectoryV1,
-    KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1, PairRequestInfoV1,
+    DeviceAuthorizationV1, DeviceKeyRecoveryInfoV1, DeviceKeyRecoveryReplyV1, E2EE_FORMAT_VERSION,
+    KeyDirectoryEntry, KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyUpdateInfoV1,
+    KeyUpdateSetV1, KeyUpdateV1, MachineDataSignerBindingV1, OuterContextV1, PairRequestInfoV1,
     PairResponseInfoV1, PairResponsePlaintextV1, PairResponseV1, PairingControlEnvelopeV1,
+    SignedSealedBlobV1, UnsignedSealedBlobV1,
 };
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, AuthProof, Authenticate, Challenge, ClosePairRoute, GrantCommitted, InstallGrant,
-    OpenPairRoute, PairData, PairRouteClosed, PairRouteOpened, Reply, RetireMachine,
-    RetirementCommitted, RevocationCommitted, RevokeDevice, RouteAccepted, Send as RouteSend,
-    ServerRestarting,
+    OpenPairRoute, PairData, PairRouteClosed, PairRouteOpened, Publish, RegisterStream, Reply,
+    RetireMachine, RetirementCommitted, RevocationCommitted, RevokeDevice, RouteAccepted,
+    SealedBlob, Send as RouteSend, ServerRestarting,
 };
 use agentdeck_protocol::relay_v2::{
     AuthenticationRole, AuthenticationTranscriptV1, DeviceRevocation, DeviceRouteId, GrantSerial,
-    MAX_FRAME_BYTES, MachineRouteId, OpaqueRouteFrame, PairRouteId, RELAY_PROTOCOL_VERSION,
-    RelayFrameBody, RequestRouteId, SignedCertificate, encode,
+    KeyDirectoryRevision, MAX_FRAME_BYTES, MachineRouteId, OpaqueRouteFrame, PairRouteId,
+    RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId, SignedCertificate, StreamGenerationId,
+    StreamRouteId, TrustEpoch, encode,
 };
+use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use agentdeck_relay_client::{LinkAuthenticator, RelayClient, RelayClientConfig, RelayClientError};
 use async_trait::async_trait;
 use rand_chacha::ChaCha20Rng;
@@ -100,6 +110,33 @@ trait MachineLinkOwner: Send + Sync {
         context: &KeyDirectorySignatureContextV1,
         directory: KeyDirectoryV1,
     ) -> Result<KeyDirectoryV1, MachinePairingError>;
+
+    fn sign_key_update(
+        &self,
+        anchor: &MachinePairingAnchor,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        update: KeyUpdateV1,
+    ) -> Result<KeyUpdateV1, MachinePairingError>;
+
+    fn sign_sealed(
+        &self,
+        anchor: &MachinePairingAnchor,
+        unsigned: UnsignedSealedBlobV1,
+        context: &OuterContextV1,
+    ) -> Result<SignedSealedBlobV1, MachinePairingError>;
+
+    fn seal_device_key_recovery_reply(
+        &self,
+        _anchor: &MachinePairingAnchor,
+        _recipient: &HpkePublicKey,
+        _info: &DeviceKeyRecoveryInfoV1,
+        _context: &OuterContextV1,
+        _update_set: &KeyUpdateSetV1,
+        _rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<DeviceKeyRecoveryReplyV1, MachinePairingError> {
+        Err(MachinePairingError::ContextMismatch)
+    }
 
     fn seal_pair_response(
         &self,
@@ -209,6 +246,39 @@ impl MachineLinkOwner for MachineLinkIdentityOwner {
         directory: KeyDirectoryV1,
     ) -> Result<KeyDirectoryV1, MachinePairingError> {
         MachineLinkIdentityOwner::sign_key_directory(self, anchor, context, directory)
+    }
+
+    fn sign_key_update(
+        &self,
+        anchor: &MachinePairingAnchor,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        update: KeyUpdateV1,
+    ) -> Result<KeyUpdateV1, MachinePairingError> {
+        MachineLinkIdentityOwner::sign_key_update(self, anchor, info, context, update)
+    }
+
+    fn sign_sealed(
+        &self,
+        anchor: &MachinePairingAnchor,
+        unsigned: UnsignedSealedBlobV1,
+        context: &OuterContextV1,
+    ) -> Result<SignedSealedBlobV1, MachinePairingError> {
+        MachineLinkIdentityOwner::sign_sealed(self, anchor, unsigned, context)
+    }
+
+    fn seal_device_key_recovery_reply(
+        &self,
+        anchor: &MachinePairingAnchor,
+        recipient: &HpkePublicKey,
+        info: &DeviceKeyRecoveryInfoV1,
+        context: &OuterContextV1,
+        update_set: &KeyUpdateSetV1,
+        rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<DeviceKeyRecoveryReplyV1, MachinePairingError> {
+        MachineLinkIdentityOwner::seal_device_key_recovery_reply(
+            self, anchor, recipient, info, context, update_set, rng,
+        )
     }
 
     fn seal_pair_response(
@@ -611,15 +681,226 @@ impl fmt::Debug for PairingInviteAnchor {
     }
 }
 
-/// 只经 Weak 委托同一 transport generation key owner 的 pairing authority。
-/// 它没有 raw sign/key getter，shutdown/reclaim 销毁 owner 后所有入口固定 fail-close。
-pub(crate) struct PairingMachineAuthority {
+/// 可交给 business sealer/key-directory publisher 的最小 MachineData capability。
+/// Clone 只复制 Weak owner 与已经验证的 public anchor/signer，不延长 authenticator 生命周期。
+pub(crate) struct DeviceKeyRecoverySealRequest<'a> {
+    pub(crate) recipient: &'a HpkePublicKey,
+    pub(crate) machine_route: MachineRouteId,
+    pub(crate) device_route: DeviceRouteId,
+    pub(crate) request_route: RequestRouteId,
+    pub(crate) grant_serial: GrantSerial,
+    pub(crate) root_trust_epoch: TrustEpoch,
+    pub(crate) known_revision: KeyDirectoryRevision,
+    pub(crate) update_set: &'a KeyUpdateSetV1,
+}
+
+#[derive(Clone)]
+pub(crate) struct MachineDataAuthority {
     owner: Weak<MachineLinkAuthenticator>,
     anchor: MachinePairingAnchor,
     data_signer: MachineDataSignerBindingV1,
 }
 
+impl MachineDataAuthority {
+    /// 使用 exact Current authorization 携带的 DeviceHPKE 与当前 MachineDataSign
+    /// 生成独立 recovery reply。该 capability 不接触 DeviceReplyTx key/counter。
+    pub(crate) fn seal_device_key_recovery_reply(
+        &self,
+        request: DeviceKeyRecoverySealRequest<'_>,
+    ) -> Result<DeviceKeyRecoveryReplyV1, RemoteTransportError> {
+        if request.machine_route != self.anchor.machine_route
+            || request.root_trust_epoch != self.anchor.trust_epoch
+            || request.update_set.device_route != request.device_route
+        {
+            return Err(pairing_authority_mismatch());
+        }
+        let info = DeviceKeyRecoveryInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            relay_server_id: self.anchor.relay_server_id,
+            machine_route: request.machine_route,
+            device_route: request.device_route,
+            request_route: request.request_route,
+            grant_serial: request.grant_serial,
+            root_trust_epoch: request.root_trust_epoch,
+            known_key_directory_revision: request.known_revision,
+            target_key_directory_revision: request.update_set.key_directory_revision,
+            update_set_sha256: request
+                .update_set
+                .canonical_sha256()
+                .map_err(|_| pairing_authority_mismatch())?,
+            machine_data_signer: self.data_signer.clone(),
+        };
+        let context = OuterContextV1::device_key_recovery(
+            request.machine_route,
+            request.device_route,
+            request.request_route,
+        );
+        info.validate_for_update_set(request.update_set)
+            .map_err(|_| pairing_authority_mismatch())?;
+        info.validate_context(&context)
+            .map_err(|_| pairing_authority_mismatch())?;
+        let owner = self.verified_owner()?;
+        let mut rng = pairing_crypto_rng(|bytes| getrandom::fill(bytes).map_err(|_| ()))?;
+        owner
+            .owner
+            .seal_device_key_recovery_reply(
+                &self.anchor,
+                request.recipient,
+                &info,
+                &context,
+                request.update_set,
+                &mut rng,
+            )
+            .map_err(map_pairing_authority_error)
+    }
+
+    pub(crate) fn sign_key_directory(
+        &self,
+        context: &KeyDirectorySignatureContextV1,
+        directory: KeyDirectoryV1,
+    ) -> Result<KeyDirectoryV1, RemoteTransportError> {
+        let owner = self.verified_owner()?;
+        owner
+            .owner
+            .sign_key_directory(&self.anchor, context, directory)
+            .map_err(map_pairing_authority_error)
+    }
+
+    /// 使用当前 root-certified MachineDataSign 对一个完整 typed KeyUpdate 签名；
+    /// raw key 与任意 preimage 均不离开 authority owner。
+    pub(crate) fn sign_key_update(
+        &self,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        update: KeyUpdateV1,
+    ) -> Result<KeyUpdateV1, RemoteTransportError> {
+        self.validate_key_update_axes(info, context)?;
+        let owner = self.verified_owner()?;
+        owner
+            .owner
+            .sign_key_update(&self.anchor, info, context, update)
+            .map_err(map_pairing_authority_error)
+    }
+
+    pub(crate) fn sign_sealed(
+        &self,
+        unsigned: UnsignedSealedBlobV1,
+        context: &OuterContextV1,
+    ) -> Result<SignedSealedBlobV1, RemoteTransportError> {
+        if !matches!(
+            context.frame_kind,
+            agentdeck_protocol::e2ee::OuterFrameKind::CatalogPublish
+                | agentdeck_protocol::e2ee::OuterFrameKind::ConversationPublish
+                | agentdeck_protocol::e2ee::OuterFrameKind::DirectedReply
+                | agentdeck_protocol::e2ee::OuterFrameKind::KeyUpdate
+        ) || context.machine_route != Some(self.anchor.machine_route)
+        {
+            return Err(pairing_authority_mismatch());
+        }
+        let owner = self.verified_owner()?;
+        owner
+            .owner
+            .sign_sealed(&self.anchor, unsigned, context)
+            .map_err(map_pairing_authority_error)
+    }
+
+    pub(crate) fn seal_key_directory_entry(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        key: &SecretAeadKey,
+    ) -> Result<KeyDirectoryEntry, RemoteTransportError> {
+        self.seal_key_directory_entry_with_entropy_source(recipient, info, context, key, |bytes| {
+            getrandom::fill(bytes).map_err(|_| ())
+        })
+    }
+
+    fn seal_key_directory_entry_with_entropy_source<F>(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        key: &SecretAeadKey,
+        source: F,
+    ) -> Result<KeyDirectoryEntry, RemoteTransportError>
+    where
+        F: FnMut(&mut [u8]) -> Result<(), ()>,
+    {
+        self.validate_key_update_axes(info, context)?;
+        let _owner = self.verified_owner()?;
+        let mut rng = pairing_crypto_rng(source)?;
+        crypto_seal_key_directory_entry(recipient, info, context, key, &mut rng)
+            .map_err(|_| supervisor_failure("remote.transport.pairing_crypto_failed"))
+    }
+
+    #[cfg(test)]
+    fn seal_key_directory_entry_with_rng_for_test<R: agentdeck_crypto::rand_core::CryptoRng>(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        key: &SecretAeadKey,
+        rng: &mut R,
+    ) -> Result<KeyDirectoryEntry, RemoteTransportError> {
+        self.validate_key_update_axes(info, context)?;
+        let _owner = self.verified_owner()?;
+        crypto_seal_key_directory_entry(recipient, info, context, key, rng)
+            .map_err(|_| supervisor_failure("remote.transport.pairing_crypto_failed"))
+    }
+
+    fn validate_key_update_axes(
+        &self,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+    ) -> Result<(), RemoteTransportError> {
+        if info.relay_server_id != self.anchor.relay_server_id
+            || info.machine_route != self.anchor.machine_route
+            || info.root_trust_epoch != self.anchor.trust_epoch
+            || context.frame_kind != agentdeck_protocol::e2ee::OuterFrameKind::KeyUpdate
+            || context.machine_route != Some(self.anchor.machine_route)
+            || context.validate().is_err()
+        {
+            return Err(pairing_authority_mismatch());
+        }
+        Ok(())
+    }
+
+    fn verified_owner(&self) -> Result<Arc<MachineLinkAuthenticator>, RemoteTransportError> {
+        let owner = self.owner.upgrade().ok_or(RemoteTransportError::Closed)?;
+        owner
+            .verify_pairing_anchor(&self.anchor)
+            .map_err(map_pairing_authority_error)?;
+        let signer = MachineDataSignerBindingV1::from_certificate(&self.anchor.data_certificate)
+            .map_err(|_| supervisor_failure("remote.transport.pairing_crypto_failed"))?;
+        if signer != self.data_signer {
+            return Err(pairing_authority_mismatch());
+        }
+        Ok(owner)
+    }
+}
+
+impl fmt::Debug for MachineDataAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MachineDataAuthority([REDACTED])")
+    }
+}
+
+/// 只经 Weak 委托同一 transport generation key owner 的 pairing authority。
+/// 它没有 raw sign/key getter，shutdown/reclaim 销毁 owner 后所有入口固定 fail-close。
+pub(crate) struct PairingMachineAuthority {
+    owner: Weak<MachineLinkAuthenticator>,
+    anchor: MachinePairingAnchor,
+    machine_data: MachineDataAuthority,
+}
+
 impl PairingMachineAuthority {
+    pub(crate) fn machine_data_authority(&self) -> MachineDataAuthority {
+        self.machine_data.clone()
+    }
+
     pub(crate) fn invite_anchor(&self) -> Result<PairingInviteAnchor, RemoteTransportError> {
         self.verified_owner()?;
         Ok(PairingInviteAnchor {
@@ -668,7 +949,7 @@ impl PairingMachineAuthority {
                 info,
                 context,
                 request_hash,
-                &self.data_signer,
+                &self.machine_data.data_signer,
                 &mut rng,
             )
             .map_err(map_pairing_authority_error)
@@ -694,7 +975,7 @@ impl PairingMachineAuthority {
                 info,
                 context,
                 request_hash,
-                &self.data_signer,
+                &self.machine_data.data_signer,
                 rng,
             )
             .map_err(map_pairing_authority_error)
@@ -729,11 +1010,25 @@ impl PairingMachineAuthority {
         context: &KeyDirectorySignatureContextV1,
         directory: KeyDirectoryV1,
     ) -> Result<KeyDirectoryV1, RemoteTransportError> {
-        let owner = self.verified_owner()?;
-        owner
-            .owner
-            .sign_key_directory(&self.anchor, context, directory)
-            .map_err(map_pairing_authority_error)
+        self.machine_data.sign_key_directory(context, directory)
+    }
+
+    /// 使用同一 Weak key owner 的当前 MachineDataSign 对 typed sealed blob 签名。
+    /// authority 只接受 protocol type-state 与 canonical context，不暴露 raw key/任意 bytes
+    /// 签名入口；transport shutdown 销毁 owner 后固定返回 `Closed`。
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "compatibility delegation while business sealer composition is pending"
+        )
+    )]
+    pub(crate) fn sign_sealed(
+        &self,
+        unsigned: UnsignedSealedBlobV1,
+        context: &OuterContextV1,
+    ) -> Result<SignedSealedBlobV1, RemoteTransportError> {
+        self.machine_data.sign_sealed(unsigned, context)
     }
 
     /// 使用可失败系统熵把固定 32-byte 对称 key 封装为 typed directory entry。
@@ -745,11 +1040,11 @@ impl PairingMachineAuthority {
         context: &OuterContextV1,
         key: &SecretAeadKey,
     ) -> Result<KeyDirectoryEntry, RemoteTransportError> {
-        self.seal_key_directory_entry_with_entropy_source(recipient, info, context, key, |bytes| {
-            getrandom::fill(bytes).map_err(|_| ())
-        })
+        self.machine_data
+            .seal_key_directory_entry(recipient, info, context, key)
     }
 
+    #[cfg(test)]
     fn seal_key_directory_entry_with_entropy_source<F>(
         &self,
         recipient: &HpkePublicKey,
@@ -761,11 +1056,8 @@ impl PairingMachineAuthority {
     where
         F: FnMut(&mut [u8]) -> Result<(), ()>,
     {
-        self.validate_key_update_axes(info)?;
-        let _owner = self.verified_owner()?;
-        let mut rng = pairing_crypto_rng(source)?;
-        crypto_seal_key_directory_entry(recipient, info, context, key, &mut rng)
-            .map_err(|_| supervisor_failure("remote.transport.pairing_crypto_failed"))
+        self.machine_data
+            .seal_key_directory_entry_with_entropy_source(recipient, info, context, key, source)
     }
 
     #[cfg(test)]
@@ -777,20 +1069,8 @@ impl PairingMachineAuthority {
         key: &SecretAeadKey,
         rng: &mut R,
     ) -> Result<KeyDirectoryEntry, RemoteTransportError> {
-        self.validate_key_update_axes(info)?;
-        let _owner = self.verified_owner()?;
-        crypto_seal_key_directory_entry(recipient, info, context, key, rng)
-            .map_err(|_| supervisor_failure("remote.transport.pairing_crypto_failed"))
-    }
-
-    fn validate_key_update_axes(&self, info: &KeyUpdateInfoV1) -> Result<(), RemoteTransportError> {
-        if info.relay_server_id != self.anchor.relay_server_id
-            || info.machine_route != self.anchor.machine_route
-            || info.root_trust_epoch != self.anchor.trust_epoch
-        {
-            return Err(pairing_authority_mismatch());
-        }
-        Ok(())
+        self.machine_data
+            .seal_key_directory_entry_with_rng_for_test(recipient, info, context, key, rng)
     }
 
     /// PairResponse 与 PairPending 共用相同的 fail-close 系统熵边界。
@@ -915,6 +1195,8 @@ pub enum RemoteTransportError {
     PairingLaneUnavailable,
     #[error("business transport lane is unavailable or has already been taken")]
     BusinessLaneUnavailable,
+    #[error("machine publication is offline until the current session authenticates again")]
+    PublicationOffline,
     #[error("exclusive control is pending before pairing activation")]
     PairingActivationBlocked,
     #[error("pairing frame does not match the frozen machine/pair/device/serial binding")]
@@ -927,6 +1209,12 @@ pub enum RemoteTransportError {
     BusinessLagged,
     #[error("business reply belongs to a replaced transport generation")]
     BusinessGenerationReplaced,
+    #[error("publication does not match its exact machine/stream/generation/sequence/blob binding")]
+    PublicationBindingMismatch,
+    #[error("publication pending capacity is exhausted")]
+    PublicationCapacity,
+    #[error("publication ACK is wrong, stale, duplicated, or not pending on this connection")]
+    PublicationAckMismatch,
     #[error("pairing transport generation is exhausted")]
     PairingGenerationExhausted,
     #[error("pairing transport could not obtain cryptographic entropy")]
@@ -949,12 +1237,16 @@ impl RemoteTransportError {
             Self::AuthenticatorStillShared => "remote.transport.authenticator_still_shared",
             Self::PairingLaneUnavailable => "remote.transport.pairing_lane_unavailable",
             Self::BusinessLaneUnavailable => "remote.transport.business_lane_unavailable",
+            Self::PublicationOffline => "remote.transport.publication_offline",
             Self::PairingActivationBlocked => "remote.transport.pairing_activation_blocked",
             Self::PairingBindingMismatch => "remote.transport.pairing_binding_mismatch",
             Self::PairingCapacity => "remote.transport.pairing_capacity",
             Self::PairingLagged => "remote.transport.pairing_lagged",
             Self::BusinessLagged => "remote.transport.business_lagged",
             Self::BusinessGenerationReplaced => "remote.transport.business_generation_replaced",
+            Self::PublicationBindingMismatch => "remote.transport.publication_binding_mismatch",
+            Self::PublicationCapacity => "remote.transport.publication_capacity",
+            Self::PublicationAckMismatch => "remote.transport.publication_ack_mismatch",
             Self::PairingGenerationExhausted => "remote.transport.pairing_generation_exhausted",
             Self::PairingEntropyUnavailable => "remote.transport.pairing_entropy_unavailable",
             Self::SupervisorFailed { code } => code,
@@ -1493,6 +1785,297 @@ fn business_reply_frame(reply: Reply) -> Result<OpaqueRouteFrame, RemoteTranspor
     Ok(frame)
 }
 
+const PUBLICATION_PENDING_CAPACITY: usize = 128;
+const PUBLICATION_COMPLETED_CAPACITY: usize = 512;
+
+/// Relay `Publish` COMMIT 的精确 transport receipt。它不是 local outbox ACK；publisher
+/// 必须先把本 receipt 与 frozen dispatch key 完整匹配，之后才可推进本地状态。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MachinePublicationCommit {
+    pub(crate) connection_generation: u64,
+    pub(crate) stream_route: StreamRouteId,
+    pub(crate) stream_generation: StreamGenerationId,
+    pub(crate) stream_seq: u64,
+    pub(crate) blob_sha256: [u8; 32],
+}
+
+impl fmt::Debug for MachinePublicationCommit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MachinePublicationCommit")
+            .field("connection_generation", &self.connection_generation)
+            .field("stream", &self.stream_route.redacted())
+            .field("stream_generation", &self.stream_generation.redacted())
+            .field("stream_seq", &self.stream_seq)
+            .field("blob_sha256", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Publication transport 的三态结果。只有 `Committed` 表示匹配 ACK 已从同一连接读回；
+/// `OutcomeUnknown` 必须复用 durable exact blob，`Offline` 表示本次未进入可写连接。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MachinePublicationOutcome {
+    Committed(MachinePublicationCommit),
+    OutcomeUnknown,
+    Offline,
+}
+
+impl fmt::Debug for MachinePublicationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Committed(commit) => formatter.debug_tuple("Committed").field(commit).finish(),
+            Self::OutcomeUnknown => formatter.write_str("OutcomeUnknown"),
+            Self::Offline => formatter.write_str("Offline"),
+        }
+    }
+}
+
+struct PreparedMachinePublication {
+    registration: RegisterStream,
+    publish: Publish,
+    exact_blob: Arc<[u8]>,
+    blob_sha256: [u8; 32],
+}
+
+fn prepare_machine_publication(
+    machine_route: MachineRouteId,
+    stream_route: StreamRouteId,
+    stream_generation: StreamGenerationId,
+    stream_seq: u64,
+    exact_blob: Arc<[u8]>,
+    blob_sha256: [u8; 32],
+) -> Result<PreparedMachinePublication, RemoteTransportError> {
+    if machine_route.as_bytes() == &[0; 16]
+        || stream_route.as_bytes() == &[0; 16]
+        || stream_generation.as_bytes() == &[0; 16]
+        || stream_seq == u64::MAX
+        || sha256(exact_blob.as_ref()) != blob_sha256
+        || SignedSealedBlobV1::from_wire_bytes(exact_blob.as_ref()).is_err()
+    {
+        return Err(RemoteTransportError::PublicationBindingMismatch);
+    }
+    let registration = RegisterStream {
+        machine_route,
+        stream_route,
+        generation: stream_generation,
+    };
+    let publish = Publish {
+        stream_route,
+        generation: stream_generation,
+        stream_seq,
+        sealed_blob: SealedBlob(exact_blob.to_vec()),
+    };
+    for body in [
+        RelayFrameBody::RegisterStream(registration.clone()),
+        RelayFrameBody::Publish(publish.clone()),
+    ] {
+        if encode(&OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body,
+        })
+        .len()
+            > MAX_FRAME_BYTES
+        {
+            return Err(RemoteTransportError::Client(RelayClientError::Failure {
+                code: "relay.client.frame_too_large".to_owned(),
+            }));
+        }
+    }
+    Ok(PreparedMachinePublication {
+        registration,
+        publish,
+        exact_blob,
+        blob_sha256,
+    })
+}
+
+/// 可交给 durable publisher 的窄 handle。它只能在已经领取的 business lane 上发送
+/// `RegisterStream`/`Publish`，复用现有 command channel，不能 connect 第二个 RelayClient。
+#[derive(Clone)]
+pub(crate) struct MachinePublicationHandle {
+    machine_route: MachineRouteId,
+    command_tx: mpsc::Sender<SupervisorCommand>,
+    connection_generation: Arc<AtomicU64>,
+    authenticated_generation_rx: watch::Receiver<u64>,
+    enabled: Arc<AtomicBool>,
+    activation_epoch: Arc<AtomicU64>,
+    admitted_activation_epoch: u64,
+}
+
+/// 已领取 business activation 的窄 reconnect 观察者。旧 activation 被 restore/drop
+/// 后即使同一 supervisor 后续再次认证，也不能唤醒旧 publication/transition owner。
+pub(crate) struct AuthenticatedBusinessReconnects {
+    generation_rx: watch::Receiver<u64>,
+    observed_generation: u64,
+    enabled: Arc<AtomicBool>,
+    activation_epoch: Arc<AtomicU64>,
+    admitted_activation_epoch: u64,
+}
+
+impl AuthenticatedBusinessReconnects {
+    pub(crate) fn mark_attempt_baseline(&mut self) -> Result<u64, RemoteTransportError> {
+        self.check_activation()?;
+        let current = *self.generation_rx.borrow_and_update();
+        self.observed_generation = current;
+        Ok(current)
+    }
+
+    pub(crate) async fn changed(&mut self) -> Result<u64, RemoteTransportError> {
+        loop {
+            self.check_activation()?;
+            self.generation_rx
+                .changed()
+                .await
+                .map_err(|_| RemoteTransportError::Closed)?;
+            self.check_activation()?;
+            let current = *self.generation_rx.borrow_and_update();
+            if current > self.observed_generation {
+                self.observed_generation = current;
+                return Ok(current);
+            }
+        }
+    }
+
+    fn check_activation(&self) -> Result<(), RemoteTransportError> {
+        if !self.enabled.load(Ordering::Acquire)
+            || self.activation_epoch.load(Ordering::Acquire) != self.admitted_activation_epoch
+        {
+            return Err(RemoteTransportError::BusinessLaneUnavailable);
+        }
+        Ok(())
+    }
+}
+
+impl MachinePublicationHandle {
+    pub(crate) fn current_connection_generation(&self) -> u64 {
+        self.connection_generation.load(Ordering::Acquire)
+    }
+
+    /// 只由同一 supervisor 完成 authenticated reconnect 后递增。克隆 receiver 不会
+    /// 消费唯一 business event lane，可供 RemoteLink 启动前的 durable owner 停车等待。
+    pub(crate) fn subscribe_authenticated_reconnects(&self) -> AuthenticatedBusinessReconnects {
+        let mut generation_rx = self.authenticated_generation_rx.clone();
+        let observed_generation = self.current_connection_generation();
+        let _ = *generation_rx.borrow_and_update();
+        AuthenticatedBusinessReconnects {
+            generation_rx,
+            observed_generation,
+            enabled: Arc::clone(&self.enabled),
+            activation_epoch: Arc::clone(&self.activation_epoch),
+            admitted_activation_epoch: self.admitted_activation_epoch,
+        }
+    }
+
+    /// 每次 retry 都先发送完全相同的幂等 `RegisterStream`，再发送 frozen exact `Publish`。
+    /// Register 的 writer flush 绝不返回 `Committed`；只有 supervisor 读回匹配
+    /// `AcceptedRef::StreamFrame` 才完成本 future。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "focused transport contract；production adapter 使用 generation-bound 入口"
+        )
+    )]
+    pub(crate) async fn publish_exact(
+        &self,
+        stream_route: StreamRouteId,
+        stream_generation: StreamGenerationId,
+        stream_seq: u64,
+        exact_blob: Arc<[u8]>,
+        blob_sha256: [u8; 32],
+    ) -> Result<MachinePublicationOutcome, RemoteTransportError> {
+        let expected_connection_generation = self.current_connection_generation();
+        self.publish_exact_for_generation(
+            expected_connection_generation,
+            stream_route,
+            stream_generation,
+            stream_seq,
+            exact_blob,
+            blob_sha256,
+        )
+        .await
+    }
+
+    pub(crate) async fn publish_exact_for_generation(
+        &self,
+        expected_connection_generation: u64,
+        stream_route: StreamRouteId,
+        stream_generation: StreamGenerationId,
+        stream_seq: u64,
+        exact_blob: Arc<[u8]>,
+        blob_sha256: [u8; 32],
+    ) -> Result<MachinePublicationOutcome, RemoteTransportError> {
+        if !self.enabled.load(Ordering::Acquire)
+            || self.activation_epoch.load(Ordering::Acquire) != self.admitted_activation_epoch
+        {
+            return Err(RemoteTransportError::BusinessLaneUnavailable);
+        }
+        let prepared = prepare_machine_publication(
+            self.machine_route,
+            stream_route,
+            stream_generation,
+            stream_seq,
+            exact_blob,
+            blob_sha256,
+        )?;
+        let (register_tx, register_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(SupervisorCommand::RegisterStream {
+                expected_connection_generation,
+                expected_activation_epoch: self.admitted_activation_epoch,
+                registration: prepared.registration,
+                response: register_tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(RemoteTransportError::Closed);
+        }
+        match register_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(RemoteTransportError::PublicationOffline)) => {
+                return Ok(MachinePublicationOutcome::Offline);
+            }
+            Ok(Err(RemoteTransportError::BusinessGenerationReplaced)) => {
+                return Ok(MachinePublicationOutcome::OutcomeUnknown);
+            }
+            Ok(Err(RemoteTransportError::Client(_))) => {
+                return Ok(MachinePublicationOutcome::OutcomeUnknown);
+            }
+            Err(_) => return Err(RemoteTransportError::Closed),
+            Ok(Err(error)) => return Err(error),
+        }
+
+        let (publish_tx, publish_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(SupervisorCommand::Publish {
+                expected_connection_generation,
+                expected_activation_epoch: self.admitted_activation_epoch,
+                publish: prepared.publish,
+                exact_blob: prepared.exact_blob,
+                blob_sha256: prepared.blob_sha256,
+                response: publish_tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(RemoteTransportError::Closed);
+        }
+        publish_rx
+            .await
+            .unwrap_or(Ok(MachinePublicationOutcome::OutcomeUnknown))
+    }
+}
+
+impl fmt::Debug for MachinePublicationHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MachinePublicationHandle([REDACTED])")
+    }
+}
+
 /// 唯一 MachineLink 上的 typed business ingress。
 ///
 /// `RouteAccepted` 只表示 Relay writer 已接受 request route，不是业务内核回执。
@@ -1518,7 +2101,6 @@ impl fmt::Debug for BusinessTransportEvent {
     }
 }
 
-#[allow(dead_code)] // 下一内部子片由 RemoteLink actor 消费 bounded signal。
 struct BusinessTransportSignal {
     generation: u64,
     event: BusinessTransportEvent,
@@ -1529,8 +2111,8 @@ struct BusinessTransportSignal {
 ///
 /// lane 只持有唯一 supervisor 的 typed command handle 与 bounded event receiver；不持有
 /// authenticator、start permit、RelayClient、业务内核或 canonical 业务状态。
-#[allow(dead_code)] // 下一内部子片由 RemoteLink composition 领取并驱动。
 pub(crate) struct BusinessTransportLane {
+    machine_route: MachineRouteId,
     command_tx: mpsc::Sender<SupervisorCommand>,
     event_rx: mpsc::Receiver<BusinessTransportSignal>,
     health_rx: watch::Receiver<Option<String>>,
@@ -1538,10 +2120,25 @@ pub(crate) struct BusinessTransportLane {
     generation_rx: watch::Receiver<u64>,
     observed_generation: u64,
     enabled: Arc<AtomicBool>,
+    activation_epoch: Arc<AtomicU64>,
+    admitted_activation_epoch: u64,
 }
 
-#[allow(dead_code)] // 下一内部子片接入 RemoteLink ingress/reply pump。
 impl BusinessTransportLane {
+    /// 派生可 Clone 的窄 publication handle；它仍受唯一 business lane activation 生命周期
+    /// 约束，且只持有同一 supervisor 的 command sender，不具备 connect 能力。
+    pub(crate) fn publication_handle(&self) -> MachinePublicationHandle {
+        MachinePublicationHandle {
+            machine_route: self.machine_route,
+            command_tx: self.command_tx.clone(),
+            connection_generation: Arc::clone(&self.generation),
+            authenticated_generation_rx: self.generation_rx.clone(),
+            enabled: Arc::clone(&self.enabled),
+            activation_epoch: Arc::clone(&self.activation_epoch),
+            admitted_activation_epoch: self.admitted_activation_epoch,
+        }
+    }
+
     /// 发送已经完成 endpoint sealing 的 directed reply；supervisor 的 session `send`
     /// 只有在底层 writer flush 完成后才返回。
     pub(crate) async fn send_reply(
@@ -1554,6 +2151,7 @@ impl BusinessTransportLane {
         self.command_tx
             .send(SupervisorCommand::BusinessReply {
                 expected_generation,
+                expected_activation_epoch: self.admitted_activation_epoch,
                 reply,
                 response: response_tx,
             })
@@ -1898,6 +2496,7 @@ pub struct RemoteTransport {
 
 const CONTROL_CHANNEL_CAPACITY: usize = 8;
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
+const BUSINESS_DEACTIVATION_DEADLINE: Duration = Duration::from_secs(10);
 
 enum SupervisorCommand {
     SendRetirement {
@@ -1908,10 +2507,28 @@ enum SupervisorCommand {
         command: PairingCommand,
         response: oneshot::Sender<Result<(), RemoteTransportError>>,
     },
-    #[allow(dead_code)] // 下一内部子片由 RemoteLink reply pump 构造。
     BusinessReply {
         expected_generation: u64,
+        expected_activation_epoch: u64,
         reply: Reply,
+        response: oneshot::Sender<Result<(), RemoteTransportError>>,
+    },
+    RegisterStream {
+        expected_connection_generation: u64,
+        expected_activation_epoch: u64,
+        registration: RegisterStream,
+        response: oneshot::Sender<Result<(), RemoteTransportError>>,
+    },
+    Publish {
+        expected_connection_generation: u64,
+        expected_activation_epoch: u64,
+        publish: Publish,
+        exact_blob: Arc<[u8]>,
+        blob_sha256: [u8; 32],
+        response: oneshot::Sender<Result<MachinePublicationOutcome, RemoteTransportError>>,
+    },
+    DeactivateBusiness {
+        expected_activation_epoch: u64,
         response: oneshot::Sender<Result<(), RemoteTransportError>>,
     },
     Reconnect {
@@ -1919,13 +2536,160 @@ enum SupervisorCommand {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PublicationAckKey {
+    stream_route: StreamRouteId,
+    stream_seq: u64,
+}
+
+struct PendingPublication {
+    connection_generation: u64,
+    stream_generation: StreamGenerationId,
+    exact_blob: Arc<[u8]>,
+    blob_sha256: [u8; 32],
+    response: oneshot::Sender<Result<MachinePublicationOutcome, RemoteTransportError>>,
+}
+
+#[derive(Default)]
+struct PublicationBindings {
+    pending: HashMap<PublicationAckKey, PendingPublication>,
+    completed: Vec<(u64, PublicationAckKey)>,
+}
+
+impl PublicationBindings {
+    fn validate_outbound(
+        &self,
+        machine_route: MachineRouteId,
+        connection_generation: u64,
+        publish: &Publish,
+        exact_blob: &[u8],
+        blob_sha256: [u8; 32],
+    ) -> Result<(), RemoteTransportError> {
+        let prepared = prepare_machine_publication(
+            machine_route,
+            publish.stream_route,
+            publish.generation,
+            publish.stream_seq,
+            Arc::from(exact_blob),
+            blob_sha256,
+        )?;
+        if prepared.publish != *publish || self.pending.len() >= PUBLICATION_PENDING_CAPACITY {
+            return Err(if self.pending.len() >= PUBLICATION_PENDING_CAPACITY {
+                RemoteTransportError::PublicationCapacity
+            } else {
+                RemoteTransportError::PublicationBindingMismatch
+            });
+        }
+        let key = PublicationAckKey {
+            stream_route: publish.stream_route,
+            stream_seq: publish.stream_seq,
+        };
+        if self.pending.contains_key(&key) || self.completed.contains(&(connection_generation, key))
+        {
+            return Err(RemoteTransportError::PublicationBindingMismatch);
+        }
+        Ok(())
+    }
+
+    fn insert(
+        &mut self,
+        connection_generation: u64,
+        publish: &Publish,
+        exact_blob: Arc<[u8]>,
+        blob_sha256: [u8; 32],
+        response: oneshot::Sender<Result<MachinePublicationOutcome, RemoteTransportError>>,
+    ) {
+        self.pending.insert(
+            PublicationAckKey {
+                stream_route: publish.stream_route,
+                stream_seq: publish.stream_seq,
+            },
+            PendingPublication {
+                connection_generation,
+                stream_generation: publish.generation,
+                exact_blob,
+                blob_sha256,
+                response,
+            },
+        );
+    }
+
+    fn accept(
+        &mut self,
+        connection_generation: u64,
+        accepted: &RouteAccepted,
+    ) -> Result<(), RemoteTransportError> {
+        let AcceptedRef::StreamFrame {
+            stream_route,
+            stream_seq,
+        } = &accepted.accepted
+        else {
+            return Err(RemoteTransportError::PublicationAckMismatch);
+        };
+        let key = PublicationAckKey {
+            stream_route: *stream_route,
+            stream_seq: *stream_seq,
+        };
+        let Some(pending) = self.pending.remove(&key) else {
+            return Err(RemoteTransportError::PublicationAckMismatch);
+        };
+        if pending.connection_generation != connection_generation
+            || sha256(pending.exact_blob.as_ref()) != pending.blob_sha256
+        {
+            let _ = pending
+                .response
+                .send(Ok(MachinePublicationOutcome::OutcomeUnknown));
+            return Err(RemoteTransportError::PublicationAckMismatch);
+        }
+        let commit = MachinePublicationCommit {
+            connection_generation,
+            stream_route: *stream_route,
+            stream_generation: pending.stream_generation,
+            stream_seq: *stream_seq,
+            blob_sha256: pending.blob_sha256,
+        };
+        remember_completed_bounded(
+            &mut self.completed,
+            (connection_generation, key),
+            PUBLICATION_COMPLETED_CAPACITY,
+        );
+        let _ = pending
+            .response
+            .send(Ok(MachinePublicationOutcome::Committed(commit)));
+        Ok(())
+    }
+
+    fn resolve_unknown(&mut self) {
+        for (_, pending) in self.pending.drain() {
+            let _ = pending
+                .response
+                .send(Ok(MachinePublicationOutcome::OutcomeUnknown));
+        }
+    }
+
+    fn replace_connection(&mut self) {
+        self.resolve_unknown();
+        self.completed.clear();
+    }
+}
+
+fn remember_completed_bounded<T: PartialEq>(completed: &mut Vec<T>, value: T, capacity: usize) {
+    if completed.contains(&value) {
+        return;
+    }
+    if completed.len() == capacity {
+        completed.remove(0);
+    }
+    completed.push(value);
+}
+
 struct ControlSupervisor {
     command_tx: mpsc::Sender<SupervisorCommand>,
     control_rx: mpsc::Receiver<Result<Option<RemoteControl>, RemoteTransportError>>,
     retained_control: VecDeque<Result<Option<RemoteControl>, RemoteTransportError>>,
     pairing_transition: Arc<Mutex<PairingTransition>>,
-    #[allow(dead_code)] // 由下一内部子片的 take_business_lane activation 消费。
     business_enabled: Arc<AtomicBool>,
+    business_activation_epoch: Arc<AtomicU64>,
     cancel_tx: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
     health_rx: watch::Receiver<Option<String>>,
@@ -1940,6 +2704,7 @@ struct SupervisorSignals {
     business_tx: mpsc::Sender<BusinessTransportSignal>,
     business_bytes: Arc<Semaphore>,
     business_enabled: Arc<AtomicBool>,
+    business_activation_epoch: Arc<AtomicU64>,
     health: watch::Sender<Option<String>>,
 }
 
@@ -1958,6 +2723,7 @@ impl ControlSupervisor {
             watch::channel(INITIAL_PAIRING_GENERATION);
         let business_bytes = Arc::new(Semaphore::new(BUSINESS_EVENT_BYTES_CAPACITY));
         let business_enabled = Arc::new(AtomicBool::new(false));
+        let business_activation_epoch = Arc::new(AtomicU64::new(0));
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (health_tx, health_rx) = watch::channel(None);
         let task = tokio::spawn(run_control_supervisor(
@@ -1973,6 +2739,7 @@ impl ControlSupervisor {
                 business_tx,
                 business_bytes,
                 business_enabled: Arc::clone(&business_enabled),
+                business_activation_epoch: Arc::clone(&business_activation_epoch),
                 health: health_tx,
             },
             cancel_rx,
@@ -1987,6 +2754,7 @@ impl ControlSupervisor {
             authority_anchor: None,
         };
         let business_lane = BusinessTransportLane {
+            machine_route,
             command_tx: command_tx.clone(),
             event_rx: business_rx,
             health_rx: health_rx.clone(),
@@ -1994,6 +2762,8 @@ impl ControlSupervisor {
             generation_rx: business_generation_rx,
             observed_generation: INITIAL_PAIRING_GENERATION,
             enabled: Arc::clone(&business_enabled),
+            activation_epoch: Arc::clone(&business_activation_epoch),
+            admitted_activation_epoch: 0,
         };
         (
             Self {
@@ -2002,6 +2772,7 @@ impl ControlSupervisor {
                 retained_control: VecDeque::with_capacity(CONTROL_CHANNEL_CAPACITY),
                 pairing_transition,
                 business_enabled,
+                business_activation_epoch,
                 cancel_tx,
                 task: Some(task),
                 health_rx,
@@ -2011,17 +2782,60 @@ impl ControlSupervisor {
         )
     }
 
-    #[allow(dead_code)] // 下一内部子片由 RemoteLink composition 调用。
-    fn activate_business(&self, lane: &BusinessTransportLane) -> Result<(), RemoteTransportError> {
+    fn activate_business(
+        &self,
+        lane: &mut BusinessTransportLane,
+    ) -> Result<(), RemoteTransportError> {
         if !Arc::ptr_eq(&self.business_enabled, &lane.enabled)
-            || self
-                .business_enabled
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
+            || !Arc::ptr_eq(&self.business_activation_epoch, &lane.activation_epoch)
+            || self.business_enabled.load(Ordering::Acquire)
         {
             return Err(RemoteTransportError::BusinessLaneUnavailable);
         }
+        let activation_epoch = self
+            .business_activation_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1).filter(|next| *next != 0)
+            })
+            .map_err(|_| RemoteTransportError::BusinessLaneUnavailable)?
+            + 1;
+        if self
+            .business_enabled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(RemoteTransportError::BusinessLaneUnavailable);
+        }
+        lane.admitted_activation_epoch = activation_epoch;
         Ok(())
+    }
+
+    async fn restore_business(
+        &self,
+        lane: &BusinessTransportLane,
+    ) -> Result<(), RemoteTransportError> {
+        if !Arc::ptr_eq(&self.business_enabled, &lane.enabled)
+            || !Arc::ptr_eq(&self.business_activation_epoch, &lane.activation_epoch)
+            || self.business_activation_epoch.load(Ordering::Acquire)
+                != lane.admitted_activation_epoch
+        {
+            return Err(RemoteTransportError::BusinessLaneUnavailable);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        tokio::time::timeout(BUSINESS_DEACTIVATION_DEADLINE, async {
+            self.command_tx
+                .send(SupervisorCommand::DeactivateBusiness {
+                    expected_activation_epoch: lane.admitted_activation_epoch,
+                    response: response_tx,
+                })
+                .await
+                .map_err(|_| RemoteTransportError::Closed)?;
+            response_rx
+                .await
+                .map_err(|_| RemoteTransportError::Closed)?
+        })
+        .await
+        .map_err(|_| RemoteTransportError::BusinessLaneUnavailable)?
     }
 
     fn failure_code(&self) -> Option<String> {
@@ -2137,12 +2951,14 @@ async fn run_control_supervisor(
         business_tx,
         business_bytes,
         business_enabled,
+        business_activation_epoch,
         health,
     } = signals;
     let mut reader_enabled = true;
     let mut session_shutdown = false;
     let mut pending_control = None;
     let mut pairing_bindings = PairingBindings::default();
+    let mut publication_bindings = PublicationBindings::default();
 
     loop {
         if *cancel_rx.borrow() {
@@ -2204,7 +3020,9 @@ async fn run_control_supervisor(
                             generation: &pairing_generation,
                             business_generation: &business_generation,
                             pairing_bindings: &mut pairing_bindings,
+                            publication_bindings: &mut publication_bindings,
                             business_enabled: &business_enabled,
+                            business_activation_epoch: &business_activation_epoch,
                         },
                     ).await;
                     pending_control = Some(control);
@@ -2275,7 +3093,9 @@ async fn run_control_supervisor(
                             generation: &pairing_generation,
                             business_generation: &business_generation,
                             pairing_bindings: &mut pairing_bindings,
+                            publication_bindings: &mut publication_bindings,
                             business_enabled: &business_enabled,
+                            business_activation_epoch: &business_activation_epoch,
                         },
                     ).await;
                 }
@@ -2303,13 +3123,21 @@ async fn run_control_supervisor(
                         generation: &pairing_generation,
                         business_generation: &business_generation,
                         pairing_bindings: &mut pairing_bindings,
+                        publication_bindings: &mut publication_bindings,
                         business_enabled: &business_enabled,
+                        business_activation_epoch: &business_activation_epoch,
                     },
                 ).await;
             }
             received = session.next() => {
                 match received {
-                    Ok(Some(frame)) => match decode_inbound(machine_route, &mut pairing_bindings, frame) {
+                    Ok(Some(frame)) => match decode_inbound(
+                        machine_route,
+                        pairing_generation.load(Ordering::Acquire),
+                        &mut pairing_bindings,
+                        &mut publication_bindings,
+                        frame,
+                    ) {
                         Ok(InboundDispatch::Control(control)) => {
                             replace_pending_control(
                                 &mut pending_control,
@@ -2365,6 +3193,7 @@ async fn run_control_supervisor(
                                 );
                             }
                         }
+                        Ok(InboundDispatch::PublicationCommitted) => {}
                         Ok(InboundDispatch::Shared { control, pairing_failure }) => {
                             let mut control = Some(Ok(Some(control)));
                             let pairing_dispatch = {
@@ -2402,6 +3231,7 @@ async fn run_control_supervisor(
                             }
                         }
                         Err(error) => {
+                            publication_bindings.resolve_unknown();
                             set_supervisor_failure(&health, error.code());
                             reader_enabled = false;
                             session.shutdown().await;
@@ -2414,6 +3244,7 @@ async fn run_control_supervisor(
                         }
                     },
                     Ok(None) => {
+                        publication_bindings.resolve_unknown();
                         set_supervisor_failure(&health, RemoteTransportError::Closed.code());
                         reader_enabled = false;
                         replace_pending_control(
@@ -2423,6 +3254,7 @@ async fn run_control_supervisor(
                         );
                     }
                     Err(error) => {
+                        publication_bindings.resolve_unknown();
                         set_supervisor_failure(&health, error.code());
                         reader_enabled = false;
                         replace_pending_control(
@@ -2439,13 +3271,16 @@ async fn run_control_supervisor(
     if !session_shutdown {
         session.shutdown().await;
     }
+    publication_bindings.resolve_unknown();
 }
 
 struct SupervisorState<'a> {
     generation: &'a AtomicU64,
     business_generation: &'a watch::Sender<u64>,
     pairing_bindings: &'a mut PairingBindings,
+    publication_bindings: &'a mut PublicationBindings,
     business_enabled: &'a AtomicBool,
+    business_activation_epoch: &'a AtomicU64,
 }
 
 async fn handle_supervisor_command(
@@ -2474,6 +3309,7 @@ async fn handle_supervisor_command(
                 .await
                 .map_err(RemoteTransportError::Client);
             if let Err(error) = &result {
+                state.publication_bindings.resolve_unknown();
                 set_supervisor_failure(health, error.code());
                 *reader_enabled = false;
             }
@@ -2510,6 +3346,7 @@ async fn handle_supervisor_command(
             match &result {
                 Ok(()) => *state.pairing_bindings = next_bindings,
                 Err(error) => {
+                    state.publication_bindings.resolve_unknown();
                     set_supervisor_failure(health, error.code());
                     *reader_enabled = false;
                 }
@@ -2518,6 +3355,7 @@ async fn handle_supervisor_command(
         }
         SupervisorCommand::BusinessReply {
             expected_generation,
+            expected_activation_epoch,
             reply,
             response,
         } => {
@@ -2525,7 +3363,10 @@ async fn handle_supervisor_command(
                 let _ = response.send(Err(RemoteTransportError::Closed));
                 return;
             }
-            if !state.business_enabled.load(Ordering::Acquire) {
+            if !state.business_enabled.load(Ordering::Acquire)
+                || state.business_activation_epoch.load(Ordering::Acquire)
+                    != expected_activation_epoch
+            {
                 let _ = response.send(Err(RemoteTransportError::BusinessLaneUnavailable));
                 return;
             }
@@ -2545,16 +3386,145 @@ async fn handle_supervisor_command(
                 .await
                 .map_err(RemoteTransportError::Client);
             if let Err(error) = &result {
+                state.publication_bindings.resolve_unknown();
                 set_supervisor_failure(health, error.code());
                 *reader_enabled = false;
             }
             let _ = response.send(result);
+        }
+        SupervisorCommand::RegisterStream {
+            expected_connection_generation,
+            expected_activation_epoch,
+            registration,
+            response,
+        } => {
+            if !state.business_enabled.load(Ordering::Acquire)
+                || state.business_activation_epoch.load(Ordering::Acquire)
+                    != expected_activation_epoch
+            {
+                let _ = response.send(Err(RemoteTransportError::BusinessLaneUnavailable));
+                return;
+            }
+            if state.generation.load(Ordering::Acquire) != expected_connection_generation {
+                let _ = response.send(Err(RemoteTransportError::BusinessGenerationReplaced));
+                return;
+            }
+            let frame = OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::RegisterStream(registration.clone()),
+            };
+            if registration.machine_route != machine_route
+                || registration.stream_route.as_bytes() == &[0; 16]
+                || registration.generation.as_bytes() == &[0; 16]
+            {
+                let _ = response.send(Err(RemoteTransportError::PublicationBindingMismatch));
+                return;
+            }
+            if encode(&frame).len() > MAX_FRAME_BYTES {
+                let _ = response.send(Err(RemoteTransportError::Client(
+                    RelayClientError::Failure {
+                        code: "relay.client.frame_too_large".to_owned(),
+                    },
+                )));
+                return;
+            }
+            if session_shutdown {
+                let _ = response.send(Err(RemoteTransportError::Closed));
+                return;
+            }
+            if !*reader_enabled {
+                let _ = response.send(Err(RemoteTransportError::PublicationOffline));
+                return;
+            }
+            let result = session
+                .send(frame)
+                .await
+                .map_err(RemoteTransportError::Client);
+            if let Err(error) = &result {
+                state.publication_bindings.resolve_unknown();
+                set_supervisor_failure(health, error.code());
+                *reader_enabled = false;
+            }
+            let _ = response.send(result);
+        }
+        SupervisorCommand::Publish {
+            expected_connection_generation,
+            expected_activation_epoch,
+            publish,
+            exact_blob,
+            blob_sha256,
+            response,
+        } => {
+            if !state.business_enabled.load(Ordering::Acquire)
+                || state.business_activation_epoch.load(Ordering::Acquire)
+                    != expected_activation_epoch
+            {
+                let _ = response.send(Err(RemoteTransportError::BusinessLaneUnavailable));
+                return;
+            }
+            if state.generation.load(Ordering::Acquire) != expected_connection_generation {
+                let _ = response.send(Ok(MachinePublicationOutcome::OutcomeUnknown));
+                return;
+            }
+            if session_shutdown {
+                let _ = response.send(Err(RemoteTransportError::Closed));
+                return;
+            }
+            if !*reader_enabled {
+                let _ = response.send(Ok(MachinePublicationOutcome::Offline));
+                return;
+            }
+            if let Err(error) = state.publication_bindings.validate_outbound(
+                machine_route,
+                expected_connection_generation,
+                &publish,
+                exact_blob.as_ref(),
+                blob_sha256,
+            ) {
+                let _ = response.send(Err(error));
+                return;
+            }
+            let frame = OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::Publish(publish.clone()),
+            };
+            match session.send(frame).await {
+                Ok(()) => state.publication_bindings.insert(
+                    expected_connection_generation,
+                    &publish,
+                    exact_blob,
+                    blob_sha256,
+                    response,
+                ),
+                Err(error) => {
+                    state.publication_bindings.resolve_unknown();
+                    set_supervisor_failure(health, error.code());
+                    *reader_enabled = false;
+                    let _ = response.send(Ok(MachinePublicationOutcome::OutcomeUnknown));
+                }
+            }
+        }
+        SupervisorCommand::DeactivateBusiness {
+            expected_activation_epoch,
+            response,
+        } => {
+            if state.business_activation_epoch.load(Ordering::Acquire) != expected_activation_epoch
+                || state
+                    .business_enabled
+                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                let _ = response.send(Err(RemoteTransportError::BusinessLaneUnavailable));
+                return;
+            }
+            let _ = response.send(Ok(()));
         }
         SupervisorCommand::Reconnect { response } => {
             if session_shutdown {
                 let _ = response.send(Err(RemoteTransportError::Closed));
                 return;
             }
+            state.publication_bindings.replace_connection();
             let next_generation = state
                 .generation
                 .load(Ordering::Acquire)
@@ -2661,6 +3631,7 @@ enum InboundDispatch {
         event: BusinessTransportEvent,
         encoded_len: usize,
     },
+    PublicationCommitted,
     Shared {
         control: RemoteControl,
         pairing_failure: SafeFailure,
@@ -2669,7 +3640,9 @@ enum InboundDispatch {
 
 fn decode_inbound(
     machine_route: MachineRouteId,
+    connection_generation: u64,
     pairing_bindings: &mut PairingBindings,
+    publication_bindings: &mut PublicationBindings,
     frame: OpaqueRouteFrame,
 ) -> Result<InboundDispatch, RemoteTransportError> {
     if frame.version != RELAY_PROTOCOL_VERSION {
@@ -2727,9 +3700,10 @@ fn decode_inbound(
             AcceptedRef::PairFrame { .. } => pairing_bindings
                 .accept_pair_frame(accepted)
                 .map(InboundDispatch::Pairing),
-            AcceptedRef::Request { .. } | AcceptedRef::StreamFrame { .. } => {
-                Err(RemoteTransportError::FrameForbidden)
-            }
+            AcceptedRef::StreamFrame { .. } => publication_bindings
+                .accept(connection_generation, &accepted)
+                .map(|()| InboundDispatch::PublicationCommitted),
+            AcceptedRef::Request { .. } => Err(RemoteTransportError::FrameForbidden),
         },
         RelayFrameBody::PairRouteClosed(closed) => pairing_bindings
             .accept_closed(closed)
@@ -2838,7 +3812,6 @@ impl RemoteTransport {
 
     /// 原子领取唯一 MachineLink supervisor 上的 bounded business lane。
     /// 未领取或 lane drop 后收到业务 frame 都会关闭当前 transport generation。
-    #[allow(dead_code)] // 下一内部子片由 RemoteLink composition 领取。
     pub(crate) fn take_business_lane(
         &mut self,
     ) -> Result<BusinessTransportLane, RemoteTransportError> {
@@ -2848,12 +3821,34 @@ impl RemoteTransport {
             .ok_or(RemoteTransportError::Closed)?;
         let lane = self
             .business_lane
-            .as_ref()
+            .as_mut()
             .ok_or(RemoteTransportError::BusinessLaneUnavailable)?;
         supervisor.activate_business(lane)?;
         self.business_lane
             .take()
             .ok_or(RemoteTransportError::BusinessLaneUnavailable)
+    }
+
+    /// startup 在触达 RemoteLink 前失败且所有派生 owner 已完成 join 后，将唯一
+    /// receiver 归还同一 supervisor。归还同时关闭旧 attempt 的 publication handles；
+    /// 未证明 quiescence 时 manager 绝不能调用本入口。
+    pub(crate) async fn restore_business_lane(
+        &mut self,
+        lane: BusinessTransportLane,
+    ) -> Result<(), RemoteTransportError> {
+        if self.business_lane.is_some()
+            || lane.machine_route != self.machine_route
+            || self.supervisor.is_none()
+        {
+            return Err(RemoteTransportError::BusinessLaneUnavailable);
+        }
+        self.supervisor
+            .as_ref()
+            .ok_or(RemoteTransportError::Closed)?
+            .restore_business(&lane)
+            .await?;
+        self.business_lane = Some(lane);
+        Ok(())
     }
 
     /// 原子取出同一 transport generation 的唯一 pairing lane 与 Weak authority。
@@ -2891,12 +3886,17 @@ impl RemoteTransport {
             .take()
             .ok_or(RemoteTransportError::PairingLaneUnavailable)?;
         lane.authority_anchor = Some(anchor.clone());
+        let machine_data = MachineDataAuthority {
+            owner: owner.clone(),
+            anchor: anchor.clone(),
+            data_signer,
+        };
         Ok(PairingRuntimeParts {
             lane,
             authority: PairingMachineAuthority {
                 owner,
                 anchor,
-                data_signer,
+                machine_data,
             },
         })
     }
@@ -3032,7 +4032,6 @@ impl fmt::Debug for RemoteTransport {
 }
 
 #[cfg(test)]
-#[allow(dead_code)] // link compile-RED fixture consumes flush controls in the next internal slice.
 pub(super) struct RemoteTransportTestHarness {
     incoming_tx: mpsc::Sender<Result<Option<OpaqueRouteFrame>, RelayClientError>>,
     sent: Arc<Mutex<Vec<OpaqueRouteFrame>>>,
@@ -3043,7 +4042,6 @@ pub(super) struct RemoteTransportTestHarness {
 }
 
 #[cfg(test)]
-#[allow(dead_code)] // link compile-RED fixture consumes flush controls in the next internal slice.
 impl RemoteTransportTestHarness {
     pub(super) async fn push_frame(&self, frame: OpaqueRouteFrame) {
         self.incoming_tx
@@ -3193,7 +4191,7 @@ pub(super) fn active_pairing_transport_for_test(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::convert::Infallible;
     use std::sync::Mutex;
@@ -3202,14 +4200,15 @@ mod tests {
     use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
     use agentdeck_crypto::{
         HpkePrivateKey, SecretAeadKey, SignatureBytes, SigningKey, open_key_directory_entry,
-        open_pair_pending, open_pair_response, sign_authentication_transcript, sign_tbs,
-        verify_authentication_transcript, verify_device_authorization, verify_key_directory,
-        verify_tbs,
+        open_pair_pending, open_pair_response, sign_authentication_transcript, sign_key_update,
+        sign_sealed, sign_tbs, verify_authentication_transcript, verify_device_authorization,
+        verify_key_directory, verify_key_update, verify_sealed, verify_tbs,
     };
     use agentdeck_protocol::e2ee::{
         AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
-        E2EE_FORMAT_VERSION, KeyDirectoryEntry, KeyDirectoryV1, KeyId, KeyPurpose, OuterContextV1,
-        OuterFrameKind, PairRequestInfoV1, PairResponseInfoV1, PairResponsePlaintextV1,
+        E2EE_FORMAT_VERSION, KeyDirectoryEntry, KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1,
+        KeyUpdateV1, OuterContextV1, OuterFrameKind, PairRequestInfoV1, PairResponseInfoV1,
+        PairResponsePlaintextV1, UnsignedSealedBlobV1,
     };
     use agentdeck_protocol::relay_v2::frame::{
         AcceptedRef, ClosePairRoute, GrantCommitted, InstallGrant, OpenPairRoute, PairData,
@@ -3231,6 +4230,209 @@ mod tests {
 
     const RELAY: RelayServerId = RelayServerId::from_bytes([0x11; 16]);
     const ROUTE: MachineRouteId = MachineRouteId::from_bytes([0x22; 16]);
+
+    /// 仅为跨模块 composition test 保活 production `MachineDataAuthority` 的 Weak owner。
+    pub(crate) struct MachineDataAuthorityOwnerLease {
+        _owner: Arc<MachineLinkAuthenticator>,
+    }
+
+    struct TransitionAuthorityOwner {
+        anchor: MachinePairingAnchor,
+        data_signing_key: SigningKey,
+    }
+
+    impl MachineLinkOwner for TransitionAuthorityOwner {
+        fn sign_authentication(
+            &self,
+            _relay_server_id: RelayServerId,
+            _machine_route: MachineRouteId,
+            _link_cert: &SignedCertificate,
+            _transcript: &AuthenticationTranscriptV1,
+        ) -> Result<Ed25519Signature, MachineCertificateError> {
+            panic!("transition authority never authenticates a Relay link")
+        }
+
+        fn freeze_retirement(
+            &self,
+            _relay_server_id: RelayServerId,
+            _machine_route: MachineRouteId,
+            _expected_trust_epoch: u64,
+        ) -> Result<FrozenMachineRetirement, MachineRetirementError> {
+            panic!("transition authority never freezes retirement")
+        }
+
+        fn pairing_anchor(
+            &self,
+            relay_server_id: RelayServerId,
+            machine_route: MachineRouteId,
+            data_certificate: &SignedCertificate,
+        ) -> Result<MachinePairingAnchor, MachinePairingError> {
+            if relay_server_id != self.anchor.relay_server_id
+                || machine_route != self.anchor.machine_route
+                || data_certificate != &self.anchor.data_certificate
+            {
+                return Err(MachinePairingError::ContextMismatch);
+            }
+            Ok(self.anchor.clone())
+        }
+
+        fn seal_pair_pending(
+            &self,
+            _recipient: &HpkePublicKey,
+            _info: &PairRequestInfoV1,
+            _context: &OuterContextV1,
+            _request_hash: [u8; 32],
+            _signer: &MachineDataSignerBindingV1,
+            _rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+        ) -> Result<PairingControlEnvelopeV1, MachinePairingError> {
+            panic!("transition authority never seals PairPending")
+        }
+
+        fn sign_relay_grant(
+            &self,
+            _anchor: &MachinePairingAnchor,
+            _grant: RelayGrant,
+        ) -> Result<RelayGrant, MachinePairingError> {
+            panic!("transition authority never signs a RelayGrant")
+        }
+
+        fn sign_device_authorization(
+            &self,
+            _anchor: &MachinePairingAnchor,
+            _grant: &RelayGrant,
+            _authorization: DeviceAuthorizationV1,
+        ) -> Result<DeviceAuthorizationV1, MachinePairingError> {
+            panic!("transition authority never signs a DeviceAuthorization")
+        }
+
+        fn sign_key_directory(
+            &self,
+            _anchor: &MachinePairingAnchor,
+            _context: &KeyDirectorySignatureContextV1,
+            _directory: KeyDirectoryV1,
+        ) -> Result<KeyDirectoryV1, MachinePairingError> {
+            panic!("transition authority never signs a full KeyDirectory")
+        }
+
+        fn sign_key_update(
+            &self,
+            anchor: &MachinePairingAnchor,
+            info: &KeyUpdateInfoV1,
+            context: &OuterContextV1,
+            update: KeyUpdateV1,
+        ) -> Result<KeyUpdateV1, MachinePairingError> {
+            if anchor != &self.anchor {
+                return Err(MachinePairingError::ContextMismatch);
+            }
+            let signer = MachineDataSignerBindingV1::from_certificate(&anchor.data_certificate)
+                .map_err(|_| MachinePairingError::Crypto)?;
+            sign_key_update(&self.data_signing_key, &signer, info, context, update)
+                .map_err(Into::into)
+        }
+
+        fn sign_sealed(
+            &self,
+            anchor: &MachinePairingAnchor,
+            unsigned: UnsignedSealedBlobV1,
+            context: &OuterContextV1,
+        ) -> Result<SignedSealedBlobV1, MachinePairingError> {
+            if anchor != &self.anchor {
+                return Err(MachinePairingError::ContextMismatch);
+            }
+            Ok(sign_sealed(unsigned, &self.data_signing_key, context))
+        }
+
+        fn seal_device_key_recovery_reply(
+            &self,
+            anchor: &MachinePairingAnchor,
+            recipient: &HpkePublicKey,
+            info: &DeviceKeyRecoveryInfoV1,
+            context: &OuterContextV1,
+            update_set: &KeyUpdateSetV1,
+            mut rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+        ) -> Result<DeviceKeyRecoveryReplyV1, MachinePairingError> {
+            if anchor != &self.anchor {
+                return Err(MachinePairingError::ContextMismatch);
+            }
+            let signer = MachineDataSignerBindingV1::from_certificate(&anchor.data_certificate)
+                .map_err(|_| MachinePairingError::Crypto)?;
+            Ok(crypto_seal_device_key_recovery_reply(
+                DeviceKeyRecoverySealAuthority {
+                    device_hpke_public_key: recipient,
+                    machine_data_signing_key: &self.data_signing_key,
+                    signer: &signer,
+                },
+                info,
+                context,
+                update_set,
+                &mut rng,
+            )?)
+        }
+
+        fn seal_pair_response(
+            &self,
+            _anchor: &MachinePairingAnchor,
+            _recipient: &HpkePublicKey,
+            _info: &PairResponseInfoV1,
+            _context: &OuterContextV1,
+            _plaintext: &PairResponsePlaintextV1,
+            _rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+        ) -> Result<PairResponseV1, MachinePairingError> {
+            panic!("transition authority never seals PairResponse")
+        }
+
+        fn sign_device_revocation(
+            &self,
+            _anchor: &MachinePairingAnchor,
+            _revocation: DeviceRevocation,
+        ) -> Result<DeviceRevocation, MachinePairingError> {
+            panic!("transition authority never signs DeviceRevocation")
+        }
+    }
+
+    pub(in crate::remote) fn machine_data_authority_for_transition_test(
+        anchor: MachinePairingAnchor,
+        data_sign_seed: [u8; 32],
+    ) -> (MachineDataAuthority, MachineDataAuthorityOwnerLease) {
+        let data_signing_key = SigningKey::from_seed(&data_sign_seed);
+        assert_eq!(
+            data_signing_key.verifying_key().to_bytes(),
+            anchor.data_certificate.subject_pubkey.0,
+            "test MachineData private key must match the authenticated Store binding"
+        );
+        let relay_server_id = anchor.relay_server_id;
+        let machine_route = anchor.machine_route;
+        let data_certificate = anchor.data_certificate.clone();
+        let owner = TransitionAuthorityOwner {
+            anchor,
+            data_signing_key,
+        };
+        let authenticator = Arc::new(MachineLinkAuthenticator::new(
+            owner,
+            machine_route,
+            data_certificate.clone(),
+        ));
+        *authenticator
+            .authenticated_relay
+            .lock()
+            .expect("bind transition authority Relay") = Some(relay_server_id);
+        let anchor = authenticator
+            .bind_pairing_anchor(&data_certificate)
+            .expect("bind transition authority anchor");
+        let data_signer = MachineDataSignerBindingV1::from_certificate(&data_certificate)
+            .expect("bind transition MachineData signer");
+        let authority = MachineDataAuthority {
+            owner: Arc::downgrade(&authenticator),
+            anchor,
+            data_signer,
+        };
+        (
+            authority,
+            MachineDataAuthorityOwnerLease {
+                _owner: authenticator,
+            },
+        )
+    }
 
     struct DeterministicRng {
         seed: [u8; 32],
@@ -3502,6 +4704,47 @@ mod tests {
             Ok(agentdeck_crypto::sign_key_directory(
                 &data, &signer, context, directory,
             )?)
+        }
+
+        fn sign_key_update(
+            &self,
+            anchor: &MachinePairingAnchor,
+            info: &KeyUpdateInfoV1,
+            context: &OuterContextV1,
+            update: KeyUpdateV1,
+        ) -> Result<KeyUpdateV1, MachinePairingError> {
+            if info.relay_server_id != anchor.relay_server_id
+                || info.machine_route != anchor.machine_route
+                || info.root_trust_epoch != anchor.trust_epoch
+            {
+                return Err(MachinePairingError::ContextMismatch);
+            }
+            let data = SigningKey::from_seed(&[0x33; 32]);
+            let signer = MachineDataSignerBindingV1::from_certificate(&anchor.data_certificate)
+                .map_err(|_| MachinePairingError::Crypto)?;
+            Ok(agentdeck_crypto::sign_key_update(
+                &data, &signer, info, context, update,
+            )?)
+        }
+
+        fn sign_sealed(
+            &self,
+            anchor: &MachinePairingAnchor,
+            unsigned: UnsignedSealedBlobV1,
+            context: &OuterContextV1,
+        ) -> Result<SignedSealedBlobV1, MachinePairingError> {
+            if context.machine_route != Some(anchor.machine_route)
+                || context.relay_protocol_version != RELAY_PROTOCOL_VERSION
+                || context.e2ee_format_version != E2EE_FORMAT_VERSION
+                || context.validate().is_err()
+            {
+                return Err(MachinePairingError::ContextMismatch);
+            }
+            Ok(agentdeck_crypto::sign_sealed(
+                unsigned,
+                &SigningKey::from_seed(&[0x33; 32]),
+                context,
+            ))
         }
 
         fn seal_pair_response(
@@ -3846,6 +5089,696 @@ mod tests {
         OpaqueRouteFrame {
             version: RELAY_PROTOCOL_VERSION,
             body,
+        }
+    }
+
+    fn publication_wire(seed: u8) -> Arc<[u8]> {
+        Arc::from(
+            UnsignedSealedBlobV1::new(
+                KeyId {
+                    purpose: KeyPurpose::Catalog,
+                    epoch: 7,
+                },
+                7,
+                11,
+                [seed; 12],
+                vec![seed.wrapping_add(1); 16],
+            )
+            .attach_signature(Ed25519Signature([seed.wrapping_add(2); 64]))
+            .to_wire_bytes(),
+        )
+    }
+
+    fn publication_context(
+        machine_route: MachineRouteId,
+        stream_route: StreamRouteId,
+        generation: StreamGenerationId,
+        stream_seq: u64,
+    ) -> OuterContextV1 {
+        OuterContextV1 {
+            frame_kind: OuterFrameKind::CatalogPublish,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            machine_route: Some(machine_route),
+            device_route: None,
+            stream_route: Some(stream_route),
+            request_route: None,
+            pair_route: None,
+            stream_generation: Some(generation),
+            stream_cursor: None,
+            stream_seq: Some(stream_seq),
+            message_key_epoch: 7,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_manager_start_can_restore_and_reclaim_the_same_business_lane() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let business = fixture
+            .transport
+            .take_business_lane()
+            .expect("claim business lane for first startup attempt");
+        let stale_publication = business.publication_handle();
+
+        fixture
+            .transport
+            .restore_business_lane(business)
+            .await
+            .expect("joined startup rollback restores its exact lane");
+        let exact_blob = publication_wire(0xb1);
+        assert!(matches!(
+            stale_publication
+                .publish_exact(
+                    StreamRouteId::from_bytes([0xb2; 16]),
+                    StreamGenerationId::from_bytes([0xb3; 16]),
+                    0,
+                    Arc::clone(&exact_blob),
+                    sha256(exact_blob.as_ref()),
+                )
+                .await,
+            Err(RemoteTransportError::BusinessLaneUnavailable)
+        ));
+        assert!(
+            fixture.harness.sent.lock().expect("lock sent").is_empty(),
+            "restored lane must fence handles from the failed startup attempt"
+        );
+
+        let retry_lane = fixture
+            .transport
+            .take_business_lane()
+            .expect("same process can claim a fresh startup attempt");
+        let stale_retry = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stale_publication.publish_exact(
+                StreamRouteId::from_bytes([0xb4; 16]),
+                StreamGenerationId::from_bytes([0xb5; 16]),
+                0,
+                Arc::clone(&exact_blob),
+                sha256(exact_blob.as_ref()),
+            ),
+        )
+        .await;
+        assert!(matches!(
+            stale_retry,
+            Ok(Err(RemoteTransportError::BusinessLaneUnavailable))
+        ));
+        assert!(
+            fixture.harness.sent.lock().expect("lock sent").is_empty(),
+            "a stale publication handle must never revive with a later lane activation"
+        );
+        drop(retry_lane);
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rollback_deactivation_serializes_inflight_publication_before_next_activation() {
+        let (mut transport, _pairing_lane, harness) = active_pairing_transport_for_test(ROUTE);
+        let business = transport
+            .take_business_lane()
+            .expect("claim first activation");
+        let stale_publication = business.publication_handle();
+        let stream_route = StreamRouteId::from_bytes([0xb6; 16]);
+        let generation = StreamGenerationId::from_bytes([0xb7; 16]);
+        let exact_blob = publication_wire(0xb8);
+        let blob_sha256 = sha256(exact_blob.as_ref());
+
+        harness.hold_send_flush();
+        let old_attempt = tokio::spawn({
+            let exact_blob = Arc::clone(&exact_blob);
+            async move {
+                stale_publication
+                    .publish_exact(stream_route, generation, 0, exact_blob, blob_sha256)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while harness.send_started_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old RegisterStream enters the supervisor");
+
+        {
+            let restore = transport.restore_business_lane(business);
+            tokio::pin!(restore);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), restore.as_mut())
+                    .await
+                    .is_err(),
+                "rollback must wait for earlier supervisor sends to quiesce"
+            );
+            harness.release_send_flush();
+            restore
+                .await
+                .expect("serialized deactivation follows the old RegisterStream");
+        }
+
+        let retry_lane = transport
+            .take_business_lane()
+            .expect("claim a distinct retry activation");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), old_attempt)
+                .await
+                .expect("old publication future resolves")
+                .expect("join old publication future"),
+            Err(RemoteTransportError::BusinessLaneUnavailable)
+        ));
+        let sent = harness.sent_frames();
+        assert_eq!(sent.len(), 1, "old Publish must not cross retry activation");
+        assert!(matches!(sent[0].body, RelayFrameBody::RegisterStream(_)));
+
+        drop(retry_lane);
+        transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn publication_handle_uses_same_session_and_waits_for_exact_stream_commit() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let business = fixture
+            .transport
+            .take_business_lane()
+            .expect("take unique business lane");
+        let publisher = business.publication_handle();
+        let stream_route = StreamRouteId::from_bytes([0xc1; 16]);
+        let generation = StreamGenerationId::from_bytes([0xc2; 16]);
+        let exact_blob = publication_wire(0xc3);
+        let blob_sha256 = sha256(exact_blob.as_ref());
+        let publish = tokio::spawn({
+            let publisher = publisher.clone();
+            let exact_blob = Arc::clone(&exact_blob);
+            async move {
+                publisher
+                    .publish_exact(stream_route, generation, 0, exact_blob, blob_sha256)
+                    .await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while fixture.harness.sent.lock().expect("lock sent").len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("register and publish use the existing supervisor");
+        let sent = fixture.harness.sent.lock().expect("lock sent").clone();
+        assert!(matches!(
+            &sent[0].body,
+            RelayFrameBody::RegisterStream(register)
+                if register.machine_route == ROUTE
+                    && register.stream_route == stream_route
+                    && register.generation == generation
+        ));
+        assert!(matches!(
+            &sent[1].body,
+            RelayFrameBody::Publish(frame)
+                if frame.stream_route == stream_route
+                    && frame.generation == generation
+                    && frame.stream_seq == 0
+                    && frame.sealed_blob.0.as_slice() == exact_blob.as_ref()
+        ));
+        assert!(!publish.is_finished(), "writer flush is not Relay COMMIT");
+        assert_eq!(fixture.harness.connects.load(Ordering::SeqCst), 1);
+
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::RouteAccepted(RouteAccepted {
+                accepted: AcceptedRef::StreamFrame {
+                    stream_route,
+                    stream_seq: 0,
+                },
+            })));
+        let outcome = publish
+            .await
+            .expect("join publisher")
+            .expect("valid publish");
+        assert_eq!(
+            outcome,
+            MachinePublicationOutcome::Committed(MachinePublicationCommit {
+                connection_generation: INITIAL_PAIRING_GENERATION,
+                stream_route,
+                stream_generation: generation,
+                stream_seq: 0,
+                blob_sha256,
+            })
+        );
+        assert_eq!(fixture.harness.connects.load(Ordering::SeqCst), 1);
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn max_publication_is_rejected_before_the_existing_session_is_touched() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let business = fixture
+            .transport
+            .take_business_lane()
+            .expect("take unique business lane");
+        let publisher = business.publication_handle();
+        let stream_route = StreamRouteId::from_bytes([0xd1; 16]);
+        let generation = StreamGenerationId::from_bytes([0xd2; 16]);
+        let exact_blob = publication_wire(0xd3);
+        let blob_sha256 = sha256(exact_blob.as_ref());
+        assert!(matches!(
+            publisher
+                .publish_exact(stream_route, generation, u64::MAX, exact_blob, blob_sha256)
+                .await,
+            Err(RemoteTransportError::PublicationBindingMismatch)
+        ));
+        assert!(
+            fixture.harness.sent.lock().expect("lock sent").is_empty(),
+            "MAX must be rejected before RegisterStream or Publish enters the existing session"
+        );
+
+        let publish = tokio::spawn({
+            let publisher = publisher.clone();
+            let exact_blob = publication_wire(0xd4);
+            let blob_sha256 = sha256(exact_blob.as_ref());
+            async move {
+                publisher
+                    .publish_exact(
+                        stream_route,
+                        generation,
+                        u64::MAX - 1,
+                        exact_blob,
+                        blob_sha256,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while fixture.harness.sent.lock().expect("lock sent").len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("MAX - 1 reaches the existing session");
+        assert!(matches!(
+            &fixture.harness.sent.lock().expect("lock sent")[1].body,
+            RelayFrameBody::Publish(frame)
+                if frame.stream_seq == u64::MAX - 1
+        ));
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::RouteAccepted(RouteAccepted {
+                accepted: AcceptedRef::StreamFrame {
+                    stream_route,
+                    stream_seq: u64::MAX - 1,
+                },
+            })));
+        assert!(matches!(
+            publish.await.expect("join MAX - 1 publisher"),
+            Ok(MachinePublicationOutcome::Committed(MachinePublicationCommit {
+                stream_seq,
+                ..
+            })) if stream_seq == u64::MAX - 1
+        ));
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pending_publication_becomes_unknown_on_reconnect_and_exact_retry_can_commit() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let business = fixture
+            .transport
+            .take_business_lane()
+            .expect("take unique business lane");
+        let publisher = business.publication_handle();
+        let stream_route = StreamRouteId::from_bytes([0xc4; 16]);
+        let generation = StreamGenerationId::from_bytes([0xc5; 16]);
+        let exact_blob = publication_wire(0xc6);
+        let blob_sha256 = sha256(exact_blob.as_ref());
+        let first = tokio::spawn({
+            let publisher = publisher.clone();
+            let exact_blob = Arc::clone(&exact_blob);
+            async move {
+                publisher
+                    .publish_exact(stream_route, generation, 4, exact_blob, blob_sha256)
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while fixture.harness.sent.lock().expect("lock sent").len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first publish reaches the existing session");
+
+        fixture
+            .transport
+            .reconnect()
+            .await
+            .expect("same RelayClient reconnects");
+        assert_eq!(
+            first
+                .await
+                .expect("join first publish")
+                .expect("valid publish"),
+            MachinePublicationOutcome::OutcomeUnknown
+        );
+        assert_eq!(fixture.harness.connects.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.harness.reconnects.load(Ordering::SeqCst), 1);
+
+        let retry = tokio::spawn({
+            let publisher = publisher.clone();
+            let exact_blob = Arc::clone(&exact_blob);
+            async move {
+                publisher
+                    .publish_exact(stream_route, generation, 4, exact_blob, blob_sha256)
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while fixture.harness.sent.lock().expect("lock sent").len() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry reuses exact blob on the replacement generation");
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::RouteAccepted(RouteAccepted {
+                accepted: AcceptedRef::StreamFrame {
+                    stream_route,
+                    stream_seq: 4,
+                },
+            })));
+        assert_eq!(
+            retry.await.expect("join retry").expect("valid retry"),
+            MachinePublicationOutcome::Committed(MachinePublicationCommit {
+                connection_generation: INITIAL_PAIRING_GENERATION + 1,
+                stream_route,
+                stream_generation: generation,
+                stream_seq: 4,
+                blob_sha256,
+            })
+        );
+        {
+            let sent = fixture.harness.sent.lock().expect("lock sent");
+            let RelayFrameBody::Publish(first_frame) = &sent[1].body else {
+                panic!("first publish frame");
+            };
+            let RelayFrameBody::Publish(retry_frame) = &sent[3].body else {
+                panic!("retry publish frame");
+            };
+            assert_eq!(first_frame.sealed_blob, retry_frame.sealed_blob);
+        }
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_reconnect_receiver_excludes_history_and_stale_lane_activations() {
+        let (mut transport, _pairing_lane, _harness) = active_pairing_transport_for_test(ROUTE);
+        let business = transport
+            .take_business_lane()
+            .expect("claim reconnect-observation business lane");
+        let publication = business.publication_handle();
+
+        transport
+            .reconnect()
+            .await
+            .expect("establish historical authenticated generation");
+        let mut reconnects = publication.subscribe_authenticated_reconnects();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), reconnects.changed())
+                .await
+                .is_err(),
+            "a generation completed before subscription is only the baseline"
+        );
+
+        reconnects
+            .mark_attempt_baseline()
+            .expect("bind the full-drive attempt to the current activation");
+        transport
+            .reconnect()
+            .await
+            .expect("replace generation after the attempt baseline");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), reconnects.changed())
+                .await
+                .expect("new authenticated generation wakes")
+                .expect("same activation stays valid"),
+            INITIAL_PAIRING_GENERATION + 2
+        );
+
+        transport
+            .restore_business_lane(business)
+            .await
+            .expect("deactivate and restore the unique lane");
+        assert!(matches!(
+            reconnects.changed().await,
+            Err(RemoteTransportError::BusinessLaneUnavailable)
+        ));
+        transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn wrong_and_duplicate_stream_commits_fail_closed() {
+        let mut wrong = connected_fixture(Vec::new(), None).await;
+        let business = wrong
+            .transport
+            .take_business_lane()
+            .expect("take unique business lane");
+        let publisher = business.publication_handle();
+        let retry_publisher = publisher.clone();
+        let stream_route = StreamRouteId::from_bytes([0xc7; 16]);
+        let generation = StreamGenerationId::from_bytes([0xc8; 16]);
+        let exact_blob = publication_wire(0xc9);
+        let blob_sha256 = sha256(exact_blob.as_ref());
+        let pending = tokio::spawn({
+            let publisher = publisher.clone();
+            async move {
+                publisher
+                    .publish_exact(stream_route, generation, 8, exact_blob, blob_sha256)
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while wrong.harness.sent.lock().expect("lock sent").len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending publication is installed");
+        wrong
+            .harness
+            .push_incoming(frame(RelayFrameBody::RouteAccepted(RouteAccepted {
+                accepted: AcceptedRef::StreamFrame {
+                    stream_route,
+                    stream_seq: 9,
+                },
+            })));
+        assert_eq!(
+            pending.await.expect("join pending").expect("valid publish"),
+            MachinePublicationOutcome::OutcomeUnknown
+        );
+        assert_eq!(
+            wrong.transport.observed_failure_code().as_deref(),
+            Some("remote.transport.publication_ack_mismatch")
+        );
+        assert_eq!(wrong.harness.shutdowns.load(Ordering::SeqCst), 1);
+        let retry_blob = publication_wire(0xcb);
+        assert!(matches!(
+            retry_publisher
+                .publish_exact(
+                    stream_route,
+                    generation,
+                    8,
+                    Arc::clone(&retry_blob),
+                    sha256(retry_blob.as_ref()),
+                )
+                .await,
+            Err(RemoteTransportError::Closed)
+        ));
+        wrong.transport.shutdown().await;
+
+        let mut duplicate = connected_fixture(Vec::new(), None).await;
+        let business = duplicate
+            .transport
+            .take_business_lane()
+            .expect("take unique business lane");
+        let publisher = business.publication_handle();
+        let exact_blob = publication_wire(0xca);
+        let blob_sha256 = sha256(exact_blob.as_ref());
+        let committed = tokio::spawn(async move {
+            publisher
+                .publish_exact(stream_route, generation, 10, exact_blob, blob_sha256)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while duplicate.harness.sent.lock().expect("lock sent").len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publication is pending");
+        let accepted = frame(RelayFrameBody::RouteAccepted(RouteAccepted {
+            accepted: AcceptedRef::StreamFrame {
+                stream_route,
+                stream_seq: 10,
+            },
+        }));
+        duplicate.harness.push_incoming(accepted.clone());
+        assert!(matches!(
+            committed
+                .await
+                .expect("join committed")
+                .expect("valid publish"),
+            MachinePublicationOutcome::Committed(_)
+        ));
+        duplicate.harness.push_incoming(accepted);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while duplicate.transport.observed_failure_code().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("duplicate COMMIT fails closed");
+        assert_eq!(
+            duplicate.transport.observed_failure_code().as_deref(),
+            Some("remote.transport.publication_ack_mismatch")
+        );
+        assert_eq!(duplicate.harness.shutdowns.load(Ordering::SeqCst), 1);
+        duplicate.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn machine_data_authority_signs_typed_sealed_blob_and_dies_with_owner() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let PairingRuntimeParts {
+            lane: _lane,
+            authority,
+        } = fixture
+            .transport
+            .take_pairing_runtime(fixture.data_cert.clone())
+            .expect("bind Weak machine data authority");
+        let business_authority = authority.machine_data_authority();
+        let parallel_business_authority = business_authority.clone();
+        let stream_route = StreamRouteId::from_bytes([0xcb; 16]);
+        let generation = StreamGenerationId::from_bytes([0xcc; 16]);
+        let context = publication_context(ROUTE, stream_route, generation, 0);
+        let unsigned = UnsignedSealedBlobV1::new(
+            KeyId {
+                purpose: KeyPurpose::Catalog,
+                epoch: 7,
+            },
+            7,
+            11,
+            [0xcd; 12],
+            vec![0xce; 16],
+        );
+        let pairing_unsigned = unsigned.clone();
+        let business_unsigned = unsigned.clone();
+        let pairing_context = context.clone();
+        let business_context = context.clone();
+        let (pairing_signed, business_signed) = std::thread::scope(|scope| {
+            let pairing = scope.spawn(|| {
+                authority
+                    .sign_sealed(pairing_unsigned, &pairing_context)
+                    .expect("pairing path uses typed MachineDataSign")
+            });
+            let business = scope.spawn(move || {
+                parallel_business_authority
+                    .sign_sealed(business_unsigned, &business_context)
+                    .expect("business sealer uses cloned narrow authority")
+            });
+            (
+                pairing.join().expect("join pairing signer"),
+                business.join().expect("join business signer"),
+            )
+        });
+        for signed in [pairing_signed, business_signed] {
+            verify_sealed(
+                signed,
+                &SigningKey::from_seed(&[0x33; 32]).verifying_key(),
+                &context,
+            )
+            .expect("signature verifies with the certified MachineDataSign key");
+        }
+
+        let mismatch = publication_context(
+            MachineRouteId::from_bytes([0xcf; 16]),
+            stream_route,
+            generation,
+            0,
+        );
+        assert_eq!(
+            business_authority
+                .sign_sealed(unsigned.clone(), &mismatch)
+                .expect_err("cross-machine context must fail")
+                .code(),
+            "remote.transport.pairing_authority_mismatch"
+        );
+        let mut forbidden_kind = context.clone();
+        forbidden_kind.frame_kind = OuterFrameKind::PairPending;
+        assert_eq!(
+            business_authority
+                .sign_sealed(unsigned.clone(), &forbidden_kind)
+                .expect_err("pairing frame kind is outside the narrow data surface")
+                .code(),
+            "remote.transport.pairing_authority_mismatch"
+        );
+
+        fixture.transport.shutdown().await;
+        assert_eq!(
+            authority
+                .sign_sealed(unsigned.clone(), &context)
+                .expect_err("destroyed owner cannot sign")
+                .code(),
+            "remote.transport.closed"
+        );
+        assert_eq!(
+            business_authority
+                .sign_sealed(unsigned, &context)
+                .expect_err("cloned narrow authority dies with the same owner")
+                .code(),
+            "remote.transport.closed"
+        );
+    }
+
+    #[test]
+    fn machine_data_authority_public_surface_is_cloneable_typed_and_narrow() {
+        fn assert_capability<T: Clone + std::marker::Send + Sync>() {}
+        assert_capability::<MachineDataAuthority>();
+
+        let source = include_str!("transport.rs");
+        let implementation = source
+            .split("impl MachineDataAuthority {")
+            .nth(1)
+            .expect("MachineDataAuthority implementation")
+            .split("impl fmt::Debug for MachineDataAuthority")
+            .next()
+            .expect("MachineDataAuthority implementation boundary");
+        let public_methods = implementation
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("pub(crate) fn ")
+                    .and_then(|suffix| suffix.split('(').next())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            public_methods,
+            [
+                "seal_device_key_recovery_reply",
+                "sign_key_directory",
+                "sign_key_update",
+                "sign_sealed",
+                "seal_key_directory_entry"
+            ]
+        );
+        for forbidden in [
+            "sign_relay_grant",
+            "sign_device_authorization",
+            "sign_device_revocation",
+            "root_sign",
+            "raw_sign",
+            "signing_key",
+        ] {
+            assert!(
+                !implementation.contains(forbidden),
+                "forbidden: {forbidden}"
+            );
         }
     }
 
@@ -4976,6 +6909,7 @@ mod tests {
             entries.push(entry);
         }
         let mut unsigned_directory = bootstrap_key_directory(grant.device_route);
+        let catalog_entry = entries[0].clone();
         unsigned_directory.entries = entries;
         let key_directory = runtime
             .authority
@@ -4988,6 +6922,45 @@ mod tests {
             &key_directory,
         )
         .expect("verify MachineData-signed key directory");
+
+        let update_info = KeyUpdateInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_server_id: RELAY,
+            machine_route: grant.machine_route,
+            device_route: grant.device_route,
+            stream_route: None,
+            grant_serial: grant.grant_serial,
+            root_trust_epoch: grant.trust_epoch,
+            key_directory_revision: KeyDirectoryRevision::new(1),
+            key_purpose: KeyPurpose::Catalog,
+            key_epoch: 1,
+        };
+        let signed_update = runtime
+            .authority
+            .machine_data_authority()
+            .sign_key_update(
+                &update_info,
+                &key_update_context,
+                KeyUpdateV1 {
+                    key_directory_revision: KeyDirectoryRevision::new(1),
+                    key_id: catalog_entry.key_id,
+                    device_route: catalog_entry.device_route,
+                    stream_route: catalog_entry.stream_route,
+                    enc: catalog_entry.enc,
+                    wrapped_key: catalog_entry.wrapped_key,
+                    signature: Ed25519Signature([0; 64]),
+                },
+            )
+            .expect("sign typed KeyUpdate with the narrow MachineData authority");
+        verify_key_update(
+            &machine_data.verifying_key(),
+            &signer,
+            &update_info,
+            &key_update_context,
+            &signed_update,
+        )
+        .expect("verify MachineData-signed KeyUpdate");
 
         let response_info = pairing_response_info(pair_route, request_hash, &grant);
         let response_context = pairing_outer_context(OuterFrameKind::PairResponse, pair_route);

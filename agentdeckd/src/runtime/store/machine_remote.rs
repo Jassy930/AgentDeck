@@ -45,24 +45,79 @@ const ROW_METADATA_DOMAIN: &[u8] = b"machine.remote.metadata.v1";
 const ROW_PRIMARY_KEY: &[u8] = b"singleton=1";
 const ROW_COLUMN: &[u8] = b"sealed_state";
 
+/// 仅供全库 grant/auth integrity audit 使用。RetirePending/RelayCommitted 已禁止
+/// 新业务，但 sealed retirement payload 仍保留最后一个 authenticated Active authority，
+/// 必须用它验证尚待 quiescence 后 scrub 的 terminal authorization history。
+/// 业务 admission 继续只调用 `pairing::active_machine`，不能使用本函数放宽生命周期。
+pub(super) fn machine_authority_for_integrity(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+) -> Result<Box<ActiveMachineEnrollmentState>, RuntimeStoreError> {
+    let row = load_authenticated_row(connection, key_bundle, database_id)?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let active = match row.payload {
+        LoadedPayload::Active(active) => active,
+        LoadedPayload::RetirePending(pending) => pending.active,
+        LoadedPayload::RelayCommitted(committed) => committed.pending.active,
+        _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+    };
+    Ok(Box::new(ActiveMachineEnrollmentState {
+        record: row.record,
+        connection: connection_material(active.connection),
+        binding: active.binding.into(),
+        link_cert: active.link_cert,
+        data_cert: active.data_cert,
+        prepare_input_hash: active.prepare_input_hash,
+        response: active.response,
+    }))
+}
+
 /// Trust reset 的临时 Store 栅栏。
 ///
 /// P4.3 coordinator 完成 terminal close/revoke/scrub 前，任何仍有授权力或秘密材料的
 /// v10 remote row 都必须阻止 machine trust lifecycle 前进。无秘密的 pairing receipt
 /// tombstone 刻意不在这里：它只用于防止 pairing ID/route 复用，不具有授权力。
-fn require_remote_security_state_empty(
+fn require_remote_security_state_scrubbed(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
     database_id: [u8; 16],
+    allow_guard_manifest: bool,
 ) -> Result<(), RuntimeStoreError> {
     let ledger = super::sqlite::load_runtime_ledger(connection, key_bundle, database_id)?;
-    let physical: (i64, i64, i64, i64) = connection.query_row(
+    super::publication::validate_integrity(connection, key_bundle, database_id, &ledger)?;
+    super::remote_replay::validate_v11_integrity(connection, key_bundle, database_id, &ledger)?;
+    super::key_transition::validate_v12_integrity(connection, key_bundle, database_id, &ledger)?;
+    super::remote_counter_guard_manifest::validate_v12_integrity(
+        connection,
+        key_bundle,
+        database_id,
+        &ledger,
+    )?;
+    let physical: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = connection.query_row(
         "SELECT (SELECT COUNT(*) FROM remote_pairings),
                 (SELECT COUNT(*) FROM remote_control_outbox),
                 (SELECT COUNT(*) FROM remote_authorization_ledger),
-                (SELECT COUNT(*) FROM remote_key_directory)",
+                (SELECT COUNT(*) FROM remote_key_directory),
+                (SELECT COUNT(*) FROM publication_outbox),
+                (SELECT COUNT(*) FROM remote_replay_states),
+                (SELECT COUNT(*) FROM remote_counter_states),
+                (SELECT COUNT(*) FROM remote_key_transitions),
+                (SELECT COUNT(*) FROM remote_key_update_outbox)",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        },
     )?;
     let ledger_occupied = ledger.remote_pairing_count != 0
         || ledger.remote_pairing_sealed_bytes != 0
@@ -77,11 +132,51 @@ fn require_remote_security_state_empty(
         || ledger.remote_control_outbox_count != 0
         || ledger.remote_control_outbox_pending_count != 0
         || ledger.remote_control_outbox_acknowledged_count != 0
-        || ledger.remote_control_outbox_sealed_bytes != 0;
-    if physical != (0, 0, 0, 0) || ledger_occupied {
+        || ledger.remote_control_outbox_sealed_bytes != 0
+        || ledger.publication_outbox_count != 0
+        || ledger.publication_outbox_bytes != 0
+        || ledger.remote_replay_scope_count != 0
+        || ledger.remote_replay_retired_scope_count != 0
+        || ledger.remote_replay_pin_count != 0
+        || ledger.remote_replay_sealed_bytes != 0
+        || ledger.remote_counter_state_count != 0
+        || ledger.remote_counter_state_sealed_bytes != 0
+        || ledger.remote_key_transition_count != 0
+        || ledger.remote_key_transition_active_count != 0
+        || ledger.remote_key_transition_sealed_bytes != 0
+        || ledger.remote_key_update_outbox_count != 0
+        || ledger.remote_key_update_outbox_sealed_bytes != 0
+        || (!allow_guard_manifest && ledger.remote_counter_guard_manifest_count != 0);
+    let unsafe_streams: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM publication_streams
+         WHERE state <> 'needsSnapshot'
+            OR counter_scope_token IS NOT NULL
+            OR sender_counter_high_water IS NOT NULL
+            OR reserved_high_water IS NOT NULL
+            OR committed_high_water IS NOT NULL
+            OR committed_inner_cursor IS NOT NULL
+            OR last_committed_blob_hash IS NOT NULL
+            OR acknowledged_high_water IS NOT NULL
+            OR acknowledged_inner_cursor IS NOT NULL
+            OR last_acknowledged_blob_hash IS NOT NULL
+            OR last_acknowledged_publication_id IS NOT NULL
+            OR last_acknowledged_request_digest IS NOT NULL
+            OR last_rotation_request_digest IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if physical != (0, 0, 0, 0, 0, 0, 0, 0, 0) || ledger_occupied || unsafe_streams != 0 {
         return Err(RuntimeStoreError::MachineRemoteConflict);
     }
     Ok(())
+}
+
+fn require_remote_security_state_empty(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+) -> Result<(), RuntimeStoreError> {
+    require_remote_security_state_scrubbed(connection, key_bundle, database_id, false)
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -888,6 +983,71 @@ pub(super) fn activate_machine_enrollment(
     })
 }
 
+/// 在调用方现有的 key-rotation transaction 内重封 Active enrollment 的 exact
+/// public identity binding，只允许 directory revision 推进唯一一步。该 helper 不
+/// commit；identity row 与 transition phase 必须由同一外层事务一起推进。
+pub(super) fn advance_active_key_directory_revision_in_transaction(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    expected_machine_route: [u8; 16],
+    expected_binding: &MachineIdentityBinding,
+    to_revision: u64,
+) -> Result<MachineIdentityBinding, RuntimeStoreError> {
+    if expected_machine_route == [0; 16]
+        || expected_binding.key_directory_revision.checked_add(1) != Some(to_revision)
+    {
+        return Err(RuntimeStoreError::MachineRemoteConflict);
+    }
+    let current = load_authenticated_row(transaction, key_bundle, database_id)?
+        .ok_or(RuntimeStoreError::MachineRemoteConflict)?;
+    if current.record.lifecycle != MachineRemoteLifecycle::Active
+        || current.record.machine_route != expected_machine_route
+        || current.record.root_key_id != expected_binding.root_key_id
+        || current.record.root_fingerprint != expected_binding.root_fingerprint
+        || current.record.trust_epoch != expected_binding.trust_epoch
+    {
+        return Err(RuntimeStoreError::MachineRemoteConflict);
+    }
+    let LoadedPayload::Active(active) = current.payload else {
+        return Err(RuntimeStoreError::MachineRemoteConflict);
+    };
+    let persisted_binding: MachineIdentityBinding = active.binding.clone().into();
+    if &persisted_binding != expected_binding {
+        return Err(RuntimeStoreError::MachineRemoteConflict);
+    }
+
+    let mut next_binding = persisted_binding;
+    next_binding.key_directory_revision = to_revision;
+    let next_payload = ActivePayloadV1 {
+        binding: next_binding.clone().into(),
+        ..active
+    };
+    let canonical = encode_payload(&next_payload)?;
+    let sealed_state = seal_payload(key_bundle, database_id, canonical.as_slice())?;
+    let mut next_record = current.record;
+    next_record.sealed_state_bytes = sealed_state.len();
+    let next_token = row_token(key_bundle, database_id, &next_record, None, &sealed_state)?;
+    if update_row(
+        transaction,
+        "active",
+        &current.metadata_token,
+        &next_record,
+        None,
+        &sealed_state,
+        next_token,
+    )? != 1
+    {
+        return Err(RuntimeStoreError::MachineRemoteConflict);
+    }
+    validate_locator_mirror(transaction, &next_record)?;
+    let ledger = super::sqlite::load_runtime_ledger(transaction, key_bundle, database_id)?;
+    if ledger.machine_remote_state_count != 1 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(next_binding)
+}
+
 pub(super) fn prepare_machine_retirement(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
@@ -929,9 +1089,10 @@ pub(super) fn prepare_machine_retirement(
         RemoteTransition {
             previous_lifecycle: MachineRemoteLifecycle::Active,
             reset_kind: MachineTrustResetKind::RootPresent,
-            remote_cleanup: Some(
-                reset_cleanup::RemoteSecurityCleanupMode::RootPresentAfterRevocation,
-            ),
+            require_root_present_ready: true,
+            // RetirePending 只冻结 Relay retirement；P4.5 business owners 此时尚未
+            // 被 manager 证明静默，不能提前 scrub durable state。
+            remote_cleanup: None,
             before_operation: RuntimeStoreOperation::PrepareMachineRetirementBeforeCommit,
             after_operation: RuntimeStoreOperation::PrepareMachineRetirementAfterCommit,
             commit_operation: RuntimeCommitOperation::PrepareMachineRetirement,
@@ -980,6 +1141,7 @@ pub(super) fn record_machine_retirement_terminal(
         RemoteTransition {
             previous_lifecycle: MachineRemoteLifecycle::RetirePending,
             reset_kind: MachineTrustResetKind::RootPresent,
+            require_root_present_ready: false,
             remote_cleanup: None,
             before_operation: RuntimeStoreOperation::RecordMachineRetirementTerminalBeforeCommit,
             after_operation: RuntimeStoreOperation::RecordMachineRetirementTerminalAfterCommit,
@@ -1030,7 +1192,12 @@ pub(super) fn confirm_machine_purge_readback_absent(
         RemoteTransition {
             previous_lifecycle: MachineRemoteLifecycle::RelayCommitted,
             reset_kind: MachineTrustResetKind::RootPresent,
-            remote_cleanup: None,
+            require_root_present_ready: false,
+            // manager 只可在 RemoteLink/transition/publication/pairing owner 全部
+            // stop+join 且 transport 已回收后调用本转换。
+            remote_cleanup: Some(
+                reset_cleanup::RemoteSecurityCleanupMode::RootPresentAfterRevocation,
+            ),
             before_operation: RuntimeStoreOperation::ConfirmMachinePurgeReadbackAbsentBeforeCommit,
             after_operation: RuntimeStoreOperation::ConfirmMachinePurgeReadbackAbsentAfterCommit,
             commit_operation: RuntimeCommitOperation::ConfirmMachinePurgeReadbackAbsent,
@@ -1084,6 +1251,7 @@ pub(super) fn record_root_lost_machine_purge(
         RemoteTransition {
             previous_lifecycle: MachineRemoteLifecycle::Active,
             reset_kind: MachineTrustResetKind::RootLost,
+            require_root_present_ready: false,
             remote_cleanup: Some(
                 reset_cleanup::RemoteSecurityCleanupMode::RootLostAfterPurgeReadback,
             ),
@@ -1109,8 +1277,18 @@ pub(super) fn finalize_machine_local_deletion(
     }
     let current = load_authenticated_row(&state.connection, &state.key_bundle, state.database_id)?
         .ok_or(RuntimeStoreError::MachineRemoteConflict)?;
-    require_remote_security_state_empty(&state.connection, &state.key_bundle, state.database_id)?;
+    require_remote_security_state_scrubbed(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        true,
+    )?;
     if let LoadedPayload::LocalDeleted(payload) = &current.payload {
+        require_remote_security_state_empty(
+            &state.connection,
+            &state.key_bundle,
+            state.database_id,
+        )?;
         if MachineTrustResetKind::from(payload.reset_kind) == expected_reset_kind
             && payload.purge_proof_hash == expected_purge_proof_hash
             && payload.cleanup_witness_hash == cleanup_witness_hash
@@ -1178,6 +1356,24 @@ pub(super) fn finalize_machine_local_deletion(
     let transaction = state
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger =
+        super::sqlite::load_runtime_ledger(&transaction, &state.key_bundle, state.database_id)?;
+    let mut next_ledger = ledger.clone();
+    super::remote_counter_guard_manifest::clear_after_guard_readback(
+        &transaction,
+        &state.key_bundle,
+        state.database_id,
+        &mut next_ledger,
+    )?;
+    if next_ledger != ledger {
+        let _ = super::sqlite::update_runtime_ledger(
+            &transaction,
+            &state.key_bundle,
+            state.database_id,
+            &ledger,
+            &next_ledger,
+        )?;
+    }
     if update_row(
         &transaction,
         "purgeReadbackAbsent",
@@ -1207,6 +1403,7 @@ pub(super) fn finalize_machine_local_deletion(
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
+    require_remote_security_state_empty(&transaction, &state.key_bundle, state.database_id)?;
     config
         .fault_injector
         .before_operation(RuntimeStoreOperation::FinalizeMachineLocalDeletionBeforeCommit)?;

@@ -1,8 +1,9 @@
 //! Machine trust-reset 的确定性 root 签名与 durable orchestration。
 //!
-//! Root-present 固定执行 `RetirePending → RelayCommitted → PurgeReadbackAbsent`；任何
-//! 网络动作之前必须先 durable prepare。Root-lost 只导入 Relay admin portable receipt，
-//! 不建立 transport。本模块不删除本地 DB/Keychain，也不进入 LocalDeleted。
+//! Root-present 先执行 `RetirePending → RelayCommitted`；manager 证明所有业务 owner
+//! quiescence 并回收 transport 后，才调用无 transport 的 confirmation 进入
+//! `PurgeReadbackAbsent`。Root-lost 只导入 Relay admin portable receipt，不建立
+//! transport。本模块不删除本地 DB/Keychain，也不进入 LocalDeleted。
 
 use std::fmt;
 use std::time::Duration;
@@ -22,7 +23,8 @@ use crate::runtime::store::{
     MachineRetirementRequestMaterial, MachineRetirementTerminalMaterial, MachineTrustResetKind,
     PrepareMachineRetirementOutcome, PurgeReadbackAbsentMachineEnrollmentState,
     RecordMachineRetirementTerminalOutcome, RecordRootLostMachinePurgeOutcome,
-    RuntimeCommitOperation, RuntimeStoreError, RuntimeStoreHandle,
+    RelayCommittedMachineEnrollmentState, RuntimeCommitOperation, RuntimeStoreError,
+    RuntimeStoreHandle,
 };
 
 use super::identity::MachineKeyMaterial;
@@ -349,15 +351,22 @@ impl MachineTrustResetWorkflow {
         Self { control_deadline }
     }
 
-    /// 先 durable prepare frozen retirement，再允许 control transport 发送。
-    pub async fn run_root_present(
+    /// 仅推进 root-present retirement 到 durable `RelayCommitted`。
+    ///
+    /// 此窄接口故意不执行本地 purge confirmation：manager 必须先停止并 join
+    /// RemoteLink、transition、publication、pairing owner，回收 transport，随后才能
+    /// 调用 [`Self::confirm_root_present_after_quiescence`] 进入本地 scrub 边界。
+    pub async fn run_root_present_to_relay_committed(
         &self,
         store: &RuntimeStoreHandle,
         frozen: FrozenMachineRetirement,
         transport: &mut RemoteTransport,
-    ) -> Result<Box<PurgeReadbackAbsentMachineEnrollmentState>, MachineTrustResetWorkflowError>
-    {
-        self.run_root_present_with(store, frozen, transport).await
+    ) -> Result<Box<RelayCommittedMachineEnrollmentState>, MachineTrustResetWorkflowError> {
+        validate_frozen_retirement(&frozen)?;
+        let prepared = store.prepare_retirement(frozen.retirement.clone()).await;
+        let state = settle_prepare(store, prepared, &frozen).await?;
+        self.drive_root_present_to_relay_committed(store, state, &frozen, Some(transport))
+            .await
     }
 
     /// Root-lost 只导入 portable Relay admin receipt；本路径没有 transport 参数。
@@ -370,22 +379,20 @@ impl MachineTrustResetWorkflow {
         self.run_root_lost_with(store, receipt).await
     }
 
-    /// 启动恢复只消费 Store 中已经认证的 frozen retirement。`RelayCommitted`
-    /// 不再拨号或等待第二次 readback；仅 `RetirePending` 需要同证书 transport
-    /// 重放 exact request。
-    pub async fn resume_root_present(
+    /// 从 Store 中认证并恢复 exact retirement，但只推进到 `RelayCommitted`。
+    /// `RetirePending` 仍要求同证书 transport；已经 terminal 的状态严格零网络。
+    pub async fn resume_root_present_to_relay_committed(
         &self,
         store: &RuntimeStoreHandle,
         transport: Option<&mut RemoteTransport>,
-    ) -> Result<Box<PurgeReadbackAbsentMachineEnrollmentState>, MachineTrustResetWorkflowError>
-    {
+    ) -> Result<Box<RelayCommittedMachineEnrollmentState>, MachineTrustResetWorkflowError> {
         let state = store
             .load_machine_enrollment_state()
             .await
             .map_err(MachineTrustResetWorkflowError::store)?
             .ok_or_else(MachineTrustResetWorkflowError::state_conflict)?;
         let frozen = frozen_from_durable_root_present(&state)?;
-        self.drive_root_present(
+        self.drive_root_present_to_relay_committed(
             store,
             state,
             &frozen,
@@ -394,6 +401,24 @@ impl MachineTrustResetWorkflow {
         .await
     }
 
+    /// owner quiescence 已由 manager 证明后，消费 authenticated `RelayCommitted`
+    /// terminal 并执行唯一一次本地 purge confirmation。此接口没有 transport 参数，
+    /// 因而不能重新触达 Relay。
+    pub async fn confirm_root_present_after_quiescence(
+        &self,
+        store: &RuntimeStoreHandle,
+    ) -> Result<Box<PurgeReadbackAbsentMachineEnrollmentState>, MachineTrustResetWorkflowError>
+    {
+        let state = store
+            .load_machine_enrollment_state()
+            .await
+            .map_err(MachineTrustResetWorkflowError::store)?
+            .ok_or_else(MachineTrustResetWorkflowError::state_conflict)?;
+        let frozen = frozen_from_durable_root_present(&state)?;
+        self.confirm_root_present(store, state, &frozen).await
+    }
+
+    #[cfg(test)]
     async fn run_root_present_with(
         &self,
         store: &dyn TrustResetStore,
@@ -408,14 +433,40 @@ impl MachineTrustResetWorkflow {
             .await
     }
 
+    #[cfg(test)]
     async fn drive_root_present(
+        &self,
+        store: &dyn TrustResetStore,
+        state: MachineEnrollmentState,
+        frozen: &FrozenMachineRetirement,
+        transport: Option<&mut dyn TrustResetControlTransport>,
+    ) -> Result<Box<PurgeReadbackAbsentMachineEnrollmentState>, MachineTrustResetWorkflowError>
+    {
+        let state = match state {
+            MachineEnrollmentState::PurgeReadbackAbsent(purge) => {
+                validate_root_present_purge(&purge, frozen, None)?;
+                return Ok(purge);
+            }
+            state => state,
+        };
+        let committed = self
+            .drive_root_present_to_relay_committed(store, state, frozen, transport)
+            .await?;
+        self.confirm_root_present(
+            store,
+            MachineEnrollmentState::RelayCommitted(committed),
+            frozen,
+        )
+        .await
+    }
+
+    async fn drive_root_present_to_relay_committed(
         &self,
         store: &dyn TrustResetStore,
         mut state: MachineEnrollmentState,
         frozen: &FrozenMachineRetirement,
         mut transport: Option<&mut dyn TrustResetControlTransport>,
-    ) -> Result<Box<PurgeReadbackAbsentMachineEnrollmentState>, MachineTrustResetWorkflowError>
-    {
+    ) -> Result<Box<RelayCommittedMachineEnrollmentState>, MachineTrustResetWorkflowError> {
         loop {
             state = match state {
                 MachineEnrollmentState::RetirePending(pending) => {
@@ -448,25 +499,53 @@ impl MachineTrustResetWorkflow {
                         &committed.terminal,
                         frozen,
                     )?;
-                    let terminal_bytes = committed.terminal.canonical_frame_bytes.clone();
-                    let terminal_hash = committed.terminal.canonical_frame_hash;
-                    let confirmed = store
-                        .confirm_purge_absent(terminal_bytes.clone(), terminal_hash)
-                        .await;
-                    settle_confirmation(store, confirmed, frozen, &terminal_bytes, terminal_hash)
-                        .await?
+                    return Ok(committed);
                 }
-                MachineEnrollmentState::PurgeReadbackAbsent(purge) => {
-                    validate_root_present_purge(&purge, frozen, None)?;
-                    return Ok(purge);
-                }
-                MachineEnrollmentState::EnrollmentPrepared(_)
+                MachineEnrollmentState::PurgeReadbackAbsent(_)
+                | MachineEnrollmentState::EnrollmentPrepared(_)
                 | MachineEnrollmentState::EnrollmentResponseValidated(_)
                 | MachineEnrollmentState::Active(_)
                 | MachineEnrollmentState::LocalDeleted(_) => {
                     return Err(MachineTrustResetWorkflowError::state_conflict());
                 }
             };
+        }
+    }
+
+    async fn confirm_root_present(
+        &self,
+        store: &dyn TrustResetStore,
+        state: MachineEnrollmentState,
+        frozen: &FrozenMachineRetirement,
+    ) -> Result<Box<PurgeReadbackAbsentMachineEnrollmentState>, MachineTrustResetWorkflowError>
+    {
+        match state {
+            MachineEnrollmentState::RelayCommitted(committed) => {
+                validate_committed(
+                    &committed.record,
+                    &committed.retirement,
+                    &committed.terminal,
+                    frozen,
+                )?;
+                let terminal_bytes = committed.terminal.canonical_frame_bytes.clone();
+                let terminal_hash = committed.terminal.canonical_frame_hash;
+                let confirmed = store
+                    .confirm_purge_absent(terminal_bytes.clone(), terminal_hash)
+                    .await;
+                let state =
+                    settle_confirmation(store, confirmed, frozen, &terminal_bytes, terminal_hash)
+                        .await?;
+                let MachineEnrollmentState::PurgeReadbackAbsent(purge) = state else {
+                    return Err(MachineTrustResetWorkflowError::state_conflict());
+                };
+                validate_root_present_purge(&purge, frozen, None)?;
+                Ok(purge)
+            }
+            MachineEnrollmentState::PurgeReadbackAbsent(purge) => {
+                validate_root_present_purge(&purge, frozen, None)?;
+                Ok(purge)
+            }
+            _ => Err(MachineTrustResetWorkflowError::state_conflict()),
         }
     }
 

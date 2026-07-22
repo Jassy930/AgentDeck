@@ -31,14 +31,19 @@ use super::cipher::{
 use super::schema::{
     EXPECTED_TABLES, EXPECTED_TABLES_V1, EXPECTED_TABLES_V2, EXPECTED_TABLES_V3,
     EXPECTED_TABLES_V4, EXPECTED_TABLES_V5, EXPECTED_TABLES_V6, EXPECTED_TABLES_V7,
-    EXPECTED_TABLES_V8, EXPECTED_TABLES_V9, RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_DDL_V1,
+    EXPECTED_TABLES_V8, EXPECTED_TABLES_V9, EXPECTED_TABLES_V10, EXPECTED_TABLES_V11,
+    EXPECTED_TABLES_V12, EXPECTED_TABLES_V13, RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_DDL_V1,
     RUNTIME_KEY_GENERATION, RUNTIME_MIGRATION_V2, RUNTIME_MIGRATION_V3, RUNTIME_MIGRATION_V4,
     RUNTIME_MIGRATION_V5, RUNTIME_MIGRATION_V6, RUNTIME_MIGRATION_V7, RUNTIME_MIGRATION_V8,
-    RUNTIME_MIGRATION_V9, RUNTIME_MIGRATION_V10, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION,
+    RUNTIME_MIGRATION_V9, RUNTIME_MIGRATION_V10, RUNTIME_MIGRATION_V11, RUNTIME_MIGRATION_V12,
+    RUNTIME_MIGRATION_V13, RUNTIME_MIGRATION_V14, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION,
     RUNTIME_SCHEMA_VERSION_V5, RUNTIME_SCHEMA_VERSION_V6, RUNTIME_SCHEMA_VERSION_V7,
-    RUNTIME_SCHEMA_VERSION_V8, RUNTIME_SCHEMA_VERSION_V9, schema_signature, schema_signature_v1,
-    schema_signature_v2, schema_signature_v3, schema_signature_v4, schema_signature_v5,
-    schema_signature_v6, schema_signature_v7, schema_signature_v8, schema_signature_v9,
+    RUNTIME_SCHEMA_VERSION_V8, RUNTIME_SCHEMA_VERSION_V9, RUNTIME_SCHEMA_VERSION_V10,
+    RUNTIME_SCHEMA_VERSION_V11, RUNTIME_SCHEMA_VERSION_V12, RUNTIME_SCHEMA_VERSION_V13,
+    schema_signature, schema_signature_v1, schema_signature_v2, schema_signature_v3,
+    schema_signature_v4, schema_signature_v5, schema_signature_v6, schema_signature_v7,
+    schema_signature_v8, schema_signature_v9, schema_signature_v10, schema_signature_v11,
+    schema_signature_v12, schema_signature_v13,
 };
 
 const DATABASE_MODE: u32 = 0o600;
@@ -138,6 +143,9 @@ mod migration_tests {
     };
     use crate::runtime::store::cipher::RowAad;
     use crate::runtime::store::identity::{RuntimeId, RuntimeIdKind};
+    use crate::runtime::store::schema::{
+        EXPECTED_TABLES_V14, RUNTIME_SCHEMA_VERSION_V13, RUNTIME_SCHEMA_VERSION_V14,
+    };
     use crate::runtime::store::sequence::{SequenceScope, decode_sequence, encode_sequence};
     use crate::runtime::store::worker::RuntimeStoreHandle;
     use crate::runtime::store::{
@@ -541,6 +549,57 @@ mod migration_tests {
         claude_code_adapter_states: Vec<Vec<u8>>,
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct PublicationByteEvidence {
+        stream_blobs: Vec<Option<Vec<u8>>>,
+        outbox_blobs: Vec<Vec<u8>>,
+    }
+
+    type PopulatedStrictV12Fixture = (
+        CipherEvidence,
+        Vec<(String, Vec<Vec<u8>>)>,
+        PublicationByteEvidence,
+    );
+    type PopulatedStrictV13Fixture = (
+        Vec<Vec<rusqlite::types::Value>>,
+        Vec<(String, Vec<Vec<u8>>)>,
+    );
+
+    fn publication_byte_evidence(connection: &Connection) -> PublicationByteEvidence {
+        let stream_blobs = connection
+            .query_row(
+                "SELECT publication_stream_id, stream_route, generation, counter_scope_token,
+                        last_acknowledged_blob_hash, last_acknowledged_publication_id,
+                        last_acknowledged_request_digest, last_rotation_request_digest,
+                        last_committed_blob_hash, metadata_token
+                 FROM publication_streams",
+                [],
+                |row| {
+                    (0..10)
+                        .map(|index| row.get::<_, Option<Vec<u8>>>(index))
+                        .collect::<Result<Vec<_>, _>>()
+                },
+            )
+            .expect("read publication stream byte evidence");
+        let outbox_blobs = connection
+            .query_row(
+                "SELECT publication_id, publication_stream_id, generation, counter_scope_token,
+                        blob_sha256, metadata_token, sealed_publication
+                 FROM publication_outbox",
+                [],
+                |row| {
+                    (0..7)
+                        .map(|index| row.get::<_, Vec<u8>>(index))
+                        .collect::<Result<Vec<_>, _>>()
+                },
+            )
+            .expect("read publication outbox byte evidence");
+        PublicationByteEvidence {
+            stream_blobs,
+            outbox_blobs,
+        }
+    }
+
     fn collect_blobs(connection: &Connection, sql: &str) -> Vec<Vec<u8>> {
         connection
             .prepare(sql)
@@ -574,10 +633,9 @@ mod migration_tests {
                 .expect("query authenticated evidence columns")
                 .collect::<Result<Vec<_>, _>>()
                 .expect("collect authenticated evidence columns");
-            for column in names
-                .into_iter()
-                .filter(|name| name.contains("token") || name.starts_with("sealed_"))
-            {
+            for column in names.into_iter().filter(|name| {
+                name.contains("token") || name.starts_with("sealed_") && !name.ends_with("_bytes")
+            }) {
                 let escaped_column = column.replace('"', "\"\"");
                 let sql = format!(
                     "SELECT \"{escaped_column}\" FROM \"{escaped_table}\"
@@ -590,6 +648,28 @@ mod migration_tests {
             }
         }
         columns
+    }
+
+    fn key_update_row_evidence(connection: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        connection
+            .prepare(
+                "SELECT operation_id, device_route, grant_serial, database_id,
+                        key_revision, lifecycle, update_hash, canonical_update_bytes,
+                        ack_hash, applied_ack_count, applied_ack_set_hash,
+                        created_at_ms, state_changed_at_ms, sealed_state,
+                        sealed_state_bytes, metadata_token
+                 FROM remote_key_update_outbox
+                 ORDER BY operation_id, device_route, grant_serial",
+            )
+            .expect("prepare exact key-update row evidence")
+            .query_map([], |row| {
+                (0..16)
+                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("query exact key-update row evidence")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect exact key-update row evidence")
     }
 
     fn drop_v10_physical_shape(connection: &Connection) {
@@ -618,6 +698,174 @@ mod migration_tests {
                  ALTER TABLE runtime_meta DROP COLUMN remote_pairing_count;",
             )
             .expect("remove v10-only physical shape");
+    }
+
+    fn drop_v11_physical_shape(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TABLE remote_counter_states;
+                 DROP TABLE remote_replay_states;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_counter_state_sealed_bytes;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_counter_state_count;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_replay_sealed_bytes;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_replay_pin_count;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_replay_retired_scope_count;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_replay_scope_count;",
+            )
+            .expect("remove v11-only physical shape");
+    }
+
+    fn drop_v12_physical_shape(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TABLE remote_key_update_outbox;
+                 DROP TABLE remote_key_transitions;
+                 DROP TABLE remote_counter_guard_manifest;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_key_update_outbox_sealed_bytes;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_key_update_outbox_count;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_key_transition_sealed_bytes;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_key_transition_active_count;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_key_transition_count;
+                 ALTER TABLE runtime_meta DROP COLUMN remote_counter_guard_manifest_count;",
+            )
+            .expect("remove v12-only physical shape");
+    }
+
+    fn ddl_statement<'a>(ddl: &'a str, prefix: &str) -> &'a str {
+        let start = ddl.find(prefix).expect("find frozen DDL statement");
+        let tail = &ddl[start..];
+        let end = tail.find(';').expect("frozen DDL statement terminator") + 1;
+        &tail[..end]
+    }
+
+    /// 测试专用逆向投影：v14 只放宽 key-update outbox 的两个容量 CHECK。
+    /// 复用冻结的 v12/v13 DDL，确保 legacy fixture 不是手写近似 schema。
+    fn rebuild_v14_key_update_shape_as_v13(connection: &Connection) {
+        connection
+            .execute_batch(
+                "ALTER TABLE remote_key_update_outbox
+                     RENAME TO remote_key_update_outbox_v14;
+                 DROP INDEX idx_remote_key_update_recovery;",
+            )
+            .expect("rename current key-update table for strict v13 projection");
+        connection
+            .execute_batch(ddl_statement(
+                RUNTIME_MIGRATION_V12,
+                "CREATE TABLE remote_key_update_outbox (",
+            ))
+            .expect("recreate exact v13 key-update outbox table");
+        connection
+            .execute(
+                "INSERT INTO remote_key_update_outbox (
+                     operation_id, device_route, grant_serial, database_id,
+                     key_revision, lifecycle, update_hash, canonical_update_bytes,
+                     ack_hash, applied_ack_count, applied_ack_set_hash,
+                     created_at_ms, state_changed_at_ms, sealed_state,
+                     sealed_state_bytes, metadata_token
+                 )
+                 SELECT operation_id, device_route, grant_serial, database_id,
+                        key_revision, lifecycle, update_hash, canonical_update_bytes,
+                        ack_hash, applied_ack_count, applied_ack_set_hash,
+                        created_at_ms, state_changed_at_ms, sealed_state,
+                        sealed_state_bytes, metadata_token
+                 FROM remote_key_update_outbox_v14",
+                [],
+            )
+            .expect("copy exact key-update bytes into strict v13 shape");
+        connection
+            .execute_batch("DROP TABLE remote_key_update_outbox_v14;")
+            .expect("drop current key-update projection table");
+        connection
+            .execute_batch(ddl_statement(
+                RUNTIME_MIGRATION_V12,
+                "CREATE INDEX idx_remote_key_update_recovery",
+            ))
+            .expect("recreate exact v13 key-update recovery index");
+    }
+
+    /// 测试专用逆向投影：current v13 与历史 v12 只在 publication-stream CHECK 形态不同。
+    /// 必须复用冻结的 v4-v12 原始 DDL，让 `schema_manifest` 成为严格 legacy-v12 oracle，
+    /// 而不是手写的近似结构。
+    fn rebuild_v13_publication_shape_as_v12(connection: &Connection) {
+        connection
+            .execute_batch(
+                "ALTER TABLE publication_outbox RENAME TO publication_outbox_v13;
+                 ALTER TABLE publication_streams RENAME TO publication_streams_v13;
+                 DROP INDEX idx_publication_pending;
+                 DROP INDEX idx_publication_active_catalog;
+                 DROP INDEX idx_publication_active_conversation;",
+            )
+            .expect("rename current publication tables for strict v12 projection");
+        connection
+            .execute_batch(ddl_statement(
+                RUNTIME_MIGRATION_V4,
+                "CREATE TABLE publication_streams (",
+            ))
+            .expect("recreate exact v12 publication stream table");
+        connection
+            .execute(
+                "INSERT INTO publication_streams (
+                     publication_stream_id, scope, conversation_id, stream_route, generation,
+                     counter_scope_token, sender_counter_high_water, reserved_high_water,
+                     committed_high_water, committed_inner_cursor, acknowledged_high_water,
+                     acknowledged_inner_cursor, last_acknowledged_blob_hash,
+                     last_acknowledged_publication_id, last_acknowledged_request_digest,
+                     last_rotation_request_digest, rotation_serial, last_committed_blob_hash,
+                     state, created_at_ms, updated_at_ms, metadata_token
+                 )
+                 SELECT publication_stream_id, scope, conversation_id, stream_route, generation,
+                        counter_scope_token, sender_counter_high_water, reserved_high_water,
+                        committed_high_water, committed_inner_cursor, acknowledged_high_water,
+                        acknowledged_inner_cursor, last_acknowledged_blob_hash,
+                        last_acknowledged_publication_id, last_acknowledged_request_digest,
+                        last_rotation_request_digest, rotation_serial, last_committed_blob_hash,
+                        state, created_at_ms, updated_at_ms, metadata_token
+                 FROM publication_streams_v13",
+                [],
+            )
+            .expect("copy exact publication stream bytes into strict v12 shape");
+        for prefix in [
+            "CREATE UNIQUE INDEX idx_publication_active_catalog",
+            "CREATE UNIQUE INDEX idx_publication_active_conversation",
+        ] {
+            connection
+                .execute_batch(ddl_statement(RUNTIME_MIGRATION_V4, prefix))
+                .expect("recreate exact v12 publication stream index");
+        }
+        connection
+            .execute_batch(ddl_statement(
+                RUNTIME_MIGRATION_V4,
+                "CREATE TABLE publication_outbox (",
+            ))
+            .expect("recreate exact v12 publication outbox table");
+        connection
+            .execute(
+                "INSERT INTO publication_outbox (
+                     publication_id, publication_stream_id, generation, stream_seq,
+                     counter_scope_token, sender_counter, inner_after_seq, inner_through_seq,
+                     payload_kind, blob_sha256, logical_blob_bytes, created_at_ms,
+                     metadata_token, sealed_publication
+                 )
+                 SELECT publication_id, publication_stream_id, generation, stream_seq,
+                        counter_scope_token, sender_counter, inner_after_seq, inner_through_seq,
+                        payload_kind, blob_sha256, logical_blob_bytes, created_at_ms,
+                        metadata_token, sealed_publication
+                 FROM publication_outbox_v13",
+                [],
+            )
+            .expect("copy exact publication outbox bytes into strict v12 shape");
+        connection
+            .execute_batch(ddl_statement(
+                RUNTIME_MIGRATION_V4,
+                "CREATE INDEX idx_publication_pending",
+            ))
+            .expect("recreate exact v12 publication outbox index");
+        connection
+            .execute_batch(
+                "DROP TABLE publication_outbox_v13;
+                 DROP TABLE publication_streams_v13;",
+            )
+            .expect("drop current publication projection tables");
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -1953,6 +2201,9 @@ mod migration_tests {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("begin exact v8 projection");
+        rebuild_v13_publication_shape_as_v12(&transaction);
+        drop_v12_physical_shape(&transaction);
+        drop_v11_physical_shape(&transaction);
         drop_v10_physical_shape(&transaction);
         transaction
             .execute_batch(
@@ -2035,6 +2286,9 @@ mod migration_tests {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("begin exact v9 projection");
+        rebuild_v13_publication_shape_as_v12(&transaction);
+        drop_v12_physical_shape(&transaction);
+        drop_v11_physical_shape(&transaction);
         drop_v10_physical_shape(&transaction);
         assert_eq!(
             transaction
@@ -2064,6 +2318,387 @@ mod migration_tests {
             authenticated_blob_evidence(&connection)
         };
         (before, authenticated_before)
+    }
+
+    async fn build_strict_v10_fixture(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+    ) -> (CipherEvidence, Vec<(String, Vec<Vec<u8>>)>) {
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(keys, &root.database()).expect("create strict v10 KEK"),
+        )
+        .await
+        .expect("create current fixture for v10 projection");
+        store.shutdown().await.expect("shutdown current v10 source");
+
+        let mut connection =
+            Connection::open(root.database()).expect("open current fixture for v10 projection");
+        let meta = read_meta(&connection)
+            .expect("read current meta for v10 projection")
+            .expect("current meta exists");
+        let storage_kek =
+            load_or_create_storage_kek(keys, &root.database()).expect("reload current fixture KEK");
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &meta.database_id,
+            },
+            &meta.wrapped_key_bundle,
+        )
+        .expect("unwrap current fixture key bundle");
+        let token = runtime_ledger_token_v10(&key_bundle, meta.database_id, &meta.ledger)
+            .expect("authenticate strict v10 ledger");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin exact v10 projection");
+        rebuild_v13_publication_shape_as_v12(&transaction);
+        drop_v12_physical_shape(&transaction);
+        drop_v11_physical_shape(&transaction);
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE runtime_meta
+                     SET schema_version = 10, schema_signature = ?1, metadata_token = ?2
+                     WHERE singleton = 1 AND schema_version = ?3",
+                    params![
+                        &schema_signature_v10()[..],
+                        &token[..],
+                        i64::from(RUNTIME_SCHEMA_VERSION),
+                    ],
+                )
+                .expect("publish authenticated strict v10 meta"),
+            1
+        );
+        transaction.commit().expect("commit exact v10 projection");
+        assert_eq!(
+            schema_manifest(&connection).expect("read strict v10 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V10).expect("build exact v10 manifest")
+        );
+        drop(connection);
+        let before = cipher_evidence(&root.database());
+        let authenticated_before = {
+            let connection =
+                Connection::open(root.database()).expect("open strict v10 authenticated evidence");
+            authenticated_blob_evidence(&connection)
+        };
+        (before, authenticated_before)
+    }
+
+    async fn build_strict_v11_fixture(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+    ) -> (CipherEvidence, Vec<(String, Vec<Vec<u8>>)>) {
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(keys, &root.database()).expect("create strict v11 KEK"),
+        )
+        .await
+        .expect("create current fixture for v11 projection");
+        store.shutdown().await.expect("shutdown current v11 source");
+
+        let mut connection =
+            Connection::open(root.database()).expect("open current fixture for v11 projection");
+        let meta = read_meta(&connection)
+            .expect("read current meta for v11 projection")
+            .expect("current meta exists");
+        let storage_kek =
+            load_or_create_storage_kek(keys, &root.database()).expect("reload current fixture KEK");
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &meta.database_id,
+            },
+            &meta.wrapped_key_bundle,
+        )
+        .expect("unwrap current fixture key bundle");
+        let token = runtime_ledger_token_v11(&key_bundle, meta.database_id, &meta.ledger)
+            .expect("authenticate strict v11 ledger");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin exact v11 projection");
+        rebuild_v13_publication_shape_as_v12(&transaction);
+        drop_v12_physical_shape(&transaction);
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE runtime_meta
+                     SET schema_version = 11, schema_signature = ?1, metadata_token = ?2
+                     WHERE singleton = 1 AND schema_version = ?3",
+                    params![
+                        &schema_signature_v11()[..],
+                        &token[..],
+                        i64::from(RUNTIME_SCHEMA_VERSION),
+                    ],
+                )
+                .expect("publish authenticated strict v11 meta"),
+            1
+        );
+        transaction.commit().expect("commit exact v11 projection");
+        assert_eq!(
+            schema_manifest(&connection).expect("read strict v11 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V11).expect("build exact v11 manifest")
+        );
+        drop(connection);
+        let before = cipher_evidence(&root.database());
+        let authenticated_before = {
+            let connection =
+                Connection::open(root.database()).expect("open strict v11 authenticated evidence");
+            authenticated_blob_evidence(&connection)
+        };
+        (before, authenticated_before)
+    }
+
+    fn build_populated_strict_v13_key_update_fixture(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+    ) -> PopulatedStrictV13Fixture {
+        let config =
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk);
+        let mut state = open(
+            &config,
+            load_or_create_storage_kek(keys, &root.database())
+                .expect("create populated strict v13 KEK"),
+        )
+        .expect("create current source for populated strict v13 projection");
+        let operation_id = [0xD1; 16];
+        let recipient = super::super::key_transition::KeyTransitionRecipient {
+            device_route: [0xD2; 16],
+            grant_serial: 7,
+        };
+        super::super::key_transition::begin_key_transition(
+            &mut state,
+            &config,
+            super::super::key_transition::BeginKeyTransition {
+                operation_id,
+                operation: super::super::key_transition::KeyTransitionOperation::Add,
+                target: super::super::key_transition::KeyTransitionTarget::Device(recipient),
+                from_revision: 6,
+                to_revision: 7,
+                recipients: vec![recipient],
+                replay_retirement: None,
+                created_at_ms: 100,
+            },
+        )
+        .expect("begin populated strict v13 transition");
+        super::super::key_transition::mark_rotated_preparing_updates(
+            &mut state,
+            &config,
+            operation_id,
+            101,
+        )
+        .expect("mark populated strict v13 transition rotated");
+        super::super::key_transition::freeze_key_updates(
+            &mut state,
+            &config,
+            operation_id,
+            vec![super::super::key_transition::FrozenKeyUpdate {
+                recipient,
+                key_revision: 7,
+                canonical_update_set: vec![0xD3; 4_096],
+            }],
+            102,
+        )
+        .expect("freeze populated strict v13 key update");
+        drop(state);
+
+        let mut connection = Connection::open(root.database())
+            .expect("open current source for strict v13 projection");
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable foreign keys for exact v13 inverse projection");
+        let meta = read_meta(&connection)
+            .expect("read current meta for strict v13 projection")
+            .expect("current meta exists for strict v13 projection");
+        let storage_kek = load_or_create_storage_kek(keys, &root.database())
+            .expect("reload populated strict v13 KEK");
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &meta.database_id,
+            },
+            &meta.wrapped_key_bundle,
+        )
+        .expect("unwrap populated strict v13 key bundle");
+        let legacy_token = runtime_ledger_token_v13(&key_bundle, meta.database_id, &meta.ledger)
+            .expect("authenticate populated strict v13 ledger");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin exact populated v13 projection");
+        rebuild_v14_key_update_shape_as_v13(&transaction);
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE runtime_meta
+                     SET schema_version = ?1, schema_signature = ?2, metadata_token = ?3
+                     WHERE singleton = 1 AND schema_version = ?4
+                       AND schema_signature = ?5 AND metadata_token = ?6",
+                    params![
+                        i64::from(RUNTIME_SCHEMA_VERSION_V13),
+                        &schema_signature_v13()[..],
+                        &legacy_token[..],
+                        i64::from(RUNTIME_SCHEMA_VERSION),
+                        &schema_signature()[..],
+                        &meta.metadata_token,
+                    ],
+                )
+                .expect("publish authenticated populated strict v13 meta"),
+            1
+        );
+        transaction
+            .commit()
+            .expect("commit exact populated strict v13 projection");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint populated strict v13 fixture");
+        let legacy = read_and_validate_legacy_v13_schema(&connection)
+            .expect("validate populated strict v13 schema and meta");
+        verify_runtime_ledger_token_v13(&key_bundle, &legacy)
+            .expect("verify populated strict v13 ledger token");
+        super::super::key_transition::validate_v12_integrity(
+            &connection,
+            &key_bundle,
+            legacy.database_id,
+            &legacy.ledger,
+        )
+        .expect("validate populated strict v13 key-transition rows");
+        super::super::journal::validate_store_integrity(
+            &connection,
+            &key_bundle,
+            legacy.database_id,
+        )
+        .expect("validate populated strict v13 authenticated rows");
+        let row_before = key_update_row_evidence(&connection);
+        let authenticated_before = authenticated_blob_evidence(&connection);
+        assert_eq!(row_before.len(), 1);
+        drop(connection);
+        (row_before, authenticated_before)
+    }
+
+    fn build_populated_strict_v12_fixture(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+    ) -> PopulatedStrictV12Fixture {
+        let config =
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk);
+        let mut state = open(
+            &config,
+            load_or_create_storage_kek(keys, &root.database())
+                .expect("create populated strict v12 KEK"),
+        )
+        .expect("create current source for populated strict v12 projection");
+        let publication_stream_id = [0xC1; 16];
+        let generation = [0xC2; 16];
+        super::super::publication::create_publication_stream(
+            &mut state,
+            &config,
+            publication_stream_id,
+            super::super::publication::PublicationScope::Catalog,
+            [0xC3; 16],
+            generation,
+            1,
+        )
+        .expect("create populated strict v12 publication stream");
+        super::super::publication::freeze_publication(
+            &mut state,
+            &config,
+            super::super::publication::FreezePublicationRequest {
+                publication_id: [0xC4; 16],
+                publication_stream_id,
+                generation,
+                counter_scope_token: [0xC5; 32],
+                sender_counter: 1,
+                inner_after: None,
+                inner_through: Some(0),
+                payload_kind: super::super::publication::PublicationPayloadKind::Catalog,
+                blob: vec![0xC6; 96],
+            },
+            2,
+        )
+        .expect("freeze populated strict v12 publication outbox row");
+        drop(state);
+
+        let mut connection = Connection::open(root.database())
+            .expect("open current source for populated strict v12 projection");
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable foreign keys for exact v12 inverse projection");
+        let meta = read_meta(&connection)
+            .expect("read current meta for strict v12 projection")
+            .expect("current meta exists for strict v12 projection");
+        let storage_kek = load_or_create_storage_kek(keys, &root.database())
+            .expect("reload populated strict v12 KEK");
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &meta.database_id,
+            },
+            &meta.wrapped_key_bundle,
+        )
+        .expect("unwrap populated strict v12 key bundle");
+        let legacy_token = runtime_ledger_token_v12(&key_bundle, meta.database_id, &meta.ledger)
+            .expect("authenticate populated strict v12 ledger");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin exact populated v12 projection");
+        rebuild_v14_key_update_shape_as_v13(&transaction);
+        rebuild_v13_publication_shape_as_v12(&transaction);
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE runtime_meta
+                     SET schema_version = ?1, schema_signature = ?2, metadata_token = ?3
+                     WHERE singleton = 1 AND schema_version = ?4
+                       AND schema_signature = ?5 AND metadata_token = ?6",
+                    params![
+                        i64::from(RUNTIME_SCHEMA_VERSION_V12),
+                        &schema_signature_v12()[..],
+                        &legacy_token[..],
+                        i64::from(RUNTIME_SCHEMA_VERSION),
+                        &schema_signature()[..],
+                        &meta.metadata_token,
+                    ],
+                )
+                .expect("publish authenticated populated strict v12 meta"),
+            1
+        );
+        transaction
+            .commit()
+            .expect("commit exact populated strict v12 projection");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint populated strict v12 fixture");
+        assert_eq!(
+            schema_manifest(&connection).expect("read populated strict v12 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V12)
+                .expect("build exact populated v12 manifest")
+        );
+        let legacy = read_and_validate_legacy_v12_schema(&connection)
+            .expect("validate populated strict v12 schema and meta");
+        verify_runtime_ledger_token_v12(&key_bundle, &legacy)
+            .expect("verify populated strict v12 ledger token");
+        super::super::journal::validate_store_integrity(
+            &connection,
+            &key_bundle,
+            legacy.database_id,
+        )
+        .expect("validate populated strict v12 authenticated rows");
+        let publication_before = publication_byte_evidence(&connection);
+        let authenticated_before = authenticated_blob_evidence(&connection);
+        drop(connection);
+        (
+            cipher_evidence(&root.database()),
+            authenticated_before,
+            publication_before,
+        )
     }
 
     async fn build_populated_strict_v5_fixture_with_metadata_mutation(
@@ -2153,6 +2788,9 @@ mod migration_tests {
         .expect("unwrap populated fixture key bundle");
         let v5_token = runtime_ledger_token_v5(&key_bundle, meta.database_id, &meta.ledger)
             .expect("authenticate populated v5 ledger");
+        rebuild_v13_publication_shape_as_v12(&connection);
+        drop_v12_physical_shape(&connection);
+        drop_v11_physical_shape(&connection);
         drop_v10_physical_shape(&connection);
         connection
             .execute(
@@ -2561,7 +3199,7 @@ mod migration_tests {
         let key_bundle = RuntimeKeyBundle::fresh(RUNTIME_KEY_GENERATION).expect("fresh test keys");
         let database_id = [0x49; 16];
         let ledger = RuntimeLedger::default();
-        let baseline_v10 = runtime_ledger_token(&key_bundle, database_id, &ledger)
+        let baseline_v10 = runtime_ledger_token_v10(&key_bundle, database_id, &ledger)
             .expect("authenticate baseline v10 ledger");
         let baseline_v9 = runtime_ledger_token_v9(&key_bundle, database_id, &ledger)
             .expect("authenticate baseline v9 ledger");
@@ -2590,7 +3228,7 @@ mod migration_tests {
         }
         for changed in variants {
             assert_ne!(
-                runtime_ledger_token(&key_bundle, database_id, &changed)
+                runtime_ledger_token_v10(&key_bundle, database_id, &changed)
                     .expect("authenticate changed v10 ledger"),
                 baseline_v10
             );
@@ -2601,6 +3239,89 @@ mod migration_tests {
                 "v9 token must ignore all v10-only remote security totals"
             );
         }
+    }
+
+    #[test]
+    fn v11_ledger_token_authenticates_replay_and_counter_totals_without_changing_v10_domain() {
+        let key_bundle = RuntimeKeyBundle::fresh(RUNTIME_KEY_GENERATION).expect("fresh test keys");
+        let database_id = [0x4a; 16];
+        let ledger = RuntimeLedger::default();
+        let baseline_v11 = runtime_ledger_token_v11(&key_bundle, database_id, &ledger)
+            .expect("authenticate baseline v11 ledger");
+        let baseline_v10 = runtime_ledger_token_v10(&key_bundle, database_id, &ledger)
+            .expect("authenticate baseline v10 ledger");
+        for mutate in [
+            |ledger: &mut RuntimeLedger| ledger.remote_replay_scope_count = 1,
+            |ledger: &mut RuntimeLedger| ledger.remote_replay_retired_scope_count = 1,
+            |ledger: &mut RuntimeLedger| ledger.remote_replay_pin_count = 1,
+            |ledger: &mut RuntimeLedger| ledger.remote_replay_sealed_bytes = 40,
+            |ledger: &mut RuntimeLedger| ledger.remote_counter_state_count = 1,
+            |ledger: &mut RuntimeLedger| ledger.remote_counter_state_sealed_bytes = 40,
+        ] {
+            let mut changed = ledger.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                runtime_ledger_token_v11(&key_bundle, database_id, &changed)
+                    .expect("authenticate changed v11 ledger"),
+                baseline_v11
+            );
+            assert_eq!(
+                runtime_ledger_token_v10(&key_bundle, database_id, &changed)
+                    .expect("authenticate legacy v10 projection"),
+                baseline_v10,
+                "v10 token must ignore all v11-only replay/counter totals"
+            );
+        }
+    }
+
+    #[test]
+    fn v12_ledger_token_authenticates_key_transition_totals_without_changing_v11_domain() {
+        let key_bundle = RuntimeKeyBundle::fresh(RUNTIME_KEY_GENERATION).expect("fresh test keys");
+        let database_id = [0x4b; 16];
+        let ledger = RuntimeLedger::default();
+        let baseline_v12 = runtime_ledger_token_v12(&key_bundle, database_id, &ledger)
+            .expect("authenticate baseline v12 ledger");
+        let baseline_v11 = runtime_ledger_token_v11(&key_bundle, database_id, &ledger)
+            .expect("authenticate baseline v11 ledger");
+        for mutate in [
+            |ledger: &mut RuntimeLedger| ledger.remote_counter_guard_manifest_count = 1,
+            |ledger: &mut RuntimeLedger| ledger.remote_key_transition_count = 1,
+            |ledger: &mut RuntimeLedger| ledger.remote_key_transition_active_count = 1,
+            |ledger: &mut RuntimeLedger| ledger.remote_key_transition_sealed_bytes = 40,
+            |ledger: &mut RuntimeLedger| ledger.remote_key_update_outbox_count = 1,
+            |ledger: &mut RuntimeLedger| ledger.remote_key_update_outbox_sealed_bytes = 40,
+        ] {
+            let mut changed = ledger.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                runtime_ledger_token_v12(&key_bundle, database_id, &changed)
+                    .expect("authenticate changed v12 ledger"),
+                baseline_v12
+            );
+            assert_eq!(
+                runtime_ledger_token_v11(&key_bundle, database_id, &changed)
+                    .expect("authenticate legacy v11 projection"),
+                baseline_v11,
+                "v11 token must ignore all v12-only key-transition totals"
+            );
+        }
+    }
+
+    #[test]
+    fn v12_v13_v14_ledger_tokens_rotate_domain_without_changing_projection() {
+        let key_bundle = RuntimeKeyBundle::fresh(RUNTIME_KEY_GENERATION).expect("fresh test keys");
+        let database_id = [0x4c; 16];
+        let ledger = RuntimeLedger::default();
+        let token_v12 = runtime_ledger_token_v12(&key_bundle, database_id, &ledger)
+            .expect("authenticate v12 ledger");
+        let token_v13 = runtime_ledger_token_v13(&key_bundle, database_id, &ledger)
+            .expect("authenticate v13 ledger");
+        let token_v14 = runtime_ledger_token(&key_bundle, database_id, &ledger)
+            .expect("authenticate v14 ledger");
+
+        assert_ne!(token_v12, token_v13);
+        assert_ne!(token_v12, token_v14);
+        assert_ne!(token_v13, token_v14);
     }
 
     #[tokio::test]
@@ -2904,24 +3625,466 @@ mod migration_tests {
     }
 
     #[tokio::test]
-    async fn fresh_v10_has_exact_empty_remote_security_manifest_and_reopens_without_migration() {
-        let root = TestRoot::new("v10-fresh-remote-security-manifest");
+    async fn strict_v11_migrates_to_v12_without_rewrapping_or_reencrypting_existing_rows() {
+        let root = TestRoot::new("strict-v11-to-v12");
+        let keys = MemoryKeyStore::new();
+        let (before, authenticated_before) = build_strict_v11_fixture(&root, &keys).await;
+
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload strict v11 KEK"),
+        )
+        .await
+        .expect("migrate strict v11 fixture to v12");
+        let snapshot = store.inspect().await.expect("inspect migrated v12 store");
+        assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION);
+        assert_eq!(snapshot.table_names, EXPECTED_TABLES);
+        store.shutdown().await.expect("shutdown migrated v12 store");
+
+        assert_eq!(
+            cipher_evidence(&root.database()),
+            before,
+            "v11 to v12 must preserve wrapped keys and existing ciphertext byte-exact"
+        );
+        let connection = Connection::open(root.database()).expect("inspect v11-to-v12 database");
+        assert_eq!(
+            authenticated_blob_evidence(&connection),
+            authenticated_before,
+            "v11 to v12 must preserve every existing non-meta token and ciphertext byte-exact"
+        );
+        assert_eq!(
+            schema_manifest(&connection).expect("read migrated v12 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v12 manifest")
+        );
+        let meta = read_meta(&connection)
+            .expect("read migrated v12 meta")
+            .expect("migrated v12 meta exists");
+        assert_eq!(
+            [
+                meta.ledger.remote_key_transition_count,
+                meta.ledger.remote_key_transition_active_count,
+                meta.ledger.remote_key_transition_sealed_bytes,
+                meta.ledger.remote_key_update_outbox_count,
+                meta.ledger.remote_key_update_outbox_sealed_bytes,
+            ],
+            [0; 5]
+        );
+        drop(connection);
+
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload migrated v12 KEK"),
+        )
+        .await
+        .expect("reopen migrated v12 without a second migration");
+        reopened.shutdown().await.expect("shutdown reopened v12");
+        assert_eq!(cipher_evidence(&root.database()), before);
+    }
+
+    #[tokio::test]
+    async fn populated_strict_v13_migrates_to_v14_without_changing_key_update_bytes() {
+        let root = TestRoot::new("populated-strict-v13-to-v14");
+        let keys = MemoryKeyStore::new();
+        let (row_before, authenticated_before) =
+            build_populated_strict_v13_key_update_fixture(&root, &keys);
+
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload populated strict v13 KEK"),
+        )
+        .await
+        .expect("migrate populated strict v13 fixture to v14");
+        let snapshot = store.inspect().await.expect("inspect migrated v14 store");
+        assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(snapshot.table_names, EXPECTED_TABLES_V14);
+        store.shutdown().await.expect("shutdown migrated v14 store");
+
+        let connection =
+            Connection::open(root.database()).expect("inspect populated v13-to-v14 database");
+        assert_eq!(
+            key_update_row_evidence(&connection),
+            row_before,
+            "v13 to v14 must preserve every key-update column byte-exact"
+        );
+        assert_eq!(
+            authenticated_blob_evidence(&connection),
+            authenticated_before,
+            "v13 to v14 must preserve every non-meta token and sealed blob byte-exact"
+        );
+        assert_eq!(
+            schema_manifest(&connection).expect("read migrated v14 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V14).expect("build exact v14 manifest")
+        );
+        let temporary_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name IN ('remote_key_update_outbox_v13',
+                                'remote_key_update_outbox_v14')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count v14 migration temporary tables");
+        assert_eq!(temporary_table_count, 0);
+        let foreign_key_violation_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("count migrated v14 foreign-key violations");
+        assert_eq!(foreign_key_violation_count, 0);
+        drop(connection);
+
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_fault_injector(Arc::new(
+                FailMigrationBeforeCommit {
+                    failed: AtomicBool::new(false),
+                },
+            )),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload migrated v14 KEK"),
+        )
+        .await
+        .expect("reopen current v14 without attempting a second migration");
+        reopened.shutdown().await.expect("shutdown reopened v14");
+        let reopened_connection =
+            Connection::open(root.database()).expect("inspect reopened current v14");
+        assert_eq!(key_update_row_evidence(&reopened_connection), row_before);
+    }
+
+    #[tokio::test]
+    async fn strict_v13_capacity_rejection_precedes_v14_artifact_rewrite() {
+        let root = TestRoot::new("strict-v13-v14-capacity");
+        let keys = MemoryKeyStore::new();
+        build_populated_strict_v13_key_update_fixture(&root, &keys);
+        let before = artifact_evidence(&root.database());
+
+        let error = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationLowDisk),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload capacity-rejected strict v13 KEK"),
+        )
+        .await
+        .expect_err("v14 migration capacity gate must reject strict v13 before DDL");
+        assert!(matches!(error, RuntimeStoreError::DiskLow { .. }));
+        assert_eq!(artifact_evidence(&root.database()), before);
+        let legacy = Connection::open(root.database()).expect("inspect capacity-rejected v13");
+        assert_eq!(
+            schema_manifest(&legacy).expect("read capacity-rejected v13 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V13)
+                .expect("build exact capacity-rejected v13 manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_kek_rejects_strict_v13_before_v14_artifact_rewrite() {
+        let root = TestRoot::new("strict-v13-v14-wrong-kek");
+        let keys = MemoryKeyStore::new();
+        build_populated_strict_v13_key_update_fixture(&root, &keys);
+        let before = artifact_evidence(&root.database());
+        let wrong_keys = MemoryKeyStore::new();
+        let wrong_namespace = root.0.join("wrong-v13-key-namespace.db");
+        let wrong_kek = load_or_create_storage_kek(&wrong_keys, &wrong_namespace)
+            .expect("create independent wrong strict v13 KEK");
+
+        RuntimeStoreHandle::open(RuntimeStoreConfig::new(root.database()), wrong_kek)
+            .await
+            .expect_err("wrong KEK must reject strict v13 before v14 migration");
+        assert_eq!(artifact_evidence(&root.database()), before);
+        let legacy = Connection::open(root.database()).expect("inspect wrong-KEK strict v13");
+        assert_eq!(
+            schema_manifest(&legacy).expect("read wrong-KEK strict v13 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V13)
+                .expect("build exact wrong-KEK v13 manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_v13_key_update_rejects_before_v14_artifact_rewrite() {
+        let root = TestRoot::new("strict-v13-v14-tamper");
+        let keys = MemoryKeyStore::new();
+        build_populated_strict_v13_key_update_fixture(&root, &keys);
+        let connection = Connection::open(root.database()).expect("open strict v13 tamper fixture");
+        let mut sealed: Vec<u8> = connection
+            .query_row(
+                "SELECT sealed_state FROM remote_key_update_outbox LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read strict v13 key-update ciphertext");
+        sealed[0] ^= 0x80;
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE remote_key_update_outbox SET sealed_state = ?1",
+                    params![sealed],
+                )
+                .expect("tamper strict v13 key-update ciphertext"),
+            1
+        );
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint strict v13 tamper fixture");
+        drop(connection);
+        let before = artifact_evidence(&root.database());
+
+        RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload tampered strict v13 KEK"),
+        )
+        .await
+        .expect_err("tampered v13 key-update row must reject before v14 migration");
+        assert_eq!(artifact_evidence(&root.database()), before);
+        let legacy = Connection::open(root.database()).expect("inspect rejected tampered v13");
+        assert_eq!(
+            schema_manifest(&legacy).expect("read rejected tampered v13 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V13)
+                .expect("build exact rejected tampered v13 manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn populated_strict_v12_migrates_to_v14_without_changing_publication_bytes() {
+        let root = TestRoot::new("populated-strict-v12-to-v13");
+        let keys = MemoryKeyStore::new();
+        let (cipher_before, authenticated_before, publication_before) =
+            build_populated_strict_v12_fixture(&root, &keys);
+
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload populated strict v12 KEK"),
+        )
+        .await
+        .expect("migrate populated strict v12 fixture to v14");
+        let snapshot = store.inspect().await.expect("inspect migrated v14 store");
+        assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(snapshot.table_names, EXPECTED_TABLES_V14);
+        store.shutdown().await.expect("shutdown migrated v14 store");
+
+        assert_eq!(
+            cipher_evidence(&root.database()),
+            cipher_before,
+            "v12 to v14 must preserve wrapped key and pre-existing row ciphertext byte-exact"
+        );
+        let connection =
+            Connection::open(root.database()).expect("inspect populated v12-to-v14 database");
+        assert_eq!(
+            authenticated_blob_evidence(&connection),
+            authenticated_before,
+            "v12 to v14 must preserve every non-meta token and sealed blob byte-exact"
+        );
+        assert_eq!(
+            publication_byte_evidence(&connection),
+            publication_before,
+            "v12 to v14 must preserve publication IDs, generations, hashes, tokens and sealed blob"
+        );
+        assert_eq!(
+            schema_manifest(&connection).expect("read migrated v14 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V14).expect("build exact v14 manifest")
+        );
+        let temporary_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name IN ('publication_streams_v12', 'publication_outbox_v12')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count v14 migration temporary tables");
+        assert_eq!(temporary_table_count, 0);
+        let foreign_key_violation_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("count migrated v14 foreign-key violations");
+        assert_eq!(foreign_key_violation_count, 0);
+        drop(connection);
+
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_fault_injector(Arc::new(
+                FailMigrationBeforeCommit {
+                    failed: AtomicBool::new(false),
+                },
+            )),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload migrated v14 KEK"),
+        )
+        .await
+        .expect("reopen current v14 without attempting a second migration");
+        reopened.shutdown().await.expect("shutdown reopened v14");
+        let reopened_connection =
+            Connection::open(root.database()).expect("inspect reopened current v14");
+        assert_eq!(
+            publication_byte_evidence(&reopened_connection),
+            publication_before
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_v12_capacity_rejection_precedes_v14_artifact_rewrite() {
+        let root = TestRoot::new("strict-v12-v14-capacity");
+        let keys = MemoryKeyStore::new();
+        build_populated_strict_v12_fixture(&root, &keys);
+        let before = artifact_evidence(&root.database());
+
+        let error = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationLowDisk),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload capacity-rejected strict v12 KEK"),
+        )
+        .await
+        .expect_err("v14 migration capacity gate must reject strict v12 before DDL");
+        assert!(matches!(error, RuntimeStoreError::DiskLow { .. }));
+        assert_eq!(artifact_evidence(&root.database()), before);
+        let legacy = Connection::open(root.database()).expect("inspect capacity-rejected v12");
+        assert_eq!(
+            schema_manifest(&legacy).expect("read capacity-rejected v12 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V12)
+                .expect("build exact capacity-rejected v12 manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_kek_rejects_strict_v12_before_v14_artifact_rewrite() {
+        let root = TestRoot::new("strict-v12-v14-wrong-kek");
+        let keys = MemoryKeyStore::new();
+        build_populated_strict_v12_fixture(&root, &keys);
+        let before = artifact_evidence(&root.database());
+        let wrong_keys = MemoryKeyStore::new();
+        let wrong_namespace = root.0.join("wrong-v12-key-namespace.db");
+        let wrong_kek = load_or_create_storage_kek(&wrong_keys, &wrong_namespace)
+            .expect("create independent wrong strict v12 KEK");
+
+        RuntimeStoreHandle::open(RuntimeStoreConfig::new(root.database()), wrong_kek)
+            .await
+            .expect_err("wrong KEK must reject strict v12 before v14 migration");
+        assert_eq!(artifact_evidence(&root.database()), before);
+        let legacy = Connection::open(root.database()).expect("inspect wrong-KEK strict v12");
+        assert_eq!(
+            schema_manifest(&legacy).expect("read wrong-KEK strict v12 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V12)
+                .expect("build exact wrong-KEK v12 manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_v12_publication_corruption_rejects_before_v14_artifact_rewrite() {
+        let root = TestRoot::new("strict-v12-v14-publication-corrupt");
+        let keys = MemoryKeyStore::new();
+        build_populated_strict_v12_fixture(&root, &keys);
+        let connection = Connection::open(root.database())
+            .expect("open strict v12 publication corruption fixture");
+        connection
+            .execute(
+                "UPDATE publication_outbox
+                 SET sealed_publication = zeroblob(length(sealed_publication))",
+                [],
+            )
+            .expect("tamper strict v12 sealed publication");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint strict v12 publication corruption");
+        drop(connection);
+        let before = artifact_evidence(&root.database());
+
+        let error = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload corrupt strict v12 KEK"),
+        )
+        .await
+        .expect_err("authenticated strict v12 publication corruption must fail closed");
+        assert!(
+            matches!(
+                error,
+                RuntimeStoreError::UnknownOrCorruptSchema | RuntimeStoreError::Cipher(_)
+            ),
+            "strict-v12 publication corruption must return authenticated failure, got {error:?}"
+        );
+        assert_eq!(artifact_evidence(&root.database()), before);
+        let legacy = Connection::open(root.database()).expect("inspect rejected corrupt v12");
+        assert_eq!(
+            schema_manifest(&legacy).expect("read corrupt strict v12 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V12)
+                .expect("build exact corrupt v12 manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_v10_migrates_to_v12_without_rewrapping_or_reencrypting_existing_rows() {
+        let root = TestRoot::new("strict-v10-to-v11");
+        let keys = MemoryKeyStore::new();
+        let (before, authenticated_before) = build_strict_v10_fixture(&root, &keys).await;
+
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload strict v10 KEK"),
+        )
+        .await
+        .expect("migrate strict v10 fixture to v11");
+        let snapshot = store.inspect().await.expect("inspect migrated v11 store");
+        assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION);
+        assert_eq!(snapshot.table_names, EXPECTED_TABLES);
+        store.shutdown().await.expect("shutdown migrated v11 store");
+
+        assert_eq!(
+            cipher_evidence(&root.database()),
+            before,
+            "v10 to v11 must preserve wrapped keys and existing ciphertext byte-exact"
+        );
+        let connection = Connection::open(root.database()).expect("inspect v10-to-v11 database");
+        assert_eq!(
+            authenticated_blob_evidence(&connection),
+            authenticated_before,
+            "v10 to v11 must preserve every existing non-meta token and ciphertext byte-exact"
+        );
+        assert_eq!(
+            schema_manifest(&connection).expect("read migrated v11 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v11 manifest")
+        );
+        let meta = read_meta(&connection)
+            .expect("read migrated v11 meta")
+            .expect("migrated v11 meta exists");
+        assert_eq!(
+            [
+                meta.ledger.remote_replay_scope_count,
+                meta.ledger.remote_replay_retired_scope_count,
+                meta.ledger.remote_replay_pin_count,
+                meta.ledger.remote_replay_sealed_bytes,
+                meta.ledger.remote_counter_state_count,
+                meta.ledger.remote_counter_state_sealed_bytes,
+            ],
+            [0; 6]
+        );
+        drop(connection);
+
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload migrated v11 KEK"),
+        )
+        .await
+        .expect("reopen migrated v11 without a second migration");
+        reopened.shutdown().await.expect("shutdown reopened v11");
+        assert_eq!(cipher_evidence(&root.database()), before);
+    }
+
+    #[tokio::test]
+    async fn fresh_v12_has_exact_empty_remote_security_manifest_and_reopens_without_migration() {
+        let root = TestRoot::new("v12-fresh-remote-security-manifest");
         let keys = MemoryKeyStore::new();
         let store = RuntimeStoreHandle::open(
             RuntimeStoreConfig::new(root.database()),
-            load_or_create_storage_kek(&keys, &root.database()).expect("create fresh v10 KEK"),
+            load_or_create_storage_kek(&keys, &root.database()).expect("create fresh v11 KEK"),
         )
         .await
-        .expect("open fresh v10 store");
-        let snapshot = store.inspect().await.expect("inspect fresh v10 store");
+        .expect("open fresh v11 store");
+        let snapshot = store.inspect().await.expect("inspect fresh v11 store");
         assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION);
         assert_eq!(snapshot.table_names, EXPECTED_TABLES);
-        store.shutdown().await.expect("shutdown fresh v10 store");
+        store.shutdown().await.expect("shutdown fresh v11 store");
 
-        let connection = Connection::open(root.database()).expect("inspect fresh v10 database");
+        let connection = Connection::open(root.database()).expect("inspect fresh v11 database");
         assert_eq!(
-            schema_manifest(&connection).expect("read fresh v10 manifest"),
-            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v10 manifest")
+            schema_manifest(&connection).expect("read fresh v11 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v11 manifest")
         );
         let empty_admin: (i64, i64, i64, i64) = connection
             .query_row(
@@ -2932,7 +4095,7 @@ mod migration_tests {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
-            .expect("read fresh v10 admin totals");
+            .expect("read fresh v11 admin totals");
         assert_eq!(empty_admin, (0, 0, 0, 0));
         let empty_identity: (i64, i64) = connection
             .query_row(
@@ -2942,7 +4105,7 @@ mod migration_tests {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("read fresh v10 identity totals");
+            .expect("read fresh v11 identity totals");
         assert_eq!(empty_identity, (0, 0));
         let empty_remote: (i64, i64) = connection
             .query_row(
@@ -2952,7 +4115,7 @@ mod migration_tests {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("read fresh v10 remote totals");
+            .expect("read fresh v11 remote totals");
         assert_eq!(empty_remote, (0, 0));
         for table in [
             "remote_pairings",
@@ -2960,17 +4123,21 @@ mod migration_tests {
             "remote_authorization_ledger",
             "remote_key_directory",
             "remote_control_outbox",
+            "remote_replay_states",
+            "remote_counter_states",
+            "remote_key_transitions",
+            "remote_key_update_outbox",
         ] {
             let count: i64 = connection
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                     row.get(0)
                 })
-                .expect("count fresh v10 remote security table");
+                .expect("count fresh v11 remote security table");
             assert_eq!(count, 0, "fresh {table} must be empty");
         }
         let meta = read_meta(&connection)
-            .expect("read fresh v10 authenticated meta")
-            .expect("fresh v10 meta exists");
+            .expect("read fresh v11 authenticated meta")
+            .expect("fresh v11 meta exists");
         assert_eq!(
             [
                 meta.ledger.remote_pairing_count,
@@ -2989,26 +4156,37 @@ mod migration_tests {
                 meta.ledger.remote_control_outbox_pending_count,
                 meta.ledger.remote_control_outbox_acknowledged_count,
                 meta.ledger.remote_control_outbox_sealed_bytes,
+                meta.ledger.remote_replay_scope_count,
+                meta.ledger.remote_replay_retired_scope_count,
+                meta.ledger.remote_replay_pin_count,
+                meta.ledger.remote_replay_sealed_bytes,
+                meta.ledger.remote_counter_state_count,
+                meta.ledger.remote_counter_state_sealed_bytes,
+                meta.ledger.remote_key_transition_count,
+                meta.ledger.remote_key_transition_active_count,
+                meta.ledger.remote_key_transition_sealed_bytes,
+                meta.ledger.remote_key_update_outbox_count,
+                meta.ledger.remote_key_update_outbox_sealed_bytes,
             ],
-            [0; 16]
+            [0; 27]
         );
         drop(connection);
 
         let reopened = RuntimeStoreHandle::open(
             RuntimeStoreConfig::new(root.database()),
-            load_or_create_storage_kek(&keys, &root.database()).expect("reload fresh v10 KEK"),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload fresh v11 KEK"),
         )
         .await
-        .expect("reopen fresh v10 store without migration");
+        .expect("reopen fresh v11 store without migration");
         reopened
             .shutdown()
             .await
-            .expect("shutdown reopened v10 store");
+            .expect("shutdown reopened v11 store");
     }
 
     #[tokio::test]
-    async fn strict_v9_migrates_to_v10_without_rewrapping_or_reencrypting_existing_rows() {
-        let root = TestRoot::new("strict-v9-to-v10");
+    async fn strict_v9_migrates_to_v11_without_rewrapping_or_reencrypting_existing_rows() {
+        let root = TestRoot::new("strict-v9-to-v11");
         let keys = MemoryKeyStore::new();
         let (before, authenticated_before) = build_strict_v9_fixture(&root, &keys).await;
         let rescue_before = artifact_evidence(&root.database());
@@ -3027,30 +4205,30 @@ mod migration_tests {
             load_or_create_storage_kek(&keys, &root.database()).expect("reload strict v9 KEK"),
         )
         .await
-        .expect("migrate strict v9 fixture to v10");
-        let snapshot = store.inspect().await.expect("inspect migrated v10 store");
+        .expect("migrate strict v9 fixture to v11");
+        let snapshot = store.inspect().await.expect("inspect migrated v11 store");
         assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION);
         assert_eq!(snapshot.table_names, EXPECTED_TABLES);
-        store.shutdown().await.expect("shutdown migrated v10 store");
+        store.shutdown().await.expect("shutdown migrated v11 store");
 
         assert_eq!(
             cipher_evidence(&root.database()),
             before,
-            "v9 to v10 must preserve wrapped keys and existing ciphertext byte-exact"
+            "v9 to v11 must preserve wrapped keys and existing ciphertext byte-exact"
         );
-        let connection = Connection::open(root.database()).expect("inspect v9-to-v10 database");
+        let connection = Connection::open(root.database()).expect("inspect v9-to-v11 database");
         assert_eq!(
             authenticated_blob_evidence(&connection),
             authenticated_before,
-            "v9 to v10 must preserve every existing non-meta token and ciphertext byte-exact"
+            "v9 to v11 must preserve every existing non-meta token and ciphertext byte-exact"
         );
         assert_eq!(
-            schema_manifest(&connection).expect("read migrated v10 manifest"),
-            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v10 manifest")
+            schema_manifest(&connection).expect("read migrated v11 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION).expect("build exact v11 manifest")
         );
         let meta = read_meta(&connection)
-            .expect("read migrated v10 meta")
-            .expect("migrated v10 meta exists");
+            .expect("read migrated v11 meta")
+            .expect("migrated v11 meta exists");
         assert_eq!(
             [
                 meta.ledger.remote_pairing_count,
@@ -3076,16 +4254,16 @@ mod migration_tests {
 
         let reopened = RuntimeStoreHandle::open(
             RuntimeStoreConfig::new(root.database()),
-            load_or_create_storage_kek(&keys, &root.database()).expect("reload migrated v10 KEK"),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload migrated v11 KEK"),
         )
         .await
-        .expect("reopen migrated v10 without a second migration");
-        reopened.shutdown().await.expect("shutdown reopened v10");
+        .expect("reopen migrated v11 without a second migration");
+        reopened.shutdown().await.expect("shutdown reopened v11");
     }
 
     #[tokio::test]
-    async fn v9_to_v10_before_commit_fault_rolls_back_byte_exact_then_retries() {
-        let root = TestRoot::new("v9-to-v10-before-commit");
+    async fn v9_to_v11_before_commit_fault_rolls_back_byte_exact_then_retries() {
+        let root = TestRoot::new("v9-to-v11-before-commit");
         let keys = MemoryKeyStore::new();
         let (before, _) = build_strict_v9_fixture(&root, &keys).await;
         let artifacts_before = artifact_evidence(&root.database());
@@ -3098,7 +4276,7 @@ mod migration_tests {
             load_or_create_storage_kek(&keys, &root.database()).expect("reload strict v9 KEK"),
         )
         .await
-        .expect_err("before-commit hook must abort v9 to v10 migration");
+        .expect_err("before-commit hook must abort v9 to v11 migration");
         assert!(matches!(error, RuntimeStoreError::WorkerStopped));
         assert_eq!(artifact_evidence(&root.database()), artifacts_before);
         let legacy = Connection::open(root.database()).expect("inspect rolled back strict v9");
@@ -3123,17 +4301,17 @@ mod migration_tests {
             reopened
                 .inspect()
                 .await
-                .expect("inspect retried v10 migration")
+                .expect("inspect retried v11 migration")
                 .schema_version,
             RUNTIME_SCHEMA_VERSION
         );
-        reopened.shutdown().await.expect("shutdown retried v10");
+        reopened.shutdown().await.expect("shutdown retried v11");
         assert_eq!(cipher_evidence(&root.database()), before);
     }
 
     #[tokio::test]
-    async fn v9_to_v10_after_commit_unknown_reopens_without_second_rewrite() {
-        let root = TestRoot::new("v9-to-v10-after-commit");
+    async fn v9_to_v11_after_commit_unknown_reopens_without_second_rewrite() {
+        let root = TestRoot::new("v9-to-v11-after-commit");
         let keys = MemoryKeyStore::new();
         let (before, _) = build_strict_v9_fixture(&root, &keys).await;
         let error = RuntimeStoreHandle::open(
@@ -3152,39 +4330,39 @@ mod migration_tests {
                 operation: RuntimeCommitOperation::MigrateSchema
             }
         ));
-        let committed = Connection::open(root.database()).expect("inspect committed v10");
+        let committed = Connection::open(root.database()).expect("inspect committed v11");
         let committed_meta = read_meta(&committed)
-            .expect("read committed v10 meta")
-            .expect("committed v10 meta exists");
-        let committed_manifest = schema_manifest(&committed).expect("read committed v10 manifest");
+            .expect("read committed v11 meta")
+            .expect("committed v11 meta exists");
+        let committed_manifest = schema_manifest(&committed).expect("read committed v11 manifest");
         drop(committed);
         let reopened = RuntimeStoreHandle::open(
             RuntimeStoreConfig::new(root.database()),
-            load_or_create_storage_kek(&keys, &root.database()).expect("reload committed v10 KEK"),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload committed v11 KEK"),
         )
         .await
-        .expect("reopen committed v10 migration");
+        .expect("reopen committed v11 migration");
         assert_eq!(
             reopened
                 .inspect()
                 .await
-                .expect("inspect reopened v10 migration")
+                .expect("inspect reopened v11 migration")
                 .schema_version,
             RUNTIME_SCHEMA_VERSION
         );
-        reopened.shutdown().await.expect("shutdown reopened v10");
-        let after_reopen = Connection::open(root.database()).expect("inspect reopened v10");
+        reopened.shutdown().await.expect("shutdown reopened v11");
+        let after_reopen = Connection::open(root.database()).expect("inspect reopened v11");
         let reopened_meta = read_meta(&after_reopen)
-            .expect("read reopened v10 meta")
-            .expect("reopened v10 meta exists");
+            .expect("read reopened v11 meta")
+            .expect("reopened v11 meta exists");
         assert!(
             same_meta(&reopened_meta, &committed_meta),
-            "after-COMMIT v10 reopen must not republish runtime_meta"
+            "after-COMMIT v11 reopen must not republish runtime_meta"
         );
         assert_eq!(
-            schema_manifest(&after_reopen).expect("read reopened v10 manifest"),
+            schema_manifest(&after_reopen).expect("read reopened v11 manifest"),
             committed_manifest,
-            "after-COMMIT v10 reopen must not apply schema DDL twice"
+            "after-COMMIT v11 reopen must not apply schema DDL twice"
         );
         assert_eq!(cipher_evidence(&root.database()), before);
     }
@@ -3657,7 +4835,11 @@ mod migration_tests {
                 | LegacySchemaVersion::V6
                 | LegacySchemaVersion::V7
                 | LegacySchemaVersion::V8
-                | LegacySchemaVersion::V9 => {
+                | LegacySchemaVersion::V9
+                | LegacySchemaVersion::V10
+                | LegacySchemaVersion::V11
+                | LegacySchemaVersion::V12
+                | LegacySchemaVersion::V13 => {
                     unreachable!("table only covers legacy v1-v4")
                 }
             };
@@ -3680,7 +4862,11 @@ mod migration_tests {
                 | LegacySchemaVersion::V6
                 | LegacySchemaVersion::V7
                 | LegacySchemaVersion::V8
-                | LegacySchemaVersion::V9 => {
+                | LegacySchemaVersion::V9
+                | LegacySchemaVersion::V10
+                | LegacySchemaVersion::V11
+                | LegacySchemaVersion::V12
+                | LegacySchemaVersion::V13 => {
                     unreachable!("table only covers legacy v1-v4")
                 }
             }
@@ -5436,6 +6622,18 @@ pub(crate) struct RuntimeLedger {
     pub remote_control_outbox_pending_count: u64,
     pub remote_control_outbox_acknowledged_count: u64,
     pub remote_control_outbox_sealed_bytes: u64,
+    pub remote_replay_scope_count: u64,
+    pub remote_replay_retired_scope_count: u64,
+    pub remote_replay_pin_count: u64,
+    pub remote_replay_sealed_bytes: u64,
+    pub remote_counter_state_count: u64,
+    pub remote_counter_state_sealed_bytes: u64,
+    pub remote_counter_guard_manifest_count: u64,
+    pub remote_key_transition_count: u64,
+    pub remote_key_transition_active_count: u64,
+    pub remote_key_transition_sealed_bytes: u64,
+    pub remote_key_update_outbox_count: u64,
+    pub remote_key_update_outbox_sealed_bytes: u64,
     pub accepted_count: u64,
     pub accepted_payload_bytes: u64,
     pub started_without_fence_count: u64,
@@ -5454,6 +6652,10 @@ enum SchemaState {
     LegacyV7(MetaRow, StoreFileIdentity),
     LegacyV8(MetaRow, StoreFileIdentity),
     LegacyV9(MetaRow, StoreFileIdentity),
+    LegacyV10(MetaRow, StoreFileIdentity),
+    LegacyV11(MetaRow, StoreFileIdentity),
+    LegacyV12(MetaRow, StoreFileIdentity),
+    LegacyV13(MetaRow, StoreFileIdentity),
     Current(MetaRow, StoreFileIdentity),
 }
 
@@ -5468,6 +6670,10 @@ enum LegacySchemaVersion {
     V7,
     V8,
     V9,
+    V10,
+    V11,
+    V12,
+    V13,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5618,6 +6824,38 @@ where
             identity,
             LegacySchemaVersion::V9,
         ),
+        SchemaState::LegacyV10(meta, identity) => open_legacy(
+            config,
+            storage_path,
+            &storage_kek,
+            meta,
+            identity,
+            LegacySchemaVersion::V10,
+        ),
+        SchemaState::LegacyV11(meta, identity) => open_legacy(
+            config,
+            storage_path,
+            &storage_kek,
+            meta,
+            identity,
+            LegacySchemaVersion::V11,
+        ),
+        SchemaState::LegacyV12(meta, identity) => open_legacy(
+            config,
+            storage_path,
+            &storage_kek,
+            meta,
+            identity,
+            LegacySchemaVersion::V12,
+        ),
+        SchemaState::LegacyV13(meta, identity) => open_legacy(
+            config,
+            storage_path,
+            &storage_kek,
+            meta,
+            identity,
+            LegacySchemaVersion::V13,
+        ),
         SchemaState::Current(meta, identity) => open_current(
             config,
             storage_path,
@@ -5685,6 +6923,10 @@ fn open_fresh(
         transaction.execute_batch(RUNTIME_MIGRATION_V8)?;
         transaction.execute_batch(RUNTIME_MIGRATION_V9)?;
         transaction.execute_batch(RUNTIME_MIGRATION_V10)?;
+        transaction.execute_batch(RUNTIME_MIGRATION_V11)?;
+        transaction.execute_batch(RUNTIME_MIGRATION_V12)?;
+        transaction.execute_batch(RUNTIME_MIGRATION_V13)?;
+        transaction.execute_batch(RUNTIME_MIGRATION_V14)?;
         transaction.execute(
             "INSERT INTO runtime_meta (
                  singleton, schema_family, schema_version, schema_signature,
@@ -5840,6 +7082,10 @@ fn open_legacy(
         LegacySchemaVersion::V7 => verify_runtime_ledger_token_v7(&key_bundle, &inspected)?,
         LegacySchemaVersion::V8 => verify_runtime_ledger_token_v8(&key_bundle, &inspected)?,
         LegacySchemaVersion::V9 => verify_runtime_ledger_token_v9(&key_bundle, &inspected)?,
+        LegacySchemaVersion::V10 => verify_runtime_ledger_token_v10(&key_bundle, &inspected)?,
+        LegacySchemaVersion::V11 => verify_runtime_ledger_token_v11(&key_bundle, &inspected)?,
+        LegacySchemaVersion::V12 => verify_runtime_ledger_token_v12(&key_bundle, &inspected)?,
+        LegacySchemaVersion::V13 => verify_runtime_ledger_token_v13(&key_bundle, &inspected)?,
     }
 
     validate_database_file(&storage_path)?;
@@ -5859,6 +7105,10 @@ fn open_legacy(
         LegacySchemaVersion::V7 => read_and_validate_legacy_v7_schema(&connection)?,
         LegacySchemaVersion::V8 => read_and_validate_legacy_v8_schema(&connection)?,
         LegacySchemaVersion::V9 => read_and_validate_legacy_v9_schema(&connection)?,
+        LegacySchemaVersion::V10 => read_and_validate_legacy_v10_schema(&connection)?,
+        LegacySchemaVersion::V11 => read_and_validate_legacy_v11_schema(&connection)?,
+        LegacySchemaVersion::V12 => read_and_validate_legacy_v12_schema(&connection)?,
+        LegacySchemaVersion::V13 => read_and_validate_legacy_v13_schema(&connection)?,
     };
     if !same_meta(&inspected, &current) {
         return Err(RuntimeStoreError::SchemaInspectionRaced);
@@ -5883,7 +7133,11 @@ fn open_legacy(
         | LegacySchemaVersion::V6
         | LegacySchemaVersion::V7
         | LegacySchemaVersion::V8
-        | LegacySchemaVersion::V9 => {
+        | LegacySchemaVersion::V9
+        | LegacySchemaVersion::V10
+        | LegacySchemaVersion::V11
+        | LegacySchemaVersion::V12
+        | LegacySchemaVersion::V13 => {
             super::journal::validate_store_integrity(
                 &connection,
                 &key_bundle,
@@ -5908,18 +7162,35 @@ fn open_legacy(
             | LegacySchemaVersion::V7
             | LegacySchemaVersion::V8
             | LegacySchemaVersion::V9
+            | LegacySchemaVersion::V10
+            | LegacySchemaVersion::V11
+            | LegacySchemaVersion::V12
+            | LegacySchemaVersion::V13
     ) {
         0
     } else {
         super::configuration::migration_projection_bytes(current.ledger.conversation_count)?
     };
+    let key_update_shape_projection = current
+        .ledger
+        .remote_key_update_outbox_count
+        .checked_mul(8 * 1024)
+        .and_then(|row_overhead| {
+            row_overhead.checked_add(current.ledger.remote_key_update_outbox_sealed_bytes)
+        })
+        .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+            field: "v14 key-update migration projection bytes",
+        })?;
     let migration_projection = match legacy_version {
         LegacySchemaVersion::V4 => v5_projection,
         LegacySchemaVersion::V5
         | LegacySchemaVersion::V6
         | LegacySchemaVersion::V7
         | LegacySchemaVersion::V8
-        | LegacySchemaVersion::V9 => 0,
+        | LegacySchemaVersion::V9
+        | LegacySchemaVersion::V10
+        | LegacySchemaVersion::V11 => 0,
+        LegacySchemaVersion::V12 | LegacySchemaVersion::V13 => key_update_shape_projection,
         LegacySchemaVersion::V1 | LegacySchemaVersion::V2 | LegacySchemaVersion::V3 => {
             super::stream::migration_projection_bytes(&connection)?
                 .checked_add(v5_projection)
@@ -5946,6 +7217,10 @@ fn open_legacy(
         LegacySchemaVersion::V7 => schema_signature_v7(),
         LegacySchemaVersion::V8 => schema_signature_v8(),
         LegacySchemaVersion::V9 => schema_signature_v9(),
+        LegacySchemaVersion::V10 => schema_signature_v10(),
+        LegacySchemaVersion::V11 => schema_signature_v11(),
+        LegacySchemaVersion::V12 => schema_signature_v12(),
+        LegacySchemaVersion::V13 => schema_signature_v13(),
     };
     let new_signature = schema_signature();
     let old_token = match legacy_version {
@@ -5976,6 +7251,18 @@ fn open_legacy(
         LegacySchemaVersion::V9 => {
             runtime_ledger_token_v9(&key_bundle, current.database_id, &current.ledger)?
         }
+        LegacySchemaVersion::V10 => {
+            runtime_ledger_token_v10(&key_bundle, current.database_id, &current.ledger)?
+        }
+        LegacySchemaVersion::V11 => {
+            runtime_ledger_token_v11(&key_bundle, current.database_id, &current.ledger)?
+        }
+        LegacySchemaVersion::V12 => {
+            runtime_ledger_token_v12(&key_bundle, current.database_id, &current.ledger)?
+        }
+        LegacySchemaVersion::V13 => {
+            runtime_ledger_token_v13(&key_bundle, current.database_id, &current.ledger)?
+        }
     };
     let mut transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // 容量 probe 与 BEGIN 之间不能沿用先前认证结果：同 UID 的另一 SQLite
@@ -5992,6 +7279,10 @@ fn open_legacy(
         LegacySchemaVersion::V7 => read_and_validate_legacy_v7_schema(&transaction)?,
         LegacySchemaVersion::V8 => read_and_validate_legacy_v8_schema(&transaction)?,
         LegacySchemaVersion::V9 => read_and_validate_legacy_v9_schema(&transaction)?,
+        LegacySchemaVersion::V10 => read_and_validate_legacy_v10_schema(&transaction)?,
+        LegacySchemaVersion::V11 => read_and_validate_legacy_v11_schema(&transaction)?,
+        LegacySchemaVersion::V12 => read_and_validate_legacy_v12_schema(&transaction)?,
+        LegacySchemaVersion::V13 => read_and_validate_legacy_v13_schema(&transaction)?,
     };
     if !same_meta(&current, &locked) {
         return Err(RuntimeStoreError::SchemaInspectionRaced);
@@ -6017,6 +7308,10 @@ fn open_legacy(
         LegacySchemaVersion::V7 => verify_runtime_ledger_token_v7(&key_bundle, &locked)?,
         LegacySchemaVersion::V8 => verify_runtime_ledger_token_v8(&key_bundle, &locked)?,
         LegacySchemaVersion::V9 => verify_runtime_ledger_token_v9(&key_bundle, &locked)?,
+        LegacySchemaVersion::V10 => verify_runtime_ledger_token_v10(&key_bundle, &locked)?,
+        LegacySchemaVersion::V11 => verify_runtime_ledger_token_v11(&key_bundle, &locked)?,
+        LegacySchemaVersion::V12 => verify_runtime_ledger_token_v12(&key_bundle, &locked)?,
+        LegacySchemaVersion::V13 => verify_runtime_ledger_token_v13(&key_bundle, &locked)?,
     }
     if legacy_version != LegacySchemaVersion::V1 {
         super::journal::validate_store_integrity(&transaction, &key_bundle, locked.database_id)?;
@@ -6038,6 +7333,10 @@ fn open_legacy(
             | LegacySchemaVersion::V7
             | LegacySchemaVersion::V8
             | LegacySchemaVersion::V9
+            | LegacySchemaVersion::V10
+            | LegacySchemaVersion::V11
+            | LegacySchemaVersion::V12
+            | LegacySchemaVersion::V13
     ) {
         current.ledger.clone()
     } else {
@@ -6056,6 +7355,10 @@ fn open_legacy(
             | LegacySchemaVersion::V7
             | LegacySchemaVersion::V8
             | LegacySchemaVersion::V9
+            | LegacySchemaVersion::V10
+            | LegacySchemaVersion::V11
+            | LegacySchemaVersion::V12
+            | LegacySchemaVersion::V13
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V5)?;
         super::configuration::materialize_legacy_v4_states(
@@ -6070,25 +7373,71 @@ fn open_legacy(
             | LegacySchemaVersion::V7
             | LegacySchemaVersion::V8
             | LegacySchemaVersion::V9
+            | LegacySchemaVersion::V10
+            | LegacySchemaVersion::V11
+            | LegacySchemaVersion::V12
+            | LegacySchemaVersion::V13
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V6)?;
     }
     if !matches!(
         legacy_version,
-        LegacySchemaVersion::V7 | LegacySchemaVersion::V8 | LegacySchemaVersion::V9
+        LegacySchemaVersion::V7
+            | LegacySchemaVersion::V8
+            | LegacySchemaVersion::V9
+            | LegacySchemaVersion::V10
+            | LegacySchemaVersion::V11
+            | LegacySchemaVersion::V12
+            | LegacySchemaVersion::V13
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V7)?;
     }
     if !matches!(
         legacy_version,
-        LegacySchemaVersion::V8 | LegacySchemaVersion::V9
+        LegacySchemaVersion::V8
+            | LegacySchemaVersion::V9
+            | LegacySchemaVersion::V10
+            | LegacySchemaVersion::V11
+            | LegacySchemaVersion::V12
+            | LegacySchemaVersion::V13
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V8)?;
     }
-    if legacy_version != LegacySchemaVersion::V9 {
+    if !matches!(
+        legacy_version,
+        LegacySchemaVersion::V9
+            | LegacySchemaVersion::V10
+            | LegacySchemaVersion::V11
+            | LegacySchemaVersion::V12
+            | LegacySchemaVersion::V13
+    ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V9)?;
     }
-    transaction.execute_batch(RUNTIME_MIGRATION_V10)?;
+    if !matches!(
+        legacy_version,
+        LegacySchemaVersion::V10
+            | LegacySchemaVersion::V11
+            | LegacySchemaVersion::V12
+            | LegacySchemaVersion::V13
+    ) {
+        transaction.execute_batch(RUNTIME_MIGRATION_V10)?;
+    }
+    if !matches!(
+        legacy_version,
+        LegacySchemaVersion::V11 | LegacySchemaVersion::V12 | LegacySchemaVersion::V13
+    ) {
+        transaction.execute_batch(RUNTIME_MIGRATION_V11)?;
+    }
+    if !matches!(
+        legacy_version,
+        LegacySchemaVersion::V12 | LegacySchemaVersion::V13
+    ) {
+        transaction.execute_batch(RUNTIME_MIGRATION_V12)?;
+    }
+    if legacy_version != LegacySchemaVersion::V13 {
+        transaction.execute_batch(RUNTIME_MIGRATION_V13)?;
+    }
+    transaction.execute_batch(RUNTIME_MIGRATION_V14)?;
     let new_token = runtime_ledger_token(&key_bundle, current.database_id, &migrated_ledger)?;
     if transaction.execute(
         "UPDATE runtime_meta
@@ -6169,6 +7518,10 @@ fn open_legacy(
                 LegacySchemaVersion::V7 => 7_i64,
                 LegacySchemaVersion::V8 => 8_i64,
                 LegacySchemaVersion::V9 => 9_i64,
+                LegacySchemaVersion::V10 => 10_i64,
+                LegacySchemaVersion::V11 => 11_i64,
+                LegacySchemaVersion::V12 => 12_i64,
+                LegacySchemaVersion::V13 => 13_i64,
             },
             &old_signature[..],
             &old_token[..],
@@ -6348,6 +7701,46 @@ fn inspect_schema(path: &Path, storage_kek: &StorageKek) -> Result<SchemaState, 
                     )?;
                     SchemaState::LegacyV9(legacy, identity.clone())
                 }
+                RUNTIME_SCHEMA_VERSION_V10 if family == RUNTIME_SCHEMA_FAMILY => {
+                    let legacy = read_and_validate_legacy_v10_schema(connection)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V10,
+                    )?;
+                    SchemaState::LegacyV10(legacy, identity.clone())
+                }
+                RUNTIME_SCHEMA_VERSION_V11 if family == RUNTIME_SCHEMA_FAMILY => {
+                    let legacy = read_and_validate_legacy_v11_schema(connection)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V11,
+                    )?;
+                    SchemaState::LegacyV11(legacy, identity.clone())
+                }
+                RUNTIME_SCHEMA_VERSION_V12 if family == RUNTIME_SCHEMA_FAMILY => {
+                    let legacy = read_and_validate_legacy_v12_schema(connection)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V12,
+                    )?;
+                    SchemaState::LegacyV12(legacy, identity.clone())
+                }
+                RUNTIME_SCHEMA_VERSION_V13 if family == RUNTIME_SCHEMA_FAMILY => {
+                    let legacy = read_and_validate_legacy_v13_schema(connection)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V13,
+                    )?;
+                    SchemaState::LegacyV13(legacy, identity.clone())
+                }
                 RUNTIME_SCHEMA_VERSION if family == RUNTIME_SCHEMA_FAMILY => {
                     let current = read_and_validate_current_schema(connection)?;
                     // WAL recovery 的 schema inspection 已在私有 rescue 副本上看到完整
@@ -6406,6 +7799,10 @@ fn validate_legacy_before_read_write_open(
         LegacySchemaVersion::V7 => verify_runtime_ledger_token_v7(&key_bundle, legacy)?,
         LegacySchemaVersion::V8 => verify_runtime_ledger_token_v8(&key_bundle, legacy)?,
         LegacySchemaVersion::V9 => verify_runtime_ledger_token_v9(&key_bundle, legacy)?,
+        LegacySchemaVersion::V10 => verify_runtime_ledger_token_v10(&key_bundle, legacy)?,
+        LegacySchemaVersion::V11 => verify_runtime_ledger_token_v11(&key_bundle, legacy)?,
+        LegacySchemaVersion::V12 => verify_runtime_ledger_token_v12(&key_bundle, legacy)?,
+        LegacySchemaVersion::V13 => verify_runtime_ledger_token_v13(&key_bundle, legacy)?,
     }
     if legacy_version == LegacySchemaVersion::V5 {
         reject_legacy_v5_native_projection(connection)?;
@@ -6427,7 +7824,11 @@ fn validate_legacy_before_read_write_open(
         | LegacySchemaVersion::V6
         | LegacySchemaVersion::V7
         | LegacySchemaVersion::V8
-        | LegacySchemaVersion::V9 => {
+        | LegacySchemaVersion::V9
+        | LegacySchemaVersion::V10
+        | LegacySchemaVersion::V11
+        | LegacySchemaVersion::V12
+        | LegacySchemaVersion::V13 => {
             super::journal::validate_store_integrity(connection, &key_bundle, legacy.database_id)?;
         }
     }
@@ -6692,6 +8093,94 @@ fn read_and_validate_legacy_v9_schema(
         || meta.metadata_token.len() != 32
         || table_names(connection)? != EXPECTED_TABLES_V9
         || schema_manifest(connection)? != expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V9)?
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(meta)
+}
+
+fn read_and_validate_legacy_v10_schema(
+    connection: &Connection,
+) -> Result<MetaRow, RuntimeStoreError> {
+    let Some(meta) =
+        read_meta_v10(connection).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+    else {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    };
+    if meta.family != RUNTIME_SCHEMA_FAMILY
+        || meta.version != RUNTIME_SCHEMA_VERSION_V10
+        || meta.signature != schema_signature_v10()
+        || meta.key_generation != RUNTIME_KEY_GENERATION
+        || meta.wrapped_key_bundle.len() != WRAPPED_KEY_BUNDLE_V1_LEN
+        || meta.metadata_token.len() != 32
+        || table_names(connection)? != EXPECTED_TABLES_V10
+        || schema_manifest(connection)? != expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V10)?
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(meta)
+}
+
+fn read_and_validate_legacy_v11_schema(
+    connection: &Connection,
+) -> Result<MetaRow, RuntimeStoreError> {
+    let Some(meta) =
+        read_meta_v11(connection).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+    else {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    };
+    if meta.family != RUNTIME_SCHEMA_FAMILY
+        || meta.version != RUNTIME_SCHEMA_VERSION_V11
+        || meta.signature != schema_signature_v11()
+        || meta.key_generation != RUNTIME_KEY_GENERATION
+        || meta.wrapped_key_bundle.len() != WRAPPED_KEY_BUNDLE_V1_LEN
+        || meta.metadata_token.len() != 32
+        || table_names(connection)? != EXPECTED_TABLES_V11
+        || schema_manifest(connection)? != expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V11)?
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(meta)
+}
+
+fn read_and_validate_legacy_v12_schema(
+    connection: &Connection,
+) -> Result<MetaRow, RuntimeStoreError> {
+    let Some(meta) =
+        read_meta_v12(connection).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+    else {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    };
+    if meta.family != RUNTIME_SCHEMA_FAMILY
+        || meta.version != RUNTIME_SCHEMA_VERSION_V12
+        || meta.signature != schema_signature_v12()
+        || meta.key_generation != RUNTIME_KEY_GENERATION
+        || meta.wrapped_key_bundle.len() != WRAPPED_KEY_BUNDLE_V1_LEN
+        || meta.metadata_token.len() != 32
+        || table_names(connection)? != EXPECTED_TABLES_V12
+        || schema_manifest(connection)? != expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V12)?
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(meta)
+}
+
+fn read_and_validate_legacy_v13_schema(
+    connection: &Connection,
+) -> Result<MetaRow, RuntimeStoreError> {
+    let Some(meta) =
+        read_meta(connection).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+    else {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    };
+    if meta.family != RUNTIME_SCHEMA_FAMILY
+        || meta.version != RUNTIME_SCHEMA_VERSION_V13
+        || meta.signature != schema_signature_v13()
+        || meta.key_generation != RUNTIME_KEY_GENERATION
+        || meta.wrapped_key_bundle.len() != WRAPPED_KEY_BUNDLE_V1_LEN
+        || meta.metadata_token.len() != 32
+        || table_names(connection)? != EXPECTED_TABLES_V13
+        || schema_manifest(connection)? != expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V13)?
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
@@ -7613,7 +9102,7 @@ fn read_meta_v9(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Er
     Ok(Some(meta))
 }
 
-fn read_meta(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
+fn read_meta_v10(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
     let Some(mut meta) = read_meta_v9(connection)? else {
         return Ok(None);
     };
@@ -7695,6 +9184,108 @@ fn read_meta(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error
     meta.ledger.remote_control_outbox_acknowledged_count = value[14];
     meta.ledger.remote_control_outbox_sealed_bytes = value[15];
     Ok(Some(meta))
+}
+
+fn read_meta_v11(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
+    let Some(mut meta) = read_meta_v10(connection)? else {
+        return Ok(None);
+    };
+    let raw: [i64; 6] = connection.query_row(
+        "SELECT remote_replay_scope_count, remote_replay_retired_scope_count,
+                remote_replay_pin_count, remote_replay_sealed_bytes,
+                remote_counter_state_count, remote_counter_state_sealed_bytes
+         FROM runtime_meta WHERE singleton = 1",
+        [],
+        |row| {
+            Ok([
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ])
+        },
+    )?;
+    let mut value = [0_u64; 6];
+    for (offset, raw) in raw.into_iter().enumerate() {
+        value[offset] = sqlite_nonnegative_u64(68 + offset, raw)?;
+    }
+    if value[0] > super::remote_replay::MAX_REMOTE_REPLAY_SCOPES
+        || value[1] > value[0]
+        || value[2] > 1_048_576
+        || value[3] > 1024 * 1024 * 1024
+        || ((value[0] == 0) != (value[3] == 0))
+        || value[4] > 4_096
+        || value[5] > 1024 * 1024 * 1024
+        || ((value[4] == 0) != (value[5] == 0))
+    {
+        return Err(rusqlite::Error::IntegralValueOutOfRange(
+            68,
+            i64::try_from(value[0]).unwrap_or(i64::MAX),
+        ));
+    }
+    meta.ledger.remote_replay_scope_count = value[0];
+    meta.ledger.remote_replay_retired_scope_count = value[1];
+    meta.ledger.remote_replay_pin_count = value[2];
+    meta.ledger.remote_replay_sealed_bytes = value[3];
+    meta.ledger.remote_counter_state_count = value[4];
+    meta.ledger.remote_counter_state_sealed_bytes = value[5];
+    Ok(Some(meta))
+}
+
+fn read_meta_v12(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
+    let Some(mut meta) = read_meta_v11(connection)? else {
+        return Ok(None);
+    };
+    let raw: [i64; 6] = connection.query_row(
+        "SELECT remote_counter_guard_manifest_count,
+                remote_key_transition_count, remote_key_transition_active_count,
+                remote_key_transition_sealed_bytes, remote_key_update_outbox_count,
+                remote_key_update_outbox_sealed_bytes
+         FROM runtime_meta WHERE singleton = 1",
+        [],
+        |row| {
+            Ok([
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ])
+        },
+    )?;
+    let mut value = [0_u64; 6];
+    for (offset, raw) in raw.into_iter().enumerate() {
+        value[offset] = sqlite_nonnegative_u64(74 + offset, raw)?;
+    }
+    if value[0] > super::remote_counter_guard_manifest::MAX_REMOTE_COUNTER_GUARD_SCOPES
+        || value[1] > super::key_transition::MAX_KEY_TRANSITIONS
+        || value[2] > 1
+        || value[2] > value[1]
+        || value[3] > super::key_transition::MAX_KEY_TRANSITION_SEALED_BYTES
+        || ((value[1] == 0) != (value[3] == 0))
+        || value[4] > super::key_transition::MAX_KEY_UPDATE_ROWS
+        || value[5] > super::key_transition::MAX_KEY_UPDATE_SEALED_BYTES
+        || ((value[4] == 0) != (value[5] == 0))
+    {
+        return Err(rusqlite::Error::IntegralValueOutOfRange(
+            74,
+            i64::try_from(value[0]).unwrap_or(i64::MAX),
+        ));
+    }
+    meta.ledger.remote_counter_guard_manifest_count = value[0];
+    meta.ledger.remote_key_transition_count = value[1];
+    meta.ledger.remote_key_transition_active_count = value[2];
+    meta.ledger.remote_key_transition_sealed_bytes = value[3];
+    meta.ledger.remote_key_update_outbox_count = value[4];
+    meta.ledger.remote_key_update_outbox_sealed_bytes = value[5];
+    Ok(Some(meta))
+}
+
+fn read_meta(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
+    read_meta_v12(connection)
 }
 
 fn read_meta_v5(connection: &Connection) -> Result<Option<MetaRow>, rusqlite::Error> {
@@ -8017,6 +9608,18 @@ fn read_meta_with_sql(
                         remote_control_outbox_pending_count: 0,
                         remote_control_outbox_acknowledged_count: 0,
                         remote_control_outbox_sealed_bytes: 0,
+                        remote_replay_scope_count: 0,
+                        remote_replay_retired_scope_count: 0,
+                        remote_replay_pin_count: 0,
+                        remote_replay_sealed_bytes: 0,
+                        remote_counter_state_count: 0,
+                        remote_counter_state_sealed_bytes: 0,
+                        remote_counter_guard_manifest_count: 0,
+                        remote_key_transition_count: 0,
+                        remote_key_transition_active_count: 0,
+                        remote_key_transition_sealed_bytes: 0,
+                        remote_key_update_outbox_count: 0,
+                        remote_key_update_outbox_sealed_bytes: 0,
                         accepted_count,
                         accepted_payload_bytes,
                         started_without_fence_count,
@@ -8117,6 +9720,56 @@ fn expected_schema_manifest(version: u32) -> Result<Vec<SchemaObject>, RuntimeSt
             connection.execute_batch(RUNTIME_MIGRATION_V8)?;
             connection.execute_batch(RUNTIME_MIGRATION_V9)?;
         }
+        RUNTIME_SCHEMA_VERSION_V10 => {
+            connection.execute_batch(RUNTIME_MIGRATION_V2)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V3)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V4)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V5)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V6)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V7)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V8)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V9)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V10)?;
+        }
+        RUNTIME_SCHEMA_VERSION_V11 => {
+            connection.execute_batch(RUNTIME_MIGRATION_V2)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V3)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V4)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V5)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V6)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V7)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V8)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V9)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V10)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V11)?;
+        }
+        RUNTIME_SCHEMA_VERSION_V12 => {
+            connection.execute_batch(RUNTIME_MIGRATION_V2)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V3)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V4)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V5)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V6)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V7)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V8)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V9)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V10)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V11)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V12)?;
+        }
+        RUNTIME_SCHEMA_VERSION_V13 => {
+            connection.execute_batch(RUNTIME_MIGRATION_V2)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V3)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V4)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V5)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V6)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V7)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V8)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V9)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V10)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V11)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V12)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V13)?;
+        }
         RUNTIME_SCHEMA_VERSION => {
             connection.execute_batch(RUNTIME_MIGRATION_V2)?;
             connection.execute_batch(RUNTIME_MIGRATION_V3)?;
@@ -8127,6 +9780,10 @@ fn expected_schema_manifest(version: u32) -> Result<Vec<SchemaObject>, RuntimeSt
             connection.execute_batch(RUNTIME_MIGRATION_V8)?;
             connection.execute_batch(RUNTIME_MIGRATION_V9)?;
             connection.execute_batch(RUNTIME_MIGRATION_V10)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V11)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V12)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V13)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V14)?;
         }
         _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
     }
@@ -8325,11 +9982,7 @@ fn runtime_ledger_token_v9(
     Ok(*token.as_bytes())
 }
 
-fn runtime_ledger_token(
-    key_bundle: &RuntimeKeyBundle,
-    database_id: [u8; 16],
-    ledger: &RuntimeLedger,
-) -> Result<[u8; 32], RuntimeStoreError> {
+fn runtime_ledger_message_v10(database_id: [u8; 16], ledger: &RuntimeLedger) -> Vec<u8> {
     let mut message = runtime_ledger_message_v9(database_id, ledger);
     message.reserve(16 * std::mem::size_of::<u64>());
     message.extend_from_slice(&ledger.remote_pairing_count.to_be_bytes());
@@ -8352,7 +10005,81 @@ fn runtime_ledger_token(
             .to_be_bytes(),
     );
     message.extend_from_slice(&ledger.remote_control_outbox_sealed_bytes.to_be_bytes());
+    message
+}
+
+fn runtime_ledger_token_v10(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &RuntimeLedger,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let message = runtime_ledger_message_v10(database_id, ledger);
     let token = key_bundle.blind_index(super::schema::RUNTIME_LEDGER_DOMAIN_V10, &message)?;
+    Ok(*token.as_bytes())
+}
+
+fn runtime_ledger_token_v11(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &RuntimeLedger,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let mut message = runtime_ledger_message_v10(database_id, ledger);
+    message.reserve(6 * std::mem::size_of::<u64>());
+    message.extend_from_slice(&ledger.remote_replay_scope_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_replay_retired_scope_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_replay_pin_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_replay_sealed_bytes.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_counter_state_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_counter_state_sealed_bytes.to_be_bytes());
+    let token = key_bundle.blind_index(super::schema::RUNTIME_LEDGER_DOMAIN_V11, &message)?;
+    Ok(*token.as_bytes())
+}
+
+fn runtime_ledger_message_v12(database_id: [u8; 16], ledger: &RuntimeLedger) -> Vec<u8> {
+    let mut message = runtime_ledger_message_v10(database_id, ledger);
+    message.reserve(12 * std::mem::size_of::<u64>());
+    message.extend_from_slice(&ledger.remote_replay_scope_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_replay_retired_scope_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_replay_pin_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_replay_sealed_bytes.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_counter_state_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_counter_state_sealed_bytes.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_counter_guard_manifest_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_key_transition_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_key_transition_active_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_key_transition_sealed_bytes.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_key_update_outbox_count.to_be_bytes());
+    message.extend_from_slice(&ledger.remote_key_update_outbox_sealed_bytes.to_be_bytes());
+    message
+}
+
+fn runtime_ledger_token_v12(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &RuntimeLedger,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let message = runtime_ledger_message_v12(database_id, ledger);
+    let token = key_bundle.blind_index(super::schema::RUNTIME_LEDGER_DOMAIN_V12, &message)?;
+    Ok(*token.as_bytes())
+}
+
+fn runtime_ledger_token_v13(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &RuntimeLedger,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let message = runtime_ledger_message_v12(database_id, ledger);
+    let token = key_bundle.blind_index(super::schema::RUNTIME_LEDGER_DOMAIN_V13, &message)?;
+    Ok(*token.as_bytes())
+}
+
+fn runtime_ledger_token(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &RuntimeLedger,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let message = runtime_ledger_message_v12(database_id, ledger);
+    let token = key_bundle.blind_index(super::schema::RUNTIME_LEDGER_DOMAIN_V14, &message)?;
     Ok(*token.as_bytes())
 }
 
@@ -8534,6 +10261,50 @@ fn verify_runtime_ledger_token_v9(
     Ok(())
 }
 
+fn verify_runtime_ledger_token_v10(
+    key_bundle: &RuntimeKeyBundle,
+    meta: &MetaRow,
+) -> Result<(), RuntimeStoreError> {
+    let expected = runtime_ledger_token_v10(key_bundle, meta.database_id, &meta.ledger)?;
+    if meta.metadata_token.as_slice() != expected {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
+fn verify_runtime_ledger_token_v11(
+    key_bundle: &RuntimeKeyBundle,
+    meta: &MetaRow,
+) -> Result<(), RuntimeStoreError> {
+    let expected = runtime_ledger_token_v11(key_bundle, meta.database_id, &meta.ledger)?;
+    if meta.metadata_token.as_slice() != expected {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
+fn verify_runtime_ledger_token_v12(
+    key_bundle: &RuntimeKeyBundle,
+    meta: &MetaRow,
+) -> Result<(), RuntimeStoreError> {
+    let expected = runtime_ledger_token_v12(key_bundle, meta.database_id, &meta.ledger)?;
+    if meta.metadata_token.as_slice() != expected {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
+fn verify_runtime_ledger_token_v13(
+    key_bundle: &RuntimeKeyBundle,
+    meta: &MetaRow,
+) -> Result<(), RuntimeStoreError> {
+    let expected = runtime_ledger_token_v13(key_bundle, meta.database_id, &meta.ledger)?;
+    if meta.metadata_token.as_slice() != expected {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
 pub(crate) fn load_runtime_ledger(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
@@ -8552,6 +10323,10 @@ pub(crate) fn load_runtime_ledger(
         RUNTIME_SCHEMA_VERSION_V7 => read_meta_v7(connection)?,
         RUNTIME_SCHEMA_VERSION_V8 => read_meta_v8(connection)?,
         RUNTIME_SCHEMA_VERSION_V9 => read_meta_v9(connection)?,
+        RUNTIME_SCHEMA_VERSION_V10 => read_meta_v10(connection)?,
+        RUNTIME_SCHEMA_VERSION_V11 => read_meta_v11(connection)?,
+        RUNTIME_SCHEMA_VERSION_V12 => read_meta_v12(connection)?,
+        RUNTIME_SCHEMA_VERSION_V13 => read_meta(connection)?,
         RUNTIME_SCHEMA_VERSION => read_meta(connection)?,
         _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
     }
@@ -8568,6 +10343,10 @@ pub(crate) fn load_runtime_ledger(
         RUNTIME_SCHEMA_VERSION_V7 => verify_runtime_ledger_token_v7(key_bundle, &meta)?,
         RUNTIME_SCHEMA_VERSION_V8 => verify_runtime_ledger_token_v8(key_bundle, &meta)?,
         RUNTIME_SCHEMA_VERSION_V9 => verify_runtime_ledger_token_v9(key_bundle, &meta)?,
+        RUNTIME_SCHEMA_VERSION_V10 => verify_runtime_ledger_token_v10(key_bundle, &meta)?,
+        RUNTIME_SCHEMA_VERSION_V11 => verify_runtime_ledger_token_v11(key_bundle, &meta)?,
+        RUNTIME_SCHEMA_VERSION_V12 => verify_runtime_ledger_token_v12(key_bundle, &meta)?,
+        RUNTIME_SCHEMA_VERSION_V13 => verify_runtime_ledger_token_v13(key_bundle, &meta)?,
         RUNTIME_SCHEMA_VERSION => verify_runtime_ledger_token(key_bundle, &meta)?,
         _ => unreachable!("version matched above"),
     }
@@ -8675,10 +10454,21 @@ fn update_runtime_ledger_inner(
              remote_control_outbox_pending_count = ?54,
              remote_control_outbox_acknowledged_count = ?55,
              remote_control_outbox_sealed_bytes = ?56,
-             accepted_count = ?57, accepted_payload_bytes = ?58,
-             started_without_fence_count = ?59, started_without_release_count = ?60,
-             started_released_count = ?61, metadata_token = ?62
-         WHERE singleton = 1 AND metadata_token = ?63",
+             remote_replay_scope_count = ?57,
+             remote_replay_retired_scope_count = ?58,
+             remote_replay_pin_count = ?59, remote_replay_sealed_bytes = ?60,
+             remote_counter_state_count = ?61,
+             remote_counter_state_sealed_bytes = ?62,
+             remote_counter_guard_manifest_count = ?63,
+             remote_key_transition_count = ?64,
+             remote_key_transition_active_count = ?65,
+             remote_key_transition_sealed_bytes = ?66,
+             remote_key_update_outbox_count = ?67,
+             remote_key_update_outbox_sealed_bytes = ?68,
+             accepted_count = ?69, accepted_payload_bytes = ?70,
+             started_without_fence_count = ?71, started_without_release_count = ?72,
+             started_released_count = ?73, metadata_token = ?74
+         WHERE singleton = 1 AND metadata_token = ?75",
         params![
             next.catalog_high_water.as_deref(),
             i64::try_from(next.conversation_count)
@@ -8789,6 +10579,30 @@ fn update_runtime_ledger_inner(
             i64::try_from(next.remote_control_outbox_acknowledged_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             i64::try_from(next.remote_control_outbox_sealed_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_replay_scope_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_replay_retired_scope_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_replay_pin_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_replay_sealed_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_counter_state_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_counter_state_sealed_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_counter_guard_manifest_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_key_transition_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_key_transition_active_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_key_transition_sealed_bytes)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_key_update_outbox_count)
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
+            i64::try_from(next.remote_key_update_outbox_sealed_bytes)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
             i64::try_from(next.accepted_count)
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
@@ -8953,6 +10767,18 @@ pub(crate) fn read_rescue_index(
         (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION_V9) => {
             read_and_validate_legacy_v9_schema(connection)?;
         }
+        (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION_V10) => {
+            read_and_validate_legacy_v10_schema(connection)?;
+        }
+        (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION_V11) => {
+            read_and_validate_legacy_v11_schema(connection)?;
+        }
+        (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION_V12) => {
+            read_and_validate_legacy_v12_schema(connection)?;
+        }
+        (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION_V13) => {
+            read_and_validate_legacy_v13_schema(connection)?;
+        }
         (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION) => {
             read_and_validate_current_schema(connection)?;
         }
@@ -8989,6 +10815,65 @@ pub(crate) fn read_rescue_index(
     validate_store_files(&storage_path)?;
     ensure_store_identity(&storage_path, &original_identity)?;
     Ok(receipts)
+}
+
+/// stopped-daemon purge finalizer 的窄 existing-only 读取入口。
+///
+/// 只接受当前 schema，并用既有 StorageKEK 认证 wrapped Runtime key、完整 ledger 与
+/// CounterGuard manifest。无 WAL 时 immutable/RO 打开；有 committed WAL 时只在私有
+/// rescue 副本恢复。原 Runtime DB/WAL/SHM 不创建、不迁移、不改写。
+pub(crate) fn read_authenticated_counter_guard_manifest_existing_only(
+    storage_path: &Path,
+    storage_kek: &StorageKek,
+) -> Result<
+    (
+        [u8; 16],
+        super::remote_counter_guard_manifest::CounterGuardCleanupManifest,
+    ),
+    RuntimeStoreError,
+> {
+    let storage_path = normalize_storage_path(storage_path)?;
+    let metadata =
+        preflight_store_files(&storage_path)?.ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if metadata.len() == 0 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let original_identity = capture_store_identity(&storage_path)?;
+    let rescue = open_rescue_connection(&storage_path)?;
+    let connection = rescue.connection();
+    configure_defensive_limits(connection)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    connection
+        .pragma_update(None, "query_only", true)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    connection
+        .pragma_update(None, "trusted_schema", false)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let (family, version) = read_schema_header(connection)?;
+    if family != RUNTIME_SCHEMA_FAMILY || version != RUNTIME_SCHEMA_VERSION {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let meta = read_and_validate_current_schema(connection)?;
+    let key_context = KeyWrapAad {
+        schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+        schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+        database_id: &meta.database_id,
+    };
+    let key_bundle = RuntimeKeyBundle::unwrap(storage_kek, &key_context, &meta.wrapped_key_bundle)?;
+    if key_bundle.generation() != meta.key_generation {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    verify_runtime_ledger_token(&key_bundle, &meta)?;
+    let ledger = load_runtime_ledger(connection, &key_bundle, meta.database_id)?;
+    let manifest = super::remote_counter_guard_manifest::load_cleanup_against_ledger(
+        connection,
+        &key_bundle,
+        meta.database_id,
+        &ledger,
+    )?;
+    validate_store_files(&storage_path)?;
+    ensure_store_identity(&storage_path, &original_identity)?;
+    Ok((meta.database_id, manifest))
 }
 
 fn open_rescue_connection(storage_path: &Path) -> Result<RescueConnection, RuntimeStoreError> {

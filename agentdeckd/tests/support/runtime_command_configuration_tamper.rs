@@ -1,4 +1,4 @@
-//! Command configuration pin 的 current-v10 篡改测试支撑。
+//! Command configuration pin 的 current-v14 篡改测试支撑。
 //!
 //! 所有 SQLite 读取都发生在 tamper 前：先用 production `RuntimeKeyBundle`
 //! 解包密钥并自证现有 pin/runtime ledger token，随后只执行一次定向写入。
@@ -18,7 +18,7 @@ use agentdeckd::security::StorageKek;
 use rusqlite::{Connection, params};
 
 const COMMAND_PIN_METADATA_DOMAIN: &[u8] = b"command.configuration.pin.metadata.v1";
-const RUNTIME_LEDGER_DOMAIN_V10: &[u8] = b"runtime.meta.ledger.v10";
+const RUNTIME_LEDGER_DOMAIN_V14: &[u8] = b"runtime.meta.ledger.v14";
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,6 +154,18 @@ struct Ledger {
     remote_control_outbox_pending_count: u64,
     remote_control_outbox_acknowledged_count: u64,
     remote_control_outbox_sealed_bytes: u64,
+    remote_replay_scope_count: u64,
+    remote_replay_retired_scope_count: u64,
+    remote_replay_pin_count: u64,
+    remote_replay_sealed_bytes: u64,
+    remote_counter_state_count: u64,
+    remote_counter_state_sealed_bytes: u64,
+    remote_counter_guard_manifest_count: u64,
+    remote_key_transition_count: u64,
+    remote_key_transition_active_count: u64,
+    remote_key_transition_sealed_bytes: u64,
+    remote_key_update_outbox_count: u64,
+    remote_key_update_outbox_sealed_bytes: u64,
     accepted_count: u64,
     accepted_payload_bytes: u64,
     started_without_fence_count: u64,
@@ -212,7 +224,7 @@ impl VerifiedTamperContext {
         assert_eq!(
             ledger_token,
             ledger_metadata_token(&key_bundle, database_id, &ledger),
-            "test helper must reproduce the existing production v10 ledger token"
+            "test helper must reproduce the existing production v14 ledger token"
         );
 
         let mut statement = connection
@@ -480,7 +492,14 @@ fn read_ledger(connection: &Connection) -> (Ledger, Vec<u8>) {
                     remote_key_directory_count, remote_key_directory_sealed_bytes,
                     remote_control_outbox_count, remote_control_outbox_pending_count,
                     remote_control_outbox_acknowledged_count,
-                    remote_control_outbox_sealed_bytes, metadata_token
+                    remote_control_outbox_sealed_bytes,
+                    remote_replay_scope_count, remote_replay_retired_scope_count,
+                    remote_replay_pin_count, remote_replay_sealed_bytes,
+                    remote_counter_state_count, remote_counter_state_sealed_bytes,
+                    remote_counter_guard_manifest_count, remote_key_transition_count,
+                    remote_key_transition_active_count, remote_key_transition_sealed_bytes,
+                    remote_key_update_outbox_count, remote_key_update_outbox_sealed_bytes,
+                    metadata_token
              FROM runtime_meta WHERE singleton = 1",
             [],
             |row| {
@@ -547,12 +566,24 @@ fn read_ledger(connection: &Connection) -> (Ledger, Vec<u8>) {
                         remote_control_outbox_pending_count: nonnegative(row.get(58)?, 58)?,
                         remote_control_outbox_acknowledged_count: nonnegative(row.get(59)?, 59)?,
                         remote_control_outbox_sealed_bytes: nonnegative(row.get(60)?, 60)?,
+                        remote_replay_scope_count: nonnegative(row.get(61)?, 61)?,
+                        remote_replay_retired_scope_count: nonnegative(row.get(62)?, 62)?,
+                        remote_replay_pin_count: nonnegative(row.get(63)?, 63)?,
+                        remote_replay_sealed_bytes: nonnegative(row.get(64)?, 64)?,
+                        remote_counter_state_count: nonnegative(row.get(65)?, 65)?,
+                        remote_counter_state_sealed_bytes: nonnegative(row.get(66)?, 66)?,
+                        remote_counter_guard_manifest_count: nonnegative(row.get(67)?, 67)?,
+                        remote_key_transition_count: nonnegative(row.get(68)?, 68)?,
+                        remote_key_transition_active_count: nonnegative(row.get(69)?, 69)?,
+                        remote_key_transition_sealed_bytes: nonnegative(row.get(70)?, 70)?,
+                        remote_key_update_outbox_count: nonnegative(row.get(71)?, 71)?,
+                        remote_key_update_outbox_sealed_bytes: nonnegative(row.get(72)?, 72)?,
                     },
-                    row.get(61)?,
+                    row.get(73)?,
                 ))
             },
         )
-        .expect("read current-v10 authenticated runtime ledger")
+        .expect("read current-v14 authenticated runtime ledger")
 }
 
 fn nonnegative(value: i64, column: usize) -> rusqlite::Result<u64> {
@@ -564,7 +595,7 @@ fn ledger_metadata_token(
     database_id: [u8; 16],
     ledger: &Ledger,
 ) -> Vec<u8> {
-    let mut message = Vec::with_capacity(528);
+    let mut message = Vec::with_capacity(624);
     message.extend_from_slice(&database_id);
     encode_optional_sequence(&mut message, ledger.catalog_high_water.as_deref());
     for value in [
@@ -647,9 +678,25 @@ fn ledger_metadata_token(
     ] {
         message.extend_from_slice(&value.to_be_bytes());
     }
+    for value in [
+        ledger.remote_replay_scope_count,
+        ledger.remote_replay_retired_scope_count,
+        ledger.remote_replay_pin_count,
+        ledger.remote_replay_sealed_bytes,
+        ledger.remote_counter_state_count,
+        ledger.remote_counter_state_sealed_bytes,
+        ledger.remote_counter_guard_manifest_count,
+        ledger.remote_key_transition_count,
+        ledger.remote_key_transition_active_count,
+        ledger.remote_key_transition_sealed_bytes,
+        ledger.remote_key_update_outbox_count,
+        ledger.remote_key_update_outbox_sealed_bytes,
+    ] {
+        message.extend_from_slice(&value.to_be_bytes());
+    }
     key_bundle
-        .blind_index(RUNTIME_LEDGER_DOMAIN_V10, &message)
-        .expect("compute current-v10 runtime ledger token")
+        .blind_index(RUNTIME_LEDGER_DOMAIN_V14, &message)
+        .expect("compute current-v14 runtime ledger token")
         .as_bytes()
         .to_vec()
 }

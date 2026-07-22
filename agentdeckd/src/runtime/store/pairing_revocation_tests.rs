@@ -4,25 +4,37 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use agentdeck_crypto::{SigningKey, sign_tbs};
+use agentdeck_protocol::e2ee::KeyPurpose;
 use agentdeck_protocol::relay_v2::frame::{OpaqueRouteFrame, RelayFrameBody, RevocationCommitted};
 use agentdeck_protocol::relay_v2::{
     DeviceRevocation, DeviceRouteId, Ed25519Signature, GrantSerial, MachineRouteId,
     RELAY_PROTOCOL_VERSION, RelayGrant, RootKeyId, TrustEpoch, decode, encode,
 };
-use agentdeck_protocol::runtime::PairingReceipt;
 use agentdeck_protocol::runtime::identity::{DeviceHandle, GrantSerial as RuntimeGrantSerial};
+use agentdeck_protocol::runtime::{PairingReceipt, StreamCursor};
+use tokio::sync::Semaphore;
 
+use crate::runtime::backfill::BarrierRequest;
+use crate::runtime::catalog_snapshot::CatalogSnapshotProvider;
+use crate::runtime::connection::PrincipalIssuer;
+use crate::runtime::events::{RegisterStreamBarrier, RuntimeStreamTarget, WatchGeneration};
 use crate::runtime::model::{
-    MachineIdentityBinding, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
-    RuntimeStoreOperation,
+    ConversationDescriptor, MachineIdentityBinding, NewConversation, RuntimeCommitOperation,
+    RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
 };
+use crate::runtime::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
 use super::RuntimeStoreHandle;
 use super::identity::{RuntimeId, RuntimeIdKind};
 use super::pairing::PairingInviteLifecycle;
+use super::pairing_grant::{ConversationKeyRotation, GlobalKeyStateV1};
+use super::pairing_grant_allocation_tests::complete_active_membership_transition;
 use super::pairing_grant_commit::AcknowledgeGrantCommitted;
-use super::pairing_grant_tests::{awaiting_pairing, grant_input};
+use super::pairing_grant_tests::{
+    awaiting_pairing, awaiting_pairing_with, complete_active_zero_cut_transition, grant_input,
+    grant_input_with, secret,
+};
 use super::pairing_grant_tx::{ConfirmPairingGrantOutcome, GrantPreparingRecovery};
 use super::pairing_revocation::{
     BeginDeviceRevocation, BeginDeviceRevocationOutcome, RevocationRecoveryPhase,
@@ -35,6 +47,7 @@ use super::pairing_revocation_ack::{
 use super::pairing_tests::{
     GenerousCapacity, NOW_MS, OneShotFault, RELAY, TestClock, TestRoot, artifact_bytes, make_active,
 };
+use super::publication::PublicationScope;
 
 const ROOT_SEED: [u8; 32] = [0x41; 32];
 const PAIRING_EXPIRY_MS: u64 = NOW_MS + 300_000;
@@ -135,6 +148,19 @@ async fn prepare_installing_grant(
     (binding, pairing_id, recovery, grant)
 }
 
+async fn cancel_active_grant_transition(store: &RuntimeStoreHandle) {
+    if let Some(recovery) = store
+        .load_active_key_transition()
+        .await
+        .expect("load active grant transition before cancellation")
+    {
+        store
+            .cancel_key_transition(recovery.transition.operation_id)
+            .await
+            .expect("cancel superseded grant transition before revocation");
+    }
+}
+
 async fn begin_expired_orphan(
     store: &RuntimeStoreHandle,
     clock: &AtomicU64,
@@ -142,6 +168,7 @@ async fn begin_expired_orphan(
     let (binding, pairing_id, _, grant) = prepare_installing_grant(store).await;
     let revocation = signed_revocation(&grant, &binding);
     clock.store(PAIRING_EXPIRY_MS, Ordering::SeqCst);
+    cancel_active_grant_transition(store).await;
     assert!(matches!(
         store
             .begin_device_revocation(BeginDeviceRevocation::orphan(
@@ -154,6 +181,28 @@ async fn begin_expired_orphan(
             if recovery.phase() == RevocationRecoveryPhase::AwaitingGrantCommit
     ));
     (pairing_id, grant, revocation)
+}
+
+async fn create_active_conversation_stream(store: &RuntimeStoreHandle, seed: u8) -> RuntimeId {
+    let conversation_id =
+        RuntimeId::from_bytes(RuntimeIdKind::Conversation, [seed; 16]).expect("conversation id");
+    store
+        .create_conversation(NewConversation {
+            conversation_id,
+            adapter_state_key: RuntimeId::from_bytes(
+                RuntimeIdKind::AdapterState,
+                [seed.wrapping_add(1); 16],
+            )
+            .expect("adapter state key"),
+            descriptor: ConversationDescriptor {
+                agent_kind: agentdeck_protocol::AgentKind::Codex,
+                title: Some(format!("ADGK2 revoke conversation {seed}")),
+                cwd: std::path::PathBuf::from(format!("/tmp/adgk2-revoke-{seed}")),
+            },
+        })
+        .await
+        .expect("create active conversation");
+    conversation_id
 }
 
 #[test]
@@ -217,6 +266,7 @@ async fn expired_preparing_grant_revokes_in_strict_order_and_recovers_after_rest
     });
 
     clock.store(PAIRING_EXPIRY_MS, Ordering::SeqCst);
+    cancel_active_grant_transition(&store).await;
     let due = store
         .list_due_orphan_revocation_targets()
         .await
@@ -401,6 +451,7 @@ async fn local_pre_expiry_revocation_cancels_undelivered_pairing_and_cannot_repl
         ))
         .await
         .expect("activate grant before local revoke");
+    complete_active_zero_cut_transition(&store).await;
 
     let handle = device_handle(grant.device_route);
     let runtime_serial = RuntimeGrantSerial::new(grant.grant_serial.value());
@@ -501,6 +552,309 @@ async fn local_pre_expiry_revocation_cancels_undelivered_pairing_and_cannot_repl
 }
 
 #[tokio::test]
+async fn local_revoke_atomically_rotates_all_production_shared_keys_and_remaining_authorization() {
+    let root = TestRoot::new("revocation-local-adgk2-rotation");
+    let keys = MemoryKeyStore::new();
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let store = RuntimeStoreHandle::open(
+        config(&root, clock.clone()).with_fault_injector(Arc::new(OneShotFault {
+            operation: RuntimeStoreOperation::BeginDeviceRevocationBeforeCommit,
+            fired: AtomicBool::new(false),
+        })),
+        load_or_create_storage_kek(&keys, &root.database()).expect("load StorageKEK"),
+    )
+    .await
+    .expect("open ADGK2 revoke store");
+    store
+        .create_publication_stream(
+            [0x21; 16],
+            PublicationScope::Catalog,
+            [0x22; 16],
+            [0x23; 16],
+        )
+        .await
+        .expect("create catalog publication stream");
+    let _first_conversation = create_active_conversation_stream(&store, 0x31).await;
+    let _second_conversation = create_active_conversation_stream(&store, 0x41).await;
+    let principal = PrincipalIssuer::local_only(
+        store
+            .machine_trust_domain()
+            .expect("load ADGK2 catalog snapshot trust domain"),
+    )
+    .issue_verified_local(503, [0x24; 16])
+    .expect("issue ADGK2 catalog snapshot principal");
+    let catalog_provider = CatalogSnapshotProvider::with_clock(
+        store.clone(),
+        Arc::new(TestClock(clock.clone())),
+        Arc::new(Semaphore::new(SNAPSHOT_BUILD_MEMORY_BYTES)),
+    )
+    .expect("create ADGK2 catalog snapshot provider");
+    let mut catalog_registration = store
+        .register_stream_barrier(RegisterStreamBarrier {
+            target: RuntimeStreamTarget::Catalog,
+            generation: WatchGeneration::new(1).expect("ADGK2 catalog snapshot generation"),
+            request: BarrierRequest::Subscribe {
+                cursor: StreamCursor::BeforeFirst,
+            },
+        })
+        .await
+        .expect("capture ADGK2 catalog snapshot barrier");
+    let catalog_page = catalog_provider
+        .first_page(&mut catalog_registration, &principal)
+        .await
+        .expect("materialize ADGK2 catalog publication baseline");
+    drop(catalog_page);
+    drop(catalog_registration);
+    drop(catalog_provider);
+    let (binding, data_cert) = make_active(&store).await;
+
+    let first_preparation = awaiting_pairing(&store, &binding, &data_cert).await;
+    let first_fingerprint =
+        agentdeck_crypto::sha256(&first_preparation.request().device_sign_pubkey.0);
+    let active_conversation_routes = match store
+        .load_grant_allocation(first_preparation.pairing_id(), first_fingerprint)
+        .await
+        .expect("load authenticated deferred conversation routes")
+    {
+        super::pairing_grant_allocation::GrantAllocationProjection::New {
+            current_global_keys: None,
+            active_conversation_routes,
+            ..
+        } => active_conversation_routes,
+        _ => panic!("first grant must use a fresh allocation"),
+    };
+    assert_eq!(active_conversation_routes.len(), 2);
+    let first_stream = active_conversation_routes[0];
+    let second_stream = active_conversation_routes[1];
+    let first_route = DeviceRouteId::from_bytes([0xd1; 16]);
+    let first_global = GlobalKeyStateV1::bootstrap_with_conversations(
+        1,
+        1,
+        secret(0xc1),
+        first_route,
+        1,
+        secret(0xc2),
+        1,
+        secret(0xc3),
+        vec![
+            ConversationKeyRotation::new(first_stream, secret(0xc4)),
+            ConversationKeyRotation::new(second_stream, secret(0xc5)),
+        ],
+    )
+    .expect("bootstrap first global state with deferred conversation keys");
+    let first = store
+        .confirm_pairing_grant(grant_input_with(
+            &first_preparation,
+            &binding,
+            &data_cert,
+            first_route,
+            GrantSerial::new(1),
+            first_global,
+            None,
+            0xd2,
+        ))
+        .await
+        .expect("confirm first active device");
+    let first_recovery = match first {
+        ConfirmPairingGrantOutcome::Confirmed { recovery, .. } => recovery,
+        other => panic!("first device must confirm: {other:?}"),
+    };
+    let first_grant = grant_from_install(&first_recovery);
+    store
+        .acknowledge_grant_committed(AcknowledgeGrantCommitted::new(
+            first_recovery.pairing_id(),
+            grant_committed_frame(&first_grant),
+        ))
+        .await
+        .expect("activate first authorization");
+    complete_active_membership_transition(&store, &clock).await;
+
+    let second_preparation = awaiting_pairing_with(
+        &store,
+        &binding,
+        &data_cert,
+        agentdeck_protocol::relay_v2::PairRouteId::from_bytes([0xb1; 16]),
+        0xb2,
+        0xb3,
+        0xb4,
+        0xb5,
+        0xb6,
+        0xb7,
+        "revocation-local-adgk2-second",
+    )
+    .await;
+    let second_route = DeviceRouteId::from_bytes([0xd2; 16]);
+    let second_global = store
+        .load_global_key_state()
+        .await
+        .expect("load first global state")
+        .expect("first global state exists")
+        .plan_add_device(
+            second_route,
+            secret(0xe1),
+            secret(0xe2),
+            secret(0xe3),
+            vec![
+                ConversationKeyRotation::new(first_stream, secret(0xe4)),
+                ConversationKeyRotation::new(second_stream, secret(0xe5)),
+            ],
+            NOW_MS,
+        )
+        .expect("plan second active member")
+        .into_state();
+    let second = store
+        .confirm_pairing_grant(grant_input_with(
+            &second_preparation,
+            &binding,
+            &data_cert,
+            second_route,
+            GrantSerial::new(1),
+            second_global,
+            None,
+            0xe6,
+        ))
+        .await
+        .expect("confirm second active device");
+    let second_recovery = match second {
+        ConfirmPairingGrantOutcome::Confirmed { recovery, .. } => recovery,
+        other => panic!("second device must confirm: {other:?}"),
+    };
+    let second_grant = grant_from_install(&second_recovery);
+    store
+        .acknowledge_grant_committed(AcknowledgeGrantCommitted::new(
+            second_recovery.pairing_id(),
+            grant_committed_frame(&second_grant),
+        ))
+        .await
+        .expect("activate second authorization");
+    let second_transition = store
+        .load_active_key_transition()
+        .await
+        .expect("load second-device transition")
+        .expect("second-device transition exists");
+    assert_eq!(second_transition.transition.from_revision, 1);
+    assert_eq!(second_transition.transition.to_revision, 2);
+    complete_active_membership_transition(&store, &clock).await;
+
+    let revocation = signed_revocation(&first_grant, &binding);
+    clock.store(NOW_MS + 1, Ordering::SeqCst);
+    let before_fault = artifact_bytes(&root.database());
+    store
+        .begin_device_revocation(BeginDeviceRevocation::local(revocation.clone()))
+        .await
+        .expect_err("before-COMMIT revoke fault must roll back every rotation write");
+    assert_eq!(artifact_bytes(&root.database()), before_fault);
+    let unchanged = store
+        .load_global_key_state()
+        .await
+        .expect("load global state after rollback")
+        .expect("global state remains");
+    assert_eq!(unchanged.revision().value(), 2);
+    assert_eq!(
+        unchanged
+            .shared_key_epochs_for_test()
+            .into_iter()
+            .map(|(_, epoch)| epoch)
+            .collect::<Vec<_>>(),
+        vec![2, 2, 2]
+    );
+
+    assert!(matches!(
+        store
+            .begin_device_revocation(BeginDeviceRevocation::local(revocation.clone()))
+            .await
+            .expect("retry exact local revoke"),
+        BeginDeviceRevocationOutcome::Prepared { recovery }
+            if recovery.phase() == RevocationRecoveryPhase::ReadyToRevoke
+    ));
+    let transition = store
+        .load_active_key_transition()
+        .await
+        .expect("load revoke transition")
+        .expect("revoke transition is durable in the membership transaction");
+    let retirement = transition
+        .transition
+        .replay_retirement
+        .expect("revoke freezes the old DeviceCommandTx replay scope");
+    assert_eq!(
+        retirement.scope,
+        super::remote_replay::canonical_device_command_scope(
+            *first_grant.machine_route.as_bytes(),
+            first_grant.trust_epoch.value(),
+            *first_route.as_bytes(),
+            first_grant.grant_serial.value(),
+            1,
+        )
+        .expect("canonical old revoke replay scope"),
+    );
+    assert_eq!(retirement.old_reply_key_epoch, 1);
+    assert_eq!(
+        retirement.lifecycle,
+        super::key_transition::ReplayRetirementLifecycle::Pending,
+    );
+    let rotated = store
+        .load_global_key_state()
+        .await
+        .expect("load rotated global state")
+        .expect("rotated global state exists");
+    assert_eq!(rotated.revision().value(), 3);
+    assert_eq!(
+        rotated
+            .shared_key_epochs_for_test()
+            .into_iter()
+            .map(|(_, epoch)| epoch)
+            .collect::<Vec<_>>(),
+        vec![3, 3, 3]
+    );
+    assert_eq!(
+        rotated.device_revoked_at_for_test(first_route),
+        Some(NOW_MS + 1)
+    );
+    assert!(
+        rotated.bootstrap_view(first_route).is_err(),
+        "revoked device must not obtain a bootstrap containing the new catalog epoch"
+    );
+    assert!(
+        rotated
+            .device_transport_key(first_route, KeyPurpose::DeviceReplyTx)
+            .is_err(),
+        "revoked device must not retain key-directory access"
+    );
+    assert_eq!(
+        rotated
+            .device_transport_key(second_route, KeyPurpose::DeviceReplyTx)
+            .expect("remaining active device retains directed reply access")
+            .epoch,
+        1
+    );
+
+    let before_replay = artifact_bytes(&root.database());
+    assert!(matches!(
+        store
+            .begin_device_revocation(BeginDeviceRevocation::local(revocation))
+            .await
+            .expect("replay exact committed local revoke"),
+        BeginDeviceRevocationOutcome::Replayed { recovery }
+            if recovery.phase() == RevocationRecoveryPhase::ReadyToRevoke
+    ));
+    assert_eq!(artifact_bytes(&root.database()), before_replay);
+    store.shutdown().await.expect("shutdown ADGK2 revoke store");
+
+    let connection = rusqlite::Connection::open(root.database()).expect("open authorization DB");
+    let active_revisions = connection
+        .prepare(
+            "SELECT key_directory_revision FROM remote_authorization_ledger
+             WHERE lifecycle = 'active' ORDER BY device_route, grant_serial",
+        )
+        .expect("prepare active revision evidence")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query active revision evidence")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect active revision evidence");
+    assert_eq!(active_revisions, vec!["00000000000000000003"]);
+}
+
+#[tokio::test]
 async fn revocation_begin_fault_boundaries_converge_by_restart_and_exact_retry() {
     for (label, operation, committed) in [
         (
@@ -526,6 +880,7 @@ async fn revocation_begin_fault_boundaries_converge_by_restart_and_exact_retry()
         let (binding, pairing_id, _, grant) = prepare_installing_grant(&setup).await;
         let revocation = signed_revocation(&grant, &binding);
         clock.store(PAIRING_EXPIRY_MS, Ordering::SeqCst);
+        cancel_active_grant_transition(&setup).await;
         setup.shutdown().await.expect("shutdown begin-fault setup");
 
         let faulted = RuntimeStoreHandle::open(

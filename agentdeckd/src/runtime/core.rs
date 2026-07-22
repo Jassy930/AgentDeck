@@ -44,6 +44,10 @@ use super::conversation::{
     ActiveCancelResult, ConversationError, ConversationRegistry, PromptAcceptResult,
     QueuedCancelResult,
 };
+use super::conversation_activation::{
+    ConversationActivationCoordinator, ConversationActivationError,
+    DisabledConversationActivationCoordinator,
+};
 use super::execution::{
     DisabledExecutionCoordinator, GatedExecutionCoordinator, RuntimeExecutionCoordinator,
 };
@@ -70,6 +74,7 @@ use super::revocation_administration::{
 };
 use super::router::AgentRouter;
 use super::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
+use super::store::key_transition::{KeyTransitionStreamScope, TransitionSnapshotPermit};
 use super::store::{
     ActiveRemoteIngressProof, CommandReceiptSelector, CommandState, ConfigureConversation,
     ConfigureConversationOutcome, ConversationDescriptor, CreateConversationOutcome,
@@ -120,6 +125,7 @@ pub struct RuntimeCore {
     remote_administration: Arc<dyn RemoteAdministration>,
     pairing_administration: Arc<dyn PairingAdministration>,
     revocation_administration: Arc<dyn RevocationAdministration>,
+    conversation_activation: Arc<dyn ConversationActivationCoordinator>,
     recovery_identity: Arc<()>,
     recovery: RuntimeRecoveryCoordinator,
     read_pool: ReadPool,
@@ -244,6 +250,17 @@ impl RuntimeCore {
         self
     }
 
+    /// production composition 注入 daemon-private transition owner。Core 只在 Store
+    /// 已原子建立 conversation activation 后调用，不取得任何 Relay/crypto 类型。
+    #[doc(hidden)]
+    pub fn with_conversation_activation(
+        mut self,
+        conversation_activation: Arc<dyn ConversationActivationCoordinator>,
+    ) -> Self {
+        self.conversation_activation = conversation_activation;
+        self
+    }
+
     /// 返回只持有 bounded connection registry 的弱耦合 pending sink；RemoteManager
     /// 可在 Core 被 `Arc` 包装后单次安装，不形成 Core↔manager 强引用环。
     #[doc(hidden)]
@@ -320,6 +337,7 @@ impl RuntimeCore {
             remote_administration: Arc::new(DisabledRemoteAdministration),
             pairing_administration: Arc::new(DisabledPairingAdministration),
             revocation_administration: Arc::new(DisabledRevocationAdministration),
+            conversation_activation: Arc::new(DisabledConversationActivationCoordinator),
             recovery_identity,
             recovery,
             read_pool: ReadPool::new(DEFAULT_RUNTIME_READ_CONCURRENCY)?,
@@ -416,6 +434,15 @@ impl RuntimeCore {
     #[cfg(test)]
     pub(crate) fn remote_registration_calls_for_test(&self) -> usize {
         self.remote_registration_calls.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_sender_usage_for_test(&self) -> usize {
+        let (_, _, snapshot_senders, _) = self
+            .subscriptions
+            .metrics_for_test()
+            .expect("read RuntimeCore snapshot sender usage");
+        snapshot_senders
     }
 
     /// 消费与 exact Current proof 同源的 staged lease；调用方只有在本 activation
@@ -561,6 +588,121 @@ impl RuntimeCore {
                 body: RuntimeMessage::Reply(reply),
             },
         )
+    }
+
+    /// Active Add transition 的唯一 RuntimeCore 入口。RemoteLink 已完成完整 ingress
+    /// 验证与 Store permit admission；Core 仍逐轴复核 exact Subscribe(BeforeFirst)，
+    /// 并把 opaque permit 交给专用 subscription capture，绝不回退 generic barrier。
+    pub(crate) async fn handle_transition_snapshot_envelope(
+        &self,
+        connection_id: ConnectionId,
+        envelope: RuntimeEnvelope,
+        permit: TransitionSnapshotPermit,
+    ) -> Result<(), RuntimeFailure> {
+        let principal = self
+            .connections
+            .principal(connection_id)
+            .map_err(|error| RuntimeCoreError::Connection(error).into_failure())?;
+        let operation = self
+            .try_enter_operation()
+            .map_err(RuntimeCoreError::into_failure)?;
+        let RuntimeEnvelope {
+            version,
+            message_id,
+            body,
+        } = envelope;
+        if version != RUNTIME_PROTOCOL_VERSION {
+            return self.enqueue_stream_failure(
+                &operation,
+                connection_id,
+                message_id,
+                RuntimeFailure::new(
+                    DAEMON_RUNTIME_PROTOCOL_MISMATCH,
+                    "runtime protocol version is incompatible",
+                ),
+            );
+        }
+        let RuntimeMessage::Request(RuntimeRequest::Subscribe { inner_cursor }) = body else {
+            return self.enqueue_stream_failure(
+                &operation,
+                connection_id,
+                message_id,
+                RuntimeFailure::new(
+                    DAEMON_RUNTIME_INVALID_REQUEST,
+                    "transition snapshot accepts exact subscribe only",
+                ),
+            );
+        };
+        let (target, cursor) = match parse_inner_cursor(inner_cursor) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.enqueue_stream_failure(
+                    &operation,
+                    connection_id,
+                    message_id,
+                    error.into_failure(),
+                );
+            }
+        };
+        let expected_target = match transition_snapshot_target(&permit) {
+            Ok(target) => target,
+            Err(error) => {
+                return self.enqueue_stream_failure(
+                    &operation,
+                    connection_id,
+                    message_id,
+                    error.into_failure(),
+                );
+            }
+        };
+        if target != expected_target
+            || cursor != agentdeck_protocol::runtime::StreamCursor::BeforeFirst
+        {
+            return self.enqueue_stream_failure(
+                &operation,
+                connection_id,
+                message_id,
+                RuntimeFailure::new(
+                    DAEMON_RUNTIME_INVALID_REQUEST,
+                    "transition snapshot axes do not match Store permit",
+                ),
+            );
+        }
+        let authorization = match target {
+            super::events::RuntimeStreamTarget::Catalog => {
+                principal.try_enter_runtime_permission(AuthorizationPermissionV1::CatalogRead)
+            }
+            super::events::RuntimeStreamTarget::Conversation(_) => {
+                principal.try_enter_runtime_permission(AuthorizationPermissionV1::ConversationRead)
+            }
+        };
+        let _authorization = match authorization {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                return self.enqueue_stream_failure(
+                    &operation,
+                    connection_id,
+                    message_id,
+                    RuntimeCoreError::from(error).into_failure(),
+                );
+            }
+        };
+        match self
+            .subscriptions
+            .prepare_transition_snapshot(connection_id, message_id.clone(), target, permit)
+            .await
+        {
+            Ok(prepared) => prepared
+                .commit()
+                .await
+                .map_err(|error| error.into_failure()),
+            Err(error) => self.enqueue_stream_failure(
+                &operation,
+                connection_id,
+                message_id,
+                error.into_failure(),
+            ),
+        }
     }
 
     /// StageUpgrade 是唯一把 transport flush ACK 作为副作用许可的 Runtime request。
@@ -874,10 +1016,22 @@ impl RuntimeCore {
                         }
                         other => RuntimeCoreError::Store(other),
                     })?;
-                let (conversation, replayed) = match outcome {
-                    CreateConversationOutcome::Created { conversation } => (conversation, false),
-                    CreateConversationOutcome::Replayed { conversation } => (conversation, true),
+                let (conversation, replayed, conversation_activation_pending) = match outcome {
+                    CreateConversationOutcome::Created {
+                        conversation,
+                        conversation_activation_pending,
+                    } => (conversation, false, conversation_activation_pending),
+                    CreateConversationOutcome::Replayed {
+                        conversation,
+                        conversation_activation_pending,
+                    } => (conversation, true, conversation_activation_pending),
                 };
+                if conversation_activation_pending {
+                    self.conversation_activation
+                        .drive_to_business_ready()
+                        .await
+                        .map_err(RuntimeCoreError::ConversationActivation)?;
+                }
                 self.conversations
                     .install(conversation.clone(), Vec::new())
                     .await?;
@@ -1825,6 +1979,8 @@ pub(crate) enum RuntimeCoreError {
     PairingAdministration(PairingAdministrationError),
     #[error("revocation administration failed: {0:?}")]
     RevocationAdministration(RevocationAdministrationError),
+    #[error("conversation activation failed: {0:?}")]
+    ConversationActivation(ConversationActivationError),
     #[error(transparent)]
     HistoryReceipt(#[from] HistoryOnlyReceiptError),
     #[error(transparent)]
@@ -1897,6 +2053,10 @@ impl RuntimeCoreError {
             Self::RevocationAdministration(error) => {
                 RuntimeFailure::new(error.code(), "device revocation administration failed")
             }
+            Self::ConversationActivation(error) => RuntimeFailure::new(
+                error.code(),
+                "remote conversation activation did not reach business-ready",
+            ),
             Self::HistoryReceipt(_) => RuntimeFailure::new(
                 DAEMON_RUNTIME_READ_UNAVAILABLE,
                 "runtime history receipt index is unavailable",
@@ -2014,6 +2174,19 @@ fn random_runtime_id(kind: RuntimeIdKind) -> Result<RuntimeId, RuntimeCoreError>
         }
     }
     Err(RuntimeCoreError::EntropyUnavailable)
+}
+
+fn transition_snapshot_target(
+    permit: &TransitionSnapshotPermit,
+) -> Result<super::events::RuntimeStreamTarget, RuntimeCoreError> {
+    match permit.scope() {
+        KeyTransitionStreamScope::Catalog => Ok(super::events::RuntimeStreamTarget::Catalog),
+        KeyTransitionStreamScope::Conversation(bytes) => {
+            RuntimeId::from_bytes(RuntimeIdKind::Conversation, bytes)
+                .map(super::events::RuntimeStreamTarget::Conversation)
+                .map_err(|_| RuntimeCoreError::InvalidRequest)
+        }
+    }
 }
 
 fn parse_inner_cursor(

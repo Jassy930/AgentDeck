@@ -134,6 +134,50 @@ struct CountingRevocationAdministration {
     failure_code: Option<&'static str>,
 }
 
+struct ToggleConversationActivation {
+    calls: AtomicUsize,
+    fail: AtomicBool,
+}
+
+struct CompletingConversationActivation {
+    store: RuntimeStoreHandle,
+}
+
+impl ToggleConversationActivation {
+    fn failing() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            fail: AtomicBool::new(true),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::ConversationActivationCoordinator for ToggleConversationActivation {
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<(), crate::runtime::ConversationActivationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            Err(crate::runtime::ConversationActivationError::new(
+                "daemon.remote.test_activation_blocked",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::ConversationActivationCoordinator for CompletingConversationActivation {
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<(), crate::runtime::ConversationActivationError> {
+        crate::runtime::store::complete_active_zero_cut_transition(&self.store).await;
+        Ok(())
+    }
+}
+
 impl CountingRevocationAdministration {
     fn succeeding() -> Self {
         Self {
@@ -3045,6 +3089,61 @@ async fn approval_requests_require_canonical_approval_ids() {
 }
 
 #[tokio::test]
+async fn paired_start_requires_durable_conversation_activation_before_success_receipt() {
+    let root = TestRoot::new("paired-start-activation");
+    let store = active_authorization_store_with_permissions_for_test(
+        &root.database(),
+        root.kek(),
+        vec![AuthorizationCapabilityV1::Conversation],
+        vec![AuthorizationPermissionV1::ConversationStart],
+    )
+    .await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let activation = Arc::new(ToggleConversationActivation::failing());
+    let core = Arc::new(
+        RuntimeCore::new(store.clone(), router, [0xA7; 32])
+            .expect("construct paired activation Core")
+            .with_conversation_activation(activation.clone()),
+    );
+    core.recover()
+        .await
+        .expect("recover paired activation Core");
+    let connection = connect_local(&core, 0x71).await;
+
+    let blocked = core
+        .handle(connection, start_request("paired-activation-start"))
+        .await;
+    assert!(matches!(
+        blocked,
+        RuntimeReply::Failure(RuntimeFailure { code, .. })
+            if code == "daemon.remote.test_activation_blocked"
+    ));
+    let transition = store
+        .load_active_key_transition()
+        .await
+        .expect("load durable activation after blocked receipt")
+        .expect("activation remains recoverable");
+    assert_eq!(
+        transition.transition.operation,
+        crate::runtime::store::key_transition::KeyTransitionOperation::ActivateConversation
+    );
+    assert_eq!(core.actor_count().await, 0);
+
+    activation.fail.store(false, Ordering::SeqCst);
+    let replayed = start_receipt(
+        core.handle(connection, start_request("paired-activation-start"))
+            .await,
+    );
+    assert!(replayed.replayed);
+    assert_eq!(activation.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(core.actor_count().await, 1);
+
+    core.shutdown()
+        .await
+        .expect("shutdown paired activation Core");
+}
+
+#[tokio::test]
 async fn start_is_pure_durable_idempotent_then_prompt_and_query_are_separate() {
     let root = TestRoot::new("start-query");
     let core = core(&root).await;
@@ -5005,6 +5104,9 @@ async fn canonical_remote_revoke_fences_accepted_before_durable_backend_and_retr
             Arc::new(execution.clone()),
         )
         .expect("construct held revoke Core")
+        .with_conversation_activation(Arc::new(CompletingConversationActivation {
+            store: store.clone(),
+        }))
         .with_revocation_administration(revocation),
     );
     core.recover().await.expect("recover held revoke Core");
@@ -5228,6 +5330,7 @@ async fn recovery_blocked_is_strictly_read_only_without_blocking_a_healthy_conve
             })
             .await
             .expect("create recovery policy conversation");
+        crate::runtime::store::complete_active_zero_cut_transition(&store).await;
     }
     store
         .mark_conversation_recovery_blocked(MarkConversationRecoveryBlocked {

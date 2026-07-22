@@ -1224,6 +1224,7 @@ async fn recovery_rejects_authenticated_native_snapshot_row_without_rewrite() {
     let trim_error = super::retention::authorize_trim(
         &raw.connection,
         &raw.key_bundle,
+        raw.database_id,
         super::retention::RetentionTarget::Conversation(conversation.conversation_id.as_bytes()),
         &super::sequence::encode_sequence(victim),
         39_001,

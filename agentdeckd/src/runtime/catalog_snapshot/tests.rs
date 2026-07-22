@@ -4,22 +4,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use agentdeck_protocol::AgentKind;
-use agentdeck_protocol::runtime::StreamCursor;
 use agentdeck_protocol::runtime::identity::CatalogPageCursor;
+use agentdeck_protocol::runtime::identity::ConversationId;
+use agentdeck_protocol::runtime::{ConversationEntry, StreamCursor};
 
 use super::*;
 use crate::runtime::backfill::{BarrierDecision, BarrierRequest};
 use crate::runtime::connection::PrincipalIssuer;
 use crate::runtime::events::{RegisterStreamBarrier, WatchGeneration};
 use crate::runtime::model::{
-    ConversationDescriptor, NewConversation, RuntimeClockError, RuntimeStoreConfig,
-    RuntimeStoreError, RuntimeStoreFaultInjector, RuntimeStoreOperation,
+    ConversationDescriptor, NewConversation, RuntimeCapacityObservation, RuntimeCapacityProbe,
+    RuntimeCapacityProbeError, RuntimeClockError, RuntimeStoreConfig, RuntimeStoreError,
+    RuntimeStoreFaultInjector, RuntimeStoreOperation,
 };
 use crate::runtime::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
 use crate::runtime::store::{RuntimeId, RuntimeIdKind, RuntimeStoreHandle};
 use crate::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+struct GenerousCapacity;
+
+impl RuntimeCapacityProbe for GenerousCapacity {
+    fn observe(
+        &self,
+        database: &Path,
+    ) -> Result<RuntimeCapacityObservation, RuntimeCapacityProbeError> {
+        let bytes = |path: &Path| fs::metadata(path).map_or(0, |metadata| metadata.len());
+        Ok(RuntimeCapacityObservation {
+            main_bytes: bytes(database),
+            wal_bytes: bytes(&PathBuf::from(format!("{}-wal", database.display()))),
+            shm_bytes: bytes(&PathBuf::from(format!("{}-shm", database.display()))),
+            filesystem_total_bytes: 1024 * 1024 * 1024 * 1024,
+            filesystem_available_bytes: 1024 * 1024 * 1024 * 1024,
+        })
+    }
+}
 
 struct TestRoot(PathBuf);
 
@@ -191,6 +211,7 @@ async fn open_store(
     RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(root.database())
             .with_conversation_capacity(1_024)
+            .with_capacity_probe(GenerousCapacity)
             .with_clock(clock),
         root.storage_kek(keys),
     )
@@ -505,6 +526,102 @@ async fn catalog_cursor_keeps_exact_frozen_snapshot_across_concurrent_refresh() 
         .shutdown()
         .await
         .expect("shutdown concurrent refresh store");
+}
+
+#[tokio::test]
+async fn ephemeral_cursor_never_falls_back_to_same_id_durable_snapshot_after_cache_loss() {
+    let root = TestRoot::new("ephemeral-cursor-no-durable-fallback");
+    let keys = MemoryKeyStore::new();
+    let clock = ManualClock::new(25_500);
+    let store = open_store(&root, &keys, clock.clone()).await;
+    create_rows(&store, 0, 501).await;
+    let provider = provider(store.clone(), clock, [0x4E; 32]);
+    let owner = principal(14);
+
+    let mut registration = register_catalog(&store, 20).await;
+    let durable_first = provider
+        .first_page(&mut registration, &owner)
+        .await
+        .expect("persist a durable catalog row with a second page");
+    drop(durable_first);
+    let durable_reference = provider
+        .memory
+        .lock()
+        .expect("catalog memory state")
+        .catalogs
+        .values()
+        .next()
+        .expect("durable first page installs a cache")
+        .reference
+        .snapshot
+        .clone();
+    provider.clear_cache().expect("clear durable decoded cache");
+
+    let entries = (0..501_u16)
+        .map(|index| {
+            let input = conversation(index);
+            ConversationEntry {
+                conversation_id: ConversationId::new(input.conversation_id.to_canonical_string()),
+                agent_kind: input.descriptor.agent_kind,
+                title: input.descriptor.title,
+                cwd: Some(input.descriptor.cwd),
+                last_active_ms: 0,
+                archived: false,
+                entry_revision: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    let peak = catalog_materialization_peak_bound(
+        durable_reference.logical_bytes,
+        durable_reference.item_count,
+    )
+    .expect("ephemeral fixture fits shared catalog budget");
+    let memory = CatalogMemoryLease::reserve(
+        provider.memory.clone(),
+        provider.global_memory.clone(),
+        peak,
+    )
+    .expect("reserve ephemeral catalog build memory");
+    let first = provider
+        .build_owned_page(
+            CatalogPageReference::ephemeral(durable_reference),
+            entries,
+            None,
+            PageIssue {
+                observed_now_ms: 25_500,
+                issued_at_ms: 25_500,
+                expires_at_ms: 25_500 + CATALOG_PAGE_CURSOR_TTL_MS,
+                binding: principal_binding(&owner),
+            },
+            memory,
+        )
+        .expect("build transition-only ephemeral first page");
+    let cursor = first
+        .snapshot()
+        .next_page_cursor()
+        .cloned()
+        .expect("501 ephemeral rows require a second page");
+    drop(first);
+
+    let second = provider
+        .page_for_cursor(&cursor, &owner)
+        .await
+        .expect("ephemeral cursor may read its exact in-process cache");
+    assert_eq!(second.snapshot().entries().len(), 1);
+    drop(second);
+    provider
+        .clear_cache()
+        .expect("simulate cache loss/restart boundary");
+    let error = provider
+        .page_for_cursor(&cursor, &owner)
+        .await
+        .expect_err("ephemeral cursor must not load the same-id durable snapshot");
+    assert!(matches!(error, CatalogSnapshotProviderError::InvalidCursor));
+
+    store
+        .shutdown()
+        .await
+        .expect("shutdown ephemeral cursor store");
 }
 
 #[tokio::test]
@@ -848,8 +965,8 @@ async fn failed_exact_load_releases_decoded_memory_reservation() {
     };
 
     provider
-        .page_from_reference(
-            missing,
+        .page_from_page_reference(
+            CatalogPageReference::durable(missing),
             None,
             PageIssue {
                 observed_now_ms: 30_000,

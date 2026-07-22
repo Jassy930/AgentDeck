@@ -281,7 +281,7 @@ async fn idempotent_create_distinguishes_a_cross_restart_replay() {
         .await
         .expect("create conversation with outcome")
     {
-        CreateConversationOutcome::Created { conversation } => conversation,
+        CreateConversationOutcome::Created { conversation, .. } => conversation,
         CreateConversationOutcome::Replayed { .. } => panic!("first create cannot replay"),
     };
     store.shutdown().await.expect("shutdown first store");
@@ -294,7 +294,7 @@ async fn idempotent_create_distinguishes_a_cross_restart_replay() {
         .await
         .expect("retry persisted conversation")
     {
-        CreateConversationOutcome::Replayed { conversation } => conversation,
+        CreateConversationOutcome::Replayed { conversation, .. } => conversation,
         CreateConversationOutcome::Created { .. } => panic!("persisted retry must replay"),
     };
     assert_eq!(replayed, created);

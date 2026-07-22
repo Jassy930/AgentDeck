@@ -14,6 +14,7 @@ hpke = { version = "0.14", default-features = false, features = ["alloc", "getra
 ed25519-dalek = { version = "2", features = ["zeroize"] }
 # §7.1 高频 RFC 8439 AEAD；0.11 与 hpke 0.14 内部同一版本，cargo tree 无第二套 AEAD。
 chacha20poly1305 = "0.11"
+hmac = "0.12"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 thiserror = "1"

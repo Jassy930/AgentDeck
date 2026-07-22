@@ -13,14 +13,29 @@ use agentdeck_protocol::relay_v2::frame::{
 };
 use agentdeck_protocol::relay_v2::{
     DeviceRevocation, DeviceRouteId, Ed25519Signature, GrantSerial, PairRouteId,
-    RELAY_PROTOCOL_VERSION, encode,
+    RELAY_PROTOCOL_VERSION, StreamRouteId, encode,
+};
+use agentdeck_protocol::runtime::{
+    CodexConversationConfiguration, ConversationConfiguration, StreamCursor,
+    VendorConfigurationSnapshot,
 };
 use agentdeck_protocol::runtime::{PairingReceipt, PairingState};
+use agentdeck_protocol::{CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode};
+use tokio::sync::Semaphore;
 
 use crate::remote::access::{PairResponseAccessBinding, VerifiedPairResponseReceipt};
+use crate::runtime::AgentRouter;
+use crate::runtime::backfill::BarrierRequest;
+use crate::runtime::catalog_snapshot::CatalogSnapshotProvider;
+use crate::runtime::connection::PrincipalIssuer;
+use crate::runtime::events::{RegisterStreamBarrier, RuntimeStreamTarget, WatchGeneration};
 use crate::runtime::model::{
     MachineEnrollmentState, RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError,
     RuntimeStoreOperation,
+};
+use crate::runtime::snapshot::{
+    SNAPSHOT_BUILD_MEMORY_BYTES, SnapshotMaterialization, SnapshotMaterializer,
+    assemble_build_snapshot,
 };
 use crate::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
@@ -29,10 +44,16 @@ use super::pairing::{AcceptPairRequest, CommitPairPending, PairingInviteLifecycl
 use super::pairing_delivery::{
     AcknowledgePairResponseReceived, AcknowledgePairResponseReceivedOutcome,
 };
+use super::pairing_grant::ConversationKeyRotation;
 use super::pairing_grant::PairingGrantPreparation;
+use super::pairing_grant_allocation_tests::{
+    complete_active_membership_transition,
+    complete_active_membership_transition_with_production_finalize,
+};
 use super::pairing_grant_commit::{AcknowledgeGrantCommitted, GrantCommittedRecovery};
 use super::pairing_grant_tests::{
-    awaiting_pairing, awaiting_pairing_with_authorization, grant_input, grant_input_with, secret,
+    awaiting_pairing, awaiting_pairing_with_authorization, complete_active_zero_cut_transition,
+    grant_input, grant_input_with, secret,
 };
 use super::pairing_grant_tx::ConfirmPairingGrantOutcome;
 use super::pairing_revocation::{BeginDeviceRevocation, BeginDeviceRevocationOutcome};
@@ -41,6 +62,12 @@ use super::pairing_tests::{
     GenerousCapacity, NOW_MS, OneShotFault, TestClock, TestRoot, artifact_bytes, make_active,
     pending_envelope, prepare_unused_pairing, verified_request_with_authorization,
 };
+use super::publication::PublicationScope;
+use super::{
+    ConfigureConversation, ConfigureConversationOutcome, IdempotencyOwner, NewConversation,
+    RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeId, RuntimeIdKind,
+};
+use crate::runtime::model::ConversationDescriptor;
 
 const DEVICE_SIGN_SEED: [u8; 32] = [0xa4; 32];
 const ROOT_SIGN_SEED: [u8; 32] = [0x41; 32];
@@ -180,7 +207,7 @@ async fn authorization_only_store_for_test(database: &Path, revoking: bool) -> R
     let keys = MemoryKeyStore::new();
     let storage_kek =
         load_or_create_storage_kek(&keys, database).expect("create authorization test StorageKEK");
-    authorization_store_for_test(database, storage_kek, None, revoking).await
+    authorization_store_for_test(database, storage_kek, None, revoking, true, false).await
 }
 
 async fn authorization_store_for_test(
@@ -191,10 +218,14 @@ async fn authorization_store_for_test(
         Vec<AuthorizationPermissionV1>,
     )>,
     revoking: bool,
+    complete_transition: bool,
+    production_finalize: bool,
 ) -> RuntimeStoreHandle {
     let clock = Arc::new(AtomicU64::new(NOW_MS));
     let store = RuntimeStoreHandle::open(
-        RuntimeStoreConfig::new(database.to_path_buf()).with_clock(TestClock(clock.clone())),
+        RuntimeStoreConfig::new(database.to_path_buf())
+            .with_clock(TestClock(clock.clone()))
+            .with_capacity_probe(GenerousCapacity),
         storage_kek,
     )
     .await
@@ -228,6 +259,16 @@ async fn authorization_store_for_test(
             .expect("read scrubbed pairing recovery")
             .is_empty()
     );
+    if complete_transition {
+        // Initial activation now owns a real key-transition fence. Production manager recovery
+        // completes this zero-cut transition before publisher admission or local revoke may start;
+        // shared fixtures must model the same ordering instead of bypassing the fence.
+        if production_finalize {
+            complete_active_membership_transition_with_production_finalize(&store, &clock).await;
+        } else {
+            complete_active_zero_cut_transition(&store).await;
+        }
+    }
 
     if revoking {
         let Some(MachineEnrollmentState::Active(active)) = store
@@ -285,6 +326,42 @@ pub(crate) async fn active_authorization_store_with_permissions_for_test(
         storage_kek,
         Some((capabilities, permissions)),
         false,
+        true,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn active_authorization_store_with_pending_transition_for_test(
+    database: &Path,
+    storage_kek: StorageKek,
+    capabilities: Vec<AuthorizationCapabilityV1>,
+    permissions: Vec<AuthorizationPermissionV1>,
+) -> RuntimeStoreHandle {
+    authorization_store_for_test(
+        database,
+        storage_kek,
+        Some((capabilities, permissions)),
+        false,
+        false,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn production_aligned_active_authorization_store_for_test(
+    database: &Path,
+    storage_kek: StorageKek,
+    capabilities: Vec<AuthorizationCapabilityV1>,
+    permissions: Vec<AuthorizationPermissionV1>,
+) -> RuntimeStoreHandle {
+    authorization_store_for_test(
+        database,
+        storage_kek,
+        Some((capabilities, permissions)),
+        false,
+        true,
+        true,
     )
     .await
 }
@@ -317,6 +394,16 @@ pub(crate) async fn two_active_authorization_store_with_permissions_for_test(
         NOW_MS + 2,
     )
     .await;
+    complete_active_zero_cut_transition(&store).await;
+    store
+        .create_publication_stream(
+            [0x21; 16],
+            PublicationScope::Catalog,
+            [0x22; 16],
+            [0x23; 16],
+        )
+        .await
+        .expect("create catalog stream before second membership transition");
 
     let (binding, data_cert) = make_active(&store).await;
     let (pairing_id, invite) = prepare_unused_pairing(
@@ -406,7 +493,258 @@ pub(crate) async fn two_active_authorization_store_with_permissions_for_test(
         NOW_MS + 4,
     )
     .await;
+    complete_active_membership_transition(&store, &clock).await;
     store
+}
+
+pub(crate) struct PendingNewDeviceTransitionFixture {
+    pub(crate) store: RuntimeStoreHandle,
+    pub(crate) device_route: DeviceRouteId,
+    pub(crate) conversation_id: RuntimeId,
+}
+
+/// 本机先有 conversation/history 与 Relay-committed cut，再加入首个 remote device，
+/// 且保留 membership transition 未完成。该 fixture 只供跨层 transition E2E 使用。
+pub(crate) async fn pending_new_device_transition_fixture_for_test(
+    database: &Path,
+    storage_kek: StorageKek,
+    capabilities: Vec<AuthorizationCapabilityV1>,
+    permissions: Vec<AuthorizationPermissionV1>,
+) -> PendingNewDeviceTransitionFixture {
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(database.to_path_buf())
+            .with_clock(TestClock(clock.clone()))
+            .with_capacity_probe(GenerousCapacity),
+        storage_kek,
+    )
+    .await
+    .expect("open pending new-device transition Store");
+    let conversation_id =
+        RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0xc1; 16]).expect("conversation id");
+    let descriptor = ConversationDescriptor {
+        agent_kind: agentdeck_protocol::AgentKind::Codex,
+        title: Some("new-device transition conversation".to_owned()),
+        cwd: std::path::PathBuf::from("/tmp/agentdeck-new-device-transition"),
+    };
+    let created = store
+        .create_conversation(NewConversation {
+            conversation_id,
+            adapter_state_key: RuntimeId::from_bytes(RuntimeIdKind::AdapterState, [0xc2; 16])
+                .expect("adapter state key"),
+            descriptor: descriptor.clone(),
+        })
+        .await
+        .expect("create transition conversation");
+    store
+        .create_publication_stream(
+            [0x21; 16],
+            PublicationScope::Catalog,
+            [0x22; 16],
+            [0x23; 16],
+        )
+        .await
+        .expect("create catalog stream before first remote-device transition");
+
+    assert!(matches!(
+        store
+            .configure_conversation(ConfigureConversation {
+                conversation_id,
+                owner: IdempotencyOwner::Local {
+                    machine_trust_domain: store
+                        .machine_trust_domain()
+                        .expect("load transition trust domain"),
+                    uid: 501,
+                    client_installation_id: [0xc3; 16],
+                },
+                idempotency_key: "new-device-transition-event".to_owned(),
+                expected_configuration_revision: 0,
+                configuration: ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+                    CodexConversationConfiguration::new(
+                        CodexApprovalPolicy::OnRequest,
+                        CodexSandboxMode::WorkspaceWrite,
+                        CodexReasoningEffort::Medium,
+                    )
+                ),),
+            })
+            .await
+            .expect("append transition conversation event"),
+        ConfigureConversationOutcome::Applied { .. }
+    ));
+    let plan = store
+        .acquire_backfill_pin(RuntimeBackfillTarget::Conversation(conversation_id), None)
+        .await
+        .expect("pin transition conversation event");
+    let RuntimeBackfillPlan::Pinned(pin) = plan else {
+        panic!("fresh transition event must require a pinned backfill page")
+    };
+    let page = store
+        .load_event_backfill_page(pin.clone(), None)
+        .await
+        .expect("load transition conversation event");
+    let event = page.events.last().expect("transition event exists").clone();
+    drop(page);
+    store
+        .release_backfill_pin(pin.pin_id)
+        .await
+        .expect("release transition event pin");
+    // 首设备 baseline 只能引用 production snapshot pipeline 已认证覆盖的 exact H。
+    // Catalog 走真实 barrier/provider；conversation 走同一 linear build capability、
+    // materializer、typed assembly 与 durable writer，不能用测试专用 row 注入旁路。
+    let principal = PrincipalIssuer::local_only(
+        store
+            .machine_trust_domain()
+            .expect("load snapshot principal trust domain"),
+    )
+    .issue_verified_local(501, [0xc4; 16])
+    .expect("issue local snapshot principal");
+    let catalog_provider = CatalogSnapshotProvider::with_clock(
+        store.clone(),
+        Arc::new(TestClock(clock.clone())),
+        Arc::new(Semaphore::new(SNAPSHOT_BUILD_MEMORY_BYTES)),
+    )
+    .expect("create production catalog snapshot provider");
+    let mut catalog_registration = store
+        .register_stream_barrier(RegisterStreamBarrier {
+            target: RuntimeStreamTarget::Catalog,
+            generation: WatchGeneration::new(1).expect("catalog snapshot generation"),
+            request: BarrierRequest::Subscribe {
+                cursor: StreamCursor::BeforeFirst,
+            },
+        })
+        .await
+        .expect("capture exact catalog snapshot barrier");
+    let catalog_page = catalog_provider
+        .first_page(&mut catalog_registration, &principal)
+        .await
+        .expect("materialize exact catalog ready snapshot");
+    assert_eq!(
+        catalog_page.snapshot().base_catalog_cursor,
+        StreamCursor::At(created.catalog_revision)
+    );
+    drop(catalog_page);
+    drop(catalog_registration);
+    drop(catalog_provider);
+
+    let conversation_source = store
+        .acquire_snapshot_build_source(conversation_id)
+        .await
+        .expect("capture exact conversation snapshot source");
+    let materializer = SnapshotMaterializer::new(
+        store.clone(),
+        Arc::new(AgentRouter::with_runtime_store(store.clone())),
+    );
+    let SnapshotMaterialization::Build(mut conversation_build) = materializer
+        .materialize(conversation_source)
+        .await
+        .expect("materialize exact conversation snapshot build")
+    else {
+        panic!("fresh managed conversation must require an exact snapshot build")
+    };
+    assert_eq!(
+        conversation_build.base_event_cursor(),
+        StreamCursor::At(event.event_seq)
+    );
+    let assembled = assemble_build_snapshot(&mut conversation_build, Vec::new())
+        .expect("assemble typed conversation snapshot");
+    let write = conversation_build
+        .bind_assembled_snapshot(assembled)
+        .expect("bind exact conversation snapshot write");
+    store
+        .store_conversation_snapshot(write)
+        .await
+        .expect("store exact conversation ready snapshot");
+
+    let conversation_stream_id: Vec<u8> = rusqlite::Connection::open(database)
+        .expect("open transition stream mapping")
+        .query_row(
+            "SELECT publication_stream_id FROM publication_streams\n             WHERE scope = 'conversation' AND conversation_id = ?1",
+            [conversation_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("read transition conversation stream id");
+    let conversation_stream_id: [u8; 16] = conversation_stream_id
+        .as_slice()
+        .try_into()
+        .expect("fixed conversation stream id");
+    let (binding, data_cert) = make_active(&store).await;
+    let preparation = awaiting_pairing_with_authorization(
+        &store,
+        &binding,
+        &data_cert,
+        capabilities,
+        permissions,
+    )
+    .await;
+    let device_route = DeviceRouteId::from_bytes([0xd1; 16]);
+    let conversation_route = StreamRouteId::from_bytes(
+        store
+            .load_publication_stream_record(conversation_stream_id)
+            .await
+            .expect("load first-device conversation publication stream")
+            .stream_route,
+    );
+    let initial_global = super::pairing_grant::GlobalKeyStateV1::bootstrap_with_conversations(
+        1,
+        1,
+        secret(0xdb),
+        device_route,
+        1,
+        secret(0xdc),
+        1,
+        secret(0xdd),
+        vec![ConversationKeyRotation::new(
+            conversation_route,
+            secret(0xde),
+        )],
+    )
+    .expect("bootstrap first remote device over existing conversation");
+    let confirmed = store
+        .confirm_pairing_grant(grant_input_with(
+            &preparation,
+            &binding,
+            &data_cert,
+            device_route,
+            GrantSerial::new(1),
+            initial_global,
+            None,
+            0xdf,
+        ))
+        .await
+        .expect("confirm first remote device");
+    let installing = match confirmed {
+        ConfirmPairingGrantOutcome::Confirmed { recovery, .. } => recovery,
+        other => panic!("first remote device must confirm: {other:?}"),
+    };
+    clock.store(NOW_MS + 5, Ordering::SeqCst);
+    let committed = match store
+        .acknowledge_grant_committed(AcknowledgeGrantCommitted::new(
+            preparation.pairing_id(),
+            grant_committed_frame(&installing),
+        ))
+        .await
+        .expect("commit first remote-device grant")
+    {
+        super::pairing_grant_commit::AcknowledgeGrantCommittedOutcome::Committed { recovery } => {
+            recovery
+        }
+        other => panic!("first remote-device GrantCommitted must transition: {other:?}"),
+    };
+    deliver_and_close_for_test(
+        &store,
+        &clock,
+        preparation,
+        committed,
+        DEVICE_SIGN_SEED,
+        NOW_MS + 6,
+    )
+    .await;
+
+    PendingNewDeviceTransitionFixture {
+        store,
+        device_route,
+        conversation_id,
+    }
 }
 
 async fn deliver_and_close_for_test(

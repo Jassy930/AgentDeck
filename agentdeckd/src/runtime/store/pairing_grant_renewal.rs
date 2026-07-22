@@ -10,7 +10,7 @@ use agentdeck_protocol::relay_v2::DeviceRouteId;
 use crate::runtime::model::RuntimeStoreError;
 use crate::security::SecretBytes;
 
-use super::pairing_grant::{GlobalKeyStateV1, InternalKey, MAX_DEVICES};
+use super::pairing_grant::{DeviceTransportKey, GlobalKeyStateV1, InternalKey, MAX_DEVICES};
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,15 +39,25 @@ impl GlobalKeyStateV1 {
         let device_index = self
             .devices
             .iter()
-            .position(|device| device.device_route == device_route)
+            .position(|device| device.device_route == device_route && device.is_active())
             .ok_or(RuntimeStoreError::PairingConflict)?;
         let device = &self.devices[device_index];
-        if catalog_key.expose_secret() == device.command.key.expose_secret()
-            || catalog_key.expose_secret() == device.reply.key.expose_secret()
-            || command_key.expose_secret() == device.command.key.expose_secret()
-            || command_key.expose_secret() == device.reply.key.expose_secret()
-            || reply_key.expose_secret() == device.command.key.expose_secret()
-            || reply_key.expose_secret() == device.reply.key.expose_secret()
+        let current_command = device
+            .command
+            .key
+            .as_ref()
+            .ok_or(RuntimeStoreError::PairingConflict)?;
+        let current_reply = device
+            .reply
+            .key
+            .as_ref()
+            .ok_or(RuntimeStoreError::PairingConflict)?;
+        if catalog_key.expose_secret() == current_command.expose_secret()
+            || catalog_key.expose_secret() == current_reply.expose_secret()
+            || command_key.expose_secret() == current_command.expose_secret()
+            || command_key.expose_secret() == current_reply.expose_secret()
+            || reply_key.expose_secret() == current_command.expose_secret()
+            || reply_key.expose_secret() == current_reply.expose_secret()
         {
             return Err(RuntimeStoreError::PairingConflict);
         }
@@ -69,17 +79,19 @@ impl GlobalKeyStateV1 {
                 })?;
         let current_catalog = self
             .catalogs
-            .last()
+            .last_mut()
             .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
         let next_catalog_epoch = current_catalog.epoch.checked_add(1).ok_or(
             RuntimeStoreError::CapacityArithmeticOverflow {
                 field: "catalog_key_epoch",
             },
         )?;
+        current_catalog.retire_with_unknown_legacy_time()?;
         self.catalogs
             .push(InternalKey::new(next_catalog_epoch, catalog_key)?);
-        self.devices[device_index].command = InternalKey::new(next_command_epoch, command_key)?;
-        self.devices[device_index].reply = InternalKey::new(next_reply_epoch, reply_key)?;
+        self.devices[device_index].command =
+            DeviceTransportKey::new(next_command_epoch, command_key)?;
+        self.devices[device_index].reply = DeviceTransportKey::new(next_reply_epoch, reply_key)?;
         self.validate()?;
         Ok(self)
     }
@@ -88,13 +100,15 @@ impl GlobalKeyStateV1 {
     pub(crate) fn key_axes_for_test(&self, device_route: DeviceRouteId) -> Option<KeyAxesForTest> {
         let catalog = self.catalogs.last()?;
         let device = self.device(device_route)?;
+        let command = device.command.key.as_ref()?;
+        let reply = device.reply.key.as_ref()?;
         Some(KeyAxesForTest {
             catalog_epoch: catalog.epoch,
             catalog_hash: sha256(catalog.key.expose_secret()),
             command_epoch: device.command.epoch,
-            command_hash: sha256(device.command.key.expose_secret()),
+            command_hash: sha256(command.expose_secret()),
             reply_epoch: device.reply.epoch,
-            reply_hash: sha256(device.reply.key.expose_secret()),
+            reply_hash: sha256(reply.expose_secret()),
         })
     }
 }

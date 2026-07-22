@@ -20,9 +20,11 @@ use super::super::connection::{
 use super::super::events::{PinnedBackfillSource, RuntimeStreamTarget, StreamBarrierRegistration};
 use super::super::history_receipt::{HistoryOnlyReceiptError, HistoryOnlyReceiptRegistry};
 use super::super::model::RuntimeStoreError;
+use super::super::store::key_transition::{RemoteTransitionIngressClass, TransitionSnapshotPermit};
 use super::super::store::{
-    RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeId, RuntimeStoreHandle,
+    RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeId, RuntimeIdKind, RuntimeStoreHandle,
 };
+use super::super::transfer_identity::DurableStreamSource;
 use super::coordinator::PendingSubscriptionPermit;
 use super::egress::TransferEgressControl;
 use super::{SubscriptionLease, SubscriptionRegistry, SubscriptionRegistryError};
@@ -73,6 +75,7 @@ pub(super) struct PumpJob {
     pub(super) principal: AuthenticatedPrincipal,
     pub(super) flushed_business_frame: bool,
     pub(super) emit_subscription_receipt: bool,
+    pub(super) transition_snapshot: Option<TransitionSnapshotPermit>,
     pub(super) pending_permit: Option<PendingSubscriptionPermit>,
 }
 
@@ -242,13 +245,15 @@ async fn activate_subscription(job: &mut PumpJob) -> Result<(), PumpError> {
     job.registry.require_current(&job.lease)?;
     let _ = job.connections.principal(job.connection_id)?;
     if job.emit_subscription_receipt {
+        let stream_generation = job.transition_snapshot.as_ref().map_or_else(
+            || job.lease.generation().wire_generation(),
+            transition_wire_generation,
+        );
         let envelope = RuntimeEnvelope {
             version: RUNTIME_PROTOCOL_VERSION,
             message_id: job.message_id.clone(),
             body: RuntimeMessage::Reply(RuntimeReply::Subscription(
-                SubscriptionReceipt::Subscribed {
-                    stream_generation: job.lease.generation().wire_generation(),
-                },
+                SubscriptionReceipt::Subscribed { stream_generation },
             )),
         };
         let frame = EncodedRuntimeFrame::from_envelope(&envelope)?;
@@ -273,7 +278,14 @@ async fn run_inner(
         .decision;
     match decision {
         BarrierDecision::Snapshot { base, through, .. } => {
+            if let Some(permit) = job.transition_snapshot.as_ref() {
+                let registration = job.registration.as_ref().ok_or(PumpError::MissingSource)?;
+                validate_transition_registration(job.target, registration, permit)?;
+            }
             let snapshot_base = send_snapshot(job).await?;
+            if job.transition_snapshot.is_some() && snapshot_base != through {
+                return Err(PumpError::InvalidDto);
+            }
             if base != through {
                 let mut source = job
                     .registration
@@ -313,11 +325,22 @@ async fn run_inner(
     ensure_current(job)?;
     let registration = job.registration.as_ref().ok_or(PumpError::MissingSource)?;
     let inner = registration.high_water;
-    let sync = RuntimeSyncComplete {
-        stream_generation: job.lease.generation().wire_generation(),
-        stream_cursor: registration.relay_committed.outer,
-        inner_cursor: inner_cursor(job.target, inner),
-        key_directory_revision: 0,
+    let sync = match job.transition_snapshot.as_ref() {
+        Some(permit) => {
+            validate_transition_registration(job.target, registration, permit)?;
+            RuntimeSyncComplete {
+                stream_generation: transition_wire_generation(permit),
+                stream_cursor: StreamCursor::from_high_water(permit.relay_committed_outer()),
+                inner_cursor: inner_cursor(job.target, inner),
+                key_directory_revision: permit.key_directory_revision(),
+            }
+        }
+        None => RuntimeSyncComplete {
+            stream_generation: job.lease.generation().wire_generation(),
+            stream_cursor: registration.relay_committed.outer,
+            inner_cursor: inner_cursor(job.target, inner),
+            key_directory_revision: 0,
+        },
     };
     reply::reply(
         &job.connections,
@@ -329,11 +352,46 @@ async fn run_inner(
     )
     .await?;
     job.flushed_business_frame = true;
+
+    if job.transition_snapshot.is_some() {
+        // 两个 transition scopes 可能共享同一 connection。首个 SyncComplete 后必须
+        // 释放 egress gate，让 sibling snapshot 也能 flush 并取得 StreamAppliedAck；
+        // registry barrier 仍保持 active，所以任何 live enqueue 都不会抢跑。
+        drop(initial_guard.take());
+        job.registry
+            .release_snapshot_sender(&job.lease, epoch_ms()?)?;
+        wait_transition_business_ready(job).await?;
+        let gate = job.gate.clone();
+        let _continuation_guard = controlled(job, gate.lock_owned()).await?;
+        ensure_current(job)?;
+        job.registry.complete_barrier(&job.lease, epoch_ms()?)?;
+        let live_control = job.control.without_deadline();
+        let mut cursor = inner;
+        let pinned = job
+            .registration
+            .as_mut()
+            .ok_or(PumpError::MissingSource)?
+            .take_backfill_source();
+        if let Some(source) = pinned {
+            cursor = send_pinned_with_control(job, source, false, &live_control).await?;
+        }
+        cursor = send_latest_catchup(job, cursor, &live_control).await?;
+        drop(_continuation_guard);
+        return run_live(job, cursor, live_control).await;
+    }
+
     job.registry.complete_barrier(&job.lease, epoch_ms()?)?;
     drop(initial_guard.take());
 
     let live_control = job.control.without_deadline();
-    let mut cursor = inner;
+    run_live(job, inner, live_control).await
+}
+
+async fn run_live(
+    job: &mut PumpJob,
+    mut cursor: StreamCursor,
+    live_control: TransferEgressControl,
+) -> Result<(), PumpError> {
     loop {
         ensure_current(job)?;
         let high_water = {
@@ -374,6 +432,135 @@ async fn run_inner(
     }
 }
 
+async fn send_latest_catchup(
+    job: &mut PumpJob,
+    cursor: StreamCursor,
+    control: &TransferEgressControl,
+) -> Result<StreamCursor, PumpError> {
+    let latest = job
+        .registration
+        .as_ref()
+        .ok_or(PumpError::MissingSource)?
+        .watch
+        .latest();
+    if !cursor_is_newer(latest, cursor) {
+        return Ok(cursor);
+    }
+    job.registry.admit_live_enqueue(&job.lease, epoch_ms()?)?;
+    let plan = controlled_with(
+        control,
+        job.store
+            .acquire_backfill_pin(backfill_target(job.target), cursor.high_water()),
+    )
+    .await??;
+    let RuntimeBackfillPlan::Pinned(pin) = plan else {
+        return Ok(latest);
+    };
+    let cleanup = job
+        .registration
+        .as_ref()
+        .ok_or(PumpError::MissingSource)?
+        .watch
+        .backfill_pin_cleanup(pin.pin_id);
+    send_pinned_with_control(job, PinnedBackfillSource::new(pin, cleanup), false, control).await
+}
+
+async fn wait_transition_business_ready(job: &PumpJob) -> Result<(), PumpError> {
+    loop {
+        ensure_current(job)?;
+        match job
+            .store
+            .check_remote_transition_ingress(RemoteTransitionIngressClass::Business)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(RuntimeStoreError::InvalidStateTransition) => {
+                controlled(
+                    job,
+                    tokio::time::sleep(std::time::Duration::from_millis(10)),
+                )
+                .await?;
+            }
+            Err(error) => return Err(PumpError::Store(error)),
+        }
+    }
+}
+
+fn validate_transition_registration(
+    target: RuntimeStreamTarget,
+    registration: &StreamBarrierRegistration,
+    permit: &TransitionSnapshotPermit,
+) -> Result<(), PumpError> {
+    let scope_matches = match (target, permit.scope()) {
+        (
+            RuntimeStreamTarget::Catalog,
+            super::super::store::key_transition::KeyTransitionStreamScope::Catalog,
+        ) => true,
+        (
+            RuntimeStreamTarget::Conversation(conversation_id),
+            super::super::store::key_transition::KeyTransitionStreamScope::Conversation(bytes),
+        ) => conversation_id.as_bytes() == &bytes,
+        _ => false,
+    };
+    let frozen = StreamCursor::from_high_water(permit.relay_committed_inner());
+    if !scope_matches
+        || registration.target != target
+        || registration.high_water != frozen
+        || registration.relay_committed.publication_stream_id
+            != Some(permit.publication_stream_id())
+        || registration.relay_committed.generation != Some(permit.generation())
+        || registration.relay_committed.outer
+            != StreamCursor::from_high_water(permit.relay_committed_outer())
+        || registration.relay_committed.inner != frozen
+    {
+        return Err(PumpError::MissingSource);
+    }
+    Ok(())
+}
+
+fn transition_wire_generation(
+    permit: &TransitionSnapshotPermit,
+) -> agentdeck_protocol::runtime::identity::StreamGeneration {
+    agentdeck_protocol::runtime::identity::StreamGeneration::new(
+        uuid::Uuid::from_bytes(permit.generation())
+            .hyphenated()
+            .to_string(),
+    )
+}
+
+fn validate_transition_conversation_snapshot(
+    target: RuntimeId,
+    snapshot: &agentdeck_protocol::runtime::ConversationSnapshot,
+    permit: &TransitionSnapshotPermit,
+) -> Result<(), PumpError> {
+    let super::super::store::key_transition::KeyTransitionStreamScope::Conversation(expected) =
+        permit.scope()
+    else {
+        return Err(PumpError::InvalidDto);
+    };
+    if target.as_bytes() != &expected
+        || snapshot.conversation_id.as_str() != target.to_canonical_string()
+        || snapshot.base_event_cursor
+            != StreamCursor::from_high_water(permit.relay_committed_inner())
+    {
+        return Err(PumpError::InvalidDto);
+    }
+    Ok(())
+}
+
+fn validate_transition_catalog_snapshot(
+    snapshot: &agentdeck_protocol::runtime::CatalogSnapshot,
+    permit: &TransitionSnapshotPermit,
+) -> Result<(), PumpError> {
+    if permit.scope() != super::super::store::key_transition::KeyTransitionStreamScope::Catalog
+        || snapshot.base_catalog_cursor
+            != StreamCursor::from_high_water(permit.relay_committed_inner())
+    {
+        return Err(PumpError::InvalidDto);
+    }
+    Ok(())
+}
+
 async fn send_snapshot(job: &mut PumpJob) -> Result<StreamCursor, PumpError> {
     match job.target {
         RuntimeStreamTarget::Conversation(conversation_id) => {
@@ -397,6 +584,9 @@ async fn send_snapshot(job: &mut PumpJob) -> Result<StreamCursor, PumpError> {
             .await??;
             let (snapshot, payload, history_command_ids, memory_permit) = reduced.into_parts();
             let base = snapshot.base_event_cursor;
+            if let Some(permit) = job.transition_snapshot.as_ref() {
+                validate_transition_conversation_snapshot(conversation_id, &snapshot, permit)?;
+            }
             ensure_current(job)?;
             if let Some(command_ids) = history_command_ids {
                 // 只有完整 adapter read、identity collision gate 与 canonical serialize
@@ -436,6 +626,9 @@ async fn send_snapshot(job: &mut PumpJob) -> Result<StreamCursor, PumpError> {
             )
             .await??;
             let base = page.snapshot().base_catalog_cursor;
+            if let Some(permit) = job.transition_snapshot.as_ref() {
+                validate_transition_catalog_snapshot(page.snapshot(), permit)?;
+            }
             loop {
                 let next = page.snapshot().next_page_cursor().cloned();
                 ensure_current(job)?;
@@ -525,11 +718,22 @@ async fn send_pinned_with_control(
                 } else {
                     for event in page.events {
                         ensure_current(job)?;
+                        let event_id = RuntimeId::parse_canonical(
+                            RuntimeIdKind::Event,
+                            event.event_id.as_str(),
+                        )
+                        .map_err(|_| PumpError::InvalidDto)?;
+                        let durable_source = DurableStreamSource::Event {
+                            conversation_id,
+                            event_id,
+                            event_seq: event.event_seq,
+                        };
                         let payload =
                             serde_json::to_vec(&event).map_err(|_| PumpError::InvalidDto)?;
                         reply::stream(
                             &job.connections,
                             job.connection_id,
+                            durable_source,
                             RuntimeStreamItem::Event(event),
                             Some(&payload),
                             control,
@@ -575,11 +779,16 @@ async fn send_pinned_with_control(
                 } else {
                     for delta in page.deltas {
                         ensure_current(job)?;
+                        let durable_source = DurableStreamSource::Catalog {
+                            first_revision: delta.catalog_revision,
+                            through_revision: delta.catalog_revision,
+                        };
                         let payload =
                             serde_json::to_vec(&delta).map_err(|_| PumpError::InvalidDto)?;
                         reply::stream(
                             &job.connections,
                             job.connection_id,
+                            durable_source,
                             RuntimeStreamItem::CatalogDelta(delta),
                             Some(&payload),
                             control,

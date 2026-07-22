@@ -118,6 +118,10 @@ fn subscribe_conversation_envelope(message: &str, conversation_id: RuntimeId) ->
     }
 }
 
+fn publication_axis_id(seed: u8) -> RuntimeId {
+    RuntimeId::from_bytes(RuntimeIdKind::RemoteOutbox, [seed; 16]).expect("publication axis id")
+}
+
 async fn store_ready_snapshot_with_text_bytes(
     core: &RuntimeCore,
     conversation_id: RuntimeId,
@@ -1325,6 +1329,12 @@ async fn unacked_conversation_snapshot_holds_global_build_budget_until_flush() {
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
             .with_id_source(SequenceIdSource::new([
+                publication_axis_id(0xA0),
+                publication_axis_id(0xA1),
+                publication_axis_id(0xA2),
+                publication_axis_id(0xA3),
+                publication_axis_id(0xA4),
+                publication_axis_id(0xA5),
                 first_configuration_event,
                 first_command,
                 first_turn,
@@ -1526,6 +1536,9 @@ async fn regular_near_limit_backfill_pages_charge_dto_and_payload_in_one_pool() 
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
             .with_id_source(SequenceIdSource::new([
+                publication_axis_id(0xA0),
+                publication_axis_id(0xA1),
+                publication_axis_id(0xA2),
                 configuration_event,
                 command_id,
                 turn_id,
@@ -1617,6 +1630,9 @@ async fn oversized_backfill_payload_holds_exclusive_read_lease_until_flush_and_c
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
             .with_id_source(SequenceIdSource::new([
+                publication_axis_id(0xA0),
+                publication_axis_id(0xA1),
+                publication_axis_id(0xA2),
                 configuration_event,
                 command_id,
                 turn_id,
@@ -2305,6 +2321,9 @@ async fn failure_after_flushed_snapshot_fail_closes_the_connection() {
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
             .with_id_source(SequenceIdSource::new([
+                publication_axis_id(0xA0),
+                publication_axis_id(0xA1),
+                publication_axis_id(0xA2),
                 configuration_event,
                 command_id,
                 turn_id,

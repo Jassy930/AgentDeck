@@ -334,6 +334,7 @@ async fn create_conversation(
         })
         .await
         .expect("create ADC2 recovery conversation");
+    super::complete_active_zero_cut_transition(store).await;
 }
 
 async fn configure_remote_conversation(
@@ -438,6 +439,7 @@ async fn prepare_remote_and_healthy(
 async fn adc2_freezes_exact_authorization_and_active_recovery_is_conversation_scoped() {
     let root = TestRoot::new("p44-adc2-active-recovery");
     let store = full_authorization_store(&root).await;
+    let (remote_id, healthy_id, owner) = prepare_remote_and_healthy(&store, 0x41, 0x42).await;
     let ingress = store
         .load_active_remote_ingress(MACHINE_ROUTE, DEVICE_ROUTE)
         .await
@@ -446,7 +448,6 @@ async fn adc2_freezes_exact_authorization_and_active_recovery_is_conversation_sc
         .recheck_active_remote_ingress(&ingress)
         .await
         .expect("recheck ADC2 Active proof");
-    let (remote_id, healthy_id, owner) = prepare_remote_and_healthy(&store, 0x41, 0x42).await;
     let command = match store
         .accept_remote_command_authorized(
             AcceptCommand {
@@ -493,6 +494,7 @@ async fn adc2_freezes_exact_authorization_and_active_recovery_is_conversation_sc
 async fn inactive_adc2_is_revoked_before_start_without_blocking_healthy_recovery() {
     let root = TestRoot::new("p44-adc2-inactive-recovery");
     let store = full_authorization_store(&root).await;
+    let (remote_id, healthy_id, owner) = prepare_remote_and_healthy(&store, 0x51, 0x52).await;
     let ingress = store
         .load_active_remote_ingress(MACHINE_ROUTE, DEVICE_ROUTE)
         .await
@@ -501,7 +503,6 @@ async fn inactive_adc2_is_revoked_before_start_without_blocking_healthy_recovery
         .recheck_active_remote_ingress(&ingress)
         .await
         .expect("recheck inactive-case authorization before accept");
-    let (remote_id, healthy_id, owner) = prepare_remote_and_healthy(&store, 0x51, 0x52).await;
     let command = match store
         .accept_remote_command_authorized(
             AcceptCommand {

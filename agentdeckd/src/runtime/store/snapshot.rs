@@ -289,6 +289,25 @@ pub(crate) struct CatalogSnapshotRefreshPreflight {
     current_reference: Option<ReadySnapshotReference>,
 }
 
+/// Transition-only Catalog snapshot 的只读重建计划。`observed_reference` 绑定 barrier
+/// capture 时认证过的唯一 durable row；当 durable D 晚于 frozen H 时，D 只能作为
+/// 防漂移坐标，不能作为 reducer baseline，也不能被回写成 H。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogTransitionSnapshotPreflight {
+    pub(crate) peak_retained_bytes: usize,
+    pub(crate) frozen: StreamCursor,
+    pub(crate) usable_baseline: Option<ReadySnapshotReference>,
+    observed_reference: Option<ReadySnapshotReference>,
+}
+
+/// 只存在于 provider 进程内 cache 的 Catalog H。`reference.snapshot_id` 不是 durable
+/// snapshots 主键；cursor 必须额外携带 Ephemeral source kind，cache miss 时禁止回退
+/// durable load。
+pub(crate) struct EphemeralCatalogMaterialization {
+    pub(crate) reference: ReadySnapshotReference,
+    pub(crate) entries: Vec<ConversationEntry>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CatalogBaselineV1 {
@@ -1576,6 +1595,240 @@ pub(super) fn preflight_catalog_snapshot_refresh(
         peak_retained_bytes,
         refresh_required,
         current_reference,
+    })
+}
+
+/// Active key transition 专用的 metadata-only preflight。与 generic refresh 不同，
+/// current durable D 可以晚于 frozen H；此时只认证 D 的 exact identity，然后从空目录
+/// 重放 0..H。retention 已越过所需首 revision 时在任何 plaintext/egress 前 typed
+/// fail-close，绝不误发 D。
+pub(super) fn preflight_transition_catalog_snapshot(
+    state: &RuntimeSqlite,
+    observed_reference: Option<&ReadySnapshotReference>,
+    frozen: StreamCursor,
+) -> Result<CatalogTransitionSnapshotPreflight, RuntimeStoreError> {
+    preflight_transition_catalog_snapshot_in(
+        &state.connection,
+        state.key_bundle.as_ref(),
+        state.database_id,
+        observed_reference,
+        frozen,
+    )
+}
+
+pub(super) fn preflight_transition_catalog_snapshot_in(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    observed_reference: Option<&ReadySnapshotReference>,
+    frozen: StreamCursor,
+) -> Result<CatalogTransitionSnapshotPreflight, RuntimeStoreError> {
+    if observed_reference
+        .is_some_and(|source| source.target != crate::runtime::events::RuntimeStreamTarget::Catalog)
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let current_metadata = load_catalog_snapshot_metadata(connection, key_bundle)?;
+    let current_reference = current_metadata
+        .as_ref()
+        .map(catalog_snapshot_metadata_reference)
+        .transpose()?;
+    if current_reference.as_ref() != observed_reference {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+
+    let ledger = super::sqlite::load_runtime_ledger(connection, key_bundle, database_id)?;
+    let ledger_high_water = ledger
+        .catalog_high_water
+        .as_deref()
+        .map(|value| decode_sequence(SequenceScope::CatalogRevision, value))
+        .transpose()?;
+    match (frozen.high_water(), ledger_high_water) {
+        (None, _) => {}
+        (Some(through), Some(high_water)) if high_water >= through => {}
+        _ => return Err(RuntimeStoreError::InvalidStateTransition),
+    }
+
+    let usable_baseline = current_reference
+        .as_ref()
+        .filter(|reference| !cursor_after(reference.base, frozen))
+        .cloned();
+    let baseline_cursor = usable_baseline
+        .as_ref()
+        .map_or(StreamCursor::BeforeFirst, |reference| reference.base);
+    let range = match (baseline_cursor == frozen, frozen.high_water()) {
+        (true, _) | (_, None) => None,
+        (false, Some(through)) => {
+            let first = baseline_cursor
+                .checked_next()
+                .map_err(|_| RuntimeStoreError::InvalidStateTransition)?;
+            let retained_floor = ledger
+                .catalog_retention_floor
+                .as_deref()
+                .map(|value| decode_sequence(SequenceScope::CatalogRevision, value))
+                .transpose()?;
+            match retained_floor {
+                Some(floor) if floor <= first => {}
+                Some(_) => return Err(RuntimeStoreError::BackfillNeedSnapshot),
+                None => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+            }
+            Some(super::catalog::summarize_authenticated_delta_range(
+                connection, key_bundle, first, through,
+            )?)
+        }
+    };
+    let baseline_logical_bytes = usable_baseline
+        .as_ref()
+        .map_or(0, |reference| reference.logical_bytes);
+    let baseline_item_count = usable_baseline
+        .as_ref()
+        .map_or(0, |reference| reference.item_count);
+    let projected_logical_bytes = baseline_logical_bytes
+        .checked_add(range.map_or(0, |range| range.logical_bytes))
+        .ok_or(RuntimeStoreError::PayloadTooLarge)?;
+    let projected_item_count = baseline_item_count
+        .checked_add(range.map_or(0, |range| range.count))
+        .ok_or(RuntimeStoreError::PayloadTooLarge)?
+        .min(MAX_SNAPSHOT_ITEMS);
+    let peak_retained_bytes =
+        catalog_materialization_peak_bound(projected_logical_bytes, projected_item_count)?;
+    Ok(CatalogTransitionSnapshotPreflight {
+        peak_retained_bytes,
+        frozen,
+        usable_baseline,
+        observed_reference: current_reference,
+    })
+}
+
+/// `freeze_key_barriers` transaction 内使用的 current-reference wrapper。
+/// 该路径没有跨 await 的 observed coordinate；仍先认证唯一 durable row，再复用
+/// transition preflight 检查 frozen H 的 HWM、retention floor 与完整 delta 区间。
+pub(super) fn preflight_transition_catalog_cut_in(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    frozen: StreamCursor,
+) -> Result<CatalogTransitionSnapshotPreflight, RuntimeStoreError> {
+    let current_reference = load_catalog_snapshot_metadata(connection, key_bundle)?
+        .as_ref()
+        .map(catalog_snapshot_metadata_reference)
+        .transpose()?;
+    preflight_transition_catalog_snapshot_in(
+        connection,
+        key_bundle,
+        database_id,
+        current_reference.as_ref(),
+        frozen,
+    )
+}
+
+/// 按 preflight 的 exact D/H 坐标只读组装 ephemeral H。函数仅接收 `&RuntimeSqlite`，
+/// 不做 capacity admission、不创建 transaction、不写 snapshots/runtime_meta。
+pub(super) fn materialize_transition_catalog_snapshot(
+    state: &RuntimeSqlite,
+    preflight: &CatalogTransitionSnapshotPreflight,
+    ephemeral_id: [u8; 16],
+) -> Result<EphemeralCatalogMaterialization, RuntimeStoreError> {
+    if ephemeral_id == [0; 16] {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let rechecked = preflight_transition_catalog_snapshot(
+        state,
+        preflight.observed_reference.as_ref(),
+        preflight.frozen,
+    )?;
+    if rechecked != *preflight {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+
+    let baseline = match &preflight.usable_baseline {
+        Some(reference) => {
+            let current =
+                load_catalog_snapshot_row(&state.connection, &state.key_bundle, state.database_id)?
+                    .ok_or(RuntimeStoreError::InvalidStateTransition)?;
+            if catalog_snapshot_reference(&current)? != *reference {
+                return Err(RuntimeStoreError::InvalidStateTransition);
+            }
+            let decoded = decode_catalog_baseline(&current.payload)?;
+            drop(current);
+            decoded
+        }
+        None => CatalogBaselineV1 {
+            version: 1,
+            base_catalog_cursor: StreamCursor::BeforeFirst,
+            entries: Vec::new(),
+        },
+    };
+    let baseline_cursor = preflight
+        .usable_baseline
+        .as_ref()
+        .map_or(StreamCursor::BeforeFirst, |reference| reference.base);
+    if baseline.version != 1 || baseline.base_catalog_cursor != baseline_cursor {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let mut entries = BTreeMap::new();
+    for entry in baseline.entries {
+        let key = entry.conversation_id.as_str().to_owned();
+        if entries.insert(key, entry).is_some() {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+    }
+    if let Some(through) = preflight.frozen.high_water()
+        && baseline_cursor != preflight.frozen
+    {
+        let first = baseline_cursor
+            .checked_next()
+            .map_err(|_| RuntimeStoreError::InvalidStateTransition)?;
+        let read_crypto = state.key_bundle.read_only_capability();
+        for revision in first..=through {
+            let delta = super::catalog::load_delta(
+                &state.connection,
+                &read_crypto,
+                state.database_id,
+                &encode_sequence(revision),
+            )?;
+            if delta.catalog_revision != revision {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            match delta.changes.as_slice() {
+                [agentdeck_protocol::runtime::CatalogChange::Upserted { entry }] => {
+                    entries.insert(entry.conversation_id.as_str().to_owned(), entry.clone());
+                }
+                [agentdeck_protocol::runtime::CatalogChange::Removed { conversation_id }] => {
+                    if entries.remove(conversation_id.as_str()).is_none() {
+                        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+                    }
+                }
+                _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+            }
+        }
+    }
+    let entries = entries.into_values().collect::<Vec<_>>();
+    let item_count =
+        u64::try_from(entries.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    if item_count > MAX_SNAPSHOT_ITEMS {
+        return Err(RuntimeStoreError::PayloadTooLarge);
+    }
+    let baseline = CatalogBaselineV1 {
+        version: 1,
+        base_catalog_cursor: preflight.frozen,
+        entries,
+    };
+    let canonical = encode_catalog_baseline_bounded(&baseline, item_count)?;
+    let logical_bytes =
+        u64::try_from(canonical.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let content_sha256: [u8; 32] = Sha256::digest(&canonical).into();
+    drop(canonical);
+    Ok(EphemeralCatalogMaterialization {
+        reference: ReadySnapshotReference {
+            snapshot_id: ephemeral_id,
+            target: crate::runtime::events::RuntimeStreamTarget::Catalog,
+            base: preflight.frozen,
+            item_count,
+            logical_bytes,
+            content_sha256,
+        },
+        entries: baseline.entries,
     })
 }
 

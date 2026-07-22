@@ -13,11 +13,11 @@ use agentdeck_protocol::runtime::ConversationEntry;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::CatalogSnapshotProviderError;
+use super::{CatalogCacheKey, CatalogPageReference};
 use crate::runtime::snapshot::{SNAPSHOT_BUILD_MEMORY_BYTES, SharedSnapshotBuildPermit};
-use crate::runtime::store::ReadySnapshotReference;
 
 pub(super) struct CachedCatalog {
-    pub(super) reference: ReadySnapshotReference,
+    pub(super) reference: CatalogPageReference,
     pub(super) entries: Vec<ConversationEntry>,
     pub(super) expires_at_ms: u64,
     pub(super) expiry_version: u64,
@@ -26,7 +26,7 @@ pub(super) struct CachedCatalog {
 }
 
 impl CachedCatalog {
-    pub(super) fn matches(&self, reference: &ReadySnapshotReference) -> bool {
+    pub(super) fn matches(&self, reference: &CatalogPageReference) -> bool {
         self.reference == *reference
     }
 
@@ -46,7 +46,7 @@ pub(super) struct CatalogCacheExpiry {
 
 #[derive(Default)]
 pub(super) struct CatalogMemoryState {
-    pub(super) catalogs: HashMap<[u8; 16], CachedCatalog>,
+    pub(super) catalogs: HashMap<CatalogCacheKey, CachedCatalog>,
     cache_bytes: usize,
     active_bytes: usize,
     last_now_ms: Option<u64>,
@@ -56,7 +56,7 @@ impl CatalogMemoryState {
     pub(super) fn observe_and_purge(
         &mut self,
         now_ms: u64,
-    ) -> Result<Vec<[u8; 16]>, CatalogSnapshotProviderError> {
+    ) -> Result<Vec<CatalogCacheKey>, CatalogSnapshotProviderError> {
         if self.last_now_ms.is_some_and(|previous| now_ms < previous) {
             return Err(CatalogSnapshotProviderError::ClockRegressed);
         }
@@ -64,7 +64,7 @@ impl CatalogMemoryState {
         Ok(self.purge_expired(now_ms))
     }
 
-    fn purge_expired(&mut self, now_ms: u64) -> Vec<[u8; 16]> {
+    fn purge_expired(&mut self, now_ms: u64) -> Vec<CatalogCacheKey> {
         let expired = self
             .catalogs
             .iter()
@@ -88,13 +88,13 @@ impl CatalogMemoryState {
     /// 因此只有成功构造 page 后才能用 match 时读到的 version 原子续期。
     pub(super) fn touch_expiry(
         &mut self,
-        reference: &ReadySnapshotReference,
+        reference: &CatalogPageReference,
         matched_version: u64,
         extend_expiry_to: u64,
     ) -> Result<CatalogCacheExpiry, CatalogSnapshotProviderError> {
         let cached = self
             .catalogs
-            .get_mut(&reference.snapshot_id)
+            .get_mut(&reference.cache_key())
             .filter(|cached| cached.matches(reference))
             .ok_or(CatalogSnapshotProviderError::InvalidCursor)?;
         if cached.expiry_version != matched_version {
@@ -111,12 +111,12 @@ impl CatalogMemoryState {
         Ok(cached.expiry_token())
     }
 
-    pub(super) fn expire_exact(&mut self, snapshot_id: [u8; 16], expiry: CatalogCacheExpiry) {
+    pub(super) fn expire_exact(&mut self, cache_key: CatalogCacheKey, expiry: CatalogCacheExpiry) {
         let expired = self
             .catalogs
-            .get(&snapshot_id)
+            .get(&cache_key)
             .is_some_and(|cached| cached.expiry_token() == expiry);
-        if expired && let Some(cached) = self.catalogs.remove(&snapshot_id) {
+        if expired && let Some(cached) = self.catalogs.remove(&cache_key) {
             self.cache_bytes = self
                 .cache_bytes
                 .checked_sub(cached.retained_bytes)
@@ -202,7 +202,7 @@ impl CatalogMemoryLease {
             .map_err(|_| CatalogSnapshotProviderError::MemoryStatePoisoned)?;
         if cached
             .as_ref()
-            .is_some_and(|entry| state.catalogs.contains_key(&entry.reference.snapshot_id))
+            .is_some_and(|entry| state.catalogs.contains_key(&entry.reference.cache_key()))
         {
             return Err(CatalogSnapshotProviderError::InvalidCursor);
         }
@@ -263,7 +263,7 @@ impl CatalogMemoryLease {
                 .cache_bytes
                 .checked_add(cached.retained_bytes)
                 .ok_or(CatalogSnapshotProviderError::MemoryBudgetExceeded)?;
-            state.catalogs.insert(cached.reference.snapshot_id, cached);
+            state.catalogs.insert(cached.reference.cache_key(), cached);
         }
         Ok(())
     }

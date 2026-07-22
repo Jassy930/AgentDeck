@@ -124,6 +124,7 @@ pub(super) fn validate_root_lost_receipt(
 pub(super) struct RemoteTransition {
     pub(super) previous_lifecycle: MachineRemoteLifecycle,
     pub(super) reset_kind: MachineTrustResetKind,
+    pub(super) require_root_present_ready: bool,
     pub(super) remote_cleanup: Option<super::reset_cleanup::RemoteSecurityCleanupMode>,
     pub(super) before_operation: RuntimeStoreOperation,
     pub(super) after_operation: RuntimeStoreOperation,
@@ -158,6 +159,13 @@ pub(super) fn commit_remote_transition(
     let transaction = state
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if transition.require_root_present_ready {
+        super::reset_cleanup::require_root_present_ready(
+            &transaction,
+            &state.key_bundle,
+            state.database_id,
+        )?;
+    }
     if let Some(mode) = transition.remote_cleanup {
         super::reset_cleanup::scrub_remote_security_state(
             &transaction,

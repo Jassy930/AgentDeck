@@ -1,7 +1,8 @@
 //! 高频对称内容加密（design §7.1 / §7.4）——RFC 8439 ChaCha20-Poly1305。
 //!
-//! 每个对称发送 key 只有一个发送方向；nonce = `32-bit 随机 key prefix || 64-bit big-endian
-//! sender counter`（design §7.4）。AAD 用 P1.2 的 [`OuterContextV1::encode_aad`] 确定性编码。
+//! 每个对称发送 key 只有一个发送方向；nonce = `32-bit key-derived pseudorandom prefix ||
+//! 64-bit big-endian sender counter`（design §7.4）。AAD 用 P1.2 的
+//! [`OuterContextV1::encode_aad`] 确定性编码。
 //!
 //! 对称 key wrapper zeroize-on-drop，`Debug` 不输出材料。
 
@@ -12,9 +13,13 @@ use agentdeck_protocol::e2ee::payload::{
 };
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::CryptoError;
+
+const NONCE_PREFIX_DERIVATION_DOMAIN: &[u8] = b"AgentDeck/AEADNoncePrefix/v1\0";
 
 /// 32-byte 对称 AEAD key。zeroize-on-drop；`Debug` 脱敏。
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -34,6 +39,21 @@ impl SecretAeadKey {
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+}
+
+/// 从双方已经持有的 256-bit 随机 AEAD key 稳定派生 32-bit nonce prefix。
+///
+/// 这是 domain-separated HMAC-SHA256 的确定性伪随机投影，不改变 wrapped-key wire，
+/// 也不把 raw key 暴露给调用方。相同 key 的两端必然得到相同 prefix；不同 key 即使
+/// 偶然得到相同 32-bit prefix，也属于不同 ChaCha20-Poly1305 nonce domain。调用方仍须
+/// 让同一 key 生命周期内的 durable sender counter 永不回退或复用。
+#[must_use]
+pub fn derive_nonce_prefix(key: &SecretAeadKey) -> [u8; 4] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes())
+        .expect("HMAC-SHA256 accepts a 32-byte AEAD key");
+    mac.update(NONCE_PREFIX_DERIVATION_DOMAIN);
+    let projection = mac.finalize().into_bytes();
+    [projection[0], projection[1], projection[2], projection[3]]
 }
 
 /// 64-bit sender counter（design §7.4）；填入 nonce 后 8 字节（big-endian）。
@@ -59,6 +79,10 @@ pub struct AeadSendingKey {
 }
 
 impl AeadSendingKey {
+    /// 显式 nonce prefix 构造器，仅供协议 golden vector、跨语言 synthetic fixture 与测试使用。
+    /// Production wrapped-key 路径必须使用 [`Self::with_derived_nonce_prefix`]，避免两端各自生成
+    /// 或硬编码不一致的 prefix。
+    #[must_use]
     pub fn new(
         key_id: KeyId,
         epoch: u64,
@@ -73,6 +97,18 @@ impl AeadSendingKey {
             nonce_prefix,
             key,
         }
+    }
+
+    /// Production constructor：从 wrapped-key 中已有的随机 AEAD key 双端派生稳定 prefix。
+    #[must_use]
+    pub fn with_derived_nonce_prefix(
+        key_id: KeyId,
+        epoch: u64,
+        key_directory_revision: u64,
+        key: SecretAeadKey,
+    ) -> Self {
+        let nonce_prefix = derive_nonce_prefix(&key);
+        Self::new(key_id, epoch, key_directory_revision, nonce_prefix, key)
     }
 }
 

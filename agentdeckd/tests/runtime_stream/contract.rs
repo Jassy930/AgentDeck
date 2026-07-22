@@ -13,6 +13,9 @@ async fn stable_event_item_entity_and_command_ids_survive_replay() {
     let entity_id = EntityId::new("stable-entity-id");
     let store = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA0),
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA1),
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA2),
             configuration_event_id,
             command_id,
             turn_id,
@@ -188,6 +191,9 @@ async fn snapshot_and_backfill_emit_capabilities_before_any_agent_item() {
     let started_event_id = runtime_id(RuntimeIdKind::Event, 0x45);
     let store = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA0),
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA1),
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA2),
             configuration_event_id,
             command_id,
             turn_id,
@@ -372,6 +378,9 @@ async fn snapshot_capture_holds_no_actor_lock_or_sqlite_transaction_during_io() 
     let event_id = runtime_id(RuntimeIdKind::Event, 0x53);
     let store = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA0),
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA1),
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA2),
             configuration_event_id,
             command_id,
             turn_id,

@@ -268,7 +268,9 @@ async fn materialize_snapshot_build(
         .expect("acquire managed snapshot test build source");
     let probe = match source.source() {
         SnapshotBarrierSource::Build(pin) => pin.clone(),
-        SnapshotBarrierSource::Ready(_) | SnapshotBarrierSource::Dynamic(_) => {
+        SnapshotBarrierSource::Ready(_)
+        | SnapshotBarrierSource::TransitionBuild(_)
+        | SnapshotBarrierSource::Dynamic(_) => {
             panic!("direct acquire must return build source")
         }
     };
@@ -480,7 +482,9 @@ async fn dropping_taken_snapshot_source_releases_exact_temp_pin() {
         .expect("fresh conversation requires a build source");
     let probe = match source.source() {
         SnapshotBarrierSource::Build(pin) => pin.clone(),
-        SnapshotBarrierSource::Ready(_) | SnapshotBarrierSource::Dynamic(_) => {
+        SnapshotBarrierSource::Ready(_)
+        | SnapshotBarrierSource::TransitionBuild(_)
+        | SnapshotBarrierSource::Dynamic(_) => {
             panic!("fresh conversation cannot be ready")
         }
     };
@@ -524,7 +528,9 @@ async fn dropping_directly_acquired_snapshot_pin_releases_exact_temp_pin() {
         .expect("directly acquire managed snapshot build source");
     let probe = match source.source() {
         SnapshotBarrierSource::Build(pin) => pin.clone(),
-        SnapshotBarrierSource::Ready(_) | SnapshotBarrierSource::Dynamic(_) => {
+        SnapshotBarrierSource::Ready(_)
+        | SnapshotBarrierSource::TransitionBuild(_)
+        | SnapshotBarrierSource::Dynamic(_) => {
             panic!("direct acquire must return build source")
         }
     };

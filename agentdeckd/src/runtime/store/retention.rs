@@ -14,19 +14,25 @@ use super::sequence::{SequenceScope, decode_sequence};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RetentionEvidence {
     pub active_pin_covers_victim: bool,
+    pub active_transition_covers_victim: bool,
     pub durable_snapshot_covers_victim: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetentionBlock {
     ActivePin,
+    TransitionBarrier,
     ReplacementMissing,
 }
 
-/// 纯策略层：pin 优先阻断；没有 durable replacement 也阻断。
+/// 纯策略层：易失 pin 与持久 transition barrier 都优先阻断；没有 durable
+/// replacement 也阻断。
 pub(crate) const fn evaluate_trim(evidence: RetentionEvidence) -> Result<(), RetentionBlock> {
     if evidence.active_pin_covers_victim {
         return Err(RetentionBlock::ActivePin);
+    }
+    if evidence.active_transition_covers_victim {
+        return Err(RetentionBlock::TransitionBarrier);
     }
     if !evidence.durable_snapshot_covers_victim {
         return Err(RetentionBlock::ReplacementMissing);
@@ -43,6 +49,7 @@ pub(super) enum RetentionTarget<'a> {
 pub(super) fn authorize_trim(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
     target: RetentionTarget<'_>,
     victim: &str,
     now_ms: u64,
@@ -62,6 +69,15 @@ pub(super) fn authorize_trim(
         ),
     };
     let victim_value = decode_sequence(sequence_scope, victim)?;
+    let active_transition_covers_victim = match target {
+        RetentionTarget::Catalog => super::key_transition::active_catalog_cut_covers_revision(
+            connection,
+            key_bundle,
+            database_id,
+            victim_value,
+        )?,
+        RetentionTarget::Conversation(_) => false,
+    };
     let durable_snapshot_covers_victim = match target {
         RetentionTarget::Catalog => super::snapshot::authenticated_catalog_snapshot_covers(
             connection,
@@ -85,12 +101,15 @@ pub(super) fn authorize_trim(
     };
     evaluate_trim(RetentionEvidence {
         active_pin_covers_victim,
+        active_transition_covers_victim,
         durable_snapshot_covers_victim,
     })
     .map_err(|block| match block {
-        RetentionBlock::ActivePin => RuntimeStoreError::WorkerBusy {
-            lane: RuntimeStoreLane::Normal,
-        },
+        RetentionBlock::ActivePin | RetentionBlock::TransitionBarrier => {
+            RuntimeStoreError::WorkerBusy {
+                lane: RuntimeStoreLane::Normal,
+            }
+        }
         RetentionBlock::ReplacementMissing => RuntimeStoreError::PublicationNeedsSnapshot,
     })
 }
@@ -142,6 +161,7 @@ mod tests {
         assert_eq!(
             evaluate_trim(RetentionEvidence {
                 active_pin_covers_victim: true,
+                active_transition_covers_victim: false,
                 durable_snapshot_covers_victim: true,
             }),
             Err(RetentionBlock::ActivePin)
@@ -149,6 +169,7 @@ mod tests {
         assert_eq!(
             evaluate_trim(RetentionEvidence {
                 active_pin_covers_victim: false,
+                active_transition_covers_victim: false,
                 durable_snapshot_covers_victim: false,
             }),
             Err(RetentionBlock::ReplacementMissing)
@@ -156,9 +177,18 @@ mod tests {
         assert_eq!(
             evaluate_trim(RetentionEvidence {
                 active_pin_covers_victim: false,
+                active_transition_covers_victim: false,
                 durable_snapshot_covers_victim: true,
             }),
             Ok(())
+        );
+        assert_eq!(
+            evaluate_trim(RetentionEvidence {
+                active_pin_covers_victim: false,
+                active_transition_covers_victim: true,
+                durable_snapshot_covers_victim: true,
+            }),
+            Err(RetentionBlock::TransitionBarrier)
         );
     }
 }

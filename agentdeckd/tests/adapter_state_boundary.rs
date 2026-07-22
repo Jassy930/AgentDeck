@@ -78,9 +78,16 @@ fn public_conversation_debug_omits_daemon_private_adapter_state_key() {
             "{:?}",
             CreateConversationOutcome::Created {
                 conversation: conversation.clone(),
+                conversation_activation_pending: false,
             }
         ),
-        format!("{:?}", CreateConversationOutcome::Replayed { conversation }),
+        format!(
+            "{:?}",
+            CreateConversationOutcome::Replayed {
+                conversation,
+                conversation_activation_pending: false,
+            }
+        ),
     ] {
         assert!(!output.contains("adapter_state_key"), "{output}");
         assert!(

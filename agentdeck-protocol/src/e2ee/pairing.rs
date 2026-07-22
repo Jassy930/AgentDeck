@@ -1035,8 +1035,11 @@ impl PairResponsePlaintextV1 {
         }
         self.device_authorization
             .validate_for_grant(&self.relay_grant)?;
+        // PairResponse wire 可携带首次 grant 的 authenticated conversation epoch-1
+        // entries；exact route 集合必须由 daemon 用 Store mapping 调用
+        // `validate_initial_directory_for_device` 复核。
         self.key_directory
-            .validate_bootstrap_for_device(self.relay_grant.device_route)
+            .validate_for_device(self.relay_grant.device_route)
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, PairingError> {

@@ -30,6 +30,7 @@ pub(crate) const MAX_PUBLICATION_MEMORY_BYTES: usize =
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PublicationDispatchKey {
     pub publication_stream_id: [u8; 16],
+    pub stream_route: [u8; 16],
     pub generation: [u8; 16],
     pub stream_seq: u64,
     pub blob_sha256: [u8; 32],
@@ -39,6 +40,7 @@ impl From<&FrozenPublication> for PublicationDispatchKey {
     fn from(publication: &FrozenPublication) -> Self {
         Self {
             publication_stream_id: publication.publication_stream_id,
+            stream_route: publication.stream_route,
             generation: publication.generation,
             stream_seq: publication.stream_seq,
             blob_sha256: publication.blob_sha256,
@@ -56,6 +58,7 @@ pub(crate) enum PublicationTransportOutcome {
     Committed(PublicationCommitReceipt),
     OutcomeUnknown,
     Offline,
+    Rejected,
 }
 
 #[async_trait::async_trait]
@@ -69,6 +72,8 @@ pub(crate) enum PublicationDispatchError {
     Store(#[from] RuntimeStoreError),
     #[error("publication transport receipt does not match the exact frozen row")]
     ReceiptMismatch,
+    #[error("publication transport rejected an invalid or stale binding")]
+    TransportRejected,
     #[error("publication dispatcher child task failed")]
     ChildTaskFailed,
     #[error("publication store returned a page above the fixed 8 MiB bound")]
@@ -79,6 +84,7 @@ pub(crate) enum PublicationDispatchError {
 enum InFlightPhase {
     Publishing,
     CommitPending,
+    AckPending,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,17 +108,19 @@ pub(crate) struct PublicationDriveReport {
     pub committed: usize,
     pub outcome_unknown: usize,
     pub commit_pending: usize,
+    pub transient_store_busy: usize,
     pub offline: bool,
 }
 
 struct LoadedPublication {
     publication: FrozenPublication,
+    relay_committed: bool,
     _page_permit: OwnedSemaphorePermit,
 }
 
 enum LoadResult {
     Empty([u8; 16]),
-    Loaded([u8; 16], LoadedPublication),
+    Loaded([u8; 16], Box<LoadedPublication>),
     Failed([u8; 16], RuntimeStoreError),
 }
 
@@ -187,6 +195,16 @@ impl<T: PublicationTransport> PublicationDispatcher<T> {
         }
     }
 
+    /// owner 的 startup admission gate 使用的进程内状态读回。只有所有已认证 stream
+    /// 都经过一次 Empty park 才是零；Ready/InFlight/TerminalError 均不能冒充恢复完成。
+    #[must_use]
+    pub(crate) fn pending_stream_count(&self) -> usize {
+        self.states
+            .values()
+            .filter(|state| **state != DispatcherStreamState::EmptyParked)
+            .count()
+    }
+
     /// 每轮每个 stream 至多尝试一次；OutcomeUnknown 与临时 ReadPool busy 只重新排到
     /// 下一次 owner drive，确保从 DB 重载 exact bytes 且不会在本轮 hot loop。单轮最多
     /// 并发两页，因此 retained page memory 不超过 16 MiB。
@@ -232,12 +250,30 @@ impl<T: PublicationTransport> PublicationDispatcher<T> {
                             );
                         }
                         let publication = page.into_iter().next().expect("non-empty page");
+                        let stream = match store.load_publication_stream_record(stream_id).await {
+                            Ok(stream) => stream,
+                            Err(error) => return LoadResult::Failed(stream_id, error),
+                        };
+                        if stream.generation != publication.generation
+                            || stream
+                                .acknowledged_high_water
+                                .is_some_and(|acknowledged| acknowledged >= publication.stream_seq)
+                        {
+                            return LoadResult::Failed(
+                                stream_id,
+                                RuntimeStoreError::PublicationMismatch,
+                            );
+                        }
+                        let relay_committed = stream
+                            .committed_high_water
+                            .is_some_and(|committed| committed >= publication.stream_seq);
                         LoadResult::Loaded(
                             stream_id,
-                            LoadedPublication {
+                            Box::new(LoadedPublication {
                                 publication,
+                                relay_committed,
                                 _page_permit: permit,
-                            },
+                            }),
                         )
                     }
                     Err(error) => LoadResult::Failed(stream_id, error),
@@ -286,6 +322,7 @@ impl<T: PublicationTransport> PublicationDispatcher<T> {
                         }
                     ) {
                         self.mark_ready(stream_id);
+                        report.transient_store_busy += 1;
                         continue;
                     }
                     self.states
@@ -307,8 +344,37 @@ impl<T: PublicationTransport> PublicationDispatcher<T> {
             return Err(error);
         }
 
-        let mut publishes = Vec::with_capacity(loaded.len());
+        // `committed > acknowledged` 是 Relay 已 durable 接收、daemon local ACK 尚未
+        // 完成的 crash cut。它只允许复用 authenticated exact key 删除本地 outbox；
+        // 绝不能再次调用 transport.publish。
+        let mut publishable = Vec::with_capacity(loaded.len());
+        let mut ack_error = None;
         for (stream_id, key, loaded) in loaded {
+            if loaded.relay_committed {
+                drop(loaded);
+                self.states.insert(
+                    stream_id,
+                    DispatcherStreamState::InFlight(InFlightPublication {
+                        key,
+                        phase: InFlightPhase::AckPending,
+                    }),
+                );
+                if let Err(error) = self.ack_exact(stream_id, key, &mut report).await {
+                    ack_error.get_or_insert(error);
+                }
+            } else {
+                publishable.push((stream_id, key, loaded));
+            }
+        }
+        if let Some(error) = ack_error {
+            for (stream_id, _, _) in publishable {
+                self.mark_ready(stream_id);
+            }
+            return Err(error);
+        }
+
+        let mut publishes = Vec::with_capacity(publishable.len());
+        for (stream_id, key, loaded) in publishable {
             let transport = Arc::clone(&self.transport);
             let task = tokio::spawn(async move {
                 let outcome = transport.publish(loaded.publication).await;
@@ -369,6 +435,11 @@ impl<T: PublicationTransport> PublicationDispatcher<T> {
                 report.offline = true;
                 Ok(())
             }
+            PublicationTransportOutcome::Rejected => {
+                self.states
+                    .insert(stream_id, DispatcherStreamState::TerminalError);
+                Err(PublicationDispatchError::TransportRejected)
+            }
         }
     }
 
@@ -388,11 +459,7 @@ impl<T: PublicationTransport> PublicationDispatcher<T> {
             )
             .await
         {
-            Ok(_) => {
-                report.committed += 1;
-                self.mark_ready(stream_id);
-                Ok(())
-            }
+            Ok(_) => self.ack_exact(stream_id, key, report).await,
             Err(RuntimeStoreError::CommitOutcomeUnknown {
                 operation: RuntimeCommitOperation::CommitPublication,
             })
@@ -404,6 +471,55 @@ impl<T: PublicationTransport> PublicationDispatcher<T> {
                     DispatcherStreamState::InFlight(InFlightPublication {
                         key,
                         phase: InFlightPhase::CommitPending,
+                    }),
+                );
+                self.commit_pending.push_back(stream_id);
+                report.commit_pending += 1;
+                Ok(())
+            }
+            Err(error) => {
+                self.states
+                    .insert(stream_id, DispatcherStreamState::TerminalError);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Relay COMMIT 与本地 retention 是两个独立 transaction。只有 exact local ACK
+    /// 成功（或 tombstone exact retry 读回）后，才把本轮计为完整 committed 并继续
+    /// 下一 row；outcome unknown / Safety busy 只重试 ACK，不再触达 transport。
+    async fn ack_exact(
+        &mut self,
+        stream_id: [u8; 16],
+        key: PublicationDispatchKey,
+        report: &mut PublicationDriveReport,
+    ) -> Result<(), PublicationDispatchError> {
+        match self
+            .store
+            .acknowledge_publication_delivery(
+                key.publication_stream_id,
+                key.generation,
+                key.stream_seq,
+                key.blob_sha256,
+            )
+            .await
+        {
+            Ok(_) => {
+                report.committed += 1;
+                self.mark_ready(stream_id);
+                Ok(())
+            }
+            Err(RuntimeStoreError::CommitOutcomeUnknown {
+                operation: RuntimeCommitOperation::AcknowledgePublication,
+            })
+            | Err(RuntimeStoreError::WorkerBusy {
+                lane: RuntimeStoreLane::Safety,
+            }) => {
+                self.states.insert(
+                    stream_id,
+                    DispatcherStreamState::InFlight(InFlightPublication {
+                        key,
+                        phase: InFlightPhase::AckPending,
                     }),
                 );
                 self.commit_pending.push_back(stream_id);
@@ -435,10 +551,15 @@ impl<T: PublicationTransport> PublicationDispatcher<T> {
             else {
                 continue;
             };
-            if inflight.phase != InFlightPhase::CommitPending {
-                continue;
+            match inflight.phase {
+                InFlightPhase::CommitPending => {
+                    self.commit_exact(stream_id, inflight.key, report).await?;
+                }
+                InFlightPhase::AckPending => {
+                    self.ack_exact(stream_id, inflight.key, report).await?;
+                }
+                InFlightPhase::Publishing => {}
             }
-            self.commit_exact(stream_id, inflight.key, report).await?;
         }
         Ok(())
     }

@@ -60,6 +60,10 @@ pub(super) enum ReducedSnapshotPayload {
         canonical_payload: Vec<u8>,
         input: Box<DynamicSnapshotInput>,
     },
+    Transition {
+        canonical_payload: Vec<u8>,
+        input: Box<crate::runtime::snapshot::SnapshotBuildInput>,
+    },
 }
 
 impl ReducedSnapshotPayload {
@@ -71,6 +75,9 @@ impl ReducedSnapshotPayload {
             } => wire_payload.as_deref().unwrap_or(stored.payload.as_slice()),
             Self::Dynamic {
                 canonical_payload, ..
+            }
+            | Self::Transition {
+                canonical_payload, ..
             } => canonical_payload,
         }
     }
@@ -80,10 +87,18 @@ impl ReducedSnapshotPayload {
         store: &RuntimeStoreHandle,
         router: Arc<AgentRouter>,
     ) -> Result<(), SnapshotReducerError> {
-        if let Self::Dynamic { input, .. } = self {
-            SnapshotMaterializer::new(store.clone(), router)
-                .release_dynamic_input(*input)
-                .await?;
+        match self {
+            Self::Dynamic { input, .. } => {
+                SnapshotMaterializer::new(store.clone(), router)
+                    .release_dynamic_input(*input)
+                    .await?;
+            }
+            Self::Transition { input, .. } => {
+                SnapshotMaterializer::new(store.clone(), router)
+                    .release_build_input(*input)
+                    .await?;
+            }
+            Self::Durable { .. } => {}
         }
         Ok(())
     }
@@ -116,7 +131,9 @@ pub(super) async fn materialize(
 ) -> Result<ReducedConversationSnapshot, SnapshotReducerError> {
     let build_source = matches!(
         source.source(),
-        SnapshotBarrierSource::Build(_) | SnapshotBarrierSource::Dynamic(_)
+        SnapshotBarrierSource::Build(_)
+            | SnapshotBarrierSource::TransitionBuild(_)
+            | SnapshotBarrierSource::Dynamic(_)
     );
     // 威胁场景：Build 已持 bootstrap permit 时，Ready 若先把整池申请排进公平
     // semaphore，Build 后续 upgrade 会永远排在无法满足的 Ready 后面。所有初始
@@ -127,7 +144,9 @@ pub(super) async fn materialize(
             reference.logical_bytes,
             reference.item_count,
         )?,
-        SnapshotBarrierSource::Build(_) | SnapshotBarrierSource::Dynamic(_) => {
+        SnapshotBarrierSource::Build(_)
+        | SnapshotBarrierSource::TransitionBuild(_)
+        | SnapshotBarrierSource::Dynamic(_) => {
             ConversationSnapshotBudgetEstimator::bootstrap_bound()?
         }
     };
@@ -180,6 +199,30 @@ pub(super) async fn materialize(
                 },
                 history_command_ids: None,
                 memory_permit,
+            })
+        }
+        SnapshotMaterialization::TransitionBuild(mut input) => {
+            let capabilities = input.capabilities().ok_or(SnapshotReducerError::Decode)?;
+            let configuration_state = input
+                .configuration_state()
+                .ok_or(SnapshotReducerError::Decode)?;
+            let mut estimator =
+                ConversationSnapshotBudgetEstimator::new(capabilities, configuration_state)?;
+            memory.grow_to(estimator.current_bound()?).await?;
+            let items = load_stable_items(store, &input, &mut memory, &mut estimator).await?;
+            memory
+                .grow_to(estimator.final_build_peak(&input, &items)?)
+                .await?;
+            let assembled = assemble_build_snapshot(&mut input, items)?;
+            let (snapshot, canonical_payload) = input.bind_assembled_transition_read(assembled)?;
+            Ok(ReducedConversationSnapshot {
+                snapshot,
+                payload: ReducedSnapshotPayload::Transition {
+                    canonical_payload,
+                    input: Box::new(input),
+                },
+                history_command_ids: None,
+                memory_permit: memory.into_permit()?,
             })
         }
         SnapshotMaterialization::Dynamic(mut input) => {

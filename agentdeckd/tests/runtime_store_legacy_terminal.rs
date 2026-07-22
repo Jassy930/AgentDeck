@@ -227,9 +227,60 @@ fn reauthenticate_runtime_ledger(
     ] {
         message.extend_from_slice(&runtime_meta_count(connection, column).to_be_bytes());
     }
+    for column in [
+        "configuration_count",
+        "configuration_sealed_bytes",
+        "command_configuration_pin_count",
+        "metadata_mutation_count",
+        "active_metadata_mutation_count",
+        "metadata_mutation_charged_bytes",
+        "native_projection_present_count",
+        "native_projection_tombstone_count",
+        "native_projection_retired_count",
+        "native_projection_physical_count",
+        "native_projection_charged_bytes",
+        "native_metadata_effect_fence_count",
+        "native_metadata_effect_unreleased_count",
+        "native_metadata_effect_released_count",
+        "admin_command_count",
+        "admin_command_pending_count",
+        "admin_command_charged_bytes",
+        "machine_identity_count",
+        "machine_remote_state_count",
+        "remote_pairing_count",
+        "remote_pairing_sealed_bytes",
+        "remote_pairing_receipt_count",
+        "remote_pairing_receipt_bytes",
+        "remote_authorization_count",
+        "remote_authorization_preparing_count",
+        "remote_authorization_active_count",
+        "remote_authorization_revoking_count",
+        "remote_authorization_revoked_count",
+        "remote_authorization_sealed_bytes",
+        "remote_key_directory_count",
+        "remote_key_directory_sealed_bytes",
+        "remote_control_outbox_count",
+        "remote_control_outbox_pending_count",
+        "remote_control_outbox_acknowledged_count",
+        "remote_control_outbox_sealed_bytes",
+        "remote_replay_scope_count",
+        "remote_replay_retired_scope_count",
+        "remote_replay_pin_count",
+        "remote_replay_sealed_bytes",
+        "remote_counter_state_count",
+        "remote_counter_state_sealed_bytes",
+        "remote_counter_guard_manifest_count",
+        "remote_key_transition_count",
+        "remote_key_transition_active_count",
+        "remote_key_transition_sealed_bytes",
+        "remote_key_update_outbox_count",
+        "remote_key_update_outbox_sealed_bytes",
+    ] {
+        message.extend_from_slice(&runtime_meta_count(connection, column).to_be_bytes());
+    }
     let token = bundle
-        .blind_index(b"runtime.meta.ledger.v4", &message)
-        .expect("authenticate rewritten Runtime ledger");
+        .blind_index(b"runtime.meta.ledger.v14", &message)
+        .expect("authenticate rewritten current-v14 Runtime ledger");
     assert_eq!(
         connection
             .execute(

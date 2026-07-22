@@ -10,16 +10,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agentdeck_protocol::runtime::identity::{MessageId, TransferId};
 use agentdeck_protocol::runtime::{
-    MAX_JSON_PART_BYTES, MAX_JSON_TRANSFER_PARTS, MAX_TRANSFER_BYTES, RUNTIME_PROTOCOL_VERSION,
-    RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeStreamItem, RuntimeTransferChannel,
-    TransferEnvelope, TransferError,
+    MAX_JSON_PART_BYTES, MAX_JSON_TRANSFER_PARTS, MAX_PART_BYTES, MAX_TRANSFER_BYTES,
+    MAX_TRANSFER_PARTS, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage, RuntimeReply,
+    RuntimeStreamItem, RuntimeTransferCarrierV1, RuntimeTransferChannel, TransferEnvelope,
+    TransferError,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use super::super::connection::{
-    ConnectionError, ConnectionId, ConnectionRegistry, EncodedRuntimeFrame,
+    ConnectionError, ConnectionFramingProfile, ConnectionId, ConnectionRegistry,
+    EncodedRuntimeFrame,
 };
 
 /// 受 JSON carrier 的 part 数与 raw part 上限共同约束的真实 payload 上限。
@@ -91,7 +93,7 @@ impl TransferEgressControl {
 pub(crate) enum TransferEgressErrorKind {
     #[error("transfer identity is empty or exceeds its UTF-8 wire bound")]
     InvalidIdentity,
-    #[error("transfer cannot be represented by at most 94 JSON parts of 700 KiB")]
+    #[error("transfer cannot be represented by the selected bounded carrier profile")]
     TooLarge,
     #[error("transfer egress was cancelled")]
     Cancelled,
@@ -146,6 +148,60 @@ fn json_transfer_part_count(payload_bytes: usize) -> Result<u32, TransferEgressE
         Err(TransferEgressErrorKind::TooLarge)
     } else {
         Ok(count)
+    }
+}
+
+fn compact_transfer_part_count(payload_bytes: usize) -> Result<u32, TransferEgressErrorKind> {
+    if payload_bytes > MAX_TRANSFER_BYTES as usize {
+        return Err(TransferEgressErrorKind::TooLarge);
+    }
+    let count = payload_bytes.max(1).div_ceil(MAX_PART_BYTES);
+    let count = u32::try_from(count).map_err(|_| TransferEgressErrorKind::TooLarge)?;
+    if count == 0 || count > MAX_TRANSFER_PARTS {
+        Err(TransferEgressErrorKind::TooLarge)
+    } else {
+        Ok(count)
+    }
+}
+
+/// 按 connection 安装时声明的中立 framing capability 选择 Stream transfer carrier。
+/// local UDS 保持 JSON/700 KiB；MachineLink 使用 ADRT1/3.5 MiB。普通 Runtime JSON
+/// 始终只能经 `EncodedRuntimeFrame::from_envelope`，不能借此入口放宽 1 MiB gate。
+pub(crate) async fn send_stream_transfer(
+    connections: &ConnectionRegistry,
+    connection_id: ConnectionId,
+    message_id: MessageId,
+    transfer_id: TransferId,
+    payload: &[u8],
+    control: &TransferEgressControl,
+) -> Result<TransferEgressReport, TransferEgressError> {
+    match connections
+        .framing_profile(connection_id)
+        .map_err(|error| failed(TransferEgressErrorKind::Reserve(error), 0))?
+    {
+        ConnectionFramingProfile::JsonRuntime => {
+            send_json_transfer(
+                connections,
+                connection_id,
+                message_id,
+                transfer_id,
+                RuntimeTransferChannel::Stream,
+                payload,
+                control,
+            )
+            .await
+        }
+        ConnectionFramingProfile::CompactTransfer => {
+            send_compact_stream_transfer(
+                connections,
+                connection_id,
+                message_id,
+                transfer_id,
+                payload,
+                control,
+            )
+            .await
+        }
     }
 }
 
@@ -207,6 +263,72 @@ pub(crate) async fn send_json_transfer(
         };
 
         let frame = EncodedRuntimeFrame::from_envelope(&envelope)
+            .map_err(|error| failed(TransferEgressErrorKind::Frame(error), flushed_parts))?;
+        let reservation = controlled(control, connections.reserve_paced(connection_id, frame))
+            .await
+            .map_err(|kind| failed(kind, flushed_parts))?
+            .map_err(|error| failed(TransferEgressErrorKind::Reserve(error), flushed_parts))?;
+        ensure_active(control, flushed_parts)?;
+        let receipt = connections
+            .commit_paced(reservation)
+            .map_err(|error| failed(TransferEgressErrorKind::Commit(error), flushed_parts))?;
+        controlled(control, receipt.wait())
+            .await
+            .map_err(|kind| failed(kind, flushed_parts))?
+            .map_err(|error| failed(TransferEgressErrorKind::Flush(error), flushed_parts))?;
+        flushed_parts = flushed_parts
+            .checked_add(1)
+            .ok_or_else(|| failed(TransferEgressErrorKind::TooLarge, flushed_parts))?;
+    }
+
+    Ok(TransferEgressReport {
+        part_count,
+        total_bytes,
+        total_sha256,
+    })
+}
+
+async fn send_compact_stream_transfer(
+    connections: &ConnectionRegistry,
+    connection_id: ConnectionId,
+    message_id: MessageId,
+    transfer_id: TransferId,
+    payload: &[u8],
+    control: &TransferEgressControl,
+) -> Result<TransferEgressReport, TransferEgressError> {
+    if !message_id.is_valid_wire_value() || !transfer_id.is_valid_wire_value() {
+        return Err(failed(TransferEgressErrorKind::InvalidIdentity, 0));
+    }
+    let part_count = compact_transfer_part_count(payload.len()).map_err(|kind| failed(kind, 0))?;
+    let total_bytes =
+        u64::try_from(payload.len()).map_err(|_| failed(TransferEgressErrorKind::TooLarge, 0))?;
+    let total_sha256: [u8; 32] = Sha256::digest(payload).into();
+    let mut flushed_parts = 0_u32;
+
+    for part_index in 0..part_count {
+        ensure_active(control, flushed_parts)?;
+        let start = part_index as usize * MAX_PART_BYTES;
+        let end = start.saturating_add(MAX_PART_BYTES).min(payload.len());
+        let part = if start < payload.len() {
+            payload[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        let transfer = TransferEnvelope::new(
+            transfer_id.clone(),
+            part_index,
+            part_count,
+            total_sha256,
+            total_bytes,
+            part,
+        )
+        .map_err(|error| failed(TransferEgressErrorKind::Transfer(error), flushed_parts))?;
+        let carrier = RuntimeTransferCarrierV1::new(
+            message_id.clone(),
+            RuntimeTransferChannel::Stream,
+            transfer,
+        );
+        let frame = EncodedRuntimeFrame::from_transfer_carrier(&carrier)
             .map_err(|error| failed(TransferEgressErrorKind::Frame(error), flushed_parts))?;
         let reservation = controlled(control, connections.reserve_paced(connection_id, frame))
             .await

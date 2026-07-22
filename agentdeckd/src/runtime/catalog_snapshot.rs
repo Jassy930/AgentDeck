@@ -10,7 +10,8 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
 use super::connection::{AuthenticatedPrincipal, PrincipalAccessError};
 use super::events::{
-    RegisterStreamBarrier, RuntimeStreamTarget, StreamBarrierRegistration, WatchGeneration,
+    CatalogSnapshotMaterializationMode, RegisterStreamBarrier, RuntimeStreamTarget,
+    StreamBarrierRegistration, WatchGeneration,
 };
 use super::model::{RuntimeClock, RuntimeClockError, SystemRuntimeClock};
 use super::store::{
@@ -33,6 +34,64 @@ mod page;
 
 pub(crate) const ONE_SHOT_CATALOG_BARRIERS: usize = 128;
 pub const CATALOG_PAGE_CURSOR_TTL_MS: u64 = 5 * 60 * 1_000;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum CatalogPageSourceKind {
+    Durable,
+    Ephemeral,
+}
+
+impl CatalogPageSourceKind {
+    const fn wire(self) -> u8 {
+        match self {
+            Self::Durable => 0,
+            Self::Ephemeral => 1,
+        }
+    }
+
+    fn from_wire(value: u8) -> Result<Self, CatalogSnapshotProviderError> {
+        match value {
+            0 => Ok(Self::Durable),
+            1 => Ok(Self::Ephemeral),
+            _ => Err(CatalogSnapshotProviderError::InvalidCursor),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct CatalogCacheKey {
+    pub(super) kind: CatalogPageSourceKind,
+    pub(super) snapshot_id: [u8; 16],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CatalogPageReference {
+    pub(super) kind: CatalogPageSourceKind,
+    pub(super) snapshot: ReadySnapshotReference,
+}
+
+impl CatalogPageReference {
+    fn durable(snapshot: ReadySnapshotReference) -> Self {
+        Self {
+            kind: CatalogPageSourceKind::Durable,
+            snapshot,
+        }
+    }
+
+    fn ephemeral(snapshot: ReadySnapshotReference) -> Self {
+        Self {
+            kind: CatalogPageSourceKind::Ephemeral,
+            snapshot,
+        }
+    }
+
+    fn cache_key(&self) -> CatalogCacheKey {
+        CatalogCacheKey {
+            kind: self.kind,
+            snapshot_id: self.snapshot.snapshot_id,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct CatalogSnapshotProvider {
@@ -183,7 +242,7 @@ impl CatalogSnapshotProvider {
         let source = registration
             .take_catalog_snapshot_source()
             .ok_or(CatalogSnapshotProviderError::MissingSnapshotSource)?;
-        let (source, frozen) = source.into_parts();
+        let (mode, source, frozen) = source.into_parts();
         if frozen != registration.high_water
             || source
                 .as_ref()
@@ -194,13 +253,6 @@ impl CatalogSnapshotProvider {
         let _operation = self.operation_gate.lock().await;
         let now_ms = self.clock.now_ms()?;
         self.purge_expired(now_ms)?;
-        // store 先只读认证 exact source/frozen delta metadata，并在 materialize
-        // 任何 snapshot/delta plaintext 前给出 conservative refresh peak。该
-        // reservation 贯穿 refresh、exact load、page/cache transition 与 transport flush。
-        let refresh = self
-            .store
-            .preflight_catalog_snapshot_refresh(source.clone(), frozen)
-            .await?;
         let expires_at_ms = now_ms
             .checked_add(CATALOG_PAGE_CURSOR_TTL_MS)
             .ok_or(CatalogSnapshotProviderError::InvalidCursor)?;
@@ -211,10 +263,57 @@ impl CatalogSnapshotProvider {
             expires_at_ms,
             binding,
         };
+        if mode == CatalogSnapshotMaterializationMode::TransitionEphemeral {
+            // Transition H 绝不能调用 durable refresh：D > H 时只认证 D identity，
+            // 从 retained delta 只读重建 ephemeral H；cache miss/restart 不得回退 D。
+            let preflight = self
+                .store
+                .preflight_transition_catalog_snapshot(source, frozen)
+                .await?;
+            let memory = CatalogMemoryLease::reserve(
+                self.memory.clone(),
+                self.global_memory.clone(),
+                preflight.peak_retained_bytes,
+            )?;
+            let mut ephemeral_id = [0_u8; 16];
+            getrandom::fill(&mut ephemeral_id)
+                .map_err(|_| CatalogSnapshotProviderError::EntropyUnavailable)?;
+            if ephemeral_id == [0; 16] {
+                return Err(CatalogSnapshotProviderError::EntropyUnavailable);
+            }
+            let materialized = self
+                .store
+                .materialize_transition_catalog_snapshot(
+                    preflight,
+                    ephemeral_id,
+                    memory.shared_permit()?,
+                )
+                .await?;
+            if materialized.reference.base != frozen
+                || materialized.reference.target != RuntimeStreamTarget::Catalog
+            {
+                return Err(CatalogSnapshotProviderError::InvalidRegistration);
+            }
+            return self.build_owned_page(
+                CatalogPageReference::ephemeral(materialized.reference),
+                materialized.entries,
+                None,
+                issue,
+                memory,
+            );
+        }
+
+        // Generic path 仍只接受 D <= H，并可在 exact H 持久 refresh。该 reservation
+        // 贯穿 refresh、exact load、page/cache transition 与 transport flush。
+        let refresh = self
+            .store
+            .preflight_catalog_snapshot_refresh(source.clone(), frozen)
+            .await?;
         if !refresh.refresh_required {
             let reference = source.ok_or(CatalogSnapshotProviderError::MissingSnapshotSource)?;
-            if let Some(cache_version) = self.cached_matches(&reference)? {
-                return self.build_cached_page(&reference, cache_version, None, issue);
+            let page_reference = CatalogPageReference::durable(reference.clone());
+            if let Some(cache_version) = self.cached_matches(&page_reference)? {
+                return self.build_cached_page(&page_reference, cache_version, None, issue);
             }
             let memory = CatalogMemoryLease::reserve(
                 self.memory.clone(),
@@ -285,8 +384,8 @@ impl CatalogSnapshotProvider {
         // 错误会绕过 purge，随后时钟回拨还能让同一 cursor 复活。
         self.purge_expired(now_ms)?;
         let claims = decode_cursor(&self.cursor_key, cursor, binding, now_ms)?;
-        self.page_from_reference(
-            claims.snapshot,
+        self.page_from_page_reference(
+            claims.reference,
             Some(claims.next_key),
             PageIssue {
                 observed_now_ms: now_ms,
@@ -324,9 +423,9 @@ impl CatalogSnapshotProvider {
         self.first_page(&mut registration, principal).await
     }
 
-    async fn page_from_reference(
+    async fn page_from_page_reference(
         &self,
-        reference: ReadySnapshotReference,
+        reference: CatalogPageReference,
         after: Option<String>,
         issue: PageIssue,
     ) -> Result<CatalogSnapshotPage, CatalogSnapshotProviderError> {
@@ -334,12 +433,18 @@ impl CatalogSnapshotProvider {
             return self.build_cached_page(&reference, cache_version, after.as_deref(), issue);
         }
 
-        let peak =
-            catalog_materialization_peak_bound(reference.logical_bytes, reference.item_count)
-                .map_err(|_| CatalogSnapshotProviderError::MemoryBudgetExceeded)?;
+        if reference.kind == CatalogPageSourceKind::Ephemeral {
+            return Err(CatalogSnapshotProviderError::InvalidCursor);
+        }
+
+        let peak = catalog_materialization_peak_bound(
+            reference.snapshot.logical_bytes,
+            reference.snapshot.item_count,
+        )
+        .map_err(|_| CatalogSnapshotProviderError::MemoryBudgetExceeded)?;
         let memory =
             CatalogMemoryLease::reserve(self.memory.clone(), self.global_memory.clone(), peak)?;
-        self.page_from_reference_with_memory(reference, after, issue, memory)
+        self.page_from_reference_with_memory(reference.snapshot, after, issue, memory)
             .await
     }
 
@@ -383,19 +488,25 @@ impl CatalogSnapshotProvider {
         {
             return Err(CatalogSnapshotProviderError::InvalidCursor);
         }
-        self.build_owned_page(reference, entries, after.as_deref(), issue, memory)
+        self.build_owned_page(
+            CatalogPageReference::durable(reference),
+            entries,
+            after.as_deref(),
+            issue,
+            memory,
+        )
     }
 
     fn build_owned_page(
         &self,
-        reference: ReadySnapshotReference,
+        reference: CatalogPageReference,
         entries: Vec<ConversationEntry>,
         after: Option<&str>,
         issue: PageIssue,
         mut memory: CatalogMemoryLease,
     ) -> Result<CatalogSnapshotPage, CatalogSnapshotProviderError> {
         let (start, end) = page_range(&entries, after)?;
-        let retained_bytes = cache_retained_bound(reference.logical_bytes, &entries)?;
+        let retained_bytes = cache_retained_bound(reference.snapshot.logical_bytes, &entries)?;
         let cursor_bound = if end < entries.len() { 512 } else { 0 };
         let page_build_bytes = page_memory_bound(&entries[start..end], cursor_bound)?;
         let build_peak = retained_bytes
@@ -429,10 +540,10 @@ impl CatalogSnapshotProvider {
             .transpose()?;
         let cache_expiry = cached
             .as_ref()
-            .map(|cached| (cached.reference.snapshot_id, cached.expiry_token()));
+            .map(|cached| (cached.reference.cache_key(), cached.expiry_token()));
         memory.transition(page_bytes, cached)?;
-        if let Some((snapshot_id, expiry)) = cache_expiry {
-            self.schedule_cache_expiry(snapshot_id, expiry, issue.observed_now_ms)?;
+        if let Some((cache_key, expiry)) = cache_expiry {
+            self.schedule_cache_expiry(cache_key, expiry, issue.observed_now_ms)?;
         }
         Ok(CatalogSnapshotPage {
             snapshot,
@@ -444,7 +555,7 @@ impl CatalogSnapshotProvider {
 
     fn build_cached_page(
         &self,
-        reference: &ReadySnapshotReference,
+        reference: &CatalogPageReference,
         matched_version: u64,
         after: Option<&str>,
         issue: PageIssue,
@@ -456,7 +567,7 @@ impl CatalogSnapshotProvider {
                 .map_err(|_| CatalogSnapshotProviderError::MemoryStatePoisoned)?;
             let cached = state
                 .catalogs
-                .get(&reference.snapshot_id)
+                .get(&reference.cache_key())
                 .filter(|cached| cached.matches(reference))
                 .ok_or(CatalogSnapshotProviderError::InvalidCursor)?;
             let (start, end) = page_range(&cached.entries, after)?;
@@ -479,7 +590,7 @@ impl CatalogSnapshotProvider {
                 .map_err(|_| CatalogSnapshotProviderError::MemoryStatePoisoned)?;
             let cached = state
                 .catalogs
-                .get(&reference.snapshot_id)
+                .get(&reference.cache_key())
                 .filter(|cached| cached.matches(reference))
                 .ok_or(CatalogSnapshotProviderError::InvalidCursor)?;
             construct_page(
@@ -498,7 +609,7 @@ impl CatalogSnapshotProvider {
             .lock()
             .map_err(|_| CatalogSnapshotProviderError::MemoryStatePoisoned)?
             .touch_expiry(reference, matched_version, issue.expires_at_ms)?;
-        self.schedule_cache_expiry(reference.snapshot_id, expiry, issue.observed_now_ms)?;
+        self.schedule_cache_expiry(reference.cache_key(), expiry, issue.observed_now_ms)?;
         Ok(CatalogSnapshotPage {
             snapshot,
             payload,
@@ -509,13 +620,13 @@ impl CatalogSnapshotProvider {
 
     fn cached_matches(
         &self,
-        reference: &ReadySnapshotReference,
+        reference: &CatalogPageReference,
     ) -> Result<Option<u64>, CatalogSnapshotProviderError> {
         let state = self
             .memory
             .lock()
             .map_err(|_| CatalogSnapshotProviderError::MemoryStatePoisoned)?;
-        let Some(cached) = state.catalogs.get(&reference.snapshot_id) else {
+        let Some(cached) = state.catalogs.get(&reference.cache_key()) else {
             return Ok(None);
         };
         if !cached.matches(reference) {
@@ -530,21 +641,21 @@ impl CatalogSnapshotProvider {
             .lock()
             .map_err(|_| CatalogSnapshotProviderError::MemoryStatePoisoned)?
             .observe_and_purge(now_ms)?;
-        for snapshot_id in expired {
-            self.expiry_tasks.cancel(snapshot_id)?;
+        for cache_key in expired {
+            self.expiry_tasks.cancel(cache_key)?;
         }
         Ok(())
     }
 
     fn schedule_cache_expiry(
         &self,
-        snapshot_id: [u8; 16],
+        cache_key: CatalogCacheKey,
         expiry: CatalogCacheExpiry,
         observed_now_ms: u64,
     ) -> Result<(), CatalogSnapshotProviderError> {
         self.expiry_tasks.replace(
             Arc::downgrade(&self.memory),
-            snapshot_id,
+            cache_key,
             expiry,
             observed_now_ms,
         )

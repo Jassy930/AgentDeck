@@ -8,7 +8,7 @@ use agentdeck_crypto::{
     HpkePrivateKey, SigningKey, ValidatedRelayReceiptSignerIdentityV1, sha256,
     sign_relay_admin_purge_receipt,
 };
-use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, PairInviteV1};
+use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, KeyId, KeyPurpose, PairInviteV1};
 use agentdeck_protocol::relay_v2::failure::RelayFailure;
 use agentdeck_protocol::relay_v2::frame::{RelayFrameBody, RetirementCommitted};
 use agentdeck_protocol::relay_v2::{
@@ -30,7 +30,9 @@ use agentdeck_relay_client::{RelayClientConfig, RelayClientError};
 use crate::config::{DaemonConfig, DaemonStartupOptions};
 use crate::local::listener::remote_start_permit_for_test;
 use crate::purge_finalizer::AuthenticatedPurgeAuthorization;
-use crate::remote::bootstrap::{RemoteBootstrapOutcome, reconcile_machine_identity};
+use crate::remote::bootstrap::{
+    RemoteBootstrapOutcome, machine_pairing_anchor_for_test, reconcile_machine_identity,
+};
 use crate::remote::cleanup::MachineCleanupWorkflow;
 use crate::remote::config::ValidatedEnrollmentConfig;
 use crate::remote::enrollment::FrozenMachineEnrollment;
@@ -44,8 +46,9 @@ use crate::runtime::store::IdempotencyOwner;
 use crate::runtime::store::pairing::{PreparePairingInvite, PreparePairingInviteOutcome};
 use crate::runtime::store::{
     ActiveMachineEnrollmentState, LocalDeletedMachineEnrollmentState, MachineEnrollmentState,
-    MachineRemoteLifecycle, MachineRemoteStateRecord, MachineTrustResetKind, RuntimeStoreConfig,
-    RuntimeStoreHandle,
+    MachineRemoteLifecycle, MachineRemoteStateRecord, MachineTrustResetKind,
+    PublicationPayloadKind, PublicationScope, RuntimeStoreConfig, RuntimeStoreHandle,
+    active_authorization_store_for_test,
 };
 use crate::runtime::{PairingAdministration, RevocationAdministration};
 use crate::security::{KeyStore, MemoryKeyStore, SecretBytes, load_or_create_storage_kek};
@@ -255,6 +258,37 @@ async fn active_state(store: &RuntimeStoreHandle) -> Box<ActiveMachineEnrollment
         panic!("expected active manager state")
     };
     active
+}
+
+async fn business_start_authority(
+    fixture: &ManagerFixture,
+) -> (
+    crate::remote::transport::MachineDataAuthority,
+    crate::remote::transport::tests::MachineDataAuthorityOwnerLease,
+    MachineRouteId,
+) {
+    let active = active_state(&fixture.store).await;
+    let secret = fixture
+        .keys
+        .load(MACHINE_DATA_SIGN_ACCOUNT)
+        .expect("load manager MachineDataSign seed")
+        .expect("manager fixture keeps MachineDataSign seed");
+    let seed: [u8; 32] = secret
+        .expose_secret()
+        .try_into()
+        .expect("MachineDataSign seed is exactly 32 bytes");
+    let machine_route = MachineRouteId::from_bytes(active.record.machine_route);
+    let (authority, owner) =
+        crate::remote::transport::tests::machine_data_authority_for_transition_test(
+            machine_pairing_anchor_for_test(
+                active.connection.relay_server_id,
+                machine_route,
+                &active.binding,
+                active.data_cert.clone(),
+            ),
+            seed,
+        );
+    (authority, owner, machine_route)
 }
 
 fn portable_admin_purge_receipt(active: &ActiveMachineEnrollmentState) -> RelayAdminPurgeReceiptV1 {
@@ -505,36 +539,1747 @@ async fn finish_split_store_fixture(
     let _ = fs::remove_dir_all(fixture.root);
 }
 
+#[test]
+fn recover_pending_offline_never_releases_remote_link_admission() {
+    let mut admission = super::RemoteBusinessAdmission::new();
+    admission
+        .observe_counter_audit(Ok(()))
+        .expect("sender counters audited");
+    admission
+        .observe_transition_readiness(Ok(
+            crate::remote::transition_owner::TransitionReadiness::NoActiveTransition,
+        ))
+        .expect("transition is business-ready before pending recovery");
+    let error = admission
+        .observe_publication_recovery(Err(
+            crate::remote::publication_transport::PublicationDriveError::RecoveryOffline,
+        ))
+        .expect_err("offline frozen outbox must keep link fenced");
+    assert_eq!(error.code(), "daemon.remote.publication.recovery_offline");
+    assert_eq!(
+        admission.phase,
+        super::RemoteBusinessAdmissionPhase::TransitionReady
+    );
+    assert_eq!(
+        admission
+            .into_permit()
+            .expect_err("link permit stays absent")
+            .code(),
+        "daemon.remote.link.admission_fenced"
+    );
+}
+
+#[test]
+fn transition_failure_after_counter_audit_never_releases_remote_link_admission() {
+    let mut admission = super::RemoteBusinessAdmission::new();
+    admission
+        .observe_counter_audit(Ok(()))
+        .expect("sender counters audited");
+    let error = admission
+        .observe_transition_readiness(Err(admin_error(
+            "daemon.remote.transition.advance_exhausted",
+        )))
+        .expect_err("non-ready transition keeps link fenced");
+    assert_eq!(error.code(), "daemon.remote.transition.advance_exhausted");
+    assert_eq!(
+        admission.phase,
+        super::RemoteBusinessAdmissionPhase::CounterAudited
+    );
+    assert_eq!(
+        admission
+            .into_permit()
+            .expect_err("link permit stays absent")
+            .code(),
+        "daemon.remote.link.admission_fenced"
+    );
+}
+
+#[test]
+fn control_plane_readiness_never_mints_a_business_ready_link_permit() {
+    let mut admission = super::RemoteBusinessAdmission::new();
+    admission
+        .observe_counter_audit(Ok(()))
+        .expect("sender counters audited");
+    admission
+        .observe_transition_readiness(Ok(
+            crate::remote::transition_owner::TransitionReadiness::ControlPlaneReady {
+                barrier_count: 2,
+            },
+        ))
+        .expect("control plane may proceed to exact pending recovery");
+    admission
+        .observe_publication_recovery(Ok(()))
+        .expect("frozen publication directory is recovered before opening control ingress");
+    let permit = admission
+        .into_permit()
+        .expect("control-plane RemoteLink still needs an explicit typed permit");
+    assert_eq!(
+        permit.mode,
+        super::RemoteLinkAdmissionMode::ControlPlaneOnly,
+        "BarriersCommitted without required ACK must not be mislabeled business-ready"
+    );
+}
+
+#[test]
+fn remote_link_admission_requires_counter_audit_transition_then_pending_recovery() {
+    let mut admission = super::RemoteBusinessAdmission::new();
+    assert_eq!(
+        admission
+            .observe_transition_readiness(Ok(
+                crate::remote::transition_owner::TransitionReadiness::NoActiveTransition,
+            ))
+            .expect_err("transition cannot skip counter audit")
+            .code(),
+        super::REMOTE_STATE_CONFLICT
+    );
+    admission
+        .observe_counter_audit(Ok(()))
+        .expect("counter audit advances exact phase");
+    assert_eq!(
+        admission
+            .observe_publication_recovery(Ok(()))
+            .expect_err("publication recovery cannot skip transition readiness")
+            .code(),
+        super::REMOTE_STATE_CONFLICT
+    );
+    admission
+        .observe_transition_readiness(Ok(
+            crate::remote::transition_owner::TransitionReadiness::BusinessReady {
+                barrier_count: 2,
+            },
+        ))
+        .expect("business-ready transition advances exact phase");
+    admission
+        .observe_publication_recovery(Ok(()))
+        .expect("pending recovery advances final admission phase");
+    admission
+        .into_permit()
+        .expect("only exact ordered gates release link admission");
+}
+
+struct RecordingLinkOwner {
+    order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+struct FailedLinkOwner;
+
+struct LifecycleRecordingLinkOwner {
+    store: RuntimeStoreHandle,
+    observed: Arc<std::sync::Mutex<Vec<(&'static str, &'static str)>>>,
+}
+
+#[async_trait::async_trait]
+impl super::ManagedRemoteLinkOwner for RecordingLinkOwner {
+    async fn shutdown(&mut self) -> Result<(), crate::remote::link::RemoteLinkError> {
+        self.order
+            .lock()
+            .expect("record link shutdown")
+            .push("link");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedRemoteLinkOwner for FailedLinkOwner {
+    async fn shutdown(&mut self) -> Result<(), crate::remote::link::RemoteLinkError> {
+        Ok(())
+    }
+
+    fn observed_failure_code(&self) -> Option<String> {
+        Some("daemon.remote.link.actor_exited".to_owned())
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedRemoteLinkOwner for LifecycleRecordingLinkOwner {
+    async fn shutdown(&mut self) -> Result<(), crate::remote::link::RemoteLinkError> {
+        let lifecycle = observed_machine_lifecycle(&self.store).await;
+        self.observed
+            .lock()
+            .expect("record link lifecycle")
+            .push(("link", lifecycle));
+        Ok(())
+    }
+}
+
+struct RecordingTransitionOwner {
+    order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+struct LifecycleRecordingTransitionOwner {
+    store: RuntimeStoreHandle,
+    observed: Arc<std::sync::Mutex<Vec<(&'static str, &'static str)>>>,
+}
+
+struct FailingTransitionShutdownOwner;
+
+struct FailedTransitionHealthOwner;
+
+struct RecordingMaintenanceOwner {
+    order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+struct LifecycleRecordingMaintenanceOwner {
+    store: RuntimeStoreHandle,
+    observed: Arc<std::sync::Mutex<Vec<(&'static str, &'static str)>>>,
+}
+
+#[derive(Default)]
+struct ReadyTransitionHandle {
+    calls: AtomicUsize,
+}
+
+struct FailingTransitionHandle;
+
+#[derive(Default)]
+struct PendingTransitionHandle {
+    requests: AtomicUsize,
+}
+
+struct ControlThenReadyTransitionHandle {
+    calls: AtomicUsize,
+    progress_tx: tokio::sync::watch::Sender<crate::remote::transition_owner::TransitionProgress>,
+}
+
+struct ControlOnlyTransitionHandle {
+    calls: AtomicUsize,
+    progress_tx: tokio::sync::watch::Sender<crate::remote::transition_owner::TransitionProgress>,
+}
+
+struct ProgressPendingThenReadyTransitionHandle {
+    calls: AtomicUsize,
+    progress_tx: tokio::sync::watch::Sender<crate::remote::transition_owner::TransitionProgress>,
+}
+
+struct StaleReadyPendingTransitionHandle {
+    calls: AtomicUsize,
+    progress_tx: tokio::sync::watch::Sender<crate::remote::transition_owner::TransitionProgress>,
+}
+
+struct StaleReadyTerminalTransitionHandle {
+    progress_tx: tokio::sync::watch::Sender<crate::remote::transition_owner::TransitionProgress>,
+}
+
+struct StaleReadyReconnectPendingTransitionHandle {
+    calls: AtomicUsize,
+    progress_tx: tokio::sync::watch::Sender<crate::remote::transition_owner::TransitionProgress>,
+}
+
+struct StaleReadyRetryableStoreTransitionHandle {
+    calls: AtomicUsize,
+    progress_tx: tokio::sync::watch::Sender<crate::remote::transition_owner::TransitionProgress>,
+}
+
+impl Default for ControlThenReadyTransitionHandle {
+    fn default() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            progress_tx: tokio::sync::watch::channel(
+                crate::remote::transition_owner::TransitionProgress::Idle,
+            )
+            .0,
+        }
+    }
+}
+
+impl ControlThenReadyTransitionHandle {
+    fn publish_business_ready(&self) {
+        self.progress_tx
+            .send_replace(crate::remote::transition_owner::TransitionProgress::Ready(
+                crate::remote::transition_owner::TransitionReadiness::BusinessReady {
+                    barrier_count: 2,
+                },
+            ));
+    }
+}
+
+impl Default for ControlOnlyTransitionHandle {
+    fn default() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            progress_tx: tokio::sync::watch::channel(
+                crate::remote::transition_owner::TransitionProgress::Idle,
+            )
+            .0,
+        }
+    }
+}
+
+impl Default for ProgressPendingThenReadyTransitionHandle {
+    fn default() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            progress_tx: tokio::sync::watch::channel(
+                crate::remote::transition_owner::TransitionProgress::Idle,
+            )
+            .0,
+        }
+    }
+}
+
+fn stale_business_ready_progress()
+-> tokio::sync::watch::Sender<crate::remote::transition_owner::TransitionProgress> {
+    tokio::sync::watch::channel(crate::remote::transition_owner::TransitionProgress::Ready(
+        crate::remote::transition_owner::TransitionReadiness::BusinessReady { barrier_count: 1 },
+    ))
+    .0
+}
+
+impl Default for StaleReadyPendingTransitionHandle {
+    fn default() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            progress_tx: stale_business_ready_progress(),
+        }
+    }
+}
+
+impl Default for StaleReadyTerminalTransitionHandle {
+    fn default() -> Self {
+        Self {
+            progress_tx: stale_business_ready_progress(),
+        }
+    }
+}
+
+impl Default for StaleReadyReconnectPendingTransitionHandle {
+    fn default() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            progress_tx: stale_business_ready_progress(),
+        }
+    }
+}
+
+impl Default for StaleReadyRetryableStoreTransitionHandle {
+    fn default() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            progress_tx: stale_business_ready_progress(),
+        }
+    }
+}
+
+impl StaleReadyReconnectPendingTransitionHandle {
+    fn publish_current_attempt_business_ready(&self) {
+        self.progress_tx
+            .send_replace(crate::remote::transition_owner::TransitionProgress::Ready(
+                crate::remote::transition_owner::TransitionReadiness::BusinessReady {
+                    barrier_count: 2,
+                },
+            ));
+    }
+}
+
+impl StaleReadyRetryableStoreTransitionHandle {
+    fn publish_current_attempt_business_ready(&self) {
+        self.progress_tx
+            .send_replace(crate::remote::transition_owner::TransitionProgress::Ready(
+                crate::remote::transition_owner::TransitionReadiness::BusinessReady {
+                    barrier_count: 3,
+                },
+            ));
+    }
+}
+
+impl ProgressPendingThenReadyTransitionHandle {
+    fn publish_control_plane_ready(&self) {
+        self.progress_tx
+            .send_replace(crate::remote::transition_owner::TransitionProgress::Ready(
+                crate::remote::transition_owner::TransitionReadiness::ControlPlaneReady {
+                    barrier_count: 1,
+                },
+            ));
+    }
+}
+
+#[derive(Default)]
+struct CountingStartupPublicationTransport {
+    publish_calls: AtomicUsize,
+}
+
+#[derive(Default)]
+struct OfflineOnceStartupPublicationTransport {
+    publish_calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::publication::PublicationTransport for CountingStartupPublicationTransport {
+    async fn publish(
+        &self,
+        publication: crate::runtime::store::FrozenPublication,
+    ) -> crate::runtime::publication::PublicationTransportOutcome {
+        self.publish_calls.fetch_add(1, Ordering::SeqCst);
+        let key = crate::runtime::publication::PublicationDispatchKey::from(&publication);
+        crate::runtime::publication::PublicationTransportOutcome::Committed(
+            crate::runtime::publication::PublicationCommitReceipt { key },
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::publication::PublicationTransport for OfflineOnceStartupPublicationTransport {
+    async fn publish(
+        &self,
+        publication: crate::runtime::store::FrozenPublication,
+    ) -> crate::runtime::publication::PublicationTransportOutcome {
+        let call = self.publish_calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            return crate::runtime::publication::PublicationTransportOutcome::Offline;
+        }
+        let key = crate::runtime::publication::PublicationDispatchKey::from(&publication);
+        crate::runtime::publication::PublicationTransportOutcome::Committed(
+            crate::runtime::publication::PublicationCommitReceipt { key },
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionHandle for FailingTransitionHandle {
+    fn request_control_plane_progress(
+        &self,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        Err(admin_error("daemon.remote.transition.test_blocked"))
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<
+        crate::remote::transition_owner::TransitionReadiness,
+        crate::runtime::remote_administration::RemoteAdministrationError,
+    > {
+        Err(admin_error("daemon.remote.transition.test_blocked"))
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionHandle for PendingTransitionHandle {
+    fn request_control_plane_progress(
+        &self,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<
+        crate::remote::transition_owner::TransitionReadiness,
+        crate::runtime::remote_administration::RemoteAdministrationError,
+    > {
+        std::future::pending().await
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionHandle for ReadyTransitionHandle {
+    fn request_control_plane_progress(
+        &self,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<
+        crate::remote::transition_owner::TransitionReadiness,
+        crate::runtime::remote_administration::RemoteAdministrationError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(
+            crate::remote::transition_owner::TransitionReadiness::BusinessReady {
+                barrier_count: 0,
+            },
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionHandle for ControlThenReadyTransitionHandle {
+    fn request_control_plane_progress(
+        &self,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        Ok(())
+    }
+
+    fn subscribe_progress(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<crate::remote::transition_owner::TransitionProgress>>
+    {
+        Some(self.progress_tx.subscribe())
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<
+        crate::remote::transition_owner::TransitionReadiness,
+        crate::runtime::remote_administration::RemoteAdministrationError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let readiness = crate::remote::transition_owner::TransitionReadiness::ControlPlaneReady {
+            barrier_count: 2,
+        };
+        self.progress_tx
+            .send_replace(crate::remote::transition_owner::TransitionProgress::Ready(
+                readiness,
+            ));
+        Ok(readiness)
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionHandle for ControlOnlyTransitionHandle {
+    fn request_control_plane_progress(
+        &self,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        Ok(())
+    }
+
+    fn subscribe_progress(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<crate::remote::transition_owner::TransitionProgress>>
+    {
+        Some(self.progress_tx.subscribe())
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<
+        crate::remote::transition_owner::TransitionReadiness,
+        crate::runtime::remote_administration::RemoteAdministrationError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let readiness = crate::remote::transition_owner::TransitionReadiness::ControlPlaneReady {
+            barrier_count: 2,
+        };
+        self.progress_tx
+            .send_replace(crate::remote::transition_owner::TransitionProgress::Ready(
+                readiness,
+            ));
+        Ok(readiness)
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionHandle for ProgressPendingThenReadyTransitionHandle {
+    fn request_control_plane_progress(
+        &self,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        Ok(())
+    }
+
+    fn subscribe_progress(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<crate::remote::transition_owner::TransitionProgress>>
+    {
+        Some(self.progress_tx.subscribe())
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<
+        crate::remote::transition_owner::TransitionReadiness,
+        crate::runtime::remote_administration::RemoteAdministrationError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.progress_tx
+            .send_replace(crate::remote::transition_owner::TransitionProgress::Pending);
+        Err(admin_error("daemon.remote.transition.progress_pending"))
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionHandle for StaleReadyPendingTransitionHandle {
+    fn request_control_plane_progress(
+        &self,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        Ok(())
+    }
+
+    fn subscribe_progress(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<crate::remote::transition_owner::TransitionProgress>>
+    {
+        Some(self.progress_tx.subscribe())
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<
+        crate::remote::transition_owner::TransitionReadiness,
+        crate::runtime::remote_administration::RemoteAdministrationError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionHandle for StaleReadyTerminalTransitionHandle {
+    fn request_control_plane_progress(
+        &self,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        Ok(())
+    }
+
+    fn subscribe_progress(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<crate::remote::transition_owner::TransitionProgress>>
+    {
+        Some(self.progress_tx.subscribe())
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<
+        crate::remote::transition_owner::TransitionReadiness,
+        crate::runtime::remote_administration::RemoteAdministrationError,
+    > {
+        Err(admin_error("daemon.remote.transition.test_blocked"))
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionHandle for StaleReadyReconnectPendingTransitionHandle {
+    fn request_control_plane_progress(
+        &self,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        Ok(())
+    }
+
+    fn subscribe_progress(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<crate::remote::transition_owner::TransitionProgress>>
+    {
+        Some(self.progress_tx.subscribe())
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<
+        crate::remote::transition_owner::TransitionReadiness,
+        crate::runtime::remote_administration::RemoteAdministrationError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(admin_error("daemon.remote.transition.reconnect_pending"))
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionHandle for StaleReadyRetryableStoreTransitionHandle {
+    fn request_control_plane_progress(
+        &self,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        Ok(())
+    }
+
+    fn subscribe_progress(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<crate::remote::transition_owner::TransitionProgress>>
+    {
+        Some(self.progress_tx.subscribe())
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<
+        crate::remote::transition_owner::TransitionReadiness,
+        crate::runtime::remote_administration::RemoteAdministrationError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.progress_tx
+            .send_replace(crate::remote::transition_owner::TransitionProgress::Pending);
+        Err(admin_error(
+            "daemon.remote.transition.completion_store_failed",
+        ))
+    }
+}
+
 #[tokio::test]
-async fn unavailable_p4_5_egress_keeps_business_lane_unclaimed_for_pairing_only_startup() {
-    let mut fixture = active_fixture("p44-egress-gated").await;
+async fn transition_readiness_uses_absolute_deadline_and_shutdown_cancellation() {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let pending = PendingTransitionHandle::default();
+    let timed_out = super::await_transition_readiness(
+        &pending,
+        tokio::time::Instant::now() + Duration::from_millis(20),
+        shutdown_rx,
+    )
+    .await
+    .expect_err("stalled Relay transition must hit the absolute deadline");
+    assert_eq!(
+        timed_out.code(),
+        "daemon.remote.transition.recovery_timed_out"
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    shutdown_tx.send_replace(true);
+    let pending = PendingTransitionHandle::default();
+    let cancelled = super::await_transition_readiness(
+        &pending,
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        shutdown_rx,
+    )
+    .await
+    .expect_err("shutdown must cancel transition admission immediately");
+    assert_eq!(cancelled.code(), "daemon.remote.shutting_down");
+}
+
+#[tokio::test]
+async fn startup_progress_pending_keeps_the_unique_owner_waiter_until_progress_ready() {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let transition = Arc::new(ProgressPendingThenReadyTransitionHandle::default());
+    let wait = tokio::spawn({
+        let transition = Arc::clone(&transition);
+        async move {
+            super::await_transition_readiness(
+                transition.as_ref(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                shutdown_rx,
+            )
+            .await
+        }
+    });
+    for _ in 0..1_000 {
+        if transition.calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(transition.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !wait.is_finished(),
+        "ProgressPending must stay attached to the existing owner instead of rolling startup back"
+    );
+    transition.publish_control_plane_ready();
+    assert_eq!(
+        wait.await
+            .expect("join startup readiness waiter")
+            .expect("owner progress releases startup control plane"),
+        crate::remote::transition_owner::TransitionReadiness::ControlPlaneReady {
+            barrier_count: 1
+        }
+    );
+    assert_eq!(
+        transition.calls.load(Ordering::SeqCst),
+        1,
+        "manager must not create a second transition drive owner"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_business_ready_cannot_cover_a_new_drive_timeout() {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let transition = StaleReadyPendingTransitionHandle::default();
+    let error = super::await_exact_business_readiness(
+        &transition,
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        shutdown_rx,
+    )
+    .await
+    .expect_err("a prior Ready value must not cover a stalled current transition");
+    assert_eq!(error.code(), "daemon.remote.transition.recovery_timed_out");
+    assert_eq!(transition.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn stale_business_ready_cannot_cover_a_terminal_drive_error() {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let error = super::await_exact_business_readiness(
+        &StaleReadyTerminalTransitionHandle::default(),
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        shutdown_rx,
+    )
+    .await
+    .expect_err("a prior Ready value must not cover a terminal current-attempt error");
+    assert_eq!(error.code(), "daemon.remote.transition.test_blocked");
+}
+
+#[tokio::test]
+async fn stale_business_ready_waits_for_fresh_progress_after_reconnect_pending() {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let transition = Arc::new(StaleReadyReconnectPendingTransitionHandle::default());
+    let wait = tokio::spawn({
+        let transition = Arc::clone(&transition);
+        async move {
+            super::await_exact_business_readiness(
+                transition.as_ref(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                shutdown_rx,
+            )
+            .await
+        }
+    });
+    for _ in 0..1_000 {
+        if transition.calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(transition.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !wait.is_finished(),
+        "ReconnectPending must not reuse a Ready value from an earlier transition"
+    );
+    transition.publish_current_attempt_business_ready();
+    wait.await
+        .expect("join fresh progress waiter")
+        .expect("fresh current-attempt progress releases business readiness");
+}
+
+#[tokio::test]
+async fn stale_business_ready_uses_fresh_pending_to_distinguish_retryable_store_progress() {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let transition = Arc::new(StaleReadyRetryableStoreTransitionHandle::default());
+    let wait = tokio::spawn({
+        let transition = Arc::clone(&transition);
+        async move {
+            super::await_exact_business_readiness(
+                transition.as_ref(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                shutdown_rx,
+            )
+            .await
+        }
+    });
+    for _ in 0..1_000 {
+        if transition.calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(transition.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !wait.is_finished(),
+        "fresh Pending is the typed distinction between retryable and permanent Store errors"
+    );
+    transition.publish_current_attempt_business_ready();
+    wait.await
+        .expect("join retryable Store progress waiter")
+        .expect("owner retry progress releases exact business readiness");
+}
+
+#[tokio::test]
+async fn shutdown_wins_while_stale_ready_waits_on_reconnect_pending() {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let transition = Arc::new(StaleReadyReconnectPendingTransitionHandle::default());
+    let wait = tokio::spawn({
+        let transition = Arc::clone(&transition);
+        async move {
+            super::await_exact_business_readiness(
+                transition.as_ref(),
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                shutdown_rx,
+            )
+            .await
+        }
+    });
+    for _ in 0..1_000 {
+        if transition.calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(transition.calls.load(Ordering::SeqCst), 1);
+    assert!(!wait.is_finished());
+    shutdown_tx.send_replace(true);
+    let error = wait
+        .await
+        .expect("join shutdown-priority waiter")
+        .expect_err("shutdown must beat stale and future Ready progress");
+    assert_eq!(error.code(), REMOTE_SHUTTING_DOWN);
+}
+
+#[tokio::test]
+async fn post_start_business_readiness_never_treats_control_plane_ready_as_success() {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let eventually_ready = Arc::new(ControlThenReadyTransitionHandle::default());
+    let wait = tokio::spawn({
+        let eventually_ready = Arc::clone(&eventually_ready);
+        async move {
+            super::await_exact_business_readiness(
+                eventually_ready.as_ref(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                shutdown_rx,
+            )
+            .await
+        }
+    });
+    for _ in 0..1_000 {
+        if eventually_ready.calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(eventually_ready.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !wait.is_finished(),
+        "ControlPlaneReady must stay fenced until owner progress observes the ACK"
+    );
+    eventually_ready.publish_business_ready();
+    wait.await
+        .expect("join exact readiness waiter")
+        .expect("owner progress releases exact business readiness");
+    assert_eq!(
+        eventually_ready.calls.load(Ordering::SeqCst),
+        1,
+        "manager must not issue a second full drive"
+    );
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let never_ready = ControlOnlyTransitionHandle::default();
+    let error = super::await_exact_business_readiness(
+        &never_ready,
+        tokio::time::Instant::now() + Duration::from_millis(40),
+        shutdown_rx,
+    )
+    .await
+    .expect_err("ControlPlaneReady without required ACK must never report business success");
+    assert_eq!(error.code(), "daemon.remote.transition.recovery_timed_out");
+    assert!(never_ready.calls.load(Ordering::SeqCst) >= 1);
+    assert!(
+        !super::transition_timeout_resolved(Some(error.code()), true),
+        "timeout must remain a stable remote block while the durable transition is active"
+    );
+    assert!(
+        super::transition_timeout_resolved(Some(error.code()), false),
+        "status may clear only after Store proves the transition slot is empty"
+    );
+    assert!(
+        !super::transition_timeout_resolved(
+            Some("daemon.remote.transition.backend_rejected"),
+            false
+        ),
+        "unrelated transition failures must not be cleared by the timeout rule"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn post_start_control_plane_wait_does_not_redrive_every_twenty_five_milliseconds() {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let never_ready = ControlOnlyTransitionHandle::default();
+    let error = super::await_exact_business_readiness(
+        &never_ready,
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        shutdown_rx,
+    )
+    .await
+    .expect_err("missing endpoint ACK must remain bounded by the original absolute deadline");
+    assert_eq!(error.code(), "daemon.remote.transition.recovery_timed_out");
+    assert!(
+        never_ready.calls.load(Ordering::SeqCst) <= 8,
+        "the manager must not bypass the owner 250ms -> 30s backoff with a 25ms drive loop"
+    );
+}
+
+#[tokio::test]
+async fn retired_active_sender_stages_one_counter_recovery_and_repeat_reuses_operation() {
+    let root = tempfile::tempdir().expect("create manager counter recovery root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure manager counter recovery root");
+    }
+    let database = root.path().join("runtime.db");
+    let store = active_authorization_store_for_test(&database).await;
+    let keys = Arc::new(MemoryKeyStore::new());
+    let authorization = store
+        .load_active_sender_counter_bindings()
+        .await
+        .expect("load authenticated sender inventory")
+        .into_iter()
+        .find_map(|binding| match binding {
+            crate::runtime::store::ActiveSenderCounterBinding::DirectedReply { authorization } => {
+                Some(authorization)
+            }
+            crate::runtime::store::ActiveSenderCounterBinding::SharedPublication { .. } => None,
+        })
+        .expect("active directed sender binding");
+    let key_id = KeyId {
+        purpose: KeyPurpose::DeviceReplyTx,
+        epoch: authorization.reply_key_epoch(),
+    };
+    let scope = crate::remote::counter::CounterScope::directed_reply_for_trust_epoch(
+        authorization.machine_trust_domain(),
+        authorization.machine_route(),
+        authorization.trust_epoch(),
+        authorization.device_route(),
+        authorization.grant_serial(),
+        authorization.reply_key_epoch(),
+    )
+    .expect("derive active directed sender scope");
+    let genesis = store
+        .load_remote_counter_record(scope.token(), key_id)
+        .await
+        .expect("load counter genesis");
+    store
+        .retire_remote_counter(
+            crate::runtime::store::remote_counter::RemoteCounterRetirementRequest {
+                scope_token: scope.token(),
+                key_id,
+                expected_reserved_end: genesis.reserved_end,
+                expected_db_anchor: genesis.db_anchor,
+                retired_through: crate::remote::counter::COUNTER_BLOCK_SIZE,
+            },
+        )
+        .await
+        .expect("persist rollback retirement");
+
+    let guard = crate::remote::identity::OwnedKeyStoreCounterGuardBackend::new(keys);
+    let operation_id = super::reconcile_active_sender_counters(&store, &guard)
+        .await
+        .expect("stage canonical counter recovery")
+        .expect("rollback requires a transition");
+    assert_ne!(operation_id, [0; 16]);
+    let transition = store
+        .load_active_key_transition()
+        .await
+        .expect("load staged counter transition")
+        .expect("counter transition remains active");
+    assert_eq!(transition.transition.operation_id, operation_id);
+    assert_eq!(
+        transition.transition.operation,
+        crate::runtime::store::key_transition::KeyTransitionOperation::CounterRecovery
+    );
+    assert!(
+        store
+            .has_retired_remote_counter()
+            .await
+            .expect("read recovery fence")
+    );
+
+    assert_eq!(
+        super::reconcile_active_sender_counters(&store, &guard)
+            .await
+            .expect("resume the same durable recovery"),
+        Some(operation_id),
+        "repeat startup must not fork the durable recovery lineage"
+    );
+    store
+        .shutdown()
+        .await
+        .expect("shutdown manager recovery Store");
+}
+
+#[tokio::test]
+async fn startup_counter_audit_fences_retired_pending_blob_before_transport_publish() {
+    let root = tempfile::tempdir().expect("create startup counter-order root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure startup counter-order root");
+    }
+    let store = active_authorization_store_for_test(&root.path().join("runtime.db")).await;
+    let publication_stream_id = [0xc1; 16];
+    let stream_route = [0xc2; 16];
+    let generation = [0xc3; 16];
+    store
+        .create_publication_stream(
+            publication_stream_id,
+            PublicationScope::Catalog,
+            stream_route,
+            generation,
+        )
+        .await
+        .expect("create startup Catalog stream");
+    let old_key_id = store
+        .load_active_sender_counter_bindings()
+        .await
+        .expect("load startup sender inventory")
+        .into_iter()
+        .find_map(|binding| match binding {
+            crate::runtime::store::ActiveSenderCounterBinding::SharedPublication {
+                publication_stream_id: id,
+                key_id,
+            } if id == publication_stream_id => Some(key_id),
+            _ => None,
+        })
+        .expect("load startup Catalog sender");
+    let old_scope = crate::remote::counter::CounterScope::publication(
+        store.machine_trust_domain().expect("startup trust domain"),
+        old_key_id,
+        publication_stream_id,
+    )
+    .expect("derive startup Catalog counter scope");
+    let Some(MachineEnrollmentState::Active(active)) = store
+        .load_machine_enrollment_state()
+        .await
+        .expect("load startup machine enrollment")
+    else {
+        panic!("startup authorization fixture must remain actively enrolled")
+    };
+    let key_directory_revision = store
+        .load_global_key_state()
+        .await
+        .expect("load startup key directory")
+        .expect("startup key directory exists")
+        .revision()
+        .value();
+    let freeze_guard = crate::remote::identity::OwnedKeyStoreCounterGuardBackend::new(Arc::new(
+        MemoryKeyStore::new(),
+    ));
+    let frozen = crate::remote::publisher::SignedPublicationCoordinator::new(&store, &freeze_guard)
+        .freeze_signed(
+            crate::remote::publisher::SignedPublicationRequest {
+                publication_id: [0xc4; 16],
+                publication_stream_id,
+                machine_route: MachineRouteId::from_bytes(active.record.machine_route),
+                generation: agentdeck_protocol::relay_v2::StreamGenerationId::from_bytes(
+                    generation,
+                ),
+                key_directory_revision,
+                key_id: old_key_id,
+                counter_scope: old_scope,
+                inner_after: None,
+                inner_through: Some(0),
+                payload_kind: PublicationPayloadKind::Catalog,
+                sealer_retained_bytes: 0,
+            },
+            |_axes| Ok(b"retired-old-counter-blob".to_vec()),
+        )
+        .await
+        .expect("transactionally freeze old-counter publication before rollback detection");
+    assert!(
+        frozen.counter_db_anchor.is_some(),
+        "fixture must exercise the P4 transaction-bound counter path"
+    );
+
+    let transport = Arc::new(CountingStartupPublicationTransport::default());
+    let publication_owner =
+        crate::remote::publication_transport::tests::open_owner_with_transport_for_test(
+            store.clone(),
+            Arc::clone(&transport),
+        )
+        .await
+        .expect("open startup publication owner");
+    let guard = crate::remote::identity::OwnedKeyStoreCounterGuardBackend::new(Arc::new(
+        MemoryKeyStore::new(),
+    ));
+    let transition = ReadyTransitionHandle::default();
+    let mut admission = super::RemoteBusinessAdmission::new();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let error = super::drive_business_startup_gates(
+        &store,
+        &guard,
+        &publication_owner.handle(),
+        &transition,
+        &mut admission,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        shutdown_rx,
+        None,
+    )
+    .await
+    .expect_err("retired pending scope must block startup before transport");
+    assert_eq!(
+        transport.publish_calls.load(Ordering::SeqCst),
+        0,
+        "CounterGuard/recovery audit must complete before any pending blob reaches transport"
+    );
+    assert_eq!(error.code(), super::COUNTER_RETIRED);
+    assert_eq!(
+        transition.calls.load(Ordering::SeqCst),
+        0,
+        "retired pending scope must fail before transition drive can rediscover it"
+    );
+    let staged = store
+        .load_active_key_transition()
+        .await
+        .expect("read back startup counter reconciliation")
+        .expect("rollback audit stages CounterRecovery before blocking transport");
+    assert_eq!(
+        staged.transition.operation,
+        crate::runtime::store::key_transition::KeyTransitionOperation::CounterRecovery
+    );
+    let pending = store
+        .load_pending_publications(publication_stream_id)
+        .await
+        .expect("reload fenced old-counter outbox");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].blob, b"retired-old-counter-blob");
+
+    publication_owner
+        .shutdown()
+        .await
+        .expect("shutdown startup publication owner");
+    store.shutdown().await.expect("shutdown startup Store");
+}
+
+#[tokio::test]
+async fn startup_offline_pending_recovery_keeps_owner_until_authenticated_reconnect() {
+    let root = tempfile::tempdir().expect("create healthy startup-order root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure healthy startup-order root");
+    }
+    let store = active_authorization_store_for_test(&root.path().join("runtime.db")).await;
+    let publication_stream_id = [0xd1; 16];
+    let generation = [0xd3; 16];
+    store
+        .create_publication_stream(
+            publication_stream_id,
+            PublicationScope::Catalog,
+            [0xd2; 16],
+            generation,
+        )
+        .await
+        .expect("create healthy startup Catalog stream");
+    let key_id = store
+        .load_active_sender_counter_bindings()
+        .await
+        .expect("load healthy startup sender inventory")
+        .into_iter()
+        .find_map(|binding| match binding {
+            crate::runtime::store::ActiveSenderCounterBinding::SharedPublication {
+                publication_stream_id: id,
+                key_id,
+            } if id == publication_stream_id => Some(key_id),
+            _ => None,
+        })
+        .expect("load healthy startup Catalog sender");
+    let scope = crate::remote::counter::CounterScope::publication(
+        store.machine_trust_domain().expect("healthy trust domain"),
+        key_id,
+        publication_stream_id,
+    )
+    .expect("derive healthy startup counter scope");
+    store
+        .freeze_publication(crate::runtime::store::FreezePublicationRequest {
+            publication_id: [0xd4; 16],
+            publication_stream_id,
+            generation,
+            counter_scope_token: scope.token(),
+            sender_counter: 1,
+            inner_after: None,
+            inner_through: Some(0),
+            payload_kind: PublicationPayloadKind::Catalog,
+            blob: b"healthy-pending-blob".to_vec(),
+        })
+        .await
+        .expect("freeze healthy startup publication");
+
+    let transport = Arc::new(OfflineOnceStartupPublicationTransport::default());
+    let publication_owner =
+        crate::remote::publication_transport::tests::open_owner_with_transport_for_test(
+            store.clone(),
+            Arc::clone(&transport),
+        )
+        .await
+        .expect("open healthy startup publication owner");
+    let guard = crate::remote::identity::OwnedKeyStoreCounterGuardBackend::new(Arc::new(
+        MemoryKeyStore::new(),
+    ));
+    let transition = Arc::new(ReadyTransitionHandle::default());
+    let (mut reconnect_transport, _pairing_lane, reconnect_harness) =
+        crate::remote::transport::active_pairing_transport_for_test(MachineRouteId::from_bytes(
+            [0xd5; 16],
+        ));
+    let reconnect_lane = reconnect_transport
+        .take_business_lane()
+        .expect("claim startup reconnect observation lane");
+    let reconnects = reconnect_lane
+        .publication_handle()
+        .subscribe_authenticated_reconnects();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let gate = tokio::spawn({
+        let store = store.clone();
+        let publication_drive = publication_owner.handle();
+        let guard = guard;
+        let transition = Arc::clone(&transition);
+        async move {
+            let mut admission = super::RemoteBusinessAdmission::new();
+            super::drive_business_startup_gates(
+                &store,
+                &guard,
+                &publication_drive,
+                transition.as_ref(),
+                &mut admission,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                shutdown_rx,
+                Some(reconnects),
+            )
+            .await?;
+            admission.into_permit()
+        }
+    });
+    for _ in 0..10_000 {
+        if transport.publish_calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(transport.publish_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !gate.is_finished(),
+        "Relay Offline must retain the startup gate and its unique publication owner"
+    );
+    reconnect_transport
+        .reconnect()
+        .await
+        .expect("authenticated replacement generation wakes startup recovery");
+    assert_eq!(reconnect_harness.reconnect_count(), 1);
+    tokio::time::timeout(Duration::from_secs(2), gate)
+        .await
+        .expect("startup recovery remains inside its original deadline")
+        .expect("join startup gate")
+        .expect("authenticated reconnect releases the RemoteLink admission permit");
+    assert_eq!(transition.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.publish_calls.load(Ordering::SeqCst), 2);
+
+    publication_owner
+        .shutdown()
+        .await
+        .expect("shutdown healthy startup publication owner");
+    drop(reconnect_lane);
+    reconnect_transport.shutdown().await;
+    store
+        .shutdown()
+        .await
+        .expect("shutdown healthy startup Store");
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionOwner for RecordingTransitionOwner {
+    async fn shutdown(
+        self: Box<Self>,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        self.order
+            .lock()
+            .expect("record transition shutdown")
+            .push("transition");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionOwner for LifecycleRecordingTransitionOwner {
+    async fn shutdown(
+        self: Box<Self>,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        let lifecycle = observed_machine_lifecycle(&self.store).await;
+        self.observed
+            .lock()
+            .expect("record transition lifecycle")
+            .push(("transition", lifecycle));
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionOwner for FailingTransitionShutdownOwner {
+    async fn shutdown(
+        self: Box<Self>,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        Err(admin_error("daemon.remote.transition.shutdown_timed_out"))
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedTransitionOwner for FailedTransitionHealthOwner {
+    async fn shutdown(
+        self: Box<Self>,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        Ok(())
+    }
+
+    fn observed_failure_code(&self) -> Option<String> {
+        Some("daemon.remote.transition.business_fenced".to_owned())
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedMaintenanceOwner for RecordingMaintenanceOwner {
+    async fn shutdown(
+        self: Box<Self>,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        self.order
+            .lock()
+            .expect("record maintenance shutdown")
+            .push("maintenance");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedMaintenanceOwner for LifecycleRecordingMaintenanceOwner {
+    async fn shutdown(
+        self: Box<Self>,
+    ) -> Result<(), crate::runtime::remote_administration::RemoteAdministrationError> {
+        let lifecycle = observed_machine_lifecycle(&self.store).await;
+        self.observed
+            .lock()
+            .expect("record maintenance lifecycle")
+            .push(("maintenance", lifecycle));
+        Ok(())
+    }
+}
+
+struct RecordingPublicationOwner {
+    order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+struct LifecycleRecordingPublicationOwner {
+    store: RuntimeStoreHandle,
+    observed: Arc<std::sync::Mutex<Vec<(&'static str, &'static str)>>>,
+}
+
+struct FailingPublicationShutdownOwner;
+
+#[async_trait::async_trait]
+impl super::ManagedPublicationOwner for RecordingPublicationOwner {
+    async fn shutdown(
+        self: Box<Self>,
+    ) -> Result<(), crate::remote::publication_transport::PublicationDriveError> {
+        self.order
+            .lock()
+            .expect("record publication shutdown")
+            .push("publication");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedPublicationOwner for LifecycleRecordingPublicationOwner {
+    async fn shutdown(
+        self: Box<Self>,
+    ) -> Result<(), crate::remote::publication_transport::PublicationDriveError> {
+        let lifecycle = observed_machine_lifecycle(&self.store).await;
+        self.observed
+            .lock()
+            .expect("record publication lifecycle")
+            .push(("publication", lifecycle));
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ManagedPublicationOwner for FailingPublicationShutdownOwner {
+    async fn shutdown(
+        self: Box<Self>,
+    ) -> Result<(), crate::remote::publication_transport::PublicationDriveError> {
+        Err(crate::remote::publication_transport::PublicationDriveError::ShutdownTimedOut)
+    }
+}
+
+async fn observed_machine_lifecycle(store: &RuntimeStoreHandle) -> &'static str {
+    match store
+        .load_machine_enrollment_state()
+        .await
+        .expect("load lifecycle observed during owner shutdown")
+        .expect("owner shutdown requires durable machine lifecycle")
+    {
+        MachineEnrollmentState::EnrollmentPrepared(_) => "enrollmentPrepared",
+        MachineEnrollmentState::EnrollmentResponseValidated(_) => "enrollmentResponseValidated",
+        MachineEnrollmentState::Active(_) => "active",
+        MachineEnrollmentState::RetirePending(_) => "retirePending",
+        MachineEnrollmentState::RelayCommitted(_) => "relayCommitted",
+        MachineEnrollmentState::PurgeReadbackAbsent(_) => "purgeReadbackAbsent",
+        MachineEnrollmentState::LocalDeleted(_) => "localDeleted",
+    }
+}
+
+#[tokio::test]
+async fn shutdown_reclaims_remote_link_then_maintenance_transition_and_publication() {
+    let mut fixture = unenrolled_fixture("p45-owner-shutdown-order").await;
     let manager = RemoteManager::new(
         fixture.store.clone(),
         fixture.keys.clone(),
         fixture.config.clone(),
-        RemoteBootstrapOutcome::Active(
-            fixture
-                .identity
-                .take()
-                .expect("active fixture owns machine identity"),
-        ),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
     );
-    let machine_route = MachineRouteId::from_bytes([0x22; 16]);
-    let (mut transport, _pairing_lane, _harness) =
-        crate::remote::transport::active_pairing_transport_for_test(machine_route);
-
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
     {
         let mut state = manager.state.lock().await;
-        manager
-            .start_remote_link(&mut state, &mut transport, *machine_route.as_bytes())
-            .expect("P4.5-unavailable business ingress is gated without failing pairing startup");
-        assert!(state.link.is_none());
+        state.link = Some(Box::new(RecordingLinkOwner {
+            order: Arc::clone(&order),
+        }));
+        state.transition = Some(Box::new(RecordingTransitionOwner {
+            order: Arc::clone(&order),
+        }));
+        state.transition_handle = Some(Arc::new(ReadyTransitionHandle::default()));
+        state.maintenance = Some(Box::new(RecordingMaintenanceOwner {
+            order: Arc::clone(&order),
+        }));
+        state.publication = Some(Box::new(RecordingPublicationOwner {
+            order: Arc::clone(&order),
+        }));
     }
-    let _business = transport
-        .take_business_lane()
-        .expect("readiness gate must run before claiming the unique business lane");
 
-    transport.shutdown().await;
+    manager.shutdown().await;
+
+    assert_eq!(
+        *order.lock().expect("read shutdown order"),
+        vec!["link", "maintenance", "transition", "publication"]
+    );
+    {
+        let state = manager.state.lock().await;
+        assert!(state.link.is_none());
+        assert!(state.transition.is_none());
+        assert!(state.transition_handle.is_none());
+        assert!(state.maintenance.is_none());
+        assert!(state.publication.is_none());
+    }
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test]
+async fn failed_business_start_rolls_back_all_business_owners_but_keeps_pairing() {
+    let mut fixture = unenrolled_fixture("p45-start-rollback-order").await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (pairing, _health_tx) = crate::remote::pairing::PairingCoordinatorOwner::health_test_double(
+        crate::remote::pairing::PairingCoordinatorHealth::Healthy,
+    );
+    {
+        let mut state = manager.state.lock().await;
+        state.pairing = Some(pairing);
+        state.link = Some(Box::new(RecordingLinkOwner {
+            order: Arc::clone(&order),
+        }));
+        state.transition = Some(Box::new(RecordingTransitionOwner {
+            order: Arc::clone(&order),
+        }));
+        state.transition_handle = Some(Arc::new(ReadyTransitionHandle::default()));
+        state.maintenance = Some(Box::new(RecordingMaintenanceOwner {
+            order: Arc::clone(&order),
+        }));
+        state.publication = Some(Box::new(RecordingPublicationOwner {
+            order: Arc::clone(&order),
+        }));
+
+        super::rollback_business_start(&mut state)
+            .await
+            .expect("all startup owners join before retry");
+
+        assert!(state.link.is_none());
+        assert!(state.transition.is_none());
+        assert!(state.transition_handle.is_none());
+        assert!(state.maintenance.is_none());
+        assert!(state.publication.is_none());
+        assert!(state.pairing.is_some(), "pairing control must remain live");
+    }
+    assert_eq!(
+        *order.lock().expect("read startup rollback order"),
+        vec!["link", "maintenance", "transition", "publication"]
+    );
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test]
+async fn business_start_missing_runtime_core_preserves_same_process_retry_intent() {
+    let mut fixture = active_fixture("p45-start-retry-intent").await;
+    let (machine_data, _machine_data_owner, machine_route) =
+        business_start_authority(&fixture).await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        super::stage_business_start(&mut state, *machine_route.as_bytes(), machine_data)
+            .expect("stage exact active-machine business start");
+    }
+
+    let error = manager
+        .start_business_stack_if_ready()
+        .await
+        .expect_err("missing RuntimeCore must keep business startup blocked");
+    assert_eq!(error.code(), "daemon.remote.runtime_core_unavailable");
+    let state = manager.state.lock().await;
+    assert!(
+        state.pending_business_start.is_some(),
+        "a transient pre-lane failure must preserve the exact retry intent"
+    );
+    assert_eq!(
+        state.blocked_code.as_deref(),
+        Some("daemon.remote.runtime_core_unavailable")
+    );
+    drop(state);
+
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test]
+async fn business_start_post_lane_failure_restores_lane_and_exact_retry_intent() {
+    let mut fixture = active_fixture("p45-start-retry-lane").await;
+    let (machine_data, _machine_data_owner, machine_route) =
+        business_start_authority(&fixture).await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+    let core = Arc::new(
+        crate::runtime::RuntimeCore::new(
+            fixture.store.clone(),
+            Arc::new(crate::runtime::AgentRouter::with_runtime_store(
+                fixture.store.clone(),
+            )),
+            fixture
+                .store
+                .machine_trust_domain()
+                .expect("load manager fixture trust domain"),
+        )
+        .expect("construct manager startup RuntimeCore"),
+    );
+    assert!(manager.install_runtime_core(&core));
+    let (transport, _pairing_lane, _harness) =
+        crate::remote::transport::active_pairing_transport_for_test(machine_route);
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.transport = Some(transport);
+        super::stage_business_start(&mut state, *machine_route.as_bytes(), machine_data)
+            .expect("stage exact active-machine business start");
+    }
+    manager
+        .install_business_start_failure_after_lane_for_test("daemon.remote.test_start_after_lane")
+        .await;
+
+    let error = manager
+        .start_business_stack_if_ready()
+        .await
+        .expect_err("injected post-lane failure keeps startup blocked");
+    assert_eq!(error.code(), "daemon.remote.test_start_after_lane");
+    let mut state = manager.state.lock().await;
+    assert!(state.pending_business_start.is_some());
+    assert!(!state.quiescence_unknown);
+    let retry_lane = state
+        .transport
+        .as_mut()
+        .expect("transport remains owned by manager")
+        .take_business_lane()
+        .expect("joined rollback restores the unique business lane");
+    state
+        .transport
+        .as_mut()
+        .expect("transport remains owned by manager")
+        .restore_business_lane(retry_lane)
+        .await
+        .expect("return test lane for manager shutdown");
+    drop(state);
+
+    drop(core);
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test]
+async fn failed_business_start_rollback_latches_unknown_quiescence_and_blocks_retry() {
+    let mut fixture = active_fixture("p45-start-rollback-quiescence").await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.transition = Some(Box::new(FailingTransitionShutdownOwner));
+        let _ = super::rollback_business_start(&mut state).await;
+        assert!(
+            state.quiescence_unknown,
+            "failed startup owner join must irreversibly latch this process"
+        );
+        assert_eq!(
+            state.blocked_code.as_deref(),
+            Some("daemon.remote.quiescence_unknown")
+        );
+    }
+
+    let status = manager
+        .status()
+        .await
+        .expect("blocked status remains readable");
+    assert_eq!(status.lifecycle, WireLifecycle::Blocked);
+    assert_eq!(
+        status.failure_code.unwrap().as_str(),
+        "daemon.remote.quiescence_unknown"
+    );
+    let retry = manager
+        .enroll(MachineEnrollRequest {
+            bundle: fixture.bundle.clone(),
+            scope: LocalOnlyAdministration::LocalOnly,
+        })
+        .await
+        .expect_err("same-process exact enroll retry must honor unknown quiescence");
+    assert_eq!(retry.code(), "daemon.remote.quiescence_unknown");
+
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test]
+async fn remote_link_actor_failure_is_visible_to_status_and_running_admission() {
+    let mut fixture = active_fixture("p45-link-health").await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.link = Some(Box::new(FailedLinkOwner));
+        let error = super::require_running_armed(&state)
+            .expect_err("an exited RemoteLink actor must fence administration");
+        assert_eq!(error.code(), "daemon.remote.link.actor_exited");
+    }
+
+    let status = manager
+        .status()
+        .await
+        .expect("failed link status remains readable");
+    assert_eq!(status.lifecycle, WireLifecycle::Blocked);
+    assert_eq!(
+        status.failure_code.expect("link failure code").as_str(),
+        "daemon.remote.link.actor_exited"
+    );
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test]
+async fn transition_fence_is_visible_to_status_and_running_admission() {
+    let mut fixture = active_fixture("p45-transition-health").await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.transition = Some(Box::new(FailedTransitionHealthOwner));
+        let error = super::require_running_armed(&state)
+            .expect_err("control-plane-only transition must fence administration");
+        assert_eq!(error.code(), "daemon.remote.transition.business_fenced");
+    }
+
+    let status = manager
+        .status()
+        .await
+        .expect("transition-fenced status remains readable");
+    assert_eq!(status.lifecycle, WireLifecycle::Blocked);
+    assert_eq!(
+        status
+            .failure_code
+            .expect("transition failure code")
+            .as_str(),
+        "daemon.remote.transition.business_fenced"
+    );
     finish_fixture(manager, fixture).await;
 }
 
@@ -597,6 +2342,155 @@ impl PurgePlanSink for RecordingPurgeSink {
             PurgeReservationResume::Absent
         })
     }
+}
+
+#[tokio::test]
+async fn root_present_terminal_quiesces_p45_owners_before_purge_scrub() {
+    let mut fixture = active_fixture("p45-q-order").await;
+    prepare_retirement(&fixture).await;
+    record_retirement_terminal(&fixture.store).await;
+    assert!(matches!(
+        fixture.store.load_machine_enrollment_state().await.unwrap(),
+        Some(MachineEnrollmentState::RelayCommitted(_))
+    ));
+
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    )
+    .with_purge_plan_sink(Arc::new(RecordingPurgeSink::default()));
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let result = {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.link = Some(Box::new(LifecycleRecordingLinkOwner {
+            store: fixture.store.clone(),
+            observed: Arc::clone(&observed),
+        }));
+        state.transition = Some(Box::new(LifecycleRecordingTransitionOwner {
+            store: fixture.store.clone(),
+            observed: Arc::clone(&observed),
+        }));
+        state.maintenance = Some(Box::new(LifecycleRecordingMaintenanceOwner {
+            store: fixture.store.clone(),
+            observed: Arc::clone(&observed),
+        }));
+        state.publication = Some(Box::new(LifecycleRecordingPublicationOwner {
+            store: fixture.store.clone(),
+            observed: Arc::clone(&observed),
+        }));
+        manager
+            .trust_reset_locked(
+                &mut state,
+                TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+                    .expect("ordinary root-present reset"),
+            )
+            .await
+    };
+    result.expect("quiescent root-present reset completes");
+    assert_eq!(
+        *observed.lock().expect("read reset quiescence observations"),
+        vec![
+            ("link", "relayCommitted"),
+            ("maintenance", "relayCommitted"),
+            ("transition", "relayCommitted"),
+            ("publication", "relayCommitted"),
+        ]
+    );
+    assert!(matches!(
+        fixture.store.load_machine_enrollment_state().await.unwrap(),
+        Some(MachineEnrollmentState::LocalDeleted(_))
+    ));
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test]
+async fn shutdown_timeout_keeps_relay_committed_keys_and_latches_process() {
+    let mut fixture = active_fixture("p45-q-timeout").await;
+    prepare_retirement(&fixture).await;
+    record_retirement_terminal(&fixture.store).await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    )
+    .with_purge_plan_sink(Arc::new(RecordingPurgeSink::default()));
+    let request = || {
+        TrustResetRequest::new(LocalOnlyAdministration::LocalOnly, None)
+            .expect("ordinary root-present reset")
+    };
+
+    let first = {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.transition = Some(Box::new(FailingTransitionShutdownOwner));
+        manager
+            .trust_reset_locked(&mut state, request())
+            .await
+            .expect_err("unknown transition quiescence must stop before scrub")
+    };
+    assert_eq!(first.code(), "daemon.remote.quiescence_unknown");
+    assert!(matches!(
+        fixture.store.load_machine_enrollment_state().await.unwrap(),
+        Some(MachineEnrollmentState::RelayCommitted(_))
+    ));
+    for account in [
+        MACHINE_DATA_SIGN_ACCOUNT,
+        MACHINE_LINK_SIGN_ACCOUNT,
+        MACHINE_HPKE_ACCOUNT,
+        KEY_DIRECTORY_GUARD_ACCOUNT,
+        MACHINE_ROOT_SIGN_ACCOUNT,
+    ] {
+        assert!(
+            fixture.keys.load(account).unwrap().is_some(),
+            "quiescence timeout must retain {account}"
+        );
+    }
+
+    let second = {
+        let mut state = manager.state.lock().await;
+        manager
+            .trust_reset_locked(&mut state, request())
+            .await
+            .expect_err("same process cannot retry after unknown quiescence")
+    };
+    assert_eq!(second.code(), "daemon.remote.quiescence_unknown");
+    assert!(matches!(
+        fixture.store.load_machine_enrollment_state().await.unwrap(),
+        Some(MachineEnrollmentState::RelayCommitted(_))
+    ));
+    finish_fixture(manager, fixture).await;
+}
+
+#[tokio::test]
+async fn purge_finalizer_shutdown_timeout_never_releases_ready_state() {
+    let mut fixture = active_fixture("p45-final-q-timeout").await;
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    );
+
+    let error = {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.purge_pending = true;
+        state.publication = Some(Box::new(FailingPublicationShutdownOwner));
+        manager
+            .quiesce_for_purge_finalizer(&mut state)
+            .await
+            .expect_err("finalizer readiness requires proven publication quiescence")
+    };
+    assert_eq!(error.code(), "daemon.remote.quiescence_unknown");
+    let state = manager.state.lock().await;
+    assert!(state.identity.is_some());
+    assert!(state.purge_pending);
+    drop(state);
+    finish_fixture(manager, fixture).await;
 }
 
 struct RejectingPurgeSink;
@@ -823,6 +2717,45 @@ async fn shutdown_cancels_pairing_startup_while_arm_holds_manager_mutex() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cancels_business_startup_without_waiting_for_manager_mutex() {
+    let mut fixture = unenrolled_fixture("cancel-business-start").await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let startup_entered = manager.install_business_startup_test_hook().await;
+
+    let arm_manager = Arc::clone(&manager);
+    let arm = tokio::spawn(async move { arm_manager.arm(remote_start_permit_for_test()).await });
+    tokio::time::timeout(Duration::from_secs(1), startup_entered)
+        .await
+        .expect("arm must reach the pending business recovery wait")
+        .expect("business startup hook remains installed");
+    let state = manager
+        .state
+        .try_lock()
+        .expect("business recovery must not retain the manager state mutex");
+    drop(state);
+
+    tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .expect("shutdown must cancel business recovery within a fixed bound");
+    let arm_error = arm
+        .await
+        .expect("arm task joins")
+        .expect_err("shutdown must cancel pending business startup");
+    assert_eq!(arm_error.code(), REMOTE_SHUTTING_DOWN);
+    assert!(manager.state.lock().await.stopped);
+
+    let manager = Arc::try_unwrap(manager).unwrap_or_else(|_| panic!("all manager tasks joined"));
+    drop(manager);
+    fixture.store.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_offline_connect_keeps_exact_retry_owner_until_joined_shutdown() {
     let mut fixture = active_fixture("active-offline").await;
     let manager = RemoteManager::new(
@@ -934,6 +2867,7 @@ async fn revocation_waits_for_actor_without_holding_manager_mutex() {
     };
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let transition = Arc::new(PendingTransitionHandle::default());
     {
         let mut state = manager.state.lock().await;
         state.armed = true;
@@ -944,6 +2878,7 @@ async fn revocation_waits_for_actor_without_holding_manager_mutex() {
                 expected.clone(),
             ),
         );
+        state.transition_handle = Some(transition.clone());
     }
 
     let operation_manager = Arc::clone(&manager);
@@ -960,7 +2895,15 @@ async fn revocation_waits_for_actor_without_holding_manager_mutex() {
         .expect("manager mutex must be free while Relay ACK is pending");
     drop(guard);
     release_tx.send(()).expect("release fake actor ACK");
-    assert_eq!(operation.await.unwrap().unwrap(), expected);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(100), operation)
+            .await
+            .expect("committed revocation must not wait for endpoint transition ACK")
+            .unwrap()
+            .unwrap(),
+        expected
+    );
+    assert_eq!(transition.requests.load(Ordering::SeqCst), 1);
 
     let manager = match Arc::try_unwrap(manager) {
         Ok(manager) => manager,
@@ -969,6 +2912,64 @@ async fn revocation_waits_for_actor_without_holding_manager_mutex() {
     drop(manager);
     fixture.store.shutdown().await.unwrap();
     let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_revocation_returns_receipt_and_latches_transition_enqueue_failure() {
+    let mut fixture = active_fixture("revocation-transition-fence").await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let device = DeviceHandle::new("device-22222222222222222222222222222222");
+    let serial = GrantSerial::new(8);
+    let committed = RevocationReceipt::Committed {
+        grant_serial: serial,
+    };
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test = Some(
+            crate::remote::pairing::PairingCoordinatorHandle::revocation_test_double(
+                entered_tx, release_rx, committed,
+            ),
+        );
+        state.transition_handle = Some(Arc::new(FailingTransitionHandle));
+    }
+
+    let operation = {
+        let manager = Arc::clone(&manager);
+        let device = device.clone();
+        tokio::spawn(async move { manager.revoke_device(device, serial).await })
+    };
+    assert_eq!(
+        entered_rx.await.expect("revocation reaches actor"),
+        (device, serial)
+    );
+    release_tx
+        .send(())
+        .expect("release committed revocation receipt");
+    assert_eq!(
+        operation
+            .await
+            .expect("join committed revocation")
+            .expect("durable receipt must survive transition enqueue failure"),
+        RevocationReceipt::Committed {
+            grant_serial: serial
+        }
+    );
+    assert_eq!(
+        manager.state.lock().await.blocked_code.as_deref(),
+        Some("daemon.remote.transition.test_blocked")
+    );
+
+    let manager = Arc::try_unwrap(manager)
+        .unwrap_or_else(|_| panic!("fenced revocation drops all manager owners"));
+    finish_fixture(manager, fixture).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

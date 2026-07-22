@@ -71,6 +71,9 @@ async fn disconnecting_snapshot_build_keeps_shared_budget_until_store_command_fi
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
             .with_id_source(SequenceIdSource::new([
+                publication_axis_id(0xA0),
+                publication_axis_id(0xA1),
+                publication_axis_id(0xA2),
                 configuration_event,
                 command_id,
                 turn_id,
@@ -206,6 +209,9 @@ async fn unacked_snapshot_store_failure_drops_retry_payload_and_build_pin_before
         crate::runtime::store::RuntimeStoreConfig::new(root.path.join("runtime.db"))
             .with_command_capacity(1_024)
             .with_id_source(SequenceIdSource::new([
+                publication_axis_id(0xA0),
+                publication_axis_id(0xA1),
+                publication_axis_id(0xA2),
                 configuration_event,
                 command_id,
                 turn_id,

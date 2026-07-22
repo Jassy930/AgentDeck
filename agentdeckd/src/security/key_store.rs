@@ -224,6 +224,17 @@ pub fn load_or_create_storage_kek(
     Ok(persisted)
 }
 
+/// 只读取既有 StorageKEK；缺失、长度错误或 KeyStore 失败均 fail-close。
+///
+/// 本入口专供 stopped-daemon rescue/finalizer 使用，不检查 Runtime artifact，且绝不
+/// 创建或覆盖 Keychain item。
+pub fn load_existing_storage_kek(key_store: &dyn KeyStore) -> Result<StorageKek, StorageKekError> {
+    let secret = key_store
+        .load(STORAGE_KEK_ACCOUNT)?
+        .ok_or(StorageKekError::StorageKeyMissing)?;
+    StorageKek::from_secret(secret)
+}
+
 fn runtime_artifacts(runtime_db: &Path) -> [PathBuf; 3] {
     [
         runtime_db.to_path_buf(),

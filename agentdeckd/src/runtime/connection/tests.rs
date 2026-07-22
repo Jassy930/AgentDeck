@@ -1,10 +1,11 @@
 use super::*;
 
 use agentdeck_protocol::runtime::command::HelloParams;
-use agentdeck_protocol::runtime::identity::{ConversationId, EventId, MessageId};
+use agentdeck_protocol::runtime::identity::{ConversationId, EventId, MessageId, TransferId};
 use agentdeck_protocol::runtime::{
     MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeEvent,
     RuntimeEventBody, RuntimeFailure, RuntimeMessage, RuntimeReply, RuntimeStreamItem,
+    RuntimeTransferCarrierV1, RuntimeTransferChannel, TransferEnvelope,
 };
 
 fn principal(seed: u8) -> AuthenticatedPrincipal {
@@ -73,6 +74,7 @@ async fn panicking_writer_reports_same_failure_to_owner_and_waiter() {
                 byte_budget: Arc::new(Semaphore::new(8)),
                 frame_budget: Arc::new(Semaphore::new(1)),
                 paced_reservation_slot: Arc::new(Semaphore::new(1)),
+                framing_profile: ConnectionFramingProfile::JsonRuntime,
             },
         );
         tasks.insert(
@@ -490,6 +492,7 @@ async fn stale_paced_reservation_cannot_remove_replacement_connection_entry() {
                 byte_budget: Arc::new(Semaphore::new(8)),
                 frame_budget: Arc::new(Semaphore::new(1)),
                 paced_reservation_slot: Arc::new(Semaphore::new(1)),
+                framing_profile: ConnectionFramingProfile::JsonRuntime,
             },
         );
 
@@ -563,6 +566,39 @@ fn encoded_frame_rejects_oversized_reply_and_stream_before_writer_admission() {
         EncodedRuntimeFrame::from_envelope(&stream),
         Err(ConnectionError::FrameTooLarge)
     ));
+}
+
+#[tokio::test]
+async fn compact_transfer_frame_is_typed_and_rejected_by_a_json_only_connection() {
+    let transfer = TransferEnvelope::new(
+        TransferId::new("typed-compact-transfer"),
+        0,
+        1,
+        [0x22; 32],
+        7,
+        b"compact".to_vec(),
+    )
+    .expect("valid compact transfer");
+    let carrier = RuntimeTransferCarrierV1::new(
+        MessageId::new("typed-compact-message"),
+        RuntimeTransferChannel::Stream,
+        transfer,
+    );
+    let frame = EncodedRuntimeFrame::from_transfer_carrier(&carrier)
+        .expect("typed carrier constructor must encode ADRT1");
+    assert_eq!(frame.kind(), EncodedRuntimeFrameKind::CompactTransfer);
+
+    let registry = ConnectionRegistry::new(1, 4 * 1024 * 1024);
+    let (tx, mut rx) = mpsc::channel(1);
+    let id = registry
+        .connect(principal(29), ConnectionSink::new(tx))
+        .expect("connect default JSON-only writer");
+    assert!(matches!(
+        registry.reserve_paced(id, frame).await,
+        Err(ConnectionError::FramingProfileMismatch)
+    ));
+    assert!(rx.try_recv().is_err());
+    registry.shutdown().await.expect("shutdown JSON writer");
 }
 
 #[tokio::test]

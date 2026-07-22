@@ -11,7 +11,7 @@ use agentdeck_crypto::{
 use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, PairInviteV1, PairResponseReceivedV1};
 use agentdeck_protocol::relay_v2::frame::{
     GrantCommitted, OpaqueRouteFrame, PairRouteCloseOutcome, PairRouteClosed, RelayFrameBody,
-    RetireMachine, RevocationCommitted,
+    RetireMachine, RetirementCommitted, RevocationCommitted,
 };
 use agentdeck_protocol::relay_v2::{
     CertRole, DeviceRevocation, Digest32, ENROLLMENT_BUNDLE_VERSION, Ed25519Signature,
@@ -25,25 +25,34 @@ use agentdeck_protocol::relay_v2::{
 };
 use rusqlite::Connection;
 
+use crate::config::{DaemonConfig, DaemonStartupOptions};
 use crate::remote::access::{PairResponseAccessBinding, VerifiedPairResponseReceipt};
+use crate::remote::bootstrap::{RemoteBootstrapOutcome, reconcile_machine_identity};
+use crate::remote::identity::{
+    MACHINE_DATA_SIGN_ACCOUNT, MACHINE_HPKE_ACCOUNT, MACHINE_LINK_SIGN_ACCOUNT,
+    MACHINE_ROOT_SIGN_ACCOUNT, load_key_directory_guard,
+};
 use crate::runtime::model::{
     IdempotencyOwner, MachineEnrollmentState, MachineIdentityBinding, RuntimeCapacityObservation,
     RuntimeCapacityProbe, RuntimeCapacityProbeError, RuntimeCommitOperation, RuntimeStoreConfig,
     RuntimeStoreError, RuntimeStoreFaultInjector, RuntimeStoreOperation,
 };
-use crate::security::{MemoryKeyStore, SecretBytes, load_or_create_storage_kek};
+use crate::security::{KeyStore, MemoryKeyStore, SecretBytes, load_or_create_storage_kek};
 
+use super::super::key_transition::KeyTransitionPhase;
 use super::super::pairing::{PreparePairingInvite, PreparePairingInviteOutcome};
 use super::super::pairing_delivery::{
     AcknowledgePairResponseReceived, AcknowledgePairResponseReceivedOutcome,
 };
 use super::super::pairing_grant::PairingGrantPreparation;
 use super::super::pairing_grant_allocation::GrantAllocationProjection;
+use super::super::pairing_grant_allocation_tests::complete_active_membership_transition;
 use super::super::pairing_grant_commit::{
     AcknowledgeGrantCommitted, AcknowledgeGrantCommittedOutcome, GrantCommittedRecovery,
 };
 use super::super::pairing_grant_tests::{
-    awaiting_pairing, awaiting_pairing_with, grant_input, grant_input_with, secret,
+    awaiting_pairing, awaiting_pairing_with, complete_active_zero_cut_transition, grant_input,
+    grant_input_with, secret,
 };
 use super::super::pairing_grant_tx::{ConfirmPairingGrantOutcome, GrantPreparingRecovery};
 use super::super::pairing_revocation::{BeginDeviceRevocation, BeginDeviceRevocationOutcome};
@@ -52,6 +61,7 @@ use super::super::pairing_revocation_ack::{
 };
 use super::super::pairing_terminal::PairingTerminalAction;
 use super::super::pairing_tests::{NOW_MS, TestClock};
+use super::super::publication::PublicationScope;
 use super::super::{RuntimeId, RuntimeStoreHandle};
 
 const RELAY: RelayServerId = RelayServerId::from_bytes([0x31; 16]);
@@ -90,6 +100,31 @@ impl Drop for TestRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn stable_remote_config(root: &TestRoot) -> (DaemonConfig, PathBuf) {
+    let home = Path::new("/tmp").join(format!(
+        "adrh-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(home.join("Library/Application Support"))
+        .expect("create stable recovery home");
+    let config = DaemonConfig::resolve_with_roots(
+        DaemonStartupOptions {
+            ephemeral: false,
+            no_remote: false,
+            stdio_compat: false,
+            profile: None,
+            stable_keychain_access_group: Some(
+                "A1B2C3D4E5.com.agentdeck.agentdeckd.stable".to_owned(),
+            ),
+        },
+        &home,
+        &root.0,
+    )
+    .expect("resolve stable recovery config");
+    (config, home)
 }
 
 struct GenerousCapacity;
@@ -256,9 +291,22 @@ async fn make_active(store: &RuntimeStoreHandle, binding: &MachineIdentityBindin
         .activate_machine_identity(binding.clone())
         .await
         .expect("activate identity");
+    enroll_active_binding(
+        store,
+        binding,
+        certificate(binding, CertRole::Link),
+        certificate(binding, CertRole::Data),
+    )
+    .await
+}
+
+async fn enroll_active_binding(
+    store: &RuntimeStoreHandle,
+    binding: &MachineIdentityBinding,
+    link: SignedCertificate,
+    data: SignedCertificate,
+) -> [u8; 32] {
     let bundle = bundle();
-    let link = certificate(binding, CertRole::Link);
-    let data = certificate(binding, CertRole::Data);
     let request = MachineEnrollmentRequestV1 {
         code: bundle.code.clone(),
         machine_route: MACHINE_ROUTE,
@@ -465,6 +513,16 @@ async fn prepare_full_grant_history(
         grant_input(&first, binding, &data_cert),
     )
     .await;
+    complete_active_zero_cut_transition(store).await;
+    store
+        .create_publication_stream(
+            [0x21; 16],
+            PublicationScope::Catalog,
+            [0x22; 16],
+            [0x23; 16],
+        )
+        .await
+        .expect("create full-history catalog stream before renewal transition");
 
     let renewal = awaiting_pairing_with(
         store,
@@ -517,9 +575,281 @@ async fn prepare_full_grant_history(
         ),
     )
     .await;
+    complete_active_membership_transition(store, clock).await;
     assert_eq!(renewed.device_route, first_grant.device_route);
     assert_eq!(renewed.grant_serial, GrantSerial::new(2));
     renewed
+}
+
+#[tokio::test]
+async fn rotation_finalize_atomically_advances_identity_remote_binding_and_transition_phase() {
+    let root = TestRoot::new();
+    let keys = Arc::new(MemoryKeyStore::new());
+    let binding = binding();
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let store = open_store_with_clock_and_fault(&root, &keys, clock.clone(), None).await;
+    let _ = make_active(&store, &binding).await;
+
+    let data_cert = certificate(&binding, CertRole::Data);
+    let preparation = awaiting_pairing(&store, &binding, &data_cert).await;
+    let confirmed = store
+        .confirm_pairing_grant(grant_input(&preparation, &binding, &data_cert))
+        .await
+        .expect("membership transaction commits global state and active transition");
+    assert!(matches!(
+        confirmed,
+        ConfirmPairingGrantOutcome::Confirmed { .. }
+    ));
+    let before = store
+        .load_active_key_transition()
+        .await
+        .expect("load initial active transition")
+        .expect("membership transaction stages transition");
+    assert_eq!(before.transition.phase, KeyTransitionPhase::DrainingOld);
+    assert_eq!(before.transition.from_revision, 0);
+    assert_eq!(before.transition.to_revision, 1);
+    let global = store
+        .load_global_key_state()
+        .await
+        .expect("load authenticated global state")
+        .expect("first grant bootstraps global state");
+    assert_eq!(global.revision().value(), before.transition.to_revision);
+
+    next_time(&clock);
+    let rotated = store
+        .finalize_key_directory_rotation(before.transition.operation_id)
+        .await
+        .expect("finalize guard-backed rotation in one Store transaction");
+    assert_eq!(rotated.phase, KeyTransitionPhase::RotatedPreparingUpdates);
+    let identity = store
+        .load_machine_identity_state()
+        .await
+        .expect("load rotated identity")
+        .expect("active identity remains present");
+    assert_eq!(identity.binding.key_directory_revision, 1);
+    let Some(MachineEnrollmentState::Active(remote)) = store
+        .load_machine_enrollment_state()
+        .await
+        .expect("load rotated active enrollment")
+    else {
+        panic!("active enrollment must remain active after key rotation")
+    };
+    assert_eq!(remote.binding.key_directory_revision, 1);
+    assert_eq!(remote.binding, identity.binding);
+
+    store.shutdown().await.expect("shutdown rotation fixture");
+}
+
+async fn assert_rotation_finalize_axes(
+    store: &RuntimeStoreHandle,
+    operation_id: [u8; 16],
+    expected_revision: u64,
+    expected_phase: KeyTransitionPhase,
+) {
+    let identity = store
+        .load_machine_identity_state()
+        .await
+        .expect("load finalize identity axis")
+        .expect("active identity remains present");
+    assert_eq!(identity.binding.key_directory_revision, expected_revision);
+    let Some(MachineEnrollmentState::Active(remote)) = store
+        .load_machine_enrollment_state()
+        .await
+        .expect("load finalize remote axis")
+    else {
+        panic!("active enrollment must remain active")
+    };
+    assert_eq!(remote.binding, identity.binding);
+    let transition = store
+        .load_active_key_transition()
+        .await
+        .expect("load finalize transition axis")
+        .expect("rotation remains active");
+    assert_eq!(transition.transition.operation_id, operation_id);
+    assert_eq!(transition.transition.phase, expected_phase);
+}
+
+#[tokio::test]
+async fn rotation_finalize_commit_faults_are_atomic_and_retry_is_clock_independent() {
+    for (operation, committed) in [
+        (
+            RuntimeStoreOperation::FinalizeKeyDirectoryRotationBeforeCommit,
+            false,
+        ),
+        (
+            RuntimeStoreOperation::FinalizeKeyDirectoryRotationAfterCommit,
+            true,
+        ),
+    ] {
+        let root = TestRoot::new();
+        let keys = Arc::new(MemoryKeyStore::new());
+        let binding = binding();
+        let clock = Arc::new(AtomicU64::new(NOW_MS));
+        let setup = open_store_with_clock_and_fault(&root, &keys, clock.clone(), None).await;
+        let _ = make_active(&setup, &binding).await;
+        let data_cert = certificate(&binding, CertRole::Data);
+        let preparation = awaiting_pairing(&setup, &binding, &data_cert).await;
+        setup
+            .confirm_pairing_grant(grant_input(&preparation, &binding, &data_cert))
+            .await
+            .expect("stage guard-backed transition");
+        let operation_id = setup
+            .load_active_key_transition()
+            .await
+            .expect("load staged transition")
+            .expect("membership stages active transition")
+            .transition
+            .operation_id;
+        setup
+            .shutdown()
+            .await
+            .expect("shutdown before finalize fault reopen");
+
+        next_time(&clock);
+        let faulted = open_store_with_clock_and_fault(
+            &root,
+            &keys,
+            clock.clone(),
+            Some(Arc::new(OneShotFault::new(operation))),
+        )
+        .await;
+        let error = faulted
+            .finalize_key_directory_rotation(operation_id)
+            .await
+            .expect_err("inject atomic rotation finalize fault");
+        if committed {
+            assert!(matches!(
+                error,
+                RuntimeStoreError::CommitOutcomeUnknown {
+                    operation: RuntimeCommitOperation::FinalizeKeyDirectoryRotation
+                }
+            ));
+            assert_rotation_finalize_axes(
+                &faulted,
+                operation_id,
+                1,
+                KeyTransitionPhase::RotatedPreparingUpdates,
+            )
+            .await;
+            clock.store(0, Ordering::SeqCst);
+        } else {
+            assert!(matches!(error, RuntimeStoreError::WorkerStopped));
+            assert_rotation_finalize_axes(
+                &faulted,
+                operation_id,
+                0,
+                KeyTransitionPhase::DrainingOld,
+            )
+            .await;
+            next_time(&clock);
+        }
+
+        let retried = faulted
+            .finalize_key_directory_rotation(operation_id)
+            .await
+            .expect("exact retry converges after finalize fault");
+        assert_eq!(retried.phase, KeyTransitionPhase::RotatedPreparingUpdates);
+        assert_rotation_finalize_axes(
+            &faulted,
+            operation_id,
+            1,
+            KeyTransitionPhase::RotatedPreparingUpdates,
+        )
+        .await;
+        faulted
+            .shutdown()
+            .await
+            .expect("shutdown finalize fault fixture");
+    }
+}
+
+#[tokio::test]
+async fn startup_reconcile_recovers_the_exact_global_ahead_identity_state() {
+    let root = TestRoot::new();
+    let keys = Arc::new(MemoryKeyStore::new());
+    for (account, seed) in [
+        (MACHINE_ROOT_SIGN_ACCOUNT, ROOT_SEED),
+        (MACHINE_HPKE_ACCOUNT, [0x44; 32]),
+        (MACHINE_LINK_SIGN_ACCOUNT, LINK_SEED),
+        (MACHINE_DATA_SIGN_ACCOUNT, DATA_SEED),
+    ] {
+        keys.store(account, &SecretBytes::new(seed.to_vec()))
+            .expect("seed exact bootstrap identity material");
+    }
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let store = open_store_with_clock_and_fault(&root, &keys, clock.clone(), None).await;
+    let (config, config_home) = stable_remote_config(&root);
+
+    let first = reconcile_machine_identity(&config, &store, &*keys)
+        .await
+        .expect("bootstrap active machine identity");
+    let RemoteBootstrapOutcome::Active(identity) = first else {
+        panic!("fresh stable bootstrap must be active")
+    };
+    let binding = identity.binding().clone();
+    let certificates = identity
+        .certificates(RELAY, MACHINE_ROUTE)
+        .expect("issue exact enrollment certificates");
+    let data_cert = certificates.data().clone();
+    enroll_active_binding(
+        &store,
+        &binding,
+        certificates.link().clone(),
+        data_cert.clone(),
+    )
+    .await;
+    drop(identity);
+
+    let preparation = awaiting_pairing(&store, &binding, &data_cert).await;
+    store
+        .confirm_pairing_grant(grant_input(&preparation, &binding, &data_cert))
+        .await
+        .expect("membership transaction commits global revision and transition");
+    let operation_id = store
+        .load_active_key_transition()
+        .await
+        .expect("load staged startup recovery transition")
+        .expect("membership stages active transition")
+        .transition
+        .operation_id;
+    assert_eq!(
+        load_key_directory_guard(&*keys)
+            .expect("load pre-recovery guard")
+            .expect("bootstrap installs guard")
+            .key_directory_revision(),
+        0
+    );
+    assert_rotation_finalize_axes(&store, operation_id, 0, KeyTransitionPhase::DrainingOld).await;
+
+    next_time(&clock);
+    let recovered = reconcile_machine_identity(&config, &store, &*keys)
+        .await
+        .expect("startup recovery remains remote-scoped");
+    let RemoteBootstrapOutcome::Active(identity) = recovered else {
+        panic!("exact one-step crash state must recover to Active")
+    };
+    assert_eq!(identity.binding().key_directory_revision, 1);
+    assert_eq!(
+        load_key_directory_guard(&*keys)
+            .expect("load recovered guard")
+            .expect("guard remains installed")
+            .key_directory_revision(),
+        1
+    );
+    assert_rotation_finalize_axes(
+        &store,
+        operation_id,
+        1,
+        KeyTransitionPhase::RotatedPreparingUpdates,
+    )
+    .await;
+    drop(identity);
+    store
+        .shutdown()
+        .await
+        .expect("shutdown startup recovery fixture");
+    drop(config);
+    fs::remove_dir_all(config_home).expect("remove stable recovery home");
 }
 
 fn signed_revocation(grant: &RelayGrant, binding: &MachineIdentityBinding) -> DeviceRevocation {
@@ -590,6 +920,31 @@ fn retirement(binding: &MachineIdentityBinding) -> RetireMachine {
     )
     .into();
     retirement
+}
+
+async fn record_retirement_terminal(store: &RuntimeStoreHandle) -> (Vec<u8>, [u8; 32]) {
+    let Some(MachineEnrollmentState::RetirePending(pending)) = store
+        .load_machine_enrollment_state()
+        .await
+        .expect("load pending retirement")
+    else {
+        panic!("expected pending retirement")
+    };
+    let committed = RetirementCommitted {
+        machine_route: pending.retirement.retirement.machine_route,
+        trust_epoch: pending.retirement.retirement.trust_epoch,
+        retire_hash: pending.retirement.canonical_hash,
+    };
+    let bytes = encode(&OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::RetirementCommitted(committed),
+    });
+    let hash = sha256(&bytes);
+    store
+        .record_machine_retirement_terminal(bytes.clone(), hash)
+        .await
+        .expect("record retirement terminal");
+    (bytes, hash)
 }
 
 fn root_lost_receipt(
@@ -691,6 +1046,130 @@ struct ResetBoundaryEvidence {
     ledger_metadata_token: Vec<u8>,
     rows: RemoteSecurityRows,
     ledger: RemoteSecurityLedger,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct P45ResetEvidence {
+    publication_stream_count: i64,
+    publication_outbox_count: i64,
+    publication_outbox_bytes: i64,
+    replay_count: i64,
+    replay_bytes: i64,
+    counter_count: i64,
+    counter_bytes: i64,
+    manifest_count: i64,
+    transition_count: i64,
+    transition_active_count: i64,
+    transition_bytes: i64,
+    update_count: i64,
+    update_bytes: i64,
+    stream: Option<PublicationResetProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicationResetProjection {
+    stream_route: Vec<u8>,
+    generation: Vec<u8>,
+    counter_scope_token: Option<Vec<u8>>,
+    sender_counter_high_water: Option<String>,
+    reserved_high_water: Option<String>,
+    committed_high_water: Option<String>,
+    committed_inner_cursor: Option<String>,
+    last_committed_blob_hash: Option<Vec<u8>>,
+    acknowledged_high_water: Option<String>,
+    acknowledged_inner_cursor: Option<String>,
+    last_acknowledged_blob_hash: Option<Vec<u8>>,
+    last_acknowledged_publication_id: Option<Vec<u8>>,
+    last_acknowledged_request_digest: Option<Vec<u8>>,
+    last_rotation_request_digest: Option<Vec<u8>>,
+    rotation_serial: String,
+    state: String,
+}
+
+fn p45_reset_evidence(database: &Path) -> P45ResetEvidence {
+    let connection = Connection::open(database).expect("open P4.5 reset evidence database");
+    let ledger = connection
+        .query_row(
+            "SELECT publication_stream_count, publication_outbox_count,
+                    publication_outbox_bytes, remote_replay_scope_count,
+                    remote_replay_sealed_bytes, remote_counter_state_count,
+                    remote_counter_state_sealed_bytes,
+                    remote_counter_guard_manifest_count,
+                    remote_key_transition_count, remote_key_transition_active_count,
+                    remote_key_transition_sealed_bytes,
+                    remote_key_update_outbox_count,
+                    remote_key_update_outbox_sealed_bytes
+             FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                ))
+            },
+        )
+        .expect("read P4.5 reset ledger");
+    let stream = connection
+        .query_row(
+            "SELECT stream_route, generation, counter_scope_token,
+                    sender_counter_high_water, reserved_high_water,
+                    committed_high_water, committed_inner_cursor,
+                    last_committed_blob_hash, acknowledged_high_water,
+                    acknowledged_inner_cursor, last_acknowledged_blob_hash,
+                    last_acknowledged_publication_id,
+                    last_acknowledged_request_digest,
+                    last_rotation_request_digest, rotation_serial, state
+             FROM publication_streams ORDER BY publication_stream_id LIMIT 1",
+            [],
+            |row| {
+                Ok(PublicationResetProjection {
+                    stream_route: row.get(0)?,
+                    generation: row.get(1)?,
+                    counter_scope_token: row.get(2)?,
+                    sender_counter_high_water: row.get(3)?,
+                    reserved_high_water: row.get(4)?,
+                    committed_high_water: row.get(5)?,
+                    committed_inner_cursor: row.get(6)?,
+                    last_committed_blob_hash: row.get(7)?,
+                    acknowledged_high_water: row.get(8)?,
+                    acknowledged_inner_cursor: row.get(9)?,
+                    last_acknowledged_blob_hash: row.get(10)?,
+                    last_acknowledged_publication_id: row.get(11)?,
+                    last_acknowledged_request_digest: row.get(12)?,
+                    last_rotation_request_digest: row.get(13)?,
+                    rotation_serial: row.get(14)?,
+                    state: row.get(15)?,
+                })
+            },
+        )
+        .ok();
+    P45ResetEvidence {
+        publication_stream_count: ledger.0,
+        publication_outbox_count: ledger.1,
+        publication_outbox_bytes: ledger.2,
+        replay_count: ledger.3,
+        replay_bytes: ledger.4,
+        counter_count: ledger.5,
+        counter_bytes: ledger.6,
+        manifest_count: ledger.7,
+        transition_count: ledger.8,
+        transition_active_count: ledger.9,
+        transition_bytes: ledger.10,
+        update_count: ledger.11,
+        update_bytes: ledger.12,
+        stream,
+    }
 }
 
 fn reset_boundary_evidence(database: &Path) -> ResetBoundaryEvidence {
@@ -886,13 +1365,13 @@ fn assert_remote_security_cleaned(
 
 fn assert_cleanup_fault(error: RuntimeStoreError, operation: RuntimeStoreOperation) {
     let expected_commit = match operation {
-        RuntimeStoreOperation::PrepareMachineRetirementAfterCommit => {
-            RuntimeCommitOperation::PrepareMachineRetirement
+        RuntimeStoreOperation::ConfirmMachinePurgeReadbackAbsentAfterCommit => {
+            RuntimeCommitOperation::ConfirmMachinePurgeReadbackAbsent
         }
         RuntimeStoreOperation::RecordRootLostMachinePurgeAfterCommit => {
             RuntimeCommitOperation::RecordRootLostMachinePurge
         }
-        RuntimeStoreOperation::PrepareMachineRetirementBeforeCommit
+        RuntimeStoreOperation::ConfirmMachinePurgeReadbackAbsentBeforeCommit
         | RuntimeStoreOperation::RecordRootLostMachinePurgeBeforeCommit => {
             assert!(matches!(error, RuntimeStoreError::WorkerStopped));
             return;
@@ -907,10 +1386,122 @@ fn assert_cleanup_fault(error: RuntimeStoreError, operation: RuntimeStoreOperati
 }
 
 #[tokio::test]
+async fn root_present_defers_all_remote_scrub_until_relay_terminal_and_quiescence_gate() {
+    let root = TestRoot::new();
+    let keys = Arc::new(MemoryKeyStore::new());
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let binding = binding();
+    let store = open_store_with_clock_and_fault(&root, &keys, clock.clone(), None).await;
+    let _ = make_active(&store, &binding).await;
+    let current = prepare_full_grant_history(&store, &binding, &clock).await;
+    revoke_current_grant(&store, &binding, &clock, &current).await;
+    let baseline_manifest_count = p45_reset_evidence(&root.database()).manifest_count;
+    store
+        .register_remote_counter_guard_scope([0xa5; 32])
+        .await
+        .expect("register authenticated cleanup manifest scope");
+
+    let before_remote = reset_boundary_evidence(&root.database());
+    let before_p45 = p45_reset_evidence(&root.database());
+    assert!(before_remote.rows.authorization_count > 0);
+    assert_eq!(before_p45.publication_stream_count, 1);
+    assert!(before_p45.transition_count > 0);
+    assert!(before_p45.transition_bytes > 0);
+    assert_eq!(before_p45.manifest_count, baseline_manifest_count + 1);
+
+    store
+        .prepare_machine_retirement(retirement(&binding))
+        .await
+        .expect("freeze retirement without scrubbing business owners");
+    assert_eq!(
+        reset_boundary_evidence(&root.database()).rows,
+        before_remote.rows,
+        "RetirePending is not a business-owner quiescence proof"
+    );
+    assert_eq!(
+        p45_reset_evidence(&root.database()),
+        before_p45,
+        "RetirePending must preserve every P4.5 durable owner row"
+    );
+
+    let (terminal_bytes, terminal_hash) = record_retirement_terminal(&store).await;
+    assert_eq!(
+        reset_boundary_evidence(&root.database()).rows,
+        before_remote.rows,
+        "RelayCommitted alone must not scrub before manager quiescence"
+    );
+    assert_eq!(p45_reset_evidence(&root.database()), before_p45);
+
+    store
+        .confirm_machine_purge_readback_absent(terminal_bytes, terminal_hash)
+        .await
+        .expect("quiesced manager may atomically scrub and confirm purge readback");
+    let after_remote = reset_boundary_evidence(&root.database());
+    assert_remote_security_cleaned(
+        &after_remote,
+        &before_remote,
+        "purgeReadbackAbsent",
+        "rootPresent",
+    );
+    let after_p45 = p45_reset_evidence(&root.database());
+    assert_eq!(after_p45.publication_stream_count, 1);
+    assert_eq!(after_p45.publication_outbox_count, 0);
+    assert_eq!(after_p45.publication_outbox_bytes, 0);
+    assert_eq!(after_p45.replay_count, 0);
+    assert_eq!(after_p45.replay_bytes, 0);
+    assert_eq!(after_p45.counter_count, 0);
+    assert_eq!(after_p45.counter_bytes, 0);
+    assert_eq!(after_p45.transition_count, 0);
+    assert_eq!(after_p45.transition_active_count, 0);
+    assert_eq!(after_p45.transition_bytes, 0);
+    assert_eq!(after_p45.update_count, 0);
+    assert_eq!(after_p45.update_bytes, 0);
+    assert_eq!(
+        after_p45.manifest_count, before_p45.manifest_count,
+        "manifest remains authenticated until Keychain guards are absent"
+    );
+    let before_stream = before_p45.stream.expect("pre-reset publication stream");
+    let after_stream = after_p45
+        .stream
+        .expect("stable publication stream identity");
+    assert_ne!(after_stream.stream_route, before_stream.stream_route);
+    assert_ne!(after_stream.generation, before_stream.generation);
+    assert_eq!(
+        after_stream
+            .rotation_serial
+            .parse::<u64>()
+            .expect("reset rotation serial"),
+        before_stream
+            .rotation_serial
+            .parse::<u64>()
+            .expect("previous rotation serial")
+            + 1
+    );
+    assert_eq!(after_stream.state, "needsSnapshot");
+    assert_eq!(after_stream.counter_scope_token, None);
+    assert_eq!(after_stream.sender_counter_high_water, None);
+    assert_eq!(after_stream.reserved_high_water, None);
+    assert_eq!(after_stream.committed_high_water, None);
+    assert_eq!(after_stream.committed_inner_cursor, None);
+    assert_eq!(after_stream.last_committed_blob_hash, None);
+    assert_eq!(after_stream.acknowledged_high_water, None);
+    assert_eq!(after_stream.acknowledged_inner_cursor, None);
+    assert_eq!(after_stream.last_acknowledged_blob_hash, None);
+    assert_eq!(after_stream.last_acknowledged_publication_id, None);
+    assert_eq!(after_stream.last_acknowledged_request_digest, None);
+    assert_eq!(after_stream.last_rotation_request_digest, None);
+
+    store
+        .shutdown()
+        .await
+        .expect("shutdown reset sequencing store");
+}
+
+#[tokio::test]
 async fn root_present_full_history_cleanup_restarts_before_exact_commit_retry() {
     for operation in [
-        RuntimeStoreOperation::PrepareMachineRetirementBeforeCommit,
-        RuntimeStoreOperation::PrepareMachineRetirementAfterCommit,
+        RuntimeStoreOperation::ConfirmMachinePurgeReadbackAbsentBeforeCommit,
+        RuntimeStoreOperation::ConfirmMachinePurgeReadbackAbsentAfterCommit,
     ] {
         let root = TestRoot::new();
         let keys = Arc::new(MemoryKeyStore::new());
@@ -923,6 +1514,14 @@ async fn root_present_full_history_cleanup_restarts_before_exact_commit_retry() 
         let before = reset_boundary_evidence(&root.database());
         assert_full_history(&before, 0, 1);
         let reset = retirement(&binding);
+        setup
+            .prepare_machine_retirement(reset)
+            .await
+            .expect("prepare root-present retirement without scrub");
+        let (terminal_bytes, terminal_hash) = record_retirement_terminal(&setup).await;
+        let relay_committed = reset_boundary_evidence(&root.database());
+        assert_eq!(relay_committed.lifecycle, "relayCommitted");
+        assert_eq!(relay_committed.rows, before.rows);
         setup.shutdown().await.expect("shutdown root-present setup");
 
         let faulted = open_store_with_clock_and_fault(
@@ -933,7 +1532,7 @@ async fn root_present_full_history_cleanup_restarts_before_exact_commit_retry() 
         )
         .await;
         let error = faulted
-            .prepare_machine_retirement(reset.clone())
+            .confirm_machine_purge_readback_absent(terminal_bytes.clone(), terminal_hash)
             .await
             .expect_err("inject root-present cleanup fault");
         assert_cleanup_fault(error, operation);
@@ -944,18 +1543,29 @@ async fn root_present_full_history_cleanup_restarts_before_exact_commit_retry() 
 
         let restarted = open_store_with_clock_and_fault(&root, &keys, clock.clone(), None).await;
         let after_restart = reset_boundary_evidence(&root.database());
-        let committed = operation == RuntimeStoreOperation::PrepareMachineRetirementAfterCommit;
+        let committed =
+            operation == RuntimeStoreOperation::ConfirmMachinePurgeReadbackAbsentAfterCommit;
         if committed {
-            assert_remote_security_cleaned(&after_restart, &before, "retirePending", "rootPresent");
+            assert_remote_security_cleaned(
+                &after_restart,
+                &relay_committed,
+                "purgeReadbackAbsent",
+                "rootPresent",
+            );
         } else {
-            assert_eq!(after_restart, before);
+            assert_eq!(after_restart, relay_committed);
         }
         restarted
-            .prepare_machine_retirement(reset.clone())
+            .confirm_machine_purge_readback_absent(terminal_bytes.clone(), terminal_hash)
             .await
             .expect("exact root-present retry after restart");
         let after_retry = reset_boundary_evidence(&root.database());
-        assert_remote_security_cleaned(&after_retry, &before, "retirePending", "rootPresent");
+        assert_remote_security_cleaned(
+            &after_retry,
+            &relay_committed,
+            "purgeReadbackAbsent",
+            "rootPresent",
+        );
         if committed {
             assert_eq!(after_retry, after_restart);
         }
@@ -967,7 +1577,7 @@ async fn root_present_full_history_cleanup_restarts_before_exact_commit_retry() 
         let final_reopen = open_store_with_clock_and_fault(&root, &keys, clock.clone(), None).await;
         let before_final_replay = reset_boundary_evidence(&root.database());
         final_reopen
-            .prepare_machine_retirement(reset)
+            .confirm_machine_purge_readback_absent(terminal_bytes, terminal_hash)
             .await
             .expect("replay root-present cleanup after second restart");
         assert_eq!(

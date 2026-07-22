@@ -8,6 +8,7 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agentdeck_protocol::e2ee::{KeyId, KeyPurpose};
 use agentdeck_protocol::relay_v2::{
     ENROLLMENT_BUNDLE_VERSION, EnrollmentBundleV2, MachineEnrollmentRequestV1, MachineRouteId,
 };
@@ -30,14 +31,22 @@ use crate::purge_finalizer::{
     resume_reserved_purge_marker,
 };
 use crate::runtime::remote_administration::{RemoteAdministration, RemoteAdministrationError};
+use crate::runtime::store::key_transition::{
+    KeyTransitionOperation, KeyTransitionPhase, KeyTransitionTarget,
+};
+use crate::runtime::store::remote_counter::{
+    CounterRecoveryDisposition, CounterRecoveryStageRequest, CounterRecoveryStageTarget,
+    RemoteCounterRecordKind,
+};
 use crate::runtime::store::{
-    ActiveMachineEnrollmentState, MachineEnrollmentConnectionMaterial, MachineEnrollmentState,
-    MachineRemoteStateRecord, RuntimeStoreError, RuntimeStoreHandle,
+    ActiveMachineEnrollmentState, ActiveSenderCounterBinding, MachineEnrollmentConnectionMaterial,
+    MachineEnrollmentState, MachineRemoteStateRecord, RuntimeStoreError, RuntimeStoreHandle,
     machine_enrollment_prepare_input_hash,
 };
 use crate::runtime::{
-    PairingAdministration, PairingAdministrationError, PairingPendingSink,
-    RevocationAdministration, RevocationAdministrationError, RuntimeCore,
+    ConversationActivationCoordinator, ConversationActivationError, PairingAdministration,
+    PairingAdministrationError, PairingPendingSink, RevocationAdministration,
+    RevocationAdministrationError, RuntimeCore,
 };
 use crate::security::KeyStore;
 
@@ -48,10 +57,14 @@ use super::cleanup::{MachineCleanupWorkflow, MachineCleanupWorkflowError};
 use super::config::{
     EnrollmentConfigError, ValidatedEnrollmentConfig, validate_sealed_relay_connection,
 };
+use super::counter::CounterScope;
+use super::directed_reply::DeviceReplyTxSealer;
 use super::enrollment::{FrozenMachineEnrollment, MachineEnrollmentError};
-use super::link::{
-    DirectedReplySealer, RemoteLinkOwner, RemoteStreamPublisher, UnavailableDirectedReplySealer,
-    UnavailableRemoteStreamPublisher,
+use super::identity::OwnedKeyStoreCounterGuardBackend;
+use super::key_control::StoreBackedKeyControlIngressHandler;
+use super::link::{RemoteLinkError, RemoteLinkIngressMode, RemoteLinkOwner};
+use super::maintenance::{
+    RemoteMaintenanceError, RemoteMaintenanceOwner, run_remote_maintenance_once,
 };
 #[cfg(test)]
 use super::pairing::await_pairing_startup;
@@ -59,7 +72,19 @@ use super::pairing::{
     PairingCoordinatorHandle, PairingCoordinatorOwner, PairingDrainStartError,
     PairingInviteContext, unavailable as pairing_unavailable,
 };
-use super::transport::{PairingRuntimeParts, RemoteTransport, RemoteTransportConnectError};
+use super::publication_transport::{PublicationDriveError, PublicationDriveOwner};
+use super::publisher::{SignedPublicationCoordinator, SignedPublicationError};
+use super::shared_publisher::{
+    RuntimeStoreSharedPublicationBackend, SharedPublisherError, SharedStreamPublisher,
+};
+use super::transition_owner::{
+    KeyTransitionRecoveryError, KeyTransitionRecoveryHandle, KeyTransitionRecoveryOwner,
+    TransitionProgress, TransitionReadiness,
+};
+use super::transport::{
+    AuthenticatedBusinessReconnects, BusinessTransportLane, MachineDataAuthority,
+    PairingRuntimeParts, RemoteTransport, RemoteTransportConnectError,
+};
 use super::trust_reset::{MachineTrustResetWorkflow, MachineTrustResetWorkflowError};
 use super::workflow::MachineEnrollmentWorkflow;
 
@@ -67,7 +92,9 @@ const REMOTE_DISABLED: &str = "daemon.remote.administration.unavailable";
 const REMOTE_NOT_ARMED: &str = "daemon.remote.start_not_armed";
 const REMOTE_SHUTTING_DOWN: &str = "daemon.remote.shutting_down";
 const REMOTE_STATE_CONFLICT: &str = "daemon.remote.enrollment.state_conflict";
+const REMOTE_QUIESCENCE_UNKNOWN: &str = "daemon.remote.quiescence_unknown";
 const PAIRING_DRAIN_WAIT_DEADLINE: Duration = Duration::from_secs(10);
+const BUSINESS_STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 const PAIRING_DRAIN_PENDING: &str = "daemon.pairing.drain_pending";
 const PAIRING_ACTIVE: &str = "daemon.pairing.active";
 const ROOT_PRESENT_RECEIPT_FORBIDDEN: &str =
@@ -75,6 +102,22 @@ const ROOT_PRESENT_RECEIPT_FORBIDDEN: &str =
 const ROOT_LOST_RECEIPT_REQUIRED: &str = "daemon.remote.trust_reset.admin_receipt_required";
 const PURGE_FINALIZER_UNAVAILABLE: &str = "daemon.purge.finalizer_unavailable";
 const PURGE_RECOVERY_REQUIRED: &str = "daemon.purge.recovery_required";
+const TRANSITION_OWNER_UNAVAILABLE: &str = "daemon.remote.transition.owner_unavailable";
+const TRANSITION_RECOVERY_TIMED_OUT: &str = "daemon.remote.transition.recovery_timed_out";
+const TRANSITION_PROGRESS_PENDING: &str = "daemon.remote.transition.progress_pending";
+const TRANSITION_RECONNECT_PENDING: &str = "daemon.remote.transition.reconnect_pending";
+const COUNTER_RETIRED: &str = "daemon.remote.counter.retired";
+const COUNTER_RECOVERY_ENTROPY_UNAVAILABLE: &str =
+    "daemon.remote.counter.recovery_entropy_unavailable";
+const COUNTER_RECOVERY_ENTROPY_ATTEMPTS: usize = 16;
+
+#[derive(Clone)]
+struct ActiveSenderCounterCandidate {
+    scope: CounterScope,
+    key_id: KeyId,
+    replacement_scope: CounterScope,
+    target: CounterRecoveryStageTarget,
+}
 
 enum PairingDrainWaitError {
     NotEnqueued(PairingAdministrationError),
@@ -266,12 +309,15 @@ pub struct RemoteManager {
     enrollment_workflow: MachineEnrollmentWorkflow,
     pairing_pending_sink: OnceLock<Arc<dyn PairingPendingSink>>,
     runtime_core: OnceLock<Weak<RuntimeCore>>,
-    reply_sealer: Arc<dyn DirectedReplySealer>,
-    stream_publisher: Arc<dyn RemoteStreamPublisher>,
     shutdown_tx: watch::Sender<bool>,
     trust_reset_singleflight: Mutex<()>,
+    business_start_singleflight: Mutex<()>,
     #[cfg(test)]
     pairing_startup_for_test: Mutex<Option<PairingStartupTestHook>>,
+    #[cfg(test)]
+    business_startup_for_test: Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    business_start_failure_after_lane_for_test: Mutex<Option<&'static str>>,
     state: Mutex<RemoteManagerState>,
 }
 
@@ -286,16 +332,258 @@ struct RemoteManagerState {
     enabled: bool,
     armed: bool,
     stopped: bool,
+    /// 任一 business owner 的 stop/join 返回失败后，本进程不能再声称已证明静默。
+    /// 只允许通过进程重启、重新加载 durable state 后清除此 latch。
+    quiescence_unknown: bool,
     purge_pending: bool,
     identity: Option<Box<ActiveMachineIdentity>>,
     start_permit: Option<RemoteStartPermit>,
     transport: Option<RemoteTransport>,
-    link: Option<RemoteLinkOwner>,
+    link: Option<Box<dyn ManagedRemoteLinkOwner>>,
+    transition: Option<Box<dyn ManagedTransitionOwner>>,
+    transition_handle: Option<Arc<dyn ManagedTransitionHandle>>,
+    maintenance: Option<Box<dyn ManagedMaintenanceOwner>>,
+    publication: Option<Box<dyn ManagedPublicationOwner>>,
+    pending_business_start: Option<PendingBusinessStart>,
     pairing: Option<PairingCoordinatorOwner>,
     #[cfg(test)]
     pairing_handle_for_test: Option<super::pairing::PairingCoordinatorHandle>,
     connect_retry: Option<RemoteTransportConnectError>,
     blocked_code: Option<String>,
+}
+
+#[derive(Clone)]
+struct PendingBusinessStart {
+    machine_route: [u8; 16],
+    machine_data: MachineDataAuthority,
+}
+
+#[async_trait]
+trait ManagedRemoteLinkOwner: Send {
+    async fn shutdown(&mut self) -> Result<(), RemoteLinkError>;
+
+    fn observed_failure_code(&self) -> Option<String> {
+        None
+    }
+}
+
+#[async_trait]
+impl ManagedRemoteLinkOwner for RemoteLinkOwner {
+    async fn shutdown(&mut self) -> Result<(), RemoteLinkError> {
+        RemoteLinkOwner::shutdown(self).await
+    }
+
+    fn observed_failure_code(&self) -> Option<String> {
+        RemoteLinkOwner::observed_failure_code(self)
+    }
+}
+
+#[async_trait]
+trait ManagedPublicationOwner: Send {
+    async fn shutdown(self: Box<Self>) -> Result<(), PublicationDriveError>;
+}
+
+#[async_trait]
+impl ManagedPublicationOwner for PublicationDriveOwner {
+    async fn shutdown(self: Box<Self>) -> Result<(), PublicationDriveError> {
+        PublicationDriveOwner::shutdown(*self).await
+    }
+}
+
+/// key transition 的 manager-owned 生命周期窄面。协调器的 Store/crypto/Relay
+/// 语义留在 transition 模块；manager 只负责启动成功后持有 owner，并在 publication
+/// drive 之前逆序回收。
+#[async_trait]
+trait ManagedTransitionOwner: Send {
+    async fn shutdown(self: Box<Self>) -> Result<(), RemoteAdministrationError>;
+
+    fn observed_failure_code(&self) -> Option<String> {
+        None
+    }
+}
+
+#[async_trait]
+trait ManagedTransitionHandle: Send + Sync {
+    fn request_control_plane_progress(&self) -> Result<(), RemoteAdministrationError>;
+
+    fn subscribe_progress(&self) -> Option<watch::Receiver<TransitionProgress>> {
+        None
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<TransitionReadiness, RemoteAdministrationError>;
+}
+
+/// retention GC 的 manager-owned 生命周期窄面。任何 machine scrub 前必须先 join，
+/// 防止 replay/key/transition 删除与 trust-reset 或 uninstall 并发。
+#[async_trait]
+trait ManagedMaintenanceOwner: Send {
+    async fn shutdown(self: Box<Self>) -> Result<(), RemoteAdministrationError>;
+}
+
+#[async_trait]
+impl ManagedMaintenanceOwner for RemoteMaintenanceOwner {
+    async fn shutdown(self: Box<Self>) -> Result<(), RemoteAdministrationError> {
+        RemoteMaintenanceOwner::shutdown(*self)
+            .await
+            .map_err(remote_maintenance_error)
+    }
+}
+
+#[async_trait]
+impl ManagedTransitionOwner for KeyTransitionRecoveryOwner {
+    async fn shutdown(self: Box<Self>) -> Result<(), RemoteAdministrationError> {
+        KeyTransitionRecoveryOwner::shutdown(*self)
+            .await
+            .map_err(transition_recovery_error)
+    }
+
+    fn observed_failure_code(&self) -> Option<String> {
+        KeyTransitionRecoveryOwner::observed_failure_code(self)
+    }
+}
+
+#[async_trait]
+impl ManagedTransitionHandle for KeyTransitionRecoveryHandle {
+    fn request_control_plane_progress(&self) -> Result<(), RemoteAdministrationError> {
+        KeyTransitionRecoveryHandle::request_control_plane_progress(self)
+            .map_err(transition_recovery_error)
+    }
+
+    fn subscribe_progress(&self) -> Option<watch::Receiver<TransitionProgress>> {
+        Some(KeyTransitionRecoveryHandle::subscribe_progress(self))
+    }
+
+    async fn drive_to_business_ready(
+        &self,
+    ) -> Result<TransitionReadiness, RemoteAdministrationError> {
+        KeyTransitionRecoveryHandle::drive_to_business_ready(self)
+            .await
+            .map_err(transition_recovery_error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteBusinessAdmissionPhase {
+    LaneClaimed,
+    CounterAudited,
+    TransitionReady,
+    PendingRecovered,
+}
+
+/// RemoteLink 的线性 admission capability。只有同一 business lane 的 durable pending
+/// outbox 已收口，且 transition owner 已从 Store 读回 business-ready，才能生成 permit。
+struct RemoteBusinessAdmission {
+    phase: RemoteBusinessAdmissionPhase,
+    mode: Option<RemoteLinkAdmissionMode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteLinkAdmissionMode {
+    ControlPlaneOnly,
+    BusinessReady,
+}
+
+#[derive(Debug)]
+struct RemoteBusinessAdmissionPermit {
+    mode: RemoteLinkAdmissionMode,
+}
+
+impl RemoteBusinessAdmission {
+    const fn new() -> Self {
+        Self {
+            phase: RemoteBusinessAdmissionPhase::LaneClaimed,
+            mode: None,
+        }
+    }
+
+    fn observe_counter_audit<T>(
+        &mut self,
+        audit: Result<T, RemoteAdministrationError>,
+    ) -> Result<T, RemoteAdministrationError> {
+        let audited = audit?;
+        if self.phase != RemoteBusinessAdmissionPhase::LaneClaimed {
+            return Err(admin_error(REMOTE_STATE_CONFLICT));
+        }
+        self.phase = RemoteBusinessAdmissionPhase::CounterAudited;
+        Ok(audited)
+    }
+
+    fn observe_publication_recovery(
+        &mut self,
+        recovery: Result<(), PublicationDriveError>,
+    ) -> Result<(), RemoteAdministrationError> {
+        recovery.map_err(publication_drive_error)?;
+        if self.phase != RemoteBusinessAdmissionPhase::TransitionReady {
+            return Err(admin_error(REMOTE_STATE_CONFLICT));
+        }
+        self.phase = RemoteBusinessAdmissionPhase::PendingRecovered;
+        Ok(())
+    }
+
+    fn observe_transition_readiness(
+        &mut self,
+        readiness: Result<TransitionReadiness, RemoteAdministrationError>,
+    ) -> Result<(), RemoteAdministrationError> {
+        let mode = match readiness? {
+            TransitionReadiness::ControlPlaneReady { .. } => {
+                RemoteLinkAdmissionMode::ControlPlaneOnly
+            }
+            TransitionReadiness::NoActiveTransition | TransitionReadiness::BusinessReady { .. } => {
+                RemoteLinkAdmissionMode::BusinessReady
+            }
+        };
+        self.observe_transition_ready(mode)
+    }
+
+    fn observe_transition_ready(
+        &mut self,
+        mode: RemoteLinkAdmissionMode,
+    ) -> Result<(), RemoteAdministrationError> {
+        if self.phase != RemoteBusinessAdmissionPhase::CounterAudited {
+            return Err(admin_error(REMOTE_STATE_CONFLICT));
+        }
+        self.phase = RemoteBusinessAdmissionPhase::TransitionReady;
+        self.mode = Some(mode);
+        Ok(())
+    }
+
+    fn into_permit(self) -> Result<RemoteBusinessAdmissionPermit, RemoteAdministrationError> {
+        if self.phase != RemoteBusinessAdmissionPhase::PendingRecovered {
+            return Err(admin_error("daemon.remote.link.admission_fenced"));
+        }
+        self.mode
+            .map(|mode| RemoteBusinessAdmissionPermit { mode })
+            .ok_or_else(|| admin_error("daemon.remote.link.admission_fenced"))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_admitted_remote_link(
+    permit: RemoteBusinessAdmissionPermit,
+    machine_route: MachineRouteId,
+    store: RuntimeStoreHandle,
+    lane: BusinessTransportLane,
+    core: Weak<RuntimeCore>,
+    sealer: Arc<DeviceReplyTxSealer>,
+    publisher: Arc<SharedStreamPublisher>,
+    key_control: Arc<StoreBackedKeyControlIngressHandler>,
+) -> Result<RemoteLinkOwner, RemoteLinkError> {
+    let ingress_mode = match permit.mode {
+        RemoteLinkAdmissionMode::ControlPlaneOnly => RemoteLinkIngressMode::ControlPlaneOnly,
+        RemoteLinkAdmissionMode::BusinessReady => RemoteLinkIngressMode::BusinessReady,
+    };
+    RemoteLinkOwner::start_with_ingress_mode_and_key_control_handler(
+        machine_route,
+        store,
+        lane,
+        core,
+        sealer,
+        publisher,
+        key_control,
+        ingress_mode,
+    )
 }
 
 impl RemoteManager {
@@ -329,21 +617,30 @@ impl RemoteManager {
             enrollment_workflow: MachineEnrollmentWorkflow::new(),
             pairing_pending_sink: OnceLock::new(),
             runtime_core: OnceLock::new(),
-            reply_sealer: Arc::new(UnavailableDirectedReplySealer),
-            stream_publisher: Arc::new(UnavailableRemoteStreamPublisher),
             shutdown_tx: watch::channel(false).0,
             trust_reset_singleflight: Mutex::new(()),
+            business_start_singleflight: Mutex::new(()),
             #[cfg(test)]
             pairing_startup_for_test: Mutex::new(None),
+            #[cfg(test)]
+            business_startup_for_test: Mutex::new(None),
+            #[cfg(test)]
+            business_start_failure_after_lane_for_test: Mutex::new(None),
             state: Mutex::new(RemoteManagerState {
                 enabled,
                 armed: false,
                 stopped: false,
+                quiescence_unknown: false,
                 purge_pending: false,
                 identity,
                 start_permit: None,
                 transport: None,
                 link: None,
+                transition: None,
+                transition_handle: None,
+                maintenance: None,
+                publication: None,
+                pending_business_start: None,
                 pairing: None,
                 #[cfg(test)]
                 pairing_handle_for_test: None,
@@ -392,6 +689,18 @@ impl RemoteManager {
         entered_rx
     }
 
+    #[cfg(test)]
+    async fn install_business_startup_test_hook(&self) -> oneshot::Receiver<()> {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        *self.business_startup_for_test.lock().await = Some(entered_tx);
+        entered_rx
+    }
+
+    #[cfg(test)]
+    async fn install_business_start_failure_after_lane_for_test(&self, code: &'static str) {
+        *self.business_start_failure_after_lane_for_test.lock().await = Some(code);
+    }
+
     /// 唯一启动边界。调用前 manager 的 network side effect 恒为零。
     /// remote 恢复失败只形成 blocked status，不影响已绑定的 local listener。
     pub async fn arm(&self, permit: RemoteStartPermit) -> Result<(), RemoteAdministrationError> {
@@ -432,7 +741,8 @@ impl RemoteManager {
             state.blocked_code = state.pairing.is_none().then(|| error.code().to_owned());
             return Err(error);
         }
-        Ok(())
+        drop(state);
+        self.start_business_stack_if_ready().await
     }
 
     /// shutdown 没有 detached task：若 transport 存在，会先等待 Relay session join；
@@ -450,11 +760,21 @@ impl RemoteManager {
             );
             state.link.take();
         }
+        if let Err(error) = stop_maintenance_owner(&mut state).await {
+            log_forced_shutdown("remote_maintenance_shutdown", error.code());
+        }
+        if let Err(error) = stop_transition_owner(&mut state).await {
+            log_forced_shutdown("remote_transition_shutdown", error.code());
+        }
+        if let Err(error) = stop_publication_owner(&mut state).await {
+            log_forced_shutdown("remote_publication_shutdown", error.code());
+        }
         stop_pairing_actor(&mut state).await;
         if let Some(mut transport) = state.transport.take() {
             transport.shutdown().await;
         }
         state.connect_retry = None;
+        state.pending_business_start = None;
         state.identity = None;
         state.start_permit = None;
     }
@@ -497,16 +817,24 @@ impl RemoteManager {
                 self.connect_parts(state, record, binding, connection, link_cert, None)
                     .await?;
                 self.await_trust_reset(
-                    MachineTrustResetWorkflow::new()
-                        .resume_root_present(&self.store, state.transport.as_mut()),
+                    MachineTrustResetWorkflow::new().resume_root_present_to_relay_committed(
+                        &self.store,
+                        state.transport.as_mut(),
+                    ),
                 )
                 .await?;
+                self.quiesce_remote_stack(state).await?;
+                MachineTrustResetWorkflow::new()
+                    .confirm_root_present_after_quiescence(&self.store)
+                    .await
+                    .map_err(|error| admin_error(error.code()))?;
                 self.finish_purge_authorization(state, None).await
             }
             Some(MachineEnrollmentState::RelayCommitted(_)) => {
                 // RetirementCommitted 已证明 Relay purge COMMIT+absent；这里严格零网络。
+                self.quiesce_remote_stack(state).await?;
                 MachineTrustResetWorkflow::new()
-                    .resume_root_present(&self.store, None)
+                    .confirm_root_present_after_quiescence(&self.store)
                     .await
                     .map_err(|error| admin_error(error.code()))?;
                 self.finish_purge_authorization(state, None).await
@@ -661,6 +989,7 @@ impl RemoteManager {
         request: TrustResetRequest,
     ) -> Result<MachineRemoteStatus, RemoteAdministrationError> {
         require_running_armed(state)?;
+        require_known_quiescence(state)?;
         let uninstall_plan = request.uninstall_purge_plan().cloned();
         let receipt = request.into_admin_purge_receipt();
         let durable = self.store.load_machine_enrollment_state().await?;
@@ -696,8 +1025,9 @@ impl RemoteManager {
                 if let Some(plan) = uninstall_plan.as_ref() {
                     self.reserve_purge_plan(state, plan).await?;
                 }
+                self.quiesce_remote_stack(state).await?;
                 MachineTrustResetWorkflow::new()
-                    .resume_root_present(&self.store, None)
+                    .confirm_root_present_after_quiescence(&self.store)
                     .await
                     .map_err(|error| admin_error(error.code()))?;
                 self.finish_purge_authorization(state, uninstall_plan)
@@ -756,28 +1086,37 @@ impl RemoteManager {
                             active.record.trust_epoch,
                         )
                         .map_err(|error| admin_error(error.code()))?;
-                    self.await_trust_reset(MachineTrustResetWorkflow::new().run_root_present(
-                        &self.store,
-                        frozen,
-                        transport,
-                    ))
+                    self.await_trust_reset(
+                        MachineTrustResetWorkflow::new().run_root_present_to_relay_committed(
+                            &self.store,
+                            frozen,
+                            transport,
+                        ),
+                    )
                     .await?;
                 }
                 Some(MachineEnrollmentState::RetirePending(_)) => {
                     self.await_trust_reset(
-                        MachineTrustResetWorkflow::new()
-                            .resume_root_present(&self.store, state.transport.as_mut()),
+                        MachineTrustResetWorkflow::new().resume_root_present_to_relay_committed(
+                            &self.store,
+                            state.transport.as_mut(),
+                        ),
                     )
                     .await?;
                 }
-                Some(MachineEnrollmentState::RelayCommitted(_)) => {
-                    MachineTrustResetWorkflow::new()
-                        .resume_root_present(&self.store, None)
-                        .await
-                        .map_err(|error| admin_error(error.code()))?;
-                }
+                Some(MachineEnrollmentState::RelayCommitted(_)) => {}
                 Some(MachineEnrollmentState::PurgeReadbackAbsent(_)) => {}
                 _ => return Err(admin_error(REMOTE_STATE_CONFLICT)),
+            }
+            if !matches!(
+                self.store.load_machine_enrollment_state().await?,
+                Some(MachineEnrollmentState::PurgeReadbackAbsent(_))
+            ) {
+                self.quiesce_remote_stack(state).await?;
+                MachineTrustResetWorkflow::new()
+                    .confirm_root_present_after_quiescence(&self.store)
+                    .await
+                    .map_err(|error| admin_error(error.code()))?;
             }
         } else {
             let Some(receipt) = receipt else {
@@ -785,6 +1124,7 @@ impl RemoteManager {
                 return self.status_locked(state).await;
             };
             // portable path 不持有/建立 transport，因此在 Store proof 前后都严格零网络。
+            self.quiesce_remote_stack(state).await?;
             MachineTrustResetWorkflow::new()
                 .run_root_lost(&self.store, *receipt)
                 .await
@@ -949,20 +1289,59 @@ impl RemoteManager {
         &self,
         state: &mut RemoteManagerState,
     ) -> Result<(), RemoteAdministrationError> {
+        self.quiesce_remote_stack(state).await?;
+        state.identity = None;
+        state.purge_pending = true;
+        Ok(())
+    }
+
+    /// 在任何本地 machine scrub / finalizer handoff 前证明所有 P4.5 业务 owner 已静默。
+    /// stop/join 固定逆序为 Link → maintenance → transition → publication → pairing，
+    /// 随后才消费并回收 transport。任一步无法证明 join，都会设置不可逆的进程内
+    /// latch；调用方不能继续 confirm、删 Keychain 或释放 finalizer readiness。
+    async fn quiesce_remote_stack(
+        &self,
+        state: &mut RemoteManagerState,
+    ) -> Result<(), RemoteAdministrationError> {
+        require_known_quiescence(state)?;
         if state.connect_retry.is_some() {
             return Err(admin_error(REMOTE_STATE_CONFLICT));
         }
-        stop_remote_link(state).await?;
-        stop_pairing_actor(state).await;
-        if let Some(transport) = state.transport.take() {
-            let permit = transport
-                .shutdown_and_reclaim_start_permit()
-                .await
-                .map_err(|error| admin_error(error.code()))?;
-            state.start_permit = Some(permit);
+        state.pending_business_start = None;
+
+        let mut unknown = false;
+        if let Err(error) = stop_remote_link(state).await {
+            unknown = true;
+            log_quiescence_failure("remote_link_shutdown", error.code());
         }
-        state.identity = None;
-        state.purge_pending = true;
+        if let Err(error) = stop_maintenance_owner(state).await {
+            unknown = true;
+            log_quiescence_failure("remote_maintenance_shutdown", error.code());
+        }
+        if let Err(error) = stop_transition_owner(state).await {
+            unknown = true;
+            log_quiescence_failure("remote_transition_shutdown", error.code());
+        }
+        if let Err(error) = stop_publication_owner(state).await {
+            unknown = true;
+            log_quiescence_failure("remote_publication_shutdown", error.code());
+        }
+        stop_pairing_actor(state).await;
+
+        if let Some(transport) = state.transport.take() {
+            match transport.shutdown_and_reclaim_start_permit().await {
+                Ok(permit) => state.start_permit = Some(permit),
+                Err(error) => {
+                    unknown = true;
+                    log_quiescence_failure("remote_transport_shutdown", error.code());
+                }
+            }
+        }
+        if unknown {
+            state.quiescence_unknown = true;
+            state.blocked_code = Some(REMOTE_QUIESCENCE_UNKNOWN.to_owned());
+            return Err(admin_error(REMOTE_QUIESCENCE_UNKNOWN));
+        }
         Ok(())
     }
 
@@ -1035,20 +1414,18 @@ impl RemoteManager {
         {
             Ok(mut transport) => {
                 let pairing_start = match data_cert {
-                    Some(data_cert) => {
-                        match self.start_remote_link(state, &mut transport, record.machine_route) {
-                            Ok(()) => {
-                                self.start_pairing_actor(
-                                    state,
-                                    &mut transport,
-                                    pairing_connection,
-                                    data_cert,
-                                )
-                                .await
-                            }
-                            Err(error) => Err(error),
+                    Some(data_cert) => match self
+                        .start_pairing_actor(state, &mut transport, pairing_connection, data_cert)
+                        .await
+                    {
+                        Ok(machine_data) => {
+                            stage_business_start(state, record.machine_route, machine_data)
                         }
-                    }
+                        Err(error) => {
+                            record_pairing_start_failure(state, &error);
+                            Err(error)
+                        }
+                    },
                     // RetirePending deliberately has no data cert/business link.
                     None => Ok(()),
                 };
@@ -1059,10 +1436,7 @@ impl RemoteManager {
                         state.blocked_code = None;
                         Ok(())
                     }
-                    Err(error) => {
-                        record_pairing_start_failure(state, &error);
-                        Err(error)
-                    }
+                    Err(error) => Err(error),
                 }
             }
             Err(error) => {
@@ -1085,24 +1459,23 @@ impl RemoteManager {
         match retry.retry().await {
             Ok(mut transport) => {
                 let pairing_start = match self.store.load_machine_enrollment_state().await? {
-                    Some(MachineEnrollmentState::Active(active)) => {
-                        match self.start_remote_link(
+                    Some(MachineEnrollmentState::Active(active)) => match self
+                        .start_pairing_actor(
                             state,
                             &mut transport,
-                            active.record.machine_route,
-                        ) {
-                            Ok(()) => {
-                                self.start_pairing_actor(
-                                    state,
-                                    &mut transport,
-                                    active.connection,
-                                    active.data_cert,
-                                )
-                                .await
-                            }
-                            Err(error) => Err(error),
+                            active.connection,
+                            active.data_cert,
+                        )
+                        .await
+                    {
+                        Ok(machine_data) => {
+                            stage_business_start(state, active.record.machine_route, machine_data)
                         }
-                    }
+                        Err(error) => {
+                            record_pairing_start_failure(state, &error);
+                            Err(error)
+                        }
+                    },
                     Some(MachineEnrollmentState::RetirePending(_)) => Ok(()),
                     _ => Err(admin_error(REMOTE_STATE_CONFLICT)),
                 };
@@ -1112,10 +1485,7 @@ impl RemoteManager {
                         state.blocked_code = None;
                         Ok(())
                     }
-                    Err(error) => {
-                        record_pairing_start_failure(state, &error);
-                        Err(error)
-                    }
+                    Err(error) => Err(error),
                 }
             }
             Err(error) => {
@@ -1133,7 +1503,7 @@ impl RemoteManager {
         transport: &mut RemoteTransport,
         connection: MachineEnrollmentConnectionMaterial,
         data_cert: agentdeck_protocol::relay_v2::SignedCertificate,
-    ) -> Result<(), RemoteAdministrationError> {
+    ) -> Result<MachineDataAuthority, RemoteAdministrationError> {
         if state.pairing.is_some() {
             return Err(admin_error(REMOTE_STATE_CONFLICT));
         }
@@ -1145,6 +1515,7 @@ impl RemoteManager {
         let PairingRuntimeParts { lane, authority } = transport
             .take_pairing_runtime(data_cert)
             .map_err(|error| admin_error(error.code()))?;
+        let machine_data = authority.machine_data_authority();
         let invite_anchor = authority
             .invite_anchor()
             .map_err(|error| admin_error(error.code()))?;
@@ -1165,56 +1536,258 @@ impl RemoteManager {
         )
         .await;
         state.pairing = Some(owner);
-        ready.map_err(|error| admin_error(error.code()))
+        ready.map_err(|error| admin_error(error.code()))?;
+        Ok(machine_data)
     }
 
-    fn start_remote_link(
-        &self,
-        state: &mut RemoteManagerState,
-        transport: &mut RemoteTransport,
-        machine_route: [u8; 16],
-    ) -> Result<(), RemoteAdministrationError> {
-        if state.link.is_some() {
-            return Err(admin_error(REMOTE_STATE_CONFLICT));
+    async fn start_business_stack_if_ready(&self) -> Result<(), RemoteAdministrationError> {
+        let _singleflight = self.business_start_singleflight.lock().await;
+        #[cfg(test)]
+        if let Some(entered) = self.business_startup_for_test.lock().await.take() {
+            let _ = entered.send(());
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            if !*shutdown_rx.borrow() {
+                let _ = shutdown_rx.changed().await;
+            }
+            return Err(admin_error(REMOTE_SHUTTING_DOWN));
         }
-        // P4.4 production 尚未安装 P4.5 sealer/publisher。此时 pairing control lane
-        // 必须继续启动，但 business lane 不能被领取，更不能让 Core 先 durable accept
-        // 一个永远无法回执的请求。Owner::start 仍保留第二层 fail-close。
-        if !self.reply_sealer.admission_ready() || !self.stream_publisher.admission_ready() {
-            return Ok(());
+
+        let prepared = {
+            let mut state = self.state.lock().await;
+            if state.stopped {
+                return Err(admin_error(REMOTE_SHUTTING_DOWN));
+            }
+            require_known_quiescence(&state)?;
+            let Some(pending) = state.pending_business_start.as_ref().cloned() else {
+                return Ok(());
+            };
+            if state.link.is_some()
+                || state.transition.is_some()
+                || state.transition_handle.is_some()
+                || state.maintenance.is_some()
+                || state.publication.is_some()
+            {
+                return Err(admin_error(REMOTE_STATE_CONFLICT));
+            }
+            let core = self
+                .runtime_core
+                .get()
+                .cloned()
+                .filter(|core| core.upgrade().is_some())
+                .ok_or_else(|| admin_error("daemon.remote.runtime_core_unavailable"));
+            let core = match core {
+                Ok(core) => core,
+                Err(error) => {
+                    state.blocked_code = Some(error.code().to_owned());
+                    return Err(error);
+                }
+            };
+            let lane = match state.transport.as_mut() {
+                Some(transport) => transport
+                    .take_business_lane()
+                    .map_err(|error| admin_error(error.code())),
+                None => Err(admin_error(REMOTE_STATE_CONFLICT)),
+            };
+            let lane = match lane {
+                Ok(lane) => lane,
+                Err(error) => {
+                    state.blocked_code = Some(error.code().to_owned());
+                    return Err(error);
+                }
+            };
+            (pending, lane, core)
+        };
+        let (pending, claimed_lane, core) = prepared;
+        let mut lane = Some(claimed_lane);
+        let machine_route = MachineRouteId::from_bytes(pending.machine_route);
+        let machine_data = pending.machine_data;
+        let mut admission = RemoteBusinessAdmission::new();
+        #[cfg(test)]
+        let injected_failure = self
+            .business_start_failure_after_lane_for_test
+            .lock()
+            .await
+            .take();
+
+        let result: Result<Box<dyn ManagedRemoteLinkOwner>, RemoteAdministrationError> = async {
+            #[cfg(test)]
+            if let Some(code) = injected_failure {
+                return Err(admin_error(code));
+            }
+            let machine_publication = lane
+                .as_ref()
+                .ok_or_else(|| admin_error(REMOTE_STATE_CONFLICT))?
+                .publication_handle();
+            let transition_reconnect_rx = machine_publication.subscribe_authenticated_reconnects();
+            let pending_reconnect_rx = machine_publication.subscribe_authenticated_reconnects();
+            let publication_owner =
+                PublicationDriveOwner::open(self.store.clone(), machine_publication)
+                    .await
+                    .map_err(publication_drive_error)?;
+            let publication_drive = publication_owner.handle();
+            {
+                let mut state = self.state.lock().await;
+                if state.stopped {
+                    drop(state);
+                    publication_owner
+                        .shutdown()
+                        .await
+                        .map_err(publication_drive_error)?;
+                    return Err(admin_error(REMOTE_SHUTTING_DOWN));
+                }
+                state.publication = Some(Box::new(publication_owner));
+            }
+            let deadline = tokio::time::Instant::now() + BUSINESS_STARTUP_DEADLINE;
+            let guard = Arc::new(OwnedKeyStoreCounterGuardBackend::new(Arc::clone(
+                &self.key_store,
+            )));
+            let transition_owner = KeyTransitionRecoveryOwner::start_with_authenticated_reconnect(
+                self.store.clone(),
+                Arc::clone(&self.key_store),
+                machine_route,
+                machine_data.clone(),
+                publication_drive.clone(),
+                transition_reconnect_rx,
+            )
+            .map_err(transition_recovery_error)?;
+            let transition_handle = transition_owner.handle();
+            {
+                let mut state = self.state.lock().await;
+                if state.stopped {
+                    drop(state);
+                    transition_owner
+                        .shutdown()
+                        .await
+                        .map_err(transition_recovery_error)?;
+                    return Err(admin_error(REMOTE_SHUTTING_DOWN));
+                }
+                state.transition = Some(Box::new(transition_owner));
+                state.transition_handle = Some(Arc::new(transition_handle.clone()));
+            }
+            drive_business_startup_gates(
+                &self.store,
+                guard.as_ref(),
+                &publication_drive,
+                &transition_handle,
+                &mut admission,
+                deadline,
+                self.shutdown_tx.subscribe(),
+                Some(pending_reconnect_rx),
+            )
+            .await?;
+            let maintenance_now_ms = unix_now_ms()?;
+            run_remote_maintenance_once(&self.store, self.key_store.as_ref(), maintenance_now_ms)
+                .await
+                .map_err(remote_maintenance_error)?;
+            let maintenance_owner =
+                RemoteMaintenanceOwner::start(self.store.clone(), Arc::clone(&self.key_store));
+            {
+                let mut state = self.state.lock().await;
+                if state.stopped {
+                    drop(state);
+                    maintenance_owner
+                        .shutdown()
+                        .await
+                        .map_err(remote_maintenance_error)?;
+                    return Err(admin_error(REMOTE_SHUTTING_DOWN));
+                }
+                state.maintenance = Some(Box::new(maintenance_owner));
+            }
+
+            let shared_backend = Arc::new(
+                RuntimeStoreSharedPublicationBackend::new(self.store.clone(), guard, machine_route)
+                    .map_err(shared_publisher_error)?,
+            );
+            let publisher = Arc::new(
+                SharedStreamPublisher::new(
+                    machine_route,
+                    shared_backend,
+                    Arc::new(publication_drive),
+                    Arc::new(machine_data.clone()),
+                )
+                .map_err(shared_publisher_error)?,
+            );
+            let sealer = Arc::new(DeviceReplyTxSealer::new(
+                self.store.clone(),
+                Arc::clone(&self.key_store),
+                machine_data,
+            ));
+            let key_control =
+                Arc::new(StoreBackedKeyControlIngressHandler::new(self.store.clone()));
+            let admitted_lane = lane
+                .take()
+                .ok_or_else(|| admin_error(REMOTE_STATE_CONFLICT))?;
+            start_admitted_remote_link(
+                admission.into_permit()?,
+                machine_route,
+                self.store.clone(),
+                admitted_lane,
+                core,
+                sealer,
+                publisher,
+                key_control,
+            )
+            .map(|owner| Box::new(owner) as Box<dyn ManagedRemoteLinkOwner>)
+            .map_err(|error| admin_error(error.code()))
         }
-        let core = self
-            .runtime_core
-            .get()
-            .cloned()
-            .ok_or_else(|| admin_error("daemon.remote.runtime_core_unavailable"))?;
-        if core.upgrade().is_none() {
-            return Err(admin_error("daemon.remote.runtime_core_unavailable"));
+        .await;
+
+        match result {
+            Ok(mut owner) => {
+                let mut state = self.state.lock().await;
+                if state.stopped {
+                    drop(state);
+                    let _ = owner.shutdown().await;
+                    return Err(admin_error(REMOTE_SHUTTING_DOWN));
+                }
+                state.link = Some(owner);
+                state.pending_business_start = None;
+                state.blocked_code = None;
+                Ok(())
+            }
+            Err(error) => {
+                let mut state = self.state.lock().await;
+                if !state.stopped {
+                    state.blocked_code = Some(error.code().to_owned());
+                }
+                match rollback_business_start(&mut state).await {
+                    Ok(()) => {
+                        if !state.stopped
+                            && let Some(claimed_lane) = lane.take()
+                        {
+                            let restored = match state.transport.as_mut() {
+                                Some(transport) => transport
+                                    .restore_business_lane(claimed_lane)
+                                    .await
+                                    .map_err(|restore| admin_error(restore.code())),
+                                None => Err(admin_error(REMOTE_STATE_CONFLICT)),
+                            };
+                            if let Err(restore) = restored {
+                                log_quiescence_failure(
+                                    "remote_business_lane_start_rollback",
+                                    restore.code(),
+                                );
+                                state.quiescence_unknown = true;
+                                state.blocked_code = Some(REMOTE_QUIESCENCE_UNKNOWN.to_owned());
+                                return Err(admin_error(REMOTE_QUIESCENCE_UNKNOWN));
+                            }
+                        }
+                        Err(error)
+                    }
+                    Err(quiescence) => Err(quiescence),
+                }
+            }
         }
-        let lane = transport
-            .take_business_lane()
-            .map_err(|error| admin_error(error.code()))?;
-        let owner = RemoteLinkOwner::start(
-            MachineRouteId::from_bytes(machine_route),
-            self.store.clone(),
-            lane,
-            core,
-            self.reply_sealer.clone(),
-            self.stream_publisher.clone(),
-        )
-        .map_err(|error| admin_error(error.code()))?;
-        state.link = Some(owner);
-        Ok(())
     }
 
     async fn cleanup(
         &self,
         state: &mut RemoteManagerState,
     ) -> Result<(), RemoteAdministrationError> {
+        self.quiesce_remote_stack(state).await?;
         state.identity = None;
         state.connect_retry = None;
-        stop_remote_link(state).await?;
-        stop_pairing_actor(state).await;
+        state.pending_business_start = None;
         let transport = state.transport.take();
         match MachineCleanupWorkflow::new()
             .run(&self.store, self.key_store.as_ref(), transport)
@@ -1242,6 +1815,12 @@ impl RemoteManager {
         &self,
         state: &mut RemoteManagerState,
     ) -> Result<MachineRemoteStatus, RemoteAdministrationError> {
+        if state.blocked_code.as_deref() == Some(TRANSITION_RECOVERY_TIMED_OUT) {
+            let transition_active = self.store.load_active_key_transition().await?.is_some();
+            if transition_timeout_resolved(state.blocked_code.as_deref(), transition_active) {
+                state.blocked_code = None;
+            }
+        }
         let enabled = state.enabled;
         let armed = state.armed;
         let stopped = state.stopped;
@@ -1251,22 +1830,639 @@ impl RemoteManager {
             .and_then(RemoteTransport::observed_failure_code)
             .or_else(|| {
                 state
+                    .link
+                    .as_ref()
+                    .and_then(|link| link.observed_failure_code())
+            })
+            .or_else(|| {
+                state
                     .pairing
                     .as_ref()
                     .and_then(PairingCoordinatorOwner::observed_failure_code)
+            })
+            .or_else(|| {
+                state
+                    .transition
+                    .as_ref()
+                    .and_then(|transition| transition.observed_failure_code())
+            })
+            .or_else(|| {
+                state
+                    .quiescence_unknown
+                    .then(|| REMOTE_QUIESCENCE_UNKNOWN.to_owned())
             })
             .or_else(|| state.blocked_code.clone());
         if !enabled || !self.config.remote_enabled() {
             return Err(admin_error(REMOTE_DISABLED));
         }
+        let counter_retired = self.store.has_retired_remote_counter().await?;
         let durable = self.store.load_machine_enrollment_state().await?;
         status_from_state(
             durable.as_ref(),
-            blocked_code
-                .as_deref()
+            counter_retired
+                .then_some(COUNTER_RETIRED)
+                .or(blocked_code.as_deref())
                 .or_else(|| (!armed && !stopped).then_some(REMOTE_NOT_ARMED)),
             stopped,
         )
+    }
+
+    /// Conversation activation 已 durable COMMIT membership mutation 后，沿启动时安装的
+    /// 唯一 transition owner 推进到 exact business-ready fence。等待 Store/Relay 时不持
+    /// manager mutex；失败形成稳定 remote block，不能把已提交 mutation 伪装成业务可用。
+    async fn drive_transition_to_business_ready(&self) -> Result<(), RemoteAdministrationError> {
+        let handle = {
+            let state = self.state.lock().await;
+            if state.stopped {
+                return Err(admin_error(REMOTE_SHUTTING_DOWN));
+            }
+            state
+                .transition_handle
+                .clone()
+                .ok_or_else(|| admin_error(TRANSITION_OWNER_UNAVAILABLE))?
+        };
+        let result = await_exact_business_readiness(
+            handle.as_ref(),
+            tokio::time::Instant::now() + BUSINESS_STARTUP_DEADLINE,
+            self.shutdown_tx.subscribe(),
+        )
+        .await;
+        if let Err(error) = &result
+            && error.code() == TRANSITION_RECOVERY_TIMED_OUT
+        {
+            let mut state = self.state.lock().await;
+            if !state.stopped {
+                state.blocked_code = Some(TRANSITION_RECOVERY_TIMED_OUT.to_owned());
+            }
+        }
+        result
+    }
+
+    /// Pairing/revocation 的 durable receipt 只描述已提交的赢家/终态，不能被后续
+    /// Relay barrier 或 endpoint ACK 覆写。把幂等推进交给 manager-owned transition
+    /// owner 后立即返回；投递失败会稳定阻断 remote，但不改变已经提交的 receipt。
+    async fn request_transition_control_plane_progress(&self) {
+        let result = {
+            let state = self.state.lock().await;
+            if state.stopped {
+                return;
+            }
+            state
+                .transition_handle
+                .clone()
+                .ok_or_else(|| admin_error(TRANSITION_OWNER_UNAVAILABLE))
+                .and_then(|handle| handle.request_control_plane_progress())
+        };
+        if let Err(error) = result {
+            crate::diag::log(
+                "remote_transition_progress",
+                &format!("status=blocked code={}", error.code()),
+            );
+            let mut state = self.state.lock().await;
+            if !state.stopped {
+                state.blocked_code = Some(error.code().to_owned());
+            }
+        }
+    }
+}
+
+fn transition_timeout_resolved(blocked_code: Option<&str>, transition_active: bool) -> bool {
+    blocked_code == Some(TRANSITION_RECOVERY_TIMED_OUT) && !transition_active
+}
+
+async fn reconcile_active_sender_counters(
+    store: &RuntimeStoreHandle,
+    guard: &OwnedKeyStoreCounterGuardBackend,
+) -> Result<Option<[u8; 16]>, RemoteAdministrationError> {
+    if let Some(active) = store.load_active_key_transition().await?
+        && active.transition.operation == KeyTransitionOperation::CounterRecovery
+    {
+        if active.transition.terminal.is_some() || active.transition.operation_id == [0; 16] {
+            return Err(admin_error(COUNTER_RETIRED));
+        }
+        return Ok(Some(active.transition.operation_id));
+    }
+
+    let trust_domain = store.machine_trust_domain()?;
+    let candidates = store
+        .load_active_sender_counter_bindings()
+        .await?
+        .into_iter()
+        .map(|binding| active_sender_counter_candidate(trust_domain, binding))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut retired = None;
+    for candidate in &candidates {
+        let record = store
+            .load_remote_counter_record(candidate.scope.token(), candidate.key_id)
+            .await?;
+        match record.kind {
+            RemoteCounterRecordKind::Retired => {
+                if retired.replace(candidate.clone()).is_some() {
+                    return Err(admin_error(COUNTER_RETIRED));
+                }
+            }
+            RemoteCounterRecordKind::RecoveryStaged | RemoteCounterRecordKind::Recovered => {
+                return Err(admin_error(COUNTER_RETIRED));
+            }
+            RemoteCounterRecordKind::Genesis
+            | RemoteCounterRecordKind::Gap
+            | RemoteCounterRecordKind::Frozen => {}
+        }
+    }
+    if let Some(candidate) = retired {
+        return stage_counter_recovery(store, candidate).await.map(Some);
+    }
+    // A retirement that cannot be uniquely bound to the authenticated active sender inventory
+    // cannot be auto-repaired. Keep the global remote fence and require an explicit trust reset.
+    if store.has_retired_remote_counter().await? {
+        return Err(admin_error(COUNTER_RETIRED));
+    }
+
+    let coordinator = SignedPublicationCoordinator::new(store, guard);
+    for candidate in candidates {
+        match coordinator
+            .audit_sender_scope(candidate.scope, candidate.key_id)
+            .await
+        {
+            Ok(()) => {}
+            Err(SignedPublicationError::RetireKey) => {
+                return stage_counter_recovery(store, candidate).await.map(Some);
+            }
+            Err(error) => return Err(signed_publication_error(error)),
+        }
+    }
+    Ok(None)
+}
+
+/// Business startup 的线性门禁。CounterGuard/Store reconciliation 与 pending scope
+/// 审计必须先于任何可能触达 Relay 的 transition/publication drive；最终恢复前再审一次，
+/// 防止 CounterRecovery 把 retired scope 的旧冻结密文混入 replacement barrier drive。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "显式绑定同一 startup 的 Store、owners、admission、absolute deadline、cancel 与 authenticated reconnect"
+)]
+async fn drive_business_startup_gates(
+    store: &RuntimeStoreHandle,
+    guard: &OwnedKeyStoreCounterGuardBackend,
+    publication_drive: &super::publication_transport::PublicationDriveHandle,
+    transition_handle: &dyn ManagedTransitionHandle,
+    admission: &mut RemoteBusinessAdmission,
+    deadline: tokio::time::Instant,
+    shutdown_rx: watch::Receiver<bool>,
+    pending_reconnect_rx: Option<AuthenticatedBusinessReconnects>,
+) -> Result<(), RemoteAdministrationError> {
+    if *shutdown_rx.borrow() {
+        return Err(admin_error(REMOTE_SHUTTING_DOWN));
+    }
+    let counter_recovery_operation =
+        admission.observe_counter_audit(reconcile_active_sender_counters(store, guard).await)?;
+    if transition_may_drive_publication(store, counter_recovery_operation).await? {
+        audit_pending_publication_counter_scopes(store).await?;
+    }
+    let mut readiness =
+        await_transition_readiness(transition_handle, deadline, shutdown_rx.clone()).await?;
+    if let Some(operation_id) = counter_recovery_operation {
+        let recovered = store
+            .mark_remote_counter_recovery_business_ready(operation_id)
+            .await?;
+        if recovered.kind != RemoteCounterRecordKind::Recovered {
+            return Err(admin_error(COUNTER_RETIRED));
+        }
+        let _ = store.try_complete_key_transition(operation_id).await?;
+        audit_current_sender_counters(store, guard).await?;
+        readiness =
+            await_transition_readiness(transition_handle, deadline, shutdown_rx.clone()).await?;
+        // CounterGuard lineage 已安全切到 replacement scope，但现有设备仍需经
+        // RemoteLink 控制面取得 KeyUpdate 并提交 required ACK。此时必须允许
+        // ControlPlaneOnly link 启动；普通业务继续由 active transition fence 拒绝。
+    }
+    admission.observe_transition_readiness(Ok(readiness))?;
+    audit_pending_publication_counter_scopes(store).await?;
+    admission.observe_publication_recovery(
+        recover_pending_after_authenticated_reconnect(
+            publication_drive,
+            deadline,
+            shutdown_rx,
+            pending_reconnect_rx,
+        )
+        .await,
+    )?;
+    Ok(())
+}
+
+async fn recover_pending_after_authenticated_reconnect(
+    publication_drive: &super::publication_transport::PublicationDriveHandle,
+    deadline: tokio::time::Instant,
+    shutdown_rx: watch::Receiver<bool>,
+    mut reconnect_rx: Option<AuthenticatedBusinessReconnects>,
+) -> Result<(), PublicationDriveError> {
+    loop {
+        if let Some(reconnect_rx) = reconnect_rx.as_mut() {
+            reconnect_rx
+                .mark_attempt_baseline()
+                .map_err(|_| PublicationDriveError::Closed)?;
+        }
+        match publication_drive
+            .recover_pending_until(deadline, shutdown_rx.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(PublicationDriveError::RecoveryOffline) => {}
+            Err(error) => return Err(error),
+        }
+        if *shutdown_rx.borrow() {
+            return Err(PublicationDriveError::RecoveryCancelled);
+        }
+        let Some(reconnect_rx) = reconnect_rx.as_mut() else {
+            return Err(PublicationDriveError::RecoveryOffline);
+        };
+        let mut cancelled_rx = shutdown_rx.clone();
+        tokio::select! {
+            biased;
+            changed = cancelled_rx.changed() => {
+                if changed.is_err() || *cancelled_rx.borrow() {
+                    return Err(PublicationDriveError::RecoveryCancelled);
+                }
+            }
+            changed = tokio::time::timeout_at(deadline, reconnect_rx.changed()) => {
+                match changed {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) => return Err(PublicationDriveError::Closed),
+                    Err(_) => return Err(PublicationDriveError::RecoveryTimedOut),
+                }
+            }
+        }
+    }
+}
+
+async fn transition_may_drive_publication(
+    store: &RuntimeStoreHandle,
+    counter_recovery_operation: Option<[u8; 16]>,
+) -> Result<bool, RemoteAdministrationError> {
+    let Some(operation_id) = counter_recovery_operation else {
+        return Ok(true);
+    };
+    let active = store
+        .load_active_key_transition()
+        .await?
+        .ok_or_else(|| admin_error(COUNTER_RETIRED))?;
+    if active.transition.operation_id != operation_id
+        || active.transition.operation != KeyTransitionOperation::CounterRecovery
+        || active.transition.terminal.is_some()
+    {
+        return Err(admin_error(COUNTER_RETIRED));
+    }
+    Ok(
+        active.transition.phase != KeyTransitionPhase::BarriersCommitted
+            && !matches!(active.transition.target, KeyTransitionTarget::Device(_)),
+    )
+}
+
+/// `load_pending_publication_streams` 先认证完整 stream/outbox directory；逐 stream 的
+/// record readback 再取得同一 parent counter scope。CounterRecovery staged 期间 Store
+/// 只允许 exact replacement scope，因此 old retired blob（以及会被共享 dispatcher
+/// 意外夹带的其他 fenced scope）会在任何 drive 前 fail-close。
+async fn audit_pending_publication_counter_scopes(
+    store: &RuntimeStoreHandle,
+) -> Result<(), RemoteAdministrationError> {
+    for publication_stream_id in store.load_pending_publication_streams().await? {
+        let stream = store
+            .load_publication_stream_record(publication_stream_id)
+            .await?;
+        let scope_token = stream
+            .counter_scope_token
+            .ok_or_else(|| admin_error(COUNTER_RETIRED))?;
+        if !store.remote_counter_scope_allowed(scope_token).await? {
+            return Err(admin_error(COUNTER_RETIRED));
+        }
+    }
+    Ok(())
+}
+
+async fn audit_current_sender_counters(
+    store: &RuntimeStoreHandle,
+    guard: &OwnedKeyStoreCounterGuardBackend,
+) -> Result<(), RemoteAdministrationError> {
+    let trust_domain = store.machine_trust_domain()?;
+    let coordinator = SignedPublicationCoordinator::new(store, guard);
+    for binding in store.load_active_sender_counter_bindings().await? {
+        let candidate = active_sender_counter_candidate(trust_domain, binding)?;
+        coordinator
+            .audit_sender_scope(candidate.scope, candidate.key_id)
+            .await
+            .map_err(signed_publication_error)?;
+    }
+    Ok(())
+}
+
+fn active_sender_counter_candidate(
+    trust_domain: [u8; 32],
+    binding: ActiveSenderCounterBinding,
+) -> Result<ActiveSenderCounterCandidate, RemoteAdministrationError> {
+    match binding {
+        ActiveSenderCounterBinding::SharedPublication {
+            publication_stream_id,
+            key_id,
+        } => {
+            let replacement_key_id = KeyId {
+                purpose: key_id.purpose,
+                epoch: key_id
+                    .epoch
+                    .checked_add(1)
+                    .ok_or_else(|| admin_error(COUNTER_RETIRED))?,
+            };
+            let scope = CounterScope::publication(trust_domain, key_id, publication_stream_id)
+                .map_err(|error| admin_error(error.code()))?;
+            let replacement_scope =
+                CounterScope::publication(trust_domain, replacement_key_id, publication_stream_id)
+                    .map_err(|error| admin_error(error.code()))?;
+            Ok(ActiveSenderCounterCandidate {
+                scope,
+                key_id,
+                replacement_scope,
+                target: CounterRecoveryStageTarget::SharedPublication {
+                    publication_stream_id,
+                },
+            })
+        }
+        ActiveSenderCounterBinding::DirectedReply { authorization } => {
+            if authorization.machine_trust_domain() != trust_domain {
+                return Err(admin_error(COUNTER_RETIRED));
+            }
+            let key_id = KeyId {
+                purpose: KeyPurpose::DeviceReplyTx,
+                epoch: authorization.reply_key_epoch(),
+            };
+            let replacement_epoch = key_id
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| admin_error(COUNTER_RETIRED))?;
+            let scope = CounterScope::directed_reply_for_trust_epoch(
+                trust_domain,
+                authorization.machine_route(),
+                authorization.trust_epoch(),
+                authorization.device_route(),
+                authorization.grant_serial(),
+                key_id.epoch,
+            )
+            .map_err(|error| admin_error(error.code()))?;
+            let replacement_scope = CounterScope::directed_reply_for_trust_epoch(
+                trust_domain,
+                authorization.machine_route(),
+                authorization.trust_epoch(),
+                authorization.device_route(),
+                authorization.grant_serial(),
+                replacement_epoch,
+            )
+            .map_err(|error| admin_error(error.code()))?;
+            Ok(ActiveSenderCounterCandidate {
+                scope,
+                key_id,
+                replacement_scope,
+                target: CounterRecoveryStageTarget::DirectedReply { authorization },
+            })
+        }
+    }
+}
+
+async fn stage_counter_recovery(
+    store: &RuntimeStoreHandle,
+    candidate: ActiveSenderCounterCandidate,
+) -> Result<[u8; 16], RemoteAdministrationError> {
+    let operation_id = fresh_counter_recovery_operation_id()?;
+    let expected_retired_scope = candidate.scope.token();
+    let expected_replacement_scope = candidate.replacement_scope.token();
+    let outcome = store
+        .stage_remote_counter_recovery(CounterRecoveryStageRequest {
+            operation_id,
+            retired_scope_token: expected_retired_scope,
+            retired_key_id: candidate.key_id,
+            replacement_scope_token: expected_replacement_scope,
+            target: candidate.target,
+        })
+        .await?;
+    match outcome.disposition {
+        CounterRecoveryDisposition::Staged | CounterRecoveryDisposition::AlreadyStaged => {
+            let binding = outcome
+                .binding
+                .ok_or_else(|| admin_error(COUNTER_RETIRED))?;
+            if binding.operation_id != operation_id
+                || binding.retired_scope_token != expected_retired_scope
+                || binding.retired_key_id != candidate.key_id
+                || binding.replacement_scope_token != expected_replacement_scope
+            {
+                return Err(admin_error(COUNTER_RETIRED));
+            }
+            Ok(operation_id)
+        }
+        CounterRecoveryDisposition::TrustResetRequired => Err(admin_error(COUNTER_RETIRED)),
+    }
+}
+
+fn fresh_counter_recovery_operation_id() -> Result<[u8; 16], RemoteAdministrationError> {
+    for _ in 0..COUNTER_RECOVERY_ENTROPY_ATTEMPTS {
+        let mut operation_id = [0; 16];
+        getrandom::fill(&mut operation_id)
+            .map_err(|_| admin_error(COUNTER_RECOVERY_ENTROPY_UNAVAILABLE))?;
+        if operation_id != [0; 16] {
+            return Ok(operation_id);
+        }
+    }
+    Err(admin_error(COUNTER_RECOVERY_ENTROPY_UNAVAILABLE))
+}
+
+async fn await_transition_readiness(
+    handle: &dyn ManagedTransitionHandle,
+    deadline: tokio::time::Instant,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<TransitionReadiness, RemoteAdministrationError> {
+    await_transition_target(handle, deadline, shutdown_rx, false).await
+}
+
+/// startup 允许在 ControlPlaneReady 时先拉起只读控制面；RemoteLink 已运行后的
+/// conversation activation 必须等待 required ACK 真正释放 Store transition slot，
+/// 绝不能把中间态上报为 business success。Pairing/revoke 的 durable receipt 另走
+/// owner-enqueue，不同步等待 endpoint ACK。
+async fn await_exact_business_readiness(
+    handle: &dyn ManagedTransitionHandle,
+    deadline: tokio::time::Instant,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), RemoteAdministrationError> {
+    let _ = await_transition_target(handle, deadline, shutdown_rx, true).await?;
+    Ok(())
+}
+
+async fn await_transition_target(
+    handle: &dyn ManagedTransitionHandle,
+    deadline: tokio::time::Instant,
+    mut shutdown_rx: watch::Receiver<bool>,
+    require_business: bool,
+) -> Result<TransitionReadiness, RemoteAdministrationError> {
+    if *shutdown_rx.borrow() {
+        return Err(admin_error(REMOTE_SHUTTING_DOWN));
+    }
+    let mut progress_rx = handle.subscribe_progress();
+    if let Some(progress_rx) = progress_rx.as_mut() {
+        // watch 保留的是 owner 上一次 drive 的状态。先把它标成 baseline，只有本轮
+        // drive 之后递增的 version 才能证明当前 transition 已推进。
+        let _ = *progress_rx.borrow_and_update();
+    }
+    let first = tokio::select! {
+        biased;
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+            return Err(admin_error(REMOTE_SHUTTING_DOWN));
+        }
+        result = tokio::time::timeout_at(deadline, handle.drive_to_business_ready()) => {
+            result.unwrap_or_else(|_| Err(admin_error(TRANSITION_RECOVERY_TIMED_OUT)))
+        }
+    };
+
+    // drive 完成与 shutdown 同时可见时仍以关停为准；旧 Ready 不能覆盖本轮的
+    // timeout、terminal error 或 shutdown。
+    if *shutdown_rx.borrow() {
+        return Err(admin_error(REMOTE_SHUTTING_DOWN));
+    }
+    if let Some(result) = transition_initial_result(&first, require_business) {
+        return result;
+    }
+
+    if let Some(progress_rx) = progress_rx.as_mut() {
+        match progress_rx.has_changed() {
+            Ok(true) => {
+                let progress = *progress_rx.borrow_and_update();
+                match progress {
+                    TransitionProgress::Pending => {}
+                    TransitionProgress::Blocked(code) => return Err(admin_error(code)),
+                    TransitionProgress::Ready(readiness) => {
+                        // owner 的一次 drive 总是在回应 caller 前发布同一结果。若两者
+                        // 矛盾，绝不能让 Ready 覆盖 direct error；只信任成功 drive 的
+                        // fresh Ready。
+                        if let Err(error) = &first {
+                            return Err(error.clone());
+                        }
+                        if let Some(result) = transition_progress_result(
+                            TransitionProgress::Ready(readiness),
+                            require_business,
+                        ) {
+                            return result;
+                        }
+                    }
+                    TransitionProgress::Idle => {
+                        if let Err(error) = &first {
+                            return Err(error.clone());
+                        }
+                    }
+                }
+            }
+            Ok(false) => {
+                if let Err(error) = &first
+                    && !transition_error_waits_without_fresh_progress(error)
+                {
+                    return Err(error.clone());
+                }
+            }
+            Err(_) => {
+                if let Err(error) = &first
+                    && !transition_error_waits_without_fresh_progress(error)
+                {
+                    return Err(error.clone());
+                }
+                return Err(admin_error(TRANSITION_OWNER_UNAVAILABLE));
+            }
+        }
+
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    let _ = changed;
+                    return Err(admin_error(REMOTE_SHUTTING_DOWN));
+                }
+                changed = tokio::time::timeout_at(deadline, progress_rx.changed()) => {
+                    match changed {
+                        Ok(Ok(())) => {
+                            let progress = *progress_rx.borrow_and_update();
+                            if let Some(result) = transition_progress_result(progress, require_business) {
+                                return result;
+                            }
+                        }
+                        Ok(Err(_)) => return Err(admin_error(TRANSITION_OWNER_UNAVAILABLE)),
+                        Err(_) => return Err(admin_error(TRANSITION_RECOVERY_TIMED_OUT)),
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(result) = transition_direct_result(first, require_business) {
+        return result;
+    }
+    tokio::select! {
+        biased;
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+            Err(admin_error(REMOTE_SHUTTING_DOWN))
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            Err(admin_error(TRANSITION_RECOVERY_TIMED_OUT))
+        }
+    }
+}
+
+fn transition_initial_result(
+    result: &Result<TransitionReadiness, RemoteAdministrationError>,
+    require_business: bool,
+) -> Option<Result<TransitionReadiness, RemoteAdministrationError>> {
+    match result {
+        Ok(
+            readiness @ (TransitionReadiness::NoActiveTransition
+            | TransitionReadiness::BusinessReady { .. }),
+        ) => Some(Ok(*readiness)),
+        Ok(readiness @ TransitionReadiness::ControlPlaneReady { .. }) if !require_business => {
+            Some(Ok(*readiness))
+        }
+        Ok(TransitionReadiness::ControlPlaneReady { .. }) => None,
+        Err(error) if error.code() == TRANSITION_RECOVERY_TIMED_OUT => Some(Err(error.clone())),
+        Err(_) => None,
+    }
+}
+
+fn transition_error_waits_without_fresh_progress(error: &RemoteAdministrationError) -> bool {
+    matches!(
+        error.code(),
+        TRANSITION_PROGRESS_PENDING | TRANSITION_RECONNECT_PENDING
+    )
+}
+
+fn transition_direct_result(
+    result: Result<TransitionReadiness, RemoteAdministrationError>,
+    require_business: bool,
+) -> Option<Result<TransitionReadiness, RemoteAdministrationError>> {
+    match result {
+        Ok(
+            readiness @ (TransitionReadiness::NoActiveTransition
+            | TransitionReadiness::BusinessReady { .. }),
+        ) => Some(Ok(readiness)),
+        Ok(readiness @ TransitionReadiness::ControlPlaneReady { .. }) if !require_business => {
+            Some(Ok(readiness))
+        }
+        Ok(TransitionReadiness::ControlPlaneReady { .. }) => None,
+        Err(error) => Some(Err(error)),
+    }
+}
+
+fn transition_progress_result(
+    progress: TransitionProgress,
+    require_business: bool,
+) -> Option<Result<TransitionReadiness, RemoteAdministrationError>> {
+    match progress {
+        TransitionProgress::Idle | TransitionProgress::Pending => None,
+        TransitionProgress::Ready(readiness) => {
+            transition_direct_result(Ok(readiness), require_business)
+        }
+        TransitionProgress::Blocked(code) => Some(Err(admin_error(code))),
     }
 }
 
@@ -1294,8 +2490,12 @@ impl RemoteAdministration for RemoteManager {
         &self,
         request: MachineEnrollRequest,
     ) -> Result<MachineRemoteStatus, RemoteAdministrationError> {
-        let mut state = self.state.lock().await;
-        self.enroll_locked(&mut state, request).await
+        let status = {
+            let mut state = self.state.lock().await;
+            self.enroll_locked(&mut state, request).await?
+        };
+        self.start_business_stack_if_ready().await?;
+        Ok(status)
     }
 
     async fn status(&self) -> Result<MachineRemoteStatus, RemoteAdministrationError> {
@@ -1396,6 +2596,15 @@ impl RemoteAdministration for RemoteManager {
 }
 
 #[async_trait]
+impl ConversationActivationCoordinator for RemoteManager {
+    async fn drive_to_business_ready(&self) -> Result<(), ConversationActivationError> {
+        RemoteManager::drive_transition_to_business_ready(self)
+            .await
+            .map_err(|error| ConversationActivationError::new(error.code()))
+    }
+}
+
+#[async_trait]
 impl PairingAdministration for RemoteManager {
     async fn create(
         &self,
@@ -1450,8 +2659,12 @@ impl PairingAdministration for RemoteManager {
             }
             pairing.handle()
         };
-        // Grant freeze、Store CAS 与 InstallGrant send 均不得占用 manager mutex。
-        handle.confirm(pairing_id).await
+        // Grant freeze、Store CAS、InstallGrant send 与其后的 key transition 均不得占用
+        // manager mutex。新设备收到 PairResponse 前不可能回 transition ACK；receipt
+        // 产生后只向已有 owner 投递推进请求，不再同步等待 Relay/endpoint 状态。
+        let receipt = handle.confirm(pairing_id).await?;
+        self.request_transition_control_plane_progress().await;
+        Ok(receipt)
     }
 
     async fn cancel(
@@ -1498,11 +2711,14 @@ impl RevocationAdministration for RemoteManager {
                 RevocationAdministrationError::new("daemon.revocation.administration.unavailable")
             })?
         };
-        // 不持 manager mutex 等 durable revoke COMMIT、Relay terminal 或重连。
-        handle
+        // 不持 manager mutex 等 durable revoke COMMIT、Relay terminal 或重连。receipt
+        // 已提交后只投递 key-transition 推进，不能再被离线 endpoint ACK 覆写。
+        let receipt = handle
             .revoke_device(device, grant_serial)
             .await
-            .map_err(|error| RevocationAdministrationError::new(error.code()))
+            .map_err(|error| RevocationAdministrationError::new(error.code()))?;
+        self.request_transition_control_plane_progress().await;
+        Ok(receipt)
     }
 }
 
@@ -1511,6 +2727,118 @@ async fn stop_pairing_actor(state: &mut RemoteManagerState) {
         pairing.shutdown().await;
     }
     state.pairing.take();
+}
+
+fn stage_business_start(
+    state: &mut RemoteManagerState,
+    machine_route: [u8; 16],
+    machine_data: MachineDataAuthority,
+) -> Result<(), RemoteAdministrationError> {
+    if state.pending_business_start.is_some()
+        || state.link.is_some()
+        || state.transition.is_some()
+        || state.transition_handle.is_some()
+        || state.maintenance.is_some()
+        || state.publication.is_some()
+    {
+        return Err(admin_error(REMOTE_STATE_CONFLICT));
+    }
+    state.pending_business_start = Some(PendingBusinessStart {
+        machine_route,
+        machine_data,
+    });
+    Ok(())
+}
+
+async fn rollback_business_start(
+    state: &mut RemoteManagerState,
+) -> Result<(), RemoteAdministrationError> {
+    let mut unknown = false;
+    if let Err(error) = stop_remote_link(state).await {
+        unknown = true;
+        log_quiescence_failure("remote_link_start_rollback", error.code());
+        state.link.take();
+    }
+    if let Err(error) = stop_maintenance_owner(state).await {
+        unknown = true;
+        log_quiescence_failure("remote_maintenance_start_rollback", error.code());
+    }
+    if let Err(error) = stop_transition_owner(state).await {
+        unknown = true;
+        log_quiescence_failure("remote_transition_start_rollback", error.code());
+    }
+    if let Err(error) = stop_publication_owner(state).await {
+        unknown = true;
+        log_quiescence_failure("remote_publication_start_rollback", error.code());
+    }
+    if unknown {
+        state.quiescence_unknown = true;
+        state.blocked_code = Some(REMOTE_QUIESCENCE_UNKNOWN.to_owned());
+        return Err(admin_error(REMOTE_QUIESCENCE_UNKNOWN));
+    }
+    Ok(())
+}
+
+async fn stop_transition_owner(
+    state: &mut RemoteManagerState,
+) -> Result<(), RemoteAdministrationError> {
+    state.transition_handle.take();
+    if let Some(owner) = state.transition.take() {
+        owner.shutdown().await?;
+    }
+    Ok(())
+}
+
+async fn stop_maintenance_owner(
+    state: &mut RemoteManagerState,
+) -> Result<(), RemoteAdministrationError> {
+    if let Some(owner) = state.maintenance.take() {
+        owner.shutdown().await?;
+    }
+    Ok(())
+}
+
+async fn stop_publication_owner(
+    state: &mut RemoteManagerState,
+) -> Result<(), RemoteAdministrationError> {
+    if let Some(owner) = state.publication.take() {
+        owner.shutdown().await.map_err(publication_drive_error)?;
+    }
+    Ok(())
+}
+
+const fn publication_drive_error_code(error: &PublicationDriveError) -> &'static str {
+    match error {
+        PublicationDriveError::Dispatch(_) => "daemon.remote.publication.dispatch_failed",
+        PublicationDriveError::Closed => "daemon.remote.publication.owner_closed",
+        PublicationDriveError::TaskFailed => "daemon.remote.publication.owner_failed",
+        PublicationDriveError::ShutdownTimedOut => "daemon.remote.publication.shutdown_timed_out",
+        PublicationDriveError::RecoveryOffline => "daemon.remote.publication.recovery_offline",
+        PublicationDriveError::RecoveryStalled => "daemon.remote.publication.recovery_stalled",
+        PublicationDriveError::RecoveryExhausted => "daemon.remote.publication.recovery_exhausted",
+        PublicationDriveError::RecoveryCancelled => REMOTE_SHUTTING_DOWN,
+        PublicationDriveError::RecoveryTimedOut => "daemon.remote.publication.recovery_timed_out",
+    }
+}
+
+fn publication_drive_error(error: PublicationDriveError) -> RemoteAdministrationError {
+    admin_error(publication_drive_error_code(&error))
+}
+
+fn transition_recovery_error(error: KeyTransitionRecoveryError) -> RemoteAdministrationError {
+    admin_error(error.code())
+}
+
+fn remote_maintenance_error(error: RemoteMaintenanceError) -> RemoteAdministrationError {
+    admin_error(error.code())
+}
+
+fn shared_publisher_error(error: SharedPublisherError) -> RemoteAdministrationError {
+    admin_error(error.code())
+}
+
+fn signed_publication_error(error: SignedPublicationError) -> RemoteAdministrationError {
+    admin_error(error.code())
 }
 
 async fn stop_remote_link(state: &mut RemoteManagerState) -> Result<(), RemoteAdministrationError> {
@@ -1553,7 +2881,35 @@ fn require_running_armed(state: &RemoteManagerState) -> Result<(), RemoteAdminis
     if !state.armed {
         return Err(admin_error(REMOTE_NOT_ARMED));
     }
+    if let Some(code) = state
+        .link
+        .as_ref()
+        .and_then(|link| link.observed_failure_code())
+        .or_else(|| {
+            state
+                .transition
+                .as_ref()
+                .and_then(|transition| transition.observed_failure_code())
+        })
+    {
+        return Err(admin_error(code));
+    }
+    require_known_quiescence(state)
+}
+
+fn require_known_quiescence(state: &RemoteManagerState) -> Result<(), RemoteAdministrationError> {
+    if state.quiescence_unknown {
+        return Err(admin_error(REMOTE_QUIESCENCE_UNKNOWN));
+    }
     Ok(())
+}
+
+fn log_quiescence_failure(event: &str, code: &str) {
+    crate::diag::log(event, &format!("status=quiescence_unknown code={code}"));
+}
+
+fn log_forced_shutdown(event: &str, code: &str) {
+    crate::diag::log(event, &format!("status=forced code={code}"));
 }
 
 fn require_identity_and_permit(

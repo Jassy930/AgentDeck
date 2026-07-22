@@ -31,6 +31,7 @@ use super::super::model::RuntimeStoreError;
 #[cfg(test)]
 use super::super::snapshot::SNAPSHOT_BUILD_MEMORY_BYTES;
 use super::super::store::RuntimeStoreHandle;
+use super::super::store::key_transition::TransitionSnapshotPermit;
 use super::budget::{
     MAX_PENDING_SUBSCRIPTION_JOBS_GLOBAL, MAX_PENDING_SUBSCRIPTION_JOBS_PER_CONNECTION,
 };
@@ -118,6 +119,32 @@ pub(super) struct PendingSubscriptionPermit {
     _connection: OwnedSemaphorePermit,
 }
 
+enum SubscriptionBarrierPreparation {
+    Standard {
+        target: RuntimeStreamTarget,
+        request: BarrierRequest,
+    },
+    TransitionSnapshot {
+        target: RuntimeStreamTarget,
+        permit: Box<TransitionSnapshotPermit>,
+    },
+}
+
+impl SubscriptionBarrierPreparation {
+    const fn target(&self) -> RuntimeStreamTarget {
+        match self {
+            Self::Standard { target, .. } | Self::TransitionSnapshot { target, .. } => *target,
+        }
+    }
+
+    fn transition_snapshot(&self) -> Option<TransitionSnapshotPermit> {
+        match self {
+            Self::Standard { .. } => None,
+            Self::TransitionSnapshot { permit, .. } => Some(permit.as_ref().clone()),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SubscriptionCoordinator {
     inner: Arc<CoordinatorInner>,
@@ -162,6 +189,42 @@ impl SubscriptionCoordinator {
         request: BarrierRequest,
         emit_subscription_receipt: bool,
     ) -> Result<PreparedSubscription, SubscriptionPumpError> {
+        self.prepare_inner(
+            connection_id,
+            message_id,
+            SubscriptionBarrierPreparation::Standard { target, request },
+            emit_subscription_receipt,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_transition_snapshot(
+        &self,
+        connection_id: ConnectionId,
+        message_id: MessageId,
+        target: RuntimeStreamTarget,
+        permit: TransitionSnapshotPermit,
+    ) -> Result<PreparedSubscription, SubscriptionPumpError> {
+        self.prepare_inner(
+            connection_id,
+            message_id,
+            SubscriptionBarrierPreparation::TransitionSnapshot {
+                target,
+                permit: Box::new(permit),
+            },
+            true,
+        )
+        .await
+    }
+
+    async fn prepare_inner(
+        &self,
+        connection_id: ConnectionId,
+        message_id: MessageId,
+        preparation: SubscriptionBarrierPreparation,
+        emit_subscription_receipt: bool,
+    ) -> Result<PreparedSubscription, SubscriptionPumpError> {
+        let target = preparation.target();
         // 快速拒绝明显不存在的连接，避免为伪造 ID 创建 coordination slot；随后
         // 仍在 connection 的 coordination gate 内重查并取得同一 pending semaphore。
         let _ = self.inner.connections.principal(connection_id)?;
@@ -178,15 +241,25 @@ impl SubscriptionCoordinator {
         let generation = self.inner.registry.allocate_generation()?;
         let watch_generation = WatchGeneration::new(generation.watch_generation())
             .ok_or(SubscriptionPumpError::InvalidGeneration)?;
-        let registration = self
-            .inner
-            .store
-            .register_stream_barrier(RegisterStreamBarrier {
-                target,
-                generation: watch_generation,
-                request,
-            })
-            .await?;
+        let transition_snapshot = preparation.transition_snapshot();
+        let registration = match preparation {
+            SubscriptionBarrierPreparation::Standard { target, request } => {
+                self.inner
+                    .store
+                    .register_stream_barrier(RegisterStreamBarrier {
+                        target,
+                        generation: watch_generation,
+                        request,
+                    })
+                    .await?
+            }
+            SubscriptionBarrierPreparation::TransitionSnapshot { permit, .. } => {
+                self.inner
+                    .store
+                    .register_transition_snapshot_barrier(*permit, watch_generation)
+                    .await?
+            }
+        };
         let needs_snapshot = matches!(registration.decision, BarrierDecision::Snapshot { .. });
         let now_ms = epoch_ms()?;
         let coordination_guard = coordination_gate.lock().await;
@@ -215,6 +288,7 @@ impl SubscriptionCoordinator {
             control: TransferEgressControl::new(deadline),
             gate: gate.clone(),
             emit_subscription_receipt,
+            transition_snapshot,
             principal,
             coordination_gate,
             pending_permit,
@@ -756,6 +830,7 @@ pub(crate) struct PreparedSubscription {
     control: TransferEgressControl,
     gate: Arc<AsyncMutex<()>>,
     emit_subscription_receipt: bool,
+    transition_snapshot: Option<TransitionSnapshotPermit>,
     principal: super::super::connection::AuthenticatedPrincipal,
     coordination_gate: Arc<AsyncMutex<()>>,
     pending_permit: PendingSubscriptionPermit,
@@ -821,6 +896,7 @@ impl PreparedSubscription {
                 principal: self.principal,
                 flushed_business_frame: false,
                 emit_subscription_receipt: self.emit_subscription_receipt,
+                transition_snapshot: self.transition_snapshot,
                 pending_permit: Some(self.pending_permit),
             })
             .await;

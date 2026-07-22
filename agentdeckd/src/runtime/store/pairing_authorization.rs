@@ -8,6 +8,7 @@ use agentdeck_protocol::e2ee::{
 };
 use agentdeck_protocol::relay_v2::{
     DeviceRevocation, DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayGrant,
+    TrustEpoch,
 };
 use agentdeck_protocol::runtime::identity::{DeviceHandle, GrantSerial as RuntimeGrantSerial};
 use rusqlite::Connection;
@@ -41,9 +42,11 @@ struct RemoteIngressMaterial {
     database_id: [u8; 16],
     machine_trust_domain: [u8; 32],
     machine_route: MachineRouteId,
+    trust_epoch: TrustEpoch,
     device_route: DeviceRouteId,
     grant_serial: GrantSerial,
     device_sign_fingerprint: [u8; 32],
+    device_hpke_public_key: [u8; 32],
     device_verifying_key: VerifyingKey,
     authorization_hash: [u8; 32],
     key_directory_revision: KeyDirectoryRevision,
@@ -71,6 +74,10 @@ impl ActiveRemoteIngressProof {
         self.material.machine_route
     }
 
+    pub(crate) fn trust_epoch(&self) -> TrustEpoch {
+        self.material.trust_epoch
+    }
+
     pub(crate) fn device_route(&self) -> DeviceRouteId {
         self.material.device_route
     }
@@ -81,6 +88,10 @@ impl ActiveRemoteIngressProof {
 
     pub(crate) fn device_sign_fingerprint(&self) -> [u8; 32] {
         self.material.device_sign_fingerprint
+    }
+
+    pub(crate) fn device_hpke_public_key(&self) -> [u8; 32] {
+        self.material.device_hpke_public_key
     }
 
     pub(crate) fn authorization_hash(&self) -> [u8; 32] {
@@ -174,9 +185,12 @@ pub(crate) struct CurrentRemoteAuthorizationProof {
 pub(crate) struct RemoteReplyAuthorization {
     machine_trust_domain: [u8; 32],
     machine_route: MachineRouteId,
+    trust_epoch: TrustEpoch,
     device_route: DeviceRouteId,
     grant_serial: GrantSerial,
+    device_sign_fingerprint: [u8; 32],
     authorization_hash: [u8; 32],
+    device_hpke_public_key: [u8; 32],
     key_directory_revision: KeyDirectoryRevision,
     reply_key_epoch: u64,
 }
@@ -191,6 +205,10 @@ impl RemoteReplyAuthorization {
         self.machine_route
     }
 
+    pub(crate) const fn trust_epoch(&self) -> TrustEpoch {
+        self.trust_epoch
+    }
+
     pub(crate) const fn device_route(&self) -> DeviceRouteId {
         self.device_route
     }
@@ -199,8 +217,16 @@ impl RemoteReplyAuthorization {
         self.grant_serial
     }
 
+    pub(crate) const fn device_sign_fingerprint(&self) -> [u8; 32] {
+        self.device_sign_fingerprint
+    }
+
     pub(crate) const fn authorization_hash(&self) -> [u8; 32] {
         self.authorization_hash
+    }
+
+    pub(crate) const fn device_hpke_public_key(&self) -> [u8; 32] {
+        self.device_hpke_public_key
     }
 
     pub(crate) const fn key_directory_revision(&self) -> KeyDirectoryRevision {
@@ -209,6 +235,22 @@ impl RemoteReplyAuthorization {
 
     pub(crate) const fn reply_key_epoch(&self) -> u64 {
         self.reply_key_epoch
+    }
+
+    /// 只允许同一个 durable authorization lineage 把 egress revision 单调刷新到
+    /// 当前值。revoke/regrant、trust reset、设备密钥或 reply-key rotation 都不能
+    /// 借这个谓词跨越。
+    pub(crate) fn is_same_lineage_at_or_after(&self, frozen: &Self) -> bool {
+        self.machine_trust_domain == frozen.machine_trust_domain
+            && self.machine_route == frozen.machine_route
+            && self.trust_epoch == frozen.trust_epoch
+            && self.device_route == frozen.device_route
+            && self.grant_serial == frozen.grant_serial
+            && self.device_sign_fingerprint == frozen.device_sign_fingerprint
+            && self.authorization_hash == frozen.authorization_hash
+            && self.device_hpke_public_key == frozen.device_hpke_public_key
+            && self.reply_key_epoch == frozen.reply_key_epoch
+            && self.key_directory_revision.value() >= frozen.key_directory_revision.value()
     }
 
     #[cfg(test)]
@@ -220,9 +262,12 @@ impl RemoteReplyAuthorization {
         Self {
             machine_trust_domain: [marker; 32],
             machine_route,
+            trust_epoch: TrustEpoch::new(u64::from(marker).max(1)),
             device_route,
             grant_serial: GrantSerial::new(u64::from(marker).max(1)),
+            device_sign_fingerprint: [marker; 32],
             authorization_hash: [marker; 32],
+            device_hpke_public_key: [marker; 32],
             key_directory_revision: KeyDirectoryRevision::new(u64::from(marker).max(1)),
             reply_key_epoch: u64::from(marker).max(1),
         }
@@ -272,14 +317,23 @@ impl CurrentRemoteAuthorizationProof {
     }
 
     pub(crate) fn remote_reply_authorization(&self) -> RemoteReplyAuthorization {
+        self.active.remote_reply_authorization()
+    }
+}
+
+impl ActiveRemoteIngressProof {
+    pub(crate) fn remote_reply_authorization(&self) -> RemoteReplyAuthorization {
         RemoteReplyAuthorization {
-            machine_trust_domain: self.active.machine_trust_domain(),
-            machine_route: self.active.machine_route(),
-            device_route: self.active.device_route(),
-            grant_serial: self.active.grant_serial(),
-            authorization_hash: self.active.authorization_hash(),
-            key_directory_revision: self.active.key_directory_revision(),
-            reply_key_epoch: self.active.material.reply_key_epoch,
+            machine_trust_domain: self.machine_trust_domain(),
+            machine_route: self.machine_route(),
+            trust_epoch: self.trust_epoch(),
+            device_route: self.device_route(),
+            grant_serial: self.grant_serial(),
+            device_sign_fingerprint: self.device_sign_fingerprint(),
+            authorization_hash: self.authorization_hash(),
+            device_hpke_public_key: self.device_hpke_public_key(),
+            key_directory_revision: self.key_directory_revision(),
+            reply_key_epoch: self.material.reply_key_epoch,
         }
     }
 }
@@ -464,116 +518,6 @@ pub(super) fn authorization_token(
             &state_changed_at_ms.to_be_bytes(),
         ],
     )
-}
-
-/// 仅供组合测试模拟“KeyUpdate 已被端点确认”后的最小 Store 状态。
-///
-/// P4.4 需要证明同一 MachineLink 上多个当前设备不会串路由，但第二台设备加入后，
-/// 第一台设备在 P4.5 真正实现 KeyUpdate 之前应继续被 lower-revision 门禁隔离。
-/// 这个 helper 只在测试构建中存在，只更新已认证 Active authorization 的 revision 与
-/// 对应 metadata token；production loader 和 mutation API 均不放宽。
-#[cfg(test)]
-pub(super) fn align_active_authorization_revision_for_test(
-    connection: &mut Connection,
-    key_bundle: &RuntimeKeyBundle,
-    database_id: [u8; 16],
-    device_route: DeviceRouteId,
-) -> Result<KeyDirectoryRevision, RuntimeStoreError> {
-    let transaction =
-        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let directory = super::pairing::load_directory(&transaction, key_bundle, database_id)?;
-    let global_revision = directory
-        .grants
-        .global
-        .as_ref()
-        .ok_or(RuntimeStoreError::PairingConflict)?
-        .revision;
-    let authorization = directory
-        .grants
-        .authorizations
-        .iter()
-        .find(|authorization| {
-            authorization.device_route == device_route
-                && authorization.lifecycle == AuthorizationLifecycle::Active
-        })
-        .ok_or(RuntimeStoreError::PairingConflict)?;
-    if authorization.key_directory_revision == global_revision {
-        transaction.commit()?;
-        return Ok(KeyDirectoryRevision::new(global_revision));
-    }
-    if authorization.key_directory_revision == 0
-        || authorization.key_directory_revision > global_revision
-        || authorization.revocation_hash.is_some()
-        || authorization.sealed_revocation_bytes.is_some()
-    {
-        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-    }
-
-    let grant_serial = authorization.grant_serial;
-    let old_revision = authorization.key_directory_revision;
-    let fingerprint = authorization.device_sign_fingerprint;
-    let grant_hash = authorization.grant_hash;
-    let authorization_hash = authorization.authorization_hash;
-    let created_at_ms = authorization.created_at_ms;
-    let state_changed_at_ms = authorization.state_changed_at_ms;
-    let sealed_bytes = authorization.sealed_bytes;
-    let old_metadata_token = authorization.metadata_token;
-    drop(directory);
-
-    let encoded_grant_serial = super::sequence::encode_sequence(grant_serial.value());
-    let sealed_authorization: Vec<u8> = transaction.query_row(
-        "SELECT sealed_authorization FROM remote_authorization_ledger
-         WHERE device_route = ?1 AND grant_serial = ?2 AND lifecycle = 'active'",
-        rusqlite::params![device_route.as_bytes().as_slice(), encoded_grant_serial],
-        |row| row.get(0),
-    )?;
-    if u64::try_from(sealed_authorization.len()).unwrap_or(u64::MAX) != sealed_bytes {
-        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-    }
-    let metadata_token = authorization_token(
-        key_bundle,
-        database_id,
-        device_route,
-        grant_serial,
-        AuthorizationLifecycle::Active,
-        fingerprint,
-        grant_hash,
-        authorization_hash,
-        global_revision,
-        &sealed_authorization,
-        created_at_ms,
-        state_changed_at_ms,
-    )?;
-    let changed = transaction.execute(
-        "UPDATE remote_authorization_ledger
-         SET key_directory_revision = ?1, metadata_token = ?2
-         WHERE device_route = ?3 AND grant_serial = ?4 AND lifecycle = 'active'
-           AND key_directory_revision = ?5 AND metadata_token = ?6",
-        rusqlite::params![
-            super::sequence::encode_sequence(global_revision),
-            metadata_token.as_slice(),
-            device_route.as_bytes().as_slice(),
-            super::sequence::encode_sequence(grant_serial.value()),
-            super::sequence::encode_sequence(old_revision),
-            old_metadata_token.as_slice(),
-        ],
-    )?;
-    if changed != 1 {
-        return Err(RuntimeStoreError::PairingConflict);
-    }
-    let aligned = super::pairing::load_directory(&transaction, key_bundle, database_id)?;
-    if aligned.grants.global.as_ref().map(|global| global.revision) != Some(global_revision)
-        || !aligned.grants.authorizations.iter().any(|authorization| {
-            authorization.device_route == device_route
-                && authorization.lifecycle == AuthorizationLifecycle::Active
-                && authorization.key_directory_revision == global_revision
-                && authorization.metadata_token == metadata_token
-        })
-    {
-        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-    }
-    transaction.commit()?;
-    Ok(KeyDirectoryRevision::new(global_revision))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -942,7 +886,7 @@ fn build_active_remote_ingress(
         .state
         .devices
         .iter()
-        .find(|keys| keys.device_route == device_route)
+        .find(|keys| keys.device_route == device_route && keys.is_active())
         .ok_or(RuntimeStoreError::PairingConflict)?;
     if authorization.key_directory_revision != global.revision
         || global.revision == 0
@@ -954,6 +898,8 @@ fn build_active_remote_ingress(
     let command_key_bytes: [u8; 32] = device_keys
         .command
         .key
+        .as_ref()
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
         .expose_secret()
         .try_into()
         .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
@@ -964,9 +910,11 @@ fn build_active_remote_ingress(
         database_id,
         machine_trust_domain,
         machine_route,
+        trust_epoch: authorization.grant.trust_epoch,
         device_route,
         grant_serial: authorization.grant_serial,
         device_sign_fingerprint: authorization.device_sign_fingerprint,
+        device_hpke_public_key: authorization.authorization.device_hpke_pubkey.0,
         device_verifying_key,
         authorization_hash: authorization.authorization_hash,
         key_directory_revision: KeyDirectoryRevision::new(global.revision),
@@ -987,6 +935,64 @@ fn build_active_remote_ingress(
     Ok(ActiveRemoteIngressProof {
         material: Arc::new(material),
     })
+}
+
+pub(super) fn remote_reply_authorization_from_authenticated(
+    database_id: [u8; 16],
+    machine_trust_domain: [u8; 32],
+    active_machine: &crate::runtime::model::ActiveMachineEnrollmentState,
+    authorization: &AuthenticatedAuthorization,
+    global: &super::pairing_grant::AuthenticatedGlobalKeyState,
+) -> Result<RemoteReplyAuthorization, RuntimeStoreError> {
+    if authorization.lifecycle != AuthorizationLifecycle::Active {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    let machine_route = MachineRouteId::from_bytes(active_machine.record.machine_route);
+    if authorization.grant.machine_route != machine_route
+        || authorization.grant.trust_epoch.value() != active_machine.record.trust_epoch
+    {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    build_active_remote_ingress(
+        database_id,
+        machine_trust_domain,
+        machine_route,
+        authorization.device_route,
+        authorization,
+        global,
+    )
+    .map(|proof| proof.remote_reply_authorization())
+}
+
+pub(super) fn active_remote_reply_authorizations_from_directory(
+    database_id: [u8; 16],
+    machine_trust_domain: [u8; 32],
+    active_machine: &crate::runtime::model::ActiveMachineEnrollmentState,
+    directory: &super::pairing::PairingDirectory,
+) -> Result<Vec<RemoteReplyAuthorization>, RuntimeStoreError> {
+    let active_rows = directory
+        .grants
+        .authorizations
+        .iter()
+        .filter(|authorization| authorization.lifecycle == AuthorizationLifecycle::Active);
+    let Some(global) = directory.grants.global.as_ref() else {
+        return if active_rows.count() == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(RuntimeStoreError::UnknownOrCorruptSchema)
+        };
+    };
+    active_rows
+        .map(|authorization| {
+            remote_reply_authorization_from_authenticated(
+                database_id,
+                machine_trust_domain,
+                active_machine,
+                authorization,
+                global,
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn recheck_active_remote_ingress(
@@ -1014,9 +1020,11 @@ pub(crate) fn recheck_active_remote_ingress(
     if expected.database_id != observed.database_id
         || expected.machine_trust_domain != observed.machine_trust_domain
         || expected.machine_route != observed.machine_route
+        || expected.trust_epoch != observed.trust_epoch
         || expected.device_route != observed.device_route
         || expected.grant_serial != observed.grant_serial
         || expected.device_sign_fingerprint != observed.device_sign_fingerprint
+        || expected.device_hpke_public_key != observed.device_hpke_public_key
         || expected.device_verifying_key != observed.device_verifying_key
         || expected.authorization_hash != observed.authorization_hash
         || expected.key_directory_revision != observed.key_directory_revision
@@ -1071,6 +1079,8 @@ pub(crate) fn classify_remote_command_authorization(
             let exact_key = global.revision == binding.key_directory_revision().value()
                 && global.state.devices.iter().any(|device| {
                     device.device_route == binding.device_route()
+                        && device.is_active()
+                        && device.command.key.is_some()
                         && device.command.epoch == binding.command_key_epoch()
                 });
             Ok(if exact_key {

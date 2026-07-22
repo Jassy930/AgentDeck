@@ -1724,6 +1724,21 @@ impl SnapshotBuildInput {
             cleanup,
         ))
     }
+
+    /// Active key transition 的 exact H 只读组装。它认证与 durable Build 相同的
+    /// binding，但故意不移动 pin，也不产生 write capability；调用方必须在 wire flush
+    /// 后通过 `release_build_input` 回收 TEMP pin。
+    pub(crate) fn bind_assembled_transition_read(
+        &self,
+        assembled: AssembledConversationSnapshot,
+    ) -> Result<(ConversationSnapshot, Vec<u8>), SnapshotMaterializationError> {
+        if assembled.binding != self.binding()? {
+            return Err(SnapshotMaterializationError::SchemaIncompatible);
+        }
+        let snapshot = serde_json::from_slice(&assembled.canonical_payload)
+            .map_err(|_| SnapshotMaterializationError::SchemaIncompatible)?;
+        Ok((snapshot, assembled.canonical_payload))
+    }
 }
 
 /// NativeProjected conversation 的线性 dynamic handoff。它持有与 barrier H 绑定的
@@ -1908,6 +1923,7 @@ pub(crate) fn assemble_dynamic_snapshot(
 pub enum SnapshotMaterialization {
     Ready(MaterializedConversationSnapshot),
     Build(SnapshotBuildInput),
+    TransitionBuild(SnapshotBuildInput),
     Dynamic(DynamicSnapshotInput),
 }
 
@@ -1936,10 +1952,21 @@ impl SnapshotMaterializer {
             (SnapshotBarrierSource::Build(pin), Some(cleanup)) => {
                 self.prepare_build(pin, cleanup).await
             }
+            (SnapshotBarrierSource::TransitionBuild(pin), Some(cleanup)) => {
+                match self.prepare_build(pin, cleanup).await? {
+                    SnapshotMaterialization::Build(input) => {
+                        Ok(SnapshotMaterialization::TransitionBuild(input))
+                    }
+                    _ => Err(SnapshotMaterializationError::InvalidState),
+                }
+            }
             (SnapshotBarrierSource::Dynamic(pin), Some(cleanup)) => {
                 self.prepare_dynamic(pin, cleanup).await
             }
             (SnapshotBarrierSource::Build(pin), None) => Err(self
+                .release_pin_after_error(pin, None, SnapshotMaterializationError::InvalidState)
+                .await),
+            (SnapshotBarrierSource::TransitionBuild(pin), None) => Err(self
                 .release_pin_after_error(pin, None, SnapshotMaterializationError::InvalidState)
                 .await),
             (SnapshotBarrierSource::Dynamic(pin), None) => Err(self

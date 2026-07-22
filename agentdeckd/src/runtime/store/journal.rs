@@ -928,8 +928,23 @@ pub(crate) fn create_conversation(
         if existing.adapter_state_key == input.adapter_state_key
             && existing.descriptor == input.descriptor
         {
+            let mapping = super::publication::load_conversation_publication_mapping(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+                input.conversation_id,
+            )?;
+            let conversation_activation_pending =
+                super::conversation_activation::replay_activation_pending(
+                    &state.connection,
+                    &state.key_bundle,
+                    state.database_id,
+                    input.conversation_id,
+                    &mapping,
+                )?;
             return Ok(CreateConversationOutcome::Replayed {
                 conversation: existing,
+                conversation_activation_pending,
             });
         }
         return Err(RuntimeStoreError::ConversationConflict);
@@ -957,8 +972,27 @@ pub(crate) fn create_conversation(
             observed_ms: created_at_ms,
         });
     }
-    let projected_write_bytes =
-        projected_write_bytes(&[descriptor_bytes.len(), descriptor_bytes.len(), 4 * 1024])?;
+    let remote_activation_projection = super::pairing_grant::load_global_key_state(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+    )?
+    .map(|global| {
+        usize::try_from(global.sealed_bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(64 * 1024))
+            .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+                field: "conversation_remote_activation_projection",
+            })
+    })
+    .transpose()?
+    .unwrap_or(0);
+    let projected_write_bytes = projected_write_bytes(&[
+        descriptor_bytes.len(),
+        descriptor_bytes.len(),
+        4 * 1024,
+        remote_activation_projection,
+    ])?;
     sqlite::admit_ordinary_write(
         &state.connection,
         &state.key_bundle,
@@ -976,6 +1010,14 @@ pub(crate) fn create_conversation(
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let ledger = sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
     validate_managed_conversation_capacity(&ledger, config)?;
+    // 若 ADGK2 已存在，必须在 conversation/catalog/publication 第一笔 DML 前占住
+    // 唯一 transition slot；后续所有 activation 轴与 conversation row 同事务提交。
+    let activation = super::conversation_activation::ConversationActivationPreflight::load(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+    )?;
     if load_optional_conversation(&transaction, key_bundle, database_id, input.conversation_id)?
         .is_some()
     {
@@ -1024,6 +1066,25 @@ pub(crate) fn create_conversation(
         .conversation_count
         .checked_add(1)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let publication = super::publication::stage_conversation_publication_in_transaction(
+        &transaction,
+        config,
+        key_bundle,
+        &mut next_ledger,
+        conversation.conversation_id,
+        created_at_ms,
+    )?;
+    let conversation_activation_pending = activation.stage(
+        &transaction,
+        key_bundle,
+        database_id,
+        &mut next_ledger,
+        super::conversation_activation::ConversationActivationStage::new(
+            conversation.conversation_id,
+            &publication,
+            created_at_ms,
+        ),
+    )?;
     let pending_targets = sqlite::update_runtime_ledger(
         &transaction,
         key_bundle,
@@ -1046,7 +1107,10 @@ pub(crate) fn create_conversation(
         RuntimeStoreOperation::CreateConversationAfterCommit,
         RuntimeCommitOperation::CreateConversation,
     )?;
-    Ok(CreateConversationOutcome::Created { conversation })
+    Ok(CreateConversationOutcome::Created {
+        conversation,
+        conversation_activation_pending,
+    })
 }
 
 /// managed create 的 capacity 只消耗 authenticated live 槽位；v6 为 native
@@ -6540,7 +6604,7 @@ pub(crate) fn validate_store_integrity(
                 &ledger,
             )
         }
-        super::schema::RUNTIME_SCHEMA_VERSION => {
+        super::schema::RUNTIME_SCHEMA_VERSION_V10 => {
             super::machine_identity::validate_v8_integrity(
                 connection,
                 key_bundle,
@@ -6554,6 +6618,76 @@ pub(crate) fn validate_store_integrity(
                 &ledger,
             )?;
             super::pairing::validate_v10_integrity(connection, key_bundle, database_id, &ledger)?;
+            super::admin::validate_v7_integrity(connection, key_bundle, database_id, &ledger)?;
+            super::native_projection::validate_v6_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )
+        }
+        super::schema::RUNTIME_SCHEMA_VERSION_V11 => {
+            super::machine_identity::validate_v8_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )?;
+            super::machine_remote::validate_v9_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )?;
+            super::pairing::validate_v10_integrity(connection, key_bundle, database_id, &ledger)?;
+            super::remote_replay::validate_v11_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )?;
+            super::admin::validate_v7_integrity(connection, key_bundle, database_id, &ledger)?;
+            super::native_projection::validate_v6_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )
+        }
+        super::schema::RUNTIME_SCHEMA_VERSION_V12
+        | super::schema::RUNTIME_SCHEMA_VERSION_V13
+        | super::schema::RUNTIME_SCHEMA_VERSION => {
+            super::machine_identity::validate_v8_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )?;
+            super::machine_remote::validate_v9_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )?;
+            super::pairing::validate_v10_integrity(connection, key_bundle, database_id, &ledger)?;
+            super::remote_replay::validate_v11_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )?;
+            super::key_transition::validate_v12_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )?;
+            super::remote_counter_guard_manifest::validate_v12_integrity(
+                connection,
+                key_bundle,
+                database_id,
+                &ledger,
+            )?;
             super::admin::validate_v7_integrity(connection, key_bundle, database_id, &ledger)?;
             super::native_projection::validate_v6_integrity(
                 connection,
@@ -8105,7 +8239,7 @@ mod tests {
         match create_conversation(state, config, input, descriptor_bytes, &mut effects)
             .expect("create managed fixture")
         {
-            CreateConversationOutcome::Created { conversation } => conversation,
+            CreateConversationOutcome::Created { conversation, .. } => conversation,
             CreateConversationOutcome::Replayed { .. } => panic!("fresh fixture replayed"),
         }
     }

@@ -1,9 +1,9 @@
 //! G1 confirm CAS transaction、exact replay 与 grantPreparing recovery projection。
 
 use agentdeck_crypto::sha256;
-use agentdeck_protocol::relay_v2::{DeviceRouteId, GrantSerial};
+use agentdeck_protocol::relay_v2::{DeviceRouteId, GrantSerial, StreamRouteId};
 use agentdeck_protocol::runtime::{PairingReceipt, PairingState};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 use crate::runtime::model::{
     RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
@@ -35,6 +35,45 @@ const OUTBOX_COLUMN: &[u8] = b"sealed_frame";
 const MAX_GLOBAL_KEY_STATE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AUTHORIZATIONS: u64 = 256;
 const MAX_AUTHORIZATION_SEALED_BYTES: u64 = 64 * 1024 * 1024;
+
+fn observed_active_conversation_stream_routes(
+    connection: &Connection,
+) -> Result<Vec<StreamRouteId>, RuntimeStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT stream_route FROM publication_streams
+         WHERE scope = 'conversation' AND state = 'active'
+         ORDER BY stream_route",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut routes = Vec::new();
+    for row in rows {
+        let bytes: [u8; 16] = row?
+            .try_into()
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if bytes == [0; 16] {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        routes.push(StreamRouteId::from_bytes(bytes));
+    }
+    if routes.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(routes)
+}
+
+pub(super) fn authenticated_active_conversation_stream_routes(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    ledger: &RuntimeLedger,
+) -> Result<Vec<StreamRouteId>, RuntimeStoreError> {
+    let _ = super::publication::authenticate_directory(
+        transaction,
+        key_bundle,
+        ledger,
+        super::publication::PublicationScope::Catalog,
+    )?;
+    observed_active_conversation_stream_routes(transaction)
+}
 
 #[derive(Debug)]
 pub(crate) struct GrantPreparingRecovery {
@@ -264,6 +303,68 @@ fn authorization_primary_key(device_route: DeviceRouteId, serial: GrantSerial) -
     value
 }
 
+fn grant_transition_plan(
+    grants: &super::pairing_grant::AuthenticatedGrantDirectory,
+    allocation: super::pairing_grant_allocation::ValidatedGrantAllocation,
+    target_device_route: DeviceRouteId,
+    target_grant_serial: GrantSerial,
+) -> Result<
+    (
+        super::key_transition::KeyTransitionOperation,
+        Vec<super::key_transition::KeyTransitionRecipient>,
+    ),
+    RuntimeStoreError,
+> {
+    let (operation, superseded) = match allocation {
+        super::pairing_grant_allocation::ValidatedGrantAllocation::New => {
+            (super::key_transition::KeyTransitionOperation::Add, None)
+        }
+        super::pairing_grant_allocation::ValidatedGrantAllocation::Renew {
+            device_route,
+            previous_serial,
+            next_serial,
+        } => {
+            if device_route != target_device_route || next_serial != target_grant_serial {
+                return Err(RuntimeStoreError::PairingConflict);
+            }
+            (
+                super::key_transition::KeyTransitionOperation::Renew,
+                Some((device_route, previous_serial)),
+            )
+        }
+    };
+    let mut removed_superseded = 0_usize;
+    let mut recipients = Vec::new();
+    for authorization in grants
+        .authorizations
+        .iter()
+        .filter(|authorization| authorization.lifecycle == AuthorizationLifecycle::Active)
+    {
+        if superseded.is_some_and(|(device_route, grant_serial)| {
+            authorization.device_route == device_route && authorization.grant_serial == grant_serial
+        }) {
+            removed_superseded += 1;
+            continue;
+        }
+        recipients.push(super::key_transition::KeyTransitionRecipient {
+            device_route: *authorization.device_route.as_bytes(),
+            grant_serial: authorization.grant_serial.value(),
+        });
+    }
+    if superseded.is_some() && removed_superseded != 1 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    recipients.push(super::key_transition::KeyTransitionRecipient {
+        device_route: *target_device_route.as_bytes(),
+        grant_serial: target_grant_serial.value(),
+    });
+    recipients.sort_unstable();
+    if recipients.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    Ok((operation, recipients))
+}
+
 fn supersede_previous_authorization(
     transaction: &rusqlite::Transaction<'_>,
     key_bundle: &RuntimeKeyBundle,
@@ -330,6 +431,77 @@ fn supersede_previous_authorization(
     )? != 1
     {
         return Err(RuntimeStoreError::PairingConflict);
+    }
+    Ok(())
+}
+
+fn align_existing_active_authorizations(
+    transaction: &rusqlite::Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    grants: &super::pairing_grant::AuthenticatedGrantDirectory,
+    excluded: Option<(DeviceRouteId, GrantSerial)>,
+    next_revision: u64,
+) -> Result<(), RuntimeStoreError> {
+    for authorization in grants.authorizations.iter().filter(|authorization| {
+        authorization.lifecycle == AuthorizationLifecycle::Active
+            && !excluded.is_some_and(|(device_route, grant_serial)| {
+                authorization.device_route == device_route
+                    && authorization.grant_serial == grant_serial
+            })
+    }) {
+        if authorization.key_directory_revision == 0
+            || authorization.key_directory_revision >= next_revision
+            || authorization.revocation_hash.is_some()
+            || authorization.sealed_revocation_bytes.is_some()
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let sealed_authorization: Vec<u8> = transaction.query_row(
+            "SELECT sealed_authorization FROM remote_authorization_ledger
+             WHERE device_route = ?1 AND grant_serial = ?2 AND lifecycle = 'active'",
+            params![
+                authorization.device_route.as_bytes().as_slice(),
+                super::sequence::encode_sequence(authorization.grant_serial.value()),
+            ],
+            |row| row.get(0),
+        )?;
+        if u64::try_from(sealed_authorization.len()).unwrap_or(u64::MAX)
+            != authorization.sealed_bytes
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let metadata_token = authorization_token(
+            key_bundle,
+            database_id,
+            authorization.device_route,
+            authorization.grant_serial,
+            AuthorizationLifecycle::Active,
+            authorization.device_sign_fingerprint,
+            authorization.grant_hash,
+            authorization.authorization_hash,
+            next_revision,
+            &sealed_authorization,
+            authorization.created_at_ms,
+            authorization.state_changed_at_ms,
+        )?;
+        if transaction.execute(
+            "UPDATE remote_authorization_ledger
+             SET key_directory_revision = ?1, metadata_token = ?2
+             WHERE device_route = ?3 AND grant_serial = ?4 AND lifecycle = 'active'
+               AND key_directory_revision = ?5 AND metadata_token = ?6",
+            params![
+                super::sequence::encode_sequence(next_revision),
+                &metadata_token[..],
+                authorization.device_route.as_bytes().as_slice(),
+                super::sequence::encode_sequence(authorization.grant_serial.value()),
+                super::sequence::encode_sequence(authorization.key_directory_revision),
+                &authorization.metadata_token[..],
+            ],
+        )? != 1
+        {
+            return Err(RuntimeStoreError::PairingConflict);
+        }
     }
     Ok(())
 }
@@ -526,12 +698,15 @@ pub(crate) fn confirm_pairing_grant(
     }
     let active =
         super::pairing::active_machine(&state.connection, &state.key_bundle, state.database_id)?;
+    let active_stream_routes = observed_active_conversation_stream_routes(&state.connection)?;
     let _ = validate_prepared(
         current,
         &directory.pairings,
         &prepared,
         &directory.grants,
         &active,
+        &active_stream_routes,
+        now_ms,
     )?;
     super::sqlite::admit_safety_write(
         &state.connection,
@@ -564,13 +739,36 @@ pub(crate) fn confirm_pairing_grant(
     }
     let active =
         super::pairing::active_machine(&transaction, &state.key_bundle, state.database_id)?;
+    let active_stream_routes = authenticated_active_conversation_stream_routes(
+        &transaction,
+        &state.key_bundle,
+        &directory.ledger,
+    )?;
     let validated = validate_prepared(
         &current,
         &directory.pairings,
         &prepared,
         &directory.grants,
         &active,
+        &active_stream_routes,
+        now_ms,
     )?;
+    let (transition_operation, transition_recipients) = grant_transition_plan(
+        &directory.grants,
+        validated.allocation,
+        validated.grant.device_route,
+        validated.grant.grant_serial,
+    )?;
+    let transition_from_revision = directory
+        .grants
+        .global
+        .as_ref()
+        .map_or(0, |global| global.revision);
+    if transition_operation == super::key_transition::KeyTransitionOperation::Renew
+        && transition_from_revision == 0
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
     let receipt_write = super::pairing_terminal::prepare_confirmed_receipt(
         &state.key_bundle,
         state.database_id,
@@ -688,7 +886,7 @@ pub(crate) fn confirm_pairing_grant(
         now_ms,
         now_ms,
     )?;
-    let next = next_ledger(
+    let mut next = next_ledger(
         &directory.ledger,
         current.sealed_state_bytes,
         sealed_pairing.len(),
@@ -704,6 +902,79 @@ pub(crate) fn confirm_pairing_grant(
         sealed_install.len(),
         validated.allocation.is_renewal(),
     )?;
+    let replay_retirement = match validated.allocation {
+        super::pairing_grant_allocation::ValidatedGrantAllocation::New => None,
+        super::pairing_grant_allocation::ValidatedGrantAllocation::Renew {
+            device_route,
+            previous_serial,
+            ..
+        } => {
+            let old_device = directory
+                .grants
+                .global
+                .as_ref()
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+                .state
+                .devices
+                .iter()
+                .find(|device| device.device_route == device_route)
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+            let scope = super::remote_replay::canonical_device_command_scope(
+                active.record.machine_route,
+                active.record.trust_epoch,
+                *device_route.as_bytes(),
+                previous_serial.value(),
+                old_device.command.epoch,
+            )?;
+            Some(
+                super::key_transition::ReplayRetirement::pending_device_command(
+                    scope,
+                    old_device.reply.epoch,
+                )?,
+            )
+        }
+    };
+
+    // 本 gate 在第一笔 DML 前执行；任何 global revision advance 都必须与唯一 durable
+    // transition 同事务建立，不能与另一笔 membership transition 交错。
+    super::key_transition::ensure_key_transition_slot_available(
+        &transaction,
+        &state.key_bundle,
+        state.database_id,
+        &directory.ledger,
+    )?;
+    if transition_operation == super::key_transition::KeyTransitionOperation::Add
+        && transition_from_revision == 0
+        && transition_recipients.len() == 1
+    {
+        super::publication::initialize_first_remote_member_baselines(
+            &transaction,
+            &state.key_bundle,
+            &directory.ledger,
+            now_ms,
+        )?;
+    }
+    let _ = super::key_transition::stage_key_transition_in_transaction(
+        &transaction,
+        &state.key_bundle,
+        state.database_id,
+        &mut next,
+        super::key_transition::BeginKeyTransition {
+            operation_id: *outbox_id.as_bytes(),
+            operation: transition_operation,
+            target: super::key_transition::KeyTransitionTarget::Device(
+                super::key_transition::KeyTransitionRecipient {
+                    device_route: *validated.grant.device_route.as_bytes(),
+                    grant_serial: validated.grant.grant_serial.value(),
+                },
+            ),
+            from_revision: transition_from_revision,
+            to_revision: validated.global.revision().value(),
+            recipients: transition_recipients,
+            replay_retirement,
+            created_at_ms: now_ms,
+        },
+    )?;
 
     supersede_previous_authorization(
         &transaction,
@@ -713,6 +984,24 @@ pub(crate) fn confirm_pairing_grant(
         validated.allocation,
         now_ms,
     )?;
+    if directory.grants.global.is_some() {
+        let excluded = match validated.allocation {
+            super::pairing_grant_allocation::ValidatedGrantAllocation::New => None,
+            super::pairing_grant_allocation::ValidatedGrantAllocation::Renew {
+                device_route,
+                previous_serial,
+                ..
+            } => Some((device_route, previous_serial)),
+        };
+        align_existing_active_authorizations(
+            &transaction,
+            &state.key_bundle,
+            state.database_id,
+            &directory.grants,
+            excluded,
+            validated.global.revision().value(),
+        )?;
+    }
     super::pairing_terminal::insert_confirmed_receipt(&transaction, &current, &receipt_write)?;
     if transaction.execute(
         "INSERT INTO remote_authorization_ledger (

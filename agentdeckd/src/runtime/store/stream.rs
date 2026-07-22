@@ -389,12 +389,12 @@ pub(super) fn migrate_v4_rows(
         // 都物化后才做 global trim，否则容量预检只投影 global cap 却可能
         // 短暂写入数百万个 index row。每个 conversation 完成后立即裁剪，
         // 中间态最多只比 global cap 多一个已有 per-conversation cap 的批次。
-        trim_global_event_window(transaction, key_bundle, false, 0)?;
+        trim_global_event_window(transaction, key_bundle, database_id, false, 0)?;
     }
     drop(conversation_statement);
 
     // 保留终态校验式 trim，便于未来调整批次时仍不依赖循环细节。
-    trim_global_event_window(transaction, key_bundle, false, 0)?;
+    trim_global_event_window(transaction, key_bundle, database_id, false, 0)?;
     let (event_stream_count, event_stream_bytes): (i64, i64) = transaction.query_row(
         "SELECT COUNT(*), COALESCE(SUM(logical_event_bytes), 0)
          FROM event_stream_index",
@@ -603,11 +603,14 @@ pub(super) fn reconcile_event_stream_with_trim_clock(
         trim_unrecorded_conversation_window(
             transaction,
             key_bundle,
+            database_id,
             &conversation_id,
-            true,
-            effective_trim_now_ms(conversation_trim_now_ms, trim_now_ms),
-            MAX_EVENT_STREAM_EVENTS_PER_CONVERSATION,
-            MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+            ConversationTrimPolicy {
+                respect_pins: true,
+                now_ms: effective_trim_now_ms(conversation_trim_now_ms, trim_now_ms),
+                max_events: MAX_EVENT_STREAM_EVENTS_PER_CONVERSATION,
+                max_bytes: MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+            },
         )?;
         refresh_retention(transaction, key_bundle, &conversation_id)?;
         global_trim_now_ms = global_trim_now_ms.max(conversation_trim_now_ms);
@@ -626,6 +629,7 @@ pub(super) fn reconcile_event_stream_with_trim_clock(
     trim_global_event_window(
         transaction,
         key_bundle,
+        database_id,
         true,
         effective_trim_now_ms(global_trim_now_ms, trim_now_ms),
     )?;
@@ -1071,14 +1075,20 @@ fn validate_pin_clock_lower_bound(
     Ok(())
 }
 
-fn trim_unrecorded_conversation_window(
-    transaction: &Transaction<'_>,
-    key_bundle: &RuntimeKeyBundle,
-    conversation_id: &[u8],
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConversationTrimPolicy {
     respect_pins: bool,
     now_ms: u64,
     max_events: u64,
     max_bytes: u64,
+}
+
+fn trim_unrecorded_conversation_window(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    conversation_id: &[u8],
+    policy: ConversationTrimPolicy,
 ) -> Result<(), RuntimeStoreError> {
     loop {
         let (count, bytes): (i64, i64) = transaction.query_row(
@@ -1089,7 +1099,7 @@ fn trim_unrecorded_conversation_window(
         )?;
         let count = u64::try_from(count).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
         let bytes = u64::try_from(bytes).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-        if count <= max_events && bytes <= max_bytes {
+        if count <= policy.max_events && bytes <= policy.max_bytes {
             return Ok(());
         }
         let oldest: String = transaction.query_row(
@@ -1098,13 +1108,14 @@ fn trim_unrecorded_conversation_window(
             [conversation_id],
             |row| row.get(0),
         )?;
-        if respect_pins {
+        if policy.respect_pins {
             super::retention::authorize_trim(
                 transaction,
                 key_bundle,
+                database_id,
                 super::retention::RetentionTarget::Conversation(conversation_id),
                 &oldest,
-                now_ms,
+                policy.now_ms,
             )?;
         }
         if transaction.execute(
@@ -1400,12 +1411,14 @@ pub(super) fn validate_v4_integrity(
 fn trim_global_event_window(
     transaction: &Transaction<'_>,
     key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
     respect_pins: bool,
     now_ms: u64,
 ) -> Result<(), RuntimeStoreError> {
     trim_global_event_window_with_limits(
         transaction,
         key_bundle,
+        database_id,
         respect_pins,
         now_ms,
         MAX_EVENT_STREAM_EVENTS_GLOBAL,
@@ -1416,6 +1429,7 @@ fn trim_global_event_window(
 fn trim_global_event_window_with_limits(
     transaction: &Transaction<'_>,
     key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
     respect_pins: bool,
     now_ms: u64,
     max_events: u64,
@@ -1467,6 +1481,7 @@ fn trim_global_event_window_with_limits(
             match super::retention::authorize_trim(
                 transaction,
                 key_bundle,
+                database_id,
                 super::retention::RetentionTarget::Conversation(&candidate.0),
                 &candidate.1,
                 now_ms,

@@ -29,6 +29,13 @@ fn stream(byte: u8) -> StreamRouteId {
     StreamRouteId::from_bytes([byte; 16])
 }
 
+fn ordered_stream(index: u16) -> StreamRouteId {
+    assert_ne!(index, 0);
+    let mut bytes = [0_u8; 16];
+    bytes[14..].copy_from_slice(&index.to_be_bytes());
+    StreamRouteId::from_bytes(bytes)
+}
+
 fn entry(
     purpose: KeyPurpose,
     epoch: u64,
@@ -63,6 +70,19 @@ fn directory_with_conversation() -> KeyDirectoryV1 {
         entry(KeyPurpose::ConversationDek, 1, Some(stream(0x33)), 0x71),
     );
     directory
+}
+
+fn initial_directory_with_conversations(count: u16) -> (KeyDirectoryV1, Vec<StreamRouteId>) {
+    let routes = (1..=count).map(ordered_stream).collect::<Vec<_>>();
+    let mut directory = bootstrap_directory();
+    directory.entries.splice(
+        1..1,
+        routes
+            .iter()
+            .copied()
+            .map(|route| entry(KeyPurpose::ConversationDek, 1, Some(route), 0x71)),
+    );
+    (directory, routes)
 }
 
 fn signature_context() -> KeyDirectorySignatureContextV1 {
@@ -166,6 +186,70 @@ fn bootstrap_requires_exactly_one_catalog_command_and_reply() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn initial_directory_requires_exact_epoch_one_authenticated_conversation_routes() {
+    let base = directory_with_conversation();
+    base.validate_initial_directory_for_device(device(0x22), &[stream(0x33)])
+        .unwrap();
+
+    assert!(
+        base.validate_initial_directory_for_device(device(0x22), &[])
+            .is_err()
+    );
+    assert!(
+        base.validate_initial_directory_for_device(device(0x22), &[stream(0x34)])
+            .is_err()
+    );
+    assert!(
+        base.validate_initial_directory_for_device(device(0x22), &[stream(0x33), stream(0x33)])
+            .is_err()
+    );
+
+    let mut wrong_epoch = base.clone();
+    wrong_epoch.entries[1].key_id.epoch = 2;
+    assert!(
+        wrong_epoch
+            .validate_initial_directory_for_device(device(0x22), &[stream(0x33)])
+            .is_err()
+    );
+    let mut wrong_command_epoch = base.clone();
+    wrong_command_epoch.entries[2].key_id.epoch = 2;
+    assert!(
+        wrong_command_epoch
+            .validate_initial_directory_for_device(device(0x22), &[stream(0x33)])
+            .is_err()
+    );
+}
+
+#[test]
+fn initial_directory_accepts_1024_conversations_and_canonical_round_trip() {
+    let (directory, routes) = initial_directory_with_conversations(1_024);
+    assert_eq!(directory.entries.len(), 1_027);
+
+    directory
+        .validate_initial_directory_for_device(device(0x22), &routes)
+        .unwrap();
+    let canonical = directory.canonical_bytes().unwrap();
+    let decoded = KeyDirectoryV1::from_canonical_bytes(&canonical).unwrap();
+    assert_eq!(decoded, directory);
+    decoded
+        .validate_initial_directory_for_device(device(0x22), &routes)
+        .unwrap();
+}
+
+#[test]
+fn initial_directory_rejects_1025_conversations() {
+    let (directory, routes) = initial_directory_with_conversations(1_025);
+    assert_eq!(directory.entries.len(), 1_028);
+
+    assert!(
+        directory
+            .validate_initial_directory_for_device(device(0x22), &routes)
+            .is_err()
+    );
+    assert!(directory.canonical_bytes().is_err());
 }
 
 #[test]

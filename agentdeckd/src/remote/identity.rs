@@ -4,8 +4,8 @@
 //! 它不拥有网络或配对流程。私钥只以 [`agentdeck_crypto`] 的 typed wrapper 暴露，
 //! raw seed/IKM 不进入公开 API、`Debug` 或错误文本。
 
-use std::fmt;
-use std::sync::{Mutex, MutexGuard};
+use std::fmt::{self, Write as _};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use agentdeck_crypto::{HpkePrivateKey, SigningKey, sha256};
 use agentdeck_protocol::e2ee::{KeyId, KeyPurpose};
@@ -14,6 +14,11 @@ use zeroize::Zeroizing;
 
 use crate::runtime::store::{MachineIdentityBinding, MachineTrustResetKind};
 use crate::security::{KeyStore, KeyStoreError, SecretBytes};
+
+use super::counter::{
+    CounterError, CounterGuardBackend, CounterGuardCas, CounterGuardState, CounterScope,
+    validate_guard_transition,
+};
 
 pub const MACHINE_ROOT_SIGN_ACCOUNT: &str = "machine-root-sign.v1";
 pub const MACHINE_HPKE_ACCOUNT: &str = "machine-hpke.v1";
@@ -54,10 +59,20 @@ pub enum MachineIdentityError {
     InvalidGuardEncoding { account: String },
     #[error("key-directory guard conflicts with the existing authenticated identity")]
     KeyDirectoryGuardConflict,
+    #[error("key-directory guard database/root binding cannot change during revision advance")]
+    KeyDirectoryGuardBindingMismatch,
+    #[error(
+        "key-directory guard revision cannot stay at or decrease from {current} to {requested}"
+    )]
+    KeyDirectoryGuardRegression { current: u64, requested: u64 },
+    #[error("key-directory guard revision must advance exactly once from {current} to {requested}")]
+    KeyDirectoryGuardJump { current: u64, requested: u64 },
     #[error("key-directory guard is missing")]
     KeyDirectoryGuardMissing,
     #[error("counter guard high-water cannot decrease from {current} to {requested}")]
     CounterRegression { current: u64, requested: u64 },
+    #[error("scoped counter guard failed: {0}")]
+    ScopedCounter(#[from] CounterError),
     #[error("expected root fingerprint does not match the persisted machine identity")]
     RootFingerprintMismatch,
     #[error("deleted machine identity item {account} is still present")]
@@ -85,8 +100,14 @@ impl MachineIdentityError {
             }
             Self::InvalidGuardEncoding { .. } => "daemon.remote.identity.guard_invalid",
             Self::KeyDirectoryGuardConflict => "daemon.remote.identity.guard_conflict",
+            Self::KeyDirectoryGuardBindingMismatch => {
+                "daemon.remote.identity.guard_binding_mismatch"
+            }
+            Self::KeyDirectoryGuardRegression { .. } => "daemon.remote.identity.guard_regression",
+            Self::KeyDirectoryGuardJump { .. } => "daemon.remote.identity.guard_jump",
             Self::KeyDirectoryGuardMissing => "daemon.remote.identity.guard_missing",
             Self::CounterRegression { .. } => "daemon.remote.identity.counter_regression",
+            Self::ScopedCounter(error) => error.code(),
             Self::RootFingerprintMismatch => "daemon.remote.identity.fingerprint_mismatch",
             Self::DeleteReadbackFailed { .. } => "daemon.remote.identity.delete_failed",
             Self::CleanupBindingMismatch { .. } => {
@@ -383,6 +404,61 @@ pub fn install_key_directory_guard(
     Ok(persisted)
 }
 
+/// 在新 key-directory revision 可用于 seal/dispatch 前，以完整旧 guard 推进其唯一后继。
+///
+/// CAS 的 expected/next 都绑定同一 database ID 与 MachineRoot fingerprint，revision
+/// 只能递增 1。调用方必须把本 primitive 与可恢复的 durable Store transition 共同编排；
+/// 若前一次 CAS 已成功但周边 transition 尚未完成，同一 old→new 调用只读重放。任何其他
+/// 现值、绑定漂移、回退或跳号都 fail-close，且不会覆盖既有 guard。
+pub fn advance_key_directory_guard(
+    key_store: &dyn KeyStore,
+    expected: KeyDirectoryGuard,
+    next: KeyDirectoryGuard,
+) -> Result<KeyDirectoryGuard, MachineIdentityError> {
+    if !same_key_directory_binding(expected, next) {
+        return Err(MachineIdentityError::KeyDirectoryGuardBindingMismatch);
+    }
+    if next.key_directory_revision <= expected.key_directory_revision {
+        return Err(MachineIdentityError::KeyDirectoryGuardRegression {
+            current: expected.key_directory_revision,
+            requested: next.key_directory_revision,
+        });
+    }
+    if expected.key_directory_revision.checked_add(1) != Some(next.key_directory_revision) {
+        return Err(MachineIdentityError::KeyDirectoryGuardJump {
+            current: expected.key_directory_revision,
+            requested: next.key_directory_revision,
+        });
+    }
+
+    let _lock = lock_keystore_io()?;
+    let current = load_key_directory_guard_unlocked(key_store)?
+        .ok_or(MachineIdentityError::KeyDirectoryGuardMissing)?;
+    if current == next {
+        return Ok(current);
+    }
+    if !same_key_directory_binding(current, expected) {
+        return Err(MachineIdentityError::KeyDirectoryGuardBindingMismatch);
+    }
+    if current != expected {
+        return Err(MachineIdentityError::KeyDirectoryGuardConflict);
+    }
+
+    let encoded = encode_key_directory_guard(next);
+    store_exact(key_store, KEY_DIRECTORY_GUARD_ACCOUNT, &encoded)?;
+    let persisted = load_key_directory_guard_unlocked(key_store)?.ok_or_else(|| {
+        MachineIdentityError::PersistedItemMissing {
+            account: KEY_DIRECTORY_GUARD_ACCOUNT.to_owned(),
+        }
+    })?;
+    if persisted != next {
+        return Err(MachineIdentityError::PersistedItemMismatch {
+            account: KEY_DIRECTORY_GUARD_ACCOUNT.to_owned(),
+        });
+    }
+    Ok(persisted)
+}
+
 pub fn delete_key_directory_guard(
     key_store: &dyn KeyStore,
     expected_root_fingerprint: [u8; 32],
@@ -465,7 +541,281 @@ pub fn delete_counter_guard(
     Ok(true)
 }
 
-/// 只消费 Store 已认证的 machine binding、database ID 与 active counter axes。
+/// V2 CounterGuard 的 Keychain account。只暴露完整 nonce scope 的 SHA-256 token，
+/// 不把 route、grant、trust epoch 或 key material 写入 account 文本。
+#[must_use]
+pub fn scoped_counter_guard_account(scope: &CounterScope) -> String {
+    encode_scoped_counter_guard_account(scope.token())
+}
+
+/// 从 Store 已认证 manifest 中的完整 scope token 恢复 V2 CounterGuard account。
+///
+/// 本入口不接受零 token；调用方仍须先完成 Store manifest 的 MAC/ledger 审计，不能把
+/// 未认证磁盘字节直接当作 Keychain account capability。
+pub(crate) fn scoped_counter_guard_account_from_token(
+    scope_token: [u8; 32],
+) -> Result<String, MachineIdentityError> {
+    validate_scoped_counter_guard_token(scope_token)?;
+    Ok(encode_scoped_counter_guard_account(scope_token))
+}
+
+fn encode_scoped_counter_guard_account(scope_token: [u8; 32]) -> String {
+    let mut account = String::with_capacity("counter-guard-v2/".len() + 64);
+    account.push_str("counter-guard-v2/");
+    for byte in scope_token {
+        // 写入 String 不会失败；避免引入另一套 hex 编码依赖。
+        write!(&mut account, "{byte:02x}").expect("writing to String is infallible");
+    }
+    account
+}
+
+/// Existing-only 读取 Store 已认证 token 对应的 V2 CounterGuard。
+///
+/// 已存在 item 必须通过 canonical decode，且其内嵌 token 必须与 account token
+/// 完全一致；缺失只返回 `None`，不创建、不覆盖。
+pub(crate) fn load_scoped_counter_guard_for_token(
+    key_store: &dyn KeyStore,
+    scope_token: [u8; 32],
+) -> Result<Option<CounterGuardState>, MachineIdentityError> {
+    let _lock = lock_keystore_io()?;
+    load_scoped_counter_guard_for_token_unlocked(key_store, scope_token)
+}
+
+/// Existing-only 删除 Store 已认证 token 对应的 V2 CounterGuard。
+///
+/// 第一笔 mutation 前先完成 canonical decode/token 校验；已缺失时零写返回
+/// `false`，已存在时删除后必须精确读回 absent 才返回 `true`。
+#[allow(dead_code)] // P4.5 trust-reset/counter GC 接线将在本 Task 后续消费该低层 seam。
+pub(crate) fn delete_scoped_counter_guard_for_token(
+    key_store: &dyn KeyStore,
+    scope_token: [u8; 32],
+) -> Result<bool, MachineIdentityError> {
+    let _lock = lock_keystore_io()?;
+    if load_scoped_counter_guard_for_token_unlocked(key_store, scope_token)?.is_none() {
+        return Ok(false);
+    }
+    let account = scoped_counter_guard_account_from_token(scope_token)?;
+    delete_exact(key_store, &account)?;
+    Ok(true)
+}
+
+/// running daemon counter GC 的单临界区 batch delete。`scope_tokens` 必须来自 Store
+/// authenticated exact plan 且严格排序；函数在第一笔 mutation 前 canonical decode
+/// 全部现存 guard/embedded token，随后 existing-only 删除并逐项 exact absent readback。
+/// Reserved+absent 合法且零写，不会补建 Keychain item。
+pub(crate) fn delete_scoped_counter_guards_for_tokens(
+    key_store: &dyn KeyStore,
+    scope_tokens: &[[u8; 32]],
+) -> Result<u64, MachineIdentityError> {
+    let _lock = lock_keystore_io()?;
+    let mut previous = None;
+    let mut accounts = Vec::with_capacity(scope_tokens.len());
+    for scope_token in scope_tokens.iter().copied() {
+        if previous.is_some_and(|value| value >= scope_token) {
+            return Err(MachineIdentityError::CleanupCounterAxisDuplicate);
+        }
+        let account = scoped_counter_guard_account_from_token(scope_token)?;
+        accounts.push((scope_token, account));
+        previous = Some(scope_token);
+    }
+    let mut guards = Vec::with_capacity(accounts.len());
+    for (scope_token, account) in accounts {
+        let guard = load_scoped_counter_guard_for_token_unlocked(key_store, scope_token)?;
+        guards.push((account, guard));
+    }
+    let mut deleted = 0_u64;
+    for (account, guard) in guards {
+        if guard.is_some() {
+            delete_exact(key_store, &account)?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+/// stopped-daemon purge finalizer 的 V2-only batch cleanup。
+///
+/// `manifest` 必须来自 existing-only authenticated Runtime rescue read。全部现存 guard
+/// 在第一笔删除前完成 canonical decode 与 embedded-token 校验；Root-present retry 只
+/// 接受既定删除顺序产生的 absent-prefix，Reserved+absent 不参与该前缀。每笔删除均
+/// exact absent readback，整个 batch 与同进程 CounterGuard IO 共用一个临界区。
+pub(crate) fn cleanup_scoped_counter_guards(
+    key_store: &dyn KeyStore,
+    reset_kind: MachineTrustResetKind,
+    manifest: &[([u8; 32], bool)],
+) -> Result<(), MachineIdentityError> {
+    let _lock = lock_keystore_io()?;
+    let mut previous = None;
+    let guards = manifest
+        .iter()
+        .copied()
+        .map(|(scope_token, materialized)| {
+            if previous.is_some_and(|value| value >= scope_token) {
+                return Err(MachineIdentityError::CleanupCounterAxisDuplicate);
+            }
+            previous = Some(scope_token);
+            let account = scoped_counter_guard_account_from_token(scope_token)?;
+            let guard = load_scoped_counter_guard_for_token_unlocked(key_store, scope_token)?;
+            Ok((account, guard, materialized || guard.is_some()))
+        })
+        .collect::<Result<Vec<_>, MachineIdentityError>>()?;
+
+    if reset_kind == MachineTrustResetKind::RootPresent {
+        let presence = guards
+            .iter()
+            .filter(|(_, _, participates)| *participates)
+            .map(|(_, guard, _)| guard.is_some())
+            .collect::<Vec<_>>();
+        if !is_legal_cleanup_prefix(&presence) {
+            return Err(MachineIdentityError::CleanupPartialState);
+        }
+    }
+    for (account, guard, _) in guards {
+        if guard.is_some() {
+            delete_exact(key_store, &account)?;
+        }
+    }
+    Ok(())
+}
+
+/// finalizer 全局 preflight 使用的 existing-only V2 batch audit。所有现存 item 都必须
+/// canonical decode 且 embedded token 与 authenticated manifest 一致；零写入。
+pub(crate) fn validate_scoped_counter_guards(
+    key_store: &dyn KeyStore,
+    manifest: &[([u8; 32], bool)],
+) -> Result<(), MachineIdentityError> {
+    let _lock = lock_keystore_io()?;
+    let mut previous = None;
+    for (scope_token, _) in manifest.iter().copied() {
+        if previous.is_some_and(|value| value >= scope_token) {
+            return Err(MachineIdentityError::CleanupCounterAxisDuplicate);
+        }
+        let _ = load_scoped_counter_guard_for_token_unlocked(key_store, scope_token)?;
+        previous = Some(scope_token);
+    }
+    Ok(())
+}
+
+/// stable daemon 的真实 KeyStore-backed CounterGuard compare-and-swap adapter。
+///
+/// daemon singleton 排除正常跨进程 writer；`KEYSTORE_IO` 再把同进程内的
+/// load→compare→store→exact readback 固定在一个临界区。同 UID 在线攻击者不在威胁边界内。
+pub struct KeyStoreCounterGuardBackend<'a> {
+    key_store: &'a dyn KeyStore,
+}
+
+impl<'a> KeyStoreCounterGuardBackend<'a> {
+    #[must_use]
+    pub const fn new(key_store: &'a dyn KeyStore) -> Self {
+        Self { key_store }
+    }
+}
+
+impl fmt::Debug for KeyStoreCounterGuardBackend<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("KeyStoreCounterGuardBackend([REDACTED])")
+    }
+}
+
+impl CounterGuardBackend for KeyStoreCounterGuardBackend<'_> {
+    type Error = MachineIdentityError;
+
+    fn load_guard(&self, scope: &CounterScope) -> Result<Option<CounterGuardState>, Self::Error> {
+        load_scoped_counter_guard(self.key_store, scope)
+    }
+
+    fn compare_and_swap_guard(
+        &self,
+        scope: &CounterScope,
+        expected: Option<CounterGuardState>,
+        next: CounterGuardState,
+    ) -> Result<CounterGuardCas, Self::Error> {
+        compare_and_swap_counter_guard(self.key_store, scope, expected, next)
+    }
+}
+
+/// 长生命周期 remote/publication owner 使用的 `'static` CounterGuard adapter。它只延长
+/// KeyStore capability 的进程内生命周期，不复制任何 key material。
+#[derive(Clone)]
+pub struct OwnedKeyStoreCounterGuardBackend {
+    key_store: Arc<dyn KeyStore>,
+}
+
+impl OwnedKeyStoreCounterGuardBackend {
+    #[must_use]
+    pub fn new(key_store: Arc<dyn KeyStore>) -> Self {
+        Self { key_store }
+    }
+}
+
+impl fmt::Debug for OwnedKeyStoreCounterGuardBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnedKeyStoreCounterGuardBackend([REDACTED])")
+    }
+}
+
+impl CounterGuardBackend for OwnedKeyStoreCounterGuardBackend {
+    type Error = MachineIdentityError;
+
+    fn load_guard(&self, scope: &CounterScope) -> Result<Option<CounterGuardState>, Self::Error> {
+        load_scoped_counter_guard(self.key_store.as_ref(), scope)
+    }
+
+    fn compare_and_swap_guard(
+        &self,
+        scope: &CounterScope,
+        expected: Option<CounterGuardState>,
+        next: CounterGuardState,
+    ) -> Result<CounterGuardCas, Self::Error> {
+        compare_and_swap_counter_guard(self.key_store.as_ref(), scope, expected, next)
+    }
+}
+
+fn load_scoped_counter_guard(
+    key_store: &dyn KeyStore,
+    scope: &CounterScope,
+) -> Result<Option<CounterGuardState>, MachineIdentityError> {
+    load_scoped_counter_guard_for_token(key_store, scope.token())
+}
+
+fn compare_and_swap_counter_guard(
+    key_store: &dyn KeyStore,
+    scope: &CounterScope,
+    expected: Option<CounterGuardState>,
+    next: CounterGuardState,
+) -> Result<CounterGuardCas, MachineIdentityError> {
+    if expected.is_some_and(|state| state.token() != scope.token()) || next.token() != scope.token()
+    {
+        return Err(CounterError::ScopeMismatch.into());
+    }
+
+    let _lock = lock_keystore_io()?;
+    let current = load_scoped_counter_guard_unlocked(key_store, scope)?;
+    if current != expected {
+        return Ok(CounterGuardCas::Conflict(current));
+    }
+    validate_guard_transition(current, next)?;
+
+    // 幂等 CAS 仍已在本临界区完成 canonical load/decode；无需产生第二笔覆盖写。
+    if current == Some(next) {
+        return Ok(CounterGuardCas::Swapped(next));
+    }
+
+    let account = scoped_counter_guard_account(scope);
+    let encoded = next.encode();
+    store_exact(key_store, &account, &encoded)?;
+    let persisted = load_scoped_counter_guard_unlocked(key_store, scope)?.ok_or_else(|| {
+        MachineIdentityError::PersistedItemMissing {
+            account: account.clone(),
+        }
+    })?;
+    if persisted != next {
+        return Err(MachineIdentityError::PersistedItemMismatch { account });
+    }
+    Ok(CounterGuardCas::Swapped(persisted))
+}
+
+/// 只消费 Store 已认证的 machine binding、database ID、V2 scope manifest 与 legacy axes。
 ///
 /// 所有现存 item 都会在第一笔删除前完成 existing-only 校验。Root-present 只接受固定
 /// 删除顺序产生的 prefix-absent 形态；Root-lost 已由 portable admin purge receipt
@@ -475,6 +825,7 @@ pub(super) fn cleanup_machine_identity(
     database_id: [u8; 16],
     binding: &MachineIdentityBinding,
     reset_kind: MachineTrustResetKind,
+    counter_guard_scopes: &[([u8; 32], bool)],
     counter_guard_axes: &[KeyId],
 ) -> Result<MachineIdentityCleanupOutcome, MachineIdentityError> {
     let _lock = lock_keystore_io()?;
@@ -483,6 +834,18 @@ pub(super) fn cleanup_machine_identity(
     let raw = load_raw_material_unlocked(key_store)?;
     validate_present_raw_material(&raw)?;
     let directory_guard = load_key_directory_guard_unlocked(key_store)?;
+    let scoped_counter_guards = counter_guard_scopes
+        .iter()
+        .copied()
+        .map(|(scope_token, materialized)| {
+            let account = scoped_counter_guard_account_from_token(scope_token)?;
+            let guard = load_scoped_counter_guard_for_token_unlocked(key_store, scope_token)?;
+            // Reserved+absent 是“已登记但从未生成 guard”的合法状态，不参与
+            // root-present 删除前缀；Reserved+present 覆盖 guard CAS 后、manifest
+            // phase COMMIT 前的 crash gap，仍须 existing-only 删除。
+            Ok((account, guard, materialized || guard.is_some()))
+        })
+        .collect::<Result<Vec<_>, MachineIdentityError>>()?;
     let counter_guards = counter_guard_axes
         .iter()
         .copied()
@@ -506,18 +869,23 @@ pub(super) fn cleanup_machine_identity(
 
     let all_keys_absent =
         raw.root.is_none() && raw.hpke.is_none() && raw.link.is_none() && raw.data.is_none();
-    let all_counters_absent = counter_guards.iter().all(|(_, guard)| guard.is_none());
+    let all_counters_absent = scoped_counter_guards
+        .iter()
+        .all(|(_, guard, _)| guard.is_none())
+        && counter_guards.iter().all(|(_, guard)| guard.is_none());
     if all_keys_absent && directory_guard.is_none() && all_counters_absent {
         return Ok(MachineIdentityCleanupOutcome::AlreadyAbsent);
     }
 
-    // 删除序列是 counters → data → link → hpke → directory guard → root。
+    // 删除序列是 V2 scopes → legacy counters → data → link → hpke → directory guard → root。
     // Root-present crash/retry 只接受该序列产生的 `absent* present*` 前缀；任何
     // 跳序缺失都在下一笔 mutation 前 fail-close。Root-lost 已先验证 portable
     // admin receipt，可以 existing-only 清除任意 surviving item，不补建缺失项。
-    let mut presence = counter_guards
+    let mut presence = scoped_counter_guards
         .iter()
-        .map(|(_, guard)| guard.is_some())
+        .filter(|(_, _, participates_in_prefix)| *participates_in_prefix)
+        .map(|(_, guard, _)| guard.is_some())
+        .chain(counter_guards.iter().map(|(_, guard)| guard.is_some()))
         .collect::<Vec<_>>();
     presence.extend([
         raw.data.is_some(),
@@ -532,6 +900,11 @@ pub(super) fn cleanup_machine_identity(
         }
     }
 
+    for (account, guard, _) in &scoped_counter_guards {
+        if guard.is_some() {
+            delete_exact(key_store, account)?;
+        }
+    }
     for (key_id, guard) in &counter_guards {
         if guard.is_some() {
             delete_exact(key_store, &counter_guard_account(*key_id))?;
@@ -946,6 +1319,38 @@ fn load_counter_guard_unlocked(
         .transpose()
 }
 
+fn load_scoped_counter_guard_unlocked(
+    key_store: &dyn KeyStore,
+    scope: &CounterScope,
+) -> Result<Option<CounterGuardState>, MachineIdentityError> {
+    load_scoped_counter_guard_for_token_unlocked(key_store, scope.token())
+}
+
+fn load_scoped_counter_guard_for_token_unlocked(
+    key_store: &dyn KeyStore,
+    scope_token: [u8; 32],
+) -> Result<Option<CounterGuardState>, MachineIdentityError> {
+    let account = scoped_counter_guard_account_from_token(scope_token)?;
+    let state = key_store
+        .load(&account)?
+        .map(|secret| CounterGuardState::decode(secret.expose_secret()))
+        .transpose()?;
+    if state.is_some_and(|state| state.token() != scope_token) {
+        return Err(CounterError::ScopeMismatch.into());
+    }
+    Ok(state)
+}
+
+fn validate_scoped_counter_guard_token(scope_token: [u8; 32]) -> Result<(), MachineIdentityError> {
+    if scope_token == [0; 32] {
+        return Err(CounterError::InvalidScope {
+            axis: "scope token",
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn ensure_root_fingerprint(
     guard: KeyDirectoryGuard,
     expected: [u8; 32],
@@ -954,6 +1359,10 @@ fn ensure_root_fingerprint(
         return Err(MachineIdentityError::RootFingerprintMismatch);
     }
     Ok(())
+}
+
+fn same_key_directory_binding(left: KeyDirectoryGuard, right: KeyDirectoryGuard) -> bool {
+    left.database_id == right.database_id && left.root_fingerprint == right.root_fingerprint
 }
 
 fn key_purpose_tag(purpose: KeyPurpose) -> u8 {
@@ -1003,8 +1412,12 @@ mod tests {
     struct TestKeyStore {
         values: Mutex<HashMap<String, Vec<u8>>>,
         stores: Mutex<Vec<String>>,
+        deletes: Mutex<Vec<String>>,
         corrupt_readback: Mutex<Option<String>>,
         missing_readback: Mutex<Option<String>>,
+        corrupt_readback_after_store: Mutex<Option<String>>,
+        missing_readback_after_store: Mutex<Option<String>>,
+        retain_after_delete: Mutex<Option<String>>,
     }
 
     impl TestKeyStore {
@@ -1042,10 +1455,25 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(account.to_owned(), value.expose_secret().to_vec());
+            let mut corrupt_after_store = self.corrupt_readback_after_store.lock().unwrap();
+            if corrupt_after_store.as_deref() == Some(account) {
+                *corrupt_after_store = None;
+                *self.corrupt_readback.lock().unwrap() = Some(account.to_owned());
+            }
+            drop(corrupt_after_store);
+            let mut missing_after_store = self.missing_readback_after_store.lock().unwrap();
+            if missing_after_store.as_deref() == Some(account) {
+                *missing_after_store = None;
+                *self.missing_readback.lock().unwrap() = Some(account.to_owned());
+            }
             Ok(())
         }
 
         fn delete(&self, account: &str) -> Result<(), KeyStoreError> {
+            self.deletes.lock().unwrap().push(account.to_owned());
+            if self.retain_after_delete.lock().unwrap().as_deref() == Some(account) {
+                return Ok(());
+            }
             self.values.lock().unwrap().remove(account);
             Ok(())
         }
@@ -1120,5 +1548,341 @@ mod tests {
             *missing.stores.lock().unwrap(),
             vec![MACHINE_ROOT_SIGN_ACCOUNT]
         );
+    }
+
+    fn directory_guard(revision: u64) -> KeyDirectoryGuard {
+        KeyDirectoryGuard::new([0x71; 16], [0x72; 32], revision)
+    }
+
+    #[test]
+    fn key_directory_guard_advance_is_monotonic_exact_retry_and_persisted() {
+        let store = TestKeyStore::default();
+        let current = directory_guard(9);
+        let next = directory_guard(10);
+        install_key_directory_guard(&store, current).unwrap();
+
+        assert_eq!(
+            advance_key_directory_guard(&store, current, next).unwrap(),
+            next
+        );
+        assert_eq!(load_key_directory_guard(&store).unwrap(), Some(next));
+        assert_eq!(
+            *store.stores.lock().unwrap(),
+            vec![KEY_DIRECTORY_GUARD_ACCOUNT, KEY_DIRECTORY_GUARD_ACCOUNT]
+        );
+
+        // guard CAS 成功但周边 durable transition 尚未完成时，重启会以同一
+        // old→new reservation 重试；exact next 只读重放，不能产生覆盖写。
+        assert_eq!(
+            advance_key_directory_guard(&store, current, next).unwrap(),
+            next
+        );
+        assert_eq!(load_key_directory_guard(&store).unwrap(), Some(next));
+        assert_eq!(
+            *store.stores.lock().unwrap(),
+            vec![KEY_DIRECTORY_GUARD_ACCOUNT, KEY_DIRECTORY_GUARD_ACCOUNT]
+        );
+    }
+
+    #[test]
+    fn key_directory_guard_advance_rejects_regression_and_jump_without_write() {
+        for (next_revision, expected_code) in [
+            (8, "daemon.remote.identity.guard_regression"),
+            (9, "daemon.remote.identity.guard_regression"),
+            (11, "daemon.remote.identity.guard_jump"),
+        ] {
+            let store = TestKeyStore::default();
+            let current = directory_guard(9);
+            install_key_directory_guard(&store, current).unwrap();
+            let stores_before = store.stores.lock().unwrap().clone();
+
+            let error =
+                advance_key_directory_guard(&store, current, directory_guard(next_revision))
+                    .expect_err("non-successor revision must fail closed");
+            assert_eq!(error.code(), expected_code);
+            assert_eq!(load_key_directory_guard(&store).unwrap(), Some(current));
+            assert_eq!(*store.stores.lock().unwrap(), stores_before);
+        }
+    }
+
+    #[test]
+    fn key_directory_guard_advance_rejects_wrong_binding_without_write() {
+        for next in [
+            KeyDirectoryGuard::new([0x73; 16], [0x72; 32], 10),
+            KeyDirectoryGuard::new([0x71; 16], [0x74; 32], 10),
+        ] {
+            let store = TestKeyStore::default();
+            let current = directory_guard(9);
+            install_key_directory_guard(&store, current).unwrap();
+            let stores_before = store.stores.lock().unwrap().clone();
+
+            let error = advance_key_directory_guard(&store, current, next)
+                .expect_err("database/root binding changes must fail closed");
+            assert_eq!(
+                error.code(),
+                "daemon.remote.identity.guard_binding_mismatch"
+            );
+            assert_eq!(load_key_directory_guard(&store).unwrap(), Some(current));
+            assert_eq!(*store.stores.lock().unwrap(), stores_before);
+        }
+
+        let store = TestKeyStore::default();
+        let persisted = KeyDirectoryGuard::new([0x73; 16], [0x72; 32], 9);
+        install_key_directory_guard(&store, persisted).unwrap();
+        let stores_before = store.stores.lock().unwrap().clone();
+        let error = advance_key_directory_guard(&store, directory_guard(9), directory_guard(10))
+            .expect_err("persisted database/root binding mismatch must fail closed");
+        assert_eq!(
+            error.code(),
+            "daemon.remote.identity.guard_binding_mismatch"
+        );
+        assert_eq!(load_key_directory_guard(&store).unwrap(), Some(persisted));
+        assert_eq!(*store.stores.lock().unwrap(), stores_before);
+    }
+
+    #[test]
+    fn key_directory_guard_advance_rejects_cas_conflict_without_overwrite() {
+        let store = TestKeyStore::default();
+        let persisted = directory_guard(9);
+        install_key_directory_guard(&store, persisted).unwrap();
+        let stores_before = store.stores.lock().unwrap().clone();
+
+        let error = advance_key_directory_guard(&store, directory_guard(10), directory_guard(11))
+            .expect_err("non-current expected guard must conflict");
+        assert_eq!(error.code(), "daemon.remote.identity.guard_conflict");
+        assert_eq!(load_key_directory_guard(&store).unwrap(), Some(persisted));
+        assert_eq!(*store.stores.lock().unwrap(), stores_before);
+    }
+
+    #[test]
+    fn key_directory_guard_advance_rejects_missing_guard_without_installing() {
+        let store = TestKeyStore::default();
+        let error = advance_key_directory_guard(&store, directory_guard(9), directory_guard(10))
+            .expect_err("advance cannot synthesize a missing guard");
+        assert_eq!(error.code(), "daemon.remote.identity.guard_missing");
+        assert_eq!(load_key_directory_guard(&store).unwrap(), None);
+        assert!(store.stores.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn key_directory_guard_advance_requires_exact_store_readback() {
+        for missing in [false, true] {
+            let store = TestKeyStore::default();
+            let current = directory_guard(9);
+            install_key_directory_guard(&store, current).unwrap();
+            if missing {
+                *store.missing_readback_after_store.lock().unwrap() =
+                    Some(KEY_DIRECTORY_GUARD_ACCOUNT.to_owned());
+            } else {
+                *store.corrupt_readback_after_store.lock().unwrap() =
+                    Some(KEY_DIRECTORY_GUARD_ACCOUNT.to_owned());
+            }
+
+            let error = advance_key_directory_guard(&store, current, directory_guard(10))
+                .expect_err("advance must verify the persisted guard bytes");
+            assert_eq!(
+                error.code(),
+                "daemon.remote.identity.key_persistence_failed"
+            );
+        }
+    }
+
+    fn scoped_publication_counter() -> CounterScope {
+        CounterScope::publication(
+            [0xa1; 32],
+            KeyId {
+                purpose: KeyPurpose::ConversationDek,
+                epoch: 9,
+            },
+            [0xa2; 16],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn scoped_counter_guard_cas_preserves_conflict_and_promotes_exact_state() {
+        let store = TestKeyStore::default();
+        let backend = KeyStoreCounterGuardBackend::new(&store);
+        let scope = scoped_publication_counter();
+        let pending =
+            CounterGuardState::pending(scope.token(), 0, 1_024, [0xb1; 16], [0xb2; 16], [0xb3; 32])
+                .unwrap();
+        assert_eq!(
+            backend
+                .compare_and_swap_guard(&scope, None, pending)
+                .unwrap(),
+            CounterGuardCas::Swapped(pending)
+        );
+        assert_eq!(backend.load_guard(&scope).unwrap(), Some(pending));
+
+        let stable = CounterGuardState::stable(scope.token(), 1_024, [0xb4; 32]).unwrap();
+        assert_eq!(
+            backend
+                .compare_and_swap_guard(&scope, None, stable)
+                .unwrap(),
+            CounterGuardCas::Conflict(Some(pending))
+        );
+        assert_eq!(backend.load_guard(&scope).unwrap(), Some(pending));
+
+        assert_eq!(
+            backend
+                .compare_and_swap_guard(&scope, Some(pending), stable)
+                .unwrap(),
+            CounterGuardCas::Swapped(stable)
+        );
+        assert_eq!(backend.load_guard(&scope).unwrap(), Some(stable));
+    }
+
+    #[test]
+    fn owned_counter_guard_backend_is_static_and_preserves_exact_cas_semantics() {
+        fn assert_owner<T: Send + Sync + 'static>() {}
+        assert_owner::<OwnedKeyStoreCounterGuardBackend>();
+
+        let store = std::sync::Arc::new(TestKeyStore::default());
+        let key_store: std::sync::Arc<dyn KeyStore> = store;
+        let backend = OwnedKeyStoreCounterGuardBackend::new(key_store);
+        let scope = scoped_publication_counter();
+        let pending =
+            CounterGuardState::pending(scope.token(), 0, 1_024, [0xd1; 16], [0xd2; 16], [0xd3; 32])
+                .unwrap();
+        assert_eq!(
+            backend
+                .compare_and_swap_guard(&scope, None, pending)
+                .unwrap(),
+            CounterGuardCas::Swapped(pending)
+        );
+        assert_eq!(backend.load_guard(&scope).unwrap(), Some(pending));
+    }
+
+    #[test]
+    fn authenticated_scope_token_restores_canonical_v2_account() {
+        let token = [0xab; 32];
+        assert_eq!(
+            scoped_counter_guard_account_from_token(token).unwrap(),
+            format!("counter-guard-v2/{}", "ab".repeat(32))
+        );
+        let error = scoped_counter_guard_account_from_token([0; 32])
+            .expect_err("zero manifest token must fail closed");
+        assert_eq!(error.code(), "daemon.remote.counter.scope_invalid");
+    }
+
+    #[test]
+    fn token_based_scoped_guard_load_decodes_and_rejects_embedded_token_mismatch() {
+        let store = TestKeyStore::default();
+        let token = [0xe1; 32];
+        let account = scoped_counter_guard_account_from_token(token).unwrap();
+        let stable = CounterGuardState::stable(token, 1_024, [0xe2; 32]).unwrap();
+        store.insert(&account, &stable.encode());
+        assert_eq!(
+            load_scoped_counter_guard_for_token(&store, token).unwrap(),
+            Some(stable)
+        );
+
+        let wrong = CounterGuardState::stable([0xe3; 32], 1_024, [0xe4; 32]).unwrap();
+        store.insert(&account, &wrong.encode());
+        let error = load_scoped_counter_guard_for_token(&store, token)
+            .expect_err("account and embedded token mismatch must fail closed");
+        assert_eq!(error.code(), "daemon.remote.counter.scope_mismatch");
+        let error = delete_scoped_counter_guard_for_token(&store, token)
+            .expect_err("mismatched guard must be rejected before delete");
+        assert_eq!(error.code(), "daemon.remote.counter.scope_mismatch");
+        assert!(store.deletes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn token_based_scoped_guard_delete_is_existing_only_with_absent_readback() {
+        let store = TestKeyStore::default();
+        let token = [0xf1; 32];
+        let account = scoped_counter_guard_account_from_token(token).unwrap();
+
+        assert!(!delete_scoped_counter_guard_for_token(&store, token).unwrap());
+        assert!(store.deletes.lock().unwrap().is_empty());
+
+        let stable = CounterGuardState::stable(token, 2_048, [0xf2; 32]).unwrap();
+        store.insert(&account, &stable.encode());
+        assert!(delete_scoped_counter_guard_for_token(&store, token).unwrap());
+        assert_eq!(*store.deletes.lock().unwrap(), vec![account.clone()]);
+        assert_eq!(
+            load_scoped_counter_guard_for_token(&store, token).unwrap(),
+            None
+        );
+
+        store.insert(&account, &stable.encode());
+        *store.retain_after_delete.lock().unwrap() = Some(account.clone());
+        let error = delete_scoped_counter_guard_for_token(&store, token)
+            .expect_err("delete must require an exact absent readback");
+        assert_eq!(error.code(), "daemon.remote.identity.delete_failed");
+        assert_eq!(
+            load_scoped_counter_guard_for_token(&store, token).unwrap(),
+            Some(stable)
+        );
+    }
+
+    #[test]
+    fn scoped_guard_batch_delete_audits_all_before_first_mutation() {
+        let store = TestKeyStore::default();
+        let first = [0xa1; 32];
+        let second = [0xa2; 32];
+        let first_account = scoped_counter_guard_account_from_token(first).unwrap();
+        let second_account = scoped_counter_guard_account_from_token(second).unwrap();
+        let second_guard = CounterGuardState::stable(second, 1_024, [0xa3; 32]).unwrap();
+        store.insert(&second_account, &second_guard.encode());
+
+        assert_eq!(
+            delete_scoped_counter_guards_for_tokens(&store, &[first, second]).unwrap(),
+            1
+        );
+        assert_eq!(*store.deletes.lock().unwrap(), vec![second_account.clone()]);
+        assert!(store.values.lock().unwrap().get(&second_account).is_none());
+
+        store.deletes.lock().unwrap().clear();
+        let first_guard = CounterGuardState::stable(first, 2_048, [0xa4; 32]).unwrap();
+        let mismatched = CounterGuardState::stable([0xa5; 32], 2_048, [0xa6; 32]).unwrap();
+        store.insert(&first_account, &first_guard.encode());
+        store.insert(&second_account, &mismatched.encode());
+        let error = delete_scoped_counter_guards_for_tokens(&store, &[first, second])
+            .expect_err("later malformed guard must fail before deleting the first");
+        assert_eq!(error.code(), "daemon.remote.counter.scope_mismatch");
+        assert!(store.deletes.lock().unwrap().is_empty());
+        assert!(store.values.lock().unwrap().contains_key(&first_account));
+        assert!(store.values.lock().unwrap().contains_key(&second_account));
+
+        assert_eq!(
+            delete_scoped_counter_guards_for_tokens(&store, &[second, first])
+                .expect_err("plan tokens must be strictly ordered"),
+            MachineIdentityError::CleanupCounterAxisDuplicate
+        );
+        assert!(store.deletes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scoped_counter_guard_cas_requires_exact_key_store_readback() {
+        for missing in [false, true] {
+            let store = TestKeyStore::default();
+            let backend = KeyStoreCounterGuardBackend::new(&store);
+            let scope = scoped_publication_counter();
+            let account = scoped_counter_guard_account(&scope);
+            if missing {
+                *store.missing_readback.lock().unwrap() = Some(account);
+            } else {
+                *store.corrupt_readback.lock().unwrap() = Some(account);
+            }
+            let pending = CounterGuardState::pending(
+                scope.token(),
+                0,
+                1_024,
+                [0xc1; 16],
+                [0xc2; 16],
+                [0xc3; 32],
+            )
+            .unwrap();
+            let error = backend
+                .compare_and_swap_guard(&scope, None, pending)
+                .unwrap_err();
+            assert_eq!(
+                error.code(),
+                "daemon.remote.identity.key_persistence_failed"
+            );
+        }
     }
 }

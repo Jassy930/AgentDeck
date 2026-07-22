@@ -340,31 +340,60 @@ pub struct RegisterStreamBarrier {
 
 /// SubscriptionBarrier 已认证并冻结的 snapshot 来源。
 ///
-/// `Ready` 绑定 exact durable row；`Build` / `Dynamic` 的 TEMP pin 绑定本次 barrier
-/// 捕获的 conversation H。`Dynamic` 只能用于 authenticated NativeProjected origin，
-/// 且类型上不携带 snapshot store 写能力。调用方不得在 capture 后重新按“当前 H”
-/// 申请另一枚 pin。
+/// `Ready` 绑定 exact durable row；`Build` / `TransitionBuild` / `Dynamic` 的 TEMP pin
+/// 绑定本次 barrier 捕获的 conversation H。`TransitionBuild` 只读组装 exact H，不能
+/// 覆盖已推进到 D 的 durable ready row；`Dynamic` 只能用于 authenticated
+/// NativeProjected origin。调用方不得在 capture 后重新按“当前 H”申请另一枚 pin。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SnapshotBarrierSource {
     Ready(ReadySnapshotReference),
     Build(RuntimeSnapshotBuildPin),
+    TransitionBuild(RuntimeSnapshotBuildPin),
     Dynamic(RuntimeSnapshotBuildPin),
 }
 
 /// Catalog barrier 冻结的 durable baseline（fresh DB 为 None）与 exact H。
 /// 该 source 只供 CatalogSnapshotProvider 消费，不冒充 conversation build pin。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CatalogSnapshotMaterializationMode {
+    DurableRefresh,
+    TransitionEphemeral,
+}
+
 pub struct CatalogSnapshotSource {
+    mode: CatalogSnapshotMaterializationMode,
     baseline: Option<ReadySnapshotReference>,
     frozen: StreamCursor,
 }
 
 impl CatalogSnapshotSource {
     pub(crate) fn new(baseline: Option<ReadySnapshotReference>, frozen: StreamCursor) -> Self {
-        Self { baseline, frozen }
+        Self {
+            mode: CatalogSnapshotMaterializationMode::DurableRefresh,
+            baseline,
+            frozen,
+        }
     }
 
-    pub(crate) fn into_parts(self) -> (Option<ReadySnapshotReference>, StreamCursor) {
-        (self.baseline, self.frozen)
+    pub(crate) fn transition(
+        baseline: Option<ReadySnapshotReference>,
+        frozen: StreamCursor,
+    ) -> Self {
+        Self {
+            mode: CatalogSnapshotMaterializationMode::TransitionEphemeral,
+            baseline,
+            frozen,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CatalogSnapshotMaterializationMode,
+        Option<ReadySnapshotReference>,
+        StreamCursor,
+    ) {
+        (self.mode, self.baseline, self.frozen)
     }
 }
 
@@ -403,7 +432,9 @@ impl SnapshotMaterializationSource {
     #[must_use]
     pub const fn build_pin(&self) -> Option<&RuntimeSnapshotBuildPin> {
         match &self.source {
-            SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin) => Some(pin),
+            SnapshotBarrierSource::Build(pin)
+            | SnapshotBarrierSource::TransitionBuild(pin)
+            | SnapshotBarrierSource::Dynamic(pin) => Some(pin),
             SnapshotBarrierSource::Ready(_) => None,
         }
     }
@@ -416,7 +447,9 @@ impl SnapshotMaterializationSource {
         mut self,
     ) -> Option<RuntimeSnapshotBuildPin> {
         let pin = match &self.source {
-            SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin) => pin,
+            SnapshotBarrierSource::Build(pin)
+            | SnapshotBarrierSource::TransitionBuild(pin)
+            | SnapshotBarrierSource::Dynamic(pin) => pin,
             SnapshotBarrierSource::Ready(_) => return None,
         };
         if let Some(cleanup) = &mut self.cleanup {

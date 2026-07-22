@@ -30,7 +30,8 @@ use rusqlite::{Connection, OpenFlags, ToSql, Transaction};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 const EVIDENCE_MAX_ROWS_PER_TABLE: usize = 64;
-const EVIDENCE_MAX_COLUMNS_PER_TABLE: usize = 80;
+// `runtime_meta` 是当前 v14 schema 中最宽的表；证据快照仍保持精确硬上界。
+const EVIDENCE_MAX_COLUMNS_PER_TABLE: usize = 81;
 const EVIDENCE_MAX_BYTES_PER_TABLE: usize = 8 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;

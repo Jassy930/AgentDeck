@@ -19,8 +19,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const KEY_DIRECTORY_MAX_ENTRIES: usize = 256;
+// Runtime 最多 1,024 个 active conversations；首次目录还必须包含 catalog、
+// DeviceCommandTx 与 DeviceReplyTx 三个 device-scoped key。
+pub const KEY_DIRECTORY_MAX_ENTRIES: usize = 1_024 + 3;
 pub const KEY_DIRECTORY_WRAPPED_KEY_BYTES: usize = 48;
+const KEY_UPDATE_MAX_CANONICAL_BYTES: usize = 1_024;
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
@@ -94,6 +97,7 @@ pub struct KeyDirectoryEntry {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KeyDirectoryV1 {
     pub revision: KeyDirectoryRevision,
+    #[schemars(length(min = 3, max = 1027))]
     pub entries: Vec<KeyDirectoryEntry>,
     pub signature: Ed25519Signature,
 }
@@ -283,6 +287,48 @@ impl KeyDirectoryV1 {
         Ok(())
     }
 
+    /// 首个 grant 的完整 install directory：保留 strict bootstrap 的三项 device
+    /// contract，同时要求 authenticated conversation route 集合逐项、唯一、无增删地
+    /// 出现在 epoch 1。调用方必须传入 Store 已认证的 mapping，不能使用设备自报 routes。
+    pub fn validate_initial_directory_for_device(
+        &self,
+        expected_device: DeviceRouteId,
+        expected_conversation_routes: &[StreamRouteId],
+    ) -> Result<(), PairingError> {
+        let conversations = self.validate_shape_for_device(expected_device)?;
+        if is_zero(&self.signature.0)
+            || conversations != expected_conversation_routes.len()
+            || self.entries.iter().any(|entry| entry.key_id.epoch != 1)
+        {
+            return Err(PairingError::InvalidField("initial key directory"));
+        }
+        let mut previous = None;
+        for route in expected_conversation_routes {
+            if is_zero(route.as_bytes()) || previous.is_some_and(|value| value >= *route.as_bytes())
+            {
+                return Err(PairingError::InvalidField(
+                    "initial conversation key routes",
+                ));
+            }
+            previous = Some(*route.as_bytes());
+        }
+        let observed = self
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                (entry.key_id.purpose == KeyPurpose::ConversationDek)
+                    .then_some(entry.stream_route)
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        if observed != expected_conversation_routes {
+            return Err(PairingError::InvalidField(
+                "initial conversation key routes",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), PairingError> {
         let device = self
             .entries
@@ -426,6 +472,379 @@ pub struct KeyUpdateV1 {
     #[schemars(with = "String")]
     pub wrapped_key: Vec<u8>,
     pub signature: Ed25519Signature,
+}
+
+/// MachineDataSign 对单个 HPKE-wrapped key update 签名的确定性 preimage。
+///
+/// TBS 同时绑定三个版本轴、完整 machine/device trust domain、key identity、HPKE
+/// `info`/AAD、`enc`、wrapped-key digest 与 root-certified MachineData credential；调用方
+/// 不能只对 wrapped key 或一份脱离上下文的 JSON 签名。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KeyUpdateTbsV1 {
+    pub e2ee_format_version: u16,
+    pub runtime_protocol_version: u16,
+    pub relay_protocol_version: u16,
+    pub relay_server_id: RelayServerId,
+    pub machine_route: MachineRouteId,
+    pub device_route: DeviceRouteId,
+    pub grant_serial: GrantSerial,
+    pub root_trust_epoch: TrustEpoch,
+    pub key_directory_revision: KeyDirectoryRevision,
+    pub key_purpose: KeyPurpose,
+    pub key_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_route: Option<StreamRouteId>,
+    #[serde(with = "b64_32")]
+    #[schemars(with = "String")]
+    pub signing_key_fingerprint: [u8; 32],
+    pub signing_key_generation: crate::relay_v2::LinkGeneration,
+    #[serde(with = "b64_32")]
+    #[schemars(with = "String")]
+    pub signing_credential_sha256: [u8; 32],
+    #[serde(with = "b64_32")]
+    #[schemars(with = "String")]
+    pub info_sha256: [u8; 32],
+    #[serde(with = "b64_32")]
+    #[schemars(with = "String")]
+    pub aad_sha256: [u8; 32],
+    #[serde(with = "b64_vec")]
+    #[schemars(with = "String")]
+    pub enc: Vec<u8>,
+    #[serde(with = "b64_32")]
+    #[schemars(with = "String")]
+    pub wrapped_key_sha256: [u8; 32],
+}
+
+impl std::fmt::Debug for KeyUpdateTbsV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KeyUpdateTbsV1")
+            .field("versions", &"<redacted>")
+            .field("bound_material", &"<redacted>")
+            .finish()
+    }
+}
+
+impl KeyUpdateTbsV1 {
+    pub fn validate(&self) -> Result<(), PairingError> {
+        let stream_shape_valid = match self.key_purpose {
+            KeyPurpose::ConversationDek => self
+                .stream_route
+                .is_some_and(|route| !is_zero(route.as_bytes())),
+            _ => self.stream_route.is_none(),
+        };
+        if self.e2ee_format_version != E2EE_FORMAT_VERSION
+            || self.runtime_protocol_version != RUNTIME_PROTOCOL_VERSION
+            || self.relay_protocol_version != RELAY_PROTOCOL_VERSION
+            || is_zero(self.relay_server_id.as_bytes())
+            || is_zero(self.machine_route.as_bytes())
+            || is_zero(self.device_route.as_bytes())
+            || self.grant_serial.value() == 0
+            || self.root_trust_epoch.value() == 0
+            || self.key_directory_revision.value() == 0
+            || self.key_epoch == 0
+            || !stream_shape_valid
+            || is_zero(&self.signing_key_fingerprint)
+            || self.signing_key_generation.value() == 0
+            || is_zero(&self.signing_credential_sha256)
+            || is_zero(&self.info_sha256)
+            || is_zero(&self.aad_sha256)
+            || self.enc.len() != PAIRING_HPKE_ENC_BYTES
+            || is_zero(&self.enc)
+            || is_zero(&self.wrapped_key_sha256)
+        {
+            return Err(PairingError::InvalidField("key update TBS"));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, PairingError> {
+        self.validate()?;
+        let mut encoder = Enc::new();
+        encoder.domain(b"AgentDeck/KeyUpdateTbsV1\0");
+        encoder.u16(self.e2ee_format_version);
+        encoder.u16(self.runtime_protocol_version);
+        encoder.u16(self.relay_protocol_version);
+        encoder.bytes(self.relay_server_id.as_bytes());
+        encoder.bytes(self.machine_route.as_bytes());
+        encoder.bytes(self.device_route.as_bytes());
+        encoder.u64(self.grant_serial.value());
+        encoder.u64(self.root_trust_epoch.value());
+        encoder.u64(self.key_directory_revision.value());
+        encoder.u8(self.key_purpose.tag());
+        encoder.u64(self.key_epoch);
+        encoder.opt_id16(self.stream_route.as_ref().map(|route| route.as_bytes()));
+        encoder.bytes(&self.signing_key_fingerprint);
+        encoder.u64(self.signing_key_generation.value());
+        encoder.bytes(&self.signing_credential_sha256);
+        encoder.bytes(&self.info_sha256);
+        encoder.bytes(&self.aad_sha256);
+        encoder.bytes(&self.enc);
+        encoder.bytes(&self.wrapped_key_sha256);
+        Ok(encoder.finish())
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, PairingError> {
+        if bytes.len() > KEY_UPDATE_MAX_CANONICAL_BYTES {
+            return Err(PairingError::SizeLimit("key update TBS"));
+        }
+        let mut decoder = KeyDecoder::new(bytes);
+        decoder.domain(b"AgentDeck/KeyUpdateTbsV1\0")?;
+        let value = Self {
+            e2ee_format_version: decoder.u16()?,
+            runtime_protocol_version: decoder.u16()?,
+            relay_protocol_version: decoder.u16()?,
+            relay_server_id: RelayServerId::from_bytes(decoder.fixed_bytes()?),
+            machine_route: MachineRouteId::from_bytes(decoder.fixed_bytes()?),
+            device_route: DeviceRouteId::from_bytes(decoder.fixed_bytes()?),
+            grant_serial: GrantSerial::new(decoder.u64()?),
+            root_trust_epoch: TrustEpoch::new(decoder.u64()?),
+            key_directory_revision: KeyDirectoryRevision::new(decoder.u64()?),
+            key_purpose: KeyPurpose::from_tag(decoder.u8()?)?,
+            key_epoch: decoder.u64()?,
+            stream_route: decoder.optional_stream_route()?,
+            signing_key_fingerprint: decoder.fixed_bytes()?,
+            signing_key_generation: crate::relay_v2::LinkGeneration::new(decoder.u64()?),
+            signing_credential_sha256: decoder.fixed_bytes()?,
+            info_sha256: decoder.fixed_bytes()?,
+            aad_sha256: decoder.fixed_bytes()?,
+            enc: decoder.bytes(PAIRING_HPKE_ENC_BYTES)?.to_vec(),
+            wrapped_key_sha256: decoder.fixed_bytes()?,
+        };
+        decoder.finish()?;
+        value.validate()?;
+        if value.encode()?.as_slice() != bytes {
+            return Err(PairingError::InvalidEncoding(
+                "non-canonical key update TBS",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+/// 只能由 protocol 在完整 authority/context 校验和 canonical 编码后构造的
+/// KeyUpdate TBS capability。外部 signer/verifier 只能消费该 token，不能把任意字节
+/// 喂给 protocol-owned hook。
+///
+/// 外部 crate 无法构造 token：
+/// ```compile_fail
+/// use agentdeck_protocol::e2ee::CanonicalKeyUpdateTbs;
+/// let bytes = b"not protocol validated";
+/// let _ = CanonicalKeyUpdateTbs { bytes };
+/// ```
+#[derive(Clone, Copy)]
+pub struct CanonicalKeyUpdateTbs<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> CanonicalKeyUpdateTbs<'a> {
+    #[must_use]
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+impl std::fmt::Debug for CanonicalKeyUpdateTbs<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CanonicalKeyUpdateTbs([REDACTED])")
+    }
+}
+
+/// Protocol-owned signer hook：实现只能接收已经过完整 authority/context 校验的 canonical
+/// TBS capability，并暴露实际 signing-key fingerprint 供 credential binding 复核。
+pub trait KeyUpdateSignatureSigner {
+    fn signing_key_fingerprint(&self) -> [u8; 32];
+
+    fn sign_key_update_tbs(
+        &self,
+        canonical_tbs: CanonicalKeyUpdateTbs<'_>,
+    ) -> Result<Ed25519Signature, PairingError>;
+}
+
+/// Protocol-owned verifier hook；与 signer hook 一样不能选择被验字节。
+pub trait KeyUpdateSignatureVerifier {
+    fn verifying_key_fingerprint(&self) -> [u8; 32];
+
+    fn verify_key_update_tbs(
+        &self,
+        canonical_tbs: CanonicalKeyUpdateTbs<'_>,
+        signature: &Ed25519Signature,
+    ) -> Result<(), PairingError>;
+}
+
+impl KeyUpdateV1 {
+    fn validate_shape(&self, require_signature: bool) -> Result<(), PairingError> {
+        let stream_shape_valid = match self.key_id.purpose {
+            KeyPurpose::ConversationDek => self
+                .stream_route
+                .is_some_and(|route| !is_zero(route.as_bytes())),
+            _ => self.stream_route.is_none(),
+        };
+        if self.key_directory_revision.value() == 0
+            || self.key_id.epoch == 0
+            || is_zero(self.device_route.as_bytes())
+            || !stream_shape_valid
+            || self.enc.len() != PAIRING_HPKE_ENC_BYTES
+            || is_zero(&self.enc)
+            || self.wrapped_key.len() != KEY_DIRECTORY_WRAPPED_KEY_BYTES
+            || is_zero(&self.wrapped_key)
+            || (require_signature && is_zero(&self.signature.0))
+            || (!require_signature && !is_zero(&self.signature.0))
+        {
+            return Err(PairingError::InvalidField("key update"));
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), PairingError> {
+        self.validate_shape(true)
+    }
+
+    pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, PairingError> {
+        let signed = !is_zero(&self.signature.0);
+        self.validate_shape(signed)?;
+        let mut encoder = Enc::new();
+        encoder.domain(b"AgentDeck/KeyUpdateUnsignedV1\0");
+        encoder.u64(self.key_directory_revision.value());
+        encoder.u8(self.key_id.purpose.tag());
+        encoder.u64(self.key_id.epoch);
+        encoder.bytes(self.device_route.as_bytes());
+        encoder.opt_id16(self.stream_route.as_ref().map(|route| route.as_bytes()));
+        encoder.bytes(&self.enc);
+        encoder.bytes(&self.wrapped_key);
+        Ok(encoder.finish())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PairingError> {
+        self.validate()?;
+        let mut encoder = Enc::new();
+        encoder.domain(b"AgentDeck/KeyUpdateV1\0");
+        encoder.bytes(&self.unsigned_canonical_bytes()?);
+        encoder.bytes(&self.signature.0);
+        Ok(encoder.finish())
+    }
+
+    pub fn canonical_sha256(&self) -> Result<[u8; 32], PairingError> {
+        Ok(sha256(&self.canonical_bytes()?))
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, PairingError> {
+        if bytes.len() > KEY_UPDATE_MAX_CANONICAL_BYTES {
+            return Err(PairingError::SizeLimit("key update"));
+        }
+        let mut outer = KeyDecoder::new(bytes);
+        outer.domain(b"AgentDeck/KeyUpdateV1\0")?;
+        let unsigned = outer.bytes(KEY_UPDATE_MAX_CANONICAL_BYTES)?;
+        let signature = Ed25519Signature(outer.fixed_bytes()?);
+        outer.finish()?;
+
+        let mut decoder = KeyDecoder::new(unsigned);
+        decoder.domain(b"AgentDeck/KeyUpdateUnsignedV1\0")?;
+        let value = Self {
+            key_directory_revision: KeyDirectoryRevision::new(decoder.u64()?),
+            key_id: KeyId {
+                purpose: KeyPurpose::from_tag(decoder.u8()?)?,
+                epoch: decoder.u64()?,
+            },
+            device_route: DeviceRouteId::from_bytes(decoder.fixed_bytes()?),
+            stream_route: decoder.optional_stream_route()?,
+            enc: decoder.bytes(PAIRING_HPKE_ENC_BYTES)?.to_vec(),
+            wrapped_key: decoder.bytes(KEY_DIRECTORY_WRAPPED_KEY_BYTES)?.to_vec(),
+            signature,
+        };
+        decoder.finish()?;
+        value.validate()?;
+        if value.canonical_bytes()?.as_slice() != bytes {
+            return Err(PairingError::InvalidEncoding("non-canonical key update"));
+        }
+        Ok(value)
+    }
+
+    pub fn signature_tbs(
+        &self,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        signer: &MachineDataSignerBindingV1,
+    ) -> Result<KeyUpdateTbsV1, PairingError> {
+        let signed = !is_zero(&self.signature.0);
+        self.validate_shape(signed)?;
+        info.validate_context(context)?;
+        signer.validate()?;
+        if self.key_directory_revision != info.key_directory_revision
+            || self.key_id.purpose != info.key_purpose
+            || self.key_id.epoch != info.key_epoch
+            || self.device_route != info.device_route
+            || self.stream_route != info.stream_route
+        {
+            return Err(PairingError::ContextBindingMismatch);
+        }
+        let tbs = KeyUpdateTbsV1 {
+            e2ee_format_version: info.e2ee_format_version,
+            runtime_protocol_version: info.runtime_protocol_version,
+            relay_protocol_version: context.relay_protocol_version,
+            relay_server_id: info.relay_server_id,
+            machine_route: info.machine_route,
+            device_route: info.device_route,
+            grant_serial: info.grant_serial,
+            root_trust_epoch: info.root_trust_epoch,
+            key_directory_revision: info.key_directory_revision,
+            key_purpose: info.key_purpose,
+            key_epoch: info.key_epoch,
+            stream_route: info.stream_route,
+            signing_key_fingerprint: signer.signing_key_fingerprint,
+            signing_key_generation: signer.generation,
+            signing_credential_sha256: signer.certificate_sha256,
+            info_sha256: sha256(&info.encode()),
+            aad_sha256: sha256(&context.encode_aad()),
+            enc: self.enc.clone(),
+            wrapped_key_sha256: sha256(&self.wrapped_key),
+        };
+        tbs.validate()?;
+        Ok(tbs)
+    }
+
+    pub fn sign_with<S: KeyUpdateSignatureSigner>(
+        mut self,
+        signer_hook: &S,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        signer: &MachineDataSignerBindingV1,
+    ) -> Result<Self, PairingError> {
+        self.validate_shape(false)?;
+        signer.validate()?;
+        if signer_hook.signing_key_fingerprint() != signer.signing_key_fingerprint {
+            return Err(PairingError::InvalidField(
+                "key update signer credential binding",
+            ));
+        }
+        let tbs = self.signature_tbs(info, context, signer)?.encode()?;
+        let signature = signer_hook.sign_key_update_tbs(CanonicalKeyUpdateTbs { bytes: &tbs })?;
+        if is_zero(&signature.0) {
+            return Err(PairingError::InvalidField("key update signature"));
+        }
+        self.signature = signature;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn verify_with<V: KeyUpdateSignatureVerifier>(
+        &self,
+        verifier_hook: &V,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        signer: &MachineDataSignerBindingV1,
+    ) -> Result<(), PairingError> {
+        self.validate()?;
+        signer.validate()?;
+        if verifier_hook.verifying_key_fingerprint() != signer.signing_key_fingerprint {
+            return Err(PairingError::InvalidField(
+                "key update verifier credential binding",
+            ));
+        }
+        let tbs = self.signature_tbs(info, context, signer)?.encode()?;
+        verifier_hook.verify_key_update_tbs(CanonicalKeyUpdateTbs { bytes: &tbs }, &self.signature)
+    }
 }
 
 /// 成员/epoch 变化时在每个 active stream 记录的 epoch barrier（design §7.2 / §9.2）。
@@ -598,6 +1017,12 @@ impl<'a> KeyDecoder<'a> {
         self.take(N)?
             .try_into()
             .map_err(|_| PairingError::InvalidEncoding("key directory fixed bytes"))
+    }
+
+    fn fixed_bytes<const N: usize>(&mut self) -> Result<[u8; N], PairingError> {
+        self.bytes(N)?
+            .try_into()
+            .map_err(|_| PairingError::InvalidEncoding("key directory fixed field"))
     }
 
     fn bytes(&mut self, maximum: usize) -> Result<&'a [u8], PairingError> {

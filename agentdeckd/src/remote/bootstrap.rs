@@ -9,15 +9,19 @@
 use std::fmt;
 
 use agentdeck_crypto::{
-    CryptoError, HpkePublicKey, PairResponseSealAuthority, SignatureBytes,
-    ValidatedRelayReceiptVerifyKey, VerifyingKey, seal_pair_pending, seal_pair_response, sha256,
-    sign_authentication_transcript, sign_device_authorization,
-    sign_key_directory as crypto_sign_key_directory, sign_tbs, verify_tbs,
+    CryptoError, DeviceKeyRecoverySealAuthority, HpkePublicKey, PairResponseSealAuthority,
+    SignatureBytes, ValidatedRelayReceiptVerifyKey, VerifyingKey, seal_device_key_recovery_reply,
+    seal_pair_pending, seal_pair_response, sha256, sign_authentication_transcript,
+    sign_device_authorization, sign_key_directory as crypto_sign_key_directory,
+    sign_key_update as crypto_sign_key_update, sign_sealed as crypto_sign_sealed, sign_tbs,
+    verify_tbs,
 };
 use agentdeck_protocol::e2ee::{
-    DeviceAuthorizationV1, KeyDirectorySignatureContextV1, KeyDirectoryV1,
+    DeviceAuthorizationV1, DeviceKeyRecoveryInfoV1, DeviceKeyRecoveryReplyV1,
+    KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyUpdateInfoV1, KeyUpdateSetV1, KeyUpdateV1,
     MachineDataSignerBindingV1, OuterContextV1, PairRequestInfoV1, PairResponseInfoV1,
-    PairResponsePlaintextV1, PairResponseV1, PairingControlEnvelopeV1,
+    PairResponsePlaintextV1, PairResponseV1, PairingControlEnvelopeV1, SignedSealedBlobV1,
+    UnsignedSealedBlobV1,
 };
 use agentdeck_protocol::relay_v2::{
     AuthenticationTranscriptV1, CertRole, DeviceRevocation, Ed25519Signature, LinkGeneration,
@@ -40,8 +44,8 @@ use super::certificate::{
     verify_active_machine_certificate,
 };
 use super::identity::{
-    KeyDirectoryGuard, MachineIdentityError, MachineKeyMaterial, install_key_directory_guard,
-    load_key_directory_guard, load_machine_key_material,
+    KeyDirectoryGuard, MachineIdentityError, MachineKeyMaterial, advance_key_directory_guard,
+    install_key_directory_guard, load_key_directory_guard, load_machine_key_material,
     load_or_create_preparing_machine_key_material,
 };
 use super::trust_reset::{
@@ -71,6 +75,30 @@ pub(super) struct MachinePairingAnchor {
 impl fmt::Debug for MachinePairingAnchor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("MachinePairingAnchor([REDACTED])")
+    }
+}
+
+#[cfg(test)]
+pub(super) fn machine_pairing_anchor_for_test(
+    relay_server_id: RelayServerId,
+    machine_route: MachineRouteId,
+    binding: &MachineIdentityBinding,
+    data_certificate: SignedCertificate,
+) -> MachinePairingAnchor {
+    assert_eq!(
+        data_certificate.subject_pubkey.0, binding.data_sign_public_key,
+        "test MachineData certificate must match the authenticated Store binding"
+    );
+    MachinePairingAnchor {
+        relay_server_id,
+        machine_route,
+        root_public_key: PublicKeyBytes(binding.root_public_key),
+        root_fingerprint: binding.root_fingerprint,
+        root_key_id: RootKeyId::from_bytes(binding.root_key_id),
+        trust_epoch: TrustEpoch::new(binding.trust_epoch),
+        machine_hpke_public_key: PublicKeyBytes(binding.machine_hpke_public_key),
+        data_generation: LinkGeneration::new(binding.data_generation),
+        data_certificate,
     }
 }
 
@@ -116,6 +144,7 @@ impl MachinePairingAnchor {
     }
 }
 
+#[derive(Debug)]
 pub(super) enum MachinePairingError {
     Certificate(MachineCertificateError),
     Crypto,
@@ -210,6 +239,379 @@ impl fmt::Debug for RemoteBootstrapBlock {
 pub struct ActiveMachineIdentity {
     state: MachineIdentityStateRecord,
     material: MachineKeyMaterial,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KeyDirectoryRotationRecoveryEvidence {
+    identity: MachineIdentityStateRecord,
+    guard: KeyDirectoryGuard,
+    remote_machine_route: MachineRouteId,
+    remote_binding: MachineIdentityBinding,
+    remote_root_key_id: [u8; 16],
+    remote_root_fingerprint: [u8; 32],
+    remote_trust_epoch: u64,
+    global_revision: Option<u64>,
+    transition: Option<crate::runtime::store::key_transition::KeyTransitionRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyDirectoryRotationRecoveryAction {
+    AdvanceGuardThenStore {
+        operation_id: [u8; 16],
+        from_revision: u64,
+        to_revision: u64,
+    },
+    CompleteStore {
+        operation_id: [u8; 16],
+        from_revision: u64,
+        to_revision: u64,
+    },
+}
+
+fn plan_key_directory_rotation_recovery(
+    evidence: &KeyDirectoryRotationRecoveryEvidence,
+) -> Result<KeyDirectoryRotationRecoveryAction, RemoteBootstrapBlock> {
+    use crate::runtime::store::key_transition::{
+        KeyTransitionOperation, KeyTransitionPhase, KeyTransitionTarget,
+    };
+
+    let transition = evidence
+        .transition
+        .as_ref()
+        .ok_or(RemoteBootstrapBlock::STATE_FORK)?;
+    let global_revision = evidence
+        .global_revision
+        .ok_or(RemoteBootstrapBlock::STATE_FORK)?;
+    let binding = &evidence.identity.binding;
+    let operation_matches_target = match (transition.operation, transition.target) {
+        (
+            KeyTransitionOperation::Add | KeyTransitionOperation::Renew,
+            KeyTransitionTarget::Device(target),
+        ) => transition.recipients.contains(&target),
+        (KeyTransitionOperation::Revoke, KeyTransitionTarget::Device(target)) => {
+            !transition.recipients.contains(&target)
+        }
+        (
+            KeyTransitionOperation::ActivateConversation,
+            KeyTransitionTarget::Conversation {
+                conversation_id,
+                stream_route,
+            },
+        ) => conversation_id != [0; 16] && stream_route != [0; 16],
+        (KeyTransitionOperation::CounterRecovery, KeyTransitionTarget::Device(target)) => {
+            transition.recipients.contains(&target)
+        }
+        (
+            KeyTransitionOperation::CounterRecovery,
+            KeyTransitionTarget::Conversation {
+                conversation_id,
+                stream_route,
+            },
+        ) => conversation_id != [0; 16] && stream_route != [0; 16],
+        _ => false,
+    };
+    let recipients_are_canonical = transition
+        .recipients
+        .iter()
+        .enumerate()
+        .all(|(index, item)| {
+            item.device_route != [0; 16]
+                && item.grant_serial != 0
+                && transition.recipients[..index]
+                    .last()
+                    .is_none_or(|previous| previous < item)
+        });
+    if evidence.identity.lifecycle != MachineIdentityLifecycle::Active
+        || evidence.remote_machine_route.as_bytes() == &[0; 16]
+        || evidence.remote_binding != *binding
+        || evidence.remote_root_key_id != binding.root_key_id
+        || evidence.remote_root_fingerprint != binding.root_fingerprint
+        || evidence.remote_trust_epoch != binding.trust_epoch
+        || evidence.guard.database_id() != evidence.identity.database_id
+        || evidence.guard.root_fingerprint() != binding.root_fingerprint
+        || transition.operation_id == [0; 16]
+        || transition.phase != KeyTransitionPhase::DrainingOld
+        || transition.terminal.is_some()
+        || transition.update_count != 0
+        || !transition.cuts.is_empty()
+        || !operation_matches_target
+        || !recipients_are_canonical
+        || transition.to_revision
+            != transition
+                .from_revision
+                .checked_add(1)
+                .ok_or(RemoteBootstrapBlock::STATE_FORK)?
+        || transition.to_revision == 0
+        || global_revision != transition.to_revision
+        || binding.key_directory_revision != transition.from_revision
+    {
+        return Err(RemoteBootstrapBlock::STATE_FORK);
+    }
+
+    let action = match evidence.guard.key_directory_revision() {
+        revision if revision == transition.from_revision => {
+            KeyDirectoryRotationRecoveryAction::AdvanceGuardThenStore {
+                operation_id: transition.operation_id,
+                from_revision: transition.from_revision,
+                to_revision: transition.to_revision,
+            }
+        }
+        revision if revision == transition.to_revision => {
+            KeyDirectoryRotationRecoveryAction::CompleteStore {
+                operation_id: transition.operation_id,
+                from_revision: transition.from_revision,
+                to_revision: transition.to_revision,
+            }
+        }
+        _ => return Err(RemoteBootstrapBlock::STATE_FORK),
+    };
+    Ok(action)
+}
+
+#[derive(Debug)]
+enum KeyDirectoryRotationFinalizeError {
+    OutcomeUnknown,
+    Store(RuntimeStoreError),
+}
+
+#[async_trait::async_trait]
+trait KeyDirectoryRotationRecoveryStore: Sync {
+    async fn load_rotation_recovery_evidence(
+        &self,
+        guard: KeyDirectoryGuard,
+    ) -> Result<KeyDirectoryRotationRecoveryEvidence, RuntimeStoreError>;
+
+    async fn finalize_key_directory_rotation(
+        &self,
+        operation_id: [u8; 16],
+    ) -> Result<
+        crate::runtime::store::key_transition::KeyTransitionRecord,
+        KeyDirectoryRotationFinalizeError,
+    >;
+}
+
+#[async_trait::async_trait]
+impl KeyDirectoryRotationRecoveryStore for RuntimeStoreHandle {
+    async fn load_rotation_recovery_evidence(
+        &self,
+        guard: KeyDirectoryGuard,
+    ) -> Result<KeyDirectoryRotationRecoveryEvidence, RuntimeStoreError> {
+        let identity = self
+            .load_machine_identity_state()
+            .await?
+            .ok_or(RuntimeStoreError::MachineIdentityMissing)?;
+        let remote = self
+            .load_machine_enrollment_state()
+            .await?
+            .ok_or(RuntimeStoreError::MachineRemoteConflict)?;
+        let MachineEnrollmentState::Active(remote) = remote else {
+            return Err(RuntimeStoreError::MachineRemoteConflict);
+        };
+        let global_revision = self
+            .load_global_key_state()
+            .await?
+            .map(|global| global.revision().value());
+        let transition = self
+            .load_active_key_transition()
+            .await?
+            .map(|recovery| recovery.transition);
+        Ok(KeyDirectoryRotationRecoveryEvidence {
+            identity,
+            guard,
+            remote_machine_route: MachineRouteId::from_bytes(remote.record.machine_route),
+            remote_binding: remote.binding,
+            remote_root_key_id: remote.record.root_key_id,
+            remote_root_fingerprint: remote.record.root_fingerprint,
+            remote_trust_epoch: remote.record.trust_epoch,
+            global_revision,
+            transition,
+        })
+    }
+
+    async fn finalize_key_directory_rotation(
+        &self,
+        operation_id: [u8; 16],
+    ) -> Result<
+        crate::runtime::store::key_transition::KeyTransitionRecord,
+        KeyDirectoryRotationFinalizeError,
+    > {
+        match RuntimeStoreHandle::finalize_key_directory_rotation(self, operation_id).await {
+            Ok(record) => Ok(record),
+            Err(RuntimeStoreError::CommitOutcomeUnknown {
+                operation: RuntimeCommitOperation::FinalizeKeyDirectoryRotation,
+            }) => Err(KeyDirectoryRotationFinalizeError::OutcomeUnknown),
+            Err(error) => Err(KeyDirectoryRotationFinalizeError::Store(error)),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum KeyDirectoryRotationRecoveryOutcome {
+    Recovered(Box<MachineIdentityStateRecord>),
+    Blocked(RemoteBootstrapBlock),
+}
+
+/// production startup 与运行期 transition owner 共用的唯一 guard/Store recovery 编排。
+///
+/// 调用方只提供既有 Store/KeyStore owner；本 seam 固定执行 authenticated evidence
+/// 规划、必要的 guard exact CAS、单事务 Store finalize 与 exact reload，不允许下游复制
+/// 或跳过其中任一步。
+pub(crate) async fn recover_key_directory_rotation(
+    store: &RuntimeStoreHandle,
+    key_store: &dyn KeyStore,
+) -> Result<KeyDirectoryRotationRecoveryOutcome, RuntimeStoreError> {
+    drive_key_directory_rotation_recovery(store, key_store).await
+}
+
+async fn drive_key_directory_rotation_recovery<S: KeyDirectoryRotationRecoveryStore>(
+    store: &S,
+    key_store: &dyn KeyStore,
+) -> Result<KeyDirectoryRotationRecoveryOutcome, RuntimeStoreError> {
+    let guard = match load_key_directory_guard(key_store) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            return Ok(KeyDirectoryRotationRecoveryOutcome::Blocked(
+                RemoteBootstrapBlock::GUARD_MISSING,
+            ));
+        }
+        Err(error) => {
+            return Ok(KeyDirectoryRotationRecoveryOutcome::Blocked(
+                RemoteBootstrapBlock::identity(&error),
+            ));
+        }
+    };
+    let evidence = match store.load_rotation_recovery_evidence(guard).await {
+        Ok(evidence) => evidence,
+        Err(error) if rotation_store_error_is_state_fork(&error) => {
+            return Ok(KeyDirectoryRotationRecoveryOutcome::Blocked(
+                RemoteBootstrapBlock::STATE_FORK,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let action = match plan_key_directory_rotation_recovery(&evidence) {
+        Ok(action) => action,
+        Err(block) => return Ok(KeyDirectoryRotationRecoveryOutcome::Blocked(block)),
+    };
+    let (operation_id, from_revision, to_revision, advance_guard) = match action {
+        KeyDirectoryRotationRecoveryAction::AdvanceGuardThenStore {
+            operation_id,
+            from_revision,
+            to_revision,
+        } => (operation_id, from_revision, to_revision, true),
+        KeyDirectoryRotationRecoveryAction::CompleteStore {
+            operation_id,
+            from_revision,
+            to_revision,
+        } => (operation_id, from_revision, to_revision, false),
+    };
+    let expected_guard = KeyDirectoryGuard::new(
+        evidence.identity.database_id,
+        evidence.identity.binding.root_fingerprint,
+        from_revision,
+    );
+    let next_guard = KeyDirectoryGuard::new(
+        evidence.identity.database_id,
+        evidence.identity.binding.root_fingerprint,
+        to_revision,
+    );
+    if advance_guard
+        && let Err(error) = advance_key_directory_guard(key_store, expected_guard, next_guard)
+    {
+        return Ok(KeyDirectoryRotationRecoveryOutcome::Blocked(
+            RemoteBootstrapBlock::identity(&error),
+        ));
+    }
+
+    match store.finalize_key_directory_rotation(operation_id).await {
+        Ok(_) | Err(KeyDirectoryRotationFinalizeError::OutcomeUnknown) => {}
+        Err(KeyDirectoryRotationFinalizeError::Store(error))
+            if rotation_store_error_is_state_fork(&error) =>
+        {
+            return Ok(KeyDirectoryRotationRecoveryOutcome::Blocked(
+                RemoteBootstrapBlock::STATE_FORK,
+            ));
+        }
+        Err(KeyDirectoryRotationFinalizeError::Store(error)) => return Err(error),
+    }
+
+    let persisted_guard = match load_key_directory_guard(key_store) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            return Ok(KeyDirectoryRotationRecoveryOutcome::Blocked(
+                RemoteBootstrapBlock::GUARD_MISSING,
+            ));
+        }
+        Err(error) => {
+            return Ok(KeyDirectoryRotationRecoveryOutcome::Blocked(
+                RemoteBootstrapBlock::identity(&error),
+            ));
+        }
+    };
+    let reloaded = match store.load_rotation_recovery_evidence(persisted_guard).await {
+        Ok(evidence) => evidence,
+        Err(error) if rotation_store_error_is_state_fork(&error) => {
+            return Ok(KeyDirectoryRotationRecoveryOutcome::Blocked(
+                RemoteBootstrapBlock::STATE_FORK,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if !completed_rotation_matches(
+        &reloaded,
+        operation_id,
+        from_revision,
+        to_revision,
+        next_guard,
+    ) {
+        return Ok(KeyDirectoryRotationRecoveryOutcome::Blocked(
+            RemoteBootstrapBlock::STATE_FORK,
+        ));
+    }
+    Ok(KeyDirectoryRotationRecoveryOutcome::Recovered(Box::new(
+        reloaded.identity,
+    )))
+}
+
+fn completed_rotation_matches(
+    evidence: &KeyDirectoryRotationRecoveryEvidence,
+    operation_id: [u8; 16],
+    from_revision: u64,
+    to_revision: u64,
+    expected_guard: KeyDirectoryGuard,
+) -> bool {
+    use crate::runtime::store::key_transition::KeyTransitionPhase;
+
+    let Some(transition) = evidence.transition.as_ref() else {
+        return false;
+    };
+    evidence.identity.lifecycle == MachineIdentityLifecycle::Active
+        && evidence.identity.binding.key_directory_revision == to_revision
+        && evidence.guard == expected_guard
+        && evidence.remote_machine_route.as_bytes() != &[0; 16]
+        && evidence.remote_binding == evidence.identity.binding
+        && evidence.remote_root_key_id == evidence.identity.binding.root_key_id
+        && evidence.remote_root_fingerprint == evidence.identity.binding.root_fingerprint
+        && evidence.remote_trust_epoch == evidence.identity.binding.trust_epoch
+        && evidence.global_revision == Some(to_revision)
+        && transition.operation_id == operation_id
+        && transition.from_revision == from_revision
+        && transition.to_revision == to_revision
+        && transition.phase == KeyTransitionPhase::RotatedPreparingUpdates
+        && transition.terminal.is_none()
+        && transition.update_count == 0
+        && transition.cuts.is_empty()
+}
+
+const fn rotation_store_error_is_state_fork(error: &RuntimeStoreError) -> bool {
+    matches!(
+        error,
+        RuntimeStoreError::MachineIdentityMissing
+            | RuntimeStoreError::MachineIdentityConflict
+            | RuntimeStoreError::MachineRemoteConflict
+            | RuntimeStoreError::PublicationMismatch
+            | RuntimeStoreError::InvalidStateTransition
+    )
 }
 
 /// `LocalDeleted` 显式 re-enroll 的临时 key owner。
@@ -579,6 +981,86 @@ impl MachineLinkIdentityOwner {
         )?)
     }
 
+    /// 仅允许当前 MachineDataSign 对 protocol-owned KeyUpdate TBS 签名。
+    pub(super) fn sign_key_update(
+        &self,
+        anchor: &MachinePairingAnchor,
+        info: &KeyUpdateInfoV1,
+        context: &OuterContextV1,
+        update: KeyUpdateV1,
+    ) -> Result<KeyUpdateV1, MachinePairingError> {
+        if info.relay_server_id != anchor.relay_server_id
+            || info.machine_route != anchor.machine_route
+            || info.root_trust_epoch != anchor.trust_epoch
+        {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        let signer = MachineDataSignerBindingV1::from_certificate(&anchor.data_certificate)
+            .map_err(|_| MachinePairingError::Crypto)?;
+        Ok(crypto_sign_key_update(
+            self.identity.material.data_signing_key(),
+            &signer,
+            info,
+            context,
+            update,
+        )?)
+    }
+
+    /// 只允许当前 MachineDataSign 对 protocol 计算的 sealed-blob TBS 签名。
+    /// 调用方拿不到 raw signing key，也不能传入任意 preimage。
+    pub(super) fn sign_sealed(
+        &self,
+        anchor: &MachinePairingAnchor,
+        unsigned: UnsignedSealedBlobV1,
+        context: &OuterContextV1,
+    ) -> Result<SignedSealedBlobV1, MachinePairingError> {
+        if context.machine_route != Some(anchor.machine_route)
+            || context.relay_protocol_version
+                != agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION
+            || context.e2ee_format_version != agentdeck_protocol::e2ee::E2EE_FORMAT_VERSION
+            || context.validate().is_err()
+        {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        Ok(crypto_sign_sealed(
+            unsigned,
+            self.identity.material.data_signing_key(),
+            context,
+        ))
+    }
+
+    /// 只允许当前 root-certified MachineDataSign 与 exact DeviceHPKE recipient
+    /// 生成 protocol-owned CounterRecovery reply；不存在 raw signing 或 reply-AEAD 入口。
+    pub(super) fn seal_device_key_recovery_reply(
+        &self,
+        anchor: &MachinePairingAnchor,
+        recipient: &HpkePublicKey,
+        info: &DeviceKeyRecoveryInfoV1,
+        context: &OuterContextV1,
+        update_set: &KeyUpdateSetV1,
+        mut rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<DeviceKeyRecoveryReplyV1, MachinePairingError> {
+        if info.relay_server_id != anchor.relay_server_id
+            || info.machine_route != anchor.machine_route
+            || info.root_trust_epoch != anchor.trust_epoch
+        {
+            return Err(MachinePairingError::ContextMismatch);
+        }
+        let signer = MachineDataSignerBindingV1::from_certificate(&anchor.data_certificate)
+            .map_err(|_| MachinePairingError::Crypto)?;
+        Ok(seal_device_key_recovery_reply(
+            DeviceKeyRecoverySealAuthority {
+                device_hpke_public_key: recipient,
+                machine_data_signing_key: self.identity.material.data_signing_key(),
+                signer: &signer,
+            },
+            info,
+            context,
+            update_set,
+            &mut rng,
+        )?)
+    }
+
     pub(super) fn seal_pair_response(
         &self,
         anchor: &MachinePairingAnchor,
@@ -882,6 +1364,52 @@ async fn reconcile_existing(
         ));
     }
 
+    if state.lifecycle == MachineIdentityLifecycle::Active {
+        let global_revision = store
+            .load_global_key_state()
+            .await?
+            .map(|global| global.revision().value());
+        let active_transition = store.load_active_key_transition().await?;
+        let identity_revision = state.binding.key_directory_revision;
+        if global_revision.is_some_and(|revision| revision > identity_revision) {
+            return match recover_key_directory_rotation(store, key_store).await? {
+                KeyDirectoryRotationRecoveryOutcome::Recovered(recovered)
+                    if binding_matches_material(&recovered.binding, &material) =>
+                {
+                    Ok(RemoteBootstrapOutcome::Active(Box::new(
+                        ActiveMachineIdentity {
+                            state: *recovered,
+                            material,
+                        },
+                    )))
+                }
+                KeyDirectoryRotationRecoveryOutcome::Recovered(_) => Ok(
+                    RemoteBootstrapOutcome::Blocked(RemoteBootstrapBlock::STATE_FORK),
+                ),
+                KeyDirectoryRotationRecoveryOutcome::Blocked(block) => {
+                    Ok(RemoteBootstrapOutcome::Blocked(block))
+                }
+            };
+        }
+
+        let global_is_stable = match global_revision {
+            None => identity_revision == 0 && active_transition.is_none(),
+            Some(revision) if revision == identity_revision => {
+                active_transition.as_ref().is_none_or(|recovery| {
+                    recovery.transition.phase
+                        != crate::runtime::store::key_transition::KeyTransitionPhase::DrainingOld
+                        && recovery.transition.to_revision == identity_revision
+                })
+            }
+            Some(_) => false,
+        };
+        if !global_is_stable {
+            return Ok(RemoteBootstrapOutcome::Blocked(
+                RemoteBootstrapBlock::STATE_FORK,
+            ));
+        }
+    }
+
     let expected_guard = KeyDirectoryGuard::new(
         state.database_id,
         state.binding.root_fingerprint,
@@ -1093,10 +1621,17 @@ async fn settle_activate_unknown(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use agentdeck_protocol::relay_v2::{DeviceRouteId, GrantSerial};
 
     use super::*;
-    use crate::security::MemoryKeyStore;
+    use crate::runtime::store::key_transition::{
+        CounterRetirementLifecycle, KeyTransitionOperation, KeyTransitionPhase,
+        KeyTransitionRecipient, KeyTransitionRecord, KeyTransitionTarget,
+    };
+    use crate::security::{KeyStoreError, MemoryKeyStore, SecretBytes};
 
     const TEST_RELAY: RelayServerId = RelayServerId::from_bytes([0x41; 16]);
     const TEST_MACHINE: MachineRouteId = MachineRouteId::from_bytes([0x42; 16]);
@@ -1129,6 +1664,394 @@ mod tests {
             .pairing_anchor(TEST_RELAY, TEST_MACHINE, &data_certificate)
             .unwrap_or_else(|error| panic!("bind pairing authority: {}", error.code()));
         (owner, anchor, root_verifying_key)
+    }
+
+    fn rotation_recovery_evidence(guard_revision: u64) -> KeyDirectoryRotationRecoveryEvidence {
+        let keys = MemoryKeyStore::new();
+        let material = load_or_create_preparing_machine_key_material(&keys)
+            .expect("create recovery machine key material");
+        let binding = fresh_binding(&material, [0x63; 16]);
+        let recipient = KeyTransitionRecipient {
+            device_route: [0x64; 16],
+            grant_serial: 1,
+        };
+        KeyDirectoryRotationRecoveryEvidence {
+            identity: MachineIdentityStateRecord {
+                database_id: [0x65; 16],
+                lifecycle: MachineIdentityLifecycle::Active,
+                binding: binding.clone(),
+            },
+            guard: KeyDirectoryGuard::new([0x65; 16], binding.root_fingerprint, guard_revision),
+            remote_machine_route: MachineRouteId::from_bytes([0x66; 16]),
+            remote_binding: binding.clone(),
+            remote_root_key_id: binding.root_key_id,
+            remote_root_fingerprint: binding.root_fingerprint,
+            remote_trust_epoch: binding.trust_epoch,
+            global_revision: Some(1),
+            transition: Some(KeyTransitionRecord {
+                operation_id: [0x67; 16],
+                operation: KeyTransitionOperation::Add,
+                target: KeyTransitionTarget::Device(recipient),
+                from_revision: 0,
+                to_revision: 1,
+                phase: KeyTransitionPhase::DrainingOld,
+                terminal: None,
+                recipients: vec![recipient],
+                replay_retirement: None,
+                counter_retirement: CounterRetirementLifecycle::Pending,
+                cuts: Vec::new(),
+                update_count: 0,
+                created_at_ms: 10,
+                state_changed_at_ms: 10,
+                terminal_at_ms: None,
+                retain_until_ms: None,
+            }),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingKeyStore {
+        inner: MemoryKeyStore,
+        store_calls: AtomicUsize,
+    }
+
+    impl RecordingKeyStore {
+        fn reset_store_calls(&self) {
+            self.store_calls.store(0, Ordering::SeqCst);
+        }
+
+        fn store_calls(&self) -> usize {
+            self.store_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl KeyStore for RecordingKeyStore {
+        fn load(&self, account: &str) -> Result<Option<SecretBytes>, KeyStoreError> {
+            self.inner.load(account)
+        }
+
+        fn store(&self, account: &str, value: &SecretBytes) -> Result<(), KeyStoreError> {
+            self.store_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.store(account, value)
+        }
+
+        fn delete(&self, account: &str) -> Result<(), KeyStoreError> {
+            self.inner.delete(account)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FakeFinalizeMode {
+        Succeed,
+        FailBeforeCommitOnce,
+        OutcomeUnknownAfterCommitOnce,
+        CorruptReload,
+    }
+
+    struct FakeRotationRecoveryState {
+        evidence: KeyDirectoryRotationRecoveryEvidence,
+        mode: FakeFinalizeMode,
+        finalize_calls: usize,
+        guard_revisions_at_finalize: Vec<u64>,
+    }
+
+    struct FakeRotationRecoveryStore {
+        key_store: Arc<RecordingKeyStore>,
+        state: Mutex<FakeRotationRecoveryState>,
+    }
+
+    impl FakeRotationRecoveryStore {
+        fn new(
+            initial_guard_revision: u64,
+            mode: FakeFinalizeMode,
+        ) -> (Arc<RecordingKeyStore>, Self) {
+            let evidence = rotation_recovery_evidence(initial_guard_revision);
+            let key_store = Arc::new(RecordingKeyStore::default());
+            install_key_directory_guard(&*key_store, evidence.guard)
+                .expect("install rotation recovery guard");
+            key_store.reset_store_calls();
+            let store = Self {
+                key_store: Arc::clone(&key_store),
+                state: Mutex::new(FakeRotationRecoveryState {
+                    evidence,
+                    mode,
+                    finalize_calls: 0,
+                    guard_revisions_at_finalize: Vec::new(),
+                }),
+            };
+            (key_store, store)
+        }
+
+        fn finalize_calls(&self) -> usize {
+            self.state.lock().expect("fake store lock").finalize_calls
+        }
+
+        fn guard_revisions_at_finalize(&self) -> Vec<u64> {
+            self.state
+                .lock()
+                .expect("fake store lock")
+                .guard_revisions_at_finalize
+                .clone()
+        }
+
+        fn identity_revision(&self) -> u64 {
+            self.state
+                .lock()
+                .expect("fake store lock")
+                .evidence
+                .identity
+                .binding
+                .key_directory_revision
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KeyDirectoryRotationRecoveryStore for FakeRotationRecoveryStore {
+        async fn load_rotation_recovery_evidence(
+            &self,
+            guard: KeyDirectoryGuard,
+        ) -> Result<KeyDirectoryRotationRecoveryEvidence, RuntimeStoreError> {
+            let mut evidence = self.state.lock().expect("fake store lock").evidence.clone();
+            evidence.guard = guard;
+            Ok(evidence)
+        }
+
+        async fn finalize_key_directory_rotation(
+            &self,
+            operation_id: [u8; 16],
+        ) -> Result<
+            crate::runtime::store::key_transition::KeyTransitionRecord,
+            KeyDirectoryRotationFinalizeError,
+        > {
+            let guard = load_key_directory_guard(&*self.key_store)
+                .map_err(|_| {
+                    KeyDirectoryRotationFinalizeError::Store(RuntimeStoreError::WorkerStopped)
+                })?
+                .ok_or_else(|| {
+                    KeyDirectoryRotationFinalizeError::Store(RuntimeStoreError::WorkerStopped)
+                })?;
+            let mut state = self.state.lock().expect("fake store lock");
+            state.finalize_calls += 1;
+            state
+                .guard_revisions_at_finalize
+                .push(guard.key_directory_revision());
+            if state.mode == FakeFinalizeMode::FailBeforeCommitOnce {
+                state.mode = FakeFinalizeMode::Succeed;
+                return Err(KeyDirectoryRotationFinalizeError::Store(
+                    RuntimeStoreError::WorkerStopped,
+                ));
+            }
+
+            let transition = state.evidence.transition.as_mut().ok_or_else(|| {
+                KeyDirectoryRotationFinalizeError::Store(RuntimeStoreError::InvalidStateTransition)
+            })?;
+            if transition.operation_id != operation_id {
+                return Err(KeyDirectoryRotationFinalizeError::Store(
+                    RuntimeStoreError::InvalidStateTransition,
+                ));
+            }
+            let to_revision = transition.to_revision;
+            transition.phase = KeyTransitionPhase::RotatedPreparingUpdates;
+            state.evidence.identity.binding.key_directory_revision = to_revision;
+            state.evidence.remote_binding = state.evidence.identity.binding.clone();
+            if state.mode == FakeFinalizeMode::CorruptReload {
+                state.evidence.remote_trust_epoch = state
+                    .evidence
+                    .remote_trust_epoch
+                    .checked_add(1)
+                    .expect("test trust epoch");
+            }
+            let completed = state
+                .evidence
+                .transition
+                .as_ref()
+                .expect("completed fake transition")
+                .clone();
+            if state.mode == FakeFinalizeMode::OutcomeUnknownAfterCommitOnce {
+                state.mode = FakeFinalizeMode::Succeed;
+                return Err(KeyDirectoryRotationFinalizeError::OutcomeUnknown);
+            }
+            Ok(completed)
+        }
+    }
+
+    #[test]
+    fn guard_rotation_recovery_accepts_only_the_two_exact_one_step_crash_states() {
+        let from = rotation_recovery_evidence(0);
+        assert_eq!(
+            plan_key_directory_rotation_recovery(&from),
+            Ok(KeyDirectoryRotationRecoveryAction::AdvanceGuardThenStore {
+                operation_id: [0x67; 16],
+                from_revision: 0,
+                to_revision: 1,
+            })
+        );
+
+        let to = rotation_recovery_evidence(1);
+        assert_eq!(
+            plan_key_directory_rotation_recovery(&to),
+            Ok(KeyDirectoryRotationRecoveryAction::CompleteStore {
+                operation_id: [0x67; 16],
+                from_revision: 0,
+                to_revision: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn guard_rotation_recovery_rejects_missing_gap_phase_operation_and_binding_forks() {
+        let mut invalid = Vec::new();
+
+        let mut missing_transition = rotation_recovery_evidence(0);
+        missing_transition.transition = None;
+        invalid.push(missing_transition);
+
+        let mut missing_global = rotation_recovery_evidence(0);
+        missing_global.global_revision = None;
+        invalid.push(missing_global);
+
+        let mut global_gap = rotation_recovery_evidence(0);
+        global_gap.global_revision = Some(2);
+        invalid.push(global_gap);
+
+        let mut transition_gap = rotation_recovery_evidence(0);
+        transition_gap
+            .transition
+            .as_mut()
+            .expect("transition")
+            .to_revision = 2;
+        invalid.push(transition_gap);
+
+        let mut wrong_phase = rotation_recovery_evidence(0);
+        wrong_phase.transition.as_mut().expect("transition").phase =
+            KeyTransitionPhase::RotatedPreparingUpdates;
+        invalid.push(wrong_phase);
+
+        let mut wrong_operation = rotation_recovery_evidence(0);
+        wrong_operation
+            .transition
+            .as_mut()
+            .expect("transition")
+            .operation = KeyTransitionOperation::ActivateConversation;
+        invalid.push(wrong_operation);
+
+        let mut wrong_database = rotation_recovery_evidence(0);
+        wrong_database.guard = KeyDirectoryGuard::new(
+            [0x68; 16],
+            wrong_database.identity.binding.root_fingerprint,
+            0,
+        );
+        invalid.push(wrong_database);
+
+        let mut wrong_root = rotation_recovery_evidence(0);
+        wrong_root.remote_root_fingerprint = [0x69; 32];
+        invalid.push(wrong_root);
+
+        let mut wrong_machine = rotation_recovery_evidence(0);
+        wrong_machine.remote_machine_route = MachineRouteId::from_bytes([0; 16]);
+        invalid.push(wrong_machine);
+
+        let mut wrong_remote_binding = rotation_recovery_evidence(0);
+        wrong_remote_binding.remote_binding.key_directory_revision = 1;
+        invalid.push(wrong_remote_binding);
+
+        let mut identity_ahead_of_draining_transition = rotation_recovery_evidence(1);
+        identity_ahead_of_draining_transition
+            .identity
+            .binding
+            .key_directory_revision = 1;
+        identity_ahead_of_draining_transition
+            .remote_binding
+            .key_directory_revision = 1;
+        invalid.push(identity_ahead_of_draining_transition);
+
+        let wrong_guard_revision = rotation_recovery_evidence(2);
+        invalid.push(wrong_guard_revision);
+
+        for evidence in invalid {
+            assert_eq!(
+                plan_key_directory_rotation_recovery(&evidence),
+                Err(RemoteBootstrapBlock::STATE_FORK),
+                "invalid recovery evidence must fail closed: {evidence:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_rotation_recovery_orders_cas_before_finalize_and_skips_redundant_cas() {
+        for (initial_guard_revision, expected_store_calls) in [(0, 1), (1, 0)] {
+            let (key_store, store) =
+                FakeRotationRecoveryStore::new(initial_guard_revision, FakeFinalizeMode::Succeed);
+            let outcome = drive_key_directory_rotation_recovery(&store, &*key_store)
+                .await
+                .expect("drive exact recovery");
+            let KeyDirectoryRotationRecoveryOutcome::Recovered(identity) = outcome else {
+                panic!("exact one-step crash state must recover")
+            };
+            assert_eq!(identity.binding.key_directory_revision, 1);
+            assert_eq!(key_store.store_calls(), expected_store_calls);
+            assert_eq!(store.finalize_calls(), 1);
+            assert_eq!(store.guard_revisions_at_finalize(), vec![1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_rotation_recovery_restarts_after_before_commit_store_failure() {
+        let (key_store, store) =
+            FakeRotationRecoveryStore::new(0, FakeFinalizeMode::FailBeforeCommitOnce);
+        let error = drive_key_directory_rotation_recovery(&store, &*key_store)
+            .await
+            .expect_err("before-COMMIT store failure remains fatal for this startup");
+        assert!(matches!(error, RuntimeStoreError::WorkerStopped));
+        assert_eq!(store.identity_revision(), 0);
+        assert_eq!(
+            load_key_directory_guard(&*key_store)
+                .expect("load advanced guard")
+                .expect("guard remains installed")
+                .key_directory_revision(),
+            1
+        );
+        assert_eq!(key_store.store_calls(), 1);
+
+        let outcome = drive_key_directory_rotation_recovery(&store, &*key_store)
+            .await
+            .expect("restart completes guard-ahead Store state");
+        assert!(matches!(
+            outcome,
+            KeyDirectoryRotationRecoveryOutcome::Recovered(_)
+        ));
+        assert_eq!(store.identity_revision(), 1);
+        assert_eq!(key_store.store_calls(), 1, "restart must not rewrite guard");
+        assert_eq!(store.finalize_calls(), 2);
+        assert_eq!(store.guard_revisions_at_finalize(), vec![1, 1]);
+    }
+
+    #[tokio::test]
+    async fn guard_rotation_recovery_settles_after_commit_unknown_by_exact_reload() {
+        let (key_store, store) =
+            FakeRotationRecoveryStore::new(0, FakeFinalizeMode::OutcomeUnknownAfterCommitOnce);
+        let outcome = drive_key_directory_rotation_recovery(&store, &*key_store)
+            .await
+            .expect("exact reload settles after-COMMIT unknown");
+        let KeyDirectoryRotationRecoveryOutcome::Recovered(identity) = outcome else {
+            panic!("committed exact state must settle as recovered")
+        };
+        assert_eq!(identity.binding.key_directory_revision, 1);
+        assert_eq!(store.finalize_calls(), 1);
+        assert_eq!(store.guard_revisions_at_finalize(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn guard_rotation_recovery_blocks_inconsistent_exact_reload() {
+        let (key_store, store) = FakeRotationRecoveryStore::new(0, FakeFinalizeMode::CorruptReload);
+        let outcome = drive_key_directory_rotation_recovery(&store, &*key_store)
+            .await
+            .expect("state fork is a remote-only block");
+        assert_eq!(
+            outcome,
+            KeyDirectoryRotationRecoveryOutcome::Blocked(RemoteBootstrapBlock::STATE_FORK)
+        );
+        assert_eq!(store.finalize_calls(), 1);
     }
 
     fn unsigned_grant(anchor: &MachinePairingAnchor, device_key: PublicKeyBytes) -> RelayGrant {

@@ -171,10 +171,16 @@ fn open_retention_state(
             .expect("secure retention test root");
     }
     let ids = [
+        (super::super::RuntimeIdKind::RemoteOutbox, 0x90),
+        (super::super::RuntimeIdKind::RemoteOutbox, 0x91),
+        (super::super::RuntimeIdKind::RemoteOutbox, 0x92),
         (super::super::RuntimeIdKind::Event, 0x86),
         (super::super::RuntimeIdKind::Command, 0x80),
         (super::super::RuntimeIdKind::Turn, 0x81),
         (super::super::RuntimeIdKind::Event, 0x82),
+        (super::super::RuntimeIdKind::RemoteOutbox, 0x93),
+        (super::super::RuntimeIdKind::RemoteOutbox, 0x94),
+        (super::super::RuntimeIdKind::RemoteOutbox, 0x95),
         (super::super::RuntimeIdKind::Event, 0x87),
         (super::super::RuntimeIdKind::Command, 0x83),
         (super::super::RuntimeIdKind::Turn, 0x84),
@@ -329,25 +335,20 @@ fn freeze_exact_event_publication(
     seed: u8,
 ) {
     let now_ms = config.clock.now_ms().expect("publication test clock");
-    let stream_id = [seed; 16];
-    let generation = [seed.wrapping_add(1); 16];
-    super::super::publication::create_publication_stream(
-        state,
-        config,
-        stream_id,
-        super::super::publication::PublicationScope::Conversation(conversation_id),
-        [seed.wrapping_add(2); 16],
-        generation,
-        now_ms,
+    let mapping = super::super::publication::load_conversation_publication_mapping(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        conversation_id,
     )
-    .expect("create production publication stream");
+    .expect("load production conversation publication mapping");
     super::super::publication::freeze_publication(
         state,
         config,
         super::super::publication::FreezePublicationRequest {
             publication_id: [seed.wrapping_add(3); 16],
-            publication_stream_id: stream_id,
-            generation,
+            publication_stream_id: mapping.publication_stream_id,
+            generation: mapping.generation,
             counter_scope_token: [seed.wrapping_add(4); 32],
             sender_counter: 1,
             inner_after: None,
@@ -752,11 +753,14 @@ fn pinned_reader_and_rows_survive_rejected_writer_trim() {
         trim_unrecorded_conversation_window(
             &transaction,
             &key_bundle,
+            database_id,
             conversation_id.as_bytes(),
-            true,
-            1,
-            1,
-            MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+            ConversationTrimPolicy {
+                respect_pins: true,
+                now_ms: 1,
+                max_events: 1,
+                max_bytes: MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+            },
         ),
         Err(RuntimeStoreError::WorkerBusy {
             lane: crate::runtime::model::RuntimeStoreLane::Normal,
@@ -793,11 +797,14 @@ fn pinned_reader_and_rows_survive_rejected_writer_trim() {
         trim_unrecorded_conversation_window(
             &transaction,
             &key_bundle,
+            database_id,
             conversation_id.as_bytes(),
-            true,
-            1,
-            1,
-            MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+            ConversationTrimPolicy {
+                respect_pins: true,
+                now_ms: 1,
+                max_events: 1,
+                max_bytes: MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+            },
         ),
         Err(RuntimeStoreError::PublicationNeedsSnapshot)
     ));
@@ -858,11 +865,14 @@ fn journal_retention_uses_10000_events_or_64mib_and_512mib_global() {
     trim_unrecorded_conversation_window(
         &transaction,
         &key_bundle,
+        database_id,
         conversation_id.as_bytes(),
-        false,
-        0,
-        3,
-        u64::MAX,
+        ConversationTrimPolicy {
+            respect_pins: false,
+            now_ms: 0,
+            max_events: 3,
+            max_bytes: u64::MAX,
+        },
     )
     .expect("count cap trims oldest suffix row");
     transaction.commit().expect("commit count trim");
@@ -895,11 +905,14 @@ fn journal_retention_uses_10000_events_or_64mib_and_512mib_global() {
     trim_unrecorded_conversation_window(
         &transaction,
         &key_bundle,
+        database_id,
         conversation_id.as_bytes(),
-        false,
-        0,
-        u64::MAX,
-        u64::try_from(newest_bytes).expect("positive logical event bytes"),
+        ConversationTrimPolicy {
+            respect_pins: false,
+            now_ms: 0,
+            max_events: u64::MAX,
+            max_bytes: u64::try_from(newest_bytes).expect("positive logical event bytes"),
+        },
     )
     .expect("byte cap independently trims oldest suffix rows");
     transaction.commit().expect("commit byte trim");
@@ -928,6 +941,7 @@ fn journal_retention_uses_10000_events_or_64mib_and_512mib_global() {
     trim_global_event_window_with_limits(
         &transaction,
         state.key_bundle.as_ref(),
+        state.database_id,
         false,
         0,
         1,
@@ -959,11 +973,14 @@ fn ready_snapshot_authorizes_production_conversation_trim() {
     trim_unrecorded_conversation_window(
         &transaction,
         state.key_bundle.as_ref(),
+        state.database_id,
         conversation_id.as_bytes(),
-        true,
-        config.clock.now_ms().expect("ready snapshot trim clock"),
-        0,
-        MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+        ConversationTrimPolicy {
+            respect_pins: true,
+            now_ms: config.clock.now_ms().expect("ready snapshot trim clock"),
+            max_events: 0,
+            max_bytes: MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+        },
     )
     .expect("authenticated ready snapshot covers victim");
     transaction.commit().expect("commit snapshot-covered trim");
@@ -1016,11 +1033,14 @@ fn equal_length_snapshot_ciphertext_tamper_cannot_authorize_trim() {
     trim_unrecorded_conversation_window(
         &transaction,
         state.key_bundle.as_ref(),
+        state.database_id,
         conversation_id.as_bytes(),
-        true,
-        config.clock.now_ms().expect("tamper trim clock"),
-        0,
-        MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+        ConversationTrimPolicy {
+            respect_pins: true,
+            now_ms: config.clock.now_ms().expect("tamper trim clock"),
+            max_events: 0,
+            max_bytes: MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+        },
     )
     .expect_err("tampered snapshot cannot authorize replay membership deletion");
     drop(transaction);
@@ -1068,11 +1088,14 @@ fn expired_snapshot_pin_is_purged_by_trim_and_cannot_revive() {
     trim_unrecorded_conversation_window(
         &transaction,
         state.key_bundle.as_ref(),
+        state.database_id,
         conversation_id.as_bytes(),
-        true,
-        trim_now_ms,
-        0,
-        MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+        ConversationTrimPolicy {
+            respect_pins: true,
+            now_ms: trim_now_ms,
+            max_events: 0,
+            max_bytes: MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+        },
     )
     .expect("pin at exact expiry no longer blocks ready-snapshot trim");
     transaction.commit().expect("commit expired-pin trim");
@@ -1110,11 +1133,14 @@ fn exact_authenticated_outbox_does_not_authorize_production_conversation_trim() 
     let error = trim_unrecorded_conversation_window(
         &transaction,
         state.key_bundle.as_ref(),
+        state.database_id,
         conversation_id.as_bytes(),
-        true,
-        config.clock.now_ms().expect("outbox-only trim clock"),
-        0,
-        MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+        ConversationTrimPolicy {
+            respect_pins: true,
+            now_ms: config.clock.now_ms().expect("outbox-only trim clock"),
+            max_events: 0,
+            max_bytes: MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+        },
     )
     .expect_err("outbox is not a locally consumable replay replacement");
     assert!(matches!(error, RuntimeStoreError::PublicationNeedsSnapshot));
@@ -1163,11 +1189,14 @@ fn active_snapshot_pin_blocks_both_replacements_and_rollback_preserves_state() {
     let trim_error = trim_unrecorded_conversation_window(
         &transaction,
         state.key_bundle.as_ref(),
+        state.database_id,
         conversation_id.as_bytes(),
-        true,
-        now_ms,
-        0,
-        MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+        ConversationTrimPolicy {
+            respect_pins: true,
+            now_ms,
+            max_events: 0,
+            max_bytes: MAX_EVENT_STREAM_BYTES_PER_CONVERSATION,
+        },
     )
     .expect_err("active snapshot pin must block both durable replacements");
     assert!(
@@ -1215,6 +1244,7 @@ fn global_trim_skips_blocked_oldest_and_trims_eligible_conversation() {
     trim_global_event_window_with_limits(
         &transaction,
         state.key_bundle.as_ref(),
+        state.database_id,
         true,
         now_ms,
         2,

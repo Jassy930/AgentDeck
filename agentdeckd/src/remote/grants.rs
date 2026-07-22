@@ -5,6 +5,7 @@
 //! 才允许注入固定熵源。
 
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdeck_crypto::{
     HpkePublicKey, SecretAeadKey, SignatureBytes, VerifyingKey, sha256,
@@ -19,14 +20,14 @@ use agentdeck_protocol::e2ee::{
 use agentdeck_protocol::relay_v2::{
     DeviceRouteId, Ed25519Signature, GrantSerial, KeyDirectoryRevision, LinkGeneration,
     MachineRouteId, PublicKeyBytes, RELAY_PROTOCOL_VERSION, RelayGrant, RelayServerId, RootKeyId,
-    SignedCertificate, TrustEpoch,
+    SignedCertificate, StreamRouteId, TrustEpoch,
 };
 use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::runtime::store::pairing_grant::{
-    ConfirmPairingGrant, GlobalKeyStateV1, PairingGrantPreparation,
+    ConfirmPairingGrant, ConversationKeyRotation, GlobalKeyStateV1, PairingGrantPreparation,
 };
 use crate::runtime::store::{GrantAllocationProjection, RuntimeId};
 use crate::security::SecretBytes;
@@ -161,17 +162,19 @@ impl GrantAllocation {
 
     fn from_projection(
         projection: GrantAllocationProjection,
-    ) -> Result<(Self, Option<GlobalKeyStateV1>), GrantFreezeError> {
-        let (allocation, current_global_keys) = match projection {
+    ) -> Result<(Self, Option<GlobalKeyStateV1>, Vec<StreamRouteId>), GrantFreezeError> {
+        let (allocation, current_global_keys, active_conversation_routes) = match projection {
             GrantAllocationProjection::New {
                 device_sign_fingerprint,
                 current_global_keys,
+                active_conversation_routes,
             } => (
                 Self::from_authenticated(
                     device_sign_fingerprint,
                     GrantAllocationState::NewFingerprint,
                 )?,
                 current_global_keys,
+                active_conversation_routes,
             ),
             GrantAllocationProjection::Renew {
                 device_sign_fingerprint,
@@ -187,10 +190,15 @@ impl GrantAllocation {
                     grant_serial: next_serial,
                 };
                 allocation.validate(device_sign_fingerprint)?;
-                (allocation, Some(current_global_keys))
+                let active_conversation_routes = current_global_keys.active_conversation_routes();
+                (
+                    allocation,
+                    Some(current_global_keys),
+                    active_conversation_routes,
+                )
             }
         };
-        Ok((allocation, current_global_keys))
+        Ok((allocation, current_global_keys, active_conversation_routes))
     }
 
     #[cfg(test)]
@@ -262,6 +270,7 @@ pub(crate) struct GrantFreezeBuilder<'a> {
     invite_anchor: &'a PairingInviteAnchor,
     authority: &'a PairingMachineAuthority,
     current_global_keys: Option<GlobalKeyStateV1>,
+    active_conversation_routes: Vec<StreamRouteId>,
     allocation: GrantAllocation,
     next_key_directory_revision: KeyDirectoryRevision,
 }
@@ -280,7 +289,14 @@ impl<'a> GrantFreezeBuilder<'a> {
         projection: GrantAllocationProjection,
     ) -> Result<Self, GrantFreezeError> {
         let expected_fingerprint = sha256(&preparation.request().device_sign_pubkey.0);
-        let (allocation, current_global_keys) = GrantAllocation::from_projection(projection)?;
+        let (allocation, current_global_keys, active_conversation_routes) =
+            GrantAllocation::from_projection(projection)?;
+        if current_global_keys
+            .as_ref()
+            .is_some_and(|global| global.active_conversation_routes() != active_conversation_routes)
+        {
+            return Err(GrantFreezeError::KeyStateConflict);
+        }
         allocation.validate(expected_fingerprint)?;
         let current_revision = current_global_keys
             .as_ref()
@@ -293,6 +309,7 @@ impl<'a> GrantFreezeBuilder<'a> {
             invite_anchor,
             authority,
             current_global_keys,
+            active_conversation_routes,
             allocation,
             next_key_directory_revision,
         })
@@ -310,10 +327,11 @@ impl<'a> GrantFreezeBuilder<'a> {
             request_hash: self.preparation.request_hash(),
             request: self.preparation.request(),
         };
-        freeze_with_allocation(
+        freeze_with_authenticated_allocation(
             material,
             expected_anchor,
             self.current_global_keys,
+            self.active_conversation_routes,
             self.allocation,
             self.next_key_directory_revision,
             &authority,
@@ -606,11 +624,42 @@ where
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn freeze_with_allocation<F>(
     material: FrozenRequestMaterial<'_>,
     expected_anchor: AuthorityBinding,
     current_global_keys: Option<GlobalKeyStateV1>,
+    allocation: GrantAllocation,
+    next_revision: KeyDirectoryRevision,
+    authority: &impl GrantCryptographicAuthority,
+    entropy: F,
+) -> Result<FrozenGrantArtifacts, GrantFreezeError>
+where
+    F: FnMut(&mut [u8]) -> Result<(), GrantFreezeError>,
+{
+    let active_conversation_routes = current_global_keys
+        .as_ref()
+        .map(GlobalKeyStateV1::active_conversation_routes)
+        .unwrap_or_default();
+    freeze_with_authenticated_allocation(
+        material,
+        expected_anchor,
+        current_global_keys,
+        active_conversation_routes,
+        allocation,
+        next_revision,
+        authority,
+        entropy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn freeze_with_authenticated_allocation<F>(
+    material: FrozenRequestMaterial<'_>,
+    expected_anchor: AuthorityBinding,
+    current_global_keys: Option<GlobalKeyStateV1>,
+    active_conversation_routes: Vec<StreamRouteId>,
     allocation: GrantAllocation,
     next_revision: KeyDirectoryRevision,
     authority: &impl GrantCryptographicAuthority,
@@ -627,6 +676,7 @@ where
         &material,
         &expected_anchor,
         current_global_keys.as_ref(),
+        &active_conversation_routes,
         &allocation,
         next_revision,
     )?;
@@ -639,6 +689,22 @@ where
     let catalog_key = random_secret_key(&mut entropy)?;
     let command_key = random_secret_key_distinct(&mut entropy, &[&*catalog_key])?;
     let reply_key = random_secret_key_distinct(&mut entropy, &[&*catalog_key, &*command_key])?;
+    let conversation_rotations = active_conversation_routes
+        .iter()
+        .copied()
+        .map(|stream_route| {
+            random_secret_key(&mut entropy).map(|key| {
+                ConversationKeyRotation::new(stream_route, SecretBytes::new(key.as_ref().to_vec()))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let retired_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| GrantFreezeError::CryptoFailure)?
+        .as_millis()
+        .try_into()
+        .map_err(|_| GrantFreezeError::CryptoFailure)?;
+    let initial_global = current_global_keys.is_none();
 
     let global_key_state = transition_global_key_state(
         current_global_keys,
@@ -647,6 +713,8 @@ where
         catalog_key,
         command_key,
         reply_key,
+        conversation_rotations,
+        retired_at_ms,
         allocation.is_renewal(),
     )?;
 
@@ -686,9 +754,9 @@ where
         grant_serial,
         root_trust_epoch: expected_anchor.trust_epoch,
     };
-    let mut entries = Vec::with_capacity(3);
+    let mut entries = Vec::with_capacity(3 + active_conversation_routes.len());
     for view in global_key_state
-        .bootstrap_view(device_route)
+        .install_directory_view(device_route)
         .map_err(|_| GrantFreezeError::KeyStateConflict)?
     {
         let info = KeyUpdateInfoV1 {
@@ -697,7 +765,7 @@ where
             relay_server_id: expected_anchor.relay_server_id,
             machine_route: expected_anchor.machine_route,
             device_route,
-            stream_route: None,
+            stream_route: view.stream_route,
             grant_serial,
             root_trust_epoch: expected_anchor.trust_epoch,
             key_directory_revision: next_revision,
@@ -708,7 +776,12 @@ where
         entries.push(authority.seal_key_directory_entry(&recipient, &info, &context, &view.key)?);
     }
     entries.sort_by_key(|entry| key_purpose_rank(entry.key_id.purpose));
-    validate_bootstrap_entries(&entries, device_route)?;
+    validate_install_entries(
+        &entries,
+        device_route,
+        &active_conversation_routes,
+        initial_global,
+    )?;
     let key_directory = authority.sign_key_directory(
         &directory_context,
         KeyDirectoryV1 {
@@ -757,6 +830,8 @@ where
         &directory_context,
         &key_directory,
         next_revision,
+        &active_conversation_routes,
+        initial_global,
         &response_info,
         &response_context,
         &pair_response,
@@ -804,9 +879,21 @@ fn validate_frozen_material(
     material: &FrozenRequestMaterial<'_>,
     anchor: &AuthorityBinding,
     current_global_keys: Option<&GlobalKeyStateV1>,
+    active_conversation_routes: &[StreamRouteId],
     allocation: &GrantAllocation,
     next_revision: KeyDirectoryRevision,
 ) -> Result<HpkePublicKey, GrantFreezeError> {
+    if active_conversation_routes
+        .iter()
+        .any(|route| route.as_bytes() == &[0; 16])
+        || active_conversation_routes
+            .windows(2)
+            .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+        || current_global_keys
+            .is_some_and(|global| global.active_conversation_routes() != active_conversation_routes)
+    {
+        return Err(GrantFreezeError::KeyStateConflict);
+    }
     material
         .invite
         .validate_static()
@@ -871,6 +958,8 @@ fn verify_frozen_outputs(
     directory_context: &KeyDirectorySignatureContextV1,
     directory: &KeyDirectoryV1,
     expected_revision: KeyDirectoryRevision,
+    active_conversation_routes: &[StreamRouteId],
+    initial_global: bool,
     response_info: &PairResponseInfoV1,
     response_context: &OuterContextV1,
     response: &PairResponseV1,
@@ -891,9 +980,21 @@ fn verify_frozen_outputs(
     authorization
         .validate_for_grant(grant)
         .map_err(|_| GrantFreezeError::CryptoFailure)?;
-    directory
-        .validate_bootstrap_for_device(grant.device_route)
-        .map_err(|_| GrantFreezeError::CryptoFailure)?;
+    if initial_global {
+        directory
+            .validate_initial_directory_for_device(grant.device_route, active_conversation_routes)
+            .map_err(|_| GrantFreezeError::CryptoFailure)?;
+    } else {
+        directory
+            .validate_for_device(grant.device_route)
+            .map_err(|_| GrantFreezeError::CryptoFailure)?;
+        validate_install_entries(
+            &directory.entries,
+            grant.device_route,
+            active_conversation_routes,
+            false,
+        )?;
+    }
 
     let root_verifier = VerifyingKey::from_bytes(&anchor.root_public_key.0)
         .map_err(|_| GrantFreezeError::AuthorityMismatch)?;
@@ -922,6 +1023,7 @@ fn verify_frozen_outputs(
     .map_err(|_| GrantFreezeError::CryptoFailure)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transition_global_key_state(
     current: Option<GlobalKeyStateV1>,
     next_revision: KeyDirectoryRevision,
@@ -929,6 +1031,8 @@ fn transition_global_key_state(
     catalog_key: Zeroizing<[u8; 32]>,
     command_key: Zeroizing<[u8; 32]>,
     reply_key: Zeroizing<[u8; 32]>,
+    conversation_rotations: Vec<ConversationKeyRotation>,
+    retired_at_ms: u64,
     renewal: bool,
 ) -> Result<GlobalKeyStateV1, GrantFreezeError> {
     let catalog_key = SecretBytes::new(catalog_key.as_ref().to_vec());
@@ -938,11 +1042,18 @@ fn transition_global_key_state(
         (Some(current), true) => {
             current.renew_for_device(device_route, catalog_key, command_key, reply_key)
         }
-        (Some(current), false) => {
-            current.next_for_device(device_route, catalog_key, command_key, reply_key)
-        }
+        (Some(current), false) => current
+            .plan_add_device(
+                device_route,
+                catalog_key,
+                command_key,
+                reply_key,
+                conversation_rotations,
+                retired_at_ms,
+            )
+            .map(|plan| plan.into_state()),
         (None, true) => Err(crate::runtime::store::RuntimeStoreError::PairingConflict),
-        (None, false) => GlobalKeyStateV1::bootstrap(
+        (None, false) => GlobalKeyStateV1::bootstrap_with_conversations(
             next_revision.value(),
             FIRST_KEY_EPOCH,
             catalog_key,
@@ -951,6 +1062,7 @@ fn transition_global_key_state(
             command_key,
             FIRST_KEY_EPOCH,
             reply_key,
+            conversation_rotations,
         ),
     }
     .map_err(|_| GrantFreezeError::KeyStateConflict)?;
@@ -1001,22 +1113,31 @@ fn key_purpose_rank(purpose: KeyPurpose) -> u8 {
     }
 }
 
-fn validate_bootstrap_entries(
+fn validate_install_entries(
     entries: &[KeyDirectoryEntry],
     device_route: DeviceRouteId,
+    active_conversation_routes: &[StreamRouteId],
+    require_epoch_one: bool,
 ) -> Result<(), GrantFreezeError> {
-    let expected = [
-        KeyPurpose::Catalog,
-        KeyPurpose::DeviceCommandTx,
-        KeyPurpose::DeviceReplyTx,
-    ];
-    if entries.len() != expected.len()
-        || entries.iter().zip(expected).any(|(entry, purpose)| {
-            entry.key_id.purpose != purpose
-                || entry.device_route != device_route
-                || entry.stream_route.is_some()
-        })
-    {
+    let mut catalog = 0_usize;
+    let mut command = 0_usize;
+    let mut reply = 0_usize;
+    let mut observed_routes = Vec::new();
+    for entry in entries {
+        if entry.device_route != device_route || (require_epoch_one && entry.key_id.epoch != 1) {
+            return Err(GrantFreezeError::CryptoFailure);
+        }
+        match entry.key_id.purpose {
+            KeyPurpose::Catalog if entry.stream_route.is_none() => catalog += 1,
+            KeyPurpose::DeviceCommandTx if entry.stream_route.is_none() => command += 1,
+            KeyPurpose::DeviceReplyTx if entry.stream_route.is_none() => reply += 1,
+            KeyPurpose::ConversationDek => {
+                observed_routes.push(entry.stream_route.ok_or(GrantFreezeError::CryptoFailure)?);
+            }
+            _ => return Err(GrantFreezeError::CryptoFailure),
+        }
+    }
+    if catalog != 1 || command != 1 || reply != 1 || observed_routes != active_conversation_routes {
         return Err(GrantFreezeError::CryptoFailure);
     }
     Ok(())

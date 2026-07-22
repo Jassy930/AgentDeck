@@ -1,11 +1,11 @@
-//! P4.4 RemoteLink / dispatch compile-RED。
+//! P4.4 RemoteLink 边界与 P4.5 durable crypto/publication 接线回归。
 //!
 //! production 只冻结 reply sealer 的安全签名；其余组合经单个 test fixture 表达，避免为
 //! RED 测试引入第二套 authorization Store/Core trait。
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agentdeck_crypto::replay::{ReplayDisposition, ReplayWindow};
 use agentdeck_protocol::e2ee::{KeyId, KeyPurpose, SignedSealedBlobV1, UnsignedSealedBlobV1};
 use agentdeck_protocol::relay_v2::{
     DeviceRouteId, Ed25519Signature, MachineRouteId, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION,
@@ -21,8 +21,9 @@ use agentdeck_protocol::runtime::{
     ArtifactSha256, CatalogDelta, ConversationMetadataMutation,
     ConversationMetadataMutationRequest, ConversationMetadataReceipt, LocalOnlyAdministration,
     RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeFailure, RuntimeInnerCursor, RuntimeMessage,
-    RuntimeReply, RuntimeRequest, RuntimeStreamItem, RuntimeSyncComplete, StageUpgradeReceipt,
-    StageUpgradeRequest, StreamCursor, TransferEnvelope,
+    RuntimeReply, RuntimeRequest, RuntimeStreamItem, RuntimeSyncComplete, RuntimeTransferCarrierV1,
+    RuntimeTransferChannel, StageUpgradeReceipt, StageUpgradeRequest, StreamCursor,
+    TransferEnvelope,
 };
 use async_trait::async_trait;
 use tokio::sync::oneshot::error::TryRecvError;
@@ -38,10 +39,11 @@ use super::dispatch::{
     },
 };
 use super::link::{
-    DirectedReplyRoute, DirectedReplySealer, RemoteLinkError, RemoteLinkOwner, RemoteReplyPump,
-    RemoteStreamPublisher, ReplyRouteLifecycle, UnavailableDirectedReplySealer,
-    UnavailableRemoteStreamPublisher, send_directed_reply_for_test,
+    DirectedReplyRoute, DirectedReplySeal, DirectedReplySealer, RemoteLinkError, RemoteLinkOwner,
+    RemoteReplyPump, RemoteStreamPublisher, ReplyRouteBind, ReplyRouteLifecycle,
+    UnavailableDirectedReplySealer, UnavailableRemoteStreamPublisher, send_directed_reply_for_test,
 };
+use super::replay::{ReplayDecision, ReplayError};
 use super::transport::active_pairing_transport_for_test;
 
 const MACHINE: MachineRouteId = MachineRouteId::from_bytes([0x32; 16]);
@@ -73,6 +75,25 @@ async fn wait_for_sent(
     .unwrap_or_else(|_| panic!("{context}: sent={}", harness.sent_count()));
 }
 
+async fn wait_for_connection_count(
+    owner: &RemoteLinkOwner,
+    expected: usize,
+    context: &'static str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while owner.connection_ids_for_test().len() != expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{context}: connections={:?}",
+            owner.connection_ids_for_test()
+        )
+    });
+}
+
 fn recorded_runtime_reply(call: &SealCall) -> RuntimeReply {
     let envelope: RuntimeEnvelope = serde_json::from_slice(&call.bytes)
         .expect("recorded sealer input is a canonical Runtime envelope");
@@ -82,22 +103,11 @@ fn recorded_runtime_reply(call: &SealCall) -> RuntimeReply {
     reply
 }
 
-fn replay_disposition(
-    window: &ReplayWindow,
-    counter: u64,
-    ciphertext_hash: [u8; 32],
-) -> ReplayDisposition {
-    let mut probe = window.clone();
-    probe
-        .observe(counter, ciphertext_hash)
-        .expect("test replay tuple is well formed")
-}
-
 /// 这条测试不接受由 `RemoteLinkFixture` 自报 core call/replay 数量。test support 只负责
 /// 建立真实 Store authorization 与真实 DeviceSign/AEAD frame；阶段推进必须调用
 /// production `dispatch.rs` 与 RuntimeCore 的两段 capability API。
 #[tokio::test]
-async fn production_dispatch_verifies_before_core_activation_and_commits_replay_last() {
+async fn production_dispatch_rechecks_then_durably_admits_before_core_activation() {
     let fixture = active_remote_dispatch_for_test(MACHINE, DEVICE_A).await;
     let frame = fixture.signed_runtime_send(
         REQUEST_A,
@@ -105,17 +115,16 @@ async fn production_dispatch_verifies_before_core_activation_and_commits_replay_
         RuntimeRequest::DescribeAgents,
         11,
     );
-    let mut live_replay = ReplayWindow::new();
 
     let verified = fixture
         .dispatcher()
-        .verify_send(frame.send().clone(), &live_replay)
+        .verify_send(frame.send().clone())
         .await
-        .expect("real canonical/signature/AAD/AEAD/Runtime Request chain verifies");
+        .expect("canonical/signature/AAD/AEAD/Runtime Request chain verifies");
     assert_eq!(
-        replay_disposition(&live_replay, frame.counter(), frame.ciphertext_hash()),
-        ReplayDisposition::Fresh,
-        "crypto verification must only stage a cloned replay candidate"
+        fixture.core().remote_registration_calls_for_test(),
+        0,
+        "crypto verification must not call RuntimeCore"
     );
 
     let current = fixture
@@ -124,27 +133,102 @@ async fn production_dispatch_verifies_before_core_activation_and_commits_replay_
         .await
         .expect("unchanged Store authorization remains Current");
     assert_eq!(
-        replay_disposition(&live_replay, frame.counter(), frame.ciphertext_hash()),
-        ReplayDisposition::Fresh,
-        "even a successful final Store recheck must not mutate live replay before activation"
+        fixture.core().remote_registration_calls_for_test(),
+        0,
+        "final Store recheck still precedes RuntimeCore"
     );
-    let activated = current
-        .activate(fixture.core(), &mut live_replay)
+    let admitted = fixture
+        .dispatcher()
+        .admit_replay(current)
+        .await
+        .expect("durable replay COMMIT succeeds after exact Active recheck");
+    assert_eq!(admitted.decision(), ReplayDecision::Fresh);
+    assert_eq!(fixture.core().remote_registration_calls_for_test(), 0);
+    let activated = admitted
+        .into_dispatchable()
+        .expect("Fresh payload decrypts")
+        .expect("Fresh replay tuple dispatches")
+        .activate(fixture.core())
         .expect("Current proof activates the shared lease only after full verification");
     assert!(matches!(
         &activated.envelope().body,
         RuntimeMessage::Request(RuntimeRequest::DescribeAgents)
     ));
+    let (_, reply_authorization, _, _, _) = activated.into_parts();
     assert_eq!(
-        replay_disposition(&live_replay, frame.counter(), frame.ciphertext_hash()),
-        ReplayDisposition::ExactDuplicate,
-        "only successful Current activation commits the replay candidate"
+        reply_authorization.trust_epoch().value(),
+        1,
+        "directed reply authorization carries the authenticated grant trust epoch"
+    );
+    assert_eq!(
+        fixture.core().remote_registration_calls_for_test(),
+        1,
+        "only durable replay admission can release a Core capability"
     );
     fixture.shutdown().await;
 }
 
 #[tokio::test]
-async fn invalid_signature_aad_and_replay_reject_without_any_core_registration() {
+async fn replay_commit_before_core_crash_retries_exact_into_runtime_idempotency() {
+    let fixture = active_remote_dispatch_for_test(MACHINE, DEVICE_A).await;
+    let frame = fixture.signed_runtime_send(
+        REQUEST_A,
+        MessageId::new("p45-replay-commit-before-core-crash"),
+        RuntimeRequest::DescribeAgents,
+        31,
+    );
+
+    let verified = fixture
+        .dispatcher()
+        .verify_send(frame.send().clone())
+        .await
+        .expect("first crypto chain");
+    let current = fixture
+        .dispatcher()
+        .recheck_current(verified)
+        .await
+        .expect("first exact Active recheck");
+    let committed_before_crash = fixture
+        .dispatcher()
+        .admit_replay(current)
+        .await
+        .expect("first durable replay COMMIT");
+    assert_eq!(committed_before_crash.decision(), ReplayDecision::Fresh);
+    drop(committed_before_crash);
+    assert_eq!(
+        fixture.core().remote_registration_calls_for_test(),
+        0,
+        "simulated crash point is after replay COMMIT but before Core"
+    );
+
+    let retry = fixture
+        .dispatcher()
+        .verify_send(frame.send().clone())
+        .await
+        .expect("exact retry crypto chain");
+    let retry = fixture
+        .dispatcher()
+        .recheck_current(retry)
+        .await
+        .expect("exact retry Active recheck");
+    let retry = fixture
+        .dispatcher()
+        .admit_replay(retry)
+        .await
+        .expect("exact retry reads durable replay state");
+    assert_eq!(retry.decision(), ReplayDecision::ExactDuplicate);
+    retry
+        .into_dispatchable()
+        .expect("ExactDuplicate payload decrypts")
+        .expect("ExactDuplicate must re-enter RuntimeCore idempotency")
+        .activate(fixture.core())
+        .expect("exact retry activates Core capability");
+    assert_eq!(fixture.core().remote_registration_calls_for_test(), 1);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_signature_aad_and_nonce_reuse_reject_without_wrong_core_registration() {
     let fixture = active_remote_dispatch_for_test(MACHINE, DEVICE_A).await;
     let frame = fixture.signed_runtime_send(
         REQUEST_A,
@@ -159,10 +243,7 @@ async fn invalid_signature_aad_and_replay_reject_without_any_core_registration()
     signed.signature.0[0] ^= 0x80;
     bad_signature.sealed_blob.0 = signed.to_wire_bytes();
     assert!(matches!(
-        fixture
-            .dispatcher()
-            .verify_send(bad_signature, &ReplayWindow::new())
-            .await,
+        fixture.dispatcher().verify_send(bad_signature).await,
         Err(RemoteDispatchError::InvalidSignature)
     ));
     assert_eq!(fixture.core().remote_registration_calls_for_test(), 0);
@@ -170,30 +251,164 @@ async fn invalid_signature_aad_and_replay_reject_without_any_core_registration()
     let mut bad_aad = frame.send().clone();
     bad_aad.request_route = REQUEST_B;
     assert!(matches!(
-        fixture
-            .dispatcher()
-            .verify_send(bad_aad, &ReplayWindow::new())
-            .await,
+        fixture.dispatcher().verify_send(bad_aad).await,
         Err(RemoteDispatchError::InvalidSignature)
     ));
     assert_eq!(fixture.core().remote_registration_calls_for_test(), 0);
 
-    let mut replay = ReplayWindow::new();
-    replay
-        .observe(frame.counter(), frame.ciphertext_hash())
-        .expect("seed exact replay tuple");
-    assert!(matches!(
-        fixture
-            .dispatcher()
-            .verify_send(frame.send().clone(), &replay)
-            .await,
-        Err(RemoteDispatchError::ReplayRejected)
-    ));
+    let verified = fixture
+        .dispatcher()
+        .verify_send(frame.send().clone())
+        .await
+        .expect("seed replay tuple crypto chain");
+    let current = fixture
+        .dispatcher()
+        .recheck_current(verified)
+        .await
+        .expect("seed replay tuple Active recheck");
+    let seeded = fixture
+        .dispatcher()
+        .admit_replay(current)
+        .await
+        .expect("seed replay tuple durably");
+    assert_eq!(seeded.decision(), ReplayDecision::Fresh);
+
+    let reuse = fixture.signed_runtime_send(
+        RequestRouteId::from_bytes([0x66; 16]),
+        MessageId::new("p45-valid-but-nonce-reused"),
+        RuntimeRequest::DescribeAgents,
+        frame.counter(),
+    );
+    let reuse = fixture
+        .dispatcher()
+        .verify_send(reuse.send().clone())
+        .await
+        .expect("nonce-reuse frame remains signature/AAD/AEAD valid");
+    let reuse = fixture
+        .dispatcher()
+        .recheck_current(reuse)
+        .await
+        .expect("nonce-reuse frame remains exactly authorized");
+    let reuse = fixture
+        .dispatcher()
+        .admit_replay(reuse)
+        .await
+        .expect_err("same counter with different ciphertext is isolated");
+    assert!(reuse.requires_connection_isolation());
     assert_eq!(
         fixture.core().remote_registration_calls_for_test(),
         0,
         "all untrusted ingress failures must occur before the first RuntimeCore API"
     );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn signed_bad_tag_nonce_reuse_is_quarantined_before_aead_open() {
+    let fixture = active_remote_dispatch_for_test(MACHINE, DEVICE_A).await;
+    let first = fixture.signed_runtime_send(
+        REQUEST_A,
+        MessageId::new("p45-replay-before-aead-seed"),
+        RuntimeRequest::DescribeAgents,
+        42,
+    );
+    let verified = fixture
+        .dispatcher()
+        .verify_send(first.send().clone())
+        .await
+        .expect("seed frame verifies");
+    let current = fixture
+        .dispatcher()
+        .recheck_current(verified)
+        .await
+        .expect("seed authorization remains current");
+    assert_eq!(
+        fixture
+            .dispatcher()
+            .admit_replay(current)
+            .await
+            .expect("seed tuple commits")
+            .decision(),
+        ReplayDecision::Fresh
+    );
+
+    let reuse_with_bad_tag = fixture.signed_runtime_send_with_tampered_ciphertext_for_test(
+        REQUEST_B,
+        MessageId::new("p45-replay-before-aead-reuse"),
+        RuntimeRequest::DescribeAgents,
+        first.counter(),
+    );
+    let verified = fixture
+        .dispatcher()
+        .verify_send(reuse_with_bad_tag.send().clone())
+        .await
+        .expect("valid DeviceSign must release the tuple before AEAD open");
+    let current = fixture
+        .dispatcher()
+        .recheck_current(verified)
+        .await
+        .expect("reuse authorization remains current");
+    let error =
+        fixture.dispatcher().admit_replay(current).await.expect_err(
+            "same counter with a different signed ciphertext must quarantine the scope",
+        );
+    assert!(matches!(error, ReplayError::NonceReuse));
+    assert!(error.requires_connection_isolation());
+    assert_eq!(fixture.core().remote_registration_calls_for_test(), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn fresh_signed_bad_tag_consumes_counter_before_returning_ciphertext_error() {
+    let fixture = active_remote_dispatch_for_test(MACHINE, DEVICE_A).await;
+    let bad_tag = fixture.signed_runtime_send_with_tampered_ciphertext_for_test(
+        REQUEST_A,
+        MessageId::new("p45-fresh-bad-tag"),
+        RuntimeRequest::DescribeAgents,
+        43,
+    );
+    let verified = fixture
+        .dispatcher()
+        .verify_send(bad_tag.send().clone())
+        .await
+        .expect("valid DeviceSign releases fresh tuple before AEAD open");
+    let current = fixture
+        .dispatcher()
+        .recheck_current(verified)
+        .await
+        .expect("fresh bad-tag authorization remains current");
+    let admitted = fixture
+        .dispatcher()
+        .admit_replay(current)
+        .await
+        .expect("fresh bad-tag tuple is durably consumed");
+    assert_eq!(admitted.decision(), ReplayDecision::Fresh);
+    assert!(matches!(
+        admitted.into_route(),
+        Err(RemoteDispatchError::InvalidCiphertext)
+    ));
+
+    let verified = fixture
+        .dispatcher()
+        .verify_send(bad_tag.send().clone())
+        .await
+        .expect("exact bad-tag retry still verifies DeviceSign");
+    let current = fixture
+        .dispatcher()
+        .recheck_current(verified)
+        .await
+        .expect("exact bad-tag retry remains current");
+    let admitted = fixture
+        .dispatcher()
+        .admit_replay(current)
+        .await
+        .expect("exact bad-tag retry reads the consumed tuple");
+    assert_eq!(admitted.decision(), ReplayDecision::ExactDuplicate);
+    assert!(matches!(
+        admitted.into_route(),
+        Err(RemoteDispatchError::InvalidCiphertext)
+    ));
+    assert_eq!(fixture.core().remote_registration_calls_for_test(), 0);
     fixture.shutdown().await;
 }
 
@@ -345,22 +560,351 @@ async fn real_remote_link_actor_isolates_two_devices_and_rejects_invalid_ingress
         .push_frame(business_frame(fresh_b.send().clone()))
         .await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while harness.sent_count() != 3 {
+        while harness.sent_count() != 4 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("healthy sibling proceeds after exact replay rejection");
+    .expect("exact duplicate re-enters Core and healthy sibling also proceeds");
     assert_eq!(
         sealer.calls.lock().expect("read replay calls").len(),
+        4,
+        "exact duplicate must reach RuntimeCore durable idempotency and sealer"
+    );
+
+    let current_revision = fixture.key_directory_revision(DEVICE_A);
+    assert!(
+        current_revision > 1,
+        "fixture needs a lower signed revision"
+    );
+    let rollback_a = fixture.signed_runtime_send_with_revision(
+        DEVICE_A,
+        RequestRouteId::from_bytes([0x76; 16]),
+        MessageId::new("revision-rollback-isolates-only-device-a"),
+        RuntimeRequest::DescribeAgents,
+        6,
+        current_revision - 1,
+    );
+    harness
+        .push_frame(business_frame(rollback_a.send().clone()))
+        .await;
+    wait_for_connection_count(
+        &owner,
+        1,
+        "lower signed revision disconnects only Device A logical connection",
+    )
+    .await;
+    assert_eq!(
+        harness.sent_count(),
+        4,
+        "revision rollback never enters Core"
+    );
+
+    let sibling_after_rollback = fixture.signed_runtime_send(
+        DEVICE_B,
+        RequestRouteId::from_bytes([0x77; 16]),
+        MessageId::new("device-b-after-device-a-revision-rollback"),
+        RuntimeRequest::DescribeAgents,
         3,
-        "exact replay must not enter Core or sealer"
+    );
+    harness
+        .push_frame(business_frame(sibling_after_rollback.send().clone()))
+        .await;
+    wait_for_sent(
+        &harness,
+        5,
+        "Device B remains served after Device A revision rollback isolation",
+    )
+    .await;
+
+    let reconnect_a = fixture.signed_runtime_send(
+        DEVICE_A,
+        RequestRouteId::from_bytes([0x78; 16]),
+        MessageId::new("device-a-reconnect-before-nonce-reuse"),
+        RuntimeRequest::DescribeAgents,
+        6,
+    );
+    harness
+        .push_frame(business_frame(reconnect_a.send().clone()))
+        .await;
+    wait_for_sent(&harness, 6, "Device A reconnects with a fresh tuple").await;
+    wait_for_connection_count(
+        &owner,
+        2,
+        "both logical device connections exist before nonce-reuse isolation",
+    )
+    .await;
+
+    let nonce_reuse_a = fixture.signed_runtime_send(
+        DEVICE_A,
+        RequestRouteId::from_bytes([0x79; 16]),
+        MessageId::new("nonce-reuse-retires-device-a-epoch"),
+        RuntimeRequest::DescribeAgents,
+        healthy_a.counter(),
+    );
+    harness
+        .push_frame(business_frame(nonce_reuse_a.send().clone()))
+        .await;
+    wait_for_connection_count(&owner, 1, "nonce reuse disconnects Device A").await;
+    assert_eq!(harness.sent_count(), 6, "nonce reuse never enters Core");
+
+    let sibling_after_nonce_reuse = fixture.signed_runtime_send(
+        DEVICE_B,
+        RequestRouteId::from_bytes([0x7a; 16]),
+        MessageId::new("device-b-after-device-a-nonce-reuse"),
+        RuntimeRequest::DescribeAgents,
+        4,
+    );
+    harness
+        .push_frame(business_frame(sibling_after_nonce_reuse.send().clone()))
+        .await;
+    wait_for_sent(
+        &harness,
+        7,
+        "Device B remains served after Device A nonce-reuse isolation",
+    )
+    .await;
+
+    let retired_epoch_a = fixture.signed_runtime_send(
+        DEVICE_A,
+        RequestRouteId::from_bytes([0x7b; 16]),
+        MessageId::new("device-a-same-epoch-after-nonce-reuse"),
+        RuntimeRequest::DescribeAgents,
+        7,
+    );
+    let sibling_after_retired_retry = fixture.signed_runtime_send(
+        DEVICE_B,
+        RequestRouteId::from_bytes([0x7c; 16]),
+        MessageId::new("device-b-after-device-a-retired-retry"),
+        RuntimeRequest::DescribeAgents,
+        5,
+    );
+    harness
+        .push_frame(business_frame(retired_epoch_a.send().clone()))
+        .await;
+    harness
+        .push_frame(business_frame(sibling_after_retired_retry.send().clone()))
+        .await;
+    wait_for_sent(
+        &harness,
+        8,
+        "sibling proves same-epoch retry was processed and remained blocked",
+    )
+    .await;
+    assert_eq!(owner.connection_ids_for_test().len(), 1);
+    assert!(
+        !harness.sent_frames().iter().any(|frame| matches!(
+            &frame.body,
+            RelayFrameBody::Reply(reply)
+                if reply.device_route == DEVICE_A
+                    && reply.request_route == RequestRouteId::from_bytes([0x7b; 16])
+        )),
+        "durably retired sender epoch must never re-enter Core or emit a reply"
+    );
+    assert_eq!(
+        sealer.calls.lock().expect("read isolation calls").len(),
+        8,
+        "lower revision, nonce reuse, and retired-epoch retry must not reach sealer"
     );
 
     owner
         .shutdown()
         .await
         .expect("shutdown real RemoteLink actor");
+    transport.shutdown().await;
+    drop(core);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_link_owner_reports_unexpected_transport_exit() {
+    let fixture = active_remote_dispatch_for_test(MACHINE, DEVICE_A).await;
+    let core = fixture.core_arc();
+    let (mut transport, _pairing_lane, _harness) = active_pairing_transport_for_test(MACHINE);
+    let business = transport
+        .take_business_lane()
+        .expect("take health-observed business lane");
+    let mut owner = RemoteLinkOwner::start(
+        MACHINE,
+        fixture.store(),
+        business,
+        Arc::downgrade(&core),
+        Arc::new(RecordingSealer {
+            calls: Mutex::new(Vec::new()),
+            sealed: None,
+        }),
+        Arc::new(RecordingPublisher::default()),
+    )
+    .expect("start health-observed RemoteLink");
+
+    transport.shutdown().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while owner.observed_failure_code().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unexpected transport EOF must become observable");
+    assert_eq!(
+        owner.observed_failure_code().as_deref(),
+        Some("daemon.remote.link.actor_exited")
+    );
+    owner
+        .shutdown()
+        .await
+        .expect("join exited RemoteLink owner");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn signature_aad_and_tag_failures_disconnect_only_the_claimed_device() {
+    let fixture = two_active_remote_dispatch_for_test(MACHINE, DEVICE_A, DEVICE_B).await;
+    let core = fixture.core_arc();
+    let (mut transport, _pairing_lane, harness) = active_pairing_transport_for_test(MACHINE);
+    let business = transport
+        .take_business_lane()
+        .expect("take crypto-isolation business lane");
+    let sealer = Arc::new(RecordingSealer {
+        calls: Mutex::new(Vec::new()),
+        sealed: None,
+    });
+    let mut owner = RemoteLinkOwner::start(
+        MACHINE,
+        fixture.store(),
+        business,
+        Arc::downgrade(&core),
+        sealer.clone(),
+        Arc::new(RecordingPublisher::default()),
+    )
+    .expect("start crypto-isolation RemoteLink");
+
+    let healthy_a_1 = fixture.signed_runtime_send(
+        DEVICE_A,
+        RequestRouteId::from_bytes([0x81; 16]),
+        MessageId::new("crypto-isolation-a-1"),
+        RuntimeRequest::DescribeAgents,
+        1,
+    );
+    let healthy_b_1 = fixture.signed_runtime_send(
+        DEVICE_B,
+        RequestRouteId::from_bytes([0x82; 16]),
+        MessageId::new("crypto-isolation-b-1"),
+        RuntimeRequest::DescribeAgents,
+        1,
+    );
+    harness
+        .push_frame(business_frame(healthy_a_1.send().clone()))
+        .await;
+    harness
+        .push_frame(business_frame(healthy_b_1.send().clone()))
+        .await;
+    wait_for_sent(
+        &harness,
+        2,
+        "both devices establish logical Core connections",
+    )
+    .await;
+    assert_eq!(owner.connection_ids_for_test().len(), 2);
+
+    let mut bad_signature = fixture
+        .signed_runtime_send(
+            DEVICE_A,
+            RequestRouteId::from_bytes([0x83; 16]),
+            MessageId::new("crypto-isolation-bad-signature"),
+            RuntimeRequest::DescribeAgents,
+            2,
+        )
+        .send()
+        .clone();
+    let mut signed = SignedSealedBlobV1::from_wire_bytes(&bad_signature.sealed_blob.0)
+        .expect("parse signature isolation frame");
+    signed.signature.0[0] ^= 0x80;
+    bad_signature.sealed_blob.0 = signed.to_wire_bytes();
+    harness.push_frame(business_frame(bad_signature)).await;
+    wait_for_connection_count(&owner, 1, "bad signature isolates Device A").await;
+
+    let healthy_a_2 = fixture.signed_runtime_send(
+        DEVICE_A,
+        RequestRouteId::from_bytes([0x84; 16]),
+        MessageId::new("crypto-isolation-a-2"),
+        RuntimeRequest::DescribeAgents,
+        2,
+    );
+    harness
+        .push_frame(business_frame(healthy_a_2.send().clone()))
+        .await;
+    wait_for_sent(&harness, 3, "Device A reconnects after signature isolation").await;
+    wait_for_connection_count(&owner, 2, "Device A has reconnected").await;
+
+    let mut bad_aad = fixture
+        .signed_runtime_send(
+            DEVICE_A,
+            RequestRouteId::from_bytes([0x85; 16]),
+            MessageId::new("crypto-isolation-bad-aad"),
+            RuntimeRequest::DescribeAgents,
+            3,
+        )
+        .send()
+        .clone();
+    bad_aad.request_route = RequestRouteId::from_bytes([0x86; 16]);
+    harness.push_frame(business_frame(bad_aad)).await;
+    wait_for_connection_count(&owner, 1, "bad AAD isolates Device A").await;
+
+    let healthy_a_3 = fixture.signed_runtime_send(
+        DEVICE_A,
+        RequestRouteId::from_bytes([0x87; 16]),
+        MessageId::new("crypto-isolation-a-3"),
+        RuntimeRequest::DescribeAgents,
+        3,
+    );
+    harness
+        .push_frame(business_frame(healthy_a_3.send().clone()))
+        .await;
+    wait_for_sent(&harness, 4, "Device A reconnects after AAD isolation").await;
+    wait_for_connection_count(&owner, 2, "Device A reconnects a second time").await;
+
+    let bad_tag = fixture.signed_runtime_send_with_tampered_ciphertext(
+        DEVICE_A,
+        RequestRouteId::from_bytes([0x88; 16]),
+        MessageId::new("crypto-isolation-bad-tag"),
+        RuntimeRequest::DescribeAgents,
+        4,
+    );
+    harness
+        .push_frame(business_frame(bad_tag.send().clone()))
+        .await;
+    wait_for_connection_count(&owner, 1, "bad AEAD tag isolates Device A").await;
+
+    let healthy_b_2 = fixture.signed_runtime_send(
+        DEVICE_B,
+        RequestRouteId::from_bytes([0x89; 16]),
+        MessageId::new("crypto-isolation-b-2"),
+        RuntimeRequest::DescribeAgents,
+        2,
+    );
+    harness
+        .push_frame(business_frame(healthy_b_2.send().clone()))
+        .await;
+    wait_for_sent(
+        &harness,
+        5,
+        "healthy sibling remains available after Device A crypto isolation",
+    )
+    .await;
+    assert_eq!(
+        sealer
+            .calls
+            .lock()
+            .expect("read crypto-isolation calls")
+            .len(),
+        5,
+        "signature/AAD/tag failures never reach RuntimeCore or the reply sealer"
+    );
+
+    owner
+        .shutdown()
+        .await
+        .expect("shutdown crypto-isolation RemoteLink");
     transport.shutdown().await;
     drop(core);
     fixture.shutdown().await;
@@ -378,13 +922,14 @@ async fn real_remote_link_actor_survives_transient_failure_and_replies_after_rec
         calls: Mutex::new(Vec::new()),
         sealed: None,
     });
+    let publisher = Arc::new(RecordingPublisher::default());
     let mut owner = RemoteLinkOwner::start(
         MACHINE,
         fixture.store(),
         business,
         Arc::downgrade(&core),
         sealer.clone(),
-        Arc::new(RecordingPublisher::default()),
+        publisher.clone(),
     )
     .expect("ready reconnect egress starts RemoteLink");
 
@@ -404,6 +949,11 @@ async fn real_remote_link_actor_survives_transient_failure_and_replies_after_rec
     })
     .await
     .expect("real actor sends the pre-failure reply");
+    assert_eq!(
+        publisher.reconnects.load(Ordering::SeqCst),
+        0,
+        "ordinary authenticated business frames must not forge a reconnect wake"
+    );
 
     harness.push_error("relay.client.connection_lost").await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -413,12 +963,35 @@ async fn real_remote_link_actor_survives_transient_failure_and_replies_after_rec
     })
     .await
     .expect("transient health failure becomes observable");
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        publisher.reconnects.load(Ordering::SeqCst),
+        0,
+        "transport health failure alone must not forge notify_reconnected"
+    );
     transport
         .reconnect()
         .await
         .expect("replace failed MachineLink generation");
     assert_eq!(transport.observed_failure_code(), None);
     assert_eq!(harness.reconnect_count(), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while publisher.reconnects.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("generation replacement wakes the durable publication drive exactly once");
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        publisher.reconnects.load(Ordering::SeqCst),
+        1,
+        "only the authenticated generation replacement may emit one reconnect wake"
+    );
 
     let after_reconnect = fixture.signed_runtime_send(
         REQUEST_B,
@@ -766,7 +1339,7 @@ async fn remote_link_owner_rejects_each_unavailable_egress_capability_before_spa
 }
 
 #[tokio::test]
-async fn remote_link_shutdown_deadline_aborts_and_joins_a_stuck_actor() {
+async fn remote_link_shutdown_deadline_aborts_a_stuck_actor_without_unbounded_join() {
     let fixture = active_remote_dispatch_for_test(MACHINE, DEVICE_A).await;
     let core = fixture.core_arc();
     let mut owner = RemoteLinkOwner::pending_for_shutdown_test(
@@ -779,6 +1352,36 @@ async fn remote_link_shutdown_deadline_aborts_and_joins_a_stuck_actor() {
     assert!(matches!(result, Err(RemoteLinkError::ShutdownTimedOut)));
     drop(core);
     fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_link_shutdown_deadline_does_not_await_non_cooperative_main_after_abort() {
+    let mut owner = RemoteLinkOwner::slow_main_for_shutdown_test(
+        std::sync::Weak::new(),
+        std::time::Duration::from_millis(20),
+        std::time::Duration::from_millis(400),
+    )
+    .await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_millis(150), owner.shutdown())
+        .await
+        .expect("absolute deadline must include abort cleanup");
+    assert!(matches!(result, Err(RemoteLinkError::ShutdownTimedOut)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_link_shutdown_deadline_bounds_non_quiescing_child_tracker() {
+    let mut owner = RemoteLinkOwner::slow_child_for_shutdown_test(
+        std::sync::Weak::new(),
+        std::time::Duration::from_millis(20),
+        std::time::Duration::from_millis(400),
+    )
+    .await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_millis(150), owner.shutdown())
+        .await
+        .expect("child quiescence must share the owner's absolute deadline");
+    assert!(matches!(result, Err(RemoteLinkError::ShutdownTimedOut)));
 }
 
 #[derive(Clone)]
@@ -794,9 +1397,17 @@ struct RecordingSealer {
 
 struct FailingSealer;
 
+struct LineageDriftSealer {
+    authorization_used: RemoteReplyAuthorization,
+}
+
+struct FailingPublisher;
+
 #[derive(Default)]
 struct RecordingPublisher {
     calls: Mutex<Vec<Arc<[u8]>>>,
+    transfer_calls: Mutex<Vec<RuntimeTransferCarrierV1>>,
+    reconnects: AtomicUsize,
     release: tokio::sync::Notify,
 }
 
@@ -811,7 +1422,7 @@ impl DirectedReplySealer for RecordingSealer {
         authorization: &RemoteReplyAuthorization,
         route: DirectedReplyRoute,
         runtime_bytes: Arc<[u8]>,
-    ) -> Result<SignedSealedBlobV1, RemoteLinkError> {
+    ) -> Result<DirectedReplySeal, RemoteLinkError> {
         self.calls
             .lock()
             .expect("record sealer call")
@@ -819,10 +1430,36 @@ impl DirectedReplySealer for RecordingSealer {
                 route,
                 bytes: runtime_bytes,
             });
-        Ok(self
-            .sealed
-            .clone()
-            .unwrap_or_else(|| fake_signed_reply(authorization)))
+        Ok(DirectedReplySeal {
+            authorization_used: authorization.clone(),
+            sealed: self
+                .sealed
+                .clone()
+                .unwrap_or_else(|| fake_signed_reply(authorization)),
+        })
+    }
+
+    async fn seal_transfer_exact(
+        &self,
+        authorization: &RemoteReplyAuthorization,
+        route: DirectedReplyRoute,
+        carrier: RuntimeTransferCarrierV1,
+    ) -> Result<DirectedReplySeal, RemoteLinkError> {
+        let bytes: Arc<[u8]> = carrier
+            .encode()
+            .map_err(|_| RemoteLinkError::InvalidCoreEgress)?
+            .into();
+        self.calls
+            .lock()
+            .expect("record compact directed sealer call")
+            .push(SealCall { route, bytes });
+        Ok(DirectedReplySeal {
+            authorization_used: authorization.clone(),
+            sealed: self
+                .sealed
+                .clone()
+                .unwrap_or_else(|| fake_signed_reply(authorization)),
+        })
     }
 }
 
@@ -837,8 +1474,27 @@ impl DirectedReplySealer for FailingSealer {
         _authorization: &RemoteReplyAuthorization,
         _route: DirectedReplyRoute,
         _runtime_bytes: Arc<[u8]>,
-    ) -> Result<SignedSealedBlobV1, RemoteLinkError> {
+    ) -> Result<DirectedReplySeal, RemoteLinkError> {
         Err(RemoteLinkError::ReplySealFailed)
+    }
+}
+
+#[async_trait]
+impl DirectedReplySealer for LineageDriftSealer {
+    fn admission_ready(&self) -> bool {
+        true
+    }
+
+    async fn seal_exact(
+        &self,
+        _authorization: &RemoteReplyAuthorization,
+        _route: DirectedReplyRoute,
+        _runtime_bytes: Arc<[u8]>,
+    ) -> Result<DirectedReplySeal, RemoteLinkError> {
+        Ok(DirectedReplySeal {
+            authorization_used: self.authorization_used.clone(),
+            sealed: fake_signed_reply(&self.authorization_used),
+        })
     }
 }
 
@@ -855,6 +1511,41 @@ impl RemoteStreamPublisher for RecordingPublisher {
             .push(runtime_bytes);
         self.release.notified().await;
         Ok(())
+    }
+
+    async fn publish_transfer_exact(
+        &self,
+        carrier: RuntimeTransferCarrierV1,
+    ) -> Result<(), RemoteLinkError> {
+        self.transfer_calls
+            .lock()
+            .expect("record transfer publisher call")
+            .push(carrier);
+        self.release.notified().await;
+        Ok(())
+    }
+
+    async fn notify_reconnected(&self) -> Result<(), RemoteLinkError> {
+        self.reconnects.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RemoteStreamPublisher for FailingPublisher {
+    fn admission_ready(&self) -> bool {
+        true
+    }
+
+    async fn publish_exact(&self, _runtime_bytes: Arc<[u8]>) -> Result<(), RemoteLinkError> {
+        Err(RemoteLinkError::StreamPublishFailed)
+    }
+
+    async fn publish_transfer_exact(
+        &self,
+        _carrier: RuntimeTransferCarrierV1,
+    ) -> Result<(), RemoteLinkError> {
+        Err(RemoteLinkError::StreamPublishFailed)
     }
 }
 
@@ -932,6 +1623,53 @@ async fn directed_reply_binds_exact_route_and_bytes_then_acks_only_after_flush()
     assert_eq!(reply.sealed_blob.0, expected_wire);
     transport.shutdown().await;
     fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn exact_inflight_route_bind_is_coalesced_before_a_second_core_dispatch() {
+    let (mut transport, _pairing_lane, _harness) = active_pairing_transport_for_test(MACHINE);
+    let business = transport
+        .take_business_lane()
+        .expect("take in-flight duplicate business lane");
+    let mut pump = RemoteReplyPump::new(
+        business,
+        Arc::new(RecordingSealer {
+            calls: Mutex::new(Vec::new()),
+            sealed: None,
+        }),
+    );
+    let authorization = RemoteReplyAuthorization::for_test(MACHINE, DEVICE_A, 1);
+    let message_id = MessageId::new("inflight-exact-duplicate");
+    let route = DirectedReplyRoute {
+        machine_route: MACHINE,
+        device_route: DEVICE_A,
+        request_route: REQUEST_A,
+    };
+
+    assert_eq!(
+        pump.bind(
+            CONNECTION_A,
+            message_id.clone(),
+            route,
+            authorization.clone(),
+            ReplyRouteLifecycle::OneShot,
+        )
+        .expect("first request installs its route"),
+        ReplyRouteBind::Inserted
+    );
+    assert_eq!(
+        pump.bind(
+            CONNECTION_A,
+            message_id,
+            route,
+            authorization,
+            ReplyRouteLifecycle::OneShot,
+        )
+        .expect("exact in-flight retry reuses the same route"),
+        ReplyRouteBind::ExistingExact
+    );
+
+    transport.shutdown().await;
 }
 
 fn runtime_write(
@@ -1031,6 +1769,46 @@ async fn directed_reply_rejects_invalid_sealer_metadata_without_send_or_ack() {
         );
         transport.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn directed_reply_rejects_sealer_authorization_lineage_drift_without_send_or_ack() {
+    let frozen = RemoteReplyAuthorization::for_test(MACHINE, DEVICE_A, 1);
+    let drifted = RemoteReplyAuthorization::for_test(MACHINE, DEVICE_A, 2);
+    let route = DirectedReplyRoute {
+        machine_route: MACHINE,
+        device_route: DEVICE_A,
+        request_route: REQUEST_A,
+    };
+    let (mut transport, _pairing_lane, harness) = active_pairing_transport_for_test(MACHINE);
+    let business = transport
+        .take_business_lane()
+        .expect("take lineage-drift business lane");
+    let mut pump = RemoteReplyPump::new(
+        business,
+        Arc::new(LineageDriftSealer {
+            authorization_used: drifted,
+        }),
+    );
+    let (message_id, write, acknowledged) = runtime_failure_write("lineage-drift");
+    pump.bind(
+        CONNECTION_A,
+        message_id,
+        route,
+        frozen,
+        ReplyRouteLifecycle::OneShot,
+    )
+    .expect("bind frozen route before lineage drift");
+    assert!(matches!(
+        pump.forward(CONNECTION_A, write).await,
+        Err(RemoteLinkError::ReplyAuthorizationMismatch)
+    ));
+    assert!(
+        acknowledged.await.is_err(),
+        "lineage drift must drop the Core write without ACK"
+    );
+    assert_eq!(harness.sent_count(), 0);
+    transport.shutdown().await;
 }
 
 /// Reply failures必须落到 production route table/pump；不能把测试直接传入一个永远
@@ -1259,6 +2037,183 @@ async fn production_egress_publishes_stream_but_rejects_request_without_ack_or_r
     );
     assert!(sealer.calls.lock().expect("read request sealer").is_empty());
     assert_eq!(harness.sent_count(), 0);
+    transport.shutdown().await;
+}
+
+#[tokio::test]
+async fn compact_stream_uses_typed_publisher_and_compact_reply_uses_directed_sealer() {
+    let (mut transport, _pairing_lane, harness) = active_pairing_transport_for_test(MACHINE);
+    let business = transport
+        .take_business_lane()
+        .expect("take compact stream business lane");
+    let publisher = Arc::new(RecordingPublisher::default());
+    let sealer = Arc::new(RecordingSealer {
+        calls: Mutex::new(Vec::new()),
+        sealed: None,
+    });
+    let mut pump =
+        RemoteReplyPump::new(business, sealer.clone()).with_stream_publisher(publisher.clone());
+    let transfer = TransferEnvelope::new(
+        TransferId::new("compact-stream-transfer"),
+        0,
+        1,
+        [0x71; 32],
+        3,
+        vec![1, 2, 3],
+    )
+    .expect("valid compact part");
+    let stream_carrier = RuntimeTransferCarrierV1::new(
+        MessageId::new("compact-stream-message"),
+        RuntimeTransferChannel::Stream,
+        transfer.clone(),
+    );
+    let (stream_write, mut stream_acknowledged) =
+        ConnectionWrite::for_compact_transfer_test(&stream_carrier)
+            .expect("encode typed compact write");
+    let mut publish = Box::pin(pump.forward(CONNECTION_A, stream_write));
+    tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        loop {
+            if !publisher
+                .transfer_calls
+                .lock()
+                .expect("observe compact publisher start")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::select! {
+                result = publish.as_mut() => {
+                    panic!("compact publisher returned before held boundary: {result:?}");
+                }
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("compact Stream reaches typed publisher");
+    assert_eq!(stream_acknowledged.try_recv(), Err(TryRecvError::Empty));
+    assert!(publisher.calls.lock().expect("JSON calls").is_empty());
+    assert_eq!(
+        publisher.transfer_calls.lock().expect("transfer calls")[0],
+        stream_carrier
+    );
+    publisher.release.notify_one();
+    publish.as_mut().await.expect("compact publisher succeeds");
+    drop(publish);
+    stream_acknowledged
+        .await
+        .expect("typed publisher success ACKs write");
+
+    let reply_message_id = MessageId::new("compact-reply-message");
+    let reply_carrier = RuntimeTransferCarrierV1::new(
+        reply_message_id.clone(),
+        RuntimeTransferChannel::Reply,
+        transfer,
+    );
+    let authorization = RemoteReplyAuthorization::for_test(MACHINE, DEVICE_A, 1);
+    let route = DirectedReplyRoute {
+        machine_route: MACHINE,
+        device_route: DEVICE_A,
+        request_route: REQUEST_A,
+    };
+    pump.bind(
+        CONNECTION_A,
+        reply_message_id,
+        route,
+        authorization,
+        ReplyRouteLifecycle::OneShot,
+    )
+    .expect("bind compact reply to its exact device/request route");
+    let (reply_write, reply_acknowledged) =
+        ConnectionWrite::for_compact_transfer_test(&reply_carrier)
+            .expect("encode compact reply write");
+    pump.forward(CONNECTION_A, reply_write)
+        .await
+        .expect("compact Reply seals with DeviceReplyTx and flushes as Relay Reply");
+    reply_acknowledged
+        .await
+        .expect("compact Reply ACK waits for directed Relay flush");
+    assert_eq!(
+        publisher
+            .transfer_calls
+            .lock()
+            .expect("transfer calls")
+            .len(),
+        1
+    );
+    assert_eq!(
+        sealer.calls.lock().expect("directed transfer calls").len(),
+        1
+    );
+    assert_eq!(harness.sent_count(), 1);
+    let sent = harness.sent_frames();
+    let RelayFrameBody::Reply(reply) = &sent[0].body else {
+        panic!("compact Reply must use Relay Reply, never shared Publish");
+    };
+    assert_eq!(
+        (reply.device_route, reply.request_route),
+        (DEVICE_A, REQUEST_A)
+    );
+    transport.shutdown().await;
+}
+
+#[tokio::test]
+async fn json_and_compact_publication_failures_drop_core_writes_without_ack() {
+    let (mut transport, _pairing_lane, harness) = active_pairing_transport_for_test(MACHINE);
+    let business = transport
+        .take_business_lane()
+        .expect("take publication-failure business lane");
+    let mut pump = RemoteReplyPump::new(
+        business,
+        Arc::new(RecordingSealer {
+            calls: Mutex::new(Vec::new()),
+            sealed: None,
+        }),
+    )
+    .with_stream_publisher(Arc::new(FailingPublisher));
+
+    let (_message_id, json_write, json_acknowledged) = runtime_write(
+        "json-publication-failure",
+        RuntimeMessage::Stream(RuntimeStreamItem::CatalogDelta(CatalogDelta {
+            catalog_revision: 23,
+            changes: Vec::new(),
+        })),
+    );
+    assert!(matches!(
+        pump.forward(CONNECTION_A, json_write).await,
+        Err(RemoteLinkError::StreamPublishFailed)
+    ));
+    assert!(
+        json_acknowledged.await.is_err(),
+        "JSON publication failure must drop the Core write without ACK"
+    );
+
+    let transfer = TransferEnvelope::new(
+        TransferId::new("compact-publication-failure"),
+        0,
+        1,
+        [0x72; 32],
+        3,
+        vec![4, 5, 6],
+    )
+    .expect("valid failing compact part");
+    let carrier = RuntimeTransferCarrierV1::new(
+        MessageId::new("compact-publication-failure"),
+        RuntimeTransferChannel::Stream,
+        transfer,
+    );
+    let (compact_write, compact_acknowledged) =
+        ConnectionWrite::for_compact_transfer_test(&carrier).expect("encode failing compact write");
+    assert!(matches!(
+        pump.forward(CONNECTION_A, compact_write).await,
+        Err(RemoteLinkError::StreamPublishFailed)
+    ));
+    assert!(
+        compact_acknowledged.await.is_err(),
+        "compact publication failure must drop the Core write without ACK"
+    );
+    assert_eq!(harness.sent_count(), 0, "publisher errors never emit Reply");
+
     transport.shutdown().await;
 }
 

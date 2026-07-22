@@ -21,7 +21,8 @@ use super::pairing::PairingInviteLifecycle;
 use super::pairing_grant::PairingGrantPreparation;
 use super::pairing_grant_commit::{AcknowledgeGrantCommitted, AcknowledgeGrantCommittedOutcome};
 use super::pairing_grant_tests::{
-    awaiting_pairing, awaiting_pairing_with, grant_input, grant_input_with, secret,
+    awaiting_pairing, awaiting_pairing_with, complete_active_zero_cut_transition, grant_input,
+    grant_input_with, secret,
 };
 use super::pairing_grant_tx::ConfirmPairingGrantOutcome;
 use super::pairing_tests::{
@@ -449,6 +450,7 @@ async fn full_open_audit_accepts_mixed_committed_and_preparing_grants() {
         ))
         .await
         .expect("commit first grant");
+    complete_active_zero_cut_transition(&store).await;
 
     let second_preparation = awaiting_pairing_with(
         &store,

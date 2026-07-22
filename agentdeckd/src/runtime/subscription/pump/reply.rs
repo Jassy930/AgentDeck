@@ -2,15 +2,21 @@
 
 use std::future::Future;
 
-use agentdeck_protocol::runtime::identity::{MessageId, TransferId};
+use agentdeck_protocol::runtime::identity::MessageId;
 use agentdeck_protocol::runtime::{
     MAX_JSON_PART_BYTES, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage, RuntimeReply,
     RuntimeStreamItem, RuntimeTransferChannel,
 };
 
-use super::super::egress::{TransferEgressControl, TransferEgressError, send_json_transfer};
+use super::super::egress::{
+    TransferEgressControl, TransferEgressError, send_json_transfer, send_stream_transfer,
+};
 use crate::runtime::connection::{
     ConnectionError, ConnectionId, ConnectionRegistry, EncodedRuntimeFrame,
+};
+use crate::runtime::transfer_identity::{
+    DurableReplyTransferIdentity, DurableStreamSource, DurableStreamTransferIdentity,
+    DurableStreamTransferIdentityError,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +33,8 @@ pub(in crate::runtime::subscription) enum PumpSendError {
     Entropy,
     #[error("oversized runtime item has no transfer DTO payload")]
     MissingTransferPayload,
+    #[error(transparent)]
+    DurableTransferIdentity(#[from] DurableStreamTransferIdentityError),
 }
 
 pub(super) async fn reply(
@@ -37,6 +45,9 @@ pub(super) async fn reply(
     transfer_payload: Option<&[u8]>,
     control: &TransferEgressControl,
 ) -> Result<(), PumpSendError> {
+    let transfer_identity = transfer_payload
+        .map(|payload| DurableReplyTransferIdentity::for_reply(&message_id, &reply, payload))
+        .transpose()?;
     // 威胁场景：已 canonical encode 的 64 MiB snapshot 若先再尝试序列化成 1 MiB
     // envelope，raw payload、typed DTO 与注定失败的第二份大 buffer 会同时驻留。
     // 达到单个 JSON transfer part 大小时直接走真实 paced transfer。
@@ -47,7 +58,9 @@ pub(super) async fn reply(
             connections,
             connection_id,
             message_id,
-            random_transfer_id()?,
+            transfer_identity
+                .ok_or(PumpSendError::MissingTransferPayload)?
+                .transfer_id(),
             RuntimeTransferChannel::Reply,
             payload,
             control,
@@ -64,11 +77,13 @@ pub(super) async fn reply(
         Ok(frame) => paced(connections, connection_id, frame, control).await,
         Err(ConnectionError::FrameTooLarge) => {
             let payload = transfer_payload.ok_or(PumpSendError::MissingTransferPayload)?;
+            let transfer_identity =
+                transfer_identity.ok_or(PumpSendError::MissingTransferPayload)?;
             send_json_transfer(
                 connections,
                 connection_id,
                 message_id,
-                random_transfer_id()?,
+                transfer_identity.transfer_id(),
                 RuntimeTransferChannel::Reply,
                 payload,
                 control,
@@ -83,19 +98,31 @@ pub(super) async fn reply(
 pub(super) async fn stream(
     connections: &ConnectionRegistry,
     connection_id: ConnectionId,
+    durable_source: DurableStreamSource,
     item: RuntimeStreamItem,
     transfer_payload: Option<&[u8]>,
     control: &TransferEgressControl,
 ) -> Result<(), PumpSendError> {
+    let transfer_identity = transfer_payload
+        .map(|payload| {
+            DurableStreamTransferIdentity::for_stream_source(durable_source, &item, payload)
+        })
+        .transpose()?;
+    let transfer_part_bytes = connections
+        .framing_profile(connection_id)?
+        .transfer_part_bytes();
     if let Some(payload) = transfer_payload
-        && payload.len() >= MAX_JSON_PART_BYTES
+        && payload.len() >= transfer_part_bytes
     {
-        send_json_transfer(
+        send_stream_transfer(
             connections,
             connection_id,
-            random_message_id()?,
-            random_transfer_id()?,
-            RuntimeTransferChannel::Stream,
+            transfer_identity
+                .ok_or(PumpSendError::MissingTransferPayload)?
+                .message_id(),
+            transfer_identity
+                .ok_or(PumpSendError::MissingTransferPayload)?
+                .transfer_id(),
             payload,
             control,
         )
@@ -112,12 +139,13 @@ pub(super) async fn stream(
         Ok(frame) => paced(connections, connection_id, frame, control).await,
         Err(ConnectionError::FrameTooLarge) => {
             let payload = transfer_payload.ok_or(PumpSendError::MissingTransferPayload)?;
-            send_json_transfer(
+            let transfer_identity =
+                transfer_identity.ok_or(PumpSendError::MissingTransferPayload)?;
+            send_stream_transfer(
                 connections,
                 connection_id,
-                message_id,
-                random_transfer_id()?,
-                RuntimeTransferChannel::Stream,
+                transfer_identity.message_id(),
+                transfer_identity.transfer_id(),
                 payload,
                 control,
             )
@@ -166,10 +194,6 @@ async fn controlled<T>(
 
 fn random_message_id() -> Result<MessageId, PumpSendError> {
     Ok(MessageId::new(format!("stream-{}", random_uuid()?)))
-}
-
-fn random_transfer_id() -> Result<TransferId, PumpSendError> {
-    Ok(TransferId::new(format!("transfer-{}", random_uuid()?)))
 }
 
 fn random_uuid() -> Result<String, PumpSendError> {

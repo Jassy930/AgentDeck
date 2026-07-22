@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use super::CatalogCacheKey;
 use super::CatalogSnapshotProviderError;
 use super::cache::{CatalogCacheExpiry, CatalogMemoryState};
 
@@ -19,7 +20,7 @@ struct ScheduledExpiry {
 }
 
 pub(super) struct CatalogExpiryTasks {
-    tasks: Mutex<HashMap<[u8; 16], ScheduledExpiry>>,
+    tasks: Mutex<HashMap<CatalogCacheKey, ScheduledExpiry>>,
     #[cfg(test)]
     active_tasks: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -36,7 +37,7 @@ impl CatalogExpiryTasks {
     pub(super) fn replace(
         self: &Arc<Self>,
         memory: Weak<Mutex<CatalogMemoryState>>,
-        snapshot_id: [u8; 16],
+        cache_key: CatalogCacheKey,
         expiry: CatalogCacheExpiry,
         observed_now_ms: u64,
     ) -> Result<(), CatalogSnapshotProviderError> {
@@ -44,7 +45,7 @@ impl CatalogExpiryTasks {
             .tasks
             .lock()
             .map_err(|_| CatalogSnapshotProviderError::MemoryStatePoisoned)?;
-        if let Some(previous) = tasks.remove(&snapshot_id) {
+        if let Some(previous) = tasks.remove(&cache_key) {
             previous.handle.abort();
         }
 
@@ -65,13 +66,13 @@ impl CatalogExpiryTasks {
             if let Some(memory) = memory.upgrade()
                 && let Ok(mut state) = memory.lock()
             {
-                state.expire_exact(snapshot_id, expiry);
+                state.expire_exact(cache_key, expiry);
             }
             if let Some(owner) = owner.upgrade() {
-                owner.finish_exact(snapshot_id, &task_identity);
+                owner.finish_exact(cache_key, &task_identity);
             }
         });
-        let replaced = tasks.insert(snapshot_id, ScheduledExpiry { identity, handle });
+        let replaced = tasks.insert(cache_key, ScheduledExpiry { identity, handle });
         debug_assert!(replaced.is_none());
         drop(tasks);
         let _ = publish.send(());
@@ -89,27 +90,30 @@ impl CatalogExpiryTasks {
         Ok(())
     }
 
-    pub(super) fn cancel(&self, snapshot_id: [u8; 16]) -> Result<(), CatalogSnapshotProviderError> {
+    pub(super) fn cancel(
+        &self,
+        cache_key: CatalogCacheKey,
+    ) -> Result<(), CatalogSnapshotProviderError> {
         let task = self
             .tasks
             .lock()
             .map_err(|_| CatalogSnapshotProviderError::MemoryStatePoisoned)?
-            .remove(&snapshot_id);
+            .remove(&cache_key);
         if let Some(task) = task {
             task.handle.abort();
         }
         Ok(())
     }
 
-    fn finish_exact(&self, snapshot_id: [u8; 16], identity: &Arc<()>) {
+    fn finish_exact(&self, cache_key: CatalogCacheKey, identity: &Arc<()>) {
         let Ok(mut tasks) = self.tasks.lock() else {
             return;
         };
         if tasks
-            .get(&snapshot_id)
+            .get(&cache_key)
             .is_some_and(|task| Arc::ptr_eq(&task.identity, identity))
         {
-            tasks.remove(&snapshot_id);
+            tasks.remove(&cache_key);
         }
     }
 

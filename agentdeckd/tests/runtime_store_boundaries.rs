@@ -93,21 +93,32 @@ impl RuntimeClock for ManualClock {
     }
 }
 
-struct RepeatingIdSource {
-    bytes: [u8; 16],
-    calls: Arc<AtomicUsize>,
+struct RepeatingCommandIdSource {
+    command_bytes: [u8; 16],
+    command_calls: Arc<AtomicUsize>,
+    next_unique_sequence: u32,
 }
 
-impl RepeatingIdSource {
-    fn new(bytes: [u8; 16], calls: Arc<AtomicUsize>) -> Self {
-        Self { bytes, calls }
+impl RepeatingCommandIdSource {
+    fn new(command_bytes: [u8; 16], command_calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            command_bytes,
+            command_calls,
+            next_unique_sequence: 1,
+        }
     }
 }
 
-impl RuntimeIdSource for RepeatingIdSource {
+impl RuntimeIdSource for RepeatingCommandIdSource {
     fn next_id(&mut self, kind: RuntimeIdKind) -> Result<RuntimeId, RuntimeIdError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        RuntimeId::from_bytes(kind, self.bytes)
+        if kind == RuntimeIdKind::Command {
+            self.command_calls.fetch_add(1, Ordering::SeqCst);
+            return RuntimeId::from_bytes(kind, self.command_bytes);
+        }
+
+        let sequence = self.next_unique_sequence;
+        self.next_unique_sequence += 1;
+        Ok(runtime_id(kind, sequence))
     }
 }
 
@@ -542,7 +553,35 @@ fn runtime_ledger_token(
             },
         )
         .expect("read Runtime remote security ledger fixture");
-    let mut message = Vec::with_capacity(528);
+    let extended_remote_ledger: [i64; 12] = connection
+        .query_row(
+            "SELECT remote_replay_scope_count, remote_replay_retired_scope_count,
+                    remote_replay_pin_count, remote_replay_sealed_bytes,
+                    remote_counter_state_count, remote_counter_state_sealed_bytes,
+                    remote_counter_guard_manifest_count, remote_key_transition_count,
+                    remote_key_transition_active_count, remote_key_transition_sealed_bytes,
+                    remote_key_update_outbox_count, remote_key_update_outbox_sealed_bytes
+             FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ])
+            },
+        )
+        .expect("read Runtime extended remote security ledger fixture");
+    let mut message = Vec::with_capacity(624);
     message.extend_from_slice(&database_id);
     match catalog_high_water {
         None => message.push(0),
@@ -665,8 +704,15 @@ fn runtime_ledger_token(
                 .to_be_bytes(),
         );
     }
+    for value in extended_remote_ledger {
+        message.extend_from_slice(
+            &u64::try_from(value)
+                .expect("fixture extended remote ledger counter is non-negative")
+                .to_be_bytes(),
+        );
+    }
     *key_bundle
-        .blind_index(b"runtime.meta.ledger.v10", &message)
+        .blind_index(b"runtime.meta.ledger.v14", &message)
         .expect("authenticate Runtime boundary ledger")
         .as_bytes()
 }
@@ -991,12 +1037,12 @@ async fn command_id_sixteen_collisions_exhaust_without_adding_a_row_or_advancing
     let keys = MemoryKeyStore::new();
     let clock = ManualClock::new(1_000);
     let collision_bytes = [0xcc; 16];
-    let first_calls = Arc::new(AtomicUsize::new(0));
+    let first_command_calls = Arc::new(AtomicUsize::new(0));
     let initial_config = RuntimeStoreConfig::new(root.database())
         .with_clock(clock.clone())
-        .with_id_source(RepeatingIdSource::new(
+        .with_id_source(RepeatingCommandIdSource::new(
             collision_bytes,
-            Arc::clone(&first_calls),
+            Arc::clone(&first_command_calls),
         ));
     let store = RuntimeStoreHandle::open(initial_config, root.storage_kek(&keys))
         .await
@@ -1018,16 +1064,16 @@ async fn command_id_sixteen_collisions_exhaust_without_adding_a_row_or_advancing
         first,
         AcceptOutcome::Accepted { command, .. } if command.command_id.as_bytes() == &collision_bytes
     ));
-    assert_eq!(first_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(first_command_calls.load(Ordering::SeqCst), 1);
     store.shutdown().await.expect("close collision fixture");
 
     clock.set(2_000);
-    let retry_calls = Arc::new(AtomicUsize::new(0));
+    let retry_command_calls = Arc::new(AtomicUsize::new(0));
     let retry_config = RuntimeStoreConfig::new(root.database())
         .with_clock(clock)
-        .with_id_source(RepeatingIdSource::new(
+        .with_id_source(RepeatingCommandIdSource::new(
             collision_bytes,
-            Arc::clone(&retry_calls),
+            Arc::clone(&retry_command_calls),
         ));
     let reopened = RuntimeStoreHandle::open(retry_config, root.storage_kek(&keys))
         .await
@@ -1047,7 +1093,7 @@ async fn command_id_sixteen_collisions_exhaust_without_adding_a_row_or_advancing
             attempts: COMMAND_COLLISION_ATTEMPTS,
         })
     ));
-    assert_eq!(retry_calls.load(Ordering::SeqCst), 16);
+    assert_eq!(retry_command_calls.load(Ordering::SeqCst), 16);
 
     let recovery = runtime_recovery::load_recovery_state(&reopened)
         .await
@@ -1089,11 +1135,11 @@ async fn catalog_hwm_u64_max_returns_typed_exhaustion_and_inserts_no_additional_
                 [],
                 |row| row.get(0),
             )
-            .expect("read baseline v10 ledger token");
+            .expect("read baseline current-v14 ledger token");
         assert_eq!(
             runtime_ledger_token(&transaction, &key_bundle, database_id).as_slice(),
             stored_token,
-            "fixture v10 ledger encoder must match the store"
+            "fixture current-v14 ledger encoder must match the store"
         );
         assert_eq!(
             transaction

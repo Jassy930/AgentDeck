@@ -7,6 +7,7 @@ pub mod backfill;
 pub mod catalog_snapshot;
 mod connection;
 mod conversation;
+pub(crate) mod conversation_activation;
 mod core;
 pub mod events;
 pub(crate) mod execution;
@@ -32,13 +33,17 @@ pub mod snapshot;
 pub mod store;
 pub(crate) mod subscription;
 pub mod transfer;
+pub(crate) mod transfer_identity;
 pub(crate) mod upgrade;
 
 pub use connection::{
     AuthenticatedPrincipal, ConnectionId, ConnectionSink, ConnectionWrite, FlushReceipt,
 };
+pub(crate) use connection::{ConnectionFramingProfile, EncodedRuntimeFrameKind};
 #[cfg(test)]
 pub(crate) use conversation::tests::FakeCoordinator;
+#[doc(hidden)]
+pub use conversation_activation::{ConversationActivationCoordinator, ConversationActivationError};
 pub use core::{RecoveryReport, RuntimeCore};
 pub use hub::RuntimeHub;
 #[doc(hidden)]

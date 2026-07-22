@@ -298,6 +298,24 @@ impl SubscriptionRegistry {
         Ok(true)
     }
 
+    /// transition sibling scopes 共享同一 connection 时，首个 snapshot 已 flush 后只释放
+    /// snapshot-sender 配额，barrier 继续保持 active，直到全部 StreamApplied ACK 完成。
+    pub(crate) fn release_snapshot_sender(
+        &self,
+        lease: &SubscriptionLease,
+        now_ms: u64,
+    ) -> Result<bool, SubscriptionRegistryError> {
+        self.require_same_registry(lease)?;
+        let mut state = self.lock()?;
+        observe_now(&mut state, now_ms)?;
+        expire_locked(&mut state, now_ms)?;
+        if !current_entry(&state, lease)?.snapshot_sender {
+            return Ok(false);
+        }
+        current_entry_mut(&mut state, lease)?.snapshot_sender = false;
+        Ok(true)
+    }
+
     pub(crate) fn admit_live_enqueue(
         &self,
         lease: &SubscriptionLease,

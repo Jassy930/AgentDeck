@@ -7,7 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use agentdeck_protocol::runtime::{ArtifactSha256, UninstallPurgePlanV1};
 
+use crate::remote::counter::CounterGuardState;
+use crate::remote::identity::scoped_counter_guard_account_from_token;
+use crate::runtime::model::RuntimeStoreConfig;
 use crate::runtime::singleton::SingletonGuard;
+use crate::runtime::store::RuntimeStoreHandle;
+use crate::security::load_or_create_storage_kek;
 
 use super::*;
 
@@ -139,6 +144,7 @@ struct Fixture {
     plan: UninstallPurgePlanV1,
     identity: RunningFinalizerIdentity,
     keys: RecordingKeyStore,
+    database_id: [u8; 16],
 }
 
 impl Fixture {
@@ -169,10 +175,6 @@ impl Fixture {
         fs::create_dir_all(&launch_agents).expect("LaunchAgents");
         let plist = launch_agents.join(PLIST_BASENAME);
         write_mode(&plist, b"plist", 0o600);
-        for path in runtime_artifact_paths(&paths.runtime_db) {
-            write_mode(&path, b"runtime", 0o600);
-        }
-
         let helper_hash = ArtifactSha256::new(hex(&sha256(HELPER_BYTES))).expect("hash");
         let plan = UninstallPurgePlanV1::new(
             helper.clone(),
@@ -194,6 +196,33 @@ impl Fixture {
         for (index, account) in machine_accounts().iter().enumerate() {
             keys.insert(account, &[0x40 + index as u8; 32]);
         }
+        let storage_kek =
+            load_or_create_storage_kek(&keys, &paths.runtime_db).expect("load fixture StorageKEK");
+        let database_id = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build purge fixture runtime");
+                    runtime.block_on(async {
+                        let store = RuntimeStoreHandle::open(
+                            RuntimeStoreConfig::new(paths.runtime_db.clone()),
+                            storage_kek,
+                        )
+                        .await
+                        .expect("create authenticated purge fixture database");
+                        let database_id = store.authenticated_database_id();
+                        store
+                            .shutdown()
+                            .await
+                            .expect("shutdown purge fixture store");
+                        database_id
+                    })
+                })
+                .join()
+                .expect("join purge fixture runtime")
+        });
         Self {
             _root: root,
             paths,
@@ -203,13 +232,14 @@ impl Fixture {
             plan,
             identity,
             keys,
+            database_id,
         }
     }
 
     fn authorization(&self) -> AuthenticatedPurgeAuthorization {
         AuthenticatedPurgeAuthorization {
             binding: PurgeAuthorizationBinding::Remote {
-                database_id: [0x11; 16],
+                database_id: self.database_id,
                 relay_server_id: [0x12; 16],
                 machine_route: [0x13; 16],
                 root_key_id: [0x14; 16],
@@ -225,7 +255,7 @@ impl Fixture {
     fn local_deleted_authorization(&self) -> AuthenticatedPurgeAuthorization {
         AuthenticatedPurgeAuthorization {
             binding: PurgeAuthorizationBinding::Remote {
-                database_id: [0x11; 16],
+                database_id: self.database_id,
                 relay_server_id: [0x12; 16],
                 machine_route: [0x13; 16],
                 root_key_id: [0x14; 16],
@@ -241,7 +271,7 @@ impl Fixture {
     fn unenrolled_authorization(&self) -> AuthenticatedPurgeAuthorization {
         AuthenticatedPurgeAuthorization {
             binding: PurgeAuthorizationBinding::Unenrolled {
-                database_id: [0x11; 16],
+                database_id: self.database_id,
                 root_key_id: [0x14; 16],
                 root_fingerprint: [0x22; 32],
                 trust_epoch: 1,
@@ -315,6 +345,62 @@ impl Fixture {
         }
         self.keys.clear_values();
         self.keys.clear_operations();
+    }
+
+    fn seed_counter_guard_manifest(&self, entries: &[([u8; 32], bool, bool)]) {
+        let storage_kek = load_or_create_storage_kek(&self.keys, &self.paths.runtime_db)
+            .expect("reload fixture StorageKEK");
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build guard fixture runtime");
+                    runtime.block_on(async {
+                        let store = RuntimeStoreHandle::open(
+                            RuntimeStoreConfig::new(self.paths.runtime_db.clone()),
+                            storage_kek,
+                        )
+                        .await
+                        .expect("open guard fixture database");
+                        for (scope_token, materialized, _) in entries.iter().copied() {
+                            store
+                                .register_remote_counter_guard_scope(scope_token)
+                                .await
+                                .expect("register purge guard scope");
+                            if materialized {
+                                store
+                                    .mark_remote_counter_guard_scope_materialized(scope_token)
+                                    .await
+                                    .expect("materialize purge guard scope");
+                            }
+                        }
+                        assert_eq!(store.authenticated_database_id(), self.database_id);
+                        store
+                            .shutdown()
+                            .await
+                            .expect("shutdown guard fixture store");
+                    });
+                })
+                .join()
+                .expect("join guard fixture runtime");
+        });
+        for (index, (scope_token, _, present)) in entries.iter().copied().enumerate() {
+            if present {
+                let guard = CounterGuardState::stable(
+                    scope_token,
+                    1_024 + index as u64,
+                    [0x81 + index as u8; 32],
+                )
+                .expect("build purge guard");
+                self.keys.insert(
+                    &scoped_counter_guard_account_from_token(scope_token)
+                        .expect("derive purge guard account"),
+                    &guard.encode(),
+                );
+            }
+        }
     }
 }
 
@@ -457,6 +543,43 @@ fn marker_intent_probe_is_read_only_and_malformed_state_fails_closed() {
         .expect_err("malformed marker cannot be treated as absent");
     assert_eq!(error.code(), "daemon.purge.marker_invalid");
     assert_no_key_writes(&present.keys);
+}
+
+#[test]
+fn legacy_v1_marker_is_typed_fail_closed_and_never_rewritten() {
+    for (index, phase) in ["prepared", "runtimeRemoved"].into_iter().enumerate() {
+        let fixture = Fixture::new(&format!("legacy-v1-marker-{index}"));
+        fixture.reserve();
+        let current = fixture
+            .keys
+            .values_snapshot()
+            .remove(PURGE_FINALIZER_MARKER_ACCOUNT)
+            .expect("current marker bytes");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&current).expect("decode current marker fixture");
+        let object = legacy.as_object_mut().expect("marker object");
+        object.insert("marker_version".to_owned(), serde_json::json!(1));
+        object.insert("phase".to_owned(), serde_json::json!(phase));
+        object.remove("counter_guard_manifest");
+        let legacy_bytes = serde_json::to_vec(&legacy).expect("encode legacy marker fixture");
+        fixture
+            .keys
+            .insert(PURGE_FINALIZER_MARKER_ACCOUNT, &legacy_bytes);
+        fixture.keys.clear_operations();
+
+        let error = purge_marker_intent_present(&fixture.keys)
+            .expect_err("legacy marker must remain a visible fail-closed intent");
+        assert_eq!(error.code(), "daemon.purge.marker_version_unsupported");
+        assert_eq!(
+            fixture
+                .keys
+                .values_snapshot()
+                .get(PURGE_FINALIZER_MARKER_ACCOUNT),
+            Some(&legacy_bytes),
+            "unsupported marker bytes must remain exact"
+        );
+        assert_no_key_writes(&fixture.keys);
+    }
 }
 
 #[test]
@@ -716,6 +839,173 @@ fn full_finalizer_order_keeps_recovery_helper_and_deletes_marker_last() {
 }
 
 #[test]
+fn counter_guard_phase_removes_authenticated_v2_inventory_before_runtime_and_machine_secrets() {
+    let fixture = Fixture::new("counter-guard-order");
+    let entries = [
+        ([0x11; 32], false, false),
+        ([0x22; 32], true, true),
+        ([0x33; 32], true, true),
+    ];
+    fixture.seed_counter_guard_manifest(&entries);
+    fixture.prepare();
+    fixture.keys.clear_operations();
+    let stopped = fixture.stopped();
+
+    let error = run_purge_finalizer_with_observer(
+        &fixture.keys,
+        &fixture.paths,
+        &fixture.identity,
+        &stopped,
+        fixture.plan_id(),
+        &CrashOnce::new(PurgeFinalizerEvent::BeforePhase(
+            PurgeFinalizerPhase::CounterGuardsRemoved,
+        )),
+    )
+    .expect_err("stop after CounterGuard cleanup phase commit");
+    assert_eq!(error.code(), "daemon.purge.injected_crash");
+    assert!(fixture.paths.runtime_db.exists());
+    for (scope_token, _, _) in entries {
+        assert!(!fixture.keys.contains(
+            &scoped_counter_guard_account_from_token(scope_token).expect("guard account")
+        ));
+    }
+    for account in machine_accounts() {
+        assert!(fixture.keys.contains(account));
+    }
+    let deletes = fixture.keys.deletes();
+    assert_eq!(
+        deletes,
+        vec![
+            scoped_counter_guard_account_from_token([0x22; 32]).unwrap(),
+            scoped_counter_guard_account_from_token([0x33; 32]).unwrap(),
+        ]
+    );
+
+    assert_eq!(
+        run_purge_finalizer(
+            &fixture.keys,
+            &fixture.paths,
+            &fixture.identity,
+            &stopped,
+            fixture.plan_id(),
+        )
+        .expect("resume after CounterGuard phase commit"),
+        PurgeFinalizerOutcome::Completed
+    );
+}
+
+#[test]
+fn counter_guard_batch_preflight_rejects_late_corruption_before_first_delete() {
+    let fixture = Fixture::new("cg-preflight");
+    fixture.seed_counter_guard_manifest(&[([0x41; 32], true, true), ([0x42; 32], true, true)]);
+    fixture.prepare();
+    let later = scoped_counter_guard_account_from_token([0x42; 32]).unwrap();
+    fixture.keys.insert(&later, b"corrupt-later-guard");
+    fixture.keys.clear_operations();
+    let disk_before = disk_snapshot(&fixture._root.0);
+    let keys_before = fixture.keys.values_snapshot();
+    let stopped = fixture.stopped();
+
+    let error = run_purge_finalizer(
+        &fixture.keys,
+        &fixture.paths,
+        &fixture.identity,
+        &stopped,
+        fixture.plan_id(),
+    )
+    .expect_err("all guards must validate before the first delete");
+    assert_eq!(error.code(), "daemon.purge.counter_guard_cleanup_failed");
+    assert!(fixture.keys.deletes().is_empty());
+    drop(stopped);
+    assert_eq!(disk_snapshot(&fixture._root.0), disk_before);
+    assert_eq!(fixture.keys.values_snapshot(), keys_before);
+    assert!(fixture.paths.runtime_db.exists());
+}
+
+#[test]
+fn counter_guard_delete_before_phase_commit_is_exactly_retryable() {
+    let fixture = Fixture::new("cg-crash");
+    fixture.seed_counter_guard_manifest(&[
+        ([0x51; 32], false, false),
+        ([0x52; 32], true, true),
+        ([0x53; 32], true, true),
+    ]);
+    fixture.prepare();
+    let stopped = fixture.stopped();
+
+    let error = run_purge_finalizer_with_observer(
+        &fixture.keys,
+        &fixture.paths,
+        &fixture.identity,
+        &stopped,
+        fixture.plan_id(),
+        &CrashOnce::new(PurgeFinalizerEvent::AfterPhaseAction(
+            PurgeFinalizerPhase::InstallDetached,
+        )),
+    )
+    .expect_err("crash after guard readback but before phase marker commit");
+    assert_eq!(error.code(), "daemon.purge.injected_crash");
+    assert!(fixture.paths.runtime_db.exists());
+    assert_eq!(
+        load_marker(&fixture.keys)
+            .expect("load retry marker")
+            .expect("retry marker remains")
+            .phase,
+        PurgeFinalizerPhase::InstallDetached
+    );
+
+    assert_eq!(
+        run_purge_finalizer(
+            &fixture.keys,
+            &fixture.paths,
+            &fixture.identity,
+            &stopped,
+            fixture.plan_id(),
+        )
+        .expect("retry converges from guard delete crash gap"),
+        PurgeFinalizerOutcome::Completed
+    );
+}
+
+#[test]
+fn marker_freezes_constant_size_counter_guard_commitment_not_token_inventory() {
+    let empty = Fixture::new("cg-empty");
+    empty.reserve();
+    let empty_marker = load_marker(&empty.keys)
+        .expect("load empty marker")
+        .expect("empty marker exists");
+    assert_eq!(empty_marker.counter_guard_manifest.count, 0);
+
+    let populated = Fixture::new("cg-populated");
+    populated.seed_counter_guard_manifest(&[
+        ([0x61; 32], false, false),
+        ([0x62; 32], true, true),
+        ([0x63; 32], true, true),
+    ]);
+    populated.reserve();
+    let populated_bytes = populated.keys.values_snapshot();
+    let populated_marker = populated_bytes
+        .get(PURGE_FINALIZER_MARKER_ACCOUNT)
+        .expect("populated marker");
+    let decoded = load_marker(&populated.keys)
+        .expect("load populated marker")
+        .expect("populated marker exists");
+    assert_eq!(decoded.counter_guard_manifest.count, 3);
+    assert_ne!(
+        decoded.counter_guard_manifest.digest,
+        empty_marker.counter_guard_manifest.digest
+    );
+    for token in [[0x61; 32], [0x62; 32], [0x63; 32]] {
+        assert!(
+            !populated_marker
+                .windows(token.len())
+                .any(|window| window == token),
+            "marker must not embed the manifest token list"
+        );
+    }
+}
+
+#[test]
 fn every_nonterminal_phase_before_action_and_commit_crash_is_retryable() {
     let events = [
         PurgeFinalizerEvent::BeforePhase(PurgeFinalizerPhase::Prepared),
@@ -726,6 +1016,9 @@ fn every_nonterminal_phase_before_action_and_commit_crash_is_retryable() {
         PurgeFinalizerEvent::AfterPhaseCommit(PurgeFinalizerPhase::InstallDetached),
         PurgeFinalizerEvent::BeforePhase(PurgeFinalizerPhase::InstallDetached),
         PurgeFinalizerEvent::AfterPhaseAction(PurgeFinalizerPhase::InstallDetached),
+        PurgeFinalizerEvent::AfterPhaseCommit(PurgeFinalizerPhase::CounterGuardsRemoved),
+        PurgeFinalizerEvent::BeforePhase(PurgeFinalizerPhase::CounterGuardsRemoved),
+        PurgeFinalizerEvent::AfterPhaseAction(PurgeFinalizerPhase::CounterGuardsRemoved),
         PurgeFinalizerEvent::AfterPhaseCommit(PurgeFinalizerPhase::RuntimeRemoved),
         PurgeFinalizerEvent::BeforePhase(PurgeFinalizerPhase::RuntimeRemoved),
         PurgeFinalizerEvent::AfterPhaseAction(PurgeFinalizerPhase::RuntimeRemoved),
@@ -1372,6 +1665,7 @@ fn restored_completed_prefix_is_rejected_before_next_phase_deletion() {
                     0o600,
                 );
             }
+            PurgeFinalizerPhase::CounterGuardsRemoved => unreachable!(),
             PurgeFinalizerPhase::MachineSecretsRemoved => {
                 fixture
                     .keys
@@ -1405,6 +1699,7 @@ fn restored_completed_prefix_is_rejected_before_next_phase_deletion() {
             PurgeFinalizerPhase::RuntimeRemoved => {
                 assert!(fixture.keys.contains(MACHINE_ROOT_SIGN_ACCOUNT));
             }
+            PurgeFinalizerPhase::CounterGuardsRemoved => unreachable!(),
             PurgeFinalizerPhase::MachineSecretsRemoved => {
                 assert!(fixture.keys.contains(STORAGE_KEK_ACCOUNT));
             }
@@ -1569,7 +1864,7 @@ fn resume_reserved_marker_is_absent_authorized_or_exact_replay() {
     fixture.keys.clear_operations();
     let conflicting = AuthenticatedPurgeAuthorization {
         binding: PurgeAuthorizationBinding::Remote {
-            database_id: [0x11; 16],
+            database_id: fixture.database_id,
             relay_server_id: [0x12; 16],
             machine_route: [0x13; 16],
             root_key_id: [0x14; 16],

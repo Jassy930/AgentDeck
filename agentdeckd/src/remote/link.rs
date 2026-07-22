@@ -1,6 +1,6 @@
 //! 唯一 MachineLink 上的 Runtime dispatch actor。
 //!
-//! RemoteLink 只拥有易失的 generation、replay window、connection 与 reply-route 映射；
+//! RemoteLink 只拥有易失的 generation、connection 与 reply-route 映射；
 //! canonical conversation/command/receipt 状态始终留在 [`RuntimeCore`] / Runtime Store。
 
 use std::future::poll_fn;
@@ -9,36 +9,68 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::Poll;
 use std::time::Duration;
 
-use agentdeck_crypto::replay::ReplayWindow;
-use agentdeck_protocol::e2ee::{KeyPurpose, SignedSealedBlobV1};
+use agentdeck_crypto::sha256;
+use agentdeck_protocol::e2ee::{
+    DeviceKeyRecoveryReplyV1, DirectoryCurrentV1, KeyPurpose, KeyUpdateSetV1, SignedSealedBlobV1,
+};
+use agentdeck_protocol::relay_v2::KeyDirectoryRevision;
 use agentdeck_protocol::relay_v2::frame::{Reply, SealedBlob, Send as RouteSend};
 use agentdeck_protocol::relay_v2::{DeviceRouteId, MachineRouteId, RequestRouteId};
 use agentdeck_protocol::runtime::identity::MessageId;
 use agentdeck_protocol::runtime::{
     MAX_RUNTIME_JSON_FRAME_BYTES, RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeRequest,
+    RuntimeTransferCarrierV1, RuntimeTransferChannel,
 };
 use async_trait::async_trait;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::runtime::store::key_transition::TransitionSnapshotPermit;
 use crate::runtime::store::{RemoteReplyAuthorization, RuntimeStoreHandle};
-use crate::runtime::{ConnectionId, ConnectionSink, ConnectionWrite, RuntimeCore};
+use crate::runtime::{
+    ConnectionFramingProfile, ConnectionId, ConnectionSink, ConnectionWrite,
+    EncodedRuntimeFrameKind, RuntimeCore,
+};
 
-use super::dispatch::{RemoteDispatchError, RemoteIngressDispatcher};
+use super::dispatch::{
+    ActivatedRemoteIngress, RemoteDispatchError, RemoteIngressDispatcher, RemoteIngressRoute,
+};
+#[cfg(test)]
+use super::key_control::BusinessOnlyKeyControlIngressHandler;
+use super::key_control::{
+    AuthenticatedKeyControlIngressHandler, BusinessIngressAdmission, KeyControlDirectedPayload,
+    KeyControlDirectedReply, KeyControlIngressError, KeyControlIngressOutcome,
+};
+use super::replay::ReplayError;
 use super::transport::{BusinessTransportEvent, BusinessTransportLane, RemoteTransportError};
 
 const REPLY_ROUTE_CAPACITY: usize = 512;
 const REMOTE_CONNECTION_CAPACITY: usize = 128;
-const REMOTE_REPLAY_KEY_CAPACITY: usize = 256;
 const CORE_WRITER_HANDOFF_CAPACITY: usize = 8;
 const CORE_DISPATCH_CAPACITY: usize = 128;
 const REMOTE_LINK_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
+const REMOTE_LINK_ACTOR_EXITED: &str = "daemon.remote.link.actor_exited";
+
+/// RemoteLink 启动时的 ingress capability。ControlPlaneOnly 只允许 authenticated
+/// KeyControl；首个 business frame 必须先从 Store 读回 transition 已释放，才能把
+/// actor 单向提升为 BusinessReady。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteLinkIngressMode {
+    ControlPlaneOnly,
+    BusinessReady,
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct DirectedReplyRoute {
     pub(crate) machine_route: MachineRouteId,
     pub(crate) device_route: DeviceRouteId,
     pub(crate) request_route: RequestRouteId,
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectedReplySeal {
+    pub(crate) authorization_used: RemoteReplyAuthorization,
+    pub(crate) sealed: SignedSealedBlobV1,
 }
 
 /// P4.5 directed reply sealer 的挂载点。P4.4 production 默认实现严格 fail-close，
@@ -52,7 +84,83 @@ pub(crate) trait DirectedReplySealer: Send + Sync {
         authorization: &RemoteReplyAuthorization,
         route: DirectedReplyRoute,
         runtime_bytes: Arc<[u8]>,
-    ) -> Result<SignedSealedBlobV1, RemoteLinkError>;
+    ) -> Result<DirectedReplySeal, RemoteLinkError>;
+
+    /// Compact `Reply` carrier 仍属于单设备定向通道，必须使用 DeviceReplyTx；
+    /// 它不能因体积较大而误入 shared publication outbox。
+    async fn seal_transfer_exact(
+        &self,
+        _authorization: &RemoteReplyAuthorization,
+        _route: DirectedReplyRoute,
+        _carrier: RuntimeTransferCarrierV1,
+    ) -> Result<DirectedReplySeal, RemoteLinkError> {
+        Err(RemoteLinkError::ReplySealUnavailable)
+    }
+
+    /// Active Add transition 的 exact snapshot route。普通 business revision refresh
+    /// 在此时必须保持 fenced；只有 Store-issued permit 可以授权这组 directed replies。
+    async fn seal_transition_snapshot_exact(
+        &self,
+        _authorization: &RemoteReplyAuthorization,
+        _route: DirectedReplyRoute,
+        _permit: &TransitionSnapshotPermit,
+        _runtime_bytes: Arc<[u8]>,
+    ) -> Result<DirectedReplySeal, RemoteLinkError> {
+        Err(RemoteLinkError::ReplySealUnavailable)
+    }
+
+    async fn seal_transition_snapshot_transfer_exact(
+        &self,
+        _authorization: &RemoteReplyAuthorization,
+        _route: DirectedReplyRoute,
+        _permit: &TransitionSnapshotPermit,
+        _carrier: RuntimeTransferCarrierV1,
+    ) -> Result<DirectedReplySeal, RemoteLinkError> {
+        Err(RemoteLinkError::ReplySealUnavailable)
+    }
+
+    /// 仅在 exact SyncComplete 已通过 Relay writer 且 Core write 已 ACK 后调用。
+    async fn mark_transition_snapshot_flushed(
+        &self,
+        _permit: TransitionSnapshotPermit,
+        _sync_complete_sha256: [u8; 32],
+    ) -> Result<(), RemoteLinkError> {
+        Err(RemoteLinkError::ReplySealUnavailable)
+    }
+
+    /// KeySync 的 typed KeyUpdateSet 使用同一 DeviceReplyTx counter/key transaction，
+    /// 但不伪装成 Runtime reply envelope。
+    async fn seal_key_update_exact(
+        &self,
+        _authorization: &RemoteReplyAuthorization,
+        _route: DirectedReplyRoute,
+        _update_set: KeyUpdateSetV1,
+    ) -> Result<SignedSealedBlobV1, RemoteLinkError> {
+        Err(RemoteLinkError::ReplySealUnavailable)
+    }
+
+    /// daemon 尚停在 known revision 时，以当前 DeviceReplyTx key 返回 authenticated
+    /// `DirectoryCurrent(r)`；不得误用 requested revision 的 replacement key。
+    async fn seal_directory_current_exact(
+        &self,
+        _authorization: &RemoteReplyAuthorization,
+        _route: DirectedReplyRoute,
+        _status: DirectoryCurrentV1,
+    ) -> Result<SignedSealedBlobV1, RemoteLinkError> {
+        Err(RemoteLinkError::ReplySealUnavailable)
+    }
+
+    /// DeviceReplyTx rollback 的独立 DeviceHPKE + MachineDataSign recovery carrier。
+    /// 该路径不得调用 reply AEAD sealer 或预留 sender counter。
+    async fn seal_device_key_recovery_exact(
+        &self,
+        _authorization: &RemoteReplyAuthorization,
+        _route: DirectedReplyRoute,
+        _known_revision: KeyDirectoryRevision,
+        _update_set: KeyUpdateSetV1,
+    ) -> Result<DeviceKeyRecoveryReplyV1, RemoteLinkError> {
+        Err(RemoteLinkError::ReplySealUnavailable)
+    }
 }
 
 /// P4.5 publication/outbox 的最小挂载点。成功必须表示 publisher 自己的 durable/Relay
@@ -62,10 +170,23 @@ pub(crate) trait RemoteStreamPublisher: Send + Sync {
     fn admission_ready(&self) -> bool;
 
     async fn publish_exact(&self, runtime_bytes: Arc<[u8]>) -> Result<(), RemoteLinkError>;
+
+    async fn publish_transfer_exact(
+        &self,
+        carrier: RuntimeTransferCarrierV1,
+    ) -> Result<(), RemoteLinkError>;
+
+    /// transport generation 替换后唤醒 durable outbox。默认实现只服务不持久化
+    /// publication 的测试 double；production shared publisher 必须转发到唯一 drive owner。
+    async fn notify_reconnected(&self) -> Result<(), RemoteLinkError> {
+        Ok(())
+    }
 }
 
+#[cfg(test)]
 pub(crate) struct UnavailableDirectedReplySealer;
 
+#[cfg(test)]
 #[async_trait]
 impl DirectedReplySealer for UnavailableDirectedReplySealer {
     fn admission_ready(&self) -> bool {
@@ -77,7 +198,7 @@ impl DirectedReplySealer for UnavailableDirectedReplySealer {
         _authorization: &RemoteReplyAuthorization,
         _route: DirectedReplyRoute,
         _runtime_bytes: Arc<[u8]>,
-    ) -> Result<SignedSealedBlobV1, RemoteLinkError> {
+    ) -> Result<DirectedReplySeal, RemoteLinkError> {
         Err(RemoteLinkError::ReplySealUnavailable)
     }
 }
@@ -93,12 +214,23 @@ impl RemoteStreamPublisher for UnavailableRemoteStreamPublisher {
     async fn publish_exact(&self, _runtime_bytes: Arc<[u8]>) -> Result<(), RemoteLinkError> {
         Err(RemoteLinkError::StreamPublisherUnavailable)
     }
+
+    async fn publish_transfer_exact(
+        &self,
+        _carrier: RuntimeTransferCarrierV1,
+    ) -> Result<(), RemoteLinkError> {
+        Err(RemoteLinkError::StreamPublisherUnavailable)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RemoteLinkError {
     #[error("remote ingress failed: {0}")]
     Dispatch(#[from] RemoteDispatchError),
+    #[error("remote replay admission failed: {0}")]
+    Replay(#[from] ReplayError),
+    #[error("remote key-control ingress failed: {0}")]
+    KeyControl(#[from] KeyControlIngressError),
     #[error("remote transport failed: {0}")]
     Transport(#[from] RemoteTransportError),
     #[error("RuntimeCore is unavailable")]
@@ -111,8 +243,6 @@ pub(crate) enum RemoteLinkError {
     ReplyRouteCapacity,
     #[error("remote connection capacity is exhausted")]
     ConnectionCapacity,
-    #[error("remote replay-key capacity is exhausted")]
-    ReplayCapacity,
     #[error("remote Core dispatch capacity is exhausted")]
     CoreDispatchCapacity,
     #[error("remote reply authorization does not match its route")]
@@ -121,6 +251,8 @@ pub(crate) enum RemoteLinkError {
     InvalidReplySeal,
     #[error("RuntimeCore emitted an invalid envelope")]
     InvalidCoreEgress,
+    #[error("Store-backed KeySync emitted an invalid key update")]
+    InvalidKeyControlReply,
     #[cfg(test)]
     #[error("directed reply sealing failed")]
     ReplySealFailed,
@@ -128,6 +260,10 @@ pub(crate) enum RemoteLinkError {
     ReplySealUnavailable,
     #[error("stream publisher is not installed")]
     StreamPublisherUnavailable,
+    #[error("shared stream publication failed before exact Relay COMMIT")]
+    StreamPublishFailed,
+    #[error("remote sender counter scope is durably retired")]
+    CounterRetired,
     #[error("remote link actor is closed")]
     Closed,
     #[error("remote link did not quiesce before the shutdown deadline")]
@@ -138,6 +274,8 @@ impl RemoteLinkError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Dispatch(error) => error.code(),
+            Self::Replay(error) => error.code(),
+            Self::KeyControl(error) => error.code(),
             Self::Transport(error) => match error {
                 RemoteTransportError::BusinessGenerationReplaced => {
                     "daemon.remote.link.generation_replaced"
@@ -149,18 +287,25 @@ impl RemoteLinkError {
             Self::UnknownReplyRoute => "daemon.remote.link.reply_route_unknown",
             Self::ReplyRouteCapacity => "daemon.remote.link.reply_route_capacity",
             Self::ConnectionCapacity => "daemon.remote.link.connection_capacity",
-            Self::ReplayCapacity => "daemon.remote.link.replay_capacity",
             Self::CoreDispatchCapacity => "daemon.remote.link.core_dispatch_capacity",
             Self::ReplyAuthorizationMismatch => "daemon.remote.link.reply_authorization_mismatch",
             Self::InvalidReplySeal => "daemon.remote.link.reply_seal_invalid",
             Self::InvalidCoreEgress => "daemon.remote.link.invalid_core_egress",
+            Self::InvalidKeyControlReply => "daemon.remote.link.invalid_key_control_reply",
             #[cfg(test)]
             Self::ReplySealFailed => "daemon.remote.link.reply_seal_failed",
             Self::ReplySealUnavailable => "daemon.remote.link.reply_seal_unavailable",
             Self::StreamPublisherUnavailable => "daemon.remote.link.stream_publisher_unavailable",
+            Self::StreamPublishFailed => "daemon.remote.link.stream_publish_failed",
+            Self::CounterRetired => "daemon.remote.counter.retired",
             Self::Closed => "daemon.remote.link.closed",
             Self::ShutdownTimedOut => "daemon.remote.link.shutdown_timed_out",
         }
+    }
+
+    fn requires_device_isolation(&self) -> bool {
+        matches!(self, Self::Dispatch(error) if error.requires_connection_isolation())
+            || matches!(self, Self::Replay(error) if error.requires_connection_isolation())
     }
 }
 
@@ -172,12 +317,19 @@ struct ReplyRouteBinding {
     route: DirectedReplyRoute,
     authorization: RemoteReplyAuthorization,
     lifecycle: ReplyRouteLifecycle,
+    transition_snapshot: Option<TransitionSnapshotPermit>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ReplyRouteLifecycle {
     OneShot,
     UntilSyncComplete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplyRouteBind {
+    Inserted,
+    ExistingExact,
 }
 
 impl ReplyRouteLifecycle {
@@ -202,6 +354,17 @@ impl ReplyRouteLifecycle {
                     RuntimeReply::SyncComplete(_) | RuntimeReply::Failure(_)
                 )
             }
+        }
+    }
+
+    fn completes_transfer(self, carrier: &RuntimeTransferCarrierV1) -> bool {
+        match self {
+            Self::OneShot => carrier
+                .transfer
+                .part_index
+                .checked_add(1)
+                .is_some_and(|next| next == carrier.transfer.part_count),
+            Self::UntilSyncComplete => false,
         }
     }
 }
@@ -240,7 +403,45 @@ impl RemoteReplyPump {
         route: DirectedReplyRoute,
         authorization: RemoteReplyAuthorization,
         lifecycle: ReplyRouteLifecycle,
-    ) -> Result<(), RemoteLinkError> {
+    ) -> Result<ReplyRouteBind, RemoteLinkError> {
+        self.bind_with_transition_snapshot(
+            connection_id,
+            message_id,
+            route,
+            authorization,
+            lifecycle,
+            None,
+        )
+    }
+
+    pub(crate) fn bind_transition_snapshot(
+        &mut self,
+        connection_id: ConnectionId,
+        message_id: MessageId,
+        route: DirectedReplyRoute,
+        authorization: RemoteReplyAuthorization,
+        lifecycle: ReplyRouteLifecycle,
+        permit: TransitionSnapshotPermit,
+    ) -> Result<ReplyRouteBind, RemoteLinkError> {
+        self.bind_with_transition_snapshot(
+            connection_id,
+            message_id,
+            route,
+            authorization,
+            lifecycle,
+            Some(permit),
+        )
+    }
+
+    fn bind_with_transition_snapshot(
+        &mut self,
+        connection_id: ConnectionId,
+        message_id: MessageId,
+        route: DirectedReplyRoute,
+        authorization: RemoteReplyAuthorization,
+        lifecycle: ReplyRouteLifecycle,
+        transition_snapshot: Option<TransitionSnapshotPermit>,
+    ) -> Result<ReplyRouteBind, RemoteLinkError> {
         if authorization.machine_route() != route.machine_route
             || authorization.device_route() != route.device_route
         {
@@ -254,10 +455,11 @@ impl RemoteReplyPump {
                 || existing.route != route
                 || existing.authorization != authorization
                 || existing.lifecycle != lifecycle
+                || existing.transition_snapshot != transition_snapshot
             {
                 return Err(RemoteLinkError::ReplyAuthorizationMismatch);
             }
-            return Ok(());
+            return Ok(ReplyRouteBind::ExistingExact);
         }
         if self.routes.len() >= REPLY_ROUTE_CAPACITY {
             return Err(RemoteLinkError::ReplyRouteCapacity);
@@ -269,8 +471,9 @@ impl RemoteReplyPump {
             route,
             authorization,
             lifecycle,
+            transition_snapshot,
         });
-        Ok(())
+        Ok(ReplyRouteBind::Inserted)
     }
 
     pub(crate) fn remove_connection(&mut self, connection_id: ConnectionId) {
@@ -291,6 +494,29 @@ impl RemoteReplyPump {
         });
     }
 
+    fn refresh_exact_authorization(
+        &mut self,
+        connection_id: ConnectionId,
+        message_id: &MessageId,
+        generation: u64,
+        authorization: RemoteReplyAuthorization,
+    ) -> Result<(), RemoteLinkError> {
+        let binding = self
+            .routes
+            .iter_mut()
+            .find(|binding| {
+                binding.connection_id == connection_id
+                    && binding.message_id == *message_id
+                    && binding.generation == generation
+            })
+            .ok_or(RemoteLinkError::UnknownReplyRoute)?;
+        if !authorization.is_same_lineage_at_or_after(&binding.authorization) {
+            return Err(RemoteLinkError::ReplyAuthorizationMismatch);
+        }
+        binding.authorization = authorization;
+        Ok(())
+    }
+
     pub(crate) async fn next_transport_event(
         &mut self,
     ) -> Result<Option<BusinessTransportEvent>, RemoteLinkError> {
@@ -304,6 +530,75 @@ impl RemoteReplyPump {
         Ok(event)
     }
 
+    /// authenticated KeySync 的 exact request route 定向回复。Relay flush 失败或
+    /// generation 更换都会返回错误；`RouteAccepted` 从不参与此 terminal。
+    pub(crate) async fn forward_key_control(
+        &mut self,
+        reply: KeyControlDirectedReply,
+    ) -> Result<(), RemoteLinkError> {
+        let generation = self.lane.current_generation();
+        let (authorization, route, payload) = reply.into_parts();
+        let route = DirectedReplyRoute {
+            machine_route: route.machine_route,
+            device_route: route.device_route,
+            request_route: route.request_route,
+        };
+        if authorization.machine_route() != route.machine_route
+            || authorization.device_route() != route.device_route
+        {
+            return Err(RemoteLinkError::ReplyAuthorizationMismatch);
+        }
+        let wire = match payload {
+            KeyControlDirectedPayload::DirectoryCurrent(status) => {
+                let sealed = self
+                    .sealer
+                    .seal_directory_current_exact(&authorization, route, status)
+                    .await?;
+                validated_reply_wire(&authorization, sealed)?
+            }
+            KeyControlDirectedPayload::UpdateSet(update_set) => {
+                let sealed = self
+                    .sealer
+                    .seal_key_update_exact(&authorization, route, update_set)
+                    .await?;
+                validated_reply_wire(&authorization, sealed)?
+            }
+            KeyControlDirectedPayload::DeviceKeyRecovery {
+                known_revision,
+                update_set,
+            } => {
+                let expected_update = update_set.clone();
+                let reply = self
+                    .sealer
+                    .seal_device_key_recovery_exact(
+                        &authorization,
+                        route,
+                        known_revision,
+                        update_set,
+                    )
+                    .await?;
+                validated_key_recovery_wire(
+                    &authorization,
+                    route,
+                    known_revision,
+                    &expected_update,
+                    reply,
+                )?
+            }
+        };
+        self.lane
+            .send_reply(
+                generation,
+                Reply {
+                    device_route: route.device_route,
+                    request_route: route.request_route,
+                    sealed_blob: SealedBlob(wire),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     /// ACK 是严格的末端边界：Reply 只有 seal + 同 generation Relay flush 成功后 ACK；
     /// Stream 只有 publisher 成功后 ACK；未知 route、Request、任何错误都 drop write。
     pub(crate) async fn forward(
@@ -312,6 +607,73 @@ impl RemoteReplyPump {
         write: ConnectionWrite,
     ) -> Result<(), RemoteLinkError> {
         let bytes = write.shared_bytes();
+        if write.kind() == EncodedRuntimeFrameKind::CompactTransfer {
+            let carrier = RuntimeTransferCarrierV1::decode(&bytes)
+                .map_err(|_| RemoteLinkError::InvalidCoreEgress)?;
+            match carrier.channel {
+                RuntimeTransferChannel::Stream => {
+                    self.stream_publisher
+                        .publish_transfer_exact(carrier)
+                        .await?;
+                    return write.acknowledge().map_err(|_| RemoteLinkError::Closed);
+                }
+                RuntimeTransferChannel::Reply => {
+                    let message_id = carrier.message_id.clone();
+                    let binding = self
+                        .routes
+                        .iter()
+                        .find(|candidate| {
+                            candidate.connection_id == connection_id
+                                && candidate.message_id == message_id
+                                && candidate.generation == self.lane.current_generation()
+                        })
+                        .cloned()
+                        .ok_or(RemoteLinkError::UnknownReplyRoute)?;
+                    let completes_route = binding.lifecycle.completes_transfer(&carrier);
+                    let sealed = match &binding.transition_snapshot {
+                        Some(permit) => {
+                            self.sealer
+                                .seal_transition_snapshot_transfer_exact(
+                                    &binding.authorization,
+                                    binding.route,
+                                    permit,
+                                    carrier,
+                                )
+                                .await?
+                        }
+                        None => {
+                            self.sealer
+                                .seal_transfer_exact(&binding.authorization, binding.route, carrier)
+                                .await?
+                        }
+                    };
+                    let (authorization_used, sealed) =
+                        validated_refreshed_reply_wire(&binding.authorization, sealed)?;
+                    self.lane
+                        .send_reply(
+                            binding.generation,
+                            Reply {
+                                device_route: binding.route.device_route,
+                                request_route: binding.route.request_route,
+                                sealed_blob: SealedBlob(sealed),
+                            },
+                        )
+                        .await?;
+                    write.acknowledge().map_err(|_| RemoteLinkError::Closed)?;
+                    if completes_route {
+                        self.remove_exact(connection_id, &message_id, binding.generation);
+                    } else {
+                        self.refresh_exact_authorization(
+                            connection_id,
+                            &message_id,
+                            binding.generation,
+                            authorization_used,
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
         if bytes.len() >= MAX_RUNTIME_JSON_FRAME_BYTES {
             return Err(RemoteLinkError::InvalidCoreEgress);
         }
@@ -330,11 +692,33 @@ impl RemoteReplyPump {
                     .cloned()
                     .ok_or(RemoteLinkError::UnknownReplyRoute)?;
                 let completes_route = binding.lifecycle.completes(&reply);
-                let sealed = self
-                    .sealer
-                    .seal_exact(&binding.authorization, binding.route, bytes)
-                    .await?;
-                let sealed = validated_reply_wire(&binding.authorization, sealed)?;
+                let sync_complete_sha256 = match (&binding.transition_snapshot, &reply) {
+                    (Some(_), RuntimeReply::SyncComplete(sync)) => {
+                        let canonical = serde_json::to_vec(sync)
+                            .map_err(|_| RemoteLinkError::InvalidCoreEgress)?;
+                        Some(sha256(&canonical))
+                    }
+                    _ => None,
+                };
+                let sealed = match &binding.transition_snapshot {
+                    Some(permit) => {
+                        self.sealer
+                            .seal_transition_snapshot_exact(
+                                &binding.authorization,
+                                binding.route,
+                                permit,
+                                bytes,
+                            )
+                            .await?
+                    }
+                    None => {
+                        self.sealer
+                            .seal_exact(&binding.authorization, binding.route, bytes)
+                            .await?
+                    }
+                };
+                let (authorization_used, sealed) =
+                    validated_refreshed_reply_wire(&binding.authorization, sealed)?;
                 self.lane
                     .send_reply(
                         binding.generation,
@@ -346,8 +730,22 @@ impl RemoteReplyPump {
                     )
                     .await?;
                 write.acknowledge().map_err(|_| RemoteLinkError::Closed)?;
+                if let (Some(permit), Some(sync_complete_sha256)) =
+                    (binding.transition_snapshot.clone(), sync_complete_sha256)
+                {
+                    self.sealer
+                        .mark_transition_snapshot_flushed(permit, sync_complete_sha256)
+                        .await?;
+                }
                 if completes_route {
                     self.remove_exact(connection_id, &envelope.message_id, binding.generation);
+                } else {
+                    self.refresh_exact_authorization(
+                        connection_id,
+                        &envelope.message_id,
+                        binding.generation,
+                        authorization_used,
+                    )?;
                 }
                 Ok(())
             }
@@ -371,7 +769,7 @@ pub(crate) async fn send_directed_reply_for_test(
     let generation = lane.current_generation();
     let bytes = write.shared_bytes();
     let sealed = sealer.seal_exact(&authorization, route, bytes).await?;
-    let sealed = validated_reply_wire(&authorization, sealed)?;
+    let (_, sealed) = validated_refreshed_reply_wire(&authorization, sealed)?;
     lane.send_reply(
         generation,
         Reply {
@@ -382,6 +780,17 @@ pub(crate) async fn send_directed_reply_for_test(
     )
     .await?;
     write.acknowledge().map_err(|_| RemoteLinkError::Closed)
+}
+
+fn validated_refreshed_reply_wire(
+    frozen: &RemoteReplyAuthorization,
+    reply: DirectedReplySeal,
+) -> Result<(RemoteReplyAuthorization, Vec<u8>), RemoteLinkError> {
+    if !reply.authorization_used.is_same_lineage_at_or_after(frozen) {
+        return Err(RemoteLinkError::ReplyAuthorizationMismatch);
+    }
+    let wire = validated_reply_wire(&reply.authorization_used, reply.sealed)?;
+    Ok((reply.authorization_used, wire))
 }
 
 fn validated_reply_wire(
@@ -404,16 +813,44 @@ fn validated_reply_wire(
     Ok(wire)
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct ReplayKey {
-    device_route: DeviceRouteId,
-    key_epoch: u64,
-    key_directory_revision: u64,
-}
-
-struct ReplayEntry {
-    key: ReplayKey,
-    window: ReplayWindow,
+fn validated_key_recovery_wire(
+    authorization: &RemoteReplyAuthorization,
+    route: DirectedReplyRoute,
+    known_revision: KeyDirectoryRevision,
+    update_set: &KeyUpdateSetV1,
+    reply: DeviceKeyRecoveryReplyV1,
+) -> Result<Vec<u8>, RemoteLinkError> {
+    reply
+        .validate()
+        .map_err(|_| RemoteLinkError::InvalidKeyControlReply)?;
+    let info = &reply.info;
+    if route.machine_route != authorization.machine_route()
+        || route.device_route != authorization.device_route()
+        || info.machine_route != route.machine_route
+        || info.device_route != route.device_route
+        || info.request_route != route.request_route
+        || info.grant_serial != authorization.grant_serial()
+        || info.root_trust_epoch != authorization.trust_epoch()
+        || info.known_key_directory_revision != known_revision
+        || info.target_key_directory_revision != authorization.key_directory_revision()
+        || update_set.device_route != route.device_route
+        || update_set.key_directory_revision != authorization.key_directory_revision()
+        || update_set
+            .canonical_sha256()
+            .map_err(|_| RemoteLinkError::InvalidKeyControlReply)?
+            != info.update_set_sha256
+    {
+        return Err(RemoteLinkError::InvalidKeyControlReply);
+    }
+    let wire = reply
+        .canonical_bytes()
+        .map_err(|_| RemoteLinkError::InvalidKeyControlReply)?;
+    let decoded = DeviceKeyRecoveryReplyV1::from_canonical_bytes(&wire)
+        .map_err(|_| RemoteLinkError::InvalidKeyControlReply)?;
+    if decoded != reply {
+        return Err(RemoteLinkError::InvalidKeyControlReply);
+    }
+    Ok(wire)
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -551,12 +988,14 @@ impl Drop for RemoteLinkTaskGuard {
 pub(crate) struct RemoteLinkOwner {
     cancel: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
+    health_rx: watch::Receiver<Option<String>>,
     cleanup: Arc<RemoteLinkConnectionCleanup>,
     tasks: Arc<RemoteLinkTaskTracker>,
     shutdown_timeout: Duration,
 }
 
 impl RemoteLinkOwner {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         machine_route: MachineRouteId,
@@ -566,6 +1005,55 @@ impl RemoteLinkOwner {
         sealer: Arc<dyn DirectedReplySealer>,
         publisher: Arc<dyn RemoteStreamPublisher>,
     ) -> Result<Self, RemoteLinkError> {
+        Self::start_with_key_control_handler(
+            machine_route,
+            store,
+            lane,
+            core,
+            sealer,
+            publisher,
+            Arc::new(BusinessOnlyKeyControlIngressHandler),
+        )
+    }
+
+    /// production 只允许显式安装 Store-backed transition consumer；authenticated
+    /// key-control 不存在静默降级路径。
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_with_key_control_handler(
+        machine_route: MachineRouteId,
+        store: RuntimeStoreHandle,
+        lane: BusinessTransportLane,
+        core: Weak<RuntimeCore>,
+        sealer: Arc<dyn DirectedReplySealer>,
+        publisher: Arc<dyn RemoteStreamPublisher>,
+        key_control: Arc<dyn AuthenticatedKeyControlIngressHandler>,
+    ) -> Result<Self, RemoteLinkError> {
+        Self::start_with_ingress_mode_and_key_control_handler(
+            machine_route,
+            store,
+            lane,
+            core,
+            sealer,
+            publisher,
+            key_control,
+            RemoteLinkIngressMode::BusinessReady,
+        )
+    }
+
+    /// manager admission 唯一可指定初始 ingress mode 的 production 构造；mode 只在
+    /// actor 内单向提升，不形成第二份业务状态或绕过 Store transition fence。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_with_ingress_mode_and_key_control_handler(
+        machine_route: MachineRouteId,
+        store: RuntimeStoreHandle,
+        lane: BusinessTransportLane,
+        core: Weak<RuntimeCore>,
+        sealer: Arc<dyn DirectedReplySealer>,
+        publisher: Arc<dyn RemoteStreamPublisher>,
+        key_control: Arc<dyn AuthenticatedKeyControlIngressHandler>,
+        ingress_mode: RemoteLinkIngressMode,
+    ) -> Result<Self, RemoteLinkError> {
         if !sealer.admission_ready() {
             return Err(RemoteLinkError::ReplySealUnavailable);
         }
@@ -573,22 +1061,37 @@ impl RemoteLinkOwner {
             return Err(RemoteLinkError::StreamPublisherUnavailable);
         }
         let (cancel, cancel_rx) = watch::channel(false);
+        let (health_tx, health_rx) = watch::channel(None);
+        let health_cancel = cancel_rx.clone();
         let cleanup = Arc::new(RemoteLinkConnectionCleanup::new(core.clone()));
         let tasks = Arc::new(RemoteLinkTaskTracker::default());
-        let task = tokio::spawn(run_remote_link(
-            machine_route,
-            store,
-            lane,
-            core,
-            sealer,
-            publisher,
-            cancel_rx,
-            Arc::clone(&cleanup),
-            Arc::clone(&tasks),
-        ));
+        let task = tokio::spawn({
+            let cleanup = Arc::clone(&cleanup);
+            let tasks = Arc::clone(&tasks);
+            async move {
+                run_remote_link(
+                    machine_route,
+                    store,
+                    lane,
+                    core,
+                    sealer,
+                    publisher,
+                    key_control,
+                    ingress_mode,
+                    cancel_rx,
+                    cleanup,
+                    tasks,
+                )
+                .await;
+                if !*health_cancel.borrow() {
+                    health_tx.send_replace(Some(REMOTE_LINK_ACTOR_EXITED.to_owned()));
+                }
+            }
+        });
         Ok(Self {
             cancel,
             task: Some(task),
+            health_rx,
             cleanup,
             tasks,
             shutdown_timeout: REMOTE_LINK_SHUTDOWN_DEADLINE,
@@ -598,26 +1101,39 @@ impl RemoteLinkOwner {
     pub(crate) async fn shutdown(&mut self) -> Result<(), RemoteLinkError> {
         self.cancel.send_replace(true);
         let deadline = tokio::time::Instant::now() + self.shutdown_timeout;
-        if let Some(task) = self.task.as_mut()
-            && tokio::time::timeout_at(deadline, &mut *task).await.is_err()
-        {
-            task.abort();
-            let _ = task.await;
-            self.task.take();
+        let shutdown = async {
+            if let Some(task) = self.task.as_mut() {
+                let _ = (&mut *task).await;
+            }
             self.tasks.wait_for_quiescence().await;
-            self.cleanup.fail_close_all();
-            return Err(RemoteLinkError::ShutdownTimedOut);
+            self.cleanup.disconnect_all().await;
+        };
+        match tokio::time::timeout_at(deadline, shutdown).await {
+            Ok(()) => {
+                self.task.take();
+                Ok(())
+            }
+            Err(_) => {
+                // deadline 已耗尽后，安全状态必须立即可见；abort 只发取消，不能再
+                // 无界 await 一个不协作的 main/child task。
+                self.cleanup.fail_close_all();
+                if let Some(task) = self.task.take() {
+                    task.abort();
+                }
+                Err(RemoteLinkError::ShutdownTimedOut)
+            }
         }
-        self.task.take();
-        self.tasks.wait_for_quiescence().await;
-        if tokio::time::timeout_at(deadline, self.cleanup.disconnect_all())
-            .await
-            .is_err()
-        {
-            self.cleanup.fail_close_all();
-            return Err(RemoteLinkError::ShutdownTimedOut);
-        }
-        Ok(())
+    }
+
+    pub(crate) fn observed_failure_code(&self) -> Option<String> {
+        self.health_rx.borrow().clone().or_else(|| {
+            (!*self.cancel.borrow()
+                && self
+                    .task
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished))
+            .then(|| REMOTE_LINK_ACTOR_EXITED.to_owned())
+        })
     }
 
     #[cfg(test)]
@@ -629,9 +1145,11 @@ impl RemoteLinkOwner {
     #[cfg(test)]
     pub(crate) fn pending_for_shutdown_test(core: Weak<RuntimeCore>, timeout: Duration) -> Self {
         let (cancel, _cancel_rx) = watch::channel(false);
+        let (_health_tx, health_rx) = watch::channel(None);
         Self {
             cancel,
             task: Some(tokio::spawn(std::future::pending())),
+            health_rx,
             cleanup: Arc::new(RemoteLinkConnectionCleanup::new(core)),
             tasks: Arc::new(RemoteLinkTaskTracker::default()),
             shutdown_timeout: REMOTE_LINK_SHUTDOWN_DEADLINE,
@@ -640,8 +1158,91 @@ impl RemoteLinkOwner {
     }
 
     #[cfg(test)]
+    pub(crate) async fn slow_main_for_shutdown_test(
+        core: Weak<RuntimeCore>,
+        timeout: Duration,
+        drop_delay: Duration,
+    ) -> Self {
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let (_health_tx, health_rx) = watch::channel(None);
+        let cleanup = Arc::new(RemoteLinkConnectionCleanup::new(core));
+        let tasks = Arc::new(RemoteLinkTaskTracker::default());
+        let started = Arc::new(Notify::new());
+        let task = tokio::spawn({
+            let tasks = Arc::clone(&tasks);
+            let started = Arc::clone(&started);
+            async move {
+                let _task_guard = tasks.track();
+                let _slow_drop = SlowShutdownDrop(drop_delay);
+                started.notify_one();
+                std::future::pending::<()>().await;
+            }
+        });
+        started.notified().await;
+        Self {
+            cancel,
+            task: Some(task),
+            health_rx,
+            cleanup,
+            tasks,
+            shutdown_timeout: timeout,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn slow_child_for_shutdown_test(
+        core: Weak<RuntimeCore>,
+        timeout: Duration,
+        drop_delay: Duration,
+    ) -> Self {
+        let (cancel, mut cancel_rx) = watch::channel(false);
+        let (_health_tx, health_rx) = watch::channel(None);
+        let cleanup = Arc::new(RemoteLinkConnectionCleanup::new(core));
+        let tasks = Arc::new(RemoteLinkTaskTracker::default());
+        let started = Arc::new(Notify::new());
+        let task = tokio::spawn({
+            let tasks = Arc::clone(&tasks);
+            let started = Arc::clone(&started);
+            async move {
+                let mut children = JoinSet::new();
+                let task_guard = tasks.track();
+                children.spawn(async move {
+                    let _task_guard = task_guard;
+                    let _slow_drop = SlowShutdownDrop(drop_delay);
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                });
+                while !*cancel_rx.borrow() {
+                    if cancel_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        started.notified().await;
+        Self {
+            cancel,
+            task: Some(task),
+            health_rx,
+            cleanup,
+            tasks,
+            shutdown_timeout: timeout,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn connection_ids_for_test(&self) -> Vec<ConnectionId> {
         self.cleanup.snapshot()
+    }
+}
+
+#[cfg(test)]
+struct SlowShutdownDrop(Duration);
+
+#[cfg(test)]
+impl Drop for SlowShutdownDrop {
+    fn drop(&mut self) {
+        std::thread::sleep(self.0);
     }
 }
 
@@ -663,13 +1264,14 @@ async fn run_remote_link(
     core: Weak<RuntimeCore>,
     sealer: Arc<dyn DirectedReplySealer>,
     publisher: Arc<dyn RemoteStreamPublisher>,
+    key_control: Arc<dyn AuthenticatedKeyControlIngressHandler>,
+    mut ingress_mode: RemoteLinkIngressMode,
     mut cancel: watch::Receiver<bool>,
     cleanup: Arc<RemoteLinkConnectionCleanup>,
     tasks: Arc<RemoteLinkTaskTracker>,
 ) {
     let dispatcher = RemoteIngressDispatcher::new(machine_route, store);
-    let mut pump = RemoteReplyPump::new(lane, sealer).with_stream_publisher(publisher);
-    let mut replays = Vec::<ReplayEntry>::new();
+    let mut pump = RemoteReplyPump::new(lane, sealer).with_stream_publisher(Arc::clone(&publisher));
     let mut connections = Vec::<RemoteConnection>::new();
     let mut core_cursor = 0_usize;
     let mut dispatches = JoinSet::<CoreDispatchCompletion>::new();
@@ -687,6 +1289,7 @@ async fn run_remote_link(
             event = pump.next_transport_event() => {
                 match event {
                     Ok(Some(BusinessTransportEvent::Send(send))) => {
+                        let device_route = send.device_route;
                         let dispatch = tokio::select! {
                             biased;
                             changed = cancel.changed() => {
@@ -700,15 +1303,28 @@ async fn run_remote_link(
                                 &dispatcher,
                                 &core,
                                 &mut pump,
-                                &mut replays,
                                 &mut connections,
                                 &mut dispatches,
                                 &cleanup,
                                 &tasks,
+                                key_control.as_ref(),
+                                &mut ingress_mode,
                                 send,
                             ) => dispatch,
                         };
                         if let Err(error) = dispatch {
+                            if error.requires_device_isolation()
+                                && let Some(core) = core.upgrade()
+                            {
+                                disconnect_device(
+                                    core.as_ref(),
+                                    &cleanup,
+                                    &mut pump,
+                                    &mut connections,
+                                    device_route,
+                                )
+                                .await;
+                            }
                             // Untrusted frame errors are per-frame fail-close; the authenticated
                             // MachineLink remains available for other devices/conversations.
                             crate::diag::log(
@@ -721,6 +1337,13 @@ async fn run_remote_link(
                         // Transport-only state: never synthesize Runtime success.
                     }
                     Ok(Some(BusinessTransportEvent::GenerationReplaced { .. })) => {
+                        if let Err(error) = publisher.notify_reconnected().await {
+                            crate::diag::log(
+                                "remote_link_publication_reconnect",
+                                &format!("status=blocked code={}", error.code()),
+                            );
+                            break 'actor;
+                        }
                         abort_and_join_dispatches(&mut dispatches).await;
                         disconnect_all(&core, &cleanup, &mut connections).await;
                     }
@@ -790,26 +1413,30 @@ async fn dispatch_send(
     dispatcher: &RemoteIngressDispatcher,
     core: &Weak<RuntimeCore>,
     pump: &mut RemoteReplyPump,
-    replays: &mut Vec<ReplayEntry>,
     connections: &mut Vec<RemoteConnection>,
     dispatches: &mut JoinSet<CoreDispatchCompletion>,
     cleanup: &RemoteLinkConnectionCleanup,
     tasks: &Arc<RemoteLinkTaskTracker>,
+    key_control: &dyn AuthenticatedKeyControlIngressHandler,
+    ingress_mode: &mut RemoteLinkIngressMode,
     send: RouteSend,
 ) -> Result<(), RemoteLinkError> {
-    if dispatches.len() >= CORE_DISPATCH_CAPACITY {
-        return Err(RemoteLinkError::CoreDispatchCapacity);
-    }
-    let replay_key = replay_key(&send)?;
-    let mut candidate = replays
-        .iter()
-        .find(|entry| entry.key == replay_key)
-        .map(|entry| entry.window.clone())
-        .unwrap_or_default();
-    let verified = dispatcher.verify_send(send.clone(), &candidate).await?;
+    let verified = dispatcher.verify_send(send).await?;
     let current = dispatcher.recheck_current(verified).await?;
+    let admitted = dispatcher.admit_replay(current).await?;
+    let route = admitted
+        .into_route()?
+        .ok_or(RemoteDispatchError::ReplayRejected)?;
+    let admitted_business =
+        match route_ingress_before_core_with_mode(route, key_control, core, ingress_mode).await? {
+            PreCoreIngressOutcome::Business(activated) => *activated,
+            PreCoreIngressOutcome::KeyControl(KeyControlIngressOutcome::Consumed) => return Ok(()),
+            PreCoreIngressOutcome::KeyControl(KeyControlIngressOutcome::DirectedReply(reply)) => {
+                return pump.forward_key_control(*reply).await;
+            }
+        };
+    let (activated, business_admission) = admitted_business.into_parts();
     let core = core.upgrade().ok_or(RemoteLinkError::CoreUnavailable)?;
-    let activated = current.activate(&core, &mut candidate)?;
 
     let message_id = activated.envelope().message_id.clone();
     let RuntimeMessage::Request(request) = &activated.envelope().body else {
@@ -831,7 +1458,11 @@ async fn dispatch_send(
             }
             let (core_tx, core_rx) = mpsc::channel(CORE_WRITER_HANDOFF_CAPACITY);
             let connection_id = core
-                .connect(principal, ConnectionSink::new(core_tx))
+                .connect(
+                    principal,
+                    ConnectionSink::new(core_tx)
+                        .with_framing_profile(ConnectionFramingProfile::CompactTransfer),
+                )
                 .map_err(|_| RemoteLinkError::CoreRejected)?;
             connections.push(RemoteConnection {
                 key: connection_key,
@@ -843,34 +1474,67 @@ async fn dispatch_send(
             connection_id
         }
     };
-    if let Err(error) = pump.bind(
-        connection_id,
-        message_id.clone(),
-        DirectedReplyRoute {
-            machine_route,
-            device_route,
-            request_route,
-        },
-        authorization,
-        route_lifecycle,
-    ) {
-        if created_connection {
-            disconnect_one(&Arc::downgrade(&core), cleanup, connections, connection_id).await;
+    let directed_route = DirectedReplyRoute {
+        machine_route,
+        device_route,
+        request_route,
+    };
+    let (route_bind_result, transition_snapshot) = match business_admission {
+        BusinessIngressAdmission::BusinessReady => (
+            pump.bind(
+                connection_id,
+                message_id.clone(),
+                directed_route,
+                authorization,
+                route_lifecycle,
+            ),
+            None,
+        ),
+        BusinessIngressAdmission::TransitionSnapshot(permit) => (
+            pump.bind_transition_snapshot(
+                connection_id,
+                message_id.clone(),
+                directed_route,
+                authorization,
+                route_lifecycle,
+                permit.as_ref().clone(),
+            ),
+            Some(*permit),
+        ),
+    };
+    let route_bind = match route_bind_result {
+        Ok(route_bind) => route_bind,
+        Err(error) => {
+            if created_connection {
+                disconnect_one(&Arc::downgrade(&core), cleanup, connections, connection_id).await;
+            }
+            return Err(error);
         }
-        return Err(error);
+    };
+    if route_bind == ReplyRouteBind::ExistingExact {
+        // 同 generation 的 exact in-flight Relay retry 复用现有 Core dispatch。首个
+        // terminal reply 完成后 route 才释放；随后到达的 exact retry会重新进入
+        // RuntimeCore durable idempotency，而不会在此并发生成第二份 reply writer。
+        return Ok(());
     }
-    if let Err(error) = commit_replay(replays, replay_key, candidate) {
+    if dispatches.len() >= CORE_DISPATCH_CAPACITY {
         pump.remove_exact(connection_id, &message_id, pump.lane.current_generation());
         if created_connection {
             disconnect_one(&Arc::downgrade(&core), cleanup, connections, connection_id).await;
         }
-        return Err(error);
+        return Err(RemoteLinkError::CoreDispatchCapacity);
     }
     let generation = pump.lane.current_generation();
     let task_guard = tasks.track();
     dispatches.spawn(async move {
         let _task_guard = task_guard;
-        let succeeded = core.handle_envelope(connection_id, envelope).await.is_ok();
+        let succeeded = match transition_snapshot {
+            Some(permit) => core
+                .handle_transition_snapshot_envelope(connection_id, envelope, permit)
+                .await
+                .is_ok(),
+            None => core.handle_envelope(connection_id, envelope).await.is_ok(),
+        };
         CoreDispatchCompletion {
             connection_id,
             message_id,
@@ -881,39 +1545,68 @@ async fn dispatch_send(
     Ok(())
 }
 
-fn replay_key(send: &RouteSend) -> Result<ReplayKey, RemoteLinkError> {
-    let signed = SignedSealedBlobV1::from_wire_bytes(&send.sealed_blob.0)
-        .map_err(|_| RemoteDispatchError::InvalidSealedBlob)?;
-    if signed.inner.key_id.purpose != KeyPurpose::DeviceCommandTx
-        || signed.inner.key_epoch == 0
-        || signed.inner.key_directory_revision == 0
-    {
-        return Err(RemoteDispatchError::InvalidKeyBinding.into());
-    }
-    Ok(ReplayKey {
-        device_route: send.device_route,
-        key_epoch: signed.inner.key_epoch,
-        key_directory_revision: signed.inner.key_directory_revision,
-    })
+/// authenticated ingress 的最后一道 pre-Core 边界。Control 在这里消费且永远不调用
+/// RuntimeCore；business 必须先通过 transition fence，才允许 upgrade/register/activate。
+pub(crate) enum PreCoreIngressOutcome {
+    Business(Box<AdmittedBusinessIngress>),
+    KeyControl(KeyControlIngressOutcome),
 }
 
-fn commit_replay(
-    replays: &mut Vec<ReplayEntry>,
-    key: ReplayKey,
-    window: ReplayWindow,
-) -> Result<(), RemoteLinkError> {
-    if let Some(existing) = replays.iter_mut().find(|entry| entry.key == key) {
-        existing.window = window;
-        return Ok(());
+/// 单个 request 的 Store-issued admission 与已规范化 Core ingress。transition snapshot
+/// capability 不会提升 actor mode，也不会缓存为整个 connection 的业务权限。
+pub(crate) struct AdmittedBusinessIngress {
+    activated: ActivatedRemoteIngress,
+    admission: BusinessIngressAdmission,
+}
+
+impl AdmittedBusinessIngress {
+    fn into_parts(self) -> (ActivatedRemoteIngress, BusinessIngressAdmission) {
+        (self.activated, self.admission)
     }
-    // A validated new key revision makes prior keys for the same device non-current; removing
-    // those volatile windows is safe because Store final recheck already rejects their frames.
-    replays.retain(|entry| entry.key.device_route != key.device_route);
-    if replays.len() >= REMOTE_REPLAY_KEY_CAPACITY {
-        return Err(RemoteLinkError::ReplayCapacity);
+}
+
+#[cfg(test)]
+pub(crate) async fn route_ingress_before_core(
+    route: RemoteIngressRoute,
+    key_control: &dyn AuthenticatedKeyControlIngressHandler,
+    core: &Weak<RuntimeCore>,
+) -> Result<PreCoreIngressOutcome, RemoteLinkError> {
+    let mut mode = RemoteLinkIngressMode::BusinessReady;
+    route_ingress_before_core_with_mode(route, key_control, core, &mut mode).await
+}
+
+pub(crate) async fn route_ingress_before_core_with_mode(
+    route: RemoteIngressRoute,
+    key_control: &dyn AuthenticatedKeyControlIngressHandler,
+    core: &Weak<RuntimeCore>,
+    mode: &mut RemoteLinkIngressMode,
+) -> Result<PreCoreIngressOutcome, RemoteLinkError> {
+    match route {
+        RemoteIngressRoute::KeyControl(ingress) => {
+            let outcome = key_control.consume(ingress).await?;
+            Ok(PreCoreIngressOutcome::KeyControl(outcome))
+        }
+        RemoteIngressRoute::Business(dispatchable) => {
+            // ControlPlaneOnly 是 actor-local 的第一道 capability gate。只有 Store
+            // 明确返回 BusinessReady 才能单向提升；TransitionSnapshot 是 exact request
+            // capability，消费后仍保持 control-only。
+            let admission = key_control
+                .authorize_business_ingress(dispatchable.authorization(), dispatchable.envelope())
+                .await?;
+            if matches!(admission, BusinessIngressAdmission::BusinessReady)
+                && matches!(*mode, RemoteLinkIngressMode::ControlPlaneOnly)
+            {
+                *mode = RemoteLinkIngressMode::BusinessReady;
+            }
+            let core = core.upgrade().ok_or(RemoteLinkError::CoreUnavailable)?;
+            Ok(PreCoreIngressOutcome::Business(Box::new(
+                AdmittedBusinessIngress {
+                    activated: dispatchable.activate(&core)?,
+                    admission,
+                },
+            )))
+        }
     }
-    replays.push(ReplayEntry { key, window });
-    Ok(())
 }
 
 fn connection_key(authorization: &RemoteReplyAuthorization) -> DeviceConnectionKey {

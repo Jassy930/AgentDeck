@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use agentdeck_crypto::rand_core::SeedableRng;
+use agentdeck_crypto::rand_core::{Rng, SeedableRng};
 use agentdeck_crypto::{
     HpkePrivateKey, PairResponseSealAuthority, SigningKey, open_key_directory_entry,
     open_pair_response, seal_key_directory_entry, seal_pair_response, sign_device_authorization,
@@ -277,6 +277,21 @@ fn deterministic_entropy(first: u8) -> impl FnMut(&mut [u8]) -> Result<(), Grant
         marker = marker.checked_add(1).unwrap_or(1).max(1);
         Ok(())
     }
+}
+
+fn seeded_entropy(seed: u8) -> impl FnMut(&mut [u8]) -> Result<(), GrantFreezeError> {
+    let mut rng = ChaCha20Rng::from_seed([seed; 32]);
+    move |output| {
+        rng.fill_bytes(output);
+        Ok(())
+    }
+}
+
+fn indexed_stream(index: u16) -> StreamRouteId {
+    assert_ne!(index, 0);
+    let mut bytes = [0_u8; 16];
+    bytes[14..].copy_from_slice(&index.to_be_bytes());
+    StreamRouteId::from_bytes(bytes)
 }
 
 fn freeze_fixture(
@@ -652,9 +667,11 @@ fn fresh_fingerprint_gets_serial_one_and_a_random_nonzero_route() {
     let projection = GrantAllocationProjection::New {
         device_sign_fingerprint: fingerprint,
         current_global_keys: None,
+        active_conversation_routes: Vec::new(),
     };
-    let (allocation, current_global_keys) =
+    let (allocation, current_global_keys, active_conversation_routes) =
         GrantAllocation::from_projection(projection).expect("authenticated fresh allocation");
+    assert!(active_conversation_routes.is_empty());
     assert_eq!(allocation.device_sign_fingerprint(), fingerprint);
     assert_eq!(allocation.device_route(), None);
     assert_eq!(allocation.grant_serial(), GrantSerial::new(1));
@@ -675,6 +692,144 @@ fn fresh_fingerprint_gets_serial_one_and_a_random_nonzero_route() {
         frozen.device_authorization().device_sign_fingerprint,
         fingerprint
     );
+}
+
+#[test]
+fn first_grant_bootstraps_authenticated_conversation_routes_in_single_revision() {
+    let fixture = Fixture::new();
+    let active_conversation_routes = vec![
+        StreamRouteId::from_bytes([0x31; 16]),
+        StreamRouteId::from_bytes([0x32; 16]),
+    ];
+    let projection = GrantAllocationProjection::New {
+        device_sign_fingerprint: fixture.device_sign_fingerprint(),
+        current_global_keys: None,
+        active_conversation_routes: active_conversation_routes.clone(),
+    };
+    let (allocation, current_global_keys, authenticated_routes) =
+        GrantAllocation::from_projection(projection).expect("authenticated initial allocation");
+    let frozen = freeze_with_authenticated_allocation(
+        fixture.material(),
+        fixture.binding.clone(),
+        current_global_keys,
+        authenticated_routes,
+        allocation,
+        KeyDirectoryRevision::new(1),
+        &fixture.authority(),
+        deterministic_entropy(73),
+    )
+    .expect("freeze first grant with deferred conversation routes");
+
+    assert_eq!(
+        frozen.global_key_state.revision(),
+        KeyDirectoryRevision::new(1),
+        "all initial keys belong to the single 0 -> 1 revision"
+    );
+    assert_eq!(
+        frozen.global_key_state.active_conversation_routes(),
+        active_conversation_routes
+    );
+    assert_eq!(
+        frozen.key_directory().revision,
+        KeyDirectoryRevision::new(1)
+    );
+    frozen
+        .key_directory()
+        .validate_initial_directory_for_device(
+            frozen.relay_grant().device_route,
+            &active_conversation_routes,
+        )
+        .expect("initial directory exactly covers authenticated routes");
+    let conversation_entries = frozen
+        .key_directory()
+        .entries
+        .iter()
+        .filter(|entry| entry.key_id.purpose == KeyPurpose::ConversationDek)
+        .collect::<Vec<_>>();
+    assert_eq!(conversation_entries.len(), 2);
+    assert!(
+        conversation_entries
+            .iter()
+            .all(|entry| entry.key_id.epoch == 1)
+    );
+}
+
+#[test]
+fn first_grant_supports_full_conversation_capacity_in_openable_pair_response() {
+    let fixture = Fixture::new();
+    let active_conversation_routes = (1_u16..=1_024).map(indexed_stream).collect::<Vec<_>>();
+    let projection = GrantAllocationProjection::New {
+        device_sign_fingerprint: fixture.device_sign_fingerprint(),
+        current_global_keys: None,
+        active_conversation_routes: active_conversation_routes.clone(),
+    };
+    let (allocation, current_global_keys, authenticated_routes) =
+        GrantAllocation::from_projection(projection).expect("authenticated maximum allocation");
+    let frozen = freeze_with_authenticated_allocation(
+        fixture.material(),
+        fixture.binding.clone(),
+        current_global_keys,
+        authenticated_routes,
+        allocation,
+        KeyDirectoryRevision::new(1),
+        &fixture.authority(),
+        seeded_entropy(0x75),
+    )
+    .expect("freeze first grant at the full conversation capacity");
+
+    assert_eq!(
+        frozen.global_key_state.active_conversation_routes(),
+        active_conversation_routes
+    );
+    assert_eq!(frozen.key_directory().entries.len(), 1_027);
+    frozen
+        .key_directory()
+        .validate_initial_directory_for_device(
+            frozen.relay_grant().device_route,
+            &active_conversation_routes,
+        )
+        .expect("maximum initial directory covers every authenticated route");
+    assert!(
+        frozen.pair_response().ciphertext.len() <= 256 * 1_024,
+        "maximum initial directory must remain inside the PairResponse ciphertext cap"
+    );
+
+    let signer = MachineDataSignerBindingV1::from_certificate(&fixture.invite.data_sign_cert)
+        .expect("signer binding");
+    let opened = open_pair_response(
+        &fixture.device_hpke_private,
+        frozen.response_info(),
+        frozen.response_context(),
+        frozen.pair_response(),
+        &fixture.data.verifying_key(),
+        &signer,
+        &fixture.root.verifying_key(),
+    )
+    .expect("open maximum PairResponse");
+    assert_eq!(opened.key_directory, *frozen.key_directory());
+
+    for entry in &opened.key_directory.entries {
+        let info = KeyUpdateInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_server_id: TEST_RELAY,
+            machine_route: TEST_MACHINE,
+            device_route: frozen.relay_grant().device_route,
+            stream_route: entry.stream_route,
+            grant_serial: GrantSerial::new(1),
+            root_trust_epoch: TEST_TRUST_EPOCH,
+            key_directory_revision: KeyDirectoryRevision::new(1),
+            key_purpose: entry.key_id.purpose,
+            key_epoch: entry.key_id.epoch,
+        };
+        open_key_directory_entry(
+            &fixture.device_hpke_private,
+            &info,
+            &key_update_context(&info),
+            entry,
+        )
+        .expect("every maximum-directory HPKE entry opens on its exact axes");
+    }
 }
 
 #[test]
@@ -710,7 +865,7 @@ fn renewal_reuses_route_advances_serial_and_rotates_only_target_device_keys() {
         next_serial: GrantSerial::new(2),
         current_global_keys: second.global_key_state,
     };
-    let (allocation, current_global_keys) =
+    let (allocation, current_global_keys, _active_conversation_routes) =
         GrantAllocation::from_projection(projection).expect("authenticated renewal allocation");
     let renewed = freeze_with_allocation(
         first_fixture.material(),

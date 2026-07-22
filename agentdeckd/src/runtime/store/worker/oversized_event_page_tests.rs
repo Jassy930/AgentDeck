@@ -93,10 +93,17 @@ async fn nine_mib_canonical_event_replays_through_backfill_and_snapshot_pages() 
     let event_id = runtime_id(RuntimeIdKind::Event, 0x33);
     let configuration_event_id = runtime_id(RuntimeIdKind::Event, 0x37);
     let item_event_id = runtime_id(RuntimeIdKind::Event, 0x36);
-    let config =
-        RuntimeStoreConfig::new(root.0.join("runtime.db")).with_id_source(OrderedIdSource(
-            VecDeque::from([configuration_event_id, command_id, turn_id, event_id]),
-        ));
+    let config = RuntimeStoreConfig::new(root.0.join("runtime.db")).with_id_source(
+        OrderedIdSource(VecDeque::from([
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0x38),
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0x39),
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0x3A),
+            configuration_event_id,
+            command_id,
+            turn_id,
+            event_id,
+        ])),
+    );
     let storage_kek = load_or_create_storage_kek(&keys, &root.0.join("key-state.db"))
         .expect("create oversized event StorageKEK");
     let store = RuntimeStoreHandle::open(config, storage_kek)

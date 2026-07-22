@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use agentdeck_crypto::sha256;
-use agentdeck_protocol::relay_v2::{DeviceRouteId, GrantSerial, RelayGrant};
+use agentdeck_protocol::relay_v2::{DeviceRouteId, GrantSerial, RelayGrant, StreamRouteId};
 use rusqlite::Connection;
 
 use crate::runtime::model::RuntimeStoreError;
@@ -20,6 +20,8 @@ pub(crate) enum GrantAllocationProjection {
     New {
         device_sign_fingerprint: [u8; 32],
         current_global_keys: Option<GlobalKeyStateV1>,
+        /// 完整 authenticated publication directory 中的 active conversation routes。
+        active_conversation_routes: Vec<StreamRouteId>,
     },
     Renew {
         device_sign_fingerprint: [u8; 32],
@@ -170,6 +172,31 @@ pub(crate) fn load_grant_allocation(
     device_sign_fingerprint: [u8; 32],
 ) -> Result<GrantAllocationProjection, RuntimeStoreError> {
     let mut directory = super::pairing::load_directory(connection, key_bundle, database_id)?;
+    let publication_ledger =
+        super::sqlite::load_runtime_ledger(connection, key_bundle, database_id)?;
+    let mut active_conversation_routes = super::publication::authenticate_directory_records(
+        connection,
+        key_bundle,
+        &publication_ledger,
+    )?
+    .into_iter()
+    .filter_map(|stream| {
+        (stream.state == super::publication::PublicationStreamState::Active).then_some(stream)
+    })
+    .filter_map(|stream| match stream.scope {
+        super::publication::PublicationScope::Catalog => None,
+        super::publication::PublicationScope::Conversation(_) => {
+            Some(StreamRouteId::from_bytes(stream.stream_route))
+        }
+    })
+    .collect::<Vec<_>>();
+    active_conversation_routes.sort_by_key(|route| *route.as_bytes());
+    if active_conversation_routes
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
     let authenticated_fingerprint = pairing_fingerprint(
         pairing(&directory, pairing_id)?,
         pairing_id,
@@ -181,10 +208,17 @@ pub(crate) fn load_grant_allocation(
         authenticated_fingerprint,
     )?;
     let current_global_keys = directory.grants.global.take().map(|global| global.state);
+    if current_global_keys
+        .as_ref()
+        .is_some_and(|global| global.active_conversation_routes() != active_conversation_routes)
+    {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
     match allocation {
         ValidatedGrantAllocation::New => Ok(GrantAllocationProjection::New {
             device_sign_fingerprint: authenticated_fingerprint,
             current_global_keys,
+            active_conversation_routes,
         }),
         ValidatedGrantAllocation::Renew {
             device_route,

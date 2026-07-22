@@ -1,6 +1,7 @@
 //! Runtime store stream/backfill/snapshot/publication async facade 与 barrier capture。
 
 use super::*;
+use crate::runtime::events::WatchGeneration;
 
 /// Worker 在 oneshot send 前就绑定 TEMP backfill pin 的 Drop cleanup。
 ///
@@ -47,6 +48,29 @@ impl RuntimeStoreHandle {
             &self.lifecycle,
             RuntimeStoreLane::Read,
             |reply| ReadCommand::RegisterStreamBarrier { request, reply },
+        )
+        .await?
+    }
+
+    /// Active Add transition 的专用 snapshot capture。permit 的 frozen H/C、stream
+    /// identity 与 revision 由 Store 重新认证；本地 head 即使已推进到 L，也不能把
+    /// L 混入定向 snapshot，H→L 只作为 continuation pin 随 registration 返回。
+    pub(crate) async fn register_transition_snapshot_barrier(
+        &self,
+        permit: key_transition::TransitionSnapshotPermit,
+        generation: WatchGeneration,
+    ) -> Result<StreamBarrierRegistration, RuntimeStoreError> {
+        let machine_trust_domain = self.machine_trust_domain()?;
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::RegisterTransitionSnapshotBarrier {
+                permit,
+                generation,
+                machine_trust_domain,
+                reply,
+            },
         )
         .await?
     }
@@ -612,6 +636,54 @@ impl RuntimeStoreHandle {
         .await?
     }
 
+    /// Transition-only Catalog H 的 metadata preflight。允许 observed durable D > H，
+    /// 但只返回只读 rebuild 计划，不触发 generic durable refresh。
+    pub(crate) async fn preflight_transition_catalog_snapshot(
+        &self,
+        observed_reference: Option<super::super::snapshot::ReadySnapshotReference>,
+        frozen: agentdeck_protocol::runtime::StreamCursor,
+    ) -> Result<super::super::snapshot::CatalogTransitionSnapshotPreflight, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<NormalCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::PreflightTransitionCatalogSnapshot {
+                observed_reference,
+                frozen,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    /// 在共享 snapshot budget 下只读组装 transition Catalog H。permit 仅证明 caller
+    /// 已预留完整峰值；worker 完成/失败后归还 clone，不产生 durable write。
+    pub(crate) async fn materialize_transition_catalog_snapshot(
+        &self,
+        preflight: super::super::snapshot::CatalogTransitionSnapshotPreflight,
+        ephemeral_id: [u8; 16],
+        build_permit: SharedSnapshotBuildPermit,
+    ) -> Result<super::super::snapshot::EphemeralCatalogMaterialization, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<NormalCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::MaterializeTransitionCatalogSnapshot {
+                preflight,
+                ephemeral_id,
+                build_permit,
+                reply,
+            },
+        )
+        .await?
+    }
+
     pub(crate) async fn load_catalog_snapshot_by_reference(
         &self,
         reference: super::super::snapshot::ReadySnapshotReference,
@@ -662,6 +734,28 @@ impl RuntimeStoreHandle {
         .await?
     }
 
+    pub(crate) async fn preflight_shared_publication(
+        &self,
+        request: super::super::publication::SharedPublicationPreflightRequest,
+        proposal: super::super::publication::SharedPublicationStreamProposal,
+    ) -> Result<super::super::publication::SharedPublicationPreflight, RuntimeStoreError> {
+        let retained = request.canonical_item_bytes.capacity();
+        let charge = memory_charge(size_of::<NormalCommand>(), &[retained])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::PreflightSharedPublication {
+                request,
+                proposal,
+                reply,
+            },
+        )
+        .await?
+    }
+
     pub async fn rotate_publication_stream(
         &self,
         request: RotatePublicationStreamRequest,
@@ -698,6 +792,24 @@ impl RuntimeStoreHandle {
         .await?
     }
 
+    /// P4 signed path：worker queue 保留一次性 sealer，真正的 streamSeq/counter
+    /// 只在同一个 `BEGIN IMMEDIATE` transaction 内分配并交给它一次。
+    pub(crate) async fn freeze_signed_publication(
+        &self,
+        request: FreezeSignedPublicationRequest,
+    ) -> Result<FrozenPublication, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<NormalCommand>(), &[request.sealer_retained_bytes])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::FreezeSignedPublication { request, reply },
+        )
+        .await?
+    }
+
     /// Relay durable commit receipt；走 safety lane，容量水位下仍可删除 outbox 并推进 cut。
     pub async fn acknowledge_publication_commit(
         &self,
@@ -724,8 +836,9 @@ impl RuntimeStoreHandle {
         .await?
     }
 
-    /// device consumption ACK；与 Relay COMMIT 分离。只有 exact ACK 成功才删除
-    /// frozen outbox row并推进 acknowledged cursor。
+    /// daemon local ACK；与 Relay COMMIT 分离。只有 exact ACK 成功才删除 frozen
+    /// outbox row 并推进 acknowledged cursor。它不代表任一远端 device 已应用业务流；
+    /// key transition 的 `StreamAppliedAck` 仍是独立的端到端门禁。
     pub async fn acknowledge_publication_delivery(
         &self,
         publication_stream_id: [u8; 16],
@@ -778,8 +891,38 @@ impl RuntimeStoreHandle {
         Ok(publications)
     }
 
+    /// transaction-bound signed publisher 的 exact retry 入口。该查询按
+    /// `publication_id` 直达 authenticated row，不受 pending page 的 64-row/8 MiB 截断影响。
+    pub(crate) async fn load_frozen_publication(
+        &self,
+        publication_id: [u8; 16],
+    ) -> Result<Option<FrozenPublication>, RuntimeStoreError> {
+        ensure_running(&self.lifecycle)?;
+        let read_crypto = self.read_crypto.clone();
+        let database_id = self.database_id;
+        let retained = self
+            .read_pool
+            .run_sqlite_page(MAX_RUNTIME_READ_PAGE_BYTES, move |connection| {
+                super::super::publication::load_optional_outbox_read(
+                    connection,
+                    &read_crypto,
+                    database_id,
+                    publication_id,
+                )
+                .map_err(ReadPoolError::Operation)
+            })
+            .await
+            .map_err(map_read_pool_error)?;
+        let (mut publication, lease) = retained.into_parts();
+        if let Some(publication) = &mut publication {
+            publication.memory_lease = Some(lease);
+        }
+        Ok(publication)
+    }
+
     /// 重启恢复先在唯一 worker 上认证完整 publication directory/ledger，再返回
-    /// `reserved > committed` 的稳定排序 stream IDs。调用方不能从裸 SQL 枚举恢复。
+    /// `reserved > acknowledged` 的稳定排序 stream IDs。调用方不能从裸 SQL 枚举恢复；
+    /// 对 `committed > acknowledged` 的 row 只能做 local ACK repair，不能重新 publish。
     pub async fn load_pending_publication_streams(
         &self,
     ) -> Result<Vec<[u8; 16]>, RuntimeStoreError> {
@@ -812,6 +955,30 @@ impl RuntimeStoreHandle {
             .map_err(map_read_pool_error)?;
         let (barrier, _lease) = retained.into_parts();
         Ok(barrier)
+    }
+
+    /// exact publisher readback 的 authenticated ACK tombstone seam。只复用现有
+    /// read pool 与 publication row MAC，不创建第二 writer 或裸 SQL 旁路。
+    pub(crate) async fn load_publication_stream_record(
+        &self,
+        publication_stream_id: [u8; 16],
+    ) -> Result<PublicationStreamRecord, RuntimeStoreError> {
+        ensure_running(&self.lifecycle)?;
+        let read_crypto = self.read_crypto.clone();
+        let retained = self
+            .read_pool
+            .run_sqlite_page(64 * 1024, move |connection| {
+                super::super::publication::load_stream_read(
+                    connection,
+                    &read_crypto,
+                    publication_stream_id,
+                )
+                .map_err(ReadPoolError::Operation)
+            })
+            .await
+            .map_err(map_read_pool_error)?;
+        let (stream, _lease) = retained.into_parts();
+        Ok(stream)
     }
 }
 
@@ -854,7 +1021,9 @@ pub(super) fn send_snapshot_build_pin_reply(
 ) {
     let managed = result.map(|source| {
         let pin = match &source {
-            SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin) => pin.clone(),
+            SnapshotBarrierSource::Build(pin)
+            | SnapshotBarrierSource::TransitionBuild(pin)
+            | SnapshotBarrierSource::Dynamic(pin) => pin.clone(),
             SnapshotBarrierSource::Ready(_) => unreachable!("direct acquire cannot return Ready"),
         };
         let cleanup = SnapshotBuildPinCleanup::new(pin.clone(), cleanup_tx.clone());
@@ -1075,7 +1244,9 @@ pub(super) fn register_stream_barrier_on_worker(
                 Ok(RuntimeBackfillPlan::Pinned(pin)) => Some(pin),
                 Ok(RuntimeBackfillPlan::Current { .. }) => {
                     if let Some(
-                        SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin),
+                        SnapshotBarrierSource::Build(pin)
+                        | SnapshotBarrierSource::TransitionBuild(pin)
+                        | SnapshotBarrierSource::Dynamic(pin),
                     ) = &snapshot_source
                     {
                         let _ = stream::release_snapshot_build_pin(state, pin);
@@ -1084,7 +1255,9 @@ pub(super) fn register_stream_barrier_on_worker(
                 }
                 Err(error) => {
                     if let Some(
-                        SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin),
+                        SnapshotBarrierSource::Build(pin)
+                        | SnapshotBarrierSource::TransitionBuild(pin)
+                        | SnapshotBarrierSource::Dynamic(pin),
                     ) = &snapshot_source
                     {
                         let _ = stream::release_snapshot_build_pin(state, pin);
@@ -1113,9 +1286,11 @@ pub(super) fn register_stream_barrier_on_worker(
     match result {
         Ok((watch, captured)) => {
             let snapshot_cleanup = match &captured.snapshot_source {
-                Some(SnapshotBarrierSource::Build(pin) | SnapshotBarrierSource::Dynamic(pin)) => {
-                    Some(watch.snapshot_build_pin_cleanup(pin.clone()))
-                }
+                Some(
+                    SnapshotBarrierSource::Build(pin)
+                    | SnapshotBarrierSource::TransitionBuild(pin)
+                    | SnapshotBarrierSource::Dynamic(pin),
+                ) => Some(watch.snapshot_build_pin_cleanup(pin.clone())),
                 Some(SnapshotBarrierSource::Ready(_)) | None => None,
             };
             let backfill_cleanup = captured
@@ -1141,5 +1316,278 @@ pub(super) fn register_stream_barrier_on_worker(
         Err(RegisterCaptureError::Hub(StoreCommitHubError::WatchIdentityExhausted)) => Err(
             RuntimeStoreError::InvalidConfig("store commit watch identity exhausted"),
         ),
+    }
+}
+
+/// Transition snapshot 的 frozen cut 不能复用 generic capture：generic 路径会把
+/// subscription 当下的 local head L 写入 snapshot/SyncComplete。这里以 Store-issued
+/// permit 的 H 作为初始 barrier，同时把 capture 时已经存在的 H→L 区间独立 pin 住，
+/// 供 StreamAppliedAck 释放 transition 后再进入 shared publication。
+pub(super) fn register_transition_snapshot_barrier_on_worker(
+    state: &sqlite::RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    commit_hub: &mut StoreCommitHub,
+    permit: key_transition::TransitionSnapshotPermit,
+    generation: WatchGeneration,
+    machine_trust_domain: [u8; 32],
+) -> Result<StreamBarrierRegistration, RuntimeStoreError> {
+    let target = transition_snapshot_target(&permit)?;
+    let frozen =
+        agentdeck_protocol::runtime::StreamCursor::from_high_water(permit.relay_committed_inner());
+    let committed_outer =
+        agentdeck_protocol::runtime::StreamCursor::from_high_water(permit.relay_committed_outer());
+    let result = commit_hub.register_then_capture(target, generation, |_| {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &state.connection,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        key_transition::validate_transition_snapshot_permit_axes_in_transaction(
+            &transaction,
+            &state.key_bundle,
+            state.database_id,
+            &permit,
+        )?;
+        let active_machine =
+            pairing::active_machine(&transaction, &state.key_bundle, state.database_id)?;
+        let current_authorization = pairing_authorization::load_active_remote_ingress(
+            &transaction,
+            &state.key_bundle,
+            state.database_id,
+            machine_trust_domain,
+            agentdeck_protocol::relay_v2::MachineRouteId::from_bytes(
+                active_machine.record.machine_route,
+            ),
+            agentdeck_protocol::relay_v2::DeviceRouteId::from_bytes(
+                permit.recipient().device_route,
+            ),
+        )?;
+        if current_authorization.grant_serial().value() != permit.recipient().grant_serial
+            || current_authorization.key_directory_revision().value()
+                != permit.key_directory_revision()
+            || current_authorization.authorization_hash() != permit.authorization_hash()
+        {
+            return Err(RuntimeStoreError::PairingConflict);
+        }
+        let ledger =
+            sqlite::load_runtime_ledger(&transaction, &state.key_bundle, state.database_id)?;
+        let ready_snapshot_reference = super::super::snapshot::authenticate_directory(
+            &transaction,
+            &state.key_bundle,
+            &ledger,
+            target,
+        )?;
+        let target_cut = stream::load_authenticated_target_cut_in(
+            &transaction,
+            &state.key_bundle,
+            state.database_id,
+            &ledger,
+            target,
+        )?;
+        if !cursor_is_at_or_after(target_cut.high_water, frozen) {
+            return Err(RuntimeStoreError::PublicationMismatch);
+        }
+        let conversation_origin = match target {
+            RuntimeStreamTarget::Catalog => None,
+            RuntimeStreamTarget::Conversation(conversation_id) => Some(
+                journal::load_authenticated_conversation_snapshot_context(
+                    &transaction,
+                    &state.key_bundle,
+                    state.database_id,
+                    conversation_id,
+                )?
+                .origin,
+            ),
+        };
+        let dynamic_native = conversation_origin == Some(SnapshotOrigin::NativeProjected);
+        validate_ready_snapshot_origin(dynamic_native, ready_snapshot_reference.as_ref())?;
+        drop(transaction);
+
+        let now_ms = config.clock.now_ms().map_err(RuntimeStoreError::from)?;
+        let catalog_snapshot_source = (target == RuntimeStreamTarget::Catalog)
+            .then(|| CatalogSnapshotSource::transition(ready_snapshot_reference.clone(), frozen));
+        let snapshot_source = match target {
+            RuntimeStreamTarget::Catalog => None,
+            RuntimeStreamTarget::Conversation(_) if !dynamic_native => {
+                match ready_snapshot_reference.clone() {
+                    Some(reference) if reference.base == frozen => {
+                        Some(SnapshotBarrierSource::Ready(reference))
+                    }
+                    Some(reference) if cursor_is_strictly_newer(reference.base, frozen) => {
+                        let RuntimeStreamTarget::Conversation(conversation_id) = target else {
+                            unreachable!("transition conversation target was matched above")
+                        };
+                        Some(SnapshotBarrierSource::TransitionBuild(
+                            stream::acquire_snapshot_build_pin_at(
+                                &state.connection,
+                                conversation_id,
+                                frozen.high_water(),
+                                now_ms,
+                            )?,
+                        ))
+                    }
+                    _ => {
+                        let RuntimeStreamTarget::Conversation(conversation_id) = target else {
+                            unreachable!("transition conversation target was matched above")
+                        };
+                        Some(SnapshotBarrierSource::Build(
+                            stream::acquire_snapshot_build_pin_at(
+                                &state.connection,
+                                conversation_id,
+                                frozen.high_water(),
+                                now_ms,
+                            )?,
+                        ))
+                    }
+                }
+            }
+            RuntimeStreamTarget::Conversation(conversation_id) => Some(
+                SnapshotBarrierSource::Dynamic(stream::acquire_snapshot_build_pin_at(
+                    &state.connection,
+                    conversation_id,
+                    frozen.high_water(),
+                    now_ms,
+                )?),
+            ),
+        };
+        let continuation_pin = if cursor_is_strictly_newer(target_cut.high_water, frozen) {
+            let through = target_cut
+                .high_water
+                .high_water()
+                .ok_or(RuntimeStoreError::PublicationMismatch)?;
+            let backfill_target = match target {
+                RuntimeStreamTarget::Catalog => RuntimeBackfillTarget::Catalog,
+                RuntimeStreamTarget::Conversation(conversation_id) => {
+                    RuntimeBackfillTarget::Conversation(conversation_id)
+                }
+            };
+            match stream::acquire_backfill_pin_at(
+                state,
+                backfill_target,
+                frozen.high_water(),
+                through,
+                now_ms,
+            ) {
+                Ok(RuntimeBackfillPlan::Pinned(pin)) => Some(pin),
+                Ok(RuntimeBackfillPlan::Current { .. }) => {
+                    if let Some(
+                        SnapshotBarrierSource::Build(pin)
+                        | SnapshotBarrierSource::TransitionBuild(pin)
+                        | SnapshotBarrierSource::Dynamic(pin),
+                    ) = &snapshot_source
+                    {
+                        let _ = stream::release_snapshot_build_pin(state, pin);
+                    }
+                    return Err(RuntimeStoreError::PublicationMismatch);
+                }
+                Err(error) => {
+                    if let Some(
+                        SnapshotBarrierSource::Build(pin)
+                        | SnapshotBarrierSource::TransitionBuild(pin)
+                        | SnapshotBarrierSource::Dynamic(pin),
+                    ) = &snapshot_source
+                    {
+                        let _ = stream::release_snapshot_build_pin(state, pin);
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        Ok::<_, RuntimeStoreError>((
+            frozen,
+            CapturedStreamBarrier {
+                target,
+                high_water: frozen,
+                retained_floor: target_cut.retained_floor,
+                ready_snapshot_base: ready_snapshot_reference
+                    .as_ref()
+                    .map(|reference| reference.base),
+                snapshot_source,
+                catalog_snapshot_source,
+                backfill_pin: continuation_pin,
+                relay_committed: RelayCommittedCut {
+                    publication_stream_id: Some(permit.publication_stream_id()),
+                    generation: Some(permit.generation()),
+                    outer: committed_outer,
+                    inner: frozen,
+                },
+                decision: crate::runtime::backfill::BarrierDecision::Snapshot {
+                    base: frozen,
+                    through: frozen,
+                    committed_outer,
+                },
+            },
+        ))
+    });
+    match result {
+        Ok((watch, captured)) => {
+            let snapshot_cleanup = match &captured.snapshot_source {
+                Some(
+                    SnapshotBarrierSource::Build(pin)
+                    | SnapshotBarrierSource::TransitionBuild(pin)
+                    | SnapshotBarrierSource::Dynamic(pin),
+                ) => Some(watch.snapshot_build_pin_cleanup(pin.clone())),
+                Some(SnapshotBarrierSource::Ready(_)) | None => None,
+            };
+            let backfill_cleanup = captured
+                .backfill_pin
+                .as_ref()
+                .map(|pin| watch.backfill_pin_cleanup(pin.pin_id));
+            Ok(StreamBarrierRegistration {
+                target: captured.target,
+                high_water: captured.high_water,
+                retained_floor: captured.retained_floor,
+                ready_snapshot_base: captured.ready_snapshot_base,
+                snapshot_source: captured.snapshot_source,
+                snapshot_cleanup,
+                catalog_snapshot_source: captured.catalog_snapshot_source,
+                backfill_pin: captured.backfill_pin,
+                backfill_cleanup,
+                relay_committed: captured.relay_committed,
+                decision: captured.decision,
+                watch,
+            })
+        }
+        Err(RegisterCaptureError::Capture(error)) => Err(error),
+        Err(RegisterCaptureError::Hub(StoreCommitHubError::WatchIdentityExhausted)) => Err(
+            RuntimeStoreError::InvalidConfig("store commit watch identity exhausted"),
+        ),
+    }
+}
+
+fn transition_snapshot_target(
+    permit: &key_transition::TransitionSnapshotPermit,
+) -> Result<RuntimeStreamTarget, RuntimeStoreError> {
+    match permit.scope() {
+        key_transition::KeyTransitionStreamScope::Catalog => Ok(RuntimeStreamTarget::Catalog),
+        key_transition::KeyTransitionStreamScope::Conversation(bytes) => {
+            Ok(RuntimeStreamTarget::Conversation(RuntimeId::from_bytes(
+                RuntimeIdKind::Conversation,
+                bytes,
+            )?))
+        }
+    }
+}
+
+fn cursor_is_at_or_after(
+    candidate: agentdeck_protocol::runtime::StreamCursor,
+    baseline: agentdeck_protocol::runtime::StreamCursor,
+) -> bool {
+    match (candidate.high_water(), baseline.high_water()) {
+        (_, None) => true,
+        (Some(candidate), Some(baseline)) => candidate >= baseline,
+        (None, Some(_)) => false,
+    }
+}
+
+fn cursor_is_strictly_newer(
+    candidate: agentdeck_protocol::runtime::StreamCursor,
+    baseline: agentdeck_protocol::runtime::StreamCursor,
+) -> bool {
+    match (candidate.high_water(), baseline.high_water()) {
+        (Some(_), None) => true,
+        (Some(candidate), Some(baseline)) => candidate > baseline,
+        _ => false,
     }
 }

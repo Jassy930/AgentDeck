@@ -10,8 +10,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
 
 use agentdeck_protocol::e2ee::AuthorizationPermissionV1;
-use agentdeck_protocol::runtime::RuntimeEnvelope;
 use agentdeck_protocol::runtime::identity::{DeviceHandle, GrantSerial};
+use agentdeck_protocol::runtime::{
+    MAX_JSON_PART_BYTES, MAX_PART_BYTES, RuntimeEnvelope, RuntimeTransferCarrierError,
+    RuntimeTransferCarrierV1,
+};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use zeroize::Zeroizing;
 
@@ -809,19 +812,65 @@ impl fmt::Debug for ConnectionId {
 #[derive(Clone)]
 pub struct ConnectionSink {
     sender: mpsc::Sender<ConnectionWrite>,
+    framing_profile: ConnectionFramingProfile,
 }
 
 impl ConnectionSink {
     #[must_use]
     pub fn new(sender: mpsc::Sender<ConnectionWrite>) -> Self {
-        Self { sender }
+        Self {
+            sender,
+            framing_profile: ConnectionFramingProfile::JsonRuntime,
+        }
     }
+
+    /// 为只理解 Runtime JSON 的 local UDS 保留默认值；MachineLink 必须显式安装
+    /// compact transfer capability，不能从 principal 或 payload magic 推断 transport。
+    #[must_use]
+    pub(crate) fn with_framing_profile(mut self, profile: ConnectionFramingProfile) -> Self {
+        self.framing_profile = profile;
+        self
+    }
+}
+
+/// connection transport 能力，而不是业务或 authorization state。compact profile
+/// 仍接受普通 Runtime JSON，只把 oversized Stream transfer 改走 ADRT1 carrier。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionFramingProfile {
+    JsonRuntime,
+    CompactTransfer,
+}
+
+impl ConnectionFramingProfile {
+    pub(crate) const fn transfer_part_bytes(self) -> usize {
+        match self {
+            Self::JsonRuntime => MAX_JSON_PART_BYTES,
+            Self::CompactTransfer => MAX_PART_BYTES,
+        }
+    }
+
+    const fn accepts(self, kind: EncodedRuntimeFrameKind) -> bool {
+        match (self, kind) {
+            (_, EncodedRuntimeFrameKind::JsonRuntime)
+            | (Self::CompactTransfer, EncodedRuntimeFrameKind::CompactTransfer) => true,
+            (Self::JsonRuntime, EncodedRuntimeFrameKind::CompactTransfer) => false,
+        }
+    }
+}
+
+/// typed encoded frame kind。transport dispatch 不检查 magic；只有专用 carrier
+/// constructor 能构造 `CompactTransfer`。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EncodedRuntimeFrameKind {
+    JsonRuntime,
+    CompactTransfer,
 }
 
 /// transport 的单次写入工作项。丢弃而不 ACK 会关闭当前 Runtime connection；
 /// 只有 `acknowledge` 才释放 Core 的 frame/byte budget。
 pub struct ConnectionWrite {
     bytes: Arc<[u8]>,
+    kind: EncodedRuntimeFrameKind,
     acknowledged: Option<oneshot::Sender<()>>,
 }
 
@@ -829,6 +878,11 @@ impl ConnectionWrite {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    #[must_use]
+    pub(crate) fn kind(&self) -> EncodedRuntimeFrameKind {
+        self.kind
     }
 
     /// 返回可与 `cancelled` 的可变借用并行使用的共享 encoded frame。
@@ -851,10 +905,27 @@ impl ConnectionWrite {
         (
             Self {
                 bytes: bytes.into(),
+                kind: EncodedRuntimeFrameKind::JsonRuntime,
                 acknowledged: Some(acknowledged),
             },
             acknowledgement,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_compact_transfer_test(
+        carrier: &RuntimeTransferCarrierV1,
+    ) -> Result<(Self, oneshot::Receiver<()>), ConnectionError> {
+        let frame = EncodedRuntimeFrame::from_transfer_carrier(carrier)?;
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        Ok((
+            Self {
+                bytes: frame.bytes,
+                kind: frame.kind,
+                acknowledged: Some(acknowledged),
+            },
+            acknowledgement,
+        ))
     }
 
     pub fn acknowledge(mut self) -> Result<(), ConnectionError> {
@@ -871,6 +942,7 @@ impl fmt::Debug for ConnectionWrite {
         formatter
             .debug_struct("ConnectionWrite")
             .field("encoded_bytes", &self.bytes.len())
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -901,6 +973,7 @@ impl fmt::Debug for FlushReceipt {
 #[derive(Clone)]
 pub struct EncodedRuntimeFrame {
     bytes: Arc<[u8]>,
+    kind: EncodedRuntimeFrameKind,
 }
 
 impl EncodedRuntimeFrame {
@@ -916,7 +989,28 @@ impl EncodedRuntimeFrame {
             })?;
         Ok(Self {
             bytes: Arc::from(bytes),
+            kind: EncodedRuntimeFrameKind::JsonRuntime,
         })
+    }
+
+    pub(crate) fn from_transfer_carrier(
+        carrier: &RuntimeTransferCarrierV1,
+    ) -> Result<Self, ConnectionError> {
+        let bytes = carrier.encode().map_err(|error| match error {
+            RuntimeTransferCarrierError::TooLarge => ConnectionError::FrameTooLarge,
+            RuntimeTransferCarrierError::Invalid
+            | RuntimeTransferCarrierError::Version
+            | RuntimeTransferCarrierError::Transfer(_) => ConnectionError::Encode,
+        })?;
+        Ok(Self {
+            bytes: Arc::from(bytes),
+            kind: EncodedRuntimeFrameKind::CompactTransfer,
+        })
+    }
+
+    #[cfg(test)]
+    const fn kind(&self) -> EncodedRuntimeFrameKind {
+        self.kind
     }
 
     #[cfg(test)]
@@ -924,6 +1018,7 @@ impl EncodedRuntimeFrame {
     pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Self {
         Self {
             bytes: bytes.into(),
+            kind: EncodedRuntimeFrameKind::JsonRuntime,
         }
     }
 }
@@ -955,6 +1050,7 @@ struct ConnectionEntry {
     byte_budget: Arc<Semaphore>,
     frame_budget: Arc<Semaphore>,
     paced_reservation_slot: Arc<Semaphore>,
+    framing_profile: ConnectionFramingProfile,
 }
 
 type ConnectionEntries = Mutex<HashMap<ConnectionId, ConnectionEntry>>;
@@ -1166,6 +1262,10 @@ impl ConnectionRegistry {
         if !connection_id_is_available(&entries, &tasks, id) {
             return Err(ConnectionError::EntropyUnavailable);
         }
+        let ConnectionSink {
+            sender: sink_sender,
+            framing_profile,
+        } = sink;
         let (writer, mut receiver) = mpsc::channel::<QueuedFrame>(self.frame_capacity);
         let incarnation = Arc::new(ConnectionIncarnation);
         let byte_budget = Arc::new(Semaphore::new(self.byte_capacity));
@@ -1192,10 +1292,10 @@ impl ConnectionRegistry {
             }
             while let Some(mut queued) = receiver.recv().await {
                 let (acknowledged, acknowledgement) = oneshot::channel();
-                let transport_result = if sink
-                    .sender
+                let transport_result = if sink_sender
                     .send(ConnectionWrite {
                         bytes: queued.frame.bytes.clone(),
+                        kind: queued.frame.kind,
                         acknowledged: Some(acknowledged),
                     })
                     .await
@@ -1228,6 +1328,7 @@ impl ConnectionRegistry {
             byte_budget,
             frame_budget,
             paced_reservation_slot,
+            framing_profile,
         };
         let replaced = entries.insert(id, entry);
         debug_assert!(replaced.is_none());
@@ -1255,6 +1356,18 @@ impl ConnectionRegistry {
             .map_err(|_| ConnectionError::RegistryPoisoned)?
             .get(&id)
             .map(|entry| entry.principal.clone())
+            .ok_or(ConnectionError::NotFound)
+    }
+
+    pub(crate) fn framing_profile(
+        &self,
+        id: ConnectionId,
+    ) -> Result<ConnectionFramingProfile, ConnectionError> {
+        self.entries
+            .lock()
+            .map_err(|_| ConnectionError::RegistryPoisoned)?
+            .get(&id)
+            .map(|entry| entry.framing_profile)
             .ok_or(ConnectionError::NotFound)
     }
 
@@ -1288,6 +1401,9 @@ impl ConnectionRegistry {
             .map_err(|_| ConnectionError::RegistryPoisoned)?;
         let entry = entries.get(&id).ok_or(ConnectionError::NotFound)?;
         let incarnation = entry.incarnation.clone();
+        if !entry.framing_profile.accepts(frame.kind) {
+            return Err(ConnectionError::FramingProfileMismatch);
+        }
         if encoded_len == 0 || encoded_len > self.byte_capacity {
             let removed = entries.remove(&id).is_some();
             drop(entries);
@@ -1378,7 +1494,14 @@ impl ConnectionRegistry {
             return Err(ConnectionError::Lagged);
         }
         let permits = u32::try_from(encoded_len).map_err(|_| ConnectionError::Lagged)?;
-        let (incarnation, writer, byte_budget, frame_budget, paced_reservation_slot) = {
+        let (
+            incarnation,
+            writer,
+            byte_budget,
+            frame_budget,
+            paced_reservation_slot,
+            framing_profile,
+        ) = {
             let entries = self
                 .entries
                 .lock()
@@ -1390,8 +1513,12 @@ impl ConnectionRegistry {
                 entry.byte_budget.clone(),
                 entry.frame_budget.clone(),
                 entry.paced_reservation_slot.clone(),
+                entry.framing_profile,
             )
         };
+        if !framing_profile.accepts(frame.kind) {
+            return Err(ConnectionError::FramingProfileMismatch);
+        }
         let reservation_slot = paced_reservation_slot
             .try_acquire_owned()
             .map_err(|_| ConnectionError::Lagged)?;
@@ -1657,6 +1784,8 @@ pub enum ConnectionError {
     Encode,
     #[error("runtime JSON/UDS frame exceeds its hard limit")]
     FrameTooLarge,
+    #[error("encoded Runtime frame is unsupported by the connection framing profile")]
+    FramingProfileMismatch,
 }
 
 #[cfg(test)]

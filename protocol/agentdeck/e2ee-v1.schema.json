@@ -198,6 +198,369 @@
       "title": "DeviceAuthorizationV1",
       "type": "object"
     },
+    "DeviceKeyRecoveryInfoV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "MachineDataSignerBindingV1": {
+          "additionalProperties": false,
+          "description": "PairResponse 的当前 MachineDataSign 身份。绑定公钥 fingerprint、单调 generation 与 包含 MachineRoot signature 的完整 data cert hash，避免只靠 verifier key 隐含身份。",
+          "properties": {
+            "certificateSha256": {
+              "type": "string"
+            },
+            "generation": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "signingKeyFingerprint": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "certificateSha256",
+            "generation",
+            "signingKeyFingerprint"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "HPKE clear `info` 与 recovery authority。完整结构也进入外层签名 TBS。",
+      "properties": {
+        "deviceRoute": {
+          "type": "string"
+        },
+        "e2eeFormatVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "grantSerial": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "knownKeyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "machineDataSigner": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MachineDataSignerBindingV1"
+            }
+          ],
+          "description": "已由 MachineRoot certificate 固定的当前 MachineDataSign 身份。"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "relayProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "relayServerId": {
+          "type": "string"
+        },
+        "requestRoute": {
+          "type": "string"
+        },
+        "rootTrustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtimeProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "targetKeyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "updateSetSha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "deviceRoute",
+        "e2eeFormatVersion",
+        "grantSerial",
+        "knownKeyDirectoryRevision",
+        "machineDataSigner",
+        "machineRoute",
+        "relayProtocolVersion",
+        "relayServerId",
+        "requestRoute",
+        "rootTrustEpoch",
+        "runtimeProtocolVersion",
+        "targetKeyDirectoryRevision",
+        "updateSetSha256"
+      ],
+      "title": "DeviceKeyRecoveryInfoV1",
+      "type": "object"
+    },
+    "DeviceKeyRecoveryReplyV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "DeviceKeyRecoveryInfoV1": {
+          "additionalProperties": false,
+          "description": "HPKE clear `info` 与 recovery authority。完整结构也进入外层签名 TBS。",
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "e2eeFormatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "knownKeyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineDataSigner": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/MachineDataSignerBindingV1"
+                }
+              ],
+              "description": "已由 MachineRoot certificate 固定的当前 MachineDataSign 身份。"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "relayServerId": {
+              "type": "string"
+            },
+            "requestRoute": {
+              "type": "string"
+            },
+            "rootTrustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "runtimeProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "targetKeyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "updateSetSha256": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "e2eeFormatVersion",
+            "grantSerial",
+            "knownKeyDirectoryRevision",
+            "machineDataSigner",
+            "machineRoute",
+            "relayProtocolVersion",
+            "relayServerId",
+            "requestRoute",
+            "rootTrustEpoch",
+            "runtimeProtocolVersion",
+            "targetKeyDirectoryRevision",
+            "updateSetSha256"
+          ],
+          "type": "object"
+        },
+        "MachineDataSignerBindingV1": {
+          "additionalProperties": false,
+          "description": "PairResponse 的当前 MachineDataSign 身份。绑定公钥 fingerprint、单调 generation 与 包含 MachineRoot signature 的完整 data cert hash，避免只靠 verifier key 隐含身份。",
+          "properties": {
+            "certificateSha256": {
+              "type": "string"
+            },
+            "generation": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "signingKeyFingerprint": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "certificateSha256",
+            "generation",
+            "signingKeyFingerprint"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "Relay opaque Reply 中的独立 recovery envelope；外层必须由当前 MachineDataSign 签名。",
+      "properties": {
+        "ciphertext": {
+          "type": "string"
+        },
+        "enc": {
+          "type": "string"
+        },
+        "formatVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "info": {
+          "$ref": "#/definitions/DeviceKeyRecoveryInfoV1"
+        },
+        "machineDataSignature": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ciphertext",
+        "enc",
+        "formatVersion",
+        "info",
+        "machineDataSignature"
+      ],
+      "title": "DeviceKeyRecoveryReplyV1",
+      "type": "object"
+    },
+    "DeviceKeyRecoveryTbsV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "MachineDataSignerBindingV1": {
+          "additionalProperties": false,
+          "description": "PairResponse 的当前 MachineDataSign 身份。绑定公钥 fingerprint、单调 generation 与 包含 MachineRoot signature 的完整 data cert hash，避免只靠 verifier key 隐含身份。",
+          "properties": {
+            "certificateSha256": {
+              "type": "string"
+            },
+            "generation": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "signingKeyFingerprint": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "certificateSha256",
+            "generation",
+            "signingKeyFingerprint"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "MachineDataSign 的 canonical TBS；显式重复 clear info 的全部安全轴，并加入 HPKE/AAD digest。",
+      "properties": {
+        "ciphertextSha256": {
+          "type": "string"
+        },
+        "deviceRoute": {
+          "type": "string"
+        },
+        "e2eeFormatVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "enc": {
+          "type": "string"
+        },
+        "grantSerial": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "infoSha256": {
+          "type": "string"
+        },
+        "knownKeyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "machineDataSigner": {
+          "$ref": "#/definitions/MachineDataSignerBindingV1"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "outerContextAadSha256": {
+          "type": "string"
+        },
+        "relayProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "relayServerId": {
+          "type": "string"
+        },
+        "requestRoute": {
+          "type": "string"
+        },
+        "rootTrustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtimeProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "targetKeyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "updateSetSha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ciphertextSha256",
+        "deviceRoute",
+        "e2eeFormatVersion",
+        "enc",
+        "grantSerial",
+        "infoSha256",
+        "knownKeyDirectoryRevision",
+        "machineDataSigner",
+        "machineRoute",
+        "outerContextAadSha256",
+        "relayProtocolVersion",
+        "relayServerId",
+        "requestRoute",
+        "rootTrustEpoch",
+        "runtimeProtocolVersion",
+        "targetKeyDirectoryRevision",
+        "updateSetSha256"
+      ],
+      "title": "DeviceKeyRecoveryTbsV1",
+      "type": "object"
+    },
     "EpochBarrierV1": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "additionalProperties": false,
@@ -312,6 +675,789 @@
       ],
       "title": "EpochBarrierV1",
       "type": "object"
+    },
+    "KeyControlRequestV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "KeyId": {
+          "additionalProperties": false,
+          "description": "对称 key 的身份：用途 + epoch。",
+          "properties": {
+            "epoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "purpose": {
+              "$ref": "#/definitions/KeyPurpose"
+            }
+          },
+          "required": [
+            "epoch",
+            "purpose"
+          ],
+          "type": "object"
+        },
+        "KeyPurpose": {
+          "description": "对称 key 用途（design §7.2）。每个用途一个发送方向。",
+          "oneOf": [
+            {
+              "description": "机器/session catalog 与状态快照。",
+              "enum": [
+                "catalog"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "每 conversation 的 daemon→device canonical events。",
+              "enum": [
+                "conversationDek"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、device→daemon 命令通道。",
+              "enum": [
+                "deviceCommandTx"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、daemon→device reply 通道。",
+              "enum": [
+                "deviceReplyTx"
+              ],
+              "type": "string"
+            }
+          ]
+        },
+        "KeySyncRequestV1": {
+          "additionalProperties": false,
+          "description": "设备看到已签名的未知更高 revision/epoch 后发出的有界 KeySync 请求。该 DTO 在进入 RuntimeCore 前由 RemoteLink 消费；daemon 只验证并冻结 `attempt` 为 1..=3。 30 秒绝对 deadline 由 P4.6 CLI / P5 Swift endpoint 状态机持有。",
+          "properties": {
+            "attempt": {
+              "format": "uint8",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "deviceRoute": {
+              "type": "string"
+            },
+            "formatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "keyId": {
+              "$ref": "#/definitions/KeyId"
+            },
+            "knownKeyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "requestedKeyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "rootTrustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "runtimeProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "streamRoute": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "attempt",
+            "deviceRoute",
+            "formatVersion",
+            "grantSerial",
+            "keyId",
+            "knownKeyDirectoryRevision",
+            "machineRoute",
+            "relayProtocolVersion",
+            "requestedKeyDirectoryRevision",
+            "rootTrustEpoch",
+            "runtimeProtocolVersion"
+          ],
+          "type": "object"
+        },
+        "KeyUpdateAckV1": {
+          "additionalProperties": false,
+          "description": "设备已安装 exact update set 的 authenticated ACK。DeviceSign sealed-blob signature 提供 真实性；DTO 继续绑定完整 authority 与 set canonical hash，Relay RouteAccepted 不可替代它。",
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "formatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "keyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "rootTrustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "runtimeProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "updateSetSha256": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "formatVersion",
+            "grantSerial",
+            "keyDirectoryRevision",
+            "machineRoute",
+            "relayProtocolVersion",
+            "rootTrustEpoch",
+            "runtimeProtocolVersion",
+            "updateSetSha256"
+          ],
+          "type": "object"
+        },
+        "RuntimeInnerCursor": {
+          "description": "Runtime 内层 canonical cursor；tag 阻止 catalog/event 混用。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "catalog"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "conversationId": {
+                  "type": "string"
+                },
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "conversation"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "conversationId",
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "StreamAppliedAckV1": {
+          "additionalProperties": false,
+          "description": "设备已应用 exact epoch barrier 的 authenticated ACK；只有该 ACK 才能证明 device delivery， Relay 的 Publish COMMIT/RouteAccepted 仅证明 Relay 接收。",
+          "properties": {
+            "appliedStreamSeq": {
+              "description": "承载 barrier control payload 的 first-new-key outer streamSeq `D=next(C)`；barrier 自身的 `streamCursor` 仍引用 old committed cut `C`。",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "deviceRoute": {
+              "type": "string"
+            },
+            "epochBarrierSha256": {
+              "type": "string"
+            },
+            "formatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "innerCursor": {
+              "$ref": "#/definitions/RuntimeInnerCursor"
+            },
+            "keyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "keyEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "rootTrustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "runtimeProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "streamGeneration": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "appliedStreamSeq",
+            "deviceRoute",
+            "epochBarrierSha256",
+            "formatVersion",
+            "grantSerial",
+            "innerCursor",
+            "keyDirectoryRevision",
+            "keyEpoch",
+            "machineRoute",
+            "relayProtocolVersion",
+            "rootTrustEpoch",
+            "runtimeProtocolVersion",
+            "streamGeneration",
+            "streamRoute"
+          ],
+          "type": "object"
+        },
+        "StreamCursor": {
+          "description": "zero-based stream/canonical sequence cursor。",
+          "oneOf": [
+            {
+              "enum": [
+                "beforeFirst"
+              ],
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "at": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "at"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "description": "Device→daemon 的中立 key-control carrier。它在 DeviceCommandTxKey 保护的 `SealedPayloadKind::KeyUpdate` 明文内出现，RemoteLink 在 RuntimeCore 前消费； Relay outer 仍只路由 opaque `Send`。",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "keySync"
+              ],
+              "type": "string"
+            },
+            "request": {
+              "$ref": "#/definitions/KeySyncRequestV1"
+            }
+          },
+          "required": [
+            "kind",
+            "request"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ack": {
+              "$ref": "#/definitions/KeyUpdateAckV1"
+            },
+            "kind": {
+              "enum": [
+                "keyUpdateAck"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "ack",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ack": {
+              "$ref": "#/definitions/StreamAppliedAckV1"
+            },
+            "kind": {
+              "enum": [
+                "streamAppliedAck"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "ack",
+            "kind"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "KeyControlRequestV1"
+    },
+    "KeyControlV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "DirectoryCurrentV1": {
+          "additionalProperties": false,
+          "description": "daemon 尚未推进到 probe 所请求 revision 时返回的 authenticated 状态。\n\n该值只允许表达 `current=r, requested=r+1`。它在当前 `DeviceReplyTx` key 下 定向返回，outer AAD/MachineDataSign 继续绑定 exact request route；设备收到后保持 当前目录并在 bounded reconnect probe 的后续时机重试，不能把它当作 key update ACK。",
+          "properties": {
+            "currentKeyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "deviceRoute": {
+              "type": "string"
+            },
+            "formatVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "requestedKeyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "rootTrustEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "runtimeProtocolVersion": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "currentKeyDirectoryRevision",
+            "deviceRoute",
+            "formatVersion",
+            "grantSerial",
+            "machineRoute",
+            "relayProtocolVersion",
+            "requestedKeyDirectoryRevision",
+            "rootTrustEpoch",
+            "runtimeProtocolVersion"
+          ],
+          "type": "object"
+        },
+        "EpochBarrierV1": {
+          "additionalProperties": false,
+          "description": "成员/epoch 变化时在每个 active stream 记录的 epoch barrier（design §7.2 / §9.2）。 同时含外层 generation/cursor 与 tagged inner cursor；剩余设备从 `next(C)` 使用新 key。",
+          "properties": {
+            "innerCursor": {
+              "$ref": "#/definitions/RuntimeInnerCursor"
+            },
+            "keyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "newEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "oldEpoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "streamCursor": {
+              "$ref": "#/definitions/StreamCursor"
+            },
+            "streamGeneration": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "innerCursor",
+            "keyDirectoryRevision",
+            "newEpoch",
+            "oldEpoch",
+            "streamCursor",
+            "streamGeneration"
+          ],
+          "type": "object"
+        },
+        "KeyId": {
+          "additionalProperties": false,
+          "description": "对称 key 的身份：用途 + epoch。",
+          "properties": {
+            "epoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "purpose": {
+              "$ref": "#/definitions/KeyPurpose"
+            }
+          },
+          "required": [
+            "epoch",
+            "purpose"
+          ],
+          "type": "object"
+        },
+        "KeyPurpose": {
+          "description": "对称 key 用途（design §7.2）。每个用途一个发送方向。",
+          "oneOf": [
+            {
+              "description": "机器/session catalog 与状态快照。",
+              "enum": [
+                "catalog"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "每 conversation 的 daemon→device canonical events。",
+              "enum": [
+                "conversationDek"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、device→daemon 命令通道。",
+              "enum": [
+                "deviceCommandTx"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、daemon→device reply 通道。",
+              "enum": [
+                "deviceReplyTx"
+              ],
+              "type": "string"
+            }
+          ]
+        },
+        "KeyUpdateSetV1": {
+          "additionalProperties": false,
+          "description": "同一 revision、同一 device 的 bounded wrapped-key update set。\n\n`updates` 以 `(purpose tag, stream route bytes)` 严格排序且不得重复；MVP 最大集合为 catalog + 1,024 conversation + command + reply，共 1,027 项，仍小于 Relay 4 MiB frame cap。 本 protocol 类型只证明 carrier 的同质性、顺序与容量，不知道 Store 的 active stream roster， 因而**不宣称 set 自身完整**；membership transition 冻结前必须由 Store 对 roster 做 exact 对账。",
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "keyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "updates": {
+              "items": {
+                "$ref": "#/definitions/KeyUpdateV1"
+              },
+              "maxItems": 1027,
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "keyDirectoryRevision",
+            "updates"
+          ],
+          "type": "object"
+        },
+        "KeyUpdateV1": {
+          "additionalProperties": false,
+          "description": "单个 key 更新（HPKE 封装给某设备；MachineDataSign/Root 签名）。",
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "enc": {
+              "type": "string"
+            },
+            "keyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "keyId": {
+              "$ref": "#/definitions/KeyId"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "wrappedKey": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "enc",
+            "keyDirectoryRevision",
+            "keyId",
+            "signature",
+            "wrappedKey"
+          ],
+          "type": "object"
+        },
+        "RuntimeInnerCursor": {
+          "description": "Runtime 内层 canonical cursor；tag 阻止 catalog/event 混用。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "catalog"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "conversationId": {
+                  "type": "string"
+                },
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "conversation"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "conversationId",
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "StreamCursor": {
+          "description": "zero-based stream/canonical sequence cursor。",
+          "oneOf": [
+            {
+              "enum": [
+                "beforeFirst"
+              ],
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "at": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "at"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "description": "密文内 key-control carrier。Relay outer 继续使用既有 opaque Reply/Publish family。",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "format_version": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "updateSet"
+              ],
+              "type": "string"
+            },
+            "update_set": {
+              "$ref": "#/definitions/KeyUpdateSetV1"
+            }
+          },
+          "required": [
+            "format_version",
+            "kind",
+            "update_set"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "barrier": {
+              "$ref": "#/definitions/EpochBarrierV1"
+            },
+            "format_version": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "epochBarrier"
+              ],
+              "type": "string"
+            },
+            "stream_route": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "barrier",
+            "format_version",
+            "kind",
+            "stream_route"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "format_version": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "directoryCurrent"
+              ],
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/DirectoryCurrentV1"
+            }
+          },
+          "required": [
+            "format_version",
+            "kind",
+            "status"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "KeyControlV1"
     },
     "KeyDirectorySignatureContextV1": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -519,6 +1665,8 @@
           "items": {
             "$ref": "#/definitions/KeyDirectoryEntry"
           },
+          "maxItems": 1027,
+          "minItems": 3,
           "type": "array"
         },
         "revision": {
@@ -592,6 +1740,196 @@
         "purpose"
       ],
       "title": "KeyId",
+      "type": "object"
+    },
+    "KeySyncRequestV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "KeyId": {
+          "additionalProperties": false,
+          "description": "对称 key 的身份：用途 + epoch。",
+          "properties": {
+            "epoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "purpose": {
+              "$ref": "#/definitions/KeyPurpose"
+            }
+          },
+          "required": [
+            "epoch",
+            "purpose"
+          ],
+          "type": "object"
+        },
+        "KeyPurpose": {
+          "description": "对称 key 用途（design §7.2）。每个用途一个发送方向。",
+          "oneOf": [
+            {
+              "description": "机器/session catalog 与状态快照。",
+              "enum": [
+                "catalog"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "每 conversation 的 daemon→device canonical events。",
+              "enum": [
+                "conversationDek"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、device→daemon 命令通道。",
+              "enum": [
+                "deviceCommandTx"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、daemon→device reply 通道。",
+              "enum": [
+                "deviceReplyTx"
+              ],
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "description": "设备看到已签名的未知更高 revision/epoch 后发出的有界 KeySync 请求。该 DTO 在进入 RuntimeCore 前由 RemoteLink 消费；daemon 只验证并冻结 `attempt` 为 1..=3。 30 秒绝对 deadline 由 P4.6 CLI / P5 Swift endpoint 状态机持有。",
+      "properties": {
+        "attempt": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "deviceRoute": {
+          "type": "string"
+        },
+        "formatVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "grantSerial": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "keyId": {
+          "$ref": "#/definitions/KeyId"
+        },
+        "knownKeyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "relayProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "requestedKeyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rootTrustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtimeProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "streamRoute": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "attempt",
+        "deviceRoute",
+        "formatVersion",
+        "grantSerial",
+        "keyId",
+        "knownKeyDirectoryRevision",
+        "machineRoute",
+        "relayProtocolVersion",
+        "requestedKeyDirectoryRevision",
+        "rootTrustEpoch",
+        "runtimeProtocolVersion"
+      ],
+      "title": "KeySyncRequestV1",
+      "type": "object"
+    },
+    "KeyUpdateAckV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "设备已安装 exact update set 的 authenticated ACK。DeviceSign sealed-blob signature 提供 真实性；DTO 继续绑定完整 authority 与 set canonical hash，Relay RouteAccepted 不可替代它。",
+      "properties": {
+        "deviceRoute": {
+          "type": "string"
+        },
+        "formatVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "grantSerial": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "keyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "relayProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rootTrustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtimeProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "updateSetSha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "deviceRoute",
+        "formatVersion",
+        "grantSerial",
+        "keyDirectoryRevision",
+        "machineRoute",
+        "relayProtocolVersion",
+        "rootTrustEpoch",
+        "runtimeProtocolVersion",
+        "updateSetSha256"
+      ],
+      "title": "KeyUpdateAckV1",
       "type": "object"
     },
     "KeyUpdateInfoV1": {
@@ -696,6 +2034,271 @@
         "runtimeProtocolVersion"
       ],
       "title": "KeyUpdateInfoV1",
+      "type": "object"
+    },
+    "KeyUpdateSetV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "KeyId": {
+          "additionalProperties": false,
+          "description": "对称 key 的身份：用途 + epoch。",
+          "properties": {
+            "epoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "purpose": {
+              "$ref": "#/definitions/KeyPurpose"
+            }
+          },
+          "required": [
+            "epoch",
+            "purpose"
+          ],
+          "type": "object"
+        },
+        "KeyPurpose": {
+          "description": "对称 key 用途（design §7.2）。每个用途一个发送方向。",
+          "oneOf": [
+            {
+              "description": "机器/session catalog 与状态快照。",
+              "enum": [
+                "catalog"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "每 conversation 的 daemon→device canonical events。",
+              "enum": [
+                "conversationDek"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、device→daemon 命令通道。",
+              "enum": [
+                "deviceCommandTx"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、daemon→device reply 通道。",
+              "enum": [
+                "deviceReplyTx"
+              ],
+              "type": "string"
+            }
+          ]
+        },
+        "KeyUpdateV1": {
+          "additionalProperties": false,
+          "description": "单个 key 更新（HPKE 封装给某设备；MachineDataSign/Root 签名）。",
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "enc": {
+              "type": "string"
+            },
+            "keyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "keyId": {
+              "$ref": "#/definitions/KeyId"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "wrappedKey": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "enc",
+            "keyDirectoryRevision",
+            "keyId",
+            "signature",
+            "wrappedKey"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "同一 revision、同一 device 的 bounded wrapped-key update set。\n\n`updates` 以 `(purpose tag, stream route bytes)` 严格排序且不得重复；MVP 最大集合为 catalog + 1,024 conversation + command + reply，共 1,027 项，仍小于 Relay 4 MiB frame cap。 本 protocol 类型只证明 carrier 的同质性、顺序与容量，不知道 Store 的 active stream roster， 因而**不宣称 set 自身完整**；membership transition 冻结前必须由 Store 对 roster 做 exact 对账。",
+      "properties": {
+        "deviceRoute": {
+          "type": "string"
+        },
+        "keyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "updates": {
+          "items": {
+            "$ref": "#/definitions/KeyUpdateV1"
+          },
+          "maxItems": 1027,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "deviceRoute",
+        "keyDirectoryRevision",
+        "updates"
+      ],
+      "title": "KeyUpdateSetV1",
+      "type": "object"
+    },
+    "KeyUpdateTbsV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "KeyPurpose": {
+          "description": "对称 key 用途（design §7.2）。每个用途一个发送方向。",
+          "oneOf": [
+            {
+              "description": "机器/session catalog 与状态快照。",
+              "enum": [
+                "catalog"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "每 conversation 的 daemon→device canonical events。",
+              "enum": [
+                "conversationDek"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、device→daemon 命令通道。",
+              "enum": [
+                "deviceCommandTx"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、daemon→device reply 通道。",
+              "enum": [
+                "deviceReplyTx"
+              ],
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "description": "MachineDataSign 对单个 HPKE-wrapped key update 签名的确定性 preimage。\n\nTBS 同时绑定三个版本轴、完整 machine/device trust domain、key identity、HPKE `info`/AAD、`enc`、wrapped-key digest 与 root-certified MachineData credential；调用方 不能只对 wrapped key 或一份脱离上下文的 JSON 签名。",
+      "properties": {
+        "aadSha256": {
+          "type": "string"
+        },
+        "deviceRoute": {
+          "type": "string"
+        },
+        "e2eeFormatVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "enc": {
+          "type": "string"
+        },
+        "grantSerial": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "infoSha256": {
+          "type": "string"
+        },
+        "keyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "keyEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "keyPurpose": {
+          "$ref": "#/definitions/KeyPurpose"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "relayProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "relayServerId": {
+          "type": "string"
+        },
+        "rootTrustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtimeProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "signingCredentialSha256": {
+          "type": "string"
+        },
+        "signingKeyFingerprint": {
+          "type": "string"
+        },
+        "signingKeyGeneration": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "streamRoute": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "wrappedKeySha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "aadSha256",
+        "deviceRoute",
+        "e2eeFormatVersion",
+        "enc",
+        "grantSerial",
+        "infoSha256",
+        "keyDirectoryRevision",
+        "keyEpoch",
+        "keyPurpose",
+        "machineRoute",
+        "relayProtocolVersion",
+        "relayServerId",
+        "rootTrustEpoch",
+        "runtimeProtocolVersion",
+        "signingCredentialSha256",
+        "signingKeyFingerprint",
+        "signingKeyGeneration",
+        "wrappedKeySha256"
+      ],
+      "title": "KeyUpdateTbsV1",
       "type": "object"
     },
     "KeyUpdateV1": {
@@ -826,18 +2429,29 @@
       "definitions": {
         "OuterFrameKind": {
           "description": "AAD 绑定的 outer frame 用途。",
-          "enum": [
-            "catalogPublish",
-            "conversationPublish",
-            "directedReply",
-            "uplinkSend",
-            "pairRequest",
-            "pairResponse",
-            "keyUpdate",
-            "pairPending",
-            "pairResponseReceived"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "catalogPublish",
+                "conversationPublish",
+                "directedReply",
+                "uplinkSend",
+                "pairRequest",
+                "pairResponse",
+                "keyUpdate",
+                "pairPending",
+                "pairResponseReceived"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "DeviceReplyTx counter recovery 的独立 DeviceHPKE reply；不使用 reply AEAD key/counter。",
+              "enum": [
+                "deviceKeyRecovery"
+              ],
+              "type": "string"
+            }
+          ]
         },
         "StreamCursor": {
           "description": "zero-based stream/canonical sequence cursor。",
@@ -1542,6 +3156,8 @@
               "items": {
                 "$ref": "#/definitions/KeyDirectoryEntry"
               },
+              "maxItems": 1027,
+              "minItems": 3,
               "type": "array"
             },
             "revision": {
@@ -2232,6 +3848,164 @@
         "signature"
       ],
       "title": "SignedSealedBlobV1",
+      "type": "object"
+    },
+    "StreamAppliedAckV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "RuntimeInnerCursor": {
+          "description": "Runtime 内层 canonical cursor；tag 阻止 catalog/event 混用。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "catalog"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "conversationId": {
+                  "type": "string"
+                },
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "conversation"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "conversationId",
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "StreamCursor": {
+          "description": "zero-based stream/canonical sequence cursor。",
+          "oneOf": [
+            {
+              "enum": [
+                "beforeFirst"
+              ],
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "at": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "at"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "description": "设备已应用 exact epoch barrier 的 authenticated ACK；只有该 ACK 才能证明 device delivery， Relay 的 Publish COMMIT/RouteAccepted 仅证明 Relay 接收。",
+      "properties": {
+        "appliedStreamSeq": {
+          "description": "承载 barrier control payload 的 first-new-key outer streamSeq `D=next(C)`；barrier 自身的 `streamCursor` 仍引用 old committed cut `C`。",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "deviceRoute": {
+          "type": "string"
+        },
+        "epochBarrierSha256": {
+          "type": "string"
+        },
+        "formatVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "grantSerial": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "innerCursor": {
+          "$ref": "#/definitions/RuntimeInnerCursor"
+        },
+        "keyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "keyEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "relayProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rootTrustEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtimeProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "streamGeneration": {
+          "type": "string"
+        },
+        "streamRoute": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "appliedStreamSeq",
+        "deviceRoute",
+        "epochBarrierSha256",
+        "formatVersion",
+        "grantSerial",
+        "innerCursor",
+        "keyDirectoryRevision",
+        "keyEpoch",
+        "machineRoute",
+        "relayProtocolVersion",
+        "rootTrustEpoch",
+        "runtimeProtocolVersion",
+        "streamGeneration",
+        "streamRoute"
+      ],
+      "title": "StreamAppliedAckV1",
       "type": "object"
     },
     "ToBeSignedV1": {

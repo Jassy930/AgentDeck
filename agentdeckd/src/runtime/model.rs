@@ -93,6 +93,8 @@ pub enum RuntimeStoreOperation {
     RecordValidatedEnrollmentResponseAfterCommit,
     ActivateMachineEnrollmentBeforeCommit,
     ActivateMachineEnrollmentAfterCommit,
+    FinalizeKeyDirectoryRotationBeforeCommit,
+    FinalizeKeyDirectoryRotationAfterCommit,
     PreparePairingInviteBeforeCommit,
     PreparePairingInviteAfterCommit,
     AcknowledgePairRouteOpenBeforeCommit,
@@ -212,6 +214,12 @@ pub enum RuntimeStoreOperation {
     CommitPublicationAfterCommit,
     AcknowledgePublicationBeforeCommit,
     AcknowledgePublicationAfterCommit,
+    ApplyReplayRetirementBeforeCommit,
+    ApplyReplayRetirementAfterCommit,
+    ApplyCounterRetirementBeforeCommit,
+    ApplyCounterRetirementAfterCommit,
+    GcKeyTransitionsBeforeCommit,
+    GcKeyTransitionsAfterCommit,
 }
 
 pub trait RuntimeStoreFaultInjector: Send + Sync {
@@ -796,6 +804,7 @@ pub enum RuntimeCommitOperation {
     PrepareMachineEnrollment,
     RecordValidatedEnrollmentResponse,
     ActivateMachineEnrollment,
+    FinalizeKeyDirectoryRotation,
     PreparePairingInvite,
     AcknowledgePairRouteOpen,
     AcceptPairRequest,
@@ -855,6 +864,9 @@ pub enum RuntimeCommitOperation {
     FreezePublication,
     CommitPublication,
     AcknowledgePublication,
+    ApplyReplayRetirement,
+    ApplyCounterRetirement,
+    GcKeyTransitions,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -938,8 +950,14 @@ impl std::fmt::Debug for ConversationRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CreateConversationOutcome {
-    Created { conversation: ConversationRecord },
-    Replayed { conversation: ConversationRecord },
+    Created {
+        conversation: ConversationRecord,
+        conversation_activation_pending: bool,
+    },
+    Replayed {
+        conversation: ConversationRecord,
+        conversation_activation_pending: bool,
+    },
 }
 
 /// 把一个 conversation 持久化为 fail-closed recovery 状态的精确绑定。

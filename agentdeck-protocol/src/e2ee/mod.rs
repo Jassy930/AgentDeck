@@ -9,6 +9,8 @@
 //! HPKE info）使用本模块的 [`Enc`] 长度前缀编码，与 Relay 二进制 codec **相互独立**。
 
 pub mod context;
+pub mod key_control;
+pub mod key_recovery;
 pub mod keys;
 pub mod pairing;
 pub mod pairing_control;
@@ -174,9 +176,19 @@ pub(crate) mod b64_vec {
 }
 
 pub use context::{OuterContextError, OuterContextV1, OuterFrameKind};
+pub use key_control::{
+    DirectoryCurrentV1, KEY_CONTROL_MAX_ID_BYTES, KEY_UPDATE_SET_MAX_CANONICAL_BYTES,
+    KEY_UPDATE_SET_MAX_KEYS, KeyControlRequestV1, KeyControlV1, KeySyncRequestV1, KeyUpdateAckV1,
+    KeyUpdateSetV1, StreamAppliedAckV1,
+};
+pub use key_recovery::{
+    DEVICE_KEY_RECOVERY_HPKE_ENC_BYTES, DEVICE_KEY_RECOVERY_MAX_CIPHERTEXT_BYTES,
+    DeviceKeyRecoveryInfoV1, DeviceKeyRecoveryReplyV1, DeviceKeyRecoveryTbsV1,
+};
 pub use keys::{
-    EpochBarrierV1, KeyDirectoryEntry, KeyDirectorySignatureContextV1, KeyDirectoryTbsV1,
-    KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1, KeyUpdateV1,
+    CanonicalKeyUpdateTbs, EpochBarrierV1, KeyDirectoryEntry, KeyDirectorySignatureContextV1,
+    KeyDirectoryTbsV1, KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1,
+    KeyUpdateSignatureSigner, KeyUpdateSignatureVerifier, KeyUpdateTbsV1, KeyUpdateV1,
 };
 pub use pairing::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,

@@ -26,7 +26,8 @@ use thiserror::Error;
 use crate::config::compiled_stable_keychain_access_group;
 use crate::remote::identity::{
     KEY_DIRECTORY_GUARD_ACCOUNT, MACHINE_DATA_SIGN_ACCOUNT, MACHINE_HPKE_ACCOUNT,
-    MACHINE_LINK_SIGN_ACCOUNT, MACHINE_ROOT_SIGN_ACCOUNT,
+    MACHINE_LINK_SIGN_ACCOUNT, MACHINE_ROOT_SIGN_ACCOUNT, cleanup_scoped_counter_guards,
+    validate_scoped_counter_guards,
 };
 use crate::runtime::namespace::DaemonPaths;
 use crate::runtime::singleton::{SingletonError, SingletonGuard};
@@ -36,11 +37,16 @@ use crate::runtime::store::{
     MachineRemoteLifecycle, MachineTrustResetKind, PurgeReadbackAbsentMachineEnrollmentState,
     RuntimeStoreHandle,
 };
-use crate::security::{KeyStore, KeyStoreError, STORAGE_KEK_ACCOUNT, SecretBytes};
+use crate::security::{
+    KeyStore, KeyStoreError, STORAGE_KEK_ACCOUNT, SecretBytes, load_existing_storage_kek,
+};
 
 pub const PURGE_FINALIZER_MARKER_ACCOUNT: &str = "purge-finalizer-phase.v1";
 
-const MARKER_VERSION: u16 = 1;
+// Keychain account 是已发行的稳定定位符，不随 payload schema 改名。
+// v2 新增 authenticated CounterGuard manifest commitment；v1 缺少该证据，
+// 新 binary 只能明确 fail-close，不得猜测迁移或覆写旧 marker。
+const MARKER_VERSION: u16 = 2;
 const MAX_MARKER_BYTES: usize = 64 * 1024;
 const MAX_VERSION_ENTRIES: usize = 32;
 const DATA_DIR_MODE: u32 = 0o700;
@@ -60,6 +66,7 @@ static FINALIZER_IO: Mutex<()> = Mutex::new(());
 pub enum PurgeFinalizerPhase {
     Prepared,
     InstallDetached,
+    CounterGuardsRemoved,
     RuntimeRemoved,
     MachineSecretsRemoved,
     StorageKekRemoved,
@@ -69,7 +76,8 @@ impl PurgeFinalizerPhase {
     const fn next(self) -> Option<Self> {
         match self {
             Self::Prepared => Some(Self::InstallDetached),
-            Self::InstallDetached => Some(Self::RuntimeRemoved),
+            Self::InstallDetached => Some(Self::CounterGuardsRemoved),
+            Self::CounterGuardsRemoved => Some(Self::RuntimeRemoved),
             Self::RuntimeRemoved => Some(Self::MachineSecretsRemoved),
             Self::MachineSecretsRemoved => Some(Self::StorageKekRemoved),
             Self::StorageKekRemoved => None,
@@ -80,9 +88,10 @@ impl PurgeFinalizerPhase {
         match self {
             Self::Prepared => 0,
             Self::InstallDetached => 1,
-            Self::RuntimeRemoved => 2,
-            Self::MachineSecretsRemoved => 3,
-            Self::StorageKekRemoved => 4,
+            Self::CounterGuardsRemoved => 2,
+            Self::RuntimeRemoved => 3,
+            Self::MachineSecretsRemoved => 4,
+            Self::StorageKekRemoved => 5,
         }
     }
 }
@@ -501,8 +510,21 @@ struct PurgeMarkerV1 {
     retained_version: VersionBinding,
     removable_versions: Vec<VersionBinding>,
     runtime_artifacts: Vec<EntryBinding>,
+    counter_guard_manifest: CounterGuardManifestBinding,
     machine_items: Vec<KeyItemBinding>,
     storage_kek_hash: [u8; 32],
+}
+
+#[derive(Deserialize)]
+struct PurgeMarkerVersionProbe {
+    marker_version: u16,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct CounterGuardManifestBinding {
+    database_id: [u8; 16],
+    count: u64,
+    digest: [u8; 32],
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -810,7 +832,10 @@ pub fn run_purge_finalizer_with_observer(
             PurgeFinalizerPhase::Prepared => {
                 detach_install_artifacts(&marker, &layout, observer)?;
             }
-            PurgeFinalizerPhase::InstallDetached => remove_runtime_artifacts(&marker)?,
+            PurgeFinalizerPhase::InstallDetached => {
+                remove_counter_guards(key_store, &marker)?;
+            }
+            PurgeFinalizerPhase::CounterGuardsRemoved => remove_runtime_artifacts(&marker)?,
             PurgeFinalizerPhase::RuntimeRemoved => {
                 remove_bound_key_items(key_store, &marker.machine_items)?;
             }
@@ -988,8 +1013,17 @@ fn snapshot_marker(
             })
         })
         .collect::<Result<Vec<_>, PurgeFinalizerError>>()?;
-    let storage_kek_hash = load_secret_hash(key_store, STORAGE_KEK_ACCOUNT)?
-        .ok_or(PurgeFinalizerError::StorageKekMissing)?;
+    let storage_kek =
+        load_existing_storage_kek(key_store).map_err(|_| PurgeFinalizerError::StorageKekMissing)?;
+    let storage_kek_hash = sha256(storage_kek.expose_secret());
+    let (database_id, counter_guard_manifest) =
+        crate::runtime::store::read_authenticated_counter_guard_manifest_existing_only(
+            &layout.runtime_db,
+            &storage_kek,
+        )
+        .map_err(|_| PurgeFinalizerError::CounterGuardManifestInvalid)?;
+    let counter_guard_manifest =
+        counter_guard_manifest_binding(database_id, &counter_guard_manifest)?;
     Ok(PurgeMarkerV1 {
         marker_version: MARKER_VERSION,
         phase: PurgeFinalizerPhase::Prepared,
@@ -1003,6 +1037,7 @@ fn snapshot_marker(
         retained_version,
         removable_versions,
         runtime_artifacts,
+        counter_guard_manifest,
         machine_items,
         storage_kek_hash,
     })
@@ -1270,6 +1305,78 @@ fn remove_runtime_artifacts(marker: &PurgeMarkerV1) -> Result<(), PurgeFinalizer
     Ok(())
 }
 
+fn remove_counter_guards(
+    key_store: &dyn KeyStore,
+    marker: &PurgeMarkerV1,
+) -> Result<(), PurgeFinalizerError> {
+    let manifest = read_bound_counter_guard_manifest(key_store, marker)?;
+    let reset_kind = match &marker.authorization {
+        PurgeMarkerAuthorization::Authorized {
+            binding: PurgeAuthorizationBinding::Remote { reset_kind: 1, .. },
+        } => MachineTrustResetKind::RootPresent,
+        PurgeMarkerAuthorization::Authorized {
+            binding: PurgeAuthorizationBinding::Remote { reset_kind: 2, .. },
+        } => MachineTrustResetKind::RootLost,
+        PurgeMarkerAuthorization::Authorized {
+            binding: PurgeAuthorizationBinding::Unenrolled { .. },
+        } if manifest.is_empty() => return Ok(()),
+        _ => return Err(PurgeFinalizerError::AuthorizationInvalid),
+    };
+    cleanup_scoped_counter_guards(key_store, reset_kind, &manifest)
+        .map_err(|_| PurgeFinalizerError::CounterGuardCleanupFailed)
+}
+
+fn read_bound_counter_guard_manifest(
+    key_store: &dyn KeyStore,
+    marker: &PurgeMarkerV1,
+) -> Result<
+    crate::runtime::store::remote_counter_guard_manifest::CounterGuardCleanupManifest,
+    PurgeFinalizerError,
+> {
+    let storage_kek =
+        load_existing_storage_kek(key_store).map_err(|_| PurgeFinalizerError::StorageKekMissing)?;
+    if sha256(storage_kek.expose_secret()) != marker.storage_kek_hash {
+        return Err(PurgeFinalizerError::StorageKekConflict);
+    }
+    let (database_id, manifest) =
+        crate::runtime::store::read_authenticated_counter_guard_manifest_existing_only(
+            Path::new(&marker.runtime_artifacts[0].path),
+            &storage_kek,
+        )
+        .map_err(|_| PurgeFinalizerError::CounterGuardManifestInvalid)?;
+    let binding = counter_guard_manifest_binding(database_id, &manifest)?;
+    if binding != marker.counter_guard_manifest {
+        return Err(PurgeFinalizerError::CounterGuardManifestConflict);
+    }
+    Ok(manifest)
+}
+
+fn counter_guard_manifest_binding(
+    database_id: [u8; 16],
+    manifest: &[([u8; 32], bool)],
+) -> Result<CounterGuardManifestBinding, PurgeFinalizerError> {
+    let count = u64::try_from(manifest.len())
+        .map_err(|_| PurgeFinalizerError::CounterGuardManifestInvalid)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"AgentDeck/PurgeCounterGuardManifestV1\0");
+    hasher.update(database_id);
+    hasher.update(count.to_be_bytes());
+    let mut previous = None;
+    for (scope_token, materialized) in manifest.iter().copied() {
+        if scope_token == [0; 32] || previous.is_some_and(|value| value >= scope_token) {
+            return Err(PurgeFinalizerError::CounterGuardManifestInvalid);
+        }
+        hasher.update(scope_token);
+        hasher.update([u8::from(materialized)]);
+        previous = Some(scope_token);
+    }
+    Ok(CounterGuardManifestBinding {
+        database_id,
+        count,
+        digest: hasher.finalize().into(),
+    })
+}
+
 fn remove_bound_key_items(
     key_store: &dyn KeyStore,
     bindings: &[KeyItemBinding],
@@ -1299,6 +1406,7 @@ fn remove_storage_kek(
 fn validate_marker(marker: &PurgeMarkerV1) -> Result<(), PurgeFinalizerError> {
     if marker.marker_version != MARKER_VERSION
         || marker.machine_items.len() != machine_accounts().len()
+        || marker.counter_guard_manifest.database_id == [0; 16]
     {
         return Err(PurgeFinalizerError::MarkerInvalid);
     }
@@ -1377,6 +1485,11 @@ fn preflight_remaining(
     // 先全局认证所有 frozen binding；exact present 可在后续 replay 删除，冲突项则
     // 零写 fail-close。
     validate_runtime_artifacts(marker)?;
+    if marker.phase.rank() < PurgeFinalizerPhase::CounterGuardsRemoved.rank() {
+        let manifest = read_bound_counter_guard_manifest(key_store, marker)?;
+        validate_scoped_counter_guards(key_store, &manifest)
+            .map_err(|_| PurgeFinalizerError::CounterGuardCleanupFailed)?;
+    }
     validate_bound_key_items(key_store, &marker.machine_items)?;
     validate_storage_kek(key_store, marker.storage_kek_hash)?;
     Ok(())
@@ -1386,6 +1499,20 @@ fn validate_authorization_machine_items(
     marker: &PurgeMarkerV1,
     authorization: &AuthenticatedPurgeAuthorization,
 ) -> Result<(), PurgeFinalizerError> {
+    let authorization_database_id = match &authorization.binding {
+        PurgeAuthorizationBinding::Unenrolled { database_id, .. }
+        | PurgeAuthorizationBinding::Remote { database_id, .. } => *database_id,
+    };
+    if authorization_database_id != marker.counter_guard_manifest.database_id {
+        return Err(PurgeFinalizerError::AuthorizationInvalid);
+    }
+    if matches!(
+        &authorization.binding,
+        PurgeAuthorizationBinding::Unenrolled { .. }
+    ) && marker.counter_guard_manifest.count != 0
+    {
+        return Err(PurgeFinalizerError::AuthorizationInvalid);
+    }
     if authorization.requires_machine_items_absent()
         && marker
             .machine_items
@@ -1412,6 +1539,12 @@ fn replay_completed_prefix(
 ) -> Result<(), PurgeFinalizerError> {
     if marker.phase.rank() >= PurgeFinalizerPhase::InstallDetached.rank() {
         detach_install_artifacts(marker, layout, &NoopObserver)?;
+    }
+    if marker.phase.rank() >= PurgeFinalizerPhase::CounterGuardsRemoved.rank()
+        && marker.phase.rank() < PurgeFinalizerPhase::RuntimeRemoved.rank()
+    {
+        // CounterGuardsRemoved marker COMMIT 是 exact absent readback 的 durable proof；
+        // 此 phase 的 Runtime 删除 crash gap 不再依赖已可能删除的 DB 反查 token。
     }
     if marker.phase.rank() >= PurgeFinalizerPhase::RuntimeRemoved.rank() {
         remove_runtime_artifacts(marker)?;
@@ -1786,6 +1919,11 @@ fn load_marker(key_store: &dyn KeyStore) -> Result<Option<PurgeMarkerV1>, PurgeF
     if bytes.is_empty() || bytes.len() > MAX_MARKER_BYTES {
         return Err(PurgeFinalizerError::MarkerInvalid);
     }
+    let version: PurgeMarkerVersionProbe =
+        serde_json::from_slice(bytes).map_err(|_| PurgeFinalizerError::MarkerInvalid)?;
+    if version.marker_version != MARKER_VERSION {
+        return Err(PurgeFinalizerError::MarkerVersionUnsupported);
+    }
     let marker: PurgeMarkerV1 =
         serde_json::from_slice(bytes).map_err(|_| PurgeFinalizerError::MarkerInvalid)?;
     let canonical = encode_marker(&marker)?;
@@ -1890,6 +2028,8 @@ pub enum PurgeFinalizerError {
     MarkerMissing,
     #[error("purge finalizer marker is invalid")]
     MarkerInvalid,
+    #[error("purge finalizer marker version is unsupported by this binary")]
+    MarkerVersionUnsupported,
     #[error("purge finalizer marker conflicts with another plan")]
     MarkerConflict,
     #[error("purge finalizer marker is reserved but not authorized")]
@@ -1914,6 +2054,12 @@ pub enum PurgeFinalizerError {
     StorageKekMissing,
     #[error("purge finalizer StorageKEK conflicts with its frozen binding")]
     StorageKekConflict,
+    #[error("purge finalizer authenticated CounterGuard manifest is invalid")]
+    CounterGuardManifestInvalid,
+    #[error("purge finalizer CounterGuard manifest conflicts with its frozen binding")]
+    CounterGuardManifestConflict,
+    #[error("purge finalizer CounterGuard cleanup failed")]
+    CounterGuardCleanupFailed,
     #[error("purge finalizer deletion readback failed")]
     DeleteReadbackFailed,
     #[error("purge finalizer marker-missing terminal proof failed")]
@@ -1943,6 +2089,7 @@ impl PurgeFinalizerError {
             Self::PlanMismatch => "daemon.purge.plan_mismatch",
             Self::MarkerMissing => "daemon.purge.marker_missing",
             Self::MarkerInvalid => "daemon.purge.marker_invalid",
+            Self::MarkerVersionUnsupported => "daemon.purge.marker_version_unsupported",
             Self::MarkerConflict => "daemon.purge.marker_conflict",
             Self::MarkerUnauthorized => "daemon.purge.marker_unauthorized",
             Self::MarkerPersistence => "daemon.purge.marker_persistence_failed",
@@ -1955,6 +2102,9 @@ impl PurgeFinalizerError {
             Self::KeyItemConflict => "daemon.purge.key_item_conflict",
             Self::StorageKekMissing => "daemon.purge.storage_kek_missing",
             Self::StorageKekConflict => "daemon.purge.storage_kek_conflict",
+            Self::CounterGuardManifestInvalid => "daemon.purge.counter_guard_manifest_invalid",
+            Self::CounterGuardManifestConflict => "daemon.purge.counter_guard_manifest_conflict",
+            Self::CounterGuardCleanupFailed => "daemon.purge.counter_guard_cleanup_failed",
             Self::DeleteReadbackFailed => "daemon.purge.delete_readback_failed",
             Self::TerminalProofFailed => "daemon.purge.terminal_proof_failed",
             Self::Synchronization => "daemon.purge.synchronization_failed",

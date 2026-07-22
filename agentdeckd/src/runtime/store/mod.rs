@@ -8,9 +8,14 @@ pub mod cipher;
 mod command_configuration;
 mod command_event;
 mod configuration;
+mod conversation_activation;
+pub(crate) mod directed_reply;
 mod execution_event;
 pub mod identity;
 mod journal;
+pub(crate) mod key_transition;
+#[cfg(test)]
+mod key_transition_tests;
 mod machine_identity;
 mod machine_remote;
 mod metadata;
@@ -27,6 +32,7 @@ mod native_projection_lifecycle_tests;
 )]
 pub(crate) mod pairing;
 mod pairing_authorization;
+pub(crate) mod transition_material;
 #[allow(
     unused_imports,
     reason = "P4.4 RemoteLink 与 P4.5 publisher 在后续同阶段 slice 消费这些 capability"
@@ -40,14 +46,19 @@ mod pairing_delivery;
 mod pairing_delivery_tests;
 #[cfg(test)]
 pub(crate) use pairing_delivery_tests::{
-    active_authorization_store_for_test, active_authorization_store_with_permissions_for_test,
-    revoking_authorization_store_for_test,
+    active_authorization_store_for_test,
+    active_authorization_store_with_pending_transition_for_test,
+    active_authorization_store_with_permissions_for_test,
+    pending_new_device_transition_fixture_for_test,
+    production_aligned_active_authorization_store_for_test, revoking_authorization_store_for_test,
     two_active_authorization_store_with_permissions_for_test,
 };
 pub(crate) mod pairing_grant;
 mod pairing_grant_allocation;
 #[cfg(test)]
 mod pairing_grant_allocation_tests;
+#[cfg(test)]
+pub(crate) use pairing_grant_allocation_tests::complete_active_membership_transition;
 mod pairing_grant_commit;
 #[cfg(test)]
 mod pairing_grant_commit_tests;
@@ -55,7 +66,9 @@ mod pairing_grant_renewal;
 #[cfg(test)]
 mod pairing_grant_tests;
 #[cfg(test)]
-pub(crate) use pairing_grant_tests::grant_input_with as grant_input_with_for_test;
+pub(crate) use pairing_grant_tests::{
+    complete_active_zero_cut_transition, grant_input_with as grant_input_with_for_test,
+};
 mod pairing_grant_tx;
 pub(crate) use pairing_delivery::{
     AcknowledgePairResponseReceived, AcknowledgePairResponseReceivedOutcome,
@@ -101,17 +114,31 @@ mod pairing_tests;
 #[cfg(test)]
 pub(crate) use pairing_tests::{RELAY as PAIRING_TEST_RELAY, make_active as make_active_for_test};
 mod persisted_event;
-mod publication;
+pub(crate) mod publication;
 pub mod queue;
 mod recovery;
+pub(crate) mod remote_counter;
+pub(crate) use remote_counter::ActiveSenderCounterBinding;
+pub(crate) mod remote_counter_guard_manifest;
+#[cfg(test)]
+mod remote_counter_guard_manifest_tests;
+#[cfg(test)]
+mod remote_counter_tests;
 #[cfg(test)]
 mod remote_ingress_tests;
+pub(crate) mod remote_replay;
+mod retired_key;
+pub(crate) use pairing_grant::{RetiredKeyOwnerKind, RetiredSharedKeyOwner};
+pub(crate) use retired_key::{RetiredKeyGcOutcome, RetiredKeyMutationOutcome};
 pub(crate) mod retention;
+#[cfg(test)]
+mod retired_key_tests;
 mod schema;
 pub(crate) mod sequence;
 mod snapshot;
 pub(crate) use snapshot::decode_catalog_baseline;
 mod sqlite;
+pub(crate) use sqlite::read_authenticated_counter_guard_manifest_existing_only;
 mod stream;
 mod worker;
 

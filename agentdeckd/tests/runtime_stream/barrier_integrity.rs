@@ -10,6 +10,9 @@ async fn ready_snapshot_authenticated_base_is_captured_with_later_high_water() {
     let started_event_id = runtime_id(RuntimeIdKind::Event, 0x49);
     let store = RuntimeStoreHandle::open(
         RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA0),
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA1),
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0xA2),
             configuration_event_id,
             command_id,
             turn_id,
@@ -101,7 +104,9 @@ async fn snapshot_build_pin_is_bound_to_barrier_captured_h() {
         .expect("empty conversation must capture an exact-H build source");
     let pin = match source.source() {
         SnapshotBarrierSource::Build(pin) => pin.clone(),
-        SnapshotBarrierSource::Ready(_) | SnapshotBarrierSource::Dynamic(_) => {
+        SnapshotBarrierSource::Ready(_)
+        | SnapshotBarrierSource::TransitionBuild(_)
+        | SnapshotBarrierSource::Dynamic(_) => {
             panic!("empty conversation must capture an exact-H build source")
         }
     };
@@ -176,7 +181,9 @@ async fn ready_snapshot_reference_is_exact_and_replacement_safe() {
         .expect("ready snapshot must return an exact reference");
     let reference = match source.source() {
         SnapshotBarrierSource::Ready(reference) => reference.clone(),
-        SnapshotBarrierSource::Build(_) | SnapshotBarrierSource::Dynamic(_) => {
+        SnapshotBarrierSource::Build(_)
+        | SnapshotBarrierSource::TransitionBuild(_)
+        | SnapshotBarrierSource::Dynamic(_) => {
             panic!("ready snapshot must return an exact reference")
         }
     };
@@ -775,8 +782,22 @@ async fn publication_binding_tamper_is_rejected_before_barrier_can_fallback_to_d
  {
     let root = TestRoot::new("publication-binding-live-tamper");
     let keys = MemoryKeyStore::new();
+    let conversation_publication_stream_id = [0x8d_u8; 16];
+    let conversation_publication_generation = [0x8f_u8; 16];
     let store = RuntimeStoreHandle::open(
-        RuntimeStoreConfig::new(root.database()),
+        RuntimeStoreConfig::new(root.database()).with_id_source(SequenceIdSource::new([
+            RuntimeId::from_bytes(
+                RuntimeIdKind::RemoteOutbox,
+                conversation_publication_stream_id,
+            )
+            .expect("conversation publication stream id"),
+            runtime_id(RuntimeIdKind::RemoteOutbox, 0x8e),
+            RuntimeId::from_bytes(
+                RuntimeIdKind::RemoteOutbox,
+                conversation_publication_generation,
+            )
+            .expect("conversation publication generation"),
+        ])),
         root.storage_kek(&keys),
     )
     .await
@@ -787,6 +808,20 @@ async fn publication_binding_tamper_is_rejected_before_barrier_can_fallback_to_d
         .create_conversation(conversation)
         .await
         .expect("create catalog revision zero and valid replacement parent");
+    store
+        .freeze_publication(FreezePublicationRequest {
+            publication_id: [0x8c; 16],
+            publication_stream_id: conversation_publication_stream_id,
+            generation: conversation_publication_generation,
+            counter_scope_token: [0x8b; 32],
+            sender_counter: u64::MAX,
+            inner_after: None,
+            inner_through: None,
+            payload_kind: PublicationPayloadKind::Control,
+            blob: b"terminal-valid-conversation-publication".to_vec(),
+        })
+        .await
+        .expect("freeze terminal conversation publication and release active binding");
     let publication_stream_id = [0x90_u8; 16];
     let generation = [0x91_u8; 16];
     store

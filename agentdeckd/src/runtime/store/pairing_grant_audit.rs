@@ -102,8 +102,11 @@ pub(in crate::runtime::store) fn authenticate_grant_directory(
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
-    let active = super::super::pairing::active_machine(connection, key_bundle, database_id)
-        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let active = super::super::machine_remote::machine_authority_for_integrity(
+        connection,
+        key_bundle,
+        database_id,
+    )?;
     validate_authorization_histories(&directory.authorizations)?;
     for authorization in &directory.authorizations {
         validate_durable_authorization(authorization, global, &active)?;
@@ -319,7 +322,9 @@ pub(in crate::runtime::store) fn authenticate_grant_directory(
                 .expose_secret(),
         )
         .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-        if key_directory.revision.value() != authorization.key_directory_revision
+        // PairResponse 中的 bootstrap directory 是不可变历史证据；成员轮换只推进
+        // authenticated authorization ledger 的 current revision，不能重签旧 response。
+        if key_directory.revision.value() > authorization.key_directory_revision
             || response.canonical_sha256().ok() != Some(response_hash)
         {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);

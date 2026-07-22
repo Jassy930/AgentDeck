@@ -29,8 +29,11 @@ struct AuthenticatedMachineCleanup {
     binding: MachineIdentityBinding,
     reset_kind: MachineTrustResetKind,
     purge_proof_hash: [u8; 32],
-    /// P4.2 尚未创建 active symmetric-key reservation；空集合是当前 production
-    /// authenticated 结果。P4.3 接入 key directory 后由 Store 填入真实 axes。
+    /// Store authenticated manifest 中按 token 排序的 V2 CounterGuard scopes；布尔值
+    /// 表示该 scope 已在 exact guard readback 后单调提升为 Materialized。
+    counter_guard_scopes: Vec<([u8; 32], bool)>,
+    /// 旧版 `KeyId` 轴只用于兼容清理已存在的 V1 guard；新写入一律使用上面的
+    /// authenticated V2 scope manifest。
     counter_guard_axes: Vec<KeyId>,
 }
 
@@ -82,6 +85,8 @@ impl MachineCleanupStore for RuntimeStoreHandle {
             .ok_or(RuntimeStoreError::MachineRemoteConflict)?;
         match state {
             MachineEnrollmentState::PurgeReadbackAbsent(state) => {
+                let counter_guard_scopes =
+                    self.load_remote_counter_guard_cleanup_manifest().await?;
                 let purge_proof_hash = match (&state.reset_kind, &state.proof) {
                     (
                         MachineTrustResetKind::RootPresent,
@@ -99,6 +104,7 @@ impl MachineCleanupStore for RuntimeStoreHandle {
                     binding: state.binding,
                     reset_kind: state.reset_kind,
                     purge_proof_hash,
+                    counter_guard_scopes,
                     counter_guard_axes: Vec::new(),
                 };
                 cleanup.witness()?;
@@ -242,6 +248,7 @@ impl MachineCleanupWorkflow {
                 cleanup.database_id,
                 &cleanup.binding,
                 cleanup.reset_kind,
+                &cleanup.counter_guard_scopes,
                 &cleanup.counter_guard_axes,
             )?;
             store

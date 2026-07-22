@@ -2,7 +2,10 @@
 
 use std::sync::OnceLock;
 
+use agentdeck_protocol::e2ee::KEY_UPDATE_SET_MAX_CANONICAL_BYTES;
 use sha2::{Digest, Sha256};
+
+use super::cipher::ROW_BLOB_V1_OVERHEAD_LEN;
 
 pub const RUNTIME_SCHEMA_FAMILY: &str = "agentdeck-runtime";
 pub const RUNTIME_SCHEMA_VERSION_V5: u32 = 5;
@@ -11,7 +14,17 @@ pub const RUNTIME_SCHEMA_VERSION_V7: u32 = 7;
 pub const RUNTIME_SCHEMA_VERSION_V8: u32 = 8;
 pub const RUNTIME_SCHEMA_VERSION_V9: u32 = 9;
 pub const RUNTIME_SCHEMA_VERSION_V10: u32 = 10;
-pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V10;
+pub const RUNTIME_SCHEMA_VERSION_V11: u32 = 11;
+pub const RUNTIME_SCHEMA_VERSION_V12: u32 = 12;
+pub const RUNTIME_SCHEMA_VERSION_V13: u32 = 13;
+pub const RUNTIME_SCHEMA_VERSION_V14: u32 = 14;
+pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V14;
+/// 协议允许的最大 canonical KeyUpdateSet；Store admission 与 physical CHECK 共用此事实源。
+pub const RUNTIME_KEY_UPDATE_MAX_CANONICAL_BYTES: usize = KEY_UPDATE_SET_MAX_CANONICAL_BYTES;
+/// ADKU codec 的最大明文；physical sealed-state CHECK 还必须加固定行密文开销。
+pub const RUNTIME_KEY_UPDATE_MAX_PLAINTEXT_BYTES: usize = 1024 * 1024;
+pub const RUNTIME_KEY_UPDATE_MAX_SEALED_STATE_BYTES: usize =
+    RUNTIME_KEY_UPDATE_MAX_PLAINTEXT_BYTES + ROW_BLOB_V1_OVERHEAD_LEN;
 /// 行密文与 wrapped key bundle 的 AAD context 版本。
 ///
 /// physical schema migration 只增表/增认证计数，不得让既有行重新加密或重新包装。
@@ -61,6 +74,14 @@ pub const RUNTIME_LEDGER_DOMAIN_V8: &[u8] = b"runtime.meta.ledger.v8";
 pub const RUNTIME_LEDGER_DOMAIN_V9: &[u8] = b"runtime.meta.ledger.v9";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const RUNTIME_LEDGER_DOMAIN_V10: &[u8] = b"runtime.meta.ledger.v10";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V11: &[u8] = b"runtime.meta.ledger.v11";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V12: &[u8] = b"runtime.meta.ledger.v12";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V13: &[u8] = b"runtime.meta.ledger.v13";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V14: &[u8] = b"runtime.meta.ledger.v14";
 pub const EXPECTED_TABLES_V1: [&str; 7] = [
     "commands",
     "conversations",
@@ -267,10 +288,165 @@ pub const EXPECTED_TABLES_V10: [&str; 30] = [
     "runtime_meta",
     "snapshots",
 ];
-pub const EXPECTED_TABLES: [&str; 30] = EXPECTED_TABLES_V10;
+pub const EXPECTED_TABLES_V11: [&str; 32] = [
+    "admin_commands",
+    "approval_ledger",
+    "catalog_journal",
+    "claude_code_adapter_state",
+    "codex_adapter_state",
+    "command_configuration_pins",
+    "commands",
+    "configuration_journal",
+    "conversation_state",
+    "conversations",
+    "event_journal",
+    "event_retention",
+    "event_stream_index",
+    "execution_fences",
+    "execution_intents",
+    "machine_enrollment_receipts",
+    "machine_identity_state",
+    "machine_remote_state",
+    "metadata_mutation_ledger",
+    "native_metadata_effect_fences",
+    "native_projection_state",
+    "publication_outbox",
+    "publication_streams",
+    "remote_authorization_ledger",
+    "remote_control_outbox",
+    "remote_counter_states",
+    "remote_key_directory",
+    "remote_pairing_receipts",
+    "remote_pairings",
+    "remote_replay_states",
+    "runtime_meta",
+    "snapshots",
+];
+pub const EXPECTED_TABLES_V12: [&str; 35] = [
+    "admin_commands",
+    "approval_ledger",
+    "catalog_journal",
+    "claude_code_adapter_state",
+    "codex_adapter_state",
+    "command_configuration_pins",
+    "commands",
+    "configuration_journal",
+    "conversation_state",
+    "conversations",
+    "event_journal",
+    "event_retention",
+    "event_stream_index",
+    "execution_fences",
+    "execution_intents",
+    "machine_enrollment_receipts",
+    "machine_identity_state",
+    "machine_remote_state",
+    "metadata_mutation_ledger",
+    "native_metadata_effect_fences",
+    "native_projection_state",
+    "publication_outbox",
+    "publication_streams",
+    "remote_authorization_ledger",
+    "remote_control_outbox",
+    "remote_counter_guard_manifest",
+    "remote_counter_states",
+    "remote_key_directory",
+    "remote_key_transitions",
+    "remote_key_update_outbox",
+    "remote_pairing_receipts",
+    "remote_pairings",
+    "remote_replay_states",
+    "runtime_meta",
+    "snapshots",
+];
+pub const EXPECTED_TABLES_V13: [&str; 35] = EXPECTED_TABLES_V12;
+pub const EXPECTED_TABLES_V14: [&str; 35] = EXPECTED_TABLES_V13;
+pub const EXPECTED_TABLES: [&str; 35] = EXPECTED_TABLES_V14;
 
 pub fn schema_signature() -> [u8; 32] {
-    schema_signature_v10()
+    schema_signature_v14()
+}
+
+pub fn schema_signature_v14() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V4.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V5.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V6.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V7.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V8.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V9.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V10.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V11.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V12.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V13.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V14.as_bytes());
+        digest.finalize().into()
+    })
+}
+
+pub fn schema_signature_v13() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V4.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V5.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V6.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V7.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V8.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V9.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V10.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V11.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V12.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V13.as_bytes());
+        digest.finalize().into()
+    })
+}
+
+pub fn schema_signature_v12() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V4.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V5.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V6.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V7.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V8.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V9.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V10.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V11.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V12.as_bytes());
+        digest.finalize().into()
+    })
+}
+
+pub fn schema_signature_v11() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V4.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V5.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V6.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V7.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V8.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V9.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V10.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V11.as_bytes());
+        digest.finalize().into()
+    })
 }
 
 pub fn schema_signature_v10() -> [u8; 32] {
@@ -2007,6 +2183,635 @@ CREATE INDEX idx_remote_control_outbox_recovery
     ON remote_control_outbox(lifecycle, operation_kind, created_at_ms, outbox_id);
 "#;
 
+/// P4.5 additive v11 physical shape。
+///
+/// replay window 的完整 scope、counter→ciphertext hash map 与 retention pins 只进入
+/// `sealed_state`；SQLite 仅暴露 blind-index scope token 和经过 metadata MAC 绑定的
+/// GC 投影。CounterGuard 的 Runtime DB 侧状态在同一 physical bump 预留，避免发布
+/// 接线随后再升 v12。既有 row/ciphertext、wrapped key bundle 与 crypto context 均不改写。
+pub const RUNTIME_MIGRATION_V11: &str = r#"
+ALTER TABLE runtime_meta ADD COLUMN remote_replay_scope_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_replay_scope_count BETWEEN 0 AND 4096);
+ALTER TABLE runtime_meta ADD COLUMN remote_replay_retired_scope_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_replay_retired_scope_count BETWEEN 0 AND remote_replay_scope_count);
+ALTER TABLE runtime_meta ADD COLUMN remote_replay_pin_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_replay_pin_count BETWEEN 0 AND 1048576);
+ALTER TABLE runtime_meta ADD COLUMN remote_replay_sealed_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_replay_sealed_bytes BETWEEN 0 AND 1073741824)
+    CHECK((remote_replay_scope_count = 0 AND remote_replay_sealed_bytes = 0)
+       OR (remote_replay_scope_count > 0 AND remote_replay_sealed_bytes > 0));
+
+ALTER TABLE runtime_meta ADD COLUMN remote_counter_state_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_counter_state_count BETWEEN 0 AND 4096);
+ALTER TABLE runtime_meta ADD COLUMN remote_counter_state_sealed_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_counter_state_sealed_bytes BETWEEN 0 AND 1073741824)
+    CHECK((remote_counter_state_count = 0 AND remote_counter_state_sealed_bytes = 0)
+       OR (remote_counter_state_count > 0 AND remote_counter_state_sealed_bytes > 0));
+
+CREATE TABLE remote_replay_states (
+    scope_token BLOB PRIMARY KEY NOT NULL CHECK(
+        typeof(scope_token) = 'blob' AND length(scope_token) = 32
+        AND scope_token <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    retired_at_ms INTEGER CHECK(
+        retired_at_ms IS NULL OR retired_at_ms BETWEEN 0 AND 9223372036764775807
+    ),
+    sealed_state BLOB NOT NULL CHECK(
+        typeof(sealed_state) = 'blob' AND length(sealed_state) BETWEEN 40 AND 262184
+    ),
+    sealed_state_bytes INTEGER NOT NULL CHECK(
+        typeof(sealed_state_bytes) = 'integer'
+        AND sealed_state_bytes = length(sealed_state)
+    ),
+    metadata_token BLOB NOT NULL CHECK(
+        typeof(metadata_token) = 'blob' AND length(metadata_token) = 32
+    )
+);
+CREATE INDEX idx_remote_replay_retired
+    ON remote_replay_states(retired_at_ms, scope_token) WHERE retired_at_ms IS NOT NULL;
+
+CREATE TABLE remote_counter_states (
+    scope_token BLOB PRIMARY KEY NOT NULL CHECK(
+        typeof(scope_token) = 'blob' AND length(scope_token) = 32
+        AND scope_token <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    purpose TEXT NOT NULL CHECK(purpose IN (
+        'catalog', 'conversationDek', 'deviceCommandTx', 'deviceReplyTx'
+    )),
+    key_epoch TEXT NOT NULL CHECK(
+        typeof(key_epoch) = 'text' AND length(key_epoch) = 20
+        AND key_epoch NOT GLOB '*[^0-9]*'
+        AND key_epoch > '00000000000000000000'
+        AND key_epoch <= '18446744073709551615'
+    ),
+    reserved_end TEXT NOT NULL CHECK(
+        typeof(reserved_end) = 'text' AND length(reserved_end) = 20
+        AND reserved_end NOT GLOB '*[^0-9]*'
+        AND reserved_end <= '18446744073709551615'
+    ),
+    reservation_id BLOB CHECK(
+        reservation_id IS NULL OR (
+            typeof(reservation_id) = 'blob' AND length(reservation_id) = 16
+            AND reservation_id <> X'00000000000000000000000000000000'
+        )
+    ),
+    db_anchor BLOB NOT NULL CHECK(
+        typeof(db_anchor) = 'blob' AND length(db_anchor) = 32
+        AND db_anchor <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active', 'retired')),
+    sealed_state BLOB NOT NULL CHECK(
+        typeof(sealed_state) = 'blob' AND length(sealed_state) BETWEEN 40 AND 262184
+    ),
+    sealed_state_bytes INTEGER NOT NULL CHECK(
+        typeof(sealed_state_bytes) = 'integer'
+        AND sealed_state_bytes = length(sealed_state)
+    ),
+    metadata_token BLOB NOT NULL CHECK(
+        typeof(metadata_token) = 'blob' AND length(metadata_token) = 32
+    )
+);
+CREATE INDEX idx_remote_counter_lifecycle
+    ON remote_counter_states(lifecycle, purpose, key_epoch, scope_token);
+"#;
+
+/// P4.5 additive v12 key-transition substrate。
+///
+/// canonical recipient roster、per-stream committed cut 与 opaque update/ACK bytes 全部进入
+/// StorageKEK 行密文；outer projection 只保留有界恢复索引，并由 metadata token 与 v12 ledger
+/// 交叉认证。旧行密文继续使用 frozen crypto context v1，不因 physical bump 重写。
+pub const RUNTIME_MIGRATION_V12: &str = r#"
+ALTER TABLE runtime_meta ADD COLUMN remote_counter_guard_manifest_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_counter_guard_manifest_count BETWEEN 0 AND 4096);
+ALTER TABLE runtime_meta ADD COLUMN remote_key_transition_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_key_transition_count BETWEEN 0 AND 4096);
+ALTER TABLE runtime_meta ADD COLUMN remote_key_transition_active_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_key_transition_active_count BETWEEN 0 AND 1
+          AND remote_key_transition_active_count <= remote_key_transition_count);
+ALTER TABLE runtime_meta ADD COLUMN remote_key_transition_sealed_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_key_transition_sealed_bytes BETWEEN 0 AND 536870912)
+    CHECK((remote_key_transition_count = 0 AND remote_key_transition_sealed_bytes = 0)
+       OR (remote_key_transition_count > 0 AND remote_key_transition_sealed_bytes > 0));
+ALTER TABLE runtime_meta ADD COLUMN remote_key_update_outbox_count INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_key_update_outbox_count BETWEEN 0 AND 65536);
+ALTER TABLE runtime_meta ADD COLUMN remote_key_update_outbox_sealed_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_key_update_outbox_sealed_bytes BETWEEN 0 AND 536870912)
+    CHECK((remote_key_update_outbox_count = 0 AND remote_key_update_outbox_sealed_bytes = 0)
+       OR (remote_key_update_outbox_count > 0 AND remote_key_update_outbox_sealed_bytes > 0));
+
+CREATE TABLE remote_counter_guard_manifest (
+    scope_token BLOB PRIMARY KEY NOT NULL CHECK(
+        typeof(scope_token) = 'blob' AND length(scope_token) = 32
+        AND scope_token <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    phase TEXT NOT NULL CHECK(phase IN ('reserved', 'materialized')),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32)
+);
+
+CREATE TABLE remote_key_transitions (
+    operation_id BLOB PRIMARY KEY NOT NULL CHECK(
+        typeof(operation_id) = 'blob' AND length(operation_id) = 16
+        AND operation_id <> X'00000000000000000000000000000000'
+    ),
+    active_slot INTEGER NOT NULL DEFAULT 1 CHECK(active_slot = 1),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    operation_kind TEXT NOT NULL CHECK(operation_kind IN (
+        'Add', 'Renew', 'Revoke', 'ActivateConversation', 'CounterRecovery'
+    )),
+    target_device_route BLOB CHECK(
+        target_device_route IS NULL OR (typeof(target_device_route) = 'blob'
+        AND length(target_device_route) = 16
+        AND target_device_route <> X'00000000000000000000000000000000')
+    ),
+    target_grant_serial TEXT CHECK(
+        target_grant_serial IS NULL OR (typeof(target_grant_serial) = 'text'
+        AND length(target_grant_serial) = 20
+        AND target_grant_serial NOT GLOB '*[^0-9]*'
+        AND target_grant_serial > '00000000000000000000'
+        AND target_grant_serial <= '18446744073709551615')
+    ),
+    target_conversation_id BLOB CHECK(
+        target_conversation_id IS NULL OR (typeof(target_conversation_id) = 'blob'
+        AND length(target_conversation_id) = 16
+        AND target_conversation_id <> X'00000000000000000000000000000000')
+    ),
+    target_stream_route BLOB CHECK(
+        target_stream_route IS NULL OR (typeof(target_stream_route) = 'blob'
+        AND length(target_stream_route) = 16
+        AND target_stream_route <> X'00000000000000000000000000000000')
+    ),
+    from_revision TEXT NOT NULL CHECK(
+        typeof(from_revision) = 'text' AND length(from_revision) = 20
+        AND from_revision NOT GLOB '*[^0-9]*'
+        AND from_revision <= '18446744073709551615'
+    ),
+    to_revision TEXT NOT NULL CHECK(
+        typeof(to_revision) = 'text' AND length(to_revision) = 20
+        AND to_revision NOT GLOB '*[^0-9]*'
+        AND to_revision > '00000000000000000000'
+        AND to_revision <= '18446744073709551615'
+    ),
+    phase TEXT NOT NULL CHECK(phase IN (
+        'DrainingOld', 'RotatedPreparingUpdates', 'UpdatesFrozen',
+        'BarriersFrozen', 'BarriersCommitted', 'Complete'
+    )),
+    terminal_kind TEXT CHECK(terminal_kind IS NULL OR terminal_kind IN ('Completed', 'Cancelled')),
+    recipient_count INTEGER NOT NULL CHECK(recipient_count BETWEEN 0 AND 256),
+    stream_count INTEGER NOT NULL CHECK(stream_count BETWEEN 0 AND 1025),
+    update_count INTEGER NOT NULL CHECK(update_count BETWEEN 0 AND recipient_count),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms BETWEEN 0 AND 9223372034262775807),
+    state_changed_at_ms INTEGER NOT NULL CHECK(state_changed_at_ms >= created_at_ms),
+    terminal_at_ms INTEGER CHECK(
+        terminal_at_ms IS NULL OR terminal_at_ms BETWEEN state_changed_at_ms AND 9223372034262775807
+    ),
+    retain_until_ms INTEGER CHECK(
+        retain_until_ms IS NULL OR retain_until_ms BETWEEN terminal_at_ms AND 9223372036854775807
+    ),
+    sealed_state BLOB NOT NULL CHECK(
+        typeof(sealed_state) = 'blob' AND length(sealed_state) BETWEEN 40 AND 524328
+    ),
+    sealed_state_bytes INTEGER NOT NULL CHECK(
+        typeof(sealed_state_bytes) = 'integer' AND sealed_state_bytes = length(sealed_state)
+    ),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    CHECK((operation_kind IN ('Add', 'Renew', 'Revoke')
+              AND target_device_route IS NOT NULL AND target_grant_serial IS NOT NULL
+              AND target_conversation_id IS NULL AND target_stream_route IS NULL)
+          OR (operation_kind = 'ActivateConversation'
+              AND target_device_route IS NULL AND target_grant_serial IS NULL
+              AND target_conversation_id IS NOT NULL AND target_stream_route IS NOT NULL)
+          OR (operation_kind = 'CounterRecovery'
+              AND ((target_device_route IS NOT NULL AND target_grant_serial IS NOT NULL
+                    AND target_conversation_id IS NULL AND target_stream_route IS NULL)
+                OR (target_device_route IS NULL AND target_grant_serial IS NULL
+                    AND target_conversation_id IS NOT NULL AND target_stream_route IS NOT NULL)))),
+    CHECK((phase = 'Complete' AND terminal_kind IS NOT NULL
+              AND terminal_at_ms IS NOT NULL AND retain_until_ms IS NOT NULL)
+          OR (phase <> 'Complete' AND terminal_kind IS NULL
+              AND terminal_at_ms IS NULL AND retain_until_ms IS NULL)),
+    CHECK((phase IN ('DrainingOld', 'RotatedPreparingUpdates') AND update_count = 0)
+          OR phase NOT IN ('DrainingOld', 'RotatedPreparingUpdates')),
+    CHECK((phase IN ('DrainingOld', 'RotatedPreparingUpdates', 'UpdatesFrozen') AND stream_count = 0)
+          OR phase NOT IN ('DrainingOld', 'RotatedPreparingUpdates', 'UpdatesFrozen'))
+);
+CREATE UNIQUE INDEX idx_remote_key_transition_active
+    ON remote_key_transitions(active_slot) WHERE phase <> 'Complete';
+CREATE INDEX idx_remote_key_transition_recovery
+    ON remote_key_transitions(phase, state_changed_at_ms, operation_id);
+CREATE INDEX idx_remote_key_transition_retention
+    ON remote_key_transitions(retain_until_ms, operation_id) WHERE phase = 'Complete';
+
+CREATE TABLE remote_key_update_outbox (
+    operation_id BLOB NOT NULL CHECK(
+        typeof(operation_id) = 'blob' AND length(operation_id) = 16
+        AND operation_id <> X'00000000000000000000000000000000'
+    ),
+    device_route BLOB NOT NULL CHECK(
+        typeof(device_route) = 'blob' AND length(device_route) = 16
+        AND device_route <> X'00000000000000000000000000000000'
+    ),
+    grant_serial TEXT NOT NULL CHECK(
+        typeof(grant_serial) = 'text' AND length(grant_serial) = 20
+        AND grant_serial NOT GLOB '*[^0-9]*'
+        AND grant_serial > '00000000000000000000'
+        AND grant_serial <= '18446744073709551615'
+    ),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    key_revision TEXT NOT NULL CHECK(
+        typeof(key_revision) = 'text' AND length(key_revision) = 20
+        AND key_revision NOT GLOB '*[^0-9]*'
+        AND key_revision > '00000000000000000000'
+        AND key_revision <= '18446744073709551615'
+    ),
+    lifecycle TEXT NOT NULL CHECK(lifecycle IN ('Frozen', 'Acked', 'Cancelled')),
+    update_hash BLOB NOT NULL CHECK(
+        typeof(update_hash) = 'blob' AND length(update_hash) = 32
+        AND update_hash <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    canonical_update_bytes INTEGER NOT NULL CHECK(canonical_update_bytes BETWEEN 1 AND 262144),
+    ack_hash BLOB CHECK(
+        ack_hash IS NULL OR (typeof(ack_hash) = 'blob' AND length(ack_hash) = 32
+            AND ack_hash <> X'0000000000000000000000000000000000000000000000000000000000000000')
+    ),
+    applied_ack_count INTEGER NOT NULL CHECK(applied_ack_count BETWEEN 0 AND 1025),
+    applied_ack_set_hash BLOB CHECK(
+        applied_ack_set_hash IS NULL OR (
+            typeof(applied_ack_set_hash) = 'blob' AND length(applied_ack_set_hash) = 32
+            AND applied_ack_set_hash <>
+                X'0000000000000000000000000000000000000000000000000000000000000000'
+        )
+    ),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms BETWEEN 0 AND 9223372036854775807),
+    state_changed_at_ms INTEGER NOT NULL CHECK(state_changed_at_ms >= created_at_ms),
+    sealed_state BLOB NOT NULL CHECK(
+        typeof(sealed_state) = 'blob' AND length(sealed_state) BETWEEN 40 AND 524328
+    ),
+    sealed_state_bytes INTEGER NOT NULL CHECK(
+        typeof(sealed_state_bytes) = 'integer' AND sealed_state_bytes = length(sealed_state)
+    ),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    PRIMARY KEY(operation_id, device_route, grant_serial),
+    FOREIGN KEY(operation_id) REFERENCES remote_key_transitions(operation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CHECK((lifecycle = 'Acked' AND ack_hash IS NOT NULL)
+          OR (lifecycle IN ('Frozen', 'Cancelled') AND ack_hash IS NULL)),
+    CHECK((applied_ack_count = 0 AND applied_ack_set_hash IS NULL)
+          OR (lifecycle = 'Acked' AND applied_ack_count > 0
+              AND applied_ack_set_hash IS NOT NULL))
+);
+CREATE INDEX idx_remote_key_update_recovery
+    ON remote_key_update_outbox(operation_id, lifecycle, device_route, grant_serial);
+"#;
+
+/// P4.5 v13 generation-rollover physical shape。
+///
+/// v4-v12 的 publication CHECK 将 outer 与 inner cursor 的 NULL 形态错误地绑定在
+/// 一起，无法表达 authenticated rotation baseline `(BeforeFirst, H)`。v13 在同一
+/// transaction 内重建 parent/outbox 两张表，逐列复制 opaque ciphertext、hash、token
+/// 与 wrapped key 相关字节；只放宽由 rotation lineage 表达的 inner baseline，不新增
+/// canonical state，也不重写任何行密文。
+pub const RUNTIME_MIGRATION_V13: &str = r#"
+PRAGMA defer_foreign_keys = ON;
+
+ALTER TABLE publication_outbox RENAME TO publication_outbox_v12;
+ALTER TABLE publication_streams RENAME TO publication_streams_v12;
+DROP INDEX idx_publication_pending;
+DROP INDEX idx_publication_active_catalog;
+DROP INDEX idx_publication_active_conversation;
+
+CREATE TABLE publication_streams (
+    publication_stream_id BLOB PRIMARY KEY
+        CHECK(typeof(publication_stream_id) = 'blob' AND length(publication_stream_id) = 16),
+    scope TEXT NOT NULL CHECK(scope IN ('catalog', 'conversation')),
+    conversation_id BLOB
+        CHECK(conversation_id IS NULL OR (
+            typeof(conversation_id) = 'blob' AND length(conversation_id) = 16
+        )),
+    stream_route BLOB NOT NULL
+        CHECK(typeof(stream_route) = 'blob' AND length(stream_route) = 16),
+    generation BLOB NOT NULL
+        CHECK(typeof(generation) = 'blob' AND length(generation) = 16),
+    counter_scope_token BLOB CHECK(
+        counter_scope_token IS NULL OR (
+            typeof(counter_scope_token) = 'blob' AND length(counter_scope_token) = 32
+        )
+    ),
+    sender_counter_high_water TEXT CHECK(
+        sender_counter_high_water IS NULL OR (
+            typeof(sender_counter_high_water) = 'text'
+            AND length(sender_counter_high_water) = 20
+            AND sender_counter_high_water NOT GLOB '*[^0-9]*'
+            AND sender_counter_high_water <= '18446744073709551615'
+        )
+    ),
+    reserved_high_water TEXT CHECK(
+        reserved_high_water IS NULL OR (
+            typeof(reserved_high_water) = 'text' AND length(reserved_high_water) = 20
+            AND reserved_high_water NOT GLOB '*[^0-9]*'
+            AND reserved_high_water <= '18446744073709551615'
+        )
+    ),
+    committed_high_water TEXT CHECK(
+        committed_high_water IS NULL OR (
+            typeof(committed_high_water) = 'text' AND length(committed_high_water) = 20
+            AND committed_high_water NOT GLOB '*[^0-9]*'
+            AND committed_high_water <= '18446744073709551615'
+        )
+    ),
+    committed_inner_cursor TEXT CHECK(
+        committed_inner_cursor IS NULL OR (
+            typeof(committed_inner_cursor) = 'text'
+            AND length(committed_inner_cursor) = 20
+            AND committed_inner_cursor NOT GLOB '*[^0-9]*'
+            AND committed_inner_cursor <= '18446744073709551615'
+        )
+    ),
+    acknowledged_high_water TEXT CHECK(
+        acknowledged_high_water IS NULL OR (
+            typeof(acknowledged_high_water) = 'text'
+            AND length(acknowledged_high_water) = 20
+            AND acknowledged_high_water NOT GLOB '*[^0-9]*'
+            AND acknowledged_high_water <= '18446744073709551615'
+        )
+    ),
+    acknowledged_inner_cursor TEXT CHECK(
+        acknowledged_inner_cursor IS NULL OR (
+            typeof(acknowledged_inner_cursor) = 'text'
+            AND length(acknowledged_inner_cursor) = 20
+            AND acknowledged_inner_cursor NOT GLOB '*[^0-9]*'
+            AND acknowledged_inner_cursor <= '18446744073709551615'
+        )
+    ),
+    last_acknowledged_blob_hash BLOB CHECK(
+        last_acknowledged_blob_hash IS NULL OR (
+            typeof(last_acknowledged_blob_hash) = 'blob'
+            AND length(last_acknowledged_blob_hash) = 32
+        )
+    ),
+    last_acknowledged_publication_id BLOB CHECK(
+        last_acknowledged_publication_id IS NULL OR (
+            typeof(last_acknowledged_publication_id) = 'blob'
+            AND length(last_acknowledged_publication_id) = 16
+        )
+    ),
+    last_acknowledged_request_digest BLOB CHECK(
+        last_acknowledged_request_digest IS NULL OR (
+            typeof(last_acknowledged_request_digest) = 'blob'
+            AND length(last_acknowledged_request_digest) = 32
+        )
+    ),
+    last_rotation_request_digest BLOB CHECK(
+        last_rotation_request_digest IS NULL OR (
+            typeof(last_rotation_request_digest) = 'blob'
+            AND length(last_rotation_request_digest) = 32
+        )
+    ),
+    rotation_serial TEXT NOT NULL CHECK(
+        typeof(rotation_serial) = 'text' AND length(rotation_serial) = 20
+        AND rotation_serial NOT GLOB '*[^0-9]*'
+        AND rotation_serial <= '18446744073709551615'
+    ),
+    last_committed_blob_hash BLOB CHECK(
+        last_committed_blob_hash IS NULL OR (
+            typeof(last_committed_blob_hash) = 'blob'
+            AND length(last_committed_blob_hash) = 32
+        )
+    ),
+    state TEXT NOT NULL CHECK(state IN ('active', 'needsSnapshot', 'retired')),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    CHECK((scope = 'catalog' AND conversation_id IS NULL)
+       OR (scope = 'conversation' AND conversation_id IS NOT NULL)),
+    CHECK(committed_high_water IS NULL OR reserved_high_water IS NOT NULL),
+    CHECK(committed_high_water IS NULL OR committed_high_water <= reserved_high_water),
+    CHECK(acknowledged_high_water IS NULL OR committed_high_water IS NOT NULL),
+    CHECK(acknowledged_high_water IS NULL OR acknowledged_high_water <= committed_high_water),
+    CHECK((committed_high_water IS NULL
+           AND last_committed_blob_hash IS NULL
+           AND (committed_inner_cursor IS NULL OR (
+               rotation_serial > '00000000000000000000'
+               AND last_rotation_request_digest IS NOT NULL
+               AND acknowledged_high_water IS NULL
+               AND acknowledged_inner_cursor IS committed_inner_cursor)))
+       OR (committed_high_water IS NOT NULL
+           AND last_committed_blob_hash IS NOT NULL)),
+    CHECK((acknowledged_high_water IS NULL
+           AND last_acknowledged_blob_hash IS NULL
+           AND (acknowledged_inner_cursor IS NULL OR (
+               rotation_serial > '00000000000000000000'
+               AND last_rotation_request_digest IS NOT NULL
+               AND committed_inner_cursor IS acknowledged_inner_cursor)))
+       OR (acknowledged_high_water IS NOT NULL
+           AND last_acknowledged_blob_hash IS NOT NULL)),
+    CHECK((counter_scope_token IS NULL AND sender_counter_high_water IS NULL)
+       OR (counter_scope_token IS NOT NULL AND sender_counter_high_water IS NOT NULL)),
+    CHECK((last_acknowledged_publication_id IS NULL
+           AND last_acknowledged_request_digest IS NULL)
+       OR (last_acknowledged_publication_id IS NOT NULL
+           AND last_acknowledged_request_digest IS NOT NULL)),
+    UNIQUE(publication_stream_id, generation),
+    UNIQUE(stream_route, generation),
+    UNIQUE(counter_scope_token),
+    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+INSERT INTO publication_streams (
+    publication_stream_id, scope, conversation_id, stream_route, generation,
+    counter_scope_token, sender_counter_high_water, reserved_high_water,
+    committed_high_water, committed_inner_cursor, acknowledged_high_water,
+    acknowledged_inner_cursor, last_acknowledged_blob_hash,
+    last_acknowledged_publication_id, last_acknowledged_request_digest,
+    last_rotation_request_digest, rotation_serial, last_committed_blob_hash,
+    state, created_at_ms, updated_at_ms, metadata_token
+)
+SELECT publication_stream_id, scope, conversation_id, stream_route, generation,
+       counter_scope_token, sender_counter_high_water, reserved_high_water,
+       committed_high_water, committed_inner_cursor, acknowledged_high_water,
+       acknowledged_inner_cursor, last_acknowledged_blob_hash,
+       last_acknowledged_publication_id, last_acknowledged_request_digest,
+       last_rotation_request_digest, rotation_serial, last_committed_blob_hash,
+       state, created_at_ms, updated_at_ms, metadata_token
+FROM publication_streams_v12;
+
+CREATE UNIQUE INDEX idx_publication_active_catalog
+    ON publication_streams(scope) WHERE scope = 'catalog' AND state = 'active';
+CREATE UNIQUE INDEX idx_publication_active_conversation
+    ON publication_streams(conversation_id)
+    WHERE scope = 'conversation' AND state = 'active';
+
+CREATE TABLE publication_outbox (
+    publication_id BLOB PRIMARY KEY
+        CHECK(typeof(publication_id) = 'blob' AND length(publication_id) = 16),
+    publication_stream_id BLOB NOT NULL
+        CHECK(typeof(publication_stream_id) = 'blob' AND length(publication_stream_id) = 16),
+    generation BLOB NOT NULL
+        CHECK(typeof(generation) = 'blob' AND length(generation) = 16),
+    stream_seq TEXT NOT NULL CHECK(
+        typeof(stream_seq) = 'text' AND length(stream_seq) = 20
+        AND stream_seq NOT GLOB '*[^0-9]*'
+        AND stream_seq <= '18446744073709551615'
+    ),
+    counter_scope_token BLOB NOT NULL
+        CHECK(typeof(counter_scope_token) = 'blob' AND length(counter_scope_token) = 32),
+    sender_counter TEXT NOT NULL CHECK(
+        typeof(sender_counter) = 'text' AND length(sender_counter) = 20
+        AND sender_counter NOT GLOB '*[^0-9]*'
+        AND sender_counter <= '18446744073709551615'
+    ),
+    inner_after_seq TEXT CHECK(
+        inner_after_seq IS NULL OR (
+            typeof(inner_after_seq) = 'text' AND length(inner_after_seq) = 20
+            AND inner_after_seq NOT GLOB '*[^0-9]*'
+            AND inner_after_seq <= '18446744073709551615'
+        )
+    ),
+    inner_through_seq TEXT CHECK(
+        inner_through_seq IS NULL OR (
+            typeof(inner_through_seq) = 'text' AND length(inner_through_seq) = 20
+            AND inner_through_seq NOT GLOB '*[^0-9]*'
+            AND inner_through_seq <= '18446744073709551615'
+        )
+    ),
+    payload_kind TEXT NOT NULL CHECK(
+        payload_kind IN ('event', 'catalog', 'snapshot', 'control')
+    ),
+    blob_sha256 BLOB NOT NULL
+        CHECK(typeof(blob_sha256) = 'blob' AND length(blob_sha256) = 32),
+    logical_blob_bytes INTEGER NOT NULL
+        CHECK(logical_blob_bytes BETWEEN 1 AND 4194304),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    sealed_publication BLOB NOT NULL CHECK(
+        typeof(sealed_publication) = 'blob'
+        AND length(sealed_publication) BETWEEN 40 AND 4194344
+    ),
+    CHECK((inner_after_seq IS NULL AND inner_through_seq IS NULL)
+       OR (inner_through_seq IS NOT NULL
+           AND (inner_after_seq IS NULL OR inner_after_seq < inner_through_seq))),
+    UNIQUE(publication_stream_id, generation, stream_seq),
+    UNIQUE(counter_scope_token, sender_counter),
+    FOREIGN KEY(publication_stream_id, generation)
+        REFERENCES publication_streams(publication_stream_id, generation)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+INSERT INTO publication_outbox (
+    publication_id, publication_stream_id, generation, stream_seq,
+    counter_scope_token, sender_counter, inner_after_seq, inner_through_seq,
+    payload_kind, blob_sha256, logical_blob_bytes, created_at_ms,
+    metadata_token, sealed_publication
+)
+SELECT publication_id, publication_stream_id, generation, stream_seq,
+       counter_scope_token, sender_counter, inner_after_seq, inner_through_seq,
+       payload_kind, blob_sha256, logical_blob_bytes, created_at_ms,
+       metadata_token, sealed_publication
+FROM publication_outbox_v12;
+
+CREATE INDEX idx_publication_pending
+    ON publication_outbox(publication_stream_id, generation, stream_seq);
+
+DROP TABLE publication_outbox_v12;
+DROP TABLE publication_streams_v12;
+"#;
+
+/// P4.5 v14 key-update capacity shape。
+///
+/// 最大合法 `KeyUpdateSetV1` 为 277,297 bytes；v12/v13 的 256 KiB CHECK 会在
+/// Store admission 之后拒绝协议合法值。完整 ACK、1,025 个 applied ACK 与 1,025 个
+/// snapshot flush marker 的 ADKU plaintext 也会超过旧 512 KiB。迁移只重建 outbox
+/// 的物理 CHECK，逐列复制既有 opaque ciphertext/hash/token，crypto context 保持 v1。
+pub const RUNTIME_MIGRATION_V14: &str = r#"
+PRAGMA defer_foreign_keys = ON;
+
+ALTER TABLE remote_key_update_outbox RENAME TO remote_key_update_outbox_v13;
+DROP INDEX idx_remote_key_update_recovery;
+
+CREATE TABLE remote_key_update_outbox (
+    operation_id BLOB NOT NULL CHECK(
+        typeof(operation_id) = 'blob' AND length(operation_id) = 16
+        AND operation_id <> X'00000000000000000000000000000000'
+    ),
+    device_route BLOB NOT NULL CHECK(
+        typeof(device_route) = 'blob' AND length(device_route) = 16
+        AND device_route <> X'00000000000000000000000000000000'
+    ),
+    grant_serial TEXT NOT NULL CHECK(
+        typeof(grant_serial) = 'text' AND length(grant_serial) = 20
+        AND grant_serial NOT GLOB '*[^0-9]*'
+        AND grant_serial > '00000000000000000000'
+        AND grant_serial <= '18446744073709551615'
+    ),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    key_revision TEXT NOT NULL CHECK(
+        typeof(key_revision) = 'text' AND length(key_revision) = 20
+        AND key_revision NOT GLOB '*[^0-9]*'
+        AND key_revision > '00000000000000000000'
+        AND key_revision <= '18446744073709551615'
+    ),
+    lifecycle TEXT NOT NULL CHECK(lifecycle IN ('Frozen', 'Acked', 'Cancelled')),
+    update_hash BLOB NOT NULL CHECK(
+        typeof(update_hash) = 'blob' AND length(update_hash) = 32
+        AND update_hash <> X'0000000000000000000000000000000000000000000000000000000000000000'
+    ),
+    canonical_update_bytes INTEGER NOT NULL CHECK(canonical_update_bytes BETWEEN 1 AND 393216),
+    ack_hash BLOB CHECK(
+        ack_hash IS NULL OR (typeof(ack_hash) = 'blob' AND length(ack_hash) = 32
+            AND ack_hash <> X'0000000000000000000000000000000000000000000000000000000000000000')
+    ),
+    applied_ack_count INTEGER NOT NULL CHECK(applied_ack_count BETWEEN 0 AND 1025),
+    applied_ack_set_hash BLOB CHECK(
+        applied_ack_set_hash IS NULL OR (
+            typeof(applied_ack_set_hash) = 'blob' AND length(applied_ack_set_hash) = 32
+            AND applied_ack_set_hash <>
+                X'0000000000000000000000000000000000000000000000000000000000000000'
+        )
+    ),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms BETWEEN 0 AND 9223372036854775807),
+    state_changed_at_ms INTEGER NOT NULL CHECK(state_changed_at_ms >= created_at_ms),
+    sealed_state BLOB NOT NULL CHECK(
+        typeof(sealed_state) = 'blob' AND length(sealed_state) BETWEEN 40 AND 1048616
+    ),
+    sealed_state_bytes INTEGER NOT NULL CHECK(
+        typeof(sealed_state_bytes) = 'integer' AND sealed_state_bytes = length(sealed_state)
+    ),
+    metadata_token BLOB NOT NULL CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    PRIMARY KEY(operation_id, device_route, grant_serial),
+    FOREIGN KEY(operation_id) REFERENCES remote_key_transitions(operation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CHECK((lifecycle = 'Acked' AND ack_hash IS NOT NULL)
+          OR (lifecycle IN ('Frozen', 'Cancelled') AND ack_hash IS NULL)),
+    CHECK((applied_ack_count = 0 AND applied_ack_set_hash IS NULL)
+          OR (lifecycle = 'Acked' AND applied_ack_count > 0
+              AND applied_ack_set_hash IS NOT NULL))
+);
+
+INSERT INTO remote_key_update_outbox (
+    operation_id, device_route, grant_serial, database_id,
+    key_revision, lifecycle, update_hash, canonical_update_bytes,
+    ack_hash, applied_ack_count, applied_ack_set_hash,
+    created_at_ms, state_changed_at_ms, sealed_state,
+    sealed_state_bytes, metadata_token
+)
+SELECT operation_id, device_route, grant_serial, database_id,
+       key_revision, lifecycle, update_hash, canonical_update_bytes,
+       ack_hash, applied_ack_count, applied_ack_set_hash,
+       created_at_ms, state_changed_at_ms, sealed_state,
+       sealed_state_bytes, metadata_token
+FROM remote_key_update_outbox_v13;
+
+DROP TABLE remote_key_update_outbox_v13;
+
+CREATE INDEX idx_remote_key_update_recovery
+    ON remote_key_update_outbox(operation_id, lifecycle, device_route, grant_serial);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2192,9 +2997,21 @@ mod tests {
             .expect("read table SQL")
     }
 
+    fn check_upper_bound(sql: &str, marker: &str) -> usize {
+        let tail = sql
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("missing CHECK marker: {marker}"))
+            .1;
+        let digits = tail
+            .split(|character: char| !character.is_ascii_digit())
+            .next()
+            .expect("CHECK upper bound digits");
+        digits.parse().expect("numeric CHECK upper bound")
+    }
+
     #[test]
     fn stream_schema_advances_to_v4_with_six_bounded_store_tables() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V10);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         for table in [
             "event_stream_index",
@@ -2210,7 +3027,7 @@ mod tests {
 
     #[test]
     fn approval_physical_schema_remains_v3_compatible_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V10);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V3.len(), 10);
         assert!(EXPECTED_TABLES_V3.contains(&"approval_ledger"));
@@ -2286,9 +3103,74 @@ mod tests {
         connection
     }
 
+    fn v11_structural_connection() -> Connection {
+        let connection = v10_structural_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V11)
+            .expect("apply v11 structural migration");
+        connection
+    }
+
+    fn v12_structural_connection() -> Connection {
+        let connection = v11_structural_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V12)
+            .expect("apply v12 structural migration");
+        connection
+    }
+
+    fn v13_structural_connection() -> Connection {
+        let connection = v12_structural_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V13)
+            .expect("apply v13 structural migration");
+        connection
+    }
+
+    fn v14_structural_connection() -> Connection {
+        let connection = v13_structural_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V14)
+            .expect("apply v14 structural migration");
+        connection
+    }
+
+    fn insert_v13_rotation_baseline(
+        connection: &Connection,
+        identity_byte: u8,
+        committed_inner_cursor: Option<&str>,
+        acknowledged_inner_cursor: Option<&str>,
+        rotation_serial: &str,
+        last_rotation_request_digest: Option<&[u8]>,
+    ) -> rusqlite::Result<usize> {
+        let publication_stream_id = [identity_byte; 16];
+        let stream_route = [identity_byte.wrapping_add(1); 16];
+        let generation = [identity_byte.wrapping_add(2); 16];
+        let metadata_token = [identity_byte.wrapping_add(3); 32];
+        connection.execute(
+            "INSERT INTO publication_streams (
+                 publication_stream_id, scope, conversation_id, stream_route, generation,
+                 committed_inner_cursor, acknowledged_inner_cursor,
+                 last_rotation_request_digest, rotation_serial, state,
+                 created_at_ms, updated_at_ms, metadata_token
+             ) VALUES (?1, 'catalog', NULL, ?2, ?3, ?4, ?5, ?6, ?7,
+                       'retired', 0, 0, ?8)",
+            params![
+                &publication_stream_id[..],
+                &stream_route[..],
+                &generation[..],
+                committed_inner_cursor,
+                acknowledged_inner_cursor,
+                last_rotation_request_digest,
+                rotation_serial,
+                &metadata_token[..],
+            ],
+        )
+    }
+
     #[test]
     fn v6_adds_projection_and_effect_fence_sidecars_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V10);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V6, 6);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V5.len(), 20);
@@ -2319,7 +3201,7 @@ mod tests {
 
     #[test]
     fn v7_adds_machine_wide_admin_command_ledger_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V10);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V7, 7);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V7.len(), 23);
@@ -2509,13 +3391,12 @@ mod tests {
 
     #[test]
     fn v10_adds_five_bounded_remote_security_tables_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V10);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V10, 10);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V9.len(), 25);
         assert_eq!(EXPECTED_TABLES_V10.len(), 30);
-        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V10);
-        assert_eq!(schema_signature(), schema_signature_v10());
+        assert_ne!(EXPECTED_TABLES.as_slice(), EXPECTED_TABLES_V10.as_slice());
+        assert_ne!(schema_signature(), schema_signature_v10());
         assert_ne!(schema_signature_v9(), schema_signature_v10());
         assert_eq!(RUNTIME_LEDGER_DOMAIN_V10, b"runtime.meta.ledger.v10");
 
@@ -2628,6 +3509,291 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn v11_adds_authenticated_replay_and_counter_state_without_rotating_crypto_context() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION_V11, 11);
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        assert_eq!(EXPECTED_TABLES_V10.len(), 30);
+        assert_eq!(EXPECTED_TABLES_V11.len(), 32);
+        assert_ne!(EXPECTED_TABLES.as_slice(), EXPECTED_TABLES_V11.as_slice());
+        assert_ne!(schema_signature(), schema_signature_v11());
+        assert_ne!(schema_signature_v10(), schema_signature_v11());
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V11, b"runtime.meta.ledger.v11");
+
+        let connection = v11_structural_connection();
+        assert_eq!(table_names(&connection), EXPECTED_TABLES_V11);
+        assert_eq!(
+            &table_columns(&connection, "runtime_meta")
+                [table_columns(&connection, "runtime_meta").len() - 6..],
+            [
+                "remote_replay_scope_count",
+                "remote_replay_retired_scope_count",
+                "remote_replay_pin_count",
+                "remote_replay_sealed_bytes",
+                "remote_counter_state_count",
+                "remote_counter_state_sealed_bytes",
+            ]
+        );
+        assert_eq!(
+            table_columns(&connection, "remote_replay_states"),
+            [
+                "scope_token",
+                "database_id",
+                "retired_at_ms",
+                "sealed_state",
+                "sealed_state_bytes",
+                "metadata_token",
+            ]
+        );
+        assert_eq!(
+            table_columns(&connection, "remote_counter_states"),
+            [
+                "scope_token",
+                "database_id",
+                "purpose",
+                "key_epoch",
+                "reserved_end",
+                "reservation_id",
+                "db_anchor",
+                "lifecycle",
+                "sealed_state",
+                "sealed_state_bytes",
+                "metadata_token",
+            ]
+        );
+        for table in ["remote_replay_states", "remote_counter_states"] {
+            let sql = table_sql(&connection, table).to_ascii_lowercase();
+            assert!(sql.contains("database_id"));
+            assert!(sql.contains("sealed_state"));
+            assert!(sql.contains("metadata_token"));
+        }
+        assert_eq!(
+            explicit_indexes(&connection, "remote_replay_states"),
+            ["idx_remote_replay_retired"]
+        );
+        assert_eq!(
+            explicit_indexes(&connection, "remote_counter_states"),
+            ["idx_remote_counter_lifecycle"]
+        );
+    }
+
+    #[test]
+    fn v12_adds_authenticated_key_transition_and_update_outbox_without_rotating_crypto_context() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(RUNTIME_SCHEMA_VERSION_V12, 12);
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        assert_eq!(EXPECTED_TABLES_V11.len(), 32);
+        assert_eq!(EXPECTED_TABLES_V12.len(), 35);
+        assert_eq!(EXPECTED_TABLES_V13, EXPECTED_TABLES_V12);
+        assert_ne!(EXPECTED_TABLES.as_slice(), EXPECTED_TABLES_V11.as_slice());
+        assert_ne!(schema_signature(), schema_signature_v12());
+        assert_ne!(schema_signature_v11(), schema_signature_v12());
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V12, b"runtime.meta.ledger.v12");
+
+        let connection = v12_structural_connection();
+        assert_eq!(table_names(&connection), EXPECTED_TABLES_V12);
+        assert_eq!(
+            &table_columns(&connection, "runtime_meta")
+                [table_columns(&connection, "runtime_meta").len() - 6..],
+            [
+                "remote_counter_guard_manifest_count",
+                "remote_key_transition_count",
+                "remote_key_transition_active_count",
+                "remote_key_transition_sealed_bytes",
+                "remote_key_update_outbox_count",
+                "remote_key_update_outbox_sealed_bytes",
+            ]
+        );
+        let manifest_sql =
+            table_sql(&connection, "remote_counter_guard_manifest").to_ascii_lowercase();
+        assert_eq!(
+            table_columns(&connection, "remote_counter_guard_manifest"),
+            ["scope_token", "database_id", "phase", "metadata_token"]
+        );
+        assert!(manifest_sql.contains("scope_token"));
+        assert!(manifest_sql.contains("database_id"));
+        assert!(manifest_sql.contains("phase"));
+        assert!(manifest_sql.contains("'reserved'"));
+        assert!(manifest_sql.contains("'materialized'"));
+        assert!(manifest_sql.contains("metadata_token"));
+        for table in ["remote_key_transitions", "remote_key_update_outbox"] {
+            let sql = table_sql(&connection, table).to_ascii_lowercase();
+            assert!(sql.contains("database_id"));
+            assert!(sql.contains("sealed_state"));
+            assert!(sql.contains("metadata_token"));
+        }
+        let active = index_shape(
+            &connection,
+            "remote_key_transitions",
+            "idx_remote_key_transition_active",
+        );
+        assert!(active.unique);
+        assert!(active.partial);
+        assert_eq!(active.columns, ["active_slot"]);
+        assert!(active.sql.contains("WHERE phase <> 'Complete'"));
+        assert_eq!(
+            foreign_key_columns(&connection, "remote_key_update_outbox")
+                .iter()
+                .filter(|foreign| foreign.target_table == "remote_key_transitions")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn v13_rebuilds_publication_tables_and_only_accepts_authenticated_inner_baseline() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(RUNTIME_SCHEMA_VERSION_V13, 13);
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        assert_eq!(EXPECTED_TABLES_V13, EXPECTED_TABLES_V12);
+        assert_eq!(EXPECTED_TABLES_V14, EXPECTED_TABLES_V13);
+        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V14);
+        assert_ne!(schema_signature(), schema_signature_v13());
+        assert_ne!(schema_signature_v12(), schema_signature_v13());
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V13, b"runtime.meta.ledger.v13");
+
+        let connection = v13_structural_connection();
+        assert_eq!(table_names(&connection), EXPECTED_TABLES_V13);
+        assert_eq!(
+            explicit_indexes(&connection, "publication_streams"),
+            [
+                "idx_publication_active_catalog",
+                "idx_publication_active_conversation",
+            ]
+        );
+        assert_eq!(
+            explicit_indexes(&connection, "publication_outbox"),
+            ["idx_publication_pending"]
+        );
+        assert_eq!(
+            foreign_key_columns(&connection, "publication_outbox")
+                .iter()
+                .filter(|foreign| foreign.target_table == "publication_streams")
+                .count(),
+            2
+        );
+        let legacy_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name IN ('publication_streams_v12', 'publication_outbox_v12')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count temporary v12 tables");
+        assert_eq!(legacy_table_count, 0);
+        let foreign_key_violation_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("count foreign-key violations");
+        assert_eq!(foreign_key_violation_count, 0);
+
+        let inner_h = "00000000000000000042";
+        let inner_before_h = "00000000000000000041";
+        let rotation_serial = "00000000000000000001";
+        let zero_rotation_serial = "00000000000000000000";
+        let rotation_digest = [0xA5_u8; 32];
+        insert_v13_rotation_baseline(
+            &connection,
+            1,
+            Some(inner_h),
+            Some(inner_h),
+            rotation_serial,
+            Some(&rotation_digest),
+        )
+        .expect("accept authenticated (BeforeFirst, H) baseline");
+
+        for (identity_byte, committed, acknowledged, serial, digest) in [
+            (
+                10,
+                Some(inner_h),
+                Some(inner_h),
+                zero_rotation_serial,
+                Some(rotation_digest.as_slice()),
+            ),
+            (11, Some(inner_h), Some(inner_h), rotation_serial, None),
+            (
+                12,
+                Some(inner_h),
+                Some(inner_before_h),
+                rotation_serial,
+                Some(rotation_digest.as_slice()),
+            ),
+            (
+                13,
+                None,
+                Some(inner_h),
+                rotation_serial,
+                Some(rotation_digest.as_slice()),
+            ),
+        ] {
+            assert!(
+                insert_v13_rotation_baseline(
+                    &connection,
+                    identity_byte,
+                    committed,
+                    acknowledged,
+                    serial,
+                    digest,
+                )
+                .is_err(),
+                "invalid inner baseline {identity_byte} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn v14_rebuilds_key_update_outbox_with_protocol_and_codec_capacity() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(RUNTIME_SCHEMA_VERSION_V14, 14);
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        assert_eq!(EXPECTED_TABLES_V14, EXPECTED_TABLES_V13);
+        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V14);
+        assert_eq!(schema_signature(), schema_signature_v14());
+        assert_ne!(schema_signature_v13(), schema_signature_v14());
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V14, b"runtime.meta.ledger.v14");
+
+        let connection = v14_structural_connection();
+        assert_eq!(table_names(&connection), EXPECTED_TABLES_V14);
+        let update_sql = table_sql(&connection, "remote_key_update_outbox");
+        assert_eq!(
+            check_upper_bound(&update_sql, "canonical_update_bytes BETWEEN 1 AND "),
+            RUNTIME_KEY_UPDATE_MAX_CANONICAL_BYTES,
+            "SQLite canonical admission must track the protocol KeyUpdateSet cap"
+        );
+        assert_eq!(
+            check_upper_bound(&update_sql, "length(sealed_state) BETWEEN 40 AND "),
+            RUNTIME_KEY_UPDATE_MAX_SEALED_STATE_BYTES,
+            "SQLite sealed-state admission must track codec plaintext plus row overhead"
+        );
+        assert_eq!(
+            explicit_indexes(&connection, "remote_key_update_outbox"),
+            ["idx_remote_key_update_recovery"]
+        );
+        assert_eq!(
+            foreign_key_columns(&connection, "remote_key_update_outbox")
+                .iter()
+                .filter(|foreign| foreign.target_table == "remote_key_transitions")
+                .count(),
+            1
+        );
+        let legacy_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name = 'remote_key_update_outbox_v13'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count temporary v13 key-update table");
+        assert_eq!(legacy_table_count, 0);
+        let foreign_key_violation_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("count v14 foreign-key violations");
+        assert_eq!(foreign_key_violation_count, 0);
     }
 
     #[test]

@@ -432,7 +432,13 @@ pub(super) fn reconcile_catalog_journal(
     }
 
     let mut floor = previous.catalog_retention_floor.clone();
-    trim_catalog_window(transaction, key_bundle, &mut floor, trim_now_ms)?;
+    trim_catalog_window(
+        transaction,
+        key_bundle,
+        database_id,
+        &mut floor,
+        trim_now_ms,
+    )?;
     let (count, bytes): (i64, i64) = transaction.query_row(
         "SELECT COUNT(*), COALESCE(SUM(logical_delta_bytes), 0) FROM catalog_journal",
         [],
@@ -450,12 +456,14 @@ pub(super) fn reconcile_catalog_journal(
 fn trim_catalog_window(
     transaction: &Transaction<'_>,
     key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
     floor: &mut Option<String>,
     now_ms: u64,
 ) -> Result<(), RuntimeStoreError> {
     trim_catalog_window_with_limits(
         transaction,
         key_bundle,
+        database_id,
         floor,
         now_ms,
         MAX_CATALOG_DELTAS,
@@ -463,9 +471,10 @@ fn trim_catalog_window(
     )
 }
 
-fn trim_catalog_window_with_limits(
+pub(super) fn trim_catalog_window_with_limits(
     transaction: &Transaction<'_>,
     key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
     floor: &mut Option<String>,
     now_ms: u64,
     max_deltas: u64,
@@ -494,6 +503,7 @@ fn trim_catalog_window_with_limits(
         super::retention::authorize_trim(
             transaction,
             key_bundle,
+            database_id,
             super::retention::RetentionTarget::Catalog,
             &victim,
             now_ms,
@@ -875,6 +885,7 @@ mod tests {
             trim_catalog_window_with_limits(
                 &transaction,
                 state.key_bundle.as_ref(),
+                state.database_id,
                 &mut floor,
                 10,
                 1,
@@ -934,6 +945,7 @@ mod tests {
             trim_catalog_window_with_limits(
                 &transaction,
                 state.key_bundle.as_ref(),
+                state.database_id,
                 &mut floor,
                 10,
                 1,
@@ -973,6 +985,7 @@ mod tests {
             trim_catalog_window_with_limits(
                 &transaction,
                 state.key_bundle.as_ref(),
+                state.database_id,
                 &mut floor,
                 11,
                 1,
@@ -1093,6 +1106,7 @@ mod tests {
         trim_catalog_window_with_limits(
             &transaction,
             key_bundle.as_ref(),
+            database_id,
             &mut floor,
             11,
             2,

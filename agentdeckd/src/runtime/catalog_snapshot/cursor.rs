@@ -6,7 +6,10 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use super::{CATALOG_PAGE_CURSOR_TTL_MS, CatalogSnapshotProviderError};
+use super::{
+    CATALOG_PAGE_CURSOR_TTL_MS, CatalogPageReference, CatalogPageSourceKind,
+    CatalogSnapshotProviderError,
+};
 use crate::runtime::connection::AuthenticatedPrincipal;
 use crate::runtime::events::RuntimeStreamTarget;
 use crate::runtime::store::ReadySnapshotReference;
@@ -44,7 +47,7 @@ impl Drop for CursorMacKey {
 }
 
 pub(super) struct CursorClaims {
-    pub(super) snapshot: ReadySnapshotReference,
+    pub(super) reference: CatalogPageReference,
     pub(super) next_key: String,
     pub(super) issued_at_ms: u64,
     pub(super) expires_at_ms: u64,
@@ -66,11 +69,12 @@ pub(super) fn encode_cursor(
     }
     let mut body = Vec::with_capacity(160 + next_key.len());
     body.extend_from_slice(CURSOR_MAGIC);
-    body.extend_from_slice(&claims.snapshot.snapshot_id);
-    encode_stream_cursor(&mut body, claims.snapshot.base);
-    body.extend_from_slice(&claims.snapshot.item_count.to_be_bytes());
-    body.extend_from_slice(&claims.snapshot.logical_bytes.to_be_bytes());
-    body.extend_from_slice(&claims.snapshot.content_sha256);
+    body.push(claims.reference.kind.wire());
+    body.extend_from_slice(&claims.reference.snapshot.snapshot_id);
+    encode_stream_cursor(&mut body, claims.reference.snapshot.base);
+    body.extend_from_slice(&claims.reference.snapshot.item_count.to_be_bytes());
+    body.extend_from_slice(&claims.reference.snapshot.logical_bytes.to_be_bytes());
+    body.extend_from_slice(&claims.reference.snapshot.content_sha256);
     body.extend_from_slice(&claims.issued_at_ms.to_be_bytes());
     body.extend_from_slice(&claims.expires_at_ms.to_be_bytes());
     body.extend_from_slice(&claims.principal_binding);
@@ -115,6 +119,7 @@ pub(super) fn decode_cursor(
     if reader.take(5)? != CURSOR_MAGIC {
         return Err(CatalogSnapshotProviderError::InvalidCursor);
     }
+    let kind = CatalogPageSourceKind::from_wire(reader.u8()?)?;
     let snapshot_id: [u8; 16] = reader
         .take(16)?
         .try_into()
@@ -157,13 +162,16 @@ pub(super) fn decode_cursor(
         return Err(CatalogSnapshotProviderError::CursorExpired);
     }
     Ok(CursorClaims {
-        snapshot: ReadySnapshotReference {
-            snapshot_id,
-            target: RuntimeStreamTarget::Catalog,
-            base,
-            item_count,
-            logical_bytes,
-            content_sha256,
+        reference: CatalogPageReference {
+            kind,
+            snapshot: ReadySnapshotReference {
+                snapshot_id,
+                target: RuntimeStreamTarget::Catalog,
+                base,
+                item_count,
+                logical_bytes,
+                content_sha256,
+            },
         },
         next_key,
         issued_at_ms,

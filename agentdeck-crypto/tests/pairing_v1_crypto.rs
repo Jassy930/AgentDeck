@@ -538,7 +538,7 @@ fn pair_response_round_trip_verifies_machine_data_root_grant_and_authorization()
         },
     );
     let mut rejected_rng = DeterministicRng::new([0xad; 32]);
-    assert!(matches!(
+    assert_eq!(
         seal_pair_response(
             &device_hpke_public,
             &info,
@@ -551,8 +551,8 @@ fn pair_response_round_trip_verifies_machine_data_root_grant_and_authorization()
             },
             &mut rejected_rng,
         ),
-        Err(CryptoError::InvalidPairing(_))
-    ));
+        Err(CryptoError::BadSignature)
+    );
 
     let mut rng = DeterministicRng::new([0xa6; 32]);
     let response = seal_pair_response(

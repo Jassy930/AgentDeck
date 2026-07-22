@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::Notify;
@@ -26,6 +26,7 @@ use agentdeck_protocol::runtime::{
 };
 
 use crate::runtime::store::pairing_grant::GlobalKeyStateV1;
+use crate::runtime::store::publication::PublicationScope;
 use crate::runtime::store::{MachineIdentityBinding, RuntimeIdKind, RuntimeStoreConfig};
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
@@ -5712,8 +5713,19 @@ async fn production_store_renewal_supersedes_and_restart_recovers_only_current_r
 
     let first =
         complete_store_backed_pairing(&mut actor, &store, "renewal-first", 0xa4, 0xa5, 1).await;
+    crate::runtime::store::complete_active_zero_cut_transition(&store).await;
+    store
+        .create_publication_stream(
+            [0x21; 16],
+            PublicationScope::Catalog,
+            [0x22; 16],
+            [0x23; 16],
+        )
+        .await
+        .expect("create renewal catalog stream before guarded transition");
     let second =
         complete_store_backed_pairing(&mut actor, &store, "renewal-second", 0xa4, 0xb5, 11).await;
+    crate::runtime::store::complete_active_membership_transition(&store, &AtomicU64::new(1)).await;
 
     assert_eq!(
         first.install.grant.device_sign_pubkey, second.install.grant.device_sign_pubkey,

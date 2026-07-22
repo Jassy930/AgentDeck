@@ -6,9 +6,9 @@ use agentdeck_protocol::runtime::identity::{
     ConversationId, EntityId, ItemId, MessageId, TransferId,
 };
 use agentdeck_protocol::runtime::{
-    ConversationSnapshot, MAX_JSON_PART_BYTES, MAX_JSON_TRANSFER_PARTS,
+    ConversationSnapshot, MAX_JSON_PART_BYTES, MAX_JSON_TRANSFER_PARTS, MAX_PART_BYTES,
     MAX_RUNTIME_JSON_FRAME_BYTES, MAX_TRANSFER_BYTES, RuntimeEnvelope, RuntimeMessage,
-    RuntimeReply, RuntimeTransferChannel, SnapshotItem, StreamCursor,
+    RuntimeReply, RuntimeTransferCarrierV1, RuntimeTransferChannel, SnapshotItem, StreamCursor,
 };
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, SessionCapabilities, VendorCapabilities,
@@ -17,11 +17,11 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
 
 use super::*;
-use crate::runtime::ConnectionSink;
 use crate::runtime::connection::{
     ConnectionRegistry, ConnectionWrite, DEFAULT_CONNECTION_WRITER_BYTES,
     DEFAULT_CONNECTION_WRITER_FRAMES, PrincipalIssuer,
 };
+use crate::runtime::{ConnectionFramingProfile, ConnectionSink, EncodedRuntimeFrameKind};
 
 fn registry() -> ConnectionRegistry {
     ConnectionRegistry::new(
@@ -41,6 +41,24 @@ fn connect(
     let connection_id = connections
         .connect(principal, ConnectionSink::new(sender))
         .expect("connect runtime writer");
+    (connection_id, receiver)
+}
+
+fn connect_compact(
+    connections: &ConnectionRegistry,
+    seed: u8,
+) -> (ConnectionId, mpsc::Receiver<ConnectionWrite>) {
+    let principal = PrincipalIssuer::local_only([0xA5; 32])
+        .issue_verified_local(501, [seed; 16])
+        .expect("issue verified local principal");
+    let (sender, receiver) = mpsc::channel(1);
+    let connection_id = connections
+        .connect(
+            principal,
+            ConnectionSink::new(sender)
+                .with_framing_profile(ConnectionFramingProfile::CompactTransfer),
+        )
+        .expect("connect compact runtime writer");
     (connection_id, receiver)
 }
 
@@ -88,6 +106,61 @@ fn json_uds_part_budget_covers_the_full_transfer_ceiling() {
         MAX_JSON_TRANSFER_PARTS
     );
     assert!(json_transfer_part_count(MAX_TRANSFER_BYTES as usize + 1).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_profile_carries_the_full_sixty_four_mib_as_adrt1_stream_parts() {
+    let connections = registry();
+    let (connection_id, mut receiver) = connect_compact(&connections, 0x35);
+    // 不能把本门禁缩成小 fixture：它必须证明 remote 3.5 MiB / 64-part profile
+    // 对完整 64 MiB payload 可表示，并且不复用 JSON/UDS 的 700 KiB 分片。
+    let payload: Arc<[u8]> = vec![0x5A; MAX_TRANSFER_BYTES as usize].into();
+    let expected_parts = payload.len().div_ceil(MAX_PART_BYTES) as u32;
+    assert!(expected_parts <= 64);
+    let control = TransferEgressControl::new(Instant::now() + Duration::from_secs(60));
+    let send_connections = connections.clone();
+    let send_payload = payload.clone();
+    let sender = tokio::spawn(async move {
+        send_stream_transfer(
+            &send_connections,
+            connection_id,
+            MessageId::new("compact-full-message"),
+            TransferId::new("compact-full-transfer"),
+            &send_payload,
+            &control,
+        )
+        .await
+    });
+
+    let mut assembled = Vec::with_capacity(payload.len());
+    for expected_index in 0..expected_parts {
+        let write = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("compact part timed out")
+            .expect("writer closed before complete compact transfer");
+        assert_eq!(write.kind(), EncodedRuntimeFrameKind::CompactTransfer);
+        let carrier = RuntimeTransferCarrierV1::decode(write.bytes()).expect("decode ADRT1");
+        assert_eq!(carrier.channel, RuntimeTransferChannel::Stream);
+        assert_eq!(carrier.transfer.part_index, expected_index);
+        assert_eq!(carrier.transfer.part_count, expected_parts);
+        assert!(carrier.transfer.part.len() <= MAX_PART_BYTES);
+        assert_eq!(carrier.transfer.total_bytes, MAX_TRANSFER_BYTES);
+        assembled.extend_from_slice(&carrier.transfer.part);
+
+        tokio::task::yield_now().await;
+        assert!(receiver.try_recv().is_err(), "next part preceded flush ACK");
+        write.acknowledge().expect("ACK compact part");
+    }
+
+    let report = timeout(Duration::from_secs(10), sender)
+        .await
+        .expect("compact egress completion timed out")
+        .expect("compact egress task panicked")
+        .expect("compact egress failed");
+    assert_eq!(report.part_count, expected_parts);
+    assert_eq!(report.total_bytes, MAX_TRANSFER_BYTES);
+    assert_eq!(assembled.as_slice(), payload.as_ref());
+    connections.shutdown().await.expect("shutdown registry");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -6,6 +6,33 @@ const ROTATION_REQUEST_DIGEST_DOMAIN: &[u8] = b"publication.rotation-request.v1"
 const ROTATION_ROUTE_DERIVATION_DOMAIN: &[u8] = b"publication.rotation-route.v1";
 const ROTATION_GENERATION_DERIVATION_DOMAIN: &[u8] = b"publication.rotation-generation.v1";
 
+/// Relay v2 将 `u64::MAX` 保留为不可发送边界；daemon 最后可冻结的 outer
+/// sequence 是 `MAX - 1`。到达该值的 stream 必须先完成 exact COMMIT/ACK，
+/// 再走完整 generation rotation，绝不能先冻结一个无法发送的 MAX row。
+pub(crate) const LAST_RELAY_STREAM_SEQ: u64 = u64::MAX - 1;
+
+/// 兼容旧版本可能留下的 authenticated Active/MAX-1 stream：在任何 sealer、
+/// outbox 或 counter mutation 前把它转为 NeedsSnapshot。正常新路径在成功冻结
+/// MAX-1 时就会直接进入相同状态。
+pub(super) fn mark_relay_sequence_exhausted(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    stream: &mut PublicationStreamRecord,
+    next_stream_seq: u64,
+    now_ms: u64,
+) -> Result<bool, RuntimeStoreError> {
+    if next_stream_seq <= LAST_RELAY_STREAM_SEQ {
+        return Ok(false);
+    }
+    if next_stream_seq != u64::MAX || stream.reserved_high_water != Some(LAST_RELAY_STREAM_SEQ) {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    stream.state = PublicationStreamState::NeedsSnapshot;
+    stream.updated_at_ms = now_ms;
+    super::update_stream(transaction, key_bundle, stream)?;
+    Ok(true)
+}
+
 /// 威胁场景：正常运行持续创建历史 generation，单机最终累计 1,025 rows 并永久
 /// 撞上 directory cap；因此只在旧 generation 已完整消费且有 snapshot 覆盖时原地轮换。
 /// 将已完整消费、且已有 authenticated ready snapshot 覆盖的 publication
@@ -63,6 +90,7 @@ pub(in crate::runtime::store) fn rotate_publication_stream(
     }
     if stream.reserved_high_water != stream.committed_high_water
         || stream.committed_high_water != stream.acknowledged_high_water
+        || stream.committed_inner_cursor != stream.acknowledged_inner_cursor
     {
         return Err(RuntimeStoreError::PublicationMismatch);
     }
@@ -116,15 +144,16 @@ pub(in crate::runtime::store) fn rotate_publication_stream(
     stream.stream_route = next_stream_route;
     stream.generation = next_generation;
     stream.rotation_serial = next_rotation_serial;
-    // Rollover 只重置 Relay stream 的 outer/inner cursor，不是 data-key rotation。
-    // 保留 counter scope 与 HWM，避免新 generation 复用旧 scope 并从低 counter
-    // 重新开始；真正换 scope 留给 P4.5 的持久 CounterGuard/key-rotation 流程。
+    // Rollover 只重置 Relay generation 的 outer cursor，不是业务 journal 或
+    // data-key rotation。ready snapshot 已认证覆盖 committed inner H，因此新
+    // generation 必须从 `(BeforeFirst, H)` 继续；清空 inner 会让首个 seq=0
+    // publication 错误地回退到 BeforeFirst。保留 counter scope 与 HWM，避免新
+    // generation 复用旧 scope 并从低 counter 重新开始；真正换 scope 留给 P4.5
+    // 的持久 CounterGuard/key-rotation 流程。
     stream.reserved_high_water = None;
     stream.committed_high_water = None;
-    stream.committed_inner_cursor = None;
     stream.last_committed_blob_hash = None;
     stream.acknowledged_high_water = None;
-    stream.acknowledged_inner_cursor = None;
     stream.last_acknowledged_blob_hash = None;
     stream.last_rotation_request_digest = Some(request_digest);
     stream.state = PublicationStreamState::Active;
@@ -211,6 +240,64 @@ fn update_rotated_stream(
         return Err(RuntimeStoreError::PublicationMismatch);
     }
     Ok(())
+}
+
+/// Machine trust-reset 已取得 Relay terminal/readback 且所有业务 owner 已静默后，
+/// 原地冻结 publication directory 的稳定本机 identity，并丢弃旧 trust domain 的
+/// 全部 Relay/crypto projection。caller 与其余 remote security row 在同一事务更新
+/// Runtime ledger；本 helper 不自行 COMMIT。
+pub(in crate::runtime::store) fn reset_for_machine_purge(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &mut RuntimeLedger,
+) -> Result<(), RuntimeStoreError> {
+    let mut streams =
+        super::directory::authenticate_directory_records(transaction, key_bundle, ledger)?;
+    let expected_outbox = ledger.publication_outbox_count;
+    let deleted = transaction.execute("DELETE FROM publication_outbox", [])?;
+    if u64::try_from(deleted).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+        != expected_outbox
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+
+    for stream in &mut streams {
+        let previous_generation = stream.generation;
+        let next_rotation_serial = stream
+            .rotation_serial
+            .checked_add(1)
+            .ok_or(RuntimeStoreError::PublicationMismatch)?;
+        let (next_stream_route, next_generation) = derive_rotation_identity(
+            key_bundle,
+            stream.publication_stream_id,
+            next_rotation_serial,
+        )?;
+        if next_stream_route == stream.stream_route || next_generation == stream.generation {
+            return Err(RuntimeStoreError::PublicationMismatch);
+        }
+        stream.stream_route = next_stream_route;
+        stream.generation = next_generation;
+        stream.counter_scope_token = None;
+        stream.sender_counter_high_water = None;
+        stream.reserved_high_water = None;
+        stream.committed_high_water = None;
+        stream.committed_inner_cursor = None;
+        stream.last_committed_blob_hash = None;
+        stream.acknowledged_high_water = None;
+        stream.acknowledged_inner_cursor = None;
+        stream.last_acknowledged_blob_hash = None;
+        stream.last_acknowledged_publication_id = None;
+        stream.last_acknowledged_request_digest = None;
+        stream.last_rotation_request_digest = None;
+        stream.rotation_serial = next_rotation_serial;
+        stream.state = PublicationStreamState::NeedsSnapshot;
+        update_rotated_stream(transaction, key_bundle, previous_generation, stream)?;
+    }
+
+    ledger.publication_outbox_count = 0;
+    ledger.publication_outbox_bytes = 0;
+    super::validate_integrity(transaction, key_bundle, database_id, ledger)
 }
 
 fn rotated_record_matches(

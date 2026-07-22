@@ -19,6 +19,8 @@ pub mod counter;
 pub mod error;
 pub mod hpke;
 pub mod key_directory;
+pub mod key_recovery;
+pub mod key_update;
 pub mod pairing;
 pub mod replay;
 pub mod sealed_blob;
@@ -29,14 +31,21 @@ pub mod signature;
 pub use ::hpke::rand_core;
 
 pub use aead::{
-    AeadReceivingKey, AeadSendingKey, SecretAeadKey, SenderCounter, open_sealed_payload,
-    open_symmetric, seal_symmetric,
+    AeadReceivingKey, AeadSendingKey, SecretAeadKey, SenderCounter, derive_nonce_prefix,
+    open_sealed_payload, open_symmetric, seal_symmetric,
 };
 pub use canonical::sha256;
 pub use error::CryptoError;
 pub use hpke::{HpkeEnvelopeV1, HpkePrivateKey, HpkePublicKey, hpke_open_base, hpke_seal_base};
 pub use key_directory::{
     open_key_directory_entry, seal_key_directory_entry, sign_key_directory, verify_key_directory,
+};
+pub use key_recovery::{
+    DeviceKeyRecoveryOpenAuthority, DeviceKeyRecoverySealAuthority, open_device_key_recovery_reply,
+    seal_device_key_recovery_reply, verify_device_key_recovery_reply,
+};
+pub use key_update::{
+    Ed25519KeyUpdateSigner, Ed25519KeyUpdateVerifier, sign_key_update, verify_key_update,
 };
 pub use pairing::{
     PairResponseSealAuthority, VerifiedPairRequestV1, open_pair_pending, open_pair_request,

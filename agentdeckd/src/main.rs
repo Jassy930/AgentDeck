@@ -334,8 +334,10 @@ fn validate_cli_args(args: &CliArgs) -> Result<(), CliError> {
 }
 
 fn run_purge_finalizer_one_shot(plan_id: [u8; 16]) -> ExitCode {
-    // finalizer 必须在普通 StorageKEK load/create、DB open、record namespace 与 UDS
-    // bootstrap 前分流；它只 existing-load marker/key items，并持有 stopped permit。
+    // finalizer 必须在普通 StorageKEK load/create、RuntimeStore RW open、record namespace
+    // 与 UDS bootstrap 前分流。它只 existing-load marker/KEK/key items，并在删除 Runtime
+    // artifacts 前通过 immutable/rescue 副本只读认证 CounterGuard manifest；原 DB/WAL/
+    // SHM 不创建、不迁移、不改写，且全程持有 stopped permit。
     let config = match DaemonConfig::resolve(DaemonStartupOptions {
         ephemeral: false,
         no_remote: false,
@@ -704,6 +706,7 @@ fn run_main_loop(
                 core.with_remote_administration(remote_manager.clone())
                     .with_pairing_administration(remote_manager.clone())
                     .with_revocation_administration(remote_manager.clone())
+                    .with_conversation_activation(remote_manager.clone())
                     .with_versioned_daemon_upgrade(
                         config.paths().data_dir.join("bin"),
                         upgrade_exit,

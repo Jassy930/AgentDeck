@@ -5,11 +5,12 @@ use std::sync::{Arc, Mutex};
 use agentdeck_protocol::e2ee::{KeyId, KeyPurpose};
 use async_trait::async_trait;
 
+use crate::remote::counter::CounterGuardState;
 use crate::remote::identity::{
     KEY_DIRECTORY_GUARD_ACCOUNT, KeyDirectoryGuard, MACHINE_DATA_SIGN_ACCOUNT,
     MACHINE_HPKE_ACCOUNT, MACHINE_LINK_SIGN_ACCOUNT, MACHINE_ROOT_SIGN_ACCOUNT,
     advance_counter_guard, counter_guard_account, install_key_directory_guard,
-    load_machine_key_material,
+    load_machine_key_material, scoped_counter_guard_account_from_token,
 };
 use crate::runtime::store::{
     MachineIdentityBinding, MachineRemoteLifecycle, MachineRemoteStateRecord,
@@ -69,6 +70,14 @@ impl RecordingKeyStore {
     }
 
     fn all_absent(&self, counter_axes: &[KeyId]) -> bool {
+        self.all_absent_with_scoped(&[], counter_axes)
+    }
+
+    fn all_absent_with_scoped(
+        &self,
+        counter_scope_tokens: &[[u8; 32]],
+        counter_axes: &[KeyId],
+    ) -> bool {
         let values = self.values.lock().expect("lock values");
         [
             MACHINE_ROOT_SIGN_ACCOUNT.to_owned(),
@@ -78,6 +87,9 @@ impl RecordingKeyStore {
             KEY_DIRECTORY_GUARD_ACCOUNT.to_owned(),
         ]
         .into_iter()
+        .chain(counter_scope_tokens.iter().copied().map(|token| {
+            scoped_counter_guard_account_from_token(token).expect("authenticated test scope token")
+        }))
         .chain(counter_axes.iter().copied().map(counter_guard_account))
         .all(|account| !values.contains_key(&account))
     }
@@ -146,6 +158,15 @@ impl Fixture {
         reset_kind: MachineTrustResetKind,
         counter_axes: Vec<KeyId>,
     ) -> Self {
+        Self::install_with_scoped(keys, reset_kind, Vec::new(), counter_axes)
+    }
+
+    fn install_with_scoped(
+        keys: &RecordingKeyStore,
+        reset_kind: MachineTrustResetKind,
+        counter_scope_tokens: Vec<[u8; 32]>,
+        counter_axes: Vec<KeyId>,
+    ) -> Self {
         keys.insert(MACHINE_ROOT_SIGN_ACCOUNT, &[0x31; 32]);
         keys.insert(MACHINE_HPKE_ACCOUNT, &[0x32; 32]);
         keys.insert(MACHINE_LINK_SIGN_ACCOUNT, &[0x33; 32]);
@@ -180,6 +201,17 @@ impl Fixture {
             advance_counter_guard(keys, key_id, 1_024 + index as u64)
                 .expect("install counter guard");
         }
+        for (index, scope_token) in counter_scope_tokens.iter().copied().enumerate() {
+            let guard = CounterGuardState::stable(
+                scope_token,
+                2_048 + index as u64,
+                [0x81_u8.wrapping_add(index as u8); 32],
+            )
+            .expect("install V2 counter guard");
+            let account = scoped_counter_guard_account_from_token(scope_token)
+                .expect("canonical V2 counter guard account");
+            keys.insert(&account, &guard.encode());
+        }
         keys.clear_events();
         Self {
             snapshot: AuthenticatedMachineCleanup {
@@ -200,6 +232,11 @@ impl Fixture {
                 binding,
                 reset_kind,
                 purge_proof_hash: [0x45; 32],
+                counter_guard_scopes: counter_scope_tokens
+                    .iter()
+                    .copied()
+                    .map(|token| (token, true))
+                    .collect(),
                 counter_guard_axes: counter_axes.clone(),
             },
             counter_axes,
@@ -386,6 +423,141 @@ async fn root_present_shuts_down_owner_then_deletes_exact_axes_with_root_last() 
         .rposition(|event| event.starts_with("key.delete:"))
         .unwrap();
     assert!(finalize > last_delete);
+}
+
+#[tokio::test]
+async fn authenticated_v2_guards_are_deleted_before_legacy_guards_and_machine_keys() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let keys = RecordingKeyStore::with_events(Arc::clone(&events));
+    let scope_tokens = vec![[0x11; 32], [0x22; 32]];
+    let fixture = Fixture::install_with_scoped(
+        &keys,
+        MachineTrustResetKind::RootPresent,
+        scope_tokens.clone(),
+        counter_axes(),
+    );
+    let store = FakeStore::new(fixture.snapshot, events);
+
+    run_fixture(&keys, &store).await.unwrap();
+
+    let v2_accounts = scope_tokens
+        .iter()
+        .copied()
+        .map(|token| scoped_counter_guard_account_from_token(token).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        v2_accounts
+            .iter()
+            .all(|account| !keys.values.lock().unwrap().contains_key(account))
+    );
+    let deletes = keys
+        .events()
+        .into_iter()
+        .filter(|event| event.starts_with("key.delete:"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        &deletes[..v2_accounts.len()],
+        v2_accounts
+            .iter()
+            .map(|account| format!("key.delete:{account}"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(store.finalize_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn reserved_absent_v2_scope_is_legal_between_materialized_scopes() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let keys = RecordingKeyStore::with_events(Arc::clone(&events));
+    let mut fixture = Fixture::install_with_scoped(
+        &keys,
+        MachineTrustResetKind::RootPresent,
+        vec![[0x11; 32], [0x33; 32]],
+        vec![],
+    );
+    fixture.snapshot.counter_guard_scopes =
+        vec![([0x11; 32], true), ([0x22; 32], false), ([0x33; 32], true)];
+    let store = FakeStore::new(fixture.snapshot, events);
+
+    assert_eq!(
+        run_fixture(&keys, &store).await.unwrap().disposition(),
+        MachineCleanupDisposition::Finalized
+    );
+    assert!(keys.all_absent_with_scoped(&[[0x11; 32], [0x22; 32], [0x33; 32]], &[]));
+}
+
+#[tokio::test]
+async fn later_v2_guard_is_authenticated_before_the_first_delete() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let keys = RecordingKeyStore::with_events(Arc::clone(&events));
+    let fixture = Fixture::install_with_scoped(
+        &keys,
+        MachineTrustResetKind::RootPresent,
+        vec![[0x41; 32], [0x42; 32]],
+        vec![],
+    );
+    let later_account = scoped_counter_guard_account_from_token([0x42; 32]).unwrap();
+    let transplanted = CounterGuardState::stable([0x43; 32], 4_096, [0x44; 32]).unwrap();
+    keys.insert(&later_account, &transplanted.encode());
+    keys.clear_events();
+    let store = FakeStore::new(fixture.snapshot, events);
+
+    let error = run_fixture(&keys, &store)
+        .await
+        .expect_err("later V2 guard mismatch must fail before deleting the first guard");
+    assert_eq!(error.code(), "daemon.remote.counter.scope_mismatch");
+    assert!(
+        !keys
+            .events()
+            .iter()
+            .any(|event| event.starts_with("key.delete:"))
+    );
+    assert_eq!(store.finalize_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn v2_delete_readback_failure_keeps_cleanup_authorization_retryable() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let keys = RecordingKeyStore::with_events(Arc::clone(&events));
+    let scope_token = [0x51; 32];
+    let fixture = Fixture::install_with_scoped(
+        &keys,
+        MachineTrustResetKind::RootPresent,
+        vec![scope_token],
+        vec![],
+    );
+    let account = scoped_counter_guard_account_from_token(scope_token).unwrap();
+    keys.retain_after_next_delete(&account);
+    keys.clear_events();
+    let store = FakeStore::new(fixture.snapshot, events);
+
+    let error = run_fixture(&keys, &store)
+        .await
+        .expect_err("V2 delete must require exact absent readback");
+    assert_eq!(error.code(), "daemon.remote.identity.delete_failed");
+    assert_eq!(store.finalize_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.snapshot.record.lifecycle,
+        MachineRemoteLifecycle::PurgeReadbackAbsent
+    );
+    assert_eq!(
+        store.snapshot.counter_guard_scopes,
+        vec![(scope_token, true)]
+    );
+    assert!(keys.values.lock().unwrap().contains_key(&account));
+    assert!(
+        keys.values
+            .lock()
+            .unwrap()
+            .contains_key(MACHINE_DATA_SIGN_ACCOUNT)
+    );
+
+    keys.clear_events();
+    run_fixture(&keys, &store)
+        .await
+        .expect("same authenticated manifest must retry after the readback fault clears");
+    assert!(keys.all_absent_with_scoped(&[scope_token], &[]));
+    assert_eq!(store.finalize_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -767,12 +939,14 @@ async fn assert_each_delete_boundary_is_retryable(
     reset_kind: MachineTrustResetKind,
     root_initially_absent: bool,
 ) {
+    let scope_tokens = vec![[0x11; 32], [0x22; 32]];
     let axes = counter_axes();
-    let mut deletion_order = axes
+    let mut deletion_order = scope_tokens
         .iter()
         .copied()
-        .map(counter_guard_account)
+        .map(|token| scoped_counter_guard_account_from_token(token).unwrap())
         .collect::<Vec<_>>();
+    deletion_order.extend(axes.iter().copied().map(counter_guard_account));
     deletion_order.extend([
         MACHINE_DATA_SIGN_ACCOUNT.to_owned(),
         MACHINE_LINK_SIGN_ACCOUNT.to_owned(),
@@ -786,7 +960,8 @@ async fn assert_each_delete_boundary_is_retryable(
     for failure_account in deletion_order {
         let events = Arc::new(Mutex::new(Vec::new()));
         let keys = RecordingKeyStore::with_events(Arc::clone(&events));
-        let fixture = Fixture::install(&keys, reset_kind, axes.clone());
+        let fixture =
+            Fixture::install_with_scoped(&keys, reset_kind, scope_tokens.clone(), axes.clone());
         if root_initially_absent {
             keys.remove(MACHINE_ROOT_SIGN_ACCOUNT);
         }
@@ -811,7 +986,7 @@ async fn assert_each_delete_boundary_is_retryable(
         run_fixture(&keys, &store)
             .await
             .expect("the exact prefix-deleted shape must resume safely");
-        assert!(keys.all_absent(&axes));
+        assert!(keys.all_absent_with_scoped(&scope_tokens, &axes));
         assert_eq!(store.finalize_calls.load(Ordering::SeqCst), 1);
     }
 }

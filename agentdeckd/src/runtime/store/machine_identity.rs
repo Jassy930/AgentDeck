@@ -353,6 +353,56 @@ pub(super) fn insert_active_replacement(
     Ok(record)
 }
 
+/// 在调用方现有的 key-rotation transaction 内把 Active identity 的 directory
+/// revision 推进唯一一步。它不自行 commit，也不更新 count ledger；调用方必须把
+/// machine remote sealed binding 与 active transition phase 放在同一事务中。
+pub(super) fn advance_active_key_directory_revision_in_transaction(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    expected_binding: &MachineIdentityBinding,
+    to_revision: u64,
+) -> Result<MachineIdentityStateRecord, RuntimeStoreError> {
+    validate_binding(expected_binding)?;
+    if expected_binding.key_directory_revision.checked_add(1) != Some(to_revision) {
+        return Err(RuntimeStoreError::MachineIdentityConflict);
+    }
+    let current = load_machine_identity_state(transaction, key_bundle, database_id)?
+        .ok_or(RuntimeStoreError::MachineIdentityMissing)?;
+    if current.lifecycle != MachineIdentityLifecycle::Active || &current.binding != expected_binding
+    {
+        return Err(RuntimeStoreError::MachineIdentityConflict);
+    }
+    let mut binding = current.binding.clone();
+    binding.key_directory_revision = to_revision;
+    let next = MachineIdentityStateRecord {
+        binding,
+        ..current.clone()
+    };
+    let previous_token = row_token(key_bundle, &current)?;
+    let next_token = row_token(key_bundle, &next)?;
+    if transaction.execute(
+        "UPDATE machine_identity_state
+         SET key_directory_revision = ?1, metadata_token = ?2
+         WHERE singleton = 1 AND identity_state = 'active'
+           AND key_directory_revision = ?3 AND metadata_token = ?4",
+        params![
+            super::sequence::encode_sequence(to_revision),
+            &next_token[..],
+            super::sequence::encode_sequence(expected_binding.key_directory_revision),
+            &previous_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::MachineIdentityConflict);
+    }
+    let ledger = super::sqlite::load_runtime_ledger(transaction, key_bundle, database_id)?;
+    if ledger.machine_identity_count != 1 {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(next)
+}
+
 fn replay_prepare(
     state: Option<MachineIdentityStateRecord>,
     binding: &MachineIdentityBinding,

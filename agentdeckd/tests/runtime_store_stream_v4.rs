@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,9 +9,9 @@ use agentdeckd::runtime::store::{
     AcceptCommand, AcceptOutcome, ConversationDescriptor, ExecutionFence, FreezePublicationRequest,
     IdempotencyOwner, NewConversation, PublicationPayloadKind, PublicationScope,
     RuntimeBackfillPlan, RuntimeBackfillTarget, RuntimeClock, RuntimeClockError,
-    RuntimeCommitOperation, RuntimeId, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError,
-    RuntimeStoreFaultInjector, RuntimeStoreHandle, RuntimeStoreOperation, StartCommand,
-    StartOutcome, StartedBeforeReleaseTermination, TerminateStartedBeforeRelease,
+    RuntimeCommitOperation, RuntimeId, RuntimeIdKind, RuntimeIdSource, RuntimeStoreConfig,
+    RuntimeStoreError, RuntimeStoreFaultInjector, RuntimeStoreHandle, RuntimeStoreOperation,
+    StartCommand, StartOutcome, StartedBeforeReleaseTermination, TerminateStartedBeforeRelease,
 };
 use agentdeckd::security::{MemoryKeyStore, StorageKek, load_or_create_storage_kek};
 
@@ -83,6 +84,24 @@ impl RuntimeClock for ManualClock {
     }
 }
 
+struct SeedIdSource(VecDeque<u8>);
+
+impl SeedIdSource {
+    fn new(seeds: impl IntoIterator<Item = u8>) -> Self {
+        Self(seeds.into_iter().collect())
+    }
+}
+
+impl RuntimeIdSource for SeedIdSource {
+    fn next_id(
+        &mut self,
+        kind: RuntimeIdKind,
+    ) -> Result<RuntimeId, agentdeckd::runtime::store::identity::RuntimeIdError> {
+        let seed = self.0.pop_front().expect("deterministic runtime id seed");
+        RuntimeId::from_bytes(kind, [seed; 16])
+    }
+}
+
 struct FailOnceAfterFreeze(AtomicBool);
 struct FailOnceAfterDeliveryAck(AtomicBool);
 struct FailOnceAfterSnapshot(AtomicBool);
@@ -151,7 +170,8 @@ async fn catalog_pin_snapshot_and_publication_have_one_durable_cut() {
     let root = TestRoot::new("roundtrip");
     let keys = MemoryKeyStore::new();
     let store = RuntimeStoreHandle::open(
-        RuntimeStoreConfig::new(root.database()),
+        RuntimeStoreConfig::new(root.database())
+            .with_id_source(SeedIdSource::new([0x51, 0x53, 0x52])),
         root.storage_kek(&keys),
     )
     .await
@@ -202,15 +222,6 @@ async fn catalog_pin_snapshot_and_publication_have_one_durable_cut() {
 
     let publication_stream_id = [0x51; 16];
     let generation = [0x52; 16];
-    store
-        .create_publication_stream(
-            publication_stream_id,
-            PublicationScope::Conversation(conversation_id),
-            [0x53; 16],
-            generation,
-        )
-        .await
-        .expect("create publication stream");
     let request = FreezePublicationRequest {
         publication_id: [0x54; 16],
         publication_stream_id,
@@ -621,15 +632,14 @@ async fn counter_scope_cannot_be_rebound_to_another_stream_or_generation() {
     let root = TestRoot::new("counter-cross-stream");
     let keys = MemoryKeyStore::new();
     let store = RuntimeStoreHandle::open(
-        RuntimeStoreConfig::new(root.database()),
+        RuntimeStoreConfig::new(root.database())
+            .with_id_source(SeedIdSource::new([0xF1, 0xF6, 0xF3, 0xF2, 0xF7, 0xF4])),
         root.storage_kek(&keys),
     )
     .await
     .expect("open store");
     let first = conversation(0xD7);
     let second = conversation(0xD8);
-    let first_conversation = first.conversation_id;
-    let second_conversation = second.conversation_id;
     store
         .create_conversation(first)
         .await
@@ -643,24 +653,6 @@ async fn counter_scope_cannot_be_rebound_to_another_stream_or_generation() {
     let first_generation = [0xF3; 16];
     let second_generation = [0xF4; 16];
     let counter_scope = [0xF5; 32];
-    store
-        .create_publication_stream(
-            first_stream,
-            PublicationScope::Conversation(first_conversation),
-            [0xF6; 16],
-            first_generation,
-        )
-        .await
-        .expect("create first stream");
-    store
-        .create_publication_stream(
-            second_stream,
-            PublicationScope::Conversation(second_conversation),
-            [0xF7; 16],
-            second_generation,
-        )
-        .await
-        .expect("create second stream");
     store
         .freeze_publication(FreezePublicationRequest {
             publication_id: [0xF8; 16],
@@ -1005,28 +997,19 @@ async fn publication_rejects_inner_gaps_and_outbox_token_tamper_fails_closed() {
     let root = TestRoot::new("publication-tamper");
     let keys = MemoryKeyStore::new();
     let store = RuntimeStoreHandle::open(
-        RuntimeStoreConfig::new(root.database()),
+        RuntimeStoreConfig::new(root.database())
+            .with_id_source(SeedIdSource::new([0x61, 0x63, 0x62])),
         root.storage_kek(&keys),
     )
     .await
     .expect("open store");
     let input = conversation(0x41);
-    let conversation_id = input.conversation_id;
     store
         .create_conversation(input)
         .await
         .expect("create conversation");
     let stream_id = [0x61; 16];
     let generation = [0x62; 16];
-    store
-        .create_publication_stream(
-            stream_id,
-            PublicationScope::Conversation(conversation_id),
-            [0x63; 16],
-            generation,
-        )
-        .await
-        .expect("create stream");
     let request = |publication_id, inner_after, inner_through| FreezePublicationRequest {
         publication_id,
         publication_stream_id: stream_id,
@@ -1116,28 +1099,20 @@ async fn publication_after_commit_unknown_retries_the_exact_frozen_row() {
     let keys = MemoryKeyStore::new();
     let fault = Arc::new(FailOnceAfterFreeze(AtomicBool::new(false)));
     let store = RuntimeStoreHandle::open(
-        RuntimeStoreConfig::new(root.database()).with_fault_injector(fault),
+        RuntimeStoreConfig::new(root.database())
+            .with_fault_injector(fault)
+            .with_id_source(SeedIdSource::new([0x71, 0x73, 0x72])),
         root.storage_kek(&keys),
     )
     .await
     .expect("open store");
     let input = conversation(0x61);
-    let conversation_id = input.conversation_id;
     store
         .create_conversation(input)
         .await
         .expect("create conversation");
     let stream_id = [0x71; 16];
     let generation = [0x72; 16];
-    store
-        .create_publication_stream(
-            stream_id,
-            PublicationScope::Conversation(conversation_id),
-            [0x73; 16],
-            generation,
-        )
-        .await
-        .expect("create publication stream");
     let request = FreezePublicationRequest {
         publication_id: [0x74; 16],
         publication_stream_id: stream_id,
@@ -1536,7 +1511,7 @@ async fn snapshot_source_build_pin_is_authenticated_on_reopen() {
 
 #[tokio::test]
 async fn retention_stream_and_v4_ledger_tamper_each_fail_closed_on_reopen() {
-    async fn assert_rejected(label: &str, sql: &str, create_stream: bool) {
+    async fn assert_rejected(label: &str, sql: &str) {
         let root = TestRoot::new(label);
         let keys = MemoryKeyStore::new();
         let store = RuntimeStoreHandle::open(
@@ -1546,22 +1521,10 @@ async fn retention_stream_and_v4_ledger_tamper_each_fail_closed_on_reopen() {
         .await
         .expect("open tamper fixture");
         let input = conversation(label.as_bytes()[0]);
-        let conversation_id = input.conversation_id;
         store
             .create_conversation(input)
             .await
             .expect("create tamper conversation");
-        if create_stream {
-            store
-                .create_publication_stream(
-                    [0xD1; 16],
-                    PublicationScope::Conversation(conversation_id),
-                    [0xD2; 16],
-                    [0xD3; 16],
-                )
-                .await
-                .expect("create tamper publication stream");
-        }
         store.shutdown().await.expect("shutdown before tamper");
         let connection = rusqlite::Connection::open(root.database()).expect("open raw DB");
         if matches!(label, "retention-orphan" | "stream-index-orphan") {
@@ -1583,13 +1546,11 @@ async fn retention_stream_and_v4_ledger_tamper_each_fail_closed_on_reopen() {
     assert_rejected(
         "retention-token",
         "UPDATE event_retention SET metadata_token = zeroblob(32)",
-        false,
     )
     .await;
     assert_rejected(
         "retention-range-digest",
         "UPDATE event_retention SET range_digest = zeroblob(32)",
-        false,
     )
     .await;
     assert_rejected(
@@ -1602,7 +1563,6 @@ async fn retention_stream_and_v4_ledger_tamper_each_fail_closed_on_reopen() {
                 indexed_through_event_seq, retained_event_count, retained_logical_bytes,
                 range_digest, metadata_token
          FROM event_retention LIMIT 1",
-        false,
     )
     .await;
     assert_rejected(
@@ -1614,19 +1574,16 @@ async fn retention_stream_and_v4_ledger_tamper_each_fail_closed_on_reopen() {
              X'EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE', '00000000000000000000',
              X'DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD', 1, 0, zeroblob(32)
          )",
-        false,
     )
     .await;
     assert_rejected(
         "stream-token",
         "UPDATE publication_streams SET metadata_token = zeroblob(32)",
-        true,
     )
     .await;
     assert_rejected(
         "ledger-count",
         "UPDATE runtime_meta SET catalog_delta_count = 0 WHERE singleton = 1",
-        false,
     )
     .await;
 }

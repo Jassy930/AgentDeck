@@ -3,14 +3,14 @@
 use agentdeck_protocol::runtime::catalog::{CatalogSnapshot, MAX_CATALOG_PAGE_ROWS};
 use agentdeck_protocol::runtime::{ConversationEntry, StreamCursor};
 
-use super::CatalogSnapshotProviderError;
 use super::cache::actual_page_retained_bound;
 use super::cursor::{CursorClaims, CursorMacKey, encode_cursor};
+use super::{CatalogPageReference, CatalogSnapshotProviderError};
 use crate::runtime::store::{ReadySnapshotReference, StoredCatalogSnapshot};
 
 pub(super) fn construct_page(
     cursor_key: &CursorMacKey,
-    reference: &ReadySnapshotReference,
+    reference: &CatalogPageReference,
     selected: &[ConversationEntry],
     has_more: bool,
     issued_at_ms: u64,
@@ -28,7 +28,7 @@ pub(super) fn construct_page(
         Some(encode_cursor(
             cursor_key,
             &CursorClaims {
-                snapshot: reference.clone(),
+                reference: reference.clone(),
                 next_key,
                 issued_at_ms,
                 expires_at_ms,
@@ -41,7 +41,7 @@ pub(super) fn construct_page(
     let cursor_bytes = next_page_cursor
         .as_ref()
         .map_or(0, |value| value.as_str().len());
-    let snapshot = CatalogSnapshot::new(reference.base, page_entries, next_page_cursor)?;
+    let snapshot = CatalogSnapshot::new(reference.snapshot.base, page_entries, next_page_cursor)?;
     let payload =
         serde_json::to_vec(&snapshot).map_err(|_| CatalogSnapshotProviderError::InvalidCursor)?;
     let page_bytes =
