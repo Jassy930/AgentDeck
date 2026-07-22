@@ -53,6 +53,10 @@ final class HistorySidebarUnifiedHistoryTests: XCTestCase {
         XCTAssertFalse(visibleText.contains("Codex"))
         XCTAssertFalse(visibleText.contains("Claude Code"))
         XCTAssertFalse(visibleText.contains("claude_code"))
+
+        XCTAssertTrue(row.toolTip?.contains(thread.displayTitle) == true)
+        XCTAssertEqual(row.accessibilityLabel(), thread.displayTitle)
+        XCTAssertTrue((row.accessibilityValue() as? String)?.contains(thread.status) == true)
     }
 
     private static func allViews(_ root: NSView) -> [NSView] {

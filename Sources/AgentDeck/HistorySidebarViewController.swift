@@ -1,6 +1,12 @@
 import AppKit
 import AgentDeckCore
 
+private enum HistorySidebarLayout {
+    /// `.sourceList` 把数据 cell 向右移 16pt，为 outline chrome 预留空间。
+    /// 单列宽度必须扣除这段位移，cell 尾边才会与 clip view 对齐。
+    static let sourceListCellLeadingInset: CGFloat = 16
+}
+
 /// NSOutlineView-based history sidebar (source list style).
 /// Reproduces the SwiftUI `historySidebar` / `historyGroup` / `historyThreadRow`
 /// visual treatment from SessionView.swift (lines 130–377) in pure AppKit.
@@ -30,29 +36,47 @@ final class HistorySidebarViewController: NSViewController {
     }()
 
 
-    /// T6B: "+ New Session" — when set, the sidebar shows a plus button beside
-    /// Refresh and invokes the closure when tapped (SessionViewController
-    /// presents `NewSessionDialog`).
+    /// 新对话入口与项目标题行的加号共用该回调，由 SessionViewController
+    /// 展示 `NewSessionDialog`。
     var onNewSessionRequested: (() -> Void)?
     private let newSessionButton: NSButton = {
         let btn = NSButton()
         btn.bezelStyle = .inline
         btn.isBordered = false
-        btn.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "New session")
-        btn.toolTip = "New session"
-        // 显式灰色 + 关焦点环：inline 按钮拿到键盘焦点时会显蓝色高亮，关掉。
+        btn.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "新建会话")
+        btn.toolTip = "新建会话"
         btn.contentTintColor = DesignTokens.text3
-        btn.focusRingType = .none
+        btn.setAccessibilityIdentifier("sidebar-project-new-session")
+        btn.setAccessibilityLabel("新建会话")
         btn.translatesAutoresizingMaskIntoConstraints = false
         return btn
     }()
 
+    private lazy var topNewSessionButton = makeTopActionButton(
+        symbol: "square.and.pencil",
+        title: "新对话",
+        accessibilityIdentifier: "sidebar-new-conversation",
+        action: #selector(handleNewSession)
+    )
+
+    private lazy var searchToggleButton = makeTopActionButton(
+        symbol: "magnifyingglass",
+        title: "搜索",
+        accessibilityIdentifier: "sidebar-search-toggle",
+        buttonType: .pushOnPushOff,
+        action: #selector(handleSearchToggle)
+    )
+
     private let searchField: NSSearchField = {
         let sf = NSSearchField()
         sf.placeholderString = "搜索会话"
+        sf.setAccessibilityIdentifier("sidebar-search-field")
+        sf.setAccessibilityLabel("搜索会话")
         sf.translatesAutoresizingMaskIntoConstraints = false
         return sf
     }()
+    private var searchFieldHeightConstraint: NSLayoutConstraint?
+    private var isSearchExpanded = false
 
     /// Shown while isLoadingHistory
     private let loadingIndicator: NSProgressIndicator = {
@@ -78,10 +102,13 @@ final class HistorySidebarViewController: NSViewController {
 
     /// Shown when history is empty (and not loading or errored)
     private let emptyStateLabel: NSTextField = {
-        let label = NSTextField(wrappingLabelWithString: "暂无历史\n刷新以扫描已持久化的 agent 会话。")
+        let label = NSTextField(
+            wrappingLabelWithString: "暂无历史\n新建会话后会显示在这里；刷新可加载当前支持的历史。"
+        )
         label.font = .systemFont(ofSize: NSFont.systemFontSize)
         label.textColor = DesignTokens.text2
         label.isHidden = true
+        label.setAccessibilityIdentifier("sidebar-empty-history")
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }()
@@ -89,7 +116,12 @@ final class HistorySidebarViewController: NSViewController {
     private lazy var scrollView: NSScrollView = {
         let sv = NSScrollView()
         sv.hasVerticalScroller = true
+        sv.hasHorizontalScroller = false
         sv.autohidesScrollers = true
+        sv.automaticallyAdjustsContentInsets = false
+        sv.contentInsets = NSEdgeInsets()
+        sv.scrollerInsets = NSEdgeInsets()
+        sv.horizontalScrollElasticity = .none
         sv.drawsBackground = false   // 让侧栏容器底色透过，不自绘浅色/黑底
         sv.documentView = outlineView
         sv.translatesAutoresizingMaskIntoConstraints = false
@@ -104,6 +136,9 @@ final class HistorySidebarViewController: NSViewController {
         ov.intercellSpacing = NSSize(width: 0, height: 2)
         ov.indentationPerLevel = 0   // groups are not indented relative to root
         ov.autoresizesOutlineColumn = false
+        // `.sourceList` 会给单列留下隐式尾距；列宽由 `viewDidLayout()` 显式同步
+        // 到 clip view，确保高亮和尾随图标真正抵达分隔线。
+        ov.columnAutoresizingStyle = .noColumnAutoresizing
         // 侧栏毛玻璃做底，outline 自身透明让材质透出
         ov.backgroundColor = .clear
         ov.floatsGroupRows = false
@@ -112,6 +147,8 @@ final class HistorySidebarViewController: NSViewController {
 
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("main"))
         col.isEditable = false
+        col.resizingMask = []
+        col.minWidth = 0
         ov.addTableColumn(col)
         ov.outlineTableColumn = col
 
@@ -192,7 +229,10 @@ final class HistorySidebarViewController: NSViewController {
 
         let accountFooter = makeAccountFooter()
 
-        searchField.isHidden = true
+        searchField.stringValue = model.historySearchTerm
+        isSearchExpanded = !model.historySearchTerm.isEmpty
+        searchField.isHidden = !isSearchExpanded
+        searchToggleButton.state = isSearchExpanded ? .on : .off
 
         container.addSubview(topActions)
         container.addSubview(headerRow)
@@ -203,39 +243,44 @@ final class HistorySidebarViewController: NSViewController {
         container.addSubview(scrollView)
         container.addSubview(accountFooter)
 
+        let searchHeight = searchField.heightAnchor.constraint(
+            equalToConstant: isSearchExpanded ? 28 : 0
+        )
+        searchFieldHeightConstraint = searchHeight
+
         NSLayoutConstraint.activate([
             // 设计系统 .wb-side padding-top:44 + .wb-side__actions padding:6 10 → 顶起 50、水平 10
             topActions.topAnchor.constraint(equalTo: container.topAnchor, constant: 50),
             topActions.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 18),
             topActions.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -18),
 
-            // Header（设计 .wb-side__title padding:14 16 6 → 上 14、水平 16）
+            // Header（紧凑侧栏：上 14、左 16、右 12）
             headerRow.topAnchor.constraint(equalTo: topActions.bottomAnchor, constant: 14),
             headerRow.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            headerRow.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            headerRow.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
 
             // Search field
             searchField.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 8),
             searchField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             searchField.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-            searchField.heightAnchor.constraint(equalToConstant: 0),
+            searchHeight,
 
             // Loading indicator
-            loadingIndicator.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 12),
+            loadingIndicator.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 4),
             loadingIndicator.centerXAnchor.constraint(equalTo: container.centerXAnchor),
 
             // Error label
-            errorLabel.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 8),
+            errorLabel.topAnchor.constraint(equalTo: searchField.bottomAnchor),
             errorLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             errorLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
 
             // Empty-state label
-            emptyStateLabel.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 12),
+            emptyStateLabel.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 4),
             emptyStateLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             emptyStateLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
 
             // Outline scroll view
-            scrollView.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 10),
+            scrollView.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 2),
             scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: accountFooter.topAnchor, constant: -10),
@@ -258,44 +303,47 @@ final class HistorySidebarViewController: NSViewController {
         // Search is driven solely by NSSearchFieldDelegate.controlTextDidChange;
         // no target/action so each keystroke only reloads once.
         searchField.delegate = self
+        updateSearchToggleAccessibility()
 
         // Reopen all groups by default after data load
         updateVisibility()
     }
 
     private func makeTopActions() -> NSStackView {
-        let actions: [(String, String)] = [
-            ("square.and.pencil", "新对话"),
-            ("magnifyingglass", "搜索"),
-            ("clock", "已安排"),
-            ("puzzlepiece.extension", "插件"),
-        ]
-        let views = actions.map { symbol, title in
-            let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
-            icon.contentTintColor = DesignTokens.text2
-            icon.translatesAutoresizingMaskIntoConstraints = false
-            let label = NSTextField(labelWithString: title)
-            label.font = .systemFont(ofSize: 13, weight: .medium)
-            label.textColor = DesignTokens.text
-            label.translatesAutoresizingMaskIntoConstraints = false
-            let row = NSStackView(views: [icon, label])
-            row.orientation = .horizontal
-            row.alignment = .centerY
-            row.spacing = 9
-            row.translatesAutoresizingMaskIntoConstraints = false
-            NSLayoutConstraint.activate([
-                icon.widthAnchor.constraint(equalToConstant: 15),
-                icon.heightAnchor.constraint(equalToConstant: 15),
-                row.heightAnchor.constraint(equalToConstant: 27),
-            ])
-            return row
-        }
-        let stack = NSStackView(views: views)
+        let stack = NSStackView(views: [topNewSessionButton, searchToggleButton])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 7
         stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            topNewSessionButton.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            searchToggleButton.widthAnchor.constraint(equalTo: stack.widthAnchor),
+        ])
         return stack
+    }
+
+    private func makeTopActionButton(
+        symbol: String,
+        title: String,
+        accessibilityIdentifier: String,
+        buttonType: NSButton.ButtonType = .momentaryChange,
+        action: Selector
+    ) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        button.imagePosition = .imageLeading
+        button.imageHugsTitle = true
+        button.alignment = .left
+        button.font = .systemFont(ofSize: 13, weight: .medium)
+        button.contentTintColor = DesignTokens.text
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.setButtonType(buttonType)
+        button.setAccessibilityIdentifier(accessibilityIdentifier)
+        button.setAccessibilityLabel(title)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.heightAnchor.constraint(equalToConstant: 27).isActive = true
+        return button
     }
 
     private func makeAccountFooter() -> NSView {
@@ -352,6 +400,11 @@ final class HistorySidebarViewController: NSViewController {
         bindObservations()
     }
 
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        synchronizeOutlineColumnWidth()
+    }
+
     // MARK: - Observation Binding
 
     private func bindObservations() {
@@ -388,7 +441,23 @@ final class HistorySidebarViewController: NSViewController {
     // MARK: - Data Helpers
 
     private var groups: [HistoryProjectGroup] {
-        model.historyGroups
+        let allGroups = model.historyGroups
+        let query = model.historySearchTerm.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return allGroups }
+
+        return allGroups.compactMap { group in
+            if group.projectName.localizedCaseInsensitiveContains(query)
+                || group.cwd.localizedCaseInsensitiveContains(query) {
+                return group
+            }
+            let matchingThreads = group.threads.filter { thread in
+                thread.displayTitle.localizedCaseInsensitiveContains(query)
+                    || thread.preview.localizedCaseInsensitiveContains(query)
+                    || thread.status.localizedCaseInsensitiveContains(query)
+            }
+            guard !matchingThreads.isEmpty else { return nil }
+            return HistoryProjectGroup(cwd: group.cwd, threads: matchingThreads)
+        }
     }
 
     // MARK: - Reload
@@ -405,10 +474,29 @@ final class HistorySidebarViewController: NSViewController {
         }
     }
 
+    private func synchronizeOutlineColumnWidth() {
+        let visibleWidth = scrollView.contentView.bounds.width
+        guard visibleWidth > 0, let column = outlineView.tableColumns.first else { return }
+        let columnWidth = max(
+            0,
+            visibleWidth - HistorySidebarLayout.sourceListCellLeadingInset
+        )
+
+        if abs(column.width - columnWidth) > 0.5 {
+            column.width = columnWidth
+        }
+        if abs(outlineView.frame.width - visibleWidth) > 0.5 {
+            var size = outlineView.frame.size
+            size.width = visibleWidth
+            outlineView.setFrameSize(size)
+        }
+    }
+
     private func updateVisibility() {
         let loading = model.isLoadingHistory
         let hasError = model.historyErrorMessage != nil
         let isEmpty  = groups.isEmpty
+        let isSearching = !model.historySearchTerm.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
         loadingIndicator.isHidden = !loading
         if loading { loadingIndicator.startAnimation(nil) } else { loadingIndicator.stopAnimation(nil) }
@@ -417,6 +505,9 @@ final class HistorySidebarViewController: NSViewController {
         if let err = model.historyErrorMessage { errorLabel.stringValue = err }
 
         // Empty state only when done loading, no error, and really empty
+        emptyStateLabel.stringValue = isSearching
+            ? "没有匹配的会话"
+            : "暂无历史\n新建会话后会显示在这里；刷新可加载当前支持的历史。"
         emptyStateLabel.isHidden = loading || hasError || !isEmpty
 
         scrollView.isHidden = loading || hasError || isEmpty
@@ -426,6 +517,38 @@ final class HistorySidebarViewController: NSViewController {
 
     @objc private func handleNewSession() {
         onNewSessionRequested?()
+    }
+
+    @objc private func handleSearchToggle() {
+        setSearchExpanded(!isSearchExpanded)
+    }
+
+    private func setSearchExpanded(_ expanded: Bool) {
+        isSearchExpanded = expanded
+        searchFieldHeightConstraint?.constant = expanded ? 28 : 0
+        searchField.isHidden = !expanded
+        searchToggleButton.state = expanded ? .on : .off
+
+        if expanded {
+            view.needsLayout = true
+            view.layoutSubtreeIfNeeded()
+            view.window?.makeFirstResponder(searchField)
+        } else {
+            view.window?.makeFirstResponder(nil)
+            if !searchField.stringValue.isEmpty || !model.historySearchTerm.isEmpty {
+                searchField.stringValue = ""
+                model.historySearchTerm = ""
+                reloadOutline()
+            }
+        }
+        updateSearchToggleAccessibility()
+    }
+
+    private func updateSearchToggleAccessibility() {
+        let stateLabel = isSearchExpanded ? "已展开" : "已收起"
+        searchToggleButton.toolTip = isSearchExpanded ? "收起搜索" : "搜索会话"
+        searchToggleButton.setAccessibilityValue(stateLabel)
+        searchToggleButton.setAccessibilityHelp(isSearchExpanded ? "收起会话搜索框" : "展开会话搜索框")
     }
 
     // MARK: - Context Menu (Rename / Archive)
@@ -541,7 +664,7 @@ extension HistorySidebarViewController: NSOutlineViewDelegate {
     // MARK: Row height
 
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
-        // 设计系统：.projgroup padding:7 12（≈30）；.wb-side__list .thread padding:10 12 单行标题（≈40）。
+        // 设计系统：.projgroup padding:7 10（≈30）；.wb-side__list .thread padding:10 单行标题（≈40）。
         if item is HistoryProjectGroup { return 30 }
         return 40
     }
@@ -566,6 +689,12 @@ extension HistorySidebarViewController: NSOutlineViewDelegate {
 
     func outlineView(_ outlineView: NSOutlineView, isGroupItem item: Any) -> Bool {
         item is HistoryProjectGroup
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, shouldShowOutlineCellForItem item: Any) -> Bool {
+        // 分组始终展开且使用自绘行，不显示原生 disclosure cell。否则 `.sourceList`
+        // 会在单列两侧各保留约 16pt，造成右侧高亮和尾随图标提前结束。
+        false
     }
 
     @objc private func handleRename(_ sender: NSMenuItem) {
@@ -616,8 +745,7 @@ extension HistorySidebarViewController: NSSearchFieldDelegate {
     func controlTextDidChange(_ obj: Notification) {
         guard let sf = obj.object as? NSSearchField else { return }
         model.historySearchTerm = sf.stringValue
-        // Debouncing intentionally omitted — mirrors the SwiftUI onChange behaviour
-        // which calls loadHistory via .onSubmit / binding. Drive explicit reload here.
-        model.loadHistory()
+        // 历史已经在本地，搜索只过滤现有统一历史，避免每次按键重启 daemon 查询。
+        reloadOutline()
     }
 }

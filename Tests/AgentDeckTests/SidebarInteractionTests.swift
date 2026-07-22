@@ -74,6 +74,70 @@ final class SidebarInteractionTests: XCTestCase {
         XCTAssertTrue(vc.outlineView(NSOutlineView(), shouldSelectItem: t), "会话行应可选")
     }
 
+    func testTopActionsOnlyExposeWorkingNewSessionAndSearchButtons() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let vc = HistorySidebarViewController(model: model)
+        _ = vc.view
+
+        let buttons = vc.view.allDescendants(ofType: NSButton.self)
+        let newSession = try XCTUnwrap(buttons.first { $0.title == "新对话" })
+        let search = try XCTUnwrap(buttons.first { $0.title == "搜索" })
+
+        XCTAssertFalse(buttons.contains { $0.title == "已安排" })
+        XCTAssertFalse(buttons.contains { $0.title == "插件" })
+        XCTAssertNotEqual(newSession.focusRingType, .none)
+        XCTAssertNotEqual(search.focusRingType, .none)
+
+        var requestCount = 0
+        vc.onNewSessionRequested = { requestCount += 1 }
+        newSession.performClick(nil)
+        XCTAssertEqual(requestCount, 1, "The visible New conversation action must invoke the real session flow")
+    }
+
+    func testSearchActionExpandsFiltersAndClearsOnCollapse() throws {
+        let (vc, outlineView, model) = makeSidebar([
+            thread("t1", "拆分登录", cwd: "/p/refactor-auth"),
+            thread("t2", "修复竞态", cwd: "/p/refactor-auth"),
+            thread("t3", "补文档", cwd: "/p/agentdeck-docs"),
+        ])
+        let buttons = vc.view.allDescendants(ofType: NSButton.self)
+        let searchButton = try XCTUnwrap(buttons.first { $0.title == "搜索" })
+        let searchField = try XCTUnwrap(vc.view.firstDescendant(ofType: NSSearchField.self))
+
+        XCTAssertTrue(searchField.isHidden)
+        searchButton.performClick(nil)
+        vc.view.layoutSubtreeIfNeeded()
+        XCTAssertFalse(searchField.isHidden)
+        XCTAssertGreaterThan(searchField.frame.height, 0)
+
+        searchField.stringValue = "竞态"
+        vc.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: searchField))
+        XCTAssertEqual(model.historySearchTerm, "竞态")
+        XCTAssertEqual(outlineView.numberOfRows, 2, "One matching project and thread should remain visible")
+
+        searchButton.performClick(nil)
+        XCTAssertTrue(searchField.isHidden)
+        XCTAssertEqual(model.historySearchTerm, "")
+        XCTAssertEqual(outlineView.numberOfRows, 5, "Collapsing search must clear the hidden filter")
+    }
+
+    func testPreloadedSearchStartsExpandedWithToggleStateInSync() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        model.historySearchTerm = "竞态"
+        let vc = HistorySidebarViewController(model: model)
+        _ = vc.view
+
+        let searchButton = try XCTUnwrap(
+            vc.view.allDescendants(ofType: NSButton.self).first { $0.title == "搜索" }
+        )
+        let searchField = try XCTUnwrap(vc.view.firstDescendant(ofType: NSSearchField.self))
+
+        XCTAssertFalse(searchField.isHidden)
+        XCTAssertEqual(searchField.stringValue, "竞态")
+        XCTAssertEqual(searchButton.state, .on)
+        XCTAssertEqual(searchButton.accessibilityValue() as? String, "已展开")
+    }
+
     /// 渲染有数据的侧栏为 PNG，供人工核对真实呈现。
     func testRenderPopulatedSidebar() {
         let (vc, _, _) = makeSidebar([
@@ -81,6 +145,6 @@ final class SidebarInteractionTests: XCTestCase {
             thread("t2", "修复 token 刷新的竞态条件", cwd: "/p/refactor-auth", status: "waiting"),
             thread("t3", "补充 README 的部署章节", cwd: "/p/agentdeck-docs", status: "done"),
         ])
-        vc.view.renderPNG(to: "/tmp/adk-sidebar.png", size: NSSize(width: 236, height: 640))
+        vc.view.renderPNG(to: "/tmp/adk-sidebar.png", size: NSSize(width: 216, height: 640))
     }
 }
