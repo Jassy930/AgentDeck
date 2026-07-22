@@ -327,20 +327,20 @@ impl ClaudeCodeTranslator {
                     status: ShellStatus::Running,
                     exit_code: None,
                     duration_ms: None,
-                    meta: AgentItemMeta::default(),
+                    meta: tool_meta(&id),
                 })
             }
             "Edit" | "Write" | "MultiEdit" => {
                 let files = diff_files_from_tool_use(&name, &input);
                 self.agent_item_event(AgentItem::Diff {
                     files,
-                    meta: AgentItemMeta::default(),
+                    meta: tool_meta(&id),
                 })
             }
             _ => {
-                let mut meta = AgentItemMeta::default();
+                let mut meta = tool_meta(&id);
                 meta.vendor_extensions
-                    .insert("toolUseId".into(), json!(id.clone()));
+                    .insert("status".into(), json!("inProgress"));
                 self.agent_item_event(AgentItem::ToolCall {
                     name: name.clone(),
                     args: input.clone(),
@@ -417,7 +417,7 @@ impl ClaudeCodeTranslator {
                         status,
                         exit_code,
                         duration_ms: Some(duration_ms),
-                        meta: AgentItemMeta::default(),
+                        meta: tool_meta(tool_use_id),
                     })
                 }
                 "Edit" | "Write" | "MultiEdit" => {
@@ -426,13 +426,17 @@ impl ClaudeCodeTranslator {
                     let files = diff_files_from_tool_use(&record.name, &record.input);
                     self.agent_item_event(AgentItem::Diff {
                         files,
-                        meta: AgentItemMeta::default(),
+                        meta: tool_meta(tool_use_id),
                     })
                 }
                 _ => {
-                    let mut meta = AgentItemMeta::default();
+                    let mut meta = tool_meta(tool_use_id);
+                    meta.vendor_extensions.insert(
+                        "status".into(),
+                        json!(if is_error { "failed" } else { "completed" }),
+                    );
                     meta.vendor_extensions
-                        .insert("toolUseId".into(), json!(tool_use_id));
+                        .insert("durationMs".into(), json!(duration_ms));
                     if is_error {
                         meta.vendor_extensions.insert("isError".into(), json!(true));
                     }
@@ -561,6 +565,13 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn tool_meta(tool_use_id: &str) -> AgentItemMeta {
+    let mut meta = AgentItemMeta::default();
+    meta.vendor_extensions
+        .insert("toolUseId".into(), json!(tool_use_id));
+    meta
 }
 
 fn system_status_message(parsed: &Value) -> Option<String> {

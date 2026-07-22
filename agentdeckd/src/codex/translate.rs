@@ -855,6 +855,14 @@ fn tool_meta(item: &Value) -> AgentItemMeta {
             meta.vendor_extensions.insert(key.to_string(), v.clone());
         }
     }
+    if let Some(app_context) = item.get("appContext") {
+        for (source, target) in [("resourceUri", "resourceUri"), ("actionName", "actionName")] {
+            if let Some(value) = app_context.get(source) {
+                meta.vendor_extensions
+                    .insert(target.to_string(), value.clone());
+            }
+        }
+    }
     if let Some(kind) = item.get("type").and_then(Value::as_str) {
         meta.vendor_extensions
             .insert("codexToolKind".to_string(), json!(kind));
@@ -1342,6 +1350,27 @@ mod tests {
                 assert_eq!(result["success"], true);
             }
             other => panic!("expected dynamic ToolCall, got {other:?}"),
+        }
+
+        let mcp = history_item_to_agent_item(&json!({
+            "id": "mcp-1",
+            "type": "mcpToolCall",
+            "server": "node_repl",
+            "tool": "js",
+            "arguments": { "code": "..." },
+            "status": "completed",
+            "appContext": {
+                "connectorId": "computer-use",
+                "resourceUri": "app://agentdeck",
+                "actionName": "确认 AgentDeck 窗口"
+            }
+        }));
+        match mcp {
+            AgentItem::ToolCall { meta, .. } => {
+                assert_eq!(meta.vendor_extensions["resourceUri"], "app://agentdeck");
+                assert_eq!(meta.vendor_extensions["actionName"], "确认 AgentDeck 窗口");
+            }
+            other => panic!("expected MCP ToolCall, got {other:?}"),
         }
 
         let collab = history_item_to_agent_item(&json!({

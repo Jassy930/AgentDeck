@@ -78,14 +78,19 @@ fn bash_tool_use_becomes_shell_running() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::Shell {
-                command, status, ..
-            },
+            item:
+                AgentItem::Shell {
+                    command,
+                    status,
+                    meta,
+                    ..
+                },
             agent_kind,
             ..
         } => {
             assert_eq!(command, "ls -la");
             assert!(matches!(status, ShellStatus::Running));
+            assert_eq!(meta.vendor_extensions["toolUseId"], json!("tu_b1"));
             assert_eq!(*agent_kind, AgentKind::ClaudeCode);
         }
         other => panic!("expected Shell(Running), got {other:?}"),
@@ -127,6 +132,7 @@ fn tool_result_after_bash_emits_shell_completion() {
                     command,
                     status,
                     exit_code,
+                    meta,
                     ..
                 },
             ..
@@ -134,6 +140,7 @@ fn tool_result_after_bash_emits_shell_completion() {
             assert_eq!(command, "echo ok");
             assert!(matches!(status, ShellStatus::Completed));
             assert_eq!(*exit_code, Some(0));
+            assert_eq!(meta.vendor_extensions["toolUseId"], json!("tu_b1"));
         }
         other => panic!("expected Shell(Completed), got {other:?}"),
     }
@@ -200,7 +207,7 @@ fn edit_tool_use_becomes_diff() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::Diff { files, .. },
+            item: AgentItem::Diff { files, meta },
             ..
         } => {
             assert_eq!(files.len(), 1);
@@ -209,6 +216,7 @@ fn edit_tool_use_becomes_diff() {
             let p = files[0].patch.as_deref().unwrap_or("");
             assert!(p.contains("-foo"));
             assert!(p.contains("+bar"));
+            assert_eq!(meta.vendor_extensions["toolUseId"], json!("tu_e1"));
         }
         other => panic!("expected Diff, got {other:?}"),
     }
@@ -262,13 +270,70 @@ fn unknown_tool_becomes_tool_call() {
     assert_eq!(out.events.len(), 1);
     match &out.events[0] {
         ServerEvent::AgentItem {
-            item: AgentItem::ToolCall { name, result, .. },
+            item: AgentItem::ToolCall {
+                name, result, meta, ..
+            },
             ..
         } => {
             assert_eq!(name, "Read");
             assert!(result.is_none()); // populated on tool_result
+            assert_eq!(meta.vendor_extensions["toolUseId"], json!("tu_r1"));
+            assert_eq!(meta.vendor_extensions["status"], json!("inProgress"));
         }
         other => panic!("expected ToolCall, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_tool_result_preserves_failure_status_and_duration() {
+    let mut t = tr();
+    let started = json!({
+        "type": "assistant",
+        "session_id": "thread_1",
+        "message": { "content": [{
+            "type": "tool_use",
+            "id": "tu_r2",
+            "name": "Read",
+            "input": { "file_path": "/tmp/missing" }
+        }] }
+    });
+    let started_out = t.translate_line(&started.to_string());
+    assert_eq!(started_out.events.len(), 1);
+    match &started_out.events[0] {
+        ServerEvent::AgentItem {
+            item: AgentItem::ToolCall { meta, .. },
+            ..
+        } => {
+            assert_eq!(meta.vendor_extensions["toolUseId"], json!("tu_r2"));
+            assert_eq!(meta.vendor_extensions["status"], json!("inProgress"));
+        }
+        other => panic!("expected in-progress ToolCall, got {other:?}"),
+    }
+
+    let finished = json!({
+        "type": "user",
+        "session_id": "thread_1",
+        "message": { "content": [{
+            "type": "tool_result",
+            "tool_use_id": "tu_r2",
+            "content": "file not found",
+            "is_error": true
+        }] }
+    });
+    let out = t.translate_line(&finished.to_string());
+    assert_eq!(out.events.len(), 1);
+    match &out.events[0] {
+        ServerEvent::AgentItem {
+            item: AgentItem::ToolCall { result, meta, .. },
+            ..
+        } => {
+            assert_eq!(result.as_ref(), Some(&json!("file not found")));
+            assert_eq!(meta.vendor_extensions["toolUseId"], json!("tu_r2"));
+            assert_eq!(meta.vendor_extensions["status"], json!("failed"));
+            assert_eq!(meta.vendor_extensions["isError"], json!(true));
+            assert!(meta.vendor_extensions["durationMs"].as_u64().is_some());
+        }
+        other => panic!("expected ToolCall failure, got {other:?}"),
     }
 }
 

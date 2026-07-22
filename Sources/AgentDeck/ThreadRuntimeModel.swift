@@ -149,8 +149,7 @@ final class ThreadRuntimeModel {
         var store = AgentItemStore()
         for turn in turns {
             for item in turn.items {
-                agentItemSeq += 1
-                AgentItemReducer.apply(item, itemId: "ai-\(agentItemSeq)", into: &store)
+                AgentItemReducer.apply(item, itemId: nextItemId(for: item), into: &store)
             }
         }
         items = store.items
@@ -183,14 +182,49 @@ final class ThreadRuntimeModel {
 
     private func applyAgentItem(_ item: AgentItem) {
         markUpdated()
-        agentItemSeq += 1
-        let itemId = "ai-\(agentItemSeq)"
+        let itemId = nextItemId(for: item)
         var store = AgentItemStore()
         store.items = items
         store.itemIndexById = itemIndexById
         AgentItemReducer.apply(item, itemId: itemId, into: &store)
         items = store.items
         itemIndexById = store.itemIndexById
+    }
+
+    /// Claude Code emits a complete tool snapshot when a tool starts and a
+    /// second complete snapshot when it finishes. Both carry the same
+    /// `toolUseId`; folding that pair into one stable UI slot is the cumulative
+    /// AgentItem contract recorded by the v0.2 implementation plan.
+    private func nextItemId(for item: AgentItem) -> String {
+        // Keep the synthetic sequence aligned with the received event stream;
+        // stable tool snapshots still consume their original sequence position.
+        agentItemSeq += 1
+        if let toolUseId = toolUseId(from: item), !toolUseId.isEmpty {
+            return "tool-\(toolUseId)"
+        }
+        return "ai-\(agentItemSeq)"
+    }
+
+    private func toolUseId(from item: AgentItem) -> String? {
+        let meta: AgentItemMeta
+        switch item {
+        case .userMessage(_, let itemMeta),
+             .assistantMessage(_, let itemMeta),
+             .reasoning(_, let itemMeta):
+            meta = itemMeta
+        case .shell(_, _, _, _, let itemMeta):
+            meta = itemMeta
+        case .diff(_, let itemMeta),
+             .plan(_, let itemMeta):
+            meta = itemMeta
+        case .imageReference(_, _, let itemMeta):
+            meta = itemMeta
+        case .toolCall(_, _, _, let itemMeta):
+            meta = itemMeta
+        case .raw(_, _, let itemMeta):
+            meta = itemMeta
+        }
+        return meta.vendorExtensions["toolUseId"]?.value as? String
     }
 
     @discardableResult

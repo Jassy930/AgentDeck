@@ -796,7 +796,8 @@ final class ToolCallCellView: ConversationRowCellView {
         let contentW = contentWidth(forRowWidth: width)
         let toolName = ToolPresentation.toolName(item)
         let context = ToolPresentation.toolContextSummary(item)
-        let status = ToolPresentation.toolStatus(item)
+        let semanticStatus = ToolPresentation.toolStatus(item)
+        let status = ToolPresentation.toolStatusSummary(item)
 
         icon.image = Self.toolIcon(for: toolName)
         nameLabel.stringValue = toolName
@@ -805,7 +806,7 @@ final class ToolCallCellView: ConversationRowCellView {
         contextLabel.toolTip = context
         contextLabel.isHidden = context.isEmpty
         statusLabel.stringValue = status
-        statusLabel.textColor = Self.statusColor(for: status)
+        statusLabel.textColor = Self.statusColor(for: semanticStatus)
         statusLabel.isHidden = status.isEmpty
 
         // 参数/结果默认折叠：对话流保持干净，展开时才显示美化后的 JSON。
@@ -846,7 +847,7 @@ final class ToolCallCellView: ConversationRowCellView {
 
     private static func statusColor(for status: String) -> NSColor {
         let normalized = status.lowercased()
-        if ["running", "starting", "pending", "in_progress", "in progress"]
+        if ["running", "starting", "pending", "inprogress", "in_progress", "in progress"]
             .contains(normalized) {
             return DesignTokens.running
         }

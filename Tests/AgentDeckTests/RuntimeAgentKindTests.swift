@@ -53,6 +53,56 @@ final class RuntimeAgentKindTests: XCTestCase {
         XCTAssertEqual(runtime.items.first?.kind, "message")
     }
 
+    func testClaudeToolSnapshotsFoldIntoOneLiveItem() throws {
+        let runtime = ThreadRuntimeModel(
+            id: "cc-live",
+            agentKind: .claudeCode,
+            cwd: URL(fileURLWithPath: "/tmp")
+        )
+        let snapshots = claudeToolSnapshots(toolUseId: "tu-live")
+
+        for item in snapshots {
+            _ = runtime.ingest(.agentItem(
+                sessionId: "cc-live",
+                threadId: "thread-live",
+                agentKind: .claudeCode,
+                item: item
+            ))
+        }
+
+        XCTAssertEqual(runtime.items.count, 1)
+        XCTAssertEqual(runtime.itemIndexById.count, 1)
+        let item = try XCTUnwrap(runtime.items.first)
+        XCTAssertEqual(item.id, "tool-tu-live")
+        XCTAssertEqual(item.statusName, "failed")
+        XCTAssertEqual(item.durationMs, 42)
+        XCTAssertEqual(item.success, false)
+        XCTAssertTrue(item.result.contains("file not found"))
+        XCTAssertFalse(runtime.items.contains { $0.statusName == "inProgress" })
+    }
+
+    func testClaudeToolSnapshotsFoldIntoOneHistoryItem() throws {
+        let runtime = ThreadRuntimeModel(
+            id: "cc-history",
+            agentKind: .claudeCode,
+            cwd: URL(fileURLWithPath: "/tmp")
+        )
+
+        runtime.applyReplayTurns([
+            HistoryTurn(items: claudeToolSnapshots(toolUseId: "tu-history")),
+        ])
+
+        XCTAssertEqual(runtime.items.count, 1)
+        XCTAssertEqual(runtime.itemIndexById.count, 1)
+        let item = try XCTUnwrap(runtime.items.first)
+        XCTAssertEqual(item.id, "tool-tu-history")
+        XCTAssertEqual(item.statusName, "failed")
+        XCTAssertEqual(item.durationMs, 42)
+        XCTAssertEqual(item.success, false)
+        XCTAssertTrue(item.result.contains("file not found"))
+        XCTAssertFalse(runtime.items.contains { $0.statusName == "inProgress" })
+    }
+
     func testIngestTurnCompleteTransitionsToReady() {
         let runtime = ThreadRuntimeModel(id: "s1", agentKind: .codex, cwd: URL(fileURLWithPath: "/tmp"))
         runtime.phase = .running
@@ -158,6 +208,78 @@ final class RuntimeAgentKindTests: XCTestCase {
         XCTAssertEqual(runtime.items.map(\.statusName), expected.items.map(\.statusName))
     }
 
+    func testToolReducerPreservesNeutralPresentationMetadata() throws {
+        let meta = AgentItemMeta(vendorExtensions: [
+            "server": AnyCodable("node_repl"),
+            "status": AnyCodable("failed"),
+            "durationMs": AnyCodable(Int64(136)),
+            "mcpAppResourceUri": AnyCodable("app://agentdeck"),
+        ])
+        let agentItem = AgentItem.toolCall(
+            name: "js",
+            args: AnyCodable(["title": "确认 AgentDeck 窗口"]),
+            result: AnyCodable(["success": false]),
+            meta: meta
+        )
+        var store = AgentItemStore()
+
+        AgentItemReducer.apply(agentItem, itemId: "tool-1", into: &store)
+
+        let item = try XCTUnwrap(store.items.first)
+        XCTAssertEqual(item.server, "node_repl")
+        XCTAssertEqual(item.tool, "js")
+        XCTAssertEqual(item.toolKind, "mcp")
+        XCTAssertEqual(item.statusName, "failed")
+        XCTAssertEqual(item.durationMs, 136)
+        XCTAssertEqual(item.resourceUri, "app://agentdeck")
+        XCTAssertEqual(item.success, false)
+    }
+
+    func testToolReducerPreservesClaudeCodeFailureMetadata() throws {
+        let meta = AgentItemMeta(vendorExtensions: [
+            "toolUseId": AnyCodable("tool-use-1"),
+            "isError": AnyCodable(true),
+        ])
+        let agentItem = AgentItem.toolCall(
+            name: "Read",
+            args: AnyCodable(["file_path": "/tmp/missing"]),
+            result: AnyCodable("file not found"),
+            meta: meta
+        )
+        var store = AgentItemStore()
+
+        AgentItemReducer.apply(agentItem, itemId: "tool-cc-1", into: &store)
+
+        let item = try XCTUnwrap(store.items.first)
+        XCTAssertEqual(item.tool, "Read")
+        XCTAssertEqual(item.success, false)
+        XCTAssertEqual(ToolPresentation.toolStatus(item), "failed")
+    }
+
+    func testToolReducerPrefersCanonicalMCPAppContextMetadata() throws {
+        let meta = AgentItemMeta(vendorExtensions: [
+            "server": AnyCodable("node_repl"),
+            "status": AnyCodable("completed"),
+            "resourceUri": AnyCodable("app://canonical-agentdeck"),
+            "actionName": AnyCodable("确认 AgentDeck 窗口"),
+            "mcpAppResourceUri": AnyCodable("app://deprecated-agentdeck"),
+        ])
+        let agentItem = AgentItem.toolCall(
+            name: "js",
+            args: AnyCodable(["code": "..."]),
+            result: AnyCodable(["success": true]),
+            meta: meta
+        )
+        var store = AgentItemStore()
+
+        AgentItemReducer.apply(agentItem, itemId: "tool-canonical", into: &store)
+
+        let item = try XCTUnwrap(store.items.first)
+        XCTAssertEqual(item.resourceUri, "app://canonical-agentdeck")
+        XCTAssertEqual(item.action, "确认 AgentDeck 窗口")
+        XCTAssertEqual(ToolPresentation.toolContextSummary(item), "确认 AgentDeck 窗口")
+    }
+
     func testReplayTurnsBuildsLargeHistoryInOneCompleteStore() {
         let count = 4_000
         let items: [AgentItem] = (0..<count).map { index in
@@ -178,5 +300,31 @@ final class RuntimeAgentKindTests: XCTestCase {
         XCTAssertEqual(runtime.items.last?.id, "ai-4000")
         XCTAssertEqual(runtime.items.last?.text, "message-3999")
         XCTAssertEqual(runtime.itemIndexById["ai-4000"], 3_999)
+    }
+
+    private func claudeToolSnapshots(toolUseId: String) -> [AgentItem] {
+        let args = AnyCodable(["file_path": "/tmp/missing"])
+        return [
+            .toolCall(
+                name: "Read",
+                args: args,
+                result: nil,
+                meta: AgentItemMeta(vendorExtensions: [
+                    "toolUseId": AnyCodable(toolUseId),
+                    "status": AnyCodable("inProgress"),
+                ])
+            ),
+            .toolCall(
+                name: "Read",
+                args: args,
+                result: AnyCodable("file not found"),
+                meta: AgentItemMeta(vendorExtensions: [
+                    "toolUseId": AnyCodable(toolUseId),
+                    "status": AnyCodable("failed"),
+                    "durationMs": AnyCodable(42),
+                    "isError": AnyCodable(true),
+                ])
+            ),
+        ]
     }
 }

@@ -79,6 +79,16 @@ public enum ToolPresentation {
         }
         var parts: [String] = []
 
+        // Some generic MCP surfaces (notably node_repl/computer-use) expose a
+        // user-facing operation label in `title`. Without it every call
+        // collapses to the same opaque tool name such as `js`.
+        let titleKeys = ["title", "displaytitle", "operationtitle", "label"]
+        if !item.action.isEmpty {
+            parts.append(compactPreview(item.action))
+        } else if let title = firstDisplayValue(in: normalizedFields, keys: titleKeys) {
+            parts.append(title)
+        }
+
         let queryKeys = ["query", "pattern", "searchquery", "searchterm", "needle", "glob"]
         if let query = firstDisplayValue(in: normalizedFields, keys: queryKeys) {
             parts.append("query: \(query)")
@@ -90,7 +100,7 @@ public enum ToolPresentation {
         ]
         if let path = firstDisplayValue(in: normalizedFields, keys: pathKeys) {
             parts.append("path: \(path)")
-        } else if !item.resourceUri.isEmpty {
+        } else if parts.isEmpty, !item.resourceUri.isEmpty {
             parts.append("path: \(compactPreview(item.resourceUri))")
         }
 
@@ -105,6 +115,28 @@ public enum ToolPresentation {
         if !item.statusName.isEmpty { return item.statusName }
         if item.success == true || !item.result.isEmpty { return "completed" }
         return item.lifecycle
+    }
+
+    /// Localized, compact status shown in the collapsed tool row. The raw
+    /// status remains available through `toolStatus(_:)` for semantic color
+    /// mapping and tests; this function is presentation-only.
+    public static func toolStatusSummary(_ item: UIItem) -> String {
+        let rawStatus = toolStatus(item)
+        let localized: String
+        switch rawStatus.lowercased() {
+        case "running", "starting", "inprogress", "in_progress", "in progress": localized = "进行中"
+        case "pending", "queued": localized = "等待中"
+        case "completed", "complete", "done", "success", "succeeded": localized = "已完成"
+        case "failed", "failure", "error": localized = "失败"
+        case "canceled", "cancelled": localized = "已取消"
+        default: localized = rawStatus
+        }
+
+        guard let durationMs = item.durationMs else { return localized }
+        let duration = durationMs < 1_000
+            ? "\(durationMs)ms"
+            : String(format: "%.1fs", Double(durationMs) / 1_000)
+        return [localized, duration].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
     /// Caption parts for a generic tool-call row (status, success/failed,

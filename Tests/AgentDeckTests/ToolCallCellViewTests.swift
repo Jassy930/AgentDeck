@@ -39,7 +39,7 @@ final class ToolCallCellViewTests: XCTestCase {
             .map(\.stringValue)
         XCTAssertTrue(visibleLabels.contains("Read"))
         XCTAssertTrue(visibleLabels.contains("path: /repo/Sources/First.swift"))
-        XCTAssertTrue(visibleLabels.contains("completed"))
+        XCTAssertTrue(visibleLabels.contains("已完成"))
         XCTAssertFalse(visibleLabels.contains("Tool call"), "不应再显示会被压成 T 的泛化标题")
         XCTAssertFalse(visibleLabels.contains { $0.hasPrefix("arguments\n") })
 
@@ -73,7 +73,7 @@ final class ToolCallCellViewTests: XCTestCase {
         let visibleLabels = cell.allDescendants(ofType: NSTextField.self)
             .filter { !$0.isHidden }
             .map(\.stringValue)
-        XCTAssertTrue(visibleLabels.contains("failed"), "展开后状态仍应留在摘要行")
+        XCTAssertTrue(visibleLabels.contains("失败"), "展开后状态仍应留在摘要行")
         XCTAssertTrue(
             visibleLabels.contains { $0.contains("arguments\n") && $0.contains("result\n") },
             "展开后应保留完整 arguments/result payload"
@@ -85,11 +85,11 @@ final class ToolCallCellViewTests: XCTestCase {
     }
 
     func testStatusUsesReadableSemanticColor() throws {
-        let cases: [(status: String, color: NSColor)] = [
-            ("running", DesignTokens.running),
-            ("completed", DesignTokens.success),
-            ("failed", DesignTokens.danger),
-            ("queued", DesignTokens.text2),
+        let cases: [(status: String, label: String, color: NSColor)] = [
+            ("running", "进行中", DesignTokens.running),
+            ("completed", "已完成", DesignTokens.success),
+            ("failed", "失败", DesignTokens.danger),
+            ("queued", "等待中", DesignTokens.text2),
         ]
 
         for testCase in cases {
@@ -113,12 +113,39 @@ final class ToolCallCellViewTests: XCTestCase {
 
             let label = try XCTUnwrap(
                 cell.allDescendants(ofType: NSTextField.self)
-                    .first { $0.stringValue == testCase.status }
+                    .first { $0.stringValue == testCase.label }
             )
             XCTAssertTrue(
                 label.textColor?.isEqual(testCase.color) == true,
                 "\(testCase.status) 应使用对应语义色"
             )
         }
+    }
+
+    func testNodeReplRowShowsServerActionTitleAndTrueMetadata() {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        var item = UIItem(id: "computer-use-1", lifecycle: "completed", kind: "toolCall")
+        item.server = "node_repl"
+        item.tool = "js"
+        item.arguments = #"{"code":"...","title":"确认 AgentDeck 窗口","timeout_ms":30000}"#
+        item.statusName = "failed"
+        item.durationMs = 136
+        let row = ConversationDisplayRow(
+            role: .assistantItem,
+            turnId: "turn-computer-use",
+            item: item,
+            firstInTurn: true,
+            lastInTurn: true
+        )
+
+        let cell = ToolCallCellView()
+        cell.configure(row: row, width: 720, model: model)
+
+        let visibleLabels = cell.allDescendants(ofType: NSTextField.self)
+            .filter { !$0.isHidden }
+            .map(\.stringValue)
+        XCTAssertTrue(visibleLabels.contains("node_repl/js"))
+        XCTAssertTrue(visibleLabels.contains("确认 AgentDeck 窗口"))
+        XCTAssertTrue(visibleLabels.contains("失败 · 136ms"))
     }
 }

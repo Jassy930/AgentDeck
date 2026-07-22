@@ -176,6 +176,15 @@ struct ToolPresentationToolContextSummaryTests {
         )
     }
 
+    @Test("node_repl title makes adjacent generic js calls identifiable")
+    func nodeReplTitleIsSurfaced() {
+        var item = makeItem()
+        item.server = "node_repl"
+        item.tool = "js"
+        item.arguments = #"{"code":"...","title":"确认 AgentDeck 窗口","timeout_ms":30000}"#
+        #expect(ToolPresentation.toolContextSummary(item) == "确认 AgentDeck 窗口")
+    }
+
     @Test("resource URI is a fallback when arguments have no target")
     func resourceUriFallback() {
         var item = makeItem()
@@ -218,6 +227,21 @@ struct ToolPresentationToolStatusTests {
     func lifecycleFallback() {
         let item = makeItem(lifecycle: "running")
         #expect(ToolPresentation.toolStatus(item) == "running")
+    }
+
+    @Test("collapsed status is localized and includes a compact duration")
+    func localizedStatusIncludesDuration() {
+        var item = makeItem()
+        item.statusName = "completed"
+        item.durationMs = 1_449
+        #expect(ToolPresentation.toolStatusSummary(item) == "已完成 · 1.4s")
+    }
+
+    @Test("official inProgress status remains visibly active")
+    func camelCaseInProgressIsLocalized() {
+        var item = makeItem()
+        item.statusName = "inProgress"
+        #expect(ToolPresentation.toolStatusSummary(item) == "进行中")
     }
 }
 

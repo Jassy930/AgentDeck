@@ -85,9 +85,19 @@ public enum AgentItemReducer {
             ui.mediaKind = "image"
             ui.savedPath = savedPath ?? ""
             ui.path = originalPath ?? savedPath ?? ""
-        case .toolCall(let name, let args, let result, _):
+        case .toolCall(let name, let args, let result, let meta):
             ui.tool = name
-            ui.toolKind = "generic"
+            ui.server = stringExtension("server", from: meta) ?? ""
+            ui.namespace = stringExtension("namespace", from: meta) ?? ""
+            ui.statusName = stringExtension("status", from: meta) ?? ""
+            ui.durationMs = integerExtension("durationMs", from: meta)
+            ui.resourceUri = stringExtension("resourceUri", from: meta)
+                ?? stringExtension("mcpAppResourceUri", from: meta)
+                ?? ""
+            ui.action = stringExtension("actionName", from: meta) ?? ""
+            ui.toolKind = ui.server.isEmpty && ui.namespace.isEmpty ? "generic" : "mcp"
+            let metadataReportsError = booleanExtension("isError", from: meta) == true
+            ui.success = metadataReportsError ? false : nil
             if let argsData = try? JSONSerialization.data(
                 withJSONObject: AgentItemReducer.unwrap(args.value),
                 options: [.sortedKeys]
@@ -100,6 +110,11 @@ public enum AgentItemReducer {
                     options: [.sortedKeys]
                 ), let resStr = String(data: resData, encoding: .utf8) {
                     ui.result = resStr
+                }
+                if !metadataReportsError,
+                   let resultObject = result.value as? [String: Any],
+                   let success = resultObject["success"] as? Bool {
+                    ui.success = success
                 }
             }
         case .raw(let rawKind, let rawPayload, _):
@@ -117,5 +132,29 @@ public enum AgentItemReducer {
         // Wrap as single-item array so JSONSerialization can encode it; the
         // caller surfaces this as the argument blob anyway.
         return [value]
+    }
+
+    private static func stringExtension(_ key: String, from meta: AgentItemMeta) -> String? {
+        meta.vendorExtensions[key]?.value as? String
+    }
+
+    private static func booleanExtension(_ key: String, from meta: AgentItemMeta) -> Bool? {
+        meta.vendorExtensions[key]?.value as? Bool
+    }
+
+    private static func integerExtension(_ key: String, from meta: AgentItemMeta) -> Int? {
+        guard let value = meta.vendorExtensions[key]?.value else { return nil }
+        switch value {
+        case let value as Int:
+            return value
+        case let value as Int64:
+            return Int(exactly: value)
+        case let value as Double where value.isFinite && value.rounded() == value:
+            return Int(exactly: value)
+        case let value as NSNumber:
+            return value.intValue
+        default:
+            return nil
+        }
     }
 }
