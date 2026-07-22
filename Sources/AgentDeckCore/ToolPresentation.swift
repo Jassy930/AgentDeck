@@ -54,7 +54,57 @@ public enum ToolPresentation {
         if let prefix {
             return "\(prefix)/\(item.tool)"
         }
-        return item.tool
+        if !item.tool.isEmpty { return item.tool }
+        return item.toolKind == "mcp" ? "MCP tool" : "Tool"
+    }
+
+    /// Compact, discriminating context for a tool-call header. Tool payloads
+    /// often contain a large JSON object, but the path/query target is enough
+    /// to tell adjacent `Read` / `Grep` calls apart while they are collapsed.
+    /// Full arguments remain available in `toolPayload(_:)`.
+    public static func toolContextSummary(_ item: UIItem) -> String {
+        var fields: [String: Any] = [:]
+        if let data = item.arguments.data(using: .utf8),
+           let decoded = try? JSONSerialization.jsonObject(with: data),
+           let dictionary = decoded as? [String: Any] {
+            fields = dictionary
+        }
+
+        // Malformed/adapter-specific payloads can contain aliases such as both
+        // `file_path` and `filePath`; keep the first value instead of trapping
+        // on duplicate normalized keys.
+        var normalizedFields: [String: Any] = [:]
+        for key in fields.keys.sorted() where normalizedFields[normalizedKey(key)] == nil {
+            normalizedFields[normalizedKey(key)] = fields[key]
+        }
+        var parts: [String] = []
+
+        let queryKeys = ["query", "pattern", "searchquery", "searchterm", "needle", "glob"]
+        if let query = firstDisplayValue(in: normalizedFields, keys: queryKeys) {
+            parts.append("query: \(query)")
+        }
+
+        let pathKeys = [
+            "filepath", "path", "notebookpath", "directorypath", "directory",
+            "folder", "cwd", "root", "url", "uri",
+        ]
+        if let path = firstDisplayValue(in: normalizedFields, keys: pathKeys) {
+            parts.append("path: \(path)")
+        } else if !item.resourceUri.isEmpty {
+            parts.append("path: \(compactPreview(item.resourceUri))")
+        }
+
+        return parts.joined(separator: " · ")
+    }
+
+    /// One canonical status for the compact header. Prefer explicit failure
+    /// evidence, then adapter status, then completion evidence, and finally
+    /// the neutral lifecycle value carried by legacy history items.
+    public static func toolStatus(_ item: UIItem) -> String {
+        if item.success == false || !item.errorText.isEmpty { return "failed" }
+        if !item.statusName.isEmpty { return item.statusName }
+        if item.success == true || !item.result.isEmpty { return "completed" }
+        return item.lifecycle
     }
 
     /// Caption parts for a generic tool-call row (status, success/failed,
@@ -89,5 +139,32 @@ public enum ToolPresentation {
               let string = String(data: pretty, encoding: .utf8)
         else { return compact }
         return string
+    }
+
+    private static func normalizedKey(_ key: String) -> String {
+        key.lowercased().filter { $0.isLetter || $0.isNumber }
+    }
+
+    private static func firstDisplayValue(
+        in fields: [String: Any],
+        keys: [String]
+    ) -> String? {
+        for key in keys {
+            guard let value = fields[key] else { continue }
+            if let string = value as? String, !string.isEmpty {
+                let preview = compactPreview(string)
+                if !preview.isEmpty { return preview }
+            }
+            if let number = value as? NSNumber {
+                return number.stringValue
+            }
+        }
+        return nil
+    }
+
+    private static func compactPreview(_ value: String, limit: Int = 180) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > limit else { return trimmed }
+        return String(trimmed.prefix(limit - 1)) + "…"
     }
 }

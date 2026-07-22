@@ -185,19 +185,15 @@ enum ConversationRowFactory {
             return h
 
         case "toolCall":
-            var h: CGFloat = 10 * 2
-            h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
-            h += verticalGap + textHeight(ToolPresentation.toolName(item),
-                                          font: ConversationRowMetrics.monoCalloutMediumFont, width: contentW)
-            let metadata = ToolPresentation.toolMetadata(item)
-            if !metadata.isEmpty {
-                h += verticalGap + ConversationRowMetrics.lineHeight(ConversationRowMetrics.monoCaptionFont)
-            }
-            // 参数/结果默认折叠：只算 disclosure 头（展开后的载荷高度由控制器补上）。
-            if !ToolPresentation.toolPayload(item).isEmpty {
-                h += verticalGap + disclosureHeaderHeight
-            }
-            return h
+            // Collapsed tool calls are always one compact summary line. The
+            // full payload is still measured by ConversationViewController
+            // when disclosure state is expanded.
+            let compactVerticalPadding: CGFloat = 6 * 2
+            let compactHeaderHeight = max(
+                ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutMediumFont),
+                18
+            )
+            return compactVerticalPadding + compactHeaderHeight
 
         case "collabAgentToolCall":
             var h: CGFloat = 10 * 2

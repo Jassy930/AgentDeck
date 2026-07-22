@@ -141,4 +141,36 @@ final class ConversationRowFactoryTests: XCTestCase {
         // The collapsed height must be far smaller than the full output would be.
         XCTAssertLessThan(height, 400, "折叠态 shell 行高应只计 header，不随 output 行数膨胀")
     }
+
+    func testCollapsedToolCallUsesCompactSingleLineHeight() {
+        let row = ConversationDisplayRowTestSupport.assistantRow(kind: "toolCall") { item in
+            item.tool = "Read"
+            item.arguments = #"{"file_path":"/tmp/compact.swift"}"#
+            item.result = String(repeating: "payload line\n", count: 200)
+            item.statusName = "completed"
+        }
+
+        let height = ConversationRowFactory.height(for: row, width: 400)
+
+        XCTAssertLessThanOrEqual(height, 32, "折叠态 toolCall 应保持为紧凑单行")
+    }
+
+    func testCollapsedToolCallHeightDoesNotGrowWithPayload() {
+        let short = ConversationDisplayRowTestSupport.assistantRow(kind: "toolCall") { item in
+            item.tool = "Read"
+            item.arguments = #"{"file_path":"/tmp/short.swift"}"#
+        }
+        let long = ConversationDisplayRowTestSupport.assistantRow(kind: "toolCall") { item in
+            item.tool = "Read"
+            item.arguments = #"{"file_path":"/tmp/long.swift"}"#
+            item.result = String(repeating: "result\n", count: 500)
+        }
+
+        XCTAssertEqual(
+            ConversationRowFactory.height(for: short, width: 400),
+            ConversationRowFactory.height(for: long, width: 400),
+            accuracy: 0.1,
+            "payload 只应影响展开态高度"
+        )
+    }
 }

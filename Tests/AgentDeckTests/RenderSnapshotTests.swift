@@ -33,10 +33,10 @@ final class RenderSnapshotTests: XCTestCase {
     func testRenderToolCallCollapsed() {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         var item = UIItem(id: "tc1", lifecycle: "completed", kind: "toolCall")
-        item.tool = "TaskCreate"
+        item.tool = "Read"
         item.statusName = "completed"
         item.success = true
-        item.arguments = "{\"activeForm\":\"收录厂家摄像头资料\",\"subject\":\"收录厂家参数\",\"description\":\"把资料收进当前仓库\"}"
+        item.arguments = "{\"file_path\":\"/repo/Sources/AgentDeck/ConversationRowViews.swift\"}"
         let row = ConversationDisplayRow(role: .assistantItem, turnId: "t", item: item,
                                          firstInTurn: true, lastInTurn: true)
         let cell = ToolCallCellView()
@@ -59,9 +59,9 @@ final class RenderSnapshotTests: XCTestCase {
         }
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         var item = UIItem(id: "tc2", lifecycle: "completed", kind: "toolCall")
-        item.tool = "TaskCreate"
+        item.tool = "Grep"
         item.statusName = "completed"
-        item.arguments = "{\"activeForm\":\"收录厂家摄像头资料\",\"subject\":\"收录厂家参数\",\"description\":\"把资料收进当前仓库\"}"
+        item.arguments = "{\"pattern\":\"ToolCallCellView\",\"path\":\"/repo/Sources\"}"
         let row = ConversationDisplayRow(role: .assistantItem, turnId: "t", item: item,
                                          firstInTurn: true, lastInTurn: true)
         let store = AlwaysExpanded()

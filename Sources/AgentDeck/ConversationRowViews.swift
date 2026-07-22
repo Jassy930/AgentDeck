@@ -677,13 +677,31 @@ final class HookPromptCellView: ConversationRowCellView {
     }
 }
 
-/// Ports "toolCall" / MCP: header + tool name + metadata + payload labels.
+/// Compact tool-call row: one collapsed summary line (icon + tool + target +
+/// status + disclosure) and the full payload beneath it only when expanded.
+/// Keeping the tool name and target on the first line makes adjacent `Read`
+/// calls identifiable without spending four transcript rows per call.
 final class ToolCallCellView: ConversationRowCellView {
-    private let header = ToolHeaderView(systemImage: "wrench.and.screwdriver", title: "Tool call")
+    override var verticalPadding: CGFloat { 6 }
+
+    private let summaryRow = NSStackView()
+    private let icon = NSImageView()
     private let nameLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCalloutMediumFont, color: DesignTokens.text)
-    private let metadataLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text3)
+        font: ConversationRowMetrics.calloutMediumFont,
+        color: DesignTokens.text,
+        selectable: false
+    )
+    private let contextLabel = ConversationRowControls.label(
+        font: ConversationRowMetrics.monoCaptionFont,
+        color: DesignTokens.text2,
+        selectable: false
+    )
+    private let statusLabel = ConversationRowControls.label(
+        font: ConversationRowMetrics.monoCaptionFont,
+        color: DesignTokens.text2,
+        selectable: false
+    )
+    private let spacer = NSView()
     private let disclosure = ConversationRowControls.disclosureButton(title: "")
     private let payloadLabel = ConversationRowControls.label(
         font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text2)
@@ -694,14 +712,68 @@ final class ToolCallCellView: ConversationRowCellView {
         super.init(frame: frameRect)
         applyVerticalPadding()
         contentStack.spacing = 5
+
+        summaryRow.orientation = .horizontal
+        summaryRow.alignment = .centerY
+        summaryRow.spacing = 7
+        summaryRow.translatesAutoresizingMaskIntoConstraints = false
+
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.imageScaling = .scaleProportionallyDown
+        icon.contentTintColor = DesignTokens.text3
+        icon.setAccessibilityElement(false)
+
+        for label in [nameLabel, contextLabel, statusLabel] {
+            label.maximumNumberOfLines = 1
+        }
+        nameLabel.lineBreakMode = .byTruncatingTail
+        nameLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        nameLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        contextLabel.lineBreakMode = .byTruncatingMiddle
+        contextLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        contextLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.setContentHuggingPriority(.required, for: .horizontal)
+        statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
         disclosure.target = self
         disclosure.action = #selector(toggle)
-        contentStack.addArrangedSubview(header)
-        contentStack.addArrangedSubview(nameLabel)
-        contentStack.addArrangedSubview(metadataLabel)
-        contentStack.addArrangedSubview(disclosure)
+        disclosure.title = ""
+        disclosure.toolTip = "Show tool details"
+        disclosure.setAccessibilityLabel("Show tool details")
+        disclosure.setContentHuggingPriority(.required, for: .horizontal)
+        disclosure.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        summaryRow.addArrangedSubview(icon)
+        summaryRow.addArrangedSubview(nameLabel)
+        summaryRow.addArrangedSubview(contextLabel)
+        summaryRow.addArrangedSubview(spacer)
+        summaryRow.addArrangedSubview(statusLabel)
+        summaryRow.addArrangedSubview(disclosure)
+
+        contentStack.addArrangedSubview(summaryRow)
         contentStack.addArrangedSubview(payloadLabel)
-        pin(nameLabel); pin(metadataLabel); pin(payloadLabel)
+        pin(summaryRow)
+        pin(payloadLabel)
+
+        NSLayoutConstraint.activate([
+            // The base cell intentionally permits natural-width stacks, but a
+            // compact header needs the full transcript width so its path can
+            // truncate only after status/disclosure have been reserved.
+            contentStack.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -ConversationRowCellView.horizontalInset
+            ),
+            icon.widthAnchor.constraint(equalToConstant: 14),
+            icon.heightAnchor.constraint(equalToConstant: 14),
+            summaryRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 18),
+            disclosure.widthAnchor.constraint(equalToConstant: 18),
+            disclosure.heightAnchor.constraint(equalToConstant: 18),
+        ])
     }
 
     required init?(coder: NSCoder) { super.init(coder: coder) }
@@ -721,29 +793,71 @@ final class ToolCallCellView: ConversationRowCellView {
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
         let item = row.item
         itemId = item.id
-        header.update(
-            systemImage: "wrench.and.screwdriver",
-            title: item.toolKind == "mcp" ? "MCP tool" : "Tool call"
-        )
         let contentW = contentWidth(forRowWidth: width)
-        nameLabel.stringValue = ToolPresentation.toolName(item)
-        nameLabel.preferredMaxLayoutWidth = contentW
+        let toolName = ToolPresentation.toolName(item)
+        let context = ToolPresentation.toolContextSummary(item)
+        let status = ToolPresentation.toolStatus(item)
 
-        let metadata = ToolPresentation.toolMetadata(item)
-        metadataLabel.stringValue = metadata.joined(separator: " · ")
-        metadataLabel.isHidden = metadata.isEmpty
+        icon.image = Self.toolIcon(for: toolName)
+        nameLabel.stringValue = toolName
+        nameLabel.toolTip = toolName
+        contextLabel.stringValue = context
+        contextLabel.toolTip = context
+        contextLabel.isHidden = context.isEmpty
+        statusLabel.stringValue = status
+        statusLabel.textColor = Self.statusColor(for: status)
+        statusLabel.isHidden = status.isEmpty
 
         // 参数/结果默认折叠：对话流保持干净，展开时才显示美化后的 JSON。
         let payload = ToolPresentation.toolPayload(item)
         let hasPayload = !payload.isEmpty
         disclosure.isHidden = !hasPayload
-        disclosure.title = ToolPresentation.outputLabel(payload, noun: "details")
+        disclosure.toolTip = hasPayload
+            ? ToolPresentation.outputLabel(payload, noun: "details")
+            : nil
         payloadLabel.stringValue = payload
         payloadLabel.preferredMaxLayoutWidth = contentW
 
         let expanded = hasPayload && (disclosureStore?.isItemExpanded(item.id) ?? false)
         disclosure.state = expanded ? .on : .off
         payloadLabel.isHidden = !expanded
+
+        let accessibilityParts = [toolName, context, status].filter { !$0.isEmpty }
+        setAccessibilityLabel(accessibilityParts.joined(separator: ", "))
+    }
+
+    private static func toolIcon(for name: String) -> NSImage? {
+        let lowered = name.lowercased()
+        let preferredSymbol: String
+        if lowered.contains("read") {
+            preferredSymbol = "doc.text.magnifyingglass"
+        } else if ["grep", "glob", "search", "find"].contains(where: lowered.contains) {
+            preferredSymbol = "magnifyingglass"
+        } else if lowered.contains("fetch") || lowered.contains("web") {
+            preferredSymbol = "globe"
+        } else if lowered.contains("task") {
+            preferredSymbol = "checklist"
+        } else {
+            preferredSymbol = "wrench.and.screwdriver"
+        }
+        return NSImage(systemSymbolName: preferredSymbol, accessibilityDescription: nil)
+            ?? NSImage(systemSymbolName: "wrench.and.screwdriver", accessibilityDescription: nil)
+    }
+
+    private static func statusColor(for status: String) -> NSColor {
+        let normalized = status.lowercased()
+        if ["running", "starting", "pending", "in_progress", "in progress"]
+            .contains(normalized) {
+            return DesignTokens.running
+        }
+        if ["completed", "complete", "done", "success", "succeeded"]
+            .contains(normalized) {
+            return DesignTokens.success
+        }
+        if ["failed", "failure", "error"].contains(normalized) {
+            return DesignTokens.danger
+        }
+        return DesignTokens.text2
     }
 }
 
