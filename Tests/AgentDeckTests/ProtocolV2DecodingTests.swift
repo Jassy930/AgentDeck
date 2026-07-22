@@ -242,6 +242,43 @@ final class ProtocolV2DecodingTests: XCTestCase {
         XCTAssertTrue(line.contains("\"command\":\"history\""))
         XCTAssertTrue(line.contains("\"op\":\"list\""))
         XCTAssertTrue(line.contains("\"agentKind\":\"codex\""))
+        XCTAssertFalse(line.contains("\"requestId\""), "legacy request should omit a nil requestId")
+    }
+
+    func testDecodeLegacyHistoryRequestWithoutRequestId() throws {
+        let json = #"{"op":"list","agentKind":"codex","limit":25}"#
+        let request = try JSONDecoder().decode(HistoryRequest.self, from: Data(json.utf8))
+
+        XCTAssertNil(request.requestId)
+        guard case let .list(agentKind, cwdFilter, limit, requestId) = request else {
+            return XCTFail("expected list")
+        }
+        XCTAssertEqual(agentKind, .codex)
+        XCTAssertNil(cwdFilter)
+        XCTAssertEqual(limit, 25)
+        XCTAssertNil(requestId)
+    }
+
+    func testHistoryRequestIdRoundTripsForEveryOperation() throws {
+        let requests: [HistoryRequest] = [
+            .list(agentKind: nil, cwdFilter: "/proj", limit: 25),
+            .read(threadId: "read-1", agentKind: .codex),
+            .archive(threadId: "archive-1", agentKind: .claudeCode),
+            .unarchive(threadId: "unarchive-1", agentKind: .codex),
+            .rename(threadId: "rename-1", agentKind: .claudeCode, title: "renamed"),
+        ]
+
+        for request in requests {
+            let correlated = request.withRequestId("history-request-42")
+            XCTAssertEqual(correlated.requestId, "history-request-42")
+
+            let data = try JSONEncoder().encode(correlated)
+            let wire = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(wire["requestId"] as? String, "history-request-42")
+
+            let decoded = try JSONDecoder().decode(HistoryRequest.self, from: data)
+            XCTAssertEqual(decoded.requestId, "history-request-42")
+        }
     }
 
     func testDecodeHistoryResponseList() throws {

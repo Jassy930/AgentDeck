@@ -26,9 +26,15 @@
 
 use crate::agent::{AgentEventSender, AgentSessionHandle};
 use crate::runtime::router::AgentRouter;
-use agentdeck_protocol::{ClientCommand, PROTOCOL_VERSION, ProtocolError, ServerEvent, SessionId};
+#[cfg(test)]
+use agentdeck_protocol::HistoryRequest;
+use agentdeck_protocol::{
+    ClientCommand, HistoryResponse, PROTOCOL_VERSION, ProtocolError, ServerEvent, SessionId,
+};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
 
@@ -41,6 +47,42 @@ const EVENTS_CHANNEL_CAPACITY: usize = 256;
 /// ProtocolSchema, ProtocolVersion. These are bursty but rare; 32 is
 /// enough headroom for a flood of selfchecks during boot.
 const ADMIN_REPLY_CAPACITY: usize = 32;
+
+/// Bound the complete merged-history operation below the Swift client's
+/// 35-second transport timeout. Dropping the router future also guarantees
+/// the daemon cannot emit a late terminal reply after this deadline.
+const HISTORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(32);
+
+async fn handle_history_with_timeout<F>(
+    request: F,
+    timeout: Duration,
+) -> Result<HistoryResponse, ProtocolError>
+where
+    F: Future<Output = Result<HistoryResponse, ProtocolError>>,
+{
+    tokio::time::timeout(timeout, request)
+        .await
+        .map_err(|_| ProtocolError {
+            code: "history-request-timeout".into(),
+            message: format!("history request exceeded the {timeout:?} daemon deadline"),
+            diagnostic_ref: None,
+        })?
+}
+
+fn history_admin_reply(
+    request_id: Option<String>,
+    result: Result<HistoryResponse, ProtocolError>,
+) -> String {
+    let mut reply = serde_json::json!({ "reply": "history" });
+    if let Some(request_id) = request_id {
+        reply["requestId"] = serde_json::Value::String(request_id);
+    }
+    match result {
+        Ok(response) => reply["response"] = serde_json::json!(response),
+        Err(error) => reply["error"] = serde_json::json!(error),
+    }
+    reply.to_string()
+}
 
 /// Coordinator for the daemon's stdin/stdout main loop.
 ///
@@ -341,34 +383,23 @@ impl RuntimeHub {
                 // events) so it doesn't try to fit through the
                 // `ServerEvent` shape.
                 //
-                // Errors still flow through events_tx as
-                // `ServerEvent::Error` (consistent with every other
-                // failure path in this dispatch).
+                // Success and error use one request-correlated admin reply.
+                // Do not also emit an uncorrelated `ServerEvent::Error`: a
+                // concurrent history waiter could mistake that side-channel
+                // event for its own terminal failure.
                 //
                 // K1 (C6 fix): spawn — Read/List can fan out across
                 // adapters and touch disk; don't block stdin.
+                let request_id = req.request_id().map(str::to_owned);
                 let router = Arc::clone(&self.router);
-                let events_tx = events_tx.clone();
                 let admin_tx = admin_tx.clone();
                 tokio::spawn(async move {
-                    match router.handle_history(req).await {
-                        Ok(response) => {
-                            let line = serde_json::json!({
-                                "reply": "history",
-                                "response": response,
-                            })
-                            .to_string();
-                            let _ = admin_tx.send(line).await;
-                        }
-                        Err(error) => {
-                            let _ = events_tx
-                                .send(ServerEvent::Error {
-                                    session_id: None,
-                                    error,
-                                })
-                                .await;
-                        }
-                    }
+                    let result = handle_history_with_timeout(
+                        router.handle_history(req),
+                        HISTORY_REQUEST_TIMEOUT,
+                    )
+                    .await;
+                    let _ = admin_tx.send(history_admin_reply(request_id, result)).await;
                 });
             }
         }
@@ -524,13 +555,36 @@ mod tests {
         assert_eq!(parsed["ok"], true);
     }
 
-    /// Task 4C — Phase 4 finalization: History command now flows
-    /// end-to-end through the router. With an empty router the
-    /// cross-agent List collapses to `{"reply":"history","response":
-    /// {"kind":"list","value":[]}}` on the admin reply side-channel.
-    /// Asserts the wire shape so Phase 5 / 6 clients can rely on it.
+    #[test]
+    fn history_success_admin_reply_echoes_request_id() {
+        let line = history_admin_reply(
+            Some("history-success-1".into()),
+            Ok(HistoryResponse::List(Vec::new())),
+        );
+        let reply: serde_json::Value = serde_json::from_str(&line).expect("history reply JSON");
+
+        assert_eq!(reply["reply"], "history");
+        assert_eq!(reply["requestId"], "history-success-1");
+        assert_eq!(reply["response"]["kind"], "list");
+        assert!(reply.get("error").is_none());
+    }
+
     #[tokio::test]
-    async fn history_list_returns_admin_reply_with_empty_list_on_bare_router() {
+    async fn history_timeout_helper_bounds_pending_future() {
+        let pending = std::future::pending::<Result<HistoryResponse, ProtocolError>>();
+        let error = handle_history_with_timeout(pending, Duration::from_millis(5))
+            .await
+            .expect_err("pending history future must time out");
+
+        assert_eq!(error.code, "history-request-timeout");
+        assert!(error.message.contains("5ms"));
+    }
+
+    /// An empty router is a configuration failure, not an empty history.
+    /// The error must use the History admin envelope so request/response
+    /// clients always receive a terminal reply for their refresh.
+    #[tokio::test]
+    async fn history_list_on_bare_router_returns_admin_error_reply() {
         let router = Arc::new(AgentRouter::new());
         let hub = RuntimeHub::new(router);
 
@@ -540,6 +594,7 @@ mod tests {
         let hub_task = tokio::spawn(hub.run(daemon_stdin, daemon_stdout));
 
         let cmd = ClientCommand::History(HistoryRequest::List {
+            request_id: Some("history-list-1".into()),
             agent_kind: None,
             cwd_filter: None,
             limit: None,
@@ -559,21 +614,24 @@ mod tests {
             .expect("daemon should respond and exit");
         hub_task.await.unwrap().unwrap();
 
-        let response = String::from_utf8_lossy(&buf);
-        let first_line = response.lines().next().expect("at least one reply line");
-        let parsed: serde_json::Value =
-            serde_json::from_str(first_line).expect("history reply JSON");
-        assert_eq!(parsed["reply"], "history");
-        assert_eq!(parsed["response"]["kind"], "list");
-        assert!(parsed["response"]["value"].is_array());
-        assert_eq!(parsed["response"]["value"].as_array().unwrap().len(), 0);
+        let lines = String::from_utf8_lossy(&buf)
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("output JSON"))
+            .collect::<Vec<_>>();
+        let reply = lines
+            .iter()
+            .find(|line| line["reply"] == "history")
+            .expect("history admin reply");
+        assert_eq!(reply["requestId"], "history-list-1");
+        assert_eq!(reply["error"]["code"], "history-no-sources");
+        assert!(reply.get("response").is_none());
+        assert!(lines.iter().all(|line| line.get("type").is_none()));
     }
 
-    /// Read against an unregistered agent kind surfaces an Error
-    /// event (not a hung-forever admin reply). Confirms the failure
-    /// path still flows through the normal events stream.
+    /// Read against an unregistered agent kind returns exactly one correlated
+    /// History admin error reply, without an uncorrelated Error event.
     #[tokio::test]
-    async fn history_read_for_unregistered_kind_yields_error_event() {
+    async fn history_read_for_unregistered_kind_returns_only_correlated_reply() {
         let router = Arc::new(AgentRouter::new());
         let hub = RuntimeHub::new(router);
 
@@ -583,6 +641,7 @@ mod tests {
         let hub_task = tokio::spawn(hub.run(daemon_stdin, daemon_stdout));
 
         let cmd = ClientCommand::History(HistoryRequest::Read {
+            request_id: Some("history-read-1".into()),
             thread_id: ThreadId("nope".into()),
             agent_kind: AgentKind::Codex,
         });
@@ -601,15 +660,17 @@ mod tests {
             .expect("daemon should respond and exit");
         hub_task.await.unwrap().unwrap();
 
-        let response = String::from_utf8_lossy(&buf);
-        let first_line = response.lines().next().expect("at least one reply line");
-        let event: ServerEvent = serde_json::from_str(first_line).expect("ServerEvent");
-        match event {
-            ServerEvent::Error { error, .. } => {
-                assert_eq!(error.code, "agent-not-registered");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
+        let lines = String::from_utf8_lossy(&buf)
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("output JSON"))
+            .collect::<Vec<_>>();
+        let reply = lines
+            .iter()
+            .find(|line| line["reply"] == "history")
+            .expect("history admin reply");
+        assert_eq!(reply["requestId"], "history-read-1");
+        assert_eq!(reply["error"]["code"], "agent-not-registered");
+        assert!(lines.iter().all(|line| line.get("type").is_none()));
     }
 
     /// K1 regression (C6 fix): a slow SessionStart must NOT block

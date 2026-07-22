@@ -19,10 +19,20 @@ final class MockDaemonTransportTests: XCTestCase {
 
     func testHistoryListReplyDecodes() {
         let t = MockDaemonTransport()
-        let frames = lines(from: t, after: .history(.list(agentKind: nil, cwdFilter: nil, limit: nil)), count: 1)
+        let frames = lines(
+            from: t,
+            after: .history(.list(
+                agentKind: nil,
+                cwdFilter: nil,
+                limit: nil,
+                requestId: "mock-history-request"
+            )),
+            count: 1
+        )
         XCTAssertEqual(frames.count, 1)
         let obj = try! JSONSerialization.jsonObject(with: Data(frames[0].utf8)) as! [String: Any]
         XCTAssertEqual(obj["reply"] as? String, "history")
+        XCTAssertEqual(obj["requestId"] as? String, "mock-history-request")
         let responseData = try! JSONSerialization.data(withJSONObject: obj["response"]!)
         let resp = try! JSONDecoder().decode(HistoryResponse.self, from: responseData)
         guard case .list(let items) = resp else { return XCTFail("应为 list") }

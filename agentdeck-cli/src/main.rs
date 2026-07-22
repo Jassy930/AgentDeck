@@ -295,19 +295,23 @@ fn run_sync(cli: &Cli) -> Result<(), CliError> {
                     cwd_filter,
                     limit,
                 } => HistoryRequest::List {
+                    request_id: None,
                     agent_kind: agent.map(|a| a.into()),
                     cwd_filter: cwd_filter.clone(),
                     limit: *limit,
                 },
                 HistoryOp::Read { thread_id, agent } => HistoryRequest::Read {
+                    request_id: None,
                     thread_id: ThreadId(thread_id.clone()),
                     agent_kind: (*agent).into(),
                 },
                 HistoryOp::Archive { thread_id, agent } => HistoryRequest::Archive {
+                    request_id: None,
                     thread_id: ThreadId(thread_id.clone()),
                     agent_kind: (*agent).into(),
                 },
                 HistoryOp::Unarchive { thread_id, agent } => HistoryRequest::Unarchive {
+                    request_id: None,
                     thread_id: ThreadId(thread_id.clone()),
                     agent_kind: (*agent).into(),
                 },
@@ -316,6 +320,7 @@ fn run_sync(cli: &Cli) -> Result<(), CliError> {
                     title,
                     agent,
                 } => HistoryRequest::Rename {
+                    request_id: None,
                     thread_id: ThreadId(thread_id.clone()),
                     agent_kind: (*agent).into(),
                     title: title.clone(),

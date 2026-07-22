@@ -2,24 +2,93 @@
 //! ClaudeCodeAdapter simultaneously, exercising the cross-agent
 //! `handle_history` merge path added in Task 4C.
 //!
-//! Phase 4 Task 4C — Phase 4 finalization. Closeout assertion that
-//! the daemon binary's `main.rs` wiring (register both adapters into
-//! one router) behaves correctly: kinds enumerate, list-merge runs,
-//! Codex's stub returns empty + CC's real history merges in
-//! gracefully.
+//! The daemon binary registers both adapters into one router. Pure shape
+//! tests always run; operations that inspect real local histories are gated
+//! behind `AGENTDECK_E2E=1`.
 
 use agentdeck_protocol::*;
-use agentdeckd::agent::DynAgent;
+use agentdeckd::agent::{Agent, AgentEventSender, AgentSessionHandle, DynAgent};
 use agentdeckd::claude_code::ClaudeCodeAdapter;
 use agentdeckd::codex::CodexAdapter;
 use agentdeckd::runtime::router::AgentRouter;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Barrier;
 
 fn router_with_both() -> AgentRouter {
     let mut r = AgentRouter::new();
     r.register(Arc::new(CodexAdapter::new()) as DynAgent);
     r.register(Arc::new(ClaudeCodeAdapter::new()) as DynAgent);
     r
+}
+
+struct DelayedHistoryAgent {
+    kind: AgentKind,
+    gate: Arc<Barrier>,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl Agent for DelayedHistoryAgent {
+    fn kind(&self) -> AgentKind {
+        self.kind
+    }
+
+    fn capabilities(&self) -> SessionCapabilities {
+        SessionCapabilities {
+            agent_kind: self.kind,
+            agent_version: "delayed-history-stub".into(),
+            features: Default::default(),
+            vendor: match self.kind {
+                AgentKind::Codex => VendorCapabilities::Codex(Default::default()),
+                AgentKind::ClaudeCode => VendorCapabilities::ClaudeCode(Default::default()),
+            },
+        }
+    }
+
+    async fn start_session(
+        &self,
+        _: SessionStart,
+        _: AgentEventSender,
+    ) -> Result<AgentSessionHandle, ProtocolError> {
+        unimplemented!("history-only test stub")
+    }
+
+    async fn continue_thread(
+        &self,
+        _: ThreadId,
+        _: std::path::PathBuf,
+        _: String,
+        _: AgentEventSender,
+    ) -> Result<AgentSessionHandle, ProtocolError> {
+        unimplemented!("history-only test stub")
+    }
+
+    async fn submit_decision(&self, _: &SessionId, _: ActionDecision) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+
+    async fn submit_vendor_control(
+        &self,
+        _: &SessionId,
+        _: VendorControlPayload,
+    ) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+
+    async fn cancel(&self, _: &SessionId) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+
+    async fn handle_history(&self, _: HistoryRequest) -> Result<HistoryResponse, ProtocolError> {
+        self.gate.wait().await;
+        tokio::time::sleep(self.delay).await;
+        Ok(HistoryResponse::List(Vec::new()))
+    }
+}
+
+fn real_history_enabled() -> bool {
+    std::env::var("AGENTDECK_E2E").as_deref() == Ok("1")
 }
 
 #[test]
@@ -46,15 +115,52 @@ fn router_capabilities_distinct_per_kind() {
     assert!(matches!(cc.vendor, VendorCapabilities::ClaudeCode(_)));
 }
 
-/// Cross-agent list — request has `agent_kind = None`. The router
-/// fans out to every registered adapter. Codex's v0.2 stub returns
-/// an empty Vec; CC's real implementation enumerates jsonl files.
-/// The merged result is always Ok(HistoryResponse::List(_)), even if
-/// both adapters contribute zero items (no CC binary / no jsonl).
+#[tokio::test]
+async fn router_queries_both_history_sources_concurrently() {
+    let gate = Arc::new(Barrier::new(2));
+    let delay = Duration::from_millis(100);
+    let mut router = AgentRouter::new();
+    for kind in [AgentKind::Codex, AgentKind::ClaudeCode] {
+        router.register(Arc::new(DelayedHistoryAgent {
+            kind,
+            gate: Arc::clone(&gate),
+            delay,
+        }));
+    }
+
+    let started = Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_millis(300),
+        router.handle_history(HistoryRequest::List {
+            request_id: Some("parallel-history-1".into()),
+            agent_kind: None,
+            cwd_filter: None,
+            limit: None,
+        }),
+    )
+    .await
+    .expect("both sources must reach the barrier concurrently")
+    .expect("both delayed history sources must succeed");
+    let elapsed = started.elapsed();
+
+    assert!(matches!(response, HistoryResponse::List(items) if items.is_empty()));
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "two 100ms sources should complete concurrently, elapsed={elapsed:?}"
+    );
+}
+
+/// Cross-agent list — request has `agent_kind = None`, so both real local
+/// history sources are queried and merged newest-first.
 #[tokio::test]
 async fn router_cross_agent_history_list_merges_without_error() {
+    if !real_history_enabled() {
+        eprintln!("SKIP router_cross_agent_history_list_merges_without_error: AGENTDECK_E2E != 1");
+        return;
+    }
     let r = router_with_both();
     let req = HistoryRequest::List {
+        request_id: None,
         agent_kind: None,
         cwd_filter: None,
         limit: None,
@@ -64,15 +170,11 @@ async fn router_cross_agent_history_list_merges_without_error() {
         HistoryResponse::List(v) => v,
         other => panic!("expected List variant, got {other:?}"),
     };
-    // Every item must be CC-kinded (codex returns empty) — proves the
-    // router routed by kind and labeled correctly. If CC isn't on the
-    // PATH the list may be empty; that's still acceptable.
     for item in &items {
-        assert_eq!(
+        assert!(matches!(
             item.agent_kind,
-            AgentKind::ClaudeCode,
-            "non-CC item in cross-agent list (codex stub should produce none)"
-        );
+            AgentKind::Codex | AgentKind::ClaudeCode
+        ));
     }
     eprintln!(
         "router_cross_agent_history_list_merges_without_error: \
@@ -81,44 +183,73 @@ async fn router_cross_agent_history_list_merges_without_error() {
     );
 }
 
-/// Codex-specific List goes to the codex stub — empty Vec, never an
-/// error. (Important: the router must not 500 just because codex's
-/// list is a no-op stub.)
+/// Codex-specific List routes real app-server results and stamps every item
+/// with the neutral Codex agent kind.
 #[tokio::test]
-async fn router_codex_list_returns_empty_stub() {
+async fn router_codex_list_returns_real_history_or_empty() {
+    if !real_history_enabled() {
+        eprintln!("SKIP router_codex_list_returns_real_history_or_empty: AGENTDECK_E2E != 1");
+        return;
+    }
     let r = router_with_both();
     let req = HistoryRequest::List {
+        request_id: None,
         agent_kind: Some(AgentKind::Codex),
         cwd_filter: None,
-        limit: None,
+        limit: Some(3),
     };
     let result = r
         .handle_history(req)
         .await
-        .expect("codex stub must not error");
+        .expect("real Codex list must not error");
     match result {
-        HistoryResponse::List(v) => assert!(
-            v.is_empty(),
-            "Codex v0.2 stub returns empty Vec; got {} items",
-            v.len()
-        ),
+        HistoryResponse::List(items) => {
+            assert!(items.len() <= 3);
+            assert!(items.iter().all(|item| item.agent_kind == AgentKind::Codex));
+        }
         other => panic!("expected List variant, got {other:?}"),
     }
 }
 
-/// Codex-specific Read goes to the codex stub which returns a
-/// structured `codex-history-read-not-implemented` error. This is the
-/// trait-method-exists, impl-deferred posture documented in spec § 5
-/// (v0.2 CC MUST; Codex MAY).
+/// Codex-specific Read routes through app-server and returns the same thread
+/// id when at least one persisted local history exists.
 #[tokio::test]
-async fn router_codex_read_surfaces_not_implemented_error() {
+async fn router_codex_read_returns_real_history_when_available() {
+    if !real_history_enabled() {
+        eprintln!("SKIP router_codex_read_returns_real_history_when_available: AGENTDECK_E2E != 1");
+        return;
+    }
     let r = router_with_both();
-    let req = HistoryRequest::Read {
-        thread_id: ThreadId("nonexistent".into()),
-        agent_kind: AgentKind::Codex,
+    let listed = r
+        .handle_history(HistoryRequest::List {
+            request_id: None,
+            agent_kind: Some(AgentKind::Codex),
+            cwd_filter: None,
+            limit: Some(1),
+        })
+        .await
+        .expect("real Codex list must succeed");
+    let HistoryResponse::List(items) = listed else {
+        panic!("expected list response");
     };
-    let err = r.handle_history(req).await.expect_err("codex stub errors");
-    assert_eq!(err.code, "codex-history-read-not-implemented");
+    let Some(first) = items.first() else {
+        eprintln!("SKIP router_codex_read_returns_real_history_when_available: no history");
+        return;
+    };
+    let expected = first.thread_id.clone();
+    let read = r
+        .handle_history(HistoryRequest::Read {
+            request_id: None,
+            thread_id: expected.clone(),
+            agent_kind: AgentKind::Codex,
+        })
+        .await
+        .expect("real Codex read must succeed");
+    let HistoryResponse::Read(detail) = read else {
+        panic!("expected read response");
+    };
+    assert_eq!(detail.thread_id, expected);
+    assert_eq!(detail.agent_kind, AgentKind::Codex);
 }
 
 /// CC-specific Unarchive is a NO-OP per the Task 4C design (CC's
@@ -128,6 +259,7 @@ async fn router_codex_read_surfaces_not_implemented_error() {
 async fn router_cc_unarchive_is_noop_ack() {
     let r = router_with_both();
     let req = HistoryRequest::Unarchive {
+        request_id: None,
         thread_id: ThreadId("anything".into()),
         agent_kind: AgentKind::ClaudeCode,
     };
@@ -141,6 +273,7 @@ async fn router_cc_unarchive_is_noop_ack() {
 async fn router_unregistered_kind_returns_structured_error() {
     let r = AgentRouter::new(); // empty
     let req = HistoryRequest::List {
+        request_id: None,
         agent_kind: Some(AgentKind::Codex),
         cwd_filter: None,
         limit: None,

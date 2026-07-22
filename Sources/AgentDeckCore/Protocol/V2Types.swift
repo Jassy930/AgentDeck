@@ -933,40 +933,69 @@ public struct HistoryReadResponse: Codable, Sendable {
 
 /// `#[serde(tag = "op", rename_all = "camelCase")]`
 public enum HistoryRequest: Codable, Sendable {
-    case list(agentKind: AgentKind?, cwdFilter: String?, limit: UInt?)
-    case read(threadId: String, agentKind: AgentKind)
-    case archive(threadId: String, agentKind: AgentKind)
-    case unarchive(threadId: String, agentKind: AgentKind)
-    case rename(threadId: String, agentKind: AgentKind, title: String)
+    case list(agentKind: AgentKind?, cwdFilter: String?, limit: UInt?, requestId: String? = nil)
+    case read(threadId: String, agentKind: AgentKind, requestId: String? = nil)
+    case archive(threadId: String, agentKind: AgentKind, requestId: String? = nil)
+    case unarchive(threadId: String, agentKind: AgentKind, requestId: String? = nil)
+    case rename(threadId: String, agentKind: AgentKind, title: String, requestId: String? = nil)
 
-    private enum CodingKeys: String, CodingKey { case op, agentKind, cwdFilter, limit, threadId, title }
+    private enum CodingKeys: String, CodingKey {
+        case op, agentKind, cwdFilter, limit, threadId, title, requestId
+    }
+
+    public var requestId: String? {
+        switch self {
+        case .list(_, _, _, let requestId),
+             .read(_, _, let requestId),
+             .archive(_, _, let requestId),
+             .unarchive(_, _, let requestId),
+             .rename(_, _, _, let requestId):
+            requestId
+        }
+    }
+
+    public func withRequestId(_ requestId: String?) -> HistoryRequest {
+        switch self {
+        case .list(let kind, let cwd, let limit, _):
+            .list(agentKind: kind, cwdFilter: cwd, limit: limit, requestId: requestId)
+        case .read(let threadId, let kind, _):
+            .read(threadId: threadId, agentKind: kind, requestId: requestId)
+        case .archive(let threadId, let kind, _):
+            .archive(threadId: threadId, agentKind: kind, requestId: requestId)
+        case .unarchive(let threadId, let kind, _):
+            .unarchive(threadId: threadId, agentKind: kind, requestId: requestId)
+        case .rename(let threadId, let kind, let title, _):
+            .rename(threadId: threadId, agentKind: kind, title: title, requestId: requestId)
+        }
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let op = try c.decode(String.self, forKey: .op)
+        let requestId = try c.decodeIfPresent(String.self, forKey: .requestId)
         switch op {
         case "list":
             let kind = try c.decodeIfPresent(AgentKind.self, forKey: .agentKind)
             let cwd = try c.decodeIfPresent(String.self, forKey: .cwdFilter)
             let limit = try c.decodeIfPresent(UInt.self, forKey: .limit)
-            self = .list(agentKind: kind, cwdFilter: cwd, limit: limit)
+            self = .list(agentKind: kind, cwdFilter: cwd, limit: limit, requestId: requestId)
         case "read":
             let tid = try c.decode(String.self, forKey: .threadId)
             let kind = try c.decode(AgentKind.self, forKey: .agentKind)
-            self = .read(threadId: tid, agentKind: kind)
+            self = .read(threadId: tid, agentKind: kind, requestId: requestId)
         case "archive":
             let tid = try c.decode(String.self, forKey: .threadId)
             let kind = try c.decode(AgentKind.self, forKey: .agentKind)
-            self = .archive(threadId: tid, agentKind: kind)
+            self = .archive(threadId: tid, agentKind: kind, requestId: requestId)
         case "unarchive":
             let tid = try c.decode(String.self, forKey: .threadId)
             let kind = try c.decode(AgentKind.self, forKey: .agentKind)
-            self = .unarchive(threadId: tid, agentKind: kind)
+            self = .unarchive(threadId: tid, agentKind: kind, requestId: requestId)
         case "rename":
             let tid = try c.decode(String.self, forKey: .threadId)
             let kind = try c.decode(AgentKind.self, forKey: .agentKind)
             let title = try c.decode(String.self, forKey: .title)
-            self = .rename(threadId: tid, agentKind: kind, title: title)
+            self = .rename(threadId: tid, agentKind: kind, title: title, requestId: requestId)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .op, in: c, debugDescription: "unknown HistoryRequest op: \(op)"
@@ -977,28 +1006,33 @@ public enum HistoryRequest: Codable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .list(let kind, let cwd, let limit):
+        case .list(let kind, let cwd, let limit, let requestId):
             try c.encode("list", forKey: .op)
             try c.encodeIfPresent(kind, forKey: .agentKind)
             try c.encodeIfPresent(cwd, forKey: .cwdFilter)
             try c.encodeIfPresent(limit, forKey: .limit)
-        case .read(let tid, let kind):
+            try c.encodeIfPresent(requestId, forKey: .requestId)
+        case .read(let tid, let kind, let requestId):
             try c.encode("read", forKey: .op)
             try c.encode(tid, forKey: .threadId)
             try c.encode(kind, forKey: .agentKind)
-        case .archive(let tid, let kind):
+            try c.encodeIfPresent(requestId, forKey: .requestId)
+        case .archive(let tid, let kind, let requestId):
             try c.encode("archive", forKey: .op)
             try c.encode(tid, forKey: .threadId)
             try c.encode(kind, forKey: .agentKind)
-        case .unarchive(let tid, let kind):
+            try c.encodeIfPresent(requestId, forKey: .requestId)
+        case .unarchive(let tid, let kind, let requestId):
             try c.encode("unarchive", forKey: .op)
             try c.encode(tid, forKey: .threadId)
             try c.encode(kind, forKey: .agentKind)
-        case .rename(let tid, let kind, let title):
+            try c.encodeIfPresent(requestId, forKey: .requestId)
+        case .rename(let tid, let kind, let title, let requestId):
             try c.encode("rename", forKey: .op)
             try c.encode(tid, forKey: .threadId)
             try c.encode(kind, forKey: .agentKind)
             try c.encode(title, forKey: .title)
+            try c.encodeIfPresent(requestId, forKey: .requestId)
         }
     }
 }

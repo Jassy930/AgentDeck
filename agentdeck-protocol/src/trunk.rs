@@ -304,6 +304,8 @@ pub enum VendorPanelPayload {
 #[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
 pub enum HistoryRequest {
     List {
+        #[serde(rename = "requestId", default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         #[serde(rename = "agentKind")]
         agent_kind: Option<AgentKind>,
         #[serde(rename = "cwdFilter")]
@@ -312,30 +314,76 @@ pub enum HistoryRequest {
         limit: Option<usize>,
     },
     Read {
+        #[serde(rename = "requestId", default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         #[serde(rename = "threadId")]
         thread_id: ThreadId,
         #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
     },
     Archive {
+        #[serde(rename = "requestId", default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         #[serde(rename = "threadId")]
         thread_id: ThreadId,
         #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
     },
     Unarchive {
+        #[serde(rename = "requestId", default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         #[serde(rename = "threadId")]
         thread_id: ThreadId,
         #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
     },
     Rename {
+        #[serde(rename = "requestId", default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         #[serde(rename = "threadId")]
         thread_id: ThreadId,
         #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
         title: String,
     },
+}
+
+impl HistoryRequest {
+    /// Correlates a history admin reply with the request that produced it.
+    /// Legacy peers may omit this field, so callers must continue to handle
+    /// `None` while transitioning to request-scoped replies.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::List { request_id, .. }
+            | Self::Read { request_id, .. }
+            | Self::Archive { request_id, .. }
+            | Self::Unarchive { request_id, .. }
+            | Self::Rename { request_id, .. } => request_id.as_deref(),
+        }
+    }
+
+    /// Returns the same request payload with a correlation id attached.
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        let request_id = Some(request_id.into());
+        match &mut self {
+            Self::List {
+                request_id: slot, ..
+            }
+            | Self::Read {
+                request_id: slot, ..
+            }
+            | Self::Archive {
+                request_id: slot, ..
+            }
+            | Self::Unarchive {
+                request_id: slot, ..
+            }
+            | Self::Rename {
+                request_id: slot, ..
+            } => *slot = request_id,
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

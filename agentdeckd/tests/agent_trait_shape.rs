@@ -71,6 +71,7 @@ impl Agent for DefaultHistoryStub {
 async fn default_handle_history_returns_history_not_supported() {
     let a = DefaultHistoryStub;
     let req = HistoryRequest::List {
+        request_id: None,
         agent_kind: Some(AgentKind::Codex),
         cwd_filter: None,
         limit: None,

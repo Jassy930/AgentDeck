@@ -35,6 +35,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::time::SystemTime;
 
 use agentdeck_protocol::{
@@ -44,6 +45,7 @@ use agentdeck_protocol::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::process::{Child, Command};
 
 // ── Path encoding (CC convention) ───────────────────────────────────────────
 
@@ -350,8 +352,7 @@ fn is_memory_agent_session(path: &Path) -> bool {
         let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if v
-            .get("content")
+        if v.get("content")
             .and_then(Value::as_str)
             .map(is_memory_agent_prompt)
             .unwrap_or(false)
@@ -381,8 +382,7 @@ fn is_memory_agent_project_path(path: &Path) -> bool {
 
 fn is_memory_agent_prompt(prompt: &str) -> bool {
     let normalized = prompt.trim_start().to_ascii_lowercase();
-    normalized.starts_with("hello memory agent")
-        || normalized.starts_with("you are a claude-mem")
+    normalized.starts_with("hello memory agent") || normalized.starts_with("you are a claude-mem")
 }
 
 /// List history (async wrapper). Spawning is sync-blocking on the
@@ -713,6 +713,103 @@ fn extract_tool_result_text(block: &Value) -> String {
 
 // ── Public async API ────────────────────────────────────────────────────────
 
+const VENDOR_STDERR_WITHHELD_NOTE: &str =
+    "vendor stderr content withheld by the vendor-token boundary";
+
+struct VendorCommandFailureCodes {
+    spawn: &'static str,
+    wait: &'static str,
+    status: &'static str,
+}
+
+/// Owns one vendor CLI process while an async history mutation is in flight.
+///
+/// The hub may cancel the surrounding future at its history deadline. Tokio's
+/// default `Child` drop behavior leaves the process running, so every command
+/// gets its own process group and this guard synchronously SIGKILLs that group
+/// when cancellation drops the future. `kill_on_drop` remains the portable
+/// direct-child fallback.
+struct CancelSafeVendorChild {
+    child: Option<Child>,
+}
+
+impl CancelSafeVendorChild {
+    fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        command.kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        command.spawn().map(|child| Self { child: Some(child) })
+    }
+
+    async fn wait(mut self) -> std::io::Result<ExitStatus> {
+        let status = self
+            .child
+            .as_mut()
+            .expect("cancel-safe vendor child exists until wait completes")
+            .wait()
+            .await?;
+        // The child has been reaped; disarm cancellation cleanup so a recycled
+        // pid can never be targeted after a successful wait.
+        self.child.take();
+        Ok(status)
+    }
+}
+
+impl Drop for CancelSafeVendorChild {
+    fn drop(&mut self) {
+        let Some(child) = &mut self.child else {
+            return;
+        };
+        #[cfg(unix)]
+        if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+            unsafe {
+                cc_history_kill(-pid, SIGKILL);
+            }
+        }
+        let _ = child.start_kill();
+    }
+}
+
+/// Run a history mutation without ever retaining vendor stdout/stderr bytes.
+/// Failure details stay bounded to our own operation label, exit status and
+/// structured failure code.
+async fn run_vendor_command(
+    mut command: Command,
+    operation: &str,
+    codes: VendorCommandFailureCodes,
+) -> Result<(), ProtocolError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = CancelSafeVendorChild::spawn(&mut command).map_err(|error| ProtocolError {
+        code: codes.spawn.into(),
+        message: format!("spawn {operation}: {error}"),
+        diagnostic_ref: None,
+    })?;
+    let status = child.wait().await.map_err(|error| ProtocolError {
+        code: codes.wait.into(),
+        message: format!("wait for {operation}: {error}"),
+        diagnostic_ref: None,
+    })?;
+    if !status.success() {
+        return Err(ProtocolError {
+            code: codes.status.into(),
+            message: format!("{operation} exited with {status}; {VENDOR_STDERR_WITHHELD_NOTE}"),
+            diagnostic_ref: None,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "kill"]
+    fn cc_history_kill(pid: i32, sig: i32) -> i32;
+}
+
 /// Read a session's transcript. Looks up the jsonl file by scanning
 /// all project dirs for `<thread_id>.jsonl` (the cwd is encoded into
 /// the dir name and is not knowable up front for read requests).
@@ -768,7 +865,7 @@ pub async fn archive(thread_id: &ThreadId) -> Result<(), ProtocolError> {
     // CC's `claude rm` looks up the session by ID within the current cwd.
     // We must run it from the session's ORIGINAL cwd, discovered via list_history.
     let cwd = find_session_cwd(thread_id).await?;
-    run_claude_in(&["rm", &thread_id.0], "cc-archive", &cwd).await
+    run_claude_in(&["rm", &thread_id.0], &cwd).await
 }
 
 /// Look up the original cwd for a session by scanning history. Returns
@@ -792,15 +889,14 @@ async fn find_session_cwd(thread_id: &ThreadId) -> Result<PathBuf, ProtocolError
 /// writes `{"type":"custom-title","customTitle":"<name>"}` to the
 /// jsonl tail. Subsequent `list_history` scans pick the title up.
 pub async fn rename(thread_id: &ThreadId, title: &str) -> Result<(), ProtocolError> {
-    use tokio::io::AsyncWriteExt;
-    use tokio::process::Command;
     // CC `--resume` looks up the session by ID within the current cwd. We
     // must run rename from the session's original cwd, discovered via
     // list_history. Without this the CC binary reports
     // "No conversation found with session ID: <id>".
     let session_cwd = find_session_cwd(thread_id).await?;
-    let mut cmd = Command::new("claude");
-    cmd.current_dir(&session_cwd)
+    let mut command = Command::new("claude");
+    command
+        .current_dir(&session_cwd)
         .arg("--print")
         .arg("--resume")
         .arg(&thread_id.0)
@@ -810,77 +906,121 @@ pub async fn rename(thread_id: &ThreadId, title: &str) -> Result<(), ProtocolErr
         .arg("stream-json")
         .arg("--input-format")
         .arg("stream-json")
-        .arg("--verbose")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| ProtocolError {
-        code: "cc-rename-spawn".into(),
-        message: format!("spawn claude --resume --name: {e}"),
-        diagnostic_ref: None,
-    })?;
-    // Close stdin so CC exits immediately after applying the name
-    // (verified: an open stdin keeps the session interactive).
-    if let Some(stdin) = child.stdin.take() {
-        let mut s = stdin;
-        let _ = s.shutdown().await;
-    }
-    let out = child.wait_with_output().await.map_err(|e| ProtocolError {
-        code: "cc-rename-wait".into(),
-        message: format!("wait claude --resume --name: {e}"),
-        diagnostic_ref: None,
-    })?;
-    if !out.status.success() {
-        return Err(ProtocolError {
-            code: "cc-rename-status".into(),
-            message: format!(
-                "claude --resume --name (cwd={}) exited with {}: {}",
-                session_cwd.display(),
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            ),
-            diagnostic_ref: None,
-        });
-    }
-    Ok(())
+        .arg("--verbose");
+    // A null stdin delivers EOF immediately, matching the previously verified
+    // closed-pipe behavior without retaining a pipe across cancellation.
+    run_vendor_command(
+        command,
+        "claude --resume --name",
+        VendorCommandFailureCodes {
+            spawn: "cc-rename-spawn",
+            wait: "cc-rename-wait",
+            status: "cc-rename-status",
+        },
+    )
+    .await
 }
 
-/// Generic wrapper for fire-and-forget `claude <args>` invocations
-/// (used by `archive`). Captures stderr into structured errors.
-async fn run_claude_in(
-    args: &[&str],
-    code_prefix: &str,
-    cwd: &std::path::Path,
-) -> Result<(), ProtocolError> {
-    use tokio::process::Command;
-    let mut cmd = Command::new("claude");
-    cmd.current_dir(cwd);
+/// Generic wrapper for fire-and-forget `claude <args>` invocations used by
+/// archive. Vendor output is discarded at the process boundary.
+async fn run_claude_in(args: &[&str], cwd: &std::path::Path) -> Result<(), ProtocolError> {
+    let mut command = Command::new("claude");
+    command.current_dir(cwd);
     for a in args {
-        cmd.arg(a);
+        command.arg(a);
     }
-    let out = cmd.output().await.map_err(|e| ProtocolError {
-        code: format!("{code_prefix}-spawn"),
-        message: format!("spawn claude {}: {e}", args.join(" ")),
-        diagnostic_ref: None,
-    })?;
-    if !out.status.success() {
-        return Err(ProtocolError {
-            code: format!("{code_prefix}-status"),
-            message: format!(
-                "claude {} exited with {}: {}",
-                args.join(" "),
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            ),
-            diagnostic_ref: None,
-        });
-    }
-    Ok(())
+    run_vendor_command(
+        command,
+        "claude history mutation",
+        VendorCommandFailureCodes {
+            spawn: "cc-archive-spawn",
+            wait: "cc-archive-wait",
+            status: "cc-archive-status",
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_vendor_command_kills_its_process_group() {
+        let dir = tempdir_unique();
+        let marker = dir.join("late-side-effect");
+        let ready = dir.join("helper-ready");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"(sleep 0.4; printf late > "$1") & helper=$!; printf '%s' "$helper" > "$2"; wait"#,
+            )
+            .arg("cancel-safe-vendor-test")
+            .arg(&marker)
+            .arg(&ready);
+
+        let task = tokio::spawn(run_vendor_command(
+            command,
+            "cancel-safe vendor test",
+            VendorCommandFailureCodes {
+                spawn: "test-vendor-spawn",
+                wait: "test-vendor-wait",
+                status: "test-vendor-status",
+            },
+        ));
+        let helper_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !ready.is_file() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+
+        task.abort();
+        let cancellation = task
+            .await
+            .expect_err("history future cancellation must abort the command waiter");
+        assert!(cancellation.is_cancelled());
+        assert!(
+            helper_started,
+            "vendor helper must start before cancellation"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(
+            !marker.exists(),
+            "a process-group descendant survived cancellation and performed a late side effect"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vendor_status_error_withholds_stderr_contents() {
+        let secret = "sk-vendor-secret-must-not-cross-k9";
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("printf '%s' '{secret}' >&2; exit 7"));
+
+        let error = run_vendor_command(
+            command,
+            "failing vendor test",
+            VendorCommandFailureCodes {
+                spawn: "test-vendor-spawn",
+                wait: "test-vendor-wait",
+                status: "test-vendor-status",
+            },
+        )
+        .await
+        .expect_err("non-zero vendor exit must fail");
+
+        assert_eq!(error.code, "test-vendor-status");
+        assert!(error.message.contains(VENDOR_STDERR_WITHHELD_NOTE));
+        assert!(!error.message.contains(secret));
+    }
 
     #[test]
     fn encode_cwd_round_trip_unix_path() {
@@ -1093,7 +1233,10 @@ mod tests {
         )
         .unwrap();
         let newest = std::time::SystemTime::now() + std::time::Duration::from_secs(180);
-        std::fs::File::open(&claude_mem).unwrap().set_modified(newest).unwrap();
+        std::fs::File::open(&claude_mem)
+            .unwrap()
+            .set_modified(newest)
+            .unwrap();
 
         let memory = project.join("00000000-0000-0000-0000-000000000200.jsonl");
         std::fs::write(
@@ -1114,7 +1257,10 @@ mod tests {
         )
         .unwrap();
         let older = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&normal).unwrap().set_modified(older).unwrap();
+        std::fs::File::open(&normal)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
 
         let items = list_history_from_jsonl_root(&root, None, 1).unwrap();
         assert_eq!(items.len(), 1);
@@ -1152,7 +1298,10 @@ mod tests {
         )
         .unwrap();
         let older = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&normal).unwrap().set_modified(older).unwrap();
+        std::fs::File::open(&normal)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
 
         let items = list_history_from_jsonl_root(&root, None, 1).unwrap();
         assert_eq!(items.len(), 1);
@@ -1180,14 +1329,20 @@ mod tests {
         )
         .unwrap();
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::open(&newest).unwrap().set_modified(future).unwrap();
+        std::fs::File::open(&newest)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
 
         let stale_fifo = project.join("00000000-0000-0000-0000-000000000001.jsonl");
         let status = std::process::Command::new("mkfifo")
             .arg(&stale_fifo)
             .status()
             .unwrap();
-        assert!(status.success(), "mkfifo should create a blocking stale candidate");
+        assert!(
+            status.success(),
+            "mkfifo should create a blocking stale candidate"
+        );
 
         let root_for_thread = root.clone();
         let (tx, rx) = mpsc::channel();
