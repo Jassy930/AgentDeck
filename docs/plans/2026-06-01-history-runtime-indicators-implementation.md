@@ -61,6 +61,12 @@ agent 图标时都会重新从 bundle 查找并解码 SVG；另一个热路径�
 `NSImage`（包括 miss），并把 `SessionModel.historyGroups` 改为
 `setHistoryThreads(_:)` 时维护的存储投影，避免滚动期间重复做 I/O、图片解码和分组排序。
 
+**2026-07-22 AppKit 回归修复：** AppKit 重写后的 `AgentKindIcon` 曾重新退化为每次
+`HistoryThreadRowView.configure` 都同步查找并解码 SVG，数百条真实历史会把主线程卡在
+`Bundle.url(forResource:)`。现已在 `AgentKindIcon` 内按 agent kind 缓存原图与 18×18
+紧凑图（资源缺失也由静态可选值缓存），并让开发 app bundle 携带 SwiftPM resource
+bundle，避免运行时依赖编译目录的绝对 fallback 路径。
+
 验证：
 
 ```bash

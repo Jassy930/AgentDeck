@@ -13,6 +13,8 @@ APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_BINARY="$APP_MACOS/$APP_NAME"
 BUNDLED_DAEMON="$APP_MACOS/agentdeckd"
+RESOURCE_BUNDLE_NAME="${APP_NAME}_${APP_NAME}.bundle"
+BUNDLED_RESOURCE_BUNDLE="$APP_BUNDLE/$RESOURCE_BUNDLE_NAME"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 DAEMON_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 
@@ -64,10 +66,16 @@ stop_current_bundle_instances
 
 cargo build -p agentdeckd --target-dir "$DAEMON_TARGET_DIR"
 swift build
-BUILD_BINARY="$(swift build --show-bin-path)/$APP_NAME"
+SWIFT_BIN_DIR="$(swift build --show-bin-path)"
+BUILD_BINARY="$SWIFT_BIN_DIR/$APP_NAME"
+BUILD_RESOURCE_BUNDLE="$SWIFT_BIN_DIR/$RESOURCE_BUNDLE_NAME"
 
 if [[ ! -x "$DAEMON_BINARY" ]]; then
   echo "agentdeckd build output not found: $DAEMON_BINARY" >&2
+  exit 1
+fi
+if [[ ! -d "$BUILD_RESOURCE_BUNDLE" ]]; then
+  echo "SwiftPM resource bundle not found: $BUILD_RESOURCE_BUNDLE" >&2
   exit 1
 fi
 
@@ -75,6 +83,7 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS"
 cp "$BUILD_BINARY" "$APP_BINARY"
 cp "$DAEMON_BINARY" "$BUNDLED_DAEMON"
+cp -R "$BUILD_RESOURCE_BUNDLE" "$BUNDLED_RESOURCE_BUNDLE"
 chmod +x "$APP_BINARY" "$BUNDLED_DAEMON"
 
 cat >"$INFO_PLIST" <<PLIST
@@ -111,6 +120,14 @@ verify_running_bundle() {
 
   [[ -x "$BUNDLED_DAEMON" ]] || {
     echo "verify failed: bundled agentdeckd is missing or not executable" >&2
+    return 1
+  }
+  [[ -f "$BUNDLED_RESOURCE_BUNDLE/Assets.xcassets/CodexIcon.imageset/codex.svg" ]] || {
+    echo "verify failed: bundled Codex icon resource is missing" >&2
+    return 1
+  }
+  [[ -f "$BUNDLED_RESOURCE_BUNDLE/Assets.xcassets/ClaudeCodeIcon.imageset/claudecode.svg" ]] || {
+    echo "verify failed: bundled Claude Code icon resource is missing" >&2
     return 1
   }
 
@@ -154,6 +171,7 @@ verify_running_bundle() {
       if [[ -n "$daemon_pid" ]]; then
         echo "verify OK: $APP_BINARY pid=$app_pid"
         echo "verify OK: $BUNDLED_DAEMON pid=$daemon_pid"
+        echo "verify OK: $BUNDLED_RESOURCE_BUNDLE"
         echo "verify OK: LSMinimumSystemVersion=$actual_min_system_version"
         echo "verify OK: Mach-O minos=$binary_min_system_version"
         return 0

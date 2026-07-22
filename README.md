@@ -278,7 +278,7 @@ cargo run -q -p agentdeck-cli -- protocol schema \
 agentdeck protocol version
 ```
 
-运行（bundle 会携带同版本 `agentdeckd` 并从绝对路径启动；
+运行（bundle 会携带同版本 `agentdeckd` 与 SwiftPM 图标资源，并从绝对路径启动；
 `AGENTDECK_DAEMON_PATH` 可用于本地 harness 显式覆盖，`swift run` 再回退到
 源码树 `target/` 与 `PATH`）：
 
