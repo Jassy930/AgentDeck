@@ -67,7 +67,7 @@ import Foundation
 
 /// 右上环境面板的只读数据模型（macOS UI chrome，不进 AgentDeckCore 共享层）。
 /// 真实 app 暂无 daemon 后端提供它（见 2026-07-01-codex-desktop-chrome-sync.md），
-/// 默认 nil 时面板显示零值占位；preview 在引导层注入 mock 值。
+/// 默认 nil 时面板不显示且不占位；preview 在引导层注入 mock 值。
 struct EnvironmentInfo: Equatable {
     let added: Int
     let removed: Int
@@ -84,7 +84,7 @@ struct EnvironmentInfo: Equatable {
 
 在 `Sources/AgentDeck/SessionModel.swift` 的可观察属性区（`historySearchTerm` 一带，约 `:88`）新增：
 ```swift
-    /// 右上环境面板数据源。真实 app 默认 nil（面板显示零值占位）；
+    /// 右上环境面板数据源。真实 app 默认 nil（面板不显示且不占位）；
     /// preview 引导层注入 mock 值。不经 IPC——面板暂无 daemon 后端。
     var environmentInfo: EnvironmentInfo?
 ```

@@ -868,7 +868,7 @@ git commit -m "feat(ui): AppKit status bar and turn-jump rail"
 
 实现要点：
 - 顶层 vertical stack：`StatusBarView` + 分隔线 + `NSSplitViewController`（左 `HistorySidebarViewController` 固定 260pt、右内容）。
-- 右内容：`cwd == nil` 时显示 `EmptyStateView`（复现 D5 文案 + “Choose project…” `NSOpenPanel` + Refresh）；否则 `ConversationViewController` + 叠加 `TurnJumpRailView`（trailing overlay 28pt）。
+- 右内容：`cwd == nil` 时显示 `EmptyStateView`（复现 D5 文案 + “Choose project…” `NSOpenPanel` + Refresh）；否则显示 `ConversationViewController` 与 `TurnJumpRailView`。原计划中的 trailing overlay 28pt 已在 2026-07-22 界面收口时演进为独立 44pt 尾列，避免命中层覆盖正文、composer 或环境面板。
 - 用 `ObservationBinder` 绑 `model.cwd` 切换空态/会话；把 `ConversationViewController.topVisibleTurnId` 变化喂给 `TurnJumpRailView.syncSelection`，`TurnJumpRailView.onSelectTurn` → 让会话滚到该 turn。
 
 - [ ] **Step 1: 实现两文件 + smoke test 构造**

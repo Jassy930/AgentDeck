@@ -191,7 +191,7 @@ svg[class^="lucide"], .lucide { stroke-width: 1.8; }
 .iconbtn i { width: 16px; height: 16px; }
 .iconbtn:hover { background: var(--surface-2); color: var(--text); }
 .iconbtn--round { border-radius: 50%; }
-.iconbtn--send { width: 30px; height: 30px; border-radius: 50%; background: var(--text); color: var(--bg); }
+.iconbtn--send { width: 44px; height: 44px; min-width: 44px; min-height: 44px; flex: none; border-radius: 50%; background: var(--text); color: var(--bg); }
 [data-theme="warm"] .iconbtn--send { background: var(--accent); color: var(--text-on-accent); }
 .iconbtn--send:hover { filter: brightness(0.92); }
 
@@ -260,7 +260,7 @@ svg[class^="lucide"], .lucide { stroke-width: 1.8; }
 .env-file .g .a { color: var(--success); } .env-file .g .d { color: var(--danger); }
 
 /* 列表行：历史线程 */
-.thread { display: flex; gap: 10px; padding: 10px 12px; border-radius: var(--radius-sm); position: relative; transition: background var(--dur) var(--ease); }
+.thread { display: flex; gap: 10px; padding: 10px; border-radius: var(--radius-sm); position: relative; transition: background var(--dur) var(--ease); }
 .thread:hover { background: var(--surface); }
 .thread.sel { background: var(--surface-2); }
 .thread.sel::before { content: ""; position: absolute; left: 0; top: 9px; bottom: 9px; width: 3px; border-radius: 2px; background: var(--accent); }
@@ -271,7 +271,7 @@ svg[class^="lucide"], .lucide { stroke-width: 1.8; }
 .thread__meta .agent { width: 13px; height: 13px; opacity: 0.7; }
 
 /* 列表行：项目组 */
-.projgroup { display: flex; align-items: center; gap: 8px; padding: 7px 12px; }
+.projgroup { display: flex; align-items: center; gap: 8px; padding: 7px 10px; }
 .projgroup .chev { color: var(--text-3); width: 13px; height: 13px; }
 .projgroup b { font-size: 12px; font-weight: 600; }
 .projgroup .count { font-size: 11px; color: var(--text-3); font-family: var(--font-mono); }
@@ -281,7 +281,7 @@ svg[class^="lucide"], .lucide { stroke-width: 1.8; }
    桌面工作台 UI kit
    ============================================================ */
 .workbench {
-  height: 620px; display: grid; grid-template-columns: 232px minmax(0,1fr);
+  height: 620px; display: grid; grid-template-columns: 216px minmax(0,1fr);
   background: var(--bg); border: 1px solid var(--border-strong); border-radius: 12px;
   overflow: hidden; box-shadow: var(--shadow-pop); position: relative;
 }
@@ -296,10 +296,10 @@ svg[class^="lucide"], .lucide { stroke-width: 1.8; }
 .wb-act { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: var(--radius-sm); font-size: 13px; color: var(--text-2); }
 .wb-act i { width: 15px; height: 15px; }
 .wb-act:hover { background: var(--surface); color: var(--text); }
-.wb-side__title { display: flex; align-items: center; padding: 14px 16px 6px; }
+.wb-side__title { display: flex; align-items: center; padding: 14px 12px 6px 16px; }
 .wb-side__title .eyebrow { color: var(--text-2); }
 .wb-side__title .sp { flex: 1; }
-.wb-side__list { flex: 1; overflow-y: auto; padding: 2px 8px; }
+.wb-side__list { flex: 1; overflow-y: auto; padding: 2px 6px; }
 .wb-side__foot { display: flex; align-items: center; gap: 10px; margin: 10px; padding: 8px 10px; background: color-mix(in srgb, var(--surface-2) 70%, transparent); border-radius: 8px; }
 .wb-avatar { width: 28px; height: 28px; border-radius: 50%; background: var(--info); color: #fff; display: grid; place-items: center; font-size: 12px; font-weight: 600; flex: none; }
 .wb-side__foot b { font-size: 12.5px; font-weight: 600; display: block; }
@@ -312,7 +312,7 @@ svg[class^="lucide"], .lucide { stroke-width: 1.8; }
 .wb-header b { font-size: 14px; font-weight: 600; }
 .wb-header .cwd { font-size: 11.5px; color: var(--text-3); font-family: var(--font-mono); }
 .wb-header .sp { flex: 1; }
-.wb-stream { flex: 1; overflow-y: auto; padding: 24px 290px 130px 24px; position: relative; } /* 右侧为环境面板预留检查器栏 */
+.wb-stream { flex: 1; overflow-y: auto; padding: 24px 290px 130px 24px; margin-right: 44px; position: relative; } /* 右侧为环境面板预留检查器栏，尾部另留 44pt 轨道 */
 .wb-col { max-width: 620px; margin: 0 auto; } /* 会话列在左侧内容区居中，平衡重心且不压面板 */
 
 /* 会话流 item */
@@ -331,13 +331,19 @@ svg[class^="lucide"], .lucide { stroke-width: 1.8; }
 .difftag .a { color: var(--success); } .difftag .d { color: var(--danger); }
 
 /* 悬浮 composer */
-.wb-composer { position: absolute; left: 24px; right: 290px; bottom: 16px; max-width: 620px; margin-left: auto; margin-right: auto; } /* 与会话列同区居中、上下对齐 */
+.wb-composer { position: absolute; left: 24px; right: 334px; bottom: 16px; max-width: 620px; margin-left: auto; margin-right: auto; } /* 290pt 检查器栏 + 独立 44pt 轨道 */
 /* 环境面板叠加 */
 .wb-env { position: absolute; top: 56px; right: 20px; z-index: 4; }
 /* 轮次导航 */
-.wb-rail { position: absolute; top: 0; bottom: 0; right: 2px; width: 22px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; }
-.wb-rail i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); opacity: 0.5; transition: all var(--dur) var(--ease); }
-.wb-rail i.on { background: var(--accent); opacity: 1; transform: scale(1.5); }
+.wb-rail { position: absolute; top: 44px; bottom: 0; right: 0; width: 44px; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 5; border-left: 1px solid var(--separator); background: var(--bg); }
+.wb-rail__target { width: 44px; height: 44px; flex: 0 0 44px; display: grid; place-items: center; position: relative; color: var(--text-3); }
+.wb-rail__target--latest { position: absolute; bottom: 0; }
+.wb-rail__dot { width: 5px; height: 5px; border-radius: 50%; background: var(--text-3); opacity: 0.5; transition: all var(--dur) var(--ease); }
+.wb-rail__target[aria-current="step"] .wb-rail__dot { width: 8px; height: 8px; background: var(--accent); opacity: 1; }
+.wb-rail__latest { font-size: 16px; line-height: 1; }
+.wb-rail__target::after { content: attr(data-summary); position: absolute; right: 40px; top: 50%; transform: translateY(-50%); display: none; width: max-content; max-width: 280px; padding: 6px 8px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text); box-shadow: var(--shadow-panel); font-size: 11px; white-space: nowrap; z-index: 1; }
+.wb-rail__target:hover::after, .wb-rail__target:focus-visible::after { display: block; }
+.wb-rail__target:focus-visible { outline-offset: -4px; }
 
 @media (max-width: 760px) { .workbench { height: 540px; grid-template-columns: 1fr; } .wb-side { display: none; } .wb-env { display: none; } }
 
@@ -521,7 +527,7 @@ button:focus:not(:focus-visible) { outline: none; }
 .connector:hover { transform: translateY(-2px); box-shadow: var(--shadow-panel); }
 
 /* 轮次导航点 hover（Dock 拉伸感）*/
-.wb-rail i:hover { opacity: 0.9; transform: scale(1.4); background: var(--text-2); }
+.wb-rail__target:hover .wb-rail__dot, .wb-rail__target:focus-visible .wb-rail__dot { width: 11px; height: 11px; opacity: 0.9; background: var(--text-2); }
 
 /* 移动激活 tab 图标微放大 */
 .m-tab.on i { transform: scale(1.06); }
@@ -540,7 +546,7 @@ button:focus:not(:focus-visible) { outline: none; }
 /* 尊重系统「减少动态效果」 */
 @media (prefers-reduced-motion: reduce) {
   .sdot--run, .ring, .motion-dot, .composer__input::after,
-  .btn, .iconbtn, .connector, .stylecard, .thread { animation: none !important; transition: none !important; }
+  .btn, .iconbtn, .connector, .stylecard, .thread, .wb-rail__target, .wb-rail__dot { animation: none !important; transition: none !important; }
 }
 
 /* ============================================================
@@ -592,7 +598,7 @@ button:focus:not(:focus-visible) { outline: none; }
 .wb-side__list .thread__meta { margin-top: 0; font-size: 0; flex: none; } /* 隐去状态文字，仅留 agent 图标 */
 
 /* ============================================================
-   桌面工作台：真实尺寸预览（按 1440×860 绘制，整体缩放显示）
+   桌面工作台：真实尺寸预览（按 1280×820 绘制，整体缩放显示）
    —— 让比例与留白贴近平时使用，而非把小尺寸直接塞进文档。
    ============================================================ */
 .wbscene__bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
@@ -608,7 +614,7 @@ button:focus:not(:focus-visible) { outline: none; }
 /* 真实尺寸画布 + 缩放（zoom 会同时缩放布局占位，便于内容流式适配）
    1280×820 为标准 Mac 窗口逻辑尺寸，75% 恰好放进文档列而不裁切。*/
 .wbscene .workbench {
-  width: 1280px; height: 820px; grid-template-columns: 260px 1fr;
+  width: 1280px; height: 820px; grid-template-columns: 216px 1fr;
   zoom: var(--wb-zoom, 0.75); flex: none;
 }
 
