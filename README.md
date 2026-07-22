@@ -295,6 +295,11 @@ macOS 前端使用纯 AppKit。当前主窗口外壳对齐 Codex Desktop：透�
 全高左侧历史/项目侧栏、右侧 thread header、Codex 风格空态 composer、
 会话态悬浮 composer 和右侧环境信息面板。外观层仍保持 v0.2 统一壳边界：
 vendor 控件由 `CapabilityRouter` 装配，daemon / IPC / history 模型不因视觉同步而改动。
+同一回合的连续执行记录会在 macOS 会话流中默认折叠为自然语言工作摘要；
+正文、媒体与 Codex/Claude Code 子任务会截断聚合；展开后仍按原顺序显示全部工具、
+命令、文件修改、中间 reasoning 与单项详情。Codex 的子任务活动以独立紧凑行显示
+任务名及“已开始工作 / 已更新 / 已中断”，不再退化为 unsupported raw item，也不把
+历史活动误标成仍在运行；官方上下文压缩记录则显示为独立的“上下文已压缩”系统行。
 
 Profile（用于拆分稳定工作实例和开发调试实例）：
 
