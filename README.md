@@ -99,10 +99,11 @@ agent 来源、不提供 agent 切换或过滤入口，默认按项目和更新�
 `agentKind` 仍保留在数据模型中，用于读取、继续、归档和重命名时路由到正确
 adapter。
 
-**Codex 历史**：v0.2 仍是显式 stub，`history list --agent codex` 返回空列表，
-`history read --agent codex` 返回 `codex-history-read-not-implemented`。Codex
-app-server 的 `thread/list` / `thread/read(includeTurns: true)` 接入留到 v0.3；
-文档和 UI 不应把 Codex 历史回放说成已接通。
+**Codex 历史**：daemon 通过官方 app-server `thread/list` 分页读取
+本机会话，并用 `thread/read(includeTurns: true)` 按需读取 turns/items。
+历史 item 复用 live 会话的中立 translator；未识别的官方 item 保留为
+`Raw`，因此回放是 lossy 的，不宣称完整还原每一次工具执行。Codex
+的 archive / unarchive / rename 仍返回明确的 not-supported 错误，不伪装成成功。
 
 **Claude Code 历史**：通过 `claude agents --json` 及直读
 `~/.claude/projects/<encoded_cwd>/<id>.jsonl` 获取，事实唯一来源在 CC 原生
@@ -335,9 +336,11 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history
 
 ### 协议
 
-`protocol/` 是从官方 `codex app-server generate-json-schema` 生成的
-协议 schema（非逆向）。`protocol/SPIKE_FINDINGS.md` 记录实测的 wire
-framing（逐行 JSONL）。codex 版本固定在 `protocol/CODEX_VERSION.txt`。
+`protocol/` 原样固化官方 `codex app-server generate-json-schema` 生成物中
+的关键快照（非逆向）。`client-methods.txt` 从 `ClientRequest.json`
+确定性派生，不手写。`protocol/SPIKE_FINDINGS.md` 记录实测的 wire
+framing（逐行 JSONL），Codex 版本固定在 `protocol/CODEX_VERSION.txt`；
+刷新与校验步骤见 `docs/QUALITY.md`。
 
 ### 本地数据（AgentDeck 管理，绝不进你的 git）
 

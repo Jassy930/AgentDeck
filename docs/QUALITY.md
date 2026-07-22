@@ -136,14 +136,78 @@ cargo install cargo-llvm-cov
 | approval / action request / action decision | `cargo test approval`；`swift test --filter approval`；再跑完整 `cargo test`、`swift test`、`swift run AgentDeck -- --selfcheck` |
 | 诊断日志、自检、数据目录、profile、密钥脱敏 | `cargo test`；`swift run AgentDeck -- --selfcheck`；`swift run AgentDeck -- --diagnostics-report --json`；涉及 profile 时加跑 `swift run AgentDeck -- --selfcheck --profile dev` 和 `swift run AgentDeck -- --diagnostics-report --json --profile dev` |
 | 文档结构、AGENTS 入口、计划规则 | `scripts/verify-agent-docs.sh` |
-| 协议 schema 或 app-server 方法 | `cargo test`；核对 `protocol/SPIKE_FINDINGS.md` 和 `protocol/CODEX_VERSION.txt` |
+| Codex vendor schema 或 app-server 方法 | 按下方“Codex vendor schema 快照”重新生成；独立快照逐字比较、聚合 schema 规范化比较；再运行 `cargo test` |
 | agentdeck-protocol 类型变更 | `cargo test`（漂移测试自动运行）；若漂移测试失败须先重新生成快照（见下） |
 | 参考客户端 CLI（agentdeck-cli）、Transport、Client | `cargo test -p agentdeck-cli`；再跑完整 `cargo test` |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
-## 协议 schema 漂移测试
+## Codex vendor schema 快照
 
-`cargo test` 会在 `agentdeck-protocol` 测试套件中运行 `schema_matches_committed_snapshot`：比较 schemars 从 Rust 类型实时生成的 JSON Schema 与 `protocol/agentdeck/agentdeck-protocol.schema.json` 快照。若两者不一致，说明协议类型已变更但快照未更新，测试失败。
+`protocol/ClientRequest.json` 等文件是 Codex app-server 的 vendor 协议快照，
+与 AgentDeck 自身 schemars 生成的
+`protocol/agentdeck/agentdeck-protocol.schema.json` 是两套独立门禁。
+`cargo test` 通过不能证明本机 Codex 版本与 vendor 快照一致。
+
+升级刷新或同版本复验时，都先在临时目录 fail-closed 生成，并记录本机
+Codex 的实际版本：
+
+```bash
+CODEX_BIN="$(command -v codex)"
+ACTUAL_VERSION="$("$CODEX_BIN" --version)"
+SCHEMA_DIR="$(mktemp -d /tmp/agentdeck-codex-schema.XXXXXX)"
+"$CODEX_BIN" app-server generate-json-schema --out "$SCHEMA_DIR"
+
+jq -er '
+  .oneOf as $requests
+  | if (($requests | type) != "array") or (($requests | length) == 0) then
+      error("ClientRequest.oneOf missing or empty")
+    elif any($requests[];
+      ((.properties.method.enum | type) != "array")
+      or ((.properties.method.enum | length) != 1)
+      or ((.properties.method.enum[0] | type) != "string")) then
+      error("unexpected ClientRequest method schema")
+    else
+      [$requests[].properties.method.enum[0]] as $methods
+      | if (($methods | length) != ($methods | unique | length)) then
+          error("duplicate ClientRequest methods")
+        else $methods | sort[] end
+    end
+' "$SCHEMA_DIR/ClientRequest.json" > "$SCHEMA_DIR/client-methods.txt"
+```
+
+升级刷新时，将 `ClientRequest.json`、`JSONRPCMessage.json`、
+`ServerNotification.json`、`ServerRequest.json`、
+`codex_app_server_protocol.v2.schemas.json` 与 `client-methods.txt` 复制到
+`protocol/`，再把 `ACTUAL_VERSION` 写入 `CODEX_VERSION.txt`。同版本复验时先运行：
+
+```bash
+test "$ACTUAL_VERSION" = "$(cat protocol/CODEX_VERSION.txt)"
+```
+
+四个独立 schema 与 `client-methods.txt` 的输出顺序稳定，提交前逐文件运行
+`cmp`。聚合的 `codex_app_server_protocol.v2.schemas.json` 中 definitions 顺序
+可能在相同版本的两次官方生成之间变化，必须用 `jq -S` 规范化后比较，不能把
+raw byte 顺序差异误判成协议漂移：
+
+```bash
+jq -S . protocol/codex_app_server_protocol.v2.schemas.json \
+  > "$SCHEMA_DIR/committed-v2.normalized.json"
+jq -S . "$SCHEMA_DIR/codex_app_server_protocol.v2.schemas.json" \
+  > "$SCHEMA_DIR/generated-v2.normalized.json"
+cmp "$SCHEMA_DIR/committed-v2.normalized.json" \
+  "$SCHEMA_DIR/generated-v2.normalized.json"
+```
+
+确认 method 表行数和内容一致后，再运行 `cargo test`、
+`scripts/verify-agent-docs.sh` 和 `git diff --check`。当前稳定合约不使用
+`--experimental`；只有客户端显式启用 `experimentalApi` 时才建立独立实验基线。
+
+## AgentDeck IPC schema 漂移测试
+
+`cargo test` 会在 `agentdeck-protocol` 测试套件中运行
+`schema_matches_committed_snapshot`：比较 schemars 从 Rust 类型实时生成的
+JSON Schema 与 `protocol/agentdeck/agentdeck-protocol.schema.json` 快照。若两者
+不一致，说明 AgentDeck IPC 类型已变更但快照未更新，测试失败。
 
 重新生成快照：
 
