@@ -28,3 +28,10 @@ pub mod history;
 pub mod translate;
 
 pub use adapter::ClaudeCodeAdapter;
+
+/// Claude Code 2.1.191 uses `Agent`; older/current-compatible tool tables may
+/// still expose `Task`. Keep this vendor spelling inside the CC adapter and
+/// emit only the neutral `activityKind=collaboration` marker downstream.
+pub(super) fn is_collaboration_tool_name(name: &str) -> bool {
+    matches!(name, "Agent" | "Task")
+}

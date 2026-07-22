@@ -459,6 +459,13 @@ mod tests {
                                 }
                             ]
                         },
+                        {
+                            "id": "activity-1",
+                            "type": "subAgentActivity",
+                            "kind": "interacted",
+                            "agentThreadId": "child-1",
+                            "agentPath": "/root/schema_mapping_check"
+                        },
                         { "id": "compact-1", "type": "contextCompaction" }
                     ]
                 }],
@@ -504,7 +511,16 @@ mod tests {
         ));
         assert!(matches!(
             &items[5],
-            AgentItem::Raw { raw_kind, .. } if raw_kind == "contextCompaction"
+            AgentItem::ToolCall { name, meta, .. }
+                if name == "Schema mapping check"
+                    && meta.vendor_extensions["activityKind"] == "collaboration"
+                    && meta.vendor_extensions["activityEvent"] == "interacted"
+        ));
+        assert!(matches!(
+            &items[6],
+            AgentItem::ToolCall { name, meta, .. }
+                if name == "contextCompaction"
+                    && meta.vendor_extensions["activityKind"] == "contextMaintenance"
         ));
     }
 

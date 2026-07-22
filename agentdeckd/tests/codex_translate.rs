@@ -194,6 +194,91 @@ fn fixture_replay_unknown_item_type_falls_back_to_raw_not_silently_dropped() {
 }
 
 #[test]
+fn fixture_replay_subagent_activity_is_visible_once_after_started_completed_pair() {
+    let mut t = new_translator();
+    let item = r#"{"id":"activity-1","type":"subAgentActivity","kind":"started","agentThreadId":"child-1","agentPath":"/root/tool_ui_trace"}"#;
+    let lines = [
+        format!(r#"{{"method":"item/started","params":{{"item":{item},"threadId":"thread-1"}}}}"#),
+        format!(
+            r#"{{"method":"item/completed","params":{{"item":{item},"threadId":"thread-1"}}}}"#
+        ),
+    ];
+    let events: Vec<_> = lines
+        .iter()
+        .flat_map(|line| t.translate_line(line))
+        .collect();
+
+    assert_eq!(
+        events.len(),
+        1,
+        "started/completed must not duplicate one activity"
+    );
+    match &events[0] {
+        ServerEvent::AgentItem {
+            item:
+                AgentItem::ToolCall {
+                    name,
+                    args,
+                    result,
+                    meta,
+                },
+            ..
+        } => {
+            assert_eq!(name, "Tool ui trace");
+            assert_eq!(args["agentThreadId"], "child-1");
+            assert_eq!(args["kind"], "started");
+            assert!(result.is_none());
+            assert_eq!(meta.vendor_extensions["activityKind"], "collaboration");
+            assert_eq!(meta.vendor_extensions["activityEvent"], "started");
+        }
+        other => panic!("expected subagent activity ToolCall, got {other:?}"),
+    }
+
+    let mut completed_only = new_translator();
+    let events = completed_only.translate_line(&format!(
+        r#"{{"method":"item/completed","params":{{"item":{item},"threadId":"thread-1"}}}}"#
+    ));
+    assert_eq!(
+        events.len(),
+        1,
+        "completed-only activity must remain visible"
+    );
+    assert!(matches!(
+        &events[0],
+        ServerEvent::AgentItem {
+            item: AgentItem::ToolCall { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn fixture_replay_context_compaction_is_a_neutral_activity_not_raw_error() {
+    let mut t = new_translator();
+    let item = r#"{"id":"compact-1","type":"contextCompaction"}"#;
+    let events = [
+        format!(r#"{{"method":"item/started","params":{{"item":{item},"threadId":"thread-1"}}}}"#),
+        format!(
+            r#"{{"method":"item/completed","params":{{"item":{item},"threadId":"thread-1"}}}}"#
+        ),
+    ]
+    .iter()
+    .flat_map(|line| t.translate_line(line))
+    .collect::<Vec<_>>();
+
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ServerEvent::AgentItem {
+            item: AgentItem::ToolCall { meta, .. },
+            ..
+        } => {
+            assert_eq!(meta.vendor_extensions["activityKind"], "contextMaintenance");
+        }
+        other => panic!("expected context maintenance ToolCall, got {other:?}"),
+    }
+}
+
+#[test]
 fn fixture_replay_malformed_line_yields_error_event_with_session_id() {
     let mut t = new_translator();
     let events = t.translate_line("{not valid json at all");

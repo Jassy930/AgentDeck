@@ -724,9 +724,12 @@ fn classify(item: &Value) -> InFlightKind {
         "fileChange" => InFlightKind::Diff,
         "plan" => InFlightKind::Plan,
         "imageView" | "imageGeneration" => InFlightKind::Image,
-        "mcpToolCall" | "dynamicToolCall" | "collabAgentToolCall" | "webSearch" => {
-            InFlightKind::ToolCall
-        }
+        "mcpToolCall"
+        | "dynamicToolCall"
+        | "collabAgentToolCall"
+        | "subAgentActivity"
+        | "contextCompaction"
+        | "webSearch" => InFlightKind::ToolCall,
         "userMessage" => InFlightKind::UserMessage,
         _ => InFlightKind::Raw,
     }
@@ -866,11 +869,33 @@ fn tool_meta(item: &Value) -> AgentItemMeta {
     if let Some(kind) = item.get("type").and_then(Value::as_str) {
         meta.vendor_extensions
             .insert("codexToolKind".to_string(), json!(kind));
+        if matches!(kind, "collabAgentToolCall" | "subAgentActivity") {
+            // The shared UI must not need to understand a Codex item name in
+            // order to keep collaboration controls outside ordinary execution
+            // summaries. Carry only the neutral semantic across the trunk.
+            meta.vendor_extensions
+                .insert("activityKind".to_string(), json!("collaboration"));
+        }
+        if kind == "subAgentActivity" {
+            if let Some(activity_event @ ("started" | "interacted" | "interrupted")) =
+                item.get("kind").and_then(Value::as_str)
+            {
+                meta.vendor_extensions
+                    .insert("activityEvent".to_string(), json!(activity_event));
+            }
+        }
+        if kind == "contextCompaction" {
+            meta.vendor_extensions
+                .insert("activityKind".to_string(), json!("contextMaintenance"));
+        }
     }
     meta
 }
 
 fn tool_name(item: &Value) -> String {
+    if item.get("type").and_then(Value::as_str) == Some("subAgentActivity") {
+        return sub_agent_activity_name(item);
+    }
     item.get("tool")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -881,6 +906,21 @@ fn tool_name(item: &Value) -> String {
                 .unwrap_or("tool")
                 .to_string()
         })
+}
+
+fn sub_agent_activity_name(item: &Value) -> String {
+    let component = item
+        .get("agentPath")
+        .and_then(Value::as_str)
+        .and_then(|path| path.rsplit('/').find(|part| !part.is_empty()))
+        .unwrap_or("subagent");
+    let readable = component.replace('_', " ").replace('-', " ");
+    let readable = readable.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = readable.chars();
+    let Some(first) = characters.next() else {
+        return "Subagent".into();
+    };
+    format!("{}{}", first.to_uppercase(), characters.as_str())
 }
 
 fn object_with_present_fields(item: &Value, fields: &[&str]) -> Value {
@@ -906,6 +946,9 @@ fn tool_args(item: &Value) -> Value {
                 "senderThreadId",
             ],
         ),
+        "subAgentActivity" => {
+            object_with_present_fields(item, &["id", "agentPath", "agentThreadId", "kind"])
+        }
         _ => item.get("arguments").cloned().unwrap_or(Value::Null),
     }
 }
@@ -1369,6 +1412,7 @@ mod tests {
             AgentItem::ToolCall { meta, .. } => {
                 assert_eq!(meta.vendor_extensions["resourceUri"], "app://agentdeck");
                 assert_eq!(meta.vendor_extensions["actionName"], "确认 AgentDeck 窗口");
+                assert!(!meta.vendor_extensions.contains_key("activityKind"));
             }
             other => panic!("expected MCP ToolCall, got {other:?}"),
         }
@@ -1387,9 +1431,13 @@ mod tests {
         }));
         match collab {
             AgentItem::ToolCall {
-                name, args, result, ..
+                name,
+                args,
+                result,
+                meta,
             } => {
                 assert_eq!(name, "spawnAgent");
+                assert_eq!(meta.vendor_extensions["activityKind"], "collaboration");
                 assert_eq!(args["prompt"], "review this");
                 assert_eq!(args["receiverThreadIds"][0], "child-1");
                 assert_eq!(args["senderThreadId"], "parent-1");
@@ -1399,6 +1447,81 @@ mod tests {
                 );
             }
             other => panic!("expected collab ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_tool_mapping_preserves_subagent_activity_without_inventing_status() {
+        for activity_event in ["started", "interacted", "interrupted"] {
+            let item = history_item_to_agent_item(&json!({
+                "id": format!("activity-{activity_event}"),
+                "type": "subAgentActivity",
+                "kind": activity_event,
+                "agentThreadId": "child-1",
+                "agentPath": "/root/tool_ui_trace",
+                "vendorSecret": "must-not-cross"
+            }));
+
+            match item {
+                AgentItem::ToolCall {
+                    name,
+                    args,
+                    result,
+                    meta,
+                } => {
+                    assert_eq!(name, "Tool ui trace");
+                    assert_eq!(args["id"], format!("activity-{activity_event}"));
+                    assert_eq!(args["agentPath"], "/root/tool_ui_trace");
+                    assert_eq!(args["agentThreadId"], "child-1");
+                    assert_eq!(args["kind"], activity_event);
+                    assert!(args.get("vendorSecret").is_none());
+                    assert!(result.is_none());
+                    assert_eq!(meta.vendor_extensions["codexToolKind"], "subAgentActivity");
+                    assert_eq!(meta.vendor_extensions["activityKind"], "collaboration");
+                    assert_eq!(meta.vendor_extensions["activityEvent"], activity_event);
+                    assert!(!meta.vendor_extensions.contains_key("status"));
+                }
+                other => panic!("expected subagent activity ToolCall, got {other:?}"),
+            }
+        }
+
+        let unknown = history_item_to_agent_item(&json!({
+            "id": "activity-future",
+            "type": "subAgentActivity",
+            "kind": "futureEvent",
+            "agentThreadId": "child-1",
+            "agentPath": "/root/tool_ui_trace"
+        }));
+        match unknown {
+            AgentItem::ToolCall { meta, .. } => {
+                assert_eq!(meta.vendor_extensions["activityKind"], "collaboration");
+                assert!(!meta.vendor_extensions.contains_key("activityEvent"));
+            }
+            other => panic!("expected future subagent activity ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_tool_mapping_lowers_context_compaction_to_neutral_maintenance_activity() {
+        let item = history_item_to_agent_item(&json!({
+            "id": "compact-1",
+            "type": "contextCompaction"
+        }));
+
+        match item {
+            AgentItem::ToolCall {
+                name,
+                args,
+                result,
+                meta,
+            } => {
+                assert_eq!(name, "contextCompaction");
+                assert!(args.is_null());
+                assert!(result.is_none());
+                assert_eq!(meta.vendor_extensions["codexToolKind"], "contextCompaction");
+                assert_eq!(meta.vendor_extensions["activityKind"], "contextMaintenance");
+            }
+            other => panic!("expected context maintenance ToolCall, got {other:?}"),
         }
     }
 

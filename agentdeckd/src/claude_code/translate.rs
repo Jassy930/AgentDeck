@@ -65,6 +65,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+use super::is_collaboration_tool_name;
 use agentdeck_protocol::{
     ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentKind,
     ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, DiffFile, DiffStatus, ServerEvent,
@@ -327,18 +328,18 @@ impl ClaudeCodeTranslator {
                     status: ShellStatus::Running,
                     exit_code: None,
                     duration_ms: None,
-                    meta: tool_meta(&id),
+                    meta: tool_meta(&id, &name),
                 })
             }
             "Edit" | "Write" | "MultiEdit" => {
                 let files = diff_files_from_tool_use(&name, &input);
                 self.agent_item_event(AgentItem::Diff {
                     files,
-                    meta: tool_meta(&id),
+                    meta: tool_meta(&id, &name),
                 })
             }
             _ => {
-                let mut meta = tool_meta(&id);
+                let mut meta = tool_meta(&id, &name);
                 meta.vendor_extensions
                     .insert("status".into(), json!("inProgress"));
                 self.agent_item_event(AgentItem::ToolCall {
@@ -417,7 +418,7 @@ impl ClaudeCodeTranslator {
                         status,
                         exit_code,
                         duration_ms: Some(duration_ms),
-                        meta: tool_meta(tool_use_id),
+                        meta: tool_meta(tool_use_id, &record.name),
                     })
                 }
                 "Edit" | "Write" | "MultiEdit" => {
@@ -426,11 +427,11 @@ impl ClaudeCodeTranslator {
                     let files = diff_files_from_tool_use(&record.name, &record.input);
                     self.agent_item_event(AgentItem::Diff {
                         files,
-                        meta: tool_meta(tool_use_id),
+                        meta: tool_meta(tool_use_id, &record.name),
                     })
                 }
                 _ => {
-                    let mut meta = tool_meta(tool_use_id);
+                    let mut meta = tool_meta(tool_use_id, &record.name);
                     meta.vendor_extensions.insert(
                         "status".into(),
                         json!(if is_error { "failed" } else { "completed" }),
@@ -567,10 +568,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn tool_meta(tool_use_id: &str) -> AgentItemMeta {
+fn tool_meta(tool_use_id: &str, tool_name: &str) -> AgentItemMeta {
     let mut meta = AgentItemMeta::default();
     meta.vendor_extensions
         .insert("toolUseId".into(), json!(tool_use_id));
+    if is_collaboration_tool_name(tool_name) {
+        meta.vendor_extensions
+            .insert("activityKind".into(), json!("collaboration"));
+    }
     meta
 }
 

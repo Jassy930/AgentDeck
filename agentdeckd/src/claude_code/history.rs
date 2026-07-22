@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::SystemTime;
 
+use super::is_collaboration_tool_name;
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, DiffFile, DiffStatus, HistoryListItem,
     HistoryReadResponse, HistoryTurn, ProtocolError, ShellStatus, ThreadId,
@@ -568,15 +569,15 @@ fn tool_use_to_agent_item(tool_use_id: &str, name: &str, input: &Value) -> Agent
                 status: ShellStatus::Running,
                 exit_code: None,
                 duration_ms: None,
-                meta: tool_meta(tool_use_id),
+                meta: tool_meta(tool_use_id, name),
             }
         }
         "Edit" | "Write" | "MultiEdit" => AgentItem::Diff {
             files: diff_files_from_tool_use(name, input),
-            meta: tool_meta(tool_use_id),
+            meta: tool_meta(tool_use_id, name),
         },
         _ => {
-            let mut meta = tool_meta(tool_use_id);
+            let mut meta = tool_meta(tool_use_id, name);
             meta.vendor_extensions
                 .insert("status".into(), serde_json::json!("inProgress"));
             AgentItem::ToolCall {
@@ -614,15 +615,15 @@ fn tool_result_to_agent_item(
                 },
                 exit_code: Some(if is_error { 1 } else { 0 }),
                 duration_ms: None,
-                meta: tool_meta(tool_use_id),
+                meta: tool_meta(tool_use_id, name),
             }
         }
         "Edit" | "Write" | "MultiEdit" => AgentItem::Diff {
             files: diff_files_from_tool_use(name, input),
-            meta: tool_meta(tool_use_id),
+            meta: tool_meta(tool_use_id, name),
         },
         _ => {
-            let mut meta = tool_meta(tool_use_id);
+            let mut meta = tool_meta(tool_use_id, name);
             meta.vendor_extensions.insert(
                 "status".into(),
                 serde_json::json!(if is_error { "failed" } else { "completed" }),
@@ -641,10 +642,14 @@ fn tool_result_to_agent_item(
     }
 }
 
-fn tool_meta(tool_use_id: &str) -> AgentItemMeta {
+fn tool_meta(tool_use_id: &str, tool_name: &str) -> AgentItemMeta {
     let mut meta = AgentItemMeta::default();
     meta.vendor_extensions
         .insert("toolUseId".into(), serde_json::json!(tool_use_id));
+    if is_collaboration_tool_name(tool_name) {
+        meta.vendor_extensions
+            .insert("activityKind".into(), serde_json::json!("collaboration"));
+    }
     meta
 }
 
@@ -1176,6 +1181,7 @@ mod tests {
                 assert!(result.is_none());
                 assert_eq!(meta.vendor_extensions["toolUseId"], "read-1");
                 assert_eq!(meta.vendor_extensions["status"], "inProgress");
+                assert!(!meta.vendor_extensions.contains_key("activityKind"));
             }
             other => panic!("expected in-progress ToolCall, got {other:?}"),
         }
@@ -1184,8 +1190,31 @@ mod tests {
                 assert_eq!(result, &Some(serde_json::json!("done")));
                 assert_eq!(meta.vendor_extensions["toolUseId"], "read-1");
                 assert_eq!(meta.vendor_extensions["status"], "completed");
+                assert!(!meta.vendor_extensions.contains_key("activityKind"));
             }
             other => panic!("expected completed ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_session_jsonl_collaboration_tool_keeps_neutral_marker() {
+        let content = r#"
+{"type":"user","message":{"role":"user","content":"delegate it"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"agent-1","name":"Agent","input":{"description":"review","subagent_type":"Explore","prompt":"inspect UI"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-1","content":"done","is_error":false}]}}
+"#;
+        let resp = parse_session_jsonl(content, ThreadId("x".into())).unwrap();
+        let items = &resp.turns[0].items;
+        assert_eq!(items.len(), 3);
+
+        for item in &items[1..] {
+            match item {
+                AgentItem::ToolCall { meta, .. } => {
+                    assert_eq!(meta.vendor_extensions["toolUseId"], "agent-1");
+                    assert_eq!(meta.vendor_extensions["activityKind"], "collaboration");
+                }
+                other => panic!("expected collaboration ToolCall, got {other:?}"),
+            }
         }
     }
 

@@ -285,6 +285,69 @@ fn unknown_tool_becomes_tool_call() {
 }
 
 #[test]
+fn collaboration_tools_keep_neutral_activity_marker_from_start_to_result() {
+    for (index, name) in ["Agent", "Task"].into_iter().enumerate() {
+        let mut t = tr();
+        let tool_use_id = format!("collab-{index}");
+        let started = json!({
+            "type": "assistant",
+            "session_id": "thread_1",
+            "message": { "content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": name,
+                "input": {
+                    "description": "review grouping",
+                    "subagent_type": "Explore",
+                    "prompt": "inspect the UI"
+                }
+            }] }
+        });
+        let started_out = t.translate_line(&started.to_string());
+        match &started_out.events[0] {
+            ServerEvent::AgentItem {
+                item: AgentItem::ToolCall { meta, .. },
+                ..
+            } => {
+                assert_eq!(meta.vendor_extensions["toolUseId"], json!(tool_use_id));
+                assert_eq!(
+                    meta.vendor_extensions["activityKind"],
+                    json!("collaboration")
+                );
+                assert_eq!(meta.vendor_extensions["status"], json!("inProgress"));
+            }
+            other => panic!("expected collaboration ToolCall start, got {other:?}"),
+        }
+
+        let finished = json!({
+            "type": "user",
+            "session_id": "thread_1",
+            "message": { "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": "done",
+                "is_error": false
+            }] }
+        });
+        let finished_out = t.translate_line(&finished.to_string());
+        match &finished_out.events[0] {
+            ServerEvent::AgentItem {
+                item: AgentItem::ToolCall { meta, .. },
+                ..
+            } => {
+                assert_eq!(meta.vendor_extensions["toolUseId"], json!(tool_use_id));
+                assert_eq!(
+                    meta.vendor_extensions["activityKind"],
+                    json!("collaboration")
+                );
+                assert_eq!(meta.vendor_extensions["status"], json!("completed"));
+            }
+            other => panic!("expected collaboration ToolCall result, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn unknown_tool_result_preserves_failure_status_and_duration() {
     let mut t = tr();
     let started = json!({
