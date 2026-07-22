@@ -30,7 +30,7 @@ swift build
 swift test   # 覆盖：markdown builder、display-row、observation binder、
              #         行高缓存、契约一致性、rail 几何、Codex chrome smoke tests
 
-# GUI bundle 启动验证（避免 raw SwiftPM GUI 启动差异）
+# GUI bundle 启动验证（同时检查 bundle 内 agentdeckd 子进程）
 ./script/build_and_run.sh --verify
 
 # headless 自检（IPC 生命周期 + 日志/脱敏）
@@ -47,7 +47,9 @@ cargo test
 
 下列项目无法通过单元测试覆盖，须每次发布前人工验证：
 
-- [ ] 应用可通过 `./script/build_and_run.sh --verify` 启动为 `dist/AgentDeck.app`
+- [ ] `./script/build_and_run.sh --verify` 读回 App/daemon 实际 executable path、
+      `Info.plist` 与 Mach-O `minos=15.0`，再确认目标 bundle 两个进程均已启动
+      （不能只以进程名、PPID 或 App 进程存在作为成功）
 - [ ] 应用正常启动，窗口标题显示 `AgentDeck Dev`（debug 构建）
 - [ ] 空态首屏对齐 Codex Desktop：透明标题栏、全高左侧侧栏、居中大标题、圆角 composer、连接卡片和底部速率提示
 - [ ] 会话态对齐 Codex Desktop：右侧 thread header、右上环境信息面板、底部悬浮 composer
@@ -129,6 +131,7 @@ cargo install cargo-llvm-cov
 | 变更范围 | 最小验证 |
 | --- | --- |
 | Rust daemon、IPC、Codex adapter、history list 性能、run record、diagnostics | `cargo test`；涉及运行态再跑 `swift run AgentDeck -- --selfcheck` |
+| macOS App 打包、daemon 定位或启动错误传播 | `swift test --filter 'DaemonLocatorTests|HistoryDaemonLaunchTests'`；`bash -n script/build_and_run.sh`；`./script/build_and_run.sh --verify` |
 | Swift UI、会话模型、历史回放、live session 侧栏可见性、富文本渲染、选择/滚动行为 | `swift test` |
 | approval / action request / action decision | `cargo test approval`；`swift test --filter approval`；再跑完整 `cargo test`、`swift test`、`swift run AgentDeck -- --selfcheck` |
 | 诊断日志、自检、数据目录、profile、密钥脱敏 | `cargo test`；`swift run AgentDeck -- --selfcheck`；`swift run AgentDeck -- --diagnostics-report --json`；涉及 profile 时加跑 `swift run AgentDeck -- --selfcheck --profile dev` 和 `swift run AgentDeck -- --diagnostics-report --json --profile dev` |

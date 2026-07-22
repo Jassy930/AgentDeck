@@ -109,6 +109,7 @@ final class SessionModel {
 
     private let client: DaemonClient?
     private var daemonStarted = false
+    private var daemonLaunchFailureMessage: String?
     private var conversationViewportRevision = 0
 
     init(
@@ -236,11 +237,32 @@ final class SessionModel {
             do {
                 try client.start()
                 daemonStarted = true
+                if let launchFailure = daemonLaunchFailureMessage,
+                   phase == .failed,
+                   errorMessage == launchFailure {
+                    errorMessage = nil
+                    phase = cwd == nil ? .idle : .ready
+                }
+                daemonLaunchFailureMessage = nil
             } catch {
+                let message = "\(error)"
                 phase = .failed
-                errorMessage = "\(error)"
+                errorMessage = message
+                daemonLaunchFailureMessage = message
                 return false
             }
+        }
+        return true
+    }
+
+    /// History owns a dedicated visible error surface in the sidebar. Mirror
+    /// daemon launch failures there instead of returning early and letting an
+    /// unavailable daemon look like a valid empty history catalogue.
+    @discardableResult
+    private func ensureHistoryDaemonStarted() -> Bool {
+        guard ensureDaemonStarted() else {
+            historyErrorMessage = errorMessage ?? "failed to start agentdeckd"
+            return false
         }
         return true
     }
@@ -300,7 +322,7 @@ final class SessionModel {
             historyErrorMessage = "no daemon client"
             return
         }
-        guard ensureDaemonStarted() else { return }
+        guard ensureHistoryDaemonStarted() else { return }
         isLoadingHistory = true
         historyErrorMessage = nil
         let cwdFilter = currentProjectOnly ? cwd?.path : nil
@@ -338,7 +360,7 @@ final class SessionModel {
             return
         }
         guard let client else { return }
-        guard ensureDaemonStarted() else { return }
+        guard ensureHistoryDaemonStarted() else { return }
         openingHistoryThreadId = thread.id
         historyErrorMessage = nil
         lastHistoryOpenTiming = nil
@@ -418,7 +440,7 @@ final class SessionModel {
     }
 
     func archiveHistoryThread(_ thread: HistoryThreadSummary) {
-        guard let client, ensureDaemonStarted() else { return }
+        guard let client, ensureHistoryDaemonStarted() else { return }
         let agentKind: AgentKind = thread.agentKind
         do {
             _ = try client.history(.archive(threadId: thread.id, agentKind: agentKind))
@@ -433,7 +455,7 @@ final class SessionModel {
 
     func renameHistoryThread(_ thread: HistoryThreadSummary, name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let client, ensureDaemonStarted() else { return }
+        guard !trimmed.isEmpty, let client, ensureHistoryDaemonStarted() else { return }
         let agentKind: AgentKind = thread.agentKind
         do {
             _ = try client.history(.rename(threadId: thread.id, agentKind: agentKind, title: trimmed))

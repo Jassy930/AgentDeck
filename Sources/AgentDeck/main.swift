@@ -64,7 +64,9 @@ func argumentValue(after flag: String, in args: [String] = CommandLine.arguments
 
 func runDaemonOneShot(args daemonArgs: [String]) -> Int32 {
     guard let path = DaemonClient.locateDaemon() else {
-        FileHandle.standardError.write(Data("AgentDeck FATAL: agentdeckd not found at target/{debug,release}/agentdeckd or PATH\n".utf8))
+        FileHandle.standardError.write(Data(
+            "AgentDeck FATAL: agentdeckd not found via AGENTDECK_DAEMON_PATH, app bundle, target/{debug,release}, or PATH\n".utf8
+        ))
         return 1
     }
     let process = Process()

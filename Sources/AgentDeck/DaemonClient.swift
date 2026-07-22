@@ -186,21 +186,64 @@ final class DaemonClient {
         }
     }
 
-    /// Locate the daemon binary.
-    static func locateDaemon() -> String? {
-        let candidates = [
-            "target/debug/agentdeckd",
-            "target/release/agentdeckd",
+    /// Locate the daemon binary without relying on the process cwd.
+    ///
+    /// LaunchServices starts an `.app` with `/` as its working directory, so a
+    /// cwd-relative `target/debug/agentdeckd` lookup cannot support a packaged
+    /// development app. The bundle therefore carries `agentdeckd` next to the
+    /// App executable. `AGENTDECK_DAEMON_PATH` remains the explicit override
+    /// for local harnesses; source-tree and PATH candidates are development
+    /// fallbacks for `swift run AgentDeck`.
+    static func locateDaemon(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        executableURL: URL? = Bundle.main.executableURL,
+        currentDirectoryPath: String = FileManager.default.currentDirectoryPath,
+        fileManager: FileManager = .default
+    ) -> String? {
+        var candidates: [String] = []
+
+        if let override = environment["AGENTDECK_DAEMON_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !override.isEmpty {
+            candidates.append(override)
+        }
+
+        if let executableURL {
+            candidates.append(
+                executableURL.deletingLastPathComponent()
+                    .appendingPathComponent("agentdeckd", isDirectory: false)
+                    .path
+            )
+        }
+
+        candidates.append(contentsOf: [
+            (currentDirectoryPath as NSString).appendingPathComponent("target/debug/agentdeckd"),
+            (currentDirectoryPath as NSString).appendingPathComponent("target/release/agentdeckd"),
+        ])
+
+        if let path = environment["PATH"] {
+            candidates.append(contentsOf: path.split(separator: ":").map {
+                (String($0) as NSString).appendingPathComponent("agentdeckd")
+            })
+        }
+
+        candidates.append(contentsOf: [
             "/usr/local/bin/agentdeckd",
             "/opt/homebrew/bin/agentdeckd",
-        ]
-        let fm = FileManager.default
-        for c in candidates where fm.isExecutableFile(atPath: c) {
-            return c
-        }
-        for c in candidates {
-            let abs = fm.currentDirectoryPath + "/" + c
-            if fm.isExecutableFile(atPath: abs) { return abs }
+        ])
+
+        for rawCandidate in candidates {
+            let expanded = (rawCandidate as NSString).expandingTildeInPath
+            let absolute = (expanded as NSString).isAbsolutePath
+                ? expanded
+                : (currentDirectoryPath as NSString).appendingPathComponent(expanded)
+            let normalized = URL(fileURLWithPath: absolute).standardizedFileURL.path
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: normalized, isDirectory: &isDirectory),
+               !isDirectory.boolValue,
+               fileManager.isExecutableFile(atPath: normalized) {
+                return normalized
+            }
         }
         return nil
     }

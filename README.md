@@ -277,11 +277,13 @@ cargo run -q -p agentdeck-cli -- protocol schema \
 agentdeck protocol version
 ```
 
-运行（Swift app 会自动 spawn 同目录或 PATH 上的 agentdeckd）：
+运行（bundle 会携带同版本 `agentdeckd` 并从绝对路径启动；
+`AGENTDECK_DAEMON_PATH` 可用于本地 harness 显式覆盖，`swift run` 再回退到
+源码树 `target/` 与 `PATH`）：
 
 ```bash
-./script/build_and_run.sh        # 构建 SwiftPM 产物，临时打包 dist/AgentDeck.app 并启动
-./script/build_and_run.sh --verify  # 启动后确认 AgentDeck 进程存在
+./script/build_and_run.sh        # 构建 Swift + Rust daemon，打包 dist/AgentDeck.app 并启动
+./script/build_and_run.sh --verify  # 读回 App/daemon 绝对路径及 macOS 15 最低版本后确认启动
 swift run AgentDeck               # 本地 debug 构建默认使用 dev profile
 swift run AgentDeck -- --selfcheck  # 无窗口自检: IPC lifecycle + logging/redaction probe
 swift run AgentDeck -- --diagnostics-report --json  # 输出机器可读诊断报告
