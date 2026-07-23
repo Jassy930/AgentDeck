@@ -51,8 +51,8 @@ pub use pairing::{
     PairResponseSealAuthority, VerifiedPairRequestV1, open_pair_pending, open_pair_request,
     open_pair_request_verified, open_pair_response, open_pair_response_received, seal_pair_pending,
     seal_pair_request, seal_pair_response, seal_pair_response_received, sign_device_authorization,
-    sign_pair_response_received, verify_device_authorization, verify_pair_response_envelope,
-    verify_pair_response_received,
+    sign_pair_response_received, verify_device_authorization, verify_pair_request_envelope,
+    verify_pair_response_envelope, verify_pair_response_received,
 };
 pub use sealed_blob::{sign_sealed, verify_sealed};
 pub use signature::{

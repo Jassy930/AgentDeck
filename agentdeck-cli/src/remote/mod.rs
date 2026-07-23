@@ -5,3 +5,4 @@
 pub mod crypto_state;
 pub mod device_lock;
 pub mod keychain;
+pub mod pending;

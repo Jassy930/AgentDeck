@@ -6,7 +6,8 @@ use agentdeck_crypto::{
     open_pair_request, open_pair_request_verified, open_pair_response, open_pair_response_received,
     seal_pair_pending, seal_pair_request, seal_pair_response, seal_pair_response_received, sha256,
     sign_device_authorization, sign_key_directory, sign_pair_response_received, sign_tbs,
-    verify_device_authorization, verify_pair_response_envelope, verify_pair_response_received,
+    verify_device_authorization, verify_pair_request_envelope, verify_pair_response_envelope,
+    verify_pair_response_received,
 };
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,
@@ -337,6 +338,13 @@ fn pair_request_seal_is_byte_stable_and_open_verifies_detached_device_proof() {
     .unwrap();
     assert_eq!(a.canonical_bytes().unwrap(), b.canonical_bytes().unwrap());
     assert_eq!(a.canonical_sha256().unwrap(), b.canonical_sha256().unwrap());
+    verify_pair_request_envelope(
+        &device.verifying_key(),
+        &request_info(),
+        &context(OuterFrameKind::PairRequest),
+        &a,
+    )
+    .unwrap();
     assert_eq!(
         open_pair_request(
             &invite_private,
@@ -351,6 +359,15 @@ fn pair_request_seal_is_byte_stable_and_open_verifies_detached_device_proof() {
 
     let mut signature = a.clone();
     signature.device_proof_signature.0[0] ^= 1;
+    assert_eq!(
+        verify_pair_request_envelope(
+            &device.verifying_key(),
+            &request_info(),
+            &context(OuterFrameKind::PairRequest),
+            &signature,
+        ),
+        Err(CryptoError::BadSignature)
+    );
     assert_eq!(
         open_pair_request(
             &invite_private,

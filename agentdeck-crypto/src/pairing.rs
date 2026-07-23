@@ -122,11 +122,12 @@ pub fn seal_pair_request<R: ::hpke::rand_core::CryptoRng>(
     }
     let info_bytes = info.encode();
     let aad = context.encode_aad();
+    let canonical_plaintext = Zeroizing::new(plaintext.canonical_bytes()?);
     let sealed = hpke_seal_base(
         recipient,
         &info_bytes,
         &aad,
-        &plaintext.canonical_bytes()?,
+        canonical_plaintext.as_slice(),
         rng,
     )?;
     let fingerprint = signer_fingerprint(&verifying_key);
@@ -157,12 +158,12 @@ pub fn open_pair_request(
     envelope: &PairRequestV1,
 ) -> Result<PairRequestPlaintextV1, CryptoError> {
     envelope.validate()?;
-    let opened = hpke_open_base(
+    let opened = Zeroizing::new(hpke_open_base(
         recipient,
         &info.encode(),
         &context.encode_aad(),
         &hpke_envelope(&envelope.enc, &envelope.ciphertext),
-    )?;
+    )?);
     let plaintext = PairRequestPlaintextV1::from_canonical_bytes(&opened)
         .map_err(|_| CryptoError::BadCiphertext)?;
     if &plaintext.invite_secret != expected_invite_secret {
@@ -195,6 +196,20 @@ pub fn open_pair_request_verified(
         info: info.clone(),
         context: context.clone(),
     })
+}
+
+/// 只验证 PairRequest 的形状、完整 canonical carrier 上的 DeviceSign possession proof
+/// 及其 info/AAD 绑定；不持有 invite private key，因此不解密 ciphertext。
+pub fn verify_pair_request_envelope(
+    device_verifying_key: &VerifyingKey,
+    info: &PairRequestInfoV1,
+    context: &OuterContextV1,
+    envelope: &PairRequestV1,
+) -> Result<(), CryptoError> {
+    envelope.validate()?;
+    let fingerprint = signer_fingerprint(device_verifying_key);
+    let tbs = envelope.proof_tbs(info, context, fingerprint)?;
+    verify_validated_pairing_tbs(device_verifying_key, &tbs, &envelope.device_proof_signature)
 }
 
 pub fn seal_pair_response<R: ::hpke::rand_core::CryptoRng>(
