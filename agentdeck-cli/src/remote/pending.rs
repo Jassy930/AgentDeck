@@ -10,15 +10,17 @@ use std::fmt;
 use agentdeck_crypto::rand_core::CryptoRng;
 use agentdeck_crypto::{
     CryptoError, HpkePrivateKey, HpkePublicKey, PairResponseExpectedV1, SigningKey,
-    VerifiedPairResponseV1, VerifyingKey, open_pair_response_verified, seal_pair_request,
-    verify_pair_request_envelope,
+    VerifiedPairResponseV1, VerifyingKey, open_pair_pending, open_pair_response_verified,
+    seal_pair_request, verify_pair_request_envelope,
 };
 use agentdeck_protocol::e2ee::{
-    AuthorizationRequestV1, E2EE_FORMAT_VERSION, OuterContextV1, OuterFrameKind, PairInviteV1,
-    PairRequestInfoV1, PairRequestPlaintextV1, PairRequestV1, PairingError,
+    AuthorizationRequestV1, E2EE_FORMAT_VERSION, MachineDataSignerBindingV1, OuterContextV1,
+    OuterFrameKind, PairInviteV1, PairPendingV1, PairRequestInfoV1, PairRequestPlaintextV1,
+    PairRequestV1, PairResponseV1, PairingControlEnvelopeV1, PairingError,
 };
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
-use agentdeck_protocol::relay_v2::auth::PublicKeyBytes;
+use agentdeck_protocol::relay_v2::auth::{CertRole, PublicKeyBytes};
+use agentdeck_protocol::relay_v2::frame::PairData;
 use agentdeck_protocol::relay_v2::id::{DeviceRouteId, MachineRouteId};
 use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use thiserror::Error;
@@ -47,6 +49,8 @@ pub enum PendingPairingError {
     Crypto(#[source] CryptoError),
     #[error("pair response verification failed")]
     InvalidResponse(#[source] CryptoError),
+    #[error("Relay PairData is invalid or unauthenticated")]
+    InvalidPairData,
     #[error("pending pairing persistence failed")]
     Persistence(#[source] RemoteKeyStoreError),
     #[error("pending pairing entropy source is unavailable")]
@@ -67,6 +71,7 @@ impl PendingPairingError {
             Self::InvalidAuthorization(_) => "remote.pairing.authorization_invalid",
             Self::Crypto(_) => "remote.pairing.crypto_failed",
             Self::InvalidResponse(_) => "remote.pairing.response_invalid",
+            Self::InvalidPairData => "remote.pairing.frame_invalid",
             Self::Persistence(_) => "remote.pairing.pending_persistence_failed",
             Self::EntropyUnavailable => "remote.pairing.entropy_unavailable",
             Self::InvalidRecord => "remote.pairing.pending_invalid",
@@ -74,6 +79,25 @@ impl PendingPairingError {
             Self::ImmutableConflict => "remote.pairing.pending_conflict",
         }
     }
+}
+
+/// 已按 durable pending marker 验证的 Relay `PairData` 业务结果。
+///
+/// `Waiting` 已验证 OOB invite 固定的 MachineDataSign identity、完整 data cert hash、
+/// PairPending signature、HPKE info/AAD 以及 pairRoute/inviteHash/requestHash。PairPending
+/// 阶段尚无 machine route，root→data cert signature 的独立复核由 `Response` 的完整验证链
+/// 在 machine route 披露后完成。枚举不实现 Clone/Serde，避免把 response capability 降级
+/// 为可复制的裸 DTO。
+///
+/// ```compile_fail
+/// use agentdeck_cli::remote::pending::VerifiedPendingPairData;
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<VerifiedPendingPairData>();
+/// ```
+#[derive(Debug)]
+pub enum VerifiedPendingPairData {
+    Waiting(PairPendingV1),
+    Response(Box<VerifiedPendingPairResponse>),
 }
 
 /// 已通过完整 crypto chain 且其 expectations 来自 durable pending marker 的 response。
@@ -409,6 +433,106 @@ impl<'a> PendingPairingCoordinator<'a> {
         })
     }
 
+    /// 对 Relay `PairData` 做严格 wire 分类，并只返回认证后的 waiting/response capability。
+    ///
+    /// `RouteAccepted`、未知 payload、outer pairRoute 不匹配、非 canonical carrier 以及任何
+    /// info/AAD/signature/requestHash 错误都 fail-close。本入口只读 durable pending state，
+    /// 不生成、修复或替换 private item。
+    pub fn classify_pair_data(
+        &self,
+        invite: &PairInviteV1,
+        authorization: &AuthorizationRequestV1,
+        now_ms: u64,
+        data: &PairData,
+    ) -> Result<VerifiedPendingPairData, PendingPairingError> {
+        if data.pair_route != invite.pair_route {
+            return Err(PendingPairingError::InvalidPairData);
+        }
+
+        let control = PairingControlEnvelopeV1::from_canonical_bytes(&data.sealed_blob.0);
+        let response = PairResponseV1::from_canonical_bytes(&data.sealed_blob.0);
+        match (control, response) {
+            (Ok(envelope), Err(_)) => self
+                .verify_waiting(invite, authorization, now_ms, &envelope)
+                .map(VerifiedPendingPairData::Waiting),
+            (Err(_), Ok(_)) => self
+                .verify_response(invite, authorization, now_ms, &data.sealed_blob.0)
+                .map(Box::new)
+                .map(VerifiedPendingPairData::Response)
+                .map_err(|error| match error {
+                    PendingPairingError::InvalidResponse(_) => PendingPairingError::InvalidPairData,
+                    other => other,
+                }),
+            _ => Err(PendingPairingError::InvalidPairData),
+        }
+    }
+
+    fn verify_waiting(
+        &self,
+        invite: &PairInviteV1,
+        authorization: &AuthorizationRequestV1,
+        now_ms: u64,
+        envelope: &PairingControlEnvelopeV1,
+    ) -> Result<PairPendingV1, PendingPairingError> {
+        invite
+            .validate(now_ms)
+            .map_err(PendingPairingError::InvalidInvite)?;
+        authorization
+            .validate()
+            .map_err(PendingPairingError::InvalidAuthorization)?;
+        let invite_hash = invite
+            .canonical_sha256()
+            .map_err(PendingPairingError::InvalidInvite)?;
+        let accounts = PendingAccounts::new(self.installation_id, invite_hash);
+        let record = self
+            .store
+            .load(&accounts.record)
+            .map_err(PendingPairingError::Persistence)?
+            .ok_or(PendingPairingError::IncompleteState)?;
+        let (device_sign, device_hpke) = self.load_committed_keys(&accounts)?;
+        let prepared = validate_record(
+            record.expose_secret(),
+            invite,
+            authorization,
+            &device_sign,
+            &device_hpke,
+        )?;
+
+        // Waiting 阶段没有 machine route，无法重建 root-signed certificate TBS。可信锚是
+        // exact OOB invite：validate_record 固定其 inviteHash，而 PairPending TBS 再固定完整
+        // certificate hash、role/generation/rootKeyId/trustEpoch/expiry 与 subject key。完整
+        // root→cert signature 会在 PairResponse 披露 machine route 后由 verify_response 复核。
+        let certificate = &invite.data_sign_cert;
+        if certificate.cert_role != CertRole::Data
+            || certificate.generation.value() == 0
+            || certificate.root_key_id.as_bytes() == &[0; 16]
+            || certificate.trust_epoch.value() == 0
+            || certificate
+                .not_after_ms
+                .is_some_and(|not_after_ms| now_ms >= not_after_ms)
+        {
+            return Err(PendingPairingError::InvalidPairData);
+        }
+        let verifier = VerifyingKey::from_bytes(&certificate.subject_pubkey.0)
+            .map_err(|_| PendingPairingError::InvalidPairData)?;
+        let signer = MachineDataSignerBindingV1::from_certificate(certificate)
+            .map_err(|_| PendingPairingError::InvalidPairData)?;
+        let recipient = hpke_key_from_secret(&device_hpke)?;
+        let pending = open_pair_pending(
+            &recipient,
+            &request_info(invite, invite_hash),
+            &pending_context(invite),
+            envelope,
+            &verifier,
+            &signer,
+        )
+        .map_err(|_| PendingPairingError::InvalidPairData)?;
+        if pending.request_hash != prepared.request_hash() {
+            return Err(PendingPairingError::InvalidPairData);
+        }
+        Ok(pending)
+    }
+
     fn load_committed_keys(
         &self,
         accounts: &PendingAccounts,
@@ -687,6 +811,13 @@ fn request_context(invite: &PairInviteV1) -> OuterContextV1 {
         stream_cursor: None,
         stream_seq: None,
         message_key_epoch: 0,
+    }
+}
+
+fn pending_context(invite: &PairInviteV1) -> OuterContextV1 {
+    OuterContextV1 {
+        frame_kind: OuterFrameKind::PairPending,
+        ..request_context(invite)
     }
 }
 

@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -19,28 +19,31 @@ use agentdeck_cli::remote::paired_machine::{
     AutomaticRuntimeStateProbe, PairedMachineIdentity, PairedMachineStore, PairedMutationObserver,
     PairedMutationStage, PairedPromotionCoordinator, PromotedPairedMachine,
 };
-use agentdeck_cli::remote::pending::{PendingPairingCoordinator, PreparedPairRequest};
+use agentdeck_cli::remote::pending::{
+    PendingPairingCoordinator, PreparedPairRequest, VerifiedPendingPairData,
+};
 use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
 use agentdeck_crypto::{
-    open_pair_request, open_pair_response_received, seal_key_directory_entry, seal_pair_response,
-    sha256, sign_device_authorization, sign_key_directory, sign_tbs, HpkePrivateKey,
-    PairResponseSealAuthority, SecretAeadKey, SigningKey, VerifyingKey,
+    HpkePrivateKey, PairResponseSealAuthority, SecretAeadKey, SigningKey, VerifyingKey,
+    open_pair_request, open_pair_response_received, seal_key_directory_entry, seal_pair_pending,
+    seal_pair_response, sha256, sign_device_authorization, sign_key_directory, sign_tbs,
 };
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,
-    DeviceAuthorizationV1, KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyPurpose,
-    KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairInviteV1,
-    PairRequestInfoV1, PairRequestPlaintextV1, PairRequestV1, PairResponseInfoV1,
-    PairResponsePlaintextV1, PairResponseV1, PairingControlEnvelopeV1, E2EE_FORMAT_VERSION,
+    DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1, KeyDirectoryV1,
+    KeyPurpose, KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind,
+    PairInviteV1, PairRequestInfoV1, PairRequestPlaintextV1, PairRequestV1, PairResponseInfoV1,
+    PairResponsePlaintextV1, PairResponseV1, PairingControlEnvelopeV1,
 };
+use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::{
     CertRole, Ed25519Signature, PublicKeyBytes, RelayGrant, SignedCertificate,
 };
+use agentdeck_protocol::relay_v2::frame::{PairData, SealedBlob};
 use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, LinkGeneration, MachineRouteId, PairRouteId,
     RelayServerId, RootKeyId, TrustEpoch,
 };
-use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::runtime::{MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION};
 use uuid::Uuid;
 
@@ -220,6 +223,35 @@ impl Fixture {
 
     fn response_for(&self, prepared: &PreparedPairRequest) -> Vec<u8> {
         self.response_for_seed(prepared, [0x38; 32])
+    }
+
+    fn pending_for(
+        &self,
+        prepared: &PreparedPairRequest,
+        info: &PairRequestInfoV1,
+        request_hash: [u8; 32],
+        signing_key: &SigningKey,
+        certificate: &SignedCertificate,
+    ) -> Vec<u8> {
+        let recipient =
+            agentdeck_crypto::HpkePublicKey::from_bytes(&prepared.device_hpke_public_key())
+                .unwrap();
+        let signer = MachineDataSignerBindingV1::from_certificate(certificate).unwrap();
+        let mut rng = DeterministicRng::new([0x39; 32]);
+        let mut context = pairing_context(OuterFrameKind::PairPending);
+        context.pair_route = Some(info.pair_route);
+        seal_pair_pending(
+            &recipient,
+            info,
+            &context,
+            request_hash,
+            signing_key,
+            &signer,
+            &mut rng,
+        )
+        .unwrap()
+        .canonical_bytes()
+        .unwrap()
     }
 
     fn response_for_seed(
@@ -578,6 +610,239 @@ fn verified_response_is_read_only_and_bound_to_the_durable_pending_transaction()
 }
 
 #[test]
+fn pair_data_classifier_returns_only_verified_waiting_or_move_only_response() {
+    let fixture = Fixture::new();
+    let store = UnknownCommitStore::new(usize::MAX);
+    let coordinator = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+    let mut rng = DeterministicRng::new([0x4a; 32]);
+    let prepared = coordinator
+        .prepare(&fixture.invite, &fixture.authorization, NOW_MS, &mut rng)
+        .unwrap();
+    let pending_bytes = fixture.pending_for(
+        &prepared,
+        &fixture.request_info(),
+        prepared.request_hash(),
+        &Fixture::data_signing_key(),
+        &fixture.invite.data_sign_cert,
+    );
+    let response_bytes = fixture.response_for(&prepared);
+    let writes_before_classify = store.writes.load(Ordering::SeqCst);
+
+    let waiting = coordinator
+        .classify_pair_data(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 1,
+            &PairData {
+                pair_route: fixture.invite.pair_route,
+                sealed_blob: SealedBlob(pending_bytes),
+            },
+        )
+        .expect("MachineDataSign-authenticated PairPending");
+    match waiting {
+        VerifiedPendingPairData::Waiting(pending) => {
+            assert_eq!(pending.request_hash, prepared.request_hash());
+        }
+        VerifiedPendingPairData::Response(_) => panic!("PairPending must not classify as response"),
+    }
+
+    let response = coordinator
+        .classify_pair_data(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 1,
+            &PairData {
+                pair_route: fixture.invite.pair_route,
+                sealed_blob: SealedBlob(response_bytes.clone()),
+            },
+        )
+        .expect("fully verified PairResponse");
+    match response {
+        VerifiedPendingPairData::Response(verified) => {
+            assert_eq!(verified.response_hash(), sha256(&response_bytes));
+            assert_eq!(verified.machine_route(), MACHINE_ROUTE);
+        }
+        VerifiedPendingPairData::Waiting(_) => panic!("PairResponse must not classify as pending"),
+    }
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before_classify);
+}
+
+#[test]
+fn pair_data_classifier_rejects_unbound_pending_and_unknown_payloads_fail_closed() {
+    let fixture = Fixture::new();
+    let store = UnknownCommitStore::new(usize::MAX);
+    let coordinator = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+    let mut rng = DeterministicRng::new([0x4b; 32]);
+    let prepared = coordinator
+        .prepare(&fixture.invite, &fixture.authorization, NOW_MS, &mut rng)
+        .unwrap();
+    let writes_before_classify = store.writes.load(Ordering::SeqCst);
+    let expected_info = fixture.request_info();
+    let valid_pending = fixture.pending_for(
+        &prepared,
+        &expected_info,
+        prepared.request_hash(),
+        &Fixture::data_signing_key(),
+        &fixture.invite.data_sign_cert,
+    );
+    let classify = |pair_route, sealed_blob| {
+        coordinator.classify_pair_data(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 1,
+            &PairData {
+                pair_route,
+                sealed_blob: SealedBlob(sealed_blob),
+            },
+        )
+    };
+
+    let wrong_outer = classify(PairRouteId::from_bytes([0x91; 16]), valid_pending.clone())
+        .expect_err("Relay PairData route is part of the trusted outer binding");
+    assert_eq!(wrong_outer.code(), "remote.pairing.frame_invalid");
+
+    let mut wrong_info = expected_info.clone();
+    wrong_info.invite_hash[0] ^= 1;
+    let wrong_aad = fixture.pending_for(
+        &prepared,
+        &wrong_info,
+        prepared.request_hash(),
+        &Fixture::data_signing_key(),
+        &fixture.invite.data_sign_cert,
+    );
+    assert_eq!(
+        classify(PAIR_ROUTE, wrong_aad)
+            .expect_err("inviteHash/info mismatch must fail HPKE/AAD verification")
+            .code(),
+        "remote.pairing.frame_invalid"
+    );
+
+    let mut wrong_aad_info = expected_info.clone();
+    wrong_aad_info.pair_route = PairRouteId::from_bytes([0x94; 16]);
+    let wrong_aad = fixture.pending_for(
+        &prepared,
+        &wrong_aad_info,
+        prepared.request_hash(),
+        &Fixture::data_signing_key(),
+        &fixture.invite.data_sign_cert,
+    );
+    assert_eq!(
+        classify(PAIR_ROUTE, wrong_aad)
+            .expect_err("sealed PairPending for another pairRoute/AAD must fail")
+            .code(),
+        "remote.pairing.frame_invalid"
+    );
+
+    let wrong_request = fixture.pending_for(
+        &prepared,
+        &expected_info,
+        [0x92; 32],
+        &Fixture::data_signing_key(),
+        &fixture.invite.data_sign_cert,
+    );
+    assert_eq!(
+        classify(PAIR_ROUTE, wrong_request)
+            .expect_err("signed pending for another request must fail")
+            .code(),
+        "remote.pairing.frame_invalid"
+    );
+
+    let other_data = SigningKey::from_seed(&[0x93; 32]);
+    let mut other_certificate = fixture.invite.data_sign_cert.clone();
+    other_certificate.subject_pubkey = PublicKeyBytes(other_data.verifying_key().to_bytes());
+    other_certificate.signature = sign_tbs(
+        &Fixture::root_signing_key(),
+        &other_certificate.to_be_signed_v1(
+            RELAY_SERVER,
+            MACHINE_ROUTE,
+            fixture.invite.machine_root_fingerprint,
+        ),
+    )
+    .into();
+    let wrong_signer = fixture.pending_for(
+        &prepared,
+        &expected_info,
+        prepared.request_hash(),
+        &other_data,
+        &other_certificate,
+    );
+    assert_eq!(
+        classify(PAIR_ROUTE, wrong_signer)
+            .expect_err("MachineDataSign must be the certificate pinned by the invite")
+            .code(),
+        "remote.pairing.frame_invalid"
+    );
+
+    assert_eq!(
+        classify(PAIR_ROUTE, b"RouteAccepted is not pairing success".to_vec())
+            .expect_err("unknown payload and RouteAccepted-like bytes must fail closed")
+            .code(),
+        "remote.pairing.frame_invalid"
+    );
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before_classify);
+}
+
+#[test]
+fn waiting_pins_the_exact_oob_data_certificate_until_response_can_verify_its_root_signature() {
+    let fixture = Fixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let coordinator = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+    let mut rng = DeterministicRng::new([0x4c; 32]);
+    let prepared = coordinator
+        .prepare(&fixture.invite, &fixture.authorization, NOW_MS, &mut rng)
+        .unwrap();
+    let info = fixture.request_info();
+    let original = &fixture.invite.data_sign_cert;
+    let mut variants = Vec::new();
+
+    let mut generation = original.clone();
+    generation.generation = LinkGeneration::new(original.generation.value() + 1);
+    variants.push(("generation", generation));
+
+    let mut root_key = original.clone();
+    root_key.root_key_id = RootKeyId::from_bytes([0x95; 16]);
+    variants.push(("rootKeyId", root_key));
+
+    let mut trust = original.clone();
+    trust.trust_epoch = TrustEpoch::new(original.trust_epoch.value() + 1);
+    variants.push(("trustEpoch", trust));
+
+    let mut expiry = original.clone();
+    expiry.not_after_ms = Some(NOW_MS + 599_999);
+    variants.push(("expiry", expiry));
+
+    let mut credential = original.clone();
+    credential.signature.0[0] ^= 1;
+    variants.push(("root signature bytes", credential));
+
+    for (axis, certificate) in variants {
+        let sealed = fixture.pending_for(
+            &prepared,
+            &info,
+            prepared.request_hash(),
+            &Fixture::data_signing_key(),
+            &certificate,
+        );
+        let error = coordinator
+            .classify_pair_data(
+                &fixture.invite,
+                &fixture.authorization,
+                NOW_MS + 1,
+                &PairData {
+                    pair_route: PAIR_ROUTE,
+                    sealed_blob: SealedBlob(sealed),
+                },
+            )
+            .expect_err("the exact OOB certificate hash is part of PairPending trust");
+        assert_eq!(
+            error.code(),
+            "remote.pairing.frame_invalid",
+            "changed {axis} must fail"
+        );
+    }
+}
+
+#[test]
 fn response_verification_never_repairs_a_missing_pending_key() {
     for (index, missing_purpose) in [
         PendingRemoteKeyPurpose::PairingRecord,
@@ -908,10 +1173,12 @@ fn committed_record_with_missing_private_item_fails_closed_without_regeneration(
         PendingRemoteKeyPurpose::PairingRecord,
     );
     let record = store.load(&record_account).unwrap().unwrap();
-    assert!(record
-        .expose_secret()
-        .windows(frozen.len())
-        .any(|window| window == frozen));
+    assert!(
+        record
+            .expose_secret()
+            .windows(frozen.len())
+            .any(|window| window == frozen)
+    );
 
     let (replacement, _) = HpkePrivateKey::derive_keypair(&[0xee; 32]);
     store
@@ -1407,10 +1674,12 @@ fn promotion_takes_the_device_lease_before_rng_or_any_paired_write() {
         PairedRemoteKeyPurpose::CounterGuard,
         PairedRemoteKeyPurpose::CommitMarker,
     ] {
-        assert!(store
-            .load(&paired_account(&fixture, purpose))
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .load(&paired_account(&fixture, purpose))
+                .unwrap()
+                .is_none()
+        );
     }
     assert!(!contains_crypto_state_file(&state_root));
 
@@ -2880,9 +3149,11 @@ fn production_opened_machine_cannot_use_the_automatic_runtime_state_probe() {
     );
     assert_eq!(store.mutation_calls(), mutations_before);
     assert_eq!(fs::read(&state_path).unwrap(), state_before);
-    assert!(!inspect_paired_crypto_state(&store, &fixture, &state_root)
-        .prepared_stage_path()
-        .exists());
+    assert!(
+        !inspect_paired_crypto_state(&store, &fixture, &state_root)
+            .prepared_stage_path()
+            .exists()
+    );
 }
 
 #[test]
