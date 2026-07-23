@@ -162,31 +162,19 @@ public enum ToolActivityGroupPresentation {
         let activities = activityItems(in: items)
         guard !activities.isEmpty else { return "" }
         let states = activities.map(activityState(for:))
-        let stateText: String?
         let failures = states.filter { $0 == .failed }.count
         if failures > 0 {
-            stateText = "\(failures) 项失败"
-        } else if states.contains(.running) {
-            stateText = "进行中"
-        } else if states.contains(.pending) {
-            stateText = "等待中"
-        } else if states.allSatisfy({ $0 == .completed }) {
-            stateText = "已完成"
-        } else if states.allSatisfy({ $0 == .canceled }) {
-            stateText = "已取消"
-        } else {
-            stateText = nil
+            return "\(failures) 项失败"
         }
-
-        var parts = ["\(activities.count) 项"]
-        if let stateText { parts.append(stateText) }
-        if !states.contains(.running),
-           !states.contains(.pending),
+        if states.contains(.running) { return "进行中" }
+        if states.contains(.pending) { return "等待中" }
+        if states.allSatisfy({ $0 == .canceled }) { return "已取消" }
+        if states.allSatisfy({ $0 == .completed }),
            activities.allSatisfy({ $0.durationMs != nil }) {
             let total = activities.compactMap(\.durationMs).reduce(0, +)
-            parts.append(formattedDuration(total))
+            return formattedDuration(total)
         }
-        return parts.joined(separator: " · ")
+        return ""
     }
 
     private static func activityItems(in items: [UIItem]) -> [UIItem] {

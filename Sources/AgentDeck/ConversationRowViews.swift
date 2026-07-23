@@ -777,7 +777,7 @@ final class ToolActivityGroupCellView: ConversationRowCellView {
     private let disclosure = ConversationRowControls.disclosureButton(title: "")
     private let icon = NSImageView()
     private let summaryLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.calloutMediumFont,
+        font: ConversationRowMetrics.calloutFont,
         color: DesignTokens.text2,
         selectable: false
     )
@@ -823,11 +823,11 @@ final class ToolActivityGroupCellView: ConversationRowCellView {
         statusLabel.setContentHuggingPriority(.required, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        summaryRow.addArrangedSubview(disclosure)
         summaryRow.addArrangedSubview(icon)
         summaryRow.addArrangedSubview(summaryLabel)
-        summaryRow.addArrangedSubview(spacer)
         summaryRow.addArrangedSubview(statusLabel)
+        summaryRow.addArrangedSubview(spacer)
+        summaryRow.addArrangedSubview(disclosure)
         contentStack.addArrangedSubview(summaryRow)
 
         NSLayoutConstraint.activate([
@@ -901,7 +901,7 @@ final class ToolActivityGroupCellView: ConversationRowCellView {
     private static func statusColor(for status: String) -> NSColor {
         switch status.lowercased() {
         case "running", "starting", "pending": return DesignTokens.running
-        case "completed", "complete", "done", "success": return DesignTokens.success
+        case "completed", "complete", "done", "success": return DesignTokens.text3
         case "failed", "failure", "error": return DesignTokens.danger
         default: return DesignTokens.text3
         }
@@ -982,8 +982,8 @@ final class ToolCallCellView: ConversationRowCellView {
         summaryRow.addArrangedSubview(icon)
         summaryRow.addArrangedSubview(nameLabel)
         summaryRow.addArrangedSubview(contextLabel)
-        summaryRow.addArrangedSubview(spacer)
         summaryRow.addArrangedSubview(statusLabel)
+        summaryRow.addArrangedSubview(spacer)
         summaryRow.addArrangedSubview(disclosure)
 
         contentStack.addArrangedSubview(summaryRow)
@@ -1086,7 +1086,7 @@ final class ToolCallCellView: ConversationRowCellView {
         }
         if ["completed", "complete", "done", "success", "succeeded"]
             .contains(normalized) {
-            return DesignTokens.success
+            return DesignTokens.text3
         }
         if ["failed", "failure", "error"].contains(normalized) {
             return DesignTokens.danger

@@ -39,17 +39,64 @@ final class ToolActivityGroupCellViewTests: XCTestCase {
             width: 620,
             model: SessionModel(turnStarter: NoopRuntimeTurnStarter())
         )
+        cell.applyTurnSpacing(for: row)
+        cell.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: 620,
+            height: ConversationRowFactory.height(for: row, width: 620)
+        )
+        cell.layoutSubtreeIfNeeded()
 
         let labels = cell.allDescendants(ofType: NSTextField.self)
             .filter { !$0.isHidden }
-        XCTAssertTrue(labels.map(\.stringValue).contains("读取 1 个文件并运行 1 个命令"))
-        let status = try XCTUnwrap(labels.first { $0.stringValue == "2 项 · 1 项失败" })
+        let summary = try XCTUnwrap(
+            labels.first { $0.stringValue == "读取 1 个文件并运行 1 个命令" }
+        )
+        let status = try XCTUnwrap(labels.first { $0.stringValue == "1 项失败" })
         XCTAssertTrue(status.textColor?.isEqual(DesignTokens.danger) == true)
 
         let disclosure = try XCTUnwrap(cell.allDescendants(ofType: NSButton.self).first)
+        XCTAssertGreaterThanOrEqual(status.frame.minX, summary.frame.maxX)
+        XCTAssertLessThanOrEqual(status.frame.minX - summary.frame.maxX, 12)
+        XCTAssertGreaterThan(disclosure.frame.minX, status.frame.maxX)
+        XCTAssertFalse(cell.hasAmbiguousLayout)
         XCTAssertEqual(disclosure.state, .off)
         XCTAssertEqual(disclosure.accessibilityLabel(), "展开工具活动详情")
         XCTAssertTrue(cell.accessibilityLabel()?.contains("已折叠") == true)
+    }
+
+    func testCompletedGroupShowsOnlyLowWeightDuration() throws {
+        var read = UIItem(id: "read", lifecycle: "completed", kind: "toolCall")
+        read.tool = "Read"
+        read.statusName = "completed"
+        read.durationMs = 400
+        var shell = UIItem(id: "shell", lifecycle: "completed", kind: "shell")
+        shell.command = "swift test"
+        shell.statusName = "completed"
+        shell.durationMs = 700
+        let row = try XCTUnwrap(ConversationDisplayRowBuilder.rows(
+            from: [ConversationTurn(
+                id: "turn-completed",
+                user: nil,
+                assistantItems: [read, shell]
+            )],
+            toolGrouping: .consecutiveActivity
+        ).first)
+
+        let cell = ToolActivityGroupCellView()
+        cell.configure(
+            row: row,
+            width: 620,
+            model: SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        )
+        let labels = cell.allDescendants(ofType: NSTextField.self)
+            .filter { !$0.isHidden }
+        let duration = try XCTUnwrap(labels.first { $0.stringValue == "1.1s" })
+
+        XCTAssertTrue(duration.textColor?.isEqual(DesignTokens.text3) == true)
+        XCTAssertFalse(labels.contains { $0.stringValue.contains("已完成") })
+        XCTAssertFalse(labels.contains { $0.stringValue == "2 项" })
     }
 
     func testExpandedStoreRestoresDisclosureState() throws {

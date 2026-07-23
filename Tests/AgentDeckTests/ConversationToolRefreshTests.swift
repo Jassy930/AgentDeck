@@ -133,7 +133,9 @@ final class ConversationToolRefreshTests: XCTestCase {
         let initial = try XCTUnwrap(
             table.view(atColumn: 0, row: 1, makeIfNecessary: true) as? ToolActivityGroupCellView
         )
-        XCTAssertTrue(visibleLabels(in: initial).contains("2 项 · 已完成"))
+        let initialLabels = visibleLabels(in: initial)
+        XCTAssertTrue(initialLabels.contains("已读取 2 个文件"))
+        XCTAssertFalse(initialLabels.contains { $0.contains("已完成") })
 
         var failed = readTool("read-3", status: "failed")
         failed.errorText = "permission denied"
@@ -146,7 +148,7 @@ final class ConversationToolRefreshTests: XCTestCase {
         )
         let labels = visibleLabels(in: updated)
         XCTAssertTrue(labels.contains("读取 3 个文件"))
-        XCTAssertTrue(labels.contains("3 项 · 1 项失败"))
+        XCTAssertTrue(labels.contains("1 项失败"))
 
         let groupId = "tool-group:user-group-live:read-1"
         let store = controller as ConversationDisclosureStateStore

@@ -197,7 +197,7 @@ enum ConversationRowFactory {
             // the group disclosure is expanded by the controller.
             let compactVerticalPadding = itemVerticalPadding * 2
             let compactHeaderHeight = max(
-                ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutMediumFont),
+                ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutFont),
                 18
             )
             return compactVerticalPadding + compactHeaderHeight

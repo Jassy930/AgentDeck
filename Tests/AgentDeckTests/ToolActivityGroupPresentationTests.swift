@@ -90,7 +90,7 @@ final class ToolActivityGroupPresentationTests: XCTestCase {
         )
         XCTAssertEqual(
             ToolActivityGroupPresentation.statusSummary([failed, running]),
-            "2 项 · 1 项失败"
+            "1 项失败"
         )
     }
 
@@ -100,7 +100,7 @@ final class ToolActivityGroupPresentationTests: XCTestCase {
 
         XCTAssertEqual(
             ToolActivityGroupPresentation.statusSummary([first, second]),
-            "2 项 · 已完成 · 1.1s"
+            "1.1s"
         )
     }
 
@@ -114,7 +114,7 @@ final class ToolActivityGroupPresentationTests: XCTestCase {
             "修改 1 个文件并读取 1 个文件"
         )
         XCTAssertEqual(ToolActivityGroupPresentation.semanticStatus([edit, read]), "")
-        XCTAssertEqual(ToolActivityGroupPresentation.statusSummary([edit, read]), "2 项")
+        XCTAssertEqual(ToolActivityGroupPresentation.statusSummary([edit, read]), "")
     }
 
     func testFileEditSummaryCountsFilesInsideOneDiffActivity() {
@@ -132,7 +132,7 @@ final class ToolActivityGroupPresentationTests: XCTestCase {
         )
         XCTAssertEqual(
             ToolActivityGroupPresentation.statusSummary([edit, read]),
-            "2 项"
+            ""
         )
     }
 
@@ -146,7 +146,7 @@ final class ToolActivityGroupPresentationTests: XCTestCase {
         )
         XCTAssertEqual(
             ToolActivityGroupPresentation.statusSummary([completed, running]),
-            "2 项 · 进行中"
+            "进行中"
         )
     }
 

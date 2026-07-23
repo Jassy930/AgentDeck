@@ -87,7 +87,7 @@ final class ToolCallCellViewTests: XCTestCase {
     func testStatusUsesReadableSemanticColor() throws {
         let cases: [(status: String, label: String, color: NSColor)] = [
             ("running", "进行中", DesignTokens.running),
-            ("completed", "已完成", DesignTokens.success),
+            ("completed", "已完成", DesignTokens.text3),
             ("failed", "失败", DesignTokens.danger),
             ("queued", "等待中", DesignTokens.text2),
         ]
