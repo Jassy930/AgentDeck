@@ -6,9 +6,10 @@ use agentdeck_protocol::runtime::identity::{
     ConversationId, EntityId, ItemId, MessageId, TransferId,
 };
 use agentdeck_protocol::runtime::{
-    ConversationSnapshot, MAX_JSON_PART_BYTES, MAX_JSON_TRANSFER_PARTS, MAX_PART_BYTES,
-    MAX_RUNTIME_JSON_FRAME_BYTES, MAX_TRANSFER_BYTES, RuntimeEnvelope, RuntimeMessage,
-    RuntimeReply, RuntimeTransferCarrierV1, RuntimeTransferChannel, SnapshotItem, StreamCursor,
+    CatalogSnapshot, ConversationEntry, ConversationSnapshot, MAX_JSON_PART_BYTES,
+    MAX_JSON_TRANSFER_PARTS, MAX_PART_BYTES, MAX_RUNTIME_JSON_FRAME_BYTES, MAX_TRANSFER_BYTES,
+    MAX_TRANSFER_PARTS, RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeTransferCarrierV1,
+    RuntimeTransferChannel, SnapshotItem, StreamCursor,
 };
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, SessionCapabilities, VendorCapabilities,
@@ -106,6 +107,71 @@ fn json_uds_part_budget_covers_the_full_transfer_ceiling() {
         MAX_JSON_TRANSFER_PARTS
     );
     assert!(json_transfer_part_count(MAX_TRANSFER_BYTES as usize + 1).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_profile_sends_oversized_catalog_reply_as_adrt1_reply_parts() {
+    let connections = registry();
+    let (connection_id, mut receiver) = connect_compact(&connections, 0x36);
+    let snapshot = CatalogSnapshot::new(
+        StreamCursor::BeforeFirst,
+        vec![ConversationEntry {
+            conversation_id: ConversationId::new("catalog-compact-reply"),
+            agent_kind: AgentKind::Codex,
+            title: Some("x".repeat(MAX_RUNTIME_JSON_FRAME_BYTES + 64 * 1024)),
+            cwd: None,
+            last_active_ms: 0,
+            archived: false,
+            entry_revision: 0,
+        }],
+        None,
+    )
+    .expect("construct oversized valid CatalogSnapshot");
+    let payload: Arc<[u8]> = serde_json::to_vec(&snapshot)
+        .expect("encode CatalogSnapshot transfer payload")
+        .into();
+    assert!(payload.len() > MAX_RUNTIME_JSON_FRAME_BYTES);
+
+    // JSON/UDS 需要第 65 part 的区间必须由 compact profile 继续可表示；
+    // 这里不再额外分配约 44.8 MiB，只冻结两个 part-count oracle。
+    let first_json_gap = MAX_JSON_PART_BYTES * MAX_TRANSFER_PARTS as usize + 1;
+    assert_eq!(json_transfer_part_count(first_json_gap).unwrap(), 65);
+    assert!(compact_transfer_part_count(first_json_gap).unwrap() <= MAX_TRANSFER_PARTS);
+
+    let control = TransferEgressControl::new(Instant::now() + Duration::from_secs(10));
+    let send_connections = connections.clone();
+    let send_payload = Arc::clone(&payload);
+    let send_snapshot = snapshot.clone();
+    let sender = tokio::spawn(async move {
+        super::super::pump::send_one_shot_reply(
+            &send_connections,
+            connection_id,
+            MessageId::new("catalog-compact-message"),
+            RuntimeReply::Catalog(send_snapshot),
+            Some(&send_payload),
+            &control,
+        )
+        .await
+    });
+
+    let write = timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("compact Catalog reply timed out")
+        .expect("writer closed before compact Catalog reply");
+    assert_eq!(write.kind(), EncodedRuntimeFrameKind::CompactTransfer);
+    let carrier = RuntimeTransferCarrierV1::decode(write.bytes()).expect("decode ADRT1 reply");
+    assert_eq!(carrier.message_id.as_str(), "catalog-compact-message");
+    assert_eq!(carrier.channel, RuntimeTransferChannel::Reply);
+    assert_eq!(carrier.transfer.part_count, 1);
+    assert_eq!(carrier.transfer.part, payload.as_ref());
+    write.acknowledge().expect("ACK compact Catalog reply");
+
+    timeout(Duration::from_secs(5), sender)
+        .await
+        .expect("compact Catalog egress completion timed out")
+        .expect("compact Catalog egress task panicked")
+        .expect("compact Catalog egress failed");
+    connections.shutdown().await.expect("shutdown registry");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

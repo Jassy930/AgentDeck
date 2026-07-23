@@ -7,6 +7,7 @@
 #![cfg(unix)]
 
 use std::convert::Infallible;
+use std::time::Instant;
 
 use agentdeck_crypto::rand_core::{CryptoRng, TryCryptoRng, TryRng};
 use agentdeck_crypto::sha256;
@@ -24,7 +25,9 @@ use agentdeck_protocol::runtime::identity::{
 use agentdeck_protocol::runtime::{
     ApprovalDeliveryState, ApprovalReceipt, CatalogSnapshot, CommandReceipt, ConversationId,
     MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION, RevocationReceipt, RuntimeEnvelope,
-    RuntimeFailure, RuntimeMessage, RuntimeReply, SendPromptRequest,
+    RuntimeFailure, RuntimeMessage, RuntimeReply, RuntimeTransferCarrierError,
+    RuntimeTransferCarrierV1, RuntimeTransferChannel, SendPromptRequest, TransferError,
+    TransferProgress, TransferReassembler,
 };
 use agentdeck_relay_client::RelayClientError;
 use async_trait::async_trait;
@@ -251,8 +254,10 @@ pub enum RemoteRuntimeError {
     OutcomeUnknown,
     #[error("remote reply is not correlated or has an invalid shape: {0}")]
     InvalidReply(&'static str),
-    #[error("catalog compact transfer replies are not supported by this runtime slice")]
-    TransferUnsupported,
+    #[error("remote compact transfer carrier is invalid")]
+    TransferCarrier(#[source] RuntimeTransferCarrierError),
+    #[error("remote transfer reassembly failed")]
+    Transfer(#[from] TransferError),
     #[error("authenticated reply replay tuple was rejected")]
     ReplayRejected,
     #[error("durable remote runtime state has an invalid canonical encoding")]
@@ -281,7 +286,8 @@ where
         self.transport.shutdown().await;
     }
 
-    /// 请求一页 catalog；A1 只接受未分片的 authenticated `CatalogSnapshot`。
+    /// 请求一页 catalog；小页接受 authenticated JSON，大页接受
+    /// message-bound ADRT1 Reply 分片并在完整重组后才持久化 terminal。
     pub async fn catalog_page<R: CryptoRng>(
         &mut self,
         page_cursor: Option<CatalogPageCursor>,
@@ -457,6 +463,8 @@ where
             .await?;
 
         let mut route_accepted = false;
+        let transfer_started_at = Instant::now();
+        let mut reply_transfers = TransferReassembler::new();
         loop {
             let Some(received) = self.transport.recv().await? else {
                 return Err(RemoteRuntimeError::OutcomeUnknown);
@@ -494,12 +502,52 @@ where
                     self.admit_reply_replay(&candidate)?;
                     let opened = self.machine.open_verified_directed_reply(candidate)?;
                     if opened.payload_kind == SealedPayloadKind::TransferPart {
-                        if matches!(pending.operation, DirectedOperation::Catalog { .. }) {
-                            return Err(RemoteRuntimeError::TransferUnsupported);
+                        if !matches!(pending.operation, DirectedOperation::Catalog { .. }) {
+                            return Err(RemoteRuntimeError::InvalidReply(
+                                "directed transfer reply does not match the pending request",
+                            ));
                         }
-                        return Err(RemoteRuntimeError::InvalidReply(
-                            "directed transfer reply does not match the pending request",
-                        ));
+                        let carrier = RuntimeTransferCarrierV1::decode(&opened.payload)
+                            .map_err(map_transfer_carrier_error)?;
+                        if carrier.channel != RuntimeTransferChannel::Reply {
+                            return Err(RemoteRuntimeError::InvalidReply(
+                                "directed transfer carrier is not on the Reply channel",
+                            ));
+                        }
+                        if carrier.message_id != pending.message_id {
+                            return Err(RemoteRuntimeError::InvalidReply(
+                                "directed transfer messageId does not match the pending request",
+                            ));
+                        }
+                        let now_ms = u64::try_from(transfer_started_at.elapsed().as_millis())
+                            .unwrap_or(u64::MAX);
+                        match reply_transfers.accept(
+                            RuntimeTransferChannel::Reply,
+                            carrier.transfer,
+                            now_ms,
+                        )? {
+                            TransferProgress::InProgress { .. } => continue,
+                            TransferProgress::AlreadyComplete => {
+                                return Err(RemoteRuntimeError::InvalidReply(
+                                    "directed transfer completed more than once",
+                                ));
+                            }
+                            TransferProgress::Complete(payload) => {
+                                let snapshot: CatalogSnapshot = serde_json::from_slice(&payload)?;
+                                let validated = pending.operation.validate_reply(
+                                    SealedPayloadKind::CatalogSnapshot,
+                                    RuntimeReply::Catalog(snapshot),
+                                )?;
+                                let ValidatedDirectedReply::Terminal(receipt) = validated else {
+                                    return Err(RemoteRuntimeError::InvalidReply(
+                                        "Catalog transfer did not produce a terminal reply",
+                                    ));
+                                };
+                                self.persist_terminal(&pending, reply_frame_hash, &receipt)?;
+                                return directed_outcome(route_accepted, receipt)
+                                    .map(DirectedExchangeResult::Receipt);
+                            }
+                        }
                     }
                     if !pending
                         .operation
@@ -1106,6 +1154,13 @@ fn validate_received_runtime_frame(
         ));
     }
     Ok(())
+}
+
+fn map_transfer_carrier_error(error: RuntimeTransferCarrierError) -> RemoteRuntimeError {
+    match error {
+        RuntimeTransferCarrierError::Transfer(error) => RemoteRuntimeError::Transfer(error),
+        error => RemoteRuntimeError::TransferCarrier(error),
+    }
 }
 
 fn directed_outcome(

@@ -144,6 +144,7 @@ struct FakeTransport {
     script: TransportScript,
     expected_request: RuntimeRequest,
     reply: RuntimeReply,
+    reply_sequence: Option<Vec<RuntimeReply>>,
     expected_command_counter: u64,
     reply_counter: u64,
     device_sign_verifying_key: VerifyingKey,
@@ -230,6 +231,7 @@ impl FakeTransport {
                 script,
                 expected_request,
                 reply,
+                reply_sequence: None,
                 expected_command_counter,
                 reply_counter,
                 device_sign_verifying_key,
@@ -239,6 +241,25 @@ impl FakeTransport {
             },
             sent_codec_frames,
         )
+    }
+
+    fn new_runtime_sequence(
+        expected_request: RuntimeRequest,
+        replies: Vec<RuntimeReply>,
+        device_sign_verifying_key: VerifyingKey,
+    ) -> (Self, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let fallback = replies
+            .first()
+            .cloned()
+            .expect("reply sequence must not be empty");
+        let (mut transport, sent) = Self::new_runtime(
+            TransportScript::ReplyOnly,
+            expected_request,
+            fallback,
+            device_sign_verifying_key,
+        );
+        transport.reply_sequence = Some(replies);
+        (transport, sent)
     }
 
     fn with_shutdown_observer(mut self, shutdown_observed: Arc<AtomicBool>) -> Self {
@@ -310,6 +331,18 @@ impl FakeTransport {
     }
 
     fn queue_scripted_inbound(&mut self, request_route: RequestRouteId, message_id: MessageId) {
+        if let Some(replies) = &self.reply_sequence {
+            for (offset, reply) in replies.iter().enumerate() {
+                self.inbound.push_back(received_exact(reply_frame(
+                    request_route,
+                    message_id.clone(),
+                    reply.clone(),
+                    ReplyShape::Valid,
+                    self.reply_counter + offset as u64,
+                )));
+            }
+            return;
+        }
         let accepted = route_accepted(request_route);
         match self.script {
             TransportScript::ReplyOnly => self.inbound.push_back(received_exact(reply_frame(
@@ -399,6 +432,7 @@ enum ReplyShape {
     ForgedMachineDataSignature,
     AuthenticatedBadCiphertext,
     WrongMessageId,
+    WrongTransferChannel,
     WrongPayloadKind,
     WrongKeyPurpose,
     WrongKeyEpoch,
@@ -430,7 +464,11 @@ fn reply_frame(
             SealedPayloadKind::TransferPart,
             RuntimeTransferCarrierV1::new(
                 reply_message_id,
-                RuntimeTransferChannel::Reply,
+                if matches!(shape, ReplyShape::WrongTransferChannel) {
+                    RuntimeTransferChannel::Stream
+                } else {
+                    RuntimeTransferChannel::Reply
+                },
                 transfer,
             )
             .encode()
@@ -512,6 +550,7 @@ fn reply_frame(
         ReplyShape::Valid
         | ReplyShape::AuthenticatedBadCiphertext
         | ReplyShape::WrongMessageId
+        | ReplyShape::WrongTransferChannel
         | ReplyShape::WrongPayloadKind
         | ReplyShape::WrongKeyPurpose
         | ReplyShape::WrongKeyEpoch
@@ -723,6 +762,31 @@ fn newer_catalog_snapshot() -> CatalogSnapshot {
         None,
     )
     .expect("bounded newer catalog fixture")
+}
+
+fn catalog_transfer_replies(snapshot: &CatalogSnapshot) -> Vec<RuntimeReply> {
+    let payload = serde_json::to_vec(snapshot).expect("encode CatalogSnapshot transfer payload");
+    let midpoint = payload.len() / 2;
+    let total_sha256 = sha256(&payload);
+    let total_bytes = payload.len() as u64;
+    let transfer_id = TransferId::new("catalog-transfer-1");
+    [payload[..midpoint].to_vec(), payload[midpoint..].to_vec()]
+        .into_iter()
+        .enumerate()
+        .map(|(index, part)| {
+            RuntimeReply::TransferPart(
+                TransferEnvelope::new(
+                    transfer_id.clone(),
+                    index as u32,
+                    2,
+                    total_sha256,
+                    total_bytes,
+                    part,
+                )
+                .expect("valid compact Catalog transfer part"),
+            )
+        })
+        .collect()
 }
 
 fn assert_catalog_outcome(
@@ -2452,7 +2516,7 @@ async fn catalog_requires_catalog_snapshot_payload_kind() {
 }
 
 #[tokio::test]
-async fn catalog_transfer_part_is_typed_unsupported_until_compact_reassembly_lands() {
+async fn catalog_compact_transfer_reassembles_before_persisting_the_terminal_snapshot() {
     let fixture = PairingFixture::new();
     let store = MemoryRemoteKeyStore::new();
     let temp = tempfile::tempdir().expect("tempdir");
@@ -2461,27 +2525,50 @@ async fn catalog_transfer_part_is_typed_unsupported_until_compact_reassembly_lan
     let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
         .open_exact(fixture.identity())
         .expect("open promoted machine");
-    let part = b"catalog transfer fixture".to_vec();
-    let transfer = TransferEnvelope::new_json(
-        TransferId::new("catalog-transfer-1"),
-        0,
-        1,
-        sha256(&part),
-        part.len() as u64,
-        part,
-    )
-    .expect("valid transfer fixture");
-    let (transport, _sent) = FakeTransport::new_runtime(
-        TransportScript::ReplyOnly,
+    let expected = catalog_snapshot();
+    let (transport, _sent) = FakeTransport::new_runtime_sequence(
         catalog_request(None),
-        RuntimeReply::TransferPart(transfer),
+        catalog_transfer_replies(&expected),
         device_sign,
     );
     let mut runtime = RemoteRuntime::new(opened, transport);
     let mut rng = DeterministicRng::new([0xcb; 32]);
 
-    assert!(matches!(
-        runtime.catalog_page(None, &mut rng).await,
-        Err(RemoteRuntimeError::TransferUnsupported)
-    ));
+    let outcome = runtime
+        .catalog_page(None, &mut rng)
+        .await
+        .expect("two authenticated ADRT1 parts must produce one Catalog terminal");
+    assert_catalog_outcome(&outcome, false, &expected);
+}
+
+#[tokio::test]
+async fn catalog_compact_transfer_rejects_wrong_message_or_stream_channel() {
+    for (seed, shape) in [
+        (0xcc, ReplyShape::WrongMessageId),
+        (0xcd, ReplyShape::WrongTransferChannel),
+    ] {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, seed);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open promoted machine");
+        let mut replies = catalog_transfer_replies(&catalog_snapshot());
+        let first = replies.remove(0);
+        let (transport, _sent) = FakeTransport::new_runtime(
+            TransportScript::ReplyOnlyWithShape(shape),
+            catalog_request(None),
+            first,
+            device_sign,
+        );
+        let mut runtime = RemoteRuntime::new(opened, transport);
+        let mut rng = DeterministicRng::new([seed; 32]);
+
+        assert!(matches!(
+            runtime.catalog_page(None, &mut rng).await,
+            Err(RemoteRuntimeError::InvalidReply(_))
+        ));
+    }
 }

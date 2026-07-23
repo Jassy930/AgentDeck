@@ -35,7 +35,8 @@ mod reply;
 pub(super) use reply::PumpSendError as OneShotSendError;
 
 /// One-shot CatalogRequest 与 subscription pump 共用的唯一 directed egress 入口。
-/// 小页走 paced frame，大页由 `reply` 进入真实 JSON TransferPart/FlushReceipt 链。
+/// 小页走 paced frame，大页由 `reply` 按 connection profile 进入真实
+/// JSON 或 compact TransferPart/FlushReceipt 链。
 pub(super) async fn send_one_shot_reply(
     connections: &ConnectionRegistry,
     connection_id: ConnectionId,

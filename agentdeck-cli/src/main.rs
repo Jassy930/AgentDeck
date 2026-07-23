@@ -1056,7 +1056,8 @@ fn persistent_remote_mutation_cli_error(
             RemoteRuntimeError::RelayCodec(_)
             | RemoteRuntimeError::Json(_)
             | RemoteRuntimeError::InvalidReply(_)
-            | RemoteRuntimeError::TransferUnsupported,
+            | RemoteRuntimeError::TransferCarrier(_)
+            | RemoteRuntimeError::Transfer(_),
         ) => CliError::Protocol { code, message },
         PersistentRemoteMutationError::Paired(_)
         | PersistentRemoteMutationError::Connect(PairedRuntimeConnectError::Paired(_))

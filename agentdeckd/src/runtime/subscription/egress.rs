@@ -192,11 +192,54 @@ pub(crate) async fn send_stream_transfer(
             .await
         }
         ConnectionFramingProfile::CompactTransfer => {
-            send_compact_stream_transfer(
+            send_compact_transfer(
                 connections,
                 connection_id,
                 message_id,
                 transfer_id,
+                RuntimeTransferChannel::Stream,
+                payload,
+                control,
+            )
+            .await
+        }
+    }
+}
+
+/// 按 connection framing capability 选择 directed Reply transfer carrier。
+/// local UDS 保持 JSON/94-part，MachineLink 使用 ADRT1/64-part；两者都不改变
+/// canonical reply payload bytes 或 message identity。
+pub(crate) async fn send_reply_transfer(
+    connections: &ConnectionRegistry,
+    connection_id: ConnectionId,
+    message_id: MessageId,
+    transfer_id: TransferId,
+    payload: &[u8],
+    control: &TransferEgressControl,
+) -> Result<TransferEgressReport, TransferEgressError> {
+    match connections
+        .framing_profile(connection_id)
+        .map_err(|error| failed(TransferEgressErrorKind::Reserve(error), 0))?
+    {
+        ConnectionFramingProfile::JsonRuntime => {
+            send_json_transfer(
+                connections,
+                connection_id,
+                message_id,
+                transfer_id,
+                RuntimeTransferChannel::Reply,
+                payload,
+                control,
+            )
+            .await
+        }
+        ConnectionFramingProfile::CompactTransfer => {
+            send_compact_transfer(
+                connections,
+                connection_id,
+                message_id,
+                transfer_id,
+                RuntimeTransferChannel::Reply,
                 payload,
                 control,
             )
@@ -288,11 +331,12 @@ pub(crate) async fn send_json_transfer(
     })
 }
 
-async fn send_compact_stream_transfer(
+async fn send_compact_transfer(
     connections: &ConnectionRegistry,
     connection_id: ConnectionId,
     message_id: MessageId,
     transfer_id: TransferId,
+    channel: RuntimeTransferChannel,
     payload: &[u8],
     control: &TransferEgressControl,
 ) -> Result<TransferEgressReport, TransferEgressError> {
@@ -323,11 +367,7 @@ async fn send_compact_stream_transfer(
             part,
         )
         .map_err(|error| failed(TransferEgressErrorKind::Transfer(error), flushed_parts))?;
-        let carrier = RuntimeTransferCarrierV1::new(
-            message_id.clone(),
-            RuntimeTransferChannel::Stream,
-            transfer,
-        );
+        let carrier = RuntimeTransferCarrierV1::new(message_id.clone(), channel, transfer);
         let frame = EncodedRuntimeFrame::from_transfer_carrier(&carrier)
             .map_err(|error| failed(TransferEgressErrorKind::Frame(error), flushed_parts))?;
         let reservation = controlled(control, connections.reserve_paced(connection_id, frame))

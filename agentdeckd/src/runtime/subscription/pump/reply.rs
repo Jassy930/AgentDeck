@@ -4,12 +4,11 @@ use std::future::Future;
 
 use agentdeck_protocol::runtime::identity::MessageId;
 use agentdeck_protocol::runtime::{
-    MAX_JSON_PART_BYTES, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage, RuntimeReply,
-    RuntimeStreamItem, RuntimeTransferChannel,
+    RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeStreamItem,
 };
 
 use super::super::egress::{
-    TransferEgressControl, TransferEgressError, send_json_transfer, send_stream_transfer,
+    TransferEgressControl, TransferEgressError, send_reply_transfer, send_stream_transfer,
 };
 use crate::runtime::connection::{
     ConnectionError, ConnectionId, ConnectionRegistry, EncodedRuntimeFrame,
@@ -69,20 +68,22 @@ pub(super) async fn reply_with_stream_binding(
     let transfer_identity = transfer_payload
         .map(|payload| DurableReplyTransferIdentity::for_reply(&message_id, &reply, payload))
         .transpose()?;
+    let transfer_part_bytes = connections
+        .framing_profile(connection_id)?
+        .transfer_part_bytes();
     // 威胁场景：已 canonical encode 的 64 MiB snapshot 若先再尝试序列化成 1 MiB
     // envelope，raw payload、typed DTO 与注定失败的第二份大 buffer 会同时驻留。
-    // 达到单个 JSON transfer part 大小时直接走真实 paced transfer。
+    // 达到当前 transport 的单 part 大小时直接走对应 paced transfer。
     if let Some(payload) = transfer_payload
-        && payload.len() >= MAX_JSON_PART_BYTES
+        && payload.len() >= transfer_part_bytes
     {
-        send_json_transfer(
+        send_reply_transfer(
             connections,
             connection_id,
             message_id,
             transfer_identity
                 .ok_or(PumpSendError::MissingTransferPayload)?
                 .transfer_id(),
-            RuntimeTransferChannel::Reply,
             payload,
             control,
         )
@@ -103,12 +104,11 @@ pub(super) async fn reply_with_stream_binding(
             let payload = transfer_payload.ok_or(PumpSendError::MissingTransferPayload)?;
             let transfer_identity =
                 transfer_identity.ok_or(PumpSendError::MissingTransferPayload)?;
-            send_json_transfer(
+            send_reply_transfer(
                 connections,
                 connection_id,
                 message_id,
                 transfer_identity.transfer_id(),
-                RuntimeTransferChannel::Reply,
                 payload,
                 control,
             )

@@ -115,14 +115,14 @@ fn remote_runtime_error_code(error: &RemoteRuntimeError) -> &str {
             "remote.runtime.transport_failed"
         }
         RemoteRuntimeError::RelayCodec(_) => "remote.runtime.relay_frame_invalid",
-        RemoteRuntimeError::Json(_) | RemoteRuntimeError::InvalidReply(_) => {
-            "remote.runtime.reply_invalid"
-        }
+        RemoteRuntimeError::Json(_)
+        | RemoteRuntimeError::InvalidReply(_)
+        | RemoteRuntimeError::TransferCarrier(_) => "remote.runtime.reply_invalid",
         RemoteRuntimeError::EntropyUnavailable => "remote.runtime.entropy_unavailable",
         RemoteRuntimeError::PendingIntentConflict => "remote.runtime.pending_intent_conflict",
         RemoteRuntimeError::DaemonFailure(failure) => failure.code.as_str(),
         RemoteRuntimeError::OutcomeUnknown => "remote.runtime.outcome_unknown",
-        RemoteRuntimeError::TransferUnsupported => "remote.runtime.transfer_unsupported",
+        RemoteRuntimeError::Transfer(error) => error.code(),
         RemoteRuntimeError::ReplayRejected => "remote.runtime.replay_rejected",
         RemoteRuntimeError::InvalidDurableState => "remote.runtime.state_invalid",
     }

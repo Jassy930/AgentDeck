@@ -1032,7 +1032,7 @@ impl ConnectionSink {
 }
 
 /// connection transport 能力，而不是业务或 authorization state。compact profile
-/// 仍接受普通 Runtime JSON，只把 oversized Stream transfer 改走 ADRT1 carrier。
+/// 仍接受普通 Runtime JSON，只把 oversized Reply/Stream transfer 改走 ADRT1 carrier。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConnectionFramingProfile {
     JsonRuntime,
