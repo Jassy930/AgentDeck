@@ -12,21 +12,22 @@ use std::path::{Path, PathBuf};
 
 use agentdeck_crypto::rand_core::CryptoRng;
 use agentdeck_crypto::{
-    CryptoError, HpkePrivateKey, HpkePublicKey, SignatureBytes, SigningKey, VerifyingKey,
-    open_key_directory_entry, seal_pair_response_received, sha256, verify_device_authorization,
-    verify_key_directory, verify_pair_response_envelope, verify_tbs,
+    CryptoError, HpkePrivateKey, HpkePublicKey, SecretAeadKey, SignatureBytes, SigningKey,
+    VerifyingKey, open_key_directory_entry, open_pair_response, seal_pair_response_received,
+    sha256, verify_tbs,
 };
 use agentdeck_protocol::e2ee::{
-    DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1, KeyDirectoryV1,
-    KeyPurpose, KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind,
-    PairResponseReceivedV1, PairResponseV1, PairingControlEnvelopeV1, PairingError,
+    DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1,
+    MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairResponseReceivedV1,
+    PairResponseV1, PairingControlEnvelopeV1, PairingError,
 };
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::{
     AuthCanonicalError, CertRole, Ed25519Signature, RelayGrant, SignedCertificate,
 };
 use agentdeck_protocol::relay_v2::id::{
-    DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayServerId, TrustEpoch,
+    DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayServerId, StreamRouteId,
+    TrustEpoch,
 };
 use agentdeck_protocol::runtime::{MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION};
 use thiserror::Error;
@@ -39,8 +40,8 @@ use super::crypto_state::{
 };
 use super::device_lock::{RemoteDeviceLease, RemoteDeviceLockError, RemoteDeviceLockKey};
 use super::keychain::{
-    PairedRemoteKeyPurpose, PendingRemoteKeyPurpose, RemoteKeyAccount, RemoteKeyStore,
-    RemoteKeyStoreError, RemoteSecret,
+    PairedRemoteKeyPurpose, ParsedPairedRemoteKeyAccount, PendingRemoteKeyPurpose,
+    RemoteKeyAccount, RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
 };
 use super::pending::{PendingInvitePublicProjection, VerifiedPendingPairResponse};
 
@@ -156,6 +157,358 @@ impl PromotedPairedMachine {
     #[must_use]
     pub const fn was_already_committed(&self) -> bool {
         self.already_committed
+    }
+}
+
+/// marker account、sealed state 与所有 final Keychain item 共用的 machine identity。
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct PairedMachineIdentity {
+    machine_root_fingerprint: MachineRootFingerprint,
+    machine_route: MachineRouteId,
+}
+
+impl fmt::Debug for PairedMachineIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairedMachineIdentity([REDACTED])")
+    }
+}
+
+impl PairedMachineIdentity {
+    #[must_use]
+    pub const fn new(
+        machine_root_fingerprint: MachineRootFingerprint,
+        machine_route: MachineRouteId,
+    ) -> Self {
+        Self {
+            machine_root_fingerprint,
+            machine_route,
+        }
+    }
+
+    #[must_use]
+    pub const fn machine_root_fingerprint(self) -> MachineRootFingerprint {
+        self.machine_root_fingerprint
+    }
+
+    #[must_use]
+    pub const fn machine_route(self) -> MachineRouteId {
+        self.machine_route
+    }
+}
+
+/// 完整审计后可用于选择 machine 的无 secret 投影。
+#[derive(Clone, Eq, PartialEq)]
+pub struct PairedMachineSummary {
+    identity: PairedMachineIdentity,
+    machine_display_name: String,
+    device_route: DeviceRouteId,
+}
+
+impl fmt::Debug for PairedMachineSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairedMachineSummary([REDACTED])")
+    }
+}
+
+impl PairedMachineSummary {
+    #[must_use]
+    pub const fn identity(&self) -> PairedMachineIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub fn machine_display_name(&self) -> &str {
+        &self.machine_display_name
+    }
+
+    #[must_use]
+    pub const fn device_route(&self) -> DeviceRouteId {
+        self.device_route
+    }
+}
+
+struct OpenedPairedDirectoryKey {
+    _key_id: KeyId,
+    _stream_route: Option<StreamRouteId>,
+    _key: SecretAeadKey,
+}
+
+struct AuditedPairedMachine {
+    identity: PairedMachineIdentity,
+    machine_display_name: String,
+    wss_url: String,
+    device_route: DeviceRouteId,
+    grant_serial: GrantSerial,
+    trust_epoch: TrustEpoch,
+    directory_revision: KeyDirectoryRevision,
+    _relay_server_id: RelayServerId,
+    _current_spki_pin: [u8; 32],
+    _next_spki_pin: [u8; 32],
+    _state_path: PathBuf,
+    _canonical_receipt_carrier: Vec<u8>,
+    _grant: RelayGrant,
+    _authorization: DeviceAuthorizationV1,
+    _device_signing_key: SigningKey,
+    _device_hpke_private_key: HpkePrivateKey,
+    _opened_directory_keys: Vec<OpenedPairedDirectoryKey>,
+    _counter_guard: CounterGuardV1,
+}
+
+impl AuditedPairedMachine {
+    fn summary(&self) -> PairedMachineSummary {
+        PairedMachineSummary {
+            identity: self.identity,
+            machine_display_name: self.machine_display_name.clone(),
+            device_route: self.device_route,
+        }
+    }
+
+    fn into_opened(self, lease: RemoteDeviceLease) -> OpenedPairedMachine {
+        OpenedPairedMachine {
+            audited: self,
+            _lease: lease,
+        }
+    }
+}
+
+/// marker-first 只读审计成功后持有 device lease 与 typed crypto capabilities 的 machine。
+///
+/// 本类型不实现 `Clone` / serde，`Debug` 永远 redacted，且没有 raw secret getter。
+pub struct OpenedPairedMachine {
+    audited: AuditedPairedMachine,
+    // 必须最后销毁，确保 crypto/counter capabilities 不会晚于跨进程独占 lease。
+    _lease: RemoteDeviceLease,
+}
+
+impl fmt::Debug for OpenedPairedMachine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OpenedPairedMachine([REDACTED])")
+    }
+}
+
+impl OpenedPairedMachine {
+    #[must_use]
+    pub const fn identity(&self) -> PairedMachineIdentity {
+        self.audited.identity
+    }
+
+    #[must_use]
+    pub fn machine_display_name(&self) -> &str {
+        &self.audited.machine_display_name
+    }
+
+    #[must_use]
+    pub fn wss_url(&self) -> &str {
+        &self.audited.wss_url
+    }
+
+    #[must_use]
+    pub const fn device_route(&self) -> DeviceRouteId {
+        self.audited.device_route
+    }
+
+    #[must_use]
+    pub const fn grant_serial(&self) -> GrantSerial {
+        self.audited.grant_serial
+    }
+
+    #[must_use]
+    pub const fn trust_epoch(&self) -> TrustEpoch {
+        self.audited.trust_epoch
+    }
+
+    #[must_use]
+    pub const fn directory_revision(&self) -> KeyDirectoryRevision {
+        self.audited.directory_revision
+    }
+
+    /// 只暴露已逐项 DeviceHPKE 解封成功的 key 数量，不返回 raw key。
+    #[must_use]
+    pub fn opened_key_count(&self) -> usize {
+        self.audited._opened_directory_keys.len()
+    }
+
+    /// 查询完整审计后是否存在指定 purpose；不暴露 epoch、route 或 raw key。
+    #[must_use]
+    pub fn has_opened_key_purpose(&self, purpose: KeyPurpose) -> bool {
+        self.audited
+            ._opened_directory_keys
+            .iter()
+            .any(|key| key._key_id.purpose == purpose)
+    }
+}
+
+/// 当前 installation 的 marker-backed paired machine 只读恢复入口。
+pub struct PairedMachineStore<'a> {
+    store: &'a dyn RemoteKeyStore,
+    installation_id: Uuid,
+    state_root: PathBuf,
+}
+
+impl fmt::Debug for PairedMachineStore<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PairedMachineStore")
+            .field("identity", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> PairedMachineStore<'a> {
+    #[must_use]
+    pub fn new(store: &'a dyn RemoteKeyStore, installation_id: Uuid, state_root: &Path) -> Self {
+        Self {
+            store,
+            installation_id,
+            state_root: state_root.to_path_buf(),
+        }
+    }
+
+    /// 只枚举当前 installation 的 commit marker，并逐项完成与 `open_exact` 相同的全审计。
+    /// 任一 marker 损坏都会让整个 list fail-close，不会静默省略。
+    pub fn list(&self) -> Result<Vec<PairedMachineSummary>, PairedPromotionError> {
+        let markers = self
+            .store
+            .list_paired_commit_markers(self.installation_id)
+            .map_err(PairedPromotionError::Persistence)?;
+        let mut machines = Vec::with_capacity(markers.len());
+        for marker in markers {
+            let audited = self.audit_marker(&marker)?;
+            machines.push(audited.summary());
+        }
+        Ok(machines)
+    }
+
+    /// 在取得 exact machine lease 后，从 marker 开始只读恢复；缺失 marker 不可见且不可修复。
+    pub fn open_exact(
+        &self,
+        identity: PairedMachineIdentity,
+    ) -> Result<OpenedPairedMachine, PairedPromotionError> {
+        let account = RemoteKeyAccount::paired(
+            self.installation_id,
+            identity.machine_root_fingerprint,
+            identity.machine_route,
+            PairedRemoteKeyPurpose::CommitMarker,
+        );
+        let parsed = RemoteKeyAccount::parse_paired(account.as_str())
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        let lease = RemoteDeviceLease::acquire_in(
+            &self.state_root,
+            RemoteDeviceLockKey::new(
+                self.installation_id,
+                identity.machine_root_fingerprint,
+                identity.machine_route,
+            ),
+        )
+        .map_err(PairedPromotionError::DeviceLock)?;
+        self.audit_marker(&parsed)
+            .map(|audited| audited.into_opened(lease))
+    }
+
+    fn audit_marker(
+        &self,
+        parsed: &ParsedPairedRemoteKeyAccount,
+    ) -> Result<AuditedPairedMachine, PairedPromotionError> {
+        if parsed.installation_id() != self.installation_id
+            || parsed.purpose() != PairedRemoteKeyPurpose::CommitMarker
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let identity =
+            PairedMachineIdentity::new(parsed.machine_root_fingerprint(), parsed.machine_route());
+
+        // marker 是唯一 visibility gate；在它 exact load/decode 前不读取任何 final item/state。
+        let marker_secret = self.load_required(parsed.account())?;
+        let marker = PairedCommitMarkerV1::decode(marker_secret.expose_secret())?;
+        marker.validate_account(self.installation_id, identity)?;
+        let accounts = PairedAccounts::new(
+            self.installation_id,
+            identity.machine_root_fingerprint,
+            identity.machine_route,
+        );
+        if &accounts.marker != parsed.account() {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        // 固定只读顺序：marker → KEK → DeviceSign/HPKE → grant → guard → sealed state。
+        let kek_secret = self.load_required(&accounts.kek)?;
+        let kek_record = StorageKekRecordV1::decode(kek_secret.expose_secret())?;
+        if kek_record.promotion_id != marker.promotion_id
+            || marker.kek_record_hash != kek_record.commitment()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let device_sign_secret = self.load_required(&accounts.device_sign)?;
+        let device_hpke_secret = self.load_required(&accounts.device_hpke)?;
+        let grant_secret = self.load_required(&accounts.grant)?;
+        let counter_secret = self.load_required(&accounts.counter_guard)?;
+        let counter_guard = CounterGuardV1::decode(counter_secret.expose_secret())?;
+
+        let state_store = FileCryptoStateStore::new_in(
+            &self.state_root,
+            CryptoStateIdentity::new(
+                self.installation_id,
+                identity.machine_root_fingerprint,
+                identity.machine_route,
+            ),
+            kek_record.device_storage_kek(),
+        )
+        .map_err(PairedPromotionError::CryptoState)?;
+        let state_snapshot = state_store
+            .load()
+            .map_err(PairedPromotionError::CryptoState)?
+            .ok_or(PairedPromotionError::Incomplete)?;
+        let state = PairedCryptoStateV1::decode(state_snapshot.expose_secret())?;
+        marker.validate_state(identity, &state, state_snapshot.expose_secret())?;
+
+        let audit = audit_durable_state(
+            &state,
+            grant_secret.expose_secret(),
+            &device_sign_secret,
+            &device_hpke_secret,
+        )?;
+        if marker.device_sign_pubkey != audit.device_signing_key.verifying_key().to_bytes()
+            || marker.device_hpke_pubkey != hpke_public_bytes(&audit.device_hpke_private_key)?
+            || marker.counter_guard_hash != sha256(counter_secret.expose_secret())
+            || counter_guard
+                != CounterGuardV1::from_binding(
+                    state.directory_revision,
+                    audit.device_command_binding,
+                )
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        Ok(AuditedPairedMachine {
+            identity,
+            machine_display_name: state.machine_display_name,
+            wss_url: state.wss_url,
+            device_route: state.device_route,
+            grant_serial: state.grant_serial,
+            trust_epoch: state.trust_epoch,
+            directory_revision: state.directory_revision,
+            _relay_server_id: state.relay_server_id,
+            _current_spki_pin: state.current_spki_pin,
+            _next_spki_pin: state.next_spki_pin,
+            _state_path: state_store.state_path().to_path_buf(),
+            _canonical_receipt_carrier: state.receipt_carrier,
+            _grant: audit.grant,
+            _authorization: audit.authorization,
+            _device_signing_key: audit.device_signing_key,
+            _device_hpke_private_key: audit.device_hpke_private_key,
+            _opened_directory_keys: audit.opened_keys,
+            _counter_guard: counter_guard,
+        })
+    }
+
+    fn load_required(
+        &self,
+        account: &RemoteKeyAccount,
+    ) -> Result<RemoteSecret, PairedPromotionError> {
+        self.store
+            .load(account)
+            .map_err(PairedPromotionError::Persistence)?
+            .ok_or(PairedPromotionError::Incomplete)
     }
 }
 
@@ -604,14 +957,32 @@ fn promotion_id(
     verified: &agentdeck_crypto::VerifiedPairResponseV1,
 ) -> [u8; 32] {
     let info = verified.info();
+    promotion_id_from_parts(
+        installation_id,
+        info.invite_hash,
+        info.request_hash,
+        verified.response_hash(),
+        verified.machine_root_fingerprint(),
+        info.machine_route,
+    )
+}
+
+fn promotion_id_from_parts(
+    installation_id: Uuid,
+    invite_hash: [u8; 32],
+    request_hash: [u8; 32],
+    response_hash: [u8; 32],
+    machine_root_fingerprint: [u8; 32],
+    machine_route: MachineRouteId,
+) -> [u8; 32] {
     let mut input = Vec::with_capacity(PROMOTION_ID_DOMAIN.len() + 176);
     input.extend_from_slice(PROMOTION_ID_DOMAIN);
     input.extend_from_slice(installation_id.as_bytes());
-    input.extend_from_slice(&info.invite_hash);
-    input.extend_from_slice(&info.request_hash);
-    input.extend_from_slice(&verified.response_hash());
-    input.extend_from_slice(&verified.machine_root_fingerprint());
-    input.extend_from_slice(info.machine_route.as_bytes());
+    input.extend_from_slice(&invite_hash);
+    input.extend_from_slice(&request_hash);
+    input.extend_from_slice(&response_hash);
+    input.extend_from_slice(&machine_root_fingerprint);
+    input.extend_from_slice(machine_route.as_bytes());
     sha256(&input)
 }
 
@@ -735,6 +1106,15 @@ struct StateAudit {
     device_command_binding: CounterBindingV1,
 }
 
+struct DurableStateAudit {
+    device_signing_key: SigningKey,
+    device_hpke_private_key: HpkePrivateKey,
+    grant: RelayGrant,
+    authorization: DeviceAuthorizationV1,
+    opened_keys: Vec<OpenedPairedDirectoryKey>,
+    device_command_binding: CounterBindingV1,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn audit_state(
     installation_id: Uuid,
@@ -782,9 +1162,43 @@ fn audit_state(
         return Err(PairedPromotionError::Conflict);
     }
 
+    let durable = audit_durable_state(state, grant_bytes, device_sign_secret, device_hpke_secret)?;
+    Ok(StateAudit {
+        device_command_binding: durable.device_command_binding,
+    })
+}
+
+/// 不依赖 pending transaction 的 durable paired state 全审计。
+///
+/// canonical PairResponse 会再次以 paired DeviceHPKE 解密，随后 exact 比对并复核
+/// Root→Data cert、grant/authorization、directory 签名，再逐项重新解封 wrapped keys。
+fn audit_durable_state(
+    state: &PairedCryptoStateV1,
+    grant_bytes: &[u8],
+    device_sign_secret: &RemoteSecret,
+    device_hpke_secret: &RemoteSecret,
+) -> Result<DurableStateAudit, PairedPromotionError> {
     let response = PairResponseV1::from_canonical_bytes(&state.canonical_response)
         .map_err(PairedPromotionError::Protocol)?;
-    if response.info != *expected_info {
+    let info = &response.info;
+    if state.relay_server_id != info.relay_server_id
+        || state.machine_route != info.machine_route
+        || state.device_route != info.device_route
+        || state.grant_serial != info.grant_serial
+        || state.trust_epoch != info.root_trust_epoch
+        || state.invite_hash != info.invite_hash
+        || state.request_hash != info.request_hash
+        || state.response_hash != sha256(&state.canonical_response)
+        || state.promotion_id
+            != promotion_id_from_parts(
+                state.installation_id,
+                state.invite_hash,
+                state.request_hash,
+                state.response_hash,
+                state.machine_root_fingerprint,
+                state.machine_route,
+            )
+    {
         return Err(PairedPromotionError::Conflict);
     }
     let certificate = SignedCertificate::from_canonical_bytes(&state.data_sign_certificate)
@@ -798,16 +1212,22 @@ fn audit_state(
     PairingControlEnvelopeV1::from_canonical_bytes(&state.receipt_carrier)
         .map_err(PairedPromotionError::Protocol)?;
 
+    if state.grant_hash != grant.canonical_sha256()
+        || state.directory_revision != directory.revision
+        || grant.machine_route != state.machine_route
+        || grant.device_route != state.device_route
+        || grant.grant_serial != state.grant_serial
+        || grant.trust_epoch != state.trust_epoch
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+
     let root = VerifyingKey::from_bytes(&state.machine_root_pubkey)
         .map_err(PairedPromotionError::Crypto)?;
     if sha256(&root.to_bytes()) != state.machine_root_fingerprint
         || certificate.cert_role != CertRole::Data
         || certificate.root_key_id != grant.root_key_id
         || certificate.trust_epoch != state.trust_epoch
-        || grant.machine_route != state.machine_route
-        || grant.device_route != state.device_route
-        || grant.grant_serial != state.grant_serial
-        || grant.trust_epoch != state.trust_epoch
     {
         return Err(PairedPromotionError::Conflict);
     }
@@ -832,33 +1252,39 @@ fn audit_state(
         .map_err(PairedPromotionError::Crypto)?;
     let signer = MachineDataSignerBindingV1::from_certificate(&certificate)
         .map_err(PairedPromotionError::Protocol)?;
-    verify_pair_response_envelope(
-        &data_verifier,
-        &response.info,
-        &pair_response_context(response.info.pair_route),
-        &response,
-        &signer,
-    )
-    .map_err(PairedPromotionError::Crypto)?;
-    verify_device_authorization(&root, state.relay_server_id, &grant, &authorization)
-        .map_err(PairedPromotionError::Crypto)?;
-    verify_key_directory(
-        &data_verifier,
-        &signer,
-        &KeyDirectorySignatureContextV1 {
-            relay_server_id: state.relay_server_id,
-            machine_route: state.machine_route,
-            device_route: state.device_route,
-            grant_serial: state.grant_serial,
-            root_trust_epoch: state.trust_epoch,
-        },
-        &directory,
-    )
-    .map_err(PairedPromotionError::Crypto)?;
-
     let signing_key = signing_key(device_sign_secret)?;
     let hpke_private = hpke_private_key(device_hpke_secret)?;
-    if grant.device_sign_pubkey.0 != signing_key.verifying_key().to_bytes()
+    let plaintext = open_pair_response(
+        &hpke_private,
+        info,
+        &pair_response_context(info.pair_route),
+        &response,
+        &data_verifier,
+        &signer,
+        &root,
+    )
+    .map_err(PairedPromotionError::Crypto)?;
+    if plaintext.request_hash != state.request_hash
+        || plaintext.relay_grant.canonical_bytes() != grant_bytes
+        || plaintext
+            .device_authorization
+            .canonical_bytes()
+            .map_err(PairedPromotionError::Protocol)?
+            != state.device_authorization
+        || plaintext
+            .key_directory
+            .canonical_bytes()
+            .map_err(PairedPromotionError::Protocol)?
+            != state.key_directory
+        || authorization
+            .canonical_bytes()
+            .map_err(PairedPromotionError::Protocol)?
+            != state.device_authorization
+        || directory
+            .canonical_bytes()
+            .map_err(PairedPromotionError::Protocol)?
+            != state.key_directory
+        || grant.device_sign_pubkey.0 != signing_key.verifying_key().to_bytes()
         || authorization.device_hpke_pubkey.0 != hpke_public_bytes(&hpke_private)?
     {
         return Err(PairedPromotionError::Conflict);
@@ -866,6 +1292,7 @@ fn audit_state(
 
     let mut slots = HashSet::with_capacity(directory.entries.len());
     let mut command_binding = None;
+    let mut opened_keys = Vec::with_capacity(directory.entries.len());
     for entry in &directory.entries {
         if !slots.insert((entry.key_id.purpose, entry.stream_route)) {
             return Err(PairedPromotionError::InvalidState);
@@ -899,9 +1326,19 @@ fn audit_state(
                 nonce_prefix: agentdeck_crypto::derive_nonce_prefix(&key),
             });
         }
+        opened_keys.push(OpenedPairedDirectoryKey {
+            _key_id: entry.key_id,
+            _stream_route: entry.stream_route,
+            _key: key,
+        });
     }
 
-    Ok(StateAudit {
+    Ok(DurableStateAudit {
+        device_signing_key: signing_key,
+        device_hpke_private_key: hpke_private,
+        grant,
+        authorization,
+        opened_keys,
         device_command_binding: command_binding.ok_or(PairedPromotionError::InvalidState)?,
     })
 }
@@ -1380,6 +1817,49 @@ impl PairedCommitMarkerV1 {
             ]
             .iter()
             .any(|value| all_zero(value))
+    }
+
+    fn validate_account(
+        &self,
+        installation_id: Uuid,
+        identity: PairedMachineIdentity,
+    ) -> Result<(), PairedPromotionError> {
+        if self.installation_id != installation_id
+            || self.root_fingerprint != *identity.machine_root_fingerprint.as_bytes()
+            || self.machine_route != identity.machine_route
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(())
+    }
+
+    fn validate_state(
+        &self,
+        identity: PairedMachineIdentity,
+        state: &PairedCryptoStateV1,
+        state_bytes: &[u8],
+    ) -> Result<(), PairedPromotionError> {
+        if state.installation_id != self.installation_id
+            || state.machine_root_fingerprint != self.root_fingerprint
+            || state.machine_root_fingerprint != *identity.machine_root_fingerprint.as_bytes()
+            || state.relay_server_id != self.relay_server_id
+            || state.machine_route != self.machine_route
+            || state.machine_route != identity.machine_route
+            || state.device_route != self.device_route
+            || state.grant_serial != self.grant_serial
+            || state.trust_epoch != self.trust_epoch
+            || state.directory_revision != self.directory_revision
+            || state.invite_hash != self.invite_hash
+            || state.request_hash != self.request_hash
+            || state.grant_hash != self.grant_hash
+            || state.response_hash != self.response_hash
+            || state.promotion_id != self.promotion_id
+            || sha256(state_bytes) != self.state_plaintext_hash
+            || sha256(&state.receipt_carrier) != self.receipt_carrier_hash
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(())
     }
 
     fn validate_expected(

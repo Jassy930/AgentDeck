@@ -12,7 +12,9 @@ use agentdeck_cli::remote::keychain::{
     MemoryRemoteKeyStore, PairedRemoteKeyPurpose, PendingRemoteKeyPurpose, RemoteKeyAccount,
     RemoteKeyPersistence, RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
 };
-use agentdeck_cli::remote::paired_machine::PairedPromotionCoordinator;
+use agentdeck_cli::remote::paired_machine::{
+    PairedMachineIdentity, PairedMachineStore, PairedPromotionCoordinator, PromotedPairedMachine,
+};
 use agentdeck_cli::remote::pending::{PendingPairingCoordinator, PreparedPairRequest};
 use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
 use agentdeck_crypto::{
@@ -804,6 +806,16 @@ impl RemoteKeyStore for UnknownCommitStore {
     fn delete_exact(&self, account: &RemoteKeyAccount) -> Result<(), RemoteKeyStoreError> {
         self.inner.delete_exact(account)
     }
+
+    fn list_paired_commit_markers(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<
+        Vec<agentdeck_cli::remote::keychain::ParsedPairedRemoteKeyAccount>,
+        RemoteKeyStoreError,
+    > {
+        self.inner.list_paired_commit_markers(installation_id)
+    }
 }
 
 #[test]
@@ -1574,4 +1586,275 @@ fn orphaned_state_without_kek_fails_closed_without_generating_a_replacement() {
     assert_eq!(store.writes.load(Ordering::SeqCst), writes_before);
     assert!(store.load(&kek).unwrap().is_none());
     assert!(store.load(&marker).unwrap().is_none());
+}
+
+fn promote_for_paired_open(
+    store: &dyn RemoteKeyStore,
+    fixture: &Fixture,
+    state_root: &Path,
+    seed: u8,
+) -> PromotedPairedMachine {
+    let pending = PendingPairingCoordinator::new(store, INSTALLATION_ID);
+    let mut request_rng = DeterministicRng::new([seed; 32]);
+    let prepared = pending
+        .prepare(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS,
+            &mut request_rng,
+        )
+        .unwrap();
+    let response = fixture.response_for_seed(&prepared, [seed.wrapping_add(1); 32]);
+    drop(prepared);
+    let verified = pending
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 1,
+            &response,
+        )
+        .unwrap();
+    let coordinator = PairedPromotionCoordinator::new(store, INSTALLATION_ID, state_root);
+    let mut promotion_rng = DeterministicRng::new([seed.wrapping_add(2); 32]);
+    coordinator.promote(verified, &mut promotion_rng).unwrap()
+}
+
+fn fixture_paired_identity(fixture: &Fixture) -> PairedMachineIdentity {
+    PairedMachineIdentity::new(
+        MachineRootFingerprint::from_bytes(fixture.invite.machine_root_fingerprint),
+        MACHINE_ROUTE,
+    )
+}
+
+#[test]
+fn paired_machine_store_restarts_from_marker_without_any_pending_item() {
+    let fixture = Fixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+
+    let before = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    assert!(before.list().unwrap().is_empty());
+    promote_for_paired_open(&store, &fixture, &state_root, 0x41);
+
+    let invite_hash = fixture.invite.canonical_sha256().unwrap();
+    for purpose in [
+        PendingRemoteKeyPurpose::PairingRecord,
+        PendingRemoteKeyPurpose::DeviceSignPrivateKey,
+        PendingRemoteKeyPurpose::DeviceHpkePrivateKey,
+    ] {
+        store
+            .delete_exact(&RemoteKeyAccount::pending(
+                INSTALLATION_ID,
+                invite_hash,
+                purpose,
+            ))
+            .unwrap();
+    }
+
+    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let listed = restarted
+        .list()
+        .expect("marker-backed list must fully audit without pending state");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].identity(), fixture_paired_identity(&fixture));
+    assert_eq!(listed[0].machine_display_name(), "Fixture Machine");
+    assert_eq!(listed[0].device_route(), DEVICE_ROUTE);
+    assert_eq!(
+        format!("{:?}", listed[0].identity()),
+        "PairedMachineIdentity([REDACTED])"
+    );
+    assert_eq!(
+        format!("{:?}", listed[0]),
+        "PairedMachineSummary([REDACTED])"
+    );
+
+    let opened = restarted
+        .open_exact(listed[0].identity())
+        .expect("exact open must re-audit and hold the device lease");
+    assert_eq!(opened.identity(), fixture_paired_identity(&fixture));
+    assert_eq!(opened.machine_display_name(), "Fixture Machine");
+    assert_eq!(opened.wss_url(), "wss://relay.example/");
+    assert_eq!(opened.device_route(), DEVICE_ROUTE);
+    assert_eq!(opened.grant_serial(), GrantSerial::new(7));
+    assert_eq!(opened.trust_epoch(), TrustEpoch::new(2));
+    assert_eq!(opened.directory_revision(), KeyDirectoryRevision::new(4));
+    assert_eq!(opened.opened_key_count(), 3);
+    for purpose in [
+        KeyPurpose::Catalog,
+        KeyPurpose::DeviceCommandTx,
+        KeyPurpose::DeviceReplyTx,
+    ] {
+        assert!(
+            opened.has_opened_key_purpose(purpose),
+            "restart audit must DeviceHPKE-open {purpose:?}"
+        );
+    }
+    assert!(!opened.has_opened_key_purpose(KeyPurpose::ConversationDek));
+    assert_eq!(format!("{opened:?}"), "OpenedPairedMachine([REDACTED])");
+
+    let listed_while_open = restarted
+        .list()
+        .expect("read-only list must not contend with the active device lease");
+    assert_eq!(listed_while_open.len(), 1);
+    assert_eq!(listed_while_open[0].identity(), opened.identity());
+}
+
+#[test]
+fn paired_machine_store_treats_marker_as_the_only_visibility_boundary() {
+    let fixture = Fixture::new();
+    let store = UnknownCommitStore::new(usize::MAX);
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    promote_for_paired_open(&store, &fixture, &state_root, 0x51);
+
+    let marker = paired_account(&fixture, PairedRemoteKeyPurpose::CommitMarker);
+    store.delete_exact(&marker).unwrap();
+    let writes_before = store.writes.load(Ordering::SeqCst);
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    assert!(paired.list().unwrap().is_empty());
+    let error = paired
+        .open_exact(fixture_paired_identity(&fixture))
+        .expect_err("final items and sealed state without marker are not visible");
+    assert_eq!(error.code(), "remote.pairing.paired_incomplete");
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before);
+    assert!(store.load(&marker).unwrap().is_none());
+}
+
+#[test]
+fn paired_machine_store_binds_marker_account_body_and_state_identity_exactly() {
+    let fixture = Fixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    promote_for_paired_open(&store, &fixture, &state_root, 0x61);
+
+    let marker = store
+        .load(&paired_account(
+            &fixture,
+            PairedRemoteKeyPurpose::CommitMarker,
+        ))
+        .unwrap()
+        .unwrap();
+    let alias_identity = PairedMachineIdentity::new(
+        MachineRootFingerprint::from_bytes([0xa7; 32]),
+        MACHINE_ROUTE,
+    );
+    let alias_marker = RemoteKeyAccount::paired(
+        INSTALLATION_ID,
+        alias_identity.machine_root_fingerprint(),
+        alias_identity.machine_route(),
+        PairedRemoteKeyPurpose::CommitMarker,
+    );
+    store.persist_immutable(&alias_marker, &marker).unwrap();
+
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let error = paired
+        .list()
+        .expect_err("one aliased marker must fail the whole installation audit");
+    assert_eq!(error.code(), "remote.pairing.paired_conflict");
+    let error = paired
+        .open_exact(alias_identity)
+        .expect_err("marker body cannot be opened through a different account identity");
+    assert_eq!(error.code(), "remote.pairing.paired_conflict");
+}
+
+#[test]
+fn paired_machine_store_never_repairs_a_missing_final_item() {
+    let fixture = Fixture::new();
+    let store = UnknownCommitStore::new(usize::MAX);
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    promote_for_paired_open(&store, &fixture, &state_root, 0x71);
+
+    let grant = paired_account(&fixture, PairedRemoteKeyPurpose::DeviceGrant);
+    store.delete_exact(&grant).unwrap();
+    let writes_before = store.writes.load(Ordering::SeqCst);
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let list_error = paired
+        .list()
+        .expect_err("list must audit every marker instead of omitting corrupt entries");
+    assert_eq!(list_error.code(), "remote.pairing.paired_incomplete");
+    let open_error = paired
+        .open_exact(fixture_paired_identity(&fixture))
+        .expect_err("exact open must fail closed on a missing final grant");
+    assert_eq!(open_error.code(), "remote.pairing.paired_incomplete");
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before);
+    assert!(store.load(&grant).unwrap().is_none());
+}
+
+#[test]
+fn paired_machine_store_rejects_offline_counter_guard_tamper_without_writes() {
+    let fixture = Fixture::new();
+    let store = UnknownCommitStore::new(usize::MAX);
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    promote_for_paired_open(&store, &fixture, &state_root, 0x81);
+
+    let counter = paired_account(&fixture, PairedRemoteKeyPurpose::CounterGuard);
+    let mut tampered = store
+        .load(&counter)
+        .unwrap()
+        .unwrap()
+        .expose_secret()
+        .to_vec();
+    store.delete_exact(&counter).unwrap();
+    tampered[0] ^= 1;
+    store
+        .persist_immutable(&counter, &RemoteSecret::new(tampered.clone()))
+        .unwrap();
+    let writes_before = store.writes.load(Ordering::SeqCst);
+
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let list_error = paired
+        .list()
+        .expect_err("full list audit must reject a noncanonical CounterGuard");
+    assert_eq!(list_error.code(), "remote.pairing.paired_invalid");
+    let open_error = paired
+        .open_exact(fixture_paired_identity(&fixture))
+        .expect_err("exact open must reject the same durable tamper");
+    assert_eq!(open_error.code(), "remote.pairing.paired_invalid");
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before);
+    assert_eq!(
+        store.load(&counter).unwrap().unwrap().expose_secret(),
+        tampered
+    );
+}
+
+#[test]
+fn paired_machine_store_rejects_offline_sealed_state_tamper_without_rewriting_it() {
+    let fixture = Fixture::new();
+    let store = UnknownCommitStore::new(usize::MAX);
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0x91);
+    let state_path = promoted.state_path().to_path_buf();
+    drop(promoted);
+
+    let mut tampered = fs::read(&state_path).expect("read sealed paired state");
+    *tampered
+        .last_mut()
+        .expect("sealed state includes an AEAD tag") ^= 1;
+    fs::write(&state_path, &tampered).expect("apply offline sealed-state tamper");
+    let writes_before = store.writes.load(Ordering::SeqCst);
+
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let list_error = paired
+        .list()
+        .expect_err("full list audit must reject sealed-state authentication failure");
+    assert_eq!(
+        list_error.code(),
+        "remote.crypto_state.authentication_failed"
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), tampered);
+
+    let open_error = paired
+        .open_exact(fixture_paired_identity(&fixture))
+        .expect_err("exact open must reject the same sealed-state authentication failure");
+    assert_eq!(
+        open_error.code(),
+        "remote.crypto_state.authentication_failed"
+    );
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before);
+    assert_eq!(fs::read(&state_path).unwrap(), tampered);
 }
