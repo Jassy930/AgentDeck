@@ -6,12 +6,9 @@
 
 use agentdeck_crypto::{AeadSendingKey, SenderCounter, derive_nonce_prefix, seal_symmetric};
 use agentdeck_protocol::e2ee::{
-    KeyId, KeyPurpose, OuterContextV1, OuterFrameKind, SealedPayloadKind, SignedSealedBlobV1,
-    UnsignedSealedBlobV1,
+    KeyId, KeyPurpose, OuterContextV1, SealedPayloadKind, SignedSealedBlobV1, UnsignedSealedBlobV1,
 };
-use agentdeck_protocol::relay_v2::{
-    DeviceRouteId, MachineRouteId, RELAY_PROTOCOL_VERSION, RequestRouteId,
-};
+use agentdeck_protocol::relay_v2::{DeviceRouteId, MachineRouteId, RequestRouteId};
 use rusqlite::TransactionBehavior;
 
 use crate::runtime::model::{RuntimeStoreConfig, RuntimeStoreError};
@@ -200,20 +197,12 @@ pub(super) fn seal_transaction(
         request.counter,
         &mut next,
     )?;
-    let context = OuterContextV1 {
-        frame_kind: OuterFrameKind::DirectedReply,
-        relay_protocol_version: RELAY_PROTOCOL_VERSION,
-        e2ee_format_version: agentdeck_protocol::e2ee::E2EE_FORMAT_VERSION,
-        machine_route: Some(request.machine_route),
-        device_route: Some(request.device_route),
-        stream_route: None,
-        request_route: Some(request.request_route),
-        pair_route: None,
-        stream_generation: None,
-        stream_cursor: None,
-        stream_seq: None,
-        message_key_epoch: reply_key.epoch,
-    };
+    let context = OuterContextV1::directed_reply(
+        request.machine_route,
+        request.device_route,
+        request.request_route,
+        reply_key.epoch,
+    );
     let expected_nonce_prefix = derive_nonce_prefix(&reply_key.key);
     let axes = TransactionDirectedReplyAxes {
         context,

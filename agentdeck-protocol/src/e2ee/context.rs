@@ -122,6 +122,32 @@ impl OuterContextV1 {
         }
     }
 
+    /// daemon→device `Reply` 的固定 AAD 形状。
+    ///
+    /// Directed reply 不属于 stream，也不允许 generation/cursor/seq 或 pairing route；
+    /// machine/device/request route 与 reply-key epoch 必须由 daemon 和客户端逐字节共用。
+    pub const fn directed_reply(
+        machine_route: MachineRouteId,
+        device_route: DeviceRouteId,
+        request_route: RequestRouteId,
+        message_key_epoch: u64,
+    ) -> Self {
+        Self {
+            frame_kind: OuterFrameKind::DirectedReply,
+            relay_protocol_version: crate::relay_v2::RELAY_PROTOCOL_VERSION,
+            e2ee_format_version: crate::e2ee::E2EE_FORMAT_VERSION,
+            machine_route: Some(machine_route),
+            device_route: Some(device_route),
+            stream_route: None,
+            request_route: Some(request_route),
+            pair_route: None,
+            stream_generation: None,
+            stream_cursor: None,
+            stream_seq: None,
+            message_key_epoch,
+        }
+    }
+
     /// daemon→device counter recovery 的固定 AAD 形状。
     ///
     /// 该 carrier 由 DeviceHPKE 一次性保护，故 `message_key_epoch` 固定为 0；唯一

@@ -248,3 +248,37 @@ fn uplink_send_context_has_exact_shape_and_aad() {
         "4167656e744465636b2f4f75746572436f6e746578745631000300020001011111111111111111111111111111111101222222222222222222222222222222220001333333333333333333333333333333330000000000000000000009"
     );
 }
+
+#[test]
+fn directed_reply_context_has_exact_shape_and_aad() {
+    let machine_route = MachineRouteId::from_bytes([0x11; 16]);
+    let device_route = DeviceRouteId::from_bytes([0x22; 16]);
+    let request_route = RequestRouteId::from_bytes([0x33; 16]);
+
+    let context = OuterContextV1::directed_reply(machine_route, device_route, request_route, 9);
+
+    assert_eq!(
+        context,
+        OuterContextV1 {
+            frame_kind: OuterFrameKind::DirectedReply,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            machine_route: Some(machine_route),
+            device_route: Some(device_route),
+            stream_route: None,
+            request_route: Some(request_route),
+            pair_route: None,
+            stream_generation: None,
+            stream_cursor: None,
+            stream_seq: None,
+            message_key_epoch: 9,
+        }
+    );
+    context
+        .validate()
+        .expect("exact directed reply context is valid");
+    assert_eq!(
+        hex(&context.encode_aad()),
+        "4167656e744465636b2f4f75746572436f6e746578745631000200020001011111111111111111111111111111111101222222222222222222222222222222220001333333333333333333333333333333330000000000000000000009"
+    );
+}
