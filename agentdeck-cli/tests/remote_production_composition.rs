@@ -37,6 +37,9 @@ fn production_composition_is_the_only_binary_reachable_persistence_constructor()
         "verify_current_remote_cli_identity",
         "MacOsRemoteKeyStore",
         "remote_state_root_for_current_user",
+        "CliInstallationStore::for_os_account",
+        ".load_or_create()",
+        "installation_id",
     ] {
         assert!(
             module.contains(required),
@@ -61,13 +64,19 @@ fn production_composition_is_the_only_binary_reachable_persistence_constructor()
         .find("verify_current_remote_cli_identity")
         .expect("signature guard");
     let state_root = production_section
-        .find("remote_state_root_for_current_user")
-        .expect("OS-account state root");
+        .find("remote_state_root_from_home(installation_store.frozen_home_path())")
+        .expect("state root derived from the frozen OS-account home");
+    let installation = production_section
+        .find(".load_or_create()")
+        .expect("stable installation identity");
     let keychain = production_section
         .find("MacOsRemoteKeyStore")
         .expect("production Keychain adapter");
     assert!(signature < state_root);
     assert!(signature < keychain);
+    assert!(signature < installation);
+    assert!(installation < state_root);
+    assert!(installation < keychain);
 }
 
 #[test]
@@ -96,4 +105,25 @@ fn production_persistence_has_no_file_secret_or_runtime_selector_escape_hatch() 
             .join("../packaging/agentdeck-cli.entitlements")
             .is_file()
     );
+}
+
+#[test]
+fn injected_composition_is_debug_library_only_and_not_a_runtime_selector() {
+    let production = include_str!("../src/remote/production.rs");
+    assert!(production.contains("#[cfg(debug_assertions)]"));
+    assert!(production.contains("pub fn injected_for_test"));
+
+    let binary = include_str!("../src/main.rs");
+    assert!(!binary.contains("injected_for_test"));
+    for forbidden in [
+        "AGENTDECK_REMOTE_COMPOSITION",
+        "AGENTDECK_REMOTE_INSTALLATION_HOME",
+        "--remote-installation-home",
+        "--remote-state-root",
+    ] {
+        assert!(
+            !binary.contains(forbidden) && !production.contains(forbidden),
+            "runtime composition selector escaped: {forbidden}"
+        );
+    }
 }

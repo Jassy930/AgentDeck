@@ -180,7 +180,17 @@ impl PairingFixture {
     }
 
     pub fn promote(&self, store: &dyn RemoteKeyStore, state_root: &Path, seed: u8) -> VerifyingKey {
-        let pending = PendingPairingCoordinator::new(store, INSTALLATION_ID);
+        self.promote_for_installation(store, state_root, INSTALLATION_ID, seed)
+    }
+
+    pub fn promote_for_installation(
+        &self,
+        store: &dyn RemoteKeyStore,
+        state_root: &Path,
+        installation_id: Uuid,
+        seed: u8,
+    ) -> VerifyingKey {
+        let pending = PendingPairingCoordinator::new(store, installation_id);
         let mut request_rng = DeterministicRng::new([seed; 32]);
         let prepared = pending
             .prepare(&self.invite, &self.authorization, NOW_MS, &mut request_rng)
@@ -192,7 +202,7 @@ impl PairingFixture {
         let verified = pending
             .verify_response(&self.invite, &self.authorization, NOW_MS + 1, &response)
             .expect("verify real PairResponse fixture");
-        let coordinator = PairedPromotionCoordinator::new(store, INSTALLATION_ID, state_root);
+        let coordinator = PairedPromotionCoordinator::new(store, installation_id, state_root);
         let mut promotion_rng = DeterministicRng::new([seed.wrapping_add(2); 32]);
         drop(
             coordinator

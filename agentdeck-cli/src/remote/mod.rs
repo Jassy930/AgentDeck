@@ -5,6 +5,8 @@
 pub mod crypto_state;
 pub mod device_lock;
 pub mod keychain;
+#[cfg(unix)]
+pub mod machines;
 #[cfg(target_os = "macos")]
 mod macos_keychain;
 #[cfg(unix)]

@@ -296,10 +296,8 @@ enum RemoteOp {
         #[arg(long, value_enum)]
         role: Option<RoleArg>,
     },
-    Machines {
-        #[arg(long)]
-        relay: String,
-    },
+    /// List locally paired machines without dialing Relay or the daemon
+    Machines,
     Sessions {
         #[arg(long)]
         relay: String,
@@ -608,6 +606,16 @@ async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
         },
         Cmd::Remote { op } => {
             runtime_cli::validate_runtime_globals(&cli.profile, cli.data_dir.as_deref())?;
+            if matches!(op, RemoteOp::Machines) {
+                let composition =
+                    agentdeck_cli::remote::production::PersistentRemoteComposition::production()
+                        .map_err(persistent_remote_composition_cli_error)?;
+                let output =
+                    agentdeck_cli::remote::machines::list_persistent_remote_machines(&composition)
+                        .map_err(persistent_remote_machines_cli_error)?;
+                println!("{}", render(&output, pretty));
+                return Ok(());
+            }
             let plan = match op {
                 RemoteOp::Machine {
                     op: RemoteMachineOp::Enroll { bundle_file },
@@ -916,6 +924,24 @@ fn purge_cli_error(error: agentdeck_cli::daemon::purge::PurgeCliError) -> CliErr
     }
 }
 
+fn persistent_remote_composition_cli_error(
+    error: agentdeck_cli::remote::production::PersistentRemoteCompositionError,
+) -> CliError {
+    CliError::Session {
+        code: Some(error.code().to_owned()),
+        message: error.to_string(),
+    }
+}
+
+fn persistent_remote_machines_cli_error(
+    error: agentdeck_cli::remote::machines::PersistentRemoteMachinesError,
+) -> CliError {
+    CliError::Session {
+        code: Some(error.code().to_owned()),
+        message: error.to_string(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = match Cli::try_parse() {
@@ -941,7 +967,8 @@ async fn main() {
             RemoteOp::Machine { .. }
             | RemoteOp::Pairing { .. }
             | RemoteOp::Revoke { .. }
-            | RemoteOp::TrustReset { .. } => None,
+            | RemoteOp::TrustReset { .. }
+            | RemoteOp::Machines => None,
             RemoteOp::Synthetic { bundle } => Some(remote_cli::RemoteOpArg::Synthetic {
                 bundle: bundle.clone(),
             }),
@@ -951,7 +978,6 @@ async fn main() {
             }
             | RemoteOp::Smoke => Some(remote_cli::RemoteOpArg::LegacyV1),
             RemoteOp::Pair { .. }
-            | RemoteOp::Machines { .. }
             | RemoteOp::Sessions { .. }
             | RemoteOp::Watch { .. }
             | RemoteOp::Send { .. }
@@ -978,6 +1004,28 @@ async fn main() {
 #[cfg(test)]
 mod remote_machine_cli_tests {
     use super::*;
+
+    #[test]
+    fn persistent_machines_is_local_and_rejects_legacy_relay_selector() {
+        assert!(matches!(
+            Cli::try_parse_from(["agentdeck", "remote", "machines"])
+                .expect("parse local machines")
+                .command,
+            Cmd::Remote {
+                op: RemoteOp::Machines
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "agentdeck",
+                "remote",
+                "machines",
+                "--relay",
+                "wss://relay.example/",
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn exact_machine_enroll_status_and_trust_reset_commands_parse() {

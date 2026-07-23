@@ -128,6 +128,14 @@ impl CliInstallationStore {
         Ok(Self::for_os_account()?.record_path())
     }
 
+    /// 返回构造本 store 时已经冻结的 OS-account home。
+    ///
+    /// production composition 用它让 installation record 与其余 passwd-derived state
+    /// 共享同一次 `getpwuid_r` 观察，避免一次启动内出现两个不一致的 home root。
+    pub(crate) fn frozen_home_path(&self) -> &Path {
+        &self.home
+    }
+
     /// stable daemon install layout 与 CLI identity 共用同一 passwd-derived home。
     /// 不读取 `HOME`，也不提供 production runtime override。
     #[doc(hidden)]
