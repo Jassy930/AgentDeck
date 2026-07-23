@@ -320,6 +320,14 @@ final class ReasoningCellView: ConversationRowCellView {
         contentStack.addArrangedSubview(headerRow)
         contentStack.addArrangedSubview(streamingView)
         bodyConstraints = [
+            // StreamingTextContainerView has no horizontal intrinsic size. The
+            // base cell only caps the stack's trailing edge, so without this
+            // exact edge the stack shrinks to the short disclosure header and
+            // renders reasoning as a narrow, word-wrapped column.
+            contentStack.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -ConversationRowCellView.horizontalInset
+            ),
             headerRow.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor),
             streamingView.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor),
             streamingView.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor),

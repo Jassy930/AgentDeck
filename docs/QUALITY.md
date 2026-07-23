@@ -69,6 +69,7 @@ cargo test
 - [ ] 真实 Codex `subAgentActivity` 不得显示 `unsupported item type`，须以独立紧凑协作行显示可读任务名及“已开始工作 / 已更新 / 已中断”；该活动不能进入普通工具聚合，也不能把历史 `started` 事件误标成当前进行中
 - [ ] 真实 Codex `contextCompaction` 不得显示 `unsupported item type`，须以独立“上下文已压缩”系统行呈现并截断前后工具聚合
 - [ ] reasoning 默认折叠，但折叠头必须完整显示「思考过程」，不能因 disclosure 压缩只剩单个 `R` 字符；切换会话时不得继承上一会话同名 item 的展开/收起状态
+- [ ] 展开后的 reasoning 正文（包括工具聚合内的中间 reasoning）必须使用会话正文可用宽度，不能收缩成标题宽度或逐词换行；渲染宽度须与行高测量宽度一致，不得裁切或覆盖相邻行
 - [ ] 高风险操作触发 approve / deny 控件
 - [ ] TurnJumpRail 是独立 44pt 尾列，不覆盖会话正文、composer 或环境面板；每个目标均有 44×44pt 命中区，Tab 可聚焦、焦点清晰可见，Enter/Space 可激活，悬停或键盘聚焦均显示回合摘要，当前回合语义可读；点击/滚轮/↑↓/Home/End 可跳转，VoiceOver 自定义动作可用
 - [ ] 开启 macOS「减少动态效果」后 TurnJumpRail 直接跳变，不运行滚动或悬停定时动画

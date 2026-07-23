@@ -96,6 +96,40 @@ final class ReasoningCellViewTests: XCTestCase {
         )
     }
 
+    func testExpandedReasoningUsesFullConversationWidth() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let item = UIItem(
+            id: "reasoning-full-width",
+            lifecycle: "completed",
+            kind: "reasoning",
+            text: "Planning targeted documentation and code inspection before implementing the layout fix."
+        )
+        let row = ConversationDisplayRow(
+            role: .assistantItem,
+            turnId: "turn-reasoning",
+            item: item,
+            firstInTurn: true,
+            lastInTurn: true
+        )
+        let store = RecordingDisclosureStore()
+        store.expandedItemIds.insert(item.id)
+
+        let width: CGFloat = 620
+        let cell = ReasoningCellView(
+            frame: NSRect(x: 0, y: 0, width: width, height: 240)
+        )
+        cell.disclosureStore = store
+        cell.configure(row: row, width: width, model: model)
+        cell.layoutSubtreeIfNeeded()
+
+        let body = try XCTUnwrap(
+            cell.allDescendants(ofType: StreamingTextContainerView.self).first
+        )
+        let expectedContentWidth = width - ConversationRowCellView.horizontalInset * 2
+        XCTAssertEqual(cell.contentStack.frame.width, expectedContentWidth, accuracy: 1)
+        XCTAssertEqual(body.frame.width, expectedContentWidth, accuracy: 1)
+    }
+
     func testExplicitCollapseOverridesRunningAutoExpansion() throws {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         model.phase = .running
