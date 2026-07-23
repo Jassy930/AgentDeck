@@ -14,14 +14,17 @@ use agentdeck_protocol::ActionDecision;
 use agentdeck_protocol::e2ee::SealedPayloadKind;
 use agentdeck_protocol::relay_v2::frame::{AcceptedRef, SealedBlob, Send as RelaySend};
 use agentdeck_protocol::relay_v2::{
-    CodecError, MAX_FRAME_BYTES, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody,
-    RequestRouteId, decode, encode,
+    CodecError, GrantSerial as RelayGrantSerial, MAX_FRAME_BYTES, OpaqueRouteFrame,
+    RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId, decode, encode,
 };
-use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TurnId};
+use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
+use agentdeck_protocol::runtime::identity::{
+    ApprovalId, GrantSerial as RuntimeGrantSerial, MessageId, TurnId,
+};
 use agentdeck_protocol::runtime::{
     ApprovalDeliveryState, ApprovalReceipt, CommandReceipt, ConversationId,
-    MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeFailure,
-    RuntimeMessage, RuntimeReply, SendPromptRequest,
+    MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION, RevocationReceipt, RuntimeEnvelope,
+    RuntimeFailure, RuntimeMessage, RuntimeReply, SendPromptRequest,
 };
 use agentdeck_relay_client::RelayClientError;
 use async_trait::async_trait;
@@ -31,7 +34,7 @@ use zeroize::Zeroize;
 
 use super::paired_machine::{
     AuthorizedRuntimeRequest, OpaqueRuntimeState, OpenedPairedMachine, PairedPromotionError,
-    VerifiedDirectedReply,
+    VerifiedDirectedReply, VerifiedRevocationTerminal,
 };
 
 const EXCHANGE_MAGIC: &[u8; 4] = b"ADRX";
@@ -46,6 +49,7 @@ const MAX_REPLAY_ENTRIES: usize = 4_096;
 const INTENT_DOMAIN: &[u8] = b"AgentDeck/RemotePromptIntentV1\0";
 const RESOLVE_APPROVAL_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteResolveApprovalIntentV1\0";
 const RETRY_APPROVAL_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteRetryApprovalIntentV1\0";
+const REVOKE_SELF_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteRevokeSelfIntentV1\0";
 const MUTATION_RNG_DOMAIN: &[u8] = b"AgentDeck/RemoteRuntimeMutationRngV1\0";
 
 /// Remote Runtime 对 Relay transport 的最小需求；transport 不解析或伪造业务回执。
@@ -53,10 +57,52 @@ const MUTATION_RNG_DOMAIN: &[u8] = b"AgentDeck/RemoteRuntimeMutationRngV1\0";
 pub trait RemoteRuntimeTransport: Send {
     async fn send(&mut self, frame: ExactRelayFrame) -> Result<(), RemoteRuntimeTransportError>;
 
-    async fn recv(&mut self) -> Result<Option<OpaqueRouteFrame>, RemoteRuntimeTransportError>;
+    async fn recv(&mut self) -> Result<Option<ReceivedRuntimeFrame>, RemoteRuntimeTransportError>;
 
     /// 等待 transport-owned I/O task 收口；默认用于无后台任务的 automatic fake。
     async fn shutdown(&mut self) {}
+}
+
+/// transport 交给 Runtime 的未信任 Relay frame 与原始 binary payload。
+///
+/// 构造本身不授予 exact-wire 信任；Runtime 必须在读取 body、计算 hash 或执行任何 durable
+/// mutation 前同时验证协议版本以及 `encode(frame) == canonical_bytes`。公开构造器用于
+/// transport adapter 与 library harness，`Debug` 永远不暴露 frame 或 payload。
+#[derive(PartialEq, Eq)]
+pub struct ReceivedRuntimeFrame {
+    frame: OpaqueRouteFrame,
+    canonical_bytes: Vec<u8>,
+}
+
+impl ReceivedRuntimeFrame {
+    #[must_use]
+    pub fn from_untrusted_parts(frame: OpaqueRouteFrame, canonical_bytes: Vec<u8>) -> Self {
+        Self {
+            frame,
+            canonical_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn frame(&self) -> &OpaqueRouteFrame {
+        &self.frame
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (OpaqueRouteFrame, Vec<u8>) {
+        (self.frame, self.canonical_bytes)
+    }
+}
+
+impl std::fmt::Debug for ReceivedRuntimeFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReceivedRuntimeFrame([REDACTED])")
+    }
 }
 
 /// 已由 Runtime durable state 冻结并通过严格 Relay codec 校验的逐字节发送单元。
@@ -133,6 +179,25 @@ pub struct RemoteApprovalOutcome {
     receipt: ApprovalReceipt,
 }
 
+/// root-signed Relay terminal 已验证且本机 paired material 已完成 cleanup 的撤销结果。
+#[derive(Debug)]
+pub struct RemoteRevocationOutcome {
+    route_accepted: bool,
+    receipt: RevocationReceipt,
+}
+
+impl RemoteRevocationOutcome {
+    #[must_use]
+    pub const fn route_accepted(&self) -> bool {
+        self.route_accepted
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &RevocationReceipt {
+        &self.receipt
+    }
+}
+
 impl RemoteApprovalOutcome {
     #[must_use]
     pub const fn route_accepted(&self) -> bool {
@@ -200,9 +265,10 @@ where
         request: SendPromptRequest,
         rng: &mut R,
     ) -> Result<RemotePromptOutcome, RemoteRuntimeError> {
-        let outcome = self
-            .directed_exchange(DirectedRequestPlan::prompt(request)?, rng)
-            .await?;
+        let outcome = directed_receipt_outcome(
+            self.directed_exchange(DirectedRequestPlan::prompt(request)?, rng)
+                .await?,
+        )?;
         let DirectedReceipt::Command(receipt) = outcome.receipt else {
             return Err(RemoteRuntimeError::InvalidDurableState);
         };
@@ -221,8 +287,8 @@ where
         decision: ActionDecision,
         rng: &mut R,
     ) -> Result<RemoteApprovalOutcome, RemoteRuntimeError> {
-        let outcome = self
-            .directed_exchange(
+        let outcome = directed_receipt_outcome(
+            self.directed_exchange(
                 DirectedRequestPlan::resolve_approval(
                     conversation_id,
                     turn_id,
@@ -231,7 +297,8 @@ where
                 )?,
                 rng,
             )
-            .await?;
+            .await?,
+        )?;
         let DirectedReceipt::Approval(receipt) = outcome.receipt else {
             return Err(RemoteRuntimeError::InvalidDurableState);
         };
@@ -248,12 +315,13 @@ where
         approval_id: ApprovalId,
         rng: &mut R,
     ) -> Result<RemoteApprovalOutcome, RemoteRuntimeError> {
-        let outcome = self
-            .directed_exchange(
+        let outcome = directed_receipt_outcome(
+            self.directed_exchange(
                 DirectedRequestPlan::retry_approval(conversation_id, approval_id)?,
                 rng,
             )
-            .await?;
+            .await?,
+        )?;
         let DirectedReceipt::Approval(receipt) = outcome.receipt else {
             return Err(RemoteRuntimeError::InvalidDurableState);
         };
@@ -263,11 +331,54 @@ where
         })
     }
 
+    /// 逐字节发送或恢复同一 self-revoke intent，并消费整个 Runtime capability。
+    ///
+    /// authenticated daemon `RevocationReceipt::Committed` 只说明 daemon 已观察到 Relay
+    /// COMMIT，不是本机删 key 的授权，也不会覆盖 durable pending Send。只有 active
+    /// connection 收到的 exact MachineRoot-signed `RevocationCommitted` 才能触发 cleanup。
+    /// 所有返回路径都先等待 transport shutdown；成功路径再显式 drop transport，最后消费
+    /// paired machine 完成 crash-safe cleanup。
+    pub async fn revoke_self<R: CryptoRng>(
+        mut self,
+        rng: &mut R,
+    ) -> Result<RemoteRevocationOutcome, RemoteRuntimeError> {
+        let expected_grant_serial = self.machine.grant_serial();
+        let result = match DirectedRequestPlan::revoke_self(expected_grant_serial) {
+            Ok(plan) => self.directed_exchange(plan, rng).await,
+            Err(error) => Err(error),
+        };
+        self.transport.shutdown().await;
+
+        let DirectedExchangeResult::RevocationTerminal {
+            route_accepted,
+            terminal,
+        } = result?
+        else {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        };
+        let grant_serial = terminal.grant_serial();
+        if grant_serial != expected_grant_serial {
+            return Err(RemoteRuntimeError::InvalidReply(
+                "revocation terminal grant serial does not match the paired machine",
+            ));
+        }
+
+        let Self { transport, machine } = self;
+        drop(transport);
+        machine.commit_revocation_cleanup(terminal)?;
+        Ok(RemoteRevocationOutcome {
+            route_accepted,
+            receipt: RevocationReceipt::Committed {
+                grant_serial: RuntimeGrantSerial::new(grant_serial.value()),
+            },
+        })
+    }
+
     async fn directed_exchange<R: CryptoRng>(
         &mut self,
         plan: DirectedRequestPlan,
         rng: &mut R,
-    ) -> Result<DirectedOutcome, RemoteRuntimeError> {
+    ) -> Result<DirectedExchangeResult, RemoteRuntimeError> {
         let existing = self
             .machine
             .opaque_runtime_state()
@@ -277,7 +388,9 @@ where
         let pending =
             match select_exchange_start(existing, plan, |plan| self.prepare_pending(plan, rng))? {
                 ExchangeStart::Pending(pending) => pending,
-                ExchangeStart::Terminal(receipt) => return directed_outcome(false, receipt),
+                ExchangeStart::Terminal(receipt) => {
+                    return directed_outcome(false, receipt).map(DirectedExchangeResult::Receipt);
+                }
             };
 
         self.reject_quarantined_current_reply_scope()?;
@@ -290,15 +403,12 @@ where
 
         let mut route_accepted = false;
         loop {
-            let Some(frame) = self.transport.recv().await? else {
+            let Some(received) = self.transport.recv().await? else {
                 return Err(RemoteRuntimeError::OutcomeUnknown);
             };
-            if frame.version != RELAY_PROTOCOL_VERSION {
-                return Err(RemoteRuntimeError::InvalidReply(
-                    "unsupported Relay protocol version",
-                ));
-            }
-            let reply_frame_hash = sha256(&encode(&frame));
+            validate_received_runtime_frame(&received)?;
+            let reply_frame_hash = sha256(received.canonical_bytes());
+            let frame = received.frame();
             match &frame.body {
                 RelayFrameBody::RouteAccepted(accepted) => match accepted.accepted {
                     AcceptedRef::Request { request_route }
@@ -349,9 +459,25 @@ where
                             "Runtime envelope is not a reply",
                         ));
                     };
-                    let receipt = pending.operation.validate_reply(reply)?;
-                    self.persist_terminal(&pending, reply_frame_hash, &receipt)?;
-                    return directed_outcome(route_accepted, receipt);
+                    match pending.operation.validate_reply(reply)? {
+                        ValidatedDirectedReply::Terminal(receipt) => {
+                            self.persist_terminal(&pending, reply_frame_hash, &receipt)?;
+                            return directed_outcome(route_accepted, receipt)
+                                .map(DirectedExchangeResult::Receipt);
+                        }
+                        ValidatedDirectedReply::SelfRevocationCommitted => {}
+                    }
+                }
+                RelayFrameBody::RevocationCommitted(_)
+                    if matches!(pending.operation, DirectedOperation::RevokeSelf { .. }) =>
+                {
+                    let terminal = self
+                        .machine
+                        .verify_revocation_terminal(frame, received.canonical_bytes())?;
+                    return Ok(DirectedExchangeResult::RevocationTerminal {
+                        route_accepted,
+                        terminal,
+                    });
                 }
                 _ => {
                     return Err(RemoteRuntimeError::InvalidReply(
@@ -584,6 +710,20 @@ impl DirectedRequestPlan {
         })
     }
 
+    fn revoke_self(grant_serial: RelayGrantSerial) -> Result<Self, RemoteRuntimeError> {
+        if grant_serial == RelayGrantSerial::ZERO {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        let wire = agentdeck_protocol::runtime::RuntimeRequest::Revoke(RevokeRequest {
+            target: RevokeTarget::SelfDevice,
+        });
+        Ok(Self {
+            operation: DirectedOperation::RevokeSelf { grant_serial },
+            intent_hash: runtime_request_intent_hash(REVOKE_SELF_INTENT_DOMAIN, &wire)?,
+            request: AuthorizedRuntimeRequest::RevokeSelf,
+        })
+    }
+
     /// `RetryApproval` 的 durable attempt 只在前一轮已有 authenticated terminal 后递增。
     /// outcome-unknown 的 pending 则沿用原 attempt，从而继续逐字节重发同一 frozen frame。
     fn align_retry_attempt(
@@ -606,7 +746,9 @@ impl DirectedRequestPlan {
                 approval_id: stored_approval,
                 ..
             } => stored_conversation == &conversation_id && stored_approval == &approval_id,
-            DirectedOperation::Prompt { .. } | DirectedOperation::ResolveApproval { .. } => false,
+            DirectedOperation::Prompt { .. }
+            | DirectedOperation::ResolveApproval { .. }
+            | DirectedOperation::RevokeSelf { .. } => false,
         };
         let attempt = match existing {
             Some(DurableExchange::Pending(pending)) if same_retry(&pending.operation) => {
@@ -648,6 +790,9 @@ enum DirectedOperation {
         approval_id: ApprovalId,
         attempt: u64,
     },
+    RevokeSelf {
+        grant_serial: RelayGrantSerial,
+    },
 }
 
 impl DirectedOperation {
@@ -657,16 +802,23 @@ impl DirectedOperation {
         SealedPayloadKind::CommandReceipt
     }
 
-    fn validate_reply(&self, reply: RuntimeReply) -> Result<DirectedReceipt, RemoteRuntimeError> {
+    fn validate_reply(
+        &self,
+        reply: RuntimeReply,
+    ) -> Result<ValidatedDirectedReply, RemoteRuntimeError> {
         match (self, reply) {
-            (_, RuntimeReply::Failure(failure)) => Ok(DirectedReceipt::Failure(failure)),
+            (_, RuntimeReply::Failure(failure)) => Ok(ValidatedDirectedReply::Terminal(
+                DirectedReceipt::Failure(failure),
+            )),
             (
                 Self::Prompt {
                     expected_configuration_revision,
                 },
                 RuntimeReply::Command(receipt),
             ) if receipt_matches_expected_revision(&receipt, *expected_configuration_revision) => {
-                Ok(DirectedReceipt::Command(receipt))
+                Ok(ValidatedDirectedReply::Terminal(DirectedReceipt::Command(
+                    receipt,
+                )))
             }
             (Self::Prompt { .. }, RuntimeReply::Command(_)) => {
                 Err(RemoteRuntimeError::InvalidReply(
@@ -676,13 +828,36 @@ impl DirectedOperation {
             (Self::ResolveApproval { approval_id }, RuntimeReply::Approval(receipt))
                 if approval_receipt_id(&receipt) == approval_id =>
             {
-                Ok(DirectedReceipt::Approval(receipt))
+                Ok(ValidatedDirectedReply::Terminal(DirectedReceipt::Approval(
+                    receipt,
+                )))
             }
             (Self::RetryApproval { approval_id, .. }, RuntimeReply::Approval(receipt))
                 if approval_receipt_id(&receipt) == approval_id
                     && retry_approval_receipt_is_allowed(&receipt) =>
             {
-                Ok(DirectedReceipt::Approval(receipt))
+                Ok(ValidatedDirectedReply::Terminal(DirectedReceipt::Approval(
+                    receipt,
+                )))
+            }
+            (
+                Self::RevokeSelf { grant_serial },
+                RuntimeReply::Revocation(RevocationReceipt::Committed {
+                    grant_serial: committed,
+                }),
+            ) if committed.0 == grant_serial.value() => {
+                Ok(ValidatedDirectedReply::SelfRevocationCommitted)
+            }
+            (
+                Self::RevokeSelf { .. },
+                RuntimeReply::Revocation(RevocationReceipt::Failed { failure }),
+            ) => Ok(ValidatedDirectedReply::Terminal(DirectedReceipt::Failure(
+                failure,
+            ))),
+            (Self::RevokeSelf { .. }, RuntimeReply::Revocation(_)) => {
+                Err(RemoteRuntimeError::InvalidReply(
+                    "RevocationReceipt grant serial does not match the paired machine",
+                ))
             }
             (
                 Self::ResolveApproval { .. } | Self::RetryApproval { .. },
@@ -696,6 +871,9 @@ impl DirectedOperation {
             (Self::ResolveApproval { .. } | Self::RetryApproval { .. }, _) => Err(
                 RemoteRuntimeError::InvalidReply("Runtime reply is not ApprovalReceipt"),
             ),
+            (Self::RevokeSelf { .. }, _) => Err(RemoteRuntimeError::InvalidReply(
+                "Runtime reply is not RevocationReceipt",
+            )),
         }
     }
 
@@ -714,6 +892,10 @@ impl DirectedOperation {
                 approval_receipt_id(receipt) == approval_id
                     && retry_approval_receipt_is_allowed(receipt)
             }
+            (
+                Self::RevokeSelf { .. },
+                DirectedReceipt::Command(_) | DirectedReceipt::Approval(_),
+            ) => false,
             (_, DirectedReceipt::Failure(_)) => true,
             _ => false,
         }
@@ -723,11 +905,16 @@ impl DirectedOperation {
         match self {
             Self::RetryApproval { attempt, .. } if *attempt > 0 => Ok(*attempt),
             Self::RetryApproval { .. } => Err(RemoteRuntimeError::InvalidDurableState),
-            Self::Prompt { .. } | Self::ResolveApproval { .. } => {
+            Self::Prompt { .. } | Self::ResolveApproval { .. } | Self::RevokeSelf { .. } => {
                 Err(RemoteRuntimeError::InvalidDurableState)
             }
         }
     }
+}
+
+enum ValidatedDirectedReply {
+    Terminal(DirectedReceipt),
+    SelfRevocationCommitted,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -741,6 +928,38 @@ enum DirectedReceipt {
 struct DirectedOutcome {
     route_accepted: bool,
     receipt: DirectedReceipt,
+}
+
+enum DirectedExchangeResult {
+    Receipt(DirectedOutcome),
+    RevocationTerminal {
+        route_accepted: bool,
+        terminal: VerifiedRevocationTerminal,
+    },
+}
+
+fn directed_receipt_outcome(
+    result: DirectedExchangeResult,
+) -> Result<DirectedOutcome, RemoteRuntimeError> {
+    match result {
+        DirectedExchangeResult::Receipt(outcome) => Ok(outcome),
+        DirectedExchangeResult::RevocationTerminal { .. } => Err(RemoteRuntimeError::InvalidReply(
+            "unexpected revocation terminal for the active runtime operation",
+        )),
+    }
+}
+
+fn validate_received_runtime_frame(
+    received: &ReceivedRuntimeFrame,
+) -> Result<(), RemoteRuntimeError> {
+    if received.frame().version != RELAY_PROTOCOL_VERSION
+        || encode(received.frame()).as_slice() != received.canonical_bytes()
+    {
+        return Err(RemoteRuntimeError::InvalidReply(
+            "Relay frame is not the exact supported canonical wire payload",
+        ));
+    }
+    Ok(())
 }
 
 fn directed_outcome(
@@ -1114,6 +1333,10 @@ fn encode_operation(
             put_short_bytes(output, approval_id.as_str().as_bytes())?;
             output.extend_from_slice(&attempt.to_be_bytes());
         }
+        DirectedOperation::RevokeSelf { grant_serial } => {
+            output.push(3);
+            output.extend_from_slice(&grant_serial.value().to_be_bytes());
+        }
     }
     Ok(())
 }
@@ -1146,6 +1369,13 @@ fn decode_operation(reader: &mut Reader<'_>) -> Result<DirectedOperation, Remote
                 approval_id: ApprovalId::new(approval),
                 attempt,
             })
+        }
+        3 => {
+            let grant_serial = RelayGrantSerial::new(reader.u64()?);
+            if grant_serial == RelayGrantSerial::ZERO {
+                return Err(RemoteRuntimeError::InvalidDurableState);
+            }
+            Ok(DirectedOperation::RevokeSelf { grant_serial })
         }
         _ => Err(RemoteRuntimeError::InvalidDurableState),
     }

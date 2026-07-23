@@ -42,6 +42,7 @@ use agentdeck_protocol::relay_v2::id::{
 use agentdeck_protocol::relay_v2::{
     OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, decode, encode,
 };
+use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TurnId};
 use agentdeck_protocol::runtime::{
     ConversationId, MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope,
@@ -309,6 +310,7 @@ pub(crate) enum AuthorizedRuntimeRequest {
         conversation_id: ConversationId,
         approval_id: ApprovalId,
     },
+    RevokeSelf,
 }
 
 impl AuthorizedRuntimeRequest {
@@ -327,6 +329,10 @@ impl AuthorizedRuntimeRequest {
             Self::RetryApproval { .. } => (
                 AuthorizationCapabilityV1::Approval,
                 AuthorizationPermissionV1::ApprovalRetry,
+            ),
+            Self::RevokeSelf => (
+                AuthorizationCapabilityV1::SelfRevocation,
+                AuthorizationPermissionV1::RevokeSelf,
             ),
         }
     }
@@ -352,6 +358,9 @@ impl AuthorizedRuntimeRequest {
                 conversation_id,
                 approval_id,
             },
+            Self::RevokeSelf => RuntimeRequest::Revoke(RevokeRequest {
+                target: RevokeTarget::SelfDevice,
+            }),
         }
     }
 }
@@ -5321,6 +5330,7 @@ mod counter_reservation_tests {
             conversation_id: ConversationId::new("conversation-authorization-map"),
             approval_id: ApprovalId::new("approval-authorization-map"),
         };
+        let revoke_self = AuthorizedRuntimeRequest::RevokeSelf;
 
         assert_eq!(
             prompt.required_authorization(),
@@ -5343,6 +5353,19 @@ mod counter_reservation_tests {
                 AuthorizationPermissionV1::ApprovalRetry,
             )
         );
+        assert_eq!(
+            revoke_self.required_authorization(),
+            (
+                AuthorizationCapabilityV1::SelfRevocation,
+                AuthorizationPermissionV1::RevokeSelf,
+            )
+        );
+        assert!(matches!(
+            revoke_self.into_runtime_request(),
+            RuntimeRequest::Revoke(RevokeRequest {
+                target: RevokeTarget::SelfDevice
+            })
+        ));
     }
 
     #[test]

@@ -18,7 +18,9 @@ use async_trait::async_trait;
 
 use super::paired_machine::{device_authenticator_for_test, paired_spki_pins};
 use super::relay_transport::{RelayRuntimeIo, RelayRuntimeTransport};
-use super::runtime::{ExactRelayFrame, RemoteRuntimeTransport, RemoteRuntimeTransportError};
+use super::runtime::{
+    ExactRelayFrame, ReceivedRuntimeFrame, RemoteRuntimeTransport, RemoteRuntimeTransportError,
+};
 
 const MACHINE: MachineRouteId = MachineRouteId::from_bytes([0x11; 16]);
 const DEVICE: DeviceRouteId = DeviceRouteId::from_bytes([0x22; 16]);
@@ -136,7 +138,7 @@ struct IoState {
 
 struct FakeRelayIo {
     state: Arc<Mutex<IoState>>,
-    inbound: VecDeque<Result<Option<OpaqueRouteFrame>, RelayClientError>>,
+    inbound: VecDeque<Result<Option<ReceivedRuntimeFrame>, RelayClientError>>,
 }
 
 #[async_trait]
@@ -150,7 +152,7 @@ impl RelayRuntimeIo for FakeRelayIo {
         Ok(())
     }
 
-    async fn recv(&mut self) -> Result<Option<OpaqueRouteFrame>, RelayClientError> {
+    async fn recv_exact(&mut self) -> Result<Option<ReceivedRuntimeFrame>, RelayClientError> {
         self.inbound.pop_front().unwrap_or(Ok(None))
     }
 
@@ -172,9 +174,13 @@ fn hello() -> OpaqueRouteFrame {
 async fn relay_runtime_adapter_forwards_exact_bytes_frame_and_shutdown() {
     let state = Arc::new(Mutex::new(IoState::default()));
     let inbound = hello();
+    let inbound_bytes = encode(&inbound);
     let io = FakeRelayIo {
         state: Arc::clone(&state),
-        inbound: VecDeque::from([Ok(Some(inbound.clone()))]),
+        inbound: VecDeque::from([Ok(Some(ReceivedRuntimeFrame::from_untrusted_parts(
+            inbound.clone(),
+            inbound_bytes.clone(),
+        )))]),
     };
     let mut transport = RelayRuntimeTransport::from_test_connector(io);
     let frozen = encode(&hello());
@@ -189,7 +195,10 @@ async fn relay_runtime_adapter_forwards_exact_bytes_frame_and_shutdown() {
         RemoteRuntimeTransport::recv(&mut transport)
             .await
             .expect("receive"),
-        Some(inbound)
+        Some(ReceivedRuntimeFrame::from_untrusted_parts(
+            inbound,
+            inbound_bytes
+        ))
     );
     RemoteRuntimeTransport::shutdown(&mut transport).await;
 

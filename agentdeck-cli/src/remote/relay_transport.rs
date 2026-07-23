@@ -5,20 +5,20 @@
 
 #![cfg(unix)]
 
-use agentdeck_protocol::relay_v2::OpaqueRouteFrame;
 use agentdeck_relay_client::{RelayClient, RelayClientError};
 use async_trait::async_trait;
 
 use super::paired_machine::OpenedPairedMachine;
 use super::runtime::{
-    ExactRelayFrame, RemoteRuntime, RemoteRuntimeTransport, RemoteRuntimeTransportError,
+    ExactRelayFrame, ReceivedRuntimeFrame, RemoteRuntime, RemoteRuntimeTransport,
+    RemoteRuntimeTransportError,
 };
 
 #[async_trait]
 pub(super) trait RelayRuntimeIo: Send {
     async fn send_encoded(&mut self, bytes: Vec<u8>) -> Result<(), RelayClientError>;
 
-    async fn recv(&mut self) -> Result<Option<OpaqueRouteFrame>, RelayClientError>;
+    async fn recv_exact(&mut self) -> Result<Option<ReceivedRuntimeFrame>, RelayClientError>;
 
     async fn shutdown(&mut self);
 }
@@ -29,8 +29,13 @@ impl RelayRuntimeIo for RelayClient {
         RelayClient::send_encoded(self, bytes).await
     }
 
-    async fn recv(&mut self) -> Result<Option<OpaqueRouteFrame>, RelayClientError> {
-        RelayClient::recv(self).await
+    async fn recv_exact(&mut self) -> Result<Option<ReceivedRuntimeFrame>, RelayClientError> {
+        RelayClient::recv_exact(self).await.map(|received| {
+            received.map(|received| {
+                let (frame, canonical_bytes) = received.into_parts();
+                ReceivedRuntimeFrame::from_untrusted_parts(frame, canonical_bytes)
+            })
+        })
     }
 
     async fn shutdown(&mut self) {
@@ -72,8 +77,8 @@ impl RemoteRuntimeTransport for RelayRuntimeTransport {
         Ok(())
     }
 
-    async fn recv(&mut self) -> Result<Option<OpaqueRouteFrame>, RemoteRuntimeTransportError> {
-        self.relay.recv().await.map_err(Into::into)
+    async fn recv(&mut self) -> Result<Option<ReceivedRuntimeFrame>, RemoteRuntimeTransportError> {
+        self.relay.recv_exact().await.map_err(Into::into)
     }
 
     async fn shutdown(&mut self) {

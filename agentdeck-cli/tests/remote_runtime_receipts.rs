@@ -1,38 +1,48 @@
 #![cfg(unix)]
 
+#[allow(dead_code)]
 #[path = "support/remote_pairing.rs"]
 mod remote_pairing;
 
 use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agentdeck_cli::remote::keychain::MemoryRemoteKeyStore;
+use agentdeck_cli::remote::keychain::{
+    MemoryRemoteKeyStore, PairedRemoteKeyPurpose, RemoteKeyAccount, RemoteKeyStore,
+};
 use agentdeck_cli::remote::paired_machine::{
     PairedMachineStore, PairedMutationObserver, PairedMutationStage,
 };
 use agentdeck_cli::remote::runtime::{
-    ExactRelayFrame, RemotePromptOutcome, RemoteRuntime, RemoteRuntimeError,
+    ExactRelayFrame, ReceivedRuntimeFrame, RemotePromptOutcome, RemoteRuntime, RemoteRuntimeError,
     RemoteRuntimeTransport, RemoteRuntimeTransportError,
 };
 use agentdeck_crypto::{
     AeadReceivingKey, AeadSendingKey, SecretAeadKey, SenderCounter, SigningKey, VerifyingKey,
-    open_sealed_payload, seal_symmetric, sign_sealed, verify_sealed,
+    open_sealed_payload, seal_symmetric, sha256, sign_sealed, sign_tbs, verify_sealed,
 };
 use agentdeck_protocol::e2ee::{
     KeyId, KeyPurpose, OuterContextV1, SealedPayloadKind, SignedSealedBlobV1,
 };
-use agentdeck_protocol::relay_v2::frame::{AcceptedRef, Reply, RouteAccepted, SealedBlob, Send};
-use agentdeck_protocol::relay_v2::{
-    OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId, decode,
+use agentdeck_protocol::relay_v2::auth::{DeviceRevocation, Ed25519Signature};
+use agentdeck_protocol::relay_v2::frame::{
+    AcceptedRef, Reply, RevocationCommitted, RouteAccepted, SealedBlob, Send,
 };
-use agentdeck_protocol::runtime::identity::{ApprovalId, CommandId, MessageId, TurnId};
+use agentdeck_protocol::relay_v2::{
+    DeviceRouteId, GrantSerial as RelayGrantSerial, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION,
+    RelayFrameBody, RequestRouteId, decode, encode,
+};
+use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
+use agentdeck_protocol::runtime::identity::{
+    ApprovalId, CommandId, GrantSerial as RuntimeGrantSerial, MessageId, TurnId,
+};
 use agentdeck_protocol::runtime::{
     ApprovalReceipt, CommandReceipt, ConversationId, IdempotencyKey, PromptPayload,
-    RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeFailure, RuntimeMessage, RuntimeReply,
-    RuntimeRequest, SendPromptRequest,
+    RUNTIME_PROTOCOL_VERSION, RevocationReceipt, RuntimeEnvelope, RuntimeFailure, RuntimeMessage,
+    RuntimeReply, RuntimeRequest, SendPromptRequest,
 };
 use agentdeck_protocol::{ActionDecision, ActionDecisionKind};
 use async_trait::async_trait;
@@ -40,7 +50,7 @@ use async_trait::async_trait;
 use remote_pairing::{
     DEVICE_COMMAND_EPOCH, DEVICE_COMMAND_KEY, DEVICE_REPLY_EPOCH, DEVICE_REPLY_KEY, DEVICE_ROUTE,
     DeterministicRng, INSTALLATION_ID, KEY_DIRECTORY_REVISION, MACHINE_ROUTE, PairingFixture,
-    PanicRng,
+    PanicRng, RELAY_SERVER, ROOT_KEY_ID,
 };
 
 const REPLY_COUNTER: u64 = 41;
@@ -49,6 +59,42 @@ const WRONG_REQUEST_ROUTE: RequestRouteId = RequestRouteId::from_bytes([0xa5; 16
 struct PanicOnNthStateActive {
     target: usize,
     calls: AtomicUsize,
+}
+
+struct AssertShutdownBeforeCleanup {
+    shutdown_observed: Arc<AtomicBool>,
+    cleanup_stages: AtomicUsize,
+}
+
+impl AssertShutdownBeforeCleanup {
+    fn new(shutdown_observed: Arc<AtomicBool>) -> Self {
+        Self {
+            shutdown_observed,
+            cleanup_stages: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl PairedMutationObserver for AssertShutdownBeforeCleanup {
+    fn after_stage(&self, stage: PairedMutationStage) {
+        if matches!(
+            stage,
+            PairedMutationStage::CleanupJournalDurable
+                | PairedMutationStage::CleanupStateDeleted
+                | PairedMutationStage::CleanupCounterGuardDeleted
+                | PairedMutationStage::CleanupGrantDeleted
+                | PairedMutationStage::CleanupDeviceHpkeDeleted
+                | PairedMutationStage::CleanupDeviceSignDeleted
+                | PairedMutationStage::CleanupStorageKekDeleted
+                | PairedMutationStage::CleanupJournalDeleted
+        ) {
+            assert!(
+                self.shutdown_observed.load(Ordering::SeqCst),
+                "revocation cleanup must not start before transport shutdown completes"
+            );
+            self.cleanup_stages.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 impl PanicOnNthStateActive {
@@ -79,6 +125,16 @@ enum TransportScript {
     RouteAcceptedOnly,
     EofAfterSend,
     WrongRequestRouteOnly,
+    RevocationTerminalOnly(RevocationTerminalShape),
+}
+
+#[derive(Clone, Copy)]
+enum RevocationTerminalShape {
+    Exact,
+    ForgedSignature,
+    WrongDeviceRoute,
+    WrongGrantSerial,
+    NonExactBytes,
 }
 
 struct FakeTransport {
@@ -88,8 +144,9 @@ struct FakeTransport {
     expected_command_counter: u64,
     reply_counter: u64,
     device_sign_verifying_key: VerifyingKey,
-    inbound: VecDeque<OpaqueRouteFrame>,
+    inbound: VecDeque<ReceivedRuntimeFrame>,
     sent_codec_frames: Arc<Mutex<Vec<Vec<u8>>>>,
+    shutdown_observed: Option<Arc<AtomicBool>>,
 }
 
 impl FakeTransport {
@@ -175,9 +232,15 @@ impl FakeTransport {
                 device_sign_verifying_key,
                 inbound: VecDeque::new(),
                 sent_codec_frames: Arc::clone(&sent_codec_frames),
+                shutdown_observed: None,
             },
             sent_codec_frames,
         )
+    }
+
+    fn with_shutdown_observer(mut self, shutdown_observed: Arc<AtomicBool>) -> Self {
+        self.shutdown_observed = Some(shutdown_observed);
+        self
     }
 
     fn inspect_real_send(&self, frame: &OpaqueRouteFrame) -> (RequestRouteId, MessageId) {
@@ -246,51 +309,58 @@ impl FakeTransport {
     fn queue_scripted_inbound(&mut self, request_route: RequestRouteId, message_id: MessageId) {
         let accepted = route_accepted(request_route);
         match self.script {
-            TransportScript::ReplyOnly => self.inbound.push_back(reply_frame(
+            TransportScript::ReplyOnly => self.inbound.push_back(received_exact(reply_frame(
                 request_route,
                 message_id,
                 self.reply.clone(),
                 ReplyShape::Valid,
                 self.reply_counter,
-            )),
+            ))),
             TransportScript::ReplyOnlyWithShape(shape) => {
-                self.inbound.push_back(reply_frame(
+                self.inbound.push_back(received_exact(reply_frame(
                     request_route,
                     message_id,
                     self.reply.clone(),
                     shape,
                     self.reply_counter,
-                ));
+                )));
             }
             TransportScript::ReplyThenRouteAccepted => {
-                self.inbound.push_back(reply_frame(
+                self.inbound.push_back(received_exact(reply_frame(
                     request_route,
                     message_id,
                     self.reply.clone(),
                     ReplyShape::Valid,
                     self.reply_counter,
-                ));
-                self.inbound.push_back(accepted);
+                )));
+                self.inbound.push_back(received_exact(accepted));
             }
             TransportScript::RouteAcceptedThenReply => {
-                self.inbound.push_back(accepted);
-                self.inbound.push_back(reply_frame(
+                self.inbound.push_back(received_exact(accepted));
+                self.inbound.push_back(received_exact(reply_frame(
                     request_route,
                     message_id,
                     self.reply.clone(),
                     ReplyShape::Valid,
                     self.reply_counter,
-                ));
+                )));
             }
-            TransportScript::RouteAcceptedOnly => self.inbound.push_back(accepted),
+            TransportScript::RouteAcceptedOnly => {
+                self.inbound.push_back(received_exact(accepted));
+            }
             TransportScript::EofAfterSend => {}
-            TransportScript::WrongRequestRouteOnly => self.inbound.push_back(reply_frame(
-                WRONG_REQUEST_ROUTE,
-                message_id,
-                self.reply.clone(),
-                ReplyShape::Valid,
-                self.reply_counter,
-            )),
+            TransportScript::WrongRequestRouteOnly => {
+                self.inbound.push_back(received_exact(reply_frame(
+                    WRONG_REQUEST_ROUTE,
+                    message_id,
+                    self.reply.clone(),
+                    ReplyShape::Valid,
+                    self.reply_counter,
+                )));
+            }
+            TransportScript::RevocationTerminalOnly(shape) => {
+                self.inbound.push_back(revocation_terminal(shape));
+            }
         }
     }
 }
@@ -309,8 +379,14 @@ impl RemoteRuntimeTransport for FakeTransport {
         Ok(())
     }
 
-    async fn recv(&mut self) -> Result<Option<OpaqueRouteFrame>, RemoteRuntimeTransportError> {
+    async fn recv(&mut self) -> Result<Option<ReceivedRuntimeFrame>, RemoteRuntimeTransportError> {
         Ok(self.inbound.pop_front())
+    }
+
+    async fn shutdown(&mut self) {
+        if let Some(shutdown_observed) = &self.shutdown_observed {
+            shutdown_observed.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -437,6 +513,72 @@ fn route_accepted(request_route: RequestRouteId) -> OpaqueRouteFrame {
     }
 }
 
+fn received_exact(frame: OpaqueRouteFrame) -> ReceivedRuntimeFrame {
+    let canonical_bytes = encode(&frame);
+    ReceivedRuntimeFrame::from_untrusted_parts(frame, canonical_bytes)
+}
+
+fn revocation_terminal(shape: RevocationTerminalShape) -> ReceivedRuntimeFrame {
+    let device_route = if matches!(shape, RevocationTerminalShape::WrongDeviceRoute) {
+        DeviceRouteId::from_bytes([0xb1; 16])
+    } else {
+        DEVICE_ROUTE
+    };
+    let grant_serial = if matches!(shape, RevocationTerminalShape::WrongGrantSerial) {
+        RelayGrantSerial::new(8)
+    } else {
+        RelayGrantSerial::new(7)
+    };
+    let mut revocation = DeviceRevocation {
+        machine_route: MACHINE_ROUTE,
+        device_route,
+        grant_serial,
+        root_key_id: ROOT_KEY_ID,
+        trust_epoch: agentdeck_protocol::relay_v2::TrustEpoch::new(2),
+        signature: Ed25519Signature([0; 64]),
+    };
+    let signing_key = if matches!(shape, RevocationTerminalShape::ForgedSignature) {
+        SigningKey::from_seed(&[0xb2; 32])
+    } else {
+        PairingFixture::root_signing_key()
+    };
+    let root_fingerprint = sha256(
+        &PairingFixture::root_signing_key()
+            .verifying_key()
+            .to_bytes(),
+    );
+    revocation.signature = sign_tbs(
+        &signing_key,
+        &revocation.to_be_signed_v1(RELAY_SERVER, root_fingerprint),
+    )
+    .into();
+    let frame = OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::RevocationCommitted(RevocationCommitted {
+            device_route,
+            grant_serial,
+            signed_revocation: revocation,
+        }),
+    };
+    let mut canonical_bytes = encode(&frame);
+    if matches!(shape, RevocationTerminalShape::NonExactBytes) {
+        canonical_bytes.push(0);
+    }
+    ReceivedRuntimeFrame::from_untrusted_parts(frame, canonical_bytes)
+}
+
+fn revoke_self_request() -> RuntimeRequest {
+    RuntimeRequest::Revoke(RevokeRequest {
+        target: RevokeTarget::SelfDevice,
+    })
+}
+
+fn committed_revocation_receipt() -> RuntimeReply {
+    RuntimeReply::Revocation(RevocationReceipt::Committed {
+        grant_serial: RuntimeGrantSerial::new(7),
+    })
+}
+
 fn prompt_request() -> SendPromptRequest {
     SendPromptRequest {
         conversation_id: ConversationId::new("conversation-remote-runtime"),
@@ -521,6 +663,123 @@ fn state_root(temp: &tempfile::TempDir) -> PathBuf {
         .join("paired-state")
 }
 
+fn paired_account(fixture: &PairingFixture, purpose: PairedRemoteKeyPurpose) -> RemoteKeyAccount {
+    let identity = fixture.identity();
+    RemoteKeyAccount::paired(
+        INSTALLATION_ID,
+        identity.machine_root_fingerprint(),
+        identity.machine_route(),
+        purpose,
+    )
+}
+
+type PairedMaterialSnapshot = Vec<(PairedRemoteKeyPurpose, Option<Vec<u8>>)>;
+type CryptoStateSnapshot = Vec<(String, Vec<u8>)>;
+type MachineArtifactSnapshot = (PairedMaterialSnapshot, CryptoStateSnapshot);
+
+fn paired_materials(
+    store: &dyn RemoteKeyStore,
+    fixture: &PairingFixture,
+) -> PairedMaterialSnapshot {
+    [
+        PairedRemoteKeyPurpose::DeviceSignPrivateKey,
+        PairedRemoteKeyPurpose::DeviceHpkePrivateKey,
+        PairedRemoteKeyPurpose::DeviceGrant,
+        PairedRemoteKeyPurpose::DeviceStorageKek,
+        PairedRemoteKeyPurpose::CounterGuard,
+        PairedRemoteKeyPurpose::CommitMarker,
+    ]
+    .into_iter()
+    .map(|purpose| {
+        let value = store
+            .load(&paired_account(fixture, purpose))
+            .expect("read paired material")
+            .map(|secret| secret.expose_secret().to_vec());
+        (purpose, value)
+    })
+    .collect()
+}
+
+fn crypto_state_files(root: &std::path::Path) -> CryptoStateSnapshot {
+    fn visit(root: &std::path::Path, entries: &mut Vec<(String, Vec<u8>)>) {
+        if !root.exists() {
+            return;
+        }
+        for entry in
+            fs::read_dir(root).unwrap_or_else(|error| panic!("read {}: {error}", root.display()))
+        {
+            let path = entry.expect("read state entry").path();
+            let metadata = fs::symlink_metadata(&path).expect("state entry metadata");
+            if metadata.is_dir() {
+                visit(&path, entries);
+            } else if metadata.is_file()
+                && path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.ends_with(".crypto-state.v1") || name.ends_with(".crypto-state-stage.v1")
+                })
+            {
+                entries.push((
+                    path.to_string_lossy().into_owned(),
+                    fs::read(&path).expect("read crypto-state artifact"),
+                ));
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(root, &mut entries);
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
+fn machine_artifacts(
+    store: &dyn RemoteKeyStore,
+    state_root: &std::path::Path,
+    fixture: &PairingFixture,
+) -> MachineArtifactSnapshot {
+    (
+        paired_materials(store, fixture),
+        crypto_state_files(state_root),
+    )
+}
+
+fn assert_machine_active(
+    store: &dyn RemoteKeyStore,
+    state_root: &std::path::Path,
+    fixture: &PairingFixture,
+) {
+    let paired = PairedMachineStore::new(store, INSTALLATION_ID, state_root);
+    assert_eq!(paired.list().expect("list paired machine").len(), 1);
+    drop(
+        paired
+            .open_exact(fixture.identity())
+            .expect("paired machine remains openable"),
+    );
+}
+
+fn assert_cleanup_complete(
+    store: &dyn RemoteKeyStore,
+    state_root: &std::path::Path,
+    fixture: &PairingFixture,
+) {
+    assert!(
+        paired_materials(store, fixture)
+            .into_iter()
+            .all(|(_, value)| value.is_none()),
+        "signed terminal cleanup must remove every paired Keychain item"
+    );
+    assert!(
+        crypto_state_files(state_root).is_empty(),
+        "signed terminal cleanup must remove active state and prepared sidecar"
+    );
+    assert!(
+        PairedMachineStore::new(store, INSTALLATION_ID, state_root)
+            .list()
+            .expect("list after cleanup")
+            .is_empty()
+    );
+}
+
 fn assert_accepted_outcome(outcome: &RemotePromptOutcome, route_accepted: bool) {
     assert_eq!(outcome.route_accepted(), route_accepted);
     assert!(matches!(
@@ -544,6 +803,273 @@ fn one_sent_codec_frame(recorder: &Arc<Mutex<Vec<Vec<u8>>>>) -> Vec<u8> {
     let frames = recorder.lock().expect("sent-frame recorder");
     assert_eq!(frames.len(), 1, "one prompt attempt emits one frozen Send");
     frames[0].clone()
+}
+
+#[tokio::test]
+async fn revoke_self_route_accepted_then_eof_is_outcome_unknown_without_cleanup() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xb0);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let (transport, sent) = FakeTransport::new_runtime(
+        TransportScript::RouteAcceptedOnly,
+        revoke_self_request(),
+        committed_revocation_receipt(),
+        device_sign,
+    );
+    let shutdown_observed = Arc::new(AtomicBool::new(false));
+    let transport = transport.with_shutdown_observer(Arc::clone(&shutdown_observed));
+    let mut rng = DeterministicRng::new([0xb1; 32]);
+
+    assert!(matches!(
+        RemoteRuntime::new(opened, transport)
+            .revoke_self(&mut rng)
+            .await,
+        Err(RemoteRuntimeError::OutcomeUnknown)
+    ));
+    assert!(
+        shutdown_observed.load(Ordering::SeqCst),
+        "outcome-unknown self-revoke must still await transport shutdown"
+    );
+    let _ = one_sent_codec_frame(&sent);
+    assert_machine_active(&store, &root, &fixture);
+}
+
+#[tokio::test]
+async fn authenticated_revocation_committed_receipt_then_eof_still_does_not_cleanup() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xb2);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let (transport, _sent) = FakeTransport::new_runtime(
+        TransportScript::ReplyOnly,
+        revoke_self_request(),
+        committed_revocation_receipt(),
+        device_sign,
+    );
+    let mut rng = DeterministicRng::new([0xb3; 32]);
+
+    assert!(matches!(
+        RemoteRuntime::new(opened, transport)
+            .revoke_self(&mut rng)
+            .await,
+        Err(RemoteRuntimeError::OutcomeUnknown)
+    ));
+    assert_machine_active(&store, &root, &fixture);
+}
+
+#[tokio::test]
+async fn rejected_revocation_terminals_do_not_mutate_the_pending_machine() {
+    for (index, shape) in [
+        RevocationTerminalShape::ForgedSignature,
+        RevocationTerminalShape::WrongDeviceRoute,
+        RevocationTerminalShape::WrongGrantSerial,
+        RevocationTerminalShape::NonExactBytes,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, 0xb4 + index as u8);
+
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open promoted machine");
+        let (first_transport, first_sent) = FakeTransport::new_runtime(
+            TransportScript::EofAfterSend,
+            revoke_self_request(),
+            committed_revocation_receipt(),
+            device_sign,
+        );
+        let mut first_rng = DeterministicRng::new([0xc0 + index as u8; 32]);
+        assert!(matches!(
+            RemoteRuntime::new(opened, first_transport)
+                .revoke_self(&mut first_rng)
+                .await,
+            Err(RemoteRuntimeError::OutcomeUnknown)
+        ));
+        let frozen = one_sent_codec_frame(&first_sent);
+
+        let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("reopen pending self-revoke");
+        let before = machine_artifacts(&store, &root, &fixture);
+        let (bad_transport, bad_sent) = FakeTransport::new_runtime(
+            TransportScript::RevocationTerminalOnly(shape),
+            revoke_self_request(),
+            committed_revocation_receipt(),
+            device_sign,
+        );
+        let mut panic_rng = PanicRng;
+        assert!(
+            RemoteRuntime::new(reopened, bad_transport)
+                .revoke_self(&mut panic_rng)
+                .await
+                .is_err(),
+            "forged, wrong-bound, or non-exact terminal must be rejected"
+        );
+        assert_eq!(
+            one_sent_codec_frame(&bad_sent),
+            frozen,
+            "terminal rejection retry must reuse the frozen Send"
+        );
+        assert_eq!(
+            machine_artifacts(&store, &root, &fixture),
+            before,
+            "terminal rejection must not perform any further persistent mutation"
+        );
+        assert_machine_active(&store, &root, &fixture);
+    }
+}
+
+#[tokio::test]
+async fn outcome_unknown_restart_reuses_exact_send_and_only_exact_terminal_cleans_up() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xb8);
+
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let (first_transport, first_sent) = FakeTransport::new_runtime(
+        TransportScript::EofAfterSend,
+        revoke_self_request(),
+        committed_revocation_receipt(),
+        device_sign,
+    );
+    let mut first_rng = DeterministicRng::new([0xc8; 32]);
+    assert!(matches!(
+        RemoteRuntime::new(opened, first_transport)
+            .revoke_self(&mut first_rng)
+            .await,
+        Err(RemoteRuntimeError::OutcomeUnknown)
+    ));
+    let frozen = one_sent_codec_frame(&first_sent);
+
+    let shutdown_observed = Arc::new(AtomicBool::new(false));
+    let cleanup_observer = Arc::new(AssertShutdownBeforeCleanup::new(Arc::clone(
+        &shutdown_observed,
+    )));
+    let reopened = PairedMachineStore::new_with_mutation_observer(
+        &store,
+        INSTALLATION_ID,
+        &root,
+        cleanup_observer.clone(),
+    )
+    .open_exact(fixture.identity())
+    .expect("reopen pending self-revoke");
+    let (terminal_transport, retry_sent) = FakeTransport::new_runtime(
+        TransportScript::RevocationTerminalOnly(RevocationTerminalShape::Exact),
+        revoke_self_request(),
+        committed_revocation_receipt(),
+        device_sign,
+    );
+    let terminal_transport =
+        terminal_transport.with_shutdown_observer(Arc::clone(&shutdown_observed));
+    let mut panic_rng = PanicRng;
+    RemoteRuntime::new(reopened, terminal_transport)
+        .revoke_self(&mut panic_rng)
+        .await
+        .expect("exact root-signed terminal commits cleanup");
+
+    assert_eq!(
+        one_sent_codec_frame(&retry_sent),
+        frozen,
+        "outcome-unknown restart must reuse exact requestRoute/counter/ciphertext/proof bytes"
+    );
+    assert!(shutdown_observed.load(Ordering::SeqCst));
+    assert!(
+        cleanup_observer.cleanup_stages.load(Ordering::SeqCst) > 0,
+        "successful self-revoke must execute observed cleanup stages"
+    );
+    assert_cleanup_complete(&store, &root, &fixture);
+}
+
+#[tokio::test]
+async fn revoke_self_failure_replies_are_durable_terminals_without_cleanup() {
+    for (index, reply) in [
+        RuntimeReply::Failure(RuntimeFailure::new(
+            "daemon.revocation.rejected",
+            "fixture rejects self revocation",
+        )),
+        RuntimeReply::Revocation(RevocationReceipt::Failed {
+            failure: RuntimeFailure::new(
+                "daemon.revocation.store_failed",
+                "fixture revocation transaction failed",
+            ),
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, 0xba + index as u8);
+        let expected_failure = match &reply {
+            RuntimeReply::Failure(failure)
+            | RuntimeReply::Revocation(RevocationReceipt::Failed { failure }) => failure.clone(),
+            _ => unreachable!("failure fixture"),
+        };
+
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open promoted machine");
+        let (transport, _sent) = FakeTransport::new_runtime(
+            TransportScript::ReplyOnly,
+            revoke_self_request(),
+            reply,
+            device_sign,
+        );
+        let mut rng = DeterministicRng::new([0xca + index as u8; 32]);
+        assert!(matches!(
+            RemoteRuntime::new(opened, transport)
+                .revoke_self(&mut rng)
+                .await,
+            Err(RemoteRuntimeError::DaemonFailure(observed))
+                if observed.code == expected_failure.code
+                    && observed.message == expected_failure.message
+        ));
+        assert_machine_active(&store, &root, &fixture);
+
+        let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("reopen durable failed self-revoke");
+        let (unused_transport, replay_sent) = FakeTransport::new_runtime(
+            TransportScript::EofAfterSend,
+            revoke_self_request(),
+            committed_revocation_receipt(),
+            device_sign,
+        );
+        let mut panic_rng = PanicRng;
+        assert!(matches!(
+            RemoteRuntime::new(reopened, unused_transport)
+                .revoke_self(&mut panic_rng)
+                .await,
+            Err(RemoteRuntimeError::DaemonFailure(observed))
+                if observed.code == expected_failure.code
+                    && observed.message == expected_failure.message
+        ));
+        assert!(
+            replay_sent.lock().expect("sent-frame recorder").is_empty(),
+            "durable self-revoke failure must replay locally without transport or entropy"
+        );
+        assert_machine_active(&store, &root, &fixture);
+    }
 }
 
 #[tokio::test]
