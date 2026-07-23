@@ -384,6 +384,59 @@ async fn pinned_wss_is_binary_only_auto_pongs_and_reconnects_with_a_fresh_challe
 }
 
 #[tokio::test]
+async fn principal_sends_frozen_codec_bytes_without_reencoding() {
+    let identity = test_identity();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind frozen-wire mock");
+    let port = listener.local_addr().expect("frozen-wire address").port();
+    let acceptor = TlsAcceptor::from(Arc::clone(&identity.server_config));
+    let application = wire(RelayFrameBody::Ping(Ping {
+        nonce: 0x0102_0304_0506_0708,
+    }));
+    let frozen = encode(&application);
+    let expected = frozen.clone();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_tls_ws(&listener, &acceptor).await;
+        authenticate_principal(&mut socket, 0x70).await;
+        match tokio::time::timeout(TEST_TIMEOUT, socket.next())
+            .await
+            .expect("frozen-wire receive timeout")
+        {
+            Some(Ok(Message::Binary(actual))) => assert_eq!(actual.as_ref(), expected.as_slice()),
+            other => panic!("unexpected frozen-wire message: {other:?}"),
+        }
+    });
+
+    let policy = RelayTlsPolicy::pinned_spki(vec![identity.spki_pin]).expect("frozen-wire pin");
+    let authenticator = Arc::new(TestAuthenticator::default());
+    let mut client = RelayClient::connect(client_config(port, policy), authenticator)
+        .await
+        .expect("connect frozen-wire principal");
+
+    let mut trailing = frozen.clone();
+    trailing.push(0);
+    assert_eq!(
+        client
+            .send_encoded(trailing)
+            .await
+            .expect_err("trailing bytes must fail before the writer")
+            .code(),
+        "relay.client.frame_invalid"
+    );
+    client
+        .send_encoded(frozen)
+        .await
+        .expect("flush exact frozen bytes");
+
+    tokio::time::timeout(TEST_TIMEOUT, server)
+        .await
+        .expect("frozen-wire server completion")
+        .expect("frozen-wire server task");
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn shutdown_joins_connection_tasks_closes_the_socket_and_is_idempotent() {
     let identity = test_identity();
     let listener = TcpListener::bind("127.0.0.1:0")

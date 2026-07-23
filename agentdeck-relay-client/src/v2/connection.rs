@@ -21,6 +21,7 @@ use zeroize::Zeroizing;
 
 use super::transport::{
     BinarySocket, Socket, encode_checked, is_protocol_ping, post_enrollment, protocol_pong,
+    validate_encoded,
 };
 use super::{
     EnrollmentClientConfig, HANDSHAKE_TIMEOUT, IO_TIMEOUT, LinkAuthenticator, RelayClientConfig,
@@ -135,6 +136,15 @@ impl ActiveConnection {
 
     async fn send(&self, frame: OpaqueRouteFrame) -> Result<(), RelayClientError> {
         let bytes = encode_checked(&frame)?;
+        self.enqueue_binary(bytes).await
+    }
+
+    async fn send_encoded(&self, bytes: Vec<u8>) -> Result<(), RelayClientError> {
+        validate_encoded(&bytes)?;
+        self.enqueue_binary(bytes).await
+    }
+
+    async fn enqueue_binary(&self, bytes: Vec<u8>) -> Result<(), RelayClientError> {
         let budget = reserve_bytes(
             &self.outbound_budget,
             bytes.len(),
@@ -536,6 +546,19 @@ impl RelayClient {
             .as_ref()
             .ok_or_else(|| RelayClientError::new("relay.client.not_connected"))?
             .send(frame)
+            .await
+    }
+
+    /// 发送已由上层 durable state 冻结的 canonical Relay codec bytes。
+    ///
+    /// 本方法在进入 writer queue 前完成严格 codec/size 校验；成功后 WebSocket writer
+    /// 使用调用方传入的同一字节串，不把 frame decode 后重新编码。该边界用于保证崩溃
+    /// 恢复与 outcome-unknown retry 不会改变 ciphertext、proof 或 request route。
+    pub async fn send_encoded(&self, bytes: Vec<u8>) -> Result<(), RelayClientError> {
+        self.connection
+            .as_ref()
+            .ok_or_else(|| RelayClientError::new("relay.client.not_connected"))?
+            .send_encoded(bytes)
             .await
     }
 

@@ -125,6 +125,16 @@ pub(crate) fn encode_checked(frame: &OpaqueRouteFrame) -> Result<Vec<u8>, RelayC
     Ok(bytes)
 }
 
+/// 校验调用方已经冻结的 Relay codec bytes，但不重建或替换待发送字节。
+pub(crate) fn validate_encoded(bytes: &[u8]) -> Result<(), RelayClientError> {
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(RelayClientError::new("relay.client.frame_too_large"));
+    }
+    decode(bytes)
+        .map(|_| ())
+        .map_err(|_| RelayClientError::new("relay.client.frame_invalid"))
+}
+
 pub(crate) fn is_protocol_ping(frame: &OpaqueRouteFrame) -> Option<u64> {
     match frame.body {
         RelayFrameBody::Ping(ref ping) => Some(ping.nonce),
