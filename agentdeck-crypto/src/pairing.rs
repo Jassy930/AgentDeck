@@ -11,7 +11,7 @@ use agentdeck_protocol::e2ee::{
 };
 use agentdeck_protocol::relay_v2::auth::{Ed25519Signature, RelayGrant};
 use agentdeck_protocol::relay_v2::id::RelayServerId;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::canonical::sha256;
 use crate::error::CryptoError;
@@ -38,6 +38,30 @@ fn hpke_envelope(enc: &[u8], ciphertext: &[u8]) -> HpkeEnvelopeV1 {
     HpkeEnvelopeV1 {
         enc: enc.to_vec(),
         ciphertext: ciphertext.to_vec(),
+    }
+}
+
+struct SensitivePairRequestPlaintext(Option<PairRequestPlaintextV1>);
+
+impl SensitivePairRequestPlaintext {
+    fn new(value: PairRequestPlaintextV1) -> Self {
+        Self(Some(value))
+    }
+
+    fn as_ref(&self) -> &PairRequestPlaintextV1 {
+        self.0.as_ref().expect("sensitive plaintext is present")
+    }
+
+    fn into_inner(mut self) -> PairRequestPlaintextV1 {
+        self.0.take().expect("sensitive plaintext is present")
+    }
+}
+
+impl Drop for SensitivePairRequestPlaintext {
+    fn drop(&mut self) {
+        if let Some(value) = &mut self.0 {
+            value.invite_secret.zeroize();
+        }
     }
 }
 
@@ -164,17 +188,19 @@ pub fn open_pair_request(
         &context.encode_aad(),
         &hpke_envelope(&envelope.enc, &envelope.ciphertext),
     )?);
-    let plaintext = PairRequestPlaintextV1::from_canonical_bytes(&opened)
-        .map_err(|_| CryptoError::BadCiphertext)?;
-    if &plaintext.invite_secret != expected_invite_secret {
+    let plaintext = SensitivePairRequestPlaintext::new(
+        PairRequestPlaintextV1::from_canonical_bytes(&opened)
+            .map_err(|_| CryptoError::BadCiphertext)?,
+    );
+    if &plaintext.as_ref().invite_secret != expected_invite_secret {
         return Err(CryptoError::BadCiphertext);
     }
-    let verifying_key = VerifyingKey::from_bytes(&plaintext.device_sign_pubkey.0)?;
-    let fingerprint = plaintext.device_sign_fingerprint();
+    let verifying_key = VerifyingKey::from_bytes(&plaintext.as_ref().device_sign_pubkey.0)?;
+    let fingerprint = plaintext.as_ref().device_sign_fingerprint();
     require_signer(&verifying_key, fingerprint)?;
     let tbs = envelope.proof_tbs(info, context, fingerprint)?;
     verify_validated_pairing_tbs(&verifying_key, &tbs, &envelope.device_proof_signature)?;
-    Ok(plaintext)
+    Ok(plaintext.into_inner())
 }
 
 /// 验证并冻结 Store 可接受的 PairRequest type-state。
@@ -185,10 +211,16 @@ pub fn open_pair_request_verified(
     expected_invite_secret: &[u8; 32],
     envelope: &PairRequestV1,
 ) -> Result<VerifiedPairRequestV1, CryptoError> {
-    let plaintext = open_pair_request(recipient, info, context, expected_invite_secret, envelope)?;
+    let plaintext = SensitivePairRequestPlaintext::new(open_pair_request(
+        recipient,
+        info,
+        context,
+        expected_invite_secret,
+        envelope,
+    )?);
     let canonical_request = envelope.canonical_bytes()?;
     let request_hash = sha256(&canonical_request);
-    let canonical_plaintext = Zeroizing::new(plaintext.canonical_bytes()?);
+    let canonical_plaintext = Zeroizing::new(plaintext.as_ref().canonical_bytes()?);
     Ok(VerifiedPairRequestV1 {
         canonical_request,
         request_hash,

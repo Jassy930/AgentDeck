@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::e2ee::context::{OuterContextV1, OuterFrameKind};
 use crate::e2ee::keys::KeyDirectoryV1;
@@ -622,6 +623,30 @@ impl std::fmt::Debug for PairRequestPlaintextV1 {
     }
 }
 
+struct SensitivePairRequestPlaintext(Option<PairRequestPlaintextV1>);
+
+impl SensitivePairRequestPlaintext {
+    fn new(value: PairRequestPlaintextV1) -> Self {
+        Self(Some(value))
+    }
+
+    fn as_ref(&self) -> &PairRequestPlaintextV1 {
+        self.0.as_ref().expect("sensitive plaintext is present")
+    }
+
+    fn into_inner(mut self) -> PairRequestPlaintextV1 {
+        self.0.take().expect("sensitive plaintext is present")
+    }
+}
+
+impl Drop for SensitivePairRequestPlaintext {
+    fn drop(&mut self) {
+        if let Some(value) = &mut self.0 {
+            value.invite_secret.zeroize();
+        }
+    }
+}
+
 impl PairRequestPlaintextV1 {
     pub fn validate(&self) -> Result<(), PairingError> {
         if self.format_version != E2EE_FORMAT_VERSION {
@@ -651,19 +676,24 @@ impl PairRequestPlaintextV1 {
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, PairingError> {
         let mut decoder = Decoder::new(bytes);
         decoder.domain(b"AgentDeck/PairRequestPlaintextV1\0")?;
-        let value = Self {
-            format_version: decoder.u16()?,
-            invite_secret: decoder.fixed()?,
-            device_sign_pubkey: PublicKeyBytes(decoder.fixed()?),
-            device_hpke_pubkey: PublicKeyBytes(decoder.fixed()?),
-            authorization_request: AuthorizationRequestV1::from_canonical_bytes(
-                decoder.bytes(4 * 1_024)?,
-            )?,
-        };
+        let format_version = decoder.u16()?;
+        let invite_secret = Zeroizing::new(decoder.fixed()?);
+        let device_sign_pubkey = PublicKeyBytes(decoder.fixed()?);
+        let device_hpke_pubkey = PublicKeyBytes(decoder.fixed()?);
+        let authorization_request =
+            AuthorizationRequestV1::from_canonical_bytes(decoder.bytes(4 * 1_024)?)?;
         decoder.finish()?;
-        value.validate()?;
-        ensure_canonical(bytes, &value.canonical_bytes()?)?;
-        Ok(value)
+        let value = SensitivePairRequestPlaintext::new(Self {
+            format_version,
+            invite_secret: *invite_secret,
+            device_sign_pubkey,
+            device_hpke_pubkey,
+            authorization_request,
+        });
+        value.as_ref().validate()?;
+        let canonical = Zeroizing::new(value.as_ref().canonical_bytes()?);
+        ensure_canonical(bytes, canonical.as_slice())?;
+        Ok(value.into_inner())
     }
 
     pub fn device_sign_fingerprint(&self) -> [u8; 32] {
