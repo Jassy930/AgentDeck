@@ -1349,6 +1349,145 @@
             }
           ]
         },
+        "StreamBindingInnerCursorSchema": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "catalog"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "conversationId": {
+                  "maxLength": 1024,
+                  "minLength": 1,
+                  "type": "string",
+                  "x-maxUtf8Bytes": 1024
+                },
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "conversation"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "conversationId",
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "StreamBindingKeyIdSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "epoch": {
+              "format": "uint64",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "purpose": {
+              "$ref": "#/definitions/KeyPurpose"
+            }
+          },
+          "required": [
+            "epoch",
+            "purpose"
+          ],
+          "type": "object"
+        },
+        "StreamBindingV1": {
+          "additionalProperties": false,
+          "properties": {
+            "deviceRoute": {
+              "type": "string"
+            },
+            "formatVersion": {
+              "format": "uint16",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "grantSerial": {
+              "format": "uint64",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "innerCursor": {
+              "$ref": "#/definitions/StreamBindingInnerCursorSchema"
+            },
+            "keyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "keyId": {
+              "$ref": "#/definitions/StreamBindingKeyIdSchema"
+            },
+            "machineRoute": {
+              "type": "string"
+            },
+            "relayProtocolVersion": {
+              "format": "uint16",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "rootTrustEpoch": {
+              "format": "uint64",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "runtimeProtocolVersion": {
+              "format": "uint16",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "streamCursor": {
+              "$ref": "#/definitions/StreamCursor"
+            },
+            "streamGeneration": {
+              "type": "string"
+            },
+            "streamRoute": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "deviceRoute",
+            "formatVersion",
+            "grantSerial",
+            "innerCursor",
+            "keyDirectoryRevision",
+            "keyId",
+            "machineRoute",
+            "relayProtocolVersion",
+            "rootTrustEpoch",
+            "runtimeProtocolVersion",
+            "streamCursor",
+            "streamGeneration",
+            "streamRoute"
+          ],
+          "type": "object"
+        },
         "StreamCursor": {
           "description": "zero-based stream/canonical sequence cursor。",
           "oneOf": [
@@ -1375,14 +1514,13 @@
           ]
         }
       },
-      "description": "密文内 key-control carrier。Relay outer 继续使用既有 opaque Reply/Publish family。",
       "oneOf": [
         {
           "additionalProperties": false,
           "properties": {
-            "format_version": {
+            "formatVersion": {
               "format": "uint16",
-              "minimum": 0.0,
+              "minimum": 1.0,
               "type": "integer"
             },
             "kind": {
@@ -1391,14 +1529,14 @@
               ],
               "type": "string"
             },
-            "update_set": {
+            "updateSet": {
               "$ref": "#/definitions/KeyUpdateSetV1"
             }
           },
           "required": [
-            "format_version",
+            "formatVersion",
             "kind",
-            "update_set"
+            "updateSet"
           ],
           "type": "object"
         },
@@ -1408,9 +1546,9 @@
             "barrier": {
               "$ref": "#/definitions/EpochBarrierV1"
             },
-            "format_version": {
+            "formatVersion": {
               "format": "uint16",
-              "minimum": 0.0,
+              "minimum": 1.0,
               "type": "integer"
             },
             "kind": {
@@ -1419,24 +1557,24 @@
               ],
               "type": "string"
             },
-            "stream_route": {
+            "streamRoute": {
               "type": "string"
             }
           },
           "required": [
             "barrier",
-            "format_version",
+            "formatVersion",
             "kind",
-            "stream_route"
+            "streamRoute"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
           "properties": {
-            "format_version": {
+            "formatVersion": {
               "format": "uint16",
-              "minimum": 0.0,
+              "minimum": 1.0,
               "type": "integer"
             },
             "kind": {
@@ -1450,9 +1588,34 @@
             }
           },
           "required": [
-            "format_version",
+            "formatVersion",
             "kind",
             "status"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "binding": {
+              "$ref": "#/definitions/StreamBindingV1"
+            },
+            "formatVersion": {
+              "format": "uint16",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "streamBinding"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "binding",
+            "formatVersion",
+            "kind"
           ],
           "type": "object"
         }
@@ -4006,6 +4169,207 @@
         "streamRoute"
       ],
       "title": "StreamAppliedAckV1",
+      "type": "object"
+    },
+    "StreamBindingV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "KeyPurpose": {
+          "description": "对称 key 用途（design §7.2）。每个用途一个发送方向。",
+          "oneOf": [
+            {
+              "description": "机器/session catalog 与状态快照。",
+              "enum": [
+                "catalog"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "每 conversation 的 daemon→device canonical events。",
+              "enum": [
+                "conversationDek"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、device→daemon 命令通道。",
+              "enum": [
+                "deviceCommandTx"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "单设备、daemon→device reply 通道。",
+              "enum": [
+                "deviceReplyTx"
+              ],
+              "type": "string"
+            }
+          ]
+        },
+        "StreamBindingInnerCursorSchema": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "catalog"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "conversationId": {
+                  "maxLength": 1024,
+                  "minLength": 1,
+                  "type": "string",
+                  "x-maxUtf8Bytes": 1024
+                },
+                "cursor": {
+                  "$ref": "#/definitions/StreamCursor"
+                },
+                "scope": {
+                  "enum": [
+                    "conversation"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "conversationId",
+                "cursor",
+                "scope"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "StreamBindingKeyIdSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "epoch": {
+              "format": "uint64",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "purpose": {
+              "$ref": "#/definitions/KeyPurpose"
+            }
+          },
+          "required": [
+            "epoch",
+            "purpose"
+          ],
+          "type": "object"
+        },
+        "StreamCursor": {
+          "description": "zero-based stream/canonical sequence cursor。",
+          "oneOf": [
+            {
+              "enum": [
+                "beforeFirst"
+              ],
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "at": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "at"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "properties": {
+        "deviceRoute": {
+          "type": "string"
+        },
+        "formatVersion": {
+          "format": "uint16",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "grantSerial": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "innerCursor": {
+          "$ref": "#/definitions/StreamBindingInnerCursorSchema"
+        },
+        "keyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "keyId": {
+          "$ref": "#/definitions/StreamBindingKeyIdSchema"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "relayProtocolVersion": {
+          "format": "uint16",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "rootTrustEpoch": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "runtimeProtocolVersion": {
+          "format": "uint16",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "streamCursor": {
+          "$ref": "#/definitions/StreamCursor"
+        },
+        "streamGeneration": {
+          "type": "string"
+        },
+        "streamRoute": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "deviceRoute",
+        "formatVersion",
+        "grantSerial",
+        "innerCursor",
+        "keyDirectoryRevision",
+        "keyId",
+        "machineRoute",
+        "relayProtocolVersion",
+        "rootTrustEpoch",
+        "runtimeProtocolVersion",
+        "streamCursor",
+        "streamGeneration",
+        "streamRoute"
+      ],
+      "title": "StreamBindingV1",
       "type": "object"
     },
     "ToBeSignedV1": {

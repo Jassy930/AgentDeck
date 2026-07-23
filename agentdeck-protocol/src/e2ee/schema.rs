@@ -80,6 +80,7 @@ pub fn e2ee_schema() -> serde_json::Value {
     insert_schema!("KeySyncRequestV1", key_control::KeySyncRequestV1);
     insert_schema!("KeyUpdateAckV1", key_control::KeyUpdateAckV1);
     insert_schema!("StreamAppliedAckV1", key_control::StreamAppliedAckV1);
+    insert_schema!("StreamBindingV1", key_control::StreamBindingV1);
     insert_schema!(
         "DeviceKeyRecoveryInfoV1",
         key_recovery::DeviceKeyRecoveryInfoV1

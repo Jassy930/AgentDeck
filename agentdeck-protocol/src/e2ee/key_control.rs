@@ -3,8 +3,12 @@
 //! 这些 DTO 只存在于 E2EE plaintext；Relay outer 继续只路由 opaque Publish/Send/Reply，
 //! 不新增可观察 key-control family。
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use schemars::{
+    JsonSchema,
+    r#gen::SchemaGenerator,
+    schema::{InstanceType, Schema, SchemaObject, StringValidation},
+};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::e2ee::keys::{EpochBarrierV1, KeyId, KeyPurpose, KeyUpdateV1};
@@ -29,10 +33,12 @@ pub const KEY_UPDATE_SET_MAX_KEYS: usize = 1_024 + 3;
 pub const KEY_UPDATE_SET_MAX_CANONICAL_BYTES: usize = 384 * 1_024;
 /// key-control 中 string-backed canonical identity 的 UTF-8 byte cap。
 pub const KEY_CONTROL_MAX_ID_BYTES: usize = 1_024;
+/// 单条 remote publication binding 的 canonical 上界。
+pub const STREAM_BINDING_MAX_CANONICAL_BYTES: usize = 8 * 1_024;
 
 const KEY_UPDATE_MAX_CANONICAL_BYTES: usize = 1_024;
 const KEY_CONTROL_MAX_CANONICAL_BYTES: usize = 2 * 1_024 * 1_024;
-const KEY_CONTROL_SMALL_CANONICAL_BYTES: usize = 8 * 1_024;
+const KEY_CONTROL_SMALL_CANONICAL_BYTES: usize = STREAM_BINDING_MAX_CANONICAL_BYTES;
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
@@ -273,14 +279,303 @@ impl DirectoryCurrentV1 {
     }
 }
 
+/// Remote endpoint 构造 Relay `Subscribe` 所需的 authenticated publication binding。
+///
+/// 该 carrier 只出现在 MachineDataSign + DeviceReplyTx 保护的定向 E2EE reply 内；
+/// `stream_generation` 是 Relay publication generation，绝不是 Runtime 本地 subscription
+/// generation。Catalog route 由 daemon 在此显式提供，不能从 Catalog key 的 `None` 猜测。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamBindingV1 {
+    pub format_version: u16,
+    pub runtime_protocol_version: u16,
+    pub relay_protocol_version: u16,
+    pub machine_route: MachineRouteId,
+    pub device_route: DeviceRouteId,
+    pub grant_serial: GrantSerial,
+    pub root_trust_epoch: TrustEpoch,
+    pub stream_route: StreamRouteId,
+    pub stream_generation: StreamGenerationId,
+    /// Relay outer committed/resume cursor。
+    pub stream_cursor: StreamCursor,
+    /// Runtime target 与该 target 的 inner canonical cursor。
+    pub inner_cursor: RuntimeInnerCursor,
+    pub key_directory_revision: KeyDirectoryRevision,
+    pub key_id: KeyId,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StreamBindingWire {
+    format_version: u16,
+    runtime_protocol_version: u16,
+    relay_protocol_version: u16,
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+    grant_serial: GrantSerial,
+    root_trust_epoch: TrustEpoch,
+    stream_route: StreamRouteId,
+    stream_generation: StreamGenerationId,
+    stream_cursor: StreamCursor,
+    inner_cursor: RuntimeInnerCursor,
+    key_directory_revision: KeyDirectoryRevision,
+    key_id: KeyId,
+}
+
+impl From<&StreamBindingV1> for StreamBindingWire {
+    fn from(value: &StreamBindingV1) -> Self {
+        Self {
+            format_version: value.format_version,
+            runtime_protocol_version: value.runtime_protocol_version,
+            relay_protocol_version: value.relay_protocol_version,
+            machine_route: value.machine_route,
+            device_route: value.device_route,
+            grant_serial: value.grant_serial,
+            root_trust_epoch: value.root_trust_epoch,
+            stream_route: value.stream_route,
+            stream_generation: value.stream_generation,
+            stream_cursor: value.stream_cursor,
+            inner_cursor: value.inner_cursor.clone(),
+            key_directory_revision: value.key_directory_revision,
+            key_id: value.key_id,
+        }
+    }
+}
+
+impl From<StreamBindingWire> for StreamBindingV1 {
+    fn from(value: StreamBindingWire) -> Self {
+        Self {
+            format_version: value.format_version,
+            runtime_protocol_version: value.runtime_protocol_version,
+            relay_protocol_version: value.relay_protocol_version,
+            machine_route: value.machine_route,
+            device_route: value.device_route,
+            grant_serial: value.grant_serial,
+            root_trust_epoch: value.root_trust_epoch,
+            stream_route: value.stream_route,
+            stream_generation: value.stream_generation,
+            stream_cursor: value.stream_cursor,
+            inner_cursor: value.inner_cursor,
+            key_directory_revision: value.key_directory_revision,
+            key_id: value.key_id,
+        }
+    }
+}
+
+impl Serialize for StreamBindingV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        StreamBindingWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StreamBindingV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Self::from(StreamBindingWire::deserialize(deserializer)?);
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(JsonSchema)]
+#[schemars(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
+struct StreamBindingSchema {
+    #[schemars(range(min = 1))]
+    format_version: u16,
+    #[schemars(range(min = 1))]
+    runtime_protocol_version: u16,
+    #[schemars(range(min = 1))]
+    relay_protocol_version: u16,
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+    #[schemars(range(min = 1))]
+    grant_serial: u64,
+    #[schemars(range(min = 1))]
+    root_trust_epoch: u64,
+    stream_route: StreamRouteId,
+    stream_generation: StreamGenerationId,
+    stream_cursor: StreamCursor,
+    inner_cursor: StreamBindingInnerCursorSchema,
+    #[schemars(range(min = 1))]
+    key_directory_revision: u64,
+    key_id: StreamBindingKeyIdSchema,
+}
+
+#[derive(JsonSchema)]
+#[schemars(tag = "scope", rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
+enum StreamBindingInnerCursorSchema {
+    Catalog {
+        cursor: StreamCursor,
+    },
+    Conversation {
+        #[schemars(rename = "conversationId")]
+        conversation_id: StreamBindingConversationIdSchema,
+        cursor: StreamCursor,
+    },
+}
+
+#[derive(JsonSchema)]
+#[schemars(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
+struct StreamBindingKeyIdSchema {
+    purpose: KeyPurpose,
+    #[schemars(range(min = 1))]
+    epoch: u64,
+}
+
+#[allow(dead_code)]
+struct StreamBindingConversationIdSchema;
+
+impl JsonSchema for StreamBindingConversationIdSchema {
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn schema_name() -> String {
+        "StreamBindingConversationId".to_owned()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                min_length: Some(1),
+                max_length: Some(KEY_CONTROL_MAX_ID_BYTES as u32),
+                ..Default::default()
+            })),
+            extensions: std::iter::once((
+                "x-maxUtf8Bytes".to_owned(),
+                serde_json::json!(KEY_CONTROL_MAX_ID_BYTES),
+            ))
+            .collect(),
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
+impl JsonSchema for StreamBindingV1 {
+    fn schema_name() -> String {
+        "StreamBindingV1".to_owned()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        StreamBindingSchema::json_schema(generator)
+    }
+}
+
+impl StreamBindingV1 {
+    pub fn validate(&self) -> Result<(), PairingError> {
+        validate_authority(
+            self.format_version,
+            self.runtime_protocol_version,
+            self.relay_protocol_version,
+            self.machine_route,
+            self.device_route,
+            self.grant_serial,
+            self.root_trust_epoch,
+        )?;
+        if is_zero(self.stream_route.as_bytes())
+            || is_zero(self.stream_generation.as_bytes())
+            || self.key_directory_revision.value() == 0
+            || self.key_id.epoch == 0
+            || self.stream_cursor.checked_next().is_err()
+        {
+            return Err(PairingError::InvalidField("stream binding"));
+        }
+
+        validate_inner_cursor(&self.inner_cursor)?;
+        let inner_stream_cursor = match (&self.inner_cursor, self.key_id.purpose) {
+            (RuntimeInnerCursor::Catalog { cursor }, KeyPurpose::Catalog) => cursor,
+            (RuntimeInnerCursor::Conversation { cursor, .. }, KeyPurpose::ConversationDek) => {
+                cursor
+            }
+            _ => {
+                return Err(PairingError::InvalidField(
+                    "stream binding target/key shape",
+                ));
+            }
+        };
+        if inner_stream_cursor.checked_next().is_err() {
+            return Err(PairingError::InvalidField(
+                "exhausted stream binding inner cursor",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PairingError> {
+        self.validate()?;
+        let mut encoder = Enc::new();
+        encoder.domain(b"AgentDeck/StreamBindingV1\0");
+        encode_authority(
+            &mut encoder,
+            AuthorityFields {
+                format_version: self.format_version,
+                runtime_protocol_version: self.runtime_protocol_version,
+                relay_protocol_version: self.relay_protocol_version,
+                machine_route: self.machine_route,
+                device_route: self.device_route,
+                grant_serial: self.grant_serial,
+                root_trust_epoch: self.root_trust_epoch,
+            },
+        );
+        encoder.bytes(self.stream_route.as_bytes());
+        encoder.bytes(self.stream_generation.as_bytes());
+        encoder.cursor(&self.stream_cursor);
+        encode_inner_cursor(&mut encoder, &self.inner_cursor);
+        encoder.u64(self.key_directory_revision.value());
+        encoder.u8(self.key_id.purpose.tag());
+        encoder.u64(self.key_id.epoch);
+        let bytes = encoder.finish();
+        if bytes.len() > STREAM_BINDING_MAX_CANONICAL_BYTES {
+            return Err(PairingError::SizeLimit("stream binding"));
+        }
+        Ok(bytes)
+    }
+
+    pub fn canonical_sha256(&self) -> Result<[u8; 32], PairingError> {
+        Ok(sha256(&self.canonical_bytes()?))
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, PairingError> {
+        if bytes.len() > STREAM_BINDING_MAX_CANONICAL_BYTES {
+            return Err(PairingError::SizeLimit("stream binding"));
+        }
+        let mut decoder = ControlDecoder::new(bytes);
+        decoder.domain(b"AgentDeck/StreamBindingV1\0")?;
+        let authority = decoder.authority()?;
+        let value = Self {
+            format_version: authority.format_version,
+            runtime_protocol_version: authority.runtime_protocol_version,
+            relay_protocol_version: authority.relay_protocol_version,
+            machine_route: authority.machine_route,
+            device_route: authority.device_route,
+            grant_serial: authority.grant_serial,
+            root_trust_epoch: authority.root_trust_epoch,
+            stream_route: StreamRouteId::from_bytes(decoder.fixed_bytes()?),
+            stream_generation: StreamGenerationId::from_bytes(decoder.fixed_bytes()?),
+            stream_cursor: decoder.cursor()?,
+            inner_cursor: decoder.inner_cursor()?,
+            key_directory_revision: KeyDirectoryRevision::new(decoder.u64()?),
+            key_id: KeyId {
+                purpose: decode_key_purpose(decoder.u8()?)?,
+                epoch: decoder.u64()?,
+            },
+        };
+        finish_small(value, decoder, bytes, Self::canonical_bytes)
+    }
+}
+
 /// 密文内 key-control carrier。Relay outer 继续使用既有 opaque Reply/Publish family。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyControlV1 {
     UpdateSet {
         format_version: u16,
@@ -295,6 +590,171 @@ pub enum KeyControlV1 {
         format_version: u16,
         status: DirectoryCurrentV1,
     },
+    StreamBinding {
+        format_version: u16,
+        binding: StreamBindingV1,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum KeyControlWire {
+    UpdateSet {
+        format_version: u16,
+        update_set: KeyUpdateSetV1,
+    },
+    EpochBarrier {
+        format_version: u16,
+        stream_route: StreamRouteId,
+        barrier: EpochBarrierV1,
+    },
+    DirectoryCurrent {
+        format_version: u16,
+        status: DirectoryCurrentV1,
+    },
+    StreamBinding {
+        format_version: u16,
+        binding: StreamBindingV1,
+    },
+}
+
+impl From<&KeyControlV1> for KeyControlWire {
+    fn from(value: &KeyControlV1) -> Self {
+        match value {
+            KeyControlV1::UpdateSet {
+                format_version,
+                update_set,
+            } => Self::UpdateSet {
+                format_version: *format_version,
+                update_set: update_set.clone(),
+            },
+            KeyControlV1::EpochBarrier {
+                format_version,
+                stream_route,
+                barrier,
+            } => Self::EpochBarrier {
+                format_version: *format_version,
+                stream_route: *stream_route,
+                barrier: barrier.clone(),
+            },
+            KeyControlV1::DirectoryCurrent {
+                format_version,
+                status,
+            } => Self::DirectoryCurrent {
+                format_version: *format_version,
+                status: status.clone(),
+            },
+            KeyControlV1::StreamBinding {
+                format_version,
+                binding,
+            } => Self::StreamBinding {
+                format_version: *format_version,
+                binding: binding.clone(),
+            },
+        }
+    }
+}
+
+impl From<KeyControlWire> for KeyControlV1 {
+    fn from(value: KeyControlWire) -> Self {
+        match value {
+            KeyControlWire::UpdateSet {
+                format_version,
+                update_set,
+            } => Self::UpdateSet {
+                format_version,
+                update_set,
+            },
+            KeyControlWire::EpochBarrier {
+                format_version,
+                stream_route,
+                barrier,
+            } => Self::EpochBarrier {
+                format_version,
+                stream_route,
+                barrier,
+            },
+            KeyControlWire::DirectoryCurrent {
+                format_version,
+                status,
+            } => Self::DirectoryCurrent {
+                format_version,
+                status,
+            },
+            KeyControlWire::StreamBinding {
+                format_version,
+                binding,
+            } => Self::StreamBinding {
+                format_version,
+                binding,
+            },
+        }
+    }
+}
+
+impl Serialize for KeyControlV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        KeyControlWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyControlV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Self::from(KeyControlWire::deserialize(deserializer)?);
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(JsonSchema)]
+#[schemars(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
+enum KeyControlSchema {
+    UpdateSet {
+        #[schemars(rename = "formatVersion", range(min = 1))]
+        format_version: u16,
+        #[schemars(rename = "updateSet")]
+        update_set: KeyUpdateSetV1,
+    },
+    EpochBarrier {
+        #[schemars(rename = "formatVersion", range(min = 1))]
+        format_version: u16,
+        #[schemars(rename = "streamRoute")]
+        stream_route: StreamRouteId,
+        barrier: EpochBarrierV1,
+    },
+    DirectoryCurrent {
+        #[schemars(rename = "formatVersion", range(min = 1))]
+        format_version: u16,
+        status: DirectoryCurrentV1,
+    },
+    StreamBinding {
+        #[schemars(rename = "formatVersion", range(min = 1))]
+        format_version: u16,
+        binding: StreamBindingV1,
+    },
+}
+
+impl JsonSchema for KeyControlV1 {
+    fn schema_name() -> String {
+        "KeyControlV1".to_owned()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        KeyControlSchema::json_schema(generator)
+    }
 }
 
 impl KeyControlV1 {
@@ -324,6 +784,13 @@ impl KeyControlV1 {
         Self::DirectoryCurrent {
             format_version: E2EE_FORMAT_VERSION,
             status,
+        }
+    }
+
+    pub fn stream_binding(binding: StreamBindingV1) -> Self {
+        Self::StreamBinding {
+            format_version: E2EE_FORMAT_VERSION,
+            binding,
         }
     }
 
@@ -362,6 +829,17 @@ impl KeyControlV1 {
                 }
                 status.validate()
             }
+            Self::StreamBinding {
+                format_version,
+                binding,
+            } => {
+                if *format_version != E2EE_FORMAT_VERSION
+                    || *format_version != binding.format_version
+                {
+                    return Err(PairingError::UnsupportedVersion);
+                }
+                binding.validate()
+            }
         }
     }
 
@@ -395,6 +873,14 @@ impl KeyControlV1 {
                 encoder.u8(2);
                 encoder.u16(*format_version);
                 encoder.bytes(&status.canonical_bytes()?);
+            }
+            Self::StreamBinding {
+                format_version,
+                binding,
+            } => {
+                encoder.u8(3);
+                encoder.u16(*format_version);
+                encoder.bytes(&binding.canonical_bytes()?);
             }
         }
         let bytes = encoder.finish();
@@ -434,6 +920,12 @@ impl KeyControlV1 {
                 format_version,
                 status: DirectoryCurrentV1::from_canonical_bytes(
                     decoder.bytes(KEY_CONTROL_SMALL_CANONICAL_BYTES)?,
+                )?,
+            },
+            3 => Self::StreamBinding {
+                format_version,
+                binding: StreamBindingV1::from_canonical_bytes(
+                    decoder.bytes(STREAM_BINDING_MAX_CANONICAL_BYTES)?,
                 )?,
             },
             _ => return Err(PairingError::InvalidEncoding("key control kind")),
@@ -1008,6 +1500,12 @@ impl ValidateControl for StreamAppliedAckV1 {
 }
 
 impl ValidateControl for DirectoryCurrentV1 {
+    fn validate_control(&self) -> Result<(), PairingError> {
+        self.validate()
+    }
+}
+
+impl ValidateControl for StreamBindingV1 {
     fn validate_control(&self) -> Result<(), PairingError> {
         self.validate()
     }
