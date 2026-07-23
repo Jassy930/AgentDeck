@@ -120,34 +120,85 @@ impl TryCryptoRng for PanicRng {}
 pub struct PairingFixture {
     invite: PairInviteV1,
     authorization: AuthorizationRequestV1,
+    root_signing_seed: [u8; 32],
+    machine_data_signing_seed: [u8; 32],
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
 }
 
 impl PairingFixture {
     pub fn new() -> Self {
-        let root = Self::root_signing_key();
-        let data = Self::machine_data_signing_key();
+        Self::new_with_identity(
+            [0x31; 32],
+            [0x32; 32],
+            MACHINE_ROUTE,
+            DEVICE_ROUTE,
+            PAIR_ROUTE,
+            ROOT_KEY_ID,
+            [0x33; 32],
+            [0x34; 32],
+            [0x35; 32],
+            [0x36; 32],
+            "Fixture Machine".to_owned(),
+        )
+    }
+
+    /// 同一 installation 下构造另一台 cryptographically independent machine fixture。
+    /// 默认 [`Self::new`] 的全部字节保持不变；此入口只供需要多 machine 全库语义的测试使用。
+    pub fn new_distinct(identity_seed: u8) -> Self {
+        Self::new_with_identity(
+            [identity_seed; 32],
+            [identity_seed.wrapping_add(1); 32],
+            MachineRouteId::from_bytes([identity_seed.wrapping_add(2); 16]),
+            DeviceRouteId::from_bytes([identity_seed.wrapping_add(3); 16]),
+            PairRouteId::from_bytes([identity_seed.wrapping_add(4); 16]),
+            RootKeyId::from_bytes([identity_seed.wrapping_add(5); 16]),
+            [identity_seed.wrapping_add(6); 32],
+            [identity_seed.wrapping_add(7); 32],
+            [identity_seed.wrapping_add(8); 32],
+            [identity_seed.wrapping_add(9); 32],
+            format!("Fixture Machine {identity_seed:02x}"),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_identity(
+        root_signing_seed: [u8; 32],
+        machine_data_signing_seed: [u8; 32],
+        machine_route: MachineRouteId,
+        device_route: DeviceRouteId,
+        pair_route: PairRouteId,
+        root_key_id: RootKeyId,
+        invite_hpke_seed: [u8; 32],
+        invite_secret: [u8; 32],
+        current_spki_pin: [u8; 32],
+        next_spki_pin: [u8; 32],
+        machine_display_name: String,
+    ) -> Self {
+        let root = SigningKey::from_seed(&root_signing_seed);
+        let data = SigningKey::from_seed(&machine_data_signing_seed);
         let root_fingerprint = sha256(&root.verifying_key().to_bytes());
         let mut data_certificate = SignedCertificate {
             subject_pubkey: PublicKeyBytes(data.verifying_key().to_bytes()),
             cert_role: CertRole::Data,
             generation: LinkGeneration::new(3),
-            root_key_id: ROOT_KEY_ID,
+            root_key_id,
             trust_epoch: TrustEpoch::new(2),
             not_after_ms: Some(NOW_MS + 600_000),
             signature: Ed25519Signature([0; 64]),
         };
         data_certificate.signature = sign_tbs(
             &root,
-            &data_certificate.to_be_signed_v1(RELAY_SERVER, MACHINE_ROUTE, root_fingerprint),
+            &data_certificate.to_be_signed_v1(RELAY_SERVER, machine_route, root_fingerprint),
         )
         .into();
-        let (_invite_private, invite_public) = HpkePrivateKey::derive_keypair(&[0x33; 32]);
+        let (_invite_private, invite_public) = HpkePrivateKey::derive_keypair(&invite_hpke_seed);
         Self {
             invite: PairInviteV1 {
                 format_version: E2EE_FORMAT_VERSION,
                 relay_protocol_version: RELAY_PROTOCOL_VERSION,
-                pair_route: PAIR_ROUTE,
-                invite_secret: [0x34; 32],
+                pair_route,
+                invite_secret,
                 invite_hpke_pubkey: PublicKeyBytes(
                     invite_public
                         .to_bytes()
@@ -156,15 +207,19 @@ impl PairingFixture {
                 ),
                 wss_url: "wss://relay.example/".to_owned(),
                 relay_server_id: RELAY_SERVER,
-                current_spki_pin: [0x35; 32],
-                next_spki_pin: [0x36; 32],
+                current_spki_pin,
+                next_spki_pin,
                 expires_at_ms: NOW_MS + 300_000,
                 machine_root_pubkey: PublicKeyBytes(root.verifying_key().to_bytes()),
                 machine_root_fingerprint: root_fingerprint,
                 data_sign_cert: data_certificate,
-                machine_display_name: "Fixture Machine".to_owned(),
+                machine_display_name,
             },
             authorization: full_authorization(),
+            root_signing_seed,
+            machine_data_signing_seed,
+            machine_route,
+            device_route,
         }
     }
 
@@ -183,8 +238,24 @@ impl PairingFixture {
     pub fn identity(&self) -> PairedMachineIdentity {
         PairedMachineIdentity::new(
             MachineRootFingerprint::from_bytes(self.invite.machine_root_fingerprint),
-            MACHINE_ROUTE,
+            self.machine_route,
         )
+    }
+
+    pub fn machine_route(&self) -> MachineRouteId {
+        self.machine_route
+    }
+
+    pub fn device_route(&self) -> DeviceRouteId {
+        self.device_route
+    }
+
+    pub fn root_key_id(&self) -> RootKeyId {
+        self.invite.data_sign_cert.root_key_id
+    }
+
+    pub fn fixture_root_signing_key(&self) -> SigningKey {
+        SigningKey::from_seed(&self.root_signing_seed)
     }
 
     pub fn promote(&self, store: &dyn RemoteKeyStore, state_root: &Path, seed: u8) -> VerifyingKey {
@@ -225,38 +296,38 @@ impl PairingFixture {
     }
 
     pub fn response_for(&self, prepared: &PreparedPairRequest, response_seed: [u8; 32]) -> Vec<u8> {
-        let root = Self::root_signing_key();
-        let data = Self::machine_data_signing_key();
+        let root = self.fixture_root_signing_key();
+        let data = SigningKey::from_seed(&self.machine_data_signing_seed);
         let root_fingerprint = self.invite.machine_root_fingerprint;
         let mut grant = RelayGrant {
-            machine_route: MACHINE_ROUTE,
-            device_route: DEVICE_ROUTE,
+            machine_route: self.machine_route,
+            device_route: self.device_route,
             device_sign_pubkey: PublicKeyBytes(prepared.device_sign_public_key()),
             grant_serial: GrantSerial::new(7),
-            root_key_id: ROOT_KEY_ID,
+            root_key_id: self.root_key_id(),
             trust_epoch: TrustEpoch::new(2),
             signature: Ed25519Signature([0; 64]),
         };
         grant.signature = sign_tbs(
             &root,
-            &grant.to_be_signed_v1(RELAY_SERVER, root_fingerprint),
+            &grant.to_be_signed_v1(self.invite.relay_server_id, root_fingerprint),
         )
         .into();
         let authorization = sign_device_authorization(
             &root,
-            RELAY_SERVER,
+            self.invite.relay_server_id,
             &grant,
             DeviceAuthorizationV1 {
                 format_version: E2EE_FORMAT_VERSION,
                 grant_hash: grant.canonical_sha256(),
-                machine_route: MACHINE_ROUTE,
-                device_route: DEVICE_ROUTE,
+                machine_route: self.machine_route,
+                device_route: self.device_route,
                 device_sign_fingerprint: sha256(&prepared.device_sign_public_key()),
                 grant_serial: GrantSerial::new(7),
                 device_hpke_pubkey: PublicKeyBytes(prepared.device_hpke_public_key()),
                 capabilities: self.authorization.capabilities.clone(),
                 permissions: self.authorization.permissions.clone(),
-                root_key_id: ROOT_KEY_ID,
+                root_key_id: self.root_key_id(),
                 trust_epoch: TrustEpoch::new(2),
                 signature: Ed25519Signature([0; 64]),
             },
@@ -265,13 +336,13 @@ impl PairingFixture {
         let info = PairResponseInfoV1 {
             e2ee_format_version: E2EE_FORMAT_VERSION,
             runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
-            relay_server_id: RELAY_SERVER,
-            pair_route: PAIR_ROUTE,
+            relay_server_id: self.invite.relay_server_id,
+            pair_route: self.invite.pair_route,
             invite_hash: self.invite.canonical_sha256().expect("canonical invite"),
             expiry_ms: self.invite.expires_at_ms,
             request_hash: prepared.request_hash(),
-            machine_route: MACHINE_ROUTE,
-            device_route: DEVICE_ROUTE,
+            machine_route: self.machine_route,
+            device_route: self.device_route,
             grant_serial: GrantSerial::new(7),
             root_trust_epoch: TrustEpoch::new(2),
         };
@@ -289,9 +360,9 @@ impl PairingFixture {
             let entry_info = KeyUpdateInfoV1 {
                 e2ee_format_version: E2EE_FORMAT_VERSION,
                 runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
-                relay_server_id: RELAY_SERVER,
-                machine_route: MACHINE_ROUTE,
-                device_route: DEVICE_ROUTE,
+                relay_server_id: self.invite.relay_server_id,
+                machine_route: self.machine_route,
+                device_route: self.device_route,
                 stream_route: None,
                 grant_serial: GrantSerial::new(7),
                 root_trust_epoch: TrustEpoch::new(2),
@@ -316,9 +387,9 @@ impl PairingFixture {
             &data,
             &signer,
             &KeyDirectorySignatureContextV1 {
-                relay_server_id: RELAY_SERVER,
-                machine_route: MACHINE_ROUTE,
-                device_route: DEVICE_ROUTE,
+                relay_server_id: self.invite.relay_server_id,
+                machine_route: self.machine_route,
+                device_route: self.device_route,
                 grant_serial: GrantSerial::new(7),
                 root_trust_epoch: TrustEpoch::new(2),
             },
@@ -340,7 +411,7 @@ impl PairingFixture {
         seal_pair_response(
             &recipient,
             &info,
-            &pairing_context(),
+            &pairing_context(self.invite.pair_route),
             &plaintext,
             PairResponseSealAuthority {
                 machine_data_signing_key: &data,
@@ -355,7 +426,7 @@ impl PairingFixture {
     }
 }
 
-fn pairing_context() -> OuterContextV1 {
+fn pairing_context(pair_route: PairRouteId) -> OuterContextV1 {
     OuterContextV1 {
         frame_kind: OuterFrameKind::PairResponse,
         relay_protocol_version: RELAY_PROTOCOL_VERSION,
@@ -364,7 +435,7 @@ fn pairing_context() -> OuterContextV1 {
         device_route: None,
         stream_route: None,
         request_route: None,
-        pair_route: Some(PAIR_ROUTE),
+        pair_route: Some(pair_route),
         stream_generation: None,
         stream_cursor: None,
         stream_seq: None,

@@ -5,21 +5,31 @@
 mod remote_pairing;
 
 use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use agentdeck_cli::installation::CliInstallationStore;
 use agentdeck_cli::remote::keychain::{
-    MemoryRemoteKeyStore, ParsedPairedRemoteKeyAccount, RemoteKeyAccount, RemoteKeyPersistence,
-    RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
+    MemoryRemoteKeyStore, PairedRemoteKeyPurpose, ParsedPairedRemoteKeyAccount, RemoteKeyAccount,
+    RemoteKeyPersistence, RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
 };
 use agentdeck_cli::remote::machines::list_persistent_remote_machines;
+use agentdeck_cli::remote::paired_machine::{
+    PairedMachineStore, PairedMutationObserver, PairedMutationStage,
+};
 use agentdeck_cli::remote::production::PersistentRemoteComposition;
 use agentdeck_cli::remote::signature::{
     CurrentRemoteCliSignatureVerifier, REMOTE_CLI_ACCESS_GROUP_SUFFIX, REMOTE_CLI_CODE_IDENTIFIER,
     RemoteCliSignatureAttestation, RemoteCliSignatureError, RemoteCliSignatureExpectation,
     RemoteCliSignatureKind,
+};
+use agentdeck_crypto::{sha256, sign_tbs};
+use agentdeck_protocol::relay_v2::auth::{DeviceRevocation, Ed25519Signature};
+use agentdeck_protocol::relay_v2::frame::RevocationCommitted;
+use agentdeck_protocol::relay_v2::{
+    GrantSerial, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, TrustEpoch, encode,
 };
 
 use remote_pairing::PairingFixture;
@@ -132,6 +142,27 @@ impl RemoteKeyStore for TrackingKeyStore {
     }
 }
 
+struct PanicAfterCleanupJournal {
+    reached: AtomicBool,
+}
+
+impl PanicAfterCleanupJournal {
+    fn new() -> Self {
+        Self {
+            reached: AtomicBool::new(false),
+        }
+    }
+}
+
+impl PairedMutationObserver for PanicAfterCleanupJournal {
+    fn after_stage(&self, stage: PairedMutationStage) {
+        if stage == PairedMutationStage::CleanupJournalDurable {
+            self.reached.store(true, Ordering::SeqCst);
+            panic!("injected process crash after durable ADPC journal");
+        }
+    }
+}
+
 fn canonical_root(temp: &tempfile::TempDir, component: &str) -> PathBuf {
     fs::canonicalize(temp.path())
         .expect("canonical tempdir")
@@ -158,6 +189,173 @@ fn file_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
                         .expect("relative snapshot")
                         .to_path_buf(),
                     fs::read(&path).expect("read snapshot file"),
+                ));
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    walk(root, root, &mut output);
+    output
+}
+
+fn paired_key_snapshot(
+    store: &dyn RemoteKeyStore,
+    installation_id: uuid::Uuid,
+    fixture: &PairingFixture,
+) -> Vec<(RemoteKeyAccount, Option<Vec<u8>>)> {
+    let identity = fixture.identity();
+    [
+        PairedRemoteKeyPurpose::DeviceSignPrivateKey,
+        PairedRemoteKeyPurpose::DeviceHpkePrivateKey,
+        PairedRemoteKeyPurpose::DeviceGrant,
+        PairedRemoteKeyPurpose::DeviceStorageKek,
+        PairedRemoteKeyPurpose::CounterGuard,
+        PairedRemoteKeyPurpose::CommitMarker,
+    ]
+    .into_iter()
+    .map(|purpose| {
+        let account = RemoteKeyAccount::paired(
+            installation_id,
+            identity.machine_root_fingerprint(),
+            identity.machine_route(),
+            purpose,
+        );
+        let value = store
+            .load(&account)
+            .expect("snapshot paired Keychain value")
+            .map(|secret| secret.expose_secret().to_vec());
+        (account, value)
+    })
+    .collect()
+}
+
+fn paired_key_snapshot_for_machines(
+    store: &dyn RemoteKeyStore,
+    installation_id: uuid::Uuid,
+    fixtures: &[&PairingFixture],
+) -> Vec<(RemoteKeyAccount, Option<Vec<u8>>)> {
+    let mut snapshot = fixtures
+        .iter()
+        .flat_map(|fixture| paired_key_snapshot(store, installation_id, fixture))
+        .collect::<Vec<_>>();
+    snapshot.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+    snapshot
+}
+
+fn marker_account(installation_id: uuid::Uuid, fixture: &PairingFixture) -> RemoteKeyAccount {
+    let identity = fixture.identity();
+    RemoteKeyAccount::paired(
+        installation_id,
+        identity.machine_root_fingerprint(),
+        identity.machine_route(),
+        PairedRemoteKeyPurpose::CommitMarker,
+    )
+}
+
+fn signed_revocation_terminal(fixture: &PairingFixture) -> OpaqueRouteFrame {
+    let root = fixture.fixture_root_signing_key();
+    let root_fingerprint = sha256(&root.verifying_key().to_bytes());
+    assert_eq!(root_fingerprint, fixture.invite().machine_root_fingerprint);
+    let mut revocation = DeviceRevocation {
+        machine_route: fixture.machine_route(),
+        device_route: fixture.device_route(),
+        grant_serial: GrantSerial::new(7),
+        root_key_id: fixture.root_key_id(),
+        trust_epoch: TrustEpoch::new(2),
+        signature: Ed25519Signature([0; 64]),
+    };
+    revocation.signature = sign_tbs(
+        &root,
+        &revocation.to_be_signed_v1(fixture.invite().relay_server_id, root_fingerprint),
+    )
+    .into();
+    OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::RevocationCommitted(RevocationCommitted {
+            device_route: fixture.device_route(),
+            grant_serial: GrantSerial::new(7),
+            signed_revocation: revocation,
+        }),
+    }
+}
+
+fn leave_valid_cleanup_journal(
+    store: &dyn RemoteKeyStore,
+    state_root: &Path,
+    installation_id: uuid::Uuid,
+    fixture: &PairingFixture,
+) {
+    let observer = Arc::new(PanicAfterCleanupJournal::new());
+    let paired = PairedMachineStore::new_with_mutation_observer(
+        store,
+        installation_id,
+        state_root,
+        observer.clone(),
+    );
+    let opened = paired
+        .open_exact(fixture.identity())
+        .expect("open real paired fixture");
+    let terminal = signed_revocation_terminal(fixture);
+    let verified = opened
+        .verify_revocation_terminal(&terminal, &encode(&terminal))
+        .expect("verify exact MachineRoot-signed terminal");
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        opened
+            .commit_revocation_cleanup(verified)
+            .expect("cleanup reaches injected crash");
+    }));
+    assert!(crashed.is_err(), "fixture must stop after durable journal");
+    assert!(observer.reached.load(Ordering::SeqCst));
+    let journal = store
+        .load(&marker_account(installation_id, fixture))
+        .expect("load durable cleanup journal")
+        .expect("cleanup journal remains after crash");
+    assert_eq!(&journal.expose_secret()[..4], b"ADPC");
+}
+
+fn tamper_last_byte(store: &dyn RemoteKeyStore, account: &RemoteKeyAccount) {
+    let original = store
+        .load(account)
+        .expect("load value for offline tamper")
+        .expect("value exists for offline tamper");
+    let mut tampered = original.expose_secret().to_vec();
+    *tampered.last_mut().expect("nonempty durable value") ^= 0x01;
+    store
+        .compare_and_replace_exact(account, &original, &RemoteSecret::new(tampered))
+        .expect("inject offline tamper");
+}
+
+fn ordered_distinct_fixtures(installation_id: uuid::Uuid) -> (PairingFixture, PairingFixture) {
+    let first = PairingFixture::new();
+    let second = PairingFixture::new_distinct(0x81);
+    assert_ne!(first.identity(), second.identity());
+    if marker_account(installation_id, &first).as_str()
+        < marker_account(installation_id, &second).as_str()
+    {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+fn rust_sources_under(root: &Path) -> Vec<(PathBuf, String)> {
+    fn walk(root: &Path, current: &Path, output: &mut Vec<(PathBuf, String)>) {
+        let mut entries = fs::read_dir(current)
+            .expect("read Rust source directory")
+            .map(|entry| entry.expect("Rust source entry"))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if entry.file_type().expect("Rust source type").is_dir() {
+                walk(root, &path, output);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                output.push((
+                    path.strip_prefix(root)
+                        .expect("relative Rust source")
+                        .to_path_buf(),
+                    fs::read_to_string(&path).expect("read Rust source"),
                 ));
             }
         }
@@ -268,6 +466,350 @@ fn machines_lists_only_local_paired_store_without_key_or_state_mutation() {
     assert!(machines[0]["machineRootFingerprint"].is_string());
     assert!(machines[0]["machineRoute"].is_string());
     assert!(machines[0]["deviceRoute"].is_string());
+}
+
+#[test]
+fn machines_recovers_a_valid_cleanup_journal_before_returning_inventory() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let state = tempfile::tempdir().expect("state parent");
+    let state_root = canonical_root(&state, "remote-state");
+    let installation_store = CliInstallationStore::injected_for_test(home.path().to_path_buf());
+    let installation_id = installation_store
+        .load_or_create()
+        .expect("stable installation id");
+    let key_store = Arc::new(TrackingKeyStore::new());
+    let fixture = PairingFixture::new();
+    let _ = fixture.promote_for_installation(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        0x62,
+    );
+    leave_valid_cleanup_journal(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        &fixture,
+    );
+
+    let composition = PersistentRemoteComposition::injected_for_test(
+        &expectation(),
+        &FakeVerifier { accepted: true },
+        installation_store,
+        key_store.clone(),
+        state_root.clone(),
+    )
+    .expect("injected composition");
+    key_store.reset_mutations();
+
+    let output = list_persistent_remote_machines(&composition)
+        .expect("startup cleanup precedes inventory output");
+
+    assert!(
+        key_store.mutation_count() > 0,
+        "startup recovery must finish the durable cleanup"
+    );
+    assert!(
+        paired_key_snapshot(key_store.as_ref(), installation_id.as_uuid(), &fixture)
+            .into_iter()
+            .all(|(_, value)| value.is_none()),
+        "all paired Keychain material must be absent before output returns"
+    );
+    assert!(
+        file_snapshot(&state_root).iter().all(|(path, _)| {
+            let name = path.to_string_lossy();
+            !name.ends_with(".crypto-state.v1") && !name.ends_with(".crypto-state-stage.v1")
+        }),
+        "sealed crypto state must be absent; persistent lease files may remain"
+    );
+    assert_eq!(
+        output["result"]["machines"]
+            .as_array()
+            .expect("machine array")
+            .len(),
+        0,
+        "cleanup-pending machine must not be listed"
+    );
+}
+
+#[test]
+fn machines_rejects_a_tampered_active_marker_without_mutation_or_output() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let state = tempfile::tempdir().expect("state parent");
+    let state_root = canonical_root(&state, "remote-state");
+    let installation_store = CliInstallationStore::injected_for_test(home.path().to_path_buf());
+    let installation_id = installation_store
+        .load_or_create()
+        .expect("stable installation id");
+    let key_store = Arc::new(TrackingKeyStore::new());
+    let fixture = PairingFixture::new();
+    let _ = fixture.promote_for_installation(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        0x63,
+    );
+    tamper_last_byte(
+        key_store.as_ref(),
+        &marker_account(installation_id.as_uuid(), &fixture),
+    );
+    let composition = PersistentRemoteComposition::injected_for_test(
+        &expectation(),
+        &FakeVerifier { accepted: true },
+        installation_store,
+        key_store.clone(),
+        state_root.clone(),
+    )
+    .expect("injected composition");
+    let keys_before = paired_key_snapshot(key_store.as_ref(), installation_id.as_uuid(), &fixture);
+    let files_before = file_snapshot(&state_root);
+    key_store.reset_mutations();
+
+    let error = list_persistent_remote_machines(&composition)
+        .expect_err("tampered active marker must return Err without output value");
+
+    assert_eq!(error.code(), "remote.pairing.paired_conflict");
+    assert_eq!(key_store.mutation_count(), 0);
+    assert_eq!(
+        paired_key_snapshot(key_store.as_ref(), installation_id.as_uuid(), &fixture),
+        keys_before
+    );
+    assert_eq!(file_snapshot(&state_root), files_before);
+}
+
+#[test]
+fn machines_rejects_a_tampered_cleanup_journal_without_mutation_or_output() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let state = tempfile::tempdir().expect("state parent");
+    let state_root = canonical_root(&state, "remote-state");
+    let installation_store = CliInstallationStore::injected_for_test(home.path().to_path_buf());
+    let installation_id = installation_store
+        .load_or_create()
+        .expect("stable installation id");
+    let key_store = Arc::new(TrackingKeyStore::new());
+    let fixture = PairingFixture::new();
+    let _ = fixture.promote_for_installation(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        0x64,
+    );
+    leave_valid_cleanup_journal(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        &fixture,
+    );
+    tamper_last_byte(
+        key_store.as_ref(),
+        &marker_account(installation_id.as_uuid(), &fixture),
+    );
+    let composition = PersistentRemoteComposition::injected_for_test(
+        &expectation(),
+        &FakeVerifier { accepted: true },
+        installation_store,
+        key_store.clone(),
+        state_root.clone(),
+    )
+    .expect("injected composition");
+    let keys_before = paired_key_snapshot(key_store.as_ref(), installation_id.as_uuid(), &fixture);
+    let files_before = file_snapshot(&state_root);
+    key_store.reset_mutations();
+
+    let error = list_persistent_remote_machines(&composition)
+        .expect_err("tampered ADPC journal must return Err without output value");
+
+    assert_eq!(error.code(), "remote.pairing.paired_invalid");
+    assert_eq!(key_store.mutation_count(), 0);
+    assert_eq!(
+        paired_key_snapshot(key_store.as_ref(), installation_id.as_uuid(), &fixture),
+        keys_before
+    );
+    assert_eq!(file_snapshot(&state_root), files_before);
+}
+
+#[test]
+fn global_recovery_audits_later_active_tamper_before_cleaning_an_earlier_journal() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let state = tempfile::tempdir().expect("state parent");
+    let state_root = canonical_root(&state, "remote-state");
+    let installation_store = CliInstallationStore::injected_for_test(home.path().to_path_buf());
+    let installation_id = installation_store
+        .load_or_create()
+        .expect("stable installation id");
+    let key_store = Arc::new(TrackingKeyStore::new());
+    let (cleanup_first, tampered_second) = ordered_distinct_fixtures(installation_id.as_uuid());
+    assert!(
+        marker_account(installation_id.as_uuid(), &cleanup_first).as_str()
+            < marker_account(installation_id.as_uuid(), &tampered_second).as_str(),
+        "valid ADPC fixture must sort before the later tampered active marker"
+    );
+    let _ = cleanup_first.promote_for_installation(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        0x71,
+    );
+    let _ = tampered_second.promote_for_installation(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        0x75,
+    );
+    leave_valid_cleanup_journal(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        &cleanup_first,
+    );
+    tamper_last_byte(
+        key_store.as_ref(),
+        &marker_account(installation_id.as_uuid(), &tampered_second),
+    );
+    let composition = PersistentRemoteComposition::injected_for_test(
+        &expectation(),
+        &FakeVerifier { accepted: true },
+        installation_store,
+        key_store.clone(),
+        state_root.clone(),
+    )
+    .expect("injected composition");
+    let machines = [&cleanup_first, &tampered_second];
+    let keys_before =
+        paired_key_snapshot_for_machines(key_store.as_ref(), installation_id.as_uuid(), &machines);
+    let files_before = file_snapshot(&state_root);
+    key_store.reset_mutations();
+
+    let error = list_persistent_remote_machines(&composition)
+        .expect_err("later active tamper must prevent any earlier cleanup and return no value");
+
+    assert_eq!(error.code(), "remote.pairing.paired_conflict");
+    assert_eq!(key_store.mutation_count(), 0);
+    assert_eq!(
+        paired_key_snapshot_for_machines(key_store.as_ref(), installation_id.as_uuid(), &machines,),
+        keys_before
+    );
+    assert_eq!(file_snapshot(&state_root), files_before);
+}
+
+#[test]
+fn global_recovery_audits_later_cleanup_tamper_before_cleaning_an_earlier_journal() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let state = tempfile::tempdir().expect("state parent");
+    let state_root = canonical_root(&state, "remote-state");
+    let installation_store = CliInstallationStore::injected_for_test(home.path().to_path_buf());
+    let installation_id = installation_store
+        .load_or_create()
+        .expect("stable installation id");
+    let key_store = Arc::new(TrackingKeyStore::new());
+    let (cleanup_first, tampered_second) = ordered_distinct_fixtures(installation_id.as_uuid());
+    assert!(
+        marker_account(installation_id.as_uuid(), &cleanup_first).as_str()
+            < marker_account(installation_id.as_uuid(), &tampered_second).as_str(),
+        "valid ADPC fixture must sort before the later tampered ADPC"
+    );
+    let _ = cleanup_first.promote_for_installation(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        0x79,
+    );
+    let _ = tampered_second.promote_for_installation(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        0x7d,
+    );
+    leave_valid_cleanup_journal(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        &cleanup_first,
+    );
+    leave_valid_cleanup_journal(
+        key_store.as_ref(),
+        &state_root,
+        installation_id.as_uuid(),
+        &tampered_second,
+    );
+    tamper_last_byte(
+        key_store.as_ref(),
+        &marker_account(installation_id.as_uuid(), &tampered_second),
+    );
+    let composition = PersistentRemoteComposition::injected_for_test(
+        &expectation(),
+        &FakeVerifier { accepted: true },
+        installation_store,
+        key_store.clone(),
+        state_root.clone(),
+    )
+    .expect("injected composition");
+    let machines = [&cleanup_first, &tampered_second];
+    let keys_before =
+        paired_key_snapshot_for_machines(key_store.as_ref(), installation_id.as_uuid(), &machines);
+    let files_before = file_snapshot(&state_root);
+    key_store.reset_mutations();
+
+    let error = list_persistent_remote_machines(&composition)
+        .expect_err("later ADPC tamper must prevent any earlier cleanup and return no value");
+
+    assert_eq!(error.code(), "remote.pairing.paired_invalid");
+    assert_eq!(key_store.mutation_count(), 0);
+    assert_eq!(
+        paired_key_snapshot_for_machines(key_store.as_ref(), installation_id.as_uuid(), &machines,),
+        keys_before
+    );
+    assert_eq!(file_snapshot(&state_root), files_before);
+}
+
+#[test]
+fn persistent_composition_raw_capabilities_are_crate_private_and_branded() {
+    let production = include_str!("../src/remote/production.rs");
+    let machines = include_str!("../src/remote/machines.rs");
+    assert!(production.contains("pub(crate) fn key_store(&self)"));
+    assert!(production.contains("pub(crate) fn state_root(&self)"));
+    assert!(!production.contains("pub fn key_store(&self)"));
+    assert!(!production.contains("pub fn state_root(&self)"));
+    assert!(production.contains("pub struct RecoveredPairedMachineStore"));
+    assert!(!production.contains("impl Deref for RecoveredPairedMachineStore"));
+    assert!(machines.contains("paired_store: RecoveredPairedMachineStore<'a>"));
+    assert!(!machines.contains("PairedMachineStore::new("));
+
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for (path, source) in rust_sources_under(&source_root) {
+        let is_pair_creation_exception = path == Path::new("remote/pair.rs");
+        let raw_getter_calls =
+            source.matches(".key_store()").count() + source.matches(".state_root()").count();
+        let raw_store_constructors = source.matches("PairedMachineStore::new").count();
+        if is_pair_creation_exception {
+            assert_eq!(
+                raw_getter_calls,
+                2,
+                "pair creation is the only explicit raw composition exception: {}",
+                path.display()
+            );
+            assert_eq!(raw_store_constructors, 0);
+        } else if path == Path::new("remote/production.rs") {
+            assert_eq!(raw_getter_calls, 0);
+            assert_eq!(
+                raw_store_constructors, 1,
+                "only the branded recovery gateway may construct a raw paired store"
+            );
+        } else {
+            assert_eq!(
+                raw_getter_calls,
+                0,
+                "raw composition capability escaped into {}",
+                path.display()
+            );
+            assert_eq!(
+                raw_store_constructors,
+                0,
+                "raw paired-store construction bypassed recovery in {}",
+                path.display()
+            );
+        }
+    }
 }
 
 #[test]

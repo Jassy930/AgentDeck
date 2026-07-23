@@ -1,8 +1,9 @@
-//! Persistent `remote machines` 的纯本地只读服务。
+//! Persistent `remote machines` 的纯本地服务。
 //!
 //! 唯一数据源是当前 composition 的 stable installation identity 与
-//! [`PairedMachineStore::list`]；本模块没有 Relay、Runtime UDS 或网络依赖，也不调用任何
-//! Keychain/state mutation API。
+//! [`RecoveredPairedMachineStore`]。启动时唯一允许的 mutation 是恢复已经通过全库审计的
+//! durable revoke cleanup journal；随后 inventory 本身保持只读。本模块没有 Relay、Runtime UDS
+//! 或网络依赖。
 
 #![cfg(unix)]
 
@@ -15,8 +16,8 @@ use thiserror::Error;
 
 use crate::installation::InstallationId;
 
-use super::paired_machine::{PairedMachineStore, PairedPromotionError};
-use super::production::PersistentRemoteComposition;
+use super::paired_machine::PairedPromotionError;
+use super::production::{PersistentRemoteComposition, RecoveredPairedMachineStore};
 
 /// `remote machines` 的无 secret、稳定 JSON 行投影。
 #[derive(Clone, Eq, PartialEq, Serialize)]
@@ -34,24 +35,22 @@ impl fmt::Debug for PersistentRemoteMachineProjection {
     }
 }
 
-/// 只持有只读 paired-store view；不会打开 device lease 或建立任何连接。
+/// 持有已完成 startup cleanup recovery 的 paired-store view；inventory 不打开 device lease
+/// 或建立任何连接。
 pub struct PersistentRemoteMachinesService<'a> {
     installation_id: InstallationId,
-    paired_store: PairedMachineStore<'a>,
+    paired_store: RecoveredPairedMachineStore<'a>,
 }
 
 impl<'a> PersistentRemoteMachinesService<'a> {
-    #[must_use]
-    pub fn from_composition(composition: &'a PersistentRemoteComposition) -> Self {
+    pub fn from_composition(
+        composition: &'a PersistentRemoteComposition,
+    ) -> Result<Self, PersistentRemoteMachinesError> {
         let installation_id = composition.installation_id();
-        Self {
+        Ok(Self {
             installation_id,
-            paired_store: PairedMachineStore::new(
-                composition.key_store(),
-                installation_id.as_uuid(),
-                composition.state_root(),
-            ),
-        }
+            paired_store: composition.recovered_paired_machine_store()?,
+        })
     }
 
     pub fn list(
@@ -82,7 +81,7 @@ impl<'a> PersistentRemoteMachinesService<'a> {
 pub fn list_persistent_remote_machines(
     composition: &PersistentRemoteComposition,
 ) -> Result<serde_json::Value, PersistentRemoteMachinesError> {
-    let service = PersistentRemoteMachinesService::from_composition(composition);
+    let service = PersistentRemoteMachinesService::from_composition(composition)?;
     let machines = service.list()?;
     Ok(serde_json::json!({
         "operation": "remote.machines",
