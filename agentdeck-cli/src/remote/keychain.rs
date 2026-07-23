@@ -322,6 +322,12 @@ pub enum RemoteKeyStoreError {
     PersistenceReadbackFailed { account: RemoteKeyAccount },
     #[error("remote Keychain item {account} remained present after delete")]
     DeleteReadbackFailed { account: RemoteKeyAccount },
+    #[error("remote Keychain item {account} is missing for compare-and-replace")]
+    CompareAndReplaceMissing { account: RemoteKeyAccount },
+    #[error("remote Keychain item {account} does not match compare-and-replace expected bytes")]
+    CompareAndReplaceMismatch { account: RemoteKeyAccount },
+    #[error("remote Keychain item {account} compare-and-replace commit is unknown")]
+    CompareAndReplaceCommitUnknown { account: RemoteKeyAccount },
     #[error("remote Keychain account enumeration contained a malformed or noncanonical item")]
     MalformedEnumeratedAccount,
     #[error("remote Keychain account enumeration contained a duplicate item")]
@@ -341,6 +347,13 @@ impl RemoteKeyStoreError {
             Self::ImmutableConflict { .. } => "remote.keystore.immutable_conflict",
             Self::PersistenceReadbackFailed { .. } | Self::DeleteReadbackFailed { .. } => {
                 "remote.keystore.persistence_failed"
+            }
+            Self::CompareAndReplaceMissing { .. } => "remote.keystore.compare_and_replace_missing",
+            Self::CompareAndReplaceMismatch { .. } => {
+                "remote.keystore.compare_and_replace_mismatch"
+            }
+            Self::CompareAndReplaceCommitUnknown { .. } => {
+                "remote.keystore.compare_and_replace_commit_unknown"
             }
             Self::MalformedEnumeratedAccount | Self::DuplicateEnumeratedAccount => {
                 "remote.keystore.enumeration_integrity_failed"
@@ -362,6 +375,19 @@ pub trait RemoteKeyStore: Send + Sync {
         account: &RemoteKeyAccount,
         value: &RemoteSecret,
     ) -> Result<RemoteKeyPersistence, RemoteKeyStoreError>;
+
+    /// 只更新已存在且逐字匹配 `expected` 的 item；成功前必须逐字读回 `replacement`。
+    ///
+    /// 默认实现让尚未使用可变 Keychain state 的 injected fault stores 保持显式 unavailable；
+    /// production 与标准 memory backend 必须覆盖此方法。
+    fn compare_and_replace_exact(
+        &self,
+        _account: &RemoteKeyAccount,
+        _expected: &RemoteSecret,
+        _replacement: &RemoteSecret,
+    ) -> Result<(), RemoteKeyStoreError> {
+        Err(RemoteKeyStoreError::BackendUnavailable)
+    }
 
     /// 删除后必须读回 absent；重复删除幂等。
     fn delete_exact(&self, account: &RemoteKeyAccount) -> Result<(), RemoteKeyStoreError>;
@@ -451,6 +477,42 @@ impl RemoteKeyStore for MemoryRemoteKeyStore {
         values.remove(account);
         if values.contains_key(account) {
             return Err(RemoteKeyStoreError::DeleteReadbackFailed {
+                account: account.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn compare_and_replace_exact(
+        &self,
+        account: &RemoteKeyAccount,
+        expected: &RemoteSecret,
+        replacement: &RemoteSecret,
+    ) -> Result<(), RemoteKeyStoreError> {
+        let mut values = self
+            .values
+            .lock()
+            .map_err(|_| RemoteKeyStoreError::Poisoned)?;
+        let Some(current) = values.get(account) else {
+            return Err(RemoteKeyStoreError::CompareAndReplaceMissing {
+                account: account.clone(),
+            });
+        };
+        if current.expose_secret() != expected.expose_secret() {
+            return Err(RemoteKeyStoreError::CompareAndReplaceMismatch {
+                account: account.clone(),
+            });
+        }
+
+        values.insert(
+            account.clone(),
+            RemoteSecret::new(replacement.expose_secret().to_vec()),
+        );
+        if values
+            .get(account)
+            .is_none_or(|durable| durable.expose_secret() != replacement.expose_secret())
+        {
+            return Err(RemoteKeyStoreError::CompareAndReplaceCommitUnknown {
                 account: account.clone(),
             });
         }

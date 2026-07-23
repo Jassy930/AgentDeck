@@ -64,10 +64,11 @@ unsafe extern "C" {
 
     fn SecItemAdd(attributes: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
     fn SecItemCopyMatching(query: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
+    fn SecItemUpdate(query: CFDictionaryRef, attributes_to_update: CFDictionaryRef) -> OSStatus;
     fn SecItemDelete(query: CFDictionaryRef) -> OSStatus;
 }
 
-/// 所有 add/load/delete 共用的不可变 production policy。
+/// 所有 add/load/update/delete 共用的不可变 production policy。
 #[derive(Clone, Copy)]
 pub(crate) struct RemoteKeychainPolicy<'a> {
     access_group: &'a str,
@@ -111,7 +112,9 @@ impl<'a> RemoteKeychainPolicy<'a> {
         match operation {
             RemoteKeychainOperation::CopyMatching => "skip",
             RemoteKeychainOperation::ListAccountAttributes => "skip",
-            RemoteKeychainOperation::Add | RemoteKeychainOperation::Delete => "fail",
+            RemoteKeychainOperation::Add
+            | RemoteKeychainOperation::Update
+            | RemoteKeychainOperation::Delete => "fail",
         }
     }
 }
@@ -150,15 +153,22 @@ pub(crate) enum DeleteOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UpdateOutcome {
+    Updated,
+    NotFound,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RemoteKeychainOperation {
     Add,
     CopyMatching,
     ListAccountAttributes,
+    Update,
     Delete,
 }
 
 /// Security.framework seam。production composition 固定使用 `SystemSecurityItems`；
-/// trait 只让 automatic test 验证相同 add/readback/delete 状态机与 policy。
+/// trait 只让 automatic test 验证相同 add/readback/update/delete 状态机与 policy。
 pub(crate) trait SecurityItemBackend: Send + Sync {
     fn add(
         &self,
@@ -176,6 +186,14 @@ pub(crate) trait SecurityItemBackend: Send + Sync {
         policy: &RemoteKeychainPolicy<'_>,
         limit: usize,
     ) -> Result<Vec<String>, ()>;
+
+    /// 用 `SecItemUpdate` 更新 existing item；expected-bytes preflight 位于 store 状态机。
+    fn update_existing(
+        &self,
+        policy: &RemoteKeychainPolicy<'_>,
+        account: &str,
+        replacement: &[u8],
+    ) -> Result<UpdateOutcome, ()>;
 
     fn delete(&self, policy: &RemoteKeychainPolicy<'_>, account: &str)
     -> Result<DeleteOutcome, ()>;
@@ -314,6 +332,28 @@ impl SecurityItemBackend for SystemSecurityItems {
         }
     }
 
+    fn update_existing(
+        &self,
+        policy: &RemoteKeychainPolicy<'_>,
+        account: &str,
+        replacement: &[u8],
+    ) -> Result<UpdateOutcome, ()> {
+        let query = SecurityItemQuery::new(
+            policy,
+            Some(account),
+            None,
+            RemoteKeychainOperation::Update,
+            None,
+        )?;
+        let attributes = SecurityItemUpdateAttributes::new(replacement)?;
+        // SAFETY: both wrappers own live immutable CFDictionaries for the duration of the call.
+        match unsafe { SecItemUpdate(query.as_ref(), attributes.as_ref()) } {
+            ERR_SEC_SUCCESS => Ok(UpdateOutcome::Updated),
+            ERR_SEC_ITEM_NOT_FOUND => Ok(UpdateOutcome::NotFound),
+            _ => Err(()),
+        }
+    }
+
     fn delete(
         &self,
         policy: &RemoteKeychainPolicy<'_>,
@@ -428,6 +468,60 @@ impl RemoteKeyStore for MacOsRemoteKeyStore {
         }
     }
 
+    fn compare_and_replace_exact(
+        &self,
+        account: &RemoteKeyAccount,
+        expected: &RemoteSecret,
+        replacement: &RemoteSecret,
+    ) -> Result<(), RemoteKeyStoreError> {
+        let policy = self.policy();
+        let current = self
+            .backend
+            .load(&policy, account.as_str())
+            .map_err(|()| Self::backend_error())?
+            .map(RemoteSecret::new);
+        let Some(current) = current else {
+            return Err(RemoteKeyStoreError::CompareAndReplaceMissing {
+                account: account.clone(),
+            });
+        };
+        if current.expose_secret() != expected.expose_secret() {
+            return Err(RemoteKeyStoreError::CompareAndReplaceMismatch {
+                account: account.clone(),
+            });
+        }
+
+        // SecItem.h 只允许 Attribute/Search Constants 参与 SecItemUpdate query；
+        // kSecValueData 是 Value Type Key，不能合法用于 old-bytes search。当前威胁边界据此采用
+        // single-writer exact preflight + existing-only update；同 UID 在线 check/update 竞态是
+        // 明确的 residual risk，不在本存储原语的安全承诺内。
+        let outcome = self
+            .backend
+            .update_existing(&policy, account.as_str(), replacement.expose_secret())
+            .map_err(|()| RemoteKeyStoreError::CompareAndReplaceCommitUnknown {
+                account: account.clone(),
+            })?;
+        if outcome != UpdateOutcome::Updated {
+            return Err(RemoteKeyStoreError::CompareAndReplaceCommitUnknown {
+                account: account.clone(),
+            });
+        }
+
+        let durable = self
+            .backend
+            .load(&policy, account.as_str())
+            .map_err(|()| RemoteKeyStoreError::CompareAndReplaceCommitUnknown {
+                account: account.clone(),
+            })?
+            .map(RemoteSecret::new);
+        if durable.as_ref().map(RemoteSecret::expose_secret) != Some(replacement.expose_secret()) {
+            return Err(RemoteKeyStoreError::CompareAndReplaceCommitUnknown {
+                account: account.clone(),
+            });
+        }
+        Ok(())
+    }
+
     fn delete_exact(&self, account: &RemoteKeyAccount) -> Result<(), RemoteKeyStoreError> {
         let _ = self
             .backend
@@ -504,6 +598,22 @@ struct SecurityItemQuery {
     _owned_values: Vec<OwnedCf>,
 }
 
+struct SecurityItemUpdateAttributes(SecurityItemQuery);
+
+impl SecurityItemUpdateAttributes {
+    fn new(replacement: &[u8]) -> Result<Self, ()> {
+        let mut builder = QueryBuilder::default();
+        // SAFETY: kSecValueData is an immutable process-lifetime CoreFoundation key; builder
+        // owns the copied CFData through the SecItemUpdate call.
+        unsafe { builder.owned_data(kSecValueData, replacement)? };
+        Ok(Self(builder.build()?))
+    }
+
+    const fn as_ref(&self) -> CFDictionaryRef {
+        self.0.as_ref()
+    }
+}
+
 impl SecurityItemQuery {
     fn new(
         policy: &RemoteKeychainPolicy<'_>,
@@ -517,7 +627,9 @@ impl SecurityItemQuery {
                 if account.is_none() && value.is_none() && enumeration_limit.is_some() => {}
             RemoteKeychainOperation::Add
                 if account.is_some() && value.is_some() && enumeration_limit.is_none() => {}
-            RemoteKeychainOperation::CopyMatching | RemoteKeychainOperation::Delete
+            RemoteKeychainOperation::CopyMatching
+            | RemoteKeychainOperation::Update
+            | RemoteKeychainOperation::Delete
                 if account.is_some() && value.is_none() && enumeration_limit.is_none() => {}
             _ => return Err(()),
         }
@@ -549,9 +661,9 @@ impl SecurityItemQuery {
             let authentication_ui = match operation {
                 RemoteKeychainOperation::CopyMatching => kSecUseAuthenticationUISkip,
                 RemoteKeychainOperation::ListAccountAttributes => kSecUseAuthenticationUISkip,
-                RemoteKeychainOperation::Add | RemoteKeychainOperation::Delete => {
-                    kSecUseAuthenticationUIFail
-                }
+                RemoteKeychainOperation::Add
+                | RemoteKeychainOperation::Update
+                | RemoteKeychainOperation::Delete => kSecUseAuthenticationUIFail,
             };
             builder.borrowed(kSecUseAuthenticationUI, authentication_ui);
             if let Some(value) = value {

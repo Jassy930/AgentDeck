@@ -22,7 +22,7 @@ use keychain::{
 };
 use macos_keychain::{
     AddOutcome, DeleteOutcome, MacOsRemoteKeyStore, RemoteKeychainOperation, RemoteKeychainPolicy,
-    SecurityItemBackend,
+    SecurityItemBackend, UpdateOutcome,
 };
 use signature::{
     CurrentRemoteCliSignatureVerifier, REMOTE_CLI_CODE_IDENTIFIER, RemoteCliSignatureAttestation,
@@ -88,6 +88,7 @@ enum Operation {
     Add(PolicySnapshot, String),
     Load(PolicySnapshot, String),
     ListAccountAttributes(PolicySnapshot, usize),
+    Update(PolicySnapshot, String),
     Delete(PolicySnapshot, String),
 }
 
@@ -97,6 +98,8 @@ struct FakeSecurityItems {
     enumerated_accounts: Mutex<Option<Vec<String>>>,
     operations: Mutex<Vec<Operation>>,
     drop_next_add: Mutex<bool>,
+    drop_next_update: Mutex<bool>,
+    fail_next_update: Mutex<bool>,
     retain_next_delete: Mutex<bool>,
 }
 
@@ -111,6 +114,14 @@ impl FakeSecurityItems {
 
     fn retain_next_delete(&self) {
         *self.retain_next_delete.lock().unwrap() = true;
+    }
+
+    fn drop_next_update(&self) {
+        *self.drop_next_update.lock().unwrap() = true;
+    }
+
+    fn fail_next_update(&self) {
+        *self.fail_next_update.lock().unwrap() = true;
     }
 
     fn return_account_attributes(&self, accounts: Vec<String>) {
@@ -171,6 +182,29 @@ impl SecurityItemBackend for FakeSecurityItems {
             .unwrap_or_else(|| self.values.lock().unwrap().keys().cloned().collect());
         accounts.truncate(limit);
         Ok(accounts)
+    }
+
+    fn update_existing(
+        &self,
+        policy: &RemoteKeychainPolicy<'_>,
+        account: &str,
+        replacement: &[u8],
+    ) -> Result<UpdateOutcome, ()> {
+        self.operations.lock().unwrap().push(Operation::Update(
+            PolicySnapshot::new(policy, RemoteKeychainOperation::Update),
+            account.to_owned(),
+        ));
+        if std::mem::take(&mut *self.fail_next_update.lock().unwrap()) {
+            return Err(());
+        }
+        let mut values = self.values.lock().unwrap();
+        let Some(value) = values.get_mut(account) else {
+            return Ok(UpdateOutcome::NotFound);
+        };
+        if !std::mem::take(&mut *self.drop_next_update.lock().unwrap()) {
+            replacement.clone_into(value);
+        }
+        Ok(UpdateOutcome::Updated)
     }
 
     fn delete(
@@ -245,6 +279,13 @@ fn every_operation_uses_the_fixed_noninteractive_cli_only_policy() {
         store.load(&account).unwrap().unwrap().expose_secret(),
         &[0xa1; 32]
     );
+    store
+        .compare_and_replace_exact(
+            &account,
+            &RemoteSecret::new(vec![0xa1; 32]),
+            &RemoteSecret::new(vec![0xa2; 32]),
+        )
+        .unwrap();
     assert!(
         store
             .list_paired_commit_markers(Uuid::from_u128(0x7777))
@@ -260,7 +301,9 @@ fn every_operation_uses_the_fixed_noninteractive_cli_only_policy() {
     );
     for operation in operations {
         let (policy, expected_ui) = match operation {
-            Operation::Add(policy, _) | Operation::Delete(policy, _) => (policy, "fail"),
+            Operation::Add(policy, _)
+            | Operation::Update(policy, _)
+            | Operation::Delete(policy, _) => (policy, "fail"),
             Operation::Load(policy, _) | Operation::ListAccountAttributes(policy, _) => {
                 (policy, "skip")
             }
@@ -280,6 +323,83 @@ fn security_framework_read_queries_use_ui_skip_and_listing_returns_only_attribut
     assert!(query.contains("RemoteKeychainOperation::ListAccountAttributes"));
     assert!(query.contains("kSecReturnAttributes"));
     assert!(query.contains("kSecUseAuthenticationUIFail"));
+    assert!(source.contains("SecItemUpdate"));
+}
+
+#[test]
+fn compare_and_replace_is_existing_only_and_commit_unknown_fails_closed() {
+    let backend = Arc::new(FakeSecurityItems::default());
+    let store = store(Arc::clone(&backend));
+    let account = account();
+    let expected = RemoteSecret::new(vec![0xa5; 32]);
+    let replacement = RemoteSecret::new(vec![0xa6; 32]);
+
+    assert_eq!(
+        store.compare_and_replace_exact(&account, &expected, &replacement),
+        Err(RemoteKeyStoreError::CompareAndReplaceMissing {
+            account: account.clone(),
+        })
+    );
+    assert!(
+        backend
+            .operations()
+            .iter()
+            .all(|operation| !matches!(operation, Operation::Update(_, _))),
+        "missing must fail before SecItemUpdate"
+    );
+
+    store.persist_immutable(&account, &expected).unwrap();
+    let update_count = backend
+        .operations()
+        .iter()
+        .filter(|operation| matches!(operation, Operation::Update(_, _)))
+        .count();
+    assert_eq!(
+        store
+            .compare_and_replace_exact(&account, &RemoteSecret::new(vec![0xaf; 32]), &replacement,),
+        Err(RemoteKeyStoreError::CompareAndReplaceMismatch {
+            account: account.clone(),
+        })
+    );
+    assert_eq!(
+        backend
+            .operations()
+            .iter()
+            .filter(|operation| matches!(operation, Operation::Update(_, _)))
+            .count(),
+        update_count,
+        "expected mismatch must fail before SecItemUpdate"
+    );
+
+    store
+        .compare_and_replace_exact(&account, &expected, &replacement)
+        .expect("replace exact expected value");
+    assert_eq!(
+        store.load(&account).unwrap().unwrap().expose_secret(),
+        &[0xa6; 32]
+    );
+
+    backend.drop_next_update();
+    assert_eq!(
+        store
+            .compare_and_replace_exact(&account, &replacement, &RemoteSecret::new(vec![0xa7; 32]),),
+        Err(RemoteKeyStoreError::CompareAndReplaceCommitUnknown {
+            account: account.clone(),
+        })
+    );
+    assert_eq!(
+        store.load(&account).unwrap().unwrap().expose_secret(),
+        &[0xa6; 32]
+    );
+
+    backend.fail_next_update();
+    assert_eq!(
+        store
+            .compare_and_replace_exact(&account, &replacement, &RemoteSecret::new(vec![0xa8; 32]),),
+        Err(RemoteKeyStoreError::CompareAndReplaceCommitUnknown {
+            account: account.clone(),
+        })
+    );
 }
 
 #[test]

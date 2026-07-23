@@ -278,6 +278,52 @@ fn immutable_insert_retries_exact_bytes_and_rejects_conflicts_without_overwrite(
 }
 
 #[test]
+fn compare_and_replace_is_existing_only_and_never_overwrites_an_expected_mismatch() {
+    let store = MemoryRemoteKeyStore::new();
+    let account = paired_account(PairedRemoteKeyPurpose::CounterGuard);
+    let expected = RemoteSecret::new(vec![0x43; 32]);
+    let replacement = RemoteSecret::new(vec![0x44; 32]);
+
+    assert_eq!(
+        store.compare_and_replace_exact(&account, &expected, &replacement),
+        Err(RemoteKeyStoreError::CompareAndReplaceMissing {
+            account: account.clone(),
+        })
+    );
+
+    store
+        .persist_immutable(&account, &expected)
+        .expect("seed expected counter guard");
+    assert_eq!(
+        store
+            .compare_and_replace_exact(&account, &RemoteSecret::new(vec![0x45; 32]), &replacement,),
+        Err(RemoteKeyStoreError::CompareAndReplaceMismatch {
+            account: account.clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .load(&account)
+            .expect("load after expected mismatch")
+            .expect("expected value remains present")
+            .expose_secret(),
+        &[0x43; 32]
+    );
+
+    store
+        .compare_and_replace_exact(&account, &expected, &replacement)
+        .expect("replace exact expected bytes");
+    assert_eq!(
+        store
+            .load(&account)
+            .expect("load replacement")
+            .expect("replacement remains present")
+            .expose_secret(),
+        &[0x44; 32]
+    );
+}
+
+#[test]
 fn concurrent_immutable_insert_has_one_winner_and_never_mixes_values() {
     let store = Arc::new(MemoryRemoteKeyStore::new());
     let barrier = Arc::new(Barrier::new(3));
