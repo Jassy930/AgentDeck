@@ -5944,34 +5944,27 @@ fn remote_permission_requests(
     let conversation =
         ConversationId::new(synthetic_wire_id(RuntimeIdKind::Conversation, seed.max(1)));
     match permission {
-        AuthorizationPermissionV1::CatalogRead => vec![
-            RuntimeRequest::DescribeAgents,
-            RuntimeRequest::Catalog(CatalogRequest { page_cursor: None }),
-        ],
-        AuthorizationPermissionV1::ConversationRead => vec![
-            RuntimeRequest::Subscribe {
-                inner_cursor: RuntimeInnerCursor::Conversation {
-                    conversation_id: conversation.clone(),
-                    cursor: StreamCursor::BeforeFirst,
+        AuthorizationPermissionV1::CatalogRead => {
+            let mut requests = vec![
+                RuntimeRequest::DescribeAgents,
+                RuntimeRequest::Catalog(CatalogRequest { page_cursor: None }),
+            ];
+            requests.extend(catalog_stream_permission_requests());
+            requests
+        }
+        AuthorizationPermissionV1::ConversationRead => {
+            let mut requests = conversation_stream_permission_requests(conversation.clone());
+            requests.push(RuntimeRequest::QueryReceipt(
+                QueryReceiptSelector::Command {
+                    conversation_id: conversation,
+                    command_id: CommandId::new(synthetic_wire_id(
+                        RuntimeIdKind::Command,
+                        seed.wrapping_add(1).max(1),
+                    )),
                 },
-            },
-            RuntimeRequest::Unsubscribe {
-                target: RuntimeSubscriptionTarget::Conversation {
-                    conversation_id: conversation.clone(),
-                },
-            },
-            RuntimeRequest::Backfill(BackfillRequest::Conversation {
-                conversation_id: conversation.clone(),
-                after: StreamCursor::BeforeFirst,
-            }),
-            RuntimeRequest::QueryReceipt(QueryReceiptSelector::Command {
-                conversation_id: conversation,
-                command_id: CommandId::new(synthetic_wire_id(
-                    RuntimeIdKind::Command,
-                    seed.wrapping_add(1).max(1),
-                )),
-            }),
-        ],
+            ));
+            requests
+        }
         AuthorizationPermissionV1::ConversationStart => {
             vec![RuntimeRequest::Start(ConversationStart {
                 agent_kind: AgentKind::Codex,
@@ -6053,6 +6046,42 @@ fn remote_permission_requests(
             })]
         }
     }
+}
+
+fn catalog_stream_permission_requests() -> Vec<RuntimeRequest> {
+    vec![
+        RuntimeRequest::Subscribe {
+            inner_cursor: RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::BeforeFirst,
+            },
+        },
+        RuntimeRequest::Unsubscribe {
+            target: RuntimeSubscriptionTarget::Catalog,
+        },
+        RuntimeRequest::Backfill(BackfillRequest::Catalog {
+            after: StreamCursor::BeforeFirst,
+        }),
+    ]
+}
+
+fn conversation_stream_permission_requests(conversation: ConversationId) -> Vec<RuntimeRequest> {
+    vec![
+        RuntimeRequest::Subscribe {
+            inner_cursor: RuntimeInnerCursor::Conversation {
+                conversation_id: conversation.clone(),
+                cursor: StreamCursor::BeforeFirst,
+            },
+        },
+        RuntimeRequest::Unsubscribe {
+            target: RuntimeSubscriptionTarget::Conversation {
+                conversation_id: conversation.clone(),
+            },
+        },
+        RuntimeRequest::Backfill(BackfillRequest::Conversation {
+            conversation_id: conversation,
+            after: StreamCursor::BeforeFirst,
+        }),
+    ]
 }
 
 fn reply_has_failure_code(reply: &RuntimeReply, expected: &str) -> bool {
@@ -6143,6 +6172,233 @@ async fn remote_principal_enforces_the_exact_nine_permission_table() {
             .await
             .expect("shutdown remote permission Core");
     }
+}
+
+#[tokio::test]
+async fn remote_stream_permissions_follow_explicit_target_on_envelope_path() {
+    for (permission_index, permission) in [
+        AuthorizationPermissionV1::CatalogRead,
+        AuthorizationPermissionV1::ConversationRead,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = TestRoot::new(&format!("remote-stream-permission-{permission:?}"));
+        let store = active_authorization_store_with_permissions_for_test(
+            &root.database(),
+            root.kek(),
+            vec![remote_permission_capability(permission)],
+            vec![permission],
+        )
+        .await;
+        let trust_domain = store
+            .machine_trust_domain()
+            .expect("derive stream permission fixture trust domain");
+        let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+        let core = Arc::new(
+            RuntimeCore::new(store.clone(), router, trust_domain)
+                .expect("construct stream permission Core"),
+        );
+        core.recover()
+            .await
+            .expect("recover stream permission Core");
+
+        let conversation = ConversationId::new(synthetic_wire_id(
+            RuntimeIdKind::Conversation,
+            u8::try_from(permission_index + 0x61).expect("stream permission seed"),
+        ));
+        let (allowed, denied) = match permission {
+            AuthorizationPermissionV1::CatalogRead => (
+                catalog_stream_permission_requests(),
+                conversation_stream_permission_requests(ConversationId::new(
+                    "malformed-conversation-id",
+                )),
+            ),
+            AuthorizationPermissionV1::ConversationRead => (
+                conversation_stream_permission_requests(conversation),
+                catalog_stream_permission_requests(),
+            ),
+            _ => unreachable!("two read permissions only"),
+        };
+
+        for (request_index, (should_allow, request)) in allowed
+            .into_iter()
+            .map(|request| (true, request))
+            .chain(denied.into_iter().map(|request| (false, request)))
+            .enumerate()
+        {
+            let ingress = store
+                .load_active_remote_ingress(
+                    MachineRouteId::from_bytes([0x32; 16]),
+                    DeviceRouteId::from_bytes([0xd1; 16]),
+                )
+                .await
+                .expect("load stream permission ingress proof");
+            let registered = core
+                .register_remote_principal(&ingress)
+                .expect("register stream permission remote lease");
+            let current = store
+                .recheck_active_remote_ingress(&ingress)
+                .await
+                .expect("final-check stream permission authorization");
+            let principal = core
+                .activate_registered_remote_principal(registered, &current)
+                .expect("activate stream permission principal after final Store proof");
+            let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(16);
+            let connection = core
+                .connect(principal, ConnectionSink::new(sink))
+                .expect("connect stream permission principal");
+
+            core.handle_envelope(
+                connection,
+                RuntimeEnvelope {
+                    version: RUNTIME_PROTOCOL_VERSION,
+                    message_id: MessageId::new(format!(
+                        "stream-permission-{permission_index}-{request_index}"
+                    )),
+                    body: RuntimeMessage::Request(request),
+                },
+            )
+            .await
+            .expect("stream permission request must produce one typed reply");
+            let write = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("stream permission reply deadline")
+                .expect("stream permission reply");
+            let reply: RuntimeEnvelope =
+                serde_json::from_slice(write.bytes()).expect("decode stream permission reply");
+            let permission_denied = matches!(
+                reply.body,
+                RuntimeMessage::Reply(RuntimeReply::Failure(RuntimeFailure { ref code, .. }))
+                    if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
+            );
+            assert_eq!(
+                permission_denied, !should_allow,
+                "{permission:?} target dispatch mismatch at request {request_index}: {reply:?}"
+            );
+            write.acknowledge().expect("ACK stream permission reply");
+
+            if !should_allow {
+                assert_eq!(
+                    core.subscriptions
+                        .metrics_for_test()
+                        .expect("subscription metrics after denied request"),
+                    (0, 0, 0, 0)
+                );
+                assert_eq!(
+                    core.subscriptions
+                        .catalog_metrics_for_test()
+                        .expect("catalog metrics after denied request"),
+                    (0, 0)
+                );
+                assert_eq!(
+                    core.subscriptions
+                        .pending_job_usage_for_test(connection)
+                        .expect("pending job metrics after denied request"),
+                    (0, 0)
+                );
+            }
+            core.disconnect(connection).await;
+        }
+
+        core.shutdown()
+            .await
+            .expect("shutdown stream permission Core");
+    }
+}
+
+#[tokio::test]
+async fn transition_snapshot_authorizes_store_scope_before_parsing_request_axes() {
+    let root = TestRoot::new("transition-snapshot-permission-precedence");
+    let store = active_authorization_store_with_permissions_for_test(
+        &root.database(),
+        root.kek(),
+        vec![AuthorizationCapabilityV1::Catalog],
+        vec![AuthorizationPermissionV1::CatalogRead],
+    )
+    .await;
+    let trust_domain = store
+        .machine_trust_domain()
+        .expect("derive transition permission fixture trust domain");
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let core = Arc::new(
+        RuntimeCore::new(store.clone(), router, trust_domain)
+            .expect("construct transition permission Core"),
+    );
+    core.recover()
+        .await
+        .expect("recover transition permission Core");
+    let ingress = store
+        .load_active_remote_ingress(
+            MachineRouteId::from_bytes([0x32; 16]),
+            DeviceRouteId::from_bytes([0xd1; 16]),
+        )
+        .await
+        .expect("load transition permission ingress proof");
+    let registered = core
+        .register_remote_principal(&ingress)
+        .expect("register transition permission remote lease");
+    let current = store
+        .recheck_active_remote_ingress(&ingress)
+        .await
+        .expect("final-check transition permission authorization");
+    let principal = core
+        .activate_registered_remote_principal(registered, &current)
+        .expect("activate transition permission principal");
+    let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(4);
+    let connection = core
+        .connect(principal, ConnectionSink::new(sink))
+        .expect("connect transition permission principal");
+    let permit = crate::runtime::store::key_transition::TransitionSnapshotPermit::for_authorization_precedence_test(
+        crate::runtime::store::key_transition::KeyTransitionStreamScope::Conversation([0x66; 16]),
+    );
+
+    core.handle_transition_snapshot_envelope(
+        connection,
+        RuntimeEnvelope {
+            version: RUNTIME_PROTOCOL_VERSION,
+            message_id: MessageId::new("transition-permission-precedence"),
+            body: RuntimeMessage::Request(RuntimeRequest::Subscribe {
+                inner_cursor: RuntimeInnerCursor::Conversation {
+                    conversation_id: ConversationId::new("malformed-conversation-id"),
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            }),
+        },
+        permit,
+    )
+    .await
+    .expect("permission denial must be emitted as a typed reply");
+    let write = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+        .await
+        .expect("transition permission reply deadline")
+        .expect("transition permission reply");
+    let reply: RuntimeEnvelope =
+        serde_json::from_slice(write.bytes()).expect("decode transition permission reply");
+    assert!(matches!(
+        reply.body,
+        RuntimeMessage::Reply(RuntimeReply::Failure(RuntimeFailure { ref code, .. }))
+            if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
+    ));
+    assert_eq!(
+        core.subscriptions
+            .metrics_for_test()
+            .expect("subscription metrics after transition denial"),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        core.subscriptions
+            .catalog_metrics_for_test()
+            .expect("catalog metrics after transition denial"),
+        (0, 0)
+    );
+    write
+        .acknowledge()
+        .expect("ACK transition permission reply");
+    core.disconnect(connection).await;
+    core.shutdown()
+        .await
+        .expect("shutdown transition permission Core");
 }
 
 #[path = "subscription_tests.rs"]

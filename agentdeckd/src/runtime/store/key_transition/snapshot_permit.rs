@@ -60,6 +60,28 @@ pub(crate) struct TransitionSnapshotPermit {
 }
 
 impl TransitionSnapshotPermit {
+    #[cfg(test)]
+    pub(crate) fn for_authorization_precedence_test(scope: KeyTransitionStreamScope) -> Self {
+        Self {
+            operation_id: [0x11; 16],
+            recipient: KeyTransitionRecipient {
+                device_route: [0x22; 16],
+                grant_serial: 1,
+            },
+            authorization_hash: [0x33; 32],
+            scope,
+            publication_stream_id: [0x44; 16],
+            stream_route: [0x55; 16],
+            generation: [0x66; 16],
+            relay_committed_outer: None,
+            relay_committed_inner: None,
+            barrier_sequence: 0,
+            key_directory_revision: 1,
+            key_epoch: 1,
+            epoch_barrier_sha256: [0x77; 32],
+        }
+    }
+
     pub(crate) const fn operation_id(&self) -> [u8; 16] {
         self.operation_id
     }

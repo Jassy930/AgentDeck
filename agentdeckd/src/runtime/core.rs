@@ -819,8 +819,8 @@ impl RuntimeCore {
                 ),
             );
         };
-        let (target, cursor) = match parse_inner_cursor(inner_cursor) {
-            Ok(value) => value,
+        let expected_target = match transition_snapshot_target(&permit) {
+            Ok(target) => target,
             Err(error) => {
                 return self.enqueue_stream_failure(
                     &operation,
@@ -830,8 +830,21 @@ impl RuntimeCore {
                 );
             }
         };
-        let expected_target = match transition_snapshot_target(&permit) {
-            Ok(target) => target,
+        let authorization =
+            principal.try_enter_runtime_permission(runtime_stream_permission(&expected_target));
+        let _authorization = match authorization {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                return self.enqueue_stream_failure(
+                    &operation,
+                    connection_id,
+                    message_id,
+                    RuntimeCoreError::from(error).into_failure(),
+                );
+            }
+        };
+        let (target, cursor) = match parse_inner_cursor(inner_cursor) {
+            Ok(value) => value,
             Err(error) => {
                 return self.enqueue_stream_failure(
                     &operation,
@@ -854,25 +867,6 @@ impl RuntimeCore {
                 ),
             );
         }
-        let authorization = match target {
-            super::events::RuntimeStreamTarget::Catalog => {
-                principal.try_enter_runtime_permission(AuthorizationPermissionV1::CatalogRead)
-            }
-            super::events::RuntimeStreamTarget::Conversation(_) => {
-                principal.try_enter_runtime_permission(AuthorizationPermissionV1::ConversationRead)
-            }
-        };
-        let _authorization = match authorization {
-            Ok(authorization) => authorization,
-            Err(error) => {
-                return self.enqueue_stream_failure(
-                    &operation,
-                    connection_id,
-                    message_id,
-                    RuntimeCoreError::from(error).into_failure(),
-                );
-            }
-        };
         match self
             .subscriptions
             .prepare_transition_snapshot(connection_id, message_id.clone(), target, permit)
@@ -978,9 +972,8 @@ impl RuntimeCore {
                 }
             }
             RuntimeRequest::Subscribe { inner_cursor } => {
-                let _authorization = match principal
-                    .try_enter_runtime_permission(AuthorizationPermissionV1::ConversationRead)
-                {
+                let permission = runtime_inner_cursor_permission(&inner_cursor);
+                let _authorization = match principal.try_enter_runtime_permission(permission) {
                     Ok(value) => value,
                     Err(error) => {
                         return Some(self.enqueue_stream_failure(
@@ -1021,9 +1014,8 @@ impl RuntimeCore {
                 }
             }
             RuntimeRequest::Backfill(request) => {
-                let _authorization = match principal
-                    .try_enter_runtime_permission(AuthorizationPermissionV1::ConversationRead)
-                {
+                let permission = runtime_backfill_permission(&request);
+                let _authorization = match principal.try_enter_runtime_permission(permission) {
                     Ok(value) => value,
                     Err(error) => {
                         return Some(self.enqueue_stream_failure(
@@ -1064,9 +1056,8 @@ impl RuntimeCore {
                 }
             }
             RuntimeRequest::Unsubscribe { target } => {
-                let _authorization = match principal
-                    .try_enter_runtime_permission(AuthorizationPermissionV1::ConversationRead)
-                {
+                let permission = runtime_subscription_permission(&target);
+                let _authorization = match principal.try_enter_runtime_permission(permission) {
                     Ok(value) => value,
                     Err(error) => {
                         return Some(self.enqueue_stream_failure(
@@ -1637,11 +1628,19 @@ impl RuntimeCore {
                     turn_id: receipt.turn_id.map(wire_turn_id),
                 }))
             }
-            RuntimeRequest::Subscribe { .. }
-            | RuntimeRequest::Unsubscribe { .. }
-            | RuntimeRequest::Backfill(_) => {
+            RuntimeRequest::Subscribe { inner_cursor } => {
                 let _authorization = principal
-                    .try_enter_runtime_permission(AuthorizationPermissionV1::ConversationRead)?;
+                    .try_enter_runtime_permission(runtime_inner_cursor_permission(&inner_cursor))?;
+                Err(RuntimeCoreError::InvalidRequest)
+            }
+            RuntimeRequest::Unsubscribe { target } => {
+                let _authorization = principal
+                    .try_enter_runtime_permission(runtime_subscription_permission(&target))?;
+                Err(RuntimeCoreError::InvalidRequest)
+            }
+            RuntimeRequest::Backfill(request) => {
+                let _authorization = principal
+                    .try_enter_runtime_permission(runtime_backfill_permission(&request))?;
                 Err(RuntimeCoreError::InvalidRequest)
             }
             // Catalog page 可能超过单 frame 上限，必须携带原 messageId 进入
@@ -2555,6 +2554,40 @@ fn transition_snapshot_target(
             RuntimeId::from_bytes(RuntimeIdKind::Conversation, bytes)
                 .map(super::events::RuntimeStreamTarget::Conversation)
                 .map_err(|_| RuntimeCoreError::InvalidRequest)
+        }
+    }
+}
+
+fn runtime_stream_permission(
+    target: &super::events::RuntimeStreamTarget,
+) -> AuthorizationPermissionV1 {
+    match target {
+        super::events::RuntimeStreamTarget::Catalog => AuthorizationPermissionV1::CatalogRead,
+        super::events::RuntimeStreamTarget::Conversation(_) => {
+            AuthorizationPermissionV1::ConversationRead
+        }
+    }
+}
+
+fn runtime_inner_cursor_permission(value: &RuntimeInnerCursor) -> AuthorizationPermissionV1 {
+    match value {
+        RuntimeInnerCursor::Catalog { .. } => AuthorizationPermissionV1::CatalogRead,
+        RuntimeInnerCursor::Conversation { .. } => AuthorizationPermissionV1::ConversationRead,
+    }
+}
+
+fn runtime_backfill_permission(value: &BackfillRequest) -> AuthorizationPermissionV1 {
+    match value {
+        BackfillRequest::Catalog { .. } => AuthorizationPermissionV1::CatalogRead,
+        BackfillRequest::Conversation { .. } => AuthorizationPermissionV1::ConversationRead,
+    }
+}
+
+fn runtime_subscription_permission(value: &RuntimeSubscriptionTarget) -> AuthorizationPermissionV1 {
+    match value {
+        RuntimeSubscriptionTarget::Catalog => AuthorizationPermissionV1::CatalogRead,
+        RuntimeSubscriptionTarget::Conversation { .. } => {
+            AuthorizationPermissionV1::ConversationRead
         }
     }
 }
