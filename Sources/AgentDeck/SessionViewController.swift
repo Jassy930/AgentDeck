@@ -244,8 +244,9 @@ final class SessionViewController: NSViewController {
         conversationComposite.translatesAutoresizingMaskIntoConstraints = false
         conversationComposite.addSubview(convView)
 
-        // Rail: dedicated trailing column, 44pt interaction width, full height.
-        // It must not overlay the composer, transcript, or environment panel.
+        // Rail: dedicated 44pt trailing column, with 36pt navigation interaction
+        // and an 8pt native window-resize gutter at the outside edge. It must
+        // not overlay the composer, transcript, or environment panel.
         rail.translatesAutoresizingMaskIntoConstraints = false
         conversationComposite.addSubview(rail)
 

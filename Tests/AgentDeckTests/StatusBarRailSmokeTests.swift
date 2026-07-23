@@ -67,8 +67,34 @@ final class StatusBarRailSmokeTests: XCTestCase {
         let view = TurnJumpRailView(model: model)
         view.frame = CGRect(x: 0, y: 0, width: TurnJumpRailLayout.width, height: 400)
         view.layoutSubtreeIfNeeded()
-        XCTAssertEqual(TurnJumpRailLayout.width, 44, "轨道应提供完整的桌面命中宽度")
+        XCTAssertEqual(TurnJumpRailLayout.width, 44, "轨道尾列应保持 44pt 布局宽度")
         XCTAssertGreaterThan(view.bounds.height, 0)
+    }
+
+    func testTurnJumpRailLeavesTrailingWindowResizeGutter() throws {
+        let view = TurnJumpRailView(model: SessionModel())
+        view.frame = NSRect(x: 0, y: 0, width: TurnJumpRailLayout.width, height: 400)
+        view.layoutSubtreeIfNeeded()
+        let expectedInteractiveWidth = TurnJumpRailLayout.width - 8
+
+        let interaction = try XCTUnwrap(
+            view.firstDescendant(ofType: RailInteractionNSView.self)
+        )
+        XCTAssertEqual(
+            interaction.frame.width,
+            expectedInteractiveWidth,
+            accuracy: 0.5,
+            "回合导航必须为窗口右缘保留原生缩放命中区"
+        )
+        XCTAssertTrue(
+            view.hitTest(NSPoint(x: expectedInteractiveWidth - 1, y: 200))
+                === interaction,
+            "缩放区左侧仍应保持完整的轨道交互"
+        )
+        XCTAssertNil(
+            view.hitTest(NSPoint(x: TurnJumpRailLayout.width - 1, y: 200)),
+            "窗口最右侧不能被轨道吞掉，必须交还给原生缩放"
+        )
     }
 
     func testTurnJumpRailSummaryBubbleClampsInsideNarrowContainer() {

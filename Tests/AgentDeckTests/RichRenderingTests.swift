@@ -68,7 +68,7 @@ struct RichRenderingTests {
         #expect(items[1].attachmentCount == 0)
     }
 
-    @Test("turn jump rail hit testing covers full rail positions")
+    @Test("turn jump rail hit testing preserves the trailing window resize gutter")
     func turnJumpRailHitTestingCoversFullRailPositions() {
         let height: CGFloat = 200
         let firstY = TurnJumpRailLayout.turnY(index: 0, count: 3, height: height)
@@ -76,8 +76,9 @@ struct RichRenderingTests {
         let latestY = TurnJumpRailLayout.latestY(height: height)
 
         #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: 1, y: firstY), count: 3, height: height) == .turn(0))
-        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: TurnJumpRailLayout.width - 1, y: middleY + 6), count: 3, height: height) == .turn(1))
+        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: TurnJumpRailLayout.interactiveWidth - 1, y: middleY + 6), count: 3, height: height) == .turn(1))
         #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: TurnJumpRailLayout.centerX, y: latestY), count: 3, height: height) == .latest)
+        #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: TurnJumpRailLayout.width - 1, y: middleY), count: 3, height: height) == nil)
         #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: TurnJumpRailLayout.width + 1, y: firstY), count: 3, height: height) == nil)
         #expect(TurnJumpRailLayout.hitTarget(at: CGPoint(x: TurnJumpRailLayout.centerX, y: height - 45), count: 3, height: height) == nil)
     }

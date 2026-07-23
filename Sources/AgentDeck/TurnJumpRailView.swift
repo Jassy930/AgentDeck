@@ -10,9 +10,11 @@ enum TurnJumpRailHitTarget: Equatable {
 }
 
 struct TurnJumpRailLayout {
-    /// 44pt 是轨道的真实交互宽度；视觉圆点仍保持克制，不再让细轨道
-    /// 同时承担过小的鼠标/触控命中区域。
+    /// 44pt 是轨道尾列的布局宽度。最右侧 8pt 必须留给 macOS 原生窗口
+    /// 缩放命中；否则全高交互层会吞掉用户从右边缘拉宽窗口的手势。
     static let width: CGFloat = 44
+    static let windowResizeGutter: CGFloat = 8
+    static let interactiveWidth = width - windowResizeGutter
     static let centerX: CGFloat = 22
     static let turnSpacing: CGFloat = 16
     private static let topPadding: CGFloat = 18
@@ -130,7 +132,7 @@ struct TurnJumpRailLayout {
         height: CGFloat,
         scrollOffset: CGFloat = 0
     ) -> TurnJumpRailHitTarget? {
-        guard point.x >= 0, point.x <= width else { return nil }
+        guard point.x >= 0, point.x < interactiveWidth else { return nil }
         if abs(point.y - latestY(height: height)) <= hitRadius {
             return .latest
         }
@@ -432,11 +434,26 @@ final class TurnJumpRailView: NSView {
 
     override func layout() {
         super.layout()
-        interactionView.frame = bounds
+        interactionView.frame = NSRect(
+            x: bounds.minX,
+            y: bounds.minY,
+            width: max(0, bounds.width - TurnJumpRailLayout.windowResizeGutter),
+            height: bounds.height
+        )
         interactionView.itemCount = navItems.count
         interactionView.railScrollOffset = railScrollOffset
         positionSummaryBubble()
         needsDisplay = true
+    }
+
+    /// 不让回合导航覆盖窗口右缘的原生 resize hit zone。返回 nil 后事件
+    /// 继续交给窗口内容层级，AppKit 可恢复标准左右缩放光标与拖拽手势。
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard bounds.contains(point) else { return nil }
+        guard point.x < bounds.maxX - TurnJumpRailLayout.windowResizeGutter else {
+            return nil
+        }
+        return super.hitTest(point)
     }
 
     override func viewDidMoveToSuperview() {

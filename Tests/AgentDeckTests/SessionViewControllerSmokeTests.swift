@@ -208,6 +208,42 @@ final class SessionViewControllerSmokeTests: XCTestCase {
         XCTAssertLessThanOrEqual(bubble.frame.maxX, rail.frame.minX - 8)
     }
 
+    func testWindowHitTestingDoesNotRouteTrailingResizeGutterIntoRail() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        model.cwd = URL(fileURLWithPath: NSTemporaryDirectory())
+        model.items = [
+            UIItem(id: "u1", lifecycle: "completed", kind: "user", text: "验证右缘缩放"),
+        ]
+        let vc = SessionViewController(model: model)
+        let window = NSWindow(contentViewController: vc)
+        window.styleMask.insert([.titled, .resizable, .fullSizeContentView])
+        window.setContentSize(NSSize(width: 1000, height: 620))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+
+        let rail = try XCTUnwrap(vc.view.descendant(id: "turn-jump-rail"))
+        rail.layoutSubtreeIfNeeded()
+        let interaction = try XCTUnwrap(
+            rail.firstDescendant(ofType: RailInteractionNSView.self)
+        )
+        let resizePoint = rail.convert(
+            NSPoint(x: TurnJumpRailLayout.width - 1, y: rail.bounds.midY),
+            to: window.contentView
+        )
+
+        XCTAssertFalse(
+            window.contentView?.hitTest(resizePoint) is RailInteractionNSView,
+            "真实窗口层级最右 8pt 不得再路由给回合导航"
+        )
+        XCTAssertEqual(
+            interaction.frame.width,
+            TurnJumpRailLayout.interactiveWidth,
+            accuracy: 0.5,
+            "真实窗口中的轨道交互层应在缩放区之前结束"
+        )
+    }
+
     // MARK: - Child controllers
 
     func testSessionViewControllerHasChildControllers() {
