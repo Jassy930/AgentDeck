@@ -11,15 +11,21 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use agentdeck_crypto::rand_core::{CryptoRng, TryCryptoRng, TryRng};
-use agentdeck_crypto::sha256;
+use agentdeck_crypto::{CryptoError, sha256};
 use agentdeck_protocol::ActionDecision;
-use agentdeck_protocol::e2ee::{KeyControlV1, SealedPayloadKind, StreamBindingV1};
+use agentdeck_protocol::e2ee::{
+    E2eeError, KeyControlV1, REMOTE_CRYPTO_BAD_CIPHERTEXT, REMOTE_CRYPTO_BAD_SENDER_SIGNATURE,
+    REMOTE_CRYPTO_COUNTER_REPLAY, REMOTE_CRYPTO_KEY_EPOCH_MISSING,
+    REMOTE_CRYPTO_KEY_REVISION_ROLLBACK, REMOTE_CRYPTO_NONCE_REUSE, SealedPayloadKind,
+    SealedPayloadV1, StreamBindingV1,
+};
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, Ack as RelayAck, SealedBlob, Send as RelaySend, Subscribe as RelaySubscribe,
 };
 use agentdeck_protocol::relay_v2::{
     CodecError, GrantSerial as RelayGrantSerial, MAX_FRAME_BYTES, OpaqueRouteFrame,
-    RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId, decode, encode,
+    RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId, StreamGenerationId, StreamRouteId,
+    decode, encode,
 };
 use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::identity::{
@@ -29,9 +35,9 @@ use agentdeck_protocol::runtime::{
     ApprovalDeliveryState, ApprovalReceipt, BackfillChunk, CatalogSnapshot, CommandReceipt,
     ConversationId, ConversationSnapshot, MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION,
     RevocationReceipt, RuntimeEnvelope, RuntimeFailure, RuntimeInnerCursor, RuntimeMessage,
-    RuntimeReply, RuntimeSyncComplete, RuntimeTransferCarrierError, RuntimeTransferCarrierV1,
-    RuntimeTransferChannel, SendPromptRequest, StreamCursor, SubscriptionReceipt, TRANSFER_TTL_MS,
-    TransferError, TransferProgress, TransferReassembler,
+    RuntimeReply, RuntimeStreamItem, RuntimeSyncComplete, RuntimeTransferCarrierError,
+    RuntimeTransferCarrierV1, RuntimeTransferChannel, SendPromptRequest, StreamCursor,
+    SubscriptionReceipt, TRANSFER_TTL_MS, TransferError, TransferProgress, TransferReassembler,
 };
 use agentdeck_relay_client::RelayClientError;
 use async_trait::async_trait;
@@ -44,7 +50,9 @@ use super::paired_machine::{
     AuthorizedRuntimeRequest, OpaqueRuntimeState, OpenedPairedMachine, PairedPromotionError,
     VerifiedDirectedReply, VerifiedRevocationTerminal,
 };
-use super::stream_state::DurableStreamBindingV1;
+use super::stream_state::{
+    DurableStreamBindingV1, StreamDirectApplyMode, StreamPublishDisposition,
+};
 
 const EXCHANGE_MAGIC: &[u8; 4] = b"ADRX";
 const LEGACY_EXCHANGE_VERSION: u16 = 1;
@@ -201,6 +209,23 @@ pub enum RemoteSubscriptionBootstrapItem {
     Backfill(BackfillChunk),
 }
 
+/// 单个 authenticated live stream frame 的业务结果。Relay replay/control terminal 与
+/// Runtime reducer apply 保持显式区分；`AppliedDuplicate` 只表示本地 durable cut 已包含该
+/// publication，调用方仍已重新发送 cumulative ACK。
+#[derive(Debug)]
+pub enum RemoteStreamFrameOutcome {
+    Applied(Box<RuntimeStreamItem>),
+    AuthenticatedOverlap,
+    AppliedDuplicate,
+    Gap {
+        need_stream_seq: u64,
+        oldest_stream_seq: u64,
+    },
+    ReplayComplete {
+        current_cursor: StreamCursor,
+    },
+}
+
 /// subscription bootstrap 的 clone-and-swap reducer 契约。
 ///
 /// Runtime 先 clone 当前 reducer，再把全部 authenticated snapshot/backfill 应用到 clone；
@@ -210,6 +235,11 @@ pub trait RemoteSubscriptionReducer: Clone {
     fn inner_cursor(&self) -> &RuntimeInnerCursor;
 
     fn apply(&mut self, item: &RemoteSubscriptionBootstrapItem) -> Result<(), RemoteRuntimeError>;
+
+    /// 应用一条已经完成 Publish signature/replay/AEAD/canonical 验证、且相对 durable
+    /// `inner_observed` exact-next 的 live item。Runtime 只在 clone 上调用，并在 cursor
+    /// 精确到达预期 cut、durable state COMMIT 后 swap 回调用方。
+    fn apply_live(&mut self, item: &RuntimeStreamItem) -> Result<(), RemoteRuntimeError>;
 }
 
 impl RemoteSubscriptionBootstrap {
@@ -327,6 +357,10 @@ pub enum RemoteRuntimeError {
     Transfer(#[from] TransferError),
     #[error("authenticated reply replay tuple was rejected")]
     ReplayRejected,
+    #[error("authenticated stream counter is stale or not admissible")]
+    CounterReplay,
+    #[error("authenticated stream reused a nonce with a different ciphertext")]
+    NonceReuse,
     #[error("durable remote runtime state has an invalid canonical encoding")]
     InvalidDurableState,
 }
@@ -335,6 +369,18 @@ impl RemoteRuntimeError {
     #[must_use]
     pub fn code(&self) -> &str {
         match self {
+            Self::Paired(PairedPromotionError::Crypto(CryptoError::BadSignature)) => {
+                REMOTE_CRYPTO_BAD_SENDER_SIGNATURE
+            }
+            Self::Paired(PairedPromotionError::Crypto(CryptoError::BadCiphertext)) => {
+                REMOTE_CRYPTO_BAD_CIPHERTEXT
+            }
+            Self::Paired(PairedPromotionError::Crypto(CryptoError::E2ee(
+                E2eeError::KeyEpochMissing,
+            ))) => REMOTE_CRYPTO_KEY_EPOCH_MISSING,
+            Self::Paired(PairedPromotionError::Crypto(CryptoError::E2ee(
+                E2eeError::KeyRevisionRollback,
+            ))) => REMOTE_CRYPTO_KEY_REVISION_ROLLBACK,
             Self::Paired(error) => error.code(),
             Self::Transport(RemoteRuntimeTransportError::Relay(error)) => error.code(),
             Self::Transport(RemoteRuntimeTransportError::Failed(_)) => {
@@ -350,6 +396,8 @@ impl RemoteRuntimeError {
             Self::OutcomeUnknown => "remote.runtime.outcome_unknown",
             Self::Transfer(error) => error.code(),
             Self::ReplayRejected => "remote.runtime.replay_rejected",
+            Self::CounterReplay => REMOTE_CRYPTO_COUNTER_REPLAY,
+            Self::NonceReuse => REMOTE_CRYPTO_NONCE_REUSE,
             Self::InvalidDurableState => "remote.runtime.state_invalid",
         }
     }
@@ -675,6 +723,139 @@ where
                     ));
                 }
             }
+        }
+    }
+
+    /// 接收并处理一个 subscription-owned Relay frame。Publish 在进入 reducer 前固定走：
+    /// canonical Relay outer → route/generation/key/AAD/signature → durable replay admission →
+    /// AEAD/canonical Runtime stream → clone reducer → durable outer/inner → reducer swap → ACK。
+    pub async fn receive_stream_frame<D>(
+        &mut self,
+        reducer: &mut D,
+    ) -> Result<RemoteStreamFrameOutcome, RemoteRuntimeError>
+    where
+        D: RemoteSubscriptionReducer,
+    {
+        let received = self
+            .transport
+            .recv()
+            .await?
+            .ok_or(RemoteRuntimeError::OutcomeUnknown)?;
+        validate_received_runtime_frame(&received)?;
+        let (frame, _) = received.into_parts();
+        match frame.body {
+            RelayFrameBody::Publish(publish) => {
+                let durable =
+                    self.stream_binding_for_route(publish.stream_route, publish.generation)?;
+                if reducer.inner_cursor() != durable.inner_applied() {
+                    return Err(RemoteRuntimeError::InvalidDurableState);
+                }
+                let candidate = self.machine.verify_stream_publish(&durable, &publish)?;
+                let stream_seq = candidate.stream_seq();
+                let (admitted, disposition) = durable
+                    .admit_publish(
+                        candidate.stream_seq(),
+                        candidate.counter(),
+                        candidate.ciphertext_sha256(),
+                    )
+                    .map_err(|_| RemoteRuntimeError::CounterReplay)?;
+                let admitted = if admitted == durable {
+                    durable
+                } else {
+                    let mut mutation_rng = SystemMutationRng::new()?;
+                    self.machine.commit_stream_state_transition(
+                        &durable,
+                        &admitted,
+                        &mut mutation_rng,
+                    )?
+                };
+                match disposition {
+                    StreamPublishDisposition::NonceReuseQuarantined => {
+                        return Err(RemoteRuntimeError::NonceReuse);
+                    }
+                    StreamPublishDisposition::AppliedDuplicate => {
+                        self.send_stream_ack(&admitted).await?;
+                        return Ok(RemoteStreamFrameOutcome::AppliedDuplicate);
+                    }
+                    StreamPublishDisposition::Fresh
+                    | StreamPublishDisposition::PendingDuplicate => {}
+                }
+
+                let opened = self.machine.open_verified_stream_publish(candidate)?;
+                let (item, observed_after) = decode_direct_stream_item(admitted.binding(), opened)?;
+                let mode = admitted.direct_apply_mode(&observed_after).map_err(|_| {
+                    RemoteRuntimeError::InvalidReply(
+                        "live stream item is not exact-next for the durable inner cut",
+                    )
+                })?;
+                let staged_reducer = if mode == StreamDirectApplyMode::Apply {
+                    let mut staged = reducer.clone();
+                    staged.apply_live(&item)?;
+                    if staged.inner_cursor() != &observed_after {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "live reducer did not reach the exact authenticated inner cut",
+                        ));
+                    }
+                    Some(staged)
+                } else {
+                    None
+                };
+                let (committed, committed_mode) = admitted
+                    .commit_direct_publish(stream_seq, observed_after)
+                    .map_err(|_| RemoteRuntimeError::InvalidDurableState)?;
+                if committed_mode != mode {
+                    return Err(RemoteRuntimeError::InvalidDurableState);
+                }
+                let mut mutation_rng = SystemMutationRng::new()?;
+                let committed = self.machine.commit_stream_state_transition(
+                    &admitted,
+                    &committed,
+                    &mut mutation_rng,
+                )?;
+                if let Some(staged) = staged_reducer {
+                    *reducer = staged;
+                }
+                self.send_stream_ack(&committed).await?;
+                match committed_mode {
+                    StreamDirectApplyMode::Overlap => {
+                        Ok(RemoteStreamFrameOutcome::AuthenticatedOverlap)
+                    }
+                    StreamDirectApplyMode::Apply => {
+                        Ok(RemoteStreamFrameOutcome::Applied(Box::new(item)))
+                    }
+                }
+            }
+            RelayFrameBody::Gap(gap) => {
+                let durable = self.stream_binding_for_route(gap.stream_route, gap.generation)?;
+                durable
+                    .validate_gap(gap.need_stream_seq, gap.oldest_stream_seq)
+                    .map_err(|_| {
+                        RemoteRuntimeError::InvalidReply(
+                            "Relay Gap does not match the exact durable stream cut",
+                        )
+                    })?;
+                Ok(RemoteStreamFrameOutcome::Gap {
+                    need_stream_seq: gap.need_stream_seq,
+                    oldest_stream_seq: gap.oldest_stream_seq,
+                })
+            }
+            RelayFrameBody::ReplayComplete(complete) => {
+                let durable =
+                    self.stream_binding_for_route(complete.stream_route, complete.generation)?;
+                durable
+                    .validate_replay_complete(complete.current_cursor)
+                    .map_err(|_| {
+                        RemoteRuntimeError::InvalidReply(
+                            "Relay ReplayComplete does not match the exact durable stream cut",
+                        )
+                    })?;
+                Ok(RemoteStreamFrameOutcome::ReplayComplete {
+                    current_cursor: complete.current_cursor,
+                })
+            }
+            _ => Err(RemoteRuntimeError::InvalidReply(
+                "unexpected Relay frame on the live stream ingress",
+            )),
         }
     }
 
@@ -1022,27 +1203,59 @@ where
             .send(ExactRelayFrame::from_frozen(subscribe)?)
             .await?;
 
-        if durable.outer_acked() != outer_applied
-            && let StreamCursor::At(up_to_seq) = outer_applied
-        {
-            let ack = OpaqueRouteFrame {
-                version: RELAY_PROTOCOL_VERSION,
-                body: RelayFrameBody::Ack(RelayAck {
-                    stream_route: binding.stream_route,
-                    generation: binding.stream_generation,
-                    up_to_seq,
-                }),
-            };
-            let ack = encode(&ack);
-            let _ = decode(&ack)?;
-            self.transport
-                .send(ExactRelayFrame::from_frozen(ack)?)
-                .await?;
-            let mut mutation_rng = SystemMutationRng::new()?;
-            let _ = self
-                .machine
-                .commit_stream_ack(durable, up_to_seq, &mut mutation_rng)?;
+        if matches!(outer_applied, StreamCursor::At(_)) {
+            self.send_stream_ack(durable).await?;
         }
+        Ok(())
+    }
+
+    fn stream_binding_for_route(
+        &self,
+        stream_route: StreamRouteId,
+        generation: StreamGenerationId,
+    ) -> Result<DurableStreamBindingV1, RemoteRuntimeError> {
+        let mut matching = self
+            .machine
+            .durable_stream_bindings()?
+            .into_iter()
+            .filter(|state| {
+                state.binding().stream_route == stream_route
+                    && state.binding().stream_generation == generation
+            });
+        let durable = matching.next().ok_or(RemoteRuntimeError::InvalidReply(
+            "stream frame route/generation is not an installed durable binding",
+        ))?;
+        if matching.next().is_some() {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        Ok(durable)
+    }
+
+    async fn send_stream_ack(
+        &mut self,
+        durable: &DurableStreamBindingV1,
+    ) -> Result<(), RemoteRuntimeError> {
+        let StreamCursor::At(up_to_seq) = durable.outer_applied() else {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        };
+        let binding = durable.binding();
+        let ack = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::Ack(RelayAck {
+                stream_route: binding.stream_route,
+                generation: binding.stream_generation,
+                up_to_seq,
+            }),
+        };
+        let ack = encode(&ack);
+        let _ = decode(&ack)?;
+        self.transport
+            .send(ExactRelayFrame::from_frozen(ack)?)
+            .await?;
+        let mut mutation_rng = SystemMutationRng::new()?;
+        let _ = self
+            .machine
+            .commit_stream_ack(durable, up_to_seq, &mut mutation_rng)?;
         Ok(())
     }
 
@@ -2194,6 +2407,57 @@ fn validate_received_runtime_frame(
         ));
     }
     Ok(())
+}
+
+fn decode_direct_stream_item(
+    binding: &StreamBindingV1,
+    opened: SealedPayloadV1,
+) -> Result<(RuntimeStreamItem, RuntimeInnerCursor), RemoteRuntimeError> {
+    if opened.payload.len() >= MAX_RUNTIME_JSON_FRAME_BYTES {
+        return Err(RemoteRuntimeError::InvalidReply(
+            "live Runtime stream payload exceeds the JSON frame limit",
+        ));
+    }
+    let envelope = canonical_json::<RuntimeEnvelope>(&opened.payload).ok_or(
+        RemoteRuntimeError::InvalidReply(
+            "live Runtime stream payload is not one canonical JSON envelope",
+        ),
+    )?;
+    let RuntimeMessage::Stream(item) = envelope.body else {
+        return Err(RemoteRuntimeError::InvalidReply(
+            "live Runtime envelope is not a stream item",
+        ));
+    };
+    let observed_after = match (&binding.inner_cursor, opened.payload_kind, &item) {
+        (
+            RuntimeInnerCursor::Catalog { .. },
+            SealedPayloadKind::CatalogDelta,
+            RuntimeStreamItem::CatalogDelta(delta),
+        ) => RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(delta.catalog_revision),
+        },
+        (
+            RuntimeInnerCursor::Conversation {
+                conversation_id, ..
+            },
+            SealedPayloadKind::ConversationEvent,
+            RuntimeStreamItem::Event(event),
+        ) if &event.conversation_id == conversation_id => RuntimeInnerCursor::Conversation {
+            conversation_id: conversation_id.clone(),
+            cursor: StreamCursor::At(event.event_seq),
+        },
+        (_, SealedPayloadKind::TransferPart, RuntimeStreamItem::TransferPart(_)) => {
+            return Err(RemoteRuntimeError::InvalidReply(
+                "live TransferPart requires the durable transfer ingress",
+            ));
+        }
+        _ => {
+            return Err(RemoteRuntimeError::InvalidReply(
+                "live payload kind/item/target does not match the durable binding",
+            ));
+        }
+    };
+    Ok((item, observed_after))
 }
 
 fn map_transfer_carrier_error(error: RuntimeTransferCarrierError) -> RemoteRuntimeError {

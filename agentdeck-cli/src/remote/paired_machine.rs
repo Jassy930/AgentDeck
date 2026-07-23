@@ -33,11 +33,11 @@ use agentdeck_protocol::relay_v2::auth::{
     RelayGrant, SignedCertificate,
 };
 use agentdeck_protocol::relay_v2::frame::{
-    AuthProof, Authenticate, Challenge, RevocationCommitted,
+    AuthProof, Authenticate, Challenge, Publish, RevocationCommitted,
 };
 use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayServerId,
-    RequestRouteId, RootKeyId, StreamRouteId, TrustEpoch,
+    RequestRouteId, RootKeyId, StreamGenerationId, StreamRouteId, TrustEpoch,
 };
 use agentdeck_protocol::relay_v2::{
     OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, decode, encode,
@@ -46,7 +46,7 @@ use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, Revoke
 use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TurnId};
 use agentdeck_protocol::runtime::{
     ConversationId, MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope,
-    RuntimeInnerCursor, RuntimeMessage, RuntimeRequest, SendPromptRequest, StreamCursor,
+    RuntimeInnerCursor, RuntimeMessage, RuntimeRequest, SendPromptRequest,
 };
 use agentdeck_relay_client::{
     LinkAuthenticator, RelayClientConfig, RelayClientError, RelayTlsPolicy,
@@ -650,8 +650,8 @@ enum OpenedPairedKeyMaterial {
         nonce_prefix: [u8; 4],
     },
     StreamRx {
-        _key: AeadReceivingKey,
-        _nonce_prefix: [u8; 4],
+        key: AeadReceivingKey,
+        nonce_prefix: [u8; 4],
     },
 }
 
@@ -870,6 +870,18 @@ pub(crate) struct VerifiedDirectedReply {
     signed_blob_hash: [u8; 32],
 }
 
+/// 已完成 Relay Publish outer、key header、nonce prefix、AAD 与 MachineDataSign 验证的
+/// stream candidate。字段保持私有；runtime 只能先 durable admit replay tuple，再把同一
+/// branded token 交回 paired capability 做 AEAD open。
+pub(crate) struct VerifiedStreamPublish {
+    verified: VerifiedSealedBlobV1,
+    context: OuterContextV1,
+    brand: StreamPublishBrand,
+    stream_seq: u64,
+    counter: u64,
+    ciphertext_sha256: [u8; 32],
+}
+
 /// 当前 paired capability 对 root-signed Relay terminal 完整验签后铸造的撤销证明。
 ///
 /// 字段私有且类型不可由调用方构造；后续 cleanup 协调器只能消费本 token，不能接受裸
@@ -969,6 +981,16 @@ struct DirectedReplyBrand {
     directory_revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StreamPublishBrand {
+    machine_route: MachineRouteId,
+    stream_route: StreamRouteId,
+    stream_generation: StreamGenerationId,
+    key_id: KeyId,
+    directory_revision: u64,
+    frame_kind: OuterFrameKind,
+}
+
 fn validate_directed_reply_brand(
     actual: DirectedReplyBrand,
     expected: DirectedReplyBrand,
@@ -977,6 +999,43 @@ fn validate_directed_reply_brand(
         return Err(PairedPromotionError::Conflict);
     }
     Ok(())
+}
+
+fn stream_publish_frame_kind(key_id: KeyId) -> Result<OuterFrameKind, PairedPromotionError> {
+    match key_id.purpose {
+        KeyPurpose::Catalog => Ok(OuterFrameKind::CatalogPublish),
+        KeyPurpose::ConversationDek => Ok(OuterFrameKind::ConversationPublish),
+        KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => {
+            Err(PairedPromotionError::Conflict)
+        }
+    }
+}
+
+fn stream_key_slot_route(
+    key_id: KeyId,
+    publication_route: StreamRouteId,
+) -> Result<Option<StreamRouteId>, PairedPromotionError> {
+    match key_id.purpose {
+        KeyPurpose::Catalog => Ok(None),
+        KeyPurpose::ConversationDek => Ok(Some(publication_route)),
+        KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => {
+            Err(PairedPromotionError::Conflict)
+        }
+    }
+}
+
+fn stream_publish_brand(
+    machine_route: MachineRouteId,
+    binding: &StreamBindingV1,
+) -> Result<StreamPublishBrand, PairedPromotionError> {
+    Ok(StreamPublishBrand {
+        machine_route,
+        stream_route: binding.stream_route,
+        stream_generation: binding.stream_generation,
+        key_id: binding.key_id,
+        directory_revision: binding.key_directory_revision.value(),
+        frame_kind: stream_publish_frame_kind(binding.key_id)?,
+    })
 }
 
 impl VerifiedDirectedReply {
@@ -998,6 +1057,23 @@ impl VerifiedDirectedReply {
     #[must_use]
     pub(crate) const fn signed_blob_hash(&self) -> [u8; 32] {
         self.signed_blob_hash
+    }
+}
+
+impl VerifiedStreamPublish {
+    #[must_use]
+    pub(crate) const fn stream_seq(&self) -> u64 {
+        self.stream_seq
+    }
+
+    #[must_use]
+    pub(crate) const fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    #[must_use]
+    pub(crate) const fn ciphertext_sha256(&self) -> [u8; 32] {
+        self.ciphertext_sha256
     }
 }
 
@@ -1340,13 +1416,24 @@ impl OpenedPairedMachine<'_> {
         inner_applied: RuntimeInnerCursor,
         rng: &mut R,
     ) -> Result<DurableStreamBindingV1, PairedPromotionError> {
-        let candidate = DurableStreamBindingV1::from_subscription_bootstrap(binding, inner_applied)
-            .map_err(|_| PairedPromotionError::InvalidState)?;
         self.refresh_mutable_state()?;
         self.recover_pending_guard()?;
-        self.validate_stream_binding_capability(candidate.binding())?;
         let mut states = self.audited.state.durable_stream_bindings()?;
-        let target = candidate.target_key();
+        let fresh = DurableStreamBindingV1::from_subscription_bootstrap(
+            binding.clone(),
+            inner_applied.clone(),
+        )
+        .map_err(|_| PairedPromotionError::InvalidState)?;
+        let target = fresh.target_key();
+        let candidate =
+            if let Some(existing) = states.iter().find(|state| state.target_key() == target) {
+                existing
+                    .replace_subscription_bootstrap(binding, inner_applied)
+                    .map_err(|_| PairedPromotionError::Conflict)?
+            } else {
+                fresh
+            };
+        self.validate_stream_binding_capability(candidate.binding())?;
         states.retain(|state| state.target_key() != target);
         states.push(candidate.clone());
         let stream_bindings =
@@ -1356,6 +1443,74 @@ impl OpenedPairedMachine<'_> {
             OpaqueRuntimeState::new(None, current.replay_windows().to_vec(), stream_bindings);
         self.replace_opaque_runtime_state(&replacement, rng)?;
         Ok(candidate)
+    }
+
+    /// 以完整 durable state 做 CAS，提交一条 live stream 的 replay admission 或 outer/inner
+    /// apply transition。replacement 不能改写 binding/target；其他 stream、directed exchange
+    /// 与 reply replay windows 在同一 sealed-state transaction 中逐字保留。
+    pub(crate) fn commit_stream_state_transition<R: CryptoRng>(
+        &mut self,
+        expected: &DurableStreamBindingV1,
+        replacement: &DurableStreamBindingV1,
+        rng: &mut R,
+    ) -> Result<DurableStreamBindingV1, PairedPromotionError> {
+        if expected.binding() != replacement.binding()
+            || expected.target_key() != replacement.target_key()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let _ = replacement
+            .canonical_bytes()
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.validate_stream_binding_capability(expected.binding())?;
+        self.validate_stream_binding_capability(replacement.binding())?;
+        let mut states = self.audited.state.durable_stream_bindings()?;
+        let target = expected.target_key();
+        let current = states
+            .iter_mut()
+            .find(|state| state.target_key() == target)
+            .ok_or(PairedPromotionError::Conflict)?;
+        if current == replacement {
+            return Ok(current.clone());
+        }
+        if current != expected {
+            return Err(PairedPromotionError::Conflict);
+        }
+        *current = replacement.clone();
+        let stream_bindings =
+            encode_stream_bindings(states).map_err(|_| PairedPromotionError::InvalidState)?;
+        let current_runtime = self.audited.state.opaque_runtime_state();
+        let next_runtime = OpaqueRuntimeState::new(
+            current_runtime.exchange().map(ToOwned::to_owned),
+            current_runtime.replay_windows().to_vec(),
+            stream_bindings,
+        );
+        match self.replace_opaque_runtime_state(&next_runtime, rng) {
+            Ok(_) => Ok(replacement.clone()),
+            Err(write_error) => {
+                // active state CAS 之后的 guard-finalize/sidecar cleanup 仍可能报错。此时先
+                // refresh + forward-recover，再以完整 candidate readback 决定是否已 COMMIT；
+                // 不能把“已落盘但返回 Err”交给 runtime，导致 reducer 永久不 swap。
+                if self.refresh_mutable_state().is_err() {
+                    return Err(write_error);
+                }
+                let _recovery = self.recover_pending_guard();
+                let recovered = self.audited.state.durable_stream_bindings()?;
+                let current = recovered
+                    .iter()
+                    .find(|state| state.target_key() == target)
+                    .ok_or(PairedPromotionError::Conflict)?;
+                if current == replacement {
+                    Ok(replacement.clone())
+                } else if current == expected {
+                    Err(write_error)
+                } else {
+                    Err(PairedPromotionError::Conflict)
+                }
+            }
+        }
     }
 
     /// 在对应 Relay ACK 的 transport write 成功后，精确推进同一 durable stream cut。
@@ -1376,13 +1531,10 @@ impl OpenedPairedMachine<'_> {
             .iter_mut()
             .find(|state| state.target_key() == target)
             .ok_or(PairedPromotionError::Conflict)?;
-        if current != expected
-            && (current.binding() != expected.binding()
-                || current.outer_applied() != expected.outer_applied()
-                || current.inner_applied() != expected.inner_applied()
-                || current.replay_tuple() != expected.replay_tuple()
-                || current.outer_acked() != StreamCursor::At(up_to_seq))
-        {
+        let expected_acked = expected
+            .with_committed_outer_ack(up_to_seq)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        if current != expected && current != &expected_acked {
             return Err(PairedPromotionError::Conflict);
         }
         let committed = current
@@ -1551,6 +1703,189 @@ impl OpenedPairedMachine<'_> {
             sign_sealed(unsigned, self.audited.device_signing_key.as_ref(), &context)
                 .to_wire_bytes(),
         )
+    }
+
+    /// 在任何 stream replay/outer/inner durable mutation 前完成 Publish 的完整公开边界
+    /// 验证。`binding` 必须来自本 machine 已审计的 durable collection；Publish route、
+    /// generation、key header、nonce prefix、AAD 与 MachineDataSign 任一漂移都 fail-close。
+    pub(crate) fn verify_stream_publish(
+        &self,
+        durable: &DurableStreamBindingV1,
+        publish: &Publish,
+    ) -> Result<VerifiedStreamPublish, PairedPromotionError> {
+        let binding = durable.binding();
+        let installed = self
+            .audited
+            .state
+            .durable_stream_bindings()?
+            .into_iter()
+            .filter(|state| state == durable)
+            .count();
+        if installed != 1 {
+            return Err(PairedPromotionError::Conflict);
+        }
+        self.validate_stream_binding_capability(binding)?;
+        if publish.stream_route != binding.stream_route
+            || publish.generation != binding.stream_generation
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let expected_slot = stream_key_slot_route(binding.key_id, binding.stream_route)?;
+        let mut matching =
+            self.audited
+                .opened_directory_keys
+                .iter()
+                .filter_map(|entry| match &entry.material {
+                    OpenedPairedKeyMaterial::StreamRx { key, nonce_prefix }
+                        if entry.key_id == binding.key_id
+                            && entry.stream_route == expected_slot =>
+                    {
+                        Some((key, *nonce_prefix))
+                    }
+                    OpenedPairedKeyMaterial::CommandTx(_)
+                    | OpenedPairedKeyMaterial::ReplyTx { .. }
+                    | OpenedPairedKeyMaterial::StreamRx { .. } => None,
+                });
+        let (stream_key, nonce_prefix) =
+            matching.next().ok_or(PairedPromotionError::InvalidState)?;
+        if matching.next().is_some() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let signed = SignedSealedBlobV1::from_wire_bytes(&publish.sealed_blob.0)
+            .map_err(|error| PairedPromotionError::Crypto(error.into()))?;
+        let expected_revision = self.audited.directory_revision.value();
+        if binding.key_directory_revision.value() != expected_revision
+            || binding.key_id != stream_key.key_id
+            || binding.key_id.epoch != stream_key.epoch
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let frame_kind = stream_publish_frame_kind(binding.key_id)?;
+        let context = OuterContextV1 {
+            frame_kind,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            machine_route: Some(self.audited.identity.machine_route),
+            device_route: None,
+            stream_route: Some(publish.stream_route),
+            request_route: None,
+            pair_route: None,
+            stream_generation: Some(publish.generation),
+            stream_cursor: None,
+            stream_seq: Some(publish.stream_seq),
+            // 先以 sender 签入 header 的 epoch 重建 TBS。只有 MachineDataSign 通过后，
+            // 才能把 revision/epoch 漂移分类为 rollback 或 bounded KeySync 所需的
+            // missing epoch；未认证 header 不能驱动安全状态机。
+            message_key_epoch: signed.inner.key_epoch,
+        };
+        context
+            .validate()
+            .map_err(|_| PairedPromotionError::Crypto(CryptoError::BadCiphertext))?;
+        let verified = verify_sealed(signed, &self.audited.machine_data_verifying_key, &context)
+            .map_err(PairedPromotionError::Crypto)?;
+        let header = &verified.sealed().inner;
+        if header.key_directory_revision < expected_revision
+            || (header.key_directory_revision == expected_revision
+                && header.key_id.purpose == binding.key_id.purpose
+                && header.key_epoch < stream_key.epoch)
+        {
+            return Err(PairedPromotionError::Crypto(CryptoError::E2ee(
+                agentdeck_protocol::e2ee::E2eeError::KeyRevisionRollback,
+            )));
+        }
+        if header.key_directory_revision > expected_revision
+            || (header.key_directory_revision == expected_revision
+                && header.key_id.purpose == binding.key_id.purpose
+                && header.key_epoch > stream_key.epoch)
+        {
+            return Err(PairedPromotionError::Crypto(CryptoError::E2ee(
+                agentdeck_protocol::e2ee::E2eeError::KeyEpochMissing,
+            )));
+        }
+        if header.key_id != binding.key_id
+            || header.key_id != stream_key.key_id
+            || header.key_epoch != stream_key.epoch
+            || header.key_directory_revision != expected_revision
+            || header.nonce[..4] != nonce_prefix
+        {
+            return Err(PairedPromotionError::Crypto(CryptoError::BadCiphertext));
+        }
+        let counter = u64::from_be_bytes(
+            header.nonce[4..]
+                .try_into()
+                .map_err(|_| PairedPromotionError::InvalidState)?,
+        );
+        let ciphertext_sha256 = sha256(&header.ciphertext);
+        Ok(VerifiedStreamPublish {
+            verified,
+            context,
+            brand: stream_publish_brand(self.audited.identity.machine_route, binding)?,
+            stream_seq: publish.stream_seq,
+            counter,
+            ciphertext_sha256,
+        })
+    }
+
+    /// 只消费本 capability 铸造的 verified stream token；调用方必须先把其 replay tuple
+    /// durable admission。再次对照当前 key slot 与完整 brand，避免验证和 open 之间发生
+    /// binding/key replacement 后继续使用旧 capability。
+    pub(crate) fn open_verified_stream_publish(
+        &self,
+        candidate: VerifiedStreamPublish,
+    ) -> Result<SealedPayloadV1, PairedPromotionError> {
+        let expected_slot =
+            stream_key_slot_route(candidate.brand.key_id, candidate.brand.stream_route)?;
+        let mut matching =
+            self.audited
+                .opened_directory_keys
+                .iter()
+                .filter_map(|entry| match &entry.material {
+                    OpenedPairedKeyMaterial::StreamRx { key, .. }
+                        if entry.key_id == candidate.brand.key_id
+                            && entry.stream_route == expected_slot =>
+                    {
+                        Some(key)
+                    }
+                    OpenedPairedKeyMaterial::CommandTx(_)
+                    | OpenedPairedKeyMaterial::ReplyTx { .. }
+                    | OpenedPairedKeyMaterial::StreamRx { .. } => None,
+                });
+        let stream_key = matching.next().ok_or(PairedPromotionError::InvalidState)?;
+        if matching.next().is_some() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let expected_brand = StreamPublishBrand {
+            machine_route: self.audited.identity.machine_route,
+            stream_route: candidate.brand.stream_route,
+            stream_generation: candidate.brand.stream_generation,
+            key_id: stream_key.key_id,
+            directory_revision: self.audited.directory_revision.value(),
+            frame_kind: stream_publish_frame_kind(stream_key.key_id)?,
+        };
+        if candidate.brand != expected_brand
+            || candidate.context.machine_route != Some(expected_brand.machine_route)
+            || candidate.context.stream_route != Some(expected_brand.stream_route)
+            || candidate.context.stream_generation != Some(expected_brand.stream_generation)
+            || candidate.context.stream_seq != Some(candidate.stream_seq)
+            || candidate.context.message_key_epoch != stream_key.epoch
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let installed = self
+            .audited
+            .state
+            .durable_stream_bindings()?
+            .into_iter()
+            .filter(|state| {
+                stream_publish_brand(self.audited.identity.machine_route, state.binding())
+                    .is_ok_and(|brand| brand == candidate.brand)
+            })
+            .count();
+        if installed != 1 {
+            return Err(PairedPromotionError::Conflict);
+        }
+        open_sealed_payload(stream_key, &candidate.context, candidate.verified)
+            .map_err(PairedPromotionError::Crypto)
     }
 
     /// 在 replay state 之前完成 outer-correlated reply 的 canonical/header/AAD/signature 验证。
@@ -3735,8 +4070,8 @@ fn audit_durable_state(
             KeyPurpose::Catalog | KeyPurpose::ConversationDek => {
                 let nonce_prefix = agentdeck_crypto::derive_nonce_prefix(&key);
                 OpenedPairedKeyMaterial::StreamRx {
-                    _key: AeadReceivingKey::new(entry.key_id, entry.key_id.epoch, key),
-                    _nonce_prefix: nonce_prefix,
+                    key: AeadReceivingKey::new(entry.key_id, entry.key_id.epoch, key),
+                    nonce_prefix,
                 }
             }
         };

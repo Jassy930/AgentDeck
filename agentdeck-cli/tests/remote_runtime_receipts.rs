@@ -19,7 +19,7 @@ use agentdeck_cli::remote::paired_machine::{
 use agentdeck_cli::remote::runtime::{
     ExactRelayFrame, ReceivedRuntimeFrame, RemoteCatalogPageOutcome, RemotePromptOutcome,
     RemoteRuntime, RemoteRuntimeError, RemoteRuntimeTransport, RemoteRuntimeTransportError,
-    RemoteSubscriptionBootstrapItem, RemoteSubscriptionReducer,
+    RemoteStreamFrameOutcome, RemoteSubscriptionBootstrapItem, RemoteSubscriptionReducer,
 };
 use agentdeck_crypto::{
     AeadReceivingKey, AeadSendingKey, SecretAeadKey, SenderCounter, SigningKey, VerifyingKey,
@@ -28,12 +28,13 @@ use agentdeck_crypto::{
 };
 use agentdeck_protocol::capabilities::{SessionCapabilities, VendorCapabilities};
 use agentdeck_protocol::e2ee::{
-    E2EE_FORMAT_VERSION, KeyControlV1, KeyId, KeyPurpose, OuterContextV1, SealedPayloadKind,
-    SignedSealedBlobV1, StreamBindingV1,
+    E2EE_FORMAT_VERSION, KeyControlV1, KeyId, KeyPurpose, OuterContextV1, OuterFrameKind,
+    SealedPayloadKind, SignedSealedBlobV1, StreamBindingV1,
 };
 use agentdeck_protocol::relay_v2::auth::{DeviceRevocation, Ed25519Signature};
 use agentdeck_protocol::relay_v2::frame::{
-    AcceptedRef, Ack, Reply, RevocationCommitted, RouteAccepted, SealedBlob, Send, Subscribe,
+    AcceptedRef, Ack, Publish, Reply, RevocationCommitted, RouteAccepted, SealedBlob, Send,
+    Subscribe,
 };
 use agentdeck_protocol::relay_v2::{
     DeviceRouteId, GrantSerial as RelayGrantSerial, KeyDirectoryRevision, OpaqueRouteFrame,
@@ -50,7 +51,7 @@ use agentdeck_protocol::runtime::{
     ConversationConfigurationState, ConversationEntry, ConversationId, ConversationSnapshot,
     IdempotencyKey, MAX_RUNTIME_JSON_FRAME_BYTES, PromptPayload, RUNTIME_PROTOCOL_VERSION,
     RevocationReceipt, RuntimeEnvelope, RuntimeFailure, RuntimeInnerCursor, RuntimeMessage,
-    RuntimeReply, RuntimeRequest, RuntimeSyncComplete, RuntimeTransferCarrierV1,
+    RuntimeReply, RuntimeRequest, RuntimeStreamItem, RuntimeSyncComplete, RuntimeTransferCarrierV1,
     RuntimeTransferChannel, SendPromptRequest, SnapshotItem, StreamCursor, SubscriptionReceipt,
     TransferEnvelope,
 };
@@ -168,6 +169,7 @@ enum SubscriptionScript {
     CatalogPartialTransferThenPending,
     CatalogUnfinishedPageThenSync,
     CatalogSyncAheadOfBinding,
+    CatalogSmallSyncAhead,
     ConversationIndependentGeneration,
     ConversationCompact,
     CatalogBeforeFirst,
@@ -196,6 +198,7 @@ struct FakeTransport {
     reply_counter: u64,
     device_sign_verifying_key: VerifyingKey,
     inbound: VecDeque<ReceivedRuntimeFrame>,
+    post_script_inbound: VecDeque<ReceivedRuntimeFrame>,
     sent_codec_frames: Arc<Mutex<Vec<Vec<u8>>>>,
     shutdown_observed: Option<Arc<AtomicBool>>,
     panic_on_first_subscription_control: bool,
@@ -285,6 +288,7 @@ impl FakeTransport {
                 reply_counter,
                 device_sign_verifying_key,
                 inbound: VecDeque::new(),
+                post_script_inbound: VecDeque::new(),
                 sent_codec_frames: Arc::clone(&sent_codec_frames),
                 shutdown_observed: None,
                 panic_on_first_subscription_control: false,
@@ -355,6 +359,11 @@ impl FakeTransport {
 
     fn with_fail_on_subscription_ack(mut self) -> Self {
         self.fail_on_subscription_ack = true;
+        self
+    }
+
+    fn with_post_script_inbound(mut self, frames: Vec<OpaqueRouteFrame>) -> Self {
+        self.post_script_inbound = frames.into_iter().map(received_exact).collect();
         self
     }
 
@@ -432,6 +441,7 @@ impl FakeTransport {
                     self.reply_counter + offset as u64,
                 )));
             }
+            self.inbound.append(&mut self.post_script_inbound);
             return;
         }
         let accepted = route_accepted(request_route);
@@ -501,6 +511,7 @@ impl FakeTransport {
                 );
             }
         }
+        self.inbound.append(&mut self.post_script_inbound);
     }
 }
 
@@ -574,6 +585,22 @@ enum ReplyShape {
     WrongNoncePrefix,
     WrongAad,
     NonCanonicalJson,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StreamPublishShape {
+    Valid,
+    ForgedSignature,
+    WrongAad,
+    NonCanonicalJson,
+    AuthenticatedBadCiphertext,
+    LowerDirectoryRevision,
+    HigherDirectoryRevision,
+    LowerKeyEpoch,
+    HigherKeyEpoch,
+    WrongKeyPurpose,
+    WrongNoncePrefix,
+    MalformedSealedBlob,
 }
 
 fn reply_frame(
@@ -758,6 +785,108 @@ fn key_control_stream_binding_reply_frame(
     }
 }
 
+fn catalog_publish_frame(
+    stream_seq: u64,
+    catalog_revision: u64,
+    sender_counter: u64,
+    shape: StreamPublishShape,
+) -> OpaqueRouteFrame {
+    let item = RuntimeStreamItem::CatalogDelta(CatalogDelta {
+        catalog_revision,
+        changes: Vec::new(),
+    });
+    let envelope = RuntimeEnvelope {
+        version: RUNTIME_PROTOCOL_VERSION,
+        message_id: MessageId::new(format!("catalog-live-{stream_seq}")),
+        body: RuntimeMessage::Stream(item),
+    };
+    let mut plaintext = envelope
+        .to_json_bytes_checked()
+        .expect("canonical live Catalog envelope");
+    if matches!(shape, StreamPublishShape::NonCanonicalJson) {
+        plaintext.insert(1, b' ');
+    }
+    let key_purpose = if matches!(shape, StreamPublishShape::WrongKeyPurpose) {
+        KeyPurpose::ConversationDek
+    } else {
+        KeyPurpose::Catalog
+    };
+    let key_epoch = match shape {
+        StreamPublishShape::LowerKeyEpoch => CATALOG_EPOCH - 1,
+        StreamPublishShape::HigherKeyEpoch => CATALOG_EPOCH + 1,
+        _ => CATALOG_EPOCH,
+    };
+    let directory_revision = match shape {
+        StreamPublishShape::LowerDirectoryRevision => KEY_DIRECTORY_REVISION - 1,
+        StreamPublishShape::HigherDirectoryRevision => KEY_DIRECTORY_REVISION + 1,
+        _ => KEY_DIRECTORY_REVISION,
+    };
+    let expected_context = OuterContextV1 {
+        frame_kind: OuterFrameKind::CatalogPublish,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: Some(MACHINE_ROUTE),
+        device_route: None,
+        stream_route: Some(CATALOG_STREAM_ROUTE),
+        request_route: None,
+        pair_route: None,
+        stream_generation: Some(CATALOG_RELAY_GENERATION),
+        stream_cursor: None,
+        stream_seq: Some(stream_seq),
+        message_key_epoch: key_epoch,
+    };
+    let seal_context = if matches!(shape, StreamPublishShape::WrongAad) {
+        OuterContextV1 {
+            stream_route: Some(StreamRouteId::from_bytes([0xfe; 16])),
+            ..expected_context.clone()
+        }
+    } else {
+        expected_context.clone()
+    };
+    let key = AeadSendingKey::with_derived_nonce_prefix(
+        KeyId {
+            purpose: key_purpose,
+            epoch: key_epoch,
+        },
+        key_epoch,
+        directory_revision,
+        SecretAeadKey::from_bytes([0x71; 32]),
+    );
+    let mut unsigned = seal_symmetric(
+        &key,
+        &seal_context,
+        SealedPayloadKind::CatalogDelta,
+        &plaintext,
+        SenderCounter(sender_counter),
+    )
+    .expect("seal live Catalog publication");
+    if matches!(shape, StreamPublishShape::AuthenticatedBadCiphertext) {
+        unsigned.ciphertext[0] ^= 1;
+    }
+    if matches!(shape, StreamPublishShape::WrongNoncePrefix) {
+        unsigned.nonce[0] ^= 1;
+    }
+    let signer = if matches!(shape, StreamPublishShape::ForgedSignature) {
+        SigningKey::from_seed(&[0xfa; 32])
+    } else {
+        PairingFixture::machine_data_signing_key()
+    };
+    let signed = sign_sealed(unsigned, &signer, &seal_context);
+    let mut sealed_blob = signed.to_wire_bytes();
+    if matches!(shape, StreamPublishShape::MalformedSealedBlob) {
+        sealed_blob.pop();
+    }
+    OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::Publish(Publish {
+            stream_route: CATALOG_STREAM_ROUTE,
+            generation: CATALOG_RELAY_GENERATION,
+            stream_seq,
+            sealed_blob: SealedBlob(sealed_blob),
+        }),
+    }
+}
+
 fn catalog_requested_cursor() -> RuntimeInnerCursor {
     RuntimeInnerCursor::Catalog {
         cursor: StreamCursor::BeforeFirst,
@@ -781,6 +910,7 @@ fn conversation_requested_cursor() -> RuntimeInnerCursor {
 struct CapturingSubscriptionReducer {
     cursor: RuntimeInnerCursor,
     applied: Vec<RemoteSubscriptionBootstrapItem>,
+    live_applied: Vec<RuntimeStreamItem>,
     reject_apply: bool,
     stall_cursor: bool,
 }
@@ -790,6 +920,7 @@ impl CapturingSubscriptionReducer {
         Self {
             cursor,
             applied: Vec::new(),
+            live_applied: Vec::new(),
             reject_apply: false,
             stall_cursor: false,
         }
@@ -811,6 +942,10 @@ impl CapturingSubscriptionReducer {
 
     fn applied(&self) -> &[RemoteSubscriptionBootstrapItem] {
         &self.applied
+    }
+
+    fn live_applied(&self) -> &[RuntimeStreamItem] {
+        &self.live_applied
     }
 }
 
@@ -873,6 +1008,47 @@ impl RemoteSubscriptionReducer for CapturingSubscriptionReducer {
             self.cursor = next;
         }
         self.applied.push(item.clone());
+        Ok(())
+    }
+
+    fn apply_live(&mut self, item: &RuntimeStreamItem) -> Result<(), RemoteRuntimeError> {
+        if self.reject_apply {
+            return Err(RemoteRuntimeError::InvalidReply(
+                "test reducer injected a live apply rejection",
+            ));
+        }
+        let next = match (item, &self.cursor) {
+            (RuntimeStreamItem::CatalogDelta(delta), RuntimeInnerCursor::Catalog { cursor })
+                if cursor.checked_next().ok() == Some(delta.catalog_revision) =>
+            {
+                RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::At(delta.catalog_revision),
+                }
+            }
+            (
+                RuntimeStreamItem::Event(event),
+                RuntimeInnerCursor::Conversation {
+                    conversation_id,
+                    cursor,
+                },
+            ) if &event.conversation_id == conversation_id
+                && cursor.checked_next().ok() == Some(event.event_seq) =>
+            {
+                RuntimeInnerCursor::Conversation {
+                    conversation_id: conversation_id.clone(),
+                    cursor: StreamCursor::At(event.event_seq),
+                }
+            }
+            _ => {
+                return Err(RemoteRuntimeError::InvalidReply(
+                    "test reducer rejected a cross-target or discontinuous live item",
+                ));
+            }
+        };
+        if !self.stall_cursor {
+            self.cursor = next;
+        }
+        self.live_applied.push(item.clone());
         Ok(())
     }
 }
@@ -1343,6 +1519,29 @@ fn subscription_inbound_frames(
         SubscriptionScript::CatalogSyncAheadOfBinding => {
             let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
             let sync_inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_snapshot(sync_inner)),
+                    REPLY_COUNTER + 1,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, sync_inner)),
+                    REPLY_COUNTER + 2,
+                ),
+                stream_binding_reply(
+                    catalog_stream_binding(outer, StreamCursor::BeforeFirst),
+                    REPLY_COUNTER + 3,
+                ),
+            ]
+        }
+        SubscriptionScript::CatalogSmallSyncAhead => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let sync_inner = StreamCursor::At(2);
             vec![
                 accepted,
                 runtime_reply(
@@ -3772,6 +3971,7 @@ fn assert_durable_stream_binding(
     assert_eq!(installed.binding(), expected);
     assert_eq!(installed.outer_applied(), expected.stream_cursor);
     assert_eq!(installed.outer_acked(), expected.stream_cursor);
+    assert_eq!(installed.inner_observed(), &expected.inner_cursor);
     assert_eq!(installed.inner_applied(), &expected.inner_cursor);
     assert_eq!(installed.replay_tuple(), None);
 }
@@ -3793,8 +3993,77 @@ fn assert_durable_stream_binding_unacked(
     assert_eq!(installed.binding(), expected);
     assert_eq!(installed.outer_applied(), expected.stream_cursor);
     assert_eq!(installed.outer_acked(), StreamCursor::BeforeFirst);
+    assert_eq!(installed.inner_observed(), &expected.inner_cursor);
     assert_eq!(installed.inner_applied(), &expected.inner_cursor);
     assert_eq!(installed.replay_tuple(), None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_durable_stream_progress(
+    store: &dyn RemoteKeyStore,
+    root: &std::path::Path,
+    fixture: &PairingFixture,
+    expected_binding: &StreamBindingV1,
+    outer_applied: StreamCursor,
+    outer_acked: StreamCursor,
+    inner_observed: RuntimeInnerCursor,
+    inner_applied: RuntimeInnerCursor,
+    replay: Option<(u64, u64)>,
+) {
+    let opened = PairedMachineStore::new(store, INSTALLATION_ID, root)
+        .open_exact(fixture.identity())
+        .expect("reopen paired machine after live stream progress");
+    let bindings = opened
+        .durable_stream_bindings()
+        .expect("read live durable stream bindings");
+    assert_eq!(bindings.len(), 1);
+    let state = &bindings[0];
+    assert_eq!(state.binding(), expected_binding);
+    assert_eq!(state.outer_applied(), outer_applied);
+    assert_eq!(state.outer_acked(), outer_acked);
+    assert_eq!(state.inner_observed(), &inner_observed);
+    assert_eq!(state.inner_applied(), &inner_applied);
+    assert_eq!(
+        state
+            .replay_tuple()
+            .map(|tuple| (tuple.stream_seq(), tuple.sender_counter())),
+        replay,
+    );
+}
+
+fn assert_durable_catalog_live_failure_state(
+    store: &dyn RemoteKeyStore,
+    root: &std::path::Path,
+    fixture: &PairingFixture,
+    expected_binding: &StreamBindingV1,
+    replay: Option<(u64, u64)>,
+    replay_entry_count: usize,
+    replay_quarantined: bool,
+) {
+    assert_durable_stream_progress(
+        store,
+        root,
+        fixture,
+        expected_binding,
+        StreamCursor::At(CATALOG_OUTER_HIGH_WATER),
+        StreamCursor::At(CATALOG_OUTER_HIGH_WATER),
+        RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(CATALOG_INNER_HIGH_WATER),
+        },
+        RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(CATALOG_INNER_HIGH_WATER),
+        },
+        replay,
+    );
+    let opened = PairedMachineStore::new(store, INSTALLATION_ID, root)
+        .open_exact(fixture.identity())
+        .expect("reopen paired machine to inspect live replay metadata");
+    let bindings = opened
+        .durable_stream_bindings()
+        .expect("read live replay metadata");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].replay_entry_count(), replay_entry_count);
+    assert_eq!(bindings[0].replay_quarantined(), replay_quarantined);
 }
 
 fn assert_no_durable_stream_binding(
@@ -4002,6 +4271,531 @@ async fn subscription_ack_send_failure_keeps_durable_cursor_unacked() {
     );
     drop(runtime);
     assert_durable_stream_binding_unacked(&store, &root, &fixture, &expected_binding);
+}
+
+#[tokio::test]
+async fn live_catalog_publish_is_verified_reduced_durable_and_exact_duplicate_safe() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("live Catalog state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xe5);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open live Catalog machine");
+    let publish = catalog_publish_frame(
+        CATALOG_OUTER_HIGH_WATER + 1,
+        CATALOG_INNER_HIGH_WATER + 1,
+        500,
+        StreamPublishShape::Valid,
+    );
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogAt,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let transport = transport.with_post_script_inbound(vec![publish.clone(), publish]);
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xe6; 32]);
+    let bootstrap = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("bootstrap before live Catalog");
+    let binding = bootstrap.binding().clone();
+
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::Applied(item))
+            if matches!(item.as_ref(), RuntimeStreamItem::CatalogDelta(delta)
+                if delta.catalog_revision == CATALOG_INNER_HIGH_WATER + 1)
+    ));
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::AppliedDuplicate)
+    ));
+    assert_eq!(reducer.live_applied().len(), 1);
+    assert_eq!(
+        reducer.inner_cursor(),
+        &RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(CATALOG_INNER_HIGH_WATER + 1),
+        }
+    );
+    let frames = decoded_outbound_frames(&sent);
+    assert_eq!(frames.len(), 5, "duplicate must re-ACK without reapplying");
+    for frame in &frames[3..] {
+        assert!(matches!(
+            frame.body,
+            RelayFrameBody::Ack(Ack {
+                up_to_seq,
+                ..
+            }) if up_to_seq == CATALOG_OUTER_HIGH_WATER + 1
+        ));
+    }
+    drop(runtime);
+    assert_durable_stream_progress(
+        &store,
+        &root,
+        &fixture,
+        &binding,
+        StreamCursor::At(CATALOG_OUTER_HIGH_WATER + 1),
+        StreamCursor::At(CATALOG_OUTER_HIGH_WATER + 1),
+        RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(CATALOG_INNER_HIGH_WATER + 1),
+        },
+        RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(CATALOG_INNER_HIGH_WATER + 1),
+        },
+        Some((CATALOG_OUTER_HIGH_WATER + 1, 500)),
+    );
+}
+
+#[tokio::test]
+async fn snapshot_ahead_live_overlap_advances_observed_before_applying_the_next_item() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("live overlap state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xe7);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open live overlap machine");
+    let publications = (0_u64..=3)
+        .map(|inner| {
+            catalog_publish_frame(
+                CATALOG_OUTER_HIGH_WATER + 1 + inner,
+                inner,
+                600 + inner,
+                StreamPublishShape::Valid,
+            )
+        })
+        .collect();
+    let (transport, _sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogSmallSyncAhead,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport.with_post_script_inbound(publications));
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xe8; 32]);
+    let bootstrap = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("small snapshot-ahead bootstrap");
+    let binding = bootstrap.binding().clone();
+
+    for _ in 0..3 {
+        assert!(matches!(
+            runtime.receive_stream_frame(&mut reducer).await,
+            Ok(RemoteStreamFrameOutcome::AuthenticatedOverlap)
+        ));
+        assert!(reducer.live_applied().is_empty());
+        assert_eq!(
+            reducer.inner_cursor(),
+            &RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(2),
+            }
+        );
+    }
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::Applied(item))
+            if matches!(item.as_ref(), RuntimeStreamItem::CatalogDelta(delta)
+                if delta.catalog_revision == 3)
+    ));
+    assert_eq!(reducer.live_applied().len(), 1);
+    drop(runtime);
+    assert_durable_stream_progress(
+        &store,
+        &root,
+        &fixture,
+        &binding,
+        StreamCursor::At(CATALOG_OUTER_HIGH_WATER + 4),
+        StreamCursor::At(CATALOG_OUTER_HIGH_WATER + 4),
+        RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(3),
+        },
+        RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(3),
+        },
+        Some((CATALOG_OUTER_HIGH_WATER + 4, 603)),
+    );
+}
+
+#[tokio::test]
+async fn forged_signature_or_wrong_aad_is_rejected_before_replay_hwm_reducer_or_ack() {
+    for (seed, shape) in [
+        (0xe9, StreamPublishShape::ForgedSignature),
+        (0xea, StreamPublishShape::WrongAad),
+    ] {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("untrusted live state root");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, seed);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open machine before untrusted live frame");
+        let untrusted = catalog_publish_frame(
+            CATALOG_OUTER_HIGH_WATER + 1,
+            CATALOG_INNER_HIGH_WATER + 1,
+            700,
+            shape,
+        );
+        let (transport, sent) = FakeTransport::new_subscription(
+            SubscriptionScript::CatalogAt,
+            catalog_requested_cursor(),
+            device_sign,
+        );
+        let mut runtime =
+            RemoteRuntime::new(opened, transport.with_post_script_inbound(vec![untrusted]));
+        let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+        let mut rng = DeterministicRng::new([seed.wrapping_add(1); 32]);
+        let bootstrap = runtime
+            .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+            .await
+            .expect("bootstrap before untrusted live frame");
+        let binding = bootstrap.binding().clone();
+        let controls_before = decoded_outbound_frames(&sent).len();
+
+        let error = runtime
+            .receive_stream_frame(&mut reducer)
+            .await
+            .expect_err("signature or signed AAD mismatch must fail closed");
+        assert_eq!(error.code(), "remote.crypto.bad_sender_signature");
+        assert!(reducer.live_applied().is_empty());
+        assert_eq!(decoded_outbound_frames(&sent).len(), controls_before);
+        drop(runtime);
+        assert_durable_catalog_live_failure_state(
+            &store, &root, &fixture, &binding, None, 0, false,
+        );
+    }
+}
+
+#[tokio::test]
+async fn signed_stream_key_drift_and_malformed_headers_have_stable_crypto_codes() {
+    for (seed, shape, expected_code) in [
+        (
+            0x91,
+            StreamPublishShape::LowerDirectoryRevision,
+            "remote.crypto.key_revision_rollback",
+        ),
+        (
+            0x92,
+            StreamPublishShape::LowerKeyEpoch,
+            "remote.crypto.key_revision_rollback",
+        ),
+        (
+            0x93,
+            StreamPublishShape::HigherDirectoryRevision,
+            "remote.crypto.key_epoch_missing",
+        ),
+        (
+            0x94,
+            StreamPublishShape::HigherKeyEpoch,
+            "remote.crypto.key_epoch_missing",
+        ),
+        (
+            0x95,
+            StreamPublishShape::WrongKeyPurpose,
+            "remote.crypto.bad_ciphertext",
+        ),
+        (
+            0x96,
+            StreamPublishShape::WrongNoncePrefix,
+            "remote.crypto.bad_ciphertext",
+        ),
+        (
+            0x97,
+            StreamPublishShape::MalformedSealedBlob,
+            "remote.crypto.bad_ciphertext",
+        ),
+    ] {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("classified live crypto failure state root");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, seed);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open machine before classified live crypto failure");
+        let publish = catalog_publish_frame(
+            CATALOG_OUTER_HIGH_WATER + 1,
+            CATALOG_INNER_HIGH_WATER + 1,
+            705,
+            shape,
+        );
+        let (transport, sent) = FakeTransport::new_subscription(
+            SubscriptionScript::CatalogAt,
+            catalog_requested_cursor(),
+            device_sign,
+        );
+        let mut runtime =
+            RemoteRuntime::new(opened, transport.with_post_script_inbound(vec![publish]));
+        let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+        let mut rng = DeterministicRng::new([seed.wrapping_add(1); 32]);
+        let bootstrap = runtime
+            .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+            .await
+            .expect("bootstrap before classified live crypto failure");
+        let binding = bootstrap.binding().clone();
+        let controls_before = decoded_outbound_frames(&sent).len();
+
+        let error = runtime
+            .receive_stream_frame(&mut reducer)
+            .await
+            .expect_err("classified live crypto failure must fail closed");
+        assert_eq!(error.code(), expected_code, "unexpected code for {shape:?}");
+        assert!(reducer.live_applied().is_empty());
+        assert_eq!(decoded_outbound_frames(&sent).len(), controls_before);
+        drop(runtime);
+        assert_durable_catalog_live_failure_state(
+            &store, &root, &fixture, &binding, None, 0, false,
+        );
+    }
+}
+
+#[tokio::test]
+async fn authenticated_bad_ciphertext_is_replay_durable_but_never_advances_business_cut_or_ack() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("bad live ciphertext state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xeb);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open machine before bad live ciphertext");
+    let stream_seq = CATALOG_OUTER_HIGH_WATER + 1;
+    let sender_counter = 701;
+    let bad_ciphertext = catalog_publish_frame(
+        stream_seq,
+        CATALOG_INNER_HIGH_WATER + 1,
+        sender_counter,
+        StreamPublishShape::AuthenticatedBadCiphertext,
+    );
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogAt,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let transport =
+        transport.with_post_script_inbound(vec![bad_ciphertext.clone(), bad_ciphertext]);
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xec; 32]);
+    let bootstrap = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("bootstrap before bad live ciphertext");
+    let binding = bootstrap.binding().clone();
+    let controls_before = decoded_outbound_frames(&sent).len();
+
+    for _ in 0..2 {
+        let error = runtime
+            .receive_stream_frame(&mut reducer)
+            .await
+            .expect_err("authenticated bad ciphertext must fail AEAD on exact retry");
+        assert_eq!(error.code(), "remote.crypto.bad_ciphertext");
+        assert!(reducer.live_applied().is_empty());
+        assert_eq!(decoded_outbound_frames(&sent).len(), controls_before);
+    }
+    drop(runtime);
+    assert_durable_catalog_live_failure_state(
+        &store,
+        &root,
+        &fixture,
+        &binding,
+        Some((stream_seq, sender_counter)),
+        1,
+        false,
+    );
+}
+
+#[tokio::test]
+async fn authenticated_noncanonical_runtime_json_is_replay_durable_without_business_progress() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("noncanonical live JSON state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xed);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open machine before noncanonical live JSON");
+    let stream_seq = CATALOG_OUTER_HIGH_WATER + 1;
+    let sender_counter = 702;
+    let noncanonical = catalog_publish_frame(
+        stream_seq,
+        CATALOG_INNER_HIGH_WATER + 1,
+        sender_counter,
+        StreamPublishShape::NonCanonicalJson,
+    );
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogAt,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(
+        opened,
+        transport.with_post_script_inbound(vec![noncanonical]),
+    );
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xee; 32]);
+    let bootstrap = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("bootstrap before noncanonical live JSON");
+    let binding = bootstrap.binding().clone();
+    let controls_before = decoded_outbound_frames(&sent).len();
+
+    let error = runtime
+        .receive_stream_frame(&mut reducer)
+        .await
+        .expect_err("authenticated noncanonical Runtime JSON must fail closed");
+    assert_eq!(error.code(), "remote.runtime.reply_invalid");
+    assert!(reducer.live_applied().is_empty());
+    assert_eq!(decoded_outbound_frames(&sent).len(), controls_before);
+    drop(runtime);
+    assert_durable_catalog_live_failure_state(
+        &store,
+        &root,
+        &fixture,
+        &binding,
+        Some((stream_seq, sender_counter)),
+        1,
+        false,
+    );
+}
+
+#[tokio::test]
+async fn live_reducer_rejection_or_cursor_stall_never_commits_outer_inner_or_ack() {
+    for (seed, reject_apply) in [(0xef, true), (0xf0, false)] {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("failed live reducer state root");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, seed);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open machine before failed live reducer");
+        let stream_seq = CATALOG_OUTER_HIGH_WATER + 1;
+        let sender_counter = 703;
+        let publish = catalog_publish_frame(
+            stream_seq,
+            CATALOG_INNER_HIGH_WATER + 1,
+            sender_counter,
+            StreamPublishShape::Valid,
+        );
+        let (transport, sent) = FakeTransport::new_subscription(
+            SubscriptionScript::CatalogAt,
+            catalog_requested_cursor(),
+            device_sign,
+        );
+        let mut runtime =
+            RemoteRuntime::new(opened, transport.with_post_script_inbound(vec![publish]));
+        let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+        let mut rng = DeterministicRng::new([seed.wrapping_add(1); 32]);
+        let bootstrap = runtime
+            .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+            .await
+            .expect("bootstrap before failed live reducer");
+        let binding = bootstrap.binding().clone();
+        if reject_apply {
+            reducer.reject_apply = true;
+        } else {
+            reducer.stall_cursor = true;
+        }
+        let controls_before = decoded_outbound_frames(&sent).len();
+
+        let error = runtime
+            .receive_stream_frame(&mut reducer)
+            .await
+            .expect_err("reducer rejection or cursor stall must abort the live commit");
+        assert_eq!(error.code(), "remote.runtime.reply_invalid");
+        assert!(reducer.live_applied().is_empty());
+        assert_eq!(
+            reducer.inner_cursor(),
+            &RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(CATALOG_INNER_HIGH_WATER),
+            }
+        );
+        assert_eq!(decoded_outbound_frames(&sent).len(), controls_before);
+        drop(runtime);
+        assert_durable_catalog_live_failure_state(
+            &store,
+            &root,
+            &fixture,
+            &binding,
+            Some((stream_seq, sender_counter)),
+            1,
+            false,
+        );
+    }
+}
+
+#[tokio::test]
+async fn same_counter_with_different_live_ciphertext_durably_quarantines_the_stream() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("live nonce reuse state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xf1);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open machine before live nonce reuse");
+    let stream_seq = CATALOG_OUTER_HIGH_WATER + 1;
+    let sender_counter = 704;
+    let first = catalog_publish_frame(
+        stream_seq,
+        CATALOG_INNER_HIGH_WATER + 1,
+        sender_counter,
+        StreamPublishShape::NonCanonicalJson,
+    );
+    let conflicting = catalog_publish_frame(
+        stream_seq,
+        CATALOG_INNER_HIGH_WATER + 1,
+        sender_counter,
+        StreamPublishShape::Valid,
+    );
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogAt,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(
+        opened,
+        transport.with_post_script_inbound(vec![first, conflicting]),
+    );
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xf2; 32]);
+    let bootstrap = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("bootstrap before live nonce reuse");
+    let binding = bootstrap.binding().clone();
+    let controls_before = decoded_outbound_frames(&sent).len();
+
+    let first_error = runtime
+        .receive_stream_frame(&mut reducer)
+        .await
+        .expect_err("first authenticated noncanonical payload must not apply");
+    assert_eq!(first_error.code(), "remote.runtime.reply_invalid");
+    let nonce_reuse = runtime
+        .receive_stream_frame(&mut reducer)
+        .await
+        .expect_err("same counter with different ciphertext must quarantine");
+    assert_eq!(nonce_reuse.code(), "remote.crypto.nonce_reuse");
+    assert!(reducer.live_applied().is_empty());
+    assert_eq!(decoded_outbound_frames(&sent).len(), controls_before);
+    drop(runtime);
+    assert_durable_catalog_live_failure_state(
+        &store,
+        &root,
+        &fixture,
+        &binding,
+        Some((stream_seq, sender_counter)),
+        1,
+        true,
+    );
 }
 
 #[tokio::test]
