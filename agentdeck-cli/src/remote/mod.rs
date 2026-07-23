@@ -35,3 +35,4 @@ pub mod selector;
 pub mod signature;
 #[cfg(unix)]
 pub mod stream_state;
+pub mod transfer_state;
