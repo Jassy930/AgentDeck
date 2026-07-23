@@ -22,4 +22,6 @@ pub mod relay_transport;
 mod relay_transport_tests;
 #[cfg(unix)]
 pub mod runtime;
+#[cfg(unix)]
+pub mod selector;
 pub mod signature;

@@ -259,6 +259,34 @@ enum RuntimeSmokeOp {
     },
 }
 
+#[derive(clap::Args)]
+struct PersistentMachineSelectorArgs {
+    /// Exact MachineRoot fingerprint: canonical padded STANDARD base64 for 32 bytes
+    #[arg(long, value_name = "STANDARD_BASE64_32")]
+    machine_root_fingerprint: String,
+    /// Exact machine route: canonical padded STANDARD base64 for 16 bytes
+    #[arg(long, value_name = "STANDARD_BASE64_16")]
+    machine_route: String,
+}
+
+impl PersistentMachineSelectorArgs {
+    fn parse(
+        &self,
+    ) -> Result<agentdeck_cli::remote::selector::PersistentMachineSelector, CliError> {
+        agentdeck_cli::remote::selector::PersistentMachineSelector::parse(
+            &self.machine_root_fingerprint,
+            &self.machine_route,
+        )
+        .map_err(|error| CliError::Usage(error.to_string()))
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
+enum RemoteApprovalDecisionArg {
+    Approve,
+    Deny,
+}
+
 #[derive(Subcommand)]
 enum RemoteOp {
     /// Same-UID machine enrollment and status over the canonical Runtime UDS
@@ -314,38 +342,61 @@ enum RemoteOp {
     },
     /// List locally paired machines without dialing Relay or the daemon
     Machines,
-    Sessions {
-        #[arg(long)]
-        relay: String,
-        machine_id: String,
+    /// List canonical conversations for one exact locally paired machine
+    Conversations {
+        #[command(flatten)]
+        selector: PersistentMachineSelectorArgs,
     },
+    /// Watch one canonical conversation on one exact locally paired machine
     Watch {
+        #[command(flatten)]
+        selector: PersistentMachineSelectorArgs,
         #[arg(long)]
-        relay: String,
         conversation_id: String,
     },
-    Send {
+    /// Send a canonical prompt and wait for the authenticated daemon receipt
+    Prompt {
+        #[command(flatten)]
+        selector: PersistentMachineSelectorArgs,
         #[arg(long)]
-        relay: String,
         conversation_id: String,
+        #[arg(long)]
         text: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        expected_configuration_revision: u64,
     },
+    /// Submit one first-wins approval decision and wait for its daemon receipt
     Approve {
+        #[command(flatten)]
+        selector: PersistentMachineSelectorArgs,
         #[arg(long)]
-        relay: String,
-        turn_session_id: String,
+        conversation_id: String,
+        #[arg(long)]
+        turn_id: String,
+        #[arg(long)]
+        approval_id: String,
+        #[arg(long, value_enum)]
+        decision: RemoteApprovalDecisionArg,
+        #[arg(long)]
         request_id: String,
-    },
-    Deny {
         #[arg(long)]
-        relay: String,
-        turn_session_id: String,
-        request_id: String,
+        persist: bool,
     },
-    Ping {
+    /// Retry delivery of the already claimed decision for one exact approval
+    RetryApproval {
+        #[command(flatten)]
+        selector: PersistentMachineSelectorArgs,
         #[arg(long)]
-        relay: String,
-        machine_id: String,
+        conversation_id: String,
+        #[arg(long)]
+        approval_id: String,
+    },
+    /// Revoke this persistent paired device after an authenticated Relay terminal
+    RevokeSelf {
+        #[command(flatten)]
+        selector: PersistentMachineSelectorArgs,
     },
 }
 
@@ -1170,6 +1221,31 @@ fn is_flag_or_assignment(value: &[u8], flag: &[u8]) -> bool {
             .is_some_and(|suffix| suffix.starts_with(b"="))
 }
 
+fn remote_pre_dispatch(op: &RemoteOp) -> Result<Option<remote_cli::RemoteOpArg>, CliError> {
+    let arg = match op {
+        RemoteOp::Machine { .. }
+        | RemoteOp::Pairing { .. }
+        | RemoteOp::Revoke { .. }
+        | RemoteOp::TrustReset { .. }
+        | RemoteOp::Pair { .. }
+        | RemoteOp::Machines => None,
+        RemoteOp::Synthetic { bundle } => Some(remote_cli::RemoteOpArg::Synthetic {
+            bundle: bundle.clone(),
+        }),
+        RemoteOp::Smoke => Some(remote_cli::RemoteOpArg::LegacyV1),
+        RemoteOp::Conversations { selector }
+        | RemoteOp::Watch { selector, .. }
+        | RemoteOp::Prompt { selector, .. }
+        | RemoteOp::Approve { selector, .. }
+        | RemoteOp::RetryApproval { selector, .. }
+        | RemoteOp::RevokeSelf { selector } => {
+            let _selector = selector.parse()?;
+            Some(remote_cli::RemoteOpArg::PersistentUnsupported)
+        }
+    };
+    Ok(arg)
+}
+
 #[tokio::main]
 async fn main() {
     if forbidden_remote_pair_argv(std::env::args_os()) {
@@ -1197,25 +1273,19 @@ async fn main() {
         }
     };
     if let Cmd::Remote { op } = &cli.command {
-        let arg = match op {
-            RemoteOp::Machine { .. }
-            | RemoteOp::Pairing { .. }
-            | RemoteOp::Revoke { .. }
-            | RemoteOp::TrustReset { .. }
-            | RemoteOp::Pair { .. }
-            | RemoteOp::Machines => None,
-            RemoteOp::Synthetic { bundle } => Some(remote_cli::RemoteOpArg::Synthetic {
-                bundle: bundle.clone(),
-            }),
-            RemoteOp::Smoke => Some(remote_cli::RemoteOpArg::LegacyV1),
-            RemoteOp::Sessions { .. }
-            | RemoteOp::Watch { .. }
-            | RemoteOp::Send { .. }
-            | RemoteOp::Approve { .. }
-            | RemoteOp::Deny { .. }
-            | RemoteOp::Ping { .. } => Some(remote_cli::RemoteOpArg::PersistentUnsupported),
+        let arg = match remote_pre_dispatch(op) {
+            Ok(arg) => arg,
+            Err(error) => {
+                eprintln!("agentdeck: {}", error.message());
+                println!("{}", render(&output::error_envelope(&error), cli.pretty));
+                std::process::exit(error.exit_code());
+            }
         };
         if let Some(arg) = arg {
+            if matches!(&arg, remote_cli::RemoteOpArg::PersistentUnsupported) {
+                eprintln!("remote.persistent.unsupported");
+                std::process::exit(1);
+            }
             let code = remote_cli::run(arg, &cli.profile, cli.data_dir.as_deref()).await;
             if code == std::process::ExitCode::SUCCESS {
                 return;
@@ -1580,7 +1650,7 @@ mod remote_pair_cli_tests {
         assert!(!forbidden_remote_pair_argv([
             "agentdeck",
             "remote",
-            "sessions",
+            "conversations",
             "pair",
             "--relay",
             "wss://relay.example/",
@@ -1654,6 +1724,290 @@ mod remote_pair_cli_tests {
         assert_eq!(error.exit_code(), 3);
         assert!(rendered.contains("remote.pairing.input_unsafe"));
         assert!(!rendered.contains("secret-sentinel-path"));
+    }
+}
+
+#[cfg(test)]
+mod persistent_remote_command_cli_tests {
+    use super::*;
+
+    const ROOT: &str = "ERERERERERERERERERERERERERERERERERERERERERE=";
+    const ROUTE: &str = "IiIiIiIiIiIiIiIiIiIiIg==";
+
+    fn selector_tail() -> [&'static str; 4] {
+        ["--machine-root-fingerprint", ROOT, "--machine-route", ROUTE]
+    }
+
+    #[test]
+    fn planned_persistent_commands_collect_the_complete_runtime_arguments() {
+        let conversations = Cli::try_parse_from(
+            ["agentdeck", "remote", "conversations"]
+                .into_iter()
+                .chain(selector_tail()),
+        )
+        .expect("parse conversations");
+        assert!(matches!(
+            conversations.command,
+            Cmd::Remote {
+                op: RemoteOp::Conversations { selector }
+            } if selector.parse().is_ok()
+        ));
+
+        let watch = Cli::try_parse_from(
+            [
+                "agentdeck",
+                "remote",
+                "watch",
+                "--conversation-id",
+                "conversation-1",
+            ]
+            .into_iter()
+            .chain(selector_tail()),
+        )
+        .expect("parse watch");
+        assert!(matches!(
+            watch.command,
+            Cmd::Remote {
+                op: RemoteOp::Watch {
+                    selector,
+                    conversation_id,
+                }
+            } if selector.parse().is_ok() && conversation_id == "conversation-1"
+        ));
+
+        let prompt = Cli::try_parse_from(
+            [
+                "agentdeck",
+                "remote",
+                "prompt",
+                "--conversation-id",
+                "conversation-1",
+                "--text",
+                "continue safely",
+                "--idempotency-key",
+                "prompt-1",
+                "--expected-configuration-revision",
+                "7",
+            ]
+            .into_iter()
+            .chain(selector_tail()),
+        )
+        .expect("parse prompt");
+        assert!(matches!(
+            prompt.command,
+            Cmd::Remote {
+                op: RemoteOp::Prompt {
+                    selector,
+                    conversation_id,
+                    text,
+                    idempotency_key,
+                    expected_configuration_revision: 7,
+                }
+            } if selector.parse().is_ok()
+                && conversation_id == "conversation-1"
+                && text == "continue safely"
+                && idempotency_key == "prompt-1"
+        ));
+
+        let approve = Cli::try_parse_from(
+            [
+                "agentdeck",
+                "remote",
+                "approve",
+                "--conversation-id",
+                "conversation-1",
+                "--turn-id",
+                "turn-1",
+                "--approval-id",
+                "approval-1",
+                "--decision",
+                "deny",
+                "--request-id",
+                "request-1",
+                "--persist",
+            ]
+            .into_iter()
+            .chain(selector_tail()),
+        )
+        .expect("parse approve");
+        assert!(matches!(
+            approve.command,
+            Cmd::Remote {
+                op: RemoteOp::Approve {
+                    selector,
+                    conversation_id,
+                    turn_id,
+                    approval_id,
+                    decision: RemoteApprovalDecisionArg::Deny,
+                    request_id,
+                    persist: true,
+                }
+            } if selector.parse().is_ok()
+                && conversation_id == "conversation-1"
+                && turn_id == "turn-1"
+                && approval_id == "approval-1"
+                && request_id == "request-1"
+        ));
+
+        let retry = Cli::try_parse_from(
+            [
+                "agentdeck",
+                "remote",
+                "retry-approval",
+                "--conversation-id",
+                "conversation-1",
+                "--approval-id",
+                "approval-1",
+            ]
+            .into_iter()
+            .chain(selector_tail()),
+        )
+        .expect("parse retry-approval");
+        assert!(matches!(
+            retry.command,
+            Cmd::Remote {
+                op: RemoteOp::RetryApproval {
+                    selector,
+                    conversation_id,
+                    approval_id,
+                }
+            } if selector.parse().is_ok()
+                && conversation_id == "conversation-1"
+                && approval_id == "approval-1"
+        ));
+
+        let revoke = Cli::try_parse_from(
+            ["agentdeck", "remote", "revoke-self"]
+                .into_iter()
+                .chain(selector_tail()),
+        )
+        .expect("parse revoke-self");
+        assert!(matches!(
+            revoke.command,
+            Cmd::Remote {
+                op: RemoteOp::RevokeSelf { selector }
+            } if selector.parse().is_ok()
+        ));
+    }
+
+    #[test]
+    fn every_persistent_command_requires_both_machine_identity_components() {
+        let command_tails = [
+            vec!["conversations"],
+            vec!["watch", "--conversation-id", "conversation-1"],
+            vec![
+                "prompt",
+                "--conversation-id",
+                "conversation-1",
+                "--text",
+                "hello",
+                "--idempotency-key",
+                "prompt-1",
+                "--expected-configuration-revision",
+                "1",
+            ],
+            vec![
+                "approve",
+                "--conversation-id",
+                "conversation-1",
+                "--turn-id",
+                "turn-1",
+                "--approval-id",
+                "approval-1",
+                "--decision",
+                "approve",
+                "--request-id",
+                "request-1",
+            ],
+            vec![
+                "retry-approval",
+                "--conversation-id",
+                "conversation-1",
+                "--approval-id",
+                "approval-1",
+            ],
+            vec!["revoke-self"],
+        ];
+
+        for tail in command_tails {
+            let mut missing_root = vec!["agentdeck", "remote"];
+            missing_root.extend(tail.iter().copied());
+            missing_root.extend(["--machine-route", ROUTE]);
+            assert!(Cli::try_parse_from(missing_root).is_err());
+
+            let mut missing_route = vec!["agentdeck", "remote"];
+            missing_route.extend(tail);
+            missing_route.extend(["--machine-root-fingerprint", ROOT]);
+            assert!(Cli::try_parse_from(missing_route).is_err());
+        }
+    }
+
+    #[test]
+    fn persistent_commands_reject_ambiguous_and_removed_selectors() {
+        for forbidden in [
+            vec!["--relay", "wss://relay.example/"],
+            vec!["--display-name", "workstation"],
+            vec!["--device-route", "device-route-secret"],
+            vec!["--machine-id", "legacy-machine"],
+        ] {
+            let mut args = vec!["agentdeck", "remote", "conversations"];
+            args.extend(selector_tail());
+            args.extend(forbidden);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(
+            Cli::try_parse_from(
+                ["agentdeck", "remote", "conversations", "legacy-machine"]
+                    .into_iter()
+                    .chain(selector_tail())
+            )
+            .is_err()
+        );
+
+        for removed in ["sessions", "send", "deny", "ping"] {
+            assert!(Cli::try_parse_from(["agentdeck", "remote", removed]).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_selector_is_rejected_without_echo_and_valid_commands_are_unsupported_only() {
+        let cli = Cli::try_parse_from([
+            "agentdeck",
+            "remote",
+            "conversations",
+            "--machine-root-fingerprint",
+            ROOT,
+            "--machine-route",
+            "route-secret-sentinel",
+        ])
+        .expect("raw selector values are validated by the redacting composite parser");
+        let Cmd::Remote { op } = cli.command else {
+            panic!("expected remote command");
+        };
+        let error = match remote_pre_dispatch(&op) {
+            Ok(_) => panic!("invalid selector must fail before dispatch"),
+            Err(error) => error,
+        };
+        assert!(!error.message().contains("route-secret-sentinel"));
+        assert!(
+            !output::error_envelope(&error)
+                .to_string()
+                .contains("route-secret-sentinel")
+        );
+
+        let valid = Cli::try_parse_from(
+            ["agentdeck", "remote", "conversations"]
+                .into_iter()
+                .chain(selector_tail()),
+        )
+        .expect("valid persistent command");
+        let Cmd::Remote { op } = valid.command else {
+            panic!("expected remote command");
+        };
+        assert!(matches!(
+            remote_pre_dispatch(&op).expect("valid selector"),
+            Some(remote_cli::RemoteOpArg::PersistentUnsupported)
+        ));
     }
 }
 
