@@ -17,7 +17,8 @@ use agentdeck_crypto::{
     AeadReceivingKey, AeadSendingKey, CryptoError, HpkePrivateKey, HpkePublicKey, SecretAeadKey,
     SenderCounter, SignatureBytes, SigningKey, VerifyingKey, open_key_directory_entry,
     open_pair_response, open_sealed_payload, seal_pair_response_received, seal_symmetric, sha256,
-    sign_authentication_transcript, sign_sealed, verify_sealed, verify_tbs,
+    sign_authentication_transcript, sign_revocation_cleanup_journal_digest, sign_sealed,
+    verify_revocation_cleanup_journal_digest, verify_sealed, verify_tbs,
 };
 use agentdeck_protocol::ActionDecision;
 use agentdeck_protocol::e2ee::{
@@ -36,10 +37,10 @@ use agentdeck_protocol::relay_v2::frame::{
 };
 use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayServerId,
-    RequestRouteId, StreamRouteId, TrustEpoch,
+    RequestRouteId, RootKeyId, StreamRouteId, TrustEpoch,
 };
 use agentdeck_protocol::relay_v2::{
-    OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, encode,
+    OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, decode, encode,
 };
 use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TurnId};
 use agentdeck_protocol::runtime::{
@@ -57,6 +58,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::crypto_state::{
     CryptoStateError, CryptoStateIdentity, CryptoStateSnapshot, DeviceStorageKek,
     FileCryptoStateStore, MAX_CRYPTO_STATE_PLAINTEXT_LEN, PreparedCryptoStateStage,
+    revocation_cleanup_entries_absent_in,
 };
 use super::device_lock::{RemoteDeviceLease, RemoteDeviceLockError, RemoteDeviceLockKey};
 use super::keychain::{
@@ -78,6 +80,11 @@ const MAX_MUTABLE_AUDIT_ATTEMPTS: usize = 3;
 
 const MARKER_MAGIC: &[u8; 4] = b"ADPM";
 const MARKER_VERSION: u16 = 1;
+const PAIRED_COMMIT_MARKER_BYTES: usize = 480;
+const CLEANUP_JOURNAL_MAGIC: &[u8; 4] = b"ADPC";
+const CLEANUP_JOURNAL_VERSION: u16 = 1;
+const MAX_CLEANUP_TERMINAL_BYTES: usize = 64 * 1024;
+const MAX_CLEANUP_GRANT_BYTES: usize = 4 * 1024;
 const KEK_MAGIC: &[u8; 4] = b"ADKK";
 const KEK_VERSION: u16 = 1;
 const COUNTER_GUARD_MAGIC: &[u8; 4] = b"ADCG";
@@ -105,6 +112,14 @@ pub enum PairedMutationStage {
     StateRecoveryActiveDurable,
     StateGuardStableDurable,
     StateStageCleared,
+    CleanupJournalDurable,
+    CleanupStateDeleted,
+    CleanupCounterGuardDeleted,
+    CleanupGrantDeleted,
+    CleanupDeviceHpkeDeleted,
+    CleanupDeviceSignDeleted,
+    CleanupStorageKekDeleted,
+    CleanupJournalDeleted,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -426,6 +441,8 @@ pub enum PairedPromotionError {
     Incomplete,
     #[error("paired promotion conflicts with durable state")]
     Conflict,
+    #[error("paired machine is revoked and cleanup is pending")]
+    RevokedCleanupPending,
     #[error("paired promotion state has an invalid canonical encoding")]
     InvalidState,
 }
@@ -444,6 +461,7 @@ impl PairedPromotionError {
             Self::CounterEpochExhausted => "remote.counter.epoch_retirement_required",
             Self::Incomplete => "remote.pairing.paired_incomplete",
             Self::Conflict => "remote.pairing.paired_conflict",
+            Self::RevokedCleanupPending => "remote.pairing.revoked_cleanup_pending",
         }
     }
 }
@@ -743,6 +761,57 @@ impl VerifiedRevocationTerminal {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RevocationTerminalBinding {
+    root_fingerprint: [u8; 32],
+    relay_server_id: RelayServerId,
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+    grant_serial: GrantSerial,
+    root_key_id: RootKeyId,
+    trust_epoch: TrustEpoch,
+    machine_root_pubkey: [u8; 32],
+}
+
+fn validate_exact_revocation_terminal(
+    frame: &OpaqueRouteFrame,
+    canonical_bytes: &[u8],
+    expected: RevocationTerminalBinding,
+) -> Result<(), PairedPromotionError> {
+    if frame.version != RELAY_PROTOCOL_VERSION || encode(frame).as_slice() != canonical_bytes {
+        return Err(PairedPromotionError::InvalidState);
+    }
+    let RelayFrameBody::RevocationCommitted(RevocationCommitted {
+        device_route,
+        grant_serial,
+        signed_revocation,
+    }) = &frame.body
+    else {
+        return Err(PairedPromotionError::InvalidState);
+    };
+    if *device_route != signed_revocation.device_route
+        || *grant_serial != signed_revocation.grant_serial
+        || signed_revocation.machine_route != expected.machine_route
+        || signed_revocation.device_route != expected.device_route
+        || signed_revocation.grant_serial != expected.grant_serial
+        || signed_revocation.root_key_id != expected.root_key_id
+        || signed_revocation.trust_epoch != expected.trust_epoch
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+    let root = VerifyingKey::from_bytes(&expected.machine_root_pubkey)
+        .map_err(PairedPromotionError::Crypto)?;
+    if sha256(&root.to_bytes()) != expected.root_fingerprint {
+        return Err(PairedPromotionError::Conflict);
+    }
+    verify_tbs(
+        &root,
+        &signed_revocation.to_be_signed_v1(expected.relay_server_id, expected.root_fingerprint),
+        &SignatureBytes::from(signed_revocation.signature),
+    )
+    .map_err(PairedPromotionError::Crypto)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DirectedReplyBrand {
     machine_route: MachineRouteId,
@@ -895,42 +964,21 @@ impl OpenedPairedMachine<'_> {
         frame: &OpaqueRouteFrame,
         canonical_bytes: &[u8],
     ) -> Result<VerifiedRevocationTerminal, PairedPromotionError> {
-        if frame.version != RELAY_PROTOCOL_VERSION || encode(frame).as_slice() != canonical_bytes {
-            return Err(PairedPromotionError::InvalidState);
-        }
-        let RelayFrameBody::RevocationCommitted(RevocationCommitted {
-            device_route,
-            grant_serial,
-            signed_revocation,
-        }) = &frame.body
-        else {
-            return Err(PairedPromotionError::InvalidState);
-        };
         let bootstrap = self.audited.state.bootstrap();
-        if *device_route != signed_revocation.device_route
-            || *grant_serial != signed_revocation.grant_serial
-            || signed_revocation.machine_route != self.audited.identity.machine_route
-            || signed_revocation.device_route != self.audited.device_route
-            || signed_revocation.grant_serial != self.audited.grant_serial
-            || signed_revocation.root_key_id != self.audited.grant.root_key_id
-            || signed_revocation.trust_epoch != self.audited.trust_epoch
-        {
-            return Err(PairedPromotionError::Conflict);
-        }
-        let root = VerifyingKey::from_bytes(&bootstrap.machine_root_pubkey)
-            .map_err(PairedPromotionError::Crypto)?;
-        if sha256(&root.to_bytes()) != bootstrap.machine_root_fingerprint {
-            return Err(PairedPromotionError::Conflict);
-        }
-        verify_tbs(
-            &root,
-            &signed_revocation.to_be_signed_v1(
-                self.audited.relay_server_id,
-                bootstrap.machine_root_fingerprint,
-            ),
-            &SignatureBytes::from(signed_revocation.signature),
-        )
-        .map_err(PairedPromotionError::Crypto)?;
+        validate_exact_revocation_terminal(
+            frame,
+            canonical_bytes,
+            RevocationTerminalBinding {
+                root_fingerprint: bootstrap.machine_root_fingerprint,
+                relay_server_id: self.audited.relay_server_id,
+                machine_route: self.audited.identity.machine_route,
+                device_route: self.audited.device_route,
+                grant_serial: self.audited.grant_serial,
+                root_key_id: self.audited.grant.root_key_id,
+                trust_epoch: self.audited.trust_epoch,
+                machine_root_pubkey: bootstrap.machine_root_pubkey,
+            },
+        )?;
 
         Ok(VerifiedRevocationTerminal {
             canonical_bytes: canonical_bytes.to_vec(),
@@ -938,6 +986,132 @@ impl OpenedPairedMachine<'_> {
             device_route: self.audited.device_route,
             grant_serial: self.audited.grant_serial,
         })
+    }
+
+    /// 把已验证的 root-signed terminal 原子提升为唯一 cleanup journal，再按固定顺序
+    /// 删除本 machine 的 sealed state 与 Keychain material。journal 是唯一可见性边界，
+    /// 一旦 durable，machine 永远不能再作为 active pairing 打开。
+    pub fn commit_revocation_cleanup(
+        mut self,
+        terminal: VerifiedRevocationTerminal,
+    ) -> Result<(), PairedPromotionError> {
+        if terminal.identity != self.audited.identity
+            || terminal.device_route != self.audited.device_route
+            || terminal.grant_serial != self.audited.grant_serial
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.refresh_mutable_state()?;
+        if self.audited.prepared_stage.is_some() {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        let accounts = PairedAccounts::new(
+            self.audited.marker.installation_id,
+            self.audited.identity.machine_root_fingerprint,
+            self.audited.identity.machine_route,
+        );
+        let device_sign = self.load_cleanup_source(&accounts.device_sign)?;
+        let device_hpke = self.load_cleanup_source(&accounts.device_hpke)?;
+        let grant = self.load_cleanup_source(&accounts.grant)?;
+        let storage_kek = self.load_cleanup_source(&accounts.kek)?;
+        let kek_record = StorageKekRecordV1::decode(storage_kek.expose_secret())?;
+        if kek_record.promotion_id != self.audited.marker.promotion_id
+            || kek_record.commitment() != self.audited.marker.kek_record_hash
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let durable = audit_durable_state(
+            self.audited.state.bootstrap(),
+            grant.expose_secret(),
+            &device_sign,
+            &device_hpke,
+        )?;
+        if durable.device_signing_key.verifying_key().to_bytes()
+            != self.audited.marker.device_sign_pubkey
+            || hpke_public_bytes(&durable.device_hpke_private_key)?
+                != self.audited.marker.device_hpke_pubkey
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        let terminal_frame =
+            decode(&terminal.canonical_bytes).map_err(|_| PairedPromotionError::InvalidState)?;
+        let bootstrap = self.audited.state.bootstrap();
+        validate_exact_revocation_terminal(
+            &terminal_frame,
+            &terminal.canonical_bytes,
+            RevocationTerminalBinding {
+                root_fingerprint: bootstrap.machine_root_fingerprint,
+                relay_server_id: bootstrap.relay_server_id,
+                machine_route: bootstrap.machine_route,
+                device_route: bootstrap.device_route,
+                grant_serial: bootstrap.grant_serial,
+                root_key_id: durable.grant.root_key_id,
+                trust_epoch: bootstrap.trust_epoch,
+                machine_root_pubkey: bootstrap.machine_root_pubkey,
+            },
+        )?;
+
+        let mut journal = PairedCleanupJournalV1 {
+            installation_id: self.audited.marker.installation_id,
+            root_fingerprint: self.audited.marker.root_fingerprint,
+            relay_server_id: self.audited.marker.relay_server_id,
+            machine_route: self.audited.marker.machine_route,
+            device_route: self.audited.marker.device_route,
+            grant_serial: self.audited.marker.grant_serial,
+            root_key_id: durable.grant.root_key_id,
+            trust_epoch: self.audited.marker.trust_epoch,
+            machine_root_pubkey: bootstrap.machine_root_pubkey,
+            active_marker: self.audited.marker,
+            terminal_bytes: terminal.canonical_bytes,
+            grant_bytes: grant.expose_secret().to_vec(),
+            state_plaintext_hash: sha256(self.audited.state_snapshot.expose_secret()),
+            counter_guard_hash: sha256(self.audited.counter_guard_bytes.expose_secret()),
+            grant_hash: sha256(grant.expose_secret()),
+            device_hpke_hash: sha256(device_hpke.expose_secret()),
+            device_sign_hash: sha256(device_sign.expose_secret()),
+            storage_kek_hash: sha256(storage_kek.expose_secret()),
+            journal_signature: SignatureBytes([0; 64]),
+        };
+        journal.journal_signature = sign_revocation_cleanup_journal_digest(
+            &durable.device_signing_key,
+            sha256(&journal.encode_unsigned()?),
+        );
+        journal.validate(self.audited.identity)?;
+        let active_marker = RemoteSecret::new(self.audited.marker.encode());
+        let journal_bytes = journal.encode()?;
+        self.store
+            .compare_and_replace_exact(
+                &accounts.marker,
+                &active_marker,
+                &RemoteSecret::new(journal_bytes.clone()),
+            )
+            .map_err(PairedPromotionError::Persistence)?;
+        self.observe_mutation(PairedMutationStage::CleanupJournalDurable);
+
+        execute_revocation_cleanup(
+            self.store,
+            self.audited.state_store.root(),
+            self.audited.identity,
+            &accounts,
+            &journal,
+            &journal_bytes,
+            self.mutation_observer.as_deref(),
+        )
+    }
+
+    fn load_cleanup_source(
+        &self,
+        account: &RemoteKeyAccount,
+    ) -> Result<RemoteSecret, PairedPromotionError> {
+        self.store
+            .load(account)
+            .map_err(PairedPromotionError::Persistence)?
+            .ok_or(PairedPromotionError::Incomplete)
     }
 
     /// 只暴露已逐项 DeviceHPKE 解封成功的 key 数量，不返回 raw key。
@@ -1691,9 +1865,32 @@ impl<'a> PairedMachineStore<'a> {
             .list_paired_commit_markers(self.installation_id)
             .map_err(PairedPromotionError::Persistence)?;
         let mut machines = Vec::with_capacity(markers.len());
-        for marker in markers {
-            let audited = self.audit_marker(&marker)?;
-            machines.push(audited.summary());
+        for parsed in markers {
+            let identity = self.validate_marker_account(&parsed)?;
+            let marker_secret = self.load_required(parsed.account())?;
+            match PairedMarkerValue::decode(marker_secret.expose_secret())? {
+                PairedMarkerValue::Active(marker) => {
+                    let audited = self.audit_active_marker(&parsed, *marker)?;
+                    machines.push(audited.summary());
+                }
+                PairedMarkerValue::Cleanup(journal) => {
+                    // 合法 ADPC 已经永久关闭可见性；list 只验证 journal 自身并隐藏，
+                    // 不恢复、不删除，也不把剩余 credential 暴露成 active machine。
+                    journal.validate(identity)?;
+                    let accounts = PairedAccounts::new(
+                        self.installation_id,
+                        identity.machine_root_fingerprint,
+                        identity.machine_route,
+                    );
+                    audit_revocation_cleanup(
+                        self.store,
+                        &self.state_root,
+                        identity,
+                        &accounts,
+                        &journal,
+                    )?;
+                }
+            }
         }
         Ok(machines)
     }
@@ -1720,7 +1917,16 @@ impl<'a> PairedMachineStore<'a> {
             ),
         )
         .map_err(PairedPromotionError::DeviceLock)?;
-        let audited = self.audit_marker(&parsed)?;
+        let marker_secret = self.load_required(parsed.account())?;
+        let marker = match PairedMarkerValue::decode(marker_secret.expose_secret())? {
+            PairedMarkerValue::Active(marker) => *marker,
+            PairedMarkerValue::Cleanup(journal) => {
+                // cleanup pending 时只读取并验证唯一 marker，绝不再读取残留 credential。
+                journal.validate(identity)?;
+                return Err(PairedPromotionError::RevokedCleanupPending);
+            }
+        };
+        let audited = self.audit_active_marker(&parsed, marker)?;
         let mut opened = audited.into_opened(
             self.store,
             self.mutation_observer.clone(),
@@ -1731,21 +1937,104 @@ impl<'a> PairedMachineStore<'a> {
         Ok(opened)
     }
 
-    fn audit_marker(
+    /// 恢复当前 installation 中所有 durable ADPC cleanup journal。
+    ///
+    /// 第一遍先对全部 ADPM/ADPC 做零写全审计；任一 active machine 或 cleanup prefix
+    /// 损坏都会阻止所有删除。只有全局审计通过后，才逐 machine 取得 lease、逐字重读
+    /// journal，并在每个删除边界前重新执行完整 preflight。
+    pub fn recover_revocation_cleanups(&self) -> Result<(), PairedPromotionError> {
+        let markers = self
+            .store
+            .list_paired_commit_markers(self.installation_id)
+            .map_err(PairedPromotionError::Persistence)?;
+        let mut cleanups = Vec::new();
+
+        for parsed in markers {
+            let identity = self.validate_marker_account(&parsed)?;
+            let marker_secret = self.load_required(parsed.account())?;
+            match PairedMarkerValue::decode(marker_secret.expose_secret())? {
+                PairedMarkerValue::Active(marker) => {
+                    // recovery 是 installation-wide fail-close：不能先清掉 A，再忽略损坏的 B。
+                    drop(self.audit_active_marker(&parsed, *marker)?);
+                }
+                PairedMarkerValue::Cleanup(journal) => {
+                    journal.validate(identity)?;
+                    let accounts = PairedAccounts::new(
+                        self.installation_id,
+                        identity.machine_root_fingerprint,
+                        identity.machine_route,
+                    );
+                    audit_revocation_cleanup(
+                        self.store,
+                        &self.state_root,
+                        identity,
+                        &accounts,
+                        &journal,
+                    )?;
+                    cleanups.push((identity, marker_secret.expose_secret().to_vec()));
+                }
+            }
+        }
+
+        for (identity, expected_journal_bytes) in cleanups {
+            let _lease = RemoteDeviceLease::acquire_in(
+                &self.state_root,
+                RemoteDeviceLockKey::new(
+                    self.installation_id,
+                    identity.machine_root_fingerprint,
+                    identity.machine_route,
+                ),
+            )
+            .map_err(PairedPromotionError::DeviceLock)?;
+            let accounts = PairedAccounts::new(
+                self.installation_id,
+                identity.machine_root_fingerprint,
+                identity.machine_route,
+            );
+            let durable = self.load_required(&accounts.marker)?;
+            if durable.expose_secret() != expected_journal_bytes {
+                return Err(PairedPromotionError::Conflict);
+            }
+            let PairedMarkerValue::Cleanup(current) =
+                PairedMarkerValue::decode(durable.expose_secret())?
+            else {
+                return Err(PairedPromotionError::Conflict);
+            };
+            current.validate(identity)?;
+            execute_revocation_cleanup(
+                self.store,
+                &self.state_root,
+                identity,
+                &accounts,
+                &current,
+                durable.expose_secret(),
+                self.mutation_observer.as_deref(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_marker_account(
         &self,
         parsed: &ParsedPairedRemoteKeyAccount,
-    ) -> Result<AuditedPairedMachine, PairedPromotionError> {
+    ) -> Result<PairedMachineIdentity, PairedPromotionError> {
         if parsed.installation_id() != self.installation_id
             || parsed.purpose() != PairedRemoteKeyPurpose::CommitMarker
         {
             return Err(PairedPromotionError::Conflict);
         }
-        let identity =
-            PairedMachineIdentity::new(parsed.machine_root_fingerprint(), parsed.machine_route());
+        Ok(PairedMachineIdentity::new(
+            parsed.machine_root_fingerprint(),
+            parsed.machine_route(),
+        ))
+    }
 
-        // marker 是唯一 visibility gate；在它 exact load/decode 前不读取任何 final item/state。
-        let marker_secret = self.load_required(parsed.account())?;
-        let marker = PairedCommitMarkerV1::decode(marker_secret.expose_secret())?;
+    fn audit_active_marker(
+        &self,
+        parsed: &ParsedPairedRemoteKeyAccount,
+        marker: PairedCommitMarkerV1,
+    ) -> Result<AuditedPairedMachine, PairedPromotionError> {
+        let identity = self.validate_marker_account(parsed)?;
         marker.validate_account(self.installation_id, identity)?;
         let accounts = PairedAccounts::new(
             self.installation_id,
@@ -2300,6 +2589,268 @@ impl PairedAccounts {
             marker: account(PairedRemoteKeyPurpose::CommitMarker),
         }
     }
+}
+
+struct RevocationCleanupPreflight {
+    state_store: Option<FileCryptoStateStore>,
+    state_present: bool,
+    counter_guard_present: bool,
+    grant_present: bool,
+    device_hpke_present: bool,
+    device_sign_present: bool,
+    storage_kek_present: bool,
+}
+
+fn audit_revocation_cleanup(
+    store: &dyn RemoteKeyStore,
+    state_root: &Path,
+    identity: PairedMachineIdentity,
+    accounts: &PairedAccounts,
+    journal: &PairedCleanupJournalV1,
+) -> Result<RevocationCleanupPreflight, PairedPromotionError> {
+    journal.validate(identity)?;
+    let expected_journal = journal.encode()?;
+    let durable_journal = store
+        .load(&accounts.marker)
+        .map_err(PairedPromotionError::Persistence)?
+        .ok_or(PairedPromotionError::Incomplete)?;
+    if durable_journal.expose_secret() != expected_journal {
+        return Err(PairedPromotionError::Conflict);
+    }
+
+    let counter_guard =
+        load_cleanup_item(store, &accounts.counter_guard, journal.counter_guard_hash)?;
+    let grant = load_cleanup_item(store, &accounts.grant, journal.grant_hash)?;
+    if grant
+        .as_ref()
+        .is_some_and(|value| value.expose_secret() != journal.grant_bytes)
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+    let device_hpke = load_cleanup_item(store, &accounts.device_hpke, journal.device_hpke_hash)?;
+    let device_sign = load_cleanup_item(store, &accounts.device_sign, journal.device_sign_hash)?;
+    let storage_kek = load_cleanup_item(store, &accounts.kek, journal.storage_kek_hash)?;
+
+    let state_identity = CryptoStateIdentity::new(
+        journal.installation_id,
+        identity.machine_root_fingerprint,
+        identity.machine_route,
+    );
+    let (state_store, state_present) = if let Some(secret) = storage_kek.as_ref() {
+        let record = StorageKekRecordV1::decode(secret.expose_secret())?;
+        if record.promotion_id != journal.active_marker.promotion_id
+            || record.commitment() != journal.storage_kek_hash
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let state_store =
+            FileCryptoStateStore::new_in(state_root, state_identity, record.device_storage_kek())
+                .map_err(PairedPromotionError::CryptoState)?;
+        let present = state_store
+            .audit_revocation_cleanup_state(journal.state_plaintext_hash)
+            .map_err(PairedPromotionError::CryptoState)?;
+        (Some(state_store), present)
+    } else {
+        if !revocation_cleanup_entries_absent_in(state_root, state_identity)
+            .map_err(PairedPromotionError::CryptoState)?
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        (None, false)
+    };
+
+    let presence = [
+        state_present,
+        counter_guard.is_some(),
+        grant.is_some(),
+        device_hpke.is_some(),
+        device_sign.is_some(),
+        storage_kek.is_some(),
+    ];
+    let mut reached_remaining_suffix = false;
+    for present in presence {
+        if present {
+            reached_remaining_suffix = true;
+        } else if reached_remaining_suffix {
+            // 只接受删除顺序形成的 absence prefix：false* true*。
+            return Err(PairedPromotionError::Conflict);
+        }
+    }
+
+    if state_present {
+        let state_store_ref = state_store.as_ref().ok_or(PairedPromotionError::Conflict)?;
+        let snapshot = state_store_ref
+            .load()
+            .map_err(PairedPromotionError::CryptoState)?
+            .ok_or(PairedPromotionError::Incomplete)?;
+        if sha256(snapshot.expose_secret()) != journal.state_plaintext_hash {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let state = PairedCryptoState::decode(snapshot.expose_secret())?;
+        journal
+            .active_marker
+            .validate_state(identity, &state, snapshot.expose_secret())?;
+        let device_sign = device_sign
+            .as_ref()
+            .ok_or(PairedPromotionError::Incomplete)?;
+        let device_hpke = device_hpke
+            .as_ref()
+            .ok_or(PairedPromotionError::Incomplete)?;
+        let grant = grant.as_ref().ok_or(PairedPromotionError::Incomplete)?;
+        let durable = audit_durable_state(
+            state.bootstrap(),
+            grant.expose_secret(),
+            device_sign,
+            device_hpke,
+        )?;
+        if durable.device_signing_key.verifying_key().to_bytes()
+            != journal.active_marker.device_sign_pubkey
+            || hpke_public_bytes(&durable.device_hpke_private_key)?
+                != journal.active_marker.device_hpke_pubkey
+            || durable.grant.root_key_id != journal.root_key_id
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let counter = counter_guard
+            .as_ref()
+            .ok_or(PairedPromotionError::Incomplete)?;
+        let counter_state = CounterGuardState::decode(counter.expose_secret())?;
+        validate_counter_guard_state(
+            &journal.active_marker,
+            identity,
+            &counter_state,
+            counter.expose_secret(),
+            &state,
+            snapshot.expose_secret(),
+            None,
+            durable.device_command_binding,
+        )?;
+    }
+
+    Ok(RevocationCleanupPreflight {
+        state_store,
+        state_present,
+        counter_guard_present: counter_guard.is_some(),
+        grant_present: grant.is_some(),
+        device_hpke_present: device_hpke.is_some(),
+        device_sign_present: device_sign.is_some(),
+        storage_kek_present: storage_kek.is_some(),
+    })
+}
+
+fn load_cleanup_item(
+    store: &dyn RemoteKeyStore,
+    account: &RemoteKeyAccount,
+    expected_hash: [u8; 32],
+) -> Result<Option<RemoteSecret>, PairedPromotionError> {
+    let value = store
+        .load(account)
+        .map_err(PairedPromotionError::Persistence)?;
+    if value
+        .as_ref()
+        .is_some_and(|secret| sha256(secret.expose_secret()) != expected_hash)
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+    Ok(value)
+}
+
+fn delete_cleanup_item(
+    store: &dyn RemoteKeyStore,
+    account: &RemoteKeyAccount,
+    expected_hash: [u8; 32],
+) -> Result<(), PairedPromotionError> {
+    let current = store
+        .load(account)
+        .map_err(PairedPromotionError::Persistence)?
+        .ok_or(PairedPromotionError::Incomplete)?;
+    if sha256(current.expose_secret()) != expected_hash {
+        return Err(PairedPromotionError::Conflict);
+    }
+    store
+        .delete_exact(account)
+        .map_err(PairedPromotionError::Persistence)
+}
+
+fn observe_cleanup(observer: Option<&dyn PairedMutationObserver>, stage: PairedMutationStage) {
+    if let Some(observer) = observer {
+        observer.after_stage(stage);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_revocation_cleanup(
+    store: &dyn RemoteKeyStore,
+    state_root: &Path,
+    identity: PairedMachineIdentity,
+    accounts: &PairedAccounts,
+    journal: &PairedCleanupJournalV1,
+    journal_bytes: &[u8],
+    observer: Option<&dyn PairedMutationObserver>,
+) -> Result<(), PairedPromotionError> {
+    let mut preflight = audit_revocation_cleanup(store, state_root, identity, accounts, journal)?;
+    if preflight.state_present {
+        preflight
+            .state_store
+            .take()
+            .ok_or(PairedPromotionError::Conflict)?
+            .delete_revocation_cleanup_state(journal.state_plaintext_hash)
+            .map_err(PairedPromotionError::CryptoState)?;
+        observe_cleanup(observer, PairedMutationStage::CleanupStateDeleted);
+    }
+
+    preflight = audit_revocation_cleanup(store, state_root, identity, accounts, journal)?;
+    if preflight.counter_guard_present {
+        delete_cleanup_item(store, &accounts.counter_guard, journal.counter_guard_hash)?;
+        observe_cleanup(observer, PairedMutationStage::CleanupCounterGuardDeleted);
+    }
+
+    preflight = audit_revocation_cleanup(store, state_root, identity, accounts, journal)?;
+    if preflight.grant_present {
+        delete_cleanup_item(store, &accounts.grant, journal.grant_hash)?;
+        observe_cleanup(observer, PairedMutationStage::CleanupGrantDeleted);
+    }
+
+    preflight = audit_revocation_cleanup(store, state_root, identity, accounts, journal)?;
+    if preflight.device_hpke_present {
+        delete_cleanup_item(store, &accounts.device_hpke, journal.device_hpke_hash)?;
+        observe_cleanup(observer, PairedMutationStage::CleanupDeviceHpkeDeleted);
+    }
+
+    preflight = audit_revocation_cleanup(store, state_root, identity, accounts, journal)?;
+    if preflight.device_sign_present {
+        delete_cleanup_item(store, &accounts.device_sign, journal.device_sign_hash)?;
+        observe_cleanup(observer, PairedMutationStage::CleanupDeviceSignDeleted);
+    }
+
+    preflight = audit_revocation_cleanup(store, state_root, identity, accounts, journal)?;
+    if preflight.storage_kek_present {
+        delete_cleanup_item(store, &accounts.kek, journal.storage_kek_hash)?;
+        observe_cleanup(observer, PairedMutationStage::CleanupStorageKekDeleted);
+    }
+
+    preflight = audit_revocation_cleanup(store, state_root, identity, accounts, journal)?;
+    if preflight.state_present
+        || preflight.counter_guard_present
+        || preflight.grant_present
+        || preflight.device_hpke_present
+        || preflight.device_sign_present
+        || preflight.storage_kek_present
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+    let current = store
+        .load(&accounts.marker)
+        .map_err(PairedPromotionError::Persistence)?
+        .ok_or(PairedPromotionError::Incomplete)?;
+    if current.expose_secret() != journal_bytes {
+        return Err(PairedPromotionError::Conflict);
+    }
+    store
+        .delete_exact(&accounts.marker)
+        .map_err(PairedPromotionError::Persistence)?;
+    observe_cleanup(observer, PairedMutationStage::CleanupJournalDeleted);
+    Ok(())
 }
 
 fn signing_key(secret: &RemoteSecret) -> Result<SigningKey, PairedPromotionError> {
@@ -4132,7 +4683,7 @@ impl PairedCommitMarkerV1 {
     }
 
     fn encode(&self) -> Vec<u8> {
-        let mut encoded = Vec::with_capacity(480);
+        let mut encoded = Vec::with_capacity(PAIRED_COMMIT_MARKER_BYTES);
         encoded.extend_from_slice(MARKER_MAGIC);
         encoded.extend_from_slice(&MARKER_VERSION.to_be_bytes());
         encoded.extend_from_slice(&[0, 0]);
@@ -4163,7 +4714,7 @@ impl PairedCommitMarkerV1 {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
-        if bytes.len() != 480
+        if bytes.len() != PAIRED_COMMIT_MARKER_BYTES
             || &bytes[..4] != MARKER_MAGIC
             || u16::from_be_bytes([bytes[4], bytes[5]]) != MARKER_VERSION
             || bytes[6..8] != [0, 0]
@@ -4301,6 +4852,255 @@ impl PairedCommitMarkerV1 {
             return Err(PairedPromotionError::Conflict);
         }
         Ok(())
+    }
+}
+
+enum PairedMarkerValue {
+    Active(Box<PairedCommitMarkerV1>),
+    Cleanup(Box<PairedCleanupJournalV1>),
+}
+
+impl PairedMarkerValue {
+    fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
+        match bytes.get(..4) {
+            Some(magic) if magic == MARKER_MAGIC => {
+                PairedCommitMarkerV1::decode(bytes).map(|marker| Self::Active(Box::new(marker)))
+            }
+            Some(magic) if magic == CLEANUP_JOURNAL_MAGIC => PairedCleanupJournalV1::decode(bytes)
+                .map(|journal| Self::Cleanup(Box::new(journal))),
+            _ => Err(PairedPromotionError::InvalidState),
+        }
+    }
+}
+
+struct PairedCleanupJournalV1 {
+    installation_id: Uuid,
+    root_fingerprint: [u8; 32],
+    relay_server_id: RelayServerId,
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+    grant_serial: GrantSerial,
+    root_key_id: RootKeyId,
+    trust_epoch: TrustEpoch,
+    machine_root_pubkey: [u8; 32],
+    active_marker: PairedCommitMarkerV1,
+    terminal_bytes: Vec<u8>,
+    grant_bytes: Vec<u8>,
+    state_plaintext_hash: [u8; 32],
+    counter_guard_hash: [u8; 32],
+    grant_hash: [u8; 32],
+    device_hpke_hash: [u8; 32],
+    device_sign_hash: [u8; 32],
+    storage_kek_hash: [u8; 32],
+    journal_signature: SignatureBytes,
+}
+
+impl fmt::Debug for PairedCleanupJournalV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairedCleanupJournalV1([REDACTED])")
+    }
+}
+
+impl PairedCleanupJournalV1 {
+    fn encode_unsigned(&self) -> Result<Vec<u8>, PairedPromotionError> {
+        let mut encoded = Vec::with_capacity(
+            8 + 16
+                + 32
+                + 16
+                + 16
+                + 16
+                + 8
+                + 16
+                + 8
+                + 32
+                + PAIRED_COMMIT_MARKER_BYTES
+                + 4
+                + self.terminal_bytes.len()
+                + 4
+                + self.grant_bytes.len()
+                + 6 * 32,
+        );
+        encoded.extend_from_slice(CLEANUP_JOURNAL_MAGIC);
+        encoded.extend_from_slice(&CLEANUP_JOURNAL_VERSION.to_be_bytes());
+        encoded.extend_from_slice(&[0, 0]);
+        encoded.extend_from_slice(self.installation_id.as_bytes());
+        encoded.extend_from_slice(&self.root_fingerprint);
+        encoded.extend_from_slice(self.relay_server_id.as_bytes());
+        encoded.extend_from_slice(self.machine_route.as_bytes());
+        encoded.extend_from_slice(self.device_route.as_bytes());
+        encoded.extend_from_slice(&self.grant_serial.value().to_be_bytes());
+        encoded.extend_from_slice(self.root_key_id.as_bytes());
+        encoded.extend_from_slice(&self.trust_epoch.value().to_be_bytes());
+        encoded.extend_from_slice(&self.machine_root_pubkey);
+        encoded.extend_from_slice(&self.active_marker.encode());
+        put_state_field(
+            &mut encoded,
+            &self.terminal_bytes,
+            MAX_CLEANUP_TERMINAL_BYTES,
+        )?;
+        put_state_field(&mut encoded, &self.grant_bytes, MAX_CLEANUP_GRANT_BYTES)?;
+        for hash in [
+            self.state_plaintext_hash,
+            self.counter_guard_hash,
+            self.grant_hash,
+            self.device_hpke_hash,
+            self.device_sign_hash,
+            self.storage_kek_hash,
+        ] {
+            encoded.extend_from_slice(&hash);
+        }
+        Ok(encoded)
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, PairedPromotionError> {
+        let mut encoded = self.encode_unsigned()?;
+        encoded.extend_from_slice(&self.journal_signature.0);
+        Ok(encoded)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
+        const FIXED_AFTER_HEADER: usize = 16
+            + 32
+            + 16
+            + 16
+            + 16
+            + 8
+            + 16
+            + 8
+            + 32
+            + PAIRED_COMMIT_MARKER_BYTES
+            + 4
+            + 4
+            + 6 * 32
+            + 64;
+        if bytes.len() < 8 + FIXED_AFTER_HEADER
+            || &bytes[..4] != CLEANUP_JOURNAL_MAGIC
+            || u16::from_be_bytes([bytes[4], bytes[5]]) != CLEANUP_JOURNAL_VERSION
+            || bytes[6..8] != [0, 0]
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let mut decoder = StateDecoder::new(&bytes[8..]);
+        let installation_id = Uuid::from_bytes(decoder.fixed()?);
+        let root_fingerprint = decoder.fixed()?;
+        let relay_server_id = RelayServerId::from_bytes(decoder.fixed()?);
+        let machine_route = MachineRouteId::from_bytes(decoder.fixed()?);
+        let device_route = DeviceRouteId::from_bytes(decoder.fixed()?);
+        let grant_serial = GrantSerial::new(decoder.u64()?);
+        let root_key_id = RootKeyId::from_bytes(decoder.fixed()?);
+        let trust_epoch = TrustEpoch::new(decoder.u64()?);
+        let machine_root_pubkey = decoder.fixed()?;
+        let active_marker_bytes: [u8; PAIRED_COMMIT_MARKER_BYTES] = decoder.fixed()?;
+        let active_marker = PairedCommitMarkerV1::decode(&active_marker_bytes)?;
+        let terminal_bytes = decoder.field(MAX_CLEANUP_TERMINAL_BYTES)?.to_vec();
+        let grant_bytes = decoder.field(MAX_CLEANUP_GRANT_BYTES)?.to_vec();
+        let value = Self {
+            installation_id,
+            root_fingerprint,
+            relay_server_id,
+            machine_route,
+            device_route,
+            grant_serial,
+            root_key_id,
+            trust_epoch,
+            machine_root_pubkey,
+            active_marker,
+            terminal_bytes,
+            grant_bytes,
+            state_plaintext_hash: decoder.fixed()?,
+            counter_guard_hash: decoder.fixed()?,
+            grant_hash: decoder.fixed()?,
+            device_hpke_hash: decoder.fixed()?,
+            device_sign_hash: decoder.fixed()?,
+            storage_kek_hash: decoder.fixed()?,
+            journal_signature: SignatureBytes(decoder.fixed()?),
+        };
+        decoder.finish()?;
+        if value.encode()?.as_slice() != bytes {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(value)
+    }
+
+    fn validate(&self, identity: PairedMachineIdentity) -> Result<(), PairedPromotionError> {
+        self.active_marker
+            .validate_account(self.installation_id, identity)?;
+        if self.installation_id.is_nil()
+            || self.root_fingerprint != *identity.machine_root_fingerprint.as_bytes()
+            || self.root_fingerprint != self.active_marker.root_fingerprint
+            || self.relay_server_id != self.active_marker.relay_server_id
+            || self.machine_route != identity.machine_route
+            || self.machine_route != self.active_marker.machine_route
+            || self.device_route != self.active_marker.device_route
+            || self.grant_serial != self.active_marker.grant_serial
+            || self.trust_epoch != self.active_marker.trust_epoch
+            || all_zero(self.root_key_id.as_bytes())
+            || sha256(&self.machine_root_pubkey) != self.root_fingerprint
+            || self.terminal_bytes.is_empty()
+            || self.terminal_bytes.len() > MAX_CLEANUP_TERMINAL_BYTES
+            || self.grant_bytes.is_empty()
+            || self.grant_bytes.len() > MAX_CLEANUP_GRANT_BYTES
+            || [
+                self.state_plaintext_hash,
+                self.counter_guard_hash,
+                self.grant_hash,
+                self.device_hpke_hash,
+                self.device_sign_hash,
+                self.storage_kek_hash,
+            ]
+            .iter()
+            .any(|hash| all_zero(hash))
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        let root = VerifyingKey::from_bytes(&self.machine_root_pubkey)
+            .map_err(PairedPromotionError::Crypto)?;
+        let grant = RelayGrant::from_canonical_bytes(&self.grant_bytes)
+            .map_err(PairedPromotionError::AuthCanonical)?;
+        if grant.machine_route != self.machine_route
+            || grant.device_route != self.device_route
+            || grant.grant_serial != self.grant_serial
+            || grant.root_key_id != self.root_key_id
+            || grant.trust_epoch != self.trust_epoch
+            || grant.device_sign_pubkey.0 != self.active_marker.device_sign_pubkey
+            || grant.canonical_sha256() != self.grant_hash
+            || self.grant_hash != self.active_marker.grant_hash
+            || self.storage_kek_hash != self.active_marker.kek_record_hash
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        verify_tbs(
+            &root,
+            &grant.to_be_signed_v1(self.relay_server_id, self.root_fingerprint),
+            &SignatureBytes::from(grant.signature),
+        )
+        .map_err(PairedPromotionError::Crypto)?;
+        let device_sign = VerifyingKey::from_bytes(&grant.device_sign_pubkey.0)
+            .map_err(PairedPromotionError::Crypto)?;
+        verify_revocation_cleanup_journal_digest(
+            &device_sign,
+            sha256(&self.encode_unsigned()?),
+            &self.journal_signature,
+        )
+        .map_err(PairedPromotionError::Crypto)?;
+
+        let terminal =
+            decode(&self.terminal_bytes).map_err(|_| PairedPromotionError::InvalidState)?;
+        validate_exact_revocation_terminal(
+            &terminal,
+            &self.terminal_bytes,
+            RevocationTerminalBinding {
+                root_fingerprint: self.root_fingerprint,
+                relay_server_id: self.relay_server_id,
+                machine_route: self.machine_route,
+                device_route: self.device_route,
+                grant_serial: self.grant_serial,
+                root_key_id: self.root_key_id,
+                trust_epoch: self.trust_epoch,
+                machine_root_pubkey: self.machine_root_pubkey,
+            },
+        )
     }
 }
 

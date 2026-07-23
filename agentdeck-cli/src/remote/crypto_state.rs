@@ -382,6 +382,11 @@ impl FileCryptoStateStore {
         &self.state_path
     }
 
+    #[must_use]
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// 仅供 automatic harness 检查 prepared sidecar 的文件安全属性与 crash 生命周期。
     #[doc(hidden)]
     #[must_use]
@@ -795,6 +800,108 @@ impl FileCryptoStateStore {
         Ok(())
     }
 
+    /// 只读审计 revocation cleanup 即将删除的 exact active state。
+    ///
+    /// prepared sidecar 必须缺失；active state 缺失返回 `false`。既有 state 会完成
+    /// no-follow/private inode、backup exclusion、AEAD 与 plaintext SHA-256 全链认证，
+    /// 任一失败均零写拒绝。
+    pub(crate) fn audit_revocation_cleanup_state(
+        &self,
+        expected_plaintext_sha256: [u8; 32],
+    ) -> Result<bool, CryptoStateError> {
+        self.audit_revocation_cleanup_state_entry(expected_plaintext_sha256)
+            .map(|entry| entry.is_some())
+    }
+
+    /// 删除已经全链认证、plaintext hash 精确匹配的 revocation cleanup state。
+    ///
+    /// 缺失幂等成功。删除前保留 parent dirfd 与已认证文件 fd，并做最终 inode 对照；
+    /// `unlinkat` 后 fsync parent，最后在不依赖 KEK 的 absent 视图中读回 state 与
+    /// prepared sidecar 均缺失。
+    pub(crate) fn delete_revocation_cleanup_state(
+        &self,
+        expected_plaintext_sha256: [u8; 32],
+    ) -> Result<(), CryptoStateError> {
+        let Some(audited) = self.audit_revocation_cleanup_state_entry(expected_plaintext_sha256)?
+        else {
+            return Ok(());
+        };
+
+        validate_state_entry(
+            &audited.directories.devices,
+            &audited.component,
+            &audited.file,
+            audited.uid,
+        )?;
+        let name = c_string(OsStr::new(&audited.component))?;
+        // SAFETY: the retained private dirfd still names the parent, and the immediately preceding
+        // fstat/fstatat comparison proved this basename is the exact authenticated inode.
+        if unsafe { libc::unlinkat(audited.directories.devices.as_raw_fd(), name.as_ptr(), 0) } != 0
+        {
+            return Err(io_error(
+                "remove revocation cleanup state",
+                io::Error::last_os_error(),
+            ));
+        }
+        audited
+            .directories
+            .devices
+            .sync_all()
+            .map_err(|source| io_error("sync revocation cleanup state removal", source))?;
+
+        if revocation_cleanup_entries_absent_in(&self.root, self.identity)? {
+            Ok(())
+        } else {
+            Err(CryptoStateError::PersistenceReadbackFailed)
+        }
+    }
+
+    fn audit_revocation_cleanup_state_entry(
+        &self,
+        expected_plaintext_sha256: [u8; 32],
+    ) -> Result<Option<AuditedRevocationCleanupState>, CryptoStateError> {
+        let uid = current_euid();
+        let Some(directories) = self.open_existing_directories(uid)? else {
+            return Ok(None);
+        };
+        let prepared_component = self.identity.prepared_stage_file_component();
+        let prepared = open_state_file(
+            &directories.devices,
+            &prepared_component,
+            &self.prepared_stage_path,
+            uid,
+        )?;
+        let state_component = self.identity.state_file_component();
+        let state = open_state_file(
+            &directories.devices,
+            &state_component,
+            &self.state_path,
+            uid,
+        )?;
+        if prepared.is_some() {
+            return Err(CryptoStateError::ImmutableConflict);
+        }
+        let Some(mut file) = state else {
+            return Ok(None);
+        };
+        if !read_backup_excluded(&file, &self.state_path)? {
+            return Err(CryptoStateError::BackupExclusion);
+        }
+        validate_state_entry(&directories.devices, &state_component, &file, uid)?;
+        let sealed = read_sealed_file(&mut file)?;
+        let plaintext = Zeroizing::new(open_snapshot(&self.identity, &self.kek, &sealed)?);
+        if sha256_bytes(plaintext.as_slice()) != expected_plaintext_sha256 {
+            return Err(CryptoStateError::CompareAndSwapConflict);
+        }
+        validate_state_entry(&directories.devices, &state_component, &file, uid)?;
+        Ok(Some(AuditedRevocationCleanupState {
+            directories,
+            file,
+            component: state_component,
+            uid,
+        }))
+    }
+
     fn observe_replace_stage(&self, stage: CryptoStateReplaceStage) {
         if let Some(observer) = &self.replace_observer {
             observer.after_stage(stage);
@@ -819,25 +926,7 @@ impl FileCryptoStateStore {
         &self,
         uid: libc::uid_t,
     ) -> Result<Option<StateDirectories>, CryptoStateError> {
-        let Some(root) = open_existing_root_without_symlinks(&self.root, uid)? else {
-            return Ok(None);
-        };
-        let installation_component = self.identity.installation_component();
-        let Some(installation) =
-            open_existing_private_directory_at(&root, OsStr::new(&installation_component), uid)?
-        else {
-            return Ok(None);
-        };
-        let Some(devices) =
-            open_existing_private_directory_at(&installation, OsStr::new(DEVICES_DIRECTORY), uid)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(StateDirectories {
-            _root: root,
-            _installation: installation,
-            devices,
-        }))
+        open_existing_state_directories(&self.root, self.identity, uid)
     }
 
     fn open_or_create_directories(
@@ -862,6 +951,68 @@ struct StateDirectories {
     _root: File,
     _installation: File,
     devices: File,
+}
+
+struct AuditedRevocationCleanupState {
+    directories: StateDirectories,
+    file: File,
+    component: String,
+    uid: libc::uid_t,
+}
+
+fn open_existing_state_directories(
+    root_path: &Path,
+    identity: CryptoStateIdentity,
+    uid: libc::uid_t,
+) -> Result<Option<StateDirectories>, CryptoStateError> {
+    let Some(root) = open_existing_root_without_symlinks(root_path, uid)? else {
+        return Ok(None);
+    };
+    let installation_component = identity.installation_component();
+    let Some(installation) =
+        open_existing_private_directory_at(&root, OsStr::new(&installation_component), uid)?
+    else {
+        return Ok(None);
+    };
+    let Some(devices) =
+        open_existing_private_directory_at(&installation, OsStr::new(DEVICES_DIRECTORY), uid)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(StateDirectories {
+        _root: root,
+        _installation: installation,
+        devices,
+    }))
+}
+
+/// 在 StorageKEK 已删除的 cleanup 尾段，只读确认 active state 与 prepared sidecar
+/// 都安全缺失。安全的既有项返回 `false`；symlink、错误 owner/mode/hardlink 等异常项
+/// 返回 typed error，且本函数从不创建、修复或删除任何目录/文件。
+pub(crate) fn revocation_cleanup_entries_absent_in(
+    root: &Path,
+    identity: CryptoStateIdentity,
+) -> Result<bool, CryptoStateError> {
+    absolute_normal_components(root)?;
+    let uid = current_euid();
+    let Some(directories) = open_existing_state_directories(root, identity, uid)? else {
+        return Ok(true);
+    };
+    let devices_path = root
+        .join(identity.installation_component())
+        .join(DEVICES_DIRECTORY);
+    let state_component = identity.state_file_component();
+    let state_path = devices_path.join(&state_component);
+    let state = open_state_file(&directories.devices, &state_component, &state_path, uid)?;
+    let prepared_component = identity.prepared_stage_file_component();
+    let prepared_path = devices_path.join(&prepared_component);
+    let prepared = open_state_file(
+        &directories.devices,
+        &prepared_component,
+        &prepared_path,
+        uid,
+    )?;
+    Ok(state.is_none() && prepared.is_none())
 }
 
 fn seal_snapshot(
@@ -1655,7 +1806,7 @@ fn mark_backup_excluded(_file: &File, path: &Path) -> Result<(), CryptoStateErro
     use core_foundation_sys::base::CFTypeRef;
     use core_foundation_sys::error::CFErrorRef;
     use core_foundation_sys::number::kCFBooleanTrue;
-    use core_foundation_sys::url::{kCFURLIsExcludedFromBackupKey, CFURLSetResourcePropertyForKey};
+    use core_foundation_sys::url::{CFURLSetResourcePropertyForKey, kCFURLIsExcludedFromBackupKey};
 
     let url = create_cf_file_url(path)?;
     let mut error: CFErrorRef = std::ptr::null_mut();
@@ -1807,4 +1958,157 @@ fn mark_backup_excluded(_file: &File, _path: &Path) -> Result<(), CryptoStateErr
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn read_backup_excluded(_file: &File, _path: &Path) -> Result<bool, CryptoStateError> {
     Err(CryptoStateError::NoReplaceUnsupported)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn cleanup_identity() -> CryptoStateIdentity {
+        CryptoStateIdentity::new(
+            Uuid::from_bytes([0x11; 16]),
+            MachineRootFingerprint::from_bytes([0x22; 32]),
+            MachineRouteId::from_bytes([0x33; 16]),
+        )
+    }
+
+    fn cleanup_store(root: &Path, identity: CryptoStateIdentity) -> FileCryptoStateStore {
+        FileCryptoStateStore::new_in(root, identity, DeviceStorageKek::new([0x44; 32]))
+            .expect("create cleanup crypto-state store")
+    }
+
+    #[test]
+    fn revocation_cleanup_audits_exact_plaintext_and_deletes_idempotently() {
+        let temp = tempfile::tempdir().expect("create cleanup tempdir");
+        let root = fs::canonicalize(temp.path())
+            .expect("canonicalize cleanup tempdir")
+            .join("remote-state");
+        let identity = cleanup_identity();
+        let store = cleanup_store(&root, identity);
+        let snapshot = CryptoStateSnapshot::new(b"authenticated cleanup state".to_vec());
+        let expected_hash = sha256_bytes(snapshot.expose_secret());
+
+        assert_eq!(store.root(), root);
+        assert!(revocation_cleanup_entries_absent_in(&root, identity).expect("audit absence"));
+        assert!(
+            !store
+                .audit_revocation_cleanup_state(expected_hash)
+                .expect("missing state is not cleanup work")
+        );
+        store
+            .commit_initial(&snapshot)
+            .expect("commit cleanup fixture state");
+        assert!(
+            !revocation_cleanup_entries_absent_in(&root, identity)
+                .expect("detect safe state presence")
+        );
+        assert!(
+            store
+                .audit_revocation_cleanup_state(expected_hash)
+                .expect("authenticate exact cleanup state")
+        );
+
+        store
+            .delete_revocation_cleanup_state(expected_hash)
+            .expect("delete authenticated cleanup state");
+        assert!(
+            revocation_cleanup_entries_absent_in(&root, identity).expect("read back exact absence")
+        );
+        assert!(
+            !store
+                .audit_revocation_cleanup_state(expected_hash)
+                .expect("deleted state remains absent")
+        );
+        store
+            .delete_revocation_cleanup_state(expected_hash)
+            .expect("missing cleanup state is idempotent");
+    }
+
+    #[test]
+    fn revocation_cleanup_rejects_hash_conflict_and_prepared_sidecar_without_writes() {
+        let temp = tempfile::tempdir().expect("create cleanup tempdir");
+        let root = fs::canonicalize(temp.path())
+            .expect("canonicalize cleanup tempdir")
+            .join("remote-state");
+        let identity = cleanup_identity();
+        let store = cleanup_store(&root, identity);
+        let active = CryptoStateSnapshot::new(b"active cleanup state".to_vec());
+        let expected_hash = sha256_bytes(active.expose_secret());
+        store
+            .commit_initial(&active)
+            .expect("commit cleanup fixture state");
+        let before = fs::read(store.state_path()).expect("read state before rejected cleanup");
+
+        assert!(matches!(
+            store.audit_revocation_cleanup_state([0x99; 32]),
+            Err(CryptoStateError::CompareAndSwapConflict)
+        ));
+        assert!(matches!(
+            store.delete_revocation_cleanup_state([0x99; 32]),
+            Err(CryptoStateError::CompareAndSwapConflict)
+        ));
+        assert_eq!(
+            fs::read(store.state_path()).expect("read state after hash conflict"),
+            before
+        );
+
+        let next = CryptoStateSnapshot::new(b"prepared cleanup successor".to_vec());
+        store
+            .prepare_stage(&active, [0x55; 32], [0x66; 16], &next)
+            .expect("publish prepared cleanup fixture");
+        assert!(matches!(
+            store.audit_revocation_cleanup_state(expected_hash),
+            Err(CryptoStateError::ImmutableConflict)
+        ));
+        assert!(matches!(
+            store.delete_revocation_cleanup_state(expected_hash),
+            Err(CryptoStateError::ImmutableConflict)
+        ));
+        assert_eq!(
+            fs::read(store.state_path()).expect("read state after prepared conflict"),
+            before
+        );
+        assert!(store.prepared_stage_path().exists());
+        assert!(
+            !revocation_cleanup_entries_absent_in(&root, identity)
+                .expect("safe prepared entry is present")
+        );
+    }
+
+    #[test]
+    fn revocation_cleanup_absence_check_rejects_unsafe_entries_without_repair() {
+        let temp = tempfile::tempdir().expect("create cleanup tempdir");
+        let root = fs::canonicalize(temp.path())
+            .expect("canonicalize cleanup tempdir")
+            .join("remote-state");
+        let identity = cleanup_identity();
+        let store = cleanup_store(&root, identity);
+        store
+            .commit_initial(&CryptoStateSnapshot::new(b"unsafe fixture".to_vec()))
+            .expect("commit cleanup fixture state");
+        let path = store.state_path();
+        let before = fs::read(path).expect("read unsafe fixture before audit");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+            .expect("make cleanup fixture unsafe");
+
+        assert!(matches!(
+            revocation_cleanup_entries_absent_in(&root, identity),
+            Err(CryptoStateError::UnsafeFile { .. })
+        ));
+        assert_eq!(
+            fs::symlink_metadata(path)
+                .expect("read unsafe fixture mode")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644
+        );
+        assert_eq!(
+            fs::read(path).expect("read unsafe fixture after audit"),
+            before
+        );
+    }
 }

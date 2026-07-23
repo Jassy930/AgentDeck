@@ -206,6 +206,47 @@ pub fn verify_tbs(
         .map_err(|_| CryptoError::BadSignature)
 }
 
+const REVOCATION_CLEANUP_JOURNAL_SIGNATURE_DOMAIN: &[u8] =
+    b"AgentDeck/DeviceRevocationCleanupJournalDigestV1\0";
+
+fn revocation_cleanup_journal_signature_message(body_sha256: [u8; 32]) -> Vec<u8> {
+    let mut message =
+        Vec::with_capacity(REVOCATION_CLEANUP_JOURNAL_SIGNATURE_DOMAIN.len() + body_sha256.len());
+    message.extend_from_slice(REVOCATION_CLEANUP_JOURNAL_SIGNATURE_DOMAIN);
+    message.extend_from_slice(&body_sha256);
+    message
+}
+
+/// 使用 DeviceSign 对本地 revocation cleanup journal 的 canonical body digest 签名。
+///
+/// 固定 domain 与固定 32-byte digest 让该签名不能被当作 Relay frame、authentication
+/// transcript 或其他任意消息的签名 oracle。
+pub fn sign_revocation_cleanup_journal_digest(
+    key: &SigningKey,
+    body_sha256: [u8; 32],
+) -> SignatureBytes {
+    SignatureBytes(
+        key.0
+            .sign(&revocation_cleanup_journal_signature_message(body_sha256))
+            .to_bytes(),
+    )
+}
+
+/// 验证 DeviceSign 对本地 revocation cleanup journal canonical body digest 的签名。
+pub fn verify_revocation_cleanup_journal_digest(
+    key: &VerifyingKey,
+    body_sha256: [u8; 32],
+    signature: &SignatureBytes,
+) -> Result<(), CryptoError> {
+    let signature = Signature::from_bytes(&signature.0);
+    key.0
+        .verify_strict(
+            &revocation_cleanup_journal_signature_message(body_sha256),
+            &signature,
+        )
+        .map_err(|_| CryptoError::BadSignature)
+}
+
 /// 对 Relay v2 单次 challenge 的 typed canonical transcript 签名。
 ///
 /// 本接口故意只接受 [`AuthenticationTranscriptV1`]，避免把 auth call site 退化成可对任意
@@ -401,6 +442,22 @@ mod tests {
         changed.0[0] ^= 1;
         assert_eq!(
             verify_authentication_transcript(&signing.verifying_key(), &transcript, &changed),
+            Err(CryptoError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn revocation_cleanup_journal_signature_binds_the_exact_body_digest() {
+        let signing = SigningKey::from_seed(&[0x52; 32]);
+        let digest = [0x61; 32];
+        let signature = sign_revocation_cleanup_journal_digest(&signing, digest);
+        verify_revocation_cleanup_journal_digest(&signing.verifying_key(), digest, &signature)
+            .expect("cleanup journal signature verifies");
+
+        let mut changed = digest;
+        changed[17] ^= 1;
+        assert_eq!(
+            verify_revocation_cleanup_journal_digest(&signing.verifying_key(), changed, &signature,),
             Err(CryptoError::BadSignature)
         );
     }

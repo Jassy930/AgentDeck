@@ -59,6 +59,7 @@ pub use sealed_blob::{sign_sealed, verify_sealed};
 pub use signature::{
     SignatureBytes, SigningKey, ValidatedRelayReceiptSignerIdentityV1,
     ValidatedRelayReceiptVerifyKey, VerifyingKey, sign_authentication_transcript,
-    sign_relay_admin_purge_receipt, sign_tbs, verify_authentication_transcript,
-    verify_relay_admin_purge_receipt, verify_tbs,
+    sign_relay_admin_purge_receipt, sign_revocation_cleanup_journal_digest, sign_tbs,
+    verify_authentication_transcript, verify_relay_admin_purge_receipt,
+    verify_revocation_cleanup_journal_digest, verify_tbs,
 };
