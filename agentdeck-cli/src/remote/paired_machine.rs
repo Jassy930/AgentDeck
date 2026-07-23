@@ -9,7 +9,9 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use agentdeck_crypto::counter::COUNTER_BLOCK_SIZE;
 use agentdeck_crypto::rand_core::CryptoRng;
 use agentdeck_crypto::{
     CryptoError, HpkePrivateKey, HpkePublicKey, SecretAeadKey, SignatureBytes, SigningKey,
@@ -47,9 +49,12 @@ use super::pending::{PendingInvitePublicProjection, VerifiedPendingPairResponse}
 
 const STATE_MAGIC: &[u8; 4] = b"ADPS";
 const STATE_VERSION: u16 = 1;
+const MUTABLE_STATE_VERSION: u16 = 2;
 const STATE_HEADER_LEN: usize = 12;
 const MAX_STATE_FIELD_LEN: usize = 8 * 1024 * 1024;
 const MAX_STATE_STRING_LEN: usize = 8 * 1024;
+const MAX_STATE_COLLECTION_ITEMS: usize = 4_096;
+const MAX_MUTABLE_AUDIT_ATTEMPTS: usize = 3;
 
 const MARKER_MAGIC: &[u8; 4] = b"ADPM";
 const MARKER_VERSION: u16 = 1;
@@ -57,7 +62,95 @@ const KEK_MAGIC: &[u8; 4] = b"ADKK";
 const KEK_VERSION: u16 = 1;
 const COUNTER_GUARD_MAGIC: &[u8; 4] = b"ADCG";
 const COUNTER_GUARD_VERSION: u16 = 1;
+const MUTABLE_COUNTER_GUARD_VERSION: u16 = 2;
 const PROMOTION_ID_DOMAIN: &[u8] = b"AgentDeck/PairedPromotionIdV1\0";
+
+/// 仅供 automatic library harness 在 reservation/recovery 的 durable 边界注入进程终止。
+/// production CLI 不构造该 observer，也不存在环境变量或配置入口。
+#[doc(hidden)]
+pub trait PairedMutationObserver: Send + Sync {
+    fn after_stage(&self, stage: PairedMutationStage);
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PairedMutationStage {
+    GuardPendingDurable,
+    StateDurable,
+    RecoveryStateDurable,
+    GuardStableDurable,
+}
+
+/// 已在 CounterGuard 中 durable 预留的 DeviceCommandTx counter 整块。
+#[derive(Eq, PartialEq)]
+pub struct CommandCounterReservation {
+    reservation_id: [u8; 16],
+    start: u64,
+    end_exclusive: u64,
+}
+
+impl fmt::Debug for CommandCounterReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommandCounterReservation")
+            .field("reservation_id", &"[REDACTED]")
+            .field("start", &self.start)
+            .field("end_exclusive", &self.end_exclusive)
+            .finish()
+    }
+}
+
+impl CommandCounterReservation {
+    #[must_use]
+    pub const fn reservation_id(&self) -> [u8; 16] {
+        self.reservation_id
+    }
+
+    #[must_use]
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end_exclusive(&self) -> u64 {
+        self.end_exclusive
+    }
+
+    fn validate(&self) -> Result<(), PairedPromotionError> {
+        if all_zero(&self.reservation_id)
+            || self
+                .start
+                .checked_add(COUNTER_BLOCK_SIZE)
+                .is_none_or(|end| end != self.end_exclusive)
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(())
+    }
+}
+
+/// 纯内存地准备下一整块；overflow 必须早于 entropy、state 构造与任一 durable mutation。
+fn prepare_command_counter_reservation<R: CryptoRng>(
+    previous_high_water: u64,
+    rng: &mut R,
+) -> Result<CommandCounterReservation, PairedPromotionError> {
+    let end_exclusive = previous_high_water
+        .checked_add(COUNTER_BLOCK_SIZE)
+        .ok_or(PairedPromotionError::CounterEpochExhausted)?;
+    let mut reservation_id = [0_u8; 16];
+    rng.try_fill_bytes(&mut reservation_id)
+        .map_err(|_| PairedPromotionError::EntropyUnavailable)?;
+    if all_zero(&reservation_id) {
+        return Err(PairedPromotionError::EntropyUnavailable);
+    }
+    let reservation = CommandCounterReservation {
+        reservation_id,
+        start: previous_high_water,
+        end_exclusive,
+    };
+    reservation.validate()?;
+    Ok(reservation)
+}
 
 #[derive(Debug, Error)]
 pub enum PairedPromotionError {
@@ -75,6 +168,8 @@ pub enum PairedPromotionError {
     AuthCanonical(#[source] AuthCanonicalError),
     #[error("paired promotion entropy source is unavailable")]
     EntropyUnavailable,
+    #[error("paired command counter reached the current key epoch limit")]
+    CounterEpochExhausted,
     #[error("paired promotion is incomplete or corrupt")]
     Incomplete,
     #[error("paired promotion conflicts with durable state")]
@@ -94,6 +189,7 @@ impl PairedPromotionError {
                 "remote.pairing.paired_invalid"
             }
             Self::EntropyUnavailable => "remote.pairing.entropy_unavailable",
+            Self::CounterEpochExhausted => "remote.counter.epoch_retirement_required",
             Self::Incomplete => "remote.pairing.paired_incomplete",
             Self::Conflict => "remote.pairing.paired_conflict",
         }
@@ -244,14 +340,20 @@ struct AuditedPairedMachine {
     _relay_server_id: RelayServerId,
     _current_spki_pin: [u8; 32],
     _next_spki_pin: [u8; 32],
-    _state_path: PathBuf,
+    state_store: FileCryptoStateStore,
+    state_snapshot: CryptoStateSnapshot,
+    state: PairedCryptoState,
+    counter_account: RemoteKeyAccount,
+    counter_guard_bytes: RemoteSecret,
+    counter_guard: CounterGuardState,
+    device_command_binding: CounterBindingV1,
+    marker: PairedCommitMarkerV1,
     _canonical_receipt_carrier: Vec<u8>,
     _grant: RelayGrant,
     _authorization: DeviceAuthorizationV1,
     _device_signing_key: SigningKey,
     _device_hpke_private_key: HpkePrivateKey,
     _opened_directory_keys: Vec<OpenedPairedDirectoryKey>,
-    _counter_guard: CounterGuardV1,
 }
 
 impl AuditedPairedMachine {
@@ -263,9 +365,16 @@ impl AuditedPairedMachine {
         }
     }
 
-    fn into_opened(self, lease: RemoteDeviceLease) -> OpenedPairedMachine {
+    fn into_opened<'a>(
+        self,
+        store: &'a dyn RemoteKeyStore,
+        mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
+        lease: RemoteDeviceLease,
+    ) -> OpenedPairedMachine<'a> {
         OpenedPairedMachine {
             audited: self,
+            store,
+            mutation_observer,
             _lease: lease,
         }
     }
@@ -274,19 +383,21 @@ impl AuditedPairedMachine {
 /// marker-first 只读审计成功后持有 device lease 与 typed crypto capabilities 的 machine。
 ///
 /// 本类型不实现 `Clone` / serde，`Debug` 永远 redacted，且没有 raw secret getter。
-pub struct OpenedPairedMachine {
+pub struct OpenedPairedMachine<'a> {
     audited: AuditedPairedMachine,
+    store: &'a dyn RemoteKeyStore,
+    mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
     // 必须最后销毁，确保 crypto/counter capabilities 不会晚于跨进程独占 lease。
     _lease: RemoteDeviceLease,
 }
 
-impl fmt::Debug for OpenedPairedMachine {
+impl fmt::Debug for OpenedPairedMachine<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("OpenedPairedMachine([REDACTED])")
     }
 }
 
-impl OpenedPairedMachine {
+impl OpenedPairedMachine<'_> {
     #[must_use]
     pub const fn identity(&self) -> PairedMachineIdentity {
         self.audited.identity
@@ -336,6 +447,212 @@ impl OpenedPairedMachine {
             .iter()
             .any(|key| key._key_id.purpose == purpose)
     }
+
+    /// 先提升 Keychain guard，再替换 sealed state，最后 finalize guard。
+    /// 重启永不复用先前进程可能消费过的 reservation remainder。
+    pub fn reserve_command_counter_block<R: CryptoRng>(
+        &mut self,
+        rng: &mut R,
+    ) -> Result<CommandCounterReservation, PairedPromotionError> {
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+
+        let (previous_high_water, current_state_hash, binding, initial_guard_commitment) =
+            match self.audited.counter_guard {
+                CounterGuardState::V1(guard) => (
+                    guard.reserved_high_water,
+                    sha256(self.audited.state_snapshot.expose_secret()),
+                    guard.binding,
+                    self.audited.marker.counter_guard_hash,
+                ),
+                CounterGuardState::V2(CounterGuardV2 {
+                    initial_guard_commitment,
+                    directory_revision: _,
+                    binding,
+                    phase:
+                        CounterGuardPhaseV2::Stable {
+                            reserved_high_water,
+                            current_state_hash,
+                        },
+                }) => (
+                    reserved_high_water,
+                    current_state_hash,
+                    binding,
+                    initial_guard_commitment,
+                ),
+                CounterGuardState::V2(CounterGuardV2 {
+                    phase: CounterGuardPhaseV2::Pending { .. },
+                    ..
+                }) => return Err(PairedPromotionError::InvalidState),
+            };
+        if current_state_hash != sha256(self.audited.state_snapshot.expose_secret()) {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let reservation = prepare_command_counter_reservation(previous_high_water, rng)?;
+        let end_exclusive = reservation.end_exclusive;
+        let reservation_id = reservation.reservation_id;
+
+        let next_state = self.audited.state.with_counter_reservation(
+            self.audited.marker.state_plaintext_hash,
+            self.audited.marker.counter_guard_hash,
+            &reservation,
+        )?;
+        let next_state_bytes = next_state.encode()?;
+        let next_state_hash = sha256(&next_state_bytes);
+        let pending = CounterGuardV2::pending(
+            initial_guard_commitment,
+            self.audited.directory_revision,
+            binding,
+            previous_high_water,
+            end_exclusive,
+            reservation_id,
+            current_state_hash,
+            next_state_hash,
+        )?;
+        self.replace_counter_guard(CounterGuardState::V2(pending))?;
+        self.observe_mutation(PairedMutationStage::GuardPendingDurable);
+
+        let next_snapshot = CryptoStateSnapshot::new(next_state_bytes);
+        self.audited
+            .state_store
+            .compare_and_replace(&self.audited.state_snapshot, &next_snapshot)
+            .map_err(PairedPromotionError::CryptoState)?;
+        // observer 位于 durable store 返回与内存 cache 更新之间，覆盖 committed-but-stale handle。
+        self.observe_mutation(PairedMutationStage::StateDurable);
+        self.audited.state_snapshot = next_snapshot;
+        self.audited.state = next_state;
+
+        let stable = CounterGuardV2::stable(
+            initial_guard_commitment,
+            self.audited.directory_revision,
+            binding,
+            end_exclusive,
+            next_state_hash,
+        )?;
+        self.replace_counter_guard(CounterGuardState::V2(stable))?;
+        self.observe_mutation(PairedMutationStage::GuardStableDurable);
+        Ok(reservation)
+    }
+
+    fn recover_pending_guard(&mut self) -> Result<(), PairedPromotionError> {
+        let CounterGuardState::V2(guard) = self.audited.counter_guard else {
+            return Ok(());
+        };
+        let CounterGuardPhaseV2::Pending {
+            previous_high_water,
+            next_high_water,
+            reservation_id,
+            previous_state_hash,
+            next_state_hash,
+        } = guard.phase
+        else {
+            return Ok(());
+        };
+        let mut current_hash = sha256(self.audited.state_snapshot.expose_secret());
+        let expected = CommandCounterReservation {
+            reservation_id,
+            start: previous_high_water,
+            end_exclusive: next_high_water,
+        };
+        expected.validate()?;
+        if current_hash == next_state_hash {
+            if self.audited.state.counter_reservation() != Some(&expected) {
+                return Err(PairedPromotionError::Conflict);
+            }
+        } else if current_hash == previous_state_hash {
+            // guard-first 已经让整块不可复用。用 pending 中冻结的同一 reservation 重建
+            // canonical next state，写成 sealed counter fence，但绝不把该块返回给调用方。
+            let (skipped_state, skipped_snapshot) = rebuild_frozen_counter_state(
+                &self.audited.marker,
+                &self.audited.state,
+                expected,
+                next_state_hash,
+            )?;
+            self.audited
+                .state_store
+                .compare_and_replace(&self.audited.state_snapshot, &skipped_snapshot)
+                .map_err(PairedPromotionError::CryptoState)?;
+            // recovery 自己也是 state CAS → guard finalize 的事务；在 cache 更新前保留
+            // 独立 crash seam，证明 committed-but-stale reopen 只走 pending+next。
+            self.observe_mutation(PairedMutationStage::RecoveryStateDurable);
+            self.audited.state_snapshot = skipped_snapshot;
+            self.audited.state = skipped_state;
+            current_hash = next_state_hash;
+        } else {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        // 无论 recovery 从 previous 还是 next 进入，重启都不暴露该 reservation；它只作为
+        // exact sealed fence 与 Stable HWM 绑定，下一次调用从下一整块继续。
+        let stable = CounterGuardV2::stable(
+            guard.initial_guard_commitment,
+            guard.directory_revision,
+            guard.binding,
+            next_high_water,
+            current_hash,
+        )?;
+        self.replace_counter_guard(CounterGuardState::V2(stable))?;
+        Ok(())
+    }
+
+    /// mutation error 之后不得信任内存 expected；每次 reserve 都从两个 durable backend
+    /// 重新读回，并只接受 marker initial commitments 下的 coherent previous/next/stable。
+    fn refresh_mutable_state(&mut self) -> Result<(), PairedPromotionError> {
+        let counter_guard_bytes = self
+            .store
+            .load(&self.audited.counter_account)
+            .map_err(PairedPromotionError::Persistence)?
+            .ok_or(PairedPromotionError::Incomplete)?;
+        let counter_guard = CounterGuardState::decode(counter_guard_bytes.expose_secret())?;
+        let state_snapshot = self
+            .audited
+            .state_store
+            .load()
+            .map_err(PairedPromotionError::CryptoState)?
+            .ok_or(PairedPromotionError::Incomplete)?;
+        let state = PairedCryptoState::decode(state_snapshot.expose_secret())?;
+        self.audited.marker.validate_state(
+            self.audited.identity,
+            &state,
+            state_snapshot.expose_secret(),
+        )?;
+        validate_counter_guard_state(
+            &self.audited.marker,
+            &counter_guard,
+            counter_guard_bytes.expose_secret(),
+            &state,
+            state_snapshot.expose_secret(),
+            self.audited.device_command_binding,
+        )?;
+        self.audited.counter_guard_bytes = counter_guard_bytes;
+        self.audited.counter_guard = counter_guard;
+        self.audited.state_snapshot = state_snapshot;
+        self.audited.state = state;
+        Ok(())
+    }
+
+    fn replace_counter_guard(
+        &mut self,
+        replacement: CounterGuardState,
+    ) -> Result<(), PairedPromotionError> {
+        let replacement_bytes = replacement.encode();
+        self.store
+            .compare_and_replace_exact(
+                &self.audited.counter_account,
+                &self.audited.counter_guard_bytes,
+                &RemoteSecret::new(replacement_bytes.clone()),
+            )
+            .map_err(PairedPromotionError::Persistence)?;
+        self.audited.counter_guard_bytes = RemoteSecret::new(replacement_bytes);
+        self.audited.counter_guard = replacement;
+        Ok(())
+    }
+
+    fn observe_mutation(&self, stage: PairedMutationStage) {
+        if let Some(observer) = &self.mutation_observer {
+            observer.after_stage(stage);
+        }
+    }
 }
 
 /// 当前 installation 的 marker-backed paired machine 只读恢复入口。
@@ -343,6 +660,7 @@ pub struct PairedMachineStore<'a> {
     store: &'a dyn RemoteKeyStore,
     installation_id: Uuid,
     state_root: PathBuf,
+    mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
 }
 
 impl fmt::Debug for PairedMachineStore<'_> {
@@ -357,10 +675,31 @@ impl fmt::Debug for PairedMachineStore<'_> {
 impl<'a> PairedMachineStore<'a> {
     #[must_use]
     pub fn new(store: &'a dyn RemoteKeyStore, installation_id: Uuid, state_root: &Path) -> Self {
+        Self::new_inner(store, installation_id, state_root, None)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_with_mutation_observer(
+        store: &'a dyn RemoteKeyStore,
+        installation_id: Uuid,
+        state_root: &Path,
+        observer: Arc<dyn PairedMutationObserver>,
+    ) -> Self {
+        Self::new_inner(store, installation_id, state_root, Some(observer))
+    }
+
+    fn new_inner(
+        store: &'a dyn RemoteKeyStore,
+        installation_id: Uuid,
+        state_root: &Path,
+        mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
+    ) -> Self {
         Self {
             store,
             installation_id,
             state_root: state_root.to_path_buf(),
+            mutation_observer,
         }
     }
 
@@ -383,7 +722,7 @@ impl<'a> PairedMachineStore<'a> {
     pub fn open_exact(
         &self,
         identity: PairedMachineIdentity,
-    ) -> Result<OpenedPairedMachine, PairedPromotionError> {
+    ) -> Result<OpenedPairedMachine<'a>, PairedPromotionError> {
         let account = RemoteKeyAccount::paired(
             self.installation_id,
             identity.machine_root_fingerprint,
@@ -401,8 +740,10 @@ impl<'a> PairedMachineStore<'a> {
             ),
         )
         .map_err(PairedPromotionError::DeviceLock)?;
-        self.audit_marker(&parsed)
-            .map(|audited| audited.into_opened(lease))
+        let audited = self.audit_marker(&parsed)?;
+        let mut opened = audited.into_opened(self.store, self.mutation_observer.clone(), lease);
+        opened.recover_pending_guard()?;
+        Ok(opened)
     }
 
     fn audit_marker(
@@ -441,8 +782,6 @@ impl<'a> PairedMachineStore<'a> {
         let device_sign_secret = self.load_required(&accounts.device_sign)?;
         let device_hpke_secret = self.load_required(&accounts.device_hpke)?;
         let grant_secret = self.load_required(&accounts.grant)?;
-        let counter_secret = self.load_required(&accounts.counter_guard)?;
-        let counter_guard = CounterGuardV1::decode(counter_secret.expose_secret())?;
 
         let state_store = FileCryptoStateStore::new_in(
             &self.state_root,
@@ -454,50 +793,58 @@ impl<'a> PairedMachineStore<'a> {
             kek_record.device_storage_kek(),
         )
         .map_err(PairedPromotionError::CryptoState)?;
-        let state_snapshot = state_store
-            .load()
-            .map_err(PairedPromotionError::CryptoState)?
-            .ok_or(PairedPromotionError::Incomplete)?;
-        let state = PairedCryptoStateV1::decode(state_snapshot.expose_secret())?;
+        let (counter_secret, state_snapshot) =
+            self.load_coherent_mutable_pair(&accounts.counter_guard, &state_store)?;
+        let counter_guard = CounterGuardState::decode(counter_secret.expose_secret())?;
+        let state = PairedCryptoState::decode(state_snapshot.expose_secret())?;
         marker.validate_state(identity, &state, state_snapshot.expose_secret())?;
+        let bootstrap = state.bootstrap();
 
         let audit = audit_durable_state(
-            &state,
+            bootstrap,
             grant_secret.expose_secret(),
             &device_sign_secret,
             &device_hpke_secret,
         )?;
         if marker.device_sign_pubkey != audit.device_signing_key.verifying_key().to_bytes()
             || marker.device_hpke_pubkey != hpke_public_bytes(&audit.device_hpke_private_key)?
-            || marker.counter_guard_hash != sha256(counter_secret.expose_secret())
-            || counter_guard
-                != CounterGuardV1::from_binding(
-                    state.directory_revision,
-                    audit.device_command_binding,
-                )
         {
             return Err(PairedPromotionError::Conflict);
         }
+        validate_counter_guard_state(
+            &marker,
+            &counter_guard,
+            counter_secret.expose_secret(),
+            &state,
+            state_snapshot.expose_secret(),
+            audit.device_command_binding,
+        )?;
 
         Ok(AuditedPairedMachine {
             identity,
-            machine_display_name: state.machine_display_name,
-            wss_url: state.wss_url,
-            device_route: state.device_route,
-            grant_serial: state.grant_serial,
-            trust_epoch: state.trust_epoch,
-            directory_revision: state.directory_revision,
-            _relay_server_id: state.relay_server_id,
-            _current_spki_pin: state.current_spki_pin,
-            _next_spki_pin: state.next_spki_pin,
-            _state_path: state_store.state_path().to_path_buf(),
-            _canonical_receipt_carrier: state.receipt_carrier,
+            machine_display_name: bootstrap.machine_display_name.clone(),
+            wss_url: bootstrap.wss_url.clone(),
+            device_route: bootstrap.device_route,
+            grant_serial: bootstrap.grant_serial,
+            trust_epoch: bootstrap.trust_epoch,
+            directory_revision: bootstrap.directory_revision,
+            _relay_server_id: bootstrap.relay_server_id,
+            _current_spki_pin: bootstrap.current_spki_pin,
+            _next_spki_pin: bootstrap.next_spki_pin,
+            _canonical_receipt_carrier: bootstrap.receipt_carrier.clone(),
+            state_store,
+            state_snapshot,
+            state,
+            counter_account: accounts.counter_guard,
+            counter_guard_bytes: counter_secret,
+            counter_guard,
+            device_command_binding: audit.device_command_binding,
+            marker,
             _grant: audit.grant,
             _authorization: audit.authorization,
             _device_signing_key: audit.device_signing_key,
             _device_hpke_private_key: audit.device_hpke_private_key,
             _opened_directory_keys: audit.opened_keys,
-            _counter_guard: counter_guard,
         })
     }
 
@@ -509,6 +856,27 @@ impl<'a> PairedMachineStore<'a> {
             .load(account)
             .map_err(PairedPromotionError::Persistence)?
             .ok_or(PairedPromotionError::Incomplete)
+    }
+
+    /// `list()` 不取 device lease；用 bounded guard1→state→guard2 避免把合法 writer
+    /// 的三阶段切换误判为 durable divergence。读取始终只读，耗尽重试后 fail-close。
+    fn load_coherent_mutable_pair(
+        &self,
+        counter_account: &RemoteKeyAccount,
+        state_store: &FileCryptoStateStore,
+    ) -> Result<(RemoteSecret, CryptoStateSnapshot), PairedPromotionError> {
+        for _ in 0..MAX_MUTABLE_AUDIT_ATTEMPTS {
+            let before = self.load_required(counter_account)?;
+            let state = state_store
+                .load()
+                .map_err(PairedPromotionError::CryptoState)?
+                .ok_or(PairedPromotionError::Incomplete)?;
+            let after = self.load_required(counter_account)?;
+            if before.expose_secret() == after.expose_secret() {
+                return Ok((after, state));
+            }
+        }
+        Err(PairedPromotionError::Conflict)
     }
 }
 
@@ -829,10 +1197,13 @@ impl<'a> PairedPromotionCoordinator<'a> {
             .load()
             .map_err(PairedPromotionError::CryptoState)?
             .ok_or(PairedPromotionError::Incomplete)?;
-        let state = PairedCryptoStateV1::decode(state_snapshot.expose_secret())?;
-        if marker.state_plaintext_hash != sha256(state_snapshot.expose_secret()) {
-            return Err(PairedPromotionError::Conflict);
-        }
+        let state = PairedCryptoState::decode(state_snapshot.expose_secret())?;
+        let identity = PairedMachineIdentity::new(
+            MachineRootFingerprint::from_bytes(verified.machine_root_fingerprint()),
+            verified.info().machine_route,
+        );
+        marker.validate_state(identity, &state, state_snapshot.expose_secret())?;
+        let bootstrap = state.bootstrap();
 
         let device_sign = self.load_required(&accounts.device_sign)?;
         let device_hpke = self.load_required(&accounts.device_hpke)?;
@@ -842,32 +1213,37 @@ impl<'a> PairedPromotionCoordinator<'a> {
         let hpke_private = hpke_private_key(&device_hpke)?;
         let audit = audit_state(
             self.installation_id,
-            &state,
+            bootstrap,
             verified,
             invite,
             grant.expose_secret(),
             &device_sign,
             &device_hpke,
         )?;
-        let counter_guard = CounterGuardV1::decode(counter.expose_secret())?;
-        if counter_guard
-            != CounterGuardV1::from_binding(state.directory_revision, audit.device_command_binding)
-            || marker.counter_guard_hash != sha256(counter.expose_secret())
-            || marker.device_sign_pubkey != signing_key.verifying_key().to_bytes()
+        let counter_guard = CounterGuardState::decode(counter.expose_secret())?;
+        validate_counter_guard_state(
+            &marker,
+            &counter_guard,
+            counter.expose_secret(),
+            &state,
+            state_snapshot.expose_secret(),
+            audit.device_command_binding,
+        )?;
+        if marker.device_sign_pubkey != signing_key.verifying_key().to_bytes()
             || marker.device_hpke_pubkey != hpke_public_bytes(&hpke_private)?
-            || marker.receipt_carrier_hash != sha256(&state.receipt_carrier)
+            || marker.receipt_carrier_hash != sha256(&bootstrap.receipt_carrier)
         {
             return Err(PairedPromotionError::Conflict);
         }
 
         Ok(PromotedPairedMachine {
             state_path: state_store.state_path().to_path_buf(),
-            canonical_receipt_carrier: state.receipt_carrier,
-            machine_route: state.machine_route,
-            device_route: state.device_route,
-            request_hash: state.request_hash,
-            grant_hash: state.grant_hash,
-            response_hash: state.response_hash,
+            canonical_receipt_carrier: bootstrap.receipt_carrier.clone(),
+            machine_route: bootstrap.machine_route,
+            device_route: bootstrap.device_route,
+            request_hash: bootstrap.request_hash,
+            grant_hash: bootstrap.grant_hash,
+            response_hash: bootstrap.response_hash,
             already_committed,
         })
     }
@@ -1343,6 +1719,124 @@ fn audit_durable_state(
     })
 }
 
+fn validate_counter_guard_state(
+    marker: &PairedCommitMarkerV1,
+    guard: &CounterGuardState,
+    guard_bytes: &[u8],
+    state: &PairedCryptoState,
+    state_bytes: &[u8],
+    expected_binding: CounterBindingV1,
+) -> Result<(), PairedPromotionError> {
+    let state_hash = sha256(state_bytes);
+    match (*guard, state) {
+        (CounterGuardState::V1(value), PairedCryptoState::V1(_))
+            if value
+                == CounterGuardV1::from_binding(marker.directory_revision, expected_binding)
+                && sha256(guard_bytes) == marker.counter_guard_hash =>
+        {
+            Ok(())
+        }
+        (CounterGuardState::V1(_), PairedCryptoState::V1(_)) => Err(PairedPromotionError::Conflict),
+        (CounterGuardState::V1(_), PairedCryptoState::V2(_)) => Err(PairedPromotionError::Conflict),
+        (CounterGuardState::V2(value), _) => {
+            if value.initial_guard_commitment != marker.counter_guard_hash
+                || value.directory_revision != marker.directory_revision
+                || value.binding != expected_binding
+            {
+                return Err(PairedPromotionError::Conflict);
+            }
+            match value.phase {
+                CounterGuardPhaseV2::Stable {
+                    reserved_high_water,
+                    current_state_hash,
+                } if current_state_hash == state_hash
+                    && state_matches_stable_high_water(state, reserved_high_water) =>
+                {
+                    Ok(())
+                }
+                CounterGuardPhaseV2::Pending {
+                    previous_high_water,
+                    next_high_water,
+                    reservation_id,
+                    previous_state_hash,
+                    next_state_hash,
+                } if state_hash == previous_state_hash
+                    && state_matches_previous_high_water(state, previous_high_water) =>
+                {
+                    let expected = CommandCounterReservation {
+                        reservation_id,
+                        start: previous_high_water,
+                        end_exclusive: next_high_water,
+                    };
+                    expected.validate()?;
+                    rebuild_frozen_counter_state(marker, state, expected, next_state_hash)?;
+                    Ok(())
+                }
+                CounterGuardPhaseV2::Pending {
+                    previous_high_water,
+                    next_high_water,
+                    reservation_id,
+                    previous_state_hash: _,
+                    next_state_hash,
+                } if state_hash == next_state_hash => {
+                    let expected = CommandCounterReservation {
+                        reservation_id,
+                        start: previous_high_water,
+                        end_exclusive: next_high_water,
+                    };
+                    expected.validate()?;
+                    if state.counter_reservation() == Some(&expected) {
+                        Ok(())
+                    } else {
+                        Err(PairedPromotionError::Conflict)
+                    }
+                }
+                _ => Err(PairedPromotionError::Conflict),
+            }
+        }
+    }
+}
+
+/// 纯只读地重建 Pending 冻结的 canonical next state；inventory audit 与 recovery
+/// 共用这一条路径，避免 `list()` 接受一个直到 `open()` 才发现不可恢复的 transition。
+fn rebuild_frozen_counter_state(
+    marker: &PairedCommitMarkerV1,
+    previous: &PairedCryptoState,
+    reservation: CommandCounterReservation,
+    expected_state_hash: [u8; 32],
+) -> Result<(PairedCryptoState, CryptoStateSnapshot), PairedPromotionError> {
+    let next = previous.with_counter_reservation(
+        marker.state_plaintext_hash,
+        marker.counter_guard_hash,
+        &reservation,
+    )?;
+    let encoded = next.encode()?;
+    if sha256(&encoded) != expected_state_hash {
+        return Err(PairedPromotionError::Conflict);
+    }
+    Ok((next, CryptoStateSnapshot::new(encoded)))
+}
+
+fn state_matches_previous_high_water(state: &PairedCryptoState, high_water: u64) -> bool {
+    match state {
+        // V1 guard 本身只编码初始 HWM=0；任何非零值都必须已有 V2 sealed fence。
+        PairedCryptoState::V1(_) => high_water == 0,
+        PairedCryptoState::V2(_) => state
+            .counter_reservation()
+            .is_some_and(|reservation| reservation.end_exclusive == high_water),
+    }
+}
+
+fn state_matches_stable_high_water(state: &PairedCryptoState, high_water: u64) -> bool {
+    match state {
+        // stable V2 总在 sealed-state CAS 之后；V1 state 是不可能的 durable 顺序。
+        PairedCryptoState::V1(_) => false,
+        PairedCryptoState::V2(_) => state
+            .counter_reservation()
+            .is_some_and(|reservation| reservation.end_exclusive == high_water),
+    }
+}
+
 struct StorageKekRecordV1 {
     promotion_id: [u8; 32],
     key: [u8; 32],
@@ -1410,11 +1904,242 @@ struct CounterBindingV1 {
     nonce_prefix: [u8; 4],
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CounterGuardState {
+    V1(CounterGuardV1),
+    V2(CounterGuardV2),
+}
+
+impl fmt::Debug for CounterGuardState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CounterGuardState([REDACTED])")
+    }
+}
+
+impl CounterGuardState {
+    fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
+        if bytes.len() < 8 || &bytes[..4] != COUNTER_GUARD_MAGIC {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        match u16::from_be_bytes([bytes[4], bytes[5]]) {
+            COUNTER_GUARD_VERSION => CounterGuardV1::decode(bytes).map(Self::V1),
+            MUTABLE_COUNTER_GUARD_VERSION => CounterGuardV2::decode(bytes).map(Self::V2),
+            _ => Err(PairedPromotionError::InvalidState),
+        }
+    }
+
+    fn encode(self) -> Vec<u8> {
+        match self {
+            Self::V1(value) => value.encode(),
+            Self::V2(value) => value.encode(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CounterGuardV1 {
     directory_revision: KeyDirectoryRevision,
     binding: CounterBindingV1,
     reserved_high_water: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CounterGuardPhaseV2 {
+    Stable {
+        reserved_high_water: u64,
+        current_state_hash: [u8; 32],
+    },
+    Pending {
+        previous_high_water: u64,
+        next_high_water: u64,
+        reservation_id: [u8; 16],
+        previous_state_hash: [u8; 32],
+        next_state_hash: [u8; 32],
+    },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct CounterGuardV2 {
+    initial_guard_commitment: [u8; 32],
+    directory_revision: KeyDirectoryRevision,
+    binding: CounterBindingV1,
+    phase: CounterGuardPhaseV2,
+}
+
+impl fmt::Debug for CounterGuardV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CounterGuardV2([REDACTED])")
+    }
+}
+
+impl CounterGuardV2 {
+    fn stable(
+        initial_guard_commitment: [u8; 32],
+        directory_revision: KeyDirectoryRevision,
+        binding: CounterBindingV1,
+        reserved_high_water: u64,
+        current_state_hash: [u8; 32],
+    ) -> Result<Self, PairedPromotionError> {
+        let value = Self {
+            initial_guard_commitment,
+            directory_revision,
+            binding,
+            phase: CounterGuardPhaseV2::Stable {
+                reserved_high_water,
+                current_state_hash,
+            },
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pending(
+        initial_guard_commitment: [u8; 32],
+        directory_revision: KeyDirectoryRevision,
+        binding: CounterBindingV1,
+        previous_high_water: u64,
+        next_high_water: u64,
+        reservation_id: [u8; 16],
+        previous_state_hash: [u8; 32],
+        next_state_hash: [u8; 32],
+    ) -> Result<Self, PairedPromotionError> {
+        let value = Self {
+            initial_guard_commitment,
+            directory_revision,
+            binding,
+            phase: CounterGuardPhaseV2::Pending {
+                previous_high_water,
+                next_high_water,
+                reservation_id,
+                previous_state_hash,
+                next_state_hash,
+            },
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn encode(self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(match self.phase {
+            CounterGuardPhaseV2::Stable { .. } => 100,
+            CounterGuardPhaseV2::Pending { .. } => 156,
+        });
+        encoded.extend_from_slice(COUNTER_GUARD_MAGIC);
+        encoded.extend_from_slice(&MUTABLE_COUNTER_GUARD_VERSION.to_be_bytes());
+        encoded.push(match self.phase {
+            CounterGuardPhaseV2::Stable { .. } => 0,
+            CounterGuardPhaseV2::Pending { .. } => 1,
+        });
+        encoded.push(0);
+        encoded.extend_from_slice(&self.initial_guard_commitment);
+        encoded.extend_from_slice(&self.directory_revision.value().to_be_bytes());
+        encoded.extend_from_slice(&self.binding.key_epoch.to_be_bytes());
+        encoded.extend_from_slice(&self.binding.nonce_prefix);
+        match self.phase {
+            CounterGuardPhaseV2::Stable {
+                reserved_high_water,
+                current_state_hash,
+            } => {
+                encoded.extend_from_slice(&reserved_high_water.to_be_bytes());
+                encoded.extend_from_slice(&current_state_hash);
+            }
+            CounterGuardPhaseV2::Pending {
+                previous_high_water,
+                next_high_water,
+                reservation_id,
+                previous_state_hash,
+                next_state_hash,
+            } => {
+                encoded.extend_from_slice(&previous_high_water.to_be_bytes());
+                encoded.extend_from_slice(&next_high_water.to_be_bytes());
+                encoded.extend_from_slice(&reservation_id);
+                encoded.extend_from_slice(&previous_state_hash);
+                encoded.extend_from_slice(&next_state_hash);
+            }
+        }
+        encoded
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
+        if !matches!(bytes.len(), 100 | 156)
+            || &bytes[..4] != COUNTER_GUARD_MAGIC
+            || u16::from_be_bytes([bytes[4], bytes[5]]) != MUTABLE_COUNTER_GUARD_VERSION
+            || bytes[7] != 0
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let mut decoder = StateDecoder::new(&bytes[8..]);
+        let initial_guard_commitment = decoder.fixed()?;
+        let directory_revision = KeyDirectoryRevision::new(decoder.u64()?);
+        let binding = CounterBindingV1 {
+            key_epoch: decoder.u64()?,
+            nonce_prefix: decoder.fixed()?,
+        };
+        let value = match bytes[6] {
+            0 if bytes.len() == 100 => Self::stable(
+                initial_guard_commitment,
+                directory_revision,
+                binding,
+                decoder.u64()?,
+                decoder.fixed()?,
+            )?,
+            1 if bytes.len() == 156 => Self::pending(
+                initial_guard_commitment,
+                directory_revision,
+                binding,
+                decoder.u64()?,
+                decoder.u64()?,
+                decoder.fixed()?,
+                decoder.fixed()?,
+                decoder.fixed()?,
+            )?,
+            _ => return Err(PairedPromotionError::InvalidState),
+        };
+        decoder.finish()?;
+        if value.encode() != bytes {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(value)
+    }
+
+    fn validate(self) -> Result<(), PairedPromotionError> {
+        if all_zero(&self.initial_guard_commitment)
+            || self.directory_revision.value() == 0
+            || self.binding.key_epoch == 0
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        match self.phase {
+            CounterGuardPhaseV2::Stable {
+                reserved_high_water,
+                current_state_hash,
+            } if reserved_high_water == 0
+                || !reserved_high_water.is_multiple_of(COUNTER_BLOCK_SIZE)
+                || all_zero(&current_state_hash) =>
+            {
+                Err(PairedPromotionError::InvalidState)
+            }
+            CounterGuardPhaseV2::Pending {
+                previous_high_water,
+                next_high_water,
+                reservation_id,
+                previous_state_hash,
+                next_state_hash,
+            } if !previous_high_water.is_multiple_of(COUNTER_BLOCK_SIZE)
+                || previous_high_water
+                    .checked_add(COUNTER_BLOCK_SIZE)
+                    .is_none_or(|end| end != next_high_water)
+                || all_zero(&reservation_id)
+                || all_zero(&previous_state_hash)
+                || all_zero(&next_state_hash)
+                || previous_state_hash == next_state_hash =>
+            {
+                Err(PairedPromotionError::InvalidState)
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl CounterGuardV1 {
@@ -1467,6 +2192,7 @@ impl CounterGuardV1 {
     }
 }
 
+#[derive(Clone)]
 struct PairedCryptoStateV1 {
     installation_id: Uuid,
     invite_hpke_pubkey: [u8; 32],
@@ -1662,6 +2388,233 @@ impl PairedCryptoStateV1 {
     }
 }
 
+enum PairedCryptoState {
+    V1(PairedCryptoStateV1),
+    V2(PairedCryptoStateV2),
+}
+
+impl fmt::Debug for PairedCryptoState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairedCryptoState([REDACTED])")
+    }
+}
+
+impl PairedCryptoState {
+    fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
+        if bytes.len() < STATE_HEADER_LEN || &bytes[..4] != STATE_MAGIC {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        match u16::from_be_bytes([bytes[4], bytes[5]]) {
+            STATE_VERSION => PairedCryptoStateV1::decode(bytes).map(Self::V1),
+            MUTABLE_STATE_VERSION => PairedCryptoStateV2::decode(bytes).map(Self::V2),
+            _ => Err(PairedPromotionError::InvalidState),
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, PairedPromotionError> {
+        match self {
+            Self::V1(value) => value.encode(),
+            Self::V2(value) => value.encode(),
+        }
+    }
+
+    const fn bootstrap(&self) -> &PairedCryptoStateV1 {
+        match self {
+            Self::V1(value) => value,
+            Self::V2(value) => &value.bootstrap,
+        }
+    }
+
+    const fn counter_reservation(&self) -> Option<&CommandCounterReservation> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(value) => value.counter_reservation.as_ref(),
+        }
+    }
+
+    fn with_counter_reservation(
+        &self,
+        initial_state_commitment: [u8; 32],
+        initial_guard_commitment: [u8; 32],
+        reservation: &CommandCounterReservation,
+    ) -> Result<Self, PairedPromotionError> {
+        reservation.validate()?;
+        let stored_reservation = || CommandCounterReservation {
+            reservation_id: reservation.reservation_id,
+            start: reservation.start,
+            end_exclusive: reservation.end_exclusive,
+        };
+        let value = match self {
+            Self::V1(bootstrap) => PairedCryptoStateV2 {
+                initial_state_commitment,
+                initial_guard_commitment,
+                bootstrap: bootstrap.clone(),
+                receipt_terminal: None,
+                counter_reservation: Some(stored_reservation()),
+                replay_windows: Vec::new(),
+                stream_cursors: Vec::new(),
+            },
+            Self::V2(current) => PairedCryptoStateV2 {
+                initial_state_commitment: current.initial_state_commitment,
+                initial_guard_commitment: current.initial_guard_commitment,
+                bootstrap: current.bootstrap.clone(),
+                receipt_terminal: current.receipt_terminal.clone(),
+                counter_reservation: Some(stored_reservation()),
+                replay_windows: current.replay_windows.clone(),
+                stream_cursors: current.stream_cursors.clone(),
+            },
+        };
+        value.validate()?;
+        Ok(Self::V2(value))
+    }
+}
+
+/// V2 把 marker 的两个旧 hash 固化为 initial commitments；当前 state hash 只由 guard 绑定。
+/// receipt/replay/cursor 以 bounded canonical blob 保存，具体语义由后续 runtime 层严格解码。
+struct PairedCryptoStateV2 {
+    initial_state_commitment: [u8; 32],
+    initial_guard_commitment: [u8; 32],
+    bootstrap: PairedCryptoStateV1,
+    receipt_terminal: Option<Vec<u8>>,
+    counter_reservation: Option<CommandCounterReservation>,
+    replay_windows: Vec<Vec<u8>>,
+    stream_cursors: Vec<Vec<u8>>,
+}
+
+impl fmt::Debug for PairedCryptoStateV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairedCryptoStateV2([REDACTED])")
+    }
+}
+
+impl PairedCryptoStateV2 {
+    fn encode(&self) -> Result<Vec<u8>, PairedPromotionError> {
+        self.validate()?;
+        let mut body = Vec::new();
+        body.extend_from_slice(&self.initial_state_commitment);
+        body.extend_from_slice(&self.initial_guard_commitment);
+        let bootstrap = Zeroizing::new(self.bootstrap.encode()?);
+        put_state_field(
+            &mut body,
+            bootstrap.as_slice(),
+            MAX_CRYPTO_STATE_PLAINTEXT_LEN,
+        )?;
+        put_state_field(
+            &mut body,
+            self.receipt_terminal.as_deref().unwrap_or_default(),
+            MAX_STATE_FIELD_LEN,
+        )?;
+        match &self.counter_reservation {
+            Some(reservation) => {
+                body.push(1);
+                body.extend_from_slice(&[0, 0, 0]);
+                body.extend_from_slice(&reservation.reservation_id);
+                body.extend_from_slice(&reservation.start.to_be_bytes());
+                body.extend_from_slice(&reservation.end_exclusive.to_be_bytes());
+            }
+            None => body.extend_from_slice(&[0; 36]),
+        }
+        put_state_collection(&mut body, &self.replay_windows)?;
+        put_state_collection(&mut body, &self.stream_cursors)?;
+        if body.len() > MAX_CRYPTO_STATE_PLAINTEXT_LEN - STATE_HEADER_LEN {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let body_len = u32::try_from(body.len()).map_err(|_| PairedPromotionError::InvalidState)?;
+        let mut encoded = Vec::with_capacity(STATE_HEADER_LEN + body.len());
+        encoded.extend_from_slice(STATE_MAGIC);
+        encoded.extend_from_slice(&MUTABLE_STATE_VERSION.to_be_bytes());
+        encoded.extend_from_slice(&[0, 0]);
+        encoded.extend_from_slice(&body_len.to_be_bytes());
+        encoded.extend_from_slice(&body);
+        Ok(encoded)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
+        if bytes.len() < STATE_HEADER_LEN
+            || bytes.len() > MAX_CRYPTO_STATE_PLAINTEXT_LEN
+            || &bytes[..4] != STATE_MAGIC
+            || u16::from_be_bytes([bytes[4], bytes[5]]) != MUTABLE_STATE_VERSION
+            || bytes[6..8] != [0, 0]
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let declared = u32::from_be_bytes(
+            bytes[8..12]
+                .try_into()
+                .map_err(|_| PairedPromotionError::InvalidState)?,
+        ) as usize;
+        if declared != bytes.len() - STATE_HEADER_LEN {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let mut decoder = StateDecoder::new(&bytes[STATE_HEADER_LEN..]);
+        let initial_state_commitment = decoder.fixed()?;
+        let initial_guard_commitment = decoder.fixed()?;
+        let bootstrap =
+            PairedCryptoStateV1::decode(decoder.field(MAX_CRYPTO_STATE_PLAINTEXT_LEN)?)?;
+        let receipt = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
+        let receipt_terminal = (!receipt.is_empty()).then_some(receipt);
+        let reservation_tag = decoder.u8()?;
+        if decoder.take(3)? != [0, 0, 0] {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let reservation_id = decoder.fixed()?;
+        let reservation_start = decoder.u64()?;
+        let reservation_end = decoder.u64()?;
+        let counter_reservation = match reservation_tag {
+            0 if all_zero(&reservation_id) && reservation_start == 0 && reservation_end == 0 => {
+                None
+            }
+            1 => Some(CommandCounterReservation {
+                reservation_id,
+                start: reservation_start,
+                end_exclusive: reservation_end,
+            }),
+            _ => return Err(PairedPromotionError::InvalidState),
+        };
+        let replay_windows = decode_state_collection(&mut decoder)?;
+        let stream_cursors = decode_state_collection(&mut decoder)?;
+        decoder.finish()?;
+        let value = Self {
+            initial_state_commitment,
+            initial_guard_commitment,
+            bootstrap,
+            receipt_terminal,
+            counter_reservation,
+            replay_windows,
+            stream_cursors,
+        };
+        value.validate()?;
+        let canonical = Zeroizing::new(value.encode()?);
+        if canonical.as_slice() != bytes {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), PairedPromotionError> {
+        let bootstrap = Zeroizing::new(self.bootstrap.encode()?);
+        if all_zero(&self.initial_state_commitment)
+            || all_zero(&self.initial_guard_commitment)
+            || sha256(bootstrap.as_slice()) != self.initial_state_commitment
+            || self.receipt_terminal.as_ref().is_some_and(Vec::is_empty)
+            || self.replay_windows.len() > MAX_STATE_COLLECTION_ITEMS
+            || self.stream_cursors.len() > MAX_STATE_COLLECTION_ITEMS
+            || self
+                .replay_windows
+                .iter()
+                .chain(&self.stream_cursors)
+                .any(|entry| entry.is_empty() || entry.len() > MAX_STATE_FIELD_LEN)
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        if let Some(reservation) = &self.counter_reservation {
+            reservation.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
 struct PairedCommitMarkerV1 {
     installation_id: Uuid,
     root_fingerprint: [u8; 32],
@@ -1836,28 +2789,35 @@ impl PairedCommitMarkerV1 {
     fn validate_state(
         &self,
         identity: PairedMachineIdentity,
-        state: &PairedCryptoStateV1,
+        state: &PairedCryptoState,
         state_bytes: &[u8],
     ) -> Result<(), PairedPromotionError> {
-        if state.installation_id != self.installation_id
-            || state.machine_root_fingerprint != self.root_fingerprint
-            || state.machine_root_fingerprint != *identity.machine_root_fingerprint.as_bytes()
-            || state.relay_server_id != self.relay_server_id
-            || state.machine_route != self.machine_route
-            || state.machine_route != identity.machine_route
-            || state.device_route != self.device_route
-            || state.grant_serial != self.grant_serial
-            || state.trust_epoch != self.trust_epoch
-            || state.directory_revision != self.directory_revision
-            || state.invite_hash != self.invite_hash
-            || state.request_hash != self.request_hash
-            || state.grant_hash != self.grant_hash
-            || state.response_hash != self.response_hash
-            || state.promotion_id != self.promotion_id
-            || sha256(state_bytes) != self.state_plaintext_hash
-            || sha256(&state.receipt_carrier) != self.receipt_carrier_hash
+        let bootstrap = state.bootstrap();
+        if bootstrap.installation_id != self.installation_id
+            || bootstrap.machine_root_fingerprint != self.root_fingerprint
+            || bootstrap.machine_root_fingerprint != *identity.machine_root_fingerprint.as_bytes()
+            || bootstrap.relay_server_id != self.relay_server_id
+            || bootstrap.machine_route != self.machine_route
+            || bootstrap.machine_route != identity.machine_route
+            || bootstrap.device_route != self.device_route
+            || bootstrap.grant_serial != self.grant_serial
+            || bootstrap.trust_epoch != self.trust_epoch
+            || bootstrap.directory_revision != self.directory_revision
+            || bootstrap.invite_hash != self.invite_hash
+            || bootstrap.request_hash != self.request_hash
+            || bootstrap.grant_hash != self.grant_hash
+            || bootstrap.response_hash != self.response_hash
+            || bootstrap.promotion_id != self.promotion_id
+            || sha256(&bootstrap.receipt_carrier) != self.receipt_carrier_hash
         {
             return Err(PairedPromotionError::Conflict);
+        }
+        match state {
+            PairedCryptoState::V1(_) if sha256(state_bytes) == self.state_plaintext_hash => {}
+            PairedCryptoState::V2(value)
+                if value.initial_state_commitment == self.state_plaintext_hash
+                    && value.initial_guard_commitment == self.counter_guard_hash => {}
+            _ => return Err(PairedPromotionError::Conflict),
         }
         Ok(())
     }
@@ -1971,6 +2931,42 @@ fn put_state_field(
     Ok(())
 }
 
+fn put_state_collection(
+    encoded: &mut Vec<u8>,
+    values: &[Vec<u8>],
+) -> Result<(), PairedPromotionError> {
+    if values.len() > MAX_STATE_COLLECTION_ITEMS {
+        return Err(PairedPromotionError::InvalidState);
+    }
+    let count = u16::try_from(values.len()).map_err(|_| PairedPromotionError::InvalidState)?;
+    encoded.extend_from_slice(&count.to_be_bytes());
+    for value in values {
+        if value.is_empty() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        put_state_field(encoded, value, MAX_STATE_FIELD_LEN)?;
+    }
+    Ok(())
+}
+
+fn decode_state_collection(
+    decoder: &mut StateDecoder<'_>,
+) -> Result<Vec<Vec<u8>>, PairedPromotionError> {
+    let count = usize::from(decoder.u16()?);
+    if count > MAX_STATE_COLLECTION_ITEMS {
+        return Err(PairedPromotionError::InvalidState);
+    }
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        let value = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
+        if value.is_empty() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
 fn read_u64(bytes: &[u8]) -> Result<u64, PairedPromotionError> {
     Ok(u64::from_be_bytes(
         bytes
@@ -1981,4 +2977,57 @@ fn read_u64(bytes: &[u8]) -> Result<u64, PairedPromotionError> {
 
 fn all_zero(bytes: &[u8]) -> bool {
     bytes.iter().all(|byte| *byte == 0)
+}
+
+#[cfg(test)]
+mod counter_reservation_tests {
+    use std::convert::Infallible;
+
+    use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
+
+    use super::*;
+
+    struct CountingRng {
+        fill_calls: usize,
+    }
+
+    impl TryRng for CountingRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            unreachable!("counter reservation only requests exact bytes")
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            unreachable!("counter reservation only requests exact bytes")
+        }
+
+        fn try_fill_bytes(&mut self, output: &mut [u8]) -> Result<(), Self::Error> {
+            self.fill_calls += 1;
+            output.fill(0x5a);
+            Ok(())
+        }
+    }
+
+    impl TryCryptoRng for CountingRng {}
+
+    #[test]
+    fn last_counter_block_succeeds_then_epoch_exhaustion_precedes_entropy() {
+        let maximum_aligned_high_water = u64::MAX - (u64::MAX % COUNTER_BLOCK_SIZE);
+        let last_start = maximum_aligned_high_water - COUNTER_BLOCK_SIZE;
+        let mut rng = CountingRng { fill_calls: 0 };
+
+        let last = prepare_command_counter_reservation(last_start, &mut rng).unwrap();
+        assert_eq!(last.start(), last_start);
+        assert_eq!(last.end_exclusive(), maximum_aligned_high_water);
+        assert_eq!(rng.fill_calls, 1);
+
+        let error = prepare_command_counter_reservation(maximum_aligned_high_water, &mut rng)
+            .expect_err("the next block cannot be represented in the current key epoch");
+        assert_eq!(error.code(), "remote.counter.epoch_retirement_required");
+        assert_eq!(
+            rng.fill_calls, 1,
+            "overflow must fail before RNG and therefore before every durable mutation"
+        );
+    }
 }

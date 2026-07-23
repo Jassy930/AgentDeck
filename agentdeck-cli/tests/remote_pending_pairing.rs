@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -9,11 +10,13 @@ use agentdeck_cli::remote::crypto_state::{
 };
 use agentdeck_cli::remote::device_lock::{RemoteDeviceLease, RemoteDeviceLockKey};
 use agentdeck_cli::remote::keychain::{
-    MemoryRemoteKeyStore, PairedRemoteKeyPurpose, PendingRemoteKeyPurpose, RemoteKeyAccount,
-    RemoteKeyPersistence, RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
+    MemoryRemoteKeyStore, PairedRemoteKeyPurpose, ParsedPairedRemoteKeyAccount,
+    PendingRemoteKeyPurpose, RemoteKeyAccount, RemoteKeyPersistence, RemoteKeyStore,
+    RemoteKeyStoreError, RemoteSecret,
 };
 use agentdeck_cli::remote::paired_machine::{
-    PairedMachineIdentity, PairedMachineStore, PairedPromotionCoordinator, PromotedPairedMachine,
+    PairedMachineIdentity, PairedMachineStore, PairedMutationObserver, PairedMutationStage,
+    PairedPromotionCoordinator, PromotedPairedMachine,
 };
 use agentdeck_cli::remote::pending::{PendingPairingCoordinator, PreparedPairRequest};
 use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
@@ -1857,4 +1860,865 @@ fn paired_machine_store_rejects_offline_sealed_state_tamper_without_rewriting_it
     );
     assert_eq!(store.writes.load(Ordering::SeqCst), writes_before);
     assert_eq!(fs::read(&state_path).unwrap(), tampered);
+}
+
+struct PanicAfterPairedMutationStage {
+    stage: PairedMutationStage,
+    hits: AtomicUsize,
+}
+
+struct MutationCountingRemoteKeyStore {
+    inner: MemoryRemoteKeyStore,
+    mutation_calls: AtomicUsize,
+}
+
+impl MutationCountingRemoteKeyStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryRemoteKeyStore::new(),
+            mutation_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn mutation_calls(&self) -> usize {
+        self.mutation_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl RemoteKeyStore for MutationCountingRemoteKeyStore {
+    fn load(
+        &self,
+        account: &RemoteKeyAccount,
+    ) -> Result<Option<RemoteSecret>, RemoteKeyStoreError> {
+        self.inner.load(account)
+    }
+
+    fn persist_immutable(
+        &self,
+        account: &RemoteKeyAccount,
+        value: &RemoteSecret,
+    ) -> Result<RemoteKeyPersistence, RemoteKeyStoreError> {
+        self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.persist_immutable(account, value)
+    }
+
+    fn compare_and_replace_exact(
+        &self,
+        account: &RemoteKeyAccount,
+        expected: &RemoteSecret,
+        replacement: &RemoteSecret,
+    ) -> Result<(), RemoteKeyStoreError> {
+        self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .compare_and_replace_exact(account, expected, replacement)
+    }
+
+    fn delete_exact(&self, account: &RemoteKeyAccount) -> Result<(), RemoteKeyStoreError> {
+        self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.delete_exact(account)
+    }
+
+    fn list_paired_commit_markers(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<Vec<ParsedPairedRemoteKeyAccount>, RemoteKeyStoreError> {
+        self.inner.list_paired_commit_markers(installation_id)
+    }
+}
+
+impl PairedMutationObserver for PanicAfterPairedMutationStage {
+    fn after_stage(&self, stage: PairedMutationStage) {
+        if stage == self.stage {
+            let previous_hits = self.hits.fetch_add(1, Ordering::SeqCst);
+            if previous_hits == 0 {
+                panic!("injected crash after {stage:?}");
+            }
+        }
+    }
+}
+
+fn crash_counter_reservation_after(
+    store: &dyn RemoteKeyStore,
+    fixture: &Fixture,
+    state_root: &Path,
+    stage: PairedMutationStage,
+    seed: u8,
+) {
+    let observer = Arc::new(PanicAfterPairedMutationStage {
+        stage,
+        hits: AtomicUsize::new(0),
+    });
+    let observer_seam: Arc<dyn PairedMutationObserver> = observer.clone();
+    let paired = PairedMachineStore::new_with_mutation_observer(
+        store,
+        INSTALLATION_ID,
+        state_root,
+        observer_seam,
+    );
+    let mut opened = paired
+        .open_exact(fixture_paired_identity(fixture))
+        .expect("open paired machine before injected mutation crash");
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        let mut rng = DeterministicRng::new([seed; 32]);
+        opened
+            .reserve_command_counter_block(&mut rng)
+            .expect("observer must panic after the durable stage");
+    }));
+    assert!(crashed.is_err(), "{stage:?} observer must inject a crash");
+    assert_eq!(observer.hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn first_counter_reservation_upgrades_v1_without_rewriting_marker_and_restart_skips_the_block() {
+    let fixture = Fixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0xa1);
+    drop(promoted);
+
+    let marker = paired_account(&fixture, PairedRemoteKeyPurpose::CommitMarker);
+    let marker_before = store.load(&marker).unwrap().unwrap();
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut opened = paired
+        .open_exact(fixture_paired_identity(&fixture))
+        .unwrap();
+    let mut first_rng = DeterministicRng::new([0xa2; 32]);
+    let first = opened
+        .reserve_command_counter_block(&mut first_rng)
+        .unwrap();
+    assert_eq!(first.start(), 0);
+    assert_eq!(first.end_exclusive(), 1_024);
+    drop(opened);
+    assert_eq!(
+        store.load(&marker).unwrap().unwrap().expose_secret(),
+        marker_before.expose_secret()
+    );
+
+    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut reopened = restarted
+        .open_exact(fixture_paired_identity(&fixture))
+        .unwrap();
+    let mut second_rng = DeterministicRng::new([0xa3; 32]);
+    let second = reopened
+        .reserve_command_counter_block(&mut second_rng)
+        .unwrap();
+    assert_eq!(second.start(), 1_024);
+    assert_eq!(second.end_exclusive(), 2_048);
+    assert_ne!(first.reservation_id(), second.reservation_id());
+}
+
+#[test]
+fn every_counter_reservation_durable_stage_recovers_without_reusing_the_crashed_block() {
+    for (index, stage) in [
+        PairedMutationStage::GuardPendingDurable,
+        PairedMutationStage::StateDurable,
+        PairedMutationStage::GuardStableDurable,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = Fixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+        let promoted =
+            promote_for_paired_open(&store, &fixture, &state_root, 0xb1 + index as u8 * 4);
+        let state_path = promoted.state_path().to_path_buf();
+        drop(promoted);
+        let counter = paired_account(&fixture, PairedRemoteKeyPurpose::CounterGuard);
+        let guard_before = store.load(&counter).unwrap().unwrap();
+        let state_before = fs::read(&state_path).unwrap();
+
+        crash_counter_reservation_after(
+            &store,
+            &fixture,
+            &state_root,
+            stage,
+            0xb2 + index as u8 * 4,
+        );
+        let guard_after_crash = store.load(&counter).unwrap().unwrap();
+        let state_after_crash = fs::read(&state_path).unwrap();
+        assert_ne!(
+            guard_after_crash.expose_secret(),
+            guard_before.expose_secret(),
+            "{stage:?} must follow the pending-guard CAS"
+        );
+        if stage == PairedMutationStage::GuardPendingDurable {
+            assert_eq!(state_after_crash, state_before);
+        } else {
+            assert_ne!(state_after_crash, state_before);
+        }
+
+        let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+        let mut reopened = restarted
+            .open_exact(fixture_paired_identity(&fixture))
+            .expect("restart must reconcile an authenticated mutation boundary");
+        let mut restart_rng = DeterministicRng::new([0xb3 + index as u8 * 4; 32]);
+        let next = reopened
+            .reserve_command_counter_block(&mut restart_rng)
+            .expect("crashed block must be skipped, never reused");
+        assert_eq!(next.start(), 1_024, "stage {stage:?}");
+        assert_eq!(next.end_exclusive(), 2_048, "stage {stage:?}");
+    }
+}
+
+#[test]
+fn pending_second_counter_block_is_sealed_as_a_skipped_fence_before_later_reservations() {
+    let fixture = Fixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0xbb);
+    let state_path = promoted.state_path().to_path_buf();
+    drop(promoted);
+
+    let marker = paired_account(&fixture, PairedRemoteKeyPurpose::CommitMarker);
+    let marker_before = store.load(&marker).unwrap().unwrap();
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut opened = paired
+        .open_exact(fixture_paired_identity(&fixture))
+        .unwrap();
+    let mut first_rng = DeterministicRng::new([0xbc; 32]);
+    let first = opened
+        .reserve_command_counter_block(&mut first_rng)
+        .unwrap();
+    assert_eq!(first.start(), 0);
+    assert_eq!(first.end_exclusive(), 1_024);
+    drop(opened);
+    let state_after_first = fs::read(&state_path).unwrap();
+
+    crash_counter_reservation_after(
+        &store,
+        &fixture,
+        &state_root,
+        PairedMutationStage::GuardPendingDurable,
+        0xbd,
+    );
+    assert_eq!(
+        fs::read(&state_path).unwrap(),
+        state_after_first,
+        "guard-first crash must leave the previous sealed state durable"
+    );
+
+    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut recovered = restarted
+        .open_exact(fixture_paired_identity(&fixture))
+        .expect("open must seal the frozen second block before finalizing its guard");
+    assert_ne!(
+        fs::read(&state_path).unwrap(),
+        state_after_first,
+        "recovery must persist the skipped [1024,2048) reservation as a sealed fence"
+    );
+    let mut third_rng = DeterministicRng::new([0xbe; 32]);
+    let third = recovered
+        .reserve_command_counter_block(&mut third_rng)
+        .expect("the crashed second block must never be returned");
+    assert_eq!(third.start(), 2_048);
+    assert_eq!(third.end_exclusive(), 3_072);
+    assert_ne!(first.reservation_id(), third.reservation_id());
+    drop(recovered);
+
+    assert_eq!(
+        store.load(&marker).unwrap().unwrap().expose_secret(),
+        marker_before.expose_secret(),
+        "mutable reservations must never rewrite the initial commit marker"
+    );
+    let restarted_again = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut reopened = restarted_again
+        .open_exact(fixture_paired_identity(&fixture))
+        .expect("recovered guard and sealed state must remain coherent after another restart");
+    let mut fourth_rng = DeterministicRng::new([0xbf; 32]);
+    let fourth = reopened
+        .reserve_command_counter_block(&mut fourth_rng)
+        .unwrap();
+    assert_eq!(fourth.start(), 3_072);
+    assert_eq!(fourth.end_exclusive(), 4_096);
+}
+
+#[test]
+fn recovery_state_commit_crash_reopens_pending_next_and_only_finalizes_the_guard() {
+    let fixture = Fixture::new();
+    let store = MutationCountingRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0x61);
+    let state_path = promoted.state_path().to_path_buf();
+    drop(promoted);
+
+    let marker = paired_account(&fixture, PairedRemoteKeyPurpose::CommitMarker);
+    let marker_before = store.load(&marker).unwrap().unwrap();
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut opened = paired
+        .open_exact(fixture_paired_identity(&fixture))
+        .unwrap();
+    let mut first_rng = DeterministicRng::new([0x62; 32]);
+    let first = opened
+        .reserve_command_counter_block(&mut first_rng)
+        .unwrap();
+    assert_eq!(first.start(), 0);
+    assert_eq!(first.end_exclusive(), 1_024);
+    drop(opened);
+
+    crash_counter_reservation_after(
+        &store,
+        &fixture,
+        &state_root,
+        PairedMutationStage::GuardPendingDurable,
+        0x63,
+    );
+    let counter = paired_account(&fixture, PairedRemoteKeyPurpose::CounterGuard);
+    let pending_guard = store.load(&counter).unwrap().unwrap();
+    let previous_state = fs::read(&state_path).unwrap();
+    let mutations_before_recovery = store.mutation_calls();
+
+    let observer = Arc::new(PanicAfterPairedMutationStage {
+        stage: PairedMutationStage::RecoveryStateDurable,
+        hits: AtomicUsize::new(0),
+    });
+    let observer_seam: Arc<dyn PairedMutationObserver> = observer.clone();
+    let recovering = PairedMachineStore::new_with_mutation_observer(
+        &store,
+        INSTALLATION_ID,
+        &state_root,
+        observer_seam,
+    );
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        recovering
+            .open_exact(fixture_paired_identity(&fixture))
+            .expect("recovery observer must panic after its sealed-state CAS");
+    }));
+    assert!(crashed.is_err());
+    assert_eq!(observer.hits.load(Ordering::SeqCst), 1);
+    assert_ne!(fs::read(&state_path).unwrap(), previous_state);
+    assert_eq!(
+        store.load(&counter).unwrap().unwrap().expose_secret(),
+        pending_guard.expose_secret(),
+        "recovery crash must leave an authenticated pending+next pair"
+    );
+    assert_eq!(
+        store.mutation_calls(),
+        mutations_before_recovery,
+        "state recovery must not touch any Keychain account before guard finalize"
+    );
+
+    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut recovered = restarted
+        .open_exact(fixture_paired_identity(&fixture))
+        .expect("pending+next recovery must only finalize the frozen guard");
+    assert_eq!(
+        store.mutation_calls(),
+        mutations_before_recovery + 1,
+        "only the counter guard may change while finalizing pending+next"
+    );
+    let mut third_rng = DeterministicRng::new([0x64; 32]);
+    let third = recovered
+        .reserve_command_counter_block(&mut third_rng)
+        .unwrap();
+    assert_eq!(third.start(), 2_048);
+    assert_eq!(third.end_exclusive(), 3_072);
+    assert_eq!(
+        store.load(&marker).unwrap().unwrap().expose_secret(),
+        marker_before.expose_secret()
+    );
+}
+
+#[test]
+fn marker_inventory_list_is_read_only_while_counter_guard_is_pending() {
+    let fixture = Fixture::new();
+    let store = MutationCountingRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0xc1);
+    let state_path = promoted.state_path().to_path_buf();
+    drop(promoted);
+
+    crash_counter_reservation_after(
+        &store,
+        &fixture,
+        &state_root,
+        PairedMutationStage::GuardPendingDurable,
+        0xc2,
+    );
+    let counter = paired_account(&fixture, PairedRemoteKeyPurpose::CounterGuard);
+    let pending_guard = store.load(&counter).unwrap().unwrap();
+    let previous_state = fs::read(&state_path).unwrap();
+    let mutations_before = store.mutation_calls();
+
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let listed = paired
+        .list()
+        .expect("list may audit GuardPending but must not finalize recovery");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].identity(), fixture_paired_identity(&fixture));
+    assert_eq!(store.mutation_calls(), mutations_before);
+    assert_eq!(
+        store.load(&counter).unwrap().unwrap().expose_secret(),
+        pending_guard.expose_secret()
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), previous_state);
+}
+
+#[test]
+fn authenticated_old_state_rollback_under_stable_v2_guard_fails_without_repair() {
+    let fixture = Fixture::new();
+    let store = MutationCountingRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0xd1);
+    let state_path = promoted.state_path().to_path_buf();
+    drop(promoted);
+    let authenticated_v1_state = fs::read(&state_path).unwrap();
+
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut opened = paired
+        .open_exact(fixture_paired_identity(&fixture))
+        .unwrap();
+    let mut rng = DeterministicRng::new([0xd2; 32]);
+    let first = opened.reserve_command_counter_block(&mut rng).unwrap();
+    assert_eq!(first.start(), 0);
+    assert_eq!(first.end_exclusive(), 1_024);
+    drop(opened);
+
+    let counter = paired_account(&fixture, PairedRemoteKeyPurpose::CounterGuard);
+    let stable_guard = store.load(&counter).unwrap().unwrap();
+    assert_ne!(fs::read(&state_path).unwrap(), authenticated_v1_state);
+    fs::write(&state_path, &authenticated_v1_state).unwrap();
+    let rolled_back_state = fs::read(&state_path).unwrap();
+    let mutations_before = store.mutation_calls();
+
+    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let list_error = restarted
+        .list()
+        .expect_err("stable V2 guard must reject an authenticated old state");
+    assert_eq!(list_error.code(), "remote.pairing.paired_conflict");
+    let open_error = restarted
+        .open_exact(fixture_paired_identity(&fixture))
+        .expect_err("rollback must fail closed instead of repairing either side");
+    assert_eq!(open_error.code(), "remote.pairing.paired_conflict");
+    assert_eq!(store.mutation_calls(), mutations_before);
+    assert_eq!(fs::read(&state_path).unwrap(), rolled_back_state);
+    assert_eq!(
+        store.load(&counter).unwrap().unwrap().expose_secret(),
+        stable_guard.expose_secret()
+    );
+}
+
+#[test]
+fn state_commit_with_stale_handle_reloads_durable_previous_or_next_before_retrying() {
+    let fixture = Fixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    drop(promote_for_paired_open(&store, &fixture, &state_root, 0xe1));
+
+    let observer = Arc::new(PanicAfterPairedMutationStage {
+        stage: PairedMutationStage::StateDurable,
+        hits: AtomicUsize::new(0),
+    });
+    let observer_seam: Arc<dyn PairedMutationObserver> = observer.clone();
+    let paired = PairedMachineStore::new_with_mutation_observer(
+        &store,
+        INSTALLATION_ID,
+        &state_root,
+        observer_seam,
+    );
+    let mut opened = paired
+        .open_exact(fixture_paired_identity(&fixture))
+        .unwrap();
+    let first = catch_unwind(AssertUnwindSafe(|| {
+        let mut rng = DeterministicRng::new([0xe2; 32]);
+        opened.reserve_command_counter_block(&mut rng).unwrap();
+    }));
+    assert!(first.is_err());
+
+    // File CAS 已 durable，但 observer 位于内存 cache 更新前；同一 handle 必须先重读
+    // durable pending+next，绝不能用 stale previous hash finalize。
+    let mut retry_rng = DeterministicRng::new([0xe3; 32]);
+    let retry = opened
+        .reserve_command_counter_block(&mut retry_rng)
+        .expect("same handle must reload durable state before recovery");
+    assert_eq!(retry.start(), 1_024);
+    assert_eq!(retry.end_exclusive(), 2_048);
+    assert_eq!(observer.hits.load(Ordering::SeqCst), 2);
+    drop(opened);
+
+    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut reopened = restarted
+        .open_exact(fixture_paired_identity(&fixture))
+        .expect("stale-handle recovery must leave a coherent durable pair");
+    let mut next_rng = DeterministicRng::new([0xe4; 32]);
+    let next = reopened
+        .reserve_command_counter_block(&mut next_rng)
+        .unwrap();
+    assert_eq!(next.start(), 2_048);
+    assert_eq!(next.end_exclusive(), 3_072);
+}
+
+#[test]
+fn parse_valid_stable_high_water_rollback_is_rejected_without_reusing_counters() {
+    let fixture = Fixture::new();
+    let store = MutationCountingRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0xf1);
+    let state_path = promoted.state_path().to_path_buf();
+    drop(promoted);
+
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut opened = paired
+        .open_exact(fixture_paired_identity(&fixture))
+        .unwrap();
+    for seed in [0xf2, 0xf3] {
+        let mut rng = DeterministicRng::new([seed; 32]);
+        opened.reserve_command_counter_block(&mut rng).unwrap();
+    }
+    drop(opened);
+
+    let counter = paired_account(&fixture, PairedRemoteKeyPurpose::CounterGuard);
+    let stable = store.load(&counter).unwrap().unwrap();
+    let mut rolled_back_hwm = stable.expose_secret().to_vec();
+    assert_eq!(
+        u64::from_be_bytes(rolled_back_hwm[60..68].try_into().unwrap()),
+        2_048
+    );
+    rolled_back_hwm[60..68].copy_from_slice(&1_024_u64.to_be_bytes());
+    store
+        .compare_and_replace_exact(
+            &counter,
+            &stable,
+            &RemoteSecret::new(rolled_back_hwm.clone()),
+        )
+        .unwrap();
+    let state_before = fs::read(&state_path).unwrap();
+    let mutations_before = store.mutation_calls();
+
+    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let error = restarted
+        .list()
+        .expect_err("stable HWM below sealed reservation end must fail closed");
+    assert_eq!(error.code(), "remote.pairing.paired_conflict");
+    assert_eq!(store.mutation_calls(), mutations_before);
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert_eq!(
+        store.load(&counter).unwrap().unwrap().expose_secret(),
+        rolled_back_hwm
+    );
+}
+
+#[test]
+fn v1_state_rejects_parse_valid_pending_guard_with_nonzero_previous_high_water() {
+    let fixture = Fixture::new();
+    let store = MutationCountingRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0x21);
+    let state_path = promoted.state_path().to_path_buf();
+    drop(promoted);
+
+    crash_counter_reservation_after(
+        &store,
+        &fixture,
+        &state_root,
+        PairedMutationStage::GuardPendingDurable,
+        0x22,
+    );
+    let counter = paired_account(&fixture, PairedRemoteKeyPurpose::CounterGuard);
+    let pending = store.load(&counter).unwrap().unwrap();
+    let mut impossible_pending = pending.expose_secret().to_vec();
+    assert_eq!(impossible_pending.len(), 156);
+    assert_eq!(impossible_pending[6], 1);
+    assert_eq!(
+        u64::from_be_bytes(impossible_pending[60..68].try_into().unwrap()),
+        0
+    );
+    assert_eq!(
+        u64::from_be_bytes(impossible_pending[68..76].try_into().unwrap()),
+        1_024
+    );
+    impossible_pending[60..68].copy_from_slice(&1_024_u64.to_be_bytes());
+    impossible_pending[68..76].copy_from_slice(&2_048_u64.to_be_bytes());
+    store
+        .compare_and_replace_exact(
+            &counter,
+            &pending,
+            &RemoteSecret::new(impossible_pending.clone()),
+        )
+        .unwrap();
+    let state_before = fs::read(&state_path).unwrap();
+    let mutations_before = store.mutation_calls();
+
+    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    assert_eq!(
+        restarted.list().unwrap_err().code(),
+        "remote.pairing.paired_conflict"
+    );
+    assert_eq!(
+        restarted
+            .open_exact(fixture_paired_identity(&fixture))
+            .unwrap_err()
+            .code(),
+        "remote.pairing.paired_conflict"
+    );
+    assert_eq!(store.mutation_calls(), mutations_before);
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert_eq!(
+        store.load(&counter).unwrap().unwrap().expose_secret(),
+        impossible_pending
+    );
+}
+
+#[test]
+fn v1_state_rejects_parse_valid_stable_v2_guard_without_a_sealed_counter_fence() {
+    let fixture = Fixture::new();
+    let store = MutationCountingRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0x25);
+    let state_path = promoted.state_path().to_path_buf();
+    drop(promoted);
+
+    crash_counter_reservation_after(
+        &store,
+        &fixture,
+        &state_root,
+        PairedMutationStage::GuardPendingDurable,
+        0x26,
+    );
+    let counter = paired_account(&fixture, PairedRemoteKeyPurpose::CounterGuard);
+    let pending = store.load(&counter).unwrap().unwrap();
+    let pending_bytes = pending.expose_secret();
+    assert_eq!(pending_bytes.len(), 156);
+    let mut impossible_stable = pending_bytes[..60].to_vec();
+    impossible_stable[6] = 0;
+    impossible_stable.extend_from_slice(&1_024_u64.to_be_bytes());
+    // Pending 的 previous_state_hash 正是当前 authenticated V1 plaintext hash。
+    impossible_stable.extend_from_slice(&pending_bytes[92..124]);
+    assert_eq!(impossible_stable.len(), 100);
+    store
+        .compare_and_replace_exact(
+            &counter,
+            &pending,
+            &RemoteSecret::new(impossible_stable.clone()),
+        )
+        .unwrap();
+    let state_before = fs::read(&state_path).unwrap();
+    let mutations_before = store.mutation_calls();
+
+    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    assert_eq!(
+        restarted.list().unwrap_err().code(),
+        "remote.pairing.paired_conflict"
+    );
+    assert_eq!(
+        restarted
+            .open_exact(fixture_paired_identity(&fixture))
+            .unwrap_err()
+            .code(),
+        "remote.pairing.paired_conflict"
+    );
+    assert_eq!(store.mutation_calls(), mutations_before);
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert_eq!(
+        store.load(&counter).unwrap().unwrap().expose_secret(),
+        impossible_stable
+    );
+}
+
+#[test]
+fn v1_guard_with_authenticated_v2_state_is_an_impossible_order_and_never_repaired() {
+    let fixture = Fixture::new();
+    let store = MutationCountingRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0x31);
+    let state_path = promoted.state_path().to_path_buf();
+    drop(promoted);
+
+    let counter = paired_account(&fixture, PairedRemoteKeyPurpose::CounterGuard);
+    let initial_v1_guard = store.load(&counter).unwrap().unwrap();
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut opened = paired
+        .open_exact(fixture_paired_identity(&fixture))
+        .unwrap();
+    let mut rng = DeterministicRng::new([0x32; 32]);
+    opened.reserve_command_counter_block(&mut rng).unwrap();
+    drop(opened);
+
+    let stable_v2_guard = store.load(&counter).unwrap().unwrap();
+    store
+        .compare_and_replace_exact(&counter, &stable_v2_guard, &initial_v1_guard)
+        .unwrap();
+    let state_before = fs::read(&state_path).unwrap();
+    let mutations_before = store.mutation_calls();
+
+    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    assert_eq!(
+        restarted.list().unwrap_err().code(),
+        "remote.pairing.paired_conflict"
+    );
+    assert_eq!(
+        restarted
+            .open_exact(fixture_paired_identity(&fixture))
+            .unwrap_err()
+            .code(),
+        "remote.pairing.paired_conflict"
+    );
+    assert_eq!(store.mutation_calls(), mutations_before);
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert_eq!(
+        store.load(&counter).unwrap().unwrap().expose_secret(),
+        initial_v1_guard.expose_secret()
+    );
+}
+
+#[test]
+fn pending_guard_with_authenticated_third_state_hash_fails_closed_without_repair() {
+    let fixture = Fixture::new();
+    let store = MutationCountingRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0x35);
+    let state_path = promoted.state_path().to_path_buf();
+    drop(promoted);
+
+    crash_counter_reservation_after(
+        &store,
+        &fixture,
+        &state_root,
+        PairedMutationStage::GuardPendingDurable,
+        0x36,
+    );
+    let counter = paired_account(&fixture, PairedRemoteKeyPurpose::CounterGuard);
+    let pending_first_block = store.load(&counter).unwrap().unwrap();
+
+    // 正常恢复会跳过第一块，再提交 [1024,2048)；该 state 对旧 pending 而言既不是
+    // previous V1 hash，也不是其冻结的 [0,1024) next hash。
+    let recovered = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let mut opened = recovered
+        .open_exact(fixture_paired_identity(&fixture))
+        .unwrap();
+    let mut rng = DeterministicRng::new([0x37; 32]);
+    opened.reserve_command_counter_block(&mut rng).unwrap();
+    drop(opened);
+    let stable_second_block = store.load(&counter).unwrap().unwrap();
+    store
+        .compare_and_replace_exact(&counter, &stable_second_block, &pending_first_block)
+        .unwrap();
+    let third_state = fs::read(&state_path).unwrap();
+    let mutations_before = store.mutation_calls();
+
+    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    assert_eq!(
+        restarted.list().unwrap_err().code(),
+        "remote.pairing.paired_conflict"
+    );
+    assert_eq!(
+        restarted
+            .open_exact(fixture_paired_identity(&fixture))
+            .unwrap_err()
+            .code(),
+        "remote.pairing.paired_conflict"
+    );
+    assert_eq!(store.mutation_calls(), mutations_before);
+    assert_eq!(fs::read(&state_path).unwrap(), third_state);
+    assert_eq!(
+        store.load(&counter).unwrap().unwrap().expose_secret(),
+        pending_first_block.expose_secret()
+    );
+}
+
+#[test]
+fn pending_previous_state_audit_recomputes_the_frozen_next_transition_without_repairing() {
+    for (index, tamper_label) in ["reservation-id", "next-state-hash"]
+        .into_iter()
+        .enumerate()
+    {
+        let fixture = Fixture::new();
+        let store = MutationCountingRemoteKeyStore::new();
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+        let promoted = promote_for_paired_open(
+            &store,
+            &fixture,
+            &state_root,
+            0x45 + u8::try_from(index).unwrap() * 4,
+        );
+        let state_path = promoted.state_path().to_path_buf();
+        drop(promoted);
+
+        crash_counter_reservation_after(
+            &store,
+            &fixture,
+            &state_root,
+            PairedMutationStage::GuardPendingDurable,
+            0x46 + u8::try_from(index).unwrap() * 4,
+        );
+        let counter = paired_account(&fixture, PairedRemoteKeyPurpose::CounterGuard);
+        let pending = store.load(&counter).unwrap().unwrap();
+        let mut tampered = pending.expose_secret().to_vec();
+        assert_eq!(tampered.len(), 156);
+        match index {
+            0 => tampered[76] ^= 1,
+            1 => tampered[124] ^= 1,
+            _ => unreachable!(),
+        }
+        store
+            .compare_and_replace_exact(&counter, &pending, &RemoteSecret::new(tampered.clone()))
+            .unwrap();
+        let state_before = fs::read(&state_path).unwrap();
+        let mutations_before = store.mutation_calls();
+
+        let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+        assert_eq!(
+            restarted.list().unwrap_err().code(),
+            "remote.pairing.paired_conflict",
+            "{tamper_label} must be rejected by read-only inventory audit"
+        );
+        assert_eq!(
+            restarted
+                .open_exact(fixture_paired_identity(&fixture))
+                .unwrap_err()
+                .code(),
+            "remote.pairing.paired_conflict",
+            "{tamper_label} must be rejected before recovery mutation"
+        );
+        assert_eq!(store.mutation_calls(), mutations_before);
+        assert_eq!(fs::read(&state_path).unwrap(), state_before);
+        assert_eq!(
+            store.load(&counter).unwrap().unwrap().expose_secret(),
+            tampered
+        );
+    }
+}
+
+#[test]
+fn marker_backed_open_with_missing_kek_fails_closed_without_generating_or_repairing() {
+    let fixture = Fixture::new();
+    let store = MutationCountingRemoteKeyStore::new();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let promoted = promote_for_paired_open(&store, &fixture, &state_root, 0x39);
+    let state_path = promoted.state_path().to_path_buf();
+    drop(promoted);
+
+    let kek = paired_account(&fixture, PairedRemoteKeyPurpose::DeviceStorageKek);
+    store.delete_exact(&kek).unwrap();
+    let state_before = fs::read(&state_path).unwrap();
+    let mutations_before = store.mutation_calls();
+    let paired = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    assert_eq!(
+        paired.list().unwrap_err().code(),
+        "remote.pairing.paired_incomplete"
+    );
+    assert_eq!(
+        paired
+            .open_exact(fixture_paired_identity(&fixture))
+            .unwrap_err()
+            .code(),
+        "remote.pairing.paired_incomplete"
+    );
+    assert_eq!(store.mutation_calls(), mutations_before);
+    assert!(store.load(&kek).unwrap().is_none());
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
 }
