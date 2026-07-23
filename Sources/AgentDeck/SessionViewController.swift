@@ -7,6 +7,33 @@ private enum SidebarLayout {
     static let maximumWidth: CGFloat = 280
 }
 
+/// `fullSizeContentView` 会让内容树一直铺到窗口 frame 内侧。最右 8pt 必须
+/// 退出内容命中，避免轨道或空态子视图吞掉边缘事件；真正的拖拽序列由
+/// `AgentDeckWindow.sendEvent(_:)` 在 frame 层统一接管。
+final class WindowResizeAwareRootView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard bounds.contains(point) else { return nil }
+        guard point.x < bounds.maxX - TurnJumpRailLayout.windowResizeGutter else {
+            return nil
+        }
+        return super.hitTest(point)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(trailingResizeRect, cursor: .resizeLeftRight)
+    }
+
+    private var trailingResizeRect: NSRect {
+        NSRect(
+            x: max(bounds.minX, bounds.maxX - AgentDeckWindow.trailingResizeCaptureWidth),
+            y: bounds.minY,
+            width: min(bounds.width, AgentDeckWindow.trailingResizeCaptureWidth),
+            height: bounds.height
+        )
+    }
+}
+
 // MARK: - SessionViewController (Task 11)
 //
 // Top-level AppKit view controller that assembles all session sub-views into
@@ -100,7 +127,7 @@ final class SessionViewController: NSViewController {
     // MARK: - View lifecycle
 
     override func loadView() {
-        let root = NSView()
+        let root = WindowResizeAwareRootView()
         root.translatesAutoresizingMaskIntoConstraints = false
         root.wantsLayer = true
         // 透明：让侧栏 .behindWindow 毛玻璃不被根视图实色遮挡（内容区自绘不透明底）。

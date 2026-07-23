@@ -1,5 +1,79 @@
 import AppKit
 
+/// AppKit 的 full-size content window 在右缘内部只提供极窄的原生 resize
+/// 命中。窗口层在 view hit-testing 之前接管最右 16pt 的左键序列，保证空态、
+/// 会话态和轨道状态都能稳定水平缩放；其他事件继续交给 NSWindow 默认实现。
+@MainActor
+final class AgentDeckWindow: NSWindow {
+    /// 最外约 8pt 会先被 AppKit 私有 frame view 命中；扩到 16pt 后，内侧
+    /// 约 8pt 可稳定进入 `sendEvent`，与系统最外缘共同形成可用缩放带。
+    static let trailingResizeCaptureWidth: CGFloat = 16
+
+    private var trailingResizeOrigin: (frame: NSRect, pointerX: CGFloat)?
+
+    override func sendEvent(_ event: NSEvent) {
+        if handleTrailingResizeEvent(
+            type: event.type,
+            locationInWindow: event.locationInWindow,
+            pointerX: event.locationInWindow.x
+        ) {
+            return
+        }
+        super.sendEvent(event)
+    }
+
+    @discardableResult
+    func handleTrailingResizeEvent(
+        type: NSEvent.EventType,
+        locationInWindow: NSPoint,
+        pointerX: CGFloat
+    ) -> Bool {
+        switch type {
+        case .leftMouseDown:
+            guard isInTrailingResizeGutter(locationInWindow) else { return false }
+            trailingResizeOrigin = (frame, pointerX)
+            return true
+
+        case .leftMouseDragged:
+            guard let origin = trailingResizeOrigin else { return false }
+            let nextFrame = Self.resizedFrame(
+                from: origin.frame,
+                deltaX: pointerX - origin.pointerX,
+                minimumWidth: minSize.width,
+                maximumWidth: maxSize.width
+            )
+            setFrame(nextFrame, display: true)
+            return true
+
+        case .leftMouseUp:
+            guard trailingResizeOrigin != nil else { return false }
+            trailingResizeOrigin = nil
+            return true
+
+        default:
+            return false
+        }
+    }
+
+    static func resizedFrame(
+        from frame: NSRect,
+        deltaX: CGFloat,
+        minimumWidth: CGFloat,
+        maximumWidth: CGFloat
+    ) -> NSRect {
+        let upperBound = max(minimumWidth, maximumWidth)
+        let width = min(max(frame.width + deltaX, minimumWidth), upperBound)
+        return NSRect(x: frame.minX, y: frame.minY, width: width, height: frame.height)
+    }
+
+    private func isInTrailingResizeGutter(_ locationInWindow: NSPoint) -> Bool {
+        guard styleMask.contains(.resizable), let contentView else { return false }
+        let point = contentView.convert(locationInWindow, from: nil)
+        return contentView.bounds.contains(point)
+            && point.x >= contentView.bounds.maxX - Self.trailingResizeCaptureWidth
+    }
+}
+
 /// AppKit entry point (replaces the former SwiftUI `App`). Owns the single
 /// session window assembled by `SessionViewController` and reinstalls the
 /// Cmd-Q main menu the SwiftUI command group used to provide. `@MainActor`
@@ -24,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
 
         let vc: NSViewController = gallery ? GalleryViewController() : SessionViewController(model: model)
-        let win = NSWindow(contentViewController: vc)
+        let win = AgentDeckWindow(contentViewController: vc)
         win.title = profile.windowTitle
         win.setContentSize(NSSize(width: 1280, height: 760))
         win.styleMask.insert([.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView])

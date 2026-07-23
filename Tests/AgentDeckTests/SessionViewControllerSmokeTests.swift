@@ -232,9 +232,9 @@ final class SessionViewControllerSmokeTests: XCTestCase {
             to: window.contentView
         )
 
-        XCTAssertFalse(
-            window.contentView?.hitTest(resizePoint) is RailInteractionNSView,
-            "真实窗口层级最右 8pt 不得再路由给回合导航"
+        XCTAssertNil(
+            window.contentView?.hitTest(resizePoint),
+            "真实窗口层级最右 8pt 必须退出内容命中，让窗口层接管缩放"
         )
         XCTAssertEqual(
             interaction.frame.width,
@@ -242,6 +242,104 @@ final class SessionViewControllerSmokeTests: XCTestCase {
             accuracy: 0.5,
             "真实窗口中的轨道交互层应在缩放区之前结束"
         )
+    }
+
+    func testEmptyStateTrailingResizeGutterEscapesContentHierarchy() {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let vc = SessionViewController(model: model)
+        let window = NSWindow(contentViewController: vc)
+        window.styleMask.insert([.titled, .resizable, .fullSizeContentView])
+        window.setContentSize(NSSize(width: 1000, height: 620))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+
+        let resizePoint = NSPoint(
+            x: vc.view.bounds.maxX - 1,
+            y: vc.view.bounds.midY
+        )
+
+        XCTAssertNil(
+            window.contentView?.hitTest(resizePoint),
+            "空态右缘也必须退出内容命中"
+        )
+    }
+
+    func testTrailingResizeFrameTracksDragAndClampsToWindowLimits() {
+        let initial = NSRect(x: 100, y: 200, width: 1000, height: 620)
+
+        XCTAssertEqual(
+            AgentDeckWindow.resizedFrame(
+                from: initial,
+                deltaX: 120,
+                minimumWidth: 700,
+                maximumWidth: 1400
+            ),
+            NSRect(x: 100, y: 200, width: 1120, height: 620)
+        )
+        XCTAssertEqual(
+            AgentDeckWindow.resizedFrame(
+                from: initial,
+                deltaX: -500,
+                minimumWidth: 700,
+                maximumWidth: 1400
+            ).width,
+            700
+        )
+        XCTAssertEqual(
+            AgentDeckWindow.resizedFrame(
+                from: initial,
+                deltaX: 600,
+                minimumWidth: 700,
+                maximumWidth: 1400
+            ).width,
+            1400
+        )
+    }
+
+    func testAgentDeckWindowConsumesTrailingResizeSequenceBeforeFrameHitTesting() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let vc = SessionViewController(model: model)
+        let window = AgentDeckWindow(contentViewController: vc)
+        window.styleMask.insert([.titled, .resizable, .fullSizeContentView])
+        window.setContentSize(NSSize(width: 1000, height: 620))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+
+        let contentView = try XCTUnwrap(window.contentView)
+        let locationInWindow = contentView.convert(
+            NSPoint(x: contentView.bounds.maxX - 12, y: contentView.bounds.midY),
+            to: nil
+        )
+        let widthBefore = window.frame.width
+
+        XCTAssertTrue(window.handleTrailingResizeEvent(
+            type: .leftMouseDown,
+            locationInWindow: locationInWindow,
+            pointerX: 1000
+        ))
+        XCTAssertTrue(window.handleTrailingResizeEvent(
+            type: .leftMouseDragged,
+            locationInWindow: locationInWindow,
+            pointerX: 880
+        ))
+        XCTAssertEqual(window.frame.width, widthBefore - 120, accuracy: 1)
+        XCTAssertTrue(window.handleTrailingResizeEvent(
+            type: .leftMouseUp,
+            locationInWindow: locationInWindow,
+            pointerX: 880
+        ))
+
+        let outsideLocation = contentView.convert(
+            NSPoint(x: contentView.bounds.maxX - 20, y: contentView.bounds.midY),
+            to: nil
+        )
+        XCTAssertFalse(window.handleTrailingResizeEvent(
+            type: .leftMouseDown,
+            locationInWindow: outsideLocation,
+            pointerX: 1000
+        ))
     }
 
     // MARK: - Child controllers
