@@ -42,7 +42,7 @@ use agentdeck_protocol::relay_v2::id::{
 use agentdeck_protocol::relay_v2::{
     OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, decode, encode,
 };
-use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
+use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TurnId};
 use agentdeck_protocol::runtime::{
     ConversationId, MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope,
@@ -299,6 +299,7 @@ fn validate_current_command_reservation(
 /// `RuntimeRequest`。调用方不能传入裸 `RuntimeRequest`，因此新增远程命令必须显式扩展本
 /// allowlist 及其授权映射。
 pub(crate) enum AuthorizedRuntimeRequest {
+    Catalog(CatalogRequest),
     SendPrompt(SendPromptRequest),
     ResolveApproval {
         conversation_id: ConversationId,
@@ -318,6 +319,10 @@ impl AuthorizedRuntimeRequest {
         &self,
     ) -> (AuthorizationCapabilityV1, AuthorizationPermissionV1) {
         match self {
+            Self::Catalog(_) => (
+                AuthorizationCapabilityV1::Catalog,
+                AuthorizationPermissionV1::CatalogRead,
+            ),
             Self::SendPrompt(_) => (
                 AuthorizationCapabilityV1::Prompt,
                 AuthorizationPermissionV1::PromptSend,
@@ -339,6 +344,7 @@ impl AuthorizedRuntimeRequest {
 
     fn into_runtime_request(self) -> RuntimeRequest {
         match self {
+            Self::Catalog(request) => RuntimeRequest::Catalog(request),
             Self::SendPrompt(request) => RuntimeRequest::SendPrompt(request),
             Self::ResolveApproval {
                 conversation_id,
@@ -5307,6 +5313,7 @@ mod counter_reservation_tests {
 
     #[test]
     fn closed_runtime_requests_map_to_one_exact_authorization_each() {
+        let catalog = AuthorizedRuntimeRequest::Catalog(CatalogRequest { page_cursor: None });
         let prompt = AuthorizedRuntimeRequest::SendPrompt(SendPromptRequest {
             conversation_id: ConversationId::new("conversation-authorization-map"),
             idempotency_key: agentdeck_protocol::runtime::IdempotencyKey::new(
@@ -5332,6 +5339,17 @@ mod counter_reservation_tests {
         };
         let revoke_self = AuthorizedRuntimeRequest::RevokeSelf;
 
+        assert_eq!(
+            catalog.required_authorization(),
+            (
+                AuthorizationCapabilityV1::Catalog,
+                AuthorizationPermissionV1::CatalogRead,
+            )
+        );
+        assert!(matches!(
+            catalog.into_runtime_request(),
+            RuntimeRequest::Catalog(CatalogRequest { page_cursor: None })
+        ));
         assert_eq!(
             prompt.required_authorization(),
             (

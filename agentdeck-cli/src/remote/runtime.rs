@@ -2,7 +2,7 @@
 //!
 //! 本模块只把已配对 machine 的 typed crypto capability 与 Relay `Send`/`Reply`
 //! transport 组合起来；Relay 的 `RouteAccepted` 仅是传输状态，业务成功只来自经完整
-//! 验证且已 durable terminal 的 daemon `CommandReceipt`。
+//! 验证且已 durable terminal 的 daemon typed reply。
 
 #![cfg(unix)]
 
@@ -17,12 +17,12 @@ use agentdeck_protocol::relay_v2::{
     CodecError, GrantSerial as RelayGrantSerial, MAX_FRAME_BYTES, OpaqueRouteFrame,
     RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId, decode, encode,
 };
-use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
+use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::identity::{
-    ApprovalId, GrantSerial as RuntimeGrantSerial, MessageId, TurnId,
+    ApprovalId, CatalogPageCursor, GrantSerial as RuntimeGrantSerial, MessageId, TurnId,
 };
 use agentdeck_protocol::runtime::{
-    ApprovalDeliveryState, ApprovalReceipt, CommandReceipt, ConversationId,
+    ApprovalDeliveryState, ApprovalReceipt, CatalogSnapshot, CommandReceipt, ConversationId,
     MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION, RevocationReceipt, RuntimeEnvelope,
     RuntimeFailure, RuntimeMessage, RuntimeReply, SendPromptRequest,
 };
@@ -46,6 +46,7 @@ const REPLAY_MAGIC: &[u8; 4] = b"ADRW";
 const REPLAY_VERSION: u16 = 1;
 const MAX_REPLAY_WINDOWS: usize = 4_096;
 const MAX_REPLAY_ENTRIES: usize = 4_096;
+const CATALOG_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteCatalogIntentV1\0";
 const INTENT_DOMAIN: &[u8] = b"AgentDeck/RemotePromptIntentV1\0";
 const RESOLVE_APPROVAL_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteResolveApprovalIntentV1\0";
 const RETRY_APPROVAL_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteRetryApprovalIntentV1\0";
@@ -160,6 +161,25 @@ pub struct RemotePromptOutcome {
     receipt: CommandReceipt,
 }
 
+/// 一页 authenticated catalog snapshot 及独立 transport acceptance 观测。
+#[derive(Debug)]
+pub struct RemoteCatalogPageOutcome {
+    route_accepted: bool,
+    snapshot: CatalogSnapshot,
+}
+
+impl RemoteCatalogPageOutcome {
+    #[must_use]
+    pub const fn route_accepted(&self) -> bool {
+        self.route_accepted
+    }
+
+    #[must_use]
+    pub const fn snapshot(&self) -> &CatalogSnapshot {
+        &self.snapshot
+    }
+}
+
 impl RemotePromptOutcome {
     #[must_use]
     pub const fn route_accepted(&self) -> bool {
@@ -231,6 +251,8 @@ pub enum RemoteRuntimeError {
     OutcomeUnknown,
     #[error("remote reply is not correlated or has an invalid shape: {0}")]
     InvalidReply(&'static str),
+    #[error("catalog compact transfer replies are not supported by this runtime slice")]
+    TransferUnsupported,
     #[error("authenticated reply replay tuple was rejected")]
     ReplayRejected,
     #[error("durable remote runtime state has an invalid canonical encoding")]
@@ -257,6 +279,39 @@ where
     /// 显式等待 transport shutdown，随后按字段顺序先销毁 transport、再释放 device lease。
     pub async fn shutdown(mut self) {
         self.transport.shutdown().await;
+    }
+
+    /// 请求一页 catalog；A1 只接受未分片的 authenticated `CatalogSnapshot`。
+    pub async fn catalog_page<R: CryptoRng>(
+        &mut self,
+        page_cursor: Option<CatalogPageCursor>,
+        rng: &mut R,
+    ) -> Result<RemoteCatalogPageOutcome, RemoteRuntimeError> {
+        let operation = DirectedOperation::Catalog {
+            page_cursor: page_cursor.clone(),
+        };
+        let exchange = self
+            .directed_exchange(DirectedRequestPlan::catalog(page_cursor)?, rng)
+            .await;
+        let outcome = match exchange {
+            Ok(exchange) => directed_receipt_outcome(exchange)?,
+            Err(error @ RemoteRuntimeError::DaemonFailure(_)) => {
+                self.consume_catalog_terminal(&operation)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let DirectedReceipt::Catalog(snapshot) = outcome.receipt else {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        };
+        // Catalog 是 read-only query，不以 request payload 提供幂等身份。terminal 只在
+        // persist→return 的 crash 窗口保留；一旦本次调用消费到 authenticated 结果就
+        // durable 清除，下一次相同 Catalog(None) 必须重新查询，不能永久读旧快照。
+        self.consume_catalog_terminal(&operation)?;
+        Ok(RemoteCatalogPageOutcome {
+            route_accepted: outcome.route_accepted,
+            snapshot,
+        })
     }
 
     /// 发送或精确重试一个 prompt，直到得到 authenticated daemon receipt 或非成功错误。
@@ -438,7 +493,18 @@ where
                     // ciphertext/tag 失败，同 counter 的另一 signed ciphertext 也不能重试。
                     self.admit_reply_replay(&candidate)?;
                     let opened = self.machine.open_verified_directed_reply(candidate)?;
-                    if opened.payload_kind != pending.operation.reply_payload_kind() {
+                    if opened.payload_kind == SealedPayloadKind::TransferPart {
+                        if matches!(pending.operation, DirectedOperation::Catalog { .. }) {
+                            return Err(RemoteRuntimeError::TransferUnsupported);
+                        }
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "directed transfer reply does not match the pending request",
+                        ));
+                    }
+                    if !pending
+                        .operation
+                        .accepts_json_payload_kind(opened.payload_kind)
+                    {
                         return Err(RemoteRuntimeError::InvalidReply(
                             "directed reply payload kind does not match the pending request",
                         ));
@@ -459,7 +525,10 @@ where
                             "Runtime envelope is not a reply",
                         ));
                     };
-                    match pending.operation.validate_reply(reply)? {
+                    match pending
+                        .operation
+                        .validate_reply(opened.payload_kind, reply)?
+                    {
                         ValidatedDirectedReply::Terminal(receipt) => {
                             self.persist_terminal(&pending, reply_frame_hash, &receipt)?;
                             return directed_outcome(route_accepted, receipt)
@@ -630,6 +699,33 @@ where
         )
     }
 
+    fn consume_catalog_terminal(
+        &mut self,
+        expected: &DirectedOperation,
+    ) -> Result<(), RemoteRuntimeError> {
+        let current = self.machine.opaque_runtime_state();
+        let terminal = current
+            .exchange()
+            .ok_or(RemoteRuntimeError::InvalidDurableState)
+            .and_then(decode_exchange)?;
+        let DurableExchange::Terminal(terminal) = terminal else {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        };
+        if &terminal.operation != expected
+            || !matches!(
+                terminal.receipt,
+                DirectedReceipt::Catalog(_) | DirectedReceipt::Failure(_)
+            )
+        {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        self.replace_runtime_state(
+            None,
+            current.replay_windows().to_vec(),
+            current.stream_cursors().to_vec(),
+        )
+    }
+
     fn replace_runtime_state(
         &mut self,
         exchange: Option<Vec<u8>>,
@@ -652,6 +748,18 @@ struct DirectedRequestPlan {
 }
 
 impl DirectedRequestPlan {
+    fn catalog(page_cursor: Option<CatalogPageCursor>) -> Result<Self, RemoteRuntimeError> {
+        let request = CatalogRequest { page_cursor };
+        let wire = agentdeck_protocol::runtime::RuntimeRequest::Catalog(request.clone());
+        Ok(Self {
+            operation: DirectedOperation::Catalog {
+                page_cursor: request.page_cursor.clone(),
+            },
+            intent_hash: runtime_request_intent_hash(CATALOG_INTENT_DOMAIN, &wire)?,
+            request: AuthorizedRuntimeRequest::Catalog(request),
+        })
+    }
+
     fn prompt(request: SendPromptRequest) -> Result<Self, RemoteRuntimeError> {
         Ok(Self {
             operation: DirectedOperation::Prompt {
@@ -746,7 +854,8 @@ impl DirectedRequestPlan {
                 approval_id: stored_approval,
                 ..
             } => stored_conversation == &conversation_id && stored_approval == &approval_id,
-            DirectedOperation::Prompt { .. }
+            DirectedOperation::Catalog { .. }
+            | DirectedOperation::Prompt { .. }
             | DirectedOperation::ResolveApproval { .. }
             | DirectedOperation::RevokeSelf { .. } => false,
         };
@@ -779,6 +888,9 @@ impl DirectedRequestPlan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DirectedOperation {
+    Catalog {
+        page_cursor: Option<CatalogPageCursor>,
+    },
     Prompt {
         expected_configuration_revision: u64,
     },
@@ -796,20 +908,39 @@ enum DirectedOperation {
 }
 
 impl DirectedOperation {
-    const fn reply_payload_kind(&self) -> SealedPayloadKind {
-        // daemon 的 directed Runtime reply carrier 统一使用 CommandReceipt；真正的
-        // 业务 reply variant 仍在 authenticated RuntimeEnvelope 内闭合校验。
-        SealedPayloadKind::CommandReceipt
+    fn accepts_json_payload_kind(&self, payload_kind: SealedPayloadKind) -> bool {
+        match self {
+            Self::Catalog { .. } => matches!(
+                payload_kind,
+                SealedPayloadKind::CatalogSnapshot | SealedPayloadKind::CommandReceipt
+            ),
+            Self::Prompt { .. }
+            | Self::ResolveApproval { .. }
+            | Self::RetryApproval { .. }
+            | Self::RevokeSelf { .. } => payload_kind == SealedPayloadKind::CommandReceipt,
+        }
     }
 
     fn validate_reply(
         &self,
+        payload_kind: SealedPayloadKind,
         reply: RuntimeReply,
     ) -> Result<ValidatedDirectedReply, RemoteRuntimeError> {
         match (self, reply) {
-            (_, RuntimeReply::Failure(failure)) => Ok(ValidatedDirectedReply::Terminal(
-                DirectedReceipt::Failure(failure),
-            )),
+            (_, RuntimeReply::Failure(failure))
+                if payload_kind == SealedPayloadKind::CommandReceipt =>
+            {
+                Ok(ValidatedDirectedReply::Terminal(DirectedReceipt::Failure(
+                    failure,
+                )))
+            }
+            (Self::Catalog { .. }, RuntimeReply::Catalog(snapshot))
+                if payload_kind == SealedPayloadKind::CatalogSnapshot =>
+            {
+                Ok(ValidatedDirectedReply::Terminal(DirectedReceipt::Catalog(
+                    snapshot,
+                )))
+            }
             (
                 Self::Prompt {
                     expected_configuration_revision,
@@ -868,6 +999,9 @@ impl DirectedOperation {
             (Self::Prompt { .. }, _) => Err(RemoteRuntimeError::InvalidReply(
                 "Runtime reply is not CommandReceipt",
             )),
+            (Self::Catalog { .. }, _) => Err(RemoteRuntimeError::InvalidReply(
+                "Runtime reply is not a CatalogSnapshot with the expected payload kind",
+            )),
             (Self::ResolveApproval { .. } | Self::RetryApproval { .. }, _) => Err(
                 RemoteRuntimeError::InvalidReply("Runtime reply is not ApprovalReceipt"),
             ),
@@ -879,6 +1013,7 @@ impl DirectedOperation {
 
     fn stored_receipt_matches(&self, receipt: &DirectedReceipt) -> bool {
         match (self, receipt) {
+            (Self::Catalog { .. }, DirectedReceipt::Catalog(_)) => true,
             (
                 Self::Prompt {
                     expected_configuration_revision,
@@ -894,7 +1029,16 @@ impl DirectedOperation {
             }
             (
                 Self::RevokeSelf { .. },
-                DirectedReceipt::Command(_) | DirectedReceipt::Approval(_),
+                DirectedReceipt::Catalog(_)
+                | DirectedReceipt::Command(_)
+                | DirectedReceipt::Approval(_),
+            ) => false,
+            (Self::Catalog { .. }, DirectedReceipt::Command(_) | DirectedReceipt::Approval(_)) => {
+                false
+            }
+            (
+                Self::Prompt { .. } | Self::ResolveApproval { .. } | Self::RetryApproval { .. },
+                DirectedReceipt::Catalog(_),
             ) => false,
             (_, DirectedReceipt::Failure(_)) => true,
             _ => false,
@@ -905,9 +1049,10 @@ impl DirectedOperation {
         match self {
             Self::RetryApproval { attempt, .. } if *attempt > 0 => Ok(*attempt),
             Self::RetryApproval { .. } => Err(RemoteRuntimeError::InvalidDurableState),
-            Self::Prompt { .. } | Self::ResolveApproval { .. } | Self::RevokeSelf { .. } => {
-                Err(RemoteRuntimeError::InvalidDurableState)
-            }
+            Self::Catalog { .. }
+            | Self::Prompt { .. }
+            | Self::ResolveApproval { .. }
+            | Self::RevokeSelf { .. } => Err(RemoteRuntimeError::InvalidDurableState),
         }
     }
 }
@@ -920,6 +1065,7 @@ enum ValidatedDirectedReply {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "receipt", rename_all = "camelCase")]
 enum DirectedReceipt {
+    Catalog(CatalogSnapshot),
     Command(CommandReceipt),
     Approval(ApprovalReceipt),
     Failure(RuntimeFailure),
@@ -1313,6 +1459,16 @@ fn encode_operation(
     operation: &DirectedOperation,
 ) -> Result<(), RemoteRuntimeError> {
     match operation {
+        DirectedOperation::Catalog { page_cursor } => {
+            output.push(4);
+            match page_cursor {
+                Some(page_cursor) => {
+                    output.push(1);
+                    put_bytes(output, page_cursor.as_str().as_bytes())?;
+                }
+                None => output.push(0),
+            }
+        }
         DirectedOperation::Prompt {
             expected_configuration_revision,
         } => {
@@ -1376,6 +1532,19 @@ fn decode_operation(reader: &mut Reader<'_>) -> Result<DirectedOperation, Remote
                 return Err(RemoteRuntimeError::InvalidDurableState);
             }
             Ok(DirectedOperation::RevokeSelf { grant_serial })
+        }
+        4 => {
+            let page_cursor = match reader.u8()? {
+                0 => None,
+                1 => {
+                    let raw = reader.bytes(MAX_RUNTIME_JSON_FRAME_BYTES - 1)?;
+                    let value = std::str::from_utf8(raw)
+                        .map_err(|_| RemoteRuntimeError::InvalidDurableState)?;
+                    Some(CatalogPageCursor::new(value))
+                }
+                _ => return Err(RemoteRuntimeError::InvalidDurableState),
+            };
+            Ok(DirectedOperation::Catalog { page_cursor })
         }
         _ => Err(RemoteRuntimeError::InvalidDurableState),
     }

@@ -17,12 +17,13 @@ use agentdeck_cli::remote::paired_machine::{
     PairedMachineStore, PairedMutationObserver, PairedMutationStage,
 };
 use agentdeck_cli::remote::runtime::{
-    ExactRelayFrame, ReceivedRuntimeFrame, RemotePromptOutcome, RemoteRuntime, RemoteRuntimeError,
-    RemoteRuntimeTransport, RemoteRuntimeTransportError,
+    ExactRelayFrame, ReceivedRuntimeFrame, RemoteCatalogPageOutcome, RemotePromptOutcome,
+    RemoteRuntime, RemoteRuntimeError, RemoteRuntimeTransport, RemoteRuntimeTransportError,
 };
 use agentdeck_crypto::{
     AeadReceivingKey, AeadSendingKey, SecretAeadKey, SenderCounter, SigningKey, VerifyingKey,
-    open_sealed_payload, seal_symmetric, sha256, sign_sealed, sign_tbs, verify_sealed,
+    counter::COUNTER_BLOCK_SIZE, open_sealed_payload, seal_symmetric, sha256, sign_sealed,
+    sign_tbs, verify_sealed,
 };
 use agentdeck_protocol::e2ee::{
     KeyId, KeyPurpose, OuterContextV1, SealedPayloadKind, SignedSealedBlobV1,
@@ -35,16 +36,18 @@ use agentdeck_protocol::relay_v2::{
     DeviceRouteId, GrantSerial as RelayGrantSerial, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION,
     RelayFrameBody, RequestRouteId, decode, encode,
 };
-use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
+use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::identity::{
-    ApprovalId, CommandId, GrantSerial as RuntimeGrantSerial, MessageId, TurnId,
+    ApprovalId, CatalogPageCursor, CommandId, GrantSerial as RuntimeGrantSerial, MessageId,
+    TransferId, TurnId,
 };
 use agentdeck_protocol::runtime::{
-    ApprovalReceipt, CommandReceipt, ConversationId, IdempotencyKey, PromptPayload,
-    RUNTIME_PROTOCOL_VERSION, RevocationReceipt, RuntimeEnvelope, RuntimeFailure, RuntimeMessage,
-    RuntimeReply, RuntimeRequest, SendPromptRequest,
+    ApprovalReceipt, CatalogSnapshot, CommandReceipt, ConversationEntry, ConversationId,
+    IdempotencyKey, PromptPayload, RUNTIME_PROTOCOL_VERSION, RevocationReceipt, RuntimeEnvelope,
+    RuntimeFailure, RuntimeMessage, RuntimeReply, RuntimeRequest, RuntimeTransferCarrierV1,
+    RuntimeTransferChannel, SendPromptRequest, StreamCursor, TransferEnvelope,
 };
-use agentdeck_protocol::{ActionDecision, ActionDecisionKind};
+use agentdeck_protocol::{ActionDecision, ActionDecisionKind, AgentKind};
 use async_trait::async_trait;
 
 use remote_pairing::{
@@ -417,18 +420,41 @@ fn reply_frame(
         request_route,
         DEVICE_REPLY_EPOCH,
     );
-    let envelope = RuntimeEnvelope {
-        version: RUNTIME_PROTOCOL_VERSION,
-        message_id: if matches!(shape, ReplyShape::WrongMessageId) {
-            MessageId::new("wrong-message-id")
-        } else {
-            message_id
-        },
-        body: RuntimeMessage::Reply(reply),
+    let reply_message_id = if matches!(shape, ReplyShape::WrongMessageId) {
+        MessageId::new("wrong-message-id")
+    } else {
+        message_id
     };
-    let plaintext = envelope
-        .to_json_bytes_checked()
-        .expect("fixture Runtime reply envelope");
+    let (payload_kind, plaintext) = match reply {
+        RuntimeReply::TransferPart(transfer) => (
+            SealedPayloadKind::TransferPart,
+            RuntimeTransferCarrierV1::new(
+                reply_message_id,
+                RuntimeTransferChannel::Reply,
+                transfer,
+            )
+            .encode()
+            .expect("fixture compact transfer carrier"),
+        ),
+        reply => {
+            let payload_kind = if matches!(reply, RuntimeReply::Catalog(_)) {
+                SealedPayloadKind::CatalogSnapshot
+            } else {
+                SealedPayloadKind::CommandReceipt
+            };
+            let envelope = RuntimeEnvelope {
+                version: RUNTIME_PROTOCOL_VERSION,
+                message_id: reply_message_id,
+                body: RuntimeMessage::Reply(reply),
+            };
+            (
+                payload_kind,
+                envelope
+                    .to_json_bytes_checked()
+                    .expect("fixture Runtime reply envelope"),
+            )
+        }
+    };
     let key_purpose = if matches!(shape, ReplyShape::WrongKeyPurpose) {
         KeyPurpose::DeviceCommandTx
     } else {
@@ -469,7 +495,7 @@ fn reply_frame(
         if matches!(shape, ReplyShape::WrongPayloadKind) {
             SealedPayloadKind::CommandRequest
         } else {
-            SealedPayloadKind::CommandReceipt
+            payload_kind
         },
         &plaintext,
         SenderCounter(counter),
@@ -655,6 +681,57 @@ fn delivery_failed_approval_receipt() -> ApprovalReceipt {
     ApprovalReceipt::DeliveryFailed {
         approval_id: approval_id(),
     }
+}
+
+fn catalog_page_cursor() -> CatalogPageCursor {
+    CatalogPageCursor::new("catalog-page-cursor-1")
+}
+
+fn catalog_request(page_cursor: Option<CatalogPageCursor>) -> RuntimeRequest {
+    RuntimeRequest::Catalog(CatalogRequest { page_cursor })
+}
+
+fn catalog_snapshot() -> CatalogSnapshot {
+    CatalogSnapshot::new(
+        StreamCursor::At(17),
+        vec![ConversationEntry {
+            conversation_id: ConversationId::new("conversation-catalog-1"),
+            agent_kind: AgentKind::Codex,
+            title: Some("Catalog fixture".to_owned()),
+            cwd: Some(PathBuf::from("/tmp/catalog-fixture")),
+            last_active_ms: 42,
+            archived: false,
+            entry_revision: 5,
+        }],
+        Some(CatalogPageCursor::new("catalog-page-cursor-2")),
+    )
+    .expect("bounded catalog fixture")
+}
+
+fn newer_catalog_snapshot() -> CatalogSnapshot {
+    CatalogSnapshot::new(
+        StreamCursor::At(18),
+        vec![ConversationEntry {
+            conversation_id: ConversationId::new("conversation-catalog-2"),
+            agent_kind: AgentKind::ClaudeCode,
+            title: Some("Newer catalog fixture".to_owned()),
+            cwd: Some(PathBuf::from("/tmp/newer-catalog-fixture")),
+            last_active_ms: 84,
+            archived: false,
+            entry_revision: 6,
+        }],
+        None,
+    )
+    .expect("bounded newer catalog fixture")
+}
+
+fn assert_catalog_outcome(
+    outcome: &RemoteCatalogPageOutcome,
+    route_accepted: bool,
+    expected: &CatalogSnapshot,
+) {
+    assert_eq!(outcome.route_accepted(), route_accepted);
+    assert_eq!(outcome.snapshot(), expected);
 }
 
 fn state_root(temp: &tempfile::TempDir) -> PathBuf {
@@ -2129,4 +2206,282 @@ fn crash_after_replay_admission_before_aead_open_recovers_exact_reply() {
         .block_on(retry_runtime.prompt(request, &mut panic_rng))
         .expect("exact authenticated reply completes after replay-state recovery");
     assert_accepted_outcome(&outcome, false);
+}
+
+#[tokio::test]
+async fn catalog_page_seals_exact_cursor_request_and_only_reports_authenticated_snapshot() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xc0);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let page_cursor = catalog_page_cursor();
+    let snapshot = catalog_snapshot();
+    let (transport, sent) = FakeTransport::new_runtime(
+        TransportScript::RouteAcceptedThenReply,
+        catalog_request(Some(page_cursor.clone())),
+        RuntimeReply::Catalog(snapshot.clone()),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xc1; 32]);
+
+    let outcome = runtime
+        .catalog_page(Some(page_cursor), &mut rng)
+        .await
+        .expect("authenticated CatalogSnapshot is terminal");
+
+    assert_catalog_outcome(&outcome, true, &snapshot);
+    let _ = one_sent_codec_frame(&sent);
+}
+
+#[tokio::test]
+async fn catalog_route_accepted_only_restarts_with_the_exact_frozen_send() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xc2);
+    let snapshot = catalog_snapshot();
+    let page_cursor = catalog_page_cursor();
+
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let (first_transport, first_sent) = FakeTransport::new_runtime(
+        TransportScript::RouteAcceptedOnly,
+        catalog_request(Some(page_cursor.clone())),
+        RuntimeReply::Catalog(snapshot.clone()),
+        device_sign,
+    );
+    let mut first_runtime = RemoteRuntime::new(opened, first_transport);
+    let mut first_rng = DeterministicRng::new([0xc3; 32]);
+    assert!(matches!(
+        first_runtime
+            .catalog_page(Some(page_cursor.clone()), &mut first_rng)
+            .await,
+        Err(RemoteRuntimeError::OutcomeUnknown)
+    ));
+    let first_frame = one_sent_codec_frame(&first_sent);
+    drop(first_runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen pending catalog request");
+    let (retry_transport, retry_sent) = FakeTransport::new_runtime(
+        TransportScript::ReplyOnly,
+        catalog_request(Some(page_cursor.clone())),
+        RuntimeReply::Catalog(snapshot.clone()),
+        device_sign,
+    );
+    let mut retry_runtime = RemoteRuntime::new(reopened, retry_transport);
+    let mut retry_rng = PanicRng;
+    let outcome = retry_runtime
+        .catalog_page(Some(page_cursor), &mut retry_rng)
+        .await
+        .expect("exact catalog retry may finish from authenticated snapshot");
+
+    assert_catalog_outcome(&outcome, false, &snapshot);
+    assert_eq!(one_sent_codec_frame(&retry_sent), first_frame);
+}
+
+#[tokio::test]
+async fn catalog_authenticated_daemon_failure_is_never_snapshot_success() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xc4);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let failure = RuntimeFailure::new(
+        "daemon.catalog.fixture_rejected",
+        "fixture rejects the catalog request",
+    );
+    let (transport, _sent) = FakeTransport::new_runtime(
+        TransportScript::ReplyOnly,
+        catalog_request(None),
+        RuntimeReply::Failure(failure.clone()),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xc5; 32]);
+
+    assert!(matches!(
+        runtime.catalog_page(None, &mut rng).await,
+        Err(RemoteRuntimeError::DaemonFailure(observed))
+            if observed.code == failure.code && observed.message == failure.message
+    ));
+    drop(runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen after consumed catalog failure");
+    let snapshot = catalog_snapshot();
+    let (retry_transport, retry_sent) = FakeTransport::new_runtime_with_counters(
+        TransportScript::ReplyOnly,
+        catalog_request(None),
+        RuntimeReply::Catalog(snapshot.clone()),
+        device_sign,
+        COUNTER_BLOCK_SIZE,
+        REPLY_COUNTER + 1,
+    );
+    let mut retry = RemoteRuntime::new(reopened, retry_transport);
+    let mut retry_rng = DeterministicRng::new([0xd5; 32]);
+    let outcome = retry
+        .catalog_page(None, &mut retry_rng)
+        .await
+        .expect("a transient authenticated failure cannot pin future catalog reads");
+    assert_catalog_outcome(&outcome, false, &snapshot);
+    let _ = one_sent_codec_frame(&retry_sent);
+}
+
+#[test]
+fn catalog_terminal_replays_after_crash_once_then_the_next_read_is_fresh() {
+    let fixture = PairingFixture::new();
+    let store = Arc::new(MemoryRemoteKeyStore::new());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(store.as_ref(), &root, 0xc6);
+    let snapshot = catalog_snapshot();
+
+    let crashed_store = Arc::clone(&store);
+    let crashed_root = root.clone();
+    let crashed_snapshot = snapshot.clone();
+    let crashed = std::thread::spawn(move || {
+        let observer = Arc::new(PanicOnNthStateActive::new(3));
+        let opened = PairedMachineStore::new_with_mutation_observer(
+            crashed_store.as_ref(),
+            INSTALLATION_ID,
+            &crashed_root,
+            observer,
+        )
+        .open_exact(PairingFixture::new().identity())
+        .expect("open promoted machine with terminal crash observer");
+        let (transport, _sent) = FakeTransport::new_runtime(
+            TransportScript::ReplyOnly,
+            catalog_request(None),
+            RuntimeReply::Catalog(crashed_snapshot),
+            device_sign,
+        );
+        let mut runtime = RemoteRuntime::new(opened, transport);
+        let mut rng = DeterministicRng::new([0xc7; 32]);
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("single-thread test Runtime");
+        let _ = executor.block_on(runtime.catalog_page(None, &mut rng));
+    })
+    .join();
+    assert!(
+        crashed.is_err(),
+        "observer must stop after durable terminal and before consumption"
+    );
+
+    let reopened = PairedMachineStore::new(store.as_ref(), INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen crash-durable catalog terminal");
+    let (unused_transport, sent) = FakeTransport::new_runtime(
+        TransportScript::EofAfterSend,
+        catalog_request(None),
+        RuntimeReply::Catalog(catalog_snapshot()),
+        device_sign,
+    );
+    let mut replay = RemoteRuntime::new(reopened, unused_transport);
+    let mut panic_rng = PanicRng;
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("single-thread replay Runtime");
+    let local = executor
+        .block_on(replay.catalog_page(None, &mut panic_rng))
+        .expect("durable catalog terminal is a local read");
+
+    assert_catalog_outcome(&local, false, &snapshot);
+    assert!(sent.lock().expect("sent-frame recorder").is_empty());
+    drop(replay);
+
+    let reopened = PairedMachineStore::new(store.as_ref(), INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen after catalog terminal consumption");
+    let newer = newer_catalog_snapshot();
+    let (fresh_transport, fresh_sent) = FakeTransport::new_runtime_with_counters(
+        TransportScript::ReplyOnly,
+        catalog_request(None),
+        RuntimeReply::Catalog(newer.clone()),
+        device_sign,
+        COUNTER_BLOCK_SIZE,
+        REPLY_COUNTER + 1,
+    );
+    let mut fresh = RemoteRuntime::new(reopened, fresh_transport);
+    let mut fresh_rng = DeterministicRng::new([0xd7; 32]);
+    let fresh_outcome = executor
+        .block_on(fresh.catalog_page(None, &mut fresh_rng))
+        .expect("the next invocation must query a fresh catalog page");
+    assert_catalog_outcome(&fresh_outcome, false, &newer);
+    let _ = one_sent_codec_frame(&fresh_sent);
+}
+
+#[tokio::test]
+async fn catalog_requires_catalog_snapshot_payload_kind() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xc8);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let (transport, _sent) = FakeTransport::new_runtime(
+        TransportScript::ReplyOnlyWithShape(ReplyShape::WrongPayloadKind),
+        catalog_request(None),
+        RuntimeReply::Catalog(catalog_snapshot()),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xc9; 32]);
+
+    assert!(matches!(
+        runtime.catalog_page(None, &mut rng).await,
+        Err(RemoteRuntimeError::InvalidReply(_))
+    ));
+}
+
+#[tokio::test]
+async fn catalog_transfer_part_is_typed_unsupported_until_compact_reassembly_lands() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xca);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let part = b"catalog transfer fixture".to_vec();
+    let transfer = TransferEnvelope::new_json(
+        TransferId::new("catalog-transfer-1"),
+        0,
+        1,
+        sha256(&part),
+        part.len() as u64,
+        part,
+    )
+    .expect("valid transfer fixture");
+    let (transport, _sent) = FakeTransport::new_runtime(
+        TransportScript::ReplyOnly,
+        catalog_request(None),
+        RuntimeReply::TransferPart(transfer),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xcb; 32]);
+
+    assert!(matches!(
+        runtime.catalog_page(None, &mut rng).await,
+        Err(RemoteRuntimeError::TransferUnsupported)
+    ));
 }
