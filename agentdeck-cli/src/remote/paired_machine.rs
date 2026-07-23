@@ -14,31 +14,38 @@ use std::sync::Arc;
 use agentdeck_crypto::counter::COUNTER_BLOCK_SIZE;
 use agentdeck_crypto::rand_core::CryptoRng;
 use agentdeck_crypto::{
-    open_key_directory_entry, open_pair_response, seal_pair_response_received, sha256, verify_tbs,
-    CryptoError, HpkePrivateKey, HpkePublicKey, SecretAeadKey, SignatureBytes, SigningKey,
-    VerifyingKey,
+    AeadReceivingKey, AeadSendingKey, CryptoError, HpkePrivateKey, HpkePublicKey, SecretAeadKey,
+    SenderCounter, SignatureBytes, SigningKey, VerifyingKey, open_key_directory_entry,
+    open_pair_response, open_sealed_payload, seal_pair_response_received, seal_symmetric, sha256,
+    sign_sealed, verify_sealed, verify_tbs,
 };
 use agentdeck_protocol::e2ee::{
-    DeviceAuthorizationV1, KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1,
+    AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
+    E2EE_FORMAT_VERSION, KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1,
     MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairResponseReceivedV1,
-    PairResponseV1, PairingControlEnvelopeV1, PairingError, E2EE_FORMAT_VERSION,
+    PairResponseV1, PairingControlEnvelopeV1, PairingError, SealedPayloadKind, SealedPayloadV1,
+    SignedSealedBlobV1, VerifiedSealedBlobV1,
 };
+use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::{
     AuthCanonicalError, CertRole, Ed25519Signature, RelayGrant, SignedCertificate,
 };
 use agentdeck_protocol::relay_v2::id::{
-    DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayServerId, StreamRouteId,
-    TrustEpoch,
+    DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayServerId,
+    RequestRouteId, StreamRouteId, TrustEpoch,
 };
-use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
-use agentdeck_protocol::runtime::{MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION};
+use agentdeck_protocol::runtime::identity::MessageId;
+use agentdeck_protocol::runtime::{
+    MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage,
+    RuntimeRequest, SendPromptRequest,
+};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::crypto_state::{
     CryptoStateError, CryptoStateIdentity, CryptoStateSnapshot, DeviceStorageKek,
-    FileCryptoStateStore, PreparedCryptoStateStage, MAX_CRYPTO_STATE_PLAINTEXT_LEN,
+    FileCryptoStateStore, MAX_CRYPTO_STATE_PLAINTEXT_LEN, PreparedCryptoStateStage,
 };
 use super::device_lock::{RemoteDeviceLease, RemoteDeviceLockError, RemoteDeviceLockKey};
 use super::keychain::{
@@ -112,12 +119,40 @@ impl fmt::Debug for OpaqueRuntimeState {
 
 impl OpaqueRuntimeState {
     #[must_use]
+    pub(crate) fn new(
+        exchange: Option<Vec<u8>>,
+        replay_windows: Vec<Vec<u8>>,
+        stream_cursors: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            exchange,
+            replay_windows,
+            stream_cursors,
+        }
+    }
+
+    #[must_use]
     pub(crate) const fn empty() -> Self {
         Self {
             exchange: None,
             replay_windows: Vec::new(),
             stream_cursors: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn exchange(&self) -> Option<&[u8]> {
+        self.exchange.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) fn replay_windows(&self) -> &[Vec<u8>] {
+        &self.replay_windows
+    }
+
+    #[must_use]
+    pub(crate) fn stream_cursors(&self) -> &[Vec<u8>] {
+        &self.stream_cursors
     }
 
     fn validate(&self) -> Result<(), PairedPromotionError> {
@@ -203,11 +238,32 @@ impl AutomaticRuntimeStateProbe {
 }
 
 /// 已在 CounterGuard 中 durable 预留的 DeviceCommandTx counter 整块。
+///
+/// reservation 不实现 `Clone`/`Copy`，且 seal API 按值消费：
+/// ```compile_fail
+/// use agentdeck_cli::remote::paired_machine::CommandCounterReservation;
+/// fn consume(value: CommandCounterReservation) { drop(value); }
+/// fn cannot_reuse(value: CommandCounterReservation) {
+///     consume(value);
+///     consume(value);
+/// }
+/// ```
 #[derive(Eq, PartialEq)]
 pub struct CommandCounterReservation {
     reservation_id: [u8; 16],
     start: u64,
     end_exclusive: u64,
+}
+
+fn validate_current_prompt_reservation(
+    current: Option<&CommandCounterReservation>,
+    candidate: &CommandCounterReservation,
+) -> Result<(), PairedPromotionError> {
+    candidate.validate()?;
+    if current != Some(candidate) {
+        return Err(PairedPromotionError::Conflict);
+    }
+    Ok(())
 }
 
 impl fmt::Debug for CommandCounterReservation {
@@ -444,10 +500,21 @@ impl PairedMachineSummary {
     }
 }
 
+enum OpenedPairedKeyMaterial {
+    CommandTx(AeadSendingKey),
+    ReplyTx {
+        key: AeadReceivingKey,
+        nonce_prefix: [u8; 4],
+    },
+    Other {
+        _key: SecretAeadKey,
+    },
+}
+
 struct OpenedPairedDirectoryKey {
-    _key_id: KeyId,
+    key_id: KeyId,
     _stream_route: Option<StreamRouteId>,
-    _key: SecretAeadKey,
+    material: OpenedPairedKeyMaterial,
 }
 
 struct AuditedPairedMachine {
@@ -471,11 +538,63 @@ struct AuditedPairedMachine {
     device_command_binding: CounterBindingV1,
     marker: PairedCommitMarkerV1,
     _canonical_receipt_carrier: Vec<u8>,
-    _grant: RelayGrant,
-    _authorization: DeviceAuthorizationV1,
-    _device_signing_key: SigningKey,
+    grant: RelayGrant,
+    authorization: DeviceAuthorizationV1,
+    device_signing_key: SigningKey,
+    machine_data_verifying_key: VerifyingKey,
     _device_hpke_private_key: HpkePrivateKey,
-    _opened_directory_keys: Vec<OpenedPairedDirectoryKey>,
+    opened_directory_keys: Vec<OpenedPairedDirectoryKey>,
+}
+
+/// 已完成 canonical decode、header/AAD 绑定与 MachineDataSign 验证的 directed reply。
+/// 字段保持私有，只有 replay durable admission 后才能交回 paired machine 做 AEAD open。
+pub(crate) struct VerifiedDirectedReply {
+    verified: VerifiedSealedBlobV1,
+    context: OuterContextV1,
+    brand: DirectedReplyBrand,
+    counter: u64,
+    signed_blob_hash: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectedReplyBrand {
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+    key_id: KeyId,
+    key_epoch: u64,
+    directory_revision: u64,
+}
+
+fn validate_directed_reply_brand(
+    actual: DirectedReplyBrand,
+    expected: DirectedReplyBrand,
+) -> Result<(), PairedPromotionError> {
+    if actual != expected {
+        return Err(PairedPromotionError::Conflict);
+    }
+    Ok(())
+}
+
+impl VerifiedDirectedReply {
+    #[must_use]
+    pub(crate) const fn key_epoch(&self) -> u64 {
+        self.brand.key_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn directory_revision(&self) -> u64 {
+        self.brand.directory_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    #[must_use]
+    pub(crate) const fn signed_blob_hash(&self) -> [u8; 32] {
+        self.signed_blob_hash
+    }
 }
 
 impl AuditedPairedMachine {
@@ -561,16 +680,200 @@ impl OpenedPairedMachine<'_> {
     /// 只暴露已逐项 DeviceHPKE 解封成功的 key 数量，不返回 raw key。
     #[must_use]
     pub fn opened_key_count(&self) -> usize {
-        self.audited._opened_directory_keys.len()
+        self.audited.opened_directory_keys.len()
     }
 
     /// 查询完整审计后是否存在指定 purpose；不暴露 epoch、route 或 raw key。
     #[must_use]
     pub fn has_opened_key_purpose(&self, purpose: KeyPurpose) -> bool {
         self.audited
-            ._opened_directory_keys
+            .opened_directory_keys
             .iter()
-            .any(|key| key._key_id.purpose == purpose)
+            .any(|key| key.key_id.purpose == purpose)
+    }
+
+    /// 返回 runtime opaque fields 的 owned projection；不包含 KEK、traffic key 或 signing key。
+    #[must_use]
+    pub(crate) fn opaque_runtime_state(&self) -> OpaqueRuntimeState {
+        self.audited.state.opaque_runtime_state()
+    }
+
+    /// 当前 authenticated DeviceReplyTx replay scope；只暴露非秘密 epoch/revision。
+    pub(crate) fn directed_reply_scope(&self) -> Result<(u64, u64), PairedPromotionError> {
+        let reply_epoch =
+            self.audited
+                .opened_directory_keys
+                .iter()
+                .find_map(|entry| match &entry.material {
+                    OpenedPairedKeyMaterial::ReplyTx { key, .. } => Some(key.epoch),
+                    OpenedPairedKeyMaterial::CommandTx(_)
+                    | OpenedPairedKeyMaterial::Other { .. } => None,
+                })
+                .ok_or(PairedPromotionError::InvalidState)?;
+        Ok((reply_epoch, self.audited.directory_revision.value()))
+    }
+
+    /// 使用审计后的 DeviceCommandTx + DeviceSign capability 封装唯一允许的 prompt 请求。
+    /// reservation 按值消费并与当前 authenticated state exact 对照，调用方不能传裸 counter。
+    pub(crate) fn seal_runtime_prompt(
+        &self,
+        request_route: RequestRouteId,
+        message_id: MessageId,
+        request: SendPromptRequest,
+        reservation: CommandCounterReservation,
+    ) -> Result<Vec<u8>, PairedPromotionError> {
+        if self.audited.grant.machine_route != self.audited.identity.machine_route
+            || self.audited.grant.device_route != self.audited.device_route
+            || self.audited.grant.grant_serial != self.audited.grant_serial
+            || self.audited.authorization.machine_route != self.audited.identity.machine_route
+            || self.audited.authorization.device_route != self.audited.device_route
+            || self.audited.authorization.grant_serial != self.audited.grant_serial
+            || !self
+                .audited
+                .authorization
+                .capabilities
+                .contains(&AuthorizationCapabilityV1::Prompt)
+            || !self
+                .audited
+                .authorization
+                .permissions
+                .contains(&AuthorizationPermissionV1::PromptSend)
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        validate_current_prompt_reservation(
+            self.audited.state.counter_reservation(),
+            &reservation,
+        )?;
+        let command_key =
+            self.audited
+                .opened_directory_keys
+                .iter()
+                .find_map(|entry| match &entry.material {
+                    OpenedPairedKeyMaterial::CommandTx(key) => Some(key),
+                    OpenedPairedKeyMaterial::ReplyTx { .. }
+                    | OpenedPairedKeyMaterial::Other { .. } => None,
+                })
+                .ok_or(PairedPromotionError::InvalidState)?;
+        let envelope = RuntimeEnvelope {
+            version: RUNTIME_PROTOCOL_VERSION,
+            message_id,
+            body: RuntimeMessage::Request(RuntimeRequest::SendPrompt(request)),
+        };
+        let plaintext = envelope
+            .to_json_bytes_checked()
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        let context = OuterContextV1::uplink_send(
+            self.audited.identity.machine_route,
+            self.audited.device_route,
+            request_route,
+            command_key.epoch,
+        );
+        let unsigned = seal_symmetric(
+            command_key,
+            &context,
+            SealedPayloadKind::CommandRequest,
+            &plaintext,
+            SenderCounter(reservation.start()),
+        )
+        .map_err(PairedPromotionError::Crypto)?;
+        Ok(sign_sealed(unsigned, &self.audited.device_signing_key, &context).to_wire_bytes())
+    }
+
+    /// 在 replay state 之前完成 outer-correlated reply 的 canonical/header/AAD/signature 验证。
+    pub(crate) fn verify_directed_reply(
+        &self,
+        request_route: RequestRouteId,
+        sealed_blob: &[u8],
+    ) -> Result<VerifiedDirectedReply, PairedPromotionError> {
+        let reply =
+            self.audited
+                .opened_directory_keys
+                .iter()
+                .find_map(|entry| match &entry.material {
+                    OpenedPairedKeyMaterial::ReplyTx { key, nonce_prefix } => {
+                        Some((key, *nonce_prefix))
+                    }
+                    OpenedPairedKeyMaterial::CommandTx(_)
+                    | OpenedPairedKeyMaterial::Other { .. } => None,
+                })
+                .ok_or(PairedPromotionError::InvalidState)?;
+        let signed = SignedSealedBlobV1::from_wire_bytes(sealed_blob)
+            .map_err(|error| PairedPromotionError::Crypto(error.into()))?;
+        let expected_revision = self.audited.directory_revision.value();
+        if signed.inner.key_id != reply.0.key_id
+            || signed.inner.key_epoch != reply.0.epoch
+            || signed.inner.key_directory_revision != expected_revision
+            || signed.inner.nonce[..4] != reply.1
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let context = OuterContextV1::directed_reply(
+            self.audited.identity.machine_route,
+            self.audited.device_route,
+            request_route,
+            reply.0.epoch,
+        );
+        let counter = u64::from_be_bytes(
+            signed.inner.nonce[4..]
+                .try_into()
+                .map_err(|_| PairedPromotionError::InvalidState)?,
+        );
+        let signed_blob_hash = sha256(sealed_blob);
+        let verified = verify_sealed(signed, &self.audited.machine_data_verifying_key, &context)
+            .map_err(PairedPromotionError::Crypto)?;
+        Ok(VerifiedDirectedReply {
+            verified,
+            context,
+            brand: DirectedReplyBrand {
+                machine_route: self.audited.identity.machine_route,
+                device_route: self.audited.device_route,
+                key_id: reply.0.key_id,
+                key_epoch: reply.0.epoch,
+                directory_revision: expected_revision,
+            },
+            counter,
+            signed_blob_hash,
+        })
+    }
+
+    /// 只接受上一步产生的 verified candidate；runtime 必须先 durable admit replay tuple。
+    pub(crate) fn open_verified_directed_reply(
+        &self,
+        candidate: VerifiedDirectedReply,
+    ) -> Result<SealedPayloadV1, PairedPromotionError> {
+        let reply_key =
+            self.audited
+                .opened_directory_keys
+                .iter()
+                .find_map(|entry| match &entry.material {
+                    OpenedPairedKeyMaterial::ReplyTx { key, .. } => Some(key),
+                    OpenedPairedKeyMaterial::CommandTx(_)
+                    | OpenedPairedKeyMaterial::Other { .. } => None,
+                })
+                .ok_or(PairedPromotionError::InvalidState)?;
+        let expected_context = OuterContextV1::directed_reply(
+            self.audited.identity.machine_route,
+            self.audited.device_route,
+            candidate
+                .context
+                .request_route
+                .ok_or(PairedPromotionError::InvalidState)?,
+            reply_key.epoch,
+        );
+        let expected_brand = DirectedReplyBrand {
+            machine_route: self.audited.identity.machine_route,
+            device_route: self.audited.device_route,
+            key_id: reply_key.key_id,
+            key_epoch: reply_key.epoch,
+            directory_revision: self.audited.directory_revision.value(),
+        };
+        validate_directed_reply_brand(candidate.brand, expected_brand)?;
+        if candidate.context != expected_context {
+            return Err(PairedPromotionError::Conflict);
+        }
+        open_sealed_payload(reply_key, &candidate.context, candidate.verified)
+            .map_err(PairedPromotionError::Crypto)
     }
 
     /// 仅供 automatic crash harness 读回非生产 state-mutation 探针。
@@ -1257,11 +1560,12 @@ impl<'a> PairedMachineStore<'a> {
             counter_guard,
             device_command_binding: audit.device_command_binding,
             marker,
-            _grant: audit.grant,
-            _authorization: audit.authorization,
-            _device_signing_key: audit.device_signing_key,
+            grant: audit.grant,
+            authorization: audit.authorization,
+            device_signing_key: audit.device_signing_key,
+            machine_data_verifying_key: audit.machine_data_verifying_key,
             _device_hpke_private_key: audit.device_hpke_private_key,
-            _opened_directory_keys: audit.opened_keys,
+            opened_directory_keys: audit.opened_keys,
         })
     }
 
@@ -1921,6 +2225,7 @@ struct StateAudit {
 
 struct DurableStateAudit {
     device_signing_key: SigningKey,
+    machine_data_verifying_key: VerifyingKey,
     device_hpke_private_key: HpkePrivateKey,
     grant: RelayGrant,
     authorization: DeviceAuthorizationV1,
@@ -2105,6 +2410,7 @@ fn audit_durable_state(
 
     let mut slots = HashSet::with_capacity(directory.entries.len());
     let mut command_binding = None;
+    let mut reply_key_seen = false;
     let mut opened_keys = Vec::with_capacity(directory.entries.len());
     for entry in &directory.entries {
         if !slots.insert((entry.key_id.purpose, entry.stream_route)) {
@@ -2138,16 +2444,45 @@ fn audit_durable_state(
                 key_epoch: entry.key_id.epoch,
                 nonce_prefix: agentdeck_crypto::derive_nonce_prefix(&key),
             });
+        } else if entry.key_id.purpose == KeyPurpose::DeviceReplyTx {
+            if entry.stream_route.is_some() || reply_key_seen {
+                return Err(PairedPromotionError::InvalidState);
+            }
+            reply_key_seen = true;
         }
+        let material = match entry.key_id.purpose {
+            KeyPurpose::DeviceCommandTx => {
+                OpenedPairedKeyMaterial::CommandTx(AeadSendingKey::with_derived_nonce_prefix(
+                    entry.key_id,
+                    entry.key_id.epoch,
+                    directory.revision.value(),
+                    key,
+                ))
+            }
+            KeyPurpose::DeviceReplyTx => {
+                let nonce_prefix = agentdeck_crypto::derive_nonce_prefix(&key);
+                OpenedPairedKeyMaterial::ReplyTx {
+                    key: AeadReceivingKey::new(entry.key_id, entry.key_id.epoch, key),
+                    nonce_prefix,
+                }
+            }
+            KeyPurpose::Catalog | KeyPurpose::ConversationDek => {
+                OpenedPairedKeyMaterial::Other { _key: key }
+            }
+        };
         opened_keys.push(OpenedPairedDirectoryKey {
-            _key_id: entry.key_id,
+            key_id: entry.key_id,
             _stream_route: entry.stream_route,
-            _key: key,
+            material,
         });
+    }
+    if !reply_key_seen {
+        return Err(PairedPromotionError::InvalidState);
     }
 
     Ok(DurableStateAudit {
         device_signing_key: signing_key,
+        machine_data_verifying_key: data_verifier,
         device_hpke_private_key: hpke_private,
         grant,
         authorization,
@@ -3871,6 +4206,50 @@ mod counter_reservation_tests {
     use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
 
     use super::*;
+
+    fn reservation(id: u8, start: u64) -> CommandCounterReservation {
+        CommandCounterReservation {
+            reservation_id: [id; 16],
+            start,
+            end_exclusive: start + COUNTER_BLOCK_SIZE,
+        }
+    }
+
+    #[test]
+    fn old_prompt_reservation_cannot_seal_after_current_state_advances() {
+        let old = reservation(0x11, 0);
+        let current = reservation(0x22, COUNTER_BLOCK_SIZE);
+
+        assert!(matches!(
+            validate_current_prompt_reservation(Some(&current), &old),
+            Err(PairedPromotionError::Conflict)
+        ));
+        validate_current_prompt_reservation(Some(&current), &current)
+            .expect("exact authenticated current reservation remains usable once");
+    }
+
+    #[test]
+    fn directed_reply_brand_rejects_cross_machine_candidate() {
+        let expected = DirectedReplyBrand {
+            machine_route: MachineRouteId::from_bytes([0x11; 16]),
+            device_route: DeviceRouteId::from_bytes([0x22; 16]),
+            key_id: KeyId {
+                purpose: KeyPurpose::DeviceReplyTx,
+                epoch: 7,
+            },
+            key_epoch: 7,
+            directory_revision: 4,
+        };
+        let other_machine = DirectedReplyBrand {
+            machine_route: MachineRouteId::from_bytes([0x33; 16]),
+            ..expected
+        };
+
+        assert!(matches!(
+            validate_directed_reply_brand(other_machine, expected),
+            Err(PairedPromotionError::Conflict)
+        ));
+    }
 
     struct CountingRng {
         fill_calls: usize,
