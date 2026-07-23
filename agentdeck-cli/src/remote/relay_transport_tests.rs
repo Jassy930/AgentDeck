@@ -1,11 +1,15 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agentdeck_crypto::{SignatureBytes, SigningKey, verify_authentication_transcript};
 use agentdeck_protocol::relay_v2::auth::{
-    AuthenticationRole, AuthenticationTranscriptV1, Ed25519Signature, PublicKeyBytes, RelayGrant,
+    AuthenticationRole, AuthenticationTranscriptV1, DeviceRevocation, Ed25519Signature,
+    PublicKeyBytes, RelayGrant,
 };
-use agentdeck_protocol::relay_v2::frame::{AuthProof, Challenge, Hello};
+use agentdeck_protocol::relay_v2::frame::{
+    AuthProof, Challenge, Hello, RetirementCommitted, RevocationCommitted,
+};
 use agentdeck_protocol::relay_v2::id::{
     ConnectionInstanceId, DeviceRouteId, GrantSerial, MachineRouteId, RelayServerId, RootKeyId,
     TrustEpoch,
@@ -16,8 +20,13 @@ use agentdeck_protocol::relay_v2::{
 use agentdeck_relay_client::RelayClientError;
 use async_trait::async_trait;
 
-use super::paired_machine::{device_authenticator_for_test, paired_spki_pins};
-use super::relay_transport::{RelayRuntimeIo, RelayRuntimeTransport};
+use super::paired_machine::{
+    PairedPromotionError, device_authenticator_for_test, paired_spki_pins,
+};
+use super::relay_transport::{
+    PairedRuntimeConnectError, PairedRuntimeHandle, RelayRuntimeConnectCompletion, RelayRuntimeIo,
+    RelayRuntimeTransport, complete_paired_runtime_connect,
+};
 use super::runtime::{
     ExactRelayFrame, ReceivedRuntimeFrame, RemoteRuntimeTransport, RemoteRuntimeTransportError,
 };
@@ -231,4 +240,252 @@ async fn relay_runtime_adapter_preserves_typed_authentication_terminal() {
         relay.authentication_terminal_bytes(),
         Some(terminal_bytes.as_slice())
     );
+}
+
+#[derive(Default)]
+struct ConnectState {
+    verifies: AtomicUsize,
+    cleanups: AtomicUsize,
+    connected: AtomicUsize,
+}
+
+struct FakePairedRuntimeHandle {
+    state: Arc<ConnectState>,
+    connector_dropped: Arc<AtomicBool>,
+    expected_frame: OpaqueRouteFrame,
+    expected_bytes: Vec<u8>,
+}
+
+struct FakeVerifiedRevocation;
+
+impl PairedRuntimeHandle for FakePairedRuntimeHandle {
+    type Connected = Arc<ConnectState>;
+    type VerifiedRevocation = FakeVerifiedRevocation;
+
+    fn verify_revocation_terminal(
+        &self,
+        frame: &OpaqueRouteFrame,
+        canonical_bytes: &[u8],
+    ) -> Result<Self::VerifiedRevocation, PairedPromotionError> {
+        self.state.verifies.fetch_add(1, Ordering::SeqCst);
+        if frame != &self.expected_frame || canonical_bytes != self.expected_bytes {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(FakeVerifiedRevocation)
+    }
+
+    fn into_connected(self, transport: RelayRuntimeTransport) -> Self::Connected {
+        self.state.connected.fetch_add(1, Ordering::SeqCst);
+        drop(transport);
+        self.state
+    }
+
+    fn commit_revocation_cleanup(
+        self,
+        _verified: Self::VerifiedRevocation,
+    ) -> Result<(), PairedPromotionError> {
+        assert!(
+            self.connector_dropped.load(Ordering::SeqCst),
+            "connector/socket must be gone before cleanup can make its journal durable"
+        );
+        self.state.cleanups.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct ConnectorDropGuard(Arc<AtomicBool>);
+
+impl Drop for ConnectorDropGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+fn connect_fixture(
+    expected_frame: OpaqueRouteFrame,
+) -> (FakePairedRuntimeHandle, Arc<ConnectState>, Arc<AtomicBool>) {
+    let state = Arc::new(ConnectState::default());
+    let connector_dropped = Arc::new(AtomicBool::new(false));
+    let expected_bytes = encode(&expected_frame);
+    (
+        FakePairedRuntimeHandle {
+            state: Arc::clone(&state),
+            connector_dropped: Arc::clone(&connector_dropped),
+            expected_frame,
+            expected_bytes,
+        },
+        state,
+        connector_dropped,
+    )
+}
+
+async fn authentication_terminal_after_connector_drop(
+    connector_dropped: Arc<AtomicBool>,
+    frame: OpaqueRouteFrame,
+    canonical_bytes: Vec<u8>,
+) -> Result<RelayRuntimeTransport, RelayClientError> {
+    let _socket = ConnectorDropGuard(connector_dropped);
+    Err(RelayClientError::AuthenticationTerminal {
+        frame: Box::new(frame),
+        canonical_bytes: Arc::from(canonical_bytes),
+    })
+}
+
+fn revocation_terminal() -> OpaqueRouteFrame {
+    let signed_revocation = DeviceRevocation {
+        machine_route: MACHINE,
+        device_route: DEVICE,
+        grant_serial: GrantSerial::new(17),
+        root_key_id: RootKeyId::from_bytes([0x44; 16]),
+        trust_epoch: TrustEpoch::new(9),
+        signature: Ed25519Signature([0x55; 64]),
+    };
+    OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::RevocationCommitted(RevocationCommitted {
+            device_route: DEVICE,
+            grant_serial: GrantSerial::new(17),
+            signed_revocation,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn paired_runtime_connect_returns_a_typed_connected_outcome() {
+    let expected = revocation_terminal();
+    let (machine, state, _) = connect_fixture(expected);
+    let transport = RelayRuntimeTransport::from_test_connector(FakeRelayIo {
+        state: Arc::new(Mutex::new(IoState::default())),
+        inbound: VecDeque::new(),
+    });
+
+    let outcome = complete_paired_runtime_connect(machine, async { Ok(transport) })
+        .await
+        .expect("ordinary authenticated connection");
+
+    let RelayRuntimeConnectCompletion::Connected(connected_state) = outcome else {
+        panic!("ordinary authentication must return Connected");
+    };
+    assert!(Arc::ptr_eq(&connected_state, &state));
+    assert_eq!(state.connected.load(Ordering::SeqCst), 1);
+    assert_eq!(state.verifies.load(Ordering::SeqCst), 0);
+    assert_eq!(state.cleanups.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn paired_runtime_connect_keeps_non_terminal_relay_failures_typed() {
+    let expected = revocation_terminal();
+    let (machine, state, _) = connect_fixture(expected);
+    let error = complete_paired_runtime_connect(machine, async {
+        Err(RelayClientError::Failure {
+            code: "relay.client.handshake_rejected".to_owned(),
+        })
+    })
+    .await
+    .expect_err("ordinary Relay failure");
+
+    assert!(matches!(error, PairedRuntimeConnectError::Relay(_)));
+    assert_eq!(state.connected.load(Ordering::SeqCst), 0);
+    assert_eq!(state.verifies.load(Ordering::SeqCst), 0);
+    assert_eq!(state.cleanups.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn exact_revocation_terminal_cleans_up_only_after_connector_drop() {
+    let terminal = revocation_terminal();
+    let terminal_bytes = encode(&terminal);
+    let (machine, state, connector_dropped) = connect_fixture(terminal.clone());
+
+    let outcome = complete_paired_runtime_connect(
+        machine,
+        authentication_terminal_after_connector_drop(
+            Arc::clone(&connector_dropped),
+            terminal,
+            terminal_bytes,
+        ),
+    )
+    .await
+    .expect("exact verified revocation terminal");
+
+    assert!(matches!(outcome, RelayRuntimeConnectCompletion::Revoked));
+    assert!(connector_dropped.load(Ordering::SeqCst));
+    assert_eq!(state.connected.load(Ordering::SeqCst), 0);
+    assert_eq!(state.verifies.load(Ordering::SeqCst), 1);
+    assert_eq!(state.cleanups.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn non_revocation_or_non_exact_authentication_terminals_never_cleanup() {
+    let valid = revocation_terminal();
+    let valid_bytes = encode(&valid);
+    let mut cases = Vec::new();
+
+    cases.push((
+        "retirement terminal",
+        OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::RetirementCommitted(RetirementCommitted {
+                machine_route: MACHINE,
+                trust_epoch: TrustEpoch::new(9),
+                retire_hash: [0x70; 32],
+            }),
+        },
+        None,
+    ));
+
+    let mut forged_signature = valid.clone();
+    let RelayFrameBody::RevocationCommitted(committed) = &mut forged_signature.body else {
+        unreachable!()
+    };
+    committed.signed_revocation.signature.0[0] ^= 0x80;
+    cases.push(("forged signature", forged_signature, None));
+
+    let mut wrong_device = valid.clone();
+    let RelayFrameBody::RevocationCommitted(committed) = &mut wrong_device.body else {
+        unreachable!()
+    };
+    committed.device_route = DeviceRouteId::from_bytes([0x90; 16]);
+    cases.push(("wrong device", wrong_device, None));
+
+    let mut wrong_grant = valid.clone();
+    let RelayFrameBody::RevocationCommitted(committed) = &mut wrong_grant.body else {
+        unreachable!()
+    };
+    committed.grant_serial = GrantSerial::new(18);
+    cases.push(("wrong grant", wrong_grant, None));
+
+    let mut wrong_binding = valid.clone();
+    let RelayFrameBody::RevocationCommitted(committed) = &mut wrong_binding.body else {
+        unreachable!()
+    };
+    committed.signed_revocation.machine_route = MachineRouteId::from_bytes([0x91; 16]);
+    cases.push(("wrong signed binding", wrong_binding, None));
+
+    let mut non_exact_bytes = valid_bytes.clone();
+    non_exact_bytes.push(0);
+    cases.push(("non-exact bytes", valid.clone(), Some(non_exact_bytes)));
+
+    for (label, frame, byte_override) in cases {
+        let (machine, state, connector_dropped) = connect_fixture(valid.clone());
+        let bytes = byte_override.unwrap_or_else(|| encode(&frame));
+        let error = complete_paired_runtime_connect(
+            machine,
+            authentication_terminal_after_connector_drop(
+                Arc::clone(&connector_dropped),
+                frame,
+                bytes,
+            ),
+        )
+        .await
+        .expect_err(label);
+
+        assert!(
+            matches!(error, PairedRuntimeConnectError::Paired(_)),
+            "{label}: terminal verification failure must remain a paired-state error"
+        );
+        assert!(connector_dropped.load(Ordering::SeqCst), "{label}");
+        assert_eq!(state.connected.load(Ordering::SeqCst), 0, "{label}");
+        assert_eq!(state.verifies.load(Ordering::SeqCst), 1, "{label}");
+        assert_eq!(state.cleanups.load(Ordering::SeqCst), 0, "{label}");
+    }
 }
