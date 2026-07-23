@@ -1541,6 +1541,46 @@ async fn pair_data_is_bidirectional_target_first_and_backpressure_closes_only_th
 }
 
 #[tokio::test]
+async fn machine_close_delivers_terminal_ack_to_the_bound_pairing_requester() {
+    let mut fixture = Fixture::new().await;
+    let machine_route = fixture.realms[0].machine_route;
+    let route = pair_route(22);
+    let mut machine = fixture.connect_machine(0).await;
+    assert_applied(
+        fixture
+            .core
+            .handle(
+                &machine.access,
+                open_pair_frame(machine_route, route, NOW_MS + PAIR_TTL_MS),
+            )
+            .await
+            .expect("open route for machine terminal ACK"),
+    );
+    assert_opened(&mut machine, machine_route, route, NOW_MS + PAIR_TTL_MS).await;
+    let mut pairing = fixture
+        .connect_pairing(route, OutboundWriterConfig::default())
+        .await;
+
+    assert_applied(
+        fixture
+            .core
+            .handle(&machine.access, close_pair_frame(machine_route, route))
+            .await
+            .expect("machine closes route after durable pairing receipt"),
+    );
+    assert_closed_ack(&mut machine, route, PairRouteCloseOutcome::Closed).await;
+    assert_closed_ack(&mut pairing, route, PairRouteCloseOutcome::Closed).await;
+
+    let stale = fixture
+        .core
+        .handle(&pairing.access, pair_data_frame(route, vec![0x22]))
+        .await
+        .expect_err("terminal ACK cannot leave the pairing route usable");
+    assert_eq!(stale.code, RELAY_ROUTE_NOT_FOUND);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn pair_route_close_and_expiry_races_are_actor_serialized() {
     let mut close_race = Fixture::new().await;
     let machine_route = close_race.realms[0].machine_route;
@@ -1582,6 +1622,12 @@ async fn pair_route_close_and_expiry_races_are_actor_serialized() {
     assert_applied(pairing_close.expect("detached pairing close retry is idempotent"));
     assert_closed_ack(
         &mut machine,
+        machine_first_route,
+        PairRouteCloseOutcome::Closed,
+    )
+    .await;
+    assert_closed_ack(
+        &mut pairing,
         machine_first_route,
         PairRouteCloseOutcome::Closed,
     )

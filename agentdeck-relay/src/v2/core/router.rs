@@ -1197,15 +1197,29 @@ impl RelayCoreActor {
             }
             AccessContext::Device(_) => return Err(forbidden()),
         };
-        // Machine 关闭时对端只解绑、不立即清空 writer；Pairing 自己关闭时也必须先把
-        // PairRouteClosed 放入 FIFO。后续数据面会因 route 已 tombstone 而 fail-closed。
-        let _detached_pairing = closed.detached_pairing;
-        let Some(writer) = writer else {
-            return Ok(RouteOutcome::Closed);
-        };
+        // Machine 关闭通常是 daemon durable 接收 PairResponseReceived 后的 terminal ACK。
+        // route registry 已冻结 exact pairing connection；先把同一 PairRouteClosed 放入对端
+        // control FIFO，再保持 route tombstone，使 requester 能区分 durable success 与
+        // expiry/transport EOF。Pairing 自己关闭时 origin 与 detached id 相同，不能重复入队。
+        let pair_route = closed.frame.pair_route;
         let outbound = OpaqueRouteFrame {
             version: RELAY_PROTOCOL_VERSION,
             body: RelayFrameBody::PairRouteClosed(closed.frame),
+        };
+        if let Some(pairing_connection) = closed
+            .detached_pairing
+            .filter(|connection| *connection != access.connection_instance())
+            && let Some(pairing_writer) = self
+                .connections
+                .pairing_writer_for(pairing_connection, pair_route)
+            && pairing_writer
+                .try_enqueue_control(outbound.clone())
+                .is_err()
+        {
+            self.close_connection(pairing_connection, WriterCloseReason::CriticalBackpressure);
+        }
+        let Some(writer) = writer else {
+            return Ok(RouteOutcome::Closed);
         };
         let queued = match access {
             AccessContext::Machine(_) => self.enqueue_if_current(

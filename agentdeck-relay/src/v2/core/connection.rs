@@ -7,8 +7,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use agentdeck_protocol::relay_v2::{
-    ConnectionInstanceId, MachineRouteId, OpaqueRouteFrame, StreamCursor, StreamGenerationId,
-    StreamRouteId, encode,
+    ConnectionInstanceId, MachineRouteId, OpaqueRouteFrame, PairRouteId, StreamCursor,
+    StreamGenerationId, StreamRouteId, encode,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -414,6 +414,29 @@ impl ConnectionRegistry {
         self.entries
             .get(&access.connection_instance())
             .filter(|entry| entry.terminal.is_none() && entry.access.as_ref() == Some(access))
+            .map(|entry| entry.writer.clone())
+    }
+
+    /// 返回 actor 已确认且仍绑定 exact route 的 pairing writer。
+    ///
+    /// 仅供 route registry 已经给出 exact connection id + pair route 的 terminal fan-out；
+    /// 普通业务路由仍必须使用 [`Self::writer_for`] 复核完整 `AccessContext`。
+    pub(crate) fn pairing_writer_for(
+        &self,
+        connection: ConnectionInstanceId,
+        pair_route: PairRouteId,
+    ) -> Option<WriterHandle> {
+        self.entries
+            .get(&connection)
+            .filter(|entry| {
+                entry.terminal.is_none()
+                    && matches!(
+                        entry.access.as_ref(),
+                        Some(AccessContext::Pairing(pairing))
+                            if pairing.connection_instance == connection
+                                && pairing.pair_route == pair_route
+                    )
+            })
             .map(|entry| entry.writer.clone())
     }
 
