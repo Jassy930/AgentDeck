@@ -8,18 +8,20 @@
 | 版本轴 | 版本常量 | 快照文件 | 聚合 schema 函数 | CLI 导出命令 | 重生成命令 |
 | --- | --- | --- | --- | --- | --- |
 | 本地 IPC（CLI/Swift ⇄ daemon） | `agentdeck_protocol::PROTOCOL_VERSION` = 2 | `agentdeck-protocol.schema.json` | `agentdeck_protocol::protocol_schema()` | `agentdeck protocol schema` | `UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` |
-| Runtime（本机 UDS 与 RemoteLink 解密后的共同业务 wire） | `agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION` = 4 | `runtime-protocol.schema.json` | `agentdeck_protocol::runtime::runtime_schema()` | `agentdeck protocol runtime-schema` | `UPDATE_RUNTIME_SCHEMA=1 cargo test -p agentdeck-protocol runtime_schema_matches_committed_snapshot` |
+| Runtime（本机 UDS 与 RemoteLink 解密后的共同业务 wire） | `agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION` = 5 | `runtime-protocol.schema.json` | `agentdeck_protocol::runtime::runtime_schema()` | `agentdeck protocol runtime-schema` | `UPDATE_RUNTIME_SCHEMA=1 cargo test -p agentdeck-protocol runtime_schema_matches_committed_snapshot` |
 | Relay v2（endpoint ⇄ relay 外层可见字段） | `agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION` = 2 | `relay-v2.schema.json` | `agentdeck_protocol::relay_v2::relay_v2_schema()` | `agentdeck protocol relay-schema` | `UPDATE_RELAY_SCHEMA=1 cargo test -p agentdeck-protocol relay_v2_schema_matches_committed_snapshot` |
 | E2EE（endpoint 侧密文/签名契约） | `agentdeck_protocol::e2ee::E2EE_FORMAT_VERSION` = 1 | `e2ee-v1.schema.json` | `agentdeck_protocol::e2ee::e2ee_schema()` | `agentdeck protocol e2ee-schema` | `UPDATE_E2EE_SCHEMA=1 cargo test -p agentdeck-protocol e2ee_schema_matches_committed_snapshot` |
 
-Runtime v3 曾在 v2 中立契约上增加 P4.2 本机 machine enrollment/status/trust-reset 管理面；current
+Runtime v3 曾在 v2 中立契约上增加 P4.2 本机 machine enrollment/status/trust-reset 管理面；
 Runtime v4 又 additive 增加 P4.3 PairInvite、pending pairing、confirm/cancel 与 exact device revoke 的
-local-only administration。current Rust/Swift fixture 是 `runtime-v4-wire.jsonl`。冻结的
-`runtime-v1-wire.jsonl`、`runtime-v2-wire.jsonl` 与 `runtime-v3-wire.jsonl` 只作 compatibility 证据，不是 current Runtime
-contract gate。Runtime 版本提升不联动 local IPC v2、Relay v2 或 E2EE v1。
-P4.4 只在 Runtime v4 / Relay v2 / E2EE v1 上增加严格 decode、ingress 验证与 Core dispatch 接线；
+local-only administration。current Runtime v5 为 Catalog snapshot 增加 required-null
+`currentPageCursor`，与上一页 `nextPageCursor` 形成可验证的 exact page chain。current Rust/Swift
+fixture 是 `runtime-v5-wire.jsonl`。冻结的 `runtime-v1-wire.jsonl` 至 `runtime-v4-wire.jsonl` 只作
+compatibility 证据，不是 current Runtime contract gate。Runtime 版本提升不联动 local IPC v2、Relay v2
+或 E2EE v1。
+P4.4 只在当时的 Runtime v4 / Relay v2 / E2EE v1 上增加严格 decode、ingress 验证与 Core dispatch 接线；
 四条 schema 与版本常量均未变化。
-P4.5 在 E2EE v1 内 additive 扩展 key-control/publication contract 与 schema snapshot；Runtime v4、
+P4.5 在 E2EE v1 内 additive 扩展 key-control/publication contract 与 schema snapshot；当时的 Runtime v4、
 Relay v2、E2EE v1 的版本常量均不 bump。四个 wire 版本轴仍彼此独立，physical schema v14 只是
 daemon Runtime DB 的存储版本，不等于 Runtime wire 升版。
 

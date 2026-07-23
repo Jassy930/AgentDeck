@@ -35,7 +35,7 @@ const APPROVAL_ID: &str = "33333333-3333-4333-8333-333333333333";
 const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 const ZERO_DIAL_WINDOW: Duration = Duration::from_millis(150);
 const LEGACY_OVERRIDE_MESSAGE: &str =
-    "--data-dir is diagnostics-only and cannot override a Runtime v4 endpoint";
+    "--data-dir is diagnostics-only and cannot override a Runtime v5 endpoint";
 
 fn unix_now_ms() -> u64 {
     SystemTime::now()

@@ -1972,7 +1972,8 @@ final class SessionModel {
       .replyAfterSynchronizationTerminal,
       .synchronizationReplyLimitExceeded,
       .catalogPageLimitExceeded,
-      .catalogPageCursorCycle:
+      .catalogPageCursorCycle,
+      .catalogPageCursorMismatch:
       return .exactRequired
     }
   }
@@ -2012,7 +2013,8 @@ final class SessionModel {
       .unexpectedReply,
       .receiptConversationMismatch,
       .receiptApprovalMismatch,
-      .receiptConfigurationRevisionMismatch:
+      .receiptConfigurationRevisionMismatch,
+      .catalogPageCursorMismatch:
       return true
     case .notStarted,
       .alreadyStarted,

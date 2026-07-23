@@ -3,11 +3,12 @@ import XCTest
 @testable import AgentDeckCore
 
 final class RuntimeV2WireCodecTests: XCTestCase {
-  func testCurrentFacadeIsV4AndRejectsV1IngressAndEgress() throws {
+  func testCurrentFacadeIsV5AndRejectsV1IngressAndEgress() throws {
     XCTAssertEqual(runtimeProtocolVersionV2, 2)
     XCTAssertEqual(runtimeProtocolVersionV3, 3)
     XCTAssertEqual(runtimeProtocolVersionV4, 4)
-    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV4)
+    XCTAssertEqual(runtimeProtocolVersionV5, 5)
+    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV5)
     requireV2Codec(RuntimeWireCodec.self)
 
     let hello = try fixture(named: "requestHello")
@@ -75,7 +76,7 @@ final class RuntimeV2WireCodecTests: XCTestCase {
         let compactHex = try XCTUnwrap(compactFixture.value as? String)
         let compactInput = try Data(hex: compactHex)
         let carrier = try RuntimeWireCodec.decodeTransferCarrier(compactInput)
-        XCTAssertEqual(carrier.runtimeVersion, 4)
+        XCTAssertEqual(carrier.runtimeVersion, 5)
         XCTAssertEqual(try RuntimeWireCodec.encode(carrier), compactInput)
     }
 
@@ -372,7 +373,7 @@ final class RuntimeV2WireCodecTests: XCTestCase {
             "Sources/AgentDeckCore/Protocol/RuntimeV2StreamTypes.swift",
             "Sources/AgentDeckCore/Protocol/RuntimeV2WireCodec.swift",
             "protocol/agentdeck/runtime-protocol.schema.json",
-            "protocol/agentdeck/fixtures/runtime-v4-wire.jsonl",
+            "protocol/agentdeck/fixtures/runtime-v5-wire.jsonl",
         ]
         for relativePath in noPrivateHandleFiles {
             let source = try String(
@@ -568,7 +569,7 @@ final class RuntimeV2WireCodecTests: XCTestCase {
 
     private func loadFixtures() throws -> [Fixture] {
         let data = try Data(contentsOf: repositoryRoot
-            .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v4-wire.jsonl"))
+            .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v5-wire.jsonl"))
         let text = try XCTUnwrap(String(data: data, encoding: .utf8))
         return try text.split(separator: "\n").map { line in
             let object = try XCTUnwrap(

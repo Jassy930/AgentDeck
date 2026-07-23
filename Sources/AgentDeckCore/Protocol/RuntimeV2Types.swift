@@ -1,6 +1,6 @@
 import Foundation
 
-// Runtime v4 current DTO 保留 V2 类型名以维持源码兼容。稳定且 wire 未变化的 leaf 继续复用
+// Runtime v5 current DTO 保留 V2 类型名以维持源码兼容。稳定且 wire 未变化的 leaf 继续复用
 // RuntimeWireTypes.swift；本文件提供严格的 configuration/metadata/upgrade/receipt/machine mirror。
 
 public enum RuntimeV2MirrorError: Error, Equatable, Sendable {
@@ -43,7 +43,7 @@ func runtimeV2RejectUnknownKeys(_ decoder: Decoder, allowed: Set<String>) throws
         throw DecodingError.dataCorruptedError(
             forKey: unknown,
             in: container,
-            debugDescription: "unknown Runtime v4 field \(unknown.stringValue)"
+            debugDescription: "unknown Runtime v5 field \(unknown.stringValue)"
         )
     }
 }
@@ -90,7 +90,7 @@ func runtimeV2ValidateDiscriminator(
         throw DecodingError.dataCorruptedError(
             forKey: runtimeV2Key(key),
             in: container,
-            debugDescription: "unexpected Runtime v4 discriminator \(received)"
+            debugDescription: "unexpected Runtime v5 discriminator \(received)"
         )
     }
 }
@@ -1763,7 +1763,7 @@ public enum RuntimePairingReceiptV4: Codable, Sendable {
       throw DecodingError.dataCorruptedError(
         forKey: runtimeV2Key("status"),
         in: container,
-        debugDescription: "unsupported Runtime v4 pairing status \(status)"
+        debugDescription: "unsupported Runtime v5 pairing status \(status)"
       )
     }
   }

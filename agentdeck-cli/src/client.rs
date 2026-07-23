@@ -1,4 +1,4 @@
-//! CLI binary 的 shared-daemon Runtime v4 connector。
+//! CLI binary 的 shared-daemon Runtime v5 connector。
 //!
 //! Production 只调用 `RuntimeUnixClient::connect_stable()`；没有 daemon spawn、stdio
 //! 或 diagnostics fallback。Debug smoke 只有一个 hidden private-TMPDIR root seam：它

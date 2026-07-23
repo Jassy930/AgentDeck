@@ -804,6 +804,7 @@ fn history_and_metadata_commands_keep_canonical_request_shapes() {
                         entry_revision: 4,
                     }],
                     None,
+                    None,
                 )
                 .unwrap(),
             ),

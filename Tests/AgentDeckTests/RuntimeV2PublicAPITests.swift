@@ -7,7 +7,8 @@ final class RuntimeV2PublicAPITests: XCTestCase {
     XCTAssertEqual(runtimeProtocolVersionV2, 2)
     XCTAssertEqual(runtimeProtocolVersionV3, 3)
     XCTAssertEqual(runtimeProtocolVersionV4, 4)
-    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV4)
+    XCTAssertEqual(runtimeProtocolVersionV5, 5)
+    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV5)
 
     let carrier = try RuntimeTransferCarrierV2(
       messageID: RuntimeMessageID(rawValue: "public-message"),

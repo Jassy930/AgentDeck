@@ -1,4 +1,4 @@
-//! local Runtime v4 JSONL framing 与首帧判定。
+//! local Runtime v5 JSONL framing 与首帧判定。
 //!
 //! 威胁场景：未认证客户端可发送超长、重复字段或版本不兼容的 JSON，诱发无界内存、
 //! 请求歧义，或让 daemon 在无法解释消息体时静默断线；本层先做有界读取与严格顶层
@@ -166,7 +166,7 @@ pub(crate) fn probe_runtime_header(
 /// local reader 对一条 Runtime frame 的无歧义处理决策。
 #[derive(Debug)]
 pub(crate) enum RuntimeFrameDecision {
-    /// 完整 Runtime v4 envelope，可交给 Core。
+    /// 完整 Runtime v5 envelope，可交给 Core。
     Accept(RuntimeEnvelope),
     /// 写出类型化回复、flush 后关闭当前连接。
     ReplyThenClose(RuntimeEnvelope),
@@ -174,7 +174,7 @@ pub(crate) enum RuntimeFrameDecision {
     Close,
 }
 
-/// 顶层探测后完整解码 Runtime v4；错误版本返回同 messageId 的类型化失败。
+/// 顶层探测后完整解码 Runtime v5；错误版本返回同 messageId 的类型化失败。
 pub(crate) fn decode_runtime_frame(frame: &[u8]) -> RuntimeFrameDecision {
     if frame.len() >= MAX_RUNTIME_JSON_FRAME_BYTES {
         return RuntimeFrameDecision::Close;

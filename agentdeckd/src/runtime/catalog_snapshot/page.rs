@@ -1,21 +1,21 @@
 //! 已排序 frozen baseline 的 page 切片与 DTO 构造。
 
 use agentdeck_protocol::runtime::catalog::{CatalogSnapshot, MAX_CATALOG_PAGE_ROWS};
+use agentdeck_protocol::runtime::identity::CatalogPageCursor;
 use agentdeck_protocol::runtime::{ConversationEntry, StreamCursor};
 
 use super::cache::actual_page_retained_bound;
 use super::cursor::{CursorClaims, CursorMacKey, encode_cursor};
-use super::{CatalogPageReference, CatalogSnapshotProviderError};
+use super::{CatalogPageReference, CatalogSnapshotProviderError, PageIssue};
 use crate::runtime::store::{ReadySnapshotReference, StoredCatalogSnapshot};
 
 pub(super) fn construct_page(
     cursor_key: &CursorMacKey,
     reference: &CatalogPageReference,
     selected: &[ConversationEntry],
+    current_page_cursor: Option<CatalogPageCursor>,
     has_more: bool,
-    issued_at_ms: u64,
-    expires_at_ms: u64,
-    binding: [u8; 32],
+    issue: PageIssue,
 ) -> Result<(CatalogSnapshot, Vec<u8>, usize), CatalogSnapshotProviderError> {
     let page_entries = selected.to_vec();
     let next_page_cursor = if has_more {
@@ -30,18 +30,29 @@ pub(super) fn construct_page(
             &CursorClaims {
                 reference: reference.clone(),
                 next_key,
-                issued_at_ms,
-                expires_at_ms,
-                principal_binding: binding,
+                issued_at_ms: issue.issued_at_ms,
+                expires_at_ms: issue.expires_at_ms,
+                principal_binding: issue.binding,
             },
         )?)
     } else {
         None
     };
-    let cursor_bytes = next_page_cursor
+    let cursor_bytes = current_page_cursor
         .as_ref()
-        .map_or(0, |value| value.as_str().len());
-    let snapshot = CatalogSnapshot::new(reference.snapshot.base, page_entries, next_page_cursor)?;
+        .map_or(0, |value| value.as_str().len())
+        .checked_add(
+            next_page_cursor
+                .as_ref()
+                .map_or(0, |value| value.as_str().len()),
+        )
+        .ok_or(CatalogSnapshotProviderError::MemoryBudgetExceeded)?;
+    let snapshot = CatalogSnapshot::new(
+        reference.snapshot.base,
+        page_entries,
+        current_page_cursor,
+        next_page_cursor,
+    )?;
     let payload =
         serde_json::to_vec(&snapshot).map_err(|_| CatalogSnapshotProviderError::InvalidCursor)?;
     let page_bytes =

@@ -65,6 +65,24 @@ impl DurableStreamBindingV1 {
         Ok(value)
     }
 
+    /// 从完整 subscription bootstrap 建立初始 durable reducer cut。Relay binding 的
+    /// inner cursor 是 publication cut；directed snapshot/backfill 的 SyncComplete 可以
+    /// 在线性化期间推进到同 target 的更高 inner cursor。
+    pub(crate) fn from_subscription_bootstrap(
+        binding: StreamBindingV1,
+        inner_applied: RuntimeInnerCursor,
+    ) -> Result<Self, RemoteStreamStateError> {
+        let value = Self {
+            outer_applied: binding.stream_cursor,
+            outer_acked: binding.stream_cursor,
+            binding,
+            inner_applied,
+            replay_tuple: None,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     #[must_use]
     pub const fn binding(&self) -> &StreamBindingV1 {
         &self.binding
@@ -202,11 +220,7 @@ impl DurableStreamBindingV1 {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
         match self.replay_tuple {
-            None if self.outer_applied == self.binding.stream_cursor
-                && self.inner_applied == self.binding.inner_cursor =>
-            {
-                Ok(())
-            }
+            None if self.outer_applied == self.binding.stream_cursor => Ok(()),
             Some(replay)
                 if replay.signed_blob_sha256 != [0; 32]
                     && replay_matches_applied_or_next(self.outer_applied, replay.stream_seq)
@@ -546,6 +560,38 @@ mod tests {
             },
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn subscription_bootstrap_keeps_a_sync_inner_cut_ahead_of_the_publication_binding() {
+        let binding = binding(
+            StreamRouteId::from_bytes([0x30; 16]),
+            0x40,
+            RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::BeforeFirst,
+            },
+        );
+        let state = DurableStreamBindingV1::from_subscription_bootstrap(
+            binding,
+            RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(9),
+            },
+        )
+        .expect("directed SyncComplete may be ahead of the Relay publication cut");
+        assert_eq!(
+            state.inner_applied(),
+            &RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(9),
+            }
+        );
+        let canonical = state
+            .canonical_bytes()
+            .expect("encode advanced bootstrap cut");
+        assert_eq!(
+            DurableStreamBindingV1::from_canonical_bytes(&canonical)
+                .expect("decode advanced bootstrap cut"),
+            state
+        );
     }
 
     #[test]

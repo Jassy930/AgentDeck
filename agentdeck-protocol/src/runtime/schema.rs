@@ -1,6 +1,6 @@
-//! Runtime v4 聚合 JSON Schema（独立于 local IPC / Relay v2 / E2EE schema）。
+//! Runtime v5 聚合 JSON Schema（独立于 local IPC / Relay v2 / E2EE schema）。
 //!
-//! 通过 `runtime_schema()` 聚合所有 Runtime v4 公共类型，快照写到
+//! 通过 `runtime_schema()` 聚合所有 Runtime v5 公共类型，快照写到
 //! `protocol/agentdeck/runtime-protocol.schema.json`，由 `runtime_schema_matches_committed_snapshot`
 //! 守护，用 `UPDATE_RUNTIME_SCHEMA=1` 重生成（模式仿照 local IPC 的
 //! `schema_matches_committed_snapshot`）。
@@ -39,7 +39,7 @@ impl<T: JsonSchema> JsonSchema for RequiredNullable<T> {
     }
 }
 
-/// Runtime v4 所有公共 wire 类型的聚合 schema。
+/// Runtime v5 所有公共 wire 类型的聚合 schema。
 pub fn runtime_schema() -> serde_json::Value {
     let mut properties = serde_json::Map::new();
     macro_rules! add {

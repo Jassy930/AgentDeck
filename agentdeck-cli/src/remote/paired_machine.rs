@@ -46,7 +46,7 @@ use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, Revoke
 use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TurnId};
 use agentdeck_protocol::runtime::{
     ConversationId, MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope,
-    RuntimeMessage, RuntimeRequest, SendPromptRequest,
+    RuntimeInnerCursor, RuntimeMessage, RuntimeRequest, SendPromptRequest,
 };
 use agentdeck_relay_client::{
     LinkAuthenticator, RelayClientConfig, RelayClientError, RelayTlsPolicy,
@@ -325,6 +325,7 @@ fn validate_current_command_reservation(
 /// allowlist 及其授权映射。
 pub(crate) enum AuthorizedRuntimeRequest {
     Catalog(CatalogRequest),
+    Subscribe(RuntimeInnerCursor),
     SendPrompt(SendPromptRequest),
     ResolveApproval {
         conversation_id: ConversationId,
@@ -348,6 +349,14 @@ impl AuthorizedRuntimeRequest {
                 AuthorizationCapabilityV1::Catalog,
                 AuthorizationPermissionV1::CatalogRead,
             ),
+            Self::Subscribe(RuntimeInnerCursor::Catalog { .. }) => (
+                AuthorizationCapabilityV1::Catalog,
+                AuthorizationPermissionV1::CatalogRead,
+            ),
+            Self::Subscribe(RuntimeInnerCursor::Conversation { .. }) => (
+                AuthorizationCapabilityV1::Conversation,
+                AuthorizationPermissionV1::ConversationRead,
+            ),
             Self::SendPrompt(_) => (
                 AuthorizationCapabilityV1::Prompt,
                 AuthorizationPermissionV1::PromptSend,
@@ -370,6 +379,7 @@ impl AuthorizedRuntimeRequest {
     fn into_runtime_request(self) -> RuntimeRequest {
         match self {
             Self::Catalog(request) => RuntimeRequest::Catalog(request),
+            Self::Subscribe(inner_cursor) => RuntimeRequest::Subscribe { inner_cursor },
             Self::SendPrompt(request) => RuntimeRequest::SendPrompt(request),
             Self::ResolveApproval {
                 conversation_id,
@@ -1312,6 +1322,38 @@ impl OpenedPairedMachine<'_> {
             current.replay_windows().to_vec(),
             stream_bindings,
         );
+        self.replace_opaque_runtime_state(&replacement, rng)?;
+        Ok(candidate)
+    }
+
+    /// 在 authenticated subscription bootstrap 已完整归约后，原子安装或替换该 target
+    /// 的 directed `StreamBindingV1`、推进已应用 inner cut，并清除 exact request pending。
+    ///
+    /// bootstrap 明文不写入 durable state；因此不能持久化一个缺少 reducer 内容、却能在
+    /// 冷启动时冒充完整结果的 terminal。若进程在后续 Relay control send 前退出，下一次
+    /// cold subscribe 会建立新的 snapshot request，并由本入口替换旧 target binding。
+    /// 其他 target 与 receive replay windows 始终原样保留；新 route 与其他 target 冲突时
+    /// canonical collection encoder 会在任何写入前 fail-close。
+    pub(crate) fn commit_subscription_bootstrap<R: CryptoRng>(
+        &mut self,
+        binding: StreamBindingV1,
+        inner_applied: RuntimeInnerCursor,
+        rng: &mut R,
+    ) -> Result<DurableStreamBindingV1, PairedPromotionError> {
+        let candidate = DurableStreamBindingV1::from_subscription_bootstrap(binding, inner_applied)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.validate_stream_binding_capability(candidate.binding())?;
+        let mut states = self.audited.state.durable_stream_bindings()?;
+        let target = candidate.target_key();
+        states.retain(|state| state.target_key() != target);
+        states.push(candidate.clone());
+        let stream_bindings =
+            encode_stream_bindings(states).map_err(|_| PairedPromotionError::InvalidState)?;
+        let current = self.audited.state.opaque_runtime_state();
+        let replacement =
+            OpaqueRuntimeState::new(None, current.replay_windows().to_vec(), stream_bindings);
         self.replace_opaque_runtime_state(&replacement, rng)?;
         Ok(candidate)
     }

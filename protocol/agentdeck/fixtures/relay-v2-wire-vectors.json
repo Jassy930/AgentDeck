@@ -54,7 +54,7 @@
           "relayServerId": "iIiIiIiIiIiIiIiIiIiIiA==",
           "requestHash": "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE=",
           "rootTrustEpoch": 3,
-          "runtimeProtocolVersion": 4
+          "runtimeProtocolVersion": 5
         },
         "machineDataSignature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA=="
       },
@@ -717,5 +717,5 @@
     }
   ],
   "relayProtocolVersion": 2,
-  "runtimeProtocolVersion": 4
+  "runtimeProtocolVersion": 5
 }

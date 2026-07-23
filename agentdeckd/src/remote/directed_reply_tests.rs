@@ -1629,7 +1629,7 @@ async fn transition_snapshot_sealer_requires_exact_store_permit_and_records_flus
                 route(),
                 &permit,
                 runtime_bytes(RuntimeMessage::Reply(RuntimeReply::Catalog(
-                    CatalogSnapshot::new(StreamCursor::At(0), Vec::new(), None)
+                    CatalogSnapshot::new(StreamCursor::At(0), Vec::new(), None, None)
                         .expect("construct wrong-base Catalog snapshot"),
                 ))),
             )

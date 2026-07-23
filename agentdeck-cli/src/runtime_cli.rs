@@ -1,4 +1,4 @@
-//! Runtime v4 canonical CLI facade。
+//! Runtime v5 canonical CLI facade。
 //!
 //! 本模块只接受 canonical conversation/command/event identity，并通过
 //! [`RuntimeUnixClient`] 与 shared daemon 通信。Legacy SessionStart/SessionContinue、
@@ -48,13 +48,13 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1024;
 pub fn validate_runtime_globals(profile: &str, data_dir: Option<&str>) -> Result<(), CliError> {
     if profile != "stable" {
         return Err(CliError::Usage(
-            "Runtime v4 commands only use the canonical stable shared-daemon namespace; --profile must be stable"
+            "Runtime v5 commands only use the canonical stable shared-daemon namespace; --profile must be stable"
                 .to_owned(),
         ));
     }
     if data_dir.is_some() {
         return Err(CliError::Usage(
-            "--data-dir is diagnostics-only and cannot override a Runtime v4 endpoint".to_owned(),
+            "--data-dir is diagnostics-only and cannot override a Runtime v5 endpoint".to_owned(),
         ));
     }
     Ok(())
@@ -528,7 +528,7 @@ pub async fn handle_history_list(
             }))
             .await
             .map_err(map_unix_error)?;
-        let page = decode_catalog(item)?;
+        let page = decode_catalog(item, cursor.as_ref())?;
         if let Some(expected) = base {
             if page.base_catalog_cursor != expected {
                 return Err(protocol_error(
@@ -796,21 +796,78 @@ async fn unary_reply(
     }
 }
 
-fn decode_catalog(item: ReplySequenceItem) -> Result<CatalogSnapshot, CliError> {
-    match item {
+fn decode_catalog(
+    item: ReplySequenceItem,
+    expected_page_cursor: Option<&CatalogPageCursor>,
+) -> Result<CatalogSnapshot, CliError> {
+    let snapshot = match item {
         ReplySequenceItem::Reply(reply) => match *reply {
             RuntimeReply::Catalog(snapshot) => Ok(snapshot),
             RuntimeReply::Failure(failure) => Err(runtime_failure(failure)),
             _ => Err(unexpected("Catalog did not return CatalogSnapshot")),
         },
-        ReplySequenceItem::TransferComplete(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|error| {
+        ReplySequenceItem::TransferComplete(bytes) => canonical_json::<CatalogSnapshot>(&bytes)
+            .ok_or_else(|| {
                 protocol_error(
                     TRANSFER_INVALID,
-                    format!("Catalog transfer is not a canonical CatalogSnapshot: {error}"),
+                    "Catalog transfer is not a canonical CatalogSnapshot",
                 )
-            })
+            }),
+    }?;
+    if snapshot.current_page_cursor() != expected_page_cursor {
+        return Err(protocol_error(
+            SYNC_INVALID,
+            "Catalog page does not echo the requested page cursor",
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn canonical_json<T>(payload: &[u8]) -> Option<T>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let value = serde_json::from_slice::<T>(payload).ok()?;
+    let mut comparator = CanonicalJsonComparator::new(payload);
+    serde_json::to_writer(&mut comparator, &value).ok()?;
+    comparator.is_exact().then_some(value)
+}
+
+struct CanonicalJsonComparator<'a> {
+    expected: &'a [u8],
+    offset: usize,
+    matches: bool,
+}
+
+impl<'a> CanonicalJsonComparator<'a> {
+    const fn new(expected: &'a [u8]) -> Self {
+        Self {
+            expected,
+            offset: 0,
+            matches: true,
         }
+    }
+
+    fn is_exact(&self) -> bool {
+        self.matches && self.offset == self.expected.len()
+    }
+}
+
+impl std::io::Write for CanonicalJsonComparator<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(end) = self.offset.checked_add(bytes.len()) else {
+            self.matches = false;
+            return Ok(bytes.len());
+        };
+        if self.expected.get(self.offset..end) != Some(bytes) {
+            self.matches = false;
+        }
+        self.offset = end;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1343,6 +1400,58 @@ mod tests {
             },
             key_directory_revision: 0,
         })
+    }
+
+    #[test]
+    fn catalog_decode_requires_canonical_bytes_and_the_exact_requested_page_cursor() {
+        let expected = CatalogPageCursor::new("catalog-page-2");
+        let matching = CatalogSnapshot::new(
+            StreamCursor::At(9),
+            Vec::new(),
+            Some(expected.clone()),
+            None,
+        )
+        .unwrap();
+        let decoded = decode_catalog(
+            ReplySequenceItem::Reply(Box::new(RuntimeReply::Catalog(matching.clone()))),
+            Some(&expected),
+        )
+        .expect("direct Catalog page echoes the requested cursor");
+        assert_eq!(decoded.current_page_cursor(), Some(&expected));
+
+        let mismatched = CatalogSnapshot::new(StreamCursor::At(9), Vec::new(), None, None).unwrap();
+        assert!(matches!(
+            decode_catalog(
+                ReplySequenceItem::Reply(Box::new(RuntimeReply::Catalog(mismatched.clone()))),
+                Some(&expected),
+            ),
+            Err(CliError::Protocol { .. })
+        ));
+
+        let canonical = serde_json::to_vec(&matching).unwrap();
+        assert!(
+            decode_catalog(
+                ReplySequenceItem::TransferComplete(canonical.clone()),
+                Some(&expected),
+            )
+            .is_ok()
+        );
+        let mut noncanonical = canonical;
+        noncanonical.insert(1, b' ');
+        assert!(matches!(
+            decode_catalog(
+                ReplySequenceItem::TransferComplete(noncanonical),
+                Some(&expected),
+            ),
+            Err(CliError::Protocol { .. })
+        ));
+        assert!(matches!(
+            decode_catalog(
+                ReplySequenceItem::TransferComplete(serde_json::to_vec(&mismatched).unwrap()),
+                Some(&expected),
+            ),
+            Err(CliError::Protocol { .. })
+        ));
     }
 
     #[test]

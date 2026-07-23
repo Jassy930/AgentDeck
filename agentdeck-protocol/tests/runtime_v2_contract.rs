@@ -1,7 +1,7 @@
-//! RuntimeEnvelope v4 中立契约 —— contract / deny-unknown / limits 测试。
+//! RuntimeEnvelope v5 中立契约 —— contract / deny-unknown / limits 测试。
 //!
-//! 文件名保留 `runtime_v2_contract` 以避免无价值的测试目标重命名；current wire 已升为 v4。
-//! RuntimeEnvelope v4 是 UDS 与解密后远程链路的共同业务 wire（design §8.2.2）。
+//! 文件名保留 `runtime_v2_contract` 以避免无价值的测试目标重命名；current wire 已升为 v5。
+//! RuntimeEnvelope v5 是 UDS 与解密后远程链路的共同业务 wire（design §8.2.2）。
 
 use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, PairInviteV1};
 use agentdeck_protocol::relay_v2::enrollment::EnrollmentBundleV2;
@@ -157,7 +157,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn runtime_fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../protocol/agentdeck/fixtures/runtime-v4-wire.jsonl")
+        .join("../protocol/agentdeck/fixtures/runtime-v5-wire.jsonl")
 }
 
 fn sample_enrollment_bundle() -> EnrollmentBundleV2 {
@@ -688,6 +688,7 @@ fn render_runtime_wire_fixture() -> String {
                     archived: false,
                     entry_revision: 3,
                 }],
+                None,
                 None,
             )
             .expect("fixture catalog page must satisfy bounds"),
@@ -1440,7 +1441,7 @@ fn render_runtime_wire_fixture() -> String {
 }
 
 #[test]
-fn runtime_v4_wire_fixture_is_rust_produced_and_in_sync() {
+fn runtime_v5_wire_fixture_is_rust_produced_and_in_sync() {
     let expected = render_runtime_wire_fixture();
     let path = runtime_fixture_path();
     if std::env::var("UPDATE_WIRE_FIXTURES").as_deref() == Ok("1") {
@@ -1469,32 +1470,32 @@ fn runtime_v4_wire_fixture_is_rust_produced_and_in_sync() {
 }
 
 #[test]
-fn runtime_protocol_version_is_four_and_independent() {
-    assert_eq!(RUNTIME_PROTOCOL_VERSION, 4);
+fn runtime_protocol_version_is_five_and_independent() {
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 5);
     // 与 local IPC PROTOCOL_VERSION=2 彼此独立、不联动。
     assert_eq!(agentdeck_protocol::PROTOCOL_VERSION, 2);
 }
 
 #[test]
-fn runtime_v4_is_a_hard_cutover_for_root_signed_tbs() {
+fn runtime_v5_is_a_hard_cutover_for_root_signed_tbs() {
     let invite = sample_pair_invite("hard-cutover");
     let current = invite.data_sign_cert.to_be_signed_v1(
         invite.relay_server_id,
         MachineRouteId::from_bytes([0xc1; 16]),
         invite.machine_root_fingerprint,
     );
-    assert_eq!(current.runtime_protocol_version, 4);
-    let mut legacy_v3 = current.clone();
-    legacy_v3.runtime_protocol_version = 3;
+    assert_eq!(current.runtime_protocol_version, 5);
+    let mut legacy_v4 = current.clone();
+    legacy_v4.runtime_protocol_version = 4;
     assert_ne!(
         current.encode(),
-        legacy_v3.encode(),
-        "v3-signed cert/grant material must not verify in the Runtime v4 trust domain"
+        legacy_v4.encode(),
+        "v4-signed cert/grant material must not verify in the Runtime v5 trust domain"
     );
 }
 
 #[test]
-fn runtime_v4_pairing_wire_is_strict_and_redacted() {
+fn current_runtime_pairing_wire_is_strict_and_redacted() {
     fn schema_has_property(value: &serde_json::Value, property: &str) -> bool {
         match value {
             serde_json::Value::Array(values) => values
@@ -1720,7 +1721,7 @@ fn uninstall_purge_plan_id_is_deterministic_bound_and_strict() {
 fn envelope_round_trips_a_request() {
     let env = envelope(RuntimeMessage::Request(sample_send_prompt()));
     let json = serde_json::to_value(&env).unwrap();
-    assert_eq!(json["version"], 4);
+    assert_eq!(json["version"], RUNTIME_PROTOCOL_VERSION);
     assert_eq!(json["messageId"], "m1");
     // wire round-trip (composite DTOs embed non-PartialEq trunk types).
     let back: RuntimeEnvelope = serde_json::from_value(json.clone()).unwrap();
@@ -2620,10 +2621,11 @@ fn empty_snapshots_use_before_first_without_fabricating_zero() {
     assert!(json.get("baseEventSeq").is_none());
 
     let catalog =
-        runtime::catalog::CatalogSnapshot::new(StreamCursor::BeforeFirst, Vec::new(), None)
+        runtime::catalog::CatalogSnapshot::new(StreamCursor::BeforeFirst, Vec::new(), None, None)
             .unwrap();
     let json = serde_json::to_value(&catalog).unwrap();
     assert_eq!(json["baseCatalogCursor"], serde_json::json!("beforeFirst"));
+    assert!(json["currentPageCursor"].is_null());
     assert!(json["nextPageCursor"].is_null());
 }
 
@@ -2668,11 +2670,19 @@ fn catalog_snapshot_requires_frozen_page_cursor_and_explicit_null() {
     let page = runtime::catalog::CatalogSnapshot::new(
         StreamCursor::At(9),
         Vec::new(),
+        Some(CatalogPageCursor::new("frozen-page-1")),
         Some(CatalogPageCursor::new("frozen-page-2")),
     )
     .unwrap();
     let mut json = serde_json::to_value(&page).unwrap();
+    assert_eq!(json["currentPageCursor"], "frozen-page-1");
     assert_eq!(json["nextPageCursor"], "frozen-page-2");
+    let mut missing_current = json.clone();
+    missing_current
+        .as_object_mut()
+        .unwrap()
+        .remove("currentPageCursor");
+    assert!(serde_json::from_value::<runtime::catalog::CatalogSnapshot>(missing_current).is_err());
     json.as_object_mut().unwrap().remove("nextPageCursor");
     assert!(serde_json::from_value::<runtime::catalog::CatalogSnapshot>(json).is_err());
 
@@ -2681,6 +2691,13 @@ fn catalog_snapshot_requires_frozen_page_cursor_and_explicit_null() {
     assert!(json["pageCursor"].is_null());
     json.as_object_mut().unwrap().remove("pageCursor");
     assert!(serde_json::from_value::<RuntimeRequest>(json).is_err());
+}
+
+#[test]
+fn catalog_snapshot_size_validation_does_not_allocate_a_second_full_json_page() {
+    let source = include_str!("../src/runtime/catalog.rs");
+    assert!(!source.contains("serde_json::to_vec(&snapshot)"));
+    assert!(source.contains("serde_json::to_writer(&mut counter, snapshot)"));
 }
 
 #[test]
@@ -2856,6 +2873,7 @@ fn required_null_schema_properties_accept_null_and_remain_required() {
     assert_required_nullable(tagged_variant(&snapshot, "kind", "item"), "commandId");
 
     let catalog = serde_json::to_value(schemars::schema_for!(runtime::CatalogSnapshot)).unwrap();
+    assert_required_nullable(&catalog, "currentPageCursor");
     assert_required_nullable(&catalog, "nextPageCursor");
 
     let request =

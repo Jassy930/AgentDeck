@@ -28,7 +28,7 @@ pub mod upgrade;
 
 /// Runtime 契约产物版本；独立于 local IPC `PROTOCOL_VERSION` 与 Relay
 /// `RELAY_PROTOCOL_VERSION`。改动 Runtime wire 形态时手动 +1 并重生成快照。
-pub const RUNTIME_PROTOCOL_VERSION: u16 = 4;
+pub const RUNTIME_PROTOCOL_VERSION: u16 = 5;
 
 pub use crate::relay_v2::RelayAdminPurgeReceiptV1;
 pub use catalog::{CatalogChange, CatalogDelta, CatalogError, CatalogSnapshot, ConversationEntry};

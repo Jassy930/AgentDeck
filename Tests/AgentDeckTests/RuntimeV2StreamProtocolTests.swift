@@ -37,12 +37,18 @@ final class RuntimeV2StreamProtocolTests: XCTestCase {
         var missingCursor = catalog(entries: [])
         missingCursor.removeValue(forKey: "nextPageCursor")
         try assertDecodeFails(RuntimeCatalogSnapshotV2.self, missingCursor)
+        var missingCurrentCursor = catalog(entries: [])
+        missingCurrentCursor.removeValue(forKey: "currentPageCursor")
+        try assertDecodeFails(RuntimeCatalogSnapshotV2.self, missingCurrentCursor)
         let decoded = try decode(RuntimeCatalogSnapshotV2.self, catalog(entries: []))
+        XCTAssertNil(decoded.currentPageCursor)
         XCTAssertNil(decoded.nextPageCursor)
+        XCTAssertTrue(try object(decoded)["currentPageCursor"] is NSNull)
         XCTAssertTrue(try object(decoded)["nextPageCursor"] is NSNull)
 
         let richCatalog: [String: Any] = [
             "baseCatalogCursor": ["at": 9], "entries": [richEntry],
+            "currentPageCursor": "page-1",
             "nextPageCursor": "page-2",
         ]
         XCTAssertEqual(
@@ -56,6 +62,7 @@ final class RuntimeV2StreamProtocolTests: XCTestCase {
             try RuntimeCatalogSnapshotV2(
                 baseCatalogCursor: .beforeFirst,
                 entries: Array(repeating: decodedRichEntry, count: 501),
+                currentPageCursor: nil,
                 nextPageCursor: nil
             )
         )
@@ -87,6 +94,7 @@ final class RuntimeV2StreamProtocolTests: XCTestCase {
             try RuntimeCatalogSnapshotV2(
                 baseCatalogCursor: .beforeFirst,
                 entries: [oversizedEntry],
+                currentPageCursor: nil,
                 nextPageCursor: nil
             )
         )
@@ -428,7 +436,10 @@ final class RuntimeV2StreamProtocolTests: XCTestCase {
     }
 
     private func catalog(entries: [[String: Any]]) -> [String: Any] {
-        ["baseCatalogCursor": "beforeFirst", "entries": entries, "nextPageCursor": NSNull()]
+        [
+            "baseCatalogCursor": "beforeFirst", "entries": entries,
+            "currentPageCursor": NSNull(), "nextPageCursor": NSNull(),
+        ]
     }
 
     private func catalogDelta(_ revision: UInt64) -> [String: Any] {

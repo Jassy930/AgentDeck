@@ -1,7 +1,7 @@
 import Foundation
 
-// Runtime v4 current outer 保留 V2 类型名以维持源码兼容；稳定 leaf DTO 继续复用
-// RuntimeWireTypes.swift，current facade 与 compact codec 只接受 v4。
+// Runtime v5 current outer 保留 V2 类型名以维持源码兼容；稳定 leaf DTO 继续复用
+// RuntimeWireTypes.swift，current facade 与 compact codec 只接受 v5。
 
 public enum RuntimeV2WireError: Error, Equatable, Sendable {
     case invalidIdentity
@@ -15,7 +15,8 @@ public enum RuntimeV2WireError: Error, Equatable, Sendable {
 public let runtimeProtocolVersionV2: UInt16 = 2
 public let runtimeProtocolVersionV3: UInt16 = 3
 public let runtimeProtocolVersionV4: UInt16 = 4
-public let runtimeProtocolVersionCurrent: UInt16 = runtimeProtocolVersionV4
+public let runtimeProtocolVersionV5: UInt16 = 5
+public let runtimeProtocolVersionCurrent: UInt16 = runtimeProtocolVersionV5
 public typealias RuntimeWireCodec = RuntimeV2WireCodec
 public typealias RuntimeRequestV3 = RuntimeRequestV2
 public typealias RuntimeReplyV3 = RuntimeReplyV2
@@ -25,6 +26,10 @@ public typealias RuntimeRequestV4 = RuntimeRequestV2
 public typealias RuntimeReplyV4 = RuntimeReplyV2
 public typealias RuntimeEnvelopeV4 = RuntimeEnvelopeV2
 public typealias RuntimeV4WireCodec = RuntimeV2WireCodec
+public typealias RuntimeRequestV5 = RuntimeRequestV2
+public typealias RuntimeReplyV5 = RuntimeReplyV2
+public typealias RuntimeEnvelopeV5 = RuntimeEnvelopeV2
+public typealias RuntimeV5WireCodec = RuntimeV2WireCodec
 
 private func runtimeV2ValidateIdentity(_ value: String) throws {
     guard !value.isEmpty, value.utf8.count <= 1024 else {
@@ -40,7 +45,7 @@ private func runtimeV2InvalidTag(
     .dataCorruptedError(
         forKey: runtimeV2Key(field),
         in: container,
-        debugDescription: "unsupported Runtime v4 \(field) \(value)"
+        debugDescription: "unsupported Runtime v5 \(field) \(value)"
     )
 }
 
@@ -152,7 +157,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
             throw DecodingError.dataCorruptedError(
                 forKey: .transferID,
                 in: container,
-                debugDescription: "Runtime v4 transferId must contain 1...1024 UTF-8 bytes"
+                debugDescription: "Runtime v5 transferId must contain 1...1024 UTF-8 bytes"
             )
         }
         transferID = RuntimeTransferID(rawValue: rawTransferID)
@@ -167,7 +172,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
             throw DecodingError.dataCorrupted(
                 .init(
                     codingPath: decoder.codingPath,
-                    debugDescription: "invalid Runtime v4 transfer bounds",
+                    debugDescription: "invalid Runtime v5 transfer bounds",
                     underlyingError: error
                 )
             )
@@ -182,7 +187,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
                 self,
                 .init(
                     codingPath: encoder.codingPath,
-                    debugDescription: "invalid Runtime v4 transfer bounds",
+                    debugDescription: "invalid Runtime v5 transfer bounds",
                     underlyingError: error
                 )
             )
@@ -208,7 +213,7 @@ public struct TransferEnvelopeV2: Codable, Sendable {
                 self,
                 .init(
                     codingPath: container.codingPath,
-                    debugDescription: "invalid Runtime v4 transfer bounds",
+                    debugDescription: "invalid Runtime v5 transfer bounds",
                     underlyingError: error
                 )
             )
@@ -1094,7 +1099,7 @@ public enum RuntimeMessageV2: Codable, Sendable {
             throw DecodingError.dataCorruptedError(
                 forKey: .message,
                 in: container,
-                debugDescription: "unsupported Runtime v4 message \(value)"
+                debugDescription: "unsupported Runtime v5 message \(value)"
             )
         }
     }
@@ -1153,7 +1158,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
             throw DecodingError.dataCorruptedError(
                 forKey: .messageID,
                 in: container,
-                debugDescription: "Runtime v4 messageId must contain 1...1024 UTF-8 bytes"
+                debugDescription: "Runtime v5 messageId must contain 1...1024 UTF-8 bytes"
             )
         }
         messageID = RuntimeMessageID(rawValue: rawMessageID)
@@ -1177,7 +1182,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
                 messageID.rawValue,
                 .init(
                     codingPath: encoder.codingPath + [CodingKeys.messageID],
-                    debugDescription: "Runtime v4 messageId must contain 1...1024 UTF-8 bytes"
+                    debugDescription: "Runtime v5 messageId must contain 1...1024 UTF-8 bytes"
                 )
             )
         }
@@ -1188,7 +1193,7 @@ public struct RuntimeEnvelopeV2: Codable, Sendable {
     }
 }
 
-// MARK: - Current Runtime v4 wire entry points
+// MARK: - Current Runtime v5 wire entry points
 
 public enum RuntimeV2WireCodec {
     public static let maxRequestBytes = 1024 * 1024

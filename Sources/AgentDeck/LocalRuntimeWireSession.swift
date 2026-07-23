@@ -1,7 +1,7 @@
 import AgentDeckCore
 import Foundation
 
-/// App model 使用的本机 Runtime v4 wire 边界。它只在已经完成安全 UDS/Hello 的
+/// App model 使用的本机 Runtime v5 wire 边界。它只在已经完成安全 UDS/Hello 的
 /// `RuntimeEnvelopeClient` 上收窄 API，不拥有 daemon 生命周期，也没有 spawn/fallback。
 actor LocalRuntimeWireSession {
   private let client: RuntimeEnvelopeClient
@@ -172,7 +172,7 @@ actor LocalRuntimeWireSession {
   private static func invalidTransferPayloadFailure() -> RuntimeEnvelopeClientFailure {
     RuntimeEnvelopeClientFailure(
       code: "daemon.client.transfer_invalid",
-      message: "completed transfer is not one exact current Runtime v4 payload"
+      message: "completed transfer is not one exact current Runtime v5 payload"
     )
   }
 }
@@ -219,7 +219,7 @@ struct LocalRuntimeStreamFrame: Sendable {
 }
 
 /// TransferPart 的 raw payload 不带 `reply`/`stream` discriminator；它是 daemon 在
-/// current Runtime v4 DTO canonical encode 后的裸 payload。这里只接受当前 production
+/// current Runtime v5 DTO canonical encode 后的裸 payload。这里只接受当前 production
 /// transfer egress 允许的大对象集合，并调用这些 DTO 自身的 strict current decoder。
 private enum LocalRuntimeV2TransferPayloadCodec {
   private enum DecodeFailure: Error {

@@ -1954,13 +1954,16 @@ async fn catalog_subscription_flushes_all_501_rows_before_sync_complete() {
         .await
         .expect("first catalog page timeout")
         .expect("first catalog page");
-    assert!(matches!(
-        decode(&first).body,
-        RuntimeMessage::Reply(RuntimeReply::Catalog(snapshot))
-            if snapshot.base_catalog_cursor == StreamCursor::At(500)
-                && snapshot.entries().len() == 500
-                && snapshot.next_page_cursor().is_some()
-    ));
+    let RuntimeMessage::Reply(RuntimeReply::Catalog(first_snapshot)) = decode(&first).body else {
+        panic!("first Catalog subscription page must be a snapshot");
+    };
+    assert_eq!(first_snapshot.base_catalog_cursor, StreamCursor::At(500));
+    assert_eq!(first_snapshot.entries().len(), 500);
+    assert!(first_snapshot.current_page_cursor().is_none());
+    let second_page_cursor = first_snapshot
+        .next_page_cursor()
+        .cloned()
+        .expect("first Catalog page must issue the second-page cursor");
     assert!(
         receiver.try_recv().is_err(),
         "second page overtook the first page FlushReceipt"
@@ -1971,13 +1974,16 @@ async fn catalog_subscription_flushes_all_501_rows_before_sync_complete() {
         .await
         .expect("second catalog page timeout")
         .expect("second catalog page");
-    assert!(matches!(
-        decode(&second).body,
-        RuntimeMessage::Reply(RuntimeReply::Catalog(snapshot))
-            if snapshot.base_catalog_cursor == StreamCursor::At(500)
-                && snapshot.entries().len() == 1
-                && snapshot.next_page_cursor().is_none()
-    ));
+    let RuntimeMessage::Reply(RuntimeReply::Catalog(second_snapshot)) = decode(&second).body else {
+        panic!("second Catalog subscription page must be a snapshot");
+    };
+    assert_eq!(second_snapshot.base_catalog_cursor, StreamCursor::At(500));
+    assert_eq!(second_snapshot.entries().len(), 1);
+    assert_eq!(
+        second_snapshot.current_page_cursor(),
+        Some(&second_page_cursor)
+    );
+    assert!(second_snapshot.next_page_cursor().is_none());
     assert!(
         receiver.try_recv().is_err(),
         "SyncComplete overtook the second page FlushReceipt"

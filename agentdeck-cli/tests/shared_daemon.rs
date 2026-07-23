@@ -485,7 +485,7 @@ async fn subscribe_keeps_same_message_id_sequence_until_sync_complete() {
                 stream_generation: StreamGeneration::new("subscribe-generation"),
             }),
             RuntimeReply::Catalog(
-                CatalogSnapshot::new(StreamCursor::BeforeFirst, Vec::new(), None).unwrap(),
+                CatalogSnapshot::new(StreamCursor::BeforeFirst, Vec::new(), None, None).unwrap(),
             ),
             sync_complete(),
         ];

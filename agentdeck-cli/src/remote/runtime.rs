@@ -6,32 +6,37 @@
 
 #![cfg(unix)]
 
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::time::Instant;
+use std::time::Duration;
 
 use agentdeck_crypto::rand_core::{CryptoRng, TryCryptoRng, TryRng};
 use agentdeck_crypto::sha256;
 use agentdeck_protocol::ActionDecision;
-use agentdeck_protocol::e2ee::SealedPayloadKind;
-use agentdeck_protocol::relay_v2::frame::{AcceptedRef, SealedBlob, Send as RelaySend};
+use agentdeck_protocol::e2ee::{KeyControlV1, SealedPayloadKind, StreamBindingV1};
+use agentdeck_protocol::relay_v2::frame::{
+    AcceptedRef, Ack as RelayAck, SealedBlob, Send as RelaySend, Subscribe as RelaySubscribe,
+};
 use agentdeck_protocol::relay_v2::{
     CodecError, GrantSerial as RelayGrantSerial, MAX_FRAME_BYTES, OpaqueRouteFrame,
     RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId, decode, encode,
 };
 use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::identity::{
-    ApprovalId, CatalogPageCursor, GrantSerial as RuntimeGrantSerial, MessageId, TurnId,
+    ApprovalId, CatalogPageCursor, GrantSerial as RuntimeGrantSerial, MessageId, TransferId, TurnId,
 };
 use agentdeck_protocol::runtime::{
-    ApprovalDeliveryState, ApprovalReceipt, CatalogSnapshot, CommandReceipt, ConversationId,
-    MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION, RevocationReceipt, RuntimeEnvelope,
-    RuntimeFailure, RuntimeMessage, RuntimeReply, RuntimeTransferCarrierError,
-    RuntimeTransferCarrierV1, RuntimeTransferChannel, SendPromptRequest, TransferError,
-    TransferProgress, TransferReassembler,
+    ApprovalDeliveryState, ApprovalReceipt, BackfillChunk, CatalogSnapshot, CommandReceipt,
+    ConversationId, ConversationSnapshot, MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION,
+    RevocationReceipt, RuntimeEnvelope, RuntimeFailure, RuntimeInnerCursor, RuntimeMessage,
+    RuntimeReply, RuntimeSyncComplete, RuntimeTransferCarrierError, RuntimeTransferCarrierV1,
+    RuntimeTransferChannel, SendPromptRequest, StreamCursor, SubscriptionReceipt, TRANSFER_TTL_MS,
+    TransferError, TransferProgress, TransferReassembler,
 };
 use agentdeck_relay_client::RelayClientError;
 use async_trait::async_trait;
 use thiserror::Error;
+use tokio::time::Instant;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -42,7 +47,8 @@ use super::paired_machine::{
 
 const EXCHANGE_MAGIC: &[u8; 4] = b"ADRX";
 const LEGACY_EXCHANGE_VERSION: u16 = 1;
-const EXCHANGE_VERSION: u16 = 2;
+const PRE_SUBSCRIPTION_EXCHANGE_VERSION: u16 = 2;
+const EXCHANGE_VERSION: u16 = 3;
 const EXCHANGE_PENDING: u8 = 0;
 const EXCHANGE_TERMINAL: u8 = 1;
 const REPLAY_MAGIC: &[u8; 4] = b"ADRW";
@@ -54,6 +60,7 @@ const INTENT_DOMAIN: &[u8] = b"AgentDeck/RemotePromptIntentV1\0";
 const RESOLVE_APPROVAL_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteResolveApprovalIntentV1\0";
 const RETRY_APPROVAL_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteRetryApprovalIntentV1\0";
 const REVOKE_SELF_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteRevokeSelfIntentV1\0";
+const SUBSCRIBE_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteSubscribeIntentV1\0";
 const MUTATION_RNG_DOMAIN: &[u8] = b"AgentDeck/RemoteRuntimeMutationRngV1\0";
 
 /// Remote Runtime 对 Relay transport 的最小需求；transport 不解析或伪造业务回执。
@@ -171,6 +178,61 @@ pub struct RemoteCatalogPageOutcome {
     snapshot: CatalogSnapshot,
 }
 
+/// 完整 subscription bootstrap 的 authenticated 结果。
+///
+/// Runtime 本地 generation 只存在于 `subscription`/`sync_complete`；`binding` 中的
+/// generation 属于 Relay publication，两条版本轴不得比较或互相推导。
+#[derive(Debug)]
+pub struct RemoteSubscriptionBootstrap {
+    route_accepted: bool,
+    subscription: SubscriptionReceipt,
+    sync_complete: RuntimeSyncComplete,
+    binding: StreamBindingV1,
+}
+
+/// 已完成 MachineDataSign/replay/AEAD/Runtime canonical 校验并按 inner cursor 连续归约的
+/// subscription bootstrap 内容。CLI reducer 必须只消费这里的值，不能从 Relay transport
+/// 或未验证 payload 自行拼接状态。
+#[derive(Clone)]
+pub enum RemoteSubscriptionBootstrapItem {
+    CatalogSnapshot(CatalogSnapshot),
+    ConversationSnapshot(ConversationSnapshot),
+    Backfill(BackfillChunk),
+}
+
+/// subscription bootstrap 的 clone-and-swap reducer 契约。
+///
+/// Runtime 先 clone 当前 reducer，再把全部 authenticated snapshot/backfill 应用到 clone；
+/// clone 的 cursor 必须精确等于 `SyncComplete.innerCursor`。只有 staged reducer 完整成功后
+/// 才会持久化 inner HWM、替换调用方 reducer 并发送 Relay Subscribe/Ack。
+pub trait RemoteSubscriptionReducer: Clone {
+    fn inner_cursor(&self) -> &RuntimeInnerCursor;
+
+    fn apply(&mut self, item: &RemoteSubscriptionBootstrapItem) -> Result<(), RemoteRuntimeError>;
+}
+
+impl RemoteSubscriptionBootstrap {
+    #[must_use]
+    pub const fn route_accepted(&self) -> bool {
+        self.route_accepted
+    }
+
+    #[must_use]
+    pub const fn subscription(&self) -> &SubscriptionReceipt {
+        &self.subscription
+    }
+
+    #[must_use]
+    pub const fn sync_complete(&self) -> &RuntimeSyncComplete {
+        &self.sync_complete
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &StreamBindingV1 {
+        &self.binding
+    }
+}
+
 impl RemoteCatalogPageOutcome {
     #[must_use]
     pub const fn route_accepted(&self) -> bool {
@@ -180,6 +242,10 @@ impl RemoteCatalogPageOutcome {
     #[must_use]
     pub const fn snapshot(&self) -> &CatalogSnapshot {
         &self.snapshot
+    }
+
+    pub(super) fn into_parts(self) -> (bool, CatalogSnapshot) {
+        (self.route_accepted, self.snapshot)
     }
 }
 
@@ -305,6 +371,23 @@ where
         Self { transport, machine }
     }
 
+    async fn recv_with_transfer_deadline(
+        &mut self,
+        active: &HashMap<TransferId, Instant>,
+    ) -> Result<Option<ReceivedRuntimeFrame>, RemoteRuntimeError> {
+        let Some(deadline) = active
+            .values()
+            .map(|started| *started + Duration::from_millis(TRANSFER_TTL_MS))
+            .min()
+        else {
+            return Ok(self.transport.recv().await?);
+        };
+        match tokio::time::timeout_at(deadline, self.transport.recv()).await {
+            Ok(received) => Ok(received?),
+            Err(_) => Err(TransferError::Expired.into()),
+        }
+    }
+
     /// 显式等待 transport shutdown，随后按字段顺序先销毁 transport、再释放 device lease。
     pub async fn shutdown(mut self) {
         self.transport.shutdown().await;
@@ -337,7 +420,9 @@ where
         // Catalog 是 read-only query，不以 request payload 提供幂等身份。terminal 只在
         // persist→return 的 crash 窗口保留；一旦本次调用消费到 authenticated 结果就
         // durable 清除，下一次相同 Catalog(None) 必须重新查询，不能永久读旧快照。
-        self.consume_catalog_terminal(&operation)?;
+        if outcome.terminal_persisted {
+            self.consume_catalog_terminal(&operation)?;
+        }
         Ok(RemoteCatalogPageOutcome {
             route_accepted: outcome.route_accepted,
             snapshot,
@@ -366,6 +451,230 @@ where
         let is_first_page = page_cursor.is_none();
         let outcome = self.catalog_page(page_cursor, rng).await?;
         Ok(is_first_page.then_some(outcome))
+    }
+
+    /// 建立一个 Runtime subscription bootstrap。所有 directed snapshot/backfill（包括
+    /// compact transfer）先进入 clone reducer；只有 reducer 精确到达 SyncComplete cut 且
+    /// `StreamBindingV1` 完整验证后，才原子写入 binding/inner HWM、swap reducer，并发送
+    /// Relay `Subscribe`/可选 `Ack`。
+    ///
+    /// 成功路径不持久化 bootstrap 明文或缺明文的 terminal。若进程在 state commit 后、
+    /// control send 前退出，冷启动必须从自己的空 reducer 发起新 snapshot，并替换旧 target
+    /// binding；不能只恢复 controls 后跳过未持久化的 transcript。
+    pub async fn subscribe<R, D>(
+        &mut self,
+        inner_cursor: RuntimeInnerCursor,
+        reducer: &mut D,
+        rng: &mut R,
+    ) -> Result<RemoteSubscriptionBootstrap, RemoteRuntimeError>
+    where
+        R: CryptoRng,
+        D: RemoteSubscriptionReducer,
+    {
+        if reducer.inner_cursor() != &inner_cursor {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        let plan = DirectedRequestPlan::subscribe(inner_cursor.clone())?;
+        let operation = plan.operation.clone();
+        let existing = self
+            .machine
+            .opaque_runtime_state()
+            .exchange()
+            .map(decode_exchange)
+            .transpose()?;
+        let pending =
+            match select_exchange_start(existing, plan, |plan| self.prepare_pending(plan, rng))? {
+                ExchangeStart::Pending(pending) => pending,
+                ExchangeStart::Terminal(DirectedReceipt::Failure(failure)) => {
+                    self.consume_subscription_failure_terminal(&operation)?;
+                    return Err(RemoteRuntimeError::DaemonFailure(failure));
+                }
+                ExchangeStart::Terminal(_) => {
+                    return Err(RemoteRuntimeError::InvalidDurableState);
+                }
+            };
+
+        self.reject_quarantined_current_reply_scope()?;
+        self.transport
+            .send(ExactRelayFrame::from_frozen(pending.exact_send.clone())?)
+            .await?;
+
+        let mut tracker = SubscriptionBootstrapTracker::new(inner_cursor, reducer)?;
+        let mut route_accepted = false;
+        let transfer_started_at = Instant::now();
+        let mut reply_transfers = TransferReassembler::new();
+        let mut active_reply_transfers = HashMap::new();
+        let mut processed_signed_blobs = HashSet::new();
+        loop {
+            let Some(received) = self
+                .recv_with_transfer_deadline(&active_reply_transfers)
+                .await?
+            else {
+                return Err(RemoteRuntimeError::OutcomeUnknown);
+            };
+            validate_received_runtime_frame(&received)?;
+            let reply_frame_hash = sha256(received.canonical_bytes());
+            let frame = received.frame();
+            match &frame.body {
+                RelayFrameBody::RouteAccepted(accepted) => match accepted.accepted {
+                    AcceptedRef::Request { request_route }
+                        if request_route == pending.request_route =>
+                    {
+                        route_accepted = true;
+                    }
+                    _ => {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "RouteAccepted does not match the pending subscription",
+                        ));
+                    }
+                },
+                RelayFrameBody::Reply(reply) => {
+                    if reply.device_route != self.machine.device_route()
+                        || reply.request_route != pending.request_route
+                    {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "subscription Reply outer route does not match the pending request",
+                        ));
+                    }
+                    let candidate = self
+                        .machine
+                        .verify_directed_reply(pending.request_route, &reply.sealed_blob.0)?;
+                    let signed_blob_hash = candidate.signed_blob_hash();
+                    self.admit_reply_replay(&candidate)?;
+                    if processed_signed_blobs.contains(&signed_blob_hash) {
+                        continue;
+                    }
+                    let opened = self.machine.open_verified_directed_reply(candidate)?;
+
+                    if opened.payload_kind == SealedPayloadKind::KeyUpdate {
+                        if !active_reply_transfers.is_empty() {
+                            return Err(RemoteRuntimeError::InvalidReply(
+                                "StreamBinding arrived while a bootstrap transfer is incomplete",
+                            ));
+                        }
+                        let control =
+                            KeyControlV1::from_canonical_bytes(&opened.payload).map_err(|_| {
+                                RemoteRuntimeError::InvalidReply(
+                                    "subscription terminal is not canonical key control",
+                                )
+                            })?;
+                        let KeyControlV1::StreamBinding { binding, .. } = control else {
+                            return Err(RemoteRuntimeError::InvalidReply(
+                                "subscription terminal is not a StreamBinding",
+                            ));
+                        };
+                        let progress = tracker.finish(route_accepted, &binding)?;
+                        let applied_inner = progress.sync_complete.inner_cursor.clone();
+                        let mut mutation_rng = SystemMutationRng::new()?;
+                        // staged reducer 已完整应用全部 bootstrap 内容；只有此后才能在同一
+                        // paired-state transaction 中推进 inner HWM。成功 exchange 不留
+                        // “无明文 reducer 却可恢复”的 durable terminal：冷启动必须重新
+                        // snapshot，而不是从旧 SyncComplete 跳过内容。
+                        let installed = self.machine.commit_subscription_bootstrap(
+                            binding,
+                            applied_inner,
+                            &mut mutation_rng,
+                        )?;
+                        let binding = installed.binding().clone();
+                        let (outcome, staged_reducer) =
+                            progress.into_outcome_and_reducer(binding.clone());
+                        *reducer = staged_reducer;
+                        self.send_stream_binding_controls(&binding).await?;
+                        return Ok(outcome);
+                    }
+
+                    if opened.payload_kind == SealedPayloadKind::TransferPart {
+                        let carrier = RuntimeTransferCarrierV1::decode(&opened.payload)
+                            .map_err(map_transfer_carrier_error)?;
+                        if carrier.channel != RuntimeTransferChannel::Reply {
+                            return Err(RemoteRuntimeError::InvalidReply(
+                                "subscription transfer carrier is not on the Reply channel",
+                            ));
+                        }
+                        if carrier.message_id != pending.message_id {
+                            return Err(RemoteRuntimeError::InvalidReply(
+                                "subscription transfer messageId does not match the pending request",
+                            ));
+                        }
+                        let transfer_id = carrier.transfer.transfer_id.clone();
+                        let now_ms = u64::try_from(transfer_started_at.elapsed().as_millis())
+                            .unwrap_or(u64::MAX);
+                        match reply_transfers.accept(
+                            RuntimeTransferChannel::Reply,
+                            carrier.transfer,
+                            now_ms,
+                        )? {
+                            TransferProgress::InProgress { .. } => {
+                                active_reply_transfers
+                                    .entry(transfer_id)
+                                    .or_insert_with(Instant::now);
+                                processed_signed_blobs.insert(signed_blob_hash);
+                                continue;
+                            }
+                            TransferProgress::AlreadyComplete => {
+                                return Err(RemoteRuntimeError::InvalidReply(
+                                    "subscription transfer completed more than once",
+                                ));
+                            }
+                            TransferProgress::Complete(payload) => {
+                                active_reply_transfers.remove(&transfer_id);
+                                let (payload_kind, reply) =
+                                    decode_subscription_transfer(tracker.requested(), &payload)?;
+                                tracker.accept_runtime_reply(payload_kind, reply)?;
+                                processed_signed_blobs.insert(signed_blob_hash);
+                                continue;
+                            }
+                        }
+                    }
+
+                    if opened.payload.len() >= MAX_RUNTIME_JSON_FRAME_BYTES {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "Runtime subscription reply exceeds the JSON frame limit",
+                        ));
+                    }
+                    let envelope = canonical_json::<RuntimeEnvelope>(&opened.payload).ok_or(
+                        RemoteRuntimeError::InvalidReply(
+                            "Runtime reply is not one canonical JSON envelope",
+                        ),
+                    )?;
+                    if envelope.message_id != pending.message_id {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "Runtime subscription messageId does not match the pending request",
+                        ));
+                    }
+                    let RuntimeMessage::Reply(reply) = envelope.body else {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "Runtime subscription envelope is not a reply",
+                        ));
+                    };
+                    if let RuntimeReply::Failure(failure) = reply {
+                        if opened.payload_kind != SealedPayloadKind::CommandReceipt {
+                            return Err(RemoteRuntimeError::InvalidReply(
+                                "Runtime subscription failure has the wrong payload kind",
+                            ));
+                        }
+                        let receipt = DirectedReceipt::Failure(failure.clone());
+                        self.persist_terminal(&pending, reply_frame_hash, &receipt)?;
+                        self.consume_subscription_failure_terminal(&pending.operation)?;
+                        return Err(RemoteRuntimeError::DaemonFailure(failure));
+                    }
+                    if matches!(reply, RuntimeReply::SyncComplete(_))
+                        && !active_reply_transfers.is_empty()
+                    {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "SyncComplete arrived while a bootstrap transfer is incomplete",
+                        ));
+                    }
+                    tracker.accept_runtime_reply(opened.payload_kind, reply)?;
+                    processed_signed_blobs.insert(signed_blob_hash);
+                }
+                _ => {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "unexpected Relay frame while awaiting subscription bootstrap",
+                    ));
+                }
+            }
+        }
     }
 
     /// 发送或精确重试一个 prompt，直到得到 authenticated daemon receipt 或非成功错误。
@@ -513,8 +822,12 @@ where
         let mut route_accepted = false;
         let transfer_started_at = Instant::now();
         let mut reply_transfers = TransferReassembler::new();
+        let mut active_reply_transfers = HashMap::new();
         loop {
-            let Some(received) = self.transport.recv().await? else {
+            let Some(received) = self
+                .recv_with_transfer_deadline(&active_reply_transfers)
+                .await?
+            else {
                 return Err(RemoteRuntimeError::OutcomeUnknown);
             };
             validate_received_runtime_frame(&received)?;
@@ -567,6 +880,7 @@ where
                                 "directed transfer messageId does not match the pending request",
                             ));
                         }
+                        let transfer_id = carrier.transfer.transfer_id.clone();
                         let now_ms = u64::try_from(transfer_started_at.elapsed().as_millis())
                             .unwrap_or(u64::MAX);
                         match reply_transfers.accept(
@@ -574,14 +888,25 @@ where
                             carrier.transfer,
                             now_ms,
                         )? {
-                            TransferProgress::InProgress { .. } => continue,
+                            TransferProgress::InProgress { .. } => {
+                                active_reply_transfers
+                                    .entry(transfer_id)
+                                    .or_insert_with(Instant::now);
+                                continue;
+                            }
                             TransferProgress::AlreadyComplete => {
                                 return Err(RemoteRuntimeError::InvalidReply(
                                     "directed transfer completed more than once",
                                 ));
                             }
                             TransferProgress::Complete(payload) => {
-                                let snapshot: CatalogSnapshot = serde_json::from_slice(&payload)?;
+                                active_reply_transfers.remove(&transfer_id);
+                                let catalog_payload_len = payload.len();
+                                let snapshot = canonical_json::<CatalogSnapshot>(&payload).ok_or(
+                                    RemoteRuntimeError::InvalidReply(
+                                        "Catalog transfer is not one canonical snapshot",
+                                    ),
+                                )?;
                                 let validated = pending.operation.validate_reply(
                                     SealedPayloadKind::CatalogSnapshot,
                                     RuntimeReply::Catalog(snapshot),
@@ -591,9 +916,19 @@ where
                                         "Catalog transfer did not produce a terminal reply",
                                     ));
                                 };
-                                self.persist_terminal(&pending, reply_frame_hash, &receipt)?;
-                                return directed_outcome(route_accepted, receipt)
-                                    .map(DirectedExchangeResult::Receipt);
+                                let terminal_persisted = self
+                                    .persist_or_clear_large_catalog_terminal(
+                                        &pending,
+                                        reply_frame_hash,
+                                        &receipt,
+                                        Some(catalog_payload_len),
+                                    )?;
+                                return directed_outcome_with_persistence(
+                                    route_accepted,
+                                    receipt,
+                                    terminal_persisted,
+                                )
+                                .map(DirectedExchangeResult::Receipt);
                             }
                         }
                     }
@@ -610,7 +945,11 @@ where
                             "Runtime reply exceeds the JSON frame limit",
                         ));
                     }
-                    let envelope: RuntimeEnvelope = serde_json::from_slice(&opened.payload)?;
+                    let envelope = canonical_json::<RuntimeEnvelope>(&opened.payload).ok_or(
+                        RemoteRuntimeError::InvalidReply(
+                            "Runtime reply is not one canonical JSON envelope",
+                        ),
+                    )?;
                     if envelope.message_id != pending.message_id {
                         return Err(RemoteRuntimeError::InvalidReply(
                             "Runtime messageId does not match the pending request",
@@ -626,9 +965,18 @@ where
                         .validate_reply(opened.payload_kind, reply)?
                     {
                         ValidatedDirectedReply::Terminal(receipt) => {
-                            self.persist_terminal(&pending, reply_frame_hash, &receipt)?;
-                            return directed_outcome(route_accepted, receipt)
-                                .map(DirectedExchangeResult::Receipt);
+                            let terminal_persisted = self.persist_or_clear_large_catalog_terminal(
+                                &pending,
+                                reply_frame_hash,
+                                &receipt,
+                                None,
+                            )?;
+                            return directed_outcome_with_persistence(
+                                route_accepted,
+                                receipt,
+                                terminal_persisted,
+                            )
+                            .map(DirectedExchangeResult::Receipt);
                         }
                         ValidatedDirectedReply::SelfRevocationCommitted => {}
                     }
@@ -651,6 +999,42 @@ where
                 }
             }
         }
+    }
+
+    async fn send_stream_binding_controls(
+        &mut self,
+        binding: &StreamBindingV1,
+    ) -> Result<(), RemoteRuntimeError> {
+        let subscribe = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::Subscribe(RelaySubscribe {
+                stream_route: binding.stream_route,
+                generation: binding.stream_generation,
+                cursor: binding.stream_cursor,
+            }),
+        };
+        let subscribe = encode(&subscribe);
+        let _ = decode(&subscribe)?;
+        self.transport
+            .send(ExactRelayFrame::from_frozen(subscribe)?)
+            .await?;
+
+        if let StreamCursor::At(up_to_seq) = binding.stream_cursor {
+            let ack = OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::Ack(RelayAck {
+                    stream_route: binding.stream_route,
+                    generation: binding.stream_generation,
+                    up_to_seq,
+                }),
+            };
+            let ack = encode(&ack);
+            let _ = decode(&ack)?;
+            self.transport
+                .send(ExactRelayFrame::from_frozen(ack)?)
+                .await?;
+        }
+        Ok(())
     }
 
     fn prepare_pending<R: CryptoRng>(
@@ -786,6 +1170,59 @@ where
         }))
     }
 
+    /// Compact Catalog 页可达 64 MiB，而 paired opaque-state 单字段与 durable exchange
+    /// terminal 都故意更小。只读大页完成完整认证与 canonical decode 后清掉 exact pending
+    /// 再返回；进程若在清理前退出会 exact retry，清理后退出则由下次调用重新查询，不把
+    /// 超界 plaintext 写成一个之后无法打开的 paired state。
+    fn persist_or_clear_large_catalog_terminal(
+        &mut self,
+        pending: &PendingExchange,
+        reply_frame_hash: [u8; 32],
+        receipt: &DirectedReceipt,
+        compact_catalog_payload_len: Option<usize>,
+    ) -> Result<bool, RemoteRuntimeError> {
+        // `DirectedReceipt` adds a small tagged wrapper around CatalogSnapshot. Keep a
+        // conservative margin so every persisted terminal remains decodable without allocating
+        // another copy of a potentially 64 MiB compact payload merely to measure that wrapper.
+        let oversized_catalog = matches!(receipt, DirectedReceipt::Catalog(_))
+            && compact_catalog_payload_len
+                .is_some_and(|len| len > MAX_RUNTIME_JSON_FRAME_BYTES.saturating_sub(128));
+        if oversized_catalog {
+            self.clear_exact_pending(pending)?;
+            Ok(false)
+        } else {
+            self.persist_terminal(pending, reply_frame_hash, receipt)?;
+            Ok(true)
+        }
+    }
+
+    fn clear_exact_pending(
+        &mut self,
+        expected: &PendingExchange,
+    ) -> Result<(), RemoteRuntimeError> {
+        let current = self.machine.opaque_runtime_state();
+        let exchange = current
+            .exchange()
+            .ok_or(RemoteRuntimeError::InvalidDurableState)
+            .and_then(decode_exchange)?;
+        let DurableExchange::Pending(pending) = exchange else {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        };
+        if pending.operation != expected.operation
+            || pending.intent_hash != expected.intent_hash
+            || pending.message_id != expected.message_id
+            || pending.request_route != expected.request_route
+            || pending.exact_send != expected.exact_send
+        {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        self.replace_runtime_state(
+            None,
+            current.replay_windows().to_vec(),
+            current.stream_cursors().to_vec(),
+        )
+    }
+
     fn persist_exchange(&mut self, exchange: DurableExchange) -> Result<(), RemoteRuntimeError> {
         let current = self.machine.opaque_runtime_state();
         self.replace_runtime_state(
@@ -822,6 +1259,31 @@ where
         )
     }
 
+    fn consume_subscription_failure_terminal(
+        &mut self,
+        expected: &DirectedOperation,
+    ) -> Result<(), RemoteRuntimeError> {
+        let current = self.machine.opaque_runtime_state();
+        let terminal = current
+            .exchange()
+            .ok_or(RemoteRuntimeError::InvalidDurableState)
+            .and_then(decode_exchange)?;
+        let DurableExchange::Terminal(terminal) = terminal else {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        };
+        if &terminal.operation != expected
+            || !matches!(terminal.operation, DirectedOperation::Subscribe { .. })
+            || !matches!(terminal.receipt, DirectedReceipt::Failure(_))
+        {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        self.replace_runtime_state(
+            None,
+            current.replay_windows().to_vec(),
+            current.stream_cursors().to_vec(),
+        )
+    }
+
     fn replace_runtime_state(
         &mut self,
         exchange: Option<Vec<u8>>,
@@ -844,6 +1306,20 @@ struct DirectedRequestPlan {
 }
 
 impl DirectedRequestPlan {
+    fn subscribe(inner_cursor: RuntimeInnerCursor) -> Result<Self, RemoteRuntimeError> {
+        validate_inner_cursor(&inner_cursor)?;
+        let wire = agentdeck_protocol::runtime::RuntimeRequest::Subscribe {
+            inner_cursor: inner_cursor.clone(),
+        };
+        Ok(Self {
+            operation: DirectedOperation::Subscribe {
+                inner_cursor: inner_cursor.clone(),
+            },
+            intent_hash: runtime_request_intent_hash(SUBSCRIBE_INTENT_DOMAIN, &wire)?,
+            request: AuthorizedRuntimeRequest::Subscribe(inner_cursor),
+        })
+    }
+
     fn catalog(page_cursor: Option<CatalogPageCursor>) -> Result<Self, RemoteRuntimeError> {
         let request = CatalogRequest { page_cursor };
         let wire = agentdeck_protocol::runtime::RuntimeRequest::Catalog(request.clone());
@@ -950,7 +1426,8 @@ impl DirectedRequestPlan {
                 approval_id: stored_approval,
                 ..
             } => stored_conversation == &conversation_id && stored_approval == &approval_id,
-            DirectedOperation::Catalog { .. }
+            DirectedOperation::Subscribe { .. }
+            | DirectedOperation::Catalog { .. }
             | DirectedOperation::Prompt { .. }
             | DirectedOperation::ResolveApproval { .. }
             | DirectedOperation::RevokeSelf { .. } => false,
@@ -984,6 +1461,9 @@ impl DirectedRequestPlan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DirectedOperation {
+    Subscribe {
+        inner_cursor: RuntimeInnerCursor,
+    },
     Catalog {
         page_cursor: Option<CatalogPageCursor>,
     },
@@ -1006,6 +1486,15 @@ enum DirectedOperation {
 impl DirectedOperation {
     fn accepts_json_payload_kind(&self, payload_kind: SealedPayloadKind) -> bool {
         match self {
+            Self::Subscribe { .. } => matches!(
+                payload_kind,
+                SealedPayloadKind::CatalogSnapshot
+                    | SealedPayloadKind::ConversationSnapshot
+                    | SealedPayloadKind::BackfillChunk
+                    | SealedPayloadKind::CommandReceipt
+                    | SealedPayloadKind::KeyUpdate
+                    | SealedPayloadKind::TransferPart
+            ),
             Self::Catalog { .. } => matches!(
                 payload_kind,
                 SealedPayloadKind::CatalogSnapshot | SealedPayloadKind::CommandReceipt
@@ -1030,13 +1519,17 @@ impl DirectedOperation {
                     failure,
                 )))
             }
-            (Self::Catalog { .. }, RuntimeReply::Catalog(snapshot))
-                if payload_kind == SealedPayloadKind::CatalogSnapshot =>
+            (Self::Catalog { page_cursor }, RuntimeReply::Catalog(snapshot))
+                if payload_kind == SealedPayloadKind::CatalogSnapshot
+                    && snapshot.current_page_cursor() == page_cursor.as_ref() =>
             {
                 Ok(ValidatedDirectedReply::Terminal(DirectedReceipt::Catalog(
                     snapshot,
                 )))
             }
+            (Self::Subscribe { .. }, _) => Err(RemoteRuntimeError::InvalidReply(
+                "subscription replies require the multi-receipt state machine",
+            )),
             (
                 Self::Prompt {
                     expected_configuration_revision,
@@ -1109,7 +1602,10 @@ impl DirectedOperation {
 
     fn stored_receipt_matches(&self, receipt: &DirectedReceipt) -> bool {
         match (self, receipt) {
-            (Self::Catalog { .. }, DirectedReceipt::Catalog(_)) => true,
+            (Self::Subscribe { .. }, DirectedReceipt::Failure(_)) => true,
+            (Self::Catalog { page_cursor }, DirectedReceipt::Catalog(snapshot)) => {
+                snapshot.current_page_cursor() == page_cursor.as_ref()
+            }
             (
                 Self::Prompt {
                     expected_configuration_revision,
@@ -1136,6 +1632,7 @@ impl DirectedOperation {
                 Self::Prompt { .. } | Self::ResolveApproval { .. } | Self::RetryApproval { .. },
                 DirectedReceipt::Catalog(_),
             ) => false,
+            (Self::Subscribe { .. }, _) => false,
             (_, DirectedReceipt::Failure(_)) => true,
             _ => false,
         }
@@ -1146,6 +1643,7 @@ impl DirectedOperation {
             Self::RetryApproval { attempt, .. } if *attempt > 0 => Ok(*attempt),
             Self::RetryApproval { .. } => Err(RemoteRuntimeError::InvalidDurableState),
             Self::Catalog { .. }
+            | Self::Subscribe { .. }
             | Self::Prompt { .. }
             | Self::ResolveApproval { .. }
             | Self::RevokeSelf { .. } => Err(RemoteRuntimeError::InvalidDurableState),
@@ -1167,9 +1665,494 @@ enum DirectedReceipt {
     Failure(RuntimeFailure),
 }
 
+struct SubscriptionBootstrapProgress<D> {
+    route_accepted: bool,
+    subscription: SubscriptionReceipt,
+    sync_complete: RuntimeSyncComplete,
+    staged_reducer: D,
+}
+
+impl<D> SubscriptionBootstrapProgress<D> {
+    fn into_outcome_and_reducer(
+        self,
+        binding: StreamBindingV1,
+    ) -> (RemoteSubscriptionBootstrap, D) {
+        (
+            RemoteSubscriptionBootstrap {
+                route_accepted: self.route_accepted,
+                subscription: self.subscription,
+                sync_complete: self.sync_complete,
+                binding,
+            },
+            self.staged_reducer,
+        )
+    }
+}
+
+struct SubscriptionBootstrapTracker<D> {
+    requested: RuntimeInnerCursor,
+    delivered: RuntimeInnerCursor,
+    subscription: Option<SubscriptionReceipt>,
+    staged_reducer: D,
+    catalog_snapshot_base: Option<StreamCursor>,
+    catalog_page_chain: CatalogPageChain,
+    conversation_snapshot_seen: bool,
+    backfill_started: bool,
+    sync_complete: Option<RuntimeSyncComplete>,
+}
+
+enum CatalogPageChain {
+    NotStarted,
+    Expect(CatalogPageCursor),
+    Complete,
+}
+
+impl<D> SubscriptionBootstrapTracker<D>
+where
+    D: RemoteSubscriptionReducer,
+{
+    fn new(requested: RuntimeInnerCursor, reducer: &D) -> Result<Self, RemoteRuntimeError> {
+        validate_inner_cursor(&requested)?;
+        if reducer.inner_cursor() != &requested {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        Ok(Self {
+            delivered: requested.clone(),
+            requested,
+            subscription: None,
+            staged_reducer: reducer.clone(),
+            catalog_snapshot_base: None,
+            catalog_page_chain: CatalogPageChain::NotStarted,
+            conversation_snapshot_seen: false,
+            backfill_started: false,
+            sync_complete: None,
+        })
+    }
+
+    const fn requested(&self) -> &RuntimeInnerCursor {
+        &self.requested
+    }
+
+    fn accept_runtime_reply(
+        &mut self,
+        payload_kind: SealedPayloadKind,
+        reply: RuntimeReply,
+    ) -> Result<(), RemoteRuntimeError> {
+        if self.sync_complete.is_some() {
+            return Err(RemoteRuntimeError::InvalidReply(
+                "Runtime subscription emitted data after SyncComplete",
+            ));
+        }
+        match reply {
+            RuntimeReply::Subscription(receipt)
+                if payload_kind == SealedPayloadKind::CommandReceipt
+                    && self.subscription.is_none() =>
+            {
+                if !matches!(receipt, SubscriptionReceipt::Subscribed { .. }) {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "Runtime subscription did not return Subscribed",
+                    ));
+                }
+                self.subscription = Some(receipt);
+                Ok(())
+            }
+            RuntimeReply::Catalog(snapshot)
+                if payload_kind == SealedPayloadKind::CatalogSnapshot =>
+            {
+                self.require_subscribed()?;
+                let current_page_matches = match &self.catalog_page_chain {
+                    CatalogPageChain::NotStarted => snapshot.current_page_cursor().is_none(),
+                    CatalogPageChain::Expect(expected) => {
+                        snapshot.current_page_cursor() == Some(expected)
+                    }
+                    CatalogPageChain::Complete => false,
+                };
+                if self.backfill_started
+                    || !current_page_matches
+                    || self
+                        .catalog_snapshot_base
+                        .is_some_and(|base| base != snapshot.base_catalog_cursor)
+                {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "Catalog snapshot pages are incomplete or out of order",
+                    ));
+                }
+                let RuntimeInnerCursor::Catalog { cursor: delivered } = &self.delivered else {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "Catalog snapshot crossed the requested subscription target",
+                    ));
+                };
+                if cursor_cmp(snapshot.base_catalog_cursor, *delivered).is_lt() {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "Catalog snapshot moved the inner cursor backwards",
+                    ));
+                }
+                let next = RuntimeInnerCursor::Catalog {
+                    cursor: snapshot.base_catalog_cursor,
+                };
+                self.catalog_page_chain = match snapshot.next_page_cursor().cloned() {
+                    Some(next) => CatalogPageChain::Expect(next),
+                    None => CatalogPageChain::Complete,
+                };
+                self.catalog_snapshot_base = Some(snapshot.base_catalog_cursor);
+                self.apply_item(
+                    RemoteSubscriptionBootstrapItem::CatalogSnapshot(snapshot),
+                    next,
+                )
+            }
+            RuntimeReply::Snapshot(snapshot)
+                if payload_kind == SealedPayloadKind::ConversationSnapshot =>
+            {
+                self.require_subscribed()?;
+                if self.conversation_snapshot_seen || self.backfill_started {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "Conversation snapshot is duplicated or follows backfill",
+                    ));
+                }
+                let RuntimeInnerCursor::Conversation {
+                    conversation_id,
+                    cursor: delivered,
+                } = &self.delivered
+                else {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "Conversation snapshot crossed the requested subscription target",
+                    ));
+                };
+                if snapshot.conversation_id != *conversation_id
+                    || cursor_cmp(snapshot.base_event_cursor, *delivered).is_lt()
+                {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "Conversation snapshot does not extend the requested target",
+                    ));
+                }
+                let next = RuntimeInnerCursor::Conversation {
+                    conversation_id: conversation_id.clone(),
+                    cursor: snapshot.base_event_cursor,
+                };
+                self.conversation_snapshot_seen = true;
+                self.apply_item(
+                    RemoteSubscriptionBootstrapItem::ConversationSnapshot(snapshot),
+                    next,
+                )
+            }
+            RuntimeReply::Backfill(chunk) if payload_kind == SealedPayloadKind::BackfillChunk => {
+                self.require_subscribed()?;
+                if !matches!(&self.catalog_page_chain, CatalogPageChain::NotStarted)
+                    || self.conversation_snapshot_seen
+                {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "Backfill cannot be mixed with a snapshot bootstrap",
+                    ));
+                }
+                let next = self.next_after_backfill(&chunk)?;
+                self.backfill_started = true;
+                self.apply_item(RemoteSubscriptionBootstrapItem::Backfill(chunk), next)
+            }
+            RuntimeReply::SyncComplete(sync)
+                if payload_kind == SealedPayloadKind::CommandReceipt =>
+            {
+                if matches!(&self.catalog_page_chain, CatalogPageChain::Expect(_)) {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "SyncComplete arrived before the final Catalog snapshot page",
+                    ));
+                }
+                let initial_snapshot_seen = match &self.requested {
+                    RuntimeInnerCursor::Catalog { .. } => self.catalog_snapshot_base.is_some(),
+                    RuntimeInnerCursor::Conversation { .. } => self.conversation_snapshot_seen,
+                };
+                if inner_cursor_value(&self.requested) == StreamCursor::BeforeFirst
+                    && !initial_snapshot_seen
+                {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "BeforeFirst subscription completed without its required snapshot",
+                    ));
+                }
+                let subscription = self.require_subscribed()?;
+                let SubscriptionReceipt::Subscribed { stream_generation } = subscription else {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "Runtime subscription receipt is not Subscribed",
+                    ));
+                };
+                if sync.stream_generation != *stream_generation
+                    || sync.key_directory_revision == 0
+                    || sync.stream_cursor.checked_next().is_err()
+                    || sync.inner_cursor != self.delivered
+                    || self.staged_reducer.inner_cursor() != &sync.inner_cursor
+                    || !same_inner_target(&self.requested, &sync.inner_cursor)
+                {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "SyncComplete does not match the subscription bootstrap",
+                    ));
+                }
+                validate_inner_cursor(&sync.inner_cursor)?;
+                self.sync_complete = Some(sync);
+                Ok(())
+            }
+            RuntimeReply::Subscription(_) => Err(RemoteRuntimeError::InvalidReply(
+                "Runtime subscription receipt is duplicated or has the wrong payload kind",
+            )),
+            RuntimeReply::Catalog(_)
+            | RuntimeReply::Snapshot(_)
+            | RuntimeReply::Backfill(_)
+            | RuntimeReply::SyncComplete(_) => Err(RemoteRuntimeError::InvalidReply(
+                "Runtime subscription reply has the wrong payload kind",
+            )),
+            _ => Err(RemoteRuntimeError::InvalidReply(
+                "Runtime subscription received an unrelated reply",
+            )),
+        }
+    }
+
+    fn next_after_backfill(
+        &self,
+        chunk: &BackfillChunk,
+    ) -> Result<RuntimeInnerCursor, RemoteRuntimeError> {
+        match (chunk, &self.delivered) {
+            (BackfillChunk::Catalog { range, .. }, RuntimeInnerCursor::Catalog { cursor })
+                if range.after() == *cursor =>
+            {
+                Ok(RuntimeInnerCursor::Catalog {
+                    cursor: range.through(),
+                })
+            }
+            (
+                BackfillChunk::Conversation {
+                    conversation_id,
+                    range,
+                    ..
+                },
+                RuntimeInnerCursor::Conversation {
+                    conversation_id: expected,
+                    cursor,
+                },
+            ) if conversation_id == expected && range.after() == *cursor => {
+                Ok(RuntimeInnerCursor::Conversation {
+                    conversation_id: expected.clone(),
+                    cursor: range.through(),
+                })
+            }
+            _ => Err(RemoteRuntimeError::InvalidReply(
+                "Backfill does not continue the requested subscription target",
+            )),
+        }
+    }
+
+    fn apply_item(
+        &mut self,
+        item: RemoteSubscriptionBootstrapItem,
+        next: RuntimeInnerCursor,
+    ) -> Result<(), RemoteRuntimeError> {
+        self.staged_reducer.apply(&item)?;
+        if self.staged_reducer.inner_cursor() != &next {
+            return Err(RemoteRuntimeError::InvalidReply(
+                "subscription reducer did not apply the complete canonical item",
+            ));
+        }
+        self.delivered = next;
+        Ok(())
+    }
+
+    fn require_subscribed(&self) -> Result<&SubscriptionReceipt, RemoteRuntimeError> {
+        self.subscription
+            .as_ref()
+            .ok_or(RemoteRuntimeError::InvalidReply(
+                "Runtime subscription data arrived before Subscribed",
+            ))
+    }
+
+    fn finish(
+        self,
+        route_accepted: bool,
+        binding: &StreamBindingV1,
+    ) -> Result<SubscriptionBootstrapProgress<D>, RemoteRuntimeError> {
+        let subscription = self.subscription.ok_or(RemoteRuntimeError::InvalidReply(
+            "StreamBinding arrived before Subscribed",
+        ))?;
+        let sync_complete = self.sync_complete.ok_or(RemoteRuntimeError::InvalidReply(
+            "StreamBinding arrived before SyncComplete",
+        ))?;
+        validate_subscription_binding(&self.requested, &sync_complete, binding)?;
+        Ok(SubscriptionBootstrapProgress {
+            route_accepted,
+            subscription,
+            sync_complete,
+            staged_reducer: self.staged_reducer,
+        })
+    }
+}
+
+fn decode_subscription_transfer(
+    requested: &RuntimeInnerCursor,
+    payload: &[u8],
+) -> Result<(SealedPayloadKind, RuntimeReply), RemoteRuntimeError> {
+    let snapshot = match requested {
+        RuntimeInnerCursor::Catalog { .. } => {
+            canonical_json::<CatalogSnapshot>(payload).map(|snapshot| {
+                (
+                    SealedPayloadKind::CatalogSnapshot,
+                    RuntimeReply::Catalog(snapshot),
+                )
+            })
+        }
+        RuntimeInnerCursor::Conversation { .. } => canonical_json::<ConversationSnapshot>(payload)
+            .map(|snapshot| {
+                (
+                    SealedPayloadKind::ConversationSnapshot,
+                    RuntimeReply::Snapshot(snapshot),
+                )
+            }),
+    };
+    let backfill = canonical_json::<BackfillChunk>(payload).map(|chunk| {
+        (
+            SealedPayloadKind::BackfillChunk,
+            RuntimeReply::Backfill(chunk),
+        )
+    });
+    match (snapshot, backfill) {
+        (Some(reply), None) | (None, Some(reply)) => Ok(reply),
+        (None, None) | (Some(_), Some(_)) => Err(RemoteRuntimeError::InvalidReply(
+            "subscription transfer is not one exact canonical snapshot or backfill payload",
+        )),
+    }
+}
+
+fn canonical_json<T>(payload: &[u8]) -> Option<T>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let value = serde_json::from_slice::<T>(payload).ok()?;
+    let mut comparator = CanonicalJsonComparator::new(payload);
+    serde_json::to_writer(&mut comparator, &value).ok()?;
+    comparator.is_exact().then_some(value)
+}
+
+struct CanonicalJsonComparator<'a> {
+    expected: &'a [u8],
+    offset: usize,
+    matches: bool,
+}
+
+impl<'a> CanonicalJsonComparator<'a> {
+    const fn new(expected: &'a [u8]) -> Self {
+        Self {
+            expected,
+            offset: 0,
+            matches: true,
+        }
+    }
+
+    fn is_exact(&self) -> bool {
+        self.matches && self.offset == self.expected.len()
+    }
+}
+
+impl std::io::Write for CanonicalJsonComparator<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(end) = self.offset.checked_add(bytes.len()) else {
+            self.matches = false;
+            return Ok(bytes.len());
+        };
+        if self.expected.get(self.offset..end) != Some(bytes) {
+            self.matches = false;
+        }
+        self.offset = end;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_inner_cursor(cursor: &RuntimeInnerCursor) -> Result<(), RemoteRuntimeError> {
+    match cursor {
+        RuntimeInnerCursor::Catalog { cursor } => cursor
+            .checked_next()
+            .map(|_| ())
+            .map_err(|_| RemoteRuntimeError::InvalidDurableState),
+        RuntimeInnerCursor::Conversation {
+            conversation_id,
+            cursor,
+        } if !conversation_id.as_str().is_empty()
+            && conversation_id.as_str().len() <= 1_024
+            && !conversation_id.as_str().as_bytes().contains(&0) =>
+        {
+            cursor
+                .checked_next()
+                .map(|_| ())
+                .map_err(|_| RemoteRuntimeError::InvalidDurableState)
+        }
+        RuntimeInnerCursor::Conversation { .. } => Err(RemoteRuntimeError::InvalidDurableState),
+    }
+}
+
+fn validate_subscription_binding(
+    requested: &RuntimeInnerCursor,
+    sync: &RuntimeSyncComplete,
+    binding: &StreamBindingV1,
+) -> Result<(), RemoteRuntimeError> {
+    binding
+        .validate()
+        .map_err(|_| RemoteRuntimeError::InvalidReply("StreamBinding is invalid"))?;
+    if !same_inner_target(requested, &binding.inner_cursor)
+        || !same_inner_target(requested, &sync.inner_cursor)
+        || binding.stream_cursor != sync.stream_cursor
+        || binding.key_directory_revision.value() != sync.key_directory_revision
+        || cursor_cmp(
+            inner_cursor_value(&binding.inner_cursor),
+            inner_cursor_value(requested),
+        )
+        .is_lt()
+        || cursor_cmp(
+            inner_cursor_value(&sync.inner_cursor),
+            inner_cursor_value(&binding.inner_cursor),
+        )
+        .is_lt()
+    {
+        return Err(RemoteRuntimeError::InvalidReply(
+            "StreamBinding does not match the completed subscription",
+        ));
+    }
+    Ok(())
+}
+
+fn same_inner_target(left: &RuntimeInnerCursor, right: &RuntimeInnerCursor) -> bool {
+    match (left, right) {
+        (RuntimeInnerCursor::Catalog { .. }, RuntimeInnerCursor::Catalog { .. }) => true,
+        (
+            RuntimeInnerCursor::Conversation {
+                conversation_id: left,
+                ..
+            },
+            RuntimeInnerCursor::Conversation {
+                conversation_id: right,
+                ..
+            },
+        ) => left == right,
+        _ => false,
+    }
+}
+
+fn inner_cursor_value(cursor: &RuntimeInnerCursor) -> StreamCursor {
+    match cursor {
+        RuntimeInnerCursor::Catalog { cursor }
+        | RuntimeInnerCursor::Conversation { cursor, .. } => *cursor,
+    }
+}
+
+fn cursor_cmp(left: StreamCursor, right: StreamCursor) -> std::cmp::Ordering {
+    match (left, right) {
+        (StreamCursor::BeforeFirst, StreamCursor::BeforeFirst) => std::cmp::Ordering::Equal,
+        (StreamCursor::BeforeFirst, StreamCursor::At(_)) => std::cmp::Ordering::Less,
+        (StreamCursor::At(_), StreamCursor::BeforeFirst) => std::cmp::Ordering::Greater,
+        (StreamCursor::At(left), StreamCursor::At(right)) => left.cmp(&right),
+    }
+}
+
 struct DirectedOutcome {
     route_accepted: bool,
     receipt: DirectedReceipt,
+    terminal_persisted: bool,
 }
 
 enum DirectedExchangeResult {
@@ -1215,11 +2198,20 @@ fn directed_outcome(
     route_accepted: bool,
     receipt: DirectedReceipt,
 ) -> Result<DirectedOutcome, RemoteRuntimeError> {
+    directed_outcome_with_persistence(route_accepted, receipt, true)
+}
+
+fn directed_outcome_with_persistence(
+    route_accepted: bool,
+    receipt: DirectedReceipt,
+    terminal_persisted: bool,
+) -> Result<DirectedOutcome, RemoteRuntimeError> {
     match receipt {
         DirectedReceipt::Failure(failure) => Err(RemoteRuntimeError::DaemonFailure(failure)),
         receipt => Ok(DirectedOutcome {
             route_accepted,
             receipt,
+            terminal_persisted,
         }),
     }
 }
@@ -1494,12 +2486,15 @@ fn decode_exchange(bytes: &[u8]) -> Result<DurableExchange, RemoteRuntimeError> 
         return Err(RemoteRuntimeError::InvalidDurableState);
     }
     let version = reader.u16()?;
-    if !matches!(version, LEGACY_EXCHANGE_VERSION | EXCHANGE_VERSION) {
+    if !matches!(
+        version,
+        LEGACY_EXCHANGE_VERSION | PRE_SUBSCRIPTION_EXCHANGE_VERSION | EXCHANGE_VERSION
+    ) {
         return Err(RemoteRuntimeError::InvalidDurableState);
     }
     let tag = reader.u8()?;
-    let current_operation = if version == EXCHANGE_VERSION {
-        Some(decode_operation(&mut reader)?)
+    let current_operation = if version != LEGACY_EXCHANGE_VERSION {
+        Some(decode_operation(&mut reader, version)?)
     } else {
         None
     };
@@ -1581,6 +2576,11 @@ fn encode_operation(
     operation: &DirectedOperation,
 ) -> Result<(), RemoteRuntimeError> {
     match operation {
+        DirectedOperation::Subscribe { inner_cursor } => {
+            output.push(5);
+            let canonical = serde_json::to_vec(inner_cursor)?;
+            put_bytes(output, &canonical)?;
+        }
         DirectedOperation::Catalog { page_cursor } => {
             output.push(4);
             match page_cursor {
@@ -1619,7 +2619,10 @@ fn encode_operation(
     Ok(())
 }
 
-fn decode_operation(reader: &mut Reader<'_>) -> Result<DirectedOperation, RemoteRuntimeError> {
+fn decode_operation(
+    reader: &mut Reader<'_>,
+    exchange_version: u16,
+) -> Result<DirectedOperation, RemoteRuntimeError> {
     match reader.u8()? {
         0 => Ok(DirectedOperation::Prompt {
             expected_configuration_revision: reader.u64()?,
@@ -1667,6 +2670,15 @@ fn decode_operation(reader: &mut Reader<'_>) -> Result<DirectedOperation, Remote
                 _ => return Err(RemoteRuntimeError::InvalidDurableState),
             };
             Ok(DirectedOperation::Catalog { page_cursor })
+        }
+        5 if exchange_version == EXCHANGE_VERSION => {
+            let raw = reader.bytes(MAX_RUNTIME_JSON_FRAME_BYTES - 1)?;
+            let inner_cursor: RuntimeInnerCursor = serde_json::from_slice(raw)?;
+            if serde_json::to_vec(&inner_cursor)?.as_slice() != raw {
+                return Err(RemoteRuntimeError::InvalidDurableState);
+            }
+            validate_inner_cursor(&inner_cursor)?;
+            Ok(DirectedOperation::Subscribe { inner_cursor })
         }
         _ => Err(RemoteRuntimeError::InvalidDurableState),
     }
@@ -2029,6 +3041,49 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reply_and_durable_terminal_bind_the_exact_requested_page_cursor() {
+        let requested = CatalogPageCursor::new("catalog-requested-page");
+        let operation = DirectedOperation::Catalog {
+            page_cursor: Some(requested.clone()),
+        };
+        let matching = CatalogSnapshot::new(StreamCursor::At(1), Vec::new(), Some(requested), None)
+            .expect("bounded matching Catalog page");
+        assert!(
+            operation
+                .validate_reply(
+                    SealedPayloadKind::CatalogSnapshot,
+                    RuntimeReply::Catalog(matching),
+                )
+                .is_ok()
+        );
+
+        let mismatched = CatalogSnapshot::new(StreamCursor::At(1), Vec::new(), None, None)
+            .expect("bounded mismatched Catalog page");
+        assert!(matches!(
+            operation.validate_reply(
+                SealedPayloadKind::CatalogSnapshot,
+                RuntimeReply::Catalog(mismatched.clone()),
+            ),
+            Err(RemoteRuntimeError::InvalidReply(_))
+        ));
+
+        let encoded = encode_exchange(&DurableExchange::Terminal(TerminalExchange {
+            operation,
+            intent_hash: [0x81; 32],
+            message_id: MessageId::new("catalog-cursor-terminal"),
+            request_route: RequestRouteId::from_bytes([0x82; 16]),
+            request_frame_hash: [0x83; 32],
+            reply_frame_hash: [0x84; 32],
+            receipt: DirectedReceipt::Catalog(mismatched),
+        }))
+        .expect("encode deliberately mismatched durable terminal");
+        assert!(matches!(
+            decode_exchange(&encoded),
+            Err(RemoteRuntimeError::InvalidDurableState)
+        ));
+    }
+
+    #[test]
     fn resolve_and_retry_operations_and_intent_hashes_are_domain_separated() {
         let conversation_id = ConversationId::new("conversation-domain-separation");
         let approval_id = ApprovalId::new("approval-domain-separation");
@@ -2199,7 +3254,7 @@ mod tests {
     }
 
     #[test]
-    fn current_v2_terminal_rejects_noncanonical_receipt_json() {
+    fn pre_subscription_v2_terminal_remains_compatible_and_rejects_noncanonical_json() {
         let receipt = DirectedReceipt::Command(CommandReceipt::Accepted {
             command_id: agentdeck_protocol::runtime::identity::CommandId::new(
                 "current-v2-canonical",
@@ -2218,7 +3273,8 @@ mod tests {
             reply_frame_hash: [0x54; 32],
             receipt,
         });
-        let canonical = encode_exchange(&exchange).expect("canonical v2 terminal");
+        let mut canonical = encode_exchange(&exchange).expect("canonical v3 terminal");
+        canonical[4..6].copy_from_slice(&PRE_SUBSCRIPTION_EXCHANGE_VERSION.to_be_bytes());
         assert!(matches!(
             decode_exchange(&canonical),
             Ok(DurableExchange::Terminal(_))
@@ -2241,6 +3297,53 @@ mod tests {
             decode_exchange(&noncanonical),
             Err(RemoteRuntimeError::InvalidDurableState)
         ));
+    }
+
+    #[test]
+    fn pre_subscription_v2_rejects_v3_subscribe_pending_and_terminal_downgrades() {
+        let operation = DirectedOperation::Subscribe {
+            inner_cursor: RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::BeforeFirst,
+            },
+        };
+        let request_route = RequestRouteId::from_bytes([0x61; 16]);
+        let exact_send = encode(&OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::Send(RelaySend {
+                device_route: agentdeck_protocol::relay_v2::DeviceRouteId::from_bytes([0x62; 16]),
+                request_route,
+                sealed_blob: SealedBlob(vec![0x63; 32]),
+            }),
+        });
+        let exchanges = [
+            DurableExchange::Pending(PendingExchange {
+                operation: operation.clone(),
+                intent_hash: [0x64; 32],
+                message_id: MessageId::new("subscribe-v3-pending"),
+                request_route,
+                exact_send,
+            }),
+            DurableExchange::Terminal(TerminalExchange {
+                operation,
+                intent_hash: [0x65; 32],
+                message_id: MessageId::new("subscribe-v3-terminal"),
+                request_route,
+                request_frame_hash: [0x66; 32],
+                reply_frame_hash: [0x67; 32],
+                receipt: DirectedReceipt::Failure(RuntimeFailure::new(
+                    "daemon.subscribe.fixture",
+                    "subscription terminal fixture",
+                )),
+            }),
+        ];
+        for exchange in exchanges {
+            let mut downgraded = encode_exchange(&exchange).expect("canonical v3 subscribe");
+            downgraded[4..6].copy_from_slice(&PRE_SUBSCRIPTION_EXCHANGE_VERSION.to_be_bytes());
+            assert!(matches!(
+                decode_exchange(&downgraded),
+                Err(RemoteRuntimeError::InvalidDurableState)
+            ));
+        }
     }
 
     #[test]

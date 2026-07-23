@@ -4,7 +4,7 @@
 #[path = "support/remote_pairing.rs"]
 mod remote_pairing;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -19,45 +19,63 @@ use agentdeck_cli::remote::paired_machine::{
 use agentdeck_cli::remote::runtime::{
     ExactRelayFrame, ReceivedRuntimeFrame, RemoteCatalogPageOutcome, RemotePromptOutcome,
     RemoteRuntime, RemoteRuntimeError, RemoteRuntimeTransport, RemoteRuntimeTransportError,
+    RemoteSubscriptionBootstrapItem, RemoteSubscriptionReducer,
 };
 use agentdeck_crypto::{
     AeadReceivingKey, AeadSendingKey, SecretAeadKey, SenderCounter, SigningKey, VerifyingKey,
     counter::COUNTER_BLOCK_SIZE, open_sealed_payload, seal_symmetric, sha256, sign_sealed,
     sign_tbs, verify_sealed,
 };
+use agentdeck_protocol::capabilities::{SessionCapabilities, VendorCapabilities};
 use agentdeck_protocol::e2ee::{
-    KeyId, KeyPurpose, OuterContextV1, SealedPayloadKind, SignedSealedBlobV1,
+    E2EE_FORMAT_VERSION, KeyControlV1, KeyId, KeyPurpose, OuterContextV1, SealedPayloadKind,
+    SignedSealedBlobV1, StreamBindingV1,
 };
 use agentdeck_protocol::relay_v2::auth::{DeviceRevocation, Ed25519Signature};
 use agentdeck_protocol::relay_v2::frame::{
-    AcceptedRef, Reply, RevocationCommitted, RouteAccepted, SealedBlob, Send,
+    AcceptedRef, Ack, Reply, RevocationCommitted, RouteAccepted, SealedBlob, Send, Subscribe,
 };
 use agentdeck_protocol::relay_v2::{
-    DeviceRouteId, GrantSerial as RelayGrantSerial, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION,
-    RelayFrameBody, RequestRouteId, decode, encode,
+    DeviceRouteId, GrantSerial as RelayGrantSerial, KeyDirectoryRevision, OpaqueRouteFrame,
+    RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId, StreamGenerationId, StreamRouteId,
+    TrustEpoch, decode, encode,
 };
 use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::identity::{
     ApprovalId, CatalogPageCursor, CommandId, GrantSerial as RuntimeGrantSerial, MessageId,
-    TransferId, TurnId,
+    StreamGeneration, TransferId, TurnId,
 };
 use agentdeck_protocol::runtime::{
-    ApprovalReceipt, CatalogSnapshot, CommandReceipt, ConversationEntry, ConversationId,
-    IdempotencyKey, PromptPayload, RUNTIME_PROTOCOL_VERSION, RevocationReceipt, RuntimeEnvelope,
-    RuntimeFailure, RuntimeMessage, RuntimeReply, RuntimeRequest, RuntimeTransferCarrierV1,
-    RuntimeTransferChannel, SendPromptRequest, StreamCursor, TransferEnvelope,
+    ApprovalReceipt, BackfillChunk, BackfillRange, CatalogDelta, CatalogSnapshot, CommandReceipt,
+    ConversationConfigurationState, ConversationEntry, ConversationId, ConversationSnapshot,
+    IdempotencyKey, MAX_RUNTIME_JSON_FRAME_BYTES, PromptPayload, RUNTIME_PROTOCOL_VERSION,
+    RevocationReceipt, RuntimeEnvelope, RuntimeFailure, RuntimeInnerCursor, RuntimeMessage,
+    RuntimeReply, RuntimeRequest, RuntimeSyncComplete, RuntimeTransferCarrierV1,
+    RuntimeTransferChannel, SendPromptRequest, SnapshotItem, StreamCursor, SubscriptionReceipt,
+    TransferEnvelope,
 };
+use agentdeck_protocol::vendor::codex::CodexCapabilities;
 use agentdeck_protocol::{ActionDecision, ActionDecisionKind, AgentKind};
 use async_trait::async_trait;
 
 use remote_pairing::{
-    DEVICE_COMMAND_EPOCH, DEVICE_COMMAND_KEY, DEVICE_REPLY_EPOCH, DEVICE_REPLY_KEY, DEVICE_ROUTE,
-    DeterministicRng, INSTALLATION_ID, KEY_DIRECTORY_REVISION, MACHINE_ROUTE, PairingFixture,
-    PanicRng, RELAY_SERVER, ROOT_KEY_ID,
+    CATALOG_EPOCH, CONVERSATION_EPOCH, DEVICE_COMMAND_EPOCH, DEVICE_COMMAND_KEY,
+    DEVICE_REPLY_EPOCH, DEVICE_REPLY_KEY, DEVICE_ROUTE, DeterministicRng, INSTALLATION_ID,
+    KEY_DIRECTORY_REVISION, MACHINE_ROUTE, PairingFixture, PanicRng, RELAY_SERVER, ROOT_KEY_ID,
 };
 
 const REPLY_COUNTER: u64 = 41;
 const WRONG_REQUEST_ROUTE: RequestRouteId = RequestRouteId::from_bytes([0xa5; 16]);
+const CATALOG_STREAM_ROUTE: StreamRouteId = StreamRouteId::from_bytes([0x81; 16]);
+const CONVERSATION_STREAM_ROUTE: StreamRouteId = StreamRouteId::from_bytes([0x82; 16]);
+const CATALOG_RELAY_GENERATION: StreamGenerationId = StreamGenerationId::from_bytes([0x91; 16]);
+const CONVERSATION_RELAY_GENERATION: StreamGenerationId =
+    StreamGenerationId::from_bytes([0x92; 16]);
+const CATALOG_OUTER_HIGH_WATER: u64 = 23;
+const CATALOG_INNER_HIGH_WATER: u64 = 17;
+const CONVERSATION_OUTER_HIGH_WATER: u64 = 29;
+const CONVERSATION_INNER_HIGH_WATER: u64 = 11;
+const SUBSCRIPTION_CONVERSATION_ID: &str = "018f0f9d-6f0a-7ad0-8000-000000000082";
 
 struct PanicOnNthStateActive {
     target: usize,
@@ -129,6 +147,35 @@ enum TransportScript {
     EofAfterSend,
     WrongRequestRouteOnly,
     RevocationTerminalOnly(RevocationTerminalShape),
+    Subscription(SubscriptionScript),
+}
+
+#[derive(Clone, Copy)]
+enum SubscriptionScript {
+    CatalogAt,
+    CatalogFailure,
+    CatalogCompact,
+    CatalogCompactBackfill,
+    CatalogSnapshotThenBackfill,
+    CatalogCompactSnapshotThenBackfill,
+    CatalogDuplicateOpenPage,
+    CatalogMissingFirstPage,
+    CatalogCompactMissingMiddlePage,
+    CatalogCompactWrongMessage,
+    CatalogCompactWrongChannel,
+    CatalogCompactCrossTarget,
+    CatalogPartialTransferThenSync,
+    CatalogPartialTransferThenPending,
+    CatalogUnfinishedPageThenSync,
+    CatalogSyncAheadOfBinding,
+    ConversationIndependentGeneration,
+    ConversationCompact,
+    CatalogBeforeFirst,
+    CatalogBeforeFirstNoSnapshot,
+    CatalogMissingBinding,
+    CatalogCrossTargetBinding,
+    CatalogWrongBindingRevision,
+    CatalogBindingBeforeSync,
 }
 
 #[derive(Clone, Copy)]
@@ -151,6 +198,7 @@ struct FakeTransport {
     inbound: VecDeque<ReceivedRuntimeFrame>,
     sent_codec_frames: Arc<Mutex<Vec<Vec<u8>>>>,
     shutdown_observed: Option<Arc<AtomicBool>>,
+    panic_on_first_subscription_control: bool,
 }
 
 impl FakeTransport {
@@ -238,6 +286,7 @@ impl FakeTransport {
                 inbound: VecDeque::new(),
                 sent_codec_frames: Arc::clone(&sent_codec_frames),
                 shutdown_observed: None,
+                panic_on_first_subscription_control: false,
             },
             sent_codec_frames,
         )
@@ -262,8 +311,43 @@ impl FakeTransport {
         (transport, sent)
     }
 
+    fn new_subscription(
+        script: SubscriptionScript,
+        inner_cursor: RuntimeInnerCursor,
+        device_sign_verifying_key: VerifyingKey,
+    ) -> (Self, Arc<Mutex<Vec<Vec<u8>>>>) {
+        Self::new_runtime(
+            TransportScript::Subscription(script),
+            RuntimeRequest::Subscribe { inner_cursor },
+            RuntimeReply::Subscription(catalog_subscription_receipt()),
+            device_sign_verifying_key,
+        )
+    }
+
+    fn new_subscription_with_counters(
+        script: SubscriptionScript,
+        inner_cursor: RuntimeInnerCursor,
+        device_sign_verifying_key: VerifyingKey,
+        expected_command_counter: u64,
+        reply_counter: u64,
+    ) -> (Self, Arc<Mutex<Vec<Vec<u8>>>>) {
+        Self::new_runtime_with_counters(
+            TransportScript::Subscription(script),
+            RuntimeRequest::Subscribe { inner_cursor },
+            RuntimeReply::Subscription(catalog_subscription_receipt()),
+            device_sign_verifying_key,
+            expected_command_counter,
+            reply_counter,
+        )
+    }
+
     fn with_shutdown_observer(mut self, shutdown_observed: Arc<AtomicBool>) -> Self {
         self.shutdown_observed = Some(shutdown_observed);
+        self
+    }
+
+    fn with_panic_on_first_subscription_control(mut self) -> Self {
+        self.panic_on_first_subscription_control = true;
         self
     }
 
@@ -397,6 +481,18 @@ impl FakeTransport {
             TransportScript::RevocationTerminalOnly(shape) => {
                 self.inbound.push_back(revocation_terminal(shape));
             }
+            TransportScript::Subscription(script) => {
+                self.inbound.extend(
+                    subscription_inbound_frames(
+                        script,
+                        request_route,
+                        message_id,
+                        self.reply_counter,
+                    )
+                    .into_iter()
+                    .map(received_exact),
+                );
+            }
         }
     }
 }
@@ -406,17 +502,42 @@ impl RemoteRuntimeTransport for FakeTransport {
     async fn send(&mut self, frame: ExactRelayFrame) -> Result<(), RemoteRuntimeTransportError> {
         let exact_bytes = frame.into_bytes();
         let decoded = decode(&exact_bytes).expect("runtime must hand transport canonical bytes");
-        let (request_route, message_id) = self.inspect_real_send(&decoded);
         self.sent_codec_frames
             .lock()
             .expect("sent-frame recorder")
             .push(exact_bytes);
-        self.queue_scripted_inbound(request_route, message_id);
+        match &decoded.body {
+            RelayFrameBody::Send(_) => {
+                let (request_route, message_id) = self.inspect_real_send(&decoded);
+                self.queue_scripted_inbound(request_route, message_id);
+            }
+            RelayFrameBody::Subscribe(_) | RelayFrameBody::Ack(_)
+                if matches!(self.script, TransportScript::Subscription(_)) =>
+            {
+                if self.panic_on_first_subscription_control {
+                    self.panic_on_first_subscription_control = false;
+                    panic!("injected process death after durable binding install");
+                }
+            }
+            body => panic!("remote runtime emitted an unexpected Relay frame: {body:?}"),
+        }
         Ok(())
     }
 
     async fn recv(&mut self) -> Result<Option<ReceivedRuntimeFrame>, RemoteRuntimeTransportError> {
-        Ok(self.inbound.pop_front())
+        if let Some(frame) = self.inbound.pop_front() {
+            return Ok(Some(frame));
+        }
+        if matches!(
+            self.script,
+            TransportScript::Subscription(SubscriptionScript::CatalogPartialTransferThenPending)
+        ) {
+            return std::future::pending::<
+                Result<Option<ReceivedRuntimeFrame>, RemoteRuntimeTransportError>,
+            >()
+            .await;
+        }
+        Ok(None)
     }
 
     async fn shutdown(&mut self) {
@@ -439,6 +560,7 @@ enum ReplyShape {
     WrongDirectoryRevision,
     WrongNoncePrefix,
     WrongAad,
+    NonCanonicalJson,
 }
 
 fn reply_frame(
@@ -459,7 +581,7 @@ fn reply_frame(
     } else {
         message_id
     };
-    let (payload_kind, plaintext) = match reply {
+    let (payload_kind, mut plaintext) = match reply {
         RuntimeReply::TransferPart(transfer) => (
             SealedPayloadKind::TransferPart,
             RuntimeTransferCarrierV1::new(
@@ -475,10 +597,11 @@ fn reply_frame(
             .expect("fixture compact transfer carrier"),
         ),
         reply => {
-            let payload_kind = if matches!(reply, RuntimeReply::Catalog(_)) {
-                SealedPayloadKind::CatalogSnapshot
-            } else {
-                SealedPayloadKind::CommandReceipt
+            let payload_kind = match reply {
+                RuntimeReply::Catalog(_) => SealedPayloadKind::CatalogSnapshot,
+                RuntimeReply::Snapshot(_) => SealedPayloadKind::ConversationSnapshot,
+                RuntimeReply::Backfill(_) => SealedPayloadKind::BackfillChunk,
+                _ => SealedPayloadKind::CommandReceipt,
             };
             let envelope = RuntimeEnvelope {
                 version: RUNTIME_PROTOCOL_VERSION,
@@ -493,6 +616,11 @@ fn reply_frame(
             )
         }
     };
+    if matches!(shape, ReplyShape::NonCanonicalJson)
+        && payload_kind != SealedPayloadKind::TransferPart
+    {
+        plaintext.insert(1, b' ');
+    }
     let key_purpose = if matches!(shape, ReplyShape::WrongKeyPurpose) {
         KeyPurpose::DeviceCommandTx
     } else {
@@ -556,7 +684,8 @@ fn reply_frame(
         | ReplyShape::WrongKeyEpoch
         | ReplyShape::WrongDirectoryRevision
         | ReplyShape::WrongNoncePrefix
-        | ReplyShape::WrongAad => PairingFixture::machine_data_signing_key(),
+        | ReplyShape::WrongAad
+        | ReplyShape::NonCanonicalJson => PairingFixture::machine_data_signing_key(),
     };
     let signed = sign_sealed(unsigned, &signing_key, &expected_context);
     OpaqueRouteFrame {
@@ -566,6 +695,829 @@ fn reply_frame(
             request_route,
             sealed_blob: SealedBlob(signed.to_wire_bytes()),
         }),
+    }
+}
+
+fn key_control_stream_binding_reply_frame(
+    request_route: RequestRouteId,
+    binding: StreamBindingV1,
+    counter: u64,
+) -> OpaqueRouteFrame {
+    let context = OuterContextV1::directed_reply(
+        MACHINE_ROUTE,
+        DEVICE_ROUTE,
+        request_route,
+        DEVICE_REPLY_EPOCH,
+    );
+    let control = KeyControlV1::stream_binding(binding);
+    let plaintext = control
+        .canonical_bytes()
+        .expect("fixture canonical StreamBinding KeyControl");
+    let sending_key = AeadSendingKey::with_derived_nonce_prefix(
+        KeyId {
+            purpose: KeyPurpose::DeviceReplyTx,
+            epoch: DEVICE_REPLY_EPOCH,
+        },
+        DEVICE_REPLY_EPOCH,
+        KEY_DIRECTORY_REVISION,
+        SecretAeadKey::from_bytes(DEVICE_REPLY_KEY),
+    );
+    let unsigned = seal_symmetric(
+        &sending_key,
+        &context,
+        control.sealed_payload_kind(),
+        &plaintext,
+        SenderCounter(counter),
+    )
+    .expect("seal canonical DeviceReplyTx StreamBinding");
+    let signed = sign_sealed(
+        unsigned,
+        &PairingFixture::machine_data_signing_key(),
+        &context,
+    );
+    OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::Reply(Reply {
+            device_route: DEVICE_ROUTE,
+            request_route,
+            sealed_blob: SealedBlob(signed.to_wire_bytes()),
+        }),
+    }
+}
+
+fn catalog_requested_cursor() -> RuntimeInnerCursor {
+    RuntimeInnerCursor::Catalog {
+        cursor: StreamCursor::BeforeFirst,
+    }
+}
+
+fn catalog_backfill_requested_cursor() -> RuntimeInnerCursor {
+    RuntimeInnerCursor::Catalog {
+        cursor: StreamCursor::At(0),
+    }
+}
+
+fn conversation_requested_cursor() -> RuntimeInnerCursor {
+    RuntimeInnerCursor::Conversation {
+        conversation_id: ConversationId::new(SUBSCRIPTION_CONVERSATION_ID),
+        cursor: StreamCursor::BeforeFirst,
+    }
+}
+
+#[derive(Clone)]
+struct CapturingSubscriptionReducer {
+    cursor: RuntimeInnerCursor,
+    applied: Vec<RemoteSubscriptionBootstrapItem>,
+    reject_apply: bool,
+    stall_cursor: bool,
+}
+
+impl CapturingSubscriptionReducer {
+    fn new(cursor: RuntimeInnerCursor) -> Self {
+        Self {
+            cursor,
+            applied: Vec::new(),
+            reject_apply: false,
+            stall_cursor: false,
+        }
+    }
+
+    fn rejecting(cursor: RuntimeInnerCursor) -> Self {
+        Self {
+            reject_apply: true,
+            ..Self::new(cursor)
+        }
+    }
+
+    fn stalling(cursor: RuntimeInnerCursor) -> Self {
+        Self {
+            stall_cursor: true,
+            ..Self::new(cursor)
+        }
+    }
+
+    fn applied(&self) -> &[RemoteSubscriptionBootstrapItem] {
+        &self.applied
+    }
+}
+
+impl RemoteSubscriptionReducer for CapturingSubscriptionReducer {
+    fn inner_cursor(&self) -> &RuntimeInnerCursor {
+        &self.cursor
+    }
+
+    fn apply(&mut self, item: &RemoteSubscriptionBootstrapItem) -> Result<(), RemoteRuntimeError> {
+        if self.reject_apply {
+            return Err(RemoteRuntimeError::InvalidReply(
+                "test reducer injected an apply rejection",
+            ));
+        }
+        let next = match (item, &self.cursor) {
+            (
+                RemoteSubscriptionBootstrapItem::CatalogSnapshot(snapshot),
+                RuntimeInnerCursor::Catalog { .. },
+            ) => RuntimeInnerCursor::Catalog {
+                cursor: snapshot.base_catalog_cursor,
+            },
+            (
+                RemoteSubscriptionBootstrapItem::ConversationSnapshot(snapshot),
+                RuntimeInnerCursor::Conversation {
+                    conversation_id, ..
+                },
+            ) if &snapshot.conversation_id == conversation_id => RuntimeInnerCursor::Conversation {
+                conversation_id: conversation_id.clone(),
+                cursor: snapshot.base_event_cursor,
+            },
+            (
+                RemoteSubscriptionBootstrapItem::Backfill(BackfillChunk::Catalog { range, .. }),
+                RuntimeInnerCursor::Catalog { cursor },
+            ) if range.after() == *cursor => RuntimeInnerCursor::Catalog {
+                cursor: range.through(),
+            },
+            (
+                RemoteSubscriptionBootstrapItem::Backfill(BackfillChunk::Conversation {
+                    conversation_id,
+                    range,
+                    ..
+                }),
+                RuntimeInnerCursor::Conversation {
+                    conversation_id: expected,
+                    cursor,
+                },
+            ) if conversation_id == expected && range.after() == *cursor => {
+                RuntimeInnerCursor::Conversation {
+                    conversation_id: expected.clone(),
+                    cursor: range.through(),
+                }
+            }
+            _ => {
+                return Err(RemoteRuntimeError::InvalidReply(
+                    "test reducer rejected a cross-target or discontinuous bootstrap item",
+                ));
+            }
+        };
+        if !self.stall_cursor {
+            self.cursor = next;
+        }
+        self.applied.push(item.clone());
+        Ok(())
+    }
+}
+
+fn catalog_runtime_generation() -> StreamGeneration {
+    StreamGeneration::new("018f0f9d-6f0a-7ad0-8000-000000000091")
+}
+
+fn conversation_runtime_generation() -> StreamGeneration {
+    // 该 Runtime generation 故意不等于 Relay binding 的 [0x92; 16] generation。
+    StreamGeneration::new("018f0f9d-6f0a-7ad0-8000-000000000093")
+}
+
+fn catalog_subscription_receipt() -> SubscriptionReceipt {
+    SubscriptionReceipt::Subscribed {
+        stream_generation: catalog_runtime_generation(),
+    }
+}
+
+fn conversation_subscription_receipt() -> SubscriptionReceipt {
+    SubscriptionReceipt::Subscribed {
+        stream_generation: conversation_runtime_generation(),
+    }
+}
+
+fn catalog_sync_complete(outer: StreamCursor, inner: StreamCursor) -> RuntimeSyncComplete {
+    RuntimeSyncComplete {
+        stream_generation: catalog_runtime_generation(),
+        stream_cursor: outer,
+        inner_cursor: RuntimeInnerCursor::Catalog { cursor: inner },
+        key_directory_revision: KEY_DIRECTORY_REVISION,
+    }
+}
+
+fn conversation_sync_complete() -> RuntimeSyncComplete {
+    RuntimeSyncComplete {
+        stream_generation: conversation_runtime_generation(),
+        stream_cursor: StreamCursor::At(CONVERSATION_OUTER_HIGH_WATER),
+        inner_cursor: RuntimeInnerCursor::Conversation {
+            conversation_id: ConversationId::new(SUBSCRIPTION_CONVERSATION_ID),
+            cursor: StreamCursor::At(CONVERSATION_INNER_HIGH_WATER),
+        },
+        key_directory_revision: KEY_DIRECTORY_REVISION,
+    }
+}
+
+fn catalog_stream_binding(outer: StreamCursor, inner: StreamCursor) -> StreamBindingV1 {
+    StreamBindingV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        machine_route: MACHINE_ROUTE,
+        device_route: DEVICE_ROUTE,
+        grant_serial: RelayGrantSerial::new(7),
+        root_trust_epoch: TrustEpoch::new(2),
+        stream_route: CATALOG_STREAM_ROUTE,
+        stream_generation: CATALOG_RELAY_GENERATION,
+        stream_cursor: outer,
+        inner_cursor: RuntimeInnerCursor::Catalog { cursor: inner },
+        key_directory_revision: KeyDirectoryRevision::new(KEY_DIRECTORY_REVISION),
+        key_id: KeyId {
+            purpose: KeyPurpose::Catalog,
+            epoch: CATALOG_EPOCH,
+        },
+    }
+}
+
+fn conversation_stream_binding(outer: StreamCursor, inner: StreamCursor) -> StreamBindingV1 {
+    StreamBindingV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        machine_route: MACHINE_ROUTE,
+        device_route: DEVICE_ROUTE,
+        grant_serial: RelayGrantSerial::new(7),
+        root_trust_epoch: TrustEpoch::new(2),
+        stream_route: CONVERSATION_STREAM_ROUTE,
+        stream_generation: CONVERSATION_RELAY_GENERATION,
+        stream_cursor: outer,
+        inner_cursor: RuntimeInnerCursor::Conversation {
+            conversation_id: ConversationId::new(SUBSCRIPTION_CONVERSATION_ID),
+            cursor: inner,
+        },
+        key_directory_revision: KeyDirectoryRevision::new(KEY_DIRECTORY_REVISION),
+        key_id: KeyId {
+            purpose: KeyPurpose::ConversationDek,
+            epoch: CONVERSATION_EPOCH,
+        },
+    }
+}
+
+fn subscription_catalog_snapshot(cursor: StreamCursor) -> CatalogSnapshot {
+    if cursor == StreamCursor::At(CATALOG_INNER_HIGH_WATER) {
+        let fixture = catalog_snapshot();
+        CatalogSnapshot::new(cursor, fixture.entries().to_vec(), None, None)
+            .expect("bounded final subscription catalog snapshot page")
+    } else {
+        CatalogSnapshot::new(cursor, Vec::new(), None, None)
+            .expect("bounded empty subscription catalog snapshot")
+    }
+}
+
+fn subscription_catalog_page(current: Option<&str>, next: Option<&str>) -> CatalogSnapshot {
+    CatalogSnapshot::new(
+        StreamCursor::At(CATALOG_INNER_HIGH_WATER),
+        Vec::new(),
+        current.map(CatalogPageCursor::new),
+        next.map(CatalogPageCursor::new),
+    )
+    .expect("bounded chained subscription Catalog page")
+}
+
+fn subscription_catalog_backfill() -> BackfillChunk {
+    BackfillChunk::catalog(
+        BackfillRange::new(StreamCursor::At(0), StreamCursor::At(1))
+            .expect("one-entry catalog backfill range"),
+        vec![CatalogDelta {
+            catalog_revision: 1,
+            changes: Vec::new(),
+        }],
+    )
+    .expect("one-entry catalog backfill")
+}
+
+fn subscription_conversation_snapshot() -> ConversationSnapshot {
+    let capabilities = SessionCapabilities {
+        agent_kind: AgentKind::Codex,
+        agent_version: "remote-subscription-fixture".to_owned(),
+        features: BTreeSet::new(),
+        vendor: VendorCapabilities::Codex(CodexCapabilities::default()),
+    };
+    ConversationSnapshot::new(
+        ConversationId::new(SUBSCRIPTION_CONVERSATION_ID),
+        StreamCursor::At(CONVERSATION_INNER_HIGH_WATER),
+        ConversationConfigurationState::new(0, None)
+            .expect("empty configuration state is canonical"),
+        vec![SnapshotItem::capabilities(capabilities)],
+    )
+    .expect("capabilities-first conversation snapshot")
+}
+
+fn subscription_inbound_frames(
+    script: SubscriptionScript,
+    request_route: RequestRouteId,
+    message_id: MessageId,
+    reply_counter: u64,
+) -> Vec<OpaqueRouteFrame> {
+    let counter_delta = reply_counter
+        .checked_sub(REPLY_COUNTER)
+        .expect("subscription reply counter base cannot move backwards");
+    let adjusted_counter = |counter: u64| {
+        counter
+            .checked_add(counter_delta)
+            .expect("subscription fixture reply counter overflow")
+    };
+    let runtime_reply = |reply, counter| {
+        reply_frame(
+            request_route,
+            message_id.clone(),
+            reply,
+            ReplyShape::Valid,
+            adjusted_counter(counter),
+        )
+    };
+    let runtime_reply_shape = |reply, shape, counter| {
+        reply_frame(
+            request_route,
+            message_id.clone(),
+            reply,
+            shape,
+            adjusted_counter(counter),
+        )
+    };
+    let stream_binding_reply = |binding, counter| {
+        key_control_stream_binding_reply_frame(request_route, binding, adjusted_counter(counter))
+    };
+    let accepted = route_accepted(request_route);
+    match script {
+        SubscriptionScript::CatalogAt => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_snapshot(inner)),
+                    REPLY_COUNTER + 1,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 2,
+                ),
+                stream_binding_reply(catalog_stream_binding(outer, inner), REPLY_COUNTER + 3),
+            ]
+        }
+        SubscriptionScript::CatalogFailure => vec![
+            accepted,
+            runtime_reply(
+                RuntimeReply::Failure(RuntimeFailure::new(
+                    "daemon.subscription.fixture_unavailable",
+                    "fixture transiently rejects the subscription",
+                )),
+                REPLY_COUNTER,
+            ),
+        ],
+        SubscriptionScript::CatalogCompact
+        | SubscriptionScript::CatalogCompactWrongMessage
+        | SubscriptionScript::CatalogCompactWrongChannel => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            let mut parts = catalog_transfer_replies(&subscription_catalog_snapshot(inner));
+            let first = parts.remove(0);
+            let second = parts.remove(0);
+            let first_shape = match script {
+                SubscriptionScript::CatalogCompactWrongMessage => ReplyShape::WrongMessageId,
+                SubscriptionScript::CatalogCompactWrongChannel => ReplyShape::WrongTransferChannel,
+                _ => ReplyShape::Valid,
+            };
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply_shape(first, first_shape, REPLY_COUNTER + 1),
+                runtime_reply(second, REPLY_COUNTER + 2),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 3,
+                ),
+                stream_binding_reply(catalog_stream_binding(outer, inner), REPLY_COUNTER + 4),
+            ]
+        }
+        SubscriptionScript::CatalogCompactBackfill => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let sync_inner = StreamCursor::At(1);
+            let payload = serde_json::to_vec(&subscription_catalog_backfill())
+                .expect("canonical Catalog backfill transfer payload");
+            let mut parts = transfer_replies(payload, "catalog-backfill-subscription-transfer");
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(parts.remove(0), REPLY_COUNTER + 1),
+                runtime_reply(parts.remove(0), REPLY_COUNTER + 2),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, sync_inner)),
+                    REPLY_COUNTER + 3,
+                ),
+                stream_binding_reply(
+                    catalog_stream_binding(outer, StreamCursor::At(0)),
+                    REPLY_COUNTER + 4,
+                ),
+            ]
+        }
+        SubscriptionScript::CatalogSnapshotThenBackfill => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let snapshot_inner = StreamCursor::At(0);
+            let sync_inner = StreamCursor::At(1);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_snapshot(snapshot_inner)),
+                    REPLY_COUNTER + 1,
+                ),
+                runtime_reply(
+                    RuntimeReply::Backfill(subscription_catalog_backfill()),
+                    REPLY_COUNTER + 2,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, sync_inner)),
+                    REPLY_COUNTER + 3,
+                ),
+                stream_binding_reply(
+                    catalog_stream_binding(outer, snapshot_inner),
+                    REPLY_COUNTER + 4,
+                ),
+            ]
+        }
+        SubscriptionScript::CatalogCompactSnapshotThenBackfill => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let snapshot_inner = StreamCursor::At(0);
+            let sync_inner = StreamCursor::At(1);
+            let mut parts =
+                catalog_transfer_replies(&subscription_catalog_snapshot(snapshot_inner));
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(parts.remove(0), REPLY_COUNTER + 1),
+                runtime_reply(parts.remove(0), REPLY_COUNTER + 2),
+                runtime_reply(
+                    RuntimeReply::Backfill(subscription_catalog_backfill()),
+                    REPLY_COUNTER + 3,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, sync_inner)),
+                    REPLY_COUNTER + 4,
+                ),
+                stream_binding_reply(
+                    catalog_stream_binding(outer, snapshot_inner),
+                    REPLY_COUNTER + 5,
+                ),
+            ]
+        }
+        SubscriptionScript::CatalogDuplicateOpenPage => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            let repeated = runtime_reply(
+                RuntimeReply::Catalog(subscription_catalog_page(None, Some("subscription-page-2"))),
+                REPLY_COUNTER + 1,
+            );
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                repeated.clone(),
+                repeated,
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_page(
+                        Some("subscription-page-2"),
+                        None,
+                    )),
+                    REPLY_COUNTER + 2,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 3,
+                ),
+                stream_binding_reply(catalog_stream_binding(outer, inner), REPLY_COUNTER + 4),
+            ]
+        }
+        SubscriptionScript::CatalogMissingFirstPage => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_page(
+                        Some("subscription-page-2"),
+                        None,
+                    )),
+                    REPLY_COUNTER + 1,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 2,
+                ),
+                stream_binding_reply(catalog_stream_binding(outer, inner), REPLY_COUNTER + 3),
+            ]
+        }
+        SubscriptionScript::CatalogCompactMissingMiddlePage => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            let payload = serde_json::to_vec(&subscription_catalog_page(
+                Some("subscription-page-3"),
+                None,
+            ))
+            .expect("canonical final Catalog page with a missing predecessor");
+            let mut parts = transfer_replies(payload, "missing-middle-catalog-page");
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_page(
+                        None,
+                        Some("subscription-page-2"),
+                    )),
+                    REPLY_COUNTER + 1,
+                ),
+                runtime_reply(parts.remove(0), REPLY_COUNTER + 2),
+                runtime_reply(parts.remove(0), REPLY_COUNTER + 3),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 4,
+                ),
+                stream_binding_reply(catalog_stream_binding(outer, inner), REPLY_COUNTER + 5),
+            ]
+        }
+        SubscriptionScript::CatalogCompactCrossTarget => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            let payload = serde_json::to_vec(&subscription_conversation_snapshot())
+                .expect("canonical cross-target conversation snapshot");
+            let mut parts = transfer_replies(payload, "cross-target-subscription-transfer");
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(parts.remove(0), REPLY_COUNTER + 1),
+                runtime_reply(parts.remove(0), REPLY_COUNTER + 2),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 3,
+                ),
+                stream_binding_reply(catalog_stream_binding(outer, inner), REPLY_COUNTER + 4),
+            ]
+        }
+        SubscriptionScript::CatalogPartialTransferThenSync => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            let first = catalog_transfer_replies(&subscription_catalog_snapshot(inner)).remove(0);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(first, REPLY_COUNTER + 1),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 2,
+                ),
+                stream_binding_reply(catalog_stream_binding(outer, inner), REPLY_COUNTER + 3),
+            ]
+        }
+        SubscriptionScript::CatalogPartialTransferThenPending => {
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            let first = catalog_transfer_replies(&subscription_catalog_snapshot(inner)).remove(0);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(first, REPLY_COUNTER + 1),
+            ]
+        }
+        SubscriptionScript::CatalogUnfinishedPageThenSync => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(RuntimeReply::Catalog(catalog_snapshot()), REPLY_COUNTER + 1),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 2,
+                ),
+                stream_binding_reply(catalog_stream_binding(outer, inner), REPLY_COUNTER + 3),
+            ]
+        }
+        SubscriptionScript::CatalogSyncAheadOfBinding => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let sync_inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_snapshot(sync_inner)),
+                    REPLY_COUNTER + 1,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, sync_inner)),
+                    REPLY_COUNTER + 2,
+                ),
+                stream_binding_reply(
+                    catalog_stream_binding(outer, StreamCursor::BeforeFirst),
+                    REPLY_COUNTER + 3,
+                ),
+            ]
+        }
+        SubscriptionScript::ConversationIndependentGeneration => vec![
+            accepted,
+            runtime_reply(
+                RuntimeReply::Subscription(conversation_subscription_receipt()),
+                REPLY_COUNTER,
+            ),
+            runtime_reply(
+                RuntimeReply::Snapshot(subscription_conversation_snapshot()),
+                REPLY_COUNTER + 1,
+            ),
+            runtime_reply(
+                RuntimeReply::SyncComplete(conversation_sync_complete()),
+                REPLY_COUNTER + 2,
+            ),
+            stream_binding_reply(
+                conversation_stream_binding(
+                    StreamCursor::At(CONVERSATION_OUTER_HIGH_WATER),
+                    StreamCursor::At(CONVERSATION_INNER_HIGH_WATER),
+                ),
+                REPLY_COUNTER + 3,
+            ),
+        ],
+        SubscriptionScript::ConversationCompact => {
+            let payload = serde_json::to_vec(&subscription_conversation_snapshot())
+                .expect("canonical Conversation snapshot transfer payload");
+            let mut parts = transfer_replies(payload, "conversation-subscription-transfer");
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(conversation_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(parts.remove(0), REPLY_COUNTER + 1),
+                runtime_reply(parts.remove(0), REPLY_COUNTER + 2),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(conversation_sync_complete()),
+                    REPLY_COUNTER + 3,
+                ),
+                stream_binding_reply(
+                    conversation_stream_binding(
+                        StreamCursor::At(CONVERSATION_OUTER_HIGH_WATER),
+                        StreamCursor::At(CONVERSATION_INNER_HIGH_WATER),
+                    ),
+                    REPLY_COUNTER + 4,
+                ),
+            ]
+        }
+        SubscriptionScript::CatalogBeforeFirst => {
+            let cursor = StreamCursor::BeforeFirst;
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_snapshot(cursor)),
+                    REPLY_COUNTER + 1,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(cursor, cursor)),
+                    REPLY_COUNTER + 2,
+                ),
+                stream_binding_reply(catalog_stream_binding(cursor, cursor), REPLY_COUNTER + 3),
+            ]
+        }
+        SubscriptionScript::CatalogBeforeFirstNoSnapshot => {
+            let cursor = StreamCursor::BeforeFirst;
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(cursor, cursor)),
+                    REPLY_COUNTER + 1,
+                ),
+                stream_binding_reply(catalog_stream_binding(cursor, cursor), REPLY_COUNTER + 2),
+            ]
+        }
+        SubscriptionScript::CatalogMissingBinding => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_snapshot(inner)),
+                    REPLY_COUNTER + 1,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 2,
+                ),
+            ]
+        }
+        SubscriptionScript::CatalogCrossTargetBinding => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_snapshot(inner)),
+                    REPLY_COUNTER + 1,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 2,
+                ),
+                stream_binding_reply(
+                    conversation_stream_binding(
+                        outer,
+                        StreamCursor::At(CONVERSATION_INNER_HIGH_WATER),
+                    ),
+                    REPLY_COUNTER + 3,
+                ),
+            ]
+        }
+        SubscriptionScript::CatalogWrongBindingRevision => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            let mut binding = catalog_stream_binding(outer, inner);
+            binding.key_directory_revision = KeyDirectoryRevision::new(KEY_DIRECTORY_REVISION + 1);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_snapshot(inner)),
+                    REPLY_COUNTER + 1,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 2,
+                ),
+                stream_binding_reply(binding, REPLY_COUNTER + 3),
+            ]
+        }
+        SubscriptionScript::CatalogBindingBeforeSync => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_snapshot(inner)),
+                    REPLY_COUNTER + 1,
+                ),
+                stream_binding_reply(catalog_stream_binding(outer, inner), REPLY_COUNTER + 2),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 3,
+                ),
+            ]
+        }
     }
 }
 
@@ -730,7 +1682,9 @@ fn catalog_request(page_cursor: Option<CatalogPageCursor>) -> RuntimeRequest {
     RuntimeRequest::Catalog(CatalogRequest { page_cursor })
 }
 
-fn catalog_snapshot() -> CatalogSnapshot {
+fn catalog_snapshot_with_current(
+    current_page_cursor: Option<CatalogPageCursor>,
+) -> CatalogSnapshot {
     CatalogSnapshot::new(
         StreamCursor::At(17),
         vec![ConversationEntry {
@@ -742,9 +1696,14 @@ fn catalog_snapshot() -> CatalogSnapshot {
             archived: false,
             entry_revision: 5,
         }],
+        current_page_cursor,
         Some(CatalogPageCursor::new("catalog-page-cursor-2")),
     )
     .expect("bounded catalog fixture")
+}
+
+fn catalog_snapshot() -> CatalogSnapshot {
+    catalog_snapshot_with_current(None)
 }
 
 fn newer_catalog_snapshot() -> CatalogSnapshot {
@@ -760,16 +1719,21 @@ fn newer_catalog_snapshot() -> CatalogSnapshot {
             entry_revision: 6,
         }],
         None,
+        None,
     )
     .expect("bounded newer catalog fixture")
 }
 
 fn catalog_transfer_replies(snapshot: &CatalogSnapshot) -> Vec<RuntimeReply> {
     let payload = serde_json::to_vec(snapshot).expect("encode CatalogSnapshot transfer payload");
+    transfer_replies(payload, "catalog-transfer-1")
+}
+
+fn transfer_replies(payload: Vec<u8>, transfer_id: &str) -> Vec<RuntimeReply> {
     let midpoint = payload.len() / 2;
     let total_sha256 = sha256(&payload);
     let total_bytes = payload.len() as u64;
-    let transfer_id = TransferId::new("catalog-transfer-1");
+    let transfer_id = TransferId::new(transfer_id);
     [payload[..midpoint].to_vec(), payload[midpoint..].to_vec()]
         .into_iter()
         .enumerate()
@@ -802,6 +1766,26 @@ fn state_root(temp: &tempfile::TempDir) -> PathBuf {
     fs::canonicalize(temp.path())
         .expect("canonical tempdir")
         .join("paired-state")
+}
+
+fn assert_file_tree_omits(root: &std::path::Path, sentinel: &[u8]) {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            for entry in fs::read_dir(&path).expect("read paired state directory") {
+                pending.push(entry.expect("read paired state entry").path());
+            }
+            continue;
+        }
+        let bytes = fs::read(&path).expect("read paired state artifact");
+        assert!(
+            !bytes
+                .windows(sentinel.len())
+                .any(|candidate| candidate == sentinel),
+            "bootstrap plaintext sentinel leaked into {}",
+            path.display()
+        );
+    }
 }
 
 fn paired_account(fixture: &PairingFixture, purpose: PairedRemoteKeyPurpose) -> RemoteKeyAccount {
@@ -2076,6 +3060,7 @@ async fn every_reply_header_aad_payload_and_message_axis_fails_closed() {
         ReplyShape::WrongDirectoryRevision,
         ReplyShape::WrongNoncePrefix,
         ReplyShape::WrongAad,
+        ReplyShape::NonCanonicalJson,
     ]
     .into_iter()
     .enumerate()
@@ -2283,7 +3268,7 @@ async fn catalog_page_seals_exact_cursor_request_and_only_reports_authenticated_
         .open_exact(fixture.identity())
         .expect("open promoted machine");
     let page_cursor = catalog_page_cursor();
-    let snapshot = catalog_snapshot();
+    let snapshot = catalog_snapshot_with_current(Some(page_cursor.clone()));
     let (transport, sent) = FakeTransport::new_runtime(
         TransportScript::RouteAcceptedThenReply,
         catalog_request(Some(page_cursor.clone())),
@@ -2303,14 +3288,52 @@ async fn catalog_page_seals_exact_cursor_request_and_only_reports_authenticated_
 }
 
 #[tokio::test]
+async fn catalog_rejects_a_page_that_does_not_echo_the_requested_cursor_direct_or_compact() {
+    for (seed, compact) in [(0xb0, false), (0xb2, true)] {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("mismatched Catalog cursor state root");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, seed);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open mismatched Catalog cursor machine");
+        let requested = catalog_page_cursor();
+        let mismatched = catalog_snapshot_with_current(None);
+        let (transport, sent) = if compact {
+            FakeTransport::new_runtime_sequence(
+                catalog_request(Some(requested.clone())),
+                catalog_transfer_replies(&mismatched),
+                device_sign,
+            )
+        } else {
+            FakeTransport::new_runtime(
+                TransportScript::ReplyOnly,
+                catalog_request(Some(requested.clone())),
+                RuntimeReply::Catalog(mismatched),
+                device_sign,
+            )
+        };
+        let mut runtime = RemoteRuntime::new(opened, transport);
+        let mut rng = DeterministicRng::new([seed.wrapping_add(1); 32]);
+
+        assert!(matches!(
+            runtime.catalog_page(Some(requested), &mut rng).await,
+            Err(RemoteRuntimeError::InvalidReply(_))
+        ));
+        let _ = one_sent_codec_frame(&sent);
+    }
+}
+
+#[tokio::test]
 async fn catalog_route_accepted_only_restarts_with_the_exact_frozen_send() {
     let fixture = PairingFixture::new();
     let store = MemoryRemoteKeyStore::new();
     let temp = tempfile::tempdir().expect("tempdir");
     let root = state_root(&temp);
     let device_sign = fixture.promote(&store, &root, 0xc2);
-    let snapshot = catalog_snapshot();
     let page_cursor = catalog_page_cursor();
+    let snapshot = catalog_snapshot_with_current(Some(page_cursor.clone()));
 
     let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
         .open_exact(fixture.identity())
@@ -2542,6 +3565,83 @@ async fn catalog_compact_transfer_reassembles_before_persisting_the_terminal_sna
 }
 
 #[tokio::test]
+async fn large_compact_catalog_returns_without_leaving_an_undecodable_durable_terminal() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("large compact Catalog state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xb4);
+    let mut entry = catalog_snapshot().entries()[0].clone();
+    entry.title = Some("x".repeat(MAX_RUNTIME_JSON_FRAME_BYTES + 16 * 1024));
+    let expected = CatalogSnapshot::new(StreamCursor::At(17), vec![entry], None, None)
+        .expect("valid Catalog page larger than the durable terminal bound");
+    assert!(serde_json::to_vec(&expected).unwrap().len() > MAX_RUNTIME_JSON_FRAME_BYTES);
+
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open large compact Catalog machine");
+    let (transport, _sent) = FakeTransport::new_runtime_sequence(
+        catalog_request(None),
+        catalog_transfer_replies(&expected),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xb5; 32]);
+    let outcome = runtime.catalog_page(None, &mut rng).await.expect(
+        "large read-only Catalog page clears exact pending instead of persisting plaintext",
+    );
+    assert_catalog_outcome(&outcome, false, &expected);
+    drop(runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("large Catalog completion leaves a decodable paired state");
+    let fresh_snapshot = newer_catalog_snapshot();
+    let (fresh_transport, fresh_sent) = FakeTransport::new_runtime_with_counters(
+        TransportScript::ReplyOnly,
+        catalog_request(None),
+        RuntimeReply::Catalog(fresh_snapshot.clone()),
+        device_sign,
+        COUNTER_BLOCK_SIZE,
+        REPLY_COUNTER + 2,
+    );
+    let mut fresh = RemoteRuntime::new(reopened, fresh_transport);
+    let mut fresh_rng = DeterministicRng::new([0xb6; 32]);
+    let fresh_outcome = fresh
+        .catalog_page(None, &mut fresh_rng)
+        .await
+        .expect("the next Catalog call creates a fresh request");
+    assert_catalog_outcome(&fresh_outcome, false, &fresh_snapshot);
+    let _ = one_sent_codec_frame(&fresh_sent);
+}
+
+#[tokio::test]
+async fn catalog_compact_transfer_rejects_noncanonical_snapshot_json() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("noncanonical compact Catalog state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xb7);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open noncanonical compact Catalog machine");
+    let mut payload = serde_json::to_vec(&catalog_snapshot()).expect("canonical Catalog payload");
+    payload.insert(1, b' ');
+    let (transport, _sent) = FakeTransport::new_runtime_sequence(
+        catalog_request(None),
+        transfer_replies(payload, "noncanonical-catalog-transfer"),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xb8; 32]);
+
+    assert!(matches!(
+        runtime.catalog_page(None, &mut rng).await,
+        Err(RemoteRuntimeError::InvalidReply(_))
+    ));
+}
+
+#[tokio::test]
 async fn catalog_compact_transfer_rejects_wrong_message_or_stream_channel() {
     for (seed, shape) in [
         (0xcc, ReplyShape::WrongMessageId),
@@ -2570,5 +3670,867 @@ async fn catalog_compact_transfer_rejects_wrong_message_or_stream_channel() {
             runtime.catalog_page(None, &mut rng).await,
             Err(RemoteRuntimeError::InvalidReply(_))
         ));
+    }
+}
+
+fn decoded_outbound_frames(recorder: &Arc<Mutex<Vec<Vec<u8>>>>) -> Vec<OpaqueRouteFrame> {
+    recorder
+        .lock()
+        .expect("sent-frame recorder")
+        .iter()
+        .map(|bytes| decode(bytes).expect("recorded outbound frame is canonical"))
+        .collect()
+}
+
+fn assert_binding_controls(
+    recorder: &Arc<Mutex<Vec<Vec<u8>>>>,
+    expected_binding: &StreamBindingV1,
+    request_send_prefix: bool,
+    expected_ack: Option<u64>,
+) {
+    let frames = decoded_outbound_frames(recorder);
+    let control_offset = usize::from(request_send_prefix);
+    if request_send_prefix {
+        assert!(
+            matches!(frames[0].body, RelayFrameBody::Send(_)),
+            "bootstrap must begin with exactly one directed Runtime Send"
+        );
+    }
+    let expected_len = control_offset + 1 + usize::from(expected_ack.is_some());
+    assert_eq!(
+        frames.len(),
+        expected_len,
+        "only binding-derived Subscribe and optional Ack may follow the Runtime Send"
+    );
+    assert!(matches!(
+        &frames[control_offset].body,
+        RelayFrameBody::Subscribe(Subscribe {
+            stream_route,
+            generation,
+            cursor,
+        }) if *stream_route == expected_binding.stream_route
+            && *generation == expected_binding.stream_generation
+            && *cursor == expected_binding.stream_cursor
+    ));
+    match expected_ack {
+        Some(up_to_seq) => assert!(matches!(
+            &frames[control_offset + 1].body,
+            RelayFrameBody::Ack(Ack {
+                stream_route,
+                generation,
+                up_to_seq: actual,
+            }) if *stream_route == expected_binding.stream_route
+                && *generation == expected_binding.stream_generation
+                && *actual == up_to_seq
+        )),
+        None => assert!(
+            frames
+                .iter()
+                .all(|frame| !matches!(frame.body, RelayFrameBody::Ack(_))),
+            "BeforeFirst has no committed outer sequence to acknowledge"
+        ),
+    }
+}
+
+fn assert_only_runtime_subscribe_send(recorder: &Arc<Mutex<Vec<Vec<u8>>>>) {
+    let frames = decoded_outbound_frames(recorder);
+    assert_eq!(
+        frames.len(),
+        1,
+        "rejected bootstrap must emit zero Relay subscription controls"
+    );
+    assert!(matches!(frames[0].body, RelayFrameBody::Send(_)));
+}
+
+fn assert_durable_stream_binding(
+    store: &dyn RemoteKeyStore,
+    root: &std::path::Path,
+    fixture: &PairingFixture,
+    expected: &StreamBindingV1,
+) {
+    let opened = PairedMachineStore::new(store, INSTALLATION_ID, root)
+        .open_exact(fixture.identity())
+        .expect("reopen paired machine after subscription bootstrap");
+    let bindings = opened
+        .durable_stream_bindings()
+        .expect("read durable stream bindings");
+    assert_eq!(bindings.len(), 1);
+    let installed = &bindings[0];
+    assert_eq!(installed.binding(), expected);
+    assert_eq!(installed.outer_applied(), expected.stream_cursor);
+    assert_eq!(installed.outer_acked(), expected.stream_cursor);
+    assert_eq!(installed.inner_applied(), &expected.inner_cursor);
+    assert_eq!(installed.replay_tuple(), None);
+}
+
+fn assert_no_durable_stream_binding(
+    store: &dyn RemoteKeyStore,
+    root: &std::path::Path,
+    fixture: &PairingFixture,
+) {
+    let opened = PairedMachineStore::new(store, INSTALLATION_ID, root)
+        .open_exact(fixture.identity())
+        .expect("reopen rejected subscription machine");
+    assert!(
+        opened
+            .durable_stream_bindings()
+            .expect("read durable stream bindings")
+            .is_empty(),
+        "rejected bootstrap must not reach the StreamBinding installer"
+    );
+}
+
+#[tokio::test]
+async fn subscription_daemon_failure_is_consumed_before_same_cursor_retry() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("subscription failure state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xce);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open subscription failure machine");
+    let (transport, first_sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogFailure,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xcf; 32]);
+
+    assert!(matches!(
+        runtime
+            .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+            .await,
+        Err(RemoteRuntimeError::DaemonFailure(failure))
+            if failure.code == "daemon.subscription.fixture_unavailable"
+    ));
+    assert_only_runtime_subscribe_send(&first_sent);
+    assert!(reducer.applied().is_empty());
+    drop(runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen after consumed subscription failure");
+    let (transport, retry_sent) = FakeTransport::new_subscription_with_counters(
+        SubscriptionScript::CatalogAt,
+        catalog_requested_cursor(),
+        device_sign,
+        COUNTER_BLOCK_SIZE,
+        REPLY_COUNTER + 1,
+    );
+    let mut runtime = RemoteRuntime::new(reopened, transport);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xd0; 32]);
+    let outcome = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("a transient daemon failure cannot pin the same subscription cursor");
+
+    assert!(outcome.route_accepted());
+    assert_eq!(reducer.applied().len(), 1);
+    assert_binding_controls(
+        &retry_sent,
+        outcome.binding(),
+        true,
+        Some(CATALOG_OUTER_HIGH_WATER),
+    );
+}
+
+#[test]
+fn cold_restart_after_binding_commit_refetches_snapshot_before_resuming_controls() {
+    let fixture = PairingFixture::new();
+    let store = Arc::new(MemoryRemoteKeyStore::new());
+    let temp = tempfile::tempdir().expect("subscription state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(store.as_ref(), &root, 0xe0);
+    let expected_binding = catalog_stream_binding(
+        StreamCursor::At(CATALOG_OUTER_HIGH_WATER),
+        StreamCursor::At(CATALOG_INNER_HIGH_WATER),
+    );
+
+    let crashed_store = Arc::clone(&store);
+    let crashed_root = root.clone();
+    let crashed = std::thread::spawn(move || {
+        let opened =
+            PairedMachineStore::new(crashed_store.as_ref(), INSTALLATION_ID, &crashed_root)
+                .open_exact(PairingFixture::new().identity())
+                .expect("open promoted machine before injected crash");
+        let (transport, _sent) = FakeTransport::new_subscription(
+            SubscriptionScript::CatalogAt,
+            catalog_requested_cursor(),
+            device_sign,
+        );
+        let mut runtime =
+            RemoteRuntime::new(opened, transport.with_panic_on_first_subscription_control());
+        let mut rng = DeterministicRng::new([0xe1; 32]);
+        let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("subscription crash Runtime");
+        let _ = executor.block_on(runtime.subscribe(
+            catalog_requested_cursor(),
+            &mut reducer,
+            &mut rng,
+        ));
+    })
+    .join();
+    assert!(
+        crashed.is_err(),
+        "fixture must stop at the first binding-derived Relay control"
+    );
+    assert_durable_stream_binding(store.as_ref(), &root, &fixture, &expected_binding);
+
+    let reopened = PairedMachineStore::new(store.as_ref(), INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("restart after durable binding install");
+    let (transport, sent) = FakeTransport::new_subscription_with_counters(
+        SubscriptionScript::CatalogAt,
+        catalog_requested_cursor(),
+        device_sign,
+        COUNTER_BLOCK_SIZE,
+        REPLY_COUNTER + COUNTER_BLOCK_SIZE,
+    );
+    let mut runtime = RemoteRuntime::new(reopened, transport);
+    let mut rng = DeterministicRng::new([0xe2; 32]);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("subscription recovery Runtime");
+    let outcome = executor
+        .block_on(runtime.subscribe(catalog_requested_cursor(), &mut reducer, &mut rng))
+        .expect("cold restart refetches the non-persisted reducer snapshot");
+
+    assert!(
+        outcome.route_accepted(),
+        "cold recovery must report only the fresh request acceptance"
+    );
+    assert_eq!(reducer.applied().len(), 1);
+    assert!(matches!(
+        &reducer.applied()[0],
+        RemoteSubscriptionBootstrapItem::CatalogSnapshot(_)
+    ));
+    assert_eq!(outcome.subscription(), &catalog_subscription_receipt());
+    assert_eq!(
+        outcome.sync_complete(),
+        &catalog_sync_complete(
+            StreamCursor::At(CATALOG_OUTER_HIGH_WATER),
+            StreamCursor::At(CATALOG_INNER_HIGH_WATER),
+        )
+    );
+    assert_eq!(outcome.binding(), &expected_binding);
+    assert_binding_controls(
+        &sent,
+        &expected_binding,
+        true,
+        Some(CATALOG_OUTER_HIGH_WATER),
+    );
+}
+
+#[tokio::test]
+async fn subscription_compact_catalog_snapshot_is_applied_before_hwm_and_controls() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("compact subscription state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xd0);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open compact subscription machine");
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogCompact,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xd1; 32]);
+    let outcome = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("compact transfer reaches the staged reducer");
+    let expected_binding = catalog_stream_binding(
+        StreamCursor::At(CATALOG_OUTER_HIGH_WATER),
+        StreamCursor::At(CATALOG_INNER_HIGH_WATER),
+    );
+
+    assert_eq!(reducer.applied().len(), 1);
+    let RemoteSubscriptionBootstrapItem::CatalogSnapshot(snapshot) = &reducer.applied()[0] else {
+        panic!("compact Catalog transfer must reduce to one CatalogSnapshot")
+    };
+    assert_eq!(
+        snapshot,
+        &subscription_catalog_snapshot(StreamCursor::At(CATALOG_INNER_HIGH_WATER))
+    );
+    assert_eq!(outcome.binding(), &expected_binding);
+    assert_binding_controls(
+        &sent,
+        &expected_binding,
+        true,
+        Some(CATALOG_OUTER_HIGH_WATER),
+    );
+    drop(runtime);
+    assert_durable_stream_binding(&store, &root, &fixture, &expected_binding);
+    assert_file_tree_omits(&root, b"Catalog fixture");
+}
+
+#[tokio::test]
+async fn compact_backfill_and_conversation_snapshot_reach_their_exact_reducers() {
+    {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("compact backfill state root");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, 0xc0);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open compact backfill machine");
+        let (transport, sent) = FakeTransport::new_subscription(
+            SubscriptionScript::CatalogCompactBackfill,
+            catalog_backfill_requested_cursor(),
+            device_sign,
+        );
+        let mut runtime = RemoteRuntime::new(opened, transport);
+        let mut reducer = CapturingSubscriptionReducer::new(catalog_backfill_requested_cursor());
+        let mut rng = DeterministicRng::new([0xc1; 32]);
+        let outcome = runtime
+            .subscribe(catalog_backfill_requested_cursor(), &mut reducer, &mut rng)
+            .await
+            .expect("compact Catalog backfill reaches reducer");
+        assert_eq!(reducer.applied().len(), 1);
+        assert!(matches!(
+            &reducer.applied()[0],
+            RemoteSubscriptionBootstrapItem::Backfill(BackfillChunk::Catalog { .. })
+        ));
+        assert_eq!(
+            reducer.inner_cursor(),
+            &RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(1),
+            }
+        );
+        assert_binding_controls(
+            &sent,
+            outcome.binding(),
+            true,
+            Some(CATALOG_OUTER_HIGH_WATER),
+        );
+        drop(runtime);
+        let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("reopen compact backfill binding");
+        let bindings = reopened
+            .durable_stream_bindings()
+            .expect("read compact backfill HWM");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].inner_applied(), reducer.inner_cursor());
+    }
+
+    {
+        let fixture = PairingFixture::new().with_conversation_stream(CONVERSATION_STREAM_ROUTE);
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("compact conversation state root");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, 0xc2);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open compact conversation machine");
+        let (transport, sent) = FakeTransport::new_subscription(
+            SubscriptionScript::ConversationCompact,
+            conversation_requested_cursor(),
+            device_sign,
+        );
+        let mut runtime = RemoteRuntime::new(opened, transport);
+        let mut reducer = CapturingSubscriptionReducer::new(conversation_requested_cursor());
+        let mut rng = DeterministicRng::new([0xc3; 32]);
+        let outcome = runtime
+            .subscribe(conversation_requested_cursor(), &mut reducer, &mut rng)
+            .await
+            .expect("compact Conversation snapshot reaches reducer");
+        assert_eq!(reducer.applied().len(), 1);
+        assert!(matches!(
+            &reducer.applied()[0],
+            RemoteSubscriptionBootstrapItem::ConversationSnapshot(_)
+        ));
+        assert_binding_controls(
+            &sent,
+            outcome.binding(),
+            true,
+            Some(CONVERSATION_OUTER_HIGH_WATER),
+        );
+        drop(runtime);
+        assert_durable_stream_binding(&store, &root, &fixture, outcome.binding());
+    }
+}
+
+#[tokio::test]
+async fn exact_duplicate_bootstrap_page_is_applied_only_once() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("duplicate bootstrap state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xc8);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open duplicate bootstrap machine");
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogDuplicateOpenPage,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xc9; 32]);
+    let outcome = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("an exact transport duplicate is idempotent within one bootstrap");
+
+    assert_eq!(
+        reducer.applied().len(),
+        2,
+        "the repeated non-final Catalog page must reach the reducer exactly once"
+    );
+    assert_binding_controls(
+        &sent,
+        outcome.binding(),
+        true,
+        Some(CATALOG_OUTER_HIGH_WATER),
+    );
+}
+
+#[tokio::test]
+async fn missing_catalog_subscription_page_fails_closed_direct_or_compact() {
+    for (seed, script) in [
+        (0xcc, SubscriptionScript::CatalogMissingFirstPage),
+        (0xcd, SubscriptionScript::CatalogCompactMissingMiddlePage),
+    ] {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("missing Catalog page state root");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, seed);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open missing Catalog page machine");
+        let (transport, sent) =
+            FakeTransport::new_subscription(script, catalog_requested_cursor(), device_sign);
+        let mut runtime = RemoteRuntime::new(opened, transport);
+        let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+        let mut rng = DeterministicRng::new([seed.wrapping_add(1); 32]);
+
+        assert!(
+            runtime
+                .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+                .await
+                .is_err(),
+            "a signed final page cannot hide an omitted predecessor"
+        );
+        assert!(reducer.applied().is_empty());
+        assert_only_runtime_subscribe_send(&sent);
+        drop(runtime);
+        assert_no_durable_stream_binding(&store, &root, &fixture);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_subscription_transfer_expires_without_waiting_for_another_frame() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("expired bootstrap transfer state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xca);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open expired bootstrap transfer machine");
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogPartialTransferThenPending,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xcb; 32]);
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(agentdeck_protocol::runtime::TRANSFER_TTL_MS + 1_000),
+        runtime.subscribe(catalog_requested_cursor(), &mut reducer, &mut rng),
+    )
+    .await
+    .expect("the Runtime must own an earlier transfer deadline");
+    assert!(matches!(
+        outcome,
+        Err(RemoteRuntimeError::Transfer(
+            agentdeck_protocol::runtime::TransferError::Expired
+        ))
+    ));
+    assert!(reducer.applied().is_empty());
+    assert_only_runtime_subscribe_send(&sent);
+    drop(runtime);
+    assert_no_durable_stream_binding(&store, &root, &fixture);
+}
+
+#[tokio::test]
+async fn snapshot_and_backfill_modes_cannot_be_mixed_direct_or_compact() {
+    for (seed, script) in [
+        (0xc4, SubscriptionScript::CatalogSnapshotThenBackfill),
+        (0xc6, SubscriptionScript::CatalogCompactSnapshotThenBackfill),
+    ] {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("mixed subscription mode state root");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, seed);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open mixed subscription mode machine");
+        let (transport, sent) =
+            FakeTransport::new_subscription(script, catalog_requested_cursor(), device_sign);
+        let mut runtime = RemoteRuntime::new(opened, transport);
+        let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+        let mut rng = DeterministicRng::new([seed.wrapping_add(1); 32]);
+
+        assert!(
+            runtime
+                .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+                .await
+                .is_err(),
+            "one bootstrap must choose exactly one of snapshot or backfill"
+        );
+        assert!(reducer.applied().is_empty());
+        assert_eq!(reducer.inner_cursor(), &catalog_requested_cursor());
+        assert_only_runtime_subscribe_send(&sent);
+        drop(runtime);
+        assert_no_durable_stream_binding(&store, &root, &fixture);
+    }
+}
+
+#[tokio::test]
+async fn invalid_or_incomplete_subscription_transfer_never_swaps_reducer_or_hwm() {
+    for (seed, script) in [
+        (0xd2, SubscriptionScript::CatalogCompactWrongMessage),
+        (0xd4, SubscriptionScript::CatalogCompactWrongChannel),
+        (0xd6, SubscriptionScript::CatalogCompactCrossTarget),
+        (0xd8, SubscriptionScript::CatalogPartialTransferThenSync),
+        (0xda, SubscriptionScript::CatalogUnfinishedPageThenSync),
+        (0xdb, SubscriptionScript::CatalogBeforeFirstNoSnapshot),
+    ] {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("rejected transfer state root");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, seed);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open rejected transfer machine");
+        let (transport, sent) =
+            FakeTransport::new_subscription(script, catalog_requested_cursor(), device_sign);
+        let mut runtime = RemoteRuntime::new(opened, transport);
+        let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+        let mut rng = DeterministicRng::new([seed.wrapping_add(1); 32]);
+
+        assert!(
+            runtime
+                .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+                .await
+                .is_err(),
+            "invalid compact metadata, target, completion, or pagination must fail-close"
+        );
+        assert!(
+            reducer.applied().is_empty(),
+            "a failed staged reducer must not replace the caller's canonical state"
+        );
+        assert_eq!(reducer.inner_cursor(), &catalog_requested_cursor());
+        assert_only_runtime_subscribe_send(&sent);
+        drop(runtime);
+        assert_no_durable_stream_binding(&store, &root, &fixture);
+    }
+}
+
+#[tokio::test]
+async fn reducer_rejection_keeps_exact_pending_and_retry_uses_no_new_entropy() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("reducer rejection state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xdc);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open reducer rejection machine");
+    let (transport, first_sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogAt,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = CapturingSubscriptionReducer::rejecting(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xdd; 32]);
+    assert!(
+        runtime
+            .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+            .await
+            .is_err()
+    );
+    assert!(reducer.applied().is_empty());
+    assert_only_runtime_subscribe_send(&first_sent);
+    drop(runtime);
+    assert_no_durable_stream_binding(&store, &root, &fixture);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen exact pending after reducer rejection");
+    let (transport, retry_sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogAt,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(reopened, transport);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut panic_rng = PanicRng;
+    let outcome = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut panic_rng)
+        .await
+        .expect("exact pending retry succeeds without caller entropy");
+    assert!(outcome.route_accepted());
+    assert_eq!(reducer.applied().len(), 1);
+    assert_binding_controls(
+        &retry_sent,
+        outcome.binding(),
+        true,
+        Some(CATALOG_OUTER_HIGH_WATER),
+    );
+}
+
+#[tokio::test]
+async fn reducer_cursor_mismatch_never_commits_binding_or_controls() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("stalled reducer state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xde);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open stalled reducer machine");
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogAt,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = CapturingSubscriptionReducer::stalling(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xdf; 32]);
+    assert!(
+        runtime
+            .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+            .await
+            .is_err()
+    );
+    assert!(reducer.applied().is_empty());
+    assert_only_runtime_subscribe_send(&sent);
+    drop(runtime);
+    assert_no_durable_stream_binding(&store, &root, &fixture);
+}
+
+#[tokio::test]
+async fn sync_inner_ahead_of_publication_cut_is_persisted_as_the_applied_inner_cursor() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("subscription state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xef);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted catalog machine");
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogSyncAheadOfBinding,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xf0; 32]);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let outcome = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("SyncComplete may advance beyond the Relay publication cut");
+    let expected_binding = catalog_stream_binding(
+        StreamCursor::At(CATALOG_OUTER_HIGH_WATER),
+        StreamCursor::BeforeFirst,
+    );
+    assert_eq!(reducer.applied().len(), 1);
+    assert_eq!(
+        reducer.inner_cursor(),
+        &RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(CATALOG_INNER_HIGH_WATER),
+        }
+    );
+    assert_eq!(outcome.binding(), &expected_binding);
+    assert_binding_controls(
+        &sent,
+        &expected_binding,
+        true,
+        Some(CATALOG_OUTER_HIGH_WATER),
+    );
+    drop(runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen advanced subscription cut");
+    let bindings = reopened
+        .durable_stream_bindings()
+        .expect("read advanced durable binding");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].binding(), &expected_binding);
+    assert_eq!(
+        bindings[0].inner_applied(),
+        &RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(CATALOG_INNER_HIGH_WATER),
+        }
+    );
+}
+
+#[tokio::test]
+async fn conversation_subscription_keeps_runtime_and_relay_generations_independent() {
+    let fixture = PairingFixture::new().with_conversation_stream(CONVERSATION_STREAM_ROUTE);
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("subscription state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xe2);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted conversation machine");
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::ConversationIndependentGeneration,
+        conversation_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xe3; 32]);
+    let mut reducer = CapturingSubscriptionReducer::new(conversation_requested_cursor());
+    let outcome = runtime
+        .subscribe(conversation_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("independent Runtime and Relay generations are valid");
+    let expected_binding = conversation_stream_binding(
+        StreamCursor::At(CONVERSATION_OUTER_HIGH_WATER),
+        StreamCursor::At(CONVERSATION_INNER_HIGH_WATER),
+    );
+
+    assert!(outcome.route_accepted());
+    assert_eq!(outcome.subscription(), &conversation_subscription_receipt());
+    assert_eq!(outcome.sync_complete(), &conversation_sync_complete());
+    assert_eq!(outcome.binding(), &expected_binding);
+    assert_eq!(reducer.applied().len(), 1);
+    assert!(matches!(
+        &reducer.applied()[0],
+        RemoteSubscriptionBootstrapItem::ConversationSnapshot(_)
+    ));
+    assert_binding_controls(
+        &sent,
+        &expected_binding,
+        true,
+        Some(CONVERSATION_OUTER_HIGH_WATER),
+    );
+    drop(runtime);
+    assert_durable_stream_binding(&store, &root, &fixture, &expected_binding);
+}
+
+#[tokio::test]
+async fn before_first_binding_subscribes_without_emitting_an_ack() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("subscription state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xe4);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted catalog machine");
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogBeforeFirst,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xe5; 32]);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let outcome = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("BeforeFirst binding completes without a fabricated Ack");
+    let expected_binding =
+        catalog_stream_binding(StreamCursor::BeforeFirst, StreamCursor::BeforeFirst);
+
+    assert_eq!(outcome.binding(), &expected_binding);
+    assert_binding_controls(&sent, &expected_binding, true, None);
+    drop(runtime);
+    assert_durable_stream_binding(&store, &root, &fixture, &expected_binding);
+}
+
+#[tokio::test]
+async fn route_accepted_and_sync_complete_without_stream_binding_are_not_terminal() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("subscription state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xe6);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted catalog machine");
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogMissingBinding,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xe7; 32]);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+
+    assert!(
+        runtime
+            .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+            .await
+            .is_err(),
+        "RouteAccepted plus SyncComplete must not complete without StreamBinding"
+    );
+    assert!(reducer.applied().is_empty());
+    assert_only_runtime_subscribe_send(&sent);
+    drop(runtime);
+    assert_no_durable_stream_binding(&store, &root, &fixture);
+}
+
+#[tokio::test]
+async fn invalid_stream_binding_target_revision_or_order_rejects_before_install_and_controls() {
+    for (seed, script) in [
+        (0xe8, SubscriptionScript::CatalogCrossTargetBinding),
+        (0xea, SubscriptionScript::CatalogWrongBindingRevision),
+        (0xec, SubscriptionScript::CatalogBindingBeforeSync),
+    ] {
+        let fixture = PairingFixture::new().with_conversation_stream(CONVERSATION_STREAM_ROUTE);
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("independent subscription rejection root");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, seed);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open promoted catalog machine");
+        let (transport, sent) =
+            FakeTransport::new_subscription(script, catalog_requested_cursor(), device_sign);
+        let mut runtime = RemoteRuntime::new(opened, transport);
+        let mut rng = DeterministicRng::new([seed.wrapping_add(1); 32]);
+        let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+
+        assert!(
+            runtime
+                .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+                .await
+                .is_err(),
+            "invalid binding must not become a subscription terminal"
+        );
+        assert!(reducer.applied().is_empty());
+        assert_only_runtime_subscribe_send(&sent);
+        drop(runtime);
+        assert_no_durable_stream_binding(&store, &root, &fixture);
     }
 }

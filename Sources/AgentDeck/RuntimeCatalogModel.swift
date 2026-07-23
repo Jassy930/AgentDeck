@@ -10,6 +10,11 @@ enum RuntimeCatalogModelError: Error, Equatable, Sendable {
     actual: RuntimeStreamCursorV1,
     pageIndex: Int
   )
+  case snapshotPageCursorMismatch(
+    expected: RuntimeCatalogPageCursor?,
+    actual: RuntimeCatalogPageCursor?,
+    pageIndex: Int
+  )
   case snapshotEndedBeforeLastPage(pageIndex: Int)
   case snapshotDidNotTerminate
   case repeatedPageCursor(RuntimeCatalogPageCursor)
@@ -82,12 +87,20 @@ struct RuntimeCatalogModel: Sendable {
     var activeEntries: [RuntimeConversationID: RuntimeConversationEntryV2] = [:]
     var latestEntries: [RuntimeConversationID: RuntimeConversationEntryV2] = [:]
     var seenPageCursors: Set<RuntimeCatalogPageCursor> = []
+    var expectedPageCursor: RuntimeCatalogPageCursor?
 
     for (pageIndex, page) in snapshotPages.enumerated() {
       guard page.baseCatalogCursor == baseCursor else {
         throw RuntimeCatalogModelError.snapshotBaseCursorMismatch(
           expected: baseCursor,
           actual: page.baseCatalogCursor,
+          pageIndex: pageIndex
+        )
+      }
+      guard page.currentPageCursor == expectedPageCursor else {
+        throw RuntimeCatalogModelError.snapshotPageCursorMismatch(
+          expected: expectedPageCursor,
+          actual: page.currentPageCursor,
           pageIndex: pageIndex
         )
       }
@@ -104,6 +117,7 @@ struct RuntimeCatalogModel: Sendable {
         guard seenPageCursors.insert(nextPageCursor).inserted else {
           throw RuntimeCatalogModelError.repeatedPageCursor(nextPageCursor)
         }
+        expectedPageCursor = nextPageCursor
       }
 
       for entry in page.entries {

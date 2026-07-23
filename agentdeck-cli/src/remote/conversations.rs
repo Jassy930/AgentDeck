@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
+use std::io;
 
 use agentdeck_crypto::rand_core::CryptoRng;
 use agentdeck_protocol::runtime::identity::CatalogPageCursor;
@@ -26,7 +27,9 @@ use super::selector::PersistentMachineSelector;
 
 const MAX_PERSISTENT_CATALOG_PAGES: usize = 128;
 const MAX_PERSISTENT_CATALOG_ENTRIES: usize = 1_024;
-const MAX_PERSISTENT_CATALOG_BYTES: usize = 128 * 1024 * 1024;
+// 这是跨页 canonical encoded data 的聚合准入上界；transport reassembly 的 resident
+// memory 由 TransferReassembler 独立执行自己的 128 MiB hard cap。
+const MAX_PERSISTENT_CATALOG_ENCODED_BYTES: usize = 128 * 1024 * 1024;
 
 /// 完整 Catalog readback；transport acceptance 只保留为独立观测，不能替代本结果。
 pub struct PersistentRemoteConversationsOutcome {
@@ -79,7 +82,7 @@ pub enum PersistentRemotePaginationError {
     PageLimitExceeded,
     #[error("Catalog pagination exceeded the 1,024-entry client bound")]
     EntryLimitExceeded,
-    #[error("Catalog pagination exceeded the 128 MiB client bound")]
+    #[error("Catalog pagination exceeded the 128 MiB encoded-data client bound")]
     ByteLimitExceeded,
     #[error("Catalog pagination repeated a conversation identity")]
     DuplicateConversation,
@@ -128,8 +131,9 @@ impl CatalogPage {
         }
     }
 
-    fn from_runtime(outcome: &RemoteCatalogPageOutcome) -> Self {
-        Self::new(outcome.route_accepted(), outcome.snapshot().clone())
+    fn from_runtime(outcome: RemoteCatalogPageOutcome) -> Self {
+        let (route_accepted, snapshot) = outcome.into_parts();
+        Self::new(route_accepted, snapshot)
     }
 }
 
@@ -164,7 +168,6 @@ where
         Ok(
             RemoteRuntime::resume_pending_catalog_page(self.as_mut(), rng)
                 .await?
-                .as_ref()
                 .map(CatalogPage::from_runtime),
         )
     }
@@ -175,7 +178,7 @@ where
         rng: &mut R,
     ) -> Result<CatalogPage, RemoteRuntimeError> {
         let outcome = RemoteRuntime::catalog_page(self.as_mut(), cursor, rng).await?;
-        Ok(CatalogPage::from_runtime(&outcome))
+        Ok(CatalogPage::from_runtime(outcome))
     }
 
     async fn shutdown(self) {
@@ -200,9 +203,32 @@ pub(super) fn checked_catalog_totals(
         .ok_or(PersistentRemotePaginationError::EntryLimitExceeded)?;
     let bytes = current_bytes
         .checked_add(page_bytes)
-        .filter(|bytes| *bytes <= MAX_PERSISTENT_CATALOG_BYTES)
+        .filter(|bytes| *bytes <= MAX_PERSISTENT_CATALOG_ENCODED_BYTES)
         .ok_or(PersistentRemotePaginationError::ByteLimitExceeded)?;
     Ok((entries, bytes))
+}
+
+#[derive(Default)]
+struct JsonByteCounter(usize);
+
+impl io::Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoded_catalog_len(snapshot: &CatalogSnapshot) -> Result<usize, RemoteRuntimeError> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, snapshot).map_err(RemoteRuntimeError::Json)?;
+    Ok(counter.0)
 }
 
 async fn collect_catalog<R, Runtime>(
@@ -231,33 +257,36 @@ where
             Some(page) => page,
             None => runtime.catalog_page(next_page_cursor.take(), rng).await?,
         };
-        let page_bytes = serde_json::to_vec(&page.snapshot)
-            .map_err(RemoteRuntimeError::Json)?
-            .len();
+        let page_bytes = encoded_catalog_len(&page.snapshot)?;
+        let CatalogPage {
+            route_accepted,
+            snapshot,
+        } = page;
+        let (page_base, entries, _current_page_cursor, next_page) = snapshot.into_parts();
         let (_, next_catalog_bytes) = checked_catalog_totals(
             conversations.len(),
             catalog_bytes,
-            page.snapshot.entries().len(),
+            entries.len(),
             page_bytes,
         )?;
         page_count += 1;
         catalog_bytes = next_catalog_bytes;
-        route_accepted_observed |= page.route_accepted;
+        route_accepted_observed |= route_accepted;
         match base_catalog_cursor {
-            Some(expected) if page.snapshot.base_catalog_cursor != expected => {
+            Some(expected) if page_base != expected => {
                 return Err(PersistentRemotePaginationError::BaseCursorChanged.into());
             }
-            None => base_catalog_cursor = Some(page.snapshot.base_catalog_cursor),
+            None => base_catalog_cursor = Some(page_base),
             Some(_) => {}
         }
 
-        for entry in page.snapshot.entries() {
+        for entry in entries {
             if !conversation_ids.insert(entry.conversation_id.as_str().to_owned()) {
                 return Err(PersistentRemotePaginationError::DuplicateConversation.into());
             }
-            conversations.push(entry.clone());
+            conversations.push(entry);
         }
-        let Some(next) = page.snapshot.next_page_cursor().cloned() else {
+        let Some(next) = next_page else {
             break;
         };
         if !issued_cursors.insert(next.as_str().to_owned()) {

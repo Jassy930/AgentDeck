@@ -2684,6 +2684,12 @@
         "baseCatalogCursor": {
           "$ref": "#/definitions/StreamCursor"
         },
+        "currentPageCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "entries": {
           "items": {
             "$ref": "#/definitions/ConversationEntry"
@@ -2699,6 +2705,7 @@
       },
       "required": [
         "baseCatalogCursor",
+        "currentPageCursor",
         "entries",
         "nextPageCursor"
       ],
@@ -8427,6 +8434,12 @@
                 "baseCatalogCursor": {
                   "$ref": "#/definitions/StreamCursor"
                 },
+                "currentPageCursor": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "entries": {
                   "items": {
                     "$ref": "#/definitions/ConversationEntry"
@@ -8448,6 +8461,7 @@
               },
               "required": [
                 "baseCatalogCursor",
+                "currentPageCursor",
                 "entries",
                 "nextPageCursor",
                 "reply"
@@ -10301,7 +10315,7 @@
           ]
         }
       },
-      "description": "Runtime v4 顶层封装。\n\n未派生 `PartialEq`：`RuntimeMessage` 传递内嵌未派生 `PartialEq` 的中立 trunk 类型； 本 task 不改动 trunk，契约测试以 wire round-trip 覆盖。",
+      "description": "Runtime v5 顶层封装。\n\n未派生 `PartialEq`：`RuntimeMessage` 传递内嵌未派生 `PartialEq` 的中立 trunk 类型； 本 task 不改动 trunk，契约测试以 wire round-trip 覆盖。",
       "properties": {
         "body": {
           "$ref": "#/definitions/RuntimeMessage"
@@ -15721,6 +15735,12 @@
                 "baseCatalogCursor": {
                   "$ref": "#/definitions/StreamCursor"
                 },
+                "currentPageCursor": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "entries": {
                   "items": {
                     "$ref": "#/definitions/ConversationEntry"
@@ -15742,6 +15762,7 @@
               },
               "required": [
                 "baseCatalogCursor",
+                "currentPageCursor",
                 "entries",
                 "nextPageCursor",
                 "reply"
@@ -20357,6 +20378,12 @@
             "baseCatalogCursor": {
               "$ref": "#/definitions/StreamCursor"
             },
+            "currentPageCursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "entries": {
               "items": {
                 "$ref": "#/definitions/ConversationEntry"
@@ -20378,6 +20405,7 @@
           },
           "required": [
             "baseCatalogCursor",
+            "currentPageCursor",
             "entries",
             "nextPageCursor",
             "reply"
@@ -25288,6 +25316,6 @@
       "type": "object"
     }
   },
-  "title": "AgentDeck Runtime Protocol v4",
+  "title": "AgentDeck Runtime Protocol v5",
   "type": "object"
 }

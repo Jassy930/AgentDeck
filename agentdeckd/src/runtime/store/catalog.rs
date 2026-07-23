@@ -1,4 +1,4 @@
-//! Runtime v4 authenticated catalog delta journal。
+//! Runtime v5 authenticated catalog delta journal。
 
 use std::path::PathBuf;
 

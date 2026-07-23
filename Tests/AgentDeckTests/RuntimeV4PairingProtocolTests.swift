@@ -6,7 +6,8 @@ import XCTest
 final class RuntimeV4PairingProtocolTests: XCTestCase {
   func testRustPairingFixturesRoundTripThroughCurrentCodec() throws {
     XCTAssertEqual(runtimeProtocolVersionV4, 4)
-    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV4)
+    XCTAssertEqual(runtimeProtocolVersionV5, 5)
+    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV5)
 
     for name in [
       "requestCreatePairInvite",
@@ -21,12 +22,12 @@ final class RuntimeV4PairingProtocolTests: XCTestCase {
       "streamPairingPending",
     ] {
       let input = try fixtureValue(named: name)
-      let decoded = try RuntimeV4WireCodec.decodeEnvelope(input)
-      XCTAssertEqual(decoded.version, runtimeProtocolVersionV4)
+      let decoded = try RuntimeV5WireCodec.decodeEnvelope(input)
+      XCTAssertEqual(decoded.version, runtimeProtocolVersionV5)
       XCTAssertEqual(
-        try normalizedJSON(RuntimeV4WireCodec.encode(decoded)),
+        try normalizedJSON(RuntimeV5WireCodec.encode(decoded)),
         try normalizedJSON(input),
-        "Rust/Swift Runtime v4 drift for \(name)"
+        "Rust/Swift Runtime v5 drift for \(name)"
       )
     }
   }
@@ -170,6 +171,6 @@ final class RuntimeV4PairingProtocolTests: XCTestCase {
       .deletingLastPathComponent()
       .deletingLastPathComponent()
       .deletingLastPathComponent()
-      .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v4-wire.jsonl")
+      .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v5-wire.jsonl")
   }
 }

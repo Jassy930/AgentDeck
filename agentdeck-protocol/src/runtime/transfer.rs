@@ -409,7 +409,9 @@ impl TransferReassembler {
                 parts: BTreeMap::new(),
                 buffered_bytes: 0,
             });
-        entry.parts.insert(env.part_index, env.part.clone());
+        // `env.part` 已由 ingress 独占持有；直接移交给 active transfer，避免在 128 MiB
+        // parts+assembly 峰值之外短暂保留一份未计费 clone。
+        entry.parts.insert(env.part_index, env.part);
         entry.buffered_bytes = entry
             .buffered_bytes
             .checked_add(incoming)
@@ -735,5 +737,40 @@ mod b64_bytes {
         STANDARD
             .decode(s.as_bytes())
             .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_moves_the_incoming_part_into_the_reassembly_budget() {
+        let transfer_id = TransferId::new("move-owned-part");
+        let part = vec![0x5a; 4_096];
+        let original_allocation = part.as_ptr();
+        let envelope = TransferEnvelope::new(transfer_id.clone(), 0, 2, [0x7b; 32], 8_192, part)
+            .expect("bounded first part");
+        let mut reassembler = TransferReassembler::new();
+
+        assert!(matches!(
+            reassembler
+                .accept(RuntimeTransferChannel::Reply, envelope, 0)
+                .expect("first part remains active"),
+            TransferProgress::InProgress {
+                received_parts: 1,
+                part_count: 2
+            }
+        ));
+        let buffered = reassembler
+            .active
+            .get(&transfer_id)
+            .and_then(|transfer| transfer.parts.get(&0))
+            .expect("active transfer owns the first part");
+        assert_eq!(
+            buffered.as_ptr(),
+            original_allocation,
+            "reassembly must move the already allocated input part instead of cloning an unbudgeted copy"
+        );
     }
 }

@@ -125,6 +125,7 @@ async fn compact_profile_sends_oversized_catalog_reply_as_adrt1_reply_parts() {
             entry_revision: 0,
         }],
         None,
+        None,
     )
     .expect("construct oversized valid CatalogSnapshot");
     let payload: Arc<[u8]> = serde_json::to_vec(&snapshot)

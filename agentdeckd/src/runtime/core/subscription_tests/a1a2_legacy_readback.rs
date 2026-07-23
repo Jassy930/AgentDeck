@@ -183,10 +183,10 @@ fn assert_no_private_handle(bytes: &[u8]) {
 
 #[tokio::test]
 #[ignore = "A1a2 manual real-writer gate; requires AGENTDECK_A1A2_FIXTURE_DIR"]
-async fn reads_runtime_v1_v4_sample_as_current_v4_without_rewrite() {
-    // 威胁场景：只用合成 JSON 证明 dual-decode 会漏掉真实 v4 AEAD/AAD/token、
+async fn reads_runtime_v1_v4_sample_as_current_v5_without_rewrite() {
+    // 威胁场景：只用合成 JSON 证明 dual-decode 会漏掉真实 v4 DB AEAD/AAD/token、
     // read-pool lease 与 paced transfer handoff 的组合错误，甚至在 open 时静默 reseal。
-    assert_eq!(RUNTIME_PROTOCOL_VERSION, 4);
+    assert_eq!(RUNTIME_PROTOCOL_VERSION, 5);
     assert_eq!(RUNTIME_SCHEMA_VERSION, 13);
     assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
     let artifact = PathBuf::from(

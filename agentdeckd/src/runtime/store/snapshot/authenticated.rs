@@ -1,4 +1,4 @@
-//! Runtime v4 snapshot authenticated metadata and exact-reference read boundary。
+//! Runtime v5 snapshot authenticated metadata and exact-reference read boundary。
 
 use std::collections::HashMap;
 

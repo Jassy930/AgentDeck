@@ -114,6 +114,10 @@ enum AppRuntimeCoordinatorError: Error, Equatable, Sendable {
   case synchronizationReplyLimitExceeded
   case catalogPageLimitExceeded
   case catalogPageCursorCycle(RuntimeCatalogPageCursor)
+  case catalogPageCursorMismatch(
+    expected: RuntimeCatalogPageCursor?,
+    actual: RuntimeCatalogPageCursor?
+  )
 }
 
 struct AppRuntimeSynchronizationResult: Sendable {
@@ -245,6 +249,12 @@ actor AppRuntimeCoordinator {
       let reply = try await request(.catalog(pageCursor: pageCursor))
       guard case .catalog(let page) = reply else {
         throw unexpected(operation: .catalog, expected: .catalog, actual: reply)
+      }
+      guard page.currentPageCursor == pageCursor else {
+        throw AppRuntimeCoordinatorError.catalogPageCursorMismatch(
+          expected: pageCursor,
+          actual: page.currentPageCursor
+        )
       }
       pages.append(page)
       guard let next = page.nextPageCursor else { return pages }

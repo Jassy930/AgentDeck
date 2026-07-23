@@ -1,4 +1,4 @@
-//! Runtime v4 transport-neutral durable publication outbox。
+//! Runtime v5 transport-neutral durable publication outbox。
 
 mod binding;
 mod directory;

@@ -181,15 +181,18 @@ public struct RuntimeCatalogSnapshotV2: RuntimeV2FlattenedPayload {
 
     public let baseCatalogCursor: RuntimeStreamCursorV1
     public let entries: [RuntimeConversationEntryV2]
+    public let currentPageCursor: RuntimeCatalogPageCursor?
     public let nextPageCursor: RuntimeCatalogPageCursor?
 
     public init(
         baseCatalogCursor: RuntimeStreamCursorV1,
         entries: [RuntimeConversationEntryV2],
+        currentPageCursor: RuntimeCatalogPageCursor? = nil,
         nextPageCursor: RuntimeCatalogPageCursor?
     ) throws {
         self.baseCatalogCursor = baseCatalogCursor
         self.entries = entries
+        self.currentPageCursor = currentPageCursor
         self.nextPageCursor = nextPageCursor
         try validate()
     }
@@ -214,6 +217,11 @@ public struct RuntimeCatalogSnapshotV2: RuntimeV2FlattenedPayload {
             entries: container.decode(
                 [RuntimeConversationEntryV2].self,
                 forKey: runtimeV2Key("entries")
+            ),
+            currentPageCursor: runtimeV2DecodeRequiredNullable(
+                RuntimeCatalogPageCursor.self,
+                from: container,
+                forKey: runtimeV2Key("currentPageCursor")
             ),
             nextPageCursor: runtimeV2DecodeRequiredNullable(
                 RuntimeCatalogPageCursor.self,
@@ -242,6 +250,7 @@ public struct RuntimeCatalogSnapshotV2: RuntimeV2FlattenedPayload {
     ) throws {
         try container.encode(baseCatalogCursor, forKey: runtimeV2Key("baseCatalogCursor"))
         try container.encode(entries, forKey: runtimeV2Key("entries"))
+        try container.encode(currentPageCursor, forKey: runtimeV2Key("currentPageCursor"))
         try container.encode(nextPageCursor, forKey: runtimeV2Key("nextPageCursor"))
     }
 
@@ -256,7 +265,7 @@ public struct RuntimeCatalogSnapshotV2: RuntimeV2FlattenedPayload {
     }
 
     private static let wireKeys: Set<String> = [
-        "baseCatalogCursor", "entries", "nextPageCursor",
+        "baseCatalogCursor", "entries", "currentPageCursor", "nextPageCursor",
     ]
 }
 

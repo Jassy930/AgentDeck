@@ -19,6 +19,7 @@ final class RuntimeCatalogModelTests: XCTestCase {
         entry("conversation-a", lastActiveMs: 100, entryRevision: 1),
         entry("conversation-c", lastActiveMs: 300, entryRevision: 0),
       ],
+      current: "page-2",
       next: nil
     )
 
@@ -44,7 +45,7 @@ final class RuntimeCatalogModelTests: XCTestCase {
       try RuntimeCatalogModel(
         snapshotPages: [
           try page(base: .at(7), entries: [], next: "page-2"),
-          try page(base: .at(8), entries: [], next: nil),
+          try page(base: .at(8), entries: [], current: "page-2", next: nil),
         ]
       )
     ) { error in
@@ -82,14 +83,34 @@ final class RuntimeCatalogModelTests: XCTestCase {
       try RuntimeCatalogModel(
         snapshotPages: [
           try page(base: .beforeFirst, entries: [], next: "same-page"),
-          try page(base: .beforeFirst, entries: [], next: "same-page"),
-          try page(base: .beforeFirst, entries: [], next: nil),
+          try page(
+            base: .beforeFirst, entries: [], current: "same-page", next: "same-page"
+          ),
+          try page(base: .beforeFirst, entries: [], current: "same-page", next: nil),
         ]
       )
     ) { error in
       XCTAssertEqual(
         error as? RuntimeCatalogModelError,
         .repeatedPageCursor(pageCursor("same-page"))
+      )
+    }
+
+    XCTAssertThrowsError(
+      try RuntimeCatalogModel(
+        snapshotPages: [
+          try page(base: .beforeFirst, entries: [], next: "page-2"),
+          try page(base: .beforeFirst, entries: [], current: "page-3", next: nil),
+        ]
+      )
+    ) { error in
+      XCTAssertEqual(
+        error as? RuntimeCatalogModelError,
+        .snapshotPageCursorMismatch(
+          expected: pageCursor("page-2"),
+          actual: pageCursor("page-3"),
+          pageIndex: 1
+        )
       )
     }
   }
@@ -399,11 +420,13 @@ final class RuntimeCatalogModelTests: XCTestCase {
   private func page(
     base: RuntimeStreamCursorV1,
     entries: [RuntimeConversationEntryV2],
+    current: String? = nil,
     next: String?
   ) throws -> RuntimeCatalogSnapshotV2 {
     try RuntimeCatalogSnapshotV2(
       baseCatalogCursor: base,
       entries: entries,
+      currentPageCursor: current.map(pageCursor),
       nextPageCursor: next.map(pageCursor)
     )
   }

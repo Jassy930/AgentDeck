@@ -122,6 +122,7 @@ fn snapshot(base: StreamCursor, conversation: &str, next: Option<&str>) -> Catal
             archived: false,
             entry_revision: 1,
         }],
+        None,
         next.map(CatalogPageCursor::new),
     )
     .expect("valid Catalog page")
@@ -146,6 +147,7 @@ fn snapshot_range(
                 entry_revision: 1,
             })
             .collect(),
+        None,
         next.map(CatalogPageCursor::new),
     )
     .expect("bounded Catalog page")
@@ -383,6 +385,51 @@ fn aggregate_catalog_byte_and_entry_bounds_are_checked_without_large_allocations
         checked_catalog_totals(0, 128 * 1024 * 1024, 0, 1),
         Err(PersistentRemotePaginationError::ByteLimitExceeded)
     );
+}
+
+#[tokio::test]
+async fn catalog_collection_moves_page_storage_and_uses_streaming_size_accounting() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    let title = "owned-without-page-clones".repeat(32);
+    let title_storage = title.as_ptr();
+    let snapshot = CatalogSnapshot::new(
+        StreamCursor::At(9),
+        vec![ConversationEntry {
+            conversation_id: ConversationId::new("conversation-owned"),
+            agent_kind: AgentKind::Codex,
+            title: Some(title),
+            cwd: None,
+            last_active_ms: 9,
+            archived: false,
+            entry_revision: 1,
+        }],
+        None,
+        None,
+    )
+    .expect("bounded Catalog page");
+
+    let outcome = execute_fake(
+        None,
+        vec![Ok(CatalogPage::new(false, snapshot))],
+        events,
+        requested,
+    )
+    .await
+    .expect("single authenticated page");
+    assert_eq!(
+        outcome.conversations()[0]
+            .title
+            .as_ref()
+            .expect("title")
+            .as_ptr(),
+        title_storage,
+        "Catalog collection must move entry storage instead of cloning a full page",
+    );
+
+    let source = include_str!("conversations.rs");
+    assert!(!source.contains("snapshot().clone()"));
+    assert!(!source.contains("serde_json::to_vec(&page.snapshot)"));
 }
 
 #[tokio::test]

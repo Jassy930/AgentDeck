@@ -4,19 +4,20 @@ import XCTest
 @testable import AgentDeckCore
 
 final class RuntimeV3MachineAdminProtocolTests: XCTestCase {
-  func testCurrentVersionAndSourceCompatibleAliasesAreV4() throws {
+  func testCurrentVersionAndSourceCompatibleAliasesAreV5() throws {
     XCTAssertEqual(runtimeProtocolVersionV2, 2)
     XCTAssertEqual(runtimeProtocolVersionV3, 3)
     XCTAssertEqual(runtimeProtocolVersionV4, 4)
-    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV4)
+    XCTAssertEqual(runtimeProtocolVersionV5, 5)
+    XCTAssertEqual(runtimeProtocolVersionCurrent, runtimeProtocolVersionV5)
 
-    let request: RuntimeRequestV4 = .machineRemoteStatus(scope: .localOnly)
-    let envelope = RuntimeEnvelopeV4(
+    let request: RuntimeRequestV5 = .machineRemoteStatus(scope: .localOnly)
+    let envelope = RuntimeEnvelopeV5(
       version: runtimeProtocolVersionCurrent,
-      messageID: RuntimeMessageID(rawValue: "runtime-v4-alias"),
+      messageID: RuntimeMessageID(rawValue: "runtime-v5-alias"),
       body: .request(request)
     )
-    _ = try RuntimeV4WireCodec.encode(envelope)
+    _ = try RuntimeV5WireCodec.encode(envelope)
   }
 
   func testRustMachineAdministrationFixturesRoundTripThroughCurrentCodec() throws {
@@ -29,9 +30,9 @@ final class RuntimeV3MachineAdminProtocolTests: XCTestCase {
       "replyMachineRemoteStatus",
     ] {
       let input = try fixtureValue(named: name)
-      let decoded = try RuntimeV4WireCodec.decodeEnvelope(input)
-      XCTAssertEqual(decoded.version, runtimeProtocolVersionV4)
-      try XCTAssertEqual(normalizedJSON(RuntimeV4WireCodec.encode(decoded)), normalizedJSON(input))
+      let decoded = try RuntimeV5WireCodec.decodeEnvelope(input)
+      XCTAssertEqual(decoded.version, runtimeProtocolVersionV5)
+      try XCTAssertEqual(normalizedJSON(RuntimeV5WireCodec.encode(decoded)), normalizedJSON(input))
 
       switch (name, decoded.body) {
       case (
@@ -302,7 +303,7 @@ final class RuntimeV3MachineAdminProtocolTests: XCTestCase {
       adminPurgeReceipt: nil
     )
     let uninstallEnvelope = RuntimeEnvelopeV4(
-      version: runtimeProtocolVersionV4,
+      version: runtimeProtocolVersionV5,
       messageID: RuntimeMessageID(rawValue: "runtime-v4-uninstall-purge"),
       body: .request(uninstallRequest)
     )
@@ -386,6 +387,6 @@ final class RuntimeV3MachineAdminProtocolTests: XCTestCase {
       .deletingLastPathComponent()
       .deletingLastPathComponent()
       .deletingLastPathComponent()
-      .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v4-wire.jsonl")
+      .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v5-wire.jsonl")
   }
 }

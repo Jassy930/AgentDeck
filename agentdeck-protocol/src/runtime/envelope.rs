@@ -1,4 +1,4 @@
-//! Runtime v4 顶层 envelope（design §8.2）。
+//! Runtime v5 顶层 envelope（design §8.2）。
 //!
 //! `RuntimeEnvelope` 是 UDS 与解密后远程链路的共同业务 wire。它把三类业务消息
 //! （请求/回复/流）统一封装；限制值（如单个 `RuntimeRequest` ≤ 1 MiB）在契约层
@@ -60,7 +60,7 @@ pub fn ensure_request_within_limit(encoded_len: usize) -> Result<(), RuntimeSize
     Ok(())
 }
 
-/// Runtime v4 顶层封装。
+/// Runtime v5 顶层封装。
 ///
 /// 未派生 `PartialEq`：`RuntimeMessage` 传递内嵌未派生 `PartialEq` 的中立 trunk 类型；
 /// 本 task 不改动 trunk，契约测试以 wire round-trip 覆盖。

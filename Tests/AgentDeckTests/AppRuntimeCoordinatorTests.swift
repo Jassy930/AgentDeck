@@ -413,11 +413,13 @@ final class AppRuntimeCoordinatorTests: XCTestCase {
     let first = try RuntimeCatalogSnapshotV2(
       baseCatalogCursor: .at(4),
       entries: [],
+      currentPageCursor: nil,
       nextPageCursor: next
     )
     let second = try RuntimeCatalogSnapshotV2(
       baseCatalogCursor: .at(4),
       entries: [],
+      currentPageCursor: next,
       nextPageCursor: nil
     )
     let wire = AppRuntimeFakeWire(unaryReplies: [
@@ -440,6 +442,36 @@ final class AppRuntimeCoordinatorTests: XCTestCase {
       requestKinds,
       ["describeAgents", "catalog.nil", "catalog.page-2"]
     )
+  }
+
+  func testCatalogPaginationRejectsMissingMiddlePageByExactCursorChain() async throws {
+    let expected = RuntimeCatalogPageCursor(rawValue: "page-2")
+    let unexpected = RuntimeCatalogPageCursor(rawValue: "page-3")
+    let first = try RuntimeCatalogSnapshotV2(
+      baseCatalogCursor: .at(4),
+      entries: [],
+      currentPageCursor: nil,
+      nextPageCursor: expected
+    )
+    let skipped = try RuntimeCatalogSnapshotV2(
+      baseCatalogCursor: .at(4),
+      entries: [],
+      currentPageCursor: unexpected,
+      nextPageCursor: nil
+    )
+    let wire = AppRuntimeFakeWire(unaryReplies: [.catalog(first), .catalog(skipped)])
+    let coordinator = AppRuntimeCoordinator(wire: wire) { _ in }
+    try await coordinator.start()
+    do {
+      _ = try await coordinator.loadCatalog()
+      XCTFail("missing middle Catalog page must fail closed")
+    } catch {
+      XCTAssertEqual(
+        error as? AppRuntimeCoordinatorError,
+        .catalogPageCursorMismatch(expected: expected, actual: unexpected)
+      )
+    }
+    await coordinator.close()
   }
 
   func testCloseDuringCoordinatorStartCannotPublishRunningState() async throws {

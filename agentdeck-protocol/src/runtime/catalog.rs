@@ -9,6 +9,7 @@ use crate::runtime::sync::StreamCursor;
 use crate::trunk::AgentKind;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::path::PathBuf;
 
 /// Catalog 每页最多 500 rows（design §9.5）。
@@ -48,6 +49,8 @@ pub struct CatalogSnapshot {
     pub base_catalog_cursor: StreamCursor,
     entries: Vec<ConversationEntry>,
     #[schemars(with = "crate::runtime::schema::RequiredNullable<CatalogPageCursor>")]
+    current_page_cursor: Option<CatalogPageCursor>,
+    #[schemars(with = "crate::runtime::schema::RequiredNullable<CatalogPageCursor>")]
     next_page_cursor: Option<CatalogPageCursor>,
 }
 
@@ -55,6 +58,7 @@ impl CatalogSnapshot {
     pub fn new(
         base_catalog_cursor: StreamCursor,
         entries: Vec<ConversationEntry>,
+        current_page_cursor: Option<CatalogPageCursor>,
         next_page_cursor: Option<CatalogPageCursor>,
     ) -> Result<Self, CatalogError> {
         if entries.len() > MAX_CATALOG_PAGE_ROWS {
@@ -63,15 +67,10 @@ impl CatalogSnapshot {
         let snapshot = Self {
             base_catalog_cursor,
             entries,
+            current_page_cursor,
             next_page_cursor,
         };
-        if serde_json::to_vec(&snapshot)
-            .map_err(|_| CatalogError::EncodedTooLarge)?
-            .len()
-            > MAX_CATALOG_PAGE_BYTES
-        {
-            return Err(CatalogError::EncodedTooLarge);
-        }
+        ensure_encoded_size(&snapshot)?;
         Ok(snapshot)
     }
 
@@ -79,9 +78,52 @@ impl CatalogSnapshot {
         &self.entries
     }
 
+    pub fn current_page_cursor(&self) -> Option<&CatalogPageCursor> {
+        self.current_page_cursor.as_ref()
+    }
+
     pub fn next_page_cursor(&self) -> Option<&CatalogPageCursor> {
         self.next_page_cursor.as_ref()
     }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        StreamCursor,
+        Vec<ConversationEntry>,
+        Option<CatalogPageCursor>,
+        Option<CatalogPageCursor>,
+    ) {
+        (
+            self.base_catalog_cursor,
+            self.entries,
+            self.current_page_cursor,
+            self.next_page_cursor,
+        )
+    }
+}
+
+struct BoundedJsonByteCounter(usize);
+
+impl io::Write for BoundedJsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|next| *next <= MAX_CATALOG_PAGE_BYTES)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Catalog page too large"))?;
+        self.0 = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn ensure_encoded_size(snapshot: &CatalogSnapshot) -> Result<(), CatalogError> {
+    let mut counter = BoundedJsonByteCounter(0);
+    serde_json::to_writer(&mut counter, snapshot).map_err(|_| CatalogError::EncodedTooLarge)
 }
 
 impl<'de> Deserialize<'de> for CatalogSnapshot {
@@ -95,11 +137,18 @@ impl<'de> Deserialize<'de> for CatalogSnapshot {
             base_catalog_cursor: StreamCursor,
             entries: Vec<ConversationEntry>,
             #[serde(deserialize_with = "deserialize_required_optional_page_cursor")]
+            current_page_cursor: Option<CatalogPageCursor>,
+            #[serde(deserialize_with = "deserialize_required_optional_page_cursor")]
             next_page_cursor: Option<CatalogPageCursor>,
         }
         let w = Wire::deserialize(deserializer)?;
-        CatalogSnapshot::new(w.base_catalog_cursor, w.entries, w.next_page_cursor)
-            .map_err(serde::de::Error::custom)
+        CatalogSnapshot::new(
+            w.base_catalog_cursor,
+            w.entries,
+            w.current_page_cursor,
+            w.next_page_cursor,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

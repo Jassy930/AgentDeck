@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use agentdeck_protocol::runtime::catalog::{CatalogError, CatalogSnapshot};
 use agentdeck_protocol::runtime::command::CatalogRequest;
+use agentdeck_protocol::runtime::identity::CatalogPageCursor;
 use agentdeck_protocol::runtime::{ConversationEntry, StreamCursor};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
@@ -298,6 +299,7 @@ impl CatalogSnapshotProvider {
                 CatalogPageReference::ephemeral(materialized.reference),
                 materialized.entries,
                 None,
+                None,
                 issue,
                 memory,
             );
@@ -313,7 +315,7 @@ impl CatalogSnapshotProvider {
             let reference = source.ok_or(CatalogSnapshotProviderError::MissingSnapshotSource)?;
             let page_reference = CatalogPageReference::durable(reference.clone());
             if let Some(cache_version) = self.cached_matches(&page_reference)? {
-                return self.build_cached_page(&page_reference, cache_version, None, issue);
+                return self.build_cached_page(&page_reference, cache_version, None, None, issue);
             }
             let memory = CatalogMemoryLease::reserve(
                 self.memory.clone(),
@@ -321,7 +323,7 @@ impl CatalogSnapshotProvider {
                 refresh.peak_retained_bytes,
             )?;
             return self
-                .page_from_reference_with_memory(reference, None, issue, memory)
+                .page_from_reference_with_memory(reference, None, None, issue, memory)
                 .await;
         }
         let memory = CatalogMemoryLease::reserve(
@@ -333,7 +335,7 @@ impl CatalogSnapshotProvider {
             .store
             .refresh_catalog_snapshot(source, frozen, memory.shared_permit()?)
             .await?;
-        self.page_from_reference_with_memory(reference, None, issue, memory)
+        self.page_from_reference_with_memory(reference, None, None, issue, memory)
             .await
     }
 
@@ -387,6 +389,7 @@ impl CatalogSnapshotProvider {
         self.page_from_page_reference(
             claims.reference,
             Some(claims.next_key),
+            Some(cursor.clone()),
             PageIssue {
                 observed_now_ms: now_ms,
                 issued_at_ms: claims.issued_at_ms,
@@ -427,10 +430,17 @@ impl CatalogSnapshotProvider {
         &self,
         reference: CatalogPageReference,
         after: Option<String>,
+        current_page_cursor: Option<CatalogPageCursor>,
         issue: PageIssue,
     ) -> Result<CatalogSnapshotPage, CatalogSnapshotProviderError> {
         if let Some(cache_version) = self.cached_matches(&reference)? {
-            return self.build_cached_page(&reference, cache_version, after.as_deref(), issue);
+            return self.build_cached_page(
+                &reference,
+                cache_version,
+                after.as_deref(),
+                current_page_cursor,
+                issue,
+            );
         }
 
         if reference.kind == CatalogPageSourceKind::Ephemeral {
@@ -444,14 +454,21 @@ impl CatalogSnapshotProvider {
         .map_err(|_| CatalogSnapshotProviderError::MemoryBudgetExceeded)?;
         let memory =
             CatalogMemoryLease::reserve(self.memory.clone(), self.global_memory.clone(), peak)?;
-        self.page_from_reference_with_memory(reference.snapshot, after, issue, memory)
-            .await
+        self.page_from_reference_with_memory(
+            reference.snapshot,
+            after,
+            current_page_cursor,
+            issue,
+            memory,
+        )
+        .await
     }
 
     async fn page_from_reference_with_memory(
         &self,
         reference: ReadySnapshotReference,
         after: Option<String>,
+        current_page_cursor: Option<CatalogPageCursor>,
         issue: PageIssue,
         mut memory: CatalogMemoryLease,
     ) -> Result<CatalogSnapshotPage, CatalogSnapshotProviderError> {
@@ -492,6 +509,7 @@ impl CatalogSnapshotProvider {
             CatalogPageReference::durable(reference),
             entries,
             after.as_deref(),
+            current_page_cursor,
             issue,
             memory,
         )
@@ -502,12 +520,17 @@ impl CatalogSnapshotProvider {
         reference: CatalogPageReference,
         entries: Vec<ConversationEntry>,
         after: Option<&str>,
+        current_page_cursor: Option<CatalogPageCursor>,
         issue: PageIssue,
         mut memory: CatalogMemoryLease,
     ) -> Result<CatalogSnapshotPage, CatalogSnapshotProviderError> {
         let (start, end) = page_range(&entries, after)?;
         let retained_bytes = cache_retained_bound(reference.snapshot.logical_bytes, &entries)?;
-        let cursor_bound = if end < entries.len() { 512 } else { 0 };
+        let cursor_bound = current_page_cursor
+            .as_ref()
+            .map_or(0, |cursor| cursor.as_str().len())
+            .checked_add(if end < entries.len() { 512 } else { 0 })
+            .ok_or(CatalogSnapshotProviderError::MemoryBudgetExceeded)?;
         let page_build_bytes = page_memory_bound(&entries[start..end], cursor_bound)?;
         let build_peak = retained_bytes
             .checked_add(page_build_bytes)
@@ -519,10 +542,9 @@ impl CatalogSnapshotProvider {
             &self.cursor_key,
             &reference,
             &entries[start..end],
+            current_page_cursor,
             end < entries.len(),
-            issue.issued_at_ms,
-            issue.expires_at_ms,
-            issue.binding,
+            issue,
         )?;
         let cached = snapshot
             .next_page_cursor()
@@ -558,6 +580,7 @@ impl CatalogSnapshotProvider {
         reference: &CatalogPageReference,
         matched_version: u64,
         after: Option<&str>,
+        current_page_cursor: Option<CatalogPageCursor>,
         issue: PageIssue,
     ) -> Result<CatalogSnapshotPage, CatalogSnapshotProviderError> {
         let (start, end, preallocation) = {
@@ -571,7 +594,11 @@ impl CatalogSnapshotProvider {
                 .filter(|cached| cached.matches(reference))
                 .ok_or(CatalogSnapshotProviderError::InvalidCursor)?;
             let (start, end) = page_range(&cached.entries, after)?;
-            let cursor_bytes = if end < cached.entries.len() { 512 } else { 0 };
+            let cursor_bytes = current_page_cursor
+                .as_ref()
+                .map_or(0, |cursor| cursor.as_str().len())
+                .checked_add(if end < cached.entries.len() { 512 } else { 0 })
+                .ok_or(CatalogSnapshotProviderError::MemoryBudgetExceeded)?;
             (
                 start,
                 end,
@@ -597,10 +624,9 @@ impl CatalogSnapshotProvider {
                 &self.cursor_key,
                 reference,
                 &cached.entries[start..end],
+                current_page_cursor,
                 end < cached.entries.len(),
-                issue.issued_at_ms,
-                issue.expires_at_ms,
-                issue.binding,
+                issue,
             )?
         };
         memory.transition(page_bytes, None)?;

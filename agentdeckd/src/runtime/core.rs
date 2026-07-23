@@ -681,7 +681,7 @@ impl RuntimeCore {
         }
     }
 
-    /// 所有 Runtime v4 transport 共用的完整 envelope 入口。directed reply 严格复用
+    /// 所有 Runtime v5 transport 共用的完整 envelope 入口。directed reply 严格复用
     /// 原 request messageId，并进入 connection-owned reply pump；本方法不等待 socket。
     pub async fn handle_envelope(
         &self,

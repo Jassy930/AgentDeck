@@ -715,7 +715,7 @@ final class RuntimeV2OuterJSONTests: XCTestCase {
 
     private func loadFixtures() throws -> [Fixture] {
         let data = try Data(contentsOf: repositoryRoot
-            .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v4-wire.jsonl"))
+            .appendingPathComponent("protocol/agentdeck/fixtures/runtime-v5-wire.jsonl"))
         let text = try XCTUnwrap(String(data: data, encoding: .utf8))
         return try text.split(separator: "\n").map { line in
             let object = try XCTUnwrap(

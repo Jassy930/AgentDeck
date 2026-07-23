@@ -1,4 +1,4 @@
-//! Runtime v4 frozen conversation snapshot repository。
+//! Runtime v5 frozen conversation snapshot repository。
 
 use std::collections::BTreeMap;
 use std::mem::size_of;

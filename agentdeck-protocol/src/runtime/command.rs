@@ -1,4 +1,4 @@
-//! Runtime v4 device/local → daemon 请求（design §8 / §13.2）。
+//! Runtime v5 device/local → daemon 请求（design §8 / §13.2）。
 //!
 //! `RuntimeRequest` 是解密后设备/本地统一规范化的业务请求（RC-2 传输平权）。
 //! pending pairing 的 list/confirm/cancel 以及 create/trust-reset/device-revoke 是

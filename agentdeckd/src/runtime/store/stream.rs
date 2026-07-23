@@ -1,4 +1,4 @@
-//! Runtime v4 canonical replay window、snapshot 与 publication store。
+//! Runtime v5 canonical replay window、snapshot 与 publication store。
 //!
 //! `event_journal` 仍是 P3.2/P3.5 authenticated audit；本模块只裁剪
 //! `event_stream_index` membership，绝不删除或改写 audit ciphertext。

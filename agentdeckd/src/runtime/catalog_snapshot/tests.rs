@@ -330,6 +330,7 @@ async fn fresh_empty_catalog_builds_and_reads_a_durable_page() {
         StreamCursor::BeforeFirst
     );
     assert!(page.snapshot().entries().is_empty());
+    assert!(page.snapshot().current_page_cursor().is_none());
     assert!(page.snapshot().next_page_cursor().is_none());
     drop(page);
     let durable = register_catalog(&store, 2).await;
@@ -363,6 +364,7 @@ async fn existing_501_rows_page_exactly_and_cursor_is_bound_authenticated_and_ex
         .expect("build exact frozen catalog snapshot");
     assert_eq!(first.snapshot().base_catalog_cursor, StreamCursor::At(500));
     assert_eq!(first.snapshot().entries().len(), 500);
+    assert!(first.snapshot().current_page_cursor().is_none());
     let cursor = first
         .snapshot()
         .next_page_cursor()
@@ -395,6 +397,7 @@ async fn existing_501_rows_page_exactly_and_cursor_is_bound_authenticated_and_ex
         .expect("read second frozen page");
     assert_eq!(second.snapshot().base_catalog_cursor, StreamCursor::At(500));
     assert_eq!(second.snapshot().entries().len(), 1);
+    assert_eq!(second.snapshot().current_page_cursor(), Some(&cursor));
     assert!(second.snapshot().next_page_cursor().is_none());
     assert_ne!(
         first
@@ -586,6 +589,7 @@ async fn ephemeral_cursor_never_falls_back_to_same_id_durable_snapshot_after_cac
         .build_owned_page(
             CatalogPageReference::ephemeral(durable_reference),
             entries,
+            None,
             None,
             PageIssue {
                 observed_now_ms: 25_500,
@@ -967,6 +971,7 @@ async fn failed_exact_load_releases_decoded_memory_reservation() {
     provider
         .page_from_page_reference(
             CatalogPageReference::durable(missing),
+            None,
             None,
             PageIssue {
                 observed_now_ms: 30_000,
