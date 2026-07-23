@@ -87,6 +87,7 @@ enum ConversationRowFactory {
 
     private static let verticalGap: CGFloat = 5
     private static let tightGap: CGFloat = 4
+    private static let itemVerticalPadding = ConversationRowMetrics.itemVerticalPadding
 
     private static func userPromptHeight(row: ConversationDisplayRow, width: CGFloat) -> CGFloat {
         // padding(.vertical, 8) outer + bubble inner padding (10 top + 10 bottom).
@@ -110,20 +111,23 @@ enum ConversationRowFactory {
             // padding(.vertical, 4) + streaming RICH markdown. Measured from the
             // SAME markdown attributed string the cell renders (design §5), so
             // measurement and rendering can never diverge.
-            let pad: CGFloat = 4 * 2
+            let pad = itemVerticalPadding * 2
             let attributed = MarkdownAttributedStringBuilder.attributedString(from: item.text, style: .standard)
             return pad + max(measuredTextHeight(attributed, width: contentW),
-                             ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutFont))
+                             ConversationTypography.targetLineHeight(
+                                for: ConversationRowMetrics.bodyFont,
+                                text: item.text
+                             ))
 
         case "reasoning":
-            // padding(.vertical, 6) + the reasoning disclosure header. The
+            // `.item` padding + the reasoning disclosure header. The
             // streamed body is collapsed by default, so it is NOT counted here.
-            let pad: CGFloat = 6 * 2
+            let pad = itemVerticalPadding * 2
             return pad + disclosureHeaderHeight
 
         case "shell":
-            // padding(.vertical, 10) + command + (metadata?) + (disclosure?) + (exit?)
-            var h: CGFloat = 10 * 2
+            // `.item` padding + command + (metadata?) + (disclosure?) + (exit?)
+            var h = itemVerticalPadding * 2
             h += textHeight("$ \(item.command)", font: ConversationRowMetrics.monoCalloutFont, width: contentW)
             let metadata = ToolPresentation.shellMetadata(item)
             if !metadata.isEmpty {
@@ -138,7 +142,7 @@ enum ConversationRowFactory {
             return h
 
         case "fileEdit":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += textHeight(item.path, font: ConversationRowMetrics.monoCalloutMediumFont, width: contentW)
             if !item.statusName.isEmpty {
                 h += tightGap + ConversationRowMetrics.lineHeight(ConversationRowMetrics.monoCaptionFont)
@@ -149,7 +153,7 @@ enum ConversationRowFactory {
             return h
 
         case "webSearch":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
             if !item.query.isEmpty {
                 h += verticalGap + textHeight(item.query, font: ConversationRowMetrics.calloutFont, width: contentW)
@@ -166,7 +170,7 @@ enum ConversationRowFactory {
             return h
 
         case "plan", "reviewMode":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
             let body = item.kind == "plan" ? item.text : item.review
             if !body.isEmpty {
@@ -175,7 +179,7 @@ enum ConversationRowFactory {
             return h
 
         case "hookPrompt":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
             for fragment in item.fragments {
                 h += verticalGap
@@ -188,7 +192,7 @@ enum ConversationRowFactory {
         case "toolActivityGroup":
             // One semantic summary line; member rows are inserted only when
             // the group disclosure is expanded by the controller.
-            let compactVerticalPadding: CGFloat = 6 * 2
+            let compactVerticalPadding = itemVerticalPadding * 2
             let compactHeaderHeight = max(
                 ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutMediumFont),
                 18
@@ -199,7 +203,7 @@ enum ConversationRowFactory {
             // Collapsed tool calls are always one compact summary line. The
             // full payload is still measured by ConversationViewController
             // when disclosure state is expanded.
-            let compactVerticalPadding: CGFloat = 6 * 2
+            let compactVerticalPadding = itemVerticalPadding * 2
             let compactHeaderHeight = max(
                 ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutMediumFont),
                 18
@@ -207,7 +211,7 @@ enum ConversationRowFactory {
             return compactVerticalPadding + compactHeaderHeight
 
         case "collabAgentToolCall":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
             let metadata = [item.tool, item.statusName, item.model, item.reasoningEffort].filter { !$0.isEmpty }
             if !metadata.isEmpty {
@@ -222,7 +226,7 @@ enum ConversationRowFactory {
             return h
 
         case "media":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
             let preview = MediaPreviewPresentation(item: item)
             if let image = preview.localImage {
@@ -239,11 +243,11 @@ enum ConversationRowFactory {
             return h
 
         case "contextCompaction":
-            // padding(.vertical, 10) + lone header.
-            return 10 * 2 + ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)
+            return itemVerticalPadding * 2
+                + ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)
 
         default: // raw
-            let pad: CGFloat = 8 * 2
+            let pad = itemVerticalPadding * 2
             return pad + max(textHeight(item.descriptionText, font: ConversationRowMetrics.calloutFont, width: contentW),
                              ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutFont))
         }

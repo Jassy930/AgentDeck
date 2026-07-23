@@ -46,6 +46,14 @@ final class StreamingTextContainerView: NSView {
     /// `MarkdownAttributedStringBuilder` and replaces the storage — the builder
     /// owns the attributes, so the plain-text font/color path is bypassed.
     private var markdownStyle: MarkdownStyle?
+    /// Reasoning 的正文允许在尚未收到内容时折叠为 0 高；一旦 buffer
+    /// 流入文本，intrinsic height 会随同一次更新恢复。
+    var collapsesWhenEmpty = false {
+        didSet {
+            guard collapsesWhenEmpty != oldValue else { return }
+            recalculateHeight(for: max(bounds.width, 1))
+        }
+    }
     private lazy var selectionOwner = SessionTextSelectionOwner { [weak self] in
         self?.textView.clearSelection()
     }
@@ -106,7 +114,9 @@ final class StreamingTextContainerView: NSView {
         // storage — wiping any in-progress text selection (C2). The buffer's
         // own observer already pushes new tokens into the storage, so keep the
         // existing subscription and selection untouched.
-        if markdownStyle != nil, observedBuffer === buffer {
+        if let markdownStyle,
+           markdownStyle.isVisuallyEquivalent(to: style),
+           observedBuffer === buffer {
             return
         }
         unbind()
@@ -198,15 +208,20 @@ final class StreamingTextContainerView: NSView {
         }
         let storage = textView.textStorage ?? NSTextStorage()
         let attributed = MarkdownAttributedStringBuilder.attributedString(from: fullText, style: style)
-        // Mirror the plain path's `.unchanged` early-return: when the rendered
-        // STRING already matches what is displayed, rewriting the storage would
-        // be a no-op visually but would still collapse the user's selection (C2).
-        if storage.string == attributed.string {
+        // Mirror the plain path's `.unchanged` early-return, but compare the
+        // complete attributed value: identical visible text can still acquire
+        // markdown emphasis or a new paragraph style.
+        if storage.isEqual(to: attributed) {
             return
         }
+        let preservesSelection = storage.string == attributed.string
+        let selectedRanges = preservesSelection ? textView.selectedRanges : []
         storage.beginEditing()
         storage.setAttributedString(attributed)
         storage.endEditing()
+        if preservesSelection {
+            textView.selectedRanges = selectedRanges
+        }
     }
 
     private func currentAttributes() -> [NSAttributedString.Key: Any] {
@@ -270,10 +285,28 @@ final class StreamingTextContainerView: NSView {
             return
         }
 
+        if collapsesWhenEmpty, textView.string.isEmpty {
+            updateMeasuredHeight(0)
+            return
+        }
+
         layoutManager.ensureLayout(for: textContainer)
         let usedRect = layoutManager.usedRect(for: textContainer)
-        let lineHeight = textView.font?.boundingRectForFont.height ?? 1
+        let lineHeight: CGFloat
+        if let markdownStyle {
+            lineHeight = ConversationTypography.targetLineHeight(
+                for: markdownStyle.bodyFont,
+                text: textView.string,
+                language: markdownStyle.lineHeightLanguage
+            )
+        } else {
+            lineHeight = textView.font?.boundingRectForFont.height ?? 1
+        }
         let nextHeight = max(ceil(usedRect.height), ceil(lineHeight), 1)
+        updateMeasuredHeight(nextHeight)
+    }
+
+    private func updateMeasuredHeight(_ nextHeight: CGFloat) {
         if abs(nextHeight - measuredHeight) > 0.5 {
             measuredHeight = nextHeight
             invalidateIntrinsicContentSize()

@@ -52,17 +52,19 @@ extension ConversationDisclosureStateStore {
 /// Layout constants shared by cells and the factory's height math. Centralised
 /// so the rendered height and the measured height never drift.
 enum ConversationRowMetrics {
-    /// Body / callout text (SwiftUI `.callout` ≈ systemFontSize - 1 ≈ 12).
-    static let calloutSize: CGFloat = NSFont.systemFontSize - 1
-    /// Caption text (SwiftUI `.caption`).
-    static let captionSize: CGFloat = NSFont.smallSystemFontSize
+    static let bodySize = DesignTokens.typeBody
+    static let calloutSize = DesignTokens.typeCallout
+    static let captionSize = DesignTokens.typeCaption
+    static let monoSize = DesignTokens.typeMono
+    static let itemVerticalPadding = DesignTokens.sp1
 
+    static var bodyFont: NSFont { ConversationTypography.bodyFont }
     static var calloutFont: NSFont { .systemFont(ofSize: calloutSize) }
     static var calloutMediumFont: NSFont { .systemFont(ofSize: calloutSize, weight: .medium) }
     static var captionFont: NSFont { .systemFont(ofSize: captionSize) }
     static var captionSemiboldFont: NSFont { .systemFont(ofSize: captionSize, weight: .semibold) }
-    static var monoCalloutFont: NSFont { .monospacedSystemFont(ofSize: calloutSize, weight: .regular) }
-    static var monoCalloutMediumFont: NSFont { .monospacedSystemFont(ofSize: calloutSize, weight: .medium) }
+    static var monoCalloutFont: NSFont { .monospacedSystemFont(ofSize: monoSize, weight: .regular) }
+    static var monoCalloutMediumFont: NSFont { .monospacedSystemFont(ofSize: monoSize, weight: .medium) }
     static var monoCaptionFont: NSFont { .monospacedSystemFont(ofSize: captionSize, weight: .regular) }
 
     /// Single-line height for a font (used by the factory's fixed-element math).
@@ -118,8 +120,8 @@ class ConversationRowCellView: NSTableCellView {
     /// `nonisolated` so the factory's (MainActor) height math and any layout
     /// helper can read this pure constant without isolation noise.
     nonisolated static let horizontalInset: CGFloat = 20
-    /// Default vertical padding for assistant tool rows (`.padding(.vertical, 10)`).
-    var verticalPadding: CGFloat { 10 }
+    /// 设计系统 `.item` 的上下内距。
+    var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
 
     let contentStack: NSStackView = {
         let stack = NSStackView()
@@ -255,7 +257,7 @@ final class UserPromptCellView: ConversationRowCellView {
 /// Height (factory) is measured from the SAME markdown attributed string, so
 /// measurement and rendering can never disagree.
 final class MessageCellView: ConversationRowCellView {
-    override var verticalPadding: CGFloat { 4 }
+    override var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
 
     private let streamingView = StreamingTextContainerView()
 
@@ -275,13 +277,13 @@ final class MessageCellView: ConversationRowCellView {
     }
 }
 
-// MARK: - Reasoning (collapsible, monospaced streaming)
+// MARK: - Reasoning (collapsible, markdown streaming)
 
 /// Ports `ReasoningRow`: a disclosure labelled "Reasoning", default-collapsed,
-/// auto-expanded while a turn is running. The body is small secondary-coloured
-/// streaming text.
+/// auto-expanded while a turn is running. The body uses the design-system
+/// reasoning typography and secondary colour while preserving inline markdown.
 final class ReasoningCellView: ConversationRowCellView {
-    override var verticalPadding: CGFloat { 6 }
+    override var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
 
     private let headerRow = NSStackView()
     private let disclosure = ConversationRowControls.disclosureButton(title: "")
@@ -297,6 +299,7 @@ final class ReasoningCellView: ConversationRowCellView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         applyVerticalPadding()
+        contentStack.spacing = DesignTokens.sp1
         headerRow.orientation = .horizontal
         headerRow.alignment = .centerY
         headerRow.spacing = 6
@@ -316,6 +319,7 @@ final class ReasoningCellView: ConversationRowCellView {
 
         headerRow.addArrangedSubview(disclosure)
         headerRow.addArrangedSubview(titleLabel)
+        streamingView.collapsesWhenEmpty = true
         streamingView.translatesAutoresizingMaskIntoConstraints = false
         contentStack.addArrangedSubview(headerRow)
         contentStack.addArrangedSubview(streamingView)
@@ -354,11 +358,7 @@ final class ReasoningCellView: ConversationRowCellView {
 
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
         itemId = row.item.id
-        streamingView.bindBuffer(
-            to: row.item.textBuffer,
-            font: .systemFont(ofSize: NSFont.smallSystemFontSize),
-            color: DesignTokens.text2
-        )
+        streamingView.bindMarkdownBuffer(to: row.item.textBuffer, style: .reasoning)
         // Default-collapsed; auto-expand while the selected turn is running
         // (mirrors `model.shouldShowReasoningExpanded`).
         let explicitlyCollapsed = disclosureStore?.isItemCollapsed(itemId) ?? false
@@ -442,7 +442,7 @@ final class ShellCellView: ConversationRowCellView {
             disclosure.title = ToolPresentation.outputLabel(item.output)
             outputView.bindBuffer(
                 to: item.outputBuffer,
-                font: .monospacedSystemFont(ofSize: 13, weight: .regular),
+                font: ConversationRowMetrics.monoCalloutFont,
                 color: DesignTokens.text2
             )
         }
@@ -540,7 +540,7 @@ final class FileEditCellView: ConversationRowCellView {
             disclosure.title = ToolPresentation.outputLabel(item.diff, noun: "diff")
             diffView.bindBuffer(
                 to: item.diffBuffer,
-                font: .monospacedSystemFont(ofSize: 12, weight: .regular),
+                font: ConversationRowMetrics.monoCalloutFont,
                 color: DesignTokens.text
             )
         }
@@ -738,7 +738,7 @@ final class HookPromptCellView: ConversationRowCellView {
 /// rows underneath it when expanded, so every tool's payload and intermediate
 /// reasoning remain available without nesting table cells inside one giant row.
 final class ToolActivityGroupCellView: ConversationRowCellView {
-    override var verticalPadding: CGFloat { 6 }
+    override var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
 
     private let summaryRow = NSStackView()
     private let disclosure = ConversationRowControls.disclosureButton(title: "")
@@ -880,7 +880,7 @@ final class ToolActivityGroupCellView: ConversationRowCellView {
 /// Keeping the tool name and target on the first line makes adjacent `Read`
 /// calls identifiable without spending four transcript rows per call.
 final class ToolCallCellView: ConversationRowCellView {
-    override var verticalPadding: CGFloat { 6 }
+    override var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
 
     private let summaryRow = NSStackView()
     private let icon = NSImageView()
@@ -1220,7 +1220,7 @@ final class ContextCompactionCellView: ConversationRowCellView {
 
 /// Ports the default branch: neutralized unknown ("raw") — tertiary callout.
 final class RawCellView: ConversationRowCellView {
-    override var verticalPadding: CGFloat { 8 }
+    override var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
 
     private let bodyLabel = ConversationRowControls.label(
         font: ConversationRowMetrics.calloutFont, color: DesignTokens.text3)

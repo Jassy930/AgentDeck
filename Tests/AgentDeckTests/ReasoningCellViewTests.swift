@@ -130,6 +130,75 @@ final class ReasoningCellViewTests: XCTestCase {
         XCTAssertEqual(body.frame.width, expectedContentWidth, accuracy: 1)
     }
 
+    func testExpandedReasoningUsesDesignTypographyAndRendersMarkdown() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let row = ConversationDisplayRowTestSupport.assistantRow(
+            kind: "reasoning",
+            text: "先 **梳理** 依赖"
+        )
+        let store = RecordingDisclosureStore()
+        store.expandedItemIds.insert(row.item.id)
+        let cell = ReasoningCellView(
+            frame: NSRect(x: 0, y: 0, width: 620, height: 160)
+        )
+        cell.disclosureStore = store
+        cell.configure(row: row, width: 620, model: model)
+
+        let body = try XCTUnwrap(
+            cell.allDescendants(ofType: StreamingTextContainerView.self).first
+        )
+        XCTAssertEqual(body.currentText, "先 梳理 依赖")
+        XCTAssertFalse(body.currentText.contains("**"))
+
+        let attributed = body.currentAttributedText
+        let ns = attributed.string as NSString
+        let plainRange = ns.range(of: "先")
+        let boldRange = ns.range(of: "梳理")
+        let plainFont = try XCTUnwrap(
+            attributed.attribute(.font, at: plainRange.location, effectiveRange: nil) as? NSFont
+        )
+        let boldFont = try XCTUnwrap(
+            attributed.attribute(.font, at: boldRange.location, effectiveRange: nil) as? NSFont
+        )
+        let color = try XCTUnwrap(
+            attributed.attribute(.foregroundColor, at: plainRange.location, effectiveRange: nil)
+                as? NSColor
+        )
+        let paragraph = try XCTUnwrap(
+            attributed.attribute(.paragraphStyle, at: plainRange.location, effectiveRange: nil)
+                as? NSParagraphStyle
+        )
+
+        XCTAssertEqual(plainFont.pointSize, DesignTokens.typeCallout)
+        XCTAssertEqual(boldFont.pointSize, DesignTokens.typeCallout)
+        XCTAssertTrue(boldFont.fontDescriptor.symbolicTraits.contains(.bold))
+        XCTAssertTrue(color.isEqual(DesignTokens.text2))
+        XCTAssertEqual(
+            paragraph.minimumLineHeight,
+            DesignTokens.typeCallout * DesignTokens.lineHeightCJK,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(cell.verticalPadding, DesignTokens.sp1)
+        XCTAssertEqual(cell.contentStack.spacing, DesignTokens.sp1)
+    }
+
+    func testCollapsedReasoningFactoryHeightUsesFourPointItemPadding() {
+        let row = ConversationDisplayRowTestSupport.assistantRow(
+            kind: "reasoning",
+            text: "Inspect dependencies"
+        )
+        let headerHeight = max(
+            ConversationRowMetrics.lineHeight(ConversationRowMetrics.monoCaptionFont),
+            16
+        )
+
+        XCTAssertEqual(
+            ConversationRowFactory.height(for: row, width: 620),
+            DesignTokens.sp1 * 2 + headerHeight,
+            accuracy: 0.001
+        )
+    }
+
     func testExplicitCollapseOverridesRunningAutoExpansion() throws {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         model.phase = .running

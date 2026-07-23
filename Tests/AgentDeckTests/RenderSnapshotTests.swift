@@ -77,6 +77,40 @@ final class RenderSnapshotTests: XCTestCase {
         cell.renderPNG(to: "/tmp/adk-toolcall-expanded.png")
     }
 
+    func testRenderReasoningTypography() {
+        final class AlwaysExpanded: ConversationDisclosureStateStore {
+            func isItemExpanded(_ itemId: String) -> Bool { true }
+            func setItem(_ itemId: String, expanded: Bool) {}
+        }
+
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let item = UIItem(
+            id: "reasoning-typography",
+            lifecycle: "completed",
+            kind: "reasoning",
+            text: "**Inspecting typography tokens**\n先梳理中文正文的行高，再核对 Latin paragraph spacing."
+        )
+        item.textBuffer.replace(with: item.text)
+        let row = ConversationDisplayRow(
+            role: .assistantItem,
+            turnId: "turn-reasoning-typography",
+            item: item,
+            firstInTurn: true,
+            lastInTurn: true
+        )
+        let cell = ReasoningCellView()
+        let store = AlwaysExpanded()
+        cell.disclosureStore = store
+        cell.wantsLayer = true
+        cell.layer?.backgroundColor = DesignTokens.bg.cgColor
+        cell.translatesAutoresizingMaskIntoConstraints = false
+        cell.widthAnchor.constraint(equalToConstant: 620).isActive = true
+        cell.heightAnchor.constraint(equalToConstant: 150).isActive = true
+        cell.configure(row: row, width: 620, model: model)
+        cell.layoutSubtreeIfNeeded()
+        cell.renderPNG(to: "/tmp/adk-reasoning-typography.png")
+    }
+
     func testRenderConversationStream() {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         model.cwd = URL(fileURLWithPath: "/p/refactor-auth")

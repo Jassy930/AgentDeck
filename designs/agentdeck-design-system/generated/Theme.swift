@@ -13,6 +13,10 @@ public struct Palette {
 }
 public struct Radii { public let lg, md, sm, pill: CGFloat }
 public struct Fonts { public let ui, display, mono: [String] }
+public struct Typography {
+  public let displayXl, display, title, body, callout, caption, mono: CGFloat
+  public let lineHeightCJK, lineHeightLatin: CGFloat
+}
 public struct Structure {
   public let statusShape: StatusShape
   public let surfaceMode: SurfaceMode
@@ -26,6 +30,7 @@ public struct Theme {
   public let color: Palette
   public let radius: Radii
   public let font: Fonts
+  public let typography: Typography
   public let structure: Structure
 }
 
@@ -60,6 +65,7 @@ public extension Theme {
     ),
     radius: Radii(lg: 18, md: 10, sm: 6, pill: 999),
     font: Fonts(ui: ["-apple-system", "SF Pro Text", "PingFang SC", "Noto Sans SC", "sans-serif"], display: ["-apple-system", "SF Pro Display", "PingFang SC", "Noto Sans SC", "sans-serif"], mono: ["SF Mono", "JetBrains Mono", "ui-monospace", "PingFang SC", "monospace"]),
+    typography: Typography(displayXl: 34, display: 24, title: 16, body: 14, callout: 13, caption: 11, mono: 12.5, lineHeightCJK: 1.72, lineHeightLatin: 1.45),
     structure: Structure(statusShape: .dot, surfaceMode: .float, composerForm: .card, iconMode: .line, labelCase: .normal)
   )
   static let terminal = Theme(
@@ -92,6 +98,7 @@ public extension Theme {
     ),
     radius: Radii(lg: 4, md: 3, sm: 2, pill: 3),
     font: Fonts(ui: ["JetBrains Mono", "SF Mono", "ui-monospace", "PingFang SC", "monospace"], display: ["JetBrains Mono", "ui-monospace", "monospace"], mono: ["JetBrains Mono", "SF Mono", "ui-monospace", "monospace"]),
+    typography: Typography(displayXl: 34, display: 24, title: 16, body: 14, callout: 13, caption: 11, mono: 12.5, lineHeightCJK: 1.72, lineHeightLatin: 1.45),
     structure: Structure(statusShape: .square, surfaceMode: .boxed, composerForm: .cli, iconMode: .glyph, labelCase: .upper)
   )
   static let linear = Theme(
@@ -124,6 +131,7 @@ public extension Theme {
     ),
     radius: Radii(lg: 12, md: 8, sm: 6, pill: 999),
     font: Fonts(ui: ["-apple-system", "SF Pro Text", "PingFang SC", "Noto Sans SC", "sans-serif"], display: ["Space Grotesk", "-apple-system", "PingFang SC", "Noto Sans SC", "sans-serif"], mono: ["JetBrains Mono", "ui-monospace", "monospace"]),
+    typography: Typography(displayXl: 34, display: 24, title: 16, body: 14, callout: 13, caption: 11, mono: 12.5, lineHeightCJK: 1.72, lineHeightLatin: 1.45),
     structure: Structure(statusShape: .pill, surfaceMode: .float, composerForm: .card, iconMode: .line, labelCase: .normal)
   )
   static let warm = Theme(
@@ -156,6 +164,7 @@ public extension Theme {
     ),
     radius: Radii(lg: 14, md: 10, sm: 7, pill: 999),
     font: Fonts(ui: ["-apple-system", "SF Pro Text", "PingFang SC", "Noto Sans SC", "sans-serif"], display: ["Newsreader", "Georgia", "Songti SC", "Noto Serif SC", "serif"], mono: ["JetBrains Mono", "ui-monospace", "monospace"]),
+    typography: Typography(displayXl: 34, display: 24, title: 16, body: 14, callout: 13, caption: 11, mono: 12.5, lineHeightCJK: 1.72, lineHeightLatin: 1.45),
     structure: Structure(statusShape: .dot, surfaceMode: .hairline, composerForm: .editorial, iconMode: .minimal, labelCase: .smallCaps)
   )
   static let notion = Theme(
@@ -188,6 +197,7 @@ public extension Theme {
     ),
     radius: Radii(lg: 6, md: 4, sm: 3, pill: 999),
     font: Fonts(ui: ["-apple-system", "SF Pro Text", "Segoe UI", "PingFang SC", "Noto Sans SC", "sans-serif"], display: ["-apple-system", "SF Pro Display", "Segoe UI", "PingFang SC", "sans-serif"], mono: ["SF Mono", "JetBrains Mono", "ui-monospace", "monospace"]),
+    typography: Typography(displayXl: 34, display: 24, title: 16, body: 14, callout: 13, caption: 11, mono: 12.5, lineHeightCJK: 1.72, lineHeightLatin: 1.45),
     structure: Structure(statusShape: .dot, surfaceMode: .flat, composerForm: .card, iconMode: .line, labelCase: .normal)
   )
   static let macos = Theme(
@@ -220,6 +230,7 @@ public extension Theme {
     ),
     radius: Radii(lg: 12, md: 8, sm: 6, pill: 999),
     font: Fonts(ui: ["-apple-system", "SF Pro Text", "Helvetica Neue", "PingFang SC", "Noto Sans SC", "sans-serif"], display: ["-apple-system", "SF Pro Display", "Helvetica Neue", "PingFang SC", "sans-serif"], mono: ["SF Mono", "JetBrains Mono", "ui-monospace", "monospace"]),
+    typography: Typography(displayXl: 34, display: 24, title: 16, body: 14, callout: 13, caption: 11, mono: 12.5, lineHeightCJK: 1.72, lineHeightLatin: 1.45),
     structure: Structure(statusShape: .dot, surfaceMode: .float, composerForm: .card, iconMode: .line, labelCase: .normal)
   )
   static let all: [Theme] = [.codex, .terminal, .linear, .warm, .notion, .macos]

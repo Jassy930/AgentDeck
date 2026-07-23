@@ -6,15 +6,37 @@ struct MarkdownStyle {
     var textColor: NSColor
     var codeBackground: NSColor
     var linkColor: NSColor
+    var lineHeightLanguage: ConversationLineHeightLanguage
 
     static var standard: MarkdownStyle {
         MarkdownStyle(
-            bodyFont: .systemFont(ofSize: NSFont.systemFontSize),
-            codeFont: .monospacedSystemFont(ofSize: NSFont.systemFontSize - 1, weight: .regular),
+            bodyFont: ConversationTypography.bodyFont,
+            codeFont: ConversationTypography.monoFont,
             textColor: DesignTokens.text,
             codeBackground: DesignTokens.text3,
-            linkColor: .linkColor
+            linkColor: .linkColor,
+            lineHeightLanguage: .automatic
         )
+    }
+
+    static var reasoning: MarkdownStyle {
+        MarkdownStyle(
+            bodyFont: ConversationTypography.reasoningFont,
+            codeFont: ConversationTypography.monoFont,
+            textColor: DesignTokens.text2,
+            codeBackground: DesignTokens.text3,
+            linkColor: .linkColor,
+            lineHeightLanguage: .automatic
+        )
+    }
+
+    func isVisuallyEquivalent(to other: MarkdownStyle) -> Bool {
+        bodyFont.isEqual(other.bodyFont)
+            && codeFont.isEqual(other.codeFont)
+            && textColor.isEqual(other.textColor)
+            && codeBackground.isEqual(other.codeBackground)
+            && linkColor.isEqual(other.linkColor)
+            && lineHeightLanguage == other.lineHeightLanguage
     }
 }
 
@@ -30,18 +52,30 @@ enum MarkdownAttributedStringBuilder {
         if let a = try? AttributedString(markdown: markdown, options: options) {
             parsed = a
         } else {
-            return NSAttributedString(
+            let fallback = NSMutableAttributedString(
                 string: markdown,
                 attributes: [.font: style.bodyFont, .foregroundColor: style.textColor]
             )
+            ConversationTypography.applyParagraphStyles(
+                to: fallback,
+                font: style.bodyFont,
+                language: style.lineHeightLanguage
+            )
+            return fallback
         }
         let result = NSMutableAttributedString(attributedString: NSAttributedString(parsed))
         let full = NSRange(location: 0, length: result.length)
         // 基线样式
         result.addAttributes([.font: style.bodyFont, .foregroundColor: style.textColor], range: full)
+        applyEmphasis(to: result, parsed: parsed, style: style)
         // 行内代码：AttributedString 的 inlinePresentationIntent.code → 等宽 + 背景
         applyInlineCode(to: result, parsed: parsed, style: style)
         applyLinks(to: result, style: style)
+        ConversationTypography.applyParagraphStyles(
+            to: result,
+            font: style.bodyFont,
+            language: style.lineHeightLanguage
+        )
         return result
     }
 
@@ -54,6 +88,36 @@ enum MarkdownAttributedStringBuilder {
             let nsRange = NSRange(run.range, in: parsed)
             guard nsRange.location != NSNotFound, nsRange.location + nsRange.length <= ns.length else { continue }
             ns.addAttributes([.font: style.codeFont, .backgroundColor: style.codeBackground], range: nsRange)
+        }
+    }
+
+    private static func applyEmphasis(
+        to ns: NSMutableAttributedString,
+        parsed: AttributedString,
+        style: MarkdownStyle
+    ) {
+        for run in parsed.runs {
+            guard let intent = run.inlinePresentationIntent else { continue }
+            var traits = style.bodyFont.fontDescriptor.symbolicTraits
+            var changed = false
+            if intent.contains(.stronglyEmphasized) {
+                traits.insert(.bold)
+                changed = true
+            }
+            if intent.contains(.emphasized) {
+                traits.insert(.italic)
+                changed = true
+            }
+            guard changed else { continue }
+
+            let nsRange = NSRange(run.range, in: parsed)
+            let descriptor = style.bodyFont.fontDescriptor.withSymbolicTraits(traits)
+            guard nsRange.location != NSNotFound,
+                  nsRange.location + nsRange.length <= ns.length,
+                  let font = NSFont(descriptor: descriptor, size: style.bodyFont.pointSize) else {
+                continue
+            }
+            ns.addAttribute(.font, value: font, range: nsRange)
         }
     }
 

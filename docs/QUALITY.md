@@ -62,6 +62,8 @@ cargo test
 - [ ] 新建会话（点击项目旁加号）→ 右侧显示空状态视图
 - [ ] 发送第一条 prompt → 会话流开始流式渲染（reasoning / shell / file-edit 行）
 - [ ] 1280×820 标准窗口下会话流与 composer 共用水平内容轴，不出现明显宽度断层
+- [ ] 会话流 assistant 正文使用 14pt `body`，reasoning 正文使用 13pt `callout` + `text2` 并正确渲染 Markdown，shell / diff 使用 12.5pt `mono`；各类 assistant item 上下内距统一为 4pt，连续内容密度自然且无忽松忽紧
+- [ ] assistant / reasoning Markdown 的纯拉丁段落按 `1.45`、CJK 或中西混排段落按 `1.72` 行高渲染；渲染与表格测高一致，等字节中西文替换也须刷新行高，空 reasoning 不虚构正文行；仅 Markdown 属性变化时保留当前文字选区，展开/收起及流式更新后均无裁切、覆盖或异常留白
 - [ ] 没有环境/变更数据时右上面板完全折叠且不保留宽度；有数据但空间不足时也优先折叠以保留至少 252pt composer，窗口恢复后自动显示
 - [ ] 顶栏只显示已接通的打开目录动作；composer 只显示已接通的发送动作，按钮命中区不小于 44pt
 - [ ] 工具调用默认以紧凑单行显示 MCP server/tool、中文动作标题或关键路径、真实状态与耗时；展开后再看参数与结果，禁止把不同操作都退化成重复的 `js / completed`；同一 Claude Code `toolUseId` 从进行中更新为单个终态行，不残留重复状态

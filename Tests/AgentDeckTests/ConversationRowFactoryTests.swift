@@ -116,6 +116,22 @@ final class ConversationRowFactoryTests: XCTestCase {
         }
     }
 
+    func testEveryAssistantItemUsesDesignSystemVerticalPadding() throws {
+        let rows = ConversationDisplayRowTestSupport.oneOfEachAssistantKind()
+            + [ConversationDisplayRowTestSupport.toolActivityGroupRow()]
+
+        for row in rows {
+            let cell = try XCTUnwrap(
+                ConversationRowFactory.makeCell(for: row) as? ConversationRowCellView
+            )
+            XCTAssertEqual(
+                cell.verticalPadding,
+                DesignTokens.sp1,
+                "kind=\(row.presentationKind) 应使用设计系统 `.item` 的 4pt 上下内距"
+            )
+        }
+    }
+
     func testMakeUserPromptCellIsUserPromptCellView() {
         let row = ConversationDisplayRowTestSupport.userPromptRow()
         let cell = ConversationRowFactory.makeCell(for: row)

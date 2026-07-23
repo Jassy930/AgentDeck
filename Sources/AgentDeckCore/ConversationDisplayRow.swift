@@ -109,9 +109,9 @@ public enum ConversationRowsDiff: Equatable {
     /// Pure function of the two id/version sequences so it is unit-testable
     /// without any AppKit view. When the id sequence matches, only rows whose
     /// content `version` changed are reported as needing height re-measurement.
-    public static func decide(
-        previous: [(id: String, version: Int)],
-        next: [(id: String, version: Int)]
+    public static func decide<Version: Equatable>(
+        previous: [(id: String, version: Version)],
+        next: [(id: String, version: Version)]
     ) -> ConversationRowsDiff {
         guard previous.count == next.count else { return .structural }
         var changed: [Int] = []

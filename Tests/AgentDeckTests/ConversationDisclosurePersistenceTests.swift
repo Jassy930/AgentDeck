@@ -72,6 +72,115 @@ final class ConversationDisclosurePersistenceTests: XCTestCase {
         XCTAssertEqual(afterReconfigure, expandedHeight, accuracy: 0.5, "重配后行高保持展开高度")
     }
 
+    func testExpandedReasoningEqualByteLanguageReplacementInvalidatesHeightCache() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let user = UIItem(id: "u-language", lifecycle: "completed", kind: "user", text: "检查行高")
+        var reasoning = UIItem(
+            id: "r-language",
+            lifecycle: "completed",
+            kind: "reasoning",
+            text: "abc"
+        )
+        reasoning.textBuffer.replace(with: "abc")
+        model.items = [user, reasoning]
+
+        let controller = ConversationViewController(model: model)
+        _ = controller.view
+        let table = try XCTUnwrap(firstTableView(in: controller.view))
+        let store = controller as ConversationDisclosureStateStore
+        store.setItem("r-language", expanded: true)
+
+        let latinHeight = table.delegate?.tableView?(table, heightOfRow: 1) ?? 0
+        reasoning.text = "中"
+        reasoning.textBuffer.replace(with: "中") // 与 `abc` 同为 3 个 UTF-8 bytes
+        model.items = [user, reasoning]
+        let cjkHeight = table.delegate?.tableView?(table, heightOfRow: 1) ?? 0
+
+        XCTAssertGreaterThan(
+            cjkHeight,
+            latinHeight,
+            "等字节替换也必须按 CJK 1.72 行高重新测量，不能命中旧 Latin 缓存"
+        )
+        XCTAssertEqual(
+            cjkHeight - latinHeight,
+            ceil(DesignTokens.typeCallout * DesignTokens.lineHeightCJK)
+                - ceil(DesignTokens.typeCallout * DesignTokens.lineHeightLatin),
+            accuracy: 0.5
+        )
+    }
+
+    func testExpandedReasoningRevisionAndLengthCannotCancelInHeightVersion() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let user = UIItem(id: "u-collision", lifecycle: "completed", kind: "user", text: "检查版本碰撞")
+        let latinText = String(repeating: "a", count: 34)
+        var reasoning = UIItem(
+            id: "r-collision",
+            lifecycle: "completed",
+            kind: "reasoning",
+            text: latinText
+        )
+        reasoning.textBuffer.replace(with: latinText) // revision=1, bytes=34
+        model.items = [user, reasoning]
+
+        let controller = ConversationViewController(model: model)
+        _ = controller.view
+        let table = try XCTUnwrap(firstTableView(in: controller.view))
+        let store = controller as ConversationDisclosureStateStore
+        store.setItem("r-collision", expanded: true)
+        let latinHeight = table.delegate?.tableView?(table, heightOfRow: 1) ?? 0
+
+        reasoning.text = "中"
+        reasoning.textBuffer.replace(with: "中") // revision=2, bytes=3
+        model.items = [user, reasoning]
+        let cjkHeight = table.delegate?.tableView?(table, heightOfRow: 1) ?? 0
+
+        XCTAssertNotEqual(
+            cjkHeight,
+            latinHeight,
+            "revision=1/34 bytes 与 revision=2/3 bytes 不得折叠成同一个行高版本"
+        )
+        let headerHeight = max(
+            ConversationRowMetrics.lineHeight(ConversationRowMetrics.monoCaptionFont),
+            16
+        )
+        XCTAssertEqual(
+            cjkHeight,
+            DesignTokens.sp1 * 2
+                + headerHeight
+                + DesignTokens.sp1
+                + ceil(DesignTokens.typeCallout * DesignTokens.lineHeightCJK),
+            accuracy: 0.5,
+            "碰撞用例必须返回替换后单行 CJK 正文的真实高度"
+        )
+    }
+
+    func testExpandedEmptyReasoningReservesOnlyDesignSystemStackSpacing() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let user = UIItem(id: "u-empty", lifecycle: "completed", kind: "user", text: "检查空正文")
+        let reasoning = UIItem(id: "r-empty", lifecycle: "completed", kind: "reasoning")
+        model.items = [user, reasoning]
+
+        let controller = ConversationViewController(model: model)
+        _ = controller.view
+        let table = try XCTUnwrap(firstTableView(in: controller.view))
+        let store = controller as ConversationDisclosureStateStore
+        store.setItem("r-empty", expanded: true)
+
+        let headerHeight = max(
+            ConversationRowMetrics.lineHeight(ConversationRowMetrics.monoCaptionFont),
+            16
+        )
+        let expected = DesignTokens.sp1 * 2 + headerHeight + DesignTokens.sp1
+        let actual = table.delegate?.tableView?(table, heightOfRow: 1) ?? 0
+
+        XCTAssertEqual(
+            actual,
+            expected,
+            accuracy: 0.5,
+            "空 reasoning 不应虚构一行正文，但必须保留 header 到 body 的 4pt 节奏"
+        )
+    }
+
     /// 不同会话的历史回放都可能生成相同的 `ai-1` / `s1` item ID；切换
     /// viewport 时必须丢弃上一会话的 disclosure 状态，不能串到新会话。
     func testViewportChangeClearsDisclosureStateForCollidingItemIds() async {

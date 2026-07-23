@@ -20,7 +20,7 @@ tokens/tokens.json  (SSOT)
                        └─ ios/AgentDeckMobile/DesignTokens.swift (iOS，禁止手改)
 ```
 
-颜色/间距/圆角/字体因此机器强制一致——这是唯一没出偏差的层。**结论：把同一个「SSOT → codegen → 多端 + 校验」范式从 token 扩展到组件。**
+颜色/间距/圆角等基础值和 `Theme.swift` 的字体族已走 codegen；当前 macOS 消费路径也会生成字号/行高 token。上述 token 值由机器保持一致，但具体 `NSFont` 解析、语言判断和段落样式仍由原生消费层映射。**结论：把同一个「SSOT → codegen → 多端 + 校验」范式从 token 扩展到组件。**
 
 ## 核心原则
 
@@ -83,7 +83,7 @@ CSS 与 AppKit 不能共享渲染，所以：
 
 - 首批组件的结构断言能拦住「新增禁止元素 / 换错骨架 / token 用错」——用本次已修的用户气泡/环境面板做回归基线。
 - 巨型气泡类布局 bug 能被极小宽度渲染的快照 diff 抓到。
-- 一次 `swift test` + 一次 `node tools/build.mjs && git diff --exit-code` 即覆盖「视觉保真」门禁。
+- 一次 `swift test` + 一次 `bun run build && git diff --exit-code` 即覆盖「视觉保真」门禁。
 
 ## 待决策（开始 Phase 1 前需确认）
 

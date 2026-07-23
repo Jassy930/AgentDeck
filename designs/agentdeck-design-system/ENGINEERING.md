@@ -28,7 +28,7 @@
 ## 2. 硬性规则
 
 ### MUST（必须）
-- **M1** 一切颜色/圆角/字体/间距/阴影，**只能引用 token**（Web：`var(--x)`；AppKit：`theme.color.x` / `theme.radius.x`）。
+- **M1** 一切颜色/圆角/字体族/字号/行高/间距/阴影，**只能引用 token**（Web：`var(--x)`；AppKit：`theme.color.x` / `theme.radius.x` / `theme.typography.x`，macOS 生产端使用生成的 `DesignTokens`）。
 - **M2** 结构差异只能读**可枚举开关**（`--k-*` / Swift `theme.structure.*`）；平台差异只能读 `--p-*` / `Platform`。
 - **M3** 新主题 = 在 `tokens.json` 增一套值 + 从开关菜单选值；跑 build。**不改任何组件**。
 - **M4** 新开关（结构/平台）= 先进 `interface.css` 契约（定义默认 + 通用消费规则）并更新 `THEMING.md`，再赋值。
@@ -73,6 +73,8 @@ let t = Theme.codex                 // 六套之一（Theme.all）
 view.layer?.backgroundColor = t.color.bg.cgColor
 label.textColor = t.color.text
 card.layer?.cornerRadius = t.radius.md
+let bodyFont = NSFont.systemFont(ofSize: t.typography.body)
+let cjkLineHeight = t.typography.body * t.typography.lineHeightCJK
 // 结构差异读枚举，禁 if theme ==
 switch t.structure.statusShape { case .dot: …; case .square: …; case .pill: … }
 // 平台
@@ -81,6 +83,20 @@ topInset = p.safeTop
 ```
 
 原则：**视图持有 `Theme` + `Platform`，从中取值**；切主题 = 换 `Theme` 值并重绘；**不写主题名分支**。这与你们 `CapabilityRouter`「禁 vendor 分支、按能力装配」是同一条路。
+
+### 会话流排版映射
+
+| 内容 | 字号 token | 颜色 | 行高 |
+|---|---|---|---|
+| assistant 正文 | `body`（14pt） | `text` | 按段落自动选择 CJK `1.72` / Latin `1.45` |
+| reasoning 正文 | `callout`（13pt） | `text2` | 同上，保留 Markdown 强调与行内代码 |
+| shell / diff | `mono`（12.5pt） | 对应组件语义色 | 等宽字体 |
+| 次要说明 | `caption`（11pt） | `text2` 或非必读场景的 `text3` | 由组件契约决定 |
+
+- 自动语言判断以段落为单位；纯拉丁段落用 `1.45`，含任一 CJK 字符的中西混排段落用 `1.72`。
+- TextKit 的 `lineHeightMultiple` 不是 CSS 字号倍率的等价物；AppKit 必须把 `字号 × 倍率` 映射成明确的最小/最大行高。
+- 渲染与虚拟化表格测高必须消费同一份 attributed string；字号、Markdown 属性或段落样式变化都必须触发行高刷新。
+- 会话流 assistant item 的上下内距统一使用 `sp1`（4pt），避免不同类型之间出现无意的密度跳变。
 
 ---
 
@@ -96,5 +112,5 @@ topInset = p.safeTop
 ## 6. 现状与边界（诚实）
 
 - ✅ 已工程化：SSOT + 生成器（CSS/Swift/TS）+ 三关门禁 + 无障碍核验 + 契约文档。
-- 🚧 生成物是**骨架**：`Theme.swift` 覆盖色板/圆角/字体/结构枚举/平台；**阴影**目前保留在 CSS 层（Swift 侧未分解 `NSShadow`），**字体**只给族名栈（未映射具体 `NSFont`）—— 落地时补。
+- 🚧 生成物是**契约骨架**：`Theme.swift` 覆盖色板/圆角/字体族/字号与行高/结构枚举/平台；macOS 生产端也生成对应字号与行高常量。**阴影**目前保留在 CSS 层（Swift 侧未分解 `NSShadow`）；具体字体解析、语言判断和 `NSParagraphStyle` 仍由 AppKit 消费层映射。
 - 🚧 组件是 CSS 类 + 演示 HTML，非打包的 Swift/React 组件；`COMPONENTS.md` 给出契约，具体实现由各端按契约完成。

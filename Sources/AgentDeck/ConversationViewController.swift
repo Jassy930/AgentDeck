@@ -1,6 +1,18 @@
 import AppKit
 import AgentDeckCore
 
+/// 行高缓存的结构化内容版本。字段按值比较，避免把多个 revision / 长度
+/// 线性折叠为一个 Int 时产生可构造碰撞。
+private struct ConversationRowContentVersion: Hashable {
+    var textRevision: UInt64 = 0
+    var outputRevision: UInt64 = 0
+    var diffRevision: UInt64 = 0
+    var descriptionText = ""
+    var reasoningExpanded = false
+    var disclosureExpanded = false
+    var expandedToolPayload: [String] = []
+}
+
 /// 与设计系统 `.wb-stream` / `.wb-col` / `.wb-composer` 对齐的主内容布局度量。
 /// inspector 有数据且空间足够时，正文和 composer 都在
 /// `24 ... (width - 290)` 区域内居中；无数据或窄于响应式门槛时，左右各保留
@@ -77,7 +89,7 @@ final class ConversationViewController: NSViewController {
     /// Compared against a freshly rebuilt sequence in `modelDidChange()` so a
     /// pure streaming-text flush (identical id sequence) skips the full reload
     /// and only re-measures the rows whose content actually grew.
-    private var displayedRowSignatures: [(id: String, version: Int)] = []
+    private var displayedRowSignatures: [(id: String, version: ConversationRowContentVersion)] = []
 
     /// Static presentation fields (tool status, duration, payload, command,
     /// path, etc.) do not flow through `StreamingTextBuffer`. Keep a separate
@@ -408,7 +420,7 @@ final class ConversationViewController: NSViewController {
     ///   and selection (C2) is protected by the streaming-view unchanged guards,
     ///   so the reload no longer destroys user state.
     private func applyRowUpdate(
-        previousSignatures: [(id: String, version: Int)],
+        previousSignatures: [(id: String, version: ConversationRowContentVersion)],
         previousConfigurationVersions: [Int],
         reasoningFlipped: Bool,
         forceFullReload: Bool = false
@@ -449,9 +461,6 @@ final class ConversationViewController: NSViewController {
                 reloadIndexes.formUnion(reasoningIndexes)
             }
             if !reloadIndexes.isEmpty {
-                for index in reloadIndexes where rows.indices.contains(index) {
-                    cache.invalidate(rowId: rows[index].id)
-                }
                 tableView.reloadData(
                     forRowIndexes: reloadIndexes,
                     columnIndexes: IndexSet(integer: 0)
@@ -459,9 +468,15 @@ final class ConversationViewController: NSViewController {
                 heightIndexes.formUnion(reloadIndexes)
             }
             if !heightIndexes.isEmpty {
+                // 每个流式版本只保留当前 row 的一个缓存项。否则逐 token
+                // 版本会永久堆积；结构化 key 还可能持有展开 payload 的 String。
+                for index in heightIndexes where rows.indices.contains(index) {
+                    cache.invalidate(rowId: rows[index].id)
+                }
                 tableView.noteHeightOfRows(withIndexesChanged: heightIndexes)
             }
         case .structural:
+            cache.invalidateAll()
             tableView.reloadData()
             if !rows.isEmpty {
                 tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<rows.count))
@@ -688,42 +703,28 @@ final class ConversationViewController: NSViewController {
         return max(tableView.bounds.width, scrollView.contentView.bounds.width, 1)
     }
 
-    /// A coarse content version for the height cache: changes whenever the
-    /// rendered text length changes (streaming append, replace, or disclosure
-    /// expansion state for reasoning). Combined with rowId × width, this keeps
-    /// the cache fresh without per-token invalidation.
-    private func contentVersion(for row: ConversationDisplayRow) -> Int {
+    /// Buffer revisions catch both growth and replacement (`abc` → `中`) while
+    /// the structured key keeps independent fields from cancelling each other.
+    private func contentVersion(for row: ConversationDisplayRow) -> ConversationRowContentVersion {
         // The collapsed group header has a fixed one-line height; membership,
         // summary and status changes belong to configurationVersion instead.
-        if row.toolActivityGroup != nil { return 0 }
+        if row.toolActivityGroup != nil { return ConversationRowContentVersion() }
         let item = row.item
-        var version = item.textBuffer.text.utf8.count
-        version = version &* 31 &+ item.outputBuffer.text.utf8.count
-        version = version &* 31 &+ item.diffBuffer.text.utf8.count
-        version = version &* 31 &+ item.descriptionText.utf8.count
-        if row.item.kind == "reasoning", isReasoningExpanded(item.id) {
-            version = version &* 31 &+ 1  // distinct key for the expanded body
-        }
-        if item.kind == "toolCall", expandedItemIds.contains(item.id) {
-            // Group members can stay hidden while a running tool updates its
-            // payload. Include a deterministic digest of the raw payload in
-            // the expanded row's height key so reopening the group cannot hit
-            // a stale height cached before the hidden update.
-            for payloadPart in [item.arguments, item.result, item.errorText] {
-                version = version &* 31 &+ payloadPart.utf8.count
-                for byte in payloadPart.utf8 {
-                    version = (version ^ Int(byte)) &* 16_777_619
-                }
-            }
-        }
-        // A collapsible row that the user expanded measures taller (its body is
-        // included). Fold the expanded flag into the version so the height cache
-        // re-measures when it flips. (C1)
-        if (item.kind == "shell" || item.kind == "fileEdit" || item.kind == "toolCall"),
-           expandedItemIds.contains(item.id) {
-            version = version &* 31 &+ 2
-        }
-        return version
+        let disclosureExpanded = (item.kind == "shell"
+            || item.kind == "fileEdit"
+            || item.kind == "toolCall")
+            && expandedItemIds.contains(item.id)
+        return ConversationRowContentVersion(
+            textRevision: item.textBuffer.revision,
+            outputRevision: item.outputBuffer.revision,
+            diffRevision: item.diffBuffer.revision,
+            descriptionText: item.descriptionText,
+            reasoningExpanded: item.kind == "reasoning" && isReasoningExpanded(item.id),
+            disclosureExpanded: disclosureExpanded,
+            expandedToolPayload: item.kind == "toolCall" && disclosureExpanded
+                ? [item.arguments, item.result, item.errorText]
+                : []
+        )
     }
 
     /// Version of values copied into static AppKit controls during `configure`.
@@ -822,10 +823,10 @@ final class ConversationViewController: NSViewController {
         switch item.kind {
         case "shell":
             text = item.outputBuffer.text
-            font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+            font = ConversationRowMetrics.monoCalloutFont
         case "fileEdit":
             text = item.diffBuffer.text
-            font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            font = ConversationRowMetrics.monoCalloutFont
         case "toolCall":
             // 展开后显示美化 JSON（payloadLabel 用 monoCaptionFont，stack 间距 5）。
             let payload = ToolPresentation.toolPayload(item)
@@ -843,16 +844,21 @@ final class ConversationViewController: NSViewController {
         return 4 + measuredTextHeight(attributed, width: contentW)
     }
 
-    /// Height of the auto-expanded reasoning body (small secondary streaming
-    /// text), measured the same way the factory measures wrapped text. The
-    /// contentStack spacing (5) precedes the body.
+    /// Height of the expanded reasoning body, measured from the same markdown
+    /// attributed string rendered by `ReasoningCellView`.
     private func reasoningExpandedBodyHeight(for row: ConversationDisplayRow, width: CGFloat) -> CGFloat {
         let text = row.item.textBuffer.text
-        guard !text.isEmpty else { return 0 }
         let contentW = max(width - ConversationRowCellView.horizontalInset * 2, 1)
-        let font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-        let attributed = NSAttributedString(string: text, attributes: [.font: font])
-        return 5 + measuredTextHeight(attributed, width: contentW)
+        let attributed = MarkdownAttributedStringBuilder.attributedString(
+            from: text,
+            style: .reasoning
+        )
+        // Reasoning 的空正文 view 折叠为 0 高，但作为第二个 arranged view
+        // 仍保留设计系统的 4pt stack spacing；渲染出可见文字后再加正文高度。
+        let bodyHeight = attributed.length == 0
+            ? 0
+            : measuredTextHeight(attributed, width: contentW)
+        return DesignTokens.sp1 + bodyHeight
     }
 
     // MARK: Cell registration
@@ -943,7 +949,10 @@ extension ConversationViewController: ConversationDisclosureStateStore {
             let memberIndexes = IndexSet(
                 integersIn: (groupIndex + 1)..<(groupIndex + 1 + group.members.count)
             )
-            cache.invalidate(rowId: rows[groupIndex].id)
+            // Group toggle is a structural insert/remove path that bypasses
+            // `applyRowUpdate(.structural)`. 清空摘要和全部成员版本，避免
+            // 隐藏期间变化的展开 payload 旧 key 被长期保留。
+            cache.invalidateAll()
             rebuildRows()
 
             tableView.beginUpdates()
