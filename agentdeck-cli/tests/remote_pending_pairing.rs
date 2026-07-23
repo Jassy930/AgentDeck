@@ -6,20 +6,27 @@ use agentdeck_cli::remote::keychain::{
     MemoryRemoteKeyStore, PendingRemoteKeyPurpose, RemoteKeyAccount, RemoteKeyPersistence,
     RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
 };
-use agentdeck_cli::remote::pending::PendingPairingCoordinator;
+use agentdeck_cli::remote::pending::{PendingPairingCoordinator, PreparedPairRequest};
 use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
-use agentdeck_crypto::{HpkePrivateKey, SigningKey, open_pair_request, sha256, sign_tbs};
+use agentdeck_crypto::{
+    HpkePrivateKey, PairResponseSealAuthority, SecretAeadKey, SigningKey, open_pair_request,
+    seal_key_directory_entry, seal_pair_response, sha256, sign_device_authorization,
+    sign_key_directory, sign_tbs,
+};
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,
-    E2EE_FORMAT_VERSION, OuterContextV1, OuterFrameKind, PairInviteV1, PairRequestInfoV1,
-    PairRequestPlaintextV1, PairRequestV1,
+    DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1, KeyDirectoryV1,
+    KeyPurpose, KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind,
+    PairInviteV1, PairRequestInfoV1, PairRequestPlaintextV1, PairRequestV1, PairResponseInfoV1,
+    PairResponsePlaintextV1,
 };
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::{
-    CertRole, Ed25519Signature, PublicKeyBytes, SignedCertificate,
+    CertRole, Ed25519Signature, PublicKeyBytes, RelayGrant, SignedCertificate,
 };
 use agentdeck_protocol::relay_v2::id::{
-    LinkGeneration, MachineRouteId, PairRouteId, RelayServerId, RootKeyId, TrustEpoch,
+    DeviceRouteId, GrantSerial, KeyDirectoryRevision, LinkGeneration, MachineRouteId, PairRouteId,
+    RelayServerId, RootKeyId, TrustEpoch,
 };
 use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use uuid::Uuid;
@@ -27,6 +34,7 @@ use uuid::Uuid;
 const NOW_MS: u64 = 1_900_000_000_000;
 const INSTALLATION_ID: Uuid = Uuid::from_bytes([0x11; 16]);
 const MACHINE_ROUTE: MachineRouteId = MachineRouteId::from_bytes([0x21; 16]);
+const DEVICE_ROUTE: DeviceRouteId = DeviceRouteId::from_bytes([0x25; 16]);
 const PAIR_ROUTE: PairRouteId = PairRouteId::from_bytes([0x22; 16]);
 const RELAY_SERVER: RelayServerId = RelayServerId::from_bytes([0x23; 16]);
 const ROOT_KEY_ID: RootKeyId = RootKeyId::from_bytes([0x24; 16]);
@@ -115,9 +123,17 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn root_signing_key() -> SigningKey {
+        SigningKey::from_seed(&[0x31; 32])
+    }
+
+    fn data_signing_key() -> SigningKey {
+        SigningKey::from_seed(&[0x32; 32])
+    }
+
     fn new() -> Self {
-        let root = SigningKey::from_seed(&[0x31; 32]);
-        let data = SigningKey::from_seed(&[0x32; 32]);
+        let root = Self::root_signing_key();
+        let data = Self::data_signing_key();
         let root_fingerprint = sha256(&root.verifying_key().to_bytes());
         let mut data_certificate = SignedCertificate {
             subject_pubkey: PublicKeyBytes(data.verifying_key().to_bytes()),
@@ -187,6 +203,170 @@ impl Fixture {
             stream_seq: None,
             message_key_epoch: 0,
         }
+    }
+
+    fn response_for(&self, prepared: &PreparedPairRequest) -> Vec<u8> {
+        let root = Self::root_signing_key();
+        let data = Self::data_signing_key();
+        let root_fingerprint = self.invite.machine_root_fingerprint;
+        let mut grant = RelayGrant {
+            machine_route: MACHINE_ROUTE,
+            device_route: DEVICE_ROUTE,
+            device_sign_pubkey: PublicKeyBytes(prepared.device_sign_public_key()),
+            grant_serial: GrantSerial::new(7),
+            root_key_id: ROOT_KEY_ID,
+            trust_epoch: TrustEpoch::new(2),
+            signature: Ed25519Signature([0; 64]),
+        };
+        grant.signature = sign_tbs(
+            &root,
+            &grant.to_be_signed_v1(RELAY_SERVER, root_fingerprint),
+        )
+        .into();
+        let authorization = sign_device_authorization(
+            &root,
+            RELAY_SERVER,
+            &grant,
+            DeviceAuthorizationV1 {
+                format_version: E2EE_FORMAT_VERSION,
+                grant_hash: grant.canonical_sha256(),
+                machine_route: MACHINE_ROUTE,
+                device_route: DEVICE_ROUTE,
+                device_sign_fingerprint: sha256(&prepared.device_sign_public_key()),
+                grant_serial: GrantSerial::new(7),
+                device_hpke_pubkey: PublicKeyBytes(prepared.device_hpke_public_key()),
+                capabilities: self.authorization.capabilities.clone(),
+                permissions: self.authorization.permissions.clone(),
+                root_key_id: ROOT_KEY_ID,
+                trust_epoch: TrustEpoch::new(2),
+                signature: Ed25519Signature([0; 64]),
+            },
+        )
+        .unwrap();
+        let info = PairResponseInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_server_id: RELAY_SERVER,
+            pair_route: PAIR_ROUTE,
+            invite_hash: self.invite.canonical_sha256().unwrap(),
+            expiry_ms: self.invite.expires_at_ms,
+            request_hash: prepared.request_hash(),
+            machine_route: MACHINE_ROUTE,
+            device_route: DEVICE_ROUTE,
+            grant_serial: GrantSerial::new(7),
+            root_trust_epoch: TrustEpoch::new(2),
+        };
+        let revision = KeyDirectoryRevision::new(4);
+        let recipient =
+            agentdeck_crypto::HpkePublicKey::from_bytes(&prepared.device_hpke_public_key())
+                .unwrap();
+        let mut entry_rng = DeterministicRng::new([0x37; 32]);
+        let mut entries = Vec::new();
+        for (purpose, epoch, key_byte) in [
+            (KeyPurpose::Catalog, 3_u64, 0x71_u8),
+            (KeyPurpose::DeviceCommandTx, 5, 0x72),
+            (KeyPurpose::DeviceReplyTx, 7, 0x73),
+        ] {
+            let entry_info = KeyUpdateInfoV1 {
+                e2ee_format_version: E2EE_FORMAT_VERSION,
+                runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+                relay_server_id: RELAY_SERVER,
+                machine_route: MACHINE_ROUTE,
+                device_route: DEVICE_ROUTE,
+                stream_route: None,
+                grant_serial: GrantSerial::new(7),
+                root_trust_epoch: TrustEpoch::new(2),
+                key_directory_revision: revision,
+                key_purpose: purpose,
+                key_epoch: epoch,
+            };
+            entries.push(
+                seal_key_directory_entry(
+                    &recipient,
+                    &entry_info,
+                    &key_update_context(&entry_info),
+                    &SecretAeadKey::from_bytes([key_byte; 32]),
+                    &mut entry_rng,
+                )
+                .unwrap(),
+            );
+        }
+        let signer =
+            MachineDataSignerBindingV1::from_certificate(&self.invite.data_sign_cert).unwrap();
+        let directory = sign_key_directory(
+            &data,
+            &signer,
+            &KeyDirectorySignatureContextV1 {
+                relay_server_id: RELAY_SERVER,
+                machine_route: MACHINE_ROUTE,
+                device_route: DEVICE_ROUTE,
+                grant_serial: GrantSerial::new(7),
+                root_trust_epoch: TrustEpoch::new(2),
+            },
+            KeyDirectoryV1 {
+                revision,
+                entries,
+                signature: Ed25519Signature([0; 64]),
+            },
+        )
+        .unwrap();
+        let plaintext = PairResponsePlaintextV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            request_hash: prepared.request_hash(),
+            relay_grant: grant,
+            device_authorization: authorization,
+            key_directory: directory,
+        };
+        let mut response_rng = DeterministicRng::new([0x38; 32]);
+        seal_pair_response(
+            &recipient,
+            &info,
+            &pairing_context(OuterFrameKind::PairResponse),
+            &plaintext,
+            PairResponseSealAuthority {
+                machine_data_signing_key: &data,
+                signer: &signer,
+                machine_root_verifying_key: &root.verifying_key(),
+            },
+            &mut response_rng,
+        )
+        .unwrap()
+        .canonical_bytes()
+        .unwrap()
+    }
+}
+
+fn pairing_context(frame_kind: OuterFrameKind) -> OuterContextV1 {
+    OuterContextV1 {
+        frame_kind,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: None,
+        device_route: None,
+        stream_route: None,
+        request_route: None,
+        pair_route: Some(PAIR_ROUTE),
+        stream_generation: None,
+        stream_cursor: None,
+        stream_seq: None,
+        message_key_epoch: 0,
+    }
+}
+
+fn key_update_context(info: &KeyUpdateInfoV1) -> OuterContextV1 {
+    OuterContextV1 {
+        frame_kind: OuterFrameKind::KeyUpdate,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: Some(info.machine_route),
+        device_route: Some(info.device_route),
+        stream_route: info.stream_route,
+        request_route: None,
+        pair_route: None,
+        stream_generation: None,
+        stream_cursor: None,
+        stream_seq: None,
+        message_key_epoch: info.key_epoch,
     }
 }
 
@@ -324,6 +504,97 @@ fn first_send_is_frozen_in_keychain_and_every_retry_reuses_exact_pair_request() 
         .expect("durable retry");
     assert_eq!(retry.canonical_request(), first_bytes);
     assert_eq!(retry.request_hash(), first_hash);
+}
+
+#[test]
+fn verified_response_is_read_only_and_bound_to_the_durable_pending_transaction() {
+    let fixture = Fixture::new();
+    let store = UnknownCommitStore::new(usize::MAX);
+    let coordinator = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+    let mut rng = DeterministicRng::new([0x42; 32]);
+    let prepared = coordinator
+        .prepare(&fixture.invite, &fixture.authorization, NOW_MS, &mut rng)
+        .unwrap();
+    let response = fixture.response_for(&prepared);
+    drop(prepared);
+    let writes_before_verify = store.writes.load(Ordering::SeqCst);
+
+    let verified = coordinator
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 1,
+            &response,
+        )
+        .expect("response must verify from persisted pending keys");
+    assert_eq!(
+        format!("{verified:?}"),
+        "VerifiedPendingPairResponse([REDACTED])"
+    );
+    assert_eq!(verified.response_hash(), sha256(&response));
+    assert_eq!(verified.machine_route(), MACHINE_ROUTE);
+    assert_eq!(verified.device_route(), DEVICE_ROUTE);
+    assert_eq!(verified.opened_key_count(), 3);
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before_verify);
+
+    let restarted = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+    restarted
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 2,
+            &response,
+        )
+        .expect("restart must verify the same response without generating state");
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before_verify);
+
+    let changed = full_authorization("Changed Authorization");
+    let error = restarted
+        .verify_response(&fixture.invite, &changed, NOW_MS + 2, &response)
+        .expect_err("a caller cannot replace pending expectations with response fields");
+    assert_eq!(error.code(), "remote.pairing.pending_conflict");
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before_verify);
+}
+
+#[test]
+fn response_verification_never_repairs_a_missing_pending_key() {
+    for (index, missing_purpose) in [
+        PendingRemoteKeyPurpose::PairingRecord,
+        PendingRemoteKeyPurpose::DeviceSignPrivateKey,
+        PendingRemoteKeyPurpose::DeviceHpkePrivateKey,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = Fixture::new();
+        let store = UnknownCommitStore::new(usize::MAX);
+        let coordinator = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+        let mut rng = DeterministicRng::new([0x43 + index as u8; 32]);
+        let prepared = coordinator
+            .prepare(&fixture.invite, &fixture.authorization, NOW_MS, &mut rng)
+            .unwrap();
+        let response = fixture.response_for(&prepared);
+        drop(prepared);
+
+        let missing_account = RemoteKeyAccount::pending(
+            INSTALLATION_ID,
+            fixture.invite.canonical_sha256().unwrap(),
+            missing_purpose,
+        );
+        store.delete_exact(&missing_account).unwrap();
+        let writes_before_verify = store.writes.load(Ordering::SeqCst);
+        let error = coordinator
+            .verify_response(
+                &fixture.invite,
+                &fixture.authorization,
+                NOW_MS + 1,
+                &response,
+            )
+            .expect_err("missing committed pending item must fail closed");
+        assert_eq!(error.code(), "remote.pairing.pending_incomplete");
+        assert_eq!(store.writes.load(Ordering::SeqCst), writes_before_verify);
+        assert!(store.load(&missing_account).unwrap().is_none());
+    }
 }
 
 #[test]

@@ -1,20 +1,24 @@
 use std::convert::Infallible;
 
+use ed25519_dalek::Signer;
+
 use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
 use agentdeck_crypto::{
-    CryptoError, HpkePrivateKey, PairResponseSealAuthority, SigningKey, open_pair_pending,
-    open_pair_request, open_pair_request_verified, open_pair_response, open_pair_response_received,
-    seal_pair_pending, seal_pair_request, seal_pair_response, seal_pair_response_received, sha256,
-    sign_device_authorization, sign_key_directory, sign_pair_response_received, sign_tbs,
-    verify_device_authorization, verify_pair_request_envelope, verify_pair_response_envelope,
-    verify_pair_response_received,
+    CryptoError, HpkePrivateKey, PairResponseExpectedV1, PairResponseSealAuthority, SecretAeadKey,
+    SigningKey, derive_nonce_prefix, hpke_seal_base, open_pair_pending, open_pair_request,
+    open_pair_request_verified, open_pair_response, open_pair_response_received,
+    open_pair_response_verified, seal_key_directory_entry, seal_pair_pending, seal_pair_request,
+    seal_pair_response, seal_pair_response_received, sha256, sign_device_authorization,
+    sign_key_directory, sign_pair_response_received, sign_tbs, verify_device_authorization,
+    verify_pair_request_envelope, verify_pair_response_envelope, verify_pair_response_received,
 };
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,
     DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectoryEntry, KeyDirectorySignatureContextV1,
-    KeyDirectoryV1, KeyId, KeyPurpose, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind,
-    PairRequestInfoV1, PairRequestPlaintextV1, PairResponseInfoV1, PairResponsePlaintextV1,
-    PairResponseReceivedV1, PairingError,
+    KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1,
+    OuterFrameKind, PairInviteV1, PairRequestInfoV1, PairRequestPlaintextV1, PairResponseInfoV1,
+    PairResponsePlaintextV1, PairResponseReceivedV1, PairResponseV1, PairingEnvelopeTbsV1,
+    PairingError,
 };
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::{
@@ -308,6 +312,282 @@ fn response_plaintext(
         device_authorization: signed_authorization(root, &grant, device_hpke_public),
         relay_grant: grant,
         key_directory,
+    }
+}
+
+struct VerifiedResponseFixture {
+    invite: PairInviteV1,
+    authorization: AuthorizationRequestV1,
+    device_hpke_private: HpkePrivateKey,
+    device_sign_public: [u8; 32],
+    device_hpke_public: [u8; 32],
+    request_hash: [u8; 32],
+    canonical_response: Vec<u8>,
+    opened_key_prefixes: Vec<[u8; 4]>,
+}
+
+impl VerifiedResponseFixture {
+    fn expected(&self) -> PairResponseExpectedV1<'_> {
+        PairResponseExpectedV1::new(
+            &self.invite,
+            self.request_hash,
+            self.device_sign_public,
+            self.device_hpke_public,
+            &self.authorization,
+            1_700_000_000_000,
+        )
+    }
+}
+
+fn key_update_context(info: &KeyUpdateInfoV1) -> OuterContextV1 {
+    OuterContextV1 {
+        frame_kind: OuterFrameKind::KeyUpdate,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: Some(info.machine_route),
+        device_route: Some(info.device_route),
+        stream_route: info.stream_route,
+        request_route: None,
+        pair_route: None,
+        stream_generation: None,
+        stream_cursor: None,
+        stream_seq: None,
+        message_key_epoch: info.key_epoch,
+    }
+}
+
+fn verified_response_fixture(
+    certificate_machine_route: MachineRouteId,
+    wrong_entry_revision: bool,
+    duplicate_conversation_slot: bool,
+    bad_directory_signature: bool,
+) -> VerifiedResponseFixture {
+    let root = SigningKey::from_seed(&[0xc1; 32]);
+    let data = SigningKey::from_seed(&[0xc2; 32]);
+    let device = SigningKey::from_seed(&[0xc3; 32]);
+    let root_fingerprint = sha256(&root.verifying_key().to_bytes());
+    let mut certificate = SignedCertificate {
+        subject_pubkey: PublicKeyBytes(data.verifying_key().to_bytes()),
+        cert_role: CertRole::Data,
+        generation: LinkGeneration::new(4),
+        root_key_id: root_key_id(),
+        trust_epoch: TrustEpoch::new(2),
+        not_after_ms: Some(1_700_000_400_000),
+        signature: Ed25519Signature([0; 64]),
+    };
+    certificate.signature = sign_tbs(
+        &root,
+        &certificate.to_be_signed_v1(relay_server(), certificate_machine_route, root_fingerprint),
+    )
+    .into();
+    let (_, invite_public) = HpkePrivateKey::derive_keypair(&[0xc4; 32]);
+    let invite = PairInviteV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        pair_route: pair_route(),
+        invite_secret: [0xc5; 32],
+        invite_hpke_pubkey: PublicKeyBytes(invite_public.to_bytes().try_into().unwrap()),
+        wss_url: "wss://relay.example/".into(),
+        relay_server_id: relay_server(),
+        current_spki_pin: [0xc6; 32],
+        next_spki_pin: [0xc7; 32],
+        expires_at_ms: 1_700_000_299_000,
+        machine_root_pubkey: PublicKeyBytes(root.verifying_key().to_bytes()),
+        machine_root_fingerprint: root_fingerprint,
+        data_sign_cert: certificate,
+        machine_display_name: "Verified Machine".into(),
+    };
+    let authorization = AuthorizationRequestV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        device_display_name: "Verified Remote".into(),
+        capabilities: vec![
+            AuthorizationCapabilityV1::Catalog,
+            AuthorizationCapabilityV1::Conversation,
+            AuthorizationCapabilityV1::Prompt,
+        ],
+        permissions: vec![
+            AuthorizationPermissionV1::CatalogRead,
+            AuthorizationPermissionV1::ConversationRead,
+        ],
+    };
+    let (device_hpke_private, device_hpke_public) = HpkePrivateKey::derive_keypair(&[0xc8; 32]);
+    let device_hpke_public_bytes: [u8; 32] = device_hpke_public.to_bytes().try_into().unwrap();
+    let request_hash = [0xc9; 32];
+    let info = PairResponseInfoV1 {
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        relay_server_id: relay_server(),
+        pair_route: pair_route(),
+        invite_hash: invite.canonical_sha256().unwrap(),
+        expiry_ms: invite.expires_at_ms,
+        request_hash,
+        machine_route: machine_route(),
+        device_route: device_route(),
+        grant_serial: GrantSerial::new(7),
+        root_trust_epoch: TrustEpoch::new(2),
+    };
+    let signer = MachineDataSignerBindingV1::from_certificate(&invite.data_sign_cert).unwrap();
+    let grant = signed_grant(&root, &device);
+    let device_authorization = sign_device_authorization(
+        &root,
+        relay_server(),
+        &grant,
+        DeviceAuthorizationV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            grant_hash: grant.canonical_sha256(),
+            machine_route: grant.machine_route,
+            device_route: grant.device_route,
+            device_sign_fingerprint: sha256(&grant.device_sign_pubkey.0),
+            grant_serial: grant.grant_serial,
+            device_hpke_pubkey: PublicKeyBytes(device_hpke_public_bytes),
+            capabilities: authorization.capabilities.clone(),
+            permissions: authorization.permissions.clone(),
+            root_key_id: grant.root_key_id,
+            trust_epoch: grant.trust_epoch,
+            signature: Ed25519Signature([0; 64]),
+        },
+    )
+    .unwrap();
+    let directory_revision = KeyDirectoryRevision::new(9);
+    let conversation_route = StreamRouteId::from_bytes([0xca; 16]);
+    let mut entry_specs = vec![
+        (KeyPurpose::Catalog, None, 3_u64, 0xd1_u8),
+        (
+            KeyPurpose::ConversationDek,
+            Some(conversation_route),
+            5,
+            0xd2,
+        ),
+        (KeyPurpose::DeviceCommandTx, None, 7, 0xd3),
+        (KeyPurpose::DeviceReplyTx, None, 11, 0xd4),
+    ];
+    if duplicate_conversation_slot {
+        entry_specs.insert(
+            2,
+            (
+                KeyPurpose::ConversationDek,
+                Some(conversation_route),
+                6,
+                0xd5,
+            ),
+        );
+    }
+    let mut entry_rng = DeterministicRng::new([0xcb; 32]);
+    let mut opened_key_prefixes = Vec::new();
+    let mut entries = Vec::new();
+    for (key_purpose, stream_route, key_epoch, key_byte) in entry_specs {
+        let sealed_revision = if wrong_entry_revision && key_purpose == KeyPurpose::DeviceReplyTx {
+            KeyDirectoryRevision::new(directory_revision.value() + 1)
+        } else {
+            directory_revision
+        };
+        let info = KeyUpdateInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_server_id: relay_server(),
+            machine_route: machine_route(),
+            device_route: device_route(),
+            stream_route,
+            grant_serial: GrantSerial::new(7),
+            root_trust_epoch: TrustEpoch::new(2),
+            key_directory_revision: sealed_revision,
+            key_purpose,
+            key_epoch,
+        };
+        let key = SecretAeadKey::from_bytes([key_byte; 32]);
+        opened_key_prefixes.push(derive_nonce_prefix(&key));
+        entries.push(
+            seal_key_directory_entry(
+                &device_hpke_public,
+                &info,
+                &key_update_context(&info),
+                &key,
+                &mut entry_rng,
+            )
+            .unwrap(),
+        );
+    }
+    let mut directory = sign_key_directory(
+        &data,
+        &signer,
+        &KeyDirectorySignatureContextV1 {
+            relay_server_id: relay_server(),
+            machine_route: machine_route(),
+            device_route: device_route(),
+            grant_serial: GrantSerial::new(7),
+            root_trust_epoch: TrustEpoch::new(2),
+        },
+        KeyDirectoryV1 {
+            revision: directory_revision,
+            entries,
+            signature: Ed25519Signature([0; 64]),
+        },
+    )
+    .unwrap();
+    if bad_directory_signature {
+        directory.signature.0[0] ^= 1;
+    }
+    let plaintext = PairResponsePlaintextV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        request_hash,
+        relay_grant: grant,
+        device_authorization,
+        key_directory: directory,
+    };
+    let response_context = context(OuterFrameKind::PairResponse);
+    let mut response_rng = DeterministicRng::new([0xcc; 32]);
+    let response = if bad_directory_signature {
+        let sealed = hpke_seal_base(
+            &device_hpke_public,
+            &info.encode(),
+            &response_context.encode_aad(),
+            &plaintext.canonical_bytes().unwrap(),
+            &mut response_rng,
+        )
+        .unwrap();
+        let tbs = PairingEnvelopeTbsV1::for_response_parts(
+            E2EE_FORMAT_VERSION,
+            sealed.enc.clone(),
+            &sealed.ciphertext,
+            &info,
+            &response_context,
+            &signer,
+        )
+        .unwrap();
+        let signature = ed25519_dalek::SigningKey::from_bytes(&[0xc2; 32])
+            .sign(&tbs.encode().unwrap())
+            .to_bytes();
+        PairResponseV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            info: info.clone(),
+            enc: sealed.enc,
+            ciphertext: sealed.ciphertext,
+            machine_data_signature: Ed25519Signature(signature),
+        }
+    } else {
+        seal_pair_response(
+            &device_hpke_public,
+            &info,
+            &response_context,
+            &plaintext,
+            PairResponseSealAuthority {
+                machine_data_signing_key: &data,
+                signer: &signer,
+                machine_root_verifying_key: &root.verifying_key(),
+            },
+            &mut response_rng,
+        )
+        .unwrap()
+    };
+    VerifiedResponseFixture {
+        invite,
+        authorization,
+        device_hpke_private,
+        device_sign_public: device.verifying_key().to_bytes(),
+        device_hpke_public: device_hpke_public_bytes,
+        request_hash,
+        canonical_response: response.canonical_bytes().unwrap(),
+        opened_key_prefixes,
     }
 }
 
@@ -717,6 +997,245 @@ fn pair_response_round_trip_verifies_machine_data_root_grant_and_authorization()
             &root.verifying_key(),
         ),
         Err(CryptoError::BadSignature)
+    );
+}
+
+#[test]
+fn verified_pair_response_requires_full_root_pending_and_directory_key_chain() {
+    let fixture = verified_response_fixture(machine_route(), false, false, false);
+    let verified = open_pair_response_verified(
+        &fixture.device_hpke_private,
+        fixture.expected(),
+        &fixture.canonical_response,
+    )
+    .expect("complete verified response chain");
+
+    assert_eq!(
+        format!("{verified:?}"),
+        "VerifiedPairResponseV1([REDACTED])"
+    );
+    assert_eq!(verified.canonical_response(), fixture.canonical_response);
+    assert_eq!(
+        verified.response_hash(),
+        sha256(&fixture.canonical_response)
+    );
+    assert_eq!(
+        verified.relay_grant().device_sign_pubkey.0,
+        fixture.device_sign_public
+    );
+    assert_eq!(verified.key_directory().revision.value(), 9);
+    assert_eq!(verified.opened_keys().len(), 4);
+    assert_eq!(
+        verified
+            .opened_keys()
+            .iter()
+            .map(|entry| entry.derived_nonce_prefix())
+            .collect::<Vec<_>>(),
+        fixture.opened_key_prefixes
+    );
+}
+
+#[test]
+fn verified_pair_response_rejects_unproven_data_cert_and_pending_identity_mismatch() {
+    let wrong_certificate_route =
+        verified_response_fixture(MachineRouteId::from_bytes([0xee; 16]), false, false, false);
+    assert!(
+        open_pair_response_verified(
+            &wrong_certificate_route.device_hpke_private,
+            wrong_certificate_route.expected(),
+            &wrong_certificate_route.canonical_response,
+        )
+        .is_err(),
+        "a shape-valid Data cert signed for another machine route must be rejected"
+    );
+
+    let fixture = verified_response_fixture(machine_route(), false, false, false);
+    let alternate_device_sign = SigningKey::from_seed(&[0xef; 32]);
+    let wrong_sign = PairResponseExpectedV1::new(
+        &fixture.invite,
+        fixture.request_hash,
+        alternate_device_sign.verifying_key().to_bytes(),
+        fixture.device_hpke_public,
+        &fixture.authorization,
+        1_700_000_000_000,
+    );
+    assert!(
+        open_pair_response_verified(
+            &fixture.device_hpke_private,
+            wrong_sign,
+            &fixture.canonical_response,
+        )
+        .is_err(),
+        "grant DeviceSign must match the frozen pending request"
+    );
+
+    let (_, alternate_hpke_public) = HpkePrivateKey::derive_keypair(&[0xed; 32]);
+    let wrong_hpke = PairResponseExpectedV1::new(
+        &fixture.invite,
+        fixture.request_hash,
+        fixture.device_sign_public,
+        alternate_hpke_public.to_bytes().try_into().unwrap(),
+        &fixture.authorization,
+        1_700_000_000_000,
+    );
+    assert!(
+        open_pair_response_verified(
+            &fixture.device_hpke_private,
+            wrong_hpke,
+            &fixture.canonical_response,
+        )
+        .is_err(),
+        "authorization DeviceHPKE and recipient must match the frozen pending request"
+    );
+
+    let mut changed_capability = fixture.authorization.clone();
+    changed_capability.capabilities.pop();
+    changed_capability.validate().unwrap();
+    let wrong_capability = PairResponseExpectedV1::new(
+        &fixture.invite,
+        fixture.request_hash,
+        fixture.device_sign_public,
+        fixture.device_hpke_public,
+        &changed_capability,
+        1_700_000_000_000,
+    );
+    assert!(
+        open_pair_response_verified(
+            &fixture.device_hpke_private,
+            wrong_capability,
+            &fixture.canonical_response,
+        )
+        .is_err(),
+        "granted capabilities must equal the pending request"
+    );
+
+    let mut changed_permission = fixture.authorization.clone();
+    changed_permission.permissions.pop();
+    changed_permission.validate().unwrap();
+    let wrong_permission = PairResponseExpectedV1::new(
+        &fixture.invite,
+        fixture.request_hash,
+        fixture.device_sign_public,
+        fixture.device_hpke_public,
+        &changed_permission,
+        1_700_000_000_000,
+    );
+    assert!(
+        open_pair_response_verified(
+            &fixture.device_hpke_private,
+            wrong_permission,
+            &fixture.canonical_response,
+        )
+        .is_err(),
+        "granted permissions must equal the pending request"
+    );
+}
+
+#[test]
+fn verified_pair_response_derives_exact_entry_context_and_rejects_ambiguous_current_slots() {
+    let wrong_entry_revision = verified_response_fixture(machine_route(), true, false, false);
+    assert!(
+        open_pair_response_verified(
+            &wrong_entry_revision.device_hpke_private,
+            wrong_entry_revision.expected(),
+            &wrong_entry_revision.canonical_response,
+        )
+        .is_err(),
+        "entry HPKE info must use the signed directory revision"
+    );
+
+    let duplicate_slot = verified_response_fixture(machine_route(), false, true, false);
+    assert!(
+        open_pair_response_verified(
+            &duplicate_slot.device_hpke_private,
+            duplicate_slot.expected(),
+            &duplicate_slot.canonical_response,
+        )
+        .is_err(),
+        "one current directory cannot carry two epochs for one semantic slot"
+    );
+}
+
+#[test]
+fn verified_pair_response_rejects_bad_inner_directory_signature_after_valid_outer_open() {
+    let bad_directory = verified_response_fixture(machine_route(), false, false, true);
+    assert_eq!(
+        open_pair_response_verified(
+            &bad_directory.device_hpke_private,
+            bad_directory.expected(),
+            &bad_directory.canonical_response,
+        )
+        .unwrap_err(),
+        CryptoError::BadSignature,
+        "receive-side verification must not trust a valid outer signature over a bad directory"
+    );
+}
+
+#[test]
+fn verified_pair_response_rejects_every_pending_clear_axis_before_promotion() {
+    let fixture = verified_response_fixture(machine_route(), false, false, false);
+    let mut invite_variants = Vec::new();
+
+    let mut changed_relay = fixture.invite.clone();
+    changed_relay.relay_server_id = RelayServerId::from_bytes([0xe1; 16]);
+    invite_variants.push(("relayServerId", changed_relay));
+
+    let mut changed_route = fixture.invite.clone();
+    changed_route.pair_route = PairRouteId::from_bytes([0xe2; 16]);
+    invite_variants.push(("pairRoute", changed_route));
+
+    let mut changed_expiry = fixture.invite.clone();
+    changed_expiry.expires_at_ms -= 1;
+    invite_variants.push(("expiry", changed_expiry));
+
+    let mut changed_hash_input = fixture.invite.clone();
+    changed_hash_input.machine_display_name = "Another Machine".into();
+    invite_variants.push(("inviteHash", changed_hash_input));
+
+    for (axis, invite) in invite_variants {
+        let expected = PairResponseExpectedV1::new(
+            &invite,
+            fixture.request_hash,
+            fixture.device_sign_public,
+            fixture.device_hpke_public,
+            &fixture.authorization,
+            1_700_000_000_000,
+        );
+        assert!(
+            open_pair_response_verified(
+                &fixture.device_hpke_private,
+                expected,
+                &fixture.canonical_response,
+            )
+            .is_err(),
+            "changed {axis} must fail"
+        );
+    }
+
+    let wrong_request = PairResponseExpectedV1::new(
+        &fixture.invite,
+        [0xe3; 32],
+        fixture.device_sign_public,
+        fixture.device_hpke_public,
+        &fixture.authorization,
+        1_700_000_000_000,
+    );
+    assert!(
+        open_pair_response_verified(
+            &fixture.device_hpke_private,
+            wrong_request,
+            &fixture.canonical_response,
+        )
+        .is_err(),
+        "changed requestHash must fail"
+    );
+
+    let mut trailing = fixture.canonical_response.clone();
+    trailing.push(0);
+    assert!(
+        open_pair_response_verified(&fixture.device_hpke_private, fixture.expected(), &trailing)
+            .is_err(),
+        "strict canonical parser must reject trailing bytes"
     );
 }
 

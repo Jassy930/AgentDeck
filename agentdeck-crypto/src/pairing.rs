@@ -3,20 +3,29 @@
 //! 调用方不能把任意 raw bytes 交给这些签名入口；所有签名都先通过 protocol-owned typed
 //! TBS validation。HPKE plaintext/ciphertext 只使用 frozen canonical bytes。
 
+use std::collections::HashSet;
+
 use agentdeck_protocol::e2ee::{
-    DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1,
-    MachineDataSignerBindingV1, OuterContextV1, PairPendingV1, PairRequestInfoV1,
-    PairRequestPlaintextV1, PairRequestV1, PairResponseInfoV1, PairResponsePlaintextV1,
-    PairResponseReceivedV1, PairResponseV1, PairingControlEnvelopeV1, PairingEnvelopeTbsV1,
+    AuthorizationRequestV1, DeviceAuthorizationV1, E2EE_FORMAT_VERSION,
+    KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyId, KeyUpdateInfoV1,
+    MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairInviteV1, PairPendingV1,
+    PairRequestInfoV1, PairRequestPlaintextV1, PairRequestV1, PairResponseInfoV1,
+    PairResponsePlaintextV1, PairResponseReceivedV1, PairResponseV1, PairingControlEnvelopeV1,
+    PairingEnvelopeTbsV1, PairingError,
 };
-use agentdeck_protocol::relay_v2::auth::{Ed25519Signature, RelayGrant};
-use agentdeck_protocol::relay_v2::id::RelayServerId;
+use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
+use agentdeck_protocol::relay_v2::auth::{
+    CertRole, Ed25519Signature, PublicKeyBytes, RelayGrant, SignedCertificate,
+};
+use agentdeck_protocol::relay_v2::id::{RelayServerId, StreamRouteId};
+use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::aead::{SecretAeadKey, derive_nonce_prefix};
 use crate::canonical::sha256;
 use crate::error::CryptoError;
 use crate::hpke::{HpkeEnvelopeV1, HpkePrivateKey, HpkePublicKey, hpke_open_base, hpke_seal_base};
-use crate::key_directory::verify_key_directory;
+use crate::key_directory::{open_key_directory_entry, verify_key_directory};
 use crate::signature::{
     SignatureBytes, SigningKey, VerifyingKey, sign_raw, sign_tbs, verify_raw, verify_tbs,
 };
@@ -126,6 +135,177 @@ impl std::fmt::Debug for PairResponseSealAuthority<'_> {
             .debug_struct("PairResponseSealAuthority")
             .field("authority", &"<redacted>")
             .finish()
+    }
+}
+
+/// PairResponse 验证必须匹配的本地 pending 事实。
+///
+/// 这个值本身不是 verified marker；它只把所有 caller expectations 收拢成一个参数，避免
+/// 调用点漏传轴。Persistent client 必须从已提交的 pending record 构造它，而不是从 response
+/// 自报字段反向填充。
+pub struct PairResponseExpectedV1<'a> {
+    invite: &'a PairInviteV1,
+    request_hash: [u8; 32],
+    device_sign_pubkey: [u8; 32],
+    device_hpke_pubkey: [u8; 32],
+    authorization: &'a AuthorizationRequestV1,
+    now_ms: u64,
+}
+
+impl std::fmt::Debug for PairResponseExpectedV1<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PairResponseExpectedV1([REDACTED])")
+    }
+}
+
+impl<'a> PairResponseExpectedV1<'a> {
+    #[must_use]
+    pub const fn new(
+        invite: &'a PairInviteV1,
+        request_hash: [u8; 32],
+        device_sign_pubkey: [u8; 32],
+        device_hpke_pubkey: [u8; 32],
+        authorization: &'a AuthorizationRequestV1,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            invite,
+            request_hash,
+            device_sign_pubkey,
+            device_hpke_pubkey,
+            authorization,
+            now_ms,
+        }
+    }
+}
+
+/// 已用 pending DeviceHPKE 解封并绑定到 exact key identity 的 directory entry。
+/// 字段私有、不实现 Clone/Serde，raw key 只能通过消费本值取得。
+pub struct OpenedDirectoryKeyV1 {
+    key_id: KeyId,
+    stream_route: Option<StreamRouteId>,
+    key: SecretAeadKey,
+}
+
+impl std::fmt::Debug for OpenedDirectoryKeyV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenedDirectoryKeyV1")
+            .field("key_id", &self.key_id)
+            .field("stream_route", &self.stream_route.map(|_| "[REDACTED]"))
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl OpenedDirectoryKeyV1 {
+    #[must_use]
+    pub const fn key_id(&self) -> KeyId {
+        self.key_id
+    }
+
+    #[must_use]
+    pub const fn stream_route(&self) -> Option<StreamRouteId> {
+        self.stream_route
+    }
+
+    /// 不暴露 raw key 的稳定 nonce-prefix 投影，供调用方建立 counter domain。
+    #[must_use]
+    pub fn derived_nonce_prefix(&self) -> [u8; 4] {
+        derive_nonce_prefix(&self.key)
+    }
+
+    #[must_use]
+    pub fn into_key(self) -> SecretAeadKey {
+        self.key
+    }
+}
+
+/// 完整通过 Root→Data cert、MachineDataSign、DeviceHPKE、grant/authorization、
+/// KeyDirectory 签名与每项 HPKE 解封的 PairResponse。
+///
+/// 字段私有且不实现 Clone/Serialize；后续 paired promotion 必须接受本能力类型，而不能接受
+/// 裸 `PairResponsePlaintextV1`。
+///
+/// ```compile_fail
+/// use agentdeck_crypto::VerifiedPairResponseV1;
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<VerifiedPairResponseV1>();
+/// ```
+pub struct VerifiedPairResponseV1 {
+    canonical_response: Vec<u8>,
+    response_hash: [u8; 32],
+    info: PairResponseInfoV1,
+    machine_root_pubkey: PublicKeyBytes,
+    machine_root_fingerprint: [u8; 32],
+    data_sign_certificate: SignedCertificate,
+    signer: MachineDataSignerBindingV1,
+    relay_grant: RelayGrant,
+    device_authorization: DeviceAuthorizationV1,
+    key_directory: KeyDirectoryV1,
+    opened_keys: Vec<OpenedDirectoryKeyV1>,
+}
+
+impl std::fmt::Debug for VerifiedPairResponseV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("VerifiedPairResponseV1([REDACTED])")
+    }
+}
+
+impl VerifiedPairResponseV1 {
+    #[must_use]
+    pub fn canonical_response(&self) -> &[u8] {
+        &self.canonical_response
+    }
+
+    #[must_use]
+    pub const fn response_hash(&self) -> [u8; 32] {
+        self.response_hash
+    }
+
+    #[must_use]
+    pub const fn info(&self) -> &PairResponseInfoV1 {
+        &self.info
+    }
+
+    #[must_use]
+    pub const fn machine_root_pubkey(&self) -> PublicKeyBytes {
+        self.machine_root_pubkey
+    }
+
+    #[must_use]
+    pub const fn machine_root_fingerprint(&self) -> [u8; 32] {
+        self.machine_root_fingerprint
+    }
+
+    #[must_use]
+    pub const fn data_sign_certificate(&self) -> &SignedCertificate {
+        &self.data_sign_certificate
+    }
+
+    #[must_use]
+    pub const fn signer(&self) -> &MachineDataSignerBindingV1 {
+        &self.signer
+    }
+
+    #[must_use]
+    pub const fn relay_grant(&self) -> &RelayGrant {
+        &self.relay_grant
+    }
+
+    #[must_use]
+    pub const fn device_authorization(&self) -> &DeviceAuthorizationV1 {
+        &self.device_authorization
+    }
+
+    #[must_use]
+    pub const fn key_directory(&self) -> &KeyDirectoryV1 {
+        &self.key_directory
+    }
+
+    #[must_use]
+    pub fn opened_keys(&self) -> &[OpenedDirectoryKeyV1] {
+        &self.opened_keys
     }
 }
 
@@ -336,6 +516,151 @@ pub fn open_pair_response(
     Ok(plaintext)
 }
 
+/// 从 canonical PairResponse 构造不可伪造的完整 verified capability。
+///
+/// 本入口自行解析 embedded info、派生 PairResponse/KeyUpdate context 与 verifier；调用方不能
+/// 通过传入自选 info/context 绕开 pending、证书或 wrapped-key 绑定。
+pub fn open_pair_response_verified(
+    recipient: &HpkePrivateKey,
+    expected: PairResponseExpectedV1<'_>,
+    canonical_response: &[u8],
+) -> Result<VerifiedPairResponseV1, CryptoError> {
+    let response = PairResponseV1::from_canonical_bytes(canonical_response)?;
+    expected.invite.validate(expected.now_ms)?;
+    expected.authorization.validate()?;
+    let invite_hash = expected.invite.canonical_sha256()?;
+    let info = &response.info;
+    if info.relay_server_id != expected.invite.relay_server_id
+        || info.pair_route != expected.invite.pair_route
+        || info.invite_hash != invite_hash
+        || info.expiry_ms != expected.invite.expires_at_ms
+        || info.request_hash != expected.request_hash
+    {
+        return Err(invalid_verified_response(
+            "pending PairResponse info binding",
+        ));
+    }
+
+    if recipient.public_key().to_bytes() != expected.device_hpke_pubkey {
+        return Err(CryptoError::InvalidKey(
+            "pending DeviceHPKE private/public key mismatch",
+        ));
+    }
+    VerifyingKey::from_bytes(&expected.device_sign_pubkey)
+        .map_err(|_| CryptoError::InvalidKey("pending DeviceSign public key"))?;
+    HpkePublicKey::from_bytes(&expected.device_hpke_pubkey)
+        .map_err(|_| CryptoError::InvalidKey("pending DeviceHPKE public key"))?;
+
+    let root_verifying_key = VerifyingKey::from_bytes(&expected.invite.machine_root_pubkey.0)
+        .map_err(|_| CryptoError::InvalidKey("MachineRoot public key"))?;
+    if signer_fingerprint(&root_verifying_key) != expected.invite.machine_root_fingerprint {
+        return Err(CryptoError::InvalidKey("MachineRoot fingerprint mismatch"));
+    }
+    let certificate = &expected.invite.data_sign_cert;
+    if certificate.cert_role != CertRole::Data
+        || certificate.generation.value() == 0
+        || certificate.trust_epoch != info.root_trust_epoch
+        || certificate
+            .not_after_ms
+            .is_some_and(|not_after_ms| expected.now_ms >= not_after_ms)
+    {
+        return Err(invalid_verified_response(
+            "MachineDataSign certificate binding",
+        ));
+    }
+    verify_tbs(
+        &root_verifying_key,
+        &certificate.to_be_signed_v1(
+            info.relay_server_id,
+            info.machine_route,
+            expected.invite.machine_root_fingerprint,
+        ),
+        &SignatureBytes::from(certificate.signature),
+    )?;
+
+    let machine_data_verifying_key = VerifyingKey::from_bytes(&certificate.subject_pubkey.0)
+        .map_err(|_| CryptoError::InvalidKey("MachineDataSign public key"))?;
+    let signer = MachineDataSignerBindingV1::from_certificate(certificate)?;
+    let response_context = pair_response_context(info.pair_route);
+    let plaintext = open_pair_response(
+        recipient,
+        info,
+        &response_context,
+        &response,
+        &machine_data_verifying_key,
+        &signer,
+        &root_verifying_key,
+    )?;
+
+    let grant = &plaintext.relay_grant;
+    let authorization = &plaintext.device_authorization;
+    if plaintext.request_hash != expected.request_hash
+        || grant.machine_route != info.machine_route
+        || grant.device_route != info.device_route
+        || grant.grant_serial != info.grant_serial
+        || grant.device_sign_pubkey.0 != expected.device_sign_pubkey
+        || grant.root_key_id != certificate.root_key_id
+        || grant.trust_epoch != certificate.trust_epoch
+        || authorization.device_hpke_pubkey.0 != expected.device_hpke_pubkey
+        || authorization.capabilities != expected.authorization.capabilities
+        || authorization.permissions != expected.authorization.permissions
+    {
+        return Err(invalid_verified_response(
+            "pending grant or authorization binding",
+        ));
+    }
+
+    let mut semantic_slots = HashSet::with_capacity(plaintext.key_directory.entries.len());
+    let mut opened_keys = Vec::with_capacity(plaintext.key_directory.entries.len());
+    for entry in &plaintext.key_directory.entries {
+        if !semantic_slots.insert((entry.key_id.purpose, entry.stream_route)) {
+            return Err(invalid_verified_response(
+                "ambiguous key directory current slot",
+            ));
+        }
+        let entry_info = KeyUpdateInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_server_id: info.relay_server_id,
+            machine_route: info.machine_route,
+            device_route: info.device_route,
+            stream_route: entry.stream_route,
+            grant_serial: info.grant_serial,
+            root_trust_epoch: info.root_trust_epoch,
+            key_directory_revision: plaintext.key_directory.revision,
+            key_purpose: entry.key_id.purpose,
+            key_epoch: entry.key_id.epoch,
+        };
+        let entry_context = key_update_context(&entry_info);
+        let key = open_key_directory_entry(recipient, &entry_info, &entry_context, entry)?;
+        opened_keys.push(OpenedDirectoryKeyV1 {
+            key_id: entry.key_id,
+            stream_route: entry.stream_route,
+            key,
+        });
+    }
+
+    let PairResponsePlaintextV1 {
+        relay_grant,
+        device_authorization,
+        key_directory,
+        ..
+    } = plaintext;
+    Ok(VerifiedPairResponseV1 {
+        canonical_response: canonical_response.to_vec(),
+        response_hash: sha256(canonical_response),
+        info: response.info,
+        machine_root_pubkey: expected.invite.machine_root_pubkey,
+        machine_root_fingerprint: expected.invite.machine_root_fingerprint,
+        data_sign_certificate: certificate.clone(),
+        signer,
+        relay_grant,
+        device_authorization,
+        key_directory,
+        opened_keys,
+    })
+}
+
 /// 只验证 PairResponse 外层 shape、MachineDataSign provenance 与 typed TBS 签名。
 /// 本入口不解密 ciphertext，也不验证密文内 grant / authorization / key directory。
 pub fn verify_pair_response_envelope(
@@ -363,6 +688,44 @@ fn key_directory_context(info: &PairResponseInfoV1) -> KeyDirectorySignatureCont
         grant_serial: info.grant_serial,
         root_trust_epoch: info.root_trust_epoch,
     }
+}
+
+fn pair_response_context(pair_route: agentdeck_protocol::relay_v2::PairRouteId) -> OuterContextV1 {
+    OuterContextV1 {
+        frame_kind: OuterFrameKind::PairResponse,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: None,
+        device_route: None,
+        stream_route: None,
+        request_route: None,
+        pair_route: Some(pair_route),
+        stream_generation: None,
+        stream_cursor: None,
+        stream_seq: None,
+        message_key_epoch: 0,
+    }
+}
+
+fn key_update_context(info: &KeyUpdateInfoV1) -> OuterContextV1 {
+    OuterContextV1 {
+        frame_kind: OuterFrameKind::KeyUpdate,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: Some(info.machine_route),
+        device_route: Some(info.device_route),
+        stream_route: info.stream_route,
+        request_route: None,
+        pair_route: None,
+        stream_generation: None,
+        stream_cursor: None,
+        stream_seq: None,
+        message_key_epoch: info.key_epoch,
+    }
+}
+
+fn invalid_verified_response(field: &'static str) -> CryptoError {
+    CryptoError::InvalidPairing(PairingError::InvalidField(field))
 }
 
 pub fn seal_pair_pending<R: ::hpke::rand_core::CryptoRng>(

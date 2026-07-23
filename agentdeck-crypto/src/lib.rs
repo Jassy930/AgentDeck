@@ -48,11 +48,12 @@ pub use key_update::{
     Ed25519KeyUpdateSigner, Ed25519KeyUpdateVerifier, sign_key_update, verify_key_update,
 };
 pub use pairing::{
-    PairResponseSealAuthority, VerifiedPairRequestV1, open_pair_pending, open_pair_request,
-    open_pair_request_verified, open_pair_response, open_pair_response_received, seal_pair_pending,
-    seal_pair_request, seal_pair_response, seal_pair_response_received, sign_device_authorization,
-    sign_pair_response_received, verify_device_authorization, verify_pair_request_envelope,
-    verify_pair_response_envelope, verify_pair_response_received,
+    OpenedDirectoryKeyV1, PairResponseExpectedV1, PairResponseSealAuthority, VerifiedPairRequestV1,
+    VerifiedPairResponseV1, open_pair_pending, open_pair_request, open_pair_request_verified,
+    open_pair_response, open_pair_response_received, open_pair_response_verified,
+    seal_pair_pending, seal_pair_request, seal_pair_response, seal_pair_response_received,
+    sign_device_authorization, sign_pair_response_received, verify_device_authorization,
+    verify_pair_request_envelope, verify_pair_response_envelope, verify_pair_response_received,
 };
 pub use sealed_blob::{sign_sealed, verify_sealed};
 pub use signature::{

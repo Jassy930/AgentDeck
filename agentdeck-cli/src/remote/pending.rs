@@ -2,14 +2,15 @@
 //!
 //! 首次允许网络发送前，本层先以独立 Keychain item 冻结 DeviceSign seed、DeviceHPKE
 //! private key 与完整 `enc+ciphertext+proof`。record 是这组三项的 commit marker；marker
-//! 已存在时任一 private item 缺失均 fail-close，不会生成替代身份。PairResponse 验证与
-//! paired promotion 属后续子片，不在这里提前实现。
+//! 已存在时任一 private item 缺失均 fail-close，不会生成替代身份。PairResponse 只从该
+//! marker 只读建立 verified capability；paired promotion 属后续子片，不在这里提前实现。
 
 use std::fmt;
 
 use agentdeck_crypto::rand_core::CryptoRng;
 use agentdeck_crypto::{
-    CryptoError, HpkePrivateKey, HpkePublicKey, SigningKey, VerifyingKey, seal_pair_request,
+    CryptoError, HpkePrivateKey, HpkePublicKey, PairResponseExpectedV1, SigningKey,
+    VerifiedPairResponseV1, VerifyingKey, open_pair_response_verified, seal_pair_request,
     verify_pair_request_envelope,
 };
 use agentdeck_protocol::e2ee::{
@@ -18,6 +19,7 @@ use agentdeck_protocol::e2ee::{
 };
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::PublicKeyBytes;
+use agentdeck_protocol::relay_v2::id::{DeviceRouteId, MachineRouteId};
 use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use thiserror::Error;
 use uuid::Uuid;
@@ -43,6 +45,8 @@ pub enum PendingPairingError {
     InvalidAuthorization(#[source] PairingError),
     #[error("pending pairing crypto operation failed")]
     Crypto(#[source] CryptoError),
+    #[error("pair response verification failed")]
+    InvalidResponse(#[source] CryptoError),
     #[error("pending pairing persistence failed")]
     Persistence(#[source] RemoteKeyStoreError),
     #[error("pending pairing entropy source is unavailable")]
@@ -62,12 +66,62 @@ impl PendingPairingError {
             Self::InvalidInvite(_) => "remote.pairing.invite_invalid",
             Self::InvalidAuthorization(_) => "remote.pairing.authorization_invalid",
             Self::Crypto(_) => "remote.pairing.crypto_failed",
+            Self::InvalidResponse(_) => "remote.pairing.response_invalid",
             Self::Persistence(_) => "remote.pairing.pending_persistence_failed",
             Self::EntropyUnavailable => "remote.pairing.entropy_unavailable",
             Self::InvalidRecord => "remote.pairing.pending_invalid",
             Self::IncompleteState => "remote.pairing.pending_incomplete",
             Self::ImmutableConflict => "remote.pairing.pending_conflict",
         }
+    }
+}
+
+/// 已通过完整 crypto chain 且其 expectations 来自 durable pending marker 的 response。
+///
+/// 字段私有、不实现 Clone/Serde；后续 paired promotion 只能接受本类型，不能接受裸
+/// `PairResponsePlaintextV1` 或仅 crypto 层自组 expectations 得到的值。
+///
+/// ```compile_fail
+/// use agentdeck_cli::remote::pending::VerifiedPendingPairResponse;
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<VerifiedPendingPairResponse>();
+/// ```
+///
+/// ```compile_fail
+/// use agentdeck_cli::remote::pending::VerifiedPendingPairResponse;
+/// fn bypass(value: VerifiedPendingPairResponse) {
+///     let _ = value.verified;
+/// }
+/// ```
+pub struct VerifiedPendingPairResponse {
+    verified: VerifiedPairResponseV1,
+}
+
+impl fmt::Debug for VerifiedPendingPairResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedPendingPairResponse([REDACTED])")
+    }
+}
+
+impl VerifiedPendingPairResponse {
+    #[must_use]
+    pub const fn response_hash(&self) -> [u8; 32] {
+        self.verified.response_hash()
+    }
+
+    #[must_use]
+    pub const fn machine_route(&self) -> MachineRouteId {
+        self.verified.info().machine_route
+    }
+
+    #[must_use]
+    pub const fn device_route(&self) -> DeviceRouteId {
+        self.verified.info().device_route
+    }
+
+    #[must_use]
+    pub fn opened_key_count(&self) -> usize {
+        self.verified.opened_keys().len()
     }
 }
 
@@ -270,6 +324,57 @@ impl<'a> PendingPairingCoordinator<'a> {
             }
             Err(error) => Err(PendingPairingError::Persistence(error)),
         }
+    }
+
+    /// 只读加载已提交 pending transaction，并验证完整 PairResponse crypto chain。
+    ///
+    /// 本入口不调用 RNG、不生成或修复任何 key/record；marker 或 private item 缺失时直接
+    /// fail-close。后续 paired promotion 只能消费返回的 [`VerifiedPendingPairResponse`]。
+    pub fn verify_response(
+        &self,
+        invite: &PairInviteV1,
+        authorization: &AuthorizationRequestV1,
+        now_ms: u64,
+        canonical_response: &[u8],
+    ) -> Result<VerifiedPendingPairResponse, PendingPairingError> {
+        invite
+            .validate(now_ms)
+            .map_err(PendingPairingError::InvalidInvite)?;
+        authorization
+            .validate()
+            .map_err(PendingPairingError::InvalidAuthorization)?;
+        let invite_hash = invite
+            .canonical_sha256()
+            .map_err(PendingPairingError::InvalidInvite)?;
+        let accounts = PendingAccounts::new(self.installation_id, invite_hash);
+        let record = self
+            .store
+            .load(&accounts.record)
+            .map_err(PendingPairingError::Persistence)?
+            .ok_or(PendingPairingError::IncompleteState)?;
+        let (device_sign, device_hpke) = self.load_committed_keys(&accounts)?;
+        let prepared = validate_record(
+            record.expose_secret(),
+            invite,
+            authorization,
+            &device_sign,
+            &device_hpke,
+        )?;
+        let recipient = hpke_key_from_secret(&device_hpke)?;
+        let verified = open_pair_response_verified(
+            &recipient,
+            PairResponseExpectedV1::new(
+                invite,
+                prepared.request_hash(),
+                prepared.device_sign_public_key(),
+                prepared.device_hpke_public_key(),
+                authorization,
+                now_ms,
+            ),
+            canonical_response,
+        )
+        .map_err(PendingPairingError::InvalidResponse)?;
+        Ok(VerifiedPendingPairResponse { verified })
     }
 
     fn load_committed_keys(
