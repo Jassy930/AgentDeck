@@ -1075,7 +1075,8 @@ ignored/BLOCKED；P3.7 exec gate 主体、边界裁决、两个 prepare finding 
 `c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；P3.8 production UDS 与后续
 P3.9 shared-daemon client 与 P3.10 LaunchAgent Task 已完成；P3.10 code/test commit 为 `19622ab`，
 后续 Phase hardening code baseline 为 `9efb28d`，P3 automatic scope 已完成 6/6 Phase Exit；P4
-已由 P4.1–P4.4 推进到 4/7，下一项是 P4.5 signed publication/counter recovery；E2EE/Relay Publish 仍未完成。
+已由 P4.1–P4.5 推进到 5/7，current Runtime wire 保持 v4、physical schema 为 v14/35 表，下一项是
+P4.6 persistent remote CLI。当前 verifier 仍只接受 `p0|p2|p3`，不宣称 P4 Phase PASS。
 
 ### Task P3.6-A：先冻结 Runtime/E2EE contract 与跨语言 wire
 
@@ -2468,7 +2469,7 @@ P3.9 固定以下迁移边界：
   真实 Codex/CC login 与 provisioned signed Keychain 继续是 post-MVP BLOCKED 槽位，不冒充本 Task 证据。
   P3.9 至此完成；P3.10 已由 `19622ab` 完成 Task 收口并通过完整 verifier 与双路 Task 终审；后续
   Phase review hardening 已由 `773a2b3` / `0057824` / `81cc314` / `9efb28d` 收口，P3 automatic scope
-  已完成 6/6 Phase Exit。后续 P4.1–P4.4 已完成，P4 当前为 4/7，下一项是 P4.5。
+  已完成 6/6 Phase Exit。后续 P4.1–P4.5 已完成，P4 当前为 5/7，下一项是 P4.6。
 
 ### Task P3.10：实现 LaunchAgent 安装、versioned upgrade 与保留数据的 uninstall
 
@@ -2478,8 +2479,8 @@ P3.9 固定以下迁移边界：
 > code/test，并由 `19622ab` scoped commit。冻结 candidate 的完整
 > `bash scripts/verify-relay-companion-mvp.sh p3` 已 exit 0，两路 Task review 均 Approved、无 P0/P1/P2；
 > 隔离 ephemeral UDS 已完成 install→stage→ACK→idle→手动 current restart→Hello；后续 Phase review
-> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。后续 P4.1–P4.4 已完成，P4 当前为
-> 4/7，下一项是 P4.5。
+> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。后续 P4.1–P4.5 已完成，P4 当前为
+> 5/7，下一项是 P4.6。
 
 **前置冻结：** local-only typed `StageUpgrade` request/reply、授权与错误语义已纳入 P3.9-C0-A 的 Runtime
 v2 contract；P3.9 的历史基线固定返回 typed feature-unavailable，P3.10 implementation 已用 durable/flush-ACK
@@ -2558,18 +2559,20 @@ focused tests + scoped Clippy/fmt，不做子片级双路终审、全量慢门�
 - [x] 四 schema、daemon network boundary、agent docs、local smoke、diagnostics 与 scoped diff/status 全绿；
   冻结 candidate 的两路 phase code review 均为 P0/P1/P2=0。
 - [x] P3 标记为 `complete (automatic scope)`；provisioned production-signed LaunchAgent/Keychain
-  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。后续 P4.1–P4.4 已完成，P4 当前为 4/7，
-  下一项是 P4.5。
+  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。后续 P4.1–P4.5 已完成，P4 当前为 5/7，
+  下一项是 P4.6。
 
 ---
 
 ## Phase P4：Machine identity、Pairing 与 RemoteLink
 
-> **当前状态（2026-07-22）：4/7 Task 完成。** P4.1 machine identity/guard、P4.2
+> **当前状态（2026-07-23）：5/7 Task 完成。** P4.1 machine identity/guard、P4.2
 > certificate/enrollment/control-only RemoteTransport/trust reset、P4.3 PairInvite/DeviceGrant/auth ledger 与
 > P4.4 MachineLink ingress/RuntimeCore dispatch automatic scope 已完成 Task 级完整门禁与双路 Approved；
-> 下一项是 P4.5 signed publication/counter recovery。P4.5–P4.7 与 P4 Phase Exit 仍未完成，其 checkbox
-> 保持未勾。此前 0/7、1/7、2/7、3/7 分别是 P4.1/P4.2/P4.3/P4.4 开始前的历史基线。
+> P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成并通过同一冻结候选上的双路终审。
+> current Runtime wire 保持 v4，physical schema 为 v14/35 表。下一项是 P4.6 persistent remote CLI；
+> P4.6–P4.7 与 P4 Phase Exit 仍未完成，其 checkbox 保持未勾。此前 0/7、1/7、2/7、3/7、4/7
+> 分别是 P4.1/P4.2/P4.3/P4.4/P4.5 开始前的历史基线。
 
 ### Task P4.1：扩展 macOS Keychain 为 Machine identity 与 CounterGuard（零 cert/enrollment/RemoteLink）
 
@@ -2807,7 +2810,8 @@ production-signed Keychain 槽位；继续精确记为 post-MVP BLOCKED，不计
 > **状态：Task complete。** 主体 code/test commit 为 `518380e`，后续 ownership/recovery hardening 为
 > `b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`，Runtime v4 gate repair 为 `fe3a9ad`，最终
 > shutdown/startup/local-recovery hardening 与 v10 inventory/ledger/cipher fixture gate 为 `3b4b977`。current Runtime
-> protocol 为 v4，physical schema 为 v10/30 表；后续 P4.4 已由 `cd7d9fb` 完成，下一项为 P4.5。
+> protocol 为 v4，physical schema 为 v10/30 表；后续 P4.4 与 P4.5 已完成，current Runtime wire 仍为
+> v4、physical schema 已推进至 v14/35 表，下一项为 P4.6。
 
 **Files:**
 - Create: `agentdeckd/src/remote/{pairing,grants,access,key_directory}.rs`
@@ -2867,8 +2871,8 @@ crypto/tamper/schema/network/fmt/diff gates 全绿。最终 `4fd8ed8..3b4b977` �
 
 > **状态：Task complete。** code/test commit 为 `cd7d9fb`。本 Task 完成唯一 MachineLink business
 > lane、完整 ingress 验证、local auth-ledger exact recheck、`RemotePrincipal` 与 `RuntimeCore` dispatch；
-> Runtime protocol 保持 v4，physical schema 保持 v10/30 表。P4.5 的 directed sealer 与 stream publisher
-> 尚未安装，production admission 保持关闭并 fail-close。
+> Runtime protocol 保持 v4，physical schema 保持 v10/30 表。在 P4.4 收口时，P4.5 的 directed sealer 与
+> stream publisher 尚未安装，production admission 保持关闭并 fail-close；后续 P4.5 已完成该接线与恢复门禁。
 
 **Files:**
 - Create: `agentdeckd/src/remote/{link,dispatch}.rs`
@@ -2914,13 +2918,18 @@ RemotePrincipal → RuntimeCore 是唯一 ingress；RemoteLink 只拥有 transpo
 不裁决 canonical 业务状态。P4.4 只预留 `DirectedReplySealer` / `RemoteStreamPublisher` 接缝，production
 `admission_ready=false`；不预留 counter、不 seal、不写 durable publication outbox。独立 `spec/security`
 与 `quality` 终审均为 P0/P1/P2=0、Approved。counter reservation、durable publication outbox、Relay
-Publish、persistent remote CLI 与 production-signed PASS 均仍属于 P4.5/P4.6 或 post-MVP gate。
+Publish、persistent remote CLI 与 production-signed PASS 在 P4.4 收口时分别属于 P4.5/P4.6 或 post-MVP
+gate；后续 P4.5 已完成 signed publication/counter recovery，persistent remote CLI 仍属于 P4.6。
 
 **Task 实际范围与刹车线：** `cd7d9fb` 精确覆盖 35 个 code/test 路径，未修改
 Cargo manifest、lockfile 或 network-boundary 脚本。最大 production 子片为 `remote/link.rs`
 1,038 additions，低于 1,800 行预拆线；测试、fixture 与文档不计 production 拆片线。
 
 ### Task P4.5：实现 key directory、MachineDataSign、publish/replay 与 counter crash recovery
+
+> **状态：Task complete。** code/test commits 为 `c6ef387`、`88b3c42`。current Runtime wire 保持 v4，
+> physical schema 为 v14/35 表；P4.5 只收口 signed publication/counter recovery，不包含 P4.6 persistent
+> remote CLI，也不改变 P3.1 方案 b 或任何 production signing/物理设备/公网 post-MVP BLOCKED 槽位。
 
 **Files:**
 - Create: `agentdeckd/src/remote/{counter,publisher,replay}.rs`
@@ -2930,12 +2939,19 @@ Cargo manifest、lockfile 或 network-boundary 脚本。最大 production 子片
 - Modify: `agentdeckd/src/runtime/store/{schema,sqlite,journal,worker,mod}.rs`
 - Modify: `agentdeckd/src/remote/{dispatch,link}.rs`
 
-- [ ] Step 1: 写crypto/replay/publication tests。 CatalogKey/ConversationDEK/DeviceCommandTxKey/DeviceReplyTxKey方向；MachineDataSign来源；新增/撤销设备轮换catalog与active conversation epoch，新设备拿不到旧epoch且从barrier定向snapshot接续；EpochBarrier绑定generation/outer cursor/tagged inner cursor/key revision，且只使用Relay-committed outer+inner对应cut；unknown higher revision 3次/30s KeySync；lower revision隔离；CounterGuard先于DB、DB备份rollback、nonce reuse、4,096 window、retired key 24h+1h。 对catalog/event/barrier分别注入四个publish边界，重启只允许逐字节重发冻结blob。
-- [ ] Step 2: 运行两套 tests。 Expected: FAIL，publisher/key directory不存在。
-- [ ] Step 3: 实现wrapped key directory、counter allocator、signed sealed publisher、durable publication outbox/ACK与receive replay。 固定顺序为`Keychain guard reserve → seal一次 → Runtime DB冻结exact blob/streamSeq/counter/event range → Relay Publish COMMIT → local ACK`；第一步后失败只跳号，第二步后所有retry复用同一blob。 Backfill/Snapshot用DeviceReplyTxKey定向reply且不进outbox/Relay frames；shared ConversationDEK只用于barrier后publish。
-- [ ] Step 4: 重跑tests并替换Runtime DB为旧备份。 Expected: publication crash gap无事件永久缺口、无同seq不同blob；自动退休旧epoch并rekey，无法协调时remote fail-closed，绝不发送旧counter。
-- [ ] Step 5: 运行security sentinel与clippy。
-- [ ] Step 6: 提交。 `git add agentdeckd && git commit -m "feat(remote): 加入签名事件流与 crash-safe counter"`
+- [x] Step 1: 写crypto/replay/publication tests。 CatalogKey/ConversationDEK/DeviceCommandTxKey/DeviceReplyTxKey方向；MachineDataSign来源；新增/撤销设备轮换catalog与active conversation epoch，新设备拿不到旧epoch且从barrier定向snapshot接续；EpochBarrier绑定generation/outer cursor/tagged inner cursor/key revision，且只使用Relay-committed outer+inner对应cut；unknown higher revision 3次/30s KeySync；lower revision隔离；CounterGuard先于DB、DB备份rollback、nonce reuse、4,096 window、retired key 24h+1h。 对catalog/event/barrier分别注入四个publish边界，重启只允许逐字节重发冻结blob。
+- [x] Step 2: 运行两套 tests。 Expected: FAIL，publisher/key directory不存在。
+- [x] Step 3: 实现wrapped key directory、counter allocator、signed sealed publisher、durable publication outbox/ACK与receive replay。 固定顺序为`Keychain guard reserve → seal一次 → Runtime DB冻结exact blob/streamSeq/counter/event range → Relay Publish COMMIT → local ACK`；第一步后失败只跳号，第二步后所有retry复用同一blob。 Backfill/Snapshot用DeviceReplyTxKey定向reply且不进outbox/Relay frames；shared ConversationDEK只用于barrier后publish。
+- [x] Step 4: 重跑tests并替换Runtime DB为旧备份。 Expected: publication crash gap无事件永久缺口、无同seq不同blob；自动退休旧epoch并rekey，无法协调时remote fail-closed，绝不发送旧counter。
+- [x] Step 5: 运行security sentinel与clippy。
+- [x] Step 6: code/test 已由 `c6ef387`、`88b3c42` 精确提交；未使用 `git add -A`，未加入 co-author。
+
+**Task 收口证据：** 完整 daemon lib `1579 passed / 3 gated ignored`，main `7/7`，integration 与
+doc-test 零失败；`runtime_store_boundaries` `5/5`（256 MiB，282.85 秒），Clippy、fmt、diff 全绿。
+`spec/security` 与 `quality` 双路终审使用同一冻结 hash
+`88ac6c486a7446b5fe4613388f66ee25561a7529a2fd0f8904844217730a896f`，P0/P1/P2=0。
+当前 `scripts/verify-relay-companion-mvp.sh` 仍只接受 `p0|p2|p3`；本 Task 不声称 `p4`、`p4-auto`
+或 P4 Phase PASS。P3.1 方案 b 与 production signing/物理设备/公网 post-MVP BLOCKED 保持不变。
 
 ### Task P4.6：实现 macOS persistent remote CLI Keychain 与真实 daemon receipts
 

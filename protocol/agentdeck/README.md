@@ -19,6 +19,9 @@ local-only administration。current Rust/Swift fixture 是 `runtime-v4-wire.json
 contract gate。Runtime 版本提升不联动 local IPC v2、Relay v2 或 E2EE v1。
 P4.4 只在 Runtime v4 / Relay v2 / E2EE v1 上增加严格 decode、ingress 验证与 Core dispatch 接线；
 四条 schema 与版本常量均未变化。
+P4.5 在 E2EE v1 内 additive 扩展 key-control/publication contract 与 schema snapshot；Runtime v4、
+Relay v2、E2EE v1 的版本常量均不 bump。四个 wire 版本轴仍彼此独立，physical schema v14 只是
+daemon Runtime DB 的存储版本，不等于 Runtime wire 升版。
 
 四个 `agentdeck protocol <op>` 子命令（连同 `protocol version`）都是纯本地
 计算：它们直接调用上表对应的聚合 schema 函数并原样打印，**不 spawn

@@ -207,7 +207,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P4 已完成 4/7，下一项 P4.5）
+## Relay Companion MVP 实施状态（P4 已完成 5/7，下一项 P4.6）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -242,7 +242,7 @@ post-MVP `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`；verifier exi
 provisioned signed LaunchAgent/Keychain roundtrip 不阻塞 P3 complete，但 stable production signing 仍未完成。
 
 P4.1 收口时完成 1/7。P4.1 由 `3cd76d2`、`644712c`、`95090c1`、`85df3d2`、`f137112`、`46c6bb8`
-完成 code/test 收口：current Runtime physical schema 从 v7 单调升级到 v8，fresh v8 精确为 24 表；新增
+完成 code/test 收口：当时 Runtime physical schema 从 v7 单调升级到 v8，fresh v8 精确为 24 表；新增
 authenticated singleton `machine_identity_state` 与进入 Runtime ledger 的
 `runtime_meta.machine_identity_count`。daemon 持久化并逐项读回 MachineRoot、MachineHPKE、
 MachineLinkSign、MachineDataSign 四组 key material，按
@@ -257,7 +257,7 @@ enrollment workflow、零 enrollment receipt IO、零 RemoteLink；通用 Counte
 key/DB counter reservation，也尚未闭环整库 artifact 消失或自洽历史回滚。P3.1 provisioned signed
 Keychain roundtrip 继续是 post-MVP BLOCKED，不计 PASS。
 
-P4.2 code/test 由 `a6842bc` 收口。current Runtime protocol 从 v2 additive 升为 v3，Runtime
+P4.2 code/test 由 `a6842bc` 收口。该 Task 当时把 Runtime protocol 从 v2 additive 升为 v3，Runtime
 physical schema 从 v8/24 表 additive 升为 v9/25 表；新增 authenticated singleton
 `machine_remote_state`、root-signed MachineLinkSign/MachineDataSign cert、durable enrollment/receipt、
 same-UID local-only machine administration 与一条 **control-only** authenticated MachineLink transport。
@@ -271,7 +271,7 @@ bootout/PID+UDS absent 与 retained finalizer 删除，StorageKEK 最后删除�
 
 P4.3 code/test 主体由 `518380e` 完成，`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f` 依次收紧
 transport/pairing 所有权、drain/recovery、trust-reset singleflight、canceled waiter 与 pairing→retirement
-handoff；`fe3a9ad` 只修复 Runtime v4 后遗漏的 Rust/Swift 门禁预期。current Runtime protocol 为 v4，
+handoff；`fe3a9ad` 只修复 Runtime v4 后遗漏的 Rust/Swift 门禁预期。该 Task 收口时 Runtime protocol 为 v4，
 physical schema 为 v10/30 表；新增 durable PairInvite/PairRequest/PairPending/DeviceGrant/DeviceAuthorization/
 KeyDirectory、本机 auth ledger、revoke 与 close outbox。`PairResponse.info` 同时绑定 canonical response hash、
 HPKE info、MachineDataSign TBS 与 receipt TBS；邀请使用 298 秒 TTL，为 Relay 300 秒硬上限保留 2 秒调度余量。
@@ -289,11 +289,15 @@ generation/replay/connection/reply-route，不持有 canonical conversation、co
 recovery 完成前 RemoteLink 不启动：Active 可恢复，Inactive 在 actor install 前终止，Unprovable/legacy
 只把对应 conversation 保持只读，健康 sibling 继续服务。
 
-P4 当前完成 4/7，下一项 P4.5 signed publication/counter recovery。P4.5 的 directed sealer 与 stream
-publisher 尚未安装，production `admission_ready=false` 并 fail-close；本 Task 不证明 CounterGuard active
-reservation、MachineDataSign sealing、durable publication outbox、Relay Publish/ACK、持久远程 CLI、
-Companion E2E 或 production-signed LaunchAgent/Keychain。通用 CounterGuard 仍未建立 active symmetric
-key/DB counter reservation 或整库历史回滚闭环。
+P4.5 code/test 由 `c6ef387`、`88b3c42` 收口。Runtime wire 保持 v4，physical schema 已推进到
+v14/35 表。signed publication 顺序固定为 `CounterGuard reserve → seal once → Runtime DB 冻结 exact blob →
+Relay Publish COMMIT → local ACK`；retry、COMMIT outcome unknown 与 daemon restart 都只复用同一 frozen blob。
+链路离线时 publication park，只有 authenticated reconnect 才恢复 exact work；counter recovery、publication
+recovery 与 transition recovery 全部通过后才开启 production admission。
+
+P4 当前完成 5/7，下一项 P4.6 persistent remote CLI。persistent remote CLI 与 iOS 真实链路仍未完成；
+当前 verifier 不支持 `p4`，不得把 focused/Task 门禁写成 P4 aggregate verifier PASS。P3.1 继续采用方案 b，
+production signing、物理设备与公网证据继续保持 post-MVP BLOCKED。
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -585,8 +589,9 @@ P3.9 至此完成。P3.10 已由 `19622ab` 完成当时的 schema v7、durable a
 schema 推进到 v8/24 表并建立 machine identity、key-directory guard 与通用 CounterGuard IO；P4.2 又以
 `a6842bc` 推进到 v9/25 表并建立 certificate、enrollment、receipt、control-only
 RemoteTransport 与 trust reset；P4.3 再推进到 v10/30 表并建立 pairing/auth ledger/revoke/control handoff；
-P4.4 在不改变 Runtime v4/schema v10/30 表的前提下接入 business ingress/Core dispatch。active key/DB counter
-reservation、signed-sealed publication 与真实 vendor metadata mutation 仍未完成，下一项是 P4.5。
+P4.4 在不改变 Runtime v4/schema v10/30 表的前提下接入 business ingress/Core dispatch；P4.5 随后以
+`c6ef387`、`88b3c42` 接通 signed-sealed publication/counter/transition recovery，并把 physical schema
+推进到 v14/35 表。下一项是 P4.6 persistent remote CLI；真实 vendor metadata mutation 与 iOS 真链路仍未完成。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -650,7 +655,7 @@ authenticated audit，不承诺物理删除历史 audit row。独立 ReadPool �
 `mode=ro/query_only=ON` WAL connection，整个池保留页内存 128 MiB，单页 64 rows/8 MiB；
 短事务复制完成后才把页交给 reply pump。
 
-当前 production physical schema 已由 C0-C 单调推进到 v6/22 表。v5 先新增
+P3.6 收口后的 production physical schema 曾由 C0-C 单调推进到 v6/22 表。v5 先新增
 `conversation_state`、`configuration_journal`、`command_configuration_pins` 与
 `metadata_mutation_ledger` 四张 authenticated sidecar；v6 再新增 authenticated
 `native_projection_state` 与 `native_metadata_effect_fences`，并增加 projection present/tombstone/retired/
@@ -765,10 +770,9 @@ execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 
 Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/test 提交分别为 `b818f81` / `d68cc02`。
 普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS。P3.10 LaunchAgent
 安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；基于 `9efb28d` 的独立 P3 Phase
-Exit 已完成；P4.1–P4.4 code/test 与 Task 门禁已收口，P4–P6 当前为 4/7、0/9、0/4。P3.1 provisioned signed Keychain roundtrip 继续是 post-MVP
+Exit 已完成；P4.1–P4.5 code/test 与 Task 门禁已收口，P4–P6 当前为 5/7、0/9、0/4。P3.1 provisioned signed Keychain roundtrip 继续是 post-MVP
 BLOCKED 槽位，不阻塞 P3 automatic closeout；P5/P6 物理设备/公网/Linux 证据也是 post-MVP，不冒充
-PASS。下一项 P4.5 接通 signed-sealed publication/counter recovery；P4.4 ingress/Core PASS 不冒充
-publication 或 persistent remote CLI PASS。
+PASS。下一项 P4.6 persistent remote CLI；P4.5 publication PASS 不冒充 remote CLI 或 iOS 真链路 PASS。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）

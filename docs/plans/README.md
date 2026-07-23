@@ -82,13 +82,14 @@ candidate/AEAD、Store exact-current auth-ledger recheck 后才把 `RuntimeReque
 可恢复、Inactive 在 actor install 前终止、Unprovable/legacy 只隔离对应 conversation。
 `RemoteLink` 只持易失 generation/replay/connection/reply-route，不持 canonical 业务状态。最大 production
 子片 `link.rs` 为 1,038 additions，低于 1,800 预拆线。
-P4 当前为 4/7，下一项是 P4.5 signed publication/counter recovery。P4.4 只预留
-`DirectedReplySealer` / `RemoteStreamPublisher` 接缝，production `admission_ready=false`；sealer/publisher、
-active symmetric key reservation、DB high-water 绑定、MachineDataSign sealing、durable publication outbox、
-Relay Publish/ACK、持久远程 CLI、Companion E2E 与 production-signed Keychain/LaunchAgent 均未完成。
-P5 Simulator 自动 E2E 与 P6 本机第二客户端 synthetic DoD 仍未完成；物理 iPhone/第二台 Mac 是
-post-MVP BLOCKED 槽位。不能因 ingress tests、fake publication、store tests 或 Simulator fixture 改写
-尚未实现的自动链路状态。
+P4.5 code/test `c6ef387`、`88b3c42` 已收口 MachineDataSign signed publication、counter/replay/key
+transition crash recovery 与 production sealer/publisher 接线；current Runtime wire 保持 v4，physical schema
+为 v14/35 表。完整 daemon lib `1579 passed / 3 gated ignored`、main `7/7`，integration/doc-test 零失败，
+`runtime_store_boundaries` `5/5`（256 MiB，282.85 秒），Clippy/fmt/diff 全绿；双路终审在同一冻结 hash
+`88ac6c486a7446b5fe4613388f66ee25561a7529a2fd0f8904844217730a896f` 上 P0/P1/P2=0。
+P4 当前为 5/7，下一项是 P4.6 persistent remote CLI。当前 verifier 只接受 `p0|p2|p3`，不宣称
+`p4`、`p4-auto` 或 P4 Phase PASS。Companion E2E 仍未完成；P3.1 方案 b、production-signed
+Keychain/LaunchAgent、物理 iPhone/第二台 Mac 与公网证据继续作为 post-MVP BLOCKED 槽位。
 
 ```text
 docs/plans/

@@ -6,8 +6,9 @@ binary 已在 P2.9 原子切换为仅 Relay v2；P2.10 又以真实 Direct TLS/S
 `a6842bc` 完成 Runtime v3、schema v9、certificate、durable enrollment/receipt、
 control-only RemoteTransport、两条 trust reset 与安全 uninstall purge；P4.3 又由 `518380e`、`b28f995`、
 `55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成 Runtime v4、schema v10、本机确认 pairing、DeviceGrant/
-DeviceAuthorization/KeyDirectory、auth ledger 与 revoke。业务 RemoteLink、E2EE publication、持久远程 CLI
-和 iOS 自动链路仍属于后续 Task。因此本页不是“公网 Companion 已上线”
+DeviceAuthorization/KeyDirectory、auth ledger 与 revoke；P4.4 `cd7d9fb` 接通业务 ingress/Core，P4.5
+`c6ef387`、`88b3c42` 又完成 signed publication/counter recovery，并把 current physical schema 推进到
+v14/35 表。持久远程 CLI 和 iOS 真实链路仍属于后续 Task。因此本页不是“公网 Companion 已上线”
 或 production-signed LaunchAgent/Keychain 已 PASS 的证明。
 
 ## 部署不变量
@@ -98,17 +99,19 @@ enroll 在发送 code、MachineRoot 或 Link/Data public material 前完成 CA/h
 business ingress lane。完全相同的 bundle 可用于 exact retry；不同 code/origin/pin/Relay/receipt
 anchor/expiry 会在网络前 conflict。
 
-P4.3 已提供下节 `remote pairing ...` 与 exact `remote revoke` 本机管理面；P4.5–P4.6 尚未完成的持久
+P4.3 已提供下节 `remote pairing ...` 与 exact `remote revoke` 本机管理面；P4.6 尚未完成的持久
 `remote pair/machines/sessions/watch/send/...` 仍返回 `remote.persistent.unsupported`。automatic gate 使用
 injected dev/ephemeral keystore 与 hermetic namespace；真实 production 命令仍要求 provisioned、release-signed
 daemon/CLI 与正确 entitlement，当前槽位保持 post-MVP BLOCKED，不能由 automatic PASS 代替。
 
-P4.4 仅完成 ingress/Core dispatch：Relay v2 outer、DeviceSign/AAD/replay/AEAD 和本机 auth-ledger
+P4.4 完成 ingress/Core dispatch：Relay v2 outer、DeviceSign/AAD/replay/AEAD 和本机 auth-ledger
 exact recheck 全部通过后，才把 `RemotePrincipal` 交给 RuntimeCore。invalid grant/signature/AAD/
 replay 或 local revoke 后的旧 frame 会在 Core 前拒绝；`RouteAccepted` 仍不是 command success。
-当前 P4.5 `DirectedReplySealer` / `RemoteStreamPublisher` 未安装，manager 不领取可用的完整
-business lane，egress 按预期 fail-close。因此没有新增可操作的 persistent remote CLI 或端到端
-业务操作；不得为了调试绕过 admission、伪造 sealed reply/publish 或把 ingress PASS 当作远程 E2E。
+P4.5 已安装 `DirectedReplySealer` / `RemoteStreamPublisher`：顺序固定为 CounterGuard reserve→seal once→
+Runtime DB 冻结 exact blob→Relay Publish COMMIT→local ACK；retry、outcome unknown 与 restart 都只能复用
+同一 frozen blob。离线时 publication park，authenticated reconnect 后再继续；counter/publication/transition
+recovery 未全部通过前 admission 保持关闭。该实现仍未新增可操作的 persistent remote CLI 或 iOS 真链路；
+不得为了调试绕过 admission，也不得把内部 publication PASS 当作远程 E2E。
 
 ## 创建并本机确认 PairInvite
 
@@ -142,7 +145,8 @@ agentdeck remote revoke --device <device-route-id> --grant-serial <serial>
 
 pairing drain 与 retirement 共用唯一 control owner：drain 绝对 deadline 为 10 秒，可被 shutdown 取消；
 失败时保留 durable state并 exact retry。P4.3 本身不提供业务 Runtime dispatch；后续 P4.4 已接入
-严格 ingress/Core，但 persistent remote device CLI 与 iOS 真链路仍未完成，下一项为 P4.5。
+严格 ingress/Core；后续 P4.5 已完成 signed publication/counter recovery，但 persistent remote device CLI
+与 iOS 真链路仍未完成，下一项为 P4.6。
 
 ## 本机 inventory 与 readback
 
@@ -281,6 +285,9 @@ SQLite、Keychain 或签名版本来伪造完成。
 | `daemon.remote.trust_reset.admin_receipt_required` | MachineRoot 已丢失，不能在线签 retirement | 按 root-lost 流程取得 portable signed purge receipt；不得删除本地 locator/key 绕过 |
 | `daemon.remote.trust_reset.root_present_receipt_forbidden` | MachineRoot 尚在却提供 admin receipt | 删除该参数，执行普通 authenticated retirement |
 | `daemon.remote.trust_reset.terminal_timeout` | Relay 未在 10 秒绝对 deadline 内返回 retirement terminal | 保留 exact RetirePending frozen bytes；确认 Relay/链路恢复后重试，shutdown/upgrade 在 manager mutex 外取消等待 |
+| `daemon.remote.transition.progress_pending` | transition 已有唯一 owner，仍在安全推进或等待可重试 Store 结果 | 保留 frozen transition 与 admission fence；不得另起 owner 或服务 ordinary publication |
+| `daemon.remote.transition.reconnect_pending` | transition 需要 authenticated reconnect 才能继续 | 保留 exact frozen blob；恢复认证链路后由同一 owner 继续，禁止 timer 重封 |
+| `remote.transport.publication_offline` | publication 在 Register/Publish 前确认链路离线 | park exact frozen publication；等待 authenticated reconnect，不生成新 blob/counter |
 | 其他 `daemon.remote.trust_reset.*` / `remote.transport.*` | terminal/proof/binding/transport 不一致或 Relay 正在重启 | 保留 exact frozen state并重试同一输入；禁止生成新 route/cert 或猜测 terminal |
 | `daemon.purge.recovery_required` | durable purge intent/marker 存在但尚未安全完成 | 停止 enroll，按同一 install/helper/plan exact retry `daemon uninstall --purge` |
 | `daemon.purge.*` | marker/plan/helper/attestation、PID/UDS、Keychain/KEK 或删除读回失败 | 不手动续删；保留 marker与残余，按 `docs/AGENT_DIAGNOSTICS.md` 的具体 code 恢复同一 plan |
@@ -293,7 +300,7 @@ signature、receipt、terminal 或 request/response bytes 出现在日志中均�
 ```bash
 bash scripts/verify-relay-companion-mvp.sh p2
 
-# P4.2 Task automatic scope（P4 聚合 verifier 到 P4.7 才建立）
+# P4.5 Task automatic scope（P4 聚合 verifier 到 P4.7 才建立）
 cargo test -p agentdeckd --locked -- --test-threads=1
 cargo test -p agentdeck-cli --locked
 cargo test -p agentdeck-relay-client --locked
@@ -308,6 +315,6 @@ bash scripts/check-daemon-network-boundary.sh
 ```
 
 P2 聚合门禁包含 workspace Rust 回归、Relay v2 hardening/security E2E、client、Direct TLS selfcheck、
-daemon network-boundary、四份 schema 快照、文档与运行数据 git-status guard。P4.2 目前使用上面的直接 Task
-矩阵；不得虚构尚未由 P4.7 建立的 `verify-relay-companion-mvp.sh p4`。R0/R1 命令和
+daemon network-boundary、四份 schema 快照、文档与运行数据 git-status guard。P4.5 使用上面的直接 Task
+矩阵；当前 verifier 不支持 `p4`，不得虚构尚未由 P4.7 建立的 `verify-relay-companion-mvp.sh p4` PASS。R0/R1 命令和
 `--bootstrap-secret` 只属于历史记录，不得用于当前部署或验收。

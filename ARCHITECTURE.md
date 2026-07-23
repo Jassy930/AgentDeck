@@ -569,14 +569,15 @@ conversation/key，不能伪造身份连续性。
   DB artifacts → machine keys/guards → StorageKEK last`。每步按 frozen plan/namespace/helper identity 读回并可
   crash-retry；DB/marker 缺失本身不是删除 Keychain 的授权。
 - automatic gate 使用 injected dev/ephemeral keystore、signature verifier 与 hermetic install namespace。P4.4
-  已证明 business ingress/Core dispatch，但仍不证明 signed-sealed E2EE publication、持久远程 CLI、iOS 真实链路或
-  production-signed LaunchAgent/Keychain；provisioned signed 槽位继续 post-MVP BLOCKED。
+  已证明 business ingress/Core dispatch，后续 P4.5 已证明 signed-sealed E2EE publication/counter recovery；
+  持久远程 CLI、iOS 真实链路与 production-signed LaunchAgent/Keychain 仍未完成，provisioned signed 槽位继续
+  post-MVP BLOCKED。
 
 ### Relay Companion MVP P4.3 pairing / authorization ledger 不变量
 
 - P4.3 主体由 `518380e` 提交，`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f` 完成所有权与恢复收紧，
   `fe3a9ad` 对齐 Runtime v4 门禁，`3b4b977` 收口 cancel-safe join、startup shutdown watch、
-  LocalRetry/TransportRetry、health/admission epoch fence 与 v10 inventory gate。current Runtime protocol
+  LocalRetry/TransportRetry、health/admission epoch fence 与 v10 inventory gate。P4.3 收口时 Runtime protocol
   为 v4；physical schema 为 v10/30 表，在 v9
   上新增 `remote_pairings`、`remote_pairing_receipts`、`remote_authorization_ledger`、
   `remote_key_directory`、`remote_control_outbox` 五张 authenticated bounded 表，crypto context 仍为 v1。
@@ -595,9 +596,9 @@ conversation/key，不能伪造身份连续性。
 - owner shutdown 保留 JoinHandle 并复用同一绝对 deadline，超时后 abort + join；startup 等 ready 时由
   manager shutdown watch 抢占。本地恢复每轮固定 `purge_expired_receipts → recover_generation`，绝不触发
   WSS reconnect；health/admission epoch 使 pre-owner 错误稳定 Blocked、暂态自愈清码，并阻止旧命令恢复后执行。
-- P4.3 本身不拥有业务 Runtime dispatch；后续 P4.4 已由 `cd7d9fb` 完成 ingress/Core。P4 当前完成 4/7，
-  下一项 P4.5。E2EE publication/counter reservation、persistent remote CLI 或 iOS 真实链路仍未完成；
-  production-signed 槽位继续 post-MVP BLOCKED。
+- P4.3 本身不拥有业务 Runtime dispatch；后续 P4.4 已由 `cd7d9fb` 完成 ingress/Core，P4.5 又由
+  `c6ef387`、`88b3c42` 完成 E2EE publication/counter recovery。P4 当前完成 5/7，下一项 P4.6；
+  persistent remote CLI 或 iOS 真实链路仍未完成，production-signed 槽位继续 post-MVP BLOCKED。
 
 ### Relay Companion MVP P4.4 MachineLink ingress / RuntimeCore 不变量
 
@@ -611,9 +612,26 @@ conversation/key，不能伪造身份连续性。
   必须丢弃并回收 route。
 - RemoteLink 只在 recovery 完成后启动；`RecoveryBlocked` 保持 conversation-scoped read-only，健康 sibling
   继续服务。shutdown 使用绝对 deadline，超时必须 abort + join，不得 detached actor。
-- P4.4 只预留 `DirectedReplySealer` / `RemoteStreamPublisher` 接缝；真实 MachineDataSign/AEAD sealer、stream
-  publisher、counter reservation 与 durable publication outbox 属 P4.5。它们未安装时 production
-  `admission_ready=false`，不得 ACK、不得发送未 seal reply，也不得把 ingress PASS 写成 publication PASS。
+- P4.4 只预留 `DirectedReplySealer` / `RemoteStreamPublisher` 接缝；在该 Task 收口时，真实
+  MachineDataSign/AEAD sealer、stream publisher、counter reservation 与 durable publication outbox 尚未安装，
+  因而 production `admission_ready=false`。后续安装由 P4.5 独立收口。
+
+### Relay Companion MVP P4.5 signed publication / counter recovery 不变量
+
+- P4.5 code/test 由 `c6ef387`、`88b3c42` 收口；Runtime wire 保持 v4，physical schema 单调推进到
+  v14/35 表。v11 新增 authenticated replay/counter state，v12 新增 CounterGuard manifest、key transition 与
+  key-update outbox，v13/v14 只收紧 publication rollover 与 key-update 容量形态，不旋转 crypto context。
+- publication 唯一合法顺序是 `CounterGuard reserve → seal once → Runtime DB 冻结 exact blob → Relay
+  Publish COMMIT → local ACK`。retry、COMMIT outcome unknown 与 restart 都只能重放同一 frozen blob/hash/counter，
+  禁止重新 seal 或生成新 publication identity。
+- RegisterStream 前真实掉线映射为 `remote.transport.publication_offline` 并 park；不得用 timer 生成新尝试。
+  authenticated reconnect 后只恢复 exact frozen work。`RouteAccepted` 仍不等于 COMMIT 或业务成功。
+- production admission 只有在 CounterGuard/DB reconciliation、publication recovery 与 transition recovery
+  全部通过后才开启。未完成的 transition 分别以 `daemon.remote.transition.progress_pending` 或
+  `daemon.remote.transition.reconnect_pending` 保留唯一 owner，不得绕过 fence 服务普通 publication。
+- P4 当前为 5/7，下一项 P4.6 persistent remote CLI；iOS 真实链路仍未完成。P3.1 方案 b 不变，production
+  signing、物理设备与公网证据继续保持 post-MVP BLOCKED。当前 verifier 不支持 `p4`，不得宣称 P4 aggregate
+  verifier PASS。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 
@@ -689,8 +707,10 @@ conversation/key，不能伪造身份连续性。
 - Runtime DB 的物理 schema 按 phase 单调迁移：P3.2 的 v1 七表、P3.3 的 v2 两张 adapter 私表、
   P3.5 的 v3 `approval_ledger`、P3.6 的 v4 六张 stream 表、P3.9-C0-B1b 的 v5 四张
   authenticated sidecar，以及 C0-C 的 v6 两张 native sidecar，再由 P3.10 v7 增加 machine-wide
-  `admin_commands`，P4.1 v8 增加 authenticated singleton `machine_identity_state`。current v8 精确为
-  24 表；在 v4 的
+  `admin_commands`，P4.1 v8 增加 authenticated singleton `machine_identity_state`，P4.2 v9 增加
+  `machine_remote_state`，P4.3 v10 增加五张 pairing/auth 表，P4.5 v11/v12 再增加五张
+  replay/counter/transition 表，v13/v14 调整既有表的 authenticated physical shape。current v14 精确为
+  35 表；在 v4 的
   `event_stream_index`、`event_retention`、
   `catalog_journal`、`snapshots`、`publication_streams`、`publication_outbox` 上增加
   `conversation_state`、`configuration_journal`、`command_configuration_pins` 与
@@ -975,7 +995,7 @@ conversation/key，不能伪造身份连续性。
   `PayloadTooLarge`，不截断或改写旧 ciphertext。
 - P3.6-C transport-neutral stream/barrier/snapshot/transfer/publication 组件已由 `694f2d9`
   收口；本节描述的是该组件 contract，不表示 P3/P4 或远程 Companion 已完成。
-- schema v4 与 read-only WAL pool 当时由 `02cc640` 落地；当前 physical schema 已由 `3d0002d` 推进 v5，
+- schema v4 与 read-only WAL pool 当时由 `02cc640` 落地；其后 `3d0002d` 曾把 physical schema 推进 v5，
   但以下 stream/read-pool 不变量不变。logical event suffix 每 conversation
   10,000 events/64 MiB、全局 131,072/512 MiB；snapshot 单份 10,000 items/64 MiB、每
   conversation 一个 ready、全局 512 MiB；publication outbox 每 stream 2,000 rows/64 MiB、
@@ -1134,7 +1154,8 @@ daemon main
   -> P3.7 exec-gate / typed driver（普通 GUI、CLI/selfcheck 已由 P3.9-C3/D 接通）
   -> P4.2 RemoteManager → enrollment / control-only RemoteTransport → agentdeck-relay-client
   -> P4.4 RemoteLink ingress / RuntimeCore dispatch → transport-neutral P3.6 component
-  -> P4.5 signed-sealed publication / counter recovery（production owner 待实现）
+  -> P4.5 signed-sealed publication / counter/transition recovery（production owner 已安装）
+  -> P4.6 persistent remote CLI（待实现）
   -> AgentRouter → CodexAdapter / ClaudeCodeAdapter
   -> record / diag
   -> codex app-server child process / claude CLI child process
