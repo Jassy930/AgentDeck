@@ -1,0 +1,1504 @@
+//! PairResponse 验证后的 two-phase paired machine promotion。
+//!
+//! `PairedCommitMarkerV1` 是唯一可见性边界。随机 StorageKEK 必须先以 provisional
+//! Keychain item 持久化，随后才能一次性提交 sealed CryptoState；其余 final items 完成
+//! exact readback 后才最后写 marker。marker 前的 partial state 永远不代表 paired。
+
+#![cfg(unix)]
+
+use std::collections::HashSet;
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use agentdeck_crypto::rand_core::CryptoRng;
+use agentdeck_crypto::{
+    CryptoError, HpkePrivateKey, HpkePublicKey, SignatureBytes, SigningKey, VerifyingKey,
+    open_key_directory_entry, seal_pair_response_received, sha256, verify_device_authorization,
+    verify_key_directory, verify_pair_response_envelope, verify_tbs,
+};
+use agentdeck_protocol::e2ee::{
+    DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1, KeyDirectoryV1,
+    KeyPurpose, KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind,
+    PairResponseReceivedV1, PairResponseV1, PairingControlEnvelopeV1, PairingError,
+};
+use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
+use agentdeck_protocol::relay_v2::auth::{
+    AuthCanonicalError, CertRole, Ed25519Signature, RelayGrant, SignedCertificate,
+};
+use agentdeck_protocol::relay_v2::id::{
+    DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayServerId, TrustEpoch,
+};
+use agentdeck_protocol::runtime::{MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION};
+use thiserror::Error;
+use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
+
+use super::crypto_state::{
+    CryptoStateError, CryptoStateIdentity, CryptoStateSnapshot, DeviceStorageKek,
+    FileCryptoStateStore, MAX_CRYPTO_STATE_PLAINTEXT_LEN,
+};
+use super::device_lock::{RemoteDeviceLease, RemoteDeviceLockError, RemoteDeviceLockKey};
+use super::keychain::{
+    PairedRemoteKeyPurpose, PendingRemoteKeyPurpose, RemoteKeyAccount, RemoteKeyStore,
+    RemoteKeyStoreError, RemoteSecret,
+};
+use super::pending::{PendingInvitePublicProjection, VerifiedPendingPairResponse};
+
+const STATE_MAGIC: &[u8; 4] = b"ADPS";
+const STATE_VERSION: u16 = 1;
+const STATE_HEADER_LEN: usize = 12;
+const MAX_STATE_FIELD_LEN: usize = 8 * 1024 * 1024;
+const MAX_STATE_STRING_LEN: usize = 8 * 1024;
+
+const MARKER_MAGIC: &[u8; 4] = b"ADPM";
+const MARKER_VERSION: u16 = 1;
+const KEK_MAGIC: &[u8; 4] = b"ADKK";
+const KEK_VERSION: u16 = 1;
+const COUNTER_GUARD_MAGIC: &[u8; 4] = b"ADCG";
+const COUNTER_GUARD_VERSION: u16 = 1;
+const PROMOTION_ID_DOMAIN: &[u8] = b"AgentDeck/PairedPromotionIdV1\0";
+
+#[derive(Debug, Error)]
+pub enum PairedPromotionError {
+    #[error("paired promotion could not acquire the remote device lease")]
+    DeviceLock(#[source] RemoteDeviceLockError),
+    #[error("paired promotion persistence failed")]
+    Persistence(#[source] RemoteKeyStoreError),
+    #[error("paired promotion sealed state failed")]
+    CryptoState(#[source] CryptoStateError),
+    #[error("paired promotion cryptographic validation failed")]
+    Crypto(#[source] CryptoError),
+    #[error("paired promotion canonical state is invalid")]
+    Protocol(#[source] PairingError),
+    #[error("paired promotion auth credential is invalid")]
+    AuthCanonical(#[source] AuthCanonicalError),
+    #[error("paired promotion entropy source is unavailable")]
+    EntropyUnavailable,
+    #[error("paired promotion is incomplete or corrupt")]
+    Incomplete,
+    #[error("paired promotion conflicts with durable state")]
+    Conflict,
+    #[error("paired promotion state has an invalid canonical encoding")]
+    InvalidState,
+}
+
+impl PairedPromotionError {
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::DeviceLock(error) => error.code(),
+            Self::Persistence(_) => "remote.pairing.paired_persistence_failed",
+            Self::CryptoState(error) => error.code(),
+            Self::Crypto(_) | Self::Protocol(_) | Self::AuthCanonical(_) | Self::InvalidState => {
+                "remote.pairing.paired_invalid"
+            }
+            Self::EntropyUnavailable => "remote.pairing.entropy_unavailable",
+            Self::Incomplete => "remote.pairing.paired_incomplete",
+            Self::Conflict => "remote.pairing.paired_conflict",
+        }
+    }
+}
+
+/// marker exact readback 后才可返回给 transport 的 frozen receipt outbox。
+pub struct PromotedPairedMachine {
+    state_path: PathBuf,
+    canonical_receipt_carrier: Vec<u8>,
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+    request_hash: [u8; 32],
+    grant_hash: [u8; 32],
+    response_hash: [u8; 32],
+    already_committed: bool,
+}
+
+impl fmt::Debug for PromotedPairedMachine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PromotedPairedMachine([REDACTED])")
+    }
+}
+
+impl PromotedPairedMachine {
+    #[must_use]
+    pub fn state_path(&self) -> &Path {
+        &self.state_path
+    }
+
+    #[must_use]
+    pub fn canonical_receipt_carrier(&self) -> &[u8] {
+        &self.canonical_receipt_carrier
+    }
+
+    #[must_use]
+    pub const fn machine_route(&self) -> MachineRouteId {
+        self.machine_route
+    }
+
+    #[must_use]
+    pub const fn device_route(&self) -> DeviceRouteId {
+        self.device_route
+    }
+
+    #[must_use]
+    pub const fn request_hash(&self) -> [u8; 32] {
+        self.request_hash
+    }
+
+    #[must_use]
+    pub const fn grant_hash(&self) -> [u8; 32] {
+        self.grant_hash
+    }
+
+    #[must_use]
+    pub const fn response_hash(&self) -> [u8; 32] {
+        self.response_hash
+    }
+
+    #[must_use]
+    pub const fn was_already_committed(&self) -> bool {
+        self.already_committed
+    }
+}
+
+pub struct PairedPromotionCoordinator<'a> {
+    store: &'a dyn RemoteKeyStore,
+    installation_id: Uuid,
+    state_root: PathBuf,
+}
+
+impl fmt::Debug for PairedPromotionCoordinator<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PairedPromotionCoordinator")
+            .field("identity", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> PairedPromotionCoordinator<'a> {
+    #[must_use]
+    pub fn new(store: &'a dyn RemoteKeyStore, installation_id: Uuid, state_root: &Path) -> Self {
+        Self {
+            store,
+            installation_id,
+            state_root: state_root.to_path_buf(),
+        }
+    }
+
+    /// 只接受 durable pending transaction 产出的不可伪造 verified capability。
+    pub fn promote<R: CryptoRng>(
+        &self,
+        response: VerifiedPendingPairResponse,
+        rng: &mut R,
+    ) -> Result<PromotedPairedMachine, PairedPromotionError> {
+        let material = response.into_promotion_material();
+        let verified = material.verified;
+        let info = verified.info();
+        let root_fingerprint =
+            MachineRootFingerprint::from_bytes(verified.machine_root_fingerprint());
+        let accounts =
+            PairedAccounts::new(self.installation_id, root_fingerprint, info.machine_route);
+        let _lease = RemoteDeviceLease::acquire_in(
+            &self.state_root,
+            RemoteDeviceLockKey::new(self.installation_id, root_fingerprint, info.machine_route),
+        )
+        .map_err(PairedPromotionError::DeviceLock)?;
+
+        let promotion_id = promotion_id(self.installation_id, &verified);
+        if let Some(marker) = self
+            .store
+            .load(&accounts.marker)
+            .map_err(PairedPromotionError::Persistence)?
+        {
+            return self.audit_committed(
+                &accounts,
+                &verified,
+                &material.invite_public,
+                promotion_id,
+                marker.expose_secret(),
+                true,
+            );
+        }
+
+        let pending = self.load_pending_secrets(verified.info().invite_hash)?;
+        let signing_key = signing_key(&pending.device_sign)?;
+        let hpke_private = hpke_private_key(&pending.device_hpke)?;
+        validate_pending_keys(&verified, &signing_key, &hpke_private)?;
+
+        // StorageKEK 是 sealed file 的 prerequisite；marker 前只属于 provisional state。
+        if self
+            .store
+            .load(&accounts.kek)
+            .map_err(PairedPromotionError::Persistence)?
+            .is_none()
+        {
+            self.reject_state_without_kek(root_fingerprint, info.machine_route)?;
+        }
+        let kek_record = self.load_or_create_kek(&accounts.kek, promotion_id, rng)?;
+        let state_store = self.open_state_store(
+            root_fingerprint,
+            info.machine_route,
+            kek_record.device_storage_kek(),
+        )?;
+        let state = match state_store
+            .load()
+            .map_err(PairedPromotionError::CryptoState)?
+        {
+            Some(snapshot) => PairedCryptoStateV1::decode(snapshot.expose_secret())?,
+            None => {
+                let state = build_initial_state(
+                    self.installation_id,
+                    &verified,
+                    &material.invite_public,
+                    promotion_id,
+                    &signing_key,
+                    rng,
+                )?;
+                let encoded = state.encode()?;
+                state_store
+                    .commit_initial(&CryptoStateSnapshot::new(encoded))
+                    .map_err(PairedPromotionError::CryptoState)?;
+                let durable = state_store
+                    .load()
+                    .map_err(PairedPromotionError::CryptoState)?
+                    .ok_or(PairedPromotionError::Incomplete)?;
+                PairedCryptoStateV1::decode(durable.expose_secret())?
+            }
+        };
+
+        let grant_bytes = verified.relay_grant().canonical_bytes();
+        let audit = audit_state(
+            self.installation_id,
+            &state,
+            &verified,
+            &material.invite_public,
+            &grant_bytes,
+            &pending.device_sign,
+            &pending.device_hpke,
+        )?;
+        let counter_guard =
+            CounterGuardV1::from_binding(state.directory_revision, audit.device_command_binding);
+        let counter_bytes = counter_guard.encode();
+
+        self.persist_exact(&accounts.device_sign, &pending.device_sign)?;
+        self.persist_exact(&accounts.device_hpke, &pending.device_hpke)?;
+        self.persist_exact(&accounts.grant, &RemoteSecret::new(grant_bytes.clone()))?;
+        self.persist_exact(
+            &accounts.counter_guard,
+            &RemoteSecret::new(counter_bytes.clone()),
+        )?;
+
+        let state_bytes = state.encode()?;
+        let marker = PairedCommitMarkerV1::new(
+            self.installation_id,
+            &state,
+            promotion_id,
+            sha256(&state_bytes),
+            kek_record.commitment(),
+            sha256(&counter_bytes),
+            signing_key.verifying_key().to_bytes(),
+            hpke_public_bytes(&hpke_private)?,
+        );
+        let marker_bytes = marker.encode();
+        self.persist_exact(&accounts.marker, &RemoteSecret::new(marker_bytes.clone()))?;
+
+        self.audit_committed(
+            &accounts,
+            &verified,
+            &material.invite_public,
+            promotion_id,
+            &marker_bytes,
+            false,
+        )
+    }
+
+    fn load_pending_secrets(
+        &self,
+        invite_hash: [u8; 32],
+    ) -> Result<PendingSecrets, PairedPromotionError> {
+        let device_sign = self
+            .store
+            .load(&RemoteKeyAccount::pending(
+                self.installation_id,
+                invite_hash,
+                PendingRemoteKeyPurpose::DeviceSignPrivateKey,
+            ))
+            .map_err(PairedPromotionError::Persistence)?
+            .ok_or(PairedPromotionError::Incomplete)?;
+        let device_hpke = self
+            .store
+            .load(&RemoteKeyAccount::pending(
+                self.installation_id,
+                invite_hash,
+                PendingRemoteKeyPurpose::DeviceHpkePrivateKey,
+            ))
+            .map_err(PairedPromotionError::Persistence)?
+            .ok_or(PairedPromotionError::Incomplete)?;
+        Ok(PendingSecrets {
+            device_sign,
+            device_hpke,
+        })
+    }
+
+    fn load_or_create_kek<R: CryptoRng>(
+        &self,
+        account: &RemoteKeyAccount,
+        promotion_id: [u8; 32],
+        rng: &mut R,
+    ) -> Result<StorageKekRecordV1, PairedPromotionError> {
+        if let Some(existing) = self
+            .store
+            .load(account)
+            .map_err(PairedPromotionError::Persistence)?
+        {
+            let record = StorageKekRecordV1::decode(existing.expose_secret())?;
+            return if record.promotion_id == promotion_id {
+                Ok(record)
+            } else {
+                Err(PairedPromotionError::Conflict)
+            };
+        }
+
+        let mut key = [0_u8; 32];
+        rng.try_fill_bytes(&mut key)
+            .map_err(|_| PairedPromotionError::EntropyUnavailable)?;
+        if key.iter().all(|byte| *byte == 0) {
+            key.zeroize();
+            return Err(PairedPromotionError::EntropyUnavailable);
+        }
+        let candidate = StorageKekRecordV1 { promotion_id, key };
+        let encoded = candidate.encode();
+        match self
+            .store
+            .persist_immutable(account, &RemoteSecret::new(encoded))
+        {
+            Ok(_) => {}
+            Err(RemoteKeyStoreError::ImmutableConflict { .. }) => {
+                return Err(PairedPromotionError::Conflict);
+            }
+            Err(error) => return Err(PairedPromotionError::Persistence(error)),
+        }
+        let durable = self
+            .store
+            .load(account)
+            .map_err(PairedPromotionError::Persistence)?
+            .ok_or(PairedPromotionError::Incomplete)?;
+        let durable = StorageKekRecordV1::decode(durable.expose_secret())?;
+        if durable.promotion_id != promotion_id {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(durable)
+    }
+
+    fn open_state_store(
+        &self,
+        root_fingerprint: MachineRootFingerprint,
+        machine_route: MachineRouteId,
+        kek: DeviceStorageKek,
+    ) -> Result<FileCryptoStateStore, PairedPromotionError> {
+        FileCryptoStateStore::new_in(
+            &self.state_root,
+            CryptoStateIdentity::new(self.installation_id, root_fingerprint, machine_route),
+            kek,
+        )
+        .map_err(PairedPromotionError::CryptoState)
+    }
+
+    /// immutable state 已存在但 KEK 缺失时不可生成替代 KEK；否则会把离线损坏扩大成
+    /// 一个看似可恢复、实际永远无法解密的 provisional account。
+    fn reject_state_without_kek(
+        &self,
+        root_fingerprint: MachineRootFingerprint,
+        machine_route: MachineRouteId,
+    ) -> Result<(), PairedPromotionError> {
+        let probe = self.open_state_store(
+            root_fingerprint,
+            machine_route,
+            DeviceStorageKek::new([0; 32]),
+        )?;
+        match probe.load() {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) | Err(CryptoStateError::AuthenticationFailed) => {
+                Err(PairedPromotionError::Incomplete)
+            }
+            Err(error) => Err(PairedPromotionError::CryptoState(error)),
+        }
+    }
+
+    fn persist_exact(
+        &self,
+        account: &RemoteKeyAccount,
+        value: &RemoteSecret,
+    ) -> Result<(), PairedPromotionError> {
+        match self.store.persist_immutable(account, value) {
+            Ok(_) => {}
+            Err(RemoteKeyStoreError::ImmutableConflict { .. }) => {
+                return Err(PairedPromotionError::Conflict);
+            }
+            Err(error) => return Err(PairedPromotionError::Persistence(error)),
+        }
+        let durable = self
+            .store
+            .load(account)
+            .map_err(PairedPromotionError::Persistence)?
+            .ok_or(PairedPromotionError::Incomplete)?;
+        if durable.expose_secret() != value.expose_secret() {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn audit_committed(
+        &self,
+        accounts: &PairedAccounts,
+        verified: &agentdeck_crypto::VerifiedPairResponseV1,
+        invite: &PendingInvitePublicProjection,
+        promotion_id: [u8; 32],
+        marker_bytes: &[u8],
+        already_committed: bool,
+    ) -> Result<PromotedPairedMachine, PairedPromotionError> {
+        let marker = PairedCommitMarkerV1::decode(marker_bytes)?;
+        marker.validate_expected(self.installation_id, verified, promotion_id)?;
+
+        let kek_secret = self.load_required(&accounts.kek)?;
+        let kek_record = StorageKekRecordV1::decode(kek_secret.expose_secret())?;
+        if kek_record.promotion_id != promotion_id
+            || marker.kek_record_hash != kek_record.commitment()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let state_store = self.open_state_store(
+            MachineRootFingerprint::from_bytes(verified.machine_root_fingerprint()),
+            verified.info().machine_route,
+            kek_record.device_storage_kek(),
+        )?;
+        let state_snapshot = state_store
+            .load()
+            .map_err(PairedPromotionError::CryptoState)?
+            .ok_or(PairedPromotionError::Incomplete)?;
+        let state = PairedCryptoStateV1::decode(state_snapshot.expose_secret())?;
+        if marker.state_plaintext_hash != sha256(state_snapshot.expose_secret()) {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        let device_sign = self.load_required(&accounts.device_sign)?;
+        let device_hpke = self.load_required(&accounts.device_hpke)?;
+        let grant = self.load_required(&accounts.grant)?;
+        let counter = self.load_required(&accounts.counter_guard)?;
+        let signing_key = signing_key(&device_sign)?;
+        let hpke_private = hpke_private_key(&device_hpke)?;
+        let audit = audit_state(
+            self.installation_id,
+            &state,
+            verified,
+            invite,
+            grant.expose_secret(),
+            &device_sign,
+            &device_hpke,
+        )?;
+        let counter_guard = CounterGuardV1::decode(counter.expose_secret())?;
+        if counter_guard
+            != CounterGuardV1::from_binding(state.directory_revision, audit.device_command_binding)
+            || marker.counter_guard_hash != sha256(counter.expose_secret())
+            || marker.device_sign_pubkey != signing_key.verifying_key().to_bytes()
+            || marker.device_hpke_pubkey != hpke_public_bytes(&hpke_private)?
+            || marker.receipt_carrier_hash != sha256(&state.receipt_carrier)
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        Ok(PromotedPairedMachine {
+            state_path: state_store.state_path().to_path_buf(),
+            canonical_receipt_carrier: state.receipt_carrier,
+            machine_route: state.machine_route,
+            device_route: state.device_route,
+            request_hash: state.request_hash,
+            grant_hash: state.grant_hash,
+            response_hash: state.response_hash,
+            already_committed,
+        })
+    }
+
+    fn load_required(
+        &self,
+        account: &RemoteKeyAccount,
+    ) -> Result<RemoteSecret, PairedPromotionError> {
+        self.store
+            .load(account)
+            .map_err(PairedPromotionError::Persistence)?
+            .ok_or(PairedPromotionError::Incomplete)
+    }
+}
+
+struct PendingSecrets {
+    device_sign: RemoteSecret,
+    device_hpke: RemoteSecret,
+}
+
+struct PairedAccounts {
+    device_sign: RemoteKeyAccount,
+    device_hpke: RemoteKeyAccount,
+    grant: RemoteKeyAccount,
+    kek: RemoteKeyAccount,
+    counter_guard: RemoteKeyAccount,
+    marker: RemoteKeyAccount,
+}
+
+impl PairedAccounts {
+    fn new(
+        installation_id: Uuid,
+        root_fingerprint: MachineRootFingerprint,
+        machine_route: MachineRouteId,
+    ) -> Self {
+        let account = |purpose| {
+            RemoteKeyAccount::paired(installation_id, root_fingerprint, machine_route, purpose)
+        };
+        Self {
+            device_sign: account(PairedRemoteKeyPurpose::DeviceSignPrivateKey),
+            device_hpke: account(PairedRemoteKeyPurpose::DeviceHpkePrivateKey),
+            grant: account(PairedRemoteKeyPurpose::DeviceGrant),
+            kek: account(PairedRemoteKeyPurpose::DeviceStorageKek),
+            counter_guard: account(PairedRemoteKeyPurpose::CounterGuard),
+            marker: account(PairedRemoteKeyPurpose::CommitMarker),
+        }
+    }
+}
+
+fn signing_key(secret: &RemoteSecret) -> Result<SigningKey, PairedPromotionError> {
+    let mut seed: [u8; 32] = secret
+        .expose_secret()
+        .try_into()
+        .map_err(|_| PairedPromotionError::InvalidState)?;
+    let key = SigningKey::from_seed(&seed);
+    seed.zeroize();
+    Ok(key)
+}
+
+fn hpke_private_key(secret: &RemoteSecret) -> Result<HpkePrivateKey, PairedPromotionError> {
+    HpkePrivateKey::from_bytes(secret.expose_secret()).map_err(PairedPromotionError::Crypto)
+}
+
+fn hpke_public_bytes(private: &HpkePrivateKey) -> Result<[u8; 32], PairedPromotionError> {
+    private
+        .public_key()
+        .to_bytes()
+        .try_into()
+        .map_err(|_| PairedPromotionError::InvalidState)
+}
+
+fn validate_pending_keys(
+    verified: &agentdeck_crypto::VerifiedPairResponseV1,
+    signing_key: &SigningKey,
+    hpke_private: &HpkePrivateKey,
+) -> Result<(), PairedPromotionError> {
+    if verified.relay_grant().device_sign_pubkey.0 != signing_key.verifying_key().to_bytes()
+        || verified.device_authorization().device_hpke_pubkey.0 != hpke_public_bytes(hpke_private)?
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+    Ok(())
+}
+
+fn promotion_id(
+    installation_id: Uuid,
+    verified: &agentdeck_crypto::VerifiedPairResponseV1,
+) -> [u8; 32] {
+    let info = verified.info();
+    let mut input = Vec::with_capacity(PROMOTION_ID_DOMAIN.len() + 176);
+    input.extend_from_slice(PROMOTION_ID_DOMAIN);
+    input.extend_from_slice(installation_id.as_bytes());
+    input.extend_from_slice(&info.invite_hash);
+    input.extend_from_slice(&info.request_hash);
+    input.extend_from_slice(&verified.response_hash());
+    input.extend_from_slice(&verified.machine_root_fingerprint());
+    input.extend_from_slice(info.machine_route.as_bytes());
+    sha256(&input)
+}
+
+fn response_received_context(
+    pair_route: agentdeck_protocol::relay_v2::PairRouteId,
+) -> OuterContextV1 {
+    OuterContextV1 {
+        frame_kind: OuterFrameKind::PairResponseReceived,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: None,
+        device_route: None,
+        stream_route: None,
+        request_route: None,
+        pair_route: Some(pair_route),
+        stream_generation: None,
+        stream_cursor: None,
+        stream_seq: None,
+        message_key_epoch: 0,
+    }
+}
+
+fn pair_response_context(pair_route: agentdeck_protocol::relay_v2::PairRouteId) -> OuterContextV1 {
+    OuterContextV1 {
+        frame_kind: OuterFrameKind::PairResponse,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: None,
+        device_route: None,
+        stream_route: None,
+        request_route: None,
+        pair_route: Some(pair_route),
+        stream_generation: None,
+        stream_cursor: None,
+        stream_seq: None,
+        message_key_epoch: 0,
+    }
+}
+
+fn key_update_context(info: &KeyUpdateInfoV1) -> OuterContextV1 {
+    OuterContextV1 {
+        frame_kind: OuterFrameKind::KeyUpdate,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: Some(info.machine_route),
+        device_route: Some(info.device_route),
+        stream_route: info.stream_route,
+        request_route: None,
+        pair_route: None,
+        stream_generation: None,
+        stream_cursor: None,
+        stream_seq: None,
+        message_key_epoch: info.key_epoch,
+    }
+}
+
+fn build_initial_state<R: CryptoRng>(
+    installation_id: Uuid,
+    verified: &agentdeck_crypto::VerifiedPairResponseV1,
+    invite: &PendingInvitePublicProjection,
+    promotion_id: [u8; 32],
+    device_signing_key: &SigningKey,
+    rng: &mut R,
+) -> Result<PairedCryptoStateV1, PairedPromotionError> {
+    let info = verified.info();
+    let grant_hash = verified.relay_grant().canonical_sha256();
+    let invite_recipient = HpkePublicKey::from_bytes(&invite.invite_hpke_pubkey)
+        .map_err(PairedPromotionError::Crypto)?;
+    let receipt = seal_pair_response_received(
+        &invite_recipient,
+        info,
+        &response_received_context(info.pair_route),
+        PairResponseReceivedV1 {
+            request_hash: info.request_hash,
+            grant_hash,
+            response_hash: verified.response_hash(),
+            signature: Ed25519Signature([0; 64]),
+        },
+        device_signing_key,
+        rng,
+    )
+    .map_err(PairedPromotionError::Crypto)?
+    .canonical_bytes()
+    .map_err(PairedPromotionError::Protocol)?;
+
+    Ok(PairedCryptoStateV1 {
+        installation_id,
+        invite_hpke_pubkey: invite.invite_hpke_pubkey,
+        wss_url: invite.wss_url.clone(),
+        current_spki_pin: invite.current_spki_pin,
+        next_spki_pin: invite.next_spki_pin,
+        machine_display_name: invite.machine_display_name.clone(),
+        relay_server_id: info.relay_server_id,
+        machine_root_pubkey: verified.machine_root_pubkey().0,
+        machine_root_fingerprint: verified.machine_root_fingerprint(),
+        machine_route: info.machine_route,
+        device_route: info.device_route,
+        grant_serial: info.grant_serial,
+        trust_epoch: info.root_trust_epoch,
+        invite_hash: info.invite_hash,
+        request_hash: info.request_hash,
+        grant_hash,
+        response_hash: verified.response_hash(),
+        promotion_id,
+        directory_revision: verified.key_directory().revision,
+        canonical_response: verified.canonical_response().to_vec(),
+        data_sign_certificate: verified.data_sign_certificate().canonical_bytes(),
+        device_authorization: verified
+            .device_authorization()
+            .canonical_bytes()
+            .map_err(PairedPromotionError::Protocol)?,
+        key_directory: verified
+            .key_directory()
+            .canonical_bytes()
+            .map_err(PairedPromotionError::Protocol)?,
+        receipt_carrier: receipt,
+    })
+}
+
+struct StateAudit {
+    device_command_binding: CounterBindingV1,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_state(
+    installation_id: Uuid,
+    state: &PairedCryptoStateV1,
+    verified: &agentdeck_crypto::VerifiedPairResponseV1,
+    invite: &PendingInvitePublicProjection,
+    grant_bytes: &[u8],
+    device_sign_secret: &RemoteSecret,
+    device_hpke_secret: &RemoteSecret,
+) -> Result<StateAudit, PairedPromotionError> {
+    let expected_info = verified.info();
+    if state.installation_id != installation_id
+        || state.invite_hpke_pubkey != invite.invite_hpke_pubkey
+        || state.wss_url != invite.wss_url
+        || state.current_spki_pin != invite.current_spki_pin
+        || state.next_spki_pin != invite.next_spki_pin
+        || state.machine_display_name != invite.machine_display_name
+        || state.relay_server_id != expected_info.relay_server_id
+        || state.machine_root_pubkey != verified.machine_root_pubkey().0
+        || state.machine_root_fingerprint != verified.machine_root_fingerprint()
+        || state.machine_route != expected_info.machine_route
+        || state.device_route != expected_info.device_route
+        || state.grant_serial != expected_info.grant_serial
+        || state.trust_epoch != expected_info.root_trust_epoch
+        || state.invite_hash != expected_info.invite_hash
+        || state.request_hash != expected_info.request_hash
+        || state.grant_hash != verified.relay_grant().canonical_sha256()
+        || state.response_hash != verified.response_hash()
+        || state.promotion_id != promotion_id(installation_id, verified)
+        || state.directory_revision != verified.key_directory().revision
+        || state.canonical_response != verified.canonical_response()
+        || state.data_sign_certificate != verified.data_sign_certificate().canonical_bytes()
+        || state.device_authorization
+            != verified
+                .device_authorization()
+                .canonical_bytes()
+                .map_err(PairedPromotionError::Protocol)?
+        || state.key_directory
+            != verified
+                .key_directory()
+                .canonical_bytes()
+                .map_err(PairedPromotionError::Protocol)?
+        || grant_bytes != verified.relay_grant().canonical_bytes()
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+
+    let response = PairResponseV1::from_canonical_bytes(&state.canonical_response)
+        .map_err(PairedPromotionError::Protocol)?;
+    if response.info != *expected_info {
+        return Err(PairedPromotionError::Conflict);
+    }
+    let certificate = SignedCertificate::from_canonical_bytes(&state.data_sign_certificate)
+        .map_err(PairedPromotionError::AuthCanonical)?;
+    let grant = RelayGrant::from_canonical_bytes(grant_bytes)
+        .map_err(PairedPromotionError::AuthCanonical)?;
+    let authorization = DeviceAuthorizationV1::from_canonical_bytes(&state.device_authorization)
+        .map_err(PairedPromotionError::Protocol)?;
+    let directory = KeyDirectoryV1::from_canonical_bytes(&state.key_directory)
+        .map_err(PairedPromotionError::Protocol)?;
+    PairingControlEnvelopeV1::from_canonical_bytes(&state.receipt_carrier)
+        .map_err(PairedPromotionError::Protocol)?;
+
+    let root = VerifyingKey::from_bytes(&state.machine_root_pubkey)
+        .map_err(PairedPromotionError::Crypto)?;
+    if sha256(&root.to_bytes()) != state.machine_root_fingerprint
+        || certificate.cert_role != CertRole::Data
+        || certificate.root_key_id != grant.root_key_id
+        || certificate.trust_epoch != state.trust_epoch
+        || grant.machine_route != state.machine_route
+        || grant.device_route != state.device_route
+        || grant.grant_serial != state.grant_serial
+        || grant.trust_epoch != state.trust_epoch
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+    verify_tbs(
+        &root,
+        &certificate.to_be_signed_v1(
+            state.relay_server_id,
+            state.machine_route,
+            state.machine_root_fingerprint,
+        ),
+        &SignatureBytes::from(certificate.signature),
+    )
+    .map_err(PairedPromotionError::Crypto)?;
+    verify_tbs(
+        &root,
+        &grant.to_be_signed_v1(state.relay_server_id, state.machine_root_fingerprint),
+        &SignatureBytes::from(grant.signature),
+    )
+    .map_err(PairedPromotionError::Crypto)?;
+
+    let data_verifier = VerifyingKey::from_bytes(&certificate.subject_pubkey.0)
+        .map_err(PairedPromotionError::Crypto)?;
+    let signer = MachineDataSignerBindingV1::from_certificate(&certificate)
+        .map_err(PairedPromotionError::Protocol)?;
+    verify_pair_response_envelope(
+        &data_verifier,
+        &response.info,
+        &pair_response_context(response.info.pair_route),
+        &response,
+        &signer,
+    )
+    .map_err(PairedPromotionError::Crypto)?;
+    verify_device_authorization(&root, state.relay_server_id, &grant, &authorization)
+        .map_err(PairedPromotionError::Crypto)?;
+    verify_key_directory(
+        &data_verifier,
+        &signer,
+        &KeyDirectorySignatureContextV1 {
+            relay_server_id: state.relay_server_id,
+            machine_route: state.machine_route,
+            device_route: state.device_route,
+            grant_serial: state.grant_serial,
+            root_trust_epoch: state.trust_epoch,
+        },
+        &directory,
+    )
+    .map_err(PairedPromotionError::Crypto)?;
+
+    let signing_key = signing_key(device_sign_secret)?;
+    let hpke_private = hpke_private_key(device_hpke_secret)?;
+    if grant.device_sign_pubkey.0 != signing_key.verifying_key().to_bytes()
+        || authorization.device_hpke_pubkey.0 != hpke_public_bytes(&hpke_private)?
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+
+    let mut slots = HashSet::with_capacity(directory.entries.len());
+    let mut command_binding = None;
+    for entry in &directory.entries {
+        if !slots.insert((entry.key_id.purpose, entry.stream_route)) {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let entry_info = KeyUpdateInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_server_id: state.relay_server_id,
+            machine_route: state.machine_route,
+            device_route: state.device_route,
+            stream_route: entry.stream_route,
+            grant_serial: state.grant_serial,
+            root_trust_epoch: state.trust_epoch,
+            key_directory_revision: directory.revision,
+            key_purpose: entry.key_id.purpose,
+            key_epoch: entry.key_id.epoch,
+        };
+        let key = open_key_directory_entry(
+            &hpke_private,
+            &entry_info,
+            &key_update_context(&entry_info),
+            entry,
+        )
+        .map_err(PairedPromotionError::Crypto)?;
+        if entry.key_id.purpose == KeyPurpose::DeviceCommandTx {
+            if entry.stream_route.is_some() || command_binding.is_some() {
+                return Err(PairedPromotionError::InvalidState);
+            }
+            command_binding = Some(CounterBindingV1 {
+                key_epoch: entry.key_id.epoch,
+                nonce_prefix: agentdeck_crypto::derive_nonce_prefix(&key),
+            });
+        }
+    }
+
+    Ok(StateAudit {
+        device_command_binding: command_binding.ok_or(PairedPromotionError::InvalidState)?,
+    })
+}
+
+struct StorageKekRecordV1 {
+    promotion_id: [u8; 32],
+    key: [u8; 32],
+}
+
+impl fmt::Debug for StorageKekRecordV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StorageKekRecordV1([REDACTED])")
+    }
+}
+
+impl Drop for StorageKekRecordV1 {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl StorageKekRecordV1 {
+    fn encode(&self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(72);
+        encoded.extend_from_slice(KEK_MAGIC);
+        encoded.extend_from_slice(&KEK_VERSION.to_be_bytes());
+        encoded.extend_from_slice(&[0, 0]);
+        encoded.extend_from_slice(&self.promotion_id);
+        encoded.extend_from_slice(&self.key);
+        encoded
+    }
+
+    fn commitment(&self) -> [u8; 32] {
+        sha256(&Zeroizing::new(self.encode()))
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
+        if bytes.len() != 72
+            || &bytes[..4] != KEK_MAGIC
+            || u16::from_be_bytes([bytes[4], bytes[5]]) != KEK_VERSION
+            || bytes[6..8] != [0, 0]
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let promotion_id: [u8; 32] = bytes[8..40]
+            .try_into()
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        let key: [u8; 32] = bytes[40..72]
+            .try_into()
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        if all_zero(&promotion_id) || all_zero(&key) {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let value = Self { promotion_id, key };
+        if value.encode() != bytes {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(value)
+    }
+
+    fn device_storage_kek(&self) -> DeviceStorageKek {
+        DeviceStorageKek::new(self.key)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CounterBindingV1 {
+    key_epoch: u64,
+    nonce_prefix: [u8; 4],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CounterGuardV1 {
+    directory_revision: KeyDirectoryRevision,
+    binding: CounterBindingV1,
+    reserved_high_water: u64,
+}
+
+impl CounterGuardV1 {
+    fn from_binding(directory_revision: KeyDirectoryRevision, binding: CounterBindingV1) -> Self {
+        Self {
+            directory_revision,
+            binding,
+            reserved_high_water: 0,
+        }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(36);
+        encoded.extend_from_slice(COUNTER_GUARD_MAGIC);
+        encoded.extend_from_slice(&COUNTER_GUARD_VERSION.to_be_bytes());
+        encoded.extend_from_slice(&[0, 0]);
+        encoded.extend_from_slice(&self.directory_revision.value().to_be_bytes());
+        encoded.extend_from_slice(&self.binding.key_epoch.to_be_bytes());
+        encoded.extend_from_slice(&self.binding.nonce_prefix);
+        encoded.extend_from_slice(&self.reserved_high_water.to_be_bytes());
+        encoded
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
+        if bytes.len() != 36
+            || &bytes[..4] != COUNTER_GUARD_MAGIC
+            || u16::from_be_bytes([bytes[4], bytes[5]]) != COUNTER_GUARD_VERSION
+            || bytes[6..8] != [0, 0]
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let value = Self {
+            directory_revision: KeyDirectoryRevision::new(read_u64(&bytes[8..16])?),
+            binding: CounterBindingV1 {
+                key_epoch: read_u64(&bytes[16..24])?,
+                nonce_prefix: bytes[24..28]
+                    .try_into()
+                    .map_err(|_| PairedPromotionError::InvalidState)?,
+            },
+            reserved_high_water: read_u64(&bytes[28..36])?,
+        };
+        if value.directory_revision.value() == 0
+            || value.binding.key_epoch == 0
+            || value.reserved_high_water != 0
+            || value.encode() != bytes
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(value)
+    }
+}
+
+struct PairedCryptoStateV1 {
+    installation_id: Uuid,
+    invite_hpke_pubkey: [u8; 32],
+    wss_url: String,
+    current_spki_pin: [u8; 32],
+    next_spki_pin: [u8; 32],
+    machine_display_name: String,
+    relay_server_id: RelayServerId,
+    machine_root_pubkey: [u8; 32],
+    machine_root_fingerprint: [u8; 32],
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+    grant_serial: GrantSerial,
+    trust_epoch: TrustEpoch,
+    invite_hash: [u8; 32],
+    request_hash: [u8; 32],
+    grant_hash: [u8; 32],
+    response_hash: [u8; 32],
+    promotion_id: [u8; 32],
+    directory_revision: KeyDirectoryRevision,
+    canonical_response: Vec<u8>,
+    data_sign_certificate: Vec<u8>,
+    device_authorization: Vec<u8>,
+    key_directory: Vec<u8>,
+    receipt_carrier: Vec<u8>,
+}
+
+impl fmt::Debug for PairedCryptoStateV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairedCryptoStateV1([REDACTED])")
+    }
+}
+
+impl PairedCryptoStateV1 {
+    fn encode(&self) -> Result<Vec<u8>, PairedPromotionError> {
+        self.validate_shape()?;
+        let mut body = Vec::new();
+        body.extend_from_slice(self.installation_id.as_bytes());
+        body.extend_from_slice(&self.invite_hpke_pubkey);
+        body.extend_from_slice(self.relay_server_id.as_bytes());
+        body.extend_from_slice(&self.machine_root_pubkey);
+        body.extend_from_slice(&self.machine_root_fingerprint);
+        body.extend_from_slice(&self.current_spki_pin);
+        body.extend_from_slice(&self.next_spki_pin);
+        body.extend_from_slice(self.machine_route.as_bytes());
+        body.extend_from_slice(self.device_route.as_bytes());
+        body.extend_from_slice(&self.grant_serial.value().to_be_bytes());
+        body.extend_from_slice(&self.trust_epoch.value().to_be_bytes());
+        body.extend_from_slice(&self.invite_hash);
+        body.extend_from_slice(&self.request_hash);
+        body.extend_from_slice(&self.grant_hash);
+        body.extend_from_slice(&self.response_hash);
+        body.extend_from_slice(&self.promotion_id);
+        body.extend_from_slice(&self.directory_revision.value().to_be_bytes());
+        // receipt outbox=pending、counter reservation=None、空 replay/cursor collections。
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&0_u16.to_be_bytes());
+        body.extend_from_slice(&0_u16.to_be_bytes());
+        put_state_field(&mut body, self.wss_url.as_bytes(), MAX_STATE_STRING_LEN)?;
+        put_state_field(
+            &mut body,
+            self.machine_display_name.as_bytes(),
+            MAX_STATE_STRING_LEN,
+        )?;
+        put_state_field(&mut body, &self.canonical_response, MAX_STATE_FIELD_LEN)?;
+        put_state_field(&mut body, &self.data_sign_certificate, MAX_STATE_FIELD_LEN)?;
+        put_state_field(&mut body, &self.device_authorization, MAX_STATE_FIELD_LEN)?;
+        put_state_field(&mut body, &self.key_directory, MAX_STATE_FIELD_LEN)?;
+        put_state_field(&mut body, &self.receipt_carrier, MAX_STATE_FIELD_LEN)?;
+        if body.len() > MAX_CRYPTO_STATE_PLAINTEXT_LEN - STATE_HEADER_LEN {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let body_len = u32::try_from(body.len()).map_err(|_| PairedPromotionError::InvalidState)?;
+        let mut encoded = Vec::with_capacity(STATE_HEADER_LEN + body.len());
+        encoded.extend_from_slice(STATE_MAGIC);
+        encoded.extend_from_slice(&STATE_VERSION.to_be_bytes());
+        encoded.extend_from_slice(&[0, 0]);
+        encoded.extend_from_slice(&body_len.to_be_bytes());
+        encoded.extend_from_slice(&body);
+        Ok(encoded)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
+        if bytes.len() < STATE_HEADER_LEN
+            || bytes.len() > MAX_CRYPTO_STATE_PLAINTEXT_LEN
+            || &bytes[..4] != STATE_MAGIC
+            || u16::from_be_bytes([bytes[4], bytes[5]]) != STATE_VERSION
+            || bytes[6..8] != [0, 0]
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let declared = u32::from_be_bytes(
+            bytes[8..12]
+                .try_into()
+                .map_err(|_| PairedPromotionError::InvalidState)?,
+        ) as usize;
+        if declared != bytes.len() - STATE_HEADER_LEN {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let mut decoder = StateDecoder::new(&bytes[STATE_HEADER_LEN..]);
+        let installation_id = Uuid::from_bytes(decoder.fixed()?);
+        let invite_hpke_pubkey = decoder.fixed()?;
+        let relay_server_id = RelayServerId::from_bytes(decoder.fixed()?);
+        let machine_root_pubkey = decoder.fixed()?;
+        let machine_root_fingerprint = decoder.fixed()?;
+        let current_spki_pin = decoder.fixed()?;
+        let next_spki_pin = decoder.fixed()?;
+        let machine_route = MachineRouteId::from_bytes(decoder.fixed()?);
+        let device_route = DeviceRouteId::from_bytes(decoder.fixed()?);
+        let grant_serial = GrantSerial::new(decoder.u64()?);
+        let trust_epoch = TrustEpoch::new(decoder.u64()?);
+        let invite_hash = decoder.fixed()?;
+        let request_hash = decoder.fixed()?;
+        let grant_hash = decoder.fixed()?;
+        let response_hash = decoder.fixed()?;
+        let promotion_id = decoder.fixed()?;
+        let directory_revision = KeyDirectoryRevision::new(decoder.u64()?);
+        if decoder.u8()? != 0 || decoder.u8()? != 0 || decoder.u16()? != 0 || decoder.u16()? != 0 {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let wss_url = decoder.string(MAX_STATE_STRING_LEN)?;
+        let machine_display_name = decoder.string(MAX_STATE_STRING_LEN)?;
+        let canonical_response = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
+        let data_sign_certificate = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
+        let device_authorization = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
+        let key_directory = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
+        let receipt_carrier = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
+        decoder.finish()?;
+        let value = Self {
+            installation_id,
+            invite_hpke_pubkey,
+            wss_url,
+            current_spki_pin,
+            next_spki_pin,
+            machine_display_name,
+            relay_server_id,
+            machine_root_pubkey,
+            machine_root_fingerprint,
+            machine_route,
+            device_route,
+            grant_serial,
+            trust_epoch,
+            invite_hash,
+            request_hash,
+            grant_hash,
+            response_hash,
+            promotion_id,
+            directory_revision,
+            canonical_response,
+            data_sign_certificate,
+            device_authorization,
+            key_directory,
+            receipt_carrier,
+        };
+        value.validate_shape()?;
+        if value.encode()? != bytes {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(value)
+    }
+
+    fn validate_shape(&self) -> Result<(), PairedPromotionError> {
+        if self.installation_id.is_nil()
+            || all_zero(&self.invite_hpke_pubkey)
+            || self.wss_url.is_empty()
+            || self.wss_url.len() > MAX_STATE_STRING_LEN
+            || all_zero(&self.current_spki_pin)
+            || all_zero(&self.next_spki_pin)
+            || self.machine_display_name.is_empty()
+            || self.machine_display_name.len() > MAX_STATE_STRING_LEN
+            || all_zero(self.relay_server_id.as_bytes())
+            || all_zero(&self.machine_root_pubkey)
+            || all_zero(&self.machine_root_fingerprint)
+            || all_zero(self.machine_route.as_bytes())
+            || all_zero(self.device_route.as_bytes())
+            || self.grant_serial.value() == 0
+            || self.trust_epoch.value() == 0
+            || all_zero(&self.invite_hash)
+            || all_zero(&self.request_hash)
+            || all_zero(&self.grant_hash)
+            || all_zero(&self.response_hash)
+            || all_zero(&self.promotion_id)
+            || self.directory_revision.value() == 0
+            || self.canonical_response.is_empty()
+            || self.data_sign_certificate.is_empty()
+            || self.device_authorization.is_empty()
+            || self.key_directory.is_empty()
+            || self.receipt_carrier.is_empty()
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(())
+    }
+}
+
+struct PairedCommitMarkerV1 {
+    installation_id: Uuid,
+    root_fingerprint: [u8; 32],
+    relay_server_id: RelayServerId,
+    machine_route: MachineRouteId,
+    device_route: DeviceRouteId,
+    grant_serial: GrantSerial,
+    trust_epoch: TrustEpoch,
+    directory_revision: KeyDirectoryRevision,
+    device_sign_pubkey: [u8; 32],
+    device_hpke_pubkey: [u8; 32],
+    invite_hash: [u8; 32],
+    request_hash: [u8; 32],
+    grant_hash: [u8; 32],
+    response_hash: [u8; 32],
+    promotion_id: [u8; 32],
+    state_plaintext_hash: [u8; 32],
+    kek_record_hash: [u8; 32],
+    counter_guard_hash: [u8; 32],
+    receipt_carrier_hash: [u8; 32],
+}
+
+impl fmt::Debug for PairedCommitMarkerV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairedCommitMarkerV1([REDACTED])")
+    }
+}
+
+impl PairedCommitMarkerV1 {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        installation_id: Uuid,
+        state: &PairedCryptoStateV1,
+        promotion_id: [u8; 32],
+        state_plaintext_hash: [u8; 32],
+        kek_record_hash: [u8; 32],
+        counter_guard_hash: [u8; 32],
+        device_sign_pubkey: [u8; 32],
+        device_hpke_pubkey: [u8; 32],
+    ) -> Self {
+        Self {
+            installation_id,
+            root_fingerprint: state.machine_root_fingerprint,
+            relay_server_id: state.relay_server_id,
+            machine_route: state.machine_route,
+            device_route: state.device_route,
+            grant_serial: state.grant_serial,
+            trust_epoch: state.trust_epoch,
+            directory_revision: state.directory_revision,
+            device_sign_pubkey,
+            device_hpke_pubkey,
+            invite_hash: state.invite_hash,
+            request_hash: state.request_hash,
+            grant_hash: state.grant_hash,
+            response_hash: state.response_hash,
+            promotion_id,
+            state_plaintext_hash,
+            kek_record_hash,
+            counter_guard_hash,
+            receipt_carrier_hash: sha256(&state.receipt_carrier),
+        }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(480);
+        encoded.extend_from_slice(MARKER_MAGIC);
+        encoded.extend_from_slice(&MARKER_VERSION.to_be_bytes());
+        encoded.extend_from_slice(&[0, 0]);
+        encoded.extend_from_slice(self.installation_id.as_bytes());
+        encoded.extend_from_slice(&self.root_fingerprint);
+        encoded.extend_from_slice(self.relay_server_id.as_bytes());
+        encoded.extend_from_slice(self.machine_route.as_bytes());
+        encoded.extend_from_slice(self.device_route.as_bytes());
+        encoded.extend_from_slice(&self.grant_serial.value().to_be_bytes());
+        encoded.extend_from_slice(&self.trust_epoch.value().to_be_bytes());
+        encoded.extend_from_slice(&self.directory_revision.value().to_be_bytes());
+        encoded.extend_from_slice(&self.device_sign_pubkey);
+        encoded.extend_from_slice(&self.device_hpke_pubkey);
+        for hash in [
+            self.invite_hash,
+            self.request_hash,
+            self.grant_hash,
+            self.response_hash,
+            self.promotion_id,
+            self.state_plaintext_hash,
+            self.kek_record_hash,
+            self.counter_guard_hash,
+            self.receipt_carrier_hash,
+        ] {
+            encoded.extend_from_slice(&hash);
+        }
+        encoded
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
+        if bytes.len() != 480
+            || &bytes[..4] != MARKER_MAGIC
+            || u16::from_be_bytes([bytes[4], bytes[5]]) != MARKER_VERSION
+            || bytes[6..8] != [0, 0]
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let mut decoder = StateDecoder::new(&bytes[8..]);
+        let value = Self {
+            installation_id: Uuid::from_bytes(decoder.fixed()?),
+            root_fingerprint: decoder.fixed()?,
+            relay_server_id: RelayServerId::from_bytes(decoder.fixed()?),
+            machine_route: MachineRouteId::from_bytes(decoder.fixed()?),
+            device_route: DeviceRouteId::from_bytes(decoder.fixed()?),
+            grant_serial: GrantSerial::new(decoder.u64()?),
+            trust_epoch: TrustEpoch::new(decoder.u64()?),
+            directory_revision: KeyDirectoryRevision::new(decoder.u64()?),
+            device_sign_pubkey: decoder.fixed()?,
+            device_hpke_pubkey: decoder.fixed()?,
+            invite_hash: decoder.fixed()?,
+            request_hash: decoder.fixed()?,
+            grant_hash: decoder.fixed()?,
+            response_hash: decoder.fixed()?,
+            promotion_id: decoder.fixed()?,
+            state_plaintext_hash: decoder.fixed()?,
+            kek_record_hash: decoder.fixed()?,
+            counter_guard_hash: decoder.fixed()?,
+            receipt_carrier_hash: decoder.fixed()?,
+        };
+        decoder.finish()?;
+        if value.encode() != bytes || value.any_required_zero() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(value)
+    }
+
+    fn any_required_zero(&self) -> bool {
+        self.installation_id.is_nil()
+            || all_zero(&self.root_fingerprint)
+            || all_zero(self.relay_server_id.as_bytes())
+            || all_zero(self.machine_route.as_bytes())
+            || all_zero(self.device_route.as_bytes())
+            || self.grant_serial.value() == 0
+            || self.trust_epoch.value() == 0
+            || self.directory_revision.value() == 0
+            || [
+                self.device_sign_pubkey,
+                self.device_hpke_pubkey,
+                self.invite_hash,
+                self.request_hash,
+                self.grant_hash,
+                self.response_hash,
+                self.promotion_id,
+                self.state_plaintext_hash,
+                self.kek_record_hash,
+                self.counter_guard_hash,
+                self.receipt_carrier_hash,
+            ]
+            .iter()
+            .any(|value| all_zero(value))
+    }
+
+    fn validate_expected(
+        &self,
+        installation_id: Uuid,
+        verified: &agentdeck_crypto::VerifiedPairResponseV1,
+        promotion_id: [u8; 32],
+    ) -> Result<(), PairedPromotionError> {
+        let info = verified.info();
+        if self.installation_id != installation_id
+            || self.root_fingerprint != verified.machine_root_fingerprint()
+            || self.relay_server_id != info.relay_server_id
+            || self.machine_route != info.machine_route
+            || self.device_route != info.device_route
+            || self.grant_serial != info.grant_serial
+            || self.trust_epoch != info.root_trust_epoch
+            || self.directory_revision != verified.key_directory().revision
+            || self.device_sign_pubkey != verified.relay_grant().device_sign_pubkey.0
+            || self.device_hpke_pubkey != verified.device_authorization().device_hpke_pubkey.0
+            || self.invite_hash != info.invite_hash
+            || self.request_hash != info.request_hash
+            || self.grant_hash != verified.relay_grant().canonical_sha256()
+            || self.response_hash != verified.response_hash()
+            || self.promotion_id != promotion_id
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(())
+    }
+}
+
+struct StateDecoder<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> StateDecoder<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, cursor: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], PairedPromotionError> {
+        let end = self
+            .cursor
+            .checked_add(length)
+            .ok_or(PairedPromotionError::InvalidState)?;
+        let value = self
+            .bytes
+            .get(self.cursor..end)
+            .ok_or(PairedPromotionError::InvalidState)?;
+        self.cursor = end;
+        Ok(value)
+    }
+
+    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], PairedPromotionError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| PairedPromotionError::InvalidState)
+    }
+
+    fn u8(&mut self) -> Result<u8, PairedPromotionError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, PairedPromotionError> {
+        Ok(u16::from_be_bytes(self.fixed()?))
+    }
+
+    fn u32(&mut self) -> Result<u32, PairedPromotionError> {
+        Ok(u32::from_be_bytes(self.fixed()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, PairedPromotionError> {
+        Ok(u64::from_be_bytes(self.fixed()?))
+    }
+
+    fn field(&mut self, max: usize) -> Result<&'a [u8], PairedPromotionError> {
+        let length =
+            usize::try_from(self.u32()?).map_err(|_| PairedPromotionError::InvalidState)?;
+        if length > max {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        self.take(length)
+    }
+
+    fn string(&mut self, max: usize) -> Result<String, PairedPromotionError> {
+        String::from_utf8(self.field(max)?.to_vec()).map_err(|_| PairedPromotionError::InvalidState)
+    }
+
+    fn finish(self) -> Result<(), PairedPromotionError> {
+        if self.cursor != self.bytes.len() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(())
+    }
+}
+
+fn put_state_field(
+    encoded: &mut Vec<u8>,
+    value: &[u8],
+    max: usize,
+) -> Result<(), PairedPromotionError> {
+    if value.len() > max {
+        return Err(PairedPromotionError::InvalidState);
+    }
+    let length = u32::try_from(value.len()).map_err(|_| PairedPromotionError::InvalidState)?;
+    encoded.extend_from_slice(&length.to_be_bytes());
+    encoded.extend_from_slice(value);
+    Ok(())
+}
+
+fn read_u64(bytes: &[u8]) -> Result<u64, PairedPromotionError> {
+    Ok(u64::from_be_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| PairedPromotionError::InvalidState)?,
+    ))
+}
+
+fn all_zero(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| *byte == 0)
+}

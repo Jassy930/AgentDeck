@@ -5,4 +5,6 @@
 pub mod crypto_state;
 pub mod device_lock;
 pub mod keychain;
+#[cfg(unix)]
+pub mod paired_machine;
 pub mod pending;

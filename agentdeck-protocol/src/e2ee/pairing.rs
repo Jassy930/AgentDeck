@@ -20,7 +20,8 @@ use crate::e2ee::tbs::{SignedObjectType, ToBeSignedV1};
 use crate::e2ee::{E2EE_FORMAT_VERSION, Enc, b64_32, b64_vec};
 use crate::relay_v2::RELAY_PROTOCOL_VERSION;
 use crate::relay_v2::auth::{
-    AUTH_SIGNATURE_FORMAT_VERSION, CertRole, Ed25519Signature, PublicKeyBytes, RelayGrant,
+    AUTH_SIGNATURE_FORMAT_VERSION, CertRole, Ed25519Signature, PublicKeyBytes,
+    RELAY_GRANT_MAX_CANONICAL_BYTES, RelayGrant, SIGNED_CERTIFICATE_MAX_CANONICAL_BYTES,
     SignedCertificate,
 };
 use crate::relay_v2::id::{
@@ -587,7 +588,10 @@ impl PairInviteV1 {
             expires_at_ms: decoder.u64()?,
             machine_root_pubkey: PublicKeyBytes(decoder.fixed()?),
             machine_root_fingerprint: decoder.fixed()?,
-            data_sign_cert: decode_signed_certificate(decoder.bytes(1_024)?)?,
+            data_sign_cert: SignedCertificate::from_canonical_bytes(
+                decoder.bytes(SIGNED_CERTIFICATE_MAX_CANONICAL_BYTES)?,
+            )
+            .map_err(|_| PairingError::InvalidEncoding("SignedCertificate"))?,
             machine_display_name: decoder.string(PAIRING_MAX_DISPLAY_NAME_BYTES)?,
         };
         decoder.finish()?;
@@ -1090,7 +1094,10 @@ impl PairResponsePlaintextV1 {
         let value = Self {
             format_version: decoder.u16()?,
             request_hash: decoder.fixed()?,
-            relay_grant: decode_relay_grant(decoder.bytes(2 * 1_024)?)?,
+            relay_grant: RelayGrant::from_canonical_bytes(
+                decoder.bytes(RELAY_GRANT_MAX_CANONICAL_BYTES)?,
+            )
+            .map_err(|_| PairingError::InvalidEncoding("RelayGrant"))?,
             device_authorization: DeviceAuthorizationV1::from_canonical_bytes(
                 decoder.bytes(16 * 1_024)?,
             )?,
@@ -1683,60 +1690,6 @@ fn encode_device_authorization_fields(encoder: &mut Enc, value: &DeviceAuthoriza
     encoder.u64(value.trust_epoch.value());
 }
 
-fn decode_relay_grant(bytes: &[u8]) -> Result<RelayGrant, PairingError> {
-    let mut outer = Decoder::new(bytes);
-    outer.domain(b"AgentDeck/RelayGrantV1\0")?;
-    let unsigned = outer.bytes(1_024)?;
-    let signature = Ed25519Signature(outer.fixed()?);
-    outer.finish()?;
-    let mut decoder = Decoder::new(unsigned);
-    decoder.domain(b"AgentDeck/RelayGrantUnsignedV1\0")?;
-    let value = RelayGrant {
-        machine_route: MachineRouteId::from_bytes(decoder.fixed()?),
-        device_route: DeviceRouteId::from_bytes(decoder.fixed()?),
-        device_sign_pubkey: PublicKeyBytes(decoder.fixed()?),
-        grant_serial: GrantSerial::new(decoder.u64()?),
-        root_key_id: RootKeyId::from_bytes(decoder.fixed()?),
-        trust_epoch: TrustEpoch::new(decoder.u64()?),
-        signature,
-    };
-    decoder.finish()?;
-    ensure_canonical(bytes, &value.canonical_bytes())?;
-    Ok(value)
-}
-
-fn decode_signed_certificate(bytes: &[u8]) -> Result<SignedCertificate, PairingError> {
-    let mut outer = Decoder::new(bytes);
-    outer.domain(b"AgentDeck/SignedCertificateV1\0")?;
-    let unsigned = outer.bytes(1_024)?;
-    let signature = Ed25519Signature(outer.fixed()?);
-    outer.finish()?;
-    let mut decoder = Decoder::new(unsigned);
-    decoder.domain(b"AgentDeck/SignedCertificateUnsignedV1\0")?;
-    let subject_pubkey = PublicKeyBytes(decoder.fixed()?);
-    let cert_role = match decoder.u8()? {
-        0 => CertRole::Link,
-        1 => CertRole::Data,
-        _ => return Err(PairingError::InvalidEncoding("certificate role")),
-    };
-    let generation = LinkGeneration::new(decoder.u64()?);
-    let root_key_id = RootKeyId::from_bytes(decoder.fixed()?);
-    let trust_epoch = TrustEpoch::new(decoder.u64()?);
-    let not_after_ms = decoder.optional_u64()?;
-    decoder.finish()?;
-    let value = SignedCertificate {
-        subject_pubkey,
-        cert_role,
-        generation,
-        root_key_id,
-        trust_epoch,
-        not_after_ms,
-        signature,
-    };
-    ensure_canonical(bytes, &value.canonical_bytes())?;
-    Ok(value)
-}
-
 fn ensure_canonical(input: &[u8], reencoded: &[u8]) -> Result<(), PairingError> {
     if input != reencoded {
         return Err(PairingError::InvalidEncoding("non-canonical bytes"));
@@ -1809,14 +1762,6 @@ impl<'a> Decoder<'a> {
         std::str::from_utf8(value)
             .map(str::to_owned)
             .map_err(|_| PairingError::InvalidEncoding("UTF-8 string"))
-    }
-
-    fn optional_u64(&mut self) -> Result<Option<u64>, PairingError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => Ok(Some(self.u64()?)),
-            _ => Err(PairingError::InvalidEncoding("optional u64")),
-        }
     }
 
     fn finish(self) -> Result<(), PairingError> {

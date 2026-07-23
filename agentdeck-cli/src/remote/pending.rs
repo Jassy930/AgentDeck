@@ -95,6 +95,7 @@ impl PendingPairingError {
 /// ```
 pub struct VerifiedPendingPairResponse {
     verified: VerifiedPairResponseV1,
+    invite_public: PendingInvitePublicProjection,
 }
 
 impl fmt::Debug for VerifiedPendingPairResponse {
@@ -123,6 +124,28 @@ impl VerifiedPendingPairResponse {
     pub fn opened_key_count(&self) -> usize {
         self.verified.opened_keys().len()
     }
+
+    pub(crate) fn into_promotion_material(self) -> PendingPromotionMaterial {
+        PendingPromotionMaterial {
+            verified: self.verified,
+            invite_public: self.invite_public,
+        }
+    }
+}
+
+/// promotion 需要的邀请公开投影；明确不含 invite secret 或完整 PairInvite。
+pub(crate) struct PendingInvitePublicProjection {
+    pub(crate) invite_hpke_pubkey: [u8; 32],
+    pub(crate) wss_url: String,
+    pub(crate) current_spki_pin: [u8; 32],
+    pub(crate) next_spki_pin: [u8; 32],
+    pub(crate) machine_display_name: String,
+}
+
+/// sibling paired-state 模块唯一可消费的 verified promotion material。
+pub(crate) struct PendingPromotionMaterial {
+    pub(crate) verified: VerifiedPairResponseV1,
+    pub(crate) invite_public: PendingInvitePublicProjection,
 }
 
 /// 可交给 Relay PairData 的已持久化 carrier；不持有 private key 或 invite secret。
@@ -374,7 +397,16 @@ impl<'a> PendingPairingCoordinator<'a> {
             canonical_response,
         )
         .map_err(PendingPairingError::InvalidResponse)?;
-        Ok(VerifiedPendingPairResponse { verified })
+        Ok(VerifiedPendingPairResponse {
+            verified,
+            invite_public: PendingInvitePublicProjection {
+                invite_hpke_pubkey: invite.invite_hpke_pubkey.0,
+                wss_url: invite.wss_url.clone(),
+                current_spki_pin: invite.current_spki_pin,
+                next_spki_pin: invite.next_spki_pin,
+                machine_display_name: invite.machine_display_name.clone(),
+            },
+        })
     }
 
     fn load_committed_keys(

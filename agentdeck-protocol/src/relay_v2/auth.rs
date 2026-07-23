@@ -27,6 +27,26 @@ use sha2::{Digest, Sha256};
 /// Relay v2 root / endpoint 签名格式版本。该版本独立于 Relay、Runtime 与 E2EE 版本轴。
 pub const AUTH_SIGNATURE_FORMAT_VERSION: u16 = 1;
 
+/// 完整 MachineRoot-signed certificate canonical bytes 的解析硬上限。
+///
+/// 当前 v1 编码只有 222 bytes；保留 1 KiB 上限用于 fail-fast 拒绝不受信输入，且不把
+/// canonical parser 变成通用无界 length-prefix reader。
+pub const SIGNED_CERTIFICATE_MAX_CANONICAL_BYTES: usize = 1_024;
+
+/// 完整 RelayGrant canonical bytes 的解析硬上限。
+///
+/// 当前 v1 编码固定为 238 bytes；2 KiB 与 PairResponse v1 已冻结的 nested bound 一致。
+pub const RELAY_GRANT_MAX_CANONICAL_BYTES: usize = 2 * 1_024;
+
+/// Relay 公开授权对象的严格 canonical decoder 错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AuthCanonicalError {
+    #[error("auth canonical value exceeds its bound: {0}")]
+    SizeLimit(&'static str),
+    #[error("invalid auth canonical encoding: {0}")]
+    InvalidEncoding(&'static str),
+}
+
 const MACHINE_LINK_ROLE_SCOPE: &str = "machine-link";
 const MACHINE_DATA_ROLE_SCOPE: &str = "machine-data";
 const RELAY_GRANT_ROLE_SCOPE: &str = "relay-device-grant";
@@ -198,6 +218,48 @@ impl SignedCertificate {
         encoder.finish()
     }
 
+    /// 从唯一 canonical credential bytes 严格恢复证书。
+    ///
+    /// 解析在读取字段前执行总长上限，并拒绝未知 enum/optional tag、截断、内外层尾随
+    /// bytes 以及不能逐字节重编码为原输入的非 canonical 表示。
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, AuthCanonicalError> {
+        if bytes.len() > SIGNED_CERTIFICATE_MAX_CANONICAL_BYTES {
+            return Err(AuthCanonicalError::SizeLimit("SignedCertificate"));
+        }
+
+        let mut outer = CanonicalDecoder::new(bytes);
+        outer.domain(b"AgentDeck/SignedCertificateV1\0")?;
+        let unsigned = outer.bytes(
+            SIGNED_CERTIFICATE_MAX_CANONICAL_BYTES,
+            "certificate unsigned",
+        )?;
+        let signature = Ed25519Signature(outer.fixed()?);
+        outer.finish()?;
+
+        let mut decoder = CanonicalDecoder::new(unsigned);
+        decoder.domain(b"AgentDeck/SignedCertificateUnsignedV1\0")?;
+        let subject_pubkey = PublicKeyBytes(decoder.fixed()?);
+        let cert_role = match decoder.u8()? {
+            0 => CertRole::Link,
+            1 => CertRole::Data,
+            _ => {
+                return Err(AuthCanonicalError::InvalidEncoding("certificate role"));
+            }
+        };
+        let value = Self {
+            subject_pubkey,
+            cert_role,
+            generation: LinkGeneration::new(decoder.u64()?),
+            root_key_id: RootKeyId::from_bytes(decoder.fixed()?),
+            trust_epoch: TrustEpoch::new(decoder.u64()?),
+            not_after_ms: decoder.optional_u64()?,
+            signature,
+        };
+        decoder.finish()?;
+        ensure_auth_canonical(bytes, &value.canonical_bytes())?;
+        Ok(value)
+    }
+
     pub fn unsigned_canonical_sha256(&self) -> [u8; 32] {
         sha256(&self.unsigned_canonical_bytes())
     }
@@ -295,6 +357,37 @@ impl RelayGrant {
         encoder.bytes(&unsigned);
         encoder.bytes(&self.signature.0);
         encoder.finish()
+    }
+
+    /// 从唯一 canonical credential bytes 严格恢复 RelayGrant。
+    ///
+    /// 解析有总长与 nested length 双重上限，并拒绝截断、内外层尾随 bytes 以及不能
+    /// 逐字节重编码为原输入的非 canonical 表示。
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, AuthCanonicalError> {
+        if bytes.len() > RELAY_GRANT_MAX_CANONICAL_BYTES {
+            return Err(AuthCanonicalError::SizeLimit("RelayGrant"));
+        }
+
+        let mut outer = CanonicalDecoder::new(bytes);
+        outer.domain(b"AgentDeck/RelayGrantV1\0")?;
+        let unsigned = outer.bytes(RELAY_GRANT_MAX_CANONICAL_BYTES, "RelayGrant unsigned")?;
+        let signature = Ed25519Signature(outer.fixed()?);
+        outer.finish()?;
+
+        let mut decoder = CanonicalDecoder::new(unsigned);
+        decoder.domain(b"AgentDeck/RelayGrantUnsignedV1\0")?;
+        let value = Self {
+            machine_route: MachineRouteId::from_bytes(decoder.fixed()?),
+            device_route: DeviceRouteId::from_bytes(decoder.fixed()?),
+            device_sign_pubkey: PublicKeyBytes(decoder.fixed()?),
+            grant_serial: GrantSerial::new(decoder.u64()?),
+            root_key_id: RootKeyId::from_bytes(decoder.fixed()?),
+            trust_epoch: TrustEpoch::new(decoder.u64()?),
+            signature,
+        };
+        decoder.finish()?;
+        ensure_auth_canonical(bytes, &value.canonical_bytes())?;
+        Ok(value)
     }
 
     pub fn unsigned_canonical_sha256(&self) -> [u8; 32] {
@@ -438,6 +531,95 @@ fn encode_optional_device_route(encoder: &mut Enc, route: Option<&DeviceRouteId>
     }
 }
 
+fn ensure_auth_canonical(input: &[u8], reencoded: &[u8]) -> Result<(), AuthCanonicalError> {
+    if input != reencoded {
+        return Err(AuthCanonicalError::InvalidEncoding("non-canonical bytes"));
+    }
+    Ok(())
+}
+
+/// 只服务本模块固定授权对象的 borrowed decoder。
+struct CanonicalDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CanonicalDecoder<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], AuthCanonicalError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(AuthCanonicalError::InvalidEncoding("length overflow"))?;
+        if end > self.bytes.len() {
+            return Err(AuthCanonicalError::InvalidEncoding("truncated bytes"));
+        }
+        let value = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn domain(&mut self, expected: &[u8]) -> Result<(), AuthCanonicalError> {
+        if self.take(expected.len())? != expected {
+            return Err(AuthCanonicalError::InvalidEncoding("domain separator"));
+        }
+        Ok(())
+    }
+
+    fn u8(&mut self) -> Result<u8, AuthCanonicalError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, AuthCanonicalError> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?
+                .try_into()
+                .expect("take returned exactly four bytes"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, AuthCanonicalError> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?
+                .try_into()
+                .expect("take returned exactly eight bytes"),
+        ))
+    }
+
+    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], AuthCanonicalError> {
+        self.bytes(N, "fixed-width field")?
+            .try_into()
+            .map_err(|_| AuthCanonicalError::InvalidEncoding("fixed-width field"))
+    }
+
+    fn bytes(&mut self, max: usize, field: &'static str) -> Result<&'a [u8], AuthCanonicalError> {
+        let length =
+            usize::try_from(self.u32()?).map_err(|_| AuthCanonicalError::SizeLimit(field))?;
+        if length > max {
+            return Err(AuthCanonicalError::SizeLimit(field));
+        }
+        self.take(length)
+    }
+
+    fn optional_u64(&mut self) -> Result<Option<u64>, AuthCanonicalError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.u64()?)),
+            _ => Err(AuthCanonicalError::InvalidEncoding("optional u64 tag")),
+        }
+    }
+
+    fn finish(self) -> Result<(), AuthCanonicalError> {
+        if self.offset != self.bytes.len() {
+            return Err(AuthCanonicalError::InvalidEncoding("trailing bytes"));
+        }
+        Ok(())
+    }
+}
+
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -499,6 +681,60 @@ mod tests {
         assert_eq!(
             hex(&grant.canonical_sha256()),
             "4d7f552fa647dbe4611943756f4481ee99580d712445f70b5c1d0fe5bbb877dd"
+        );
+    }
+
+    #[test]
+    fn certificate_canonical_decoder_is_strict_and_bounded() {
+        let certificate = certificate();
+        let canonical = certificate.canonical_bytes();
+        assert_eq!(
+            SignedCertificate::from_canonical_bytes(&canonical).unwrap(),
+            certificate
+        );
+
+        let mut trailing = canonical.clone();
+        trailing.push(0);
+        assert!(SignedCertificate::from_canonical_bytes(&trailing).is_err());
+
+        let mut invalid_optional_tag = canonical;
+        let unsigned_domain_len = b"AgentDeck/SignedCertificateUnsignedV1\0".len();
+        let optional_tag_offset = b"AgentDeck/SignedCertificateV1\0".len()
+            + 4
+            + unsigned_domain_len
+            + 4
+            + 32
+            + 1
+            + 8
+            + 4
+            + 16
+            + 8;
+        invalid_optional_tag[optional_tag_offset] = 2;
+        assert!(SignedCertificate::from_canonical_bytes(&invalid_optional_tag).is_err());
+
+        assert!(
+            SignedCertificate::from_canonical_bytes(&vec![
+                0;
+                SIGNED_CERTIFICATE_MAX_CANONICAL_BYTES
+                    + 1
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn relay_grant_canonical_decoder_is_strict_and_bounded() {
+        let grant = grant();
+        let canonical = grant.canonical_bytes();
+        assert_eq!(RelayGrant::from_canonical_bytes(&canonical).unwrap(), grant);
+
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert!(RelayGrant::from_canonical_bytes(&trailing).is_err());
+
+        assert!(
+            RelayGrant::from_canonical_bytes(&vec![0; RELAY_GRANT_MAX_CANONICAL_BYTES + 1])
+                .is_err()
         );
     }
 

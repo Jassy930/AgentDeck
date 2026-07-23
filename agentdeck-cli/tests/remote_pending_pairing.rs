@@ -1,24 +1,31 @@
 use std::convert::Infallible;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
-use agentdeck_cli::remote::keychain::{
-    MemoryRemoteKeyStore, PendingRemoteKeyPurpose, RemoteKeyAccount, RemoteKeyPersistence,
-    RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
+use agentdeck_cli::remote::crypto_state::{
+    CryptoStateIdentity, DeviceStorageKek, FileCryptoStateStore,
 };
+use agentdeck_cli::remote::device_lock::{RemoteDeviceLease, RemoteDeviceLockKey};
+use agentdeck_cli::remote::keychain::{
+    MemoryRemoteKeyStore, PairedRemoteKeyPurpose, PendingRemoteKeyPurpose, RemoteKeyAccount,
+    RemoteKeyPersistence, RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
+};
+use agentdeck_cli::remote::paired_machine::PairedPromotionCoordinator;
 use agentdeck_cli::remote::pending::{PendingPairingCoordinator, PreparedPairRequest};
 use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
 use agentdeck_crypto::{
-    HpkePrivateKey, PairResponseSealAuthority, SecretAeadKey, SigningKey, open_pair_request,
-    seal_key_directory_entry, seal_pair_response, sha256, sign_device_authorization,
-    sign_key_directory, sign_tbs,
+    HpkePrivateKey, PairResponseSealAuthority, SecretAeadKey, SigningKey, VerifyingKey,
+    open_pair_request, open_pair_response_received, seal_key_directory_entry, seal_pair_response,
+    sha256, sign_device_authorization, sign_key_directory, sign_tbs,
 };
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,
     DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1, KeyDirectoryV1,
     KeyPurpose, KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind,
     PairInviteV1, PairRequestInfoV1, PairRequestPlaintextV1, PairRequestV1, PairResponseInfoV1,
-    PairResponsePlaintextV1,
+    PairResponsePlaintextV1, PairResponseV1, PairingControlEnvelopeV1,
 };
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::{
@@ -28,7 +35,7 @@ use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, LinkGeneration, MachineRouteId, PairRouteId,
     RelayServerId, RootKeyId, TrustEpoch,
 };
-use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
+use agentdeck_protocol::runtime::{MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION};
 use uuid::Uuid;
 
 const NOW_MS: u64 = 1_900_000_000_000;
@@ -206,6 +213,14 @@ impl Fixture {
     }
 
     fn response_for(&self, prepared: &PreparedPairRequest) -> Vec<u8> {
+        self.response_for_seed(prepared, [0x38; 32])
+    }
+
+    fn response_for_seed(
+        &self,
+        prepared: &PreparedPairRequest,
+        response_seed: [u8; 32],
+    ) -> Vec<u8> {
         let root = Self::root_signing_key();
         let data = Self::data_signing_key();
         let root_fingerprint = self.invite.machine_root_fingerprint;
@@ -317,7 +332,7 @@ impl Fixture {
             device_authorization: authorization,
             key_directory: directory,
         };
-        let mut response_rng = DeterministicRng::new([0x38; 32]);
+        let mut response_rng = DeterministicRng::new(response_seed);
         seal_pair_response(
             &recipient,
             &info,
@@ -982,4 +997,581 @@ fn changed_authorization_and_concurrent_initializers_never_replace_the_winner() 
         )
         .unwrap();
     assert_eq!(exact.canonical_request(), first);
+}
+
+fn paired_account(fixture: &Fixture, purpose: PairedRemoteKeyPurpose) -> RemoteKeyAccount {
+    RemoteKeyAccount::paired(
+        INSTALLATION_ID,
+        MachineRootFingerprint::from_bytes(fixture.invite.machine_root_fingerprint),
+        MACHINE_ROUTE,
+        purpose,
+    )
+}
+
+fn contains_crypto_state_file(root: &Path) -> bool {
+    if !root.exists() {
+        return false;
+    }
+    fs::read_dir(root).unwrap().any(|entry| {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            contains_crypto_state_file(&path)
+        } else {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".crypto-state.v1"))
+        }
+    })
+}
+
+fn open_frozen_receipt(
+    fixture: &Fixture,
+    response: &[u8],
+    device_sign_public_key: [u8; 32],
+    canonical_carrier: &[u8],
+) -> agentdeck_protocol::e2ee::PairResponseReceivedV1 {
+    let response = PairResponseV1::from_canonical_bytes(response).expect("strict response");
+    let carrier = PairingControlEnvelopeV1::from_canonical_bytes(canonical_carrier)
+        .expect("strict frozen receipt carrier");
+    let invite_private =
+        HpkePrivateKey::from_bytes(&fixture.invite_private).expect("fixture invite private key");
+    let device_sign =
+        VerifyingKey::from_bytes(&device_sign_public_key).expect("fixture DeviceSign key");
+    open_pair_response_received(
+        &invite_private,
+        &response.info,
+        &pairing_context(OuterFrameKind::PairResponseReceived),
+        &carrier,
+        &device_sign,
+    )
+    .expect("daemon invite key must open and verify the real receipt")
+}
+
+#[test]
+fn paired_promotion_commits_all_final_items_then_freezes_one_real_receipt() {
+    let fixture = Fixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let pending = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+    let mut request_rng = DeterministicRng::new([0x81; 32]);
+    let prepared = pending
+        .prepare(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS,
+            &mut request_rng,
+        )
+        .expect("freeze request");
+    let request_hash = prepared.request_hash();
+    let device_sign_public_key = prepared.device_sign_public_key();
+    let response = fixture.response_for(&prepared);
+    drop(prepared);
+    let verified = pending
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 1,
+            &response,
+        )
+        .expect("verify response");
+
+    let temp = tempfile::tempdir().expect("paired state root");
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let coordinator = PairedPromotionCoordinator::new(&store, INSTALLATION_ID, &state_root);
+    let mut promotion_rng = DeterministicRng::new([0x82; 32]);
+    let promoted = coordinator
+        .promote(verified, &mut promotion_rng)
+        .expect("two-phase paired promotion");
+
+    assert!(!promoted.was_already_committed());
+    assert_eq!(promoted.machine_route(), MACHINE_ROUTE);
+    assert_eq!(promoted.device_route(), DEVICE_ROUTE);
+    assert_eq!(promoted.request_hash(), request_hash);
+    assert_eq!(promoted.response_hash(), sha256(&response));
+    let receipt = open_frozen_receipt(
+        &fixture,
+        &response,
+        device_sign_public_key,
+        promoted.canonical_receipt_carrier(),
+    );
+    assert_eq!(receipt.request_hash, request_hash);
+    assert_eq!(receipt.grant_hash, promoted.grant_hash());
+    assert_eq!(receipt.response_hash, sha256(&response));
+
+    for purpose in [
+        PairedRemoteKeyPurpose::DeviceStorageKek,
+        PairedRemoteKeyPurpose::DeviceSignPrivateKey,
+        PairedRemoteKeyPurpose::DeviceHpkePrivateKey,
+        PairedRemoteKeyPurpose::DeviceGrant,
+        PairedRemoteKeyPurpose::CounterGuard,
+        PairedRemoteKeyPurpose::CommitMarker,
+    ] {
+        assert!(
+            store
+                .load(&paired_account(&fixture, purpose))
+                .unwrap()
+                .is_some(),
+            "paired marker may only become visible after {purpose:?} exists"
+        );
+    }
+    let sealed_state = fs::read(promoted.state_path()).expect("sealed paired CryptoState");
+    assert!(
+        !sealed_state
+            .windows(fixture.invite.invite_secret.len())
+            .any(|window| window == fixture.invite.invite_secret),
+        "sealed state must not retain the invite bearer in plaintext"
+    );
+    assert!(
+        !sealed_state
+            .windows(response.len())
+            .any(|window| window == response),
+        "canonical response must be inside the authenticated encrypted state"
+    );
+
+    let kek_record = store
+        .load(&paired_account(
+            &fixture,
+            PairedRemoteKeyPurpose::DeviceStorageKek,
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(&kek_record.expose_secret()[..4], b"ADKK");
+    let kek_bytes: [u8; 32] = kek_record.expose_secret()[40..72].try_into().unwrap();
+    let inspect_store = FileCryptoStateStore::new_in(
+        &state_root,
+        CryptoStateIdentity::new(
+            INSTALLATION_ID,
+            MachineRootFingerprint::from_bytes(fixture.invite.machine_root_fingerprint),
+            MACHINE_ROUTE,
+        ),
+        DeviceStorageKek::new(kek_bytes),
+    )
+    .unwrap();
+    let plaintext_state = inspect_store.load().unwrap().unwrap();
+    assert!(
+        plaintext_state
+            .expose_secret()
+            .windows(response.len())
+            .any(|window| window == response),
+        "state must retain the exact encrypted PairResponse for duplicate detection"
+    );
+    let invite_hash = fixture.invite.canonical_sha256().unwrap();
+    let pending_sign = store
+        .load(&RemoteKeyAccount::pending(
+            INSTALLATION_ID,
+            invite_hash,
+            PendingRemoteKeyPurpose::DeviceSignPrivateKey,
+        ))
+        .unwrap()
+        .unwrap();
+    let pending_hpke = store
+        .load(&RemoteKeyAccount::pending(
+            INSTALLATION_ID,
+            invite_hash,
+            PendingRemoteKeyPurpose::DeviceHpkePrivateKey,
+        ))
+        .unwrap()
+        .unwrap();
+    for forbidden in [
+        fixture.invite.invite_secret.as_slice(),
+        pending_sign.expose_secret(),
+        pending_hpke.expose_secret(),
+        [0x71; 32].as_slice(),
+        [0x72; 32].as_slice(),
+        [0x73; 32].as_slice(),
+        b"prompt/output transcript sentinel".as_slice(),
+    ] {
+        assert!(
+            !plaintext_state
+                .expose_secret()
+                .windows(forbidden.len())
+                .any(|window| window == forbidden),
+            "CryptoState must not retain raw bearer/private/AEAD/transcript material"
+        );
+    }
+
+    let frozen_receipt = promoted.canonical_receipt_carrier().to_vec();
+    let frozen_state = fs::read(promoted.state_path()).unwrap();
+    drop(promoted);
+    let verified_retry = pending
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 2,
+            &response,
+        )
+        .expect("verify exact retry");
+    let mut panic_rng = PanicRng;
+    let retried = coordinator
+        .promote(verified_retry, &mut panic_rng)
+        .expect("committed retry must be read-only");
+    assert!(retried.was_already_committed());
+    assert_eq!(retried.canonical_receipt_carrier(), frozen_receipt);
+    assert_eq!(fs::read(retried.state_path()).unwrap(), frozen_state);
+}
+
+#[test]
+fn every_paired_keychain_unknown_commit_recovers_without_resealing_receipt() {
+    // pending prepare 固定占用前 3 次 persist；promotion 依次写 KEK、Sign、HPKE、Grant、
+    // CounterGuard、marker。第 5 次及以后失败时 sealed state 已经 durable，恢复不得再用 RNG。
+    for fail_after_write in 4..=9 {
+        let fixture = Fixture::new();
+        let store = UnknownCommitStore::new(fail_after_write);
+        let pending = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+        let mut request_rng = DeterministicRng::new([fail_after_write as u8; 32]);
+        let prepared = pending
+            .prepare(
+                &fixture.invite,
+                &fixture.authorization,
+                NOW_MS,
+                &mut request_rng,
+            )
+            .expect("pending prepare precedes paired fault");
+        let response = fixture.response_for(&prepared);
+        drop(prepared);
+        let verified = pending
+            .verify_response(
+                &fixture.invite,
+                &fixture.authorization,
+                NOW_MS + 1,
+                &response,
+            )
+            .unwrap();
+        let temp = tempfile::tempdir().expect("paired state root");
+        let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+        let coordinator = PairedPromotionCoordinator::new(&store, INSTALLATION_ID, &state_root);
+        let mut first_rng = DeterministicRng::new([0x90 + fail_after_write as u8; 32]);
+        let error = coordinator
+            .promote(verified, &mut first_rng)
+            .expect_err("injected unknown paired commit");
+        assert_eq!(error.code(), "remote.pairing.paired_persistence_failed");
+
+        let marker = store
+            .load(&paired_account(
+                &fixture,
+                PairedRemoteKeyPurpose::CommitMarker,
+            ))
+            .unwrap();
+        assert_eq!(
+            marker.is_some(),
+            fail_after_write == 9,
+            "paired marker must be the final Keychain publication"
+        );
+
+        let verified_restart = pending
+            .verify_response(
+                &fixture.invite,
+                &fixture.authorization,
+                NOW_MS + 2,
+                &response,
+            )
+            .unwrap();
+        let recovered = if fail_after_write == 4 {
+            let mut restart_rng = DeterministicRng::new([0xa4; 32]);
+            coordinator.promote(verified_restart, &mut restart_rng)
+        } else {
+            let mut panic_rng = PanicRng;
+            coordinator.promote(verified_restart, &mut panic_rng)
+        }
+        .expect("restart converges on exact provisional state");
+        let receipt = recovered.canonical_receipt_carrier().to_vec();
+        drop(recovered);
+
+        let verified_retry = pending
+            .verify_response(
+                &fixture.invite,
+                &fixture.authorization,
+                NOW_MS + 3,
+                &response,
+            )
+            .unwrap();
+        let mut panic_rng = PanicRng;
+        let retried = coordinator
+            .promote(verified_retry, &mut panic_rng)
+            .expect("post-marker retry is read-only");
+        assert!(retried.was_already_committed());
+        assert_eq!(retried.canonical_receipt_carrier(), receipt);
+    }
+}
+
+#[test]
+fn committed_pair_rejects_a_second_valid_response_for_the_same_request() {
+    let fixture = Fixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let pending = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+    let mut request_rng = DeterministicRng::new([0xb1; 32]);
+    let prepared = pending
+        .prepare(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS,
+            &mut request_rng,
+        )
+        .unwrap();
+    let first_response = fixture.response_for_seed(&prepared, [0xb2; 32]);
+    let second_response = fixture.response_for_seed(&prepared, [0xb3; 32]);
+    assert_ne!(first_response, second_response);
+    drop(prepared);
+
+    let first_verified = pending
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 1,
+            &first_response,
+        )
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let coordinator = PairedPromotionCoordinator::new(&store, INSTALLATION_ID, &state_root);
+    let mut first_rng = DeterministicRng::new([0xb4; 32]);
+    coordinator.promote(first_verified, &mut first_rng).unwrap();
+
+    let conflicting_verified = pending
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 2,
+            &second_response,
+        )
+        .expect("both responses are independently cryptographically valid");
+    let mut panic_rng = PanicRng;
+    let error = coordinator
+        .promote(conflicting_verified, &mut panic_rng)
+        .expect_err("same request with different response bytes must conflict");
+    assert_eq!(error.code(), "remote.pairing.paired_conflict");
+}
+
+#[test]
+fn promotion_takes_the_device_lease_before_rng_or_any_paired_write() {
+    let fixture = Fixture::new();
+    let store = UnknownCommitStore::new(usize::MAX);
+    let pending = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+    let mut request_rng = DeterministicRng::new([0xc1; 32]);
+    let prepared = pending
+        .prepare(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS,
+            &mut request_rng,
+        )
+        .unwrap();
+    let response = fixture.response_for(&prepared);
+    drop(prepared);
+    let verified = pending
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 1,
+            &response,
+        )
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let holder = RemoteDeviceLease::acquire_in(
+        &state_root,
+        RemoteDeviceLockKey::new(
+            INSTALLATION_ID,
+            MachineRootFingerprint::from_bytes(fixture.invite.machine_root_fingerprint),
+            MACHINE_ROUTE,
+        ),
+    )
+    .unwrap();
+    let writes_before = store.writes.load(Ordering::SeqCst);
+    let coordinator = PairedPromotionCoordinator::new(&store, INSTALLATION_ID, &state_root);
+    let mut panic_rng = PanicRng;
+    let error = coordinator
+        .promote(verified, &mut panic_rng)
+        .expect_err("contending promoter must fail before touching paired state");
+    assert_eq!(error.code(), "remote.device.already_in_use");
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before);
+    for purpose in [
+        PairedRemoteKeyPurpose::DeviceStorageKek,
+        PairedRemoteKeyPurpose::DeviceSignPrivateKey,
+        PairedRemoteKeyPurpose::DeviceHpkePrivateKey,
+        PairedRemoteKeyPurpose::DeviceGrant,
+        PairedRemoteKeyPurpose::CounterGuard,
+        PairedRemoteKeyPurpose::CommitMarker,
+    ] {
+        assert!(
+            store
+                .load(&paired_account(&fixture, purpose))
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(!contains_crypto_state_file(&state_root));
+
+    drop(holder);
+    let verified_retry = pending
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 2,
+            &response,
+        )
+        .unwrap();
+    let mut retry_rng = DeterministicRng::new([0xc2; 32]);
+    coordinator
+        .promote(verified_retry, &mut retry_rng)
+        .expect("released promotion lease permits the exact retry");
+}
+
+#[test]
+fn committed_marker_never_repairs_a_missing_final_item_or_state_file() {
+    for (index, missing) in [
+        PairedRemoteKeyPurpose::DeviceStorageKek,
+        PairedRemoteKeyPurpose::DeviceSignPrivateKey,
+        PairedRemoteKeyPurpose::DeviceHpkePrivateKey,
+        PairedRemoteKeyPurpose::DeviceGrant,
+        PairedRemoteKeyPurpose::CounterGuard,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = Fixture::new();
+        let store = UnknownCommitStore::new(usize::MAX);
+        let pending = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+        let mut request_rng = DeterministicRng::new([0xd0 + index as u8; 32]);
+        let prepared = pending
+            .prepare(
+                &fixture.invite,
+                &fixture.authorization,
+                NOW_MS,
+                &mut request_rng,
+            )
+            .unwrap();
+        let response = fixture.response_for(&prepared);
+        drop(prepared);
+        let verified = pending
+            .verify_response(
+                &fixture.invite,
+                &fixture.authorization,
+                NOW_MS + 1,
+                &response,
+            )
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+        let coordinator = PairedPromotionCoordinator::new(&store, INSTALLATION_ID, &state_root);
+        let mut promotion_rng = DeterministicRng::new([0xe0 + index as u8; 32]);
+        coordinator.promote(verified, &mut promotion_rng).unwrap();
+
+        let missing_account = paired_account(&fixture, missing);
+        store.delete_exact(&missing_account).unwrap();
+        let writes_before = store.writes.load(Ordering::SeqCst);
+        let verified_retry = pending
+            .verify_response(
+                &fixture.invite,
+                &fixture.authorization,
+                NOW_MS + 2,
+                &response,
+            )
+            .unwrap();
+        let mut panic_rng = PanicRng;
+        let error = coordinator
+            .promote(verified_retry, &mut panic_rng)
+            .expect_err("committed state must never repair a final item");
+        assert_eq!(error.code(), "remote.pairing.paired_incomplete");
+        assert_eq!(store.writes.load(Ordering::SeqCst), writes_before);
+        assert!(store.load(&missing_account).unwrap().is_none());
+    }
+
+    let fixture = Fixture::new();
+    let store = UnknownCommitStore::new(usize::MAX);
+    let pending = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+    let mut request_rng = DeterministicRng::new([0xda; 32]);
+    let prepared = pending
+        .prepare(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS,
+            &mut request_rng,
+        )
+        .unwrap();
+    let response = fixture.response_for(&prepared);
+    drop(prepared);
+    let verified = pending
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 1,
+            &response,
+        )
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let coordinator = PairedPromotionCoordinator::new(&store, INSTALLATION_ID, &state_root);
+    let mut promotion_rng = DeterministicRng::new([0xea; 32]);
+    let promoted = coordinator.promote(verified, &mut promotion_rng).unwrap();
+    fs::remove_file(promoted.state_path()).unwrap();
+    drop(promoted);
+    let writes_before = store.writes.load(Ordering::SeqCst);
+    let verified_retry = pending
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 2,
+            &response,
+        )
+        .unwrap();
+    let mut panic_rng = PanicRng;
+    let error = coordinator
+        .promote(verified_retry, &mut panic_rng)
+        .expect_err("committed marker without sealed state is corrupt");
+    assert_eq!(error.code(), "remote.pairing.paired_incomplete");
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before);
+}
+
+#[test]
+fn orphaned_state_without_kek_fails_closed_without_generating_a_replacement() {
+    let fixture = Fixture::new();
+    let store = UnknownCommitStore::new(usize::MAX);
+    let pending = PendingPairingCoordinator::new(&store, INSTALLATION_ID);
+    let mut request_rng = DeterministicRng::new([0xf1; 32]);
+    let prepared = pending
+        .prepare(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS,
+            &mut request_rng,
+        )
+        .unwrap();
+    let response = fixture.response_for(&prepared);
+    drop(prepared);
+    let verified = pending
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 1,
+            &response,
+        )
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
+    let coordinator = PairedPromotionCoordinator::new(&store, INSTALLATION_ID, &state_root);
+    let mut promotion_rng = DeterministicRng::new([0xf2; 32]);
+    coordinator.promote(verified, &mut promotion_rng).unwrap();
+
+    let marker = paired_account(&fixture, PairedRemoteKeyPurpose::CommitMarker);
+    let kek = paired_account(&fixture, PairedRemoteKeyPurpose::DeviceStorageKek);
+    store.delete_exact(&marker).unwrap();
+    store.delete_exact(&kek).unwrap();
+    let writes_before = store.writes.load(Ordering::SeqCst);
+    let verified_retry = pending
+        .verify_response(
+            &fixture.invite,
+            &fixture.authorization,
+            NOW_MS + 2,
+            &response,
+        )
+        .unwrap();
+    let mut panic_rng = PanicRng;
+    let error = coordinator
+        .promote(verified_retry, &mut panic_rng)
+        .expect_err("immutable state without its KEK is not repairable");
+    assert_eq!(error.code(), "remote.pairing.paired_incomplete");
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes_before);
+    assert!(store.load(&kek).unwrap().is_none());
+    assert!(store.load(&marker).unwrap().is_none());
 }
