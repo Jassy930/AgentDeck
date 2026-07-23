@@ -8,6 +8,7 @@ pub mod conversations;
 mod conversations_tests;
 pub mod crypto_state;
 pub mod device_lock;
+pub mod key_sync;
 pub mod keychain;
 #[cfg(unix)]
 pub mod machines;
