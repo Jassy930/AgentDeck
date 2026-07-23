@@ -390,7 +390,11 @@ fn production_adapter_names_the_only_allowed_recovery_open_connect_chain() {
         .find("connect_paired_runtime")
         .expect("paired Runtime connector");
     assert!(recovery < open && open < connect);
-    for forbidden in ["PairedMachineStore::new", ".key_store()", ".state_root()"] {
+    for forbidden in [
+        concat!("PairedMachineStore", "::new"),
+        concat!(".key", "_store()"),
+        concat!(".state", "_root()"),
+    ] {
         assert!(
             !body.contains(forbidden),
             "production mutation adapter must not bypass branded recovery via {forbidden}"

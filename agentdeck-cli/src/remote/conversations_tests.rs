@@ -509,7 +509,11 @@ fn production_adapter_uses_only_the_branded_recovery_open_connect_chain() {
         .find("connect_paired_runtime")
         .expect("paired Runtime connector");
     assert!(recovery < open && open < connect);
-    for forbidden in ["PairedMachineStore::new", ".key_store()", ".state_root()"] {
+    for forbidden in [
+        concat!("PairedMachineStore", "::new"),
+        concat!(".key", "_store()"),
+        concat!(".state", "_root()"),
+    ] {
         assert!(!body.contains(forbidden));
     }
 }

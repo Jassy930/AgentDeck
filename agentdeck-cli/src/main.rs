@@ -2684,7 +2684,11 @@ mod persistent_remote_command_cli_tests {
             .expect("typed conversations output");
         assert!(selector < composition && composition < entropy && entropy < service);
         assert!(service < output);
-        for forbidden in ["injected_for_test", "MemoryRemoteKeyStore", "--relay"] {
+        for forbidden in [
+            concat!("injected", "_for_test"),
+            "MemoryRemoteKeyStore",
+            "--relay",
+        ] {
             assert!(!branch.contains(forbidden));
         }
     }
