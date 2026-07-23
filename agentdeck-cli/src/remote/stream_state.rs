@@ -1,7 +1,8 @@
 //! Persistent remote live-stream 的严格本地状态编码。
 //!
 //! `StreamBindingV1` 原始 canonical bytes 始终保留；Relay outer applied/ACK、Runtime
-//! inner observed/applied 与 receive replay window 是彼此独立的轴，不能互相推导。
+//! inner observed/applied、receive replay window 与 retired subscription cleanup outbox 是
+//! 彼此独立的轴，不能互相推导。
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -13,13 +14,16 @@ use thiserror::Error;
 
 const STREAM_STATE_MAGIC: &[u8; 4] = b"ADSB";
 const LEGACY_STREAM_STATE_VERSION: u16 = 1;
-const STREAM_STATE_VERSION: u16 = 2;
+const PREVIOUS_STREAM_STATE_VERSION: u16 = 2;
+const STREAM_STATE_VERSION: u16 = 3;
 const STREAM_STATE_HEADER_LEN: usize = 12;
 const MAX_CONVERSATION_ID_BYTES: usize = 1_024;
 const MAX_LEGACY_DURABLE_STREAM_STATE_BYTES: usize = 16 * 1_024;
 const MAX_DURABLE_STREAM_STATE_BYTES: usize = 512 * 1_024;
 const MAX_STREAM_REPLAY_ENTRIES: usize = 4_096;
 const MAX_STREAM_REPLAY_DISTANCE: u64 = 4_095;
+// 单 connection 的 live subscription quota 同为 64；handoff cleanup 不允许越过该硬界。
+const MAX_RETIRED_SUBSCRIPTIONS: usize = 64;
 pub(crate) const MAX_DURABLE_STREAM_BINDINGS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +62,24 @@ impl DurableStreamReplayTupleV1 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DurableRetiredSubscriptionV1 {
+    stream_route: StreamRouteId,
+    stream_generation: StreamGenerationId,
+}
+
+impl DurableRetiredSubscriptionV1 {
+    #[must_use]
+    pub const fn stream_route(self) -> StreamRouteId {
+        self.stream_route
+    }
+
+    #[must_use]
+    pub const fn stream_generation(self) -> StreamGenerationId {
+        self.stream_generation
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableStreamBindingV1 {
     binding: StreamBindingV1,
@@ -67,6 +89,7 @@ pub struct DurableStreamBindingV1 {
     inner_applied: RuntimeInnerCursor,
     replay_quarantined: bool,
     replay_entries: Vec<DurableStreamReplayTupleV1>,
+    retired_subscriptions: Vec<DurableRetiredSubscriptionV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +118,7 @@ impl DurableStreamBindingV1 {
             binding,
             replay_quarantined: false,
             replay_entries: Vec::new(),
+            retired_subscriptions: Vec::new(),
         };
         value.validate()?;
         Ok(value)
@@ -115,6 +139,7 @@ impl DurableStreamBindingV1 {
             inner_applied,
             replay_quarantined: false,
             replay_entries: Vec::new(),
+            retired_subscriptions: Vec::new(),
         };
         value.validate()?;
         Ok(value)
@@ -144,7 +169,41 @@ impl DurableStreamBindingV1 {
         {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
+        let active_changed = self.binding.stream_route != candidate.binding.stream_route
+            || self.binding.stream_generation != candidate.binding.stream_generation;
+        let candidate_pair = subscription_pair(
+            candidate.binding.stream_route,
+            candidate.binding.stream_generation,
+        );
+        let mut retired_subscriptions = self.retired_subscriptions.clone();
+        if active_changed {
+            if retired_subscriptions
+                .binary_search_by(|retired| retired_pair(retired).cmp(&candidate_pair))
+                .is_ok()
+            {
+                return Err(RemoteStreamStateError::InvalidCanonical);
+            }
+            if retired_subscriptions.len() == MAX_RETIRED_SUBSCRIPTIONS {
+                return Err(RemoteStreamStateError::TooLarge);
+            }
+            let retired = DurableRetiredSubscriptionV1 {
+                stream_route: self.binding.stream_route,
+                stream_generation: self.binding.stream_generation,
+            };
+            let position = match retired_subscriptions
+                .binary_search_by(|existing| retired_pair(existing).cmp(&retired_pair(&retired)))
+            {
+                Ok(_) => return Err(RemoteStreamStateError::InvalidCanonical),
+                Err(position) => position,
+            };
+            retired_subscriptions.insert(position, retired);
+        }
+        let candidate = Self {
+            retired_subscriptions,
+            ..candidate
+        };
         if !same_replay_scope(&self.binding, &candidate.binding) {
+            candidate.validate()?;
             return Ok(candidate);
         }
         if self.replay_quarantined
@@ -207,6 +266,31 @@ impl DurableStreamBindingV1 {
     #[must_use]
     pub const fn replay_quarantined(&self) -> bool {
         self.replay_quarantined
+    }
+
+    #[must_use]
+    pub(crate) fn retired_subscriptions(&self) -> &[DurableRetiredSubscriptionV1] {
+        &self.retired_subscriptions
+    }
+
+    /// 新 active subscription 的 exact ReplayComplete barrier 已确认后，才允许清空旧
+    /// `(streamRoute, generation)` cleanup outbox。错误 route/generation/cut 一律不改状态。
+    pub(crate) fn clear_retired_subscriptions_after_replay_barrier(
+        &self,
+        stream_route: StreamRouteId,
+        stream_generation: StreamGenerationId,
+        current_cursor: StreamCursor,
+    ) -> Result<Self, RemoteStreamStateError> {
+        if stream_route != self.binding.stream_route
+            || stream_generation != self.binding.stream_generation
+        {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+        self.validate_replay_complete(current_cursor)?;
+        let mut cleared = self.clone();
+        cleared.retired_subscriptions.clear();
+        cleared.validate()?;
+        Ok(cleared)
     }
 
     /// 只把已经完整应用的 exact outer cut 标记为已发送 ACK。ACK 不允许跳过当前
@@ -420,7 +504,24 @@ impl DurableStreamBindingV1 {
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, RemoteStreamStateError> {
+        self.v2_or_v3_canonical_bytes(STREAM_STATE_VERSION)
+    }
+
+    fn legacy_v2_canonical_bytes(&self) -> Result<Vec<u8>, RemoteStreamStateError> {
+        if !self.retired_subscriptions.is_empty() {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+        self.v2_or_v3_canonical_bytes(PREVIOUS_STREAM_STATE_VERSION)
+    }
+
+    fn v2_or_v3_canonical_bytes(&self, version: u16) -> Result<Vec<u8>, RemoteStreamStateError> {
         self.validate()?;
+        if !matches!(
+            version,
+            PREVIOUS_STREAM_STATE_VERSION | STREAM_STATE_VERSION
+        ) {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
         let binding = self
             .binding
             .canonical_bytes()
@@ -442,17 +543,19 @@ impl DurableStreamBindingV1 {
             body.extend_from_slice(&replay.sender_counter.to_be_bytes());
             body.extend_from_slice(&replay.ciphertext_sha256);
         }
+        if version == STREAM_STATE_VERSION {
+            let retired_count = u32::try_from(self.retired_subscriptions.len())
+                .map_err(|_| RemoteStreamStateError::TooLarge)?;
+            body.extend_from_slice(&retired_count.to_be_bytes());
+            for retired in &self.retired_subscriptions {
+                body.extend_from_slice(retired.stream_route.as_bytes());
+                body.extend_from_slice(retired.stream_generation.as_bytes());
+            }
+        }
         if body.len() > MAX_DURABLE_STREAM_STATE_BYTES - STREAM_STATE_HEADER_LEN {
             return Err(RemoteStreamStateError::TooLarge);
         }
-        let body_len = u32::try_from(body.len()).map_err(|_| RemoteStreamStateError::TooLarge)?;
-        let mut encoded = Vec::with_capacity(STREAM_STATE_HEADER_LEN + body.len());
-        encoded.extend_from_slice(STREAM_STATE_MAGIC);
-        encoded.extend_from_slice(&STREAM_STATE_VERSION.to_be_bytes());
-        encoded.extend_from_slice(&[0, 0]);
-        encoded.extend_from_slice(&body_len.to_be_bytes());
-        encoded.extend_from_slice(&body);
-        Ok(encoded)
+        encode_stream_state_body(version, body)
     }
 
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, RemoteStreamStateError> {
@@ -464,9 +567,11 @@ impl DurableStreamBindingV1 {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
         let version = u16::from_be_bytes([bytes[4], bytes[5]]);
-        if !matches!(version, LEGACY_STREAM_STATE_VERSION | STREAM_STATE_VERSION)
-            || (version == LEGACY_STREAM_STATE_VERSION
-                && bytes.len() > MAX_LEGACY_DURABLE_STREAM_STATE_BYTES)
+        if !matches!(
+            version,
+            LEGACY_STREAM_STATE_VERSION | PREVIOUS_STREAM_STATE_VERSION | STREAM_STATE_VERSION
+        ) || (version == LEGACY_STREAM_STATE_VERSION
+            && bytes.len() > MAX_LEGACY_DURABLE_STREAM_STATE_BYTES)
         {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
@@ -491,7 +596,13 @@ impl DurableStreamBindingV1 {
         }
         let outer_applied = decoder.cursor()?;
         let outer_acked = decoder.cursor()?;
-        let (inner_observed, inner_applied, replay_quarantined, replay_entries) = match version {
+        let (
+            inner_observed,
+            inner_applied,
+            replay_quarantined,
+            replay_entries,
+            retired_subscriptions,
+        ) = match version {
             LEGACY_STREAM_STATE_VERSION => {
                 let inner_applied = decoder.inner_cursor()?;
                 let legacy_replay_present = match decoder.u8()? {
@@ -512,9 +623,10 @@ impl DurableStreamBindingV1 {
                     inner_applied,
                     false,
                     Vec::new(),
+                    Vec::new(),
                 )
             }
-            STREAM_STATE_VERSION => {
+            PREVIOUS_STREAM_STATE_VERSION | STREAM_STATE_VERSION => {
                 let inner_observed = decoder.inner_cursor()?;
                 let inner_applied = decoder.inner_cursor()?;
                 let replay_quarantined = match decoder.u8()? {
@@ -537,11 +649,29 @@ impl DurableStreamBindingV1 {
                         ciphertext_sha256: decoder.fixed()?,
                     });
                 }
+                let retired_subscriptions = if version == STREAM_STATE_VERSION {
+                    let retired_count = usize::try_from(decoder.u32()?)
+                        .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+                    if retired_count > MAX_RETIRED_SUBSCRIPTIONS {
+                        return Err(RemoteStreamStateError::InvalidCanonical);
+                    }
+                    let mut retired = Vec::with_capacity(retired_count);
+                    for _ in 0..retired_count {
+                        retired.push(DurableRetiredSubscriptionV1 {
+                            stream_route: StreamRouteId::from_bytes(decoder.fixed()?),
+                            stream_generation: StreamGenerationId::from_bytes(decoder.fixed()?),
+                        });
+                    }
+                    retired
+                } else {
+                    Vec::new()
+                };
                 (
                     inner_observed,
                     inner_applied,
                     replay_quarantined,
                     replay_entries,
+                    retired_subscriptions,
                 )
             }
             _ => return Err(RemoteStreamStateError::InvalidCanonical),
@@ -555,12 +685,14 @@ impl DurableStreamBindingV1 {
             inner_applied,
             replay_quarantined,
             replay_entries,
+            retired_subscriptions,
         };
         value.validate()?;
-        let exact = if version == LEGACY_STREAM_STATE_VERSION {
-            value.legacy_v1_canonical_bytes()?
-        } else {
-            value.canonical_bytes()?
+        let exact = match version {
+            LEGACY_STREAM_STATE_VERSION => value.legacy_v1_canonical_bytes()?,
+            PREVIOUS_STREAM_STATE_VERSION => value.legacy_v2_canonical_bytes()?,
+            STREAM_STATE_VERSION => value.canonical_bytes()?,
+            _ => return Err(RemoteStreamStateError::InvalidCanonical),
         };
         if exact != bytes {
             return Err(RemoteStreamStateError::InvalidCanonical);
@@ -574,6 +706,7 @@ impl DurableStreamBindingV1 {
             || self.inner_observed != self.binding.inner_cursor
             || self.replay_quarantined
             || !self.replay_entries.is_empty()
+            || !self.retired_subscriptions.is_empty()
         {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
@@ -628,8 +761,19 @@ impl DurableStreamBindingV1 {
         }
         if self.replay_entries.len() > MAX_STREAM_REPLAY_ENTRIES
             || (self.replay_quarantined && self.replay_entries.is_empty())
+            || self.retired_subscriptions.len() > MAX_RETIRED_SUBSCRIPTIONS
         {
             return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+        let active_pair =
+            subscription_pair(self.binding.stream_route, self.binding.stream_generation);
+        let mut previous_retired = None;
+        for retired in &self.retired_subscriptions {
+            let pair = retired_pair(retired);
+            if pair == active_pair || previous_retired.is_some_and(|previous| previous >= pair) {
+                return Err(RemoteStreamStateError::InvalidCanonical);
+            }
+            previous_retired = Some(pair);
         }
         let Some(last) = self.replay_entries.last() else {
             return Ok(());
@@ -685,11 +829,13 @@ pub(crate) fn decode_stream_bindings(
     let mut states = Vec::with_capacity(entries.len());
     let mut previous = None;
     let mut routes = HashSet::with_capacity(entries.len());
+    let mut subscription_pairs = HashSet::with_capacity(entries.len());
     for entry in entries {
         let state = DurableStreamBindingV1::from_canonical_bytes(entry)?;
         let key = state.target_key();
         if previous.as_ref().is_some_and(|previous| previous >= &key)
             || !routes.insert(*state.binding.stream_route.as_bytes())
+            || !insert_subscription_pairs(&mut subscription_pairs, &state)
         {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
@@ -709,10 +855,12 @@ pub(crate) fn encode_stream_bindings(
     let mut encoded = Vec::with_capacity(states.len());
     let mut previous = None;
     let mut routes = HashSet::with_capacity(states.len());
+    let mut subscription_pairs = HashSet::with_capacity(states.len());
     for state in states {
         let key = state.target_key();
         if previous.as_ref().is_some_and(|previous| previous >= &key)
             || !routes.insert(*state.binding.stream_route.as_bytes())
+            || !insert_subscription_pairs(&mut subscription_pairs, &state)
         {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
@@ -775,6 +923,33 @@ fn same_replay_scope(left: &StreamBindingV1, right: &StreamBindingV1) -> bool {
         KeyPurpose::ConversationDek => left.stream_route == right.stream_route,
         KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => false,
     }
+}
+
+fn subscription_pair(
+    stream_route: StreamRouteId,
+    stream_generation: StreamGenerationId,
+) -> ([u8; 16], [u8; 16]) {
+    (*stream_route.as_bytes(), *stream_generation.as_bytes())
+}
+
+fn retired_pair(retired: &DurableRetiredSubscriptionV1) -> ([u8; 16], [u8; 16]) {
+    subscription_pair(retired.stream_route, retired.stream_generation)
+}
+
+fn insert_subscription_pairs(
+    pairs: &mut HashSet<([u8; 16], [u8; 16])>,
+    state: &DurableStreamBindingV1,
+) -> bool {
+    if !pairs.insert(subscription_pair(
+        state.binding.stream_route,
+        state.binding.stream_generation,
+    )) {
+        return false;
+    }
+    state
+        .retired_subscriptions
+        .iter()
+        .all(|retired| pairs.insert(retired_pair(retired)))
 }
 
 fn inner_cursor_value(cursor: &RuntimeInnerCursor) -> StreamCursor {
@@ -1011,6 +1186,24 @@ mod tests {
     }
 
     fn replay_entry_offsets(canonical: &[u8]) -> (usize, usize) {
+        assert!(matches!(
+            u16::from_be_bytes([canonical[4], canonical[5]]),
+            PREVIOUS_STREAM_STATE_VERSION | STREAM_STATE_VERSION
+        ));
+        let mut decoder = Decoder::new(&canonical[STREAM_STATE_HEADER_LEN..]);
+        decoder.bytes(STREAM_BINDING_MAX_CANONICAL_BYTES).unwrap();
+        decoder.cursor().unwrap();
+        decoder.cursor().unwrap();
+        decoder.inner_cursor().unwrap();
+        decoder.inner_cursor().unwrap();
+        decoder.u8().unwrap();
+        let count_offset = STREAM_STATE_HEADER_LEN + decoder.cursor;
+        decoder.u32().unwrap();
+        let entries_offset = STREAM_STATE_HEADER_LEN + decoder.cursor;
+        (count_offset, entries_offset)
+    }
+
+    fn retired_subscription_offsets(canonical: &[u8]) -> (usize, usize) {
         assert_eq!(
             u16::from_be_bytes([canonical[4], canonical[5]]),
             STREAM_STATE_VERSION
@@ -1022,6 +1215,10 @@ mod tests {
         decoder.inner_cursor().unwrap();
         decoder.inner_cursor().unwrap();
         decoder.u8().unwrap();
+        let replay_count = decoder.u32().unwrap();
+        for _ in 0..replay_count {
+            decoder.take(80).unwrap();
+        }
         let count_offset = STREAM_STATE_HEADER_LEN + decoder.cursor;
         decoder.u32().unwrap();
         let entries_offset = STREAM_STATE_HEADER_LEN + decoder.cursor;
@@ -1302,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_bootstrap_state_decodes_and_the_next_write_upgrades_to_v2() {
+    fn legacy_v1_bootstrap_state_decodes_and_the_next_write_upgrades_to_v3() {
         let mut binding = binding(
             StreamRouteId::from_bytes([0x35; 16]),
             0x45,
@@ -1400,7 +1597,9 @@ mod tests {
         const SENDER_COUNTER_OFFSET: usize = 40;
         const CIPHERTEXT_HASH_OFFSET: usize = 48;
 
-        let canonical = state_with_two_replay_entries().canonical_bytes().unwrap();
+        let canonical = state_with_two_replay_entries()
+            .legacy_v2_canonical_bytes()
+            .unwrap();
         let (count_offset, entries_offset) = replay_entry_offsets(&canonical);
         assert_eq!(
             u32::from_be_bytes(
@@ -1448,7 +1647,7 @@ mod tests {
 
     #[test]
     fn v2_decoder_rejects_a_replay_count_above_the_hard_cap_before_allocation() {
-        let mut canonical = catalog(0x63).canonical_bytes().unwrap();
+        let mut canonical = catalog(0x63).legacy_v2_canonical_bytes().unwrap();
         let (count_offset, entries_offset) = replay_entry_offsets(&canonical);
         assert_eq!(entries_offset, canonical.len());
         canonical[count_offset..count_offset + 4].copy_from_slice(
@@ -1639,6 +1838,315 @@ mod tests {
                     },
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn v2_state_migrates_with_an_empty_cleanup_outbox_and_the_next_write_upgrades() {
+        let state = state_with_two_replay_entries();
+        let v2 = state.legacy_v2_canonical_bytes().unwrap();
+        assert_eq!(u16::from_be_bytes([v2[4], v2[5]]), 2);
+
+        let migrated = DurableStreamBindingV1::from_canonical_bytes(&v2).unwrap();
+        assert_eq!(migrated, state);
+        assert!(migrated.retired_subscriptions().is_empty());
+        let upgraded = migrated.canonical_bytes().unwrap();
+        assert_eq!(
+            u16::from_be_bytes([upgraded[4], upgraded[5]]),
+            STREAM_STATE_VERSION
+        );
+        assert_ne!(upgraded, v2);
+        assert_eq!(
+            DurableStreamBindingV1::from_canonical_bytes(&upgraded).unwrap(),
+            migrated
+        );
+    }
+
+    #[test]
+    fn route_generation_handoff_durably_queues_cleanup_and_exact_retry_is_idempotent() {
+        let initial = state_with_two_replay_entries();
+        let retired = DurableRetiredSubscriptionV1 {
+            stream_route: initial.binding.stream_route,
+            stream_generation: initial.binding.stream_generation,
+        };
+        let mut next_binding = initial.binding.clone();
+        next_binding.stream_route = StreamRouteId::from_bytes([0x82; 16]);
+        next_binding.stream_generation = StreamGenerationId::from_bytes([0x83; 16]);
+        next_binding.stream_cursor = StreamCursor::BeforeFirst;
+        next_binding.inner_cursor = RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(0),
+        };
+        let rolled = initial
+            .replace_subscription_bootstrap(
+                next_binding,
+                RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::At(0),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(rolled.replay_entry_count(), initial.replay_entry_count());
+        assert_eq!(rolled.retired_subscriptions(), &[retired]);
+        let exact_retry = rolled
+            .replace_subscription_bootstrap(rolled.binding.clone(), rolled.inner_applied.clone())
+            .unwrap();
+        assert_eq!(exact_retry, rolled);
+        let reopened =
+            DurableStreamBindingV1::from_canonical_bytes(&rolled.canonical_bytes().unwrap())
+                .unwrap();
+        assert_eq!(reopened, rolled);
+    }
+
+    #[test]
+    fn cleanup_outbox_clear_requires_the_exact_active_replay_barrier_and_is_idempotent() {
+        let initial = catalog(0x84);
+        let mut next_binding = initial.binding.clone();
+        next_binding.stream_route = StreamRouteId::from_bytes([0x85; 16]);
+        next_binding.stream_generation = StreamGenerationId::from_bytes([0x86; 16]);
+        let rolled = initial
+            .replace_subscription_bootstrap(
+                next_binding,
+                RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            )
+            .unwrap();
+        assert_eq!(rolled.retired_subscriptions().len(), 1);
+
+        assert!(
+            rolled
+                .clear_retired_subscriptions_after_replay_barrier(
+                    StreamRouteId::from_bytes([0x87; 16]),
+                    rolled.binding.stream_generation,
+                    StreamCursor::BeforeFirst,
+                )
+                .is_err()
+        );
+        assert!(
+            rolled
+                .clear_retired_subscriptions_after_replay_barrier(
+                    rolled.binding.stream_route,
+                    StreamGenerationId::from_bytes([0x88; 16]),
+                    StreamCursor::BeforeFirst,
+                )
+                .is_err()
+        );
+        assert!(
+            rolled
+                .clear_retired_subscriptions_after_replay_barrier(
+                    rolled.binding.stream_route,
+                    rolled.binding.stream_generation,
+                    StreamCursor::At(0),
+                )
+                .is_err()
+        );
+
+        let cleared = rolled
+            .clear_retired_subscriptions_after_replay_barrier(
+                rolled.binding.stream_route,
+                rolled.binding.stream_generation,
+                StreamCursor::BeforeFirst,
+            )
+            .unwrap();
+        assert!(cleared.retired_subscriptions().is_empty());
+        assert_eq!(
+            cleared
+                .clear_retired_subscriptions_after_replay_barrier(
+                    cleared.binding.stream_route,
+                    cleared.binding.stream_generation,
+                    StreamCursor::BeforeFirst,
+                )
+                .unwrap(),
+            cleared
+        );
+    }
+
+    #[test]
+    fn cleanup_outbox_is_bounded_and_rejects_reusing_a_retired_pair() {
+        let mut state = catalog(0x89);
+        for index in 0..MAX_RETIRED_SUBSCRIPTIONS {
+            let mut next_binding = state.binding.clone();
+            let value = u8::try_from(index + 1).unwrap();
+            next_binding.stream_route = StreamRouteId::from_bytes([value; 16]);
+            next_binding.stream_generation =
+                StreamGenerationId::from_bytes([value.wrapping_add(0x40); 16]);
+            state = state
+                .replace_subscription_bootstrap(
+                    next_binding,
+                    RuntimeInnerCursor::Catalog {
+                        cursor: StreamCursor::BeforeFirst,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            state.retired_subscriptions().len(),
+            MAX_RETIRED_SUBSCRIPTIONS
+        );
+
+        let mut overflow = state.binding.clone();
+        overflow.stream_route = StreamRouteId::from_bytes([0xf0; 16]);
+        overflow.stream_generation = StreamGenerationId::from_bytes([0xf1; 16]);
+        assert_eq!(
+            state
+                .replace_subscription_bootstrap(
+                    overflow,
+                    RuntimeInnerCursor::Catalog {
+                        cursor: StreamCursor::BeforeFirst,
+                    },
+                )
+                .unwrap_err(),
+            RemoteStreamStateError::TooLarge
+        );
+
+        let retired = state.retired_subscriptions()[0];
+        let mut reused = state.binding.clone();
+        reused.stream_route = retired.stream_route();
+        reused.stream_generation = retired.stream_generation();
+        assert_eq!(
+            state
+                .replace_subscription_bootstrap(
+                    reused,
+                    RuntimeInnerCursor::Catalog {
+                        cursor: StreamCursor::BeforeFirst,
+                    },
+                )
+                .unwrap_err(),
+            RemoteStreamStateError::InvalidCanonical
+        );
+    }
+
+    #[test]
+    fn v3_decoder_rejects_duplicate_unsorted_overflow_and_active_cleanup_aliases() {
+        const RETIRED_ENTRY_LEN: usize = 32;
+
+        let mut state = catalog(0x8a);
+        for (route, generation) in [(0x8b, 0x9b), (0x8c, 0x9c)] {
+            let mut next_binding = state.binding.clone();
+            next_binding.stream_route = StreamRouteId::from_bytes([route; 16]);
+            next_binding.stream_generation = StreamGenerationId::from_bytes([generation; 16]);
+            state = state
+                .replace_subscription_bootstrap(
+                    next_binding,
+                    RuntimeInnerCursor::Catalog {
+                        cursor: StreamCursor::BeforeFirst,
+                    },
+                )
+                .unwrap();
+        }
+        let canonical = state.canonical_bytes().unwrap();
+        let (count_offset, entries_offset) = retired_subscription_offsets(&canonical);
+        assert_eq!(
+            u32::from_be_bytes(
+                canonical[count_offset..count_offset + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            2
+        );
+        assert_eq!(canonical.len() - entries_offset, 2 * RETIRED_ENTRY_LEN);
+
+        let mut duplicate = canonical.clone();
+        duplicate.copy_within(
+            entries_offset..entries_offset + RETIRED_ENTRY_LEN,
+            entries_offset + RETIRED_ENTRY_LEN,
+        );
+        let mut unsorted = canonical.clone();
+        let (left, right) = unsorted[entries_offset..].split_at_mut(RETIRED_ENTRY_LEN);
+        left.swap_with_slice(&mut right[..RETIRED_ENTRY_LEN]);
+        let mut active_alias = canonical;
+        active_alias[entries_offset..entries_offset + 16]
+            .copy_from_slice(state.binding.stream_route.as_bytes());
+        active_alias[entries_offset + 16..entries_offset + RETIRED_ENTRY_LEN]
+            .copy_from_slice(state.binding.stream_generation.as_bytes());
+
+        for (label, mutated) in [
+            ("duplicate", duplicate),
+            ("unsorted", unsorted),
+            ("active alias", active_alias),
+        ] {
+            assert_eq!(
+                DurableStreamBindingV1::from_canonical_bytes(&mutated).unwrap_err(),
+                RemoteStreamStateError::InvalidCanonical,
+                "{label}",
+            );
+        }
+
+        let empty = catalog(0x8d).canonical_bytes().unwrap();
+        let (count_offset, entries_offset) = retired_subscription_offsets(&empty);
+        assert_eq!(entries_offset, empty.len());
+        let mut overflow = empty;
+        overflow[count_offset..count_offset + 4].copy_from_slice(
+            &u32::try_from(MAX_RETIRED_SUBSCRIPTIONS + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        assert_eq!(
+            DurableStreamBindingV1::from_canonical_bytes(&overflow).unwrap_err(),
+            RemoteStreamStateError::InvalidCanonical
+        );
+    }
+
+    #[test]
+    fn collection_rejects_active_retired_and_retired_retired_pair_aliases() {
+        let initial = catalog(0x8e);
+        let retired_pair = (
+            initial.binding.stream_route,
+            initial.binding.stream_generation,
+        );
+        let mut next_binding = initial.binding.clone();
+        next_binding.stream_route = StreamRouteId::from_bytes([0x8f; 16]);
+        next_binding.stream_generation = StreamGenerationId::from_bytes([0x9f; 16]);
+        let catalog_rolled = initial
+            .replace_subscription_bootstrap(
+                next_binding,
+                RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            )
+            .unwrap();
+        let conversation_active = DurableStreamBindingV1::from_stream_binding(binding(
+            retired_pair.0,
+            *retired_pair.1.as_bytes().first().unwrap(),
+            RuntimeInnerCursor::Conversation {
+                conversation_id: ConversationId::new("active-retired-alias"),
+                cursor: StreamCursor::BeforeFirst,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            conversation_active.binding.stream_generation,
+            retired_pair.1
+        );
+        assert_eq!(
+            encode_stream_bindings(vec![catalog_rolled.clone(), conversation_active]).unwrap_err(),
+            RemoteStreamStateError::InvalidCanonical
+        );
+
+        let conversation_initial = DurableStreamBindingV1::from_stream_binding(binding(
+            retired_pair.0,
+            *retired_pair.1.as_bytes().first().unwrap(),
+            RuntimeInnerCursor::Conversation {
+                conversation_id: ConversationId::new("retired-retired-alias"),
+                cursor: StreamCursor::BeforeFirst,
+            },
+        ))
+        .unwrap();
+        let mut conversation_next = conversation_initial.binding.clone();
+        conversation_next.stream_route = StreamRouteId::from_bytes([0x90; 16]);
+        conversation_next.stream_generation = StreamGenerationId::from_bytes([0xa0; 16]);
+        let conversation_rolled = conversation_initial
+            .replace_subscription_bootstrap(
+                conversation_next,
+                RuntimeInnerCursor::Conversation {
+                    conversation_id: ConversationId::new("retired-retired-alias"),
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            encode_stream_bindings(vec![catalog_rolled, conversation_rolled]).unwrap_err(),
+            RemoteStreamStateError::InvalidCanonical
         );
     }
 

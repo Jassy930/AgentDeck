@@ -33,8 +33,8 @@ use agentdeck_protocol::e2ee::{
 };
 use agentdeck_protocol::relay_v2::auth::{DeviceRevocation, Ed25519Signature};
 use agentdeck_protocol::relay_v2::frame::{
-    AcceptedRef, Ack, Publish, Reply, RevocationCommitted, RouteAccepted, SealedBlob, Send,
-    Subscribe,
+    AcceptedRef, Ack, Publish, ReplayComplete, Reply, RevocationCommitted, RouteAccepted,
+    SealedBlob, Send, Subscribe, Unsubscribe,
 };
 use agentdeck_protocol::relay_v2::{
     DeviceRouteId, GrantSerial as RelayGrantSerial, KeyDirectoryRevision, OpaqueRouteFrame,
@@ -69,9 +69,12 @@ const REPLY_COUNTER: u64 = 41;
 const WRONG_REQUEST_ROUTE: RequestRouteId = RequestRouteId::from_bytes([0xa5; 16]);
 const CATALOG_STREAM_ROUTE: StreamRouteId = StreamRouteId::from_bytes([0x81; 16]);
 const CONVERSATION_STREAM_ROUTE: StreamRouteId = StreamRouteId::from_bytes([0x82; 16]);
+const REPLACEMENT_CATALOG_STREAM_ROUTE: StreamRouteId = StreamRouteId::from_bytes([0x83; 16]);
 const CATALOG_RELAY_GENERATION: StreamGenerationId = StreamGenerationId::from_bytes([0x91; 16]);
 const CONVERSATION_RELAY_GENERATION: StreamGenerationId =
     StreamGenerationId::from_bytes([0x92; 16]);
+const REPLACEMENT_CATALOG_RELAY_GENERATION: StreamGenerationId =
+    StreamGenerationId::from_bytes([0x93; 16]);
 const CATALOG_OUTER_HIGH_WATER: u64 = 23;
 const CATALOG_INNER_HIGH_WATER: u64 = 17;
 const CONVERSATION_OUTER_HIGH_WATER: u64 = 29;
@@ -170,6 +173,7 @@ enum SubscriptionScript {
     CatalogUnfinishedPageThenSync,
     CatalogSyncAheadOfBinding,
     CatalogSmallSyncAhead,
+    CatalogReplacementBinding,
     ConversationIndependentGeneration,
     ConversationCompact,
     CatalogBeforeFirst,
@@ -529,7 +533,9 @@ impl RemoteRuntimeTransport for FakeTransport {
                 let (request_route, message_id) = self.inspect_real_send(&decoded);
                 self.queue_scripted_inbound(request_route, message_id);
             }
-            RelayFrameBody::Subscribe(_) | RelayFrameBody::Ack(_)
+            RelayFrameBody::Subscribe(_)
+            | RelayFrameBody::Unsubscribe(_)
+            | RelayFrameBody::Ack(_)
                 if matches!(self.script, TransportScript::Subscription(_)) =>
             {
                 if self.panic_on_first_subscription_control {
@@ -1096,6 +1102,15 @@ fn conversation_sync_complete() -> RuntimeSyncComplete {
 }
 
 fn catalog_stream_binding(outer: StreamCursor, inner: StreamCursor) -> StreamBindingV1 {
+    catalog_stream_binding_on(CATALOG_STREAM_ROUTE, CATALOG_RELAY_GENERATION, outer, inner)
+}
+
+fn catalog_stream_binding_on(
+    stream_route: StreamRouteId,
+    stream_generation: StreamGenerationId,
+    outer: StreamCursor,
+    inner: StreamCursor,
+) -> StreamBindingV1 {
     StreamBindingV1 {
         format_version: E2EE_FORMAT_VERSION,
         runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
@@ -1104,8 +1119,8 @@ fn catalog_stream_binding(outer: StreamCursor, inner: StreamCursor) -> StreamBin
         device_route: DEVICE_ROUTE,
         grant_serial: RelayGrantSerial::new(7),
         root_trust_epoch: TrustEpoch::new(2),
-        stream_route: CATALOG_STREAM_ROUTE,
-        stream_generation: CATALOG_RELAY_GENERATION,
+        stream_route,
+        stream_generation,
         stream_cursor: outer,
         inner_cursor: RuntimeInnerCursor::Catalog { cursor: inner },
         key_directory_revision: KeyDirectoryRevision::new(KEY_DIRECTORY_REVISION),
@@ -1562,6 +1577,34 @@ fn subscription_inbound_frames(
                 ),
             ]
         }
+        SubscriptionScript::CatalogReplacementBinding => {
+            let outer = StreamCursor::At(CATALOG_OUTER_HIGH_WATER);
+            let inner = StreamCursor::At(CATALOG_INNER_HIGH_WATER);
+            vec![
+                accepted,
+                runtime_reply(
+                    RuntimeReply::Subscription(catalog_subscription_receipt()),
+                    REPLY_COUNTER,
+                ),
+                runtime_reply(
+                    RuntimeReply::Catalog(subscription_catalog_snapshot(inner)),
+                    REPLY_COUNTER + 1,
+                ),
+                runtime_reply(
+                    RuntimeReply::SyncComplete(catalog_sync_complete(outer, inner)),
+                    REPLY_COUNTER + 2,
+                ),
+                stream_binding_reply(
+                    catalog_stream_binding_on(
+                        REPLACEMENT_CATALOG_STREAM_ROUTE,
+                        REPLACEMENT_CATALOG_RELAY_GENERATION,
+                        outer,
+                        inner,
+                    ),
+                    REPLY_COUNTER + 3,
+                ),
+            ]
+        }
         SubscriptionScript::ConversationIndependentGeneration => vec![
             accepted,
             runtime_reply(
@@ -1738,6 +1781,17 @@ fn route_accepted(request_route: RequestRouteId) -> OpaqueRouteFrame {
         version: RELAY_PROTOCOL_VERSION,
         body: RelayFrameBody::RouteAccepted(RouteAccepted {
             accepted: AcceptedRef::Request { request_route },
+        }),
+    }
+}
+
+fn replay_complete_frame(binding: &StreamBindingV1) -> OpaqueRouteFrame {
+    OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::ReplayComplete(ReplayComplete {
+            stream_route: binding.stream_route,
+            generation: binding.stream_generation,
+            current_cursor: binding.stream_cursor,
         }),
     }
 }
@@ -5401,4 +5455,162 @@ async fn invalid_stream_binding_target_revision_or_order_rejects_before_install_
         drop(runtime);
         assert_no_durable_stream_binding(&store, &root, &fixture);
     }
+}
+
+#[tokio::test]
+async fn binding_handoff_unsubscribes_the_old_route_before_the_new_replay_barrier() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("binding handoff state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xf7);
+
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open machine for initial binding");
+    let (transport, _first_sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogAt,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xf8; 32]);
+    let initial = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("install initial Catalog binding")
+        .binding()
+        .clone();
+    drop(runtime);
+
+    let replacement = catalog_stream_binding_on(
+        REPLACEMENT_CATALOG_STREAM_ROUTE,
+        REPLACEMENT_CATALOG_RELAY_GENERATION,
+        StreamCursor::At(CATALOG_OUTER_HIGH_WATER),
+        StreamCursor::At(CATALOG_INNER_HIGH_WATER),
+    );
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen machine for binding handoff");
+    let (transport, sent) = FakeTransport::new_subscription_with_counters(
+        SubscriptionScript::CatalogReplacementBinding,
+        catalog_requested_cursor(),
+        device_sign,
+        COUNTER_BLOCK_SIZE,
+        REPLY_COUNTER + COUNTER_BLOCK_SIZE,
+    );
+    let mut runtime = RemoteRuntime::new(
+        reopened,
+        transport.with_post_script_inbound(vec![replay_complete_frame(&replacement)]),
+    );
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xf9; 32]);
+    let outcome = runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("install replacement Catalog binding");
+    assert_eq!(outcome.binding(), &replacement);
+
+    let frames = decoded_outbound_frames(&sent);
+    assert_eq!(
+        frames.len(),
+        4,
+        "handoff emits Send, Unsubscribe, Subscribe, Ack"
+    );
+    assert!(matches!(frames[0].body, RelayFrameBody::Send(_)));
+    assert!(matches!(
+        &frames[1].body,
+        RelayFrameBody::Unsubscribe(Unsubscribe {
+            stream_route,
+            generation,
+        }) if *stream_route == initial.stream_route
+            && *generation == initial.stream_generation
+    ));
+    assert!(matches!(
+        &frames[2].body,
+        RelayFrameBody::Subscribe(Subscribe {
+            stream_route,
+            generation,
+            cursor,
+        }) if *stream_route == replacement.stream_route
+            && *generation == replacement.stream_generation
+            && *cursor == replacement.stream_cursor
+    ));
+    assert!(matches!(
+        &frames[3].body,
+        RelayFrameBody::Ack(Ack {
+            stream_route,
+            generation,
+            up_to_seq,
+        }) if *stream_route == replacement.stream_route
+            && *generation == replacement.stream_generation
+            && *up_to_seq == CATALOG_OUTER_HIGH_WATER
+    ));
+
+    // A successful socket write is not a Relay COMMIT receipt. Dropping before the new
+    // subscription's replay barrier must leave the cleanup outbox durable.
+    drop(runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen machine after unknown Unsubscribe outcome");
+    let (transport, retry_sent) = FakeTransport::new_subscription_with_counters(
+        SubscriptionScript::CatalogReplacementBinding,
+        catalog_requested_cursor(),
+        device_sign,
+        COUNTER_BLOCK_SIZE * 2,
+        REPLY_COUNTER + COUNTER_BLOCK_SIZE * 2,
+    );
+    let mut runtime = RemoteRuntime::new(
+        reopened,
+        transport.with_post_script_inbound(vec![replay_complete_frame(&replacement)]),
+    );
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xfa; 32]);
+    runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("retry old cleanup before exact active binding");
+    let retry_frames = decoded_outbound_frames(&retry_sent);
+    assert_eq!(retry_frames.len(), 4, "unknown cleanup is retried exactly");
+    assert!(matches!(
+        &retry_frames[1].body,
+        RelayFrameBody::Unsubscribe(Unsubscribe {
+            stream_route,
+            generation,
+        }) if *stream_route == initial.stream_route
+            && *generation == initial.stream_generation
+    ));
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::ReplayComplete { current_cursor })
+            if current_cursor == replacement.stream_cursor
+    ));
+    drop(runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen machine after replay barrier");
+    let (transport, confirmed_sent) = FakeTransport::new_subscription_with_counters(
+        SubscriptionScript::CatalogReplacementBinding,
+        catalog_requested_cursor(),
+        device_sign,
+        COUNTER_BLOCK_SIZE * 3,
+        REPLY_COUNTER + COUNTER_BLOCK_SIZE * 3,
+    );
+    let mut runtime = RemoteRuntime::new(reopened, transport);
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xfb; 32]);
+    runtime
+        .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+        .await
+        .expect("exact active binding remains usable after cleanup barrier");
+    let confirmed_frames = decoded_outbound_frames(&confirmed_sent);
+    assert_eq!(confirmed_frames.len(), 3, "confirmed cleanup is not resent");
+    assert!(
+        confirmed_frames
+            .iter()
+            .all(|frame| !matches!(frame.body, RelayFrameBody::Unsubscribe(_)))
+    );
 }

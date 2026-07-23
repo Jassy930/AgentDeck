@@ -21,6 +21,7 @@ use agentdeck_protocol::e2ee::{
 };
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, Ack as RelayAck, SealedBlob, Send as RelaySend, Subscribe as RelaySubscribe,
+    Unsubscribe as RelayUnsubscribe,
 };
 use agentdeck_protocol::relay_v2::{
     CodecError, GrantSerial as RelayGrantSerial, MAX_FRAME_BYTES, OpaqueRouteFrame,
@@ -849,6 +850,21 @@ where
                             "Relay ReplayComplete does not match the exact durable stream cut",
                         )
                     })?;
+                let cleared = durable
+                    .clear_retired_subscriptions_after_replay_barrier(
+                        complete.stream_route,
+                        complete.generation,
+                        complete.current_cursor,
+                    )
+                    .map_err(|_| RemoteRuntimeError::InvalidDurableState)?;
+                if cleared != durable {
+                    let mut mutation_rng = SystemMutationRng::new()?;
+                    self.machine.commit_stream_state_transition(
+                        &durable,
+                        &cleared,
+                        &mut mutation_rng,
+                    )?;
+                }
                 Ok(RemoteStreamFrameOutcome::ReplayComplete {
                     current_cursor: complete.current_cursor,
                 })
@@ -1189,6 +1205,20 @@ where
     ) -> Result<(), RemoteRuntimeError> {
         let binding = durable.binding();
         let outer_applied = durable.outer_applied();
+        for retired in durable.retired_subscriptions() {
+            let unsubscribe = OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::Unsubscribe(RelayUnsubscribe {
+                    stream_route: retired.stream_route(),
+                    generation: retired.stream_generation(),
+                }),
+            };
+            let unsubscribe = encode(&unsubscribe);
+            let _ = decode(&unsubscribe)?;
+            self.transport
+                .send(ExactRelayFrame::from_frozen(unsubscribe)?)
+                .await?;
+        }
         let subscribe = OpaqueRouteFrame {
             version: RELAY_PROTOCOL_VERSION,
             body: RelayFrameBody::Subscribe(RelaySubscribe {
