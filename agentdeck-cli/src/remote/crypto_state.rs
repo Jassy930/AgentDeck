@@ -36,10 +36,17 @@ const ALGORITHM_CHACHA20_POLY1305: u8 = 1;
 const NONCE_LEN: usize = 12;
 const DEVICES_DIRECTORY: &str = "devices";
 const STATE_FILE_SUFFIX: &str = ".crypto-state.v1";
+const PREPARED_STAGE_FILE_SUFFIX: &str = ".crypto-state-stage.v1";
 const STATE_FILE_HASH_DOMAIN: &[u8] = b"agentdeck.remote.crypto-state-file.v1\0";
 const AAD_DOMAIN: &[u8] = b"AgentDeck/CryptoStateFileV1\0";
 const AAD_CLIENT_KIND: &[u8] = b"cli";
 const AAD_PURPOSE: &[u8] = b"crypto-state.v1";
+const PREPARED_STAGE_AAD_PURPOSE: &[u8] = b"crypto-state-prepared-stage.v1";
+const PREPARED_STAGE_MAGIC: &[u8; 4] = b"ADST";
+const PREPARED_STAGE_VERSION: u16 = 1;
+const PREPARED_STAGE_FIXED_LEN: usize = 4 + 2 + 2 + 16 + 32 + 32 + 32 + 4;
+const MAX_PREPARED_STAGE_PLAINTEXT_LEN: usize =
+    MAX_CRYPTO_STATE_PLAINTEXT_LEN + PREPARED_STAGE_FIXED_LEN;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct CryptoStateIdentity {
@@ -66,20 +73,28 @@ impl CryptoStateIdentity {
         self.installation_id.hyphenated().to_string()
     }
 
-    fn state_file_component(self) -> String {
+    fn file_component(self, suffix: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(STATE_FILE_HASH_DOMAIN);
         hasher.update(self.installation_id.as_bytes());
         hasher.update(self.machine_root_fingerprint.as_bytes());
         hasher.update(self.machine_route.as_bytes());
         let digest = hasher.finalize();
-        let mut component = String::with_capacity(digest.len() * 2 + STATE_FILE_SUFFIX.len());
+        let mut component = String::with_capacity(digest.len() * 2 + suffix.len());
         for byte in digest {
             use fmt::Write as _;
             write!(&mut component, "{byte:02x}").expect("writing to String cannot fail");
         }
-        component.push_str(STATE_FILE_SUFFIX);
+        component.push_str(suffix);
         component
+    }
+
+    fn state_file_component(self) -> String {
+        self.file_component(STATE_FILE_SUFFIX)
+    }
+
+    fn prepared_stage_file_component(self) -> String {
+        self.file_component(PREPARED_STAGE_FILE_SUFFIX)
     }
 }
 
@@ -139,6 +154,58 @@ impl fmt::Debug for CryptoStateSnapshot {
 impl Drop for CryptoStateSnapshot {
     fn drop(&mut self) {
         self.0.zeroize();
+    }
+}
+
+/// 已用独立 AAD purpose 认证的 prepared exact-next sidecar。
+///
+/// 字段仅供 paired state 层完成 guard/state 一致性审计；不会暴露 StorageKEK。
+pub(crate) struct PreparedCryptoStateStage {
+    mutation_id: [u8; 16],
+    previous_guard_hash: [u8; 32],
+    previous_state_hash: [u8; 32],
+    next_state_hash: [u8; 32],
+    snapshot: CryptoStateSnapshot,
+    sealed_commitment: [u8; 32],
+}
+
+struct DecodedPreparedStage {
+    mutation_id: [u8; 16],
+    previous_guard_hash: [u8; 32],
+    previous_state_hash: [u8; 32],
+    next_state_hash: [u8; 32],
+    snapshot: Vec<u8>,
+}
+
+impl fmt::Debug for PreparedCryptoStateStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedCryptoStateStage([REDACTED])")
+    }
+}
+
+impl PreparedCryptoStateStage {
+    pub(crate) const fn mutation_id(&self) -> [u8; 16] {
+        self.mutation_id
+    }
+
+    pub(crate) const fn previous_state_hash(&self) -> [u8; 32] {
+        self.previous_state_hash
+    }
+
+    pub(crate) const fn previous_guard_hash(&self) -> [u8; 32] {
+        self.previous_guard_hash
+    }
+
+    pub(crate) const fn next_state_hash(&self) -> [u8; 32] {
+        self.next_state_hash
+    }
+
+    pub(crate) const fn sealed_commitment(&self) -> [u8; 32] {
+        self.sealed_commitment
+    }
+
+    pub(crate) const fn snapshot(&self) -> &CryptoStateSnapshot {
+        &self.snapshot
     }
 }
 
@@ -235,6 +302,7 @@ impl CryptoStateError {
 pub struct FileCryptoStateStore {
     root: PathBuf,
     state_path: PathBuf,
+    prepared_stage_path: PathBuf,
     identity: CryptoStateIdentity,
     kek: DeviceStorageKek,
     initial_commit_observer: Option<Arc<dyn InitialCryptoStateCommitObserver>>,
@@ -294,9 +362,14 @@ impl FileCryptoStateStore {
             .join(identity.installation_component())
             .join(DEVICES_DIRECTORY)
             .join(identity.state_file_component());
+        let prepared_stage_path = root
+            .join(identity.installation_component())
+            .join(DEVICES_DIRECTORY)
+            .join(identity.prepared_stage_file_component());
         Ok(Self {
             root: root.to_path_buf(),
             state_path,
+            prepared_stage_path,
             identity,
             kek,
             initial_commit_observer,
@@ -307,6 +380,13 @@ impl FileCryptoStateStore {
     #[must_use]
     pub fn state_path(&self) -> &Path {
         &self.state_path
+    }
+
+    /// 仅供 automatic harness 检查 prepared sidecar 的文件安全属性与 crash 生命周期。
+    #[doc(hidden)]
+    #[must_use]
+    pub fn prepared_stage_path(&self) -> &Path {
+        &self.prepared_stage_path
     }
 
     pub fn load(&self) -> Result<Option<CryptoStateSnapshot>, CryptoStateError> {
@@ -352,6 +432,28 @@ impl FileCryptoStateStore {
         };
         let excluded = read_backup_excluded(&file, &self.state_path)?;
         validate_state_entry(&directories.devices, &state_component, &file, uid)?;
+        Ok(excluded)
+    }
+
+    /// 仅供 automatic harness 读取 sidecar backup-exclusion 属性，不创建或修复文件。
+    #[doc(hidden)]
+    pub fn prepared_stage_backup_excluded(&self) -> Result<bool, CryptoStateError> {
+        let uid = current_euid();
+        let Some(directories) = self.open_existing_directories(uid)? else {
+            return Ok(false);
+        };
+        let component = self.identity.prepared_stage_file_component();
+        let Some(file) = open_state_file(
+            &directories.devices,
+            &component,
+            &self.prepared_stage_path,
+            uid,
+        )?
+        else {
+            return Ok(false);
+        };
+        let excluded = read_backup_excluded(&file, &self.prepared_stage_path)?;
+        validate_state_entry(&directories.devices, &component, &file, uid)?;
         Ok(excluded)
     }
 
@@ -497,6 +599,202 @@ impl FileCryptoStateStore {
         }
     }
 
+    /// 在 active state 仍精确等于 `expected_active` 时，durable 发布唯一 prepared sidecar。
+    ///
+    /// sidecar 使用同一 StorageKEK、独立 AAD purpose，并冻结 mutation id、previous/next
+    /// hash 与 exact next snapshot。既有 sidecar（包括损坏项）一律在创建 temp 前拒绝。
+    pub(crate) fn prepare_stage(
+        &self,
+        expected_active: &CryptoStateSnapshot,
+        previous_guard_hash: [u8; 32],
+        mutation_id: [u8; 16],
+        next_snapshot: &CryptoStateSnapshot,
+    ) -> Result<PreparedCryptoStateStage, CryptoStateError> {
+        validate_prepared_stage_fields(
+            mutation_id,
+            previous_guard_hash,
+            sha256_bytes(expected_active.expose_secret()),
+            sha256_bytes(next_snapshot.expose_secret()),
+            next_snapshot.expose_secret(),
+        )?;
+        if self.load_prepared_stage()?.is_some() {
+            return Err(CryptoStateError::ImmutableConflict);
+        }
+        let active = self.load()?.ok_or(CryptoStateError::Missing)?;
+        if !snapshot_hash_and_bytes_match(active.expose_secret(), expected_active.expose_secret()) {
+            return Err(CryptoStateError::CompareAndSwapConflict);
+        }
+
+        let plaintext = Zeroizing::new(encode_prepared_stage(
+            mutation_id,
+            previous_guard_hash,
+            expected_active.expose_secret(),
+            next_snapshot.expose_secret(),
+        )?);
+        let sealed = seal_snapshot_with_purpose(
+            &self.identity,
+            &self.kek,
+            PREPARED_STAGE_AAD_PURPOSE,
+            plaintext.as_slice(),
+            MAX_PREPARED_STAGE_PLAINTEXT_LEN,
+        )?;
+        let sealed_commitment = sha256_bytes(&sealed);
+        let uid = current_euid();
+        let directories = self
+            .open_existing_directories(uid)?
+            .ok_or(CryptoStateError::Missing)?;
+        let (mut temp, mut guard) =
+            create_temp_file(&directories.devices, &self.prepared_stage_path, uid)?;
+        temp.write_all(&sealed)
+            .map_err(|source| io_error("write prepared stage temp", source))?;
+        mark_backup_excluded(&temp, guard.path())?;
+        if !read_backup_excluded(&temp, guard.path())? {
+            return Err(CryptoStateError::BackupExclusion);
+        }
+        validate_state_entry(&directories.devices, guard.component_str(), &temp, uid)?;
+        temp.sync_all()
+            .map_err(|source| io_error("sync prepared stage temp", source))?;
+        validate_state_entry(&directories.devices, guard.component_str(), &temp, uid)?;
+
+        let component = self.identity.prepared_stage_file_component();
+        match rename_no_replace(directories.devices.as_raw_fd(), guard.name(), &component)? {
+            PublishOutcome::Published => guard.disarm(),
+            PublishOutcome::LostRace => {
+                guard.remove_now()?;
+                directories
+                    .devices
+                    .sync_all()
+                    .map_err(|source| io_error("sync prepared stage lost-race cleanup", source))?;
+                return Err(CryptoStateError::ImmutableConflict);
+            }
+        }
+        directories
+            .devices
+            .sync_all()
+            .map_err(|source| io_error("sync prepared stage parent", source))?;
+
+        let prepared = self
+            .load_prepared_stage()?
+            .ok_or(CryptoStateError::PersistenceReadbackFailed)?;
+        if prepared.mutation_id == mutation_id
+            && prepared.previous_guard_hash == previous_guard_hash
+            && prepared.previous_state_hash == sha256_bytes(expected_active.expose_secret())
+            && prepared.next_state_hash == sha256_bytes(next_snapshot.expose_secret())
+            && prepared.sealed_commitment == sealed_commitment
+            && snapshot_hash_and_bytes_match(
+                prepared.snapshot.expose_secret(),
+                next_snapshot.expose_secret(),
+            )
+        {
+            Ok(prepared)
+        } else {
+            Err(CryptoStateError::PersistenceReadbackFailed)
+        }
+    }
+
+    /// 只读打开 prepared sidecar；缺失返回 `None`，异常项不修复。
+    pub(crate) fn load_prepared_stage(
+        &self,
+    ) -> Result<Option<PreparedCryptoStateStage>, CryptoStateError> {
+        let uid = current_euid();
+        let Some(directories) = self.open_existing_directories(uid)? else {
+            return Ok(None);
+        };
+        let component = self.identity.prepared_stage_file_component();
+        let Some(mut file) = open_state_file(
+            &directories.devices,
+            &component,
+            &self.prepared_stage_path,
+            uid,
+        )?
+        else {
+            return Ok(None);
+        };
+        if !read_backup_excluded(&file, &self.prepared_stage_path)? {
+            return Err(CryptoStateError::BackupExclusion);
+        }
+        validate_state_entry(&directories.devices, &component, &file, uid)?;
+        let sealed = read_sealed_file_with_limit(&mut file, MAX_PREPARED_STAGE_PLAINTEXT_LEN)?;
+        let sealed_commitment = sha256_bytes(&sealed);
+        let plaintext = Zeroizing::new(open_snapshot_with_purpose(
+            &self.identity,
+            &self.kek,
+            PREPARED_STAGE_AAD_PURPOSE,
+            &sealed,
+            MAX_PREPARED_STAGE_PLAINTEXT_LEN,
+        )?);
+        let decoded = decode_prepared_stage(plaintext.as_slice())?;
+        validate_state_entry(&directories.devices, &component, &file, uid)?;
+        Ok(Some(PreparedCryptoStateStage {
+            mutation_id: decoded.mutation_id,
+            previous_guard_hash: decoded.previous_guard_hash,
+            previous_state_hash: decoded.previous_state_hash,
+            next_state_hash: decoded.next_state_hash,
+            snapshot: CryptoStateSnapshot::new(decoded.snapshot),
+            sealed_commitment,
+        }))
+    }
+
+    /// 对已经完整认证的 exact sidecar 做 unlink + parent fsync。
+    ///
+    /// 删除前再次打开并逐字验证，缺失、替换、篡改均零写拒绝。
+    pub(crate) fn clear_prepared_stage_exact(
+        &self,
+        expected: &PreparedCryptoStateStage,
+    ) -> Result<(), CryptoStateError> {
+        let uid = current_euid();
+        let directories = self
+            .open_existing_directories(uid)?
+            .ok_or(CryptoStateError::Missing)?;
+        let component = self.identity.prepared_stage_file_component();
+        let mut file = open_state_file(
+            &directories.devices,
+            &component,
+            &self.prepared_stage_path,
+            uid,
+        )?
+        .ok_or(CryptoStateError::Missing)?;
+        if !read_backup_excluded(&file, &self.prepared_stage_path)? {
+            return Err(CryptoStateError::BackupExclusion);
+        }
+        validate_state_entry(&directories.devices, &component, &file, uid)?;
+        let sealed = read_sealed_file_with_limit(&mut file, MAX_PREPARED_STAGE_PLAINTEXT_LEN)?;
+        if sha256_bytes(&sealed) != expected.sealed_commitment {
+            return Err(CryptoStateError::CompareAndSwapConflict);
+        }
+        let plaintext = Zeroizing::new(open_snapshot_with_purpose(
+            &self.identity,
+            &self.kek,
+            PREPARED_STAGE_AAD_PURPOSE,
+            &sealed,
+            MAX_PREPARED_STAGE_PLAINTEXT_LEN,
+        )?);
+        let decoded = decode_prepared_stage(plaintext.as_slice())?;
+        if decoded.mutation_id != expected.mutation_id
+            || decoded.previous_guard_hash != expected.previous_guard_hash
+            || decoded.previous_state_hash != expected.previous_state_hash
+            || decoded.next_state_hash != expected.next_state_hash
+            || !snapshot_hash_and_bytes_match(&decoded.snapshot, expected.snapshot.expose_secret())
+        {
+            return Err(CryptoStateError::CompareAndSwapConflict);
+        }
+        validate_state_entry(&directories.devices, &component, &file, uid)?;
+        drop(file);
+        let name = c_string(OsStr::new(&component))?;
+        // SAFETY: retained private directory and the exact authenticated basename above.
+        if unsafe { libc::unlinkat(directories.devices.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(io_error(
+                "remove prepared stage",
+                io::Error::last_os_error(),
+            ));
+        }
+        directories
+            .devices
+            .sync_all()
+            .map_err(|source| io_error("sync prepared stage removal", source))?;
+        Ok(())
+    }
+
     fn observe_replace_stage(&self, stage: CryptoStateReplaceStage) {
         if let Some(observer) = &self.replace_observer {
             observer.after_stage(stage);
@@ -571,7 +869,23 @@ fn seal_snapshot(
     kek: &DeviceStorageKek,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoStateError> {
-    if plaintext.len() > MAX_CRYPTO_STATE_PLAINTEXT_LEN {
+    seal_snapshot_with_purpose(
+        identity,
+        kek,
+        AAD_PURPOSE,
+        plaintext,
+        MAX_CRYPTO_STATE_PLAINTEXT_LEN,
+    )
+}
+
+fn seal_snapshot_with_purpose(
+    identity: &CryptoStateIdentity,
+    kek: &DeviceStorageKek,
+    purpose: &[u8],
+    plaintext: &[u8],
+    max_plaintext_len: usize,
+) -> Result<Vec<u8>, CryptoStateError> {
+    if plaintext.len() > max_plaintext_len {
         return Err(CryptoStateError::InputTooLarge);
     }
     let plaintext_len =
@@ -579,7 +893,7 @@ fn seal_snapshot(
     let mut nonce = [0_u8; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(|_| CryptoStateError::EntropyUnavailable)?;
     let header = encode_header(plaintext_len, nonce);
-    let aad = encode_aad(identity, &header);
+    let aad = encode_aad(identity, purpose, &header);
     let cipher = ChaCha20Poly1305::new_from_slice(kek.as_bytes())
         .map_err(|_| CryptoStateError::AuthenticationFailed)?;
     let encrypted = cipher
@@ -602,17 +916,33 @@ fn open_snapshot(
     kek: &DeviceStorageKek,
     sealed: &[u8],
 ) -> Result<Vec<u8>, CryptoStateError> {
+    open_snapshot_with_purpose(
+        identity,
+        kek,
+        AAD_PURPOSE,
+        sealed,
+        MAX_CRYPTO_STATE_PLAINTEXT_LEN,
+    )
+}
+
+fn open_snapshot_with_purpose(
+    identity: &CryptoStateIdentity,
+    kek: &DeviceStorageKek,
+    purpose: &[u8],
+    sealed: &[u8],
+    max_plaintext_len: usize,
+) -> Result<Vec<u8>, CryptoStateError> {
     if sealed.len() < CRYPTO_STATE_V1_OVERHEAD_LEN {
         return Err(CryptoStateError::InvalidFormat);
     }
-    if sealed.len() > MAX_CRYPTO_STATE_PLAINTEXT_LEN + CRYPTO_STATE_V1_OVERHEAD_LEN {
+    if sealed.len() > max_plaintext_len + CRYPTO_STATE_V1_OVERHEAD_LEN {
         return Err(CryptoStateError::InputTooLarge);
     }
     let header: [u8; CRYPTO_STATE_V1_HEADER_LEN] = sealed[..CRYPTO_STATE_V1_HEADER_LEN]
         .try_into()
         .map_err(|_| CryptoStateError::InvalidFormat)?;
     let (plaintext_len, nonce) = decode_header(&header)?;
-    if plaintext_len > MAX_CRYPTO_STATE_PLAINTEXT_LEN {
+    if plaintext_len > max_plaintext_len {
         return Err(CryptoStateError::InputTooLarge);
     }
     let expected = plaintext_len
@@ -621,7 +951,7 @@ fn open_snapshot(
     if sealed.len() != expected {
         return Err(CryptoStateError::InvalidFormat);
     }
-    let aad = encode_aad(identity, &header);
+    let aad = encode_aad(identity, purpose, &header);
     let cipher = ChaCha20Poly1305::new_from_slice(kek.as_bytes())
         .map_err(|_| CryptoStateError::AuthenticationFailed)?;
     cipher
@@ -636,9 +966,13 @@ fn open_snapshot(
 }
 
 fn snapshot_hash_and_bytes_match(actual: &[u8], expected: &[u8]) -> bool {
-    let actual_hash: [u8; 32] = Sha256::digest(actual).into();
-    let expected_hash: [u8; 32] = Sha256::digest(expected).into();
+    let actual_hash = sha256_bytes(actual);
+    let expected_hash = sha256_bytes(expected);
     actual_hash == expected_hash && actual == expected
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
 fn encode_header(plaintext_len: u32, nonce: [u8; NONCE_LEN]) -> [u8; CRYPTO_STATE_V1_HEADER_LEN] {
@@ -675,6 +1009,7 @@ fn decode_header(
 
 fn encode_aad(
     identity: &CryptoStateIdentity,
+    purpose: &[u8],
     header: &[u8; CRYPTO_STATE_V1_HEADER_LEN],
 ) -> Vec<u8> {
     let fields: [&[u8]; 7] = [
@@ -683,7 +1018,7 @@ fn encode_aad(
         identity.installation_id.as_bytes(),
         identity.machine_root_fingerprint.as_bytes(),
         identity.machine_route.as_bytes(),
-        AAD_PURPOSE,
+        purpose,
         header,
     ];
     let capacity = fields.iter().map(|field| 4 + field.len()).sum();
@@ -696,10 +1031,120 @@ fn encode_aad(
     aad
 }
 
+fn encode_prepared_stage(
+    mutation_id: [u8; 16],
+    previous_guard_hash: [u8; 32],
+    previous_snapshot: &[u8],
+    next_snapshot: &[u8],
+) -> Result<Vec<u8>, CryptoStateError> {
+    let previous_state_hash = sha256_bytes(previous_snapshot);
+    let next_state_hash = sha256_bytes(next_snapshot);
+    validate_prepared_stage_fields(
+        mutation_id,
+        previous_guard_hash,
+        previous_state_hash,
+        next_state_hash,
+        next_snapshot,
+    )?;
+    let snapshot_len =
+        u32::try_from(next_snapshot.len()).map_err(|_| CryptoStateError::InputTooLarge)?;
+    let total_len = PREPARED_STAGE_FIXED_LEN
+        .checked_add(next_snapshot.len())
+        .ok_or(CryptoStateError::InputTooLarge)?;
+    if total_len > MAX_PREPARED_STAGE_PLAINTEXT_LEN {
+        return Err(CryptoStateError::InputTooLarge);
+    }
+    let mut encoded = Vec::with_capacity(total_len);
+    encoded.extend_from_slice(PREPARED_STAGE_MAGIC);
+    encoded.extend_from_slice(&PREPARED_STAGE_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&[0, 0]);
+    encoded.extend_from_slice(&mutation_id);
+    encoded.extend_from_slice(&previous_guard_hash);
+    encoded.extend_from_slice(&previous_state_hash);
+    encoded.extend_from_slice(&next_state_hash);
+    encoded.extend_from_slice(&snapshot_len.to_be_bytes());
+    encoded.extend_from_slice(next_snapshot);
+    Ok(encoded)
+}
+
+fn decode_prepared_stage(plaintext: &[u8]) -> Result<DecodedPreparedStage, CryptoStateError> {
+    if plaintext.len() < PREPARED_STAGE_FIXED_LEN
+        || plaintext.len() > MAX_PREPARED_STAGE_PLAINTEXT_LEN
+        || &plaintext[..4] != PREPARED_STAGE_MAGIC
+        || u16::from_be_bytes([plaintext[4], plaintext[5]]) != PREPARED_STAGE_VERSION
+        || plaintext[6..8] != [0, 0]
+    {
+        return Err(CryptoStateError::InvalidFormat);
+    }
+    let mutation_id = plaintext[8..24]
+        .try_into()
+        .map_err(|_| CryptoStateError::InvalidFormat)?;
+    let previous_guard_hash = plaintext[24..56]
+        .try_into()
+        .map_err(|_| CryptoStateError::InvalidFormat)?;
+    let previous_state_hash = plaintext[56..88]
+        .try_into()
+        .map_err(|_| CryptoStateError::InvalidFormat)?;
+    let next_state_hash = plaintext[88..120]
+        .try_into()
+        .map_err(|_| CryptoStateError::InvalidFormat)?;
+    let snapshot_len = usize::try_from(u32::from_be_bytes(
+        plaintext[120..124]
+            .try_into()
+            .map_err(|_| CryptoStateError::InvalidFormat)?,
+    ))
+    .map_err(|_| CryptoStateError::InputTooLarge)?;
+    if snapshot_len != plaintext.len() - PREPARED_STAGE_FIXED_LEN {
+        return Err(CryptoStateError::InvalidFormat);
+    }
+    let snapshot = plaintext[PREPARED_STAGE_FIXED_LEN..].to_vec();
+    validate_prepared_stage_fields(
+        mutation_id,
+        previous_guard_hash,
+        previous_state_hash,
+        next_state_hash,
+        &snapshot,
+    )?;
+    Ok(DecodedPreparedStage {
+        mutation_id,
+        previous_guard_hash,
+        previous_state_hash,
+        next_state_hash,
+        snapshot,
+    })
+}
+
+fn validate_prepared_stage_fields(
+    mutation_id: [u8; 16],
+    previous_guard_hash: [u8; 32],
+    previous_state_hash: [u8; 32],
+    next_state_hash: [u8; 32],
+    next_snapshot: &[u8],
+) -> Result<(), CryptoStateError> {
+    if mutation_id.iter().all(|byte| *byte == 0)
+        || previous_guard_hash.iter().all(|byte| *byte == 0)
+        || previous_state_hash.iter().all(|byte| *byte == 0)
+        || next_state_hash.iter().all(|byte| *byte == 0)
+        || previous_state_hash == next_state_hash
+        || next_state_hash != sha256_bytes(next_snapshot)
+        || next_snapshot.len() > MAX_CRYPTO_STATE_PLAINTEXT_LEN
+    {
+        return Err(CryptoStateError::InvalidFormat);
+    }
+    Ok(())
+}
+
 fn read_sealed_file(file: &mut File) -> Result<Vec<u8>, CryptoStateError> {
+    read_sealed_file_with_limit(file, MAX_CRYPTO_STATE_PLAINTEXT_LEN)
+}
+
+fn read_sealed_file_with_limit(
+    file: &mut File,
+    max_plaintext_len: usize,
+) -> Result<Vec<u8>, CryptoStateError> {
     let stat = fstat(file.as_raw_fd(), "stat state file")?;
     let size = usize::try_from(stat.st_size).map_err(|_| CryptoStateError::InputTooLarge)?;
-    if size > MAX_CRYPTO_STATE_PLAINTEXT_LEN + CRYPTO_STATE_V1_OVERHEAD_LEN {
+    if size > max_plaintext_len + CRYPTO_STATE_V1_OVERHEAD_LEN {
         return Err(CryptoStateError::InputTooLarge);
     }
     if size < CRYPTO_STATE_V1_OVERHEAD_LEN {
@@ -710,7 +1155,7 @@ fn read_sealed_file(file: &mut File) -> Result<Vec<u8>, CryptoStateError> {
     file.read_exact(&mut header)
         .map_err(map_bounded_read_error)?;
     let (plaintext_len, _) = decode_header(&header)?;
-    if plaintext_len > MAX_CRYPTO_STATE_PLAINTEXT_LEN {
+    if plaintext_len > max_plaintext_len {
         return Err(CryptoStateError::InputTooLarge);
     }
     let expected = plaintext_len
@@ -1210,7 +1655,7 @@ fn mark_backup_excluded(_file: &File, path: &Path) -> Result<(), CryptoStateErro
     use core_foundation_sys::base::CFTypeRef;
     use core_foundation_sys::error::CFErrorRef;
     use core_foundation_sys::number::kCFBooleanTrue;
-    use core_foundation_sys::url::{CFURLSetResourcePropertyForKey, kCFURLIsExcludedFromBackupKey};
+    use core_foundation_sys::url::{kCFURLIsExcludedFromBackupKey, CFURLSetResourcePropertyForKey};
 
     let url = create_cf_file_url(path)?;
     let mut error: CFErrorRef = std::ptr::null_mut();

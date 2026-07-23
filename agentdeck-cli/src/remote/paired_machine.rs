@@ -14,16 +14,15 @@ use std::sync::Arc;
 use agentdeck_crypto::counter::COUNTER_BLOCK_SIZE;
 use agentdeck_crypto::rand_core::CryptoRng;
 use agentdeck_crypto::{
+    open_key_directory_entry, open_pair_response, seal_pair_response_received, sha256, verify_tbs,
     CryptoError, HpkePrivateKey, HpkePublicKey, SecretAeadKey, SignatureBytes, SigningKey,
-    VerifyingKey, open_key_directory_entry, open_pair_response, seal_pair_response_received,
-    sha256, verify_tbs,
+    VerifyingKey,
 };
 use agentdeck_protocol::e2ee::{
-    DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1,
+    DeviceAuthorizationV1, KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1,
     MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairResponseReceivedV1,
-    PairResponseV1, PairingControlEnvelopeV1, PairingError,
+    PairResponseV1, PairingControlEnvelopeV1, PairingError, E2EE_FORMAT_VERSION,
 };
-use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::{
     AuthCanonicalError, CertRole, Ed25519Signature, RelayGrant, SignedCertificate,
 };
@@ -31,6 +30,7 @@ use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayServerId, StreamRouteId,
     TrustEpoch,
 };
+use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::runtime::{MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION};
 use thiserror::Error;
 use uuid::Uuid;
@@ -38,7 +38,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::crypto_state::{
     CryptoStateError, CryptoStateIdentity, CryptoStateSnapshot, DeviceStorageKek,
-    FileCryptoStateStore, MAX_CRYPTO_STATE_PLAINTEXT_LEN,
+    FileCryptoStateStore, PreparedCryptoStateStage, MAX_CRYPTO_STATE_PLAINTEXT_LEN,
 };
 use super::device_lock::{RemoteDeviceLease, RemoteDeviceLockError, RemoteDeviceLockKey};
 use super::keychain::{
@@ -54,6 +54,8 @@ const STATE_HEADER_LEN: usize = 12;
 const MAX_STATE_FIELD_LEN: usize = 8 * 1024 * 1024;
 const MAX_STATE_STRING_LEN: usize = 8 * 1024;
 const MAX_STATE_COLLECTION_ITEMS: usize = 4_096;
+const MUTABLE_STATE_FIXED_ENCODED_LEN: usize = STATE_HEADER_LEN + 64 + 4 + 4 + 36 + 2 + 2;
+const AUTOMATIC_RUNTIME_STATE_PROBE_DOMAIN: &[u8] = b"AgentDeck/AutomaticRuntimeStateProbeV1\0";
 const MAX_MUTABLE_AUDIT_ATTEMPTS: usize = 3;
 
 const MARKER_MAGIC: &[u8; 4] = b"ADPM";
@@ -79,6 +81,125 @@ pub enum PairedMutationStage {
     StateDurable,
     RecoveryStateDurable,
     GuardStableDurable,
+    StateStageDurable,
+    StateGuardPendingDurable,
+    StateActiveDurable,
+    StateRecoveryActiveDurable,
+    StateGuardStableDurable,
+    StateStageCleared,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RuntimeStateMutationAuthority {
+    Production,
+    AutomaticHarness,
+}
+
+/// runtime transport 可读写的 bounded opaque state 投影；不包含 KEK、traffic key 或 raw
+/// paired state。`exchange` 对应单一 terminal exchange blob，另外两项保持 canonical 顺序。
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct OpaqueRuntimeState {
+    exchange: Option<Vec<u8>>,
+    replay_windows: Vec<Vec<u8>>,
+    stream_cursors: Vec<Vec<u8>>,
+}
+
+impl fmt::Debug for OpaqueRuntimeState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OpaqueRuntimeState([REDACTED])")
+    }
+}
+
+impl OpaqueRuntimeState {
+    #[must_use]
+    pub(crate) const fn empty() -> Self {
+        Self {
+            exchange: None,
+            replay_windows: Vec::new(),
+            stream_cursors: Vec::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), PairedPromotionError> {
+        if self.exchange.as_ref().is_some_and(Vec::is_empty)
+            || self
+                .exchange
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_STATE_FIELD_LEN)
+            || self.replay_windows.len() > MAX_STATE_COLLECTION_ITEMS
+            || self.stream_cursors.len() > MAX_STATE_COLLECTION_ITEMS
+            || self
+                .replay_windows
+                .iter()
+                .chain(&self.stream_cursors)
+                .any(|entry| entry.is_empty() || entry.len() > MAX_STATE_FIELD_LEN)
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        checked_mutable_state_encoded_len(
+            0,
+            self.exchange.as_ref().map_or(0, Vec::len),
+            self.replay_windows.iter().map(Vec::len),
+            self.stream_cursors.iter().map(Vec::len),
+        )?;
+        Ok(())
+    }
+
+    fn from_automatic_probe(probe: AutomaticRuntimeStateProbe) -> Self {
+        let encoded = probe.encoded();
+        Self {
+            exchange: Some(encoded.clone()),
+            replay_windows: vec![encoded.clone()],
+            stream_cursors: vec![encoded],
+        }
+    }
+
+    fn automatic_probe(&self) -> Result<Option<AutomaticRuntimeStateProbe>, PairedPromotionError> {
+        if self == &Self::empty() {
+            return Ok(None);
+        }
+        let exchange = self
+            .exchange
+            .as_deref()
+            .ok_or(PairedPromotionError::InvalidState)?;
+        let probe = AutomaticRuntimeStateProbe::decode(exchange)?;
+        let expected = Self::from_automatic_probe(probe);
+        if self != &expected {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(Some(probe))
+    }
+}
+
+/// 仅供 automatic crash harness 驱动通用 state-mutation 边界的非生产探针。
+///
+/// 探针使用与 runtime exchange/replay/cursor codec 不相交的 domain，不能伪造 daemon receipt、
+/// replay admission 或 cursor。production CLI 不构造该类型，也不存在参数、环境变量或配置入口。
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutomaticRuntimeStateProbe(u8);
+
+impl AutomaticRuntimeStateProbe {
+    #[must_use]
+    pub const fn new(seed: u8) -> Self {
+        Self(seed)
+    }
+
+    fn encoded(self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(AUTOMATIC_RUNTIME_STATE_PROBE_DOMAIN.len() + 1);
+        encoded.extend_from_slice(AUTOMATIC_RUNTIME_STATE_PROBE_DOMAIN);
+        encoded.push(self.0);
+        encoded
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, PairedPromotionError> {
+        let seed = encoded
+            .strip_prefix(AUTOMATIC_RUNTIME_STATE_PROBE_DOMAIN)
+            .and_then(|suffix| <[u8; 1]>::try_from(suffix).ok())
+            .map(|suffix| suffix[0])
+            .ok_or(PairedPromotionError::InvalidState)?;
+        Ok(Self(seed))
+    }
 }
 
 /// 已在 CounterGuard 中 durable 预留的 DeviceCommandTx counter 整块。
@@ -343,6 +464,7 @@ struct AuditedPairedMachine {
     state_store: FileCryptoStateStore,
     state_snapshot: CryptoStateSnapshot,
     state: PairedCryptoState,
+    prepared_stage: Option<PreparedCryptoStateStage>,
     counter_account: RemoteKeyAccount,
     counter_guard_bytes: RemoteSecret,
     counter_guard: CounterGuardState,
@@ -369,12 +491,14 @@ impl AuditedPairedMachine {
         self,
         store: &'a dyn RemoteKeyStore,
         mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
+        runtime_state_mutation_authority: RuntimeStateMutationAuthority,
         lease: RemoteDeviceLease,
     ) -> OpenedPairedMachine<'a> {
         OpenedPairedMachine {
             audited: self,
             store,
             mutation_observer,
+            runtime_state_mutation_authority,
             _lease: lease,
         }
     }
@@ -387,6 +511,7 @@ pub struct OpenedPairedMachine<'a> {
     audited: AuditedPairedMachine,
     store: &'a dyn RemoteKeyStore,
     mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
+    runtime_state_mutation_authority: RuntimeStateMutationAuthority,
     // 必须最后销毁，确保 crypto/counter capabilities 不会晚于跨进程独占 lease。
     _lease: RemoteDeviceLease,
 }
@@ -448,6 +573,164 @@ impl OpenedPairedMachine<'_> {
             .any(|key| key._key_id.purpose == purpose)
     }
 
+    /// 仅供 automatic crash harness 读回非生产 state-mutation 探针。
+    #[doc(hidden)]
+    pub fn automatic_runtime_state_probe(
+        &self,
+    ) -> Result<Option<AutomaticRuntimeStateProbe>, PairedPromotionError> {
+        self.audited.state.opaque_runtime_state().automatic_probe()
+    }
+
+    /// 仅供 automatic crash harness 写入与 production runtime codec 不相交的探针。
+    #[doc(hidden)]
+    pub fn replace_automatic_runtime_state_probe<R: CryptoRng>(
+        &mut self,
+        probe: AutomaticRuntimeStateProbe,
+        rng: &mut R,
+    ) -> Result<AutomaticRuntimeStateProbe, PairedPromotionError> {
+        if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let replacement = OpaqueRuntimeState::from_automatic_probe(probe);
+        self.replace_opaque_runtime_state(&replacement, rng)?
+            .automatic_probe()?
+            .ok_or(PairedPromotionError::InvalidState)
+    }
+
+    /// 用 prepared sidecar → StatePending → active state → Stable 的固定前滚事务替换 runtime
+    /// opaque fields。HWM 与 counter reservation 始终保持不变。
+    pub(crate) fn replace_opaque_runtime_state<R: CryptoRng>(
+        &mut self,
+        replacement: &OpaqueRuntimeState,
+        rng: &mut R,
+    ) -> Result<OpaqueRuntimeState, PairedPromotionError> {
+        replacement.validate()?;
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        let current_runtime = self.audited.state.opaque_runtime_state();
+        if &current_runtime == replacement {
+            return Ok(current_runtime);
+        }
+
+        let (reserved_high_water, current_state_hash, binding, initial_guard_commitment) =
+            match self.audited.counter_guard {
+                CounterGuardState::V1(guard) => (
+                    guard.reserved_high_water,
+                    sha256(self.audited.state_snapshot.expose_secret()),
+                    guard.binding,
+                    self.audited.marker.counter_guard_hash,
+                ),
+                CounterGuardState::V2(CounterGuardV2 {
+                    initial_guard_commitment,
+                    directory_revision: _,
+                    binding,
+                    phase:
+                        CounterGuardPhaseV2::Stable {
+                            reserved_high_water,
+                            current_state_hash,
+                        },
+                }) => (
+                    reserved_high_water,
+                    current_state_hash,
+                    binding,
+                    initial_guard_commitment,
+                ),
+                CounterGuardState::V2(CounterGuardV2 {
+                    initial_guard_commitment,
+                    directory_revision: _,
+                    binding,
+                    phase:
+                        CounterGuardPhaseV2::StateStable {
+                            reserved_high_water,
+                            current_state_hash,
+                            ..
+                        },
+                }) => (
+                    reserved_high_water,
+                    current_state_hash,
+                    binding,
+                    initial_guard_commitment,
+                ),
+                CounterGuardState::V2(CounterGuardV2 {
+                    phase:
+                        CounterGuardPhaseV2::Pending { .. } | CounterGuardPhaseV2::StatePending { .. },
+                    ..
+                }) => return Err(PairedPromotionError::InvalidState),
+            };
+        if current_state_hash != sha256(self.audited.state_snapshot.expose_secret()) {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let next_state = self.audited.state.with_opaque_runtime_state(
+            self.audited.marker.state_plaintext_hash,
+            self.audited.marker.counter_guard_hash,
+            replacement,
+        )?;
+        let next_state_bytes = next_state.encode()?;
+        let next_state_hash = sha256(&next_state_bytes);
+        let next_snapshot = CryptoStateSnapshot::new(next_state_bytes);
+        let mut mutation_id = [0_u8; 16];
+        rng.try_fill_bytes(&mut mutation_id)
+            .map_err(|_| PairedPromotionError::EntropyUnavailable)?;
+        if all_zero(&mutation_id) {
+            return Err(PairedPromotionError::EntropyUnavailable);
+        }
+        let previous_guard_hash = sha256(self.audited.counter_guard_bytes.expose_secret());
+
+        let prepared = self
+            .audited
+            .state_store
+            .prepare_stage(
+                &self.audited.state_snapshot,
+                previous_guard_hash,
+                mutation_id,
+                &next_snapshot,
+            )
+            .map_err(PairedPromotionError::CryptoState)?;
+        self.observe_mutation(PairedMutationStage::StateStageDurable);
+        let pending = CounterGuardV2::state_pending(
+            initial_guard_commitment,
+            self.audited.directory_revision,
+            binding,
+            reserved_high_water,
+            prepared.mutation_id(),
+            prepared.previous_guard_hash(),
+            prepared.previous_state_hash(),
+            prepared.next_state_hash(),
+            prepared.sealed_commitment(),
+        )?;
+        self.audited.prepared_stage = Some(prepared);
+        self.replace_counter_guard(CounterGuardState::V2(pending))?;
+        self.observe_mutation(PairedMutationStage::StateGuardPendingDurable);
+
+        self.audited
+            .state_store
+            .compare_and_replace(&self.audited.state_snapshot, &next_snapshot)
+            .map_err(PairedPromotionError::CryptoState)?;
+        self.observe_mutation(PairedMutationStage::StateActiveDurable);
+        self.audited.state_snapshot = next_snapshot;
+        self.audited.state = next_state;
+
+        let stable = CounterGuardV2::state_stable(
+            initial_guard_commitment,
+            self.audited.directory_revision,
+            binding,
+            reserved_high_water,
+            next_state_hash,
+            mutation_id,
+            previous_guard_hash,
+            self.audited
+                .prepared_stage
+                .as_ref()
+                .ok_or(PairedPromotionError::Conflict)?
+                .sealed_commitment(),
+        )?;
+        self.replace_counter_guard(CounterGuardState::V2(stable))?;
+        self.observe_mutation(PairedMutationStage::StateGuardStableDurable);
+        self.clear_authenticated_prepared_stage()?;
+        Ok(self.audited.state.opaque_runtime_state())
+    }
+
     /// 先提升 Keychain guard，再替换 sealed state，最后 finalize guard。
     /// 重启永不复用先前进程可能消费过的 reservation remainder。
     pub fn reserve_command_counter_block<R: CryptoRng>(
@@ -481,7 +764,24 @@ impl OpenedPairedMachine<'_> {
                     initial_guard_commitment,
                 ),
                 CounterGuardState::V2(CounterGuardV2 {
-                    phase: CounterGuardPhaseV2::Pending { .. },
+                    initial_guard_commitment,
+                    directory_revision: _,
+                    binding,
+                    phase:
+                        CounterGuardPhaseV2::StateStable {
+                            reserved_high_water,
+                            current_state_hash,
+                            ..
+                        },
+                }) => (
+                    reserved_high_water,
+                    current_state_hash,
+                    binding,
+                    initial_guard_commitment,
+                ),
+                CounterGuardState::V2(CounterGuardV2 {
+                    phase:
+                        CounterGuardPhaseV2::Pending { .. } | CounterGuardPhaseV2::StatePending { .. },
                     ..
                 }) => return Err(PairedPromotionError::InvalidState),
             };
@@ -535,9 +835,22 @@ impl OpenedPairedMachine<'_> {
     }
 
     fn recover_pending_guard(&mut self) -> Result<(), PairedPromotionError> {
-        let CounterGuardState::V2(guard) = self.audited.counter_guard else {
-            return Ok(());
-        };
+        match self.audited.counter_guard {
+            CounterGuardState::V1(_) => self.clear_authenticated_prepared_stage(),
+            CounterGuardState::V2(guard) => match guard.phase {
+                CounterGuardPhaseV2::Stable { .. } | CounterGuardPhaseV2::StateStable { .. } => {
+                    self.clear_authenticated_prepared_stage()
+                }
+                CounterGuardPhaseV2::Pending { .. } => self.recover_counter_pending(guard),
+                CounterGuardPhaseV2::StatePending { .. } => self.recover_state_pending(guard),
+            },
+        }
+    }
+
+    fn recover_counter_pending(
+        &mut self,
+        guard: CounterGuardV2,
+    ) -> Result<(), PairedPromotionError> {
         let CounterGuardPhaseV2::Pending {
             previous_high_water,
             next_high_water,
@@ -546,7 +859,7 @@ impl OpenedPairedMachine<'_> {
             next_state_hash,
         } = guard.phase
         else {
-            return Ok(());
+            return Err(PairedPromotionError::InvalidState);
         };
         let mut current_hash = sha256(self.audited.state_snapshot.expose_secret());
         let expected = CommandCounterReservation {
@@ -595,6 +908,77 @@ impl OpenedPairedMachine<'_> {
         Ok(())
     }
 
+    fn recover_state_pending(&mut self, guard: CounterGuardV2) -> Result<(), PairedPromotionError> {
+        let CounterGuardPhaseV2::StatePending {
+            reserved_high_water,
+            mutation_id,
+            previous_guard_hash,
+            previous_state_hash,
+            next_state_hash,
+            stage_commitment,
+        } = guard.phase
+        else {
+            return Err(PairedPromotionError::InvalidState);
+        };
+        let prepared = self
+            .audited
+            .prepared_stage
+            .take()
+            .ok_or(PairedPromotionError::Conflict)?;
+        if prepared.mutation_id() != mutation_id
+            || prepared.previous_guard_hash() != previous_guard_hash
+            || prepared.previous_state_hash() != previous_state_hash
+            || prepared.next_state_hash() != next_state_hash
+            || prepared.sealed_commitment() != stage_commitment
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let current_hash = sha256(self.audited.state_snapshot.expose_secret());
+        if current_hash == previous_state_hash {
+            let next_snapshot =
+                CryptoStateSnapshot::new(prepared.snapshot().expose_secret().to_vec());
+            let next_state = PairedCryptoState::decode(next_snapshot.expose_secret())?;
+            self.audited
+                .state_store
+                .compare_and_replace(&self.audited.state_snapshot, &next_snapshot)
+                .map_err(PairedPromotionError::CryptoState)?;
+            self.observe_mutation(PairedMutationStage::StateRecoveryActiveDurable);
+            self.audited.state_snapshot = next_snapshot;
+            self.audited.state = next_state;
+        } else if current_hash != next_state_hash
+            || self.audited.state_snapshot.expose_secret() != prepared.snapshot().expose_secret()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        let stable = CounterGuardV2::state_stable(
+            guard.initial_guard_commitment,
+            guard.directory_revision,
+            guard.binding,
+            reserved_high_water,
+            next_state_hash,
+            mutation_id,
+            previous_guard_hash,
+            stage_commitment,
+        )?;
+        self.replace_counter_guard(CounterGuardState::V2(stable))?;
+        self.observe_mutation(PairedMutationStage::StateGuardStableDurable);
+        self.audited.prepared_stage = Some(prepared);
+        self.clear_authenticated_prepared_stage()
+    }
+
+    fn clear_authenticated_prepared_stage(&mut self) -> Result<(), PairedPromotionError> {
+        let Some(prepared) = self.audited.prepared_stage.take() else {
+            return Ok(());
+        };
+        self.audited
+            .state_store
+            .clear_prepared_stage_exact(&prepared)
+            .map_err(PairedPromotionError::CryptoState)?;
+        self.observe_mutation(PairedMutationStage::StateStageCleared);
+        Ok(())
+    }
+
     /// mutation error 之后不得信任内存 expected；每次 reserve 都从两个 durable backend
     /// 重新读回，并只接受 marker initial commitments 下的 coherent previous/next/stable。
     fn refresh_mutable_state(&mut self) -> Result<(), PairedPromotionError> {
@@ -611,6 +995,11 @@ impl OpenedPairedMachine<'_> {
             .map_err(PairedPromotionError::CryptoState)?
             .ok_or(PairedPromotionError::Incomplete)?;
         let state = PairedCryptoState::decode(state_snapshot.expose_secret())?;
+        let prepared_stage = self
+            .audited
+            .state_store
+            .load_prepared_stage()
+            .map_err(PairedPromotionError::CryptoState)?;
         self.audited.marker.validate_state(
             self.audited.identity,
             &state,
@@ -618,16 +1007,19 @@ impl OpenedPairedMachine<'_> {
         )?;
         validate_counter_guard_state(
             &self.audited.marker,
+            self.audited.identity,
             &counter_guard,
             counter_guard_bytes.expose_secret(),
             &state,
             state_snapshot.expose_secret(),
+            prepared_stage.as_ref(),
             self.audited.device_command_binding,
         )?;
         self.audited.counter_guard_bytes = counter_guard_bytes;
         self.audited.counter_guard = counter_guard;
         self.audited.state_snapshot = state_snapshot;
         self.audited.state = state;
+        self.audited.prepared_stage = prepared_stage;
         Ok(())
     }
 
@@ -661,6 +1053,7 @@ pub struct PairedMachineStore<'a> {
     installation_id: Uuid,
     state_root: PathBuf,
     mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
+    runtime_state_mutation_authority: RuntimeStateMutationAuthority,
 }
 
 impl fmt::Debug for PairedMachineStore<'_> {
@@ -675,9 +1068,17 @@ impl fmt::Debug for PairedMachineStore<'_> {
 impl<'a> PairedMachineStore<'a> {
     #[must_use]
     pub fn new(store: &'a dyn RemoteKeyStore, installation_id: Uuid, state_root: &Path) -> Self {
-        Self::new_inner(store, installation_id, state_root, None)
+        Self::new_inner(
+            store,
+            installation_id,
+            state_root,
+            None,
+            RuntimeStateMutationAuthority::Production,
+        )
     }
 
+    /// Automatic harness constructor。仅此注入入口 mint runtime-state probe write capability；
+    /// production `new` 构造的 opened handle 永远拒绝该探针，且 CLI/env/config 不可达。
     #[doc(hidden)]
     #[must_use]
     pub fn new_with_mutation_observer(
@@ -686,7 +1087,13 @@ impl<'a> PairedMachineStore<'a> {
         state_root: &Path,
         observer: Arc<dyn PairedMutationObserver>,
     ) -> Self {
-        Self::new_inner(store, installation_id, state_root, Some(observer))
+        Self::new_inner(
+            store,
+            installation_id,
+            state_root,
+            Some(observer),
+            RuntimeStateMutationAuthority::AutomaticHarness,
+        )
     }
 
     fn new_inner(
@@ -694,12 +1101,14 @@ impl<'a> PairedMachineStore<'a> {
         installation_id: Uuid,
         state_root: &Path,
         mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
+        runtime_state_mutation_authority: RuntimeStateMutationAuthority,
     ) -> Self {
         Self {
             store,
             installation_id,
             state_root: state_root.to_path_buf(),
             mutation_observer,
+            runtime_state_mutation_authority,
         }
     }
 
@@ -741,7 +1150,12 @@ impl<'a> PairedMachineStore<'a> {
         )
         .map_err(PairedPromotionError::DeviceLock)?;
         let audited = self.audit_marker(&parsed)?;
-        let mut opened = audited.into_opened(self.store, self.mutation_observer.clone(), lease);
+        let mut opened = audited.into_opened(
+            self.store,
+            self.mutation_observer.clone(),
+            self.runtime_state_mutation_authority,
+            lease,
+        );
         opened.recover_pending_guard()?;
         Ok(opened)
     }
@@ -793,7 +1207,7 @@ impl<'a> PairedMachineStore<'a> {
             kek_record.device_storage_kek(),
         )
         .map_err(PairedPromotionError::CryptoState)?;
-        let (counter_secret, state_snapshot) =
+        let (counter_secret, state_snapshot, prepared_stage) =
             self.load_coherent_mutable_pair(&accounts.counter_guard, &state_store)?;
         let counter_guard = CounterGuardState::decode(counter_secret.expose_secret())?;
         let state = PairedCryptoState::decode(state_snapshot.expose_secret())?;
@@ -813,10 +1227,12 @@ impl<'a> PairedMachineStore<'a> {
         }
         validate_counter_guard_state(
             &marker,
+            identity,
             &counter_guard,
             counter_secret.expose_secret(),
             &state,
             state_snapshot.expose_secret(),
+            prepared_stage.as_ref(),
             audit.device_command_binding,
         )?;
 
@@ -835,6 +1251,7 @@ impl<'a> PairedMachineStore<'a> {
             state_store,
             state_snapshot,
             state,
+            prepared_stage,
             counter_account: accounts.counter_guard,
             counter_guard_bytes: counter_secret,
             counter_guard,
@@ -864,19 +1281,34 @@ impl<'a> PairedMachineStore<'a> {
         &self,
         counter_account: &RemoteKeyAccount,
         state_store: &FileCryptoStateStore,
-    ) -> Result<(RemoteSecret, CryptoStateSnapshot), PairedPromotionError> {
+    ) -> Result<
+        (
+            RemoteSecret,
+            CryptoStateSnapshot,
+            Option<PreparedCryptoStateStage>,
+        ),
+        PairedPromotionError,
+    > {
+        let mut last_stage_error = None;
         for _ in 0..MAX_MUTABLE_AUDIT_ATTEMPTS {
             let before = self.load_required(counter_account)?;
             let state = state_store
                 .load()
                 .map_err(PairedPromotionError::CryptoState)?
                 .ok_or(PairedPromotionError::Incomplete)?;
+            let prepared_stage = state_store.load_prepared_stage();
             let after = self.load_required(counter_account)?;
             if before.expose_secret() == after.expose_secret() {
-                return Ok((after, state));
+                match prepared_stage {
+                    Ok(stage) => return Ok((after, state, stage)),
+                    Err(error) => last_stage_error = Some(error),
+                }
             }
         }
-        Err(PairedPromotionError::Conflict)
+        last_stage_error.map_or_else(
+            || Err(PairedPromotionError::Conflict),
+            |error| Err(PairedPromotionError::CryptoState(error)),
+        )
     }
 }
 
@@ -1221,12 +1653,17 @@ impl<'a> PairedPromotionCoordinator<'a> {
             &device_hpke,
         )?;
         let counter_guard = CounterGuardState::decode(counter.expose_secret())?;
+        let prepared_stage = state_store
+            .load_prepared_stage()
+            .map_err(PairedPromotionError::CryptoState)?;
         validate_counter_guard_state(
             &marker,
+            identity,
             &counter_guard,
             counter.expose_secret(),
             &state,
             state_snapshot.expose_secret(),
+            prepared_stage.as_ref(),
             audit.device_command_binding,
         )?;
         if marker.device_sign_pubkey != signing_key.verifying_key().to_bytes()
@@ -1719,12 +2156,15 @@ fn audit_durable_state(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_counter_guard_state(
     marker: &PairedCommitMarkerV1,
+    identity: PairedMachineIdentity,
     guard: &CounterGuardState,
     guard_bytes: &[u8],
     state: &PairedCryptoState,
     state_bytes: &[u8],
+    prepared_stage: Option<&PreparedCryptoStateStage>,
     expected_binding: CounterBindingV1,
 ) -> Result<(), PairedPromotionError> {
     let state_hash = sha256(state_bytes);
@@ -1734,7 +2174,15 @@ fn validate_counter_guard_state(
                 == CounterGuardV1::from_binding(marker.directory_revision, expected_binding)
                 && sha256(guard_bytes) == marker.counter_guard_hash =>
         {
-            Ok(())
+            validate_uncommitted_orphan_stage(
+                marker,
+                identity,
+                guard_bytes,
+                state,
+                state_bytes,
+                0,
+                prepared_stage,
+            )
         }
         (CounterGuardState::V1(_), PairedCryptoState::V1(_)) => Err(PairedPromotionError::Conflict),
         (CounterGuardState::V1(_), PairedCryptoState::V2(_)) => Err(PairedPromotionError::Conflict),
@@ -1752,7 +2200,37 @@ fn validate_counter_guard_state(
                 } if current_state_hash == state_hash
                     && state_matches_stable_high_water(state, reserved_high_water) =>
                 {
-                    Ok(())
+                    validate_uncommitted_orphan_stage(
+                        marker,
+                        identity,
+                        guard_bytes,
+                        state,
+                        state_bytes,
+                        reserved_high_water,
+                        prepared_stage,
+                    )
+                }
+                CounterGuardPhaseV2::StateStable {
+                    reserved_high_water,
+                    current_state_hash,
+                    mutation_id,
+                    previous_guard_hash,
+                    stage_commitment,
+                } if current_state_hash == state_hash
+                    && state_matches_stable_high_water(state, reserved_high_water) =>
+                {
+                    validate_state_stable_stage(
+                        marker,
+                        identity,
+                        guard_bytes,
+                        state,
+                        state_bytes,
+                        reserved_high_water,
+                        mutation_id,
+                        previous_guard_hash,
+                        stage_commitment,
+                        prepared_stage,
+                    )
                 }
                 CounterGuardPhaseV2::Pending {
                     previous_high_water,
@@ -1763,6 +2241,9 @@ fn validate_counter_guard_state(
                 } if state_hash == previous_state_hash
                     && state_matches_previous_high_water(state, previous_high_water) =>
                 {
+                    if prepared_stage.is_some() {
+                        return Err(PairedPromotionError::Conflict);
+                    }
                     let expected = CommandCounterReservation {
                         reservation_id,
                         start: previous_high_water,
@@ -1779,6 +2260,9 @@ fn validate_counter_guard_state(
                     previous_state_hash: _,
                     next_state_hash,
                 } if state_hash == next_state_hash => {
+                    if prepared_stage.is_some() {
+                        return Err(PairedPromotionError::Conflict);
+                    }
                     let expected = CommandCounterReservation {
                         reservation_id,
                         start: previous_high_water,
@@ -1791,9 +2275,157 @@ fn validate_counter_guard_state(
                         Err(PairedPromotionError::Conflict)
                     }
                 }
+                CounterGuardPhaseV2::StatePending {
+                    reserved_high_water,
+                    mutation_id,
+                    previous_guard_hash,
+                    previous_state_hash,
+                    next_state_hash,
+                    stage_commitment,
+                } => validate_state_pending_stage(
+                    marker,
+                    identity,
+                    state,
+                    state_bytes,
+                    reserved_high_water,
+                    mutation_id,
+                    previous_guard_hash,
+                    previous_state_hash,
+                    next_state_hash,
+                    stage_commitment,
+                    prepared_stage,
+                ),
                 _ => Err(PairedPromotionError::Conflict),
             }
         }
+    }
+}
+
+fn validate_uncommitted_orphan_stage(
+    marker: &PairedCommitMarkerV1,
+    identity: PairedMachineIdentity,
+    guard_bytes: &[u8],
+    active: &PairedCryptoState,
+    active_bytes: &[u8],
+    reserved_high_water: u64,
+    prepared_stage: Option<&PreparedCryptoStateStage>,
+) -> Result<(), PairedPromotionError> {
+    let Some(stage) = prepared_stage else {
+        return Ok(());
+    };
+    let active_hash = sha256(active_bytes);
+    if stage.previous_guard_hash() != sha256(guard_bytes)
+        || active_hash != stage.previous_state_hash()
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+    let next = PairedCryptoState::decode(stage.snapshot().expose_secret())?;
+    marker.validate_state(identity, &next, stage.snapshot().expose_secret())?;
+    if !state_matches_stable_high_water(&next, reserved_high_water) {
+        return Err(PairedPromotionError::Conflict);
+    }
+    validate_runtime_only_transition(marker, active, &next, stage.snapshot().expose_secret())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_state_stable_stage(
+    marker: &PairedCommitMarkerV1,
+    identity: PairedMachineIdentity,
+    guard_bytes: &[u8],
+    active: &PairedCryptoState,
+    active_bytes: &[u8],
+    reserved_high_water: u64,
+    mutation_id: [u8; 16],
+    previous_guard_hash: [u8; 32],
+    stage_commitment: [u8; 32],
+    prepared_stage: Option<&PreparedCryptoStateStage>,
+) -> Result<(), PairedPromotionError> {
+    let Some(stage) = prepared_stage else {
+        return Ok(());
+    };
+    let active_hash = sha256(active_bytes);
+    let next = PairedCryptoState::decode(stage.snapshot().expose_secret())?;
+    marker.validate_state(identity, &next, stage.snapshot().expose_secret())?;
+    if !state_matches_stable_high_water(&next, reserved_high_water) {
+        return Err(PairedPromotionError::Conflict);
+    }
+    if stage.mutation_id() == mutation_id
+        && stage.previous_guard_hash() == previous_guard_hash
+        && stage.sealed_commitment() == stage_commitment
+        && active_hash == stage.next_state_hash()
+        && active_bytes == stage.snapshot().expose_secret()
+    {
+        // Stable 已经提交本轮 exact next；sidecar 只待安全清理，不能再次执行 transition。
+        Ok(())
+    } else if stage.previous_guard_hash() == sha256(guard_bytes)
+        && active_hash == stage.previous_state_hash()
+    {
+        // 下一轮只完成了 stage-first；这是未提交 intent，只允许清理，绝不能前滚 active/HWM。
+        validate_runtime_only_transition(marker, active, &next, stage.snapshot().expose_secret())
+    } else {
+        Err(PairedPromotionError::Conflict)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_state_pending_stage(
+    marker: &PairedCommitMarkerV1,
+    identity: PairedMachineIdentity,
+    active: &PairedCryptoState,
+    active_bytes: &[u8],
+    reserved_high_water: u64,
+    mutation_id: [u8; 16],
+    previous_guard_hash: [u8; 32],
+    previous_state_hash: [u8; 32],
+    next_state_hash: [u8; 32],
+    stage_commitment: [u8; 32],
+    prepared_stage: Option<&PreparedCryptoStateStage>,
+) -> Result<(), PairedPromotionError> {
+    let stage = prepared_stage.ok_or(PairedPromotionError::Conflict)?;
+    if stage.mutation_id() != mutation_id
+        || stage.previous_guard_hash() != previous_guard_hash
+        || stage.previous_state_hash() != previous_state_hash
+        || stage.next_state_hash() != next_state_hash
+        || stage.sealed_commitment() != stage_commitment
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+    let next = PairedCryptoState::decode(stage.snapshot().expose_secret())?;
+    marker.validate_state(identity, &next, stage.snapshot().expose_secret())?;
+    if !state_matches_stable_high_water(&next, reserved_high_water) {
+        return Err(PairedPromotionError::Conflict);
+    }
+    let active_hash = sha256(active_bytes);
+    if active_hash == previous_state_hash
+        && state_matches_previous_high_water(active, reserved_high_water)
+    {
+        validate_runtime_only_transition(marker, active, &next, stage.snapshot().expose_secret())
+    } else if active_hash == next_state_hash
+        && active_bytes == stage.snapshot().expose_secret()
+        && state_matches_stable_high_water(active, reserved_high_water)
+    {
+        Ok(())
+    } else {
+        Err(PairedPromotionError::Conflict)
+    }
+}
+
+fn validate_runtime_only_transition(
+    marker: &PairedCommitMarkerV1,
+    previous: &PairedCryptoState,
+    next: &PairedCryptoState,
+    next_bytes: &[u8],
+) -> Result<(), PairedPromotionError> {
+    let rebuilt = previous.with_opaque_runtime_state(
+        marker.state_plaintext_hash,
+        marker.counter_guard_hash,
+        &next.opaque_runtime_state(),
+    )?;
+    let rebuilt_bytes = Zeroizing::new(rebuilt.encode()?);
+    if rebuilt_bytes.as_slice() == next_bytes {
+        Ok(())
+    } else {
+        Err(PairedPromotionError::Conflict)
     }
 }
 
@@ -1821,9 +2453,10 @@ fn state_matches_previous_high_water(state: &PairedCryptoState, high_water: u64)
     match state {
         // V1 guard 本身只编码初始 HWM=0；任何非零值都必须已有 V2 sealed fence。
         PairedCryptoState::V1(_) => high_water == 0,
-        PairedCryptoState::V2(_) => state
-            .counter_reservation()
-            .is_some_and(|reservation| reservation.end_exclusive == high_water),
+        PairedCryptoState::V2(_) => match state.counter_reservation() {
+            Some(reservation) => reservation.end_exclusive == high_water,
+            None => high_water == 0,
+        },
     }
 }
 
@@ -1831,9 +2464,10 @@ fn state_matches_stable_high_water(state: &PairedCryptoState, high_water: u64) -
     match state {
         // stable V2 总在 sealed-state CAS 之后；V1 state 是不可能的 durable 顺序。
         PairedCryptoState::V1(_) => false,
-        PairedCryptoState::V2(_) => state
-            .counter_reservation()
-            .is_some_and(|reservation| reservation.end_exclusive == high_water),
+        PairedCryptoState::V2(_) => match state.counter_reservation() {
+            Some(reservation) => reservation.end_exclusive == high_water,
+            None => high_water == 0,
+        },
     }
 }
 
@@ -1956,6 +2590,21 @@ enum CounterGuardPhaseV2 {
         previous_state_hash: [u8; 32],
         next_state_hash: [u8; 32],
     },
+    StatePending {
+        reserved_high_water: u64,
+        mutation_id: [u8; 16],
+        previous_guard_hash: [u8; 32],
+        previous_state_hash: [u8; 32],
+        next_state_hash: [u8; 32],
+        stage_commitment: [u8; 32],
+    },
+    StateStable {
+        reserved_high_water: u64,
+        current_state_hash: [u8; 32],
+        mutation_id: [u8; 16],
+        previous_guard_hash: [u8; 32],
+        stage_commitment: [u8; 32],
+    },
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2020,16 +2669,76 @@ impl CounterGuardV2 {
         Ok(value)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn state_pending(
+        initial_guard_commitment: [u8; 32],
+        directory_revision: KeyDirectoryRevision,
+        binding: CounterBindingV1,
+        reserved_high_water: u64,
+        mutation_id: [u8; 16],
+        previous_guard_hash: [u8; 32],
+        previous_state_hash: [u8; 32],
+        next_state_hash: [u8; 32],
+        stage_commitment: [u8; 32],
+    ) -> Result<Self, PairedPromotionError> {
+        let value = Self {
+            initial_guard_commitment,
+            directory_revision,
+            binding,
+            phase: CounterGuardPhaseV2::StatePending {
+                reserved_high_water,
+                mutation_id,
+                previous_guard_hash,
+                previous_state_hash,
+                next_state_hash,
+                stage_commitment,
+            },
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn state_stable(
+        initial_guard_commitment: [u8; 32],
+        directory_revision: KeyDirectoryRevision,
+        binding: CounterBindingV1,
+        reserved_high_water: u64,
+        current_state_hash: [u8; 32],
+        mutation_id: [u8; 16],
+        previous_guard_hash: [u8; 32],
+        stage_commitment: [u8; 32],
+    ) -> Result<Self, PairedPromotionError> {
+        let value = Self {
+            initial_guard_commitment,
+            directory_revision,
+            binding,
+            phase: CounterGuardPhaseV2::StateStable {
+                reserved_high_water,
+                current_state_hash,
+                mutation_id,
+                previous_guard_hash,
+                stage_commitment,
+            },
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     fn encode(self) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(match self.phase {
             CounterGuardPhaseV2::Stable { .. } => 100,
             CounterGuardPhaseV2::Pending { .. } => 156,
+            CounterGuardPhaseV2::StatePending { .. } => 212,
+            CounterGuardPhaseV2::StateStable { .. } => 180,
         });
         encoded.extend_from_slice(COUNTER_GUARD_MAGIC);
         encoded.extend_from_slice(&MUTABLE_COUNTER_GUARD_VERSION.to_be_bytes());
         encoded.push(match self.phase {
             CounterGuardPhaseV2::Stable { .. } => 0,
             CounterGuardPhaseV2::Pending { .. } => 1,
+            CounterGuardPhaseV2::StatePending { .. } => 2,
+            CounterGuardPhaseV2::StateStable { .. } => 3,
         });
         encoded.push(0);
         encoded.extend_from_slice(&self.initial_guard_commitment);
@@ -2057,12 +2766,40 @@ impl CounterGuardV2 {
                 encoded.extend_from_slice(&previous_state_hash);
                 encoded.extend_from_slice(&next_state_hash);
             }
+            CounterGuardPhaseV2::StatePending {
+                reserved_high_water,
+                mutation_id,
+                previous_guard_hash,
+                previous_state_hash,
+                next_state_hash,
+                stage_commitment,
+            } => {
+                encoded.extend_from_slice(&reserved_high_water.to_be_bytes());
+                encoded.extend_from_slice(&mutation_id);
+                encoded.extend_from_slice(&previous_guard_hash);
+                encoded.extend_from_slice(&previous_state_hash);
+                encoded.extend_from_slice(&next_state_hash);
+                encoded.extend_from_slice(&stage_commitment);
+            }
+            CounterGuardPhaseV2::StateStable {
+                reserved_high_water,
+                current_state_hash,
+                mutation_id,
+                previous_guard_hash,
+                stage_commitment,
+            } => {
+                encoded.extend_from_slice(&reserved_high_water.to_be_bytes());
+                encoded.extend_from_slice(&current_state_hash);
+                encoded.extend_from_slice(&mutation_id);
+                encoded.extend_from_slice(&previous_guard_hash);
+                encoded.extend_from_slice(&stage_commitment);
+            }
         }
         encoded
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, PairedPromotionError> {
-        if !matches!(bytes.len(), 100 | 156)
+        if !matches!(bytes.len(), 100 | 156 | 180 | 212)
             || &bytes[..4] != COUNTER_GUARD_MAGIC
             || u16::from_be_bytes([bytes[4], bytes[5]]) != MUTABLE_COUNTER_GUARD_VERSION
             || bytes[7] != 0
@@ -2090,6 +2827,27 @@ impl CounterGuardV2 {
                 binding,
                 decoder.u64()?,
                 decoder.u64()?,
+                decoder.fixed()?,
+                decoder.fixed()?,
+                decoder.fixed()?,
+            )?,
+            2 if bytes.len() == 212 => Self::state_pending(
+                initial_guard_commitment,
+                directory_revision,
+                binding,
+                decoder.u64()?,
+                decoder.fixed()?,
+                decoder.fixed()?,
+                decoder.fixed()?,
+                decoder.fixed()?,
+                decoder.fixed()?,
+            )?,
+            3 if bytes.len() == 180 => Self::state_stable(
+                initial_guard_commitment,
+                directory_revision,
+                binding,
+                decoder.u64()?,
+                decoder.fixed()?,
                 decoder.fixed()?,
                 decoder.fixed()?,
                 decoder.fixed()?,
@@ -2134,6 +2892,37 @@ impl CounterGuardV2 {
                 || all_zero(&previous_state_hash)
                 || all_zero(&next_state_hash)
                 || previous_state_hash == next_state_hash =>
+            {
+                Err(PairedPromotionError::InvalidState)
+            }
+            CounterGuardPhaseV2::StatePending {
+                reserved_high_water,
+                mutation_id,
+                previous_guard_hash,
+                previous_state_hash,
+                next_state_hash,
+                stage_commitment,
+            } if !reserved_high_water.is_multiple_of(COUNTER_BLOCK_SIZE)
+                || all_zero(&mutation_id)
+                || all_zero(&previous_guard_hash)
+                || all_zero(&previous_state_hash)
+                || all_zero(&next_state_hash)
+                || all_zero(&stage_commitment)
+                || previous_state_hash == next_state_hash =>
+            {
+                Err(PairedPromotionError::InvalidState)
+            }
+            CounterGuardPhaseV2::StateStable {
+                reserved_high_water,
+                current_state_hash,
+                mutation_id,
+                previous_guard_hash,
+                stage_commitment,
+            } if !reserved_high_water.is_multiple_of(COUNTER_BLOCK_SIZE)
+                || all_zero(&current_state_hash)
+                || all_zero(&mutation_id)
+                || all_zero(&previous_guard_hash)
+                || all_zero(&stage_commitment) =>
             {
                 Err(PairedPromotionError::InvalidState)
             }
@@ -2467,6 +3256,61 @@ impl PairedCryptoState {
         value.validate()?;
         Ok(Self::V2(value))
     }
+
+    fn opaque_runtime_state(&self) -> OpaqueRuntimeState {
+        match self {
+            Self::V1(_) => OpaqueRuntimeState::empty(),
+            Self::V2(value) => OpaqueRuntimeState {
+                exchange: value.receipt_terminal.clone(),
+                replay_windows: value.replay_windows.clone(),
+                stream_cursors: value.stream_cursors.clone(),
+            },
+        }
+    }
+
+    fn with_opaque_runtime_state(
+        &self,
+        initial_state_commitment: [u8; 32],
+        initial_guard_commitment: [u8; 32],
+        runtime: &OpaqueRuntimeState,
+    ) -> Result<Self, PairedPromotionError> {
+        runtime.validate()?;
+        let bootstrap = Zeroizing::new(self.bootstrap().encode()?);
+        checked_mutable_state_encoded_len(
+            bootstrap.len(),
+            runtime.exchange.as_ref().map_or(0, Vec::len),
+            runtime.replay_windows.iter().map(Vec::len),
+            runtime.stream_cursors.iter().map(Vec::len),
+        )?;
+        let copy_reservation =
+            |reservation: &CommandCounterReservation| CommandCounterReservation {
+                reservation_id: reservation.reservation_id,
+                start: reservation.start,
+                end_exclusive: reservation.end_exclusive,
+            };
+        let value = match self {
+            Self::V1(bootstrap) => PairedCryptoStateV2 {
+                initial_state_commitment,
+                initial_guard_commitment,
+                bootstrap: bootstrap.clone(),
+                receipt_terminal: runtime.exchange.clone(),
+                counter_reservation: None,
+                replay_windows: runtime.replay_windows.clone(),
+                stream_cursors: runtime.stream_cursors.clone(),
+            },
+            Self::V2(current) => PairedCryptoStateV2 {
+                initial_state_commitment: current.initial_state_commitment,
+                initial_guard_commitment: current.initial_guard_commitment,
+                bootstrap: current.bootstrap.clone(),
+                receipt_terminal: runtime.exchange.clone(),
+                counter_reservation: current.counter_reservation.as_ref().map(copy_reservation),
+                replay_windows: runtime.replay_windows.clone(),
+                stream_cursors: runtime.stream_cursors.clone(),
+            },
+        };
+        value.validate()?;
+        Ok(Self::V2(value))
+    }
 }
 
 /// V2 把 marker 的两个旧 hash 固化为 initial commitments；当前 state hash 只由 guard 绑定。
@@ -2610,6 +3454,12 @@ impl PairedCryptoStateV2 {
         if let Some(reservation) = &self.counter_reservation {
             reservation.validate()?;
         }
+        checked_mutable_state_encoded_len(
+            bootstrap.len(),
+            self.receipt_terminal.as_ref().map_or(0, Vec::len),
+            self.replay_windows.iter().map(Vec::len),
+            self.stream_cursors.iter().map(Vec::len),
+        )?;
         Ok(())
     }
 }
@@ -2949,6 +3799,41 @@ fn put_state_collection(
     Ok(())
 }
 
+fn checked_mutable_state_encoded_len<I, J>(
+    bootstrap_len: usize,
+    receipt_len: usize,
+    replay_lengths: I,
+    cursor_lengths: J,
+) -> Result<usize, PairedPromotionError>
+where
+    I: IntoIterator<Item = usize>,
+    J: IntoIterator<Item = usize>,
+{
+    if bootstrap_len > MAX_CRYPTO_STATE_PLAINTEXT_LEN || receipt_len > MAX_STATE_FIELD_LEN {
+        return Err(PairedPromotionError::InvalidState);
+    }
+    let mut encoded_len = MUTABLE_STATE_FIXED_ENCODED_LEN
+        .checked_add(bootstrap_len)
+        .and_then(|length| length.checked_add(receipt_len))
+        .ok_or(PairedPromotionError::InvalidState)?;
+    for value_len in replay_lengths.into_iter().chain(cursor_lengths) {
+        if value_len == 0 || value_len > MAX_STATE_FIELD_LEN {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        encoded_len = encoded_len
+            .checked_add(4)
+            .and_then(|length| length.checked_add(value_len))
+            .ok_or(PairedPromotionError::InvalidState)?;
+        if encoded_len > MAX_CRYPTO_STATE_PLAINTEXT_LEN {
+            return Err(PairedPromotionError::InvalidState);
+        }
+    }
+    if encoded_len > MAX_CRYPTO_STATE_PLAINTEXT_LEN {
+        return Err(PairedPromotionError::InvalidState);
+    }
+    Ok(encoded_len)
+}
+
 fn decode_state_collection(
     decoder: &mut StateDecoder<'_>,
 ) -> Result<Vec<Vec<u8>>, PairedPromotionError> {
@@ -3029,5 +3914,81 @@ mod counter_reservation_tests {
             rng.fill_calls, 1,
             "overflow must fail before RNG and therefore before every durable mutation"
         );
+    }
+
+    #[test]
+    fn mutable_state_size_gate_accepts_exact_cap_and_rejects_one_more_without_allocating_payloads()
+    {
+        let bootstrap_len = 1_024;
+        let mut replay_lengths = vec![MAX_STATE_FIELD_LEN; 14];
+        let used = MUTABLE_STATE_FIXED_ENCODED_LEN
+            + bootstrap_len
+            + MAX_STATE_FIELD_LEN
+            + replay_lengths.len() * (4 + MAX_STATE_FIELD_LEN);
+        let exact_tail = MAX_CRYPTO_STATE_PLAINTEXT_LEN - used - 4;
+        assert!(exact_tail <= MAX_STATE_FIELD_LEN);
+        replay_lengths.push(exact_tail);
+
+        assert_eq!(
+            checked_mutable_state_encoded_len(
+                bootstrap_len,
+                MAX_STATE_FIELD_LEN,
+                replay_lengths.iter().copied(),
+                [],
+            )
+            .unwrap(),
+            MAX_CRYPTO_STATE_PLAINTEXT_LEN
+        );
+        *replay_lengths.last_mut().unwrap() += 1;
+        assert_eq!(
+            checked_mutable_state_encoded_len(
+                bootstrap_len,
+                MAX_STATE_FIELD_LEN,
+                replay_lengths.iter().copied(),
+                [],
+            )
+            .unwrap_err()
+            .code(),
+            "remote.pairing.paired_invalid"
+        );
+    }
+
+    #[test]
+    fn legacy_stable_and_pending_tags_keep_exact_bytes_while_zero_hwm_stays_invalid() {
+        let mut stable = Vec::new();
+        stable.extend_from_slice(COUNTER_GUARD_MAGIC);
+        stable.extend_from_slice(&MUTABLE_COUNTER_GUARD_VERSION.to_be_bytes());
+        stable.extend_from_slice(&[0, 0]);
+        stable.extend_from_slice(&[0x11; 32]);
+        stable.extend_from_slice(&4_u64.to_be_bytes());
+        stable.extend_from_slice(&5_u64.to_be_bytes());
+        stable.extend_from_slice(&[0x22; 4]);
+        stable.extend_from_slice(&COUNTER_BLOCK_SIZE.to_be_bytes());
+        stable.extend_from_slice(&[0x33; 32]);
+        assert_eq!(stable.len(), 100);
+        assert_eq!(CounterGuardV2::decode(&stable).unwrap().encode(), stable);
+
+        let mut zero_hwm = stable.clone();
+        zero_hwm[60..68].fill(0);
+        assert_eq!(
+            CounterGuardV2::decode(&zero_hwm).unwrap_err().code(),
+            "remote.pairing.paired_invalid"
+        );
+
+        let mut pending = Vec::new();
+        pending.extend_from_slice(COUNTER_GUARD_MAGIC);
+        pending.extend_from_slice(&MUTABLE_COUNTER_GUARD_VERSION.to_be_bytes());
+        pending.extend_from_slice(&[1, 0]);
+        pending.extend_from_slice(&[0x11; 32]);
+        pending.extend_from_slice(&4_u64.to_be_bytes());
+        pending.extend_from_slice(&5_u64.to_be_bytes());
+        pending.extend_from_slice(&[0x22; 4]);
+        pending.extend_from_slice(&COUNTER_BLOCK_SIZE.to_be_bytes());
+        pending.extend_from_slice(&(COUNTER_BLOCK_SIZE * 2).to_be_bytes());
+        pending.extend_from_slice(&[0x44; 16]);
+        pending.extend_from_slice(&[0x55; 32]);
+        pending.extend_from_slice(&[0x66; 32]);
+        assert_eq!(pending.len(), 156);
+        assert_eq!(CounterGuardV2::decode(&pending).unwrap().encode(), pending);
     }
 }
