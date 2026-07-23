@@ -19,6 +19,7 @@ use agentdeck_crypto::{
     open_pair_response, open_sealed_payload, seal_pair_response_received, seal_symmetric, sha256,
     sign_authentication_transcript, sign_sealed, verify_sealed, verify_tbs,
 };
+use agentdeck_protocol::ActionDecision;
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
     E2EE_FORMAT_VERSION, KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1,
@@ -36,10 +37,10 @@ use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayServerId,
     RequestRouteId, StreamRouteId, TrustEpoch,
 };
-use agentdeck_protocol::runtime::identity::MessageId;
+use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TurnId};
 use agentdeck_protocol::runtime::{
-    MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage,
-    RuntimeRequest, SendPromptRequest,
+    ConversationId, MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope,
+    RuntimeMessage, RuntimeRequest, SendPromptRequest,
 };
 use agentdeck_relay_client::{
     LinkAuthenticator, RelayClientConfig, RelayClientError, RelayTlsPolicy,
@@ -261,7 +262,7 @@ pub struct CommandCounterReservation {
     end_exclusive: u64,
 }
 
-fn validate_current_prompt_reservation(
+fn validate_current_command_reservation(
     current: Option<&CommandCounterReservation>,
     candidate: &CommandCounterReservation,
 ) -> Result<(), PairedPromotionError> {
@@ -270,6 +271,70 @@ fn validate_current_prompt_reservation(
         return Err(PairedPromotionError::Conflict);
     }
     Ok(())
+}
+
+/// 远端 paired-machine sealing 层允许进入 authenticated command 通道的闭合集合。
+///
+/// 每个 variant 都在本模块内固定映射到唯一 capability/permission 与 wire
+/// `RuntimeRequest`。调用方不能传入裸 `RuntimeRequest`，因此新增远程命令必须显式扩展本
+/// allowlist 及其授权映射。
+pub(crate) enum AuthorizedRuntimeRequest {
+    SendPrompt(SendPromptRequest),
+    ResolveApproval {
+        conversation_id: ConversationId,
+        turn_id: TurnId,
+        approval_id: ApprovalId,
+        decision: ActionDecision,
+    },
+    RetryApproval {
+        conversation_id: ConversationId,
+        approval_id: ApprovalId,
+    },
+}
+
+impl AuthorizedRuntimeRequest {
+    const fn required_authorization(
+        &self,
+    ) -> (AuthorizationCapabilityV1, AuthorizationPermissionV1) {
+        match self {
+            Self::SendPrompt(_) => (
+                AuthorizationCapabilityV1::Prompt,
+                AuthorizationPermissionV1::PromptSend,
+            ),
+            Self::ResolveApproval { .. } => (
+                AuthorizationCapabilityV1::Approval,
+                AuthorizationPermissionV1::ApprovalResolve,
+            ),
+            Self::RetryApproval { .. } => (
+                AuthorizationCapabilityV1::Approval,
+                AuthorizationPermissionV1::ApprovalRetry,
+            ),
+        }
+    }
+
+    fn into_runtime_request(self) -> RuntimeRequest {
+        match self {
+            Self::SendPrompt(request) => RuntimeRequest::SendPrompt(request),
+            Self::ResolveApproval {
+                conversation_id,
+                turn_id,
+                approval_id,
+                decision,
+            } => RuntimeRequest::ResolveApproval {
+                conversation_id,
+                turn_id,
+                approval_id,
+                decision,
+            },
+            Self::RetryApproval {
+                conversation_id,
+                approval_id,
+            } => RuntimeRequest::RetryApproval {
+                conversation_id,
+                approval_id,
+            },
+        }
+    }
 }
 
 impl fmt::Debug for CommandCounterReservation {
@@ -815,15 +880,17 @@ impl OpenedPairedMachine<'_> {
         Ok((reply_epoch, self.audited.directory_revision.value()))
     }
 
-    /// 使用审计后的 DeviceCommandTx + DeviceSign capability 封装唯一允许的 prompt 请求。
-    /// reservation 按值消费并与当前 authenticated state exact 对照，调用方不能传裸 counter。
-    pub(crate) fn seal_runtime_prompt(
+    /// 使用审计后的 DeviceCommandTx + DeviceSign capability 封装闭合 allowlist 中的请求。
+    /// reservation 按值消费并与当前 authenticated state exact 对照，调用方不能传裸 counter
+    /// 或任意 `RuntimeRequest`。
+    pub(crate) fn seal_runtime_request(
         &self,
         request_route: RequestRouteId,
         message_id: MessageId,
-        request: SendPromptRequest,
+        request: AuthorizedRuntimeRequest,
         reservation: CommandCounterReservation,
     ) -> Result<Vec<u8>, PairedPromotionError> {
+        let (required_capability, required_permission) = request.required_authorization();
         if self.audited.grant.machine_route != self.audited.identity.machine_route
             || self.audited.grant.device_route != self.audited.device_route
             || self.audited.grant.grant_serial != self.audited.grant_serial
@@ -834,16 +901,16 @@ impl OpenedPairedMachine<'_> {
                 .audited
                 .authorization
                 .capabilities
-                .contains(&AuthorizationCapabilityV1::Prompt)
+                .contains(&required_capability)
             || !self
                 .audited
                 .authorization
                 .permissions
-                .contains(&AuthorizationPermissionV1::PromptSend)
+                .contains(&required_permission)
         {
             return Err(PairedPromotionError::Conflict);
         }
-        validate_current_prompt_reservation(
+        validate_current_command_reservation(
             self.audited.state.counter_reservation(),
             &reservation,
         )?;
@@ -860,7 +927,7 @@ impl OpenedPairedMachine<'_> {
         let envelope = RuntimeEnvelope {
             version: RUNTIME_PROTOCOL_VERSION,
             message_id,
-            body: RuntimeMessage::Request(RuntimeRequest::SendPrompt(request)),
+            body: RuntimeMessage::Request(request.into_runtime_request()),
         };
         let plaintext = envelope
             .to_json_bytes_checked()
@@ -4326,11 +4393,60 @@ mod counter_reservation_tests {
         let current = reservation(0x22, COUNTER_BLOCK_SIZE);
 
         assert!(matches!(
-            validate_current_prompt_reservation(Some(&current), &old),
+            validate_current_command_reservation(Some(&current), &old),
             Err(PairedPromotionError::Conflict)
         ));
-        validate_current_prompt_reservation(Some(&current), &current)
+        validate_current_command_reservation(Some(&current), &current)
             .expect("exact authenticated current reservation remains usable once");
+    }
+
+    #[test]
+    fn closed_runtime_requests_map_to_one_exact_authorization_each() {
+        let prompt = AuthorizedRuntimeRequest::SendPrompt(SendPromptRequest {
+            conversation_id: ConversationId::new("conversation-authorization-map"),
+            idempotency_key: agentdeck_protocol::runtime::IdempotencyKey::new(
+                "prompt-authorization-map",
+            ),
+            expected_configuration_revision: 3,
+            prompt: agentdeck_protocol::runtime::PromptPayload::new("fixture")
+                .expect("bounded prompt"),
+        });
+        let resolve = AuthorizedRuntimeRequest::ResolveApproval {
+            conversation_id: ConversationId::new("conversation-authorization-map"),
+            turn_id: TurnId::new("turn-authorization-map"),
+            approval_id: ApprovalId::new("approval-authorization-map"),
+            decision: ActionDecision {
+                request_id: "request-authorization-map".to_owned(),
+                decision: agentdeck_protocol::ActionDecisionKind::Approve,
+                persist: false,
+            },
+        };
+        let retry = AuthorizedRuntimeRequest::RetryApproval {
+            conversation_id: ConversationId::new("conversation-authorization-map"),
+            approval_id: ApprovalId::new("approval-authorization-map"),
+        };
+
+        assert_eq!(
+            prompt.required_authorization(),
+            (
+                AuthorizationCapabilityV1::Prompt,
+                AuthorizationPermissionV1::PromptSend,
+            )
+        );
+        assert_eq!(
+            resolve.required_authorization(),
+            (
+                AuthorizationCapabilityV1::Approval,
+                AuthorizationPermissionV1::ApprovalResolve,
+            )
+        );
+        assert_eq!(
+            retry.required_authorization(),
+            (
+                AuthorizationCapabilityV1::Approval,
+                AuthorizationPermissionV1::ApprovalRetry,
+            )
+        );
     }
 
     #[test]

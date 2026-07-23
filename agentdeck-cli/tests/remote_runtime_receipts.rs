@@ -28,12 +28,13 @@ use agentdeck_protocol::relay_v2::frame::{AcceptedRef, Reply, RouteAccepted, Sea
 use agentdeck_protocol::relay_v2::{
     OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId, decode,
 };
-use agentdeck_protocol::runtime::identity::{CommandId, MessageId};
+use agentdeck_protocol::runtime::identity::{ApprovalId, CommandId, MessageId, TurnId};
 use agentdeck_protocol::runtime::{
-    CommandReceipt, ConversationId, IdempotencyKey, PromptPayload, RUNTIME_PROTOCOL_VERSION,
-    RuntimeEnvelope, RuntimeFailure, RuntimeMessage, RuntimeReply, RuntimeRequest,
-    SendPromptRequest,
+    ApprovalReceipt, CommandReceipt, ConversationId, IdempotencyKey, PromptPayload,
+    RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeFailure, RuntimeMessage, RuntimeReply,
+    RuntimeRequest, SendPromptRequest,
 };
+use agentdeck_protocol::{ActionDecision, ActionDecisionKind};
 use async_trait::async_trait;
 
 use remote_pairing::{
@@ -82,8 +83,9 @@ enum TransportScript {
 
 struct FakeTransport {
     script: TransportScript,
-    expected_request: SendPromptRequest,
-    receipt: CommandReceipt,
+    expected_request: RuntimeRequest,
+    reply: RuntimeReply,
+    expected_command_counter: u64,
     reply_counter: u64,
     device_sign_verifying_key: VerifyingKey,
     inbound: VecDeque<OpaqueRouteFrame>,
@@ -113,12 +115,62 @@ impl FakeTransport {
         device_sign_verifying_key: VerifyingKey,
         reply_counter: u64,
     ) -> (Self, Arc<Mutex<Vec<Vec<u8>>>>) {
+        Self::new_runtime_with_reply_counter(
+            script,
+            RuntimeRequest::SendPrompt(expected_request),
+            RuntimeReply::Command(receipt),
+            device_sign_verifying_key,
+            reply_counter,
+        )
+    }
+
+    fn new_runtime(
+        script: TransportScript,
+        expected_request: RuntimeRequest,
+        reply: RuntimeReply,
+        device_sign_verifying_key: VerifyingKey,
+    ) -> (Self, Arc<Mutex<Vec<Vec<u8>>>>) {
+        Self::new_runtime_with_reply_counter(
+            script,
+            expected_request,
+            reply,
+            device_sign_verifying_key,
+            REPLY_COUNTER,
+        )
+    }
+
+    fn new_runtime_with_reply_counter(
+        script: TransportScript,
+        expected_request: RuntimeRequest,
+        reply: RuntimeReply,
+        device_sign_verifying_key: VerifyingKey,
+        reply_counter: u64,
+    ) -> (Self, Arc<Mutex<Vec<Vec<u8>>>>) {
+        Self::new_runtime_with_counters(
+            script,
+            expected_request,
+            reply,
+            device_sign_verifying_key,
+            0,
+            reply_counter,
+        )
+    }
+
+    fn new_runtime_with_counters(
+        script: TransportScript,
+        expected_request: RuntimeRequest,
+        reply: RuntimeReply,
+        device_sign_verifying_key: VerifyingKey,
+        expected_command_counter: u64,
+        reply_counter: u64,
+    ) -> (Self, Arc<Mutex<Vec<Vec<u8>>>>) {
         let sent_codec_frames = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
                 script,
                 expected_request,
-                receipt,
+                reply,
+                expected_command_counter,
                 reply_counter,
                 device_sign_verifying_key,
                 inbound: VecDeque::new(),
@@ -153,8 +205,8 @@ impl FakeTransport {
         assert_eq!(signed.inner.key_directory_revision, KEY_DIRECTORY_REVISION);
         assert_eq!(
             u64::from_be_bytes(signed.inner.nonce[4..].try_into().expect("counter nonce")),
-            0,
-            "the first durable command block starts at counter zero"
+            self.expected_command_counter,
+            "the request must consume the expected durable command block"
         );
 
         let context = OuterContextV1::uplink_send(
@@ -179,10 +231,15 @@ impl FakeTransport {
         let envelope = RuntimeEnvelope::from_json_bytes_checked(&opened.payload)
             .expect("decrypted bytes must be a checked Runtime request envelope");
         assert_eq!(envelope.version, RUNTIME_PROTOCOL_VERSION);
-        let RuntimeMessage::Request(RuntimeRequest::SendPrompt(actual)) = envelope.body else {
-            panic!("remote prompt may only emit RuntimeRequest::SendPrompt");
+        let RuntimeMessage::Request(actual) = envelope.body else {
+            panic!("remote runtime may only emit RuntimeRequest payloads");
         };
-        assert_eq!(actual, self.expected_request);
+        assert_eq!(
+            serde_json::to_value(actual).expect("serialize actual RuntimeRequest"),
+            serde_json::to_value(&self.expected_request)
+                .expect("serialize expected RuntimeRequest"),
+            "remote runtime must seal the exact expected request variant and fields"
+        );
         (*request_route, envelope.message_id)
     }
 
@@ -192,7 +249,7 @@ impl FakeTransport {
             TransportScript::ReplyOnly => self.inbound.push_back(reply_frame(
                 request_route,
                 message_id,
-                self.receipt.clone(),
+                self.reply.clone(),
                 ReplyShape::Valid,
                 self.reply_counter,
             )),
@@ -200,7 +257,7 @@ impl FakeTransport {
                 self.inbound.push_back(reply_frame(
                     request_route,
                     message_id,
-                    self.receipt.clone(),
+                    self.reply.clone(),
                     shape,
                     self.reply_counter,
                 ));
@@ -209,7 +266,7 @@ impl FakeTransport {
                 self.inbound.push_back(reply_frame(
                     request_route,
                     message_id,
-                    self.receipt.clone(),
+                    self.reply.clone(),
                     ReplyShape::Valid,
                     self.reply_counter,
                 ));
@@ -220,7 +277,7 @@ impl FakeTransport {
                 self.inbound.push_back(reply_frame(
                     request_route,
                     message_id,
-                    self.receipt.clone(),
+                    self.reply.clone(),
                     ReplyShape::Valid,
                     self.reply_counter,
                 ));
@@ -230,7 +287,7 @@ impl FakeTransport {
             TransportScript::WrongRequestRouteOnly => self.inbound.push_back(reply_frame(
                 WRONG_REQUEST_ROUTE,
                 message_id,
-                self.receipt.clone(),
+                self.reply.clone(),
                 ReplyShape::Valid,
                 self.reply_counter,
             )),
@@ -274,7 +331,7 @@ enum ReplyShape {
 fn reply_frame(
     request_route: RequestRouteId,
     message_id: MessageId,
-    receipt: CommandReceipt,
+    reply: RuntimeReply,
     shape: ReplyShape,
     counter: u64,
 ) -> OpaqueRouteFrame {
@@ -291,7 +348,7 @@ fn reply_frame(
         } else {
             message_id
         },
-        body: RuntimeMessage::Reply(RuntimeReply::Command(receipt)),
+        body: RuntimeMessage::Reply(reply),
     };
     let plaintext = envelope
         .to_json_bytes_checked()
@@ -410,6 +467,54 @@ fn failed_receipt() -> CommandReceipt {
     }
 }
 
+fn approval_conversation_id() -> ConversationId {
+    ConversationId::new("conversation-remote-approval")
+}
+
+fn approval_turn_id() -> TurnId {
+    TurnId::new("turn-remote-approval")
+}
+
+fn approval_id() -> ApprovalId {
+    ApprovalId::new("approval-remote-runtime-1")
+}
+
+fn approval_decision() -> ActionDecision {
+    ActionDecision {
+        request_id: "action-request-remote-runtime-1".to_owned(),
+        decision: ActionDecisionKind::Approve,
+        persist: false,
+    }
+}
+
+fn resolve_approval_request() -> RuntimeRequest {
+    RuntimeRequest::ResolveApproval {
+        conversation_id: approval_conversation_id(),
+        turn_id: approval_turn_id(),
+        approval_id: approval_id(),
+        decision: approval_decision(),
+    }
+}
+
+fn retry_approval_request() -> RuntimeRequest {
+    RuntimeRequest::RetryApproval {
+        conversation_id: approval_conversation_id(),
+        approval_id: approval_id(),
+    }
+}
+
+fn applied_approval_receipt() -> ApprovalReceipt {
+    ApprovalReceipt::Applied {
+        approval_id: approval_id(),
+    }
+}
+
+fn delivery_failed_approval_receipt() -> ApprovalReceipt {
+    ApprovalReceipt::DeliveryFailed {
+        approval_id: approval_id(),
+    }
+}
+
 fn state_root(temp: &tempfile::TempDir) -> PathBuf {
     fs::canonicalize(temp.path())
         .expect("canonical tempdir")
@@ -439,6 +544,409 @@ fn one_sent_codec_frame(recorder: &Arc<Mutex<Vec<Vec<u8>>>>) -> Vec<u8> {
     let frames = recorder.lock().expect("sent-frame recorder");
     assert_eq!(frames.len(), 1, "one prompt attempt emits one frozen Send");
     frames[0].clone()
+}
+
+#[tokio::test]
+async fn resolve_approval_only_matching_authenticated_approval_receipt_is_terminal() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0x90);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let expected_receipt = applied_approval_receipt();
+    let (transport, sent) = FakeTransport::new_runtime(
+        TransportScript::ReplyOnly,
+        resolve_approval_request(),
+        RuntimeReply::Approval(expected_receipt.clone()),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xa0; 32]);
+
+    let outcome = runtime
+        .resolve_approval(
+            approval_conversation_id(),
+            approval_turn_id(),
+            approval_id(),
+            approval_decision(),
+            &mut rng,
+        )
+        .await
+        .expect("matching authenticated ApprovalReceipt is terminal");
+
+    assert!(!outcome.route_accepted());
+    assert_eq!(outcome.receipt(), &expected_receipt);
+    let _ = one_sent_codec_frame(&sent);
+}
+
+#[tokio::test]
+async fn resolve_approval_route_accepted_followed_by_eof_is_not_success() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0x91);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let (transport, _sent) = FakeTransport::new_runtime(
+        TransportScript::RouteAcceptedOnly,
+        resolve_approval_request(),
+        RuntimeReply::Approval(applied_approval_receipt()),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut rng = DeterministicRng::new([0xa1; 32]);
+
+    assert!(matches!(
+        runtime
+            .resolve_approval(
+                approval_conversation_id(),
+                approval_turn_id(),
+                approval_id(),
+                approval_decision(),
+                &mut rng,
+            )
+            .await,
+        Err(RemoteRuntimeError::OutcomeUnknown)
+    ));
+}
+
+#[tokio::test]
+async fn resolve_approval_restarts_with_the_exact_frozen_relay_frame() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0x92);
+
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let (first_transport, first_sent) = FakeTransport::new_runtime(
+        TransportScript::EofAfterSend,
+        resolve_approval_request(),
+        RuntimeReply::Approval(applied_approval_receipt()),
+        device_sign,
+    );
+    let mut first_runtime = RemoteRuntime::new(opened, first_transport);
+    let mut first_rng = DeterministicRng::new([0xa2; 32]);
+    assert!(matches!(
+        first_runtime
+            .resolve_approval(
+                approval_conversation_id(),
+                approval_turn_id(),
+                approval_id(),
+                approval_decision(),
+                &mut first_rng,
+            )
+            .await,
+        Err(RemoteRuntimeError::OutcomeUnknown)
+    ));
+    let first_codec_frame = one_sent_codec_frame(&first_sent);
+    drop(first_runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen pending approval after unknown outcome");
+    let expected_receipt = applied_approval_receipt();
+    let (retry_transport, retry_sent) = FakeTransport::new_runtime(
+        TransportScript::ReplyOnly,
+        resolve_approval_request(),
+        RuntimeReply::Approval(expected_receipt.clone()),
+        device_sign,
+    );
+    let mut retry_runtime = RemoteRuntime::new(reopened, retry_transport);
+    let mut retry_rng = PanicRng;
+    let outcome = retry_runtime
+        .resolve_approval(
+            approval_conversation_id(),
+            approval_turn_id(),
+            approval_id(),
+            approval_decision(),
+            &mut retry_rng,
+        )
+        .await
+        .expect("exact approval retry may finish from an authenticated receipt");
+
+    assert_eq!(outcome.receipt(), &expected_receipt);
+    assert_eq!(
+        one_sent_codec_frame(&retry_sent),
+        first_codec_frame,
+        "restart must reuse the exact approval Relay frame, including requestRoute/counter/ciphertext/proof"
+    );
+}
+
+#[tokio::test]
+async fn retry_approval_after_terminal_resolve_starts_a_distinct_authenticated_exchange() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0x93);
+    let expected_receipt = applied_approval_receipt();
+
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let (resolve_transport, resolve_sent) = FakeTransport::new_runtime(
+        TransportScript::ReplyOnly,
+        resolve_approval_request(),
+        RuntimeReply::Approval(expected_receipt.clone()),
+        device_sign,
+    );
+    let mut resolve_runtime = RemoteRuntime::new(opened, resolve_transport);
+    let mut resolve_rng = DeterministicRng::new([0xa3; 32]);
+    resolve_runtime
+        .resolve_approval(
+            approval_conversation_id(),
+            approval_turn_id(),
+            approval_id(),
+            approval_decision(),
+            &mut resolve_rng,
+        )
+        .await
+        .expect("resolve approval terminal");
+    let resolve_frame = one_sent_codec_frame(&resolve_sent);
+    drop(resolve_runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen after terminal resolve");
+    let (retry_transport, retry_sent) = FakeTransport::new_runtime_with_counters(
+        TransportScript::ReplyOnly,
+        retry_approval_request(),
+        RuntimeReply::Approval(expected_receipt.clone()),
+        device_sign,
+        1_024,
+        REPLY_COUNTER + 1,
+    );
+    let mut retry_runtime = RemoteRuntime::new(reopened, retry_transport);
+    let mut retry_rng = DeterministicRng::new([0xa4; 32]);
+    let retry_outcome = retry_runtime
+        .retry_approval(approval_conversation_id(), approval_id(), &mut retry_rng)
+        .await
+        .expect("RetryApproval is a distinct authenticated request intent");
+    let retry_frame = one_sent_codec_frame(&retry_sent);
+
+    assert_eq!(retry_outcome.receipt(), &expected_receipt);
+    assert_ne!(
+        retry_frame, resolve_frame,
+        "RetryApproval must not replay a terminal ResolveApproval exchange for the same approval"
+    );
+}
+
+#[tokio::test]
+async fn retry_approval_terminal_starts_a_new_attempt_while_pending_restart_is_exact() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0x9a);
+
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let first_receipt = delivery_failed_approval_receipt();
+    let (first_transport, first_sent) = FakeTransport::new_runtime(
+        TransportScript::ReplyOnly,
+        retry_approval_request(),
+        RuntimeReply::Approval(first_receipt.clone()),
+        device_sign,
+    );
+    let mut first_runtime = RemoteRuntime::new(opened, first_transport);
+    let mut first_rng = DeterministicRng::new([0xaa; 32]);
+    let first = first_runtime
+        .retry_approval(approval_conversation_id(), approval_id(), &mut first_rng)
+        .await
+        .expect("first retry attempt reaches authenticated terminal");
+    assert_eq!(first.receipt(), &first_receipt);
+    let first_frame = one_sent_codec_frame(&first_sent);
+    drop(first_runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen first retry terminal");
+    let (second_transport, second_sent) = FakeTransport::new_runtime_with_counters(
+        TransportScript::EofAfterSend,
+        retry_approval_request(),
+        RuntimeReply::Approval(applied_approval_receipt()),
+        device_sign,
+        1_024,
+        REPLY_COUNTER + 1,
+    );
+    let mut second_runtime = RemoteRuntime::new(reopened, second_transport);
+    let mut second_rng = DeterministicRng::new([0xab; 32]);
+    assert!(matches!(
+        second_runtime
+            .retry_approval(approval_conversation_id(), approval_id(), &mut second_rng,)
+            .await,
+        Err(RemoteRuntimeError::OutcomeUnknown)
+    ));
+    let second_frame = one_sent_codec_frame(&second_sent);
+    assert_ne!(
+        second_frame, first_frame,
+        "a user retry after terminal must start a new durable business attempt"
+    );
+    drop(second_runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen outcome-unknown second retry attempt");
+    let expected_receipt = applied_approval_receipt();
+    let (resume_transport, resume_sent) = FakeTransport::new_runtime_with_counters(
+        TransportScript::ReplyOnly,
+        retry_approval_request(),
+        RuntimeReply::Approval(expected_receipt.clone()),
+        device_sign,
+        1_024,
+        REPLY_COUNTER + 1,
+    );
+    let mut resumed = RemoteRuntime::new(reopened, resume_transport);
+    let mut panic_rng = PanicRng;
+    let outcome = resumed
+        .retry_approval(approval_conversation_id(), approval_id(), &mut panic_rng)
+        .await
+        .expect("pending retry attempt resumes from the exact frozen frame");
+    assert_eq!(outcome.receipt(), &expected_receipt);
+    assert_eq!(
+        one_sent_codec_frame(&resume_sent),
+        second_frame,
+        "crash restart within one retry attempt must not reseal or consume caller entropy"
+    );
+}
+
+#[tokio::test]
+async fn retry_approval_rejects_authenticated_claimed_without_making_it_terminal() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0x9b);
+
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let (claimed_transport, _sent) = FakeTransport::new_runtime(
+        TransportScript::ReplyOnly,
+        retry_approval_request(),
+        RuntimeReply::Approval(ApprovalReceipt::Claimed {
+            approval_id: approval_id(),
+        }),
+        device_sign,
+    );
+    let mut claimed_runtime = RemoteRuntime::new(opened, claimed_transport);
+    let mut first_rng = DeterministicRng::new([0xac; 32]);
+    assert!(matches!(
+        claimed_runtime
+            .retry_approval(approval_conversation_id(), approval_id(), &mut first_rng,)
+            .await,
+        Err(RemoteRuntimeError::InvalidReply(_))
+    ));
+    drop(claimed_runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen pending retry after impossible Claimed receipt");
+    let expected_receipt = applied_approval_receipt();
+    let (valid_transport, _sent) = FakeTransport::new_runtime_with_reply_counter(
+        TransportScript::ReplyOnly,
+        retry_approval_request(),
+        RuntimeReply::Approval(expected_receipt.clone()),
+        device_sign,
+        REPLY_COUNTER + 1,
+    );
+    let mut valid_runtime = RemoteRuntime::new(reopened, valid_transport);
+    let mut panic_rng = PanicRng;
+    let outcome = valid_runtime
+        .retry_approval(approval_conversation_id(), approval_id(), &mut panic_rng)
+        .await
+        .expect("later valid RetryApproval receipt completes the original pending attempt");
+    assert_eq!(outcome.receipt(), &expected_receipt);
+}
+
+#[tokio::test]
+async fn resolve_approval_wrong_reply_kind_message_id_or_approval_id_is_not_terminal() {
+    for (index, script, wrong_reply) in [
+        (
+            0_u8,
+            TransportScript::ReplyOnly,
+            RuntimeReply::Command(accepted_receipt()),
+        ),
+        (
+            1,
+            TransportScript::ReplyOnlyWithShape(ReplyShape::WrongMessageId),
+            RuntimeReply::Approval(applied_approval_receipt()),
+        ),
+        (
+            2,
+            TransportScript::ReplyOnly,
+            RuntimeReply::Approval(ApprovalReceipt::Applied {
+                approval_id: ApprovalId::new("approval-wrong-runtime-2"),
+            }),
+        ),
+    ] {
+        let fixture = PairingFixture::new();
+        let store = MemoryRemoteKeyStore::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = state_root(&temp);
+        let device_sign = fixture.promote(&store, &root, 0x94 + index);
+        let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("open promoted machine");
+        let (bad_transport, _sent) = FakeTransport::new_runtime_with_reply_counter(
+            script,
+            resolve_approval_request(),
+            wrong_reply,
+            device_sign,
+            REPLY_COUNTER,
+        );
+        let mut bad_runtime = RemoteRuntime::new(opened, bad_transport);
+        let mut first_rng = DeterministicRng::new([0xa5 + index; 32]);
+
+        assert!(
+            bad_runtime
+                .resolve_approval(
+                    approval_conversation_id(),
+                    approval_turn_id(),
+                    approval_id(),
+                    approval_decision(),
+                    &mut first_rng,
+                )
+                .await
+                .is_err(),
+            "wrong authenticated approval reply axis {index} must not become terminal"
+        );
+        drop(bad_runtime);
+
+        let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+            .open_exact(fixture.identity())
+            .expect("reopen non-terminal approval exchange");
+        let expected_receipt = applied_approval_receipt();
+        let (valid_transport, _sent) = FakeTransport::new_runtime_with_reply_counter(
+            TransportScript::ReplyOnly,
+            resolve_approval_request(),
+            RuntimeReply::Approval(expected_receipt.clone()),
+            device_sign,
+            REPLY_COUNTER + 1,
+        );
+        let mut valid_runtime = RemoteRuntime::new(reopened, valid_transport);
+        let mut retry_rng = PanicRng;
+        let outcome = valid_runtime
+            .resolve_approval(
+                approval_conversation_id(),
+                approval_turn_id(),
+                approval_id(),
+                approval_decision(),
+                &mut retry_rng,
+            )
+            .await
+            .expect("later correctly correlated ApprovalReceipt remains terminal");
+        assert_eq!(outcome.receipt(), &expected_receipt);
+    }
 }
 
 #[tokio::test]
@@ -772,6 +1280,82 @@ async fn failed_daemon_receipt_is_durable_terminal_and_replays_locally() {
         .expect("failed terminal is read locally after restart");
     assert_eq!(local.receipt(), &failure);
     assert!(sent.lock().expect("sent-frame recorder").is_empty());
+}
+
+#[tokio::test]
+async fn authenticated_runtime_failure_is_typed_durable_and_does_not_block_a_new_intent() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0x5c);
+    let request = prompt_request();
+    let failure = RuntimeFailure::new(
+        "daemon.remote.fixture_rejected",
+        "fixture rejects the authenticated request",
+    );
+
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open promoted machine");
+    let (first_transport, _sent) = FakeTransport::new_runtime(
+        TransportScript::ReplyOnly,
+        RuntimeRequest::SendPrompt(request.clone()),
+        RuntimeReply::Failure(failure.clone()),
+        device_sign,
+    );
+    let mut first_runtime = RemoteRuntime::new(opened, first_transport);
+    let mut first_rng = DeterministicRng::new([0x6c; 32]);
+    assert!(matches!(
+        first_runtime.prompt(request.clone(), &mut first_rng).await,
+        Err(RemoteRuntimeError::DaemonFailure(observed))
+            if observed.code == failure.code && observed.message == failure.message
+    ));
+    drop(first_runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen authenticated daemon failure terminal");
+    let (unused_transport, replay_sent) = FakeTransport::new_runtime(
+        TransportScript::EofAfterSend,
+        RuntimeRequest::SendPrompt(request.clone()),
+        RuntimeReply::Command(accepted_receipt()),
+        device_sign,
+    );
+    let mut replay_runtime = RemoteRuntime::new(reopened, unused_transport);
+    let mut panic_rng = PanicRng;
+    assert!(matches!(
+        replay_runtime.prompt(request.clone(), &mut panic_rng).await,
+        Err(RemoteRuntimeError::DaemonFailure(observed))
+            if observed.code == failure.code && observed.message == failure.message
+    ));
+    assert!(
+        replay_sent.lock().expect("sent-frame recorder").is_empty(),
+        "same failed intent must replay locally without transport or caller entropy"
+    );
+    drop(replay_runtime);
+
+    let mut different = request;
+    different.idempotency_key = IdempotencyKey::new("prompt-after-daemon-failure");
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen before different prompt intent");
+    let (different_transport, different_sent) = FakeTransport::new_runtime_with_counters(
+        TransportScript::ReplyOnly,
+        RuntimeRequest::SendPrompt(different.clone()),
+        RuntimeReply::Command(accepted_receipt()),
+        device_sign,
+        1_024,
+        REPLY_COUNTER + 1,
+    );
+    let mut different_runtime = RemoteRuntime::new(reopened, different_transport);
+    let mut different_rng = DeterministicRng::new([0x6d; 32]);
+    let outcome = different_runtime
+        .prompt(different, &mut different_rng)
+        .await
+        .expect("a different intent can replace the failed terminal");
+    assert_accepted_outcome(&outcome, false);
+    let _ = one_sent_codec_frame(&different_sent);
 }
 
 #[tokio::test]
