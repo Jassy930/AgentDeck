@@ -12,7 +12,7 @@ use agentdeck_crypto::{
 };
 use agentdeck_protocol::e2ee::{
     DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1, KeyDirectoryV1,
-    KeyPurpose, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairInviteV1,
+    KeyId, KeyPurpose, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairInviteV1,
     PairRequestPlaintextV1, PairResponseInfoV1, PairResponseV1,
 };
 use agentdeck_protocol::relay_v2::frame::{InstallGrant, OpaqueRouteFrame, RelayFrameBody};
@@ -1054,6 +1054,33 @@ impl GlobalKeyStateV1 {
             });
         }
         Ok(views)
+    }
+
+    /// publication binding 只读取当前 shared key identity，不派生或复制 raw AEAD key。
+    pub(crate) fn current_shared_key_id(
+        &self,
+        purpose: KeyPurpose,
+        stream_route: Option<StreamRouteId>,
+    ) -> Result<KeyId, RuntimeStoreError> {
+        self.validate()?;
+        let epoch = match (purpose, stream_route) {
+            (KeyPurpose::Catalog, None) => {
+                self.catalogs
+                    .last()
+                    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+                    .epoch
+            }
+            (KeyPurpose::ConversationDek, Some(route)) => {
+                self.conversations
+                    .iter()
+                    .find(|conversation| conversation.stream_route == route)
+                    .and_then(|conversation| conversation.history.last())
+                    .ok_or(RuntimeStoreError::PairingConflict)?
+                    .epoch
+            }
+            _ => return Err(RuntimeStoreError::PairingConflict),
+        };
+        Ok(KeyId { purpose, epoch })
     }
 
     /// Grant freezer 只取得 daemon-private state 中已登记的 conversation route；confirm

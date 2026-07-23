@@ -449,6 +449,32 @@ fn ensure_shared_freeze_allowed(
     }
 }
 
+pub(super) fn current_shared_key_identity(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    connection: &Connection,
+    stream: &PublicationStreamRecord,
+) -> Result<Option<(u64, KeyId)>, RuntimeStoreError> {
+    let Some(state) = super::super::pairing_grant_tx::load_global_key_state_for_use(
+        connection,
+        key_bundle,
+        database_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    let revision = state.revision().value();
+    let (purpose, stream_route) = match stream.scope {
+        PublicationScope::Catalog => (KeyPurpose::Catalog, None),
+        PublicationScope::Conversation(_) => (
+            KeyPurpose::ConversationDek,
+            Some(StreamRouteId::from_bytes(stream.stream_route)),
+        ),
+    };
+    let key_id = state.current_shared_key_id(purpose, stream_route)?;
+    Ok(Some((revision, key_id)))
+}
+
 fn current_shared_key(
     key_bundle: &RuntimeKeyBundle,
     database_id: [u8; 16],

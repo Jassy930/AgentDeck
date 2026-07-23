@@ -318,6 +318,9 @@ pub struct RelayCommittedCut {
     pub generation: Option<[u8; 16]>,
     pub outer: StreamCursor,
     pub inner: StreamCursor,
+    /// Store 从同一 authenticated publication row/cut 与 shared-key directory
+    /// 捕获的 daemon-private binding capability；不会进入 Runtime DTO。
+    pub(crate) stream_binding: Option<super::store::StreamBindingPermit>,
 }
 
 impl Default for RelayCommittedCut {
@@ -327,6 +330,7 @@ impl Default for RelayCommittedCut {
             generation: None,
             outer: StreamCursor::BeforeFirst,
             inner: StreamCursor::BeforeFirst,
+            stream_binding: None,
         }
     }
 }

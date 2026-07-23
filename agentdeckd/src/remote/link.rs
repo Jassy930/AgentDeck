@@ -26,7 +26,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::runtime::store::key_transition::TransitionSnapshotPermit;
-use crate::runtime::store::{RemoteReplyAuthorization, RuntimeStoreHandle};
+use crate::runtime::store::{RemoteReplyAuthorization, RuntimeStoreHandle, StreamBindingPermit};
 use crate::runtime::{
     ConnectionFramingProfile, ConnectionId, ConnectionSink, ConnectionWrite,
     EncodedRuntimeFrameKind, RuntimeCore,
@@ -116,6 +116,16 @@ pub(crate) trait DirectedReplySealer: Send + Sync {
         _permit: &TransitionSnapshotPermit,
         _carrier: RuntimeTransferCarrierV1,
     ) -> Result<DirectedReplySeal, RemoteLinkError> {
+        Err(RemoteLinkError::ReplySealUnavailable)
+    }
+
+    /// Store-issued publication permit 的 exact directed key-control terminal。
+    async fn seal_stream_binding_exact(
+        &self,
+        _authorization: &RemoteReplyAuthorization,
+        _route: DirectedReplyRoute,
+        _permit: StreamBindingPermit,
+    ) -> Result<SignedSealedBlobV1, RemoteLinkError> {
         Err(RemoteLinkError::ReplySealUnavailable)
     }
 
@@ -607,6 +617,7 @@ impl RemoteReplyPump {
         write: ConnectionWrite,
     ) -> Result<(), RemoteLinkError> {
         let bytes = write.shared_bytes();
+        let stream_binding = write.stream_binding();
         if write.kind() == EncodedRuntimeFrameKind::CompactTransfer {
             let carrier = RuntimeTransferCarrierV1::decode(&bytes)
                 .map_err(|_| RemoteLinkError::InvalidCoreEgress)?;
@@ -691,6 +702,21 @@ impl RemoteReplyPump {
                     })
                     .cloned()
                     .ok_or(RemoteLinkError::UnknownReplyRoute)?;
+                let stream_binding = match &reply {
+                    RuntimeReply::SyncComplete(sync)
+                        if binding.lifecycle == ReplyRouteLifecycle::UntilSyncComplete =>
+                    {
+                        let permit = stream_binding.ok_or(RemoteLinkError::InvalidCoreEgress)?;
+                        if !permit.matches_runtime_sync(sync) {
+                            return Err(RemoteLinkError::InvalidCoreEgress);
+                        }
+                        Some(permit)
+                    }
+                    _ if stream_binding.is_some() => {
+                        return Err(RemoteLinkError::InvalidCoreEgress);
+                    }
+                    _ => None,
+                };
                 let completes_route = binding.lifecycle.completes(&reply);
                 let sync_complete_sha256 = match (&binding.transition_snapshot, &reply) {
                     (Some(_), RuntimeReply::SyncComplete(sync)) => {
@@ -729,6 +755,28 @@ impl RemoteReplyPump {
                         },
                     )
                     .await?;
+                if let Some(permit) = stream_binding {
+                    if permit.key_directory_revision()
+                        != authorization_used.key_directory_revision().value()
+                    {
+                        return Err(RemoteLinkError::ReplyAuthorizationMismatch);
+                    }
+                    let sealed = self
+                        .sealer
+                        .seal_stream_binding_exact(&authorization_used, binding.route, permit)
+                        .await?;
+                    let sealed = validated_reply_wire(&authorization_used, sealed)?;
+                    self.lane
+                        .send_reply(
+                            binding.generation,
+                            Reply {
+                                device_route: binding.route.device_route,
+                                request_route: binding.route.request_route,
+                                sealed_blob: SealedBlob(sealed),
+                            },
+                        )
+                        .await?;
+                }
                 write.acknowledge().map_err(|_| RemoteLinkError::Closed)?;
                 if let (Some(permit), Some(sync_complete_sha256)) =
                     (binding.transition_snapshot.clone(), sync_complete_sha256)

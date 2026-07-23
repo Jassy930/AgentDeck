@@ -1122,6 +1122,12 @@ pub(super) fn register_stream_barrier_on_worker(
                 {
                     return Err(RuntimeStoreError::UnknownOrCorruptSchema);
                 }
+                let stream_binding = super::super::publication::capture_stream_binding_permit(
+                    &transaction,
+                    &state.key_bundle,
+                    state.database_id,
+                    &publication,
+                )?;
                 RelayCommittedCut {
                     publication_stream_id: Some(publication.publication_stream_id),
                     generation: Some(publication.generation),
@@ -1129,6 +1135,7 @@ pub(super) fn register_stream_barrier_on_worker(
                         publication.committed_high_water,
                     ),
                     inner,
+                    stream_binding,
                 }
             }
         };
@@ -1386,6 +1393,34 @@ pub(super) fn register_transition_snapshot_barrier_on_worker(
         if !cursor_is_at_or_after(target_cut.high_water, frozen) {
             return Err(RuntimeStoreError::PublicationMismatch);
         }
+        let publication_scope = match target {
+            RuntimeStreamTarget::Catalog => PublicationScope::Catalog,
+            RuntimeStreamTarget::Conversation(conversation_id) => {
+                PublicationScope::Conversation(conversation_id)
+            }
+        };
+        let publication = super::super::publication::authenticate_directory(
+            &transaction,
+            &state.key_bundle,
+            &ledger,
+            publication_scope,
+        )?
+        .ok_or(RuntimeStoreError::PublicationMismatch)?;
+        let stream_binding = super::super::publication::capture_stream_binding_permit(
+            &transaction,
+            &state.key_bundle,
+            state.database_id,
+            &publication,
+        )?
+        .ok_or(RuntimeStoreError::PublicationMismatch)?;
+        if stream_binding.publication_stream_id() != permit.publication_stream_id()
+            || stream_binding.generation() != permit.generation()
+            || stream_binding.outer() != committed_outer
+            || stream_binding.inner() != frozen
+            || stream_binding.key_directory_revision() != permit.key_directory_revision()
+        {
+            return Err(RuntimeStoreError::PublicationMismatch);
+        }
         let conversation_origin = match target {
             RuntimeStreamTarget::Catalog => None,
             RuntimeStreamTarget::Conversation(conversation_id) => Some(
@@ -1511,6 +1546,7 @@ pub(super) fn register_transition_snapshot_barrier_on_worker(
                     generation: Some(permit.generation()),
                     outer: committed_outer,
                     inner: frozen,
+                    stream_binding: Some(stream_binding),
                 },
                 decision: crate::runtime::backfill::BarrierDecision::Snapshot {
                     base: frozen,

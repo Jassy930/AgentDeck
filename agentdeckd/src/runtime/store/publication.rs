@@ -1,5 +1,6 @@
 //! Runtime v4 transport-neutral durable publication outbox。
 
+mod binding;
 mod directory;
 mod rotation;
 mod shared;
@@ -25,6 +26,10 @@ use super::sqlite::{RuntimeLedger, RuntimeSqlite};
 use super::stream::{metadata_mac, open_v4_row, optional_field, seal_v4_row, sqlite_u64};
 use super::{RetiredKeyOwnerKind, RetiredSharedKeyOwner};
 
+pub(crate) use binding::StreamBindingPermit;
+pub(in crate::runtime::store) use binding::{
+    capture_stream_binding_permit, validate_stream_binding_permit_in_transaction,
+};
 pub(super) use directory::{
     authenticate_directory, authenticate_directory_records, load_pending_publication_stream_ids,
 };

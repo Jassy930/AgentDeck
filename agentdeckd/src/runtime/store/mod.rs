@@ -205,6 +205,7 @@ pub(crate) use native_projection::{
     NativeProjectionReconcilePlan, NativeProjectionRetirementCursor,
     NativeProjectionRetirementPlan,
 };
+pub(crate) use publication::StreamBindingPermit;
 pub use publication::{
     FreezePublicationRequest, FrozenPublication, PublicationAcknowledgement, PublicationBarrierCut,
     PublicationPayloadKind, PublicationScope, PublicationStreamRecord, PublicationStreamState,

@@ -28,7 +28,7 @@ use agentdeck_protocol::runtime::{
 use async_trait::async_trait;
 use tokio::sync::oneshot::error::TryRecvError;
 
-use crate::runtime::store::RemoteReplyAuthorization;
+use crate::runtime::store::{RemoteReplyAuthorization, StreamBindingPermit};
 use crate::runtime::{ConnectionId, ConnectionWrite};
 
 use super::dispatch::{
@@ -1403,6 +1403,14 @@ struct LineageDriftSealer {
 
 struct FailingPublisher;
 
+struct BindingGateSealer {
+    runtime_calls: AtomicUsize,
+    binding_calls: AtomicUsize,
+    expected_publication_generation: [u8; 16],
+    binding_started: tokio::sync::Notify,
+    release_binding: tokio::sync::Notify,
+}
+
 #[derive(Default)]
 struct RecordingPublisher {
     calls: Mutex<Vec<Arc<[u8]>>>,
@@ -1460,6 +1468,55 @@ impl DirectedReplySealer for RecordingSealer {
                 .clone()
                 .unwrap_or_else(|| fake_signed_reply(authorization)),
         })
+    }
+
+    async fn seal_stream_binding_exact(
+        &self,
+        authorization: &RemoteReplyAuthorization,
+        _route: DirectedReplyRoute,
+        _permit: StreamBindingPermit,
+    ) -> Result<SignedSealedBlobV1, RemoteLinkError> {
+        Ok(self
+            .sealed
+            .clone()
+            .unwrap_or_else(|| fake_signed_reply(authorization)))
+    }
+}
+
+#[async_trait]
+impl DirectedReplySealer for BindingGateSealer {
+    fn admission_ready(&self) -> bool {
+        true
+    }
+
+    async fn seal_exact(
+        &self,
+        authorization: &RemoteReplyAuthorization,
+        _route: DirectedReplyRoute,
+        _runtime_bytes: Arc<[u8]>,
+    ) -> Result<DirectedReplySeal, RemoteLinkError> {
+        self.runtime_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(DirectedReplySeal {
+            authorization_used: authorization.clone(),
+            sealed: fake_signed_reply(authorization),
+        })
+    }
+
+    async fn seal_stream_binding_exact(
+        &self,
+        authorization: &RemoteReplyAuthorization,
+        _route: DirectedReplyRoute,
+        permit: StreamBindingPermit,
+    ) -> Result<SignedSealedBlobV1, RemoteLinkError> {
+        assert_eq!(
+            permit.generation(),
+            self.expected_publication_generation,
+            "binding must consume Store publication generation, not Runtime local generation"
+        );
+        self.binding_calls.fetch_add(1, Ordering::SeqCst);
+        self.binding_started.notify_one();
+        self.release_binding.notified().await;
+        Ok(fake_signed_reply(authorization))
     }
 }
 
@@ -1623,6 +1680,100 @@ async fn directed_reply_binds_exact_route_and_bytes_then_acks_only_after_flush()
     assert_eq!(reply.sealed_blob.0, expected_wire);
     transport.shutdown().await;
     fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn sync_complete_flushes_runtime_then_exact_binding_before_core_ack() {
+    let (mut transport, _pairing_lane, harness) = active_pairing_transport_for_test(MACHINE);
+    let business = transport
+        .take_business_lane()
+        .expect("take stream-binding business lane");
+    let authorization = RemoteReplyAuthorization::for_test(MACHINE, DEVICE_A, 1);
+    let route = DirectedReplyRoute {
+        machine_route: MACHINE,
+        device_route: DEVICE_A,
+        request_route: REQUEST_A,
+    };
+    let sealer = Arc::new(BindingGateSealer {
+        runtime_calls: AtomicUsize::new(0),
+        binding_calls: AtomicUsize::new(0),
+        expected_publication_generation: [0x73; 16],
+        binding_started: tokio::sync::Notify::new(),
+        release_binding: tokio::sync::Notify::new(),
+    });
+    let mut pump = RemoteReplyPump::new(business, sealer.clone());
+    let message_id = MessageId::new("sync-with-store-binding");
+    pump.bind(
+        CONNECTION_A,
+        message_id.clone(),
+        route,
+        authorization,
+        ReplyRouteLifecycle::UntilSyncComplete,
+    )
+    .expect("bind subscription route");
+    let sync = RuntimeReply::SyncComplete(RuntimeSyncComplete {
+        // 故意与 publication generation 不同；binding 绝不能从这个本地值推导。
+        stream_generation: StreamGeneration::new("11111111-1111-1111-1111-111111111111"),
+        stream_cursor: StreamCursor::BeforeFirst,
+        inner_cursor: RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::BeforeFirst,
+        },
+        key_directory_revision: 0,
+    });
+    let bytes: Arc<[u8]> = RuntimeEnvelope {
+        version: RUNTIME_PROTOCOL_VERSION,
+        message_id,
+        body: RuntimeMessage::Reply(sync),
+    }
+    .to_json_bytes_checked()
+    .expect("encode SyncComplete")
+    .into();
+    let permit = StreamBindingPermit::for_test(
+        crate::runtime::events::RuntimeStreamTarget::Catalog,
+        [0x71; 16],
+        [0x72; 16],
+        [0x73; 16],
+        StreamCursor::BeforeFirst,
+        StreamCursor::BeforeFirst,
+        1,
+        KeyId {
+            purpose: KeyPurpose::Catalog,
+            epoch: 1,
+        },
+    );
+    let (write, mut acknowledged) =
+        ConnectionWrite::for_transport_test_with_stream_binding(bytes, permit);
+
+    let forward = tokio::spawn(async move { pump.forward(CONNECTION_A, write).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sealer.binding_started.notified(),
+    )
+    .await
+    .expect("binding sealing starts after Runtime SyncComplete flush");
+    assert_eq!(
+        harness.sent_count(),
+        1,
+        "Runtime SyncComplete flushes first"
+    );
+    assert_eq!(sealer.runtime_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sealer.binding_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        acknowledged.try_recv(),
+        Err(TryRecvError::Empty),
+        "Core ACK must wait for binding seal and Relay flush"
+    );
+
+    sealer.release_binding.notify_waiters();
+    forward
+        .await
+        .expect("binding forward joins")
+        .expect("both directed frames flush");
+    acknowledged
+        .await
+        .expect("Core ACK follows both directed frames");
+    assert_eq!(harness.sent_count(), 2);
+    transport.shutdown().await;
 }
 
 #[tokio::test]
@@ -2334,16 +2485,43 @@ async fn multipart_and_sync_routes_reclaim_only_at_their_exact_terminal() {
         .await
         .expect("final logical transfer part is not the sync terminal");
     transfer_acknowledged.await.expect("transfer part ACKs");
+    let sync_conversation = crate::runtime::store::RuntimeId::from_bytes(
+        crate::runtime::store::RuntimeIdKind::Conversation,
+        [0x66; 16],
+    )
+    .expect("sync conversation id");
     let sync = RuntimeReply::SyncComplete(RuntimeSyncComplete {
         stream_generation: StreamGeneration::new("remote-link-sync-generation"),
         stream_cursor: StreamCursor::BeforeFirst,
         inner_cursor: RuntimeInnerCursor::Conversation {
-            conversation_id: ConversationId::new("remote-link-sync-conversation"),
+            conversation_id: ConversationId::new(sync_conversation.to_canonical_string()),
             cursor: StreamCursor::BeforeFirst,
         },
         key_directory_revision: 1,
     });
-    let (_, sync_write, sync_acknowledged) = runtime_write(sync_id, RuntimeMessage::Reply(sync));
+    let sync_bytes: Arc<[u8]> = RuntimeEnvelope {
+        version: RUNTIME_PROTOCOL_VERSION,
+        message_id: MessageId::new(sync_id),
+        body: RuntimeMessage::Reply(sync),
+    }
+    .to_json_bytes_checked()
+    .expect("encode lifecycle SyncComplete")
+    .into();
+    let permit = StreamBindingPermit::for_test(
+        crate::runtime::events::RuntimeStreamTarget::Conversation(sync_conversation),
+        [0x67; 16],
+        [0x68; 16],
+        [0x69; 16],
+        StreamCursor::BeforeFirst,
+        StreamCursor::BeforeFirst,
+        1,
+        KeyId {
+            purpose: KeyPurpose::ConversationDek,
+            epoch: 1,
+        },
+    );
+    let (sync_write, sync_acknowledged) =
+        ConnectionWrite::for_transport_test_with_stream_binding(sync_bytes, permit);
     pump.forward(CONNECTION_A, sync_write)
         .await
         .expect("SyncComplete closes the directed lifecycle");

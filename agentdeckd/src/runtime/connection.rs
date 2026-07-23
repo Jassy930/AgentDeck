@@ -871,6 +871,7 @@ pub(crate) enum EncodedRuntimeFrameKind {
 pub struct ConnectionWrite {
     bytes: Arc<[u8]>,
     kind: EncodedRuntimeFrameKind,
+    stream_binding: Option<super::store::StreamBindingPermit>,
     acknowledged: Option<oneshot::Sender<()>>,
 }
 
@@ -883,6 +884,13 @@ impl ConnectionWrite {
     #[must_use]
     pub(crate) fn kind(&self) -> EncodedRuntimeFrameKind {
         self.kind
+    }
+
+    /// daemon-private publication binding metadata；transport 不得从 Runtime JSON
+    /// 重建这些轴，也不得把它序列化进本地 IPC。
+    #[must_use]
+    pub(crate) const fn stream_binding(&self) -> Option<super::store::StreamBindingPermit> {
+        self.stream_binding
     }
 
     /// 返回可与 `cancelled` 的可变借用并行使用的共享 encoded frame。
@@ -906,6 +914,24 @@ impl ConnectionWrite {
             Self {
                 bytes: bytes.into(),
                 kind: EncodedRuntimeFrameKind::JsonRuntime,
+                stream_binding: None,
+                acknowledged: Some(acknowledged),
+            },
+            acknowledgement,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_transport_test_with_stream_binding(
+        bytes: impl Into<Arc<[u8]>>,
+        permit: super::store::StreamBindingPermit,
+    ) -> (Self, oneshot::Receiver<()>) {
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        (
+            Self {
+                bytes: bytes.into(),
+                kind: EncodedRuntimeFrameKind::JsonRuntime,
+                stream_binding: Some(permit),
                 acknowledged: Some(acknowledged),
             },
             acknowledgement,
@@ -922,6 +948,7 @@ impl ConnectionWrite {
             Self {
                 bytes: frame.bytes,
                 kind: frame.kind,
+                stream_binding: frame.stream_binding,
                 acknowledged: Some(acknowledged),
             },
             acknowledgement,
@@ -974,6 +1001,7 @@ impl fmt::Debug for FlushReceipt {
 pub struct EncodedRuntimeFrame {
     bytes: Arc<[u8]>,
     kind: EncodedRuntimeFrameKind,
+    stream_binding: Option<super::store::StreamBindingPermit>,
 }
 
 impl EncodedRuntimeFrame {
@@ -990,6 +1018,7 @@ impl EncodedRuntimeFrame {
         Ok(Self {
             bytes: Arc::from(bytes),
             kind: EncodedRuntimeFrameKind::JsonRuntime,
+            stream_binding: None,
         })
     }
 
@@ -1005,7 +1034,14 @@ impl EncodedRuntimeFrame {
         Ok(Self {
             bytes: Arc::from(bytes),
             kind: EncodedRuntimeFrameKind::CompactTransfer,
+            stream_binding: None,
         })
+    }
+
+    #[must_use]
+    pub(crate) fn with_stream_binding(mut self, permit: super::store::StreamBindingPermit) -> Self {
+        self.stream_binding = Some(permit);
+        self
     }
 
     #[cfg(test)]
@@ -1019,6 +1055,7 @@ impl EncodedRuntimeFrame {
         Self {
             bytes: bytes.into(),
             kind: EncodedRuntimeFrameKind::JsonRuntime,
+            stream_binding: None,
         }
     }
 }
@@ -1296,6 +1333,7 @@ impl ConnectionRegistry {
                     .send(ConnectionWrite {
                         bytes: queued.frame.bytes.clone(),
                         kind: queued.frame.kind,
+                        stream_binding: queued.frame.stream_binding,
                         acknowledged: Some(acknowledged),
                     })
                     .await

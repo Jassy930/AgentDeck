@@ -33,6 +33,8 @@ use crate::remote::identity::KeyStoreCounterGuardBackend;
 use crate::remote::link::{
     DirectedReplyRoute, DirectedReplySealer, RemoteLinkError, RemoteReplyPump, ReplyRouteLifecycle,
 };
+use crate::runtime::backfill::BarrierRequest;
+use crate::runtime::events::{RegisterStreamBarrier, RuntimeStreamTarget, WatchGeneration};
 use crate::runtime::store::key_transition::{
     AcknowledgeKeyUpdate, AcknowledgeStreamApplied, FrozenKeyUpdate, KeyTransitionStreamCut,
     KeyTransitionStreamScope, TransitionSnapshotRequest, canonical_update_hash,
@@ -433,6 +435,197 @@ async fn exact_active_reply_is_aead_sealed_machine_data_signed_and_never_enters_
         })
         .expect("count shared outbox");
     assert_eq!(count, 0, "directed reply must never enter shared outbox");
+}
+
+#[tokio::test]
+async fn stream_binding_uses_barrier_publication_axes_and_rejects_post_barrier_advance() {
+    let root = TestRoot::new("stream-binding-exact-cut");
+    let database = root.database();
+    let storage_keys = MemoryKeyStore::new();
+    let counter_keys = Arc::new(MemoryKeyStore::new());
+    let store = active_store(&database, &storage_keys).await;
+    let publication_stream_id = [0x71; 16];
+    let stream_route = [0x72; 16];
+    let generation = [0x73; 16];
+    let counter_scope_token = [0x74; 32];
+    store
+        .create_publication_stream(
+            publication_stream_id,
+            PublicationScope::Catalog,
+            stream_route,
+            generation,
+        )
+        .await
+        .expect("create catalog publication stream");
+    let first = store
+        .freeze_publication(FreezePublicationRequest {
+            publication_id: [0x75; 16],
+            publication_stream_id,
+            generation,
+            counter_scope_token,
+            sender_counter: 0,
+            inner_after: None,
+            inner_through: None,
+            payload_kind: PublicationPayloadKind::Control,
+            blob: b"first committed publication cut".to_vec(),
+        })
+        .await
+        .expect("freeze first publication");
+    store
+        .acknowledge_publication_commit(
+            publication_stream_id,
+            generation,
+            first.stream_seq,
+            first.blob_sha256,
+        )
+        .await
+        .expect("commit first publication");
+
+    let registration = store
+        .register_stream_barrier(RegisterStreamBarrier {
+            target: RuntimeStreamTarget::Catalog,
+            generation: WatchGeneration::new(91).expect("local watch generation"),
+            request: BarrierRequest::Subscribe {
+                cursor: StreamCursor::BeforeFirst,
+            },
+        })
+        .await
+        .expect("capture authenticated publication cut");
+    let permit = registration
+        .relay_committed
+        .stream_binding
+        .expect("remote key directory issues binding permit");
+    assert_eq!(permit.generation(), generation);
+    assert_eq!(permit.outer(), StreamCursor::At(0));
+    assert_eq!(permit.inner(), StreamCursor::BeforeFirst);
+    drop(registration);
+
+    let authorization = authorization(&store).await;
+    let receiving = reply_key(
+        &store
+            .load_global_key_state()
+            .await
+            .expect("load global keys")
+            .expect("global keys exist"),
+    );
+    let (owner, authority) = authority(false);
+    let sealer =
+        DeviceReplyTxSealer::with_authority_for_test(store.clone(), counter_keys, authority);
+    let sealed = sealer
+        .seal_stream_binding_exact(&authorization, route(), permit)
+        .await
+        .expect("seal Store-issued binding");
+    let verified = verify_sealed(
+        sealed,
+        &owner.signing.verifying_key(),
+        &context(&authorization),
+    )
+    .expect("verify binding MachineData signature");
+    let opened = open_sealed_payload(&receiving, &context(&authorization), verified)
+        .expect("open binding DeviceReplyTx payload");
+    assert_eq!(opened.payload_kind, SealedPayloadKind::KeyUpdate);
+    let KeyControlV1::StreamBinding { binding, .. } =
+        KeyControlV1::from_canonical_bytes(&opened.payload).expect("decode stream binding")
+    else {
+        panic!("expected StreamBinding key-control carrier")
+    };
+    assert_eq!(binding.stream_route.as_bytes(), &stream_route);
+    assert_eq!(binding.stream_generation.as_bytes(), &generation);
+    assert_eq!(binding.stream_cursor, StreamCursor::At(0));
+    assert_eq!(
+        binding.inner_cursor,
+        RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::BeforeFirst,
+        }
+    );
+    assert_eq!(binding.key_id.purpose, KeyPurpose::Catalog);
+    assert_eq!(
+        binding.key_directory_revision,
+        authorization.key_directory_revision()
+    );
+
+    let advanced = store
+        .freeze_publication(FreezePublicationRequest {
+            publication_id: [0x76; 16],
+            publication_stream_id,
+            generation,
+            counter_scope_token,
+            sender_counter: 1,
+            inner_after: None,
+            inner_through: None,
+            payload_kind: PublicationPayloadKind::Control,
+            blob: b"advanced publication cut".to_vec(),
+        })
+        .await
+        .expect("freeze advanced publication");
+    store
+        .acknowledge_publication_commit(
+            publication_stream_id,
+            generation,
+            advanced.stream_seq,
+            advanced.blob_sha256,
+        )
+        .await
+        .expect("commit advanced publication");
+    assert!(matches!(
+        sealer
+            .seal_stream_binding_exact(&authorization, route(), permit)
+            .await,
+        Err(RemoteLinkError::ReplySealUnavailable)
+    ));
+    assert_eq!(
+        owner.calls.load(Ordering::SeqCst),
+        1,
+        "post-barrier publication advance must reject before a second signature"
+    );
+    store.shutdown().await.expect("shutdown binding Store");
+}
+
+#[tokio::test]
+async fn conversation_stream_binding_selects_exact_conversation_dek_identity() {
+    let root = TestRoot::new("conversation-stream-binding-key");
+    let storage_keys = MemoryKeyStore::new();
+    let store = active_store(&root.database(), &storage_keys).await;
+    let (conversation_id, authorization) =
+        commit_conversation_activation_for_reply_test(&store).await;
+    let registration = store
+        .register_stream_barrier(RegisterStreamBarrier {
+            target: RuntimeStreamTarget::Conversation(conversation_id),
+            generation: WatchGeneration::new(92).expect("conversation watch generation"),
+            request: BarrierRequest::Subscribe {
+                cursor: StreamCursor::BeforeFirst,
+            },
+        })
+        .await
+        .expect("capture conversation publication cut");
+    let permit = registration
+        .relay_committed
+        .stream_binding
+        .expect("conversation binding permit");
+    let binding = permit.to_protocol(
+        authorization.machine_route(),
+        authorization.device_route(),
+        authorization.grant_serial(),
+        authorization.trust_epoch(),
+    );
+    assert_eq!(binding.key_id.purpose, KeyPurpose::ConversationDek);
+    assert_eq!(binding.key_id.epoch, 1);
+    assert_eq!(
+        binding.key_directory_revision,
+        authorization.key_directory_revision()
+    );
+    assert!(matches!(
+        binding.inner_cursor,
+        RuntimeInnerCursor::Conversation {
+            conversation_id: observed,
+            cursor: StreamCursor::BeforeFirst,
+        } if observed.as_str() == conversation_id.to_canonical_string()
+    ));
+    drop(registration);
+    store
+        .shutdown()
+        .await
+        .expect("shutdown conversation binding Store");
 }
 
 #[tokio::test]

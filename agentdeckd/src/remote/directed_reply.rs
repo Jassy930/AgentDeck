@@ -29,7 +29,9 @@ use crate::runtime::store::remote_counter::{
     RemoteCounterGapRequest, RemoteCounterRecord, RemoteCounterRecordKind,
     RemoteCounterRetirementRequest,
 };
-use crate::runtime::store::{RemoteReplyAuthorization, RuntimeStoreError, RuntimeStoreHandle};
+use crate::runtime::store::{
+    RemoteReplyAuthorization, RuntimeStoreError, RuntimeStoreHandle, StreamBindingPermit,
+};
 use crate::security::KeyStore;
 #[cfg(test)]
 use crate::security::MemoryKeyStore;
@@ -286,6 +288,10 @@ impl DeviceReplyTxSealer {
                 current == *authorization
                     && validate_transition_snapshot_binding(&current, permit).is_ok()
             }
+            DirectedReplyAuthorizationPolicy::StreamBindingExact(permit) => {
+                current == *authorization
+                    && permit.key_directory_revision() == current.key_directory_revision().value()
+            }
         };
         if !allowed {
             return Err(RuntimeStoreError::PairingConflict.into());
@@ -420,6 +426,49 @@ impl DirectedReplySealer for DeviceReplyTxSealer {
             .await
             .map(|_| ())
             .map_err(|_| RemoteLinkError::ReplySealUnavailable)
+    }
+
+    async fn seal_stream_binding_exact(
+        &self,
+        authorization: &RemoteReplyAuthorization,
+        route: DirectedReplyRoute,
+        permit: StreamBindingPermit,
+    ) -> Result<SignedSealedBlobV1, RemoteLinkError> {
+        if route.machine_route != authorization.machine_route()
+            || route.device_route != authorization.device_route()
+            || permit.key_directory_revision() != authorization.key_directory_revision().value()
+        {
+            return Err(RemoteLinkError::ReplyAuthorizationMismatch);
+        }
+        let binding = permit.to_protocol(
+            authorization.machine_route(),
+            authorization.device_route(),
+            authorization.grant_serial(),
+            authorization.trust_epoch(),
+        );
+        let control = KeyControlV1::stream_binding(binding);
+        let payload_kind = control.sealed_payload_kind();
+        let plaintext: Arc<[u8]> = control
+            .canonical_bytes()
+            .map_err(|_| RemoteLinkError::InvalidKeyControlReply)?
+            .into();
+        let retained_bytes = plaintext
+            .len()
+            .checked_add(size_of::<StreamBindingPermit>())
+            .ok_or(RemoteLinkError::InvalidCoreEgress)?;
+        self.seal_internal(
+            authorization,
+            route,
+            DirectedReplyAuthorizationPolicy::StreamBindingExact(Box::new(permit)),
+            DirectedReplyPayload::Prepared {
+                kind: payload_kind,
+                plaintext,
+            },
+            retained_bytes,
+        )
+        .await
+        .map(|reply| reply.sealed)
+        .map_err(map_seal_error)
     }
 
     async fn seal_key_update_exact(

@@ -72,6 +72,10 @@ pub(crate) enum DirectedReplyAuthorizationPolicy {
     /// Active Add 的 snapshot/SyncComplete 只能消费 Store-issued capability；该
     /// capability 必须在 counter/reply-key 所在事务内重新绑定到 exact transition。
     TransitionSnapshotExact(Box<TransitionSnapshotPermit>),
+    /// SubscriptionBarrier 捕获的 publication row/cut/shared-key identity 必须在
+    /// counter/reply-key 所在事务内保持 exact；任何 publish advance/rotation/rekey
+    /// 都拒绝迟到 binding。
+    StreamBindingExact(Box<super::publication::StreamBindingPermit>),
 }
 
 pub(crate) struct TransactionDirectedReplyAxes {
@@ -174,6 +178,22 @@ pub(super) fn seal_transaction(
                     database_id,
                     permit,
                     &authorization_used,
+                )?;
+                true
+            }
+        }
+        DirectedReplyAuthorizationPolicy::StreamBindingExact(permit) => {
+            if authorization_used != request.authorization
+                || permit.key_directory_revision()
+                    != authorization_used.key_directory_revision().value()
+            {
+                false
+            } else {
+                super::publication::validate_stream_binding_permit_in_transaction(
+                    &transaction,
+                    &key_bundle,
+                    database_id,
+                    permit,
                 )?;
                 true
             }

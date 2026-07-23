@@ -342,12 +342,13 @@ async fn run_inner(
             key_directory_revision: 0,
         },
     };
-    reply::reply(
+    reply::reply_with_stream_binding(
         &job.connections,
         job.connection_id,
         job.message_id.clone(),
         RuntimeReply::SyncComplete(sync),
         None,
+        registration.relay_committed.stream_binding,
         &job.control,
     )
     .await?;

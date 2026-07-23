@@ -45,6 +45,27 @@ pub(super) async fn reply(
     transfer_payload: Option<&[u8]>,
     control: &TransferEgressControl,
 ) -> Result<(), PumpSendError> {
+    reply_with_stream_binding(
+        connections,
+        connection_id,
+        message_id,
+        reply,
+        transfer_payload,
+        None,
+        control,
+    )
+    .await
+}
+
+pub(super) async fn reply_with_stream_binding(
+    connections: &ConnectionRegistry,
+    connection_id: ConnectionId,
+    message_id: MessageId,
+    reply: RuntimeReply,
+    transfer_payload: Option<&[u8]>,
+    stream_binding: Option<crate::runtime::store::StreamBindingPermit>,
+    control: &TransferEgressControl,
+) -> Result<(), PumpSendError> {
     let transfer_identity = transfer_payload
         .map(|payload| DurableReplyTransferIdentity::for_reply(&message_id, &reply, payload))
         .transpose()?;
@@ -73,7 +94,10 @@ pub(super) async fn reply(
         message_id: message_id.clone(),
         body: RuntimeMessage::Reply(reply),
     };
-    match EncodedRuntimeFrame::from_envelope(&envelope) {
+    match EncodedRuntimeFrame::from_envelope(&envelope).map(|frame| match stream_binding {
+        Some(permit) => frame.with_stream_binding(permit),
+        None => frame,
+    }) {
         Ok(frame) => paced(connections, connection_id, frame, control).await,
         Err(ConnectionError::FrameTooLarge) => {
             let payload = transfer_payload.ok_or(PumpSendError::MissingTransferPayload)?;
