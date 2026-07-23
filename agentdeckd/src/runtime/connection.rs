@@ -31,6 +31,7 @@ const PRINCIPAL_ACTIVE: u8 = 0;
 const PRINCIPAL_REVOKING: u8 = 1;
 #[allow(dead_code)] // P4 durable revocation ledger 接线后成为 production path。
 const PRINCIPAL_REVOKED: u8 = 2;
+const DEVICE_HANDLE_PREFIX: &str = "device-";
 
 /// 认证后、不可由 transport raw field 直接构造的 principal capability。
 ///
@@ -58,6 +59,64 @@ enum PrincipalIdentity {
         grant_serial: u64,
         device_sign_fingerprint: [u8; 32],
     },
+}
+
+/// 由 exact authenticated remote principal 派生的一次 self-revoke admission。
+///
+/// request/transport 不能提供或覆盖 target；`into_parts` 会先释放 Active permission
+/// guard，避免后续共享 revoke fence 等待自身 inflight。Revoking lease 的 exact retry
+/// 不再新增 guard，但仍只能得到同一 principal/route/serial。
+pub(crate) struct RemoteSelfRevocationAdmission {
+    principal: AuthenticatedPrincipal,
+    device: DeviceHandle,
+    grant_serial: GrantSerial,
+    authorization: Option<AuthorizationGuard>,
+}
+
+impl RemoteSelfRevocationAdmission {
+    /// Active admission 仍走普通 connection；Revoking 只能复用 exact connection，
+    /// 或交给 Core 建立 purpose-scoped self-revoke retry connection。
+    pub(crate) const fn is_revoking_retry(&self) -> bool {
+        self.authorization.is_none()
+    }
+
+    pub(crate) fn into_parts(self) -> (AuthenticatedPrincipal, DeviceHandle, GrantSerial) {
+        let Self {
+            principal,
+            device,
+            grant_serial,
+            authorization,
+        } = self;
+        drop(authorization);
+        (principal, device, grant_serial)
+    }
+
+    /// 只把 Revoking admission 转成 purpose-scoped connection capability。Active
+    /// admission 仍必须走普通 `RuntimeCore::connect`；已经 Revoked 的 lease 即使 token
+    /// 先前已生成，也会在 Core attach 的前后双读中拒绝。
+    pub(crate) fn into_revoking_retry_principal(
+        self,
+    ) -> Result<AuthenticatedPrincipal, PrincipalAccessError> {
+        if self.authorization.is_some() {
+            return Err(PrincipalAccessError::PermissionDenied);
+        }
+        let Self {
+            principal,
+            device: _,
+            grant_serial: _,
+            authorization: _,
+        } = self;
+        if !principal.is_revoking() {
+            return Err(PrincipalAccessError::Revoked);
+        }
+        Ok(principal)
+    }
+}
+
+impl fmt::Debug for RemoteSelfRevocationAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RemoteSelfRevocationAdmission([REDACTED])")
+    }
 }
 
 struct AuthorizationLease {
@@ -240,6 +299,72 @@ impl AuthenticatedPrincipal {
         self.authorization.try_enter()
     }
 
+    /// 只允许 exact remote identity 发起自身撤销。target 完全来自 issuer 固化的
+    /// device route/grant serial；local principal、缺 permission、零 route/serial 均在
+    /// backend 前拒绝。Revoking 只为同一 exact self-revoke 的 durable retry 放行。
+    pub(crate) fn try_enter_remote_self_revocation(
+        &self,
+    ) -> Result<RemoteSelfRevocationAdmission, PrincipalAccessError> {
+        let (device, grant_serial) = self.remote_self_revocation_target()?;
+        let authorization = self.authorization.try_enter_self_revocation()?;
+        Ok(RemoteSelfRevocationAdmission {
+            principal: self.clone(),
+            device,
+            grant_serial,
+            authorization,
+        })
+    }
+
+    /// Safety-task 登记前的只读校验。它不提升 lease；Fresh 若在真正 mutation
+    /// admission 前被另一请求抢先推进到 Revoking，后续原子 CAS 仍会拒绝。
+    pub(crate) fn ensure_remote_self_revocation(
+        &self,
+        allow_revoking_retry: bool,
+    ) -> Result<(), PrincipalAccessError> {
+        self.remote_self_revocation_target()?;
+        self.authorization
+            .ensure_self_revocation(allow_revoking_retry)
+    }
+
+    /// Safety task 已被 Core 同步登记后才调用的 mutation 线性化点。Fresh 只有
+    /// 唯一 `Active -> Revoking` CAS 胜者；只有 durable ExactDuplicate 可复用
+    /// 已 Revoking lease。target 始终从 authenticated principal 派生。
+    pub(crate) async fn admit_remote_self_revocation(
+        &self,
+        allow_revoking_retry: bool,
+    ) -> Result<(DeviceHandle, GrantSerial), PrincipalAccessError> {
+        let target = self.remote_self_revocation_target()?;
+        self.authorization
+            .admit_self_revocation(allow_revoking_retry)
+            .await?;
+        Ok(target)
+    }
+
+    fn remote_self_revocation_target(
+        &self,
+    ) -> Result<(DeviceHandle, GrantSerial), PrincipalAccessError> {
+        let (device_route, grant_serial) = match self.identity.as_ref() {
+            PrincipalIdentity::Remote {
+                device_route,
+                grant_serial,
+                ..
+            } if *device_route != [0; 16] && *grant_serial != 0 => (*device_route, *grant_serial),
+            PrincipalIdentity::Local { .. } | PrincipalIdentity::Remote { .. } => {
+                return Err(PrincipalAccessError::PermissionDenied);
+            }
+        };
+        let permissions = self
+            .authorization
+            .remote_permissions
+            .ok_or(PrincipalAccessError::PermissionDenied)?;
+        if !permissions.allows(AuthorizationPermissionV1::RevokeSelf) {
+            return Err(PrincipalAccessError::PermissionDenied);
+        }
+        let device =
+            canonical_device_handle(device_route).ok_or(PrincipalAccessError::PermissionDenied)?;
+        Ok((device, GrantSerial::new(grant_serial)))
+    }
+
     /// 只有 same-EUID control issuer 能签发本能力；普通本地 read principal 与
     /// remote principal 即使持有 approval permission 也不能执行 machine-wide admin。
     pub(crate) fn try_enter_local_administration(
@@ -273,12 +398,27 @@ impl AuthenticatedPrincipal {
             .store(PRINCIPAL_REVOKED, std::sync::atomic::Ordering::Release);
     }
 
+    pub(crate) fn is_revoking(&self) -> bool {
+        self.authorization
+            .state
+            .load(std::sync::atomic::Ordering::Acquire)
+            == PRINCIPAL_REVOKING
+    }
+
     #[cfg(test)]
     pub(crate) fn is_active(&self) -> bool {
         self.authorization
             .state
             .load(std::sync::atomic::Ordering::Acquire)
             == PRINCIPAL_ACTIVE
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.authorization
+            .state
+            .load(std::sync::atomic::Ordering::Acquire)
+            == PRINCIPAL_REVOKED
     }
 }
 
@@ -353,8 +493,49 @@ impl AuthorizationLease {
         })
     }
 
+    fn try_enter_self_revocation(
+        self: &Arc<Self>,
+    ) -> Result<Option<AuthorizationGuard>, PrincipalAccessError> {
+        use std::sync::atomic::Ordering;
+
+        match self.state.load(Ordering::Acquire) {
+            PRINCIPAL_ACTIVE => self.try_enter().map(Some),
+            PRINCIPAL_REVOKING => Ok(None),
+            PRINCIPAL_REVOKED => Err(PrincipalAccessError::Revoked),
+            _ => Err(PrincipalAccessError::RegistryUnavailable),
+        }
+    }
+
+    fn ensure_self_revocation(
+        &self,
+        allow_revoking_retry: bool,
+    ) -> Result<(), PrincipalAccessError> {
+        use std::sync::atomic::Ordering;
+
+        match self.state.load(Ordering::Acquire) {
+            PRINCIPAL_ACTIVE => Ok(()),
+            PRINCIPAL_REVOKING if allow_revoking_retry => Ok(()),
+            PRINCIPAL_REVOKING | PRINCIPAL_REVOKED => Err(PrincipalAccessError::Revoked),
+            _ => Err(PrincipalAccessError::RegistryUnavailable),
+        }
+    }
+
+    async fn admit_self_revocation(
+        &self,
+        allow_revoking_retry: bool,
+    ) -> Result<(), PrincipalAccessError> {
+        self.transition_to_revoking(allow_revoking_retry).await
+    }
+
     #[allow(dead_code)] // 由 P4 durable revoke path 间接调用。
     async fn begin_revoke(&self) -> Result<(), PrincipalAccessError> {
+        self.transition_to_revoking(true).await
+    }
+
+    async fn transition_to_revoking(
+        &self,
+        allow_revoking_retry: bool,
+    ) -> Result<(), PrincipalAccessError> {
         use std::sync::atomic::Ordering;
 
         match self.state.compare_exchange(
@@ -363,10 +544,13 @@ impl AuthorizationLease {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(PRINCIPAL_ACTIVE) | Err(PRINCIPAL_REVOKING) => {}
+            Ok(PRINCIPAL_ACTIVE) => {}
+            Err(PRINCIPAL_REVOKING) if allow_revoking_retry => {}
             Ok(_) => unreachable!("compare_exchange success must return Active"),
-            Err(PRINCIPAL_REVOKED) => return Err(PrincipalAccessError::Revoked),
-            Err(_) => return Err(PrincipalAccessError::Revoked),
+            Err(PRINCIPAL_REVOKING) | Err(PRINCIPAL_REVOKED) => {
+                return Err(PrincipalAccessError::Revoked);
+            }
+            Err(_) => return Err(PrincipalAccessError::RegistryUnavailable),
         }
         loop {
             // `notify_waiters` 不保留 permit：先注册并 enable waiter，再复查 inflight，
@@ -762,7 +946,7 @@ impl PrincipalIssuer {
 }
 
 fn parse_canonical_device_handle(handle: &DeviceHandle) -> Option<[u8; 16]> {
-    let encoded = handle.as_str().strip_prefix("device-")?;
+    let encoded = handle.as_str().strip_prefix(DEVICE_HANDLE_PREFIX)?;
     if encoded.len() != 32 {
         return None;
     }
@@ -778,6 +962,20 @@ fn parse_canonical_device_handle(handle: &DeviceHandle) -> Option<[u8; 16]> {
         *value = (nibble(encoded[offset])? << 4) | nibble(encoded[offset + 1])?;
     }
     (route != [0; 16]).then_some(route)
+}
+
+fn canonical_device_handle(device_route: [u8; 16]) -> Option<DeviceHandle> {
+    if device_route == [0; 16] {
+        return None;
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(DEVICE_HANDLE_PREFIX.len() + 32);
+    value.push_str(DEVICE_HANDLE_PREFIX);
+    for byte in device_route {
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Some(DeviceHandle::new(value))
 }
 
 /// 单次连接随机 identity；连接重建必然获得新 generation/id。

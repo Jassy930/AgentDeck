@@ -803,6 +803,115 @@ async fn revocation_waits_for_inflight_guard_and_new_work_fails_closed() {
 }
 
 #[tokio::test]
+async fn remote_self_revocation_admission_is_exact_remote_only() {
+    let issuer = PrincipalIssuer::local_only([0xC2; 32]);
+    let local = issuer
+        .issue_verified_local_control(501, [0x21; 16])
+        .expect("issue local control principal");
+    assert!(matches!(
+        local.try_enter_remote_self_revocation(),
+        Err(PrincipalAccessError::PermissionDenied)
+    ));
+
+    let zero_route = issuer
+        .issue_test_remote([0x22; 16], [0; 16], 1, [0x23; 32])
+        .expect("issue synthetic zero-route principal");
+    assert!(matches!(
+        zero_route.try_enter_remote_self_revocation(),
+        Err(PrincipalAccessError::PermissionDenied)
+    ));
+    let zero_serial = issuer
+        .issue_test_remote([0x24; 16], [0x25; 16], 0, [0x26; 32])
+        .expect("issue synthetic zero-serial principal");
+    assert!(matches!(
+        zero_serial.try_enter_remote_self_revocation(),
+        Err(PrincipalAccessError::PermissionDenied)
+    ));
+
+    let exact = issuer
+        .issue_test_remote([0x27; 16], [0x28; 16], 9, [0x29; 32])
+        .expect("issue exact remote self-revocation principal");
+    let first = exact
+        .try_enter_remote_self_revocation()
+        .expect("Active exact principal may start self-revocation");
+    assert!(!first.is_revoking_retry());
+    let (projected, device, grant_serial) = first.into_parts();
+    assert_eq!(
+        device,
+        DeviceHandle::new(format!("device-{}", "28".repeat(16)))
+    );
+    assert_eq!(grant_serial, GrantSerial::new(9));
+
+    projected.begin_revoke().await.expect("enter Revoking");
+    let retry = exact
+        .try_enter_remote_self_revocation()
+        .expect("Revoking exact principal may retry self-revocation");
+    assert!(retry.is_revoking_retry());
+    let (_, retry_device, retry_serial) = retry.into_parts();
+    assert_eq!(retry_device, device);
+    assert_eq!(retry_serial, grant_serial);
+    let retry_principal = exact
+        .try_enter_remote_self_revocation()
+        .expect("issue purpose-scoped retry connection capability")
+        .into_revoking_retry_principal()
+        .expect("consume Revoking retry capability");
+    assert_eq!(
+        retry_principal.authorization_key(),
+        projected.authorization_key()
+    );
+    projected.finish_revoke();
+    assert!(matches!(
+        exact.try_enter_remote_self_revocation(),
+        Err(PrincipalAccessError::Revoked)
+    ));
+}
+
+#[tokio::test]
+async fn fresh_self_revocation_has_one_atomic_winner_and_exact_retry_can_resume() {
+    let issuer = PrincipalIssuer::local_only([0xC4; 32]);
+    let principal = issuer
+        .issue_test_remote([0x31; 16], [0x32; 16], 10, [0x33; 32])
+        .expect("issue replay-aware self-revocation principal");
+
+    principal
+        .ensure_remote_self_revocation(false)
+        .expect("first Fresh precheck sees Active");
+    principal
+        .ensure_remote_self_revocation(false)
+        .expect("second Fresh precheck can also race while Active");
+    let expected = (
+        DeviceHandle::new(format!("device-{}", "32".repeat(16))),
+        GrantSerial::new(10),
+    );
+    assert_eq!(
+        principal
+            .admit_remote_self_revocation(false)
+            .await
+            .expect("first Fresh wins Active to Revoking CAS"),
+        expected
+    );
+    assert!(matches!(
+        principal.admit_remote_self_revocation(false).await,
+        Err(PrincipalAccessError::Revoked)
+    ));
+    principal
+        .ensure_remote_self_revocation(true)
+        .expect("ExactDuplicate precheck may resume Revoking");
+    assert_eq!(
+        principal
+            .admit_remote_self_revocation(true)
+            .await
+            .expect("ExactDuplicate may reuse the existing Revoking lease"),
+        expected
+    );
+    principal.finish_revoke();
+    assert!(matches!(
+        principal.ensure_remote_self_revocation(true),
+        Err(PrincipalAccessError::Revoked)
+    ));
+}
+
+#[tokio::test]
 async fn same_authorization_identity_shares_one_revocation_lease() {
     let issuer = PrincipalIssuer::local_only([0xC3; 32]);
     let first = issuer

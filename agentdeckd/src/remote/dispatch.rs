@@ -19,7 +19,7 @@ use agentdeck_protocol::runtime::{RuntimeEnvelope, RuntimeMessage};
 use crate::runtime::store::{
     CurrentRemoteAuthorizationProof, RemoteReplyAuthorization, RuntimeStoreHandle,
 };
-use crate::runtime::{AuthenticatedPrincipal, RuntimeCore};
+use crate::runtime::{RemoteIngressReplayClass, RemotePrincipalActivation, RuntimeCore};
 
 use super::key_control::{
     AuthenticatedKeyControlIngress, KeyControlReplyRoute, validate_control_authority,
@@ -335,11 +335,17 @@ impl AdmittedRemoteIngress {
         let machine_route = current.active().machine_route();
         Ok(Some(match payload {
             VerifiedRemotePayload::Business(envelope) => {
+                let replay = match self.decision {
+                    ReplayDecision::Fresh => RemoteIngressReplayClass::Fresh,
+                    ReplayDecision::ExactDuplicate => RemoteIngressReplayClass::ExactDuplicate,
+                    _ => return Err(RemoteDispatchError::ReplayRejected),
+                };
                 RemoteIngressRoute::Business(DispatchableRemoteIngress {
                     current,
                     envelope,
                     device_route,
                     request_route,
+                    replay,
                 })
             }
             VerifiedRemotePayload::KeyControl(control) => {
@@ -369,6 +375,7 @@ pub(crate) struct DispatchableRemoteIngress {
     envelope: RuntimeEnvelope,
     device_route: DeviceRouteId,
     request_route: RequestRouteId,
+    replay: RemoteIngressReplayClass,
 }
 
 impl DispatchableRemoteIngress {
@@ -389,7 +396,12 @@ impl DispatchableRemoteIngress {
             .register_remote_principal(self.current.active())
             .map_err(|_| RemoteDispatchError::AuthorizationDenied)?;
         let principal = core
-            .activate_registered_remote_principal(registered, &self.current)
+            .activate_registered_remote_principal_for_envelope(
+                registered,
+                &self.current,
+                &self.envelope,
+                self.replay,
+            )
             .map_err(|_| RemoteDispatchError::AuthorizationDenied)?;
         Ok(ActivatedRemoteIngress {
             principal,
@@ -397,17 +409,19 @@ impl DispatchableRemoteIngress {
             envelope: self.envelope,
             device_route: self.device_route,
             request_route: self.request_route,
+            replay: self.replay,
         })
     }
 }
 
 /// RemoteLink 唯一允许交给 RuntimeCore 的规范化结果。
 pub(crate) struct ActivatedRemoteIngress {
-    principal: AuthenticatedPrincipal,
+    principal: RemotePrincipalActivation,
     reply_authorization: RemoteReplyAuthorization,
     envelope: RuntimeEnvelope,
     device_route: DeviceRouteId,
     request_route: RequestRouteId,
+    replay: RemoteIngressReplayClass,
 }
 
 impl ActivatedRemoteIngress {
@@ -418,11 +432,12 @@ impl ActivatedRemoteIngress {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        AuthenticatedPrincipal,
+        RemotePrincipalActivation,
         RemoteReplyAuthorization,
         RuntimeEnvelope,
         DeviceRouteId,
         RequestRouteId,
+        RemoteIngressReplayClass,
     ) {
         (
             self.principal,
@@ -430,6 +445,7 @@ impl ActivatedRemoteIngress {
             self.envelope,
             self.device_route,
             self.request_route,
+            self.replay,
         )
     }
 }
@@ -483,7 +499,7 @@ pub(crate) mod test_support {
         active_authorization_store_with_permissions_for_test, complete_active_zero_cut_transition,
         two_active_authorization_store_with_permissions_for_test,
     };
-    use crate::runtime::{AgentRouter, RuntimeCore};
+    use crate::runtime::{AgentRouter, RevocationAdministration, RuntimeCore};
     use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
     use super::{RemoteIngressDispatcher, uplink_context};
@@ -536,20 +552,30 @@ pub(crate) mod test_support {
         machine_route: MachineRouteId,
         device_route: DeviceRouteId,
     ) -> ActiveRemoteDispatchFixture {
-        active_remote_dispatch_for_test_inner(machine_route, device_route, false).await
+        active_remote_dispatch_for_test_inner(machine_route, device_route, false, None).await
+    }
+
+    pub(crate) async fn active_remote_dispatch_with_revocation_for_test(
+        machine_route: MachineRouteId,
+        device_route: DeviceRouteId,
+        revocation: Arc<dyn RevocationAdministration>,
+    ) -> ActiveRemoteDispatchFixture {
+        active_remote_dispatch_for_test_inner(machine_route, device_route, false, Some(revocation))
+            .await
     }
 
     pub(crate) async fn active_remote_dispatch_with_pending_transition_for_test(
         machine_route: MachineRouteId,
         device_route: DeviceRouteId,
     ) -> ActiveRemoteDispatchFixture {
-        active_remote_dispatch_for_test_inner(machine_route, device_route, true).await
+        active_remote_dispatch_for_test_inner(machine_route, device_route, true, None).await
     }
 
     async fn active_remote_dispatch_for_test_inner(
         machine_route: MachineRouteId,
         device_route: DeviceRouteId,
         preserve_bootstrap_transition: bool,
+        revocation: Option<Arc<dyn RevocationAdministration>>,
     ) -> ActiveRemoteDispatchFixture {
         let root = tempfile::tempdir().expect("create P4.4 dispatch tempdir");
         #[cfg(unix)]
@@ -583,14 +609,17 @@ pub(crate) mod test_support {
         let trust_domain = store
             .machine_trust_domain_for_test()
             .expect("derive dispatch domain");
-        let core = Arc::new(
-            RuntimeCore::new(
-                store.clone(),
-                Arc::new(AgentRouter::with_runtime_store(store.clone())),
-                trust_domain,
-            )
-            .expect("construct dispatch Core"),
-        );
+        let core = RuntimeCore::new(
+            store.clone(),
+            Arc::new(AgentRouter::with_runtime_store(store.clone())),
+            trust_domain,
+        )
+        .expect("construct dispatch Core");
+        let core = match revocation {
+            Some(revocation) => core.with_revocation_administration(revocation),
+            None => core,
+        };
+        let core = Arc::new(core);
         core.recover()
             .await
             .expect("recover dispatch Core before remote start");

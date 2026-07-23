@@ -11,31 +11,36 @@ use agentdeck_protocol::relay_v2::{
     DeviceRouteId, Ed25519Signature, MachineRouteId, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION,
     RelayFrameBody, RequestRouteId,
 };
+use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::failure::{
     DAEMON_AUTHORIZATION_PERMISSION_DENIED, DAEMON_RUNTIME_RECOVERY_BLOCKED,
 };
 use agentdeck_protocol::runtime::identity::{
-    ConversationId, IdempotencyKey, MessageId, StreamGeneration, TransferId,
+    ConversationId, DeviceHandle, GrantSerial, IdempotencyKey, MessageId, StreamGeneration,
+    TransferId,
 };
 use agentdeck_protocol::runtime::{
     ArtifactSha256, CatalogDelta, ConversationMetadataMutation,
     ConversationMetadataMutationRequest, ConversationMetadataReceipt, LocalOnlyAdministration,
-    RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeFailure, RuntimeInnerCursor, RuntimeMessage,
-    RuntimeReply, RuntimeRequest, RuntimeStreamItem, RuntimeSyncComplete, RuntimeTransferCarrierV1,
-    RuntimeTransferChannel, StageUpgradeReceipt, StageUpgradeRequest, StreamCursor,
-    TransferEnvelope,
+    RUNTIME_PROTOCOL_VERSION, RevocationReceipt, RuntimeEnvelope, RuntimeFailure,
+    RuntimeInnerCursor, RuntimeMessage, RuntimeReply, RuntimeRequest, RuntimeStreamItem,
+    RuntimeSyncComplete, RuntimeTransferCarrierV1, RuntimeTransferChannel, StageUpgradeReceipt,
+    StageUpgradeRequest, StreamCursor, TransferEnvelope,
 };
 use async_trait::async_trait;
 use tokio::sync::oneshot::error::TryRecvError;
 
 use crate::runtime::store::{RemoteReplyAuthorization, StreamBindingPermit};
-use crate::runtime::{ConnectionId, ConnectionWrite};
+use crate::runtime::{
+    ConnectionId, ConnectionSink, ConnectionWrite, RemotePrincipalActivation,
+    RevocationAdministration, RevocationAdministrationError,
+};
 
 use super::dispatch::{
     RemoteDispatchError,
     test_support::{
         active_remote_dispatch_for_test, active_remote_dispatch_with_recovery_blocked_for_test,
-        two_active_remote_dispatch_for_test,
+        active_remote_dispatch_with_revocation_for_test, two_active_remote_dispatch_for_test,
     },
 };
 use super::link::{
@@ -53,6 +58,50 @@ const REQUEST_A: RequestRouteId = RequestRouteId::from_bytes([0x64; 16]);
 const REQUEST_B: RequestRouteId = RequestRouteId::from_bytes([0x65; 16]);
 const CONNECTION_A: ConnectionId = ConnectionId::from_test_bytes([0xa1; 16]);
 const CONNECTION_B: ConnectionId = ConnectionId::from_test_bytes([0xb2; 16]);
+
+struct GatedSelfRevocationAdministration {
+    entered: tokio::sync::mpsc::UnboundedSender<(DeviceHandle, GrantSerial)>,
+    outcomes: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Result<(), &'static str>>>,
+}
+
+type GatedSelfRevocationHarness = (
+    Arc<GatedSelfRevocationAdministration>,
+    tokio::sync::mpsc::UnboundedReceiver<(DeviceHandle, GrantSerial)>,
+    tokio::sync::mpsc::UnboundedSender<Result<(), &'static str>>,
+);
+
+fn gated_self_revocation_administration() -> GatedSelfRevocationHarness {
+    let (entered, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (outcomes, outcome_rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        Arc::new(GatedSelfRevocationAdministration {
+            entered,
+            outcomes: tokio::sync::Mutex::new(outcome_rx),
+        }),
+        entered_rx,
+        outcomes,
+    )
+}
+
+#[async_trait]
+impl RevocationAdministration for GatedSelfRevocationAdministration {
+    async fn revoke_device(
+        &self,
+        device: DeviceHandle,
+        grant_serial: GrantSerial,
+    ) -> Result<RevocationReceipt, RevocationAdministrationError> {
+        self.entered
+            .send((device, grant_serial))
+            .map_err(|_| RevocationAdministrationError::new("daemon.revocation.test_gate"))?;
+        match self.outcomes.lock().await.recv().await {
+            Some(Ok(())) => Ok(RevocationReceipt::Committed { grant_serial }),
+            Some(Err(code)) => Err(RevocationAdministrationError::new(code)),
+            None => Err(RevocationAdministrationError::new(
+                "daemon.revocation.test_gate",
+            )),
+        }
+    }
+}
 
 fn business_frame(send: agentdeck_protocol::relay_v2::frame::Send) -> OpaqueRouteFrame {
     OpaqueRouteFrame {
@@ -154,7 +203,8 @@ async fn production_dispatch_rechecks_then_durably_admits_before_core_activation
         &activated.envelope().body,
         RuntimeMessage::Request(RuntimeRequest::DescribeAgents)
     ));
-    let (_, reply_authorization, _, _, _) = activated.into_parts();
+    let (_, reply_authorization, _, _, _, replay) = activated.into_parts();
+    assert_eq!(replay, crate::runtime::RemoteIngressReplayClass::Fresh);
     assert_eq!(
         reply_authorization.trust_epoch().value(),
         1,
@@ -165,6 +215,150 @@ async fn production_dispatch_rechecks_then_durably_admits_before_core_activation
         1,
         "only durable replay admission can release a Core capability"
     );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_pre_activated_fresh_self_revocations_only_enter_backend_once() {
+    let (revocation, mut entered, outcomes) = gated_self_revocation_administration();
+    let fixture =
+        active_remote_dispatch_with_revocation_for_test(MACHINE, DEVICE_A, revocation).await;
+    let core = fixture.core_arc();
+    let first = fixture.signed_runtime_send(
+        RequestRouteId::from_bytes([0x31; 16]),
+        MessageId::new("fresh-self-revoke-pre-activated-a"),
+        RuntimeRequest::Revoke(RevokeRequest {
+            target: RevokeTarget::SelfDevice,
+        }),
+        31,
+    );
+    let second = fixture.signed_runtime_send(
+        RequestRouteId::from_bytes([0x32; 16]),
+        MessageId::new("fresh-self-revoke-pre-activated-b"),
+        RuntimeRequest::Revoke(RevokeRequest {
+            target: RevokeTarget::SelfDevice,
+        }),
+        32,
+    );
+
+    let mut activated = Vec::new();
+    for send in [first.send(), second.send()] {
+        let verified = fixture
+            .dispatcher()
+            .verify_send(send.clone())
+            .await
+            .expect("Fresh self-revoke passes DeviceSign/AAD/AEAD verification");
+        let current = fixture
+            .dispatcher()
+            .recheck_current(verified)
+            .await
+            .expect("Fresh self-revoke remains current");
+        let admitted = fixture
+            .dispatcher()
+            .admit_replay(current)
+            .await
+            .expect("Fresh self-revoke replay tuple commits");
+        assert_eq!(admitted.decision(), ReplayDecision::Fresh);
+        activated.push(
+            admitted
+                .into_dispatchable()
+                .expect("Fresh self-revoke decrypts")
+                .expect("Fresh self-revoke dispatches")
+                .activate(fixture.core())
+                .expect("both Fresh frames pre-activate while the shared lease is Active"),
+        );
+    }
+
+    let first = activated.remove(0);
+    let second = activated.remove(0);
+    let (first_principal, _, first_envelope, _, _, first_replay) = first.into_parts();
+    let (second_principal, _, second_envelope, _, _, second_replay) = second.into_parts();
+    let RemotePrincipalActivation::NewOrExisting(first_principal) = first_principal else {
+        panic!("Fresh Active self-revoke must use an ordinary Core connection")
+    };
+    let RemotePrincipalActivation::NewOrExisting(second_principal) = second_principal else {
+        panic!("second Fresh Active self-revoke must also pre-activate normally")
+    };
+    // RemoteLink 会按 authorization key 复用既有 connection；第二个 activation 只证明
+    // B 也在 Active 时越过 pre-Core 边界，真正 mutation 仍从同一 connection dispatch。
+    drop(second_principal);
+    let (sink, _writes) = tokio::sync::mpsc::channel::<ConnectionWrite>(2);
+    let connection = core
+        .connect(first_principal, ConnectionSink::new(sink))
+        .expect("connect the shared pre-activated Fresh self-revoke principal");
+
+    let first_handling = tokio::spawn({
+        let core = core.clone();
+        async move {
+            core.handle_remote_envelope(connection, first_envelope, first_replay)
+                .await
+        }
+    });
+    let exact_target = (
+        DeviceHandle::new(format!("device-{}", "d1".repeat(16))),
+        GrantSerial::new(1),
+    );
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.recv())
+            .await
+            .expect("first Fresh self-revoke backend deadline")
+            .expect("first Fresh self-revoke enters backend"),
+        exact_target
+    );
+
+    let mut second_handling = tokio::spawn({
+        let core = core.clone();
+        async move {
+            core.handle_remote_envelope(connection, second_envelope, second_replay)
+                .await
+        }
+    });
+    let (second_completed, unexpected) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut second_handling => {
+                    assert!(result.expect("join rejected second Fresh handler").is_ok());
+                    (true, None)
+                }
+                observed = entered.recv() => {
+                    (false, Some(observed.expect("self-revoke backend entry channel stays open")))
+                }
+            }
+        })
+        .await
+        .expect("second Fresh must either be rejected or expose the duplicate backend entry");
+    if let Some(unexpected) = unexpected {
+        outcomes
+            .send(Err("daemon.revocation.unexpected_first_fresh"))
+            .expect("release first unexpected duplicate path");
+        outcomes
+            .send(Err("daemon.revocation.unexpected_second_fresh"))
+            .expect("release second unexpected duplicate path");
+        let _ = first_handling.await;
+        let _ = second_handling.await;
+        drop(core);
+        fixture.shutdown().await;
+        panic!("two distinct Fresh replay tuples entered the backend: {unexpected:?}");
+    }
+    assert!(
+        second_completed,
+        "the second Fresh handler must fail before backend"
+    );
+    outcomes
+        .send(Err("daemon.revocation.expected_test_stop"))
+        .expect("release the unique Fresh self-revoke");
+    assert!(
+        first_handling
+            .await
+            .expect("join first Fresh handler")
+            .is_ok()
+    );
+    assert!(matches!(
+        entered.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    drop(core);
     fixture.shutdown().await;
 }
 
@@ -409,6 +603,271 @@ async fn fresh_signed_bad_tag_consumes_counter_before_returning_ciphertext_error
         Err(RemoteDispatchError::InvalidCiphertext)
     ));
     assert_eq!(fixture.core().remote_registration_calls_for_test(), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn real_remote_link_allows_only_exact_self_revoke_after_backend_failure() {
+    let (revocation, mut entered, outcomes) = gated_self_revocation_administration();
+    let fixture =
+        active_remote_dispatch_with_revocation_for_test(MACHINE, DEVICE_A, revocation).await;
+    let core = fixture.core_arc();
+    let (mut transport, _pairing_lane, harness) = active_pairing_transport_for_test(MACHINE);
+    let business = transport
+        .take_business_lane()
+        .expect("take self-revoke retry business lane");
+    let sealer = Arc::new(RecordingSealer {
+        calls: Mutex::new(Vec::new()),
+        sealed: None,
+    });
+    let mut owner = RemoteLinkOwner::start(
+        MACHINE,
+        fixture.store(),
+        business,
+        Arc::downgrade(&core),
+        sealer.clone(),
+        Arc::new(RecordingPublisher::default()),
+    )
+    .expect("start self-revoke retry RemoteLink");
+    let exact_target = (
+        DeviceHandle::new(format!("device-{}", "d1".repeat(16))),
+        GrantSerial::new(1),
+    );
+
+    let first = fixture.signed_runtime_send(
+        RequestRouteId::from_bytes([0x41; 16]),
+        MessageId::new("remote-self-revoke-first"),
+        RuntimeRequest::Revoke(RevokeRequest {
+            target: RevokeTarget::SelfDevice,
+        }),
+        51,
+    );
+    harness
+        .push_frame(business_frame(first.send().clone()))
+        .await;
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.recv())
+            .await
+            .expect("first RemoteLink self-revoke backend deadline")
+            .expect("first RemoteLink self-revoke backend entry"),
+        exact_target
+    );
+    outcomes
+        .send(Err("daemon.revocation.remote_self_test_failure"))
+        .expect("release first RemoteLink self-revoke with failure");
+    wait_for_sent(
+        &harness,
+        1,
+        "backend failure returns one ordinary Runtime reply",
+    )
+    .await;
+    assert!(matches!(
+        recorded_runtime_reply(
+            sealer
+                .calls
+                .lock()
+                .expect("read first self-revoke reply")
+                .first()
+                .expect("first self-revoke reply was sealed"),
+        ),
+        RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+            if code == "daemon.revocation.remote_self_test_failure"
+    ));
+
+    transport
+        .reconnect()
+        .await
+        .expect("replace generation after pre-owner self-revoke failure");
+    wait_for_connection_count(
+        &owner,
+        0,
+        "generation replacement removes the failed self-revoke connection",
+    )
+    .await;
+    let blocked_business = fixture.signed_runtime_send(
+        RequestRouteId::from_bytes([0x42; 16]),
+        MessageId::new("business-after-self-revoke-failure"),
+        RuntimeRequest::DescribeAgents,
+        52,
+    );
+    let fresh_self_revoke = fixture.signed_runtime_send(
+        RequestRouteId::from_bytes([0x43; 16]),
+        MessageId::new("fresh-self-revoke-after-failure"),
+        RuntimeRequest::Revoke(RevokeRequest {
+            target: RevokeTarget::SelfDevice,
+        }),
+        53,
+    );
+    for rejected in [blocked_business.send(), fresh_self_revoke.send()] {
+        let verified = fixture
+            .dispatcher()
+            .verify_send(rejected.clone())
+            .await
+            .expect("post-failure frame passes DeviceSign/AAD verification");
+        let current = fixture
+            .dispatcher()
+            .recheck_current(verified)
+            .await
+            .expect("post-failure frame remains current");
+        let admitted = fixture
+            .dispatcher()
+            .admit_replay(current)
+            .await
+            .expect("post-failure Fresh replay tuple commits");
+        assert_eq!(admitted.decision(), ReplayDecision::Fresh);
+        let dispatchable = admitted
+            .into_dispatchable()
+            .expect("post-failure frame decrypts")
+            .expect("post-failure Fresh frame dispatches");
+        assert!(matches!(
+            dispatchable.activate(fixture.core()),
+            Err(RemoteDispatchError::AuthorizationDenied)
+        ));
+    }
+    assert!(matches!(
+        entered.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    harness
+        .push_frame(business_frame(first.send().clone()))
+        .await;
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.recv())
+            .await
+            .expect("exact RemoteLink self-revoke retry deadline")
+            .expect("exact RemoteLink self-revoke retry entry"),
+        exact_target,
+        "only the immutable exact self-revoke may cross a Revoking lease after reconnect"
+    );
+    assert_eq!(
+        harness.sent_count(),
+        1,
+        "ordinary business must remain rejected before Core while the lease is Revoking"
+    );
+    outcomes
+        .send(Ok(()))
+        .expect("release exact RemoteLink self-revoke retry with success");
+    wait_for_connection_count(
+        &owner,
+        0,
+        "successful self-revoke disconnects exact principal",
+    )
+    .await;
+    assert_eq!(
+        harness.sent_count(),
+        1,
+        "ordinary Runtime success is not the MachineRoot-signed cleanup terminal"
+    );
+
+    owner
+        .shutdown()
+        .await
+        .expect("shutdown self-revoke retry RemoteLink");
+    transport.shutdown().await;
+    drop(core);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn generation_replacement_cannot_cancel_admitted_self_revocation() {
+    let (revocation, mut entered, outcomes) = gated_self_revocation_administration();
+    let fixture =
+        active_remote_dispatch_with_revocation_for_test(MACHINE, DEVICE_A, revocation).await;
+    let core = fixture.core_arc();
+    let ingress = fixture
+        .store()
+        .load_active_remote_ingress(MACHINE, DEVICE_A)
+        .await
+        .expect("load exact generation-cancellation principal");
+    let registered = core
+        .register_remote_principal(&ingress)
+        .expect("register exact generation-cancellation principal");
+    let current = fixture
+        .store()
+        .recheck_active_remote_ingress(&ingress)
+        .await
+        .expect("recheck exact generation-cancellation principal");
+    let principal = core
+        .activate_registered_remote_principal(registered, &current)
+        .expect("activate exact generation-cancellation principal");
+    let held_guard = principal
+        .try_enter()
+        .expect("hold one in-flight permission across the revoke fence");
+
+    let (mut transport, _pairing_lane, harness) = active_pairing_transport_for_test(MACHINE);
+    let business = transport
+        .take_business_lane()
+        .expect("take generation-cancellation business lane");
+    let mut owner = RemoteLinkOwner::start(
+        MACHINE,
+        fixture.store(),
+        business,
+        Arc::downgrade(&core),
+        Arc::new(RecordingSealer {
+            calls: Mutex::new(Vec::new()),
+            sealed: None,
+        }),
+        Arc::new(RecordingPublisher::default()),
+    )
+    .expect("start generation-cancellation RemoteLink");
+    let request = fixture.signed_runtime_send(
+        RequestRouteId::from_bytes([0x44; 16]),
+        MessageId::new("remote-self-revoke-generation-replaced"),
+        RuntimeRequest::Revoke(RevokeRequest {
+            target: RevokeTarget::SelfDevice,
+        }),
+        61,
+    );
+    harness
+        .push_frame(business_frame(request.send().clone()))
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while principal.is_active() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("self-revoke reaches the shared Revoking fence");
+    wait_for_connection_count(&owner, 1, "self-revoke creates one exact Core connection").await;
+
+    transport
+        .reconnect()
+        .await
+        .expect("replace authenticated business generation");
+    wait_for_connection_count(
+        &owner,
+        0,
+        "generation replacement removes the stale virtual connection",
+    )
+    .await;
+    drop(held_guard);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.recv())
+            .await
+            .expect("generation replacement must not cancel the safety mutation")
+            .expect("self-revoke backend still receives the exact target"),
+        (
+            DeviceHandle::new(format!("device-{}", "d1".repeat(16))),
+            GrantSerial::new(1),
+        )
+    );
+    outcomes
+        .send(Ok(()))
+        .expect("complete generation-safe self-revoke");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !principal.is_revoked() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("principal publishes Revoked after durable completion");
+
+    owner
+        .shutdown()
+        .await
+        .expect("shutdown generation-cancellation RemoteLink");
+    transport.shutdown().await;
+    drop(core);
     fixture.shutdown().await;
 }
 

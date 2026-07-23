@@ -45,6 +45,7 @@ pub(crate) use conversation::tests::FakeCoordinator;
 #[doc(hidden)]
 pub use conversation_activation::{ConversationActivationCoordinator, ConversationActivationError};
 pub use core::{RecoveryReport, RuntimeCore};
+pub(crate) use core::{RemoteIngressReplayClass, RemotePrincipalActivation};
 pub use hub::RuntimeHub;
 #[doc(hidden)]
 pub use pairing_administration::{

@@ -6,9 +6,10 @@
 //! 再进入 durable store/per-conversation actor。
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 use agentdeck_protocol::e2ee::AuthorizationPermissionV1;
 use agentdeck_protocol::runtime::command::{HelloParams, QueryReceiptSelector, RevokeTarget};
@@ -31,14 +32,16 @@ use agentdeck_protocol::runtime::{
     RuntimeReply, RuntimeRequest, RuntimeSubscriptionTarget, StageUpgradeReceipt,
     SubscriptionReceipt,
 };
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
+use tokio::task::JoinSet;
 
 use super::approval::ApprovalPrincipalCapability;
 use super::catalog_snapshot::{CatalogSnapshotProvider, CatalogSnapshotProviderError};
 use super::connection::{
     AuthenticatedPrincipal, ConnectionError, ConnectionId, ConnectionRegistry, ConnectionSink,
-    DEFAULT_CONNECTION_WRITER_BYTES, DEFAULT_CONNECTION_WRITER_FRAMES, EncodedRuntimeFrame,
-    FlushReceipt, PrincipalAccessError, PrincipalIssuer,
+    DEFAULT_CONNECTION_WRITER_BYTES, DEFAULT_CONNECTION_WRITER_FRAMES,
+    DEFAULT_RUNTIME_CONNECTION_CAPACITY, EncodedRuntimeFrame, FlushReceipt, PrincipalAccessError,
+    PrincipalIssuer, RemoteSelfRevocationAdmission,
 };
 use super::conversation::{
     ActiveCancelResult, ConversationError, ConversationRegistry, PromptAcceptResult,
@@ -136,6 +139,7 @@ pub struct RuntimeCore {
     recovery_blocked_conversations: RwLock<HashSet<RuntimeId>>,
     lifecycle: AtomicU8,
     operation_tracker: Arc<RuntimeOperationTracker>,
+    safety_tasks: RuntimeSafetyTaskOwner,
     recovery_lock: Mutex<()>,
     shutdown_lock: Mutex<()>,
 }
@@ -155,6 +159,67 @@ pub(crate) struct RegisteredRemotePrincipal {
 impl std::fmt::Debug for RegisteredRemotePrincipal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RegisteredRemotePrincipal([REDACTED])")
+    }
+}
+
+/// 完整 ingress 验证后的 purpose-aware principal activation。普通业务只能走
+/// `NewOrExisting`；`SelfRevocationRetry` 仅由 normalized `Revoke(SelfDevice)` 在 shared
+/// lease 已 Revoking 时产生，只能交回 Core 的 purpose-scoped connection 入口。
+pub(crate) enum RemotePrincipalActivation {
+    NewOrExisting(AuthenticatedPrincipal),
+    SelfRevocationRetry(RemoteSelfRevocationAdmission),
+}
+
+/// 完整 durable replay admission 规范化后的 Core 中立分类。只有 byte-identical
+/// `ExactDuplicate` 能恢复已经 Revoking 的 self-revoke；Fresh 只允许首次 Active mutation。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteIngressReplayClass {
+    Fresh,
+    ExactDuplicate,
+}
+
+impl RemoteIngressReplayClass {
+    const fn allows_revoking_retry(self) -> bool {
+        matches!(self, Self::ExactDuplicate)
+    }
+}
+
+/// caller/transport cancellation 不能撤销已经准入的安全 mutation。retained operation
+/// lease 让 Core shutdown 等待 fence、durable owner 与 terminal cleanup 收口。
+struct RemoteSelfRevocationWork {
+    principal: AuthenticatedPrincipal,
+    replay: RemoteIngressReplayClass,
+    operation: RuntimeOperationGuard,
+    conversations: Arc<ConversationRegistry>,
+    connections: ConnectionRegistry,
+    subscriptions: SubscriptionCoordinator,
+    revocation_administration: Arc<dyn RevocationAdministration>,
+}
+
+impl RemoteSelfRevocationWork {
+    async fn run(self) -> Result<RuntimeReply, RuntimeCoreError> {
+        let Self {
+            principal,
+            replay,
+            operation,
+            conversations,
+            connections,
+            subscriptions,
+            revocation_administration,
+        } = self;
+        let _operation = operation;
+        let (device, grant_serial) = principal
+            .admit_remote_self_revocation(replay.allows_revoking_retry())
+            .await?;
+        conversations
+            .terminate_principal_accepted(&principal)
+            .await?;
+        let receipt = revocation_administration
+            .revoke_device(device, grant_serial)
+            .await
+            .map_err(revocation_administration_error)?;
+        finalize_remote_principal_revoke(&connections, &subscriptions, principal).await?;
+        Ok(RuntimeReply::Revocation(receipt))
     }
 }
 
@@ -347,6 +412,7 @@ impl RuntimeCore {
             recovery_blocked_conversations: RwLock::new(HashSet::new()),
             lifecycle: AtomicU8::new(CORE_COLD),
             operation_tracker: Arc::new(RuntimeOperationTracker::default()),
+            safety_tasks: RuntimeSafetyTaskOwner::new(DEFAULT_RUNTIME_CONNECTION_CAPACITY),
             recovery_lock: Mutex::new(()),
             shutdown_lock: Mutex::new(()),
         })
@@ -457,13 +523,57 @@ impl RuntimeCore {
         registered: RegisteredRemotePrincipal,
         proof: &CurrentRemoteAuthorizationProof,
     ) -> Result<AuthenticatedPrincipal, RuntimeCoreError> {
+        let principal = self.consume_registered_remote_principal(registered, proof)?;
+        let authorization = principal.try_enter()?;
+        drop(authorization);
+        Ok(principal)
+    }
+
+    /// 完整 ingress 验证链之后的 purpose-aware activation。只有 current Runtime
+    /// `Revoke(SelfDevice)` 可以在 shared lease 已 Revoking 时取得 retry-only capability；
+    /// 其它 envelope 与 generic API 仍严格要求 Active。
+    pub(crate) fn activate_registered_remote_principal_for_envelope(
+        &self,
+        registered: RegisteredRemotePrincipal,
+        proof: &CurrentRemoteAuthorizationProof,
+        envelope: &RuntimeEnvelope,
+        replay: RemoteIngressReplayClass,
+    ) -> Result<RemotePrincipalActivation, RuntimeCoreError> {
+        let principal = self.consume_registered_remote_principal(registered, proof)?;
+        let is_self_revocation = envelope.version == RUNTIME_PROTOCOL_VERSION
+            && matches!(
+                &envelope.body,
+                RuntimeMessage::Request(RuntimeRequest::Revoke(request))
+                    if matches!(&request.target, RevokeTarget::SelfDevice)
+            );
+        if is_self_revocation {
+            let admission = principal.try_enter_remote_self_revocation()?;
+            let is_revoking_retry = admission.is_revoking_retry();
+            return Ok(if is_revoking_retry {
+                if replay != RemoteIngressReplayClass::ExactDuplicate {
+                    return Err(RuntimeCoreError::AuthorizationRevoked);
+                }
+                RemotePrincipalActivation::SelfRevocationRetry(admission)
+            } else {
+                let (principal, _device, _grant_serial) = admission.into_parts();
+                RemotePrincipalActivation::NewOrExisting(principal)
+            });
+        }
+        let authorization = principal.try_enter()?;
+        drop(authorization);
+        Ok(RemotePrincipalActivation::NewOrExisting(principal))
+    }
+
+    fn consume_registered_remote_principal(
+        &self,
+        registered: RegisteredRemotePrincipal,
+        proof: &CurrentRemoteAuthorizationProof,
+    ) -> Result<AuthenticatedPrincipal, RuntimeCoreError> {
         if !Arc::ptr_eq(&registered.core_identity, &self.recovery_identity)
             || !proof.confirms_registered(&registered.registration)
         {
             return Err(RuntimeCoreError::AuthorizationDenied);
         }
-        let authorization = registered.principal.try_enter()?;
-        drop(authorization);
         Ok(registered.principal)
     }
 
@@ -487,6 +597,39 @@ impl RuntimeCore {
             .map_err(|error| RuntimeCoreError::Connection(error).into_failure())
     }
 
+    /// Store-current 且完整验证后的 exact self-revoke retry 可以在 MachineLink 换代后
+    /// 重新挂载一条 purpose-scoped virtual connection。普通业务仍无法构造 admission；
+    /// attach 前后双读与 finalize 的 Revoked-first 顺序共同封住 connection 快照竞态。
+    pub(crate) fn connect_remote_self_revocation_retry(
+        &self,
+        admission: RemoteSelfRevocationAdmission,
+        sink: ConnectionSink,
+    ) -> Result<ConnectionId, RuntimeFailure> {
+        let _operation = self
+            .try_enter_operation()
+            .map_err(RuntimeCoreError::into_failure)?;
+        let principal = admission
+            .into_revoking_retry_principal()
+            .map_err(RuntimeCoreError::from)
+            .map_err(RuntimeCoreError::into_failure)?;
+        if !principal.is_revoking() {
+            return Err(RuntimeCoreError::AuthorizationRevoked.into_failure());
+        }
+        let connection_id = self
+            .connections
+            .connect(principal.clone(), sink)
+            .map_err(RuntimeCoreError::Connection)
+            .map_err(RuntimeCoreError::into_failure)?;
+        if !principal.is_revoking() {
+            self.connections
+                .fail_close(connection_id)
+                .map_err(RuntimeCoreError::Connection)
+                .map_err(RuntimeCoreError::into_failure)?;
+            return Err(RuntimeCoreError::AuthorizationRevoked.into_failure());
+        }
+        Ok(connection_id)
+    }
+
     /// 所有 transport 共用的规范化请求入口。
     pub async fn handle(
         &self,
@@ -503,9 +646,25 @@ impl RuntimeCore {
 
     async fn handle_admitted(
         &self,
-        _operation: &RuntimeOperationGuard,
+        operation: &RuntimeOperationGuard,
         connection_id: ConnectionId,
         request: RuntimeRequest,
+    ) -> RuntimeReply {
+        self.handle_admitted_with_replay(
+            operation,
+            connection_id,
+            request,
+            RemoteIngressReplayClass::Fresh,
+        )
+        .await
+    }
+
+    async fn handle_admitted_with_replay(
+        &self,
+        operation: &RuntimeOperationGuard,
+        connection_id: ConnectionId,
+        request: RuntimeRequest,
+        replay: RemoteIngressReplayClass,
     ) -> RuntimeReply {
         let principal = match self.connections.principal(connection_id) {
             Ok(principal) => principal,
@@ -513,7 +672,10 @@ impl RuntimeCore {
                 return RuntimeReply::Failure(RuntimeCoreError::Connection(error).into_failure());
             }
         };
-        match self.handle_ready(_operation, principal, request).await {
+        match self
+            .handle_ready(operation, principal, request, replay)
+            .await
+        {
             Ok(reply) => reply,
             Err(error) => RuntimeReply::Failure(error.into_failure()),
         }
@@ -525,6 +687,29 @@ impl RuntimeCore {
         &self,
         connection_id: ConnectionId,
         envelope: RuntimeEnvelope,
+    ) -> Result<(), RuntimeFailure> {
+        self.handle_envelope_with_replay(connection_id, envelope, RemoteIngressReplayClass::Fresh)
+            .await
+    }
+
+    /// RemoteLink 在完整 DeviceSign/AAD/replay/AEAD 与 local auth-ledger 验证后
+    /// 使用的 request-scoped 入口。replay 绝不缓存到 connection；每个 frame 都必须
+    /// 把自己的 durable classification 带到真正 mutation admission。
+    pub(crate) async fn handle_remote_envelope(
+        &self,
+        connection_id: ConnectionId,
+        envelope: RuntimeEnvelope,
+        replay: RemoteIngressReplayClass,
+    ) -> Result<(), RuntimeFailure> {
+        self.handle_envelope_with_replay(connection_id, envelope, replay)
+            .await
+    }
+
+    async fn handle_envelope_with_replay(
+        &self,
+        connection_id: ConnectionId,
+        envelope: RuntimeEnvelope,
+        replay: RemoteIngressReplayClass,
     ) -> Result<(), RuntimeFailure> {
         let principal = self
             .connections
@@ -564,6 +749,7 @@ impl RuntimeCore {
                             principal,
                             message_id.clone(),
                             request,
+                            replay,
                         )
                         .await
                     {
@@ -758,6 +944,7 @@ impl RuntimeCore {
         principal: AuthenticatedPrincipal,
         message_id: agentdeck_protocol::runtime::identity::MessageId,
         request: RuntimeRequest,
+        replay: RemoteIngressReplayClass,
     ) -> Option<Result<(), RuntimeFailure>> {
         let stream_result = match request {
             RuntimeRequest::Catalog(request) => {
@@ -917,7 +1104,9 @@ impl RuntimeCore {
                 }
             }
             other => {
-                let reply = self.handle_admitted(operation, connection_id, other).await;
+                let reply = self
+                    .handle_admitted_with_replay(operation, connection_id, other, replay)
+                    .await;
                 return Some(self.enqueue_admitted(
                     operation,
                     connection_id,
@@ -973,6 +1162,7 @@ impl RuntimeCore {
         operation: &RuntimeOperationGuard,
         principal: AuthenticatedPrincipal,
         request: RuntimeRequest,
+        replay: RemoteIngressReplayClass,
     ) -> Result<RuntimeReply, RuntimeCoreError> {
         match request {
             RuntimeRequest::Hello(params) => Ok(self.handle_hello(params)),
@@ -1558,11 +1748,31 @@ impl RuntimeCore {
                     drop(authorization);
                     result
                 }
-                // SelfDevice 属后续 authenticated RemoteLink；本地管理 seam 不得代办。
                 RevokeTarget::SelfDevice => {
-                    let _authorization = principal
-                        .try_enter_runtime_permission(AuthorizationPermissionV1::RevokeSelf)?;
-                    Err(RuntimeCoreError::FeatureUnavailable)
+                    // target 只能从 authenticated remote principal 派生；request 不得
+                    // 携带或覆盖 device route / grant serial。此处只读校验 identity、
+                    // permission 与当前状态；真正 Active->Revoking CAS 必须等 safety
+                    // task 同步登记成功后在 future 内执行，owner 拒绝不能遗留孤儿 fence。
+                    principal.ensure_remote_self_revocation(replay.allows_revoking_retry())?;
+                    let work = RemoteSelfRevocationWork {
+                        principal,
+                        replay,
+                        operation: operation.retain(),
+                        conversations: self.conversations.clone(),
+                        connections: self.connections.clone(),
+                        subscriptions: self.subscriptions.clone(),
+                        revocation_administration: self.revocation_administration.clone(),
+                    };
+                    let result = self.safety_tasks.spawn(work.run()).map_err(|_| {
+                        revocation_administration_error(RevocationAdministrationError::new(
+                            "daemon.revocation.administration.unavailable",
+                        ))
+                    })?;
+                    result.await.map_err(|_| {
+                        revocation_administration_error(RevocationAdministrationError::new(
+                            "daemon.revocation.administration.unavailable",
+                        ))
+                    })?
                 }
             },
             RuntimeRequest::StageUpgrade(_) => {
@@ -1712,20 +1922,21 @@ impl RuntimeCore {
                 self.register_remote_principal(&proof)?.principal
             }
         };
-        match self
-            .conversations
-            .begin_principal_revocation(&principal)
-            .await
-        {
-            Ok(()) => {
-                self.conversations
-                    .terminate_principal_accepted(&principal)
-                    .await?;
-                Ok(Some(principal))
-            }
-            Err(ConversationError::Principal(PrincipalAccessError::Revoked)) => Ok(None),
-            Err(error) => Err(RuntimeCoreError::Conversation(error)),
+        if self.begin_exact_remote_principal_revoke(&principal).await? {
+            Ok(Some(principal))
+        } else {
+            Ok(None)
         }
+    }
+
+    /// 已认证 exact remote principal 的共享 pre-COMMIT fence。Active/Revoking 都会
+    /// drain permission guard 并终止尚未 Started 的 Accepted；Revoked 表示其它 exact
+    /// revoke 已完成，只允许 durable owner 做幂等 replay，不重复连接清理。
+    async fn begin_exact_remote_principal_revoke(
+        &self,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<bool, RuntimeCoreError> {
+        begin_exact_remote_principal_revoke(&self.conversations, principal).await
     }
 
     /// durable revoke 成功后的 terminal publish。Accepted 已在 pre-COMMIT fence
@@ -1735,18 +1946,7 @@ impl RuntimeCore {
         &self,
         principal: AuthenticatedPrincipal,
     ) -> Result<(), RuntimeCoreError> {
-        let authorization_key = principal.authorization_key();
-        let connections = self
-            .connections
-            .connections_for_authorization(&authorization_key);
-        if let Ok(connections) = &connections {
-            for connection_id in connections.iter().copied() {
-                self.disconnect(connection_id).await;
-            }
-        }
-        principal.finish_revoke();
-        connections.map_err(RuntimeCoreError::Connection)?;
-        Ok(())
+        finalize_remote_principal_revoke(&self.connections, &self.subscriptions, principal).await
     }
 
     /// 事件/异步 reply 的非阻塞投递入口。真正 transport flush ACK 前 Core 仍持有
@@ -1809,6 +2009,7 @@ impl RuntimeCore {
         if state == CORE_STOPPED {
             return Ok(());
         }
+        let mut first_failure = None;
         if state != CORE_DRAINING {
             self.lifecycle.store(CORE_CLOSING, Ordering::Release);
             // CLOSING 必须先同步关闭新的 adapter/start admission。native metadata
@@ -1817,6 +2018,14 @@ impl RuntimeCore {
             // 并移交 actor 的 operation 不受影响，仍由下方 quiescence 等到 terminal。
             self.conversations.close_admission();
             self.wait_for_operation_quiescence().await;
+            // retained safety mutation 先让 operation quiescence 证明业务 future 已经
+            // 返回，再显式 drain/join task wrapper；不能只凭计数器丢弃 JoinHandle。
+            if self.safety_tasks.shutdown().await.is_err() {
+                first_failure = Some(RuntimeFailure::new(
+                    DAEMON_RUNTIME_ACTOR_UNAVAILABLE,
+                    "runtime safety task owner failed to join",
+                ));
+            }
             // Projector 可能正在持有 per-conversation quiescence lease 或等待
             // Store exact convergence；必须先 cancel/join，再关 actor scheduling/store。
             self.native_projector.shutdown().await;
@@ -1826,13 +2035,20 @@ impl RuntimeCore {
             self.conversations.wait_for_start_fence().await;
             self.lifecycle.store(CORE_DRAINING, Ordering::Release);
         } else {
+            if self.safety_tasks.shutdown().await.is_err() {
+                first_failure = Some(RuntimeFailure::new(
+                    DAEMON_RUNTIME_ACTOR_UNAVAILABLE,
+                    "runtime safety task owner failed to join",
+                ));
+            }
             self.native_projector.shutdown().await;
         }
 
         // 任一子层报错也继续拆掉其他资源，避免一次 actor/writer join failure 让
         // connection 或 SQLite worker 永久残留。只有 store 真正静默后才发布 STOPPED。
-        let mut first_failure = None;
-        if let Err(error) = self.conversations.shutdown().await {
+        if let Err(error) = self.conversations.shutdown().await
+            && first_failure.is_none()
+        {
             first_failure = Some(RuntimeCoreError::Conversation(error).into_failure());
         }
         if let Err(error) = self.subscriptions.shutdown().await
@@ -1898,6 +2114,42 @@ impl RuntimeCore {
     }
 }
 
+async fn begin_exact_remote_principal_revoke(
+    conversations: &ConversationRegistry,
+    principal: &AuthenticatedPrincipal,
+) -> Result<bool, RuntimeCoreError> {
+    match conversations.begin_principal_revocation(principal).await {
+        Ok(()) => {
+            conversations
+                .terminate_principal_accepted(principal)
+                .await?;
+            Ok(true)
+        }
+        Err(ConversationError::Principal(PrincipalAccessError::Revoked)) => Ok(false),
+        Err(error) => Err(RuntimeCoreError::Conversation(error)),
+    }
+}
+
+async fn finalize_remote_principal_revoke(
+    connections: &ConnectionRegistry,
+    subscriptions: &SubscriptionCoordinator,
+    principal: AuthenticatedPrincipal,
+) -> Result<(), RuntimeCoreError> {
+    let authorization_key = principal.authorization_key();
+    // durable backend 已成功后先发布 Revoked，阻断任何新 retry attach；随后取得的
+    // exact connection 快照必然包含所有在发布前完成双读的 retry connection。
+    principal.finish_revoke();
+    let exact_connections = connections.connections_for_authorization(&authorization_key);
+    if let Ok(exact_connections) = &exact_connections {
+        for connection_id in exact_connections.iter().copied() {
+            let _ = subscriptions.disconnect(connection_id).await;
+            let _ = connections.disconnect(connection_id).await;
+        }
+    }
+    exact_connections.map_err(RuntimeCoreError::Connection)?;
+    Ok(())
+}
+
 #[derive(Default)]
 struct RuntimeOperationTracker {
     inflight: AtomicUsize,
@@ -1936,6 +2188,124 @@ impl Drop for RuntimeOperationGuard {
     fn drop(&mut self) {
         self.tracker.leave();
     }
+}
+
+struct RuntimeSafetyTaskState {
+    accepting: bool,
+    tasks: JoinSet<()>,
+}
+
+/// caller/transport 生命周期之外继续执行的安全 mutation 只能登记在此 owner。
+///
+/// 同步 mutex 把 capacity 检查、spawn 与 owner 登记收口在一个临界区；publication
+/// handshake 保证 future 在登记完成前不会执行。正常 shutdown 显式 join，Core Drop
+/// 则依赖 JoinSet 的 abort-on-drop 语义，任何路径都不会把 task detach。
+struct RuntimeSafetyTaskOwner {
+    capacity: usize,
+    state: StdMutex<RuntimeSafetyTaskState>,
+}
+
+impl RuntimeSafetyTaskOwner {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: StdMutex::new(RuntimeSafetyTaskState {
+                accepting: true,
+                tasks: JoinSet::new(),
+            }),
+        }
+    }
+
+    fn spawn<F, T>(&self, future: F) -> Result<oneshot::Receiver<T>, RuntimeSafetyTaskError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeSafetyTaskError::OwnerUnavailable)?;
+        if !state.accepting {
+            return Err(RuntimeSafetyTaskError::ShuttingDown);
+        }
+
+        let mut previous_failed = false;
+        while let Some(result) = state.tasks.try_join_next() {
+            previous_failed |= result.is_err();
+        }
+        if previous_failed {
+            return Err(RuntimeSafetyTaskError::TaskFailed);
+        }
+        if state.tasks.len() >= self.capacity {
+            return Err(RuntimeSafetyTaskError::Capacity);
+        }
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let (publish, published) = oneshot::channel();
+        state.tasks.spawn(async move {
+            if published.await.is_err() {
+                return;
+            }
+            let _ = result_tx.send(future.await);
+        });
+        drop(state);
+        publish
+            .send(())
+            .map_err(|_| RuntimeSafetyTaskError::TaskFailed)?;
+        Ok(result_rx)
+    }
+
+    async fn shutdown(&self) -> Result<(), RuntimeSafetyTaskError> {
+        let mut tasks = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| RuntimeSafetyTaskError::OwnerUnavailable)?;
+            state.accepting = false;
+            std::mem::take(&mut state.tasks)
+        };
+        let mut failed = false;
+        while let Some(result) = tasks.join_next().await {
+            failed |= result.is_err();
+        }
+        if failed {
+            Err(RuntimeSafetyTaskError::TaskFailed)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    fn task_count(&self) -> usize {
+        self.state
+            .lock()
+            .map_or(usize::MAX, |state| state.tasks.len())
+    }
+}
+
+impl Drop for RuntimeSafetyTaskOwner {
+    fn drop(&mut self) {
+        let state = match self.state.get_mut() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.accepting = false;
+        state.tasks.abort_all();
+        // JoinSet 自身 Drop 会继续持有并 abort 尚未完成的所有 task；这里显式
+        // abort 是为了让 owner 的兜底语义不依赖调用方记得先 shutdown。
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum RuntimeSafetyTaskError {
+    #[error("runtime safety task owner is unavailable")]
+    OwnerUnavailable,
+    #[error("runtime safety task owner is shutting down")]
+    ShuttingDown,
+    #[error("runtime safety task capacity is exhausted")]
+    Capacity,
+    #[error("runtime safety task failed")]
+    TaskFailed,
 }
 
 fn map_runtime_recovery_error(error: RuntimeRecoveryError) -> RuntimeCoreError {

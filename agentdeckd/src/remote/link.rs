@@ -29,7 +29,7 @@ use crate::runtime::store::key_transition::TransitionSnapshotPermit;
 use crate::runtime::store::{RemoteReplyAuthorization, RuntimeStoreHandle, StreamBindingPermit};
 use crate::runtime::{
     ConnectionFramingProfile, ConnectionId, ConnectionSink, ConnectionWrite,
-    EncodedRuntimeFrameKind, RuntimeCore,
+    EncodedRuntimeFrameKind, RemotePrincipalActivation, RuntimeCore,
 };
 
 use super::dispatch::{
@@ -1491,27 +1491,35 @@ async fn dispatch_send(
         return Err(RemoteLinkError::CoreRejected);
     };
     let route_lifecycle = ReplyRouteLifecycle::for_request(request);
-    let (principal, authorization, envelope, device_route, request_route) = activated.into_parts();
+    let (principal, authorization, envelope, device_route, request_route, replay) =
+        activated.into_parts();
     let connection_key = connection_key(&authorization);
     let mut created_connection = false;
     let connection_id = match connections
         .iter()
         .find(|connection| connection.key == connection_key)
     {
-        Some(connection) => connection.id,
+        Some(connection) => {
+            drop(principal);
+            connection.id
+        }
         None => {
             disconnect_device(core.as_ref(), cleanup, pump, connections, device_route).await;
             if connections.len() >= REMOTE_CONNECTION_CAPACITY {
                 return Err(RemoteLinkError::ConnectionCapacity);
             }
             let (core_tx, core_rx) = mpsc::channel(CORE_WRITER_HANDOFF_CAPACITY);
-            let connection_id = core
-                .connect(
-                    principal,
-                    ConnectionSink::new(core_tx)
-                        .with_framing_profile(ConnectionFramingProfile::CompactTransfer),
-                )
-                .map_err(|_| RemoteLinkError::CoreRejected)?;
+            let sink = ConnectionSink::new(core_tx)
+                .with_framing_profile(ConnectionFramingProfile::CompactTransfer);
+            let connection_id = match principal {
+                RemotePrincipalActivation::NewOrExisting(principal) => {
+                    core.connect(principal, sink)
+                }
+                RemotePrincipalActivation::SelfRevocationRetry(admission) => {
+                    core.connect_remote_self_revocation_retry(admission, sink)
+                }
+            }
+            .map_err(|_| RemoteLinkError::CoreRejected)?;
             connections.push(RemoteConnection {
                 key: connection_key,
                 id: connection_id,
@@ -1581,7 +1589,10 @@ async fn dispatch_send(
                 .handle_transition_snapshot_envelope(connection_id, envelope, permit)
                 .await
                 .is_ok(),
-            None => core.handle_envelope(connection_id, envelope).await.is_ok(),
+            None => core
+                .handle_remote_envelope(connection_id, envelope, replay)
+                .await
+                .is_ok(),
         };
         CoreDispatchCompletion {
             connection_id,

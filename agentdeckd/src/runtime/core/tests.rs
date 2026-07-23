@@ -1278,8 +1278,8 @@ async fn disabled_revocation_administration_fails_closed_for_local_control() {
 }
 
 #[tokio::test]
-async fn revocation_self_device_remains_feature_unavailable_without_backend_call() {
-    let root = TestRoot::new("revocation-self-device-gated");
+async fn revocation_self_device_projects_exact_remote_target_and_releases_guard_before_fence() {
+    let root = TestRoot::new("revocation-self-device-exact-target");
     let store = root.open_store().await;
     let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
     let revocation = Arc::new(CountingRevocationAdministration::succeeding());
@@ -1289,33 +1289,447 @@ async fn revocation_self_device_remains_feature_unavailable_without_backend_call
             .with_revocation_administration(revocation.clone()),
     );
     core.recover().await.expect("recover");
-    let read_only = connect_local(&core, 0x88).await;
-    let (local_control, _control_writes) = connect_local_control_with_sink(&core, 0x89);
     let remote_principal = core
         .principal_issuer
         .issue_test_remote([0x8a; 16], [0x8b; 16], 10, [0x8c; 32])
         .expect("issue remote principal");
     let (remote_sink, _remote_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
     let remote = core
-        .connect(remote_principal, ConnectionSink::new(remote_sink))
+        .connect(remote_principal.clone(), ConnectionSink::new(remote_sink))
         .expect("connect remote principal");
     let request = RuntimeRequest::Revoke(RevokeRequest {
         target: RevokeTarget::SelfDevice,
     });
 
-    for connection in [read_only, remote, local_control] {
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        core.handle(remote, request),
+    )
+    .await
+    .expect("self revoke must release its permission guard before waiting for lease drain");
+    assert!(matches!(
+        reply,
+        RuntimeReply::Revocation(RevocationReceipt::Committed {
+            grant_serial: observed
+        }) if observed == GrantSerial::new(10)
+    ));
+    let device = DeviceHandle::new(format!("device-{}", "8b".repeat(16)));
+    assert_eq!(
+        revocation
+            .observed
+            .lock()
+            .expect("lock observed self revocation target")
+            .as_slice(),
+        &[(device, GrantSerial::new(10))]
+    );
+    assert!(matches!(
+        remote_principal.try_enter(),
+        Err(PrincipalAccessError::Revoked)
+    ));
+    assert!(matches!(
+        core.connections.principal(remote),
+        Err(ConnectionError::NotFound)
+    ));
+    core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn revocation_self_device_rejects_every_local_principal_before_backend() {
+    let root = TestRoot::new("revocation-self-device-remote-only");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let revocation = Arc::new(CountingRevocationAdministration::succeeding());
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xB4; 32])
+            .expect("construct RuntimeCore")
+            .with_revocation_administration(revocation.clone()),
+    );
+    core.recover().await.expect("recover");
+    let read_only = connect_local(&core, 0x88).await;
+    let (local_control, _control_writes) = connect_local_control_with_sink(&core, 0x89);
+
+    for connection in [read_only, local_control] {
         assert!(matches!(
-            core.handle(connection, request.clone()).await,
+            core.handle(
+                connection,
+                RuntimeRequest::Revoke(RevokeRequest {
+                    target: RevokeTarget::SelfDevice,
+                }),
+            )
+            .await,
             RuntimeReply::Failure(RuntimeFailure { ref code, .. })
-                if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+                if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
         ));
     }
-    assert_eq!(
-        revocation.calls.load(Ordering::SeqCst),
-        0,
-        "SelfDevice must not enter the local revocation backend"
-    );
+    assert_eq!(revocation.calls.load(Ordering::SeqCst), 0);
     core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn self_revoke_retry_connection_accepts_only_revoking_and_rejects_stale_tokens() {
+    let root = TestRoot::new("revocation-self-device-retry-connection");
+    let core = core(&root).await;
+    core.recover().await.expect("recover");
+    let principal = core
+        .principal_issuer
+        .issue_test_remote([0x8d; 16], [0x8e; 16], 14, [0x8f; 32])
+        .expect("issue retry-connection remote principal");
+
+    let active_admission = principal
+        .try_enter_remote_self_revocation()
+        .expect("derive Active self-revoke admission");
+    let (active_sink, _active_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    assert!(matches!(
+        core.connect_remote_self_revocation_retry(
+            active_admission,
+            ConnectionSink::new(active_sink),
+        ),
+        Err(RuntimeFailure { ref code, .. })
+            if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
+    ));
+    assert_eq!(core.connections.len(), 0);
+
+    principal
+        .begin_revoke()
+        .await
+        .expect("publish shared Revoking state");
+    let retry = principal
+        .try_enter_remote_self_revocation()
+        .expect("derive Revoking retry capability");
+    let stale_retry = principal
+        .try_enter_remote_self_revocation()
+        .expect("derive second Revoking retry capability");
+    let (retry_sink, _retry_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    let retry_connection = core
+        .connect_remote_self_revocation_retry(retry, ConnectionSink::new(retry_sink))
+        .expect("attach purpose-scoped retry connection");
+    assert_eq!(core.connections.len(), 1);
+
+    finalize_remote_principal_revoke(&core.connections, &core.subscriptions, principal)
+        .await
+        .expect("finalize exact retry principal");
+    assert!(matches!(
+        core.connections.principal(retry_connection),
+        Err(ConnectionError::NotFound)
+    ));
+    let (stale_sink, _stale_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    assert!(matches!(
+        core.connect_remote_self_revocation_retry(stale_retry, ConnectionSink::new(stale_sink)),
+        Err(RuntimeFailure { ref code, .. }) if code == DAEMON_AUTHORIZATION_REVOKED
+    ));
+    assert_eq!(core.connections.len(), 0);
+    core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn revocation_self_device_backend_failure_only_allows_exact_self_revoke_retry() {
+    let root = TestRoot::new("revocation-self-device-backend-failure");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let (revocation, mut entered, outcomes) = GatedRevocationAdministration::new();
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xB5; 32])
+            .expect("construct RuntimeCore")
+            .with_revocation_administration(revocation),
+    );
+    core.recover().await.expect("recover");
+    let remote_principal = core
+        .principal_issuer
+        .issue_test_remote([0x91; 16], [0x92; 16], 11, [0x93; 32])
+        .expect("issue remote principal");
+    let (remote_sink, _remote_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    let remote = core
+        .connect(remote_principal.clone(), ConnectionSink::new(remote_sink))
+        .expect("connect remote principal");
+    let exact_target = (
+        DeviceHandle::new(format!("device-{}", "92".repeat(16))),
+        GrantSerial::new(11),
+    );
+
+    let first_revoke = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.handle(
+                remote,
+                RuntimeRequest::Revoke(RevokeRequest {
+                    target: RevokeTarget::SelfDevice,
+                }),
+            )
+            .await
+        })
+    };
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.recv())
+            .await
+            .expect("first self revoke backend entry deadline")
+            .expect("first self revoke backend entry"),
+        exact_target
+    );
+    outcomes
+        .send(Err("daemon.revocation.self_test_failure"))
+        .expect("release first self revoke with failure");
+    assert!(matches!(
+        first_revoke.await.expect("join first self revoke"),
+        RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+            if code == "daemon.revocation.self_test_failure"
+    ));
+    assert!(matches!(
+        remote_principal.try_enter(),
+        Err(PrincipalAccessError::Revoked)
+    ));
+    assert!(core.connections.principal(remote).is_ok());
+    assert!(matches!(
+        core.handle(
+            remote,
+            start_request("revocation-self-device-business-after-failure"),
+        )
+        .await,
+        RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+            if code == DAEMON_AUTHORIZATION_REVOKED
+    ));
+    assert!(matches!(
+        entered.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    let retry = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            let operation = core
+                .try_enter_operation()
+                .expect("admit exact self-revoke retry operation");
+            core.handle_admitted_with_replay(
+                &operation,
+                remote,
+                RuntimeRequest::Revoke(RevokeRequest {
+                    target: RevokeTarget::SelfDevice,
+                }),
+                RemoteIngressReplayClass::ExactDuplicate,
+            )
+            .await
+        })
+    };
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.recv())
+            .await
+            .expect("retry self revoke backend entry deadline")
+            .expect("retry self revoke backend entry"),
+        exact_target
+    );
+    outcomes
+        .send(Ok(()))
+        .expect("release retry self revoke with success");
+    assert!(matches!(
+        retry.await.expect("join retry self revoke"),
+        RuntimeReply::Revocation(RevocationReceipt::Committed {
+            grant_serial: observed,
+        }) if observed == GrantSerial::new(11)
+    ));
+    assert!(matches!(
+        core.connections.principal(remote),
+        Err(ConnectionError::NotFound)
+    ));
+    core.shutdown().await.expect("shutdown core");
+}
+
+#[tokio::test]
+async fn outer_cancellation_cannot_cancel_admitted_self_revocation() {
+    let root = TestRoot::new("revocation-self-device-outer-cancellation");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let (revocation, mut entered, outcomes) = GatedRevocationAdministration::new();
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xB6; 32])
+            .expect("construct RuntimeCore")
+            .with_revocation_administration(revocation),
+    );
+    core.recover().await.expect("recover");
+    let remote_principal = core
+        .principal_issuer
+        .issue_test_remote([0x94; 16], [0x95; 16], 12, [0x96; 32])
+        .expect("issue cancel-safe remote principal");
+    let held_guard = remote_principal
+        .try_enter()
+        .expect("hold one exact in-flight permission guard");
+    let (remote_sink, _remote_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    let remote = core
+        .connect(remote_principal.clone(), ConnectionSink::new(remote_sink))
+        .expect("connect cancel-safe remote principal");
+    let handling = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.handle(
+                remote,
+                RuntimeRequest::Revoke(RevokeRequest {
+                    target: RevokeTarget::SelfDevice,
+                }),
+            )
+            .await
+        })
+    };
+    wait_until_principal_revoking(&remote_principal).await;
+
+    handling.abort();
+    assert!(
+        handling
+            .await
+            .expect_err("outer Runtime caller is canceled")
+            .is_cancelled()
+    );
+    drop(held_guard);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.recv())
+            .await
+            .expect("daemon-owned self-revoke survives outer cancellation")
+            .expect("cancel-safe self-revoke reaches backend"),
+        (
+            DeviceHandle::new(format!("device-{}", "95".repeat(16))),
+            GrantSerial::new(12),
+        )
+    );
+    assert_eq!(
+        core.safety_tasks.task_count(),
+        1,
+        "Core must retain the admitted safety task after its caller is gone"
+    );
+    let mut shutdown = tokio::spawn({
+        let core = core.clone();
+        async move { core.shutdown().await }
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err(),
+        "Core shutdown must retain the admitted safety mutation until terminal cleanup"
+    );
+    outcomes
+        .send(Ok(()))
+        .expect("complete cancel-safe self-revoke");
+    shutdown
+        .await
+        .expect("join Core shutdown")
+        .expect("shutdown waits for cancel-safe self-revoke");
+    assert_eq!(core.safety_tasks.task_count(), 0);
+    assert!(matches!(
+        core.connections.principal(remote),
+        Err(ConnectionError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn dropping_core_aborts_unfinished_self_revocation_owner_task() {
+    let root = TestRoot::new("revocation-self-device-core-drop");
+    let store = root.open_store().await;
+    let router = Arc::new(AgentRouter::with_runtime_store(store.clone()));
+    let (revocation, mut entered, outcomes) = GatedRevocationAdministration::new();
+    let core = Arc::new(
+        RuntimeCore::new(store, router, [0xB7; 32])
+            .expect("construct RuntimeCore")
+            .with_revocation_administration(revocation),
+    );
+    core.recover().await.expect("recover");
+    let remote_principal = core
+        .principal_issuer
+        .issue_test_remote([0x97; 16], [0x98; 16], 13, [0x99; 32])
+        .expect("issue Core-drop remote principal");
+    let (remote_sink, _remote_writes) = mpsc::channel::<crate::runtime::ConnectionWrite>(2);
+    let remote = core
+        .connect(remote_principal, ConnectionSink::new(remote_sink))
+        .expect("connect Core-drop remote principal");
+    let handling = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.handle(
+                remote,
+                RuntimeRequest::Revoke(RevokeRequest {
+                    target: RevokeTarget::SelfDevice,
+                }),
+            )
+            .await
+        })
+    };
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.recv())
+            .await
+            .expect("Core-drop self-revoke backend entry deadline")
+            .expect("Core-drop self-revoke reaches backend"),
+        (
+            DeviceHandle::new(format!("device-{}", "98".repeat(16))),
+            GrantSerial::new(13),
+        )
+    );
+
+    handling.abort();
+    assert!(
+        handling
+            .await
+            .expect_err("outer Runtime caller is canceled before Core drop")
+            .is_cancelled()
+    );
+    drop(core);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !outcomes.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the last Core owner must abort and drop its unfinished safety task");
+}
+
+#[tokio::test]
+async fn safety_task_owner_capacity_and_poison_fail_before_spawn() {
+    let owner = RuntimeSafetyTaskOwner::new(1);
+    let (hold, held) = tokio::sync::oneshot::channel::<()>();
+    let first = owner
+        .spawn(async move {
+            let _ = held.await;
+        })
+        .expect("register first bounded safety task");
+    assert_eq!(owner.task_count(), 1);
+
+    let capacity_polled = Arc::new(AtomicBool::new(false));
+    let observed = capacity_polled.clone();
+    assert!(matches!(
+        owner.spawn(async move {
+            observed.store(true, Ordering::Release);
+        }),
+        Err(RuntimeSafetyTaskError::Capacity)
+    ));
+    tokio::task::yield_now().await;
+    assert!(
+        !capacity_polled.load(Ordering::Acquire),
+        "capacity rejection must happen before task spawn or first poll"
+    );
+
+    drop(owner);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), first)
+            .await
+            .expect("owner Drop abort deadline")
+            .is_err(),
+        "owner Drop must abort its registered unfinished task"
+    );
+    drop(hold);
+
+    let poisoned = RuntimeSafetyTaskOwner::new(1);
+    let poisoned_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _state = poisoned.state.lock().expect("lock fresh safety task owner");
+        panic!("poison safety task owner for fail-close coverage");
+    }));
+    assert!(poisoned_result.is_err());
+    let poison_polled = Arc::new(AtomicBool::new(false));
+    let observed = poison_polled.clone();
+    assert!(matches!(
+        poisoned.spawn(async move {
+            observed.store(true, Ordering::Release);
+        }),
+        Err(RuntimeSafetyTaskError::OwnerUnavailable)
+    ));
+    tokio::task::yield_now().await;
+    assert!(
+        !poison_polled.load(Ordering::Acquire),
+        "poison rejection must happen before task spawn or first poll"
+    );
 }
 
 #[test]
