@@ -44,6 +44,7 @@ use super::paired_machine::{
     AuthorizedRuntimeRequest, OpaqueRuntimeState, OpenedPairedMachine, PairedPromotionError,
     VerifiedDirectedReply, VerifiedRevocationTerminal,
 };
+use super::stream_state::DurableStreamBindingV1;
 
 const EXCHANGE_MAGIC: &[u8; 4] = b"ADRX";
 const LEGACY_EXCHANGE_VERSION: u16 = 1;
@@ -579,7 +580,7 @@ where
                         let (outcome, staged_reducer) =
                             progress.into_outcome_and_reducer(binding.clone());
                         *reducer = staged_reducer;
-                        self.send_stream_binding_controls(&binding).await?;
+                        self.send_stream_binding_controls(&installed).await?;
                         return Ok(outcome);
                     }
 
@@ -1003,14 +1004,16 @@ where
 
     async fn send_stream_binding_controls(
         &mut self,
-        binding: &StreamBindingV1,
+        durable: &DurableStreamBindingV1,
     ) -> Result<(), RemoteRuntimeError> {
+        let binding = durable.binding();
+        let outer_applied = durable.outer_applied();
         let subscribe = OpaqueRouteFrame {
             version: RELAY_PROTOCOL_VERSION,
             body: RelayFrameBody::Subscribe(RelaySubscribe {
                 stream_route: binding.stream_route,
                 generation: binding.stream_generation,
-                cursor: binding.stream_cursor,
+                cursor: outer_applied,
             }),
         };
         let subscribe = encode(&subscribe);
@@ -1019,7 +1022,9 @@ where
             .send(ExactRelayFrame::from_frozen(subscribe)?)
             .await?;
 
-        if let StreamCursor::At(up_to_seq) = binding.stream_cursor {
+        if durable.outer_acked() != outer_applied
+            && let StreamCursor::At(up_to_seq) = outer_applied
+        {
             let ack = OpaqueRouteFrame {
                 version: RELAY_PROTOCOL_VERSION,
                 body: RelayFrameBody::Ack(RelayAck {
@@ -1033,6 +1038,10 @@ where
             self.transport
                 .send(ExactRelayFrame::from_frozen(ack)?)
                 .await?;
+            let mut mutation_rng = SystemMutationRng::new()?;
+            let _ = self
+                .machine
+                .commit_stream_ack(durable, up_to_seq, &mut mutation_rng)?;
         }
         Ok(())
     }

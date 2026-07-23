@@ -56,7 +56,7 @@ impl DurableStreamBindingV1 {
     ) -> Result<Self, RemoteStreamStateError> {
         let value = Self {
             outer_applied: binding.stream_cursor,
-            outer_acked: binding.stream_cursor,
+            outer_acked: StreamCursor::BeforeFirst,
             inner_applied: binding.inner_cursor.clone(),
             binding,
             replay_tuple: None,
@@ -74,7 +74,7 @@ impl DurableStreamBindingV1 {
     ) -> Result<Self, RemoteStreamStateError> {
         let value = Self {
             outer_applied: binding.stream_cursor,
-            outer_acked: binding.stream_cursor,
+            outer_acked: StreamCursor::BeforeFirst,
             binding,
             inner_applied,
             replay_tuple: None,
@@ -106,6 +106,22 @@ impl DurableStreamBindingV1 {
     #[must_use]
     pub const fn replay_tuple(&self) -> Option<DurableStreamReplayTupleV1> {
         self.replay_tuple
+    }
+
+    /// 只把已经完整应用的 exact outer cut 标记为已发送 ACK。ACK 不允许跳过当前
+    /// `outer_applied`、回退或预先承诺尚未应用的 Relay sequence。
+    pub(crate) fn with_committed_outer_ack(
+        &self,
+        up_to_seq: u64,
+    ) -> Result<Self, RemoteStreamStateError> {
+        let acked = StreamCursor::At(up_to_seq);
+        if self.outer_applied != acked || cursor_cmp(self.outer_acked, acked) == Ordering::Greater {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+        let mut value = self.clone();
+        value.outer_acked = acked;
+        value.validate()?;
+        Ok(value)
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, RemoteStreamStateError> {
@@ -210,7 +226,9 @@ impl DurableStreamBindingV1 {
             .checked_next()
             .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
         if !same_target(&self.binding.inner_cursor, &self.inner_applied)
-            || cursor_cmp(self.binding.stream_cursor, self.outer_acked) == Ordering::Greater
+            || cursor_cmp(self.binding.stream_cursor, self.outer_applied) == Ordering::Greater
+            || (self.outer_acked != StreamCursor::BeforeFirst
+                && cursor_cmp(self.binding.stream_cursor, self.outer_acked) == Ordering::Greater)
             || cursor_cmp(self.outer_acked, self.outer_applied) == Ordering::Greater
             || cursor_cmp(
                 inner_cursor_value(&self.binding.inner_cursor),
@@ -564,13 +582,14 @@ mod tests {
 
     #[test]
     fn subscription_bootstrap_keeps_a_sync_inner_cut_ahead_of_the_publication_binding() {
-        let binding = binding(
+        let mut binding = binding(
             StreamRouteId::from_bytes([0x30; 16]),
             0x40,
             RuntimeInnerCursor::Catalog {
                 cursor: StreamCursor::BeforeFirst,
             },
         );
+        binding.stream_cursor = StreamCursor::At(7);
         let state = DurableStreamBindingV1::from_subscription_bootstrap(
             binding,
             RuntimeInnerCursor::Catalog {
@@ -583,6 +602,11 @@ mod tests {
             &RuntimeInnerCursor::Catalog {
                 cursor: StreamCursor::At(9),
             }
+        );
+        assert_eq!(
+            state.outer_acked(),
+            StreamCursor::BeforeFirst,
+            "durable bootstrap must not claim an ACK before the Relay control is sent",
         );
         let canonical = state
             .canonical_bytes()
@@ -630,6 +654,48 @@ mod tests {
         assert_eq!(
             skipped.canonical_bytes().unwrap_err(),
             RemoteStreamStateError::InvalidCanonical
+        );
+    }
+
+    #[test]
+    fn outer_ack_can_only_commit_the_exact_applied_cut() {
+        let mut binding = binding(
+            StreamRouteId::from_bytes([0x32; 16]),
+            0x42,
+            RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(5),
+            },
+        );
+        binding.stream_cursor = StreamCursor::At(7);
+        let pending = DurableStreamBindingV1::from_stream_binding(binding).unwrap();
+
+        assert_eq!(pending.outer_acked(), StreamCursor::BeforeFirst);
+        assert!(pending.with_committed_outer_ack(6).is_err());
+        assert!(pending.with_committed_outer_ack(8).is_err());
+        let acked = pending.with_committed_outer_ack(7).unwrap();
+        assert_eq!(acked.outer_acked(), StreamCursor::At(7));
+        assert_eq!(acked.with_committed_outer_ack(7).unwrap(), acked);
+
+        let replay = DurableStreamReplayTupleV1 {
+            stream_seq: 9,
+            sender_counter: 3,
+            signed_blob_sha256: [0x43; 32],
+        };
+        let lagging_ack = DurableStreamBindingV1 {
+            outer_applied: StreamCursor::At(9),
+            replay_tuple: Some(replay),
+            ..acked.clone()
+        };
+        lagging_ack
+            .canonical_bytes()
+            .expect("an ACK may lag the applied cut after the binding cursor");
+        let impossible_pre_binding_ack = DurableStreamBindingV1 {
+            outer_acked: StreamCursor::At(3),
+            ..lagging_ack
+        };
+        assert_eq!(
+            impossible_pre_binding_ack.canonical_bytes().unwrap_err(),
+            RemoteStreamStateError::InvalidCanonical,
         );
     }
 

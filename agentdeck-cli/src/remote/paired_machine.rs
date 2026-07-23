@@ -46,7 +46,7 @@ use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, Revoke
 use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TurnId};
 use agentdeck_protocol::runtime::{
     ConversationId, MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope,
-    RuntimeInnerCursor, RuntimeMessage, RuntimeRequest, SendPromptRequest,
+    RuntimeInnerCursor, RuntimeMessage, RuntimeRequest, SendPromptRequest, StreamCursor,
 };
 use agentdeck_relay_client::{
     LinkAuthenticator, RelayClientConfig, RelayClientError, RelayTlsPolicy,
@@ -1356,6 +1356,49 @@ impl OpenedPairedMachine<'_> {
             OpaqueRuntimeState::new(None, current.replay_windows().to_vec(), stream_bindings);
         self.replace_opaque_runtime_state(&replacement, rng)?;
         Ok(candidate)
+    }
+
+    /// 在对应 Relay ACK 的 transport write 成功后，精确推进同一 durable stream cut。
+    /// 只有调用方刚读取的完整 state 仍与磁盘一致时才允许写入，避免把旧 ACK 套到已替换
+    /// binding、reducer 或 replay state 上。重复提交同一 exact cut 保持幂等。
+    pub(crate) fn commit_stream_ack<R: CryptoRng>(
+        &mut self,
+        expected: &DurableStreamBindingV1,
+        up_to_seq: u64,
+        rng: &mut R,
+    ) -> Result<DurableStreamBindingV1, PairedPromotionError> {
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.validate_stream_binding_capability(expected.binding())?;
+        let mut states = self.audited.state.durable_stream_bindings()?;
+        let target = expected.target_key();
+        let current = states
+            .iter_mut()
+            .find(|state| state.target_key() == target)
+            .ok_or(PairedPromotionError::Conflict)?;
+        if current != expected
+            && (current.binding() != expected.binding()
+                || current.outer_applied() != expected.outer_applied()
+                || current.inner_applied() != expected.inner_applied()
+                || current.replay_tuple() != expected.replay_tuple()
+                || current.outer_acked() != StreamCursor::At(up_to_seq))
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let committed = current
+            .with_committed_outer_ack(up_to_seq)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        *current = committed.clone();
+        let stream_bindings =
+            encode_stream_bindings(states).map_err(|_| PairedPromotionError::InvalidState)?;
+        let current = self.audited.state.opaque_runtime_state();
+        let replacement = OpaqueRuntimeState::new(
+            current.exchange().map(ToOwned::to_owned),
+            current.replay_windows().to_vec(),
+            stream_bindings,
+        );
+        self.replace_opaque_runtime_state(&replacement, rng)?;
+        Ok(committed)
     }
 
     /// 仅供 automatic library harness 覆盖 stream-state 持久化与 crash recovery。

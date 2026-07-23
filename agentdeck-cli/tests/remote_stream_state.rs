@@ -221,7 +221,7 @@ fn conversation_binding_for(
 fn assert_initial_state(state: &DurableStreamBindingV1, binding: &StreamBindingV1) {
     assert_eq!(state.binding(), binding);
     assert_eq!(state.outer_applied(), binding.stream_cursor);
-    assert_eq!(state.outer_acked(), binding.stream_cursor);
+    assert_eq!(state.outer_acked(), StreamCursor::BeforeFirst);
     assert_eq!(state.inner_applied(), &binding.inner_cursor);
     assert_eq!(state.replay_tuple(), None);
     let canonical = state

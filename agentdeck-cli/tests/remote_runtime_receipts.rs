@@ -199,6 +199,7 @@ struct FakeTransport {
     sent_codec_frames: Arc<Mutex<Vec<Vec<u8>>>>,
     shutdown_observed: Option<Arc<AtomicBool>>,
     panic_on_first_subscription_control: bool,
+    fail_on_subscription_ack: bool,
 }
 
 impl FakeTransport {
@@ -287,6 +288,7 @@ impl FakeTransport {
                 sent_codec_frames: Arc::clone(&sent_codec_frames),
                 shutdown_observed: None,
                 panic_on_first_subscription_control: false,
+                fail_on_subscription_ack: false,
             },
             sent_codec_frames,
         )
@@ -348,6 +350,11 @@ impl FakeTransport {
 
     fn with_panic_on_first_subscription_control(mut self) -> Self {
         self.panic_on_first_subscription_control = true;
+        self
+    }
+
+    fn with_fail_on_subscription_ack(mut self) -> Self {
+        self.fail_on_subscription_ack = true;
         self
     }
 
@@ -517,6 +524,12 @@ impl RemoteRuntimeTransport for FakeTransport {
                 if self.panic_on_first_subscription_control {
                     self.panic_on_first_subscription_control = false;
                     panic!("injected process death after durable binding install");
+                }
+                if matches!(decoded.body, RelayFrameBody::Ack(_)) && self.fail_on_subscription_ack {
+                    self.fail_on_subscription_ack = false;
+                    return Err(RemoteRuntimeTransportError::Failed(
+                        "injected subscription ACK send failure".to_owned(),
+                    ));
                 }
             }
             body => panic!("remote runtime emitted an unexpected Relay frame: {body:?}"),
@@ -3763,6 +3776,27 @@ fn assert_durable_stream_binding(
     assert_eq!(installed.replay_tuple(), None);
 }
 
+fn assert_durable_stream_binding_unacked(
+    store: &dyn RemoteKeyStore,
+    root: &std::path::Path,
+    fixture: &PairingFixture,
+    expected: &StreamBindingV1,
+) {
+    let opened = PairedMachineStore::new(store, INSTALLATION_ID, root)
+        .open_exact(fixture.identity())
+        .expect("reopen paired machine after pre-ACK crash");
+    let bindings = opened
+        .durable_stream_bindings()
+        .expect("read durable stream bindings");
+    assert_eq!(bindings.len(), 1);
+    let installed = &bindings[0];
+    assert_eq!(installed.binding(), expected);
+    assert_eq!(installed.outer_applied(), expected.stream_cursor);
+    assert_eq!(installed.outer_acked(), StreamCursor::BeforeFirst);
+    assert_eq!(installed.inner_applied(), &expected.inner_cursor);
+    assert_eq!(installed.replay_tuple(), None);
+}
+
 fn assert_no_durable_stream_binding(
     store: &dyn RemoteKeyStore,
     root: &std::path::Path,
@@ -3881,7 +3915,7 @@ fn cold_restart_after_binding_commit_refetches_snapshot_before_resuming_controls
         crashed.is_err(),
         "fixture must stop at the first binding-derived Relay control"
     );
-    assert_durable_stream_binding(store.as_ref(), &root, &fixture, &expected_binding);
+    assert_durable_stream_binding_unacked(store.as_ref(), &root, &fixture, &expected_binding);
 
     let reopened = PairedMachineStore::new(store.as_ref(), INSTALLATION_ID, &root)
         .open_exact(fixture.identity())
@@ -3928,6 +3962,46 @@ fn cold_restart_after_binding_commit_refetches_snapshot_before_resuming_controls
         true,
         Some(CATALOG_OUTER_HIGH_WATER),
     );
+}
+
+#[tokio::test]
+async fn subscription_ack_send_failure_keeps_durable_cursor_unacked() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("subscription ACK failure state root");
+    let root = state_root(&temp);
+    let device_sign = fixture.promote(&store, &root, 0xe3);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open subscription ACK failure machine");
+    let (transport, sent) = FakeTransport::new_subscription(
+        SubscriptionScript::CatalogAt,
+        catalog_requested_cursor(),
+        device_sign,
+    );
+    let mut runtime = RemoteRuntime::new(opened, transport.with_fail_on_subscription_ack());
+    let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
+    let mut rng = DeterministicRng::new([0xe4; 32]);
+    let expected_binding = catalog_stream_binding(
+        StreamCursor::At(CATALOG_OUTER_HIGH_WATER),
+        StreamCursor::At(CATALOG_INNER_HIGH_WATER),
+    );
+
+    assert!(matches!(
+        runtime
+            .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+            .await,
+        Err(RemoteRuntimeError::Transport(RemoteRuntimeTransportError::Failed(message)))
+            if message == "injected subscription ACK send failure"
+    ));
+    assert_binding_controls(
+        &sent,
+        &expected_binding,
+        true,
+        Some(CATALOG_OUTER_HIGH_WATER),
+    );
+    drop(runtime);
+    assert_durable_stream_binding_unacked(&store, &root, &fixture, &expected_binding);
 }
 
 #[tokio::test]
