@@ -297,6 +297,27 @@ final class SessionViewControllerSmokeTests: XCTestCase {
         )
     }
 
+    func testTrailingResizeUsesEventGlobalPointerAndHasLocalFallback() {
+        XCTAssertEqual(
+            AgentDeckWindow.resizePointerX(
+                eventScreenX: 1_590,
+                locationInWindowX: 1_270,
+                windowMinX: 320
+            ),
+            1_590,
+            "真实事件必须优先使用不受窗口 frame 变化影响的 CGEvent 全局 X"
+        )
+        XCTAssertEqual(
+            AgentDeckWindow.resizePointerX(
+                eventScreenX: nil,
+                locationInWindowX: 1_270,
+                windowMinX: 320
+            ),
+            1_590,
+            "合成事件没有 CGEvent 时仍需保持同一全局坐标系"
+        )
+    }
+
     func testAgentDeckWindowConsumesTrailingResizeSequenceBeforeFrameHitTesting() throws {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         let vc = SessionViewController(model: model)
@@ -329,6 +350,28 @@ final class SessionViewControllerSmokeTests: XCTestCase {
             type: .leftMouseUp,
             locationInWindow: locationInWindow,
             pointerX: 880
+        ))
+
+        contentView.layoutSubtreeIfNeeded()
+        let grownLocation = contentView.convert(
+            NSPoint(x: contentView.bounds.maxX - 12, y: contentView.bounds.midY),
+            to: nil
+        )
+        XCTAssertTrue(window.handleTrailingResizeEvent(
+            type: .leftMouseDown,
+            locationInWindow: grownLocation,
+            pointerX: 880
+        ))
+        XCTAssertTrue(window.handleTrailingResizeEvent(
+            type: .leftMouseDragged,
+            locationInWindow: grownLocation,
+            pointerX: 1_180
+        ))
+        XCTAssertEqual(window.frame.width, widthBefore + 180, accuracy: 1)
+        XCTAssertTrue(window.handleTrailingResizeEvent(
+            type: .leftMouseUp,
+            locationInWindow: grownLocation,
+            pointerX: 1_180
         ))
 
         let outsideLocation = contentView.convert(

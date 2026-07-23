@@ -15,11 +15,26 @@ final class AgentDeckWindow: NSWindow {
         if handleTrailingResizeEvent(
             type: event.type,
             locationInWindow: event.locationInWindow,
-            pointerX: event.locationInWindow.x
+            pointerX: Self.resizePointerX(
+                eventScreenX: event.cgEvent?.location.x,
+                locationInWindowX: event.locationInWindow.x,
+                windowMinX: frame.minX
+            )
         ) {
             return
         }
         super.sendEvent(event)
+    }
+
+    /// resize 增量必须来自当前鼠标事件自身的全局坐标。窗口 frame 会在拖动
+    /// 中持续变化，不能把窗口相对坐标或可能冻结的 `NSEvent.mouseLocation`
+    /// 当作全局指针真值；无 CGEvent 的合成事件才回落到 frame + local X。
+    static func resizePointerX(
+        eventScreenX: CGFloat?,
+        locationInWindowX: CGFloat,
+        windowMinX: CGFloat
+    ) -> CGFloat {
+        eventScreenX ?? windowMinX + locationInWindowX
     }
 
     @discardableResult
