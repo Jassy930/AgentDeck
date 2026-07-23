@@ -17,10 +17,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
 use agentdeck_crypto::rand_core::SeedableRng;
+use agentdeck_protocol::runtime::identity::{ApprovalId, TurnId};
 use agentdeck_protocol::runtime::{
-    ArtifactSha256, IdempotencyKey, LocalOnlyAdministration, RuntimeReply, RuntimeRequest,
-    StageUpgradeReceipt, StageUpgradeRequest,
+    ArtifactSha256, CommandReceipt, ConversationId, IdempotencyKey, LocalOnlyAdministration,
+    PromptPayload, RuntimeReply, RuntimeRequest, SendPromptRequest, StageUpgradeReceipt,
+    StageUpgradeRequest,
 };
+use agentdeck_protocol::{ActionDecision, ActionDecisionKind};
 use rand_chacha::ChaCha20Rng;
 
 #[derive(Parser)]
@@ -691,6 +694,23 @@ async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
                 println!("{}", render(&output, pretty));
                 return Ok(());
             }
+            if let Some((operation, selector, mutation)) = persistent_remote_mutation_plan(op)? {
+                let composition =
+                    agentdeck_cli::remote::production::PersistentRemoteComposition::production()
+                        .map_err(persistent_remote_composition_cli_error)?;
+                let mut rng = production_remote_mutation_rng()?;
+                let outcome = agentdeck_cli::remote::mutations::execute_persistent_remote_mutation(
+                    &composition,
+                    selector,
+                    mutation,
+                    &mut rng,
+                )
+                .await
+                .map_err(persistent_remote_mutation_cli_error)?;
+                let output = persistent_remote_mutation_output(operation, outcome)?;
+                println!("{}", render(&output, pretty));
+                return Ok(());
+            }
             let plan = match op {
                 RemoteOp::Machine {
                     op: RemoteMachineOp::Enroll { bundle_file },
@@ -1017,6 +1037,208 @@ fn persistent_remote_machines_cli_error(
     }
 }
 
+fn persistent_remote_mutation_cli_error(
+    error: agentdeck_cli::remote::mutations::PersistentRemoteMutationError,
+) -> CliError {
+    use agentdeck_cli::remote::mutations::PersistentRemoteMutationError;
+    use agentdeck_cli::remote::relay_transport::PairedRuntimeConnectError;
+    use agentdeck_cli::remote::runtime::RemoteRuntimeError;
+
+    let code = Some(error.code().to_owned());
+    let message = error.to_string();
+    match error {
+        PersistentRemoteMutationError::Connect(PairedRuntimeConnectError::Relay(_))
+        | PersistentRemoteMutationError::Runtime(RemoteRuntimeError::Transport(_))
+        | PersistentRemoteMutationError::Runtime(RemoteRuntimeError::OutcomeUnknown) => {
+            CliError::Transport { code, message }
+        }
+        PersistentRemoteMutationError::Runtime(
+            RemoteRuntimeError::RelayCodec(_)
+            | RemoteRuntimeError::Json(_)
+            | RemoteRuntimeError::InvalidReply(_)
+            | RemoteRuntimeError::TransferUnsupported,
+        ) => CliError::Protocol { code, message },
+        PersistentRemoteMutationError::Paired(_)
+        | PersistentRemoteMutationError::Connect(PairedRuntimeConnectError::Paired(_))
+        | PersistentRemoteMutationError::HandshakeRevoked
+        | PersistentRemoteMutationError::Runtime(_) => CliError::Session { code, message },
+    }
+}
+
+fn persistent_remote_mutation_plan(
+    op: &RemoteOp,
+) -> Result<
+    Option<(
+        &'static str,
+        agentdeck_cli::remote::selector::PersistentMachineSelector,
+        agentdeck_cli::remote::mutations::PersistentRemoteMutation,
+    )>,
+    CliError,
+> {
+    use agentdeck_cli::remote::mutations::PersistentRemoteMutation;
+
+    let planned = match op {
+        RemoteOp::Prompt {
+            selector,
+            conversation_id,
+            text,
+            idempotency_key,
+            expected_configuration_revision,
+        } => {
+            validate_persistent_remote_runtime_id(
+                conversation_id,
+                "remote prompt --conversation-id",
+            )?;
+            validate_persistent_remote_opaque(idempotency_key, "remote prompt --idempotency-key")?;
+            if text.is_empty() {
+                return Err(CliError::Usage(
+                    "remote prompt --text must not be empty".to_owned(),
+                ));
+            }
+            let prompt = PromptPayload::new(text.clone())
+                .map_err(|error| CliError::Usage(error.to_string()))?;
+            (
+                "prompt",
+                selector.parse()?,
+                PersistentRemoteMutation::Prompt(SendPromptRequest {
+                    conversation_id: ConversationId::new(conversation_id.clone()),
+                    idempotency_key: IdempotencyKey::new(idempotency_key.clone()),
+                    expected_configuration_revision: *expected_configuration_revision,
+                    prompt,
+                }),
+            )
+        }
+        RemoteOp::Approve {
+            selector,
+            conversation_id,
+            turn_id,
+            approval_id,
+            decision,
+            request_id,
+            persist,
+        } => {
+            validate_persistent_remote_runtime_id(
+                conversation_id,
+                "remote approve --conversation-id",
+            )?;
+            validate_persistent_remote_runtime_id(turn_id, "remote approve --turn-id")?;
+            validate_persistent_remote_runtime_id(approval_id, "remote approve --approval-id")?;
+            validate_persistent_remote_opaque(request_id, "remote approve --request-id")?;
+            if *persist && *decision == RemoteApprovalDecisionArg::Deny {
+                return Err(CliError::Usage(
+                    "remote approve --persist is only valid with --decision approve".to_owned(),
+                ));
+            }
+            (
+                "approve",
+                selector.parse()?,
+                PersistentRemoteMutation::ResolveApproval {
+                    conversation_id: ConversationId::new(conversation_id.clone()),
+                    turn_id: TurnId::new(turn_id.clone()),
+                    approval_id: ApprovalId::new(approval_id.clone()),
+                    decision: ActionDecision {
+                        request_id: request_id.clone(),
+                        decision: match decision {
+                            RemoteApprovalDecisionArg::Approve => ActionDecisionKind::Approve,
+                            RemoteApprovalDecisionArg::Deny => ActionDecisionKind::Deny,
+                        },
+                        persist: *persist,
+                    },
+                },
+            )
+        }
+        RemoteOp::RetryApproval {
+            selector,
+            conversation_id,
+            approval_id,
+        } => {
+            validate_persistent_remote_runtime_id(
+                conversation_id,
+                "remote retry-approval --conversation-id",
+            )?;
+            validate_persistent_remote_runtime_id(
+                approval_id,
+                "remote retry-approval --approval-id",
+            )?;
+            (
+                "retryApproval",
+                selector.parse()?,
+                PersistentRemoteMutation::RetryApproval {
+                    conversation_id: ConversationId::new(conversation_id.clone()),
+                    approval_id: ApprovalId::new(approval_id.clone()),
+                },
+            )
+        }
+        RemoteOp::RevokeSelf { selector } => (
+            "revokeSelf",
+            selector.parse()?,
+            PersistentRemoteMutation::RevokeSelf,
+        ),
+        RemoteOp::Machine { .. }
+        | RemoteOp::Pairing { .. }
+        | RemoteOp::Revoke { .. }
+        | RemoteOp::TrustReset { .. }
+        | RemoteOp::Synthetic { .. }
+        | RemoteOp::Smoke
+        | RemoteOp::Pair { .. }
+        | RemoteOp::Machines
+        | RemoteOp::Conversations { .. }
+        | RemoteOp::Watch { .. } => return Ok(None),
+    };
+    Ok(Some(planned))
+}
+
+fn validate_persistent_remote_opaque(value: &str, label: &str) -> Result<(), CliError> {
+    if value.is_empty() || value.len() > 1_024 || value.as_bytes().contains(&0) {
+        return Err(CliError::Usage(format!(
+            "{label} must contain 1 to 1024 UTF-8 bytes and no NUL"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_persistent_remote_runtime_id(value: &str, label: &str) -> Result<(), CliError> {
+    let valid = uuid::Uuid::parse_str(value).is_ok_and(|parsed| {
+        parsed.as_bytes() != &[0; 16] && parsed.hyphenated().to_string() == value
+    });
+    if !valid {
+        return Err(CliError::Usage(format!(
+            "{label} must be a nonzero canonical lowercase hyphenated UUID"
+        )));
+    }
+    Ok(())
+}
+
+fn persistent_remote_mutation_output(
+    operation: &'static str,
+    outcome: agentdeck_cli::remote::mutations::PersistentRemoteMutationOutcome,
+) -> Result<serde_json::Value, CliError> {
+    use agentdeck_cli::remote::mutations::PersistentRemoteMutationOutcome;
+
+    let route_accepted = outcome.route_accepted();
+    let receipt = match outcome {
+        PersistentRemoteMutationOutcome::Prompt {
+            receipt: CommandReceipt::Failed { failure },
+            ..
+        } => {
+            return Err(CliError::Session {
+                code: Some(failure.code),
+                message: failure.message,
+            });
+        }
+        PersistentRemoteMutationOutcome::Prompt { receipt, .. } => serde_json::to_value(receipt)?,
+        PersistentRemoteMutationOutcome::Approval { receipt, .. } => serde_json::to_value(receipt)?,
+        PersistentRemoteMutationOutcome::Revocation { receipt, .. } => {
+            serde_json::to_value(receipt)?
+        }
+    };
+    Ok(serde_json::json!({
+        "operation": operation,
+        "transport": {"routeAccepted": route_accepted},
+        "receipt": receipt,
+    }))
+}
+
 async fn run_persistent_remote_pair(
     invite_file: Option<&std::path::Path>,
     invite_stdin: bool,
@@ -1114,6 +1336,22 @@ fn production_pairing_rng() -> Result<ChaCha20Rng, CliError> {
         return Err(pairing_entropy_cli_error());
     }
     Ok(ChaCha20Rng::from_seed(*seed))
+}
+
+fn production_remote_mutation_rng() -> Result<ChaCha20Rng, CliError> {
+    let mut seed = Zeroizing::new([0_u8; 32]);
+    getrandom::fill(seed.as_mut()).map_err(|_| remote_mutation_entropy_cli_error())?;
+    if seed.iter().all(|byte| *byte == 0) {
+        return Err(remote_mutation_entropy_cli_error());
+    }
+    Ok(ChaCha20Rng::from_seed(*seed))
+}
+
+fn remote_mutation_entropy_cli_error() -> CliError {
+    CliError::Session {
+        code: Some("remote.runtime.entropy_unavailable".to_owned()),
+        message: "production remote Runtime entropy is unavailable".to_owned(),
+    }
 }
 
 fn pairing_entropy_cli_error() -> CliError {
@@ -1233,14 +1471,16 @@ fn remote_pre_dispatch(op: &RemoteOp) -> Result<Option<remote_cli::RemoteOpArg>,
             bundle: bundle.clone(),
         }),
         RemoteOp::Smoke => Some(remote_cli::RemoteOpArg::LegacyV1),
-        RemoteOp::Conversations { selector }
-        | RemoteOp::Watch { selector, .. }
-        | RemoteOp::Prompt { selector, .. }
+        RemoteOp::Conversations { selector } | RemoteOp::Watch { selector, .. } => {
+            let _selector = selector.parse()?;
+            Some(remote_cli::RemoteOpArg::PersistentUnsupported)
+        }
+        RemoteOp::Prompt { selector, .. }
         | RemoteOp::Approve { selector, .. }
         | RemoteOp::RetryApproval { selector, .. }
         | RemoteOp::RevokeSelf { selector } => {
             let _selector = selector.parse()?;
-            Some(remote_cli::RemoteOpArg::PersistentUnsupported)
+            None
         }
     };
     Ok(arg)
@@ -1733,6 +1973,9 @@ mod persistent_remote_command_cli_tests {
 
     const ROOT: &str = "ERERERERERERERERERERERERERERERERERERERERERE=";
     const ROUTE: &str = "IiIiIiIiIiIiIiIiIiIiIg==";
+    const CONVERSATION_ID: &str = "11111111-1111-1111-1111-111111111111";
+    const TURN_ID: &str = "22222222-2222-2222-2222-222222222222";
+    const APPROVAL_ID: &str = "33333333-3333-3333-3333-333333333333";
 
     fn selector_tail() -> [&'static str; 4] {
         ["--machine-root-fingerprint", ROOT, "--machine-route", ROUTE]
@@ -1970,7 +2213,7 @@ mod persistent_remote_command_cli_tests {
     }
 
     #[test]
-    fn invalid_selector_is_rejected_without_echo_and_valid_commands_are_unsupported_only() {
+    fn invalid_selector_is_rejected_without_echo_and_only_stream_commands_stay_unsupported() {
         let cli = Cli::try_parse_from([
             "agentdeck",
             "remote",
@@ -2008,6 +2251,317 @@ mod persistent_remote_command_cli_tests {
             remote_pre_dispatch(&op).expect("valid selector"),
             Some(remote_cli::RemoteOpArg::PersistentUnsupported)
         ));
+
+        let prompt = Cli::try_parse_from(
+            [
+                "agentdeck",
+                "remote",
+                "prompt",
+                "--conversation-id",
+                "conversation-1",
+                "--text",
+                "continue safely",
+                "--idempotency-key",
+                "prompt-1",
+                "--expected-configuration-revision",
+                "7",
+            ]
+            .into_iter()
+            .chain(selector_tail()),
+        )
+        .expect("valid prompt command");
+        let Cmd::Remote { op } = prompt.command else {
+            panic!("expected remote prompt")
+        };
+        assert!(
+            remote_pre_dispatch(&op)
+                .expect("valid prompt selector")
+                .is_none(),
+            "mutation commands must enter the production mutation service"
+        );
+
+        let invalid_prompt = Cli::try_parse_from([
+            "agentdeck",
+            "remote",
+            "prompt",
+            "--conversation-id",
+            "conversation-1",
+            "--text",
+            "continue safely",
+            "--idempotency-key",
+            "prompt-1",
+            "--expected-configuration-revision",
+            "7",
+            "--machine-root-fingerprint",
+            ROOT,
+            "--machine-route",
+            "route-secret-sentinel",
+        ])
+        .expect("raw selector is parsed before redacting validation");
+        let Cmd::Remote { op } = invalid_prompt.command else {
+            panic!("expected remote prompt")
+        };
+        let error = match remote_pre_dispatch(&op) {
+            Ok(_) => panic!("invalid selector must pre-reject"),
+            Err(error) => error,
+        };
+        assert!(!error.message().contains("route-secret-sentinel"));
+    }
+
+    #[test]
+    fn mutation_plan_validates_fields_before_production_composition() {
+        let empty_prompt = Cli::try_parse_from(
+            [
+                "agentdeck",
+                "remote",
+                "prompt",
+                "--conversation-id",
+                CONVERSATION_ID,
+                "--text",
+                "",
+                "--idempotency-key",
+                "prompt-1",
+                "--expected-configuration-revision",
+                "7",
+            ]
+            .into_iter()
+            .chain(selector_tail()),
+        )
+        .expect("clap accepts a value for semantic validation");
+        let Cmd::Remote { op } = empty_prompt.command else {
+            panic!("expected remote prompt")
+        };
+        assert!(persistent_remote_mutation_plan(&op).is_err());
+
+        let valid = Cli::try_parse_from(
+            [
+                "agentdeck",
+                "remote",
+                "approve",
+                "--conversation-id",
+                CONVERSATION_ID,
+                "--turn-id",
+                TURN_ID,
+                "--approval-id",
+                APPROVAL_ID,
+                "--decision",
+                "approve",
+                "--request-id",
+                "request-1",
+                "--persist",
+            ]
+            .into_iter()
+            .chain(selector_tail()),
+        )
+        .expect("valid approval command");
+        let Cmd::Remote { op } = valid.command else {
+            panic!("expected remote approval")
+        };
+        let Some((operation, selector, mutation)) =
+            persistent_remote_mutation_plan(&op).expect("valid mutation plan")
+        else {
+            panic!("approval must produce a mutation plan")
+        };
+        assert_eq!(operation, "approve");
+        assert_eq!(
+            selector.identity(),
+            super::PersistentMachineSelectorArgs {
+                machine_root_fingerprint: ROOT.to_owned(),
+                machine_route: ROUTE.to_owned(),
+            }
+            .parse()
+            .expect("selector")
+            .identity()
+        );
+        assert!(matches!(
+            mutation,
+            agentdeck_cli::remote::mutations::PersistentRemoteMutation::ResolveApproval {
+                decision: ActionDecision {
+                    decision: ActionDecisionKind::Approve,
+                    persist: true,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mutation_plan_rejects_noncanonical_runtime_ids_and_persistent_deny() {
+        for invalid in [
+            "conversation-1",
+            "00000000-0000-0000-0000-000000000000",
+            "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+        ] {
+            let command = Cli::try_parse_from(
+                [
+                    "agentdeck",
+                    "remote",
+                    "prompt",
+                    "--conversation-id",
+                    invalid,
+                    "--text",
+                    "continue safely",
+                    "--idempotency-key",
+                    "prompt-1",
+                    "--expected-configuration-revision",
+                    "0",
+                ]
+                .into_iter()
+                .chain(selector_tail()),
+            )
+            .expect("clap leaves canonical Runtime ID validation to the plan");
+            let Cmd::Remote { op } = command.command else {
+                panic!("expected remote prompt")
+            };
+            let error = persistent_remote_mutation_plan(&op)
+                .expect_err("noncanonical Runtime ID must fail before production composition");
+            assert_eq!(error.exit_code(), 2);
+            assert!(!error.message().contains(invalid));
+        }
+
+        let persistent_deny = Cli::try_parse_from(
+            [
+                "agentdeck",
+                "remote",
+                "approve",
+                "--conversation-id",
+                CONVERSATION_ID,
+                "--turn-id",
+                TURN_ID,
+                "--approval-id",
+                APPROVAL_ID,
+                "--decision",
+                "deny",
+                "--request-id",
+                "request-1",
+                "--persist",
+            ]
+            .into_iter()
+            .chain(selector_tail()),
+        )
+        .expect("clap leaves decision invariants to the plan");
+        let Cmd::Remote { op } = persistent_deny.command else {
+            panic!("expected remote approval")
+        };
+        let error = persistent_remote_mutation_plan(&op)
+            .expect_err("persistent deny has no canonical adapter meaning");
+        assert_eq!(error.exit_code(), 2);
+
+        let revision_zero = Cli::try_parse_from(
+            [
+                "agentdeck",
+                "remote",
+                "prompt",
+                "--conversation-id",
+                CONVERSATION_ID,
+                "--text",
+                "continue safely",
+                "--idempotency-key",
+                "prompt-1",
+                "--expected-configuration-revision",
+                "0",
+            ]
+            .into_iter()
+            .chain(selector_tail()),
+        )
+        .expect("revision zero is a valid exact configuration revision");
+        let Cmd::Remote { op } = revision_zero.command else {
+            panic!("expected remote prompt")
+        };
+        assert!(
+            persistent_remote_mutation_plan(&op)
+                .expect("revision zero is not a sentinel")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn mutation_output_keeps_transport_acceptance_distinct_from_daemon_receipt() {
+        let output = persistent_remote_mutation_output(
+            "prompt",
+            agentdeck_cli::remote::mutations::PersistentRemoteMutationOutcome::Prompt {
+                route_accepted: false,
+                receipt: agentdeck_protocol::runtime::CommandReceipt::Accepted {
+                    command_id: agentdeck_protocol::runtime::identity::CommandId::new("command-1"),
+                    queue_position: 2,
+                    configuration_revision: 7,
+                },
+            },
+        )
+        .expect("serializable terminal receipt");
+        assert_eq!(output["operation"], "prompt");
+        assert_eq!(output["transport"]["routeAccepted"], false);
+        assert!(output.get("receipt").is_some());
+        assert!(output.get("routeAccepted").is_none());
+    }
+
+    #[test]
+    fn failed_command_receipt_is_a_typed_nonzero_cli_result() {
+        let error = persistent_remote_mutation_output(
+            "prompt",
+            agentdeck_cli::remote::mutations::PersistentRemoteMutationOutcome::Prompt {
+                route_accepted: true,
+                receipt: CommandReceipt::Failed {
+                    failure: agentdeck_protocol::runtime::RuntimeFailure::new(
+                        "daemon.command.queue_full",
+                        "runtime conversation queue is full",
+                    ),
+                },
+            },
+        )
+        .expect_err("authenticated command failure cannot be shell success");
+        assert_eq!(error.exit_code(), 5);
+        assert_eq!(
+            output::error_envelope(&error)["error"]["code"],
+            "daemon.command.queue_full"
+        );
+    }
+
+    #[test]
+    fn remote_reply_integrity_errors_use_the_protocol_exit_class() {
+        let error = persistent_remote_mutation_cli_error(
+            agentdeck_cli::remote::mutations::PersistentRemoteMutationError::Runtime(
+                agentdeck_cli::remote::runtime::RemoteRuntimeError::InvalidReply(
+                    "fixture reply mismatch",
+                ),
+            ),
+        );
+        assert_eq!(error.exit_code(), 3);
+        assert_eq!(
+            output::error_envelope(&error)["error"]["code"],
+            "remote.runtime.reply_invalid"
+        );
+    }
+
+    #[test]
+    fn production_composition_and_entropy_precede_the_mutation_service() {
+        let source = include_str!("main.rs");
+        let branch = source
+            .split("if let Some((operation, selector, mutation))")
+            .nth(1)
+            .and_then(|suffix| suffix.split("let plan = match op").next())
+            .expect("persistent mutation dispatch branch");
+        let composition = branch
+            .find("PersistentRemoteComposition::production()")
+            .expect("production composition");
+        let entropy = branch
+            .find("production_remote_mutation_rng()")
+            .expect("production entropy");
+        let service = branch
+            .find("execute_persistent_remote_mutation")
+            .expect("mutation service");
+        assert!(composition < entropy && entropy < service);
+        for forbidden in [
+            concat!("injected", "_for_test"),
+            concat!("Memory", "RemoteKeyStore"),
+            concat!("PairedMachineStore", "::new"),
+        ] {
+            assert!(
+                !branch.contains(forbidden),
+                "production CLI must not expose {forbidden}"
+            );
+        }
     }
 }
 

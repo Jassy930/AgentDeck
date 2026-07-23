@@ -10,6 +10,10 @@ pub mod machines;
 #[cfg(target_os = "macos")]
 mod macos_keychain;
 #[cfg(unix)]
+pub mod mutations;
+#[cfg(all(test, unix))]
+mod mutations_tests;
+#[cfg(unix)]
 pub mod pair;
 #[cfg(unix)]
 pub mod paired_machine;
