@@ -6,26 +6,35 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
 
+use core_foundation_sys::array::{
+    CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFArrayRef,
+};
 use core_foundation_sys::base::{CFGetTypeID, CFIndex, CFRelease, CFTypeRef, OSStatus};
 use core_foundation_sys::data::{
     CFDataCreate, CFDataGetBytePtr, CFDataGetLength, CFDataGetTypeID, CFDataRef,
 };
 use core_foundation_sys::dictionary::{
-    CFDictionaryCreate, CFDictionaryRef, kCFTypeDictionaryKeyCallBacks,
-    kCFTypeDictionaryValueCallBacks,
+    CFDictionaryCreate, CFDictionaryGetTypeID, CFDictionaryGetValue, CFDictionaryRef,
+    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
 };
-use core_foundation_sys::number::{kCFBooleanFalse, kCFBooleanTrue};
-use core_foundation_sys::string::{CFStringCreateWithBytes, CFStringRef, kCFStringEncodingUTF8};
+use core_foundation_sys::number::{
+    CFNumberCreate, kCFBooleanFalse, kCFBooleanTrue, kCFNumberCFIndexType,
+};
+use core_foundation_sys::string::{
+    CFStringCreateWithBytes, CFStringGetCString, CFStringGetTypeID, CFStringRef,
+    kCFStringEncodingUTF8,
+};
 
 use super::keychain::{
-    REMOTE_KEYCHAIN_SERVICE, RemoteKeyAccount, RemoteKeyPersistence, RemoteKeyStore,
-    RemoteKeyStoreError, RemoteSecret,
+    MAX_ENUMERATED_REMOTE_KEYCHAIN_ACCOUNT_ATTRIBUTES, MAX_REMOTE_KEY_ACCOUNT_BYTES,
+    ParsedPairedRemoteKeyAccount, REMOTE_KEYCHAIN_SERVICE, RemoteKeyAccount, RemoteKeyPersistence,
+    RemoteKeyStore, RemoteKeyStoreError, RemoteSecret, validate_enumerated_accounts,
 };
 use super::signature::VerifiedRemoteCliIdentity;
 
@@ -49,6 +58,7 @@ unsafe extern "C" {
     static kSecUseAuthenticationUISkip: CFStringRef;
     static kSecValueData: CFStringRef;
     static kSecReturnData: CFStringRef;
+    static kSecReturnAttributes: CFStringRef;
     static kSecMatchLimit: CFStringRef;
     static kSecMatchLimitOne: CFStringRef;
 
@@ -100,6 +110,7 @@ impl<'a> RemoteKeychainPolicy<'a> {
     ) -> &'static str {
         match operation {
             RemoteKeychainOperation::CopyMatching => "skip",
+            RemoteKeychainOperation::ListAccountAttributes => "skip",
             RemoteKeychainOperation::Add | RemoteKeychainOperation::Delete => "fail",
         }
     }
@@ -142,6 +153,7 @@ pub(crate) enum DeleteOutcome {
 pub(crate) enum RemoteKeychainOperation {
     Add,
     CopyMatching,
+    ListAccountAttributes,
     Delete,
 }
 
@@ -158,6 +170,13 @@ pub(crate) trait SecurityItemBackend: Send + Sync {
     fn load(&self, policy: &RemoteKeychainPolicy<'_>, account: &str)
     -> Result<Option<Vec<u8>>, ()>;
 
+    /// 只返回 generic-password item 的 account attribute；不得请求或返回 value data。
+    fn list_account_attributes(
+        &self,
+        policy: &RemoteKeychainPolicy<'_>,
+        limit: usize,
+    ) -> Result<Vec<String>, ()>;
+
     fn delete(&self, policy: &RemoteKeychainPolicy<'_>, account: &str)
     -> Result<DeleteOutcome, ()>;
 }
@@ -171,8 +190,13 @@ impl SecurityItemBackend for SystemSecurityItems {
         account: &str,
         value: &[u8],
     ) -> Result<AddOutcome, ()> {
-        let query =
-            SecurityItemQuery::new(policy, account, Some(value), RemoteKeychainOperation::Add)?;
+        let query = SecurityItemQuery::new(
+            policy,
+            Some(account),
+            Some(value),
+            RemoteKeychainOperation::Add,
+            None,
+        )?;
         // SAFETY: query owns a live immutable CFDictionary for the duration of the call;
         // a null result pointer requests no returned object.
         match unsafe { SecItemAdd(query.as_ref(), ptr::null_mut()) } {
@@ -187,8 +211,13 @@ impl SecurityItemBackend for SystemSecurityItems {
         policy: &RemoteKeychainPolicy<'_>,
         account: &str,
     ) -> Result<Option<Vec<u8>>, ()> {
-        let query =
-            SecurityItemQuery::new(policy, account, None, RemoteKeychainOperation::CopyMatching)?;
+        let query = SecurityItemQuery::new(
+            policy,
+            Some(account),
+            None,
+            RemoteKeychainOperation::CopyMatching,
+            None,
+        )?;
         let mut result: CFTypeRef = ptr::null();
         // SAFETY: query owns a live immutable CFDictionary and `result` is a valid out pointer.
         let status = unsafe { SecItemCopyMatching(query.as_ref(), &mut result) };
@@ -224,12 +253,79 @@ impl SecurityItemBackend for SystemSecurityItems {
         }
     }
 
+    fn list_account_attributes(
+        &self,
+        policy: &RemoteKeychainPolicy<'_>,
+        limit: usize,
+    ) -> Result<Vec<String>, ()> {
+        let query = SecurityItemQuery::new(
+            policy,
+            None,
+            None,
+            RemoteKeychainOperation::ListAccountAttributes,
+            Some(limit),
+        )?;
+        let mut result: CFTypeRef = ptr::null();
+        // SAFETY: query owns a live immutable CFDictionary and `result` is a valid out pointer.
+        let status = unsafe { SecItemCopyMatching(query.as_ref(), &mut result) };
+        match status {
+            ERR_SEC_ITEM_NOT_FOUND => Ok(Vec::new()),
+            ERR_SEC_SUCCESS => {
+                let result = OwnedCf::new(result).ok_or(())?;
+                // SAFETY: successful SecItemCopyMatching returned an owned CF object.
+                if unsafe { CFGetTypeID(result.as_ref()) } != unsafe { CFArrayGetTypeID() } {
+                    return Err(());
+                }
+                let array: CFArrayRef = result
+                    .as_ref()
+                    .cast::<core_foundation_sys::array::__CFArray>();
+                // SAFETY: the type-id check above proves `array` is CFArray and `result` retains it.
+                let count = unsafe { CFArrayGetCount(array) };
+                let count = usize::try_from(count).map_err(|_| ())?;
+                if count > limit {
+                    return Err(());
+                }
+                let mut accounts = Vec::with_capacity(count);
+                for index in 0..count {
+                    let index = CFIndex::try_from(index).map_err(|_| ())?;
+                    // SAFETY: `index < count` and the live array retains each returned value.
+                    let attributes = unsafe { CFArrayGetValueAtIndex(array, index) };
+                    if attributes.is_null()
+                        || unsafe { CFGetTypeID(attributes) } != unsafe { CFDictionaryGetTypeID() }
+                    {
+                        return Err(());
+                    }
+                    let attributes: CFDictionaryRef =
+                        attributes.cast::<core_foundation_sys::dictionary::__CFDictionary>();
+                    // SAFETY: attributes is a live CFDictionary and kSecAttrAccount is a
+                    // process-lifetime key. The returned value is retained by the dictionary.
+                    let account =
+                        unsafe { CFDictionaryGetValue(attributes, kSecAttrAccount.cast()) };
+                    if account.is_null()
+                        || unsafe { CFGetTypeID(account) } != unsafe { CFStringGetTypeID() }
+                    {
+                        return Err(());
+                    }
+                    accounts.push(copy_bounded_account_string(account.cast())?);
+                }
+                Ok(accounts)
+            }
+            _ => Err(()),
+        }
+    }
+
     fn delete(
         &self,
         policy: &RemoteKeychainPolicy<'_>,
         account: &str,
     ) -> Result<DeleteOutcome, ()> {
-        let query = SecurityItemQuery::new(policy, account, None, RemoteKeychainOperation::Delete)?;
+        let query = SecurityItemQuery::new(
+            policy,
+            Some(account),
+            None,
+            RemoteKeychainOperation::Delete,
+            None,
+        )?;
         // SAFETY: query owns a live immutable CFDictionary for the duration of the call.
         match unsafe { SecItemDelete(query.as_ref()) } {
             ERR_SEC_SUCCESS => Ok(DeleteOutcome::Deleted),
@@ -344,6 +440,43 @@ impl RemoteKeyStore for MacOsRemoteKeyStore {
         }
         Ok(())
     }
+
+    fn list_paired_commit_markers(
+        &self,
+        installation_id: uuid::Uuid,
+    ) -> Result<Vec<ParsedPairedRemoteKeyAccount>, RemoteKeyStoreError> {
+        let accounts = self
+            .backend
+            .list_account_attributes(
+                &self.policy(),
+                MAX_ENUMERATED_REMOTE_KEYCHAIN_ACCOUNT_ATTRIBUTES + 1,
+            )
+            .map_err(|()| Self::backend_error())?;
+        validate_enumerated_accounts(accounts, installation_id)
+    }
+}
+
+fn copy_bounded_account_string(value: CFStringRef) -> Result<String, ()> {
+    let mut buffer = [0_i8; MAX_REMOTE_KEY_ACCOUNT_BYTES + 1];
+    let buffer_size = CFIndex::try_from(buffer.len()).map_err(|_| ())?;
+    // SAFETY: `value` has been type-checked as a live CFString; `buffer` is writable for
+    // `buffer_size` bytes and CoreFoundation always NUL-terminates a successful conversion.
+    if unsafe {
+        CFStringGetCString(
+            value,
+            buffer.as_mut_ptr(),
+            buffer_size,
+            kCFStringEncodingUTF8,
+        )
+    } == 0
+    {
+        return Err(());
+    }
+    // SAFETY: successful CFStringGetCString wrote a NUL-terminated string within `buffer`.
+    let account = unsafe { CStr::from_ptr(buffer.as_ptr()) }
+        .to_str()
+        .map_err(|_| ())?;
+    Ok(account.to_owned())
 }
 
 struct OwnedCf(CFTypeRef);
@@ -374,10 +507,20 @@ struct SecurityItemQuery {
 impl SecurityItemQuery {
     fn new(
         policy: &RemoteKeychainPolicy<'_>,
-        account: &str,
+        account: Option<&str>,
         value: Option<&[u8]>,
         operation: RemoteKeychainOperation,
+        enumeration_limit: Option<usize>,
     ) -> Result<Self, ()> {
+        match operation {
+            RemoteKeychainOperation::ListAccountAttributes
+                if account.is_none() && value.is_none() && enumeration_limit.is_some() => {}
+            RemoteKeychainOperation::Add
+                if account.is_some() && value.is_some() && enumeration_limit.is_none() => {}
+            RemoteKeychainOperation::CopyMatching | RemoteKeychainOperation::Delete
+                if account.is_some() && value.is_none() && enumeration_limit.is_none() => {}
+            _ => return Err(()),
+        }
         let mut builder = QueryBuilder::default();
         // SAFETY: all kSec/kCF symbols are immutable process-lifetime CoreFoundation objects.
         unsafe {
@@ -393,7 +536,9 @@ impl SecurityItemQuery {
             };
             builder.borrowed(kSecClass, kSecClassGenericPassword);
             builder.owned_string(kSecAttrService, policy.service())?;
-            builder.owned_string(kSecAttrAccount, account)?;
+            if let Some(account) = account {
+                builder.owned_string(kSecAttrAccount, account)?;
+            }
             builder.owned_string(kSecAttrAccessGroup, policy.access_group())?;
             builder.borrowed(kSecUseDataProtectionKeychain, data_protection);
             builder.borrowed(kSecAttrSynchronizable, synchronizable);
@@ -403,6 +548,7 @@ impl SecurityItemQuery {
             );
             let authentication_ui = match operation {
                 RemoteKeychainOperation::CopyMatching => kSecUseAuthenticationUISkip,
+                RemoteKeychainOperation::ListAccountAttributes => kSecUseAuthenticationUISkip,
                 RemoteKeychainOperation::Add | RemoteKeychainOperation::Delete => {
                     kSecUseAuthenticationUIFail
                 }
@@ -414,6 +560,10 @@ impl SecurityItemQuery {
             if operation == RemoteKeychainOperation::CopyMatching {
                 builder.borrowed(kSecReturnData, kCFBooleanTrue.cast::<c_void>());
                 builder.borrowed(kSecMatchLimit, kSecMatchLimitOne);
+            }
+            if operation == RemoteKeychainOperation::ListAccountAttributes {
+                builder.borrowed(kSecReturnAttributes, kCFBooleanTrue.cast::<c_void>());
+                builder.owned_cf_index(kSecMatchLimit, enumeration_limit.ok_or(())?)?;
             }
         }
         builder.build()
@@ -473,6 +623,17 @@ impl QueryBuilder {
         let data: CFDataRef = unsafe { CFDataCreate(ptr::null(), bytes, length) };
         let owned = OwnedCf::new(data.cast()).ok_or(())?;
         // SAFETY: the created CFData remains retained by `owned_values` through dictionary use.
+        unsafe { self.owned(key, owned) };
+        Ok(())
+    }
+
+    unsafe fn owned_cf_index(&mut self, key: CFStringRef, value: usize) -> Result<(), ()> {
+        let value = CFIndex::try_from(value).map_err(|_| ())?;
+        // SAFETY: `value` remains live for the call and CoreFoundation copies it into CFNumber.
+        let number =
+            unsafe { CFNumberCreate(ptr::null(), kCFNumberCFIndexType, (&raw const value).cast()) };
+        let owned = OwnedCf::new(number.cast()).ok_or(())?;
+        // SAFETY: the created CFNumber remains retained by `owned_values` through dictionary use.
         unsafe { self.owned(key, owned) };
         Ok(())
     }

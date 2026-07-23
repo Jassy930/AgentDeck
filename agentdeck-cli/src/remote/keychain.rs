@@ -5,7 +5,7 @@
 //! [`MemoryRemoteKeyStore`] 只能由 library/test harness 显式注入，不提供 CLI、环境变量
 //! 或配置文件选择面。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Mutex;
 
@@ -19,6 +19,15 @@ use zeroize::Zeroize;
 
 /// CLI persistent remote item 的固定 Data Protection Keychain service。
 pub const REMOTE_KEYCHAIN_SERVICE: &str = "com.agentdeck.remote.v1";
+/// 单一 CLI installation 允许恢复的 paired machine marker 硬上界。
+pub const MAX_PAIRED_COMMIT_MARKERS_PER_INSTALLATION: usize = 256;
+/// 单次 Data Protection Keychain attributes 查询允许返回的总 item 硬上界。
+///
+/// 同一 CLI-only access group/service 可包含多个 installation、pending item 与每台机器的
+/// final item，因此本上界高于 paired machine marker 上界；production 查询只取 `limit + 1`
+/// 条用于 fail-close 判定，不会无界枚举。
+pub const MAX_ENUMERATED_REMOTE_KEYCHAIN_ACCOUNT_ATTRIBUTES: usize = 4_096;
+pub(crate) const MAX_REMOTE_KEY_ACCOUNT_BYTES: usize = 160;
 const ACCOUNT_LOG_DOMAIN: &[u8] = b"agentdeck.remote.key-account.log.v1\0";
 
 /// Keychain account 的封闭、带版本 purpose。
@@ -67,7 +76,7 @@ impl From<PendingRemoteKeyPurpose> for RemoteKeyPurpose {
 }
 
 /// Paired namespace 只允许 marker 与 machine-scoped final item。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PairedRemoteKeyPurpose {
     DeviceSignPrivateKey,
     DeviceHpkePrivateKey,
@@ -89,6 +98,71 @@ impl From<PairedRemoteKeyPurpose> for RemoteKeyPurpose {
         }
     }
 }
+
+impl PairedRemoteKeyPurpose {
+    fn from_account_component(component: &str) -> Option<Self> {
+        match component {
+            "device-sign-private-key.v1" => Some(Self::DeviceSignPrivateKey),
+            "device-hpke-private-key.v1" => Some(Self::DeviceHpkePrivateKey),
+            "device-grant.v1" => Some(Self::DeviceGrant),
+            "device-storage-kek.v1" => Some(Self::DeviceStorageKek),
+            "counter-guard.v1" => Some(Self::CounterGuard),
+            "paired-commit-marker.v1" => Some(Self::CommitMarker),
+            _ => None,
+        }
+    }
+}
+
+/// 严格解码后的 paired Keychain account；原始文本只有逐字 canonical 才能构造。
+#[derive(Clone, Eq, PartialEq)]
+pub struct ParsedPairedRemoteKeyAccount {
+    account: RemoteKeyAccount,
+    installation_id: Uuid,
+    machine_root_fingerprint: MachineRootFingerprint,
+    machine_route: MachineRouteId,
+    purpose: PairedRemoteKeyPurpose,
+}
+
+impl ParsedPairedRemoteKeyAccount {
+    #[must_use]
+    pub const fn account(&self) -> &RemoteKeyAccount {
+        &self.account
+    }
+
+    #[must_use]
+    pub const fn installation_id(&self) -> Uuid {
+        self.installation_id
+    }
+
+    #[must_use]
+    pub const fn machine_root_fingerprint(&self) -> MachineRootFingerprint {
+        self.machine_root_fingerprint
+    }
+
+    #[must_use]
+    pub const fn machine_route(&self) -> MachineRouteId {
+        self.machine_route
+    }
+
+    #[must_use]
+    pub const fn purpose(&self) -> PairedRemoteKeyPurpose {
+        self.purpose
+    }
+}
+
+impl fmt::Debug for ParsedPairedRemoteKeyAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParsedPairedRemoteKeyAccount")
+            .field("account", &self.account)
+            .field("purpose", &self.purpose)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("remote Keychain account is malformed or noncanonical")]
+pub struct RemoteKeyAccountParseError;
 
 /// 已 canonicalize 的 remote Keychain account。
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -127,6 +201,49 @@ impl RemoteKeyAccount {
             URL_SAFE_NO_PAD.encode(machine_route.as_bytes()),
             purpose.account_component(),
         ))
+    }
+
+    /// 严格解析 paired account，并用 typed 字段重编码后逐字比对 canonical 文本。
+    ///
+    /// 不接受 pending namespace、非小写 hyphenated UUID、带 padding/非 URL-safe Base64、
+    /// 未知 purpose、额外 component 或超长输入。
+    pub fn parse_paired(
+        canonical: &str,
+    ) -> Result<ParsedPairedRemoteKeyAccount, RemoteKeyAccountParseError> {
+        if canonical.len() > MAX_REMOTE_KEY_ACCOUNT_BYTES || !canonical.is_ascii() {
+            return Err(RemoteKeyAccountParseError);
+        }
+        let components = canonical.split('/').collect::<Vec<_>>();
+        let [client_kind, installation, root, route, purpose] = components.as_slice() else {
+            return Err(RemoteKeyAccountParseError);
+        };
+        if *client_kind != "cli" {
+            return Err(RemoteKeyAccountParseError);
+        }
+
+        let installation_id =
+            Uuid::parse_str(installation).map_err(|_| RemoteKeyAccountParseError)?;
+        let machine_root_fingerprint =
+            MachineRootFingerprint::from_bytes(decode_account_component(root)?);
+        let machine_route = MachineRouteId::from_bytes(decode_account_component(route)?);
+        let purpose = PairedRemoteKeyPurpose::from_account_component(purpose)
+            .ok_or(RemoteKeyAccountParseError)?;
+        let account = Self::paired(
+            installation_id,
+            machine_root_fingerprint,
+            machine_route,
+            purpose,
+        );
+        if account.as_str() != canonical {
+            return Err(RemoteKeyAccountParseError);
+        }
+        Ok(ParsedPairedRemoteKeyAccount {
+            account,
+            installation_id,
+            machine_root_fingerprint,
+            machine_route,
+            purpose,
+        })
     }
 
     #[must_use]
@@ -205,6 +322,12 @@ pub enum RemoteKeyStoreError {
     PersistenceReadbackFailed { account: RemoteKeyAccount },
     #[error("remote Keychain item {account} remained present after delete")]
     DeleteReadbackFailed { account: RemoteKeyAccount },
+    #[error("remote Keychain account enumeration contained a malformed or noncanonical item")]
+    MalformedEnumeratedAccount,
+    #[error("remote Keychain account enumeration contained a duplicate item")]
+    DuplicateEnumeratedAccount,
+    #[error("remote Keychain account enumeration exceeded its fixed limit")]
+    EnumerationLimitExceeded,
     #[error("remote keystore backend is unavailable")]
     BackendUnavailable,
     #[error("remote keystore lock is poisoned")]
@@ -219,6 +342,10 @@ impl RemoteKeyStoreError {
             Self::PersistenceReadbackFailed { .. } | Self::DeleteReadbackFailed { .. } => {
                 "remote.keystore.persistence_failed"
             }
+            Self::MalformedEnumeratedAccount | Self::DuplicateEnumeratedAccount => {
+                "remote.keystore.enumeration_integrity_failed"
+            }
+            Self::EnumerationLimitExceeded => "remote.keystore.enumeration_limit_exceeded",
             Self::BackendUnavailable | Self::Poisoned => "remote.keystore.unavailable",
         }
     }
@@ -238,6 +365,17 @@ pub trait RemoteKeyStore: Send + Sync {
 
     /// 删除后必须读回 absent；重复删除幂等。
     fn delete_exact(&self, account: &RemoteKeyAccount) -> Result<(), RemoteKeyStoreError>;
+
+    /// 只返回当前 installation 的 canonical paired commit-marker attributes。
+    ///
+    /// 默认实现让既有 injected fault stores 保持显式 unavailable；production 与标准 memory
+    /// backend 必须覆盖此方法，且不得通过枚举接口读取 private value。
+    fn list_paired_commit_markers(
+        &self,
+        _installation_id: Uuid,
+    ) -> Result<Vec<ParsedPairedRemoteKeyAccount>, RemoteKeyStoreError> {
+        Err(RemoteKeyStoreError::BackendUnavailable)
+    }
 }
 
 /// 仅供 injected automatic/library harness 使用的进程内 remote keystore。
@@ -318,4 +456,94 @@ impl RemoteKeyStore for MemoryRemoteKeyStore {
         }
         Ok(())
     }
+
+    fn list_paired_commit_markers(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<Vec<ParsedPairedRemoteKeyAccount>, RemoteKeyStoreError> {
+        let accounts = self
+            .values
+            .lock()
+            .map_err(|_| RemoteKeyStoreError::Poisoned)?
+            .keys()
+            .map(|account| account.as_str().to_owned())
+            .collect();
+        validate_enumerated_accounts(accounts, installation_id)
+    }
+}
+
+fn decode_account_component<const N: usize>(
+    canonical: &str,
+) -> Result<[u8; N], RemoteKeyAccountParseError> {
+    let expected_length = (N * 4).div_ceil(3);
+    if canonical.len() != expected_length {
+        return Err(RemoteKeyAccountParseError);
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(canonical)
+        .map_err(|_| RemoteKeyAccountParseError)?;
+    let bytes: [u8; N] = decoded.try_into().map_err(|_| RemoteKeyAccountParseError)?;
+    if URL_SAFE_NO_PAD.encode(bytes) != canonical {
+        return Err(RemoteKeyAccountParseError);
+    }
+    Ok(bytes)
+}
+
+fn validate_pending_account(canonical: &str) -> Result<(), RemoteKeyAccountParseError> {
+    if canonical.len() > MAX_REMOTE_KEY_ACCOUNT_BYTES || !canonical.is_ascii() {
+        return Err(RemoteKeyAccountParseError);
+    }
+    let components = canonical.split('/').collect::<Vec<_>>();
+    let [namespace, client_kind, installation, invite_hash, purpose] = components.as_slice() else {
+        return Err(RemoteKeyAccountParseError);
+    };
+    if *namespace != "pending" || *client_kind != "cli" {
+        return Err(RemoteKeyAccountParseError);
+    }
+    let installation_id = Uuid::parse_str(installation).map_err(|_| RemoteKeyAccountParseError)?;
+    let invite_hash = decode_account_component(invite_hash)?;
+    let purpose = match *purpose {
+        "pending-pairing-record.v1" => PendingRemoteKeyPurpose::PairingRecord,
+        "device-sign-private-key.v1" => PendingRemoteKeyPurpose::DeviceSignPrivateKey,
+        "device-hpke-private-key.v1" => PendingRemoteKeyPurpose::DeviceHpkePrivateKey,
+        _ => return Err(RemoteKeyAccountParseError),
+    };
+    if RemoteKeyAccount::pending(installation_id, invite_hash, purpose).as_str() != canonical {
+        return Err(RemoteKeyAccountParseError);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_enumerated_accounts(
+    accounts: Vec<String>,
+    installation_id: Uuid,
+) -> Result<Vec<ParsedPairedRemoteKeyAccount>, RemoteKeyStoreError> {
+    if accounts.len() > MAX_ENUMERATED_REMOTE_KEYCHAIN_ACCOUNT_ATTRIBUTES {
+        return Err(RemoteKeyStoreError::EnumerationLimitExceeded);
+    }
+
+    let mut seen = HashSet::with_capacity(accounts.len());
+    let mut markers = Vec::new();
+    for canonical in accounts {
+        if !seen.insert(canonical.clone()) {
+            return Err(RemoteKeyStoreError::DuplicateEnumeratedAccount);
+        }
+        if canonical.starts_with("pending/") {
+            validate_pending_account(&canonical)
+                .map_err(|_| RemoteKeyStoreError::MalformedEnumeratedAccount)?;
+            continue;
+        }
+        let parsed = RemoteKeyAccount::parse_paired(&canonical)
+            .map_err(|_| RemoteKeyStoreError::MalformedEnumeratedAccount)?;
+        if parsed.installation_id() == installation_id
+            && parsed.purpose() == PairedRemoteKeyPurpose::CommitMarker
+        {
+            markers.push(parsed);
+            if markers.len() > MAX_PAIRED_COMMIT_MARKERS_PER_INSTALLATION {
+                return Err(RemoteKeyStoreError::EnumerationLimitExceeded);
+            }
+        }
+    }
+    markers.sort_unstable_by(|left, right| left.account().as_str().cmp(right.account().as_str()));
+    Ok(markers)
 }

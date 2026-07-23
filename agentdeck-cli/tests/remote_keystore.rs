@@ -1,9 +1,9 @@
 use std::sync::{Arc, Barrier};
 
 use agentdeck_cli::remote::keychain::{
-    MemoryRemoteKeyStore, PairedRemoteKeyPurpose, PendingRemoteKeyPurpose, REMOTE_KEYCHAIN_SERVICE,
-    RemoteKeyAccount, RemoteKeyPersistence, RemoteKeyPurpose, RemoteKeyStore, RemoteKeyStoreError,
-    RemoteSecret,
+    MAX_PAIRED_COMMIT_MARKERS_PER_INSTALLATION, MemoryRemoteKeyStore, PairedRemoteKeyPurpose,
+    PendingRemoteKeyPurpose, REMOTE_KEYCHAIN_SERVICE, RemoteKeyAccount, RemoteKeyPersistence,
+    RemoteKeyPurpose, RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
 };
 use agentdeck_protocol::relay_v2::MachineRouteId;
 use agentdeck_protocol::runtime::MachineRootFingerprint;
@@ -45,6 +45,140 @@ fn keychain_service_and_accounts_are_canonical_and_client_scoped() {
     );
     assert!(!pending.as_str().contains('='));
     assert!(!paired.as_str().contains('='));
+}
+
+#[test]
+fn paired_account_parser_is_strict_and_roundtrips_canonical_fields() {
+    let installation = Uuid::from_u128(0xabcdef01_2345_6789_abcd_ef0123456789);
+    let root = MachineRootFingerprint::from_bytes([0xfb; 32]);
+    let route = MachineRouteId::from_bytes([0xff; 16]);
+    let account = RemoteKeyAccount::paired(
+        installation,
+        root,
+        route,
+        PairedRemoteKeyPurpose::CommitMarker,
+    );
+
+    let parsed = RemoteKeyAccount::parse_paired(account.as_str()).expect("parse canonical account");
+    assert_eq!(parsed.installation_id(), installation);
+    assert_eq!(parsed.machine_root_fingerprint(), root);
+    assert_eq!(parsed.machine_route(), route);
+    assert_eq!(parsed.purpose(), PairedRemoteKeyPurpose::CommitMarker);
+    assert_eq!(parsed.account(), &account);
+
+    let canonical = account.as_str();
+    let uppercase_installation = canonical.replacen(
+        &installation.hyphenated().to_string(),
+        &installation.hyphenated().to_string().to_uppercase(),
+        1,
+    );
+    let padded_root = canonical.replacen(
+        URL_SAFE_NO_PAD_FOR_FF_32,
+        &format!("{URL_SAFE_NO_PAD_FOR_FF_32}="),
+        1,
+    );
+    let standard_base64_route = canonical.replacen('_', "/", 1);
+    for invalid in [
+        uppercase_installation,
+        padded_root,
+        standard_base64_route,
+        canonical.replace("paired-commit-marker.v1", "unknown.v1"),
+        format!("{canonical}/trailing"),
+        canonical.replacen("cli/", "macos-app/", 1),
+        pending_account(PendingRemoteKeyPurpose::PairingRecord)
+            .as_str()
+            .to_owned(),
+    ] {
+        assert!(
+            RemoteKeyAccount::parse_paired(&invalid).is_err(),
+            "noncanonical/malformed paired account must fail closed"
+        );
+    }
+}
+
+const URL_SAFE_NO_PAD_FOR_FF_32: &str = "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s";
+
+#[test]
+fn memory_store_enumerates_only_current_installation_commit_markers_in_canonical_order() {
+    let store = MemoryRemoteKeyStore::new();
+    let installation = Uuid::from_u128(0x11111111_2222_3333_4444_555555555555);
+    let other_installation = Uuid::from_u128(0xaaaaaaaa_bbbb_cccc_dddd_eeeeeeeeeeee);
+    let root = MachineRootFingerprint::from_bytes([0x31; 32]);
+    let marker_a = RemoteKeyAccount::paired(
+        installation,
+        root,
+        MachineRouteId::from_bytes([0x22; 16]),
+        PairedRemoteKeyPurpose::CommitMarker,
+    );
+    let marker_b = RemoteKeyAccount::paired(
+        installation,
+        root,
+        MachineRouteId::from_bytes([0x11; 16]),
+        PairedRemoteKeyPurpose::CommitMarker,
+    );
+    let non_marker = RemoteKeyAccount::paired(
+        installation,
+        root,
+        MachineRouteId::from_bytes([0x11; 16]),
+        PairedRemoteKeyPurpose::DeviceGrant,
+    );
+    let other_marker = RemoteKeyAccount::paired(
+        other_installation,
+        root,
+        MachineRouteId::from_bytes([0x33; 16]),
+        PairedRemoteKeyPurpose::CommitMarker,
+    );
+    let pending = RemoteKeyAccount::pending(
+        installation,
+        [0x44; 32],
+        PendingRemoteKeyPurpose::PairingRecord,
+    );
+    for account in [&marker_a, &marker_b, &non_marker, &other_marker, &pending] {
+        store
+            .persist_immutable(account, &RemoteSecret::new(vec![0x81]))
+            .expect("seed canonical account");
+    }
+
+    let listed = store
+        .list_paired_commit_markers(installation)
+        .expect("enumerate current installation markers");
+    let listed_accounts = listed
+        .iter()
+        .map(|parsed| parsed.account().as_str())
+        .collect::<Vec<_>>();
+    let mut expected = vec![marker_a.as_str(), marker_b.as_str()];
+    expected.sort_unstable();
+    assert_eq!(listed_accounts, expected);
+    assert!(listed.iter().all(|parsed| {
+        parsed.installation_id() == installation
+            && parsed.purpose() == PairedRemoteKeyPurpose::CommitMarker
+    }));
+}
+
+#[test]
+fn memory_store_rejects_more_than_the_bounded_marker_inventory() {
+    let store = MemoryRemoteKeyStore::new();
+    let installation = Uuid::from_u128(0x99999999_8888_7777_6666_555555555555);
+    let root = MachineRootFingerprint::from_bytes([0x91; 32]);
+
+    for index in 0..=MAX_PAIRED_COMMIT_MARKERS_PER_INSTALLATION {
+        let mut route = [0_u8; 16];
+        route[8..].copy_from_slice(&(index as u64).to_be_bytes());
+        let marker = RemoteKeyAccount::paired(
+            installation,
+            root,
+            MachineRouteId::from_bytes(route),
+            PairedRemoteKeyPurpose::CommitMarker,
+        );
+        store
+            .persist_immutable(&marker, &RemoteSecret::new(vec![0x92]))
+            .expect("seed bounded marker inventory");
+    }
+
+    assert_eq!(
+        store.list_paired_commit_markers(installation),
+        Err(RemoteKeyStoreError::EnumerationLimitExceeded)
+    );
 }
 
 #[test]
