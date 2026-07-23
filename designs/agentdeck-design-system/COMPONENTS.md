@@ -50,6 +50,7 @@
 
 ### Composer · `.composer`
 - 结构：输入区 + 工具栏（+ / 权限 tag / effort / mic / 发送）。形态由 `--k-composer-*`（card/cli/editorial）。
+- **Token**：默认使用 `--surface-2` 形成悬浮输入层；Terminal 可通过 `--k-composer-bg` 切换为内凹表面。
 - **约束**：会话页不显式标注"监控中"——未发送即监控态由上下文体现；focus-within 高亮。
 ### Approval card · `.approval`
 - 槽：head(图标+标题+来源) / body(命令或 diff) / foot(权限 tag + 拒绝 + 批准)。**可内联进会话流**就地选择。

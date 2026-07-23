@@ -44,10 +44,20 @@ final class ComposerInteractionTests: XCTestCase {
         let c = makeComposer()
         let buttons = c.bar.allDescendants(ofType: NSButton.self)
         let send = try XCTUnwrap(c.bar.button(id: "composer-send"))
+        let chrome = try XCTUnwrap(c.bar.descendant(id: "codex-composer"))
+        let placeholder = try XCTUnwrap(
+            c.bar.allDescendants(ofType: NSTextField.self)
+                .first { $0.stringValue == "继续对话，或 @ 引用文件…" }
+        )
 
         XCTAssertEqual(buttons, [send], "未接通的附件和语音入口不应伪装成可点击按钮")
         XCTAssertGreaterThanOrEqual(send.frame.width, 44)
         XCTAssertGreaterThanOrEqual(send.frame.height, 44)
+        XCTAssertEqual(c.tv.font?.pointSize, DesignTokens.typeBody)
+        XCTAssertEqual(placeholder.font?.pointSize, DesignTokens.typeBody)
+        XCTAssertEqual(chrome.layer?.backgroundColor, DesignTokens.surface2.cgColor)
+        XCTAssertGreaterThanOrEqual(c.bar.fittingSize.height, 96)
+        XCTAssertLessThanOrEqual(c.bar.fittingSize.height, 104)
     }
 
     func testNarrowComposerKeepsSendAvailableWhenBadgesNeedMoreSpace() throws {

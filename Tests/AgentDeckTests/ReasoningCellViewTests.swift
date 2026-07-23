@@ -194,7 +194,9 @@ final class ReasoningCellViewTests: XCTestCase {
 
         XCTAssertEqual(
             ConversationRowFactory.height(for: row, width: 620),
-            DesignTokens.sp1 * 2 + headerHeight,
+            DesignTokens.sp1 * 2
+                + headerHeight
+                + ConversationRowMetrics.turnEndSpacing,
             accuracy: 0.001
         )
     }

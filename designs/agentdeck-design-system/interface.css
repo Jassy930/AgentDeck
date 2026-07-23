@@ -52,7 +52,7 @@
   --k-title-font: var(--font-display);
 
   /* ---- Composer 形态 ---- */
-  --k-composer-bg: var(--surface);
+  --k-composer-bg: var(--surface-2);
   --k-composer-prefix: "";  /* 输入前提示符，如 "> " */
   --k-composer-caret: "";   /* 行尾块光标，如 "▊"（Terminal）*/
   --k-composer-slash: "";   /* 占位符后的 slash 提示（Linear）*/

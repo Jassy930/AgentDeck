@@ -893,6 +893,7 @@ extension ConversationViewController: NSTableViewDelegate {
             // Hand the cell the persisted disclosure store BEFORE configuring so
             // collapsible cells (shell / fileEdit) restore their expansion (C1).
             conversationCell.disclosureStore = self
+            conversationCell.applyTurnSpacing(for: displayRow)
             conversationCell.configure(row: displayRow, width: columnWidth, model: model)
         }
         return cell
@@ -970,6 +971,11 @@ extension ConversationViewController: ConversationDisclosureStateStore {
             var heightIndexes = IndexSet(integer: groupIndex)
             if expanded { heightIndexes.formUnion(memberIndexes) }
             tableView.noteHeightOfRows(withIndexesChanged: heightIndexes)
+            // AppKit can retain pre-insertion row origins even after updating
+            // the new heights (the row frames grow, while following rows keep
+            // their stale y). Reload after the structural delta so every row
+            // origin is rebuilt from the same height cache.
+            tableView.reloadData()
             tableView.needsLayout = true
             tableView.layoutSubtreeIfNeeded()
             tableView.needsDisplay = true

@@ -219,7 +219,7 @@ svg[class^="lucide"], .lucide { stroke-width: 1.8; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* Composer 输入栏 */
-.composer { background: var(--surface); background-image: var(--surface-grad); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-panel); overflow: hidden; }
+.composer { background: var(--surface-2); background-image: var(--surface-grad); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-panel); overflow: hidden; }
 .composer__input { padding: 14px 16px 6px; font-size: 14px; color: var(--text); min-height: 30px; }
 .composer__input .ph { color: var(--text-3); }
 .composer__bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px 12px; }

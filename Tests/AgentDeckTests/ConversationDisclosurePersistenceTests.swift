@@ -148,9 +148,10 @@ final class ConversationDisclosurePersistenceTests: XCTestCase {
             DesignTokens.sp1 * 2
                 + headerHeight
                 + DesignTokens.sp1
-                + ceil(DesignTokens.typeCallout * DesignTokens.lineHeightCJK),
+                + ceil(DesignTokens.typeCallout * DesignTokens.lineHeightCJK)
+                + ConversationRowMetrics.turnEndSpacing,
             accuracy: 0.5,
-            "碰撞用例必须返回替换后单行 CJK 正文的真实高度"
+            "碰撞用例必须返回单行 CJK 正文与回合尾距的真实高度"
         )
     }
 
@@ -170,14 +171,17 @@ final class ConversationDisclosurePersistenceTests: XCTestCase {
             ConversationRowMetrics.lineHeight(ConversationRowMetrics.monoCaptionFont),
             16
         )
-        let expected = DesignTokens.sp1 * 2 + headerHeight + DesignTokens.sp1
+        let expected = DesignTokens.sp1 * 2
+            + headerHeight
+            + DesignTokens.sp1
+            + ConversationRowMetrics.turnEndSpacing
         let actual = table.delegate?.tableView?(table, heightOfRow: 1) ?? 0
 
         XCTAssertEqual(
             actual,
             expected,
             accuracy: 0.5,
-            "空 reasoning 不应虚构一行正文，但必须保留 header 到 body 的 4pt 节奏"
+            "空 reasoning 不应虚构正文，但必须保留 4pt 栈节奏与回合尾距"
         )
     }
 

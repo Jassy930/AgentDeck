@@ -138,6 +138,88 @@ final class ConversationRowFactoryTests: XCTestCase {
         XCTAssertTrue(cell is UserPromptCellView)
     }
 
+    func testUserPromptGeometryMatchesDesignSystem() throws {
+        let width: CGFloat = 620
+        XCTAssertEqual(
+            UserPromptCellView.maximumBubbleWidth(forRowWidth: width),
+            width * 0.82,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            UserPromptCellView.bodyWidth(forRowWidth: width),
+            width * 0.82 - 28,
+            accuracy: 0.001
+        )
+
+        let row = ConversationDisplayRowTestSupport.userPromptRow(
+            text: String(repeating: "较长的用户问题 ", count: 30)
+        )
+        let cell = UserPromptCellView()
+        cell.applyTurnSpacing(for: row)
+        cell.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: width,
+            height: ConversationRowFactory.height(for: row, width: width)
+        )
+        cell.configure(
+            row: row,
+            width: width,
+            model: SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        )
+        cell.layoutSubtreeIfNeeded()
+
+        let bubble = try XCTUnwrap(cell.contentStack.arrangedSubviews.first)
+        XCTAssertLessThanOrEqual(bubble.frame.width, width * 0.82 + 0.5)
+        XCTAssertEqual(bubble.layer?.cornerRadius, DesignTokens.radiusMd)
+        XCTAssertEqual(bubble.layer?.borderWidth, 1)
+        XCTAssertEqual(bubble.layer?.backgroundColor, DesignTokens.surface2.cgColor)
+        XCTAssertEqual(bubble.layer?.borderColor, DesignTokens.border.cgColor)
+        XCTAssertFalse(cell.hasAmbiguousLayout)
+        XCTAssertFalse(bubble.hasAmbiguousLayout)
+
+        let shortRow = ConversationDisplayRowTestSupport.userPromptRow(text: "短消息")
+        let shortCell = UserPromptCellView()
+        shortCell.applyTurnSpacing(for: shortRow)
+        shortCell.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: width,
+            height: ConversationRowFactory.height(for: shortRow, width: width)
+        )
+        shortCell.configure(
+            row: shortRow,
+            width: width,
+            model: SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        )
+        shortCell.layoutSubtreeIfNeeded()
+        let shortBubble = try XCTUnwrap(shortCell.contentStack.arrangedSubviews.first)
+        XCTAssertLessThan(shortBubble.frame.width, width * 0.5)
+        XCTAssertFalse(shortCell.hasAmbiguousLayout)
+        XCTAssertFalse(shortBubble.hasAmbiguousLayout)
+
+        let narrowWidth = ConversationLayoutMetrics.contentMinimumWidth
+        let narrowCell = UserPromptCellView()
+        narrowCell.applyTurnSpacing(for: row)
+        narrowCell.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: narrowWidth,
+            height: ConversationRowFactory.height(for: row, width: narrowWidth)
+        )
+        narrowCell.configure(
+            row: row,
+            width: narrowWidth,
+            model: SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        )
+        narrowCell.layoutSubtreeIfNeeded()
+        let narrowBubble = try XCTUnwrap(narrowCell.contentStack.arrangedSubviews.first)
+        XCTAssertLessThanOrEqual(narrowBubble.frame.width, narrowWidth * 0.82 + 0.5)
+        XCTAssertGreaterThan(narrowBubble.frame.width, 28)
+        XCTAssertFalse(narrowCell.hasAmbiguousLayout)
+        XCTAssertFalse(narrowBubble.hasAmbiguousLayout)
+    }
+
     func testToolActivityGroupUsesDedicatedReuseIdentifierAndCell() {
         let row = ConversationDisplayRowTestSupport.toolActivityGroupRow()
         let cell = ConversationRowFactory.makeCell(for: row)
@@ -239,6 +321,58 @@ final class ConversationRowFactoryTests: XCTestCase {
         XCTAssertGreaterThan(longHeight, shortHeight, "更长的 message 应占更高的行")
     }
 
+    func testOnlyLastVisibleRowReceivesTurnEndSpacing() {
+        let last = ConversationDisplayRowTestSupport.messageRow(text: "same")
+        let nonLast = ConversationDisplayRow(
+            role: last.role,
+            turnId: last.turnId,
+            item: last.item,
+            firstInTurn: last.firstInTurn,
+            lastInTurn: false
+        )
+
+        let lastHeight = ConversationRowFactory.height(for: last, width: 620)
+        let nonLastHeight = ConversationRowFactory.height(for: nonLast, width: 620)
+        XCTAssertEqual(
+            lastHeight - nonLastHeight,
+            ConversationRowMetrics.turnEndSpacing,
+            accuracy: 0.001
+        )
+    }
+
+    func testTurnEndSpacingResetsOnReusedCell() throws {
+        let last = ConversationDisplayRowTestSupport.messageRow(text: "same")
+        let nonLast = ConversationDisplayRow(
+            role: last.role,
+            turnId: last.turnId,
+            item: last.item,
+            firstInTurn: last.firstInTurn,
+            lastInTurn: false
+        )
+        let cell = try XCTUnwrap(
+            ConversationRowFactory.makeCell(for: last) as? ConversationRowCellView
+        )
+        let bottomConstraint = try XCTUnwrap(cell.constraints.first {
+            $0.firstItem === cell
+                && $0.firstAttribute == .bottom
+                && $0.secondItem === cell.contentStack
+                && $0.secondAttribute == .bottom
+        })
+
+        cell.applyTurnSpacing(for: last)
+        XCTAssertEqual(
+            bottomConstraint.constant,
+            cell.verticalPadding + ConversationRowMetrics.turnEndSpacing
+        )
+        cell.applyTurnSpacing(for: nonLast)
+        XCTAssertEqual(bottomConstraint.constant, cell.verticalPadding)
+        cell.applyTurnSpacing(for: last)
+        XCTAssertEqual(
+            bottomConstraint.constant,
+            cell.verticalPadding + ConversationRowMetrics.turnEndSpacing
+        )
+    }
+
     func testCollapsedShellHeightAccountsForHeaderOnly() {
         // Shell output collapses by default: a huge output must NOT inflate the
         // collapsed row height (header + metadata only).
@@ -263,7 +397,11 @@ final class ConversationRowFactoryTests: XCTestCase {
 
         let height = ConversationRowFactory.height(for: row, width: 400)
 
-        XCTAssertLessThanOrEqual(height, 32, "折叠态 toolCall 应保持为紧凑单行")
+        XCTAssertLessThanOrEqual(
+            height - ConversationRowMetrics.turnEndSpacing,
+            32,
+            "折叠态 toolCall 的内容应保持为紧凑单行"
+        )
     }
 
     func testCollapsedToolCallHeightDoesNotGrowWithPayload() {
@@ -295,9 +433,10 @@ final class ConversationRowFactoryTests: XCTestCase {
             accuracy: 0.1
         )
         XCTAssertLessThanOrEqual(
-            ConversationRowFactory.height(for: twenty, width: 400),
+            ConversationRowFactory.height(for: twenty, width: 400)
+                - ConversationRowMetrics.turnEndSpacing,
             32,
-            "折叠组只能占一个紧凑摘要行"
+            "折叠组内容只能占一个紧凑摘要行"
         )
     }
 }

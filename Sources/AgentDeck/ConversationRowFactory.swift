@@ -35,6 +35,7 @@ enum ConversationRowFactory {
     static func makeCell(for row: ConversationDisplayRow) -> NSTableCellView {
         let cell = makeBareCell(for: row)
         cell.identifier = reuseIdentifier(for: row)
+        (cell as? ConversationRowCellView)?.applyTurnSpacing(for: row)
         return cell
     }
 
@@ -75,12 +76,14 @@ enum ConversationRowFactory {
     /// — the table never reserves height for hidden disclosure content.
     @MainActor
     static func height(for row: ConversationDisplayRow, width: CGFloat) -> CGFloat {
+        let contentHeight: CGFloat
         switch row.role {
         case .userPrompt:
-            return userPromptHeight(row: row, width: width)
+            contentHeight = userPromptHeight(row: row, width: width)
         case .assistantItem:
-            return assistantHeight(row: row, width: width)
+            contentHeight = assistantHeight(row: row, width: width)
         }
+        return contentHeight + (row.lastInTurn ? ConversationRowMetrics.turnEndSpacing : 0)
     }
 
     // MARK: - Height: per role/kind
@@ -90,10 +93,10 @@ enum ConversationRowFactory {
     private static let itemVerticalPadding = ConversationRowMetrics.itemVerticalPadding
 
     private static func userPromptHeight(row: ConversationDisplayRow, width: CGFloat) -> CGFloat {
-        // padding(.vertical, 8) outer + bubble inner padding (10 top + 10 bottom).
+        // padding(.vertical, 8) outer + bubble inner padding (11 top + 11 bottom).
         // 「You」标题与左边条已移除，高度只含气泡内边距 + 正文。
         let outer: CGFloat = 8 * 2
-        let bubbleInset: CGFloat = 10 * 2
+        let bubbleInset: CGFloat = 11 * 2
         let bodyWidth = UserPromptCellView.bodyWidth(forRowWidth: width)
         let body = measuredTextHeight(
             MarkdownAttributedStringBuilder.attributedString(from: row.item.text),

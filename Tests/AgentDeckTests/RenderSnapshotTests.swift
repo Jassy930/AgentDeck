@@ -147,6 +147,7 @@ final class RenderSnapshotTests: XCTestCase {
         cell.translatesAutoresizingMaskIntoConstraints = false
         cell.widthAnchor.constraint(equalToConstant: width).isActive = true
         cell.heightAnchor.constraint(equalToConstant: height).isActive = true
+        cell.applyTurnSpacing(for: row)
         cell.configure(row: row, width: width, model: model)
         cell.layoutSubtreeIfNeeded()
         let streaming = cell.firstDescendant(ofType: StreamingTextContainerView.self)

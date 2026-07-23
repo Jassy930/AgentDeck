@@ -57,6 +57,7 @@ enum ConversationRowMetrics {
     static let captionSize = DesignTokens.typeCaption
     static let monoSize = DesignTokens.typeMono
     static let itemVerticalPadding = DesignTokens.sp1
+    static let turnEndSpacing = DesignTokens.sp5
 
     static var bodyFont: NSFont { ConversationTypography.bodyFont }
     static var calloutFont: NSFont { .systemFont(ofSize: calloutSize) }
@@ -116,10 +117,11 @@ enum ConversationRowControls {
 /// `contentStack`.
 class ConversationRowCellView: NSTableCellView {
 
-    /// Horizontal inset applied to every row (SwiftUI stream `.padding(.leading, 20)`).
+    /// Transcript items and composer share one horizontal axis. Component-level
+    /// padding belongs inside the component (bubble/code block), not around every row.
     /// `nonisolated` so the factory's (MainActor) height math and any layout
     /// helper can read this pure constant without isolation noise.
-    nonisolated static let horizontalInset: CGFloat = 20
+    nonisolated static let horizontalInset: CGFloat = 0
     /// 设计系统 `.item` 的上下内距。
     var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
 
@@ -174,6 +176,15 @@ class ConversationRowCellView: NSTableCellView {
         bottomConstraint?.constant = verticalPadding
     }
 
+    /// Adds the design-system `.turn` rhythm only after the final visible row
+    /// in a turn. Reset both branches on reuse so a former last row cannot keep
+    /// stale bottom spacing after grouping expands or collapses.
+    func applyTurnSpacing(for row: ConversationDisplayRow) {
+        topConstraint?.constant = verticalPadding
+        bottomConstraint?.constant = verticalPadding
+            + (row.lastInTurn ? ConversationRowMetrics.turnEndSpacing : 0)
+    }
+
     /// Remove every arranged subview so a reused cell starts clean.
     func resetContent() {
         for view in contentStack.arrangedSubviews {
@@ -217,21 +228,32 @@ final class UserPromptCellView: ConversationRowCellView {
         applyVerticalPadding()
         bubble.translatesAutoresizingMaskIntoConstraints = false
         bubble.wantsLayer = true
-        bubble.layer?.cornerRadius = 7
-        bubble.layer?.backgroundColor = NSColor.quaternarySystemFill.cgColor
+        bubble.layer?.cornerRadius = DesignTokens.radiusMd
+        bubble.layer?.cornerCurve = .continuous
+        bubble.layer?.backgroundColor = DesignTokens.surface2.cgColor
+        bubble.layer?.borderWidth = 1
+        bubble.layer?.borderColor = DesignTokens.border.cgColor
 
         bodyLabel.translatesAutoresizingMaskIntoConstraints = false
         bubble.addSubview(bodyLabel)
         NSLayoutConstraint.activate([
             bodyLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
             bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
-            bodyLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 10),
-            bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -10),
+            bodyLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 11),
+            bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -11),
         ])
 
         contentStack.addArrangedSubview(bubble)
         bubble.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor).isActive = true
-        bubble.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor).isActive = true
+        bubble.trailingAnchor.constraint(lessThanOrEqualTo: contentStack.trailingAnchor).isActive = true
+        bubble.widthAnchor.constraint(
+            lessThanOrEqualTo: contentStack.widthAnchor,
+            multiplier: 0.82
+        ).isActive = true
+        contentStack.trailingAnchor.constraint(
+            equalTo: trailingAnchor,
+            constant: -ConversationRowCellView.horizontalInset
+        ).isActive = true
     }
 
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
@@ -240,10 +262,14 @@ final class UserPromptCellView: ConversationRowCellView {
         bodyLabel.preferredMaxLayoutWidth = UserPromptCellView.bodyWidth(forRowWidth: width)
     }
 
-    /// 气泡内 markdown 正文宽度：行宽减去流插入，再减去气泡水平内边距（14 + 14）。
+    /// 气泡内 markdown 正文最大宽度：正文轴的 82%，再减去水平内边距。
     /// 纯计算，`nonisolated` 供 factory 计算高度复用。
     nonisolated static func bodyWidth(forRowWidth width: CGFloat) -> CGFloat {
-        max(width - horizontalInset * 2 - 14 - 14, 1)
+        max(maximumBubbleWidth(forRowWidth: width) - 14 - 14, 1)
+    }
+
+    nonisolated static func maximumBubbleWidth(forRowWidth width: CGFloat) -> CGFloat {
+        max((width - horizontalInset * 2) * 0.82, 1)
     }
 }
 

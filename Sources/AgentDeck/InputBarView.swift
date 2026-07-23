@@ -24,7 +24,7 @@ final class InputBarView: NSView {
     private let scrollView = NSScrollView()
     private let placeholderLabel: NSTextField = {
         let field = NSTextField(labelWithString: "继续对话，或 @ 引用文件…")
-        field.font = ConversationRowMetrics.calloutFont
+        field.font = ConversationTypography.bodyFont
         field.textColor = DesignTokens.text3
         field.translatesAutoresizingMaskIntoConstraints = false
         field.isSelectable = false
@@ -65,7 +65,7 @@ final class InputBarView: NSView {
     private var scrollHeightConstraint: NSLayoutConstraint!
 
     /// Single line height of the editing font, used to clamp growth 1…4 lines.
-    private let lineHeight = ceil(ConversationRowMetrics.calloutFont.boundingRectForFont.height)
+    private let lineHeight = ceil(ConversationTypography.bodyFont.boundingRectForFont.height)
     private let verticalTextInset: CGFloat = 6
     private var minHeight: CGFloat { lineHeight + verticalTextInset * 2 }
     private var maxHeight: CGFloat { lineHeight * 4 + verticalTextInset * 2 }
@@ -139,11 +139,12 @@ final class InputBarView: NSView {
         composerChrome.translatesAutoresizingMaskIntoConstraints = false
         composerChrome.setAccessibilityIdentifier("codex-composer")
         CodexDesktopChrome.roundedPanel(composerChrome, radius: DesignTokens.radiusLg)
+        composerChrome.layer?.backgroundColor = DesignTokens.surface2.cgColor
 
         textView.onSubmit = { [weak self] in self?.send() }
         textView.onTextChange = { [weak self] in self?.textDidChange() }
         textView.isRichText = false
-        textView.font = ConversationRowMetrics.calloutFont
+        textView.font = ConversationTypography.bodyFont
         textView.textColor = DesignTokens.text
         textView.drawsBackground = false
         textView.isVerticallyResizable = true
@@ -209,9 +210,9 @@ final class InputBarView: NSView {
             composerChrome.trailingAnchor.constraint(equalTo: trailingAnchor),
             composerChrome.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            scrollView.leadingAnchor.constraint(equalTo: composerChrome.leadingAnchor, constant: 14),
-            scrollView.topAnchor.constraint(equalTo: composerChrome.topAnchor, constant: 14),
-            scrollView.trailingAnchor.constraint(equalTo: composerChrome.trailingAnchor, constant: -14),
+            scrollView.leadingAnchor.constraint(equalTo: composerChrome.leadingAnchor, constant: 16),
+            scrollView.topAnchor.constraint(equalTo: composerChrome.topAnchor, constant: 12),
+            scrollView.trailingAnchor.constraint(equalTo: composerChrome.trailingAnchor, constant: -16),
             scrollHeightConstraint,
 
             // 只呈现已接通的控件：徽章组靠左，发送按钮靠右。
@@ -220,8 +221,8 @@ final class InputBarView: NSView {
             badgeStack.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
             badgeStack.trailingAnchor.constraint(lessThanOrEqualTo: sendButton.leadingAnchor, constant: -12),
 
-            sendButton.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 10),
-            sendButton.bottomAnchor.constraint(equalTo: composerChrome.bottomAnchor, constant: -10),
+            sendButton.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 6),
+            sendButton.bottomAnchor.constraint(equalTo: composerChrome.bottomAnchor, constant: -8),
             sendButton.trailingAnchor.constraint(equalTo: composerChrome.trailingAnchor, constant: -12),
             sendButton.centerYAnchor.constraint(equalTo: badgeStack.centerYAnchor),
             sendButton.widthAnchor.constraint(equalToConstant: 44),
