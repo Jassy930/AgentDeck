@@ -322,6 +322,12 @@ svg[class^="lucide"], .lucide { stroke-width: 1.8; }
 .item__gutter { width: 18px; flex: none; display: flex; justify-content: center; padding-top: 3px; color: var(--text-3); }
 .item__gutter i { width: 14px; height: 14px; }
 .item__body { min-width: 0; flex: 1; }
+.item__body code, .turn__user code, .m-turn code {
+  font-family: var(--font-mono); font-size: 12.5px; line-height: var(--lh-latin);
+  color: inherit; background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 1px 4px;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone;
+}
 .reason { color: var(--text-2); font-size: 13px; font-style: normal; }
 [data-theme="warm"] .reason { font-style: italic; }
 .cmd { background: var(--surface-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 9px 12px; font-family: var(--font-mono); font-size: 12px; }

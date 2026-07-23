@@ -12,6 +12,7 @@ final class MarkdownAttributedStringBuilderTests: XCTestCase {
         XCTAssertEqual(DesignTokens.lineHeightLatin, 1.45)
 
         XCTAssertEqual(MarkdownStyle.standard.bodyFont.pointSize, DesignTokens.typeBody)
+        XCTAssertEqual(MarkdownStyle.standard.headingFont.pointSize, DesignTokens.typeTitle)
         XCTAssertEqual(MarkdownStyle.standard.codeFont.pointSize, DesignTokens.typeMono)
         XCTAssertEqual(MarkdownStyle.reasoning.bodyFont.pointSize, DesignTokens.typeCallout)
         XCTAssertTrue(MarkdownStyle.reasoning.textColor.isEqual(DesignTokens.text2))
@@ -75,14 +76,63 @@ final class MarkdownAttributedStringBuilderTests: XCTestCase {
         )
     }
 
-    func testInlineCodeUsesMonospacedFont() {
+    func testInlineCodeUsesMonospacedFontAndRoundedDecorationAttribute() {
         let s = MarkdownAttributedStringBuilder.attributedString(from: "a `code` b")
-        // 找到 "code" 区段，断言其字体是等宽。
+        // 找到 "code" 区段，断言其字体是等宽且由 layout manager 绘制圆角底，
+        // 不回退到原生方形 backgroundColor。
         let ns = s.string as NSString
         let r = ns.range(of: "code")
         let font = s.attribute(.font, at: r.location, effectiveRange: nil) as? NSFont
+        let background = s.attribute(.backgroundColor, at: r.location, effectiveRange: nil)
+        let decoration = s.attribute(.agentDeckInlineCode, at: r.location, effectiveRange: nil)
         XCTAssertTrue(font?.fontDescriptor.symbolicTraits.contains(.monoSpace) ?? false,
                       "行内代码应使用等宽字体")
+        XCTAssertNil(background, "行内代码不应使用原生方形文字背景")
+        XCTAssertNotNil(decoration, "行内代码应交给自定义圆角装饰绘制")
+    }
+
+    func testHeadingsListsAndParagraphBreaksRenderWithoutLiteralMarkers() throws {
+        let s = MarkdownAttributedStringBuilder.attributedString(
+            from: "## 当前执行状态\n\n- **完成** 第一项\n- 第二项"
+        )
+        XCTAssertEqual(s.string, "当前执行状态\n•  完成 第一项\n•  第二项")
+        XCTAssertFalse(s.string.contains("##"))
+
+        let headingRange = (s.string as NSString).range(of: "当前执行状态")
+        let headingFont = try XCTUnwrap(
+            s.attribute(.font, at: headingRange.location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertEqual(headingFont.pointSize, DesignTokens.typeTitle)
+        XCTAssertTrue(headingFont.fontDescriptor.symbolicTraits.contains(.bold))
+
+        let listStyle = try paragraphStyle(in: s, substring: "•  完成")
+        XCTAssertEqual(listStyle.headIndent, 18, accuracy: 0.001)
+        XCTAssertEqual(listStyle.paragraphSpacingBefore, DesignTokens.sp2, accuracy: 0.001)
+    }
+
+    func testFencedCodeUsesMonospacedBlockDecorationAndDropsFence() throws {
+        let s = MarkdownAttributedStringBuilder.attributedString(
+            from: "正文\n\n```swift\nlet value = 1\n```\n\n结论"
+        )
+        XCTAssertEqual(s.string, "正文\nlet value = 1\n结论")
+        XCTAssertFalse(s.string.contains("```"))
+
+        let codeRange = (s.string as NSString).range(of: "let value = 1")
+        let font = try XCTUnwrap(
+            s.attribute(.font, at: codeRange.location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertTrue(font.fontDescriptor.symbolicTraits.contains(.monoSpace))
+        XCTAssertNotNil(
+            s.attribute(.agentDeckCodeBlock, at: codeRange.location, effectiveRange: nil)
+        )
+    }
+
+    func testUnclosedStreamingFenceStillFormsOneCodeBlock() {
+        let s = MarkdownAttributedStringBuilder.attributedString(
+            from: "```json\n{\"state\": \"running\"}"
+        )
+        XCTAssertEqual(s.string, "{\"state\": \"running\"}")
+        XCTAssertNotNil(s.attribute(.agentDeckCodeBlock, at: 0, effectiveRange: nil))
     }
 
     func testUnsupportedTableDowngradesToPlainTextWithoutCrash() {

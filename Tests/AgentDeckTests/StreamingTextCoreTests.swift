@@ -47,6 +47,7 @@ final class StreamingTextCoreTests: XCTestCase {
 
         let view = StreamingTextContainerView(frame: .zero)
         view.bindMarkdownBuffer(to: buffer, style: .standard)
+        XCTAssertTrue(view.usesInlineCodeLayoutManagerForTesting)
 
         let attributed = view.currentAttributedText
         // The rendered plain string drops the markdown syntax markers.

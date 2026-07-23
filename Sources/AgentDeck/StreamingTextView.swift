@@ -34,8 +34,150 @@ enum StreamingTextStorageSynchronizer {
     }
 }
 
+/// TextKit 1 自定义背景绘制：inline code 使用低对比圆角胶囊，fenced code
+/// 使用整列圆角容器。装饰属性由 `MarkdownAttributedStringBuilder` 写入，
+/// 文本本身仍保持普通字符，因此复制、选择、流式替换和测高都不受影响。
+final class InlineCodeLayoutManager: NSLayoutManager {
+    override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
+        guard glyphsToShow.length > 0,
+              let storage = textStorage,
+              let container = textContainers.first else {
+            super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
+            return
+        }
+
+        let characterRange = characterRange(
+            forGlyphRange: glyphsToShow,
+            actualGlyphRange: nil
+        )
+        drawCodeBlocks(
+            in: storage,
+            characterRange: characterRange,
+            visibleGlyphRange: glyphsToShow,
+            container: container,
+            origin: origin
+        )
+        drawInlineCode(
+            in: storage,
+            characterRange: characterRange,
+            visibleGlyphRange: glyphsToShow,
+            container: container,
+            origin: origin
+        )
+
+        // Selection/link backgrounds stay above the custom surfaces.
+        super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
+    }
+
+    private func drawCodeBlocks(
+        in storage: NSTextStorage,
+        characterRange: NSRange,
+        visibleGlyphRange: NSRange,
+        container: NSTextContainer,
+        origin: NSPoint
+    ) {
+        storage.enumerateAttribute(.agentDeckCodeBlock, in: characterRange) { value, range, _ in
+            guard value != nil else { return }
+            let glyphRange = self.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            let visible = NSIntersectionRange(glyphRange, visibleGlyphRange)
+            guard visible.length > 0 else { return }
+
+            var minY = CGFloat.greatestFiniteMagnitude
+            var maxY = -CGFloat.greatestFiniteMagnitude
+            self.enumerateLineFragments(forGlyphRange: visible) { lineRect, _, _, _, _ in
+                minY = min(minY, lineRect.minY)
+                maxY = max(maxY, lineRect.maxY)
+            }
+            guard minY.isFinite, maxY.isFinite, maxY > minY else { return }
+
+            let rect = NSRect(
+                x: origin.x,
+                y: origin.y + minY - 2,
+                width: max(container.containerSize.width, 1),
+                height: maxY - minY + 4
+            )
+            Self.drawRoundedSurface(
+                rect: rect,
+                radius: DesignTokens.radiusSm,
+                fill: DesignTokens.surfaceInset,
+                border: DesignTokens.border
+            )
+        }
+    }
+
+    private func drawInlineCode(
+        in storage: NSTextStorage,
+        characterRange: NSRange,
+        visibleGlyphRange: NSRange,
+        container: NSTextContainer,
+        origin: NSPoint
+    ) {
+        storage.enumerateAttribute(.agentDeckInlineCode, in: characterRange) { value, range, _ in
+            guard value != nil else { return }
+            let glyphRange = self.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            let visible = NSIntersectionRange(glyphRange, visibleGlyphRange)
+            guard visible.length > 0 else { return }
+
+            self.enumerateLineFragments(forGlyphRange: visible) { _, _, _, lineGlyphRange, _ in
+                let segment = NSIntersectionRange(visible, lineGlyphRange)
+                guard segment.length > 0 else { return }
+                var rect = self.boundingRect(forGlyphRange: segment, in: container)
+                guard !rect.isEmpty else { return }
+                // `boundingRect` 会继承正文 24pt 的 CJK 行框；胶囊本身只按
+                // mono 字形高度 + 2pt 上下留白绘制，避免看起来像整行选区。
+                let desiredHeight = min(
+                    rect.height,
+                    ceil(ConversationTypography.monoFont.boundingRectForFont.height) + 4
+                )
+                rect.origin.y = rect.midY - desiredHeight / 2
+                rect.size.height = desiredHeight
+                rect = rect.insetBy(dx: -3, dy: 0)
+                rect.origin.x += origin.x
+                rect.origin.y += origin.y
+                let radius = min(DesignTokens.radiusSm, rect.height / 2)
+                Self.drawRoundedSurface(
+                    rect: rect,
+                    radius: radius,
+                    fill: DesignTokens.surface2,
+                    border: DesignTokens.border
+                )
+            }
+        }
+    }
+
+    private static func drawRoundedSurface(
+        rect: NSRect,
+        radius: CGFloat,
+        fill: NSColor,
+        border: NSColor
+    ) {
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        let aligned = rect.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(
+            roundedRect: aligned,
+            xRadius: radius,
+            yRadius: radius
+        )
+        fill.setFill()
+        path.fill()
+        border.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+}
+
 final class StreamingTextContainerView: NSView {
-    private let textView = CoordinatedStreamingTextView(frame: .zero)
+    private let textView: CoordinatedStreamingTextView = {
+        let storage = NSTextStorage()
+        let layoutManager = InlineCodeLayoutManager()
+        let container = NSTextContainer(
+            size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        )
+        storage.addLayoutManager(layoutManager)
+        layoutManager.addTextContainer(container)
+        return CoordinatedStreamingTextView(frame: .zero, textContainer: container)
+    }()
     private var measuredHeight: CGFloat = 1
     private var lastFont: NSFont?
     private var lastTextColor: NSColor?
@@ -151,6 +293,10 @@ final class StreamingTextContainerView: NSView {
     /// code / link), not just plain text.
     var currentAttributedText: NSAttributedString {
         textView.textStorage ?? NSTextStorage()
+    }
+
+    var usesInlineCodeLayoutManagerForTesting: Bool {
+        textView.layoutManager is InlineCodeLayoutManager
     }
 
     /// The text view's current selection. Exposed so tests can assert that a

@@ -72,6 +72,7 @@ bun run check   # 以上一步到位（可接 CI）
 - 字号阶梯：`display-xl 34pt`、`display 24pt`、`title 16pt`、`body 14pt`、`callout 13pt`、`caption 11pt`、`mono 12.5pt`。
 - 行高倍率：纯拉丁段落 `1.45`；包含中文、日文、韩文字符的段落（含中西混排）`1.72`。
 - macOS 会话流：assistant 正文使用 `body`，reasoning 正文使用 `callout + text2`，命令与 diff 使用 `mono`；Markdown 正文与 reasoning 必须各自用同一 attributed string 完成渲染和行高测量。
+- Markdown：标题/列表/fenced code 必须隐藏语法标记并保留块级节奏；行内代码使用 `mono + surface2 + border + radius-sm` 的低对比圆角胶囊，fenced code 使用 `surface-inset + border + radius-sm` 独立容器，不能用 `text3` 画方形高亮条。
 
 ## 说明与替代
 

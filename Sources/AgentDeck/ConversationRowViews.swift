@@ -268,6 +268,13 @@ final class MessageCellView: ConversationRowCellView {
         contentStack.addArrangedSubview(streamingView)
         streamingView.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor).isActive = true
         streamingView.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor).isActive = true
+        // Streaming text has no horizontal intrinsic width. Keep the stack on
+        // the full transcript axis so Markdown does not collapse to 0pt in
+        // standalone previews or during an early table-layout pass.
+        contentStack.trailingAnchor.constraint(
+            equalTo: trailingAnchor,
+            constant: -ConversationRowCellView.horizontalInset
+        ).isActive = true
     }
 
     required init?(coder: NSCoder) { super.init(coder: coder) }

@@ -111,6 +111,50 @@ final class RenderSnapshotTests: XCTestCase {
         cell.renderPNG(to: "/tmp/adk-reasoning-typography.png")
     }
 
+    func testRenderMarkdownBlocks() {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let markdown = """
+        ## 当前执行状态
+
+        已核对 `agentdeck-relay/src/{bridge,router,store}.rs` 的实现。
+
+        - 已完成结构检查
+        - 正在运行回归测试
+
+        ```swift
+        let state = "running"
+        ```
+        """
+        let item = UIItem(
+            id: "message-markdown-blocks",
+            lifecycle: "completed",
+            kind: "message",
+            text: markdown
+        )
+        item.textBuffer.replace(with: markdown)
+        let row = ConversationDisplayRow(
+            role: .assistantItem,
+            turnId: "turn-markdown-blocks",
+            item: item,
+            firstInTurn: true,
+            lastInTurn: true
+        )
+        let cell = MessageCellView()
+        cell.wantsLayer = true
+        cell.layer?.backgroundColor = DesignTokens.bg.cgColor
+        let width: CGFloat = 620
+        let height = ConversationRowFactory.height(for: row, width: width) + 12
+        cell.translatesAutoresizingMaskIntoConstraints = false
+        cell.widthAnchor.constraint(equalToConstant: width).isActive = true
+        cell.heightAnchor.constraint(equalToConstant: height).isActive = true
+        cell.configure(row: row, width: width, model: model)
+        cell.layoutSubtreeIfNeeded()
+        let streaming = cell.firstDescendant(ofType: StreamingTextContainerView.self)
+        XCTAssertEqual(streaming?.currentText, MarkdownAttributedStringBuilder.attributedString(from: markdown).string)
+        streaming?.layoutSubtreeIfNeeded()
+        cell.renderPNG(to: "/tmp/adk-markdown-blocks.png")
+    }
+
     func testRenderConversationStream() {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         model.cwd = URL(fileURLWithPath: "/p/refactor-auth")
