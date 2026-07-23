@@ -128,6 +128,7 @@ impl StreamBindingPermit {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_test(
         target: RuntimeStreamTarget,
         publication_stream_id: [u8; 16],
