@@ -398,6 +398,9 @@ impl MacOsRemoteKeyStore {
     /// 只在 automatic policy test 编译；仍要求 verified identity，不能从 raw group
     /// 构造，也不会形成 production CLI/env/config 选择面。
     #[cfg(test)]
+    // integration policy tests 会以 source-include 方式调用该构造器；
+    // 单独编译 lib-test target 时则不存在 crate 内调用点。
+    #[allow(dead_code)]
     pub(crate) fn new_with_backend(
         identity: &VerifiedRemoteCliIdentity,
         backend: Arc<dyn SecurityItemBackend>,
