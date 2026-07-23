@@ -5,6 +5,11 @@
 pub mod crypto_state;
 pub mod device_lock;
 pub mod keychain;
+#[cfg(target_os = "macos")]
+mod macos_keychain;
 #[cfg(unix)]
 pub mod paired_machine;
 pub mod pending;
+#[cfg(unix)]
+pub mod production;
+pub mod signature;

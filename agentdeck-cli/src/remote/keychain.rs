@@ -1,8 +1,9 @@
 //! Persistent remote client 的 Keychain account 与可注入 secret-store primitive。
 //!
-//! 本模块只冻结 account 命名和 immutable/exact-readback 语义；production macOS
-//! Data Protection Keychain adapter 由 P4.6 后续子片接入。[`MemoryRemoteKeyStore`]
-//! 只能由 library/test harness 显式注入，不提供 CLI、环境变量或配置文件选择面。
+//! 本模块冻结 account 命名和 immutable/exact-readback 语义；production macOS
+//! Data Protection Keychain adapter 由 sibling `macos_keychain` 在签名 type-state 后接入。
+//! [`MemoryRemoteKeyStore`] 只能由 library/test harness 显式注入，不提供 CLI、环境变量
+//! 或配置文件选择面。
 
 use std::collections::HashMap;
 use std::fmt;
@@ -204,6 +205,8 @@ pub enum RemoteKeyStoreError {
     PersistenceReadbackFailed { account: RemoteKeyAccount },
     #[error("remote Keychain item {account} remained present after delete")]
     DeleteReadbackFailed { account: RemoteKeyAccount },
+    #[error("remote keystore backend is unavailable")]
+    BackendUnavailable,
     #[error("remote keystore lock is poisoned")]
     Poisoned,
 }
@@ -216,7 +219,7 @@ impl RemoteKeyStoreError {
             Self::PersistenceReadbackFailed { .. } | Self::DeleteReadbackFailed { .. } => {
                 "remote.keystore.persistence_failed"
             }
-            Self::Poisoned => "remote.keystore.unavailable",
+            Self::BackendUnavailable | Self::Poisoned => "remote.keystore.unavailable",
         }
     }
 }

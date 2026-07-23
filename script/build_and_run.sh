@@ -5,6 +5,34 @@ MODE="${1:-run}"
 APP_NAME="AgentDeck"
 BUNDLE_ID="dev.agentdeck.AgentDeck"
 MIN_SYSTEM_VERSION="14.0"
+CLI_CODE_IDENTIFIER="${AGENTDECK_CLI_CODE_IDENTIFIER:-}"
+CLI_TEAM_IDENTIFIER="${AGENTDECK_CLI_TEAM_IDENTIFIER:-}"
+CLI_KEYCHAIN_ACCESS_GROUP="${AGENTDECK_CLI_KEYCHAIN_ACCESS_GROUP:-}"
+CLI_CODE_IDENTIFIER_REQUIRED="com.agentdeck.agentdeck-cli"
+CLI_KEYCHAIN_ACCESS_GROUP_SUFFIX=".com.agentdeck.remote.cli"
+
+cli_identity_fields=0
+[[ -n "$CLI_CODE_IDENTIFIER" ]] && cli_identity_fields=$((cli_identity_fields + 1))
+[[ -n "$CLI_TEAM_IDENTIFIER" ]] && cli_identity_fields=$((cli_identity_fields + 1))
+[[ -n "$CLI_KEYCHAIN_ACCESS_GROUP" ]] && cli_identity_fields=$((cli_identity_fields + 1))
+if [[ "$cli_identity_fields" -ne 0 && "$cli_identity_fields" -ne 3 ]]; then
+  echo "CLI production identity must be supplied as an all-or-none triple" >&2
+  exit 2
+fi
+if [[ "$cli_identity_fields" -eq 3 ]]; then
+  if [[ "$CLI_CODE_IDENTIFIER" != "$CLI_CODE_IDENTIFIER_REQUIRED" ]]; then
+    echo "CLI production code identifier is invalid" >&2
+    exit 2
+  fi
+  if [[ ! "$CLI_TEAM_IDENTIFIER" =~ ^[[:alnum:]]{1,64}$ ]]; then
+    echo "CLI production TeamIdentifier is invalid" >&2
+    exit 2
+  fi
+  if [[ "$CLI_KEYCHAIN_ACCESS_GROUP" != "${CLI_TEAM_IDENTIFIER}${CLI_KEYCHAIN_ACCESS_GROUP_SUFFIX}" ]]; then
+    echo "CLI production Keychain access group is invalid" >&2
+    exit 2
+  fi
+fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${AGENTDECK_DIST_DIR:-$ROOT_DIR/dist}"
