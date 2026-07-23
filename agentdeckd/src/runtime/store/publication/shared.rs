@@ -8,13 +8,14 @@ use agentdeck_protocol::e2ee::{KeyControlV1, KeyId, KeyPurpose, SignedSealedBlob
 use agentdeck_protocol::relay_v2::StreamRouteId;
 use agentdeck_protocol::runtime::catalog::CatalogDelta;
 use agentdeck_protocol::runtime::event::RuntimeEvent;
-use agentdeck_protocol::runtime::{RuntimeStreamItem, RuntimeTransferCarrierV1};
+use agentdeck_protocol::runtime::{
+    MAX_DURABLE_CATALOG_REVISIONS, RuntimeStreamItem, RuntimeTransferCarrierV1,
+};
 
 use super::super::key_transition::KeyTransitionStreamScope;
 use super::*;
 use crate::runtime::transfer_identity::{DurableStreamSource, DurableStreamTransferIdentity};
 
-const MAX_SHARED_CATALOG_RANGE: u64 = 500;
 const EPOCH_BARRIER_PUBLICATION_ID_DOMAIN: &[u8] = b"AgentDeck/EpochBarrierPublicationIdV1\0";
 
 /// EpochBarrier 的 Store-authenticated durable identity。所有字段都来自已冻结的
@@ -702,7 +703,7 @@ fn validate_transfer_journal(
         return Err(RuntimeStoreError::PublicationMismatch);
     }
     let final_part = carrier.transfer.part_index + 1 == carrier.transfer.part_count;
-    let (source_after, source_through, final_kind) = match identity.source {
+    let (source_after, source_through, final_kind) = match identity.source() {
         DurableStreamSource::Catalog {
             first_revision,
             through_revision,
@@ -738,7 +739,7 @@ fn load_transfer_source_payload(
     database_id: [u8; 16],
     identity: DurableStreamTransferIdentity,
 ) -> Result<Vec<u8>, RuntimeStoreError> {
-    let source = match identity.source {
+    let source = match identity.source() {
         DurableStreamSource::Catalog {
             first_revision,
             through_revision,
@@ -840,7 +841,7 @@ fn load_catalog_item(
         .checked_sub(first)
         .and_then(|value| value.checked_add(1))
         .ok_or(RuntimeStoreError::PublicationMismatch)?;
-    if count > MAX_SHARED_CATALOG_RANGE {
+    if count > MAX_DURABLE_CATALOG_REVISIONS {
         return Err(RuntimeStoreError::PayloadTooLarge);
     }
     let read_crypto = key_bundle.read_only_capability();
@@ -880,8 +881,8 @@ fn load_event_item(
     Ok(RuntimeStreamItem::Event(event))
 }
 
-const fn transfer_scope(identity: DurableStreamTransferIdentity) -> PublicationScope {
-    match identity.source {
+fn transfer_scope(identity: DurableStreamTransferIdentity) -> PublicationScope {
+    match identity.source() {
         DurableStreamSource::Catalog { .. } => PublicationScope::Catalog,
         DurableStreamSource::Event {
             conversation_id, ..

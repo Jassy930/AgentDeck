@@ -156,7 +156,7 @@ impl CanonicalSharedPublication {
             .checked_add(1)
             .is_some_and(|next| next == carrier.transfer.part_count);
         let (scope, source_after, source_through, final_payload_kind, frame_kind) =
-            match identity.source {
+            match identity.source() {
                 DurableStreamSource::Catalog {
                     first_revision,
                     through_revision,

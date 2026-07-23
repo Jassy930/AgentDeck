@@ -1988,14 +1988,15 @@ mod tests {
     #[test]
     fn compact_transfer_publication_holds_inner_cursor_until_final_and_binds_exact_part() {
         let payload = vec![0x5c; MAX_PART_BYTES + 1];
-        let identity = DurableStreamTransferIdentity {
-            source: DurableStreamSource::Catalog {
+        let identity = DurableStreamTransferIdentity::from_stream_metadata(
+            DurableStreamSource::Catalog {
                 first_revision: 17,
                 through_revision: 17,
             },
-            total_bytes: u64::try_from(payload.len()).expect("fixture length fits u64"),
-            total_sha256: sha256(&payload),
-        };
+            u64::try_from(payload.len()).expect("fixture length fits u64"),
+            sha256(&payload),
+        )
+        .expect("bounded durable stream metadata");
         let first_carrier = identity
             .carrier_for_part(&payload, 0)
             .expect("canonical first compact part");
@@ -2592,14 +2593,15 @@ mod tests {
         };
         let payload = serde_json::to_vec(&delta).expect("encode multi-part catalog source");
         assert!(payload.len() > MAX_PART_BYTES);
-        let identity = DurableStreamTransferIdentity {
-            source: DurableStreamSource::Catalog {
+        let identity = DurableStreamTransferIdentity::from_stream_metadata(
+            DurableStreamSource::Catalog {
                 first_revision,
                 through_revision,
             },
-            total_bytes: u64::try_from(payload.len()).expect("payload length fits u64"),
-            total_sha256: sha256(&payload),
-        };
+            u64::try_from(payload.len()).expect("payload length fits u64"),
+            sha256(&payload),
+        )
+        .expect("bounded durable stream metadata");
         assert_eq!(identity.part_count().expect("part count"), 2);
         let first_carrier = identity
             .carrier_for_part(&payload, 0)

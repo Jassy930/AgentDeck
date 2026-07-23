@@ -15,6 +15,7 @@
 pub mod catalog;
 pub mod command;
 pub mod configuration;
+pub mod durable_transfer;
 pub mod envelope;
 pub mod event;
 pub mod failure;
@@ -43,6 +44,10 @@ pub use configuration::{
     CodexConversationConfiguration, ConfigurationError, ConfigurationReceipt,
     ConfigureConversationRequest, ConversationConfiguration, ConversationConfigurationState,
     VendorConfigurationSnapshot,
+};
+pub use durable_transfer::{
+    DurableStreamObjectId, DurableStreamTransferIdentity, DurableStreamTransferIdentityError,
+    DurableStreamTransferSource, MAX_DURABLE_CATALOG_REVISIONS,
 };
 pub use envelope::{
     MAX_RUNTIME_JSON_FRAME_BYTES, MAX_RUNTIME_REQUEST_BYTES, MachineRemoteFailureCode,

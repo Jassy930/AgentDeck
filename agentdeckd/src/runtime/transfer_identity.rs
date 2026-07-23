@@ -6,18 +6,18 @@
 
 use std::fmt::Write as _;
 
-use agentdeck_protocol::runtime::identity::{MessageId, TransferId};
+use agentdeck_protocol::runtime::identity::{ConversationId, EventId, MessageId, TransferId};
 use agentdeck_protocol::runtime::{
-    MAX_PART_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS, RuntimeReply, RuntimeStreamItem,
-    RuntimeTransferCarrierV1, RuntimeTransferChannel, StreamCursor, TransferEnvelope,
+    DurableStreamTransferIdentity as ProtocolDurableStreamTransferIdentity,
+    DurableStreamTransferIdentityError as ProtocolDurableStreamTransferIdentityError,
+    DurableStreamTransferSource as ProtocolDurableStreamTransferSource, MAX_PART_BYTES,
+    MAX_TRANSFER_BYTES, RuntimeReply, RuntimeStreamItem, RuntimeTransferCarrierV1,
+    RuntimeTransferChannel, StreamCursor, TransferEnvelope,
 };
 use sha2::{Digest, Sha256};
 
 use super::store::identity::{RuntimeId, RuntimeIdKind};
 
-const TRANSFER_ID_PREFIX: &str = "adrt-shared-v1";
-const MESSAGE_ID_PREFIX: &str = "shared-transfer-";
-const MESSAGE_ID_DOMAIN: &[u8] = b"AgentDeck/DurableStreamTransferMessageIdV1\0";
 const PUBLICATION_ID_DOMAIN: &[u8] = b"AgentDeck/DurableStreamTransferPublicationIdV1\0";
 const REPLY_TRANSFER_ID_DOMAIN: &[u8] = b"AgentDeck/DurableReplyTransferIdV1\0";
 const REPLY_TRANSFER_ID_PREFIX: &str = "reply-transfer-";
@@ -37,9 +37,7 @@ pub(crate) enum DurableStreamSource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DurableStreamTransferIdentity {
-    pub(crate) source: DurableStreamSource,
-    pub(crate) total_bytes: u64,
-    pub(crate) total_sha256: [u8; 32],
+    shared: ProtocolDurableStreamTransferIdentity,
 }
 
 impl DurableStreamTransferIdentity {
@@ -48,11 +46,6 @@ impl DurableStreamTransferIdentity {
         item: &RuntimeStreamItem,
         payload: &[u8],
     ) -> Result<Self, DurableStreamTransferIdentityError> {
-        let total_bytes = u64::try_from(payload.len())
-            .map_err(|_| DurableStreamTransferIdentityError::TooLarge)?;
-        if total_bytes > MAX_TRANSFER_BYTES {
-            return Err(DurableStreamTransferIdentityError::TooLarge);
-        }
         let source_matches = match (source, item) {
             (
                 DurableStreamSource::Catalog {
@@ -86,113 +79,107 @@ impl DurableStreamTransferIdentity {
         if !source_matches {
             return Err(DurableStreamTransferIdentityError::InvalidSource);
         }
-        Ok(Self {
-            source,
-            total_bytes,
-            total_sha256: Sha256::digest(payload).into(),
-        })
+        let shared = match source {
+            DurableStreamSource::Catalog {
+                first_revision,
+                through_revision,
+            } => ProtocolDurableStreamTransferIdentity::for_catalog(
+                first_revision,
+                through_revision,
+                payload,
+            ),
+            DurableStreamSource::Event {
+                conversation_id,
+                event_id,
+                event_seq,
+            } => ProtocolDurableStreamTransferIdentity::for_event(
+                &ConversationId::new(conversation_id.to_canonical_string()),
+                &EventId::new(event_id.to_canonical_string()),
+                event_seq,
+                payload,
+            ),
+        }
+        .map_err(map_protocol_identity_error)?;
+        Ok(Self { shared })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_stream_metadata(
+        source: DurableStreamSource,
+        total_bytes: u64,
+        total_sha256: [u8; 32],
+    ) -> Result<Self, DurableStreamTransferIdentityError> {
+        let shared = match source {
+            DurableStreamSource::Catalog {
+                first_revision,
+                through_revision,
+            } => ProtocolDurableStreamTransferIdentity::from_catalog_metadata(
+                first_revision,
+                through_revision,
+                total_bytes,
+                total_sha256,
+            ),
+            DurableStreamSource::Event {
+                conversation_id,
+                event_id,
+                event_seq,
+            } => ProtocolDurableStreamTransferIdentity::from_event_metadata(
+                &ConversationId::new(conversation_id.to_canonical_string()),
+                &EventId::new(event_id.to_canonical_string()),
+                event_seq,
+                total_bytes,
+                total_sha256,
+            ),
+        }
+        .map_err(map_protocol_identity_error)?;
+        Ok(Self { shared })
     }
 
     pub(crate) fn parse_transfer_id(
         transfer_id: &TransferId,
     ) -> Result<Self, DurableStreamTransferIdentityError> {
-        let parts = transfer_id.as_str().split(':').collect::<Vec<_>>();
-        let identity = match parts.as_slice() {
-            [prefix, "c", first, through, total_bytes, digest] if *prefix == TRANSFER_ID_PREFIX => {
-                let first_revision = parse_u64(first)?;
-                let through_revision = parse_u64(through)?;
-                if through_revision < first_revision {
-                    return Err(DurableStreamTransferIdentityError::InvalidIdentity);
-                }
-                Self {
-                    source: DurableStreamSource::Catalog {
-                        first_revision,
-                        through_revision,
-                    },
-                    total_bytes: parse_total_bytes(total_bytes)?,
-                    total_sha256: parse_hex_digest(digest)?,
-                }
-            }
-            [
-                prefix,
-                "e",
-                conversation,
-                event,
-                sequence,
-                total_bytes,
-                digest,
-            ] if *prefix == TRANSFER_ID_PREFIX => Self {
-                source: DurableStreamSource::Event {
-                    conversation_id: RuntimeId::parse_canonical(
-                        RuntimeIdKind::Conversation,
-                        conversation,
-                    )
-                    .map_err(|_| DurableStreamTransferIdentityError::InvalidIdentity)?,
-                    event_id: RuntimeId::parse_canonical(RuntimeIdKind::Event, event)
-                        .map_err(|_| DurableStreamTransferIdentityError::InvalidIdentity)?,
-                    event_seq: parse_u64(sequence)?,
-                },
-                total_bytes: parse_total_bytes(total_bytes)?,
-                total_sha256: parse_hex_digest(digest)?,
-            },
-            _ => return Err(DurableStreamTransferIdentityError::InvalidIdentity),
-        };
-        if identity.transfer_id() != *transfer_id {
-            return Err(DurableStreamTransferIdentityError::InvalidIdentity);
-        }
-        Ok(identity)
+        Ok(Self {
+            shared: ProtocolDurableStreamTransferIdentity::parse_transfer_id(transfer_id)
+                .map_err(map_protocol_identity_error)?,
+        })
     }
 
-    pub(crate) fn transfer_id(self) -> TransferId {
-        let mut value = String::new();
-        match self.source {
-            DurableStreamSource::Catalog {
+    pub(crate) fn source(self) -> DurableStreamSource {
+        match self.shared.source() {
+            ProtocolDurableStreamTransferSource::Catalog {
                 first_revision,
                 through_revision,
-            } => write!(
-                &mut value,
-                "{TRANSFER_ID_PREFIX}:c:{first_revision}:{through_revision}:{}:",
-                self.total_bytes
-            )
-            .expect("writing to String cannot fail"),
-            DurableStreamSource::Event {
+            } => DurableStreamSource::Catalog {
+                first_revision,
+                through_revision,
+            },
+            ProtocolDurableStreamTransferSource::Event {
                 conversation_id,
                 event_id,
                 event_seq,
-            } => write!(
-                &mut value,
-                "{TRANSFER_ID_PREFIX}:e:{conversation_id}:{event_id}:{event_seq}:{}:",
-                self.total_bytes
-            )
-            .expect("writing to String cannot fail"),
+            } => DurableStreamSource::Event {
+                conversation_id: RuntimeId::from_bytes(
+                    RuntimeIdKind::Conversation,
+                    conversation_id.as_bytes(),
+                )
+                .expect("shared durable identity rejects the all-zero conversation id"),
+                event_id: RuntimeId::from_bytes(RuntimeIdKind::Event, event_id.as_bytes())
+                    .expect("shared durable identity rejects the all-zero event id"),
+                event_seq,
+            },
         }
-        append_hex(&mut value, &self.total_sha256);
-        TransferId::new(value)
+    }
+
+    pub(crate) fn transfer_id(self) -> TransferId {
+        self.shared.transfer_id()
     }
 
     pub(crate) fn message_id(self) -> MessageId {
-        let transfer_id = self.transfer_id();
-        let mut hasher = Sha256::new();
-        hasher.update(MESSAGE_ID_DOMAIN);
-        hasher.update(transfer_id.as_str().as_bytes());
-        let digest: [u8; 32] = hasher.finalize().into();
-        let mut value = String::with_capacity(MESSAGE_ID_PREFIX.len() + 64);
-        value.push_str(MESSAGE_ID_PREFIX);
-        append_hex(&mut value, &digest);
-        MessageId::new(value)
+        self.shared.message_id()
     }
 
     pub(crate) fn part_count(self) -> Result<u32, DurableStreamTransferIdentityError> {
-        let total = usize::try_from(self.total_bytes)
-            .map_err(|_| DurableStreamTransferIdentityError::TooLarge)?;
-        let count = total.max(1).div_ceil(MAX_PART_BYTES);
-        let count =
-            u32::try_from(count).map_err(|_| DurableStreamTransferIdentityError::TooLarge)?;
-        if count == 0 || count > MAX_TRANSFER_PARTS {
-            Err(DurableStreamTransferIdentityError::TooLarge)
-        } else {
-            Ok(count)
-        }
+        Ok(self.shared.part_count())
     }
 
     pub(crate) fn carrier_for_part(
@@ -200,8 +187,8 @@ impl DurableStreamTransferIdentity {
         payload: &[u8],
         part_index: u32,
     ) -> Result<RuntimeTransferCarrierV1, DurableStreamTransferIdentityError> {
-        if u64::try_from(payload.len()).ok() != Some(self.total_bytes)
-            || Sha256::digest(payload).as_slice() != self.total_sha256
+        if u64::try_from(payload.len()).ok() != Some(self.shared.total_bytes())
+            || Sha256::digest(payload).as_slice() != self.shared.total_sha256()
         {
             return Err(DurableStreamTransferIdentityError::SourceMismatch);
         }
@@ -223,8 +210,8 @@ impl DurableStreamTransferIdentity {
             self.transfer_id(),
             part_index,
             part_count,
-            self.total_sha256,
-            self.total_bytes,
+            self.shared.total_sha256(),
+            self.shared.total_bytes(),
             part,
         )
         .map_err(|_| DurableStreamTransferIdentityError::InvalidPart)?;
@@ -236,12 +223,7 @@ impl DurableStreamTransferIdentity {
     }
 
     pub(crate) fn validates_carrier(self, carrier: &RuntimeTransferCarrierV1) -> bool {
-        carrier.channel == RuntimeTransferChannel::Stream
-            && carrier.message_id == self.message_id()
-            && carrier.transfer.transfer_id == self.transfer_id()
-            && carrier.transfer.total_bytes == self.total_bytes
-            && carrier.transfer.total_sha256 == self.total_sha256
-            && carrier.transfer.part_count == self.part_count().unwrap_or(0)
+        self.shared.validate_carrier(carrier).is_ok()
     }
 
     pub(crate) fn publication_id(
@@ -270,6 +252,25 @@ impl DurableStreamTransferIdentity {
         publication_id.copy_from_slice(&digest[..16]);
         publication_id[0] |= 0x80;
         Ok(publication_id)
+    }
+}
+
+fn map_protocol_identity_error(
+    error: ProtocolDurableStreamTransferIdentityError,
+) -> DurableStreamTransferIdentityError {
+    match error {
+        ProtocolDurableStreamTransferIdentityError::InvalidSource => {
+            DurableStreamTransferIdentityError::InvalidSource
+        }
+        ProtocolDurableStreamTransferIdentityError::InvalidIdentity => {
+            DurableStreamTransferIdentityError::InvalidIdentity
+        }
+        ProtocolDurableStreamTransferIdentityError::TooLarge => {
+            DurableStreamTransferIdentityError::TooLarge
+        }
+        ProtocolDurableStreamTransferIdentityError::MetadataMismatch => {
+            DurableStreamTransferIdentityError::InvalidPart
+        }
     }
 }
 
@@ -365,42 +366,6 @@ pub(crate) enum DurableStreamTransferIdentityError {
     SourceMismatch,
     #[error("durable Stream transfer part is invalid")]
     InvalidPart,
-}
-
-fn parse_u64(value: &str) -> Result<u64, DurableStreamTransferIdentityError> {
-    let parsed = value
-        .parse::<u64>()
-        .map_err(|_| DurableStreamTransferIdentityError::InvalidIdentity)?;
-    if parsed.to_string() != value {
-        return Err(DurableStreamTransferIdentityError::InvalidIdentity);
-    }
-    Ok(parsed)
-}
-
-fn parse_total_bytes(value: &str) -> Result<u64, DurableStreamTransferIdentityError> {
-    let parsed = parse_u64(value)?;
-    if parsed > MAX_TRANSFER_BYTES {
-        return Err(DurableStreamTransferIdentityError::TooLarge);
-    }
-    Ok(parsed)
-}
-
-fn parse_hex_digest(value: &str) -> Result<[u8; 32], DurableStreamTransferIdentityError> {
-    if value.len() != 64 || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        return Err(DurableStreamTransferIdentityError::InvalidIdentity);
-    }
-    let mut digest = [0_u8; 32];
-    for (index, slot) in digest.iter_mut().enumerate() {
-        let offset = index * 2;
-        *slot = u8::from_str_radix(&value[offset..offset + 2], 16)
-            .map_err(|_| DurableStreamTransferIdentityError::InvalidIdentity)?;
-    }
-    let mut canonical = String::with_capacity(64);
-    append_hex(&mut canonical, &digest);
-    if canonical != value {
-        return Err(DurableStreamTransferIdentityError::InvalidIdentity);
-    }
-    Ok(digest)
 }
 
 fn append_hex(output: &mut String, bytes: &[u8]) {
