@@ -27,15 +27,19 @@ use agentdeck_protocol::e2ee::{
     PairResponseV1, PairingControlEnvelopeV1, PairingError, SealedPayloadKind, SealedPayloadV1,
     SignedSealedBlobV1, VerifiedSealedBlobV1,
 };
-use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::{
     AuthCanonicalError, AuthenticationRole, AuthenticationTranscriptV1, CertRole, Ed25519Signature,
     RelayGrant, SignedCertificate,
 };
-use agentdeck_protocol::relay_v2::frame::{AuthProof, Authenticate, Challenge};
+use agentdeck_protocol::relay_v2::frame::{
+    AuthProof, Authenticate, Challenge, RevocationCommitted,
+};
 use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayServerId,
     RequestRouteId, StreamRouteId, TrustEpoch,
+};
+use agentdeck_protocol::relay_v2::{
+    OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, encode,
 };
 use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TurnId};
 use agentdeck_protocol::runtime::{
@@ -700,6 +704,45 @@ pub(crate) struct VerifiedDirectedReply {
     signed_blob_hash: [u8; 32],
 }
 
+/// 当前 paired capability 对 root-signed Relay terminal 完整验签后铸造的撤销证明。
+///
+/// 字段私有且类型不可由调用方构造；后续 cleanup 协调器只能消费本 token，不能接受裸
+/// `RevocationCommitted`、socket close 或普通 daemon receipt 作为删除授权。
+pub struct VerifiedRevocationTerminal {
+    canonical_bytes: Vec<u8>,
+    identity: PairedMachineIdentity,
+    device_route: DeviceRouteId,
+    grant_serial: GrantSerial,
+}
+
+impl fmt::Debug for VerifiedRevocationTerminal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedRevocationTerminal([REDACTED])")
+    }
+}
+
+impl VerifiedRevocationTerminal {
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> PairedMachineIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn device_route(&self) -> DeviceRouteId {
+        self.device_route
+    }
+
+    #[must_use]
+    pub const fn grant_serial(&self) -> GrantSerial {
+        self.grant_serial
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DirectedReplyBrand {
     machine_route: MachineRouteId,
@@ -842,6 +885,59 @@ impl OpenedPairedMachine<'_> {
     #[must_use]
     pub const fn directory_revision(&self) -> KeyDirectoryRevision {
         self.audited.directory_revision
+    }
+
+    /// 验证 active connection 或 reconnect authentication 返回的 exact root-signed
+    /// `RevocationCommitted`。本函数纯验证、零持久化 mutation；成功只铸造后续 cleanup
+    /// 可以消费的 type-state。
+    pub fn verify_revocation_terminal(
+        &self,
+        frame: &OpaqueRouteFrame,
+        canonical_bytes: &[u8],
+    ) -> Result<VerifiedRevocationTerminal, PairedPromotionError> {
+        if frame.version != RELAY_PROTOCOL_VERSION || encode(frame).as_slice() != canonical_bytes {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let RelayFrameBody::RevocationCommitted(RevocationCommitted {
+            device_route,
+            grant_serial,
+            signed_revocation,
+        }) = &frame.body
+        else {
+            return Err(PairedPromotionError::InvalidState);
+        };
+        let bootstrap = self.audited.state.bootstrap();
+        if *device_route != signed_revocation.device_route
+            || *grant_serial != signed_revocation.grant_serial
+            || signed_revocation.machine_route != self.audited.identity.machine_route
+            || signed_revocation.device_route != self.audited.device_route
+            || signed_revocation.grant_serial != self.audited.grant_serial
+            || signed_revocation.root_key_id != self.audited.grant.root_key_id
+            || signed_revocation.trust_epoch != self.audited.trust_epoch
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let root = VerifyingKey::from_bytes(&bootstrap.machine_root_pubkey)
+            .map_err(PairedPromotionError::Crypto)?;
+        if sha256(&root.to_bytes()) != bootstrap.machine_root_fingerprint {
+            return Err(PairedPromotionError::Conflict);
+        }
+        verify_tbs(
+            &root,
+            &signed_revocation.to_be_signed_v1(
+                self.audited.relay_server_id,
+                bootstrap.machine_root_fingerprint,
+            ),
+            &SignatureBytes::from(signed_revocation.signature),
+        )
+        .map_err(PairedPromotionError::Crypto)?;
+
+        Ok(VerifiedRevocationTerminal {
+            canonical_bytes: canonical_bytes.to_vec(),
+            identity: self.audited.identity,
+            device_route: self.audited.device_route,
+            grant_serial: self.audited.grant_serial,
+        })
     }
 
     /// 只暴露已逐项 DeviceHPKE 解封成功的 key 数量，不返回 raw key。

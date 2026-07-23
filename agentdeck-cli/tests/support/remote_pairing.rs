@@ -32,8 +32,8 @@ pub const INSTALLATION_ID: Uuid = Uuid::from_bytes([0x11; 16]);
 pub const MACHINE_ROUTE: MachineRouteId = MachineRouteId::from_bytes([0x21; 16]);
 pub const DEVICE_ROUTE: DeviceRouteId = DeviceRouteId::from_bytes([0x25; 16]);
 const PAIR_ROUTE: PairRouteId = PairRouteId::from_bytes([0x22; 16]);
-const RELAY_SERVER: RelayServerId = RelayServerId::from_bytes([0x23; 16]);
-const ROOT_KEY_ID: RootKeyId = RootKeyId::from_bytes([0x24; 16]);
+pub const RELAY_SERVER: RelayServerId = RelayServerId::from_bytes([0x23; 16]);
+pub const ROOT_KEY_ID: RootKeyId = RootKeyId::from_bytes([0x24; 16]);
 
 pub const KEY_DIRECTORY_REVISION: u64 = 4;
 pub const DEVICE_COMMAND_EPOCH: u64 = 5;
@@ -220,7 +220,7 @@ impl PairingFixture {
         device_sign
     }
 
-    fn root_signing_key() -> SigningKey {
+    pub fn root_signing_key() -> SigningKey {
         SigningKey::from_seed(&[0x31; 32])
     }
 
