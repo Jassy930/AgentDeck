@@ -2,4 +2,5 @@
 
 pub mod daemon;
 pub mod installation;
+pub mod remote;
 pub mod unix_transport;

@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 use crate::output::{CliError, render};
 use crate::runtime_cli;
 
+#[path = "remote/v2_synthetic.rs"]
 mod v2_synthetic;
 
 const MAX_REMOTE_INPUT_BYTES: usize = 64 * 1024;

@@ -2,7 +2,7 @@ mod client;
 mod commands;
 mod main_types;
 mod output;
-mod remote;
+mod remote_cli;
 mod runtime_cli;
 mod transport;
 
@@ -611,40 +611,42 @@ async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
             let plan = match op {
                 RemoteOp::Machine {
                     op: RemoteMachineOp::Enroll { bundle_file },
-                } => remote::RuntimeRemotePlan::machine_enroll(bundle_file)?,
+                } => remote_cli::RuntimeRemotePlan::machine_enroll(bundle_file)?,
                 RemoteOp::Machine {
                     op: RemoteMachineOp::Status,
-                } => remote::RuntimeRemotePlan::machine_status(),
+                } => remote_cli::RuntimeRemotePlan::machine_status(),
                 RemoteOp::Pairing {
                     op:
                         RemotePairingOp::Invite {
                             display_name,
                             idempotency_key,
                         },
-                } => remote::RuntimeRemotePlan::create_pair_invite(
+                } => remote_cli::RuntimeRemotePlan::create_pair_invite(
                     display_name.clone(),
                     idempotency_key.clone(),
                 )?,
                 RemoteOp::Pairing {
                     op: RemotePairingOp::Pending,
-                } => remote::RuntimeRemotePlan::pairing_pending(),
+                } => remote_cli::RuntimeRemotePlan::pairing_pending(),
                 RemoteOp::Pairing {
                     op: RemotePairingOp::Approve { pairing_id },
-                } => remote::RuntimeRemotePlan::pairing_approve(pairing_id.clone())?,
+                } => remote_cli::RuntimeRemotePlan::pairing_approve(pairing_id.clone())?,
                 RemoteOp::Pairing {
                     op: RemotePairingOp::Cancel { pairing_id },
-                } => remote::RuntimeRemotePlan::pairing_cancel(pairing_id.clone())?,
+                } => remote_cli::RuntimeRemotePlan::pairing_cancel(pairing_id.clone())?,
                 RemoteOp::Revoke {
                     device,
                     grant_serial,
-                } => remote::RuntimeRemotePlan::revoke_device(device.clone(), *grant_serial)?,
+                } => remote_cli::RuntimeRemotePlan::revoke_device(device.clone(), *grant_serial)?,
                 RemoteOp::TrustReset {
                     admin_purge_receipt_file,
-                } => remote::RuntimeRemotePlan::trust_reset(admin_purge_receipt_file.as_deref())?,
+                } => {
+                    remote_cli::RuntimeRemotePlan::trust_reset(admin_purge_receipt_file.as_deref())?
+                }
                 _ => unreachable!("legacy remote dispatch exits before Runtime dispatch"),
             };
             let client = connect_runtime(cli).await?;
-            remote::run_runtime(&client, plan, pretty).await
+            remote_cli::run_runtime(&client, plan, pretty).await
         }
     }
 }
@@ -940,14 +942,14 @@ async fn main() {
             | RemoteOp::Pairing { .. }
             | RemoteOp::Revoke { .. }
             | RemoteOp::TrustReset { .. } => None,
-            RemoteOp::Synthetic { bundle } => Some(remote::RemoteOpArg::Synthetic {
+            RemoteOp::Synthetic { bundle } => Some(remote_cli::RemoteOpArg::Synthetic {
                 bundle: bundle.clone(),
             }),
             RemoteOp::Pair {
                 legacy_secret: Some(_),
                 ..
             }
-            | RemoteOp::Smoke => Some(remote::RemoteOpArg::LegacyV1),
+            | RemoteOp::Smoke => Some(remote_cli::RemoteOpArg::LegacyV1),
             RemoteOp::Pair { .. }
             | RemoteOp::Machines { .. }
             | RemoteOp::Sessions { .. }
@@ -955,10 +957,10 @@ async fn main() {
             | RemoteOp::Send { .. }
             | RemoteOp::Approve { .. }
             | RemoteOp::Deny { .. }
-            | RemoteOp::Ping { .. } => Some(remote::RemoteOpArg::PersistentUnsupported),
+            | RemoteOp::Ping { .. } => Some(remote_cli::RemoteOpArg::PersistentUnsupported),
         };
         if let Some(arg) = arg {
-            let code = remote::run(arg, &cli.profile, cli.data_dir.as_deref()).await;
+            let code = remote_cli::run(arg, &cli.profile, cli.data_dir.as_deref()).await;
             if code == std::process::ExitCode::SUCCESS {
                 return;
             }
