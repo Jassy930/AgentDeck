@@ -45,6 +45,50 @@ pub enum PairingEvent {
     ServerRestarting(ServerRestarting),
 }
 
+/// active Relay connection 收到的严格 canonical frame 及其原始 binary payload。
+///
+/// `canonical_bytes` 直接来自 WebSocket reader；调用方验证 signed terminal 时不得用
+/// [`encode`] 重建 bytes 冒充原始 wire。Debug 始终隐藏 frame 与 payload。
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReceivedRelayFrame {
+    frame: OpaqueRouteFrame,
+    canonical_bytes: Vec<u8>,
+}
+
+impl ReceivedRelayFrame {
+    fn new(frame: OpaqueRouteFrame, canonical_bytes: Vec<u8>) -> Self {
+        Self {
+            frame,
+            canonical_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn frame(&self) -> &OpaqueRouteFrame {
+        &self.frame
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (OpaqueRouteFrame, Vec<u8>) {
+        (self.frame, self.canonical_bytes)
+    }
+
+    fn into_frame(self) -> OpaqueRouteFrame {
+        self.frame
+    }
+}
+
+impl std::fmt::Debug for ReceivedRelayFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReceivedRelayFrame([REDACTED])")
+    }
+}
+
 impl std::fmt::Debug for PairingEvent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -76,7 +120,7 @@ struct Outbound {
 }
 
 struct Inbound {
-    frame: OpaqueRouteFrame,
+    received: ReceivedRelayFrame,
     _budget: OwnedSemaphorePermit,
 }
 
@@ -84,7 +128,7 @@ struct ActiveConnection {
     data_tx: mpsc::Sender<Outbound>,
     outbound_budget: Arc<Semaphore>,
     inbound_rx: mpsc::Receiver<Inbound>,
-    urgent_rx: mpsc::Receiver<OpaqueRouteFrame>,
+    urgent_rx: mpsc::Receiver<ReceivedRelayFrame>,
     status_tx: watch::Sender<Option<RelayClientError>>,
     status_rx: watch::Receiver<Option<RelayClientError>>,
     cancel: CancellationToken,
@@ -161,13 +205,13 @@ impl ActiveConnection {
         await_flush(flushed, IO_TIMEOUT, &self.status_tx, &self.cancel).await
     }
 
-    async fn recv(&mut self) -> Result<Option<OpaqueRouteFrame>, RelayClientError> {
+    async fn recv_exact(&mut self) -> Result<Option<ReceivedRelayFrame>, RelayClientError> {
         loop {
-            if let Ok(frame) = self.urgent_rx.try_recv() {
-                return Ok(Some(frame));
+            if let Ok(received) = self.urgent_rx.try_recv() {
+                return Ok(Some(received));
             }
             if let Ok(inbound) = self.inbound_rx.try_recv() {
-                return Ok(Some(inbound.frame));
+                return Ok(Some(inbound.received));
             }
             if let Some(error) = self.status_rx.borrow().clone() {
                 return Err(error);
@@ -175,10 +219,10 @@ impl ActiveConnection {
             tokio::select! {
                 biased;
                 urgent = self.urgent_rx.recv() => {
-                    if let Some(frame) = urgent { return Ok(Some(frame)); }
+                    if let Some(received) = urgent { return Ok(Some(received)); }
                 }
                 inbound = self.inbound_rx.recv() => {
-                    if let Some(inbound) = inbound { return Ok(Some(inbound.frame)); }
+                    if let Some(inbound) = inbound { return Ok(Some(inbound.received)); }
                 }
                 changed = self.status_rx.changed() => {
                     if changed.is_err() && self.inbound_rx.is_closed() && self.urgent_rx.is_closed() {
@@ -187,6 +231,12 @@ impl ActiveConnection {
                 }
             }
         }
+    }
+
+    async fn recv(&mut self) -> Result<Option<OpaqueRouteFrame>, RelayClientError> {
+        self.recv_exact()
+            .await
+            .map(|received| received.map(ReceivedRelayFrame::into_frame))
     }
 
     async fn shutdown(&mut self) {
@@ -303,7 +353,7 @@ async fn reader_loop(
     outbound_budget: Arc<Semaphore>,
     inbound_tx: mpsc::Sender<Inbound>,
     inbound_budget: Arc<Semaphore>,
-    urgent_tx: mpsc::Sender<OpaqueRouteFrame>,
+    urgent_tx: mpsc::Sender<ReceivedRelayFrame>,
     status: watch::Sender<Option<RelayClientError>>,
     cancel: CancellationToken,
 ) {
@@ -336,8 +386,9 @@ async fn reader_loop(
                     }
                     continue;
                 }
-                if is_urgent(&frame) {
-                    if urgent_tx.try_send(frame).is_err() {
+                let received = ReceivedRelayFrame::new(frame, bytes.to_vec());
+                if is_urgent(received.frame()) {
+                    if urgent_tx.try_send(received).is_err() {
                         break Some(RelayClientError::new("relay.client.lagged"));
                     }
                     continue;
@@ -349,7 +400,7 @@ async fn reader_loop(
                     };
                 if inbound_tx
                     .try_send(Inbound {
-                        frame,
+                        received,
                         _budget: budget,
                     })
                     .is_err()
@@ -563,10 +614,20 @@ impl RelayClient {
     }
 
     pub async fn recv(&mut self) -> Result<Option<OpaqueRouteFrame>, RelayClientError> {
+        self.recv_exact()
+            .await
+            .map(|received| received.map(ReceivedRelayFrame::into_frame))
+    }
+
+    /// 接收 active connection 的 frame 与 WebSocket reader 原始 canonical binary bytes。
+    ///
+    /// signed revocation/retirement terminal 的验证与持久化必须使用本方法返回的 bytes；
+    /// 兼容接口 [`Self::recv`] 仅适合不需要 exact wire 证明的调用方。
+    pub async fn recv_exact(&mut self) -> Result<Option<ReceivedRelayFrame>, RelayClientError> {
         self.connection
             .as_mut()
             .ok_or_else(|| RelayClientError::new("relay.client.not_connected"))?
-            .recv()
+            .recv_exact()
             .await
     }
 
@@ -783,6 +844,11 @@ fn handshake_markers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentdeck_protocol::relay_v2::auth::{DeviceRevocation, Ed25519Signature};
+    use agentdeck_protocol::relay_v2::frame::RevocationCommitted;
+    use agentdeck_protocol::relay_v2::id::{
+        DeviceRouteId, GrantSerial, MachineRouteId, RootKeyId, TrustEpoch,
+    };
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
@@ -982,6 +1048,78 @@ mod tests {
         assert!(connection.reader_task.is_none());
         assert!(connection.writer_task.is_none());
         assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_receive_keeps_bytes_and_prioritizes_revocation_terminal() {
+        let normal = hello();
+        let normal_bytes = encode(&normal);
+        let revocation = DeviceRevocation {
+            machine_route: MachineRouteId::from_bytes([0x91; 16]),
+            device_route: DeviceRouteId::from_bytes([0x92; 16]),
+            grant_serial: GrantSerial::new(93),
+            root_key_id: RootKeyId::from_bytes([0x94; 16]),
+            trust_epoch: TrustEpoch::new(95),
+            signature: Ed25519Signature([0x96; 64]),
+        };
+        let urgent = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::RevocationCommitted(RevocationCommitted {
+                device_route: revocation.device_route,
+                grant_serial: revocation.grant_serial,
+                signed_revocation: revocation,
+            }),
+        };
+        let urgent_bytes = encode(&urgent);
+        assert!(!is_urgent(&normal));
+        assert!(is_urgent(&urgent));
+
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (urgent_tx, urgent_rx) = mpsc::channel(1);
+        let (status_tx, status_rx) = watch::channel(None);
+        let inbound_budget = Arc::new(Semaphore::new(MAX_FRAME_BYTES));
+        inbound_tx
+            .send(Inbound {
+                received: ReceivedRelayFrame::new(normal.clone(), normal_bytes.clone()),
+                _budget: reserve_bytes(&inbound_budget, normal_bytes.len(), "relay.client.lagged")
+                    .expect("normal inbound budget"),
+            })
+            .await
+            .expect("queue normal frame");
+        urgent_tx
+            .send(ReceivedRelayFrame::new(
+                urgent.clone(),
+                urgent_bytes.clone(),
+            ))
+            .await
+            .expect("queue urgent frame");
+        let mut connection = ActiveConnection {
+            data_tx,
+            outbound_budget: Arc::new(Semaphore::new(1)),
+            inbound_rx,
+            urgent_rx,
+            status_tx,
+            status_rx,
+            cancel: CancellationToken::new(),
+            reader_task: None,
+            writer_task: None,
+        };
+
+        let first = connection
+            .recv_exact()
+            .await
+            .expect("receive urgent")
+            .expect("urgent frame");
+        assert_eq!(first.frame(), &urgent);
+        assert_eq!(first.canonical_bytes(), urgent_bytes.as_slice());
+        let second = connection
+            .recv_exact()
+            .await
+            .expect("receive normal")
+            .expect("normal frame");
+        assert_eq!(second.frame(), &normal);
+        assert_eq!(second.canonical_bytes(), normal_bytes.as_slice());
     }
 
     #[test]

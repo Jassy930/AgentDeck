@@ -6,6 +6,6 @@
 pub mod v2;
 
 pub use v2::{
-    EnrollmentClientConfig, LinkAuthenticator, PairingEvent, RelayClient, RelayClientConfig,
-    RelayClientError, RelayEnrollmentClient, RelayPairingClient, RelayTlsPolicy,
+    EnrollmentClientConfig, LinkAuthenticator, PairingEvent, ReceivedRelayFrame, RelayClient,
+    RelayClientConfig, RelayClientError, RelayEnrollmentClient, RelayPairingClient, RelayTlsPolicy,
 };

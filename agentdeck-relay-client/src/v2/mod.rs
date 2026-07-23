@@ -13,7 +13,9 @@ use agentdeck_protocol::relay_v2::{OpaqueRouteFrame, RelayServerId};
 use async_trait::async_trait;
 use url::Url;
 
-pub use connection::{PairingEvent, RelayClient, RelayEnrollmentClient, RelayPairingClient};
+pub use connection::{
+    PairingEvent, ReceivedRelayFrame, RelayClient, RelayEnrollmentClient, RelayPairingClient,
+};
 pub use tls::RelayTlsPolicy;
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

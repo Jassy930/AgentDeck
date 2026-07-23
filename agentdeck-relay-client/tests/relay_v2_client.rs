@@ -2,17 +2,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agentdeck_protocol::relay_v2::auth::{CertRole, PublicKeyBytes};
+use agentdeck_protocol::relay_v2::auth::{CertRole, DeviceRevocation, PublicKeyBytes};
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, AuthProof, Authenticate, Authenticated, Challenge, ClosePairRoute, Hello,
     OpenPairRoute, PairData, PairRouteCloseOutcome, PairRouteClosed, Ping, Pong,
-    RetirementCommitted, RouteAccepted, SealedBlob,
+    RetirementCommitted, RevocationCommitted, RouteAccepted, SealedBlob,
 };
 use agentdeck_protocol::relay_v2::{
-    ConnectionInstanceId, Ed25519Signature, EnrollmentCode, LinkGeneration, MAX_FRAME_BYTES,
-    MachineEnrollmentRequestV1, MachineEnrollmentResponseV1, MachineRouteId, OpaqueRouteFrame,
-    PairRouteId, PairingHello, RELAY_PROTOCOL_VERSION, RelayFrameBody, RelayServerId, RootKeyId,
-    SignedCertificate, TrustEpoch, decode, encode, enrollment_receipt_hash,
+    ConnectionInstanceId, DeviceRouteId, Ed25519Signature, EnrollmentCode, GrantSerial,
+    LinkGeneration, MAX_FRAME_BYTES, MachineEnrollmentRequestV1, MachineEnrollmentResponseV1,
+    MachineRouteId, OpaqueRouteFrame, PairRouteId, PairingHello, RELAY_PROTOCOL_VERSION,
+    RelayFrameBody, RelayServerId, RootKeyId, SignedCertificate, TrustEpoch, decode, encode,
+    enrollment_receipt_hash,
 };
 use agentdeck_relay_client::{
     EnrollmentClientConfig, LinkAuthenticator, PairingEvent, RelayClient, RelayClientConfig,
@@ -434,6 +435,82 @@ async fn principal_sends_frozen_codec_bytes_without_reencoding() {
         .expect("frozen-wire server completion")
         .expect("frozen-wire server task");
     client.shutdown().await;
+}
+
+#[tokio::test]
+async fn active_receive_preserves_exact_normal_and_revocation_terminal_bytes() {
+    let identity = test_identity();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind exact-receive mock");
+    let port = listener.local_addr().expect("exact-receive address").port();
+    let acceptor = TlsAcceptor::from(Arc::clone(&identity.server_config));
+    let normal = wire(RelayFrameBody::RouteAccepted(RouteAccepted {
+        accepted: AcceptedRef::PairFrame {
+            pair_route: PairRouteId::from_bytes([0x71; 16]),
+        },
+    }));
+    let normal_bytes = encode(&normal);
+    let revocation = DeviceRevocation {
+        machine_route: MachineRouteId::from_bytes([0x72; 16]),
+        device_route: DeviceRouteId::from_bytes([0x73; 16]),
+        grant_serial: GrantSerial::new(74),
+        root_key_id: RootKeyId::from_bytes([0x75; 16]),
+        trust_epoch: TrustEpoch::new(76),
+        signature: Ed25519Signature([0x77; 64]),
+    };
+    let urgent = wire(RelayFrameBody::RevocationCommitted(RevocationCommitted {
+        device_route: revocation.device_route,
+        grant_serial: revocation.grant_serial,
+        signed_revocation: revocation,
+    }));
+    let urgent_bytes = encode(&urgent);
+    let server_normal = normal_bytes.clone();
+    let server_urgent = urgent_bytes.clone();
+    let (send_urgent, receive_urgent) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_tls_ws(&listener, &acceptor).await;
+        authenticate_principal(&mut socket, 0x78).await;
+        socket
+            .send(Message::Binary(server_normal.into()))
+            .await
+            .expect("send exact normal frame");
+        receive_urgent.await.expect("release urgent frame");
+        socket
+            .send(Message::Binary(server_urgent.into()))
+            .await
+            .expect("send exact revocation terminal");
+    });
+
+    let policy = RelayTlsPolicy::pinned_spki(vec![identity.spki_pin]).expect("exact-receive pin");
+    let mut client = RelayClient::connect(
+        client_config(port, policy),
+        Arc::new(TestAuthenticator::default()),
+    )
+    .await
+    .expect("connect exact-receive principal");
+
+    let received_normal = client
+        .recv_exact()
+        .await
+        .expect("receive exact normal frame")
+        .expect("normal frame");
+    assert_eq!(received_normal.frame(), &normal);
+    assert_eq!(received_normal.canonical_bytes(), normal_bytes.as_slice());
+
+    send_urgent.send(()).expect("release urgent frame");
+    let received_urgent = client
+        .recv_exact()
+        .await
+        .expect("receive exact urgent frame")
+        .expect("urgent frame");
+    assert_eq!(received_urgent.frame(), &urgent);
+    assert_eq!(received_urgent.canonical_bytes(), urgent_bytes.as_slice());
+
+    tokio::time::timeout(TEST_TIMEOUT, server)
+        .await
+        .expect("exact-receive server completion")
+        .expect("exact-receive server task");
 }
 
 #[tokio::test]
