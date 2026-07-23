@@ -31,6 +31,7 @@ use super::{
 const APPLICATION_QUEUE_FRAMES: usize = 512;
 const APPLICATION_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const URGENT_QUEUE_FRAMES: usize = 4;
+const URGENT_QUEUE_BYTES: usize = MAX_FRAME_BYTES * 2;
 const OUTBOUND_DATA_FRAMES: usize = 4;
 const OUTBOUND_CONTROL_FRAMES: usize = 8;
 const OUTBOUND_DATA_BYTES: usize = 15 * 1024 * 1024;
@@ -49,7 +50,7 @@ pub enum PairingEvent {
 ///
 /// `canonical_bytes` 直接来自 WebSocket reader；调用方验证 signed terminal 时不得用
 /// [`encode`] 重建 bytes 冒充原始 wire。Debug 始终隐藏 frame 与 payload。
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct ReceivedRelayFrame {
     frame: OpaqueRouteFrame,
     canonical_bytes: Vec<u8>,
@@ -119,7 +120,7 @@ struct Outbound {
     completion: Option<oneshot::Sender<Result<(), RelayClientError>>>,
 }
 
-struct Inbound {
+struct QueuedInbound {
     received: ReceivedRelayFrame,
     _budget: OwnedSemaphorePermit,
 }
@@ -127,8 +128,8 @@ struct Inbound {
 struct ActiveConnection {
     data_tx: mpsc::Sender<Outbound>,
     outbound_budget: Arc<Semaphore>,
-    inbound_rx: mpsc::Receiver<Inbound>,
-    urgent_rx: mpsc::Receiver<ReceivedRelayFrame>,
+    inbound_rx: mpsc::Receiver<QueuedInbound>,
+    urgent_rx: mpsc::Receiver<QueuedInbound>,
     status_tx: watch::Sender<Option<RelayClientError>>,
     status_rx: watch::Receiver<Option<RelayClientError>>,
     cancel: CancellationToken,
@@ -147,6 +148,7 @@ impl ActiveConnection {
         let outbound_budget = Arc::new(Semaphore::new(OUTBOUND_DATA_BYTES));
         let control_budget = Arc::new(Semaphore::new(OUTBOUND_CONTROL_BYTES));
         let inbound_budget = Arc::new(Semaphore::new(APPLICATION_QUEUE_BYTES));
+        let urgent_budget = Arc::new(Semaphore::new(URGENT_QUEUE_BYTES));
         let cancel = CancellationToken::new();
         let writer_task = tokio::spawn(writer_loop(
             sink,
@@ -162,6 +164,7 @@ impl ActiveConnection {
             inbound_tx,
             inbound_budget,
             urgent_tx,
+            urgent_budget,
             status_tx.clone(),
             cancel.clone(),
         ));
@@ -207,8 +210,8 @@ impl ActiveConnection {
 
     async fn recv_exact(&mut self) -> Result<Option<ReceivedRelayFrame>, RelayClientError> {
         loop {
-            if let Ok(received) = self.urgent_rx.try_recv() {
-                return Ok(Some(received));
+            if let Ok(urgent) = self.urgent_rx.try_recv() {
+                return Ok(Some(urgent.received));
             }
             if let Ok(inbound) = self.inbound_rx.try_recv() {
                 return Ok(Some(inbound.received));
@@ -219,7 +222,7 @@ impl ActiveConnection {
             tokio::select! {
                 biased;
                 urgent = self.urgent_rx.recv() => {
-                    if let Some(received) = urgent { return Ok(Some(received)); }
+                    if let Some(urgent) = urgent { return Ok(Some(urgent.received)); }
                 }
                 inbound = self.inbound_rx.recv() => {
                     if let Some(inbound) = inbound { return Ok(Some(inbound.received)); }
@@ -302,6 +305,16 @@ fn reserve_bytes(
         .map_err(|_| RelayClientError::new(code))
 }
 
+fn reserve_received_payload(
+    budget: &Arc<Semaphore>,
+    raw_bytes: usize,
+) -> Result<OwnedSemaphorePermit, RelayClientError> {
+    let retained_bytes = raw_bytes
+        .checked_mul(2)
+        .ok_or_else(|| RelayClientError::new("relay.client.lagged"))?;
+    reserve_bytes(budget, retained_bytes, "relay.client.lagged")
+}
+
 async fn writer_loop<S>(
     mut sink: S,
     mut control_rx: mpsc::Receiver<Outbound>,
@@ -351,9 +364,10 @@ async fn reader_loop(
     mut stream: futures_util::stream::SplitStream<Socket>,
     control_tx: mpsc::Sender<Outbound>,
     outbound_budget: Arc<Semaphore>,
-    inbound_tx: mpsc::Sender<Inbound>,
+    inbound_tx: mpsc::Sender<QueuedInbound>,
     inbound_budget: Arc<Semaphore>,
-    urgent_tx: mpsc::Sender<ReceivedRelayFrame>,
+    urgent_tx: mpsc::Sender<QueuedInbound>,
+    urgent_budget: Arc<Semaphore>,
     status: watch::Sender<Option<RelayClientError>>,
     cancel: CancellationToken,
 ) {
@@ -386,21 +400,29 @@ async fn reader_loop(
                     }
                     continue;
                 }
-                let received = ReceivedRelayFrame::new(frame, bytes.to_vec());
-                if is_urgent(received.frame()) {
-                    if urgent_tx.try_send(received).is_err() {
+                if is_urgent(&frame) {
+                    let budget = match reserve_received_payload(&urgent_budget, bytes.len()) {
+                        Ok(budget) => budget,
+                        Err(error) => break Some(error),
+                    };
+                    if urgent_tx
+                        .try_send(QueuedInbound {
+                            received: ReceivedRelayFrame::new(frame, bytes.to_vec()),
+                            _budget: budget,
+                        })
+                        .is_err()
+                    {
                         break Some(RelayClientError::new("relay.client.lagged"));
                     }
                     continue;
                 }
-                let budget =
-                    match reserve_bytes(&inbound_budget, bytes.len(), "relay.client.lagged") {
-                        Ok(budget) => budget,
-                        Err(error) => break Some(error),
-                    };
+                let budget = match reserve_received_payload(&inbound_budget, bytes.len()) {
+                    Ok(budget) => budget,
+                    Err(error) => break Some(error),
+                };
                 if inbound_tx
-                    .try_send(Inbound {
-                        received,
+                    .try_send(QueuedInbound {
+                        received: ReceivedRelayFrame::new(frame, bytes.to_vec()),
                         _budget: budget,
                     })
                     .is_err()
@@ -901,6 +923,37 @@ mod tests {
             .expect("heartbeat control reserve survives full data budget");
     }
 
+    #[test]
+    fn received_payload_budget_counts_raw_and_decoded_with_checked_bounds() {
+        let budget = Arc::new(Semaphore::new(10));
+        let permit = reserve_received_payload(&budget, 5)
+            .expect("five raw bytes retain five raw plus five decoded bytes");
+        assert_eq!(permit.num_permits(), 10);
+        assert_eq!(budget.available_permits(), 0);
+        assert_eq!(
+            reserve_received_payload(&budget, 1)
+                .expect_err("exhausted retained budget must fail")
+                .code(),
+            "relay.client.lagged"
+        );
+
+        drop(permit);
+        assert_eq!(budget.available_permits(), 10);
+        assert_eq!(
+            reserve_received_payload(&budget, 6)
+                .expect_err("decoded plus raw payload above the byte cap must fail")
+                .code(),
+            "relay.client.lagged"
+        );
+        assert_eq!(
+            reserve_received_payload(&budget, usize::MAX)
+                .expect_err("retained byte multiplication must reject overflow")
+                .code(),
+            "relay.client.lagged"
+        );
+        assert_eq!(budget.available_permits(), 10);
+    }
+
     #[tokio::test]
     async fn send_timeout_is_outcome_unknown_and_cancels_the_generation() {
         let (_completion, flushed) = oneshot::channel::<Result<(), RelayClientError>>();
@@ -1078,22 +1131,34 @@ mod tests {
         let (inbound_tx, inbound_rx) = mpsc::channel(1);
         let (urgent_tx, urgent_rx) = mpsc::channel(1);
         let (status_tx, status_rx) = watch::channel(None);
-        let inbound_budget = Arc::new(Semaphore::new(MAX_FRAME_BYTES));
+        let normal_retained_bytes = normal_bytes
+            .len()
+            .checked_mul(2)
+            .expect("small normal frame retained bytes");
+        let urgent_retained_bytes = urgent_bytes
+            .len()
+            .checked_mul(2)
+            .expect("small urgent frame retained bytes");
+        let inbound_budget = Arc::new(Semaphore::new(normal_retained_bytes));
+        let urgent_budget = Arc::new(Semaphore::new(urgent_retained_bytes));
         inbound_tx
-            .send(Inbound {
+            .send(QueuedInbound {
                 received: ReceivedRelayFrame::new(normal.clone(), normal_bytes.clone()),
-                _budget: reserve_bytes(&inbound_budget, normal_bytes.len(), "relay.client.lagged")
+                _budget: reserve_received_payload(&inbound_budget, normal_bytes.len())
                     .expect("normal inbound budget"),
             })
             .await
             .expect("queue normal frame");
         urgent_tx
-            .send(ReceivedRelayFrame::new(
-                urgent.clone(),
-                urgent_bytes.clone(),
-            ))
+            .send(QueuedInbound {
+                received: ReceivedRelayFrame::new(urgent.clone(), urgent_bytes.clone()),
+                _budget: reserve_received_payload(&urgent_budget, urgent_bytes.len())
+                    .expect("urgent inbound budget"),
+            })
             .await
             .expect("queue urgent frame");
+        assert_eq!(inbound_budget.available_permits(), 0);
+        assert_eq!(urgent_budget.available_permits(), 0);
         let mut connection = ActiveConnection {
             data_tx,
             outbound_budget: Arc::new(Semaphore::new(1)),
@@ -1113,6 +1178,8 @@ mod tests {
             .expect("urgent frame");
         assert_eq!(first.frame(), &urgent);
         assert_eq!(first.canonical_bytes(), urgent_bytes.as_slice());
+        assert_eq!(urgent_budget.available_permits(), urgent_retained_bytes);
+        assert_eq!(inbound_budget.available_permits(), 0);
         let second = connection
             .recv_exact()
             .await
@@ -1120,6 +1187,16 @@ mod tests {
             .expect("normal frame");
         assert_eq!(second.frame(), &normal);
         assert_eq!(second.canonical_bytes(), normal_bytes.as_slice());
+        assert_eq!(inbound_budget.available_permits(), normal_retained_bytes);
+    }
+
+    #[test]
+    fn received_frame_debug_redacts_decoded_and_raw_payloads() {
+        let received = ReceivedRelayFrame::new(hello(), b"raw-wire-secret".to_vec());
+        let rendered = format!("{received:?}");
+        assert_eq!(rendered, "ReceivedRelayFrame([REDACTED])");
+        assert!(!rendered.contains("raw-wire-secret"));
+        assert!(!rendered.contains("Hello"));
     }
 
     #[test]
