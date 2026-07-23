@@ -1,5 +1,10 @@
 # Rich Response Rendering Implementation Plan
 
+> 状态说明：本计划的 SwiftUI/Textual 路线已被 2026-06-29 AppKit 重写取代；
+> 当前富文本主路径与表格实施边界分别见
+> `2026-06-29-appkit-frontend-design.md` 和
+> `2026-07-23-native-markdown-table-rendering-implementation.md`。
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** 让 AgentDeck 用 Textual 原生渲染 Codex Markdown 回复，并重点强化代码块、diff 和表格体验。

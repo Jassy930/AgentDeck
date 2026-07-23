@@ -123,7 +123,7 @@ NSWindow
 - 输入 markdown 文本 → `NSAttributedString`，喂给复用的 NSTextView。
 - 底座：`NSAttributedString(markdown:options:)`（inline 强调 / 段落 / 列表 / 链接 / 行内与块代码）+ 自定义段落样式、字体、颜色以匹配现有视觉；代码用等宽 + 背景；链接可点。
 - 流式：`StreamingTextBuffer` 累积文本 → builder 重算 attributed string → NSTextView 替换（沿用现有 append/replace 节奏）。
-- 取舍：markdown 表现力以系统 `NSAttributedString(markdown:)` 能力为界；高级语法（如表格）需自定义渲染或降级为纯文本，本轮**降级为纯文本**并在 builder 内集中处理（避免散落）。
+- 初始取舍：高级语法统一在 builder 内集中处理，表格曾降级为纯文本。2026-07-23 起由轻量 GFM 预解析器生成 `NSTextTable` / `NSTextTableBlock`，继续复用同一份 attributed string 做绘制、选择和行高测量；不完整表格仍安全降级为原文。实施与验收见 `2026-07-23-native-markdown-table-rendering-implementation.md`。
 
 ## Observation → AppKit 绑定
 
@@ -170,7 +170,7 @@ scripts/verify-agent-docs.sh
 - `swift build` / `swift test` 通过；模型层测试零改动通过。
 - 现有用户可见功能在 AppKit 版逐项可用（对照 spec 的功能清单手动核验）。
 - 会话流在长 transcript 下保持流畅（虚拟化生效：仅可见行有 cell/NSTextView）。
-- markdown 消息渲染视觉与现状基本一致；高级语法降级为纯文本不报错。
+- markdown 消息渲染视觉与现状基本一致；GFM 表格按 2026-07-23 后续切片原生渲染，其余未支持高级语法降级为纯文本且不报错。
 - Swift↔契约一致性测试存在并通过；故意改坏 schema 时该测试失败。
 - headless `--selfcheck` / `--diagnostics-report` 仍可跑。
 

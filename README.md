@@ -92,6 +92,11 @@ message / reasoning / shell / diff 长文本交给 AppKit `NSTextView` +
 `NSTextStorage` 增量追加；会话流由虚拟化 NSTableView 按需渲染可见行，
 避免在 token 流中反复布局整个视图树。
 
+会话正文的 Markdown 由原生 TextKit 渲染，支持标题、列表、引用、链接、
+行内/块代码和 GFM 表格。表格使用 `NSTextTable` 在会话宽度内自动分栏与换行，
+保留表头样式、分隔行声明的左/中/右对齐以及单元格内的 inline Markdown；
+流式阶段尚未形成合法表头与分隔行时继续显示可读原文，不会吞掉半截内容。
+
 ## 历史会话（跨 agent）
 
 v0.2 起历史侧栏聚合 **Codex + Claude Code** 两家历史 thread，左侧不区分

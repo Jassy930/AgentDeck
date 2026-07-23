@@ -160,6 +160,7 @@ final class StreamingTextCoreTests: XCTestCase {
         let cases: [(text: String, style: MarkdownStyle)] = [
             ("中文第一行\n中文第二行包含 **重点**", .standard),
             ("English first line\nEnglish second line with **emphasis**", .standard),
+            ("| 项目 | 占用 |\n| --- | ---: |\n| APFS 数据卷 | 847 GiB / 926 GiB |", .standard),
             ("先梳理依赖\n再执行修复", .reasoning),
             ("Inspect dependencies\nThen implement the fix", .reasoning),
         ]

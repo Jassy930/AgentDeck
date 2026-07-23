@@ -25,6 +25,10 @@
 - `plans/2026-07-03-ios-uikit-frontend-design.md`：iOS UIKit companion 前端设计（fixture 驱动，R3 界面骨架，状态：Implemented）。
 - `plans/2026-07-03-ios-uikit-frontend-implementation.md`：iOS UIKit companion 前端实施计划（Task 1–15，含 AgentDeckCore 共享库抽取）。
 
+### macOS 富文本渲染（2026-07-23）
+
+- `plans/2026-07-23-native-markdown-table-rendering-implementation.md`：在现有 TextKit/NSAttributedString 管线中增加 GFM 表格识别、`NSTextTable` 原生布局、流式降级与像素快照门禁。
+
 ### Relay R0 契约 spike（2026-07-07）
 
 - `plans/2026-07-07-relay-r0-contract-spike-design.md`：Relay R0 契约 spike 设计（控制面/数据面分层、fleet 协议、内存 FakeRelay + 真实 daemon 组合、CLI remote 接口基线）。

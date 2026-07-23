@@ -135,10 +135,108 @@ final class MarkdownAttributedStringBuilderTests: XCTestCase {
         XCTAssertNotNil(s.attribute(.agentDeckCodeBlock, at: 0, effectiveRange: nil))
     }
 
-    func testUnsupportedTableDowngradesToPlainTextWithoutCrash() {
-        let table = "| a | b |\n|---|---|\n| 1 | 2 |"
-        let s = MarkdownAttributedStringBuilder.attributedString(from: table)
-        XCTAssertFalse(s.string.isEmpty, "表格降级为纯文本，不应为空或崩溃")
+    func testGFMTableUsesNativeTextTableBlocksAndDropsSyntaxRows() throws {
+        let markdown = """
+        | 项目 | 占用 |
+        | :--- | ---: |
+        | APFS 数据卷 | **847 GiB** / 926 GiB |
+        | 可用空间 | 约 41 GiB |
+        """
+        let s = MarkdownAttributedStringBuilder.attributedString(from: markdown)
+
+        XCTAssertEqual(
+            s.string,
+            "项目\n占用\nAPFS 数据卷\n847 GiB / 926 GiB\n可用空间\n约 41 GiB"
+        )
+        XCTAssertFalse(s.string.contains("---"), "表格分隔行不应作为正文显示")
+        XCTAssertFalse(s.string.contains("|"), "结构管道符不应作为正文显示")
+
+        let headerProject = try tableBlock(in: s, substring: "项目")
+        let headerUsage = try tableBlock(in: s, substring: "占用")
+        let volume = try tableBlock(in: s, substring: "APFS 数据卷")
+        let available = try tableBlock(in: s, substring: "可用空间")
+        XCTAssertTrue(headerProject.table === headerUsage.table)
+        XCTAssertTrue(headerProject.table === volume.table)
+        XCTAssertEqual(headerProject.table.numberOfColumns, 2)
+        XCTAssertEqual(headerProject.startingRow, 0)
+        XCTAssertEqual(headerProject.startingColumn, 0)
+        XCTAssertEqual(headerUsage.startingRow, 0)
+        XCTAssertEqual(headerUsage.startingColumn, 1)
+        XCTAssertEqual(volume.startingRow, 1)
+        XCTAssertEqual(volume.startingColumn, 0)
+        XCTAssertEqual(available.startingRow, 2)
+        XCTAssertEqual(available.startingColumn, 0)
+        XCTAssertTrue(headerProject.backgroundColor?.isEqual(DesignTokens.surface2) == true)
+        XCTAssertNil(volume.backgroundColor)
+
+        let headerFont = try font(in: s, substring: "项目")
+        let emphasizedFont = try font(in: s, substring: "847 GiB")
+        XCTAssertTrue(headerFont.fontDescriptor.symbolicTraits.contains(.bold))
+        XCTAssertTrue(emphasizedFont.fontDescriptor.symbolicTraits.contains(.bold))
+
+        XCTAssertEqual(try paragraphStyle(in: s, substring: "项目").alignment, .left)
+        XCTAssertEqual(try paragraphStyle(in: s, substring: "占用").alignment, .right)
+        XCTAssertEqual(try paragraphStyle(in: s, substring: "约 41 GiB").alignment, .right)
+    }
+
+    func testGFMTablePreservesInlineCodeEscapedPipesAndCenteredColumns() throws {
+        let markdown = """
+        | 路径 | 状态 |
+        | --- | :---: |
+        | ngoro\\|glm 与 `cache|path` | [正常](https://example.com) |
+        """
+        let s = MarkdownAttributedStringBuilder.attributedString(from: markdown)
+
+        XCTAssertEqual(s.string, "路径\n状态\nngoro|glm 与 cache|path\n正常")
+        let codeRange = (s.string as NSString).range(of: "cache|path")
+        XCTAssertNotNil(s.attribute(.agentDeckInlineCode, at: codeRange.location, effectiveRange: nil))
+        let linkRange = (s.string as NSString).range(of: "正常")
+        XCTAssertNotNil(s.attribute(.link, at: linkRange.location, effectiveRange: nil))
+        XCTAssertEqual(try paragraphStyle(in: s, substring: "正常").alignment, .center)
+    }
+
+    func testIncompleteOrMismatchedTableRemainsReadablePlainText() {
+        let incomplete = MarkdownAttributedStringBuilder.attributedString(
+            from: "| 项目 | 占用 |\n| --- |"
+        )
+        XCTAssertEqual(incomplete.string, "| 项目 | 占用 |\n| --- |")
+
+        let missingDelimiter = MarkdownAttributedStringBuilder.attributedString(
+            from: "| 项目 | 占用 |\n| APFS | 847 GiB |"
+        )
+        XCTAssertEqual(missingDelimiter.string, "| 项目 | 占用 |\n| APFS | 847 GiB |")
+    }
+
+    func testTableStopsBeforeFollowingMarkdownBlocks() throws {
+        let markdown = """
+        | 项目 | 占用 |
+        | --- | --- |
+        | APFS | 847 GiB |
+
+        **结论**：空间偏紧。
+        """
+        let s = MarkdownAttributedStringBuilder.attributedString(from: markdown)
+
+        XCTAssertEqual(s.string, "项目\n占用\nAPFS\n847 GiB\n结论：空间偏紧。")
+        XCTAssertNotNil(try tableBlock(in: s, substring: "APFS"))
+        let conclusion = (s.string as NSString).range(of: "结论")
+        XCTAssertNil(s.attribute(.paragraphStyle, at: conclusion.location, effectiveRange: nil)
+            .flatMap { ($0 as? NSParagraphStyle)?.textBlocks.first })
+    }
+
+    func testTablePadsMissingCellsAndKeepsEmptyFinalCell() throws {
+        let s = MarkdownAttributedStringBuilder.attributedString(
+            from: "| 第一列 | 第二列 |\n| --- | --- |\n| 只有一个值 |"
+        )
+
+        XCTAssertEqual(s.string, "第一列\n第二列\n只有一个值\n\n")
+        let paragraph = try XCTUnwrap(
+            s.attribute(.paragraphStyle, at: s.length - 1, effectiveRange: nil)
+                as? NSParagraphStyle
+        )
+        let block = try XCTUnwrap(paragraph.textBlocks.first as? NSTextTableBlock)
+        XCTAssertEqual(block.startingRow, 1)
+        XCTAssertEqual(block.startingColumn, 1)
     }
 
     func testEmptyStringYieldsEmpty() {
@@ -154,6 +252,25 @@ final class MarkdownAttributedStringBuilderTests: XCTestCase {
         return try XCTUnwrap(
             attributed.attribute(.paragraphStyle, at: range.location, effectiveRange: nil)
                 as? NSParagraphStyle
+        )
+    }
+
+    private func tableBlock(
+        in attributed: NSAttributedString,
+        substring: String
+    ) throws -> NSTextTableBlock {
+        let paragraph = try paragraphStyle(in: attributed, substring: substring)
+        return try XCTUnwrap(paragraph.textBlocks.first as? NSTextTableBlock)
+    }
+
+    private func font(
+        in attributed: NSAttributedString,
+        substring: String
+    ) throws -> NSFont {
+        let range = (attributed.string as NSString).range(of: substring)
+        XCTAssertNotEqual(range.location, NSNotFound)
+        return try XCTUnwrap(
+            attributed.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont
         )
     }
 }

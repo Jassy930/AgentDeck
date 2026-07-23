@@ -66,6 +66,7 @@ cargo test
 - [ ] 会话流 assistant 正文使用 14pt `body`，reasoning 正文使用 13pt `callout` + `text2` 并正确渲染 Markdown，shell / diff 使用 12.5pt `mono`；各类 assistant item 上下内距统一为 4pt，连续内容密度自然且无忽松忽紧
 - [ ] assistant / reasoning Markdown 的纯拉丁段落按 `1.45`、CJK 或中西混排段落按 `1.72` 行高渲染；渲染与表格测高一致，等字节中西文替换也须刷新行高，空 reasoning 不虚构正文行；仅 Markdown 属性变化时保留当前文字选区，展开/收起及流式更新后均无裁切、覆盖或异常留白
 - [ ] Markdown 标题、列表与 fenced code 不显示 `##` 或 fence 等字面语法；行内代码为低对比圆角代码胶囊，fenced code 为独立代码容器，长路径换行后每段背景连续且不遮挡相邻正文
+- [ ] GFM 表格不显示 `|` / `---` 结构原文；表头、细分隔线、左/中/右对齐、单元格 inline Markdown 和 CJK/长内容换行正确，表格前后正文无裁切或异常留白；流式半截表格保持可读原文并在分隔行完整后升级为原生表格
 - [ ] `<local-command-stdout>` / `<local-command-stderr>` 等本地命令包装和 ANSI 内容不得进入用户气泡；纯包装轮次从会话流隐藏，真实用户正文仍原样保留
 - [ ] 没有环境/变更数据时右上面板完全折叠且不保留宽度；有数据但空间不足时也优先折叠以保留至少 252pt composer，窗口恢复后自动显示
 - [ ] 顶栏只显示已接通的打开目录动作；composer 使用 `surface2` 悬浮背景，输入与占位符使用 14pt `body`，单行整体高度约 100pt，只显示已接通的发送动作且按钮命中区不小于 44pt

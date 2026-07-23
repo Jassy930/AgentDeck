@@ -156,6 +156,56 @@ final class RenderSnapshotTests: XCTestCase {
         cell.renderPNG(to: "/tmp/adk-markdown-blocks.png")
     }
 
+    func testRenderMarkdownTable() {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let markdown = """
+        当前主盘空间偏紧，需要关注：
+
+        | 项目 | 占用 |
+        | :--- | ---: |
+        | APFS 数据卷 | **847 GiB / 926 GiB** |
+        | 可用空间 | 约 41 GiB |
+        | inode 使用率 | 2%，无文件数量压力 |
+
+        表格之后的正文仍保持正常 Markdown 排版。
+        """
+        let item = UIItem(
+            id: "message-markdown-table",
+            lifecycle: "completed",
+            kind: "message",
+            text: markdown
+        )
+        item.textBuffer.replace(with: markdown)
+        let row = ConversationDisplayRow(
+            role: .assistantItem,
+            turnId: "turn-markdown-table",
+            item: item,
+            firstInTurn: true,
+            lastInTurn: true
+        )
+        let cell = MessageCellView()
+        cell.wantsLayer = true
+        cell.layer?.backgroundColor = DesignTokens.bg.cgColor
+        let width: CGFloat = 720
+        let height = ConversationRowFactory.height(for: row, width: width) + 12
+        cell.translatesAutoresizingMaskIntoConstraints = false
+        cell.widthAnchor.constraint(equalToConstant: width).isActive = true
+        cell.heightAnchor.constraint(equalToConstant: height).isActive = true
+        cell.applyTurnSpacing(for: row)
+        cell.configure(row: row, width: width, model: model)
+        cell.layoutSubtreeIfNeeded()
+        let streaming = cell.firstDescendant(ofType: StreamingTextContainerView.self)
+        XCTAssertEqual(
+            streaming?.fittingHeight(for: width - ConversationRowCellView.horizontalInset * 2),
+            measuredTextHeight(
+                MarkdownAttributedStringBuilder.attributedString(from: markdown),
+                width: width - ConversationRowCellView.horizontalInset * 2
+            )
+        )
+        streaming?.layoutSubtreeIfNeeded()
+        cell.renderPNG(to: "/tmp/adk-markdown-table.png")
+    }
+
     func testRenderConversationStream() {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         model.cwd = URL(fileURLWithPath: "/p/refactor-auth")

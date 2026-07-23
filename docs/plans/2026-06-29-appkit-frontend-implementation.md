@@ -1,5 +1,9 @@
 # AppKit 前端重写实施计划
 
+> 后续演进：Task 2 中“表格降级为纯文本”的初始验收已由
+> `2026-07-23-native-markdown-table-rendering-implementation.md` 取代；当前实现
+> 使用 GFM 预解析 + `NSTextTable`，原计划其余 AppKit 边界保持不变。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把 AgentDeck 的 macOS 前端从 SwiftUI 整体重写为纯 AppKit（移除 SwiftUI 与 `Textual` 依赖、markdown 改用原生 `NSAttributedString`、会话流用虚拟化 NSTableView、历史侧栏用 NSOutlineView），功能/视觉对等，模型层零改动，并补上 Swift↔协议契约一致性测试。
