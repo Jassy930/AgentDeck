@@ -991,6 +991,114 @@ async fn pairing_client_exposes_only_route_bound_typed_events_and_close_ack() {
 }
 
 #[tokio::test]
+async fn pairing_client_sends_only_exact_canonical_route_bound_bytes_and_shuts_down() {
+    let identity = test_identity();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind exact pairing mock");
+    let port = listener.local_addr().expect("exact pairing address").port();
+    let acceptor = TlsAcceptor::from(Arc::clone(&identity.server_config));
+    let pair_route = PairRouteId::from_bytes([0x87; 16]);
+    let exact_frame = wire(RelayFrameBody::PairData(PairData {
+        pair_route,
+        sealed_blob: SealedBlob(vec![0x88, 0x89, 0x8a]),
+    }));
+    let frozen = encode(&exact_frame);
+    let expected = frozen.clone();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_tls_ws(&listener, &acceptor).await;
+        assert!(matches!(
+            recv_wire(&mut socket).await.body,
+            RelayFrameBody::Hello(_)
+        ));
+        let RelayFrameBody::PairingHello(hello) = recv_wire(&mut socket).await.body else {
+            panic!("expected PairingHello");
+        };
+        assert_eq!(hello.relay_server_id, server_id());
+        assert_eq!(hello.pair_route, pair_route);
+        send_wire(
+            &mut socket,
+            &wire(RelayFrameBody::Authenticated(Authenticated {
+                heartbeat_interval_secs: 20,
+            })),
+        )
+        .await;
+
+        match tokio::time::timeout(TEST_TIMEOUT, socket.next())
+            .await
+            .expect("exact pairing receive timeout")
+        {
+            Some(Ok(Message::Binary(actual))) => assert_eq!(actual.as_ref(), expected.as_slice()),
+            other => panic!("unexpected exact pairing message: {other:?}"),
+        }
+        observe_client_close(&mut socket).await;
+    });
+
+    let policy = RelayTlsPolicy::pinned_spki(vec![identity.spki_pin]).expect("exact pairing pin");
+    let mut client = RelayPairingClient::connect_pairing(
+        client_config(port, policy),
+        PairingHello {
+            relay_server_id: server_id(),
+            pair_route,
+        },
+    )
+    .await
+    .expect("connect exact pairing client");
+
+    let mut trailing = frozen.clone();
+    trailing.push(0);
+    assert_eq!(
+        client
+            .send_pair_data_encoded(trailing)
+            .await
+            .expect_err("trailing bytes must fail before the pairing writer")
+            .code(),
+        "relay.client.frame_invalid"
+    );
+    assert_eq!(
+        client
+            .send_pair_data_encoded(encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION - 1,
+                body: exact_frame.body.clone(),
+            }))
+            .await
+            .expect_err("old Relay version must fail before the pairing writer")
+            .code(),
+        "relay.client.version_unsupported"
+    );
+    assert_eq!(
+        client
+            .send_pair_data_encoded(encode(&wire(RelayFrameBody::Ping(Ping { nonce: 7 }))))
+            .await
+            .expect_err("non-PairData bytes must fail before the pairing writer")
+            .code(),
+        "relay.client.pair_frame_forbidden"
+    );
+    assert_eq!(
+        client
+            .send_pair_data_encoded(encode(&wire(RelayFrameBody::PairData(PairData {
+                pair_route: PairRouteId::from_bytes([0xff; 16]),
+                sealed_blob: SealedBlob(vec![1]),
+            }))))
+            .await
+            .expect_err("cross-route frozen PairData must fail before the pairing writer")
+            .code(),
+        "relay.client.pair_route_mismatch"
+    );
+    client
+        .send_pair_data_encoded(frozen)
+        .await
+        .expect("flush exact frozen pairing bytes");
+    client.shutdown().await;
+    client.shutdown().await;
+
+    tokio::time::timeout(TEST_TIMEOUT, server)
+        .await
+        .expect("exact pairing server completion")
+        .expect("exact pairing server task");
+}
+
+#[tokio::test]
 async fn principal_returns_byte_exact_signed_terminal_and_never_signs_wrong_server_id() {
     let identity = test_identity();
     let listener = TcpListener::bind("127.0.0.1:0")

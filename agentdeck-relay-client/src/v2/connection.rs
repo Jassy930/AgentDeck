@@ -8,9 +8,9 @@ use agentdeck_protocol::relay_v2::frame::{
     PairRouteClosed, Pong, RouteAccepted, ServerRestarting,
 };
 use agentdeck_protocol::relay_v2::{
-    MAX_FRAME_BYTES, MachineEnrollmentRequestV1, MachineEnrollmentResponseV1, OpaqueRouteFrame,
-    PairRouteId, PairingHello, RELAY_PROTOCOL_VERSION, RelayFailure, RelayFrameBody,
-    enrollment_receipt_hash,
+    CodecError, MAX_FRAME_BYTES, MachineEnrollmentRequestV1, MachineEnrollmentResponseV1,
+    OpaqueRouteFrame, PairRouteId, PairingHello, RELAY_PROTOCOL_VERSION, RelayFailure,
+    RelayFrameBody, decode, encode, enrollment_receipt_hash,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
@@ -672,6 +672,40 @@ impl RelayPairingClient {
             .await
     }
 
+    /// 发送由 durable pairing state 冻结的 canonical Relay `PairData` codec bytes。
+    ///
+    /// decode 仅用于在进入 writer 前证明 current version、唯一允许的 body 与 exact
+    /// `pairRoute`；随后再做逐字节 canonical roundtrip。验证成功后，writer 收到的仍是
+    /// 调用方传入的原始 `bytes`，不会从 decoded frame 重新编码。
+    pub async fn send_pair_data_encoded(&self, bytes: Vec<u8>) -> Result<(), RelayClientError> {
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(RelayClientError::new("relay.client.frame_too_large"));
+        }
+        let frame = decode(&bytes).map_err(|error| match error {
+            CodecError::Oversize => RelayClientError::new("relay.client.frame_too_large"),
+            CodecError::UnsupportedVersion(_) => {
+                RelayClientError::new("relay.client.version_unsupported")
+            }
+            _ => RelayClientError::new("relay.client.frame_invalid"),
+        })?;
+        if frame.version != RELAY_PROTOCOL_VERSION {
+            return Err(RelayClientError::new("relay.client.version_unsupported"));
+        }
+        if encode(&frame) != bytes {
+            return Err(RelayClientError::new("relay.client.frame_invalid"));
+        }
+        match &frame.body {
+            RelayFrameBody::PairData(data) if data.pair_route == self.pair_route => {}
+            RelayFrameBody::PairData(_) => {
+                return Err(RelayClientError::new("relay.client.pair_route_mismatch"));
+            }
+            _ => {
+                return Err(RelayClientError::new("relay.client.pair_frame_forbidden"));
+            }
+        }
+        self.connection.send_encoded(bytes).await
+    }
+
     pub async fn request_close(&self, frame: ClosePairRoute) -> Result<(), RelayClientError> {
         if frame.pair_route != self.pair_route {
             return Err(RelayClientError::new("relay.client.pair_route_mismatch"));
@@ -728,6 +762,11 @@ impl RelayPairingClient {
 
     pub async fn close_pair_route(&self, frame: ClosePairRoute) -> Result<(), RelayClientError> {
         self.request_close(frame).await
+    }
+
+    /// 正常关闭 pairing generation，并等待 reader/writer task 收口；重复调用无副作用。
+    pub async fn shutdown(&mut self) {
+        self.connection.shutdown().await;
     }
 }
 
