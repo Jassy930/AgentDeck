@@ -29,8 +29,13 @@ const SECRET_SENTINEL: &str = "relay-v1-secret-must-never-be-echoed";
 const E2EE_SENTINEL: &[u8] = b"AGENTDECK_SYNTHETIC_E2EE_SENTINEL_9F4A7C21";
 const MACHINE_ROOT_FINGERPRINT: &str = "ERERERERERERERERERERERERERERERERERERERERERE=";
 const MACHINE_ROUTE: &str = "IiIiIiIiIiIiIiIiIiIiIg==";
+const CONVERSATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+const TURN_ID: &str = "22222222-2222-4222-8222-222222222222";
+const APPROVAL_ID: &str = "33333333-3333-4333-8333-333333333333";
 const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 const ZERO_DIAL_WINDOW: Duration = Duration::from_millis(150);
+const LEGACY_OVERRIDE_MESSAGE: &str =
+    "--data-dir is diagnostics-only and cannot override a Runtime v4 endpoint";
 
 fn unix_now_ms() -> u64 {
     SystemTime::now()
@@ -302,6 +307,19 @@ async fn assert_no_connection(listener: &TcpListener) {
     );
 }
 
+fn assert_legacy_override_usage(output: &std::process::Output) {
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CLI error envelope");
+    assert_eq!(envelope["error"]["code"], "usage");
+    assert_eq!(envelope["error"]["message"], LEGACY_OVERRIDE_MESSAGE);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        format!("agentdeck: {LEGACY_OVERRIDE_MESSAGE}"),
+    );
+}
+
 fn legacy_marker(data_dir: &Path, profile: &str) -> PathBuf {
     data_dir
         .join("relay")
@@ -309,11 +327,18 @@ fn legacy_marker(data_dir: &Path, profile: &str) -> PathBuf {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_credential_marker_is_untouched_and_cannot_change_the_unsupported_result() {
+async fn legacy_credential_marker_is_untouched_and_cannot_change_the_usage_result() {
     let temp = TempDir::new().expect("tempdir");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("dial sentinel");
     let marker = legacy_marker(temp.path(), "stable");
     std::fs::create_dir(marker.parent().expect("marker parent")).expect("create relay dir");
-    let original = format!(r#"{{"credential":"{SECRET_SENTINEL}"}}"#).into_bytes();
+    let original = format!(
+        r#"{{"credential":"{SECRET_SENTINEL}","relay":"ws://{}/"}}"#,
+        listener.local_addr().expect("listener address")
+    )
+    .into_bytes();
     std::fs::write(&marker, &original).expect("write legacy marker");
     let output = run_cli(&[
         "--runtime-temp-root-for-test",
@@ -328,18 +353,19 @@ async fn legacy_credential_marker_is_untouched_and_cannot_change_the_unsupported
         MACHINE_ROUTE,
     ])
     .await;
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
-        "remote.persistent.unsupported"
-    );
+    assert_legacy_override_usage(&output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(SECRET_SENTINEL));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(SECRET_SENTINEL));
     assert_eq!(std::fs::read(&marker).expect("read marker"), original);
+    assert_no_connection(&listener).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dangling_legacy_marker_is_not_followed_and_cannot_change_the_unsupported_result() {
+async fn dangling_legacy_marker_is_not_followed_and_cannot_change_the_usage_result() {
     let temp = TempDir::new().expect("tempdir");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("dial sentinel");
     let marker = legacy_marker(temp.path(), "stable");
     std::fs::create_dir(marker.parent().expect("marker parent")).expect("create relay dir");
     let missing = temp.path().join("missing-secret-target");
@@ -357,12 +383,7 @@ async fn dangling_legacy_marker_is_not_followed_and_cannot_change_the_unsupporte
         MACHINE_ROUTE,
     ])
     .await;
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
-        "remote.persistent.unsupported"
-    );
+    assert_legacy_override_usage(&output);
     assert!(
         std::fs::symlink_metadata(&marker)
             .expect("marker metadata")
@@ -373,19 +394,30 @@ async fn dangling_legacy_marker_is_not_followed_and_cannot_change_the_unsupporte
         !missing.exists(),
         "CLI must not follow or create the symlink target"
     );
+    assert_no_connection(&listener).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_persistent_command_is_stably_unsupported_without_runtime_or_network() {
+async fn supported_persistent_commands_reject_legacy_runtime_overrides_without_network() {
     let temp = TempDir::new().expect("tempdir");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("dial sentinel");
     let root = temp.path().to_str().expect("UTF-8 temp path");
+    let marker = legacy_marker(temp.path(), "stable");
+    std::fs::create_dir(marker.parent().expect("marker parent")).expect("create relay dir");
+    let marker_bytes = format!(
+        r#"{{"relay":"ws://{}/","credential":"{SECRET_SENTINEL}"}}"#,
+        listener.local_addr().expect("listener address")
+    )
+    .into_bytes();
+    std::fs::write(&marker, &marker_bytes).expect("write legacy marker");
     let command_tails = [
         vec!["conversations"],
-        vec!["watch", "--conversation-id", "conversation-1"],
         vec![
             "prompt",
             "--conversation-id",
-            "conversation-1",
+            CONVERSATION_ID,
             "--text",
             "continue safely",
             "--idempotency-key",
@@ -396,11 +428,11 @@ async fn every_persistent_command_is_stably_unsupported_without_runtime_or_netwo
         vec![
             "approve",
             "--conversation-id",
-            "conversation-1",
+            CONVERSATION_ID,
             "--turn-id",
-            "turn-1",
+            TURN_ID,
             "--approval-id",
-            "approval-1",
+            APPROVAL_ID,
             "--decision",
             "approve",
             "--request-id",
@@ -409,9 +441,9 @@ async fn every_persistent_command_is_stably_unsupported_without_runtime_or_netwo
         vec![
             "retry-approval",
             "--conversation-id",
-            "conversation-1",
+            CONVERSATION_ID,
             "--approval-id",
-            "approval-1",
+            APPROVAL_ID,
         ],
         vec!["revoke-self"],
     ];
@@ -432,13 +464,60 @@ async fn every_persistent_command_is_stably_unsupported_without_runtime_or_netwo
             MACHINE_ROUTE,
         ]);
         let output = run_cli(&arguments).await;
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr).trim(),
-            "remote.persistent.unsupported"
-        );
+        assert_legacy_override_usage(&output);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(SECRET_SENTINEL));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(SECRET_SENTINEL));
     }
+    assert_eq!(std::fs::read(marker).expect("read marker"), marker_bytes);
+    assert_no_connection(&listener).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_is_the_only_persistent_command_that_stays_unsupported() {
+    let output = run_cli(&[
+        "remote",
+        "watch",
+        "--conversation-id",
+        CONVERSATION_ID,
+        "--machine-root-fingerprint",
+        MACHINE_ROOT_FINGERPRINT,
+        "--machine-route",
+        MACHINE_ROUTE,
+    ])
+    .await;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "remote.persistent.unsupported"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conversations_without_legacy_override_enters_production_identity_gate_without_network() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("dial sentinel");
+    let output = run_cli(&[
+        "remote",
+        "conversations",
+        "--machine-root-fingerprint",
+        MACHINE_ROOT_FINGERPRINT,
+        "--machine-route",
+        MACHINE_ROUTE,
+    ])
+    .await;
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("production identity error envelope");
+    assert!(
+        envelope["error"]["code"]
+            .as_str()
+            .is_some_and(|code| code.starts_with("remote.persistent."))
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("agentdeck: "));
+    assert_no_connection(&listener).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -24,7 +24,7 @@ use super::relay_transport::{
     PairedRuntimeConnectError, PairedRuntimeConnectOutcome, RelayRuntimeTransport,
     connect_paired_runtime,
 };
-use super::runtime::{RemoteRuntime, RemoteRuntimeError, RemoteRuntimeTransportError};
+use super::runtime::{RemoteRuntime, RemoteRuntimeError};
 use super::selector::PersistentMachineSelector;
 
 /// 已完成 CLI 参数校验的 persistent remote mutation。
@@ -102,29 +102,8 @@ impl PersistentRemoteMutationError {
             Self::Paired(error) => error.code(),
             Self::Connect(error) => error.code(),
             Self::HandshakeRevoked => "remote.runtime.handshake_revoked",
-            Self::Runtime(error) => remote_runtime_error_code(error),
+            Self::Runtime(error) => error.code(),
         }
-    }
-}
-
-fn remote_runtime_error_code(error: &RemoteRuntimeError) -> &str {
-    match error {
-        RemoteRuntimeError::Paired(error) => error.code(),
-        RemoteRuntimeError::Transport(RemoteRuntimeTransportError::Relay(error)) => error.code(),
-        RemoteRuntimeError::Transport(RemoteRuntimeTransportError::Failed(_)) => {
-            "remote.runtime.transport_failed"
-        }
-        RemoteRuntimeError::RelayCodec(_) => "remote.runtime.relay_frame_invalid",
-        RemoteRuntimeError::Json(_)
-        | RemoteRuntimeError::InvalidReply(_)
-        | RemoteRuntimeError::TransferCarrier(_) => "remote.runtime.reply_invalid",
-        RemoteRuntimeError::EntropyUnavailable => "remote.runtime.entropy_unavailable",
-        RemoteRuntimeError::PendingIntentConflict => "remote.runtime.pending_intent_conflict",
-        RemoteRuntimeError::DaemonFailure(failure) => failure.code.as_str(),
-        RemoteRuntimeError::OutcomeUnknown => "remote.runtime.outcome_unknown",
-        RemoteRuntimeError::Transfer(error) => error.code(),
-        RemoteRuntimeError::ReplayRejected => "remote.runtime.replay_rejected",
-        RemoteRuntimeError::InvalidDurableState => "remote.runtime.state_invalid",
     }
 }
 

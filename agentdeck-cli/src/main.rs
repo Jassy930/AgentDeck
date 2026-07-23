@@ -694,6 +694,26 @@ async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
                 println!("{}", render(&output, pretty));
                 return Ok(());
             }
+            if let RemoteOp::Conversations { selector } = op {
+                let selector = selector.parse()?;
+                let composition =
+                    agentdeck_cli::remote::production::PersistentRemoteComposition::production()
+                        .map_err(persistent_remote_composition_cli_error)?;
+                let mut rng = production_remote_mutation_rng()?;
+                let outcome =
+                    agentdeck_cli::remote::conversations::list_persistent_remote_conversations(
+                        &composition,
+                        selector,
+                        &mut rng,
+                    )
+                    .await
+                    .map_err(persistent_remote_conversations_cli_error)?;
+                println!(
+                    "{}",
+                    render(&persistent_remote_conversations_output(&outcome), pretty)
+                );
+                return Ok(());
+            }
             if let Some((operation, selector, mutation)) = persistent_remote_mutation_plan(op)? {
                 let composition =
                     agentdeck_cli::remote::production::PersistentRemoteComposition::production()
@@ -1037,6 +1057,36 @@ fn persistent_remote_machines_cli_error(
     }
 }
 
+fn persistent_remote_conversations_cli_error(
+    error: agentdeck_cli::remote::conversations::PersistentRemoteConversationsError,
+) -> CliError {
+    use agentdeck_cli::remote::conversations::PersistentRemoteConversationsError;
+    use agentdeck_cli::remote::relay_transport::PairedRuntimeConnectError;
+    use agentdeck_cli::remote::runtime::RemoteRuntimeError;
+
+    let code = Some(error.code().to_owned());
+    let message = error.to_string();
+    match error {
+        PersistentRemoteConversationsError::Connect(PairedRuntimeConnectError::Relay(_))
+        | PersistentRemoteConversationsError::Runtime(RemoteRuntimeError::Transport(_))
+        | PersistentRemoteConversationsError::Runtime(RemoteRuntimeError::OutcomeUnknown) => {
+            CliError::Transport { code, message }
+        }
+        PersistentRemoteConversationsError::Pagination(_)
+        | PersistentRemoteConversationsError::Runtime(
+            RemoteRuntimeError::RelayCodec(_)
+            | RemoteRuntimeError::Json(_)
+            | RemoteRuntimeError::InvalidReply(_)
+            | RemoteRuntimeError::TransferCarrier(_)
+            | RemoteRuntimeError::Transfer(_),
+        ) => CliError::Protocol { code, message },
+        PersistentRemoteConversationsError::Paired(_)
+        | PersistentRemoteConversationsError::Connect(PairedRuntimeConnectError::Paired(_))
+        | PersistentRemoteConversationsError::HandshakeRevoked
+        | PersistentRemoteConversationsError::Runtime(_) => CliError::Session { code, message },
+    }
+}
+
 fn persistent_remote_mutation_cli_error(
     error: agentdeck_cli::remote::mutations::PersistentRemoteMutationError,
 ) -> CliError {
@@ -1238,6 +1288,22 @@ fn persistent_remote_mutation_output(
         "transport": {"routeAccepted": route_accepted},
         "receipt": receipt,
     }))
+}
+
+fn persistent_remote_conversations_output(
+    outcome: &agentdeck_cli::remote::conversations::PersistentRemoteConversationsOutcome,
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation": "remote.conversations",
+        "transport": {
+            "routeAcceptedObserved": outcome.route_accepted_observed(),
+        },
+        "result": {
+            "baseCatalogCursor": outcome.base_catalog_cursor(),
+            "pageCount": outcome.page_count(),
+            "conversations": outcome.conversations(),
+        },
+    })
 }
 
 async fn run_persistent_remote_pair(
@@ -1472,7 +1538,11 @@ fn remote_pre_dispatch(op: &RemoteOp) -> Result<Option<remote_cli::RemoteOpArg>,
             bundle: bundle.clone(),
         }),
         RemoteOp::Smoke => Some(remote_cli::RemoteOpArg::LegacyV1),
-        RemoteOp::Conversations { selector } | RemoteOp::Watch { selector, .. } => {
+        RemoteOp::Conversations { selector } => {
+            let _selector = selector.parse()?;
+            None
+        }
+        RemoteOp::Watch { selector, .. } => {
             let _selector = selector.parse()?;
             Some(remote_cli::RemoteOpArg::PersistentUnsupported)
         }
@@ -2214,7 +2284,7 @@ mod persistent_remote_command_cli_tests {
     }
 
     #[test]
-    fn invalid_selector_is_rejected_without_echo_and_only_stream_commands_stay_unsupported() {
+    fn invalid_selector_is_rejected_without_echo_and_only_watch_stays_unsupported() {
         let cli = Cli::try_parse_from([
             "agentdeck",
             "remote",
@@ -2248,8 +2318,28 @@ mod persistent_remote_command_cli_tests {
         let Cmd::Remote { op } = valid.command else {
             panic!("expected remote command");
         };
+        assert!(
+            remote_pre_dispatch(&op).expect("valid selector").is_none(),
+            "conversations must enter the production Catalog service"
+        );
+
+        let watch = Cli::try_parse_from(
+            [
+                "agentdeck",
+                "remote",
+                "watch",
+                "--conversation-id",
+                CONVERSATION_ID,
+            ]
+            .into_iter()
+            .chain(selector_tail()),
+        )
+        .expect("valid watch command");
+        let Cmd::Remote { op } = watch.command else {
+            panic!("expected remote watch")
+        };
         assert!(matches!(
-            remote_pre_dispatch(&op).expect("valid selector"),
+            remote_pre_dispatch(&op).expect("valid watch selector"),
             Some(remote_cli::RemoteOpArg::PersistentUnsupported)
         ));
 
@@ -2562,6 +2652,40 @@ mod persistent_remote_command_cli_tests {
                 !branch.contains(forbidden),
                 "production CLI must not expose {forbidden}"
             );
+        }
+    }
+
+    #[test]
+    fn conversations_composition_entropy_and_output_follow_the_production_service() {
+        let source = include_str!("main.rs");
+        let branch = source
+            .split("if let RemoteOp::Conversations { selector } = op")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("if let Some((operation, selector, mutation))")
+                    .next()
+            })
+            .expect("persistent conversations dispatch branch");
+        let selector = branch
+            .find("selector.parse()")
+            .expect("selector validation");
+        let composition = branch
+            .find("PersistentRemoteComposition::production()")
+            .expect("production composition");
+        let entropy = branch
+            .find("production_remote_mutation_rng()")
+            .expect("production entropy");
+        let service = branch
+            .find("list_persistent_remote_conversations")
+            .expect("Catalog pagination service");
+        let output = branch
+            .find("persistent_remote_conversations_output")
+            .expect("typed conversations output");
+        assert!(selector < composition && composition < entropy && entropy < service);
+        assert!(service < output);
+        for forbidden in ["injected_for_test", "MemoryRemoteKeyStore", "--relay"] {
+            assert!(!branch.contains(forbidden));
         }
     }
 }

@@ -264,6 +264,30 @@ pub enum RemoteRuntimeError {
     InvalidDurableState,
 }
 
+impl RemoteRuntimeError {
+    #[must_use]
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Paired(error) => error.code(),
+            Self::Transport(RemoteRuntimeTransportError::Relay(error)) => error.code(),
+            Self::Transport(RemoteRuntimeTransportError::Failed(_)) => {
+                "remote.runtime.transport_failed"
+            }
+            Self::RelayCodec(_) => "remote.runtime.relay_frame_invalid",
+            Self::Json(_) | Self::InvalidReply(_) | Self::TransferCarrier(_) => {
+                "remote.runtime.reply_invalid"
+            }
+            Self::EntropyUnavailable => "remote.runtime.entropy_unavailable",
+            Self::PendingIntentConflict => "remote.runtime.pending_intent_conflict",
+            Self::DaemonFailure(failure) => failure.code.as_str(),
+            Self::OutcomeUnknown => "remote.runtime.outcome_unknown",
+            Self::Transfer(error) => error.code(),
+            Self::ReplayRejected => "remote.runtime.replay_rejected",
+            Self::InvalidDurableState => "remote.runtime.state_invalid",
+        }
+    }
+}
+
 /// 持有同一 machine 独占 lease 的 remote Runtime command 编排器。
 ///
 /// 字段声明顺序是 drop 顺序：先关闭 transport，再最后释放 machine lease/capability。
@@ -318,6 +342,30 @@ where
             route_accepted: outcome.route_accepted,
             snapshot,
         })
+    }
+
+    /// 恢复上次进程留下的只读 Catalog pending。
+    ///
+    /// 首页 pending 的 authenticated 结果仍可直接作为本次完整 listing 的第一页；后续页
+    /// pending 必须先逐字节重试并消费 terminal，再由调用方从 `Catalog(None)` 建立新的完整
+    /// frozen listing。其他 mutation pending 不能被只读查询覆盖。
+    pub(super) async fn resume_pending_catalog_page<R: CryptoRng>(
+        &mut self,
+        rng: &mut R,
+    ) -> Result<Option<RemoteCatalogPageOutcome>, RemoteRuntimeError> {
+        let existing = self
+            .machine
+            .opaque_runtime_state()
+            .exchange()
+            .map(decode_exchange)
+            .transpose()?;
+        let CatalogPendingRecovery::Resume(page_cursor) = catalog_pending_recovery(existing)?
+        else {
+            return Ok(None);
+        };
+        let is_first_page = page_cursor.is_none();
+        let outcome = self.catalog_page(page_cursor, rng).await?;
+        Ok(is_first_page.then_some(outcome))
     }
 
     /// 发送或精确重试一个 prompt，直到得到 authenticated daemon receipt 或非成功错误。
@@ -1200,6 +1248,25 @@ enum DurableExchange {
     Terminal(TerminalExchange),
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum CatalogPendingRecovery {
+    None,
+    Resume(Option<CatalogPageCursor>),
+}
+
+fn catalog_pending_recovery(
+    existing: Option<DurableExchange>,
+) -> Result<CatalogPendingRecovery, RemoteRuntimeError> {
+    match existing {
+        Some(DurableExchange::Pending(PendingExchange {
+            operation: DirectedOperation::Catalog { page_cursor },
+            ..
+        })) => Ok(CatalogPendingRecovery::Resume(page_cursor)),
+        Some(DurableExchange::Pending(_)) => Err(RemoteRuntimeError::PendingIntentConflict),
+        Some(DurableExchange::Terminal(_)) | None => Ok(CatalogPendingRecovery::None),
+    }
+}
+
 enum ExchangeStart {
     Pending(PendingExchange),
     Terminal(DirectedReceipt),
@@ -1870,6 +1937,16 @@ mod tests {
         .expect("prompt plan")
     }
 
+    fn pending_exchange(operation: DirectedOperation) -> DurableExchange {
+        DurableExchange::Pending(PendingExchange {
+            operation,
+            intent_hash: [0x11; 32],
+            message_id: MessageId::new("pending-catalog-recovery"),
+            request_route: RequestRouteId::from_bytes([0x22; 16]),
+            exact_send: vec![0x33],
+        })
+    }
+
     fn legacy_prompt_terminal_bytes(
         receipt: &CommandReceipt,
         expected_configuration_revision: u64,
@@ -1903,6 +1980,51 @@ mod tests {
         assert!(
             transport < machine,
             "Rust drops struct fields in declaration order"
+        );
+    }
+
+    #[test]
+    fn catalog_startup_recovers_only_the_exact_pending_catalog_operation() {
+        assert_eq!(
+            catalog_pending_recovery(None).expect("empty exchange"),
+            CatalogPendingRecovery::None
+        );
+        assert_eq!(
+            catalog_pending_recovery(Some(pending_exchange(DirectedOperation::Catalog {
+                page_cursor: None,
+            })))
+            .expect("pending first page"),
+            CatalogPendingRecovery::Resume(None)
+        );
+
+        let cursor = CatalogPageCursor::new("opaque-restart-cursor");
+        assert_eq!(
+            catalog_pending_recovery(Some(pending_exchange(DirectedOperation::Catalog {
+                page_cursor: Some(cursor.clone()),
+            })))
+            .expect("pending later page"),
+            CatalogPendingRecovery::Resume(Some(cursor))
+        );
+
+        assert!(matches!(
+            catalog_pending_recovery(Some(pending_exchange(prompt_plan().operation))),
+            Err(RemoteRuntimeError::PendingIntentConflict)
+        ));
+        assert_eq!(
+            catalog_pending_recovery(Some(DurableExchange::Terminal(TerminalExchange {
+                operation: DirectedOperation::Catalog { page_cursor: None },
+                intent_hash: [0x44; 32],
+                message_id: MessageId::new("terminal-catalog-recovery"),
+                request_route: RequestRouteId::from_bytes([0x55; 16]),
+                request_frame_hash: [0x66; 32],
+                reply_frame_hash: [0x77; 32],
+                receipt: DirectedReceipt::Failure(RuntimeFailure::new(
+                    "daemon.catalog.fixture",
+                    "terminal fixture",
+                )),
+            })))
+            .expect("terminal is not pending"),
+            CatalogPendingRecovery::None
         );
     }
 
