@@ -172,6 +172,14 @@ impl PairingFixture {
         SigningKey::from_seed(&[0x32; 32])
     }
 
+    pub fn invite(&self) -> &PairInviteV1 {
+        &self.invite
+    }
+
+    pub fn authorization(&self) -> &AuthorizationRequestV1 {
+        &self.authorization
+    }
+
     pub fn identity(&self) -> PairedMachineIdentity {
         PairedMachineIdentity::new(
             MachineRootFingerprint::from_bytes(self.invite.machine_root_fingerprint),
@@ -216,7 +224,7 @@ impl PairingFixture {
         SigningKey::from_seed(&[0x31; 32])
     }
 
-    fn response_for(&self, prepared: &PreparedPairRequest, response_seed: [u8; 32]) -> Vec<u8> {
+    pub fn response_for(&self, prepared: &PreparedPairRequest, response_seed: [u8; 32]) -> Vec<u8> {
         let root = Self::root_signing_key();
         let data = Self::machine_data_signing_key();
         let root_fingerprint = self.invite.machine_root_fingerprint;

@@ -10,6 +10,8 @@ pub mod machines;
 #[cfg(target_os = "macos")]
 mod macos_keychain;
 #[cfg(unix)]
+pub mod pair;
+#[cfg(unix)]
 pub mod paired_machine;
 pub mod pending;
 #[cfg(unix)]
