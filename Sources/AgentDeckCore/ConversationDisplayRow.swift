@@ -192,7 +192,7 @@ public enum ConversationDisplayRowBuilder {
         var index = 0
 
         while index < items.count {
-            guard ToolActivityGroupPresentation.isGroupable(items[index]) else {
+            guard let groupingKey = ToolActivityGroupPresentation.groupingKey(for: items[index]) else {
                 result.append(PendingRow(role: .assistantItem, item: items[index], group: nil))
                 index += 1
                 continue
@@ -203,7 +203,7 @@ public enum ConversationDisplayRowBuilder {
             var lastActivity = index
             var activityCount = 1
             while cursor < items.count {
-                if ToolActivityGroupPresentation.isGroupable(items[cursor]) {
+                if ToolActivityGroupPresentation.groupingKey(for: items[cursor]) == groupingKey {
                     lastActivity = cursor
                     activityCount += 1
                     cursor += 1

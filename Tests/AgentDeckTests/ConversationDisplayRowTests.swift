@@ -42,6 +42,18 @@ final class ConversationDisplayRowTests: XCTestCase {
         return item
     }
 
+    private func collaboration(
+        _ id: String,
+        task: String,
+        event: String = "interacted"
+    ) -> UIItem {
+        var item = UIItem(id: id, lifecycle: "completed", kind: "toolCall")
+        item.tool = task
+        item.activityKind = "collaboration"
+        item.activityEvent = event
+        return item
+    }
+
     func testUserThenAssistantItemsFlattenInOrderWithBoundaries() {
         let turns = ConversationDisplayRowTestSupport.sampleTurns()
         let rows = ConversationDisplayRowBuilder.rows(from: turns)
@@ -278,6 +290,66 @@ final class ConversationDisplayRowTests: XCTestCase {
 
         XCTAssertEqual(rows.map(\.item.id), ["t1", "collab", "t2"])
         XCTAssertTrue(rows.allSatisfy { $0.toolActivityGroup == nil })
+    }
+
+    func testSameTaskCollaborationEventsFoldInterveningReasoningIntoOneGroup() throws {
+        let firstReasoning = UIItem(
+            id: "r-1", lifecycle: "completed", kind: "reasoning", text: "检查实现"
+        )
+        let secondReasoning = UIItem(
+            id: "r-2", lifecycle: "completed", kind: "reasoning", text: "继续复核"
+        )
+        let turn = ConversationTurn(
+            id: "turn-collaboration-group",
+            user: nil,
+            assistantItems: [
+                collaboration("c-1", task: "B3a2a implement", event: "started"),
+                firstReasoning,
+                collaboration("c-2", task: "B3a2a implement"),
+                secondReasoning,
+                collaboration("c-3", task: "B3a2a implement"),
+            ]
+        )
+
+        let rows = ConversationDisplayRowBuilder.rows(
+            from: [turn],
+            toolGrouping: .consecutiveActivity
+        )
+
+        XCTAssertEqual(rows.count, 1)
+        let group = try XCTUnwrap(rows[0].toolActivityGroup)
+        XCTAssertEqual(group.members.map(\.id), ["c-1", "r-1", "c-2", "r-2", "c-3"])
+        XCTAssertEqual(group.activityItems.map(\.id), ["c-1", "c-2", "c-3"])
+    }
+
+    func testDifferentCollaborationTasksRemainVisibleBoundaries() throws {
+        let between = UIItem(
+            id: "r-between", lifecycle: "completed", kind: "reasoning", text: "切换审计"
+        )
+        let turn = ConversationTurn(
+            id: "turn-collaboration-boundaries",
+            user: nil,
+            assistantItems: [
+                collaboration("b-1", task: "B3a2a implement"),
+                collaboration("b-2", task: "B3a2a implement"),
+                between,
+                collaboration("relay", task: "Relay plan audit", event: "interrupted"),
+                collaboration("b-3", task: "B3a2a implement"),
+                collaboration("b-4", task: "B3a2a implement"),
+            ]
+        )
+
+        let rows = ConversationDisplayRowBuilder.rows(
+            from: [turn],
+            toolGrouping: .consecutiveActivity
+        )
+
+        XCTAssertEqual(rows.count, 4)
+        XCTAssertEqual(try XCTUnwrap(rows[0].toolActivityGroup).activityItems.map(\.id), ["b-1", "b-2"])
+        XCTAssertEqual(rows[1].item.id, "r-between")
+        XCTAssertEqual(rows[2].item.id, "relay")
+        XCTAssertNil(rows[2].toolActivityGroup)
+        XCTAssertEqual(try XCTUnwrap(rows[3].toolActivityGroup).activityItems.map(\.id), ["b-3", "b-4"])
     }
 
     func testExpandingGroupRestoresOriginalRowsInOrderAndBoundaries() throws {

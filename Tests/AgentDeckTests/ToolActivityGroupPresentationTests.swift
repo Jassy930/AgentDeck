@@ -150,7 +150,7 @@ final class ToolActivityGroupPresentationTests: XCTestCase {
         )
     }
 
-    func testMediaAndCollaborationRemainNonGroupableBoundaries() {
+    func testMediaAndCollaborationControlsRemainNonGroupableBoundaries() {
         let media = UIItem(id: "media", lifecycle: "completed", kind: "media")
         let collab = UIItem(
             id: "collab",
@@ -176,5 +176,48 @@ final class ToolActivityGroupPresentationTests: XCTestCase {
         XCTAssertFalse(ToolActivityGroupPresentation.isGroupable(collab))
         XCTAssertFalse(ToolActivityGroupPresentation.isGroupable(loweredCollab))
         XCTAssertFalse(ToolActivityGroupPresentation.isGroupable(neutralCollab))
+    }
+
+    func testSameTaskCollaborationEventsHaveDedicatedGroupPresentation() {
+        var started = UIItem(id: "started", lifecycle: "completed", kind: "toolCall")
+        started.tool = "B3a2a implement"
+        started.activityKind = "collaboration"
+        started.activityEvent = "started"
+        var updated = started
+        updated.id = "updated"
+        updated.activityEvent = "interacted"
+
+        XCTAssertTrue(ToolActivityGroupPresentation.isGroupable(started))
+        XCTAssertEqual(
+            ToolActivityGroupPresentation.groupingKey(for: started),
+            .collaboration(taskName: "b3a2a implement")
+        )
+        XCTAssertEqual(
+            ToolActivityGroupPresentation.summary([started, updated]),
+            "B3a2a implement · 2 条协作动态"
+        )
+        XCTAssertEqual(ToolActivityGroupPresentation.statusSummary([started, updated]), "已更新")
+        XCTAssertEqual(ToolActivityGroupPresentation.semanticStatus([started, updated]), "interacted")
+        XCTAssertEqual(
+            ToolActivityGroupPresentation.primaryCategory(in: [started, updated]),
+            .collaboration
+        )
+    }
+
+    func testDifferentCollaborationTasksHaveDifferentGroupKeys() {
+        var implementation = UIItem(
+            id: "implementation", lifecycle: "completed", kind: "toolCall"
+        )
+        implementation.tool = "B3a2a implement"
+        implementation.activityKind = "collaboration"
+        implementation.activityEvent = "interacted"
+        var audit = implementation
+        audit.id = "audit"
+        audit.tool = "Relay plan audit"
+
+        XCTAssertNotEqual(
+            ToolActivityGroupPresentation.groupingKey(for: implementation),
+            ToolActivityGroupPresentation.groupingKey(for: audit)
+        )
     }
 }

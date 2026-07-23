@@ -854,7 +854,7 @@ final class ToolActivityGroupCellView: ConversationRowCellView {
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
         guard let group = row.toolActivityGroup else {
             disclosureId = ""
-            summaryLabel.stringValue = "工具活动"
+            summaryLabel.stringValue = "执行过程"
             statusLabel.stringValue = ""
             statusLabel.isHidden = true
             disclosure.isHidden = true
@@ -869,7 +869,7 @@ final class ToolActivityGroupCellView: ConversationRowCellView {
 
         disclosure.isHidden = false
         disclosure.state = expanded ? .on : .off
-        disclosure.toolTip = expanded ? "收起工具活动详情" : "展开工具活动详情"
+        disclosure.toolTip = expanded ? "收起执行过程详情" : "展开执行过程详情"
         disclosure.setAccessibilityLabel(disclosure.toolTip)
 
         icon.image = Self.icon(for: ToolActivityGroupPresentation.primaryCategory(in: group.members))
@@ -891,6 +891,7 @@ final class ToolActivityGroupCellView: ConversationRowCellView {
         case .edit: symbol = "square.and.pencil"
         case .search: symbol = "magnifyingglass"
         case .image: symbol = "photo.on.rectangle"
+        case .collaboration: symbol = "person.2"
         case .tool: symbol = "wrench"
         case .mixed: symbol = "list.bullet.rectangle"
         }

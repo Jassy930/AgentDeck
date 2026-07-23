@@ -8,8 +8,18 @@ public enum ToolActivityCategory: String, Hashable {
     case edit
     case search
     case image
+    case collaboration
     case tool
     case mixed
+}
+
+/// Activities may share one collapsed row only when their semantic lane is
+/// compatible. Ordinary tools form one burst; collaboration events additionally
+/// require the same neutral task name so unrelated subagents never disappear
+/// into one generic summary.
+public enum ExecutionActivityGroupKey: Hashable {
+    case toolBurst
+    case collaboration(taskName: String)
 }
 
 /// Pure, platform-neutral presentation rules for a collapsed tool-activity
@@ -26,7 +36,8 @@ public enum ToolActivityGroupPresentation {
     }
 
     /// These are execution records rather than user-visible prose/artifacts.
-    /// Media and collaboration rows intentionally remain hard boundaries.
+    /// A neutral collaboration *event* may participate in a same-task group;
+    /// collaboration controls, media and context maintenance remain boundaries.
     public static func isGroupable(_ item: UIItem) -> Bool {
         guard ["shell", "fileEdit", "webSearch", "toolCall"].contains(item.kind) else {
             return false
@@ -34,7 +45,8 @@ public enum ToolActivityGroupPresentation {
         guard item.kind == "toolCall" else { return true }
 
         if item.activityKind.caseInsensitiveCompare("collaboration") == .orderedSame {
-            return false
+            return !item.activityEvent.isEmpty
+                && !item.tool.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         if item.activityKind.caseInsensitiveCompare("contextMaintenance") == .orderedSame {
             return false
@@ -54,7 +66,22 @@ public enum ToolActivityGroupPresentation {
         ])
     }
 
+    public static func groupingKey(for item: UIItem) -> ExecutionActivityGroupKey? {
+        guard isGroupable(item) else { return nil }
+        if isCollaborationEvent(item) {
+            return .collaboration(
+                taskName: item.tool
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+            )
+        }
+        return .toolBurst
+    }
+
     public static func category(for item: UIItem) -> ToolActivityCategory {
+        if isCollaborationEvent(item) {
+            return .collaboration
+        }
         switch item.kind {
         case "shell":
             return .command
@@ -101,6 +128,12 @@ public enum ToolActivityGroupPresentation {
     public static func summary(_ items: [UIItem]) -> String {
         let activities = activityItems(in: items)
         guard !activities.isEmpty else { return "工具活动" }
+        if activities.allSatisfy(isCollaborationEvent) {
+            let taskName = activities.last?.tool.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? ""
+            let title = taskName.isEmpty ? "协作任务" : taskName
+            return "\(title) · \(activities.count) 条协作动态"
+        }
 
         var orderedCategories: [ToolActivityCategory] = []
         var counts: [ToolActivityCategory: Int] = [:]
@@ -149,7 +182,11 @@ public enum ToolActivityGroupPresentation {
     /// Semantic state used by the macOS cell for color. Failure always remains
     /// visible even when other calls in the same burst are still running.
     public static func semanticStatus(_ items: [UIItem]) -> String {
-        let states = activityItems(in: items).map(activityState(for:))
+        let activities = activityItems(in: items)
+        if activities.allSatisfy(isCollaborationEvent) {
+            return activities.last.map(ToolPresentation.toolStatus) ?? ""
+        }
+        let states = activities.map(activityState(for:))
         if states.contains(.failed) { return "failed" }
         if states.contains(.running) { return "running" }
         if states.contains(.pending) { return "pending" }
@@ -161,6 +198,9 @@ public enum ToolActivityGroupPresentation {
     public static func statusSummary(_ items: [UIItem]) -> String {
         let activities = activityItems(in: items)
         guard !activities.isEmpty else { return "" }
+        if activities.allSatisfy(isCollaborationEvent) {
+            return activities.last.map(ToolPresentation.toolStatusSummary) ?? ""
+        }
         let states = activities.map(activityState(for:))
         let failures = states.filter { $0 == .failed }.count
         if failures > 0 {
@@ -179,6 +219,12 @@ public enum ToolActivityGroupPresentation {
 
     private static func activityItems(in items: [UIItem]) -> [UIItem] {
         items.filter(isGroupable)
+    }
+
+    private static func isCollaborationEvent(_ item: UIItem) -> Bool {
+        item.kind == "toolCall"
+            && item.activityKind.caseInsensitiveCompare("collaboration") == .orderedSame
+            && !item.activityEvent.isEmpty
     }
 
     private static func containsAny(_ value: String, _ needles: [String]) -> Bool {
@@ -207,6 +253,7 @@ public enum ToolActivityGroupPresentation {
         case .edit: return "修改 \(count) 个文件"
         case .search: return "执行 \(count) 次搜索"
         case .image: return "查看 \(count) 张图像"
+        case .collaboration: return "处理 \(count) 条协作动态"
         case .tool, .mixed: return "执行 \(count) 项工具操作"
         }
     }

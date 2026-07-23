@@ -235,7 +235,7 @@ final class RuntimeAgentKindTests: XCTestCase {
         XCTAssertEqual(item.success, false)
     }
 
-    func testToolReducerPreservesNeutralCollaborationActivityBoundary() throws {
+    func testToolReducerPreservesNeutralCollaborationActivityGroupingIdentity() throws {
         let meta = AgentItemMeta(vendorExtensions: [
             "activityKind": AnyCodable("collaboration"),
             "activityEvent": AnyCodable("interacted"),
@@ -267,7 +267,11 @@ final class RuntimeAgentKindTests: XCTestCase {
         XCTAssertEqual(item.activityEvent, "interacted")
         XCTAssertEqual(item.tool, "spawnAgent")
         XCTAssertEqual(ToolPresentation.toolStatusSummary(item), "已更新")
-        XCTAssertFalse(ToolActivityGroupPresentation.isGroupable(item))
+        XCTAssertTrue(ToolActivityGroupPresentation.isGroupable(item))
+        XCTAssertEqual(
+            ToolActivityGroupPresentation.groupingKey(for: item),
+            .collaboration(taskName: "spawnagent")
+        )
     }
 
     func testToolReducerRoutesNeutralContextMaintenanceToCompactSystemRow() throws {

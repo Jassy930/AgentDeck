@@ -62,7 +62,7 @@ final class ToolActivityGroupCellViewTests: XCTestCase {
         XCTAssertGreaterThan(disclosure.frame.minX, status.frame.maxX)
         XCTAssertFalse(cell.hasAmbiguousLayout)
         XCTAssertEqual(disclosure.state, .off)
-        XCTAssertEqual(disclosure.accessibilityLabel(), "展开工具活动详情")
+        XCTAssertEqual(disclosure.accessibilityLabel(), "展开执行过程详情")
         XCTAssertTrue(cell.accessibilityLabel()?.contains("已折叠") == true)
     }
 
@@ -112,7 +112,7 @@ final class ToolActivityGroupCellViewTests: XCTestCase {
 
         let disclosure = try XCTUnwrap(cell.allDescendants(ofType: NSButton.self).first)
         XCTAssertEqual(disclosure.state, .on)
-        XCTAssertEqual(disclosure.accessibilityLabel(), "收起工具活动详情")
+        XCTAssertEqual(disclosure.accessibilityLabel(), "收起执行过程详情")
         XCTAssertTrue(cell.accessibilityLabel()?.contains("已展开") == true)
     }
 }

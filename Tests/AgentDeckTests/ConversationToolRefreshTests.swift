@@ -108,6 +108,56 @@ final class ConversationToolRefreshTests: XCTestCase {
         XCTAssertFalse(labels.contains("已开始工作"))
     }
 
+    func testRepeatedCollaborationActivityRendersOneExpandableProcessGroup() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let user = UIItem(
+            id: "user-collaboration-group",
+            lifecycle: "completed",
+            kind: "user",
+            text: "检查子任务动态"
+        )
+        var started = UIItem(
+            id: "activity-1",
+            lifecycle: "completed",
+            kind: "toolCall"
+        )
+        started.tool = "B3a2a implement"
+        started.activityKind = "collaboration"
+        started.activityEvent = "started"
+        let reasoning = UIItem(
+            id: "reasoning-between",
+            lifecycle: "completed",
+            kind: "reasoning",
+            text: "继续检查线性化"
+        )
+        var interacted = started
+        interacted.id = "activity-2"
+        interacted.activityEvent = "interacted"
+        model.items = [user, started, reasoning, interacted]
+
+        let controller = ConversationViewController(model: model)
+        let window = NSWindow(contentViewController: controller)
+        window.setContentSize(NSSize(width: 720, height: 520))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+
+        let table = try XCTUnwrap(firstTableView(in: controller.view))
+        table.reloadData()
+        XCTAssertEqual(table.numberOfRows, 2)
+        let groupCell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 1, makeIfNecessary: true) as? ToolActivityGroupCellView
+        )
+        let labels = visibleLabels(in: groupCell)
+        XCTAssertTrue(labels.contains("B3a2a implement · 2 条协作动态"))
+        XCTAssertTrue(labels.contains("已更新"))
+
+        let groupId = "tool-group:user-collaboration-group:activity-1"
+        let store = controller as ConversationDisclosureStateStore
+        store.setItem(groupId, expanded: true)
+        XCTAssertEqual(table.numberOfRows, 5, "展开后必须恢复两条动态和中间 reasoning")
+    }
+
     func testStableCollapsedGroupRefreshesCountAndFailureThenKeepsExpansionOnAppend() throws {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         let user = UIItem(
