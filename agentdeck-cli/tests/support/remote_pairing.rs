@@ -22,7 +22,7 @@ use agentdeck_protocol::relay_v2::auth::{
 };
 use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, LinkGeneration, MachineRouteId, PairRouteId,
-    RelayServerId, RootKeyId, TrustEpoch,
+    RelayServerId, RootKeyId, StreamRouteId, TrustEpoch,
 };
 use agentdeck_protocol::runtime::{MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION};
 use uuid::Uuid;
@@ -36,6 +36,8 @@ pub const RELAY_SERVER: RelayServerId = RelayServerId::from_bytes([0x23; 16]);
 pub const ROOT_KEY_ID: RootKeyId = RootKeyId::from_bytes([0x24; 16]);
 
 pub const KEY_DIRECTORY_REVISION: u64 = 4;
+pub const CATALOG_EPOCH: u64 = 3;
+pub const CONVERSATION_EPOCH: u64 = 9;
 pub const DEVICE_COMMAND_EPOCH: u64 = 5;
 pub const DEVICE_REPLY_EPOCH: u64 = 7;
 pub const DEVICE_COMMAND_KEY: [u8; 32] = [0x72; 32];
@@ -124,6 +126,7 @@ pub struct PairingFixture {
     machine_data_signing_seed: [u8; 32],
     machine_route: MachineRouteId,
     device_route: DeviceRouteId,
+    conversation_stream_routes: Vec<StreamRouteId>,
 }
 
 impl PairingFixture {
@@ -220,7 +223,33 @@ impl PairingFixture {
             machine_data_signing_seed,
             machine_route,
             device_route,
+            conversation_stream_routes: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_conversation_stream(mut self, stream_route: StreamRouteId) -> Self {
+        self.conversation_stream_routes.push(stream_route);
+        self
+    }
+
+    #[must_use]
+    pub fn without_catalog_authorization(mut self) -> Self {
+        self.authorization
+            .capabilities
+            .retain(|capability| *capability != AuthorizationCapabilityV1::Catalog);
+        self.authorization
+            .permissions
+            .retain(|permission| *permission != AuthorizationPermissionV1::CatalogRead);
+        self
+    }
+
+    #[must_use]
+    pub fn without_catalog_read_permission(mut self) -> Self {
+        self.authorization
+            .permissions
+            .retain(|permission| *permission != AuthorizationPermissionV1::CatalogRead);
+        self
     }
 
     pub fn machine_data_signing_key() -> SigningKey {
@@ -352,8 +381,56 @@ impl PairingFixture {
                 .expect("generated DeviceHPKE public key");
         let mut entry_rng = DeterministicRng::new([0x37; 32]);
         let mut entries = Vec::new();
+        let catalog_info = KeyUpdateInfoV1 {
+            e2ee_format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_server_id: self.invite.relay_server_id,
+            machine_route: self.machine_route,
+            device_route: self.device_route,
+            stream_route: None,
+            grant_serial: GrantSerial::new(7),
+            root_trust_epoch: TrustEpoch::new(2),
+            key_directory_revision: revision,
+            key_purpose: KeyPurpose::Catalog,
+            key_epoch: CATALOG_EPOCH,
+        };
+        entries.push(
+            seal_key_directory_entry(
+                &recipient,
+                &catalog_info,
+                &key_update_context(&catalog_info),
+                &SecretAeadKey::from_bytes([0x71; 32]),
+                &mut entry_rng,
+            )
+            .expect("seal key-directory entry"),
+        );
+        for (index, stream_route) in self.conversation_stream_routes.iter().copied().enumerate() {
+            let entry_info = KeyUpdateInfoV1 {
+                e2ee_format_version: E2EE_FORMAT_VERSION,
+                runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+                relay_server_id: self.invite.relay_server_id,
+                machine_route: self.machine_route,
+                device_route: self.device_route,
+                stream_route: Some(stream_route),
+                grant_serial: GrantSerial::new(7),
+                root_trust_epoch: TrustEpoch::new(2),
+                key_directory_revision: revision,
+                key_purpose: KeyPurpose::ConversationDek,
+                key_epoch: CONVERSATION_EPOCH,
+            };
+            let key_byte = 0x74_u8.wrapping_add(u8::try_from(index).expect("test stream count"));
+            entries.push(
+                seal_key_directory_entry(
+                    &recipient,
+                    &entry_info,
+                    &key_update_context(&entry_info),
+                    &SecretAeadKey::from_bytes([key_byte; 32]),
+                    &mut entry_rng,
+                )
+                .expect("seal conversation key-directory entry"),
+            );
+        }
         for (purpose, epoch, key_byte) in [
-            (KeyPurpose::Catalog, 3_u64, 0x71_u8),
             (KeyPurpose::DeviceCommandTx, DEVICE_COMMAND_EPOCH, 0x72),
             (KeyPurpose::DeviceReplyTx, DEVICE_REPLY_EPOCH, 0x73),
         ] {

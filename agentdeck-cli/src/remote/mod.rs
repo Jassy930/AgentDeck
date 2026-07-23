@@ -33,3 +33,5 @@ pub mod runtime;
 #[cfg(unix)]
 pub mod selector;
 pub mod signature;
+#[cfg(unix)]
+pub mod stream_state;
