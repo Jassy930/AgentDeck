@@ -1,14 +1,17 @@
 #![cfg(unix)]
 
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Barrier};
 
 use agentdeck_cli::remote::crypto_state::{
     CRYPTO_STATE_V1_HEADER_LEN, CRYPTO_STATE_V1_OVERHEAD_LEN, CryptoStateCommit, CryptoStateError,
-    CryptoStateIdentity, CryptoStateSnapshot, DeviceStorageKek, FileCryptoStateStore,
-    InitialCryptoStateCommitObserver, MAX_CRYPTO_STATE_PLAINTEXT_LEN,
+    CryptoStateIdentity, CryptoStateReplaceObserver, CryptoStateReplaceStage, CryptoStateSnapshot,
+    DeviceStorageKek, FileCryptoStateStore, InitialCryptoStateCommitObserver,
+    MAX_CRYPTO_STATE_PLAINTEXT_LEN,
 };
 use agentdeck_protocol::relay_v2::MachineRouteId;
 use agentdeck_protocol::runtime::MachineRootFingerprint;
@@ -18,6 +21,10 @@ const HEADER_MAGIC: &[u8; 4] = b"ADCS";
 const FORMAT_VERSION: u8 = 1;
 const ALGORITHM_CHACHA20_POLY1305: u8 = 1;
 const AUTHENTICATION_TAG_LEN: usize = 16;
+const REPLACE_CRASH_CHILD_ENV: &str = "AGENTDECK_CRYPTO_STATE_REPLACE_CRASH_CHILD";
+const REPLACE_CRASH_ROOT_ENV: &str = "AGENTDECK_CRYPTO_STATE_REPLACE_CRASH_ROOT";
+const REPLACE_CRASH_STAGE_ENV: &str = "AGENTDECK_CRYPTO_STATE_REPLACE_CRASH_STAGE";
+const REPLACE_CRASH_EXIT_CODE: i32 = 91;
 
 fn identity(
     installation_byte: u8,
@@ -151,6 +158,51 @@ fn assert_one_private_state_file(root: &Path, expected_file: &Path) {
     assert_eq!(metadata.nlink(), 1);
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct TreeEntryEvidence {
+    path: PathBuf,
+    bytes: Option<Vec<u8>>,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+}
+
+fn exact_tree_evidence(root: &Path) -> Vec<TreeEntryEvidence> {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    collect_tree(root, &mut directories, &mut files);
+    directories.sort();
+    files.sort();
+
+    directories
+        .into_iter()
+        .map(|path| {
+            let metadata = fs::symlink_metadata(&path).expect("tree directory metadata");
+            TreeEntryEvidence {
+                path,
+                bytes: None,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                mode: metadata.mode(),
+                links: metadata.nlink(),
+            }
+        })
+        .chain(files.into_iter().map(|path| {
+            let metadata = fs::symlink_metadata(&path).expect("tree file metadata");
+            let bytes = fs::read(&path).expect("read bounded tree file");
+            TreeEntryEvidence {
+                path,
+                bytes: Some(bytes),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                mode: metadata.mode(),
+                links: metadata.nlink(),
+            }
+        }))
+        .collect()
+}
+
 struct DeterministicCommitBarrier(Barrier);
 
 impl InitialCryptoStateCommitObserver for DeterministicCommitBarrier {
@@ -167,6 +219,39 @@ fn open_store_with_commit_barrier(
 ) -> FileCryptoStateStore {
     FileCryptoStateStore::new_in_with_initial_commit_observer(root, state_identity, kek, barrier)
         .expect("open crypto-state store with deterministic commit barrier")
+}
+
+struct ExitAtReplaceStage(CryptoStateReplaceStage);
+
+impl CryptoStateReplaceObserver for ExitAtReplaceStage {
+    fn after_stage(&self, stage: CryptoStateReplaceStage) {
+        if stage == self.0 {
+            std::process::exit(REPLACE_CRASH_EXIT_CODE);
+        }
+    }
+}
+
+fn replace_stage_name(stage: CryptoStateReplaceStage) -> &'static str {
+    match stage {
+        CryptoStateReplaceStage::TempCreated => "temp-created",
+        CryptoStateReplaceStage::TempWritten => "temp-written",
+        CryptoStateReplaceStage::BackupExcluded => "backup-excluded",
+        CryptoStateReplaceStage::FileSynced => "file-synced",
+        CryptoStateReplaceStage::Renamed => "renamed",
+        CryptoStateReplaceStage::ParentSynced => "parent-synced",
+    }
+}
+
+fn parse_replace_stage(value: &str) -> CryptoStateReplaceStage {
+    match value {
+        "temp-created" => CryptoStateReplaceStage::TempCreated,
+        "temp-written" => CryptoStateReplaceStage::TempWritten,
+        "backup-excluded" => CryptoStateReplaceStage::BackupExcluded,
+        "file-synced" => CryptoStateReplaceStage::FileSynced,
+        "renamed" => CryptoStateReplaceStage::Renamed,
+        "parent-synced" => CryptoStateReplaceStage::ParentSynced,
+        _ => panic!("unknown replace crash stage: {value}"),
+    }
 }
 
 #[test]
@@ -670,4 +755,238 @@ fn symlinked_ancestor_and_broad_permissions_fail_closed_without_repair() {
         small_file_evidence(store.state_path()),
         before_directory_failure
     );
+}
+
+#[test]
+fn compare_and_replace_is_existing_only_bounded_and_expected_exact() {
+    let temp = tempfile::tempdir().expect("private crypto-state harness");
+    let absent_root = private_root(&temp, "replace-absent");
+    let absent = open_store(&absent_root, identity(0xc1, 0xc2, 0xc3), storage_kek(0xc4));
+    let missing = expect_store_error(
+        absent.compare_and_replace(
+            &snapshot(b"expected state"),
+            &snapshot(b"replacement state"),
+        ),
+        "replace must not create a missing CryptoState",
+    );
+    assert_eq!(missing.code(), "remote.crypto_state.missing");
+    assert!(
+        !absent_root.exists(),
+        "existing-only replace must not create directories on missing state"
+    );
+
+    let root = private_root(&temp, "replace-cas");
+    let store = open_store(&root, identity(0xc5, 0xc6, 0xc7), storage_kek(0xc8));
+    let original = snapshot(b"authenticated old runtime state");
+    store
+        .commit_initial(&original)
+        .expect("seed replace CAS state");
+    let baseline = exact_tree_evidence(&root);
+
+    let mut wrong_expected = original.expose_secret().to_vec();
+    *wrong_expected.last_mut().expect("nonempty expected state") ^= 1;
+    let conflict = expect_store_error(
+        store.compare_and_replace(
+            &CryptoStateSnapshot::new(wrong_expected),
+            &snapshot(b"must not publish"),
+        ),
+        "wrong expected hash/bytes must fail closed",
+    );
+    assert_eq!(conflict.code(), "remote.crypto_state.cas_conflict");
+    assert_eq!(
+        exact_tree_evidence(&root),
+        baseline,
+        "expected mismatch must not create temp files or rewrite durable state"
+    );
+
+    let oversized = CryptoStateSnapshot::new(vec![0xa5; MAX_CRYPTO_STATE_PLAINTEXT_LEN + 1]);
+    let too_large = expect_store_error(
+        store.compare_and_replace(&original, &oversized),
+        "replacement above 128 MiB must fail before publication",
+    );
+    assert_eq!(too_large.code(), "remote.crypto_state.input_too_large");
+    assert_eq!(exact_tree_evidence(&root), baseline);
+}
+
+#[test]
+fn compare_and_replace_authenticates_old_state_and_never_repairs_offline_tamper() {
+    let temp = tempfile::tempdir().expect("private crypto-state harness");
+    let root = private_root(&temp, "replace-tamper");
+    let store = open_store(&root, identity(0xd1, 0xd2, 0xd3), storage_kek(0xd4));
+    let original = snapshot(b"authenticated old runtime state");
+    store
+        .commit_initial(&original)
+        .expect("seed tamper fixture");
+
+    let mut tampered = fs::read(store.state_path()).expect("read sealed state fixture");
+    *tampered.last_mut().expect("sealed state has a tag") ^= 1;
+    fs::write(store.state_path(), tampered).expect("tamper sealed state offline");
+    let before = exact_tree_evidence(&root);
+
+    let error = expect_store_error(
+        store.compare_and_replace(&original, &snapshot(b"must not replace tampered state")),
+        "unauthenticated old state must fail before replace",
+    );
+    assert_eq!(error.code(), "remote.crypto_state.authentication_failed");
+    assert_eq!(
+        exact_tree_evidence(&root),
+        before,
+        "offline tamper failure must perform zero rewrite, repair, or cleanup"
+    );
+}
+
+#[test]
+fn compare_and_replace_publishes_one_private_authenticated_file_and_survives_restart() {
+    let temp = tempfile::tempdir().expect("private crypto-state harness");
+    let root = private_root(&temp, "replace-success");
+    let state_identity = identity(0xe1, 0xe2, 0xe3);
+    let store = open_store(&root, state_identity, storage_kek(0xe4));
+    let original = snapshot(b"old cursor, replay, and receipt state");
+    let replacement = snapshot(b"new cursor, replay, and terminal receipt state");
+    store
+        .commit_initial(&original)
+        .expect("seed replace success state");
+    let original_file = small_file_evidence(store.state_path());
+
+    store
+        .compare_and_replace(&original, &replacement)
+        .expect("authenticated compare-and-replace");
+
+    let replaced_file = small_file_evidence(store.state_path());
+    assert_ne!(
+        replaced_file.inode, original_file.inode,
+        "replace must publish a fresh fully written inode"
+    );
+    assert!(
+        !replaced_file
+            .bytes
+            .windows(replacement.expose_secret().len())
+            .any(|window| window == replacement.expose_secret()),
+        "replacement snapshot must stay sealed at rest"
+    );
+    assert_one_private_state_file(&root, store.state_path());
+    assert!(
+        store
+            .backup_excluded()
+            .expect("replacement backup exclusion")
+    );
+
+    let reopened = open_store(&root, state_identity, storage_kek(0xe4));
+    assert_eq!(
+        reopened
+            .load()
+            .expect("load replaced state after restart")
+            .expect("replacement remains present")
+            .expose_secret(),
+        replacement.expose_secret()
+    );
+}
+
+#[test]
+fn compare_and_replace_crash_child() {
+    if env::var_os(REPLACE_CRASH_CHILD_ENV).is_none() {
+        return;
+    }
+    let root = PathBuf::from(
+        env::var_os(REPLACE_CRASH_ROOT_ENV).expect("replace crash child root environment"),
+    );
+    let stage = parse_replace_stage(
+        &env::var(REPLACE_CRASH_STAGE_ENV).expect("replace crash child stage environment"),
+    );
+    let store = FileCryptoStateStore::new_in_with_replace_observer(
+        &root,
+        identity(0xf1, 0xf2, 0xf3),
+        storage_kek(0xf4),
+        Arc::new(ExitAtReplaceStage(stage)),
+    )
+    .expect("open crash-injected replace store");
+    store
+        .compare_and_replace(
+            &snapshot(b"durable old state"),
+            &snapshot(b"durable new state"),
+        )
+        .expect("configured observer must terminate before replace returns");
+    panic!("replace crash observer did not terminate the child");
+}
+
+#[test]
+fn every_replace_crash_boundary_restarts_with_complete_old_or_new_state_without_repair() {
+    let stages = [
+        (CryptoStateReplaceStage::TempCreated, false),
+        (CryptoStateReplaceStage::TempWritten, false),
+        (CryptoStateReplaceStage::BackupExcluded, false),
+        (CryptoStateReplaceStage::FileSynced, false),
+        (CryptoStateReplaceStage::Renamed, true),
+        (CryptoStateReplaceStage::ParentSynced, true),
+    ];
+
+    for (stage, expects_new) in stages {
+        let temp = tempfile::tempdir().expect("private crypto-state crash harness");
+        let root = private_root(&temp, replace_stage_name(stage));
+        let store = open_store(&root, identity(0xf1, 0xf2, 0xf3), storage_kek(0xf4));
+        store
+            .commit_initial(&snapshot(b"durable old state"))
+            .expect("seed crash-boundary old state");
+
+        let status = Command::new(env::current_exe().expect("current integration test executable"))
+            .args(["--exact", "compare_and_replace_crash_child", "--nocapture"])
+            .env(REPLACE_CRASH_CHILD_ENV, "1")
+            .env(REPLACE_CRASH_ROOT_ENV, &root)
+            .env(REPLACE_CRASH_STAGE_ENV, replace_stage_name(stage))
+            .status()
+            .expect("run replace crash child");
+        assert_eq!(
+            status.code(),
+            Some(REPLACE_CRASH_EXIT_CODE),
+            "child must terminate at {}",
+            replace_stage_name(stage)
+        );
+
+        let reopened = open_store(&root, identity(0xf1, 0xf2, 0xf3), storage_kek(0xf4));
+        let before_load = exact_tree_evidence(&root);
+        let loaded = reopened
+            .load()
+            .expect("restart must load one complete authenticated state")
+            .expect("replace must never make existing state disappear");
+        let expected = if expects_new {
+            b"durable new state".as_slice()
+        } else {
+            b"durable old state".as_slice()
+        };
+        assert_eq!(
+            loaded.expose_secret(),
+            expected,
+            "restart state at {}",
+            replace_stage_name(stage)
+        );
+        assert!(
+            reopened
+                .backup_excluded()
+                .expect("surviving state backup exclusion"),
+            "surviving old/new inode must remain excluded from backup"
+        );
+        assert_eq!(
+            exact_tree_evidence(&root),
+            before_load,
+            "restart load at {} must not repair or delete crash artifacts",
+            replace_stage_name(stage)
+        );
+
+        let state_metadata = fs::symlink_metadata(reopened.state_path())
+            .expect("surviving state file metadata after crash");
+        assert_eq!(state_metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(state_metadata.nlink(), 1);
+        for entry in fs::read_dir(reopened.state_path().parent().expect("state path parent"))
+            .expect("list crash-boundary state directory")
+        {
+            let path = entry.expect("crash artifact entry").path();
+            let metadata = fs::symlink_metadata(&path).expect("crash artifact metadata");
+            assert!(
+                metadata.is_file(),
+                "crash artifact must not redirect through a link"
+            );
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+            assert_eq!(metadata.nlink(), 1);
+        }
+    }
 }

@@ -2,7 +2,8 @@
 //!
 //! 本层使用独立 `DeviceStorageKek` 与随机 nonce 的 ChaCha20-Poly1305；不会复用
 //! Relay transport counter/nonce 或 HPKE。首次发布固定为 private temp → backup exclusion
-//! readback → file fsync → no-replace rename → parent fsync，既有文件异常时零修复拒绝。
+//! readback → file fsync → no-replace rename → parent fsync；后续 existing-only CAS 使用相同
+//! durable temp 流程再 atomic replace。既有文件异常或 expected 不匹配时零修复拒绝。
 
 #![cfg(unix)]
 
@@ -23,7 +24,7 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_CRYPTO_STATE_PLAINTEXT_LEN: usize = 128 * 1024 * 1024;
 pub const CRYPTO_STATE_V1_HEADER_LEN: usize = 24;
@@ -154,6 +155,24 @@ pub trait InitialCryptoStateCommitObserver: Send + Sync {
     fn after_preflight_absent(&self);
 }
 
+/// 只供 library automatic harness 在 durable replace 的逐边界终止子进程。
+/// production CLI 不构造该 observer，也没有环境变量或配置入口。
+#[doc(hidden)]
+pub trait CryptoStateReplaceObserver: Send + Sync {
+    fn after_stage(&self, stage: CryptoStateReplaceStage);
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CryptoStateReplaceStage {
+    TempCreated,
+    TempWritten,
+    BackupExcluded,
+    FileSynced,
+    Renamed,
+    ParentSynced,
+}
+
 #[derive(Debug, Error)]
 pub enum CryptoStateError {
     #[error("crypto-state root is invalid")]
@@ -174,6 +193,10 @@ pub enum CryptoStateError {
     BackupExclusion,
     #[error("crypto-state immutable initial value conflicts with durable state")]
     ImmutableConflict,
+    #[error("crypto-state existing value is missing")]
+    Missing,
+    #[error("crypto-state compare-and-swap expected value conflicts with durable state")]
+    CompareAndSwapConflict,
     #[error("crypto-state exact readback failed after publication")]
     PersistenceReadbackFailed,
     #[error("crypto-state atomic no-replace publication is unsupported")]
@@ -192,6 +215,8 @@ impl CryptoStateError {
         match self {
             Self::InputTooLarge => "remote.crypto_state.input_too_large",
             Self::ImmutableConflict => "remote.crypto_state.immutable_conflict",
+            Self::Missing => "remote.crypto_state.missing",
+            Self::CompareAndSwapConflict => "remote.crypto_state.cas_conflict",
             Self::InvalidRoot | Self::UnsafeDirectory { .. } => {
                 "remote.crypto_state.directory_unsafe"
             }
@@ -213,6 +238,7 @@ pub struct FileCryptoStateStore {
     identity: CryptoStateIdentity,
     kek: DeviceStorageKek,
     initial_commit_observer: Option<Arc<dyn InitialCryptoStateCommitObserver>>,
+    replace_observer: Option<Arc<dyn CryptoStateReplaceObserver>>,
 }
 
 impl fmt::Debug for FileCryptoStateStore {
@@ -231,7 +257,7 @@ impl FileCryptoStateStore {
         identity: CryptoStateIdentity,
         kek: DeviceStorageKek,
     ) -> Result<Self, CryptoStateError> {
-        Self::new_in_inner(root, identity, kek, None)
+        Self::new_in_inner(root, identity, kek, None, None)
     }
 
     /// 仅供 automatic library harness 确定性覆盖 no-replace lost-race 分支。
@@ -242,7 +268,18 @@ impl FileCryptoStateStore {
         kek: DeviceStorageKek,
         observer: Arc<dyn InitialCryptoStateCommitObserver>,
     ) -> Result<Self, CryptoStateError> {
-        Self::new_in_inner(root, identity, kek, Some(observer))
+        Self::new_in_inner(root, identity, kek, Some(observer), None)
+    }
+
+    /// 仅供 automatic library harness 逐边界终止 replace 子进程。
+    #[doc(hidden)]
+    pub fn new_in_with_replace_observer(
+        root: &Path,
+        identity: CryptoStateIdentity,
+        kek: DeviceStorageKek,
+        observer: Arc<dyn CryptoStateReplaceObserver>,
+    ) -> Result<Self, CryptoStateError> {
+        Self::new_in_inner(root, identity, kek, None, Some(observer))
     }
 
     fn new_in_inner(
@@ -250,6 +287,7 @@ impl FileCryptoStateStore {
         identity: CryptoStateIdentity,
         kek: DeviceStorageKek,
         initial_commit_observer: Option<Arc<dyn InitialCryptoStateCommitObserver>>,
+        replace_observer: Option<Arc<dyn CryptoStateReplaceObserver>>,
     ) -> Result<Self, CryptoStateError> {
         absolute_normal_components(root)?;
         let state_path = root
@@ -262,6 +300,7 @@ impl FileCryptoStateStore {
             identity,
             kek,
             initial_commit_observer,
+            replace_observer,
         })
     }
 
@@ -371,6 +410,96 @@ impl FileCryptoStateStore {
                     .map_err(|source| io_error("sync lost-race cleanup", source))?;
                 self.readback_commit(snapshot, CryptoStateCommit::AlreadyPresent)
             }
+        }
+    }
+
+    /// 用已认证旧 plaintext 作为 expected，对既有 CryptoState 做 durable atomic replace。
+    ///
+    /// 缺文件、旧文件认证失败、或 SHA-256 与 exact bytes 任一不等时均在创建 temp 前拒绝；
+    /// 本方法不会创建首个 state，也不会修复异常的目录、文件或 crash artifact。
+    pub fn compare_and_replace(
+        &self,
+        expected: &CryptoStateSnapshot,
+        replacement: &CryptoStateSnapshot,
+    ) -> Result<(), CryptoStateError> {
+        if expected.expose_secret().len() > MAX_CRYPTO_STATE_PLAINTEXT_LEN
+            || replacement.expose_secret().len() > MAX_CRYPTO_STATE_PLAINTEXT_LEN
+        {
+            return Err(CryptoStateError::InputTooLarge);
+        }
+
+        let uid = current_euid();
+        let directories = self
+            .open_existing_directories(uid)?
+            .ok_or(CryptoStateError::Missing)?;
+        let state_component = self.identity.state_file_component();
+        let mut current = open_state_file(
+            &directories.devices,
+            &state_component,
+            &self.state_path,
+            uid,
+        )?
+        .ok_or(CryptoStateError::Missing)?;
+        if !read_backup_excluded(&current, &self.state_path)? {
+            return Err(CryptoStateError::BackupExclusion);
+        }
+        validate_state_entry(&directories.devices, &state_component, &current, uid)?;
+        let current_sealed = read_sealed_file(&mut current)?;
+        let current_plaintext =
+            Zeroizing::new(open_snapshot(&self.identity, &self.kek, &current_sealed)?);
+        validate_state_entry(&directories.devices, &state_component, &current, uid)?;
+        if !snapshot_hash_and_bytes_match(&current_plaintext, expected.expose_secret()) {
+            return Err(CryptoStateError::CompareAndSwapConflict);
+        }
+        drop(current_plaintext);
+        drop(current);
+
+        let sealed = seal_snapshot(&self.identity, &self.kek, replacement.expose_secret())?;
+        let (mut temp, mut guard) = create_temp_file(&directories.devices, &self.state_path, uid)?;
+        self.observe_replace_stage(CryptoStateReplaceStage::TempCreated);
+        temp.write_all(&sealed)
+            .map_err(|source| io_error("write replacement temp", source))?;
+        self.observe_replace_stage(CryptoStateReplaceStage::TempWritten);
+        mark_backup_excluded(&temp, guard.path())?;
+        if !read_backup_excluded(&temp, guard.path())? {
+            return Err(CryptoStateError::BackupExclusion);
+        }
+        self.observe_replace_stage(CryptoStateReplaceStage::BackupExcluded);
+        validate_state_entry(&directories.devices, guard.component_str(), &temp, uid)?;
+        temp.sync_all()
+            .map_err(|source| io_error("sync replacement temp", source))?;
+        validate_state_entry(&directories.devices, guard.component_str(), &temp, uid)?;
+        self.observe_replace_stage(CryptoStateReplaceStage::FileSynced);
+
+        rename_replace(
+            directories.devices.as_raw_fd(),
+            guard.name(),
+            &state_component,
+        )?;
+        guard.disarm();
+        self.observe_replace_stage(CryptoStateReplaceStage::Renamed);
+        directories
+            .devices
+            .sync_all()
+            .map_err(|source| io_error("sync replacement parent", source))?;
+        self.observe_replace_stage(CryptoStateReplaceStage::ParentSynced);
+
+        match self.load()? {
+            Some(actual)
+                if snapshot_hash_and_bytes_match(
+                    actual.expose_secret(),
+                    replacement.expose_secret(),
+                ) =>
+            {
+                Ok(())
+            }
+            Some(_) | None => Err(CryptoStateError::PersistenceReadbackFailed),
+        }
+    }
+
+    fn observe_replace_stage(&self, stage: CryptoStateReplaceStage) {
+        if let Some(observer) = &self.replace_observer {
+            observer.after_stage(stage);
         }
     }
 
@@ -504,6 +633,12 @@ fn open_snapshot(
             },
         )
         .map_err(|_| CryptoStateError::AuthenticationFailed)
+}
+
+fn snapshot_hash_and_bytes_match(actual: &[u8], expected: &[u8]) -> bool {
+    let actual_hash: [u8; 32] = Sha256::digest(actual).into();
+    let expected_hash: [u8; 32] = Sha256::digest(expected).into();
+    actual_hash == expected_hash && actual == expected
 }
 
 fn encode_header(plaintext_len: u32, nonce: [u8; NONCE_LEN]) -> [u8; CRYPTO_STATE_V1_HEADER_LEN] {
@@ -956,6 +1091,22 @@ fn rename_no_replace(
         } else {
             Err(io_error("publish state", source))
         }
+    }
+}
+
+fn rename_replace(
+    directory_fd: RawFd,
+    source: &CStr,
+    target: &str,
+) -> Result<(), CryptoStateError> {
+    let target = c_string(OsStr::new(target))?;
+    // SAFETY: both basenames are NUL-terminated beneath the same retained private directory fd;
+    // the target was opened, authenticated, and matched against expected before temp creation.
+    if unsafe { libc::renameat(directory_fd, source.as_ptr(), directory_fd, target.as_ptr()) } == 0
+    {
+        Ok(())
+    } else {
+        Err(io_error("replace state", io::Error::last_os_error()))
     }
 }
 
