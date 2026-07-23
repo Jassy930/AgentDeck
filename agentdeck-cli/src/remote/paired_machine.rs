@@ -17,7 +17,7 @@ use agentdeck_crypto::{
     AeadReceivingKey, AeadSendingKey, CryptoError, HpkePrivateKey, HpkePublicKey, SecretAeadKey,
     SenderCounter, SignatureBytes, SigningKey, VerifyingKey, open_key_directory_entry,
     open_pair_response, open_sealed_payload, seal_pair_response_received, seal_symmetric, sha256,
-    sign_sealed, verify_sealed, verify_tbs,
+    sign_authentication_transcript, sign_sealed, verify_sealed, verify_tbs,
 };
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
@@ -28,8 +28,10 @@ use agentdeck_protocol::e2ee::{
 };
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::{
-    AuthCanonicalError, CertRole, Ed25519Signature, RelayGrant, SignedCertificate,
+    AuthCanonicalError, AuthenticationRole, AuthenticationTranscriptV1, CertRole, Ed25519Signature,
+    RelayGrant, SignedCertificate,
 };
+use agentdeck_protocol::relay_v2::frame::{AuthProof, Authenticate, Challenge};
 use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RelayServerId,
     RequestRouteId, StreamRouteId, TrustEpoch,
@@ -39,6 +41,10 @@ use agentdeck_protocol::runtime::{
     MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeMessage,
     RuntimeRequest, SendPromptRequest,
 };
+use agentdeck_relay_client::{
+    LinkAuthenticator, RelayClientConfig, RelayClientError, RelayTlsPolicy,
+};
+use async_trait::async_trait;
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -525,9 +531,9 @@ struct AuditedPairedMachine {
     grant_serial: GrantSerial,
     trust_epoch: TrustEpoch,
     directory_revision: KeyDirectoryRevision,
-    _relay_server_id: RelayServerId,
-    _current_spki_pin: [u8; 32],
-    _next_spki_pin: [u8; 32],
+    relay_server_id: RelayServerId,
+    current_spki_pin: [u8; 32],
+    next_spki_pin: [u8; 32],
     state_store: FileCryptoStateStore,
     state_snapshot: CryptoStateSnapshot,
     state: PairedCryptoState,
@@ -540,10 +546,83 @@ struct AuditedPairedMachine {
     _canonical_receipt_carrier: Vec<u8>,
     grant: RelayGrant,
     authorization: DeviceAuthorizationV1,
-    device_signing_key: SigningKey,
+    device_signing_key: Arc<SigningKey>,
     machine_data_verifying_key: VerifyingKey,
     _device_hpke_private_key: HpkePrivateKey,
     opened_directory_keys: Vec<OpenedPairedDirectoryKey>,
+}
+
+/// `OpenedPairedMachine` 审计后 mint 的受控 Relay 连接材料。
+///
+/// 该投影只允许消费为 immutable client config 与 typed authenticator；不暴露
+/// DeviceSign、grant 或 TLS pin 的 raw getter。
+pub(super) struct PairedRelayConnectionMaterial {
+    config: RelayClientConfig,
+    authenticator: Arc<dyn LinkAuthenticator>,
+}
+
+impl fmt::Debug for PairedRelayConnectionMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairedRelayConnectionMaterial([REDACTED])")
+    }
+}
+
+impl PairedRelayConnectionMaterial {
+    pub(super) fn into_parts(self) -> (RelayClientConfig, Arc<dyn LinkAuthenticator>) {
+        (self.config, self.authenticator)
+    }
+}
+
+struct PairedDeviceAuthenticator {
+    signing_key: Arc<SigningKey>,
+    grant: RelayGrant,
+}
+
+#[async_trait]
+impl LinkAuthenticator for PairedDeviceAuthenticator {
+    fn proof(&self) -> AuthProof {
+        AuthProof::Device {
+            relay_grant: self.grant.clone(),
+        }
+    }
+
+    async fn authenticate(&self, challenge: &Challenge) -> Result<Authenticate, RelayClientError> {
+        let transcript = AuthenticationTranscriptV1 {
+            role: AuthenticationRole::Device,
+            challenge_nonce: challenge.challenge_nonce,
+            connection_instance: challenge.connection_instance,
+            relay_server_id: challenge.relay_server_id,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            machine_route: self.grant.machine_route,
+            device_route: Some(self.grant.device_route),
+            serial_or_generation: self.grant.grant_serial.value(),
+            credential_sha256: self.grant.canonical_sha256(),
+        };
+        Ok(Authenticate {
+            proof: self.proof(),
+            signature: sign_authentication_transcript(self.signing_key.as_ref(), &transcript)
+                .into(),
+        })
+    }
+}
+
+pub(super) fn paired_spki_pins(current: [u8; 32], next: [u8; 32]) -> Vec<[u8; 32]> {
+    if current == next {
+        vec![current]
+    } else {
+        vec![current, next]
+    }
+}
+
+#[cfg(test)]
+pub(super) fn device_authenticator_for_test(
+    signing_key: SigningKey,
+    grant: RelayGrant,
+) -> Arc<dyn LinkAuthenticator> {
+    Arc::new(PairedDeviceAuthenticator {
+        signing_key: Arc::new(signing_key),
+        grant,
+    })
 }
 
 /// 已完成 canonical decode、header/AAD 绑定与 MachineDataSign 验证的 directed reply。
@@ -655,6 +734,29 @@ impl OpenedPairedMachine<'_> {
     #[must_use]
     pub fn wss_url(&self) -> &str {
         &self.audited.wss_url
+    }
+
+    /// 从完整审计后的 paired capability mint 唯一 production Relay profile。
+    ///
+    /// TLS 永远是 state-bound pinned-SPKI；current/next 仅做保序 exact 去重，不存在
+    /// public-CA fallback、CLI override 或 raw DeviceSign/grant getter。
+    pub(super) fn mint_relay_connection_material(
+        &self,
+    ) -> Result<PairedRelayConnectionMaterial, RelayClientError> {
+        let tls = RelayTlsPolicy::pinned_spki(paired_spki_pins(
+            self.audited.current_spki_pin,
+            self.audited.next_spki_pin,
+        ))?;
+        let config =
+            RelayClientConfig::new(&self.audited.wss_url, self.audited.relay_server_id, tls)?;
+        let authenticator: Arc<dyn LinkAuthenticator> = Arc::new(PairedDeviceAuthenticator {
+            signing_key: Arc::clone(&self.audited.device_signing_key),
+            grant: self.audited.grant.clone(),
+        });
+        Ok(PairedRelayConnectionMaterial {
+            config,
+            authenticator,
+        })
     }
 
     #[must_use]
@@ -777,7 +879,10 @@ impl OpenedPairedMachine<'_> {
             SenderCounter(reservation.start()),
         )
         .map_err(PairedPromotionError::Crypto)?;
-        Ok(sign_sealed(unsigned, &self.audited.device_signing_key, &context).to_wire_bytes())
+        Ok(
+            sign_sealed(unsigned, self.audited.device_signing_key.as_ref(), &context)
+                .to_wire_bytes(),
+        )
     }
 
     /// 在 replay state 之前完成 outer-correlated reply 的 canonical/header/AAD/signature 验证。
@@ -1547,9 +1652,9 @@ impl<'a> PairedMachineStore<'a> {
             grant_serial: bootstrap.grant_serial,
             trust_epoch: bootstrap.trust_epoch,
             directory_revision: bootstrap.directory_revision,
-            _relay_server_id: bootstrap.relay_server_id,
-            _current_spki_pin: bootstrap.current_spki_pin,
-            _next_spki_pin: bootstrap.next_spki_pin,
+            relay_server_id: bootstrap.relay_server_id,
+            current_spki_pin: bootstrap.current_spki_pin,
+            next_spki_pin: bootstrap.next_spki_pin,
             _canonical_receipt_carrier: bootstrap.receipt_carrier.clone(),
             state_store,
             state_snapshot,
@@ -1562,7 +1667,7 @@ impl<'a> PairedMachineStore<'a> {
             marker,
             grant: audit.grant,
             authorization: audit.authorization,
-            device_signing_key: audit.device_signing_key,
+            device_signing_key: Arc::new(audit.device_signing_key),
             machine_data_verifying_key: audit.machine_data_verifying_key,
             _device_hpke_private_key: audit.device_hpke_private_key,
             opened_directory_keys: audit.opened_keys,

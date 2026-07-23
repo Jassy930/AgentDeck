@@ -21,6 +21,7 @@ use agentdeck_protocol::runtime::{
     CommandReceipt, MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope,
     RuntimeMessage, RuntimeReply, SendPromptRequest,
 };
+use agentdeck_relay_client::RelayClientError;
 use async_trait::async_trait;
 use thiserror::Error;
 use uuid::Uuid;
@@ -47,6 +48,9 @@ pub trait RemoteRuntimeTransport: Send {
     async fn send(&mut self, frame: ExactRelayFrame) -> Result<(), RemoteRuntimeTransportError>;
 
     async fn recv(&mut self) -> Result<Option<OpaqueRouteFrame>, RemoteRuntimeTransportError>;
+
+    /// 等待 transport-owned I/O task 收口；默认用于无后台任务的 automatic fake。
+    async fn shutdown(&mut self) {}
 }
 
 /// 已由 Runtime durable state 冻结并通过严格 Relay codec 校验的逐字节发送单元。
@@ -72,6 +76,11 @@ impl ExactRelayFrame {
         Ok(Self { bytes })
     }
 
+    #[cfg(test)]
+    pub(super) fn from_frozen_for_test(bytes: Vec<u8>) -> Result<Self, CodecError> {
+        Self::from_frozen(bytes)
+    }
+
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
@@ -86,6 +95,8 @@ impl ExactRelayFrame {
 /// Relay transport 层失败。
 #[derive(Debug, Error)]
 pub enum RemoteRuntimeTransportError {
+    #[error(transparent)]
+    Relay(#[from] RelayClientError),
     #[error("remote runtime transport failed: {0}")]
     Failed(String),
 }
@@ -149,6 +160,11 @@ where
     #[must_use]
     pub const fn new(machine: OpenedPairedMachine<'a>, transport: T) -> Self {
         Self { transport, machine }
+    }
+
+    /// 显式等待 transport shutdown，随后按字段顺序先销毁 transport、再释放 device lease。
+    pub async fn shutdown(mut self) {
+        self.transport.shutdown().await;
     }
 
     /// 发送或精确重试一个 prompt，直到得到 authenticated daemon receipt 或非成功错误。

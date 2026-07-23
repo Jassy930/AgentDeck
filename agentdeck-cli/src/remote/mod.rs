@@ -15,5 +15,9 @@ pub mod pending;
 #[cfg(unix)]
 pub mod production;
 #[cfg(unix)]
+pub mod relay_transport;
+#[cfg(all(test, unix))]
+mod relay_transport_tests;
+#[cfg(unix)]
 pub mod runtime;
 pub mod signature;
