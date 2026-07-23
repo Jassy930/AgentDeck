@@ -235,7 +235,7 @@ pub async fn run_runtime(
             runtime_cli::request_pairing_administration(client, plan.into_request()?).await?;
         let result = match (expected, reply) {
             (PairingReplyKind::Invite, RuntimeReply::PairInvite(value)) => {
-                serde_json::to_value(value)?
+                canonical_pair_invite_output(value, crate::unix_now_ms())?
             }
             (PairingReplyKind::Pending, RuntimeReply::PendingPairings { pairings }) => {
                 serde_json::to_value(pairings)?
@@ -292,6 +292,23 @@ pub async fn run_runtime(
     )?;
     println!("{}", render(&output, pretty));
     Ok(())
+}
+
+fn canonical_pair_invite_output(
+    value: agentdeck_protocol::runtime::PairInvite,
+    now_ms: u64,
+) -> Result<serde_json::Value, CliError> {
+    let invite_uri = value
+        .invite
+        .encode_uri(now_ms)
+        .map_err(|_| CliError::Protocol {
+            code: Some("daemon.client.pairing_invite_invalid".to_owned()),
+            message: "daemon returned an invalid or expired pairing invite".to_owned(),
+        })?;
+    Ok(serde_json::json!({
+        "pairingId": value.pairing_id,
+        "inviteUri": invite_uri,
+    }))
 }
 
 fn validate_pairing_idempotency_key(value: &str) -> Result<(), CliError> {
@@ -751,6 +768,31 @@ mod tests {
                 .is_err()
         );
         assert!(RuntimeRemotePlan::pairing_cancel(uuid::Uuid::nil().to_string()).is_err());
+    }
+
+    #[test]
+    fn pairing_invite_output_is_one_canonical_uri_without_structured_secret_fields() {
+        let reply: RuntimeReply =
+            serde_json::from_value(fixture_payload("replyPairInvite")).expect("fixture reply");
+        let RuntimeReply::PairInvite(value) = reply else {
+            panic!("expected PairInvite reply")
+        };
+        let expected = (*value.invite).clone();
+        let output = canonical_pair_invite_output(value, 1_700_000_000_000)
+            .expect("fresh canonical invite URI");
+
+        assert_eq!(output.as_object().map(serde_json::Map::len), Some(2));
+        assert_eq!(output["pairingId"], "pairing-invite-1");
+        let invite_uri = output["inviteUri"].as_str().expect("inviteUri string");
+        assert_eq!(
+            agentdeck_protocol::e2ee::PairInviteV1::decode_uri(invite_uri, 1_700_000_000_000,)
+                .expect("decode emitted URI"),
+            expected,
+        );
+        let rendered = output.to_string();
+        for forbidden in ["inviteSecret", "wssUrl", "currentSpkiPin", "dataSignCert"] {
+            assert!(!rendered.contains(forbidden));
+        }
     }
 
     #[test]

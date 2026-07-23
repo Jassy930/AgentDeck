@@ -325,9 +325,10 @@ async fn legacy_credential_marker_is_byte_identical_and_rejected_before_network(
         "--data-dir",
         temp.path().to_str().expect("UTF-8 temp path"),
         "remote",
-        "machines",
+        "sessions",
         "--relay",
         &relay,
+        "legacy-machine",
     ])
     .await;
     assert!(!output.status.success());
@@ -359,9 +360,10 @@ async fn dangling_legacy_marker_symlink_is_still_reset_required_and_never_follow
         "--data-dir",
         temp.path().to_str().expect("UTF-8 temp path"),
         "remote",
-        "machines",
+        "sessions",
         "--relay",
         &relay,
+        "legacy-machine",
     ])
     .await;
     assert!(!output.status.success());
@@ -397,9 +399,10 @@ async fn persistent_remote_without_a_legacy_marker_is_typed_unsupported_and_neve
         "--data-dir",
         temp.path().to_str().expect("UTF-8 temp path"),
         "remote",
-        "machines",
+        "sessions",
         "--relay",
         &relay,
+        "legacy-machine",
     ])
     .await;
     assert!(!output.status.success());
@@ -412,9 +415,10 @@ async fn persistent_remote_without_a_legacy_marker_is_typed_unsupported_and_neve
 }
 
 #[test]
-fn legacy_v1_secret_is_rejected_without_echo() {
-    let output = StdCommand::new(env!("CARGO_BIN_EXE_agentdeck"))
-        .args([
+fn forbidden_pair_argv_secrets_are_rejected_without_echo() {
+    let raw_invite = format!("agentdeck-pair:v1:{SECRET_SENTINEL}");
+    for args in [
+        vec![
             "remote",
             "pair",
             "--relay",
@@ -423,18 +427,65 @@ fn legacy_v1_secret_is_rejected_without_echo() {
             SECRET_SENTINEL,
             "--role",
             "machine",
+        ],
+        vec![
+            "remote",
+            "pair",
+            raw_invite.as_str(),
+            "--confirm-root-fingerprint",
+            "sha256:00",
+        ],
+        vec![
+            "--data-dir",
+            raw_invite.as_str(),
+            "remote",
+            "pair",
+            "--invite-stdin",
+            "--confirm-root-fingerprint",
+            "sha256:00",
+        ],
+    ] {
+        let output = StdCommand::new(env!("CARGO_BIN_EXE_agentdeck"))
+            .args(args)
+            .output()
+            .expect("run rejected remote pair argv secret");
+
+        assert!(!output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.contains(r#""code":"usage""#));
+        assert!(stdout.contains("only through --invite-file or --invite-stdin"));
+        assert!(stderr.contains("only through --invite-file or --invite-stdin"));
+        assert!(!stdout.contains(SECRET_SENTINEL));
+        assert!(!stderr.contains(SECRET_SENTINEL));
+    }
+}
+
+#[test]
+fn production_identity_gate_runs_before_missing_invite_file_read() {
+    let missing = format!("/tmp/agentdeck-missing-{SECRET_SENTINEL}");
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_agentdeck"))
+        .args([
+            "remote",
+            "pair",
+            "--invite-file",
+            missing.as_str(),
+            "--confirm-root-fingerprint",
+            "sha256:00",
         ])
         .output()
-        .expect("run rejected legacy remote pair");
+        .expect("run production-gated remote pair");
 
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect("error JSON");
     assert!(
-        stdout.is_empty(),
-        "legacy rejection must not emit a success payload"
+        envelope["error"]["code"]
+            .as_str()
+            .is_some_and(|code| code.starts_with("remote.persistent."))
     );
-    assert_eq!(stderr.trim(), "remote.v1.reset_required");
+    assert!(!stdout.contains("remote.pairing.input_unsafe"));
     assert!(!stdout.contains(SECRET_SENTINEL));
     assert!(!stderr.contains(SECRET_SENTINEL));
 }

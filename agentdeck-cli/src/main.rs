@@ -9,15 +9,19 @@ mod transport;
 use clap::{Parser, Subcommand, error::ErrorKind};
 use main_types::{AgentKindArg, ApprovalArg, EffortArg, PermissionArg, SandboxArg, SessionRunArgs};
 use output::{CliError, render};
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::future::Future;
+use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
+use agentdeck_crypto::rand_core::SeedableRng;
 use agentdeck_protocol::runtime::{
     ArtifactSha256, IdempotencyKey, LocalOnlyAdministration, RuntimeReply, RuntimeRequest,
     StageUpgradeReceipt, StageUpgradeRequest,
 };
+use rand_chacha::ChaCha20Rng;
 
 #[derive(Parser)]
 #[command(name = "agentdeck", about = "AgentDeck unified interface CLI (v2)")]
@@ -287,14 +291,26 @@ enum RemoteOp {
     },
     /// Removed Relay v1 smoke command (migration error only)
     Smoke,
-    /// Persistent pairing is P4; legacy v1 inputs return reset-required
+    /// Pair this persistent CLI from a canonical bearer invite read outside argv
     Pair {
+        /// Read the canonical PairInvite URI from a current-UID exact-0600 no-follow file
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "invite_stdin",
+            conflicts_with = "invite_stdin"
+        )]
+        invite_file: Option<PathBuf>,
+        /// Read the canonical PairInvite URI from redirected non-interactive stdin
+        #[arg(
+            long,
+            required_unless_present = "invite_file",
+            conflicts_with = "invite_file"
+        )]
+        invite_stdin: bool,
+        /// Exact MachineRoot fingerprint shown by the out-of-band invite source
         #[arg(long)]
-        relay: Option<String>,
-        #[arg(long = "bootstrap-secret", hide = true)]
-        legacy_secret: Option<OsString>,
-        #[arg(long, value_enum)]
-        role: Option<RoleArg>,
+        confirm_root_fingerprint: String,
     },
     /// List locally paired machines without dialing Relay or the daemon
     Machines,
@@ -359,12 +375,6 @@ enum RemotePairingOp {
     Approve { pairing_id: String },
     /// Cancel one pending request
     Cancel { pairing_id: String },
-}
-
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-enum RoleArg {
-    Machine,
-    Device,
 }
 
 async fn connect_runtime(
@@ -606,6 +616,20 @@ async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
         },
         Cmd::Remote { op } => {
             runtime_cli::validate_runtime_globals(&cli.profile, cli.data_dir.as_deref())?;
+            if let RemoteOp::Pair {
+                invite_file,
+                invite_stdin,
+                confirm_root_fingerprint,
+            } = op
+            {
+                return run_persistent_remote_pair(
+                    invite_file.as_deref(),
+                    *invite_stdin,
+                    confirm_root_fingerprint,
+                    pretty,
+                )
+                .await;
+            }
             if matches!(op, RemoteOp::Machines) {
                 let composition =
                     agentdeck_cli::remote::production::PersistentRemoteComposition::production()
@@ -651,7 +675,7 @@ async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
                 } => {
                     remote_cli::RuntimeRemotePlan::trust_reset(admin_purge_receipt_file.as_deref())?
                 }
-                _ => unreachable!("legacy remote dispatch exits before Runtime dispatch"),
+                _ => unreachable!("non-UDS remote dispatch exits before Runtime dispatch"),
             };
             let client = connect_runtime(cli).await?;
             remote_cli::run_runtime(&client, plan, pretty).await
@@ -942,8 +966,218 @@ fn persistent_remote_machines_cli_error(
     }
 }
 
+async fn run_persistent_remote_pair(
+    invite_file: Option<&std::path::Path>,
+    invite_stdin: bool,
+    confirm_root_fingerprint: &str,
+    pretty: bool,
+) -> Result<(), CliError> {
+    // 签名、entitlement 与 production Keychain composition 必须在触碰 bearer 前收口。
+    let composition = agentdeck_cli::remote::production::PersistentRemoteComposition::production()
+        .map_err(persistent_remote_composition_cli_error)?;
+    let now_ms = unix_now_ms();
+    let invite = match (invite_file, invite_stdin) {
+        (Some(path), false) => {
+            agentdeck_cli::remote::pair::load_pair_invite_from_private_file(path, now_ms)
+                .map_err(persistent_remote_pair_cli_error)?
+        }
+        (None, true) => {
+            let stdin = std::io::stdin();
+            require_non_tty_pair_stdin(stdin.is_terminal())?;
+            agentdeck_cli::remote::pair::load_pair_invite_from_reader(stdin.lock(), now_ms)
+                .map_err(persistent_remote_pair_cli_error)?
+        }
+        _ => {
+            return Err(CliError::Usage(
+                "remote pair requires exactly one of --invite-file or --invite-stdin".to_owned(),
+            ));
+        }
+    };
+    let confirmed = agentdeck_cli::remote::pair::confirm_machine_root_fingerprint(
+        invite,
+        confirm_root_fingerprint,
+    )
+    .map_err(persistent_remote_pair_cli_error)?;
+    let mut rng = production_pairing_rng()?;
+    let outcome = agentdeck_cli::remote::pair::pair_production(&composition, confirmed, &mut rng)
+        .await
+        .map_err(persistent_remote_pair_cli_error)?;
+    let output = serde_json::json!({
+        "operation": "remote.pair",
+        "pairing": {
+            "state": "paired",
+            "machineRootFingerprint": outcome.machine_root_fingerprint(),
+            "machineRoute": outcome.machine_route(),
+            "deviceRoute": outcome.device_route(),
+            "recoveredPairedMarker": outcome.recovered_paired_marker(),
+        },
+        "transport": {
+            "routeAcceptedObserved": outcome.route_accepted_observed(),
+            "durableClosed": true,
+        }
+    });
+    println!("{}", render(&output, pretty));
+    Ok(())
+}
+
+fn require_non_tty_pair_stdin(is_terminal: bool) -> Result<(), CliError> {
+    if is_terminal {
+        Err(CliError::Usage(
+            "remote pair --invite-stdin requires redirected non-interactive stdin".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn persistent_remote_pair_cli_error(
+    error: agentdeck_cli::remote::pair::DurablePairError,
+) -> CliError {
+    let code = Some(error.code().to_owned());
+    let message = error.to_string();
+    match error {
+        agentdeck_cli::remote::pair::DurablePairError::Input(_)
+        | agentdeck_cli::remote::pair::DurablePairError::InvalidInvite(_)
+        | agentdeck_cli::remote::pair::DurablePairError::InvalidAuthorization(_)
+        | agentdeck_cli::remote::pair::DurablePairError::RootFingerprintMismatch
+        | agentdeck_cli::remote::pair::DurablePairError::ClosedBeforeReceipt
+        | agentdeck_cli::remote::pair::DurablePairError::RouteMismatch => {
+            CliError::Protocol { code, message }
+        }
+        agentdeck_cli::remote::pair::DurablePairError::OutcomeUnknown
+        | agentdeck_cli::remote::pair::DurablePairError::TransportSecurity(_)
+        | agentdeck_cli::remote::pair::DurablePairError::RelayRejected(_) => {
+            CliError::Transport { code, message }
+        }
+        agentdeck_cli::remote::pair::DurablePairError::Pending(_)
+        | agentdeck_cli::remote::pair::DurablePairError::Promotion(_) => {
+            CliError::Session { code, message }
+        }
+    }
+}
+
+fn production_pairing_rng() -> Result<ChaCha20Rng, CliError> {
+    let mut seed = Zeroizing::new([0_u8; 32]);
+    getrandom::fill(seed.as_mut()).map_err(|_| pairing_entropy_cli_error())?;
+    if seed.iter().all(|byte| *byte == 0) {
+        return Err(pairing_entropy_cli_error());
+    }
+    Ok(ChaCha20Rng::from_seed(*seed))
+}
+
+fn pairing_entropy_cli_error() -> CliError {
+    CliError::Session {
+        code: Some("remote.pairing.entropy_unavailable".to_owned()),
+        message: "production pairing entropy is unavailable".to_owned(),
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+const FORBIDDEN_PAIR_ARGV_MESSAGE: &str =
+    "remote pair accepts the invite bearer only through --invite-file or --invite-stdin";
+
+fn forbidden_remote_pair_argv<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let arguments = args.into_iter().skip(1).collect::<Vec<_>>();
+    if arguments
+        .iter()
+        .any(|argument| contains_ascii(argument.as_ref().as_encoded_bytes(), b"agentdeck-pair:"))
+    {
+        return true;
+    }
+
+    let mut index = 0;
+    if !next_argv_command_is(&arguments, &mut index, b"remote")
+        || !next_argv_command_is(&arguments, &mut index, b"pair")
+    {
+        return false;
+    }
+    arguments[index..].iter().any(|argument| {
+        let bytes = argument.as_ref().as_encoded_bytes();
+        [
+            b"--invite".as_slice(),
+            b"--relay",
+            b"--bootstrap-secret",
+            b"--role",
+        ]
+        .into_iter()
+        .any(|flag| is_flag_or_assignment(bytes, flag))
+    })
+}
+
+fn next_argv_command_is<S>(arguments: &[S], index: &mut usize, expected: &[u8]) -> bool
+where
+    S: AsRef<OsStr>,
+{
+    while let Some(argument) = arguments.get(*index) {
+        let bytes = argument.as_ref().as_encoded_bytes();
+        if let Some(width) = global_argv_width(bytes) {
+            if width == 2 && arguments.get(index.saturating_add(1)).is_none() {
+                return false;
+            }
+            *index = index.saturating_add(width);
+            continue;
+        }
+        *index = index.saturating_add(1);
+        return bytes == expected;
+    }
+    false
+}
+
+fn global_argv_width(value: &[u8]) -> Option<usize> {
+    if value == b"--pretty" {
+        return Some(1);
+    }
+    for option in [
+        b"--profile".as_slice(),
+        b"--data-dir",
+        b"--runtime-temp-root-for-test",
+    ] {
+        if value == option {
+            return Some(2);
+        }
+        if value
+            .strip_prefix(option)
+            .is_some_and(|suffix| suffix.starts_with(b"="))
+        {
+            return Some(1);
+        }
+    }
+    None
+}
+
+fn contains_ascii(value: &[u8], needle: &[u8]) -> bool {
+    value
+        .windows(needle.len())
+        .any(|candidate| candidate == needle)
+}
+
+fn is_flag_or_assignment(value: &[u8], flag: &[u8]) -> bool {
+    value == flag
+        || value
+            .strip_prefix(flag)
+            .is_some_and(|suffix| suffix.starts_with(b"="))
+}
+
 #[tokio::main]
 async fn main() {
+    if forbidden_remote_pair_argv(std::env::args_os()) {
+        let error = CliError::Usage(FORBIDDEN_PAIR_ARGV_MESSAGE.to_owned());
+        eprintln!("agentdeck: {}", error.message());
+        println!("{}", render(&output::error_envelope(&error), false));
+        std::process::exit(error.exit_code());
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error)
@@ -968,17 +1202,13 @@ async fn main() {
             | RemoteOp::Pairing { .. }
             | RemoteOp::Revoke { .. }
             | RemoteOp::TrustReset { .. }
+            | RemoteOp::Pair { .. }
             | RemoteOp::Machines => None,
             RemoteOp::Synthetic { bundle } => Some(remote_cli::RemoteOpArg::Synthetic {
                 bundle: bundle.clone(),
             }),
-            RemoteOp::Pair {
-                legacy_secret: Some(_),
-                ..
-            }
-            | RemoteOp::Smoke => Some(remote_cli::RemoteOpArg::LegacyV1),
-            RemoteOp::Pair { .. }
-            | RemoteOp::Sessions { .. }
+            RemoteOp::Smoke => Some(remote_cli::RemoteOpArg::LegacyV1),
+            RemoteOp::Sessions { .. }
             | RemoteOp::Watch { .. }
             | RemoteOp::Send { .. }
             | RemoteOp::Approve { .. }
@@ -1194,6 +1424,236 @@ mod remote_machine_cli_tests {
             ])
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_pair_cli_tests {
+    use super::*;
+
+    const CONFIRMATION: &str = "sha256:11:22:33";
+
+    #[test]
+    fn persistent_pair_requires_one_non_argv_invite_source_and_root_confirmation() {
+        let file = Cli::try_parse_from([
+            "agentdeck",
+            "remote",
+            "pair",
+            "--invite-file",
+            "/private/tmp/pair-invite.txt",
+            "--confirm-root-fingerprint",
+            CONFIRMATION,
+        ])
+        .expect("parse private invite file source");
+        assert!(matches!(
+            file.command,
+            Cmd::Remote {
+                op: RemoteOp::Pair {
+                    invite_file: Some(path),
+                    invite_stdin: false,
+                    confirm_root_fingerprint,
+                }
+            } if path.as_path() == std::path::Path::new("/private/tmp/pair-invite.txt")
+                && confirm_root_fingerprint == CONFIRMATION
+        ));
+
+        let stdin = Cli::try_parse_from([
+            "agentdeck",
+            "remote",
+            "pair",
+            "--invite-stdin",
+            "--confirm-root-fingerprint",
+            CONFIRMATION,
+        ])
+        .expect("parse explicit stdin source");
+        assert!(matches!(
+            stdin.command,
+            Cmd::Remote {
+                op: RemoteOp::Pair {
+                    invite_file: None,
+                    invite_stdin: true,
+                    confirm_root_fingerprint,
+                }
+            } if confirm_root_fingerprint == CONFIRMATION
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "agentdeck",
+                "remote",
+                "pair",
+                "--confirm-root-fingerprint",
+                CONFIRMATION,
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agentdeck",
+                "remote",
+                "pair",
+                "--invite-stdin",
+                "--invite-file",
+                "/private/tmp/pair-invite.txt",
+                "--confirm-root-fingerprint",
+                CONFIRMATION,
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["agentdeck", "remote", "pair", "--invite-stdin",]).is_err());
+    }
+
+    #[test]
+    fn persistent_pair_rejects_every_legacy_or_argv_bearer_surface() {
+        for forbidden in [
+            vec!["--relay", "wss://relay.example/"],
+            vec!["--bootstrap-secret", "secret-sentinel"],
+            vec!["--role", "device"],
+            vec!["--invite", "agentdeck-pair:v1:secret-sentinel"],
+        ] {
+            let mut args = vec!["agentdeck", "remote", "pair", "--invite-stdin"];
+            args.extend(forbidden);
+            args.extend(["--confirm-root-fingerprint", CONFIRMATION]);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "agentdeck",
+                "remote",
+                "pair",
+                "agentdeck-pair:v1:secret-sentinel",
+                "--confirm-root-fingerprint",
+                CONFIRMATION,
+            ])
+            .is_err()
+        );
+
+        for forbidden in [
+            vec![
+                "agentdeck",
+                "remote",
+                "pair",
+                "agentdeck-pair:v1:secret-sentinel",
+            ],
+            vec!["agentdeck", "remote", "pair", "--invite", "secret-sentinel"],
+            vec![
+                "agentdeck",
+                "remote",
+                "pair",
+                "--bootstrap-secret=secret-sentinel",
+            ],
+            vec![
+                "agentdeck",
+                "remote",
+                "pair",
+                "--unknown=agentdeck-pair:v1:secret-sentinel",
+            ],
+            vec![
+                "agentdeck",
+                "--data-dir",
+                "agentdeck-pair:v1:secret-sentinel",
+                "remote",
+                "pair",
+                "--invite-stdin",
+            ],
+            vec![
+                "agentdeck",
+                "--profile",
+                "stable",
+                "remote",
+                "--pretty",
+                "pair",
+                "--bootstrap-secret=secret-sentinel",
+            ],
+        ] {
+            assert!(forbidden_remote_pair_argv(forbidden));
+        }
+        assert!(!forbidden_remote_pair_argv([
+            "agentdeck",
+            "remote",
+            "pair",
+            "--invite-file",
+            "/private/tmp/pair-invite.txt",
+            "--confirm-root-fingerprint",
+            CONFIRMATION,
+        ]));
+        assert!(!forbidden_remote_pair_argv([
+            "agentdeck",
+            "remote",
+            "sessions",
+            "pair",
+            "--relay",
+            "wss://relay.example/",
+        ]));
+        assert!(!forbidden_remote_pair_argv([
+            "agentdeck",
+            "--data-dir",
+            "remote",
+            "pair",
+            "--relay",
+            "wss://relay.example/",
+        ]));
+    }
+
+    #[test]
+    fn pair_stdin_rejects_an_interactive_terminal() {
+        let error = require_non_tty_pair_stdin(true).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(!error.message().contains("agentdeck-pair:"));
+        assert!(require_non_tty_pair_stdin(false).is_ok());
+    }
+
+    #[test]
+    fn production_signature_composition_precedes_bearer_read_and_pending_pair() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("async fn run_persistent_remote_pair(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("fn require_non_tty_pair_stdin").next())
+            .expect("persistent pair function body");
+        let composition = body
+            .find("PersistentRemoteComposition::production()")
+            .expect("production signature composition");
+        let file_read = body
+            .find("load_pair_invite_from_private_file")
+            .expect("private bearer file read");
+        let stdin_read = body
+            .find("load_pair_invite_from_reader")
+            .expect("bounded stdin bearer read");
+        let confirmation = body
+            .find("confirm_machine_root_fingerprint")
+            .expect("root fingerprint confirmation");
+        let production_pair = body.find("pair_production").expect("production pair call");
+
+        assert!(composition < file_read);
+        assert!(composition < stdin_read);
+        assert!(file_read < confirmation);
+        assert!(stdin_read < confirmation);
+        assert!(confirmation < production_pair);
+
+        let output = body
+            .split("let output = serde_json::json!")
+            .nth(1)
+            .and_then(|suffix| suffix.split("println!").next())
+            .expect("pair success output");
+        for forbidden in ["inviteUri", "inviteSecret", "wssUrl", "sealedBlob"] {
+            assert!(
+                !output.contains(forbidden),
+                "forbidden output field {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_pair_input_preserves_typed_code_without_echoing_source() {
+        let error =
+            persistent_remote_pair_cli_error(agentdeck_cli::remote::pair::DurablePairError::Input(
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "secret-sentinel-path"),
+            ));
+        let rendered = output::error_envelope(&error).to_string();
+        assert_eq!(error.exit_code(), 3);
+        assert!(rendered.contains("remote.pairing.input_unsafe"));
+        assert!(!rendered.contains("secret-sentinel-path"));
     }
 }
 

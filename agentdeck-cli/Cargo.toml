@@ -20,6 +20,7 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "process", "sync", "macros", "time"] }
 rand = "0.8"
+rand_chacha = "0.10"
 base64 = "0.22"
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 getrandom = "0.4"
