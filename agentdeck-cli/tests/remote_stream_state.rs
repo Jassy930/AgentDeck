@@ -17,9 +17,11 @@ use agentdeck_cli::remote::keychain::{
     MemoryRemoteKeyStore, PairedRemoteKeyPurpose, RemoteKeyAccount, RemoteKeyStore,
 };
 use agentdeck_cli::remote::paired_machine::{
-    AutomaticRuntimeStateProbe, PairedMachineStore, PairedMutationObserver, PairedMutationStage,
+    AutomaticRuntimeProjection, AutomaticRuntimeStateProbe, PairedMachineStore,
+    PairedMutationObserver, PairedMutationStage,
 };
-use agentdeck_cli::remote::stream_state::DurableStreamBindingV1;
+use agentdeck_cli::remote::stream_state::{DurableStreamBindingV1, RemoteStreamStateError};
+use agentdeck_crypto::sha256;
 use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, KeyId, KeyPurpose, StreamBindingV1};
 use agentdeck_protocol::relay_v2::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RELAY_PROTOCOL_VERSION,
@@ -39,7 +41,9 @@ const CONVERSATION_ROUTE: StreamRouteId = StreamRouteId::from_bytes([0x82; 16]);
 const CATALOG_GENERATION: StreamGenerationId = StreamGenerationId::from_bytes([0x91; 16]);
 const CONVERSATION_GENERATION: StreamGenerationId = StreamGenerationId::from_bytes([0x92; 16]);
 const LEGACY_MUTABLE_STATE_VERSION: u16 = 2;
-const TYPED_RUNTIME_STATE_VERSION: u16 = 3;
+const TRANSFER_RUNTIME_STATE_VERSION: u16 = 6;
+const DURABLE_STREAM_STATE_HEADER_BYTES: usize = 12;
+const EMERGENCY_REPLAY_DEBT_HASH_DOMAIN: &[u8] = b"AgentDeck/DurableStreamEmergencyReplayDebtV1\0";
 
 struct NoopMutationObserver;
 
@@ -218,6 +222,64 @@ fn conversation_binding_for(
     }
 }
 
+fn indexed_conversation_binding(fixture: &PairingFixture, index: u64) -> StreamBindingV1 {
+    let mut route = [0x82; 16];
+    route[8..].copy_from_slice(&index.to_be_bytes());
+    let mut generation = [0x92; 16];
+    generation[8..].copy_from_slice(&index.to_be_bytes());
+    conversation_binding_for(
+        fixture,
+        StreamRouteId::from_bytes(route),
+        StreamGenerationId::from_bytes(generation),
+        &format!("018f0f9d-6f0a-7ad0-8000-{index:012x}"),
+    )
+}
+
+fn catalog_v5_replay_offsets(canonical: &[u8]) -> (usize, usize) {
+    assert_eq!(u16::from_be_bytes([canonical[4], canonical[5]]), 5);
+    let binding_len = u32::from_be_bytes(canonical[12..16].try_into().unwrap()) as usize;
+    let count_offset = DURABLE_STREAM_STATE_HEADER_BYTES + 4 + binding_len + 2 * 9 + 2 * 10 + 1;
+    assert_eq!(&canonical[count_offset..count_offset + 4], &[0; 4]);
+    (count_offset, count_offset + 4)
+}
+
+fn rewrite_stream_state_body_len(canonical: &mut [u8]) {
+    let body_len = u32::try_from(canonical.len() - DURABLE_STREAM_STATE_HEADER_BYTES).unwrap();
+    canonical[8..12].copy_from_slice(&body_len.to_be_bytes());
+}
+
+fn valid_emergency_debt_canonical(
+    initial: &DurableStreamBindingV1,
+    binding: &StreamBindingV1,
+) -> (Vec<u8>, usize, usize) {
+    let mut canonical = initial.canonical_bytes().unwrap();
+    let (count_offset, entries_offset) = catalog_v5_replay_offsets(&canonical);
+    let mut replay = Vec::with_capacity(97);
+    replay.push(0); // Catalog key purpose
+    replay.extend_from_slice(&binding.key_id.epoch.to_be_bytes());
+    replay.extend_from_slice(&binding.key_directory_revision.value().to_be_bytes());
+    replay.extend_from_slice(binding.stream_route.as_bytes());
+    replay.extend_from_slice(binding.stream_generation.as_bytes());
+    replay.extend_from_slice(&0_u64.to_be_bytes());
+    replay.extend_from_slice(&17_u64.to_be_bytes());
+    replay.extend_from_slice(&[0x61; 32]);
+    assert_eq!(replay.len(), 97);
+
+    canonical[count_offset..count_offset + 4].copy_from_slice(&1_u32.to_be_bytes());
+    canonical.splice(entries_offset..entries_offset, replay.iter().copied());
+    assert_eq!(
+        canonical.last(),
+        Some(&0),
+        "initial V5 debt tag must be absent"
+    );
+    *canonical.last_mut().unwrap() = 1;
+    let mut debt_input = EMERGENCY_REPLAY_DEBT_HASH_DOMAIN.to_vec();
+    debt_input.extend_from_slice(&replay);
+    canonical.extend_from_slice(&sha256(&debt_input));
+    rewrite_stream_state_body_len(&mut canonical);
+    (canonical, entries_offset, replay.len())
+}
+
 fn assert_initial_state(state: &DurableStreamBindingV1, binding: &StreamBindingV1) {
     assert_eq!(state.binding(), binding);
     assert_eq!(state.outer_applied(), binding.stream_cursor);
@@ -341,6 +403,119 @@ fn catalog_stream_binding_is_atomic_idempotent_and_restart_durable() {
         "remote.pairing.paired_conflict"
     );
     assert_eq!(reopened.durable_stream_bindings().unwrap(), [installed]);
+}
+
+#[test]
+fn v5_emergency_debt_decoder_rejects_tampered_duplicate_and_missing_replay_tuple() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("debt decoder root");
+    let state_root = fs::canonicalize(temp.path())
+        .expect("canonical debt decoder root")
+        .join("paired-state");
+    fixture.promote(&store, &state_root, 0x63);
+    let paired = PairedMachineStore::new_with_mutation_observer(
+        &store,
+        INSTALLATION_ID,
+        &state_root,
+        Arc::new(NoopMutationObserver),
+    );
+    let mut opened = paired.open_exact(fixture.identity()).unwrap();
+    let binding = catalog_binding(&fixture);
+    let mut rng = DeterministicRng::new([0x64; 32]);
+    let initial = opened
+        .install_stream_binding_for_automatic_harness(binding.clone(), &mut rng)
+        .unwrap();
+    let (canonical, entries_offset, replay_len) =
+        valid_emergency_debt_canonical(&initial, &binding);
+    assert_eq!(
+        DurableStreamBindingV1::from_canonical_bytes(&canonical)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap(),
+        canonical
+    );
+
+    let mut tampered = canonical.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        DurableStreamBindingV1::from_canonical_bytes(&tampered).unwrap_err(),
+        RemoteStreamStateError::InvalidCanonical
+    );
+
+    let count_offset = entries_offset - 4;
+    let mut missing = canonical.clone();
+    missing[count_offset..entries_offset].copy_from_slice(&0_u32.to_be_bytes());
+    missing.drain(entries_offset..entries_offset + replay_len);
+    rewrite_stream_state_body_len(&mut missing);
+    assert_eq!(
+        DurableStreamBindingV1::from_canonical_bytes(&missing).unwrap_err(),
+        RemoteStreamStateError::InvalidCanonical
+    );
+
+    let mut duplicate = canonical.clone();
+    duplicate[count_offset..entries_offset].copy_from_slice(&2_u32.to_be_bytes());
+    let replay = duplicate[entries_offset..entries_offset + replay_len].to_vec();
+    duplicate.splice(
+        entries_offset + replay_len..entries_offset + replay_len,
+        replay,
+    );
+    rewrite_stream_state_body_len(&mut duplicate);
+    assert_eq!(
+        DurableStreamBindingV1::from_canonical_bytes(&duplicate).unwrap_err(),
+        RemoteStreamStateError::InvalidCanonical
+    );
+}
+
+#[test]
+fn stream_binding_collection_accepts_4096_and_rejects_4097() {
+    const MAX_BINDINGS: usize = 4_096;
+
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("stream collection boundary root");
+    let state_root = fs::canonicalize(temp.path())
+        .expect("canonical stream collection boundary root")
+        .join("paired-state");
+    fixture.promote(&store, &state_root, 0x65);
+    let paired = PairedMachineStore::new_with_mutation_observer(
+        &store,
+        INSTALLATION_ID,
+        &state_root,
+        Arc::new(NoopMutationObserver),
+    );
+    let mut opened = paired.open_exact(fixture.identity()).unwrap();
+    let bindings = (0..MAX_BINDINGS)
+        .map(|index| indexed_conversation_binding(&fixture, index as u64))
+        .collect::<Vec<_>>();
+    let mut rng = DeterministicRng::new([0x66; 32]);
+    opened
+        .replace_unchecked_stream_bindings_for_automatic_harness(bindings, &mut rng)
+        .expect("the complete 4096-entry stream collection must be accepted");
+    assert_eq!(
+        opened.durable_stream_bindings().unwrap().len(),
+        MAX_BINDINGS
+    );
+
+    let files_before = file_tree_bytes(&state_root);
+    let keys_before = paired_key_bytes(&store, &fixture);
+    let overflow = (0..=MAX_BINDINGS)
+        .map(|index| indexed_conversation_binding(&fixture, index as u64))
+        .collect::<Vec<_>>();
+    let mut panic_rng = PanicRng;
+    assert_eq!(
+        opened
+            .replace_unchecked_stream_bindings_for_automatic_harness(overflow, &mut panic_rng)
+            .unwrap_err()
+            .code(),
+        "remote.pairing.paired_invalid"
+    );
+    assert_eq!(
+        opened.durable_stream_bindings().unwrap().len(),
+        MAX_BINDINGS
+    );
+    assert_eq!(file_tree_bytes(&state_root), files_before);
+    assert_eq!(paired_key_bytes(&store, &fixture), keys_before);
 }
 
 #[test]
@@ -575,6 +750,16 @@ fn automatic_stream_fault_injection_helpers_reject_production_handles_before_wri
     let mut panic_rng = PanicRng;
     assert_eq!(
         opened
+            .replace_automatic_runtime_state_probe(
+                AutomaticRuntimeStateProbe::new(0xb2),
+                &mut panic_rng,
+            )
+            .unwrap_err()
+            .code(),
+        "remote.pairing.paired_invalid"
+    );
+    assert_eq!(
+        opened
             .replace_unchecked_stream_bindings_for_automatic_harness(
                 vec![canonical],
                 &mut panic_rng,
@@ -618,7 +803,7 @@ fn install_rejects_one_relay_route_aliasing_multiple_targets() {
         &fixture,
         CONVERSATION_ROUTE,
         CONVERSATION_GENERATION,
-        "conversation-route-owner-a",
+        "018f0f9d-6f0a-7ad0-8000-0000000000a1",
     );
     let mut first_rng = DeterministicRng::new([0x92; 32]);
     let installed = opened
@@ -628,7 +813,7 @@ fn install_rejects_one_relay_route_aliasing_multiple_targets() {
         &fixture,
         CONVERSATION_ROUTE,
         StreamGenerationId::from_bytes([0x94; 16]),
-        "conversation-route-owner-b",
+        "018f0f9d-6f0a-7ad0-8000-0000000000b2",
     );
     let mut panic_rng = PanicRng;
     assert_eq!(
@@ -774,7 +959,7 @@ fn v3_bindings_survive_every_counter_reservation_crash_cut_without_hwm_reuse() {
 }
 
 #[test]
-fn empty_stream_legacy_v2_upgrades_to_v3_without_losing_counter_receipt_or_replay() {
+fn empty_stream_legacy_v2_upgrades_to_v6_without_losing_counter_receipt_or_replay() {
     let fixture = PairingFixture::new();
     let store = MemoryRemoteKeyStore::new();
     let temp = tempfile::tempdir().expect("legacy V2 upgrade root");
@@ -838,7 +1023,7 @@ fn empty_stream_legacy_v2_upgrades_to_v3_without_losing_counter_receipt_or_repla
     assert_eq!(
         reopened.automatic_legacy_runtime_fields_probe().unwrap(),
         Some(legacy_probe),
-        "legacy receipt/replay bytes must survive the V3 stream install"
+        "legacy receipt/replay bytes must survive the V6 stream install"
     );
     assert_eq!(reopened.durable_stream_bindings().unwrap(), [installed]);
 
@@ -849,24 +1034,24 @@ fn empty_stream_legacy_v2_upgrades_to_v3_without_losing_counter_receipt_or_repla
     assert_eq!(
         (next.start(), next.end_exclusive()),
         (1_024, 2_048),
-        "V3 upgrade must preserve the legacy counter reservation"
+        "V6 upgrade must preserve the legacy counter reservation"
     );
     drop(reopened);
 
     let typed_plaintext = paired_state_plaintext(&store, &fixture, &state_root);
     assert_eq!(
         u16::from_be_bytes(typed_plaintext[4..6].try_into().unwrap()),
-        TYPED_RUNTIME_STATE_VERSION
+        TRANSFER_RUNTIME_STATE_VERSION
     );
 }
 
 #[test]
-fn legacy_v2_probe_remains_openable_but_is_never_treated_as_typed_stream_state() {
+fn automatic_probe_uses_exchange_and_replay_only_and_survives_restart() {
     let fixture = PairingFixture::new();
     let store = MemoryRemoteKeyStore::new();
-    let temp = tempfile::tempdir().expect("legacy V2 root");
+    let temp = tempfile::tempdir().expect("automatic probe root");
     let state_root = fs::canonicalize(temp.path())
-        .expect("canonical legacy V2 root")
+        .expect("canonical automatic probe root")
         .join("paired-state");
     fixture.promote(&store, &state_root, 0x41);
     let paired = PairedMachineStore::new_with_mutation_observer(
@@ -877,13 +1062,46 @@ fn legacy_v2_probe_remains_openable_but_is_never_treated_as_typed_stream_state()
     );
     let mut opened = paired.open_exact(fixture.identity()).unwrap();
     let probe = AutomaticRuntimeStateProbe::new(0x42);
+    let expected_projection = AutomaticRuntimeProjection::new(Some(probe), Some(probe), Vec::new());
     let mut state_rng = DeterministicRng::new([0x43; 32]);
-    opened
-        .replace_automatic_runtime_state_probe(probe, &mut state_rng)
-        .unwrap();
+    assert_eq!(
+        opened
+            .replace_automatic_runtime_state_probe(probe, &mut state_rng)
+            .unwrap(),
+        probe
+    );
+    assert_eq!(opened.automatic_runtime_state_probe().unwrap(), Some(probe));
+    assert_eq!(
+        opened
+            .automatic_runtime_projection_for_automatic_harness()
+            .unwrap(),
+        expected_projection
+    );
+    assert!(opened.durable_stream_bindings().unwrap().is_empty());
+    let transfer = opened.durable_transfer_state().unwrap();
+    assert_eq!(transfer.active_count(), 0);
+    assert_eq!(transfer.completed_count(), 0);
+    assert_eq!(transfer.marker_count(), 0);
+
+    let files_after = file_tree_bytes(&state_root);
+    let keys_after = paired_key_bytes(&store, &fixture);
+    let mut panic_rng = PanicRng;
+    assert_eq!(
+        opened
+            .replace_automatic_runtime_state_probe(probe, &mut panic_rng)
+            .unwrap(),
+        probe
+    );
+    assert_eq!(file_tree_bytes(&state_root), files_after);
+    assert_eq!(paired_key_bytes(&store, &fixture), keys_after);
     drop(opened);
 
-    let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
+    let restarted = PairedMachineStore::new_with_mutation_observer(
+        &store,
+        INSTALLATION_ID,
+        &state_root,
+        Arc::new(NoopMutationObserver),
+    );
     assert_eq!(restarted.list().unwrap().len(), 1);
     let mut reopened = restarted.open_exact(fixture.identity()).unwrap();
     assert_eq!(
@@ -891,9 +1109,16 @@ fn legacy_v2_probe_remains_openable_but_is_never_treated_as_typed_stream_state()
         Some(probe)
     );
     assert_eq!(
-        reopened.durable_stream_bindings().unwrap_err().code(),
-        "remote.pairing.paired_invalid"
+        reopened
+            .automatic_runtime_projection_for_automatic_harness()
+            .unwrap(),
+        expected_projection
     );
+    assert!(reopened.durable_stream_bindings().unwrap().is_empty());
+    let transfer = reopened.durable_transfer_state().unwrap();
+    assert_eq!(transfer.active_count(), 0);
+    assert_eq!(transfer.completed_count(), 0);
+    assert_eq!(transfer.marker_count(), 0);
     let mut counter_rng = DeterministicRng::new([0x44; 32]);
     let first = reopened
         .reserve_command_counter_block(&mut counter_rng)
@@ -904,7 +1129,14 @@ fn legacy_v2_probe_remains_openable_but_is_never_treated_as_typed_stream_state()
         Some(probe)
     );
     assert_eq!(
-        reopened.durable_stream_bindings().unwrap_err().code(),
-        "remote.pairing.paired_invalid"
+        reopened
+            .automatic_runtime_projection_for_automatic_harness()
+            .unwrap(),
+        expected_projection
     );
+    assert!(reopened.durable_stream_bindings().unwrap().is_empty());
+    let transfer = reopened.durable_transfer_state().unwrap();
+    assert_eq!(transfer.active_count(), 0);
+    assert_eq!(transfer.completed_count(), 0);
+    assert_eq!(transfer.marker_count(), 0);
 }

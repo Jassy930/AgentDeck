@@ -473,7 +473,7 @@ async fn supported_persistent_commands_reject_legacy_runtime_overrides_without_n
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn watch_is_the_only_persistent_command_that_stays_unsupported() {
+async fn watch_enters_production_dispatch_instead_of_the_legacy_unsupported_path() {
     let output = run_cli(&[
         "remote",
         "watch",
@@ -486,10 +486,16 @@ async fn watch_is_the_only_persistent_command_that_stays_unsupported() {
     ])
     .await;
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
-        "remote.persistent.unsupported"
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("production watch error envelope");
+    assert!(
+        envelope["error"]["code"]
+            .as_str()
+            .is_some_and(|code| code.starts_with("remote.persistent."))
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).starts_with("agentdeck: "),
+        "production dispatch renders a typed CLI error instead of the legacy bare unsupported line",
     );
 }
 

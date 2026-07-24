@@ -91,7 +91,7 @@ Layer B Vendor 控件命名空间允许 vendor 前缀但类型化（禁 `serde_j
 `OSAccountRuntimeWireSession → LocalRuntimeWireSession.forOSAccount()`：第一次使用时从当前 OS account
 installation 派生 canonical singleton UDS，且没有 daemon spawn、stdio 或 fallback。P3.9-D 又由
 `b818f81` 把 Rust CLI 默认 dispatcher 与 Swift `main.swift --selfcheck` 切到同一 shared daemon：普通
-`ping/selfcheck/agent/session/history/metadata/machine/pairing` 全部使用 canonical Runtime v4，socket 失败 typed 返回且零
+`ping/selfcheck/agent/session/history/metadata/machine/pairing` 全部使用 canonical Runtime v5，socket 失败 typed 返回且零
 fallback；显式 diagnostics one-shot 与 compatibility stdio 只保留为隔离运维入口。P3.9-E 又由
 `d68cc02` 收口 GUI 会话可靠性：prompt admission 明确区分 sending/daemon queued，失败只允许 exact 或
 fresh 显式重试；history 采用 latest-intent drain，stream fault 等待 close barrier 后才允许下一操作换线；
@@ -207,7 +207,7 @@ cd ios && xcodegen generate && \
 
 iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
 
-## Relay Companion MVP 实施状态（P4 已完成 5/7，下一项 P4.6）
+## Relay Companion MVP 实施状态（P4.6 automatic Task complete；P4 为 6/7）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -289,15 +289,46 @@ generation/replay/connection/reply-route，不持有 canonical conversation、co
 recovery 完成前 RemoteLink 不启动：Active 可恢复，Inactive 在 actor install 前终止，Unprovable/legacy
 只把对应 conversation 保持只读，健康 sibling 继续服务。
 
-P4.5 code/test 由 `c6ef387`、`88b3c42` 收口。Runtime wire 保持 v4，physical schema 已推进到
+P4.5 code/test 由 `c6ef387`、`88b3c42` 收口。P4.5 收口时 Runtime wire 为 v4，physical schema 已推进到
 v14/35 表。signed publication 顺序固定为 `CounterGuard reserve → seal once → Runtime DB 冻结 exact blob →
 Relay Publish COMMIT → local ACK`；retry、COMMIT outcome unknown 与 daemon restart 都只复用同一 frozen blob。
 链路离线时 publication park，只有 authenticated reconnect 才恢复 exact work；counter recovery、publication
 recovery 与 transition recovery 全部通过后才开启 production admission。
 
-P4 当前完成 5/7，下一项 P4.6 persistent remote CLI。persistent remote CLI 与 iOS 真实链路仍未完成；
-当前 verifier 不支持 `p4`，不得把 focused/Task 门禁写成 P4 aggregate verifier PASS。P3.1 继续采用方案 b，
-production signing、物理设备与公网证据继续保持 post-MVP BLOCKED。
+P4.6 persistent remote CLI 已于 2026-07-24 完成 automatic Task，current Runtime wire 为 v5。
+`pair`、`machines`、`conversations`、`watch`、`prompt`、`approve`、`retry-approval`、`revoke-self`
+均已接入。`watch` 从 fresh authenticated bootstrap 开始，以 canonical NDJSON 依次公开
+`bootstrap|synchronized|live|control|terminal`；SIGINT 与 SIGTERM 都只在当前 exact frame 完成 durable
+apply 与 ACK terminal 后输出 `stopped`。若 signal 与 `TransferBootstrapRequired` 同时出现，必须先输出 durable
+marker 再输出 `stopped`；连接已返回 `Connected` 且 signal ready 时零 Subscribe、shutdown 后输出 `stopped`，
+已验证的 revoked terminal 仍优先。握手期或 active root-signed revoke 只有在 transport shutdown/drop 与
+crash-safe cleanup 完成后才输出 `revoked`。冻结 code/test scope 为 29 paths，blob-manifest SHA-256 为
+`32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`。watch `12/12`、
+`remote_persistent_machines` `11/11`、relay-client `25/25`、protocol `244/244` 与 release allocator
+`1/1`（24.11 秒）均通过；allocator requested-live capacity/complete/duplicate 为 `363/190/3 MiB`。
+完整 CLI package final run 在同一 hash 上 exit 0（14 分 16 秒）：lib `194/194`、main `50/50`、runtime
+receipts `81/81`（432.35 秒）、transfer persistence `6/6`（256.08 秒）、transfer paired-state `7/7`
+（57.27 秒）、runtime CLI binary `17/17`（30.84 秒）、synthetic `10/10`、shared daemon `27/27`、
+doc-test `6/6`，仅预期忽略显式 release allocator。四 schema、CLI/protocol/relay-client Clippy
+`-D warnings`、fmt、
+network/no-net、docs 与 diff 全绿；`spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。
+P4 按 Task 进度为 6/7；P4.7、P4 Phase Exit 与 iOS 真实链路仍未完成；当前 verifier
+不支持 `p4`/`p4-auto`。
+P3.1 继续采用方案 b，production signing、物理设备与公网证据继续保持 post-MVP BLOCKED。
+
+P4.6 durable live transfer 将 binding/records 放入 paired-state V6 sealed CAS：partial 跨重启保留，absolute
+TTL 到界时不等待下一 Relay frame 即 durable 写入 expired marker；128 MiB 是 paired-state plaintext logical
+budget，不是 RSS。普通 V6 mutation 会按最多 4,096 个 durable binding 聚合预留最坏 replay tuple、compact
+marker 与 collection framing；fresh replay 自身越过 normal budget 时，replay admission 与
+`remote.transfer.reassembly_full` marker 在同一 exact CAS 落盘，不 ACK、不推进 reducer/cursor，也不驱逐其他
+binding records。带 stream cursor 的 legacy 状态只在下一次 mutation 时升级 V6，冷读不隐式改写；旧状态若已
+越过新 normal budget 则在 entropy/写盘前 fail-close。marker 在 binding replacement 前统一 fence
+Publish/Gap/ReplayComplete。prepared ADST v2 把 `Normal` / `EmergencyBootstrapMarker` mode 放入 AEAD
+认证内容，CounterGuard 的 sealed commitment 绑定完整 sidecar；legacy ADST v1 只解释为 Normal。4095→4096
+marker 在 guard-first 与 active-first crash cut 都按同一 production recovery 收敛；owned-unlink cleanup 可重试，
+但 reseal/commitment conflict 必须 fail-close。reducer retained 声明上限为 64 MiB，并在 IO/durable mutation
+前检查。上述 release allocator 结果来自同一冻结 hash 的 counting allocator，并非 RSS；该 automatic 证据不替代 P4.7、
+production-signed Keychain、物理设备或公网证据。
 
 Relay production binary 已原子切换到 **Relay v2**。公开数据面只接受
 `/v2/connect`、`/v2/pair` 与 enrollment 所需的 `POST /v2/machine-enroll`；
@@ -326,8 +357,9 @@ Relay，严格校验 CA/hostname/SPKI，并以临时 machine/device key 完成 e
 challenge 鉴权、InstallGrant、register/publish/subscribe replay、Send/Reply、signed revoke
 以及终态重连验证。测试同时扫描 SQLite/outer wire，证明应用 sentinel 只以真实 AEAD 密文
 存在。这个命令不会建立持久配对；P4.3 已新增只走 same-UID canonical UDS 的
-`remote pairing invite|pending|approve|cancel` 与 exact `remote revoke` 管理面，但旧的 persistent
-`remote pair/machines/sessions/watch/send/...` 仍返回 typed `remote.persistent.unsupported`。`agentdeckd` 的 network-boundary guard 只允许
+`remote pairing invite|pending|approve|cancel` 与 exact `remote revoke` 管理面。P4.6 又接入 persistent
+`remote pair|machines|conversations|watch|prompt|approve|retry-approval|revoke-self`；`remote watch`
+输出经过认证 reducer/receipt 边界的 canonical NDJSON。`agentdeckd` 的 network-boundary guard 只允许
 `agentdeckd/src/remote/` 通过纯 `agentdeck-relay-client` 发起经 CA/SPKI 验证的 enrollment/auth/control
 outbound；其他 daemon 模块仍禁止 TCP/UDP/HTTP/WSS。该 control-only transport 不是 daemon/iOS 业务
 Companion 已接通。
@@ -484,9 +516,9 @@ daemon 内存密钥或替换进程，不属于 SQLite 层安全边界；`974f9b1
 
 ### P3.4 RuntimeCore 当前边界
 
-transport-neutral `RuntimeCore` 与 production UDS framing 当前使用 Runtime v4：它在 P4.2 的 v3
-machine administration 上 additive 增加 P4.3 local-only pairing/revoke administration，不保留 production
-v3/v4 双栈。A1a1 由
+transport-neutral `RuntimeCore` 与 production UDS framing 当前使用 Runtime v5：它在 P4.2 的 v3
+machine administration 与 P4.3 的 v4 local-only pairing/revoke administration 上，继续为 P4.6 catalog exact
+page chain additive 升版；production 只接受 current v5。A1a1 由
 `3b83391` 冻结 additive configuration/metadata/upgrade DTO，A1a2 main cutover 与真实 v1/schema v4 reader
 分别由 `c28a968` / `c36a4f9` 收口；`ef830cd` 又证明 Runtime v1 TBS 签发的 persisted cert/grant、
 control grant/revocation/retirement 与 enrollment Link/Data cert 均在 v2 verifier 写 Store 前拒绝。
@@ -589,9 +621,11 @@ P3.9 至此完成。P3.10 已由 `19622ab` 完成当时的 schema v7、durable a
 schema 推进到 v8/24 表并建立 machine identity、key-directory guard 与通用 CounterGuard IO；P4.2 又以
 `a6842bc` 推进到 v9/25 表并建立 certificate、enrollment、receipt、control-only
 RemoteTransport 与 trust reset；P4.3 再推进到 v10/30 表并建立 pairing/auth ledger/revoke/control handoff；
-P4.4 在不改变 Runtime v4/schema v10/30 表的前提下接入 business ingress/Core dispatch；P4.5 随后以
+P4.4 在不改变当时 Runtime v4/schema v10/30 表的前提下接入 business ingress/Core dispatch；P4.5 随后以
 `c6ef387`、`88b3c42` 接通 signed-sealed publication/counter/transition recovery，并把 physical schema
-推进到 v14/35 表。下一项是 P4.6 persistent remote CLI；真实 vendor metadata mutation 与 iOS 真链路仍未完成。
+推进到 v14/35 表。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire
+为 v5；真实
+vendor metadata mutation 与 iOS 真链路仍未完成。
 
 进入 Core 的 principal 是字段私有的认证 capability；同一完整身份共享强 authorization lease，
 Accepted→Started 前会重新取得 guard，revoke 与 start 由该 guard + SQLite transition 线性化。
@@ -770,9 +804,11 @@ execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 
 Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/test 提交分别为 `b818f81` / `d68cc02`。
 普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS。P3.10 LaunchAgent
 安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；基于 `9efb28d` 的独立 P3 Phase
-Exit 已完成；P4.1–P4.5 code/test 与 Task 门禁已收口，P4–P6 当前为 5/7、0/9、0/4。P3.1 provisioned signed Keychain roundtrip 继续是 post-MVP
+Exit 已完成；P4.1–P4.5 code/test 与 Task 门禁已收口，P4.6 已完成 automatic Task，
+P4–P6 按 Task 进度计为 6/7、0/9、0/4。P3.1 provisioned signed Keychain roundtrip 继续是 post-MVP
 BLOCKED 槽位，不阻塞 P3 automatic closeout；P5/P6 物理设备/公网/Linux 证据也是 post-MVP，不冒充
-PASS。下一项 P4.6 persistent remote CLI；P4.5 publication PASS 不冒充 remote CLI 或 iOS 真链路 PASS。
+PASS。P4.6 automatic Task 与 P4.5 publication PASS 都不冒充 `p4-auto`、P4 Phase Exit、
+production-signed remote `watch` 或 iOS 真链路 PASS。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）
@@ -795,7 +831,7 @@ canonical `conversationId` 并执行 `Subscribe/SendPrompt`，不得使用 vendo
 `UpdateConversationMetadata`，并携带 expected entry revision 与稳定 idempotency key。输出身份只允许
 `conversationId`、`commandId`、`turnId`、`eventId`、`itemId`、`entityId`，不得合成 legacy session/thread
 identity；`protocol` 与 synthetic/legacy remote 不连接 Runtime，P4.2/P4.3 的 `remote machine enroll|status`、
-`remote pairing ...`、`remote revoke` 与 `remote trust-reset` 只连接 canonical Runtime v4 UDS。
+`remote pairing ...`、`remote revoke` 与 `remote trust-reset` 只连接 canonical Runtime v5 UDS。
 diagnostics one-shot 仍不得成为 UDS 失败 fallback。
 `persistApproval` 不再是启动配置；没有 Runtime v2 映射的 CC `worktree/sessionName` 必须删除或 typed reject。
 
@@ -815,11 +851,11 @@ agentdeck selfcheck                     # Hello + DescribeAgents
 agentdeck diagnostics report            # 输出机器可读诊断报告（JSON）
 agentdeck protocol schema               # 打印 IPC 协议 JSON Schema
 agentdeck protocol version              # 打印协议版本号
-agentdeck protocol runtime-schema       # 打印 current Runtime v4 JSON Schema
+agentdeck protocol runtime-schema       # 打印 current Runtime v5 JSON Schema
 agentdeck protocol relay-schema         # 打印 Relay v2 JSON Schema
 agentdeck protocol e2ee-schema          # 打印 E2EE v1 JSON Schema
 
-# P4.2/P4.3 本机 machine/pairing administration（只走 same-UID canonical Runtime v4 UDS）
+# P4.2/P4.3 本机 machine/pairing administration（只走 same-UID canonical Runtime v5 UDS）
 agentdeck remote machine enroll --bundle-file /secure/path/machine-enrollment-bundle.json
 agentdeck remote machine status
 agentdeck remote pairing invite --display-name workstation --idempotency-key invite-001
@@ -829,6 +865,23 @@ agentdeck remote pairing cancel 11111111-1111-1111-1111-111111111111
 agentdeck remote revoke --device <device-route-id> --grant-serial <serial>
 agentdeck remote trust-reset
 agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge-receipt.json
+
+# P4.6 persistent remote CLI（要求 production composition；machine selector 为 canonical padded base64）
+agentdeck remote pair --invite-file /secure/path/pair-invite.txt \
+  --confirm-root-fingerprint <root-fingerprint>
+agentdeck remote machines
+agentdeck remote conversations \
+  --machine-root-fingerprint <standard-base64-32> \
+  --machine-route <standard-base64-16>
+agentdeck remote watch \
+  --machine-root-fingerprint <standard-base64-32> \
+  --machine-route <standard-base64-16> \
+  --conversation-id <conversation-id>       # canonical NDJSON；SIGINT/SIGTERM 安全收口
+agentdeck remote prompt \
+  --machine-root-fingerprint <standard-base64-32> \
+  --machine-route <standard-base64-16> \
+  --conversation-id <conversation-id> --text "..." \
+  --idempotency-key <stable-key> --expected-configuration-revision <revision>
 
 # LaunchAgent lifecycle；普通卸载保留数据，--purge 是 destructive 两阶段清除
 agentdeck daemon status

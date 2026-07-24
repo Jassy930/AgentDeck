@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use agentdeck_crypto::sha256;
 use agentdeck_protocol::e2ee::StreamBindingV1;
 use agentdeck_protocol::relay_v2::{StreamGenerationId, StreamRouteId};
-use agentdeck_protocol::runtime::identity::{MessageId, TransferId};
+use agentdeck_protocol::runtime::identity::{MAX_TRANSFER_ID_BYTES, MessageId, TransferId};
 use agentdeck_protocol::runtime::{
     DurableStreamObjectId, DurableStreamTransferIdentity, DurableStreamTransferSource,
     MAX_ACTIVE_TRANSFERS, MAX_COMPLETED_TRANSFER_TOMBSTONES, MAX_PART_BYTES, MAX_REASSEMBLY_BYTES,
@@ -19,14 +19,32 @@ use agentdeck_protocol::runtime::{
 };
 use thiserror::Error;
 
+use super::stream_state::{DurableStreamBindingV1, MAX_DURABLE_STREAM_BINDINGS};
+
 const RECORD_MAGIC: &[u8; 4] = b"ADTF";
 const RECORD_VERSION: u16 = 1;
 const RECORD_HEADER_BYTES: usize = 8;
 /// 单条 durable record 与其中任一 length-delimited field 的硬上限。
 pub const MAX_DURABLE_TRANSFER_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 1_024;
-const MAX_MARKERS: usize = MAX_ACTIVE_TRANSFERS;
-const MAX_RECORDS: usize = MAX_ACTIVE_TRANSFERS * (MAX_TRANSFER_PARTS as usize + 1)
+const MAX_TRANSFER_BINDING_RECORD_BYTES: usize = 1 + 16 + 32 + 16 + 16;
+/// Emergency capacity reservation 使用的最坏 `NeedsBootstrap` record 大小：conversation
+/// binding、存在且达到 wire 上限的 transfer id、failure tag 与两个 durable clock 字段。
+/// 外层 V6 collection 的 4-byte field length 由 paired-state owner 另行计入。
+pub(crate) const MAX_NEEDS_BOOTSTRAP_MARKER_RECORD_BYTES: usize = RECORD_HEADER_BYTES
+    + MAX_TRANSFER_BINDING_RECORD_BYTES
+    + 1
+    + 4
+    + MAX_TRANSFER_ID_BYTES
+    + 1
+    + 8
+    + 8;
+// Marker 是 installed exact binding 的 terminal fence，而不是 active-transfer 槽。上限必须
+// 覆盖完整 durable binding collection；否则 64 个已失败 binding 会让第 65 个 binding 在
+// byte headroom 仍充足时无法持久化 emergency marker。
+const MAX_MARKERS: usize = MAX_DURABLE_STREAM_BINDINGS;
+pub const MAX_DURABLE_TRANSFER_RECORDS: usize = MAX_ACTIVE_TRANSFERS
+    * (MAX_TRANSFER_PARTS as usize + 1)
     + MAX_COMPLETED_TRANSFER_TOMBSTONES
     + MAX_MARKERS;
 
@@ -470,7 +488,7 @@ impl DurableLiveTransferStateV1 {
         max_buffered_bytes: u64,
     ) -> Result<Self, DurableTransferStateError> {
         validate_buffer_budget(max_buffered_bytes)?;
-        if records.len() > MAX_RECORDS {
+        if records.len() > MAX_DURABLE_TRANSFER_RECORDS {
             return Err(DurableTransferStateError::TooLarge);
         }
         let mut state = Self {
@@ -556,12 +574,146 @@ impl DurableLiveTransferStateV1 {
         self.buffered_bytes
     }
 
+    /// 返回最早到期的 active transfer 所属 exact binding 与绝对到期时间。
+    ///
+    /// 该查询不推进 durable clock，也不修改任何 record。相同到期时间按 canonical
+    /// transfer key 排序，供 runtime 在没有新入站 part 时确定性地安排 TTL 唤醒。
+    #[must_use]
+    pub fn earliest_active_expiry(&self) -> Option<(DurableTransferBindingIdentityV1, u64)> {
+        self.active
+            .iter()
+            .min_by(|(left_key, left), (right_key, right)| {
+                left.header
+                    .expires_at_ms
+                    .cmp(&right.header.expires_at_ms)
+                    .then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(_, active)| (active.header.binding, active.header.expires_at_ms))
+    }
+
+    /// Runtime scheduler 建立 monotonic timeout 前的只读绝对时钟门禁。wall clock 若低于
+    /// sealed state 的 durable watermark，必须立即 fail-close，不能用放大的 remaining
+    /// 静默延长 active transfer 的 absolute TTL。
+    pub(crate) fn earliest_active_expiry_at(
+        &self,
+        now_ms: u64,
+    ) -> Result<Option<(DurableTransferBindingIdentityV1, u64)>, DurableTransferStateError> {
+        self.validate_clock(now_ms)?;
+        Ok(self.earliest_active_expiry())
+    }
+
+    /// 在 `now_ms` 已到达最早 active transfer 的绝对 TTL 时，确定性地废弃其 exact
+    /// binding；尚未到期则原样返回。一次只处理一个 binding，runtime 可循环调用直至
+    /// 返回 `None`，再把最终候选状态纳入 paired-state CAS。
+    pub fn expire_due_active(
+        mut self,
+        now_ms: u64,
+    ) -> Result<(Self, Option<DurableTransferBindingIdentityV1>), DurableTransferStateError> {
+        self.validate_clock(now_ms)?;
+        let expired = self.expire_next_due_active_internal(now_ms)?;
+        Ok((self, expired))
+    }
+
+    /// Production runtime 的 owned expiry 路径。只有确有 active binding 到期时才生成
+    /// canonical candidate records；调用方可把 transition 直接移交 paired-state prepare，
+    /// 不必再次遍历或复制可能接近 128 MiB 的 transfer collection。
+    pub(crate) fn expire_due_active_transition(
+        mut self,
+        now_ms: u64,
+    ) -> Result<
+        Option<(
+            DurableTransferBindingIdentityV1,
+            DurableTransferTransitionV1,
+        )>,
+        DurableTransferStateError,
+    > {
+        self.validate_clock(now_ms)?;
+        let Some(expired) = self.expire_next_due_active_internal(now_ms)? else {
+            return Ok(None);
+        };
+        let transition = DurableTransferTransitionV1::new(
+            self,
+            DurableTransferOutcomeV1::NeedsBootstrap {
+                error: DurableTransferBootstrapError::Expired,
+            },
+        )?;
+        Ok(Some((expired, transition)))
+    }
+
+    fn expire_next_due_active_internal(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<Option<DurableTransferBindingIdentityV1>, DurableTransferStateError> {
+        let earliest = self
+            .active
+            .iter()
+            .min_by(|(left_key, left), (right_key, right)| {
+                left.header
+                    .expires_at_ms
+                    .cmp(&right.header.expires_at_ms)
+                    .then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(_, active)| {
+                (
+                    active.header.binding,
+                    active.header.identity.transfer_id(),
+                    active.header.expires_at_ms,
+                )
+            });
+        let Some((binding, transfer_id, expires_at_ms)) = earliest else {
+            return Ok(None);
+        };
+        if now_ms < expires_at_ms {
+            return Ok(None);
+        }
+        self.abort_binding_internal(
+            binding,
+            Some(transfer_id),
+            DurableTransferBootstrapError::Expired,
+            now_ms,
+        )?;
+        Ok(Some(binding))
+    }
+
     pub fn canonical_record_bytes(&self) -> Result<Vec<Vec<u8>>, DurableTransferStateError> {
         self.validate_in_memory()?;
         self.records()
             .into_iter()
             .map(|record| record.canonical_bytes())
             .collect()
+    }
+
+    /// Cold-open 时把所有仍可继续接收的 active/NeedsBootstrap record 精确绑定到当前
+    /// installed stream collection。Completed tombstone 只用于 exact duplicate 去重，可在
+    /// binding replacement 后短期保留；受控 replacement 会通过
+    /// [`Self::purge_exact_binding`] 一并回收。
+    pub fn validate_against_bindings(
+        &self,
+        bindings: &[DurableStreamBindingV1],
+    ) -> Result<(), DurableTransferStateError> {
+        self.validate_in_memory()?;
+        let mut installed = BTreeMap::new();
+        for binding in bindings {
+            let identity =
+                DurableTransferBindingIdentityV1::from_stream_binding(binding.binding())?;
+            if installed.insert(identity.sort_key(), identity).is_some() {
+                return Err(DurableTransferStateError::InvalidBinding);
+            }
+        }
+        if self
+            .active
+            .values()
+            .map(|active| active.header.binding.sort_key())
+            .chain(
+                self.markers
+                    .values()
+                    .map(|marker| marker.binding.sort_key()),
+            )
+            .any(|binding| !installed.contains_key(&binding))
+        {
+            return Err(DurableTransferStateError::InvalidBinding);
+        }
+        Ok(())
     }
 
     pub fn accept_part(
@@ -572,6 +724,7 @@ impl DurableLiveTransferStateV1 {
     ) -> Result<DurableTransferTransitionV1, DurableTransferStateError> {
         self.validate_clock(now_ms)?;
         self.purge_expired_completed(now_ms);
+        while self.expire_next_due_active_internal(now_ms)?.is_some() {}
         let requested_binding = DurableTransferBindingIdentityV1::from_stream_binding(binding)?;
         let requested_key = requested_binding.sort_key();
         if let Some(marker) = self.markers.get_mut(&requested_key) {
@@ -786,6 +939,24 @@ impl DurableLiveTransferStateV1 {
                 completed.clock_watermark_ms = now_ms;
             }
         }
+        self.recompute_and_validate()?;
+        Ok(self)
+    }
+
+    /// Binding replacement 的完整 cleanup：active、NeedsBootstrap 与 completed tombstone
+    /// 必须在安装新 binding 的同一 paired-state CAS 中一起删除，旧 binding 的任何 record
+    /// 都不能成为新 generation 的恢复依据。
+    pub fn purge_exact_binding(
+        mut self,
+        binding: &StreamBindingV1,
+    ) -> Result<Self, DurableTransferStateError> {
+        let binding = DurableTransferBindingIdentityV1::from_stream_binding(binding)?;
+        let key = binding.sort_key();
+        self.active
+            .retain(|transfer_key, _| transfer_key.binding != key);
+        self.completed
+            .retain(|transfer_key, _| transfer_key.binding != key);
+        self.markers.remove(&key);
         self.recompute_and_validate()?;
         Ok(self)
     }
@@ -1118,6 +1289,92 @@ impl DurableLiveTransferStateV1 {
     }
 }
 
+/// 已完成完整 V6 state audit 后的 marker-only 快查。非 marker record 不解码 part bytes，
+/// 避免 exact-binding ingress fence 为一次只读判断复制接近 128 MiB 的 durable collection。
+/// 任一 marker 仍走完整 canonical decoder；重复 exact marker fail-close。
+pub(crate) fn bootstrap_error_for_exact_binding_records(
+    records: &[Vec<u8>],
+    binding: &StreamBindingV1,
+) -> Result<Option<DurableTransferBootstrapError>, DurableTransferStateError> {
+    let requested = DurableTransferBindingIdentityV1::from_stream_binding(binding)?;
+    let requested_key = requested.sort_key();
+    let mut found = None;
+    for bytes in records {
+        if audited_record_kind_tag(bytes)? != 4 {
+            continue;
+        }
+        let record = DurableTransferRecordV1::from_canonical_bytes(bytes)?;
+        let RecordKind::NeedsBootstrap(marker) = record.kind else {
+            return Err(DurableTransferStateError::InvalidRecord);
+        };
+        if marker.binding.sort_key() == requested_key && found.replace(marker.error).is_some() {
+            return Err(DurableTransferStateError::InvalidRecord);
+        }
+    }
+    Ok(found)
+}
+
+/// 普通 production V6 candidate 必须同时为一个 transfer record 与一个 marker 留槽。
+/// 使用 checked cardinality，而不是假定 byte headroom 能覆盖 collection/count hard cap。
+pub(crate) fn has_emergency_marker_cardinality_reserve(
+    records: &[Vec<u8>],
+) -> Result<bool, DurableTransferStateError> {
+    let marker_count = bootstrap_marker_count_records(records)?;
+    let record_with_reserve = records
+        .len()
+        .checked_add(1)
+        .is_some_and(|count| count <= MAX_DURABLE_TRANSFER_RECORDS);
+    let marker_with_reserve = marker_count
+        .checked_add(1)
+        .is_some_and(|count| count <= MAX_MARKERS);
+    Ok(record_with_reserve && marker_with_reserve)
+}
+
+pub(crate) fn bootstrap_marker_count_records(
+    records: &[Vec<u8>],
+) -> Result<usize, DurableTransferStateError> {
+    let mut marker_count = 0_usize;
+    for bytes in records {
+        if audited_record_kind_tag(bytes)? == 4 {
+            marker_count = marker_count
+                .checked_add(1)
+                .ok_or(DurableTransferStateError::ArithmeticOverflow)?;
+        }
+    }
+    Ok(marker_count)
+}
+
+/// 返回 paired-state 可从 emergency reserve 精确抵扣的 marker bytes。只有完整通过
+/// canonical decoder 的 `NeedsBootstrap` record 才获得 credit；外层 V6 collection 的
+/// 4-byte field framing 与 record 实际长度一并 checked-sum，短 marker 不获得最坏长度额度。
+pub(crate) fn bootstrap_marker_credit_bytes_records(
+    records: &[Vec<u8>],
+) -> Result<usize, DurableTransferStateError> {
+    let mut credit = 0_usize;
+    for bytes in records {
+        if audited_record_kind_tag(bytes)? != 4 {
+            continue;
+        }
+        let record = DurableTransferRecordV1::from_canonical_bytes(bytes)?;
+        if !matches!(record.kind, RecordKind::NeedsBootstrap(_)) {
+            return Err(DurableTransferStateError::InvalidRecord);
+        }
+        credit = credit
+            .checked_add(4)
+            .and_then(|value| value.checked_add(bytes.len()))
+            .ok_or(DurableTransferStateError::ArithmeticOverflow)?;
+    }
+    Ok(credit)
+}
+
+fn audited_record_kind_tag(bytes: &[u8]) -> Result<u8, DurableTransferStateError> {
+    let kind = RecordDecoder::new(bytes)?.kind;
+    if !(1..=4).contains(&kind) {
+        return Err(DurableTransferStateError::InvalidRecord);
+    }
+    Ok(kind)
+}
+
 impl Default for DurableLiveTransferStateV1 {
     fn default() -> Self {
         Self::empty()
@@ -1145,6 +1402,15 @@ impl DurableTransferTransitionV1 {
         })
     }
 
+    /// 仅供 paired-machine automatic harness 把已构造的 replacement state 送入同一条
+    /// production owned prepare/commit 路径；production runtime 只能使用状态机 mutation
+    /// 返回的 transition。
+    pub(crate) fn from_automatic_harness_state(
+        state: DurableLiveTransferStateV1,
+    ) -> Result<Self, DurableTransferStateError> {
+        Self::new(state, DurableTransferOutcomeV1::AlreadyComplete)
+    }
+
     #[must_use]
     pub const fn state(&self) -> &DurableLiveTransferStateV1 {
         &self.state
@@ -1160,9 +1426,24 @@ impl DurableTransferTransitionV1 {
         &self.outcome
     }
 
+    pub(crate) fn take_outcome(&mut self) -> DurableTransferOutcomeV1 {
+        std::mem::replace(&mut self.outcome, DurableTransferOutcomeV1::AlreadyComplete)
+    }
+
     #[must_use]
     pub fn into_state(self) -> DurableLiveTransferStateV1 {
         self.state
+    }
+
+    #[must_use]
+    pub(crate) fn into_prepared_parts(
+        self,
+    ) -> (
+        DurableLiveTransferStateV1,
+        Vec<Vec<u8>>,
+        DurableTransferOutcomeV1,
+    ) {
+        (self.state, self.record_bytes, self.outcome)
     }
 }
 
@@ -1503,3 +1784,40 @@ impl<'a> RecordDecoder<'a> {
 }
 
 const _: () = assert!(MAX_PART_BYTES < MAX_DURABLE_TRANSFER_RECORD_BYTES);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_credit_uses_exact_canonical_record_length_and_rejects_trailing_bytes() {
+        let marker = DurableTransferRecordV1 {
+            kind: RecordKind::NeedsBootstrap(NeedsBootstrapMarker {
+                binding: DurableTransferBindingIdentityV1 {
+                    target: DurableTransferTargetV1::Catalog,
+                    binding_sha256: [0x31; 32],
+                    stream_route: StreamRouteId::from_bytes([0x32; 16]),
+                    stream_generation: StreamGenerationId::from_bytes([0x33; 16]),
+                },
+                transfer_id: None,
+                error: DurableTransferBootstrapError::ReassemblyFull,
+                marked_at_ms: 40,
+                clock_watermark_ms: 40,
+            }),
+        }
+        .canonical_bytes()
+        .unwrap();
+        assert!(marker.len() < MAX_NEEDS_BOOTSTRAP_MARKER_RECORD_BYTES);
+        assert_eq!(
+            bootstrap_marker_credit_bytes_records(std::slice::from_ref(&marker)).unwrap(),
+            4 + marker.len(),
+        );
+
+        let mut noncanonical = marker;
+        noncanonical.push(0);
+        assert!(matches!(
+            bootstrap_marker_credit_bytes_records(&[noncanonical]),
+            Err(DurableTransferStateError::InvalidRecord)
+        ));
+    }
+}

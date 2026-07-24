@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成；P4.4 MachineLink ingress/RuntimeCore dispatch 由 `cd7d9fb` 完成；P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成，current Runtime wire 保持 v4、physical schema 为 v14/35 表。P4/P5/P6 当前分别为 5/7、0/9、0/4 Task 完成，下一项是 P4.6 persistent remote CLI；production native metadata 与 provisioned signed Keychain/LaunchAgent 均为 post-MVP gated/BLOCKED（2026-07-23） |
+| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成；P4.4 MachineLink ingress/RuntimeCore dispatch 由 `cd7d9fb` 完成；P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成，收口时 Runtime wire 为 v4、physical schema 为 v14/35 表。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；P4/P5/P6 按 Task 进度分别为 6/7、0/9、0/4。P4.7、`p4-auto`、P4 Phase Exit、iOS 真实链路及 production native metadata 与 provisioned signed Keychain/LaunchAgent 均未完成或为 post-MVP gated/BLOCKED（2026-07-24） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -66,12 +66,20 @@ P4.4 由 `cd7d9fb` 完成唯一 MachineLink business ingress：Relay v2 outer、
 replay/AEAD、local auth-ledger exact recheck 通过后，才以 `RemotePrincipal` 进入
 `RuntimeCore`；`RouteAccepted` 不代表 command success，恢复阻断仅限对应 conversation。P4.5 又由
 `c6ef387`、`88b3c42` 完成 MachineDataSign signed publication、counter/replay/key transition crash recovery
-与 production sealer/publisher 接线，current Runtime wire 保持 v4、physical schema 为 v14/35 表。完整
+与 production sealer/publisher 接线；P4.5 收口时 Runtime wire 为 v4、physical schema 为 v14/35 表。完整
 daemon lib `1579 passed / 3 gated ignored`，main `7/7`，integration/doc-test 零失败，256 MiB
 `runtime_store_boundaries` `5/5`（282.85 秒），Clippy/fmt/diff 全绿；双路终审在同一冻结 hash
 `88ac6c486a7446b5fe4613388f66ee25561a7529a2fd0f8904844217730a896f` 上 P0/P1/P2=0。
-P4 当前为 5/7，下一项是 P4.6。persistent remote CLI、iOS 真实链路仍未完成，iOS 仍只有 fixture
-驱动骨架；当前 verifier 只接受 `p0|p2|p3`，不宣称 P4 Phase PASS。P3.1 provisioned signed
+P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；`pair`、
+`machines`、`conversations`、`watch`、`prompt`、`approve`、`retry-approval`、`revoke-self` 均已接入。
+watch 使用 fresh authenticated bootstrap、canonical NDJSON、SIGINT/SIGTERM 与有序 stopped/revoked terminal；
+2026-07-24 冻结 code/test scope 为 29 paths，blob-manifest SHA-256 为
+`32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`；watch `12/12`、
+`remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client
+`25/25` 与 protocol `244/244` 均通过，四 schema/三 crate Clippy/fmt/network/no-net/docs/diff 全绿。
+`spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。P4 按 Task 进度为
+6/7，iOS 仍只有 fixture 驱动骨架；当前 verifier
+只接受 `p0|p2|p3`，不宣称 `p4-auto` 或 P4 Phase PASS。P3.1 provisioned signed
 Keychain/LaunchAgent roundtrip 继续按方案 b 保持 post-MVP BLOCKED gate；物理设备与公网证据也继续
 post-MVP BLOCKED。完整实施仍必须满足 §17 的 Definition of Done。
 
@@ -1215,21 +1223,62 @@ transport-specific representability 同样必须校验：JSON/UDS 的 `totalByte
 `partCount * 3.5 MiB` 且保持 64-part ceiling。两者仍同时受 64 MiB transfer 总上限；part 数增加不
 扩大 reassembly memory 或 TTL。不能声明一份由该 transport 的全部 parts 永远无法组成的 totalBytes。
 
-重组完成前先比较已计入 connection budget 的 `bufferedBytes == totalBytes`，不匹配时必须在按
-`totalBytes` 预分配 assembly buffer 之前 abort 并释放预算；否则 64 个极小/零字节 parts 可诱导
-额外 64 MiB 瞬时分配并越过 128 MiB connection hard cap。
+通用 reply/JSON 易失 reassembler 在重组完成前先比较已计入 connection logical budget 的
+`bufferedBytes == totalBytes`；不匹配时必须在按 `totalBytes` 预分配 assembly buffer 之前 abort 并释放预算，
+否则 64 个极小/零字节 parts 可诱导额外 64 MiB 瞬时分配。该易失路径每 connection 最多 64 个 active
+transfer、128 MiB logical reassembly bytes，全局 512 MiB；completed tombstone 每 connection 256、全局
+8,192，absolute TTL 5 分钟。metadata/duplicate conflict、hash/length 错误、超限、TTL 或 disconnect 都会
+终止该易失 connection-owned assembly；计数使用 checked arithmetic，零字节 part 仍占 active-transfer 配额。
 
-每 connection 最多 64 个 active transfer、128 MiB reassembly；全局 512 MiB。completed tombstone
-每 connection 256、全局 8,192，absolute TTL 5 分钟。metadata/duplicate conflict、hash/length 错误、
-超限、到 TTL 边界或 disconnect 都必须 abort 并释放 bytes/count；全局/connection 计数使用 checked
-arithmetic，零字节 part 仍占 active-transfer 配额。
+P4.6 persistent CLI 的 authenticated live-stream `TransferPart` 是另一条 durable 路径：paired-state V6
+把 exact stream binding 与 transfer records 放进同一 sealed CAS。partial 在 transport disconnect、进程
+crash/restart 后继续受原 absolute expiry 约束，不因重连续期；runtime 从 sealed state 选择最早 expiry，
+即使 Relay 永久静默，也会在 deadline 到达时原子写入 `remote.transfer.expired` marker，**不依赖下一帧**。
+Tokio monotonic timer 只负责唤醒，不能替代持久化的 absolute deadline 成为信任根。
+runtime 在按 absolute expiry 建立 Tokio timer 前，必须以当前 wall clock 校验 sealed transfer records 的
+durable clock watermark。若当前时间早于 watermark，立即返回 `remote.runtime.state_invalid`；不得 clamp
+remaining、按放大的 remaining 进入等待、伪造 expired marker，或改写 paired-state、reducer、cursor 与 ACK
+状态。该拒绝路径保持 transport 零发送与 durable records byte-exact 零写。
+
+paired-state V6 的 128 MiB 是完整 CryptoState plaintext 编码的 logical budget，不是 RSS 或 resident
+high-water 保证。普通 mutation 必须按最多 4,096 个 durable stream binding 聚合预留每 binding 一次最坏 replay
+tuple、NeedsBootstrap marker 与 collection framing，并用 checked arithmetic 从 hard cap 推导 normal budget；
+marker 只能消费自己 binding 的 reserve。live-transfer replacement candidate 超出 normal budget 时，production
+path 必须丢弃超限 candidate，从 current exact state 写入 compact `remote.transfer.reassembly_full` marker；若
+fresh replay admission 本身先越过 normal budget，则在 AEAD open 前把未落盘 replay 与 marker 放入同一 exact
+CAS。两条路径都保留已认证 replay admission，outer applied/ACK 与 reducer/inner cursor 均不推进，exact binding
+的 active/buffered records 清零，其他 binding records 不驱逐且 canonical bytes 不变，冷重开仍能读到 marker。
+NeedsBootstrap marker 在 binding replacement 前同时 fence Publish、Gap 与 ReplayComplete，后两者也不得借机
+清理 durable stream 轴。任一带 stream cursor 的 legacy state 在下一次 mutation 时升级 V6 并通过 normal gate；
+cold read 不隐式迁移，已越过新 normal budget 的旧状态只能在 entropy/写盘前零写 fail-close。
+8 MiB lowered-cap 只是在 `debug_assertions` automatic test build 中驱动同一 Production authority 分支的
+不可配置 seam；release artifact 不含该入口。
+
+prepared ADST v2 将 `Normal` / `EmergencyBootstrapMarker` capacity mode 放进 AEAD 认证内容，CounterGuard
+的 sealed commitment 绑定完整 sidecar。legacy ADST v1 只能解释为 Normal，不能借旧格式获得 emergency
+authority。4095→4096 marker 必须在 guard-first 与 active-first crash cut 都由同一 production recovery
+收敛；cleanup 只有 exact owner 可以 unlink sidecar 并安全 retry。sidecar 缺失后的 reseal、commitment conflict
+或 legacy over-normal CounterPending active-next 均须 fail-close，并保持 state/guard/sidecar byte-exact 零写。
+
+P4.6 persistent `watch` 每次进程启动都从 fresh authenticated bootstrap 建立 reducer，不把 durable cursor
+当内存 transcript。canonical NDJSON 阶段固定为 `bootstrap|synchronized|live|control|terminal`；SIGINT/SIGTERM
+只能在当前 exact frame durable apply 与 ACK terminal 后公开 stopped。`TransferBootstrapRequired` 或 subscription
+control 与 signal 并发时必须先公开 marker/control，再 latch signal；Connected 与 ready signal 同时出现时零
+Subscribe、shutdown 后 stopped，verified revoked terminal 优先。握手期或 active root-signed revoke 只有在
+transport shutdown/drop 与 crash-safe cleanup 完成后才能公开 revoked；EOF/普通断线只能是 outcome unknown。
 
 part 到达绝不推进 inner cursor。只有所有 parts 齐全、length/hash 正确、canonical decode 成功、
 target/streamGeneration/after/through 匹配、Conversation capabilities preamble 校验通过，并在
 clone reducer 上完整 apply 后，才能原子 swap reducer 与持久化 inner cursor一次。completed
 tombstone/严格 reducer dedup 防止完整 retry 二次 apply；stale generation 完成也不得 commit。
-P3.6 的 `TransferStateMachine` 目前没有 production remote ingress owner；P4/P5 接线前，这些结果只
-证明 component reducer 与 accounting，不是设备端已接收、解密或应用 transfer 的证据。
+P3.6 收口时的 `TransferStateMachine` 没有 production remote ingress owner；该历史 component 结果只证明
+reducer 与 accounting，不能替代上文 P4.6 durable production-path gate，更不是设备端已接收、解密或应用
+transfer 的证据。
+
+每个 `RemoteSubscriptionReducer` 必须声明包含 inline bytes 与全部 transitive retained allocations 的
+`MAX_RETAINED_BYTES`，且不得超过 64 MiB；subscribe 与 live receive 在任何 transport IO 或 durable mutation
+前校验，超限固定返回 `remote.runtime.reducer_capacity`。Runtime 只能验证声明值和 inline size，不能把该
+声明冒充对实现内部真实 allocation 或 RSS 的动态证明。
 
 ### 9.8 固定运行时资源上界
 
@@ -1241,7 +1290,9 @@ P3.6 的 `TransferStateMachine` 目前没有 production remote ingress owner；P
 | snapshot sender/build | 1 sender/connection，2 global；build retained memory 128 MiB global |
 | snapshots | 10,000 items/64 MiB each；1 ready/conversation；512 MiB global |
 | backfill chunk | 512 events/deltas 或 64 MiB，取先到者 |
-| transfer | 64 active/connection；128 MiB/connection、512 MiB global reassembly |
+| 通用易失 transfer | 64 active/connection；128 MiB/connection、512 MiB global logical reassembly |
+| P4.6 paired-state V6 | 完整 plaintext 编码 128 MiB logical budget；非 RSS；partial 保留原 5 分钟 absolute TTL |
+| remote subscription reducer | 每实例声明的 inline + transitive retained 上界不超过 64 MiB；pre-IO/pre-durable 校验 |
 | completed transfer tombstone | 256/connection、8,192 global；absolute TTL 5 分钟 |
 | read-only WAL pool | 8 connections；128 MiB retained pages；64 rows/8 MiB per page |
 | publication dispatcher | 64 rows/8 MiB per page；16 MiB global memory |
@@ -1525,7 +1576,23 @@ Relay 外层错误只描述通用路由/传输失败；daemon 业务错误必须
 - `relay.store.unavailable`、`relay.quota.exceeded`、`relay.disk.low`。
 - `remote.crypto.bad_ciphertext`、`remote.crypto.key_epoch_missing`、`remote.crypto.key_revision_rollback`、`remote.crypto.counter_replay`、`remote.crypto.nonce_reuse`、`remote.crypto.bad_sender_signature`。
 - `remote.transport.tls_pin_mismatch`、`remote.machine.offline`。
-- `remote.transfer.too_large`、`remote.transfer.hash_mismatch`、`remote.transfer.expired`、`remote.transfer.reassembly_full`。
+- 通用 reply/JSON transfer reassembler 保留 `remote.transfer.too_large`、
+  `remote.transfer.hash_mismatch`、`remote.transfer.expired`、`remote.transfer.reassembly_full`。
+- P4.6 paired-state V6 durable bootstrap marker 使用 `remote.transfer.identity_invalid`、
+  `remote.transfer.metadata_mismatch`、`remote.transfer.target_mismatch`、
+  `remote.transfer.stale_binding`、`remote.transfer.duplicate_conflict`、`remote.transfer.expired`、
+  `remote.transfer.active_limit`、`remote.transfer.reassembly_full`、
+  `remote.transfer.length_mismatch`、`remote.transfer.hash_mismatch`、
+  `remote.transfer.payload_rejected`；其中三个共享 code 仍由具体 ingress 状态区分。paired candidate 容量
+  fallback 的 `reassembly_full` 必须保留 replay admission、保持 ACK/reducer/cursor 不推进并持久化 compact marker。
+- `remote.runtime.reducer_capacity`：reducer 声明的 inline/transitive retained 上界无效或超过 64 MiB；必须在
+  transport IO 与 durable mutation 前拒绝。
+- `remote.runtime.outcome_unknown`：watch/command 在 authenticated terminal 前 EOF 或普通断线；不得合成
+  stopped、revoked 或 daemon receipt。
+- `remote.watch.output_failed`、`remote.watch.signal_failed`：canonical NDJSON write/flush 或 SIGINT/SIGTERM
+  listener 失败；shutdown 后失败退出，不推进 durable cursor。
+- `remote.runtime.handshake_revoked` / `remote.runtime.revoked`：只表示 exact root-signed revocation terminal；
+  revoked 成功终态仍须等待 transport shutdown/drop 与 crash-safe paired cleanup。
 - P3.6 stream/barrier 当前复用已冻结的 `daemon.runtime.read_unavailable`、
   `daemon.runtime.connection_unavailable`、`daemon.runtime.invalid_state` 与 store-specific
   `daemon.runtime.*` code；没有另造 `daemon.stream.*` wire family。
@@ -1609,7 +1676,7 @@ provisioned production-signed LaunchAgent/Keychain 仍按方案 b 保持 post-MV
   Unprovable 恢复按 conversation 收敛。
 - P4.5 已完成 daemon WSS/E2EE 下行、MachineDataSign、Catalog/events/commands/replay、key/counter crash
   recovery 与 directed sealer/publisher production 接线；admission 只在 counter/publication/transition recovery
-  门禁完成后开放。Runtime wire 保持 v4，physical schema 为 v14/35 表。
+  门禁完成后开放。P4.5 收口时 Runtime wire 为 v4，physical schema 为 v14/35 表。
 - macOS persistent 远程 CLI 使用 Keychain 中的真实 grant/private keys 和 daemon receipts；Linux synthetic client 只用 ephemeral keys。
 
 退出门禁：P4 的 machine identity、pairing、RemoteLink、远程 CLI 与 trust-reset/uninstall-purge 功能全部

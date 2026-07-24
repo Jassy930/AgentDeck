@@ -97,6 +97,8 @@ impl CatalogReducer {
 }
 
 impl RemoteSubscriptionReducer for CatalogReducer {
+    const MAX_RETAINED_BYTES: usize = 64 * 1024;
+
     fn inner_cursor(&self) -> &RuntimeInnerCursor {
         &self.cursor
     }

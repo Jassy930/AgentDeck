@@ -1,4 +1,4 @@
-//! RuntimeEnvelope v4 —— UDS 与解密后远程链路的共同**中立业务 wire**（design §8.2）。
+//! RuntimeEnvelope v5 —— UDS 与解密后远程链路的共同**中立业务 wire**（design §8.2）。
 //!
 //! 本模块与 local IPC（`PROTOCOL_VERSION = 2`，见 crate 根）及 Relay v2
 //! 彼此独立、版本轴不联动：`RUNTIME_PROTOCOL_VERSION` 与

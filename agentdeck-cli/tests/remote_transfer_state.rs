@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
 use agentdeck_cli::remote::transfer_state::{
-    DurableLiveTransferStateV1, DurableTransferBootstrapError, DurableTransferOutcomeV1,
-    DurableTransferStateError, MAX_DURABLE_TRANSFER_RECORD_BYTES,
+    DurableLiveTransferStateV1, DurableTransferBindingIdentityV1, DurableTransferBootstrapError,
+    DurableTransferOutcomeV1, DurableTransferStateError, MAX_DURABLE_TRANSFER_RECORD_BYTES,
 };
 use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, KeyId, KeyPurpose, StreamBindingV1};
 use agentdeck_protocol::relay_v2::{
@@ -56,6 +56,31 @@ fn conversation_binding(conversation_id: &str, route: u8, generation: u8) -> Str
         epoch: 8,
     };
     binding
+}
+
+fn indexed_conversation_binding(index: u64) -> StreamBindingV1 {
+    let mut binding = conversation_binding(&canonical_id(0x1_000 + index), 0x35, 0x45);
+    let mut route = [0x35; 16];
+    route[8..].copy_from_slice(&index.to_be_bytes());
+    binding.stream_route = StreamRouteId::from_bytes(route);
+    let mut generation = [0x45; 16];
+    generation[8..].copy_from_slice(&index.to_be_bytes());
+    binding.stream_generation = StreamGenerationId::from_bytes(generation);
+    binding
+}
+
+fn bootstrap_marker_record(index: u64) -> Vec<u8> {
+    let binding = indexed_conversation_binding(index);
+    DurableLiveTransferStateV1::empty()
+        .abort_exact_binding(
+            &binding,
+            None,
+            DurableTransferBootstrapError::PayloadRejected,
+            START_MS,
+        )
+        .expect("construct one canonical bootstrap marker")
+        .record_bytes()[0]
+        .clone()
 }
 
 fn carrier(
@@ -283,6 +308,187 @@ fn ttl_is_absolute_and_clock_rollback_fails_closed_without_extending_expiry() {
 }
 
 #[test]
+fn earliest_active_expiry_is_absolute_read_only_and_deterministic() {
+    let conversation_a = canonical_id(0x71);
+    let conversation_b = canonical_id(0x72);
+    let binding_a = conversation_binding(&conversation_a, 0x34, 0x44);
+    let binding_b = conversation_binding(&conversation_b, 0x35, 0x45);
+    let identity_a = DurableStreamTransferIdentity::from_event_metadata(
+        &ConversationId::new(&conversation_a),
+        &EventId::new(canonical_id(0x73)),
+        1,
+        (MAX_PART_BYTES + 1) as u64,
+        [0x71; 32],
+    )
+    .unwrap();
+    let identity_b = DurableStreamTransferIdentity::from_event_metadata(
+        &ConversationId::new(&conversation_b),
+        &EventId::new(canonical_id(0x74)),
+        2,
+        (MAX_PART_BYTES + 1) as u64,
+        [0x72; 32],
+    )
+    .unwrap();
+    let part_a = carrier(identity_a, 0, vec![0x71]);
+    let part_b = carrier(identity_b, 0, vec![0x72]);
+
+    let state_ba = DurableLiveTransferStateV1::empty()
+        .accept_part(&binding_b, part_b.clone(), START_MS)
+        .unwrap()
+        .into_state()
+        .accept_part(&binding_a, part_a.clone(), START_MS)
+        .unwrap()
+        .into_state();
+    let state_ab = DurableLiveTransferStateV1::empty()
+        .accept_part(&binding_a, part_a.clone(), START_MS)
+        .unwrap()
+        .into_state()
+        .accept_part(&binding_b, part_b, START_MS)
+        .unwrap()
+        .into_state();
+    let expected_binding =
+        DurableTransferBindingIdentityV1::from_stream_binding(&binding_a).unwrap();
+    let expected = Some((expected_binding, START_MS + TRANSFER_TTL_MS));
+    assert_eq!(state_ba.earliest_active_expiry(), expected);
+    assert_eq!(state_ab.earliest_active_expiry(), expected);
+    assert_eq!(
+        state_ab
+            .clone()
+            .expire_due_active(START_MS - 1)
+            .unwrap_err(),
+        DurableTransferStateError::ClockRollback
+    );
+    assert_eq!(
+        state_ba.canonical_record_bytes().unwrap(),
+        state_ab.canonical_record_bytes().unwrap(),
+        "equal-expiry selection and canonical records must not depend on insertion order"
+    );
+
+    let records_before_query = state_ba.canonical_record_bytes().unwrap();
+    assert_eq!(state_ba.earliest_active_expiry(), expected);
+    assert_eq!(
+        state_ba.canonical_record_bytes().unwrap(),
+        records_before_query
+    );
+
+    let (before_expiry, expired_binding) = state_ba
+        .expire_due_active(START_MS + TRANSFER_TTL_MS - 1)
+        .unwrap();
+    assert_eq!(expired_binding, None);
+    assert_eq!(
+        before_expiry.canonical_record_bytes().unwrap(),
+        records_before_query
+    );
+
+    let repeated = before_expiry
+        .accept_part(&binding_a, part_a, START_MS + TRANSFER_TTL_MS - 1)
+        .unwrap();
+    assert!(matches!(
+        repeated.outcome(),
+        DurableTransferOutcomeV1::Buffered { .. }
+    ));
+    assert_eq!(repeated.state().earliest_active_expiry(), expected);
+
+    let (expired_a, expired_binding) = repeated
+        .into_state()
+        .expire_due_active(START_MS + TRANSFER_TTL_MS)
+        .unwrap();
+    assert_eq!(expired_binding, Some(expected_binding));
+    assert_eq!(expired_a.active_count(), 1);
+    assert_eq!(expired_a.marker_count(), 1);
+    let expected_binding_b =
+        DurableTransferBindingIdentityV1::from_stream_binding(&binding_b).unwrap();
+    assert_eq!(
+        expired_a.earliest_active_expiry(),
+        Some((expected_binding_b, START_MS + TRANSFER_TTL_MS))
+    );
+    let (expired_b, expired_binding) = expired_a
+        .expire_due_active(START_MS + TRANSFER_TTL_MS)
+        .unwrap();
+    assert_eq!(expired_binding, Some(expected_binding_b));
+    assert_eq!(expired_b.active_count(), 0);
+    assert_eq!(expired_b.marker_count(), 2);
+    let records = expired_b.canonical_record_bytes().unwrap();
+    let restarted = DurableLiveTransferStateV1::from_record_bytes(&records).unwrap();
+    assert_eq!(restarted.earliest_active_expiry(), None);
+    assert_eq!(restarted.marker_count(), 2);
+}
+
+#[test]
+fn accepting_new_transfer_housekeeps_expired_active_bindings_first() {
+    let expired_conversation = canonical_id(0x75);
+    let fresh_conversation = canonical_id(0x76);
+    let expired_binding = conversation_binding(&expired_conversation, 0x36, 0x46);
+    let fresh_binding = conversation_binding(&fresh_conversation, 0x37, 0x47);
+    let expired_identity = DurableStreamTransferIdentity::from_event_metadata(
+        &ConversationId::new(&expired_conversation),
+        &EventId::new(canonical_id(0x77)),
+        1,
+        (MAX_PART_BYTES + 1) as u64,
+        [0x75; 32],
+    )
+    .unwrap();
+    let fresh_identity = DurableStreamTransferIdentity::from_event_metadata(
+        &ConversationId::new(&fresh_conversation),
+        &EventId::new(canonical_id(0x78)),
+        2,
+        (MAX_PART_BYTES + 1) as u64,
+        [0x76; 32],
+    )
+    .unwrap();
+    let expired_part = carrier(expired_identity, 0, vec![0x75]);
+    let state = DurableLiveTransferStateV1::empty()
+        .accept_part(&expired_binding, expired_part.clone(), START_MS)
+        .unwrap()
+        .into_state();
+
+    let accepted = state
+        .accept_part(
+            &fresh_binding,
+            carrier(fresh_identity, 0, vec![0x76]),
+            START_MS + TRANSFER_TTL_MS,
+        )
+        .unwrap();
+    assert_eq!(
+        accepted.outcome(),
+        &DurableTransferOutcomeV1::Buffered {
+            received_parts: 1,
+            part_count: 2,
+        }
+    );
+    assert_eq!(accepted.state().active_count(), 1);
+    assert_eq!(accepted.state().marker_count(), 1);
+    assert_eq!(
+        accepted.state().earliest_active_expiry(),
+        Some((
+            DurableTransferBindingIdentityV1::from_stream_binding(&fresh_binding).unwrap(),
+            START_MS + 2 * TRANSFER_TTL_MS,
+        ))
+    );
+
+    let expired = accepted
+        .into_state()
+        .accept_part(&expired_binding, expired_part, START_MS + TRANSFER_TTL_MS)
+        .unwrap();
+    assert_eq!(
+        expired.outcome(),
+        &DurableTransferOutcomeV1::NeedsBootstrap {
+            error: DurableTransferBootstrapError::Expired,
+        }
+    );
+    assert_eq!(expired.state().active_count(), 1);
+    assert_eq!(expired.state().marker_count(), 1);
+    let records = expired.record_bytes();
+    assert_eq!(
+        DurableLiveTransferStateV1::from_record_bytes(records)
+            .unwrap()
+            .canonical_record_bytes()
+            .unwrap(),
+        records
+    );
+}
+
+#[test]
 fn sixty_four_active_is_the_hard_limit_and_sixty_fifth_needs_bootstrap() {
     let binding = catalog_binding(0x35, 0x45);
     let mut state = DurableLiveTransferStateV1::empty();
@@ -324,6 +530,53 @@ fn sixty_four_active_is_the_hard_limit_and_sixty_fifth_needs_bootstrap() {
         }
     );
     assert_eq!(rejected.state().active_count(), 0);
+}
+
+#[test]
+fn sixty_fifth_distinct_binding_marker_is_not_rejected_by_the_active_limit() {
+    let mut state = DurableLiveTransferStateV1::empty();
+    for index in 0..65 {
+        let binding = indexed_conversation_binding(index);
+        state = state
+            .abort_exact_binding(
+                &binding,
+                None,
+                DurableTransferBootstrapError::PayloadRejected,
+                START_MS,
+            )
+            .expect("each distinct binding may persist its terminal marker")
+            .into_state();
+    }
+
+    assert_eq!(state.active_count(), 0);
+    assert_eq!(state.marker_count(), 65);
+    let records = state.canonical_record_bytes().unwrap();
+    let restarted = DurableLiveTransferStateV1::from_record_bytes(&records)
+        .expect("the sixty-fifth marker remains restart durable");
+    assert_eq!(restarted.active_count(), 0);
+    assert_eq!(restarted.marker_count(), 65);
+    assert_eq!(restarted.canonical_record_bytes().unwrap(), records);
+}
+
+#[test]
+fn marker_collection_accepts_4096_and_rejects_4097() {
+    const MAX_MARKERS: u64 = 4_096;
+
+    let records = (0..MAX_MARKERS)
+        .map(bootstrap_marker_record)
+        .collect::<Vec<_>>();
+    let accepted = DurableLiveTransferStateV1::from_record_bytes(&records)
+        .expect("the complete durable binding marker collection must be accepted");
+    assert_eq!(accepted.active_count(), 0);
+    assert_eq!(accepted.marker_count(), MAX_MARKERS as usize);
+    assert_eq!(accepted.canonical_record_bytes().unwrap(), records);
+
+    let mut overflow = records;
+    overflow.push(bootstrap_marker_record(MAX_MARKERS));
+    assert_eq!(
+        DurableLiveTransferStateV1::from_record_bytes(&overflow).unwrap_err(),
+        DurableTransferStateError::TooLarge
+    );
 }
 
 #[test]

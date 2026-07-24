@@ -6,7 +6,7 @@
 
 **Goal:** 交付一个真实可用的端到端 Companion MVP：每个被控 macOS 登录用户只有一个 `launchd` 常驻 `agentdeckd`，本地 App/CLI 与多个远程 macOS/iOS/CLI 客户端共享同一 RuntimeCore；Relay 严格最小可见，Codex 与 Claude Code 均通过真实链路完成浏览、prompt、审批、重连与多写者裁决。
 
-**Architecture:** P1–P3.8 先以 `RuntimeEnvelope v1` 建立 UDS/Core 基线；P3.9-C0 因新增 configuration、agent discovery 与 canonical metadata mutation，把共同业务 wire 原子升级为 `RuntimeEnvelope v2`，不提供 production v1/v2 双栈；P4.2 additive 升级为 Runtime v3，增加 local-only machine enrollment/status/trust-reset 与 uninstall purge plan；P4.3 再升级为 Runtime v4，增加 local-only pairing/revoke administration，同样不保留 production v3/v4 双栈。`agentdeckd` 持有唯一 RuntimeCore、稳定 conversation 身份、SQLite journals、per-conversation actor、approval CAS 与两阶段 exec gate；Relay v2 只持有随机 route/stream/request 元数据、公开授权材料和 opaque sealed blob；Swift 的 `AgentDeckSessionSource` 统一本地与远程数据源，`AgentDeckRelayClient` 实现 WSS、CryptoKit、Keychain、replay 和 bounded stream。
+**Architecture:** P1–P3.8 先以 `RuntimeEnvelope v1` 建立 UDS/Core 基线；P3.9-C0 因新增 configuration、agent discovery 与 canonical metadata mutation，把共同业务 wire 原子升级为 `RuntimeEnvelope v2`，不提供 production v1/v2 双栈；P4.2 additive 升级为 Runtime v3，增加 local-only machine enrollment/status/trust-reset 与 uninstall purge plan；P4.3 再升级为 Runtime v4，增加 local-only pairing/revoke administration；P4.6 automatic Task complete为 catalog exact page chain 升至 current Runtime v5，production 仍只接受 current 单版本。`agentdeckd` 持有唯一 RuntimeCore、稳定 conversation 身份、SQLite journals、per-conversation actor、approval CAS 与两阶段 exec gate；Relay v2 只持有随机 route/stream/request 元数据、公开授权材料和 opaque sealed blob；Swift 的 `AgentDeckSessionSource` 统一本地与远程数据源，`AgentDeckRelayClient` 实现 WSS、CryptoKit、Keychain、replay 和 bounded stream。
 
 **Tech Stack:** Rust 2024、Tokio、rusqlite/SQLite WAL、rustls、`hpke 0.14`、ChaCha20-Poly1305、Ed25519；Swift 6、Foundation/CryptoKit/URLSessionWebSocketTask、AppKit、UIKit、XCTest；macOS 15+、iOS 17+、XcodeGen、launchd、Linux systemd Relay。
 
@@ -1075,8 +1075,9 @@ ignored/BLOCKED；P3.7 exec gate 主体、边界裁决、两个 prepare finding 
 `c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；P3.8 production UDS 与后续
 P3.9 shared-daemon client 与 P3.10 LaunchAgent Task 已完成；P3.10 code/test commit 为 `19622ab`，
 后续 Phase hardening code baseline 为 `9efb28d`，P3 automatic scope 已完成 6/6 Phase Exit；P4
-已由 P4.1–P4.5 推进到 5/7，current Runtime wire 保持 v4、physical schema 为 v14/35 表，下一项是
-P4.6 persistent remote CLI。当前 verifier 仍只接受 `p0|p2|p3`，不宣称 P4 Phase PASS。
+已由 P4.1–P4.6 推进到 6/7；P4.6 persistent remote CLI 已完成 automatic Task，current
+Runtime wire 为 v5；2026-07-24 的冻结范围与门禁证据见 Task P4.6 收口段。
+当前 verifier 仍只接受 `p0|p2|p3`，不宣称 P4 Phase PASS。
 
 ### Task P3.6-A：先冻结 Runtime/E2EE contract 与跨语言 wire
 
@@ -2469,7 +2470,8 @@ P3.9 固定以下迁移边界：
   真实 Codex/CC login 与 provisioned signed Keychain 继续是 post-MVP BLOCKED 槽位，不冒充本 Task 证据。
   P3.9 至此完成；P3.10 已由 `19622ab` 完成 Task 收口并通过完整 verifier 与双路 Task 终审；后续
   Phase review hardening 已由 `773a2b3` / `0057824` / `81cc314` / `9efb28d` 收口，P3 automatic scope
-  已完成 6/6 Phase Exit。后续 P4.1–P4.5 已完成，P4 当前为 5/7，下一项是 P4.6。
+  已完成 6/6 Phase Exit。后续 P4.1–P4.5 已完成，P4.6 已完成 automatic Task；P4 按
+  Task 进度为 6/7。
 
 ### Task P3.10：实现 LaunchAgent 安装、versioned upgrade 与保留数据的 uninstall
 
@@ -2479,8 +2481,8 @@ P3.9 固定以下迁移边界：
 > code/test，并由 `19622ab` scoped commit。冻结 candidate 的完整
 > `bash scripts/verify-relay-companion-mvp.sh p3` 已 exit 0，两路 Task review 均 Approved、无 P0/P1/P2；
 > 隔离 ephemeral UDS 已完成 install→stage→ACK→idle→手动 current restart→Hello；后续 Phase review
-> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。后续 P4.1–P4.5 已完成，P4 当前为
-> 5/7，下一项是 P4.6。
+> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。后续 P4.1–P4.5 已完成，P4.6 已形成
+> automatic Task complete；P4 按 Task 进度为 6/7。
 
 **前置冻结：** local-only typed `StageUpgrade` request/reply、授权与错误语义已纳入 P3.9-C0-A 的 Runtime
 v2 contract；P3.9 的历史基线固定返回 typed feature-unavailable，P3.10 implementation 已用 durable/flush-ACK
@@ -2559,19 +2561,22 @@ focused tests + scoped Clippy/fmt，不做子片级双路终审、全量慢门�
 - [x] 四 schema、daemon network boundary、agent docs、local smoke、diagnostics 与 scoped diff/status 全绿；
   冻结 candidate 的两路 phase code review 均为 P0/P1/P2=0。
 - [x] P3 标记为 `complete (automatic scope)`；provisioned production-signed LaunchAgent/Keychain
-  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。后续 P4.1–P4.5 已完成，P4 当前为 5/7，
-  下一项是 P4.6。
+  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。后续 P4.1–P4.5 已完成，P4.6 已形成
+  automatic Task complete；P4 按 Task 进度为 6/7。
 
 ---
 
 ## Phase P4：Machine identity、Pairing 与 RemoteLink
 
-> **当前状态（2026-07-23）：5/7 Task 完成。** P4.1 machine identity/guard、P4.2
+> **当前状态（2026-07-24）：P4.6 automatic Task complete，P4 为 6/7。** P4.1 machine identity/guard、P4.2
 > certificate/enrollment/control-only RemoteTransport/trust reset、P4.3 PairInvite/DeviceGrant/auth ledger 与
 > P4.4 MachineLink ingress/RuntimeCore dispatch automatic scope 已完成 Task 级完整门禁与双路 Approved；
 > P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成并通过同一冻结候选上的双路终审。
-> current Runtime wire 保持 v4，physical schema 为 v14/35 表。下一项是 P4.6 persistent remote CLI；
-> P4.6–P4.7 与 P4 Phase Exit 仍未完成，其 checkbox 保持未勾。此前 0/7、1/7、2/7、3/7、4/7
+> P4.5 收口时 Runtime wire 为 v4，physical schema 为 v14/35 表。P4.6 把 current Runtime wire
+> 升至 v5；冻结 code/test scope 为 29 paths，blob-manifest SHA-256 为
+> `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`。automatic gates 已通过；
+> `spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。
+> P4.7 与 P4 Phase Exit 仍未完成，其 checkbox 保持未勾。此前 0/7、1/7、2/7、3/7、4/7
 > 分别是 P4.1/P4.2/P4.3/P4.4/P4.5 开始前的历史基线。
 
 ### Task P4.1：扩展 macOS Keychain 为 Machine identity 与 CounterGuard（零 cert/enrollment/RemoteLink）
@@ -2810,8 +2815,9 @@ production-signed Keychain 槽位；继续精确记为 post-MVP BLOCKED，不计
 > **状态：Task complete。** 主体 code/test commit 为 `518380e`，后续 ownership/recovery hardening 为
 > `b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`，Runtime v4 gate repair 为 `fe3a9ad`，最终
 > shutdown/startup/local-recovery hardening 与 v10 inventory/ledger/cipher fixture gate 为 `3b4b977`。current Runtime
-> protocol 为 v4，physical schema 为 v10/30 表；后续 P4.4 与 P4.5 已完成，current Runtime wire 仍为
-> v4、physical schema 已推进至 v14/35 表，下一项为 P4.6。
+> protocol 为 v4，physical schema 为 v10/30 表；后续 P4.4 与 P4.5 已完成，P4.5 收口时 Runtime wire
+> 仍为 v4、physical schema 已推进至 v14/35 表。P4.6 已完成 automatic Task，current
+> Runtime wire 为 v5。
 
 **Files:**
 - Create: `agentdeckd/src/remote/{pairing,grants,access,key_directory}.rs`
@@ -2919,7 +2925,8 @@ RemotePrincipal → RuntimeCore 是唯一 ingress；RemoteLink 只拥有 transpo
 `admission_ready=false`；不预留 counter、不 seal、不写 durable publication outbox。独立 `spec/security`
 与 `quality` 终审均为 P0/P1/P2=0、Approved。counter reservation、durable publication outbox、Relay
 Publish、persistent remote CLI 与 production-signed PASS 在 P4.4 收口时分别属于 P4.5/P4.6 或 post-MVP
-gate；后续 P4.5 已完成 signed publication/counter recovery，persistent remote CLI 仍属于 P4.6。
+gate；后续 P4.5 已完成 signed publication/counter recovery，P4.6 persistent remote CLI automatic Task
+也已完成。
 
 **Task 实际范围与刹车线：** `cd7d9fb` 精确覆盖 35 个 code/test 路径，未修改
 Cargo manifest、lockfile 或 network-boundary 脚本。最大 production 子片为 `remote/link.rs`
@@ -2927,7 +2934,7 @@ Cargo manifest、lockfile 或 network-boundary 脚本。最大 production 子片
 
 ### Task P4.5：实现 key directory、MachineDataSign、publish/replay 与 counter crash recovery
 
-> **状态：Task complete。** code/test commits 为 `c6ef387`、`88b3c42`。current Runtime wire 保持 v4，
+> **状态：Task complete。** code/test commits 为 `c6ef387`、`88b3c42`。P4.5 收口时 Runtime wire 为 v4，
 > physical schema 为 v14/35 表；P4.5 只收口 signed publication/counter recovery，不包含 P4.6 persistent
 > remote CLI，也不改变 P3.1 方案 b 或任何 production signing/物理设备/公网 post-MVP BLOCKED 槽位。
 
@@ -2955,31 +2962,92 @@ doc-test 零失败；`runtime_store_boundaries` `5/5`（256 MiB，282.85 秒）�
 
 ### Task P4.6：实现 macOS persistent remote CLI Keychain 与真实 daemon receipts
 
+> **状态（2026-07-24）：automatic Task complete，P4 为 6/7。** current Runtime wire 已因 catalog
+> exact page chain 升至 v5。`pair`、`machines`、`conversations`、`watch`、`prompt`、`approve`、
+> `retry-approval`、`revoke-self` 均已接入；冻结 code/test scope 为 29 paths，blob-manifest SHA-256 为
+> `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`。P4.7、`p4-auto`、
+> P4 Phase Exit、iOS 真实链路及 production-signed/物理设备/公网证据仍未完成或保持 BLOCKED。
+
 **Files:**
 - Replace: `agentdeck-cli/src/remote.rs` → `agentdeck-cli/src/remote/{mod,keychain,pending,paired_machine,crypto_state,device_lock,runtime}.rs`
 - Create: `agentdeck-cli/tests/{remote_keystore,remote_device_lock,remote_runtime_receipts}.rs`
 - Create: `packaging/agentdeck-cli.entitlements`
 - Modify: `agentdeck-cli/src/main.rs`
 - Modify: `agentdeck-cli/Cargo.toml`
+- Create: `agentdeck-cli/src/remote/{watch,watch_tests}.rs`
 - Modify: `script/build_and_run.sh`
 - Modify: `Cargo.lock`
+- Modify: `agentdeck-protocol/src/{runtime,e2ee,relay_v2}/` 与 `protocol/agentdeck/` schema/fixture
+- Modify: `agentdeck-crypto/`、`agentdeck-relay-client/`、`agentdeck-relay/` 的 pairing/key-update/exact-frame 边界
+- Modify: `agentdeckd/src/{remote,runtime}/` 的 Runtime v5 catalog/stream/durable transfer 绑定
+- Modify: `Sources/AgentDeckCore/Protocol/`、`Sources/AgentDeck/` 与对应 Swift tests
+- Create/Modify: `agentdeck-cli/tests/remote_{stream_state,transfer_state,transfer_paired_state,transfer_persistence,transfer_memory}.rs`
+- Modify: `agentdeck-cli/tests/remote_runtime_receipts.rs` 与 `agentdeck-relay-client/src/v2/connection.rs`
 
 **Keychain naming contract:** service固定`com.agentdeck.remote.v1`；发送前pending account语法为`pending/cli/{installationId}/{inviteHash}/{purpose}`，paired语法为`cli/{installationId}/{rootFingerprint}/{machineRoute}/{purpose}`。Swift P5使用同一编码文档但以`macos-app`或`ios-app` client-kind和独立installationId存储，默认不共享device private key。
 
 **macOS persistence contract:** 仅发行签名CLI启用persistent mode；二进制带CLI-only Keychain access group entitlement并固定`kSecUseDataProtectionKeychain=true`、`kSecAttrSynchronizable=false`、`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`与non-interactive access，不能读取App或daemon access group。DeviceSign/DeviceHPKE、grant、StorageKEK与CounterGuard只进Data Protection Keychain。wrapped key directory、cursor、counter reservation和receive replay进入`~/Library/Application Support/AgentDeck/remote/cli/$INSTALLATION_ID/`下0700目录、0600 sealed file；所有open使用`O_NOFOLLOW`，写入执行temp+fsync+rename+parent fsync并排除备份。unsigned/ad-hoc CLI、无法验证entitlement或旧签名版本读回失败时返回typed unsupported/security error，绝不降级文件私钥。
 
-**Automatic evidence contract:** `p4-auto` 通过 library-level constructor 注入 dev/ephemeral keystore、
+**Automatic evidence contract:** P4.6 focused/library suite 通过 constructor 注入 dev/ephemeral keystore、
 signature verifier 与 temp sealed-state root，覆盖同一状态机、crash/restart/counter/replay/lock/receipt 语义；
 注入点不得从 production CLI、环境变量或配置文件可达。automatic mainline 不要求真实 provisioning、
 Data Protection Keychain 或 release-signed CLI roundtrip。production signed CLI contract 不降级，真实
-entitlement/access-group/versioned-item readback 只保留 post-MVP BLOCKED 槽位。
+entitlement/access-group/versioned-item readback 只保留 post-MVP BLOCKED 槽位。P4 aggregate 的 `p4-auto`
+仍由 P4.7 建立，不能把本 Task focused suite 冒充该入口。
 
-- [ ] Step 1: 写 CLI tests。首次发送前持久化 immutable `enc+ciphertext+proof` 并 exact retry；多 Keychain item+StorageKEK sealed CryptoState 使用单一 paired commit marker 两阶段提升，逐写点 crash 恢复；restart 后读 DeviceSign/DeviceHPKE/grant/counter/replay；128 MiB cap；revokeSelf 只有 signed terminal 才删 key。automatic tests 通过 library-level injected dev keystore/signature verifier 验证相同两阶段与 sealed-file contract，并静态断言 production CLI/env/config 不存在 file-keystore 降级入口；production composition 仍要求 Data Protection Keychain、ThisDeviceOnly/non-sync/无交互、CLI-only access group。两个独立 test process 同时打开同 installation/device 时，跨进程 `flock` 覆盖整个 active connection/counter allocator 生命周期，第二进程返回 `remote.device.already_in_use` 且所有 counter 唯一。signed versioned item readback 移入 post-MVP slot；另覆盖每 machine 独立 keys、旧 bearer JSON 不读写、Linux persistent pair typed unsupported。
-- [ ] Step 2: 运行 remote keystore/receipt tests。 Expected: FAIL，当前CLI仍是旧credential或synthetic-only。
-- [ ] Step 3: 使用 `security-framework` protected Keychain API 实现上述 CLI-only production contract，提交最小 entitlements；release-signed build 的指定 TeamIdentifier/签名动作本身保持 post-MVP gated。CLI 启动 persistent mode 前读回自身 designated requirement、TeamIdentifier 和 access group，失败 typed unsupported/security error。再实现 StorageKEK 加密、0700/0600/O_NOFOLLOW、backup-excluded 且 fsync+rename 的 CryptoStateStore、paired commit marker、跨进程 device lock 和 `remote pair|machines|conversations|watch|prompt|approve|retry-approval|revoke-self`；automatic composition 仅由 library harness 注入 dev keystore/verifier，不暴露 production switch。`machines` 只列本地 PairedMachineStore；prompt/approval 只在 daemon receipt 后 exit 0；RouteAccepted 只打印 transport state。
-- [ ] Step 4: 重跑 library automatic tests，并用 test-only process harness 让两个 process 竞争同一 injected installation record。Expected: 只有持锁进程能连接/预留 counter，另一个 typed fail；进程崩溃释放 lock 后可恢复；不同 installation 不误用同 key。另读回 production composition 对 unsigned/ad-hoc/缺 entitlement 必须 typed fail-close，不能把 injected PASS 写成 production-signed PASS。
-- [ ] Step 5: fmt/clippy并扫描home tempdir无private credential JSON。
-- [ ] Step 6: 提交。 `git add agentdeck-cli packaging/agentdeck-cli.entitlements script/build_and_run.sh Cargo.lock && git commit -m "feat(cli): 用 Keychain 持久化远程设备身份"`
+**P4.6 durable state / watch：** paired-state V6 把 stream binding 与 durable live-transfer records
+放入同一 sealed CAS，partial 跨 disconnect/crash/restart 保留原 absolute TTL；即使 Relay 不再发送下一帧，
+runtime 也会按 sealed deadline durable commit expired marker。128 MiB 是完整 CryptoState plaintext 编码的
+logical budget，不是 RSS；normal budget 由 4,096 个 durable binding 各自一次最坏 replay+marker+framing reserve
+从 hard cap checked 推导。fresh replay admission 越过 normal budget 时与
+`remote.transfer.reassembly_full` marker 同一 exact CAS 落盘；replacement candidate 超限也从 current exact
+state 进入同一 emergency marker 路径。两者均不 ACK、不推进 reducer/cursor，清空 exact binding 的
+active/buffered records 且不驱逐其他 binding。任一带 stream cursor 的 legacy state 只在下一次 mutation 时升级
+V6 并经过 normal gate；超 normal 的旧状态零写 fail-close。marker 在 replacement 前统一 fence
+Publish/Gap/ReplayComplete。subscription reducer 的 inline +
+transitive retained 声明上限为 64 MiB，超限在 IO/durable mutation 前拒绝。8 MiB lowered-cap seam 只在
+`debug_assertions` automatic test build 中存在，release artifact 与 production CLI/env/config 不可达。
+runtime 建立 monotonic timer 前还必须以当前 wall clock 校验 sealed transfer records 的 durable watermark；
+回拨立即返回 `remote.runtime.state_invalid`，不得 clamp、等待放大的 remaining 或伪造 expired marker，并保持
+transport 零发送、paired-state records byte-exact 零写以及 ACK/reducer/cursor 不推进。
+
+prepared ADST v2 把 Normal/EmergencyBootstrapMarker mode 放入 AEAD 认证内容，guard sealed commitment
+绑定完整 sidecar；legacy ADST v1 只解释为 Normal。4095→4096 marker 在 guard-first/active-first crash cut
+均由 production recovery 收敛；cleanup 只允许 exact owner unlink+retry，缺失后的 reseal/commitment conflict
+fail-close，legacy over-normal CounterPending active-next 零写拒绝。
+
+`watch` 从 fresh authenticated bootstrap 开始，以 canonical NDJSON 输出
+`bootstrap|synchronized|live|control|terminal`。SIGINT/SIGTERM 只在当前 exact frame durable apply 与 ACK
+terminal 后公开 stopped；TransferBootstrapRequired+signal 必须 marker→stopped，subscription control 后才
+latch。Connected+ready signal 零 Subscribe 后 shutdown→stopped，verified revoked terminal 优先；握手期/
+active revoke 都须 transport shutdown/drop→crash-safe cleanup 后才公开 revoked。allocator 计量不是 RSS；
+冻结结果见下方 Task 收口证据。
+
+- [x] Step 1: 写 CLI tests。首次发送前持久化 immutable `enc+ciphertext+proof` 并 exact retry；多 Keychain item+StorageKEK sealed CryptoState 使用单一 paired commit marker 两阶段提升，逐写点 crash 恢复；restart 后读 DeviceSign/DeviceHPKE/grant/counter/replay；128 MiB cap；revokeSelf 只有 signed terminal 才删 key。automatic tests 通过 library-level injected dev keystore/signature verifier 验证相同两阶段与 sealed-file contract，并静态断言 production CLI/env/config 不存在 file-keystore 降级入口；production composition 仍要求 Data Protection Keychain、ThisDeviceOnly/non-sync/无交互、CLI-only access group。两个独立 test process 同时打开同 installation/device 时，跨进程 `flock` 覆盖整个 active connection/counter allocator 生命周期，第二进程返回 `remote.device.already_in_use` 且所有 counter 唯一。signed versioned item readback 移入 post-MVP slot；另覆盖每 machine 独立 keys、旧 bearer JSON 不读写、Linux persistent pair typed unsupported。
+- [x] Step 2: 运行 remote keystore/receipt、paired-state/transfer persistence focused tests，并显式运行
+  `cargo test --release -p agentdeck-cli --test remote_transfer_memory --locked production_transfer_peak_is_bounded_across_capacity_completion_and_duplicate -- --ignored --exact --nocapture --test-threads=1`。
+  receipts 还必须覆盖 `restarted_live_transfer_clock_rollback_fails_before_wait_or_mutation`：250 ms 内
+  `state_invalid`、零发送、reducer/cursor 不变且 cold readback records byte-exact 不变。实现前的 RED 预期为：
+  未完整接线、任一 durable CAS/cleanup/retry/clock 不变量未闭合或 allocator 超过固定门槛时 FAIL；不得用
+  已存在的部分命令面或常规 `cargo test` 跳过 RED/ignored release gate。冻结树现已通过该显式 release gate。
+- [x] Step 3: 使用 `security-framework` protected Keychain API 实现上述 CLI-only production contract，提交最小 entitlements；release-signed build 的指定 TeamIdentifier/签名动作本身保持 post-MVP gated。CLI 启动 persistent mode 前读回自身 designated requirement、TeamIdentifier 和 access group，失败 typed unsupported/security error。再实现 StorageKEK 加密、0700/0600/O_NOFOLLOW、backup-excluded 且 fsync+rename 的 CryptoStateStore、paired commit marker、跨进程 device lock 和 `remote pair|machines|conversations|watch|prompt|approve|retry-approval|revoke-self`；automatic composition 仅由 library harness 注入 dev keystore/verifier，不暴露 production switch。`machines` 只列本地 PairedMachineStore；prompt/approval 只在 daemon receipt 后 exit 0；RouteAccepted 只打印 transport state。
+- [x] Step 4: 重跑 library automatic tests，并用 test-only process harness 让两个 process 竞争同一 injected installation record。Expected: 只有持锁进程能连接/预留 counter，另一个 typed fail；进程崩溃释放 lock 后可恢复；不同 installation 不误用同 key。另读回 production composition 对 unsigned/ad-hoc/缺 entitlement 必须 typed fail-close，不能把 injected PASS 写成 production-signed PASS。
+- [x] Step 5: 运行 fmt/clippy，并扫描 home tempdir，确认没有 private credential JSON。
+- [x] Step 6: 本变更集以单一精确 scoped commit 固化；未使用 `git add -A`，未加入 co-author。
+
+**Task 收口证据（2026-07-24）：** 冻结 code/test scope 为 29 paths，blob-manifest SHA-256 为
+`32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`。watch `12/12`、
+`remote_persistent_machines` `11/11`、relay-client `25/25`、protocol `244/244` 均通过。完整 CLI package
+final run 在同一 hash 上 exit 0（14 分 16 秒）：lib `194/194`、main `50/50`、
+`remote_runtime_receipts` `81/81`（432.35 秒）、`remote_transfer_persistence` `6/6`（256.08 秒）、
+`remote_transfer_paired_state` `7/7`（57.27 秒）、`runtime_cli_binary` `17/17`（30.84 秒）、synthetic
+`10/10`、shared daemon `27/27`、doc-test `6/6`，仅预期忽略显式 release allocator。release allocator
+`1/1`（24.11 秒），requested-live
+capacity/complete/duplicate 分别为 `363/190/3 MiB`，不是 RSS。四 schema、CLI/protocol/relay-client
+Clippy `-D warnings`、fmt、network/no-net、docs 与 diff 全绿。`spec/security` 与 `quality` 终审均已在
+同一 hash 上 Approved，P0/P1/P2=0。P4 按 Task 进度为 6/7；P4.7、`p4-auto`、
+P4 Phase Exit、iOS 真实链路与
+production-signed/物理设备/公网 post-MVP 槽位保持未完成或 BLOCKED。
 
 ### Task P4.7：远程 CLI 合成 E2E、真实槽位 contract 与阶段文档收口
 

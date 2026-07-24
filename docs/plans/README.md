@@ -83,13 +83,23 @@ candidate/AEAD、Store exact-current auth-ledger recheck 后才把 `RuntimeReque
 `RemoteLink` 只持易失 generation/replay/connection/reply-route，不持 canonical 业务状态。最大 production
 子片 `link.rs` 为 1,038 additions，低于 1,800 预拆线。
 P4.5 code/test `c6ef387`、`88b3c42` 已收口 MachineDataSign signed publication、counter/replay/key
-transition crash recovery 与 production sealer/publisher 接线；current Runtime wire 保持 v4，physical schema
+transition crash recovery 与 production sealer/publisher 接线；P4.5 收口时 Runtime wire 为 v4，physical schema
 为 v14/35 表。完整 daemon lib `1579 passed / 3 gated ignored`、main `7/7`，integration/doc-test 零失败，
 `runtime_store_boundaries` `5/5`（256 MiB，282.85 秒），Clippy/fmt/diff 全绿；双路终审在同一冻结 hash
 `88ac6c486a7446b5fe4613388f66ee25561a7529a2fd0f8904844217730a896f` 上 P0/P1/P2=0。
-P4 当前为 5/7，下一项是 P4.6 persistent remote CLI。当前 verifier 只接受 `p0|p2|p3`，不宣称
-`p4`、`p4-auto` 或 P4 Phase PASS。Companion E2E 仍未完成；P3.1 方案 b、production-signed
-Keychain/LaunchAgent、物理 iPhone/第二台 Mac 与公网证据继续作为 post-MVP BLOCKED 槽位。
+P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；`pair`、
+`machines`、`conversations`、`watch`、`prompt`、`approve`、`retry-approval`、`revoke-self` 均已接入。
+watch 使用 fresh authenticated bootstrap、canonical NDJSON、SIGINT/SIGTERM 与有序 stopped/revoked terminal；
+paired-state V6 durable transfer 的 TTL 不依赖下一帧，prepared ADST v2 mode/guard commitment 通过 AEAD
+认证并覆盖 4095→4096 crash cut recovery。2026-07-24 冻结 code/test scope 为 29 paths，blob-manifest
+SHA-256 为 `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`；watch `12/12`、
+`remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client
+`25/25` 与 protocol `244/244` 均通过，四 schema/三 crate Clippy/fmt/network/no-net/docs/diff 全绿。
+`spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。P4 按 Task 进度为 6/7。
+当前 verifier 只接受 `p0|p2|p3`，不宣称 `p4`、`p4-auto` 或 P4 Phase PASS。Companion E2E 仍未完成；
+P3.1 方案 b、production-signed
+Keychain/LaunchAgent、物理 iPhone/第二台 Mac 与公网证据继续作为 post-MVP BLOCKED 槽位；P4.7 与 P4
+Phase Exit 仍未完成。
 
 ```text
 docs/plans/

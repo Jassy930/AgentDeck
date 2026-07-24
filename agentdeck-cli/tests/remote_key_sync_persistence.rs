@@ -45,6 +45,7 @@ use remote_pairing::{
 
 const STARTED_AT_MS: u64 = 1_000_000;
 const ADPS_KEY_SYNC_VERSION: u16 = 4;
+const ADPS_TRANSFER_VERSION: u16 = 6;
 const ADPS_HEADER_LEN: usize = 12;
 const ADKS_MAX_CANONICAL_BYTES: usize = 256 * 1024;
 const CATALOG_ROUTE: StreamRouteId = StreamRouteId::from_bytes([0x81; 16]);
@@ -56,7 +57,7 @@ const CONVERSATION_GENERATION: StreamGenerationId = StreamGenerationId::from_byt
 enum BaselineVersion {
     V1,
     V2,
-    V3,
+    V6Stream,
 }
 
 impl BaselineVersion {
@@ -64,7 +65,7 @@ impl BaselineVersion {
         match self {
             Self::V1 => 1,
             Self::V2 => 2,
-            Self::V3 => 3,
+            Self::V6Stream => ADPS_TRANSFER_VERSION,
         }
     }
 }
@@ -395,11 +396,11 @@ fn prepare_baseline(
                 )
                 .expect("prepare legacy V2 baseline");
         }
-        BaselineVersion::V3 => {
+        BaselineVersion::V6Stream => {
             let mut rng = DeterministicRng::new([seed.wrapping_add(1); 32]);
             opened
                 .install_stream_binding_for_automatic_harness(catalog_binding(fixture), &mut rng)
-                .expect("prepare typed V3 baseline");
+                .expect("prepare current V6 stream baseline");
         }
     }
     drop(opened);
@@ -430,22 +431,65 @@ fn assert_v4_appends_exact_key_sync_field(
     assert_eq!(&suffix[4..], canonical);
 }
 
-fn assert_v4_has_exact_key_sync_field(encoded: &[u8], state: &DurableKeySyncStateV1) {
+fn assert_v6_replaces_exact_key_sync_field(
+    baseline: &[u8],
+    upgraded: &[u8],
+    state: &DurableKeySyncStateV1,
+) {
     let canonical = state.canonical_bytes().expect("canonical KeySync state");
-    assert_eq!(state_wire_version(encoded), ADPS_KEY_SYNC_VERSION);
+    assert_eq!(state_wire_version(baseline), ADPS_TRANSFER_VERSION);
+    assert_eq!(state_wire_version(upgraded), ADPS_TRANSFER_VERSION);
+    let key_sync_offset = baseline
+        .len()
+        .checked_sub(10)
+        .expect("V6 has KeySync, key-generation and transfer suffixes");
+    assert_eq!(
+        &baseline[key_sync_offset..],
+        &[0; 10],
+        "baseline V6 has empty KeySync/key-generation/transfer collections"
+    );
+    assert_eq!(
+        &upgraded[ADPS_HEADER_LEN..key_sync_offset],
+        &baseline[ADPS_HEADER_LEN..key_sync_offset],
+        "V6 KeySync mutation preserves every preceding field byte-exact"
+    );
+    assert_eq!(
+        u32::from_be_bytes(
+            upgraded[key_sync_offset..key_sync_offset + 4]
+                .try_into()
+                .expect("V6 KeySync field length")
+        ) as usize,
+        canonical.len()
+    );
+    let canonical_start = key_sync_offset + 4;
+    let canonical_end = canonical_start + canonical.len();
+    assert_eq!(&upgraded[canonical_start..canonical_end], canonical);
+    assert_eq!(
+        &upgraded[canonical_end..],
+        &[0; 6],
+        "key-generation and transfer collections remain empty"
+    );
+}
+
+fn assert_v6_has_exact_key_sync_field(encoded: &[u8], state: &DurableKeySyncStateV1) {
+    let canonical = state.canonical_bytes().expect("canonical KeySync state");
+    assert_eq!(state_wire_version(encoded), ADPS_TRANSFER_VERSION);
     let length_offset = encoded
         .len()
-        .checked_sub(canonical.len() + 4)
-        .expect("V4 contains the KeySync length field");
+        .checked_sub(canonical.len() + 10)
+        .expect("V6 contains KeySync plus empty key-generation/transfer suffixes");
     assert_eq!(
         u32::from_be_bytes(
             encoded[length_offset..length_offset + 4]
                 .try_into()
-                .expect("V4 KeySync field length")
+                .expect("V6 KeySync field length")
         ) as usize,
         canonical.len()
     );
-    assert_eq!(&encoded[length_offset + 4..], canonical);
+    let canonical_start = length_offset + 4;
+    let canonical_end = canonical_start + canonical.len();
+    assert_eq!(&encoded[canonical_start..canonical_end], canonical);
+    assert_eq!(&encoded[canonical_end..], &[0; 6]);
 }
 
 fn assert_v1_bootstrap_is_wrapped_exactly_in_v4(
@@ -485,11 +529,11 @@ fn assert_v1_bootstrap_is_wrapped_exactly_in_v4(
 }
 
 #[test]
-fn v1_v2_v3_read_empty_then_first_write_migrates_exactly_to_v4() {
+fn v1_v2_and_current_v6_read_empty_then_first_key_sync_write_is_exact() {
     for (index, version) in [
         BaselineVersion::V1,
         BaselineVersion::V2,
-        BaselineVersion::V3,
+        BaselineVersion::V6Stream,
     ]
     .into_iter()
     .enumerate()
@@ -513,6 +557,22 @@ fn v1_v2_v3_read_empty_then_first_write_migrates_exactly_to_v4() {
         let mut opened = paired
             .open_exact(fixture.identity())
             .expect("open legacy paired state");
+        let files_before_transfer_read = file_tree_bytes(&state_root);
+        let keys_before_transfer_read = paired_key_bytes(&store, &fixture);
+        assert!(
+            opened
+                .durable_transfer_state()
+                .expect("baseline states map to an empty transfer collection")
+                .canonical_record_bytes()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(file_tree_bytes(&state_root), files_before_transfer_read);
+        assert_eq!(
+            paired_key_bytes(&store, &fixture),
+            keys_before_transfer_read,
+            "legacy transfer readback must not migrate or rewrite"
+        );
         assert_eq!(
             opened
                 .durable_key_sync_state()
@@ -538,14 +598,33 @@ fn v1_v2_v3_read_empty_then_first_write_migrates_exactly_to_v4() {
             BaselineVersion::V1 => {
                 assert_v1_bootstrap_is_wrapped_exactly_in_v4(&legacy, &upgraded, &state)
             }
-            BaselineVersion::V2 | BaselineVersion::V3 => {
+            BaselineVersion::V2 => {
                 assert_v4_appends_exact_key_sync_field(&legacy, &upgraded, &state)
+            }
+            BaselineVersion::V6Stream => {
+                assert_v6_replaces_exact_key_sync_field(&legacy, &upgraded, &state)
             }
         }
         let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
         let reopened = restarted
             .open_exact(fixture.identity())
-            .expect("reopen migrated ADPS V4");
+            .expect("reopen migrated/current ADPS state");
+        let files_before_v4_transfer_read = file_tree_bytes(&state_root);
+        let keys_before_v4_transfer_read = paired_key_bytes(&store, &fixture);
+        assert!(
+            reopened
+                .durable_transfer_state()
+                .expect("post-KeySync state has an empty transfer collection")
+                .canonical_record_bytes()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(file_tree_bytes(&state_root), files_before_v4_transfer_read);
+        assert_eq!(
+            paired_key_bytes(&store, &fixture),
+            keys_before_v4_transfer_read,
+            "transfer readback must not migrate or rewrite"
+        );
         assert_eq!(
             reopened
                 .durable_key_sync_state()
@@ -712,7 +791,7 @@ fn unchecked_adks_is_automatic_only_and_open_audit_rejects_every_invalid_shape_w
             .expect("canonical invalid ADKS root")
             .join(format!("paired-state-{index}"));
         prepare_baseline(
-            BaselineVersion::V3,
+            BaselineVersion::V6Stream,
             &store,
             &fixture,
             &state_root,
@@ -773,7 +852,7 @@ fn contextual_invalid_adks_fails_candidate_active_and_prepared_audit_without_wri
                 .expect("canonical context-invalid ADKS root")
                 .join(format!("paired-state-{index}"));
             prepare_baseline(
-                BaselineVersion::V3,
+                BaselineVersion::V6Stream,
                 &store,
                 &fixture,
                 &state_root,
@@ -988,14 +1067,20 @@ fn every_state_transaction_crash_cut_recovers_without_resetting_key_sync_budget_
 }
 
 #[test]
-fn counter_and_stream_mutations_preserve_exact_adks_and_v4_wire_version() {
+fn counter_and_stream_mutations_preserve_exact_adks_and_v6_wire_version() {
     let fixture = PairingFixture::new().with_conversation_stream(CONVERSATION_ROUTE);
     let store = MemoryRemoteKeyStore::new();
     let temp = tempfile::tempdir().expect("KeySync mutation preservation root");
     let state_root = fs::canonicalize(temp.path())
         .expect("canonical KeySync mutation preservation root")
         .join("paired-state");
-    prepare_baseline(BaselineVersion::V3, &store, &fixture, &state_root, 0xc1);
+    prepare_baseline(
+        BaselineVersion::V6Stream,
+        &store,
+        &fixture,
+        &state_root,
+        0xc1,
+    );
     let paired = PairedMachineStore::new_with_mutation_observer(
         &store,
         INSTALLATION_ID,
@@ -1014,7 +1099,7 @@ fn counter_and_stream_mutations_preserve_exact_adks_and_v4_wire_version() {
             &mut install_rng,
         )
         .expect("install KeySync state before adjacent mutations");
-    assert_v4_has_exact_key_sync_field(
+    assert_v6_has_exact_key_sync_field(
         &paired_state_plaintext(&store, &fixture, &state_root),
         &state,
     );
@@ -1027,7 +1112,7 @@ fn counter_and_stream_mutations_preserve_exact_adks_and_v4_wire_version() {
         opened.durable_key_sync_state().unwrap(),
         Some(state.clone())
     );
-    assert_v4_has_exact_key_sync_field(
+    assert_v6_has_exact_key_sync_field(
         &paired_state_plaintext(&store, &fixture, &state_root),
         &state,
     );
@@ -1044,7 +1129,7 @@ fn counter_and_stream_mutations_preserve_exact_adks_and_v4_wire_version() {
         opened.durable_key_sync_state().unwrap(),
         Some(state.clone())
     );
-    assert_v4_has_exact_key_sync_field(
+    assert_v6_has_exact_key_sync_field(
         &paired_state_plaintext(&store, &fixture, &state_root),
         &state,
     );
@@ -1052,7 +1137,7 @@ fn counter_and_stream_mutations_preserve_exact_adks_and_v4_wire_version() {
 
     let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root)
         .open_exact(fixture.identity())
-        .expect("reopen V4 after counter and stream mutations");
+        .expect("reopen V6 after counter and stream mutations");
     assert_eq!(reopened.durable_stream_bindings().unwrap().len(), 2);
     assert_eq!(reopened.durable_key_sync_state().unwrap(), Some(state));
 }
@@ -1065,7 +1150,13 @@ fn clearing_key_sync_state_is_durable_and_exact_clear_retry_is_idempotent() {
     let state_root = fs::canonicalize(temp.path())
         .expect("canonical KeySync clear root")
         .join("paired-state");
-    prepare_baseline(BaselineVersion::V3, &store, &fixture, &state_root, 0xc1);
+    prepare_baseline(
+        BaselineVersion::V6Stream,
+        &store,
+        &fixture,
+        &state_root,
+        0xc1,
+    );
     let paired = PairedMachineStore::new_with_mutation_observer(
         &store,
         INSTALLATION_ID,
@@ -1120,7 +1211,7 @@ fn clearing_key_sync_state_is_durable_and_exact_clear_retry_is_idempotent() {
     drop(opened);
 
     let plaintext = paired_state_plaintext(&store, &fixture, &state_root);
-    assert_eq!(state_wire_version(&plaintext), ADPS_KEY_SYNC_VERSION);
+    assert_eq!(state_wire_version(&plaintext), ADPS_TRANSFER_VERSION);
     let restarted = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root);
     assert_eq!(
         restarted

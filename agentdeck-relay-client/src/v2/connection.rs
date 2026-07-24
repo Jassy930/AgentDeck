@@ -871,6 +871,7 @@ mod tests {
     use agentdeck_protocol::relay_v2::id::{
         DeviceRouteId, GrantSerial, MachineRouteId, RootKeyId, TrustEpoch,
     };
+    use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
@@ -1185,6 +1186,101 @@ mod tests {
             .await
             .expect("receive normal")
             .expect("normal frame");
+        assert_eq!(second.frame(), &normal);
+        assert_eq!(second.canonical_bytes(), normal_bytes.as_slice());
+        assert_eq!(inbound_budget.available_permits(), normal_retained_bytes);
+    }
+
+    #[tokio::test]
+    async fn cancelling_pending_exact_receive_preserves_frames_bytes_and_priority() {
+        let normal = hello();
+        let normal_bytes = encode(&normal);
+        let revocation = DeviceRevocation {
+            machine_route: MachineRouteId::from_bytes([0xa1; 16]),
+            device_route: DeviceRouteId::from_bytes([0xa2; 16]),
+            grant_serial: GrantSerial::new(103),
+            root_key_id: RootKeyId::from_bytes([0xa4; 16]),
+            trust_epoch: TrustEpoch::new(105),
+            signature: Ed25519Signature([0xa6; 64]),
+        };
+        let urgent = OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::RevocationCommitted(RevocationCommitted {
+                device_route: revocation.device_route,
+                grant_serial: revocation.grant_serial,
+                signed_revocation: revocation,
+            }),
+        };
+        let urgent_bytes = encode(&urgent);
+
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (urgent_tx, urgent_rx) = mpsc::channel(1);
+        let (status_tx, status_rx) = watch::channel(None);
+        let normal_retained_bytes = normal_bytes
+            .len()
+            .checked_mul(2)
+            .expect("small normal frame retained bytes");
+        let urgent_retained_bytes = urgent_bytes
+            .len()
+            .checked_mul(2)
+            .expect("small urgent frame retained bytes");
+        let inbound_budget = Arc::new(Semaphore::new(normal_retained_bytes));
+        let urgent_budget = Arc::new(Semaphore::new(urgent_retained_bytes));
+        let mut connection = ActiveConnection {
+            data_tx,
+            outbound_budget: Arc::new(Semaphore::new(1)),
+            inbound_rx,
+            urgent_rx,
+            status_tx,
+            status_rx,
+            cancel: CancellationToken::new(),
+            reader_task: None,
+            writer_task: None,
+        };
+
+        let mut pending_receive = Box::pin(connection.recv_exact());
+        std::future::poll_fn(|context| match pending_receive.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => {
+                panic!("empty active connection receive unexpectedly completed: {result:?}")
+            }
+        })
+        .await;
+
+        inbound_tx
+            .send(QueuedInbound {
+                received: ReceivedRelayFrame::new(normal.clone(), normal_bytes.clone()),
+                _budget: reserve_received_payload(&inbound_budget, normal_bytes.len())
+                    .expect("normal inbound budget"),
+            })
+            .await
+            .expect("queue normal frame while receive is pending");
+        urgent_tx
+            .send(QueuedInbound {
+                received: ReceivedRelayFrame::new(urgent.clone(), urgent_bytes.clone()),
+                _budget: reserve_received_payload(&urgent_budget, urgent_bytes.len())
+                    .expect("urgent inbound budget"),
+            })
+            .await
+            .expect("queue urgent frame while receive is pending");
+        drop(pending_receive);
+
+        let first = connection
+            .recv_exact()
+            .await
+            .expect("receive urgent after cancellation")
+            .expect("urgent frame after cancellation");
+        assert_eq!(first.frame(), &urgent);
+        assert_eq!(first.canonical_bytes(), urgent_bytes.as_slice());
+        assert_eq!(urgent_budget.available_permits(), urgent_retained_bytes);
+        assert_eq!(inbound_budget.available_permits(), 0);
+
+        let second = connection
+            .recv_exact()
+            .await
+            .expect("receive normal after cancellation")
+            .expect("normal frame after cancellation");
         assert_eq!(second.frame(), &normal);
         assert_eq!(second.canonical_bytes(), normal_bytes.as_slice());
         assert_eq!(inbound_budget.available_permits(), normal_retained_bytes);

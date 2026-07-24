@@ -12,13 +12,16 @@
 ## 运行与诊断
 
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2、P4.2–P4.3 machine/pairing lifecycle、
-  P4.4 RemoteLink ingress、P4.5 signed publication/counter recovery 与 conversation-scoped recovery、daemon install/upgrade failure code、v1 marker
-  显式 reset 和排查流程。
-- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.10、P3 Phase、P4.1–P4.5
-  machine identity/enrollment/pairing/RemoteLink ingress/signed publication、production UDS/client/install/smoke 与文档结构检查入口。
+  P4.4 RemoteLink ingress、P4.5 signed publication/counter recovery、P4.6 persistent CLI/watch 与 durable
+  transfer recovery、conversation-scoped recovery、daemon install/upgrade failure code、v1 marker 显式 reset
+  和排查流程。
+- `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.10、P3 Phase、P4.1–P4.6
+  machine identity/enrollment/pairing/RemoteLink ingress/signed publication/persistent CLI/watch、production
+  UDS/client/install/smoke 与文档结构检查入口。
 - `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
   enrollment、daemon 本机 status/trust-reset、安全 uninstall purge、fingerprint-bound readback、
-  portable signed root-lost purge receipt，以及 P4.5 recovery-gated egress admission 部署边界。
+  portable signed root-lost purge receipt、P4.5 recovery-gated egress admission，以及 P4.6 persistent
+  CLI/watch 与 durable transfer 运维边界。
 
 ## 计划与历史
 
@@ -76,23 +79,31 @@
   outer→DeviceSign/AAD/replay/AEAD→Store exact auth recheck→`RemotePrincipal`→`RuntimeCore` dispatch，
   以及 Active/Inactive/Unprovable 按 conversation 隔离的 recovery；`RouteAccepted` 不等于 command success，
   `RemoteLink` 不持 canonical 业务状态。P4.5 code/test `c6ef387`、`88b3c42` 又完成 MachineDataSign
-  signed publication、counter/replay/key transition crash recovery 与 production sealer/publisher 接线；current
-  Runtime wire 保持 v4，physical schema 为 v14/35 表。完整 daemon lib `1579 passed / 3 gated ignored`、
+  signed publication、counter/replay/key transition crash recovery 与 production sealer/publisher 接线；P4.5
+  收口时 Runtime wire 为 v4，physical schema 为 v14/35 表。完整 daemon lib `1579 passed / 3 gated ignored`、
   main `7/7`、integration/doc-test 零失败，`runtime_store_boundaries` `5/5`（256 MiB，282.85 秒），
   Clippy/fmt/diff 全绿；双路终审在同一冻结 hash
   `88ac6c486a7446b5fe4613388f66ee25561a7529a2fd0f8904844217730a896f` 上 P0/P1/P2=0。
-  P4–P6 当前为 5/7、0/9、0/4，下一项 P4.6 persistent remote CLI。当前 verifier 只接受
-  `p0|p2|p3`，不宣称 P4 Phase PASS；Companion E2E 尚未完成。P3.1 方案 b、production-signed
+  P4.6 persistent remote CLI 已完成 automatic Task：current Runtime wire 为 v5；`pair`、
+  `machines`、`conversations`、`watch`、`prompt`、`approve`、`retry-approval`、`revoke-self` 均已接入。
+  watch 使用 fresh authenticated bootstrap、canonical NDJSON 与 SIGINT/SIGTERM 有序 terminal；paired-state
+  V6 durable transfer 的 absolute TTL 不依赖下一帧，prepared ADST v2 mode/commitment 通过认证 recovery
+  绑定。2026-07-24 冻结 code/test scope 为 29 paths，blob-manifest SHA-256 为
+  `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`；watch `12/12`、
+  `remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client
+  `25/25` 与 protocol `244/244` 均通过，静态门禁全绿。`spec/security` 与 `quality` 终审均 Approved，
+  P0/P1/P2=0。P4–P6 按 Task 进度为 6/7、0/9、0/4。当前 verifier 只接受
+  `p0|p2|p3`，不宣称 `p4-auto` 或 P4 Phase PASS；Companion E2E 尚未完成。P3.1 方案 b、production-signed
   LaunchAgent/Keychain、物理设备与公网证据继续作为 post-MVP BLOCKED。P5 MVP 只以 iOS Simulator
-  自动 E2E 退出，本机第二客户端归 P6 synthetic DoD。
+  自动 E2E 退出，本机第二客户端归 P6 synthetic DoD；P4.7 与 P4 Phase Exit 仍未完成。
 
 ## 协议资料
 
 - `../protocol/SPIKE_FINDINGS.md`：Codex app-server wire framing、方法和 schema 事实源。
 - `../protocol/CODEX_VERSION.txt`：生成当前 schema 时使用的 Codex 版本。
 - `../protocol/*.json`：官方 schema 快照。
-- `../protocol/agentdeck/`：AgentDeck 自身四条独立协议轴的 schema 与说明。当前 Runtime v4 fixture 为
-  `fixtures/runtime-v4-wire.jsonl`；各 `*.schema.json` 均由 schemars 从 Rust 类型派生生成（非手写），
+- `../protocol/agentdeck/`：AgentDeck 自身四条独立协议轴的 schema 与说明。current Runtime v5 fixture 为
+  `fixtures/runtime-v5-wire.jsonl`；冻结的 v1–v4 fixture 只作兼容证据。各 `*.schema.json` 均由 schemars 从 Rust 类型派生生成（非手写），
   `README.md` 说明生成与更新流程。
 
 ## 更新规则

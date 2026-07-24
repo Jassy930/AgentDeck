@@ -22,9 +22,9 @@ use agentdeck_cli::remote::paired_machine::{
 };
 use agentdeck_cli::remote::pending::PendingPairingCoordinator;
 use agentdeck_cli::remote::runtime::{
-    ExactRelayFrame, ReceivedRuntimeFrame, RemoteRuntime, RemoteRuntimeError,
-    RemoteRuntimeTransport, RemoteRuntimeTransportError, RemoteStreamFrameOutcome,
-    RemoteSubscriptionBootstrapItem, RemoteSubscriptionReducer,
+    ExactRelayFrame, MAX_REMOTE_SUBSCRIPTION_REDUCER_RETAINED_BYTES, ReceivedRuntimeFrame,
+    RemoteRuntime, RemoteRuntimeError, RemoteRuntimeTransport, RemoteRuntimeTransportError,
+    RemoteStreamFrameOutcome, RemoteSubscriptionBootstrapItem, RemoteSubscriptionReducer,
 };
 use agentdeck_crypto::{
     AeadReceivingKey, AeadSendingKey, HpkeEnvelopeV1, HpkePublicKey, SecretAeadKey, SenderCounter,
@@ -133,6 +133,8 @@ struct RejectingReducer {
 }
 
 impl RemoteSubscriptionReducer for RejectingReducer {
+    const MAX_RETAINED_BYTES: usize = 64 * 1024;
+
     fn inner_cursor(&self) -> &RuntimeInnerCursor {
         &self.cursor
     }
@@ -173,6 +175,8 @@ impl LiveCatalogReducer {
 }
 
 impl RemoteSubscriptionReducer for LiveCatalogReducer {
+    const MAX_RETAINED_BYTES: usize = 64 * 1024;
+
     fn inner_cursor(&self) -> &RuntimeInnerCursor {
         &self.cursor
     }
@@ -209,6 +213,40 @@ impl RemoteSubscriptionReducer for LiveCatalogReducer {
         };
         self.applied += 1;
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct OverCapacityReducer {
+    cursor: RuntimeInnerCursor,
+}
+
+impl RemoteSubscriptionReducer for OverCapacityReducer {
+    const MAX_RETAINED_BYTES: usize = MAX_REMOTE_SUBSCRIPTION_REDUCER_RETAINED_BYTES + 1;
+
+    fn inner_cursor(&self) -> &RuntimeInnerCursor {
+        &self.cursor
+    }
+
+    fn apply(&mut self, _item: &RemoteSubscriptionBootstrapItem) -> Result<(), RemoteRuntimeError> {
+        panic!("over-capacity reducer must be rejected before bootstrap apply")
+    }
+
+    fn apply_live(&mut self, _item: &RuntimeStreamItem) -> Result<(), RemoteRuntimeError> {
+        panic!("over-capacity reducer must be rejected before live apply")
+    }
+}
+
+struct PanicTransport;
+
+#[async_trait]
+impl RemoteRuntimeTransport for PanicTransport {
+    async fn send(&mut self, _frame: ExactRelayFrame) -> Result<(), RemoteRuntimeTransportError> {
+        panic!("over-capacity reducer must be rejected before transport send")
+    }
+
+    async fn recv(&mut self) -> Result<Option<ReceivedRuntimeFrame>, RemoteRuntimeTransportError> {
+        panic!("over-capacity reducer must be rejected before transport recv")
     }
 }
 
@@ -1300,6 +1338,57 @@ async fn install_revision_only_rewrap(
             ..
         }) if key_directory_revision == revision
     ));
+}
+
+#[tokio::test]
+async fn reducer_capacity_rejects_subscribe_and_receive_before_io_or_durable_mutation() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("reducer capacity state root");
+    let root = state_root(&temp);
+    fixture.promote(&store, &root, 0x34);
+
+    let observer = Arc::new(RecordingObserver::default());
+    let paired = PairedMachineStore::new_with_mutation_observer(
+        &store,
+        INSTALLATION_ID,
+        &root,
+        observer.clone(),
+    );
+    let opened = paired
+        .open_exact(fixture.identity())
+        .expect("open reducer capacity fixture");
+    observer.clear();
+    let before = file_tree_bytes(&root);
+    let cursor = RuntimeInnerCursor::Catalog {
+        cursor: StreamCursor::At(INNER_HIGH_WATER),
+    };
+    let mut reducer = OverCapacityReducer {
+        cursor: cursor.clone(),
+    };
+    let mut runtime = RemoteRuntime::new(opened, PanicTransport);
+    let mut rng = PanicRng;
+
+    let subscribe_error = match runtime.subscribe(cursor, &mut reducer, &mut rng).await {
+        Err(error) => error,
+        Ok(_) => panic!("over-capacity subscribe unexpectedly succeeded"),
+    };
+    assert!(matches!(
+        subscribe_error,
+        RemoteRuntimeError::ReducerCapacity
+    ));
+    assert_eq!(subscribe_error.code(), "remote.runtime.reducer_capacity");
+    assert_eq!(file_tree_bytes(&root), before);
+    assert!(observer.snapshot().is_empty());
+
+    let receive_error = match runtime.receive_stream_frame(&mut reducer).await {
+        Err(error) => error,
+        Ok(_) => panic!("over-capacity receive unexpectedly succeeded"),
+    };
+    assert!(matches!(receive_error, RemoteRuntimeError::ReducerCapacity));
+    assert_eq!(receive_error.code(), "remote.runtime.reducer_capacity");
+    assert_eq!(file_tree_bytes(&root), before);
+    assert!(observer.snapshot().is_empty());
 }
 
 #[tokio::test]

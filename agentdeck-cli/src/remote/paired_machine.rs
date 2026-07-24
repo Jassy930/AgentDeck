@@ -45,10 +45,11 @@ use agentdeck_protocol::relay_v2::{
     OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, decode, encode,
 };
 use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, RevokeTarget};
-use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TurnId};
+use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TransferId, TurnId};
 use agentdeck_protocol::runtime::{
     ConversationId, MachineRootFingerprint, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope,
-    RuntimeInnerCursor, RuntimeMessage, RuntimeRequest, SendPromptRequest,
+    RuntimeInnerCursor, RuntimeMessage, RuntimeRequest, RuntimeTransferCarrierV1,
+    SendPromptRequest,
 };
 use agentdeck_relay_client::{
     LinkAuthenticator, RelayClientConfig, RelayClientError, RelayTlsPolicy,
@@ -60,8 +61,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::crypto_state::{
     CryptoStateError, CryptoStateIdentity, CryptoStateSnapshot, DeviceStorageKek,
-    FileCryptoStateStore, MAX_CRYPTO_STATE_PLAINTEXT_LEN, PreparedCryptoStateStage,
-    revocation_cleanup_entries_absent_in,
+    FileCryptoStateStore, MAX_CRYPTO_STATE_PLAINTEXT_LEN, PreparedCryptoStateCapacityMode,
+    PreparedCryptoStateStage, revocation_cleanup_entries_absent_in,
 };
 use super::device_lock::{RemoteDeviceLease, RemoteDeviceLockError, RemoteDeviceLockKey};
 use super::key_generation::{
@@ -79,8 +80,15 @@ use super::keychain::{
 };
 use super::pending::{PendingInvitePublicProjection, VerifiedPendingPairResponse};
 use super::stream_state::{
-    DurableStreamBindingV1, StreamPublishDisposition, decode_stream_bindings,
-    encode_stream_bindings,
+    DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES, DurableStreamBindingV1,
+    EMERGENCY_REPLAY_DEBT_METADATA_BYTES, MAX_DURABLE_STREAM_BINDINGS, StreamPublishDisposition,
+    decode_stream_bindings, encode_stream_bindings,
+};
+use super::transfer_state::{
+    DurableLiveTransferStateV1, DurableTransferBindingIdentityV1, DurableTransferBootstrapError,
+    DurableTransferOutcomeV1, DurableTransferTransitionV1, MAX_DURABLE_TRANSFER_RECORDS,
+    MAX_NEEDS_BOOTSTRAP_MARKER_RECORD_BYTES, bootstrap_error_for_exact_binding_records,
+    bootstrap_marker_credit_bytes_records, has_emergency_marker_cardinality_reserve,
 };
 
 const STATE_MAGIC: &[u8; 4] = b"ADPS";
@@ -89,6 +97,7 @@ const MUTABLE_STATE_VERSION: u16 = 2;
 const TYPED_RUNTIME_STATE_VERSION: u16 = 3;
 const KEY_SYNC_STATE_VERSION: u16 = 4;
 const KEY_GENERATION_STATE_VERSION: u16 = 5;
+const TRANSFER_STATE_VERSION: u16 = 6;
 const STATE_HEADER_LEN: usize = 12;
 const MAX_STATE_FIELD_LEN: usize = 8 * 1024 * 1024;
 const MAX_STATE_STRING_LEN: usize = 8 * 1024;
@@ -96,6 +105,73 @@ const MAX_STATE_COLLECTION_ITEMS: usize = 4_096;
 const MUTABLE_STATE_FIXED_ENCODED_LEN: usize = STATE_HEADER_LEN + 64 + 4 + 4 + 36 + 2 + 2;
 const AUTOMATIC_RUNTIME_STATE_PROBE_DOMAIN: &[u8] = b"AgentDeck/AutomaticRuntimeStateProbeV1\0";
 const MAX_MUTABLE_AUDIT_ATTEMPTS: usize = 3;
+
+const fn checked_capacity_add(left: usize, right: usize) -> usize {
+    match left.checked_add(right) {
+        Some(value) => value,
+        None => panic!("paired-state capacity arithmetic overflow"),
+    }
+}
+
+const fn checked_capacity_sub(left: usize, right: usize) -> usize {
+    match left.checked_sub(right) {
+        Some(value) => value,
+        None => panic!("paired-state emergency headroom exceeds hard capacity"),
+    }
+}
+
+const fn checked_capacity_mul(left: usize, right: usize) -> usize {
+    match left.checked_mul(right) {
+        Some(value) => value,
+        None => panic!("paired-state capacity multiplication overflow"),
+    }
+}
+
+/// 每个 installed binding 最多消费一次 authenticated replay admission 与一个 terminal
+/// marker。两个 4-byte 项分别保守覆盖变长 stream field 与新增 transfer record 的
+/// collection framing；实际 replay tuple 为 fixed width。
+const V6_EMERGENCY_BINDING_HEADROOM: usize = checked_capacity_add(
+    checked_capacity_add(
+        checked_capacity_add(4, DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES),
+        EMERGENCY_REPLAY_DEBT_METADATA_BYTES,
+    ),
+    checked_capacity_add(4, MAX_NEEDS_BOOTSTRAP_MARKER_RECORD_BYTES),
+);
+/// 普通 V6 mutation 为完整 durable binding collection 聚合预留 emergency 空间。一个
+/// binding 落 marker 后会被 ingress fence，不能再次消费；因此 4096 倍是闭合上界。
+const V6_EMERGENCY_HEADROOM: usize =
+    checked_capacity_mul(V6_EMERGENCY_BINDING_HEADROOM, MAX_DURABLE_STREAM_BINDINGS);
+const V6_NORMAL_STATE_PLAINTEXT_LIMIT: usize =
+    checked_capacity_sub(MAX_CRYPTO_STATE_PLAINTEXT_LEN, V6_EMERGENCY_HEADROOM);
+
+fn v6_exact_emergency_credit_bytes(
+    stream_cursors: &[Vec<u8>],
+    transfer_records: &[Vec<u8>],
+) -> Result<usize, PairedPromotionError> {
+    let stream_credit = decode_stream_bindings(stream_cursors)
+        .map_err(|_| PairedPromotionError::InvalidState)?
+        .into_iter()
+        .try_fold(0_usize, |credit, binding| {
+            credit
+                .checked_add(binding.emergency_replay_debt_credit_bytes())
+                .ok_or(PairedPromotionError::InvalidState)
+        })?;
+    let marker_credit = bootstrap_marker_credit_bytes_records(transfer_records)
+        .map_err(|_| PairedPromotionError::InvalidState)?;
+    stream_credit
+        .checked_add(marker_credit)
+        .filter(|credit| *credit <= V6_EMERGENCY_HEADROOM)
+        .ok_or(PairedPromotionError::InvalidState)
+}
+
+fn v6_base_plaintext_usage(
+    encoded_len: usize,
+    emergency_credit: usize,
+) -> Result<usize, PairedPromotionError> {
+    encoded_len
+        .checked_sub(emergency_credit)
+        .ok_or(PairedPromotionError::InvalidState)
+}
 
 const MARKER_MAGIC: &[u8; 4] = b"ADPM";
 const MARKER_VERSION: u16 = 1;
@@ -147,6 +223,183 @@ enum RuntimeStateMutationAuthority {
     AutomaticHarness,
 }
 
+/// Production 普通 V6 mutation 的 plaintext budget。真实 128 MiB hard cap 顶部固定保留
+/// [`V6_EMERGENCY_HEADROOM`]；lowered value 只供一个默认 integration test 在小内存规模
+/// 驱动同一 Production authority 路径，不持久化、不进入 CLI/env/config。Emergency marker
+/// 不使用该可降低预算，只能通过 private typed fallback 使用真实 hard cap。
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct LiveTransferCandidateCapacity {
+    plaintext_limit: usize,
+}
+
+impl LiveTransferCandidateCapacity {
+    const PRODUCTION: Self = Self {
+        plaintext_limit: V6_NORMAL_STATE_PLAINTEXT_LIMIT,
+    };
+
+    #[cfg(debug_assertions)]
+    fn lowered_for_automatic_harness(plaintext_limit: usize) -> Result<Self, PairedPromotionError> {
+        if plaintext_limit == 0 || plaintext_limit >= V6_NORMAL_STATE_PLAINTEXT_LIMIT {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        Ok(Self { plaintext_limit })
+    }
+
+    fn validate_normal(self, encoded_len: usize) -> Result<(), PairedPromotionError> {
+        if encoded_len > self.plaintext_limit {
+            return Err(PairedPromotionError::StateCapacity);
+        }
+        Ok(())
+    }
+}
+
+type V6StateCapacityMode = PreparedCryptoStateCapacityMode;
+
+fn validate_v6_encoded_capacity_with_context(
+    runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+    live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
+    encoded_len: usize,
+    stream_cursors: &[Vec<u8>],
+    transfer_records: &[Vec<u8>],
+) -> Result<(), PairedPromotionError> {
+    if encoded_len > MAX_CRYPTO_STATE_PLAINTEXT_LEN {
+        return Err(PairedPromotionError::StateCapacity);
+    }
+    if runtime_state_mutation_authority == RuntimeStateMutationAuthority::Production {
+        let emergency_credit = v6_exact_emergency_credit_bytes(stream_cursors, transfer_records)?;
+        let base_usage = v6_base_plaintext_usage(encoded_len, emergency_credit)?;
+        live_transfer_candidate_capacity.validate_normal(base_usage)?;
+    }
+    Ok(())
+}
+
+fn validate_v6_transfer_cardinality_reserve_with_context(
+    runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+    records: &[Vec<u8>],
+    mode: V6StateCapacityMode,
+) -> Result<(), PairedPromotionError> {
+    if mode == V6StateCapacityMode::Normal
+        && runtime_state_mutation_authority == RuntimeStateMutationAuthority::Production
+        && !has_emergency_marker_cardinality_reserve(records)
+            .map_err(|_| PairedPromotionError::InvalidState)?
+    {
+        return Err(PairedPromotionError::StateCapacity);
+    }
+    Ok(())
+}
+
+fn validate_equivalent_v6_normal_capacity_with_context(
+    runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+    live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
+    state: &PairedCryptoState,
+) -> Result<(), PairedPromotionError> {
+    let transfer_records = state.shared_durable_transfer_records();
+    let stream_cursors = state.durable_stream_binding_bytes();
+    let encoded_len = state.validate_current_v6_stream_transfer_capacity(
+        stream_cursors,
+        transfer_records.as_slice(),
+    )?;
+    validate_v6_encoded_capacity_with_context(
+        runtime_state_mutation_authority,
+        live_transfer_candidate_capacity,
+        encoded_len,
+        stream_cursors,
+        transfer_records.as_slice(),
+    )?;
+    validate_v6_transfer_cardinality_reserve_with_context(
+        runtime_state_mutation_authority,
+        transfer_records.as_slice(),
+        V6StateCapacityMode::Normal,
+    )
+}
+
+fn validate_state_candidate_capacity_with_context(
+    runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+    live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
+    state: &PairedCryptoState,
+    encoded_len: usize,
+    mode: V6StateCapacityMode,
+) -> Result<(), PairedPromotionError> {
+    if mode == V6StateCapacityMode::Normal {
+        return validate_equivalent_v6_normal_capacity_with_context(
+            runtime_state_mutation_authority,
+            live_transfer_candidate_capacity,
+            state,
+        );
+    }
+    let PairedCryptoState::V6(value) = state else {
+        return Err(PairedPromotionError::InvalidState);
+    };
+    validate_v6_encoded_capacity_with_context(
+        runtime_state_mutation_authority,
+        live_transfer_candidate_capacity,
+        encoded_len,
+        &value.stream_cursors,
+        value.durable_transfer_records.as_slice(),
+    )?;
+    validate_v6_transfer_cardinality_reserve_with_context(
+        runtime_state_mutation_authority,
+        value.durable_transfer_records.as_slice(),
+        mode,
+    )
+}
+
+/// V6 durable transfer records 的 immutable shared owner。公开读取只返回 immutable
+/// slice；所有真实 replacement 都必须通过 `from_owned` 建立新 allocation，禁止
+/// `Arc::make_mut`、mutable slice 或其他 copy-on-write 入口。最后一个 owner 释放时逐 record
+/// 清零明文字节。
+#[derive(Clone)]
+struct SharedTransferRecords(Arc<TransferRecordOwner>);
+
+struct TransferRecordOwner(Vec<Vec<u8>>);
+
+impl Drop for TransferRecordOwner {
+    fn drop(&mut self) {
+        for record in &mut self.0 {
+            record.zeroize();
+        }
+    }
+}
+
+impl SharedTransferRecords {
+    fn from_owned(records: Vec<Vec<u8>>) -> Self {
+        Self(Arc::new(TransferRecordOwner(records)))
+    }
+
+    fn empty() -> Self {
+        Self::from_owned(Vec::new())
+    }
+
+    fn as_slice(&self) -> &[Vec<u8>] {
+        &self.0.0
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, Vec<u8>> {
+        self.as_slice().iter()
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    #[cfg(test)]
+    fn shares_allocation_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl PartialEq for SharedTransferRecords {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for SharedTransferRecords {}
+
 /// runtime transport 可读写的 bounded opaque state 投影；不包含 KEK、traffic key 或 raw
 /// paired state。`exchange` 对应单一 terminal exchange blob，另外两项保持 canonical 顺序。
 #[derive(Clone, Eq, PartialEq)]
@@ -154,6 +407,7 @@ pub(crate) struct OpaqueRuntimeState {
     exchange: Option<Vec<u8>>,
     replay_windows: Vec<Vec<u8>>,
     stream_cursors: Vec<Vec<u8>>,
+    transfer_records: SharedTransferRecords,
 }
 
 impl fmt::Debug for OpaqueRuntimeState {
@@ -168,20 +422,37 @@ impl OpaqueRuntimeState {
         exchange: Option<Vec<u8>>,
         replay_windows: Vec<Vec<u8>>,
         stream_cursors: Vec<Vec<u8>>,
+        transfer_records: Vec<Vec<u8>>,
     ) -> Self {
         Self {
             exchange,
             replay_windows,
             stream_cursors,
+            transfer_records: SharedTransferRecords::from_owned(transfer_records),
+        }
+    }
+
+    fn new_preserving_transfer_records(
+        exchange: Option<Vec<u8>>,
+        replay_windows: Vec<Vec<u8>>,
+        stream_cursors: Vec<Vec<u8>>,
+        transfer_records: SharedTransferRecords,
+    ) -> Self {
+        Self {
+            exchange,
+            replay_windows,
+            stream_cursors,
+            transfer_records,
         }
     }
 
     #[must_use]
-    pub(crate) const fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             exchange: None,
             replay_windows: Vec::new(),
             stream_cursors: Vec::new(),
+            transfer_records: SharedTransferRecords::empty(),
         }
     }
 
@@ -208,10 +479,12 @@ impl OpaqueRuntimeState {
                 .is_some_and(|value| value.len() > MAX_STATE_FIELD_LEN)
             || self.replay_windows.len() > MAX_STATE_COLLECTION_ITEMS
             || self.stream_cursors.len() > MAX_STATE_COLLECTION_ITEMS
+            || self.transfer_records.len() > MAX_DURABLE_TRANSFER_RECORDS
             || self
                 .replay_windows
                 .iter()
                 .chain(&self.stream_cursors)
+                .chain(self.transfer_records.iter())
                 .any(|entry| entry.is_empty() || entry.len() > MAX_STATE_FIELD_LEN)
         {
             return Err(PairedPromotionError::InvalidState);
@@ -221,6 +494,7 @@ impl OpaqueRuntimeState {
             self.exchange.as_ref().map_or(0, Vec::len),
             self.replay_windows.iter().map(Vec::len),
             self.stream_cursors.iter().map(Vec::len),
+            self.transfer_records.iter().map(Vec::len),
         )?;
         Ok(())
     }
@@ -229,8 +503,9 @@ impl OpaqueRuntimeState {
         let encoded = probe.encoded();
         Self {
             exchange: Some(encoded.clone()),
-            replay_windows: vec![encoded.clone()],
-            stream_cursors: vec![encoded],
+            replay_windows: vec![encoded],
+            stream_cursors: Vec::new(),
+            transfer_records: SharedTransferRecords::empty(),
         }
     }
 
@@ -240,6 +515,7 @@ impl OpaqueRuntimeState {
             exchange: Some(encoded.clone()),
             replay_windows: vec![encoded],
             stream_cursors: Vec::new(),
+            transfer_records: SharedTransferRecords::empty(),
         }
     }
 
@@ -276,8 +552,9 @@ impl OpaqueRuntimeState {
 
 /// 仅供 automatic crash harness 驱动通用 state-mutation 边界的非生产探针。
 ///
-/// 探针使用与 runtime exchange/replay/cursor codec 不相交的 domain，不能伪造 daemon receipt、
-/// replay admission 或 cursor。production CLI 不构造该类型，也不存在参数、环境变量或配置入口。
+/// 探针只占用 exchange 与单条 replay window，使用与 production codec 不相交的 domain，
+/// 不能伪造 daemon receipt、replay admission、stream cursor 或 transfer record。production
+/// CLI 不构造该类型，也不存在参数、环境变量或配置入口。
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AutomaticRuntimeStateProbe(u8);
@@ -302,6 +579,68 @@ impl AutomaticRuntimeStateProbe {
             .map(|suffix| suffix[0])
             .ok_or(PairedPromotionError::InvalidState)?;
         Ok(Self(seed))
+    }
+}
+
+/// 仅供 automatic integration harness 表达 directed runtime 的三轴 CAS 投影。
+///
+/// exchange/replay 使用与 production codec 不相交的 probe domain；stream binding 则继续
+/// 使用 production canonical encoder。该类型不含 transfer records，避免测试入口本身
+/// 获得覆盖 durable transfer collection 的能力。
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutomaticRuntimeProjection {
+    exchange: Option<AutomaticRuntimeStateProbe>,
+    replay_window: Option<AutomaticRuntimeStateProbe>,
+    stream_bindings: Vec<DurableStreamBindingV1>,
+}
+
+impl AutomaticRuntimeProjection {
+    #[must_use]
+    pub fn new(
+        exchange: Option<AutomaticRuntimeStateProbe>,
+        replay_window: Option<AutomaticRuntimeStateProbe>,
+        stream_bindings: Vec<DurableStreamBindingV1>,
+    ) -> Self {
+        Self {
+            exchange,
+            replay_window,
+            stream_bindings,
+        }
+    }
+
+    fn to_opaque_runtime_state(&self) -> Result<OpaqueRuntimeState, PairedPromotionError> {
+        Ok(OpaqueRuntimeState::new(
+            self.exchange.map(AutomaticRuntimeStateProbe::encoded),
+            self.replay_window
+                .map(AutomaticRuntimeStateProbe::encoded)
+                .into_iter()
+                .collect(),
+            encode_stream_bindings(self.stream_bindings.clone())
+                .map_err(|_| PairedPromotionError::InvalidState)?,
+            Vec::new(),
+        ))
+    }
+
+    fn from_opaque_runtime_state(
+        runtime: &OpaqueRuntimeState,
+    ) -> Result<Self, PairedPromotionError> {
+        let exchange = runtime
+            .exchange()
+            .map(AutomaticRuntimeStateProbe::decode)
+            .transpose()?;
+        let replay_window = match runtime.replay_windows() {
+            [] => None,
+            [encoded] => Some(AutomaticRuntimeStateProbe::decode(encoded)?),
+            _ => return Err(PairedPromotionError::InvalidState),
+        };
+        let stream_bindings = decode_stream_bindings(runtime.stream_cursors())
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        Ok(Self {
+            exchange,
+            replay_window,
+            stream_bindings,
+        })
     }
 }
 
@@ -507,6 +846,8 @@ pub enum PairedPromotionError {
     Incomplete,
     #[error("paired promotion conflicts with durable state")]
     Conflict,
+    #[error("paired promotion candidate exceeds the sealed state capacity")]
+    StateCapacity,
     #[error("paired machine is revoked and cleanup is pending")]
     RevokedCleanupPending,
     #[error("paired promotion state has an invalid canonical encoding")]
@@ -527,6 +868,7 @@ impl PairedPromotionError {
             Self::CounterEpochExhausted => "remote.counter.epoch_retirement_required",
             Self::Incomplete => "remote.pairing.paired_incomplete",
             Self::Conflict => "remote.pairing.paired_conflict",
+            Self::StateCapacity => "remote.pairing.paired_capacity",
             Self::RevokedCleanupPending => "remote.pairing.revoked_cleanup_pending",
         }
     }
@@ -638,6 +980,54 @@ impl CommittedEpochBarrierActivation {
     #[must_use]
     pub(crate) const fn already_committed(&self) -> bool {
         self.already_committed
+    }
+}
+
+/// 从当前 audited paired snapshot 加载并消费 owned semantic transfer state 后铸造的
+/// production-only capability。完整 expected snapshot 由 `Arc` 零复制持有；runtime 只能
+/// 查看逻辑 outcome，不能替换 expected snapshot、candidate records 或 CAS target。
+pub(crate) struct PendingStreamTransferTransition {
+    expected_state_snapshot: Arc<CryptoStateSnapshot>,
+    expected_binding: DurableStreamBindingV1,
+    transition: DurableTransferTransitionV1,
+}
+
+impl fmt::Debug for PendingStreamTransferTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingStreamTransferTransition([REDACTED])")
+    }
+}
+
+impl PendingStreamTransferTransition {
+    pub(crate) fn take_outcome(&mut self) -> DurableTransferOutcomeV1 {
+        self.transition.take_outcome()
+    }
+
+    #[must_use]
+    pub(crate) const fn bootstrap_error(&self) -> Option<DurableTransferBootstrapError> {
+        match self.transition.outcome() {
+            DurableTransferOutcomeV1::NeedsBootstrap { error } => Some(*error),
+            DurableTransferOutcomeV1::Buffered { .. }
+            | DurableTransferOutcomeV1::AlreadyComplete
+            | DurableTransferOutcomeV1::Complete { .. } => None,
+        }
+    }
+}
+
+/// 已把 canonical transfer records 按值移入完整 V6 candidate 的私有 prepared token。
+/// expected/candidate 都持有 exact paired plaintext snapshot；commit/recovery 只做逐字节
+/// expected-or-candidate 判定，不以 transfer semantic hash 代替 full-state CAS。
+struct PreparedStreamTransferTransition {
+    expected_state_snapshot: Arc<CryptoStateSnapshot>,
+    candidate_state_snapshot: Arc<CryptoStateSnapshot>,
+    candidate_state: Option<PairedCryptoState>,
+    expected_binding: DurableStreamBindingV1,
+    replacement_binding: DurableStreamBindingV1,
+}
+
+impl fmt::Debug for PreparedStreamTransferTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedStreamTransferTransition([REDACTED])")
     }
 }
 
@@ -1193,7 +1583,7 @@ struct AuditedPairedMachine {
     current_spki_pin: [u8; 32],
     next_spki_pin: [u8; 32],
     state_store: FileCryptoStateStore,
-    state_snapshot: CryptoStateSnapshot,
+    state_snapshot: Arc<CryptoStateSnapshot>,
     state: PairedCryptoState,
     prepared_stage: Option<PreparedCryptoStateStage>,
     counter_account: RemoteKeyAccount,
@@ -1592,6 +1982,7 @@ impl AuditedPairedMachine {
         store: &'a dyn RemoteKeyStore,
         mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
         runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+        live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
         lease: RemoteDeviceLease,
     ) -> OpenedPairedMachine<'a> {
         OpenedPairedMachine {
@@ -1599,6 +1990,7 @@ impl AuditedPairedMachine {
             store,
             mutation_observer,
             runtime_state_mutation_authority,
+            live_transfer_candidate_capacity,
             _lease: lease,
         }
     }
@@ -1612,6 +2004,7 @@ pub struct OpenedPairedMachine<'a> {
     store: &'a dyn RemoteKeyStore,
     mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
     runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+    live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
     // 必须最后销毁，确保 crypto/counter capabilities 不会晚于跨进程独占 lease。
     _lease: RemoteDeviceLease,
 }
@@ -1623,6 +2016,69 @@ impl fmt::Debug for OpenedPairedMachine<'_> {
 }
 
 impl OpenedPairedMachine<'_> {
+    fn validate_v6_encoded_capacity(
+        &self,
+        encoded_len: usize,
+        stream_cursors: &[Vec<u8>],
+        transfer_records: &[Vec<u8>],
+    ) -> Result<(), PairedPromotionError> {
+        validate_v6_encoded_capacity_with_context(
+            self.runtime_state_mutation_authority,
+            self.live_transfer_candidate_capacity,
+            encoded_len,
+            stream_cursors,
+            transfer_records,
+        )
+    }
+
+    fn validate_v6_transfer_cardinality_reserve(
+        &self,
+        records: &[Vec<u8>],
+        mode: V6StateCapacityMode,
+    ) -> Result<(), PairedPromotionError> {
+        validate_v6_transfer_cardinality_reserve_with_context(
+            self.runtime_state_mutation_authority,
+            records,
+            mode,
+        )
+    }
+
+    /// Emergency mode 只能消费由当前 normal V6 投影预留的 headroom。冷读 legacy V1–V5
+    /// 不触发迁移；但只要 current state 的等价 V6 投影已越过 normal byte/cardinality
+    /// 边界，任何 emergency mutation 都必须在 entropy 与写盘前 fail-close。
+    fn validate_v6_emergency_base_capacity(&self) -> Result<(), PairedPromotionError> {
+        self.validate_equivalent_v6_normal_capacity(&self.audited.state)
+    }
+
+    /// Counter reservation 与 crash recovery 可能从 V2–V5 直接生成 next state。即使
+    /// candidate 为兼容旧 Pending hash 保留了原 enum version，也必须按其等价 V6 投影执行
+    /// 与普通 transfer mutation 相同的 exact byte/cardinality gate。
+    fn validate_equivalent_v6_normal_capacity(
+        &self,
+        state: &PairedCryptoState,
+    ) -> Result<(), PairedPromotionError> {
+        validate_equivalent_v6_normal_capacity_with_context(
+            self.runtime_state_mutation_authority,
+            self.live_transfer_candidate_capacity,
+            state,
+        )
+    }
+
+    fn validate_state_candidate_capacity(
+        &self,
+        state: &PairedCryptoState,
+        encoded_len: usize,
+        mode: V6StateCapacityMode,
+    ) -> Result<(), PairedPromotionError> {
+        validate_state_candidate_capacity_with_context(
+            self.runtime_state_mutation_authority,
+            self.live_transfer_candidate_capacity,
+            state,
+            encoded_len,
+            mode,
+        )
+    }
+
     #[must_use]
     pub const fn identity(&self) -> PairedMachineIdentity {
         self.audited.identity
@@ -1868,6 +2324,36 @@ impl OpenedPairedMachine<'_> {
         self.audited.state.durable_stream_bindings()
     }
 
+    /// 返回 cold-open 已完成 canonical record 与 installed binding 交叉审计的 live transfer
+    /// state。V1–V5 legacy paired state 精确映射为空集合，不执行迁移写入。
+    pub fn durable_transfer_state(
+        &self,
+    ) -> Result<DurableLiveTransferStateV1, PairedPromotionError> {
+        self.audited.state.durable_transfer_state()
+    }
+
+    /// exact binding 上的 terminal bootstrap marker 是 ingress fence。只扫描并解码 compact
+    /// marker records，不复制同 collection 中的大 part bytes。
+    pub(crate) fn transfer_bootstrap_error_for_binding(
+        &self,
+        expected_binding: &DurableStreamBindingV1,
+    ) -> Result<Option<DurableTransferBootstrapError>, PairedPromotionError> {
+        self.validate_stream_binding_capability(expected_binding.binding())?;
+        let matching = self
+            .audited
+            .state
+            .durable_stream_bindings()?
+            .into_iter()
+            .filter(|binding| binding == expected_binding)
+            .count();
+        if matching != 1 {
+            return Err(PairedPromotionError::Conflict);
+        }
+        self.audited
+            .state
+            .durable_transfer_bootstrap_error(expected_binding.binding())
+    }
+
     /// 返回 open-time 已完成 canonical 审计的 KeySync coordination owned projection。
     /// V1/V2/V3 与 V4 的 empty optional field 都映射为 `None`。
     pub fn durable_key_sync_state(
@@ -1991,19 +2477,37 @@ impl OpenedPairedMachine<'_> {
             &self.audited.machine_data_signer_binding,
         )?;
 
+        let previous_bindings = self.audited.state.durable_stream_bindings()?;
         let candidate_bindings = rewrap_stream_bindings_for_normal_update(
             &previous_generation,
             &candidate_generation,
             handoff.update_set(),
-            self.audited.state.durable_stream_bindings()?,
+            previous_bindings.clone(),
         )?;
-        let candidate_stream_binding_bytes = encode_stream_bindings(candidate_bindings)
+        let candidate_stream_binding_bytes = encode_stream_bindings(candidate_bindings.clone())
             .map_err(|_| PairedPromotionError::InvalidState)?;
         let candidate_generation_bytes = candidate_generation
             .canonical_bytes()
             .map_err(|_| PairedPromotionError::InvalidState)?;
         let mut runtime = self.audited.state.opaque_runtime_state();
         runtime.stream_cursors = candidate_stream_binding_bytes.clone();
+        let mut transfer = self.audited.state.durable_transfer_state()?;
+        for previous in &previous_bindings {
+            if candidate_bindings
+                .iter()
+                .find(|candidate| candidate.target_key() == previous.target_key())
+                .is_none_or(|candidate| candidate.binding() != previous.binding())
+            {
+                transfer = transfer
+                    .purge_exact_binding(previous.binding())
+                    .map_err(|_| PairedPromotionError::InvalidState)?;
+            }
+        }
+        runtime.transfer_records = SharedTransferRecords::from_owned(
+            transfer
+                .canonical_record_bytes()
+                .map_err(|_| PairedPromotionError::InvalidState)?,
+        );
         let candidate_state = self.audited.state.with_mutable_projection(
             self.audited.marker.state_plaintext_hash,
             self.audited.marker.counter_guard_hash,
@@ -2011,7 +2515,15 @@ impl OpenedPairedMachine<'_> {
             self.audited.state.counter_reservation(),
             Some(candidate_key_sync_bytes.clone()),
             Some(candidate_generation_bytes.clone()),
-            KEY_GENERATION_STATE_VERSION,
+            if matches!(&self.audited.state, PairedCryptoState::V6(_))
+                || !runtime.stream_cursors.is_empty()
+                || !runtime.transfer_records.is_empty()
+            {
+                TRANSFER_STATE_VERSION
+            } else {
+                KEY_GENERATION_STATE_VERSION
+            },
+            true,
             true,
             true,
         )?;
@@ -2306,7 +2818,10 @@ impl OpenedPairedMachine<'_> {
         )?;
         let next_state_bytes = match &next_state {
             PairedCryptoState::V5(value) => {
-                value.encode_version_inner(KEY_GENERATION_STATE_VERSION, true, false)?
+                value.encode_version_inner(KEY_GENERATION_STATE_VERSION, true, false, true)?
+            }
+            PairedCryptoState::V6(value) => {
+                value.encode_version_inner(TRANSFER_STATE_VERSION, true, false, true)?
             }
             PairedCryptoState::V1(_)
             | PairedCryptoState::V2(_)
@@ -2438,10 +2953,13 @@ impl OpenedPairedMachine<'_> {
         )?;
         let next_state_bytes = match &next_state {
             PairedCryptoState::V4(value) => {
-                value.encode_version_inner(KEY_SYNC_STATE_VERSION, false, true)?
+                value.encode_version_inner(KEY_SYNC_STATE_VERSION, false, true, true)?
             }
             PairedCryptoState::V5(value) => {
-                value.encode_version_inner(KEY_GENERATION_STATE_VERSION, false, true)?
+                value.encode_version_inner(KEY_GENERATION_STATE_VERSION, false, true, true)?
+            }
+            PairedCryptoState::V6(value) => {
+                value.encode_version_inner(TRANSFER_STATE_VERSION, false, true, true)?
             }
             PairedCryptoState::V1(_) | PairedCryptoState::V2(_) | PairedCryptoState::V3(_) => {
                 return Err(PairedPromotionError::InvalidState);
@@ -2476,10 +2994,11 @@ impl OpenedPairedMachine<'_> {
         let stream_bindings =
             encode_stream_bindings(states).map_err(|_| PairedPromotionError::InvalidState)?;
         let current = self.audited.state.opaque_runtime_state();
-        let replacement = OpaqueRuntimeState::new(
-            current.exchange().map(ToOwned::to_owned),
-            current.replay_windows().to_vec(),
+        let replacement = OpaqueRuntimeState::new_preserving_transfer_records(
+            current.exchange,
+            current.replay_windows,
             stream_bindings,
+            current.transfer_records,
         );
         self.replace_opaque_runtime_state(&replacement, rng)?;
         Ok(candidate)
@@ -2508,24 +3027,59 @@ impl OpenedPairedMachine<'_> {
         )
         .map_err(|_| PairedPromotionError::InvalidState)?;
         let target = fresh.target_key();
-        let candidate =
-            if let Some(existing) = states.iter().find(|state| state.target_key() == target) {
-                existing
-                    .replace_subscription_bootstrap(binding, inner_applied)
-                    .map_err(|_| PairedPromotionError::Conflict)?
-            } else {
-                fresh
-            };
+        let existing = states
+            .iter()
+            .find(|state| state.target_key() == target)
+            .cloned();
+        let candidate = if let Some(existing) = existing.as_ref() {
+            existing
+                .replace_subscription_bootstrap(binding, inner_applied)
+                .map_err(|_| PairedPromotionError::Conflict)?
+        } else {
+            fresh
+        };
         self.validate_stream_binding_capability(candidate.binding())?;
         states.retain(|state| state.target_key() != target);
         states.push(candidate.clone());
         let stream_bindings =
             encode_stream_bindings(states).map_err(|_| PairedPromotionError::InvalidState)?;
+        let mut transfer = self.audited.state.durable_transfer_state()?;
+        if let Some(existing) = existing {
+            // 成功 bootstrap 代表 reducer 已用完整 snapshot 建立新 cut；即使 raw binding
+            // 未变化，也不能把旧 partial/NeedsBootstrap/completed 记录带过这个边界。
+            transfer = transfer
+                .purge_exact_binding(existing.binding())
+                .map_err(|_| PairedPromotionError::InvalidState)?;
+        }
+        let transfer_records = transfer
+            .canonical_record_bytes()
+            .map_err(|_| PairedPromotionError::InvalidState)?;
         let current = self.audited.state.opaque_runtime_state();
-        let replacement =
-            OpaqueRuntimeState::new(None, current.replay_windows().to_vec(), stream_bindings);
+        let replacement = OpaqueRuntimeState::new(
+            None,
+            current.replay_windows().to_vec(),
+            stream_bindings,
+            transfer_records,
+        );
         self.replace_opaque_runtime_state(&replacement, rng)?;
         Ok(candidate)
+    }
+
+    /// 仅供 automatic library harness 驱动 production subscription replacement，并验证
+    /// 旧 binding 的 active/completed/NeedsBootstrap transfer records 与新 binding 在同一
+    /// paired-state transaction 中完成 cleanup/install。
+    #[doc(hidden)]
+    pub fn commit_subscription_bootstrap_for_automatic_harness<R: CryptoRng>(
+        &mut self,
+        binding: StreamBindingV1,
+        inner_applied: RuntimeInnerCursor,
+        rng: &mut R,
+    ) -> Result<DurableStreamBindingV1, PairedPromotionError> {
+        if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        self.commit_subscription_bootstrap(binding, inner_applied, rng)
     }
 
     /// 以完整 durable state 做 CAS，提交一条 live stream 的 replay admission 或 outer/inner
@@ -2564,14 +3118,8 @@ impl OpenedPairedMachine<'_> {
         *current = replacement.clone();
         let stream_bindings =
             encode_stream_bindings(states).map_err(|_| PairedPromotionError::InvalidState)?;
-        let current_runtime = self.audited.state.opaque_runtime_state();
-        let next_runtime = OpaqueRuntimeState::new(
-            current_runtime.exchange().map(ToOwned::to_owned),
-            current_runtime.replay_windows().to_vec(),
-            stream_bindings,
-        );
-        match self.replace_opaque_runtime_state(&next_runtime, rng) {
-            Ok(_) => Ok(replacement.clone()),
+        match self.commit_stream_bindings_preserving_transfer_from_current(stream_bindings, rng) {
+            Ok(()) => Ok(replacement.clone()),
             Err(write_error) => {
                 // active state CAS 之后的 guard-finalize/sidecar cleanup 仍可能报错。此时先
                 // refresh + forward-recover，再以完整 candidate readback 决定是否已 COMMIT；
@@ -2579,7 +3127,8 @@ impl OpenedPairedMachine<'_> {
                 if self.refresh_mutable_state().is_err() {
                     return Err(write_error);
                 }
-                let _recovery = self.recover_pending_guard();
+                self.recover_pending_guard()?;
+                self.refresh_mutable_state()?;
                 let recovered = self.audited.state.durable_stream_bindings()?;
                 let current = recovered
                     .iter()
@@ -2594,6 +3143,477 @@ impl OpenedPairedMachine<'_> {
                 }
             }
         }
+    }
+
+    /// caller 已完成 refresh/recovery 与 raw-binding equality check；这里只替换 encoded
+    /// stream collection。V6/非空 transfer collection 从 audited state 只 clone immutable
+    /// Arc owner 进入 candidate；encoder 只读同一 records allocation，不建立第二份最多
+    /// 128 MiB 的 collection。
+    fn commit_stream_bindings_preserving_transfer_from_current<R: CryptoRng>(
+        &mut self,
+        stream_bindings: Vec<Vec<u8>>,
+        rng: &mut R,
+    ) -> Result<(), PairedPromotionError> {
+        if self.audited.state.durable_stream_binding_bytes() == stream_bindings {
+            return Ok(());
+        }
+        let transfer_records = self.audited.state.shared_durable_transfer_records();
+        let candidate_encoded_len = self
+            .audited
+            .state
+            .validate_current_v6_stream_transfer_capacity(
+                &stream_bindings,
+                transfer_records.as_slice(),
+            )?;
+        self.validate_v6_encoded_capacity(
+            candidate_encoded_len,
+            &stream_bindings,
+            transfer_records.as_slice(),
+        )?;
+        self.validate_v6_transfer_cardinality_reserve(
+            transfer_records.as_slice(),
+            V6StateCapacityMode::Normal,
+        )?;
+        let next_state = self
+            .audited
+            .state
+            .with_shared_stream_transfer_projection(stream_bindings, transfer_records)?;
+        let next_state_bytes = next_state.encode_transfer_prevalidated()?;
+        self.commit_prepared_state_transition(next_state, next_state_bytes, rng)
+    }
+
+    /// 从当前 exact paired snapshot 加载并按值消费 live transfer semantic state。返回值
+    /// 同时持有该 snapshot 的零复制 capability，后续 combined CAS 不需要重编码 expected
+    /// records，也不能把另一个 paired snapshot 的 transition 拼接进来。
+    pub(crate) fn prepare_live_transfer_part(
+        &self,
+        expected_binding: &DurableStreamBindingV1,
+        carrier: RuntimeTransferCarrierV1,
+        now_ms: u64,
+    ) -> Result<PendingStreamTransferTransition, PairedPromotionError> {
+        let transition = self
+            .audited
+            .state
+            .durable_transfer_state()?
+            .accept_part(expected_binding.binding(), carrier, now_ms)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        self.bind_pending_stream_transfer_transition(expected_binding, transition)
+    }
+
+    /// 从 current exact state 生成 compact NeedsBootstrap marker。用于 malformed payload、
+    /// reducer rejection，以及大 candidate 命中 paired V6 capacity 后的 fail-closed fallback；
+    /// 不复用已消费或可能超限的 replacement records。
+    pub(crate) fn prepare_live_transfer_bootstrap_marker(
+        &self,
+        expected_binding: &DurableStreamBindingV1,
+        transfer_id: Option<&TransferId>,
+        error: DurableTransferBootstrapError,
+        now_ms: u64,
+    ) -> Result<PendingStreamTransferTransition, PairedPromotionError> {
+        let transition = self
+            .audited
+            .state
+            .durable_transfer_state()?
+            .abort_exact_binding(expected_binding.binding(), transfer_id, error, now_ms)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        self.bind_pending_stream_transfer_transition(expected_binding, transition)
+    }
+
+    /// Idle TTL 唤醒的 owned transition。无 due active 时 semantic state 直接释放，不生成
+    /// candidate records；有 due binding 时由当前 installed collection 反查唯一 exact binding。
+    pub(crate) fn prepare_due_live_transfer_expiry(
+        &self,
+        now_ms: u64,
+    ) -> Result<Option<PendingStreamTransferTransition>, PairedPromotionError> {
+        let Some((identity, transition)) = self
+            .audited
+            .state
+            .durable_transfer_state()?
+            .expire_due_active_transition(now_ms)
+            .map_err(|_| PairedPromotionError::InvalidState)?
+        else {
+            return Ok(None);
+        };
+        let expected_binding = self.stream_binding_for_transfer_identity(identity)?;
+        self.bind_pending_stream_transfer_transition(&expected_binding, transition)
+            .map(Some)
+    }
+
+    fn stream_binding_for_transfer_identity(
+        &self,
+        identity: DurableTransferBindingIdentityV1,
+    ) -> Result<DurableStreamBindingV1, PairedPromotionError> {
+        let mut matching = self
+            .audited
+            .state
+            .durable_stream_bindings()?
+            .into_iter()
+            .filter(|binding| {
+                DurableTransferBindingIdentityV1::from_stream_binding(binding.binding())
+                    == Ok(identity)
+            });
+        let binding = matching.next().ok_or(PairedPromotionError::Conflict)?;
+        if matching.next().is_some() {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(binding)
+    }
+
+    fn bind_pending_stream_transfer_transition(
+        &self,
+        expected_binding: &DurableStreamBindingV1,
+        transition: DurableTransferTransitionV1,
+    ) -> Result<PendingStreamTransferTransition, PairedPromotionError> {
+        self.validate_stream_binding_capability(expected_binding.binding())?;
+        let bindings = self.audited.state.durable_stream_bindings()?;
+        let current = bindings
+            .iter()
+            .find(|state| state.target_key() == expected_binding.target_key())
+            .ok_or(PairedPromotionError::Conflict)?;
+        if current != expected_binding {
+            return Err(PairedPromotionError::Conflict);
+        }
+        transition
+            .state()
+            .validate_against_bindings(&bindings)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        Ok(PendingStreamTransferTransition {
+            expected_state_snapshot: Arc::clone(&self.audited.state_snapshot),
+            expected_binding: expected_binding.clone(),
+            transition,
+        })
+    }
+
+    /// 把 pending semantic transition 与 outer/inner candidate 收口为完整 V6 prepared
+    /// snapshot。canonical record bytes 直接按值移入 candidate；semantic state 完成 binding
+    /// 交叉验证后立即释放，不会经 `OpaqueRuntimeState` / `with_mutable_projection` 再 clone。
+    fn prepare_stream_transfer_transition(
+        &self,
+        pending: PendingStreamTransferTransition,
+        replacement_binding: DurableStreamBindingV1,
+        capacity_mode: V6StateCapacityMode,
+    ) -> Result<PreparedStreamTransferTransition, PairedPromotionError> {
+        if capacity_mode == V6StateCapacityMode::EmergencyBootstrapMarker {
+            self.validate_v6_emergency_base_capacity()?;
+        }
+        let PendingStreamTransferTransition {
+            expected_state_snapshot,
+            expected_binding,
+            transition,
+        } = pending;
+        if !Arc::ptr_eq(&expected_state_snapshot, &self.audited.state_snapshot)
+            || expected_binding.binding() != replacement_binding.binding()
+            || expected_binding.target_key() != replacement_binding.target_key()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        self.validate_stream_binding_capability(expected_binding.binding())?;
+        self.validate_stream_binding_capability(replacement_binding.binding())?;
+        let _ = replacement_binding
+            .canonical_bytes()
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+
+        let mut bindings = self.audited.state.durable_stream_bindings()?;
+        let current_index = bindings
+            .iter()
+            .position(|state| state.target_key() == expected_binding.target_key())
+            .ok_or(PairedPromotionError::Conflict)?;
+        if bindings[current_index] != expected_binding {
+            return Err(PairedPromotionError::Conflict);
+        }
+        bindings[current_index] = replacement_binding.clone();
+
+        let (replacement_transfer, replacement_records, outcome) = transition.into_prepared_parts();
+        let replacement_records = SharedTransferRecords::from_owned(replacement_records);
+        replacement_transfer
+            .validate_against_bindings(&bindings)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        drop(replacement_transfer);
+        drop(outcome);
+
+        let stream_bindings =
+            encode_stream_bindings(bindings).map_err(|_| PairedPromotionError::InvalidState)?;
+        let candidate_encoded_len = self
+            .audited
+            .state
+            .validate_current_v6_stream_transfer_capacity(
+                &stream_bindings,
+                replacement_records.as_slice(),
+            )?;
+        self.validate_v6_encoded_capacity(
+            candidate_encoded_len,
+            &stream_bindings,
+            replacement_records.as_slice(),
+        )?;
+        self.validate_v6_transfer_cardinality_reserve(
+            replacement_records.as_slice(),
+            capacity_mode,
+        )?;
+        let candidate_state = self
+            .audited
+            .state
+            .with_shared_stream_transfer_projection(stream_bindings, replacement_records)?;
+        let candidate_state_snapshot = Arc::new(CryptoStateSnapshot::new(
+            candidate_state.encode_transfer_prevalidated()?,
+        ));
+        Ok(PreparedStreamTransferTransition {
+            expected_state_snapshot,
+            candidate_state_snapshot,
+            candidate_state: Some(candidate_state),
+            expected_binding,
+            replacement_binding,
+        })
+    }
+
+    /// Production combined CAS 只返回 committed binding。transfer state 已由 private
+    /// prepared token 与 exact candidate snapshot 认证，正常路径不做完整 collection readback
+    /// 或 clone；automatic harness 如需语义断言可在提交后另行 cold readback。
+    pub(crate) fn commit_stream_transfer_transition<R: CryptoRng>(
+        &mut self,
+        pending: PendingStreamTransferTransition,
+        replacement_binding: DurableStreamBindingV1,
+        rng: &mut R,
+    ) -> Result<DurableStreamBindingV1, PairedPromotionError> {
+        let prepared = self.prepare_stream_transfer_transition(
+            pending,
+            replacement_binding,
+            V6StateCapacityMode::Normal,
+        )?;
+        self.commit_prepared_stream_transfer_transition(prepared, V6StateCapacityMode::Normal, rng)
+    }
+
+    /// Terminal NeedsBootstrap mutation 是唯一可使用真实 128 MiB hard cap 的 mutation。
+    /// 普通路径已为该 compact marker 预留 byte/cardinality headroom；这里仍验证 pending
+    /// 确实来自 transfer 状态机的 terminal outcome，禁止把 emergency mode 变成通用旁路。
+    pub(crate) fn commit_stream_bootstrap_transition<R: CryptoRng>(
+        &mut self,
+        pending: PendingStreamTransferTransition,
+        rng: &mut R,
+    ) -> Result<DurableStreamBindingV1, PairedPromotionError> {
+        if !matches!(
+            pending.transition.outcome(),
+            DurableTransferOutcomeV1::NeedsBootstrap { .. }
+        ) {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let replacement_binding = pending.expected_binding.clone();
+        let prepared = self.prepare_stream_transfer_transition(
+            pending,
+            replacement_binding,
+            V6StateCapacityMode::EmergencyBootstrapMarker,
+        )?;
+        self.commit_prepared_stream_transfer_transition(
+            prepared,
+            V6StateCapacityMode::EmergencyBootstrapMarker,
+            rng,
+        )
+    }
+
+    /// Normal budget 已满时从 current exact snapshot 构造 ReassemblyFull terminal marker。
+    /// `expected_binding` 必须来自 current exact snapshot；`replay_admitted_binding` 只能增加
+    /// 已认证 replay tuple，不能推进 outer/inner/ACK。marker 与 replay replacement 在同一
+    /// prepared-state CAS 中提交，payload kind 仍加密时传入 `transfer_id=None`。
+    pub(crate) fn commit_stream_reassembly_full_fallback<R: CryptoRng>(
+        &mut self,
+        expected_binding: &DurableStreamBindingV1,
+        replay_admitted_binding: DurableStreamBindingV1,
+        transfer_id: Option<&TransferId>,
+        now_ms: u64,
+        rng: &mut R,
+    ) -> Result<DurableStreamBindingV1, PairedPromotionError> {
+        replay_admitted_binding
+            .validate_identical_or_fresh_replay_admission_from(expected_binding)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        let replay_admitted_binding = replay_admitted_binding
+            .with_emergency_replay_debt_from(expected_binding)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        let pending = self.prepare_live_transfer_bootstrap_marker(
+            expected_binding,
+            transfer_id,
+            DurableTransferBootstrapError::ReassemblyFull,
+            now_ms,
+        )?;
+        if !matches!(
+            pending.transition.outcome(),
+            DurableTransferOutcomeV1::NeedsBootstrap {
+                error: DurableTransferBootstrapError::ReassemblyFull,
+            }
+        ) {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let prepared = self.prepare_stream_transfer_transition(
+            pending,
+            replay_admitted_binding,
+            V6StateCapacityMode::EmergencyBootstrapMarker,
+        )?;
+        self.commit_prepared_stream_transfer_transition(
+            prepared,
+            V6StateCapacityMode::EmergencyBootstrapMarker,
+            rng,
+        )
+    }
+
+    fn commit_prepared_stream_transfer_transition<R: CryptoRng>(
+        &mut self,
+        mut prepared: PreparedStreamTransferTransition,
+        capacity_mode: V6StateCapacityMode,
+        rng: &mut R,
+    ) -> Result<DurableStreamBindingV1, PairedPromotionError> {
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.refresh_mutable_state()?;
+
+        let current = self.audited.state_snapshot.expose_secret();
+        if current == prepared.candidate_state_snapshot.expose_secret() {
+            return self.read_back_committed_stream_transfer_binding(&prepared);
+        }
+        if current != prepared.expected_state_snapshot.expose_secret() {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        let candidate_state = prepared
+            .candidate_state
+            .take()
+            .ok_or(PairedPromotionError::Conflict)?;
+        let write_result = self.commit_prepared_state_transition_snapshot_with_capacity(
+            candidate_state,
+            Arc::clone(&prepared.candidate_state_snapshot),
+            capacity_mode,
+            rng,
+        );
+        match write_result {
+            Ok(()) => self.read_back_committed_stream_transfer_binding(&prepared),
+            Err(write_error) => {
+                if self.refresh_mutable_state().is_err() {
+                    return Err(write_error);
+                }
+                if self.recover_pending_guard().is_err() || self.refresh_mutable_state().is_err() {
+                    return Err(write_error);
+                }
+                let recovered = self.audited.state_snapshot.expose_secret();
+                if recovered == prepared.candidate_state_snapshot.expose_secret() {
+                    self.read_back_committed_stream_transfer_binding(&prepared)
+                } else if recovered == prepared.expected_state_snapshot.expose_secret() {
+                    Err(write_error)
+                } else {
+                    Err(PairedPromotionError::Conflict)
+                }
+            }
+        }
+    }
+
+    fn read_back_committed_stream_transfer_binding(
+        &self,
+        prepared: &PreparedStreamTransferTransition,
+    ) -> Result<DurableStreamBindingV1, PairedPromotionError> {
+        if self.audited.state_snapshot.expose_secret()
+            != prepared.candidate_state_snapshot.expose_secret()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let binding = self
+            .audited
+            .state
+            .durable_stream_bindings()?
+            .into_iter()
+            .find(|state| state.target_key() == prepared.expected_binding.target_key())
+            .ok_or(PairedPromotionError::Conflict)?;
+        if binding != prepared.replacement_binding {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(binding)
+    }
+
+    /// Automatic library harness 对 production combined CAS 的唯一公开驱动入口。harness
+    /// 允许从显式 replacement state 构造 transition，提交后再单独读取 semantic state；
+    /// production runtime 没有这个重编码/clone seam。
+    #[doc(hidden)]
+    pub fn commit_stream_transfer_transition_for_automatic_harness<R: CryptoRng>(
+        &mut self,
+        expected_binding: &DurableStreamBindingV1,
+        replacement_binding: &DurableStreamBindingV1,
+        expected_transfer: &DurableLiveTransferStateV1,
+        replacement_transfer: &DurableLiveTransferStateV1,
+        rng: &mut R,
+    ) -> Result<(DurableStreamBindingV1, DurableLiveTransferStateV1), PairedPromotionError> {
+        if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let current_binding = self
+            .audited
+            .state
+            .durable_stream_bindings()?
+            .into_iter()
+            .find(|state| state.target_key() == expected_binding.target_key())
+            .ok_or(PairedPromotionError::Conflict)?;
+        let current_transfer = self.audited.state.durable_transfer_state()?;
+        if current_binding == *replacement_binding && current_transfer == *replacement_transfer {
+            return Ok((current_binding, current_transfer));
+        }
+        if current_binding != *expected_binding || current_transfer != *expected_transfer {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let transition =
+            DurableTransferTransitionV1::from_automatic_harness_state(replacement_transfer.clone())
+                .map_err(|_| PairedPromotionError::InvalidState)?;
+        let pending = self.bind_pending_stream_transfer_transition(expected_binding, transition)?;
+        let committed =
+            self.commit_stream_transfer_transition(pending, replacement_binding.clone(), rng)?;
+        let transfer = self.durable_transfer_state()?;
+        Ok((committed, transfer))
+    }
+
+    /// 仅供 automatic fault harness 通过完整 paired transaction 写入结构有界、但语义上
+    /// malformed/non-canonical 的 V6 transfer collection。production handle 在读取 bytes、
+    /// entropy 与任一 durable mutation 前拒绝；正常 mutation 永远使用 strict canonical state。
+    #[doc(hidden)]
+    pub fn replace_unchecked_transfer_records_for_automatic_harness<R: CryptoRng>(
+        &mut self,
+        replacement: Vec<Vec<u8>>,
+        rng: &mut R,
+    ) -> Result<(), PairedPromotionError> {
+        if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        let mut runtime = self.audited.state.opaque_runtime_state();
+        if runtime.transfer_records.as_slice() == replacement.as_slice() {
+            return Ok(());
+        }
+        runtime.transfer_records = SharedTransferRecords::from_owned(replacement);
+        runtime.validate()?;
+        let next_state = self.audited.state.with_mutable_projection(
+            self.audited.marker.state_plaintext_hash,
+            self.audited.marker.counter_guard_hash,
+            &runtime,
+            self.audited.state.counter_reservation(),
+            self.audited
+                .state
+                .key_sync_state_bytes()
+                .map(ToOwned::to_owned),
+            self.audited
+                .state
+                .key_generation_state_bytes()
+                .map(ToOwned::to_owned),
+            TRANSFER_STATE_VERSION,
+            true,
+            true,
+            false,
+        )?;
+        let next_state_bytes = match &next_state {
+            PairedCryptoState::V6(value) => {
+                value.encode_version_inner(TRANSFER_STATE_VERSION, true, true, false)?
+            }
+            PairedCryptoState::V1(_)
+            | PairedCryptoState::V2(_)
+            | PairedCryptoState::V3(_)
+            | PairedCryptoState::V4(_)
+            | PairedCryptoState::V5(_) => return Err(PairedPromotionError::InvalidState),
+        };
+        self.commit_prepared_state_transition(next_state, next_state_bytes, rng)
     }
 
     /// 在对应 Relay ACK 的 transport write 成功后，精确推进同一 durable stream cut。
@@ -2626,13 +3646,7 @@ impl OpenedPairedMachine<'_> {
         *current = committed.clone();
         let stream_bindings =
             encode_stream_bindings(states).map_err(|_| PairedPromotionError::InvalidState)?;
-        let current = self.audited.state.opaque_runtime_state();
-        let replacement = OpaqueRuntimeState::new(
-            current.exchange().map(ToOwned::to_owned),
-            current.replay_windows().to_vec(),
-            stream_bindings,
-        );
-        self.replace_opaque_runtime_state(&replacement, rng)?;
+        self.commit_stream_bindings_preserving_transfer_from_current(stream_bindings, rng)?;
         Ok(committed)
     }
 
@@ -2674,10 +3688,11 @@ impl OpenedPairedMachine<'_> {
         let stream_bindings =
             encode_stream_bindings(bindings).map_err(|_| PairedPromotionError::InvalidState)?;
         let current = self.audited.state.opaque_runtime_state();
-        let replacement = OpaqueRuntimeState::new(
-            current.exchange().map(ToOwned::to_owned),
-            current.replay_windows().to_vec(),
+        let replacement = OpaqueRuntimeState::new_preserving_transfer_records(
+            current.exchange,
+            current.replay_windows,
             stream_bindings,
+            current.transfer_records,
         );
         self.replace_opaque_runtime_state(&replacement, rng)?;
         Ok(())
@@ -3634,6 +4649,15 @@ impl OpenedPairedMachine<'_> {
             .map(ToOwned::to_owned);
         let mut runtime = self.audited.state.opaque_runtime_state();
         runtime.stream_cursors = candidate_stream_binding_bytes.clone();
+        runtime.transfer_records = SharedTransferRecords::from_owned(
+            self.audited
+                .state
+                .durable_transfer_state()?
+                .purge_exact_binding(verified.durable.binding())
+                .map_err(|_| PairedPromotionError::InvalidState)?
+                .canonical_record_bytes()
+                .map_err(|_| PairedPromotionError::InvalidState)?,
+        );
         let candidate_state = self.audited.state.with_mutable_projection(
             self.audited.marker.state_plaintext_hash,
             self.audited.marker.counter_guard_hash,
@@ -3641,7 +4665,8 @@ impl OpenedPairedMachine<'_> {
             self.audited.state.counter_reservation(),
             candidate_key_sync_bytes,
             Some(candidate_generation_bytes.clone()),
-            KEY_GENERATION_STATE_VERSION,
+            TRANSFER_STATE_VERSION,
+            true,
             true,
             true,
         )?;
@@ -4155,6 +5180,21 @@ impl OpenedPairedMachine<'_> {
             .automatic_legacy_v2_probe()
     }
 
+    /// 仅供 automatic CAS harness 读回 exchange/replay/stream 三轴投影。production handle
+    /// 在读取 opaque bytes 前拒绝；transfer records 故意不属于该投影，须走独立 typed API。
+    #[doc(hidden)]
+    pub fn automatic_runtime_projection_for_automatic_harness(
+        &self,
+    ) -> Result<AutomaticRuntimeProjection, PairedPromotionError> {
+        if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        AutomaticRuntimeProjection::from_opaque_runtime_state(
+            &self.audited.state.opaque_runtime_state(),
+        )
+    }
+
     /// 仅供 automatic crash harness 写入与 production runtime codec 不相交的探针。
     #[doc(hidden)]
     pub fn replace_automatic_runtime_state_probe<R: CryptoRng>(
@@ -4184,7 +5224,10 @@ impl OpenedPairedMachine<'_> {
         if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
             || matches!(
                 self.audited.state,
-                PairedCryptoState::V3(_) | PairedCryptoState::V4(_) | PairedCryptoState::V5(_)
+                PairedCryptoState::V3(_)
+                    | PairedCryptoState::V4(_)
+                    | PairedCryptoState::V5(_)
+                    | PairedCryptoState::V6(_)
             )
         {
             return Err(PairedPromotionError::InvalidState);
@@ -4195,6 +5238,55 @@ impl OpenedPairedMachine<'_> {
             .ok_or(PairedPromotionError::InvalidState)
     }
 
+    /// Integration-only legacy migration fixture：把 current canonical V6 在 transfer
+    /// collection 为空时逐字段重编码为 V5。只允许 AutomaticHarness authority；production
+    /// open 永远没有此降级入口，且 cold read 本身仍保持零写。
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn rewrite_current_state_as_legacy_v5_for_automatic_harness<R: CryptoRng>(
+        &mut self,
+        rng: &mut R,
+    ) -> Result<(), PairedPromotionError> {
+        if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.refresh_mutable_state()?;
+        let PairedCryptoState::V6(current) = &self.audited.state else {
+            return Err(PairedPromotionError::InvalidState);
+        };
+        if !current.durable_transfer_records.is_empty() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let legacy_value = PairedCryptoStateV2 {
+            initial_state_commitment: current.initial_state_commitment,
+            initial_guard_commitment: current.initial_guard_commitment,
+            bootstrap: current.bootstrap.clone(),
+            receipt_terminal: current.receipt_terminal.clone(),
+            counter_reservation: current.counter_reservation.as_ref().map(|reservation| {
+                CommandCounterReservation {
+                    reservation_id: reservation.reservation_id,
+                    start: reservation.start,
+                    end_exclusive: reservation.end_exclusive,
+                }
+            }),
+            replay_windows: current.replay_windows.clone(),
+            stream_cursors: current.stream_cursors.clone(),
+            durable_key_sync_state: current.durable_key_sync_state.clone(),
+            durable_key_generation_state: current.durable_key_generation_state.clone(),
+            durable_transfer_records: SharedTransferRecords::empty(),
+        };
+        legacy_value.validate_for_version_inner(KEY_GENERATION_STATE_VERSION, true, true, true)?;
+        let legacy = PairedCryptoState::V5(legacy_value);
+        let PairedCryptoState::V5(value) = &legacy else {
+            unreachable!("legacy fixture was just constructed as V5")
+        };
+        let bytes = value.encode_version_inner(KEY_GENERATION_STATE_VERSION, true, true, true)?;
+        self.commit_prepared_state_transition(legacy, bytes, rng)
+    }
+
     /// 用 prepared sidecar → StatePending → active state → Stable 的固定前滚事务替换 runtime
     /// opaque fields。HWM 与 counter reservation 始终保持不变。
     pub(crate) fn replace_opaque_runtime_state<R: CryptoRng>(
@@ -4203,6 +5295,85 @@ impl OpenedPairedMachine<'_> {
         rng: &mut R,
     ) -> Result<OpaqueRuntimeState, PairedPromotionError> {
         self.replace_opaque_runtime_state_inner(replacement, false, rng)
+    }
+
+    /// Directed exchange/replay/cursor mutation 不拥有 durable transfer collection。调用方
+    /// 必须提供刚才读取的三轴 expected projection；refresh/recovery 后，每一轴只接受
+    /// expected 或 replacement，其他 fresh value 一律在 entropy 与 durable write 前冲突。
+    /// 全部三轴已是 replacement 时是 exact retry；否则把仍处于 expected 的轴一并推进。
+    /// transfer records 始终从同一份 fresh current snapshot 复制，caller 的 stale cache
+    /// 无法回退已经提交的 binding/outer/inner/replay/transfer cut。
+    pub(crate) fn replace_runtime_projection_preserving_transfer_records<R: CryptoRng>(
+        &mut self,
+        expected: &OpaqueRuntimeState,
+        exchange: Option<Vec<u8>>,
+        replay_windows: Vec<Vec<u8>>,
+        stream_cursors: Vec<Vec<u8>>,
+        rng: &mut R,
+    ) -> Result<OpaqueRuntimeState, PairedPromotionError> {
+        let expected_projection = OpaqueRuntimeState::new(
+            expected.exchange.clone(),
+            expected.replay_windows.clone(),
+            expected.stream_cursors.clone(),
+            Vec::new(),
+        );
+        expected_projection.validate()?;
+        let replacement_projection =
+            OpaqueRuntimeState::new(exchange, replay_windows, stream_cursors, Vec::new());
+        replacement_projection.validate()?;
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.refresh_mutable_state()?;
+        let current = self.audited.state.opaque_runtime_state();
+        let exchange_matches = current.exchange == expected_projection.exchange
+            || current.exchange == replacement_projection.exchange;
+        let replay_matches = current.replay_windows == expected_projection.replay_windows
+            || current.replay_windows == replacement_projection.replay_windows;
+        let cursor_matches = current.stream_cursors == expected_projection.stream_cursors
+            || current.stream_cursors == replacement_projection.stream_cursors;
+        if !exchange_matches || !replay_matches || !cursor_matches {
+            return Err(PairedPromotionError::Conflict);
+        }
+        if current.exchange == replacement_projection.exchange
+            && current.replay_windows == replacement_projection.replay_windows
+            && current.stream_cursors == replacement_projection.stream_cursors
+        {
+            return Ok(current);
+        }
+        let replacement = OpaqueRuntimeState::new_preserving_transfer_records(
+            replacement_projection.exchange,
+            replacement_projection.replay_windows,
+            replacement_projection.stream_cursors,
+            current.transfer_records,
+        );
+        self.replace_opaque_runtime_state_from_current(&replacement, false, rng)
+    }
+
+    /// Automatic integration harness 对 production 三轴 CAS 的唯一公开驱动入口。
+    /// authority check 在 probe encoding、state read、entropy 与 durable mutation 之前完成。
+    #[doc(hidden)]
+    pub fn replace_runtime_projection_preserving_transfer_records_for_automatic_harness<
+        R: CryptoRng,
+    >(
+        &mut self,
+        expected: &AutomaticRuntimeProjection,
+        replacement: &AutomaticRuntimeProjection,
+        rng: &mut R,
+    ) -> Result<AutomaticRuntimeProjection, PairedPromotionError> {
+        if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let expected = expected.to_opaque_runtime_state()?;
+        let replacement = replacement.to_opaque_runtime_state()?;
+        let committed = self.replace_runtime_projection_preserving_transfer_records(
+            &expected,
+            replacement.exchange,
+            replacement.replay_windows,
+            replacement.stream_cursors,
+            rng,
+        )?;
+        AutomaticRuntimeProjection::from_opaque_runtime_state(&committed)
     }
 
     fn replace_opaque_runtime_state_as_legacy_v2<R: CryptoRng>(
@@ -4222,6 +5393,18 @@ impl OpenedPairedMachine<'_> {
         replacement.validate()?;
         self.refresh_mutable_state()?;
         self.recover_pending_guard()?;
+        self.replace_opaque_runtime_state_from_current(replacement, force_legacy_v2, rng)
+    }
+
+    /// 在 caller 已完成 refresh/recovery 与完整 CAS 判断后，基于同一份 audited snapshot
+    /// 准备 mutation。这里不得再次 refresh，否则会在 CAS check 与 candidate build 之间
+    /// 引入 stale overwrite 窗口；最终 state-store compare-and-replace 仍负责跨 handle 竞争。
+    fn replace_opaque_runtime_state_from_current<R: CryptoRng>(
+        &mut self,
+        replacement: &OpaqueRuntimeState,
+        force_legacy_v2: bool,
+        rng: &mut R,
+    ) -> Result<OpaqueRuntimeState, PairedPromotionError> {
         let current_runtime = self.audited.state.opaque_runtime_state();
         if &current_runtime == replacement {
             return Ok(current_runtime);
@@ -4252,6 +5435,32 @@ impl OpenedPairedMachine<'_> {
         next_state_bytes: Vec<u8>,
         rng: &mut R,
     ) -> Result<(), PairedPromotionError> {
+        self.commit_prepared_state_transition_snapshot_with_capacity(
+            next_state,
+            Arc::new(CryptoStateSnapshot::new(next_state_bytes)),
+            V6StateCapacityMode::Normal,
+            rng,
+        )
+    }
+
+    /// 与 [`Self::commit_prepared_state_transition`] 相同，但允许 private prepared token
+    /// 共享同一份 exact candidate plaintext，用于 COMMIT-unknown 的逐字节 recovery 判定，
+    /// 避免为了 readback 再复制一份接近 128 MiB 的 snapshot。
+    fn commit_prepared_state_transition_snapshot_with_capacity<R: CryptoRng>(
+        &mut self,
+        next_state: PairedCryptoState,
+        next_snapshot: Arc<CryptoStateSnapshot>,
+        capacity_mode: V6StateCapacityMode,
+        rng: &mut R,
+    ) -> Result<(), PairedPromotionError> {
+        if capacity_mode == V6StateCapacityMode::EmergencyBootstrapMarker {
+            self.validate_v6_emergency_base_capacity()?;
+        }
+        self.validate_state_candidate_capacity(
+            &next_state,
+            next_snapshot.expose_secret().len(),
+            capacity_mode,
+        )?;
         let (reserved_high_water, current_state_hash, binding, initial_guard_commitment) =
             match self.audited.counter_guard {
                 CounterGuardState::V1(guard) => (
@@ -4301,8 +5510,7 @@ impl OpenedPairedMachine<'_> {
             return Err(PairedPromotionError::Conflict);
         }
 
-        let next_state_hash = sha256(&next_state_bytes);
-        let next_snapshot = CryptoStateSnapshot::new(next_state_bytes);
+        let next_state_hash = sha256(next_snapshot.expose_secret());
         let mut mutation_id = [0_u8; 16];
         rng.try_fill_bytes(&mut mutation_id)
             .map_err(|_| PairedPromotionError::EntropyUnavailable)?;
@@ -4315,10 +5523,11 @@ impl OpenedPairedMachine<'_> {
             .audited
             .state_store
             .prepare_stage(
-                &self.audited.state_snapshot,
+                self.audited.state_snapshot.as_ref(),
                 previous_guard_hash,
                 mutation_id,
-                &next_snapshot,
+                capacity_mode,
+                next_snapshot.as_ref(),
             )
             .map_err(PairedPromotionError::CryptoState)?;
         self.observe_mutation(PairedMutationStage::StateStageDurable);
@@ -4339,7 +5548,7 @@ impl OpenedPairedMachine<'_> {
 
         self.audited
             .state_store
-            .compare_and_replace(&self.audited.state_snapshot, &next_snapshot)
+            .compare_and_replace(self.audited.state_snapshot.as_ref(), next_snapshot.as_ref())
             .map_err(PairedPromotionError::CryptoState)?;
         self.observe_mutation(PairedMutationStage::StateActiveDurable);
         self.audited.state_snapshot = next_snapshot;
@@ -4421,6 +5630,21 @@ impl OpenedPairedMachine<'_> {
         if current_state_hash != sha256(self.audited.state_snapshot.expose_secret()) {
             return Err(PairedPromotionError::Conflict);
         }
+        let preflight_end = previous_high_water
+            .checked_add(COUNTER_BLOCK_SIZE)
+            .ok_or(PairedPromotionError::CounterEpochExhausted)?;
+        let preflight_reservation = CommandCounterReservation {
+            reservation_id: [0xa5; 16],
+            start: previous_high_water,
+            end_exclusive: preflight_end,
+        };
+        let preflight_state = self.audited.state.with_counter_reservation(
+            self.audited.marker.state_plaintext_hash,
+            self.audited.marker.counter_guard_hash,
+            &preflight_reservation,
+        )?;
+        self.validate_equivalent_v6_normal_capacity(&preflight_state)?;
+
         let reservation = prepare_command_counter_reservation(previous_high_water, rng)?;
         let end_exclusive = reservation.end_exclusive;
         let reservation_id = reservation.reservation_id;
@@ -4445,10 +5669,10 @@ impl OpenedPairedMachine<'_> {
         self.replace_counter_guard(CounterGuardState::V2(pending))?;
         self.observe_mutation(PairedMutationStage::GuardPendingDurable);
 
-        let next_snapshot = CryptoStateSnapshot::new(next_state_bytes);
+        let next_snapshot = Arc::new(CryptoStateSnapshot::new(next_state_bytes));
         self.audited
             .state_store
-            .compare_and_replace(&self.audited.state_snapshot, &next_snapshot)
+            .compare_and_replace(self.audited.state_snapshot.as_ref(), next_snapshot.as_ref())
             .map_err(PairedPromotionError::CryptoState)?;
         // observer 位于 durable store 返回与内存 cache 更新之间，覆盖 committed-but-stale handle。
         self.observe_mutation(PairedMutationStage::StateDurable);
@@ -4484,130 +5708,45 @@ impl OpenedPairedMachine<'_> {
         &mut self,
         guard: CounterGuardV2,
     ) -> Result<(), PairedPromotionError> {
-        let CounterGuardPhaseV2::Pending {
-            previous_high_water,
-            next_high_water,
-            reservation_id,
-            previous_state_hash,
-            next_state_hash,
-        } = guard.phase
-        else {
-            return Err(PairedPromotionError::InvalidState);
-        };
-        let mut current_hash = sha256(self.audited.state_snapshot.expose_secret());
-        let expected = CommandCounterReservation {
-            reservation_id,
-            start: previous_high_water,
-            end_exclusive: next_high_water,
-        };
-        expected.validate()?;
-        if current_hash == next_state_hash {
-            if self.audited.state.counter_reservation() != Some(&expected) {
-                return Err(PairedPromotionError::Conflict);
-            }
-        } else if current_hash == previous_state_hash {
-            // guard-first 已经让整块不可复用。用 pending 中冻结的同一 reservation 重建
-            // canonical next state，写成 sealed counter fence，但绝不把该块返回给调用方。
-            let (skipped_state, skipped_snapshot) = rebuild_frozen_counter_state(
-                &self.audited.marker,
-                &self.audited.state,
-                expected,
-                next_state_hash,
-            )?;
-            self.audited
-                .state_store
-                .compare_and_replace(&self.audited.state_snapshot, &skipped_snapshot)
-                .map_err(PairedPromotionError::CryptoState)?;
-            // recovery 自己也是 state CAS → guard finalize 的事务；在 cache 更新前保留
-            // 独立 crash seam，证明 committed-but-stale reopen 只走 pending+next。
-            self.observe_mutation(PairedMutationStage::RecoveryStateDurable);
-            self.audited.state_snapshot = skipped_snapshot;
-            self.audited.state = skipped_state;
-            current_hash = next_state_hash;
-        } else {
-            return Err(PairedPromotionError::Conflict);
-        }
-
-        // 无论 recovery 从 previous 还是 next 进入，重启都不暴露该 reservation；它只作为
-        // exact sealed fence 与 Stable HWM 绑定，下一次调用从下一整块继续。
-        let stable = CounterGuardV2::stable(
-            guard.initial_guard_commitment,
-            guard.directory_revision,
-            guard.binding,
-            next_high_water,
-            current_hash,
-        )?;
-        self.replace_counter_guard(CounterGuardState::V2(stable))?;
-        Ok(())
+        self.pending_recovery_context()
+            .recover_counter_pending(guard)
     }
 
     fn recover_state_pending(&mut self, guard: CounterGuardV2) -> Result<(), PairedPromotionError> {
-        let CounterGuardPhaseV2::StatePending {
-            reserved_high_water,
-            mutation_id,
-            previous_guard_hash,
-            previous_state_hash,
-            next_state_hash,
-            stage_commitment,
-        } = guard.phase
-        else {
-            return Err(PairedPromotionError::InvalidState);
-        };
-        let prepared = self
-            .audited
-            .prepared_stage
-            .take()
-            .ok_or(PairedPromotionError::Conflict)?;
-        if prepared.mutation_id() != mutation_id
-            || prepared.previous_guard_hash() != previous_guard_hash
-            || prepared.previous_state_hash() != previous_state_hash
-            || prepared.next_state_hash() != next_state_hash
-            || prepared.sealed_commitment() != stage_commitment
-        {
-            return Err(PairedPromotionError::Conflict);
-        }
-        let current_hash = sha256(self.audited.state_snapshot.expose_secret());
-        if current_hash == previous_state_hash {
-            let next_snapshot =
-                CryptoStateSnapshot::new(prepared.snapshot().expose_secret().to_vec());
-            let next_state = PairedCryptoState::decode(next_snapshot.expose_secret())?;
-            self.audited
-                .state_store
-                .compare_and_replace(&self.audited.state_snapshot, &next_snapshot)
-                .map_err(PairedPromotionError::CryptoState)?;
-            self.observe_mutation(PairedMutationStage::StateRecoveryActiveDurable);
-            self.audited.state_snapshot = next_snapshot;
-            self.audited.state = next_state;
-        } else if current_hash != next_state_hash
-            || self.audited.state_snapshot.expose_secret() != prepared.snapshot().expose_secret()
-        {
-            return Err(PairedPromotionError::Conflict);
-        }
+        self.pending_recovery_context().recover_state_pending(guard)
+    }
 
-        let stable = CounterGuardV2::state_stable(
-            guard.initial_guard_commitment,
-            guard.directory_revision,
-            guard.binding,
-            reserved_high_water,
-            next_state_hash,
-            mutation_id,
-            previous_guard_hash,
-            stage_commitment,
-        )?;
-        self.replace_counter_guard(CounterGuardState::V2(stable))?;
-        self.observe_mutation(PairedMutationStage::StateGuardStableDurable);
-        self.audited.prepared_stage = Some(prepared);
-        self.clear_authenticated_prepared_stage()
+    fn pending_recovery_context(&mut self) -> MutablePendingRecovery<'_> {
+        let mutation_observer = self.mutation_observer.as_ref();
+        let runtime_state_mutation_authority = self.runtime_state_mutation_authority;
+        let live_transfer_candidate_capacity = self.live_transfer_candidate_capacity;
+        let key_store = self.store;
+        let audited = &mut self.audited;
+        MutablePendingRecovery {
+            state_store: &audited.state_store,
+            key_store,
+            counter_account: &audited.counter_account,
+            counter_guard_bytes: &mut audited.counter_guard_bytes,
+            counter_guard: &mut audited.counter_guard,
+            state_snapshot: &mut audited.state_snapshot,
+            state: &mut audited.state,
+            prepared_stage: &mut audited.prepared_stage,
+            marker: &audited.marker,
+            mutation_observer,
+            runtime_state_mutation_authority,
+            live_transfer_candidate_capacity,
+        }
     }
 
     fn clear_authenticated_prepared_stage(&mut self) -> Result<(), PairedPromotionError> {
-        let Some(prepared) = self.audited.prepared_stage.take() else {
+        let Some(prepared) = self.audited.prepared_stage.as_ref() else {
             return Ok(());
         };
         self.audited
             .state_store
-            .clear_prepared_stage_exact(&prepared)
+            .clear_prepared_stage_exact(prepared)
             .map_err(PairedPromotionError::CryptoState)?;
+        self.audited.prepared_stage = None;
         self.observe_mutation(PairedMutationStage::StateStageCleared);
         Ok(())
     }
@@ -4621,25 +5760,43 @@ impl OpenedPairedMachine<'_> {
             .map_err(PairedPromotionError::Persistence)?
             .ok_or(PairedPromotionError::Incomplete)?;
         let counter_guard = CounterGuardState::decode(counter_guard_bytes.expose_secret())?;
-        let state_snapshot = self
+        let loaded_state_snapshot = self
             .audited
             .state_store
             .load()
             .map_err(PairedPromotionError::CryptoState)?
             .ok_or(PairedPromotionError::Incomplete)?;
-        let state = PairedCryptoState::decode(state_snapshot.expose_secret())?;
+        // Production Runtime hot paths refresh before every CAS。exact-equal load 已完成
+        // file/AEAD 验证，不能在旧 128 MiB snapshot + decoded records 仍存活时再无条件
+        // decode 一份；相同 plaintext 立即释放 fresh load，复用已审计 state/records。
+        // AutomaticHarness 能故意写入 validate_transfer=false 的 malformed cache，因此禁用
+        // 快路，保持下一次同 handle refresh 也必须 canonical decode 后 fail-close。
+        let refreshed_state =
+            if self.runtime_state_mutation_authority == RuntimeStateMutationAuthority::Production {
+                decode_changed_state_snapshot(
+                    self.audited.state_snapshot.as_ref(),
+                    loaded_state_snapshot,
+                )?
+            } else {
+                let state = PairedCryptoState::decode(loaded_state_snapshot.expose_secret())?;
+                Some((state, loaded_state_snapshot))
+            };
         let prepared_stage = self
             .audited
             .state_store
             .load_prepared_stage()
             .map_err(PairedPromotionError::CryptoState)?;
+        let (state, state_snapshot) = match &refreshed_state {
+            Some((state, snapshot)) => (state, snapshot),
+            None => (&self.audited.state, self.audited.state_snapshot.as_ref()),
+        };
         self.audited.marker.validate_state(
             self.audited.identity,
-            &state,
+            state,
             state_snapshot.expose_secret(),
         )?;
         let inventories = audit_key_generation_state_and_stage(
-            &state,
+            state,
             prepared_stage.as_ref(),
             state.bootstrap(),
             &self.audited.device_hpke_private_key,
@@ -4653,7 +5810,7 @@ impl OpenedPairedMachine<'_> {
             .as_deref()
             .unwrap_or(&self.audited.opened_directory_keys);
         validate_typed_stream_state_and_stage(
-            &state,
+            state,
             prepared_stage.as_ref(),
             StreamBindingAuditContext {
                 identity: self.audited.identity,
@@ -4672,15 +5829,19 @@ impl OpenedPairedMachine<'_> {
             self.audited.identity,
             &counter_guard,
             counter_guard_bytes.expose_secret(),
-            &state,
+            state,
             state_snapshot.expose_secret(),
             prepared_stage.as_ref(),
             self.audited.device_command_binding,
+            self.runtime_state_mutation_authority,
+            self.live_transfer_candidate_capacity,
         )?;
         self.audited.counter_guard_bytes = counter_guard_bytes;
         self.audited.counter_guard = counter_guard;
-        self.audited.state_snapshot = state_snapshot;
-        self.audited.state = state;
+        if let Some((state, state_snapshot)) = refreshed_state {
+            self.audited.state_snapshot = Arc::new(state_snapshot);
+            self.audited.state = state;
+        }
         self.audited.prepared_stage = prepared_stage;
         self.audited.effective_directory_revision = effective_directory_revision;
         if let Some(active_keys) = inventories.active {
@@ -4713,6 +5874,231 @@ impl OpenedPairedMachine<'_> {
     }
 }
 
+/// Pending recovery 的最小 durable tuple。production `OpenedPairedMachine` 与 unit
+/// crash harness 共用同一实现，避免 validator-only 测试与真实 guard/state CAS 漂移。
+struct MutablePendingRecovery<'a> {
+    state_store: &'a FileCryptoStateStore,
+    key_store: &'a dyn RemoteKeyStore,
+    counter_account: &'a RemoteKeyAccount,
+    counter_guard_bytes: &'a mut RemoteSecret,
+    counter_guard: &'a mut CounterGuardState,
+    state_snapshot: &'a mut Arc<CryptoStateSnapshot>,
+    state: &'a mut PairedCryptoState,
+    prepared_stage: &'a mut Option<PreparedCryptoStateStage>,
+    marker: &'a PairedCommitMarkerV1,
+    mutation_observer: Option<&'a Arc<dyn PairedMutationObserver>>,
+    runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+    live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
+}
+
+impl MutablePendingRecovery<'_> {
+    fn validate_equivalent_v6_normal_capacity(
+        &self,
+        state: &PairedCryptoState,
+    ) -> Result<(), PairedPromotionError> {
+        validate_equivalent_v6_normal_capacity_with_context(
+            self.runtime_state_mutation_authority,
+            self.live_transfer_candidate_capacity,
+            state,
+        )
+    }
+
+    fn validate_state_candidate_capacity(
+        &self,
+        state: &PairedCryptoState,
+        encoded_len: usize,
+        mode: V6StateCapacityMode,
+    ) -> Result<(), PairedPromotionError> {
+        validate_state_candidate_capacity_with_context(
+            self.runtime_state_mutation_authority,
+            self.live_transfer_candidate_capacity,
+            state,
+            encoded_len,
+            mode,
+        )
+    }
+
+    fn observe_mutation(&self, stage: PairedMutationStage) {
+        if let Some(observer) = self.mutation_observer {
+            observer.after_stage(stage);
+        }
+    }
+
+    fn replace_counter_guard(
+        &mut self,
+        replacement: CounterGuardState,
+    ) -> Result<(), PairedPromotionError> {
+        let replacement_bytes = replacement.encode();
+        self.key_store
+            .compare_and_replace_exact(
+                self.counter_account,
+                self.counter_guard_bytes,
+                &RemoteSecret::new(replacement_bytes.clone()),
+            )
+            .map_err(PairedPromotionError::Persistence)?;
+        *self.counter_guard_bytes = RemoteSecret::new(replacement_bytes);
+        *self.counter_guard = replacement;
+        Ok(())
+    }
+
+    fn clear_authenticated_prepared_stage(&mut self) -> Result<(), PairedPromotionError> {
+        let Some(prepared) = self.prepared_stage.as_ref() else {
+            return Ok(());
+        };
+        self.state_store
+            .clear_prepared_stage_exact(prepared)
+            .map_err(PairedPromotionError::CryptoState)?;
+        *self.prepared_stage = None;
+        self.observe_mutation(PairedMutationStage::StateStageCleared);
+        Ok(())
+    }
+
+    fn recover_counter_pending(
+        &mut self,
+        guard: CounterGuardV2,
+    ) -> Result<(), PairedPromotionError> {
+        let CounterGuardPhaseV2::Pending {
+            previous_high_water,
+            next_high_water,
+            reservation_id,
+            previous_state_hash,
+            next_state_hash,
+        } = guard.phase
+        else {
+            return Err(PairedPromotionError::InvalidState);
+        };
+        let mut current_hash = sha256(self.state_snapshot.expose_secret());
+        let expected = CommandCounterReservation {
+            reservation_id,
+            start: previous_high_water,
+            end_exclusive: next_high_water,
+        };
+        expected.validate()?;
+        if current_hash == next_state_hash {
+            if self.state.counter_reservation() != Some(&expected) {
+                return Err(PairedPromotionError::Conflict);
+            }
+            self.validate_equivalent_v6_normal_capacity(self.state)?;
+        } else if current_hash == previous_state_hash {
+            // guard-first 已经让整块不可复用。用 pending 中冻结的同一 reservation 重建
+            // canonical next state，写成 sealed counter fence，但绝不把该块返回给调用方。
+            let (skipped_state, skipped_snapshot) =
+                rebuild_frozen_counter_state(self.marker, self.state, expected, next_state_hash)?;
+            self.validate_equivalent_v6_normal_capacity(&skipped_state)?;
+            self.state_store
+                .compare_and_replace(self.state_snapshot.as_ref(), &skipped_snapshot)
+                .map_err(PairedPromotionError::CryptoState)?;
+            self.observe_mutation(PairedMutationStage::RecoveryStateDurable);
+            *self.state_snapshot = Arc::new(skipped_snapshot);
+            *self.state = skipped_state;
+            current_hash = next_state_hash;
+        } else {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        let stable = CounterGuardV2::stable(
+            guard.initial_guard_commitment,
+            guard.directory_revision,
+            guard.binding,
+            next_high_water,
+            current_hash,
+        )?;
+        self.replace_counter_guard(CounterGuardState::V2(stable))
+    }
+
+    fn recover_state_pending(&mut self, guard: CounterGuardV2) -> Result<(), PairedPromotionError> {
+        let CounterGuardPhaseV2::StatePending {
+            reserved_high_water,
+            mutation_id,
+            previous_guard_hash,
+            previous_state_hash,
+            next_state_hash,
+            stage_commitment,
+        } = guard.phase
+        else {
+            return Err(PairedPromotionError::InvalidState);
+        };
+        {
+            let prepared = self
+                .prepared_stage
+                .as_ref()
+                .ok_or(PairedPromotionError::Conflict)?;
+            if prepared.mutation_id() != mutation_id
+                || prepared.previous_guard_hash() != previous_guard_hash
+                || prepared.previous_state_hash() != previous_state_hash
+                || prepared.next_state_hash() != next_state_hash
+                || prepared.sealed_commitment() != stage_commitment
+            {
+                return Err(PairedPromotionError::Conflict);
+            }
+        }
+        let current_hash = sha256(self.state_snapshot.expose_secret());
+        if current_hash == previous_state_hash {
+            let prepared = self
+                .prepared_stage
+                .as_ref()
+                .ok_or(PairedPromotionError::Conflict)?;
+            let capacity_mode = prepared.capacity_mode();
+            let next_snapshot = prepared.shared_snapshot();
+            let next_state = PairedCryptoState::decode(next_snapshot.expose_secret())?;
+            if capacity_mode == V6StateCapacityMode::EmergencyBootstrapMarker {
+                self.validate_equivalent_v6_normal_capacity(self.state)?;
+            }
+            self.validate_state_candidate_capacity(
+                &next_state,
+                next_snapshot.expose_secret().len(),
+                capacity_mode,
+            )?;
+            self.state_store
+                .compare_and_replace(self.state_snapshot.as_ref(), next_snapshot.as_ref())
+                .map_err(PairedPromotionError::CryptoState)?;
+            self.observe_mutation(PairedMutationStage::StateRecoveryActiveDurable);
+            *self.state_snapshot = next_snapshot;
+            *self.state = next_state;
+        } else {
+            let prepared = self
+                .prepared_stage
+                .as_ref()
+                .ok_or(PairedPromotionError::Conflict)?;
+            if current_hash != next_state_hash
+                || self.state_snapshot.expose_secret() != prepared.snapshot().expose_secret()
+            {
+                return Err(PairedPromotionError::Conflict);
+            }
+            self.validate_state_candidate_capacity(
+                self.state,
+                self.state_snapshot.expose_secret().len(),
+                prepared.capacity_mode(),
+            )?;
+        }
+
+        let stable = CounterGuardV2::state_stable(
+            guard.initial_guard_commitment,
+            guard.directory_revision,
+            guard.binding,
+            reserved_high_water,
+            next_state_hash,
+            mutation_id,
+            previous_guard_hash,
+            stage_commitment,
+        )?;
+        self.replace_counter_guard(CounterGuardState::V2(stable))?;
+        self.observe_mutation(PairedMutationStage::StateGuardStableDurable);
+        self.clear_authenticated_prepared_stage()
+    }
+}
+
+fn decode_changed_state_snapshot(
+    current: &CryptoStateSnapshot,
+    loaded: CryptoStateSnapshot,
+) -> Result<Option<(PairedCryptoState, CryptoStateSnapshot)>, PairedPromotionError> {
+    if loaded.expose_secret() == current.expose_secret() {
+        return Ok(None);
+    }
+    let state = PairedCryptoState::decode(loaded.expose_secret())?;
+    Ok(Some((state, loaded)))
+}
+
 /// 当前 installation 的 marker-backed paired machine 只读恢复入口。
 pub struct PairedMachineStore<'a> {
     store: &'a dyn RemoteKeyStore,
@@ -4720,6 +6106,7 @@ pub struct PairedMachineStore<'a> {
     state_root: PathBuf,
     mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
     runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+    live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
 }
 
 impl fmt::Debug for PairedMachineStore<'_> {
@@ -4740,7 +6127,55 @@ impl<'a> PairedMachineStore<'a> {
             state_root,
             None,
             RuntimeStateMutationAuthority::Production,
+            LiveTransferCandidateCapacity::PRODUCTION,
         )
+    }
+
+    /// 默认 integration gate 专用的 lowered-cap Production constructor。它只缩小 live
+    /// transfer replacement candidate 的 plaintext budget；replay/ACK preserving preflight
+    /// 仍使用完整 128 MiB hard cap。该值不持久化，production CLI/env/config 不可达。
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn new_with_production_transfer_candidate_limit_for_automatic_harness(
+        store: &'a dyn RemoteKeyStore,
+        installation_id: Uuid,
+        state_root: &Path,
+        plaintext_limit: usize,
+    ) -> Result<Self, PairedPromotionError> {
+        let capacity =
+            LiveTransferCandidateCapacity::lowered_for_automatic_harness(plaintext_limit)?;
+        Ok(Self::new_inner(
+            store,
+            installation_id,
+            state_root,
+            None,
+            RuntimeStateMutationAuthority::Production,
+            capacity,
+        ))
+    }
+
+    /// 与 lowered-cap Production constructor 相同，但附带一次性 mutation observer，供
+    /// integration gate 固定 emergency CAS 的 crash/COMMIT-unknown cut。observer 不改变
+    /// Production authority，也不开放 runtime-state probe write capability。
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn new_with_production_transfer_candidate_limit_and_mutation_observer_for_automatic_harness(
+        store: &'a dyn RemoteKeyStore,
+        installation_id: Uuid,
+        state_root: &Path,
+        plaintext_limit: usize,
+        observer: Arc<dyn PairedMutationObserver>,
+    ) -> Result<Self, PairedPromotionError> {
+        let capacity =
+            LiveTransferCandidateCapacity::lowered_for_automatic_harness(plaintext_limit)?;
+        Ok(Self::new_inner(
+            store,
+            installation_id,
+            state_root,
+            Some(observer),
+            RuntimeStateMutationAuthority::Production,
+            capacity,
+        ))
     }
 
     /// Automatic harness constructor。仅此注入入口 mint runtime-state probe write capability；
@@ -4759,6 +6194,7 @@ impl<'a> PairedMachineStore<'a> {
             state_root,
             Some(observer),
             RuntimeStateMutationAuthority::AutomaticHarness,
+            LiveTransferCandidateCapacity::PRODUCTION,
         )
     }
 
@@ -4768,6 +6204,7 @@ impl<'a> PairedMachineStore<'a> {
         state_root: &Path,
         mutation_observer: Option<Arc<dyn PairedMutationObserver>>,
         runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+        live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
     ) -> Self {
         Self {
             store,
@@ -4775,6 +6212,7 @@ impl<'a> PairedMachineStore<'a> {
             state_root: state_root.to_path_buf(),
             mutation_observer,
             runtime_state_mutation_authority,
+            live_transfer_candidate_capacity,
         }
     }
 
@@ -4852,6 +6290,7 @@ impl<'a> PairedMachineStore<'a> {
             self.store,
             self.mutation_observer.clone(),
             self.runtime_state_mutation_authority,
+            self.live_transfer_candidate_capacity,
             lease,
         );
         opened.recover_pending_guard()?;
@@ -5042,6 +6481,8 @@ impl<'a> PairedMachineStore<'a> {
             state_snapshot.expose_secret(),
             prepared_stage.as_ref(),
             audit.device_command_binding,
+            self.runtime_state_mutation_authority,
+            self.live_transfer_candidate_capacity,
         )?;
         let effective_directory_revision = state.effective_directory_revision()?;
 
@@ -5059,7 +6500,7 @@ impl<'a> PairedMachineStore<'a> {
             next_spki_pin: bootstrap.next_spki_pin,
             _canonical_receipt_carrier: bootstrap.receipt_carrier.clone(),
             state_store,
-            state_snapshot,
+            state_snapshot: Arc::new(state_snapshot),
             state,
             prepared_stage,
             counter_account: accounts.counter_guard,
@@ -5504,6 +6945,8 @@ impl<'a> PairedPromotionCoordinator<'a> {
             state_snapshot.expose_secret(),
             prepared_stage.as_ref(),
             audit.device_command_binding,
+            RuntimeStateMutationAuthority::Production,
+            LiveTransferCandidateCapacity::PRODUCTION,
         )?;
         if marker.device_sign_pubkey != signing_key.verifying_key().to_bytes()
             || marker.device_hpke_pubkey != hpke_public_bytes(&hpke_private)?
@@ -5730,6 +7173,8 @@ fn audit_revocation_cleanup(
             snapshot.expose_secret(),
             None,
             durable.device_command_binding,
+            RuntimeStateMutationAuthority::Production,
+            LiveTransferCandidateCapacity::PRODUCTION,
         )?;
     }
 
@@ -6792,6 +8237,8 @@ fn validate_counter_guard_state(
     state_bytes: &[u8],
     prepared_stage: Option<&PreparedCryptoStateStage>,
     expected_binding: CounterBindingV1,
+    runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+    live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
 ) -> Result<(), PairedPromotionError> {
     let state_hash = sha256(state_bytes);
     match (*guard, state) {
@@ -6808,6 +8255,8 @@ fn validate_counter_guard_state(
                 state_bytes,
                 0,
                 prepared_stage,
+                runtime_state_mutation_authority,
+                live_transfer_candidate_capacity,
             )
         }
         (CounterGuardState::V1(_), PairedCryptoState::V1(_)) => Err(PairedPromotionError::Conflict),
@@ -6815,6 +8264,7 @@ fn validate_counter_guard_state(
         (CounterGuardState::V1(_), PairedCryptoState::V3(_)) => Err(PairedPromotionError::Conflict),
         (CounterGuardState::V1(_), PairedCryptoState::V4(_)) => Err(PairedPromotionError::Conflict),
         (CounterGuardState::V1(_), PairedCryptoState::V5(_)) => Err(PairedPromotionError::Conflict),
+        (CounterGuardState::V1(_), PairedCryptoState::V6(_)) => Err(PairedPromotionError::Conflict),
         (CounterGuardState::V2(value), _) => {
             if value.initial_guard_commitment != marker.counter_guard_hash
                 || value.directory_revision != marker.directory_revision
@@ -6837,6 +8287,8 @@ fn validate_counter_guard_state(
                         state_bytes,
                         reserved_high_water,
                         prepared_stage,
+                        runtime_state_mutation_authority,
+                        live_transfer_candidate_capacity,
                     )
                 }
                 CounterGuardPhaseV2::StateStable {
@@ -6859,6 +8311,8 @@ fn validate_counter_guard_state(
                         previous_guard_hash,
                         stage_commitment,
                         prepared_stage,
+                        runtime_state_mutation_authority,
+                        live_transfer_candidate_capacity,
                     )
                 }
                 CounterGuardPhaseV2::Pending {
@@ -6879,7 +8333,13 @@ fn validate_counter_guard_state(
                         end_exclusive: next_high_water,
                     };
                     expected.validate()?;
-                    rebuild_frozen_counter_state(marker, state, expected, next_state_hash)?;
+                    let (candidate, _) =
+                        rebuild_frozen_counter_state(marker, state, expected, next_state_hash)?;
+                    validate_equivalent_v6_normal_capacity_with_context(
+                        runtime_state_mutation_authority,
+                        live_transfer_candidate_capacity,
+                        &candidate,
+                    )?;
                     Ok(())
                 }
                 CounterGuardPhaseV2::Pending {
@@ -6899,7 +8359,11 @@ fn validate_counter_guard_state(
                     };
                     expected.validate()?;
                     if state.counter_reservation() == Some(&expected) {
-                        Ok(())
+                        validate_equivalent_v6_normal_capacity_with_context(
+                            runtime_state_mutation_authority,
+                            live_transfer_candidate_capacity,
+                            state,
+                        )
                     } else {
                         Err(PairedPromotionError::Conflict)
                     }
@@ -6923,6 +8387,8 @@ fn validate_counter_guard_state(
                     next_state_hash,
                     stage_commitment,
                     prepared_stage,
+                    runtime_state_mutation_authority,
+                    live_transfer_candidate_capacity,
                 ),
                 _ => Err(PairedPromotionError::Conflict),
             }
@@ -6930,6 +8396,7 @@ fn validate_counter_guard_state(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_uncommitted_orphan_stage(
     marker: &PairedCommitMarkerV1,
     identity: PairedMachineIdentity,
@@ -6938,6 +8405,8 @@ fn validate_uncommitted_orphan_stage(
     active_bytes: &[u8],
     reserved_high_water: u64,
     prepared_stage: Option<&PreparedCryptoStateStage>,
+    runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+    live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
 ) -> Result<(), PairedPromotionError> {
     let Some(stage) = prepared_stage else {
         return Ok(());
@@ -6953,6 +8422,20 @@ fn validate_uncommitted_orphan_stage(
     if !state_matches_stable_high_water(&next, reserved_high_water) {
         return Err(PairedPromotionError::Conflict);
     }
+    if stage.capacity_mode() == V6StateCapacityMode::EmergencyBootstrapMarker {
+        validate_equivalent_v6_normal_capacity_with_context(
+            runtime_state_mutation_authority,
+            live_transfer_candidate_capacity,
+            active,
+        )?;
+    }
+    validate_state_candidate_capacity_with_context(
+        runtime_state_mutation_authority,
+        live_transfer_candidate_capacity,
+        &next,
+        stage.snapshot().expose_secret().len(),
+        stage.capacity_mode(),
+    )?;
     validate_runtime_only_transition(marker, active, &next, stage.snapshot().expose_secret())
 }
 
@@ -6968,6 +8451,8 @@ fn validate_state_stable_stage(
     previous_guard_hash: [u8; 32],
     stage_commitment: [u8; 32],
     prepared_stage: Option<&PreparedCryptoStateStage>,
+    runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+    live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
 ) -> Result<(), PairedPromotionError> {
     let Some(stage) = prepared_stage else {
         return Ok(());
@@ -6978,6 +8463,13 @@ fn validate_state_stable_stage(
     if !state_matches_stable_high_water(&next, reserved_high_water) {
         return Err(PairedPromotionError::Conflict);
     }
+    validate_state_candidate_capacity_with_context(
+        runtime_state_mutation_authority,
+        live_transfer_candidate_capacity,
+        &next,
+        stage.snapshot().expose_secret().len(),
+        stage.capacity_mode(),
+    )?;
     if stage.mutation_id() == mutation_id
         && stage.previous_guard_hash() == previous_guard_hash
         && stage.sealed_commitment() == stage_commitment
@@ -6990,6 +8482,13 @@ fn validate_state_stable_stage(
         && active_hash == stage.previous_state_hash()
     {
         // 下一轮只完成了 stage-first；这是未提交 intent，只允许清理，绝不能前滚 active/HWM。
+        if stage.capacity_mode() == V6StateCapacityMode::EmergencyBootstrapMarker {
+            validate_equivalent_v6_normal_capacity_with_context(
+                runtime_state_mutation_authority,
+                live_transfer_candidate_capacity,
+                active,
+            )?;
+        }
         validate_runtime_only_transition(marker, active, &next, stage.snapshot().expose_secret())
     } else {
         Err(PairedPromotionError::Conflict)
@@ -7009,6 +8508,8 @@ fn validate_state_pending_stage(
     next_state_hash: [u8; 32],
     stage_commitment: [u8; 32],
     prepared_stage: Option<&PreparedCryptoStateStage>,
+    runtime_state_mutation_authority: RuntimeStateMutationAuthority,
+    live_transfer_candidate_capacity: LiveTransferCandidateCapacity,
 ) -> Result<(), PairedPromotionError> {
     let stage = prepared_stage.ok_or(PairedPromotionError::Conflict)?;
     if stage.mutation_id() != mutation_id
@@ -7024,10 +8525,24 @@ fn validate_state_pending_stage(
     if !state_matches_stable_high_water(&next, reserved_high_water) {
         return Err(PairedPromotionError::Conflict);
     }
+    validate_state_candidate_capacity_with_context(
+        runtime_state_mutation_authority,
+        live_transfer_candidate_capacity,
+        &next,
+        stage.snapshot().expose_secret().len(),
+        stage.capacity_mode(),
+    )?;
     let active_hash = sha256(active_bytes);
     if active_hash == previous_state_hash
         && state_matches_previous_high_water(active, reserved_high_water)
     {
+        if stage.capacity_mode() == V6StateCapacityMode::EmergencyBootstrapMarker {
+            validate_equivalent_v6_normal_capacity_with_context(
+                runtime_state_mutation_authority,
+                live_transfer_candidate_capacity,
+                active,
+            )?;
+        }
         validate_runtime_only_transition(marker, active, &next, stage.snapshot().expose_secret())
     } else if active_hash == next_state_hash
         && active_bytes == stage.snapshot().expose_secret()
@@ -7066,16 +8581,27 @@ fn rebuild_frozen_counter_state(
     reservation: CommandCounterReservation,
     expected_state_hash: [u8; 32],
 ) -> Result<(PairedCryptoState, CryptoStateSnapshot), PairedPromotionError> {
-    let next = previous.with_counter_reservation(
+    let upgraded = previous.with_counter_reservation(
         marker.state_plaintext_hash,
         marker.counter_guard_hash,
         &reservation,
     )?;
-    let encoded = next.encode()?;
-    if sha256(&encoded) != expected_state_hash {
-        return Err(PairedPromotionError::Conflict);
+    let upgraded_encoded = upgraded.encode()?;
+    if sha256(&upgraded_encoded) == expected_state_hash {
+        return Ok((upgraded, CryptoStateSnapshot::new(upgraded_encoded)));
     }
-    Ok((next, CryptoStateSnapshot::new(encoded)))
+
+    let legacy = previous.with_counter_reservation_preserving_version(
+        marker.state_plaintext_hash,
+        marker.counter_guard_hash,
+        &reservation,
+    )?;
+    let legacy_encoded = legacy.encode()?;
+    if sha256(&legacy_encoded) == expected_state_hash {
+        Ok((legacy, CryptoStateSnapshot::new(legacy_encoded)))
+    } else {
+        Err(PairedPromotionError::Conflict)
+    }
 }
 
 fn state_matches_previous_high_water(state: &PairedCryptoState, high_water: u64) -> bool {
@@ -7085,7 +8611,8 @@ fn state_matches_previous_high_water(state: &PairedCryptoState, high_water: u64)
         PairedCryptoState::V2(_)
         | PairedCryptoState::V3(_)
         | PairedCryptoState::V4(_)
-        | PairedCryptoState::V5(_) => match state.counter_reservation() {
+        | PairedCryptoState::V5(_)
+        | PairedCryptoState::V6(_) => match state.counter_reservation() {
             Some(reservation) => reservation.end_exclusive == high_water,
             None => high_water == 0,
         },
@@ -7099,7 +8626,8 @@ fn state_matches_stable_high_water(state: &PairedCryptoState, high_water: u64) -
         PairedCryptoState::V2(_)
         | PairedCryptoState::V3(_)
         | PairedCryptoState::V4(_)
-        | PairedCryptoState::V5(_) => match state.counter_reservation() {
+        | PairedCryptoState::V5(_)
+        | PairedCryptoState::V6(_) => match state.counter_reservation() {
             Some(reservation) => reservation.end_exclusive == high_water,
             None => high_water == 0,
         },
@@ -7818,6 +9346,7 @@ enum PairedCryptoState {
     V3(PairedCryptoStateV2),
     V4(PairedCryptoStateV2),
     V5(PairedCryptoStateV2),
+    V6(PairedCryptoStateV2),
 }
 
 impl fmt::Debug for PairedCryptoState {
@@ -7847,6 +9376,9 @@ impl PairedCryptoState {
                 PairedCryptoStateV2::decode_version(bytes, KEY_GENERATION_STATE_VERSION)
                     .map(Self::V5)
             }
+            TRANSFER_STATE_VERSION => {
+                PairedCryptoStateV2::decode_version(bytes, TRANSFER_STATE_VERSION).map(Self::V6)
+            }
             _ => Err(PairedPromotionError::InvalidState),
         }
     }
@@ -7858,28 +9390,71 @@ impl PairedCryptoState {
             Self::V3(value) => value.encode_version(TYPED_RUNTIME_STATE_VERSION),
             Self::V4(value) => value.encode_version(KEY_SYNC_STATE_VERSION),
             Self::V5(value) => value.encode_version(KEY_GENERATION_STATE_VERSION),
+            Self::V6(value) => value.encode_version(TRANSFER_STATE_VERSION),
         }
     }
 
     const fn bootstrap(&self) -> &PairedCryptoStateV1 {
         match self {
             Self::V1(value) => value,
-            Self::V2(value) | Self::V3(value) | Self::V4(value) | Self::V5(value) => {
-                &value.bootstrap
-            }
+            Self::V2(value)
+            | Self::V3(value)
+            | Self::V4(value)
+            | Self::V5(value)
+            | Self::V6(value) => &value.bootstrap,
         }
     }
 
     const fn counter_reservation(&self) -> Option<&CommandCounterReservation> {
         match self {
             Self::V1(_) => None,
-            Self::V2(value) | Self::V3(value) | Self::V4(value) | Self::V5(value) => {
-                value.counter_reservation.as_ref()
-            }
+            Self::V2(value)
+            | Self::V3(value)
+            | Self::V4(value)
+            | Self::V5(value)
+            | Self::V6(value) => value.counter_reservation.as_ref(),
         }
     }
 
     fn with_counter_reservation(
+        &self,
+        initial_state_commitment: [u8; 32],
+        initial_guard_commitment: [u8; 32],
+        reservation: &CommandCounterReservation,
+    ) -> Result<Self, PairedPromotionError> {
+        reservation.validate()?;
+        let runtime = self.opaque_runtime_state();
+        let version = if matches!(self, Self::V6(_))
+            || !runtime.stream_cursors.is_empty()
+            || !runtime.transfer_records.is_empty()
+        {
+            TRANSFER_STATE_VERSION
+        } else {
+            match self {
+                Self::V1(_) | Self::V2(_) => MUTABLE_STATE_VERSION,
+                Self::V3(_) => TYPED_RUNTIME_STATE_VERSION,
+                Self::V4(_) => KEY_SYNC_STATE_VERSION,
+                Self::V5(_) => KEY_GENERATION_STATE_VERSION,
+                Self::V6(_) => TRANSFER_STATE_VERSION,
+            }
+        };
+        self.with_mutable_projection(
+            initial_state_commitment,
+            initial_guard_commitment,
+            &runtime,
+            Some(reservation),
+            self.key_sync_state_bytes().map(ToOwned::to_owned),
+            self.key_generation_state_bytes().map(ToOwned::to_owned),
+            version,
+            true,
+            true,
+            true,
+        )
+    }
+
+    /// 只用于识别旧二进制已经冻结进 CounterGuard Pending hash 的 canonical candidate。
+    /// 新 mutation 永远走 [`Self::with_counter_reservation`] 的 stream/transfer→V6 规则。
+    fn with_counter_reservation_preserving_version(
         &self,
         initial_state_commitment: [u8; 32],
         initial_guard_commitment: [u8; 32],
@@ -7891,6 +9466,7 @@ impl PairedCryptoState {
             Self::V3(_) => TYPED_RUNTIME_STATE_VERSION,
             Self::V4(_) => KEY_SYNC_STATE_VERSION,
             Self::V5(_) => KEY_GENERATION_STATE_VERSION,
+            Self::V6(_) => TRANSFER_STATE_VERSION,
         };
         self.with_mutable_projection(
             initial_state_commitment,
@@ -7902,19 +9478,23 @@ impl PairedCryptoState {
             version,
             true,
             true,
+            true,
         )
     }
 
     fn opaque_runtime_state(&self) -> OpaqueRuntimeState {
         match self {
             Self::V1(_) => OpaqueRuntimeState::empty(),
-            Self::V2(value) | Self::V3(value) | Self::V4(value) | Self::V5(value) => {
-                OpaqueRuntimeState {
-                    exchange: value.receipt_terminal.clone(),
-                    replay_windows: value.replay_windows.clone(),
-                    stream_cursors: value.stream_cursors.clone(),
-                }
-            }
+            Self::V2(value)
+            | Self::V3(value)
+            | Self::V4(value)
+            | Self::V5(value)
+            | Self::V6(value) => OpaqueRuntimeState {
+                exchange: value.receipt_terminal.clone(),
+                replay_windows: value.replay_windows.clone(),
+                stream_cursors: value.stream_cursors.clone(),
+                transfer_records: value.durable_transfer_records.clone(),
+            },
         }
     }
 
@@ -7923,7 +9503,7 @@ impl PairedCryptoState {
             Self::V1(_) => Ok(Vec::new()),
             Self::V2(value) if value.stream_cursors.is_empty() => Ok(Vec::new()),
             Self::V2(_) => Err(PairedPromotionError::InvalidState),
-            Self::V3(value) | Self::V4(value) | Self::V5(value) => {
+            Self::V3(value) | Self::V4(value) | Self::V5(value) | Self::V6(value) => {
                 decode_stream_bindings(&value.stream_cursors)
                     .map_err(|_| PairedPromotionError::InvalidState)
             }
@@ -7935,7 +9515,7 @@ impl PairedCryptoState {
     ) -> Result<Option<Vec<DurableStreamBindingV1>>, PairedPromotionError> {
         match self {
             Self::V1(_) | Self::V2(_) => Ok(None),
-            Self::V3(value) | Self::V4(value) | Self::V5(value) => {
+            Self::V3(value) | Self::V4(value) | Self::V5(value) | Self::V6(value) => {
                 decode_stream_bindings(&value.stream_cursors)
                     .map(Some)
                     .map_err(|_| PairedPromotionError::InvalidState)
@@ -7943,10 +9523,67 @@ impl PairedCryptoState {
         }
     }
 
+    fn durable_transfer_state(&self) -> Result<DurableLiveTransferStateV1, PairedPromotionError> {
+        let records = match self {
+            Self::V1(_) => &[][..],
+            Self::V2(value)
+            | Self::V3(value)
+            | Self::V4(value)
+            | Self::V5(value)
+            | Self::V6(value) => value.durable_transfer_records.as_slice(),
+        };
+        let transfer = DurableLiveTransferStateV1::from_record_bytes(records)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        transfer
+            .validate_against_bindings(&self.durable_stream_bindings()?)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        Ok(transfer)
+    }
+
+    fn durable_transfer_bootstrap_error(
+        &self,
+        binding: &StreamBindingV1,
+    ) -> Result<Option<DurableTransferBootstrapError>, PairedPromotionError> {
+        let records = match self {
+            Self::V1(_) => &[][..],
+            Self::V2(value)
+            | Self::V3(value)
+            | Self::V4(value)
+            | Self::V5(value)
+            | Self::V6(value) => value.durable_transfer_records.as_slice(),
+        };
+        bootstrap_error_for_exact_binding_records(records, binding)
+            .map_err(|_| PairedPromotionError::InvalidState)
+    }
+
+    fn shared_durable_transfer_records(&self) -> SharedTransferRecords {
+        match self {
+            Self::V1(_) => SharedTransferRecords::empty(),
+            Self::V2(value)
+            | Self::V3(value)
+            | Self::V4(value)
+            | Self::V5(value)
+            | Self::V6(value) => value.durable_transfer_records.clone(),
+        }
+    }
+
+    fn durable_stream_binding_bytes(&self) -> &[Vec<u8>] {
+        match self {
+            Self::V1(_) => &[],
+            Self::V2(value)
+            | Self::V3(value)
+            | Self::V4(value)
+            | Self::V5(value)
+            | Self::V6(value) => &value.stream_cursors,
+        }
+    }
+
     fn key_sync_state_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::V1(_) | Self::V2(_) | Self::V3(_) => None,
-            Self::V4(value) | Self::V5(value) => value.durable_key_sync_state.as_deref(),
+            Self::V4(value) | Self::V5(value) | Self::V6(value) => {
+                value.durable_key_sync_state.as_deref()
+            }
         }
     }
 
@@ -7962,7 +9599,7 @@ impl PairedCryptoState {
     fn key_generation_state_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::V1(_) | Self::V2(_) | Self::V3(_) | Self::V4(_) => None,
-            Self::V5(value) => value.durable_key_generation_state.as_deref(),
+            Self::V5(value) | Self::V6(value) => value.durable_key_generation_state.as_deref(),
         }
     }
 
@@ -7983,6 +9620,97 @@ impl PairedCryptoState {
             }))
     }
 
+    /// 对 production V6 candidate 做精确 plaintext 长度预检。字段形状仍由后续 canonical
+    /// validation 负责；这里只把“各字段合法但总编码超过 128 MiB”从 generic invalid 中
+    /// 分离出来，使 live transfer 能在读取 entropy 或写盘前转成 compact durable marker。
+    fn validate_v6_stream_transfer_capacity<I>(
+        &self,
+        stream_cursors: &[Vec<u8>],
+        transfer_records: &[Vec<u8>],
+        receipt_len: usize,
+        replay_lengths: I,
+    ) -> Result<usize, PairedPromotionError>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let bootstrap = Zeroizing::new(self.bootstrap().encode()?);
+        checked_v6_runtime_projection_encoded_len(
+            bootstrap.len(),
+            receipt_len,
+            replay_lengths,
+            stream_cursors.iter().map(Vec::len),
+            self.key_sync_state_bytes().map_or(0, <[u8]>::len),
+            self.key_generation_state_bytes().map_or(0, <[u8]>::len),
+            transfer_records.iter().map(Vec::len),
+            transfer_records.len(),
+        )
+    }
+
+    fn validate_current_v6_stream_transfer_capacity(
+        &self,
+        stream_cursors: &[Vec<u8>],
+        transfer_records: &[Vec<u8>],
+    ) -> Result<usize, PairedPromotionError> {
+        match self {
+            Self::V1(_) => Err(PairedPromotionError::InvalidState),
+            Self::V2(current)
+            | Self::V3(current)
+            | Self::V4(current)
+            | Self::V5(current)
+            | Self::V6(current) => self.validate_v6_stream_transfer_capacity(
+                stream_cursors,
+                transfer_records,
+                current.receipt_terminal.as_ref().map_or(0, Vec::len),
+                current.replay_windows.iter().map(Vec::len),
+            ),
+        }
+    }
+
+    fn with_shared_stream_transfer_projection(
+        &self,
+        stream_cursors: Vec<Vec<u8>>,
+        transfer_records: SharedTransferRecords,
+    ) -> Result<Self, PairedPromotionError> {
+        let copy_reservation =
+            |reservation: &CommandCounterReservation| CommandCounterReservation {
+                reservation_id: reservation.reservation_id,
+                start: reservation.start,
+                end_exclusive: reservation.end_exclusive,
+            };
+        let value = match self {
+            Self::V1(_) => return Err(PairedPromotionError::InvalidState),
+            Self::V2(current)
+            | Self::V3(current)
+            | Self::V4(current)
+            | Self::V5(current)
+            | Self::V6(current) => PairedCryptoStateV2 {
+                initial_state_commitment: current.initial_state_commitment,
+                initial_guard_commitment: current.initial_guard_commitment,
+                bootstrap: current.bootstrap.clone(),
+                receipt_terminal: current.receipt_terminal.clone(),
+                counter_reservation: current.counter_reservation.as_ref().map(copy_reservation),
+                replay_windows: current.replay_windows.clone(),
+                stream_cursors,
+                durable_key_sync_state: current.durable_key_sync_state.clone(),
+                durable_key_generation_state: current.durable_key_generation_state.clone(),
+                durable_transfer_records: transfer_records,
+            },
+        };
+        value.validate_for_version_inner(TRANSFER_STATE_VERSION, true, true, false)?;
+        Ok(Self::V6(value))
+    }
+
+    fn encode_transfer_prevalidated(&self) -> Result<Vec<u8>, PairedPromotionError> {
+        match self {
+            Self::V6(value) => {
+                value.encode_version_inner(TRANSFER_STATE_VERSION, true, true, false)
+            }
+            Self::V1(_) | Self::V2(_) | Self::V3(_) | Self::V4(_) | Self::V5(_) => {
+                Err(PairedPromotionError::InvalidState)
+            }
+        }
+    }
+
     fn with_opaque_runtime_state(
         &self,
         initial_state_commitment: [u8; 32],
@@ -7991,7 +9719,12 @@ impl PairedCryptoState {
     ) -> Result<Self, PairedPromotionError> {
         runtime.validate()?;
         let automatic_probe = runtime.automatic_probe().ok().flatten().is_some();
-        let version = if matches!(self, Self::V5(_)) {
+        let version = if matches!(self, Self::V6(_))
+            || !runtime.stream_cursors.is_empty()
+            || !runtime.transfer_records.is_empty()
+        {
+            TRANSFER_STATE_VERSION
+        } else if matches!(self, Self::V5(_)) {
             KEY_GENERATION_STATE_VERSION
         } else if matches!(self, Self::V4(_)) {
             KEY_SYNC_STATE_VERSION
@@ -8010,6 +9743,7 @@ impl PairedCryptoState {
             version,
             true,
             true,
+            true,
         )
     }
 
@@ -8022,7 +9756,8 @@ impl PairedCryptoState {
         runtime.validate()?;
         if !runtime.stream_cursors.is_empty()
             || runtime.automatic_legacy_v2_probe()?.is_none()
-            || matches!(self, Self::V3(_) | Self::V4(_) | Self::V5(_))
+            || !runtime.transfer_records.is_empty()
+            || matches!(self, Self::V3(_) | Self::V4(_) | Self::V5(_) | Self::V6(_))
         {
             return Err(PairedPromotionError::InvalidState);
         }
@@ -8034,6 +9769,7 @@ impl PairedCryptoState {
             None,
             None,
             MUTABLE_STATE_VERSION,
+            true,
             true,
             true,
         )
@@ -8051,6 +9787,7 @@ impl PairedCryptoState {
         version: u16,
         validate_key_sync: bool,
         validate_key_generation: bool,
+        validate_transfer: bool,
     ) -> Result<Self, PairedPromotionError> {
         if !matches!(
             version,
@@ -8058,8 +9795,14 @@ impl PairedCryptoState {
                 | TYPED_RUNTIME_STATE_VERSION
                 | KEY_SYNC_STATE_VERSION
                 | KEY_GENERATION_STATE_VERSION
+                | TRANSFER_STATE_VERSION
         ) || matches!(self, Self::V4(_)) && version < KEY_SYNC_STATE_VERSION
-            || matches!(self, Self::V5(_)) && version != KEY_GENERATION_STATE_VERSION
+            || matches!(self, Self::V5(_))
+                && !matches!(
+                    version,
+                    KEY_GENERATION_STATE_VERSION | TRANSFER_STATE_VERSION
+                )
+            || matches!(self, Self::V6(_)) && version != TRANSFER_STATE_VERSION
         {
             return Err(PairedPromotionError::InvalidState);
         }
@@ -8080,27 +9823,37 @@ impl PairedCryptoState {
                 stream_cursors: runtime.stream_cursors.clone(),
                 durable_key_sync_state,
                 durable_key_generation_state,
+                durable_transfer_records: runtime.transfer_records.clone(),
             },
-            Self::V2(current) | Self::V3(current) | Self::V4(current) | Self::V5(current) => {
-                PairedCryptoStateV2 {
-                    initial_state_commitment: current.initial_state_commitment,
-                    initial_guard_commitment: current.initial_guard_commitment,
-                    bootstrap: current.bootstrap.clone(),
-                    receipt_terminal: runtime.exchange.clone(),
-                    counter_reservation: counter_reservation.map(copy_reservation),
-                    replay_windows: runtime.replay_windows.clone(),
-                    stream_cursors: runtime.stream_cursors.clone(),
-                    durable_key_sync_state,
-                    durable_key_generation_state,
-                }
-            }
+            Self::V2(current)
+            | Self::V3(current)
+            | Self::V4(current)
+            | Self::V5(current)
+            | Self::V6(current) => PairedCryptoStateV2 {
+                initial_state_commitment: current.initial_state_commitment,
+                initial_guard_commitment: current.initial_guard_commitment,
+                bootstrap: current.bootstrap.clone(),
+                receipt_terminal: runtime.exchange.clone(),
+                counter_reservation: counter_reservation.map(copy_reservation),
+                replay_windows: runtime.replay_windows.clone(),
+                stream_cursors: runtime.stream_cursors.clone(),
+                durable_key_sync_state,
+                durable_key_generation_state,
+                durable_transfer_records: runtime.transfer_records.clone(),
+            },
         };
-        value.validate_for_version_inner(version, validate_key_sync, validate_key_generation)?;
+        value.validate_for_version_inner(
+            version,
+            validate_key_sync,
+            validate_key_generation,
+            validate_transfer,
+        )?;
         match version {
             MUTABLE_STATE_VERSION => Ok(Self::V2(value)),
             TYPED_RUNTIME_STATE_VERSION => Ok(Self::V3(value)),
             KEY_SYNC_STATE_VERSION => Ok(Self::V4(value)),
             KEY_GENERATION_STATE_VERSION => Ok(Self::V5(value)),
+            TRANSFER_STATE_VERSION => Ok(Self::V6(value)),
             _ => Err(PairedPromotionError::InvalidState),
         }
     }
@@ -8112,7 +9865,10 @@ impl PairedCryptoState {
         durable_key_sync_state: Option<Vec<u8>>,
         validate_key_sync: bool,
     ) -> Result<Self, PairedPromotionError> {
-        let version = if matches!(self, Self::V5(_)) {
+        let runtime = self.opaque_runtime_state();
+        let version = if matches!(self, Self::V6(_)) || !runtime.stream_cursors.is_empty() {
+            TRANSFER_STATE_VERSION
+        } else if matches!(self, Self::V5(_)) {
             KEY_GENERATION_STATE_VERSION
         } else {
             KEY_SYNC_STATE_VERSION
@@ -8120,12 +9876,13 @@ impl PairedCryptoState {
         self.with_mutable_projection(
             initial_state_commitment,
             initial_guard_commitment,
-            &self.opaque_runtime_state(),
+            &runtime,
             self.counter_reservation(),
             durable_key_sync_state,
             self.key_generation_state_bytes().map(ToOwned::to_owned),
             version,
             validate_key_sync,
+            true,
             true,
         )
     }
@@ -8137,16 +9894,22 @@ impl PairedCryptoState {
         durable_key_generation_state: Option<Vec<u8>>,
         validate_key_generation: bool,
     ) -> Result<Self, PairedPromotionError> {
+        let runtime = self.opaque_runtime_state();
         self.with_mutable_projection(
             initial_state_commitment,
             initial_guard_commitment,
-            &self.opaque_runtime_state(),
+            &runtime,
             self.counter_reservation(),
             self.key_sync_state_bytes().map(ToOwned::to_owned),
             durable_key_generation_state,
-            KEY_GENERATION_STATE_VERSION,
+            if matches!(self, Self::V6(_)) || !runtime.stream_cursors.is_empty() {
+                TRANSFER_STATE_VERSION
+            } else {
+                KEY_GENERATION_STATE_VERSION
+            },
             true,
             validate_key_generation,
+            true,
         )
     }
 
@@ -8162,6 +9925,7 @@ impl PairedCryptoState {
             Self::V3(_) => TYPED_RUNTIME_STATE_VERSION,
             Self::V4(_) => KEY_SYNC_STATE_VERSION,
             Self::V5(_) => KEY_GENERATION_STATE_VERSION,
+            Self::V6(_) => TRANSFER_STATE_VERSION,
         };
         self.with_mutable_projection(
             initial_state_commitment,
@@ -8173,14 +9937,16 @@ impl PairedCryptoState {
             version,
             true,
             true,
+            true,
         )
     }
 }
 
-/// V2–V5 共用 payload：marker 的两个旧 hash 固化为 initial commitments，当前 state hash
+/// V2–V6 共用 payload：marker 的两个旧 hash 固化为 initial commitments，当前 state hash
 /// 只由 guard 绑定。V2 保留 legacy bounded opaque fields；V3 additionally 要求 stream collection
 /// 逐项通过 typed canonical decode；V4 追加 optional canonical ADKS，V5 再追加 canonical
-/// key-generation state，旧 body prefix 始终逐字保留。
+/// key-generation state；V6 追加独立 durable transfer record collection，旧 body prefix 始终
+/// 逐字保留。
 struct PairedCryptoStateV2 {
     initial_state_commitment: [u8; 32],
     initial_guard_commitment: [u8; 32],
@@ -8191,6 +9957,7 @@ struct PairedCryptoStateV2 {
     stream_cursors: Vec<Vec<u8>>,
     durable_key_sync_state: Option<Vec<u8>>,
     durable_key_generation_state: Option<Vec<u8>>,
+    durable_transfer_records: SharedTransferRecords,
 }
 
 impl fmt::Debug for PairedCryptoStateV2 {
@@ -8201,7 +9968,7 @@ impl fmt::Debug for PairedCryptoStateV2 {
 
 impl PairedCryptoStateV2 {
     fn encode_version(&self, version: u16) -> Result<Vec<u8>, PairedPromotionError> {
-        self.encode_version_inner(version, true, true)
+        self.encode_version_inner(version, true, true, true)
     }
 
     fn encode_version_inner(
@@ -8209,8 +9976,14 @@ impl PairedCryptoStateV2 {
         version: u16,
         validate_key_sync: bool,
         validate_key_generation: bool,
+        validate_transfer: bool,
     ) -> Result<Vec<u8>, PairedPromotionError> {
-        self.validate_for_version_inner(version, validate_key_sync, validate_key_generation)?;
+        self.validate_for_version_inner(
+            version,
+            validate_key_sync,
+            validate_key_generation,
+            validate_transfer,
+        )?;
         let mut body = Vec::new();
         body.extend_from_slice(&self.initial_state_commitment);
         body.extend_from_slice(&self.initial_guard_commitment);
@@ -8239,7 +10012,7 @@ impl PairedCryptoStateV2 {
         put_state_collection(&mut body, &self.stream_cursors)?;
         if matches!(
             version,
-            KEY_SYNC_STATE_VERSION | KEY_GENERATION_STATE_VERSION
+            KEY_SYNC_STATE_VERSION | KEY_GENERATION_STATE_VERSION | TRANSFER_STATE_VERSION
         ) {
             put_state_field(
                 &mut body,
@@ -8247,13 +10020,23 @@ impl PairedCryptoStateV2 {
                 MAX_STATE_FIELD_LEN,
             )?;
         }
-        if version == KEY_GENERATION_STATE_VERSION {
+        if matches!(
+            version,
+            KEY_GENERATION_STATE_VERSION | TRANSFER_STATE_VERSION
+        ) {
             put_state_field(
                 &mut body,
                 self.durable_key_generation_state
                     .as_deref()
                     .unwrap_or_default(),
                 MAX_STATE_FIELD_LEN,
+            )?;
+        }
+        if version == TRANSFER_STATE_VERSION {
+            put_state_collection_with_limit(
+                &mut body,
+                self.durable_transfer_records.as_slice(),
+                MAX_DURABLE_TRANSFER_RECORDS,
             )?;
         }
         if body.len() > MAX_CRYPTO_STATE_PLAINTEXT_LEN - STATE_HEADER_LEN {
@@ -8315,18 +10098,26 @@ impl PairedCryptoStateV2 {
         let stream_cursors = decode_state_collection(&mut decoder)?;
         let durable_key_sync_state = if matches!(
             version,
-            KEY_SYNC_STATE_VERSION | KEY_GENERATION_STATE_VERSION
+            KEY_SYNC_STATE_VERSION | KEY_GENERATION_STATE_VERSION | TRANSFER_STATE_VERSION
         ) {
             let bytes = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
             (!bytes.is_empty()).then_some(bytes)
         } else {
             None
         };
-        let durable_key_generation_state = if version == KEY_GENERATION_STATE_VERSION {
+        let durable_key_generation_state = if matches!(
+            version,
+            KEY_GENERATION_STATE_VERSION | TRANSFER_STATE_VERSION
+        ) {
             let bytes = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
             (!bytes.is_empty()).then_some(bytes)
         } else {
             None
+        };
+        let durable_transfer_records = if version == TRANSFER_STATE_VERSION {
+            decode_shared_transfer_records(&mut decoder)?
+        } else {
+            SharedTransferRecords::empty()
         };
         decoder.finish()?;
         let value = Self {
@@ -8339,6 +10130,7 @@ impl PairedCryptoStateV2 {
             stream_cursors,
             durable_key_sync_state,
             durable_key_generation_state,
+            durable_transfer_records,
         };
         value.validate_for_version(version)?;
         let canonical = Zeroizing::new(value.encode_version(version)?);
@@ -8349,7 +10141,7 @@ impl PairedCryptoStateV2 {
     }
 
     fn validate_for_version(&self, version: u16) -> Result<(), PairedPromotionError> {
-        self.validate_for_version_inner(version, true, true)
+        self.validate_for_version_inner(version, true, true, true)
     }
 
     fn validate_for_version_inner(
@@ -8357,6 +10149,7 @@ impl PairedCryptoStateV2 {
         version: u16,
         validate_key_sync: bool,
         validate_key_generation: bool,
+        validate_transfer: bool,
     ) -> Result<(), PairedPromotionError> {
         if !matches!(
             version,
@@ -8364,6 +10157,7 @@ impl PairedCryptoStateV2 {
                 | TYPED_RUNTIME_STATE_VERSION
                 | KEY_SYNC_STATE_VERSION
                 | KEY_GENERATION_STATE_VERSION
+                | TRANSFER_STATE_VERSION
         ) {
             return Err(PairedPromotionError::InvalidState);
         }
@@ -8385,10 +10179,13 @@ impl PairedCryptoStateV2 {
         if version < KEY_SYNC_STATE_VERSION && self.durable_key_sync_state.is_some() {
             return Err(PairedPromotionError::InvalidState);
         }
-        if version != KEY_GENERATION_STATE_VERSION && self.durable_key_generation_state.is_some() {
+        if version < KEY_GENERATION_STATE_VERSION && self.durable_key_generation_state.is_some() {
             return Err(PairedPromotionError::InvalidState);
         }
         if version == KEY_GENERATION_STATE_VERSION && self.durable_key_generation_state.is_none() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        if version < TRANSFER_STATE_VERSION && !self.durable_transfer_records.is_empty() {
             return Err(PairedPromotionError::InvalidState);
         }
         if validate_key_sync && let Some(bytes) = &self.durable_key_sync_state {
@@ -8421,6 +10218,7 @@ impl PairedCryptoStateV2 {
             self.receipt_terminal.as_ref().map_or(0, Vec::len),
             self.replay_windows.iter().map(Vec::len),
             self.stream_cursors.iter().map(Vec::len),
+            self.durable_transfer_records.iter().map(Vec::len),
         )?;
         let mut encoded_len = encoded_len;
         if matches!(
@@ -8451,13 +10249,34 @@ impl PairedCryptoStateV2 {
             {
                 return Err(PairedPromotionError::InvalidState);
             }
+            encoded_len = encoded_len + 4 + key_generation_len;
+        }
+        if version == TRANSFER_STATE_VERSION {
+            checked_v6_suffix_encoded_len(
+                encoded_len,
+                self.durable_key_sync_state.as_ref().map_or(0, Vec::len),
+                self.durable_key_generation_state
+                    .as_ref()
+                    .map_or(0, Vec::len),
+                self.durable_transfer_records.len(),
+            )?;
         }
         if matches!(
             version,
-            TYPED_RUNTIME_STATE_VERSION | KEY_SYNC_STATE_VERSION | KEY_GENERATION_STATE_VERSION
+            TYPED_RUNTIME_STATE_VERSION
+                | KEY_SYNC_STATE_VERSION
+                | KEY_GENERATION_STATE_VERSION
+                | TRANSFER_STATE_VERSION
         ) {
-            decode_stream_bindings(&self.stream_cursors)
+            let bindings = decode_stream_bindings(&self.stream_cursors)
                 .map_err(|_| PairedPromotionError::InvalidState)?;
+            if validate_transfer && version == TRANSFER_STATE_VERSION {
+                DurableLiveTransferStateV1::from_record_bytes(
+                    self.durable_transfer_records.as_slice(),
+                )
+                .and_then(|transfer| transfer.validate_against_bindings(&bindings))
+                .map_err(|_| PairedPromotionError::InvalidState)?;
+            }
         }
         Ok(())
     }
@@ -8667,6 +10486,7 @@ impl PairedCommitMarkerV1 {
             | PairedCryptoState::V3(value)
             | PairedCryptoState::V4(value)
             | PairedCryptoState::V5(value)
+            | PairedCryptoState::V6(value)
                 if value.initial_state_commitment == self.state_plaintext_hash
                     && value.initial_guard_commitment == self.counter_guard_hash => {}
             _ => return Err(PairedPromotionError::Conflict),
@@ -9036,7 +10856,15 @@ fn put_state_collection(
     encoded: &mut Vec<u8>,
     values: &[Vec<u8>],
 ) -> Result<(), PairedPromotionError> {
-    if values.len() > MAX_STATE_COLLECTION_ITEMS {
+    put_state_collection_with_limit(encoded, values, MAX_STATE_COLLECTION_ITEMS)
+}
+
+fn put_state_collection_with_limit(
+    encoded: &mut Vec<u8>,
+    values: &[Vec<u8>],
+    maximum_items: usize,
+) -> Result<(), PairedPromotionError> {
+    if values.len() > maximum_items || maximum_items > usize::from(u16::MAX) {
         return Err(PairedPromotionError::InvalidState);
     }
     let count = u16::try_from(values.len()).map_err(|_| PairedPromotionError::InvalidState)?;
@@ -9050,15 +10878,17 @@ fn put_state_collection(
     Ok(())
 }
 
-fn checked_mutable_state_encoded_len<I, J>(
+fn checked_mutable_state_encoded_len<I, J, K>(
     bootstrap_len: usize,
     receipt_len: usize,
     replay_lengths: I,
     cursor_lengths: J,
+    transfer_lengths: K,
 ) -> Result<usize, PairedPromotionError>
 where
     I: IntoIterator<Item = usize>,
     J: IntoIterator<Item = usize>,
+    K: IntoIterator<Item = usize>,
 {
     if bootstrap_len > MAX_CRYPTO_STATE_PLAINTEXT_LEN || receipt_len > MAX_STATE_FIELD_LEN {
         return Err(PairedPromotionError::InvalidState);
@@ -9067,7 +10897,11 @@ where
         .checked_add(bootstrap_len)
         .and_then(|length| length.checked_add(receipt_len))
         .ok_or(PairedPromotionError::InvalidState)?;
-    for value_len in replay_lengths.into_iter().chain(cursor_lengths) {
+    for value_len in replay_lengths
+        .into_iter()
+        .chain(cursor_lengths)
+        .chain(transfer_lengths)
+    {
         if value_len == 0 || value_len > MAX_STATE_FIELD_LEN {
             return Err(PairedPromotionError::InvalidState);
         }
@@ -9085,11 +10919,94 @@ where
     Ok(encoded_len)
 }
 
+fn checked_v6_suffix_encoded_len(
+    encoded_len: usize,
+    key_sync_len: usize,
+    key_generation_len: usize,
+    transfer_record_count: usize,
+) -> Result<usize, PairedPromotionError> {
+    if key_sync_len > MAX_STATE_FIELD_LEN
+        || key_generation_len > MAX_STATE_FIELD_LEN
+        || transfer_record_count > MAX_DURABLE_TRANSFER_RECORDS
+    {
+        return Err(PairedPromotionError::InvalidState);
+    }
+    encoded_len
+        .checked_add(4)
+        .and_then(|length| length.checked_add(key_sync_len))
+        .and_then(|length| length.checked_add(4))
+        .and_then(|length| length.checked_add(key_generation_len))
+        .and_then(|length| length.checked_add(2))
+        .filter(|length| *length <= MAX_CRYPTO_STATE_PLAINTEXT_LEN)
+        .ok_or(PairedPromotionError::InvalidState)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checked_v6_runtime_projection_encoded_len<I, J, K>(
+    bootstrap_len: usize,
+    receipt_len: usize,
+    replay_lengths: I,
+    cursor_lengths: J,
+    key_sync_len: usize,
+    key_generation_len: usize,
+    transfer_lengths: K,
+    transfer_record_count: usize,
+) -> Result<usize, PairedPromotionError>
+where
+    I: IntoIterator<Item = usize>,
+    J: IntoIterator<Item = usize>,
+    K: IntoIterator<Item = usize>,
+{
+    if bootstrap_len > MAX_CRYPTO_STATE_PLAINTEXT_LEN
+        || receipt_len > MAX_STATE_FIELD_LEN
+        || key_sync_len > MAX_STATE_FIELD_LEN
+        || key_generation_len > MAX_STATE_FIELD_LEN
+        || transfer_record_count > MAX_DURABLE_TRANSFER_RECORDS
+    {
+        return Err(PairedPromotionError::InvalidState);
+    }
+    let mut encoded_len = MUTABLE_STATE_FIXED_ENCODED_LEN
+        .checked_add(bootstrap_len)
+        .and_then(|length| length.checked_add(receipt_len))
+        .ok_or(PairedPromotionError::StateCapacity)?;
+    for value_len in replay_lengths
+        .into_iter()
+        .chain(cursor_lengths)
+        .chain(transfer_lengths)
+    {
+        if value_len == 0 || value_len > MAX_STATE_FIELD_LEN {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        encoded_len = encoded_len
+            .checked_add(4)
+            .and_then(|length| length.checked_add(value_len))
+            .ok_or(PairedPromotionError::StateCapacity)?;
+    }
+    encoded_len = encoded_len
+        .checked_add(4)
+        .and_then(|length| length.checked_add(key_sync_len))
+        .and_then(|length| length.checked_add(4))
+        .and_then(|length| length.checked_add(key_generation_len))
+        .and_then(|length| length.checked_add(2))
+        .ok_or(PairedPromotionError::StateCapacity)?;
+    if encoded_len > MAX_CRYPTO_STATE_PLAINTEXT_LEN {
+        return Err(PairedPromotionError::StateCapacity);
+    }
+    Ok(encoded_len)
+}
+
 fn decode_state_collection(
     decoder: &mut StateDecoder<'_>,
 ) -> Result<Vec<Vec<u8>>, PairedPromotionError> {
+    decode_state_collection_with_limit(decoder, MAX_STATE_COLLECTION_ITEMS)
+}
+
+fn decode_state_collection_with_limit(
+    decoder: &mut StateDecoder<'_>,
+    maximum_items: usize,
+) -> Result<Vec<Vec<u8>>, PairedPromotionError> {
     let count = usize::from(decoder.u16()?);
-    if count > MAX_STATE_COLLECTION_ITEMS {
+    if count > maximum_items {
         return Err(PairedPromotionError::InvalidState);
     }
     let mut values = Vec::with_capacity(count);
@@ -9101,6 +11018,28 @@ fn decode_state_collection(
         values.push(value);
     }
     Ok(values)
+}
+
+fn decode_shared_transfer_records(
+    decoder: &mut StateDecoder<'_>,
+) -> Result<SharedTransferRecords, PairedPromotionError> {
+    let count = usize::from(decoder.u16()?);
+    if count > MAX_DURABLE_TRANSFER_RECORDS {
+        return Err(PairedPromotionError::InvalidState);
+    }
+    // 解码尚未成功时先由 zeroizing guard 持有部分 records；只有完整 collection 成功后
+    // 才按值移交给 immutable shared owner，避免 malformed V6 让已复制明文走普通 drop。
+    let mut values = Zeroizing::new(Vec::with_capacity(count));
+    for _ in 0..count {
+        let value = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
+        if value.is_empty() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        values.push(value);
+    }
+    Ok(SharedTransferRecords::from_owned(std::mem::take(
+        &mut *values,
+    )))
 }
 
 fn read_u64(bytes: &[u8]) -> Result<u64, PairedPromotionError> {
@@ -9118,10 +11057,96 @@ fn all_zero(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod counter_reservation_tests {
     use std::convert::Infallible;
+    use std::fs;
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
+    use agentdeck_protocol::runtime::StreamCursor;
+
+    use crate::remote::key_generation::{
+        DurableKeyGenerationV1, DurableKeySlotV1, KeySlotIdentityV1,
+    };
+    use crate::remote::keychain::MemoryRemoteKeyStore;
+
+    use crate::remote::crypto_state::PreparedStageCleanupObserver;
 
     use super::*;
+
+    #[allow(dead_code)]
+    mod real_pairing_fixture {
+        use crate as agentdeck_cli;
+
+        include!("../../tests/support/remote_pairing.rs");
+    }
+
+    #[test]
+    fn v6_emergency_headroom_covers_every_durable_binding_exactly() {
+        let per_binding = checked_capacity_add(
+            checked_capacity_add(
+                checked_capacity_add(4, DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES),
+                EMERGENCY_REPLAY_DEBT_METADATA_BYTES,
+            ),
+            checked_capacity_add(4, MAX_NEEDS_BOOTSTRAP_MARKER_RECORD_BYTES),
+        );
+        assert_eq!(V6_EMERGENCY_BINDING_HEADROOM, per_binding);
+        assert_eq!(
+            V6_EMERGENCY_HEADROOM,
+            per_binding
+                .checked_mul(MAX_DURABLE_STREAM_BINDINGS)
+                .expect("bounded aggregate emergency reserve"),
+        );
+        assert_eq!(
+            V6_NORMAL_STATE_PLAINTEXT_LIMIT
+                .checked_add(V6_EMERGENCY_HEADROOM)
+                .expect("normal plus emergency capacity"),
+            MAX_CRYPTO_STATE_PLAINTEXT_LEN,
+        );
+        let exact_max_credit = DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES
+            + EMERGENCY_REPLAY_DEBT_METADATA_BYTES
+            + 4
+            + MAX_NEEDS_BOOTSTRAP_MARKER_RECORD_BYTES;
+        assert_eq!(
+            V6_EMERGENCY_BINDING_HEADROOM - exact_max_credit,
+            4,
+            "唯一额外保守量是已有 stream collection field 的 4-byte framing",
+        );
+    }
+
+    #[test]
+    fn exact_credit_never_lends_unused_marker_headroom_to_normal_base() {
+        let normal_limit = 1_000;
+        let actual_short_marker_credit = 80;
+        let base_usage = v6_base_plaintext_usage(
+            normal_limit + actual_short_marker_credit + 1,
+            actual_short_marker_credit,
+        )
+        .unwrap();
+        assert!(matches!(
+            LiveTransferCandidateCapacity {
+                plaintext_limit: normal_limit,
+            }
+            .validate_normal(base_usage),
+            Err(PairedPromotionError::StateCapacity)
+        ));
+
+        let debt_credit =
+            DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES;
+        let with_marker = v6_base_plaintext_usage(
+            normal_limit + debt_credit + actual_short_marker_credit,
+            debt_credit + actual_short_marker_credit,
+        )
+        .unwrap();
+        let after_marker_cleanup =
+            v6_base_plaintext_usage(normal_limit + debt_credit, debt_credit).unwrap();
+        assert_eq!(with_marker, normal_limit);
+        assert_eq!(after_marker_cleanup, normal_limit);
+        LiveTransferCandidateCapacity {
+            plaintext_limit: normal_limit,
+        }
+        .validate_normal(after_marker_cleanup)
+        .expect("marker cleanup 后保留的 replay debt 仍以 exact credit 合法持久化");
+    }
 
     fn reservation(id: u8, start: u64) -> CommandCounterReservation {
         CommandCounterReservation {
@@ -9266,6 +11291,1165 @@ mod counter_reservation_tests {
 
     impl TryCryptoRng for CountingRng {}
 
+    fn v6_state_with_transfer_records(records: Vec<Vec<u8>>) -> PairedCryptoState {
+        let bootstrap = PairedCryptoStateV1 {
+            installation_id: Uuid::from_bytes([0x01; 16]),
+            invite_hpke_pubkey: [0x02; 32],
+            wss_url: "wss://relay.example.test".to_owned(),
+            current_spki_pin: [0x03; 32],
+            next_spki_pin: [0x04; 32],
+            machine_display_name: "transfer-sharing-fixture".to_owned(),
+            relay_server_id: RelayServerId::from_bytes([0x05; 16]),
+            machine_root_pubkey: [0x06; 32],
+            machine_root_fingerprint: [0x07; 32],
+            machine_route: MachineRouteId::from_bytes([0x08; 16]),
+            device_route: DeviceRouteId::from_bytes([0x09; 16]),
+            grant_serial: GrantSerial::new(1),
+            trust_epoch: TrustEpoch::new(1),
+            invite_hash: [0x0a; 32],
+            request_hash: [0x0b; 32],
+            grant_hash: [0x0c; 32],
+            response_hash: [0x0d; 32],
+            promotion_id: [0x0e; 32],
+            directory_revision: KeyDirectoryRevision::new(1),
+            canonical_response: vec![0x0f],
+            data_sign_certificate: vec![0x10],
+            device_authorization: vec![0x11],
+            key_directory: vec![0x12],
+            receipt_carrier: vec![0x13],
+        };
+        let initial_state_commitment = sha256(&bootstrap.encode().unwrap());
+        PairedCryptoState::V6(PairedCryptoStateV2 {
+            initial_state_commitment,
+            initial_guard_commitment: [0x14; 32],
+            bootstrap,
+            receipt_terminal: None,
+            counter_reservation: None,
+            replay_windows: Vec::new(),
+            stream_cursors: Vec::new(),
+            durable_key_sync_state: None,
+            durable_key_generation_state: None,
+            durable_transfer_records: SharedTransferRecords::from_owned(records),
+        })
+    }
+
+    fn marker_identity_for_state(
+        state: &PairedCryptoState,
+    ) -> (PairedCommitMarkerV1, PairedMachineIdentity) {
+        let bootstrap = state.bootstrap();
+        let (initial_state_commitment, initial_guard_commitment) = match state {
+            PairedCryptoState::V2(value)
+            | PairedCryptoState::V3(value)
+            | PairedCryptoState::V4(value)
+            | PairedCryptoState::V5(value)
+            | PairedCryptoState::V6(value) => (
+                value.initial_state_commitment,
+                value.initial_guard_commitment,
+            ),
+            PairedCryptoState::V1(_) => panic!("mutable-state fixture required"),
+        };
+        (
+            PairedCommitMarkerV1::new(
+                bootstrap.installation_id,
+                bootstrap,
+                bootstrap.promotion_id,
+                initial_state_commitment,
+                [0x91; 32],
+                initial_guard_commitment,
+                [0x92; 32],
+                [0x93; 32],
+            ),
+            PairedMachineIdentity {
+                machine_root_fingerprint: MachineRootFingerprint::from_bytes(
+                    bootstrap.machine_root_fingerprint,
+                ),
+                machine_route: bootstrap.machine_route,
+            },
+        )
+    }
+
+    fn indexed_transfer_stream_binding(index: u64) -> StreamBindingV1 {
+        let mut route = [0x61; 16];
+        route[8..].copy_from_slice(&index.to_be_bytes());
+        let mut generation = [0x62; 16];
+        generation[8..].copy_from_slice(&index.to_be_bytes());
+        StreamBindingV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            machine_route: MachineRouteId::from_bytes([0x08; 16]),
+            device_route: DeviceRouteId::from_bytes([0x09; 16]),
+            grant_serial: GrantSerial::new(1),
+            root_trust_epoch: TrustEpoch::new(1),
+            stream_route: StreamRouteId::from_bytes(route),
+            stream_generation: StreamGenerationId::from_bytes(generation),
+            stream_cursor: StreamCursor::BeforeFirst,
+            inner_cursor: RuntimeInnerCursor::Conversation {
+                conversation_id: ConversationId::new(format!(
+                    "11111111-1111-4111-8111-{index:012x}"
+                )),
+                cursor: StreamCursor::BeforeFirst,
+            },
+            key_directory_revision: KeyDirectoryRevision::new(1),
+            key_id: KeyId {
+                purpose: KeyPurpose::ConversationDek,
+                epoch: 1,
+            },
+        }
+    }
+
+    fn indexed_bootstrap_marker_record(index: u64) -> Vec<u8> {
+        let binding = indexed_transfer_stream_binding(index);
+        DurableLiveTransferStateV1::empty()
+            .abort_exact_binding(
+                &binding,
+                None,
+                DurableTransferBootstrapError::PayloadRejected,
+                index + 1,
+            )
+            .expect("construct canonical indexed bootstrap marker")
+            .record_bytes()[0]
+            .clone()
+    }
+
+    fn recovery_state_store(
+        temp: &tempfile::TempDir,
+        state: &PairedCryptoState,
+    ) -> FileCryptoStateStore {
+        let bootstrap = state.bootstrap();
+        FileCryptoStateStore::new_in(
+            &fs::canonicalize(temp.path())
+                .expect("canonicalize recovery tempdir")
+                .join("remote-state"),
+            CryptoStateIdentity::new(
+                bootstrap.installation_id,
+                MachineRootFingerprint::from_bytes(bootstrap.machine_root_fingerprint),
+                bootstrap.machine_route,
+            ),
+            DeviceStorageKek::new([0xa1; 32]),
+        )
+        .expect("construct recovery CryptoState store")
+    }
+
+    fn recovery_counter_account(state: &PairedCryptoState) -> RemoteKeyAccount {
+        let bootstrap = state.bootstrap();
+        RemoteKeyAccount::paired(
+            bootstrap.installation_id,
+            MachineRootFingerprint::from_bytes(bootstrap.machine_root_fingerprint),
+            bootstrap.machine_route,
+            PairedRemoteKeyPurpose::CounterGuard,
+        )
+    }
+
+    struct FailOnceAfterPreparedUnlink {
+        fired: AtomicBool,
+    }
+
+    impl PreparedStageCleanupObserver for FailOnceAfterPreparedUnlink {
+        fn after_unlink_before_parent_sync(&self) -> Result<(), CryptoStateError> {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                return Err(CryptoStateError::Io {
+                    operation: "injected prepared cleanup parent sync",
+                    source: io::Error::other("injected parent fsync failure"),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn prepared_cleanup_failure_retains_token_for_same_handle_retry() {
+        let state = v6_state_with_transfer_records(Vec::new());
+        let state_bytes = state.encode().expect("encode cleanup retry state");
+        let temp = tempfile::tempdir().expect("prepared cleanup retry tempdir");
+        let state_store = recovery_state_store(&temp, &state);
+        let initial_snapshot = CryptoStateSnapshot::new(state_bytes);
+        state_store
+            .commit_initial(&initial_snapshot)
+            .expect("commit cleanup retry state");
+        let next_snapshot = CryptoStateSnapshot::new(b"prepared cleanup retry next".to_vec());
+        let prepared = state_store
+            .prepare_stage(
+                &initial_snapshot,
+                [0xb1; 32],
+                [0xb2; 16],
+                V6StateCapacityMode::Normal,
+                &next_snapshot,
+            )
+            .expect("commit cleanup retry stage");
+
+        let stage_path = state_store.prepared_stage_path().to_path_buf();
+        let injected_missing_path = stage_path.with_extension("injected-missing");
+        fs::rename(&stage_path, &injected_missing_path)
+            .expect("inject prepared cleanup readback failure");
+
+        let (marker, _) = marker_identity_for_state(&state);
+        let binding = CounterBindingV1 {
+            key_epoch: 1,
+            nonce_prefix: [0xb3; 4],
+        };
+        let mut counter_guard = CounterGuardState::V1(CounterGuardV1::from_binding(
+            marker.directory_revision,
+            binding,
+        ));
+        let mut counter_guard_bytes = RemoteSecret::new(counter_guard.encode());
+        let mut state_snapshot = Arc::new(initial_snapshot);
+        let mut state = state;
+        let mut prepared_stage = Some(prepared);
+        let key_store = MemoryRemoteKeyStore::new();
+        let counter_account = recovery_counter_account(&state);
+        let mut recovery = MutablePendingRecovery {
+            state_store: &state_store,
+            key_store: &key_store,
+            counter_account: &counter_account,
+            counter_guard_bytes: &mut counter_guard_bytes,
+            counter_guard: &mut counter_guard,
+            state_snapshot: &mut state_snapshot,
+            state: &mut state,
+            prepared_stage: &mut prepared_stage,
+            marker: &marker,
+            mutation_observer: None,
+            runtime_state_mutation_authority: RuntimeStateMutationAuthority::Production,
+            live_transfer_candidate_capacity: LiveTransferCandidateCapacity::PRODUCTION,
+        };
+
+        let error = recovery
+            .clear_authenticated_prepared_stage()
+            .expect_err("missing exact stage must fail cleanup");
+        assert!(matches!(
+            error,
+            PairedPromotionError::CryptoState(CryptoStateError::Missing)
+        ));
+        assert!(
+            recovery.prepared_stage.is_some(),
+            "failed cleanup must retain the authenticated expected token"
+        );
+
+        fs::rename(&injected_missing_path, &stage_path)
+            .expect("restore exact prepared stage for same-handle retry");
+        recovery
+            .clear_authenticated_prepared_stage()
+            .expect("same handle retries exact prepared cleanup");
+        assert!(recovery.prepared_stage.is_none());
+        assert!(!stage_path.exists());
+    }
+
+    #[test]
+    fn prepared_cleanup_retries_parent_sync_after_owned_unlink_without_accepting_plain_missing() {
+        let state = v6_state_with_transfer_records(Vec::new());
+        let state_bytes = state.encode().expect("encode post-unlink cleanup state");
+        let temp = tempfile::tempdir().expect("post-unlink cleanup tempdir");
+        let state_store = recovery_state_store(&temp, &state)
+            .with_prepared_cleanup_observer_for_test(Arc::new(FailOnceAfterPreparedUnlink {
+                fired: AtomicBool::new(false),
+            }));
+        let initial_snapshot = CryptoStateSnapshot::new(state_bytes.clone());
+        state_store
+            .commit_initial(&initial_snapshot)
+            .expect("commit post-unlink cleanup state");
+        let next_snapshot = CryptoStateSnapshot::new(b"post-unlink cleanup next".to_vec());
+        let prepared = state_store
+            .prepare_stage(
+                &initial_snapshot,
+                [0xc1; 32],
+                [0xc2; 16],
+                V6StateCapacityMode::Normal,
+                &next_snapshot,
+            )
+            .expect("commit post-unlink prepared stage");
+        let stage_path = state_store.prepared_stage_path().to_path_buf();
+
+        let (marker, _) = marker_identity_for_state(&state);
+        let binding = CounterBindingV1 {
+            key_epoch: 1,
+            nonce_prefix: [0xc3; 4],
+        };
+        let mut counter_guard = CounterGuardState::V1(CounterGuardV1::from_binding(
+            marker.directory_revision,
+            binding,
+        ));
+        let mut counter_guard_bytes = RemoteSecret::new(counter_guard.encode());
+        let mut state_snapshot = Arc::new(initial_snapshot);
+        let mut state = state;
+        let mut prepared_stage = Some(prepared);
+        let key_store = MemoryRemoteKeyStore::new();
+        let counter_account = recovery_counter_account(&state);
+        let mut recovery = MutablePendingRecovery {
+            state_store: &state_store,
+            key_store: &key_store,
+            counter_account: &counter_account,
+            counter_guard_bytes: &mut counter_guard_bytes,
+            counter_guard: &mut counter_guard,
+            state_snapshot: &mut state_snapshot,
+            state: &mut state,
+            prepared_stage: &mut prepared_stage,
+            marker: &marker,
+            mutation_observer: None,
+            runtime_state_mutation_authority: RuntimeStateMutationAuthority::Production,
+            live_transfer_candidate_capacity: LiveTransferCandidateCapacity::PRODUCTION,
+        };
+
+        let first = recovery
+            .clear_authenticated_prepared_stage()
+            .expect_err("first cleanup must fail after owned unlink");
+        assert!(matches!(
+            first,
+            PairedPromotionError::CryptoState(CryptoStateError::Io { .. })
+        ));
+        assert!(!stage_path.exists(), "fault cut must be after unlink");
+        assert!(
+            recovery.prepared_stage.is_some(),
+            "authenticated token must survive"
+        );
+
+        recovery
+            .clear_authenticated_prepared_stage()
+            .expect("same handle must re-fsync authenticated absence");
+        assert!(recovery.prepared_stage.is_none());
+
+        let plain_missing = PreparedCryptoStateStage::authenticated_for_test(
+            [0xd1; 16],
+            [0xd2; 32],
+            V6StateCapacityMode::Normal,
+            &state_bytes,
+            b"unowned missing stage".to_vec(),
+            [0xd3; 32],
+        );
+        assert!(matches!(
+            state_store.clear_prepared_stage_exact(&plain_missing),
+            Err(CryptoStateError::Missing)
+        ));
+    }
+
+    fn paired_keychain_commitments(
+        store: &MemoryRemoteKeyStore,
+        accounts: &PairedAccounts,
+    ) -> Vec<[u8; 32]> {
+        [
+            &accounts.device_sign,
+            &accounts.device_hpke,
+            &accounts.grant,
+            &accounts.kek,
+            &accounts.counter_guard,
+            &accounts.marker,
+        ]
+        .into_iter()
+        .map(|account| {
+            let value = store
+                .load(account)
+                .expect("load paired Keychain fixture")
+                .expect("paired Keychain fixture exists");
+            sha256(value.expose_secret())
+        })
+        .collect()
+    }
+
+    #[test]
+    fn resealed_prepared_stage_conflicts_in_list_and_open_without_writes() {
+        use real_pairing_fixture::{INSTALLATION_ID, PairingFixture};
+
+        // 该 unit fixture 必须直接构造 production-authority store，才能验证 public
+        // list/open audit；用显式 test-only 别名避免 production capability sentinel 把
+        // `#[cfg(test)]` 内部调用误判成 recovery gateway bypass。
+        type TestOnlyRawStore<'a> = PairedMachineStore<'a>;
+
+        let temp = tempfile::tempdir().expect("resealed stage tempdir");
+        let state_root = fs::canonicalize(temp.path())
+            .expect("canonicalize resealed stage tempdir")
+            .join("remote-state");
+        let key_store = MemoryRemoteKeyStore::new();
+        let fixture = PairingFixture::new();
+        fixture.promote(&key_store, &state_root, 0x41);
+        let identity = fixture.identity();
+
+        let paired = TestOnlyRawStore::new(&key_store, INSTALLATION_ID, &state_root);
+        let mut opened = paired
+            .open_exact(identity)
+            .expect("open real promoted machine");
+        let replacement =
+            OpaqueRuntimeState::from_automatic_probe(AutomaticRuntimeStateProbe::new(0x42));
+        let next_state = opened
+            .audited
+            .state
+            .with_opaque_runtime_state(
+                opened.audited.marker.state_plaintext_hash,
+                opened.audited.marker.counter_guard_hash,
+                &replacement,
+            )
+            .expect("construct valid runtime-only next state");
+        let next_snapshot = CryptoStateSnapshot::new(
+            next_state
+                .encode()
+                .expect("encode valid runtime-only next state"),
+        );
+        let (reserved_high_water, binding, initial_guard_commitment) =
+            match opened.audited.counter_guard {
+                CounterGuardState::V1(guard) => (
+                    guard.reserved_high_water,
+                    guard.binding,
+                    opened.audited.marker.counter_guard_hash,
+                ),
+                CounterGuardState::V2(_) => panic!("fresh promotion must start with V1 guard"),
+            };
+        let mutation_id = [0x43; 16];
+        let previous_guard_hash = sha256(opened.audited.counter_guard_bytes.expose_secret());
+        let prepared = opened
+            .audited
+            .state_store
+            .prepare_stage(
+                opened.audited.state_snapshot.as_ref(),
+                previous_guard_hash,
+                mutation_id,
+                V6StateCapacityMode::Normal,
+                &next_snapshot,
+            )
+            .expect("persist authentic prepared stage");
+        let original_stage_commitment = prepared.sealed_commitment();
+        let pending = CounterGuardV2::state_pending(
+            initial_guard_commitment,
+            opened.audited.bootstrap_directory_revision,
+            binding,
+            reserved_high_water,
+            prepared.mutation_id(),
+            prepared.previous_guard_hash(),
+            prepared.previous_state_hash(),
+            prepared.next_state_hash(),
+            original_stage_commitment,
+        )
+        .expect("construct authentic StatePending guard");
+        opened.audited.prepared_stage = Some(prepared);
+        opened
+            .replace_counter_guard(CounterGuardState::V2(pending))
+            .expect("persist authentic StatePending guard");
+
+        let state_path = opened.audited.state_store.state_path().to_path_buf();
+        let stage_path = opened
+            .audited
+            .state_store
+            .prepared_stage_path()
+            .to_path_buf();
+        let original_sealed = fs::read(&stage_path).expect("read original sealed stage");
+        assert_eq!(sha256(&original_sealed), original_stage_commitment);
+        let resealed = opened
+            .audited
+            .state_store
+            .reseal_prepared_stage_for_test(
+                opened
+                    .audited
+                    .prepared_stage
+                    .as_ref()
+                    .expect("retain authentic stage token"),
+            )
+            .expect("reseal identical authenticated prepared plaintext");
+        assert_ne!(
+            resealed, original_sealed,
+            "fresh nonce must change sealed bytes"
+        );
+        assert_ne!(
+            sha256(&resealed),
+            original_stage_commitment,
+            "guard commitment must remain bound to the original sealed bytes",
+        );
+        fs::write(&stage_path, &resealed).expect("replace sidecar with valid reseal");
+
+        let loaded_reseal = opened
+            .audited
+            .state_store
+            .load_prepared_stage()
+            .expect("authenticate resealed sidecar")
+            .expect("resealed sidecar exists");
+        let expected_stage = opened
+            .audited
+            .prepared_stage
+            .as_ref()
+            .expect("retain original authenticated stage token");
+        assert_eq!(loaded_reseal.mutation_id(), expected_stage.mutation_id());
+        assert_eq!(
+            loaded_reseal.previous_guard_hash(),
+            expected_stage.previous_guard_hash(),
+        );
+        assert_eq!(
+            loaded_reseal.previous_state_hash(),
+            expected_stage.previous_state_hash(),
+        );
+        assert_eq!(
+            loaded_reseal.next_state_hash(),
+            expected_stage.next_state_hash()
+        );
+        assert_eq!(
+            loaded_reseal.capacity_mode(),
+            expected_stage.capacity_mode()
+        );
+        assert_eq!(
+            loaded_reseal.snapshot().expose_secret(),
+            expected_stage.snapshot().expose_secret(),
+        );
+        assert_eq!(loaded_reseal.sealed_commitment(), sha256(&resealed));
+        assert_ne!(loaded_reseal.sealed_commitment(), original_stage_commitment,);
+        drop(loaded_reseal);
+
+        let accounts = PairedAccounts::new(
+            INSTALLATION_ID,
+            identity.machine_root_fingerprint,
+            identity.machine_route,
+        );
+        let keychain_before = paired_keychain_commitments(&key_store, &accounts);
+        let active_before = fs::read(&state_path).expect("read active state before audit");
+        let sidecar_before = fs::read(&stage_path).expect("read resealed sidecar before audit");
+        assert_eq!(sidecar_before, resealed);
+        drop(opened);
+        drop(paired);
+
+        let reader = TestOnlyRawStore::new(&key_store, INSTALLATION_ID, &state_root);
+        assert!(matches!(reader.list(), Err(PairedPromotionError::Conflict)));
+        assert!(matches!(
+            reader.open_exact(identity),
+            Err(PairedPromotionError::Conflict)
+        ));
+
+        assert_eq!(
+            paired_keychain_commitments(&key_store, &accounts),
+            keychain_before,
+            "read-only public audits must not rewrite any paired Keychain record",
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("read active state after rejected audits"),
+            active_before,
+        );
+        assert_eq!(
+            fs::read(&stage_path).expect("read sidecar after rejected audits"),
+            sidecar_before,
+        );
+    }
+
+    fn assert_emergency_state_pending_recovery_cut(
+        previous: &PairedCryptoState,
+        previous_bytes: &[u8],
+        next_bytes: &[u8],
+        active_next: bool,
+    ) {
+        let temp = tempfile::tempdir().expect("state-pending recovery tempdir");
+        let state_store = recovery_state_store(&temp, previous);
+        let previous_snapshot = CryptoStateSnapshot::new(previous_bytes.to_vec());
+        let next_snapshot = CryptoStateSnapshot::new(next_bytes.to_vec());
+        state_store
+            .commit_initial(&previous_snapshot)
+            .expect("commit previous recovery state");
+        let mutation_id = [0x81; 16];
+        let previous_guard_hash = [0x82; 32];
+        let prepared = state_store
+            .prepare_stage(
+                &previous_snapshot,
+                previous_guard_hash,
+                mutation_id,
+                V6StateCapacityMode::EmergencyBootstrapMarker,
+                &next_snapshot,
+            )
+            .expect("commit emergency prepared sidecar");
+        let binding = CounterBindingV1 {
+            key_epoch: 1,
+            nonce_prefix: [0x84; 4],
+        };
+        let (marker, _) = marker_identity_for_state(previous);
+        let pending = CounterGuardV2::state_pending(
+            marker.counter_guard_hash,
+            marker.directory_revision,
+            binding,
+            0,
+            prepared.mutation_id(),
+            prepared.previous_guard_hash(),
+            prepared.previous_state_hash(),
+            prepared.next_state_hash(),
+            prepared.sealed_commitment(),
+        )
+        .expect("construct StatePending guard");
+        drop(prepared);
+        if active_next {
+            state_store
+                .compare_and_replace(&previous_snapshot, &next_snapshot)
+                .expect("commit active-next crash cut");
+        }
+        drop(previous_snapshot);
+        drop(next_snapshot);
+
+        let key_store = MemoryRemoteKeyStore::new();
+        let counter_account = recovery_counter_account(previous);
+        let pending_bytes = pending.encode();
+        key_store
+            .persist_immutable(&counter_account, &RemoteSecret::new(pending_bytes.clone()))
+            .expect("commit StatePending guard");
+        let state_file_before =
+            fs::read(state_store.state_path()).expect("read pre-recovery state");
+
+        // Cold-open the complete mutable tuple, then drive the exact production recovery engine.
+        let loaded_snapshot = state_store
+            .load()
+            .expect("load active crash-cut state")
+            .expect("active crash-cut state exists");
+        let loaded_state = PairedCryptoState::decode(loaded_snapshot.expose_secret())
+            .expect("decode active crash-cut state");
+        let loaded_stage = state_store
+            .load_prepared_stage()
+            .expect("load prepared crash-cut sidecar");
+        let mut state_snapshot = Arc::new(loaded_snapshot);
+        let mut state = loaded_state;
+        let mut prepared_stage = loaded_stage;
+        let mut counter_guard_bytes = key_store
+            .load(&counter_account)
+            .expect("load pending guard")
+            .expect("pending guard exists");
+        let mut counter_guard = CounterGuardState::decode(counter_guard_bytes.expose_secret())
+            .expect("decode pending guard");
+        MutablePendingRecovery {
+            state_store: &state_store,
+            key_store: &key_store,
+            counter_account: &counter_account,
+            counter_guard_bytes: &mut counter_guard_bytes,
+            counter_guard: &mut counter_guard,
+            state_snapshot: &mut state_snapshot,
+            state: &mut state,
+            prepared_stage: &mut prepared_stage,
+            marker: &marker,
+            mutation_observer: None,
+            runtime_state_mutation_authority: RuntimeStateMutationAuthority::Production,
+            live_transfer_candidate_capacity: LiveTransferCandidateCapacity::PRODUCTION,
+        }
+        .recover_state_pending(pending)
+        .expect("recover authenticated emergency StatePending");
+
+        assert_eq!(state_snapshot.expose_secret(), next_bytes);
+        assert_eq!(state.encode().unwrap(), next_bytes);
+        assert!(prepared_stage.is_none());
+        assert!(
+            state_store
+                .load_prepared_stage()
+                .expect("read back cleared prepared sidecar")
+                .is_none()
+        );
+        assert_eq!(
+            state_store
+                .load()
+                .expect("load recovered state")
+                .expect("recovered state exists")
+                .expose_secret(),
+            next_bytes,
+        );
+        assert!(matches!(
+            counter_guard,
+            CounterGuardState::V2(CounterGuardV2 {
+                phase: CounterGuardPhaseV2::StateStable { .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            key_store
+                .load(&counter_account)
+                .expect("read back stable guard")
+                .expect("stable guard exists")
+                .expose_secret(),
+            counter_guard_bytes.expose_secret(),
+        );
+        let state_file_after = fs::read(state_store.state_path()).expect("read recovered state");
+        assert_eq!(
+            state_file_after == state_file_before,
+            active_next,
+            "active-first recovery must not rewrite state; guard-first recovery must CAS next",
+        );
+    }
+
+    fn canonical_catalog_stream_binding() -> Vec<u8> {
+        DurableStreamBindingV1::from_stream_binding(StreamBindingV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            machine_route: MachineRouteId::from_bytes([0x41; 16]),
+            device_route: DeviceRouteId::from_bytes([0x42; 16]),
+            grant_serial: GrantSerial::new(1),
+            root_trust_epoch: TrustEpoch::new(1),
+            stream_route: StreamRouteId::from_bytes([0x43; 16]),
+            stream_generation: StreamGenerationId::from_bytes([0x44; 16]),
+            stream_cursor: StreamCursor::BeforeFirst,
+            inner_cursor: RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::BeforeFirst,
+            },
+            key_directory_revision: KeyDirectoryRevision::new(1),
+            key_id: KeyId {
+                purpose: KeyPurpose::Catalog,
+                epoch: 1,
+            },
+        })
+        .unwrap()
+        .canonical_bytes()
+        .unwrap()
+    }
+
+    fn canonical_bootstrap_key_generation_state() -> Vec<u8> {
+        let revision = KeyDirectoryRevision::new(1);
+        let device_route = DeviceRouteId::from_bytes([0x45; 16]);
+        let slots = [
+            KeyPurpose::Catalog,
+            KeyPurpose::DeviceCommandTx,
+            KeyPurpose::DeviceReplyTx,
+        ]
+        .into_iter()
+        .map(|purpose| {
+            let identity = KeySlotIdentityV1::new(purpose, None).unwrap();
+            let generation = DurableKeyGenerationV1::from_bootstrap_entry(
+                revision,
+                KeyId { purpose, epoch: 1 },
+                None,
+                device_route,
+            )
+            .unwrap();
+            DurableKeySlotV1::new(identity, generation, None, Vec::new()).unwrap()
+        })
+        .collect();
+        DurableKeyGenerationStateV1::new(revision, revision, slots)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap()
+    }
+
+    fn legacy_stream_state(version: u16) -> PairedCryptoState {
+        let PairedCryptoState::V6(mut value) = v6_state_with_transfer_records(Vec::new()) else {
+            unreachable!()
+        };
+        value.stream_cursors = vec![canonical_catalog_stream_binding()];
+        match version {
+            TYPED_RUNTIME_STATE_VERSION => PairedCryptoState::V3(value),
+            KEY_SYNC_STATE_VERSION => PairedCryptoState::V4(value),
+            KEY_GENERATION_STATE_VERSION => {
+                value.durable_key_generation_state =
+                    Some(canonical_bootstrap_key_generation_state());
+                PairedCryptoState::V5(value)
+            }
+            _ => panic!("unsupported legacy test version"),
+        }
+    }
+
+    #[test]
+    fn automatic_probe_uses_only_exchange_and_one_replay_slot() {
+        let probe = AutomaticRuntimeStateProbe::new(0x51);
+        let opaque = OpaqueRuntimeState::from_automatic_probe(probe);
+        opaque.validate().unwrap();
+        assert_eq!(opaque.exchange(), Some(probe.encoded().as_slice()));
+        assert_eq!(opaque.replay_windows(), &[probe.encoded()]);
+        assert!(opaque.stream_cursors().is_empty());
+        assert!(opaque.transfer_records.is_empty());
+        assert_eq!(opaque.automatic_probe().unwrap(), Some(probe));
+    }
+
+    #[test]
+    fn counter_reservation_upgrades_every_legacy_stream_state_to_v6() {
+        for version in [
+            TYPED_RUNTIME_STATE_VERSION,
+            KEY_SYNC_STATE_VERSION,
+            KEY_GENERATION_STATE_VERSION,
+        ] {
+            let legacy = legacy_stream_state(version);
+            let value = match &legacy {
+                PairedCryptoState::V3(value)
+                | PairedCryptoState::V4(value)
+                | PairedCryptoState::V5(value) => value,
+                _ => unreachable!(),
+            };
+            let initial_state_commitment = value.initial_state_commitment;
+            let initial_guard_commitment = value.initial_guard_commitment;
+            let reservation = reservation(0x52, 0);
+
+            let upgraded = legacy
+                .with_counter_reservation(
+                    initial_state_commitment,
+                    initial_guard_commitment,
+                    &reservation,
+                )
+                .unwrap();
+            assert!(matches!(upgraded, PairedCryptoState::V6(_)));
+            let upgraded_bytes = upgraded.encode().unwrap();
+            assert_eq!(
+                u16::from_be_bytes([upgraded_bytes[4], upgraded_bytes[5]]),
+                TRANSFER_STATE_VERSION,
+            );
+            assert!(matches!(
+                PairedCryptoState::decode(&upgraded_bytes).unwrap(),
+                PairedCryptoState::V6(_)
+            ));
+
+            let legacy_frozen = legacy
+                .with_counter_reservation_preserving_version(
+                    initial_state_commitment,
+                    initial_guard_commitment,
+                    &reservation,
+                )
+                .unwrap();
+            assert_eq!(
+                u16::from_be_bytes([
+                    legacy_frozen.encode().unwrap()[4],
+                    legacy_frozen.encode().unwrap()[5],
+                ]),
+                version,
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_counter_preflight_rejects_equivalent_v6_over_cap_before_entropy_or_mutation() {
+        for version in [
+            TYPED_RUNTIME_STATE_VERSION,
+            KEY_SYNC_STATE_VERSION,
+            KEY_GENERATION_STATE_VERSION,
+        ] {
+            let legacy = legacy_stream_state(version);
+            let state_before = legacy.encode().unwrap();
+            let guard_before = [0x71; 64];
+            let value = match &legacy {
+                PairedCryptoState::V3(value)
+                | PairedCryptoState::V4(value)
+                | PairedCryptoState::V5(value) => value,
+                _ => unreachable!(),
+            };
+            let placeholder = reservation(0x72, 0);
+            let candidate = legacy
+                .with_counter_reservation(
+                    value.initial_state_commitment,
+                    value.initial_guard_commitment,
+                    &placeholder,
+                )
+                .unwrap();
+            let records = candidate.shared_durable_transfer_records();
+            let streams = candidate.durable_stream_binding_bytes();
+            let encoded_len = candidate
+                .validate_current_v6_stream_transfer_capacity(streams, records.as_slice())
+                .unwrap();
+            let emergency_credit =
+                v6_exact_emergency_credit_bytes(streams, records.as_slice()).unwrap();
+            let base_usage = v6_base_plaintext_usage(encoded_len, emergency_credit).unwrap();
+            let lowered = LiveTransferCandidateCapacity {
+                plaintext_limit: base_usage - 1,
+            };
+            let rng = CountingRng { fill_calls: 0 };
+
+            assert!(matches!(
+                lowered.validate_normal(base_usage),
+                Err(PairedPromotionError::StateCapacity)
+            ));
+            assert_eq!(rng.fill_calls, 0, "capacity rejection must precede entropy");
+            assert_eq!(legacy.encode().unwrap(), state_before);
+            assert_eq!(guard_before, [0x71; 64]);
+        }
+    }
+
+    #[test]
+    fn counter_pending_active_next_over_normal_recovery_is_zero_write() {
+        let previous = legacy_stream_state(TYPED_RUNTIME_STATE_VERSION);
+        let value = match &previous {
+            PairedCryptoState::V3(value) => value,
+            _ => unreachable!(),
+        };
+        let reservation = reservation(0x73, 0);
+        let next = previous
+            .with_counter_reservation_preserving_version(
+                value.initial_state_commitment,
+                value.initial_guard_commitment,
+                &reservation,
+            )
+            .expect("build frozen legacy active-next candidate");
+        let next_bytes = next.encode().expect("encode frozen legacy candidate");
+        let records = next.shared_durable_transfer_records();
+        let streams = next.durable_stream_binding_bytes();
+        let encoded_len = next
+            .validate_current_v6_stream_transfer_capacity(streams, records.as_slice())
+            .expect("measure equivalent V6 candidate");
+        let emergency_credit =
+            v6_exact_emergency_credit_bytes(streams, records.as_slice()).unwrap();
+        let base_usage = v6_base_plaintext_usage(encoded_len, emergency_credit).unwrap();
+        let lowered = LiveTransferCandidateCapacity {
+            plaintext_limit: base_usage - 1,
+        };
+        let (marker, identity) = marker_identity_for_state(&next);
+        let binding = CounterBindingV1 {
+            key_epoch: 1,
+            nonce_prefix: [0x74; 4],
+        };
+        let guard = CounterGuardV2::pending(
+            marker.counter_guard_hash,
+            marker.directory_revision,
+            binding,
+            0,
+            COUNTER_BLOCK_SIZE,
+            reservation.reservation_id,
+            sha256(&previous.encode().unwrap()),
+            sha256(&next_bytes),
+        )
+        .expect("build active-next pending guard");
+        let guard_bytes = guard.encode();
+
+        assert!(matches!(
+            validate_counter_guard_state(
+                &marker,
+                identity,
+                &CounterGuardState::V2(guard),
+                &guard_bytes,
+                &next,
+                &next_bytes,
+                None,
+                binding,
+                RuntimeStateMutationAuthority::Production,
+                lowered,
+            ),
+            Err(PairedPromotionError::StateCapacity)
+        ));
+
+        let temp = tempfile::tempdir().expect("counter active-next recovery tempdir");
+        let state_store = recovery_state_store(&temp, &next);
+        state_store
+            .commit_initial(&CryptoStateSnapshot::new(next_bytes.clone()))
+            .expect("commit legacy active-next state");
+        let key_store = MemoryRemoteKeyStore::new();
+        let counter_account = recovery_counter_account(&next);
+        key_store
+            .persist_immutable(&counter_account, &RemoteSecret::new(guard_bytes.clone()))
+            .expect("commit CounterPending guard");
+        let state_file_before =
+            fs::read(state_store.state_path()).expect("read active-next state before recovery");
+        let guard_before = key_store
+            .load(&counter_account)
+            .expect("load CounterPending guard before recovery")
+            .expect("CounterPending guard exists");
+
+        let loaded_snapshot = state_store
+            .load()
+            .expect("cold-load legacy active-next state")
+            .expect("legacy active-next state exists");
+        let loaded_state = PairedCryptoState::decode(loaded_snapshot.expose_secret())
+            .expect("decode legacy active-next state");
+        let mut state_snapshot = Arc::new(loaded_snapshot);
+        let mut state = loaded_state;
+        let mut prepared_stage = state_store
+            .load_prepared_stage()
+            .expect("audit absent counter prepared stage");
+        let mut counter_guard_bytes = key_store
+            .load(&counter_account)
+            .expect("cold-load CounterPending guard")
+            .expect("CounterPending guard exists");
+        let mut counter_guard = CounterGuardState::decode(counter_guard_bytes.expose_secret())
+            .expect("decode CounterPending guard");
+        let error = MutablePendingRecovery {
+            state_store: &state_store,
+            key_store: &key_store,
+            counter_account: &counter_account,
+            counter_guard_bytes: &mut counter_guard_bytes,
+            counter_guard: &mut counter_guard,
+            state_snapshot: &mut state_snapshot,
+            state: &mut state,
+            prepared_stage: &mut prepared_stage,
+            marker: &marker,
+            mutation_observer: None,
+            runtime_state_mutation_authority: RuntimeStateMutationAuthority::Production,
+            live_transfer_candidate_capacity: lowered,
+        }
+        .recover_counter_pending(guard)
+        .expect_err("over-normal active-next must not finalize Stable");
+
+        assert!(matches!(error, PairedPromotionError::StateCapacity));
+        assert_eq!(state_snapshot.expose_secret(), next_bytes);
+        assert_eq!(state.encode().unwrap(), next_bytes);
+        assert!(prepared_stage.is_none());
+        assert!(matches!(
+            counter_guard,
+            CounterGuardState::V2(CounterGuardV2 {
+                phase: CounterGuardPhaseV2::Pending { .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            fs::read(state_store.state_path()).expect("read state after rejected recovery"),
+            state_file_before,
+        );
+        assert_eq!(
+            key_store
+                .load(&counter_account)
+                .expect("read guard after rejected recovery")
+                .expect("pending guard remains")
+                .expose_secret(),
+            guard_before.expose_secret(),
+        );
+    }
+
+    #[test]
+    fn state_pending_emergency_mode_recovers_4095_to_4096_marker_at_both_crash_cuts() {
+        let records = (0..MAX_DURABLE_STREAM_BINDINGS as u64)
+            .map(indexed_bootstrap_marker_record)
+            .collect::<Vec<_>>();
+        let stream_cursors = encode_stream_bindings(
+            (0..MAX_DURABLE_STREAM_BINDINGS as u64)
+                .map(indexed_transfer_stream_binding)
+                .map(DurableStreamBindingV1::from_stream_binding)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("construct 4096 durable stream bindings"),
+        )
+        .expect("encode 4096 durable stream bindings");
+        let mut previous =
+            v6_state_with_transfer_records(records[..MAX_DURABLE_STREAM_BINDINGS - 1].to_vec());
+        let mut next = v6_state_with_transfer_records(records);
+        let PairedCryptoState::V6(previous_value) = &mut previous else {
+            unreachable!()
+        };
+        previous_value.stream_cursors = stream_cursors.clone();
+        let PairedCryptoState::V6(next_value) = &mut next else {
+            unreachable!()
+        };
+        next_value.stream_cursors = stream_cursors;
+        let previous_bytes = previous
+            .encode()
+            .expect("encode 4095-marker previous state");
+        let next_bytes = next.encode().expect("encode 4096-marker emergency state");
+        assert_emergency_state_pending_recovery_cut(&previous, &previous_bytes, &next_bytes, false);
+        assert_emergency_state_pending_recovery_cut(&previous, &previous_bytes, &next_bytes, true);
+
+        let (marker, identity) = marker_identity_for_state(&previous);
+        let mutation_id = [0x81; 16];
+        let previous_guard_hash = [0x82; 32];
+        let stage_commitment = [0x83; 32];
+        let forged_normal_stage = PreparedCryptoStateStage::authenticated_for_test(
+            mutation_id,
+            previous_guard_hash,
+            V6StateCapacityMode::Normal,
+            &previous_bytes,
+            next_bytes.clone(),
+            stage_commitment,
+        );
+        assert!(matches!(
+            validate_state_pending_stage(
+                &marker,
+                identity,
+                &previous,
+                &previous_bytes,
+                0,
+                mutation_id,
+                previous_guard_hash,
+                sha256(&previous_bytes),
+                sha256(&next_bytes),
+                stage_commitment,
+                Some(&forged_normal_stage),
+                RuntimeStateMutationAuthority::Production,
+                LiveTransferCandidateCapacity::PRODUCTION,
+            ),
+            Err(PairedPromotionError::StateCapacity)
+        ));
+    }
+
+    fn v6_shared_transfer_records(state: &PairedCryptoState) -> &SharedTransferRecords {
+        let PairedCryptoState::V6(value) = state else {
+            panic!("test fixture must remain V6")
+        };
+        &value.durable_transfer_records
+    }
+
+    #[test]
+    fn v6_transfer_records_share_only_on_preserving_paths_and_keep_exact_bytes() {
+        let owned_records = vec![vec![0x21, 0x22], vec![0x31, 0x32, 0x33]];
+        let state = v6_state_with_transfer_records(owned_records.clone());
+        let opaque = state.opaque_runtime_state();
+        assert!(
+            v6_shared_transfer_records(&state).shares_allocation_with(&opaque.transfer_records),
+            "state→opaque preserving projection must clone only the Arc"
+        );
+
+        let PairedCryptoState::V6(current) = &state else {
+            unreachable!()
+        };
+        let preserved = state
+            .with_mutable_projection(
+                current.initial_state_commitment,
+                current.initial_guard_commitment,
+                &opaque,
+                None,
+                None,
+                None,
+                TRANSFER_STATE_VERSION,
+                true,
+                true,
+                false,
+            )
+            .unwrap();
+        assert!(
+            v6_shared_transfer_records(&state)
+                .shares_allocation_with(v6_shared_transfer_records(&preserved)),
+            "preserving mutation must retain the exact shared allocation"
+        );
+        let shared_projection = state
+            .with_shared_stream_transfer_projection(
+                Vec::new(),
+                v6_shared_transfer_records(&state).clone(),
+            )
+            .unwrap();
+        assert!(
+            v6_shared_transfer_records(&state)
+                .shares_allocation_with(v6_shared_transfer_records(&shared_projection)),
+            "binding/ACK preserving projection must retain the exact shared allocation"
+        );
+
+        let replacement = state
+            .with_shared_stream_transfer_projection(
+                Vec::new(),
+                SharedTransferRecords::from_owned(owned_records.clone()),
+            )
+            .unwrap();
+        assert!(
+            !v6_shared_transfer_records(&state)
+                .shares_allocation_with(v6_shared_transfer_records(&replacement)),
+            "owned replacement must establish a distinct immutable allocation"
+        );
+        assert!(
+            v6_shared_transfer_records(&state) == v6_shared_transfer_records(&replacement),
+            "business equality remains exact record bytes, not Arc identity"
+        );
+
+        let original_bytes = state.encode_transfer_prevalidated().unwrap();
+        assert_eq!(
+            preserved.encode_transfer_prevalidated().unwrap(),
+            original_bytes,
+            "Arc-preserving projection must not alter canonical V6 bytes"
+        );
+        assert_eq!(
+            replacement.encode_transfer_prevalidated().unwrap(),
+            original_bytes,
+            "equal owned replacement records must retain canonical V6 bytes"
+        );
+        let mut exact_transfer_suffix = Vec::new();
+        exact_transfer_suffix.extend_from_slice(&2_u16.to_be_bytes());
+        exact_transfer_suffix.extend_from_slice(&2_u32.to_be_bytes());
+        exact_transfer_suffix.extend_from_slice(&[0x21, 0x22]);
+        exact_transfer_suffix.extend_from_slice(&3_u32.to_be_bytes());
+        exact_transfer_suffix.extend_from_slice(&[0x31, 0x32, 0x33]);
+        assert!(original_bytes.ends_with(&exact_transfer_suffix));
+    }
+
+    #[test]
+    fn canonical_v6_decode_uses_a_fresh_owner_without_changing_full_state_bytes() {
+        let state = v6_state_with_transfer_records(Vec::new());
+        let canonical = state.encode_transfer_prevalidated().unwrap();
+        let current_snapshot = CryptoStateSnapshot::new(canonical.clone());
+        assert!(
+            decode_changed_state_snapshot(
+                &current_snapshot,
+                CryptoStateSnapshot::new(canonical.clone()),
+            )
+            .unwrap()
+            .is_none(),
+            "exact-equal refresh must reuse the audited state and shared record owner"
+        );
+        let decoded = PairedCryptoState::decode(&canonical).unwrap();
+
+        assert!(
+            !v6_shared_transfer_records(&state)
+                .shares_allocation_with(v6_shared_transfer_records(&decoded)),
+            "decode must establish a fresh owned transfer collection"
+        );
+        assert_eq!(decoded.encode().unwrap(), canonical);
+    }
+
     #[test]
     fn last_counter_block_succeeds_then_epoch_exhaustion_precedes_entropy() {
         let maximum_aligned_high_water = u64::MAX - (u64::MAX % COUNTER_BLOCK_SIZE);
@@ -9305,6 +12489,7 @@ mod counter_reservation_tests {
                 MAX_STATE_FIELD_LEN,
                 replay_lengths.iter().copied(),
                 [],
+                [],
             )
             .unwrap(),
             MAX_CRYPTO_STATE_PLAINTEXT_LEN
@@ -9316,9 +12501,60 @@ mod counter_reservation_tests {
                 MAX_STATE_FIELD_LEN,
                 replay_lengths.iter().copied(),
                 [],
+                [],
             )
             .unwrap_err()
             .code(),
+            "remote.pairing.paired_invalid"
+        );
+    }
+
+    #[test]
+    fn v6_transfer_lengths_share_the_full_128_mib_state_cap_without_allocating_payloads() {
+        let bootstrap_len = 1_024;
+        let suffix_len = 4 + 4 + 2; // empty ADKS + empty ADKG + transfer count
+        let mut transfer_lengths = vec![MAX_STATE_FIELD_LEN; 15];
+        let used = MUTABLE_STATE_FIXED_ENCODED_LEN
+            + bootstrap_len
+            + transfer_lengths.len() * (4 + MAX_STATE_FIELD_LEN)
+            + suffix_len;
+        let exact_tail = MAX_CRYPTO_STATE_PLAINTEXT_LEN - used - 4;
+        assert!(exact_tail <= MAX_STATE_FIELD_LEN);
+        transfer_lengths.push(exact_tail);
+
+        let base = checked_mutable_state_encoded_len(
+            bootstrap_len,
+            0,
+            [],
+            [],
+            transfer_lengths.iter().copied(),
+        )
+        .unwrap();
+        assert_eq!(
+            checked_v6_suffix_encoded_len(base, 0, 0, transfer_lengths.len()).unwrap(),
+            MAX_CRYPTO_STATE_PLAINTEXT_LEN
+        );
+
+        *transfer_lengths.last_mut().unwrap() += 1;
+        let one_over_base = checked_mutable_state_encoded_len(
+            bootstrap_len,
+            0,
+            [],
+            [],
+            transfer_lengths.iter().copied(),
+        )
+        .unwrap();
+        assert_eq!(
+            checked_v6_suffix_encoded_len(one_over_base, 0, 0, transfer_lengths.len())
+                .unwrap_err()
+                .code(),
+            "remote.pairing.paired_invalid"
+        );
+        assert!(checked_v6_suffix_encoded_len(0, 0, 0, MAX_DURABLE_TRANSFER_RECORDS).is_ok());
+        assert_eq!(
+            checked_v6_suffix_encoded_len(0, 0, 0, MAX_DURABLE_TRANSFER_RECORDS + 1)
+                .unwrap_err()
+                .code(),
             "remote.pairing.paired_invalid"
         );
     }

@@ -509,10 +509,9 @@ fn local_input_error(code: &'static str, message: String) -> CliError {
 pub enum RemoteOpArg {
     Synthetic { bundle: PathBuf },
     LegacyV1,
-    PersistentUnsupported,
 }
 
-pub async fn run(arg: RemoteOpArg, profile: &str, data_dir: Option<&str>) -> ExitCode {
+pub async fn run(arg: RemoteOpArg) -> ExitCode {
     match arg {
         RemoteOpArg::Synthetic { bundle } => match v2_synthetic::run(&bundle).await {
             Ok(report) => match serde_json::to_string(&report) {
@@ -525,50 +524,12 @@ pub async fn run(arg: RemoteOpArg, profile: &str, data_dir: Option<&str>) -> Exi
             Err(error) => fail(error.code()),
         },
         RemoteOpArg::LegacyV1 => fail("remote.v1.reset_required"),
-        RemoteOpArg::PersistentUnsupported => match legacy_marker_state(data_dir, profile) {
-            LegacyMarkerState::Present | LegacyMarkerState::Unknown => {
-                fail("remote.v1.reset_required")
-            }
-            LegacyMarkerState::Absent => fail("remote.persistent.unsupported"),
-        },
     }
 }
 
 fn fail(code: &str) -> ExitCode {
     eprintln!("{code}");
     ExitCode::FAILURE
-}
-
-/// 只探测旧凭据文件是否存在；不打开、不解析、不删除，也不读取其中任何 bearer。
-fn legacy_marker_path(data_dir: Option<&str>, profile: &str) -> PathBuf {
-    let base = data_dir.map_or_else(default_data_dir, PathBuf::from);
-    base.join("relay")
-        .join(format!("{profile}.credentials.json"))
-}
-
-enum LegacyMarkerState {
-    Present,
-    Absent,
-    Unknown,
-}
-
-fn legacy_marker_state(data_dir: Option<&str>, profile: &str) -> LegacyMarkerState {
-    match std::fs::symlink_metadata(legacy_marker_path(data_dir, profile)) {
-        Ok(_) => LegacyMarkerState::Present,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => LegacyMarkerState::Absent,
-        Err(_) => LegacyMarkerState::Unknown,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn default_data_dir() -> PathBuf {
-    Path::new(&std::env::var_os("HOME").unwrap_or_default())
-        .join("Library/Application Support/AgentDeck")
-}
-
-#[cfg(not(target_os = "macos"))]
-fn default_data_dir() -> PathBuf {
-    Path::new(&std::env::var_os("HOME").unwrap_or_default()).join(".local/share/agentdeck")
 }
 
 #[cfg(test)]
@@ -612,22 +573,6 @@ mod tests {
             Some(MachineRemoteFailureCode::new(code).expect("stable failure code")),
         )
         .expect("valid blocked status")
-    }
-
-    #[test]
-    fn legacy_marker_is_profile_scoped_without_reading_contents() {
-        assert_eq!(
-            legacy_marker_path(Some("/tmp/agentdeck-test"), "dev"),
-            PathBuf::from("/tmp/agentdeck-test/relay/dev.credentials.json")
-        );
-    }
-
-    #[test]
-    fn legacy_marker_metadata_error_fails_closed() {
-        assert!(matches!(
-            legacy_marker_state(Some("/tmp/agentdeck-test"), "invalid\0profile"),
-            LegacyMarkerState::Unknown
-        ));
     }
 
     #[test]

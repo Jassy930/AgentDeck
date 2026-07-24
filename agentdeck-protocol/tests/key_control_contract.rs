@@ -207,11 +207,11 @@ fn key_update_canonical_tbs_sign_and_verify_bind_every_axis() {
     let canonical = update.canonical_bytes().unwrap();
     assert_eq!(
         hex_sha256(&encoded),
-        "35fee2ea060104d4292645859b13b1572602baca6891e2d9690fcb0331a28b3f"
+        "d5761ae3eb1db1b54f36029afc187d9f01b81178e25e044fad25f2ed2416896d"
     );
     assert_eq!(
         hex_sha256(&canonical),
-        "503764742a10f118ef08ccf85b2015f800279f8c1ade4febba75c646fb6d140d"
+        "5a4bfd52401cf8e695463a1aa2f751ab9b5c854068a7abf6119b747a52015485"
     );
     assert_eq!(
         KeyUpdateV1::from_canonical_bytes(&canonical).unwrap(),
@@ -531,7 +531,7 @@ fn key_sync_and_authenticated_ack_dtos_are_bounded_and_canonical() {
     let request_bytes = request.canonical_bytes().unwrap();
     assert_eq!(
         hex_sha256(&request_bytes),
-        "e797a13e50ef2c1802184349703da7fc00a6cb626ced5131ca4d01ea9e737fc9"
+        "0d3b1f1c1d5fd440b48befb9958e6039acaed4b9e5e1f61cc0c4af07a981b11f"
     );
     assert_eq!(
         KeySyncRequestV1::from_canonical_bytes(&request_bytes).unwrap(),
@@ -569,7 +569,7 @@ fn key_sync_and_authenticated_ack_dtos_are_bounded_and_canonical() {
     let update_ack_bytes = update_ack.canonical_bytes().unwrap();
     assert_eq!(
         hex_sha256(&update_ack_bytes),
-        "af7408747c658d05e98464ac76e10d05aaf2731d0a56118a6974b3df8702d633"
+        "aed03444b424c9512418a0917ca4ecf9d70fe6d1136aad6dcac5ba4cd07aaae5"
     );
     assert_eq!(
         KeyUpdateAckV1::from_canonical_bytes(&update_ack_bytes).unwrap(),
@@ -599,7 +599,7 @@ fn key_sync_and_authenticated_ack_dtos_are_bounded_and_canonical() {
     let applied_bytes = applied_ack.canonical_bytes().unwrap();
     assert_eq!(
         hex_sha256(&applied_bytes),
-        "676f0b49f1350b7329745d83d047079389abc77df6c0659f3478fea545e5e33d"
+        "f63c4c8ff611bf07ac140a50d7fac4734179bf8d321340aba1d9de20d20ec36b"
     );
     assert_eq!(
         StreamAppliedAckV1::from_canonical_bytes(&applied_bytes).unwrap(),
@@ -632,9 +632,9 @@ fn key_sync_and_authenticated_ack_dtos_are_bounded_and_canonical() {
             .map(|bytes| hex_sha256(bytes))
             .collect::<Vec<_>>(),
         vec![
-            "5a3e6faff2caf359f5ee9785c9f44d8b26af13569f513fa4b4edcfaf7145637b",
-            "6f6fa6db367692363017a4acf2d484c227d39c89bcfc8bdc7d34c7cb62585e0d",
-            "96b785eadd5320167bd1914d50c5fc5efa210c452f9ea58788a35827865b319b",
+            "389ab57550d739c035e0b2a8e8cb5347d2a44ac16b32943a9f9990255d895909",
+            "347574262c9997eaffa837649e87799ab99f5f7829ea528cfdd4a42c5cf0ce90",
+            "85328c1f49c0f33afc973ffbc0fbfe9b07cc9c89c107b0eec6d07603676d13cc",
         ]
     );
     let kind_offset = b"AgentDeck/KeyControlRequestV1\0".len();

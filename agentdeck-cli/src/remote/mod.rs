@@ -38,3 +38,7 @@ pub mod signature;
 #[cfg(unix)]
 pub mod stream_state;
 pub mod transfer_state;
+#[cfg(unix)]
+pub mod watch;
+#[cfg(all(test, unix))]
+mod watch_tests;

@@ -8,8 +8,9 @@ control-only RemoteTransport、两条 trust reset 与安全 uninstall purge；P4
 `55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成 Runtime v4、schema v10、本机确认 pairing、DeviceGrant/
 DeviceAuthorization/KeyDirectory、auth ledger 与 revoke；P4.4 `cd7d9fb` 接通业务 ingress/Core，P4.5
 `c6ef387`、`88b3c42` 又完成 signed publication/counter recovery，并把 current physical schema 推进到
-v14/35 表。持久远程 CLI 和 iOS 真实链路仍属于后续 Task。因此本页不是“公网 Companion 已上线”
-或 production-signed LaunchAgent/Keychain 已 PASS 的证明。
+v14/35 表。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；
+P4 按 Task 进度为 6/7，P4.7、P4 Phase Exit 与 iOS 真实链路仍未完成。因此本页不是“公网 Companion 已上线”或
+production-signed LaunchAgent/Keychain 已 PASS 的证明。
 
 ## 部署不变量
 
@@ -84,7 +85,7 @@ InstallGrant、register/publish/subscribe replay、Send/Reply、signed revoke �
 
 ## 让 stable daemon 持久登记本机
 
-P4.2/P4.3 的本机管理只走 same-UID canonical Runtime v4 UDS，不创建第二个 admin socket。bundle 必须是
+P4.2/P4.3 的本机管理只走 same-UID canonical current Runtime v5 UDS，不创建第二个 admin socket。bundle 必须是
 current-UID、single-link、no-follow regular file，group/other 权限为零且不超过 64 KiB；推荐保持 `0600`：
 
 ```bash
@@ -99,10 +100,91 @@ enroll 在发送 code、MachineRoot 或 Link/Data public material 前完成 CA/h
 business ingress lane。完全相同的 bundle 可用于 exact retry；不同 code/origin/pin/Relay/receipt
 anchor/expiry 会在网络前 conflict。
 
-P4.3 已提供下节 `remote pairing ...` 与 exact `remote revoke` 本机管理面；P4.6 尚未完成的持久
-`remote pair/machines/sessions/watch/send/...` 仍返回 `remote.persistent.unsupported`。automatic gate 使用
-injected dev/ephemeral keystore 与 hermetic namespace；真实 production 命令仍要求 provisioned、release-signed
-daemon/CLI 与正确 entitlement，当前槽位保持 post-MVP BLOCKED，不能由 automatic PASS 代替。
+P4.3 已提供下节 `remote pairing ...` 与 exact `remote revoke` 本机管理面；P4.6 已接入
+`remote pair|machines|conversations|watch|prompt|approve|retry-approval|revoke-self`；旧
+`sessions/send/deny/ping` 命令面已删除。P4.6 automatic Task 已完成，计为 P4 的第 6/7 项。
+automatic gate 使用 injected dev/ephemeral keystore 与 hermetic namespace；真实 production 命令仍要求
+provisioned、release-signed daemon/CLI 与正确 entitlement，当前槽位保持 post-MVP BLOCKED，不能由
+automatic PASS 代替。
+
+## Persistent CLI 配对、查询与 watch
+
+PairInvite bearer 不得放入 argv。使用 current-UID、exact-0600、no-follow regular file，或重定向的
+non-interactive stdin；同时人工核对带外 MachineRoot fingerprint：
+
+```bash
+agentdeck remote pair \
+  --invite-file /secure/path/pair-invite.txt \
+  --confirm-root-fingerprint <root-fingerprint>
+agentdeck remote machines
+```
+
+`machines` 只读本机 PairedMachineStore，不拨 Relay。其余命令必须同时使用 canonical padded STANDARD
+base64 的 32-byte root fingerprint 与 16-byte machine route，不能用 display name、device route 或 URL
+回退选择：
+
+```bash
+agentdeck remote conversations \
+  --machine-root-fingerprint <standard-base64-32> \
+  --machine-route <standard-base64-16>
+
+agentdeck remote watch \
+  --machine-root-fingerprint <standard-base64-32> \
+  --machine-route <standard-base64-16> \
+  --conversation-id <conversation-id>
+```
+
+prompt、approval 与 self-revoke 使用同一 exact machine selector；前两者只有取得 authenticated daemon
+receipt 才能成功退出，`RouteAccepted` 不能替代 receipt：
+
+```bash
+agentdeck remote prompt \
+  --machine-root-fingerprint <standard-base64-32> \
+  --machine-route <standard-base64-16> \
+  --conversation-id <conversation-id> \
+  --text "continue safely" \
+  --idempotency-key <stable-key> \
+  --expected-configuration-revision <revision>
+
+agentdeck remote approve \
+  --machine-root-fingerprint <standard-base64-32> \
+  --machine-route <standard-base64-16> \
+  --conversation-id <conversation-id> \
+  --turn-id <turn-id> \
+  --approval-id <approval-id> \
+  --decision approve \
+  --request-id <stable-request-id>
+
+agentdeck remote retry-approval \
+  --machine-root-fingerprint <standard-base64-32> \
+  --machine-route <standard-base64-16> \
+  --conversation-id <conversation-id> \
+  --approval-id <approval-id>
+
+agentdeck remote revoke-self \
+  --machine-root-fingerprint <standard-base64-32> \
+  --machine-route <standard-base64-16>
+```
+
+`watch` stdout 是逐行 flush 的 canonical NDJSON，阶段只包括
+`bootstrap|synchronized|live|control|terminal`。bootstrap payload 使用 canonical raw JSON；
+synchronized 保留 transport `routeAccepted` 与 requested cursor/subscription/sync-complete，但
+`RouteAccepted` 仍不是业务成功。SIGINT/SIGTERM 会 latch：当前 exact frame 必须先 durable apply 并完成
+ACK terminal；`TransferBootstrapRequired`/subscription control 必须先输出，再输出 terminal
+`status=stopped`。Connected 与 ready signal 同时出现时零 Subscribe、shutdown 后 stopped；verified revoked
+terminal 优先，且只有 transport shutdown/drop 与 crash-safe cleanup 完成后才输出 `status=revoked`。
+EOF 或普通断线固定为 `remote.runtime.outcome_unknown`，不能伪造 stopped/revoked。
+
+P4.6 的 live-stream partial 已写入 paired-state V6 sealed CAS，disconnect/crash/restart 不会重置其
+absolute TTL。Relay 即使在最后一个 part 前永久静默，CLI runtime 也会按 sealed deadline 主动写入 durable
+`remote.transfer.expired` marker，不等待下一帧。128 MiB 是 paired-state plaintext 编码的 logical budget，
+不是 RSS 上限；candidate 超限会持久化 `remote.transfer.reassembly_full`，保留已认证 replay admission，但
+不发送 ACK、不推进 reducer/outer applied/inner cursor，并清空该 binding 的 active/buffered records。不要通过
+扩大容量或重启来绕过 bootstrap。8 MiB lowered-cap 只存在于 `debug_assertions` automatic test build，release
+artifact 不含该入口，也不能由 CLI/env/config 设置。prepared ADST v2 的 Normal/EmergencyBootstrapMarker
+mode 位于 AEAD 认证内容，guard commitment 绑定完整 sealed sidecar；legacy v1 只解释为 Normal。4095→4096
+marker 的 guard-first/active-first crash cut 均可恢复，cleanup 只允许 exact owner unlink+retry，缺失后 reseal
+或 commitment conflict 必须 fail-close。P4.7 与 P4 Phase Exit 尚未完成。
 
 P4.4 完成 ingress/Core dispatch：Relay v2 outer、DeviceSign/AAD/replay/AEAD 和本机 auth-ledger
 exact recheck 全部通过后，才把 `RemotePrincipal` 交给 RuntimeCore。invalid grant/signature/AAD/
@@ -110,8 +192,9 @@ replay 或 local revoke 后的旧 frame 会在 Core 前拒绝；`RouteAccepted` 
 P4.5 已安装 `DirectedReplySealer` / `RemoteStreamPublisher`：顺序固定为 CounterGuard reserve→seal once→
 Runtime DB 冻结 exact blob→Relay Publish COMMIT→local ACK；retry、outcome unknown 与 restart 都只能复用
 同一 frozen blob。离线时 publication park，authenticated reconnect 后再继续；counter/publication/transition
-recovery 未全部通过前 admission 保持关闭。该实现仍未新增可操作的 persistent remote CLI 或 iOS 真链路；
-不得为了调试绕过 admission，也不得把内部 publication PASS 当作远程 E2E。
+recovery 未全部通过前 admission 保持关闭。P4.5 本身当时不含 persistent remote CLI 或 iOS 真链路；
+上节命令面属于 P4.6 automatic Task，不能倒算为 P4.5 证据。不得为了调试绕过 admission，也不得把内部
+publication PASS 当作远程 E2E；iOS 真链路仍未完成。
 
 ## 创建并本机确认 PairInvite
 
@@ -145,8 +228,8 @@ agentdeck remote revoke --device <device-route-id> --grant-serial <serial>
 
 pairing drain 与 retirement 共用唯一 control owner：drain 绝对 deadline 为 10 秒，可被 shutdown 取消；
 失败时保留 durable state并 exact retry。P4.3 本身不提供业务 Runtime dispatch；后续 P4.4 已接入
-严格 ingress/Core；后续 P4.5 已完成 signed publication/counter recovery，但 persistent remote device CLI
-与 iOS 真链路仍未完成，下一项为 P4.6。
+严格 ingress/Core；后续 P4.5 已完成 signed publication/counter recovery。P4.6 persistent remote CLI 已形成
+automatic Task complete，但 P4.7、P4 Phase Exit、production-signed 与 iOS 真链路仍未完成。
 
 ## 本机 inventory 与 readback
 
@@ -249,10 +332,11 @@ DB/main/WAL/SHM、machine Keychain items，最后删除 StorageKEK。每一步�
 并可在 crash 后 exact retry；“DB 已不存在”本身从来不是删除 Keychain 的授权。任一前置失败必须 fail-close，
 不得手工拆开顺序或以 `rm`/`security delete-*` 冒充完成。
 
-## Runtime v4 hard-cutover 开发凭据
+## Runtime v5 hard-cutover 开发凭据
 
 Runtime version 已绑定 MachineRoot TBS。P3.9 的 Runtime v1→v2 与 P4.2 的 v2→v3 hard cutover 证据继续
-保留；P4.3 current contract 为 Runtime v4，不提供 production v3/v4 双栈。旧签名材料不会通过 current verifier：对外只返回
+保留；P4.3 收口时 contract 为 Runtime v4，P4.6 已将 current wire 升至 v5；production 只接受 current v5。
+旧签名材料不会通过 current verifier：对外只返回
 通用 `relay.auth.invalid_grant` / `relay.enrollment.rejected`，不暴露失败字段。这是预期 hard cutover，不是可
 自动迁移的数据。
 
@@ -263,11 +347,11 @@ P4.3 pairing trust realm 使用前，任何曾生成 Runtime v1 签名材料的�
    frame、subscription 全为 0 且只剩 retired tombstone。若 inventory 可信确认 absent（例如从未 enrollment
    或开发 Store 已受控重建），记录 absent 结果；不得为了满足流程伪造 tombstone。
 3. 只有完成 present realm 的 purge/readback，或得到可信 absent 结果后，才删除对应本地开发 trust state。
-4. 生成新的 route/key，使用 current Runtime v4 重新 enroll，再让每台设备重新 pair；禁止恢复旧
+4. 生成新的 route/key，使用 current Runtime v5 重新 enroll，再让每台设备重新 pair；禁止恢复旧
    cert/grant 或自动降级 verifier。
 
 `scripts/reset-relay-v1-dev-state.sh` 只处理早期 Relay v1 DB/bearer credential，不处理 Relay v2 Store 中的
-历史 Runtime TBS 开发凭据。当前本地 trust-reset 必须走上述 Runtime v4 命令与 signed proof；不得手改
+历史 Runtime TBS 开发凭据。当前本地 trust-reset 必须走上述 Runtime v5 命令与 signed proof；不得手改
 SQLite、Keychain 或签名版本来伪造完成。
 
 ## 常见 failure code
@@ -288,6 +372,9 @@ SQLite、Keychain 或签名版本来伪造完成。
 | `daemon.remote.transition.progress_pending` | transition 已有唯一 owner，仍在安全推进或等待可重试 Store 结果 | 保留 frozen transition 与 admission fence；不得另起 owner 或服务 ordinary publication |
 | `daemon.remote.transition.reconnect_pending` | transition 需要 authenticated reconnect 才能继续 | 保留 exact frozen blob；恢复认证链路后由同一 owner 继续，禁止 timer 重封 |
 | `remote.transport.publication_offline` | publication 在 Register/Publish 前确认链路离线 | park exact frozen publication；等待 authenticated reconnect，不生成新 blob/counter |
+| `remote.runtime.outcome_unknown` | persistent command/watch 在 authenticated terminal 前 EOF 或普通断线 | 保留 durable state，从 fresh bootstrap exact retry；不得当作 stopped/revoked 或 daemon receipt |
+| `remote.watch.output_failed` / `remote.watch.signal_failed` | NDJSON write/flush 或 SIGINT/SIGTERM listener 失败 | shutdown 后失败退出；修复 stdout consumer/signal 环境，不手改 cursor、sidecar 或 paired state |
+| terminal `stopped` / `revoked` | stopped 已完成当前 frame/ACK 与 shutdown；revoked 已完成 verified terminal、transport drop 与 crash-safe cleanup | 只接受 canonical terminal NDJSON；若前置顺序缺失，按安全回归处理，不继续使用本地 key |
 | 其他 `daemon.remote.trust_reset.*` / `remote.transport.*` | terminal/proof/binding/transport 不一致或 Relay 正在重启 | 保留 exact frozen state并重试同一输入；禁止生成新 route/cert 或猜测 terminal |
 | `daemon.purge.recovery_required` | durable purge intent/marker 存在但尚未安全完成 | 停止 enroll，按同一 install/helper/plan exact retry `daemon uninstall --purge` |
 | `daemon.purge.*` | marker/plan/helper/attestation、PID/UDS、Keychain/KEK 或删除读回失败 | 不手动续删；保留 marker与残余，按 `docs/AGENT_DIAGNOSTICS.md` 的具体 code 恢复同一 plan |
@@ -300,21 +387,29 @@ signature、receipt、terminal 或 request/response bytes 出现在日志中均�
 ```bash
 bash scripts/verify-relay-companion-mvp.sh p2
 
-# P4.5 Task automatic scope（P4 聚合 verifier 到 P4.7 才建立）
-cargo test -p agentdeckd --locked -- --test-threads=1
-cargo test -p agentdeck-cli --locked
-cargo test -p agentdeck-relay-client --locked
+# P4.6 automatic Task（P4 聚合 verifier 到 P4.7 才建立）
+cargo test -p agentdeck-cli --locked --no-fail-fast -- --test-threads=1
+cargo test -p agentdeck-relay-client --locked -- --test-threads=1
 cargo test -p agentdeck-protocol --locked
-cargo test -p agentdeck-relay --features server,tls --locked
-cargo test -p agentdeck-crypto --locked
-swift test
-cd ios && xcodegen generate && \
-  xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
-    -destination 'platform=iOS Simulator,name=iPhone 17' test
+cargo test --release -p agentdeck-cli --test remote_transfer_memory --locked \
+  production_transfer_peak_is_bounded_across_capacity_completion_and_duplicate -- \
+  --ignored --exact --nocapture --test-threads=1
+cargo clippy -p agentdeck-cli -p agentdeck-protocol --locked --all-targets -- -D warnings
+cargo clippy -p agentdeck-relay-client --locked --all-targets --no-deps -- -D warnings
+cargo fmt --all -- --check
 bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+git diff --check
 ```
 
 P2 聚合门禁包含 workspace Rust 回归、Relay v2 hardening/security E2E、client、Direct TLS selfcheck、
-daemon network-boundary、四份 schema 快照、文档与运行数据 git-status guard。P4.5 使用上面的直接 Task
-矩阵；当前 verifier 不支持 `p4`，不得虚构尚未由 P4.7 建立的 `verify-relay-companion-mvp.sh p4` PASS。R0/R1 命令和
+daemon network-boundary、四份 schema 快照、文档与运行数据 git-status guard。P4.6 使用上面的直接 Task
+矩阵。2026-07-24 冻结 code/test scope 为 29 paths，blob-manifest SHA-256 为
+`32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`；watch `12/12`、
+`remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client
+`25/25` 与 protocol `244/244` 均通过，四 schema、三 crate Clippy、fmt、network/no-net、docs 与 diff
+全绿。`spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。当前 verifier
+不支持 `p4`/`p4-auto`，不得虚构尚未由 P4.7
+建立的 aggregate PASS。R0/R1 命令和
 `--bootstrap-secret` 只属于历史记录，不得用于当前部署或验收。

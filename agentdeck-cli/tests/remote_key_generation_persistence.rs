@@ -253,7 +253,7 @@ fn key_sync_state(fixture: &PairingFixture) -> DurableKeySyncStateV1 {
         .expect("start durable KeySync state")
 }
 
-fn prepare_v4(
+fn prepare_v6_with_empty_adks(
     fixture: &PairingFixture,
     store: &MemoryRemoteKeyStore,
     state_root: &Path,
@@ -266,11 +266,13 @@ fn prepare_v4(
         state_root,
         Arc::new(NoopMutationObserver),
     );
-    let mut opened = paired.open_exact(fixture.identity()).expect("open V1");
+    let mut opened = paired
+        .open_exact(fixture.identity())
+        .expect("open paired state");
     let mut binding_rng = DeterministicRng::new([seed.wrapping_add(3); 32]);
     opened
         .install_stream_binding_for_automatic_harness(catalog_binding(fixture), &mut binding_rng)
-        .expect("migrate to V3");
+        .expect("install the first typed stream binding");
     let key_sync = key_sync_state(fixture);
     let mut install_rng = DeterministicRng::new([seed.wrapping_add(4); 32]);
     opened
@@ -279,7 +281,7 @@ fn prepare_v4(
             Some(&key_sync),
             &mut install_rng,
         )
-        .expect("migrate to V4");
+        .expect("install ADKS in current V6");
     let mut clear_rng = DeterministicRng::new([seed.wrapping_add(5); 32]);
     opened
         .commit_key_sync_state_transition_for_automatic_harness(
@@ -287,7 +289,7 @@ fn prepare_v4(
             None,
             &mut clear_rng,
         )
-        .expect("leave a V4 state with empty ADKS");
+        .expect("leave current V6 with empty ADKS");
     drop(opened);
     assert_eq!(
         u16::from_be_bytes(
@@ -295,7 +297,7 @@ fn prepare_v4(
                 .try_into()
                 .unwrap()
         ),
-        4
+        6
     );
     recipient
 }
@@ -482,12 +484,12 @@ fn counter_guard_revision(store: &dyn RemoteKeyStore, fixture: &PairingFixture) 
 }
 
 #[test]
-fn v4_empty_adks_generation_only_commit_reopens_v5_with_split_revisions() {
+fn v6_empty_adks_generation_only_commit_reopens_v6_with_split_revisions() {
     let fixture = PairingFixture::new();
     let store = MemoryRemoteKeyStore::new();
     let temp = tempfile::tempdir().expect("key-generation migration root");
     let state_root = fs::canonicalize(temp.path()).unwrap().join("paired-state");
-    let recipient = prepare_v4(&fixture, &store, &state_root, 0x31);
+    let recipient = prepare_v6_with_empty_adks(&fixture, &store, &state_root, 0x31);
     let legacy = paired_state_plaintext(&store, &fixture, &state_root);
     let paired = PairedMachineStore::new_with_mutation_observer(
         &store,
@@ -515,7 +517,7 @@ fn v4_empty_adks_generation_only_commit_reopens_v5_with_split_revisions() {
     assert_eq!(paired_key_bytes(&store, &fixture), production_keys);
     drop(production_opened);
 
-    let mut opened = paired.open_exact(fixture.identity()).expect("open V4");
+    let mut opened = paired.open_exact(fixture.identity()).expect("open V6");
     let wrong_directed = generation_state(&fixture, &recipient, InventoryFault::DirectedRaw);
     let files_before_reject = file_tree_bytes(&state_root);
     let keys_before_reject = paired_key_bytes(&store, &fixture);
@@ -540,7 +542,7 @@ fn v4_empty_adks_generation_only_commit_reopens_v5_with_split_revisions() {
                 &replacement,
                 &mut rng,
             )
-            .expect("commit first V5 inventory"),
+            .expect("commit first V6 inventory"),
         replacement
     );
     let retry_files = file_tree_bytes(&state_root);
@@ -560,21 +562,52 @@ fn v4_empty_adks_generation_only_commit_reopens_v5_with_split_revisions() {
     drop(opened);
 
     let upgraded = paired_state_plaintext(&store, &fixture, &state_root);
-    assert_eq!(u16::from_be_bytes(upgraded[4..6].try_into().unwrap()), 5);
+    assert_eq!(u16::from_be_bytes(upgraded[4..6].try_into().unwrap()), 6);
+    let legacy_key_generation_offset = legacy
+        .len()
+        .checked_sub(6)
+        .expect("V6 has key-generation length and transfer count suffix");
     assert_eq!(
-        &upgraded[ADPS_HEADER_LEN..legacy.len()],
-        &legacy[ADPS_HEADER_LEN..]
+        &upgraded[ADPS_HEADER_LEN..legacy_key_generation_offset],
+        &legacy[ADPS_HEADER_LEN..legacy_key_generation_offset]
     );
     let canonical = replacement.canonical_bytes().unwrap();
     assert_eq!(
-        u32::from_be_bytes(upgraded[legacy.len()..legacy.len() + 4].try_into().unwrap()) as usize,
+        u32::from_be_bytes(
+            upgraded[legacy_key_generation_offset..legacy_key_generation_offset + 4]
+                .try_into()
+                .unwrap()
+        ) as usize,
         canonical.len()
     );
-    assert_eq!(&upgraded[legacy.len() + 4..], canonical);
+    let canonical_start = legacy_key_generation_offset + 4;
+    let canonical_end = canonical_start + canonical.len();
+    assert_eq!(&upgraded[canonical_start..canonical_end], canonical);
+    assert_eq!(
+        &upgraded[canonical_end..],
+        &[0, 0],
+        "V6 transfer collection remains empty"
+    );
 
     let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &state_root)
         .open_exact(fixture.identity())
-        .expect("reopen V5");
+        .expect("reopen V6");
+    let files_before_transfer_read = file_tree_bytes(&state_root);
+    let keys_before_transfer_read = paired_key_bytes(&store, &fixture);
+    assert!(
+        reopened
+            .durable_transfer_state()
+            .expect("V6 keeps an empty transfer collection")
+            .canonical_record_bytes()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(file_tree_bytes(&state_root), files_before_transfer_read);
+    assert_eq!(
+        paired_key_bytes(&store, &fixture),
+        keys_before_transfer_read,
+        "V6 transfer readback must not rewrite"
+    );
     assert_eq!(
         reopened.directory_revision().value(),
         KEY_DIRECTORY_REVISION + 1
@@ -624,12 +657,11 @@ fn v4_empty_adks_generation_only_commit_reopens_v5_with_split_revisions() {
 }
 
 #[test]
-fn empty_and_tampered_v5_carriers_fail_close_without_audit_writes() {
+fn tampered_v6_key_generation_carriers_fail_close_without_audit_writes() {
     for (index, fault) in [
-        None,
-        Some(InventoryFault::BadBootstrap),
-        Some(InventoryFault::BadSignature),
-        Some(InventoryFault::WrongHpke),
+        InventoryFault::BadBootstrap,
+        InventoryFault::BadSignature,
+        InventoryFault::WrongHpke,
     ]
     .into_iter()
     .enumerate()
@@ -640,17 +672,15 @@ fn empty_and_tampered_v5_carriers_fail_close_without_audit_writes() {
         let state_root = fs::canonicalize(temp.path())
             .unwrap()
             .join(format!("paired-state-{index}"));
-        let recipient = prepare_v4(
+        let recipient = prepare_v6_with_empty_adks(
             &fixture,
             &store,
             &state_root,
             0x71 + u8::try_from(index).unwrap() * 7,
         );
-        let raw = fault.map_or_else(Vec::new, |fault| {
-            generation_state(&fixture, &recipient, fault)
-                .canonical_bytes()
-                .unwrap()
-        });
+        let raw = generation_state(&fixture, &recipient, fault)
+            .canonical_bytes()
+            .unwrap();
         let automatic = PairedMachineStore::new_with_mutation_observer(
             &store,
             INSTALLATION_ID,
@@ -663,7 +693,7 @@ fn empty_and_tampered_v5_carriers_fail_close_without_audit_writes() {
         let mut rng = DeterministicRng::new([0x91 + index as u8; 32]);
         opened
             .replace_unchecked_key_generation_state_for_automatic_harness(raw, &mut rng)
-            .expect("persist unchecked V5 field");
+            .expect("persist unchecked V6 key-generation field");
         drop(opened);
 
         let files_before = file_tree_bytes(&state_root);

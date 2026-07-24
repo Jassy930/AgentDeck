@@ -11,7 +11,7 @@ use main_types::{AgentKindArg, ApprovalArg, EffortArg, PermissionArg, SandboxArg
 use output::{CliError, render};
 use std::ffi::OsStr;
 use std::future::Future;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
@@ -714,6 +714,34 @@ async fn run_non_remote(cli: &Cli) -> Result<(), CliError> {
                 );
                 return Ok(());
             }
+            if let RemoteOp::Watch {
+                selector,
+                conversation_id,
+            } = op
+            {
+                validate_persistent_remote_runtime_id(
+                    conversation_id,
+                    "remote watch --conversation-id",
+                )?;
+                let selector = selector.parse()?;
+                let composition =
+                    agentdeck_cli::remote::production::PersistentRemoteComposition::production()
+                        .map_err(persistent_remote_composition_cli_error)?;
+                let mut rng = production_remote_mutation_rng()?;
+                let stdout = std::io::stdout();
+                let mut stdout = stdout.lock();
+                agentdeck_cli::remote::watch::watch_persistent_remote_conversation(
+                    &composition,
+                    selector,
+                    ConversationId::new(conversation_id.clone()),
+                    &mut rng,
+                    persistent_remote_watch_signal(),
+                    |record| write_persistent_remote_watch_record(&mut stdout, &record),
+                )
+                .await
+                .map_err(persistent_remote_watch_cli_error)?;
+                return Ok(());
+            }
             if let Some((operation, selector, mutation)) = persistent_remote_mutation_plan(op)? {
                 let composition =
                     agentdeck_cli::remote::production::PersistentRemoteComposition::production()
@@ -960,6 +988,7 @@ fn stage_upgrade_request(
     Ok(RuntimeRequest::StageUpgrade(request))
 }
 
+#[cfg(any(debug_assertions, test))]
 fn parse_sha256_hex(value: &str) -> Result<[u8; 32], CliError> {
     ArtifactSha256::new(value.to_owned()).map_err(|error| {
         CliError::Usage(format!("installed daemon hash is not canonical: {error}"))
@@ -1095,6 +1124,46 @@ fn persistent_remote_conversations_cli_error(
         | PersistentRemoteConversationsError::Connect(PairedRuntimeConnectError::Runtime(_))
         | PersistentRemoteConversationsError::HandshakeRevoked
         | PersistentRemoteConversationsError::Runtime(_) => CliError::Session { code, message },
+    }
+}
+
+fn persistent_remote_watch_cli_error(
+    error: agentdeck_cli::remote::watch::PersistentRemoteWatchError,
+) -> CliError {
+    use agentdeck_cli::remote::relay_transport::PairedRuntimeConnectError;
+    use agentdeck_cli::remote::runtime::RemoteRuntimeError;
+    use agentdeck_cli::remote::watch::PersistentRemoteWatchError;
+
+    let code = Some(error.code().to_owned());
+    let message = error.to_string();
+    match error {
+        PersistentRemoteWatchError::Connect(PairedRuntimeConnectError::Relay(_))
+        | PersistentRemoteWatchError::Connect(PairedRuntimeConnectError::Runtime(
+            RemoteRuntimeError::Transport(_) | RemoteRuntimeError::OutcomeUnknown,
+        ))
+        | PersistentRemoteWatchError::Runtime(
+            RemoteRuntimeError::Transport(_) | RemoteRuntimeError::OutcomeUnknown,
+        )
+        | PersistentRemoteWatchError::Output(_) => CliError::Transport { code, message },
+        PersistentRemoteWatchError::Connect(PairedRuntimeConnectError::Runtime(
+            RemoteRuntimeError::RelayCodec(_)
+            | RemoteRuntimeError::Json(_)
+            | RemoteRuntimeError::InvalidReply(_)
+            | RemoteRuntimeError::TransferCarrier(_)
+            | RemoteRuntimeError::Transfer(_),
+        ))
+        | PersistentRemoteWatchError::Runtime(
+            RemoteRuntimeError::RelayCodec(_)
+            | RemoteRuntimeError::Json(_)
+            | RemoteRuntimeError::InvalidReply(_)
+            | RemoteRuntimeError::TransferCarrier(_)
+            | RemoteRuntimeError::Transfer(_),
+        ) => CliError::Protocol { code, message },
+        PersistentRemoteWatchError::Paired(_)
+        | PersistentRemoteWatchError::Connect(PairedRuntimeConnectError::Paired(_))
+        | PersistentRemoteWatchError::Connect(PairedRuntimeConnectError::Runtime(_))
+        | PersistentRemoteWatchError::Runtime(_)
+        | PersistentRemoteWatchError::Signal(_) => CliError::Session { code, message },
     }
 }
 
@@ -1326,6 +1395,159 @@ fn persistent_remote_conversations_output(
             "conversations": outcome.conversations(),
         },
     })
+}
+
+async fn persistent_remote_watch_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        signal = terminate.recv() => signal
+            .map(|_| ())
+            .ok_or_else(|| std::io::Error::other("SIGTERM listener closed")),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PersistentRemoteWatchPayloadOutput<'a, Payload>
+where
+    Payload: serde::Serialize + ?Sized,
+{
+    operation: &'static str,
+    phase: &'static str,
+    kind: &'static str,
+    payload: &'a Payload,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistentRemoteWatchTransportOutput {
+    route_accepted: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistentRemoteWatchSynchronizedResult<'a> {
+    requested_cursor: &'a agentdeck_protocol::runtime::RuntimeInnerCursor,
+    subscription: &'a agentdeck_protocol::runtime::SubscriptionReceipt,
+    sync_complete: &'a agentdeck_protocol::runtime::RuntimeSyncComplete,
+}
+
+#[derive(serde::Serialize)]
+struct PersistentRemoteWatchSynchronizedOutput<'a> {
+    operation: &'static str,
+    phase: &'static str,
+    transport: PersistentRemoteWatchTransportOutput,
+    result: PersistentRemoteWatchSynchronizedResult<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct PersistentRemoteWatchControlOutput<'a> {
+    operation: &'static str,
+    phase: &'static str,
+    control: &'a agentdeck_cli::remote::watch::PersistentRemoteWatchControl,
+}
+
+#[derive(serde::Serialize)]
+struct PersistentRemoteWatchTerminalOutput {
+    operation: &'static str,
+    phase: &'static str,
+    status: &'static str,
+}
+
+fn write_persistent_remote_watch_payload<W, Payload>(
+    writer: &mut W,
+    phase: &'static str,
+    kind: &'static str,
+    payload: &Payload,
+) -> std::io::Result<()>
+where
+    W: Write,
+    Payload: serde::Serialize + ?Sized,
+{
+    serde_json::to_writer(
+        writer,
+        &PersistentRemoteWatchPayloadOutput {
+            operation: "remote.watch",
+            phase,
+            kind,
+            payload,
+        },
+    )
+    .map_err(std::io::Error::other)
+}
+
+fn write_persistent_remote_watch_record<W: Write>(
+    writer: &mut W,
+    record: &agentdeck_cli::remote::watch::PersistentRemoteWatchRecord,
+) -> std::io::Result<()> {
+    use agentdeck_cli::remote::watch::PersistentRemoteWatchRecord;
+
+    match record {
+        PersistentRemoteWatchRecord::BootstrapSnapshot { snapshot } => {
+            write_persistent_remote_watch_payload(
+                &mut *writer,
+                "bootstrap",
+                "conversationSnapshot",
+                snapshot,
+            )?;
+        }
+        PersistentRemoteWatchRecord::BootstrapBackfill { chunk } => {
+            write_persistent_remote_watch_payload(&mut *writer, "bootstrap", "backfill", chunk)?;
+        }
+        PersistentRemoteWatchRecord::Synchronized {
+            requested_cursor,
+            route_accepted,
+            subscription,
+            sync_complete,
+        } => serde_json::to_writer(
+            &mut *writer,
+            &PersistentRemoteWatchSynchronizedOutput {
+                operation: "remote.watch",
+                phase: "synchronized",
+                transport: PersistentRemoteWatchTransportOutput {
+                    route_accepted: *route_accepted,
+                },
+                result: PersistentRemoteWatchSynchronizedResult {
+                    requested_cursor,
+                    subscription,
+                    sync_complete,
+                },
+            },
+        )
+        .map_err(std::io::Error::other)?,
+        PersistentRemoteWatchRecord::Event { event } => {
+            write_persistent_remote_watch_payload(&mut *writer, "live", "event", event)?;
+        }
+        PersistentRemoteWatchRecord::Control { control } => serde_json::to_writer(
+            &mut *writer,
+            &PersistentRemoteWatchControlOutput {
+                operation: "remote.watch",
+                phase: "control",
+                control,
+            },
+        )
+        .map_err(std::io::Error::other)?,
+        PersistentRemoteWatchRecord::Stopped => serde_json::to_writer(
+            &mut *writer,
+            &PersistentRemoteWatchTerminalOutput {
+                operation: "remote.watch",
+                phase: "terminal",
+                status: "stopped",
+            },
+        )
+        .map_err(std::io::Error::other)?,
+        PersistentRemoteWatchRecord::Revoked => serde_json::to_writer(
+            &mut *writer,
+            &PersistentRemoteWatchTerminalOutput {
+                operation: "remote.watch",
+                phase: "terminal",
+                status: "revoked",
+            },
+        )
+        .map_err(std::io::Error::other)?,
+    }
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 async fn run_persistent_remote_pair(
@@ -1566,7 +1788,7 @@ fn remote_pre_dispatch(op: &RemoteOp) -> Result<Option<remote_cli::RemoteOpArg>,
         }
         RemoteOp::Watch { selector, .. } => {
             let _selector = selector.parse()?;
-            Some(remote_cli::RemoteOpArg::PersistentUnsupported)
+            None
         }
         RemoteOp::Prompt { selector, .. }
         | RemoteOp::Approve { selector, .. }
@@ -1615,11 +1837,7 @@ async fn main() {
             }
         };
         if let Some(arg) = arg {
-            if matches!(&arg, remote_cli::RemoteOpArg::PersistentUnsupported) {
-                eprintln!("remote.persistent.unsupported");
-                std::process::exit(1);
-            }
-            let code = remote_cli::run(arg, &cli.profile, cli.data_dir.as_deref()).await;
+            let code = remote_cli::run(arg).await;
             if code == std::process::ExitCode::SUCCESS {
                 return;
             }
@@ -2306,7 +2524,7 @@ mod persistent_remote_command_cli_tests {
     }
 
     #[test]
-    fn invalid_selector_is_rejected_without_echo_and_only_watch_stays_unsupported() {
+    fn invalid_selector_is_rejected_without_echo_and_watch_enters_production_dispatch() {
         let cli = Cli::try_parse_from([
             "agentdeck",
             "remote",
@@ -2360,10 +2578,12 @@ mod persistent_remote_command_cli_tests {
         let Cmd::Remote { op } = watch.command else {
             panic!("expected remote watch")
         };
-        assert!(matches!(
-            remote_pre_dispatch(&op).expect("valid watch selector"),
-            Some(remote_cli::RemoteOpArg::PersistentUnsupported)
-        ));
+        assert!(
+            remote_pre_dispatch(&op)
+                .expect("valid watch selector")
+                .is_none(),
+            "watch must enter the production persistent composition"
+        );
 
         let prompt = Cli::try_parse_from(
             [
@@ -2607,6 +2827,107 @@ mod persistent_remote_command_cli_tests {
         assert_eq!(output["transport"]["routeAccepted"], false);
         assert!(output.get("receipt").is_some());
         assert!(output.get("routeAccepted").is_none());
+    }
+
+    #[test]
+    fn watch_ndjson_preserves_transport_receipt_terminal_and_raw_payload_bytes() {
+        use agentdeck_protocol::runtime::identity::StreamGeneration;
+        use agentdeck_protocol::runtime::{
+            RuntimeInnerCursor, RuntimeSyncComplete, StreamCursor, SubscriptionReceipt,
+        };
+
+        let requested_cursor = RuntimeInnerCursor::Conversation {
+            conversation_id: ConversationId::new(CONVERSATION_ID),
+            cursor: StreamCursor::BeforeFirst,
+        };
+        let subscription = SubscriptionReceipt::Subscribed {
+            stream_generation: StreamGeneration::new("22222222-2222-2222-2222-222222222222"),
+        };
+        let sync_complete = RuntimeSyncComplete {
+            stream_generation: StreamGeneration::new("22222222-2222-2222-2222-222222222222"),
+            stream_cursor: StreamCursor::At(9),
+            inner_cursor: requested_cursor.clone(),
+            key_directory_revision: 7,
+        };
+        let record = agentdeck_cli::remote::watch::PersistentRemoteWatchRecord::Synchronized {
+            requested_cursor: requested_cursor.clone(),
+            route_accepted: true,
+            subscription: subscription.clone(),
+            sync_complete: sync_complete.clone(),
+        };
+        let mut output = Vec::new();
+        write_persistent_remote_watch_record(&mut output, &record).unwrap();
+        let expected = format!(
+            "{{\"operation\":\"remote.watch\",\"phase\":\"synchronized\",\"transport\":{{\"routeAccepted\":true}},\"result\":{{\"requestedCursor\":{},\"subscription\":{},\"syncComplete\":{}}}}}\n",
+            serde_json::to_string(&requested_cursor).unwrap(),
+            serde_json::to_string(&subscription).unwrap(),
+            serde_json::to_string(&sync_complete).unwrap(),
+        );
+        assert_eq!(output, expected.as_bytes());
+
+        output.clear();
+        write_persistent_remote_watch_record(
+            &mut output,
+            &agentdeck_cli::remote::watch::PersistentRemoteWatchRecord::Revoked,
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            b"{\"operation\":\"remote.watch\",\"phase\":\"terminal\",\"status\":\"revoked\"}\n"
+        );
+
+        let raw = serde_json::value::RawValue::from_string("{\"z\":0, \"a\":1}".to_owned())
+            .expect("valid deliberately non-normalized raw JSON");
+        output.clear();
+        write_persistent_remote_watch_payload(
+            &mut output,
+            "bootstrap",
+            "conversationSnapshot",
+            raw.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            b"{\"operation\":\"remote.watch\",\"phase\":\"bootstrap\",\"kind\":\"conversationSnapshot\",\"payload\":{\"z\":0, \"a\":1}}"
+        );
+    }
+
+    #[test]
+    fn watch_raw_bootstrap_writer_streams_the_near_cap_payload_without_a_value_tree() {
+        #[derive(Default)]
+        struct CountingWriter(usize);
+
+        impl Write for CountingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| std::io::Error::other("watch writer count overflow"))?;
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        const NEAR_CAP_BYTES: usize = 63 * 1024 * 1024;
+        let mut raw = String::with_capacity(NEAR_CAP_BYTES);
+        raw.push('"');
+        raw.extend(std::iter::repeat_n('x', NEAR_CAP_BYTES - 2));
+        raw.push('"');
+        let raw = serde_json::value::RawValue::from_string(raw).expect("near-cap raw JSON string");
+        let mut writer = CountingWriter::default();
+        write_persistent_remote_watch_payload(
+            &mut writer,
+            "bootstrap",
+            "conversationSnapshot",
+            raw.as_ref(),
+        )
+        .expect("stream raw payload");
+
+        let prefix = b"{\"operation\":\"remote.watch\",\"phase\":\"bootstrap\",\"kind\":\"conversationSnapshot\",\"payload\":";
+        assert_eq!(writer.0, prefix.len() + NEAR_CAP_BYTES + 1);
     }
 
     #[test]

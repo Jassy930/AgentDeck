@@ -85,7 +85,7 @@ fn catalog_and_conversation_bindings_round_trip_with_append_only_key_control_tag
     let catalog = catalog_binding();
     assert_eq!(
         hex_sha256(&catalog.canonical_bytes().unwrap()),
-        "1f18c1ea7d6b1ea9a5789907ceda61e9ad08f6650912d18965a05303d3d26616"
+        "34f3e9d9c4e5e415fe8ea3cc9bc26cfce0df0fd9830bddb67cd30772a7f59ddf"
     );
     assert_eq!(
         hex_sha256(
@@ -93,7 +93,7 @@ fn catalog_and_conversation_bindings_round_trip_with_append_only_key_control_tag
                 .canonical_bytes()
                 .unwrap()
         ),
-        "a1daba2be1308f5a41a07d66ca70270345d13cb63dfde28105c9852693ae945d"
+        "0c9e57159872adb26a7c4c40dcb24de54ee666c8f0e7ea1db7546d16acb423cd"
     );
 
     for binding in [catalog_binding(), conversation_binding()] {

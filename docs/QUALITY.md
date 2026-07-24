@@ -1053,7 +1053,8 @@ exit 0。P4.1 machine identity/guard automatic Task 已在 `46c6bb8` 收口；P4
 P4.3 已由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 收口 PairInvite/
 DeviceGrant/auth ledger/revoke/control handoff；P4.4 又由 `cd7d9fb` 收口 MachineLink ingress/
 RuntimeCore dispatch；P4.5 由 `c6ef387`、`88b3c42` 收口 signed publication、key/counter/replay crash
-recovery。P4 当前为 5/7，下一项 P4.6 persistent remote CLI；P5/P6 自动实现仍未完成。
+recovery。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；
+P4 按 Task 进度为 6/7。P4.7、P4 Phase Exit 与 P5/P6 自动实现仍未完成。
 
 ## Relay Companion MVP P3.8-A local Runtime UDS transport primitives 门禁
 
@@ -2023,7 +2024,8 @@ production-signed LaunchAgent/Keychain roundtrip 继续精确输出 post-MVP
 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。该 exact BLOCKED contract 是 verifier 的必过
 自动项；整体 exit 0 只表示契约与 automatic scope 通过，不表示 production signing PASS。P3.1 继续采用
 方案 b，stable production signing 仍未完成。P3 Phase 至此 complete（MVP automatic scope）。P4.1–P4.5
-已按下节 automatic Task gate 收口，P4 当前为 5/7；下一项 P4.6 persistent remote CLI。P4.5 已在
+已按下节 automatic Task gate 收口；P4.6 persistent remote CLI 已完成 automatic Task，
+P4 按 Task 进度为 6/7。P4.5 已在
 P4.4 的唯一 business ingress/Core dispatch 上安装 production directed sealer、shared publisher、
 crash-safe CounterGuard/outbox/replay recovery；这仍只是 P4.5 Task PASS，不是 P4 Phase PASS。
 
@@ -2133,7 +2135,7 @@ production-signed Keychain 槽位继续精确记录 post-MVP
 P4.3 主体 code/test 为 `518380e`；`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f` 收紧 transport/
 pairing 所有权、drain/recovery、trust-reset singleflight、caller cancellation 与 pairing→retirement handoff；
 `fe3a9ad` 修复 Runtime v4 后遗漏的 Rust/Swift 门禁预期；`3b4b977` 收口 cancel-safe join、startup shutdown
-watch、LocalRetry health/admission fence 与 v10 table/ledger/cipher fixture。current Runtime protocol 为 v4，physical schema
+watch、LocalRetry health/admission fence 与 v10 table/ledger/cipher fixture。P4.3 收口时 Runtime protocol 为 v4，physical schema
 为 **v10 / 30 张表**，新增五张 authenticated bounded pairing/authorization/key-directory/control-outbox 表。
 
 内部 production 子片只运行 focused tests + scoped Clippy/fmt；Task 收口复跑以下矩阵：
@@ -2188,7 +2190,7 @@ P0/P1/P2=0、Approved。
 为 1,792 additions，低于 1,800 预拆线；测试、fixture、
 schema snapshot 与文档不计 production 拆片线。P4.3 本身不证明业务 Runtime dispatch、E2EE publication/
 counter reservation、persistent remote CLI、iOS 真实链路或 production-signed PASS；后续 P4.4 已完成
-ingress/Core，P4.5 已完成 signed publication/counter recovery，下一项为 P4.6。
+ingress/Core，P4.5 已完成 signed publication/counter recovery；P4.6 已完成 automatic Task。
 
 ## Relay Companion MVP P4.4 MachineLink ingress / RuntimeCore dispatch Task gate（PASS）
 
@@ -2229,13 +2231,14 @@ scoped Clippy、fmt 与 diff 全绿。正式
 通过边界严格止于 ingress/Core dispatch 与 typed egress seam。RemoteLink 只持有易失
 generation/replay/connection/reply-route，不持 canonical conversation/command/receipt state。P4.4
 收口时 `DirectedReplySealer` / `RemoteStreamPublisher` 尚未安装、production
-`admission_ready=false`；后续 P4.5 已安装这些 production 组合并保持同一所有权边界。persistent
-remote CLI 与 production-signed PASS 仍未完成。当前 verifier 脚本只接受 `p0|p2|p3`；P4 aggregate
+`admission_ready=false`；后续 P4.5 已安装这些 production 组合并保持同一所有权边界。P4.6 persistent
+remote CLI 已完成 automatic Task，production-signed PASS 仍未完成。当前 verifier 脚本只接受
+`p0|p2|p3`；P4 aggregate
 verifier 由 P4.7 建立，P4.4 与后续 P4.5 Task 均不宣称 `p4`/`p4-auto` PASS。
 
 ## Relay Companion MVP P4.5 signed publication / counter recovery Task gate（PASS）
 
-P4.5 code/test 由 `88b3c42` 收口，`c6ef387` 同步清零 Relay 全量 Clippy 告警。Runtime wire 保持
+P4.5 code/test 由 `88b3c42` 收口，`c6ef387` 同步清零 Relay 全量 Clippy 告警。P4.5 收口时 Runtime wire 为
 v4，physical schema 升为 **v14 / 35 张表**；Relay v2 与 E2EE v1 的版本常量均不 bump，E2EE v1
 schema 仅 additive 扩展 key-control/publication contract。production 固定执行
 `Keychain CounterGuard reserve → seal 一次 → Runtime DB 冻结 exact blob/streamSeq/counter/event range
@@ -2252,11 +2255,118 @@ P0/P1/P2=0。
 
 本 Task 只证明 daemon 侧 MachineDataSign、directed/shared sealing、durable publication outbox、Relay
 COMMIT/local ACK、key directory/epoch barrier、counter/replay crash recovery 与恢复期 admission fence。
-P4 当前为 5/7，下一项 P4.6；persistent remote CLI、P4 automatic E2E/P4 Phase Exit 仍未完成。当前
+P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；P4 按
+Task 进度为 6/7，P4 automatic E2E/P4 Phase Exit 仍未完成。当前
 `scripts/verify-relay-companion-mvp.sh` 只支持 `p0|p2|p3`，不得声称 `p4` 或 `p4-auto` PASS。P3.1
 继续采用方案 b；provisioned production-signed Keychain/LaunchAgent 与真实设备/公网证据继续保留为
 post-MVP `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不计 PASS，也不反向否定 P4.5
 automatic Task gate。
+
+## Relay Companion MVP P4.6 persistent remote CLI Task gate（automatic complete）
+
+current Runtime wire 为 v5。当前 Task 已接入 `pair`、`machines`、`conversations`、`watch`、`prompt`、
+`approve`、`retry-approval`、`revoke-self`。`watch` 从 fresh authenticated bootstrap 开始，以 canonical
+NDJSON 公开 `bootstrap|synchronized|live|control|terminal`。SIGINT/SIGTERM 都只在当前 exact frame durable
+apply 与 ACK terminal 后公开 stopped；`TransferBootstrapRequired`+signal 必须 marker→stopped，subscription
+control 也先输出再 latch signal。Connected+ready signal 零 Subscribe、shutdown 后 stopped；verified revoked
+terminal 优先，且握手期/active revoke 均须 transport shutdown/drop→crash-safe cleanup 后才公开 revoked。
+
+paired-state V6 把 binding 与 transfer records 放入同一 sealed CAS。prepared ADST v2 的 Normal/
+EmergencyBootstrapMarker mode 位于 AEAD 认证内容，guard sealed commitment 绑定完整 sidecar；legacy ADST v1
+只解释为 Normal。4095→4096 marker 覆盖 guard-first/active-first crash cut；cleanup 由 exact owner unlink 并可
+retry，缺失后的 reseal/commitment conflict fail-close，legacy over-normal CounterPending active-next 零写拒绝。
+P4.6 冻结门禁至少运行：
+
+```bash
+cargo test -p agentdeck-cli --test remote_transfer_paired_state --locked -- --test-threads=1
+cargo test -p agentdeck-cli --test remote_transfer_persistence --locked -- --test-threads=1
+cargo test -p agentdeck-cli --test remote_stream_state --test remote_transfer_state --locked -- --test-threads=1
+
+# watch 编排、signal latch、terminal 顺序与 fresh reducer
+cargo test -p agentdeck-cli --lib --locked remote::watch_tests -- --nocapture --test-threads=1
+cargo test -p agentdeck-cli --test remote_runtime_receipts --locked \
+  live_ack_phase_signal_is_latched_only_after_durable_apply_and_ack_completion -- \
+  --exact --nocapture --test-threads=1
+cargo test -p agentdeck-cli --test remote_runtime_receipts --locked \
+  active_watch_revocation_cleans_up_only_after_exact_verification_and_transport_shutdown -- \
+  --exact --nocapture --test-threads=1
+cargo test -p agentdeck-relay-client --locked \
+  v2::connection::tests::cancelling_pending_exact_receive_preserves_frames_bytes_and_priority -- \
+  --exact --nocapture --test-threads=1
+
+# prepared ADST v2 mode/commitment 与 production crash-cut recovery
+cargo test -p agentdeck-cli --lib --locked \
+  remote::crypto_state::tests::prepared_stage_capacity_mode_is_authenticated_and_legacy_defaults_fail_closed -- \
+  --exact --nocapture --test-threads=1
+cargo test -p agentdeck-cli --lib --locked \
+  remote::paired_machine::counter_reservation_tests::counter_pending_active_next_over_normal_recovery_is_zero_write -- \
+  --exact --nocapture --test-threads=1
+cargo test -p agentdeck-cli --lib --locked \
+  remote::paired_machine::counter_reservation_tests::state_pending_emergency_mode_recovers_4095_to_4096_marker_at_both_crash_cuts -- \
+  --exact --nocapture --test-threads=1
+
+# cold restart + future durable watermark：250 ms 内 state_invalid，且零发送/零 reducer-cursor
+# mutation/paired-state V6 canonical records byte-exact 零写（完整 receipts target 同样覆盖）
+cargo test -p agentdeck-cli --test remote_runtime_receipts --locked \
+  restarted_live_transfer_clock_rollback_fails_before_wait_or_mutation -- --exact --nocapture
+
+# normal-cap replay 与 marker 同一 CAS；第二个 distinct binding 仍有独立 emergency reserve
+cargo test -p agentdeck-cli --test remote_runtime_receipts --locked \
+  emergency_replay_debt_survives_real_binding_replacement_until_deterministic_pruning_without_cross_binding_loss -- \
+  --exact --nocapture --test-threads=1
+cargo test -p agentdeck-cli --test remote_runtime_receipts --locked \
+  consecutive_distinct_bindings_use_emergency_capacity_without_prior_state_loss -- \
+  --exact --nocapture --test-threads=1
+
+# exact marker 在 replacement 前同时 fence Publish/Gap/ReplayComplete；后两者也必须 paired bytes 零写
+cargo test -p agentdeck-cli --test remote_runtime_receipts --locked \
+  bootstrap_marker_fences_gap_and_replay_complete_without_any_state_progress -- \
+  --exact --nocapture --test-threads=1
+
+# 显式 ignored 的 production-path release allocator 门禁；常规 cargo test 不会运行
+cargo test --release -p agentdeck-cli --test remote_transfer_memory --locked \
+  production_transfer_peak_is_bounded_across_capacity_completion_and_duplicate -- \
+  --ignored --exact --nocapture --test-threads=1
+
+# 完整 Task 与静态/协议边界
+cargo test -p agentdeck-cli --locked --no-fail-fast -- --test-threads=1
+cargo test -p agentdeck-relay-client --locked
+cargo test -p agentdeck-protocol --locked -- --test-threads=1
+cargo run -q -p agentdeck-cli --locked -- protocol schema \
+  | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+cargo run -q -p agentdeck-cli --locked -- protocol runtime-schema \
+  | diff - protocol/agentdeck/runtime-protocol.schema.json
+cargo run -q -p agentdeck-cli --locked -- protocol relay-schema \
+  | diff - protocol/agentdeck/relay-v2.schema.json
+cargo run -q -p agentdeck-cli --locked -- protocol e2ee-schema \
+  | diff - protocol/agentdeck/e2ee-v1.schema.json
+cargo clippy -p agentdeck-cli -p agentdeck-protocol --locked --all-targets -- -D warnings
+cargo clippy -p agentdeck-relay-client --locked --all-targets --no-deps -- -D warnings
+cargo fmt --all -- --check
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+**Task 收口证据（2026-07-24）：** 冻结 code/test scope 为 29 paths，blob-manifest SHA-256 为
+`32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`。watch `12/12`、
+`remote_persistent_machines` `11/11`、relay-client `25/25`、protocol `244/244` 均通过。完整 CLI package
+final run 在同一 hash 上 exit 0（14 分 16 秒）：lib `194/194`、main `50/50`、
+`remote_runtime_receipts` `81/81`（432.35 秒）、`remote_transfer_persistence` `6/6`（256.08 秒）、
+`remote_transfer_paired_state` `7/7`（57.27 秒）、`runtime_cli_binary` `17/17`（30.84 秒）、synthetic
+`10/10`、shared daemon `27/27`、doc-test `6/6`，仅预期忽略显式 release allocator。release allocator
+`1/1`（24.11 秒），counting
+allocator requested-live capacity/complete/duplicate 分别为 `363/190/3 MiB`，**不是 RSS、resident
+high-water 或 128 MiB physical-memory 承诺**。四 schema、CLI/protocol/relay-client Clippy
+`-D warnings`、fmt、network/no-net、docs 与 diff 全绿。`spec/security` 与 `quality` 终审均已在同一
+hash 上 Approved，P0/P1/P2=0。
+
+8 MiB lowered-cap seam 只在 `debug_assertions` automatic test build 中存在，release artifact 不编译该入口，
+也不存在 CLI/env/config 可配置路径。上述实现以 automatic Task complete 计为 P4 的第 6/7 项。
+automatic injected keystore/verifier 只证明同一状态机；production-signed CLI/Data Protection Keychain readback
+继续作为 post-MVP `BLOCKED`，不得计 PASS。`p4-auto` 仍属于 P4.7，当前 verifier 尚未提供该入口；P4 Phase
+Exit、iOS 真实链路、物理设备与公网证据也仍未完成。
 
 ## AppKit 重写后的验证清单
 
@@ -2396,12 +2506,13 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.9-C3 App model cutover | 运行本页 App coordinator/canonical model/reliability/Preview focused `46/46`、完整 Swift、普通与 warnings-as-errors build、iOS Simulator、production source purge、strict format/diff 与双路独立终审；普通 GUI 已默认 shared UDS 且 socket failure 零 fallback；Rust CLI、`main.swift --selfcheck` 与双客户端组合 smoke 当时不计入 C3，后由 P3.9-D 完成 |
 | Relay Companion MVP P3.9-D 默认入口与组合 smoke | 运行本页 CLI/daemon/Swift/iOS 全量、真实双客户端 smoke、active-turn/双连接/close-only 组合证据、release hidden-surface、四 schema、scoped Clippy/network/docs/fmt/diff 与双路终审。`b818f81` 已完成且全部自动门禁 PASS；真实 vendor login 与 P3.1 provisioned Keychain 仍按 post-MVP BLOCKED 记录，不冒充本 Task 证据 |
 | Relay Companion MVP P3.9-E App 会话可靠性 | 运行本页 retry/reconnect/history/subscription/composer focused、完整 Swift/iOS、真实 local-runtime smoke、四 schema、network/docs/diff、changed-source baseline parity 与双路终审。`d68cc02` 已完成且自动门禁 PASS；4 个 legacy 文件只证明诊断数下降，不冒充全文件 strict clean，也不冒充真实 vendor/remote/signed 证据 |
-| Relay Companion MVP P3.10 LaunchAgent lifecycle / upgrade 与 P3 Phase Exit | `19622ab` 已完成 admin ledger、upgrade/fence、CLI lifecycle Task；`773a2b3`、`0057824`、`81cc314`、`9efb28d` 完成 verifier 资源/进程组 hardening 与 legacy pre-RW 认证。基于 `9efb28d` 的独立 `bash scripts/verify-relay-companion-mvp.sh p3` exit 0，双路 code review P0/P1/P2 = 0，P3 automatic scope complete；production-signed 槽位仍只能输出 post-MVP `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不得冒充 PASS。后续 P4.1–P4.5 已收口，P4 为 5/7，下一项 P4.6 |
+| Relay Companion MVP P3.10 LaunchAgent lifecycle / upgrade 与 P3 Phase Exit | `19622ab` 已完成 admin ledger、upgrade/fence、CLI lifecycle Task；`773a2b3`、`0057824`、`81cc314`、`9efb28d` 完成 verifier 资源/进程组 hardening 与 legacy pre-RW 认证。基于 `9efb28d` 的独立 `bash scripts/verify-relay-companion-mvp.sh p3` exit 0，双路 code review P0/P1/P2 = 0，P3 automatic scope complete；production-signed 槽位仍只能输出 post-MVP `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不得冒充 PASS。后续 P4.1–P4.5 已收口，P4.6 已完成 automatic Task，P4 按进度为 6/7 |
 | Relay Companion MVP P4.1 machine identity / Keychain guard | 运行本页 bootstrap、machine keys、machine identity Store、RootKeyId 与 v7→v8 focused gates；Task 收口再跑完整 daemon package/capacity、dev/ephemeral selfcheck、diagnostics、network boundary、schema/manifest、secret/log/static sentinel、Clippy/fmt/diff/status及双路终审。只证明 v8 authenticated identity、四组 key/guard、通用 CounterGuard IO 与 RemoteStartPermit owner；不冒充 active counter reservation/full rollback、cert/enrollment/receipt IO、RemoteLink 或 production-signed Keychain PASS。`46c6bb8` 基线已 PASS；后续 P4.2 已接管 cert/enrollment/control-only transport |
 | Relay Companion MVP P4.2 certificate / enrollment / trust reset | 运行本页 manager/finalizer/CLI purge/launchd/transport 与五份 integration focused gates，再跑完整 daemon/CLI/relay-client/protocol/Relay TLS/crypto/Swift/iOS Simulator、dev/ephemeral selfcheck、hermetic smoke、diagnostics、schema/manifest/static sentinel、network、Clippy/fmt/diff/status与双路终审。只证明 v9 authenticated lifecycle、control-only MachineLink、两条 trust reset及安全 uninstall purge；不冒充业务 RemoteLink/E2EE、持久远程 CLI、iOS 真实链路或 production-signed PASS。`a6842bc` 基线 PASS |
 | Relay Companion MVP P4.3 PairInvite / DeviceGrant / auth ledger | 运行本页 transport/pairing/manager/trust-reset/Store/reset-guard/真实 TLS+UDS+CLI focused gates，再跑完整 Rust/Swift/iOS、schema/network/docs/Clippy/fmt/diff/status与双路终审。只证明 Runtime v4/schema v10、本机确认 pairing、byte-stable grant/authorization/key-directory、revoke 与 control handoff；本 Task 不冒充业务 RemoteLink/E2EE、persistent remote CLI、iOS 真实链路或 production-signed PASS。`4fd8ed8..3b4b977` 基线 PASS；后续 P4.4 已接线 ingress/Core |
 | Relay Companion MVP P4.4 MachineLink ingress / RuntimeCore dispatch | 运行本页 protocol contract `8/8`、MachineLink boundary `1/1`、RuntimeCore static `3/3`、完整 daemon package、跨 crate/Swift/iOS、四 schema、network/no-net/docs/Clippy/fmt/diff 与双路终审。`cd7d9fb` 基线 PASS；本 Task 只证明严格 ingress、Store exact recheck、RemotePrincipal→Core、conversation-scoped recovery 与 typed egress seam。sealer/publisher 在 P4.4 收口时仍 unavailable，后续已由 P4.5 安装；P4.4 自身不冒充 counter/outbox/Relay Publish、persistent CLI、remote E2E 或 production-signed PASS |
-| Relay Companion MVP P4.5 signed publication / counter recovery | 核对 `c6ef387` + `88b3c42`，运行 remote focused `430/430`、完整 daemon package（lib `1579/3 ignored`、main `7/7`、256 MiB boundary `5/5`）、Clippy/fmt/diff 与冻结 hash 双路终审。只证明 Runtime v4/schema v14/35 下 daemon 侧 exact sealing/outbox/Relay COMMIT/local ACK、key/counter/replay crash recovery；P4 为 5/7，下一项 P4.6。verifier 仍只接受 `p0|p2|p3`，不得冒充 `p4`/`p4-auto`、persistent CLI、真实设备/公网或 production-signed PASS |
+| Relay Companion MVP P4.5 signed publication / counter recovery | 核对 `c6ef387` + `88b3c42`，运行 remote focused `430/430`、完整 daemon package（lib `1579/3 ignored`、main `7/7`、256 MiB boundary `5/5`）、Clippy/fmt/diff 与冻结 hash 双路终审。只证明当时 Runtime v4/schema v14/35 下 daemon 侧 exact sealing/outbox/Relay COMMIT/local ACK、key/counter/replay crash recovery；后续 P4.6 已完成 automatic Task，P4 按进度为 6/7。verifier 仍只接受 `p0|p2|p3`，不得冒充 `p4`/`p4-auto`、真实设备/公网或 production-signed PASS |
+| Relay Companion MVP P4.6 persistent remote CLI | 2026-07-24 automatic Task complete；冻结 29-path code/test scope，blob-manifest SHA-256 `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`。watch `12/12`、`remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client `25/25`、protocol `244/244` 与全部静态门禁均通过；`spec/security` 与 `quality` 均 Approved、P0/P1/P2=0。current Runtime 为 v5；`pair|machines|conversations|watch|prompt|approve|retry-approval|revoke-self` 已接入。P4 按进度为 6/7，production-signed Keychain 保持 post-MVP BLOCKED，不宣称 `p4-auto` 或 P4 Phase PASS |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

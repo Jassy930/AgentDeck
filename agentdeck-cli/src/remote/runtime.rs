@@ -8,6 +8,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentdeck_crypto::rand_core::{CryptoRng, TryCryptoRng, TryRng};
@@ -34,12 +36,14 @@ use agentdeck_protocol::runtime::identity::{
     ApprovalId, CatalogPageCursor, GrantSerial as RuntimeGrantSerial, MessageId, TransferId, TurnId,
 };
 use agentdeck_protocol::runtime::{
-    ApprovalDeliveryState, ApprovalReceipt, BackfillChunk, CatalogSnapshot, CommandReceipt,
-    ConversationId, ConversationSnapshot, MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION,
-    RevocationReceipt, RuntimeEnvelope, RuntimeFailure, RuntimeInnerCursor, RuntimeMessage,
-    RuntimeReply, RuntimeStreamItem, RuntimeSyncComplete, RuntimeTransferCarrierError,
-    RuntimeTransferCarrierV1, RuntimeTransferChannel, SendPromptRequest, StreamCursor,
-    SubscriptionReceipt, TRANSFER_TTL_MS, TransferError, TransferProgress, TransferReassembler,
+    ApprovalDeliveryState, ApprovalReceipt, BackfillChunk, CatalogDelta, CatalogSnapshot,
+    CommandReceipt, ConversationId, ConversationSnapshot, DurableStreamObjectId,
+    DurableStreamTransferSource, MAX_RUNTIME_JSON_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION,
+    RevocationReceipt, RuntimeEnvelope, RuntimeEvent, RuntimeFailure, RuntimeInnerCursor,
+    RuntimeMessage, RuntimeReply, RuntimeStreamItem, RuntimeSyncComplete,
+    RuntimeTransferCarrierError, RuntimeTransferCarrierV1, RuntimeTransferChannel,
+    SendPromptRequest, StreamCursor, SubscriptionReceipt, TRANSFER_TTL_MS, TransferError,
+    TransferProgress, TransferReassembler,
 };
 use agentdeck_relay_client::RelayClientError;
 use async_trait::async_trait;
@@ -59,6 +63,7 @@ use super::paired_machine::{
 use super::stream_state::{
     DurableStreamBindingV1, StreamDirectApplyMode, StreamPublishDisposition,
 };
+use super::transfer_state::{DurableTransferBootstrapError, DurableTransferOutcomeV1};
 
 const EXCHANGE_MAGIC: &[u8; 4] = b"ADRX";
 const LEGACY_EXCHANGE_VERSION: u16 = 1;
@@ -83,6 +88,9 @@ const RETRY_APPROVAL_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteRetryApprovalInten
 const REVOKE_SELF_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteRevokeSelfIntentV1\0";
 const SUBSCRIBE_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteSubscribeIntentV1\0";
 const MUTATION_RNG_DOMAIN: &[u8] = b"AgentDeck/RemoteRuntimeMutationRngV1\0";
+
+/// 单个 subscription reducer 实例允许声明的 retained-memory 硬上界。
+pub const MAX_REMOTE_SUBSCRIPTION_REDUCER_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 
 fn stream_applied_ack_recovery_batches<T>(pending: &[T]) -> std::slice::Chunks<'_, T> {
     pending.chunks(MAX_PENDING_STREAM_APPLIED_ACK_ROUTES)
@@ -117,10 +125,79 @@ where
 pub trait RemoteRuntimeTransport: Send {
     async fn send(&mut self, frame: ExactRelayFrame) -> Result<(), RemoteRuntimeTransportError>;
 
+    /// Pending `recv` 必须 cancellation-safe：future 在返回 `Ready` 前被丢弃时，不能消费、
+    /// 截断或隐藏一条 frame。Runtime 只在这个 pre-frame 等待点观察 watch interruption；
+    /// frame 一旦返回，后续认证、durable CAS、reducer swap 与 ACK/control 都不会被取消。
     async fn recv(&mut self) -> Result<Option<ReceivedRuntimeFrame>, RemoteRuntimeTransportError>;
 
     /// 等待 transport-owned I/O task 收口；默认用于无后台任务的 automatic fake。
     async fn shutdown(&mut self) {}
+}
+
+/// Runtime-owned cancellation-safe I/O 等待结果。
+///
+/// `Interrupted` 只可能在 transport 尚未交付 frame 的等待阶段产生；调用方看到
+/// `Completed` 后，Runtime 已把该 frame 的所有认证、持久化与 ACK/control 副作用驱动到
+/// terminal，不能再把同一 operation 当成可取消的 pre-frame wait。
+pub enum RemoteRuntimeInterruptible<T, Interrupt> {
+    Completed(T),
+    CompletedAndInterrupted {
+        output: T,
+        interrupt: Interrupt,
+    },
+    /// Runtime 已完成 durable terminal，但同一 terminal barrier 内也观察到 interruption。
+    /// 调用方必须先公开 `error` 对应的 terminal，再消费 `interrupt`；不得把它降级成
+    /// pre-frame `Interrupted`。
+    FailedAndInterrupted {
+        error: RemoteRuntimeError,
+        interrupt: Interrupt,
+    },
+    Interrupted(Interrupt),
+}
+
+pub(super) async fn take_ready_interrupt<C>(mut cancel: Pin<&mut C>) -> Option<C::Output>
+where
+    C: Future + ?Sized,
+{
+    tokio::select! {
+        biased;
+        interrupt = cancel.as_mut() => Some(interrupt),
+        () = std::future::ready(()) => None,
+    }
+}
+
+async fn wait_for_cancel_safe_io<C, F, T>(
+    mut cancel: Pin<&mut C>,
+    io: F,
+) -> RemoteRuntimeInterruptible<T, C::Output>
+where
+    C: Future + ?Sized,
+    F: Future<Output = T>,
+{
+    let outcome = tokio::select! {
+        biased;
+        output = io => RemoteRuntimeInterruptible::Completed(output),
+        interrupt = cancel.as_mut() => RemoteRuntimeInterruptible::Interrupted(interrupt),
+    };
+    match outcome {
+        RemoteRuntimeInterruptible::Completed(output) => {
+            match take_ready_interrupt(cancel.as_mut()).await {
+                Some(interrupt) => {
+                    RemoteRuntimeInterruptible::CompletedAndInterrupted { output, interrupt }
+                }
+                None => RemoteRuntimeInterruptible::Completed(output),
+            }
+        }
+        RemoteRuntimeInterruptible::Interrupted(interrupt) => {
+            RemoteRuntimeInterruptible::Interrupted(interrupt)
+        }
+        RemoteRuntimeInterruptible::FailedAndInterrupted { .. } => {
+            unreachable!("I/O select cannot construct a durable terminal failure")
+        }
+        RemoteRuntimeInterruptible::CompletedAndInterrupted { .. } => {
+            unreachable!("select branches only construct one-step outcomes")
+        }
+    }
 }
 
 /// transport 交给 Runtime 的未信任 Relay frame 与原始 binary payload。
@@ -257,6 +334,18 @@ pub enum RemoteStreamFrameOutcome {
     Applied(Box<RuntimeStreamItem>),
     AuthenticatedOverlap,
     AppliedDuplicate,
+    /// 一个 authenticated compact part 已与 replay/outer cut 在同一 paired-state CAS 中
+    /// 持久化；inner/reducer 尚未推进。
+    TransferBuffered {
+        transfer_id: TransferId,
+        received_parts: u32,
+        part_count: u32,
+    },
+    /// exact durable transfer 已经存在 completed tombstone；本次只提交新的 outer cut 并
+    /// 重发 cumulative ACK，不再次进入 reducer。
+    TransferAlreadyComplete {
+        transfer_id: TransferId,
+    },
     Gap {
         need_stream_seq: u64,
         oldest_stream_seq: u64,
@@ -298,6 +387,13 @@ pub enum RemoteStreamFrameOutcome {
         stream_route: StreamRouteId,
         applied_stream_seq: u64,
     },
+    /// Active connection 收到 exact MachineRoot-signed revocation terminal。这里只完成
+    /// canonical/root signature/binding 验证并铸造 cleanup capability；调用方必须随后消费
+    /// 整个 Runtime，通过 [`RemoteRuntime::commit_live_revocation`] 先关闭 transport，再提交
+    /// crash-safe paired cleanup。裸 socket EOF 或普通 daemon receipt 不能构造本 outcome。
+    RevocationCommitted {
+        terminal: VerifiedRevocationTerminal,
+    },
 }
 
 /// subscription bootstrap 的 clone-and-swap reducer 契约。
@@ -306,6 +402,13 @@ pub enum RemoteStreamFrameOutcome {
 /// clone 的 cursor 必须精确等于 `SyncComplete.innerCursor`。只有 staged reducer 完整成功后
 /// 才会持久化 inner HWM、替换调用方 reducer 并发送 Relay Subscribe/Ack。
 pub trait RemoteSubscriptionReducer: Clone {
+    /// 单个 reducer 实例的 inline bytes 与所有 transitive retained allocations 的总上界。
+    ///
+    /// `clone()` 产生的额外 retained allocations 及 clone 过程中的瞬时分配也不得超过此
+    /// 声明值。这是实现者必须遵守的资源契约；Runtime 只能静态校验声明值与 inline
+    /// `size_of::<Self>()`，无法观测或证明实现内部的 transitive allocations。
+    const MAX_RETAINED_BYTES: usize;
+
     fn inner_cursor(&self) -> &RuntimeInnerCursor;
 
     fn apply(&mut self, item: &RemoteSubscriptionBootstrapItem) -> Result<(), RemoteRuntimeError>;
@@ -314,6 +417,15 @@ pub trait RemoteSubscriptionReducer: Clone {
     /// `inner_observed` exact-next 的 live item。Runtime 只在 clone 上调用，并在 cursor
     /// 精确到达预期 cut、durable state COMMIT 后 swap 回调用方。
     fn apply_live(&mut self, item: &RuntimeStreamItem) -> Result<(), RemoteRuntimeError>;
+}
+
+fn validate_reducer_capacity<D: RemoteSubscriptionReducer>() -> Result<(), RemoteRuntimeError> {
+    if std::mem::size_of::<D>() > D::MAX_RETAINED_BYTES
+        || D::MAX_RETAINED_BYTES > MAX_REMOTE_SUBSCRIPTION_REDUCER_RETAINED_BYTES
+    {
+        return Err(RemoteRuntimeError::ReducerCapacity);
+    }
+    Ok(())
 }
 
 impl RemoteSubscriptionBootstrap {
@@ -415,6 +527,8 @@ pub enum RemoteRuntimeError {
     RelayCodec(#[from] CodecError),
     #[error("runtime JSON encoding failed")]
     Json(#[from] serde_json::Error),
+    #[error("remote subscription reducer exceeds the retained-memory capacity contract")]
+    ReducerCapacity,
     #[error("remote runtime entropy source is unavailable")]
     EntropyUnavailable,
     #[error("another durable remote intent is still pending")]
@@ -423,6 +537,8 @@ pub enum RemoteRuntimeError {
     DaemonFailure(RuntimeFailure),
     #[error("transport closed before an authenticated daemon receipt")]
     OutcomeUnknown,
+    #[error("paired device received an authenticated revocation terminal")]
+    RevocationCommitted(VerifiedRevocationTerminal),
     #[error("remote reply is not correlated or has an invalid shape: {0}")]
     InvalidReply(&'static str),
     #[error("remote compact transfer carrier is invalid")]
@@ -437,6 +553,8 @@ pub enum RemoteRuntimeError {
     NonceReuse,
     #[error("durable remote runtime state has an invalid canonical encoding")]
     InvalidDurableState,
+    #[error("durable live transfer requires a fresh subscription bootstrap")]
+    TransferBootstrapRequired(#[source] DurableTransferBootstrapError),
 }
 
 impl RemoteRuntimeError {
@@ -464,15 +582,18 @@ impl RemoteRuntimeError {
             Self::Json(_) | Self::InvalidReply(_) | Self::TransferCarrier(_) => {
                 "remote.runtime.reply_invalid"
             }
+            Self::ReducerCapacity => "remote.runtime.reducer_capacity",
             Self::EntropyUnavailable => "remote.runtime.entropy_unavailable",
             Self::PendingIntentConflict => "remote.runtime.pending_intent_conflict",
             Self::DaemonFailure(failure) => failure.code.as_str(),
             Self::OutcomeUnknown => "remote.runtime.outcome_unknown",
+            Self::RevocationCommitted(_) => "remote.runtime.revoked",
             Self::Transfer(error) => error.code(),
             Self::ReplayRejected => "remote.runtime.replay_rejected",
             Self::CounterReplay => REMOTE_CRYPTO_COUNTER_REPLAY,
             Self::NonceReuse => REMOTE_CRYPTO_NONCE_REUSE,
             Self::InvalidDurableState => "remote.runtime.state_invalid",
+            Self::TransferBootstrapRequired(error) => error.code(),
         }
     }
 }
@@ -544,22 +665,216 @@ where
         &mut self,
         active: &HashMap<TransferId, Instant>,
     ) -> Result<Option<ReceivedRuntimeFrame>, RemoteRuntimeError> {
+        let cancel = std::future::pending::<Infallible>();
+        tokio::pin!(cancel);
+        match self
+            .recv_with_transfer_deadline_interruptible(active, cancel.as_mut())
+            .await?
+        {
+            RemoteRuntimeInterruptible::Completed(received) => Ok(received),
+            RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                interrupt: never, ..
+            } => match never {},
+            RemoteRuntimeInterruptible::FailedAndInterrupted {
+                interrupt: never, ..
+            } => match never {},
+            RemoteRuntimeInterruptible::Interrupted(never) => match never {},
+        }
+    }
+
+    async fn recv_with_transfer_deadline_interruptible<C>(
+        &mut self,
+        active: &HashMap<TransferId, Instant>,
+        cancel: Pin<&mut C>,
+    ) -> Result<
+        RemoteRuntimeInterruptible<Option<ReceivedRuntimeFrame>, C::Output>,
+        RemoteRuntimeError,
+    >
+    where
+        C: Future + ?Sized,
+    {
         let Some(deadline) = active
             .values()
             .map(|started| *started + Duration::from_millis(TRANSFER_TTL_MS))
             .min()
         else {
-            return Ok(self.transport.recv().await?);
+            return match wait_for_cancel_safe_io(cancel, self.transport.recv()).await {
+                RemoteRuntimeInterruptible::Completed(received) => {
+                    Ok(RemoteRuntimeInterruptible::Completed(received?))
+                }
+                RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                    output: received,
+                    interrupt,
+                } => Ok(RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                    output: received?,
+                    interrupt,
+                }),
+                RemoteRuntimeInterruptible::Interrupted(interrupt) => {
+                    Ok(RemoteRuntimeInterruptible::Interrupted(interrupt))
+                }
+                RemoteRuntimeInterruptible::FailedAndInterrupted { .. } => {
+                    unreachable!("I/O select cannot construct a durable terminal failure")
+                }
+            };
         };
-        match tokio::time::timeout_at(deadline, self.transport.recv()).await {
-            Ok(received) => Ok(received?),
-            Err(_) => Err(TransferError::Expired.into()),
+        match wait_for_cancel_safe_io(
+            cancel,
+            tokio::time::timeout_at(deadline, self.transport.recv()),
+        )
+        .await
+        {
+            RemoteRuntimeInterruptible::Completed(Ok(received)) => {
+                Ok(RemoteRuntimeInterruptible::Completed(received?))
+            }
+            RemoteRuntimeInterruptible::Completed(Err(_)) => Err(TransferError::Expired.into()),
+            RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                output: Ok(received),
+                interrupt,
+            } => Ok(RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                output: received?,
+                interrupt,
+            }),
+            RemoteRuntimeInterruptible::CompletedAndInterrupted { output: Err(_), .. } => {
+                Err(TransferError::Expired.into())
+            }
+            RemoteRuntimeInterruptible::Interrupted(interrupt) => {
+                Ok(RemoteRuntimeInterruptible::Interrupted(interrupt))
+            }
+            RemoteRuntimeInterruptible::FailedAndInterrupted { .. } => {
+                unreachable!("I/O select cannot construct a durable terminal failure")
+            }
+        }
+    }
+
+    /// Live subscription 的 transfer TTL 来自 sealed paired state，而不是进程内计时器。
+    /// 即使 Relay 在最后一片前永久静默，也必须在 durable absolute deadline 到达时把
+    /// exact binding 原子切成 `remote.transfer.expired` marker，避免 active records 永久
+    /// 占用全局 transfer budget。timeout 分支使用已认证的绝对 deadline 推进 durable
+    /// clock；这样既不依赖下一帧，也不把 Tokio 的 monotonic timer 误当新的信任根。
+    async fn recv_live_stream_frame_interruptible<C>(
+        &mut self,
+        mut cancel: Pin<&mut C>,
+    ) -> Result<
+        RemoteRuntimeInterruptible<Option<ReceivedRuntimeFrame>, C::Output>,
+        RemoteRuntimeError,
+    >
+    where
+        C: Future + ?Sized,
+    {
+        let transfer = self.machine.durable_transfer_state()?;
+        let now_ms = unix_time_ms()?;
+        let Some((_, expires_at_ms)) = transfer
+            .earliest_active_expiry_at(now_ms)
+            .map_err(|_| RemoteRuntimeError::InvalidDurableState)?
+        else {
+            return match wait_for_cancel_safe_io(cancel, self.transport.recv()).await {
+                RemoteRuntimeInterruptible::Completed(received) => {
+                    Ok(RemoteRuntimeInterruptible::Completed(received?))
+                }
+                RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                    output: received,
+                    interrupt,
+                } => Ok(RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                    output: received?,
+                    interrupt,
+                }),
+                RemoteRuntimeInterruptible::Interrupted(interrupt) => {
+                    Ok(RemoteRuntimeInterruptible::Interrupted(interrupt))
+                }
+                RemoteRuntimeInterruptible::FailedAndInterrupted { .. } => {
+                    unreachable!("I/O select cannot construct a durable terminal failure")
+                }
+            };
+        };
+        if now_ms >= expires_at_ms {
+            self.expire_due_live_transfers(now_ms)?;
+            let error = RemoteRuntimeError::TransferBootstrapRequired(
+                DurableTransferBootstrapError::Expired,
+            );
+            if let Some(interrupt) = take_ready_interrupt(cancel.as_mut()).await {
+                return Ok(RemoteRuntimeInterruptible::FailedAndInterrupted { error, interrupt });
+            }
+            return Err(error);
+        }
+        let remaining = Duration::from_millis(expires_at_ms - now_ms);
+        match wait_for_cancel_safe_io(
+            cancel,
+            tokio::time::timeout(remaining, self.transport.recv()),
+        )
+        .await
+        {
+            RemoteRuntimeInterruptible::Completed(Ok(received)) => {
+                Ok(RemoteRuntimeInterruptible::Completed(received?))
+            }
+            RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                output: Ok(received),
+                interrupt,
+            } => Ok(RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                output: received?,
+                interrupt,
+            }),
+            RemoteRuntimeInterruptible::Completed(Err(_)) => {
+                self.expire_due_live_transfers(expires_at_ms)?;
+                Err(RemoteRuntimeError::TransferBootstrapRequired(
+                    DurableTransferBootstrapError::Expired,
+                ))
+            }
+            RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                output: Err(_),
+                interrupt,
+            } => {
+                self.expire_due_live_transfers(expires_at_ms)?;
+                Ok(RemoteRuntimeInterruptible::FailedAndInterrupted {
+                    error: RemoteRuntimeError::TransferBootstrapRequired(
+                        DurableTransferBootstrapError::Expired,
+                    ),
+                    interrupt,
+                })
+            }
+            RemoteRuntimeInterruptible::Interrupted(interrupt) => {
+                Ok(RemoteRuntimeInterruptible::Interrupted(interrupt))
+            }
+            RemoteRuntimeInterruptible::FailedAndInterrupted { .. } => {
+                unreachable!("I/O select cannot construct a durable terminal failure")
+            }
+        }
+    }
+
+    /// 把 `now_ms` 已到期的 active bindings 逐个纳入 production combined CAS。一次 CAS
+    /// 只以对应 exact binding 为能力锚；循环重新读取 committed state，避免用前一步的
+    /// stale transfer projection 覆盖后一步。
+    fn expire_due_live_transfers(&mut self, now_ms: u64) -> Result<(), RemoteRuntimeError> {
+        loop {
+            let Some(pending) = self.machine.prepare_due_live_transfer_expiry(now_ms)? else {
+                return Ok(());
+            };
+            let mut mutation_rng = SystemMutationRng::new()?;
+            let _ = self
+                .machine
+                .commit_stream_bootstrap_transition(pending, &mut mutation_rng)?;
         }
     }
 
     /// 显式等待 transport shutdown，随后按字段顺序先销毁 transport、再释放 device lease。
     pub async fn shutdown(mut self) {
         self.transport.shutdown().await;
+    }
+
+    /// 消费已经由 live ingress 验证的 root-signed revocation terminal。
+    ///
+    /// transport 必须先完成 shutdown 并显式销毁，paired machine capability 才能把 terminal
+    /// 提升为 cleanup journal 并删除本 device material；这与 self-revoke 使用同一删除边界。
+    pub async fn commit_live_revocation(
+        mut self,
+        terminal: VerifiedRevocationTerminal,
+    ) -> Result<(), RemoteRuntimeError> {
+        self.transport.shutdown().await;
+        let Self {
+            transport, machine, ..
+        } = self;
+        drop(transport);
+        machine.commit_revocation_cleanup(terminal)?;
+        Ok(())
     }
 
     /// 请求一页 catalog；小页接受 authenticated JSON，大页接受
@@ -622,14 +937,32 @@ where
         Ok(is_first_page.then_some(outcome))
     }
 
+    /// 为不持久化 plaintext reducer 的 watch 选择 crash-restart cursor。无 exchange 时保留
+    /// 调用方的 fresh target；同 target 的 Subscribe pending 返回其原 cursor，使下一次
+    /// `subscribe` byte-identical 重发 exact pending。其他/cross-target pending fail closed，
+    /// 不能被只读 watch 覆盖。
+    pub fn subscription_restart_cursor(
+        &self,
+        fresh_target: RuntimeInnerCursor,
+    ) -> Result<RuntimeInnerCursor, RemoteRuntimeError> {
+        validate_inner_cursor(&fresh_target)?;
+        let existing = self
+            .machine
+            .opaque_runtime_state()
+            .exchange()
+            .map(decode_exchange)
+            .transpose()?;
+        select_subscription_restart_cursor(existing.as_ref(), fresh_target)
+    }
+
     /// 建立一个 Runtime subscription bootstrap。所有 directed snapshot/backfill（包括
     /// compact transfer）先进入 clone reducer；只有 reducer 精确到达 SyncComplete cut 且
     /// `StreamBindingV1` 完整验证后，才原子写入 binding/inner HWM、swap reducer，并发送
     /// Relay `Subscribe`/可选 `Ack`。
     ///
-    /// 成功路径不持久化 bootstrap 明文或缺明文的 terminal。若进程在 state commit 后、
-    /// control send 前退出，冷启动必须从自己的空 reducer 发起新 snapshot，并替换旧 target
-    /// binding；不能只恢复 controls 后跳过未持久化的 transcript。
+    /// 成功路径不持久化 bootstrap 明文或缺明文的 terminal。未完成的 Subscribe pending
+    /// 必须由 `subscription_restart_cursor` 选择原 cursor 并 exact retry；commit 后 exchange
+    /// 已消费，冷启动才从自己的空 reducer 请求 fresh snapshot。
     pub async fn subscribe<R, D>(
         &mut self,
         inner_cursor: RuntimeInnerCursor,
@@ -640,6 +973,42 @@ where
         R: CryptoRng,
         D: RemoteSubscriptionReducer,
     {
+        let cancel = std::future::pending::<Infallible>();
+        tokio::pin!(cancel);
+        match self
+            .subscribe_interruptible(inner_cursor, reducer, rng, cancel.as_mut())
+            .await?
+        {
+            RemoteRuntimeInterruptible::Completed(bootstrap) => Ok(bootstrap),
+            RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                interrupt: never, ..
+            } => match never {},
+            RemoteRuntimeInterruptible::FailedAndInterrupted {
+                interrupt: never, ..
+            } => match never {},
+            RemoteRuntimeInterruptible::Interrupted(never) => match never {},
+        }
+    }
+
+    /// cancellation-safe subscription 入口。只在尚未取得下一条 Relay frame 的 transport
+    /// wait 观察 interruption；一旦收到 frame，就完整处理到下一次 pre-frame wait。特别是
+    /// `commit_subscription_bootstrap` 之后的 reducer swap 与 binding controls 不可取消。
+    pub async fn subscribe_interruptible<R, D, C>(
+        &mut self,
+        inner_cursor: RuntimeInnerCursor,
+        reducer: &mut D,
+        rng: &mut R,
+        mut cancel: Pin<&mut C>,
+    ) -> Result<
+        RemoteRuntimeInterruptible<RemoteSubscriptionBootstrap, C::Output>,
+        RemoteRuntimeError,
+    >
+    where
+        R: CryptoRng,
+        D: RemoteSubscriptionReducer,
+        C: Future + ?Sized,
+    {
+        validate_reducer_capacity::<D>()?;
         if reducer.inner_cursor() != &inner_cursor {
             return Err(RemoteRuntimeError::InvalidDurableState);
         }
@@ -676,15 +1045,36 @@ where
         let mut active_reply_transfers = HashMap::new();
         let mut processed_signed_blobs = HashSet::new();
         loop {
-            let Some(received) = self
-                .recv_with_transfer_deadline(&active_reply_transfers)
+            let (received, mut latched_interrupt) = match self
+                .recv_with_transfer_deadline_interruptible(&active_reply_transfers, cancel.as_mut())
                 .await?
-            else {
+            {
+                RemoteRuntimeInterruptible::Completed(received) => (received, None),
+                RemoteRuntimeInterruptible::CompletedAndInterrupted { output, interrupt } => {
+                    (output, Some(interrupt))
+                }
+                RemoteRuntimeInterruptible::Interrupted(interrupt) => {
+                    return Ok(RemoteRuntimeInterruptible::Interrupted(interrupt));
+                }
+                RemoteRuntimeInterruptible::FailedAndInterrupted { error, interrupt } => {
+                    return Ok(RemoteRuntimeInterruptible::FailedAndInterrupted {
+                        error,
+                        interrupt,
+                    });
+                }
+            };
+            let Some(received) = received else {
                 return Err(RemoteRuntimeError::OutcomeUnknown);
             };
             validate_received_runtime_frame(&received)?;
             let reply_frame_hash = sha256(received.canonical_bytes());
             let frame = received.frame();
+            if let RelayFrameBody::RevocationCommitted(_) = &frame.body {
+                let terminal = self
+                    .machine
+                    .verify_revocation_terminal(frame, received.canonical_bytes())?;
+                return Err(RemoteRuntimeError::RevocationCommitted(terminal));
+            }
             match &frame.body {
                 RelayFrameBody::RouteAccepted(accepted) => {
                     let AcceptedRef::Request { request_route } = accepted.accepted else {
@@ -719,6 +1109,9 @@ where
                     let signed_blob_hash = candidate.signed_blob_hash();
                     self.admit_reply_replay(&candidate)?;
                     if processed_signed_blobs.contains(&signed_blob_hash) {
+                        if let Some(interrupt) = latched_interrupt.take() {
+                            return Ok(RemoteRuntimeInterruptible::Interrupted(interrupt));
+                        }
                         continue;
                     }
                     let opened = self
@@ -759,7 +1152,19 @@ where
                             progress.into_outcome_and_reducer(binding.clone());
                         *reducer = staged_reducer;
                         self.send_stream_binding_controls(&installed).await?;
-                        return Ok(outcome);
+                        let interrupt = match latched_interrupt.take() {
+                            Some(interrupt) => Some(interrupt),
+                            None => take_ready_interrupt(cancel.as_mut()).await,
+                        };
+                        return Ok(match interrupt {
+                            Some(interrupt) => {
+                                RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                                    output: outcome,
+                                    interrupt,
+                                }
+                            }
+                            None => RemoteRuntimeInterruptible::Completed(outcome),
+                        });
                     }
 
                     if opened.payload_kind == SealedPayloadKind::TransferPart {
@@ -788,6 +1193,9 @@ where
                                     .entry(transfer_id)
                                     .or_insert_with(Instant::now);
                                 processed_signed_blobs.insert(signed_blob_hash);
+                                if let Some(interrupt) = latched_interrupt.take() {
+                                    return Ok(RemoteRuntimeInterruptible::Interrupted(interrupt));
+                                }
                                 continue;
                             }
                             TransferProgress::AlreadyComplete => {
@@ -801,6 +1209,9 @@ where
                                     decode_subscription_transfer(tracker.requested(), &payload)?;
                                 tracker.accept_runtime_reply(payload_kind, reply)?;
                                 processed_signed_blobs.insert(signed_blob_hash);
+                                if let Some(interrupt) = latched_interrupt.take() {
+                                    return Ok(RemoteRuntimeInterruptible::Interrupted(interrupt));
+                                }
                                 continue;
                             }
                         }
@@ -853,12 +1264,17 @@ where
                     ));
                 }
             }
+            if let Some(interrupt) = latched_interrupt.take() {
+                return Ok(RemoteRuntimeInterruptible::Interrupted(interrupt));
+            }
         }
     }
 
-    /// 接收并处理一个 subscription-owned Relay frame。Publish 在进入 reducer 前固定走：
-    /// canonical Relay outer → route/generation/key/AAD/signature → durable replay admission →
-    /// AEAD/canonical Runtime stream → clone reducer → durable outer/inner → reducer swap → ACK。
+    /// 接收并处理一个 subscription-owned Relay frame。普通 Publish 在进入 reducer 前固定走：
+    /// canonical Relay outer → route/generation/key/AAD/signature → in-memory replay candidate →
+    /// durable replay admission → AEAD open → canonical Runtime stream → clone reducer → durable
+    /// outer/inner → reducer swap → ACK。`TransferPart` 同样先提交 replay admission；随后以
+    /// admitted binding 为 CAS expected，把 outer/inner 与 transfer records 原子提交。
     pub async fn receive_stream_frame<D>(
         &mut self,
         reducer: &mut D,
@@ -866,17 +1282,99 @@ where
     where
         D: RemoteSubscriptionReducer,
     {
-        let received = self
-            .transport
-            .recv()
+        let cancel = std::future::pending::<Infallible>();
+        tokio::pin!(cancel);
+        match self
+            .receive_stream_frame_interruptible(reducer, cancel.as_mut())
             .await?
-            .ok_or(RemoteRuntimeError::OutcomeUnknown)?;
+        {
+            RemoteRuntimeInterruptible::Completed(outcome) => Ok(outcome),
+            RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                interrupt: never, ..
+            } => match never {},
+            RemoteRuntimeInterruptible::FailedAndInterrupted {
+                interrupt: never, ..
+            } => match never {},
+            RemoteRuntimeInterruptible::Interrupted(never) => match never {},
+        }
+    }
+
+    /// cancellation-safe live ingress。interruption 先与 pre-frame `recv` 竞争；frame 一旦
+    /// 取出，认证、durable replay/inner CAS、reducer swap 以及 cumulative ACK/control 会
+    /// 完整执行。terminal 后再做一次非阻塞 signal poll，使 ACK 阶段到达的 interruption
+    /// 只能表现为 `CompletedAndInterrupted`，不能取消已提交 frame，也不能抢跑下一帧。
+    pub async fn receive_stream_frame_interruptible<D, C>(
+        &mut self,
+        reducer: &mut D,
+        mut cancel: Pin<&mut C>,
+    ) -> Result<RemoteRuntimeInterruptible<RemoteStreamFrameOutcome, C::Output>, RemoteRuntimeError>
+    where
+        D: RemoteSubscriptionReducer,
+        C: Future + ?Sized,
+    {
+        validate_reducer_capacity::<D>()?;
+        let (received, interrupt) = match self
+            .recv_live_stream_frame_interruptible(cancel.as_mut())
+            .await?
+        {
+            RemoteRuntimeInterruptible::Completed(received) => (received, None),
+            RemoteRuntimeInterruptible::CompletedAndInterrupted { output, interrupt } => {
+                (output, Some(interrupt))
+            }
+            RemoteRuntimeInterruptible::Interrupted(interrupt) => {
+                return Ok(RemoteRuntimeInterruptible::Interrupted(interrupt));
+            }
+            RemoteRuntimeInterruptible::FailedAndInterrupted { error, interrupt } => {
+                return Ok(RemoteRuntimeInterruptible::FailedAndInterrupted { error, interrupt });
+            }
+        };
+        let received = received.ok_or(RemoteRuntimeError::OutcomeUnknown)?;
+        let processed = self.process_received_stream_frame(reducer, received).await;
+        let interrupt = match interrupt {
+            Some(interrupt) => Some(interrupt),
+            None => take_ready_interrupt(cancel.as_mut()).await,
+        };
+        match processed {
+            Ok(outcome) => Ok(match interrupt {
+                Some(interrupt) => RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                    output: outcome,
+                    interrupt,
+                },
+                None => RemoteRuntimeInterruptible::Completed(outcome),
+            }),
+            Err(error @ RemoteRuntimeError::TransferBootstrapRequired(_))
+                if interrupt.is_some() =>
+            {
+                Ok(RemoteRuntimeInterruptible::FailedAndInterrupted {
+                    error,
+                    interrupt: interrupt.expect("guarded interrupt"),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn process_received_stream_frame<D>(
+        &mut self,
+        reducer: &mut D,
+        received: ReceivedRuntimeFrame,
+    ) -> Result<RemoteStreamFrameOutcome, RemoteRuntimeError>
+    where
+        D: RemoteSubscriptionReducer,
+    {
         validate_received_runtime_frame(&received)?;
-        let (frame, _) = received.into_parts();
+        let (frame, canonical_bytes) = received.into_parts();
+        if let RelayFrameBody::RevocationCommitted(_) = &frame.body {
+            let terminal = self
+                .machine
+                .verify_revocation_terminal(&frame, &canonical_bytes)?;
+            return Ok(RemoteStreamFrameOutcome::RevocationCommitted { terminal });
+        }
         match frame.body {
             RelayFrameBody::Publish(publish) => {
                 let durable =
                     self.stream_binding_for_route(publish.stream_route, publish.generation)?;
+                self.ensure_stream_binding_not_bootstrap_fenced(&durable)?;
                 if reducer.inner_cursor() != durable.inner_applied() {
                     return Err(RemoteRuntimeError::InvalidDurableState);
                 }
@@ -949,18 +1447,16 @@ where
                         candidate.ciphertext_sha256(),
                     )
                     .map_err(|_| RemoteRuntimeError::CounterReplay)?;
-                let admitted = if admitted == durable {
-                    durable
-                } else {
-                    let mut mutation_rng = SystemMutationRng::new()?;
-                    self.machine.commit_stream_state_transition(
-                        &durable,
-                        &admitted,
-                        &mut mutation_rng,
-                    )?
-                };
                 match disposition {
                     StreamPublishDisposition::NonceReuseQuarantined => {
+                        if admitted != durable {
+                            let mut mutation_rng = SystemMutationRng::new()?;
+                            self.machine.commit_stream_state_transition(
+                                &durable,
+                                &admitted,
+                                &mut mutation_rng,
+                            )?;
+                        }
                         return Err(RemoteRuntimeError::NonceReuse);
                     }
                     StreamPublishDisposition::AppliedDuplicate => {
@@ -971,7 +1467,37 @@ where
                     | StreamPublishDisposition::PendingDuplicate => {}
                 }
 
+                let admitted = if admitted == durable {
+                    durable
+                } else {
+                    let mut mutation_rng = SystemMutationRng::new()?;
+                    match self.machine.commit_stream_state_transition(
+                        &durable,
+                        &admitted,
+                        &mut mutation_rng,
+                    ) {
+                        Ok(committed) => committed,
+                        Err(PairedPromotionError::StateCapacity) => {
+                            let error = DurableTransferBootstrapError::ReassemblyFull;
+                            let now_ms = unix_time_ms()?;
+                            let _ = self.machine.commit_stream_reassembly_full_fallback(
+                                &durable,
+                                admitted,
+                                None,
+                                now_ms,
+                                &mut mutation_rng,
+                            )?;
+                            return Err(RemoteRuntimeError::TransferBootstrapRequired(error));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
                 let opened = self.machine.open_verified_stream_publish(candidate)?;
+                if opened.payload_kind == SealedPayloadKind::TransferPart {
+                    return self
+                        .receive_live_transfer_part(reducer, admitted, stream_seq, opened)
+                        .await;
+                }
                 let (item, observed_after) = decode_direct_stream_item(admitted.binding(), opened)?;
                 let mode = admitted.direct_apply_mode(&observed_after).map_err(|_| {
                     RemoteRuntimeError::InvalidReply(
@@ -1017,6 +1543,7 @@ where
             }
             RelayFrameBody::Gap(gap) => {
                 let durable = self.stream_binding_for_route(gap.stream_route, gap.generation)?;
+                self.ensure_stream_binding_not_bootstrap_fenced(&durable)?;
                 durable
                     .validate_gap(gap.need_stream_seq, gap.oldest_stream_seq)
                     .map_err(|_| {
@@ -1032,6 +1559,7 @@ where
             RelayFrameBody::ReplayComplete(complete) => {
                 let durable =
                     self.stream_binding_for_route(complete.stream_route, complete.generation)?;
+                self.ensure_stream_binding_not_bootstrap_fenced(&durable)?;
                 durable
                     .validate_replay_complete(complete.current_cursor)
                     .map_err(|_| {
@@ -1074,6 +1602,208 @@ where
                 "unexpected Relay frame on the live stream ingress",
             )),
         }
+    }
+
+    async fn receive_live_transfer_part<D>(
+        &mut self,
+        reducer: &mut D,
+        admitted: DurableStreamBindingV1,
+        stream_seq: u64,
+        opened: SealedPayloadV1,
+    ) -> Result<RemoteStreamFrameOutcome, RemoteRuntimeError>
+    where
+        D: RemoteSubscriptionReducer,
+    {
+        if opened.payload_kind != SealedPayloadKind::TransferPart {
+            return Err(RemoteRuntimeError::InvalidReply(
+                "durable transfer ingress received a non-transfer payload",
+            ));
+        }
+        let now_ms = unix_time_ms()?;
+        let carrier = match RuntimeTransferCarrierV1::decode(&opened.payload) {
+            Ok(carrier) => carrier,
+            Err(_) => {
+                let error = DurableTransferBootstrapError::InvalidIdentity;
+                self.persist_transfer_bootstrap_marker(&admitted, None, error, now_ms)?;
+                return Err(RemoteRuntimeError::TransferBootstrapRequired(error));
+            }
+        };
+        let transfer_id = carrier.transfer.transfer_id.clone();
+        let mut pending = self
+            .machine
+            .prepare_live_transfer_part(&admitted, carrier, now_ms)?;
+        if let Some(error) = pending.bootstrap_error() {
+            let mut mutation_rng = SystemMutationRng::new()?;
+            let _ = self
+                .machine
+                .commit_stream_bootstrap_transition(pending, &mut mutation_rng)?;
+            return Err(RemoteRuntimeError::TransferBootstrapRequired(error));
+        }
+        let outcome = pending.take_outcome();
+
+        match outcome {
+            DurableTransferOutcomeV1::NeedsBootstrap { .. } => {
+                Err(RemoteRuntimeError::InvalidDurableState)
+            }
+            DurableTransferOutcomeV1::Buffered {
+                received_parts,
+                part_count,
+            } => {
+                let (replacement_binding, mode) = admitted
+                    .commit_transfer_part_publish(stream_seq, None)
+                    .map_err(|_| RemoteRuntimeError::InvalidDurableState)?;
+                if mode.is_some() {
+                    return Err(RemoteRuntimeError::InvalidDurableState);
+                }
+                let mut mutation_rng = SystemMutationRng::new()?;
+                let committed_binding = match self.machine.commit_stream_transfer_transition(
+                    pending,
+                    replacement_binding,
+                    &mut mutation_rng,
+                ) {
+                    Ok(committed_binding) => committed_binding,
+                    Err(PairedPromotionError::StateCapacity) => {
+                        let error = DurableTransferBootstrapError::ReassemblyFull;
+                        let _ = self.machine.commit_stream_reassembly_full_fallback(
+                            &admitted,
+                            admitted.clone(),
+                            Some(&transfer_id),
+                            now_ms,
+                            &mut mutation_rng,
+                        )?;
+                        return Err(RemoteRuntimeError::TransferBootstrapRequired(error));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                self.send_stream_ack(&committed_binding).await?;
+                Ok(RemoteStreamFrameOutcome::TransferBuffered {
+                    transfer_id,
+                    received_parts,
+                    part_count,
+                })
+            }
+            DurableTransferOutcomeV1::AlreadyComplete => {
+                let (replacement_binding, mode) = admitted
+                    .commit_transfer_part_publish(stream_seq, None)
+                    .map_err(|_| RemoteRuntimeError::InvalidDurableState)?;
+                if mode.is_some() {
+                    return Err(RemoteRuntimeError::InvalidDurableState);
+                }
+                let mut mutation_rng = SystemMutationRng::new()?;
+                let committed_binding = self.machine.commit_stream_transfer_transition(
+                    pending,
+                    replacement_binding,
+                    &mut mutation_rng,
+                )?;
+                self.send_stream_ack(&committed_binding).await?;
+                Ok(RemoteStreamFrameOutcome::TransferAlreadyComplete { transfer_id })
+            }
+            DurableTransferOutcomeV1::Complete { payload, source } => {
+                let item = match decode_completed_transfer_stream_item(&payload, source) {
+                    Ok(item) => item,
+                    Err(_) => {
+                        let error = DurableTransferBootstrapError::PayloadRejected;
+                        drop(pending);
+                        drop(payload);
+                        self.persist_transfer_bootstrap_marker(
+                            &admitted,
+                            Some(&transfer_id),
+                            error,
+                            now_ms,
+                        )?;
+                        return Err(RemoteRuntimeError::TransferBootstrapRequired(error));
+                    }
+                };
+                let (replacement_binding, mode) =
+                    match admitted.commit_transfer_part_publish(stream_seq, Some(source)) {
+                        Ok(candidate) => candidate,
+                        Err(_) => {
+                            let error = DurableTransferBootstrapError::PayloadRejected;
+                            drop(pending);
+                            drop(payload);
+                            self.persist_transfer_bootstrap_marker(
+                                &admitted,
+                                Some(&transfer_id),
+                                error,
+                                now_ms,
+                            )?;
+                            return Err(RemoteRuntimeError::TransferBootstrapRequired(error));
+                        }
+                    };
+                let Some(mode) = mode else {
+                    return Err(RemoteRuntimeError::InvalidDurableState);
+                };
+                let staged_reducer = if mode == StreamDirectApplyMode::Apply {
+                    let mut staged = reducer.clone();
+                    if staged.apply_live(&item).is_err()
+                        || staged.inner_cursor() != replacement_binding.inner_applied()
+                    {
+                        let error = DurableTransferBootstrapError::PayloadRejected;
+                        drop(pending);
+                        drop(payload);
+                        self.persist_transfer_bootstrap_marker(
+                            &admitted,
+                            Some(&transfer_id),
+                            error,
+                            now_ms,
+                        )?;
+                        return Err(RemoteRuntimeError::TransferBootstrapRequired(error));
+                    }
+                    Some(staged)
+                } else {
+                    None
+                };
+                drop(payload);
+                let mut mutation_rng = SystemMutationRng::new()?;
+                let committed_binding = self.machine.commit_stream_transfer_transition(
+                    pending,
+                    replacement_binding,
+                    &mut mutation_rng,
+                )?;
+                if let Some(staged) = staged_reducer {
+                    *reducer = staged;
+                }
+                self.send_stream_ack(&committed_binding).await?;
+                match mode {
+                    StreamDirectApplyMode::Overlap => {
+                        Ok(RemoteStreamFrameOutcome::AuthenticatedOverlap)
+                    }
+                    StreamDirectApplyMode::Apply => {
+                        Ok(RemoteStreamFrameOutcome::Applied(Box::new(item)))
+                    }
+                }
+            }
+        }
+    }
+
+    fn persist_transfer_bootstrap_marker(
+        &mut self,
+        admitted: &DurableStreamBindingV1,
+        transfer_id: Option<&TransferId>,
+        error: DurableTransferBootstrapError,
+        now_ms: u64,
+    ) -> Result<(), RemoteRuntimeError> {
+        let pending = self.machine.prepare_live_transfer_bootstrap_marker(
+            admitted,
+            transfer_id,
+            error,
+            now_ms,
+        )?;
+        let mut mutation_rng = SystemMutationRng::new()?;
+        let _ = self
+            .machine
+            .commit_stream_bootstrap_transition(pending, &mut mutation_rng)?;
+        Ok(())
+    }
+
+    fn ensure_stream_binding_not_bootstrap_fenced(
+        &self,
+        durable: &DurableStreamBindingV1,
+    ) -> Result<(), RemoteRuntimeError> {
+        if let Some(error) = self.machine.transfer_bootstrap_error_for_binding(durable)? {
+            return Err(RemoteRuntimeError::TransferBootstrapRequired(error));
+        }
+        Ok(())
     }
 
     async fn handle_key_sync_reply(
@@ -2351,6 +3081,7 @@ where
         }
         let encoded = windows.iter().map(encode_replay_window).collect();
         self.replace_runtime_state(
+            &current,
             current.exchange().map(ToOwned::to_owned),
             encoded,
             current.stream_cursors().to_vec(),
@@ -2435,6 +3166,7 @@ where
             return Err(RemoteRuntimeError::InvalidDurableState);
         }
         self.replace_runtime_state(
+            &current,
             None,
             current.replay_windows().to_vec(),
             current.stream_cursors().to_vec(),
@@ -2444,6 +3176,7 @@ where
     fn persist_exchange(&mut self, exchange: DurableExchange) -> Result<(), RemoteRuntimeError> {
         let current = self.machine.opaque_runtime_state();
         self.replace_runtime_state(
+            &current,
             Some(encode_exchange(&exchange)?),
             current.replay_windows().to_vec(),
             current.stream_cursors().to_vec(),
@@ -2471,6 +3204,7 @@ where
             return Err(RemoteRuntimeError::InvalidDurableState);
         }
         self.replace_runtime_state(
+            &current,
             None,
             current.replay_windows().to_vec(),
             current.stream_cursors().to_vec(),
@@ -2496,6 +3230,7 @@ where
             return Err(RemoteRuntimeError::InvalidDurableState);
         }
         self.replace_runtime_state(
+            &current,
             None,
             current.replay_windows().to_vec(),
             current.stream_cursors().to_vec(),
@@ -2504,15 +3239,21 @@ where
 
     fn replace_runtime_state(
         &mut self,
+        expected: &OpaqueRuntimeState,
         exchange: Option<Vec<u8>>,
         replay_windows: Vec<Vec<u8>>,
         stream_cursors: Vec<Vec<u8>>,
     ) -> Result<(), RemoteRuntimeError> {
-        let replacement = OpaqueRuntimeState::new(exchange, replay_windows, stream_cursors);
         let mut mutation_rng = SystemMutationRng::new()?;
         let _ = self
             .machine
-            .replace_opaque_runtime_state(&replacement, &mut mutation_rng)?;
+            .replace_runtime_projection_preserving_transfer_records(
+                expected,
+                exchange,
+                replay_windows,
+                stream_cursors,
+                &mut mutation_rng,
+            )?;
         Ok(())
     }
 }
@@ -3405,6 +4146,49 @@ fn validate_received_runtime_frame(
     Ok(())
 }
 
+fn decode_completed_transfer_stream_item(
+    payload: &[u8],
+    source: DurableStreamTransferSource,
+) -> Result<RuntimeStreamItem, RemoteRuntimeError> {
+    match source {
+        DurableStreamTransferSource::Catalog {
+            first_revision,
+            through_revision,
+        } => {
+            let delta =
+                canonical_json::<CatalogDelta>(payload).ok_or(RemoteRuntimeError::InvalidReply(
+                    "completed catalog transfer is not one canonical CatalogDelta",
+                ))?;
+            if first_revision > through_revision || delta.catalog_revision != through_revision {
+                return Err(RemoteRuntimeError::InvalidReply(
+                    "completed catalog transfer does not match its authenticated source range",
+                ));
+            }
+            Ok(RuntimeStreamItem::CatalogDelta(delta))
+        }
+        DurableStreamTransferSource::Event {
+            conversation_id,
+            event_id,
+            event_seq,
+        } => {
+            let event =
+                canonical_json::<RuntimeEvent>(payload).ok_or(RemoteRuntimeError::InvalidReply(
+                    "completed event transfer is not one canonical RuntimeEvent",
+                ))?;
+            if DurableStreamObjectId::parse_canonical(event.conversation_id.as_str())
+                != Ok(conversation_id)
+                || DurableStreamObjectId::parse_canonical(event.event_id.as_str()) != Ok(event_id)
+                || event.event_seq != event_seq
+            {
+                return Err(RemoteRuntimeError::InvalidReply(
+                    "completed event transfer does not match its authenticated source identity",
+                ));
+            }
+            Ok(RuntimeStreamItem::Event(event))
+        }
+    }
+}
+
 fn decode_direct_stream_item(
     binding: &StreamBindingV1,
     opened: SealedPayloadV1,
@@ -3548,6 +4332,20 @@ fn catalog_pending_recovery(
 enum ExchangeStart {
     Pending(PendingExchange),
     Terminal(DirectedReceipt),
+}
+
+fn select_subscription_restart_cursor(
+    existing: Option<&DurableExchange>,
+    fresh_target: RuntimeInnerCursor,
+) -> Result<RuntimeInnerCursor, RemoteRuntimeError> {
+    match existing {
+        Some(DurableExchange::Pending(PendingExchange {
+            operation: DirectedOperation::Subscribe { inner_cursor },
+            ..
+        })) if same_inner_target(inner_cursor, &fresh_target) => Ok(inner_cursor.clone()),
+        Some(DurableExchange::Pending(_)) => Err(RemoteRuntimeError::PendingIntentConflict),
+        Some(DurableExchange::Terminal(_)) | None => Ok(fresh_target),
+    }
 }
 
 fn select_exchange_start<F>(
@@ -4296,6 +5094,96 @@ mod tests {
         sha256(&counter.to_be_bytes())
     }
 
+    #[test]
+    fn completed_transfer_decoder_accepts_only_canonical_raw_source_payloads() {
+        let catalog = CatalogDelta {
+            catalog_revision: 9,
+            changes: Vec::new(),
+        };
+        let catalog_bytes = serde_json::to_vec(&catalog).unwrap();
+        let catalog_source = DurableStreamTransferSource::Catalog {
+            first_revision: 7,
+            through_revision: 9,
+        };
+        let decoded = decode_completed_transfer_stream_item(&catalog_bytes, catalog_source)
+            .expect("canonical raw CatalogDelta");
+        assert!(matches!(
+            decoded,
+            RuntimeStreamItem::CatalogDelta(CatalogDelta {
+                catalog_revision: 9,
+                ..
+            })
+        ));
+        assert!(
+            decode_completed_transfer_stream_item(
+                &catalog_bytes,
+                DurableStreamTransferSource::Catalog {
+                    first_revision: 7,
+                    through_revision: 10,
+                },
+            )
+            .is_err(),
+            "catalog payload must end at the authenticated through revision",
+        );
+        assert!(
+            decode_completed_transfer_stream_item(
+                &catalog_bytes,
+                DurableStreamTransferSource::Catalog {
+                    first_revision: 10,
+                    through_revision: 9,
+                },
+            )
+            .is_err(),
+            "catalog source range must be forward-contiguous",
+        );
+        let mut noncanonical_catalog = catalog_bytes.clone();
+        noncanonical_catalog.push(b'\n');
+        assert!(
+            decode_completed_transfer_stream_item(&noncanonical_catalog, catalog_source).is_err(),
+            "trailing bytes must fail exact canonical JSON comparison",
+        );
+
+        let conversation_id = DurableStreamObjectId::from_bytes([0x61; 16]).unwrap();
+        let event_id = DurableStreamObjectId::from_bytes([0x62; 16]).unwrap();
+        let event = RuntimeEvent::new(
+            ConversationId::new(conversation_id.to_string()),
+            agentdeck_protocol::runtime::identity::EventId::new(event_id.to_string()),
+            4,
+            None,
+            None,
+            None,
+            agentdeck_protocol::runtime::RuntimeEventBody::Error {
+                failure: RuntimeFailure::new("remote.test", "fixture"),
+            },
+        )
+        .unwrap();
+        let event_bytes = serde_json::to_vec(&event).unwrap();
+        let event_source = DurableStreamTransferSource::Event {
+            conversation_id,
+            event_id,
+            event_seq: 4,
+        };
+        let decoded = decode_completed_transfer_stream_item(&event_bytes, event_source)
+            .expect("canonical raw RuntimeEvent");
+        assert!(matches!(decoded, RuntimeStreamItem::Event(event) if event.event_seq == 4));
+        assert!(
+            decode_completed_transfer_stream_item(
+                &event_bytes,
+                DurableStreamTransferSource::Event {
+                    conversation_id,
+                    event_id: DurableStreamObjectId::from_bytes([0x63; 16]).unwrap(),
+                    event_seq: 4,
+                },
+            )
+            .is_err(),
+            "event payload must match all three authenticated identity fields",
+        );
+        assert!(
+            decode_completed_transfer_stream_item(&event_bytes, catalog_source).is_err(),
+            "a raw RuntimeEvent must not decode as a catalog completion",
+        );
+    }
+
     fn prompt_plan() -> DirectedRequestPlan {
         DirectedRequestPlan::prompt(SendPromptRequest {
             conversation_id: ConversationId::new("conversation-legacy-prompt"),
@@ -4735,6 +5623,86 @@ mod tests {
         };
         assert_eq!(pending.request_route, request_route);
         assert_eq!(pending.exact_send, exact_send);
+    }
+
+    #[test]
+    fn subscription_restart_reuses_same_target_pending_bytes_and_rejects_other_intents() {
+        let pending_cursor = RuntimeInnerCursor::Conversation {
+            conversation_id: ConversationId::new("11111111-1111-1111-1111-111111111111"),
+            cursor: StreamCursor::At(7),
+        };
+        let plan = DirectedRequestPlan::subscribe(pending_cursor.clone()).unwrap();
+        let request_route = RequestRouteId::from_bytes([0x72; 16]);
+        let exact_send = encode(&OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::Send(RelaySend {
+                device_route: DeviceRouteId::from_bytes([0x73; 16]),
+                request_route,
+                sealed_blob: SealedBlob(vec![0x74; 32]),
+            }),
+        });
+        let pending = PendingExchange {
+            operation: plan.operation.clone(),
+            intent_hash: plan.intent_hash,
+            message_id: MessageId::new("subscription-restart"),
+            request_route,
+            exact_send: exact_send.clone(),
+        };
+        let exchange = DurableExchange::Pending(pending);
+        let fresh = RuntimeInnerCursor::Conversation {
+            conversation_id: ConversationId::new("11111111-1111-1111-1111-111111111111"),
+            cursor: StreamCursor::BeforeFirst,
+        };
+        let restart = select_subscription_restart_cursor(Some(&exchange), fresh)
+            .expect("same target pending subscription restart");
+        assert_eq!(restart, pending_cursor);
+
+        let retry_plan = DirectedRequestPlan::subscribe(restart).unwrap();
+        let start = select_exchange_start(Some(exchange), retry_plan, |_| {
+            let mut panic_entropy = PanicEntropy;
+            let _ = random_nonzero::<16, _>(&mut panic_entropy)?;
+            Err(RemoteRuntimeError::InvalidDurableState)
+        })
+        .expect("pending subscribe must retry exact bytes without entropy");
+        let ExchangeStart::Pending(retried) = start else {
+            panic!("pending subscribe must remain pending")
+        };
+        assert_eq!(retried.exact_send, exact_send);
+
+        let other_target = RuntimeInnerCursor::Conversation {
+            conversation_id: ConversationId::new("22222222-2222-2222-2222-222222222222"),
+            cursor: StreamCursor::BeforeFirst,
+        };
+        let subscribe_pending = DurableExchange::Pending(retried);
+        assert!(matches!(
+            select_subscription_restart_cursor(Some(&subscribe_pending), other_target),
+            Err(RemoteRuntimeError::PendingIntentConflict)
+        ));
+        let prompt_pending = pending_exchange(prompt_plan().operation);
+        assert!(matches!(
+            select_subscription_restart_cursor(
+                Some(&prompt_pending),
+                RuntimeInnerCursor::Conversation {
+                    conversation_id: ConversationId::new("11111111-1111-1111-1111-111111111111"),
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            ),
+            Err(RemoteRuntimeError::PendingIntentConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_safe_io_prefers_frame_and_latches_simultaneous_interrupt() {
+        let cancel = std::future::ready("signal");
+        tokio::pin!(cancel);
+        let outcome = wait_for_cancel_safe_io(cancel.as_mut(), std::future::ready("frame")).await;
+        assert!(matches!(
+            outcome,
+            RemoteRuntimeInterruptible::CompletedAndInterrupted {
+                output: "frame",
+                interrupt: "signal",
+            }
+        ));
     }
 
     #[test]

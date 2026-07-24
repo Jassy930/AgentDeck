@@ -173,7 +173,8 @@ oracle。诊断日志同样只能记录 failure code、脱敏 route 短标识和
 P3.9 Runtime v2 hard cutover 后，Runtime v1 TBS 签发的 persisted cert/grant、control
 grant/revocation/retirement 都统一表现为 `relay.auth.invalid_grant`；旧 Link/Data cert 经公网
 enrollment 统一表现为 `relay.enrollment.rejected`。不要根据通用 code 猜具体失败字段，也不要自动降级。
-P4.2 曾 additive 升为 Runtime v3；P4.3 current contract 已再升为 Runtime v4，不提供 production v3/v4 双栈。开发环境发现旧凭据时，
+P4.2 曾 additive 升为 Runtime v3，P4.3 又升为 Runtime v4；P4.6 automatic Task complete的
+current contract 已升为 Runtime v5，production 只接受 current v5。开发环境发现旧凭据时，
 先用可信 Relay admin inventory 定位 realm：存在时执行 purge 并取得 portable signed receipt，不存在时记录
 可信 absent 结果；随后只用本页 P4.2 本地 trust-reset 命令重新 enroll。不得手改 SQLite/Keychain 代替。
 
@@ -433,7 +434,7 @@ sentinel；出现应用明文、key、签名或 enrollment code 均是安全回�
 | code / 现象 | 含义 | 下一步 |
 | --- | --- | --- |
 | `remote.v1.reset_required` | 发现旧 marker、悬空 symlink，或 metadata 状态无法安全判断 | 不读取 marker；停止旧 Relay，按上节显式 reset 后重新配对 |
-| `remote.persistent.unsupported` | P4 前调用了持久 remote 命令 | 只运行 synthetic 门禁；等待 P4 Keychain/持久状态机，不要自行落 secret 文件 |
+| `remote.persistent.unsupported` | 当前平台或 production identity/composition 不支持持久 remote；非受支持平台、unsigned/ad-hoc 或缺 entitlement/access-group 都可能触发 | 先区分签名、平台与 composition 前置；不要落 secret 文件、绕过签名或把 automatic injected PASS 当 production PASS。`watch` 已属于支持命令面，不得再以“命令未实现”解释该错误 |
 | `/v1/connect` 返回 426 | 预期的无状态 migration tombstone | 升级到 v2；禁止自动降级或重试 v1 |
 | synthetic 在 SPKI/CA/hostname 前失败 | server identity 未通过完整验证 | 核对证书、DNS、bundle 与 pin 轮换；不得改成明文或 pin-only |
 | synthetic 返回 authentication terminal | signed revoke/retire 已成为当前终态 | 验 canonical terminal；临时身份直接丢弃，持久身份由 P4 状态机处理 |
@@ -717,7 +718,7 @@ P3.9-D（`b818f81`）又把 `agentdeck` Rust binary 默认入口与
 | --- | --- | --- |
 | `daemon.client.installation_home_failed` / `installation_parent_unsafe` / `installation_record_unsafe` / `installation_record_corrupt` / `installation_publish_unsupported` / `installation_io_failed` | passwd home 不可用，installation parent/record 的 type、owner、mode、nlink 不安全，record 非 canonical，或 no-replace/fsync I/O 失败 | 保留原 record 与目录；修复 OS account home/权限/文件系统，不删除或自动轮换 identity，不改用 `HOME` 覆盖 |
 | `daemon.client.socket_path_invalid` / `socket_missing` / `socket_parent_unsafe` / `socket_unsafe` / `connect_failed` / `socket_option_failed` | canonical UDS 路径非法或不存在，parent/socket 的 type、owner、mode、nlink 不满足，connect 或 socket option 失败 | GUI、Rust CLI 与 Swift selfcheck 都直接暴露该失败且零 fallback；核对 stable daemon/LaunchAgent、current-EUID installation 与 canonical path，不用 diagnostics/legacy stdio 成功覆盖 Runtime socket failure |
-| `daemon.client.preface_failed` / `encode_failed` / `hello_invalid` / `hello_order_invalid` / `sequence_required` / `message_id_duplicate` / `server_request_forbidden` / `reply_uncorrelated` | preface/Hello/首帧/messageId/reply sequence 编码或协议被破坏 | 关闭当前 fd，升级为同一 Runtime v4 candidate；若 daemon 返回 `daemon.runtime.protocol_mismatch`，client 会保留该精确 code，不包成通用错误 |
+| `daemon.client.preface_failed` / `encode_failed` / `hello_invalid` / `hello_order_invalid` / `sequence_required` / `message_id_duplicate` / `server_request_forbidden` / `reply_uncorrelated` | preface/Hello/首帧/messageId/reply sequence 编码或协议被破坏 | 关闭当前 fd，升级为同一 Runtime v5 candidate；若 daemon 返回 `daemon.runtime.protocol_mismatch`，client 会保留该精确 code，不包成通用错误 |
 | `daemon.client.connection_closed` / `read_failed` / `frame_invalid` / `frame_unterminated` / `frame_too_large` / `write_failed` / `write_timeout` / `write_handoff_incomplete` / `close_failed` | EOF、JSONL/1 MiB framing、read/write/flush/cancellation 或 close 失败 | 未见 terminal 的 sender close 必须按 failure 处理；App 先等待共享 close barrier，不能在 fault callback 内热重连。下一次用户操作才建新 wire；有副作用请求保守复用 exact Runtime request payload、stable idempotency key 与冻结 revision，让新 wire 自行分配 outer messageId 并由 daemon 裁决 durable outcome，不能把 EOF 当正常完成 |
 | `daemon.client.reply_backpressure` / `reply_sequence_backpressure` / `reply_timeout` / `reply_drain_expired` / `stream_backpressure` | pending/reply/stream 的 frame、retained-byte budget、absolute deadline 或 TTL 到界；Rust CLI 完整 reply sequence 共用一个 30 秒 deadline，中间帧不续期；Swift 普通 event/catalogDelta 与 transfer complete 都计入 stream byte budget | 关闭当前连接并有界重连；有副作用请求用原 idempotency key 重发 exact request，让 daemon 裁决 replay/conflict，或由同 owner 显式查询 durable receipt。先消费/取消旧 sequence，不扩大 channel 或并发生成新 messageId |
 | `daemon.client.transfer_backpressure` / `transfer_binding_mismatch` / `transfer_expired` / `transfer_incomplete` / `transfer_invalid` / `transfer_tombstone_desync` | transfer part 数量、byte/hash/binding/TTL/completed tombstone 不一致 | 丢弃当前重组状态并关闭连接；从 daemon cursor 重新同步，不接受 partial payload 或复用 transferId |
@@ -807,8 +808,8 @@ automatic gate 正确，不表示 production signing PASS。P3.1 继续采用方
 P4.2 又由 `a6842bc` 完成 Link/Data cert、enrollment workflow、receipt IO、control-only
 RemoteTransport 与 trust reset；P4.3 又完成 PairInvite/DeviceGrant/auth ledger/revoke/control handoff；
 P4.4 由 `cd7d9fb` 完成 MachineLink ingress/RuntimeCore dispatch；P4.5 由 `c6ef387`、`88b3c42`
-完成 signed publication、key/counter/replay crash recovery。P4 当前为 5/7，下一项 P4.6 persistent
-remote CLI。
+完成 signed publication、key/counter/replay crash recovery。P4.6 persistent remote CLI automatic Task
+已完成，current Runtime wire 为 v5；P4 按 Task 进度为 6/7。P4.7 与 P4 Phase Exit 仍未完成。
 
 ### P4.1 machine identity / Keychain guard 排障
 
@@ -847,8 +848,8 @@ BLOCKED，不是 P4.1/P4.2 automatic PASS 证据。
 
 ### P4.2 machine enrollment / control-only transport / trust reset / purge 排障
 
-P4.2 收口时 Runtime protocol 是 v3、physical schema 是 **v9 / 25 张表**；current P4.3 已升级为
-Runtime v4、schema v10/30 表。本节以下 enrollment/trust-reset lifecycle 仍保持兼容。P4.2 新增 authenticated
+P4.2 收口时 Runtime protocol 是 v3、physical schema 是 **v9 / 25 张表**；P4.3 收口时升级为
+Runtime v4、schema v10/30 表，current P4.6 contract 已使用 Runtime v5。本节以下 enrollment/trust-reset lifecycle 仍保持兼容。P4.2 新增 authenticated
 `machine_remote_state` 与以下可公开的最小 lifecycle；status 只允许 Relay server ID、machine route、root
 fingerprint、trust epoch 和 bounded failure code，不得回显 code、origin/pin、cert、receipt、terminal 或 proof：
 
@@ -876,7 +877,7 @@ receipt trust-reset 不做网络或删除，只返回该安全操作提示。
 | `remote.local_input.unsafe` | bundle/receipt 不是 current-UID、single-link、no-follow、group/other 权限为零的 regular file | 修正可信原文件 owner/mode/nlink；禁止 symlink、hardlink、目录、FIFO 或宽权限副本 |
 | `remote.local_input.too_large` | 输入超过固定 64 KiB | 从可信 Relay 重新导出严格 DTO；禁止提高上界或截断 JSON |
 | `remote.local_input.invalid_json` | deny-unknown JSON、版本或 portable receipt shape/签名字段编码非法 | 不猜字段、不做宽松 decode；重新取得 current bundle/receipt |
-| `daemon.client.machine_status_invalid` | daemon 返回的 lifecycle/binding/failure-code 组合不满足 current Runtime v4 contract | 关闭 fd并升级 client/daemon到同一 candidate；不要展示部分 binding 或生成 purge 模板 |
+| `daemon.client.machine_status_invalid` | daemon 返回的 lifecycle/binding/failure-code 组合不满足 current Runtime v5 contract | 关闭 fd并升级 client/daemon到同一 candidate；不要展示部分 binding 或生成 purge 模板 |
 | `daemon.remote.administration.unavailable` | remote 显式禁用或未安装 production manager | 使用 stable remote-enabled daemon；ephemeral/no-remote 不得开启网络 |
 | `daemon.remote.start_not_armed` | recovery/UDS 尚未产生或 transport 已消费 `RemoteStartPermit` | 检查 startup ownership/order；不得绕过 permit直接连接 Relay |
 | `daemon.remote.shutting_down` | manager 正在停止 | 等待同一 daemon 完成 shutdown；不要并发 enroll/reset |
@@ -905,7 +906,7 @@ Clone 的 exact retry state，重拨必须复用相同 authenticator、cert与 s
 
 #### P4.3 Pairing、grant 与 revoke
 
-Pairing 只允许 same-UID canonical Runtime v4 UDS 管理。invite absolute TTL 为 298 秒；RouteAccepted 不是
+Pairing 只允许 same-UID canonical Runtime v5 UDS 管理。invite absolute TTL 为 298 秒；RouteAccepted 不是
 grant/delivery 成功，只有 exact DeviceSign-signed `PairResponseReceived` 才能推进 delivered。错误后必须保留
 durable frozen state并用同一 idempotency key/pairing ID/grant serial 重试，不能重建 secret/grant：
 
@@ -948,7 +949,7 @@ RuntimeCore/Store。
 | `daemon.remote.ingress.invalid_outer` / `invalid_sealed_blob` / `invalid_key_binding` | Relay route/context、canonical sealed blob 或 DeviceCommandTx key epoch/revision 不匹配 | 在 Core 前拒绝；核对 current Relay v2 / E2EE v1 wire 与 key directory，禁止宽松 decode |
 | `daemon.remote.ingress.invalid_signature` / `replay_rejected` / `invalid_ciphertext` | DeviceSign、counter+ciphertext replay tuple 或 AEAD 验证失败 | 丢弃 frame 并保留 current replay window；不调用 Core、不返回业务成功 |
 | `daemon.remote.ingress.authorization_denied` | device/grant 不是 Active，或 crypto 后 exact-current auth-ledger recheck 因 revoke/renew/key revision 变化失败 | 保持 fail-close；读取本机 auth ledger，禁止缓存旧 grant 绕过 recheck |
-| `daemon.remote.ingress.invalid_runtime_request` | 解密 payload 不是 current Runtime v4 request | 拒绝且不猜测版本/类型；四个协议版本轴不得联动升级 |
+| `daemon.remote.ingress.invalid_runtime_request` | 解密 payload 不是 current Runtime v5 request | 拒绝且不猜测版本/类型；四个协议版本轴不得联动升级 |
 | `daemon.remote.link.generation_replaced` / `transport_failed` / `closed` | active business generation 被新连接替换，或 transport/actor 结束 | 丢弃 stale generation 的 reply route并由唯一 supervisor 有界恢复；不创建第二 owner |
 | `daemon.remote.link.core_unavailable` / `core_rejected` / `core_dispatch_capacity` | Core 不可用、拒绝 request 或有界 dispatch lane 已满 | 不把 RouteAccepted 提升为 command success；返回 typed failure 并保持有界背压 |
 | `daemon.remote.link.reply_route_unknown` / `reply_route_capacity` / `reply_authorization_mismatch` / `reply_seal_invalid` / `invalid_core_egress` | directed reply route 过期/满载、授权错绑、sealer 返回错绑 wire，或 Core 输出不是 Reply/Stream | drop write 且不 ACK；不换 route、不宽松校验 |
@@ -969,6 +970,50 @@ counter、创建第二 driver，或让普通 drive 绕过 remote fence。
 | `daemon.remote.transition.progress_pending` | publication outcome unknown、commit pending 或 typed Store busy，尚不能证明 durable progress | 唯一 owner 按 250 ms→30 s 有界退避复用 exact request/blob；不得 reseal、换 idempotency binding 或创建第二 driver |
 | `daemon.remote.transition.reconnect_pending` | Relay offline，transition 只能等待 authenticated generation replacement | 等待认证 transport generation 变化后由同一 owner 恢复；不做 timer retry，普通 drive 不得绕过 |
 | `remote.transport.publication_offline` | activation/generation 仍有效，但当前 authenticated session reader offline | dispatcher 停放冻结 exact blob；authenticated reconnect 后重发同一 artifact，不 ACK、不重封 |
+
+#### P4.6 persistent CLI durable transfer / watch（automatic Task complete）
+
+current Runtime wire 为 v5。persistent CLI 已接入 `pair`、`machines`、`conversations`、`watch`、`prompt`、
+`approve`、`retry-approval`、`revoke-self`。`watch` 从 fresh authenticated bootstrap 开始，以 canonical
+NDJSON 输出 `bootstrap|synchronized|live|control|terminal`；paired-state V6 把 durable stream binding 与
+live-transfer records 放入同一 sealed CAS；V1–V5 冷读映射为空 transfer collection，不做隐式写迁移。
+下列 `remote.transfer.*` 是要求废弃
+exact binding 并重新 bootstrap 的稳定 marker，不是放宽校验后继续组包的许可：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `remote.transfer.identity_invalid` / `metadata_mismatch` / `target_mismatch` / `stale_binding` | transfer identity、authenticated metadata、stream target 或 exact binding 不一致 | 原子保留 NeedsBootstrap marker并丢弃该 exact binding 的 active partial；completed tombstone 只用于 exact duplicate 去重，随受控 binding replacement、TTL 清理或 256 条硬上界下的 oldest eviction 回收。越过已驱逐 tombstone 的旧 source 仍由 inner cut fail-close 并要求重新 bootstrap，不猜 source/cursor |
+| `remote.transfer.duplicate_conflict` | 同一 part index 的 durable bytes 与重放 bytes 冲突 | fail-close 当前 binding；不得任选一份、覆盖 durable bytes 或继续 hash assembly |
+| `remote.transfer.expired` / `active_limit` | sealed absolute TTL 或 active transfer 数到界 | 停止接收当前 binding 并重新 bootstrap；idle TTL 由 runtime 自己唤醒并 durable commit，不等待下一 Relay frame，也不得通过重连续期 |
+| `remote.transfer.reassembly_full` | 通用 reassembly logical budget，或 paired-state V6 normal plaintext budget 到界；128 MiB hard cap 顶部按 4,096 个 binding 聚合预留 replay+marker emergency 空间，这不是 RSS 断言 | replay admission 自身超限时与 marker 同一 exact CAS 落盘；replacement candidate 超限也从 current exact state 持久化 compact marker。两者均保留 replay admission，但 ACK/outer applied/reducer/inner cursor 不推进并清空 exact binding 的 active/buffered records；冷重开后 Publish/Gap/ReplayComplete 均保持原 marker fence。不得驱逐其他 binding state、扩大容量或让超 normal 的 legacy state 先写后失败 |
+| `remote.transfer.length_mismatch` / `hash_mismatch` / `payload_rejected` | 完整 payload 与 authenticated length/hash 不符，或上层 reducer 拒绝已认证 payload | 不发布 partial/complete 结果；保留稳定 marker，换新 binding 后从 snapshot/cut 重新同步 |
+| `remote.runtime.reducer_capacity` | subscription reducer 声明的 inline + transitive retained 上界无效或超过 64 MiB | 在 transport IO 与 durable mutation 前拒绝；修正 reducer 的真实静态资源契约，不得调高全局上限或把声明值当作 RSS 证据 |
+| `remote.runtime.state_invalid` | 持久 Runtime 状态不可信；例如 cold restart 后 wall clock 早于 paired-state V6 sealed transfer watermark，scheduler 无法可信计算 absolute TTL | 立即 fail-close 并修复系统时钟或损坏状态；回拨路径不得等待放大的 timer、伪造 expired marker或发送 transport frame，且 paired-state records byte-exact 零写、ACK/reducer/cursor 不推进 |
+
+prepared ADST v2 的 Normal/EmergencyBootstrapMarker mode 位于 AEAD 认证内容，CounterGuard sealed
+commitment 绑定完整 sidecar；legacy ADST v1 只解释为 Normal。4095→4096 marker 的 guard-first 与
+active-first crash cut 都必须恢复到 exact next state/stable guard 并清理 sidecar。cleanup 仅由 exact owner
+unlink 并可安全 retry；sidecar 缺失后的 reseal、commitment conflict 或 legacy over-normal CounterPending
+active-next 都必须 fail-close，state/guard/sidecar 保持 byte-exact 零写。
+
+| watch code / terminal | 含义 | 下一步 |
+| --- | --- | --- |
+| `remote.runtime.outcome_unknown` | EOF 或普通断线发生在 authenticated terminal 前 | 非成功退出；保留 durable state 并从 fresh bootstrap 重试，不得合成 stopped/revoked |
+| `remote.watch.output_failed` | canonical NDJSON 编码、写入或 flush 失败 | 关闭 transport 并失败退出；不要把未 flush record 当作消费者已观察 |
+| `remote.watch.signal_failed` | SIGINT/SIGTERM listener 无法建立或异常关闭 | shutdown 后失败退出；修复本机 signal 环境，不改写 durable cursor |
+| `remote.runtime.handshake_revoked` / terminal `revoked` | 握手期已取得 verified root-signed revoked terminal；或 active connection 收到相同终态 | revoked 优先于 ready signal；只有 transport shutdown/drop 与 crash-safe paired cleanup 完成后才公开 terminal `status=revoked` |
+| terminal `stopped` | SIGINT/SIGTERM 已 latch | 当前 exact frame 必须先 durable apply + ACK terminal；marker/control 先输出。Connected+ready signal 时零 Subscribe，shutdown 后才输出 `status=stopped` |
+
+这些 code 与 paired-state V6 focused tests 属于 P4.6 automatic Task 证据。2026-07-24 冻结 code/test
+scope 为 29 paths，blob-manifest SHA-256 为
+`32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`；watch `12/12`、
+`remote_persistent_machines` `11/11`、release allocator `1/1`、relay-client `25/25`、protocol
+`244/244` 与完整 CLI package final run 均通过，四 schema、三 crate Clippy、fmt、network/no-net、docs、diff
+全绿。`spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。
+`p4-auto`、P4 Phase Exit 与 production-signed Keychain 仍未闭合，不能把 marker 行为写成
+production-signed 或真实公网 watch PASS。真实 entitlement/access-group roundtrip 继续保持 post-MVP BLOCKED。
+8 MiB lowered-cap 只在 `debug_assertions` automatic test build 中存在，release artifact 不编译该入口，
+production CLI/env/config 也不能选择该值；P4.7 与 P4 Phase Exit 仍未完成。
 
 #### Trust reset 与本地 cleanup
 
@@ -998,7 +1043,7 @@ portable receipt完成普通 trust-reset；`daemon uninstall --purge` 本身不�
 | `daemon.purge.daemon_not_running` / `pid_missing` / `pid_changed` / `daemon_still_running` / `socket_unsafe` | live daemon/PID/UDS无法建立稳定停止边界 | 停止操作并核对launchd、PID与socket identity；不得在进程仍可能运行时调用finalizer |
 | `daemon.purge.helper_missing` / `helper_unsafe` / `helper_mismatch` / `attestation_mismatch` / `attestation_changed` | retained helper不存在，或owner/mode/nlink/version/hash/signature发生变化 | 零删除；恢复同一已签名安装artifact，禁止换helper续做原plan |
 | `daemon.purge.namespace_invalid` / `install_layout_invalid` / `filesystem_unsafe` / `stopped_recovery_unsafe` / `stopped_permit_mismatch` | stable namespace、bin/current/plist/parent或stopped permit不满足exact安全布局 | 保留残余并修复真实安装布局；禁止symlink/hardlink/递归rm绕过 |
-| `daemon.purge.runtime_request_invalid` / `runtime_reply_invalid` / `runtime_readback_mismatch` | current Runtime v4 purge request/reply不是exact plan或未读回`PurgeReadbackAbsent`+marker | 不bootout、不删文件；升级同一candidate并用原plan重试 |
+| `daemon.purge.runtime_request_invalid` / `runtime_reply_invalid` / `runtime_readback_mismatch` | current Runtime v5 purge request/reply不是exact plan或未读回`PurgeReadbackAbsent`+marker | 不bootout、不删文件；升级同一candidate并用原plan重试 |
 | `daemon.purge.key_item_conflict` / `storage_kek_missing` / `storage_kek_conflict` | machine key/guard/StorageKEK与frozen binding冲突或KEK在marker前已缺失 | 停止finalizer；DB absent或部分key absent不能补充授权 |
 | `daemon.purge.delete_readback_failed` / `cleanup_readback_failed` / `terminal_proof_failed` / `synchronization_failed` | 删除后仍可读、retained helper/bin仍存在、marker-missing终态证明或fsync失败 | 保留剩余artifact并exact retry；不得打印成功或假定最终一致 |
 | `daemon.purge.helper_failed` / `io_failed` | finalizer子进程或文件系统操作失败 | 读取稳定code与剩余exact paths，保持plan/marker；不要无计划续删 |
@@ -1149,11 +1194,12 @@ StoreCommitHub 同样在 oneshot reply 前把 backfill/snapshot pin 交给 clean
 `pin created -> cleanup bound -> oneshot send` 的顺序与对应 worker diagnostic。
 
 P3.6 publication 只接受测试注入的 opaque/fake sealed blob，验证 freeze/COMMIT/ACK/restart 算法；这是
-P3.6 历史 component gate 的边界。当前 P4.5 已安装真实 MachineDataSign/E2EE sealing、CounterGuard 与
+P3.6 历史 component gate 的边界。P4.5 已安装真实 MachineDataSign/E2EE sealing、CounterGuard 与
 Relay publication，但 P3.6 的 fake blob、Runtime TransferPart 或 Simulator fixture 仍不能冒充 P4.5
-证据。transfer reassembly 当前仍是 bounded component API，duplicate/metadata/hash/length/TTL/配额冲突
-返回 typed `TransferError`；P4.5 为 publication dispatcher 安装 production remote owner，不等于
-`TransferStateMachine` 已接入真实远程收发，也不得据此虚构 transfer wire failure code 或 WSS 诊断。
+证据。P4.6 automatic Task 已把 bounded transfer reassembly 接入 paired-state V6 durable
+records，duplicate/metadata/hash/length/TTL/配额冲突映射为上表 `remote.transfer.*` bootstrap marker，并接入
+authenticated watch。冻结范围与门禁证据见上节；这些 automatic 证据仍不得据此宣称
+production-signed、真实公网持续 watch/WSS、iOS 真链路或 P4 Phase PASS。
 
 P3.3 canonical adapter 边界的错误不会携带 raw resume reference：
 
