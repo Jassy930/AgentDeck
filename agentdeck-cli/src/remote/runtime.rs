@@ -17,7 +17,8 @@ use agentdeck_protocol::e2ee::{
     DirectoryCurrentV1, E2eeError, KeyControlV1, KeyUpdateAckV1, REMOTE_CRYPTO_BAD_CIPHERTEXT,
     REMOTE_CRYPTO_BAD_SENDER_SIGNATURE, REMOTE_CRYPTO_COUNTER_REPLAY,
     REMOTE_CRYPTO_KEY_EPOCH_MISSING, REMOTE_CRYPTO_KEY_REVISION_ROLLBACK,
-    REMOTE_CRYPTO_NONCE_REUSE, SealedPayloadKind, SealedPayloadV1, StreamBindingV1,
+    REMOTE_CRYPTO_NONCE_REUSE, SealedPayloadKind, SealedPayloadV1, StreamAppliedAckV1,
+    StreamBindingV1,
 };
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, Ack as RelayAck, SealedBlob, Send as RelaySend, Subscribe as RelaySubscribe,
@@ -70,9 +71,11 @@ const REPLAY_VERSION: u16 = 1;
 const MAX_REPLAY_WINDOWS: usize = 4_096;
 const MAX_REPLAY_ENTRIES: usize = 4_096;
 const MAX_PENDING_KEY_UPDATE_ACK_ROUTES: usize = 8;
+const MAX_PENDING_STREAM_APPLIED_ACK_ROUTES: usize = 64;
 const MAX_PENDING_KEY_SYNC_ROUTES: usize = 8;
 const MAX_PENDING_KEY_SYNC_ACCEPTANCES_PER_ROUTE: usize = 8;
 const KEY_SYNC_RECOVERY_ACK_TIMEOUT_MS: u64 = 5_000;
+const STREAM_APPLIED_ACK_RECOVERY_ACCEPT_TIMEOUT_MS: u64 = 5_000;
 const CATALOG_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteCatalogIntentV1\0";
 const INTENT_DOMAIN: &[u8] = b"AgentDeck/RemotePromptIntentV1\0";
 const RESOLVE_APPROVAL_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteResolveApprovalIntentV1\0";
@@ -80,6 +83,34 @@ const RETRY_APPROVAL_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteRetryApprovalInten
 const REVOKE_SELF_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteRevokeSelfIntentV1\0";
 const SUBSCRIBE_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteSubscribeIntentV1\0";
 const MUTATION_RNG_DOMAIN: &[u8] = b"AgentDeck/RemoteRuntimeMutationRngV1\0";
+
+fn stream_applied_ack_recovery_batches<T>(pending: &[T]) -> std::slice::Chunks<'_, T> {
+    pending.chunks(MAX_PENDING_STREAM_APPLIED_ACK_ROUTES)
+}
+
+#[async_trait]
+trait BoundedStreamAppliedAckRecoveryDriver {
+    type Item: Sync;
+
+    async fn send_recovery_item(&mut self, item: &Self::Item) -> Result<(), RemoteRuntimeError>;
+    async fn await_recovery_batch(&mut self) -> Result<(), RemoteRuntimeError>;
+}
+
+async fn recover_stream_applied_ack_batches<D>(
+    driver: &mut D,
+    pending: &[D::Item],
+) -> Result<(), RemoteRuntimeError>
+where
+    D: BoundedStreamAppliedAckRecoveryDriver + Send,
+{
+    for batch in stream_applied_ack_recovery_batches(pending) {
+        for item in batch {
+            driver.send_recovery_item(item).await?;
+        }
+        driver.await_recovery_batch().await?;
+    }
+    Ok(())
+}
 
 /// Remote Runtime 对 Relay transport 的最小需求；transport 不解析或伪造业务回执。
 #[async_trait]
@@ -252,6 +283,20 @@ pub enum RemoteStreamFrameOutcome {
     /// Relay 只确认 KeyUpdateAck `Send` 进入有界 writer；durable ACK basis 不会因此清除。
     KeyUpdateAckRouteAccepted {
         key_directory_revision: u64,
+    },
+    /// exact EpochBarrier 已通过 staged replay→AEAD→combined paired-state CAS，receipt 与
+    /// cumulative Relay ACK 均在 durable activation 之后发送；不进入业务 reducer。
+    EpochBarrierApplied {
+        stream_seq: u64,
+        key_directory_revision: u64,
+        key_epoch: u64,
+        already_applied: bool,
+    },
+    /// Relay 只确认 StreamAppliedAck `Send` 进入 writer；durable receipt basis 保留，
+    /// 不能把该状态当作 daemon 已完成 transition。
+    StreamAppliedAckRouteAccepted {
+        stream_route: StreamRouteId,
+        applied_stream_seq: u64,
     },
 }
 
@@ -444,11 +489,13 @@ struct PendingKeySyncRoute {
 fn request_route_is_owned(
     request_route: RequestRouteId,
     pending_key_update_ack_routes: &HashMap<RequestRouteId, KeyDirectoryRevision>,
+    pending_stream_applied_ack_routes: &HashMap<RequestRouteId, (StreamRouteId, u64)>,
     pending_key_sync_routes: &HashMap<RequestRouteId, PendingKeySyncRoute>,
     active_key_sync_route: Option<RequestRouteId>,
     pending_exchange_route: Option<RequestRouteId>,
 ) -> bool {
     pending_key_update_ack_routes.contains_key(&request_route)
+        || pending_stream_applied_ack_routes.contains_key(&request_route)
         || pending_key_sync_routes.contains_key(&request_route)
         || active_key_sync_route == Some(request_route)
         || pending_exchange_route == Some(request_route)
@@ -458,7 +505,24 @@ pub struct RemoteRuntime<'a, T> {
     transport: T,
     machine: OpenedPairedMachine<'a>,
     pending_key_update_ack_routes: HashMap<RequestRouteId, KeyDirectoryRevision>,
+    pending_stream_applied_ack_routes: HashMap<RequestRouteId, (StreamRouteId, u64)>,
     pending_key_sync_routes: HashMap<RequestRouteId, PendingKeySyncRoute>,
+}
+
+#[async_trait]
+impl<T> BoundedStreamAppliedAckRecoveryDriver for RemoteRuntime<'_, T>
+where
+    T: RemoteRuntimeTransport,
+{
+    type Item = StreamAppliedAckV1;
+
+    async fn send_recovery_item(&mut self, item: &Self::Item) -> Result<(), RemoteRuntimeError> {
+        self.send_stream_applied_ack(item).await.map(|_| ())
+    }
+
+    async fn await_recovery_batch(&mut self) -> Result<(), RemoteRuntimeError> {
+        self.await_stream_applied_ack_recovery_acceptances().await
+    }
 }
 
 impl<'a, T> RemoteRuntime<'a, T>
@@ -471,6 +535,7 @@ where
             transport,
             machine,
             pending_key_update_ack_routes: HashMap::new(),
+            pending_stream_applied_ack_routes: HashMap::new(),
             pending_key_sync_routes: HashMap::new(),
         }
     }
@@ -818,6 +883,57 @@ where
                 let candidate = self.machine.verify_stream_publish(&durable, &publish)?;
                 let candidate = match candidate {
                     VerifiedStreamPublish::Current(candidate) => *candidate,
+                    VerifiedStreamPublish::StagedEpochBarrier(candidate) => {
+                        let mut mutation_rng = SystemMutationRng::new()?;
+                        let (admitted, disposition) = self.machine.admit_staged_epoch_barrier(
+                            &durable,
+                            candidate.as_ref(),
+                            &mut mutation_rng,
+                        )?;
+                        match disposition {
+                            StreamPublishDisposition::NonceReuseQuarantined => {
+                                return Err(RemoteRuntimeError::NonceReuse);
+                            }
+                            StreamPublishDisposition::Fresh
+                            | StreamPublishDisposition::PendingDuplicate => {}
+                            StreamPublishDisposition::AppliedDuplicate => {
+                                return Err(RemoteRuntimeError::InvalidDurableState);
+                            }
+                        }
+                        let verified = self
+                            .machine
+                            .open_verified_staged_epoch_barrier(admitted, *candidate)?;
+                        let prepared = self.machine.prepare_epoch_barrier_activation(verified)?;
+                        let committed = self
+                            .machine
+                            .commit_epoch_barrier_activation(prepared, &mut mutation_rng)?;
+                        let ack = committed.ack().clone();
+                        let stream_binding = committed.stream_binding().clone();
+                        let already_applied = committed.already_committed();
+                        self.send_stream_applied_ack(&ack).await?;
+                        self.send_stream_ack(&stream_binding).await?;
+                        return Ok(RemoteStreamFrameOutcome::EpochBarrierApplied {
+                            stream_seq: ack.applied_stream_seq,
+                            key_directory_revision: ack.key_directory_revision.value(),
+                            key_epoch: ack.key_epoch,
+                            already_applied,
+                        });
+                    }
+                    VerifiedStreamPublish::CommittedEpochBarrierDuplicate(candidate) => {
+                        let committed = self
+                            .machine
+                            .open_committed_epoch_barrier_duplicate(durable, *candidate)?;
+                        let ack = committed.ack().clone();
+                        let stream_binding = committed.stream_binding().clone();
+                        self.send_stream_applied_ack(&ack).await?;
+                        self.send_stream_ack(&stream_binding).await?;
+                        return Ok(RemoteStreamFrameOutcome::EpochBarrierApplied {
+                            stream_seq: ack.applied_stream_seq,
+                            key_directory_revision: ack.key_directory_revision.value(),
+                            key_epoch: ack.key_epoch,
+                            already_applied: true,
+                        });
+                    }
                     VerifiedStreamPublish::Higher(candidate) => {
                         return self
                             .coordinate_key_sync((*candidate).into_observation())
@@ -826,7 +942,8 @@ where
                 };
                 let stream_seq = candidate.stream_seq();
                 let (admitted, disposition) = durable
-                    .admit_publish(
+                    .admit_publish_at_authenticated_revision(
+                        candidate.header_directory_revision(),
                         candidate.stream_seq(),
                         candidate.counter(),
                         candidate.ciphertext_sha256(),
@@ -1131,6 +1248,59 @@ where
         self.pump_durable_key_sync_recovery().await
     }
 
+    /// 建连后、业务交付前重封所有 durable StreamAppliedAck basis。每次重封使用新的
+    /// CounterGuard reservation/requestRoute，但 ACK body 保持 canonical exact。durable
+    /// receipt 可跨连接累计到 binding 总上限，因此只允许 64 条在途：每批必须消费全部
+    /// RouteAccepted 后再继续；accepted 仍不清 basis，后续连接会幂等重发全量 receipt。
+    pub async fn recover_durable_epoch_barrier_acks(&mut self) -> Result<(), RemoteRuntimeError> {
+        if !self.pending_stream_applied_ack_routes.is_empty()
+            || !self.pending_key_update_ack_routes.is_empty()
+            || !self.pending_key_sync_routes.is_empty()
+        {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        let pending = self.machine.pending_stream_applied_acks()?;
+        recover_stream_applied_ack_batches(self, &pending).await
+    }
+
+    async fn await_stream_applied_ack_recovery_acceptances(
+        &mut self,
+    ) -> Result<(), RemoteRuntimeError> {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(
+                STREAM_APPLIED_ACK_RECOVERY_ACCEPT_TIMEOUT_MS,
+            ))
+            .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+        while !self.pending_stream_applied_ack_routes.is_empty() {
+            let received = match tokio::time::timeout_at(deadline, self.transport.recv()).await {
+                Ok(received) => received?,
+                Err(_) => return Err(RemoteRuntimeError::OutcomeUnknown),
+            }
+            .ok_or(RemoteRuntimeError::OutcomeUnknown)?;
+            validate_received_runtime_frame(&received)?;
+            let (frame, _) = received.into_parts();
+            let RelayFrameBody::RouteAccepted(accepted) = frame.body else {
+                return Err(RemoteRuntimeError::InvalidReply(
+                    "unexpected Relay frame during StreamAppliedAck cold recovery",
+                ));
+            };
+            let AcceptedRef::Request { request_route } = accepted.accepted else {
+                return Err(RemoteRuntimeError::InvalidReply(
+                    "StreamAppliedAck recovery RouteAccepted must reference a request route",
+                ));
+            };
+            if !matches!(
+                self.consume_key_control_route_accepted(request_route),
+                Some(RemoteStreamFrameOutcome::StreamAppliedAckRouteAccepted { .. })
+            ) {
+                return Err(RemoteRuntimeError::InvalidReply(
+                    "StreamAppliedAck recovery received an unrelated RouteAccepted",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn pump_durable_key_sync_recovery(&mut self) -> Result<(), RemoteRuntimeError> {
         let mut resolved_ack_deadline = None;
         loop {
@@ -1238,6 +1408,7 @@ where
         Ok(request_route_is_owned(
             request_route,
             &self.pending_key_update_ack_routes,
+            &self.pending_stream_applied_ack_routes,
             &self.pending_key_sync_routes,
             active_key_sync_route,
             self.durable_pending_exchange_route()?,
@@ -1282,6 +1453,9 @@ where
         if self
             .pending_key_update_ack_routes
             .contains_key(&active.request_route())
+            || self
+                .pending_stream_applied_ack_routes
+                .contains_key(&active.request_route())
             || self.durable_pending_exchange_route()? == Some(active.request_route())
         {
             return Err(RemoteRuntimeError::PendingIntentConflict);
@@ -1364,6 +1538,31 @@ where
         Ok(request_route)
     }
 
+    async fn send_stream_applied_ack(
+        &mut self,
+        ack: &StreamAppliedAckV1,
+    ) -> Result<RequestRouteId, RemoteRuntimeError> {
+        if self.pending_stream_applied_ack_routes.len() >= MAX_PENDING_STREAM_APPLIED_ACK_ROUTES {
+            return Err(RemoteRuntimeError::PendingIntentConflict);
+        }
+        let mut mutation_rng = SystemMutationRng::new()?;
+        let reservation = self
+            .machine
+            .reserve_command_counter_block(&mut mutation_rng)?;
+        let request_route = RequestRouteId::from_bytes(random_nonzero::<16, _>(&mut mutation_rng)?);
+        self.ensure_fresh_request_route_available(request_route)?;
+        let signed = self
+            .machine
+            .seal_stream_applied_ack(request_route, ack, reservation)?;
+        let exact_send = self.encode_key_control_send(request_route, signed)?;
+        self.transport
+            .send(ExactRelayFrame::from_frozen(exact_send)?)
+            .await?;
+        self.pending_stream_applied_ack_routes
+            .insert(request_route, (ack.stream_route, ack.applied_stream_seq));
+        Ok(request_route)
+    }
+
     fn consume_key_control_route_accepted(
         &mut self,
         request_route: RequestRouteId,
@@ -1371,6 +1570,15 @@ where
         if let Some(revision) = self.pending_key_update_ack_routes.remove(&request_route) {
             return Some(RemoteStreamFrameOutcome::KeyUpdateAckRouteAccepted {
                 key_directory_revision: revision.value(),
+            });
+        }
+        if let Some((stream_route, applied_stream_seq)) = self
+            .pending_stream_applied_ack_routes
+            .remove(&request_route)
+        {
+            return Some(RemoteStreamFrameOutcome::StreamAppliedAckRouteAccepted {
+                stream_route,
+                applied_stream_seq,
             });
         }
         let pending = self.pending_key_sync_routes.get_mut(&request_route)?;
@@ -4152,11 +4360,13 @@ mod tests {
         let owned = RequestRouteId::from_bytes([0x41; 16]);
         let other = RequestRouteId::from_bytes([0x42; 16]);
         let mut ack_routes = HashMap::new();
+        let mut stream_ack_routes = HashMap::new();
         let mut probe_routes = HashMap::new();
 
         assert!(!request_route_is_owned(
             owned,
             &ack_routes,
+            &stream_ack_routes,
             &probe_routes,
             None,
             None,
@@ -4165,11 +4375,23 @@ mod tests {
         assert!(request_route_is_owned(
             owned,
             &ack_routes,
+            &stream_ack_routes,
             &probe_routes,
             None,
             None,
         ));
         ack_routes.clear();
+
+        stream_ack_routes.insert(owned, (StreamRouteId::from_bytes([0x43; 16]), 9));
+        assert!(request_route_is_owned(
+            owned,
+            &ack_routes,
+            &stream_ack_routes,
+            &probe_routes,
+            None,
+            None,
+        ));
+        stream_ack_routes.clear();
 
         probe_routes.insert(
             owned,
@@ -4181,6 +4403,7 @@ mod tests {
         assert!(request_route_is_owned(
             owned,
             &ack_routes,
+            &stream_ack_routes,
             &probe_routes,
             None,
             None,
@@ -4190,6 +4413,7 @@ mod tests {
         assert!(request_route_is_owned(
             owned,
             &ack_routes,
+            &stream_ack_routes,
             &probe_routes,
             Some(owned),
             None,
@@ -4197,6 +4421,7 @@ mod tests {
         assert!(request_route_is_owned(
             owned,
             &ack_routes,
+            &stream_ack_routes,
             &probe_routes,
             None,
             Some(owned),
@@ -4204,10 +4429,107 @@ mod tests {
         assert!(!request_route_is_owned(
             other,
             &ack_routes,
+            &stream_ack_routes,
             &probe_routes,
             Some(owned),
             Some(owned),
         ));
+    }
+
+    #[derive(Default)]
+    struct FakeBoundedAckRecovery {
+        sent: Vec<u64>,
+        accepted: usize,
+        in_flight: usize,
+        completed_batch_boundaries: Vec<usize>,
+        fail_next_batch_after_accepting: Option<usize>,
+    }
+
+    #[async_trait]
+    impl BoundedStreamAppliedAckRecoveryDriver for FakeBoundedAckRecovery {
+        type Item = u64;
+
+        async fn send_recovery_item(
+            &mut self,
+            item: &Self::Item,
+        ) -> Result<(), RemoteRuntimeError> {
+            assert!(self.in_flight < MAX_PENDING_STREAM_APPLIED_ACK_ROUTES);
+            if *item == u64::try_from(MAX_PENDING_STREAM_APPLIED_ACK_ROUTES).unwrap() {
+                assert_eq!(
+                    self.completed_batch_boundaries,
+                    [MAX_PENDING_STREAM_APPLIED_ACK_ROUTES],
+                    "the sixty-fifth Send must wait for every first-batch acceptance",
+                );
+            }
+            self.sent.push(*item);
+            self.in_flight += 1;
+            Ok(())
+        }
+
+        async fn await_recovery_batch(&mut self) -> Result<(), RemoteRuntimeError> {
+            if let Some(partial) = self.fail_next_batch_after_accepting.take() {
+                assert!(partial < self.in_flight);
+                self.accepted += partial;
+                self.in_flight -= partial;
+                return Err(RemoteRuntimeError::OutcomeUnknown);
+            }
+            self.accepted += self.in_flight;
+            self.in_flight = 0;
+            self.completed_batch_boundaries.push(self.sent.len());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_applied_ack_recovery_drives_sixty_five_in_two_batches_and_restarts_all() {
+        let durable_receipts = (0_u64
+            ..=u64::try_from(MAX_PENDING_STREAM_APPLIED_ACK_ROUTES).unwrap())
+            .collect::<Vec<_>>();
+        let mut complete = FakeBoundedAckRecovery::default();
+        recover_stream_applied_ack_batches(&mut complete, &durable_receipts)
+            .await
+            .expect("recover all durable receipts");
+        assert_eq!(complete.sent, durable_receipts);
+        assert_eq!(complete.accepted, durable_receipts.len());
+        assert_eq!(complete.in_flight, 0);
+        assert_eq!(
+            complete.completed_batch_boundaries,
+            [
+                MAX_PENDING_STREAM_APPLIED_ACK_ROUTES,
+                durable_receipts.len()
+            ]
+        );
+
+        let mut interrupted = FakeBoundedAckRecovery {
+            fail_next_batch_after_accepting: Some(17),
+            ..FakeBoundedAckRecovery::default()
+        };
+        assert!(matches!(
+            recover_stream_applied_ack_batches(&mut interrupted, &durable_receipts).await,
+            Err(RemoteRuntimeError::OutcomeUnknown)
+        ));
+        assert_eq!(
+            interrupted.sent.len(),
+            MAX_PENDING_STREAM_APPLIED_ACK_ROUTES
+        );
+        assert_eq!(interrupted.accepted, 17);
+        assert_eq!(
+            interrupted.in_flight,
+            MAX_PENDING_STREAM_APPLIED_ACK_ROUTES - 17
+        );
+
+        let mut restarted = FakeBoundedAckRecovery::default();
+        recover_stream_applied_ack_batches(&mut restarted, &durable_receipts)
+            .await
+            .expect("restart reseals the complete durable receipt set");
+        assert_eq!(restarted.sent, durable_receipts);
+        assert_eq!(
+            restarted.completed_batch_boundaries,
+            [
+                MAX_PENDING_STREAM_APPLIED_ACK_ROUTES,
+                durable_receipts.len()
+            ]
+        );
     }
 
     #[test]

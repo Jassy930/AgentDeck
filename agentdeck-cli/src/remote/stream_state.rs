@@ -5,9 +5,12 @@
 //! 彼此独立的轴，不能互相推导。
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use agentdeck_protocol::e2ee::{KeyPurpose, STREAM_BINDING_MAX_CANONICAL_BYTES, StreamBindingV1};
+use agentdeck_protocol::e2ee::{
+    EpochBarrierV1, KeyId, KeyPurpose, STREAM_BINDING_MAX_CANONICAL_BYTES, StreamAppliedAckV1,
+    StreamBindingV1,
+};
 use agentdeck_protocol::relay_v2::{KeyDirectoryRevision, StreamGenerationId, StreamRouteId};
 use agentdeck_protocol::runtime::{ConversationId, RuntimeInnerCursor, StreamCursor};
 use thiserror::Error;
@@ -15,7 +18,8 @@ use thiserror::Error;
 const STREAM_STATE_MAGIC: &[u8; 4] = b"ADSB";
 const LEGACY_STREAM_STATE_VERSION: u16 = 1;
 const PREVIOUS_STREAM_STATE_VERSION: u16 = 2;
-const STREAM_STATE_VERSION: u16 = 3;
+const RETIRED_STREAM_STATE_VERSION: u16 = 3;
+const STREAM_STATE_VERSION: u16 = 4;
 const STREAM_STATE_HEADER_LEN: usize = 12;
 const MAX_CONVERSATION_ID_BYTES: usize = 1_024;
 const MAX_LEGACY_DURABLE_STREAM_STATE_BYTES: usize = 16 * 1_024;
@@ -28,6 +32,8 @@ pub(crate) const MAX_DURABLE_STREAM_BINDINGS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurableStreamReplayTupleV1 {
+    key_id: KeyId,
+    key_directory_revision: KeyDirectoryRevision,
     stream_route: StreamRouteId,
     stream_generation: StreamGenerationId,
     stream_seq: u64,
@@ -36,6 +42,16 @@ pub struct DurableStreamReplayTupleV1 {
 }
 
 impl DurableStreamReplayTupleV1 {
+    #[must_use]
+    pub const fn key_id(self) -> KeyId {
+        self.key_id
+    }
+
+    #[must_use]
+    pub const fn key_directory_revision(self) -> KeyDirectoryRevision {
+        self.key_directory_revision
+    }
+
     #[must_use]
     pub const fn stream_seq(self) -> u64 {
         self.stream_seq
@@ -59,6 +75,24 @@ impl DurableStreamReplayTupleV1 {
     #[must_use]
     pub const fn ciphertext_sha256(self) -> [u8; 32] {
         self.ciphertext_sha256
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingEpochBarrierV1 {
+    replay_tuple: DurableStreamReplayTupleV1,
+    replay_quarantined: bool,
+}
+
+impl PendingEpochBarrierV1 {
+    #[must_use]
+    pub const fn replay_tuple(&self) -> DurableStreamReplayTupleV1 {
+        self.replay_tuple
+    }
+
+    #[must_use]
+    pub const fn replay_quarantined(&self) -> bool {
+        self.replay_quarantined
     }
 }
 
@@ -90,6 +124,8 @@ pub struct DurableStreamBindingV1 {
     replay_quarantined: bool,
     replay_entries: Vec<DurableStreamReplayTupleV1>,
     retired_subscriptions: Vec<DurableRetiredSubscriptionV1>,
+    pending_epoch_barrier: Option<PendingEpochBarrierV1>,
+    latest_stream_applied_ack_basis: Option<StreamAppliedAckV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,6 +155,8 @@ impl DurableStreamBindingV1 {
             replay_quarantined: false,
             replay_entries: Vec::new(),
             retired_subscriptions: Vec::new(),
+            pending_epoch_barrier: None,
+            latest_stream_applied_ack_basis: None,
         };
         value.validate()?;
         Ok(value)
@@ -140,6 +178,8 @@ impl DurableStreamBindingV1 {
             replay_quarantined: false,
             replay_entries: Vec::new(),
             retired_subscriptions: Vec::new(),
+            pending_epoch_barrier: None,
+            latest_stream_applied_ack_basis: None,
         };
         value.validate()?;
         Ok(value)
@@ -154,6 +194,9 @@ impl DurableStreamBindingV1 {
         inner_applied: RuntimeInnerCursor,
     ) -> Result<Self, RemoteStreamStateError> {
         self.validate()?;
+        if self.pending_epoch_barrier.is_some() {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
         let candidate = Self::from_subscription_bootstrap(binding, inner_applied)?;
         if self.target_key() != candidate.target_key() {
             return Err(RemoteStreamStateError::InvalidCanonical);
@@ -227,7 +270,8 @@ impl DurableStreamBindingV1 {
     }
 
     /// 同一 shared-key epoch 的 directory carrier rewrap 只推进 exact-next revision。
-    /// 所有 subscription、cursor、ACK、replay/quarantine 与 cleanup outbox 状态原样保留；
+    /// 所有 subscription、cursor、Relay ACK、replay/quarantine 与 cleanup outbox 状态原样
+    /// 保留；旧 revision 的 barrier ACK basis 不能用新 command key 重封，因此会被清除。
     /// shared-key rotation 必须走独立的 epoch barrier/新 binding 安装路径。
     pub(crate) fn with_rewrapped_key_revision(
         &self,
@@ -248,11 +292,28 @@ impl DurableStreamBindingV1 {
         if next_revision != expected {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
+        if self.pending_epoch_barrier.is_some() {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
 
         let mut rewrapped = self.clone();
         rewrapped.binding.key_directory_revision = next_revision;
+        rewrapped.latest_stream_applied_ack_basis = None;
         rewrapped.validate()?;
         Ok(rewrapped)
+    }
+
+    /// 任一后续 directory transition 都会使旧 revision 的 StreamAppliedAck basis 失去
+    /// command-key sealing authority。rotation 的 stream binding 仍停在旧 epoch/revision
+    /// 等待下一条 barrier，因此只显式 supersede receipt，其他 durable 轴逐字保留。
+    pub(crate) fn with_superseded_stream_applied_ack(
+        &self,
+    ) -> Result<Self, RemoteStreamStateError> {
+        self.validate()?;
+        let mut superseded = self.clone();
+        superseded.latest_stream_applied_ack_basis = None;
+        superseded.validate()?;
+        Ok(superseded)
     }
 
     #[must_use]
@@ -295,6 +356,16 @@ impl DurableStreamBindingV1 {
     #[must_use]
     pub const fn replay_quarantined(&self) -> bool {
         self.replay_quarantined
+    }
+
+    #[must_use]
+    pub(crate) const fn pending_epoch_barrier(&self) -> Option<&PendingEpochBarrierV1> {
+        self.pending_epoch_barrier.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) const fn latest_stream_applied_ack_basis(&self) -> Option<&StreamAppliedAckV1> {
+        self.latest_stream_applied_ack_basis.as_ref()
     }
 
     #[must_use]
@@ -345,14 +416,40 @@ impl DurableStreamBindingV1 {
     /// 验证的 Publish。新 tuple 必须是 exact-next outer sequence；sender counter 可在
     /// 4096 数值窗口内乱序到达，但 floor 以下的 unseen counter 会被拒绝。相同 tuple 只
     /// 区分 pending/applied 幂等重放，同 counter 不同 ciphertext 会持久化 quarantine。
+    #[cfg(test)]
     pub(crate) fn admit_publish(
         &self,
         stream_seq: u64,
         sender_counter: u64,
         ciphertext_sha256: [u8; 32],
     ) -> Result<(Self, StreamPublishDisposition), RemoteStreamStateError> {
+        self.admit_publish_at_authenticated_revision(
+            self.binding.key_directory_revision,
+            stream_seq,
+            sender_counter,
+            ciphertext_sha256,
+        )
+    }
+
+    /// 显式带入已完成 signature/AAD 验证的 header revision。它只允许旧 revision 的 exact
+    /// durable duplicate；旧 revision 的 fresh tuple 一律作为 rollback 拒绝，避免
+    /// same-epoch rewrap 后把网络输入误标成当前 revision。
+    pub(crate) fn admit_publish_at_authenticated_revision(
+        &self,
+        authenticated_revision: KeyDirectoryRevision,
+        stream_seq: u64,
+        sender_counter: u64,
+        ciphertext_sha256: [u8; 32],
+    ) -> Result<(Self, StreamPublishDisposition), RemoteStreamStateError> {
         self.validate()?;
-        if ciphertext_sha256 == [0; 32] || StreamCursor::At(stream_seq).checked_next().is_err() {
+        if authenticated_revision.value() == 0
+            || authenticated_revision.value() > self.binding.key_directory_revision.value()
+            || ciphertext_sha256 == [0; 32]
+            || StreamCursor::At(stream_seq).checked_next().is_err()
+        {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+        if self.pending_epoch_barrier.is_some() {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
         if self.replay_quarantined {
@@ -361,12 +458,12 @@ impl DurableStreamBindingV1 {
                 StreamPublishDisposition::NonceReuseQuarantined,
             ));
         }
-        if let Some(replay) = self
-            .replay_entries
-            .iter()
-            .find(|entry| entry.sender_counter == sender_counter)
-        {
-            if replay.stream_route != self.binding.stream_route
+        if let Some(replay) = self.replay_entries.iter().find(|entry| {
+            same_nonce_scope(entry.key_id, self.binding.key_id)
+                && entry.sender_counter == sender_counter
+        }) {
+            if replay.key_directory_revision != authenticated_revision
+                || replay.stream_route != self.binding.stream_route
                 || replay.stream_generation != self.binding.stream_generation
                 || replay.stream_seq != stream_seq
                 || replay.ciphertext_sha256 != ciphertext_sha256
@@ -397,45 +494,292 @@ impl DurableStreamBindingV1 {
             quarantined.validate()?;
             return Ok((quarantined, StreamPublishDisposition::NonceReuseQuarantined));
         }
-        let replay_floor = self.replay_entries.last().map_or(0, |entry| {
-            entry
-                .sender_counter
-                .saturating_sub(MAX_STREAM_REPLAY_DISTANCE)
-        });
-        if self.outer_applied.checked_next().ok() != Some(stream_seq)
+        let replay_floor = replay_scope_high_water(&self.replay_entries, self.binding.key_id)
+            .map_or(0, |high_water| {
+                high_water.saturating_sub(MAX_STREAM_REPLAY_DISTANCE)
+            });
+        if authenticated_revision != self.binding.key_directory_revision
+            || self.outer_applied.checked_next().ok() != Some(stream_seq)
             || (!self.replay_entries.is_empty() && sender_counter < replay_floor)
         {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
         let mut pending = self.clone();
+        let replay = DurableStreamReplayTupleV1 {
+            key_id: self.binding.key_id,
+            key_directory_revision: authenticated_revision,
+            stream_route: self.binding.stream_route,
+            stream_generation: self.binding.stream_generation,
+            stream_seq,
+            sender_counter,
+            ciphertext_sha256,
+        };
         let insertion = match pending
             .replay_entries
-            .binary_search_by_key(&sender_counter, |entry| entry.sender_counter)
+            .binary_search_by(|entry| replay_cmp(entry, &replay))
         {
             Ok(_) => return Err(RemoteStreamStateError::InvalidCanonical),
             Err(insertion) => insertion,
         };
-        pending.replay_entries.insert(
-            insertion,
-            DurableStreamReplayTupleV1 {
-                stream_route: self.binding.stream_route,
-                stream_generation: self.binding.stream_generation,
-                stream_seq,
-                sender_counter,
-                ciphertext_sha256,
-            },
-        );
-        let replay_high_water = pending
-            .replay_entries
-            .last()
-            .ok_or(RemoteStreamStateError::InvalidCanonical)?
-            .sender_counter;
+        pending.replay_entries.insert(insertion, replay);
+        let replay_high_water =
+            replay_scope_high_water(&pending.replay_entries, self.binding.key_id)
+                .ok_or(RemoteStreamStateError::InvalidCanonical)?;
         let replay_floor = replay_high_water.saturating_sub(MAX_STREAM_REPLAY_DISTANCE);
-        pending
-            .replay_entries
-            .retain(|entry| entry.sender_counter >= replay_floor);
+        pending.replay_entries.retain(|entry| {
+            !same_nonce_scope(entry.key_id, self.binding.key_id)
+                || entry.sender_counter >= replay_floor
+        });
+        if pending.replay_entries.len() > MAX_STREAM_REPLAY_ENTRIES {
+            return Err(RemoteStreamStateError::TooLarge);
+        }
         pending.validate()?;
         Ok((pending, StreamPublishDisposition::Fresh))
+    }
+
+    /// 在 AEAD open 前只接纳当前 shared-key scope 的 exact-next epoch/revision barrier
+    /// carrier。future scope 不从网络输入推导，只允许由当前 durable binding 唯一计算出的
+    /// `(same purpose, epoch+1, revision+1)`；pending tuple 在 activation 前独立持久化。
+    pub(crate) fn admit_pending_epoch_barrier(
+        &self,
+        key_id: KeyId,
+        key_directory_revision: KeyDirectoryRevision,
+        stream_seq: u64,
+        sender_counter: u64,
+        ciphertext_sha256: [u8; 32],
+    ) -> Result<(Self, StreamPublishDisposition), RemoteStreamStateError> {
+        self.validate()?;
+        let expected_epoch = self
+            .binding
+            .key_id
+            .epoch
+            .checked_add(1)
+            .ok_or(RemoteStreamStateError::InvalidCanonical)?;
+        let expected_revision = self
+            .binding
+            .key_directory_revision
+            .next()
+            .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+        let expected_stream_seq = self
+            .outer_applied
+            .checked_next()
+            .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+        if self.replay_quarantined
+            || self.inner_observed != self.inner_applied
+            || ciphertext_sha256 == [0; 32]
+            || key_id.purpose != self.binding.key_id.purpose
+            || key_id.epoch != expected_epoch
+            || key_directory_revision != expected_revision
+            || stream_seq != expected_stream_seq
+            || StreamCursor::At(stream_seq).checked_next().is_err()
+        {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+
+        let replay_tuple = DurableStreamReplayTupleV1 {
+            key_id,
+            key_directory_revision,
+            stream_route: self.binding.stream_route,
+            stream_generation: self.binding.stream_generation,
+            stream_seq,
+            sender_counter,
+            ciphertext_sha256,
+        };
+        if let Some(existing) = self.pending_epoch_barrier {
+            if existing.replay_quarantined {
+                return Ok((
+                    self.clone(),
+                    StreamPublishDisposition::NonceReuseQuarantined,
+                ));
+            }
+            let existing_tuple = existing.replay_tuple;
+            if existing_tuple.key_id != key_id
+                || existing_tuple.key_directory_revision != key_directory_revision
+                || existing_tuple.stream_route != replay_tuple.stream_route
+                || existing_tuple.stream_generation != replay_tuple.stream_generation
+                || existing_tuple.stream_seq != stream_seq
+            {
+                return Err(RemoteStreamStateError::InvalidCanonical);
+            }
+            if existing_tuple.sender_counter == sender_counter
+                && existing_tuple.ciphertext_sha256 == ciphertext_sha256
+            {
+                return Ok((self.clone(), StreamPublishDisposition::PendingDuplicate));
+            }
+            let mut quarantined = self.clone();
+            quarantined
+                .pending_epoch_barrier
+                .as_mut()
+                .ok_or(RemoteStreamStateError::InvalidCanonical)?
+                .replay_quarantined = true;
+            quarantined.validate()?;
+            return Ok((quarantined, StreamPublishDisposition::NonceReuseQuarantined));
+        }
+
+        if self.replay_entries.len() == MAX_STREAM_REPLAY_ENTRIES {
+            return Err(RemoteStreamStateError::TooLarge);
+        }
+        if self.replay_entries.iter().any(|entry| {
+            entry.stream_route == replay_tuple.stream_route
+                && entry.stream_generation == replay_tuple.stream_generation
+                && entry.stream_seq == replay_tuple.stream_seq
+        }) || self.replay_entries.iter().any(|entry| {
+            same_nonce_scope(entry.key_id, replay_tuple.key_id)
+                && entry.sender_counter == replay_tuple.sender_counter
+        }) {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+
+        let mut pending = self.clone();
+        pending.pending_epoch_barrier = Some(PendingEpochBarrierV1 {
+            replay_tuple,
+            replay_quarantined: false,
+        });
+        pending.validate()?;
+        Ok((pending, StreamPublishDisposition::Fresh))
+    }
+
+    /// 只在 pending carrier 已完成新 key AEAD open，且 payload 是精确 epoch barrier 时原子
+    /// 激活。`D=next(C)` 被记为 outer applied，inner cut 保持 H 不前进，并持久化后续由
+    /// DeviceCommandTx 认证发送的 exact `StreamAppliedAckV1` basis。
+    pub(crate) fn activate_epoch_barrier(
+        &self,
+        stream_route: StreamRouteId,
+        barrier: &EpochBarrierV1,
+    ) -> Result<Self, RemoteStreamStateError> {
+        self.validate()?;
+        barrier
+            .validate()
+            .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+        if self.pending_epoch_barrier.is_none() {
+            if self.is_exact_committed_epoch_barrier(stream_route, barrier)? {
+                return Ok(self.clone());
+            }
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+
+        let pending = self
+            .pending_epoch_barrier
+            .ok_or(RemoteStreamStateError::InvalidCanonical)?;
+        let replay = pending.replay_tuple;
+        let next_epoch = self
+            .binding
+            .key_id
+            .epoch
+            .checked_add(1)
+            .ok_or(RemoteStreamStateError::InvalidCanonical)?;
+        let next_revision = self
+            .binding
+            .key_directory_revision
+            .next()
+            .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+        let next_stream_seq = self
+            .outer_applied
+            .checked_next()
+            .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+        if self.replay_quarantined
+            || pending.replay_quarantined
+            || stream_route != self.binding.stream_route
+            || barrier.stream_generation != self.binding.stream_generation
+            || barrier.stream_cursor != self.outer_applied
+            || barrier.inner_cursor != self.inner_observed
+            || barrier.inner_cursor != self.inner_applied
+            || barrier.old_epoch != self.binding.key_id.epoch
+            || barrier.new_epoch != next_epoch
+            || barrier.key_directory_revision != next_revision
+            || (self.outer_acked != StreamCursor::BeforeFirst
+                && self.outer_acked != barrier.stream_cursor)
+            || replay.key_id
+                != (KeyId {
+                    purpose: self.binding.key_id.purpose,
+                    epoch: barrier.new_epoch,
+                })
+            || replay.key_directory_revision != barrier.key_directory_revision
+            || replay.stream_route != stream_route
+            || replay.stream_generation != barrier.stream_generation
+            || replay.stream_seq != next_stream_seq
+        {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+
+        let mut binding = self.binding.clone();
+        binding.stream_cursor = barrier.stream_cursor;
+        binding.inner_cursor = barrier.inner_cursor.clone();
+        binding.key_id = replay.key_id;
+        binding.key_directory_revision = replay.key_directory_revision;
+
+        let ack = StreamAppliedAckV1 {
+            format_version: binding.format_version,
+            runtime_protocol_version: binding.runtime_protocol_version,
+            relay_protocol_version: binding.relay_protocol_version,
+            machine_route: binding.machine_route,
+            device_route: binding.device_route,
+            grant_serial: binding.grant_serial,
+            root_trust_epoch: binding.root_trust_epoch,
+            stream_route,
+            stream_generation: barrier.stream_generation,
+            applied_stream_seq: next_stream_seq,
+            inner_cursor: barrier.inner_cursor.clone(),
+            key_directory_revision: barrier.key_directory_revision,
+            key_epoch: barrier.new_epoch,
+            epoch_barrier_sha256: barrier
+                .canonical_sha256()
+                .map_err(|_| RemoteStreamStateError::InvalidCanonical)?,
+        };
+        ack.validate_for_barrier(stream_route, barrier)
+            .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+
+        let mut activated = self.clone();
+        activated.binding = binding;
+        activated.outer_applied = StreamCursor::At(next_stream_seq);
+        let insertion = match activated
+            .replay_entries
+            .binary_search_by(|entry| replay_cmp(entry, &replay))
+        {
+            Ok(_) => return Err(RemoteStreamStateError::InvalidCanonical),
+            Err(position) => position,
+        };
+        activated.replay_entries.insert(insertion, replay);
+        activated.pending_epoch_barrier = None;
+        activated.latest_stream_applied_ack_basis = Some(ack);
+        activated.validate()?;
+        Ok(activated)
+    }
+
+    fn is_exact_committed_epoch_barrier(
+        &self,
+        stream_route: StreamRouteId,
+        barrier: &EpochBarrierV1,
+    ) -> Result<bool, RemoteStreamStateError> {
+        let next_stream_seq = barrier
+            .stream_cursor
+            .checked_next()
+            .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+        let Some(ack) = self.latest_stream_applied_ack_basis.as_ref() else {
+            return Ok(false);
+        };
+        if stream_route != self.binding.stream_route
+            || barrier.stream_generation != self.binding.stream_generation
+            || barrier.stream_cursor != self.binding.stream_cursor
+            || barrier.inner_cursor != self.binding.inner_cursor
+            || barrier.new_epoch != self.binding.key_id.epoch
+            || barrier.key_directory_revision != self.binding.key_directory_revision
+            || cursor_cmp(StreamCursor::At(next_stream_seq), self.outer_applied)
+                == Ordering::Greater
+            || cursor_cmp(
+                inner_cursor_value(&barrier.inner_cursor),
+                inner_cursor_value(&self.inner_observed),
+            ) == Ordering::Greater
+            || cursor_cmp(
+                inner_cursor_value(&barrier.inner_cursor),
+                inner_cursor_value(&self.inner_applied),
+            ) == Ordering::Greater
+        {
+            return Ok(false);
+        }
+        ack.validate_for_barrier(stream_route, barrier)
+            .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+        Ok(true)
     }
 
     /// 判断 exact-next authenticated inner item 是 bootstrap snapshot 已覆盖的 overlap，
@@ -533,22 +877,73 @@ impl DurableStreamBindingV1 {
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, RemoteStreamStateError> {
-        self.v2_or_v3_canonical_bytes(STREAM_STATE_VERSION)
+        self.validate()?;
+        let binding = self
+            .binding
+            .canonical_bytes()
+            .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+        let mut body = Vec::with_capacity(binding.len() + 256);
+        put_bytes(&mut body, &binding)?;
+        put_cursor(&mut body, self.outer_applied);
+        put_cursor(&mut body, self.outer_acked);
+        put_inner_cursor(&mut body, &self.inner_observed)?;
+        put_inner_cursor(&mut body, &self.inner_applied)?;
+        body.push(u8::from(self.replay_quarantined));
+        put_replay_count(&mut body, self.replay_entries.len())?;
+        for replay in &self.replay_entries {
+            put_replay_tuple_v4(&mut body, replay);
+        }
+        put_retired_subscriptions(&mut body, &self.retired_subscriptions)?;
+        match self.pending_epoch_barrier {
+            None => body.push(0),
+            Some(pending) => {
+                body.push(1);
+                put_replay_tuple_v4(&mut body, &pending.replay_tuple);
+                body.push(u8::from(pending.replay_quarantined));
+            }
+        }
+        match &self.latest_stream_applied_ack_basis {
+            None => body.push(0),
+            Some(ack) => {
+                body.push(1);
+                let ack = ack
+                    .canonical_bytes()
+                    .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+                put_bytes(&mut body, &ack)?;
+            }
+        }
+        if body.len() > MAX_DURABLE_STREAM_STATE_BYTES - STREAM_STATE_HEADER_LEN {
+            return Err(RemoteStreamStateError::TooLarge);
+        }
+        encode_stream_state_body(STREAM_STATE_VERSION, body)
     }
 
     fn legacy_v2_canonical_bytes(&self) -> Result<Vec<u8>, RemoteStreamStateError> {
         if !self.retired_subscriptions.is_empty() {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
-        self.v2_or_v3_canonical_bytes(PREVIOUS_STREAM_STATE_VERSION)
+        self.legacy_v2_or_v3_canonical_bytes(PREVIOUS_STREAM_STATE_VERSION)
     }
 
-    fn v2_or_v3_canonical_bytes(&self, version: u16) -> Result<Vec<u8>, RemoteStreamStateError> {
+    fn legacy_v3_canonical_bytes(&self) -> Result<Vec<u8>, RemoteStreamStateError> {
+        self.legacy_v2_or_v3_canonical_bytes(RETIRED_STREAM_STATE_VERSION)
+    }
+
+    fn legacy_v2_or_v3_canonical_bytes(
+        &self,
+        version: u16,
+    ) -> Result<Vec<u8>, RemoteStreamStateError> {
         self.validate()?;
         if !matches!(
             version,
-            PREVIOUS_STREAM_STATE_VERSION | STREAM_STATE_VERSION
-        ) {
+            PREVIOUS_STREAM_STATE_VERSION | RETIRED_STREAM_STATE_VERSION
+        ) || self.pending_epoch_barrier.is_some()
+            || self.latest_stream_applied_ack_basis.is_some()
+            || self.replay_entries.iter().any(|replay| {
+                replay.key_id != self.binding.key_id
+                    || replay.key_directory_revision != self.binding.key_directory_revision
+            })
+        {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
         let binding = self
@@ -562,24 +957,12 @@ impl DurableStreamBindingV1 {
         put_inner_cursor(&mut body, &self.inner_observed)?;
         put_inner_cursor(&mut body, &self.inner_applied)?;
         body.push(u8::from(self.replay_quarantined));
-        let replay_count = u32::try_from(self.replay_entries.len())
-            .map_err(|_| RemoteStreamStateError::TooLarge)?;
-        body.extend_from_slice(&replay_count.to_be_bytes());
+        put_replay_count(&mut body, self.replay_entries.len())?;
         for replay in &self.replay_entries {
-            body.extend_from_slice(replay.stream_route.as_bytes());
-            body.extend_from_slice(replay.stream_generation.as_bytes());
-            body.extend_from_slice(&replay.stream_seq.to_be_bytes());
-            body.extend_from_slice(&replay.sender_counter.to_be_bytes());
-            body.extend_from_slice(&replay.ciphertext_sha256);
+            put_replay_tuple_legacy(&mut body, replay);
         }
-        if version == STREAM_STATE_VERSION {
-            let retired_count = u32::try_from(self.retired_subscriptions.len())
-                .map_err(|_| RemoteStreamStateError::TooLarge)?;
-            body.extend_from_slice(&retired_count.to_be_bytes());
-            for retired in &self.retired_subscriptions {
-                body.extend_from_slice(retired.stream_route.as_bytes());
-                body.extend_from_slice(retired.stream_generation.as_bytes());
-            }
+        if version == RETIRED_STREAM_STATE_VERSION {
+            put_retired_subscriptions(&mut body, &self.retired_subscriptions)?;
         }
         if body.len() > MAX_DURABLE_STREAM_STATE_BYTES - STREAM_STATE_HEADER_LEN {
             return Err(RemoteStreamStateError::TooLarge);
@@ -598,7 +981,10 @@ impl DurableStreamBindingV1 {
         let version = u16::from_be_bytes([bytes[4], bytes[5]]);
         if !matches!(
             version,
-            LEGACY_STREAM_STATE_VERSION | PREVIOUS_STREAM_STATE_VERSION | STREAM_STATE_VERSION
+            LEGACY_STREAM_STATE_VERSION
+                | PREVIOUS_STREAM_STATE_VERSION
+                | RETIRED_STREAM_STATE_VERSION
+                | STREAM_STATE_VERSION
         ) || (version == LEGACY_STREAM_STATE_VERSION
             && bytes.len() > MAX_LEGACY_DURABLE_STREAM_STATE_BYTES)
         {
@@ -631,6 +1017,8 @@ impl DurableStreamBindingV1 {
             replay_quarantined,
             replay_entries,
             retired_subscriptions,
+            pending_epoch_barrier,
+            latest_stream_applied_ack_basis,
         ) = match version {
             LEGACY_STREAM_STATE_VERSION => {
                 let inner_applied = decoder.inner_cursor()?;
@@ -653,9 +1041,11 @@ impl DurableStreamBindingV1 {
                     false,
                     Vec::new(),
                     Vec::new(),
+                    None,
+                    None,
                 )
             }
-            PREVIOUS_STREAM_STATE_VERSION | STREAM_STATE_VERSION => {
+            PREVIOUS_STREAM_STATE_VERSION | RETIRED_STREAM_STATE_VERSION | STREAM_STATE_VERSION => {
                 let inner_observed = decoder.inner_cursor()?;
                 let inner_applied = decoder.inner_cursor()?;
                 let replay_quarantined = match decoder.u8()? {
@@ -670,37 +1060,58 @@ impl DurableStreamBindingV1 {
                 }
                 let mut replay_entries = Vec::with_capacity(replay_count);
                 for _ in 0..replay_count {
-                    replay_entries.push(DurableStreamReplayTupleV1 {
-                        stream_route: StreamRouteId::from_bytes(decoder.fixed()?),
-                        stream_generation: StreamGenerationId::from_bytes(decoder.fixed()?),
-                        stream_seq: decoder.u64()?,
-                        sender_counter: decoder.u64()?,
-                        ciphertext_sha256: decoder.fixed()?,
-                    });
-                }
-                let retired_subscriptions = if version == STREAM_STATE_VERSION {
-                    let retired_count = usize::try_from(decoder.u32()?)
-                        .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
-                    if retired_count > MAX_RETIRED_SUBSCRIPTIONS {
-                        return Err(RemoteStreamStateError::InvalidCanonical);
-                    }
-                    let mut retired = Vec::with_capacity(retired_count);
-                    for _ in 0..retired_count {
-                        retired.push(DurableRetiredSubscriptionV1 {
+                    replay_entries.push(if version == STREAM_STATE_VERSION {
+                        decode_replay_tuple_v4(&mut decoder)?
+                    } else {
+                        DurableStreamReplayTupleV1 {
+                            key_id: binding.key_id,
+                            key_directory_revision: binding.key_directory_revision,
                             stream_route: StreamRouteId::from_bytes(decoder.fixed()?),
                             stream_generation: StreamGenerationId::from_bytes(decoder.fixed()?),
-                        });
-                    }
-                    retired
-                } else {
-                    Vec::new()
-                };
+                            stream_seq: decoder.u64()?,
+                            sender_counter: decoder.u64()?,
+                            ciphertext_sha256: decoder.fixed()?,
+                        }
+                    });
+                }
+                let retired_subscriptions =
+                    if matches!(version, RETIRED_STREAM_STATE_VERSION | STREAM_STATE_VERSION) {
+                        decode_retired_subscriptions(&mut decoder)?
+                    } else {
+                        Vec::new()
+                    };
+                let (pending_epoch_barrier, latest_stream_applied_ack_basis) =
+                    if version == STREAM_STATE_VERSION {
+                        let pending = match decoder.u8()? {
+                            0 => None,
+                            1 => Some(PendingEpochBarrierV1 {
+                                replay_tuple: decode_replay_tuple_v4(&mut decoder)?,
+                                replay_quarantined: decode_bool(&mut decoder)?,
+                            }),
+                            _ => return Err(RemoteStreamStateError::InvalidCanonical),
+                        };
+                        let ack = match decoder.u8()? {
+                            0 => None,
+                            1 => Some(
+                                StreamAppliedAckV1::from_canonical_bytes(
+                                    decoder.bytes(STREAM_BINDING_MAX_CANONICAL_BYTES)?,
+                                )
+                                .map_err(|_| RemoteStreamStateError::InvalidCanonical)?,
+                            ),
+                            _ => return Err(RemoteStreamStateError::InvalidCanonical),
+                        };
+                        (pending, ack)
+                    } else {
+                        (None, None)
+                    };
                 (
                     inner_observed,
                     inner_applied,
                     replay_quarantined,
                     replay_entries,
                     retired_subscriptions,
+                    pending_epoch_barrier,
+                    latest_stream_applied_ack_basis,
                 )
             }
             _ => return Err(RemoteStreamStateError::InvalidCanonical),
@@ -715,11 +1126,14 @@ impl DurableStreamBindingV1 {
             replay_quarantined,
             replay_entries,
             retired_subscriptions,
+            pending_epoch_barrier,
+            latest_stream_applied_ack_basis,
         };
         value.validate()?;
         let exact = match version {
             LEGACY_STREAM_STATE_VERSION => value.legacy_v1_canonical_bytes()?,
             PREVIOUS_STREAM_STATE_VERSION => value.legacy_v2_canonical_bytes()?,
+            RETIRED_STREAM_STATE_VERSION => value.legacy_v3_canonical_bytes()?,
             STREAM_STATE_VERSION => value.canonical_bytes()?,
             _ => return Err(RemoteStreamStateError::InvalidCanonical),
         };
@@ -736,6 +1150,8 @@ impl DurableStreamBindingV1 {
             || self.replay_quarantined
             || !self.replay_entries.is_empty()
             || !self.retired_subscriptions.is_empty()
+            || self.pending_epoch_barrier.is_some()
+            || self.latest_stream_applied_ack_basis.is_some()
         {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
@@ -788,8 +1204,13 @@ impl DurableStreamBindingV1 {
         {
             return Err(RemoteStreamStateError::InvalidCanonical);
         }
-        if self.replay_entries.len() > MAX_STREAM_REPLAY_ENTRIES
+        if self
+            .replay_entries
+            .len()
+            .checked_add(usize::from(self.pending_epoch_barrier.is_some()))
+            .is_none_or(|count| count > MAX_STREAM_REPLAY_ENTRIES)
             || (self.replay_quarantined && self.replay_entries.is_empty())
+            || (self.replay_quarantined && self.pending_epoch_barrier.is_some())
             || self.retired_subscriptions.len() > MAX_RETIRED_SUBSCRIPTIONS
         {
             return Err(RemoteStreamStateError::InvalidCanonical);
@@ -804,36 +1225,134 @@ impl DurableStreamBindingV1 {
             }
             previous_retired = Some(pair);
         }
-        let Some(last) = self.replay_entries.last() else {
-            return Ok(());
-        };
-        let replay_floor = last
-            .sender_counter
-            .saturating_sub(MAX_STREAM_REPLAY_DISTANCE);
+        let mut replay_high_waters = HashMap::new();
+        for replay in &self.replay_entries {
+            replay_high_waters
+                .entry(replay.key_id)
+                .and_modify(|high_water: &mut u64| {
+                    *high_water = (*high_water).max(replay.sender_counter);
+                })
+                .or_insert(replay.sender_counter);
+        }
         let mut previous = None;
         let mut stream_sequences = HashSet::with_capacity(self.replay_entries.len());
         let pending_seq = self.outer_applied.checked_next().ok();
         for replay in &self.replay_entries {
             let replay_cursor = StreamCursor::At(replay.stream_seq);
-            if replay.ciphertext_sha256 == [0; 32]
+            let replay_floor = replay_high_waters
+                .get(&replay.key_id)
+                .ok_or(RemoteStreamStateError::InvalidCanonical)?
+                .saturating_sub(MAX_STREAM_REPLAY_DISTANCE);
+            if replay.key_id.purpose != self.binding.key_id.purpose
+                || replay.key_id.epoch == 0
+                || replay.key_id.epoch > self.binding.key_id.epoch
+                || replay.key_directory_revision.value() == 0
+                || replay.key_directory_revision.value()
+                    > self.binding.key_directory_revision.value()
+                || is_zero_16(replay.stream_route.as_bytes())
+                || is_zero_16(replay.stream_generation.as_bytes())
+                || replay.ciphertext_sha256 == [0; 32]
                 || replay.sender_counter < replay_floor
                 || replay_cursor.checked_next().is_err()
                 || (replay.stream_route == self.binding.stream_route
                     && replay.stream_generation == self.binding.stream_generation
                     && cursor_cmp(replay_cursor, self.outer_applied) == Ordering::Greater
-                    && pending_seq != Some(replay.stream_seq))
+                    && (pending_seq != Some(replay.stream_seq)
+                        || replay.key_id != self.binding.key_id))
                 || !stream_sequences.insert((
                     *replay.stream_route.as_bytes(),
                     *replay.stream_generation.as_bytes(),
                     replay.stream_seq,
                 ))
                 || previous.is_some_and(|previous: &DurableStreamReplayTupleV1| {
-                    previous.sender_counter >= replay.sender_counter
+                    replay_cmp(previous, replay) != Ordering::Less
                 })
             {
                 return Err(RemoteStreamStateError::InvalidCanonical);
             }
             previous = Some(replay);
+        }
+
+        if let Some(pending) = self.pending_epoch_barrier {
+            let replay = pending.replay_tuple;
+            let expected_epoch = self
+                .binding
+                .key_id
+                .epoch
+                .checked_add(1)
+                .ok_or(RemoteStreamStateError::InvalidCanonical)?;
+            let expected_revision = self
+                .binding
+                .key_directory_revision
+                .next()
+                .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+            let expected_stream_seq = self
+                .outer_applied
+                .checked_next()
+                .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+            if replay.key_id.purpose != self.binding.key_id.purpose
+                || replay.key_id.epoch != expected_epoch
+                || replay.key_directory_revision != expected_revision
+                || replay.stream_route != self.binding.stream_route
+                || replay.stream_generation != self.binding.stream_generation
+                || replay.stream_seq != expected_stream_seq
+                || replay.ciphertext_sha256 == [0; 32]
+                || StreamCursor::At(replay.stream_seq).checked_next().is_err()
+                || self.replay_entries.iter().any(|committed| {
+                    committed.stream_route == replay.stream_route
+                        && committed.stream_generation == replay.stream_generation
+                        && committed.stream_seq == replay.stream_seq
+                })
+                || self.replay_entries.iter().any(|committed| {
+                    same_nonce_scope(committed.key_id, replay.key_id)
+                        && committed.sender_counter == replay.sender_counter
+                })
+            {
+                return Err(RemoteStreamStateError::InvalidCanonical);
+            }
+        }
+
+        if let Some(ack) = &self.latest_stream_applied_ack_basis {
+            ack.validate()
+                .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+            let barrier = EpochBarrierV1 {
+                stream_generation: self.binding.stream_generation,
+                stream_cursor: self.binding.stream_cursor,
+                inner_cursor: self.binding.inner_cursor.clone(),
+                old_epoch: self
+                    .binding
+                    .key_id
+                    .epoch
+                    .checked_sub(1)
+                    .ok_or(RemoteStreamStateError::InvalidCanonical)?,
+                new_epoch: self.binding.key_id.epoch,
+                key_directory_revision: self.binding.key_directory_revision,
+            };
+            ack.validate_for_barrier(self.binding.stream_route, &barrier)
+                .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+            let expected_stream_seq = self
+                .binding
+                .stream_cursor
+                .checked_next()
+                .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+            if ack.format_version != self.binding.format_version
+                || ack.runtime_protocol_version != self.binding.runtime_protocol_version
+                || ack.relay_protocol_version != self.binding.relay_protocol_version
+                || ack.machine_route != self.binding.machine_route
+                || ack.device_route != self.binding.device_route
+                || ack.grant_serial != self.binding.grant_serial
+                || ack.root_trust_epoch != self.binding.root_trust_epoch
+                || ack.stream_route != self.binding.stream_route
+                || ack.stream_generation != self.binding.stream_generation
+                || ack.applied_stream_seq != expected_stream_seq
+                || ack.inner_cursor != self.binding.inner_cursor
+                || ack.key_directory_revision != self.binding.key_directory_revision
+                || ack.key_epoch != self.binding.key_id.epoch
+                || cursor_cmp(StreamCursor::At(ack.applied_stream_seq), self.outer_applied)
+                    == Ordering::Greater
+            {
+                return Err(RemoteStreamStateError::InvalidCanonical);
+            }
         }
         Ok(())
     }
@@ -952,6 +1471,140 @@ fn same_replay_scope(left: &StreamBindingV1, right: &StreamBindingV1) -> bool {
         KeyPurpose::ConversationDek => left.stream_route == right.stream_route,
         KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => false,
     }
+}
+
+fn same_nonce_scope(left: KeyId, right: KeyId) -> bool {
+    left == right
+}
+
+fn key_purpose_tag(purpose: KeyPurpose) -> u8 {
+    match purpose {
+        KeyPurpose::Catalog => 0,
+        KeyPurpose::ConversationDek => 1,
+        KeyPurpose::DeviceCommandTx => 2,
+        KeyPurpose::DeviceReplyTx => 3,
+    }
+}
+
+fn decode_key_purpose(tag: u8) -> Result<KeyPurpose, RemoteStreamStateError> {
+    match tag {
+        0 => Ok(KeyPurpose::Catalog),
+        1 => Ok(KeyPurpose::ConversationDek),
+        2 => Ok(KeyPurpose::DeviceCommandTx),
+        3 => Ok(KeyPurpose::DeviceReplyTx),
+        _ => Err(RemoteStreamStateError::InvalidCanonical),
+    }
+}
+
+fn replay_cmp(left: &DurableStreamReplayTupleV1, right: &DurableStreamReplayTupleV1) -> Ordering {
+    (
+        key_purpose_tag(left.key_id.purpose),
+        left.key_id.epoch,
+        left.sender_counter,
+    )
+        .cmp(&(
+            key_purpose_tag(right.key_id.purpose),
+            right.key_id.epoch,
+            right.sender_counter,
+        ))
+}
+
+fn replay_scope_high_water(
+    replay_entries: &[DurableStreamReplayTupleV1],
+    key_id: KeyId,
+) -> Option<u64> {
+    replay_entries
+        .iter()
+        .filter(|entry| same_nonce_scope(entry.key_id, key_id))
+        .map(|entry| entry.sender_counter)
+        .max()
+}
+
+fn put_replay_count(output: &mut Vec<u8>, count: usize) -> Result<(), RemoteStreamStateError> {
+    output.extend_from_slice(
+        &u32::try_from(count)
+            .map_err(|_| RemoteStreamStateError::TooLarge)?
+            .to_be_bytes(),
+    );
+    Ok(())
+}
+
+fn put_replay_tuple_legacy(output: &mut Vec<u8>, replay: &DurableStreamReplayTupleV1) {
+    output.extend_from_slice(replay.stream_route.as_bytes());
+    output.extend_from_slice(replay.stream_generation.as_bytes());
+    output.extend_from_slice(&replay.stream_seq.to_be_bytes());
+    output.extend_from_slice(&replay.sender_counter.to_be_bytes());
+    output.extend_from_slice(&replay.ciphertext_sha256);
+}
+
+fn put_replay_tuple_v4(output: &mut Vec<u8>, replay: &DurableStreamReplayTupleV1) {
+    output.push(key_purpose_tag(replay.key_id.purpose));
+    output.extend_from_slice(&replay.key_id.epoch.to_be_bytes());
+    output.extend_from_slice(&replay.key_directory_revision.value().to_be_bytes());
+    put_replay_tuple_legacy(output, replay);
+}
+
+fn decode_replay_tuple_v4(
+    decoder: &mut Decoder<'_>,
+) -> Result<DurableStreamReplayTupleV1, RemoteStreamStateError> {
+    Ok(DurableStreamReplayTupleV1 {
+        key_id: KeyId {
+            purpose: decode_key_purpose(decoder.u8()?)?,
+            epoch: decoder.u64()?,
+        },
+        key_directory_revision: KeyDirectoryRevision::new(decoder.u64()?),
+        stream_route: StreamRouteId::from_bytes(decoder.fixed()?),
+        stream_generation: StreamGenerationId::from_bytes(decoder.fixed()?),
+        stream_seq: decoder.u64()?,
+        sender_counter: decoder.u64()?,
+        ciphertext_sha256: decoder.fixed()?,
+    })
+}
+
+fn put_retired_subscriptions(
+    output: &mut Vec<u8>,
+    retired_subscriptions: &[DurableRetiredSubscriptionV1],
+) -> Result<(), RemoteStreamStateError> {
+    output.extend_from_slice(
+        &u32::try_from(retired_subscriptions.len())
+            .map_err(|_| RemoteStreamStateError::TooLarge)?
+            .to_be_bytes(),
+    );
+    for retired in retired_subscriptions {
+        output.extend_from_slice(retired.stream_route.as_bytes());
+        output.extend_from_slice(retired.stream_generation.as_bytes());
+    }
+    Ok(())
+}
+
+fn decode_retired_subscriptions(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<DurableRetiredSubscriptionV1>, RemoteStreamStateError> {
+    let retired_count =
+        usize::try_from(decoder.u32()?).map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+    if retired_count > MAX_RETIRED_SUBSCRIPTIONS {
+        return Err(RemoteStreamStateError::InvalidCanonical);
+    }
+    let mut retired = Vec::with_capacity(retired_count);
+    for _ in 0..retired_count {
+        retired.push(DurableRetiredSubscriptionV1 {
+            stream_route: StreamRouteId::from_bytes(decoder.fixed()?),
+            stream_generation: StreamGenerationId::from_bytes(decoder.fixed()?),
+        });
+    }
+    Ok(retired)
+}
+
+fn decode_bool(decoder: &mut Decoder<'_>) -> Result<bool, RemoteStreamStateError> {
+    match decoder.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(RemoteStreamStateError::InvalidCanonical),
+    }
+}
+
+fn is_zero_16(value: &[u8; 16]) -> bool {
+    value.iter().all(|byte| *byte == 0)
 }
 
 fn subscription_pair(
@@ -1156,7 +1809,7 @@ impl<'a> Decoder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, KeyId, KeyPurpose};
+    use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, EpochBarrierV1, KeyId, KeyPurpose};
     use agentdeck_protocol::relay_v2::{
         DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, RELAY_PROTOCOL_VERSION,
         StreamGenerationId, StreamRouteId, TrustEpoch,
@@ -1217,7 +1870,7 @@ mod tests {
     fn replay_entry_offsets(canonical: &[u8]) -> (usize, usize) {
         assert!(matches!(
             u16::from_be_bytes([canonical[4], canonical[5]]),
-            PREVIOUS_STREAM_STATE_VERSION | STREAM_STATE_VERSION
+            PREVIOUS_STREAM_STATE_VERSION
         ));
         let mut decoder = Decoder::new(&canonical[STREAM_STATE_HEADER_LEN..]);
         decoder.bytes(STREAM_BINDING_MAX_CANONICAL_BYTES).unwrap();
@@ -1235,7 +1888,7 @@ mod tests {
     fn retired_subscription_offsets(canonical: &[u8]) -> (usize, usize) {
         assert_eq!(
             u16::from_be_bytes([canonical[4], canonical[5]]),
-            STREAM_STATE_VERSION
+            RETIRED_STREAM_STATE_VERSION
         );
         let mut decoder = Decoder::new(&canonical[STREAM_STATE_HEADER_LEN..]);
         decoder.bytes(STREAM_BINDING_MAX_CANONICAL_BYTES).unwrap();
@@ -1272,6 +1925,501 @@ mod tests {
         second_pending
     }
 
+    fn applied_catalog_cut(route: u8) -> DurableStreamBindingV1 {
+        let initial = catalog(route);
+        let (pending, disposition) = initial.admit_publish(0, 10, [0x91; 32]).unwrap();
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+        let (applied, mode) = pending
+            .commit_direct_publish(
+                0,
+                RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::At(0),
+                },
+            )
+            .unwrap();
+        assert_eq!(mode, StreamDirectApplyMode::Apply);
+        applied.with_committed_outer_ack(0).unwrap()
+    }
+
+    fn next_epoch_barrier(state: &DurableStreamBindingV1) -> EpochBarrierV1 {
+        EpochBarrierV1 {
+            stream_generation: state.binding.stream_generation,
+            stream_cursor: state.outer_applied,
+            inner_cursor: state.inner_applied.clone(),
+            old_epoch: state.binding.key_id.epoch,
+            new_epoch: state.binding.key_id.epoch + 1,
+            key_directory_revision: state.binding.key_directory_revision.next().unwrap(),
+        }
+    }
+
+    #[test]
+    fn staged_epoch_barrier_admission_is_scoped_bounded_and_quarantines_nonce_conflict() {
+        let state = applied_catalog_cut(0x63);
+        let barrier = next_epoch_barrier(&state);
+        let new_key_id = KeyId {
+            purpose: KeyPurpose::Catalog,
+            epoch: barrier.new_epoch,
+        };
+        let (pending, disposition) = state
+            .admit_pending_epoch_barrier(
+                new_key_id,
+                barrier.key_directory_revision,
+                1,
+                10,
+                [0x92; 32],
+            )
+            .unwrap();
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+        let staged = pending.pending_epoch_barrier().expect("pending barrier");
+        assert_eq!(staged.replay_tuple().key_id(), new_key_id);
+        assert_eq!(
+            staged.replay_tuple().key_directory_revision(),
+            barrier.key_directory_revision
+        );
+        assert_eq!(staged.replay_tuple().sender_counter(), 10);
+        assert!(!staged.replay_quarantined());
+        let pending_canonical = pending.canonical_bytes().unwrap();
+        assert_eq!(
+            DurableStreamBindingV1::from_canonical_bytes(&pending_canonical).unwrap(),
+            pending,
+        );
+        assert!(
+            pending
+                .replace_subscription_bootstrap(
+                    pending.binding.clone(),
+                    pending.inner_applied.clone(),
+                )
+                .is_err(),
+            "subscription replacement must not erase a durable staged barrier",
+        );
+
+        let (exact, disposition) = pending
+            .admit_pending_epoch_barrier(
+                new_key_id,
+                barrier.key_directory_revision,
+                1,
+                10,
+                [0x92; 32],
+            )
+            .unwrap();
+        assert_eq!(disposition, StreamPublishDisposition::PendingDuplicate);
+        assert_eq!(exact, pending);
+
+        let (outer_identity_quarantined, disposition) = pending
+            .admit_pending_epoch_barrier(
+                new_key_id,
+                barrier.key_directory_revision,
+                1,
+                11,
+                [0x94; 32],
+            )
+            .unwrap();
+        assert_eq!(disposition, StreamPublishDisposition::NonceReuseQuarantined,);
+        assert!(
+            outer_identity_quarantined
+                .pending_epoch_barrier()
+                .expect("outer identity quarantine")
+                .replay_quarantined(),
+        );
+
+        let (quarantined, disposition) = pending
+            .admit_pending_epoch_barrier(
+                new_key_id,
+                barrier.key_directory_revision,
+                1,
+                10,
+                [0x93; 32],
+            )
+            .unwrap();
+        assert_eq!(disposition, StreamPublishDisposition::NonceReuseQuarantined);
+        assert!(
+            quarantined
+                .pending_epoch_barrier()
+                .expect("quarantined pending barrier")
+                .replay_quarantined()
+        );
+        assert_eq!(
+            DurableStreamBindingV1::from_canonical_bytes(&quarantined.canonical_bytes().unwrap(),)
+                .unwrap(),
+            quarantined,
+        );
+        assert!(
+            quarantined
+                .activate_epoch_barrier(state.binding.stream_route, &barrier)
+                .is_err()
+        );
+
+        for (key_id, revision) in [
+            (
+                KeyId {
+                    purpose: KeyPurpose::ConversationDek,
+                    epoch: barrier.new_epoch,
+                },
+                barrier.key_directory_revision,
+            ),
+            (state.binding.key_id, barrier.key_directory_revision),
+            (new_key_id, state.binding.key_directory_revision),
+            (
+                KeyId {
+                    purpose: KeyPurpose::Catalog,
+                    epoch: barrier.new_epoch + 1,
+                },
+                barrier.key_directory_revision,
+            ),
+        ] {
+            assert!(
+                state
+                    .admit_pending_epoch_barrier(key_id, revision, 1, 10, [0x94; 32])
+                    .is_err(),
+                "arbitrary future key scope must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_barrier_activation_binds_exact_cut_and_committed_retry_is_idempotent() {
+        let state = applied_catalog_cut(0x64);
+        let barrier = next_epoch_barrier(&state);
+        let new_key_id = KeyId {
+            purpose: KeyPurpose::Catalog,
+            epoch: barrier.new_epoch,
+        };
+        let (pending, _) = state
+            .admit_pending_epoch_barrier(
+                new_key_id,
+                barrier.key_directory_revision,
+                1,
+                10,
+                [0xa1; 32],
+            )
+            .unwrap();
+        let activated = pending
+            .activate_epoch_barrier(state.binding.stream_route, &barrier)
+            .expect("activate exact barrier");
+
+        assert_eq!(activated.binding.key_id, new_key_id);
+        assert_eq!(
+            activated.binding.key_directory_revision,
+            barrier.key_directory_revision
+        );
+        assert_eq!(activated.binding.stream_cursor, barrier.stream_cursor);
+        assert_eq!(activated.binding.inner_cursor, barrier.inner_cursor);
+        assert_eq!(activated.outer_applied(), StreamCursor::At(1));
+        assert_eq!(activated.outer_acked(), StreamCursor::At(0));
+        assert_eq!(activated.inner_observed(), &barrier.inner_cursor);
+        assert_eq!(activated.inner_applied(), &barrier.inner_cursor);
+        assert_eq!(activated.replay_entry_count(), 2);
+        assert!(activated.pending_epoch_barrier().is_none());
+        let ack = activated
+            .latest_stream_applied_ack_basis()
+            .expect("durable StreamAppliedAck basis");
+        ack.validate_for_barrier(state.binding.stream_route, &barrier)
+            .expect("ACK basis binds exact barrier");
+
+        assert_eq!(
+            activated
+                .activate_epoch_barrier(state.binding.stream_route, &barrier)
+                .expect("committed activation retry"),
+            activated
+        );
+        let (next_pending, disposition) = activated
+            .admit_publish(2, 20, [0xa2; 32])
+            .expect("admit post-barrier publish");
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+        let (progressed, mode) = next_pending
+            .commit_direct_publish(
+                2,
+                RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::At(1),
+                },
+            )
+            .expect("apply post-barrier publish");
+        assert_eq!(mode, StreamDirectApplyMode::Apply);
+        assert_eq!(
+            progressed
+                .activate_epoch_barrier(state.binding.stream_route, &barrier)
+                .expect("committed retry remains idempotent after later progress"),
+            progressed,
+        );
+        let canonical = activated.canonical_bytes().unwrap();
+        assert_eq!(
+            u16::from_be_bytes([canonical[4], canonical[5]]),
+            STREAM_STATE_VERSION
+        );
+        assert_eq!(
+            DurableStreamBindingV1::from_canonical_bytes(&canonical).unwrap(),
+            activated
+        );
+        let mut forged_ack = activated.clone();
+        forged_ack
+            .latest_stream_applied_ack_basis
+            .as_mut()
+            .expect("ACK basis")
+            .epoch_barrier_sha256[0] ^= 1;
+        assert_eq!(
+            forged_ack.canonical_bytes().unwrap_err(),
+            RemoteStreamStateError::InvalidCanonical,
+            "open-time validation must reconstruct and authenticate the exact barrier hash",
+        );
+        let rewrapped = activated
+            .with_rewrapped_key_revision(
+                barrier
+                    .key_directory_revision
+                    .next()
+                    .expect("next revision"),
+            )
+            .expect("same-epoch rewrap after activation");
+        assert!(
+            rewrapped.latest_stream_applied_ack_basis().is_none(),
+            "a new revision must not re-seal the previous revision's barrier ACK basis",
+        );
+        assert_eq!(
+            rewrapped.replay_entries, activated.replay_entries,
+            "rewrap preserves the scoped replay audit trail without relabeling revisions",
+        );
+        let mut expected_superseded = activated.clone();
+        expected_superseded.latest_stream_applied_ack_basis = None;
+        assert_eq!(
+            activated
+                .with_superseded_stream_applied_ack()
+                .expect("next rotation supersedes the old receipt basis"),
+            expected_superseded,
+            "rotation receipt supersession changes no stream/replay/cursor axis",
+        );
+    }
+
+    #[test]
+    fn epoch_barrier_receipt_basis_survives_carrier_replay_window_pruning() {
+        let state = catalog(0x65);
+        let barrier = next_epoch_barrier(&state);
+        let new_key_id = KeyId {
+            purpose: KeyPurpose::Catalog,
+            epoch: barrier.new_epoch,
+        };
+        let (pending, disposition) = state
+            .admit_pending_epoch_barrier(
+                new_key_id,
+                barrier.key_directory_revision,
+                0,
+                0,
+                [0xa5; 32],
+            )
+            .expect("admit first-frame epoch barrier");
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+        let mut near_window_edge = pending
+            .activate_epoch_barrier(state.binding.stream_route, &barrier)
+            .expect("activate first-frame epoch barrier");
+
+        // 直接构造已经通过前 4,095 个 current-epoch frame 的 canonical cut，避免这个
+        // focused regression 用 O(n²) admission 循环拖慢整个 lib gate。最后一条仍走真实
+        // admission/commit，精确覆盖 carrier 被 floor 淘汰的边界。
+        near_window_edge.replay_entries.extend(
+            (1..u64::try_from(MAX_STREAM_REPLAY_ENTRIES).unwrap()).map(|counter| {
+                DurableStreamReplayTupleV1 {
+                    key_id: new_key_id,
+                    key_directory_revision: barrier.key_directory_revision,
+                    stream_route: state.binding.stream_route,
+                    stream_generation: state.binding.stream_generation,
+                    stream_seq: counter,
+                    sender_counter: counter,
+                    ciphertext_sha256: [u8::try_from(counter % 251 + 1).unwrap(); 32],
+                }
+            }),
+        );
+        near_window_edge.outer_applied = StreamCursor::At(4_095);
+        near_window_edge.inner_observed = RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(4_094),
+        };
+        near_window_edge.inner_applied = near_window_edge.inner_observed.clone();
+        near_window_edge
+            .validate()
+            .expect("canonical state immediately before carrier pruning");
+
+        let (admitted, disposition) = near_window_edge
+            .admit_publish(4_096, 4_096, [0xf6; 32])
+            .expect("admit the frame that prunes the barrier carrier");
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+        let (progressed, mode) = admitted
+            .commit_direct_publish(
+                4_096,
+                RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::At(4_095),
+                },
+            )
+            .expect("commit after barrier carrier pruning");
+        assert_eq!(mode, StreamDirectApplyMode::Apply);
+
+        assert_eq!(progressed.replay_entry_count(), MAX_STREAM_REPLAY_ENTRIES);
+        assert!(
+            progressed
+                .replay_entries
+                .iter()
+                .all(|entry| entry.stream_seq != 0 || entry.key_id != new_key_id),
+            "the old barrier carrier may age out of the bounded replay window",
+        );
+        assert!(progressed.latest_stream_applied_ack_basis().is_some());
+        assert_eq!(
+            progressed
+                .activate_epoch_barrier(state.binding.stream_route, &barrier)
+                .expect("durable receipt basis remains independently idempotent"),
+            progressed,
+        );
+        assert_eq!(
+            DurableStreamBindingV1::from_canonical_bytes(
+                &progressed
+                    .canonical_bytes()
+                    .expect("encode progressed state")
+            )
+            .expect("decode progressed state"),
+            progressed,
+        );
+    }
+
+    #[test]
+    fn epoch_barrier_rejects_axis_drift_and_lagging_old_ack_without_mutation() {
+        let overlap_bootstrap = DurableStreamBindingV1::from_subscription_bootstrap(
+            binding(
+                StreamRouteId::from_bytes([0x66; 16]),
+                0x76,
+                RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            ),
+            RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(0),
+            },
+        )
+        .unwrap();
+        assert!(
+            overlap_bootstrap
+                .admit_pending_epoch_barrier(
+                    KeyId {
+                        purpose: KeyPurpose::Catalog,
+                        epoch: 4,
+                    },
+                    KeyDirectoryRevision::new(5),
+                    0,
+                    9,
+                    [0xb0; 32],
+                )
+                .is_err(),
+            "a barrier cannot occupy D while bootstrap overlap still needs current-key frames",
+        );
+
+        let state = applied_catalog_cut(0x65);
+        let barrier = next_epoch_barrier(&state);
+        let new_key_id = KeyId {
+            purpose: KeyPurpose::Catalog,
+            epoch: barrier.new_epoch,
+        };
+        let (pending, _) = state
+            .admit_pending_epoch_barrier(
+                new_key_id,
+                barrier.key_directory_revision,
+                1,
+                11,
+                [0xb1; 32],
+            )
+            .unwrap();
+
+        let mut drifted = Vec::new();
+        let mut wrong_generation = barrier.clone();
+        wrong_generation.stream_generation = StreamGenerationId::from_bytes([0xee; 16]);
+        drifted.push(wrong_generation);
+        let mut wrong_outer = barrier.clone();
+        wrong_outer.stream_cursor = StreamCursor::BeforeFirst;
+        drifted.push(wrong_outer);
+        let mut wrong_inner = barrier.clone();
+        wrong_inner.inner_cursor = RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::BeforeFirst,
+        };
+        drifted.push(wrong_inner);
+        let mut wrong_old = barrier.clone();
+        wrong_old.old_epoch -= 1;
+        drifted.push(wrong_old);
+        let mut wrong_new = barrier.clone();
+        wrong_new.new_epoch += 1;
+        drifted.push(wrong_new);
+        let mut wrong_revision = barrier.clone();
+        wrong_revision.key_directory_revision = KeyDirectoryRevision::new(7);
+        drifted.push(wrong_revision);
+        for candidate in drifted {
+            assert!(
+                pending
+                    .activate_epoch_barrier(state.binding.stream_route, &candidate)
+                    .is_err()
+            );
+        }
+        assert!(
+            pending
+                .activate_epoch_barrier(StreamRouteId::from_bytes([0xef; 16]), &barrier)
+                .is_err()
+        );
+
+        let lagging = DurableStreamBindingV1 {
+            outer_applied: StreamCursor::At(2),
+            outer_acked: StreamCursor::At(1),
+            inner_observed: RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(2),
+            },
+            inner_applied: RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(2),
+            },
+            replay_entries: vec![
+                DurableStreamReplayTupleV1 {
+                    key_id: state.binding.key_id,
+                    key_directory_revision: state.binding.key_directory_revision,
+                    stream_route: state.binding.stream_route,
+                    stream_generation: state.binding.stream_generation,
+                    stream_seq: 0,
+                    sender_counter: 10,
+                    ciphertext_sha256: [0xc1; 32],
+                },
+                DurableStreamReplayTupleV1 {
+                    key_id: state.binding.key_id,
+                    key_directory_revision: state.binding.key_directory_revision,
+                    stream_route: state.binding.stream_route,
+                    stream_generation: state.binding.stream_generation,
+                    stream_seq: 1,
+                    sender_counter: 11,
+                    ciphertext_sha256: [0xc2; 32],
+                },
+                DurableStreamReplayTupleV1 {
+                    key_id: state.binding.key_id,
+                    key_directory_revision: state.binding.key_directory_revision,
+                    stream_route: state.binding.stream_route,
+                    stream_generation: state.binding.stream_generation,
+                    stream_seq: 2,
+                    sender_counter: 12,
+                    ciphertext_sha256: [0xc3; 32],
+                },
+            ],
+            ..state
+        };
+        lagging
+            .validate()
+            .expect("lagging ACK is valid before barrier");
+        let lagging_barrier = next_epoch_barrier(&lagging);
+        let (lagging_pending, _) = lagging
+            .admit_pending_epoch_barrier(
+                KeyId {
+                    purpose: KeyPurpose::Catalog,
+                    epoch: lagging_barrier.new_epoch,
+                },
+                lagging_barrier.key_directory_revision,
+                3,
+                13,
+                [0xc4; 32],
+            )
+            .unwrap();
+        assert!(
+            lagging_pending
+                .activate_epoch_barrier(lagging.binding.stream_route, &lagging_barrier)
+                .is_err(),
+            "old outer ACK must be BeforeFirst or exact C",
+        );
+    }
+
     #[test]
     fn shared_key_revision_rewrap_changes_only_the_exact_next_revision() {
         let initial = catalog(0x2a);
@@ -1302,6 +2450,42 @@ mod tests {
         assert_eq!(disposition, StreamPublishDisposition::Fresh);
         let (quarantined, disposition) = next_pending.admit_publish(1, 20, [0x73; 32]).unwrap();
         assert_eq!(disposition, StreamPublishDisposition::NonceReuseQuarantined);
+
+        let rewrapped_acked = acked
+            .with_rewrapped_key_revision(KeyDirectoryRevision::new(5))
+            .unwrap();
+        assert_eq!(
+            rewrapped_acked
+                .admit_publish_at_authenticated_revision(
+                    KeyDirectoryRevision::new(4),
+                    0,
+                    10,
+                    [0x71; 32],
+                )
+                .unwrap()
+                .1,
+            StreamPublishDisposition::AppliedDuplicate,
+            "an authenticated predecessor revision may only replay its exact durable tuple",
+        );
+        assert!(
+            rewrapped_acked
+                .admit_publish_at_authenticated_revision(
+                    KeyDirectoryRevision::new(4),
+                    1,
+                    30,
+                    [0x75; 32],
+                )
+                .is_err(),
+            "a predecessor revision cannot create a fresh tuple after rewrap",
+        );
+        let (rewrap_quarantined, disposition) =
+            rewrapped_acked.admit_publish(1, 10, [0x74; 32]).unwrap();
+        assert_eq!(
+            disposition,
+            StreamPublishDisposition::NonceReuseQuarantined,
+            "same-epoch rewrap must share the previous revision's nonce scope",
+        );
+        assert!(rewrap_quarantined.replay_quarantined());
 
         let mut expected_catalog = quarantined.clone();
         expected_catalog.binding.key_directory_revision = KeyDirectoryRevision::new(5);
@@ -1411,6 +2595,8 @@ mod tests {
         let initial = catalog(0x31);
         let pending = DurableStreamBindingV1 {
             replay_entries: vec![DurableStreamReplayTupleV1 {
+                key_id: initial.binding.key_id,
+                key_directory_revision: initial.binding.key_directory_revision,
                 stream_route: initial.binding.stream_route,
                 stream_generation: initial.binding.stream_generation,
                 stream_seq: 0,
@@ -1435,6 +2621,8 @@ mod tests {
 
         let skipped = DurableStreamBindingV1 {
             replay_entries: vec![DurableStreamReplayTupleV1 {
+                key_id: initial.binding.key_id,
+                key_directory_revision: initial.binding.key_directory_revision,
                 stream_route: initial.binding.stream_route,
                 stream_generation: initial.binding.stream_generation,
                 stream_seq: 1,
@@ -1469,6 +2657,8 @@ mod tests {
         assert_eq!(acked.with_committed_outer_ack(7).unwrap(), acked);
 
         let replay = DurableStreamReplayTupleV1 {
+            key_id: acked.binding.key_id,
+            key_directory_revision: acked.binding.key_directory_revision,
             stream_route: acked.binding.stream_route,
             stream_generation: acked.binding.stream_generation,
             stream_seq: 9,
@@ -1617,7 +2807,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_bootstrap_state_decodes_and_the_next_write_upgrades_to_v3() {
+    fn legacy_v1_bootstrap_state_decodes_and_the_next_write_upgrades_to_v4() {
         let mut binding = binding(
             StreamRouteId::from_bytes([0x35; 16]),
             0x45,
@@ -1856,6 +3046,8 @@ mod tests {
         let stream_generation = state.binding.stream_generation;
         state.replay_entries = (905_u64..=5_000)
             .map(|value| DurableStreamReplayTupleV1 {
+                key_id: state.binding.key_id,
+                key_directory_revision: state.binding.key_directory_revision,
                 stream_route,
                 stream_generation,
                 stream_seq: value,
@@ -2152,7 +3344,12 @@ mod tests {
                 )
                 .unwrap();
         }
-        let canonical = state.canonical_bytes().unwrap();
+        let canonical = state.legacy_v3_canonical_bytes().unwrap();
+        assert_eq!(
+            DurableStreamBindingV1::from_canonical_bytes(&canonical).unwrap(),
+            state,
+            "v3 retired-subscription state migrates without inventing pending/ACK state",
+        );
         let (count_offset, entries_offset) = retired_subscription_offsets(&canonical);
         assert_eq!(
             u32::from_be_bytes(
@@ -2190,7 +3387,7 @@ mod tests {
             );
         }
 
-        let empty = catalog(0x8d).canonical_bytes().unwrap();
+        let empty = catalog(0x8d).legacy_v3_canonical_bytes().unwrap();
         let (count_offset, entries_offset) = retired_subscription_offsets(&empty);
         assert_eq!(entries_offset, empty.len());
         let mut overflow = empty;

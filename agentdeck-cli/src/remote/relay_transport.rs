@@ -249,6 +249,10 @@ pub async fn connect_paired_runtime<'a>(
                 .recover_durable_key_sync()
                 .await
                 .map_err(PairedRuntimeConnectError::Runtime)?;
+            runtime
+                .recover_durable_epoch_barrier_acks()
+                .await
+                .map_err(PairedRuntimeConnectError::Runtime)?;
             Ok(PairedRuntimeConnectOutcome::Connected(Box::new(runtime)))
         }
         RelayRuntimeConnectCompletion::Revoked => Ok(PairedRuntimeConnectOutcome::Revoked),

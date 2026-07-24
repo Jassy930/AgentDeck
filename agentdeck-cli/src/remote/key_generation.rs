@@ -46,6 +46,8 @@ pub enum KeyGenerationStateError {
     DirectedKeyRotation,
     #[error("normal UpdateSet does not exactly match the installed key roster and history")]
     UpdateSetMismatch,
+    #[error("epoch barrier does not exactly match the staged shared-key transition")]
+    EpochBarrierMismatch,
 }
 
 /// 一个 durable slot 的稳定身份；epoch/revision 属于 generation record，不属于 slot。
@@ -457,8 +459,80 @@ impl DurableKeyGenerationStateV1 {
         .map(DurableKeySlotV1::current)
     }
 
-    /// 重建尚未由 EpochBarrier 激活的 exact normal UpdateSet。该投影是 ADKG 与 ADKS
-    /// completion hash/KeyUpdateAck 的自包含审计桥；post-activation state 不满足此 shape。
+    /// 激活一个与 EpochBarrier 完全匹配的 shared-key slot。
+    ///
+    /// 新 generation 必须已经作为当前 effective revision 的 staged generation 持久化；
+    /// 激活只把旧 current 追加到有界 retired 链，并把 staged 原样提升为 current。已经
+    /// 完成的同一请求可安全重试，但任何 route/revision/epoch 或历史尾项漂移都会拒绝。
+    pub fn activate_shared_key_slot(
+        &self,
+        purpose: KeyPurpose,
+        stream_route: Option<StreamRouteId>,
+        key_directory_revision: KeyDirectoryRevision,
+        old_epoch: u64,
+        new_epoch: u64,
+    ) -> Result<Self, KeyGenerationStateError> {
+        if !matches!(purpose, KeyPurpose::Catalog | KeyPurpose::ConversationDek)
+            || key_directory_revision != self.effective_directory_revision
+            || old_epoch.checked_add(1) != Some(new_epoch)
+        {
+            return Err(KeyGenerationStateError::EpochBarrierMismatch);
+        }
+        let identity = KeySlotIdentityV1::new(purpose, stream_route)
+            .map_err(|_| KeyGenerationStateError::EpochBarrierMismatch)?;
+        let slot_index = self
+            .slots
+            .binary_search_by(|slot| slot.identity.sort_key().cmp(&identity.sort_key()))
+            .map_err(|_| KeyGenerationStateError::EpochBarrierMismatch)?;
+        let slot = &self.slots[slot_index];
+
+        let exact_new_current = slot.current.key_directory_revision == key_directory_revision
+            && slot.current.key_id.purpose == purpose
+            && slot.current.key_id.epoch == new_epoch
+            && slot.current.stream_route == stream_route;
+        if slot.staged.is_none() {
+            let exact_retired_tail = slot.retired.last().is_some_and(|retired| {
+                retired.key_id.purpose == purpose
+                    && retired.key_id.epoch == old_epoch
+                    && retired.stream_route == stream_route
+            });
+            if exact_new_current && exact_retired_tail {
+                return Ok(self.clone());
+            }
+            return Err(KeyGenerationStateError::EpochBarrierMismatch);
+        }
+
+        let Some(staged) = slot.staged.as_ref() else {
+            return Err(KeyGenerationStateError::EpochBarrierMismatch);
+        };
+        if slot.current.key_id.purpose != purpose
+            || slot.current.key_id.epoch != old_epoch
+            || slot.current.stream_route != stream_route
+            || staged.key_directory_revision != key_directory_revision
+            || staged.key_id.purpose != purpose
+            || staged.key_id.epoch != new_epoch
+            || staged.stream_route != stream_route
+        {
+            return Err(KeyGenerationStateError::EpochBarrierMismatch);
+        }
+        if slot.retired.len() >= MAX_RETIRED_KEY_GENERATIONS_PER_SLOT {
+            return Err(KeyGenerationStateError::TooLarge);
+        }
+
+        let mut retired = slot.retired.clone();
+        retired.push(slot.current.clone());
+        let mut slots = self.slots.clone();
+        slots[slot_index] = DurableKeySlotV1::new(identity, staged.clone(), None, retired)?;
+        Self::new(
+            self.bootstrap_directory_revision,
+            self.effective_directory_revision,
+            slots,
+        )
+    }
+
+    /// 从 shared slot 的 staged/current 组合重建 exact normal UpdateSet；部分或全部
+    /// EpochBarrier activation 后仍保持成立。该投影是 ADKG 与 ADKS completion hash/
+    /// KeyUpdateAck 的自包含审计桥。
     pub fn staged_normal_update_set(&self) -> Result<KeyUpdateSetV1, KeyGenerationStateError> {
         let mut updates = Vec::with_capacity(self.slots.len());
         for slot in &self.slots {
@@ -1734,6 +1808,236 @@ mod tests {
                 .staged_normal_update_set()
                 .expect("rewrapped state reconstructs the exact set"),
             set
+        );
+    }
+
+    #[test]
+    fn shared_key_activation_promotes_exact_catalog_slot_and_preserves_every_other_slot() {
+        let (previous, set) = normal_update_fixture();
+        let staged = stage_normal_update_set(&previous, &set).expect("stage exact UpdateSet");
+        let before_catalog = staged
+            .find_slot(KeyPurpose::Catalog, None)
+            .expect("staged catalog")
+            .clone();
+
+        let activated = staged
+            .activate_shared_key_slot(
+                KeyPurpose::Catalog,
+                None,
+                KeyDirectoryRevision::new(5),
+                2,
+                3,
+            )
+            .expect("activate exact catalog barrier");
+        let after_catalog = activated
+            .find_slot(KeyPurpose::Catalog, None)
+            .expect("activated catalog");
+
+        assert_eq!(
+            after_catalog.current(),
+            before_catalog.staged().expect("catalog staged generation")
+        );
+        assert!(after_catalog.staged().is_none());
+        assert_eq!(
+            &after_catalog.retired()[..before_catalog.retired().len()],
+            before_catalog.retired()
+        );
+        assert_eq!(
+            after_catalog.retired().last(),
+            Some(before_catalog.current())
+        );
+        for before in staged.slots() {
+            if before.identity().purpose() != KeyPurpose::Catalog {
+                assert_eq!(
+                    activated.find_slot(
+                        before.identity().purpose(),
+                        before.identity().stream_route()
+                    ),
+                    Some(before),
+                    "non-target slot must remain byte-for-byte equivalent"
+                );
+            }
+        }
+        assert_eq!(
+            activated
+                .staged_normal_update_set()
+                .expect("partially activated state reconstructs exact UpdateSet"),
+            set
+        );
+    }
+
+    #[test]
+    fn shared_key_activation_accepts_exact_conversation_route_and_retry_is_idempotent() {
+        let route = StreamRouteId::from_bytes([7; 16]);
+        let (previous, set) = normal_update_fixture();
+        let staged = stage_normal_update_set(&previous, &set).expect("stage exact UpdateSet");
+        let catalog_activated = staged
+            .activate_shared_key_slot(
+                KeyPurpose::Catalog,
+                None,
+                KeyDirectoryRevision::new(5),
+                2,
+                3,
+            )
+            .expect("activate catalog");
+        let fully_activated = catalog_activated
+            .activate_shared_key_slot(
+                KeyPurpose::ConversationDek,
+                Some(route),
+                KeyDirectoryRevision::new(5),
+                9,
+                10,
+            )
+            .expect("activate exact conversation barrier");
+
+        assert_eq!(
+            fully_activated
+                .staged_normal_update_set()
+                .expect("fully activated state reconstructs exact UpdateSet"),
+            set
+        );
+        let committed_bytes = fully_activated
+            .canonical_bytes()
+            .expect("canonical committed state");
+        let retried = fully_activated
+            .activate_shared_key_slot(
+                KeyPurpose::ConversationDek,
+                Some(route),
+                KeyDirectoryRevision::new(5),
+                9,
+                10,
+            )
+            .expect("exact committed retry");
+        assert_eq!(retried, fully_activated);
+        assert_eq!(
+            retried.canonical_bytes().expect("canonical retried state"),
+            committed_bytes,
+            "committed retry must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn shared_key_activation_rejects_non_exact_barriers_and_directed_slots() {
+        let route = StreamRouteId::from_bytes([7; 16]);
+        let wrong_route = StreamRouteId::from_bytes([8; 16]);
+        let (previous, set) = normal_update_fixture();
+        let staged = stage_normal_update_set(&previous, &set).expect("stage exact UpdateSet");
+
+        for rejected in [
+            staged.activate_shared_key_slot(
+                KeyPurpose::Catalog,
+                Some(route),
+                KeyDirectoryRevision::new(5),
+                2,
+                3,
+            ),
+            staged.activate_shared_key_slot(
+                KeyPurpose::ConversationDek,
+                Some(wrong_route),
+                KeyDirectoryRevision::new(5),
+                9,
+                10,
+            ),
+            staged.activate_shared_key_slot(
+                KeyPurpose::Catalog,
+                None,
+                KeyDirectoryRevision::new(4),
+                2,
+                3,
+            ),
+            staged.activate_shared_key_slot(
+                KeyPurpose::Catalog,
+                None,
+                KeyDirectoryRevision::new(5),
+                1,
+                2,
+            ),
+            staged.activate_shared_key_slot(
+                KeyPurpose::Catalog,
+                None,
+                KeyDirectoryRevision::new(5),
+                2,
+                4,
+            ),
+            staged.activate_shared_key_slot(
+                KeyPurpose::DeviceCommandTx,
+                None,
+                KeyDirectoryRevision::new(5),
+                5,
+                6,
+            ),
+            staged.activate_shared_key_slot(
+                KeyPurpose::DeviceReplyTx,
+                None,
+                KeyDirectoryRevision::new(5),
+                6,
+                7,
+            ),
+            previous.activate_shared_key_slot(
+                KeyPurpose::Catalog,
+                None,
+                KeyDirectoryRevision::new(4),
+                2,
+                3,
+            ),
+        ] {
+            assert_eq!(
+                rejected.unwrap_err(),
+                KeyGenerationStateError::EpochBarrierMismatch
+            );
+        }
+    }
+
+    #[test]
+    fn shared_key_activation_fails_closed_when_retired_history_is_full() {
+        let retired = (1_u64..=64)
+            .map(|epoch| {
+                generation(
+                    KeyPurpose::Catalog,
+                    None,
+                    epoch,
+                    epoch,
+                    u8::try_from(epoch).expect("bounded seed"),
+                )
+            })
+            .collect();
+        let catalog = DurableKeySlotV1::new(
+            KeySlotIdentityV1::new(KeyPurpose::Catalog, None).expect("catalog identity"),
+            generation(KeyPurpose::Catalog, None, 65, 65, 65),
+            Some(generation(KeyPurpose::Catalog, None, 66, 66, 66)),
+            retired,
+        )
+        .expect("full retained chain with one staged generation");
+        let value = DurableKeyGenerationStateV1::new(
+            KeyDirectoryRevision::new(1),
+            KeyDirectoryRevision::new(66),
+            vec![
+                catalog,
+                slot(KeyPurpose::DeviceCommandTx, 66, 1, 71),
+                slot(KeyPurpose::DeviceReplyTx, 66, 1, 72),
+            ],
+        )
+        .expect("state at retired hard bound");
+        let before = value.canonical_bytes().expect("canonical pre-state");
+
+        assert_eq!(
+            value
+                .activate_shared_key_slot(
+                    KeyPurpose::Catalog,
+                    None,
+                    KeyDirectoryRevision::new(66),
+                    65,
+                    66,
+                )
+                .unwrap_err(),
+            KeyGenerationStateError::TooLarge
+        );
+        assert_eq!(
+            value
+                .canonical_bytes()
+                .expect("canonical state after rejection"),
+            before,
+            "failed activation must not mutate the source state"
         );
     }
 

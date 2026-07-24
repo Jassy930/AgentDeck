@@ -24,10 +24,11 @@ use agentdeck_crypto::{
 use agentdeck_protocol::ActionDecision;
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
-    E2EE_FORMAT_VERSION, E2eeError, KeyControlRequestV1, KeyDirectoryV1, KeyId, KeyPurpose,
-    KeySyncRequestV1, KeyUpdateAckV1, KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1,
-    OuterFrameKind, PairResponseReceivedV1, PairResponseV1, PairingControlEnvelopeV1, PairingError,
-    SealedPayloadKind, SealedPayloadV1, SignedSealedBlobV1, StreamBindingV1, VerifiedSealedBlobV1,
+    E2EE_FORMAT_VERSION, E2eeError, EpochBarrierV1, KeyControlRequestV1, KeyControlV1,
+    KeyDirectoryV1, KeyId, KeyPurpose, KeySyncRequestV1, KeyUpdateAckV1, KeyUpdateInfoV1,
+    MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairResponseReceivedV1,
+    PairResponseV1, PairingControlEnvelopeV1, PairingError, SealedPayloadKind, SealedPayloadV1,
+    SignedSealedBlobV1, StreamAppliedAckV1, StreamBindingV1, VerifiedSealedBlobV1,
 };
 use agentdeck_protocol::relay_v2::auth::{
     AuthCanonicalError, AuthenticationRole, AuthenticationTranscriptV1, CertRole, Ed25519Signature,
@@ -587,6 +588,59 @@ impl CommittedKeyUpdateInstall {
     }
 }
 
+/// 已完成 staged-key signature/AAD、durable replay admission、AEAD 与 canonical
+/// EpochBarrier 逐轴校验，等待单次 ADPS CAS 的私有 activation capability。
+///
+/// expected/candidate 都是完整 paired-state plaintext；调用方不能拆开提交 ADKG、
+/// stream binding 或 receipt basis。`Debug` 永不输出密钥、barrier 或 state bytes。
+pub(crate) struct PreparedEpochBarrierActivation {
+    expected_state_bytes: Vec<u8>,
+    candidate_state_bytes: Vec<u8>,
+    candidate_generation_bytes: Vec<u8>,
+    candidate_stream_binding_bytes: Vec<Vec<u8>>,
+    expected_stream_route: StreamRouteId,
+    expected_stream_generation: StreamGenerationId,
+    expected_ack: StreamAppliedAckV1,
+}
+
+impl fmt::Debug for PreparedEpochBarrierActivation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedEpochBarrierActivation([REDACTED])")
+    }
+}
+
+/// combined activation 完整 durable readback 后铸造的 receipt capability。该值只证明
+/// 本地 staged→current、stream cut/replay 与 ACK basis 已一起 COMMIT；Relay 的
+/// RouteAccepted 仍只是 transport state。
+pub(crate) struct CommittedEpochBarrierActivation {
+    stream_binding: DurableStreamBindingV1,
+    ack: StreamAppliedAckV1,
+    already_committed: bool,
+}
+
+impl fmt::Debug for CommittedEpochBarrierActivation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CommittedEpochBarrierActivation([REDACTED])")
+    }
+}
+
+impl CommittedEpochBarrierActivation {
+    #[must_use]
+    pub(crate) const fn stream_binding(&self) -> &DurableStreamBindingV1 {
+        &self.stream_binding
+    }
+
+    #[must_use]
+    pub(crate) const fn ack(&self) -> &StreamAppliedAckV1 {
+        &self.ack
+    }
+
+    #[must_use]
+    pub(crate) const fn already_committed(&self) -> bool {
+        self.already_committed
+    }
+}
+
 /// marker exact readback 后才可返回给 transport 的 frozen receipt outbox。
 pub struct PromotedPairedMachine {
     state_path: PathBuf,
@@ -832,6 +886,7 @@ fn validate_typed_stream_state(
     let Some(bindings) = state.typed_durable_stream_bindings()? else {
         return Ok(());
     };
+    let generation = state.durable_key_generation_state()?;
     for binding in bindings {
         validate_stream_binding_against_audit(
             binding.binding(),
@@ -839,8 +894,178 @@ fn validate_typed_stream_state(
             authorization,
             opened_keys,
         )?;
+        if binding.pending_epoch_barrier().is_some() {
+            validate_pending_epoch_barrier_against_generation(
+                &binding,
+                generation.as_ref().ok_or(PairedPromotionError::Conflict)?,
+            )?;
+        }
     }
     Ok(())
+}
+
+/// Cold open 必须把已经 durable admission 的 future-key replay tuple 与 ADKG 的唯一
+/// shared staged slot 逐轴交叉认证。该约束只从 pending 指向 staged；正常 UpdateSet 在
+/// barrier 到达前允许 staged slot 尚无 pending carrier。
+fn validate_pending_epoch_barrier_against_generation(
+    binding: &DurableStreamBindingV1,
+    generation: &DurableKeyGenerationStateV1,
+) -> Result<(), PairedPromotionError> {
+    let pending = binding
+        .pending_epoch_barrier()
+        .ok_or(PairedPromotionError::Conflict)?;
+    let tuple = pending.replay_tuple();
+    let current = binding.binding();
+    let slot_route = stream_key_slot_route(current.key_id, current.stream_route)?;
+    let slot = generation
+        .find_slot(current.key_id.purpose, slot_route)
+        .ok_or(PairedPromotionError::Conflict)?;
+    let staged = slot.staged().ok_or(PairedPromotionError::Conflict)?;
+    if generation.effective_directory_revision() != tuple.key_directory_revision()
+        || slot.current().key_id() != current.key_id
+        || slot.current().key_directory_revision() != current.key_directory_revision
+        || slot.current().stream_route() != slot_route
+        || tuple.key_id().purpose != current.key_id.purpose
+        || tuple.stream_route() != current.stream_route
+        || tuple.stream_generation() != current.stream_generation
+        || staged.key_id() != tuple.key_id()
+        || staged.key_directory_revision() != tuple.key_directory_revision()
+        || staged.stream_route() != slot_route
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pending_epoch_barrier_audit_tests {
+    use super::*;
+    use crate::remote::key_generation::{DurableKeySlotV1, KeySlotIdentityV1};
+    use agentdeck_protocol::e2ee::KeyUpdateV1;
+    use agentdeck_protocol::runtime::StreamCursor;
+
+    const ROUTE: StreamRouteId = StreamRouteId::from_bytes([0x41; 16]);
+    const GENERATION: StreamGenerationId = StreamGenerationId::from_bytes([0x42; 16]);
+    const DEVICE: DeviceRouteId = DeviceRouteId::from_bytes([0x43; 16]);
+
+    fn pending_catalog() -> DurableStreamBindingV1 {
+        let binding = StreamBindingV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            machine_route: MachineRouteId::from_bytes([0x44; 16]),
+            device_route: DEVICE,
+            grant_serial: GrantSerial::new(7),
+            root_trust_epoch: TrustEpoch::new(2),
+            stream_route: ROUTE,
+            stream_generation: GENERATION,
+            stream_cursor: StreamCursor::BeforeFirst,
+            inner_cursor: RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::BeforeFirst,
+            },
+            key_directory_revision: KeyDirectoryRevision::new(4),
+            key_id: KeyId {
+                purpose: KeyPurpose::Catalog,
+                epoch: 3,
+            },
+        };
+        DurableStreamBindingV1::from_stream_binding(binding)
+            .expect("valid catalog binding")
+            .admit_pending_epoch_barrier(
+                KeyId {
+                    purpose: KeyPurpose::Catalog,
+                    epoch: 4,
+                },
+                KeyDirectoryRevision::new(5),
+                0,
+                9,
+                [0x45; 32],
+            )
+            .expect("valid pending barrier")
+            .0
+    }
+
+    fn update_generation(
+        purpose: KeyPurpose,
+        revision: u64,
+        epoch: u64,
+        seed: u8,
+    ) -> DurableKeyGenerationV1 {
+        DurableKeyGenerationV1::from_update(KeyUpdateV1 {
+            key_directory_revision: KeyDirectoryRevision::new(revision),
+            key_id: KeyId { purpose, epoch },
+            device_route: DEVICE,
+            stream_route: None,
+            enc: vec![seed; 32],
+            wrapped_key: vec![seed.wrapping_add(1); 48],
+            signature: Ed25519Signature([seed.wrapping_add(2); 64]),
+        })
+        .expect("valid staged generation")
+    }
+
+    fn generation(
+        staged: Option<DurableKeyGenerationV1>,
+        effective: u64,
+    ) -> DurableKeyGenerationStateV1 {
+        let current = DurableKeyGenerationV1::from_bootstrap_entry(
+            KeyDirectoryRevision::new(4),
+            KeyId {
+                purpose: KeyPurpose::Catalog,
+                epoch: 3,
+            },
+            None,
+            DEVICE,
+        )
+        .expect("valid current generation");
+        DurableKeyGenerationStateV1::new(
+            KeyDirectoryRevision::new(4),
+            KeyDirectoryRevision::new(effective),
+            vec![
+                DurableKeySlotV1::new(
+                    KeySlotIdentityV1::new(KeyPurpose::Catalog, None).expect("catalog slot"),
+                    current,
+                    staged,
+                    Vec::new(),
+                )
+                .expect("valid key slot"),
+                DurableKeySlotV1::new(
+                    KeySlotIdentityV1::new(KeyPurpose::DeviceCommandTx, None)
+                        .expect("command slot"),
+                    update_generation(KeyPurpose::DeviceCommandTx, effective, 5, 0x51),
+                    None,
+                    Vec::new(),
+                )
+                .expect("valid command slot"),
+                DurableKeySlotV1::new(
+                    KeySlotIdentityV1::new(KeyPurpose::DeviceReplyTx, None).expect("reply slot"),
+                    update_generation(KeyPurpose::DeviceReplyTx, effective, 7, 0x61),
+                    None,
+                    Vec::new(),
+                )
+                .expect("valid reply slot"),
+            ],
+        )
+        .expect("valid generation state")
+    }
+
+    #[test]
+    fn pending_epoch_barrier_requires_the_exact_staged_generation_axes() {
+        let binding = pending_catalog();
+        let exact = generation(Some(update_generation(KeyPurpose::Catalog, 5, 4, 0x41)), 5);
+        validate_pending_epoch_barrier_against_generation(&binding, &exact)
+            .expect("exact staged generation matches pending tuple");
+
+        for drifted in [
+            generation(None, 5),
+            generation(Some(update_generation(KeyPurpose::Catalog, 5, 5, 0x42)), 5),
+            generation(Some(update_generation(KeyPurpose::Catalog, 6, 4, 0x43)), 6),
+        ] {
+            assert!(matches!(
+                validate_pending_epoch_barrier_against_generation(&binding, &drifted),
+                Err(PairedPromotionError::Conflict)
+            ));
+        }
+    }
 }
 
 /// ADKS 必须绑定当前 paired authority、已安装 revision 与 exact live publication slot。
@@ -1071,10 +1296,13 @@ pub(crate) struct VerifiedDirectedReply {
 }
 
 /// 已完成 canonical Relay outer、durable route/generation 与 MachineDataSign/AAD 验证的
-/// stream proof。当前 revision 才携带可进入 replay/AEAD 的 branded token；未知更高
-/// directory revision 只携带 bounded KeySync observation，绝不伪装成可解密 publication。
+/// stream proof。当前 revision 携带普通 live token；与 ADKG 唯一 staged shared slot
+/// 精确匹配的 next revision/new epoch 只携带 EpochBarrier admission token；其余未知更高
+/// revision 只能触发 bounded KeySync，绝不伪装成可解密 publication。
 pub(crate) enum VerifiedStreamPublish {
     Current(Box<VerifiedCurrentStreamPublish>),
+    StagedEpochBarrier(Box<VerifiedStagedEpochBarrierPublish>),
+    CommittedEpochBarrierDuplicate(Box<VerifiedCurrentStreamPublish>),
     Higher(Box<VerifiedHigherStreamPublish>),
 }
 
@@ -1090,6 +1318,25 @@ pub(crate) struct VerifiedCurrentStreamPublish {
 
 pub(crate) struct VerifiedHigherStreamPublish {
     observation: SignedHigherRevisionObservationV1,
+}
+
+/// 仅证明 outer/signature/AAD/header 已绑定唯一 staged shared generation；AEAD 必须等
+/// staged replay tuple durable admission 后才能消费。字段私有，不能由 runtime 拼造。
+pub(crate) struct VerifiedStagedEpochBarrierPublish {
+    verified: VerifiedSealedBlobV1,
+    context: OuterContextV1,
+    brand: StreamPublishBrand,
+    stream_seq: u64,
+    counter: u64,
+    ciphertext_sha256: [u8; 32],
+}
+
+/// staged replay 已 durable、AEAD/canonical control 与本地 C/H/epoch/revision 全部精确
+/// 对账后的 activation proof。它仍不代表 paired-state activation 已提交。
+pub(crate) struct VerifiedEpochBarrierActivation {
+    durable: DurableStreamBindingV1,
+    stream_route: StreamRouteId,
+    barrier: EpochBarrierV1,
 }
 
 /// 当前 paired capability 对 root-signed Relay terminal 完整验签后铸造的撤销证明。
@@ -1290,12 +1537,44 @@ impl VerifiedCurrentStreamPublish {
     pub(crate) const fn ciphertext_sha256(&self) -> [u8; 32] {
         self.ciphertext_sha256
     }
+
+    #[must_use]
+    pub(crate) const fn header_directory_revision(&self) -> KeyDirectoryRevision {
+        KeyDirectoryRevision::new(self.header_directory_revision)
+    }
 }
 
 impl VerifiedHigherStreamPublish {
     #[must_use]
     pub(crate) fn into_observation(self) -> SignedHigherRevisionObservationV1 {
         self.observation
+    }
+}
+
+impl VerifiedStagedEpochBarrierPublish {
+    #[must_use]
+    pub(crate) const fn stream_seq(&self) -> u64 {
+        self.stream_seq
+    }
+
+    #[must_use]
+    pub(crate) const fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    #[must_use]
+    pub(crate) const fn ciphertext_sha256(&self) -> [u8; 32] {
+        self.ciphertext_sha256
+    }
+
+    #[must_use]
+    pub(crate) const fn key_id(&self) -> KeyId {
+        self.brand.key_id
+    }
+
+    #[must_use]
+    pub(crate) const fn key_directory_revision(&self) -> KeyDirectoryRevision {
+        KeyDirectoryRevision::new(self.brand.directory_revision)
     }
 }
 
@@ -2720,6 +2999,112 @@ impl OpenedPairedMachine<'_> {
         )
     }
 
+    /// 用当前 durable barrier receipt basis 与 DeviceCommandTx capability 重封
+    /// StreamAppliedAck。basis 会保留到后续 directory transition 显式替换，Relay 的
+    /// RouteAccepted 不会清除它。
+    pub(crate) fn seal_stream_applied_ack(
+        &self,
+        request_route: RequestRouteId,
+        ack: &StreamAppliedAckV1,
+        reservation: CommandCounterReservation,
+    ) -> Result<Vec<u8>, PairedPromotionError> {
+        if request_route.as_bytes().iter().all(|byte| *byte == 0)
+            || !self
+                .pending_stream_applied_acks()?
+                .iter()
+                .any(|basis| basis == ack)
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        validate_current_command_reservation(
+            self.audited.state.counter_reservation(),
+            &reservation,
+        )?;
+        let command_key = self
+            .audited
+            .opened_directory_keys
+            .iter()
+            .find_map(|entry| match &entry.material {
+                OpenedPairedKeyMaterial::CommandTx(key) => {
+                    Some((key, entry.key_directory_revision))
+                }
+                OpenedPairedKeyMaterial::ReplyTx { .. }
+                | OpenedPairedKeyMaterial::StreamRx { .. } => None,
+            })
+            .ok_or(PairedPromotionError::InvalidState)?;
+        if command_key.1 != ack.key_directory_revision
+            || command_key.0.key_directory_revision != ack.key_directory_revision.value()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let control = KeyControlRequestV1::stream_applied_ack(ack.clone());
+        let plaintext = control
+            .canonical_bytes()
+            .map_err(PairedPromotionError::Protocol)?;
+        let context = OuterContextV1::uplink_send(
+            self.audited.identity.machine_route,
+            self.audited.device_route,
+            request_route,
+            command_key.0.epoch,
+        );
+        let unsigned = seal_symmetric(
+            command_key.0,
+            &context,
+            control.sealed_payload_kind(),
+            &plaintext,
+            SenderCounter(reservation.start()),
+        )
+        .map_err(PairedPromotionError::Crypto)?;
+        Ok(
+            sign_sealed(unsigned, self.audited.device_signing_key.as_ref(), &context)
+                .to_wire_bytes(),
+        )
+    }
+
+    fn staged_stream_receiving_key(
+        &self,
+        binding: &StreamBindingV1,
+        key_id: KeyId,
+        key_directory_revision: KeyDirectoryRevision,
+    ) -> Result<(AeadReceivingKey, [u8; 4]), PairedPromotionError> {
+        if key_id.purpose != binding.key_id.purpose
+            || binding.key_id.epoch.checked_add(1) != Some(key_id.epoch)
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let generation = self
+            .audited
+            .state
+            .durable_key_generation_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+        if generation.effective_directory_revision() != key_directory_revision {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let slot_route = stream_key_slot_route(key_id, binding.stream_route)?;
+        let staged = generation
+            .find_slot(key_id.purpose, slot_route)
+            .and_then(|slot| slot.staged())
+            .ok_or(PairedPromotionError::Conflict)?;
+        if staged.key_id() != key_id
+            || staged.key_directory_revision() != key_directory_revision
+            || staged.stream_route() != slot_route
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let secret = open_durable_generation(
+            self.audited.state.bootstrap(),
+            &self.audited.device_hpke_private_key,
+            &self.audited.machine_data_verifying_key,
+            &self.audited.machine_data_signer_binding,
+            staged,
+        )?;
+        let nonce_prefix = agentdeck_crypto::derive_nonce_prefix(&secret);
+        Ok((
+            AeadReceivingKey::new(key_id, key_id.epoch, secret),
+            nonce_prefix,
+        ))
+    }
+
     /// 在任何 stream replay/outer/inner durable mutation 前完成 Publish 的完整公开边界
     /// 验证。`binding` 必须来自本 machine 已审计的 durable collection；Publish route、
     /// generation、key header、nonce prefix、AAD 与 MachineDataSign 任一漂移都 fail-close。
@@ -2818,7 +3203,12 @@ impl OpenedPairedMachine<'_> {
             && header.key_epoch == stream_key.epoch
             && header.nonce[..4] == nonce_prefix
             && durable
-                .admit_publish(publish.stream_seq, counter, ciphertext_sha256)
+                .admit_publish_at_authenticated_revision(
+                    KeyDirectoryRevision::new(header.key_directory_revision),
+                    publish.stream_seq,
+                    counter,
+                    ciphertext_sha256,
+                )
                 .is_ok_and(|(_, disposition)| {
                     matches!(
                         disposition,
@@ -2839,6 +3229,45 @@ impl OpenedPairedMachine<'_> {
         if header.key_directory_revision > expected_revision {
             if header.key_id.purpose != binding.key_id.purpose {
                 return Err(PairedPromotionError::Crypto(CryptoError::BadCiphertext));
+            }
+            let header_revision = KeyDirectoryRevision::new(header.key_directory_revision);
+            if header_revision == self.audited.effective_directory_revision
+                && binding.key_id.epoch.checked_add(1) == Some(header.key_epoch)
+            {
+                // Staged key 只允许验证 exact-next outer frame；encrypted C/H/variant 在
+                // durable staged replay admission 后再由专用 open capability 校验。
+                if durable.outer_applied().checked_next().ok() != Some(publish.stream_seq) {
+                    return Err(PairedPromotionError::Conflict);
+                }
+                let (_staged_key, staged_nonce_prefix) =
+                    self.staged_stream_receiving_key(binding, header.key_id, header_revision)?;
+                if header.nonce[..4] != staged_nonce_prefix {
+                    return Err(PairedPromotionError::Crypto(CryptoError::BadCiphertext));
+                }
+                let staged_key_id = header.key_id;
+                let staged_directory_revision = header.key_directory_revision;
+                let staged_brand = StreamPublishBrand {
+                    machine_route: self.audited.identity.machine_route,
+                    stream_route: binding.stream_route,
+                    stream_generation: binding.stream_generation,
+                    key_id: staged_key_id,
+                    directory_revision: staged_directory_revision,
+                    frame_kind,
+                };
+                return Ok(VerifiedStreamPublish::StagedEpochBarrier(Box::new(
+                    VerifiedStagedEpochBarrierPublish {
+                        verified,
+                        context,
+                        brand: staged_brand,
+                        stream_seq: publish.stream_seq,
+                        counter,
+                        ciphertext_sha256,
+                    },
+                )));
+            }
+            if header_revision <= self.audited.effective_directory_revision {
+                // 已知 revision 却没有唯一 staged capability 不是 KeySync trigger。
+                return Err(PairedPromotionError::Conflict);
             }
             let key_slot_stream_route = stream_key_slot_route(header.key_id, publish.stream_route)?;
             let signed_frame_sha256 = sha256(&encode(&OpaqueRouteFrame {
@@ -2887,17 +3316,35 @@ impl OpenedPairedMachine<'_> {
             return Err(PairedPromotionError::Crypto(CryptoError::BadCiphertext));
         }
         let header_directory_revision = header.key_directory_revision;
-        Ok(VerifiedStreamPublish::Current(Box::new(
-            VerifiedCurrentStreamPublish {
-                verified,
-                context,
-                brand: stream_publish_brand(self.audited.identity.machine_route, binding)?,
-                header_directory_revision,
-                stream_seq: publish.stream_seq,
-                counter,
-                ciphertext_sha256,
-            },
-        )))
+        let current = VerifiedCurrentStreamPublish {
+            verified,
+            context,
+            brand: stream_publish_brand(self.audited.identity.machine_route, binding)?,
+            header_directory_revision,
+            stream_seq: publish.stream_seq,
+            counter,
+            ciphertext_sha256,
+        };
+        let committed_barrier_duplicate = durable
+            .latest_stream_applied_ack_basis()
+            .is_some_and(|ack| ack.applied_stream_seq == publish.stream_seq)
+            && durable
+                .admit_publish_at_authenticated_revision(
+                    KeyDirectoryRevision::new(header_directory_revision),
+                    publish.stream_seq,
+                    counter,
+                    ciphertext_sha256,
+                )
+                .is_ok_and(|(_, disposition)| {
+                    disposition == StreamPublishDisposition::AppliedDuplicate
+                });
+        if committed_barrier_duplicate {
+            Ok(VerifiedStreamPublish::CommittedEpochBarrierDuplicate(
+                Box::new(current),
+            ))
+        } else {
+            Ok(VerifiedStreamPublish::Current(Box::new(current)))
+        }
     }
 
     /// 只消费本 capability 铸造的 verified stream token；调用方必须先把其 replay tuple
@@ -2969,7 +3416,8 @@ impl OpenedPairedMachine<'_> {
         }
         if candidate.header_directory_revision != expected_brand.directory_revision {
             let (_, disposition) = installed_state
-                .admit_publish(
+                .admit_publish_at_authenticated_revision(
+                    KeyDirectoryRevision::new(candidate.header_directory_revision),
                     candidate.stream_seq,
                     candidate.counter,
                     candidate.ciphertext_sha256,
@@ -2981,6 +3429,420 @@ impl OpenedPairedMachine<'_> {
         }
         open_sealed_payload(stream_key, &candidate.context, candidate.verified)
             .map_err(PairedPromotionError::Crypto)
+    }
+
+    /// 把 staged-key Publish 的 replay tuple 先单独 durable admission。ADKG/current binding
+    /// 此时保持旧 cut；AEAD 与 canonical barrier 只能消费本次 exact readback 后的 token。
+    pub(crate) fn admit_staged_epoch_barrier<R: CryptoRng>(
+        &mut self,
+        durable: &DurableStreamBindingV1,
+        candidate: &VerifiedStagedEpochBarrierPublish,
+        rng: &mut R,
+    ) -> Result<(DurableStreamBindingV1, StreamPublishDisposition), PairedPromotionError> {
+        let binding = durable.binding();
+        let expected_brand = StreamPublishBrand {
+            machine_route: self.audited.identity.machine_route,
+            stream_route: binding.stream_route,
+            stream_generation: binding.stream_generation,
+            key_id: candidate.key_id(),
+            directory_revision: candidate.key_directory_revision().value(),
+            frame_kind: stream_publish_frame_kind(binding.key_id)?,
+        };
+        if candidate.brand != expected_brand
+            || candidate.context.machine_route != Some(expected_brand.machine_route)
+            || candidate.context.stream_route != Some(expected_brand.stream_route)
+            || candidate.context.stream_generation != Some(expected_brand.stream_generation)
+            || candidate.context.stream_seq != Some(candidate.stream_seq)
+            || candidate.context.message_key_epoch != expected_brand.key_id.epoch
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let header = &candidate.verified.sealed().inner;
+        let (_key, nonce_prefix) = self.staged_stream_receiving_key(
+            binding,
+            candidate.key_id(),
+            candidate.key_directory_revision(),
+        )?;
+        if header.key_id != candidate.key_id()
+            || header.key_epoch != candidate.key_id().epoch
+            || header.key_directory_revision != candidate.key_directory_revision().value()
+            || header.nonce[..4] != nonce_prefix
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let (admitted, disposition) = durable
+            .admit_pending_epoch_barrier(
+                candidate.key_id(),
+                candidate.key_directory_revision(),
+                candidate.stream_seq(),
+                candidate.counter(),
+                candidate.ciphertext_sha256(),
+            )
+            .map_err(|_| PairedPromotionError::Conflict)?;
+        if admitted == *durable {
+            return Ok((admitted, disposition));
+        }
+        let committed = self.commit_stream_state_transition(durable, &admitted, rng)?;
+        if committed != admitted {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok((committed, disposition))
+    }
+
+    /// 只在 staged replay admission 已 durable readback 后解密；成功 token 固定绑定当前
+    /// admitted state 的 C/H 与唯一 staged generation，不能跨 stream 或跨 CAS 复用。
+    pub(crate) fn open_verified_staged_epoch_barrier(
+        &self,
+        durable: DurableStreamBindingV1,
+        candidate: VerifiedStagedEpochBarrierPublish,
+    ) -> Result<VerifiedEpochBarrierActivation, PairedPromotionError> {
+        let installed = self
+            .audited
+            .state
+            .durable_stream_bindings()?
+            .into_iter()
+            .filter(|state| state == &durable)
+            .count();
+        let pending = durable
+            .pending_epoch_barrier()
+            .ok_or(PairedPromotionError::Conflict)?;
+        let tuple = pending.replay_tuple();
+        if installed != 1
+            || pending.replay_quarantined()
+            || tuple.key_id() != candidate.key_id()
+            || tuple.key_directory_revision() != candidate.key_directory_revision()
+            || tuple.stream_seq() != candidate.stream_seq()
+            || tuple.sender_counter() != candidate.counter()
+            || tuple.ciphertext_sha256() != candidate.ciphertext_sha256()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let binding = durable.binding();
+        let (stream_key, nonce_prefix) = self.staged_stream_receiving_key(
+            binding,
+            candidate.key_id(),
+            candidate.key_directory_revision(),
+        )?;
+        let header = &candidate.verified.sealed().inner;
+        if header.key_id != candidate.key_id()
+            || header.key_epoch != candidate.key_id().epoch
+            || header.key_directory_revision != candidate.key_directory_revision().value()
+            || header.nonce[..4] != nonce_prefix
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let candidate_stream_seq = candidate.stream_seq();
+        let candidate_key_id = candidate.key_id();
+        let candidate_key_directory_revision = candidate.key_directory_revision();
+        let opened = open_sealed_payload(&stream_key, &candidate.context, candidate.verified)
+            .map_err(PairedPromotionError::Crypto)?;
+        if opened.payload_kind != SealedPayloadKind::KeyUpdate {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let control = KeyControlV1::from_canonical_bytes(&opened.payload)
+            .map_err(PairedPromotionError::Protocol)?;
+        let KeyControlV1::EpochBarrier {
+            stream_route,
+            barrier,
+            ..
+        } = control
+        else {
+            return Err(PairedPromotionError::Conflict);
+        };
+        barrier.validate().map_err(PairedPromotionError::Protocol)?;
+        let expected_stream_seq = barrier
+            .stream_cursor
+            .checked_next()
+            .map_err(|_| PairedPromotionError::Conflict)?;
+        if stream_route != binding.stream_route
+            || barrier.stream_generation != binding.stream_generation
+            || barrier.stream_cursor != durable.outer_applied()
+            || barrier.inner_cursor != *durable.inner_observed()
+            || barrier.inner_cursor != *durable.inner_applied()
+            || expected_stream_seq != candidate_stream_seq
+            || barrier.old_epoch != binding.key_id.epoch
+            || barrier.new_epoch != candidate_key_id.epoch
+            || barrier.key_directory_revision != candidate_key_directory_revision
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(VerifiedEpochBarrierActivation {
+            durable,
+            stream_route,
+            barrier,
+        })
+    }
+
+    /// 纯内存构造 activation 的完整 paired-state candidate。ADKS bytes 保持逐字不变；
+    /// ADKG、target binding/replay 与 StreamAppliedAck basis 只能一起进入下一次 CAS。
+    pub(crate) fn prepare_epoch_barrier_activation(
+        &self,
+        verified: VerifiedEpochBarrierActivation,
+    ) -> Result<PreparedEpochBarrierActivation, PairedPromotionError> {
+        let current_generation = self
+            .audited
+            .state
+            .durable_key_generation_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+        let slot_route = stream_key_slot_route(
+            KeyId {
+                purpose: verified.durable.binding().key_id.purpose,
+                epoch: verified.barrier.new_epoch,
+            },
+            verified.stream_route,
+        )?;
+        let candidate_generation = current_generation
+            .activate_shared_key_slot(
+                verified.durable.binding().key_id.purpose,
+                slot_route,
+                verified.barrier.key_directory_revision,
+                verified.barrier.old_epoch,
+                verified.barrier.new_epoch,
+            )
+            .map_err(|_| PairedPromotionError::Conflict)?;
+        let candidate_binding = verified
+            .durable
+            .activate_epoch_barrier(verified.stream_route, &verified.barrier)
+            .map_err(|_| PairedPromotionError::Conflict)?;
+        let expected_ack = candidate_binding
+            .latest_stream_applied_ack_basis()
+            .cloned()
+            .ok_or(PairedPromotionError::Conflict)?;
+        expected_ack
+            .validate_for_barrier(verified.stream_route, &verified.barrier)
+            .map_err(PairedPromotionError::Protocol)?;
+
+        let mut bindings = self.audited.state.durable_stream_bindings()?;
+        let target = verified.durable.target_key();
+        let current = bindings
+            .iter_mut()
+            .find(|state| state.target_key() == target)
+            .ok_or(PairedPromotionError::Conflict)?;
+        if current != &verified.durable {
+            return Err(PairedPromotionError::Conflict);
+        }
+        *current = candidate_binding;
+        let candidate_stream_binding_bytes =
+            encode_stream_bindings(bindings).map_err(|_| PairedPromotionError::InvalidState)?;
+        let candidate_generation_bytes = candidate_generation
+            .canonical_bytes()
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        let candidate_key_sync_bytes = self
+            .audited
+            .state
+            .key_sync_state_bytes()
+            .map(ToOwned::to_owned);
+        let mut runtime = self.audited.state.opaque_runtime_state();
+        runtime.stream_cursors = candidate_stream_binding_bytes.clone();
+        let candidate_state = self.audited.state.with_mutable_projection(
+            self.audited.marker.state_plaintext_hash,
+            self.audited.marker.counter_guard_hash,
+            &runtime,
+            self.audited.state.counter_reservation(),
+            candidate_key_sync_bytes,
+            Some(candidate_generation_bytes.clone()),
+            KEY_GENERATION_STATE_VERSION,
+            true,
+            true,
+        )?;
+
+        let inventories = audit_key_generation_state_and_stage(
+            &candidate_state,
+            None,
+            candidate_state.bootstrap(),
+            &self.audited.device_hpke_private_key,
+            &self.audited.machine_data_verifying_key,
+            &self.audited.machine_data_signer_binding,
+            &self.audited.opened_directory_keys,
+        )?;
+        let candidate_opened = inventories
+            .active
+            .as_deref()
+            .ok_or(PairedPromotionError::InvalidState)?;
+        validate_typed_stream_state_and_stage(
+            &candidate_state,
+            None,
+            StreamBindingAuditContext {
+                identity: self.audited.identity,
+                device_route: self.audited.device_route,
+                grant_serial: self.audited.grant_serial,
+                trust_epoch: self.audited.trust_epoch,
+                bootstrap_directory_revision: self.audited.bootstrap_directory_revision,
+                effective_directory_revision: candidate_generation.effective_directory_revision(),
+            },
+            &self.audited.authorization,
+            candidate_opened,
+            None,
+        )?;
+        let candidate_state_bytes = candidate_state.encode()?;
+        Ok(PreparedEpochBarrierActivation {
+            expected_state_bytes: self.audited.state_snapshot.expose_secret().to_vec(),
+            candidate_state_bytes,
+            candidate_generation_bytes,
+            candidate_stream_binding_bytes,
+            expected_stream_route: verified.stream_route,
+            expected_stream_generation: verified.barrier.stream_generation,
+            expected_ack,
+        })
+    }
+
+    pub(crate) fn commit_epoch_barrier_activation<R: CryptoRng>(
+        &mut self,
+        prepared: PreparedEpochBarrierActivation,
+        rng: &mut R,
+    ) -> Result<CommittedEpochBarrierActivation, PairedPromotionError> {
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.refresh_mutable_state()?;
+        let current = self.audited.state_snapshot.expose_secret();
+        if current == prepared.candidate_state_bytes {
+            return self.read_back_committed_epoch_barrier_activation(&prepared, true);
+        }
+        if current != prepared.expected_state_bytes {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let candidate_state = PairedCryptoState::decode(&prepared.candidate_state_bytes)?;
+        let write_result = self.commit_prepared_state_transition(
+            candidate_state,
+            prepared.candidate_state_bytes.clone(),
+            rng,
+        );
+        match write_result {
+            Ok(()) => self.read_back_committed_epoch_barrier_activation(&prepared, false),
+            Err(write_error) => {
+                if self.refresh_mutable_state().is_err() {
+                    return Err(write_error);
+                }
+                let _recovery = self.recover_pending_guard();
+                if self.refresh_mutable_state().is_err() {
+                    return Err(write_error);
+                }
+                if self.audited.state_snapshot.expose_secret() == prepared.candidate_state_bytes {
+                    self.read_back_committed_epoch_barrier_activation(&prepared, false)
+                } else if self.audited.state_snapshot.expose_secret()
+                    == prepared.expected_state_bytes
+                {
+                    Err(write_error)
+                } else {
+                    Err(PairedPromotionError::Conflict)
+                }
+            }
+        }
+    }
+
+    fn read_back_committed_epoch_barrier_activation(
+        &mut self,
+        prepared: &PreparedEpochBarrierActivation,
+        already_committed: bool,
+    ) -> Result<CommittedEpochBarrierActivation, PairedPromotionError> {
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.refresh_mutable_state()?;
+        if self.audited.state_snapshot.expose_secret() != prepared.candidate_state_bytes {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let generation = self
+            .audited
+            .state
+            .durable_key_generation_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+        if generation
+            .canonical_bytes()
+            .map_err(|_| PairedPromotionError::InvalidState)?
+            != prepared.candidate_generation_bytes
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let bindings = self.audited.state.durable_stream_bindings()?;
+        if encode_stream_bindings(bindings.clone())
+            .map_err(|_| PairedPromotionError::InvalidState)?
+            != prepared.candidate_stream_binding_bytes
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let mut matching = bindings.into_iter().filter(|state| {
+            state.binding().stream_route == prepared.expected_stream_route
+                && state.binding().stream_generation == prepared.expected_stream_generation
+                && state.latest_stream_applied_ack_basis() == Some(&prepared.expected_ack)
+        });
+        let stream_binding = matching.next().ok_or(PairedPromotionError::Conflict)?;
+        if matching.next().is_some() {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(CommittedEpochBarrierActivation {
+            stream_binding,
+            ack: prepared.expected_ack.clone(),
+            already_committed,
+        })
+    }
+
+    /// 已提交 barrier 的 current-key exact duplicate。必须重新 AEAD/canonical decode 并
+    /// 与 durable receipt basis 对账，之后只重发 receipt/Relay ACK，不二次 retirement。
+    pub(crate) fn open_committed_epoch_barrier_duplicate(
+        &self,
+        durable: DurableStreamBindingV1,
+        candidate: VerifiedCurrentStreamPublish,
+    ) -> Result<CommittedEpochBarrierActivation, PairedPromotionError> {
+        let opened = self.open_verified_stream_publish(candidate)?;
+        if opened.payload_kind != SealedPayloadKind::KeyUpdate {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let control = KeyControlV1::from_canonical_bytes(&opened.payload)
+            .map_err(PairedPromotionError::Protocol)?;
+        let KeyControlV1::EpochBarrier {
+            stream_route,
+            barrier,
+            ..
+        } = control
+        else {
+            return Err(PairedPromotionError::Conflict);
+        };
+        let ack = durable
+            .latest_stream_applied_ack_basis()
+            .cloned()
+            .ok_or(PairedPromotionError::Conflict)?;
+        ack.validate_for_barrier(stream_route, &barrier)
+            .map_err(PairedPromotionError::Protocol)?;
+        let idempotent = durable
+            .activate_epoch_barrier(stream_route, &barrier)
+            .map_err(|_| PairedPromotionError::Conflict)?;
+        if durable.binding().stream_route != stream_route
+            || durable.binding().stream_generation != barrier.stream_generation
+            || durable.binding().key_directory_revision != barrier.key_directory_revision
+            || durable.binding().key_id.epoch != barrier.new_epoch
+            || idempotent != durable
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(CommittedEpochBarrierActivation {
+            stream_binding: durable,
+            ack,
+            already_committed: true,
+        })
+    }
+
+    /// 返回所有已通过 open-time 全库审计、仍需在连接恢复时幂等重发的 barrier receipt。
+    pub(crate) fn pending_stream_applied_acks(
+        &self,
+    ) -> Result<Vec<StreamAppliedAckV1>, PairedPromotionError> {
+        self.audited
+            .state
+            .durable_stream_bindings()?
+            .into_iter()
+            .filter_map(|binding| binding.latest_stream_applied_ack_basis().cloned())
+            .map(|ack| {
+                ack.validate().map_err(PairedPromotionError::Protocol)?;
+                if ack.machine_route != self.audited.identity.machine_route
+                    || ack.device_route != self.audited.device_route
+                    || ack.grant_serial != self.audited.grant_serial
+                    || ack.root_trust_epoch != self.audited.trust_epoch
+                    || ack.key_directory_revision != self.audited.effective_directory_revision
+                {
+                    return Err(PairedPromotionError::Conflict);
+                }
+                Ok(ack)
+            })
+            .collect()
     }
 
     /// KeySync 专用 Reply verifier。当前 DeviceReplyTx raw key 在 same-epoch rewrap 中保持
@@ -5710,7 +6572,9 @@ fn rewrap_stream_bindings_for_normal_update(
                 SharedUpdateMetadataKindV1::RewrapSameEpoch => binding
                     .with_rewrapped_key_revision(update_set.key_directory_revision)
                     .map_err(|_| PairedPromotionError::Conflict),
-                SharedUpdateMetadataKindV1::RotateNextEpoch => Ok(binding),
+                SharedUpdateMetadataKindV1::RotateNextEpoch => binding
+                    .with_superseded_stream_applied_ack()
+                    .map_err(|_| PairedPromotionError::Conflict),
                 SharedUpdateMetadataKindV1::AddConversation => Err(PairedPromotionError::Conflict),
             }
         })
