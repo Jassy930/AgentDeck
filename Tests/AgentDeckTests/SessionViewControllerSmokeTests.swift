@@ -208,7 +208,7 @@ final class SessionViewControllerSmokeTests: XCTestCase {
         XCTAssertLessThanOrEqual(bubble.frame.maxX, rail.frame.minX - 8)
     }
 
-    func testWindowHitTestingDoesNotRouteTrailingResizeGutterIntoRail() throws {
+    func testWindowHitTestingRoutesTrailingResizeGutterToResizeRoot() throws {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         model.cwd = URL(fileURLWithPath: NSTemporaryDirectory())
         model.items = [
@@ -232,9 +232,9 @@ final class SessionViewControllerSmokeTests: XCTestCase {
             to: window.contentView
         )
 
-        XCTAssertNil(
-            window.contentView?.hitTest(resizePoint),
-            "真实窗口层级最右 8pt 必须退出内容命中，让窗口层接管缩放"
+        XCTAssertTrue(
+            window.contentView?.hitTest(resizePoint) is WindowResizeAwareRootView,
+            "真实窗口层级最右 8pt 必须由显式 resize responder 接管，不能落回私有 frame hit-testing"
         )
         XCTAssertEqual(
             interaction.frame.width,
@@ -244,7 +244,7 @@ final class SessionViewControllerSmokeTests: XCTestCase {
         )
     }
 
-    func testEmptyStateTrailingResizeGutterEscapesContentHierarchy() {
+    func testEmptyStateTrailingResizeGutterUsesResizeRoot() {
         let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
         let vc = SessionViewController(model: model)
         let window = NSWindow(contentViewController: vc)
@@ -259,10 +259,42 @@ final class SessionViewControllerSmokeTests: XCTestCase {
             y: vc.view.bounds.midY
         )
 
-        XCTAssertNil(
-            window.contentView?.hitTest(resizePoint),
-            "空态右缘也必须退出内容命中"
+        XCTAssertTrue(
+            window.contentView?.hitTest(resizePoint) is WindowResizeAwareRootView,
+            "空态右缘也必须由显式 resize responder 接管"
         )
+    }
+
+    func testResizeRootConsumesTrailingDragAndChangesWindowWidth() throws {
+        let model = SessionModel(turnStarter: NoopRuntimeTurnStarter())
+        let vc = SessionViewController(model: model)
+        let window = NSWindow(contentViewController: vc)
+        window.styleMask.insert([.titled, .resizable, .fullSizeContentView])
+        window.setContentSize(NSSize(width: 1000, height: 620))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+
+        let root = try XCTUnwrap(vc.view as? WindowResizeAwareRootView)
+        let resizePoint = NSPoint(x: root.bounds.maxX - 4, y: root.bounds.midY)
+        let widthBefore = window.frame.width
+
+        XCTAssertTrue(root.handleTrailingResizeEvent(
+            type: .leftMouseDown,
+            locationInView: resizePoint,
+            pointerX: 1_000
+        ))
+        XCTAssertTrue(root.handleTrailingResizeEvent(
+            type: .leftMouseDragged,
+            locationInView: resizePoint,
+            pointerX: 1_180
+        ))
+        XCTAssertEqual(window.frame.width, widthBefore + 180, accuracy: 1)
+        XCTAssertTrue(root.handleTrailingResizeEvent(
+            type: .leftMouseUp,
+            locationInView: resizePoint,
+            pointerX: 1_180
+        ))
     }
 
     func testTrailingResizeFrameTracksDragAndClampsToWindowLimits() {

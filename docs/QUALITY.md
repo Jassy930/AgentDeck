@@ -77,7 +77,7 @@ cargo test
 - [ ] reasoning 默认折叠，但折叠头必须完整显示「思考过程」，不能因 disclosure 压缩只剩单个 `R` 字符；切换会话时不得继承上一会话同名 item 的展开/收起状态
 - [ ] 展开后的 reasoning 正文（包括工具聚合内的中间 reasoning）必须使用会话正文可用宽度，不能收缩成标题宽度或逐词换行；渲染宽度须与行高测量宽度一致，不得裁切或覆盖相邻行
 - [ ] 高风险操作触发 approve / deny 控件
-- [ ] TurnJumpRail 是独立 44pt 尾列，不覆盖会话正文、composer 或环境面板；窗口根内容层最右 8pt 必须退出 view hit-testing，`AgentDeckWindow.sendEvent(_:)` 还需在 frame 层捕获最右 16pt，使系统最外缘与其内侧可达命中带共同支持缩放，不能只避开轨道子视图或依赖系统最外 1pt；拖拽宽度增量必须使用当前 CGEvent 的全局 X，不能依赖可能冻结的全局鼠标快照或受窗口 frame 变化影响的相对坐标；确保空态与会话态从右侧中部和右下角均可连续拉宽，缩小后仍可再次放大，轨道中心区域、滚轮、↑↓/Home/End 与 VoiceOver 自定义动作保持可用
+- [ ] TurnJumpRail 是独立 44pt 尾列，不覆盖会话正文、composer 或环境面板；窗口根内容层最右 8pt 必须由显式 resize responder 接管鼠标序列，不能返回 `nil` 后依赖 AppKit 私有 frame hit-testing，`AgentDeckWindow.sendEvent(_:)` 同时在 frame 层捕获最右 16pt 作为兜底；拖拽宽度增量必须使用当前 CGEvent 的全局 X，不能依赖可能冻结的全局鼠标快照或受窗口 frame 变化影响的相对坐标；确保空态与会话态从右侧中部和右下角均可连续拉宽，缩小后仍可再次放大，轨道中心区域、滚轮、↑↓/Home/End 与 VoiceOver 自定义动作保持可用
 - [ ] 开启 macOS「减少动态效果」后 TurnJumpRail 直接跳变，不运行滚动或悬停定时动画
 - [ ] 继续历史会话：点击历史行 → 右侧回放历史 items
 - [ ] Cmd-Q 正常退出

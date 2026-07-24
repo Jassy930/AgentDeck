@@ -7,29 +7,121 @@ private enum SidebarLayout {
     static let maximumWidth: CGFloat = 280
 }
 
-/// `fullSizeContentView` 会让内容树一直铺到窗口 frame 内侧。最右 8pt 必须
-/// 退出内容命中，避免轨道或空态子视图吞掉边缘事件；真正的拖拽序列由
-/// `AgentDeckWindow.sendEvent(_:)` 在 frame 层统一接管。
+/// `fullSizeContentView` 会让内容树一直铺到窗口 frame 内侧。最右 8pt 由根视图
+/// 自己作为 resize responder 接管，避免把事件交回 AppKit 私有 frame view 后
+/// 在空态、会话态或回合轨道上丢失拖拽序列；`AgentDeckWindow.sendEvent(_:)`
+/// 继续覆盖其内侧命中带，作为窗口层兜底。
 final class WindowResizeAwareRootView: NSView {
+    private var trailingResizeOrigin: (frame: NSRect, pointerX: CGFloat)?
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard bounds.contains(point) else { return nil }
-        guard point.x < bounds.maxX - TurnJumpRailLayout.windowResizeGutter else {
-            return nil
+        if trailingResizeRect.contains(point) {
+            return self
         }
         return super.hitTest(point)
     }
 
+    override func mouseDown(with event: NSEvent) {
+        if handleTrailingResizeEvent(
+            type: event.type,
+            locationInView: convert(event.locationInWindow, from: nil),
+            pointerX: resizePointerX(for: event)
+        ) {
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        if handleTrailingResizeEvent(
+            type: event.type,
+            locationInView: convert(event.locationInWindow, from: nil),
+            pointerX: resizePointerX(for: event)
+        ) {
+            return
+        }
+        super.mouseDragged(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if handleTrailingResizeEvent(
+            type: event.type,
+            locationInView: convert(event.locationInWindow, from: nil),
+            pointerX: resizePointerX(for: event)
+        ) {
+            return
+        }
+        super.mouseUp(with: event)
+    }
+
+    @discardableResult
+    func handleTrailingResizeEvent(
+        type: NSEvent.EventType,
+        locationInView: NSPoint,
+        pointerX: CGFloat
+    ) -> Bool {
+        switch type {
+        case .leftMouseDown:
+            guard trailingResizeRect.contains(locationInView),
+                  let window,
+                  window.styleMask.contains(.resizable) else {
+                return false
+            }
+            trailingResizeOrigin = (window.frame, pointerX)
+            return true
+
+        case .leftMouseDragged:
+            guard let origin = trailingResizeOrigin, let window else { return false }
+            let nextFrame = AgentDeckWindow.resizedFrame(
+                from: origin.frame,
+                deltaX: pointerX - origin.pointerX,
+                minimumWidth: window.minSize.width,
+                maximumWidth: window.maxSize.width
+            )
+            window.setFrame(nextFrame, display: true)
+            return true
+
+        case .leftMouseUp:
+            guard trailingResizeOrigin != nil else { return false }
+            trailingResizeOrigin = nil
+            return true
+
+        default:
+            return false
+        }
+    }
+
     override func resetCursorRects() {
         super.resetCursorRects()
-        addCursorRect(trailingResizeRect, cursor: .resizeLeftRight)
+        addCursorRect(trailingResizeCursorRect, cursor: .resizeLeftRight)
     }
 
     private var trailingResizeRect: NSRect {
+        NSRect(
+            x: max(bounds.minX, bounds.maxX - TurnJumpRailLayout.windowResizeGutter),
+            y: bounds.minY,
+            width: min(bounds.width, TurnJumpRailLayout.windowResizeGutter),
+            height: bounds.height
+        )
+    }
+
+    private var trailingResizeCursorRect: NSRect {
         NSRect(
             x: max(bounds.minX, bounds.maxX - AgentDeckWindow.trailingResizeCaptureWidth),
             y: bounds.minY,
             width: min(bounds.width, AgentDeckWindow.trailingResizeCaptureWidth),
             height: bounds.height
+        )
+    }
+
+    private func resizePointerX(for event: NSEvent) -> CGFloat {
+        AgentDeckWindow.resizePointerX(
+            eventScreenX: event.cgEvent?.location.x,
+            locationInWindowX: event.locationInWindow.x,
+            windowMinX: window?.frame.minX ?? 0
         )
     }
 }
