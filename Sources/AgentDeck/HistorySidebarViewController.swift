@@ -24,6 +24,7 @@ final class HistorySidebarViewController: NSViewController {
     // MARK: - Dependencies
 
     private let model: SessionModel
+    private let threadHoverCoordinator = HistoryThreadHoverCoordinator()
 
     // MARK: - Subviews
 
@@ -679,7 +680,7 @@ extension HistorySidebarViewController: NSOutlineViewDelegate {
             threadIdentity: HistoryThreadIdentity(thread),
             selectedThreadIdentity: model.selectedSidebarThreadIdentity,
             openingThreadIdentity: model.openingHistoryThreadIdentity,
-            hoveredThreadIdentity: nil,   // hover tracking is NSOutlineView's built-in highlight
+            hoveredThreadIdentity: nil,   // hover 由可见 row 的单一 coordinator 管理
             runtimePhase: runtime?.phase,
             unreadEventCount: runtime?.unreadEventCount ?? 0
         )
@@ -692,6 +693,9 @@ extension HistorySidebarViewController: NSOutlineViewDelegate {
             cellView.identifier = id
         }
         cellView.configure(with: thread, presentation: presentation)
+        cellView.onHoverChanged = { [weak self] row, isHovered in
+            self?.threadHoverCoordinator.update(row: row, isHovered: isHovered)
+        }
         return cellView
     }
 

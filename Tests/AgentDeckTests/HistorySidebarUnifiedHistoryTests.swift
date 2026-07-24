@@ -5,6 +5,27 @@ import AgentDeckCore
 
 @MainActor
 final class HistorySidebarUnifiedHistoryTests: XCTestCase {
+    func testHoverCoordinatorClearsPreviousRowWithoutMouseExited() {
+        let first = HistoryThreadRowView()
+        let second = HistoryThreadRowView()
+        let coordinator = HistoryThreadHoverCoordinator()
+
+        coordinator.update(row: first, isHovered: true)
+        XCTAssertTrue(first.isHovered)
+        XCTAssertFalse(second.isHovered)
+
+        // 滚动时旧 cell 可能收不到 mouseExited；新 cell 的 mouseEntered
+        // 仍必须原子地转移唯一 hover 所有权。
+        coordinator.update(row: second, isHovered: true)
+        XCTAssertFalse(first.isHovered)
+        XCTAssertTrue(second.isHovered)
+
+        // 延迟到达的旧 cell mouseExited 不能清掉当前 hover。
+        coordinator.update(row: first, isHovered: false)
+        XCTAssertFalse(first.isHovered)
+        XCTAssertTrue(second.isHovered)
+    }
+
     func testSidebarDoesNotExposeAgentKindSwitch() {
         let model = SessionModel()
         let vc = HistorySidebarViewController(model: model)

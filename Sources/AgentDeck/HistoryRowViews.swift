@@ -90,6 +90,30 @@ final class HistoryGroupRowView: NSView {
 
 // MARK: - Thread Row View
 
+/// 侧栏 hover 的单一所有者。滚动期间 AppKit 可能让新 cell 收到
+/// `mouseEntered`，却不保证旧 cell 及时收到 `mouseExited`；协调器在新行进入时
+/// 主动清掉上一行，保证复用列表中最多只有一个悬停高亮。
+@MainActor
+final class HistoryThreadHoverCoordinator {
+    private weak var hoveredRow: HistoryThreadRowView?
+
+    func update(row: HistoryThreadRowView, isHovered: Bool) {
+        if isHovered {
+            if hoveredRow !== row {
+                hoveredRow?.setHovered(false)
+                hoveredRow = row
+            }
+            row.setHovered(true)
+            return
+        }
+
+        row.setHovered(false)
+        if hoveredRow === row {
+            hoveredRow = nil
+        }
+    }
+}
+
 /// NSTableCellView-style view for a HistoryThreadSummary row.
 /// Mirrors the SwiftUI `historyThreadRow` visual treatment.
 final class HistoryThreadRowView: NSView {
@@ -104,8 +128,11 @@ final class HistoryThreadRowView: NSView {
 
     /// 当前选中/展示态与悬停态，共同决定高亮块底色。
     private var currentVisualState: HistoryThreadRowPresentation.VisualState = .idle
-    private var hovered = false
+    private(set) var isHovered = false
     private var hoverTracking: NSTrackingArea?
+
+    /// 由侧栏控制器接入单一 hover coordinator；独立使用时回落到本行状态。
+    var onHoverChanged: ((HistoryThreadRowView, Bool) -> Void)?
 
     /// Size constraints for the runtime dot — updated on configure so the dot
     /// truly resizes between 5pt (cached) and 7pt (unread). Auto Layout owns
@@ -234,7 +261,7 @@ final class HistoryThreadRowView: NSView {
 
         // 内缩块高亮：选中/展开 → surface2；悬停 → surface；否则透明（cell 复用时重置悬停）
         currentVisualState = presentation.visualState
-        hovered = false
+        isHovered = false
         updateHighlight()
 
         // Runtime dot — size driven by Auto Layout constraints (5pt cached / 7pt unread)
@@ -279,9 +306,15 @@ final class HistoryThreadRowView: NSView {
         case .hovered:
             color = DesignTokens.surface
         case .idle:
-            color = hovered ? DesignTokens.surface : .clear
+            color = isHovered ? DesignTokens.surface : .clear
         }
         highlightView.layer?.backgroundColor = color.cgColor
+    }
+
+    func setHovered(_ hovered: Bool) {
+        guard isHovered != hovered else { return }
+        isHovered = hovered
+        updateHighlight()
     }
 
     override func updateTrackingAreas() {
@@ -296,13 +329,19 @@ final class HistoryThreadRowView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        hovered = true
-        updateHighlight()
+        if let onHoverChanged {
+            onHoverChanged(self, true)
+        } else {
+            setHovered(true)
+        }
     }
 
     override func mouseExited(with event: NSEvent) {
-        hovered = false
-        updateHighlight()
+        if let onHoverChanged {
+            onHoverChanged(self, false)
+        } else {
+            setHovered(false)
+        }
     }
 
     // MARK: Helpers
