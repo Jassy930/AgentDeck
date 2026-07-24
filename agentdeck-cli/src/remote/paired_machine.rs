@@ -14,11 +14,12 @@ use std::sync::Arc;
 use agentdeck_crypto::counter::COUNTER_BLOCK_SIZE;
 use agentdeck_crypto::rand_core::CryptoRng;
 use agentdeck_crypto::{
-    AeadReceivingKey, AeadSendingKey, CryptoError, HpkePrivateKey, HpkePublicKey, SenderCounter,
-    SignatureBytes, SigningKey, VerifyingKey, open_key_directory_entry, open_pair_response,
-    open_sealed_payload, seal_key_sync_probe, seal_pair_response_received, seal_symmetric, sha256,
-    sign_authentication_transcript, sign_revocation_cleanup_journal_digest, sign_sealed,
-    verify_revocation_cleanup_journal_digest, verify_sealed, verify_tbs,
+    AeadReceivingKey, AeadSendingKey, CryptoError, HpkePrivateKey, HpkePublicKey, SecretAeadKey,
+    SenderCounter, SignatureBytes, SigningKey, VerifyingKey, open_key_directory_entry,
+    open_key_update, open_pair_response, open_sealed_payload, seal_key_sync_probe,
+    seal_pair_response_received, seal_symmetric, sha256, sign_authentication_transcript,
+    sign_revocation_cleanup_journal_digest, sign_sealed, verify_revocation_cleanup_journal_digest,
+    verify_sealed, verify_tbs,
 };
 use agentdeck_protocol::ActionDecision;
 use agentdeck_protocol::e2ee::{
@@ -62,6 +63,10 @@ use super::crypto_state::{
     revocation_cleanup_entries_absent_in,
 };
 use super::device_lock::{RemoteDeviceLease, RemoteDeviceLockError, RemoteDeviceLockKey};
+use super::key_generation::{
+    DurableKeyCarrierV1, DurableKeyGenerationStateV1, DurableKeyGenerationV1,
+    validate_directed_rewrap_metadata,
+};
 use super::key_sync::{DurableKeySyncStateV1, SignedHigherRevisionObservationV1};
 use super::keychain::{
     PairedRemoteKeyPurpose, ParsedPairedRemoteKeyAccount, PendingRemoteKeyPurpose,
@@ -75,6 +80,7 @@ const STATE_VERSION: u16 = 1;
 const MUTABLE_STATE_VERSION: u16 = 2;
 const TYPED_RUNTIME_STATE_VERSION: u16 = 3;
 const KEY_SYNC_STATE_VERSION: u16 = 4;
+const KEY_GENERATION_STATE_VERSION: u16 = 5;
 const STATE_HEADER_LEN: usize = 12;
 const MAX_STATE_FIELD_LEN: usize = 8 * 1024 * 1024;
 const MAX_STATE_STRING_LEN: usize = 8 * 1024;
@@ -660,6 +666,7 @@ enum OpenedPairedKeyMaterial {
 struct OpenedPairedDirectoryKey {
     key_id: KeyId,
     stream_route: Option<StreamRouteId>,
+    key_directory_revision: KeyDirectoryRevision,
     material: OpenedPairedKeyMaterial,
 }
 
@@ -669,7 +676,8 @@ struct StreamBindingAuditContext {
     device_route: DeviceRouteId,
     grant_serial: GrantSerial,
     trust_epoch: TrustEpoch,
-    directory_revision: KeyDirectoryRevision,
+    bootstrap_directory_revision: KeyDirectoryRevision,
+    effective_directory_revision: KeyDirectoryRevision,
 }
 
 fn validate_stream_binding_against_audit(
@@ -682,7 +690,6 @@ fn validate_stream_binding_against_audit(
         || binding.device_route != context.device_route
         || binding.grant_serial != context.grant_serial
         || binding.root_trust_epoch != context.trust_epoch
-        || binding.key_directory_revision != context.directory_revision
         || authorization.machine_route != context.identity.machine_route
         || authorization.device_route != context.device_route
         || authorization.grant_serial != context.grant_serial
@@ -715,6 +722,7 @@ fn validate_stream_binding_against_audit(
         .filter(|entry| {
             entry.key_id == binding.key_id
                 && entry.stream_route == expected_route
+                && entry.key_directory_revision == binding.key_directory_revision
                 && matches!(&entry.material, OpenedPairedKeyMaterial::StreamRx { .. })
         })
         .count();
@@ -732,12 +740,18 @@ fn validate_typed_stream_state_and_stage(
     authorization: &DeviceAuthorizationV1,
     opened_keys: &[OpenedPairedDirectoryKey],
 ) -> Result<(), PairedPromotionError> {
-    validate_typed_stream_state(state, context, authorization, opened_keys)?;
-    validate_key_sync_state_against_audit(state, context)?;
+    let mut active_context = context;
+    active_context.effective_directory_revision = state.effective_directory_revision()?;
+    validate_typed_stream_state(state, active_context, authorization, opened_keys)?;
+    validate_key_sync_state_against_audit(state, active_context)?;
     if let Some(prepared) = prepared_stage {
         let next = PairedCryptoState::decode(prepared.snapshot().expose_secret())?;
-        validate_typed_stream_state(&next, context, authorization, opened_keys)?;
-        validate_key_sync_state_against_audit(&next, context)?;
+        let mut next_context = context;
+        next_context.effective_directory_revision = next.effective_directory_revision()?;
+        validate_typed_stream_state(&next, next_context, authorization, opened_keys)?;
+        // prepared V5 的 active-key inventory 在 generation audit 中独立重建；这里仅校验
+        // 与 active inventory 仍共享的 legacy fields，不能提前激活 staged generation。
+        validate_key_sync_state_against_audit(&next, next_context)?;
     }
     Ok(())
 }
@@ -762,9 +776,9 @@ fn validate_typed_stream_state(
     Ok(())
 }
 
-/// ADKS canonical bytes 只证明编码有效；durable acceptance 还必须绑定当前 paired
-/// authority、已安装 directory revision，以及产生 higher-revision observation 的 exact
-/// live publication slot。active、prepared 与 commit candidate 共用这一条审计路径。
+/// ADKS 必须绑定当前 paired authority、已安装 revision 与 exact live publication slot。
+/// V5-A equality audit 只接受 steady state；install intermediate 必须由 V5-B combined CAS
+/// 扩展，禁止在 generation-only seam 放宽。
 fn validate_key_sync_state_against_audit(
     state: &PairedCryptoState,
     context: StreamBindingAuditContext,
@@ -773,11 +787,12 @@ fn validate_key_sync_state_against_audit(
         return Ok(());
     };
     let observation = key_sync.observation();
-    if observation.machine_route() != context.identity.machine_route
+    if context.effective_directory_revision < context.bootstrap_directory_revision
+        || observation.machine_route() != context.identity.machine_route
         || observation.device_route() != context.device_route
         || observation.grant_serial() != context.grant_serial
         || observation.root_trust_epoch() != context.trust_epoch
-        || key_sync.current_known_key_directory_revision() != context.directory_revision
+        || key_sync.current_known_key_directory_revision() != context.effective_directory_revision
     {
         return Err(PairedPromotionError::Conflict);
     }
@@ -815,7 +830,8 @@ struct AuditedPairedMachine {
     device_route: DeviceRouteId,
     grant_serial: GrantSerial,
     trust_epoch: TrustEpoch,
-    directory_revision: KeyDirectoryRevision,
+    bootstrap_directory_revision: KeyDirectoryRevision,
+    effective_directory_revision: KeyDirectoryRevision,
     relay_server_id: RelayServerId,
     current_spki_pin: [u8; 32],
     next_spki_pin: [u8; 32],
@@ -833,7 +849,8 @@ struct AuditedPairedMachine {
     authorization: DeviceAuthorizationV1,
     device_signing_key: Arc<SigningKey>,
     machine_data_verifying_key: VerifyingKey,
-    _device_hpke_private_key: HpkePrivateKey,
+    machine_data_signer_binding: MachineDataSignerBindingV1,
+    device_hpke_private_key: HpkePrivateKey,
     opened_directory_keys: Vec<OpenedPairedDirectoryKey>,
 }
 
@@ -1243,7 +1260,7 @@ impl OpenedPairedMachine<'_> {
 
     #[must_use]
     pub const fn directory_revision(&self) -> KeyDirectoryRevision {
-        self.audited.directory_revision
+        self.audited.effective_directory_revision
     }
 
     /// 验证 active connection 或 reconnect authentication 返回的 exact root-signed
@@ -1441,6 +1458,164 @@ impl OpenedPairedMachine<'_> {
         self.audited.state.durable_key_sync_state()
     }
 
+    /// 返回 open-time 已完成 canonical、MachineDataSign 与 DeviceHPKE 全审计的 generation
+    /// inventory。V1–V4 映射为 `None`；V5 field required 且不能清空退化。
+    pub fn durable_key_generation_state(
+        &self,
+    ) -> Result<Option<DurableKeyGenerationStateV1>, PairedPromotionError> {
+        self.audited.state.durable_key_generation_state()
+    }
+
+    /// 仅供 automatic wrapper 的 generation-only CAS；production UpdateSet 必须走 V5-B 的
+    /// ADKG+ADKS/roster/activation transaction，不能复用本 seam。
+    fn commit_key_generation_state_transition<R: CryptoRng>(
+        &mut self,
+        expected: Option<&DurableKeyGenerationStateV1>,
+        replacement: &DurableKeyGenerationStateV1,
+        rng: &mut R,
+    ) -> Result<DurableKeyGenerationStateV1, PairedPromotionError> {
+        let canonical = |state: &DurableKeyGenerationStateV1| {
+            state
+                .canonical_bytes()
+                .map_err(|_| PairedPromotionError::InvalidState)
+        };
+        let expected_bytes = expected.map(canonical).transpose()?;
+        let replacement_bytes = canonical(replacement)?;
+
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        let current_bytes = self
+            .audited
+            .state
+            .key_generation_state_bytes()
+            .map(ToOwned::to_owned);
+        if current_bytes.as_deref() == Some(replacement_bytes.as_slice()) {
+            return self
+                .audited
+                .state
+                .durable_key_generation_state()?
+                .ok_or(PairedPromotionError::InvalidState);
+        }
+        if current_bytes != expected_bytes {
+            return Err(PairedPromotionError::Conflict);
+        }
+        if let Some(previous) = self.audited.state.durable_key_generation_state()? {
+            validate_directed_rewrap_metadata(&previous, replacement)
+                .map_err(|_| PairedPromotionError::Conflict)?;
+        }
+
+        let next_state = self.audited.state.with_key_generation_state_bytes(
+            self.audited.marker.state_plaintext_hash,
+            self.audited.marker.counter_guard_hash,
+            Some(replacement_bytes.clone()),
+            true,
+        )?;
+        let active_keys = audit_key_generation_state_and_stage(
+            &next_state,
+            None,
+            next_state.bootstrap(),
+            &self.audited.device_hpke_private_key,
+            &self.audited.machine_data_verifying_key,
+            &self.audited.machine_data_signer_binding,
+            &self.audited.opened_directory_keys,
+        )?
+        .ok_or(PairedPromotionError::InvalidState)?;
+        validate_typed_stream_state_and_stage(
+            &next_state,
+            None,
+            StreamBindingAuditContext {
+                identity: self.audited.identity,
+                device_route: self.audited.device_route,
+                grant_serial: self.audited.grant_serial,
+                trust_epoch: self.audited.trust_epoch,
+                bootstrap_directory_revision: self.audited.bootstrap_directory_revision,
+                effective_directory_revision: replacement.effective_directory_revision(),
+            },
+            &self.audited.authorization,
+            &active_keys,
+        )?;
+        let next_state_bytes = next_state.encode()?;
+        match self.commit_prepared_state_transition(next_state, next_state_bytes, rng) {
+            Ok(()) => {
+                self.refresh_mutable_state()?;
+                self.audited
+                    .state
+                    .durable_key_generation_state()?
+                    .ok_or(PairedPromotionError::InvalidState)
+            }
+            Err(write_error) => {
+                if self.refresh_mutable_state().is_err() {
+                    return Err(write_error);
+                }
+                let _recovery = self.recover_pending_guard();
+                let recovered = self
+                    .audited
+                    .state
+                    .key_generation_state_bytes()
+                    .map(ToOwned::to_owned);
+                if recovered.as_deref() == Some(replacement_bytes.as_slice()) {
+                    self.audited
+                        .state
+                        .durable_key_generation_state()?
+                        .ok_or(PairedPromotionError::InvalidState)
+                } else if recovered == expected_bytes {
+                    Err(write_error)
+                } else {
+                    Err(PairedPromotionError::Conflict)
+                }
+            }
+        }
+    }
+
+    /// 仅 automatic harness 可达；production handle 在读取 candidate/entropy 前拒绝。
+    #[doc(hidden)]
+    pub fn commit_key_generation_state_transition_for_automatic_harness<R: CryptoRng>(
+        &mut self,
+        expected: Option<&DurableKeyGenerationStateV1>,
+        replacement: &DurableKeyGenerationStateV1,
+        rng: &mut R,
+    ) -> Result<DurableKeyGenerationStateV1, PairedPromotionError> {
+        if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        self.commit_key_generation_state_transition(expected, replacement, rng)
+    }
+
+    /// 注入非 canonical ADKG，证明 list/open 全库审计 fail-close 且零改写。
+    #[doc(hidden)]
+    pub fn replace_unchecked_key_generation_state_for_automatic_harness<R: CryptoRng>(
+        &mut self,
+        replacement: Vec<u8>,
+        rng: &mut R,
+    ) -> Result<(), PairedPromotionError> {
+        if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        if self.audited.state.key_generation_state_bytes() == Some(replacement.as_slice()) {
+            return Ok(());
+        }
+        let next_state = self.audited.state.with_key_generation_state_bytes(
+            self.audited.marker.state_plaintext_hash,
+            self.audited.marker.counter_guard_hash,
+            Some(replacement),
+            false,
+        )?;
+        let next_state_bytes = match &next_state {
+            PairedCryptoState::V5(value) => {
+                value.encode_version_inner(KEY_GENERATION_STATE_VERSION, true, false)?
+            }
+            PairedCryptoState::V1(_)
+            | PairedCryptoState::V2(_)
+            | PairedCryptoState::V3(_)
+            | PairedCryptoState::V4(_) => return Err(PairedPromotionError::InvalidState),
+        };
+        self.commit_prepared_state_transition(next_state, next_state_bytes, rng)
+    }
+
     /// 以完整 canonical ADKS bytes 做 CAS，并复用 paired state 的 prepared/guard 前滚事务。
     /// exact replacement 优先于 expected 比较，因此 committed retry 即使携带 stale expected
     /// 也不会取 entropy 或产生 durable write。
@@ -1489,7 +1664,8 @@ impl OpenedPairedMachine<'_> {
                 device_route: self.audited.device_route,
                 grant_serial: self.audited.grant_serial,
                 trust_epoch: self.audited.trust_epoch,
-                directory_revision: self.audited.directory_revision,
+                bootstrap_directory_revision: self.audited.bootstrap_directory_revision,
+                effective_directory_revision: self.audited.effective_directory_revision,
             },
         )?;
         let next_state_bytes = next_state.encode()?;
@@ -1562,7 +1738,10 @@ impl OpenedPairedMachine<'_> {
         )?;
         let next_state_bytes = match &next_state {
             PairedCryptoState::V4(value) => {
-                value.encode_version_inner(KEY_SYNC_STATE_VERSION, false)?
+                value.encode_version_inner(KEY_SYNC_STATE_VERSION, false, true)?
+            }
+            PairedCryptoState::V5(value) => {
+                value.encode_version_inner(KEY_GENERATION_STATE_VERSION, false, true)?
             }
             PairedCryptoState::V1(_) | PairedCryptoState::V2(_) | PairedCryptoState::V3(_) => {
                 return Err(PairedPromotionError::InvalidState);
@@ -1815,7 +1994,8 @@ impl OpenedPairedMachine<'_> {
                 device_route: self.audited.device_route,
                 grant_serial: self.audited.grant_serial,
                 trust_epoch: self.audited.trust_epoch,
-                directory_revision: self.audited.directory_revision,
+                bootstrap_directory_revision: self.audited.bootstrap_directory_revision,
+                effective_directory_revision: self.audited.effective_directory_revision,
             },
             &self.audited.authorization,
             &self.audited.opened_directory_keys,
@@ -1824,17 +2004,19 @@ impl OpenedPairedMachine<'_> {
 
     /// 当前 authenticated DeviceReplyTx replay scope；只暴露非秘密 epoch/revision。
     pub(crate) fn directed_reply_scope(&self) -> Result<(u64, u64), PairedPromotionError> {
-        let reply_epoch = self
+        let (reply_epoch, reply_revision) = self
             .audited
             .opened_directory_keys
             .iter()
             .find_map(|entry| match &entry.material {
-                OpenedPairedKeyMaterial::ReplyTx { key, .. } => Some(key.epoch),
+                OpenedPairedKeyMaterial::ReplyTx { key, .. } => {
+                    Some((key.epoch, entry.key_directory_revision.value()))
+                }
                 OpenedPairedKeyMaterial::CommandTx(_)
                 | OpenedPairedKeyMaterial::StreamRx { .. } => None,
             })
             .ok_or(PairedPromotionError::InvalidState)?;
-        Ok((reply_epoch, self.audited.directory_revision.value()))
+        Ok((reply_epoch, reply_revision))
     }
 
     /// 使用审计后的 DeviceCommandTx + DeviceSign capability 封装闭合 allowlist 中的请求。
@@ -1922,7 +2104,7 @@ impl OpenedPairedMachine<'_> {
             || request.device_route != self.audited.device_route
             || request.grant_serial != self.audited.grant_serial
             || request.root_trust_epoch != self.audited.trust_epoch
-            || request.known_key_directory_revision != self.audited.directory_revision
+            || request.known_key_directory_revision != self.audited.effective_directory_revision
         {
             return Err(PairedPromotionError::Conflict);
         }
@@ -1988,20 +2170,20 @@ impl OpenedPairedMachine<'_> {
                         if entry.key_id == binding.key_id
                             && entry.stream_route == expected_slot =>
                     {
-                        Some((key, *nonce_prefix))
+                        Some((key, *nonce_prefix, entry.key_directory_revision))
                     }
                     OpenedPairedKeyMaterial::CommandTx(_)
                     | OpenedPairedKeyMaterial::ReplyTx { .. }
                     | OpenedPairedKeyMaterial::StreamRx { .. } => None,
                 });
-        let (stream_key, nonce_prefix) =
+        let (stream_key, nonce_prefix, stream_revision) =
             matching.next().ok_or(PairedPromotionError::InvalidState)?;
         if matching.next().is_some() {
             return Err(PairedPromotionError::InvalidState);
         }
         let signed = SignedSealedBlobV1::from_wire_bytes(&publish.sealed_blob.0)
             .map_err(|error| PairedPromotionError::Crypto(error.into()))?;
-        let expected_revision = self.audited.directory_revision.value();
+        let expected_revision = stream_revision.value();
         if binding.key_directory_revision.value() != expected_revision
             || binding.key_id != stream_key.key_id
             || binding.key_id.epoch != stream_key.epoch
@@ -2058,7 +2240,7 @@ impl OpenedPairedMachine<'_> {
                 self.audited.device_route,
                 self.audited.grant_serial,
                 self.audited.trust_epoch,
-                self.audited.directory_revision,
+                self.audited.effective_directory_revision,
                 KeyDirectoryRevision::new(header.key_directory_revision),
                 header.key_id,
                 key_slot_stream_route,
@@ -2130,13 +2312,14 @@ impl OpenedPairedMachine<'_> {
                         if entry.key_id == candidate.brand.key_id
                             && entry.stream_route == expected_slot =>
                     {
-                        Some(key)
+                        Some((key, entry.key_directory_revision))
                     }
                     OpenedPairedKeyMaterial::CommandTx(_)
                     | OpenedPairedKeyMaterial::ReplyTx { .. }
                     | OpenedPairedKeyMaterial::StreamRx { .. } => None,
                 });
-        let stream_key = matching.next().ok_or(PairedPromotionError::InvalidState)?;
+        let (stream_key, stream_revision) =
+            matching.next().ok_or(PairedPromotionError::InvalidState)?;
         if matching.next().is_some() {
             return Err(PairedPromotionError::InvalidState);
         }
@@ -2145,7 +2328,7 @@ impl OpenedPairedMachine<'_> {
             stream_route: candidate.brand.stream_route,
             stream_generation: candidate.brand.stream_generation,
             key_id: stream_key.key_id,
-            directory_revision: self.audited.directory_revision.value(),
+            directory_revision: stream_revision.value(),
             frame_kind: stream_publish_frame_kind(stream_key.key_id)?,
         };
         if candidate.brand != expected_brand
@@ -2186,7 +2369,7 @@ impl OpenedPairedMachine<'_> {
             .iter()
             .find_map(|entry| match &entry.material {
                 OpenedPairedKeyMaterial::ReplyTx { key, nonce_prefix } => {
-                    Some((key, *nonce_prefix))
+                    Some((key, *nonce_prefix, entry.key_directory_revision))
                 }
                 OpenedPairedKeyMaterial::CommandTx(_)
                 | OpenedPairedKeyMaterial::StreamRx { .. } => None,
@@ -2194,7 +2377,7 @@ impl OpenedPairedMachine<'_> {
             .ok_or(PairedPromotionError::InvalidState)?;
         let signed = SignedSealedBlobV1::from_wire_bytes(sealed_blob)
             .map_err(|error| PairedPromotionError::Crypto(error.into()))?;
-        let expected_revision = self.audited.directory_revision.value();
+        let expected_revision = reply.2.value();
         if signed.inner.key_id != reply.0.key_id
             || signed.inner.key_epoch != reply.0.epoch
             || signed.inner.key_directory_revision != expected_revision
@@ -2241,7 +2424,9 @@ impl OpenedPairedMachine<'_> {
             .opened_directory_keys
             .iter()
             .find_map(|entry| match &entry.material {
-                OpenedPairedKeyMaterial::ReplyTx { key, .. } => Some(key),
+                OpenedPairedKeyMaterial::ReplyTx { key, .. } => {
+                    Some((key, entry.key_directory_revision))
+                }
                 OpenedPairedKeyMaterial::CommandTx(_)
                 | OpenedPairedKeyMaterial::StreamRx { .. } => None,
             })
@@ -2253,20 +2438,20 @@ impl OpenedPairedMachine<'_> {
                 .context
                 .request_route
                 .ok_or(PairedPromotionError::InvalidState)?,
-            reply_key.epoch,
+            reply_key.0.epoch,
         );
         let expected_brand = DirectedReplyBrand {
             machine_route: self.audited.identity.machine_route,
             device_route: self.audited.device_route,
-            key_id: reply_key.key_id,
-            key_epoch: reply_key.epoch,
-            directory_revision: self.audited.directory_revision.value(),
+            key_id: reply_key.0.key_id,
+            key_epoch: reply_key.0.epoch,
+            directory_revision: reply_key.1.value(),
         };
         validate_directed_reply_brand(candidate.brand, expected_brand)?;
         if candidate.context != expected_context {
             return Err(PairedPromotionError::Conflict);
         }
-        open_sealed_payload(reply_key, &candidate.context, candidate.verified)
+        open_sealed_payload(reply_key.0, &candidate.context, candidate.verified)
             .map_err(PairedPromotionError::Crypto)
     }
 
@@ -2323,7 +2508,7 @@ impl OpenedPairedMachine<'_> {
         if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
             || matches!(
                 self.audited.state,
-                PairedCryptoState::V3(_) | PairedCryptoState::V4(_)
+                PairedCryptoState::V3(_) | PairedCryptoState::V4(_) | PairedCryptoState::V5(_)
             )
         {
             return Err(PairedPromotionError::InvalidState);
@@ -2463,7 +2648,7 @@ impl OpenedPairedMachine<'_> {
         self.observe_mutation(PairedMutationStage::StateStageDurable);
         let pending = CounterGuardV2::state_pending(
             initial_guard_commitment,
-            self.audited.directory_revision,
+            self.audited.bootstrap_directory_revision,
             binding,
             reserved_high_water,
             prepared.mutation_id(),
@@ -2486,7 +2671,7 @@ impl OpenedPairedMachine<'_> {
 
         let stable = CounterGuardV2::state_stable(
             initial_guard_commitment,
-            self.audited.directory_revision,
+            self.audited.bootstrap_directory_revision,
             binding,
             reserved_high_water,
             next_state_hash,
@@ -2573,7 +2758,7 @@ impl OpenedPairedMachine<'_> {
         let next_state_hash = sha256(&next_state_bytes);
         let pending = CounterGuardV2::pending(
             initial_guard_commitment,
-            self.audited.directory_revision,
+            self.audited.bootstrap_directory_revision,
             binding,
             previous_high_water,
             end_exclusive,
@@ -2596,7 +2781,7 @@ impl OpenedPairedMachine<'_> {
 
         let stable = CounterGuardV2::stable(
             initial_guard_commitment,
-            self.audited.directory_revision,
+            self.audited.bootstrap_directory_revision,
             binding,
             end_exclusive,
             next_state_hash,
@@ -2777,6 +2962,19 @@ impl OpenedPairedMachine<'_> {
             &state,
             state_snapshot.expose_secret(),
         )?;
+        let active_keys = audit_key_generation_state_and_stage(
+            &state,
+            prepared_stage.as_ref(),
+            state.bootstrap(),
+            &self.audited.device_hpke_private_key,
+            &self.audited.machine_data_verifying_key,
+            &self.audited.machine_data_signer_binding,
+            &self.audited.opened_directory_keys,
+        )?;
+        let effective_directory_revision = state.effective_directory_revision()?;
+        let opened_keys = active_keys
+            .as_deref()
+            .unwrap_or(&self.audited.opened_directory_keys);
         validate_typed_stream_state_and_stage(
             &state,
             prepared_stage.as_ref(),
@@ -2785,10 +2983,11 @@ impl OpenedPairedMachine<'_> {
                 device_route: self.audited.device_route,
                 grant_serial: self.audited.grant_serial,
                 trust_epoch: self.audited.trust_epoch,
-                directory_revision: self.audited.directory_revision,
+                bootstrap_directory_revision: self.audited.bootstrap_directory_revision,
+                effective_directory_revision: self.audited.effective_directory_revision,
             },
             &self.audited.authorization,
-            &self.audited.opened_directory_keys,
+            opened_keys,
         )?;
         validate_counter_guard_state(
             &self.audited.marker,
@@ -2805,6 +3004,10 @@ impl OpenedPairedMachine<'_> {
         self.audited.state_snapshot = state_snapshot;
         self.audited.state = state;
         self.audited.prepared_stage = prepared_stage;
+        self.audited.effective_directory_revision = effective_directory_revision;
+        if let Some(active_keys) = active_keys {
+            self.audited.opened_directory_keys = active_keys;
+        }
         Ok(())
     }
 
@@ -3114,12 +3317,23 @@ impl<'a> PairedMachineStore<'a> {
         marker.validate_state(identity, &state, state_snapshot.expose_secret())?;
         let bootstrap = state.bootstrap();
 
-        let audit = audit_durable_state(
+        let mut audit = audit_durable_state(
             bootstrap,
             grant_secret.expose_secret(),
             &device_sign_secret,
             &device_hpke_secret,
         )?;
+        if let Some(active_keys) = audit_key_generation_state_and_stage(
+            &state,
+            prepared_stage.as_ref(),
+            bootstrap,
+            &audit.device_hpke_private_key,
+            &audit.machine_data_verifying_key,
+            &audit.machine_data_signer_binding,
+            &audit.opened_keys,
+        )? {
+            audit.opened_keys = active_keys;
+        }
         validate_typed_stream_state_and_stage(
             &state,
             prepared_stage.as_ref(),
@@ -3128,7 +3342,8 @@ impl<'a> PairedMachineStore<'a> {
                 device_route: bootstrap.device_route,
                 grant_serial: bootstrap.grant_serial,
                 trust_epoch: bootstrap.trust_epoch,
-                directory_revision: bootstrap.directory_revision,
+                bootstrap_directory_revision: bootstrap.directory_revision,
+                effective_directory_revision: state.effective_directory_revision()?,
             },
             &audit.authorization,
             &audit.opened_keys,
@@ -3148,6 +3363,7 @@ impl<'a> PairedMachineStore<'a> {
             prepared_stage.as_ref(),
             audit.device_command_binding,
         )?;
+        let effective_directory_revision = state.effective_directory_revision()?;
 
         Ok(AuditedPairedMachine {
             identity,
@@ -3156,7 +3372,8 @@ impl<'a> PairedMachineStore<'a> {
             device_route: bootstrap.device_route,
             grant_serial: bootstrap.grant_serial,
             trust_epoch: bootstrap.trust_epoch,
-            directory_revision: bootstrap.directory_revision,
+            bootstrap_directory_revision: bootstrap.directory_revision,
+            effective_directory_revision,
             relay_server_id: bootstrap.relay_server_id,
             current_spki_pin: bootstrap.current_spki_pin,
             next_spki_pin: bootstrap.next_spki_pin,
@@ -3174,7 +3391,8 @@ impl<'a> PairedMachineStore<'a> {
             authorization: audit.authorization,
             device_signing_key: Arc::new(audit.device_signing_key),
             machine_data_verifying_key: audit.machine_data_verifying_key,
-            _device_hpke_private_key: audit.device_hpke_private_key,
+            machine_data_signer_binding: audit.machine_data_signer_binding,
+            device_hpke_private_key: audit.device_hpke_private_key,
             opened_directory_keys: audit.opened_keys,
         })
     }
@@ -3557,7 +3775,7 @@ impl<'a> PairedPromotionCoordinator<'a> {
         let counter = self.load_required(&accounts.counter_guard)?;
         let signing_key = signing_key(&device_sign)?;
         let hpke_private = hpke_private_key(&device_hpke)?;
-        let audit = audit_state(
+        let mut audit = audit_state(
             self.installation_id,
             bootstrap,
             verified,
@@ -3570,6 +3788,17 @@ impl<'a> PairedPromotionCoordinator<'a> {
         let prepared_stage = state_store
             .load_prepared_stage()
             .map_err(PairedPromotionError::CryptoState)?;
+        if let Some(active_keys) = audit_key_generation_state_and_stage(
+            &state,
+            prepared_stage.as_ref(),
+            bootstrap,
+            &audit.device_hpke_private_key,
+            &audit.machine_data_verifying_key,
+            &audit.machine_data_signer_binding,
+            &audit.opened_keys,
+        )? {
+            audit.opened_keys = active_keys;
+        }
         validate_typed_stream_state_and_stage(
             &state,
             prepared_stage.as_ref(),
@@ -3578,7 +3807,8 @@ impl<'a> PairedPromotionCoordinator<'a> {
                 device_route: bootstrap.device_route,
                 grant_serial: bootstrap.grant_serial,
                 trust_epoch: bootstrap.trust_epoch,
-                directory_revision: bootstrap.directory_revision,
+                bootstrap_directory_revision: bootstrap.directory_revision,
+                effective_directory_revision: state.effective_directory_revision()?,
             },
             verified.device_authorization(),
             &audit.opened_keys,
@@ -3763,13 +3993,24 @@ fn audit_revocation_cleanup(
             .as_ref()
             .ok_or(PairedPromotionError::Incomplete)?;
         let grant = grant.as_ref().ok_or(PairedPromotionError::Incomplete)?;
-        let durable = audit_durable_state(
+        let mut durable = audit_durable_state(
             state.bootstrap(),
             grant.expose_secret(),
             device_sign,
             device_hpke,
         )?;
         let bootstrap = state.bootstrap();
+        if let Some(active_keys) = audit_key_generation_state_and_stage(
+            &state,
+            None,
+            bootstrap,
+            &durable.device_hpke_private_key,
+            &durable.machine_data_verifying_key,
+            &durable.machine_data_signer_binding,
+            &durable.opened_keys,
+        )? {
+            durable.opened_keys = active_keys;
+        }
         validate_typed_stream_state_and_stage(
             &state,
             None,
@@ -3778,7 +4019,8 @@ fn audit_revocation_cleanup(
                 device_route: bootstrap.device_route,
                 grant_serial: bootstrap.grant_serial,
                 trust_epoch: bootstrap.trust_epoch,
-                directory_revision: bootstrap.directory_revision,
+                bootstrap_directory_revision: bootstrap.directory_revision,
+                effective_directory_revision: state.effective_directory_revision()?,
             },
             &durable.authorization,
             &durable.opened_keys,
@@ -4118,14 +4360,10 @@ fn build_initial_state<R: CryptoRng>(
     })
 }
 
-struct StateAudit {
-    device_command_binding: CounterBindingV1,
-    opened_keys: Vec<OpenedPairedDirectoryKey>,
-}
-
 struct DurableStateAudit {
     device_signing_key: SigningKey,
     machine_data_verifying_key: VerifyingKey,
+    machine_data_signer_binding: MachineDataSignerBindingV1,
     device_hpke_private_key: HpkePrivateKey,
     grant: RelayGrant,
     authorization: DeviceAuthorizationV1,
@@ -4142,7 +4380,7 @@ fn audit_state(
     grant_bytes: &[u8],
     device_sign_secret: &RemoteSecret,
     device_hpke_secret: &RemoteSecret,
-) -> Result<StateAudit, PairedPromotionError> {
+) -> Result<DurableStateAudit, PairedPromotionError> {
     let expected_info = verified.info();
     if state.installation_id != installation_id
         || state.invite_hpke_pubkey != invite.invite_hpke_pubkey
@@ -4180,11 +4418,7 @@ fn audit_state(
         return Err(PairedPromotionError::Conflict);
     }
 
-    let durable = audit_durable_state(state, grant_bytes, device_sign_secret, device_hpke_secret)?;
-    Ok(StateAudit {
-        device_command_binding: durable.device_command_binding,
-        opened_keys: durable.opened_keys,
-    })
+    audit_durable_state(state, grant_bytes, device_sign_secret, device_hpke_secret)
 }
 
 /// 不依赖 pending transaction 的 durable paired state 全审计。
@@ -4378,6 +4612,7 @@ fn audit_durable_state(
         opened_keys.push(OpenedPairedDirectoryKey {
             key_id: entry.key_id,
             stream_route: entry.stream_route,
+            key_directory_revision: directory.revision,
             material,
         });
     }
@@ -4388,12 +4623,246 @@ fn audit_durable_state(
     Ok(DurableStateAudit {
         device_signing_key: signing_key,
         machine_data_verifying_key: data_verifier,
+        machine_data_signer_binding: signer,
         device_hpke_private_key: hpke_private,
         grant,
         authorization,
         opened_keys,
         device_command_binding: command_binding.ok_or(PairedPromotionError::InvalidState)?,
     })
+}
+
+fn open_durable_generation(
+    bootstrap: &PairedCryptoStateV1,
+    device_hpke_private_key: &HpkePrivateKey,
+    machine_data_verifying_key: &VerifyingKey,
+    machine_data_signer_binding: &MachineDataSignerBindingV1,
+    generation: &DurableKeyGenerationV1,
+) -> Result<SecretAeadKey, PairedPromotionError> {
+    if generation.device_route() != bootstrap.device_route {
+        return Err(PairedPromotionError::Conflict);
+    }
+    let info = KeyUpdateInfoV1 {
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        relay_server_id: bootstrap.relay_server_id,
+        machine_route: bootstrap.machine_route,
+        device_route: bootstrap.device_route,
+        stream_route: generation.stream_route(),
+        grant_serial: bootstrap.grant_serial,
+        root_trust_epoch: bootstrap.trust_epoch,
+        key_directory_revision: generation.key_directory_revision(),
+        key_purpose: generation.key_id().purpose,
+        key_epoch: generation.key_id().epoch,
+    };
+    match generation.carrier() {
+        DurableKeyCarrierV1::BootstrapEntry => {
+            if generation.key_directory_revision() != bootstrap.directory_revision {
+                return Err(PairedPromotionError::Conflict);
+            }
+            let directory = KeyDirectoryV1::from_canonical_bytes(&bootstrap.key_directory)
+                .map_err(PairedPromotionError::Protocol)?;
+            let mut matching = directory.entries.iter().filter(|entry| {
+                entry.device_route == generation.device_route()
+                    && entry.key_id == generation.key_id()
+                    && entry.stream_route == generation.stream_route()
+            });
+            let entry = matching.next().ok_or(PairedPromotionError::Conflict)?;
+            if matching.next().is_some() {
+                return Err(PairedPromotionError::Conflict);
+            }
+            open_key_directory_entry(
+                device_hpke_private_key,
+                &info,
+                &key_update_context(&info),
+                entry,
+            )
+            .map_err(PairedPromotionError::Crypto)
+        }
+        DurableKeyCarrierV1::Update(update) => open_key_update(
+            device_hpke_private_key,
+            machine_data_verifying_key,
+            machine_data_signer_binding,
+            &info,
+            &key_update_context(&info),
+            update,
+        )
+        .map(|opened| opened.into_key())
+        .map_err(PairedPromotionError::Crypto),
+    }
+}
+
+fn directed_generation_matches_active(
+    active: &[OpenedPairedDirectoryKey],
+    generation: &DurableKeyGenerationV1,
+    candidate: &SecretAeadKey,
+) -> Result<(), PairedPromotionError> {
+    let mut matches = active.iter().filter(|entry| {
+        entry.key_id.purpose == generation.key_id().purpose && entry.stream_route.is_none()
+    });
+    let existing = matches.next().ok_or(PairedPromotionError::Conflict)?;
+    if matches.next().is_some() || existing.key_id.epoch != generation.key_id().epoch {
+        return Err(PairedPromotionError::Conflict);
+    }
+    let same = match &existing.material {
+        OpenedPairedKeyMaterial::CommandTx(key)
+            if generation.key_id().purpose == KeyPurpose::DeviceCommandTx =>
+        {
+            key.matches_secret(candidate)
+        }
+        OpenedPairedKeyMaterial::ReplyTx { key, .. }
+            if generation.key_id().purpose == KeyPurpose::DeviceReplyTx =>
+        {
+            key.matches_secret(candidate)
+        }
+        OpenedPairedKeyMaterial::CommandTx(_)
+        | OpenedPairedKeyMaterial::ReplyTx { .. }
+        | OpenedPairedKeyMaterial::StreamRx { .. } => false,
+    };
+    if same {
+        Ok(())
+    } else {
+        Err(PairedPromotionError::Conflict)
+    }
+}
+
+/// 对 ADKG 中所有 current/staged/retired carrier 做完整 MachineDataSign + DeviceHPKE
+/// 审计；只把 current generation 铸造成 active crypto capability。V5-A 对 directed staged
+/// recovery shape 保持 fail-close；V5-B 激活前仍须同 epoch、同 raw key。
+fn audit_key_generation_state(
+    state: &DurableKeyGenerationStateV1,
+    bootstrap: &PairedCryptoStateV1,
+    device_hpke_private_key: &HpkePrivateKey,
+    machine_data_verifying_key: &VerifyingKey,
+    machine_data_signer_binding: &MachineDataSignerBindingV1,
+    active: &[OpenedPairedDirectoryKey],
+) -> Result<Vec<OpenedPairedDirectoryKey>, PairedPromotionError> {
+    if state.bootstrap_directory_revision() != bootstrap.directory_revision
+        || state.effective_directory_revision() <= bootstrap.directory_revision
+        || state.device_route() != bootstrap.device_route
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+    let mut opened = Vec::with_capacity(state.slots().len());
+    for slot in state.slots() {
+        let purpose = slot.identity().purpose();
+        for retained in slot.retired() {
+            drop(open_durable_generation(
+                bootstrap,
+                device_hpke_private_key,
+                machine_data_verifying_key,
+                machine_data_signer_binding,
+                retained,
+            )?);
+        }
+        if let Some(staged) = slot.staged() {
+            drop(open_durable_generation(
+                bootstrap,
+                device_hpke_private_key,
+                machine_data_verifying_key,
+                machine_data_signer_binding,
+                staged,
+            )?);
+        }
+
+        let current = slot.current();
+        let key = open_durable_generation(
+            bootstrap,
+            device_hpke_private_key,
+            machine_data_verifying_key,
+            machine_data_signer_binding,
+            current,
+        )?;
+        if matches!(
+            purpose,
+            KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx
+        ) {
+            if current.key_directory_revision() != state.effective_directory_revision() {
+                return Err(PairedPromotionError::Conflict);
+            }
+            directed_generation_matches_active(active, current, &key)?;
+        }
+        let nonce_prefix = agentdeck_crypto::derive_nonce_prefix(&key);
+        let material = match purpose {
+            KeyPurpose::DeviceCommandTx => {
+                OpenedPairedKeyMaterial::CommandTx(AeadSendingKey::with_derived_nonce_prefix(
+                    current.key_id(),
+                    current.key_id().epoch,
+                    current.key_directory_revision().value(),
+                    key,
+                ))
+            }
+            KeyPurpose::DeviceReplyTx => OpenedPairedKeyMaterial::ReplyTx {
+                key: AeadReceivingKey::new(current.key_id(), current.key_id().epoch, key),
+                nonce_prefix,
+            },
+            KeyPurpose::Catalog | KeyPurpose::ConversationDek => {
+                OpenedPairedKeyMaterial::StreamRx {
+                    key: AeadReceivingKey::new(current.key_id(), current.key_id().epoch, key),
+                    nonce_prefix,
+                }
+            }
+        };
+        opened.push(OpenedPairedDirectoryKey {
+            key_id: current.key_id(),
+            stream_route: current.stream_route(),
+            key_directory_revision: current.key_directory_revision(),
+            material,
+        });
+    }
+    Ok(opened)
+}
+
+fn audit_key_generation_state_and_stage(
+    state: &PairedCryptoState,
+    prepared_stage: Option<&PreparedCryptoStateStage>,
+    bootstrap: &PairedCryptoStateV1,
+    device_hpke_private_key: &HpkePrivateKey,
+    machine_data_verifying_key: &VerifyingKey,
+    machine_data_signer_binding: &MachineDataSignerBindingV1,
+    bootstrap_active: &[OpenedPairedDirectoryKey],
+) -> Result<Option<Vec<OpenedPairedDirectoryKey>>, PairedPromotionError> {
+    let active_generation = state.durable_key_generation_state()?;
+    let active_keys = active_generation
+        .as_ref()
+        .map(|generation| {
+            audit_key_generation_state(
+                generation,
+                bootstrap,
+                device_hpke_private_key,
+                machine_data_verifying_key,
+                machine_data_signer_binding,
+                bootstrap_active,
+            )
+        })
+        .transpose()?;
+    if let Some(prepared) = prepared_stage {
+        let next = PairedCryptoState::decode(prepared.snapshot().expose_secret())?;
+        let next_generation = next.durable_key_generation_state()?;
+        match (&active_generation, &next_generation) {
+            (Some(previous), Some(candidate)) => {
+                if previous != candidate {
+                    validate_directed_rewrap_metadata(previous, candidate)
+                        .map_err(|_| PairedPromotionError::Conflict)?;
+                }
+            }
+            (None, Some(_)) => {}
+            (Some(_), None) => return Err(PairedPromotionError::Conflict),
+            (None, None) => return Ok(active_keys),
+        }
+        if let Some(candidate) = next_generation.as_ref() {
+            let current = active_keys.as_deref().unwrap_or(bootstrap_active);
+            drop(audit_key_generation_state(
+                candidate,
+                bootstrap,
+                device_hpke_private_key,
+                machine_data_verifying_key,
+                machine_data_signer_binding,
+                current,
+            )?);
+        }
+    }
+    Ok(active_keys)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4428,6 +4897,7 @@ fn validate_counter_guard_state(
         (CounterGuardState::V1(_), PairedCryptoState::V2(_)) => Err(PairedPromotionError::Conflict),
         (CounterGuardState::V1(_), PairedCryptoState::V3(_)) => Err(PairedPromotionError::Conflict),
         (CounterGuardState::V1(_), PairedCryptoState::V4(_)) => Err(PairedPromotionError::Conflict),
+        (CounterGuardState::V1(_), PairedCryptoState::V5(_)) => Err(PairedPromotionError::Conflict),
         (CounterGuardState::V2(value), _) => {
             if value.initial_guard_commitment != marker.counter_guard_hash
                 || value.directory_revision != marker.directory_revision
@@ -4695,12 +5165,13 @@ fn state_matches_previous_high_water(state: &PairedCryptoState, high_water: u64)
     match state {
         // V1 guard 本身只编码初始 HWM=0；任何非零值都必须已有 V2 sealed fence。
         PairedCryptoState::V1(_) => high_water == 0,
-        PairedCryptoState::V2(_) | PairedCryptoState::V3(_) | PairedCryptoState::V4(_) => {
-            match state.counter_reservation() {
-                Some(reservation) => reservation.end_exclusive == high_water,
-                None => high_water == 0,
-            }
-        }
+        PairedCryptoState::V2(_)
+        | PairedCryptoState::V3(_)
+        | PairedCryptoState::V4(_)
+        | PairedCryptoState::V5(_) => match state.counter_reservation() {
+            Some(reservation) => reservation.end_exclusive == high_water,
+            None => high_water == 0,
+        },
     }
 }
 
@@ -4708,12 +5179,13 @@ fn state_matches_stable_high_water(state: &PairedCryptoState, high_water: u64) -
     match state {
         // stable V2 总在 sealed-state CAS 之后；V1 state 是不可能的 durable 顺序。
         PairedCryptoState::V1(_) => false,
-        PairedCryptoState::V2(_) | PairedCryptoState::V3(_) | PairedCryptoState::V4(_) => {
-            match state.counter_reservation() {
-                Some(reservation) => reservation.end_exclusive == high_water,
-                None => high_water == 0,
-            }
-        }
+        PairedCryptoState::V2(_)
+        | PairedCryptoState::V3(_)
+        | PairedCryptoState::V4(_)
+        | PairedCryptoState::V5(_) => match state.counter_reservation() {
+            Some(reservation) => reservation.end_exclusive == high_water,
+            None => high_water == 0,
+        },
     }
 }
 
@@ -5428,6 +5900,7 @@ enum PairedCryptoState {
     V2(PairedCryptoStateV2),
     V3(PairedCryptoStateV2),
     V4(PairedCryptoStateV2),
+    V5(PairedCryptoStateV2),
 }
 
 impl fmt::Debug for PairedCryptoState {
@@ -5453,6 +5926,10 @@ impl PairedCryptoState {
             KEY_SYNC_STATE_VERSION => {
                 PairedCryptoStateV2::decode_version(bytes, KEY_SYNC_STATE_VERSION).map(Self::V4)
             }
+            KEY_GENERATION_STATE_VERSION => {
+                PairedCryptoStateV2::decode_version(bytes, KEY_GENERATION_STATE_VERSION)
+                    .map(Self::V5)
+            }
             _ => Err(PairedPromotionError::InvalidState),
         }
     }
@@ -5463,20 +5940,23 @@ impl PairedCryptoState {
             Self::V2(value) => value.encode_version(MUTABLE_STATE_VERSION),
             Self::V3(value) => value.encode_version(TYPED_RUNTIME_STATE_VERSION),
             Self::V4(value) => value.encode_version(KEY_SYNC_STATE_VERSION),
+            Self::V5(value) => value.encode_version(KEY_GENERATION_STATE_VERSION),
         }
     }
 
     const fn bootstrap(&self) -> &PairedCryptoStateV1 {
         match self {
             Self::V1(value) => value,
-            Self::V2(value) | Self::V3(value) | Self::V4(value) => &value.bootstrap,
+            Self::V2(value) | Self::V3(value) | Self::V4(value) | Self::V5(value) => {
+                &value.bootstrap
+            }
         }
     }
 
     const fn counter_reservation(&self) -> Option<&CommandCounterReservation> {
         match self {
             Self::V1(_) => None,
-            Self::V2(value) | Self::V3(value) | Self::V4(value) => {
+            Self::V2(value) | Self::V3(value) | Self::V4(value) | Self::V5(value) => {
                 value.counter_reservation.as_ref()
             }
         }
@@ -5493,6 +5973,7 @@ impl PairedCryptoState {
             Self::V1(_) | Self::V2(_) => MUTABLE_STATE_VERSION,
             Self::V3(_) => TYPED_RUNTIME_STATE_VERSION,
             Self::V4(_) => KEY_SYNC_STATE_VERSION,
+            Self::V5(_) => KEY_GENERATION_STATE_VERSION,
         };
         self.with_mutable_projection(
             initial_state_commitment,
@@ -5500,7 +5981,9 @@ impl PairedCryptoState {
             &self.opaque_runtime_state(),
             Some(reservation),
             self.key_sync_state_bytes().map(ToOwned::to_owned),
+            self.key_generation_state_bytes().map(ToOwned::to_owned),
             version,
+            true,
             true,
         )
     }
@@ -5508,11 +5991,13 @@ impl PairedCryptoState {
     fn opaque_runtime_state(&self) -> OpaqueRuntimeState {
         match self {
             Self::V1(_) => OpaqueRuntimeState::empty(),
-            Self::V2(value) | Self::V3(value) | Self::V4(value) => OpaqueRuntimeState {
-                exchange: value.receipt_terminal.clone(),
-                replay_windows: value.replay_windows.clone(),
-                stream_cursors: value.stream_cursors.clone(),
-            },
+            Self::V2(value) | Self::V3(value) | Self::V4(value) | Self::V5(value) => {
+                OpaqueRuntimeState {
+                    exchange: value.receipt_terminal.clone(),
+                    replay_windows: value.replay_windows.clone(),
+                    stream_cursors: value.stream_cursors.clone(),
+                }
+            }
         }
     }
 
@@ -5521,8 +6006,10 @@ impl PairedCryptoState {
             Self::V1(_) => Ok(Vec::new()),
             Self::V2(value) if value.stream_cursors.is_empty() => Ok(Vec::new()),
             Self::V2(_) => Err(PairedPromotionError::InvalidState),
-            Self::V3(value) | Self::V4(value) => decode_stream_bindings(&value.stream_cursors)
-                .map_err(|_| PairedPromotionError::InvalidState),
+            Self::V3(value) | Self::V4(value) | Self::V5(value) => {
+                decode_stream_bindings(&value.stream_cursors)
+                    .map_err(|_| PairedPromotionError::InvalidState)
+            }
         }
     }
 
@@ -5531,16 +6018,18 @@ impl PairedCryptoState {
     ) -> Result<Option<Vec<DurableStreamBindingV1>>, PairedPromotionError> {
         match self {
             Self::V1(_) | Self::V2(_) => Ok(None),
-            Self::V3(value) | Self::V4(value) => decode_stream_bindings(&value.stream_cursors)
-                .map(Some)
-                .map_err(|_| PairedPromotionError::InvalidState),
+            Self::V3(value) | Self::V4(value) | Self::V5(value) => {
+                decode_stream_bindings(&value.stream_cursors)
+                    .map(Some)
+                    .map_err(|_| PairedPromotionError::InvalidState)
+            }
         }
     }
 
     fn key_sync_state_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::V1(_) | Self::V2(_) | Self::V3(_) => None,
-            Self::V4(value) => value.durable_key_sync_state.as_deref(),
+            Self::V4(value) | Self::V5(value) => value.durable_key_sync_state.as_deref(),
         }
     }
 
@@ -5553,6 +6042,30 @@ impl PairedCryptoState {
             .map_err(|_| PairedPromotionError::InvalidState)
     }
 
+    fn key_generation_state_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::V1(_) | Self::V2(_) | Self::V3(_) | Self::V4(_) => None,
+            Self::V5(value) => value.durable_key_generation_state.as_deref(),
+        }
+    }
+
+    fn durable_key_generation_state(
+        &self,
+    ) -> Result<Option<DurableKeyGenerationStateV1>, PairedPromotionError> {
+        self.key_generation_state_bytes()
+            .map(DurableKeyGenerationStateV1::from_canonical_bytes)
+            .transpose()
+            .map_err(|_| PairedPromotionError::InvalidState)
+    }
+
+    fn effective_directory_revision(&self) -> Result<KeyDirectoryRevision, PairedPromotionError> {
+        Ok(self
+            .durable_key_generation_state()?
+            .map_or(self.bootstrap().directory_revision, |state| {
+                state.effective_directory_revision()
+            }))
+    }
+
     fn with_opaque_runtime_state(
         &self,
         initial_state_commitment: [u8; 32],
@@ -5561,19 +6074,24 @@ impl PairedCryptoState {
     ) -> Result<Self, PairedPromotionError> {
         runtime.validate()?;
         let automatic_probe = runtime.automatic_probe().ok().flatten().is_some();
-        let version = if matches!(self, Self::V4(_)) {
+        let version = if matches!(self, Self::V5(_)) {
+            KEY_GENERATION_STATE_VERSION
+        } else if matches!(self, Self::V4(_)) {
             KEY_SYNC_STATE_VERSION
         } else if automatic_probe {
             MUTABLE_STATE_VERSION
         } else {
             TYPED_RUNTIME_STATE_VERSION
         };
-        self.with_opaque_runtime_state_version(
+        self.with_mutable_projection(
             initial_state_commitment,
             initial_guard_commitment,
             runtime,
+            self.counter_reservation(),
             self.key_sync_state_bytes().map(ToOwned::to_owned),
+            self.key_generation_state_bytes().map(ToOwned::to_owned),
             version,
+            true,
             true,
         )
     }
@@ -5587,37 +6105,20 @@ impl PairedCryptoState {
         runtime.validate()?;
         if !runtime.stream_cursors.is_empty()
             || runtime.automatic_legacy_v2_probe()?.is_none()
-            || matches!(self, Self::V3(_) | Self::V4(_))
+            || matches!(self, Self::V3(_) | Self::V4(_) | Self::V5(_))
         {
             return Err(PairedPromotionError::InvalidState);
         }
-        self.with_opaque_runtime_state_version(
-            initial_state_commitment,
-            initial_guard_commitment,
-            runtime,
-            None,
-            MUTABLE_STATE_VERSION,
-            true,
-        )
-    }
-
-    fn with_opaque_runtime_state_version(
-        &self,
-        initial_state_commitment: [u8; 32],
-        initial_guard_commitment: [u8; 32],
-        runtime: &OpaqueRuntimeState,
-        durable_key_sync_state: Option<Vec<u8>>,
-        version: u16,
-        validate_key_sync: bool,
-    ) -> Result<Self, PairedPromotionError> {
         self.with_mutable_projection(
             initial_state_commitment,
             initial_guard_commitment,
             runtime,
             self.counter_reservation(),
-            durable_key_sync_state,
-            version,
-            validate_key_sync,
+            None,
+            None,
+            MUTABLE_STATE_VERSION,
+            true,
+            true,
         )
     }
 
@@ -5629,13 +6130,19 @@ impl PairedCryptoState {
         runtime: &OpaqueRuntimeState,
         counter_reservation: Option<&CommandCounterReservation>,
         durable_key_sync_state: Option<Vec<u8>>,
+        durable_key_generation_state: Option<Vec<u8>>,
         version: u16,
         validate_key_sync: bool,
+        validate_key_generation: bool,
     ) -> Result<Self, PairedPromotionError> {
         if !matches!(
             version,
-            MUTABLE_STATE_VERSION | TYPED_RUNTIME_STATE_VERSION | KEY_SYNC_STATE_VERSION
-        ) || matches!(self, Self::V4(_)) && version != KEY_SYNC_STATE_VERSION
+            MUTABLE_STATE_VERSION
+                | TYPED_RUNTIME_STATE_VERSION
+                | KEY_SYNC_STATE_VERSION
+                | KEY_GENERATION_STATE_VERSION
+        ) || matches!(self, Self::V4(_)) && version < KEY_SYNC_STATE_VERSION
+            || matches!(self, Self::V5(_)) && version != KEY_GENERATION_STATE_VERSION
         {
             return Err(PairedPromotionError::InvalidState);
         }
@@ -5655,23 +6162,28 @@ impl PairedCryptoState {
                 replay_windows: runtime.replay_windows.clone(),
                 stream_cursors: runtime.stream_cursors.clone(),
                 durable_key_sync_state,
+                durable_key_generation_state,
             },
-            Self::V2(current) | Self::V3(current) | Self::V4(current) => PairedCryptoStateV2 {
-                initial_state_commitment: current.initial_state_commitment,
-                initial_guard_commitment: current.initial_guard_commitment,
-                bootstrap: current.bootstrap.clone(),
-                receipt_terminal: runtime.exchange.clone(),
-                counter_reservation: counter_reservation.map(copy_reservation),
-                replay_windows: runtime.replay_windows.clone(),
-                stream_cursors: runtime.stream_cursors.clone(),
-                durable_key_sync_state,
-            },
+            Self::V2(current) | Self::V3(current) | Self::V4(current) | Self::V5(current) => {
+                PairedCryptoStateV2 {
+                    initial_state_commitment: current.initial_state_commitment,
+                    initial_guard_commitment: current.initial_guard_commitment,
+                    bootstrap: current.bootstrap.clone(),
+                    receipt_terminal: runtime.exchange.clone(),
+                    counter_reservation: counter_reservation.map(copy_reservation),
+                    replay_windows: runtime.replay_windows.clone(),
+                    stream_cursors: runtime.stream_cursors.clone(),
+                    durable_key_sync_state,
+                    durable_key_generation_state,
+                }
+            }
         };
-        value.validate_for_version_inner(version, validate_key_sync)?;
+        value.validate_for_version_inner(version, validate_key_sync, validate_key_generation)?;
         match version {
             MUTABLE_STATE_VERSION => Ok(Self::V2(value)),
             TYPED_RUNTIME_STATE_VERSION => Ok(Self::V3(value)),
             KEY_SYNC_STATE_VERSION => Ok(Self::V4(value)),
+            KEY_GENERATION_STATE_VERSION => Ok(Self::V5(value)),
             _ => Err(PairedPromotionError::InvalidState),
         }
     }
@@ -5683,14 +6195,41 @@ impl PairedCryptoState {
         durable_key_sync_state: Option<Vec<u8>>,
         validate_key_sync: bool,
     ) -> Result<Self, PairedPromotionError> {
+        let version = if matches!(self, Self::V5(_)) {
+            KEY_GENERATION_STATE_VERSION
+        } else {
+            KEY_SYNC_STATE_VERSION
+        };
         self.with_mutable_projection(
             initial_state_commitment,
             initial_guard_commitment,
             &self.opaque_runtime_state(),
             self.counter_reservation(),
             durable_key_sync_state,
-            KEY_SYNC_STATE_VERSION,
+            self.key_generation_state_bytes().map(ToOwned::to_owned),
+            version,
             validate_key_sync,
+            true,
+        )
+    }
+
+    fn with_key_generation_state_bytes(
+        &self,
+        initial_state_commitment: [u8; 32],
+        initial_guard_commitment: [u8; 32],
+        durable_key_generation_state: Option<Vec<u8>>,
+        validate_key_generation: bool,
+    ) -> Result<Self, PairedPromotionError> {
+        self.with_mutable_projection(
+            initial_state_commitment,
+            initial_guard_commitment,
+            &self.opaque_runtime_state(),
+            self.counter_reservation(),
+            self.key_sync_state_bytes().map(ToOwned::to_owned),
+            durable_key_generation_state,
+            KEY_GENERATION_STATE_VERSION,
+            true,
+            validate_key_generation,
         )
     }
 
@@ -5705,6 +6244,7 @@ impl PairedCryptoState {
             Self::V2(_) => MUTABLE_STATE_VERSION,
             Self::V3(_) => TYPED_RUNTIME_STATE_VERSION,
             Self::V4(_) => KEY_SYNC_STATE_VERSION,
+            Self::V5(_) => KEY_GENERATION_STATE_VERSION,
         };
         self.with_mutable_projection(
             initial_state_commitment,
@@ -5712,15 +6252,18 @@ impl PairedCryptoState {
             &next.opaque_runtime_state(),
             self.counter_reservation(),
             next.key_sync_state_bytes().map(ToOwned::to_owned),
+            next.key_generation_state_bytes().map(ToOwned::to_owned),
             version,
+            true,
             true,
         )
     }
 }
 
-/// V2/V3/V4 共用 payload：marker 的两个旧 hash 固化为 initial commitments，当前 state hash
+/// V2–V5 共用 payload：marker 的两个旧 hash 固化为 initial commitments，当前 state hash
 /// 只由 guard 绑定。V2 保留 legacy bounded opaque fields；V3 additionally 要求 stream collection
-/// 逐项通过 typed canonical decode；V4 末尾再追加 optional canonical ADKS KeySync state。
+/// 逐项通过 typed canonical decode；V4 追加 optional canonical ADKS，V5 再追加 canonical
+/// key-generation state，旧 body prefix 始终逐字保留。
 struct PairedCryptoStateV2 {
     initial_state_commitment: [u8; 32],
     initial_guard_commitment: [u8; 32],
@@ -5730,6 +6273,7 @@ struct PairedCryptoStateV2 {
     replay_windows: Vec<Vec<u8>>,
     stream_cursors: Vec<Vec<u8>>,
     durable_key_sync_state: Option<Vec<u8>>,
+    durable_key_generation_state: Option<Vec<u8>>,
 }
 
 impl fmt::Debug for PairedCryptoStateV2 {
@@ -5740,15 +6284,16 @@ impl fmt::Debug for PairedCryptoStateV2 {
 
 impl PairedCryptoStateV2 {
     fn encode_version(&self, version: u16) -> Result<Vec<u8>, PairedPromotionError> {
-        self.encode_version_inner(version, true)
+        self.encode_version_inner(version, true, true)
     }
 
     fn encode_version_inner(
         &self,
         version: u16,
         validate_key_sync: bool,
+        validate_key_generation: bool,
     ) -> Result<Vec<u8>, PairedPromotionError> {
-        self.validate_for_version_inner(version, validate_key_sync)?;
+        self.validate_for_version_inner(version, validate_key_sync, validate_key_generation)?;
         let mut body = Vec::new();
         body.extend_from_slice(&self.initial_state_commitment);
         body.extend_from_slice(&self.initial_guard_commitment);
@@ -5775,10 +6320,22 @@ impl PairedCryptoStateV2 {
         }
         put_state_collection(&mut body, &self.replay_windows)?;
         put_state_collection(&mut body, &self.stream_cursors)?;
-        if version == KEY_SYNC_STATE_VERSION {
+        if matches!(
+            version,
+            KEY_SYNC_STATE_VERSION | KEY_GENERATION_STATE_VERSION
+        ) {
             put_state_field(
                 &mut body,
                 self.durable_key_sync_state.as_deref().unwrap_or_default(),
+                MAX_STATE_FIELD_LEN,
+            )?;
+        }
+        if version == KEY_GENERATION_STATE_VERSION {
+            put_state_field(
+                &mut body,
+                self.durable_key_generation_state
+                    .as_deref()
+                    .unwrap_or_default(),
                 MAX_STATE_FIELD_LEN,
             )?;
         }
@@ -5839,7 +6396,16 @@ impl PairedCryptoStateV2 {
         };
         let replay_windows = decode_state_collection(&mut decoder)?;
         let stream_cursors = decode_state_collection(&mut decoder)?;
-        let durable_key_sync_state = if version == KEY_SYNC_STATE_VERSION {
+        let durable_key_sync_state = if matches!(
+            version,
+            KEY_SYNC_STATE_VERSION | KEY_GENERATION_STATE_VERSION
+        ) {
+            let bytes = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
+            (!bytes.is_empty()).then_some(bytes)
+        } else {
+            None
+        };
+        let durable_key_generation_state = if version == KEY_GENERATION_STATE_VERSION {
             let bytes = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
             (!bytes.is_empty()).then_some(bytes)
         } else {
@@ -5855,6 +6421,7 @@ impl PairedCryptoStateV2 {
             replay_windows,
             stream_cursors,
             durable_key_sync_state,
+            durable_key_generation_state,
         };
         value.validate_for_version(version)?;
         let canonical = Zeroizing::new(value.encode_version(version)?);
@@ -5865,17 +6432,21 @@ impl PairedCryptoStateV2 {
     }
 
     fn validate_for_version(&self, version: u16) -> Result<(), PairedPromotionError> {
-        self.validate_for_version_inner(version, true)
+        self.validate_for_version_inner(version, true, true)
     }
 
     fn validate_for_version_inner(
         &self,
         version: u16,
         validate_key_sync: bool,
+        validate_key_generation: bool,
     ) -> Result<(), PairedPromotionError> {
         if !matches!(
             version,
-            MUTABLE_STATE_VERSION | TYPED_RUNTIME_STATE_VERSION | KEY_SYNC_STATE_VERSION
+            MUTABLE_STATE_VERSION
+                | TYPED_RUNTIME_STATE_VERSION
+                | KEY_SYNC_STATE_VERSION
+                | KEY_GENERATION_STATE_VERSION
         ) {
             return Err(PairedPromotionError::InvalidState);
         }
@@ -5894,11 +6465,28 @@ impl PairedCryptoStateV2 {
         {
             return Err(PairedPromotionError::InvalidState);
         }
-        if version != KEY_SYNC_STATE_VERSION && self.durable_key_sync_state.is_some() {
+        if version < KEY_SYNC_STATE_VERSION && self.durable_key_sync_state.is_some() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        if version != KEY_GENERATION_STATE_VERSION && self.durable_key_generation_state.is_some() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        if version == KEY_GENERATION_STATE_VERSION && self.durable_key_generation_state.is_none() {
             return Err(PairedPromotionError::InvalidState);
         }
         if validate_key_sync && let Some(bytes) = &self.durable_key_sync_state {
             let state = DurableKeySyncStateV1::from_canonical_bytes(bytes)
+                .map_err(|_| PairedPromotionError::InvalidState)?;
+            if state
+                .canonical_bytes()
+                .map_err(|_| PairedPromotionError::InvalidState)?
+                != *bytes
+            {
+                return Err(PairedPromotionError::InvalidState);
+            }
+        }
+        if validate_key_generation && let Some(bytes) = &self.durable_key_generation_state {
+            let state = DurableKeyGenerationStateV1::from_canonical_bytes(bytes)
                 .map_err(|_| PairedPromotionError::InvalidState)?;
             if state
                 .canonical_bytes()
@@ -5917,7 +6505,11 @@ impl PairedCryptoStateV2 {
             self.replay_windows.iter().map(Vec::len),
             self.stream_cursors.iter().map(Vec::len),
         )?;
-        if version == KEY_SYNC_STATE_VERSION {
+        let mut encoded_len = encoded_len;
+        if matches!(
+            version,
+            KEY_SYNC_STATE_VERSION | KEY_GENERATION_STATE_VERSION
+        ) {
             let key_sync_len = self.durable_key_sync_state.as_ref().map_or(0, Vec::len);
             if key_sync_len > MAX_STATE_FIELD_LEN
                 || encoded_len
@@ -5927,8 +6519,26 @@ impl PairedCryptoStateV2 {
             {
                 return Err(PairedPromotionError::InvalidState);
             }
+            encoded_len = encoded_len + 4 + key_sync_len;
         }
-        if version == TYPED_RUNTIME_STATE_VERSION || version == KEY_SYNC_STATE_VERSION {
+        if version == KEY_GENERATION_STATE_VERSION {
+            let key_generation_len = self
+                .durable_key_generation_state
+                .as_ref()
+                .map_or(0, Vec::len);
+            if key_generation_len > MAX_STATE_FIELD_LEN
+                || encoded_len
+                    .checked_add(4)
+                    .and_then(|length| length.checked_add(key_generation_len))
+                    .is_none_or(|length| length > MAX_CRYPTO_STATE_PLAINTEXT_LEN)
+            {
+                return Err(PairedPromotionError::InvalidState);
+            }
+        }
+        if matches!(
+            version,
+            TYPED_RUNTIME_STATE_VERSION | KEY_SYNC_STATE_VERSION | KEY_GENERATION_STATE_VERSION
+        ) {
             decode_stream_bindings(&self.stream_cursors)
                 .map_err(|_| PairedPromotionError::InvalidState)?;
         }
@@ -6139,6 +6749,7 @@ impl PairedCommitMarkerV1 {
             PairedCryptoState::V2(value)
             | PairedCryptoState::V3(value)
             | PairedCryptoState::V4(value)
+            | PairedCryptoState::V5(value)
                 if value.initial_state_commitment == self.state_plaintext_hash
                     && value.initial_guard_commitment == self.counter_guard_hash => {}
             _ => return Err(PairedPromotionError::Conflict),

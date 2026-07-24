@@ -22,6 +22,18 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::error::CryptoError;
 
 const NONCE_PREFIX_DERIVATION_DOMAIN: &[u8] = b"AgentDeck/AEADNoncePrefix/v1\0";
+const KEY_MATCH_CONFIRMATION_DOMAIN: &[u8] = b"AgentDeck/AEADKeyMatch/v1\0";
+
+fn same_secret_key(left: &SecretAeadKey, right: &SecretAeadKey) -> bool {
+    let mut left_mac = <Hmac<Sha256> as Mac>::new_from_slice(left.as_bytes())
+        .expect("HMAC-SHA256 accepts a 32-byte AEAD key");
+    left_mac.update(KEY_MATCH_CONFIRMATION_DOMAIN);
+    let expected = left_mac.finalize().into_bytes();
+    let mut right_mac = <Hmac<Sha256> as Mac>::new_from_slice(right.as_bytes())
+        .expect("HMAC-SHA256 accepts a 32-byte AEAD key");
+    right_mac.update(KEY_MATCH_CONFIRMATION_DOMAIN);
+    right_mac.verify_slice(&expected).is_ok()
+}
 
 /// 32-byte 对称 AEAD key。zeroize-on-drop；`Debug` 脱敏。
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -112,6 +124,13 @@ impl AeadSendingKey {
         let nonce_prefix = derive_nonce_prefix(&key);
         Self::new(key_id, epoch, key_directory_revision, nonce_prefix, key)
     }
+
+    /// 不暴露 raw material 地验证重新 HPKE-wrapped candidate 是否仍为同一发送 key。
+    /// 比较使用完整 256-bit HMAC confirmation，而不是 32-bit nonce-prefix 投影。
+    #[must_use]
+    pub fn matches_secret(&self, candidate: &SecretAeadKey) -> bool {
+        same_secret_key(&self.key, candidate)
+    }
 }
 
 /// 单方向接收 key（open 使用 blob 内 nonce，故不需 nonce prefix）。
@@ -125,6 +144,12 @@ pub struct AeadReceivingKey {
 impl AeadReceivingKey {
     pub fn new(key_id: KeyId, epoch: u64, key: SecretAeadKey) -> Self {
         Self { key_id, epoch, key }
+    }
+
+    /// 不暴露 raw material 地验证重新 HPKE-wrapped candidate 是否仍为同一接收 key。
+    #[must_use]
+    pub fn matches_secret(&self, candidate: &SecretAeadKey) -> bool {
+        same_secret_key(&self.key, candidate)
     }
 }
 

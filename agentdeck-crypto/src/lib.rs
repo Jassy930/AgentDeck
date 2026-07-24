@@ -45,7 +45,8 @@ pub use key_recovery::{
     seal_device_key_recovery_reply, verify_device_key_recovery_reply,
 };
 pub use key_update::{
-    Ed25519KeyUpdateSigner, Ed25519KeyUpdateVerifier, sign_key_update, verify_key_update,
+    Ed25519KeyUpdateSigner, Ed25519KeyUpdateVerifier, OpenedKeyUpdateV1, open_key_update,
+    sign_key_update, verify_key_update,
 };
 pub use pairing::{
     OpenedDirectoryKeyV1, PairResponseExpectedV1, PairResponseSealAuthority, VerifiedPairRequestV1,

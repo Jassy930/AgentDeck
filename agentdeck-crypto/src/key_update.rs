@@ -4,13 +4,18 @@
 //! MachineDataSign key 绑定到 protocol hook，并提供保留 [`CryptoError`] 语义的便捷入口。
 
 use agentdeck_protocol::e2ee::{
-    CanonicalKeyUpdateTbs, KeyUpdateInfoV1, KeyUpdateSignatureSigner, KeyUpdateSignatureVerifier,
-    KeyUpdateV1, MachineDataSignerBindingV1, OuterContextV1, PairingError,
+    CanonicalKeyUpdateTbs, KeyId, KeyUpdateInfoV1, KeyUpdateSignatureSigner,
+    KeyUpdateSignatureVerifier, KeyUpdateV1, MachineDataSignerBindingV1, OuterContextV1,
+    PairingError,
 };
 use agentdeck_protocol::relay_v2::auth::Ed25519Signature;
+use agentdeck_protocol::relay_v2::{KeyDirectoryRevision, StreamRouteId};
+use zeroize::Zeroizing;
 
+use crate::aead::SecretAeadKey;
 use crate::canonical::sha256;
 use crate::error::CryptoError;
+use crate::hpke::{HpkeEnvelopeV1, HpkePrivateKey, hpke_open_base};
 use crate::signature::{SigningKey, VerifyingKey, sign_raw, verify_raw};
 
 fn require_signer(
@@ -114,4 +119,84 @@ pub fn verify_key_update(
     update.validate()?;
     let tbs = update.signature_tbs(info, context, signer)?.encode()?;
     verify_raw(verifying_key, &tbs, &update.signature)
+}
+
+/// 完整验签并按 exact KeyUpdate info/AAD 解封后的 typed key material。
+///
+/// raw key 只通过消费式 [`Self::into_key`] 交给上层 key-generation 状态机，`Debug`
+/// 永远不输出密钥材料。
+pub struct OpenedKeyUpdateV1 {
+    key_directory_revision: KeyDirectoryRevision,
+    key_id: KeyId,
+    stream_route: Option<StreamRouteId>,
+    key: SecretAeadKey,
+}
+
+impl std::fmt::Debug for OpenedKeyUpdateV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenedKeyUpdateV1")
+            .field("key_directory_revision", &self.key_directory_revision)
+            .field("key_id", &self.key_id)
+            .field("stream_route", &self.stream_route)
+            .field("key_material", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl OpenedKeyUpdateV1 {
+    #[must_use]
+    pub const fn key_directory_revision(&self) -> KeyDirectoryRevision {
+        self.key_directory_revision
+    }
+
+    #[must_use]
+    pub const fn key_id(&self) -> KeyId {
+        self.key_id
+    }
+
+    #[must_use]
+    pub const fn stream_route(&self) -> Option<StreamRouteId> {
+        self.stream_route
+    }
+
+    #[must_use]
+    pub fn into_key(self) -> SecretAeadKey {
+        self.key
+    }
+}
+
+/// 先验证 MachineDataSign 与完整 authority/context，再用 DeviceHPKE 解封固定 32-byte key。
+///
+/// 调用方不能自由拼接 HPKE `info`/AAD：两者分别固定使用
+/// [`KeyUpdateInfoV1::encode`] 与 [`OuterContextV1::encode_aad`]。签名、任一绑定轴、HPKE
+/// tag 或 plaintext 长度不匹配均 fail-close。
+pub fn open_key_update(
+    recipient: &HpkePrivateKey,
+    verifying_key: &VerifyingKey,
+    signer: &MachineDataSignerBindingV1,
+    info: &KeyUpdateInfoV1,
+    context: &OuterContextV1,
+    update: &KeyUpdateV1,
+) -> Result<OpenedKeyUpdateV1, CryptoError> {
+    verify_key_update(verifying_key, signer, info, context, update)?;
+    let plaintext = Zeroizing::new(hpke_open_base(
+        recipient,
+        &info.encode(),
+        &context.encode_aad(),
+        &HpkeEnvelopeV1 {
+            enc: update.enc.clone(),
+            ciphertext: update.wrapped_key.clone(),
+        },
+    )?);
+    let bytes: [u8; 32] = plaintext
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKey("wrapped symmetric key length"))?;
+    Ok(OpenedKeyUpdateV1 {
+        key_directory_revision: update.key_directory_revision,
+        key_id: update.key_id,
+        stream_route: update.stream_route,
+        key: SecretAeadKey::from_bytes(bytes),
+    })
 }
