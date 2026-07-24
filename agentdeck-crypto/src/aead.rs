@@ -7,10 +7,12 @@
 //! 对称 key wrapper zeroize-on-drop，`Debug` 不输出材料。
 
 use agentdeck_protocol::e2ee::context::OuterContextV1;
-use agentdeck_protocol::e2ee::keys::KeyId;
+use agentdeck_protocol::e2ee::key_control::{KeyControlRequestV1, KeySyncRequestV1};
+use agentdeck_protocol::e2ee::keys::{KeyId, KeyPurpose};
 use agentdeck_protocol::e2ee::payload::{
     SealedPayloadKind, SealedPayloadV1, UnsignedSealedBlobV1, VerifiedSealedBlobV1,
 };
+use agentdeck_protocol::relay_v2::RequestRouteId;
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use hmac::{Hmac, Mac};
@@ -201,6 +203,60 @@ pub fn seal_symmetric(
         key.key_directory_revision,
         nonce,
         ciphertext,
+    ))
+}
+
+/// 使用当前 DeviceCommandTx capability 封装 exact-next `KeySync` probe。
+///
+/// 该控制请求的 sealed header revision 必须声明请求的 exact-next directory revision，
+/// 使 daemon 能在不解析 Relay outer 的前提下选择 key-control 路径；加密材料仍只能来自
+/// 当前已安装的 DeviceCommandTx key。调用方不能传裸 revision 或任意 AAD：known/current、
+/// exact-next requested revision、authority 与 uplink context 都由 typed request 在这里闭合。
+pub fn seal_key_sync_probe(
+    key: &AeadSendingKey,
+    request_route: RequestRouteId,
+    request: &KeySyncRequestV1,
+    counter: SenderCounter,
+) -> Result<(UnsignedSealedBlobV1, OuterContextV1), CryptoError> {
+    request.validate()?;
+    if request_route.as_bytes().iter().all(|byte| *byte == 0) {
+        return Err(CryptoError::InvalidKey("KeySync request route"));
+    }
+    let exact_next = request
+        .known_key_directory_revision
+        .next()
+        .map_err(|_| CryptoError::InvalidKey("KeySync directory revision"))?;
+    if key.key_id.purpose != KeyPurpose::DeviceCommandTx
+        || key.key_id.epoch != key.epoch
+        || key.key_directory_revision != request.known_key_directory_revision.value()
+        || request.requested_key_directory_revision != exact_next
+    {
+        return Err(CryptoError::InvalidKey("KeySync DeviceCommandTx binding"));
+    }
+
+    let control = KeyControlRequestV1::key_sync(request.clone());
+    let plaintext = control.canonical_bytes()?;
+    let context = OuterContextV1::uplink_send(
+        request.machine_route,
+        request.device_route,
+        request_route,
+        key.epoch,
+    );
+    context.validate().map_err(|_| CryptoError::BadCiphertext)?;
+    let nonce = assemble_nonce(&key.nonce_prefix, counter);
+    let aad = context.encode_aad();
+    let inner =
+        SealedPayloadV1::new(control.sealed_payload_kind(), plaintext).to_plaintext_bytes()?;
+    let ciphertext = seal(key.key.as_bytes(), &nonce, &aad, &inner)?;
+    Ok((
+        UnsignedSealedBlobV1::new(
+            key.key_id,
+            key.epoch,
+            request.requested_key_directory_revision.value(),
+            nonce,
+            ciphertext,
+        ),
+        context,
     ))
 }
 

@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentdeck_crypto::rand_core::{CryptoRng, TryCryptoRng, TryRng};
 use agentdeck_crypto::{CryptoError, sha256};
@@ -47,9 +47,12 @@ use tokio::time::Instant;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use super::key_sync::{
+    DurableKeySyncStateV1, FrozenKeySyncSendV1, KeySyncError, SignedHigherRevisionObservationV1,
+};
 use super::paired_machine::{
     AuthorizedRuntimeRequest, OpaqueRuntimeState, OpenedPairedMachine, PairedPromotionError,
-    VerifiedDirectedReply, VerifiedRevocationTerminal,
+    VerifiedDirectedReply, VerifiedRevocationTerminal, VerifiedStreamPublish,
 };
 use super::stream_state::{
     DurableStreamBindingV1, StreamDirectApplyMode, StreamPublishDisposition,
@@ -224,6 +227,16 @@ pub enum RemoteStreamFrameOutcome {
     },
     ReplayComplete {
         current_cursor: StreamCursor,
+    },
+    /// 已签名的未知更高 directory revision 已触发 bounded KeySync；这只是本地协调状态，
+    /// 不表示 daemon 已接收、更不表示任何 Runtime command 成功。
+    KeySyncPending {
+        attempt: u8,
+    },
+    /// Relay 只确认 KeySync `Send` 进入有界 writer；ADKS 保持 durable active，直到后续
+    /// authenticated key-control response 完成安装状态机。
+    KeySyncRouteAccepted {
+        attempt: u8,
     },
 }
 
@@ -752,6 +765,12 @@ where
                     return Err(RemoteRuntimeError::InvalidDurableState);
                 }
                 let candidate = self.machine.verify_stream_publish(&durable, &publish)?;
+                let candidate = match candidate {
+                    VerifiedStreamPublish::Current(candidate) => candidate,
+                    VerifiedStreamPublish::Higher(candidate) => {
+                        return self.coordinate_key_sync(candidate.into_observation()).await;
+                    }
+                };
                 let stream_seq = candidate.stream_seq();
                 let (admitted, disposition) = durable
                     .admit_publish(
@@ -869,10 +888,93 @@ where
                     current_cursor: complete.current_cursor,
                 })
             }
+            RelayFrameBody::RouteAccepted(accepted) => {
+                let AcceptedRef::Request { request_route } = accepted.accepted else {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "KeySync RouteAccepted must reference its request route",
+                    ));
+                };
+                let state = self
+                    .machine
+                    .durable_key_sync_state()?
+                    .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+                let active = state
+                    .active_send()
+                    .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+                if active.request_route() != request_route {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "KeySync RouteAccepted does not match the active request",
+                    ));
+                }
+                Ok(RemoteStreamFrameOutcome::KeySyncRouteAccepted {
+                    attempt: state.attempt(),
+                })
+            }
             _ => Err(RemoteRuntimeError::InvalidReply(
                 "unexpected Relay frame on the live stream ingress",
             )),
         }
+    }
+
+    async fn coordinate_key_sync(
+        &mut self,
+        observation: SignedHigherRevisionObservationV1,
+    ) -> Result<RemoteStreamFrameOutcome, RemoteRuntimeError> {
+        let now_ms = unix_time_ms()?;
+        let current = self.machine.durable_key_sync_state()?;
+        let committed = if let Some(current) = current {
+            let mut replacement = current.clone();
+            replacement
+                .observe_again(&observation, now_ms)
+                .map_err(key_sync_runtime_error)?;
+            let mut mutation_rng = SystemMutationRng::new()?;
+            self.machine.commit_key_sync_state_transition(
+                Some(&current),
+                Some(&replacement),
+                &mut mutation_rng,
+            )?
+        } else {
+            // CounterGuard 的 durable high-water 必须先于 requestRoute、seal/freeze 与 ADKS。
+            // 此后任一失败只允许跳过整个 reservation block，绝不回退或复用 counter。
+            let mut mutation_rng = SystemMutationRng::new()?;
+            let reservation = self
+                .machine
+                .reserve_command_counter_block(&mut mutation_rng)?;
+            let request = observation
+                .request_for_attempt(1)
+                .map_err(key_sync_runtime_error)?;
+            let request_route =
+                RequestRouteId::from_bytes(random_nonzero::<16, _>(&mut mutation_rng)?);
+            let signed =
+                self.machine
+                    .seal_key_sync_request(request_route, &request, reservation)?;
+            let exact_send = encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::Send(RelaySend {
+                    device_route: self.machine.device_route(),
+                    request_route,
+                    sealed_blob: SealedBlob(signed),
+                }),
+            });
+            let _ = decode(&exact_send)?;
+            let frozen =
+                FrozenKeySyncSendV1::new(request, exact_send).map_err(key_sync_runtime_error)?;
+            let replacement = DurableKeySyncStateV1::start(observation, now_ms, frozen)
+                .map_err(key_sync_runtime_error)?;
+            self.machine.commit_key_sync_state_transition(
+                None,
+                Some(&replacement),
+                &mut mutation_rng,
+            )?
+        }
+        .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+        let active = committed
+            .active_send()
+            .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+        let attempt = committed.attempt();
+        let exact_send = ExactRelayFrame::from_frozen(active.exact_send_bytes().to_vec())?;
+        self.transport.send(exact_send).await?;
+        Ok(RemoteStreamFrameOutcome::KeySyncPending { attempt })
     }
 
     /// 发送或精确重试一个 prompt，直到得到 authenticated daemon receipt 或非成功错误。
@@ -2742,6 +2844,23 @@ fn intent_hash(domain: &[u8], request_bytes: &[u8]) -> Result<[u8; 32], RemoteRu
     );
     preimage.extend_from_slice(request_bytes);
     Ok(sha256(&preimage))
+}
+
+fn unix_time_ms() -> Result<u64, RemoteRuntimeError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| RemoteRuntimeError::InvalidDurableState)?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| RemoteRuntimeError::InvalidDurableState)
+}
+
+fn key_sync_runtime_error(error: KeySyncError) -> RemoteRuntimeError {
+    if error.public_code() == Some(REMOTE_CRYPTO_KEY_EPOCH_MISSING) {
+        RemoteRuntimeError::Paired(PairedPromotionError::Crypto(CryptoError::E2ee(
+            E2eeError::KeyEpochMissing,
+        )))
+    } else {
+        RemoteRuntimeError::InvalidDurableState
+    }
 }
 
 fn random_nonzero<const N: usize, R: CryptoRng>(

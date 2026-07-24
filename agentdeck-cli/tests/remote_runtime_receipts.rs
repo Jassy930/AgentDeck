@@ -601,7 +601,6 @@ enum StreamPublishShape {
     NonCanonicalJson,
     AuthenticatedBadCiphertext,
     LowerDirectoryRevision,
-    HigherDirectoryRevision,
     LowerKeyEpoch,
     HigherKeyEpoch,
     WrongKeyPurpose,
@@ -824,7 +823,6 @@ fn catalog_publish_frame(
     };
     let directory_revision = match shape {
         StreamPublishShape::LowerDirectoryRevision => KEY_DIRECTORY_REVISION - 1,
-        StreamPublishShape::HigherDirectoryRevision => KEY_DIRECTORY_REVISION + 1,
         _ => KEY_DIRECTORY_REVISION,
     };
     let expected_context = OuterContextV1 {
@@ -4538,11 +4536,6 @@ async fn signed_stream_key_drift_and_malformed_headers_have_stable_crypto_codes(
             0x92,
             StreamPublishShape::LowerKeyEpoch,
             "remote.crypto.key_revision_rollback",
-        ),
-        (
-            0x93,
-            StreamPublishShape::HigherDirectoryRevision,
-            "remote.crypto.key_epoch_missing",
         ),
         (
             0x94,

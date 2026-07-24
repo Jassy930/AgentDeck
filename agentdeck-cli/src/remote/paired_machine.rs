@@ -16,14 +16,14 @@ use agentdeck_crypto::rand_core::CryptoRng;
 use agentdeck_crypto::{
     AeadReceivingKey, AeadSendingKey, CryptoError, HpkePrivateKey, HpkePublicKey, SenderCounter,
     SignatureBytes, SigningKey, VerifyingKey, open_key_directory_entry, open_pair_response,
-    open_sealed_payload, seal_pair_response_received, seal_symmetric, sha256,
+    open_sealed_payload, seal_key_sync_probe, seal_pair_response_received, seal_symmetric, sha256,
     sign_authentication_transcript, sign_revocation_cleanup_journal_digest, sign_sealed,
     verify_revocation_cleanup_journal_digest, verify_sealed, verify_tbs,
 };
 use agentdeck_protocol::ActionDecision;
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
-    E2EE_FORMAT_VERSION, KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1,
+    E2EE_FORMAT_VERSION, KeyDirectoryV1, KeyId, KeyPurpose, KeySyncRequestV1, KeyUpdateInfoV1,
     MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairResponseReceivedV1,
     PairResponseV1, PairingControlEnvelopeV1, PairingError, SealedPayloadKind, SealedPayloadV1,
     SignedSealedBlobV1, StreamBindingV1, VerifiedSealedBlobV1,
@@ -62,7 +62,7 @@ use super::crypto_state::{
     revocation_cleanup_entries_absent_in,
 };
 use super::device_lock::{RemoteDeviceLease, RemoteDeviceLockError, RemoteDeviceLockKey};
-use super::key_sync::DurableKeySyncStateV1;
+use super::key_sync::{DurableKeySyncStateV1, SignedHigherRevisionObservationV1};
 use super::keychain::{
     PairedRemoteKeyPurpose, ParsedPairedRemoteKeyAccount, PendingRemoteKeyPurpose,
     RemoteKeyAccount, RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
@@ -920,16 +920,25 @@ pub(crate) struct VerifiedDirectedReply {
     signed_blob_hash: [u8; 32],
 }
 
-/// 已完成 Relay Publish outer、key header、nonce prefix、AAD 与 MachineDataSign 验证的
-/// stream candidate。字段保持私有；runtime 只能先 durable admit replay tuple，再把同一
-/// branded token 交回 paired capability 做 AEAD open。
-pub(crate) struct VerifiedStreamPublish {
+/// 已完成 canonical Relay outer、durable route/generation 与 MachineDataSign/AAD 验证的
+/// stream proof。当前 revision 才携带可进入 replay/AEAD 的 branded token；未知更高
+/// directory revision 只携带 bounded KeySync observation，绝不伪装成可解密 publication。
+pub(crate) enum VerifiedStreamPublish {
+    Current(VerifiedCurrentStreamPublish),
+    Higher(VerifiedHigherStreamPublish),
+}
+
+pub(crate) struct VerifiedCurrentStreamPublish {
     verified: VerifiedSealedBlobV1,
     context: OuterContextV1,
     brand: StreamPublishBrand,
     stream_seq: u64,
     counter: u64,
     ciphertext_sha256: [u8; 32],
+}
+
+pub(crate) struct VerifiedHigherStreamPublish {
+    observation: SignedHigherRevisionObservationV1,
 }
 
 /// 当前 paired capability 对 root-signed Relay terminal 完整验签后铸造的撤销证明。
@@ -1110,7 +1119,7 @@ impl VerifiedDirectedReply {
     }
 }
 
-impl VerifiedStreamPublish {
+impl VerifiedCurrentStreamPublish {
     #[must_use]
     pub(crate) const fn stream_seq(&self) -> u64 {
         self.stream_seq
@@ -1124,6 +1133,13 @@ impl VerifiedStreamPublish {
     #[must_use]
     pub(crate) const fn ciphertext_sha256(&self) -> [u8; 32] {
         self.ciphertext_sha256
+    }
+}
+
+impl VerifiedHigherStreamPublish {
+    #[must_use]
+    pub(crate) fn into_observation(self) -> SignedHigherRevisionObservationV1 {
+        self.observation
     }
 }
 
@@ -1893,6 +1909,50 @@ impl OpenedPairedMachine<'_> {
         )
     }
 
+    /// 使用当前审计后的 DeviceCommandTx + DeviceSign capability 封装 typed KeySync probe。
+    /// reservation 按值消费；sealed header revision 只能由 request 的 exact-next revision
+    /// 产生，不能由 runtime 传入裸 override。
+    pub(crate) fn seal_key_sync_request(
+        &self,
+        request_route: RequestRouteId,
+        request: &KeySyncRequestV1,
+        reservation: CommandCounterReservation,
+    ) -> Result<Vec<u8>, PairedPromotionError> {
+        if request.machine_route != self.audited.identity.machine_route
+            || request.device_route != self.audited.device_route
+            || request.grant_serial != self.audited.grant_serial
+            || request.root_trust_epoch != self.audited.trust_epoch
+            || request.known_key_directory_revision != self.audited.directory_revision
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        validate_current_command_reservation(
+            self.audited.state.counter_reservation(),
+            &reservation,
+        )?;
+        let command_key = self
+            .audited
+            .opened_directory_keys
+            .iter()
+            .find_map(|entry| match &entry.material {
+                OpenedPairedKeyMaterial::CommandTx(key) => Some(key),
+                OpenedPairedKeyMaterial::ReplyTx { .. }
+                | OpenedPairedKeyMaterial::StreamRx { .. } => None,
+            })
+            .ok_or(PairedPromotionError::InvalidState)?;
+        let (unsigned, context) = seal_key_sync_probe(
+            command_key,
+            request_route,
+            request,
+            SenderCounter(reservation.start()),
+        )
+        .map_err(PairedPromotionError::Crypto)?;
+        Ok(
+            sign_sealed(unsigned, self.audited.device_signing_key.as_ref(), &context)
+                .to_wire_bytes(),
+        )
+    }
+
     /// 在任何 stream replay/outer/inner durable mutation 前完成 Publish 的完整公开边界
     /// 验证。`binding` 必须来自本 machine 已审计的 durable collection；Publish route、
     /// generation、key header、nonce prefix、AAD 与 MachineDataSign 任一漂移都 fail-close。
@@ -1972,6 +2032,9 @@ impl OpenedPairedMachine<'_> {
         let verified = verify_sealed(signed, &self.audited.machine_data_verifying_key, &context)
             .map_err(PairedPromotionError::Crypto)?;
         let header = &verified.sealed().inner;
+        if header.key_id.epoch != header.key_epoch || header.key_epoch == 0 {
+            return Err(PairedPromotionError::Crypto(CryptoError::BadCiphertext));
+        }
         if header.key_directory_revision < expected_revision
             || (header.key_directory_revision == expected_revision
                 && header.key_id.purpose == binding.key_id.purpose
@@ -1981,10 +2044,43 @@ impl OpenedPairedMachine<'_> {
                 agentdeck_protocol::e2ee::E2eeError::KeyRevisionRollback,
             )));
         }
-        if header.key_directory_revision > expected_revision
-            || (header.key_directory_revision == expected_revision
-                && header.key_id.purpose == binding.key_id.purpose
-                && header.key_epoch > stream_key.epoch)
+        if header.key_directory_revision > expected_revision {
+            if header.key_id.purpose != binding.key_id.purpose {
+                return Err(PairedPromotionError::Crypto(CryptoError::BadCiphertext));
+            }
+            let key_slot_stream_route = stream_key_slot_route(header.key_id, publish.stream_route)?;
+            let signed_frame_sha256 = sha256(&encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::Publish(publish.clone()),
+            }));
+            let observation = SignedHigherRevisionObservationV1::new(
+                self.audited.identity.machine_route,
+                self.audited.device_route,
+                self.audited.grant_serial,
+                self.audited.trust_epoch,
+                self.audited.directory_revision,
+                KeyDirectoryRevision::new(header.key_directory_revision),
+                header.key_id,
+                key_slot_stream_route,
+                publish.stream_route,
+                publish.generation,
+                publish.stream_seq,
+                u64::from_be_bytes(
+                    header.nonce[4..]
+                        .try_into()
+                        .map_err(|_| PairedPromotionError::InvalidState)?,
+                ),
+                signed_frame_sha256,
+                sha256(&header.ciphertext),
+            )
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+            return Ok(VerifiedStreamPublish::Higher(VerifiedHigherStreamPublish {
+                observation,
+            }));
+        }
+        if header.key_directory_revision == expected_revision
+            && header.key_id.purpose == binding.key_id.purpose
+            && header.key_epoch > stream_key.epoch
         {
             return Err(PairedPromotionError::Crypto(CryptoError::E2ee(
                 agentdeck_protocol::e2ee::E2eeError::KeyEpochMissing,
@@ -2004,14 +2100,16 @@ impl OpenedPairedMachine<'_> {
                 .map_err(|_| PairedPromotionError::InvalidState)?,
         );
         let ciphertext_sha256 = sha256(&header.ciphertext);
-        Ok(VerifiedStreamPublish {
-            verified,
-            context,
-            brand: stream_publish_brand(self.audited.identity.machine_route, binding)?,
-            stream_seq: publish.stream_seq,
-            counter,
-            ciphertext_sha256,
-        })
+        Ok(VerifiedStreamPublish::Current(
+            VerifiedCurrentStreamPublish {
+                verified,
+                context,
+                brand: stream_publish_brand(self.audited.identity.machine_route, binding)?,
+                stream_seq: publish.stream_seq,
+                counter,
+                ciphertext_sha256,
+            },
+        ))
     }
 
     /// 只消费本 capability 铸造的 verified stream token；调用方必须先把其 replay tuple
@@ -2019,7 +2117,7 @@ impl OpenedPairedMachine<'_> {
     /// binding/key replacement 后继续使用旧 capability。
     pub(crate) fn open_verified_stream_publish(
         &self,
-        candidate: VerifiedStreamPublish,
+        candidate: VerifiedCurrentStreamPublish,
     ) -> Result<SealedPayloadV1, PairedPromotionError> {
         let expected_slot =
             stream_key_slot_route(candidate.brand.key_id, candidate.brand.stream_route)?;

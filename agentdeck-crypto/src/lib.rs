@@ -32,7 +32,7 @@ pub use ::hpke::rand_core;
 
 pub use aead::{
     AeadReceivingKey, AeadSendingKey, SecretAeadKey, SenderCounter, derive_nonce_prefix,
-    open_sealed_payload, open_symmetric, seal_symmetric,
+    open_sealed_payload, open_symmetric, seal_key_sync_probe, seal_symmetric,
 };
 pub use canonical::sha256;
 pub use error::CryptoError;
