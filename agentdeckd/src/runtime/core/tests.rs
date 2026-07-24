@@ -1054,14 +1054,20 @@ async fn dormant_machine_administration_requires_local_control_before_feature_ga
     let self_revoke = RuntimeRequest::Revoke(RevokeRequest {
         target: RevokeTarget::SelfDevice,
     });
-    for connection in [read_only, remote, local_control] {
+    for connection in [read_only, local_control] {
         let reply = core.handle(connection, self_revoke.clone()).await;
         assert!(matches!(
             reply,
             RuntimeReply::Failure(RuntimeFailure { ref code, .. })
-                if code == DAEMON_RUNTIME_FEATURE_UNAVAILABLE
+                if code == DAEMON_AUTHORIZATION_PERMISSION_DENIED
         ));
     }
+    let reply = core.handle(remote, self_revoke).await;
+    assert!(matches!(
+        reply,
+        RuntimeReply::Failure(RuntimeFailure { ref code, .. })
+            if code == "daemon.revocation.administration.unavailable"
+    ));
 
     core.shutdown().await.expect("shutdown core");
 }
