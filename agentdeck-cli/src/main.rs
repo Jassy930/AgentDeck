@@ -1068,11 +1068,21 @@ fn persistent_remote_conversations_cli_error(
     let message = error.to_string();
     match error {
         PersistentRemoteConversationsError::Connect(PairedRuntimeConnectError::Relay(_))
+        | PersistentRemoteConversationsError::Connect(PairedRuntimeConnectError::Runtime(
+            RemoteRuntimeError::Transport(_) | RemoteRuntimeError::OutcomeUnknown,
+        ))
         | PersistentRemoteConversationsError::Runtime(RemoteRuntimeError::Transport(_))
         | PersistentRemoteConversationsError::Runtime(RemoteRuntimeError::OutcomeUnknown) => {
             CliError::Transport { code, message }
         }
         PersistentRemoteConversationsError::Pagination(_)
+        | PersistentRemoteConversationsError::Connect(PairedRuntimeConnectError::Runtime(
+            RemoteRuntimeError::RelayCodec(_)
+            | RemoteRuntimeError::Json(_)
+            | RemoteRuntimeError::InvalidReply(_)
+            | RemoteRuntimeError::TransferCarrier(_)
+            | RemoteRuntimeError::Transfer(_),
+        ))
         | PersistentRemoteConversationsError::Runtime(
             RemoteRuntimeError::RelayCodec(_)
             | RemoteRuntimeError::Json(_)
@@ -1082,6 +1092,7 @@ fn persistent_remote_conversations_cli_error(
         ) => CliError::Protocol { code, message },
         PersistentRemoteConversationsError::Paired(_)
         | PersistentRemoteConversationsError::Connect(PairedRuntimeConnectError::Paired(_))
+        | PersistentRemoteConversationsError::Connect(PairedRuntimeConnectError::Runtime(_))
         | PersistentRemoteConversationsError::HandshakeRevoked
         | PersistentRemoteConversationsError::Runtime(_) => CliError::Session { code, message },
     }
@@ -1098,11 +1109,21 @@ fn persistent_remote_mutation_cli_error(
     let message = error.to_string();
     match error {
         PersistentRemoteMutationError::Connect(PairedRuntimeConnectError::Relay(_))
+        | PersistentRemoteMutationError::Connect(PairedRuntimeConnectError::Runtime(
+            RemoteRuntimeError::Transport(_) | RemoteRuntimeError::OutcomeUnknown,
+        ))
         | PersistentRemoteMutationError::Runtime(RemoteRuntimeError::Transport(_))
         | PersistentRemoteMutationError::Runtime(RemoteRuntimeError::OutcomeUnknown) => {
             CliError::Transport { code, message }
         }
-        PersistentRemoteMutationError::Runtime(
+        PersistentRemoteMutationError::Connect(PairedRuntimeConnectError::Runtime(
+            RemoteRuntimeError::RelayCodec(_)
+            | RemoteRuntimeError::Json(_)
+            | RemoteRuntimeError::InvalidReply(_)
+            | RemoteRuntimeError::TransferCarrier(_)
+            | RemoteRuntimeError::Transfer(_),
+        ))
+        | PersistentRemoteMutationError::Runtime(
             RemoteRuntimeError::RelayCodec(_)
             | RemoteRuntimeError::Json(_)
             | RemoteRuntimeError::InvalidReply(_)
@@ -1111,6 +1132,7 @@ fn persistent_remote_mutation_cli_error(
         ) => CliError::Protocol { code, message },
         PersistentRemoteMutationError::Paired(_)
         | PersistentRemoteMutationError::Connect(PairedRuntimeConnectError::Paired(_))
+        | PersistentRemoteMutationError::Connect(PairedRuntimeConnectError::Runtime(_))
         | PersistentRemoteMutationError::HandshakeRevoked
         | PersistentRemoteMutationError::Runtime(_) => CliError::Session { code, message },
     }

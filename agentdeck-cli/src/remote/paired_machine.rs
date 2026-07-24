@@ -24,10 +24,10 @@ use agentdeck_crypto::{
 use agentdeck_protocol::ActionDecision;
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
-    E2EE_FORMAT_VERSION, KeyDirectoryV1, KeyId, KeyPurpose, KeySyncRequestV1, KeyUpdateInfoV1,
-    MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairResponseReceivedV1,
-    PairResponseV1, PairingControlEnvelopeV1, PairingError, SealedPayloadKind, SealedPayloadV1,
-    SignedSealedBlobV1, StreamBindingV1, VerifiedSealedBlobV1,
+    E2EE_FORMAT_VERSION, E2eeError, KeyControlRequestV1, KeyDirectoryV1, KeyId, KeyPurpose,
+    KeySyncRequestV1, KeyUpdateAckV1, KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1,
+    OuterFrameKind, PairResponseReceivedV1, PairResponseV1, PairingControlEnvelopeV1, PairingError,
+    SealedPayloadKind, SealedPayloadV1, SignedSealedBlobV1, StreamBindingV1, VerifiedSealedBlobV1,
 };
 use agentdeck_protocol::relay_v2::auth::{
     AuthCanonicalError, AuthenticationRole, AuthenticationTranscriptV1, CertRole, Ed25519Signature,
@@ -65,15 +65,22 @@ use super::crypto_state::{
 use super::device_lock::{RemoteDeviceLease, RemoteDeviceLockError, RemoteDeviceLockKey};
 use super::key_generation::{
     DurableKeyCarrierV1, DurableKeyGenerationStateV1, DurableKeyGenerationV1,
-    validate_directed_rewrap_metadata,
+    SharedUpdateMetadataKindV1, stage_normal_update_set, validate_directed_rewrap_metadata,
+    validate_normal_update_transition,
 };
-use super::key_sync::{DurableKeySyncStateV1, SignedHigherRevisionObservationV1};
+use super::key_sync::{
+    DurableKeySyncStateV1, KeySyncUpdateSetHandoff, KeyUpdateAckBasisV1,
+    SignedHigherRevisionObservationV1,
+};
 use super::keychain::{
     PairedRemoteKeyPurpose, ParsedPairedRemoteKeyAccount, PendingRemoteKeyPurpose,
     RemoteKeyAccount, RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
 };
 use super::pending::{PendingInvitePublicProjection, VerifiedPendingPairResponse};
-use super::stream_state::{DurableStreamBindingV1, decode_stream_bindings, encode_stream_bindings};
+use super::stream_state::{
+    DurableStreamBindingV1, StreamPublishDisposition, decode_stream_bindings,
+    encode_stream_bindings,
+};
 
 const STATE_MAGIC: &[u8; 4] = b"ADPS";
 const STATE_VERSION: u16 = 1;
@@ -524,6 +531,62 @@ impl PairedPromotionError {
     }
 }
 
+/// 已完成全部 signature/HPKE/raw relation/roster/binding 校验、等待单次 ADPS CAS 的
+/// normal UpdateSet candidate。字段保持私有，调用方不能拼出 generation-only 或 ADKS-only
+/// 半安装状态；`Debug` 永远不输出 paired-state plaintext。
+pub struct PreparedKeyUpdateInstall {
+    expected_state_bytes: Vec<u8>,
+    candidate_state_bytes: Vec<u8>,
+    candidate_generation_bytes: Vec<u8>,
+    candidate_key_sync_bytes: Vec<u8>,
+    candidate_stream_binding_bytes: Vec<Vec<u8>>,
+    expected_ack_basis: KeyUpdateAckBasisV1,
+}
+
+impl fmt::Debug for PreparedKeyUpdateInstall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedKeyUpdateInstall([REDACTED])")
+    }
+}
+
+/// combined CAS 完整 durable readback 后铸造的 ACK capability。它证明 ADKG、ADKS 与
+/// installed binding collection 来自同一 paired-state snapshot；Relay RouteAccepted 不会
+/// 产生该值。
+pub struct CommittedKeyUpdateInstall {
+    key_sync_state: DurableKeySyncStateV1,
+    ack_basis: KeyUpdateAckBasisV1,
+    ack: KeyUpdateAckV1,
+    already_committed: bool,
+}
+
+impl fmt::Debug for CommittedKeyUpdateInstall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CommittedKeyUpdateInstall([REDACTED])")
+    }
+}
+
+impl CommittedKeyUpdateInstall {
+    #[must_use]
+    pub const fn key_sync_state(&self) -> &DurableKeySyncStateV1 {
+        &self.key_sync_state
+    }
+
+    #[must_use]
+    pub const fn ack_basis(&self) -> KeyUpdateAckBasisV1 {
+        self.ack_basis
+    }
+
+    #[must_use]
+    pub const fn ack(&self) -> &KeyUpdateAckV1 {
+        &self.ack
+    }
+
+    #[must_use]
+    pub const fn already_committed(&self) -> bool {
+        self.already_committed
+    }
+}
+
 /// marker exact readback 后才可返回给 transport 的 frozen receipt outbox。
 pub struct PromotedPairedMachine {
     state_path: PathBuf,
@@ -739,6 +802,7 @@ fn validate_typed_stream_state_and_stage(
     context: StreamBindingAuditContext,
     authorization: &DeviceAuthorizationV1,
     opened_keys: &[OpenedPairedDirectoryKey],
+    prepared_opened_keys: Option<&[OpenedPairedDirectoryKey]>,
 ) -> Result<(), PairedPromotionError> {
     let mut active_context = context;
     active_context.effective_directory_revision = state.effective_directory_revision()?;
@@ -748,9 +812,12 @@ fn validate_typed_stream_state_and_stage(
         let next = PairedCryptoState::decode(prepared.snapshot().expose_secret())?;
         let mut next_context = context;
         next_context.effective_directory_revision = next.effective_directory_revision()?;
-        validate_typed_stream_state(&next, next_context, authorization, opened_keys)?;
-        // prepared V5 的 active-key inventory 在 generation audit 中独立重建；这里仅校验
-        // 与 active inventory 仍共享的 legacy fields，不能提前激活 staged generation。
+        validate_typed_stream_state(
+            &next,
+            next_context,
+            authorization,
+            prepared_opened_keys.unwrap_or(opened_keys),
+        )?;
         validate_key_sync_state_against_audit(&next, next_context)?;
     }
     Ok(())
@@ -797,12 +864,77 @@ fn validate_key_sync_state_against_audit(
         return Err(PairedPromotionError::Conflict);
     }
 
+    let current_known = key_sync.current_known_key_directory_revision();
+    let binding_revision = if current_known == observation.known_key_directory_revision() {
+        // 新 cycle Active 状态没有本轮 completion；其 latest basis 来自上一轮 Resolved
+        // 状态的 retained ACK。即使 observation/current 已相等，也必须把 retained
+        // revision/hash 与当前 ADKG staged set 交叉认证，不能等到实际重封 ACK 才发现漂移。
+        if let Some(retained) = key_sync.latest_completed_ack_basis() {
+            let generation = state
+                .durable_key_generation_state()?
+                .ok_or(PairedPromotionError::Conflict)?;
+            let installed_set = generation
+                .staged_normal_update_set()
+                .map_err(|_| PairedPromotionError::Conflict)?;
+            if retained.key_directory_revision() != current_known
+                || retained.key_directory_revision() != generation.effective_directory_revision()
+                || installed_set
+                    .canonical_sha256()
+                    .map_err(PairedPromotionError::Protocol)?
+                    != retained.update_set_sha256()
+            {
+                return Err(PairedPromotionError::Conflict);
+            }
+        }
+        current_known
+    } else {
+        let completed = key_sync
+            .latest_completed_ack_basis()
+            .ok_or(PairedPromotionError::Conflict)?;
+        let generation = state
+            .durable_key_generation_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+        let installed_set = generation
+            .staged_normal_update_set()
+            .map_err(|_| PairedPromotionError::Conflict)?;
+        if completed.key_directory_revision() != current_known
+            || completed.key_directory_revision() != generation.effective_directory_revision()
+            || installed_set
+                .canonical_sha256()
+                .map_err(PairedPromotionError::Protocol)?
+                != completed.update_set_sha256()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let slot_route = observation.key_slot_stream_route();
+        let observed_update = installed_set
+            .updates
+            .iter()
+            .find(|update| {
+                update.key_id.purpose == observation.observed_key_id().purpose
+                    && update.stream_route == slot_route
+            })
+            .ok_or(PairedPromotionError::Conflict)?;
+        if observed_update.key_id != observation.observed_key_id() {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let current = generation
+            .find_slot(observation.observed_key_id().purpose, slot_route)
+            .ok_or(PairedPromotionError::Conflict)?
+            .current();
+        current.key_directory_revision()
+    };
+
     let bindings = state.durable_stream_bindings()?;
     // V1/V2 legacy state 没有 typed publication inventory；首次 V4 migration 仍可由
     // marker/directory 的硬 authority 轴授权。只要 inventory 已存在，就必须 exact 命中，
     // 不允许用另一路 route/generation 或 purpose/slot 注入 canonical ADKS。
     if bindings.is_empty() {
-        return Ok(());
+        return if current_known == observation.known_key_directory_revision() {
+            Ok(())
+        } else {
+            Err(PairedPromotionError::Conflict)
+        };
     }
     let matching_publications = bindings
         .into_iter()
@@ -810,7 +942,7 @@ fn validate_key_sync_state_against_audit(
             let binding = durable.binding();
             binding.stream_route == observation.publication_stream_route()
                 && binding.stream_generation == observation.publication_stream_generation()
-                && binding.key_directory_revision == key_sync.current_known_key_directory_revision()
+                && binding.key_directory_revision == binding_revision
                 && binding.key_id.purpose == observation.observed_key_id().purpose
                 && stream_key_slot_route(binding.key_id, binding.stream_route).ok()
                     == Some(observation.key_slot_stream_route())
@@ -933,6 +1065,7 @@ pub(crate) struct VerifiedDirectedReply {
     verified: VerifiedSealedBlobV1,
     context: OuterContextV1,
     brand: DirectedReplyBrand,
+    replay_revision_ceiling: u64,
     counter: u64,
     signed_blob_hash: [u8; 32],
 }
@@ -941,14 +1074,15 @@ pub(crate) struct VerifiedDirectedReply {
 /// stream proof。当前 revision 才携带可进入 replay/AEAD 的 branded token；未知更高
 /// directory revision 只携带 bounded KeySync observation，绝不伪装成可解密 publication。
 pub(crate) enum VerifiedStreamPublish {
-    Current(VerifiedCurrentStreamPublish),
-    Higher(VerifiedHigherStreamPublish),
+    Current(Box<VerifiedCurrentStreamPublish>),
+    Higher(Box<VerifiedHigherStreamPublish>),
 }
 
 pub(crate) struct VerifiedCurrentStreamPublish {
     verified: VerifiedSealedBlobV1,
     context: OuterContextV1,
     brand: StreamPublishBrand,
+    header_directory_revision: u64,
     stream_seq: u64,
     counter: u64,
     ciphertext_sha256: [u8; 32],
@@ -1123,6 +1257,11 @@ impl VerifiedDirectedReply {
     #[must_use]
     pub(crate) const fn directory_revision(&self) -> u64 {
         self.brand.directory_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn replay_revision_ceiling(&self) -> u64 {
+        self.replay_revision_ceiling
     }
 
     #[must_use]
@@ -1466,6 +1605,286 @@ impl OpenedPairedMachine<'_> {
         self.audited.state.durable_key_generation_state()
     }
 
+    /// 纯内存构造 normal UpdateSet 的唯一 combined candidate。该步骤不取 entropy、不写
+    /// Keychain/磁盘；ADKG、ADKS 与 same-epoch shared binding replacement 会先组成一个
+    /// 完整 V5 plaintext，之后只能交给 [`Self::commit_key_update_install`]。
+    pub fn prepare_key_update_install(
+        &self,
+        handoff: KeySyncUpdateSetHandoff,
+        installed_at_ms: u64,
+    ) -> Result<PreparedKeyUpdateInstall, PairedPromotionError> {
+        let update_set_sha256 = handoff.update_set_sha256();
+        let update_set_canonical = handoff.update_set_canonical_bytes().to_vec();
+        let current_key_sync = self
+            .audited
+            .state
+            .durable_key_sync_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+
+        // Committed retry 必须先于 clock/deadline 与 candidate reconstruction。只认 durable
+        // attempt/source route/revision/hash 四元组和 exact ADKG projection；同一 Reply 在
+        // deadline 后重放仍零 entropy、零写并可重建 ACK。
+        if let Some(expected_ack_basis) = current_key_sync.latest_completed_ack_basis()
+            && expected_ack_basis.attempt() == handoff.request().attempt
+            && expected_ack_basis.source_request_route() == handoff.request_route()
+            && expected_ack_basis.key_directory_revision()
+                == handoff.requested_key_directory_revision()
+            && expected_ack_basis.update_set_sha256() == update_set_sha256
+        {
+            let generation = self
+                .audited
+                .state
+                .durable_key_generation_state()?
+                .ok_or(PairedPromotionError::Conflict)?;
+            let installed_set = generation
+                .staged_normal_update_set()
+                .map_err(|_| PairedPromotionError::Conflict)?;
+            if installed_set
+                .canonical_bytes()
+                .map_err(PairedPromotionError::Protocol)?
+                != update_set_canonical
+            {
+                return Err(PairedPromotionError::Conflict);
+            }
+            let candidate_generation_bytes = generation
+                .canonical_bytes()
+                .map_err(|_| PairedPromotionError::InvalidState)?;
+            let candidate_key_sync_bytes = current_key_sync
+                .canonical_bytes()
+                .map_err(|_| PairedPromotionError::InvalidState)?;
+            let candidate_stream_binding_bytes =
+                encode_stream_bindings(self.audited.state.durable_stream_bindings()?)
+                    .map_err(|_| PairedPromotionError::InvalidState)?;
+            let candidate_state_bytes = self.audited.state_snapshot.expose_secret().to_vec();
+            return Ok(PreparedKeyUpdateInstall {
+                expected_state_bytes: candidate_state_bytes.clone(),
+                candidate_state_bytes,
+                candidate_generation_bytes,
+                candidate_key_sync_bytes,
+                candidate_stream_binding_bytes,
+                expected_ack_basis,
+            });
+        }
+        if &current_key_sync != handoff.retained_state() {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let outcome = handoff
+            .clone()
+            .after_durable_install(installed_at_ms, update_set_sha256)
+            .map_err(|_| PairedPromotionError::Conflict)?;
+        let candidate_key_sync = outcome.state().clone();
+        let expected_ack_basis = candidate_key_sync
+            .latest_completed_ack_basis()
+            .ok_or(PairedPromotionError::Conflict)?;
+        if expected_ack_basis.attempt() != handoff.request().attempt
+            || expected_ack_basis.source_request_route() != handoff.request_route()
+            || expected_ack_basis.key_directory_revision()
+                != handoff.requested_key_directory_revision()
+            || expected_ack_basis.update_set_sha256() != update_set_sha256
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let candidate_key_sync_bytes = candidate_key_sync
+            .canonical_bytes()
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+
+        let previous_generation = match self.audited.state.durable_key_generation_state()? {
+            Some(state) => state,
+            None => {
+                let directory = KeyDirectoryV1::from_canonical_bytes(
+                    &self.audited.state.bootstrap().key_directory,
+                )
+                .map_err(PairedPromotionError::Protocol)?;
+                DurableKeyGenerationStateV1::from_bootstrap_directory(&directory)
+                    .map_err(|_| PairedPromotionError::Conflict)?
+            }
+        };
+        let candidate_generation =
+            stage_normal_update_set(&previous_generation, handoff.update_set())
+                .map_err(|_| PairedPromotionError::Conflict)?;
+        validate_normal_update_raw_relations(
+            &previous_generation,
+            &candidate_generation,
+            handoff.update_set(),
+            self.audited.state.bootstrap(),
+            &self.audited.device_hpke_private_key,
+            &self.audited.machine_data_verifying_key,
+            &self.audited.machine_data_signer_binding,
+        )?;
+
+        let candidate_bindings = rewrap_stream_bindings_for_normal_update(
+            &previous_generation,
+            &candidate_generation,
+            handoff.update_set(),
+            self.audited.state.durable_stream_bindings()?,
+        )?;
+        let candidate_stream_binding_bytes = encode_stream_bindings(candidate_bindings)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        let candidate_generation_bytes = candidate_generation
+            .canonical_bytes()
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        let mut runtime = self.audited.state.opaque_runtime_state();
+        runtime.stream_cursors = candidate_stream_binding_bytes.clone();
+        let candidate_state = self.audited.state.with_mutable_projection(
+            self.audited.marker.state_plaintext_hash,
+            self.audited.marker.counter_guard_hash,
+            &runtime,
+            self.audited.state.counter_reservation(),
+            Some(candidate_key_sync_bytes.clone()),
+            Some(candidate_generation_bytes.clone()),
+            KEY_GENERATION_STATE_VERSION,
+            true,
+            true,
+        )?;
+
+        // 用 candidate current inventory（不是 active/旧 inventory）审计 candidate binding。
+        let inventories = audit_key_generation_state_and_stage(
+            &candidate_state,
+            None,
+            candidate_state.bootstrap(),
+            &self.audited.device_hpke_private_key,
+            &self.audited.machine_data_verifying_key,
+            &self.audited.machine_data_signer_binding,
+            &self.audited.opened_directory_keys,
+        )?;
+        let candidate_opened = inventories
+            .active
+            .as_deref()
+            .ok_or(PairedPromotionError::InvalidState)?;
+        validate_typed_stream_state_and_stage(
+            &candidate_state,
+            None,
+            StreamBindingAuditContext {
+                identity: self.audited.identity,
+                device_route: self.audited.device_route,
+                grant_serial: self.audited.grant_serial,
+                trust_epoch: self.audited.trust_epoch,
+                bootstrap_directory_revision: self.audited.bootstrap_directory_revision,
+                effective_directory_revision: candidate_generation.effective_directory_revision(),
+            },
+            &self.audited.authorization,
+            candidate_opened,
+            None,
+        )?;
+        let candidate_state_bytes = candidate_state.encode()?;
+        Ok(PreparedKeyUpdateInstall {
+            expected_state_bytes: self.audited.state_snapshot.expose_secret().to_vec(),
+            candidate_state_bytes,
+            candidate_generation_bytes,
+            candidate_key_sync_bytes,
+            candidate_stream_binding_bytes,
+            expected_ack_basis,
+        })
+    }
+
+    /// 单次提交完整 V5 candidate。exact committed retry 优先于 expected 比较，因此 stale
+    /// prepared + `PanicRng` 仍零 entropy/零写；任何 crash cut 恢复后只接受完整旧或新
+    /// snapshot。ACK 只在 ADKG/ADKS/binding collection 全部逐字读回后返回。
+    pub fn commit_key_update_install<R: CryptoRng>(
+        &mut self,
+        prepared: PreparedKeyUpdateInstall,
+        rng: &mut R,
+    ) -> Result<CommittedKeyUpdateInstall, PairedPromotionError> {
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.refresh_mutable_state()?;
+
+        let current = self.audited.state_snapshot.expose_secret();
+        if current == prepared.candidate_state_bytes {
+            return self.read_back_committed_key_update_install(&prepared, true);
+        }
+        if current != prepared.expected_state_bytes {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        let candidate_state = PairedCryptoState::decode(&prepared.candidate_state_bytes)?;
+        let write_result = self.commit_prepared_state_transition(
+            candidate_state,
+            prepared.candidate_state_bytes.clone(),
+            rng,
+        );
+        match write_result {
+            Ok(()) => self.read_back_committed_key_update_install(&prepared, false),
+            Err(write_error) => {
+                if self.refresh_mutable_state().is_err() {
+                    return Err(write_error);
+                }
+                let _recovery = self.recover_pending_guard();
+                if self.refresh_mutable_state().is_err() {
+                    return Err(write_error);
+                }
+                if self.audited.state_snapshot.expose_secret() == prepared.candidate_state_bytes {
+                    self.read_back_committed_key_update_install(&prepared, false)
+                } else if self.audited.state_snapshot.expose_secret()
+                    == prepared.expected_state_bytes
+                {
+                    Err(write_error)
+                } else {
+                    Err(PairedPromotionError::Conflict)
+                }
+            }
+        }
+    }
+
+    fn read_back_committed_key_update_install(
+        &mut self,
+        prepared: &PreparedKeyUpdateInstall,
+        already_committed: bool,
+    ) -> Result<CommittedKeyUpdateInstall, PairedPromotionError> {
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.refresh_mutable_state()?;
+        if self.audited.state_snapshot.expose_secret() != prepared.candidate_state_bytes {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let generation = self
+            .audited
+            .state
+            .durable_key_generation_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+        let key_sync_state = self
+            .audited
+            .state
+            .durable_key_sync_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+        let generation_bytes = generation
+            .canonical_bytes()
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        let key_sync_bytes = key_sync_state
+            .canonical_bytes()
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        let binding_bytes = encode_stream_bindings(self.audited.state.durable_stream_bindings()?)
+            .map_err(|_| PairedPromotionError::InvalidState)?;
+        let ack_basis = key_sync_state
+            .latest_completed_ack_basis()
+            .ok_or(PairedPromotionError::Conflict)?;
+        if generation_bytes != prepared.candidate_generation_bytes
+            || key_sync_bytes != prepared.candidate_key_sync_bytes
+            || binding_bytes != prepared.candidate_stream_binding_bytes
+            || ack_basis != prepared.expected_ack_basis
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let ack = KeyUpdateAckV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            machine_route: self.audited.identity.machine_route,
+            device_route: self.audited.device_route,
+            grant_serial: self.audited.grant_serial,
+            root_trust_epoch: self.audited.trust_epoch,
+            key_directory_revision: ack_basis.key_directory_revision(),
+            update_set_sha256: ack_basis.update_set_sha256(),
+        };
+        ack.validate().map_err(PairedPromotionError::Protocol)?;
+        Ok(CommittedKeyUpdateInstall {
+            key_sync_state,
+            ack_basis,
+            ack,
+            already_committed,
+        })
+    }
+
     /// 仅供 automatic wrapper 的 generation-only CAS；production UpdateSet 必须走 V5-B 的
     /// ADKG+ADKS/roster/activation transaction，不能复用本 seam。
     fn commit_key_generation_state_transition<R: CryptoRng>(
@@ -1519,6 +1938,7 @@ impl OpenedPairedMachine<'_> {
             &self.audited.machine_data_signer_binding,
             &self.audited.opened_directory_keys,
         )?
+        .active
         .ok_or(PairedPromotionError::InvalidState)?;
         validate_typed_stream_state_and_stage(
             &next_state,
@@ -1533,6 +1953,7 @@ impl OpenedPairedMachine<'_> {
             },
             &self.audited.authorization,
             &active_keys,
+            None,
         )?;
         let next_state_bytes = next_state.encode()?;
         match self.commit_prepared_state_transition(next_state, next_state_bytes, rng) {
@@ -2019,6 +2440,102 @@ impl OpenedPairedMachine<'_> {
         Ok((reply_epoch, reply_revision))
     }
 
+    /// 把 KeySync Reply 的公开 request projection 重新绑定到当前 durable active ADKS 与
+    /// 当前 DeviceReplyTx revision。调用方持有旧 clone 或错误 route 时在验签/解密前拒绝。
+    fn validate_active_key_sync_request(
+        &self,
+        request: &KeySyncRequestV1,
+        request_route: RequestRouteId,
+    ) -> Result<KeyDirectoryRevision, PairedPromotionError> {
+        request.validate().map_err(PairedPromotionError::Protocol)?;
+        let key_sync = self
+            .audited
+            .state
+            .durable_key_sync_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+        let active = key_sync
+            .active_send()
+            .ok_or(PairedPromotionError::Conflict)?;
+        let (_, reply_revision) = self.directed_reply_scope()?;
+        let reply_revision = KeyDirectoryRevision::new(reply_revision);
+        if active.request() != request
+            || active.request_route() != request_route
+            || request.machine_route != self.audited.identity.machine_route
+            || request.device_route != self.audited.device_route
+            || request.grant_serial != self.audited.grant_serial
+            || request.root_trust_epoch != self.audited.trust_epoch
+            || request.known_key_directory_revision != reply_revision
+            || request.known_key_directory_revision != self.audited.effective_directory_revision
+            || key_sync.current_known_key_directory_revision() != reply_revision
+            || request.requested_key_directory_revision
+                != reply_revision
+                    .next()
+                    .map_err(|_| PairedPromotionError::Conflict)?
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(reply_revision)
+    }
+
+    /// 从已完成 open-time ADKG+ADKS+binding audit 的 latest completion basis 铸造 ACK。
+    /// basis 只是索引；revision/hash/authority 必须再次从当前 durable state 精确反查。
+    pub(crate) fn key_update_ack_from_basis(
+        &self,
+        basis: KeyUpdateAckBasisV1,
+    ) -> Result<KeyUpdateAckV1, PairedPromotionError> {
+        validate_key_sync_state_against_audit(
+            &self.audited.state,
+            StreamBindingAuditContext {
+                identity: self.audited.identity,
+                device_route: self.audited.device_route,
+                grant_serial: self.audited.grant_serial,
+                trust_epoch: self.audited.trust_epoch,
+                bootstrap_directory_revision: self.audited.bootstrap_directory_revision,
+                effective_directory_revision: self.audited.effective_directory_revision,
+            },
+        )?;
+        let key_sync = self
+            .audited
+            .state
+            .durable_key_sync_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+        let durable_basis = key_sync
+            .latest_completed_ack_basis()
+            .ok_or(PairedPromotionError::Conflict)?;
+        let generation = self
+            .audited
+            .state
+            .durable_key_generation_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+        let installed_set = generation
+            .staged_normal_update_set()
+            .map_err(|_| PairedPromotionError::Conflict)?;
+        if durable_basis != basis
+            || key_sync.current_known_key_directory_revision() != basis.key_directory_revision()
+            || generation.effective_directory_revision() != basis.key_directory_revision()
+            || self.audited.effective_directory_revision != basis.key_directory_revision()
+            || installed_set
+                .canonical_sha256()
+                .map_err(PairedPromotionError::Protocol)?
+                != basis.update_set_sha256()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let ack = KeyUpdateAckV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+            relay_protocol_version: RELAY_PROTOCOL_VERSION,
+            machine_route: self.audited.identity.machine_route,
+            device_route: self.audited.device_route,
+            grant_serial: self.audited.grant_serial,
+            root_trust_epoch: self.audited.trust_epoch,
+            key_directory_revision: basis.key_directory_revision(),
+            update_set_sha256: basis.update_set_sha256(),
+        };
+        ack.validate().map_err(PairedPromotionError::Protocol)?;
+        Ok(ack)
+    }
+
     /// 使用审计后的 DeviceCommandTx + DeviceSign capability 封装闭合 allowlist 中的请求。
     /// reservation 按值消费并与当前 authenticated state exact 对照，调用方不能传裸 counter
     /// 或任意 `RuntimeRequest`。
@@ -2135,6 +2652,74 @@ impl OpenedPairedMachine<'_> {
         )
     }
 
+    /// 只用当前 durable completion basis 与当前 DeviceCommandTx capability 封装 ACK。
+    /// runtime 传入的公开 ACK 必须逐字段等于内部重新铸造值，不能借此发送任意 key-control。
+    pub(crate) fn seal_key_update_ack(
+        &self,
+        request_route: RequestRouteId,
+        ack: &KeyUpdateAckV1,
+        reservation: CommandCounterReservation,
+    ) -> Result<Vec<u8>, PairedPromotionError> {
+        if request_route.as_bytes().iter().all(|byte| *byte == 0) {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let key_sync = self
+            .audited
+            .state
+            .durable_key_sync_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+        let basis = key_sync
+            .latest_completed_ack_basis()
+            .ok_or(PairedPromotionError::Conflict)?;
+        let expected = self.key_update_ack_from_basis(basis)?;
+        if ack != &expected {
+            return Err(PairedPromotionError::Conflict);
+        }
+        validate_current_command_reservation(
+            self.audited.state.counter_reservation(),
+            &reservation,
+        )?;
+        let command_key = self
+            .audited
+            .opened_directory_keys
+            .iter()
+            .find_map(|entry| match &entry.material {
+                OpenedPairedKeyMaterial::CommandTx(key) => {
+                    Some((key, entry.key_directory_revision))
+                }
+                OpenedPairedKeyMaterial::ReplyTx { .. }
+                | OpenedPairedKeyMaterial::StreamRx { .. } => None,
+            })
+            .ok_or(PairedPromotionError::InvalidState)?;
+        if command_key.1 != ack.key_directory_revision
+            || command_key.0.key_directory_revision != ack.key_directory_revision.value()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let control = KeyControlRequestV1::key_update_ack(ack.clone());
+        let plaintext = control
+            .canonical_bytes()
+            .map_err(PairedPromotionError::Protocol)?;
+        let context = OuterContextV1::uplink_send(
+            self.audited.identity.machine_route,
+            self.audited.device_route,
+            request_route,
+            command_key.0.epoch,
+        );
+        let unsigned = seal_symmetric(
+            command_key.0,
+            &context,
+            control.sealed_payload_kind(),
+            &plaintext,
+            SenderCounter(reservation.start()),
+        )
+        .map_err(PairedPromotionError::Crypto)?;
+        Ok(
+            sign_sealed(unsigned, self.audited.device_signing_key.as_ref(), &context)
+                .to_wire_bytes(),
+        )
+    }
+
     /// 在任何 stream replay/outer/inner durable mutation 前完成 Publish 的完整公开边界
     /// 验证。`binding` 必须来自本 machine 已审计的 durable collection；Publish route、
     /// generation、key header、nonce prefix、AAD 与 MachineDataSign 任一漂移都 fail-close。
@@ -2217,7 +2802,32 @@ impl OpenedPairedMachine<'_> {
         if header.key_id.epoch != header.key_epoch || header.key_epoch == 0 {
             return Err(PairedPromotionError::Crypto(CryptoError::BadCiphertext));
         }
-        if header.key_directory_revision < expected_revision
+        let counter = u64::from_be_bytes(
+            header.nonce[4..]
+                .try_into()
+                .map_err(|_| PairedPromotionError::InvalidState)?,
+        );
+        let ciphertext_sha256 = sha256(&header.ciphertext);
+        // 连续 same-epoch rewrap 保留同一 raw key/nonce domain 与 durable replay window。
+        // 任一旧 revision 只在该 tuple 已被当前 binding 精确记录时可继续进入 runtime
+        // 分类；fresh predecessor 仍是 rollback。NonceReuse 也必须进入 durable quarantine
+        // 分支，不能被这里提前折叠成无状态错误。
+        let retained_predecessor = header.key_directory_revision < expected_revision
+            && header.key_id == binding.key_id
+            && header.key_id == stream_key.key_id
+            && header.key_epoch == stream_key.epoch
+            && header.nonce[..4] == nonce_prefix
+            && durable
+                .admit_publish(publish.stream_seq, counter, ciphertext_sha256)
+                .is_ok_and(|(_, disposition)| {
+                    matches!(
+                        disposition,
+                        StreamPublishDisposition::PendingDuplicate
+                            | StreamPublishDisposition::AppliedDuplicate
+                            | StreamPublishDisposition::NonceReuseQuarantined
+                    )
+                });
+        if (header.key_directory_revision < expected_revision && !retained_predecessor)
             || (header.key_directory_revision == expected_revision
                 && header.key_id.purpose == binding.key_id.purpose
                 && header.key_epoch < stream_key.epoch)
@@ -2256,9 +2866,9 @@ impl OpenedPairedMachine<'_> {
                 sha256(&header.ciphertext),
             )
             .map_err(|_| PairedPromotionError::InvalidState)?;
-            return Ok(VerifiedStreamPublish::Higher(VerifiedHigherStreamPublish {
-                observation,
-            }));
+            return Ok(VerifiedStreamPublish::Higher(Box::new(
+                VerifiedHigherStreamPublish { observation },
+            )));
         }
         if header.key_directory_revision == expected_revision
             && header.key_id.purpose == binding.key_id.purpose
@@ -2271,27 +2881,23 @@ impl OpenedPairedMachine<'_> {
         if header.key_id != binding.key_id
             || header.key_id != stream_key.key_id
             || header.key_epoch != stream_key.epoch
-            || header.key_directory_revision != expected_revision
+            || (header.key_directory_revision != expected_revision && !retained_predecessor)
             || header.nonce[..4] != nonce_prefix
         {
             return Err(PairedPromotionError::Crypto(CryptoError::BadCiphertext));
         }
-        let counter = u64::from_be_bytes(
-            header.nonce[4..]
-                .try_into()
-                .map_err(|_| PairedPromotionError::InvalidState)?,
-        );
-        let ciphertext_sha256 = sha256(&header.ciphertext);
-        Ok(VerifiedStreamPublish::Current(
+        let header_directory_revision = header.key_directory_revision;
+        Ok(VerifiedStreamPublish::Current(Box::new(
             VerifiedCurrentStreamPublish {
                 verified,
                 context,
                 brand: stream_publish_brand(self.audited.identity.machine_route, binding)?,
+                header_directory_revision,
                 stream_seq: publish.stream_seq,
                 counter,
                 ciphertext_sha256,
             },
-        ))
+        )))
     }
 
     /// 只消费本 capability 铸造的 verified stream token；调用方必须先把其 replay tuple
@@ -2308,17 +2914,17 @@ impl OpenedPairedMachine<'_> {
                 .opened_directory_keys
                 .iter()
                 .filter_map(|entry| match &entry.material {
-                    OpenedPairedKeyMaterial::StreamRx { key, .. }
+                    OpenedPairedKeyMaterial::StreamRx { key, nonce_prefix }
                         if entry.key_id == candidate.brand.key_id
                             && entry.stream_route == expected_slot =>
                     {
-                        Some((key, entry.key_directory_revision))
+                        Some((key, *nonce_prefix, entry.key_directory_revision))
                     }
                     OpenedPairedKeyMaterial::CommandTx(_)
                     | OpenedPairedKeyMaterial::ReplyTx { .. }
                     | OpenedPairedKeyMaterial::StreamRx { .. } => None,
                 });
-        let (stream_key, stream_revision) =
+        let (stream_key, nonce_prefix, stream_revision) =
             matching.next().ok_or(PairedPromotionError::InvalidState)?;
         if matching.next().is_some() {
             return Err(PairedPromotionError::InvalidState);
@@ -2331,7 +2937,15 @@ impl OpenedPairedMachine<'_> {
             directory_revision: stream_revision.value(),
             frame_kind: stream_publish_frame_kind(stream_key.key_id)?,
         };
+        let header = &candidate.verified.sealed().inner;
+        let revision_allowed =
+            candidate.header_directory_revision <= expected_brand.directory_revision;
         if candidate.brand != expected_brand
+            || header.key_id != stream_key.key_id
+            || header.key_epoch != stream_key.epoch
+            || header.key_directory_revision != candidate.header_directory_revision
+            || header.nonce[..4] != nonce_prefix
+            || !revision_allowed
             || candidate.context.machine_route != Some(expected_brand.machine_route)
             || candidate.context.stream_route != Some(expected_brand.stream_route)
             || candidate.context.stream_generation != Some(expected_brand.stream_generation)
@@ -2340,7 +2954,7 @@ impl OpenedPairedMachine<'_> {
         {
             return Err(PairedPromotionError::Conflict);
         }
-        let installed = self
+        let mut installed = self
             .audited
             .state
             .durable_stream_bindings()?
@@ -2348,21 +2962,37 @@ impl OpenedPairedMachine<'_> {
             .filter(|state| {
                 stream_publish_brand(self.audited.identity.machine_route, state.binding())
                     .is_ok_and(|brand| brand == candidate.brand)
-            })
-            .count();
-        if installed != 1 {
+            });
+        let installed_state = installed.next().ok_or(PairedPromotionError::Conflict)?;
+        if installed.next().is_some() {
             return Err(PairedPromotionError::Conflict);
+        }
+        if candidate.header_directory_revision != expected_brand.directory_revision {
+            let (_, disposition) = installed_state
+                .admit_publish(
+                    candidate.stream_seq,
+                    candidate.counter,
+                    candidate.ciphertext_sha256,
+                )
+                .map_err(|_| PairedPromotionError::Conflict)?;
+            if disposition != StreamPublishDisposition::PendingDuplicate {
+                return Err(PairedPromotionError::Conflict);
+            }
         }
         open_sealed_payload(stream_key, &candidate.context, candidate.verified)
             .map_err(PairedPromotionError::Crypto)
     }
 
-    /// 在 replay state 之前完成 outer-correlated reply 的 canonical/header/AAD/signature 验证。
-    pub(crate) fn verify_directed_reply(
+    /// KeySync 专用 Reply verifier。当前 DeviceReplyTx raw key 在 same-epoch rewrap 中保持
+    /// 不变，但 signed header 只允许 active request 的 known R 或 requested R+1；普通
+    /// directed reply verifier 仍严格限制在当前 R，不能借此 seam 全局放宽。
+    pub(crate) fn verify_key_sync_reply(
         &self,
+        request: &KeySyncRequestV1,
         request_route: RequestRouteId,
         sealed_blob: &[u8],
     ) -> Result<VerifiedDirectedReply, PairedPromotionError> {
+        let current_revision = self.validate_active_key_sync_request(request, request_route)?;
         let reply = self
             .audited
             .opened_directory_keys
@@ -2375,12 +3005,179 @@ impl OpenedPairedMachine<'_> {
                 | OpenedPairedKeyMaterial::StreamRx { .. } => None,
             })
             .ok_or(PairedPromotionError::InvalidState)?;
+        if reply.2 != current_revision {
+            return Err(PairedPromotionError::InvalidState);
+        }
         let signed = SignedSealedBlobV1::from_wire_bytes(sealed_blob)
             .map_err(|error| PairedPromotionError::Crypto(error.into()))?;
-        let expected_revision = reply.2.value();
         if signed.inner.key_id != reply.0.key_id
             || signed.inner.key_epoch != reply.0.epoch
-            || signed.inner.key_directory_revision != expected_revision
+            || signed.inner.nonce[..4] != reply.1
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let header_revision = signed.inner.key_directory_revision;
+        let context = OuterContextV1::directed_reply(
+            self.audited.identity.machine_route,
+            self.audited.device_route,
+            request_route,
+            reply.0.epoch,
+        );
+        let counter = u64::from_be_bytes(
+            signed.inner.nonce[4..]
+                .try_into()
+                .map_err(|_| PairedPromotionError::InvalidState)?,
+        );
+        let signed_blob_hash = sha256(sealed_blob);
+        let verified = verify_sealed(signed, &self.audited.machine_data_verifying_key, &context)
+            .map_err(PairedPromotionError::Crypto)?;
+        if header_revision < current_revision.value() {
+            return Err(PairedPromotionError::Crypto(CryptoError::E2ee(
+                E2eeError::KeyRevisionRollback,
+            )));
+        }
+        if header_revision != current_revision.value()
+            && header_revision != request.requested_key_directory_revision.value()
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        Ok(VerifiedDirectedReply {
+            verified,
+            context,
+            brand: DirectedReplyBrand {
+                machine_route: self.audited.identity.machine_route,
+                device_route: self.audited.device_route,
+                key_id: reply.0.key_id,
+                key_epoch: reply.0.epoch,
+                directory_revision: header_revision,
+            },
+            replay_revision_ceiling: request.requested_key_directory_revision.value(),
+            counter,
+            signed_blob_hash,
+        })
+    }
+
+    /// 只消费 KeySync verifier 产生的 candidate；AEAD open 前再次对照 durable active ADKS、
+    /// exact request route 与 R/R+1 header，避免 verification 与 replay admission 之间漂移。
+    pub(crate) fn open_verified_key_sync_reply(
+        &self,
+        request: &KeySyncRequestV1,
+        candidate: VerifiedDirectedReply,
+    ) -> Result<SealedPayloadV1, PairedPromotionError> {
+        let request_route = candidate
+            .context
+            .request_route
+            .ok_or(PairedPromotionError::InvalidState)?;
+        let current_revision = self.validate_active_key_sync_request(request, request_route)?;
+        let reply = self
+            .audited
+            .opened_directory_keys
+            .iter()
+            .find_map(|entry| match &entry.material {
+                OpenedPairedKeyMaterial::ReplyTx { key, .. } => {
+                    Some((key, entry.key_directory_revision))
+                }
+                OpenedPairedKeyMaterial::CommandTx(_)
+                | OpenedPairedKeyMaterial::StreamRx { .. } => None,
+            })
+            .ok_or(PairedPromotionError::InvalidState)?;
+        let expected_context = OuterContextV1::directed_reply(
+            self.audited.identity.machine_route,
+            self.audited.device_route,
+            request_route,
+            reply.0.epoch,
+        );
+        let revision_allowed = candidate.brand.directory_revision == current_revision.value()
+            || candidate.brand.directory_revision
+                == request.requested_key_directory_revision.value();
+        if reply.1 != current_revision
+            || candidate.brand.machine_route != self.audited.identity.machine_route
+            || candidate.brand.device_route != self.audited.device_route
+            || candidate.brand.key_id != reply.0.key_id
+            || candidate.brand.key_epoch != reply.0.epoch
+            || !revision_allowed
+            || candidate.context != expected_context
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        open_sealed_payload(reply.0, &candidate.context, candidate.verified)
+            .map_err(PairedPromotionError::Crypto)
+    }
+
+    /// 认证 durable pending Send 并返回其原始 directory revision。连续 same-epoch rewrap
+    /// 只能保留同一 command key id/epoch/nonce domain；rotation 后的旧 pending 不得借此
+    /// seam 使用新 key scope。签名复核也避免仅凭可解析 header 放宽 reply revision。
+    fn verify_pending_directed_request_revision(
+        &self,
+        request_route: RequestRouteId,
+        sealed_blob: &[u8],
+    ) -> Result<u64, PairedPromotionError> {
+        let mut matching =
+            self.audited
+                .opened_directory_keys
+                .iter()
+                .filter_map(|entry| match &entry.material {
+                    OpenedPairedKeyMaterial::CommandTx(key) => Some(key),
+                    OpenedPairedKeyMaterial::ReplyTx { .. }
+                    | OpenedPairedKeyMaterial::StreamRx { .. } => None,
+                });
+        let command = matching.next().ok_or(PairedPromotionError::InvalidState)?;
+        if matching.next().is_some() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        let signed = SignedSealedBlobV1::from_wire_bytes(sealed_blob)
+            .map_err(|error| PairedPromotionError::Crypto(error.into()))?;
+        let request_revision = signed.inner.key_directory_revision;
+        if signed.inner.key_id != command.key_id
+            || signed.inner.key_epoch != command.epoch
+            || request_revision == 0
+            || request_revision > command.key_directory_revision
+            || signed.inner.nonce[..4] != command.nonce_prefix
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let context = OuterContextV1::uplink_send(
+            self.audited.identity.machine_route,
+            self.audited.device_route,
+            request_route,
+            command.epoch,
+        );
+        let device_verifier = self.audited.device_signing_key.verifying_key();
+        verify_sealed(signed, &device_verifier, &context).map_err(PairedPromotionError::Crypto)?;
+        Ok(request_revision)
+    }
+
+    /// 在 replay state 之前完成 outer-correlated reply 的 canonical/header/AAD/signature 验证。
+    /// daemon 可在 request revision 之后、device current revision 之前的任一 same-lineage
+    /// revision 完成 reply；更旧 rollback 与 future revision 都在 replay mutation 前拒绝。
+    pub(crate) fn verify_directed_reply(
+        &self,
+        request_route: RequestRouteId,
+        request_sealed_blob: &[u8],
+        reply_sealed_blob: &[u8],
+    ) -> Result<VerifiedDirectedReply, PairedPromotionError> {
+        let request_revision =
+            self.verify_pending_directed_request_revision(request_route, request_sealed_blob)?;
+        let reply = self
+            .audited
+            .opened_directory_keys
+            .iter()
+            .find_map(|entry| match &entry.material {
+                OpenedPairedKeyMaterial::ReplyTx { key, nonce_prefix } => {
+                    Some((key, *nonce_prefix, entry.key_directory_revision))
+                }
+                OpenedPairedKeyMaterial::CommandTx(_)
+                | OpenedPairedKeyMaterial::StreamRx { .. } => None,
+            })
+            .ok_or(PairedPromotionError::InvalidState)?;
+        let signed = SignedSealedBlobV1::from_wire_bytes(reply_sealed_blob)
+            .map_err(|error| PairedPromotionError::Crypto(error.into()))?;
+        let expected_revision = reply.2.value();
+        let header_revision = signed.inner.key_directory_revision;
+        if signed.inner.key_id != reply.0.key_id
+            || signed.inner.key_epoch != reply.0.epoch
+            || header_revision < request_revision
+            || header_revision > expected_revision
             || signed.inner.nonce[..4] != reply.1
         {
             return Err(PairedPromotionError::InvalidState);
@@ -2396,7 +3193,7 @@ impl OpenedPairedMachine<'_> {
                 .try_into()
                 .map_err(|_| PairedPromotionError::InvalidState)?,
         );
-        let signed_blob_hash = sha256(sealed_blob);
+        let signed_blob_hash = sha256(reply_sealed_blob);
         let verified = verify_sealed(signed, &self.audited.machine_data_verifying_key, &context)
             .map_err(PairedPromotionError::Crypto)?;
         Ok(VerifiedDirectedReply {
@@ -2407,8 +3204,9 @@ impl OpenedPairedMachine<'_> {
                 device_route: self.audited.device_route,
                 key_id: reply.0.key_id,
                 key_epoch: reply.0.epoch,
-                directory_revision: expected_revision,
+                directory_revision: header_revision,
             },
+            replay_revision_ceiling: expected_revision,
             counter,
             signed_blob_hash,
         })
@@ -2417,6 +3215,7 @@ impl OpenedPairedMachine<'_> {
     /// 只接受上一步产生的 verified candidate；runtime 必须先 durable admit replay tuple。
     pub(crate) fn open_verified_directed_reply(
         &self,
+        request_sealed_blob: &[u8],
         candidate: VerifiedDirectedReply,
     ) -> Result<SealedPayloadV1, PairedPromotionError> {
         let reply_key = self
@@ -2424,8 +3223,8 @@ impl OpenedPairedMachine<'_> {
             .opened_directory_keys
             .iter()
             .find_map(|entry| match &entry.material {
-                OpenedPairedKeyMaterial::ReplyTx { key, .. } => {
-                    Some((key, entry.key_directory_revision))
+                OpenedPairedKeyMaterial::ReplyTx { key, nonce_prefix } => {
+                    Some((key, *nonce_prefix, entry.key_directory_revision))
                 }
                 OpenedPairedKeyMaterial::CommandTx(_)
                 | OpenedPairedKeyMaterial::StreamRx { .. } => None,
@@ -2440,15 +3239,30 @@ impl OpenedPairedMachine<'_> {
                 .ok_or(PairedPromotionError::InvalidState)?,
             reply_key.0.epoch,
         );
+        let request_revision = self.verify_pending_directed_request_revision(
+            expected_context
+                .request_route
+                .ok_or(PairedPromotionError::InvalidState)?,
+            request_sealed_blob,
+        )?;
         let expected_brand = DirectedReplyBrand {
             machine_route: self.audited.identity.machine_route,
             device_route: self.audited.device_route,
             key_id: reply_key.0.key_id,
             key_epoch: reply_key.0.epoch,
-            directory_revision: reply_key.1.value(),
+            directory_revision: candidate.brand.directory_revision,
         };
         validate_directed_reply_brand(candidate.brand, expected_brand)?;
-        if candidate.context != expected_context {
+        let header = &candidate.verified.sealed().inner;
+        let current_revision = reply_key.2.value();
+        if (candidate.brand.directory_revision < request_revision
+            || candidate.brand.directory_revision > current_revision)
+            || header.key_id != reply_key.0.key_id
+            || header.key_epoch != reply_key.0.epoch
+            || header.key_directory_revision != candidate.brand.directory_revision
+            || header.nonce[..4] != reply_key.1
+            || candidate.context != expected_context
+        {
             return Err(PairedPromotionError::Conflict);
         }
         open_sealed_payload(reply_key.0, &candidate.context, candidate.verified)
@@ -2962,7 +3776,7 @@ impl OpenedPairedMachine<'_> {
             &state,
             state_snapshot.expose_secret(),
         )?;
-        let active_keys = audit_key_generation_state_and_stage(
+        let inventories = audit_key_generation_state_and_stage(
             &state,
             prepared_stage.as_ref(),
             state.bootstrap(),
@@ -2972,7 +3786,8 @@ impl OpenedPairedMachine<'_> {
             &self.audited.opened_directory_keys,
         )?;
         let effective_directory_revision = state.effective_directory_revision()?;
-        let opened_keys = active_keys
+        let opened_keys = inventories
+            .active
             .as_deref()
             .unwrap_or(&self.audited.opened_directory_keys);
         validate_typed_stream_state_and_stage(
@@ -2988,6 +3803,7 @@ impl OpenedPairedMachine<'_> {
             },
             &self.audited.authorization,
             opened_keys,
+            inventories.prepared.as_deref(),
         )?;
         validate_counter_guard_state(
             &self.audited.marker,
@@ -3005,7 +3821,7 @@ impl OpenedPairedMachine<'_> {
         self.audited.state = state;
         self.audited.prepared_stage = prepared_stage;
         self.audited.effective_directory_revision = effective_directory_revision;
-        if let Some(active_keys) = active_keys {
+        if let Some(active_keys) = inventories.active {
             self.audited.opened_directory_keys = active_keys;
         }
         Ok(())
@@ -3323,7 +4139,7 @@ impl<'a> PairedMachineStore<'a> {
             &device_sign_secret,
             &device_hpke_secret,
         )?;
-        if let Some(active_keys) = audit_key_generation_state_and_stage(
+        let inventories = audit_key_generation_state_and_stage(
             &state,
             prepared_stage.as_ref(),
             bootstrap,
@@ -3331,7 +4147,8 @@ impl<'a> PairedMachineStore<'a> {
             &audit.machine_data_verifying_key,
             &audit.machine_data_signer_binding,
             &audit.opened_keys,
-        )? {
+        )?;
+        if let Some(active_keys) = inventories.active {
             audit.opened_keys = active_keys;
         }
         validate_typed_stream_state_and_stage(
@@ -3347,6 +4164,7 @@ impl<'a> PairedMachineStore<'a> {
             },
             &audit.authorization,
             &audit.opened_keys,
+            inventories.prepared.as_deref(),
         )?;
         if marker.device_sign_pubkey != audit.device_signing_key.verifying_key().to_bytes()
             || marker.device_hpke_pubkey != hpke_public_bytes(&audit.device_hpke_private_key)?
@@ -3788,7 +4606,7 @@ impl<'a> PairedPromotionCoordinator<'a> {
         let prepared_stage = state_store
             .load_prepared_stage()
             .map_err(PairedPromotionError::CryptoState)?;
-        if let Some(active_keys) = audit_key_generation_state_and_stage(
+        let inventories = audit_key_generation_state_and_stage(
             &state,
             prepared_stage.as_ref(),
             bootstrap,
@@ -3796,7 +4614,8 @@ impl<'a> PairedPromotionCoordinator<'a> {
             &audit.machine_data_verifying_key,
             &audit.machine_data_signer_binding,
             &audit.opened_keys,
-        )? {
+        )?;
+        if let Some(active_keys) = inventories.active {
             audit.opened_keys = active_keys;
         }
         validate_typed_stream_state_and_stage(
@@ -3812,6 +4631,7 @@ impl<'a> PairedPromotionCoordinator<'a> {
             },
             verified.device_authorization(),
             &audit.opened_keys,
+            inventories.prepared.as_deref(),
         )?;
         validate_counter_guard_state(
             &marker,
@@ -4000,7 +4820,7 @@ fn audit_revocation_cleanup(
             device_hpke,
         )?;
         let bootstrap = state.bootstrap();
-        if let Some(active_keys) = audit_key_generation_state_and_stage(
+        let inventories = audit_key_generation_state_and_stage(
             &state,
             None,
             bootstrap,
@@ -4008,7 +4828,8 @@ fn audit_revocation_cleanup(
             &durable.machine_data_verifying_key,
             &durable.machine_data_signer_binding,
             &durable.opened_keys,
-        )? {
+        )?;
+        if let Some(active_keys) = inventories.active {
             durable.opened_keys = active_keys;
         }
         validate_typed_stream_state_and_stage(
@@ -4024,6 +4845,7 @@ fn audit_revocation_cleanup(
             },
             &durable.authorization,
             &durable.opened_keys,
+            inventories.prepared.as_deref(),
         )?;
         if durable.device_signing_key.verifying_key().to_bytes()
             != journal.active_marker.device_sign_pubkey
@@ -4726,6 +5548,175 @@ fn directed_generation_matches_active(
     }
 }
 
+/// 消费 exact transition validator 的 typed token，并在 durable mutation 前完成所有
+/// DeviceHPKE raw-key relation。normal UpdateSet 的每个 replacement 必须彼此唯一；只有
+/// shared same-epoch rewrap 与 directed rewrap 可以和同一旧 slot 的 current key 相同。
+fn validate_normal_update_raw_relations(
+    previous: &DurableKeyGenerationStateV1,
+    candidate: &DurableKeyGenerationStateV1,
+    update_set: &agentdeck_protocol::e2ee::KeyUpdateSetV1,
+    bootstrap: &PairedCryptoStateV1,
+    device_hpke_private_key: &HpkePrivateKey,
+    machine_data_verifying_key: &VerifyingKey,
+    machine_data_signer_binding: &MachineDataSignerBindingV1,
+) -> Result<(), PairedPromotionError> {
+    let metadata = validate_normal_update_transition(previous, candidate, update_set)
+        .map_err(|_| PairedPromotionError::Conflict)?;
+
+    struct ComparableKey {
+        purpose: KeyPurpose,
+        stream_route: Option<StreamRouteId>,
+        current: bool,
+        key: AeadReceivingKey,
+    }
+
+    let mut previous_keys = Vec::with_capacity(previous.slots().len());
+    for slot in previous.slots() {
+        for generation in slot.retired() {
+            let key = open_durable_generation(
+                bootstrap,
+                device_hpke_private_key,
+                machine_data_verifying_key,
+                machine_data_signer_binding,
+                generation,
+            )?;
+            previous_keys.push(ComparableKey {
+                purpose: generation.key_id().purpose,
+                stream_route: generation.stream_route(),
+                current: false,
+                key: AeadReceivingKey::new(generation.key_id(), generation.key_id().epoch, key),
+            });
+        }
+        let generation = slot.current();
+        let key = open_durable_generation(
+            bootstrap,
+            device_hpke_private_key,
+            machine_data_verifying_key,
+            machine_data_signer_binding,
+            generation,
+        )?;
+        previous_keys.push(ComparableKey {
+            purpose: generation.key_id().purpose,
+            stream_route: generation.stream_route(),
+            current: true,
+            key: AeadReceivingKey::new(generation.key_id(), generation.key_id().epoch, key),
+        });
+    }
+
+    let mut replacement_keys: Vec<ComparableKey> = Vec::with_capacity(update_set.updates.len());
+    for update in &update_set.updates {
+        let replacement = DurableKeyGenerationV1::from_update(update.clone())
+            .map_err(|_| PairedPromotionError::Conflict)?;
+        let purpose = replacement.key_id().purpose;
+        let stream_route = replacement.stream_route();
+        let allow_same_slot = match purpose {
+            KeyPurpose::Catalog | KeyPurpose::ConversationDek => {
+                let shared = metadata
+                    .shared()
+                    .iter()
+                    .find(|entry| {
+                        entry.identity().purpose() == purpose
+                            && entry.identity().stream_route() == stream_route
+                    })
+                    .ok_or(PairedPromotionError::Conflict)?;
+                if shared.replacement() != &replacement {
+                    return Err(PairedPromotionError::Conflict);
+                }
+                match shared.kind() {
+                    SharedUpdateMetadataKindV1::RewrapSameEpoch => {
+                        shared.previous_current().is_some()
+                    }
+                    SharedUpdateMetadataKindV1::RotateNextEpoch
+                    | SharedUpdateMetadataKindV1::AddConversation => false,
+                }
+            }
+            KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => {
+                let directed = metadata
+                    .directed()
+                    .iter()
+                    .find(|(_, after)| after.key_id().purpose == purpose)
+                    .ok_or(PairedPromotionError::Conflict)?;
+                if directed.1 != &replacement {
+                    return Err(PairedPromotionError::Conflict);
+                }
+                true
+            }
+        };
+        let opened = open_durable_generation(
+            bootstrap,
+            device_hpke_private_key,
+            machine_data_verifying_key,
+            machine_data_signer_binding,
+            &replacement,
+        )?;
+
+        let mut matching_previous = previous_keys
+            .iter()
+            .filter(|entry| entry.key.matches_secret(&opened));
+        let first_match = matching_previous.next();
+        let duplicate_previous = matching_previous.next().is_some();
+        if duplicate_previous
+            || first_match.is_some() != allow_same_slot
+            || allow_same_slot
+                && first_match.is_none_or(|entry| {
+                    !entry.current || entry.purpose != purpose || entry.stream_route != stream_route
+                })
+            || replacement_keys
+                .iter()
+                .any(|entry| entry.key.matches_secret(&opened))
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        replacement_keys.push(ComparableKey {
+            purpose,
+            stream_route,
+            current: true,
+            key: AeadReceivingKey::new(replacement.key_id(), replacement.key_id().epoch, opened),
+        });
+    }
+    Ok(())
+}
+
+fn rewrap_stream_bindings_for_normal_update(
+    previous: &DurableKeyGenerationStateV1,
+    candidate: &DurableKeyGenerationStateV1,
+    update_set: &agentdeck_protocol::e2ee::KeyUpdateSetV1,
+    bindings: Vec<DurableStreamBindingV1>,
+) -> Result<Vec<DurableStreamBindingV1>, PairedPromotionError> {
+    let metadata = validate_normal_update_transition(previous, candidate, update_set)
+        .map_err(|_| PairedPromotionError::Conflict)?;
+    bindings
+        .into_iter()
+        .map(|binding| {
+            let current = binding.binding();
+            let slot_route = stream_key_slot_route(current.key_id, current.stream_route)?;
+            let update = metadata
+                .shared()
+                .iter()
+                .find(|entry| {
+                    entry.identity().purpose() == current.key_id.purpose
+                        && entry.identity().stream_route() == slot_route
+                })
+                .ok_or(PairedPromotionError::Conflict)?;
+            let previous_current = update
+                .previous_current()
+                .ok_or(PairedPromotionError::Conflict)?;
+            if current.key_id != previous_current.key_id()
+                || current.key_directory_revision != previous_current.key_directory_revision()
+            {
+                return Err(PairedPromotionError::Conflict);
+            }
+            match update.kind() {
+                SharedUpdateMetadataKindV1::RewrapSameEpoch => binding
+                    .with_rewrapped_key_revision(update_set.key_directory_revision)
+                    .map_err(|_| PairedPromotionError::Conflict),
+                SharedUpdateMetadataKindV1::RotateNextEpoch => Ok(binding),
+                SharedUpdateMetadataKindV1::AddConversation => Err(PairedPromotionError::Conflict),
+            }
+        })
+        .collect()
+}
+
 /// 对 ADKG 中所有 current/staged/retired carrier 做完整 MachineDataSign + DeviceHPKE
 /// 审计；只把 current generation 铸造成 active crypto capability。V5-A 对 directed staged
 /// recovery shape 保持 fail-close；V5-B 激活前仍须同 epoch、同 raw key。
@@ -4813,6 +5804,11 @@ fn audit_key_generation_state(
     Ok(opened)
 }
 
+struct AuditedKeyGenerationInventories {
+    active: Option<Vec<OpenedPairedDirectoryKey>>,
+    prepared: Option<Vec<OpenedPairedDirectoryKey>>,
+}
+
 fn audit_key_generation_state_and_stage(
     state: &PairedCryptoState,
     prepared_stage: Option<&PreparedCryptoStateStage>,
@@ -4821,7 +5817,7 @@ fn audit_key_generation_state_and_stage(
     machine_data_verifying_key: &VerifyingKey,
     machine_data_signer_binding: &MachineDataSignerBindingV1,
     bootstrap_active: &[OpenedPairedDirectoryKey],
-) -> Result<Option<Vec<OpenedPairedDirectoryKey>>, PairedPromotionError> {
+) -> Result<AuditedKeyGenerationInventories, PairedPromotionError> {
     let active_generation = state.durable_key_generation_state()?;
     let active_keys = active_generation
         .as_ref()
@@ -4836,23 +5832,77 @@ fn audit_key_generation_state_and_stage(
             )
         })
         .transpose()?;
+    let mut prepared_keys = None;
     if let Some(prepared) = prepared_stage {
         let next = PairedCryptoState::decode(prepared.snapshot().expose_secret())?;
         let next_generation = next.durable_key_generation_state()?;
+        let active_key_sync = state.durable_key_sync_state()?;
+        let next_key_sync = next.durable_key_sync_state()?;
+        let key_sync_advanced = match (&active_key_sync, &next_key_sync) {
+            (Some(previous), Some(candidate)) => {
+                candidate.current_known_key_directory_revision()
+                    > previous.current_known_key_directory_revision()
+            }
+            (None, Some(candidate)) => {
+                candidate.current_known_key_directory_revision() > bootstrap.directory_revision
+            }
+            (Some(_), None) => return Err(PairedPromotionError::Conflict),
+            (None, None) => false,
+        };
         match (&active_generation, &next_generation) {
             (Some(previous), Some(candidate)) => {
                 if previous != candidate {
-                    validate_directed_rewrap_metadata(previous, candidate)
-                        .map_err(|_| PairedPromotionError::Conflict)?;
+                    if key_sync_advanced {
+                        let update_set = candidate
+                            .staged_normal_update_set()
+                            .map_err(|_| PairedPromotionError::Conflict)?;
+                        validate_normal_update_raw_relations(
+                            previous,
+                            candidate,
+                            &update_set,
+                            bootstrap,
+                            device_hpke_private_key,
+                            machine_data_verifying_key,
+                            machine_data_signer_binding,
+                        )?;
+                    } else {
+                        validate_directed_rewrap_metadata(previous, candidate)
+                            .map_err(|_| PairedPromotionError::Conflict)?;
+                    }
                 }
             }
-            (None, Some(_)) => {}
+            (None, Some(candidate)) => {
+                if key_sync_advanced {
+                    let directory = KeyDirectoryV1::from_canonical_bytes(&bootstrap.key_directory)
+                        .map_err(PairedPromotionError::Protocol)?;
+                    let previous =
+                        DurableKeyGenerationStateV1::from_bootstrap_directory(&directory)
+                            .map_err(|_| PairedPromotionError::Conflict)?;
+                    let update_set = candidate
+                        .staged_normal_update_set()
+                        .map_err(|_| PairedPromotionError::Conflict)?;
+                    validate_normal_update_raw_relations(
+                        &previous,
+                        candidate,
+                        &update_set,
+                        bootstrap,
+                        device_hpke_private_key,
+                        machine_data_verifying_key,
+                        machine_data_signer_binding,
+                    )?;
+                }
+            }
             (Some(_), None) => return Err(PairedPromotionError::Conflict),
-            (None, None) => return Ok(active_keys),
+            (None, None) => {
+                return Ok(AuditedKeyGenerationInventories {
+                    active: active_keys,
+                    prepared: None,
+                });
+            }
         }
         if let Some(candidate) = next_generation.as_ref() {
             let current = active_keys.as_deref().unwrap_or(bootstrap_active);
-            drop(audit_key_generation_state(
+            prepared_keys = Some(audit_key_generation_state(
                 candidate,
                 bootstrap,
                 device_hpke_private_key,
@@ -4862,7 +5912,10 @@ fn audit_key_generation_state_and_stage(
             )?);
         }
     }
-    Ok(active_keys)
+    Ok(AuditedKeyGenerationInventories {
+        active: active_keys,
+        prepared: prepared_keys,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

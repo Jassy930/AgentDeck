@@ -16,8 +16,8 @@ use super::paired_machine::{
     OpenedPairedMachine, PairedPromotionError, VerifiedRevocationTerminal,
 };
 use super::runtime::{
-    ExactRelayFrame, ReceivedRuntimeFrame, RemoteRuntime, RemoteRuntimeTransport,
-    RemoteRuntimeTransportError,
+    ExactRelayFrame, ReceivedRuntimeFrame, RemoteRuntime, RemoteRuntimeError,
+    RemoteRuntimeTransport, RemoteRuntimeTransportError,
 };
 
 #[async_trait]
@@ -99,6 +99,8 @@ pub enum PairedRuntimeConnectError {
     Relay(#[source] RelayClientError),
     #[error("paired Runtime terminal validation or cleanup failed")]
     Paired(#[source] PairedPromotionError),
+    #[error("paired Runtime durable recovery failed")]
+    Runtime(#[source] RemoteRuntimeError),
 }
 
 impl PairedRuntimeConnectError {
@@ -107,6 +109,7 @@ impl PairedRuntimeConnectError {
         match self {
             Self::Relay(error) => error.code(),
             Self::Paired(error) => error.code(),
+            Self::Runtime(error) => error.code(),
         }
     }
 }
@@ -241,7 +244,11 @@ pub async fn connect_paired_runtime<'a>(
             .map(RelayRuntimeTransport::new)
     };
     match complete_paired_runtime_connect(machine, connector).await? {
-        RelayRuntimeConnectCompletion::Connected(runtime) => {
+        RelayRuntimeConnectCompletion::Connected(mut runtime) => {
+            runtime
+                .recover_durable_key_sync()
+                .await
+                .map_err(PairedRuntimeConnectError::Runtime)?;
             Ok(PairedRuntimeConnectOutcome::Connected(Box::new(runtime)))
         }
         RelayRuntimeConnectCompletion::Revoked => Ok(PairedRuntimeConnectOutcome::Revoked),

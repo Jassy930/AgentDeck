@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use agentdeck_protocol::e2ee::{KeyId, KeyPurpose, KeyUpdateV1};
+use agentdeck_protocol::e2ee::{KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateSetV1, KeyUpdateV1};
 use agentdeck_protocol::relay_v2::{DeviceRouteId, KeyDirectoryRevision, StreamRouteId};
 use thiserror::Error;
 
@@ -44,6 +44,8 @@ pub enum KeyGenerationStateError {
     EpochRollback,
     #[error("normal UpdateSet attempted to rotate a directed device key")]
     DirectedKeyRotation,
+    #[error("normal UpdateSet does not exactly match the installed key roster and history")]
+    UpdateSetMismatch,
 }
 
 /// 一个 durable slot 的稳定身份；epoch/revision 属于 generation record，不属于 slot。
@@ -369,6 +371,31 @@ pub struct DurableKeyGenerationStateV1 {
 redacted_debug!(DurableKeyGenerationStateV1, "DurableKeyGenerationStateV1");
 
 impl DurableKeyGenerationStateV1 {
+    /// 把 pairing 时已完整验证的 immutable directory 投影为 V5 的 bootstrap current roster。
+    pub fn from_bootstrap_directory(
+        directory: &KeyDirectoryV1,
+    ) -> Result<Self, KeyGenerationStateError> {
+        directory
+            .validate()
+            .map_err(|_| KeyGenerationStateError::InvalidCanonical)?;
+        let mut slots = Vec::with_capacity(directory.entries.len());
+        for entry in &directory.entries {
+            let identity = KeySlotIdentityV1::new(entry.key_id.purpose, entry.stream_route)?;
+            slots.push(DurableKeySlotV1::new(
+                identity,
+                DurableKeyGenerationV1::from_bootstrap_entry(
+                    directory.revision,
+                    entry.key_id,
+                    entry.stream_route,
+                    entry.device_route,
+                )?,
+                None,
+                Vec::new(),
+            )?);
+        }
+        Self::new(directory.revision, directory.revision, slots)
+    }
+
     pub fn new(
         bootstrap_directory_revision: KeyDirectoryRevision,
         effective_directory_revision: KeyDirectoryRevision,
@@ -428,6 +455,43 @@ impl DurableKeyGenerationStateV1 {
         .then(|| self.find_slot(purpose, None))
         .flatten()
         .map(DurableKeySlotV1::current)
+    }
+
+    /// 重建尚未由 EpochBarrier 激活的 exact normal UpdateSet。该投影是 ADKG 与 ADKS
+    /// completion hash/KeyUpdateAck 的自包含审计桥；post-activation state 不满足此 shape。
+    pub fn staged_normal_update_set(&self) -> Result<KeyUpdateSetV1, KeyGenerationStateError> {
+        let mut updates = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            let generation = match slot.identity.purpose {
+                KeyPurpose::Catalog | KeyPurpose::ConversationDek => match &slot.staged {
+                    Some(staged) => staged,
+                    None => &slot.current,
+                },
+                KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => {
+                    if slot.staged.is_some() {
+                        return Err(KeyGenerationStateError::UpdateSetMismatch);
+                    }
+                    &slot.current
+                }
+            };
+            if generation.key_directory_revision != self.effective_directory_revision {
+                return Err(KeyGenerationStateError::UpdateSetMismatch);
+            }
+            updates.push(
+                generation
+                    .canonical_key_update()
+                    .cloned()
+                    .ok_or(KeyGenerationStateError::UpdateSetMismatch)?,
+            );
+        }
+        let set = KeyUpdateSetV1 {
+            key_directory_revision: self.effective_directory_revision,
+            device_route: self.device_route(),
+            updates,
+        };
+        set.validate()
+            .map_err(|_| KeyGenerationStateError::UpdateSetMismatch)?;
+        Ok(set)
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, KeyGenerationStateError> {
@@ -619,6 +683,82 @@ impl DurableKeyGenerationStateV1 {
 pub type ValidatedDirectedRewrapMetadataV1<'a> =
     [(&'a DurableKeyGenerationV1, &'a DurableKeyGenerationV1); 2];
 
+/// normal UpdateSet 中一项 shared-key metadata transition。
+///
+/// 这里只分类 epoch/roster/carrier shape，不宣称已经比较 DeviceHPKE 解封后的 raw key：
+/// production installer 必须对 `RewrapSameEpoch` 证明 raw key 相同，对
+/// `RotateNextEpoch` 证明 raw key 不同；`AddConversation` 还必须纳入全 inventory 的
+/// raw-key uniqueness 检查。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedUpdateMetadataKindV1 {
+    /// 同 epoch 的新 revision carrier；installer 还须在同一 ADPS CAS 中只推进对应
+    /// durable stream binding 的 directory revision，其他 binding/replay/cursor 字节不变。
+    RewrapSameEpoch,
+    /// exact `current + 1` rotation；旧 binding 保持 current，等待 V5-C barrier 激活。
+    RotateNextEpoch,
+    /// previous ADKG roster 中不存在的唯一 conversation slot，且初始 epoch 固定为 1。
+    AddConversation,
+}
+
+/// 已通过 roster/epoch/carrier 校验、仍等待 raw-key relation 校验的一项 shared update。
+pub struct ValidatedSharedUpdateMetadataV1<'a> {
+    identity: KeySlotIdentityV1,
+    previous_current: Option<&'a DurableKeyGenerationV1>,
+    replacement: &'a DurableKeyGenerationV1,
+    kind: SharedUpdateMetadataKindV1,
+}
+
+redacted_debug!(
+    ValidatedSharedUpdateMetadataV1<'_>,
+    "ValidatedSharedUpdateMetadataV1"
+);
+
+impl<'a> ValidatedSharedUpdateMetadataV1<'a> {
+    #[must_use]
+    pub const fn identity(&self) -> KeySlotIdentityV1 {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn previous_current(&self) -> Option<&'a DurableKeyGenerationV1> {
+        self.previous_current
+    }
+
+    #[must_use]
+    pub const fn replacement(&self) -> &'a DurableKeyGenerationV1 {
+        self.replacement
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> SharedUpdateMetadataKindV1 {
+        self.kind
+    }
+}
+
+/// exact roster validator 的 typed 输出。持有 candidate 内的 generation references，迫使
+/// 上层在 durable install 前完成 shared/directed raw-key equality 或 inequality 校验。
+pub struct ValidatedNormalUpdateMetadataV1<'a> {
+    shared: Vec<ValidatedSharedUpdateMetadataV1<'a>>,
+    directed: ValidatedDirectedRewrapMetadataV1<'a>,
+}
+
+redacted_debug!(
+    ValidatedNormalUpdateMetadataV1<'_>,
+    "ValidatedNormalUpdateMetadataV1"
+);
+
+impl<'a> ValidatedNormalUpdateMetadataV1<'a> {
+    #[must_use]
+    pub fn shared(&self) -> &[ValidatedSharedUpdateMetadataV1<'a>] {
+        &self.shared
+    }
+
+    #[must_use]
+    pub const fn directed(&self) -> &ValidatedDirectedRewrapMetadataV1<'a> {
+        &self.directed
+    }
+}
+
 /// V5-A 只校验 normal UpdateSet 的 directed-key 不变量；shared roster exact 对账与
 /// activation/recovery 留给 V5-B production installer。返回值迫使上层解封比较 raw key。
 pub fn validate_directed_rewrap_metadata<'a>(
@@ -669,6 +809,180 @@ pub fn validate_directed_rewrap_metadata<'a>(
         compare(KeyPurpose::DeviceCommandTx)?,
         compare(KeyPurpose::DeviceReplyTx)?,
     ])
+}
+
+/// 校验 normal `UpdateSet` 生成的 exact transition；调用方不能借 candidate 增删 slot、
+/// 替换同 revision carrier、删除 retired history 或提前激活 shared key。
+pub fn validate_normal_update_transition<'a>(
+    previous: &'a DurableKeyGenerationStateV1,
+    candidate: &'a DurableKeyGenerationStateV1,
+    update_set: &KeyUpdateSetV1,
+) -> Result<ValidatedNormalUpdateMetadataV1<'a>, KeyGenerationStateError> {
+    previous.validate()?;
+    candidate.validate()?;
+    update_set
+        .validate()
+        .map_err(|_| KeyGenerationStateError::UpdateSetMismatch)?;
+    let expected_revision = previous
+        .effective_directory_revision
+        .next()
+        .map_err(|_| KeyGenerationStateError::RevisionRollback)?;
+    if update_set.key_directory_revision != expected_revision
+        || update_set.device_route != previous.device_route()
+        || candidate.bootstrap_directory_revision != previous.bootstrap_directory_revision
+        || candidate.effective_directory_revision != update_set.key_directory_revision
+        || candidate.device_route() != previous.device_route()
+        || !matches!(
+            update_set.updates.len().checked_sub(previous.slots.len()),
+            Some(0 | 1)
+        )
+        || candidate.slots.len() != update_set.updates.len()
+    {
+        return Err(KeyGenerationStateError::UpdateSetMismatch);
+    }
+
+    let mut matched_previous = 0_usize;
+    let mut additions = 0_usize;
+    let mut shared = Vec::with_capacity(candidate.slots.len().saturating_sub(2));
+    for (after, update) in candidate.slots.iter().zip(&update_set.updates) {
+        let replacement = DurableKeyGenerationV1::from_update(update.clone())?;
+        if after.identity != replacement.identity() {
+            return Err(KeyGenerationStateError::UpdateSetMismatch);
+        }
+        let Some(before) = previous.find_slot(replacement.key_id.purpose, replacement.stream_route)
+        else {
+            additions += 1;
+            if additions != 1
+                || replacement.key_id.purpose != KeyPurpose::ConversationDek
+                || replacement.key_id.epoch != 1
+                || after.current != replacement
+                || after.staged.is_some()
+                || !after.retired.is_empty()
+            {
+                return Err(KeyGenerationStateError::UpdateSetMismatch);
+            }
+            shared.push(ValidatedSharedUpdateMetadataV1 {
+                identity: after.identity,
+                previous_current: None,
+                replacement: &after.current,
+                kind: SharedUpdateMetadataKindV1::AddConversation,
+            });
+            continue;
+        };
+        matched_previous += 1;
+        if before.staged.is_some() || before.retired != after.retired {
+            return Err(KeyGenerationStateError::UpdateSetMismatch);
+        }
+        match before.identity.purpose {
+            KeyPurpose::Catalog | KeyPurpose::ConversationDek => {
+                let next_epoch = before
+                    .current
+                    .key_id
+                    .epoch
+                    .checked_add(1)
+                    .ok_or(KeyGenerationStateError::EpochRollback)?;
+                let rewrap = replacement.key_id.epoch == before.current.key_id.epoch
+                    && after.current == replacement
+                    && after.staged.is_none();
+                let rotation = replacement.key_id.epoch == next_epoch
+                    && after.current == before.current
+                    && after.staged.as_ref() == Some(&replacement);
+                if !rewrap && !rotation {
+                    return Err(KeyGenerationStateError::UpdateSetMismatch);
+                }
+                let (replacement, kind) = if rewrap {
+                    (&after.current, SharedUpdateMetadataKindV1::RewrapSameEpoch)
+                } else {
+                    (
+                        after
+                            .staged
+                            .as_ref()
+                            .ok_or(KeyGenerationStateError::UpdateSetMismatch)?,
+                        SharedUpdateMetadataKindV1::RotateNextEpoch,
+                    )
+                };
+                shared.push(ValidatedSharedUpdateMetadataV1 {
+                    identity: before.identity,
+                    previous_current: Some(&before.current),
+                    replacement,
+                    kind,
+                });
+            }
+            KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => {
+                if after.current != replacement
+                    || after.staged.is_some()
+                    || replacement.key_id.epoch != before.current.key_id.epoch
+                {
+                    return Err(KeyGenerationStateError::DirectedKeyRotation);
+                }
+            }
+        }
+    }
+    if matched_previous != previous.slots.len() {
+        return Err(KeyGenerationStateError::UpdateSetMismatch);
+    }
+    let directed = validate_directed_rewrap_metadata(previous, candidate)?;
+    Ok(ValidatedNormalUpdateMetadataV1 { shared, directed })
+}
+
+/// 从完整 normal `UpdateSet` 构造唯一 metadata candidate：shared same-epoch carrier 替换
+/// current、shared next-epoch carrier 进入 staged，directed key 只做同 epoch rewrap；slot
+/// roster 与 retired chain 逐项继承，只允许新增一个 epoch-1 conversation。
+///
+/// 本函数没有 HPKE private capability，不能判定 raw-key relation；调用方仍必须消费
+/// [`validate_normal_update_transition`] 返回的 typed metadata 并完成 raw-key 校验。
+pub fn stage_normal_update_set(
+    previous: &DurableKeyGenerationStateV1,
+    update_set: &KeyUpdateSetV1,
+) -> Result<DurableKeyGenerationStateV1, KeyGenerationStateError> {
+    previous.validate()?;
+    update_set
+        .validate()
+        .map_err(|_| KeyGenerationStateError::UpdateSetMismatch)?;
+    if !matches!(
+        update_set.updates.len().checked_sub(previous.slots.len()),
+        Some(0 | 1)
+    ) {
+        return Err(KeyGenerationStateError::UpdateSetMismatch);
+    }
+    let mut slots = Vec::with_capacity(update_set.updates.len());
+    for update in &update_set.updates {
+        let replacement = DurableKeyGenerationV1::from_update(update.clone())?;
+        let Some(before) = previous.find_slot(replacement.key_id.purpose, replacement.stream_route)
+        else {
+            slots.push(DurableKeySlotV1::new(
+                replacement.identity(),
+                replacement,
+                None,
+                Vec::new(),
+            )?);
+            continue;
+        };
+        let (current, staged) = match before.identity.purpose {
+            KeyPurpose::Catalog | KeyPurpose::ConversationDek
+                if replacement.key_id.epoch == before.current.key_id.epoch =>
+            {
+                (replacement, None)
+            }
+            KeyPurpose::Catalog | KeyPurpose::ConversationDek => {
+                (before.current.clone(), Some(replacement))
+            }
+            KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => (replacement, None),
+        };
+        slots.push(DurableKeySlotV1::new(
+            before.identity,
+            current,
+            staged,
+            before.retired.clone(),
+        )?);
+    }
+    let candidate = DurableKeyGenerationStateV1::new(
+        previous.bootstrap_directory_revision,
+        update_set.key_directory_revision,
+        slots,
+    )?;
+    validate_normal_update_transition(previous, &candidate, update_set)?;
+    Ok(candidate)
 }
 
 fn validate_generation_advance(
@@ -891,6 +1205,7 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentdeck_protocol::e2ee::KeyUpdateSetV1;
     use agentdeck_protocol::relay_v2::auth::Ed25519Signature;
 
     fn update(
@@ -959,6 +1274,59 @@ mod tests {
             ],
         )
         .expect("valid state")
+    }
+
+    fn normal_update_fixture() -> (DurableKeyGenerationStateV1, KeyUpdateSetV1) {
+        let conversation_route = StreamRouteId::from_bytes([7; 16]);
+        let retained_slot = |purpose, route, current_epoch, seed| {
+            DurableKeySlotV1::new(
+                KeySlotIdentityV1::new(purpose, route).expect("valid retained identity"),
+                generation(purpose, route, 4, current_epoch, seed),
+                None,
+                vec![
+                    DurableKeyGenerationV1::from_bootstrap_entry(
+                        KeyDirectoryRevision::new(1),
+                        KeyId {
+                            purpose,
+                            epoch: current_epoch - 1,
+                        },
+                        route,
+                        DeviceRouteId::from_bytes([9; 16]),
+                    )
+                    .expect("retained bootstrap generation"),
+                ],
+            )
+            .expect("valid retained slot")
+        };
+        let previous = DurableKeyGenerationStateV1::new(
+            KeyDirectoryRevision::new(1),
+            KeyDirectoryRevision::new(4),
+            vec![
+                retained_slot(KeyPurpose::Catalog, None, 2, 11),
+                retained_slot(KeyPurpose::ConversationDek, Some(conversation_route), 9, 21),
+                retained_slot(KeyPurpose::DeviceCommandTx, None, 5, 31),
+                retained_slot(KeyPurpose::DeviceReplyTx, None, 6, 41),
+            ],
+        )
+        .expect("normal-update previous state");
+        let set = KeyUpdateSetV1 {
+            key_directory_revision: KeyDirectoryRevision::new(5),
+            device_route: DeviceRouteId::from_bytes([9; 16]),
+            updates: vec![
+                update(KeyPurpose::Catalog, None, 5, 3, 51),
+                update(
+                    KeyPurpose::ConversationDek,
+                    Some(conversation_route),
+                    5,
+                    10,
+                    52,
+                ),
+                update(KeyPurpose::DeviceCommandTx, None, 5, 5, 53),
+                update(KeyPurpose::DeviceReplyTx, None, 5, 6, 54),
+            ],
+        };
+        set.validate().expect("normal UpdateSet fixture");
+        (previous, set)
     }
 
     #[test]
@@ -1145,6 +1513,337 @@ mod tests {
             validate_directed_rewrap_metadata(&previous, &staged).unwrap_err(),
             KeyGenerationStateError::DirectedKeyRotation
         );
+    }
+
+    #[test]
+    fn normal_update_set_builds_exact_candidate_and_preserves_retired_history() {
+        let (previous, set) = normal_update_fixture();
+        let candidate = stage_normal_update_set(&previous, &set).expect("stage exact UpdateSet");
+        let checked = validate_normal_update_transition(&previous, &candidate, &set)
+            .expect("candidate is the exact normal transition");
+        assert_eq!(checked.shared().len(), 2);
+        assert!(checked.shared().iter().all(|update| {
+            update.kind() == SharedUpdateMetadataKindV1::RotateNextEpoch
+                && update.previous_current().is_some()
+                && update.replacement().key_id().epoch
+                    == update
+                        .previous_current()
+                        .expect("existing shared slot")
+                        .key_id()
+                        .epoch
+                        + 1
+        }));
+        assert_eq!(checked.directed().len(), 2);
+        assert_ne!(
+            checked.shared()[0]
+                .previous_current()
+                .expect("rotated catalog")
+                .canonical_key_update_bytes(),
+            checked.shared()[0]
+                .replacement()
+                .canonical_key_update_bytes(),
+            "metadata only classifies rotation; installer must additionally prove opened raw keys differ"
+        );
+        assert_eq!(
+            candidate
+                .staged_normal_update_set()
+                .expect("rebuild exact staged UpdateSet"),
+            set
+        );
+
+        assert_eq!(candidate.effective_directory_revision().value(), 5);
+        assert_eq!(candidate.slots().len(), previous.slots().len());
+        for (before, after) in previous.slots().iter().zip(candidate.slots()) {
+            assert_eq!(after.identity(), before.identity());
+            assert_eq!(after.retired(), before.retired());
+            match before.identity().purpose() {
+                KeyPurpose::Catalog | KeyPurpose::ConversationDek => {
+                    assert_eq!(after.current(), before.current());
+                    assert_eq!(
+                        after
+                            .staged()
+                            .and_then(DurableKeyGenerationV1::canonical_key_update),
+                        set.updates.iter().find(|update| {
+                            update.key_id.purpose == before.identity().purpose()
+                                && update.stream_route == before.identity().stream_route()
+                        })
+                    );
+                }
+                KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => {
+                    assert!(after.staged().is_none());
+                    assert_eq!(
+                        after.current().canonical_key_update(),
+                        set.updates.iter().find(|update| {
+                            update.key_id.purpose == before.identity().purpose()
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normal_update_set_accepts_one_epoch_one_conversation_and_same_epoch_rewrap_metadata() {
+        let (previous, mut set) = normal_update_fixture();
+        set.updates[0] = update(KeyPurpose::Catalog, None, 5, 2, 71);
+        set.updates[1] = update(
+            KeyPurpose::ConversationDek,
+            Some(StreamRouteId::from_bytes([7; 16])),
+            5,
+            9,
+            72,
+        );
+        set.updates.insert(
+            2,
+            update(
+                KeyPurpose::ConversationDek,
+                Some(StreamRouteId::from_bytes([8; 16])),
+                5,
+                1,
+                73,
+            ),
+        );
+        set.validate().expect("single-add UpdateSet is canonical");
+
+        let candidate = stage_normal_update_set(&previous, &set)
+            .expect("one epoch-1 conversation add is metadata-valid");
+        let checked = validate_normal_update_transition(&previous, &candidate, &set)
+            .expect("single-add candidate matches the previous ADKG roster");
+        assert_eq!(candidate.slots().len(), previous.slots().len() + 1);
+        assert_eq!(
+            candidate
+                .staged_normal_update_set()
+                .expect("single-add state reconstructs exact set"),
+            set
+        );
+
+        let rewraps = checked
+            .shared()
+            .iter()
+            .filter(|update| update.kind() == SharedUpdateMetadataKindV1::RewrapSameEpoch)
+            .collect::<Vec<_>>();
+        assert_eq!(rewraps.len(), 2);
+        for update in rewraps {
+            let previous_current = update.previous_current().expect("rewrap has previous slot");
+            assert_eq!(
+                previous_current.key_id().epoch,
+                update.replacement().key_id().epoch
+            );
+            assert_ne!(
+                previous_current.canonical_key_update_bytes(),
+                update.replacement().canonical_key_update_bytes(),
+                "different HPKE carriers are allowed; installer must prove the opened raw keys are equal"
+            );
+        }
+        let additions = checked
+            .shared()
+            .iter()
+            .filter(|update| update.kind() == SharedUpdateMetadataKindV1::AddConversation)
+            .collect::<Vec<_>>();
+        assert_eq!(additions.len(), 1);
+        assert!(additions[0].previous_current().is_none());
+        assert_eq!(
+            additions[0].identity().purpose(),
+            KeyPurpose::ConversationDek
+        );
+        assert_eq!(additions[0].replacement().key_id().epoch, 1);
+        assert!(
+            candidate
+                .find_slot(
+                    KeyPurpose::ConversationDek,
+                    Some(StreamRouteId::from_bytes([8; 16]))
+                )
+                .is_some_and(|slot| slot.staged().is_none()
+                    && slot.retired().is_empty()
+                    && slot.current().key_id().epoch == 1)
+        );
+    }
+
+    #[test]
+    fn normal_update_set_classifies_mixed_shared_rewrap_and_rotation() {
+        let (previous, mut set) = normal_update_fixture();
+        set.updates[0] = update(KeyPurpose::Catalog, None, 5, 2, 81);
+        set.validate().expect("mixed shared UpdateSet is canonical");
+
+        let candidate = stage_normal_update_set(&previous, &set)
+            .expect("mixed rewrap and rotation is metadata-valid");
+        let checked = validate_normal_update_transition(&previous, &candidate, &set)
+            .expect("mixed shared transition matches exact previous roster");
+        assert_eq!(
+            checked
+                .shared()
+                .iter()
+                .map(ValidatedSharedUpdateMetadataV1::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                SharedUpdateMetadataKindV1::RewrapSameEpoch,
+                SharedUpdateMetadataKindV1::RotateNextEpoch,
+            ]
+        );
+        let catalog = candidate
+            .find_slot(KeyPurpose::Catalog, None)
+            .expect("catalog slot");
+        assert!(catalog.staged().is_none());
+        assert_eq!(catalog.current().key_id().epoch, 2);
+        let conversation = candidate
+            .find_slot(
+                KeyPurpose::ConversationDek,
+                Some(StreamRouteId::from_bytes([7; 16])),
+            )
+            .expect("conversation slot");
+        assert_eq!(conversation.current().key_id().epoch, 9);
+        assert_eq!(
+            conversation.staged().map(DurableKeyGenerationV1::key_id),
+            Some(KeyId {
+                purpose: KeyPurpose::ConversationDek,
+                epoch: 10,
+            })
+        );
+        assert_eq!(
+            candidate
+                .staged_normal_update_set()
+                .expect("mixed state reconstructs exact set"),
+            set
+        );
+    }
+
+    #[test]
+    fn normal_update_set_allows_revision_only_shared_rewrap_metadata() {
+        let (previous, mut set) = normal_update_fixture();
+        set.updates[0] = update(KeyPurpose::Catalog, None, 5, 2, 91);
+        set.updates[1] = update(
+            KeyPurpose::ConversationDek,
+            Some(StreamRouteId::from_bytes([7; 16])),
+            5,
+            9,
+            92,
+        );
+        set.validate()
+            .expect("revision-only shared rewrap set is canonical");
+
+        let candidate = stage_normal_update_set(&previous, &set)
+            .expect("all shared slots may receive a same-epoch carrier rewrap");
+        let checked = validate_normal_update_transition(&previous, &candidate, &set)
+            .expect("revision-only rewrap preserves the exact roster");
+        assert!(checked.shared().iter().all(|update| {
+            update.kind() == SharedUpdateMetadataKindV1::RewrapSameEpoch
+                && update.previous_current().is_some()
+        }));
+        assert_eq!(
+            candidate
+                .staged_normal_update_set()
+                .expect("rewrapped state reconstructs the exact set"),
+            set
+        );
+    }
+
+    #[test]
+    fn normal_update_set_rejects_drop_replace_multi_add_revision_epoch_and_history_drift() {
+        let (previous, set) = normal_update_fixture();
+
+        let mut dropped = set.clone();
+        dropped.updates.remove(1);
+        assert!(stage_normal_update_set(&previous, &dropped).is_err());
+
+        let mut wrong_initial_epoch = set.clone();
+        wrong_initial_epoch.updates.insert(
+            2,
+            update(
+                KeyPurpose::ConversationDek,
+                Some(StreamRouteId::from_bytes([8; 16])),
+                5,
+                2,
+                61,
+            ),
+        );
+        assert!(stage_normal_update_set(&previous, &wrong_initial_epoch).is_err());
+
+        let mut replaced = set.clone();
+        replaced.updates.remove(1);
+        replaced.updates.insert(
+            1,
+            update(
+                KeyPurpose::ConversationDek,
+                Some(StreamRouteId::from_bytes([6; 16])),
+                5,
+                1,
+                62,
+            ),
+        );
+        replaced
+            .validate()
+            .expect("drop-A/add-B set is wire-canonical");
+        assert!(stage_normal_update_set(&previous, &replaced).is_err());
+
+        let mut multi_add = set.clone();
+        multi_add.updates.insert(
+            2,
+            update(
+                KeyPurpose::ConversationDek,
+                Some(StreamRouteId::from_bytes([8; 16])),
+                5,
+                1,
+                63,
+            ),
+        );
+        multi_add.updates.insert(
+            3,
+            update(
+                KeyPurpose::ConversationDek,
+                Some(StreamRouteId::from_bytes([9; 16])),
+                5,
+                1,
+                64,
+            ),
+        );
+        multi_add
+            .validate()
+            .expect("multi-add set is wire-canonical");
+        assert!(stage_normal_update_set(&previous, &multi_add).is_err());
+
+        let same_revision = KeyUpdateSetV1 {
+            key_directory_revision: KeyDirectoryRevision::new(4),
+            device_route: set.device_route,
+            updates: set
+                .updates
+                .iter()
+                .cloned()
+                .map(|mut update| {
+                    update.key_directory_revision = KeyDirectoryRevision::new(4);
+                    update
+                })
+                .collect(),
+        };
+        assert!(stage_normal_update_set(&previous, &same_revision).is_err());
+
+        let mut shared_epoch_gap = set.clone();
+        shared_epoch_gap.updates[0].key_id.epoch = 4;
+        assert!(stage_normal_update_set(&previous, &shared_epoch_gap).is_err());
+
+        let mut directed_rotation = set.clone();
+        directed_rotation.updates[2].key_id.epoch = 6;
+        assert!(stage_normal_update_set(&previous, &directed_rotation).is_err());
+
+        let candidate = stage_normal_update_set(&previous, &set).expect("valid candidate");
+        let mut slots = candidate.slots().to_vec();
+        let catalog = slots.remove(0);
+        slots.insert(
+            0,
+            DurableKeySlotV1::new(
+                catalog.identity(),
+                catalog.current().clone(),
+                catalog.staged().cloned(),
+                Vec::new(),
+            )
+            .expect("structurally valid history deletion"),
+        );
+        let deleted_history = DurableKeyGenerationStateV1::new(
+            candidate.bootstrap_directory_revision(),
+            candidate.effective_directory_revision(),
+            slots,
+        )
+        .expect("candidate with deleted retained carrier");
+        assert!(validate_normal_update_transition(&previous, &deleted_history, &set).is_err());
     }
 
     #[test]

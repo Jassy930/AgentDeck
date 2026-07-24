@@ -14,19 +14,19 @@ use agentdeck_crypto::rand_core::{CryptoRng, TryCryptoRng, TryRng};
 use agentdeck_crypto::{CryptoError, sha256};
 use agentdeck_protocol::ActionDecision;
 use agentdeck_protocol::e2ee::{
-    E2eeError, KeyControlV1, REMOTE_CRYPTO_BAD_CIPHERTEXT, REMOTE_CRYPTO_BAD_SENDER_SIGNATURE,
-    REMOTE_CRYPTO_COUNTER_REPLAY, REMOTE_CRYPTO_KEY_EPOCH_MISSING,
-    REMOTE_CRYPTO_KEY_REVISION_ROLLBACK, REMOTE_CRYPTO_NONCE_REUSE, SealedPayloadKind,
-    SealedPayloadV1, StreamBindingV1,
+    DirectoryCurrentV1, E2eeError, KeyControlV1, KeyUpdateAckV1, REMOTE_CRYPTO_BAD_CIPHERTEXT,
+    REMOTE_CRYPTO_BAD_SENDER_SIGNATURE, REMOTE_CRYPTO_COUNTER_REPLAY,
+    REMOTE_CRYPTO_KEY_EPOCH_MISSING, REMOTE_CRYPTO_KEY_REVISION_ROLLBACK,
+    REMOTE_CRYPTO_NONCE_REUSE, SealedPayloadKind, SealedPayloadV1, StreamBindingV1,
 };
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, Ack as RelayAck, SealedBlob, Send as RelaySend, Subscribe as RelaySubscribe,
     Unsubscribe as RelayUnsubscribe,
 };
 use agentdeck_protocol::relay_v2::{
-    CodecError, GrantSerial as RelayGrantSerial, MAX_FRAME_BYTES, OpaqueRouteFrame,
-    RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId, StreamGenerationId, StreamRouteId,
-    decode, encode,
+    CodecError, DeviceRouteId, GrantSerial as RelayGrantSerial, KeyDirectoryRevision,
+    MAX_FRAME_BYTES, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId,
+    StreamGenerationId, StreamRouteId, decode, encode,
 };
 use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::identity::{
@@ -48,7 +48,8 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use super::key_sync::{
-    DurableKeySyncStateV1, FrozenKeySyncSendV1, KeySyncError, SignedHigherRevisionObservationV1,
+    DurableKeySyncStateV1, FrozenKeySyncSendV1, KeySyncCoordinationStatus, KeySyncError,
+    SignedHigherRevisionObservationV1,
 };
 use super::paired_machine::{
     AuthorizedRuntimeRequest, OpaqueRuntimeState, OpenedPairedMachine, PairedPromotionError,
@@ -68,6 +69,10 @@ const REPLAY_MAGIC: &[u8; 4] = b"ADRW";
 const REPLAY_VERSION: u16 = 1;
 const MAX_REPLAY_WINDOWS: usize = 4_096;
 const MAX_REPLAY_ENTRIES: usize = 4_096;
+const MAX_PENDING_KEY_UPDATE_ACK_ROUTES: usize = 8;
+const MAX_PENDING_KEY_SYNC_ROUTES: usize = 8;
+const MAX_PENDING_KEY_SYNC_ACCEPTANCES_PER_ROUTE: usize = 8;
+const KEY_SYNC_RECOVERY_ACK_TIMEOUT_MS: u64 = 5_000;
 const CATALOG_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteCatalogIntentV1\0";
 const INTENT_DOMAIN: &[u8] = b"AgentDeck/RemotePromptIntentV1\0";
 const RESOLVE_APPROVAL_INTENT_DOMAIN: &[u8] = b"AgentDeck/RemoteResolveApprovalIntentV1\0";
@@ -237,6 +242,16 @@ pub enum RemoteStreamFrameOutcome {
     /// authenticated key-control response 完成安装状态机。
     KeySyncRouteAccepted {
         attempt: u8,
+    },
+    /// Device 已完整安装并 durable readback exact UpdateSet，且先发送了绑定该安装的 ACK。
+    /// `next_attempt` 仅表示更高目标 revision 仍需 bounded probe；它不是 daemon ACK。
+    KeyUpdateInstalled {
+        key_directory_revision: u64,
+        next_attempt: Option<u8>,
+    },
+    /// Relay 只确认 KeyUpdateAck `Send` 进入有界 writer；durable ACK basis 不会因此清除。
+    KeyUpdateAckRouteAccepted {
+        key_directory_revision: u64,
     },
 }
 
@@ -420,9 +435,30 @@ impl RemoteRuntimeError {
 /// 持有同一 machine 独占 lease 的 remote Runtime command 编排器。
 ///
 /// 字段声明顺序是 drop 顺序：先关闭 transport，再最后释放 machine lease/capability。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingKeySyncRoute {
+    attempt: u8,
+    outstanding_acceptances: usize,
+}
+
+fn request_route_is_owned(
+    request_route: RequestRouteId,
+    pending_key_update_ack_routes: &HashMap<RequestRouteId, KeyDirectoryRevision>,
+    pending_key_sync_routes: &HashMap<RequestRouteId, PendingKeySyncRoute>,
+    active_key_sync_route: Option<RequestRouteId>,
+    pending_exchange_route: Option<RequestRouteId>,
+) -> bool {
+    pending_key_update_ack_routes.contains_key(&request_route)
+        || pending_key_sync_routes.contains_key(&request_route)
+        || active_key_sync_route == Some(request_route)
+        || pending_exchange_route == Some(request_route)
+}
+
 pub struct RemoteRuntime<'a, T> {
     transport: T,
     machine: OpenedPairedMachine<'a>,
+    pending_key_update_ack_routes: HashMap<RequestRouteId, KeyDirectoryRevision>,
+    pending_key_sync_routes: HashMap<RequestRouteId, PendingKeySyncRoute>,
 }
 
 impl<'a, T> RemoteRuntime<'a, T>
@@ -430,8 +466,13 @@ where
     T: RemoteRuntimeTransport,
 {
     #[must_use]
-    pub const fn new(machine: OpenedPairedMachine<'a>, transport: T) -> Self {
-        Self { transport, machine }
+    pub fn new(machine: OpenedPairedMachine<'a>, transport: T) -> Self {
+        Self {
+            transport,
+            machine,
+            pending_key_update_ack_routes: HashMap::new(),
+            pending_key_sync_routes: HashMap::new(),
+        }
     }
 
     async fn recv_with_transfer_deadline(
@@ -558,6 +599,7 @@ where
             };
 
         self.reject_quarantined_current_reply_scope()?;
+        let pending_send = decode_pending_send(&pending, self.machine.device_route())?;
         self.transport
             .send(ExactRelayFrame::from_frozen(pending.exact_send.clone())?)
             .await?;
@@ -579,18 +621,23 @@ where
             let reply_frame_hash = sha256(received.canonical_bytes());
             let frame = received.frame();
             match &frame.body {
-                RelayFrameBody::RouteAccepted(accepted) => match accepted.accepted {
-                    AcceptedRef::Request { request_route }
-                        if request_route == pending.request_route =>
-                    {
+                RelayFrameBody::RouteAccepted(accepted) => {
+                    let AcceptedRef::Request { request_route } = accepted.accepted else {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "RouteAccepted does not match the pending subscription",
+                        ));
+                    };
+                    if request_route == pending.request_route {
                         route_accepted = true;
-                    }
-                    _ => {
+                    } else if self
+                        .consume_key_control_route_accepted(request_route)
+                        .is_none()
+                    {
                         return Err(RemoteRuntimeError::InvalidReply(
                             "RouteAccepted does not match the pending subscription",
                         ));
                     }
-                },
+                }
                 RelayFrameBody::Reply(reply) => {
                     if reply.device_route != self.machine.device_route()
                         || reply.request_route != pending.request_route
@@ -599,15 +646,19 @@ where
                             "subscription Reply outer route does not match the pending request",
                         ));
                     }
-                    let candidate = self
-                        .machine
-                        .verify_directed_reply(pending.request_route, &reply.sealed_blob.0)?;
+                    let candidate = self.machine.verify_directed_reply(
+                        pending.request_route,
+                        &pending_send.sealed_blob.0,
+                        &reply.sealed_blob.0,
+                    )?;
                     let signed_blob_hash = candidate.signed_blob_hash();
                     self.admit_reply_replay(&candidate)?;
                     if processed_signed_blobs.contains(&signed_blob_hash) {
                         continue;
                     }
-                    let opened = self.machine.open_verified_directed_reply(candidate)?;
+                    let opened = self
+                        .machine
+                        .open_verified_directed_reply(&pending_send.sealed_blob.0, candidate)?;
 
                     if opened.payload_kind == SealedPayloadKind::KeyUpdate {
                         if !active_reply_transfers.is_empty() {
@@ -766,9 +817,11 @@ where
                 }
                 let candidate = self.machine.verify_stream_publish(&durable, &publish)?;
                 let candidate = match candidate {
-                    VerifiedStreamPublish::Current(candidate) => candidate,
+                    VerifiedStreamPublish::Current(candidate) => *candidate,
                     VerifiedStreamPublish::Higher(candidate) => {
-                        return self.coordinate_key_sync(candidate.into_observation()).await;
+                        return self
+                            .coordinate_key_sync((*candidate).into_observation())
+                            .await;
                     }
                 };
                 let stream_seq = candidate.stream_seq();
@@ -888,32 +941,522 @@ where
                     current_cursor: complete.current_cursor,
                 })
             }
+            RelayFrameBody::Reply(reply) => self.handle_key_sync_reply(reply).await,
             RelayFrameBody::RouteAccepted(accepted) => {
                 let AcceptedRef::Request { request_route } = accepted.accepted else {
                     return Err(RemoteRuntimeError::InvalidReply(
                         "KeySync RouteAccepted must reference its request route",
                     ));
                 };
-                let state = self
-                    .machine
-                    .durable_key_sync_state()?
-                    .ok_or(RemoteRuntimeError::InvalidDurableState)?;
-                let active = state
-                    .active_send()
-                    .ok_or(RemoteRuntimeError::InvalidDurableState)?;
-                if active.request_route() != request_route {
-                    return Err(RemoteRuntimeError::InvalidReply(
-                        "KeySync RouteAccepted does not match the active request",
-                    ));
-                }
-                Ok(RemoteStreamFrameOutcome::KeySyncRouteAccepted {
-                    attempt: state.attempt(),
-                })
+                self.consume_key_control_route_accepted(request_route)
+                    .ok_or(RemoteRuntimeError::InvalidReply(
+                        "KeySync RouteAccepted does not match a sent control request",
+                    ))
             }
             _ => Err(RemoteRuntimeError::InvalidReply(
                 "unexpected Relay frame on the live stream ingress",
             )),
         }
+    }
+
+    async fn handle_key_sync_reply(
+        &mut self,
+        reply: agentdeck_protocol::relay_v2::frame::Reply,
+    ) -> Result<RemoteStreamFrameOutcome, RemoteRuntimeError> {
+        // Outer route/device 必须在 signature、replay admission 与任何 durable mutation 前
+        // 精确关联 active ADKS attempt；错误 route 不能消耗 replay/counter 或安装状态。
+        let state = self
+            .machine
+            .durable_key_sync_state()?
+            .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+        let active = state.active_send().ok_or(RemoteRuntimeError::InvalidReply(
+            "KeySync Reply has no active durable request",
+        ))?;
+        if reply.device_route != self.machine.device_route()
+            || reply.request_route != active.request_route()
+        {
+            return Err(RemoteRuntimeError::InvalidReply(
+                "KeySync Reply does not match the active request route",
+            ));
+        }
+        let request = active.request().clone();
+        let candidate = self.machine.verify_key_sync_reply(
+            &request,
+            reply.request_route,
+            &reply.sealed_blob.0,
+        )?;
+        let reply_directory_revision = candidate.directory_revision();
+        self.admit_reply_replay(&candidate)?;
+        let opened = self
+            .machine
+            .open_verified_key_sync_reply(&request, candidate)?;
+        if opened.payload_kind != SealedPayloadKind::KeyUpdate {
+            return Err(RemoteRuntimeError::InvalidReply(
+                "KeySync Reply payload kind is not KeyUpdate",
+            ));
+        }
+        let control = KeyControlV1::from_canonical_bytes(&opened.payload).map_err(|_| {
+            RemoteRuntimeError::InvalidReply("KeySync Reply control is not canonical")
+        })?;
+        let now_ms = unix_time_ms()?;
+        match control {
+            KeyControlV1::UpdateSet { update_set, .. } => {
+                if reply_directory_revision != request.requested_key_directory_revision.value() {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "UpdateSet Reply is not sealed at the requested revision",
+                    ));
+                }
+                let handoff = state
+                    .into_update_set_handoff(now_ms, reply.request_route, update_set)
+                    .map_err(key_sync_reply_error)?;
+                let prepared = self.machine.prepare_key_update_install(handoff, now_ms)?;
+                let mut mutation_rng = SystemMutationRng::new()?;
+                let committed = self
+                    .machine
+                    .commit_key_update_install(prepared, &mut mutation_rng)?;
+                let committed_state = committed.key_sync_state().clone();
+                let revision = committed.ack_basis().key_directory_revision();
+                let ack = committed.ack().clone();
+
+                // ACK 的 CounterGuard reservation、seal 与 transport Send 必须先完成；只有
+                // 此后才能冻结/提交下一次 probe，避免 restart 观察到“已继续但未 ACK”。
+                self.send_key_update_ack(&ack).await?;
+                let next_attempt = self.continue_key_sync_after_ack(committed_state).await?;
+                Ok(RemoteStreamFrameOutcome::KeyUpdateInstalled {
+                    key_directory_revision: revision.value(),
+                    next_attempt,
+                })
+            }
+            KeyControlV1::DirectoryCurrent { status, .. } => {
+                if reply_directory_revision != request.known_key_directory_revision.value() {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "DirectoryCurrent Reply is not sealed at the known revision",
+                    ));
+                }
+                self.retry_after_directory_current(state, reply.request_route, status, now_ms)
+                    .await
+            }
+            KeyControlV1::EpochBarrier { .. } | KeyControlV1::StreamBinding { .. } => {
+                Err(RemoteRuntimeError::InvalidReply(
+                    "KeySync Reply carries an unrelated key-control variant",
+                ))
+            }
+        }
+    }
+
+    async fn retry_after_directory_current(
+        &mut self,
+        state: DurableKeySyncStateV1,
+        reply_request_route: RequestRouteId,
+        status: DirectoryCurrentV1,
+        now_ms: u64,
+    ) -> Result<RemoteStreamFrameOutcome, RemoteRuntimeError> {
+        let request = state
+            .next_retry_request_after_directory_current(now_ms, reply_request_route, &status)
+            .map_err(key_sync_reply_error)?;
+        let mut mutation_rng = SystemMutationRng::new()?;
+        let reservation = self
+            .machine
+            .reserve_command_counter_block(&mut mutation_rng)?;
+        let request_route = RequestRouteId::from_bytes(random_nonzero::<16, _>(&mut mutation_rng)?);
+        self.ensure_new_key_sync_route_available(request_route)?;
+        let signed = self
+            .machine
+            .seal_key_sync_request(request_route, &request, reservation)?;
+        let exact_send = self.encode_key_control_send(request_route, signed)?;
+        let frozen =
+            FrozenKeySyncSendV1::new(request, exact_send).map_err(key_sync_runtime_error)?;
+        let mut replacement = state.clone();
+        replacement
+            .retry_after_directory_current(now_ms, reply_request_route, &status, frozen)
+            .map_err(key_sync_reply_error)?;
+        let committed = self
+            .machine
+            .commit_key_sync_state_transition(Some(&state), Some(&replacement), &mut mutation_rng)?
+            .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+        let active = committed
+            .active_send()
+            .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+        let attempt = committed.attempt();
+        self.send_key_sync_probe(active, attempt).await?;
+        Ok(RemoteStreamFrameOutcome::KeySyncPending { attempt })
+    }
+
+    /// 重启后根据 durable completion basis 重新封装 canonical ACK。新的 requestRoute 与
+    /// CounterGuard reservation 只改变 carrier，不改变 ACK body；RouteAccepted 不清 basis。
+    pub async fn resume_pending_key_update_ack(&mut self) -> Result<(), RemoteRuntimeError> {
+        let state = self
+            .machine
+            .durable_key_sync_state()?
+            .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+        let basis = state
+            .latest_completed_ack_basis()
+            .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+        let ack = self.machine.key_update_ack_from_basis(basis)?;
+        self.send_key_update_ack(&ack).await?;
+        self.continue_key_sync_after_ack(state).await?;
+        Ok(())
+    }
+
+    /// production 建连后的 bounded KeySync 冷恢复。Resolved install 先重封 ACK；
+    /// AwaitingProbe/Active 在同一 ACK 之后冻结或逐字节重发 durable probe，并在把 runtime
+    /// 交给业务前消费本轮 ACK/probe 的 RouteAccepted 与 authenticated KeySync Reply。
+    /// 其他 frame 一律 fail-close，避免 control frame 串入下一条业务 exchange。
+    pub async fn recover_durable_key_sync(&mut self) -> Result<(), RemoteRuntimeError> {
+        let Some(state) = self.machine.durable_key_sync_state()? else {
+            return Ok(());
+        };
+        if let Some(basis) = state.latest_completed_ack_basis() {
+            let ack = self.machine.key_update_ack_from_basis(basis)?;
+            self.send_key_update_ack(&ack).await?;
+        }
+
+        match state.status() {
+            KeySyncCoordinationStatus::Resolved => {}
+            KeySyncCoordinationStatus::Exhausted => {
+                return Err(key_sync_runtime_error(KeySyncError::Exhausted));
+            }
+            KeySyncCoordinationStatus::Active => {
+                let now_ms = unix_time_ms()?;
+                let active = state
+                    .active_retry_at(now_ms)
+                    .map_err(key_sync_runtime_error)?;
+                self.send_key_sync_probe(active, state.attempt()).await?;
+            }
+            KeySyncCoordinationStatus::AwaitingProbe => {
+                self.continue_key_sync_after_ack(state).await?;
+            }
+        }
+
+        self.pump_durable_key_sync_recovery().await
+    }
+
+    async fn pump_durable_key_sync_recovery(&mut self) -> Result<(), RemoteRuntimeError> {
+        let mut resolved_ack_deadline = None;
+        loop {
+            let state = self
+                .machine
+                .durable_key_sync_state()?
+                .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+            let (deadline, timeout_error) = match state.status() {
+                KeySyncCoordinationStatus::Resolved => {
+                    if self.pending_key_update_ack_routes.is_empty()
+                        && self.pending_key_sync_routes.is_empty()
+                    {
+                        return Ok(());
+                    }
+                    let deadline = *resolved_ack_deadline.get_or_insert_with(|| {
+                        Instant::now() + Duration::from_millis(KEY_SYNC_RECOVERY_ACK_TIMEOUT_MS)
+                    });
+                    (deadline, RemoteRuntimeError::OutcomeUnknown)
+                }
+                KeySyncCoordinationStatus::Active => {
+                    let now_ms = unix_time_ms()?;
+                    state
+                        .active_retry_at(now_ms)
+                        .map_err(key_sync_runtime_error)?;
+                    let remaining_ms = state
+                        .deadline_at_ms()
+                        .checked_sub(now_ms)
+                        .ok_or_else(|| key_sync_runtime_error(KeySyncError::Exhausted))?;
+                    let deadline = Instant::now()
+                        .checked_add(Duration::from_millis(remaining_ms))
+                        .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+                    (deadline, key_sync_runtime_error(KeySyncError::Exhausted))
+                }
+                KeySyncCoordinationStatus::AwaitingProbe => {
+                    return Err(RemoteRuntimeError::InvalidDurableState);
+                }
+                KeySyncCoordinationStatus::Exhausted => {
+                    return Err(key_sync_runtime_error(KeySyncError::Exhausted));
+                }
+            };
+
+            let received = match tokio::time::timeout_at(deadline, self.transport.recv()).await {
+                Ok(received) => received?,
+                Err(_) => return Err(timeout_error),
+            }
+            .ok_or(RemoteRuntimeError::OutcomeUnknown)?;
+            validate_received_runtime_frame(&received)?;
+            let (frame, _) = received.into_parts();
+            match frame.body {
+                RelayFrameBody::RouteAccepted(accepted) => {
+                    let AcceptedRef::Request { request_route } = accepted.accepted else {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "KeySync recovery RouteAccepted must reference a request route",
+                        ));
+                    };
+                    if self
+                        .consume_key_control_route_accepted(request_route)
+                        .is_none()
+                    {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "KeySync recovery received an unrelated RouteAccepted",
+                        ));
+                    }
+                }
+                RelayFrameBody::Reply(reply) => {
+                    self.handle_key_sync_reply(reply).await?;
+                    let next_state = self
+                        .machine
+                        .durable_key_sync_state()?
+                        .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+                    if next_state.status() == KeySyncCoordinationStatus::Resolved {
+                        resolved_ack_deadline = None;
+                    }
+                }
+                _ => {
+                    return Err(RemoteRuntimeError::InvalidReply(
+                        "unexpected Relay frame during KeySync cold recovery",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn durable_pending_exchange_route(&self) -> Result<Option<RequestRouteId>, RemoteRuntimeError> {
+        let exchange = self
+            .machine
+            .opaque_runtime_state()
+            .exchange()
+            .map(decode_exchange)
+            .transpose()?;
+        Ok(match exchange {
+            Some(DurableExchange::Pending(pending)) => Some(pending.request_route),
+            Some(DurableExchange::Terminal(_)) | None => None,
+        })
+    }
+
+    fn fresh_request_route_in_use(
+        &self,
+        request_route: RequestRouteId,
+    ) -> Result<bool, RemoteRuntimeError> {
+        let active_key_sync_route = self
+            .machine
+            .durable_key_sync_state()?
+            .and_then(|state| state.active_send().map(FrozenKeySyncSendV1::request_route));
+        Ok(request_route_is_owned(
+            request_route,
+            &self.pending_key_update_ack_routes,
+            &self.pending_key_sync_routes,
+            active_key_sync_route,
+            self.durable_pending_exchange_route()?,
+        ))
+    }
+
+    fn ensure_fresh_request_route_available(
+        &self,
+        request_route: RequestRouteId,
+    ) -> Result<(), RemoteRuntimeError> {
+        if self.fresh_request_route_in_use(request_route)? {
+            return Err(RemoteRuntimeError::EntropyUnavailable);
+        }
+        Ok(())
+    }
+
+    fn ensure_new_key_sync_route_available(
+        &self,
+        request_route: RequestRouteId,
+    ) -> Result<(), RemoteRuntimeError> {
+        self.ensure_fresh_request_route_available(request_route)?;
+        if self.pending_key_sync_routes.len() >= MAX_PENDING_KEY_SYNC_ROUTES {
+            return Err(RemoteRuntimeError::PendingIntentConflict);
+        }
+        Ok(())
+    }
+
+    fn preflight_key_sync_probe_send(
+        &self,
+        active: &FrozenKeySyncSendV1,
+        attempt: u8,
+    ) -> Result<(), RemoteRuntimeError> {
+        if active.request().attempt != attempt
+            || self
+                .machine
+                .durable_key_sync_state()?
+                .and_then(|state| state.active_send().map(FrozenKeySyncSendV1::request_route))
+                != Some(active.request_route())
+        {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        if self
+            .pending_key_update_ack_routes
+            .contains_key(&active.request_route())
+            || self.durable_pending_exchange_route()? == Some(active.request_route())
+        {
+            return Err(RemoteRuntimeError::PendingIntentConflict);
+        }
+        match self.pending_key_sync_routes.get(&active.request_route()) {
+            Some(pending) => {
+                if pending.attempt != attempt {
+                    return Err(RemoteRuntimeError::InvalidDurableState);
+                }
+                if pending.outstanding_acceptances >= MAX_PENDING_KEY_SYNC_ACCEPTANCES_PER_ROUTE {
+                    return Err(RemoteRuntimeError::PendingIntentConflict);
+                }
+            }
+            None if self.pending_key_sync_routes.len() >= MAX_PENDING_KEY_SYNC_ROUTES => {
+                return Err(RemoteRuntimeError::PendingIntentConflict);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn register_successful_key_sync_probe_send(
+        &mut self,
+        request_route: RequestRouteId,
+        attempt: u8,
+    ) {
+        if let Some(pending) = self.pending_key_sync_routes.get_mut(&request_route) {
+            debug_assert_eq!(pending.attempt, attempt);
+            debug_assert!(
+                pending.outstanding_acceptances < MAX_PENDING_KEY_SYNC_ACCEPTANCES_PER_ROUTE
+            );
+            pending.outstanding_acceptances += 1;
+        } else {
+            debug_assert!(self.pending_key_sync_routes.len() < MAX_PENDING_KEY_SYNC_ROUTES);
+            self.pending_key_sync_routes.insert(
+                request_route,
+                PendingKeySyncRoute {
+                    attempt,
+                    outstanding_acceptances: 1,
+                },
+            );
+        }
+    }
+
+    async fn send_key_sync_probe(
+        &mut self,
+        active: &FrozenKeySyncSendV1,
+        attempt: u8,
+    ) -> Result<(), RemoteRuntimeError> {
+        self.preflight_key_sync_probe_send(active, attempt)?;
+        let request_route = active.request_route();
+        let exact_send = ExactRelayFrame::from_frozen(active.exact_send_bytes().to_vec())?;
+        self.transport.send(exact_send).await?;
+        self.register_successful_key_sync_probe_send(request_route, attempt);
+        Ok(())
+    }
+
+    async fn send_key_update_ack(
+        &mut self,
+        ack: &KeyUpdateAckV1,
+    ) -> Result<RequestRouteId, RemoteRuntimeError> {
+        if self.pending_key_update_ack_routes.len() >= MAX_PENDING_KEY_UPDATE_ACK_ROUTES {
+            return Err(RemoteRuntimeError::PendingIntentConflict);
+        }
+        let mut mutation_rng = SystemMutationRng::new()?;
+        let reservation = self
+            .machine
+            .reserve_command_counter_block(&mut mutation_rng)?;
+        let request_route = RequestRouteId::from_bytes(random_nonzero::<16, _>(&mut mutation_rng)?);
+        self.ensure_fresh_request_route_available(request_route)?;
+        let signed = self
+            .machine
+            .seal_key_update_ack(request_route, ack, reservation)?;
+        let exact_send = self.encode_key_control_send(request_route, signed)?;
+        self.transport
+            .send(ExactRelayFrame::from_frozen(exact_send)?)
+            .await?;
+        self.pending_key_update_ack_routes
+            .insert(request_route, ack.key_directory_revision);
+        Ok(request_route)
+    }
+
+    fn consume_key_control_route_accepted(
+        &mut self,
+        request_route: RequestRouteId,
+    ) -> Option<RemoteStreamFrameOutcome> {
+        if let Some(revision) = self.pending_key_update_ack_routes.remove(&request_route) {
+            return Some(RemoteStreamFrameOutcome::KeyUpdateAckRouteAccepted {
+                key_directory_revision: revision.value(),
+            });
+        }
+        let pending = self.pending_key_sync_routes.get_mut(&request_route)?;
+        let attempt = pending.attempt;
+        pending.outstanding_acceptances -= 1;
+        if pending.outstanding_acceptances == 0 {
+            self.pending_key_sync_routes.remove(&request_route);
+        }
+        Some(RemoteStreamFrameOutcome::KeySyncRouteAccepted { attempt })
+    }
+
+    /// ACK Send 完成后恢复 bounded continuation。AwaitingProbe 先使用新 command key reserve
+    /// counter，再冻结并 CAS ADKS，最后发送；已冻结的 Active probe 只做 exact retry。
+    async fn continue_key_sync_after_ack(
+        &mut self,
+        state: DurableKeySyncStateV1,
+    ) -> Result<Option<u8>, RemoteRuntimeError> {
+        match state.status() {
+            KeySyncCoordinationStatus::Resolved => Ok(None),
+            KeySyncCoordinationStatus::Exhausted => {
+                Err(key_sync_runtime_error(KeySyncError::Exhausted))
+            }
+            KeySyncCoordinationStatus::Active => {
+                let now_ms = unix_time_ms()?;
+                let active = state
+                    .active_retry_at(now_ms)
+                    .map_err(key_sync_runtime_error)?;
+                let attempt = state.attempt();
+                self.send_key_sync_probe(active, attempt).await?;
+                Ok(Some(attempt))
+            }
+            KeySyncCoordinationStatus::AwaitingProbe => {
+                let now_ms = unix_time_ms()?;
+                let request = state
+                    .next_request_at(now_ms)
+                    .map_err(key_sync_runtime_error)?;
+                let mut mutation_rng = SystemMutationRng::new()?;
+                let reservation = self
+                    .machine
+                    .reserve_command_counter_block(&mut mutation_rng)?;
+                let request_route =
+                    RequestRouteId::from_bytes(random_nonzero::<16, _>(&mut mutation_rng)?);
+                self.ensure_new_key_sync_route_available(request_route)?;
+                let signed =
+                    self.machine
+                        .seal_key_sync_request(request_route, &request, reservation)?;
+                let exact_send = self.encode_key_control_send(request_route, signed)?;
+                let frozen = FrozenKeySyncSendV1::new(request, exact_send)
+                    .map_err(key_sync_runtime_error)?;
+                let mut replacement = state.clone();
+                replacement
+                    .freeze_next_probe(now_ms, frozen)
+                    .map_err(key_sync_runtime_error)?;
+                let committed = self
+                    .machine
+                    .commit_key_sync_state_transition(
+                        Some(&state),
+                        Some(&replacement),
+                        &mut mutation_rng,
+                    )?
+                    .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+                let active = committed
+                    .active_send()
+                    .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+                let attempt = committed.attempt();
+                self.send_key_sync_probe(active, attempt).await?;
+                Ok(Some(attempt))
+            }
+        }
+    }
+
+    fn encode_key_control_send(
+        &self,
+        request_route: RequestRouteId,
+        sealed_blob: Vec<u8>,
+    ) -> Result<Vec<u8>, RemoteRuntimeError> {
+        let exact_send = encode(&OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::Send(RelaySend {
+                device_route: self.machine.device_route(),
+                request_route,
+                sealed_blob: SealedBlob(sealed_blob),
+            }),
+        });
+        let _ = decode(&exact_send)?;
+        Ok(exact_send)
     }
 
     async fn coordinate_key_sync(
@@ -923,16 +1466,106 @@ where
         let now_ms = unix_time_ms()?;
         let current = self.machine.durable_key_sync_state()?;
         let committed = if let Some(current) = current {
-            let mut replacement = current.clone();
-            replacement
-                .observe_again(&observation, now_ms)
-                .map_err(key_sync_runtime_error)?;
-            let mut mutation_rng = SystemMutationRng::new()?;
-            self.machine.commit_key_sync_state_transition(
-                Some(&current),
-                Some(&replacement),
-                &mut mutation_rng,
-            )?
+            match current.status() {
+                KeySyncCoordinationStatus::AwaitingProbe => {
+                    if current.observation() != &observation {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "higher-revision publication conflicts with pending KeySync continuation",
+                        ));
+                    }
+                    self.resume_pending_key_update_ack().await?;
+                    let resumed = self
+                        .machine
+                        .durable_key_sync_state()?
+                        .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+                    let active = resumed
+                        .active_send()
+                        .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+                    return Ok(RemoteStreamFrameOutcome::KeySyncPending {
+                        attempt: active.request().attempt,
+                    });
+                }
+                KeySyncCoordinationStatus::Resolved
+                    if current.observation() == &observation =>
+                {
+                    let revision = current
+                        .latest_completed_ack_basis()
+                        .ok_or(RemoteRuntimeError::InvalidDurableState)?
+                        .key_directory_revision();
+                    // 同一 higher Publish 在 barrier/apply 前重放，只触发 canonical ACK
+                    // 重封；不能重置 30 秒窗口或伪造一轮新的 KeySync。
+                    self.resume_pending_key_update_ack().await?;
+                    return Ok(RemoteStreamFrameOutcome::KeyUpdateInstalled {
+                        key_directory_revision: revision.value(),
+                        next_attempt: None,
+                    });
+                }
+                KeySyncCoordinationStatus::Resolved => {
+                    // 新 signed observation 是唯一允许 supersede Resolved ADKS 的输入。
+                    // 先只读验证，随后必须先重发旧 ACK；只有 ACK Send 成功后，才允许
+                    // durable 冻结从刚安装 revision 出发的新 attempt-1 probe。
+                    current
+                        .next_cycle_request(&observation, now_ms)
+                        .map_err(key_sync_runtime_error)?;
+                    self.resume_pending_key_update_ack().await?;
+                    let started_at_ms = unix_time_ms()?;
+                    let request = current
+                        .next_cycle_request(&observation, started_at_ms)
+                        .map_err(key_sync_runtime_error)?;
+                    let mut mutation_rng = SystemMutationRng::new()?;
+                    let reservation = self
+                        .machine
+                        .reserve_command_counter_block(&mut mutation_rng)?;
+                    let request_route =
+                        RequestRouteId::from_bytes(random_nonzero::<16, _>(&mut mutation_rng)?);
+                    self.ensure_new_key_sync_route_available(request_route)?;
+                    let signed = self.machine.seal_key_sync_request(
+                        request_route,
+                        &request,
+                        reservation,
+                    )?;
+                    let exact_send = self.encode_key_control_send(request_route, signed)?;
+                    let frozen = FrozenKeySyncSendV1::new(request, exact_send)
+                        .map_err(key_sync_runtime_error)?;
+                    let replacement = current
+                        .start_next_cycle(observation, started_at_ms, frozen)
+                        .map_err(key_sync_runtime_error)?;
+                    self.machine.commit_key_sync_state_transition(
+                        Some(&current),
+                        Some(&replacement),
+                        &mut mutation_rng,
+                    )?
+                }
+                KeySyncCoordinationStatus::Exhausted => {
+                    return Err(key_sync_runtime_error(KeySyncError::Exhausted));
+                }
+                KeySyncCoordinationStatus::Active => {
+                    if current.latest_completed_ack_basis().is_some() {
+                        if current.observation() != &observation {
+                            return Err(RemoteRuntimeError::InvalidReply(
+                                "higher-revision publication conflicts with a frozen KeySync continuation",
+                            ));
+                        }
+                        // Crash may happen after install/new-cycle CAS but before either ACK or
+                        // frozen probe reaches transport. Durable completion/retained basis must
+                        // be re-ACKed first; only then exact-retry the already frozen probe.
+                        self.resume_pending_key_update_ack().await?;
+                        return Ok(RemoteStreamFrameOutcome::KeySyncPending {
+                            attempt: current.attempt(),
+                        });
+                    }
+                    let mut replacement = current.clone();
+                    replacement
+                        .observe_again(&observation, now_ms)
+                        .map_err(key_sync_runtime_error)?;
+                    let mut mutation_rng = SystemMutationRng::new()?;
+                    self.machine.commit_key_sync_state_transition(
+                        Some(&current),
+                        Some(&replacement),
+                        &mut mutation_rng,
+                    )?
+                }
+            }
         } else {
             // CounterGuard 的 durable high-water 必须先于 requestRoute、seal/freeze 与 ADKS。
             // 此后任一失败只允许跳过整个 reservation block，绝不回退或复用 counter。
@@ -945,6 +1578,7 @@ where
                 .map_err(key_sync_runtime_error)?;
             let request_route =
                 RequestRouteId::from_bytes(random_nonzero::<16, _>(&mut mutation_rng)?);
+            self.ensure_new_key_sync_route_available(request_route)?;
             let signed =
                 self.machine
                     .seal_key_sync_request(request_route, &request, reservation)?;
@@ -972,8 +1606,7 @@ where
             .active_send()
             .ok_or(RemoteRuntimeError::InvalidDurableState)?;
         let attempt = committed.attempt();
-        let exact_send = ExactRelayFrame::from_frozen(active.exact_send_bytes().to_vec())?;
-        self.transport.send(exact_send).await?;
+        self.send_key_sync_probe(active, attempt).await?;
         Ok(RemoteStreamFrameOutcome::KeySyncPending { attempt })
     }
 
@@ -1081,7 +1714,9 @@ where
             ));
         }
 
-        let Self { transport, machine } = self;
+        let Self {
+            transport, machine, ..
+        } = self;
         drop(transport);
         machine.commit_revocation_cleanup(terminal)?;
         Ok(RemoteRevocationOutcome {
@@ -1112,6 +1747,7 @@ where
             };
 
         self.reject_quarantined_current_reply_scope()?;
+        let pending_send = decode_pending_send(&pending, self.machine.device_route())?;
 
         // Durable pending 保存的是完整 Relay codec bytes；每次发送都从 exact bytes 解码，
         // 避免重启后重新 seal/sign 或重建任一随机字段。
@@ -1134,18 +1770,23 @@ where
             let reply_frame_hash = sha256(received.canonical_bytes());
             let frame = received.frame();
             match &frame.body {
-                RelayFrameBody::RouteAccepted(accepted) => match accepted.accepted {
-                    AcceptedRef::Request { request_route }
-                        if request_route == pending.request_route =>
-                    {
+                RelayFrameBody::RouteAccepted(accepted) => {
+                    let AcceptedRef::Request { request_route } = accepted.accepted else {
+                        return Err(RemoteRuntimeError::InvalidReply(
+                            "RouteAccepted does not match the pending request",
+                        ));
+                    };
+                    if request_route == pending.request_route {
                         route_accepted = true;
-                    }
-                    _ => {
+                    } else if self
+                        .consume_key_control_route_accepted(request_route)
+                        .is_none()
+                    {
                         return Err(RemoteRuntimeError::InvalidReply(
                             "RouteAccepted does not match the pending request",
                         ));
                     }
-                },
+                }
                 RelayFrameBody::Reply(reply) => {
                     if reply.device_route != self.machine.device_route()
                         || reply.request_route != pending.request_route
@@ -1154,14 +1795,18 @@ where
                             "Reply outer route does not match the pending request",
                         ));
                     }
-                    let candidate = self
-                        .machine
-                        .verify_directed_reply(pending.request_route, &reply.sealed_blob.0)?;
+                    let candidate = self.machine.verify_directed_reply(
+                        pending.request_route,
+                        &pending_send.sealed_blob.0,
+                        &reply.sealed_blob.0,
+                    )?;
 
                     // MachineDataSign 成功后、AEAD 前 durable consume replay tuple。即使后续
                     // ciphertext/tag 失败，同 counter 的另一 signed ciphertext 也不能重试。
                     self.admit_reply_replay(&candidate)?;
-                    let opened = self.machine.open_verified_directed_reply(candidate)?;
+                    let opened = self
+                        .machine
+                        .open_verified_directed_reply(&pending_send.sealed_blob.0, candidate)?;
                     if opened.payload_kind == SealedPayloadKind::TransferPart {
                         if !matches!(pending.operation, DirectedOperation::Catalog { .. }) {
                             return Err(RemoteRuntimeError::InvalidReply(
@@ -1397,6 +2042,7 @@ where
         rng: &mut R,
     ) -> Result<PendingExchange, RemoteRuntimeError> {
         let request_route = RequestRouteId::from_bytes(random_nonzero::<16, _>(rng)?);
+        self.ensure_fresh_request_route_available(request_route)?;
         let message_id = MessageId::new(
             Uuid::from_bytes(random_nonzero::<16, _>(rng)?)
                 .hyphenated()
@@ -1435,6 +2081,15 @@ where
         &mut self,
         candidate: &VerifiedDirectedReply,
     ) -> Result<(), RemoteRuntimeError> {
+        let (current_key_epoch, _current_directory_revision) =
+            self.machine.directed_reply_scope()?;
+        let replay_revision_ceiling = candidate.replay_revision_ceiling();
+        if candidate.key_epoch() != current_key_epoch
+            || candidate.directory_revision() == 0
+            || candidate.directory_revision() > replay_revision_ceiling
+        {
+            return Err(RemoteRuntimeError::ReplayRejected);
+        }
         let current = self.machine.opaque_runtime_state();
         let mut windows = current
             .replay_windows()
@@ -1444,27 +2099,37 @@ where
         if windows.len() > MAX_REPLAY_WINDOWS {
             return Err(RemoteRuntimeError::InvalidDurableState);
         }
-        let scope_matches = |window: &&ReplayWindow| {
-            window.key_epoch == candidate.key_epoch()
-                && window.directory_revision == candidate.directory_revision()
-        };
-        let matching = windows.iter().filter(scope_matches).count();
-        if matching > 1 {
+        let matching = windows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, window)| {
+                (window.key_epoch == candidate.key_epoch()).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if matching.len() > 1 {
             return Err(RemoteRuntimeError::InvalidDurableState);
         }
         let hash = candidate.signed_blob_hash();
-        let admission = if let Some(window) = windows.iter_mut().find(|window| {
-            window.key_epoch == candidate.key_epoch()
-                && window.directory_revision == candidate.directory_revision()
-        }) {
-            window.observe(candidate.counter(), hash)?
+        let mut revision_high_water_advanced = false;
+        let admission = if let Some(index) = matching.first().copied() {
+            let previous_revision = windows[index].directory_revision;
+            if previous_revision > replay_revision_ceiling {
+                return Err(RemoteRuntimeError::InvalidDurableState);
+            }
+            let admission = windows[index].observe_at_revision(
+                replay_revision_ceiling,
+                candidate.counter(),
+                hash,
+            )?;
+            revision_high_water_advanced = windows[index].directory_revision != previous_revision;
+            admission
         } else {
             if windows.len() >= MAX_REPLAY_WINDOWS {
                 return Err(RemoteRuntimeError::ReplayRejected);
             }
             windows.push(ReplayWindow {
                 key_epoch: candidate.key_epoch(),
-                directory_revision: candidate.directory_revision(),
+                directory_revision: replay_revision_ceiling,
                 nonce_reuse_quarantined: false,
                 entries: vec![ReplayEntry {
                     counter: candidate.counter(),
@@ -1473,7 +2138,7 @@ where
             });
             ReplayAdmission::Fresh
         };
-        if admission == ReplayAdmission::ExactDuplicate {
+        if admission == ReplayAdmission::ExactDuplicate && !revision_high_water_advanced {
             return Ok(());
         }
         let encoded = windows.iter().map(encode_replay_window).collect();
@@ -1484,27 +2149,18 @@ where
         )?;
         match admission {
             ReplayAdmission::Fresh => Ok(()),
-            ReplayAdmission::NonceReuse => Err(RemoteRuntimeError::ReplayRejected),
-            ReplayAdmission::ExactDuplicate => unreachable!("exact duplicate returned above"),
+            ReplayAdmission::NonceReuse => Err(RemoteRuntimeError::NonceReuse),
+            ReplayAdmission::ExactDuplicate => Ok(()),
         }
     }
 
     fn reject_quarantined_current_reply_scope(&self) -> Result<(), RemoteRuntimeError> {
         let (key_epoch, directory_revision) = self.machine.directed_reply_scope()?;
-        let mut matching = 0_usize;
+        let mut windows = Vec::new();
         for bytes in self.machine.opaque_runtime_state().replay_windows() {
-            let window = decode_replay_window(bytes)?;
-            if window.key_epoch == key_epoch && window.directory_revision == directory_revision {
-                matching += 1;
-                if window.nonce_reuse_quarantined {
-                    return Err(RemoteRuntimeError::ReplayRejected);
-                }
-            }
+            windows.push(decode_replay_window(bytes)?);
         }
-        if matching > 1 {
-            return Err(RemoteRuntimeError::InvalidDurableState);
-        }
-        Ok(())
+        validate_current_reply_replay_scope(&windows, key_epoch, directory_revision)
     }
 
     fn persist_terminal(
@@ -2630,6 +3286,23 @@ struct PendingExchange {
     exact_send: Vec<u8>,
 }
 
+fn decode_pending_send(
+    pending: &PendingExchange,
+    expected_device_route: DeviceRouteId,
+) -> Result<RelaySend, RemoteRuntimeError> {
+    let decoded = decode(&pending.exact_send)?;
+    let RelayFrameBody::Send(send) = decoded.body else {
+        return Err(RemoteRuntimeError::InvalidDurableState);
+    };
+    if decoded.version != RELAY_PROTOCOL_VERSION
+        || send.device_route != expected_device_route
+        || send.request_route != pending.request_route
+    {
+        return Err(RemoteRuntimeError::InvalidDurableState);
+    }
+    Ok(send)
+}
+
 struct TerminalExchange {
     operation: DirectedOperation,
     intent_hash: [u8; 32],
@@ -2715,6 +3388,26 @@ enum ReplayAdmission {
 }
 
 impl ReplayWindow {
+    /// DeviceReplyTx 在 same-epoch rewrap 时保留同一 raw key 与 nonce prefix，因此 replay
+    /// window 也必须跨 directory revision 原地延续。调用方只传入已完整审计的 current
+    /// revision，因此可跨多次 rewrap 单调推进；由 durable pending request 完整验签关联的
+    /// 旧 reply 只增加 tuple，绝不降低 revision high-water。按 revision 新建窗口会让相同
+    /// counter 的不同 ciphertext 绕过 quarantine。
+    fn observe_at_revision(
+        &mut self,
+        directory_revision: u64,
+        counter: u64,
+        signed_blob_hash: [u8; 32],
+    ) -> Result<ReplayAdmission, RemoteRuntimeError> {
+        if directory_revision == 0 {
+            return Err(RemoteRuntimeError::ReplayRejected);
+        }
+        if directory_revision > self.directory_revision {
+            self.directory_revision = directory_revision;
+        }
+        self.observe(counter, signed_blob_hash)
+    }
+
     /// 与 `agentdeck_crypto::replay::ReplayWindow` 相同的 numerical window 语义；额外把
     /// tuple 保持为可 durable encode 的排序列表。
     fn observe(
@@ -2765,6 +3458,30 @@ impl ReplayWindow {
             }
         }
     }
+}
+
+fn validate_current_reply_replay_scope(
+    windows: &[ReplayWindow],
+    key_epoch: u64,
+    current_directory_revision: u64,
+) -> Result<(), RemoteRuntimeError> {
+    let mut matching = None;
+    for window in windows
+        .iter()
+        .filter(|window| window.key_epoch == key_epoch)
+    {
+        if matching.replace(()).is_some() {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        if window.directory_revision == 0 || window.directory_revision > current_directory_revision
+        {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        if window.nonce_reuse_quarantined {
+            return Err(RemoteRuntimeError::ReplayRejected);
+        }
+    }
+    Ok(())
 }
 
 fn receipt_matches_expected_revision(receipt: &CommandReceipt, expected: u64) -> bool {
@@ -2860,6 +3577,19 @@ fn key_sync_runtime_error(error: KeySyncError) -> RemoteRuntimeError {
         )))
     } else {
         RemoteRuntimeError::InvalidDurableState
+    }
+}
+
+fn key_sync_reply_error(error: KeySyncError) -> RemoteRuntimeError {
+    match error {
+        KeySyncError::ResponseConflict => RemoteRuntimeError::InvalidReply(
+            "authenticated KeySync response does not match the active request",
+        ),
+        KeySyncError::Exhausted => key_sync_runtime_error(error),
+        KeySyncError::InvalidCanonical
+        | KeySyncError::TooLarge
+        | KeySyncError::ObservationConflict
+        | KeySyncError::ClockRollback => RemoteRuntimeError::InvalidDurableState,
     }
 }
 
@@ -3418,6 +4148,69 @@ mod tests {
     }
 
     #[test]
+    fn request_route_owner_guard_covers_business_and_key_control_namespaces() {
+        let owned = RequestRouteId::from_bytes([0x41; 16]);
+        let other = RequestRouteId::from_bytes([0x42; 16]);
+        let mut ack_routes = HashMap::new();
+        let mut probe_routes = HashMap::new();
+
+        assert!(!request_route_is_owned(
+            owned,
+            &ack_routes,
+            &probe_routes,
+            None,
+            None,
+        ));
+        ack_routes.insert(owned, KeyDirectoryRevision::new(7));
+        assert!(request_route_is_owned(
+            owned,
+            &ack_routes,
+            &probe_routes,
+            None,
+            None,
+        ));
+        ack_routes.clear();
+
+        probe_routes.insert(
+            owned,
+            PendingKeySyncRoute {
+                attempt: 2,
+                outstanding_acceptances: 1,
+            },
+        );
+        assert!(request_route_is_owned(
+            owned,
+            &ack_routes,
+            &probe_routes,
+            None,
+            None,
+        ));
+        probe_routes.clear();
+
+        assert!(request_route_is_owned(
+            owned,
+            &ack_routes,
+            &probe_routes,
+            Some(owned),
+            None,
+        ));
+        assert!(request_route_is_owned(
+            owned,
+            &ack_routes,
+            &probe_routes,
+            None,
+            Some(owned),
+        ));
+        assert!(!request_route_is_owned(
+            other,
+            &ack_routes,
+            &probe_routes,
+            Some(owned),
+            Some(owned),
+        ));
+    }
+
+    #[test]
     fn catalog_startup_recovers_only_the_exact_pending_catalog_operation() {
         assert_eq!(
             catalog_pending_recovery(None).expect("empty exchange"),
@@ -3824,5 +4617,133 @@ mod tests {
         );
         assert_eq!(window.entries[0].counter, 4_999);
         assert_eq!(window.entries[1].counter, 5_000);
+    }
+
+    #[test]
+    fn replay_window_quarantines_nonce_reuse_across_exact_next_revision() {
+        let mut window = ReplayWindow {
+            key_epoch: 7,
+            directory_revision: 4,
+            nonce_reuse_quarantined: false,
+            entries: vec![ReplayEntry {
+                counter: 9,
+                signed_blob_hash: tuple_hash(9),
+            }],
+        };
+
+        assert_eq!(
+            window
+                .observe_at_revision(5, 9, [0x55; 32])
+                .expect("exact-next revision shares the same nonce domain"),
+            ReplayAdmission::NonceReuse
+        );
+        assert_eq!(window.directory_revision, 5);
+        assert!(window.nonce_reuse_quarantined);
+        assert_eq!(window.entries.len(), 1);
+        assert!(matches!(
+            window.observe_at_revision(5, 10, tuple_hash(10)),
+            Err(RemoteRuntimeError::ReplayRejected)
+        ));
+    }
+
+    #[test]
+    fn replay_window_exact_duplicate_is_idempotent_and_verified_gap_advances_high_water() {
+        let mut window = ReplayWindow {
+            key_epoch: 7,
+            directory_revision: 4,
+            nonce_reuse_quarantined: false,
+            entries: vec![ReplayEntry {
+                counter: 9,
+                signed_blob_hash: tuple_hash(9),
+            }],
+        };
+        let before = encode_replay_window(&window);
+        assert_eq!(
+            window
+                .observe_at_revision(4, 9, tuple_hash(9))
+                .expect("exact duplicate is admissible"),
+            ReplayAdmission::ExactDuplicate
+        );
+        assert_eq!(encode_replay_window(&window), before);
+        assert_eq!(
+            window
+                .observe_at_revision(6, 10, tuple_hash(10))
+                .expect("audited current revision may advance over multiple rewraps"),
+            ReplayAdmission::Fresh
+        );
+        assert_eq!(window.directory_revision, 6);
+    }
+
+    #[test]
+    fn replay_window_observes_correlated_predecessor_without_lowering_revision_high_water() {
+        let mut window = ReplayWindow {
+            key_epoch: 7,
+            directory_revision: 6,
+            nonce_reuse_quarantined: false,
+            entries: vec![ReplayEntry {
+                counter: 9,
+                signed_blob_hash: tuple_hash(9),
+            }],
+        };
+        assert_eq!(
+            window
+                .observe_at_revision(4, 10, tuple_hash(10))
+                .expect("verified pending request may correlate a predecessor reply"),
+            ReplayAdmission::Fresh
+        );
+        assert_eq!(window.directory_revision, 6);
+        assert_eq!(
+            window
+                .observe_at_revision(4, 10, tuple_hash(10))
+                .expect("exact predecessor duplicate remains idempotent"),
+            ReplayAdmission::ExactDuplicate
+        );
+        assert_eq!(
+            window
+                .observe_at_revision(4, 10, [0x55; 32])
+                .expect("predecessor nonce reuse must quarantine the shared domain"),
+            ReplayAdmission::NonceReuse
+        );
+        assert_eq!(window.directory_revision, 6);
+        assert!(window.nonce_reuse_quarantined);
+    }
+
+    #[test]
+    fn current_reply_scope_carries_predecessor_quarantine_across_same_epoch_rewrap() {
+        let predecessor = ReplayWindow {
+            key_epoch: 7,
+            directory_revision: 4,
+            nonce_reuse_quarantined: true,
+            entries: vec![ReplayEntry {
+                counter: 9,
+                signed_blob_hash: tuple_hash(9),
+            }],
+        };
+        assert!(matches!(
+            validate_current_reply_replay_scope(&[predecessor], 7, 5),
+            Err(RemoteRuntimeError::ReplayRejected)
+        ));
+    }
+
+    #[test]
+    fn current_reply_scope_accepts_any_predecessor_and_rejects_zero_future_or_duplicates() {
+        let window = |revision| ReplayWindow {
+            key_epoch: 7,
+            directory_revision: revision,
+            nonce_reuse_quarantined: false,
+            entries: vec![ReplayEntry {
+                counter: revision,
+                signed_blob_hash: tuple_hash(revision),
+            }],
+        };
+        assert!(validate_current_reply_replay_scope(&[window(3)], 7, 5).is_ok());
+        assert!(validate_current_reply_replay_scope(&[window(4)], 7, 5).is_ok());
+        assert!(validate_current_reply_replay_scope(&[window(5)], 7, 5).is_ok());
+        for invalid in [vec![window(0)], vec![window(6)], vec![window(4), window(5)]] {
+            assert!(matches!(
+                validate_current_reply_replay_scope(&invalid, 7, 5),
+                Err(RemoteRuntimeError::InvalidDurableState)
+            ));
+        }
     }
 }

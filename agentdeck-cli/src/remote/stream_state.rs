@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use agentdeck_protocol::e2ee::{KeyPurpose, STREAM_BINDING_MAX_CANONICAL_BYTES, StreamBindingV1};
-use agentdeck_protocol::relay_v2::{StreamGenerationId, StreamRouteId};
+use agentdeck_protocol::relay_v2::{KeyDirectoryRevision, StreamGenerationId, StreamRouteId};
 use agentdeck_protocol::runtime::{ConversationId, RuntimeInnerCursor, StreamCursor};
 use thiserror::Error;
 
@@ -224,6 +224,35 @@ impl DurableStreamBindingV1 {
     #[must_use]
     pub const fn binding(&self) -> &StreamBindingV1 {
         &self.binding
+    }
+
+    /// 同一 shared-key epoch 的 directory carrier rewrap 只推进 exact-next revision。
+    /// 所有 subscription、cursor、ACK、replay/quarantine 与 cleanup outbox 状态原样保留；
+    /// shared-key rotation 必须走独立的 epoch barrier/新 binding 安装路径。
+    pub(crate) fn with_rewrapped_key_revision(
+        &self,
+        next_revision: KeyDirectoryRevision,
+    ) -> Result<Self, RemoteStreamStateError> {
+        self.validate()?;
+        if !matches!(
+            self.binding.key_id.purpose,
+            KeyPurpose::Catalog | KeyPurpose::ConversationDek
+        ) {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+        let expected = self
+            .binding
+            .key_directory_revision
+            .next()
+            .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
+        if next_revision != expected {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+
+        let mut rewrapped = self.clone();
+        rewrapped.binding.key_directory_revision = next_revision;
+        rewrapped.validate()?;
+        Ok(rewrapped)
     }
 
     #[must_use]
@@ -1241,6 +1270,95 @@ mod tests {
         let (second_pending, disposition) = first_applied.admit_publish(1, 20, [0x72; 32]).unwrap();
         assert_eq!(disposition, StreamPublishDisposition::Fresh);
         second_pending
+    }
+
+    #[test]
+    fn shared_key_revision_rewrap_changes_only_the_exact_next_revision() {
+        let initial = catalog(0x2a);
+        let mut replacement = initial.binding.clone();
+        replacement.stream_route = StreamRouteId::from_bytes([0x2b; 16]);
+        replacement.stream_generation = StreamGenerationId::from_bytes([0x3b; 16]);
+        let rolled = initial
+            .replace_subscription_bootstrap(
+                replacement,
+                RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            )
+            .expect("install replacement subscription");
+        let (pending, disposition) = rolled.admit_publish(0, 10, [0x71; 32]).unwrap();
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+        let (applied, mode) = pending
+            .commit_direct_publish(
+                0,
+                RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::At(0),
+                },
+            )
+            .unwrap();
+        assert_eq!(mode, StreamDirectApplyMode::Apply);
+        let acked = applied.with_committed_outer_ack(0).unwrap();
+        let (next_pending, disposition) = acked.admit_publish(1, 20, [0x72; 32]).unwrap();
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+        let (quarantined, disposition) = next_pending.admit_publish(1, 20, [0x73; 32]).unwrap();
+        assert_eq!(disposition, StreamPublishDisposition::NonceReuseQuarantined);
+
+        let mut expected_catalog = quarantined.clone();
+        expected_catalog.binding.key_directory_revision = KeyDirectoryRevision::new(5);
+        assert_eq!(
+            quarantined
+                .with_rewrapped_key_revision(KeyDirectoryRevision::new(5))
+                .unwrap(),
+            expected_catalog,
+            "rewrap must preserve route/generation, cursors, ACK, replay, quarantine and retired subscriptions",
+        );
+
+        let conversation = conversation(0x2c, "rewrap-conversation");
+        let mut expected_conversation = conversation.clone();
+        expected_conversation.binding.key_directory_revision = KeyDirectoryRevision::new(5);
+        assert_eq!(
+            conversation
+                .with_rewrapped_key_revision(KeyDirectoryRevision::new(5))
+                .unwrap(),
+            expected_conversation,
+            "ConversationDEK uses the same exact metadata-only transition",
+        );
+    }
+
+    #[test]
+    fn shared_key_revision_rewrap_rejects_non_next_and_non_shared_revisions() {
+        let state = catalog(0x2d);
+        for revision in [0, 3, 4, 6] {
+            assert_eq!(
+                state
+                    .with_rewrapped_key_revision(KeyDirectoryRevision::new(revision))
+                    .unwrap_err(),
+                RemoteStreamStateError::InvalidCanonical,
+                "revision {revision} must not be accepted from current revision 4",
+            );
+        }
+
+        let mut exhausted = state.clone();
+        exhausted.binding.key_directory_revision = KeyDirectoryRevision::new(u64::MAX);
+        assert_eq!(
+            exhausted
+                .with_rewrapped_key_revision(KeyDirectoryRevision::new(u64::MAX))
+                .unwrap_err(),
+            RemoteStreamStateError::InvalidCanonical,
+            "revision exhaustion must fail closed instead of wrapping",
+        );
+
+        for purpose in [KeyPurpose::DeviceCommandTx, KeyPurpose::DeviceReplyTx] {
+            let mut directed = state.clone();
+            directed.binding.key_id.purpose = purpose;
+            assert_eq!(
+                directed
+                    .with_rewrapped_key_revision(KeyDirectoryRevision::new(5))
+                    .unwrap_err(),
+                RemoteStreamStateError::InvalidCanonical,
+                "directed key carriers never own StreamBinding state",
+            );
+        }
     }
 
     #[test]

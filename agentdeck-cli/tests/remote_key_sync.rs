@@ -206,6 +206,30 @@ fn initial_state() -> DurableKeySyncStateV1 {
     DurableKeySyncStateV1::start(observation, STARTED_AT_MS, first).expect("start bounded KeySync")
 }
 
+fn resolved_catalog_state() -> DurableKeySyncStateV1 {
+    let observation = catalog_observation();
+    let state = DurableKeySyncStateV1::start(
+        observation.clone(),
+        STARTED_AT_MS,
+        frozen_attempt(&observation, 1, 0x87),
+    )
+    .expect("start one-revision Catalog KeySync");
+    let update_set = update_set_for_request(active_send(&state).request());
+    let update_hash = update_set
+        .canonical_sha256()
+        .expect("resolved Catalog update hash");
+    state
+        .into_update_set_handoff(
+            STARTED_AT_MS + 1_000,
+            RequestRouteId::from_bytes([0x87; 16]),
+            update_set,
+        )
+        .expect("Catalog UpdateSet handoff")
+        .after_durable_install(STARTED_AT_MS + 2_000, update_hash)
+        .expect("durably resolve Catalog KeySync")
+        .into_state()
+}
+
 fn active_send(state: &DurableKeySyncStateV1) -> &FrozenKeySyncSendV1 {
     state.active_send().expect("fixture has an active probe")
 }
@@ -340,6 +364,16 @@ fn durable_installs_walk_11_to_14_without_resetting_one_budget() {
     assert_eq!(state.started_at_ms(), STARTED_AT_MS);
     assert_eq!(state.deadline_at_ms(), STARTED_AT_MS + KEY_SYNC_WINDOW_MS);
     assert_eq!(state.observation(), &retained_observation);
+    let first_ack = state
+        .latest_completed_ack_basis()
+        .expect("first durable ACK basis");
+    assert_eq!(first_ack.attempt(), 1);
+    assert_eq!(
+        first_ack.source_request_route(),
+        RequestRouteId::from_bytes([0x71; 16])
+    );
+    assert_eq!(first_ack.key_directory_revision().value(), 12);
+    assert_eq!(first_ack.update_set_sha256(), first_update_hash);
 
     let canonical = state
         .canonical_bytes()
@@ -356,6 +390,35 @@ fn durable_installs_walk_11_to_14_without_resetting_one_budget() {
             frozen_request(second_request.clone(), 0x72),
         )
         .expect("freeze second probe");
+    let current_after_first_install = DirectoryCurrentV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        machine_route: retained_observation.machine_route(),
+        device_route: retained_observation.device_route(),
+        grant_serial: retained_observation.grant_serial(),
+        root_trust_epoch: retained_observation.root_trust_epoch(),
+        current_key_directory_revision: second_request.known_key_directory_revision,
+        requested_key_directory_revision: second_request.requested_key_directory_revision,
+    };
+    let retry_second_request = state
+        .next_retry_request_after_directory_current(
+            STARTED_AT_MS + 3_500,
+            RequestRouteId::from_bytes([0x72; 16]),
+            &current_after_first_install,
+        )
+        .expect("derive retry from the installed intermediate revision");
+    assert_eq!(
+        retry_second_request.known_key_directory_revision.value(),
+        12
+    );
+    assert_eq!(
+        retry_second_request
+            .requested_key_directory_revision
+            .value(),
+        13
+    );
+    assert_eq!(retry_second_request.attempt, 3);
 
     let second_update = update_set_for_request(&second_request);
     let second_update_hash = second_update
@@ -384,6 +447,16 @@ fn durable_installs_walk_11_to_14_without_resetting_one_budget() {
     let state = second_outcome.into_state();
     assert_eq!(state.current_known_key_directory_revision().value(), 13);
     assert_eq!(state.attempt_count(), 2);
+    let second_ack = state
+        .latest_completed_ack_basis()
+        .expect("second durable ACK basis");
+    assert_eq!(second_ack.attempt(), 2);
+    assert_eq!(
+        second_ack.source_request_route(),
+        RequestRouteId::from_bytes([0x72; 16])
+    );
+    assert_eq!(second_ack.key_directory_revision().value(), 13);
+    assert_eq!(second_ack.update_set_sha256(), second_update_hash);
 
     let canonical = state
         .canonical_bytes()
@@ -426,6 +499,16 @@ fn durable_installs_walk_11_to_14_without_resetting_one_budget() {
         STARTED_AT_MS + KEY_SYNC_WINDOW_MS
     );
     assert_eq!(resolved.observation(), &retained_observation);
+    let third_ack = resolved
+        .latest_completed_ack_basis()
+        .expect("third durable ACK basis");
+    assert_eq!(third_ack.attempt(), 3);
+    assert_eq!(
+        third_ack.source_request_route(),
+        RequestRouteId::from_bytes([0x73; 16])
+    );
+    assert_eq!(third_ack.key_directory_revision().value(), 14);
+    assert_eq!(third_ack.update_set_sha256(), third_update_hash);
     assert_eq!(resolved.active_send(), None);
     assert_eq!(resolved.next_request(), Err(KeySyncError::ResponseConflict));
 }
@@ -493,6 +576,227 @@ fn same_observation_reuses_exact_send_and_different_signed_hash_conflicts() {
             Err(KeySyncError::ObservationConflict)
         );
     }
+}
+
+#[test]
+fn directory_current_can_be_validated_before_reserving_the_next_counter() {
+    let state = initial_state();
+    let status = directory_current(state.observation());
+    let before = state
+        .canonical_bytes()
+        .expect("state before read-only DirectoryCurrent validation");
+
+    let next = state
+        .next_retry_request_after_directory_current(
+            STARTED_AT_MS + 1_000,
+            RequestRouteId::from_bytes([0x71; 16]),
+            &status,
+        )
+        .expect("validate DirectoryCurrent before sealing");
+    assert_eq!(next.known_key_directory_revision.value(), 11);
+    assert_eq!(next.requested_key_directory_revision.value(), 12);
+    assert_eq!(next.attempt, 2);
+    assert_eq!(
+        state
+            .canonical_bytes()
+            .expect("state after read-only DirectoryCurrent validation"),
+        before,
+        "validation must not consume an attempt or mutate durable state"
+    );
+
+    assert_eq!(
+        state.next_retry_request_after_directory_current(
+            STARTED_AT_MS + 1_000,
+            RequestRouteId::from_bytes([0x70; 16]),
+            &status,
+        ),
+        Err(KeySyncError::ResponseConflict)
+    );
+    assert_eq!(state.attempt(), 1);
+}
+
+#[test]
+fn resolved_state_can_only_be_superseded_by_a_new_authenticated_revision_cycle() {
+    let resolved = resolved_catalog_state();
+    assert_eq!(resolved.status(), KeySyncCoordinationStatus::Resolved);
+    let prior_ack = resolved
+        .latest_completed_ack_basis()
+        .expect("resolved cycle has a durable ACK basis");
+    let before = resolved
+        .canonical_bytes()
+        .expect("resolved state before supersession validation");
+    let next_observation = SignedHigherRevisionObservationV1::new(
+        resolved.observation().machine_route(),
+        resolved.observation().device_route(),
+        resolved.observation().grant_serial(),
+        resolved.observation().root_trust_epoch(),
+        KeyDirectoryRevision::new(22),
+        KeyDirectoryRevision::new(23),
+        KeyId {
+            purpose: KeyPurpose::Catalog,
+            epoch: 9,
+        },
+        None,
+        StreamRouteId::from_bytes([0x83; 16]),
+        StreamGenerationId::from_bytes([0x84; 16]),
+        30,
+        32,
+        [0x91; 32],
+        [0x92; 32],
+    )
+    .expect("new signed higher-revision observation");
+    let next_request = resolved
+        .next_cycle_request(&next_observation, STARTED_AT_MS + 40_000)
+        .expect("expired resolved window does not reset the new cycle budget");
+    assert_eq!(next_request.known_key_directory_revision.value(), 22);
+    assert_eq!(next_request.requested_key_directory_revision.value(), 23);
+    assert_eq!(next_request.attempt, 1);
+    assert_eq!(
+        resolved
+            .canonical_bytes()
+            .expect("resolved state after read-only supersession validation"),
+        before
+    );
+
+    let next = resolved
+        .start_next_cycle(
+            next_observation.clone(),
+            STARTED_AT_MS + 40_000,
+            frozen_request(next_request, 0x93),
+        )
+        .expect("start a fresh bounded cycle after authenticated supersession");
+    assert_eq!(next.status(), KeySyncCoordinationStatus::Active);
+    assert_eq!(next.attempt(), 1);
+    assert_eq!(next.started_at_ms(), STARTED_AT_MS + 40_000);
+    assert_eq!(next.observation(), &next_observation);
+    assert_eq!(
+        next.latest_completed_ack_basis(),
+        Some(prior_ack),
+        "new active cycle retains the old ACK basis across the CAS/send crash gap"
+    );
+    let reopened = DurableKeySyncStateV1::from_canonical_bytes(
+        &next
+            .canonical_bytes()
+            .expect("encode superseding cycle with retained ACK"),
+    )
+    .expect("restart preserves retained ACK basis");
+    assert_eq!(reopened, next);
+    assert_eq!(reopened.latest_completed_ack_basis(), Some(prior_ack));
+
+    let wrong_known = SignedHigherRevisionObservationV1::new(
+        resolved.observation().machine_route(),
+        resolved.observation().device_route(),
+        resolved.observation().grant_serial(),
+        resolved.observation().root_trust_epoch(),
+        KeyDirectoryRevision::new(21),
+        KeyDirectoryRevision::new(23),
+        KeyId {
+            purpose: KeyPurpose::Catalog,
+            epoch: 9,
+        },
+        None,
+        StreamRouteId::from_bytes([0x83; 16]),
+        StreamGenerationId::from_bytes([0x84; 16]),
+        30,
+        32,
+        [0x93; 32],
+        [0x94; 32],
+    )
+    .expect("structurally valid stale-known observation");
+    assert_eq!(
+        resolved.next_cycle_request(&wrong_known, STARTED_AT_MS + 40_000),
+        Err(KeySyncError::ObservationConflict)
+    );
+    assert_eq!(
+        resolved.next_cycle_request(&next_observation, STARTED_AT_MS + 1_999),
+        Err(KeySyncError::ClockRollback)
+    );
+}
+
+#[test]
+fn retained_ack_extension_is_canonical_and_rejects_malformed_truncated_or_trailing_bytes() {
+    let resolved = resolved_catalog_state();
+    let next_observation = SignedHigherRevisionObservationV1::new(
+        resolved.observation().machine_route(),
+        resolved.observation().device_route(),
+        resolved.observation().grant_serial(),
+        resolved.observation().root_trust_epoch(),
+        KeyDirectoryRevision::new(22),
+        KeyDirectoryRevision::new(23),
+        KeyId {
+            purpose: KeyPurpose::Catalog,
+            epoch: 9,
+        },
+        None,
+        StreamRouteId::from_bytes([0x83; 16]),
+        StreamGenerationId::from_bytes([0x84; 16]),
+        30,
+        32,
+        [0x91; 32],
+        [0x92; 32],
+    )
+    .expect("new signed higher-revision observation");
+    let next_request = resolved
+        .next_cycle_request(&next_observation, STARTED_AT_MS + 40_000)
+        .expect("next-cycle request");
+    let next = resolved
+        .start_next_cycle(
+            next_observation,
+            STARTED_AT_MS + 40_000,
+            frozen_request(next_request, 0x93),
+        )
+        .expect("active next cycle with retained ACK basis");
+    let canonical = next
+        .canonical_bytes()
+        .expect("canonical retained ACK extension");
+    let extension_offset = canonical
+        .windows(4)
+        .position(|window| window == b"AKA1")
+        .expect("AKA1 extension magic");
+    assert_eq!(
+        canonical
+            .windows(4)
+            .filter(|window| *window == b"AKA1")
+            .count(),
+        1
+    );
+    let reopened = DurableKeySyncStateV1::from_canonical_bytes(&canonical)
+        .expect("canonical retained extension roundtrip");
+    assert_eq!(reopened, next);
+    assert_eq!(
+        reopened
+            .canonical_bytes()
+            .expect("retained extension canonical re-encode"),
+        canonical
+    );
+
+    let set_body_len = |bytes: &mut Vec<u8>| {
+        let body_len = u32::try_from(bytes.len() - 12).expect("bounded ADKS body");
+        bytes[8..12].copy_from_slice(&body_len.to_be_bytes());
+    };
+
+    let mut malformed_magic = canonical.clone();
+    malformed_magic[extension_offset] ^= 0x01;
+    assert_eq!(
+        DurableKeySyncStateV1::from_canonical_bytes(&malformed_magic),
+        Err(KeySyncError::InvalidCanonical)
+    );
+
+    let mut truncated = canonical.clone();
+    truncated.pop();
+    set_body_len(&mut truncated);
+    assert_eq!(
+        DurableKeySyncStateV1::from_canonical_bytes(&truncated),
+        Err(KeySyncError::InvalidCanonical)
+    );
+
+    let mut trailing = canonical;
+    trailing.push(0x00);
+    set_body_len(&mut trailing);
+    assert_eq!(
+        DurableKeySyncStateV1::from_canonical_bytes(&trailing),
+        Err(KeySyncError::InvalidCanonical)
+    );
 }
 
 #[test]

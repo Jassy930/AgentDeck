@@ -24,6 +24,7 @@ use thiserror::Error;
 const KEY_SYNC_STATE_MAGIC: &[u8; 4] = b"ADKS";
 const KEY_SYNC_STATE_VERSION: u16 = 1;
 const KEY_SYNC_STATE_HEADER_LEN: usize = 12;
+const RETAINED_ACK_EXTENSION_MAGIC: &[u8; 4] = b"AKA1";
 const MAX_KEY_SYNC_REQUEST_BYTES: usize = 8 * 1024;
 const MAX_DURABLE_KEY_SYNC_STATE_BYTES: usize = 256 * 1024;
 
@@ -387,6 +388,7 @@ pub struct DurableKeySyncStateV1 {
     current_known_key_directory_revision: KeyDirectoryRevision,
     attempts: Vec<KeySyncAttemptRecord>,
     completed_updates: Vec<CompletedKeySyncUpdate>,
+    retained_ack_basis: Option<KeyUpdateAckBasisV1>,
 }
 
 impl fmt::Debug for DurableKeySyncStateV1 {
@@ -420,6 +422,7 @@ impl DurableKeySyncStateV1 {
                 frozen: first,
             }],
             completed_updates: Vec::new(),
+            retained_ack_basis: None,
         };
         value.validate()?;
         Ok(value)
@@ -444,15 +447,15 @@ impl DurableKeySyncStateV1 {
         self.active_send().ok_or(KeySyncError::InvalidCanonical)
     }
 
-    /// authenticated `DirectoryCurrent` 不是 ACK；只在它精确关联当前 request 时消费一次
-    /// attempt，并冻结调用方已按 `attempt+1` 生成的新 `Send`。
-    pub fn retry_after_directory_current(
-        &mut self,
+    /// 在预留 counter、seal 与持久化之前只读验证 authenticated `DirectoryCurrent`，
+    /// 并返回下一次应当承载的 canonical request。这样无效 route/status、deadline 或
+    /// attempt budget 不会消耗不可回退的 durable counter。
+    pub fn next_retry_request_after_directory_current(
+        &self,
         now_ms: u64,
         reply_request_route: RequestRouteId,
         status: &DirectoryCurrentV1,
-        next: FrozenKeySyncSendV1,
-    ) -> Result<&FrozenKeySyncSendV1, KeySyncError> {
+    ) -> Result<KeySyncRequestV1, KeySyncError> {
         self.validate()?;
         self.check_time(now_ms)?;
         if self.attempts.len() >= usize::from(KEY_SYNC_MAX_ATTEMPTS) {
@@ -476,12 +479,25 @@ impl DurableKeySyncStateV1 {
         }
         let next_attempt =
             u8::try_from(self.attempts.len() + 1).map_err(|_| KeySyncError::Exhausted)?;
-        if next.request
-            != build_request(
-                &self.observation,
-                self.current_known_key_directory_revision,
-                next_attempt,
-            )?
+        build_request(
+            &self.observation,
+            self.current_known_key_directory_revision,
+            next_attempt,
+        )
+    }
+
+    /// authenticated `DirectoryCurrent` 不是 ACK；只在它精确关联当前 request 时消费一次
+    /// attempt，并冻结调用方已按 `attempt+1` 生成的新 `Send`。
+    pub fn retry_after_directory_current(
+        &mut self,
+        now_ms: u64,
+        reply_request_route: RequestRouteId,
+        status: &DirectoryCurrentV1,
+        next: FrozenKeySyncSendV1,
+    ) -> Result<&FrozenKeySyncSendV1, KeySyncError> {
+        let expected =
+            self.next_retry_request_after_directory_current(now_ms, reply_request_route, status)?;
+        if next.request != expected
             || self
                 .attempts
                 .iter()
@@ -497,6 +513,65 @@ impl DurableKeySyncStateV1 {
         self.last_observed_at_ms = now_ms;
         self.validate()?;
         self.active_send().ok_or(KeySyncError::InvalidCanonical)
+    }
+
+    /// 为下一轮已签名 higher-revision observation 做纯只读验证，并返回新的 attempt-1
+    /// request。旧协调必须已经 Resolved；新 observation 必须从刚安装的 revision 继续，
+    /// authority 不得漂移。旧 30 秒窗口不会延长，而是从 `started_at_ms` 开始一轮全新的
+    /// bounded budget；跨轮 persistent clock watermark 仍禁止回退。
+    ///
+    /// 调用方必须先重发旧 durable ACK，再预留 counter/seal，并通过
+    /// [`Self::start_next_cycle`] 与旧 Resolved ADKS 做单次 CAS。Relay `RouteAccepted` 本身
+    /// 绝不能调用这个 supersession seam。
+    pub fn next_cycle_request(
+        &self,
+        observation: &SignedHigherRevisionObservationV1,
+        started_at_ms: u64,
+    ) -> Result<KeySyncRequestV1, KeySyncError> {
+        self.validate()?;
+        observation.validate()?;
+        if self.status() != KeySyncCoordinationStatus::Resolved {
+            return Err(KeySyncError::ResponseConflict);
+        }
+        if started_at_ms < self.last_observed_at_ms {
+            return Err(KeySyncError::ClockRollback);
+        }
+        if observation.machine_route != self.observation.machine_route
+            || observation.device_route != self.observation.device_route
+            || observation.grant_serial != self.observation.grant_serial
+            || observation.root_trust_epoch != self.observation.root_trust_epoch
+            || observation.known_key_directory_revision != self.current_known_key_directory_revision
+        {
+            return Err(KeySyncError::ObservationConflict);
+        }
+        observation.request_for_attempt(1)
+    }
+
+    /// 构造下一轮 coordination state；重复执行上述只读验证，并拒绝复用上一轮的
+    /// requestRoute。返回值仍需由 paired-state CAS 原子替换旧 Resolved ADKS。
+    pub fn start_next_cycle(
+        &self,
+        observation: SignedHigherRevisionObservationV1,
+        started_at_ms: u64,
+        first: FrozenKeySyncSendV1,
+    ) -> Result<Self, KeySyncError> {
+        let expected = self.next_cycle_request(&observation, started_at_ms)?;
+        if first.request != expected
+            || self
+                .attempts
+                .iter()
+                .any(|attempt| attempt.frozen.request_route == first.request_route)
+        {
+            return Err(KeySyncError::ResponseConflict);
+        }
+        first.validate()?;
+        let retained_ack_basis = self
+            .latest_completed_ack_basis()
+            .ok_or(KeySyncError::InvalidCanonical)?;
+        let mut next = Self::start(observation, started_at_ms, first)?;
+        next.retained_ack_basis = Some(retained_ack_basis);
+        next.validate()?;
+        Ok(next)
     }
 
     /// 已 durable 安装上一轮 UpdateSet 后，按同一 observation、绝对 deadline 与总 attempt
@@ -516,6 +591,14 @@ impl DurableKeySyncStateV1 {
             self.current_known_key_directory_revision,
             attempt,
         )
+    }
+
+    /// AwaitingProbe 冷恢复的只读 preflight；deadline/clock 失败必须发生在新的
+    /// CounterGuard reservation、seal 与 paired-state CAS 之前。
+    pub(crate) fn next_request_at(&self, now_ms: u64) -> Result<KeySyncRequestV1, KeySyncError> {
+        self.validate()?;
+        self.check_time(now_ms)?;
+        self.next_request()
     }
 
     /// 在安装事务已把 continuation state 持久化后，用新 active DeviceCommandTx capability
@@ -624,6 +707,13 @@ impl DurableKeySyncStateV1 {
             put_bytes(&mut body, &attempt.frozen.exact_send)?;
             body.extend_from_slice(&attempt.frozen.exact_send_sha256);
         }
+        if let Some(retained) = self.retained_ack_basis {
+            body.extend_from_slice(RETAINED_ACK_EXTENSION_MAGIC);
+            body.push(retained.attempt);
+            body.extend_from_slice(retained.source_request_route.as_bytes());
+            body.extend_from_slice(&retained.key_directory_revision.value().to_be_bytes());
+            body.extend_from_slice(&retained.update_set_sha256);
+        }
         if body.len() > MAX_DURABLE_KEY_SYNC_STATE_BYTES - KEY_SYNC_STATE_HEADER_LEN {
             return Err(KeySyncError::TooLarge);
         }
@@ -707,6 +797,19 @@ impl DurableKeySyncStateV1 {
                 frozen,
             });
         }
+        let retained_ack_basis = if decoder.remaining() == 0 {
+            None
+        } else {
+            if decoder.fixed::<4>()? != *RETAINED_ACK_EXTENSION_MAGIC {
+                return Err(KeySyncError::InvalidCanonical);
+            }
+            Some(KeyUpdateAckBasisV1 {
+                attempt: decoder.u8()?,
+                source_request_route: RequestRouteId::from_bytes(decoder.fixed()?),
+                key_directory_revision: KeyDirectoryRevision::new(decoder.u64()?),
+                update_set_sha256: decoder.fixed()?,
+            })
+        };
         decoder.finish()?;
         let value = Self {
             observation,
@@ -716,6 +819,7 @@ impl DurableKeySyncStateV1 {
             current_known_key_directory_revision,
             attempts,
             completed_updates,
+            retained_ack_basis,
         };
         value.validate()?;
         if value.canonical_bytes()? != bytes {
@@ -743,6 +847,18 @@ impl DurableKeySyncStateV1 {
         {
             return Err(KeySyncError::InvalidCanonical);
         }
+        if let Some(retained) = self.retained_ack_basis
+            && (!self.completed_updates.is_empty()
+                || self.status() != KeySyncCoordinationStatus::Active
+                || retained.attempt == 0
+                || retained.attempt > KEY_SYNC_MAX_ATTEMPTS
+                || is_zero(retained.source_request_route.as_bytes())
+                || retained.key_directory_revision != self.observation.known_key_directory_revision
+                || retained.key_directory_revision != self.current_known_key_directory_revision
+                || is_zero(&retained.update_set_sha256))
+        {
+            return Err(KeySyncError::InvalidCanonical);
+        }
 
         let mut previous_completed_attempt = 0_u8;
         for completed in &self.completed_updates {
@@ -759,7 +875,10 @@ impl DurableKeySyncStateV1 {
         let mut known_revision = self.observation.known_key_directory_revision;
         let mut completed_index = 0_usize;
         let mut last_event_at_ms = self.started_at_ms;
-        let mut routes = HashSet::with_capacity(self.attempts.len());
+        let mut routes = HashSet::with_capacity(self.attempts.len() + 1);
+        if let Some(retained) = self.retained_ack_basis {
+            routes.insert(*retained.source_request_route.as_bytes());
+        }
         for (index, attempt) in self.attempts.iter().enumerate() {
             let attempt_number =
                 u8::try_from(index + 1).map_err(|_| KeySyncError::InvalidCanonical)?;
@@ -878,6 +997,24 @@ impl DurableKeySyncStateV1 {
         self.attempts.len()
     }
 
+    /// 最近一次 durable install 的不可伪造 ACK basis。`attempt` 必须反查同一 ADKS
+    /// history 中冻结的 source requestRoute；revision/hash 单独不足以证明 ACK 属于哪次
+    /// authenticated KeySync Reply。
+    #[must_use]
+    pub fn latest_completed_ack_basis(&self) -> Option<KeyUpdateAckBasisV1> {
+        let Some(completed) = self.completed_updates.last() else {
+            return self.retained_ack_basis;
+        };
+        let attempt_index = usize::from(completed.attempt).checked_sub(1)?;
+        let attempt = self.attempts.get(attempt_index)?;
+        Some(KeyUpdateAckBasisV1 {
+            attempt: completed.attempt,
+            source_request_route: attempt.frozen.request_route,
+            key_directory_revision: completed.key_directory_revision,
+            update_set_sha256: completed.update_set_sha256,
+        })
+    }
+
     #[must_use]
     pub fn active_send(&self) -> Option<&FrozenKeySyncSendV1> {
         (self.status() == KeySyncCoordinationStatus::Active).then(|| {
@@ -887,6 +1024,17 @@ impl DurableKeySyncStateV1 {
                 .expect("active KeySync state always has an attempt")
                 .frozen
         })
+    }
+
+    /// 冷启动或 transport ambiguity 后只读取得仍在 30 秒预算内的 frozen active Send。
+    /// 不更新 `last_observed_at_ms`、不重置 deadline，也不生成新的 route/counter。
+    pub(crate) fn active_retry_at(
+        &self,
+        now_ms: u64,
+    ) -> Result<&FrozenKeySyncSendV1, KeySyncError> {
+        self.validate()?;
+        self.check_time(now_ms)?;
+        self.active_send().ok_or(KeySyncError::InvalidCanonical)
     }
 }
 
@@ -910,6 +1058,13 @@ impl fmt::Debug for KeySyncUpdateSetHandoff {
 }
 
 impl KeySyncUpdateSetHandoff {
+    /// 返回产生 handoff 的完整 authenticated coordination state；combined installer
+    /// 必须把它与当前 durable ADKS exact 对照，不能只相信公开 revision/hash。
+    #[must_use]
+    pub(crate) const fn retained_state(&self) -> &DurableKeySyncStateV1 {
+        &self.state
+    }
+
     #[must_use]
     pub const fn completed_at_ms(&self) -> u64 {
         self.completed_at_ms
@@ -1003,6 +1158,9 @@ impl KeySyncUpdateSetHandoff {
             key_directory_revision: self.requested_key_directory_revision,
             update_set_sha256: self.update_set_sha256,
         });
+        // authenticated exact-next UpdateSet 证明 daemon 已处理携带 known revision 的
+        // 新 KeySync request；此时旧 cycle ACK basis 才可由本次新 completion 取代。
+        self.state.retained_ack_basis = None;
         self.state.current_known_key_directory_revision = self.requested_key_directory_revision;
         self.state.last_observed_at_ms = installed_at_ms;
         self.state.validate()?;
@@ -1014,6 +1172,45 @@ impl KeySyncUpdateSetHandoff {
                 return Err(KeySyncError::InvalidCanonical);
             }
         })
+    }
+}
+
+/// 已由 ADKS completion record 与其 exact frozen attempt 共同证明的 KeyUpdateAck basis。
+/// 该值不含 secret，也不冻结新的 outbound Send；重启可使用新的 requestRoute/counter 重新
+/// seal 同一个 canonical ACK，但不能改变 source attempt/revision/UpdateSet hash。
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct KeyUpdateAckBasisV1 {
+    attempt: u8,
+    source_request_route: RequestRouteId,
+    key_directory_revision: KeyDirectoryRevision,
+    update_set_sha256: [u8; 32],
+}
+
+impl fmt::Debug for KeyUpdateAckBasisV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("KeyUpdateAckBasisV1([REDACTED])")
+    }
+}
+
+impl KeyUpdateAckBasisV1 {
+    #[must_use]
+    pub const fn attempt(self) -> u8 {
+        self.attempt
+    }
+
+    #[must_use]
+    pub const fn source_request_route(self) -> RequestRouteId {
+        self.source_request_route
+    }
+
+    #[must_use]
+    pub const fn key_directory_revision(self) -> KeyDirectoryRevision {
+        self.key_directory_revision
+    }
+
+    #[must_use]
+    pub const fn update_set_sha256(self) -> [u8; 32] {
+        self.update_set_sha256
     }
 }
 
@@ -1242,6 +1439,10 @@ impl<'a> Decoder<'a> {
             return Err(KeySyncError::InvalidCanonical);
         }
         self.take(length)
+    }
+
+    const fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.cursor)
     }
 
     fn finish(self) -> Result<(), KeySyncError> {
