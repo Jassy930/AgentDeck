@@ -62,6 +62,7 @@ use super::crypto_state::{
     revocation_cleanup_entries_absent_in,
 };
 use super::device_lock::{RemoteDeviceLease, RemoteDeviceLockError, RemoteDeviceLockKey};
+use super::key_sync::DurableKeySyncStateV1;
 use super::keychain::{
     PairedRemoteKeyPurpose, ParsedPairedRemoteKeyAccount, PendingRemoteKeyPurpose,
     RemoteKeyAccount, RemoteKeyStore, RemoteKeyStoreError, RemoteSecret,
@@ -73,6 +74,7 @@ const STATE_MAGIC: &[u8; 4] = b"ADPS";
 const STATE_VERSION: u16 = 1;
 const MUTABLE_STATE_VERSION: u16 = 2;
 const TYPED_RUNTIME_STATE_VERSION: u16 = 3;
+const KEY_SYNC_STATE_VERSION: u16 = 4;
 const STATE_HEADER_LEN: usize = 12;
 const MAX_STATE_FIELD_LEN: usize = 8 * 1024 * 1024;
 const MAX_STATE_STRING_LEN: usize = 8 * 1024;
@@ -731,9 +733,11 @@ fn validate_typed_stream_state_and_stage(
     opened_keys: &[OpenedPairedDirectoryKey],
 ) -> Result<(), PairedPromotionError> {
     validate_typed_stream_state(state, context, authorization, opened_keys)?;
+    validate_key_sync_state_against_audit(state, context)?;
     if let Some(prepared) = prepared_stage {
         let next = PairedCryptoState::decode(prepared.snapshot().expose_secret())?;
         validate_typed_stream_state(&next, context, authorization, opened_keys)?;
+        validate_key_sync_state_against_audit(&next, context)?;
     }
     Ok(())
 }
@@ -756,6 +760,52 @@ fn validate_typed_stream_state(
         )?;
     }
     Ok(())
+}
+
+/// ADKS canonical bytes 只证明编码有效；durable acceptance 还必须绑定当前 paired
+/// authority、已安装 directory revision，以及产生 higher-revision observation 的 exact
+/// live publication slot。active、prepared 与 commit candidate 共用这一条审计路径。
+fn validate_key_sync_state_against_audit(
+    state: &PairedCryptoState,
+    context: StreamBindingAuditContext,
+) -> Result<(), PairedPromotionError> {
+    let Some(key_sync) = state.durable_key_sync_state()? else {
+        return Ok(());
+    };
+    let observation = key_sync.observation();
+    if observation.machine_route() != context.identity.machine_route
+        || observation.device_route() != context.device_route
+        || observation.grant_serial() != context.grant_serial
+        || observation.root_trust_epoch() != context.trust_epoch
+        || key_sync.current_known_key_directory_revision() != context.directory_revision
+    {
+        return Err(PairedPromotionError::Conflict);
+    }
+
+    let bindings = state.durable_stream_bindings()?;
+    // V1/V2 legacy state 没有 typed publication inventory；首次 V4 migration 仍可由
+    // marker/directory 的硬 authority 轴授权。只要 inventory 已存在，就必须 exact 命中，
+    // 不允许用另一路 route/generation 或 purpose/slot 注入 canonical ADKS。
+    if bindings.is_empty() {
+        return Ok(());
+    }
+    let matching_publications = bindings
+        .into_iter()
+        .filter(|durable| {
+            let binding = durable.binding();
+            binding.stream_route == observation.publication_stream_route()
+                && binding.stream_generation == observation.publication_stream_generation()
+                && binding.key_directory_revision == key_sync.current_known_key_directory_revision()
+                && binding.key_id.purpose == observation.observed_key_id().purpose
+                && stream_key_slot_route(binding.key_id, binding.stream_route).ok()
+                    == Some(observation.key_slot_stream_route())
+        })
+        .count();
+    if matching_publications == 1 {
+        Ok(())
+    } else {
+        Err(PairedPromotionError::Conflict)
+    }
 }
 
 struct AuditedPairedMachine {
@@ -1365,6 +1415,144 @@ impl OpenedPairedMachine<'_> {
         &self,
     ) -> Result<Vec<DurableStreamBindingV1>, PairedPromotionError> {
         self.audited.state.durable_stream_bindings()
+    }
+
+    /// 返回 open-time 已完成 canonical 审计的 KeySync coordination owned projection。
+    /// V1/V2/V3 与 V4 的 empty optional field 都映射为 `None`。
+    pub fn durable_key_sync_state(
+        &self,
+    ) -> Result<Option<DurableKeySyncStateV1>, PairedPromotionError> {
+        self.audited.state.durable_key_sync_state()
+    }
+
+    /// 以完整 canonical ADKS bytes 做 CAS，并复用 paired state 的 prepared/guard 前滚事务。
+    /// exact replacement 优先于 expected 比较，因此 committed retry 即使携带 stale expected
+    /// 也不会取 entropy 或产生 durable write。
+    pub(crate) fn commit_key_sync_state_transition<R: CryptoRng>(
+        &mut self,
+        expected: Option<&DurableKeySyncStateV1>,
+        replacement: Option<&DurableKeySyncStateV1>,
+        rng: &mut R,
+    ) -> Result<Option<DurableKeySyncStateV1>, PairedPromotionError> {
+        let canonical_bytes = |state: Option<&DurableKeySyncStateV1>| {
+            state
+                .map(|value| {
+                    value
+                        .canonical_bytes()
+                        .map_err(|_| PairedPromotionError::InvalidState)
+                })
+                .transpose()
+        };
+        let expected_bytes = canonical_bytes(expected)?;
+        let replacement_bytes = canonical_bytes(replacement)?;
+
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        let current_bytes = self
+            .audited
+            .state
+            .key_sync_state_bytes()
+            .map(ToOwned::to_owned);
+        if current_bytes == replacement_bytes {
+            return self.audited.state.durable_key_sync_state();
+        }
+        if current_bytes != expected_bytes {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        let next_state = self.audited.state.with_key_sync_state_bytes(
+            self.audited.marker.state_plaintext_hash,
+            self.audited.marker.counter_guard_hash,
+            replacement_bytes.clone(),
+            true,
+        )?;
+        validate_key_sync_state_against_audit(
+            &next_state,
+            StreamBindingAuditContext {
+                identity: self.audited.identity,
+                device_route: self.audited.device_route,
+                grant_serial: self.audited.grant_serial,
+                trust_epoch: self.audited.trust_epoch,
+                directory_revision: self.audited.directory_revision,
+            },
+        )?;
+        let next_state_bytes = next_state.encode()?;
+        match self.commit_prepared_state_transition(next_state, next_state_bytes, rng) {
+            Ok(()) => self.audited.state.durable_key_sync_state(),
+            Err(write_error) => {
+                // guard finalize 或 sidecar cleanup 失败时，先前 active CAS 可能已经提交。
+                // 只在完整 durable readback 等于 candidate 时把结果升级为成功。
+                if self.refresh_mutable_state().is_err() {
+                    return Err(write_error);
+                }
+                let _recovery = self.recover_pending_guard();
+                let recovered_bytes = self
+                    .audited
+                    .state
+                    .key_sync_state_bytes()
+                    .map(ToOwned::to_owned);
+                if recovered_bytes == replacement_bytes {
+                    self.audited.state.durable_key_sync_state()
+                } else if recovered_bytes == expected_bytes {
+                    Err(write_error)
+                } else {
+                    Err(PairedPromotionError::Conflict)
+                }
+            }
+        }
+    }
+
+    /// 仅供 automatic integration harness 驱动 crate-private authenticated KeySync commit。
+    /// production handle 在读取 state、canonical candidate、entropy 与任一 durable mutation
+    /// 之前拒绝，不能把公开可构造的 observation 当作 ingress proof type。
+    #[doc(hidden)]
+    pub fn commit_key_sync_state_transition_for_automatic_harness<R: CryptoRng>(
+        &mut self,
+        expected: Option<&DurableKeySyncStateV1>,
+        replacement: Option<&DurableKeySyncStateV1>,
+        rng: &mut R,
+    ) -> Result<Option<DurableKeySyncStateV1>, PairedPromotionError> {
+        if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        self.commit_key_sync_state_transition(expected, replacement, rng)
+    }
+
+    /// 仅供 automatic fault harness 写入非 canonical ADKS，证明后续 `list`/`open`
+    /// 全库审计 fail-close 且零改写。production handle 在读取 state、取 entropy 与任一
+    /// durable mutation 之前拒绝。
+    #[doc(hidden)]
+    pub fn replace_unchecked_key_sync_state_for_automatic_harness<R: CryptoRng>(
+        &mut self,
+        replacement: Option<Vec<u8>>,
+        rng: &mut R,
+    ) -> Result<(), PairedPromotionError> {
+        if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
+        {
+            return Err(PairedPromotionError::InvalidState);
+        }
+
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        if self.audited.state.key_sync_state_bytes() == replacement.as_deref() {
+            return Ok(());
+        }
+        let next_state = self.audited.state.with_key_sync_state_bytes(
+            self.audited.marker.state_plaintext_hash,
+            self.audited.marker.counter_guard_hash,
+            replacement,
+            false,
+        )?;
+        let next_state_bytes = match &next_state {
+            PairedCryptoState::V4(value) => {
+                value.encode_version_inner(KEY_SYNC_STATE_VERSION, false)?
+            }
+            PairedCryptoState::V1(_) | PairedCryptoState::V2(_) | PairedCryptoState::V3(_) => {
+                return Err(PairedPromotionError::InvalidState);
+            }
+        };
+        self.commit_prepared_state_transition(next_state, next_state_bytes, rng)
     }
 
     /// 安装 directed `StreamBindingV1` 的初始 durable cut。相同 target 只允许 exact
@@ -2035,7 +2223,10 @@ impl OpenedPairedMachine<'_> {
         rng: &mut R,
     ) -> Result<AutomaticRuntimeStateProbe, PairedPromotionError> {
         if self.runtime_state_mutation_authority != RuntimeStateMutationAuthority::AutomaticHarness
-            || matches!(self.audited.state, PairedCryptoState::V3(_))
+            || matches!(
+                self.audited.state,
+                PairedCryptoState::V3(_) | PairedCryptoState::V4(_)
+            )
         {
             return Err(PairedPromotionError::InvalidState);
         }
@@ -2076,7 +2267,32 @@ impl OpenedPairedMachine<'_> {
         if &current_runtime == replacement {
             return Ok(current_runtime);
         }
+        let next_state = if force_legacy_v2 {
+            self.audited.state.with_legacy_v2_opaque_runtime_state(
+                self.audited.marker.state_plaintext_hash,
+                self.audited.marker.counter_guard_hash,
+                replacement,
+            )?
+        } else {
+            self.audited.state.with_opaque_runtime_state(
+                self.audited.marker.state_plaintext_hash,
+                self.audited.marker.counter_guard_hash,
+                replacement,
+            )?
+        };
+        let next_state_bytes = next_state.encode()?;
+        self.commit_prepared_state_transition(next_state, next_state_bytes, rng)?;
+        Ok(self.audited.state.opaque_runtime_state())
+    }
 
+    /// 以 prepared sidecar 认证 exact next，再依次提交 StatePending、active、StateStable
+    /// 并清理 sidecar。调用方必须先 refresh + recover，并在本函数前完成 CAS/幂等判断。
+    fn commit_prepared_state_transition<R: CryptoRng>(
+        &mut self,
+        next_state: PairedCryptoState,
+        next_state_bytes: Vec<u8>,
+        rng: &mut R,
+    ) -> Result<(), PairedPromotionError> {
         let (reserved_high_water, current_state_hash, binding, initial_guard_commitment) =
             match self.audited.counter_guard {
                 CounterGuardState::V1(guard) => (
@@ -2125,20 +2341,7 @@ impl OpenedPairedMachine<'_> {
         if current_state_hash != sha256(self.audited.state_snapshot.expose_secret()) {
             return Err(PairedPromotionError::Conflict);
         }
-        let next_state = if force_legacy_v2 {
-            self.audited.state.with_legacy_v2_opaque_runtime_state(
-                self.audited.marker.state_plaintext_hash,
-                self.audited.marker.counter_guard_hash,
-                replacement,
-            )?
-        } else {
-            self.audited.state.with_opaque_runtime_state(
-                self.audited.marker.state_plaintext_hash,
-                self.audited.marker.counter_guard_hash,
-                replacement,
-            )?
-        };
-        let next_state_bytes = next_state.encode()?;
+
         let next_state_hash = sha256(&next_state_bytes);
         let next_snapshot = CryptoStateSnapshot::new(next_state_bytes);
         let mut mutation_id = [0_u8; 16];
@@ -2199,8 +2402,7 @@ impl OpenedPairedMachine<'_> {
         )?;
         self.replace_counter_guard(CounterGuardState::V2(stable))?;
         self.observe_mutation(PairedMutationStage::StateGuardStableDurable);
-        self.clear_authenticated_prepared_stage()?;
-        Ok(self.audited.state.opaque_runtime_state())
+        self.clear_authenticated_prepared_stage()
     }
 
     /// 先提升 Keychain guard，再替换 sealed state，最后 finalize guard。
@@ -4127,6 +4329,7 @@ fn validate_counter_guard_state(
         (CounterGuardState::V1(_), PairedCryptoState::V1(_)) => Err(PairedPromotionError::Conflict),
         (CounterGuardState::V1(_), PairedCryptoState::V2(_)) => Err(PairedPromotionError::Conflict),
         (CounterGuardState::V1(_), PairedCryptoState::V3(_)) => Err(PairedPromotionError::Conflict),
+        (CounterGuardState::V1(_), PairedCryptoState::V4(_)) => Err(PairedPromotionError::Conflict),
         (CounterGuardState::V2(value), _) => {
             if value.initial_guard_commitment != marker.counter_guard_hash
                 || value.directory_revision != marker.directory_revision
@@ -4357,10 +4560,10 @@ fn validate_runtime_only_transition(
     next: &PairedCryptoState,
     next_bytes: &[u8],
 ) -> Result<(), PairedPromotionError> {
-    let rebuilt = previous.with_opaque_runtime_state(
+    let rebuilt = previous.rebuild_mutable_projection_from(
         marker.state_plaintext_hash,
         marker.counter_guard_hash,
-        &next.opaque_runtime_state(),
+        next,
     )?;
     let rebuilt_bytes = Zeroizing::new(rebuilt.encode()?);
     if rebuilt_bytes.as_slice() == next_bytes {
@@ -4394,10 +4597,12 @@ fn state_matches_previous_high_water(state: &PairedCryptoState, high_water: u64)
     match state {
         // V1 guard 本身只编码初始 HWM=0；任何非零值都必须已有 V2 sealed fence。
         PairedCryptoState::V1(_) => high_water == 0,
-        PairedCryptoState::V2(_) | PairedCryptoState::V3(_) => match state.counter_reservation() {
-            Some(reservation) => reservation.end_exclusive == high_water,
-            None => high_water == 0,
-        },
+        PairedCryptoState::V2(_) | PairedCryptoState::V3(_) | PairedCryptoState::V4(_) => {
+            match state.counter_reservation() {
+                Some(reservation) => reservation.end_exclusive == high_water,
+                None => high_water == 0,
+            }
+        }
     }
 }
 
@@ -4405,10 +4610,12 @@ fn state_matches_stable_high_water(state: &PairedCryptoState, high_water: u64) -
     match state {
         // stable V2 总在 sealed-state CAS 之后；V1 state 是不可能的 durable 顺序。
         PairedCryptoState::V1(_) => false,
-        PairedCryptoState::V2(_) | PairedCryptoState::V3(_) => match state.counter_reservation() {
-            Some(reservation) => reservation.end_exclusive == high_water,
-            None => high_water == 0,
-        },
+        PairedCryptoState::V2(_) | PairedCryptoState::V3(_) | PairedCryptoState::V4(_) => {
+            match state.counter_reservation() {
+                Some(reservation) => reservation.end_exclusive == high_water,
+                None => high_water == 0,
+            }
+        }
     }
 }
 
@@ -5122,6 +5329,7 @@ enum PairedCryptoState {
     V1(PairedCryptoStateV1),
     V2(PairedCryptoStateV2),
     V3(PairedCryptoStateV2),
+    V4(PairedCryptoStateV2),
 }
 
 impl fmt::Debug for PairedCryptoState {
@@ -5144,6 +5352,9 @@ impl PairedCryptoState {
                 PairedCryptoStateV2::decode_version(bytes, TYPED_RUNTIME_STATE_VERSION)
                     .map(Self::V3)
             }
+            KEY_SYNC_STATE_VERSION => {
+                PairedCryptoStateV2::decode_version(bytes, KEY_SYNC_STATE_VERSION).map(Self::V4)
+            }
             _ => Err(PairedPromotionError::InvalidState),
         }
     }
@@ -5153,20 +5364,23 @@ impl PairedCryptoState {
             Self::V1(value) => value.encode(),
             Self::V2(value) => value.encode_version(MUTABLE_STATE_VERSION),
             Self::V3(value) => value.encode_version(TYPED_RUNTIME_STATE_VERSION),
+            Self::V4(value) => value.encode_version(KEY_SYNC_STATE_VERSION),
         }
     }
 
     const fn bootstrap(&self) -> &PairedCryptoStateV1 {
         match self {
             Self::V1(value) => value,
-            Self::V2(value) | Self::V3(value) => &value.bootstrap,
+            Self::V2(value) | Self::V3(value) | Self::V4(value) => &value.bootstrap,
         }
     }
 
     const fn counter_reservation(&self) -> Option<&CommandCounterReservation> {
         match self {
             Self::V1(_) => None,
-            Self::V2(value) | Self::V3(value) => value.counter_reservation.as_ref(),
+            Self::V2(value) | Self::V3(value) | Self::V4(value) => {
+                value.counter_reservation.as_ref()
+            }
         }
     }
 
@@ -5177,53 +5391,26 @@ impl PairedCryptoState {
         reservation: &CommandCounterReservation,
     ) -> Result<Self, PairedPromotionError> {
         reservation.validate()?;
-        let stored_reservation = || CommandCounterReservation {
-            reservation_id: reservation.reservation_id,
-            start: reservation.start,
-            end_exclusive: reservation.end_exclusive,
+        let version = match self {
+            Self::V1(_) | Self::V2(_) => MUTABLE_STATE_VERSION,
+            Self::V3(_) => TYPED_RUNTIME_STATE_VERSION,
+            Self::V4(_) => KEY_SYNC_STATE_VERSION,
         };
-        let (value, typed) = match self {
-            Self::V1(bootstrap) => (
-                PairedCryptoStateV2 {
-                    initial_state_commitment,
-                    initial_guard_commitment,
-                    bootstrap: bootstrap.clone(),
-                    receipt_terminal: None,
-                    counter_reservation: Some(stored_reservation()),
-                    replay_windows: Vec::new(),
-                    stream_cursors: Vec::new(),
-                },
-                false,
-            ),
-            Self::V2(current) | Self::V3(current) => (
-                PairedCryptoStateV2 {
-                    initial_state_commitment: current.initial_state_commitment,
-                    initial_guard_commitment: current.initial_guard_commitment,
-                    bootstrap: current.bootstrap.clone(),
-                    receipt_terminal: current.receipt_terminal.clone(),
-                    counter_reservation: Some(stored_reservation()),
-                    replay_windows: current.replay_windows.clone(),
-                    stream_cursors: current.stream_cursors.clone(),
-                },
-                matches!(self, Self::V3(_)),
-            ),
-        };
-        value.validate_for_version(if typed {
-            TYPED_RUNTIME_STATE_VERSION
-        } else {
-            MUTABLE_STATE_VERSION
-        })?;
-        Ok(if typed {
-            Self::V3(value)
-        } else {
-            Self::V2(value)
-        })
+        self.with_mutable_projection(
+            initial_state_commitment,
+            initial_guard_commitment,
+            &self.opaque_runtime_state(),
+            Some(reservation),
+            self.key_sync_state_bytes().map(ToOwned::to_owned),
+            version,
+            true,
+        )
     }
 
     fn opaque_runtime_state(&self) -> OpaqueRuntimeState {
         match self {
             Self::V1(_) => OpaqueRuntimeState::empty(),
-            Self::V2(value) | Self::V3(value) => OpaqueRuntimeState {
+            Self::V2(value) | Self::V3(value) | Self::V4(value) => OpaqueRuntimeState {
                 exchange: value.receipt_terminal.clone(),
                 replay_windows: value.replay_windows.clone(),
                 stream_cursors: value.stream_cursors.clone(),
@@ -5236,7 +5423,7 @@ impl PairedCryptoState {
             Self::V1(_) => Ok(Vec::new()),
             Self::V2(value) if value.stream_cursors.is_empty() => Ok(Vec::new()),
             Self::V2(_) => Err(PairedPromotionError::InvalidState),
-            Self::V3(value) => decode_stream_bindings(&value.stream_cursors)
+            Self::V3(value) | Self::V4(value) => decode_stream_bindings(&value.stream_cursors)
                 .map_err(|_| PairedPromotionError::InvalidState),
         }
     }
@@ -5246,10 +5433,26 @@ impl PairedCryptoState {
     ) -> Result<Option<Vec<DurableStreamBindingV1>>, PairedPromotionError> {
         match self {
             Self::V1(_) | Self::V2(_) => Ok(None),
-            Self::V3(value) => decode_stream_bindings(&value.stream_cursors)
+            Self::V3(value) | Self::V4(value) => decode_stream_bindings(&value.stream_cursors)
                 .map(Some)
                 .map_err(|_| PairedPromotionError::InvalidState),
         }
+    }
+
+    fn key_sync_state_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::V1(_) | Self::V2(_) | Self::V3(_) => None,
+            Self::V4(value) => value.durable_key_sync_state.as_deref(),
+        }
+    }
+
+    fn durable_key_sync_state(
+        &self,
+    ) -> Result<Option<DurableKeySyncStateV1>, PairedPromotionError> {
+        self.key_sync_state_bytes()
+            .map(DurableKeySyncStateV1::from_canonical_bytes)
+            .transpose()
+            .map_err(|_| PairedPromotionError::InvalidState)
     }
 
     fn with_opaque_runtime_state(
@@ -5260,7 +5463,9 @@ impl PairedCryptoState {
     ) -> Result<Self, PairedPromotionError> {
         runtime.validate()?;
         let automatic_probe = runtime.automatic_probe().ok().flatten().is_some();
-        let version = if automatic_probe {
+        let version = if matches!(self, Self::V4(_)) {
+            KEY_SYNC_STATE_VERSION
+        } else if automatic_probe {
             MUTABLE_STATE_VERSION
         } else {
             TYPED_RUNTIME_STATE_VERSION
@@ -5269,7 +5474,9 @@ impl PairedCryptoState {
             initial_state_commitment,
             initial_guard_commitment,
             runtime,
+            self.key_sync_state_bytes().map(ToOwned::to_owned),
             version,
+            true,
         )
     }
 
@@ -5282,7 +5489,7 @@ impl PairedCryptoState {
         runtime.validate()?;
         if !runtime.stream_cursors.is_empty()
             || runtime.automatic_legacy_v2_probe()?.is_none()
-            || matches!(self, Self::V3(_))
+            || matches!(self, Self::V3(_) | Self::V4(_))
         {
             return Err(PairedPromotionError::InvalidState);
         }
@@ -5290,7 +5497,9 @@ impl PairedCryptoState {
             initial_state_commitment,
             initial_guard_commitment,
             runtime,
+            None,
             MUTABLE_STATE_VERSION,
+            true,
         )
     }
 
@@ -5299,18 +5508,39 @@ impl PairedCryptoState {
         initial_state_commitment: [u8; 32],
         initial_guard_commitment: [u8; 32],
         runtime: &OpaqueRuntimeState,
+        durable_key_sync_state: Option<Vec<u8>>,
         version: u16,
+        validate_key_sync: bool,
     ) -> Result<Self, PairedPromotionError> {
-        if version != MUTABLE_STATE_VERSION && version != TYPED_RUNTIME_STATE_VERSION {
+        self.with_mutable_projection(
+            initial_state_commitment,
+            initial_guard_commitment,
+            runtime,
+            self.counter_reservation(),
+            durable_key_sync_state,
+            version,
+            validate_key_sync,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_mutable_projection(
+        &self,
+        initial_state_commitment: [u8; 32],
+        initial_guard_commitment: [u8; 32],
+        runtime: &OpaqueRuntimeState,
+        counter_reservation: Option<&CommandCounterReservation>,
+        durable_key_sync_state: Option<Vec<u8>>,
+        version: u16,
+        validate_key_sync: bool,
+    ) -> Result<Self, PairedPromotionError> {
+        if !matches!(
+            version,
+            MUTABLE_STATE_VERSION | TYPED_RUNTIME_STATE_VERSION | KEY_SYNC_STATE_VERSION
+        ) || matches!(self, Self::V4(_)) && version != KEY_SYNC_STATE_VERSION
+        {
             return Err(PairedPromotionError::InvalidState);
         }
-        let bootstrap = Zeroizing::new(self.bootstrap().encode()?);
-        checked_mutable_state_encoded_len(
-            bootstrap.len(),
-            runtime.exchange.as_ref().map_or(0, Vec::len),
-            runtime.replay_windows.iter().map(Vec::len),
-            runtime.stream_cursors.iter().map(Vec::len),
-        )?;
         let copy_reservation =
             |reservation: &CommandCounterReservation| CommandCounterReservation {
                 reservation_id: reservation.reservation_id,
@@ -5323,32 +5553,76 @@ impl PairedCryptoState {
                 initial_guard_commitment,
                 bootstrap: bootstrap.clone(),
                 receipt_terminal: runtime.exchange.clone(),
-                counter_reservation: None,
+                counter_reservation: counter_reservation.map(copy_reservation),
                 replay_windows: runtime.replay_windows.clone(),
                 stream_cursors: runtime.stream_cursors.clone(),
+                durable_key_sync_state,
             },
-            Self::V2(current) | Self::V3(current) => PairedCryptoStateV2 {
+            Self::V2(current) | Self::V3(current) | Self::V4(current) => PairedCryptoStateV2 {
                 initial_state_commitment: current.initial_state_commitment,
                 initial_guard_commitment: current.initial_guard_commitment,
                 bootstrap: current.bootstrap.clone(),
                 receipt_terminal: runtime.exchange.clone(),
-                counter_reservation: current.counter_reservation.as_ref().map(copy_reservation),
+                counter_reservation: counter_reservation.map(copy_reservation),
                 replay_windows: runtime.replay_windows.clone(),
                 stream_cursors: runtime.stream_cursors.clone(),
+                durable_key_sync_state,
             },
         };
-        value.validate_for_version(version)?;
-        Ok(if version == MUTABLE_STATE_VERSION {
-            Self::V2(value)
-        } else {
-            Self::V3(value)
-        })
+        value.validate_for_version_inner(version, validate_key_sync)?;
+        match version {
+            MUTABLE_STATE_VERSION => Ok(Self::V2(value)),
+            TYPED_RUNTIME_STATE_VERSION => Ok(Self::V3(value)),
+            KEY_SYNC_STATE_VERSION => Ok(Self::V4(value)),
+            _ => Err(PairedPromotionError::InvalidState),
+        }
+    }
+
+    fn with_key_sync_state_bytes(
+        &self,
+        initial_state_commitment: [u8; 32],
+        initial_guard_commitment: [u8; 32],
+        durable_key_sync_state: Option<Vec<u8>>,
+        validate_key_sync: bool,
+    ) -> Result<Self, PairedPromotionError> {
+        self.with_mutable_projection(
+            initial_state_commitment,
+            initial_guard_commitment,
+            &self.opaque_runtime_state(),
+            self.counter_reservation(),
+            durable_key_sync_state,
+            KEY_SYNC_STATE_VERSION,
+            validate_key_sync,
+        )
+    }
+
+    fn rebuild_mutable_projection_from(
+        &self,
+        initial_state_commitment: [u8; 32],
+        initial_guard_commitment: [u8; 32],
+        next: &Self,
+    ) -> Result<Self, PairedPromotionError> {
+        let version = match next {
+            Self::V1(_) => return Err(PairedPromotionError::Conflict),
+            Self::V2(_) => MUTABLE_STATE_VERSION,
+            Self::V3(_) => TYPED_RUNTIME_STATE_VERSION,
+            Self::V4(_) => KEY_SYNC_STATE_VERSION,
+        };
+        self.with_mutable_projection(
+            initial_state_commitment,
+            initial_guard_commitment,
+            &next.opaque_runtime_state(),
+            self.counter_reservation(),
+            next.key_sync_state_bytes().map(ToOwned::to_owned),
+            version,
+            true,
+        )
     }
 }
 
-/// V2/V3 共用 payload：marker 的两个旧 hash 固化为 initial commitments，当前 state hash
+/// V2/V3/V4 共用 payload：marker 的两个旧 hash 固化为 initial commitments，当前 state hash
 /// 只由 guard 绑定。V2 保留 legacy bounded opaque fields；V3 additionally 要求 stream collection
-/// 逐项通过 typed canonical decode，并在 paired 全审计时对账 authority、授权与 key slot。
+/// 逐项通过 typed canonical decode；V4 末尾再追加 optional canonical ADKS KeySync state。
 struct PairedCryptoStateV2 {
     initial_state_commitment: [u8; 32],
     initial_guard_commitment: [u8; 32],
@@ -5357,6 +5631,7 @@ struct PairedCryptoStateV2 {
     counter_reservation: Option<CommandCounterReservation>,
     replay_windows: Vec<Vec<u8>>,
     stream_cursors: Vec<Vec<u8>>,
+    durable_key_sync_state: Option<Vec<u8>>,
 }
 
 impl fmt::Debug for PairedCryptoStateV2 {
@@ -5367,7 +5642,15 @@ impl fmt::Debug for PairedCryptoStateV2 {
 
 impl PairedCryptoStateV2 {
     fn encode_version(&self, version: u16) -> Result<Vec<u8>, PairedPromotionError> {
-        self.validate_for_version(version)?;
+        self.encode_version_inner(version, true)
+    }
+
+    fn encode_version_inner(
+        &self,
+        version: u16,
+        validate_key_sync: bool,
+    ) -> Result<Vec<u8>, PairedPromotionError> {
+        self.validate_for_version_inner(version, validate_key_sync)?;
         let mut body = Vec::new();
         body.extend_from_slice(&self.initial_state_commitment);
         body.extend_from_slice(&self.initial_guard_commitment);
@@ -5394,6 +5677,13 @@ impl PairedCryptoStateV2 {
         }
         put_state_collection(&mut body, &self.replay_windows)?;
         put_state_collection(&mut body, &self.stream_cursors)?;
+        if version == KEY_SYNC_STATE_VERSION {
+            put_state_field(
+                &mut body,
+                self.durable_key_sync_state.as_deref().unwrap_or_default(),
+                MAX_STATE_FIELD_LEN,
+            )?;
+        }
         if body.len() > MAX_CRYPTO_STATE_PLAINTEXT_LEN - STATE_HEADER_LEN {
             return Err(PairedPromotionError::InvalidState);
         }
@@ -5451,6 +5741,12 @@ impl PairedCryptoStateV2 {
         };
         let replay_windows = decode_state_collection(&mut decoder)?;
         let stream_cursors = decode_state_collection(&mut decoder)?;
+        let durable_key_sync_state = if version == KEY_SYNC_STATE_VERSION {
+            let bytes = decoder.field(MAX_STATE_FIELD_LEN)?.to_vec();
+            (!bytes.is_empty()).then_some(bytes)
+        } else {
+            None
+        };
         decoder.finish()?;
         let value = Self {
             initial_state_commitment,
@@ -5460,6 +5756,7 @@ impl PairedCryptoStateV2 {
             counter_reservation,
             replay_windows,
             stream_cursors,
+            durable_key_sync_state,
         };
         value.validate_for_version(version)?;
         let canonical = Zeroizing::new(value.encode_version(version)?);
@@ -5470,7 +5767,18 @@ impl PairedCryptoStateV2 {
     }
 
     fn validate_for_version(&self, version: u16) -> Result<(), PairedPromotionError> {
-        if version != MUTABLE_STATE_VERSION && version != TYPED_RUNTIME_STATE_VERSION {
+        self.validate_for_version_inner(version, true)
+    }
+
+    fn validate_for_version_inner(
+        &self,
+        version: u16,
+        validate_key_sync: bool,
+    ) -> Result<(), PairedPromotionError> {
+        if !matches!(
+            version,
+            MUTABLE_STATE_VERSION | TYPED_RUNTIME_STATE_VERSION | KEY_SYNC_STATE_VERSION
+        ) {
             return Err(PairedPromotionError::InvalidState);
         }
         let bootstrap = Zeroizing::new(self.bootstrap.encode()?);
@@ -5488,16 +5796,41 @@ impl PairedCryptoStateV2 {
         {
             return Err(PairedPromotionError::InvalidState);
         }
+        if version != KEY_SYNC_STATE_VERSION && self.durable_key_sync_state.is_some() {
+            return Err(PairedPromotionError::InvalidState);
+        }
+        if validate_key_sync && let Some(bytes) = &self.durable_key_sync_state {
+            let state = DurableKeySyncStateV1::from_canonical_bytes(bytes)
+                .map_err(|_| PairedPromotionError::InvalidState)?;
+            if state
+                .canonical_bytes()
+                .map_err(|_| PairedPromotionError::InvalidState)?
+                != *bytes
+            {
+                return Err(PairedPromotionError::InvalidState);
+            }
+        }
         if let Some(reservation) = &self.counter_reservation {
             reservation.validate()?;
         }
-        checked_mutable_state_encoded_len(
+        let encoded_len = checked_mutable_state_encoded_len(
             bootstrap.len(),
             self.receipt_terminal.as_ref().map_or(0, Vec::len),
             self.replay_windows.iter().map(Vec::len),
             self.stream_cursors.iter().map(Vec::len),
         )?;
-        if version == TYPED_RUNTIME_STATE_VERSION {
+        if version == KEY_SYNC_STATE_VERSION {
+            let key_sync_len = self.durable_key_sync_state.as_ref().map_or(0, Vec::len);
+            if key_sync_len > MAX_STATE_FIELD_LEN
+                || encoded_len
+                    .checked_add(4)
+                    .and_then(|length| length.checked_add(key_sync_len))
+                    .is_none_or(|length| length > MAX_CRYPTO_STATE_PLAINTEXT_LEN)
+            {
+                return Err(PairedPromotionError::InvalidState);
+            }
+        }
+        if version == TYPED_RUNTIME_STATE_VERSION || version == KEY_SYNC_STATE_VERSION {
             decode_stream_bindings(&self.stream_cursors)
                 .map_err(|_| PairedPromotionError::InvalidState)?;
         }
@@ -5705,7 +6038,9 @@ impl PairedCommitMarkerV1 {
         }
         match state {
             PairedCryptoState::V1(_) if sha256(state_bytes) == self.state_plaintext_hash => {}
-            PairedCryptoState::V2(value) | PairedCryptoState::V3(value)
+            PairedCryptoState::V2(value)
+            | PairedCryptoState::V3(value)
+            | PairedCryptoState::V4(value)
                 if value.initial_state_commitment == self.state_plaintext_hash
                     && value.initial_guard_commitment == self.counter_guard_hash => {}
             _ => return Err(PairedPromotionError::Conflict),
