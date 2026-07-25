@@ -3156,7 +3156,7 @@ agent docs、diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics �
 `quality` 均 Approved，P0/P1/P2=0。verifier 仍不支持 `p4`。production-signed Keychain/LaunchAgent、
 真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与 destructive purge 继续保持 post-MVP
 `BLOCKED`；静态 runner 仍只输出 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不生成真实证据。
-P5.1 shared facade 已于后续完成；P5/P6 当前为 1/9、0/4。
+P5.1 shared facade 与 P5.2 crash-safe client storage 已于后续完成；P5/P6 当前为 2/9、0/4。
 
 ---
 
@@ -3164,8 +3164,8 @@ P5.1 shared facade 已于后续完成；P5/P6 当前为 1/9、0/4。
 
 > **执行前审计（2026-07-20）：0/9 Task 完成。** 当前只有 Relay crypto/wire、P3.9 本机 Runtime 与
 > fixture UI 基线；P5.1–P5.9 production source、真实 Simulator Relay E2E 与 post-MVP slot runner 均未实现。
-> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-26）：P5.1 已完成，P5 为
-> 1/9；P5.2–P5.9 与 P5 Phase Exit 仍未完成。**
+> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-26）：P5.1–P5.2 已完成，
+> P5 为 2/9；P5.3–P5.9 与 P5 Phase Exit 仍未完成。**
 
 ### Task P5.1：建立 AgentDeckSessionSource target 与强类型 facade
 
@@ -3213,28 +3213,47 @@ warnings-as-errors 编译下 focused `15/15`、strict SessionSource target build
 import；平台/network/fixture/unsafe token 扫描、Swift format、agent docs 与 diff check 全绿。XcodeGen
 App/Test 均显式声明 Core/SessionSource/RelayClient；SessionSource product 使用 `link: false`，由
 RelayClient target edge 传递链接，clean dependency scan 无 missing-edge warning，CoreLinkTests 实际构造
-三模块类型。旧 fixture 保留到 P5.5；P5.2–P5.9、P5 Phase Exit 与全部真实设备/公网槽位仍未完成。
+三模块类型。旧 fixture 保留到 P5.5；P5.2 已按下节独立收口，P5.3–P5.9、P5 Phase Exit 与全部真实
+设备/公网槽位仍未完成。
 
 ### Task P5.2：实现 Apple Keychain、CryptoStateStore 与 Swift counter/replay IO
 
 **Files:**
-- Create: `Sources/AgentDeckRelayClient/Storage/{KeyStore,AppleKeychainStore,CryptoStateStore,FileCryptoStateStore,PairedMachineStore}.swift`
+- Create: `Sources/AgentDeckRelayClient/Storage/{KeyStore,AppleKeychainStore,CryptoStateStore,FileCryptoStateStore,DeviceCryptoState,DurableCryptoStateCoordinator,MachineCryptoLease,PairedMachineStore}.swift`
 - Create: `Sources/AgentDeckRelayClient/Crypto/{CounterAllocator,ReplayWindow}.swift`
-- Create: `Tests/AgentDeckRelayClientTests/{AppleKeychainStoreTests,CryptoStateStoreTests,CounterAllocatorTests,ReplayWindowTests}.swift`
+- Create: `Tests/AgentDeckRelayClientTests/{AppleKeychainStoreTests,CryptoStateStoreTests,DeviceCryptoStateTests,CounterAllocatorTests,DurableCryptoStateCoordinatorTests,ReplayWindowTests,PairedMachineStoreTests}.swift`
 - Create: `ios/AgentDeckMobileTests/RelayClientStorageIntegrationTests.swift`
 
 **Core interface:**
 ```swift
-public protocol KeyStore: Sendable { func load(_ key: KeyStoreKey) async throws -> Data?; func store(_ data: Data, for key: KeyStoreKey) async throws; func delete(_ key: KeyStoreKey) async throws }
-public protocol CryptoStateStore: Sendable { func load(machineID: String) async throws -> CryptoStateSnapshot?; func commit(_ snapshot: CryptoStateSnapshot, machineID: String) async throws; func delete(machineID: String) async throws }
+public protocol KeyStore: Sendable {
+    func load(_ key: KeyStoreKey) async throws -> Data?
+    func persistImmutable(_ data: Data, for key: KeyStoreKey) async throws -> KeyStorePersistence
+    func compareAndReplaceExact(expected: Data, replacement: Data, for key: KeyStoreKey) async throws
+    func deleteExact(expected: Data, for key: KeyStoreKey) async throws
+}
+public protocol CryptoStateStore: Sendable {
+    func load() async throws -> CryptoStateSnapshot?
+    func commitInitial(_ snapshot: CryptoStateSnapshot) async throws -> CryptoStateCommit
+    func compareAndReplaceExact(expected: CryptoStateSnapshot, replacement: CryptoStateSnapshot) async throws
+    func deleteExact(expected: CryptoStateSnapshot) async throws
+}
 ```
 
-- [ ] Step 1: 写storage tests。 Keychain固定`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`、service=`com.agentdeck.remote.v1`、每machine的`device-storage-kek.v1`和counter guard accounts；`CryptoStateFileV1`用DeviceStorageKEK AEAD包装key directory/replay/cursor且AAD绑定root fingerprint/route/version，文件exclude-from-backup、complete file protection、128MiB。 原子提交固定`temp write → fsync(file) → rename → fsync(parent dir)`；CounterGuard high-water先于sealed file reservation，逐边界crash只允许跳号；rollback退休epoch；state文件扫描不得出现prompt/output transcript sentinel。
-- [ ] Step 2: 运行 `swift test --filter CounterAllocatorTests` 等四套tests。 Expected: FAIL，storage types不存在。
-- [ ] Step 3: 实现actor-isolated stores、DeviceStorageKEK、sealed file codec、原子fsync/rename与Keychain OSStatus映射；private key只经CryptoKit rawRepresentation转换后进入Keychain。 App/CLI默认不同client-kind/installation-id，不要求跨签名进程共享同一private item。
-- [ ] Step 4: 重跑SwiftPM tests并确认测试Keychain account清理。 Expected: PASS；logs/error description不含secret。
-- [ ] Step 5: 运行 `cd ios && xcodegen generate && xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile -destination 'platform=iOS Simulator,name=iPhone 17' -only-testing:AgentDeckMobileTests/RelayClientStorageIntegrationTests test`，验证 API 配置、属性读回、backup exclusion 与 crash recovery contract，再运行AgentDeckRelayClient完整tests。Simulator 不能证明物理设备锁屏时的 ThisDeviceOnly/FileProtection 行为；该生产证据保留在 P6.3 post-MVP 物理 iPhone 槽位，不是 P5.9 MVP 退出门禁。
-- [ ] Step 6: 提交。 `git add Sources/AgentDeckRelayClient Tests/AgentDeckRelayClientTests ios/AgentDeckMobileTests/RelayClientStorageIntegrationTests.swift && git commit -m "feat(swift): 加入 Keychain 与 crash-safe crypto state"`
+- [x] Step 1: 写storage tests。 Keychain固定`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`、service=`com.agentdeck.remote.v1`、每machine的`device-storage-kek.v1`和counter guard accounts；`CryptoStateFileV1`用DeviceStorageKEK AEAD包装key directory/replay/cursor且AAD绑定root fingerprint/route/version，文件exclude-from-backup、complete file protection、128MiB。 原子提交固定`temp write → fsync(file) → rename → fsync(parent dir)`；CounterGuard high-water先于sealed file reservation，逐边界crash只允许跳号；rollback退休epoch；state文件扫描不得出现prompt/output transcript sentinel。另覆盖 non-counter `statePending` 的 previous rollback、exact-next finalize、authenticated sibling replay/cursor rollback与quarantined→active拒绝。
+- [x] Step 2: 运行 AppleKeychain/CryptoState/DeviceCryptoState/CounterAllocator/DurableCoordinator/ReplayWindow/PairedMachine 七组 tests。 Expected: RED 后实现转 GREEN。
+- [x] Step 3: 实现actor-isolated stores、DeviceStorageKEK、sealed file codec、原子fsync/rename与Keychain OSStatus映射；private key只经CryptoKit rawRepresentation转换后进入Keychain。 App/CLI默认不同client-kind/installation-id，不要求跨签名进程共享同一private item。counter reservation 使用 Pending→state→Stable；replay/cursor/quarantine 使用携带 previous Stable 与 exact next commitment 的独立 statePending，禁止 revision +1 heuristic recovery。
+- [x] Step 4: 重跑SwiftPM tests并确认测试Keychain account清理。 Expected: PASS；logs/error description不含secret。SwiftPM `-34018` 四项真实 SecItem case 明确 SKIP 且不计 PASS。
+- [x] Step 5: 运行 `cd ios && xcodegen generate && xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile -destination 'platform=iOS Simulator,name=iPhone 17' -only-testing:AgentDeckMobileTests/RelayClientStorageIntegrationTests test`，验证 API 配置、属性读回、backup exclusion 与 crash recovery contract，再运行AgentDeckRelayClient完整tests。Simulator 不能证明物理设备锁屏时的 ThisDeviceOnly/FileProtection 行为；该生产证据保留在 P6.3 post-MVP 物理 iPhone 槽位，不是 P5.9 MVP 退出门禁。
+- [x] Step 6: 精确暂存本 Task code/test/docs 并提交。 `git commit -m "feat(swift): 加入 Keychain 与 crash-safe crypto state"`
+
+**P5.2 自动门禁证据（2026-07-26）：** 七组新增 SwiftPM discovery 共 `91` cases；strict
+`AgentDeckRelayClient` 完整 tests `121 executed / 4 entitlement SKIP / 0 failure`，strict target build、完整
+Swift `649 XCTest / 4 SKIP + 35 Swift Testing`、iOS storage `5/5` 与全量 Simulator `26/26` 均通过。
+Rust `agentdeck-crypto + agentdeck-protocol`、新文件 strict format、production unsafe/弱 Keychain
+policy/secret/transcript 扫描、agent docs 与 tracked/untracked diff check 全绿；双路终审 P0/P1/P2=0。
+production-signed Data Protection Keychain 与物理 iPhone locked/unlocked Complete readback 继续
+post-MVP BLOCKED，不计 PASS；P5.3–P5.9、WSS/RelaySessionSource 与 P5 Phase Exit 仍未完成。
 
 ### Task P5.3：实现 Swift RelayWebSocketTransport、SPKI pin 与 transfer assembler
 

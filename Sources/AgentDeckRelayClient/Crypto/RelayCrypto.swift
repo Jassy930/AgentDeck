@@ -9,7 +9,38 @@ public struct AeadSendingKey: Sendable, CustomDebugStringConvertible {
     public let payloadKind: SealedPayloadKind
     let symmetricKey: SymmetricKey
 
+    /// Production constructor：从 256-bit key 以 domain-separated HMAC 派生 nonce prefix。
     public init(
+        keyID: KeyIDV1,
+        epoch: UInt64,
+        keyDirectoryRevision: UInt64,
+        payloadKind: SealedPayloadKind,
+        rawKey: Data
+    ) throws {
+        guard rawKey.count == 32 else {
+            throw RelayCryptoError.invalidLength(
+                field: "aeadKey",
+                expected: 32,
+                actual: rawKey.count
+            )
+        }
+        let key = SymmetricKey(data: rawKey)
+        let prefix = HMAC<SHA256>.authenticationCode(
+            for: Data("AgentDeck/AEADNoncePrefix/v1\0".utf8),
+            using: key
+        )
+        try self.init(
+            keyID: keyID,
+            epoch: epoch,
+            keyDirectoryRevision: keyDirectoryRevision,
+            noncePrefix: Data(prefix.prefix(4)),
+            payloadKind: payloadKind,
+            rawKey: rawKey
+        )
+    }
+
+    /// 显式 prefix 只供 golden vector / synthetic test 使用。
+    init(
         keyID: KeyIDV1,
         epoch: UInt64,
         keyDirectoryRevision: UInt64,
@@ -17,6 +48,9 @@ public struct AeadSendingKey: Sendable, CustomDebugStringConvertible {
         payloadKind: SealedPayloadKind,
         rawKey: Data
     ) throws {
+        guard keyID.epoch == epoch else {
+            throw RelayCryptoError.invalidKey(field: "keyID.epoch")
+        }
         guard noncePrefix.count == 4 else {
             throw RelayCryptoError.invalidLength(
                 field: "noncePrefix",
@@ -50,6 +84,9 @@ public struct AeadReceivingKey: Sendable, CustomDebugStringConvertible {
     let symmetricKey: SymmetricKey
 
     public init(keyID: KeyIDV1, epoch: UInt64, rawKey: Data) throws {
+        guard keyID.epoch == epoch else {
+            throw RelayCryptoError.invalidKey(field: "keyID.epoch")
+        }
         guard rawKey.count == 32 else {
             throw RelayCryptoError.invalidLength(
                 field: "aeadKey",

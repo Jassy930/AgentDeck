@@ -1,0 +1,1133 @@
+import AgentDeckSessionSource
+import Foundation
+
+/// Keychain commit marker 中的无 secret、versioned paired machine record。
+public struct StoredPairedMachineRecordV1: Equatable, Sendable, CustomDebugStringConvertible {
+  public let clientKind: RelayClientKind
+  public let installationID: UUID
+  public let machineID: String
+  public let machineName: String
+  public let relayURL: URL
+  public let relayServerID: Data
+  public let machineRootFingerprint: Data
+  public let machineRoute: Data
+  public let deviceRoute: Data
+  public let currentSPKIPin: Data
+  public let nextSPKIPin: Data?
+  public let grantSerial: UInt64
+  public let trustEpoch: UInt64
+  public let createdAtMS: UInt64
+
+  public init(
+    clientKind: RelayClientKind,
+    installationID: UUID,
+    machineID: String,
+    machineName: String,
+    relayURL: URL,
+    relayServerID: Data,
+    machineRootFingerprint: Data,
+    machineRoute: Data,
+    deviceRoute: Data,
+    currentSPKIPin: Data,
+    nextSPKIPin: Data?,
+    grantSerial: UInt64,
+    trustEpoch: UInt64,
+    createdAtMS: UInt64
+  ) throws {
+    guard isNonzeroRelayInstallationID(installationID),
+      !machineID.isEmpty,
+      machineID.utf8.count <= 8 * 1_024,
+      !machineName.isEmpty,
+      machineName.utf8.count <= 128,
+      machineName.trimmingCharacters(in: .whitespacesAndNewlines) == machineName,
+      !machineName.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+      Self.isCanonicalRelayURL(relayURL),
+      Self.isNonzero(relayServerID, count: 16),
+      Self.isNonzero(machineRootFingerprint, count: 32),
+      Self.isNonzero(machineRoute, count: 16),
+      Self.isNonzero(deviceRoute, count: 16),
+      Self.isNonzero(currentSPKIPin, count: 32),
+      nextSPKIPin.map({ Self.isNonzero($0, count: 32) }) ?? true,
+      grantSerial > 0,
+      trustEpoch > 0,
+      createdAtMS > 0
+    else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    self.clientKind = clientKind
+    self.installationID = installationID
+    self.machineID = machineID
+    self.machineName = machineName
+    self.relayURL = relayURL
+    self.relayServerID = relayServerID
+    self.machineRootFingerprint = machineRootFingerprint
+    self.machineRoute = machineRoute
+    self.deviceRoute = deviceRoute
+    self.currentSPKIPin = currentSPKIPin
+    self.nextSPKIPin = nextSPKIPin
+    self.grantSerial = grantSerial
+    self.trustEpoch = trustEpoch
+    self.createdAtMS = createdAtMS
+  }
+
+  public var pairedMachine: PairedMachine {
+    PairedMachine(
+      id: machineID,
+      name: machineName,
+      relayHost: relayURL.host ?? "",
+      rootFingerprint: machineRootFingerprint
+    )
+  }
+
+  public var debugDescription: String {
+    "StoredPairedMachineRecordV1(machineID: <redacted>, routes: <redacted>)"
+  }
+
+  private static func isCanonicalRelayURL(_ url: URL) -> Bool {
+    let value = url.absoluteString
+    guard value.utf8.count <= 2 * 1_024,
+      let components = URLComponents(string: value),
+      components.scheme == "wss",
+      components.host != nil,
+      components.user == nil,
+      components.password == nil,
+      components.query == nil,
+      components.fragment == nil,
+      components.port != 0,
+      components.percentEncodedPath == "/",
+      components.string == value
+    else {
+      return false
+    }
+    return true
+  }
+
+  private static func isNonzero(_ value: Data, count: Int) -> Bool {
+    value.count == count && value.contains(where: { $0 != 0 })
+  }
+}
+
+/// pairing response 验证完成后交给 marker-last promotion 的封闭 carrier。
+///
+/// private material 只进入各自 Keychain account；debug 输出永不展开 secret。
+public struct PreparedPairedMachinePromotionV1: Sendable, CustomDebugStringConvertible {
+  public static let privateKeyBytes = 32
+  public static let maximumGrantBytes = 4 * 1_024 * 1_024
+
+  public let record: StoredPairedMachineRecordV1
+  public let promotionID32: Data
+  public let deviceSignPrivateKey: Data
+  public let deviceHPKEPrivateKey: Data
+  public let deviceGrant: Data
+  public let deviceStorageKEK: DeviceStorageKEK
+  public let initialCryptoState: CryptoStateSnapshot
+
+  public init(
+    record: StoredPairedMachineRecordV1,
+    promotionID32: Data,
+    deviceSignPrivateKey: Data,
+    deviceHPKEPrivateKey: Data,
+    deviceGrant: Data,
+    deviceStorageKEK: DeviceStorageKEK,
+    initialCryptoState: CryptoStateSnapshot
+  ) throws {
+    let state = initialCryptoState.state
+    let trust = state.trustScope
+    guard Self.isNonzero(promotionID32, count: 32),
+      Self.isNonzero(deviceSignPrivateKey, count: Self.privateKeyBytes),
+      Self.isNonzero(deviceHPKEPrivateKey, count: Self.privateKeyBytes),
+      !deviceGrant.isEmpty,
+      deviceGrant.count <= Self.maximumGrantBytes,
+      state.stateRevision == 1,
+      state.senderCounter.reservedHighWater == 0,
+      state.senderCounter.reservationID.allSatisfy({ $0 == 0 }),
+      state.securityState == .active,
+      trust.relayServerID == record.relayServerID,
+      trust.machineRootFingerprint == record.machineRootFingerprint,
+      trust.machineRoute == record.machineRoute,
+      trust.deviceRoute == record.deviceRoute,
+      trust.grantSerial == record.grantSerial,
+      trust.trustEpoch == record.trustEpoch
+    else {
+      throw PairedMachineStoreError.invalidPromotion
+    }
+    self.record = record
+    self.promotionID32 = promotionID32
+    self.deviceSignPrivateKey = deviceSignPrivateKey
+    self.deviceHPKEPrivateKey = deviceHPKEPrivateKey
+    self.deviceGrant = deviceGrant
+    self.deviceStorageKEK = deviceStorageKEK
+    self.initialCryptoState = initialCryptoState
+  }
+
+  public var debugDescription: String {
+    "PreparedPairedMachinePromotionV1(record: <redacted>, material: <redacted>)"
+  }
+
+  private static func isNonzero(_ value: Data, count: Int) -> Bool {
+    value.count == count && value.contains(where: { $0 != 0 })
+  }
+}
+
+public enum PairedMachineStoreError: Error, Equatable, Sendable {
+  case invalidRecord
+  case invalidPromotion
+  case invalidBinding
+  case persistenceMismatch
+
+  public var code: String {
+    switch self {
+    case .invalidRecord: "remote.paired_machine.invalid_record"
+    case .invalidPromotion: "remote.paired_machine.invalid_promotion"
+    case .invalidBinding: "remote.paired_machine.invalid_binding"
+    case .persistenceMismatch: "remote.paired_machine.persistence_mismatch"
+    }
+  }
+}
+
+/// commit marker 是 paired 可见性的唯一边界。
+///
+/// promotion 与 cleanup 都持有 machine transaction lease；任何 partial promotion
+/// 都没有 marker，cleanup journal 则立即关闭 list/load 可见性。
+public actor PairedMachineStore {
+  private let keyStore: any PairedMarkerListingKeyStore
+  private let stateRootURL: URL
+  private let clientKind: RelayClientKind
+  private let installationID: UUID
+
+  public init(
+    keyStore: any PairedMarkerListingKeyStore,
+    stateRootURL: URL,
+    clientKind: RelayClientKind,
+    installationID: UUID
+  ) {
+    self.keyStore = keyStore
+    self.stateRootURL = stateRootURL.standardizedFileURL
+    self.clientKind = clientKind
+    self.installationID = installationID
+  }
+
+  /// 顺序固定为 KEK → sealed state → private material/grant → CounterGuard → marker。
+  @discardableResult
+  public func promote(
+    _ prepared: PreparedPairedMachinePromotionV1
+  ) async throws -> KeyStorePersistence {
+    try validateBinding(prepared.record)
+    let context = try makeContext(record: prepared.record)
+    let lease = try await context.leaseManager.acquire()
+    do {
+      let result = try await promote(prepared, context: context, under: lease)
+      await lease.release()
+      return result
+    } catch {
+      await lease.release()
+      throw error
+    }
+  }
+
+  /// 只返回通过 marker binding、材料、CounterGuard 与 sealed state 完整审计的机器。
+  public func list() async throws -> [StoredPairedMachineRecordV1] {
+    let markerKeys = try await keyStore.pairedCommitMarkerKeys(
+      clientKind: clientKind,
+      installationID: installationID
+    )
+    var records: [StoredPairedMachineRecordV1] = []
+    records.reserveCapacity(markerKeys.count)
+    for key in markerKeys {
+      if let record = try await auditVisibleMarker(at: key) {
+        records.append(record)
+      }
+    }
+    return records
+  }
+
+  public func load(
+    rootFingerprint: Data,
+    machineRoute: Data
+  ) async throws -> StoredPairedMachineRecordV1? {
+    let key = try markerKey(
+      rootFingerprint: rootFingerprint,
+      machineRoute: machineRoute
+    )
+    return try await auditVisibleMarker(at: key)
+  }
+
+  /// marker 先 exact-CAS 为 cleanup journal，再按固定顺序做 expected delete。
+  public func deleteExact(_ record: StoredPairedMachineRecordV1) async throws {
+    try validateBinding(record)
+    let context = try makeContext(record: record)
+    let lease = try await context.leaseManager.acquire()
+    do {
+      try await deleteExact(record, context: context, under: lease)
+      await lease.release()
+    } catch {
+      await lease.release()
+      throw error
+    }
+  }
+
+  private func promote(
+    _ prepared: PreparedPairedMachinePromotionV1,
+    context: MachineContext,
+    under lease: MachineCryptoLease
+  ) async throws -> KeyStorePersistence {
+    if let existingData = try await keyStore.load(context.keys.marker) {
+      let existing = try PairedMachineMarkerCodec.decode(existingData)
+      try validateMarker(existing, at: context.keys.marker)
+      guard existing.phase == .committed,
+        existing.matches(prepared)
+      else {
+        throw PairedMachineStoreError.persistenceMismatch
+      }
+      _ = try await auditDependencies(existing, context: context, under: lease)
+      return .alreadyPresent
+    }
+
+    try await persistAndReadBack(
+      prepared.deviceStorageKEK.rawRepresentation,
+      for: context.keys.storageKEK
+    )
+    let stateStore = try FileCryptoStateStore(
+      rootURL: stateRootURL,
+      identity: context.identity,
+      storageKey: prepared.deviceStorageKEK
+    )
+    _ = try await stateStore.commitInitial(prepared.initialCryptoState)
+    guard try await stateStore.load() == prepared.initialCryptoState else {
+      throw CryptoStateStoreError.persistenceReadbackFailed
+    }
+
+    try await persistAndReadBack(
+      prepared.deviceSignPrivateKey,
+      for: context.keys.deviceSign
+    )
+    try await persistAndReadBack(
+      prepared.deviceHPKEPrivateKey,
+      for: context.keys.deviceHPKE
+    )
+    try await persistAndReadBack(prepared.deviceGrant, for: context.keys.grant)
+
+    let coordinator = try DurableCryptoStateCoordinator(
+      rootURL: stateRootURL,
+      identity: context.identity,
+      stateStore: stateStore,
+      keyStore: keyStore,
+      guardKey: context.keys.counterGuard
+    )
+    let permit = try CounterBootstrapPermit(
+      snapshot: prepared.initialCryptoState,
+      promotionID: prepared.promotionID32
+    )
+    let evidence = try await coordinator.bootstrap(permit, under: lease)
+    let marker = PairedMachineMarker(
+      phase: .committed,
+      record: prepared.record,
+      promotionID: prepared.promotionID32,
+      initialStateCommitment: evidence.initialStateCommitment,
+      initialGuardCommitment: evidence.initialGuardCommitment,
+      deviceSignHash: CanonicalCodec.sha256(prepared.deviceSignPrivateKey),
+      deviceHPKEHash: CanonicalCodec.sha256(prepared.deviceHPKEPrivateKey),
+      grantHash: CanonicalCodec.sha256(prepared.deviceGrant),
+      storageKEKHash: CanonicalCodec.sha256(
+        prepared.deviceStorageKEK.rawRepresentation
+      ),
+      cleanupStateCommitment: nil,
+      cleanupGuardHash: nil
+    )
+    let encoded = try PairedMachineMarkerCodec.encode(marker)
+    let outcome = try await keyStore.persistImmutable(encoded, for: context.keys.marker)
+    guard try await keyStore.load(context.keys.marker) == encoded else {
+      throw KeyStoreError.persistenceReadbackFailed
+    }
+    return outcome
+  }
+
+  private func auditVisibleMarker(
+    at markerKey: KeyStoreKey
+  ) async throws -> StoredPairedMachineRecordV1? {
+    guard let preliminaryData = try await keyStore.load(markerKey) else {
+      return nil
+    }
+    let preliminary = try PairedMachineMarkerCodec.decode(preliminaryData)
+    try validateMarker(preliminary, at: markerKey)
+    guard preliminary.phase == .committed else { return nil }
+
+    let context = try makeContext(record: preliminary.record)
+    let lease = try await context.leaseManager.acquire()
+    do {
+      guard let currentData = try await keyStore.load(markerKey) else {
+        await lease.release()
+        return nil
+      }
+      let current = try PairedMachineMarkerCodec.decode(currentData)
+      try validateMarker(current, at: markerKey)
+      guard current.phase == .committed else {
+        await lease.release()
+        return nil
+      }
+      guard current == preliminary else {
+        throw PairedMachineStoreError.persistenceMismatch
+      }
+      _ = try await auditDependencies(current, context: context, under: lease)
+      await lease.release()
+      return current.record
+    } catch {
+      await lease.release()
+      throw error
+    }
+  }
+
+  private func auditDependencies(
+    _ marker: PairedMachineMarker,
+    context: MachineContext,
+    under lease: MachineCryptoLease
+  ) async throws -> AuditedCleanupBindings {
+    let storageKeyData = try await loadMaterial(
+      context.keys.storageKEK,
+      expectedHash: marker.storageKEKHash
+    )
+    let storageKey = try DeviceStorageKEK(rawRepresentation: storageKeyData)
+    let sign = try await loadMaterial(
+      context.keys.deviceSign,
+      expectedHash: marker.deviceSignHash
+    )
+    let hpke = try await loadMaterial(
+      context.keys.deviceHPKE,
+      expectedHash: marker.deviceHPKEHash
+    )
+    let grant = try await loadMaterial(
+      context.keys.grant,
+      expectedHash: marker.grantHash
+    )
+    guard Self.isPrivateKey(sign),
+      Self.isPrivateKey(hpke),
+      !grant.isEmpty,
+      grant.count <= PreparedPairedMachinePromotionV1.maximumGrantBytes
+    else {
+      throw PairedMachineStoreError.persistenceMismatch
+    }
+
+    let stateStore = try FileCryptoStateStore(
+      rootURL: stateRootURL,
+      identity: context.identity,
+      storageKey: storageKey
+    )
+    guard let snapshot = try await stateStore.load() else {
+      throw PairedMachineStoreError.persistenceMismatch
+    }
+    try validateStateBinding(snapshot.state, record: marker.record)
+    let coordinator = try DurableCryptoStateCoordinator(
+      rootURL: stateRootURL,
+      identity: context.identity,
+      stateStore: stateStore,
+      keyStore: keyStore,
+      guardKey: context.keys.counterGuard
+    )
+    try await coordinator.auditBootstrap(
+      CounterBootstrapEvidence(
+        initialStateCommitment: marker.initialStateCommitment,
+        initialGuardCommitment: marker.initialGuardCommitment
+      ),
+      promotionID: marker.promotionID,
+      under: lease
+    )
+    guard let finalSnapshot = try await stateStore.load(),
+      let finalGuard = try await keyStore.load(context.keys.counterGuard)
+    else {
+      throw PairedMachineStoreError.persistenceMismatch
+    }
+    try validateStateBinding(finalSnapshot.state, record: marker.record)
+    return AuditedCleanupBindings(
+      stateCommitment: finalSnapshot.commitment,
+      guardHash: CanonicalCodec.sha256(finalGuard)
+    )
+  }
+
+  private func deleteExact(
+    _ record: StoredPairedMachineRecordV1,
+    context: MachineContext,
+    under lease: MachineCryptoLease
+  ) async throws {
+    guard await lease.isActive(for: context.leaseManager.identifier) else {
+      throw PairedMachineStoreError.persistenceMismatch
+    }
+    guard let markerData = try await keyStore.load(context.keys.marker) else {
+      return
+    }
+    var marker = try PairedMachineMarkerCodec.decode(markerData)
+    try validateMarker(marker, at: context.keys.marker)
+    guard marker.record == record else {
+      throw PairedMachineStoreError.persistenceMismatch
+    }
+
+    var cleanupData = markerData
+    if marker.phase == .committed {
+      let bindings = try await auditDependencies(marker, context: context, under: lease)
+      marker = marker.withCleanup(bindings)
+      cleanupData = try PairedMachineMarkerCodec.encode(marker)
+      try await keyStore.compareAndReplaceExact(
+        expected: markerData,
+        replacement: cleanupData,
+        for: context.keys.marker
+      )
+      guard try await keyStore.load(context.keys.marker) == cleanupData else {
+        throw KeyStoreError.persistenceReadbackFailed
+      }
+    }
+
+    try await validateCleanupDependencies(marker: marker, context: context)
+    try await deleteStateIfPresent(marker: marker, context: context)
+    guard let currentGuardHash = marker.cleanupGuardHash else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    try await deleteHashedMaterialIfPresent(
+      context.keys.counterGuard,
+      expectedHash: currentGuardHash
+    )
+    try await deleteHashedMaterialIfPresent(
+      context.keys.grant,
+      expectedHash: marker.grantHash
+    )
+    try await deleteHashedMaterialIfPresent(
+      context.keys.deviceHPKE,
+      expectedHash: marker.deviceHPKEHash
+    )
+    try await deleteHashedMaterialIfPresent(
+      context.keys.deviceSign,
+      expectedHash: marker.deviceSignHash
+    )
+    try await deleteHashedMaterialIfPresent(
+      context.keys.storageKEK,
+      expectedHash: marker.storageKEKHash
+    )
+    try await keyStore.deleteExact(expected: cleanupData, for: context.keys.marker)
+    guard try await keyStore.load(context.keys.marker) == nil else {
+      throw KeyStoreError.deleteReadbackFailed
+    }
+  }
+
+  private func validateCleanupDependencies(
+    marker: PairedMachineMarker,
+    context: MachineContext
+  ) async throws {
+    guard marker.phase == .cleanup,
+      let stateCommitment = marker.cleanupStateCommitment,
+      let guardHash = marker.cleanupGuardHash
+    else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+
+    let rawKEK = try await keyStore.load(context.keys.storageKEK)
+    let stateIsPresent: Bool
+    if let rawKEK {
+      guard CanonicalCodec.sha256(rawKEK) == marker.storageKEKHash else {
+        throw PairedMachineStoreError.persistenceMismatch
+      }
+      let stateStore = try FileCryptoStateStore(
+        rootURL: stateRootURL,
+        identity: context.identity,
+        storageKey: DeviceStorageKEK(rawRepresentation: rawKEK)
+      )
+      if let snapshot = try await stateStore.load() {
+        guard snapshot.commitment == stateCommitment else {
+          throw PairedMachineStoreError.persistenceMismatch
+        }
+        try validateStateBinding(snapshot.state, record: marker.record)
+        stateIsPresent = true
+      } else {
+        stateIsPresent = false
+      }
+    } else {
+      let stateURL = FileCryptoStateStore.stateURL(
+        rootURL: stateRootURL,
+        identity: context.identity
+      )
+      guard try !FileCryptoStateStore.entryExistsNoFollow(at: stateURL) else {
+        throw PairedMachineStoreError.persistenceMismatch
+      }
+      stateIsPresent = false
+    }
+
+    let guardValue = try await loadCleanupMaterialIfPresent(
+      context.keys.counterGuard,
+      expectedHash: guardHash
+    )
+    let grant = try await loadCleanupMaterialIfPresent(
+      context.keys.grant,
+      expectedHash: marker.grantHash
+    )
+    let hpke = try await loadCleanupMaterialIfPresent(
+      context.keys.deviceHPKE,
+      expectedHash: marker.deviceHPKEHash
+    )
+    let sign = try await loadCleanupMaterialIfPresent(
+      context.keys.deviceSign,
+      expectedHash: marker.deviceSignHash
+    )
+    if let grant {
+      guard !grant.isEmpty,
+        grant.count <= PreparedPairedMachinePromotionV1.maximumGrantBytes
+      else {
+        throw PairedMachineStoreError.persistenceMismatch
+      }
+    }
+    if let hpke {
+      guard Self.isPrivateKey(hpke) else {
+        throw PairedMachineStoreError.persistenceMismatch
+      }
+    }
+    if let sign {
+      guard Self.isPrivateKey(sign) else {
+        throw PairedMachineStoreError.persistenceMismatch
+      }
+    }
+
+    // cleanup 的合法 crash cut 只能形成 missing-prefix + present-suffix。
+    let presence = [
+      stateIsPresent,
+      guardValue != nil,
+      grant != nil,
+      hpke != nil,
+      sign != nil,
+      rawKEK != nil,
+    ]
+    var reachedPresentSuffix = false
+    for itemIsPresent in presence {
+      if itemIsPresent {
+        reachedPresentSuffix = true
+      } else if reachedPresentSuffix {
+        throw PairedMachineStoreError.persistenceMismatch
+      }
+    }
+  }
+
+  private func deleteStateIfPresent(
+    marker: PairedMachineMarker,
+    context: MachineContext
+  ) async throws {
+    guard let rawKey = try await keyStore.load(context.keys.storageKEK) else {
+      let stateURL = FileCryptoStateStore.stateURL(
+        rootURL: stateRootURL,
+        identity: context.identity
+      )
+      guard try !FileCryptoStateStore.entryExistsNoFollow(at: stateURL) else {
+        throw PairedMachineStoreError.persistenceMismatch
+      }
+      return
+    }
+    guard CanonicalCodec.sha256(rawKey) == marker.storageKEKHash else {
+      throw PairedMachineStoreError.persistenceMismatch
+    }
+    let stateStore = try FileCryptoStateStore(
+      rootURL: stateRootURL,
+      identity: context.identity,
+      storageKey: DeviceStorageKEK(rawRepresentation: rawKey)
+    )
+    guard let snapshot = try await stateStore.load() else { return }
+    guard let currentStateCommitment = marker.cleanupStateCommitment,
+      snapshot.commitment == currentStateCommitment
+    else {
+      throw PairedMachineStoreError.persistenceMismatch
+    }
+    try validateStateBinding(snapshot.state, record: marker.record)
+    try await stateStore.deleteExact(expected: snapshot)
+    guard try await stateStore.load() == nil else {
+      throw CryptoStateStoreError.persistenceReadbackFailed
+    }
+  }
+
+  private func makeContext(record: StoredPairedMachineRecordV1) throws -> MachineContext {
+    let identity = try CryptoStateIdentity(
+      clientKind: record.clientKind,
+      installationID: record.installationID,
+      machineID: record.machineID,
+      machineRootFingerprint: record.machineRootFingerprint,
+      machineRoute: record.machineRoute
+    )
+    return MachineContext(
+      identity: identity,
+      leaseManager: try MachineCryptoLeaseManager(
+        rootURL: stateRootURL,
+        identity: identity
+      ),
+      keys: try MachineKeys(record: record)
+    )
+  }
+
+  private func markerKey(
+    rootFingerprint: Data,
+    machineRoute: Data
+  ) throws -> KeyStoreKey {
+    do {
+      return try KeyStoreKey.paired(
+        clientKind: clientKind,
+        installationID: installationID,
+        rootFingerprint: rootFingerprint,
+        machineRoute: machineRoute,
+        purpose: .commitMarker
+      )
+    } catch {
+      throw PairedMachineStoreError.invalidRecord
+    }
+  }
+
+  private func validateMarker(
+    _ marker: PairedMachineMarker,
+    at actualKey: KeyStoreKey
+  ) throws {
+    try validateBinding(marker.record)
+    let expected = try markerKey(
+      rootFingerprint: marker.record.machineRootFingerprint,
+      machineRoute: marker.record.machineRoute
+    )
+    guard actualKey == expected else {
+      throw PairedMachineStoreError.invalidBinding
+    }
+  }
+
+  private func validateBinding(_ record: StoredPairedMachineRecordV1) throws {
+    guard record.clientKind == clientKind,
+      record.installationID == installationID
+    else {
+      throw PairedMachineStoreError.invalidBinding
+    }
+  }
+
+  private func validateStateBinding(
+    _ state: DeviceCryptoStateV1,
+    record: StoredPairedMachineRecordV1
+  ) throws {
+    let trust = state.trustScope
+    guard trust.relayServerID == record.relayServerID,
+      trust.machineRootFingerprint == record.machineRootFingerprint,
+      trust.machineRoute == record.machineRoute,
+      trust.deviceRoute == record.deviceRoute,
+      trust.grantSerial == record.grantSerial,
+      trust.trustEpoch == record.trustEpoch
+    else {
+      throw PairedMachineStoreError.invalidBinding
+    }
+  }
+
+  private func persistAndReadBack(_ data: Data, for key: KeyStoreKey) async throws {
+    _ = try await keyStore.persistImmutable(data, for: key)
+    guard try await keyStore.load(key) == data else {
+      throw KeyStoreError.persistenceReadbackFailed
+    }
+  }
+
+  private func loadMaterial(
+    _ key: KeyStoreKey,
+    expectedHash: Data
+  ) async throws -> Data {
+    guard let value = try await keyStore.load(key),
+      CanonicalCodec.sha256(value) == expectedHash
+    else {
+      throw PairedMachineStoreError.persistenceMismatch
+    }
+    return value
+  }
+
+  private func loadCleanupMaterialIfPresent(
+    _ key: KeyStoreKey,
+    expectedHash: Data
+  ) async throws -> Data? {
+    guard let value = try await keyStore.load(key) else { return nil }
+    guard CanonicalCodec.sha256(value) == expectedHash else {
+      throw PairedMachineStoreError.persistenceMismatch
+    }
+    return value
+  }
+
+  private func deleteHashedMaterialIfPresent(
+    _ key: KeyStoreKey,
+    expectedHash: Data
+  ) async throws {
+    guard let value = try await keyStore.load(key) else { return }
+    guard CanonicalCodec.sha256(value) == expectedHash else {
+      throw PairedMachineStoreError.persistenceMismatch
+    }
+    try await keyStore.deleteExact(expected: value, for: key)
+    guard try await keyStore.load(key) == nil else {
+      throw KeyStoreError.deleteReadbackFailed
+    }
+  }
+
+  private static func isPrivateKey(_ data: Data) -> Bool {
+    data.count == PreparedPairedMachinePromotionV1.privateKeyBytes
+      && data.contains(where: { $0 != 0 })
+  }
+}
+
+private struct MachineContext {
+  let identity: CryptoStateIdentity
+  let leaseManager: MachineCryptoLeaseManager
+  let keys: MachineKeys
+}
+
+private struct AuditedCleanupBindings {
+  let stateCommitment: Data
+  let guardHash: Data
+}
+
+private struct MachineKeys {
+  let deviceSign: KeyStoreKey
+  let deviceHPKE: KeyStoreKey
+  let grant: KeyStoreKey
+  let storageKEK: KeyStoreKey
+  let counterGuard: KeyStoreKey
+  let marker: KeyStoreKey
+
+  init(record: StoredPairedMachineRecordV1) throws {
+    func key(_ purpose: PairedKeyStorePurpose) throws -> KeyStoreKey {
+      try KeyStoreKey.paired(
+        clientKind: record.clientKind,
+        installationID: record.installationID,
+        rootFingerprint: record.machineRootFingerprint,
+        machineRoute: record.machineRoute,
+        purpose: purpose
+      )
+    }
+    deviceSign = try key(.deviceSignPrivateKey)
+    deviceHPKE = try key(.deviceHPKEPrivateKey)
+    grant = try key(.deviceGrant)
+    storageKEK = try key(.deviceStorageKEK)
+    counterGuard = try key(.counterGuard)
+    marker = try key(.commitMarker)
+  }
+}
+
+private enum PairedMachineMarkerPhase: UInt8, Equatable {
+  case committed = 0
+  case cleanup = 1
+}
+
+private struct PairedMachineMarker: Equatable {
+  let phase: PairedMachineMarkerPhase
+  let record: StoredPairedMachineRecordV1
+  let promotionID: Data
+  let initialStateCommitment: Data
+  let initialGuardCommitment: Data
+  let deviceSignHash: Data
+  let deviceHPKEHash: Data
+  let grantHash: Data
+  let storageKEKHash: Data
+  let cleanupStateCommitment: Data?
+  let cleanupGuardHash: Data?
+
+  func withCleanup(_ bindings: AuditedCleanupBindings) -> Self {
+    Self(
+      phase: .cleanup,
+      record: record,
+      promotionID: promotionID,
+      initialStateCommitment: initialStateCommitment,
+      initialGuardCommitment: initialGuardCommitment,
+      deviceSignHash: deviceSignHash,
+      deviceHPKEHash: deviceHPKEHash,
+      grantHash: grantHash,
+      storageKEKHash: storageKEKHash,
+      cleanupStateCommitment: bindings.stateCommitment,
+      cleanupGuardHash: bindings.guardHash
+    )
+  }
+
+  func matches(_ prepared: PreparedPairedMachinePromotionV1) -> Bool {
+    record == prepared.record
+      && promotionID == prepared.promotionID32
+      && initialStateCommitment == prepared.initialCryptoState.commitment
+      && deviceSignHash == CanonicalCodec.sha256(prepared.deviceSignPrivateKey)
+      && deviceHPKEHash == CanonicalCodec.sha256(prepared.deviceHPKEPrivateKey)
+      && grantHash == CanonicalCodec.sha256(prepared.deviceGrant)
+      && storageKEKHash
+        == CanonicalCodec.sha256(prepared.deviceStorageKEK.rawRepresentation)
+      && cleanupStateCommitment == nil
+      && cleanupGuardHash == nil
+  }
+}
+
+private enum PairedMachineMarkerCodec {
+  private static let maximumMarkerBytes = 64 * 1_024
+
+  static func encode(_ marker: PairedMachineMarker) throws -> Data {
+    var encoder = RecordEncoder()
+    encoder.fixed(Data("ADPM".utf8))
+    encoder.u16(2)
+    encoder.u8(marker.phase.rawValue)
+    encoder.u8(0)
+    try encoder.bytes(PairedMachineRecordCodec.encode(marker.record))
+    encoder.fixed(marker.promotionID)
+    encoder.fixed(marker.initialStateCommitment)
+    encoder.fixed(marker.initialGuardCommitment)
+    encoder.fixed(marker.deviceSignHash)
+    encoder.fixed(marker.deviceHPKEHash)
+    encoder.fixed(marker.grantHash)
+    encoder.fixed(marker.storageKEKHash)
+    switch marker.phase {
+    case .committed:
+      guard marker.cleanupStateCommitment == nil,
+        marker.cleanupGuardHash == nil
+      else {
+        throw PairedMachineStoreError.invalidRecord
+      }
+      encoder.fixed(Data(repeating: 0, count: 64))
+    case .cleanup:
+      guard let stateCommitment = marker.cleanupStateCommitment,
+        let guardHash = marker.cleanupGuardHash,
+        stateCommitment.count == 32,
+        stateCommitment.contains(where: { $0 != 0 }),
+        guardHash.count == 32,
+        guardHash.contains(where: { $0 != 0 })
+      else {
+        throw PairedMachineStoreError.invalidRecord
+      }
+      encoder.fixed(stateCommitment)
+      encoder.fixed(guardHash)
+    }
+    guard encoder.data.count <= maximumMarkerBytes else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    return encoder.data
+  }
+
+  static func decode(_ data: Data) throws -> PairedMachineMarker {
+    guard data.count <= maximumMarkerBytes else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    var decoder = RecordDecoder(data: data)
+    guard try decoder.fixed(count: 4) == Data("ADPM".utf8),
+      try decoder.u16() == 2,
+      let phase = PairedMachineMarkerPhase(rawValue: try decoder.u8()),
+      try decoder.u8() == 0
+    else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    let record = try PairedMachineRecordCodec.decode(try decoder.bytes())
+    let promotionID = try decoder.nonzeroFixed(count: 32)
+    let initialStateCommitment = try decoder.nonzeroFixed(count: 32)
+    let initialGuardCommitment = try decoder.nonzeroFixed(count: 32)
+    let deviceSignHash = try decoder.nonzeroFixed(count: 32)
+    let deviceHPKEHash = try decoder.nonzeroFixed(count: 32)
+    let grantHash = try decoder.nonzeroFixed(count: 32)
+    let storageKEKHash = try decoder.nonzeroFixed(count: 32)
+    let cleanupStateCommitment: Data?
+    let cleanupGuardHash: Data?
+    switch phase {
+    case .committed:
+      guard try decoder.fixed(count: 64).allSatisfy({ $0 == 0 }) else {
+        throw PairedMachineStoreError.invalidRecord
+      }
+      cleanupStateCommitment = nil
+      cleanupGuardHash = nil
+    case .cleanup:
+      cleanupStateCommitment = try decoder.nonzeroFixed(count: 32)
+      cleanupGuardHash = try decoder.nonzeroFixed(count: 32)
+    }
+    guard decoder.isAtEnd else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    return PairedMachineMarker(
+      phase: phase,
+      record: record,
+      promotionID: promotionID,
+      initialStateCommitment: initialStateCommitment,
+      initialGuardCommitment: initialGuardCommitment,
+      deviceSignHash: deviceSignHash,
+      deviceHPKEHash: deviceHPKEHash,
+      grantHash: grantHash,
+      storageKEKHash: storageKEKHash,
+      cleanupStateCommitment: cleanupStateCommitment,
+      cleanupGuardHash: cleanupGuardHash
+    )
+  }
+}
+
+private enum PairedMachineRecordCodec {
+  private static let maximumRecordBytes = 48 * 1_024
+
+  static func encode(_ record: StoredPairedMachineRecordV1) throws -> Data {
+    var encoder = RecordEncoder()
+    encoder.fixed(Data("ADPR".utf8))
+    encoder.u16(1)
+    encoder.u16(0)
+    switch record.clientKind {
+    case .macOSApp: encoder.u8(0)
+    case .iOSApp: encoder.u8(1)
+    case .cli: encoder.u8(2)
+    }
+    encoder.fixed(uuidBytes(record.installationID))
+    try encoder.bytes(Data(record.machineID.utf8))
+    try encoder.bytes(Data(record.machineName.utf8))
+    try encoder.bytes(Data(record.relayURL.absoluteString.utf8))
+    encoder.fixed(record.relayServerID)
+    encoder.fixed(record.machineRootFingerprint)
+    encoder.fixed(record.machineRoute)
+    encoder.fixed(record.deviceRoute)
+    encoder.fixed(record.currentSPKIPin)
+    if let next = record.nextSPKIPin {
+      encoder.u8(1)
+      encoder.fixed(next)
+    } else {
+      encoder.u8(0)
+    }
+    encoder.u64(record.grantSerial)
+    encoder.u64(record.trustEpoch)
+    encoder.u64(record.createdAtMS)
+    guard encoder.data.count <= maximumRecordBytes else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    return encoder.data
+  }
+
+  static func decode(_ data: Data) throws -> StoredPairedMachineRecordV1 {
+    guard data.count <= maximumRecordBytes else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    var decoder = RecordDecoder(data: data)
+    guard try decoder.fixed(count: 4) == Data("ADPR".utf8),
+      try decoder.u16() == 1,
+      try decoder.u16() == 0
+    else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    let clientKind: RelayClientKind
+    switch try decoder.u8() {
+    case 0: clientKind = .macOSApp
+    case 1: clientKind = .iOSApp
+    case 2: clientKind = .cli
+    default: throw PairedMachineStoreError.invalidRecord
+    }
+    let installationID = try uuid(try decoder.fixed(count: 16))
+    let machineID = try string(try decoder.bytes())
+    let machineName = try string(try decoder.bytes())
+    guard let relayURL = URL(string: try string(try decoder.bytes())) else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    let relayServerID = try decoder.fixed(count: 16)
+    let root = try decoder.fixed(count: 32)
+    let machineRoute = try decoder.fixed(count: 16)
+    let deviceRoute = try decoder.fixed(count: 16)
+    let currentPin = try decoder.fixed(count: 32)
+    let nextPin: Data?
+    switch try decoder.u8() {
+    case 0: nextPin = nil
+    case 1: nextPin = try decoder.fixed(count: 32)
+    default: throw PairedMachineStoreError.invalidRecord
+    }
+    let grantSerial = try decoder.u64()
+    let trustEpoch = try decoder.u64()
+    let createdAtMS = try decoder.u64()
+    guard decoder.isAtEnd else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    return try StoredPairedMachineRecordV1(
+      clientKind: clientKind,
+      installationID: installationID,
+      machineID: machineID,
+      machineName: machineName,
+      relayURL: relayURL,
+      relayServerID: relayServerID,
+      machineRootFingerprint: root,
+      machineRoute: machineRoute,
+      deviceRoute: deviceRoute,
+      currentSPKIPin: currentPin,
+      nextSPKIPin: nextPin,
+      grantSerial: grantSerial,
+      trustEpoch: trustEpoch,
+      createdAtMS: createdAtMS
+    )
+  }
+
+  private static func uuidBytes(_ value: UUID) -> Data {
+    var bytes = value.uuid
+    return Swift.withUnsafeBytes(of: &bytes) { Data($0) }
+  }
+
+  private static func uuid(_ bytes: Data) throws -> UUID {
+    guard bytes.count == 16 else { throw PairedMachineStoreError.invalidRecord }
+    let values = [UInt8](bytes)
+    return UUID(
+      uuid: (
+        values[0], values[1], values[2], values[3],
+        values[4], values[5], values[6], values[7],
+        values[8], values[9], values[10], values[11],
+        values[12], values[13], values[14], values[15]
+      ))
+  }
+
+  private static func string(_ data: Data) throws -> String {
+    guard let value = String(data: data, encoding: .utf8) else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    return value
+  }
+}
+
+private struct RecordEncoder {
+  var data = Data()
+
+  mutating func u8(_ value: UInt8) { data.append(value) }
+  mutating func u16(_ value: UInt16) { append(value) }
+  mutating func u64(_ value: UInt64) { append(value) }
+  mutating func fixed(_ value: Data) { data.append(value) }
+
+  mutating func bytes(_ value: Data) throws {
+    guard let count = UInt32(exactly: value.count) else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    append(count)
+    data.append(value)
+  }
+
+  private mutating func append<T: FixedWidthInteger>(_ value: T) {
+    var encoded = value.bigEndian
+    Swift.withUnsafeBytes(of: &encoded) { data.append(contentsOf: $0) }
+  }
+}
+
+private struct RecordDecoder {
+  let data: Data
+  var offset = 0
+  var isAtEnd: Bool { offset == data.count }
+
+  mutating func u8() throws -> UInt8 {
+    try fixed(count: 1)[0]
+  }
+
+  mutating func u16() throws -> UInt16 {
+    try integer(count: 2, as: UInt16.self)
+  }
+
+  mutating func u64() throws -> UInt64 {
+    try integer(count: 8, as: UInt64.self)
+  }
+
+  mutating func bytes() throws -> Data {
+    let count = Int(try integer(count: 4, as: UInt32.self))
+    return try fixed(count: count)
+  }
+
+  mutating func nonzeroFixed(count: Int) throws -> Data {
+    let value = try fixed(count: count)
+    guard value.contains(where: { $0 != 0 }) else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    return value
+  }
+
+  mutating func fixed(count: Int) throws -> Data {
+    let addition = offset.addingReportingOverflow(count)
+    guard count >= 0, !addition.overflow, addition.partialValue <= data.count else {
+      throw PairedMachineStoreError.invalidRecord
+    }
+    let end = addition.partialValue
+    defer { offset = end }
+    return data.subdata(in: offset..<end)
+  }
+
+  private mutating func integer<T: FixedWidthInteger>(
+    count: Int,
+    as _: T.Type
+  ) throws -> T {
+    try fixed(count: count).reduce(0) { ($0 << 8) | T($1) }
+  }
+}

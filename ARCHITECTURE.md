@@ -60,8 +60,8 @@ agentdeckd
   Concurrency 与 `AgentDeckCore`。它不拥有网络、crypto、Keychain、UI 或 fixture；普通远程 source 与本机
   pairing administration 是两个独立 capability。
 - `Sources/AgentDeckRelayClient/`：共享 Relay wire/crypto/client 层，显式依赖 `AgentDeckCore` 与
-  `AgentDeckSessionSource`。P5.1 只冻结依赖方向；production `RelaySessionSource`、存储与 WSS 生命周期由
-  P5.2–P5.4 继续实现。
+  `AgentDeckSessionSource`。P5.2 已实现 Apple Keychain、typed sealed CryptoState、counter/replay 与 paired
+  marker；production `RelaySessionSource`、WSS 与 connection 生命周期仍由 P5.3–P5.4 实现。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/local/`：当前为本地 Runtime v5 framing；它在 P4.2 Runtime v3 machine administration 与
@@ -775,6 +775,31 @@ conversation/key，不能伪造身份连续性。
 - P5.1 只完成 facade、公共模型、依赖图与 compile/link contract。旧 iOS
   `MobileSessionSource`/models/fixture 在 P5.5 前继续留在 app target，`SceneDelegate` 仍注入 fixture；
   因此本项不证明 RelaySessionSource、bounded broadcaster、WSS/Keychain、真实 iOS 或 P5 Phase Exit。
+
+### Relay Companion MVP P5.2 client CryptoState 不变量
+
+- Keychain service 固定为 `com.agentdeck.remote.v1`；account 只能由 pending/paired typed factory 构造，
+  `macos-app`、`ios-app`、`cli` 使用独立 installation namespace。全零 installation/invite/root/route 拒绝；
+  item 固定 Data Protection Keychain、WhenUnlockedThisDeviceOnly、non-sync、non-interactive，并以 SHA-256
+  commitment 做 immutable/exact-CAS/delete readback，不存在 blind overwrite/delete 或 file secret 降级。
+- `CryptoStateFileV1` plaintext 只能由 canonical `DeviceCryptoStateV1` 构造；ADCS v1 使用随机 ChaChaPoly
+  nonce 和长度前缀二进制 AAD，绑定 client/installation/machine/root/route。完整 plaintext 上限 128 MiB；
+  文件固定 0600、backup exclusion、Complete protection、同 UID 单链接 regular file，并通过 retained fd、
+  `O_NOFOLLOW`、`temp → fsync(file) → rename → fsync(parent) → authenticated readback` 发布。
+- counter reservation 固定 `CounterGuard Pending → sealed state → Stable`，每块 1,024；任一 crash cut
+  只能整块跳号，不能复用。replay/cursor/quarantine mutation 另先写 `statePending(previous Stable + exact
+  next revision/full-state commitment)`：state 仍等于 previous 时回滚 guard，state exact 等于 next 时
+  finalize，任何 authenticated sibling/fork 一律 durable quarantine + retired guard；禁止用 revision +1
+  heuristic 恢复。
+- receive replay window 固定 4,096 entries，floor 以下先判 stale；窗口内 exact hash 才算 duplicate，
+  同 counter 不同 hash 必须先持久化 quarantine/retirement 再报 nonce reuse。通用 state seam 不得删除
+  replay tuple、回退 cursor/hash/status 或把 quarantined machine 重激活。
+- paired promotion 固定 `KEK → sealed state → private material/grant → CounterGuard → commit marker last`；
+  cold list 必须逐项审计。cleanup journal 冻结 current state commitment 与 raw guard digest，按
+  `state → guard → grant → HPKE → Sign → KEK → journal` exact delete；损坏 state/guard 不构成删除授权。
+- 本节只证明 P5.2 本地 primitive。SwiftPM 无 entitlement 时的 SecItem `-34018` 与 Simulator 非物理
+  Complete readback均明确保持 production-signed/物理 iPhone post-MVP BLOCKED；WSS、RelaySessionSource、
+  真实 pairing/command 闭环和 P5 Phase Exit 仍未完成。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 

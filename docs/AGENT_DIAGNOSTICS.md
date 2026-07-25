@@ -1084,7 +1084,34 @@ Protection Keychain 且没有 file/dev keystore 降级。MachineRoot 丢失按
 [`RELAY_RUNBOOK.md` 的 portable purge receipt 流程](RELAY_RUNBOOK.md#machineroot-丢失后的-portable-purge-receipt)
 处理；static sentinel 不生成 receipt，也不提供删除授权。
 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与
-destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade 已完成，P5/P6 当前为 1/9、0/4。
+destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade 与 P5.2 crash-safe client storage 已完成，
+P5/P6 当前为 2/9、0/4。
+
+#### P5.2 client storage / counter / replay failure
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `remote.keystore.invalid_account` / `invalid_length` | 调用方没有使用 typed pending/paired account，或 invite/root/route 长度不合法 | 停止持久化并重建 typed identity；不得传任意 service/account |
+| `remote.keystore.immutable_conflict` | immutable item 已存在但 bytes 不同 | 保留原 item，核对 installation/root/route/purpose；不得覆盖 |
+| `remote.keystore.compare_and_replace_missing` / `compare_and_replace_mismatch` | CounterGuard 等可变 item 缺失或 expected bytes 已漂移 | 退休当前 epoch 或重新审计 paired state；不得 blind update |
+| `remote.keystore.persistence_readback_failed` / `delete_readback_failed` | Keychain mutation 后 exact readback 不一致 | 视为 commit unknown，停止发送/删除并读回；不得假定成功 |
+| `remote.keystore.unavailable.*` | Security.framework 返回 OSStatus；SwiftPM 的 `-34018` 是缺 Data Protection Keychain entitlement | production 必须使用匹配签名/entitlement；automatic runner 明确 SKIP，不回退 memory/file secret |
+| `remote.crypto_state.missing_storage_key` | sealed state 已存在但对应 DeviceStorageKEK 不在 Keychain | fail-close 并走重新配对/trust reset；禁止生成替代 KEK |
+| `remote.crypto_state.authentication_failed` / `invalid_format` | AAD identity、KEK、header/version/length 或 AEAD tag 不匹配 | 不修复、不覆盖原文件；核对 client/installation/machine/root/route 后进入 security error |
+| `remote.crypto_state.input_too_large` | plaintext 超过 128 MiB，或 sealed file 超过 128 MiB + 40-byte ADCS overhead | 停止订阅并先做 snapshot/GC；不得截断或静默丢 replay guard |
+| `remote.crypto_state.unsafe_file` / `backup_exclusion_missing` / `file_protection_missing` | state 不是当前 UID 的单链接 0600 regular file，或保护属性缺失 | 停止加载；修复可信目录/签名环境后重试，不在原路径自动降级 |
+| `remote.crypto_state.compare_and_replace_mismatch` / `persistence_readback_failed` | sealed state exact CAS 或 durable readback 失败 | 按 commit unknown 处理并重新读 guard/state；不得继续消费 counter |
+| `remote.counter.epoch_retirement_required` | guard/state high-water、state commitment、Pending reservation 分叉或 UInt64 overflow | 退休当前 key epoch 并由上层协调 rekey；绝不猜测 counter |
+| `remote.crypto.nonce_reuse` | replay window 内同 counter 出现不同 ciphertext hash | 持久化 quarantine/retirement 后隔离连接；不要只重试当前 frame |
+
+重启读到 counter `Pending` 时只能按 exact reservation commitment 补写/确认并整块跳号；读到
+non-counter `statePending` 时，只能在 state 仍等于 previous 时回滚 guard，或在 state commitment exact
+等于 next 时 finalize。第三种 state（即使 scope 相同且 revision 正好 +1）都是 authenticated fork，必须
+durable quarantine + retired guard，不能手改 guard/state 让它继续 active。
+
+Simulator 可验证 CryptoState roundtrip、backup exclusion、tamper fail-close 和 production protection policy
+配置，但 CoreSimulator 当前把 protection readback 固定显示为 `CompleteUntilFirstUserAuthentication`；只有物理
+iPhone 的锁屏/解锁 readback 能关闭真实 `Complete` 证据槽位。
 
 #### Trust reset 与本地 cleanup
 

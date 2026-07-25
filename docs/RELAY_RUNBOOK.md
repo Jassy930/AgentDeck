@@ -483,5 +483,5 @@ persistent pairing 必须使用 Data Protection Keychain，不得降级到 injec
 丢失时回到本手册的 [portable purge receipt 流程](#machineroot-丢失后的-portable-purge-receipt)，静态
 sentinel 不生成 receipt 或删除授权。production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、
 物理真机/真实 iOS、第二台 Mac 与 destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade 已完成，
-P5/P6 当前为 1/9、0/4。
+P5.2 crash-safe client storage 也已完成，P5/P6 当前为 2/9、0/4。
 R0/R1 命令和 `--bootstrap-secret` 只属于历史记录，不得用于当前部署或验收。

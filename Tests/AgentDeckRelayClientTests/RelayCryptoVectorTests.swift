@@ -129,6 +129,36 @@ final class RelayCryptoVectorTests: XCTestCase {
         )
     }
 
+    func testProductionSendingKeyDerivesRustNoncePrefixAndRejectsEpochMismatch() throws {
+        let rawKey = Data(hex: "7a03e194b52f68c011da438ef72955bc61a80d379fe47216c95b248340ed9a6f")
+        let keyID = KeyIDV1(purpose: .deviceCommandTx, epoch: 9)
+        let sendingKey = try AeadSendingKey(
+            keyID: keyID,
+            epoch: 9,
+            keyDirectoryRevision: 12,
+            payloadKind: .commandRequest,
+            rawKey: rawKey
+        )
+        XCTAssertEqual(sendingKey.noncePrefix, Data([0x52, 0xD0, 0x1C, 0x68]))
+
+        XCTAssertThrowsError(
+            try AeadSendingKey(
+                keyID: keyID,
+                epoch: 10,
+                keyDirectoryRevision: 12,
+                payloadKind: .commandRequest,
+                rawKey: rawKey
+            )
+        ) { error in
+            XCTAssertEqual(error as? RelayCryptoError, .invalidKey(field: "keyID.epoch"))
+        }
+        XCTAssertThrowsError(
+            try AeadReceivingKey(keyID: keyID, epoch: 10, rawKey: rawKey)
+        ) { error in
+            XCTAssertEqual(error as? RelayCryptoError, .invalidKey(field: "keyID.epoch"))
+        }
+    }
+
     func testSealedBlobTamperReturnsTypedFailures() throws {
         let vectors = try loadVectors()
         let aead = try section("chacha20poly1305", in: vectors)

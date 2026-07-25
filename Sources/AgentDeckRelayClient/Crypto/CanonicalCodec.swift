@@ -6,11 +6,25 @@ import Foundation
 public enum RelayCryptoError: Error, Equatable, Sendable {
     case badSignature
     case badCiphertext
+    case nonceReuse
     case invalidKey(field: String)
     case invalidLength(field: String, expected: Int, actual: Int)
     case lengthOverflow(field: String)
     case hpkeFailure
     case sealFailure
+
+    public var code: String {
+        switch self {
+        case .badSignature: "remote.crypto.bad_signature"
+        case .badCiphertext: "remote.crypto.bad_ciphertext"
+        case .nonceReuse: "remote.crypto.nonce_reuse"
+        case .invalidKey: "remote.crypto.invalid_key"
+        case .invalidLength: "remote.crypto.invalid_length"
+        case .lengthOverflow: "remote.crypto.length_overflow"
+        case .hpkeFailure: "remote.crypto.hpke_failure"
+        case .sealFailure: "remote.crypto.seal_failure"
+        }
+    }
 }
 
 public enum SignedObjectType: String, Codable, Sendable {

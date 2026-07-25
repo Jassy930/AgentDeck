@@ -212,7 +212,7 @@ module/build edge，避免生成重复 product wrapper。`CoreLinkTests` 会实�
 `FixtureSessionSource`（bundle 内 JSON 回放），旧 `MobileSessionSource`/models 要到 P5.5 才迁移。
 因此杀 app 仍会重置 fixture 状态，当前界面不依赖 daemon 或网络，也不构成真实 Relay 链路证据。
 
-## Relay Companion MVP 实施状态（P5.1 complete；P5 为 1/9）
+## Relay Companion MVP 实施状态（P5.2 complete；P5 为 2/9）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -227,8 +227,24 @@ P5.1 已建立 `AgentDeckSessionSource -> AgentDeckCore`、
 executable 显式链接三个共享 product；iOS App/Test 显式声明三 product，并通过 RelayClient 传递链接
 SessionSource。facade 固定为非 `@MainActor` 的异步观察协议、
 typed resource/connection/receipt/pairing 状态和独立的本机 pairing administration capability；共享 target
-只依赖 Foundation/Swift Concurrency 与 `AgentDeckCore`。本项只计 P5 的 1/9；Relay source、旧 iOS fixture
-迁移、真实网络/Keychain、AppKit registry、Simulator 自动 E2E 与 P5 Phase Exit 仍未完成。
+只依赖 Foundation/Swift Concurrency 与 `AgentDeckCore`。
+
+P5.2 又在 `AgentDeckRelayClient` 建立封闭语义的 App/CLI Keychain account、immutable/exact-CAS/readback
+接口和固定 `com.agentdeck.remote.v1` Apple adapter；`CryptoStateFileV1` 使用随机 nonce ChaChaPoly、独立
+长度前缀 AAD、128 MiB plaintext 上界、0600、backup exclusion、Complete protection 与
+`temp → fsync(file) → rename → fsync(parent) → authenticated readback`。sender counter 固定每次先把
+带完整 state commitment 的 Pending guard 写入 Keychain，再 CAS sealed state、最后写 Stable，三处 crash
+cut 恢复都整块跳过；replay/cursor/quarantine 更新另先写绑定 previous Stable 与 exact next full-state
+commitment 的 `statePending`，重启只允许 previous 回滚或 exact next finalize，其他 sibling/fork 一律
+quarantine + retire。receive replay 固定 4,096-entry window，并区分 exact duplicate、stale 与 nonce reuse。
+paired marker 另用 `StoredPairedMachineRecordV1`，不复用 facade 的 `PairedMachine` 名称，也不保存
+grant/private key。自动门禁为 RelayClient `121 executed / 4 entitlement SKIP`、完整 Swift
+`649 XCTest / 4 SKIP + 35 Swift Testing`、iOS storage `5/5` 与全量 Simulator `26/26`；SKIP 不计 PASS。
+P5 当前只计 2/9；Relay source、旧 iOS fixture 迁移、WSS、AppKit registry、Simulator
+自动 Relay E2E 与 P5 Phase Exit 仍未完成。当前 SwiftPM runner 的 Data Protection Keychain 因缺 entitlement
+返回 `-34018`，真实 SecItem 用例明确 SKIP；iOS Simulator 也固定回报
+`CompleteUntilFirstUserAuthentication`，不能代替物理 iPhone 锁屏 readback。这两项继续留在 post-MVP
+production-signed/物理设备槽位，不得写成 PASS。
 P3.10 已由 code/test commit `19622ab` 完成 Task 收口：当时把 Runtime schema 推进到 v7，并新增 authenticated machine-wide
 `admin_commands` ledger，并实现 30 天 retention、容量准入、exact replay/conflict 与 COMMIT-unknown
 收敛；`StageUpgrade` 只有在 exact reply 完整 flush ACK 后才 arm，随后经 active→idle fence、候选
@@ -843,8 +859,9 @@ execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 
 Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/test 提交分别为 `b818f81` / `d68cc02`。
 普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS。P3.10 LaunchAgent
 安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；基于 `9efb28d` 的独立 P3 Phase
-Exit 已完成；P4.1–P4.7 automatic Task 与 P4 automatic Phase Exit 已收口，P5.1 shared facade 也已完成；
-P4–P6 按 Task 进度计为 7/7、1/9、0/4。`p4-auto` 已 PASS，`p4` 仍不受支持；完整 P4 Phase Exit 还由 pre-closeout candidate
+Exit 已完成；P4.1–P4.7 automatic Task 与 P4 automatic Phase Exit 已收口，P5.1 shared facade 与 P5.2
+crash-safe client storage 也已完成；P4–P6 按 Task 进度计为 7/7、2/9、0/4。`p4-auto` 已 PASS，`p4`
+仍不受支持；完整 P4 Phase Exit 还由 pre-closeout candidate
 SHA-256 `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的顶层门禁和
 `spec/security`、`quality` 双路 Approved review 共同支撑，P0/P1/P2=0。P3.1 provisioned signed
 Keychain roundtrip 继续是 post-MVP BLOCKED 槽位，不阻塞 automatic closeout；P5/P6 物理设备/公网/Linux
