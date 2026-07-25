@@ -219,7 +219,7 @@ async fn next_pair_data(client: &mut RelayPairingClient) -> PairData {
     }
 }
 
-async fn await_already_absent_route_close(client: &mut RelayPairingClient) {
+async fn await_route_close(client: &mut RelayPairingClient, expected: PairRouteCloseOutcome) {
     loop {
         match tokio::time::timeout(IO_TIMEOUT, client.next_event())
             .await
@@ -228,7 +228,7 @@ async fn await_already_absent_route_close(client: &mut RelayPairingClient) {
             .expect("PairRoute close terminal")
         {
             PairingEvent::RouteClosed(closed) => {
-                assert_eq!(closed.outcome, PairRouteCloseOutcome::AlreadyAbsent);
+                assert_eq!(closed.outcome, expected);
                 return;
             }
             PairingEvent::RouteAccepted(_) => {}
@@ -580,6 +580,10 @@ async fn cli_uds_real_relay_pairing_delivers_one_active_grant_and_closes_route()
         assert_durable_delivery(&config.paths().runtime_db),
         "delivery must erase live pairing state, retain one confirmed receipt and activate one grant"
     );
+    // machine terminal Close 先把 active route 原子变为 tombstone，并按 Relay control FIFO
+    // 把同一 Closed 投递给已绑定 pairing。先消费这条 durable terminal ACK，再由 pairing
+    // 重复 Close，才能确定性证明 tombstone 返回 AlreadyAbsent。
+    await_route_close(&mut device, PairRouteCloseOutcome::Closed).await;
     device
         .request_close(ClosePairRoute {
             machine_route: response_info.machine_route,
@@ -587,7 +591,7 @@ async fn cli_uds_real_relay_pairing_delivers_one_active_grant_and_closes_route()
         })
         .await
         .expect("request idempotent close after machine terminal ACK");
-    await_already_absent_route_close(&mut device).await;
+    await_route_close(&mut device, PairRouteCloseOutcome::AlreadyAbsent).await;
     drop(device);
 
     cli.close().await.expect("close CLI Runtime transport");
