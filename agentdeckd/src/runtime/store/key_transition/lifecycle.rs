@@ -20,6 +20,93 @@ pub(crate) fn canonical_update_hash(bytes: &[u8]) -> Result<[u8; 32], RuntimeSto
     Ok(Sha256::digest(bytes).into())
 }
 
+fn bootstrap_pairing_still_retained(
+    directory: &super::super::pairing::PairingDirectory,
+    transition: &KeyTransitionRecord,
+) -> Result<bool, RuntimeStoreError> {
+    let expected_target = match (transition.operation, transition.target) {
+        (
+            KeyTransitionOperation::Add | KeyTransitionOperation::Renew,
+            KeyTransitionTarget::Device(target),
+        ) => target,
+        _ if transition.bootstrap_install_proof.is_some() => {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        _ => return Ok(false),
+    };
+    let expected_pairing_id = transition
+        .bootstrap_install_proof
+        .as_ref()
+        .map(|proof| proof.binding.pairing_id);
+    let mut expected_pairing_seen = false;
+    let mut exact_pairing_retained = false;
+
+    for pairing in &directory.pairings {
+        let pairing_id = pairing.record.pairing_id;
+        let id_matches = expected_pairing_id
+            .as_ref()
+            .is_some_and(|expected| pairing_id.as_bytes() == expected);
+        if pairing.record.lifecycle != super::super::pairing::PairingInviteLifecycle::Delivered {
+            if id_matches {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            continue;
+        }
+        if pairing
+            .record
+            .delivery_receipt_hash
+            .is_none_or(|hash| hash == [0; 32])
+            || directory.terminal.receipt_value(pairing_id).is_none()
+            || directory.terminal.close_projection(pairing_id).is_none()
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+
+        // `load_directory` 已认证 pairing/terminal rows；这里继续解析其 canonical
+        // grant 与 key directory，以三轴精确绑定 legacy v1/v2 的 proofless transition。
+        // 任一 Delivered row 无法 canonical round-trip 都必须让 GC fail closed。
+        let (key_directory, _) = super::super::pairing_delivery::bootstrap_directory(pairing)?;
+        let install = pairing
+            .record
+            .canonical_install_frame
+            .as_deref()
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let (grant, _) = super::super::pairing_grant::exact_install_frame(install)?;
+        let directory_device = key_directory
+            .entries
+            .first()
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+            .device_route;
+        let observed_target = KeyTransitionRecipient {
+            device_route: *grant.device_route.as_bytes(),
+            grant_serial: grant.grant_serial.value(),
+        };
+        if directory_device != grant.device_route {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        let axes_match = observed_target == expected_target
+            && key_directory.revision.value() == transition.to_revision;
+
+        if id_matches {
+            expected_pairing_seen = true;
+            if !axes_match {
+                return Err(RuntimeStoreError::PublicationMismatch);
+            }
+        }
+        if axes_match
+            && expected_pairing_id.is_none_or(|expected| pairing_id.as_bytes() == &expected)
+        {
+            exact_pairing_retained = true;
+        }
+    }
+
+    if expected_pairing_id.is_some() && !expected_pairing_seen {
+        Ok(false)
+    } else {
+        Ok(exact_pairing_retained)
+    }
+}
+
 pub(crate) fn begin_key_transition(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
@@ -41,6 +128,48 @@ pub(crate) fn begin_key_transition(
         database_id,
         &mut next,
         input,
+    )?;
+    if next == ledger {
+        transaction.rollback()?;
+        return Ok(record);
+    }
+    let _ = super::super::sqlite::update_runtime_ledger(
+        &transaction,
+        &key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
+    transaction.commit()?;
+    super::super::sqlite::latch_post_commit_capacity(state, config);
+    Ok(record)
+}
+
+#[cfg(test)]
+pub(crate) fn begin_key_transition_with_global_lineage_for_test(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: BeginKeyTransition,
+    global_lineage: KeyTransitionGlobalLineage,
+) -> Result<KeyTransitionRecord, RuntimeStoreError> {
+    validate_begin(&input)?;
+    let mut projected = KeyTransitionRecord::from(input.clone());
+    projected.global_lineage = Some(global_lineage);
+    admit_transition_write(state, config, encoded_transition_len(&projected)?)?;
+    let key_bundle = state.key_bundle.clone();
+    let database_id = state.database_id;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger = super::super::sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)?;
+    let mut next = ledger.clone();
+    let record = stage_key_transition_with_global_lineage_in_transaction(
+        &transaction,
+        &key_bundle,
+        database_id,
+        &mut next,
+        input,
+        global_lineage,
     )?;
     if next == ledger {
         transaction.rollback()?;
@@ -82,6 +211,10 @@ pub(crate) fn gc_expired_key_transitions(
     let ledger = super::super::sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)?;
     validate_v12_integrity(&transaction, &key_bundle, database_id, &ledger)?;
     let candidates = load_expired_transition_ids(&transaction, now_ms)?;
+    // legacy ADKT v1/v2 可能尚未持久化 bootstrap proof。GC 因此必须在第一笔
+    // DELETE 前认证 pairing directory，并用 Delivered row 的精确 lineage 决定 pin。
+    let pairing_directory =
+        super::super::pairing::load_directory(&transaction, &key_bundle, database_id)?;
     let mut outcome = KeyTransitionGcOutcome::default();
     let mut next = ledger.clone();
     let mut rows_deleted = 0_u64;
@@ -97,6 +230,10 @@ pub(crate) fn gc_expired_key_transitions(
                 .is_none_or(|deadline| deadline > now_ms)
         {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        if bootstrap_pairing_still_retained(&pairing_directory, &transition.record)? {
+            outcome.bootstrap_pairing_blocked = checked_add(outcome.bootstrap_pairing_blocked, 1)?;
+            continue;
         }
         if matches!(
             transition.record.replay_retirement,
@@ -212,6 +349,79 @@ pub(crate) fn gc_expired_key_transitions(
     Ok(outcome)
 }
 
+#[cfg(test)]
+pub(crate) fn collect_completed_key_transition_for_legacy_test(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    operation_id: [u8; 16],
+) -> Result<(), RuntimeStoreError> {
+    let key_bundle = state.key_bundle.clone();
+    let database_id = state.database_id;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger = super::super::sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)?;
+    validate_v12_integrity(&transaction, &key_bundle, database_id, &ledger)?;
+    let transition = load_transition(&transaction, &key_bundle, database_id, operation_id)?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if transition.record.phase != KeyTransitionPhase::Complete
+        || transition.record.counter_retirement != CounterRetirementLifecycle::Applied
+        || matches!(
+            transition.record.replay_retirement,
+            Some(ReplayRetirement {
+                lifecycle: ReplayRetirementLifecycle::Pending,
+                ..
+            })
+        )
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let updates = load_updates_for_operation(
+        &transaction,
+        &key_bundle,
+        database_id,
+        transition.record.operation_id,
+    )?;
+    let update_bytes = updates.iter().try_fold(0_u64, |total, update| {
+        checked_add(total, update.sealed_bytes)
+    })?;
+    for update in &updates {
+        delete_authenticated_update(&transaction, update)?;
+    }
+    delete_authenticated_transition(&transaction, &transition)?;
+
+    let mut next = ledger.clone();
+    next.remote_key_transition_count = next
+        .remote_key_transition_count
+        .checked_sub(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next.remote_key_transition_sealed_bytes = next
+        .remote_key_transition_sealed_bytes
+        .checked_sub(transition.sealed_bytes)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let update_count =
+        u64::try_from(updates.len()).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next.remote_key_update_outbox_count = next
+        .remote_key_update_outbox_count
+        .checked_sub(update_count)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    next.remote_key_update_outbox_sealed_bytes = next
+        .remote_key_update_outbox_sealed_bytes
+        .checked_sub(update_bytes)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    validate_ledger_caps(&next)?;
+    let _ = super::super::sqlite::update_runtime_ledger(
+        &transaction,
+        &key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
+    transaction.commit()?;
+    super::super::sqlite::latch_post_commit_capacity(state, config);
+    Ok(())
+}
+
 impl From<BeginKeyTransition> for KeyTransitionRecord {
     fn from(input: BeginKeyTransition) -> Self {
         Self {
@@ -223,6 +433,8 @@ impl From<BeginKeyTransition> for KeyTransitionRecord {
             phase: KeyTransitionPhase::DrainingOld,
             terminal: None,
             recipients: input.recipients,
+            global_lineage: None,
+            bootstrap_install_proof: None,
             replay_retirement: input.replay_retirement,
             counter_retirement: CounterRetirementLifecycle::Pending,
             cuts: Vec::new(),
@@ -835,10 +1047,52 @@ pub(crate) fn stage_key_transition_in_transaction(
 ) -> Result<KeyTransitionRecord, RuntimeStoreError> {
     validate_begin(&input)?;
     let record = KeyTransitionRecord::from(input);
+    stage_key_transition_record_in_transaction(
+        transaction,
+        key_bundle,
+        database_id,
+        next_ledger,
+        record,
+    )
+}
+
+/// Pairing confirm 专用：与 global-key singleton 前进同事务冻结完整
+/// confirm hash 和稳定 material lineage，避免 receipt 到达前的合法 owner/GC
+/// mutation 丢失原始 key-state 锚。
+pub(crate) fn stage_key_transition_with_global_lineage_in_transaction(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    next_ledger: &mut RuntimeLedger,
+    input: BeginKeyTransition,
+    global_lineage: KeyTransitionGlobalLineage,
+) -> Result<KeyTransitionRecord, RuntimeStoreError> {
+    validate_begin(&input)?;
+    let mut record = KeyTransitionRecord::from(input);
+    record.global_lineage = Some(global_lineage);
+    validate_transition_record(&record)?;
+    stage_key_transition_record_in_transaction(
+        transaction,
+        key_bundle,
+        database_id,
+        next_ledger,
+        record,
+    )
+}
+
+fn stage_key_transition_record_in_transaction(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    next_ledger: &mut RuntimeLedger,
+    record: KeyTransitionRecord,
+) -> Result<KeyTransitionRecord, RuntimeStoreError> {
     if let Some(existing) =
         load_transition(transaction, key_bundle, database_id, record.operation_id)?
     {
-        if same_begin(&existing.record, &record) {
+        if same_begin(&existing.record, &record)
+            && existing.record.global_lineage == record.global_lineage
+        {
             return Ok(existing.record);
         }
         return Err(RuntimeStoreError::PublicationMismatch);

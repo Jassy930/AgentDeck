@@ -954,7 +954,11 @@ pub(crate) fn confirm_pairing_grant(
             now_ms,
         )?;
     }
-    let _ = super::key_transition::stage_key_transition_in_transaction(
+    let transition_global_lineage = super::key_transition::KeyTransitionGlobalLineage {
+        global_key_state_hash: prepared.global_key_state_hash,
+        stable_key_lineage_hash: Some(validated.global.pairing_bootstrap_lineage_hash()?),
+    };
+    let _ = super::key_transition::stage_key_transition_with_global_lineage_in_transaction(
         &transaction,
         &state.key_bundle,
         state.database_id,
@@ -974,6 +978,7 @@ pub(crate) fn confirm_pairing_grant(
             replay_retirement,
             created_at_ms: now_ms,
         },
+        transition_global_lineage,
     )?;
 
     supersede_previous_authorization(

@@ -59,6 +59,35 @@ pub(crate) struct TransitionSnapshotPermit {
     epoch_barrier_sha256: [u8; 32],
 }
 
+/// transition snapshot 生成的 StreamBinding 不能复用 generic current-cut 语义：
+/// EpochBarrier COMMIT 后 publication current row 已经前进到 `next(C)/H`，但新设备
+/// 必须先安装绑定 `C/H/new epoch` 的 wire binding。该 provenance 只在 Store 内复制
+/// opaque permit 的完整稳定轴，供 capture 与最终 reply seal 两次重新认证；它不进入
+/// Runtime DTO，也不能由 wire 构造。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::runtime::store) struct TransitionStreamBindingProvenance {
+    pub(in crate::runtime::store) operation_id: [u8; 16],
+    pub(in crate::runtime::store) recipient: KeyTransitionRecipient,
+    pub(in crate::runtime::store) authorization_hash: [u8; 32],
+    pub(in crate::runtime::store) barrier_sequence: u64,
+    pub(in crate::runtime::store) epoch_barrier_sha256: [u8; 32],
+}
+
+/// StreamBinding 自身已经携带的 wire cut 轴。与 provenance 分开，避免 daemon 的
+/// per-frame metadata 重复保存 route/generation/cursor/revision，同时让最终 transaction
+/// 能重建完整 TransitionSnapshotPermit 做同一套 exact-cut 验证。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::runtime::store) struct TransitionStreamBindingCut {
+    pub(in crate::runtime::store) scope: KeyTransitionStreamScope,
+    pub(in crate::runtime::store) publication_stream_id: [u8; 16],
+    pub(in crate::runtime::store) stream_route: [u8; 16],
+    pub(in crate::runtime::store) generation: [u8; 16],
+    pub(in crate::runtime::store) relay_committed_outer: Option<u64>,
+    pub(in crate::runtime::store) relay_committed_inner: Option<u64>,
+    pub(in crate::runtime::store) key_directory_revision: u64,
+    pub(in crate::runtime::store) key_epoch: u64,
+}
+
 impl TransitionSnapshotPermit {
     #[cfg(test)]
     pub(crate) fn for_authorization_precedence_test(scope: KeyTransitionStreamScope) -> Self {
@@ -132,6 +161,31 @@ impl TransitionSnapshotPermit {
 
     pub(crate) const fn epoch_barrier_sha256(&self) -> [u8; 32] {
         self.epoch_barrier_sha256
+    }
+
+    pub(in crate::runtime::store) const fn stream_binding_provenance(
+        &self,
+    ) -> TransitionStreamBindingProvenance {
+        TransitionStreamBindingProvenance {
+            operation_id: self.operation_id,
+            recipient: self.recipient,
+            authorization_hash: self.authorization_hash,
+            barrier_sequence: self.barrier_sequence,
+            epoch_barrier_sha256: self.epoch_barrier_sha256,
+        }
+    }
+
+    pub(in crate::runtime::store) const fn stream_binding_cut(&self) -> TransitionStreamBindingCut {
+        TransitionStreamBindingCut {
+            scope: self.scope,
+            publication_stream_id: self.publication_stream_id,
+            stream_route: self.stream_route,
+            generation: self.generation,
+            relay_committed_outer: self.relay_committed_outer,
+            relay_committed_inner: self.relay_committed_inner,
+            key_directory_revision: self.key_directory_revision,
+            key_epoch: self.key_epoch,
+        }
     }
 
     pub(crate) fn into_flush(
@@ -267,6 +321,38 @@ pub(in crate::runtime::store) fn validate_transition_snapshot_permit_axes_in_tra
     }
     let _ = exact_permit_cut(&transition.record, permit)?;
     Ok(())
+}
+
+/// StreamBinding 最终 seal 的 transition provenance 复核。通过重建 daemon-private
+/// snapshot permit 复用同一 active Add/update/exact-cut 验证，不另开一套较宽规则。
+pub(in crate::runtime::store) fn validate_transition_stream_binding_provenance_in_transaction(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    provenance: TransitionStreamBindingProvenance,
+    cut: TransitionStreamBindingCut,
+) -> Result<(), RuntimeStoreError> {
+    let permit = TransitionSnapshotPermit {
+        operation_id: provenance.operation_id,
+        recipient: provenance.recipient,
+        authorization_hash: provenance.authorization_hash,
+        scope: cut.scope,
+        publication_stream_id: cut.publication_stream_id,
+        stream_route: cut.stream_route,
+        generation: cut.generation,
+        relay_committed_outer: cut.relay_committed_outer,
+        relay_committed_inner: cut.relay_committed_inner,
+        barrier_sequence: provenance.barrier_sequence,
+        key_directory_revision: cut.key_directory_revision,
+        key_epoch: cut.key_epoch,
+        epoch_barrier_sha256: provenance.epoch_barrier_sha256,
+    };
+    validate_transition_snapshot_permit_axes_in_transaction(
+        transaction,
+        key_bundle,
+        database_id,
+        &permit,
+    )
 }
 
 #[cfg(test)]

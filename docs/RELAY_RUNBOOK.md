@@ -231,6 +231,34 @@ pairing drain 与 retirement 共用唯一 control owner：drain 绝对 deadline 
 严格 ingress/Core；后续 P4.5 已完成 signed publication/counter recovery。P4.6 persistent remote CLI 已形成
 automatic Task complete，但 P4.7、P4 Phase Exit、production-signed 与 iOS 真链路仍未完成。
 
+### Pairing receipt 与 key-transition 恢复
+
+不要为了“补齐”配对而手工发送 KeyUpdateAck。经过 DeviceSign 验证的 exact `PairResponseReceived` 会把
+matching Add/Renew transition 的 target 作为已 ACK；其他设备仍保持 Frozen，等待各自普通 KeyUpdateAck。
+因此 first-device zero-cut Add 可以不经过第二条 ACK 直接收敛到 `BusinessReady`。PairResponse 与后续
+KeyUpdateSet 使用独立随机 HPKE ciphertext 是正常现象；系统比较稳定 slot identity、confirm-time 完整
+global-state hash 与同 revision 稳定 key-lineage digest，不比较 `enc`/`wrapped_key` 字节。digest 只覆盖
+active roster/current epoch/真实 key material；retention owner、retired tombstone 与 revoked-secret GC 可在
+不推进 revision 时合法变化，不应据此诊断为 state fork。
+
+receipt 与普通 KeyUpdateAck 的两种到达顺序都支持：ACK 先到时保留真实 ACK，fresh receipt 不能早于该
+durable 时间；receipt 先到时后续 ACK 可升级 evidence，但不会移动 Completed transition 的 terminal 时间。
+出现 clock regression、target/revision/slot/global-state mismatch 或 proof 后 cancel 时，保留原 pairing、transition、
+DB/WAL/SHM 与 Keychain，修复时钟或调查状态分叉后只重试 exact input；禁止手改 SQLite、伪造 proof 或放宽 ACK。
+
+从旧 candidate 升级时，ADKT v1/v2 Delivered row 若仍有 matching Add/Renew transition，只有当前 global
+revision 仍等于 receipt binding revision、且完整 global-state hash 精确一致时，第一次 exact receipt replay
+才可能原子回填 stable lineage 与 v3 proof，之后 replay 为只读；matching Completed transition 在 Close scrub
+前会被 GC pin。若 global revision 已经前进，旧 row 无法证明历史 key material lineage，必须零写拒绝，不能
+以 `stable_key_lineage_hash=None` 继续 Close。当前 ADKT v3 Add/Renew 缺失 global/stable lineage 一律按损坏
+拒绝，不能进入 legacy backfill。
+若升级前旧版本已经完整 GC transition/update，authenticated audit 只允许 exact receipt replay 与 Close scrub，
+不会重建 transition 或 proof。若 transition 不在但 matching update 仍在，按损坏停用 remote，不做自动修复。
+
+fresh Close ACK 会在 scrub pairing/outbox 的同一事务内把 receipt tombstone 延长到 ACK 后完整 30 天；原
+`created_at_ms` 仍是 receipt 的审计时间。AfterCommit-unknown 后重开会读到已延长的 tombstone；exact Close retry
+只读且不再次续期。不要通过重复 Close 延长保留期。
+
 ## 本机 inventory 与 readback
 
 inventory 分页上限固定为 128，输出 route、root fingerprint、trust epoch 和 retired 状态：
@@ -372,6 +400,8 @@ SQLite、Keychain 或签名版本来伪造完成。
 | `daemon.remote.transition.progress_pending` | transition 已有唯一 owner，仍在安全推进或等待可重试 Store 结果 | 保留 frozen transition 与 admission fence；不得另起 owner 或服务 ordinary publication |
 | `daemon.remote.transition.reconnect_pending` | transition 需要 authenticated reconnect 才能继续 | 保留 exact frozen blob；恢复认证链路后由同一 owner 继续，禁止 timer 重封 |
 | `remote.transport.publication_offline` | publication 在 Register/Publish 前确认链路离线 | park exact frozen publication；等待 authenticated reconnect，不生成新 blob/counter |
+| `daemon.runtime.invalid_state`（pairing bootstrap/Close） | receipt、Add/Renew target、revision、slot/global lineage 或 durable 时间不一致；也可能尝试取消已有 proof 的 transition | 立即停止 remote drive并保留 exact pairing/transition 与 DB/WAL/SHM；修复时钟或调查 state fork 后只重试原 input，禁止手工 ACK、重建 proof或改表 |
+| `daemon.runtime.schema_incompatible`（ADKT/transition） | authenticated proof/row 被篡改，或 transition 已不存在但 matching update 仍残留 | 保留 Runtime DB、WAL/SHM、Keychain 与诊断日志做离线审计；不得启动写迁移、删除孤立 row 或用 close-only legacy 兼容掩盖损坏 |
 | `remote.runtime.outcome_unknown` | persistent command/watch 在 authenticated terminal 前 EOF 或普通断线 | 保留 durable state，从 fresh bootstrap exact retry；不得当作 stopped/revoked 或 daemon receipt |
 | `remote.watch.output_failed` / `remote.watch.signal_failed` | NDJSON write/flush 或 SIGINT/SIGTERM listener 失败 | shutdown 后失败退出；修复 stdout consumer/signal 环境，不手改 cursor、sidecar 或 paired state |
 | terminal `stopped` / `revoked` | stopped 已完成当前 frame/ACK 与 shutdown；revoked 已完成 verified terminal、transport drop 与 crash-safe cleanup | 只接受 canonical terminal NDJSON；若前置顺序缺失，按安全回归处理，不继续使用本地 key |

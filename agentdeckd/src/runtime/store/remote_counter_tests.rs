@@ -16,8 +16,8 @@ use crate::runtime::model::{ConversationDescriptor, NewConversation};
 use super::key_transition::{
     AcknowledgeKeyUpdate, BeginKeyTransition, COUNTER_RETIREMENT_RETENTION_MS,
     CounterRetirementApplyOutcome, FrozenKeyUpdate, KEY_TRANSITION_TOMBSTONE_RETENTION_MS,
-    KeyTransitionGcLimits, KeyTransitionOperation, KeyTransitionPhase, KeyTransitionRecipient,
-    KeyTransitionTarget, canonical_update_hash,
+    KeyTransitionGcLimits, KeyTransitionGlobalLineage, KeyTransitionOperation, KeyTransitionPhase,
+    KeyTransitionRecipient, KeyTransitionTarget, canonical_update_hash,
 };
 use super::remote_counter::{
     CounterRecoveryDisposition, CounterRecoveryStageRequest, CounterRecoveryStageTarget,
@@ -26,6 +26,7 @@ use super::remote_counter::{
 use super::{
     ActiveSenderCounterBinding, PublicationScope, RuntimeId, RuntimeIdKind, RuntimeStoreHandle,
     active_authorization_store_with_pending_transition_for_test,
+    matching_bootstrap_update_for_test,
 };
 use crate::runtime::model::{RuntimeClock, RuntimeClockError, RuntimeStoreConfig};
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
@@ -95,17 +96,10 @@ async fn complete_zero_cut_with_production_finalize(store: &RuntimeStoreHandle) 
         .finalize_key_directory_rotation(operation_id)
         .await
         .expect("finalize production key-directory axes");
-    let updates = recovery
-        .transition
-        .recipients
-        .iter()
-        .map(|recipient| FrozenKeyUpdate {
-            recipient: *recipient,
-            key_revision: recovery.transition.to_revision,
-            canonical_update_set: format!("fixture-update-{operation_id:?}-{recipient:?}")
-                .into_bytes(),
-        })
-        .collect::<Vec<_>>();
+    let mut updates = Vec::with_capacity(recovery.transition.recipients.len());
+    for recipient in &recovery.transition.recipients {
+        updates.push(matching_bootstrap_update_for_test(store, *recipient).await);
+    }
     store
         .freeze_key_updates(operation_id, updates.clone())
         .await
@@ -118,19 +112,36 @@ async fn complete_zero_cut_with_production_finalize(store: &RuntimeStoreHandle) 
         .mark_key_barriers_committed(operation_id)
         .await
         .expect("commit fixture zero-cut barriers");
-    for update in updates {
-        store
-            .acknowledge_key_update(AcknowledgeKeyUpdate {
-                operation_id,
-                recipient: update.recipient,
-                key_revision: update.key_revision,
-                update_hash: canonical_update_hash(&update.canonical_update_set)
-                    .expect("fixture update hash"),
-                canonical_ack: format!("fixture-ack-{:?}", update.recipient).into_bytes(),
-                acknowledged_at_ms: 0,
-            })
-            .await
-            .expect("ack fixture key update");
+    let committed = store
+        .load_active_key_transition()
+        .await
+        .expect("reload bootstrap-receipt committed transition")
+        .expect("bootstrap transition remains active before explicit completion");
+    for record in committed.updates {
+        match record.lifecycle {
+            super::key_transition::KeyUpdateLifecycle::Acked => {
+                assert!(record.canonical_ack.is_some());
+            }
+            super::key_transition::KeyUpdateLifecycle::Frozen => {
+                let update = updates
+                    .iter()
+                    .find(|update| update.recipient == record.recipient)
+                    .expect("frozen fixture update remains in the exact input set");
+                store
+                    .acknowledge_key_update(AcknowledgeKeyUpdate {
+                        operation_id,
+                        recipient: update.recipient,
+                        key_revision: update.key_revision,
+                        update_hash: canonical_update_hash(&update.canonical_update_set)
+                            .expect("fixture update hash"),
+                        canonical_ack: format!("fixture-ack-{:?}", update.recipient).into_bytes(),
+                        acknowledged_at_ms: 0,
+                    })
+                    .await
+                    .expect("ack non-bootstrap fixture key update");
+            }
+            other => panic!("unexpected fixture update lifecycle: {other:?}"),
+        }
     }
     store
         .complete_key_transition(operation_id)
@@ -664,20 +675,26 @@ async fn occupied_transition_slot_requires_trust_reset_without_rewriting_retired
         grant_serial: authorization.grant_serial().value(),
     };
     let occupied = store
-        .begin_key_transition(BeginKeyTransition {
-            operation_id: [0xf2; 16],
-            operation: KeyTransitionOperation::Renew,
-            target: KeyTransitionTarget::Device(recipient),
-            from_revision: global.revision().value(),
-            to_revision: global
-                .revision()
-                .value()
-                .checked_add(1)
-                .expect("occupied transition revision has successor"),
-            recipients: vec![recipient],
-            replay_retirement: None,
-            created_at_ms: 0,
-        })
+        .begin_key_transition_with_global_lineage_for_test(
+            BeginKeyTransition {
+                operation_id: [0xf2; 16],
+                operation: KeyTransitionOperation::Renew,
+                target: KeyTransitionTarget::Device(recipient),
+                from_revision: global.revision().value(),
+                to_revision: global
+                    .revision()
+                    .value()
+                    .checked_add(1)
+                    .expect("occupied transition revision has successor"),
+                recipients: vec![recipient],
+                replay_retirement: None,
+                created_at_ms: 0,
+            },
+            KeyTransitionGlobalLineage {
+                global_key_state_hash: [0xf3; 32],
+                stable_key_lineage_hash: Some([0xf4; 32]),
+            },
+        )
         .await
         .expect("occupy the unique transition slot");
     let retired_before = store

@@ -454,13 +454,33 @@ fn validate_update_freeze_readback(
         return Err(TransitionCoordinatorError::ExactReadbackMismatch);
     }
     for (expected, stored) in expected.iter().zip(&readback.updates) {
+        let bootstrap_ack = readback
+            .transition
+            .bootstrap_install_proof
+            .as_ref()
+            .filter(|proof| {
+                proof.binding.device_route == stored.recipient.device_route
+                    && proof.binding.grant_serial == stored.recipient.grant_serial
+                    && proof.binding.key_revision == stored.key_revision
+            });
         if stored.operation_id != readback.transition.operation_id
             || stored.recipient != expected.recipient
             || stored.key_revision != expected.key_revision
-            || stored.lifecycle != KeyUpdateLifecycle::Frozen
             || stored.canonical_update_set != expected.canonical_update_set
-            || stored.canonical_ack.is_some()
             || !stored.stream_applied_acks.is_empty()
+            || match bootstrap_ack {
+                Some(_) => {
+                    // receipt 后到时目标可能已由经过 DeviceSign 验证的普通
+                    // KeyUpdateAck 先行 Acked；Store 会保留该 ACK。coordinator
+                    // 这里只接受 authenticated readback 中的非空 Acked 形态，
+                    // slot/proof lineage 由 Store 完整性校验负责。
+                    stored.lifecycle != KeyUpdateLifecycle::Acked
+                        || stored.canonical_ack.as_ref().is_none_or(Vec::is_empty)
+                }
+                None => {
+                    stored.lifecycle != KeyUpdateLifecycle::Frozen || stored.canonical_ack.is_some()
+                }
+            }
         {
             return Err(TransitionCoordinatorError::ExactReadbackMismatch);
         }
@@ -510,6 +530,7 @@ fn same_transition_axes(expected: &KeyTransitionRecovery, actual: &KeyTransition
         && expected.transition.to_revision == actual.transition.to_revision
         && expected.transition.terminal == actual.transition.terminal
         && expected.transition.recipients == actual.transition.recipients
+        && expected.transition.bootstrap_install_proof == actual.transition.bootstrap_install_proof
         && expected.transition.created_at_ms == actual.transition.created_at_ms
 }
 

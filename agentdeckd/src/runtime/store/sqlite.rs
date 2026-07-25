@@ -2470,7 +2470,7 @@ mod migration_tests {
             device_route: [0xD2; 16],
             grant_serial: 7,
         };
-        super::super::key_transition::begin_key_transition(
+        super::super::key_transition::begin_key_transition_with_global_lineage_for_test(
             &mut state,
             &config,
             super::super::key_transition::BeginKeyTransition {
@@ -2482,6 +2482,10 @@ mod migration_tests {
                 recipients: vec![recipient],
                 replay_retirement: None,
                 created_at_ms: 100,
+            },
+            super::super::key_transition::KeyTransitionGlobalLineage {
+                global_key_state_hash: [0xD4; 32],
+                stable_key_lineage_hash: Some([0xD5; 32]),
             },
         )
         .expect("begin populated strict v13 transition");

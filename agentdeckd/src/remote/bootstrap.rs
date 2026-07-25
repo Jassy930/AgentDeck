@@ -1697,6 +1697,8 @@ mod tests {
                 phase: KeyTransitionPhase::DrainingOld,
                 terminal: None,
                 recipients: vec![recipient],
+                global_lineage: None,
+                bootstrap_install_proof: None,
                 replay_retirement: None,
                 counter_retirement: CounterRetirementLifecycle::Pending,
                 cuts: Vec::new(),

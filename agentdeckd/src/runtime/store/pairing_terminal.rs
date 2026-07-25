@@ -228,6 +228,8 @@ struct AuthenticatedReceipt {
     receipt: PairingReceipt,
     receipt_bytes: u64,
     created_at_ms: u64,
+    retain_until_ms: u64,
+    metadata_token: [u8; 32],
 }
 
 struct AuthenticatedCloseOutbox {
@@ -392,6 +394,67 @@ fn receipt_token(
     )
 }
 
+fn refresh_receipt_retention(
+    transaction: &rusqlite::Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    receipt: &AuthenticatedReceipt,
+    acknowledged_at_ms: u64,
+) -> Result<(), RuntimeStoreError> {
+    if acknowledged_at_ms < receipt.created_at_ms {
+        return Err(RuntimeStoreError::ClockRegressed {
+            persisted_ms: receipt.created_at_ms,
+            observed_ms: acknowledged_at_ms,
+        });
+    }
+    let canonical_receipt = serde_json::to_vec(&receipt.receipt)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let receipt_bytes =
+        u64::try_from(canonical_receipt.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    let receipt_hash: [u8; 32] = Sha256::digest(&canonical_receipt).into();
+    if receipt_bytes != receipt.receipt_bytes || receipt_hash == [0; 32] {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let retain_until_ms = acknowledged_at_ms
+        .checked_add(RECEIPT_RETENTION_MS)
+        .ok_or(RuntimeStoreError::TimeOutOfRange)?;
+    let metadata_token = receipt_token(
+        key_bundle,
+        database_id,
+        receipt.pairing_id,
+        receipt.relay_server_id,
+        receipt.machine_route,
+        receipt.pair_route,
+        receipt.idempotency_token,
+        receipt.input_hash,
+        receipt.action,
+        receipt.request_hash,
+        receipt_hash,
+        receipt_bytes,
+        receipt.created_at_ms,
+        retain_until_ms,
+    )?;
+    if transaction.execute(
+        "UPDATE remote_pairing_receipts
+         SET retain_until_ms = ?1, metadata_token = ?2
+         WHERE pairing_id = ?3 AND created_at_ms = ?4 AND retain_until_ms = ?5
+           AND metadata_token = ?6",
+        params![
+            i64::try_from(retain_until_ms).map_err(|_| RuntimeStoreError::TimeOutOfRange)?,
+            &metadata_token[..],
+            &receipt.pairing_id.as_bytes()[..],
+            i64::try_from(receipt.created_at_ms).map_err(|_| RuntimeStoreError::TimeOutOfRange)?,
+            i64::try_from(receipt.retain_until_ms)
+                .map_err(|_| RuntimeStoreError::TimeOutOfRange)?,
+            &receipt.metadata_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    Ok(())
+}
+
 pub(super) fn close_operation_key(
     key_bundle: &RuntimeKeyBundle,
     pairing_id: RuntimeId,
@@ -547,7 +610,7 @@ fn authenticate_receipt(
         || receipt_bytes != u64::try_from(raw.10.len()).unwrap_or(u64::MAX)
         || created_at_ms
             .checked_add(RECEIPT_RETENTION_MS)
-            .is_none_or(|expected| expected != retain_until_ms)
+            .is_none_or(|minimum| retain_until_ms < minimum)
         || receipt_token(
             key_bundle,
             database_id,
@@ -579,6 +642,8 @@ fn authenticate_receipt(
         receipt,
         receipt_bytes,
         created_at_ms,
+        retain_until_ms,
+        metadata_token,
     })
 }
 
@@ -1637,6 +1702,14 @@ pub(crate) fn acknowledge_pair_route_close(
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
+    if pairing.record.lifecycle == PairingInviteLifecycle::Delivered {
+        super::pairing_delivery::ensure_durable_bootstrap_install_proof(
+            &state.connection,
+            &state.key_bundle,
+            state.database_id,
+            pairing,
+        )?;
+    }
     super::sqlite::admit_safety_write(
         &state.connection,
         &state.key_bundle,
@@ -1652,12 +1725,23 @@ pub(crate) fn acknowledge_pair_route_close(
     if let Some(replayed) = replayed_close_ack(&directory, pairing_id, &canonical_terminal)? {
         return Ok(replayed);
     }
+    // 两个 exact replay 分支都必须保持只读且不依赖 wall clock；只有确定进入
+    // fresh Close 事务后才读取 receipt retention 的新起点。
+    let acknowledged_at_ms = config.clock.now_ms().map_err(RuntimeStoreError::from)?;
     let pairing_index = directory
         .pairings
         .iter()
         .position(|pairing| pairing.record.pairing_id == pairing_id)
         .ok_or(RuntimeStoreError::PairingConflict)?;
     let pairing = directory.pairings.swap_remove(pairing_index);
+    if pairing.record.lifecycle == PairingInviteLifecycle::Delivered {
+        super::pairing_delivery::ensure_durable_bootstrap_install_proof(
+            &transaction,
+            &state.key_bundle,
+            state.database_id,
+            &pairing,
+        )?;
+    }
     let close_index = directory
         .terminal
         .close_outboxes
@@ -1665,13 +1749,32 @@ pub(crate) fn acknowledge_pair_route_close(
         .position(|close| close.pairing_id == pairing_id)
         .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
     let close = directory.terminal.close_outboxes.swap_remove(close_index);
-    let receipt = directory
+    let receipt_row = directory
         .terminal
         .receipt(pairing_id)
-        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
-        .receipt
-        .clone();
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let persisted_ms = pairing
+        .record
+        .state_changed_at_ms
+        .max(close.state_changed_at_ms)
+        .max(receipt_row.created_at_ms);
+    if acknowledged_at_ms < persisted_ms {
+        return Err(RuntimeStoreError::ClockRegressed {
+            persisted_ms,
+            observed_ms: acknowledged_at_ms,
+        });
+    }
+    let receipt = receipt_row.receipt.clone();
     exact_close_terminal(&canonical_terminal, pairing.record.pair_route)?;
+    // Fresh Close ACK 重新起算 receipt tombstone 的完整保留窗口。刷新、secret scrub
+    // 与 Close outbox 删除同事务提交；commit-unknown 后 exact replay 不再刷新。
+    refresh_receipt_retention(
+        &transaction,
+        &state.key_bundle,
+        state.database_id,
+        receipt_row,
+        acknowledged_at_ms,
+    )?;
     if transaction.execute(
         "DELETE FROM remote_control_outbox
          WHERE outbox_id = ?1 AND operation_kind = 'closePairRoute'

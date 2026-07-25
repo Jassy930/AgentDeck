@@ -618,6 +618,22 @@ async fn close_ack_accepts_both_terminal_outcomes_scrubs_secret_and_replays_tomb
         assert_close_projection(recovery[0].close().canonical_frame(), route);
 
         let canonical_terminal = closed_terminal(route, close_outcome);
+        clock.store(NOW_MS.saturating_sub(1), Ordering::SeqCst);
+        let before_regressed_close = artifact_bytes(&root.database());
+        let regressed = reopened
+            .acknowledge_pair_route_close(pairing_id, canonical_terminal.clone())
+            .await
+            .expect_err("fresh Close must reject a regressed retention clock");
+        assert!(matches!(
+            regressed,
+            RuntimeStoreError::ClockRegressed {
+                persisted_ms,
+                observed_ms,
+            } if persisted_ms == NOW_MS && observed_ms == NOW_MS.saturating_sub(1)
+        ));
+        assert_eq!(artifact_bytes(&root.database()), before_regressed_close);
+        assert_eq!(terminal_counts(&root.database()), (1, 1, 0, 1));
+        clock.store(NOW_MS, Ordering::SeqCst);
         let acknowledged = reopened
             .acknowledge_pair_route_close(pairing_id, canonical_terminal.clone())
             .await
@@ -880,6 +896,119 @@ async fn close_ack_fault_boundaries_converge_without_resurrecting_secrets() {
         assert_eq!(terminal_counts(&root.database()), (0, 1, 0, 0));
         faulted.shutdown().await.expect("shutdown Close ACK store");
     }
+}
+
+#[tokio::test]
+async fn late_close_commit_unknown_refreshes_receipt_before_startup_purge_and_exact_retry() {
+    let root = TestRoot::new("late-close-after-commit-retention");
+    let keys = MemoryKeyStore::new();
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let setup = open_store(&root, &keys, clock.clone()).await;
+    let (binding, data_cert) = make_active(&setup).await;
+    let route = PairRouteId::from_bytes([0xb3; 16]);
+    let (pairing_id, _) = prepare_unused_pairing(
+        &setup,
+        &binding,
+        &data_cert,
+        route,
+        0xb4,
+        0xb5,
+        "late-close-after-commit-retention",
+    )
+    .await;
+    setup
+        .terminalize_pairing(pairing_id, PairingTerminalAction::Cancel)
+        .await
+        .expect("terminalize late Close retention fixture");
+    let close_at_ms = NOW_MS
+        .checked_add(RECEIPT_RETENTION_MS)
+        .and_then(|value| value.checked_add(1))
+        .expect("late Close timestamp fits");
+    clock.store(close_at_ms, Ordering::SeqCst);
+    assert!(
+        setup
+            .plan_expired_pairing_receipt_purge()
+            .await
+            .expect("expired live receipt remains pinned by pairing and Close outbox")
+            .is_none()
+    );
+    setup.shutdown().await.expect("shutdown late Close setup");
+
+    let faulted = RuntimeStoreHandle::open(
+        config(&root, clock.clone()).with_fault_injector(Arc::new(OneShotFault {
+            operation: RuntimeStoreOperation::AcknowledgePairRouteCloseAfterCommit,
+            fired: AtomicBool::new(false),
+        })),
+        load_or_create_storage_kek(&keys, &root.database()).expect("reload test StorageKEK"),
+    )
+    .await
+    .expect("open faulted late Close store");
+    let terminal = closed_terminal(route, PairRouteCloseOutcome::Closed);
+    assert!(matches!(
+        faulted
+            .acknowledge_pair_route_close(pairing_id, terminal.clone())
+            .await,
+        Err(RuntimeStoreError::CommitOutcomeUnknown { .. })
+    ));
+    assert_eq!(terminal_counts(&root.database()), (0, 1, 0, 0));
+    faulted
+        .shutdown()
+        .await
+        .expect("shutdown after unknown late Close commit");
+
+    let reopened = open_store(&root, &keys, clock.clone()).await;
+    assert!(
+        reopened
+            .plan_expired_pairing_receipt_purge()
+            .await
+            .expect("startup purge planning observes refreshed receipt retention")
+            .is_none(),
+        "Close commit must refresh the tombstone before startup purge can delete it"
+    );
+    let before_exact_retry = artifact_bytes(&root.database());
+    let retry = reopened
+        .acknowledge_pair_route_close(pairing_id, terminal)
+        .await
+        .expect("exact Close retry survives startup purge ordering");
+    assert!(retry.replayed());
+    assert_eq!(
+        artifact_bytes(&root.database()),
+        before_exact_retry,
+        "exact Close replay must not extend receipt retention a second time"
+    );
+
+    let refreshed_deadline = close_at_ms
+        .checked_add(RECEIPT_RETENTION_MS)
+        .expect("refreshed receipt deadline fits");
+    clock.store(refreshed_deadline, Ordering::SeqCst);
+    assert!(
+        reopened
+            .plan_expired_pairing_receipt_purge()
+            .await
+            .expect("strict refreshed cutoff planning")
+            .is_none()
+    );
+    clock.store(
+        refreshed_deadline
+            .checked_add(1)
+            .expect("post-refresh purge timestamp fits"),
+        Ordering::SeqCst,
+    );
+    let plan = reopened
+        .plan_expired_pairing_receipt_purge()
+        .await
+        .expect("plan refreshed receipt purge")
+        .expect("receipt is eligible only after the refreshed full window");
+    let purged = reopened
+        .apply_pairing_receipt_purge(plan)
+        .await
+        .expect("purge refreshed receipt tombstone");
+    assert_eq!(purged.purged_count(), 1);
+    assert_eq!(terminal_counts(&root.database()), (0, 0, 0, 0));
+    reopened
+        .shutdown()
+        .await
+        .expect("shutdown late Close retention store");
 }
 
 #[tokio::test]

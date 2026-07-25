@@ -179,6 +179,16 @@ pub(crate) fn validate_v12_integrity(
         let operation_updates = updates_by_operation
             .remove(&transition.record.operation_id)
             .unwrap_or_default();
+        if let Some(proof) = transition.record.bootstrap_install_proof.as_ref() {
+            ensure_bootstrap_global_lineage_matches(
+                connection,
+                key_bundle,
+                database_id,
+                &transition.record,
+                &proof.binding,
+            )
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+        }
         validate_transition_updates(&transition.record, &operation_updates)?;
         if transition.record.phase == KeyTransitionPhase::BarriersCommitted {
             verify_barrier_commit(
@@ -311,6 +321,20 @@ fn validate_transition_updates(
 ) -> Result<(), RuntimeStoreError> {
     if u64::try_from(updates.len()).unwrap_or(u64::MAX) != transition.update_count {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    if let Some(proof) = transition.bootstrap_install_proof.as_ref()
+        && transition.phase.rank() >= KeyTransitionPhase::UpdatesFrozen.rank()
+    {
+        let target = bootstrap_target(&proof.binding);
+        let update = updates
+            .iter()
+            .find(|update| update.record.recipient == target)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if update.record.lifecycle != KeyUpdateLifecycle::Acked {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        ensure_bootstrap_update_matches(&proof.binding, &update.record)
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
     }
     for (index, update) in updates.iter().enumerate() {
         let recipient = transition

@@ -186,6 +186,7 @@ pub(super) fn seal_transaction(
             if authorization_used != request.authorization
                 || permit.key_directory_revision()
                     != authorization_used.key_directory_revision().value()
+                || !permit.matches_reply_authorization(&authorization_used)
             {
                 false
             } else {

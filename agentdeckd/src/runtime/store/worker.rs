@@ -3543,6 +3543,12 @@ enum NormalCommand {
         reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
     },
     #[cfg(test)]
+    BeginKeyTransitionWithGlobalLineage {
+        input: key_transition::BeginKeyTransition,
+        global_lineage: key_transition::KeyTransitionGlobalLineage,
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
+    },
+    #[cfg(test)]
     MarkKeyTransitionRotated {
         operation_id: [u8; 16],
         reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
@@ -4577,6 +4583,10 @@ fn handle_normal(
             NormalCommand::MarkKeyTransitionRotated { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            #[cfg(test)]
+            NormalCommand::BeginKeyTransitionWithGlobalLineage { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             NormalCommand::BeginKeyTransition { reply, .. }
             | NormalCommand::FreezeKeyUpdates { reply, .. }
             | NormalCommand::FreezeKeyBarriers { reply, .. }
@@ -4941,6 +4951,27 @@ fn handle_normal(
                 .and_then(|now| {
                     input.created_at_ms = now;
                     key_transition::begin_key_transition(state, config, input)
+                });
+            let _ = reply.send(result);
+        }
+        #[cfg(test)]
+        NormalCommand::BeginKeyTransitionWithGlobalLineage {
+            mut input,
+            global_lineage,
+            reply,
+        } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    input.created_at_ms = now;
+                    key_transition::begin_key_transition_with_global_lineage_for_test(
+                        state,
+                        config,
+                        input,
+                        global_lineage,
+                    )
                 });
             let _ = reply.send(result);
         }

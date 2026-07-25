@@ -924,6 +924,33 @@ durable frozen state并用同一 idempotency key/pairing ID/grant serial 重试�
 | `daemon.pairing.terminal_invalid` / `already_completed` / `canceled` / `expired` | terminal 与 durable winner 不一致，或 pairing 已有 confirm/cancel/expiry 赢家 | 读取 canonical receipt；同动作只读 replay，输家不得逆转 first-valid CAS |
 | `daemon.pairing.revocation_authority_unavailable` / `revocation_authority_mismatch` / `revocation_grant_invalid` / `revocation_signing_failed` | revoke 所需 authority、exact grant/serial 或签名失败 | 保留 active/revoking ledger并 exact retry；不得跳到 revoked 或删除 device key |
 
+##### Pairing bootstrap install proof / ADKT 恢复
+
+exact DeviceSign `PairResponseReceived` 同时证明目标设备已安装 PairResponse 的 bootstrap KeyDirectory。它只把
+matching Add/Renew transition 的 exact device route/grant serial/revision target 视为已 ACK；其他 recipient 仍须
+普通 `KeyUpdateAckV1`。first-device zero-cut Add 因而可直接到达 `BusinessReady`，观察不到第二条 KeyUpdateAck
+不是故障，也不能靠注入 unsolicited ACK“修复”。
+
+proof 的 stable slot digest 不比较随机 HPKE `enc`/`wrapped_key`，但必须同时匹配 pairing confirm 同事务冻结的
+完整 `global_key_state_hash` 与 stable key-lineage digest。digest 覆盖同 revision 内不可变的 active roster、
+current epoch 和真实 key material，不覆盖 retention owner、tombstone 或 revoked-secret GC；因此这些合法
+storage-lifecycle mutation 不会被误报为 fork，真实 roster/key-material 分叉仍 fail-closed。普通 ACK 先到时
+保留真实 ACK，fresh receipt 不能早于该 durable 时间；receipt 先到后普通 ACK 可升级 evidence，但不会移动
+Completed transition 的 terminal causal time。
+
+| code / 状态 | 常见原因 | 下一步 |
+| --- | --- | --- |
+| `daemon.runtime.invalid_state` 出现在 receipt/transition reconcile | fresh receipt 时钟早于 durable ACK；Add/Renew target、revision、slot/global lineage 不一致；proof 后尝试 cancel；fresh delivery 缺 matching transition | 停止 remote drive，保留 exact receipt、pairing、transition 与 DB/WAL/SHM；修复系统时钟或调查 state fork 后只重试原 input，禁止重签 receipt、手工 ACK 或重建 transition |
+| `daemon.runtime.schema_incompatible` 出现在 full-open/Close | authenticated ADKT proof/lineage 被篡改，或 transition 已无但 matching update 仍在 | remote 保持 fail-closed；保留 Runtime DB/WAL/SHM、Keychain 与日志做离线审计，不执行写迁移、删孤立 row 或用 close-only compatibility 掩盖损坏 |
+| Delivered + ADKT v1/v2 proofless transition | 旧 candidate 在 proof 字段引入前已经 delivered，matching transition/update 仍完整，且当前 global revision/hash 仍能精确证明 receipt 时的目录状态 | 仅当 current revision 等于 binding revision、完整 global-state hash 精确一致时，exact receipt replay 才可原子回填 stable lineage 与 v3 proof；revision 已前进则零写 fail-close。Close 前 GC 必须 pin matching Completed transition |
+| ADKT v3 Add/Renew 缺 global/stable lineage | 当前 row 缺失 confirm-time commitment，或 v3 被错误当作 legacy | 按 authenticated corruption 停止 remote drive并保留 DB/WAL/SHM；不得 backfill、手工补 hash 或继续 Close |
+| Delivered 且 transition/update 都已被旧版本收集 | 升级前旧 GC 已完成，authenticated v12 audit 证明两者均 absent | 只允许 exact receipt replay 与 Close scrub；不伪造 proof、不恢复 transition，也不能把该路径用于 fresh delivery |
+
+fresh Close ACK 在 scrub pairing/outbox 的同一事务内保留原 receipt `created_at_ms`，把 `retain_until_ms`
+延长为 ACK 后完整 30 天并重签 MAC。exact Close replay 在读取 wall clock 前只读返回，不再次续期；
+AfterCommit-unknown 重开时 startup purge 必须先看到已延长 tombstone。若出现 clock regression，整个 fresh
+Close 零写拒绝；不要通过重复 Close 人为续期。
+
 pairing startup/retention 遇到 `daemon.runtime.store_busy` / `store_unavailable` 等本地 Store code 时进入
 `LocalBlocked`：不得重拨 WSS，每轮只执行完整 `purge_expired_receipts → recover_generation`。status 以 actor
 health 为准，自愈后回到 Active；进入 block 前已排队的旧 admission epoch 命令必须有界失败，恢复后不得执行。

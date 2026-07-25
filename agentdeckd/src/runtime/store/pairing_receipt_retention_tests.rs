@@ -104,6 +104,18 @@ fn receipt_ledger(database: &Path) -> (u64, u64, u64, u64) {
     (physical.0, physical.1, ledger.0, ledger.1)
 }
 
+fn receipt_retention_row(database: &Path, pairing_id: super::RuntimeId) -> (u64, u64) {
+    Connection::open(database)
+        .expect("open receipt retention database")
+        .query_row(
+            "SELECT created_at_ms, retain_until_ms FROM remote_pairing_receipts
+             WHERE pairing_id = ?1",
+            [pairing_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read receipt retention row")
+}
+
 #[tokio::test]
 async fn strict_cutoff_keeps_live_recovery_and_purges_only_closed_tombstones() {
     let root = TestRoot::new("receipt-retention-cutoff");
@@ -148,15 +160,63 @@ async fn strict_cutoff_keeps_live_recovery_and_purges_only_closed_tombstones() {
             .is_some()
     );
 
-    store
-        .acknowledge_pair_route_close(live_pairing, closed_terminal(live_route))
+    let before_close_retention = receipt_retention_row(&root.database(), live_pairing);
+    let close_at_ms = clock.load(Ordering::SeqCst);
+    let canonical_close = closed_terminal(live_route);
+    let first_close = store
+        .acknowledge_pair_route_close(live_pairing, canonical_close.clone())
         .await
         .expect("finish protected Close recovery");
+    assert!(!first_close.replayed());
+    let after_close_retention = receipt_retention_row(&root.database(), live_pairing);
+    assert_eq!(after_close_retention.0, before_close_retention.0);
+    assert_eq!(
+        after_close_retention.1,
+        close_at_ms
+            .checked_add(RECEIPT_RETENTION_MS)
+            .expect("Close retention deadline fits")
+    );
+    let close_retry = store
+        .acknowledge_pair_route_close(live_pairing, canonical_close)
+        .await
+        .expect("exact Close retry reads retained receipt");
+    assert!(close_retry.replayed());
+    assert_eq!(
+        receipt_retention_row(&root.database(), live_pairing),
+        after_close_retention,
+        "exact Close retry must preserve created_at_ms and retain_until_ms"
+    );
+    assert!(
+        store
+            .plan_expired_pairing_receipt_purge()
+            .await
+            .expect("fresh Close starts a new full receipt retention window")
+            .is_none()
+    );
+    let refreshed_deadline = NOW_MS
+        .checked_add(RECEIPT_RETENTION_MS)
+        .and_then(|close_at| close_at.checked_add(1))
+        .and_then(|close_at| close_at.checked_add(RECEIPT_RETENTION_MS))
+        .expect("refreshed receipt retention deadline fits");
+    clock.store(refreshed_deadline, Ordering::SeqCst);
+    assert!(
+        store
+            .plan_expired_pairing_receipt_purge()
+            .await
+            .expect("strict refreshed retention cutoff")
+            .is_none()
+    );
+    clock.store(
+        refreshed_deadline
+            .checked_add(1)
+            .expect("post-refresh purge timestamp fits"),
+        Ordering::SeqCst,
+    );
     let second_plan = store
         .plan_expired_pairing_receipt_purge()
         .await
-        .expect("plan newly safe tombstone")
-        .expect("closed terminal receipt becomes eligible");
+        .expect("plan refreshed tombstone")
+        .expect("closed terminal receipt becomes eligible after the new full window");
     let second = store
         .apply_pairing_receipt_purge(second_plan.clone())
         .await

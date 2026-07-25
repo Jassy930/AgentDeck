@@ -49,8 +49,9 @@ use crate::remote::counter::CounterScope;
 use crate::remote::directed_reply::DeviceReplyTxSealer;
 use crate::runtime::model::MachineEnrollmentState;
 use crate::runtime::store::key_transition::{
-    BeginKeyTransition, FrozenKeyUpdate, KeyTransitionOperation, KeyTransitionRecipient,
-    KeyTransitionStreamCut, KeyTransitionStreamScope, KeyTransitionTarget, KeyUpdateLifecycle,
+    BeginKeyTransition, FrozenKeyUpdate, KeyTransitionGlobalLineage, KeyTransitionOperation,
+    KeyTransitionRecipient, KeyTransitionStreamCut, KeyTransitionStreamScope, KeyTransitionTarget,
+    KeyUpdateLifecycle,
 };
 use crate::runtime::store::publication::{
     FreezeSignedPublicationRequest, FrozenPublication, PublicationPayloadKind, PublicationScope,
@@ -62,6 +63,7 @@ use crate::runtime::store::remote_counter::{
 };
 use crate::runtime::store::{
     CurrentRemoteAuthorizationProof, RemoteReplyAuthorization, RuntimeId, RuntimeIdKind,
+    matching_bootstrap_update_for_test,
 };
 use crate::security::MemoryKeyStore;
 
@@ -1344,19 +1346,13 @@ async fn freeze_exact_key_sync_update(
         .mark_key_transition_rotated(operation_id)
         .await
         .expect("rotate KeySync fixture transition");
-    let update_set = key_update_set(current_revision);
+    let update = matching_bootstrap_update_for_test(&fixture.store(), recipient).await;
+    assert_eq!(update.key_revision, current_revision.value());
+    let update_set = KeyUpdateSetV1::from_canonical_bytes(&update.canonical_update_set)
+        .expect("decode exact matching bootstrap update set");
     fixture
         .store()
-        .freeze_key_updates(
-            operation_id,
-            vec![FrozenKeyUpdate {
-                recipient,
-                key_revision: current_revision.value(),
-                canonical_update_set: update_set
-                    .canonical_bytes()
-                    .expect("canonical KeySync fixture update set"),
-            }],
-        )
+        .freeze_key_updates(operation_id, vec![update])
         .await
         .expect("freeze exact KeySync update set");
     (operation_id, update_set)
@@ -1555,6 +1551,14 @@ async fn key_update_ack_is_store_resolved_canonical_and_exact_replay_preserves_f
         .take_business_lane()
         .expect("take ACK transport lane");
     let mut pump = RemoteReplyPump::new(business, Arc::new(RecordingKeyUpdateSealer::default()));
+    let before_route_accepted = exact_active_update(&fixture).await;
+    assert_eq!(before_route_accepted.lifecycle, KeyUpdateLifecycle::Acked);
+    assert!(before_route_accepted.canonical_ack.is_some());
+    assert_ne!(
+        before_route_accepted.canonical_ack.as_deref(),
+        Some(canonical_ack.as_slice()),
+        "bootstrap receipt starts as target-only ACK evidence, not a forged normal KeyUpdateAck"
+    );
     let accepted_route = RequestRouteId::from_bytes([0xa0; 16]);
     harness
         .push_frame(OpaqueRouteFrame {
@@ -1571,9 +1575,9 @@ async fn key_update_ack_is_store_resolved_canonical_and_exact_replay_preserves_f
         Some(BusinessTransportEvent::RouteAccepted(_))
     ));
     assert_eq!(
-        exact_active_update(&fixture).await.lifecycle,
-        KeyUpdateLifecycle::Frozen,
-        "Relay RouteAccepted must not become a device KeyUpdateAck"
+        exact_active_update(&fixture).await,
+        before_route_accepted,
+        "Relay RouteAccepted must not mutate bootstrap ACK evidence"
     );
     transport.shutdown().await;
 
@@ -1592,9 +1596,9 @@ async fn key_update_ack_is_store_resolved_canonical_and_exact_replay_preserves_f
     let first = exact_active_update(&fixture).await;
     assert_eq!(first.operation_id, operation_id);
     assert_eq!(first.lifecycle, KeyUpdateLifecycle::Acked);
-    assert_ne!(
-        first.state_changed_at_ms, 0,
-        "production handler must persist a daemon-observed ACK time"
+    assert_eq!(
+        first.state_changed_at_ms, before_route_accepted.state_changed_at_ms,
+        "late normal ACK upgrades evidence without moving the bootstrap causal time"
     );
     assert_eq!(
         first.canonical_ack.as_deref(),
@@ -1668,16 +1672,22 @@ async fn freeze_stream_ack_transition(
     };
     fixture
         .store()
-        .begin_key_transition(BeginKeyTransition {
-            operation_id,
-            operation: KeyTransitionOperation::Renew,
-            target: KeyTransitionTarget::Device(recipient),
-            from_revision: known_revision.value(),
-            to_revision: requested_revision.value(),
-            recipients: vec![recipient],
-            replay_retirement: None,
-            created_at_ms: 1,
-        })
+        .begin_key_transition_with_global_lineage_for_test(
+            BeginKeyTransition {
+                operation_id,
+                operation: KeyTransitionOperation::Renew,
+                target: KeyTransitionTarget::Device(recipient),
+                from_revision: known_revision.value(),
+                to_revision: requested_revision.value(),
+                recipients: vec![recipient],
+                replay_retirement: None,
+                created_at_ms: 1,
+            },
+            KeyTransitionGlobalLineage {
+                global_key_state_hash: [0xb5; 32],
+                stable_key_lineage_hash: Some([0xb6; 32]),
+            },
+        )
         .await
         .expect("begin stream ACK fixture transition");
     fixture

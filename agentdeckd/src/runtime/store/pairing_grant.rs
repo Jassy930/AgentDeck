@@ -1056,6 +1056,82 @@ impl GlobalKeyStateV1 {
         Ok(views)
     }
 
+    /// Pairing bootstrap transition 在 confirm 时冻结的稳定 key lineage。
+    ///
+    /// `GlobalKeyStateV1` 的完整 canonical bytes 还包含 retention owner、retired-key
+    /// tombstone 与已撤销设备 secret 的保留状态；这些字段可以在不推进 key-directory
+    /// revision 的情况下合法变化。这里因此只认证同一 revision 内必须保持不变的
+    /// active roster、current epoch 与真实 key material。编码缓冲区用 `Zeroizing`，避免
+    /// 为计算 digest 留下额外的明文 key 副本。
+    pub(super) fn pairing_bootstrap_lineage_hash(&self) -> Result<[u8; 32], RuntimeStoreError> {
+        self.validate()?;
+        let mut encoded = Zeroizing::new(Vec::with_capacity(
+            64 + self.devices.len() * 128 + self.conversations.len() * 96,
+        ));
+        encoded.extend_from_slice(b"AgentDeck/PairingBootstrapGlobalLineageV1\0");
+        encoded.extend_from_slice(&self.revision.to_be_bytes());
+
+        let catalog = self
+            .catalogs
+            .last()
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        encoded.extend_from_slice(&catalog.epoch.to_be_bytes());
+        encoded.extend_from_slice(catalog.key.expose_secret());
+
+        let active_device_count = self
+            .devices
+            .iter()
+            .filter(|device| device.is_active())
+            .count();
+        encoded.extend_from_slice(
+            &u16::try_from(active_device_count)
+                .map_err(|_| RuntimeStoreError::PairingLimit)?
+                .to_be_bytes(),
+        );
+        for device in self.devices.iter().filter(|device| device.is_active()) {
+            encoded.extend_from_slice(device.device_route.as_bytes());
+            encoded.extend_from_slice(&device.command.epoch.to_be_bytes());
+            encoded.extend_from_slice(
+                device
+                    .command
+                    .key
+                    .as_ref()
+                    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+                    .expose_secret(),
+            );
+            encoded.extend_from_slice(&device.reply.epoch.to_be_bytes());
+            encoded.extend_from_slice(
+                device
+                    .reply
+                    .key
+                    .as_ref()
+                    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+                    .expose_secret(),
+            );
+        }
+
+        encoded.extend_from_slice(
+            &u16::try_from(self.conversations.len())
+                .map_err(|_| RuntimeStoreError::PairingLimit)?
+                .to_be_bytes(),
+        );
+        for conversation in &self.conversations {
+            let current = conversation
+                .history
+                .last()
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+            encoded.extend_from_slice(conversation.stream_route.as_bytes());
+            encoded.extend_from_slice(&current.epoch.to_be_bytes());
+            encoded.extend_from_slice(current.key.expose_secret());
+        }
+
+        let digest = sha256(encoded.as_slice());
+        if digest == [0; 32] {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        Ok(digest)
+    }
+
     /// publication binding 只读取当前 shared key identity，不派生或复制 raw AEAD key。
     pub(crate) fn current_shared_key_id(
         &self,
@@ -1666,6 +1742,12 @@ impl ConfirmPairingGrant {
             response,
             global_key_state,
         }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn key_directory(&self) -> &KeyDirectoryV1 {
+        &self.key_directory
     }
 }
 

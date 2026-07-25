@@ -2368,6 +2368,70 @@ automatic injected keystore/verifier 只证明同一状态机；production-signe
 继续作为 post-MVP `BLOCKED`，不得计 PASS。`p4-auto` 仍属于 P4.7，当前 verifier 尚未提供该入口；P4 Phase
 Exit、iOS 真实链路、物理设备与公网证据也仍未完成。
 
+## Relay Companion MVP P4 pairing→key-transition production hardening gate
+
+本 gate 覆盖 P4.3 `PairResponseReceived` 与 P4.5 Add/Renew key transition 的 durable 交界，不新增 Task
+完成数。ADKT 写 codec v3、legacy v1/v2 read/replay、target-only ACK、ACK/receipt 时间竞态、GC pin 与 Close
+后完整 30 天 receipt window 必须作为一个安全工作单元验证。first-device zero-cut Add 的测试必须仅依赖
+exact receipt proof 到达 `BusinessReady`，不得注入冗余 KeyUpdateAck 掩盖 production 接线缺口。
+
+Focused matrix：
+
+```bash
+RUSTC_WRAPPER= cargo test -p agentdeckd --lib \
+  runtime::store::pairing_delivery_tests -- --test-threads=1
+RUSTC_WRAPPER= cargo test -p agentdeckd --lib \
+  runtime::store::pairing_terminal_tests -- --test-threads=1
+RUSTC_WRAPPER= cargo test -p agentdeckd --lib \
+  runtime::store::pairing_receipt_retention_tests -- --test-threads=1
+RUSTC_WRAPPER= cargo test -p agentdeckd --lib \
+  runtime::store::retired_key_tests -- --test-threads=1
+RUSTC_WRAPPER= cargo test -p agentdeckd --lib \
+  runtime::store::key_transition -- --test-threads=1
+RUSTC_WRAPPER= cargo test -p agentdeckd --lib \
+  remote::transition_tests -- --test-threads=1
+```
+
+行为验收必须同时证明：
+
+- 独立随机 HPKE ciphertext 在 stable slot/global lineage 相同时可接受；transition 必须同时认证 confirm-time
+  完整 global-state hash 与同 revision 稳定 key-lineage digest。retention owner、retired tombstone、
+  revoked-secret GC 的合法原地变化不得触发误报；active roster/current epoch/key material 任一分叉、slot/global
+  错绑、错误 target/revision/device signature 都零写拒绝，tamper 在 full-open 阶段 fail-closed且不重写
+  artifacts。固定 stable-lineage KAT
+  `2df91367dc4be4c1404451128961e4f6f99b610402cb1aa3a90818bbb560262e` 还必须经 production transaction
+  staging、ADKT v3 seal、SQLite shutdown/reopen 后保持 exact equality，不能只证明 plaintext codec roundtrip。
+- proof 只 ACK exact target；非 target 继续 Frozen。正常 ACK 先到保留真实 evidence，fresh receipt 时间回退
+  零写拒绝；receipt placeholder 先到后可升级为普通 ACK，但 Completed terminal causal time 不移动。
+- proof 后 cancel 被拒；proofful 与 ADKT v1/v2 proofless Completed transition 在 pairing/Close 尚存时都被
+  GC pin。当前 ADKT v3 Add/Renew 必须有 nonzero global/stable lineage，不能把 proofless v3 当 legacy。
+  exact legacy receipt replay 只在 matching v1/v2 transition、同 revision 且完整 global-state hash 精确一致时
+  回填；若 revision 已前进则零写 fail-close。旧版本已收集 transition/update 时只允许
+  replay/Close、零 proof forging，matching update 单独残留必须 fail-closed。
+- fresh Close ACK 原子 scrub pairing/outbox、保留原 `created_at_ms`、重签 MAC并把 `retain_until_ms` 延到
+  ACK 后完整 30 天；clock regression 零写，AfterCommit-unknown 重开不被 startup purge 抢先删除，exact retry
+  只读且不二次续期。
+- `PairingBootstrapInstallBinding` / `PairingBootstrapInstallProof` 的 Debug/日志输出不包含 receipt、route、hash、
+  key lineage 或其他 binding 内容。
+
+在 scoped commit 前还必须运行宽门禁并取得最终 exit 0；focused PASS 不能代替 package/workspace/selfcheck：
+
+```bash
+RUSTC_WRAPPER= cargo test -p agentdeckd --locked -- --test-threads=1
+RUSTC_WRAPPER= cargo test --workspace --locked -- --test-threads=1
+RUSTC_WRAPPER= cargo run -p agentdeck-cli --locked -- selfcheck
+RUSTC_WRAPPER= cargo clippy -p agentdeckd --lib --tests -- -D warnings
+cargo fmt --all -- --check
+bash scripts/check-daemon-network-boundary.sh
+RUSTC_WRAPPER= bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+git diff --check
+git status --short --branch
+```
+
+本 gate 通过也只收口该 production hardening；P4 继续为 **6/7**，P4.7 checkbox、`p4-auto` 与 P4 Phase Exit
+在其独立 automatic E2E/真实槽位 contract/phase review 完成前必须保持未完成。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。

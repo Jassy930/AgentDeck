@@ -43,6 +43,8 @@ pub(super) fn validate_transition_record(
     {
         return Err(RuntimeStoreError::PublicationMismatch);
     }
+    validate_global_lineage(record)?;
+    validate_bootstrap_install_proof(record)?;
     match record.phase {
         KeyTransitionPhase::DrainingOld | KeyTransitionPhase::RotatedPreparingUpdates => {
             if record.update_count != 0 || !record.cuts.is_empty() {
@@ -96,6 +98,112 @@ pub(super) fn validate_transition_record(
         (phase, None, None, None) if phase != KeyTransitionPhase::Complete => Ok(()),
         _ => Err(RuntimeStoreError::PublicationMismatch),
     }
+}
+
+fn validate_global_lineage(record: &KeyTransitionRecord) -> Result<(), RuntimeStoreError> {
+    let Some(lineage) = record.global_lineage else {
+        return Ok(());
+    };
+    if !matches!(
+        (record.operation, record.target),
+        (
+            KeyTransitionOperation::Add | KeyTransitionOperation::Renew,
+            KeyTransitionTarget::Device(_),
+        )
+    ) || lineage.global_key_state_hash == [0; 32]
+        || lineage
+            .stable_key_lineage_hash
+            .is_none_or(|hash| hash == [0; 32])
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    Ok(())
+}
+
+fn validate_transition_codec_version(
+    record: &KeyTransitionRecord,
+    version: u8,
+) -> Result<(), RuntimeStoreError> {
+    if !matches!(
+        version,
+        LEGACY_TRANSITION_CODEC_VERSION
+            | PREVIOUS_TRANSITION_CODEC_VERSION
+            | TRANSITION_CODEC_VERSION
+    ) || version == TRANSITION_CODEC_VERSION
+        && matches!(
+            (record.operation, record.target),
+            (
+                KeyTransitionOperation::Add | KeyTransitionOperation::Renew,
+                KeyTransitionTarget::Device(_),
+            )
+        )
+        && record.global_lineage.is_none()
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_install_proof(record: &KeyTransitionRecord) -> Result<(), RuntimeStoreError> {
+    let Some(proof) = record.bootstrap_install_proof.as_ref() else {
+        return Ok(());
+    };
+    let binding = &proof.binding;
+    let target = match (record.operation, record.target) {
+        (
+            KeyTransitionOperation::Add | KeyTransitionOperation::Renew,
+            KeyTransitionTarget::Device(target),
+        ) => target,
+        _ => return Err(RuntimeStoreError::PublicationMismatch),
+    };
+    if record
+        .global_lineage
+        .is_none_or(|lineage| lineage.global_key_state_hash != binding.global_key_state_hash)
+        || proof.operation_id != record.operation_id
+        || binding.device_route != target.device_route
+        || binding.grant_serial != target.grant_serial
+        || binding.key_revision != record.to_revision
+        || !record.recipients.contains(&target)
+        || record.terminal == Some(KeyTransitionTerminal::Cancelled)
+        || binding.grant_serial == 0
+        || binding.root_trust_epoch == 0
+        || binding.key_revision == 0
+        || binding.expiry_ms == 0
+        || binding.received_at_ms < record.created_at_ms
+        || binding.received_at_ms >= binding.expiry_ms
+        || binding.received_at_ms > MAX_TERMINAL_BASE_MS
+        || binding.canonical_receipt.is_empty()
+        || binding.canonical_receipt.len() > MAX_CANONICAL_KEY_ACK_BYTES
+        || agentdeck_crypto::sha256(&binding.canonical_receipt) != binding.receipt_hash
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    for value in [
+        binding.pairing_id,
+        binding.relay_server_id,
+        binding.pair_route,
+        binding.machine_route,
+        binding.device_route,
+    ] {
+        validate_nonzero(value)?;
+    }
+    for value in [
+        binding.invite_hash,
+        binding.request_hash,
+        binding.grant_hash,
+        binding.response_hash,
+        binding.receipt_hash,
+        binding.device_sign_fingerprint,
+        binding.info_sha256,
+        binding.aad_sha256,
+        binding.tbs_sha256,
+        binding.key_directory_hash,
+        binding.global_key_state_hash,
+        binding.key_slot_digest,
+    ] {
+        validate_nonzero(value)?;
+    }
+    Ok(())
 }
 
 pub(super) fn validate_update_record(record: &KeyUpdateRecord) -> Result<(), RuntimeStoreError> {
@@ -195,10 +303,15 @@ fn encode_transition_version(
     version: u8,
 ) -> Result<Zeroizing<Vec<u8>>, RuntimeStoreError> {
     validate_transition_record(record)?;
+    validate_transition_codec_version(record, version)?;
     if version == LEGACY_TRANSITION_CODEC_VERSION && record.replay_retirement.is_some()
+        || version < TRANSITION_CODEC_VERSION
+            && (record.global_lineage.is_some() || record.bootstrap_install_proof.is_some())
         || !matches!(
             version,
-            LEGACY_TRANSITION_CODEC_VERSION | TRANSITION_CODEC_VERSION
+            LEGACY_TRANSITION_CODEC_VERSION
+                | PREVIOUS_TRANSITION_CODEC_VERSION
+                | TRANSITION_CODEC_VERSION
         )
     {
         return Err(RuntimeStoreError::PublicationMismatch);
@@ -251,11 +364,11 @@ fn encode_transition_version(
                 encoded.extend_from_slice(&outer.to_be_bytes());
                 encoded.extend_from_slice(&inner.to_be_bytes());
             }
-            (None, Some(inner)) if version == TRANSITION_CODEC_VERSION => {
+            (None, Some(inner)) if version >= PREVIOUS_TRANSITION_CODEC_VERSION => {
                 encoded.push(2);
                 encoded.extend_from_slice(&inner.to_be_bytes());
             }
-            (Some(outer), None) if version == TRANSITION_CODEC_VERSION => {
+            (Some(outer), None) if version >= PREVIOUS_TRANSITION_CODEC_VERSION => {
                 encoded.push(3);
                 encoded.extend_from_slice(&outer.to_be_bytes());
             }
@@ -271,7 +384,7 @@ fn encode_transition_version(
     encoded.extend_from_slice(&record.state_changed_at_ms.to_be_bytes());
     encoded.extend_from_slice(&record.terminal_at_ms.unwrap_or(0).to_be_bytes());
     encoded.extend_from_slice(&record.retain_until_ms.unwrap_or(0).to_be_bytes());
-    if version == TRANSITION_CODEC_VERSION {
+    if version >= PREVIOUS_TRANSITION_CODEC_VERSION {
         encoded.push(match record.counter_retirement {
             CounterRetirementLifecycle::Pending => 1,
             CounterRetirementLifecycle::Applied => 2,
@@ -289,10 +402,140 @@ fn encode_transition_version(
             }
         }
     }
+    if version == TRANSITION_CODEC_VERSION {
+        match record.global_lineage {
+            None => encoded.push(0),
+            Some(lineage) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&lineage.global_key_state_hash);
+                match lineage.stable_key_lineage_hash {
+                    None => encoded.push(0),
+                    Some(hash) => {
+                        encoded.push(1);
+                        encoded.extend_from_slice(&hash);
+                    }
+                }
+            }
+        }
+        match record.bootstrap_install_proof.as_ref() {
+            None => encoded.push(0),
+            Some(proof) => {
+                encoded.push(1);
+                encode_bootstrap_install_proof(&mut encoded, proof)?;
+            }
+        }
+    }
     if encoded.len() > MAX_TRANSITION_PLAINTEXT_BYTES {
         return Err(RuntimeStoreError::PayloadTooLarge);
     }
     Ok(encoded)
+}
+
+#[cfg(test)]
+pub(super) fn encode_transition_legacy_for_test(
+    record: &KeyTransitionRecord,
+    version: u8,
+) -> Result<Zeroizing<Vec<u8>>, RuntimeStoreError> {
+    if !matches!(
+        version,
+        LEGACY_TRANSITION_CODEC_VERSION | PREVIOUS_TRANSITION_CODEC_VERSION
+    ) {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    encode_transition_version(record, version)
+}
+
+fn encode_bootstrap_install_proof(
+    encoded: &mut Vec<u8>,
+    proof: &PairingBootstrapInstallProof,
+) -> Result<(), RuntimeStoreError> {
+    let binding = &proof.binding;
+    encoded.extend_from_slice(&proof.operation_id);
+    encoded.extend_from_slice(&binding.pairing_id);
+    encoded.extend_from_slice(&binding.relay_server_id);
+    encoded.extend_from_slice(&binding.pair_route);
+    encoded.extend_from_slice(&binding.machine_route);
+    encoded.extend_from_slice(&binding.device_route);
+    encoded.extend_from_slice(&binding.grant_serial.to_be_bytes());
+    encoded.extend_from_slice(&binding.root_trust_epoch.to_be_bytes());
+    encoded.extend_from_slice(&binding.key_revision.to_be_bytes());
+    encoded.extend_from_slice(&binding.expiry_ms.to_be_bytes());
+    for hash in [
+        binding.invite_hash,
+        binding.request_hash,
+        binding.grant_hash,
+        binding.response_hash,
+        binding.receipt_hash,
+        binding.device_sign_fingerprint,
+        binding.info_sha256,
+        binding.aad_sha256,
+        binding.tbs_sha256,
+        binding.key_directory_hash,
+        binding.global_key_state_hash,
+        binding.key_slot_digest,
+    ] {
+        encoded.extend_from_slice(&hash);
+    }
+    push_bytes(encoded, &binding.canonical_receipt)?;
+    encoded.extend_from_slice(&binding.received_at_ms.to_be_bytes());
+    Ok(())
+}
+
+fn decode_bootstrap_install_proof(
+    decoder: &mut Decoder<'_>,
+) -> Result<PairingBootstrapInstallProof, RuntimeStoreError> {
+    let operation_id = decoder.fixed()?;
+    let pairing_id = decoder.fixed()?;
+    let relay_server_id = decoder.fixed()?;
+    let pair_route = decoder.fixed()?;
+    let machine_route = decoder.fixed()?;
+    let device_route = decoder.fixed()?;
+    let grant_serial = decoder.u64()?;
+    let root_trust_epoch = decoder.u64()?;
+    let key_revision = decoder.u64()?;
+    let expiry_ms = decoder.u64()?;
+    let invite_hash = decoder.fixed()?;
+    let request_hash = decoder.fixed()?;
+    let grant_hash = decoder.fixed()?;
+    let response_hash = decoder.fixed()?;
+    let receipt_hash = decoder.fixed()?;
+    let device_sign_fingerprint = decoder.fixed()?;
+    let info_sha256 = decoder.fixed()?;
+    let aad_sha256 = decoder.fixed()?;
+    let tbs_sha256 = decoder.fixed()?;
+    let key_directory_hash = decoder.fixed()?;
+    let global_key_state_hash = decoder.fixed()?;
+    let key_slot_digest = decoder.fixed()?;
+    let canonical_receipt = decoder.bytes(MAX_CANONICAL_KEY_ACK_BYTES)?;
+    let received_at_ms = decoder.u64()?;
+    Ok(PairingBootstrapInstallProof {
+        operation_id,
+        binding: PairingBootstrapInstallBinding {
+            pairing_id,
+            relay_server_id,
+            pair_route,
+            machine_route,
+            device_route,
+            grant_serial,
+            root_trust_epoch,
+            key_revision,
+            expiry_ms,
+            invite_hash,
+            request_hash,
+            grant_hash,
+            response_hash,
+            receipt_hash,
+            device_sign_fingerprint,
+            info_sha256,
+            aad_sha256,
+            tbs_sha256,
+            key_directory_hash,
+            global_key_state_hash,
+            key_slot_digest,
+            canonical_receipt,
+            received_at_ms,
+        },
+    })
 }
 
 pub(super) fn decode_transition(bytes: &[u8]) -> Result<KeyTransitionRecord, RuntimeStoreError> {
@@ -303,7 +546,9 @@ pub(super) fn decode_transition(bytes: &[u8]) -> Result<KeyTransitionRecord, Run
     let version = decoder.u8()?;
     if !matches!(
         version,
-        LEGACY_TRANSITION_CODEC_VERSION | TRANSITION_CODEC_VERSION
+        LEGACY_TRANSITION_CODEC_VERSION
+            | PREVIOUS_TRANSITION_CODEC_VERSION
+            | TRANSITION_CODEC_VERSION
     ) {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
@@ -351,8 +596,8 @@ pub(super) fn decode_transition(bytes: &[u8]) -> Result<KeyTransitionRecord, Run
         let (relay_committed_outer, relay_committed_inner) = match decoder.u8()? {
             0 => (None, None),
             1 => (Some(decoder.u64()?), Some(decoder.u64()?)),
-            2 if version == TRANSITION_CODEC_VERSION => (None, Some(decoder.u64()?)),
-            3 if version == TRANSITION_CODEC_VERSION => (Some(decoder.u64()?), None),
+            2 if version >= PREVIOUS_TRANSITION_CODEC_VERSION => (None, Some(decoder.u64()?)),
+            3 if version >= PREVIOUS_TRANSITION_CODEC_VERSION => (Some(decoder.u64()?), None),
             _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
         };
         cuts.push(KeyTransitionStreamCut {
@@ -373,7 +618,7 @@ pub(super) fn decode_transition(bytes: &[u8]) -> Result<KeyTransitionRecord, Run
     let state_changed_at_ms = decoder.u64()?;
     let terminal_at = decoder.u64()?;
     let retain_until = decoder.u64()?;
-    let counter_retirement = if version == TRANSITION_CODEC_VERSION {
+    let counter_retirement = if version >= PREVIOUS_TRANSITION_CODEC_VERSION {
         match decoder.u8()? {
             1 => CounterRetirementLifecycle::Pending,
             2 => CounterRetirementLifecycle::Applied,
@@ -384,7 +629,7 @@ pub(super) fn decode_transition(bytes: &[u8]) -> Result<KeyTransitionRecord, Run
         // Pending，禁止把旧 tombstone 当作可回收证据。
         CounterRetirementLifecycle::Pending
     };
-    let replay_retirement = if version == TRANSITION_CODEC_VERSION {
+    let replay_retirement = if version >= PREVIOUS_TRANSITION_CODEC_VERSION {
         match decoder.u8()? {
             0 => None,
             1 => Some(ReplayRetirement {
@@ -396,6 +641,31 @@ pub(super) fn decode_transition(bytes: &[u8]) -> Result<KeyTransitionRecord, Run
                     _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
                 },
             }),
+            _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+        }
+    } else {
+        None
+    };
+    let global_lineage = if version == TRANSITION_CODEC_VERSION {
+        match decoder.u8()? {
+            0 => None,
+            1 => Some(KeyTransitionGlobalLineage {
+                global_key_state_hash: decoder.fixed()?,
+                stable_key_lineage_hash: match decoder.u8()? {
+                    0 => None,
+                    1 => Some(decoder.fixed()?),
+                    _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+                },
+            }),
+            _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+        }
+    } else {
+        None
+    };
+    let bootstrap_install_proof = if version == TRANSITION_CODEC_VERSION {
+        match decoder.u8()? {
+            0 => None,
+            1 => Some(decode_bootstrap_install_proof(&mut decoder)?),
             _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
         }
     } else {
@@ -413,6 +683,8 @@ pub(super) fn decode_transition(bytes: &[u8]) -> Result<KeyTransitionRecord, Run
         phase,
         terminal,
         recipients,
+        global_lineage,
+        bootstrap_install_proof,
         replay_retirement,
         counter_retirement,
         cuts,
@@ -423,7 +695,13 @@ pub(super) fn decode_transition(bytes: &[u8]) -> Result<KeyTransitionRecord, Run
         retain_until_ms: terminal.map(|_| retain_until),
     };
     validate_transition_record(&record).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-    if encode_transition_version(&record, version)?.as_slice() != bytes {
+    validate_transition_codec_version(&record, version)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if encode_transition_version(&record, version)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+        .as_slice()
+        != bytes
+    {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
     Ok(record)
@@ -923,6 +1201,8 @@ mod tests {
             phase: KeyTransitionPhase::DrainingOld,
             terminal: None,
             recipients: vec![recipient],
+            global_lineage: None,
+            bootstrap_install_proof: None,
             replay_retirement: None,
             counter_retirement: CounterRetirementLifecycle::Pending,
             cuts: Vec::new(),
@@ -935,12 +1215,10 @@ mod tests {
         let legacy = encode_transition_version(&record, LEGACY_TRANSITION_CODEC_VERSION)
             .expect("encode canonical ADKT v1 fixture");
         assert_eq!(decode_transition(&legacy).expect("decode ADKT v1"), record);
-        assert_ne!(
-            encode_transition(&record)
-                .expect("encode ADKT v2")
-                .as_slice(),
-            legacy.as_slice(),
-        );
+        assert!(matches!(
+            encode_transition(&record),
+            Err(RuntimeStoreError::PublicationMismatch)
+        ));
     }
 
     #[test]
@@ -958,6 +1236,8 @@ mod tests {
             phase: KeyTransitionPhase::BarriersFrozen,
             terminal: None,
             recipients: vec![recipient],
+            global_lineage: None,
+            bootstrap_install_proof: None,
             replay_retirement: None,
             counter_retirement: CounterRetirementLifecycle::Pending,
             cuts: vec![KeyTransitionStreamCut {
@@ -979,7 +1259,9 @@ mod tests {
             retain_until_ms: None,
         };
 
-        let encoded = encode_transition(&record).expect("encode ADKT v2 genesis cut");
+        let encoded = encode_transition_version(&record, PREVIOUS_TRANSITION_CODEC_VERSION)
+            .expect("encode ADKT v2 genesis cut");
+        assert_eq!(encoded[4], PREVIOUS_TRANSITION_CODEC_VERSION);
         assert!(
             encoded
                 .windows(9)
@@ -989,6 +1271,18 @@ mod tests {
         assert_eq!(
             decode_transition(encoded.as_slice()).expect("decode ADKT v2 genesis cut"),
             record
+        );
+        let mut current_record = record.clone();
+        current_record.global_lineage = Some(KeyTransitionGlobalLineage {
+            global_key_state_hash: [0x57; 32],
+            stable_key_lineage_hash: Some([0x58; 32]),
+        });
+        let current =
+            encode_transition(&current_record).expect("encode lineage-bound ADKT v3 genesis cut");
+        assert_eq!(current[4], TRANSITION_CODEC_VERSION);
+        assert_eq!(
+            decode_transition(current.as_slice()).expect("decode ADKT v3 genesis cut"),
+            current_record
         );
         assert!(
             encode_transition_version(&record, LEGACY_TRANSITION_CODEC_VERSION).is_err(),
@@ -1011,6 +1305,8 @@ mod tests {
             phase: KeyTransitionPhase::BarriersFrozen,
             terminal: None,
             recipients: vec![recipient],
+            global_lineage: None,
+            bootstrap_install_proof: None,
             replay_retirement: None,
             counter_retirement: CounterRetirementLifecycle::Pending,
             cuts: vec![KeyTransitionStreamCut {
@@ -1032,7 +1328,9 @@ mod tests {
             retain_until_ms: None,
         };
 
-        let encoded = encode_transition(&record).expect("encode ADKT v2 outer-only cut");
+        let encoded = encode_transition_version(&record, PREVIOUS_TRANSITION_CODEC_VERSION)
+            .expect("encode ADKT v2 outer-only cut");
+        assert_eq!(encoded[4], PREVIOUS_TRANSITION_CODEC_VERSION);
         let marker = [3, 0, 0, 0, 0, 0, 0, 0, 7];
         let marker_offset = encoded
             .windows(marker.len())
@@ -1051,6 +1349,137 @@ mod tests {
         tampered[marker_offset] = 4;
         assert!(matches!(
             decode_transition(&tampered),
+            Err(RuntimeStoreError::UnknownOrCorruptSchema)
+        ));
+    }
+
+    #[test]
+    fn adkt_v3_roundtrips_bootstrap_install_proof_and_v1_v2_reject_it() {
+        let recipient = KeyTransitionRecipient {
+            device_route: [0x71; 16],
+            grant_serial: 4,
+        };
+        let stable_key_lineage_hash = [
+            0x2d, 0xf9, 0x13, 0x67, 0xdc, 0x4b, 0xe4, 0xc1, 0x40, 0x44, 0x51, 0x12, 0x89, 0x61,
+            0xe4, 0xf6, 0xf9, 0x9b, 0x61, 0x04, 0x02, 0xcb, 0x1a, 0xa3, 0xa9, 0x08, 0x18, 0xbb,
+            0xb5, 0x60, 0x26, 0x2e,
+        ];
+        let canonical_receipt = b"canonical-pair-response-received".to_vec();
+        let proof = PairingBootstrapInstallProof {
+            operation_id: [0x72; 16],
+            binding: PairingBootstrapInstallBinding {
+                pairing_id: [0x73; 16],
+                relay_server_id: [0x74; 16],
+                pair_route: [0x75; 16],
+                machine_route: [0x76; 16],
+                device_route: recipient.device_route,
+                grant_serial: recipient.grant_serial,
+                root_trust_epoch: 5,
+                key_revision: 6,
+                expiry_ms: 100,
+                invite_hash: [0x77; 32],
+                request_hash: [0x78; 32],
+                grant_hash: [0x79; 32],
+                response_hash: [0x7a; 32],
+                receipt_hash: agentdeck_crypto::sha256(&canonical_receipt),
+                device_sign_fingerprint: [0x7b; 32],
+                info_sha256: [0x7c; 32],
+                aad_sha256: [0x7d; 32],
+                tbs_sha256: [0x7e; 32],
+                key_directory_hash: [0x7f; 32],
+                global_key_state_hash: [0x81; 32],
+                key_slot_digest: [0x80; 32],
+                canonical_receipt,
+                received_at_ms: 11,
+            },
+        };
+        let record = KeyTransitionRecord {
+            operation_id: proof.operation_id,
+            operation: KeyTransitionOperation::Add,
+            target: KeyTransitionTarget::Device(recipient),
+            from_revision: 5,
+            to_revision: 6,
+            phase: KeyTransitionPhase::DrainingOld,
+            terminal: None,
+            recipients: vec![recipient],
+            global_lineage: Some(KeyTransitionGlobalLineage {
+                global_key_state_hash: [0x81; 32],
+                stable_key_lineage_hash: Some(stable_key_lineage_hash),
+            }),
+            bootstrap_install_proof: Some(proof),
+            replay_retirement: None,
+            counter_retirement: CounterRetirementLifecycle::Pending,
+            cuts: Vec::new(),
+            update_count: 0,
+            created_at_ms: 10,
+            state_changed_at_ms: 10,
+            terminal_at_ms: None,
+            retain_until_ms: None,
+        };
+
+        let encoded = encode_transition(&record).expect("encode ADKT v3 bootstrap proof");
+        assert_eq!(encoded[4], TRANSITION_CODEC_VERSION);
+        let decoded =
+            decode_transition(encoded.as_slice()).expect("decode ADKT v3 bootstrap proof");
+        assert_eq!(decoded, record);
+        assert_eq!(
+            decoded
+                .global_lineage
+                .expect("decoded ADKT v3 lineage")
+                .stable_key_lineage_hash,
+            Some(stable_key_lineage_hash),
+            "ADGK lineage KAT must survive the ADKT v3 sealed-row codec roundtrip"
+        );
+        assert!(encode_transition_version(&record, LEGACY_TRANSITION_CODEC_VERSION).is_err());
+        assert!(encode_transition_version(&record, PREVIOUS_TRANSITION_CODEC_VERSION).is_err());
+
+        let mut tampered = encoded.to_vec();
+        tampered[5] ^= 0x01;
+        assert!(matches!(
+            decode_transition(&tampered),
+            Err(RuntimeStoreError::UnknownOrCorruptSchema)
+        ));
+    }
+
+    #[test]
+    fn adkt_v3_rejects_proofless_add_without_global_lineage() {
+        let recipient = KeyTransitionRecipient {
+            device_route: [0x91; 16],
+            grant_serial: 9,
+        };
+        let record = KeyTransitionRecord {
+            operation_id: [0x92; 16],
+            operation: KeyTransitionOperation::Add,
+            target: KeyTransitionTarget::Device(recipient),
+            from_revision: 0,
+            to_revision: 1,
+            phase: KeyTransitionPhase::DrainingOld,
+            terminal: None,
+            recipients: vec![recipient],
+            global_lineage: None,
+            bootstrap_install_proof: None,
+            replay_retirement: None,
+            counter_retirement: CounterRetirementLifecycle::Pending,
+            cuts: Vec::new(),
+            update_count: 0,
+            created_at_ms: 10,
+            state_changed_at_ms: 10,
+            terminal_at_ms: None,
+            retain_until_ms: None,
+        };
+
+        assert!(matches!(
+            encode_transition(&record),
+            Err(RuntimeStoreError::PublicationMismatch)
+        ));
+
+        let legacy = encode_transition_version(&record, PREVIOUS_TRANSITION_CODEC_VERSION)
+            .expect("ADKT v2 permits the historical proofless Add grammar");
+        let mut malformed_v3 = legacy.to_vec();
+        malformed_v3[TRANSITION_MAGIC.len()] = TRANSITION_CODEC_VERSION;
+        malformed_v3.extend_from_slice(&[0, 0]);
+        assert!(matches!(
+            decode_transition(&malformed_v3),
             Err(RuntimeStoreError::UnknownOrCorruptSchema)
         ));
     }

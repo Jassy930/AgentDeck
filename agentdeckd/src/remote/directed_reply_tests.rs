@@ -36,7 +36,7 @@ use crate::remote::link::{
 use crate::runtime::backfill::BarrierRequest;
 use crate::runtime::events::{RegisterStreamBarrier, RuntimeStreamTarget, WatchGeneration};
 use crate::runtime::store::key_transition::{
-    AcknowledgeKeyUpdate, AcknowledgeStreamApplied, FrozenKeyUpdate, KeyTransitionStreamCut,
+    AcknowledgeKeyUpdate, AcknowledgeStreamApplied, KeyTransitionStreamCut,
     KeyTransitionStreamScope, TransitionSnapshotRequest, canonical_update_hash,
 };
 use crate::runtime::store::pairing_grant::GlobalKeyStateV1;
@@ -47,7 +47,7 @@ use crate::runtime::store::{
     PublicationScope, RemoteReplyAuthorization, RevocationTargetStatus, RuntimeId, RuntimeIdKind,
     RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle,
     active_authorization_store_with_pending_transition_for_test,
-    active_authorization_store_with_permissions_for_test,
+    active_authorization_store_with_permissions_for_test, matching_bootstrap_update_for_test,
 };
 use crate::runtime::{ConnectionId, ConnectionWrite};
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
@@ -494,6 +494,7 @@ async fn stream_binding_uses_barrier_publication_axes_and_rejects_post_barrier_a
     let permit = registration
         .relay_committed
         .stream_binding
+        .clone()
         .expect("remote key directory issues binding permit");
     assert_eq!(permit.generation(), generation);
     assert_eq!(permit.outer(), StreamCursor::At(0));
@@ -512,7 +513,7 @@ async fn stream_binding_uses_barrier_publication_axes_and_rejects_post_barrier_a
     let sealer =
         DeviceReplyTxSealer::with_authority_for_test(store.clone(), counter_keys, authority);
     let sealed = sealer
-        .seal_stream_binding_exact(&authorization, route(), permit)
+        .seal_stream_binding_exact(&authorization, route(), permit.clone())
         .await
         .expect("seal Store-issued binding");
     let verified = verify_sealed(
@@ -601,6 +602,7 @@ async fn conversation_stream_binding_selects_exact_conversation_dek_identity() {
     let permit = registration
         .relay_committed
         .stream_binding
+        .clone()
         .expect("conversation binding permit");
     let binding = permit.to_protocol(
         authorization.machine_route(),
@@ -1489,16 +1491,11 @@ async fn transition_snapshot_sealer_requires_exact_store_permit_and_records_flus
         .mark_key_transition_rotated(operation_id)
         .await
         .expect("advance initial Add transition");
-    let canonical_update_set = b"transition-snapshot-directed-sealer".to_vec();
+    let update = matching_bootstrap_update_for_test(&store, recipient).await;
+    assert_eq!(update.key_revision, key_revision);
+    let canonical_update_set = update.canonical_update_set.clone();
     store
-        .freeze_key_updates(
-            operation_id,
-            vec![FrozenKeyUpdate {
-                recipient,
-                key_revision,
-                canonical_update_set: canonical_update_set.clone(),
-            }],
-        )
+        .freeze_key_updates(operation_id, vec![update])
         .await
         .expect("freeze transition snapshot KeyUpdate");
     let barrier_sha256 = [0x84; 32];

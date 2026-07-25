@@ -77,6 +77,66 @@ pub(super) fn load_active_transition(
         .transpose()
 }
 
+pub(super) fn load_pairing_bootstrap_transition(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    recipient: KeyTransitionRecipient,
+    key_revision: u64,
+) -> Result<Option<AuthenticatedTransition>, RuntimeStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT operation_id FROM remote_key_transitions
+         WHERE operation_kind IN ('Add', 'Renew')
+           AND target_device_route = ?1 AND target_grant_serial = ?2
+           AND to_revision = ?3
+         ORDER BY operation_id LIMIT 2",
+    )?;
+    let ids = statement
+        .query_map(
+            params![
+                &recipient.device_route[..],
+                super::super::sequence::encode_sequence(recipient.grant_serial),
+                super::super::sequence::encode_sequence(key_revision),
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if ids.len() > 1 {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    ids.first()
+        .map(|id| {
+            load_transition(connection, key_bundle, database_id, fixed(id)?)?
+                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)
+        })
+        .transpose()
+}
+
+pub(super) fn pairing_bootstrap_update_exists(
+    connection: &Connection,
+    recipient: KeyTransitionRecipient,
+    key_revision: u64,
+) -> Result<bool, RuntimeStoreError> {
+    let exists: i64 = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM remote_key_update_outbox
+             WHERE device_route = ?1 AND grant_serial = ?2 AND key_revision = ?3
+         )",
+        params![
+            &recipient.device_route[..],
+            super::super::sequence::encode_sequence(recipient.grant_serial),
+            super::super::sequence::encode_sequence(key_revision),
+        ],
+        |row| row.get(0),
+    )?;
+    match exists {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(RuntimeStoreError::UnknownOrCorruptSchema),
+    }
+}
+
 pub(super) fn load_expired_transition_ids(
     connection: &Connection,
     now_ms: u64,
@@ -246,6 +306,10 @@ pub(super) fn authenticate_transition(
     let plaintext = open_transition(key_bundle, database_id, operation_id, &raw.sealed_state)?;
     let canonical = plaintext.expose_secret();
     let record = decode_transition(canonical)?;
+    let codec_version = canonical
+        .get(TRANSITION_MAGIC.len())
+        .copied()
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
     let metadata_token = fixed(&raw.metadata_token)?;
     if !transition_outer_matches(operation_id, &record, &raw)?
         || metadata_token
@@ -261,6 +325,7 @@ pub(super) fn authenticate_transition(
     }
     Ok(AuthenticatedTransition {
         record,
+        codec_version,
         sealed_bytes,
         metadata_token,
     })
@@ -735,6 +800,36 @@ pub(super) fn seal_transition_row(
         MAX_TRANSITION_PLAINTEXT_BYTES,
     )?;
     let token = transition_metadata_token(key_bundle, database_id, record, &sealed)?;
+    Ok((sealed, token))
+}
+
+#[cfg(test)]
+pub(super) fn seal_transition_row_legacy_for_test(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    record: &KeyTransitionRecord,
+    version: u8,
+) -> Result<(Vec<u8>, [u8; 32]), RuntimeStoreError> {
+    let plaintext = super::codec::encode_transition_legacy_for_test(record, version)?;
+    let sealed = key_bundle.row_cipher().seal_bounded(
+        &RowAad {
+            schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+            schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+            database_id: &database_id,
+            table: TRANSITION_TABLE,
+            primary_key: &record.operation_id,
+            column: SEALED_COLUMN,
+        },
+        plaintext.as_ref(),
+        MAX_TRANSITION_PLAINTEXT_BYTES,
+    )?;
+    let token = transition_metadata_token_from_canonical(
+        key_bundle,
+        database_id,
+        record.operation_id,
+        plaintext.as_slice(),
+        &sealed,
+    )?;
     Ok((sealed, token))
 }
 

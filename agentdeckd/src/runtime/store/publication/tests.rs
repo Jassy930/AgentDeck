@@ -385,7 +385,7 @@ fn shared_publication_fences_pre_barrier_transition_in_preflight_and_freeze_tran
         device_route: *DeviceRouteId::from_bytes([0x45; 16]).as_bytes(),
         grant_serial: 1,
     };
-    super::super::key_transition::begin_key_transition(
+    super::super::key_transition::begin_key_transition_with_global_lineage_for_test(
         &mut state,
         &config,
         super::super::key_transition::BeginKeyTransition {
@@ -397,6 +397,10 @@ fn shared_publication_fences_pre_barrier_transition_in_preflight_and_freeze_tran
             recipients: vec![recipient],
             replay_retirement: None,
             created_at_ms: 3,
+        },
+        super::super::key_transition::KeyTransitionGlobalLineage {
+            global_key_state_hash: [0x4a; 32],
+            stable_key_lineage_hash: Some([0x4b; 32]),
         },
     )
     .expect("stage pre-barrier transition");

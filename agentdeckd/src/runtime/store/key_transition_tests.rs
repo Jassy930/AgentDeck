@@ -1,4 +1,4 @@
-use super::key_transition::*;
+use super::key_transition::{self as key_transition_api, *};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,31 @@ fn recipient(route: u8, serial: u64) -> KeyTransitionRecipient {
         device_route: [route; 16],
         grant_serial: serial,
     }
+}
+
+fn begin_key_transition(
+    state: &mut super::sqlite::RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: BeginKeyTransition,
+) -> Result<KeyTransitionRecord, RuntimeStoreError> {
+    if matches!(
+        (input.operation, input.target),
+        (
+            KeyTransitionOperation::Add | KeyTransitionOperation::Renew,
+            KeyTransitionTarget::Device(_),
+        )
+    ) {
+        return begin_key_transition_with_global_lineage_for_test(
+            state,
+            config,
+            input,
+            KeyTransitionGlobalLineage {
+                global_key_state_hash: [0xa5; 32],
+                stable_key_lineage_hash: Some([0x5a; 32]),
+            },
+        );
+    }
+    key_transition_api::begin_key_transition(state, config, input)
 }
 
 fn maximal_canonical_key_update_set() -> Vec<u8> {
@@ -174,6 +199,110 @@ fn assert_v12_audit(state: &super::sqlite::RuntimeSqlite) {
         &ledger,
     )
     .expect("audit authenticated key-transition state");
+}
+
+#[test]
+fn generic_v3_begin_rejects_add_and_renew_without_lineage_before_write() {
+    for (operation, from_revision, to_revision, seed) in [
+        (KeyTransitionOperation::Add, 0, 1, 0x31),
+        (KeyTransitionOperation::Renew, 1, 2, 0x41),
+    ] {
+        let (_root, _keys, config, mut state) = open_test_state();
+        let target = recipient(seed, 1);
+        let before_changes = state.connection.total_changes();
+        assert!(matches!(
+            key_transition_api::begin_key_transition(
+                &mut state,
+                &config,
+                BeginKeyTransition {
+                    operation_id: [seed.wrapping_add(1); 16],
+                    operation,
+                    target: KeyTransitionTarget::Device(target),
+                    from_revision,
+                    to_revision,
+                    recipients: vec![target],
+                    replay_retirement: None,
+                    created_at_ms: 10,
+                },
+            ),
+            Err(RuntimeStoreError::PublicationMismatch)
+        ));
+        assert_eq!(state.connection.total_changes(), before_changes);
+        let row_count: i64 = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM remote_key_transitions", [], |row| {
+                row.get(0)
+            })
+            .expect("count transition rows after rejected generic membership begin");
+        assert_eq!(row_count, 0);
+        assert_v12_audit(&state);
+    }
+}
+
+#[test]
+fn adkt_v3_exact_stable_lineage_kat_survives_sqlite_reopen() {
+    let (root, keys, config, mut state) = open_test_state();
+    let operation_id = [0x52; 16];
+    let target = recipient(0x51, 1);
+    let stable_key_lineage_hash = [
+        0x2d, 0xf9, 0x13, 0x67, 0xdc, 0x4b, 0xe4, 0xc1, 0x40, 0x44, 0x51, 0x12, 0x89, 0x61, 0xe4,
+        0xf6, 0xf9, 0x9b, 0x61, 0x04, 0x02, 0xcb, 0x1a, 0xa3, 0xa9, 0x08, 0x18, 0xbb, 0xb5, 0x60,
+        0x26, 0x2e,
+    ];
+    let staged = begin_key_transition_with_global_lineage_for_test(
+        &mut state,
+        &config,
+        BeginKeyTransition {
+            operation_id,
+            operation: KeyTransitionOperation::Add,
+            target: KeyTransitionTarget::Device(target),
+            from_revision: 0,
+            to_revision: 1,
+            recipients: vec![target],
+            replay_retirement: None,
+            created_at_ms: 10,
+        },
+        KeyTransitionGlobalLineage {
+            global_key_state_hash: [0x53; 32],
+            stable_key_lineage_hash: Some(stable_key_lineage_hash),
+        },
+    )
+    .expect("stage lineage-bound ADKT v3 row through the production transaction");
+    assert_eq!(
+        staged
+            .global_lineage
+            .expect("staged transition retains global lineage")
+            .stable_key_lineage_hash,
+        Some(stable_key_lineage_hash)
+    );
+    assert_eq!(
+        transition_codec_version_for_test(&state, operation_id)
+            .expect("read staged ADKT codec version"),
+        3
+    );
+    drop(state);
+
+    let kek = load_or_create_storage_kek(&keys, &root.path().join("key-state.db"))
+        .expect("reload lineage KAT StorageKEK");
+    let reopened = super::sqlite::open(&config, kek).expect("reopen lineage-bound ADKT v3 row");
+    let recovery = load_active_key_transition(&reopened)
+        .expect("load lineage-bound transition after reopen")
+        .expect("lineage-bound transition remains active");
+    assert_eq!(
+        transition_codec_version_for_test(&reopened, operation_id)
+            .expect("read reopened ADKT codec version"),
+        3
+    );
+    assert_eq!(
+        recovery
+            .transition
+            .global_lineage
+            .expect("reopened transition retains global lineage")
+            .stable_key_lineage_hash,
+        Some(stable_key_lineage_hash),
+        "the fixed ADGK lineage KAT must survive staging, sealing, SQLite, and reopen exactly"
+    );
+    assert_v12_audit(&reopened);
 }
 
 fn assert_replay_audit(state: &super::sqlite::RuntimeSqlite) {
@@ -2911,6 +3040,132 @@ fn transition_row_count(state: &super::sqlite::RuntimeSqlite, operation_id: [u8;
             |row| row.get::<_, u64>(0),
         )
         .expect("read transition row count")
+}
+
+#[test]
+fn fresh_bootstrap_reconcile_requires_a_matching_add_or_renew_transition() {
+    let (_root, _keys, _config, mut state) = open_test_state();
+    let key_bundle = state.key_bundle.clone();
+    let database_id = state.database_id;
+    let transaction = state
+        .connection
+        .transaction()
+        .expect("open missing bootstrap transition transaction");
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)
+        .expect("load missing bootstrap transition ledger");
+    let mut next = ledger.clone();
+    let canonical_receipt = vec![0xd2; 64];
+    let binding = PairingBootstrapInstallBinding {
+        pairing_id: [0xc1; 16],
+        relay_server_id: [0xc2; 16],
+        pair_route: [0xc3; 16],
+        machine_route: [0xc4; 16],
+        device_route: [0xc5; 16],
+        grant_serial: 7,
+        root_trust_epoch: 8,
+        key_revision: 9,
+        expiry_ms: 100,
+        invite_hash: [0xc6; 32],
+        request_hash: [0xc7; 32],
+        grant_hash: [0xc8; 32],
+        response_hash: [0xc9; 32],
+        receipt_hash: agentdeck_crypto::sha256(&canonical_receipt),
+        device_sign_fingerprint: [0xcb; 32],
+        info_sha256: [0xcc; 32],
+        aad_sha256: [0xcd; 32],
+        tbs_sha256: [0xce; 32],
+        key_directory_hash: [0xcf; 32],
+        global_key_state_hash: [0xd0; 32],
+        key_slot_digest: [0xd1; 32],
+        canonical_receipt,
+        received_at_ms: 11,
+    };
+    let target = KeyTransitionRecipient {
+        device_route: binding.device_route,
+        grant_serial: binding.grant_serial,
+    };
+    let mut matching: KeyTransitionRecord = BeginKeyTransition {
+        operation_id: [0xd3; 16],
+        operation: KeyTransitionOperation::Add,
+        target: KeyTransitionTarget::Device(target),
+        from_revision: binding.key_revision - 1,
+        to_revision: binding.key_revision,
+        recipients: vec![target],
+        replay_retirement: None,
+        created_at_ms: 10,
+    }
+    .into();
+    matching.global_lineage = Some(KeyTransitionGlobalLineage {
+        global_key_state_hash: binding.global_key_state_hash,
+        stable_key_lineage_hash: Some([0xd4; 32]),
+    });
+    exact_bootstrap_proof_for_test(&matching, binding.clone())
+        .expect("a valid binding passes against the matching Add transition");
+    let mut wrong_operation = matching.clone();
+    wrong_operation.operation = KeyTransitionOperation::Revoke;
+    let mut wrong_target_device = matching.clone();
+    wrong_target_device.target = KeyTransitionTarget::Device(KeyTransitionRecipient {
+        device_route: [0xe1; 16],
+        grant_serial: target.grant_serial,
+    });
+    let mut wrong_target_grant = matching.clone();
+    wrong_target_grant.target = KeyTransitionTarget::Device(KeyTransitionRecipient {
+        device_route: target.device_route,
+        grant_serial: target.grant_serial + 1,
+    });
+    let mut wrong_revision = matching.clone();
+    wrong_revision.to_revision += 1;
+    for (axis, candidate) in [
+        ("operation", wrong_operation),
+        ("target-device", wrong_target_device),
+        ("target-grant", wrong_target_grant),
+        ("to-revision", wrong_revision),
+    ] {
+        assert!(
+            matches!(
+                exact_bootstrap_proof_for_test(&candidate, binding.clone()),
+                Err(RuntimeStoreError::PublicationMismatch)
+            ),
+            "bootstrap proof must reject mismatched {axis}"
+        );
+    }
+    let error = reconcile_pairing_bootstrap_install_proof_in_transaction(
+        &transaction,
+        &key_bundle,
+        database_id,
+        &mut next,
+        binding,
+        PairingBootstrapProofReconcileMode::FreshDelivery,
+    )
+    .expect_err("fresh delivery must not borrow the legacy collected-transition exception");
+    assert!(matches!(error, RuntimeStoreError::PublicationMismatch));
+    assert_eq!(next, ledger);
+    transaction
+        .rollback()
+        .expect("rollback missing bootstrap transition transaction");
+}
+
+#[test]
+fn legacy_collected_proof_read_rejects_a_matching_update_without_matching_transition() {
+    let (_root, _keys, config, mut state) = open_test_state();
+    let operation_id = [0xd3; 16];
+    complete_gc_fixture(&mut state, &config, operation_id, 20);
+    let exact_recipient = recipient(
+        operation_id[0].wrapping_add(1),
+        u64::from(operation_id[0]) + 1,
+    );
+    let error = match load_pairing_bootstrap_install_proof(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        exact_recipient,
+        2,
+    ) {
+        Ok(_) => panic!("matching update must prevent a legacy-collected classification"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, RuntimeStoreError::UnknownOrCorruptSchema));
+    assert_v12_audit(&state);
 }
 
 #[derive(Debug)]

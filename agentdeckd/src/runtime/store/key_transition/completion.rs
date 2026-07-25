@@ -152,7 +152,9 @@ fn finish_transition(
             // 取消只属于尚未轮换 key-directory 的 staged transition。轮换一旦完成，
             // 旧 revision 已不可恢复；任何后续 phase 都必须保留 active fence，由
             // recovery/forward completion 收口，不能靠取消释放业务入口。
-            if authenticated.record.phase != KeyTransitionPhase::DrainingOld || !updates.is_empty()
+            if authenticated.record.phase != KeyTransitionPhase::DrainingOld
+                || authenticated.record.bootstrap_install_proof.is_some()
+                || !updates.is_empty()
             {
                 return Err(RuntimeStoreError::InvalidStateTransition);
             }

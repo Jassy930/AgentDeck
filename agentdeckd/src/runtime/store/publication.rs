@@ -28,7 +28,8 @@ use super::{RetiredKeyOwnerKind, RetiredSharedKeyOwner};
 
 pub(crate) use binding::StreamBindingPermit;
 pub(in crate::runtime::store) use binding::{
-    capture_stream_binding_permit, validate_stream_binding_permit_in_transaction,
+    capture_stream_binding_permit, capture_transition_stream_binding_permit,
+    validate_stream_binding_permit_in_transaction,
 };
 pub(super) use directory::{
     authenticate_directory, authenticate_directory_records, load_pending_publication_stream_ids,

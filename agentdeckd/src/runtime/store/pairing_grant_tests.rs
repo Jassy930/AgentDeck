@@ -13,16 +13,16 @@ use agentdeck_crypto::{
 };
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
-    E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyPurpose,
-    KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind,
-    PairResponseInfoV1, PairResponsePlaintextV1,
+    E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyId, KeyPurpose,
+    KeyUpdateInfoV1, KeyUpdateSetV1, KeyUpdateV1, MachineDataSignerBindingV1, OuterContextV1,
+    OuterFrameKind, PairResponseInfoV1, PairResponsePlaintextV1,
 };
 use agentdeck_protocol::relay_v2::frame::{
     GrantCommitted, InstallGrant, OpaqueRouteFrame, RelayFrameBody,
 };
 use agentdeck_protocol::relay_v2::{
-    DeviceRouteId, Ed25519Signature, GrantSerial, RELAY_PROTOCOL_VERSION, RelayGrant, RootKeyId,
-    StreamRouteId, TrustEpoch,
+    DeviceRouteId, Ed25519Signature, GrantSerial, KeyDirectoryRevision, RELAY_PROTOCOL_VERSION,
+    RelayGrant, RootKeyId, StreamRouteId, TrustEpoch,
 };
 use agentdeck_protocol::runtime::{RUNTIME_PROTOCOL_VERSION, StreamCursor};
 use tokio::sync::Semaphore;
@@ -533,6 +533,342 @@ fn retention_owner(
 ) -> RetiredSharedKeyOwner {
     RetiredSharedKeyOwner::new(kind, owner_id, purpose, stream_route, epoch)
         .expect("valid retired-key owner")
+}
+
+fn bootstrap_lineage_fixture_with(
+    first_stream: StreamRouteId,
+    first_current_key: SecretBytes,
+) -> GlobalKeyStateV1 {
+    let revoked_route = DeviceRouteId::from_bytes([0x21; 16]);
+    let active_route = DeviceRouteId::from_bytes([0x51; 16]);
+    let second_stream = StreamRouteId::from_bytes([0x41; 16]);
+    GlobalKeyStateV1::bootstrap(
+        1,
+        1,
+        secret(0x11),
+        revoked_route,
+        1,
+        secret(0x22),
+        1,
+        secret(0x23),
+    )
+    .expect("bootstrap stable-lineage fixture")
+    .activate_conversation(first_stream, secret(0x32))
+    .expect("activate first stable-lineage conversation")
+    .activate_conversation(second_stream, secret(0x42))
+    .expect("activate second stable-lineage conversation")
+    .plan_add_device(
+        active_route,
+        secret(0x52),
+        secret(0x53),
+        secret(0x54),
+        vec![
+            ConversationKeyRotation::new(first_stream, secret(0x55)),
+            ConversationKeyRotation::new(second_stream, secret(0x56)),
+        ],
+        10_000,
+    )
+    .expect("add active stable-lineage device")
+    .into_state()
+    .plan_revoke_device(
+        revoked_route,
+        secret(0x61),
+        vec![
+            ConversationKeyRotation::new(first_stream, first_current_key),
+            ConversationKeyRotation::new(second_stream, secret(0x63)),
+        ],
+        20_000,
+    )
+    .expect("revoke old stable-lineage device")
+    .into_state()
+}
+
+fn bootstrap_lineage_fixture() -> GlobalKeyStateV1 {
+    bootstrap_lineage_fixture_with(StreamRouteId::from_bytes([0x31; 16]), secret(0x62))
+}
+
+fn bootstrap_lineage_hash(state: &GlobalKeyStateV1) -> [u8; 32] {
+    state.validate().expect("stable-lineage fixture validates");
+    state
+        .pairing_bootstrap_lineage_hash()
+        .expect("hash validated stable-lineage fixture")
+}
+
+fn bootstrap_lineage_hash_hex(state: &GlobalKeyStateV1) -> String {
+    bootstrap_lineage_hash(state)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn with_current_conversation_epoch(
+    state: &GlobalKeyStateV1,
+    current_key: u8,
+    expected_epoch: u64,
+    replacement_epoch: u64,
+) -> GlobalKeyStateV1 {
+    let mut canonical = state
+        .canonical_bytes_for_test()
+        .expect("encode conversation-epoch lineage fixture");
+    let key_pattern = [current_key; 32];
+    let key_offsets = canonical
+        .windows(key_pattern.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == key_pattern).then_some(offset))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        key_offsets.len(),
+        1,
+        "current conversation key fixture must occur exactly once"
+    );
+    let epoch_offset = key_offsets[0]
+        .checked_sub(18)
+        .expect("ADGK2 owner-free InternalKey prefix exists");
+    assert_eq!(
+        &canonical[epoch_offset..epoch_offset + 8],
+        expected_epoch.to_be_bytes().as_slice(),
+        "located current conversation key must carry the expected epoch"
+    );
+    assert_eq!(
+        &canonical[epoch_offset + 8..epoch_offset + 18],
+        &[0; 10],
+        "current conversation key must be unretired and owner-free"
+    );
+    canonical[epoch_offset..epoch_offset + 8].copy_from_slice(&replacement_epoch.to_be_bytes());
+    GlobalKeyStateV1::from_canonical_bytes_for_test(&canonical)
+        .expect("conversation-epoch mutation remains a valid canonical state")
+}
+
+fn assert_bootstrap_lineage_changed(
+    axis: &str,
+    baseline_hash: [u8; 32],
+    candidate: &GlobalKeyStateV1,
+) {
+    assert_ne!(
+        bootstrap_lineage_hash(candidate),
+        baseline_hash,
+        "changing {axis} must change the stable bootstrap lineage digest"
+    );
+}
+
+#[test]
+fn bootstrap_lineage_digest_has_fixed_sha256_kat() {
+    assert_eq!(
+        bootstrap_lineage_hash_hex(&bootstrap_lineage_fixture()),
+        "2df91367dc4be4c1404451128961e4f6f99b610402cb1aa3a90818bbb560262e"
+    );
+}
+
+#[test]
+fn bootstrap_lineage_binds_every_current_key_axis() {
+    let baseline_hash = bootstrap_lineage_hash(&bootstrap_lineage_fixture());
+
+    let mut revision = bootstrap_lineage_fixture();
+    revision.revision = 6;
+    assert_bootstrap_lineage_changed("revision", baseline_hash, &revision);
+
+    let mut catalog_epoch = bootstrap_lineage_fixture();
+    catalog_epoch
+        .catalogs
+        .last_mut()
+        .expect("current catalog exists")
+        .epoch = 4;
+    assert_bootstrap_lineage_changed("catalog epoch", baseline_hash, &catalog_epoch);
+
+    let mut catalog_key = bootstrap_lineage_fixture();
+    catalog_key
+        .catalogs
+        .last_mut()
+        .expect("current catalog exists")
+        .key = secret(0x71);
+    assert_bootstrap_lineage_changed("catalog key", baseline_hash, &catalog_key);
+
+    let mut device_route = bootstrap_lineage_fixture();
+    device_route
+        .devices
+        .iter_mut()
+        .find(|device| device.is_active())
+        .expect("active device exists")
+        .device_route = DeviceRouteId::from_bytes([0x52; 16]);
+    assert_bootstrap_lineage_changed("active device route", baseline_hash, &device_route);
+
+    let mut command_epoch = bootstrap_lineage_fixture();
+    command_epoch
+        .devices
+        .iter_mut()
+        .find(|device| device.is_active())
+        .expect("active device exists")
+        .command
+        .epoch = 2;
+    assert_bootstrap_lineage_changed("command epoch", baseline_hash, &command_epoch);
+
+    let mut command_key = bootstrap_lineage_fixture();
+    command_key
+        .devices
+        .iter_mut()
+        .find(|device| device.is_active())
+        .expect("active device exists")
+        .command
+        .key = Some(secret(0x72));
+    assert_bootstrap_lineage_changed("command key", baseline_hash, &command_key);
+
+    let mut reply_epoch = bootstrap_lineage_fixture();
+    reply_epoch
+        .devices
+        .iter_mut()
+        .find(|device| device.is_active())
+        .expect("active device exists")
+        .reply
+        .epoch = 2;
+    assert_bootstrap_lineage_changed("reply epoch", baseline_hash, &reply_epoch);
+
+    let mut reply_key = bootstrap_lineage_fixture();
+    reply_key
+        .devices
+        .iter_mut()
+        .find(|device| device.is_active())
+        .expect("active device exists")
+        .reply
+        .key = Some(secret(0x73));
+    assert_bootstrap_lineage_changed("reply key", baseline_hash, &reply_key);
+
+    let conversation_route =
+        bootstrap_lineage_fixture_with(StreamRouteId::from_bytes([0x33; 16]), secret(0x62));
+    assert_bootstrap_lineage_changed("conversation route", baseline_hash, &conversation_route);
+
+    let conversation_epoch =
+        with_current_conversation_epoch(&bootstrap_lineage_fixture(), 0x62, 3, 4);
+    assert_bootstrap_lineage_changed("conversation epoch", baseline_hash, &conversation_epoch);
+
+    let conversation_key =
+        bootstrap_lineage_fixture_with(StreamRouteId::from_bytes([0x31; 16]), secret(0x64));
+    assert_bootstrap_lineage_changed("conversation key", baseline_hash, &conversation_key);
+}
+
+#[test]
+fn bootstrap_lineage_ignores_retention_owner_while_present_and_after_release() {
+    let owner = retention_owner(
+        RetiredKeyOwnerKind::Publication,
+        [0x8f; 16],
+        KeyPurpose::Catalog,
+        None,
+        1,
+    );
+    let baseline = bootstrap_lineage_fixture();
+    let baseline_hash = bootstrap_lineage_hash(&baseline);
+    let owned = baseline
+        .acquire_retired_shared_key_owner(owner)
+        .expect("acquire owner on an existing retired catalog key");
+    assert!(
+        owned.has_retention_owner_for_test(owner),
+        "owner must actually exist before the exclusion assertion"
+    );
+    assert_eq!(bootstrap_lineage_hash(&owned), baseline_hash);
+
+    let released = owned
+        .release_retired_shared_key_owner(owner)
+        .expect("release existing retired catalog owner");
+    assert!(
+        !released.has_retention_owner_for_test(owner),
+        "released owner must actually be absent"
+    );
+    assert_eq!(bootstrap_lineage_hash(&released), baseline_hash);
+}
+
+#[test]
+fn bootstrap_lineage_ignores_retired_shared_key_gc_and_tombstones() {
+    let baseline = bootstrap_lineage_fixture();
+    let baseline_hash = bootstrap_lineage_hash(&baseline);
+    assert_eq!(baseline.retired_key_count_for_test(), 6);
+
+    let tombstoned = baseline
+        .prune_expired_retired_keys(10_000 + RETIRED_KEY_RETENTION_MS)
+        .expect("collect the first retired shared-key generation");
+    assert_eq!(
+        tombstoned.retired_key_count_for_test(),
+        3,
+        "first-generation retired shared secrets must actually be collected"
+    );
+    let tombstone_probe = retention_owner(
+        RetiredKeyOwnerKind::Replay,
+        [0x90; 16],
+        KeyPurpose::Catalog,
+        None,
+        1,
+    );
+    let tombstoned = tombstoned
+        .release_retired_shared_key_owner(tombstone_probe)
+        .expect("exact release retry proves the collected target tombstone exists");
+    assert_eq!(
+        bootstrap_lineage_hash(&tombstoned),
+        baseline_hash,
+        "retired shared-key GC and its tombstone must not fork current lineage"
+    );
+}
+
+#[test]
+fn bootstrap_lineage_ignores_revoked_device_directed_secret_scrub() {
+    let first_stream = StreamRouteId::from_bytes([0x31; 16]);
+    let second_stream = StreamRouteId::from_bytes([0x41; 16]);
+    let mut retained = bootstrap_lineage_fixture()
+        .prune_expired_retired_keys(10_000 + RETIRED_KEY_RETENTION_MS)
+        .expect("collect the first retired shared-key generation");
+    for owner in [
+        retention_owner(
+            RetiredKeyOwnerKind::Snapshot,
+            [0xa1; 16],
+            KeyPurpose::Catalog,
+            None,
+            2,
+        ),
+        retention_owner(
+            RetiredKeyOwnerKind::Snapshot,
+            [0xa2; 16],
+            KeyPurpose::ConversationDek,
+            Some(first_stream),
+            2,
+        ),
+        retention_owner(
+            RetiredKeyOwnerKind::Snapshot,
+            [0xa3; 16],
+            KeyPurpose::ConversationDek,
+            Some(second_stream),
+            2,
+        ),
+    ] {
+        retained = retained
+            .acquire_retired_shared_key_owner(owner)
+            .expect("pin second-generation retired shared key during directed-secret scrub");
+    }
+    assert_eq!(retained.retired_key_count_for_test(), 3);
+    assert_eq!(
+        retained
+            .retained_retired_secret_count()
+            .expect("count retained shared and directed secrets before scrub"),
+        5
+    );
+    let baseline_hash = bootstrap_lineage_hash(&retained);
+
+    let scrubbed = retained
+        .prune_expired_retired_keys(20_000 + RETIRED_KEY_RETENTION_MS)
+        .expect("scrub revoked-device directed secrets while owners pin shared history");
+    assert_eq!(
+        scrubbed.retired_key_count_for_test(),
+        3,
+        "pinned shared history must remain present to isolate directed-secret scrub"
+    );
+    assert_eq!(
+        scrubbed
+            .retained_retired_secret_count()
+            .expect("count retained secrets after revoked-device scrub"),
+        3,
+        "only the revoked device command/reply secrets must be removed"
+    );
+    assert_eq!(
+        bootstrap_lineage_hash(&scrubbed),
+        baseline_hash,
+        "revoked-device directed-secret scrub must not fork active lineage"
+    );
 }
 
 #[test]
@@ -2022,7 +2358,36 @@ pub(crate) async fn complete_active_zero_cut_transition(store: &RuntimeStoreHand
     let operation_id = recovery.transition.operation_id;
     let recipient = recovery.transition.recipients[0];
     let key_revision = recovery.transition.to_revision;
-    let canonical_update_set = format!("test-key-update-{operation_id:?}").into_bytes();
+    let device_route = DeviceRouteId::from_bytes(recipient.device_route);
+    let global = store
+        .load_global_key_state()
+        .await
+        .expect("load zero-cut global key state")
+        .expect("zero-cut global key state exists");
+    let updates = global
+        .install_directory_view(device_route)
+        .expect("render zero-cut exact key slots")
+        .into_iter()
+        .map(|view| KeyUpdateV1 {
+            key_directory_revision: KeyDirectoryRevision::new(key_revision),
+            key_id: KeyId {
+                purpose: view.purpose,
+                epoch: view.epoch,
+            },
+            device_route,
+            stream_route: view.stream_route,
+            enc: vec![0xa5; 32],
+            wrapped_key: vec![0x5a; 48],
+            signature: Ed25519Signature([0x7f; 64]),
+        })
+        .collect();
+    let canonical_update_set = KeyUpdateSetV1 {
+        key_directory_revision: KeyDirectoryRevision::new(key_revision),
+        device_route,
+        updates,
+    }
+    .canonical_bytes()
+    .expect("encode canonical zero-cut key update fixture");
     store
         .mark_key_transition_rotated(operation_id)
         .await
@@ -2046,18 +2411,35 @@ pub(crate) async fn complete_active_zero_cut_transition(store: &RuntimeStoreHand
         .mark_key_barriers_committed(operation_id)
         .await
         .expect("commit empty old-audience barrier set");
-    store
-        .acknowledge_key_update(super::key_transition::AcknowledgeKeyUpdate {
-            operation_id,
-            recipient,
-            key_revision,
-            update_hash: super::key_transition::canonical_update_hash(&canonical_update_set)
-                .expect("hash test key update"),
-            canonical_ack: b"test-key-update-ack".to_vec(),
-            acknowledged_at_ms: 0,
-        })
+    let persisted = store
+        .load_active_key_transition()
         .await
-        .expect("ack zero-cut key update");
+        .expect("load zero-cut update before ACK")
+        .expect("zero-cut transition remains active")
+        .updates
+        .into_iter()
+        .find(|update| update.recipient == recipient)
+        .expect("zero-cut target update exists");
+    if persisted.lifecycle == super::key_transition::KeyUpdateLifecycle::Frozen {
+        store
+            .acknowledge_key_update(super::key_transition::AcknowledgeKeyUpdate {
+                operation_id,
+                recipient,
+                key_revision,
+                update_hash: super::key_transition::canonical_update_hash(&canonical_update_set)
+                    .expect("hash test key update"),
+                canonical_ack: b"test-key-update-ack".to_vec(),
+                acknowledged_at_ms: 0,
+            })
+            .await
+            .expect("ack zero-cut key update");
+    } else {
+        assert_eq!(
+            persisted.lifecycle,
+            super::key_transition::KeyUpdateLifecycle::Acked,
+            "PairResponseReceived 可预先 Ack first-device bootstrap target"
+        );
+    }
     store
         .complete_key_transition(operation_id)
         .await

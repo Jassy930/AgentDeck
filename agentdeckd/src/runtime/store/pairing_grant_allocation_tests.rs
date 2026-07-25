@@ -7,14 +7,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentdeck_crypto::{SigningKey, sha256, sign_pair_response_received, sign_tbs};
-use agentdeck_protocol::e2ee::{KeyId, PairResponseReceivedV1};
+use agentdeck_protocol::e2ee::{KeyId, KeyUpdateSetV1, KeyUpdateV1, PairResponseReceivedV1};
 use agentdeck_protocol::relay_v2::frame::{
     GrantCommitted, OpaqueRouteFrame, PairRouteCloseOutcome, PairRouteClosed, RelayFrameBody,
     RetireMachine, RevocationCommitted,
 };
 use agentdeck_protocol::relay_v2::{
-    DeviceRevocation, DeviceRouteId, Ed25519Signature, GrantSerial, RELAY_PROTOCOL_VERSION,
-    RelayGrant, RootKeyId, TrustEpoch, decode, encode,
+    DeviceRevocation, DeviceRouteId, Ed25519Signature, GrantSerial, KeyDirectoryRevision,
+    RELAY_PROTOCOL_VERSION, RelayGrant, RootKeyId, TrustEpoch, decode, encode,
 };
 use agentdeck_protocol::runtime::StreamCursor;
 use tokio::sync::Semaphore;
@@ -114,15 +114,42 @@ async fn complete_active_membership_transition_with_rotation(
     assert!(recovery.updates.is_empty());
     let transition = recovery.transition;
     let operation_id = transition.operation_id;
+    let global = store
+        .load_global_key_state()
+        .await
+        .expect("load membership key state for canonical update fixture")
+        .expect("membership key state exists");
     let updates = transition
         .recipients
         .iter()
         .map(|recipient| {
-            let canonical_update_set = format!(
-                "renewal-fixture-update-{:02x}-{}",
-                recipient.device_route[0], transition.to_revision
-            )
-            .into_bytes();
+            let device_route = DeviceRouteId::from_bytes(recipient.device_route);
+            let entries = global
+                .install_directory_view(device_route)
+                .expect("render exact membership key slots")
+                .into_iter()
+                .map(|view| KeyUpdateV1 {
+                    key_directory_revision: KeyDirectoryRevision::new(transition.to_revision),
+                    key_id: KeyId {
+                        purpose: view.purpose,
+                        epoch: view.epoch,
+                    },
+                    device_route,
+                    stream_route: view.stream_route,
+                    // 该 Store fixture 只验证 canonical shape 与稳定 slot 轴；真实
+                    // HPKE/签名 authority 由 remote::transition production tests 覆盖。
+                    enc: vec![0xa5; 32],
+                    wrapped_key: vec![0x5a; 48],
+                    signature: Ed25519Signature([0x7f; 64]),
+                })
+                .collect();
+            let canonical_update_set = KeyUpdateSetV1 {
+                key_directory_revision: KeyDirectoryRevision::new(transition.to_revision),
+                device_route,
+                updates: entries,
+            }
+            .canonical_bytes()
+            .expect("encode canonical membership key update fixture");
             (
                 *recipient,
                 canonical_update_set.clone(),
@@ -334,23 +361,44 @@ async fn complete_active_membership_transition_with_rotation(
         .await
         .expect("commit exact membership barrier set");
     for (recipient, canonical_update_set, _) in &updates {
-        next_time(clock);
-        store
-            .acknowledge_key_update(super::key_transition::AcknowledgeKeyUpdate {
-                operation_id,
-                recipient: *recipient,
-                key_revision: transition.to_revision,
-                update_hash: super::key_transition::canonical_update_hash(canonical_update_set)
-                    .expect("hash membership key update"),
-                canonical_ack: format!(
-                    "renewal-fixture-update-ack-{:02x}-{}",
-                    recipient.device_route[0], transition.to_revision
-                )
-                .into_bytes(),
-                acknowledged_at_ms: 0,
-            })
+        let persisted = store
+            .load_active_key_transition()
             .await
-            .expect("ack membership key update");
+            .expect("load membership update before ACK")
+            .expect("membership transition remains active")
+            .updates
+            .into_iter()
+            .find(|update| update.recipient == *recipient)
+            .expect("membership recipient update exists");
+        if persisted.lifecycle == super::key_transition::KeyUpdateLifecycle::Frozen {
+            next_time(clock);
+            store
+                .acknowledge_key_update(super::key_transition::AcknowledgeKeyUpdate {
+                    operation_id,
+                    recipient: *recipient,
+                    key_revision: transition.to_revision,
+                    update_hash: super::key_transition::canonical_update_hash(canonical_update_set)
+                        .expect("hash membership key update"),
+                    canonical_ack: format!(
+                        "renewal-fixture-update-ack-{:02x}-{}",
+                        recipient.device_route[0], transition.to_revision
+                    )
+                    .into_bytes(),
+                    acknowledged_at_ms: 0,
+                })
+                .await
+                .expect("ack membership key update");
+        } else {
+            assert_eq!(
+                persisted.lifecycle,
+                super::key_transition::KeyUpdateLifecycle::Acked,
+                "PairResponseReceived 只可预先 Ack bootstrap target"
+            );
+            assert_eq!(
+                transition.target,
+                super::key_transition::KeyTransitionTarget::Device(*recipient)
+            );
+        }
         for (cut_index, (cut, _, _, _)) in barrier_materials.iter().enumerate() {
             let authorization_hash = if transition.operation
                 == super::key_transition::KeyTransitionOperation::Add

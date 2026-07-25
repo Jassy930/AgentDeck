@@ -1087,8 +1087,8 @@ impl ConnectionWrite {
     /// daemon-private publication binding metadata；transport 不得从 Runtime JSON
     /// 重建这些轴，也不得把它序列化进本地 IPC。
     #[must_use]
-    pub(crate) const fn stream_binding(&self) -> Option<super::store::StreamBindingPermit> {
-        self.stream_binding
+    pub(crate) fn stream_binding(&self) -> Option<super::store::StreamBindingPermit> {
+        self.stream_binding.clone()
     }
 
     /// 返回可与 `cancelled` 的可变借用并行使用的共享 encoded frame。
@@ -1531,7 +1531,7 @@ impl ConnectionRegistry {
                     .send(ConnectionWrite {
                         bytes: queued.frame.bytes.clone(),
                         kind: queued.frame.kind,
-                        stream_binding: queued.frame.stream_binding,
+                        stream_binding: queued.frame.stream_binding.clone(),
                         acknowledged: Some(acknowledged),
                     })
                     .await

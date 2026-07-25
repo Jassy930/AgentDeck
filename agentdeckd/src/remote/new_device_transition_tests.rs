@@ -44,7 +44,8 @@ use crate::runtime::store::key_transition::{
 use crate::runtime::store::{
     ConfigureConversation, ConfigureConversationOutcome, FrozenPublication, IdempotencyOwner,
     PublicationPayloadKind, ReadySnapshotReference, RemoteReplyAuthorization, RuntimeId,
-    RuntimeIdKind, RuntimeStoreError, active_authorization_store_with_pending_transition_for_test,
+    RuntimeIdKind, StreamBindingPermit,
+    active_authorization_store_with_pending_transition_for_test,
     pending_new_device_transition_fixture_for_test,
 };
 use crate::runtime::{AgentRouter, RuntimeCore};
@@ -344,6 +345,17 @@ impl DirectedReplySealer for ObservingTransitionSealer {
             .await
     }
 
+    async fn seal_stream_binding_exact(
+        &self,
+        authorization: &RemoteReplyAuthorization,
+        route: DirectedReplyRoute,
+        permit: StreamBindingPermit,
+    ) -> Result<SignedSealedBlobV1, RemoteLinkError> {
+        self.inner
+            .seal_stream_binding_exact(authorization, route, permit)
+            .await
+    }
+
     async fn mark_transition_snapshot_flushed(
         &self,
         permit: TransitionSnapshotPermit,
@@ -620,7 +632,7 @@ async fn assert_transition_fenced_before_core(
 }
 
 #[tokio::test]
-async fn active_transition_fences_business_until_required_acks_release_the_slot() {
+async fn bootstrap_receipt_releases_zero_cut_transition_without_redundant_key_update_ack() {
     let root = tempfile::tempdir().expect("create active-transition fence root");
     #[cfg(unix)]
     {
@@ -692,36 +704,20 @@ async fn active_transition_fences_business_until_required_acks_release_the_slot(
 
     assert!(matches!(
         transition.handle().drive_to_business_ready().await,
-        Ok(TransitionReadiness::ControlPlaneReady { barrier_count: 0 })
+        Ok(TransitionReadiness::BusinessReady { barrier_count: 0 })
     ));
-    let committed = store
-        .load_active_key_transition()
-        .await
-        .expect("load barrier-committed transition")
-        .expect("required KeyUpdateAck remains outstanding");
-    assert_eq!(
-        committed.transition.phase,
-        KeyTransitionPhase::BarriersCommitted
-    );
-    assert!(committed.updates.iter().any(|update| {
-        update.lifecycle == KeyUpdateLifecycle::Frozen && update.canonical_ack.is_none()
-    }));
     assert!(
         store
-            .check_remote_transition_ingress(RemoteTransitionIngressClass::ControlPlaneReady)
+            .load_active_key_transition()
             .await
-            .is_ok(),
-        "BarriersCommitted must enable only the RemoteLink key-control plane"
+            .expect("load completed zero-cut transition")
+            .is_none(),
+        "DeviceSign PairResponseReceived proof must release the exact bootstrap target"
     );
-    assert!(
-        matches!(
-            store
-                .check_remote_transition_ingress(RemoteTransitionIngressClass::Business)
-                .await,
-            Err(RuntimeStoreError::InvalidStateTransition)
-        ),
-        "BarriersCommitted is not business-ready until every required ACK releases the active slot"
-    );
+    store
+        .check_remote_transition_ingress(RemoteTransitionIngressClass::Business)
+        .await
+        .expect("zero-cut bootstrap receipt makes business ingress ready");
 
     transition
         .shutdown()
@@ -991,36 +987,11 @@ async fn exact_snapshot_subscribe_is_the_only_business_capability_during_active_
             cursor: StreamCursor::BeforeFirst,
         },
     };
-    let before_ack = admitted_route(
-        &dispatcher,
-        signed_runtime_send(
-            SignedRuntimeSendAxes {
-                machine_route,
-                device_route: fixture.device_route,
-                request_route: RequestRouteId::from_bytes([0xe1; 16]),
-                message_id: "transition-snapshot-before-key-ack",
-                counter: 1,
-            },
-            exact_subscribe(),
-            &command_key,
-            &device_sign,
-        ),
-    )
-    .await;
-    assert_transition_fenced_before_core(before_ack, &handler, &core, &mut mode).await;
-
-    store
-        .acknowledge_key_update(AcknowledgeKeyUpdate {
-            operation_id: committed.transition.operation_id,
-            recipient: update.recipient,
-            key_revision: update.key_revision,
-            update_hash: canonical_update_hash(&update.canonical_update_set)
-                .expect("hash exact new-device KeyUpdate"),
-            canonical_ack: b"exact-transition-snapshot-key-update-ack".to_vec(),
-            acknowledged_at_ms: committed.transition.state_changed_at_ms,
-        })
-        .await
-        .expect("ack exact new-device KeyUpdate");
+    assert_eq!(update.lifecycle, KeyUpdateLifecycle::Acked);
+    assert!(
+        update.canonical_ack.is_some(),
+        "DeviceSign receipt must pre-ACK only the bootstrap target update"
+    );
 
     let nonexistent = RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0xf1; 16])
         .expect("construct nonexistent conversation id");
@@ -1074,7 +1045,7 @@ async fn exact_snapshot_subscribe_is_the_only_business_capability_during_active_
                 .expect("reload exact new-device authorization"),
         )
         .await
-        .expect("authorization remains current after KeyUpdate ACK");
+        .expect("authorization remains current after bootstrap receipt ACK");
     let permit = store
         .resolve_transition_snapshot_permit(TransitionSnapshotRequest::new(
             current,

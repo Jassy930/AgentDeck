@@ -48,7 +48,7 @@ mod pairing_delivery_tests;
 pub(crate) use pairing_delivery_tests::{
     active_authorization_store_for_test,
     active_authorization_store_with_pending_transition_for_test,
-    active_authorization_store_with_permissions_for_test,
+    active_authorization_store_with_permissions_for_test, matching_bootstrap_update_for_test,
     pending_new_device_transition_fixture_for_test,
     production_aligned_active_authorization_store_for_test, revoking_authorization_store_for_test,
     two_active_authorization_store_with_permissions_for_test,

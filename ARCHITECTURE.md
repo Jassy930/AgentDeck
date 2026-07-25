@@ -591,6 +591,12 @@ conversation/key，不能伪造身份连续性。
 - `PairResponse.info` 同时绑定 canonical response hash、HPKE info、MachineDataSign TBS 与 receipt TBS。
   DeviceGrant、DeviceAuthorization、bootstrap KeyDirectory 与 InstallGrant 都冻结为 byte-stable artifact；只有
   验证 exact DeviceSign-signed `PairResponseReceived` 才推进 delivered，RouteAccepted 从不代表业务成功。
+- `PairResponseReceived` 还必须与 exact Add/Renew key transition 形成 durable bootstrap install proof。proof
+  只授权其 device route/grant serial/revision 对应的 target ACK；其他 recipient 仍须各自提交普通
+  `KeyUpdateAckV1`。首台设备的 zero-cut Add 可由该 proof 直接完成并进入 `BusinessReady`，不得依赖冗余 ACK。
+- fresh Close ACK、pairing secret scrub 与 Close outbox 删除属于同一事务；receipt `retain_until_ms` 从 Close
+  ACK 重新起算完整 30 天，原 `created_at_ms` 不改并纳入重签 metadata MAC。exact Close replay 在读取 wall
+  clock 前只读返回且不再次续期；clock regression 零写拒绝。
 - shared control 只能有一个 owner。activation gate 覆盖 pairing lane 安装；pairing drain 使用 10 秒绝对
   deadline并可被 shutdown 取消，完成后原子交给 retirement。Active 失败才 reacquire；RetirePending 保持
   control owner。trust reset 是 singleflight；create/revoke caller 取消后 waiter 必须回收。
@@ -623,6 +629,27 @@ conversation/key，不能伪造身份连续性。
 - P4.5 code/test 由 `c6ef387`、`88b3c42` 收口；P4.5 收口时 Runtime wire 为 v4，physical schema 单调推进到
   v14/35 表。v11 新增 authenticated replay/counter state，v12 新增 CounterGuard manifest、key transition 与
   key-update outbox，v13/v14 只收紧 publication rollover 与 key-update 容量形态，不旋转 crypto context。
+- ADKT sealed transition 写 codec 为 v3，继续严格读取 v1/v2；该 row-codec 变化不提升 physical schema、
+  Runtime、Relay 或 E2EE 版本。pairing confirm 与 Add/Renew transition 同事务冻结完整
+  `global_key_state_hash` 和稳定 `stable_key_lineage_hash`；后者认证同 revision 内不可变的 active device
+  roster、current catalog/conversation/directed epoch 与真实 key material，故意排除 retention owner、retired-key
+  tombstone 和 revoked-device secret GC。v3 proof 绑定该 confirm anchor、exact pairing/route/grant/revision/
+  transcript 与稳定 `key_slot_digest`。slot digest 只包含 revision/device route/count/purpose/epoch/stream route，
+  不包含随机 HPKE `enc`/`wrapped_key`；proof/binding `Debug` 必须完整 redacted。
+- 当前写入或读回的 ADKT v3 Add/Renew 必须同时携带非零完整 hash 与 stable lineage；无 lineage 的 v3
+  不能伪装成 legacy。ADKT v1/v2 只有在当前 global revision 与 receipt binding revision 相等、且完整
+  `global_key_state_hash` 仍逐字一致时，才可从当前 authenticated state 回填 stable digest。若 revision 已经
+  前进，旧格式没有足够证据重建历史 key material commitment，必须零写 fail-close，不能写入
+  `stable_key_lineage_hash=None` 后继续 Close。
+- bootstrap proof 只能存在于 matching Add/Renew transition，并禁止后续 cancel。普通 KeyUpdateAck 先到时保留
+  真实 ACK，fresh receipt 不得早于该 ACK；receipt placeholder 先到后可由普通 ACK 升级 evidence，但不得移动
+  Completed terminal causal time。transition owner/readback 只接受 exact target 预 ACK，绝不批量 ACK recipients。
+- Delivered pairing 或 Close 尚在时，matching proofful Completed transition 必须 GC pin。ADKT v1/v2 proofless
+  transition 也按 authenticated Delivered pairing 的 device/grant/revision lineage pin；只有同 revision 且完整
+  global-state hash 精确一致时，exact receipt replay 才可原子回填 v3 proof。若旧 transition 对应的 global
+  revision 已经前进，则因缺少历史 key-material commitment 而零写拒绝。若升级前旧实现已 GC
+  transition/update，只有在 v12 audit 证明二者都 absent 时，才允许
+  exact receipt replay 与 Close scrub；不伪造 proof、不接受 fresh delivery，matching update 单独残留按损坏拒绝。
 - publication 唯一合法顺序是 `CounterGuard reserve → seal once → Runtime DB 冻结 exact blob → Relay
   Publish COMMIT → local ACK`。retry、COMMIT outcome unknown 与 restart 都只能重放同一 frozen blob/hash/counter，
   禁止重新 seal 或生成新 publication identity。

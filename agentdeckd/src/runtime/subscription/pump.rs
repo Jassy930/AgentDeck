@@ -349,7 +349,7 @@ async fn run_inner(
         job.message_id.clone(),
         RuntimeReply::SyncComplete(sync),
         None,
-        registration.relay_committed.stream_binding,
+        registration.relay_committed.stream_binding.clone(),
         &job.control,
     )
     .await?;

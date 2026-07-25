@@ -1,7 +1,7 @@
 //! `grantCommitted -> delivered` 的 endpoint receipt CAS 与 durable Close outbox。
 
 use agentdeck_crypto::sha256;
-use agentdeck_protocol::e2ee::{PairInviteV1, PairResponseV1};
+use agentdeck_protocol::e2ee::{KeyDirectoryV1, PairInviteV1, PairResponseV1};
 use agentdeck_protocol::relay_v2::{
     DeviceRouteId, GrantSerial, MachineRouteId, PairRouteId, RelayServerId, TrustEpoch,
 };
@@ -13,6 +13,7 @@ use crate::runtime::model::{
 };
 
 use super::identity::{RuntimeId, RuntimeIdKind};
+use super::key_transition::{KeyTransitionRecipient, PairingBootstrapInstallBinding};
 use super::pairing::{AuthenticatedPairingRow, PairingDirectory, PairingInviteLifecycle};
 use super::pairing_terminal::PairingCloseProjection;
 use super::sqlite::{RuntimeLedger, RuntimeSqlite};
@@ -186,6 +187,169 @@ fn validate_proof(
     Ok(())
 }
 
+pub(super) fn bootstrap_directory(
+    pairing: &AuthenticatedPairingRow,
+) -> Result<(KeyDirectoryV1, &[u8]), RuntimeStoreError> {
+    let canonical = pairing
+        .record
+        .canonical_key_directory_view
+        .as_ref()
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+        .expose_secret();
+    let directory = KeyDirectoryV1::from_canonical_bytes(canonical)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if directory
+        .canonical_bytes()
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+        .as_slice()
+        != canonical
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok((directory, canonical))
+}
+
+fn bootstrap_binding(
+    pairing: &AuthenticatedPairingRow,
+    input: &AcknowledgePairResponseReceived,
+    received_at_ms: u64,
+) -> Result<PairingBootstrapInstallBinding, RuntimeStoreError> {
+    let (directory, canonical_directory) = bootstrap_directory(pairing)?;
+    if directory.revision.value() == 0
+        || directory
+            .entries
+            .first()
+            .is_none_or(|entry| entry.device_route != input.device_route)
+    {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    Ok(PairingBootstrapInstallBinding {
+        pairing_id: *pairing.record.pairing_id.as_bytes(),
+        relay_server_id: *input.relay_server_id.as_bytes(),
+        pair_route: *input.pair_route.as_bytes(),
+        machine_route: *input.machine_route.as_bytes(),
+        device_route: *input.device_route.as_bytes(),
+        grant_serial: input.grant_serial.value(),
+        root_trust_epoch: input.root_trust_epoch.value(),
+        key_revision: directory.revision.value(),
+        expiry_ms: input.expiry_ms,
+        invite_hash: input.invite_hash,
+        request_hash: input.request_hash,
+        grant_hash: input.grant_hash,
+        response_hash: input.response_hash,
+        receipt_hash: input.receipt_hash,
+        device_sign_fingerprint: input.device_sign_fingerprint,
+        info_sha256: input.info_sha256,
+        aad_sha256: input.aad_sha256,
+        tbs_sha256: input.tbs_sha256,
+        key_directory_hash: sha256(canonical_directory),
+        global_key_state_hash: pairing
+            .record
+            .global_key_state_hash
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
+        key_slot_digest: super::key_transition::key_directory_slot_digest(&directory)?,
+        canonical_receipt: input.canonical_receipt.clone(),
+        received_at_ms,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn bootstrap_binding_for_test(
+    pairing: &AuthenticatedPairingRow,
+    input: &AcknowledgePairResponseReceived,
+    received_at_ms: u64,
+) -> Result<PairingBootstrapInstallBinding, RuntimeStoreError> {
+    bootstrap_binding(pairing, input, received_at_ms)
+}
+
+pub(super) fn ensure_durable_bootstrap_install_proof(
+    connection: &rusqlite::Connection,
+    key_bundle: &super::cipher::RuntimeKeyBundle,
+    database_id: [u8; 16],
+    pairing: &AuthenticatedPairingRow,
+) -> Result<super::key_transition::PairingBootstrapInstallProofRead, RuntimeStoreError> {
+    if pairing.record.lifecycle != PairingInviteLifecycle::Delivered
+        || pairing
+            .record
+            .delivery_receipt_hash
+            .is_none_or(|hash| hash == [0; 32])
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let (directory, _) = bootstrap_directory(pairing)?;
+    let response = PairResponseV1::from_canonical_bytes(
+        pairing
+            .record
+            .canonical_pair_response
+            .as_ref()
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+            .expose_secret(),
+    )
+    .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let plaintext_device = directory
+        .entries
+        .first()
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+        .device_route;
+    let install = pairing
+        .record
+        .canonical_install_frame
+        .as_deref()
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let (grant, _) = super::pairing_grant::exact_install_frame(install)?;
+    if grant.device_route != plaintext_device {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let proof = super::key_transition::load_pairing_bootstrap_install_proof(
+        connection,
+        key_bundle,
+        database_id,
+        KeyTransitionRecipient {
+            device_route: *grant.device_route.as_bytes(),
+            grant_serial: grant.grant_serial.value(),
+        },
+        directory.revision.value(),
+    )?;
+    let super::key_transition::PairingBootstrapInstallProofRead::Verified(proof) = proof else {
+        return Ok(
+            super::key_transition::PairingBootstrapInstallProofRead::LegacyTransitionCollected,
+        );
+    };
+    let binding = &proof.binding;
+    if pairing.record.delivery_receipt_hash != Some(binding.receipt_hash)
+        || pairing.record.state_changed_at_ms != binding.received_at_ms
+    {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    let input = AcknowledgePairResponseReceived {
+        pairing_id: pairing.record.pairing_id,
+        canonical_receipt: binding.canonical_receipt.clone(),
+        receipt_hash: binding.receipt_hash,
+        request_hash: binding.request_hash,
+        grant_hash: binding.grant_hash,
+        response_hash: binding.response_hash,
+        relay_server_id: RelayServerId::from_bytes(binding.relay_server_id),
+        pair_route: PairRouteId::from_bytes(binding.pair_route),
+        invite_hash: binding.invite_hash,
+        expiry_ms: binding.expiry_ms,
+        machine_route: MachineRouteId::from_bytes(binding.machine_route),
+        device_route: DeviceRouteId::from_bytes(binding.device_route),
+        grant_serial: GrantSerial::new(binding.grant_serial),
+        root_trust_epoch: TrustEpoch::new(binding.root_trust_epoch),
+        device_sign_fingerprint: binding.device_sign_fingerprint,
+        info_sha256: binding.info_sha256,
+        aad_sha256: binding.aad_sha256,
+        tbs_sha256: binding.tbs_sha256,
+    };
+    validate_proof(pairing, &input)?;
+    if response.canonical_sha256().ok() != Some(binding.response_hash)
+        || bootstrap_binding(pairing, &input, pairing.record.state_changed_at_ms)? != *binding
+    {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    Ok(super::key_transition::PairingBootstrapInstallProofRead::Verified(proof))
+}
+
 fn classify_existing(
     directory: &PairingDirectory,
     input: &AcknowledgePairResponseReceived,
@@ -281,15 +445,33 @@ pub(crate) fn acknowledge_pair_response_received(
     }
     let directory =
         super::pairing::load_directory(&state.connection, &state.key_bundle, state.database_id)?;
-    if let Some(replayed) = classify_existing(&directory, &input)? {
-        return Ok(replayed);
-    }
+    let replay_needs_backfill = if let Some(replayed) = classify_existing(&directory, &input)? {
+        let pairing = directory
+            .pairings
+            .iter()
+            .find(|pairing| pairing.record.pairing_id == input.pairing_id)
+            .ok_or(RuntimeStoreError::PairingConflict)?;
+        match ensure_durable_bootstrap_install_proof(
+            &state.connection,
+            &state.key_bundle,
+            state.database_id,
+            pairing,
+        ) {
+            Ok(_) => return Ok(replayed),
+            Err(RuntimeStoreError::InvalidStateTransition) => true,
+            Err(error) => return Err(error),
+        }
+    } else {
+        false
+    };
     let pairing = directory
         .pairings
         .iter()
         .find(|pairing| pairing.record.pairing_id == input.pairing_id)
         .ok_or(RuntimeStoreError::PairingConflict)?;
-    validate_delivery_time(pairing, now_ms)?;
+    if !replay_needs_backfill {
+        validate_delivery_time(pairing, now_ms)?;
+    }
     super::sqlite::admit_safety_write(
         &state.connection,
         &state.key_bundle,
@@ -304,6 +486,77 @@ pub(crate) fn acknowledge_pair_response_received(
     let directory =
         super::pairing::load_directory(&transaction, &state.key_bundle, state.database_id)?;
     if let Some(replayed) = classify_existing(&directory, &input)? {
+        let pairing = directory
+            .pairings
+            .iter()
+            .find(|pairing| pairing.record.pairing_id == input.pairing_id)
+            .ok_or(RuntimeStoreError::PairingConflict)?;
+        match ensure_durable_bootstrap_install_proof(
+            &transaction,
+            &state.key_bundle,
+            state.database_id,
+            pairing,
+        ) {
+            Ok(_) => return Ok(replayed),
+            Err(RuntimeStoreError::InvalidStateTransition) => {}
+            Err(error) => return Err(error),
+        }
+        let mut next = directory.ledger.clone();
+        let binding = bootstrap_binding(pairing, &input, pairing.record.state_changed_at_ms)?;
+        let _ = super::key_transition::reconcile_pairing_bootstrap_install_proof_in_transaction(
+            &transaction,
+            &state.key_bundle,
+            state.database_id,
+            &mut next,
+            binding,
+            super::key_transition::PairingBootstrapProofReconcileMode::LegacyReplayBackfill,
+        )?;
+        let _ = super::sqlite::update_runtime_ledger(
+            &transaction,
+            &state.key_bundle,
+            state.database_id,
+            &directory.ledger,
+            &next,
+        )?;
+        config
+            .fault_injector
+            .before_operation(RuntimeStoreOperation::AcknowledgePairResponseReceivedBeforeCommit)?;
+        super::sqlite::commit_transaction(
+            transaction,
+            RuntimeCommitOperation::AcknowledgePairResponseReceived,
+        )?;
+        super::sqlite::latch_post_commit_capacity(state, config);
+        config
+            .fault_injector
+            .before_operation(RuntimeStoreOperation::AcknowledgePairResponseReceivedAfterCommit)
+            .map_err(|_| RuntimeStoreError::CommitOutcomeUnknown {
+                operation: RuntimeCommitOperation::AcknowledgePairResponseReceived,
+            })?;
+        let directory = super::pairing::load_directory(
+            &state.connection,
+            &state.key_bundle,
+            state.database_id,
+        )?;
+        let Some(replayed) = classify_existing(&directory, &input)? else {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        };
+        let pairing = directory
+            .pairings
+            .iter()
+            .find(|pairing| pairing.record.pairing_id == input.pairing_id)
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        let proof = ensure_durable_bootstrap_install_proof(
+            &state.connection,
+            &state.key_bundle,
+            state.database_id,
+            pairing,
+        )?;
+        if !matches!(
+            proof,
+            super::key_transition::PairingBootstrapInstallProofRead::Verified(_)
+        ) {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
         return Ok(replayed);
     }
     let pairing = directory
@@ -366,11 +619,20 @@ pub(crate) fn acknowledge_pair_response_received(
         now_ms,
         now_ms,
     )?;
-    let next = next_ledger(
+    let mut next = next_ledger(
         &directory.ledger,
         pairing.sealed_state_bytes,
         sealed_pairing.len(),
         sealed_close.len(),
+    )?;
+    let binding = bootstrap_binding(pairing, &input, now_ms)?;
+    let _ = super::key_transition::reconcile_pairing_bootstrap_install_proof_in_transaction(
+        &transaction,
+        &state.key_bundle,
+        state.database_id,
+        &mut next,
+        binding,
+        super::key_transition::PairingBootstrapProofReconcileMode::FreshDelivery,
     )?;
 
     if transaction.execute(
@@ -446,6 +708,23 @@ pub(crate) fn acknowledge_pair_response_received(
     else {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     };
+    let pairing = directory
+        .pairings
+        .iter()
+        .find(|pairing| pairing.record.pairing_id == input.pairing_id)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let proof = ensure_durable_bootstrap_install_proof(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        pairing,
+    )?;
+    if !matches!(
+        proof,
+        super::key_transition::PairingBootstrapInstallProofRead::Verified(_)
+    ) {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
     Ok(AcknowledgePairResponseReceivedOutcome::Delivered { close })
 }
 

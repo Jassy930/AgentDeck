@@ -1406,21 +1406,13 @@ pub(super) fn register_transition_snapshot_barrier_on_worker(
             publication_scope,
         )?
         .ok_or(RuntimeStoreError::PublicationMismatch)?;
-        let stream_binding = super::super::publication::capture_stream_binding_permit(
+        let stream_binding = super::super::publication::capture_transition_stream_binding_permit(
             &transaction,
             &state.key_bundle,
             state.database_id,
             &publication,
-        )?
-        .ok_or(RuntimeStoreError::PublicationMismatch)?;
-        if stream_binding.publication_stream_id() != permit.publication_stream_id()
-            || stream_binding.generation() != permit.generation()
-            || stream_binding.outer() != committed_outer
-            || stream_binding.inner() != frozen
-            || stream_binding.key_directory_revision() != permit.key_directory_revision()
-        {
-            return Err(RuntimeStoreError::PublicationMismatch);
-        }
+            &permit,
+        )?;
         let conversation_origin = match target {
             RuntimeStreamTarget::Catalog => None,
             RuntimeStreamTarget::Conversation(conversation_id) => Some(

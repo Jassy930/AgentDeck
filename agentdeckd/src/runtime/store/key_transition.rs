@@ -8,7 +8,7 @@
     reason = "P4.5 publisher/RemoteLink wiring consumes this Store substrate in the next slice"
 )]
 
-use agentdeck_protocol::e2ee::{KeyId, KeyPurpose};
+use agentdeck_protocol::e2ee::{KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateSetV1};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::runtime::model::{RuntimeStoreConfig, RuntimeStoreError};
@@ -36,13 +36,17 @@ pub(crate) use completion::{
 pub(crate) use epoch_barrier::authorize_epoch_barrier_identity;
 pub(crate) use integrity::validate_v12_integrity;
 use integrity::{verify_barrier_commit, verify_exact_committed_cuts};
-#[cfg(test)]
-pub(crate) use lifecycle::mark_rotated_preparing_updates;
 pub(crate) use lifecycle::{
     apply_counter_retirement_after_guard_readback, apply_pending_replay_retirement,
     begin_key_transition, canonical_update_hash, ensure_key_transition_slot_available,
     finalize_key_directory_rotation, gc_expired_key_transitions,
     load_pending_counter_retirement_plan, stage_key_transition_in_transaction,
+    stage_key_transition_with_global_lineage_in_transaction,
+};
+#[cfg(test)]
+pub(crate) use lifecycle::{
+    begin_key_transition_with_global_lineage_for_test,
+    collect_completed_key_transition_for_legacy_test, mark_rotated_preparing_updates,
 };
 pub(crate) use snapshot_permit::{
     TransitionSnapshotFlush, TransitionSnapshotFlushRecord, TransitionSnapshotPermit,
@@ -54,8 +58,10 @@ pub(crate) use snapshot_permit::{
     TransitionSnapshotQuery, resolve_transition_snapshot_permit_for_test,
 };
 pub(super) use snapshot_permit::{
+    TransitionStreamBindingCut, TransitionStreamBindingProvenance,
     validate_transition_snapshot_permit_axes_in_transaction,
     validate_transition_snapshot_permit_in_transaction,
+    validate_transition_stream_binding_provenance_in_transaction,
 };
 use storage::*;
 
@@ -86,7 +92,8 @@ const UPDATE_METADATA_DOMAIN: &[u8] = b"runtime.remote.key-update.metadata.v1";
 const TRANSITION_MAGIC: &[u8; 4] = b"ADKT";
 const UPDATE_MAGIC: &[u8; 4] = b"ADKU";
 const LEGACY_TRANSITION_CODEC_VERSION: u8 = 1;
-const TRANSITION_CODEC_VERSION: u8 = 2;
+const PREVIOUS_TRANSITION_CODEC_VERSION: u8 = 2;
+const TRANSITION_CODEC_VERSION: u8 = 3;
 const LEGACY_UPDATE_CODEC_VERSION: u8 = 1;
 const UPDATE_CODEC_VERSION: u8 = 2;
 const MAX_TERMINAL_BASE_MS: u64 = i64::MAX as u64 - KEY_TRANSITION_TOMBSTONE_RETENTION_MS;
@@ -273,6 +280,171 @@ pub(crate) struct StreamAppliedAckRecord {
     pub acknowledged_at_ms: u64,
 }
 
+/// Pairing confirm 与 Add/Renew transition 同事务冻结的 global-key lineage。
+///
+/// `global_key_state_hash` 是 confirm 时完整 ADGK canonical state 的不可变锚；
+/// `stable_key_lineage_hash` 只覆盖同 revision 内不可变的 active roster、epoch
+/// 和 key material。后者故意排除 retention owner、tombstone 与 revoked-secret
+/// GC 状态，避免把合法的 storage-lifecycle mutation 误判为 key fork。
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct KeyTransitionGlobalLineage {
+    pub global_key_state_hash: [u8; 32],
+    pub stable_key_lineage_hash: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for KeyTransitionGlobalLineage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("KeyTransitionGlobalLineage([REDACTED])")
+    }
+}
+
+/// 经过 DeviceSign 验证的 `PairResponseReceived` 与一次 Add/Renew transition
+/// 之间的完整 durable 绑定。它只证明目标设备已经安装 PairResponse 内的目标
+/// KeyDirectory；不能替代其他 recipient 的普通 `KeyUpdateAckV1`。
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct PairingBootstrapInstallBinding {
+    pub pairing_id: [u8; 16],
+    pub relay_server_id: [u8; 16],
+    pub pair_route: [u8; 16],
+    pub machine_route: [u8; 16],
+    pub device_route: [u8; 16],
+    pub grant_serial: u64,
+    pub root_trust_epoch: u64,
+    pub key_revision: u64,
+    pub expiry_ms: u64,
+    pub invite_hash: [u8; 32],
+    pub request_hash: [u8; 32],
+    pub grant_hash: [u8; 32],
+    pub response_hash: [u8; 32],
+    pub receipt_hash: [u8; 32],
+    pub device_sign_fingerprint: [u8; 32],
+    pub info_sha256: [u8; 32],
+    pub aad_sha256: [u8; 32],
+    pub tbs_sha256: [u8; 32],
+    pub key_directory_hash: [u8; 32],
+    pub global_key_state_hash: [u8; 32],
+    pub key_slot_digest: [u8; 32],
+    pub canonical_receipt: Vec<u8>,
+    pub received_at_ms: u64,
+}
+
+impl std::fmt::Debug for PairingBootstrapInstallBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PairingBootstrapInstallBinding([REDACTED])")
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct PairingBootstrapInstallProof {
+    pub operation_id: [u8; 16],
+    pub binding: PairingBootstrapInstallBinding,
+}
+
+impl std::fmt::Debug for PairingBootstrapInstallProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PairingBootstrapInstallProof([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PairingBootstrapProofReconcileMode {
+    FreshDelivery,
+    LegacyReplayBackfill,
+}
+
+pub(crate) enum PairingBootstrapInstallProofRead {
+    Verified(Box<PairingBootstrapInstallProof>),
+    LegacyTransitionCollected,
+}
+
+fn key_purpose_tag(purpose: KeyPurpose) -> u8 {
+    match purpose {
+        KeyPurpose::Catalog => 0,
+        KeyPurpose::ConversationDek => 1,
+        KeyPurpose::DeviceCommandTx => 2,
+        KeyPurpose::DeviceReplyTx => 3,
+    }
+}
+
+// PairResponse 与后续 KeyUpdateSet 会分别执行随机 HPKE 封装；即使明文 key
+// material 相同，`enc`/`wrapped_key` 也不会逐字节相等。这里因此只绑定由
+// authenticated GlobalKeyState 派生、且在 confirm_pairing_grant 时已经与
+// PairResponse 交叉校验过的稳定 slot 轴，不能把随机密文误当成材料等价证明。
+fn append_key_slot(
+    encoded: &mut Vec<u8>,
+    purpose: KeyPurpose,
+    epoch: u64,
+    stream_route: Option<[u8; 16]>,
+) {
+    encoded.push(key_purpose_tag(purpose));
+    encoded.extend_from_slice(&epoch.to_be_bytes());
+    match stream_route {
+        None => encoded.push(0),
+        Some(route) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&route);
+        }
+    }
+}
+
+pub(crate) fn key_directory_slot_digest(
+    directory: &KeyDirectoryV1,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    directory
+        .validate()
+        .map_err(|_| RuntimeStoreError::PublicationMismatch)?;
+    let device_route = directory
+        .entries
+        .first()
+        .ok_or(RuntimeStoreError::PublicationMismatch)?
+        .device_route;
+    let mut encoded = Vec::with_capacity(directory.entries.len() * 128 + 64);
+    encoded.extend_from_slice(b"AgentDeck/PairingBootstrapKeySlotsV1\0");
+    encoded.extend_from_slice(&directory.revision.value().to_be_bytes());
+    encoded.extend_from_slice(device_route.as_bytes());
+    encoded.extend_from_slice(
+        &u16::try_from(directory.entries.len())
+            .map_err(|_| RuntimeStoreError::PayloadTooLarge)?
+            .to_be_bytes(),
+    );
+    for entry in &directory.entries {
+        append_key_slot(
+            &mut encoded,
+            entry.key_id.purpose,
+            entry.key_id.epoch,
+            entry.stream_route.map(|route| *route.as_bytes()),
+        );
+    }
+    let digest = agentdeck_crypto::sha256(&encoded);
+    validate_nonzero(digest)?;
+    Ok(digest)
+}
+
+fn key_update_set_slot_digest(set: &KeyUpdateSetV1) -> Result<[u8; 32], RuntimeStoreError> {
+    set.validate()
+        .map_err(|_| RuntimeStoreError::PublicationMismatch)?;
+    let mut encoded = Vec::with_capacity(set.updates.len() * 128 + 64);
+    encoded.extend_from_slice(b"AgentDeck/PairingBootstrapKeySlotsV1\0");
+    encoded.extend_from_slice(&set.key_directory_revision.value().to_be_bytes());
+    encoded.extend_from_slice(set.device_route.as_bytes());
+    encoded.extend_from_slice(
+        &u16::try_from(set.updates.len())
+            .map_err(|_| RuntimeStoreError::PayloadTooLarge)?
+            .to_be_bytes(),
+    );
+    for update in &set.updates {
+        append_key_slot(
+            &mut encoded,
+            update.key_id.purpose,
+            update.key_id.epoch,
+            update.stream_route.map(|route| *route.as_bytes()),
+        );
+    }
+    let digest = agentdeck_crypto::sha256(&encoded);
+    validate_nonzero(digest)?;
+    Ok(digest)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RemoteTransitionIngressClass {
     /// 只证明 transition 已把所有 EpochBarrier durable 提交，足以启动
@@ -294,6 +466,8 @@ pub(crate) struct KeyTransitionRecord {
     pub phase: KeyTransitionPhase,
     pub terminal: Option<KeyTransitionTerminal>,
     pub recipients: Vec<KeyTransitionRecipient>,
+    pub global_lineage: Option<KeyTransitionGlobalLineage>,
+    pub bootstrap_install_proof: Option<PairingBootstrapInstallProof>,
     pub replay_retirement: Option<ReplayRetirement>,
     /// transition 派生的 shared/reply/recovery counter scope 必须 guard-first
     /// 收口后才可 GC 该 tombstone。
@@ -396,6 +570,9 @@ pub(crate) struct KeyTransitionGcOutcome {
     /// Pending replay retirement 必须先原子收口，不允许 GC 丢失冻结 scope。
     pub replay_retirement_blocked: u64,
     pub counter_retirement_blocked: u64,
+    /// Delivered pairing 或其 Close outbox 尚在时，ADKT proof 仍是延迟 Close
+    /// scrub 的唯一 durable 安装证明，不能先行 GC。
+    pub bootstrap_pairing_blocked: u64,
     pub limit_reached: bool,
 }
 
@@ -431,6 +608,7 @@ pub(crate) enum ReplayRetirementApplyOutcome {
 
 struct AuthenticatedTransition {
     record: KeyTransitionRecord,
+    codec_version: u8,
     sealed_bytes: u64,
     metadata_token: [u8; 32],
 }
@@ -485,6 +663,297 @@ struct RawUpdate {
     metadata_token: Vec<u8>,
 }
 
+fn bootstrap_target(binding: &PairingBootstrapInstallBinding) -> KeyTransitionRecipient {
+    KeyTransitionRecipient {
+        device_route: binding.device_route,
+        grant_serial: binding.grant_serial,
+    }
+}
+
+fn ensure_bootstrap_update_matches(
+    binding: &PairingBootstrapInstallBinding,
+    update: &KeyUpdateRecord,
+) -> Result<(), RuntimeStoreError> {
+    if update.recipient != bootstrap_target(binding) || update.key_revision != binding.key_revision
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    let set = KeyUpdateSetV1::from_canonical_bytes(&update.canonical_update_set)
+        .map_err(|_| RuntimeStoreError::PublicationMismatch)?;
+    if set.device_route.as_bytes() != &binding.device_route
+        || set.key_directory_revision.value() != binding.key_revision
+        || key_update_set_slot_digest(&set)? != binding.key_slot_digest
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    Ok(())
+}
+
+fn ensure_bootstrap_global_lineage_matches(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    transition: &KeyTransitionRecord,
+    binding: &PairingBootstrapInstallBinding,
+) -> Result<(), RuntimeStoreError> {
+    let lineage = transition
+        .global_lineage
+        .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    if lineage.global_key_state_hash != binding.global_key_state_hash {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    let global = super::pairing_grant::load_global_key_state(connection, key_bundle, database_id)?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if transition.phase == KeyTransitionPhase::Complete && global.revision > binding.key_revision {
+        return Ok(());
+    }
+    if global.revision != binding.key_revision {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    let expected = lineage
+        .stable_key_lineage_hash
+        .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    if global.state.pairing_bootstrap_lineage_hash()? != expected {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    Ok(())
+}
+
+fn derive_legacy_bootstrap_global_lineage(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    binding: &PairingBootstrapInstallBinding,
+) -> Result<KeyTransitionGlobalLineage, RuntimeStoreError> {
+    let global = super::pairing_grant::load_global_key_state(connection, key_bundle, database_id)?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    // 旧 ADKT v1/v2 没有独立 stable lineage 锚。只有当前 authenticated state
+    // 仍停在 binding revision，且完整 confirm-time hash 逐字节一致时，才能
+    // 从当前状态建立可持久化的 stable commitment。revision 已前进时没有历史
+    // material commitment 可供重建，必须 fail-closed，禁止写入 stable=None。
+    if global.revision != binding.key_revision
+        || global.directory_hash != binding.global_key_state_hash
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    Ok(KeyTransitionGlobalLineage {
+        global_key_state_hash: binding.global_key_state_hash,
+        stable_key_lineage_hash: Some(global.state.pairing_bootstrap_lineage_hash()?),
+    })
+}
+
+fn exact_bootstrap_proof(
+    transition: &KeyTransitionRecord,
+    binding: PairingBootstrapInstallBinding,
+) -> Result<PairingBootstrapInstallProof, RuntimeStoreError> {
+    let target = bootstrap_target(&binding);
+    if !matches!(
+        (transition.operation, transition.target),
+        (
+            KeyTransitionOperation::Add | KeyTransitionOperation::Renew,
+            KeyTransitionTarget::Device(observed),
+        ) if observed == target
+    ) || transition.to_revision != binding.key_revision
+        || !transition.recipients.contains(&target)
+        || transition.terminal == Some(KeyTransitionTerminal::Cancelled)
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    let proof = PairingBootstrapInstallProof {
+        operation_id: transition.operation_id,
+        binding,
+    };
+    let mut candidate = transition.clone();
+    candidate.bootstrap_install_proof = Some(proof.clone());
+    validate_transition_record(&candidate)?;
+    Ok(proof)
+}
+
+#[cfg(test)]
+pub(super) fn exact_bootstrap_proof_for_test(
+    transition: &KeyTransitionRecord,
+    binding: PairingBootstrapInstallBinding,
+) -> Result<PairingBootstrapInstallProof, RuntimeStoreError> {
+    exact_bootstrap_proof(transition, binding)
+}
+
+pub(crate) fn reconcile_pairing_bootstrap_install_proof_in_transaction(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &mut super::sqlite::RuntimeLedger,
+    binding: PairingBootstrapInstallBinding,
+    mode: PairingBootstrapProofReconcileMode,
+) -> Result<PairingBootstrapInstallProof, RuntimeStoreError> {
+    let recipient = bootstrap_target(&binding);
+    let authenticated = load_pairing_bootstrap_transition(
+        transaction,
+        key_bundle,
+        database_id,
+        recipient,
+        binding.key_revision,
+    )?
+    .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    let mut candidate = authenticated.record.clone();
+    if candidate.global_lineage.is_none() {
+        if !matches!(
+            authenticated.codec_version,
+            LEGACY_TRANSITION_CODEC_VERSION | PREVIOUS_TRANSITION_CODEC_VERSION
+        ) {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        candidate.global_lineage = Some(derive_legacy_bootstrap_global_lineage(
+            transaction,
+            key_bundle,
+            database_id,
+            &binding,
+        )?);
+    }
+    let proof = exact_bootstrap_proof(&candidate, binding)?;
+    ensure_bootstrap_global_lineage_matches(
+        transaction,
+        key_bundle,
+        database_id,
+        &candidate,
+        &proof.binding,
+    )?;
+    if let Some(existing) = authenticated.record.bootstrap_install_proof.as_ref()
+        && existing != &proof
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+
+    let update = if authenticated.record.phase.rank() >= KeyTransitionPhase::UpdatesFrozen.rank() {
+        Some(
+            load_update(
+                transaction,
+                key_bundle,
+                database_id,
+                authenticated.record.operation_id,
+                recipient,
+            )?
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?,
+        )
+    } else {
+        None
+    };
+    if let Some(update) = update.as_ref() {
+        match update.record.lifecycle {
+            KeyUpdateLifecycle::Frozen => {
+                ensure_bootstrap_update_matches(&proof.binding, &update.record)?;
+                if mode == PairingBootstrapProofReconcileMode::FreshDelivery {
+                    require_monotonic_time(
+                        update.record.state_changed_at_ms,
+                        proof.binding.received_at_ms,
+                    )?;
+                }
+                let mut changed = update.record.clone();
+                changed.lifecycle = KeyUpdateLifecycle::Acked;
+                changed.canonical_ack = Some(proof.binding.canonical_receipt.clone());
+                changed.state_changed_at_ms = update
+                    .record
+                    .state_changed_at_ms
+                    .max(proof.binding.received_at_ms);
+                replace_update(
+                    transaction,
+                    key_bundle,
+                    database_id,
+                    update,
+                    &changed,
+                    ledger,
+                )?;
+            }
+            KeyUpdateLifecycle::Acked => {
+                // 目标可能已经用正常 KeyUpdateAck 先行 Acked；保留其真实 ACK，
+                // 但无论 ACK provenance 为何都必须核对同一 slot lineage。
+                ensure_bootstrap_update_matches(&proof.binding, &update.record)?;
+                if mode == PairingBootstrapProofReconcileMode::FreshDelivery {
+                    require_monotonic_time(
+                        update.record.state_changed_at_ms,
+                        proof.binding.received_at_ms,
+                    )?;
+                }
+            }
+            KeyUpdateLifecycle::Cancelled => {
+                return Err(RuntimeStoreError::InvalidStateTransition);
+            }
+        }
+    }
+
+    if authenticated.record.bootstrap_install_proof.is_none()
+        || authenticated.record.global_lineage != candidate.global_lineage
+    {
+        candidate.bootstrap_install_proof = Some(proof.clone());
+        replace_transition(
+            transaction,
+            key_bundle,
+            database_id,
+            &authenticated,
+            &candidate,
+            ledger,
+        )?;
+    }
+    Ok(proof)
+}
+
+pub(crate) fn load_pairing_bootstrap_install_proof(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    recipient: KeyTransitionRecipient,
+    key_revision: u64,
+) -> Result<PairingBootstrapInstallProofRead, RuntimeStoreError> {
+    let ledger = super::sqlite::load_runtime_ledger(connection, key_bundle, database_id)?;
+    validate_v12_integrity(connection, key_bundle, database_id, &ledger)?;
+    let Some(transition) = load_pairing_bootstrap_transition(
+        connection,
+        key_bundle,
+        database_id,
+        recipient,
+        key_revision,
+    )?
+    else {
+        if pairing_bootstrap_update_exists(connection, recipient, key_revision)? {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        return Ok(PairingBootstrapInstallProofRead::LegacyTransitionCollected);
+    };
+    let proof = transition
+        .record
+        .bootstrap_install_proof
+        .clone()
+        .ok_or(RuntimeStoreError::InvalidStateTransition)?;
+    if proof.operation_id != transition.record.operation_id
+        || proof.binding.device_route != recipient.device_route
+        || proof.binding.grant_serial != recipient.grant_serial
+        || proof.binding.key_revision != key_revision
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    ensure_bootstrap_global_lineage_matches(
+        connection,
+        key_bundle,
+        database_id,
+        &transition.record,
+        &proof.binding,
+    )?;
+    if transition.record.phase.rank() >= KeyTransitionPhase::UpdatesFrozen.rank() {
+        let update = load_update(
+            connection,
+            key_bundle,
+            database_id,
+            transition.record.operation_id,
+            recipient,
+        )?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+        if update.record.lifecycle != KeyUpdateLifecycle::Acked {
+            return Err(RuntimeStoreError::InvalidStateTransition);
+        }
+        ensure_bootstrap_update_matches(&proof.binding, &update.record)?;
+    }
+    Ok(PairingBootstrapInstallProofRead::Verified(Box::new(proof)))
+}
+
 pub(crate) fn freeze_key_updates(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
@@ -493,17 +962,20 @@ pub(crate) fn freeze_key_updates(
     frozen_at_ms: u64,
 ) -> Result<KeyTransitionRecord, RuntimeStoreError> {
     validate_nonzero(operation_id)?;
-    let projected = updates.iter().try_fold(128 * 1024_u64, |total, update| {
-        total
-            .checked_add(
-                u64::try_from(update.canonical_update_set.len())
-                    .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
-            )
-            .and_then(|value| value.checked_add(ROW_BLOB_V1_OVERHEAD_LEN as u64 + 512))
-            .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
-                field: "key update freeze projection",
-            })
-    })?;
+    let projected = updates.iter().try_fold(
+        128 * 1024_u64 + MAX_CANONICAL_KEY_ACK_BYTES as u64,
+        |total, update| {
+            total
+                .checked_add(
+                    u64::try_from(update.canonical_update_set.len())
+                        .map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+                )
+                .and_then(|value| value.checked_add(ROW_BLOB_V1_OVERHEAD_LEN as u64 + 512))
+                .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+                    field: "key update freeze projection",
+                })
+        },
+    )?;
     admit_transition_write(state, config, projected)?;
     let key_bundle = state.key_bundle.clone();
     let database_id = state.database_id;
@@ -514,6 +986,17 @@ pub(crate) fn freeze_key_updates(
     let authenticated = load_transition(&transaction, &key_bundle, database_id, operation_id)?
         .ok_or(RuntimeStoreError::PublicationMismatch)?;
     validate_update_set(&authenticated.record, &updates)?;
+    if authenticated.record.phase != KeyTransitionPhase::Complete
+        && let Some(proof) = authenticated.record.bootstrap_install_proof.as_ref()
+    {
+        ensure_bootstrap_global_lineage_matches(
+            &transaction,
+            &key_bundle,
+            database_id,
+            &authenticated.record,
+            &proof.binding,
+        )?;
+    }
     if authenticated.record.phase.rank() >= KeyTransitionPhase::UpdatesFrozen.rank() {
         if authenticated.record.terminal == Some(KeyTransitionTerminal::Cancelled)
             || !updates_match(
@@ -535,13 +1018,43 @@ pub(crate) fn freeze_key_updates(
     }
     let mut next = ledger.clone();
     for update in &updates {
+        let bootstrap_ack = authenticated
+            .record
+            .bootstrap_install_proof
+            .as_ref()
+            .filter(|proof| update.recipient == bootstrap_target(&proof.binding));
+        if let Some(proof) = bootstrap_ack {
+            if proof.binding.received_at_ms > frozen_at_ms {
+                return Err(RuntimeStoreError::ClockRegressed {
+                    persisted_ms: proof.binding.received_at_ms,
+                    observed_ms: frozen_at_ms,
+                });
+            }
+            let candidate = KeyUpdateRecord {
+                operation_id,
+                recipient: update.recipient,
+                key_revision: update.key_revision,
+                lifecycle: KeyUpdateLifecycle::Frozen,
+                canonical_update_set: update.canonical_update_set.clone(),
+                canonical_ack: None,
+                snapshot_flushes: Vec::new(),
+                stream_applied_acks: Vec::new(),
+                created_at_ms: frozen_at_ms,
+                state_changed_at_ms: frozen_at_ms,
+            };
+            ensure_bootstrap_update_matches(&proof.binding, &candidate)?;
+        }
         let record = KeyUpdateRecord {
             operation_id,
             recipient: update.recipient,
             key_revision: update.key_revision,
-            lifecycle: KeyUpdateLifecycle::Frozen,
+            lifecycle: if bootstrap_ack.is_some() {
+                KeyUpdateLifecycle::Acked
+            } else {
+                KeyUpdateLifecycle::Frozen
+            },
             canonical_update_set: update.canonical_update_set.clone(),
-            canonical_ack: None,
+            canonical_ack: bootstrap_ack.map(|proof| proof.binding.canonical_receipt.clone()),
             snapshot_flushes: Vec::new(),
             stream_applied_acks: Vec::new(),
             created_at_ms: frozen_at_ms,
@@ -640,6 +1153,139 @@ pub(crate) fn replace_transition_and_update_for_capacity_test(
     transaction.commit()?;
     super::sqlite::latch_post_commit_capacity(state, config);
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn replace_update_for_legacy_transition_test(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    update: KeyUpdateRecord,
+) -> Result<(), RuntimeStoreError> {
+    let projected = u64::try_from(encode_update(&update)?.len())
+        .map_err(|_| RuntimeStoreError::PayloadTooLarge)?
+        .checked_add(128 * 1024)
+        .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+            field: "legacy key-update test projection",
+        })?;
+    admit_transition_write(state, config, projected)?;
+    let key_bundle = state.key_bundle.clone();
+    let database_id = state.database_id;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)?;
+    let authenticated_update = load_update(
+        &transaction,
+        &key_bundle,
+        database_id,
+        update.operation_id,
+        update.recipient,
+    )?
+    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let mut next = ledger.clone();
+    replace_update(
+        &transaction,
+        &key_bundle,
+        database_id,
+        &authenticated_update,
+        &update,
+        &mut next,
+    )?;
+    let _ = super::sqlite::update_runtime_ledger(
+        &transaction,
+        &key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
+    transaction.commit()?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LegacyTransitionCodecForTest {
+    V1,
+    V2,
+}
+
+#[cfg(test)]
+pub(crate) fn reseal_transition_with_legacy_codec_for_test(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    operation_id: [u8; 16],
+    codec: LegacyTransitionCodecForTest,
+) -> Result<(), RuntimeStoreError> {
+    admit_transition_write(state, config, 256 * 1024)?;
+    let key_bundle = state.key_bundle.clone();
+    let database_id = state.database_id;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)?;
+    let authenticated = load_transition(&transaction, &key_bundle, database_id, operation_id)?
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let version = match codec {
+        LegacyTransitionCodecForTest::V1 => LEGACY_TRANSITION_CODEC_VERSION,
+        LegacyTransitionCodecForTest::V2 => PREVIOUS_TRANSITION_CODEC_VERSION,
+    };
+    let mut legacy_record = authenticated.record.clone();
+    legacy_record.global_lineage = None;
+    legacy_record.bootstrap_install_proof = None;
+    let (sealed, metadata_token) =
+        seal_transition_row_legacy_for_test(&key_bundle, database_id, &legacy_record, version)?;
+    let sealed_bytes =
+        u64::try_from(sealed.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?;
+    if transaction.execute(
+        "UPDATE remote_key_transitions
+         SET sealed_state = ?1, sealed_state_bytes = ?2, metadata_token = ?3
+         WHERE operation_id = ?4 AND metadata_token = ?5",
+        rusqlite::params![
+            &sealed,
+            i64::try_from(sealed_bytes).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            &metadata_token[..],
+            &operation_id[..],
+            &authenticated.metadata_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::SchemaInspectionRaced);
+    }
+    let mut next = ledger.clone();
+    next.remote_key_transition_sealed_bytes = next
+        .remote_key_transition_sealed_bytes
+        .checked_sub(authenticated.sealed_bytes)
+        .and_then(|value| value.checked_add(sealed_bytes))
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let _ = super::sqlite::update_runtime_ledger(
+        &transaction,
+        &key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
+    transaction.commit()?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn transition_codec_version_for_test(
+    state: &RuntimeSqlite,
+    operation_id: [u8; 16],
+) -> Result<u8, RuntimeStoreError> {
+    let sealed = state.connection.query_row(
+        "SELECT sealed_state FROM remote_key_transitions WHERE operation_id = ?1",
+        [&operation_id[..]],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let plaintext = open_transition(&state.key_bundle, state.database_id, operation_id, &sealed)?;
+    plaintext
+        .expose_secret()
+        .get(4)
+        .copied()
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)
 }
 
 pub(crate) fn freeze_key_barriers(
@@ -893,16 +1539,36 @@ pub(crate) fn acknowledge_key_update(
     {
         return Err(RuntimeStoreError::PublicationMismatch);
     }
+    let bootstrap_ack_upgrade =
+        transition
+            .record
+            .bootstrap_install_proof
+            .as_ref()
+            .filter(|proof| {
+                input.recipient == bootstrap_target(&proof.binding)
+                    && input.key_revision == proof.binding.key_revision
+                    && authenticated.record.canonical_ack.as_deref()
+                        == Some(proof.binding.canonical_receipt.as_slice())
+            });
     if authenticated.record.lifecycle == KeyUpdateLifecycle::Acked {
         if authenticated.record.canonical_ack.as_deref() == Some(input.canonical_ack.as_slice()) {
             transaction.rollback()?;
             return Ok(authenticated.record);
         }
-        return Err(RuntimeStoreError::PublicationMismatch);
+        let Some(proof) = bootstrap_ack_upgrade else {
+            return Err(RuntimeStoreError::PublicationMismatch);
+        };
+        // PairResponse receipt 与已经在途的正常 KeyUpdateAck 可以交叉到达。
+        // receipt 先赢时，仅允许 exact target 把 placeholder ACK 单调升级成
+        // 经过 DeviceSign 验证的真实 ACK；proof 本身继续独立保留。
+        ensure_bootstrap_update_matches(&proof.binding, &authenticated.record)?;
     }
-    if authenticated.record.lifecycle != KeyUpdateLifecycle::Frozen {
+    if authenticated.record.lifecycle != KeyUpdateLifecycle::Frozen
+        && bootstrap_ack_upgrade.is_none()
+    {
         return Err(RuntimeStoreError::InvalidStateTransition);
     }
+    let is_bootstrap_ack_upgrade = authenticated.record.lifecycle == KeyUpdateLifecycle::Acked;
     require_monotonic_time(
         authenticated.record.state_changed_at_ms,
         input.acknowledged_at_ms,
@@ -910,7 +1576,9 @@ pub(crate) fn acknowledge_key_update(
     let mut changed = authenticated.record.clone();
     changed.lifecycle = KeyUpdateLifecycle::Acked;
     changed.canonical_ack = Some(input.canonical_ack);
-    changed.state_changed_at_ms = input.acknowledged_at_ms;
+    if !is_bootstrap_ack_upgrade {
+        changed.state_changed_at_ms = input.acknowledged_at_ms;
+    }
     let mut next = ledger.clone();
     replace_update(
         &transaction,

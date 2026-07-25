@@ -3049,6 +3049,42 @@ Clippy `-D warnings`、fmt、network/no-net、docs 与 diff 全绿。`spec/secur
 P4 Phase Exit、iOS 真实链路与
 production-signed/物理设备/公网 post-MVP 槽位保持未完成或 BLOCKED。
 
+#### P4.3↔P4.5 production hardening：pairing bootstrap proof、legacy recovery 与 Close retention
+
+**边界：** 本切片收紧 P4.3 pairing receipt 与 P4.5 key transition 的交界，不新增 Phase Task，不改变
+Runtime v5、physical schema v14/35、Relay v2 或 E2EE v1。ADKT sealed row 的写 codec 单独升为 v3，继续
+严格读取 v1/v2。P4 仍为 **6/7**；以下实现不能勾选 P4.7、`p4-auto` 或 P4 Phase Exit。
+
+- exact DeviceSign `PairResponseReceived` 已作为 Add/Renew 目标设备的 durable bootstrap install proof 写入
+  ADKT v3；proof/binding 的 `Debug` 完全 redacted，且 proof 存在后禁止 transition cancel。
+- slot digest 只编码 revision/device route/count/purpose/epoch/stream route，不编码随机 HPKE
+  `enc`/`wrapped_key`；pairing confirm 与 transition 同事务冻结 canonical `global_key_state_hash` 和 stable
+  key-lineage digest。digest 覆盖同 revision 不可变的 active roster/current epoch/真实 key material，排除
+  retention owner、retired tombstone 与 revoked-secret GC。full-open、freeze/readback 与 Close 都核对这些
+  lineage；合法 storage-lifecycle 原地变化可继续，真实错绑零写 fail-closed。
+- proof 只预 ACK exact target。普通 KeyUpdateAck 先到时保留真实 ACK，fresh receipt 不得早于已持久 ACK；
+  receipt 先到时允许后续普通 ACK 升级 evidence，但不移动 Completed transition 的 terminal causal time。
+  first-device zero-cut Add 可由 receipt proof 直接完成并到达 `BusinessReady`，不需要冗余 KeyUpdateAck。
+- 当前 ADKT v3 Add/Renew 必须有 nonzero global/stable lineage，不能伪装成 legacy。Delivered + ADKT v1/v2
+  proofless state 在 matching Add/Renew transition 仍存在、current revision 等于 binding revision 且完整
+  global-state hash 精确一致时，可由 exact receipt replay 原子回填 stable lineage 与 proof；revision 已前进时
+  因无法证明历史 key material commitment 而零写 fail-close。pairing/Close 尚在时，proofful 或 proofless
+  matching Completed transition 都被 GC pin，
+  Close scrub 后才释放。若旧版本已经 GC transition 与 update，authenticated v12 audit 确认两者都 absent
+  时只允许 exact receipt replay/Close scrub，不伪造 proof、不接受 fresh delivery；matching update 单独残留
+  必须按损坏 fail-closed。
+- fresh Close ACK 在 scrub pairing/outbox 的同一事务内把 receipt `retain_until_ms` 延到 ACK 后完整 30 天，
+  保留原 `created_at_ms` 审计语义并重签 metadata MAC。exact Close replay 在读时钟前只读返回且不二次续期；
+  clock regression 零写拒绝，AfterCommit-unknown 重开后仍能先读到延长后的 tombstone。
+
+本 hardening 的 focused gate 固定覆盖 `runtime::store::pairing_delivery_tests`、
+`runtime::store::pairing_terminal_tests`、`runtime::store::pairing_receipt_retention_tests`、
+`runtime::store::key_transition` 与 `remote::transition_tests`；Task 收口还必须取得完整 daemon package、workspace
+`cargo test`、CLI selfcheck、strict Clippy、fmt、network/no-net、docs 与 diff 的最终 exit 0。精确命令见
+`docs/QUALITY.md`，不得用 focused PASS 冒充 P4 aggregate PASS。stable-lineage 固定 KAT 还必须穿过真实
+transaction staging、ADKT v3 seal、SQLite shutdown/reopen 并 exact readback，不能用 plaintext codec
+roundtrip 或 `Some(nonzero)` 断言替代。
+
 ### Task P4.7：远程 CLI 合成 E2E、真实槽位 contract 与阶段文档收口
 
 **Files:**

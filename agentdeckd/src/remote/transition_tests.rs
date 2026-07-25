@@ -28,10 +28,11 @@ use crate::runtime::publication::{
 };
 use crate::runtime::store::identity::{RuntimeId, RuntimeIdKind};
 use crate::runtime::store::key_transition::{
-    CounterRetirementLifecycle, FrozenKeyUpdate, KeyTransitionOperation, KeyTransitionPhase,
-    KeyTransitionRecipient, KeyTransitionRecord, KeyTransitionRecovery, KeyTransitionStreamCut,
-    KeyTransitionStreamScope, KeyTransitionTarget, KeyUpdateLifecycle, KeyUpdateRecord,
-    RemoteTransitionIngressClass,
+    CounterRetirementLifecycle, FrozenKeyUpdate, KeyTransitionGlobalLineage,
+    KeyTransitionOperation, KeyTransitionPhase, KeyTransitionRecipient, KeyTransitionRecord,
+    KeyTransitionRecovery, KeyTransitionStreamCut, KeyTransitionStreamScope, KeyTransitionTarget,
+    KeyUpdateLifecycle, KeyUpdateRecord, PairingBootstrapInstallBinding,
+    PairingBootstrapInstallProof, RemoteTransitionIngressClass,
 };
 use crate::runtime::store::pairing_grant::{ConversationKeyRotation, GlobalKeyStateV1};
 use crate::runtime::store::remote_counter::{
@@ -653,6 +654,8 @@ fn material() -> TransitionMaterial {
                 phase: KeyTransitionPhase::RotatedPreparingUpdates,
                 terminal: None,
                 recipients: recipients.iter().map(|entry| entry.recipient).collect(),
+                global_lineage: None,
+                bootstrap_install_proof: None,
                 replay_retirement: None,
                 counter_retirement: CounterRetirementLifecycle::Pending,
                 cuts: Vec::new(),
@@ -674,6 +677,48 @@ fn material() -> TransitionMaterial {
         },
         recipients,
     }
+}
+
+fn material_with_bootstrap_proof() -> TransitionMaterial {
+    let mut material = material();
+    let target = match material.recovery.transition.target {
+        KeyTransitionTarget::Device(target) => target,
+        KeyTransitionTarget::Conversation { .. } => panic!("Add fixture targets a device"),
+    };
+    let canonical_receipt = b"coordinator-bootstrap-receipt".to_vec();
+    material.recovery.transition.global_lineage = Some(KeyTransitionGlobalLineage {
+        global_key_state_hash: [0x6b; 32],
+        stable_key_lineage_hash: Some([0x6d; 32]),
+    });
+    material.recovery.transition.bootstrap_install_proof = Some(PairingBootstrapInstallProof {
+        operation_id: OPERATION,
+        binding: PairingBootstrapInstallBinding {
+            pairing_id: [0x51; 16],
+            relay_server_id: RELAY,
+            pair_route: [0x52; 16],
+            machine_route: MACHINE,
+            device_route: target.device_route,
+            grant_serial: target.grant_serial,
+            root_trust_epoch: 7,
+            key_revision: REVISION,
+            expiry_ms: 2_000,
+            invite_hash: [0x61; 32],
+            request_hash: [0x62; 32],
+            grant_hash: [0x63; 32],
+            response_hash: [0x64; 32],
+            receipt_hash: sha256(&canonical_receipt),
+            device_sign_fingerprint: [0x66; 32],
+            info_sha256: [0x67; 32],
+            aad_sha256: [0x68; 32],
+            tbs_sha256: [0x69; 32],
+            key_directory_hash: [0x6a; 32],
+            global_key_state_hash: [0x6b; 32],
+            key_slot_digest: [0x6c; 32],
+            canonical_receipt,
+            received_at_ms: 950,
+        },
+    });
+    material
 }
 
 fn full_capacity_first_grant_material() -> TransitionMaterial {
@@ -712,6 +757,8 @@ fn full_capacity_first_grant_material() -> TransitionMaterial {
                 phase: KeyTransitionPhase::RotatedPreparingUpdates,
                 terminal: None,
                 recipients: vec![target.recipient],
+                global_lineage: None,
+                bootstrap_install_proof: None,
                 replay_retirement: None,
                 counter_retirement: CounterRetirementLifecycle::Pending,
                 cuts: Vec::new(),
@@ -770,6 +817,8 @@ fn last_recipient_revoked_material() -> TransitionMaterial {
                 phase: KeyTransitionPhase::RotatedPreparingUpdates,
                 terminal: None,
                 recipients: Vec::new(),
+                global_lineage: None,
+                bootstrap_install_proof: None,
                 replay_retirement: None,
                 counter_retirement: CounterRetirementLifecycle::Pending,
                 cuts: Vec::new(),
@@ -856,19 +905,37 @@ impl TransitionBackend for FakeTransitionBackend {
         state.frozen_updates = updates.clone();
         state.material.recovery.transition.phase = KeyTransitionPhase::UpdatesFrozen;
         state.material.recovery.transition.update_count = updates.len() as u64;
+        let bootstrap_proof = state
+            .material
+            .recovery
+            .transition
+            .bootstrap_install_proof
+            .clone();
         state.material.recovery.updates = updates
             .into_iter()
-            .map(|update| KeyUpdateRecord {
-                operation_id,
-                recipient: update.recipient,
-                key_revision: update.key_revision,
-                lifecycle: KeyUpdateLifecycle::Frozen,
-                canonical_update_set: update.canonical_update_set,
-                canonical_ack: None,
-                snapshot_flushes: Vec::new(),
-                stream_applied_acks: Vec::new(),
-                created_at_ms: 1_001,
-                state_changed_at_ms: 1_001,
+            .map(|update| {
+                let bootstrap_ack = bootstrap_proof.as_ref().filter(|proof| {
+                    proof.binding.device_route == update.recipient.device_route
+                        && proof.binding.grant_serial == update.recipient.grant_serial
+                        && proof.binding.key_revision == update.key_revision
+                });
+                KeyUpdateRecord {
+                    operation_id,
+                    recipient: update.recipient,
+                    key_revision: update.key_revision,
+                    lifecycle: if bootstrap_ack.is_some() {
+                        KeyUpdateLifecycle::Acked
+                    } else {
+                        KeyUpdateLifecycle::Frozen
+                    },
+                    canonical_update_set: update.canonical_update_set,
+                    canonical_ack: bootstrap_ack
+                        .map(|proof| proof.binding.canonical_receipt.clone()),
+                    snapshot_flushes: Vec::new(),
+                    stream_applied_acks: Vec::new(),
+                    created_at_ms: 1_001,
+                    state_changed_at_ms: 1_001,
+                }
             })
             .collect();
         Ok(state.material.recovery.clone())
@@ -1403,6 +1470,44 @@ async fn update_phase_freezes_byte_identical_sets_before_any_barrier_work() {
 }
 
 #[tokio::test]
+async fn update_freeze_readback_accepts_only_bootstrap_target_as_preacked() {
+    let material = material_with_bootstrap_proof();
+    let target = match material.recovery.transition.target {
+        KeyTransitionTarget::Device(target) => target,
+        KeyTransitionTarget::Conversation { .. } => panic!("bootstrap fixture targets a device"),
+    };
+    let receipt = material
+        .recovery
+        .transition
+        .bootstrap_install_proof
+        .as_ref()
+        .expect("bootstrap fixture proof exists")
+        .binding
+        .canonical_receipt
+        .clone();
+    let backend = FakeTransitionBackend::new(material, Vec::new());
+    let authority = RecordingAuthority::default();
+    let coordinator = TransitionCoordinator::new(&backend, &authority);
+
+    assert_eq!(
+        coordinator.advance_once().await,
+        Ok(TransitionAdvance::UpdatesFrozen { recipient_count: 2 })
+    );
+    let state = backend.state.lock().expect("backend lock");
+    for update in &state.material.recovery.updates {
+        if update.recipient == target {
+            assert_eq!(update.lifecycle, KeyUpdateLifecycle::Acked);
+            assert_eq!(update.canonical_ack.as_deref(), Some(receipt.as_slice()));
+        } else {
+            assert_eq!(update.lifecycle, KeyUpdateLifecycle::Frozen);
+            assert!(update.canonical_ack.is_none());
+        }
+    }
+    assert_eq!(state.old_key_drives, 0);
+    assert!(state.barrier_requests.is_empty());
+}
+
+#[tokio::test]
 async fn pending_old_key_outbox_cut_is_rejected_before_barrier_freeze() {
     let mut pending = exact_committed_cuts();
     pending[1].reserved_outer_cursor = Some(8);
@@ -1546,7 +1651,7 @@ async fn frozen_barrier_hash_epoch_or_route_drift_fails_before_republish() {
 }
 
 #[tokio::test]
-async fn production_transition_owner_reopens_real_store_and_stays_control_only_until_device_ack() {
+async fn production_transition_owner_reopens_and_consumes_bootstrap_receipt_without_second_ack() {
     let root = tempfile::tempdir().expect("create production transition composition root");
     #[cfg(unix)]
     {
@@ -1686,25 +1791,20 @@ async fn production_transition_owner_reopens_real_store_and_stays_control_only_u
     };
     assert_eq!(
         readiness,
-        TransitionReadiness::ControlPlaneReady { barrier_count: 0 }
+        TransitionReadiness::BusinessReady { barrier_count: 0 }
     );
-    let committed = reopened
-        .load_active_key_transition()
-        .await
-        .expect("reload committed transition")
-        .expect("committed transition remains auditable");
-    assert_eq!(
-        committed.transition.phase,
-        KeyTransitionPhase::BarriersCommitted
-    );
-    assert_eq!(
-        committed.updates.len(),
-        committed.transition.recipients.len()
+    assert!(
+        reopened
+            .load_active_key_transition()
+            .await
+            .expect("reload completed bootstrap transition")
+            .is_none(),
+        "durable PairResponseReceived proof must let the zero-cut first-device transition complete"
     );
     reopened
         .check_remote_transition_ingress(RemoteTransitionIngressClass::Business)
         .await
-        .expect_err("missing device ACK must keep production business ingress fenced");
+        .expect("bootstrap install proof replaces only the redundant target KeyUpdateAck");
     assert_eq!(second_transport.publish_calls.load(Ordering::SeqCst), 0);
 
     second_transition

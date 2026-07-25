@@ -47,6 +47,30 @@ impl RuntimeStoreHandle {
     }
 
     #[cfg(test)]
+    pub(crate) async fn begin_key_transition_with_global_lineage_for_test(
+        &self,
+        input: key_transition::BeginKeyTransition,
+        global_lineage: key_transition::KeyTransitionGlobalLineage,
+    ) -> Result<key_transition::KeyTransitionRecord, RuntimeStoreError> {
+        let retained = retained_vec_bytes::<key_transition::KeyTransitionRecipient>(
+            input.recipients.capacity(),
+        )?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            memory_charge(size_of::<NormalCommand>(), &[retained])?,
+            |reply| NormalCommand::BeginKeyTransitionWithGlobalLineage {
+                input,
+                global_lineage,
+                reply,
+            },
+        )
+        .await?
+    }
+
+    #[cfg(test)]
     pub(crate) async fn mark_key_transition_rotated(
         &self,
         operation_id: [u8; 16],
@@ -480,6 +504,13 @@ mod tests {
         }
     }
 
+    fn global_lineage(seed: u8) -> key_transition::KeyTransitionGlobalLineage {
+        key_transition::KeyTransitionGlobalLineage {
+            global_key_state_hash: [seed; 32],
+            stable_key_lineage_hash: Some([seed.wrapping_add(1); 32]),
+        }
+    }
+
     async fn open_store(now_ms: u64) -> (tempfile::TempDir, Arc<AtomicU64>, RuntimeStoreHandle) {
         let root = tempfile::tempdir().expect("create key-transition handle test root");
         #[cfg(unix)]
@@ -699,19 +730,22 @@ mod tests {
                 .expect("freeze full old DeviceCommandTx axes");
         clock.store(401, Ordering::SeqCst);
         store
-            .begin_key_transition(key_transition::BeginKeyTransition {
-                operation_id,
-                operation: key_transition::KeyTransitionOperation::Renew,
-                target: key_transition::KeyTransitionTarget::Device(member),
-                from_revision: 4,
-                to_revision: 5,
-                recipients: vec![member],
-                replay_retirement: Some(
-                    key_transition::ReplayRetirement::pending_device_command(replay_scope, 7)
-                        .expect("freeze old DeviceReplyTx epoch"),
-                ),
-                created_at_ms: 0,
-            })
+            .begin_key_transition_with_global_lineage_for_test(
+                key_transition::BeginKeyTransition {
+                    operation_id,
+                    operation: key_transition::KeyTransitionOperation::Renew,
+                    target: key_transition::KeyTransitionTarget::Device(member),
+                    from_revision: 4,
+                    to_revision: 5,
+                    recipients: vec![member],
+                    replay_retirement: Some(
+                        key_transition::ReplayRetirement::pending_device_command(replay_scope, 7)
+                            .expect("freeze old DeviceReplyTx epoch"),
+                    ),
+                    created_at_ms: 0,
+                },
+                global_lineage(0x26),
+            )
             .await
             .expect("begin add transition");
         clock.store(402, Ordering::SeqCst);

@@ -312,7 +312,7 @@ pub enum RegisterCaptureError<E> {
 }
 
 /// Relay durable COMMIT 后可见的 outer/inner cut；无 stream 时两者均 BeforeFirst。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayCommittedCut {
     pub publication_stream_id: Option<[u8; 16]>,
     pub generation: Option<[u8; 16]>,

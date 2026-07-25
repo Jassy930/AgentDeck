@@ -326,6 +326,35 @@ daemon 必须先向 Relay 发送带 absolute invite expiry 的 `OpenPairRoute` �
 8. daemon 收到 commit 后才把状态推进到 `grantCommitted(requestHash, encryptedResponse)`，再向设备返回由 MachineDataSign 签名、以 DeviceHPKE 加密的 DeviceGrant 与 machine key directory。崩溃在 commit 前则对同 request 继续同一份 InstallGrant；崩溃在 commit 后则重发同一 encryptedResponse。
 9. 设备把 pending keys、DeviceGrant 和 PairedMachineRecord 原子提升为 paired 状态，然后在 PairRoute 上发送 DeviceSign-signed `PairResponseReceived(requestHash, grantHash, responseHash)`；daemon 验签并匹配 frozen response 后才进入 delivered，再关闭 PairRoute，随后设备通过 challenge-response 正式连接。回执丢失时 daemon 保持 grantCommitted 并对同 request 逐字节重发响应；不能把 Relay writer enqueue/flush 的 `RouteAccepted` 当作 delivered。TTL 到期仍无有效回执时必须撤销 orphan grant。
 
+`PairResponseReceived` 同时是目标设备安装 bootstrap KeyDirectory 的 durable proof。pairing confirm 必须与
+Add/Renew transition 同事务冻结完整 global-state hash 与 stable key-lineage digest；digest 覆盖同 revision
+内不可变的 active roster、current epoch 和真实 key material，排除 retention owner、retired tombstone 与
+revoked-secret GC。daemon 只在 receipt 与 exact pairing、transition、device route/grant serial、root trust
+epoch、key-directory revision、invite/request/grant/response/receipt hash、MachineDataSign transcript、
+key-directory/global-state lineage 全部一致时，才把 proof 写入对应 transition。proof 只能把该 Add/Renew 的
+exact target 视为已 ACK；既有设备
+仍须各自提交普通 `KeyUpdateAckV1`，不能因新设备的 pairing receipt 被批量预 ACK。首台设备的 zero-cut Add
+可以仅凭该 target proof 完成并进入 `BusinessReady`，不得依赖一条协议上多余的 unsolicited KeyUpdateAck。
+
+当前 ADKT v3 Add/Renew 必须持久化非零 global/stable lineage；proofless v3 不能进入 legacy 兼容路径。
+ADKT v1/v2 仅在 current global revision 等于 receipt binding revision、且完整 global-state hash 精确一致时，
+允许从 authenticated current state 回填 stable digest。若 revision 已前进，旧格式无法证明历史 key material
+commitment，必须零写 fail-close，不能以空 stable digest 继续 Close。
+
+普通 KeyUpdateAck 先到时保留真实 ACK，fresh receipt 的时间不得早于该 durable ACK；receipt 先到时先保存
+target-only receipt evidence，后到的普通 ACK 可以升级 evidence，但不得移动已完成 transition 的 terminal
+causal time。proof 一旦存在，transition 不得 cancel，只能由原 owner 向前恢复或完成。
+
+ADKT 写格式使用 v3 保存该 proof，并继续严格读取 v1/v2。升级前的 Delivered + v1/v2 proofless transition
+若仍存在，exact receipt replay 可在单一事务内回填 proof，且 matching Completed transition/update 在 Pairing/
+Close 尚未 scrub 前必须被 GC pin。若旧版本已在升级前完整 GC transition 与 update，且 authenticated v12 audit
+确认两者都不存在，只允许 exact receipt replay 与 Close scrub；不得伪造 replacement proof，也不得把该兼容
+路径用于 fresh delivery。无 transition 却仍有 matching update 属于损坏状态，必须 fail-closed。
+
+fresh Close ACK 在 scrub pairing secret、删除 Close outbox 的同一事务内，把 receipt `retainUntil` 延长为
+ACK 后完整 30 天；`createdAt` 继续表示原始 receipt 审计时间。exact Close replay 必须在读时钟前只读返回，
+不再次续期；wall clock 回拨则零写拒绝。
+
 `RelayGrant` 只包含 Relay 鉴权所需字段：随机 machine/device route、设备连接验签公钥、grant serial 和 MachineRoot 签名。`DeviceAuthorization` 绑定同一 grant serial、设备 HPKE 公钥、能力和业务权限，并由 MachineRoot 签名后加密；Relay 只能看到前者。两者合称 DeviceGrant。
 
 DeviceGrant 默认不自动过期，直到被撤销、用更高 serial 更新或 machine trust reset；这样普通长时间离线不会制造不必要的重配。grant renewal 会产生新 serial，也会产生新的 `RemotePrincipal`，旧 serial 进入 tombstone，不能重新上线覆盖新 principal。
@@ -434,6 +463,13 @@ daemon Keychain：
 HPKE 只封装这些小型 keys；事件/命令内容使用对称 AEAD。每个对称 key 只有一个发送方向。新增或撤销设备时轮换 catalog 与 active conversation epoch。新设备不取得旧 epoch；需要历史时由 daemon 以当前 epoch 重新生成 snapshot/history。
 
 所有 key directory/update 都有 MachineDataSign 签名和单调 `keyDirectoryRevision`。成员变化时 daemon 在每个 active stream 记录 `EpochBarrier(streamGeneration, streamCursor=C, innerCursor=H, oldEpoch, newEpoch, keyDirectoryRevision)`：`innerCursor` 是 tagged catalog/conversation cursor，`C/H` 必须来自同一个已提交 publication cut，不能使用尚未提交的 reserved/frozen outer sequence。剩余设备从 checked `next(C)` 使用新 key；新设备的 subscription 从同一 generation/cursor C 接续，先取得以该设备 `DeviceReplyTxKey` 加密的 snapshot，再接共享 `ConversationDEK(newEpoch)` 保护的 `next(C)`。其中 `next(BeforeFirst)=0`，`next(At(n))` 只在 checked-add 成功时成立；到 `u64::MAX` 必须轮换 generation。Relay 不向新设备重放 barrier 之前的旧-key frames。
+
+PairResponse 与后续 `KeyUpdateSetV1` 会分别执行随机 HPKE 封装；同一 key material 的 `enc` / `wrappedKey`
+逐字节不同是正常现象，不能进入等价性 digest。bootstrap `keySlotDigest` 只绑定稳定 slot identity：revision、
+device route、entry count、purpose、epoch 与可选 stream route；transition 另在 confirm 事务中绑定 canonical
+`globalKeyStateHash` 与 stable key-lineage digest。后者直接覆盖 active roster/current epoch/真实 key material，
+但排除同 revision 可合法变化的 retention owner、retired tombstone 与 revoked-secret GC。所有轴都必须在
+full-open、update freeze/readback 与 Close 前交叉验证，任一真实错绑都零写 fail-closed。
 
 设备看到已签名的未知更高 epoch/revision 时暂停应用该 stream，发起有界 `KeySync`（最多 3 次、总计 30 秒），不能立刻把正常 key rotation 当作攻击隔离；低于本地最高 revision、签名无效或超出重试窗口才进入 security error。
 
@@ -1677,7 +1713,9 @@ provisioned production-signed LaunchAgent/Keychain 仍按方案 b 保持 post-MV
 - P4.5 已完成 daemon WSS/E2EE 下行、MachineDataSign、Catalog/events/commands/replay、key/counter crash
   recovery 与 directed sealer/publisher production 接线；admission 只在 counter/publication/transition recovery
   门禁完成后开放。P4.5 收口时 Runtime wire 为 v4，physical schema 为 v14/35 表。
-- macOS persistent 远程 CLI 使用 Keychain 中的真实 grant/private keys 和 daemon receipts；Linux synthetic client 只用 ephemeral keys。
+- P4.6 macOS persistent 远程 CLI automatic Task 已完成；production 使用 Keychain 中的真实 grant/private keys
+  和 daemon receipts，Linux synthetic client 只用 ephemeral keys。本轮 P4.3↔P4.5 bootstrap proof/retention
+  hardening 不新增 Task 完成数；P4 仍为 **6/7**，P4.7、`p4-auto` 与 P4 Phase Exit 仍未完成。
 
 退出门禁：P4 的 machine identity、pairing、RemoteLink、远程 CLI 与 trust-reset/uninstall-purge 功能全部
 保留。本地 App/CLI 必须确认待配对设备指纹，远端不能自批；自动 E2E 以合成 Codex/Claude Code
