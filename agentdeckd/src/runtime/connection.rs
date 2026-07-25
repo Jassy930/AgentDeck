@@ -42,6 +42,10 @@ const DEVICE_HANDLE_PREFIX: &str = "device-";
 pub struct AuthenticatedPrincipal {
     identity: Arc<PrincipalIdentity>,
     authorization: Arc<AuthorizationLease>,
+    /// 本次 Store-current proof 冻结的 exact command binding。共享 lease 只承载稳定
+    /// identity/permissions/revoke state；rotation 后的新请求必须保留新 revision 快照，
+    /// 不能复用首次连接的旧 ADC2 binding。
+    remote_command_authorization: Option<RemoteCommandAuthorizationBinding>,
 }
 
 #[derive(Clone, Eq, PartialEq, Hash)]
@@ -125,8 +129,15 @@ struct AuthorizationLease {
     quiesced: tokio::sync::Notify,
     approval_permissions: ApprovalPermissionGrant,
     remote_permissions: Option<RemotePermissionGrant>,
-    remote_command_authorization: Option<RemoteCommandAuthorizationBinding>,
     local_administration: bool,
+}
+
+/// issuer 对稳定 principal identity 的共享 lease 与最近一次 Store-current command
+/// binding。历史 `AuthenticatedPrincipal` 保留各自快照；latest 只供后续签发和离线 revoke
+/// 找回当前 exact binding，且绝不允许 revision 回退。
+struct PrincipalLeaseRecord {
+    authorization: Arc<AuthorizationLease>,
+    latest_remote_command_authorization: Option<RemoteCommandAuthorizationBinding>,
 }
 
 /// Store-authenticated remote permission allowlist。固定 bitset 避免把 grant 的
@@ -242,7 +253,7 @@ impl AuthenticatedPrincipal {
     pub(crate) fn remote_command_authorization_binding(
         &self,
     ) -> Option<RemoteCommandAuthorizationBinding> {
-        self.authorization.remote_command_authorization.clone()
+        self.remote_command_authorization.clone()
     }
 
     /// 向调用方自己的 domain-separated buffer 写入完整 authorization identity。
@@ -461,7 +472,6 @@ impl AuthorizationLease {
     fn new(
         approval_permissions: ApprovalPermissionGrant,
         remote_permissions: Option<RemotePermissionGrant>,
-        remote_command_authorization: Option<RemoteCommandAuthorizationBinding>,
         local_administration: bool,
     ) -> Self {
         Self {
@@ -470,7 +480,6 @@ impl AuthorizationLease {
             quiesced: tokio::sync::Notify::new(),
             approval_permissions,
             remote_permissions,
-            remote_command_authorization,
             local_administration,
         }
     }
@@ -724,7 +733,7 @@ pub enum PrincipalAccessError {
 pub(crate) struct PrincipalIssuer {
     machine_trust_domain: [u8; 32],
     lease_capacity: usize,
-    leases: Mutex<HashMap<PrincipalIdentity, Arc<AuthorizationLease>>>,
+    leases: Mutex<HashMap<PrincipalIdentity, PrincipalLeaseRecord>>,
 }
 
 impl PrincipalIssuer {
@@ -848,9 +857,10 @@ impl PrincipalIssuer {
                     } if *candidate_route == device_route && *candidate_serial == grant_serial.0
                 )
             })
-            .map(|(identity, authorization)| AuthenticatedPrincipal {
+            .map(|(identity, record)| AuthenticatedPrincipal {
                 identity: Arc::new(identity.clone()),
-                authorization: authorization.clone(),
+                authorization: Arc::clone(&record.authorization),
+                remote_command_authorization: record.latest_remote_command_authorization.clone(),
             }))
     }
 
@@ -913,16 +923,19 @@ impl PrincipalIssuer {
             .leases
             .lock()
             .map_err(|_| PrincipalAccessError::RegistryUnavailable)?;
-        let authorization = match leases.get(&identity).cloned() {
-            Some(lease) => {
-                if lease.approval_permissions != approval_permissions
-                    || lease.remote_permissions != remote_permissions
-                    || lease.remote_command_authorization != remote_command_authorization
-                    || lease.local_administration != local_administration
+        let authorization = match leases.get_mut(&identity) {
+            Some(record) => {
+                if record.authorization.approval_permissions != approval_permissions
+                    || record.authorization.remote_permissions != remote_permissions
+                    || record.authorization.local_administration != local_administration
                 {
                     return Err(PrincipalAccessError::PermissionConflict);
                 }
-                lease
+                advance_remote_command_authorization(
+                    &mut record.latest_remote_command_authorization,
+                    remote_command_authorization.as_ref(),
+                )?;
+                Arc::clone(&record.authorization)
             }
             None => {
                 if leases.len() >= self.lease_capacity {
@@ -931,17 +944,45 @@ impl PrincipalIssuer {
                 let lease = Arc::new(AuthorizationLease::new(
                     approval_permissions,
                     remote_permissions,
-                    remote_command_authorization,
                     local_administration,
                 ));
-                leases.insert(identity.clone(), lease.clone());
+                leases.insert(
+                    identity.clone(),
+                    PrincipalLeaseRecord {
+                        authorization: Arc::clone(&lease),
+                        latest_remote_command_authorization: remote_command_authorization.clone(),
+                    },
+                );
                 lease
             }
         };
         Ok(AuthenticatedPrincipal {
             identity: Arc::new(identity),
             authorization,
+            remote_command_authorization,
         })
+    }
+}
+
+fn advance_remote_command_authorization(
+    current: &mut Option<RemoteCommandAuthorizationBinding>,
+    candidate: Option<&RemoteCommandAuthorizationBinding>,
+) -> Result<(), PrincipalAccessError> {
+    match (current.as_ref(), candidate) {
+        (None, None) => Ok(()),
+        (Some(installed), Some(candidate)) if installed == candidate => Ok(()),
+        (Some(installed), Some(candidate))
+            if candidate.key_directory_revision().value()
+                > installed.key_directory_revision().value()
+                && candidate.authorization_hash() == installed.authorization_hash()
+                && candidate.command_key_epoch() >= installed.command_key_epoch() =>
+        {
+            *current = Some(candidate.clone());
+            Ok(())
+        }
+        (None, Some(_)) | (Some(_), None) | (Some(_), Some(_)) => {
+            Err(PrincipalAccessError::PermissionConflict)
+        }
     }
 }
 

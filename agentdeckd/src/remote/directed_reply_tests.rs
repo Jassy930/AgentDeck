@@ -44,8 +44,8 @@ use crate::runtime::store::remote_counter::RemoteCounterRecordKind;
 use crate::runtime::store::{
     ActiveSenderCounterBinding, BeginDeviceRevocation, BeginDeviceRevocationOutcome,
     FreezePublicationRequest, MachineEnrollmentState, NewConversation, PublicationPayloadKind,
-    PublicationScope, RemoteReplyAuthorization, RevocationTargetStatus, RuntimeId, RuntimeIdKind,
-    RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle,
+    PublicationScope, PublicationStreamRecord, RemoteReplyAuthorization, RevocationTargetStatus,
+    RuntimeId, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreHandle,
     active_authorization_store_with_pending_transition_for_test,
     active_authorization_store_with_permissions_for_test, matching_bootstrap_update_for_test,
 };
@@ -164,15 +164,28 @@ async fn active_store(
     database: &std::path::Path,
     storage_keys: &MemoryKeyStore,
 ) -> RuntimeStoreHandle {
+    active_store_with_catalog(database, storage_keys).await.0
+}
+
+async fn active_store_with_catalog(
+    database: &std::path::Path,
+    storage_keys: &MemoryKeyStore,
+) -> (RuntimeStoreHandle, PublicationStreamRecord) {
     let storage_kek =
         load_or_create_storage_kek(storage_keys, database).expect("load directed StorageKEK");
-    active_authorization_store_with_permissions_for_test(
+    let store = active_authorization_store_with_permissions_for_test(
         database,
         storage_kek,
         vec![AuthorizationCapabilityV1::Catalog],
         vec![AuthorizationPermissionV1::CatalogRead],
     )
-    .await
+    .await;
+    let catalog = store
+        .ensure_remote_catalog_publication_after_transition()
+        .await
+        .expect("ensure directed-reply Catalog publication carrier")
+        .expect("active remote authorization requires a Catalog carrier");
+    (store, catalog)
 }
 
 async fn authorization(store: &RuntimeStoreHandle) -> RemoteReplyAuthorization {
@@ -229,17 +242,8 @@ async fn commit_conversation_activation_for_reply_test(
 async fn startup_sender_inventory_covers_active_shared_and_directed_reply_scopes() {
     let root = TestRoot::new("startup-sender-inventory");
     let keys = MemoryKeyStore::new();
-    let store = active_store(&root.database(), &keys).await;
-    let publication_stream_id = [0x21; 16];
-    store
-        .create_publication_stream(
-            publication_stream_id,
-            crate::runtime::store::PublicationScope::Catalog,
-            [0x22; 16],
-            [0x23; 16],
-        )
-        .await
-        .expect("create active catalog publication stream");
+    let (store, catalog) = active_store_with_catalog(&root.database(), &keys).await;
+    let publication_stream_id = catalog.publication_stream_id;
 
     let bindings = store
         .load_active_sender_counter_bindings()
@@ -443,20 +447,11 @@ async fn stream_binding_uses_barrier_publication_axes_and_rejects_post_barrier_a
     let database = root.database();
     let storage_keys = MemoryKeyStore::new();
     let counter_keys = Arc::new(MemoryKeyStore::new());
-    let store = active_store(&database, &storage_keys).await;
-    let publication_stream_id = [0x71; 16];
-    let stream_route = [0x72; 16];
-    let generation = [0x73; 16];
+    let (store, catalog) = active_store_with_catalog(&database, &storage_keys).await;
+    let publication_stream_id = catalog.publication_stream_id;
+    let stream_route = catalog.stream_route;
+    let generation = catalog.generation;
     let counter_scope_token = [0x74; 32];
-    store
-        .create_publication_stream(
-            publication_stream_id,
-            PublicationScope::Catalog,
-            stream_route,
-            generation,
-        )
-        .await
-        .expect("create catalog publication stream");
     let first = store
         .freeze_publication(FreezePublicationRequest {
             publication_id: [0x75; 16],
@@ -1488,9 +1483,9 @@ async fn transition_snapshot_sealer_requires_exact_store_permit_and_records_flus
         .await
         .expect("create genesis catalog publication stream");
     store
-        .mark_key_transition_rotated(operation_id)
+        .finalize_key_directory_rotation(operation_id)
         .await
-        .expect("advance initial Add transition");
+        .expect("finalize initial Add key-directory rotation");
     let update = matching_bootstrap_update_for_test(&store, recipient).await;
     assert_eq!(update.key_revision, key_revision);
     let canonical_update_set = update.canonical_update_set.clone();

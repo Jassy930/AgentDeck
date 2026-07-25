@@ -49,9 +49,8 @@ use crate::remote::counter::CounterScope;
 use crate::remote::directed_reply::DeviceReplyTxSealer;
 use crate::runtime::model::MachineEnrollmentState;
 use crate::runtime::store::key_transition::{
-    BeginKeyTransition, FrozenKeyUpdate, KeyTransitionGlobalLineage, KeyTransitionOperation,
-    KeyTransitionRecipient, KeyTransitionStreamCut, KeyTransitionStreamScope, KeyTransitionTarget,
-    KeyUpdateLifecycle,
+    FrozenKeyUpdate, KeyTransitionOperation, KeyTransitionRecipient, KeyTransitionStreamCut,
+    KeyTransitionStreamScope, KeyUpdateLifecycle, TransitionSnapshotRequest,
 };
 use crate::runtime::store::publication::{
     FreezeSignedPublicationRequest, FrozenPublication, PublicationPayloadKind, PublicationScope,
@@ -117,6 +116,13 @@ struct ReadyNoopPublisher;
 impl RemoteStreamPublisher for ReadyNoopPublisher {
     fn admission_ready(&self) -> bool {
         true
+    }
+
+    async fn prepare_subscription(
+        &self,
+        _target: crate::runtime::events::RuntimeStreamTarget,
+    ) -> Result<(), RemoteLinkError> {
+        Ok(())
     }
 
     async fn publish_exact(&self, _runtime_bytes: Arc<[u8]>) -> Result<(), RemoteLinkError> {
@@ -1014,9 +1020,9 @@ async fn stage_directed_reply_counter_recovery(
         requested_revision.value()
     );
     store
-        .mark_key_transition_rotated(operation_id)
+        .finalize_key_directory_rotation(operation_id)
         .await
-        .expect("mark directed CounterRecovery rotated");
+        .expect("finalize directed CounterRecovery key-directory axes");
     let mut update_set = key_update_set(requested_revision);
     update_set.updates.push(KeyUpdateV1 {
         key_directory_revision: requested_revision,
@@ -1358,31 +1364,6 @@ async fn freeze_exact_key_sync_update(
     (operation_id, update_set)
 }
 
-async fn clear_fixture_bootstrap_transition(
-    fixture: &ActiveRemoteDispatchFixture,
-    current_revision: KeyDirectoryRevision,
-) {
-    let preexisting = fixture
-        .store()
-        .load_active_key_transition()
-        .await
-        .expect("inspect preexisting KeySync transition");
-    let Some(preexisting) = preexisting else {
-        return;
-    };
-    assert_eq!(
-        preexisting.transition.operation,
-        KeyTransitionOperation::Add
-    );
-    assert_eq!(preexisting.transition.from_revision, 0);
-    assert_eq!(preexisting.transition.to_revision, current_revision.value());
-    fixture
-        .store()
-        .cancel_key_transition(preexisting.transition.operation_id)
-        .await
-        .expect("cancel fixture-only bootstrap transition before isolated handler test");
-}
-
 #[tokio::test]
 async fn key_sync_preserves_exact_request_route_reads_frozen_set_and_sends_typed_reply_before_core()
 {
@@ -1650,7 +1631,6 @@ async fn freeze_stream_ack_transition(
     known_revision: KeyDirectoryRevision,
     requested_revision: KeyDirectoryRevision,
 ) -> (KeyUpdateSetV1, KeyTransitionStreamCut) {
-    clear_fixture_bootstrap_transition(fixture, known_revision).await;
     let publication_stream_id = [0xb2; 16];
     let stream_route = [0xb3; 16];
     let generation = [0xb4; 16];
@@ -1665,49 +1645,33 @@ async fn freeze_stream_ack_transition(
         .await
         .expect("create exact catalog publication stream");
 
-    let operation_id = [0xb1; 16];
+    let pending = fixture
+        .store()
+        .load_active_key_transition()
+        .await
+        .expect("load production bootstrap stream ACK transition")
+        .expect("stream ACK fixture preserves its bootstrap transition");
     let recipient = KeyTransitionRecipient {
         device_route: *DEVICE.as_bytes(),
         grant_serial: grant_serial.value(),
     };
+    assert_eq!(pending.transition.operation, KeyTransitionOperation::Add);
+    assert_eq!(pending.transition.from_revision, known_revision.value());
+    assert_eq!(pending.transition.to_revision, requested_revision.value());
+    assert_eq!(pending.transition.recipients, vec![recipient]);
+    let operation_id = pending.transition.operation_id;
     fixture
         .store()
-        .begin_key_transition_with_global_lineage_for_test(
-            BeginKeyTransition {
-                operation_id,
-                operation: KeyTransitionOperation::Renew,
-                target: KeyTransitionTarget::Device(recipient),
-                from_revision: known_revision.value(),
-                to_revision: requested_revision.value(),
-                recipients: vec![recipient],
-                replay_retirement: None,
-                created_at_ms: 1,
-            },
-            KeyTransitionGlobalLineage {
-                global_key_state_hash: [0xb5; 32],
-                stable_key_lineage_hash: Some([0xb6; 32]),
-            },
-        )
+        .finalize_key_directory_rotation(operation_id)
         .await
-        .expect("begin stream ACK fixture transition");
+        .expect("finalize stream ACK fixture key-directory axes");
+    let update = matching_bootstrap_update_for_test(&fixture.store(), recipient).await;
+    assert_eq!(update.key_revision, requested_revision.value());
+    let update_set = KeyUpdateSetV1::from_canonical_bytes(&update.canonical_update_set)
+        .expect("decode production bootstrap stream ACK update set");
     fixture
         .store()
-        .mark_key_transition_rotated(operation_id)
-        .await
-        .expect("rotate stream ACK fixture transition");
-    let update_set = key_update_set(requested_revision);
-    fixture
-        .store()
-        .freeze_key_updates(
-            operation_id,
-            vec![FrozenKeyUpdate {
-                recipient,
-                key_revision: requested_revision.value(),
-                canonical_update_set: update_set
-                    .canonical_bytes()
-                    .expect("canonical stream ACK update set"),
-            }],
-        )
+        .freeze_key_updates(operation_id, vec![update])
         .await
         .expect("freeze stream ACK update set");
     let catalog = KeyTransitionStreamCut {
@@ -1718,8 +1682,8 @@ async fn freeze_stream_ack_transition(
         relay_committed_outer: None,
         relay_committed_inner: None,
         barrier_sequence: 0,
-        old_epoch: 1,
-        new_epoch: 2,
+        old_epoch: 0,
+        new_epoch: 1,
         epoch_barrier_sha256: [0xb5; 32],
     };
     fixture
@@ -1734,7 +1698,7 @@ async fn freeze_stream_ack_transition(
         generation,
         KeyId {
             purpose: KeyPurpose::Catalog,
-            epoch: 2,
+            epoch: 1,
         },
         None,
         None,
@@ -1833,9 +1797,14 @@ async fn freeze_counter_bound_publication(
 
 #[tokio::test]
 async fn stream_applied_ack_binds_tagged_inner_cursor_exact_cut_and_canonical_replay() {
-    let fixture = active_remote_dispatch_for_test(MACHINE, DEVICE).await;
-    let (grant_serial, trust_epoch, known_revision) = active_authority(&fixture).await;
-    let requested_revision = KeyDirectoryRevision::new(known_revision.value() + 1);
+    let fixture = active_remote_dispatch_with_pending_transition_for_test(MACHINE, DEVICE).await;
+    let (grant_serial, trust_epoch, requested_revision) = active_authority(&fixture).await;
+    let known_revision = KeyDirectoryRevision::new(
+        requested_revision
+            .value()
+            .checked_sub(1)
+            .expect("bootstrap transition has a predecessor revision"),
+    );
     let conversation = RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0xba; 16])
         .expect("valid stream ACK conversation id");
     let (update_set, cut) =
@@ -1862,6 +1831,38 @@ async fn stream_applied_ack_binds_tagged_inner_cursor_exact_cut_and_canonical_re
     )
     .await
     .expect("ACK stream fixture key update");
+
+    let active = fixture
+        .store()
+        .load_active_remote_ingress(MACHINE, DEVICE)
+        .await
+        .expect("load stream ACK snapshot authorization");
+    let current = fixture
+        .store()
+        .recheck_active_remote_ingress(&active)
+        .await
+        .expect("recheck stream ACK snapshot authorization");
+    let permit = fixture
+        .store()
+        .resolve_transition_snapshot_permit(TransitionSnapshotRequest::new(
+            current,
+            KeyTransitionStreamScope::Catalog,
+            StreamCursor::BeforeFirst,
+        ))
+        .await
+        .expect("resolve bootstrap stream ACK snapshot permit");
+    assert_eq!(permit.stream_route(), cut.stream_route);
+    assert_eq!(permit.generation(), cut.generation);
+    assert_eq!(permit.barrier_sequence(), cut.barrier_sequence);
+    fixture
+        .store()
+        .mark_transition_snapshot_flushed(
+            permit
+                .into_flush([0xb7; 32])
+                .expect("bind bootstrap stream ACK SyncComplete hash"),
+        )
+        .await
+        .expect("persist bootstrap stream ACK snapshot flush");
 
     let exact_ack = StreamAppliedAckV1 {
         format_version: E2EE_FORMAT_VERSION,

@@ -66,6 +66,24 @@ pub(super) fn verify_barrier_commit(
     Ok(())
 }
 
+pub(super) fn verify_transition_publication_commit(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    transition: &KeyTransitionRecord,
+) -> Result<(), RuntimeStoreError> {
+    if transition.operation == KeyTransitionOperation::ActivateConversation {
+        super::directory_advance::verify_directory_advance_commit(
+            connection,
+            key_bundle,
+            database_id,
+            transition,
+        )
+    } else {
+        verify_barrier_commit(connection, key_bundle, transition, &transition.cuts)
+    }
+}
+
 fn load_active_publication_projections(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
@@ -191,11 +209,11 @@ pub(crate) fn validate_v12_integrity(
         }
         validate_transition_updates(&transition.record, &operation_updates)?;
         if transition.record.phase == KeyTransitionPhase::BarriersCommitted {
-            verify_barrier_commit(
+            verify_transition_publication_commit(
                 connection,
                 key_bundle,
+                database_id,
                 &transition.record,
-                &transition.record.cuts,
             )
             .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
         }

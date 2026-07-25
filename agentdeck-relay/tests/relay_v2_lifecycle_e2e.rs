@@ -2,6 +2,8 @@
 
 mod support;
 
+#[cfg(unix)]
+use std::mem::MaybeUninit;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
@@ -31,6 +33,53 @@ use support::{test_receipt_identity, write_test_receipt_signing_key};
 const SIGNAL_CHILD_ENV: &str = "AGENTDECK_RELAY_V2_SIGNAL_CHILD";
 #[cfg(unix)]
 const SIGNAL_STORAGE_ENV: &str = "AGENTDECK_RELAY_V2_SIGNAL_STORAGE";
+#[cfg(unix)]
+const PUBLIC_CAP_TEST_MIN_NOFILE: libc::rlim_t = (MAX_PUBLIC_CONNECTIONS * 2 + 256) as libc::rlim_t;
+
+#[cfg(unix)]
+fn ensure_public_cap_test_nofile_limit() {
+    let mut limits = MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) } != 0 {
+        panic!(
+            "read RLIMIT_NOFILE for the public connection-cap harness: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut limits = unsafe { limits.assume_init() };
+    if limits.rlim_cur >= PUBLIC_CAP_TEST_MIN_NOFILE {
+        return;
+    }
+    assert!(
+        limits.rlim_max >= PUBLIC_CAP_TEST_MIN_NOFILE,
+        "public connection-cap harness needs RLIMIT_NOFILE >= {PUBLIC_CAP_TEST_MIN_NOFILE}, \
+         but the process hard limit is {}",
+        limits.rlim_max
+    );
+    limits.rlim_cur = PUBLIC_CAP_TEST_MIN_NOFILE;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
+        panic!(
+            "raise RLIMIT_NOFILE for the public connection-cap harness: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let mut readback = MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, readback.as_mut_ptr()) } != 0 {
+        panic!(
+            "read back RLIMIT_NOFILE for the public connection-cap harness: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let readback = unsafe { readback.assume_init() };
+    assert!(
+        readback.rlim_cur >= PUBLIC_CAP_TEST_MIN_NOFILE,
+        "public connection-cap harness RLIMIT_NOFILE readback was {}",
+        readback.rlim_cur
+    );
+}
+
+#[cfg(not(unix))]
+fn ensure_public_cap_test_nofile_limit() {}
 
 fn signal_child_config(storage_path: PathBuf) -> RelayV2ServerConfig {
     let signer_parent = storage_path
@@ -269,6 +318,10 @@ async fn read_http_response_head(stream: &mut tokio::net::TcpStream) -> Vec<u8> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn complete_non_upgrade_requests_cannot_hold_all_public_connection_permits() {
+    // 同进程 full-stack harness 在回归路径上会同时持有 production cap 数量的 client
+    // 与 server socket。macOS test shell 的默认 soft nofile 只有 256，若不先提升，测试会
+    // 在到达 Relay 的 1024 admission 边界前因进程 FD 耗尽而得到无关的 reset/EOF。
+    ensure_public_cap_test_nofile_limit();
     let temp = TempDir::new().expect("tempdir");
     let handle = RelayV2ServerHandle::start(signal_child_config(
         temp.path().join("non-upgrade-cap").join("relay.db"),

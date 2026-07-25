@@ -323,6 +323,10 @@ async fn create_conversation(
     title: &str,
 ) {
     store
+        .ensure_remote_catalog_publication_after_transition()
+        .await
+        .expect("ensure ADC2 recovery production Catalog carrier");
+    store
         .create_conversation(NewConversation {
             conversation_id,
             adapter_state_key: runtime_id(RuntimeIdKind::AdapterState, adapter_seed),

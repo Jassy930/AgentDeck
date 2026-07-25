@@ -90,21 +90,6 @@ pub(crate) async fn complete_active_membership_transition(
     store: &RuntimeStoreHandle,
     clock: &AtomicU64,
 ) {
-    complete_active_membership_transition_with_rotation(store, clock, false).await;
-}
-
-pub(crate) async fn complete_active_membership_transition_with_production_finalize(
-    store: &RuntimeStoreHandle,
-    clock: &AtomicU64,
-) {
-    complete_active_membership_transition_with_rotation(store, clock, true).await;
-}
-
-async fn complete_active_membership_transition_with_rotation(
-    store: &RuntimeStoreHandle,
-    clock: &AtomicU64,
-    production_finalize: bool,
-) {
     let recovery = store
         .load_active_key_transition()
         .await
@@ -162,17 +147,10 @@ async fn complete_active_membership_transition_with_rotation(
         })
         .collect::<Vec<_>>();
     next_time(clock);
-    if production_finalize {
-        store
-            .finalize_key_directory_rotation(operation_id)
-            .await
-            .expect("finalize membership key-directory axes");
-    } else {
-        store
-            .mark_key_transition_rotated(operation_id)
-            .await
-            .expect("mark membership transition rotated");
-    }
+    store
+        .finalize_key_directory_rotation(operation_id)
+        .await
+        .expect("finalize membership key-directory axes");
     next_time(clock);
     store
         .freeze_key_updates(

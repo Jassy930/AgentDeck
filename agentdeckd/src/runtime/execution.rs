@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 use std::path::PathBuf;
 
 use agentdeck_protocol::ActionRequest;
@@ -254,6 +254,8 @@ pub(crate) struct PreparedRuntimeExecution {
 pub(crate) struct GatedExecutionCoordinator {
     router: Arc<AgentRouter>,
     processes: Arc<dyn ProcessGroupController>,
+    #[cfg(debug_assertions)]
+    gate_binary: Option<PathBuf>,
 }
 
 impl GatedExecutionCoordinator {
@@ -261,6 +263,20 @@ impl GatedExecutionCoordinator {
         Self {
             router,
             processes: Arc::new(SystemProcessGroupController),
+            #[cfg(debug_assertions)]
+            gate_binary: None,
+        }
+    }
+
+    /// debug-only automatic E2E 仍运行 production coordinator，但显式把 gate 指向
+    /// Cargo 构建出的真实 `agentdeckd` binary；integration-test harness 自身不实现
+    /// `--exec-gate`，不能被误当成 current daemon executable。
+    #[cfg(debug_assertions)]
+    pub(crate) fn for_synthetic_e2e(router: Arc<AgentRouter>, gate_binary: PathBuf) -> Self {
+        Self {
+            router,
+            processes: Arc::new(SystemProcessGroupController),
+            gate_binary: Some(gate_binary),
         }
     }
 }
@@ -298,13 +314,34 @@ impl RuntimeExecutionCoordinator for GatedExecutionCoordinator {
             let spec = prepared
                 .checked_exec_spec()
                 .map_err(|_| RuntimeExecutionError::PrepareFailedClean)?;
-            GatedChild::spawn_current(
+            #[cfg(debug_assertions)]
+            let spawned = match self.gate_binary.as_deref() {
+                Some(binary) => {
+                    GatedChild::spawn_with_binary(
+                        binary,
+                        context.daemon_boot_id,
+                        context.execution_nonce.clone(),
+                        spec,
+                    )
+                    .await
+                }
+                None => {
+                    GatedChild::spawn_current(
+                        context.daemon_boot_id,
+                        context.execution_nonce.clone(),
+                        spec,
+                    )
+                    .await
+                }
+            };
+            #[cfg(not(debug_assertions))]
+            let spawned = GatedChild::spawn_current(
                 context.daemon_boot_id,
                 context.execution_nonce.clone(),
                 spec,
             )
-            .await
-            .map_err(classify_gate_spawn_failure)?
+            .await;
+            spawned.map_err(classify_gate_spawn_failure)?
         };
         let process = gate.runtime_process_identity();
         let identity = gate.process_identity();

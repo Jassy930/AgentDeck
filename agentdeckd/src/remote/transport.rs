@@ -1838,20 +1838,14 @@ struct PreparedMachinePublication {
     blob_sha256: [u8; 32],
 }
 
-fn prepare_machine_publication(
+fn prepare_machine_stream_registration(
     machine_route: MachineRouteId,
     stream_route: StreamRouteId,
     stream_generation: StreamGenerationId,
-    stream_seq: u64,
-    exact_blob: Arc<[u8]>,
-    blob_sha256: [u8; 32],
-) -> Result<PreparedMachinePublication, RemoteTransportError> {
+) -> Result<RegisterStream, RemoteTransportError> {
     if machine_route.as_bytes() == &[0; 16]
         || stream_route.as_bytes() == &[0; 16]
         || stream_generation.as_bytes() == &[0; 16]
-        || stream_seq == u64::MAX
-        || sha256(exact_blob.as_ref()) != blob_sha256
-        || SignedSealedBlobV1::from_wire_bytes(exact_blob.as_ref()).is_err()
     {
         return Err(RemoteTransportError::PublicationBindingMismatch);
     }
@@ -1860,16 +1854,43 @@ fn prepare_machine_publication(
         stream_route,
         generation: stream_generation,
     };
+    if encode(&OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::RegisterStream(registration.clone()),
+    })
+    .len()
+        > MAX_FRAME_BYTES
+    {
+        return Err(RemoteTransportError::Client(RelayClientError::Failure {
+            code: "relay.client.frame_too_large".to_owned(),
+        }));
+    }
+    Ok(registration)
+}
+
+fn prepare_machine_publication(
+    machine_route: MachineRouteId,
+    stream_route: StreamRouteId,
+    stream_generation: StreamGenerationId,
+    stream_seq: u64,
+    exact_blob: Arc<[u8]>,
+    blob_sha256: [u8; 32],
+) -> Result<PreparedMachinePublication, RemoteTransportError> {
+    if stream_seq == u64::MAX
+        || sha256(exact_blob.as_ref()) != blob_sha256
+        || SignedSealedBlobV1::from_wire_bytes(exact_blob.as_ref()).is_err()
+    {
+        return Err(RemoteTransportError::PublicationBindingMismatch);
+    }
+    let registration =
+        prepare_machine_stream_registration(machine_route, stream_route, stream_generation)?;
     let publish = Publish {
         stream_route,
         generation: stream_generation,
         stream_seq,
         sealed_blob: SealedBlob(exact_blob.to_vec()),
     };
-    for body in [
-        RelayFrameBody::RegisterStream(registration.clone()),
-        RelayFrameBody::Publish(publish.clone()),
-    ] {
+    for body in [RelayFrameBody::Publish(publish.clone())] {
         if encode(&OpaqueRouteFrame {
             version: RELAY_PROTOCOL_VERSION,
             body,
@@ -1901,6 +1922,16 @@ pub(crate) struct MachinePublicationHandle {
     enabled: Arc<AtomicBool>,
     activation_epoch: Arc<AtomicU64>,
     admitted_activation_epoch: u64,
+}
+
+/// 空 genesis stream 的 register-only 结果。Relay v2 没有 RegisterStream ACK；
+/// `Registered` 只表示 exact frame 已在当前 authenticated MachineLink FIFO 完成 writer
+/// flush，后续 directed reply 会排在它之后。其余两态必须 fail-close 并 exact retry。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MachineStreamRegistrationOutcome {
+    Registered { connection_generation: u64 },
+    OutcomeUnknown,
+    Offline,
 }
 
 /// 已领取 business activation 的窄 reconnect 观察者。旧 activation 被 restore/drop
@@ -1948,6 +1979,10 @@ impl AuthenticatedBusinessReconnects {
 }
 
 impl MachinePublicationHandle {
+    pub(crate) const fn machine_route(&self) -> MachineRouteId {
+        self.machine_route
+    }
+
     pub(crate) fn current_connection_generation(&self) -> u64 {
         self.connection_generation.load(Ordering::Acquire)
     }
@@ -1964,6 +1999,68 @@ impl MachinePublicationHandle {
             enabled: Arc::clone(&self.enabled),
             activation_epoch: Arc::clone(&self.activation_epoch),
             admitted_activation_epoch: self.admitted_activation_epoch,
+        }
+    }
+
+    pub(crate) async fn register_stream_exact(
+        &self,
+        stream_route: StreamRouteId,
+        stream_generation: StreamGenerationId,
+    ) -> Result<MachineStreamRegistrationOutcome, RemoteTransportError> {
+        let expected_connection_generation = self.current_connection_generation();
+        self.register_stream_exact_for_generation(
+            expected_connection_generation,
+            stream_route,
+            stream_generation,
+        )
+        .await
+    }
+
+    pub(crate) async fn register_stream_exact_for_generation(
+        &self,
+        expected_connection_generation: u64,
+        stream_route: StreamRouteId,
+        stream_generation: StreamGenerationId,
+    ) -> Result<MachineStreamRegistrationOutcome, RemoteTransportError> {
+        if !self.enabled.load(Ordering::Acquire)
+            || self.activation_epoch.load(Ordering::Acquire) != self.admitted_activation_epoch
+        {
+            return Err(RemoteTransportError::BusinessLaneUnavailable);
+        }
+        let registration = prepare_machine_stream_registration(
+            self.machine_route,
+            stream_route,
+            stream_generation,
+        )?;
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SupervisorCommand::RegisterStream {
+                expected_connection_generation,
+                expected_activation_epoch: self.admitted_activation_epoch,
+                registration,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| RemoteTransportError::Closed)?;
+        match response_rx.await {
+            Ok(Ok(()))
+                if self.current_connection_generation() == expected_connection_generation =>
+            {
+                Ok(MachineStreamRegistrationOutcome::Registered {
+                    connection_generation: expected_connection_generation,
+                })
+            }
+            Ok(Ok(())) | Ok(Err(RemoteTransportError::BusinessGenerationReplaced)) => {
+                Ok(MachineStreamRegistrationOutcome::OutcomeUnknown)
+            }
+            Ok(Err(RemoteTransportError::PublicationOffline)) => {
+                Ok(MachineStreamRegistrationOutcome::Offline)
+            }
+            Ok(Err(RemoteTransportError::Client(_))) => {
+                Ok(MachineStreamRegistrationOutcome::OutcomeUnknown)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(RemoteTransportError::Closed),
         }
     }
 
@@ -2019,33 +2116,21 @@ impl MachinePublicationHandle {
             exact_blob,
             blob_sha256,
         )?;
-        let (register_tx, register_rx) = oneshot::channel();
-        if self
-            .command_tx
-            .send(SupervisorCommand::RegisterStream {
+        match self
+            .register_stream_exact_for_generation(
                 expected_connection_generation,
-                expected_activation_epoch: self.admitted_activation_epoch,
-                registration: prepared.registration,
-                response: register_tx,
-            })
-            .await
-            .is_err()
+                prepared.registration.stream_route,
+                prepared.registration.generation,
+            )
+            .await?
         {
-            return Err(RemoteTransportError::Closed);
-        }
-        match register_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(RemoteTransportError::PublicationOffline)) => {
+            MachineStreamRegistrationOutcome::Registered { .. } => {}
+            MachineStreamRegistrationOutcome::Offline => {
                 return Ok(MachinePublicationOutcome::Offline);
             }
-            Ok(Err(RemoteTransportError::BusinessGenerationReplaced)) => {
+            MachineStreamRegistrationOutcome::OutcomeUnknown => {
                 return Ok(MachinePublicationOutcome::OutcomeUnknown);
             }
-            Ok(Err(RemoteTransportError::Client(_))) => {
-                return Ok(MachinePublicationOutcome::OutcomeUnknown);
-            }
-            Err(_) => return Err(RemoteTransportError::Closed),
-            Ok(Err(error)) => return Err(error),
         }
 
         let (publish_tx, publish_rx) = oneshot::channel();
@@ -5250,6 +5335,45 @@ pub(crate) mod tests {
 
         drop(retry_lane);
         transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_only_flushes_exact_stream_on_the_existing_business_fifo() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let business = fixture
+            .transport
+            .take_business_lane()
+            .expect("take unique business lane");
+        let registration = business.publication_handle();
+        let stream_route = StreamRouteId::from_bytes([0xbe; 16]);
+        let generation = StreamGenerationId::from_bytes([0xbf; 16]);
+
+        for expected_frames in 1..=2 {
+            assert_eq!(
+                registration
+                    .register_stream_exact(stream_route, generation)
+                    .await
+                    .expect("flush exact RegisterStream"),
+                MachineStreamRegistrationOutcome::Registered {
+                    connection_generation: INITIAL_PAIRING_GENERATION,
+                }
+            );
+            let sent = fixture.harness.sent.lock().expect("lock sent").clone();
+            assert_eq!(sent.len(), expected_frames);
+            assert!(matches!(
+                &sent[expected_frames - 1].body,
+                RelayFrameBody::RegisterStream(register)
+                    if register.machine_route == ROUTE
+                        && register.stream_route == stream_route
+                        && register.generation == generation
+            ));
+            assert!(
+                sent.iter()
+                    .all(|frame| !matches!(frame.body, RelayFrameBody::Publish(_)))
+            );
+        }
+        assert_eq!(fixture.harness.connects.load(Ordering::SeqCst), 1);
+        fixture.transport.shutdown().await;
     }
 
     #[tokio::test]

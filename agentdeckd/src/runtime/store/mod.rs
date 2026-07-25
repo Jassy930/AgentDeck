@@ -67,7 +67,8 @@ mod pairing_grant_renewal;
 mod pairing_grant_tests;
 #[cfg(test)]
 pub(crate) use pairing_grant_tests::{
-    complete_active_zero_cut_transition, grant_input_with as grant_input_with_for_test,
+    complete_active_zero_cut_transition, complete_active_zero_cut_transition_with_counter_guard,
+    grant_input_with as grant_input_with_for_test,
 };
 mod pairing_grant_tx;
 pub(crate) use pairing_delivery::{

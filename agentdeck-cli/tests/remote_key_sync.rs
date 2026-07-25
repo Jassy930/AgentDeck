@@ -683,6 +683,28 @@ fn resolved_state_can_only_be_superseded_by_a_new_authenticated_revision_cycle()
     assert_eq!(reopened, next);
     assert_eq!(reopened.latest_completed_ack_basis(), Some(prior_ack));
 
+    let advance_next_request = resolved
+        .next_cycle_request(&next_observation, STARTED_AT_MS + 40_000)
+        .expect("typed notice next-cycle request");
+    let advance_next = resolved
+        .start_next_cycle_after_directory_advance(
+            next_observation.clone(),
+            STARTED_AT_MS + 40_000,
+            frozen_request(advance_next_request, 0x94),
+        )
+        .expect("typed DirectoryRevisionAdvance starts without predecessor ACK retention");
+    assert_eq!(advance_next.status(), KeySyncCoordinationStatus::Active);
+    assert_eq!(advance_next.attempt(), 1);
+    assert_eq!(advance_next.latest_completed_ack_basis(), None);
+    let reopened_advance = DurableKeySyncStateV1::from_canonical_bytes(
+        &advance_next
+            .canonical_bytes()
+            .expect("encode typed-notice superseding cycle"),
+    )
+    .expect("restart preserves absence of predecessor ACK basis");
+    assert_eq!(reopened_advance, advance_next);
+    assert_eq!(reopened_advance.latest_completed_ack_basis(), None);
+
     let wrong_known = SignedHigherRevisionObservationV1::new(
         resolved.observation().machine_route(),
         resolved.observation().device_route(),

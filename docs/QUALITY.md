@@ -1054,7 +1054,8 @@ P4.3 已由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad
 DeviceGrant/auth ledger/revoke/control handoff；P4.4 又由 `cd7d9fb` 收口 MachineLink ingress/
 RuntimeCore dispatch；P4.5 由 `c6ef387`、`88b3c42` 收口 signed publication、key/counter/replay crash
 recovery。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；
-P4 按 Task 进度为 6/7。P4.7、P4 Phase Exit 与 P5/P6 自动实现仍未完成。
+P4.7 automatic Task 与 P4 automatic Phase Exit 已完成，P4 按 Task 进度为 7/7。P5/P6 自动实现仍为
+0/9、0/4，尚未完成。
 
 ## Relay Companion MVP P3.8-A local Runtime UDS transport primitives 门禁
 
@@ -2025,9 +2026,10 @@ production-signed LaunchAgent/Keychain roundtrip 继续精确输出 post-MVP
 自动项；整体 exit 0 只表示契约与 automatic scope 通过，不表示 production signing PASS。P3.1 继续采用
 方案 b，stable production signing 仍未完成。P3 Phase 至此 complete（MVP automatic scope）。P4.1–P4.5
 已按下节 automatic Task gate 收口；P4.6 persistent remote CLI 已完成 automatic Task，
-P4 按 Task 进度为 6/7。P4.5 已在
+P4.7 automatic Task 与 P4 automatic Phase Exit 也已完成，P4 按 Task 进度为 7/7。P4.5 已在
 P4.4 的唯一 business ingress/Core dispatch 上安装 production directed sealer、shared publisher、
-crash-safe CounterGuard/outbox/replay recovery；这仍只是 P4.5 Task PASS，不是 P4 Phase PASS。
+crash-safe CounterGuard/outbox/replay recovery；这段仍只描述 P4.5 Task PASS，P4 Phase PASS 由后续
+P4.7 的独立门禁与双路 review 证明。
 
 ## Relay Companion MVP P4.1 machine identity / Keychain guard Task gate（PASS）
 
@@ -2233,8 +2235,8 @@ generation/replay/connection/reply-route，不持 canonical conversation/command
 收口时 `DirectedReplySealer` / `RemoteStreamPublisher` 尚未安装、production
 `admission_ready=false`；后续 P4.5 已安装这些 production 组合并保持同一所有权边界。P4.6 persistent
 remote CLI 已完成 automatic Task，production-signed PASS 仍未完成。当前 verifier 脚本只接受
-`p0|p2|p3`；P4 aggregate
-verifier 由 P4.7 建立，P4.4 与后续 P4.5 Task 均不宣称 `p4`/`p4-auto` PASS。
+`p0|p2|p3|p4-auto`；`p4-auto` focused aggregate 已在 P4.7 收口时 PASS，`p4` 仍不受支持。
+P4.4 与后续 P4.5 Task 的既有证据本身均不等于 P4.7 `p4-auto` 或 P4 aggregate PASS。
 
 ## Relay Companion MVP P4.5 signed publication / counter recovery Task gate（PASS）
 
@@ -2256,8 +2258,10 @@ P0/P1/P2=0。
 本 Task 只证明 daemon 侧 MachineDataSign、directed/shared sealing、durable publication outbox、Relay
 COMMIT/local ACK、key directory/epoch barrier、counter/replay crash recovery 与恢复期 admission fence。
 P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；P4 按
-Task 进度为 6/7，P4 automatic E2E/P4 Phase Exit 仍未完成。当前
-`scripts/verify-relay-companion-mvp.sh` 只支持 `p0|p2|p3`，不得声称 `p4` 或 `p4-auto` PASS。P3.1
+当时的 Task 进度为 6/7；该值是 P4.6 收口时点，不是当前状态。后续 P4.7 automatic E2E 与 P4
+automatic Phase Exit 已完成，当前为 7/7。`scripts/verify-relay-companion-mvp.sh` 支持
+`p0|p2|p3|p4-auto`，但 `p4` 仍不受支持；P4 aggregate PASS 由 P4.7 `p4-auto`、独立顶层门禁、
+冻结 candidate hash 与双路 phase review 共同证明。P3.1
 继续采用方案 b；provisioned production-signed Keychain/LaunchAgent 与真实设备/公网证据继续保留为
 post-MVP `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不计 PASS，也不反向否定 P4.5
 automatic Task gate。
@@ -2363,10 +2367,11 @@ high-water 或 128 MiB physical-memory 承诺**。四 schema、CLI/protocol/rela
 hash 上 Approved，P0/P1/P2=0。
 
 8 MiB lowered-cap seam 只在 `debug_assertions` automatic test build 中存在，release artifact 不编译该入口，
-也不存在 CLI/env/config 可配置路径。上述实现以 automatic Task complete 计为 P4 的第 6/7 项。
+也不存在 CLI/env/config 可配置路径。上述实现以 automatic Task complete 计为 P4 的第 6/7 项；这是
+P4.6 的历史 Task 序号，不随当前 P4 7/7 结论改写。
 automatic injected keystore/verifier 只证明同一状态机；production-signed CLI/Data Protection Keychain readback
-继续作为 post-MVP `BLOCKED`，不得计 PASS。`p4-auto` 仍属于 P4.7，当前 verifier 尚未提供该入口；P4 Phase
-Exit、iOS 真实链路、物理设备与公网证据也仍未完成。
+继续作为 post-MVP `BLOCKED`，不得计 PASS。后续 P4.7 focused `p4-auto`、独立顶层门禁、冻结 hash 与
+双路 phase review 已通过，P4 automatic Phase Exit complete；iOS 真实链路、物理设备与公网证据仍未完成。
 
 ## Relay Companion MVP P4 pairing→key-transition production hardening gate
 
@@ -2429,8 +2434,73 @@ git diff --check
 git status --short --branch
 ```
 
-本 gate 通过也只收口该 production hardening；P4 继续为 **6/7**，P4.7 checkbox、`p4-auto` 与 P4 Phase Exit
-在其独立 automatic E2E/真实槽位 contract/phase review 完成前必须保持未完成。
+本 gate 通过也只收口该 production hardening；在该 gate 的历史时点 P4 仍为 **6/7**，不能仅凭它勾选
+P4.7、`p4-auto` 或 P4 Phase Exit。后续 P4.7 独立 automatic E2E、真实槽位 contract 与 phase review 已完成。
+
+## Relay Companion MVP P4.7 automatic Task / P4 Phase Exit gate（PASS）
+
+`scripts/verify-relay-companion-mvp.sh p4-auto` 已完整 PASS；`p4` 仍不受支持。P4.7 automatic Task 与
+P4 automatic Phase Exit 已完成，P4 为 7/7。pre-closeout review candidate SHA-256 为
+`18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5`；`spec/security` 与 `quality`
+均 Approved，P0/P1/P2=0。
+
+`p4-auto` 只运行以下 focused aggregate：
+
+```bash
+bash scripts/verify-relay-companion-mvp.sh p4-auto
+```
+
+其内部覆盖 daemon machine synthetic E2E（由该 target 通过 `PersistentRemoteComposition` 与 persistent
+high-level API 承担完整远程 CLI 路径）、独立 RuntimeCore remote-principal cannot-confirm-pairing gate、
+CLI paired-state restart/legacy ADSB v3 migration 与真实槽位 contract、current V6 signed-frame crash/readback、
+pairing 与 trust-reset state machine、production composition、relay-client/protocol、network boundary、四份
+schema 与 agent docs。`agentdeck-cli/tests/e2e_remote_synthetic.rs` 本身不冒充完整 high-level E2E；
+cannot-confirm-pairing 必须由独立 RuntimeCore principal gate 证明，也不属于 machine E2E 的自证范围。
+
+该 focused aggregate **不包含**：
+
+- 顶层 `cargo test` 与 `swift test`；
+- 最终 `git diff --check` 与 `git status --short --branch`；
+- 冻结 candidate hash；
+- 同一冻结 hash 上的独立 `spec/security`、`quality` phase review。
+
+P4.7 收口时还单独运行并记录了：
+
+```bash
+cargo test --locked
+swift test
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/verify-relay-companion-mvp.sh p4-auto
+scripts/verify-agent-docs.sh
+git diff --check
+git status --short --branch
+```
+
+fresh `cargo test --locked`、`swift test`（577/577）、三组 Clippy、fmt、daemon network/no-net、四 schema、
+agent docs、diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics 均通过。`p4-auto` 的 focused
+PASS 与这些独立门禁、冻结 hash、双路 review 合并后，才构成 P4 automatic Phase Exit；不能把单独的
+focused aggregate 写成完整 Phase PASS。
+
+其中 current V6 replay tuple 的非零 signed-frame hash、crash cut 与 cold readback 由以下既有 focused gate
+直接证明；legacy ADSB v3 fixture 的零 sentinel 不得替代该证据：
+
+```bash
+RUSTC_WRAPPER= cargo test -p agentdeck-cli --locked \
+  --test remote_live_key_update \
+  directory_advance_crash_after_replay_commit_recovers_exact_signed_frame \
+  -- --exact --test-threads=1
+```
+
+`scripts/run-relay-companion-p4-real-e2e.sh` 当前不是 prerequisite preflight，而是静态 fail-closed slot
+sentinel：不读取参数或环境变量，不探测 release signing、entitlement、WSS、vendor login 或 disposable
+profile，也不执行真实链路。每次只固定输出完整 `missingInputs`，并精确保持
+`BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`；真实 preflight/execution 留给 post-MVP。Linux
+只允许 ephemeral test keys；macOS production persistent pairing 必须使用 Data Protection Keychain，不存在
+CLI/env/config injected/file/dev keystore 降级面。MachineRoot 丢失时按
+[`RELAY_RUNBOOK.md`](RELAY_RUNBOOK.md#machineroot-丢失后的-portable-purge-receipt) 的 portable purge
+receipt 流程处理，不得用 sentinel 或 synthetic receipt 代替。
+production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与
+destructive purge 继续保持 post-MVP BLOCKED，不属于 P4 automatic PASS；P5/P6 仍为 0/9、0/4。
 
 ## AppKit 重写后的验证清单
 
@@ -2570,13 +2640,14 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P3.9-C3 App model cutover | 运行本页 App coordinator/canonical model/reliability/Preview focused `46/46`、完整 Swift、普通与 warnings-as-errors build、iOS Simulator、production source purge、strict format/diff 与双路独立终审；普通 GUI 已默认 shared UDS 且 socket failure 零 fallback；Rust CLI、`main.swift --selfcheck` 与双客户端组合 smoke 当时不计入 C3，后由 P3.9-D 完成 |
 | Relay Companion MVP P3.9-D 默认入口与组合 smoke | 运行本页 CLI/daemon/Swift/iOS 全量、真实双客户端 smoke、active-turn/双连接/close-only 组合证据、release hidden-surface、四 schema、scoped Clippy/network/docs/fmt/diff 与双路终审。`b818f81` 已完成且全部自动门禁 PASS；真实 vendor login 与 P3.1 provisioned Keychain 仍按 post-MVP BLOCKED 记录，不冒充本 Task 证据 |
 | Relay Companion MVP P3.9-E App 会话可靠性 | 运行本页 retry/reconnect/history/subscription/composer focused、完整 Swift/iOS、真实 local-runtime smoke、四 schema、network/docs/diff、changed-source baseline parity 与双路终审。`d68cc02` 已完成且自动门禁 PASS；4 个 legacy 文件只证明诊断数下降，不冒充全文件 strict clean，也不冒充真实 vendor/remote/signed 证据 |
-| Relay Companion MVP P3.10 LaunchAgent lifecycle / upgrade 与 P3 Phase Exit | `19622ab` 已完成 admin ledger、upgrade/fence、CLI lifecycle Task；`773a2b3`、`0057824`、`81cc314`、`9efb28d` 完成 verifier 资源/进程组 hardening 与 legacy pre-RW 认证。基于 `9efb28d` 的独立 `bash scripts/verify-relay-companion-mvp.sh p3` exit 0，双路 code review P0/P1/P2 = 0，P3 automatic scope complete；production-signed 槽位仍只能输出 post-MVP `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不得冒充 PASS。后续 P4.1–P4.5 已收口，P4.6 已完成 automatic Task，P4 按进度为 6/7 |
+| Relay Companion MVP P3.10 LaunchAgent lifecycle / upgrade 与 P3 Phase Exit | `19622ab` 已完成 admin ledger、upgrade/fence、CLI lifecycle Task；`773a2b3`、`0057824`、`81cc314`、`9efb28d` 完成 verifier 资源/进程组 hardening 与 legacy pre-RW 认证。基于 `9efb28d` 的独立 `bash scripts/verify-relay-companion-mvp.sh p3` exit 0，双路 code review P0/P1/P2 = 0，P3 automatic scope complete；production-signed 槽位仍只能输出 post-MVP `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不得冒充 PASS。后续 P4.1–P4.7 与 P4 automatic Phase Exit 已收口，P4 为 7/7 |
 | Relay Companion MVP P4.1 machine identity / Keychain guard | 运行本页 bootstrap、machine keys、machine identity Store、RootKeyId 与 v7→v8 focused gates；Task 收口再跑完整 daemon package/capacity、dev/ephemeral selfcheck、diagnostics、network boundary、schema/manifest、secret/log/static sentinel、Clippy/fmt/diff/status及双路终审。只证明 v8 authenticated identity、四组 key/guard、通用 CounterGuard IO 与 RemoteStartPermit owner；不冒充 active counter reservation/full rollback、cert/enrollment/receipt IO、RemoteLink 或 production-signed Keychain PASS。`46c6bb8` 基线已 PASS；后续 P4.2 已接管 cert/enrollment/control-only transport |
 | Relay Companion MVP P4.2 certificate / enrollment / trust reset | 运行本页 manager/finalizer/CLI purge/launchd/transport 与五份 integration focused gates，再跑完整 daemon/CLI/relay-client/protocol/Relay TLS/crypto/Swift/iOS Simulator、dev/ephemeral selfcheck、hermetic smoke、diagnostics、schema/manifest/static sentinel、network、Clippy/fmt/diff/status与双路终审。只证明 v9 authenticated lifecycle、control-only MachineLink、两条 trust reset及安全 uninstall purge；不冒充业务 RemoteLink/E2EE、持久远程 CLI、iOS 真实链路或 production-signed PASS。`a6842bc` 基线 PASS |
 | Relay Companion MVP P4.3 PairInvite / DeviceGrant / auth ledger | 运行本页 transport/pairing/manager/trust-reset/Store/reset-guard/真实 TLS+UDS+CLI focused gates，再跑完整 Rust/Swift/iOS、schema/network/docs/Clippy/fmt/diff/status与双路终审。只证明 Runtime v4/schema v10、本机确认 pairing、byte-stable grant/authorization/key-directory、revoke 与 control handoff；本 Task 不冒充业务 RemoteLink/E2EE、persistent remote CLI、iOS 真实链路或 production-signed PASS。`4fd8ed8..3b4b977` 基线 PASS；后续 P4.4 已接线 ingress/Core |
 | Relay Companion MVP P4.4 MachineLink ingress / RuntimeCore dispatch | 运行本页 protocol contract `8/8`、MachineLink boundary `1/1`、RuntimeCore static `3/3`、完整 daemon package、跨 crate/Swift/iOS、四 schema、network/no-net/docs/Clippy/fmt/diff 与双路终审。`cd7d9fb` 基线 PASS；本 Task 只证明严格 ingress、Store exact recheck、RemotePrincipal→Core、conversation-scoped recovery 与 typed egress seam。sealer/publisher 在 P4.4 收口时仍 unavailable，后续已由 P4.5 安装；P4.4 自身不冒充 counter/outbox/Relay Publish、persistent CLI、remote E2E 或 production-signed PASS |
-| Relay Companion MVP P4.5 signed publication / counter recovery | 核对 `c6ef387` + `88b3c42`，运行 remote focused `430/430`、完整 daemon package（lib `1579/3 ignored`、main `7/7`、256 MiB boundary `5/5`）、Clippy/fmt/diff 与冻结 hash 双路终审。只证明当时 Runtime v4/schema v14/35 下 daemon 侧 exact sealing/outbox/Relay COMMIT/local ACK、key/counter/replay crash recovery；后续 P4.6 已完成 automatic Task，P4 按进度为 6/7。verifier 仍只接受 `p0|p2|p3`，不得冒充 `p4`/`p4-auto`、真实设备/公网或 production-signed PASS |
-| Relay Companion MVP P4.6 persistent remote CLI | 2026-07-24 automatic Task complete；冻结 29-path code/test scope，blob-manifest SHA-256 `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`。watch `12/12`、`remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client `25/25`、protocol `244/244` 与全部静态门禁均通过；`spec/security` 与 `quality` 均 Approved、P0/P1/P2=0。current Runtime 为 v5；`pair|machines|conversations|watch|prompt|approve|retry-approval|revoke-self` 已接入。P4 按进度为 6/7，production-signed Keychain 保持 post-MVP BLOCKED，不宣称 `p4-auto` 或 P4 Phase PASS |
+| Relay Companion MVP P4.5 signed publication / counter recovery | 核对 `c6ef387` + `88b3c42`，运行 remote focused `430/430`、完整 daemon package（lib `1579/3 ignored`、main `7/7`、256 MiB boundary `5/5`）、Clippy/fmt/diff 与冻结 hash 双路终审。只证明当时 Runtime v4/schema v14/35 下 daemon 侧 exact sealing/outbox/Relay COMMIT/local ACK、key/counter/replay crash recovery；后续 P4.6 完成时 P4 当时为 6/7，该历史 Task 证据本身不等于后续 P4.7 `p4-auto` 或 P4 Phase PASS。P4.7 已另行收口；不得把 automatic PASS 冒充真实设备/公网或 production-signed PASS |
+| Relay Companion MVP P4.6 persistent remote CLI | 2026-07-24 automatic Task complete；冻结 29-path code/test scope，blob-manifest SHA-256 `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`。watch `12/12`、`remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client `25/25`、protocol `244/244` 与全部静态门禁均通过；`spec/security` 与 `quality` 均 Approved、P0/P1/P2=0。current Runtime 为 v5；`pair|machines|conversations|watch|prompt|approve|retry-approval|revoke-self` 已接入。P4 在该 Task 收口时为 6/7，production-signed Keychain 保持 post-MVP BLOCKED；既有 Task 证据不等于后续 P4.7 `p4-auto` 或 P4 Phase PASS |
+| Relay Companion MVP P4.7 automatic E2E / real slot / phase docs | automatic Task 与 P4 automatic Phase Exit complete，P4 为 7/7。focused `p4-auto`、fresh `cargo test --locked`、Swift 577/577、三组 Clippy、fmt、network/no-net、schema/docs/diff、local smoke/selfcheck/diagnostics 与 pre-closeout hash `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的双路 review 均通过，P0/P1/P2=0；`p4` 仍不受支持。远端 cannot-confirm pairing 由独立 RuntimeCore principal gate 证明。runner 不读参数/env、不探测或执行，只固定输出完整 missingInputs 与 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`；production-signed、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac与 destructive purge 继续 post-MVP BLOCKED |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

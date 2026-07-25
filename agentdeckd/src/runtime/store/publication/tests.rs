@@ -9,6 +9,8 @@ use crate::runtime::store::RuntimeStoreConfig;
 use crate::runtime::store::identity::{RuntimeIdError, RuntimeIdSource};
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
+mod remote_authority;
+
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
 struct FailOnceAfterRotation(std::sync::atomic::AtomicBool);
@@ -197,6 +199,84 @@ fn create_catalog_entry(
     super::super::journal::create_conversation(state, config, input, descriptor, &mut effects)
         .expect("create catalog entry");
     conversation_id
+}
+
+#[test]
+fn catalog_subscription_stream_is_created_once_and_replays_exact_axes() {
+    let (root, base_config, mut state) = open_publication_test_store("catalog-subscription-stream");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let config = base_config.with_id_source(CountingIdSource {
+        next: 0x51,
+        calls: Arc::clone(&calls),
+    });
+    let before = super::super::sqlite::load_runtime_ledger(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+    )
+    .expect("load zero-cut ledger before first subscription");
+    assert_eq!(before.publication_stream_count, 0);
+
+    let first =
+        ensure_subscription_publication_stream(&mut state, &config, PublicationScope::Catalog, 10)
+            .expect("provision first catalog subscription stream");
+    let replay =
+        ensure_subscription_publication_stream(&mut state, &config, PublicationScope::Catalog, 11)
+            .expect("replay exact catalog subscription stream");
+
+    assert_eq!(replay, first);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(first.publication_stream_id, [0x51; 16]);
+    assert_eq!(first.stream_route, [0x52; 16]);
+    assert_eq!(first.generation, [0x53; 16]);
+    let after = super::super::sqlite::load_runtime_ledger(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+    )
+    .expect("load catalog subscription ledger");
+    assert_eq!(after.publication_stream_count, 1);
+    assert_eq!(
+        authenticate_catalog_directory(&state)
+            .expect("authenticate catalog subscription directory"),
+        Some(first)
+    );
+
+    drop(state);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn conversation_subscription_reuses_activation_mapping_and_never_invents_one() {
+    let (root, config, mut state) = open_publication_test_store("conversation-subscription-stream");
+    let conversation_id = create_catalog_entry(&mut state, &config, 0x35);
+    let activated = authenticate_conversation_directory(&state, conversation_id)
+        .expect("authenticate activation mapping")
+        .expect("activation mapping exists");
+
+    let replay = ensure_subscription_publication_stream(
+        &mut state,
+        &config,
+        PublicationScope::Conversation(conversation_id),
+        activated.updated_at_ms.saturating_add(1),
+    )
+    .expect("reuse conversation activation mapping");
+    assert_eq!(replay, activated);
+
+    let missing = RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x7f; 16])
+        .expect("missing conversation id");
+    assert!(matches!(
+        ensure_subscription_publication_stream(
+            &mut state,
+            &config,
+            PublicationScope::Conversation(missing),
+            replay.updated_at_ms.saturating_add(1),
+        ),
+        Err(RuntimeStoreError::PublicationMismatch)
+    ));
+
+    drop(state);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1932,7 +2012,193 @@ fn conversation_rollover_preserves_authenticated_inner_cut_across_restart() {
     assert_eq!(continued.stream_seq, 0);
     assert_eq!(continued.inner_after, Some(0));
     assert_eq!(continued.inner_through, Some(1));
+    acknowledge_publication_commit(
+        &mut reopened,
+        &config,
+        mapping.publication_stream_id,
+        persisted.generation,
+        continued.stream_seq,
+        continued.blob_sha256,
+        now_ms + 8,
+    )
+    .expect("Relay COMMIT persists ahead of local delivery ACK");
+    let committed = load_stream(
+        &reopened.connection,
+        &reopened.key_bundle,
+        mapping.publication_stream_id,
+    )
+    .expect("load committed rotation continuation");
+    assert_eq!(committed.committed_high_water, Some(0));
+    assert_eq!(committed.committed_inner_cursor, Some(1));
+    assert_eq!(committed.acknowledged_high_water, None);
+    assert_eq!(committed.acknowledged_inner_cursor, Some(0));
+    assert_eq!(
+        reopened
+            .connection
+            .query_row("SELECT COUNT(*) FROM publication_outbox", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count committed but unacknowledged outbox"),
+        1
+    );
+
     drop(reopened);
+    let kek = load_or_create_storage_kek(&keys, &root.join("key-state.db"))
+        .expect("reload post-COMMIT conversation rollover KEK");
+    let mut post_commit = super::super::sqlite::open(&config, kek)
+        .expect("restart authenticates committed-ahead-of-ack inner cursor");
+    let recovered = load_stream(
+        &post_commit.connection,
+        &post_commit.key_bundle,
+        mapping.publication_stream_id,
+    )
+    .expect("recover committed-ahead-of-ack stream");
+    assert_eq!(recovered.committed_high_water, Some(0));
+    assert_eq!(recovered.committed_inner_cursor, Some(1));
+    assert_eq!(recovered.acknowledged_high_water, None);
+    assert_eq!(recovered.acknowledged_inner_cursor, Some(0));
+    acknowledge_publication_delivery(
+        &mut post_commit,
+        &config,
+        mapping.publication_stream_id,
+        persisted.generation,
+        continued.stream_seq,
+        continued.blob_sha256,
+        now_ms + 9,
+    )
+    .expect("local delivery ACK catches up after restart");
+    let acknowledged = load_stream(
+        &post_commit.connection,
+        &post_commit.key_bundle,
+        mapping.publication_stream_id,
+    )
+    .expect("load locally acknowledged continuation");
+    assert_eq!(acknowledged.committed_high_water, Some(0));
+    assert_eq!(acknowledged.committed_inner_cursor, Some(1));
+    assert_eq!(acknowledged.acknowledged_high_water, Some(0));
+    assert_eq!(acknowledged.acknowledged_inner_cursor, Some(1));
+    assert_eq!(
+        post_commit
+            .connection
+            .query_row("SELECT COUNT(*) FROM publication_outbox", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count retained outbox after local ACK"),
+        0
+    );
+    drop(post_commit);
+    let kek = load_or_create_storage_kek(&keys, &root.join("key-state.db"))
+        .expect("reload post-ACK conversation rollover KEK");
+    let post_ack = super::super::sqlite::open(&config, kek)
+        .expect("restart authenticates caught-up committed and acknowledged cursors");
+    let persisted_ack = load_stream(
+        &post_ack.connection,
+        &post_ack.key_bundle,
+        mapping.publication_stream_id,
+    )
+    .expect("load restarted acknowledged continuation");
+    assert_eq!(persisted_ack.committed_inner_cursor, Some(1));
+    assert_eq!(persisted_ack.acknowledged_inner_cursor, Some(1));
+    drop(post_ack);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn authenticated_outer_ack_inner_reverse_lag_fails_rust_integrity_when_checks_are_bypassed() {
+    let (root, config, mut state) = open_publication_test_store("outer-ack-inner-reverse-lag");
+    let stream_id = [0x5a; 16];
+    let generation = [0x5b; 16];
+    create_publication_stream(
+        &mut state,
+        &config,
+        stream_id,
+        PublicationScope::Catalog,
+        [0x5c; 16],
+        generation,
+        1,
+    )
+    .expect("create reverse-lag catalog stream");
+    let frozen = freeze_publication(
+        &mut state,
+        &config,
+        FreezePublicationRequest {
+            publication_id: [0x5d; 16],
+            publication_stream_id: stream_id,
+            generation,
+            counter_scope_token: [0x5e; 32],
+            sender_counter: 1,
+            inner_after: None,
+            inner_through: Some(0),
+            payload_kind: PublicationPayloadKind::Catalog,
+            blob: b"outer-ack-inner-reverse-lag".to_vec(),
+        },
+        2,
+    )
+    .expect("freeze reverse-lag publication");
+    acknowledge_publication_commit(
+        &mut state,
+        &config,
+        stream_id,
+        generation,
+        frozen.stream_seq,
+        frozen.blob_sha256,
+        3,
+    )
+    .expect("commit reverse-lag publication baseline");
+    acknowledge_publication_delivery(
+        &mut state,
+        &config,
+        stream_id,
+        generation,
+        frozen.stream_seq,
+        frozen.blob_sha256,
+        4,
+    )
+    .expect("ack reverse-lag publication baseline");
+
+    state
+        .connection
+        .execute_batch("PRAGMA ignore_check_constraints = ON")
+        .expect("bypass physical CHECK for authenticated Rust-validator fixture");
+    let transaction = Transaction::new_unchecked(&state.connection, TransactionBehavior::Immediate)
+        .expect("begin authenticated reverse-lag fixture transaction");
+    let mut stream = load_stream(&transaction, &state.key_bundle, stream_id)
+        .expect("load valid caught-up publication stream");
+    assert_eq!(stream.committed_inner_cursor, Some(0));
+    assert_eq!(stream.acknowledged_inner_cursor, Some(0));
+    stream.acknowledged_inner_cursor = Some(1);
+    stream.updated_at_ms = 5;
+    update_stream(&transaction, &state.key_bundle, &stream)
+        .expect("install authenticated reverse-lag row with CHECK bypassed");
+    transaction
+        .commit()
+        .expect("commit authenticated reverse-lag fixture");
+    state
+        .connection
+        .execute_batch("PRAGMA ignore_check_constraints = OFF")
+        .expect("restore physical CHECK enforcement");
+
+    assert!(matches!(
+        load_stream(&state.connection, &state.key_bundle, stream_id),
+        Err(RuntimeStoreError::UnknownOrCorruptSchema)
+    ));
+    let ledger = super::super::sqlite::load_runtime_ledger(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+    )
+    .expect("load authenticated reverse-lag ledger");
+    assert!(matches!(
+        validate_integrity(
+            &state.connection,
+            &state.key_bundle,
+            state.database_id,
+            &ledger,
+        ),
+        Err(RuntimeStoreError::UnknownOrCorruptSchema)
+    ));
+
+    drop(state);
     let _ = fs::remove_dir_all(root);
 }
 

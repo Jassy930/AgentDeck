@@ -7,6 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agentdeck_protocol::runtime::StreamCursor;
 use tokio::sync::{mpsc, watch};
@@ -124,12 +125,48 @@ impl fmt::Debug for StoreCommitHubIncarnation {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug)]
+struct StoreWatchLiveness(AtomicBool);
+
+#[derive(Clone, Debug)]
 pub struct StoreWatchToken {
     incarnation: StoreCommitHubIncarnation,
     watch_id: u64,
     generation: WatchGeneration,
     target: RuntimeStreamTarget,
+    liveness: Arc<StoreWatchLiveness>,
+}
+
+impl StoreWatchToken {
+    #[must_use]
+    pub const fn target(&self) -> RuntimeStreamTarget {
+        self.target
+    }
+
+    #[must_use]
+    fn is_live(&self) -> bool {
+        self.liveness.0.load(Ordering::Acquire)
+    }
+}
+
+impl PartialEq for StoreWatchToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.incarnation == other.incarnation
+            && self.watch_id == other.watch_id
+            && self.generation == other.generation
+            && self.target == other.target
+    }
+}
+
+impl Eq for StoreWatchToken {}
+
+impl Hash for StoreWatchToken {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.incarnation.hash(state);
+        self.watch_id.hash(state);
+        self.generation.hash(state);
+        self.target.hash(state);
+    }
 }
 
 /// Drop 路径只发送不可伪造的本地 cleanup capability；唯一 store worker
@@ -208,6 +245,9 @@ impl StoreWatch {
 
 impl Drop for StoreWatch {
     fn drop(&mut self) {
+        // cleanup command 可能排在已经 enqueue 的 delayed-finalize 之后；先同步
+        // invalidate 共享 token，让 worker 的线性化检查无需等待 cleanup lane。
+        self.token.liveness.0.store(false, Ordering::Release);
         if let Some(cleanup_tx) = &self.cleanup_tx {
             let _ = cleanup_tx.send(StoreCleanup::Watch(self.token.clone()));
         }
@@ -585,6 +625,7 @@ impl StoreCommitHub {
             watch_id,
             generation,
             target,
+            liveness: Arc::new(StoreWatchLiveness(AtomicBool::new(true))),
         };
         let (sender, receiver) = watch::channel(self.high_water(target));
         self.watchers.entry(target).or_default().insert(
@@ -631,6 +672,18 @@ impl StoreCommitHub {
         })
     }
 
+    /// delayed publication baseline finalize 只接受仍由本 hub 持有的 exact watcher。
+    /// stale generation/incarnation 不能在 SyncComplete 已取消后留下全局 stream cut。
+    #[must_use]
+    pub(crate) fn contains_watch(&self, token: &StoreWatchToken) -> bool {
+        token.is_live()
+            && self
+                .watchers
+                .get(&token.target)
+                .and_then(|bucket| bucket.get(&token.watch_id))
+                .is_some_and(|entry| &entry.token == token)
+    }
+
     /// stale token 只得到 false，不能影响新 generation。
     pub fn release(&mut self, token: &StoreWatchToken) -> bool {
         let Some(bucket) = self.watchers.get_mut(&token.target) else {
@@ -650,10 +703,12 @@ impl StoreCommitHub {
 
     #[must_use]
     pub fn is_current(&self, token: &StoreWatchToken) -> bool {
-        self.watchers
-            .get(&token.target)
-            .and_then(|bucket| bucket.get(&token.watch_id))
-            .is_some_and(|entry| &entry.token == token)
+        token.is_live()
+            && self
+                .watchers
+                .get(&token.target)
+                .and_then(|bucket| bucket.get(&token.watch_id))
+                .is_some_and(|entry| &entry.token == token)
     }
 
     #[must_use]
@@ -710,7 +765,10 @@ fn cursor_is_newer(candidate: StreamCursor, current: StreamCursor) -> bool {
 
 #[cfg(test)]
 mod command_effect_tests {
-    use super::{CommandStreamEffects, PendingStreamTargets, RuntimeStreamTarget};
+    use super::{
+        CommandStreamEffects, PendingStreamTargets, RuntimeStreamTarget, StoreCleanup,
+        StoreCommitHub, WatchGeneration,
+    };
     use crate::runtime::model::{RuntimeCommitOperation, RuntimeStoreError};
     use crate::runtime::store::{RuntimeId, RuntimeIdKind};
 
@@ -758,6 +816,35 @@ mod command_effect_tests {
             effects.targets().collect::<Vec<_>>(),
             vec![RuntimeStreamTarget::Catalog, first, second],
             "durable effects form one deterministic cross-target set"
+        );
+    }
+
+    #[test]
+    fn watch_drop_invalidates_cloned_token_before_cleanup_lane_runs() {
+        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hub = StoreCommitHub::with_cleanup_sender(cleanup_tx);
+        let watch = hub
+            .register(
+                RuntimeStreamTarget::Catalog,
+                WatchGeneration::new(1).expect("nonzero generation"),
+            )
+            .expect("register watch");
+        let token = watch.token();
+        assert!(hub.contains_watch(&token));
+
+        drop(watch);
+
+        assert!(
+            !hub.contains_watch(&token),
+            "queued cleanup cannot leave a cancelled finalizer token live"
+        );
+        assert!(matches!(
+            cleanup_rx.try_recv(),
+            Ok(StoreCleanup::Watch(cleanup)) if cleanup == token
+        ));
+        assert!(
+            hub.release(&token),
+            "cleanup lane can still remove the synchronously invalidated entry"
         );
     }
 }

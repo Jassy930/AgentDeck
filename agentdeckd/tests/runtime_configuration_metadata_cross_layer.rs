@@ -354,14 +354,21 @@ fn metadata_winner(
     }
 }
 
-fn assert_configuration_replayed(reply: &RuntimeReply, conversation_id: &ConversationId) {
-    assert!(matches!(
-        reply,
-        RuntimeReply::Configuration(ConfigurationReceipt::Replayed {
-            conversation_id: replayed,
-            configuration_revision: 1,
-        }) if replayed == conversation_id
-    ));
+fn assert_configuration_replayed(
+    phase: &str,
+    reply: &RuntimeReply,
+    conversation_id: &ConversationId,
+) {
+    assert!(
+        matches!(
+            reply,
+            RuntimeReply::Configuration(ConfigurationReceipt::Replayed {
+                conversation_id: replayed,
+                configuration_revision: 1,
+            }) if replayed == conversation_id
+        ),
+        "{phase} configuration replay mismatch: expected conversation={conversation_id:?} revision=1, actual={reply:?}"
+    );
 }
 
 fn assert_metadata_replayed(reply: &RuntimeReply, conversation_id: &ConversationId) {
@@ -643,7 +650,7 @@ async fn authenticated_configuration_and_metadata_converge_across_restart() {
                 .await
         }
     };
-    assert_configuration_replayed(&configuration_replay, &conversation_id);
+    assert_configuration_replayed("before restart", &configuration_replay, &conversation_id);
     let metadata_replay = match metadata_principal {
         Principal::A => {
             a_metadata
@@ -812,7 +819,11 @@ async fn authenticated_configuration_and_metadata_converge_across_restart() {
                 .await
         }
     };
-    assert_configuration_replayed(&reopened_configuration_replay, &conversation_id);
+    assert_configuration_replayed(
+        "after restart",
+        &reopened_configuration_replay,
+        &conversation_id,
+    );
     let reopened_metadata_replay = match metadata_principal {
         Principal::A => {
             reopened_a

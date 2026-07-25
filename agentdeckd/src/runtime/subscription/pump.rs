@@ -78,6 +78,9 @@ pub(super) struct PumpJob {
     pub(super) emit_subscription_receipt: bool,
     pub(super) transition_snapshot: Option<TransitionSnapshotPermit>,
     pub(super) pending_permit: Option<PendingSubscriptionPermit>,
+    /// delayed-finalize 在 binding 前固定的 exact publication overlap。普通 bootstrap
+    /// 必须在 SyncComplete 后先消费它，再从 watcher latest 进入 live。
+    pub(super) publication_overlap: Option<PinnedBackfillSource>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -277,6 +280,7 @@ async fn run_inner(
         .as_ref()
         .ok_or(PumpError::MissingSource)?
         .decision;
+    let mut publication_binding_finalized = false;
     match decision {
         BarrierDecision::Snapshot { base, through, .. } => {
             if let Some(permit) = job.transition_snapshot.as_ref() {
@@ -284,6 +288,7 @@ async fn run_inner(
                 validate_transition_registration(job.target, registration, permit)?;
             }
             let snapshot_base = send_snapshot(job).await?;
+            publication_binding_finalized = true;
             if job.transition_snapshot.is_some() && snapshot_base != through {
                 return Err(PumpError::InvalidDto);
             }
@@ -322,6 +327,9 @@ async fn run_inner(
             send_failure(job, "requested cursor is ahead of durable high-water").await?;
             return Ok(());
         }
+    }
+    if !publication_binding_finalized && job.transition_snapshot.is_none() {
+        finalize_publication_binding(job, None).await?;
     }
     ensure_current(job)?;
     let registration = job.registration.as_ref().ok_or(PumpError::MissingSource)?;
@@ -383,10 +391,24 @@ async fn run_inner(
     }
 
     job.registry.complete_barrier(&job.lease, epoch_ms()?)?;
+    let live_control = job.control.without_deadline();
+    let registration = job.registration.as_ref().ok_or(PumpError::MissingSource)?;
+    // 只有实际下发了 durable StreamBinding 的远端订阅才需要从 Relay publication
+    // cut 补齐 bootstrap overlap。本地订阅没有 binding，仍必须从 snapshot/backfill
+    // 已覆盖的 H 进入 live，避免把 reducer 已应用的数据重复发送一次。
+    let catchup_cursor = if registration.relay_committed.stream_binding.is_some() {
+        registration.relay_committed.inner
+    } else {
+        inner
+    };
+    let mut cursor = catchup_cursor;
+    if let Some(source) = job.publication_overlap.take() {
+        cursor = send_pinned_with_control(job, source, false, &live_control).await?;
+    }
+    let cursor = send_latest_catchup(job, cursor, &live_control).await?;
     drop(initial_guard.take());
 
-    let live_control = job.control.without_deadline();
-    run_live(job, inner, live_control).await
+    run_live(job, cursor, live_control).await
 }
 
 async fn run_live(
@@ -596,6 +618,14 @@ async fn send_snapshot(job: &mut PumpJob) -> Result<StreamCursor, PumpError> {
                 // 看到 history commandId，其他连接的 QueryReceipt 已可稳定命中。
                 job.history_receipts.replace(conversation_id, command_ids)?;
             }
+            let durable_base = matches!(
+                &payload,
+                super::reducer::ReducedSnapshotPayload::Durable { .. }
+            )
+            .then_some(base);
+            if job.transition_snapshot.is_none() {
+                finalize_publication_binding(job, durable_base).await?;
+            }
             ensure_current(job)?;
             reply::reply(
                 &job.connections,
@@ -631,6 +661,9 @@ async fn send_snapshot(job: &mut PumpJob) -> Result<StreamCursor, PumpError> {
             if let Some(permit) = job.transition_snapshot.as_ref() {
                 validate_transition_catalog_snapshot(page.snapshot(), permit)?;
             }
+            if job.transition_snapshot.is_none() {
+                finalize_publication_binding(job, Some(base)).await?;
+            }
             loop {
                 let next = page.snapshot().next_page_cursor().cloned();
                 ensure_current(job)?;
@@ -657,6 +690,40 @@ async fn send_snapshot(job: &mut PumpJob) -> Result<StreamCursor, PumpError> {
             Ok(base)
         }
     }
+}
+
+/// 所有普通 StreamBinding 的唯一 delayed-finalize 门禁。snapshot materialize 已把
+/// durable S 落盘，但任何 snapshot/backfill/SyncComplete frame 尚未携带 binding；
+/// Store CAS 成功后用 fresh cut/permit 原子替换 registration，catchup 也从该 cut 开始。
+async fn finalize_publication_binding(
+    job: &mut PumpJob,
+    durable_snapshot_base: Option<StreamCursor>,
+) -> Result<(), PumpError> {
+    ensure_current(job)?;
+    let request = {
+        let registration = job.registration.as_ref().ok_or(PumpError::MissingSource)?;
+        if registration.relay_committed.stream_binding.is_none() {
+            return Ok(());
+        }
+        super::super::store::publication::FinalizeSubscriptionPublicationRequest {
+            target: job.target,
+            captured_high_water: registration.high_water,
+            durable_snapshot_base,
+            captured: registration.relay_committed.clone(),
+            watch_token: registration.watch.token(),
+        }
+    };
+    let store = job.store.clone();
+    let outcome = controlled(job, store.finalize_subscription_publication(request)).await??;
+    ensure_current(job)?;
+    if job.publication_overlap.is_some() {
+        return Err(PumpError::MissingSource);
+    }
+    let registration = job.registration.as_mut().ok_or(PumpError::MissingSource)?;
+    let (cut, overlap) = outcome.into_attached(&registration.watch);
+    registration.relay_committed = cut;
+    job.publication_overlap = overlap;
+    Ok(())
 }
 
 async fn send_pinned(

@@ -17,8 +17,8 @@ use agentdeckd::runtime::backfill::{
     BarrierDecision, BarrierError, BarrierInput, BarrierRequest, plan_barrier,
 };
 use agentdeckd::runtime::events::{
-    RegisterStreamBarrier, RuntimeStreamTarget, SnapshotBarrierSource, StoreCommitHub,
-    WatchGeneration,
+    RegisterStreamBarrier, RelayCommittedCut, RuntimeStreamTarget, SnapshotBarrierSource,
+    StoreCommitHub, WatchGeneration,
 };
 use agentdeckd::runtime::model::COMMAND_QUEUE_TTL_MS;
 use agentdeckd::runtime::store::identity::RuntimeIdError;

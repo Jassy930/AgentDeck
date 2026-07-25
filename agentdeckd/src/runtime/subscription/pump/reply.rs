@@ -32,6 +32,8 @@ pub(in crate::runtime::subscription) enum PumpSendError {
     Entropy,
     #[error("oversized runtime item has no transfer DTO payload")]
     MissingTransferPayload,
+    #[error("stream-binding metadata cannot be represented by reply transfer framing")]
+    StreamBindingTransferUnsupported,
     #[error(transparent)]
     DurableTransferIdentity(#[from] DurableStreamTransferIdentityError),
 }
@@ -65,6 +67,7 @@ pub(super) async fn reply_with_stream_binding(
     stream_binding: Option<crate::runtime::store::StreamBindingPermit>,
     control: &TransferEgressControl,
 ) -> Result<(), PumpSendError> {
+    let carries_stream_binding = stream_binding.is_some();
     let transfer_identity = transfer_payload
         .map(|payload| DurableReplyTransferIdentity::for_reply(&message_id, &reply, payload))
         .transpose()?;
@@ -77,6 +80,9 @@ pub(super) async fn reply_with_stream_binding(
     if let Some(payload) = transfer_payload
         && payload.len() >= transfer_part_bytes
     {
+        if carries_stream_binding {
+            return Err(PumpSendError::StreamBindingTransferUnsupported);
+        }
         send_reply_transfer(
             connections,
             connection_id,
@@ -101,6 +107,9 @@ pub(super) async fn reply_with_stream_binding(
     }) {
         Ok(frame) => paced(connections, connection_id, frame, control).await,
         Err(ConnectionError::FrameTooLarge) => {
+            if carries_stream_binding {
+                return Err(PumpSendError::StreamBindingTransferUnsupported);
+            }
             let payload = transfer_payload.ok_or(PumpSendError::MissingTransferPayload)?;
             let transfer_identity =
                 transfer_identity.ok_or(PumpSendError::MissingTransferPayload)?;

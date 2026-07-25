@@ -57,9 +57,11 @@ use super::publication_transport::{
 };
 use super::publisher::PublicationClass;
 use super::transition::{
-    AuthenticatedCommittedStreamCut, EpochBarrierPublicationRequest, EpochBarrierPublicationTarget,
-    ExactEpochBarrierCommit, KeyUpdateAuthority, TransitionAdvance, TransitionAnchor,
-    TransitionBackend, TransitionCoordinator, TransitionCoordinatorError, TransitionMaterial,
+    AuthenticatedCommittedStreamCut, DirectoryAdvancePublicationRequest,
+    DirectoryAdvancePublicationTarget, EpochBarrierPublicationRequest,
+    EpochBarrierPublicationTarget, ExactDirectoryAdvanceCommit, ExactEpochBarrierCommit,
+    KeyUpdateAuthority, TransitionAdvance, TransitionAnchor, TransitionBackend,
+    TransitionCatalogStream, TransitionCoordinator, TransitionCoordinatorError, TransitionMaterial,
     TransitionRecipientMaterial, build_frozen_key_updates,
 };
 use super::transition_backend::RuntimeStoreTransitionBackend;
@@ -676,6 +678,7 @@ fn material() -> TransitionMaterial {
             machine_trust_domain: [0x14; 32],
         },
         recipients,
+        activation_catalog_stream: None,
     }
 }
 
@@ -779,6 +782,7 @@ fn full_capacity_first_grant_material() -> TransitionMaterial {
             machine_trust_domain: [0x14; 32],
         },
         recipients: vec![target],
+        activation_catalog_stream: None,
     }
 }
 
@@ -839,6 +843,7 @@ fn last_recipient_revoked_material() -> TransitionMaterial {
             machine_trust_domain: [0x14; 32],
         },
         recipients: Vec::new(),
+        activation_catalog_stream: None,
     }
 }
 
@@ -853,7 +858,9 @@ struct FakeTransitionState {
     committed_cuts: Vec<AuthenticatedCommittedStreamCut>,
     frozen_updates: Vec<FrozenKeyUpdate>,
     barrier_requests: Vec<EpochBarrierPublicationRequest>,
+    directory_advance_requests: Vec<DirectoryAdvancePublicationRequest>,
     exact_commits: usize,
+    directory_advance_commits: usize,
     old_key_drives: usize,
     business_checks: usize,
     corrupt_commit_readback: bool,
@@ -875,7 +882,9 @@ impl FakeTransitionBackend {
                 committed_cuts,
                 frozen_updates: Vec::new(),
                 barrier_requests: Vec::new(),
+                directory_advance_requests: Vec::new(),
                 exact_commits: 0,
+                directory_advance_commits: 0,
                 old_key_drives: 0,
                 business_checks: 0,
                 corrupt_commit_readback: false,
@@ -1002,6 +1011,43 @@ impl TransitionBackend for FakeTransitionBackend {
             committed.stream_seq = committed.stream_seq.saturating_add(1);
         }
         Ok(ExactEpochBarrierCommit { target: committed })
+    }
+
+    async fn freeze_directory_advance(
+        &self,
+        request: DirectoryAdvancePublicationRequest,
+    ) -> Result<DirectoryAdvancePublicationTarget, TransitionCoordinatorError> {
+        let mut state = self.state.lock().expect("backend lock");
+        let mut sealed_blob_sha256 = request.control_sha256;
+        sealed_blob_sha256[0] ^= 0xff;
+        let target = DirectoryAdvancePublicationTarget {
+            class: PublicationClass::DirectoryRevisionAdvance,
+            operation_id: request.operation_id,
+            publication_stream_id: request.publication_stream_id,
+            stream_route: request.stream_route,
+            generation: request.generation,
+            stream_seq: 1,
+            from_revision: request.from_revision,
+            to_revision: request.to_revision,
+            key_id: request.expected_key_id,
+            control_sha256: request.control_sha256,
+            sealed_blob_sha256,
+        };
+        state.directory_advance_requests.push(request);
+        Ok(target)
+    }
+
+    async fn drive_directory_advance_to_exact_commit(
+        &self,
+        target: DirectoryAdvancePublicationTarget,
+    ) -> Result<ExactDirectoryAdvanceCommit, TransitionCoordinatorError> {
+        let mut state = self.state.lock().expect("backend lock");
+        state.directory_advance_commits += 1;
+        let mut committed = target;
+        if state.corrupt_commit_readback {
+            committed.stream_seq = committed.stream_seq.saturating_add(1);
+        }
+        Ok(ExactDirectoryAdvanceCommit { target: committed })
     }
 
     async fn mark_key_barriers_committed_exact(
@@ -1179,6 +1225,23 @@ fn updates_frozen_material() -> TransitionMaterial {
             state_changed_at_ms: 1_001,
         })
         .collect();
+    value
+}
+
+fn activation_barriers_frozen_material() -> TransitionMaterial {
+    let mut value = updates_frozen_material();
+    value.recovery.transition.operation = KeyTransitionOperation::ActivateConversation;
+    value.recovery.transition.target = KeyTransitionTarget::Conversation {
+        conversation_id: CONVERSATION_A,
+        stream_route: CONVERSATION_A,
+    };
+    value.recovery.transition.phase = KeyTransitionPhase::BarriersFrozen;
+    value.recovery.transition.cuts.clear();
+    value.activation_catalog_stream = Some(TransitionCatalogStream {
+        publication_stream_id: [0x91; 16],
+        stream_route: [0xa1; 16],
+        generation: [0xb1; 16],
+    });
     value
 }
 
@@ -1414,6 +1477,8 @@ async fn dedicated_epoch_barriers_reach_control_plane_but_keep_business_fenced_w
     );
     assert_eq!(state.barrier_requests.len(), 3);
     assert_eq!(state.exact_commits, 3);
+    assert!(state.directory_advance_requests.is_empty());
+    assert_eq!(state.directory_advance_commits, 0);
     assert_eq!(state.old_key_drives, 1);
     assert_eq!(state.material.recovery.updates.len(), 2);
     assert!(state.material.recovery.updates.iter().all(|update| {
@@ -1585,7 +1650,75 @@ async fn revoke_last_recipient_reaches_control_plane_without_barrier_or_ack_wait
     );
     assert!(state.barrier_requests.is_empty());
     assert_eq!(state.exact_commits, 0);
+    assert!(state.directory_advance_requests.is_empty());
+    assert_eq!(state.directory_advance_commits, 0);
     assert_eq!(state.business_checks, 1);
+}
+
+#[tokio::test]
+async fn activate_conversation_publishes_exact_directory_advance_before_control_plane() {
+    let backend = FakeTransitionBackend::new(activation_barriers_frozen_material(), Vec::new());
+    let authority = RecordingAuthority::default();
+    let coordinator = TransitionCoordinator::new(&backend, &authority);
+
+    assert_eq!(
+        coordinator.advance_once().await,
+        Ok(TransitionAdvance::ControlPlaneReady { barrier_count: 0 })
+    );
+
+    let state = backend.state.lock().expect("backend lock");
+    assert!(state.barrier_requests.is_empty());
+    assert_eq!(state.exact_commits, 0);
+    assert_eq!(state.directory_advance_requests.len(), 1);
+    assert_eq!(state.directory_advance_commits, 1);
+    assert_eq!(state.business_checks, 1);
+    assert_eq!(
+        state.material.recovery.transition.phase,
+        KeyTransitionPhase::BarriersCommitted
+    );
+    let request = &state.directory_advance_requests[0];
+    assert_eq!(request.operation_id, OPERATION);
+    assert_eq!(request.publication_stream_id, [0x91; 16]);
+    assert_eq!(request.stream_route, [0xa1; 16]);
+    assert_eq!(request.generation, [0xb1; 16]);
+    assert_eq!(request.from_revision, REVISION - 1);
+    assert_eq!(request.to_revision, REVISION);
+    assert_eq!(request.expected_key_id.purpose, KeyPurpose::Catalog);
+    let control = KeyControlV1::from_canonical_bytes(&request.canonical_control)
+        .expect("canonical directory advance control");
+    assert_eq!(
+        control.sealed_payload_kind(),
+        agentdeck_protocol::e2ee::SealedPayloadKind::KeyUpdate
+    );
+    assert_eq!(
+        control.canonical_sha256().expect("directory advance hash"),
+        request.control_sha256
+    );
+}
+
+#[tokio::test]
+async fn changed_directory_advance_commit_readback_keeps_activation_fenced() {
+    let backend = FakeTransitionBackend::new(activation_barriers_frozen_material(), Vec::new());
+    backend
+        .state
+        .lock()
+        .expect("backend lock")
+        .corrupt_commit_readback = true;
+    let authority = RecordingAuthority::default();
+    let coordinator = TransitionCoordinator::new(&backend, &authority);
+
+    assert_eq!(
+        coordinator.advance_once().await,
+        Err(TransitionCoordinatorError::BarrierMismatch)
+    );
+    let state = backend.state.lock().expect("backend lock");
+    assert_eq!(
+        state.material.recovery.transition.phase,
+        KeyTransitionPhase::BarriersFrozen
+    );
+    assert_eq!(state.directory_advance_requests.len(), 1);
+    assert_eq!(state.directory_advance_commits, 1);
+    assert_eq!(state.business_checks, 0);
 }
 
 #[tokio::test]
@@ -1651,7 +1784,7 @@ async fn frozen_barrier_hash_epoch_or_route_drift_fails_before_republish() {
 }
 
 #[tokio::test]
-async fn production_transition_owner_reopens_and_consumes_bootstrap_receipt_without_second_ack() {
+async fn production_reopened_transition_wakes_on_pairing_delivery_without_second_ack() {
     let root = tempfile::tempdir().expect("create production transition composition root");
     #[cfg(unix)]
     {
@@ -1767,28 +1900,46 @@ async fn production_transition_owner_reopens_and_consumes_bootstrap_receipt_with
         open_owner_with_transport_for_test(reopened.clone(), second_transport.clone())
             .await
             .expect("open restarted production publication owner");
-    let second_transition = KeyTransitionRecoveryOwner::start(
+    let (delivery_commit_tx, delivery_commit_rx) = tokio::sync::watch::channel(0u64);
+    let second_transition = KeyTransitionRecoveryOwner::start_with_delivery_commits(
         reopened.clone(),
         key_store,
         machine_route,
         machine_data,
         second_publication.handle(),
+        delivery_commit_rx,
     )
     .expect("start restarted production transition owner");
-    let readiness = match second_transition.handle().drive_to_business_ready().await {
-        Ok(readiness) => readiness,
-        Err(error) => {
-            let observed = reopened
-                .load_active_key_transition()
+    let mut progress_rx = second_transition.handle().subscribe_progress();
+    let _ = *progress_rx.borrow_and_update();
+    delivery_commit_tx.send_modify(|generation| {
+        *generation = generation.saturating_add(1);
+    });
+    let readiness = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            progress_rx
+                .changed()
                 .await
-                .expect("load failed composition transition")
-                .expect("failed composition transition remains active");
-            panic!(
-                "real backend/store/owner recovery failed in {:?}: {error:?}",
-                observed.transition.phase,
-            );
+                .expect("transition progress owner remains open");
+            match *progress_rx.borrow_and_update() {
+                TransitionProgress::Ready(readiness) => break readiness,
+                TransitionProgress::Blocked(code) => {
+                    let observed = reopened
+                        .load_active_key_transition()
+                        .await
+                        .expect("load failed composition transition")
+                        .expect("failed composition transition remains active");
+                    panic!(
+                        "real backend/store/owner recovery failed in {:?}: {code}",
+                        observed.transition.phase,
+                    );
+                }
+                TransitionProgress::Idle | TransitionProgress::Pending => {}
+            }
         }
-    };
+    })
+    .await
+    .expect("durable delivery commit must wake the idle transition owner immediately");
     assert_eq!(
         readiness,
         TransitionReadiness::BusinessReady { barrier_count: 0 }
@@ -2179,6 +2330,7 @@ async fn production_offline_transition_waits_for_reconnect_without_timer_retry()
     let authenticated_reconnects = reconnect_lane
         .publication_handle()
         .subscribe_authenticated_reconnects();
+    let (delivery_commit_tx, delivery_commit_rx) = tokio::sync::watch::channel(0u64);
     let transition = KeyTransitionRecoveryOwner::start_with_authenticated_reconnect(
         reopened.clone(),
         fixture.key_store(),
@@ -2186,6 +2338,7 @@ async fn production_offline_transition_waits_for_reconnect_without_timer_retry()
         authority,
         publication.handle(),
         authenticated_reconnects,
+        Some(delivery_commit_rx),
     )
     .expect("start offline-wait transition owner");
 
@@ -2225,6 +2378,23 @@ async fn production_offline_transition_waits_for_reconnect_without_timer_retry()
         "Relay Offline must stay parked until the authenticated generation is replaced"
     );
 
+    delivery_commit_tx.send_modify(|generation| {
+        *generation = generation.saturating_add(1);
+    });
+    for _ in 0..512 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        transition.attempt_count_for_test(),
+        settled_attempts,
+        "durable pairing progress may latch while Offline but must not drive before reconnect"
+    );
+    assert_eq!(
+        transport.publish_calls.load(Ordering::SeqCst),
+        1,
+        "delivery proof cannot substitute for an authenticated Relay generation"
+    );
+
     assert!(matches!(
         transition.handle().drive_to_business_ready().await,
         Err(KeyTransitionRecoveryError::ReconnectPending)
@@ -2246,6 +2416,11 @@ async fn production_offline_transition_waits_for_reconnect_without_timer_retry()
         tokio::task::yield_now().await;
     }
     assert_eq!(transport.publish_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        transition.attempt_count_for_test(),
+        settled_attempts + 1,
+        "authenticated reconnect must consume the latched proof with one owner attempt"
+    );
     assert_eq!(
         transition
             .handle()
@@ -2308,6 +2483,7 @@ async fn authenticated_generation_during_full_drive_is_not_lost_before_offline_p
         authority,
         publication.handle(),
         authenticated_reconnects,
+        None,
     )
     .expect("start generation-during-drive transition owner");
     let mut progress_rx = transition.handle().subscribe_progress();
@@ -2402,6 +2578,7 @@ async fn production_machine_link_disconnect_before_register_parks_until_authenti
         authority,
         publication.handle(),
         authenticated_reconnects,
+        None,
     )
     .expect("start real pre-register offline transition owner");
 

@@ -2137,10 +2137,14 @@ async fn business_start_post_lane_failure_restores_lane_and_exact_retry_intent()
     assert!(manager.install_runtime_core(&core));
     let (transport, _pairing_lane, _harness) =
         crate::remote::transport::active_pairing_transport_for_test(machine_route);
+    let (pairing, _health_tx) = crate::remote::pairing::PairingCoordinatorOwner::health_test_double(
+        crate::remote::pairing::PairingCoordinatorHealth::Healthy,
+    );
     {
         let mut state = manager.state.lock().await;
         state.armed = true;
         state.transport = Some(transport);
+        state.pairing = Some(pairing);
         super::stage_business_start(&mut state, *machine_route.as_bytes(), machine_data)
             .expect("stage exact active-machine business start");
     }

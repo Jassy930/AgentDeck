@@ -571,8 +571,9 @@ conversation/key，不能伪造身份连续性。
   crash-retry；DB/marker 缺失本身不是删除 Keychain 的授权。
 - automatic gate 使用 injected dev/ephemeral keystore、signature verifier 与 hermetic install namespace。P4.4
   已证明 business ingress/Core dispatch，后续 P4.5 已证明 signed-sealed E2EE publication/counter recovery；
-  P4.6 persistent remote CLI 已完成 automatic Task。iOS 真实链路与 production-signed
-  LaunchAgent/Keychain 仍未完成，provisioned signed 槽位继续 post-MVP BLOCKED。
+  P4.6 persistent remote CLI 与 P4.7 synthetic E2E/phase closeout 均已完成 automatic scope，P4 automatic
+  Phase Exit complete。iOS 真实链路与 production-signed LaunchAgent/Keychain 仍未完成，provisioned signed
+  槽位继续 post-MVP BLOCKED。
 
 ### Relay Companion MVP P4.3 pairing / authorization ledger 不变量
 
@@ -605,8 +606,9 @@ conversation/key，不能伪造身份连续性。
   WSS reconnect；health/admission epoch 使 pre-owner 错误稳定 Blocked、暂态自愈清码，并阻止旧命令恢复后执行。
 - P4.3 本身不拥有业务 Runtime dispatch；后续 P4.4 已由 `cd7d9fb` 完成 ingress/Core，P4.5 又由
   `c6ef387`、`88b3c42` 完成 E2EE publication/counter recovery。P4.6 persistent remote CLI automatic
-  Task 已完成，current Runtime wire 为 v5；P4 按 Task 进度为 6/7。iOS 真实链路仍未完成，
-  production-signed 槽位继续 post-MVP BLOCKED。
+  Task 已完成，current Runtime wire 为 v5；它是 P4 当时的第 6/7 项。P4.7 automatic Task 与 P4 automatic
+  Phase Exit 也已完成，P4 automatic scope 为 7/7。iOS 真实链路仍未完成，production-signed 槽位继续
+  post-MVP BLOCKED。
 
 ### Relay Companion MVP P4.4 MachineLink ingress / RuntimeCore 不变量
 
@@ -629,6 +631,11 @@ conversation/key，不能伪造身份连续性。
 - P4.5 code/test 由 `c6ef387`、`88b3c42` 收口；P4.5 收口时 Runtime wire 为 v4，physical schema 单调推进到
   v14/35 表。v11 新增 authenticated replay/counter state，v12 新增 CounterGuard manifest、key transition 与
   key-update outbox，v13/v14 只收紧 publication rollover 与 key-update 容量形态，不旋转 crypto context。
+- P4.7 已将 current physical schema 单调推进到 v15/35 表，不新增表。v15 只放宽带
+  authenticated rotation provenance 的 Relay Publish COMMIT→local ACK 合法 crash window：Relay COMMIT
+  已推进 committed inner cursor 时，local ACK 可仍停在 rotation baseline，但必须满足
+  `acknowledged_inner <= committed_inner`。legacy v1–v14 必须先在 rescue committed-state 与迁移事务内
+  完成认证，再原子迁移到 v15；不重封旧 ciphertext，不改写非 meta token 或 wrapped key。
 - ADKT sealed transition 写 codec 为 v3，继续严格读取 v1/v2；该 row-codec 变化不提升 physical schema、
   Runtime、Relay 或 E2EE 版本。pairing confirm 与 Add/Renew transition 同事务冻结完整
   `global_key_state_hash` 和稳定 `stable_key_lineage_hash`；后者认证同 revision 内不可变的 active device
@@ -658,9 +665,13 @@ conversation/key，不能伪造身份连续性。
 - production admission 只有在 CounterGuard/DB reconciliation、publication recovery 与 transition recovery
   全部通过后才开启。未完成的 transition 分别以 `daemon.remote.transition.progress_pending` 或
   `daemon.remote.transition.reconnect_pending` 保留唯一 owner，不得绕过 fence 服务普通 publication。
-- P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；P4 按
-  Task 进度为 6/7。iOS 真实链路仍未完成。P3.1 方案 b 不变，production signing、物理设备与公网证据继续
-  保持 post-MVP BLOCKED。当前 verifier 不支持 `p4`/`p4-auto`，不得宣称 P4 aggregate verifier PASS。
+- P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5，是 P4 当时的第 6/7 项。
+  P4.7 automatic Task 与 P4 automatic Phase Exit 也已完成，P4 automatic scope 为 7/7。focused
+  `p4-auto` 已 PASS，但 `p4` 不受支持，且 aggregate 本身不包含顶层 Rust/Swift、最终 diff/status、冻结 hash
+  或双路 phase review；这些独立门禁与 `spec/security`、`quality` 双路 review 已在 pre-closeout candidate
+  SHA-256 `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上通过，
+  P0/P1/P2=0。iOS 真实链路仍未完成；P3.1 方案 b、production signing、物理设备与公网证据继续保持
+  post-MVP BLOCKED。
 
 ### Relay Companion MVP P4.6 persistent remote CLI 当前边界（automatic Task complete）
 
@@ -675,7 +686,7 @@ conversation/key，不能伪造身份连续性。
   Subscribe、shutdown 后 stopped；已验证 revoked terminal 优先。握手期或 active root-signed revoke 只有在
   transport shutdown/drop 与 crash-safe cleanup 完成后才公开 `revoked`。
 - paired-state V6 把 durable stream binding 与 live-transfer records 放入同一 sealed CAS，覆盖 crash/restart、
-  exact binding cleanup 与全状态容量边界；P4.6 automatic Task 已完成，计为 P4 的第 6/7 项。
+  exact binding cleanup 与全状态容量边界；P4.6 automatic Task 已完成，计为 P4 当时的第 6/7 项。
   2026-07-24 冻结 code/test scope 为 29 paths，blob-manifest SHA-256 为
   `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`；watch `12/12`、
   `remote_persistent_machines` `11/11`、release allocator `1/1`、relay-client `25/25` 与 protocol
@@ -699,6 +710,10 @@ conversation/key，不能伪造身份连续性。
   Publish、Gap、ReplayComplete 一致返回原 bootstrap failure；后两者也不得清理 durable stream 状态。
   8 MiB lowered-cap seam 仅存在于 `debug_assertions` automatic test build，release artifact 与 production
   CLI/env/config 均不可达。
+- V6 durable replay tuple 固定为 129 bytes；emergency debt 使用 V2 domain hash 绑定完整 tuple，包括
+  signed-frame 与 ciphertext hash。V1–V5 冷读把缺失 signed-frame 映射为零 sentinel，并继续用 legacy V1
+  domain/97-byte tuple 做 exact readback；它不得被判成 current duplicate。legacy→V6 normal-capacity 投影会
+  对每条旧 tuple 补计 32 bytes，`required - 1` 必须零写拒绝，exact `required` 才可继续。
 - prepared ADST v2 的 `Normal` / `EmergencyBootstrapMarker` mode 位于 AEAD 认证内容中，CounterGuard 的
   `stage_commitment` 绑定完整 sealed sidecar。legacy ADST v1 只能解释为 Normal，不能借旧格式获得 emergency
   authority。4095→4096 marker 在 guard-first 与 active-first crash cut 都由同一 production recovery 收敛；
@@ -708,6 +723,30 @@ conversation/key，不能伪造身份连续性。
   receive 在任何 IO 或 durable mutation 前拒绝超限声明并返回 `remote.runtime.reducer_capacity`。
 - production composition 仍只接受 release-signed CLI/Data Protection Keychain；真实 entitlement/access-group
   roundtrip 保持 post-MVP BLOCKED，automatic injected keystore 证据不得冒充 production PASS。
+
+### Relay Companion MVP P4.7 automatic Task / P4 automatic Phase Exit 完成边界
+
+- `scripts/verify-relay-companion-mvp.sh p4-auto` 是已 PASS 的 focused aggregate，只编排 machine/CLI synthetic E2E、
+  pairing/trust-reset state machine、production composition、relay-client/protocol、network/schema/docs 门禁。
+  它刻意不包含顶层 `cargo test`、`swift test`、最终 diff/status、冻结 candidate hash 或独立
+  `spec/security`、`quality` phase review；`p4` 仍不受支持，所以 `p4-auto` 单独 PASS 不等于完整 Phase Exit。
+- 远端 principal 不能确认 pairing 的 authority boundary 由独立 RuntimeCore principal gate 证明，不能把这条
+  安全断言塞进 machine E2E 后再以同一链路自证。
+- `scripts/run-relay-companion-p4-real-e2e.sh` 当前只是静态 fail-closed slot sentinel：不读取参数或环境
+  变量，不探测任何 prerequisite，也不执行真实 vendor、公网 WSS、Keychain 或 destructive flow；它固定输出
+  完整 `missingInputs`，并保持 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。真实
+  preflight/execution 只允许在 post-MVP 扩展。
+- Linux synthetic client 只使用 ephemeral test keys。macOS production persistent pairing 必须使用
+  release-signed composition 与 Data Protection Keychain，不得通过 CLI/env/config 降级到 injected/file/dev
+  keystore。MachineRoot 丢失不属于该 sentinel 的执行面，仍须遵循
+  [`docs/RELAY_RUNBOOK.md` 的 portable purge receipt 流程](docs/RELAY_RUNBOOK.md#machineroot-丢失后的-portable-purge-receipt)。
+- pre-closeout candidate SHA-256
+  `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上，`p4-auto`、fresh
+  `cargo test --locked`、`swift test`（577/577）、三组 Clippy、fmt、network/no-net、四 schema/docs/diff、
+  local Runtime smoke、ephemeral selfcheck 与 diagnostics 均已通过；`spec/security`、`quality` 双路 review
+  均 Approved，P0/P1/P2=0。因此 Task P4.7 complete，P4 automatic scope 7/7，P4 automatic Phase Exit
+  complete。该完成边界不覆盖 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理
+  iPhone/第二台 Mac 或 destructive purge；这些真实槽位继续保持 post-MVP BLOCKED。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 
@@ -785,8 +824,8 @@ conversation/key，不能伪造身份连续性。
   authenticated sidecar，以及 C0-C 的 v6 两张 native sidecar，再由 P3.10 v7 增加 machine-wide
   `admin_commands`，P4.1 v8 增加 authenticated singleton `machine_identity_state`，P4.2 v9 增加
   `machine_remote_state`，P4.3 v10 增加五张 pairing/auth 表，P4.5 v11/v12 再增加五张
-  replay/counter/transition 表，v13/v14 调整既有表的 authenticated physical shape。current v14 精确为
-  35 表；在 v4 的
+  replay/counter/transition 表，v13/v14 调整既有表的 authenticated physical shape，v15 只放宽带
+  rotation provenance 的 publication COMMIT→local ACK crash window。current v15 精确为 35 表；在 v4 的
   `event_stream_index`、`event_retention`、
   `catalog_journal`、`snapshots`、`publication_streams`、`publication_outbox` 上增加
   `conversation_state`、`configuration_journal`、`command_configuration_pins` 与
@@ -1232,6 +1271,7 @@ daemon main
   -> P4.4 RemoteLink ingress / RuntimeCore dispatch → transport-neutral P3.6 component
   -> P4.5 signed-sealed publication / counter/transition recovery（production owner 已安装）
   -> P4.6 persistent remote CLI（automatic Task complete；含 authenticated `watch`）
+  -> P4.7 synthetic E2E / automatic Phase Exit（7/7 complete；真实槽位继续 fail-closed BLOCKED）
   -> AgentRouter → CodexAdapter / ClaudeCodeAdapter
   -> record / diag
   -> codex app-server child process / claude CLI child process

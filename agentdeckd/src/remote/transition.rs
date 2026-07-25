@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use agentdeck_crypto::{HpkePublicKey, SecretAeadKey};
 use agentdeck_protocol::e2ee::{
-    DeviceAuthorizationV1, E2EE_FORMAT_VERSION, EpochBarrierV1, KeyControlV1, KeyDirectoryEntry,
-    KeyId, KeyPurpose, KeyUpdateInfoV1, KeyUpdateSetV1, KeyUpdateV1, OuterContextV1,
-    OuterFrameKind,
+    DeviceAuthorizationV1, DirectoryRevisionAdvanceV1, E2EE_FORMAT_VERSION, EpochBarrierV1,
+    KeyControlV1, KeyDirectoryEntry, KeyId, KeyPurpose, KeyUpdateInfoV1, KeyUpdateSetV1,
+    KeyUpdateV1, OuterContextV1, OuterFrameKind,
 };
 use agentdeck_protocol::relay_v2::{
     KeyDirectoryRevision, MachineRouteId, RELAY_PROTOCOL_VERSION, RelayGrant, RelayServerId,
@@ -46,12 +46,20 @@ pub(crate) struct TransitionRecipientMaterial {
     pub(crate) authorization_revision: KeyDirectoryRevision,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransitionCatalogStream {
+    pub(crate) publication_stream_id: [u8; 16],
+    pub(crate) stream_route: [u8; 16],
+    pub(crate) generation: [u8; 16],
+}
+
 #[derive(Clone)]
 pub(crate) struct TransitionMaterial {
     pub(crate) recovery: KeyTransitionRecovery,
     pub(crate) global_keys: Arc<GlobalKeyStateV1>,
     pub(crate) anchor: TransitionAnchor,
     pub(crate) recipients: Vec<TransitionRecipientMaterial>,
+    pub(crate) activation_catalog_stream: Option<TransitionCatalogStream>,
 }
 
 pub(crate) trait KeyUpdateAuthority: Send + Sync {
@@ -156,6 +164,40 @@ pub(crate) struct ExactEpochBarrierCommit {
     pub(crate) target: EpochBarrierPublicationTarget,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirectoryAdvancePublicationRequest {
+    pub(crate) operation_id: [u8; 16],
+    pub(crate) publication_stream_id: [u8; 16],
+    pub(crate) stream_route: [u8; 16],
+    pub(crate) generation: [u8; 16],
+    pub(crate) from_revision: u64,
+    pub(crate) to_revision: u64,
+    pub(crate) expected_key_id: KeyId,
+    pub(crate) advance: DirectoryRevisionAdvanceV1,
+    pub(crate) canonical_control: Vec<u8>,
+    pub(crate) control_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DirectoryAdvancePublicationTarget {
+    pub(crate) class: PublicationClass,
+    pub(crate) operation_id: [u8; 16],
+    pub(crate) publication_stream_id: [u8; 16],
+    pub(crate) stream_route: [u8; 16],
+    pub(crate) generation: [u8; 16],
+    pub(crate) stream_seq: u64,
+    pub(crate) from_revision: u64,
+    pub(crate) to_revision: u64,
+    pub(crate) key_id: KeyId,
+    pub(crate) control_sha256: [u8; 32],
+    pub(crate) sealed_blob_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExactDirectoryAdvanceCommit {
+    pub(crate) target: DirectoryAdvancePublicationTarget,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TransitionAdvance {
     NoActiveTransition,
@@ -205,6 +247,16 @@ pub(crate) trait TransitionBackend: Send + Sync {
         &self,
         target: EpochBarrierPublicationTarget,
     ) -> Result<ExactEpochBarrierCommit, TransitionCoordinatorError>;
+
+    async fn freeze_directory_advance(
+        &self,
+        request: DirectoryAdvancePublicationRequest,
+    ) -> Result<DirectoryAdvancePublicationTarget, TransitionCoordinatorError>;
+
+    async fn drive_directory_advance_to_exact_commit(
+        &self,
+        target: DirectoryAdvancePublicationTarget,
+    ) -> Result<ExactDirectoryAdvanceCommit, TransitionCoordinatorError>;
 
     async fn mark_key_barriers_committed_exact(
         &self,
@@ -274,13 +326,16 @@ where
                     .freeze_key_barriers_exact(operation_id, cuts.clone())
                     .await?;
                 validate_barrier_freeze_readback(&material, &cuts, &readback)?;
-                self.publish_frozen_barriers(&readback, requests).await
+                let mut frozen_material = material.clone();
+                frozen_material.recovery = readback.clone();
+                self.publish_frozen_barriers(&frozen_material, &readback, requests)
+                    .await
             }
             KeyTransitionPhase::BarriersFrozen => {
                 validate_post_rotation_material(&material)?;
                 validate_existing_updates(&material.recovery)?;
                 let requests = build_barriers_from_frozen(&material)?;
-                self.publish_frozen_barriers(&material.recovery, requests)
+                self.publish_frozen_barriers(&material, &material.recovery, requests)
                     .await
             }
             KeyTransitionPhase::BarriersCommitted => {
@@ -298,6 +353,7 @@ where
 
     async fn publish_frozen_barriers(
         &self,
+        material: &TransitionMaterial,
         frozen: &KeyTransitionRecovery,
         requests: Vec<EpochBarrierPublicationRequest>,
     ) -> Result<TransitionAdvance, TransitionCoordinatorError> {
@@ -312,6 +368,21 @@ where
             let committed = self
                 .backend
                 .drive_epoch_barrier_to_exact_commit(target)
+                .await?;
+            if committed.target != target {
+                return Err(TransitionCoordinatorError::BarrierMismatch);
+            }
+        }
+        if frozen.transition.operation == KeyTransitionOperation::ActivateConversation {
+            let request = build_directory_advance_request(frozen, material)?;
+            let target = self
+                .backend
+                .freeze_directory_advance(request.clone())
+                .await?;
+            validate_directory_advance_target(&request, target)?;
+            let committed = self
+                .backend
+                .drive_directory_advance_to_exact_commit(target)
                 .await?;
             if committed.target != target {
                 return Err(TransitionCoordinatorError::BarrierMismatch);
@@ -335,6 +406,84 @@ where
             barrier_count: frozen.transition.cuts.len(),
         })
     }
+}
+
+fn validate_directory_advance_target(
+    request: &DirectoryAdvancePublicationRequest,
+    target: DirectoryAdvancePublicationTarget,
+) -> Result<(), TransitionCoordinatorError> {
+    if target.class != PublicationClass::DirectoryRevisionAdvance
+        || target.operation_id != request.operation_id
+        || target.publication_stream_id != request.publication_stream_id
+        || target.stream_route != request.stream_route
+        || target.generation != request.generation
+        || target.from_revision != request.from_revision
+        || target.to_revision != request.to_revision
+        || target.key_id != request.expected_key_id
+        || target.control_sha256 != request.control_sha256
+        || target.sealed_blob_sha256 == [0; 32]
+    {
+        return Err(TransitionCoordinatorError::BarrierMismatch);
+    }
+    Ok(())
+}
+
+fn build_directory_advance_request(
+    frozen: &KeyTransitionRecovery,
+    material: &TransitionMaterial,
+) -> Result<DirectoryAdvancePublicationRequest, TransitionCoordinatorError> {
+    if frozen.transition.operation != KeyTransitionOperation::ActivateConversation
+        || frozen.transition.phase != KeyTransitionPhase::BarriersFrozen
+        || !frozen.transition.cuts.is_empty()
+        || material.recovery != *frozen
+    {
+        return Err(TransitionCoordinatorError::MaterialMismatch);
+    }
+    let stream = material
+        .activation_catalog_stream
+        .ok_or(TransitionCoordinatorError::MaterialMismatch)?;
+    let mut catalog_keys = material
+        .global_keys
+        .current_shared_keys()
+        .map_err(|_| TransitionCoordinatorError::MaterialMismatch)?
+        .into_iter()
+        .filter(|view| view.purpose == KeyPurpose::Catalog && view.stream_route.is_none());
+    let catalog = catalog_keys
+        .next()
+        .ok_or(TransitionCoordinatorError::MaterialMismatch)?;
+    if catalog.epoch == 0 || catalog_keys.next().is_some() {
+        return Err(TransitionCoordinatorError::MaterialMismatch);
+    }
+    let expected_key_id = KeyId {
+        purpose: KeyPurpose::Catalog,
+        epoch: catalog.epoch,
+    };
+    let advance = DirectoryRevisionAdvanceV1 {
+        from_key_directory_revision: KeyDirectoryRevision::new(frozen.transition.from_revision),
+        to_key_directory_revision: KeyDirectoryRevision::new(frozen.transition.to_revision),
+    };
+    advance
+        .validate()
+        .map_err(|_| TransitionCoordinatorError::MaterialMismatch)?;
+    let control = KeyControlV1::directory_revision_advance(advance.clone());
+    let canonical_control = control
+        .canonical_bytes()
+        .map_err(|_| TransitionCoordinatorError::MaterialMismatch)?;
+    let control_sha256 = control
+        .canonical_sha256()
+        .map_err(|_| TransitionCoordinatorError::MaterialMismatch)?;
+    Ok(DirectoryAdvancePublicationRequest {
+        operation_id: frozen.transition.operation_id,
+        publication_stream_id: stream.publication_stream_id,
+        stream_route: stream.stream_route,
+        generation: stream.generation,
+        from_revision: frozen.transition.from_revision,
+        to_revision: frozen.transition.to_revision,
+        expected_key_id,
+        advance,
+        canonical_control,
+        control_sha256,
+    })
 }
 
 fn validate_barrier_target(
@@ -889,6 +1038,8 @@ fn validate_material_common(
         || material.anchor.trust_epoch.value() == 0
         || material.anchor.machine_trust_domain == [0; 32]
         || material.recipients.len() != transition.recipients.len()
+        || (transition.operation == KeyTransitionOperation::ActivateConversation)
+            != material.activation_catalog_stream.is_some()
         || !valid_operation_target(transition.operation, transition.target)
     {
         return Err(TransitionCoordinatorError::MaterialMismatch);

@@ -248,7 +248,7 @@ impl Fixture {
         let error =
             RuntimeStoreHandle::open(RuntimeStoreConfig::new(self.database()), self.storage_kek())
                 .await
-                .expect_err("tampered current-v14 store must fail closed on reopen");
+                .expect_err("tampered current-v15 store must fail closed on reopen");
         assert_integrity_error(error, &format!("{label}/reopen"));
         assert_eq!(
             StoreArtifacts::read(&self.database()),

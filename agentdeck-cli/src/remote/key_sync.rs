@@ -520,9 +520,11 @@ impl DurableKeySyncStateV1 {
     /// authority 不得漂移。旧 30 秒窗口不会延长，而是从 `started_at_ms` 开始一轮全新的
     /// bounded budget；跨轮 persistent clock watermark 仍禁止回退。
     ///
-    /// 调用方必须先重发旧 durable ACK，再预留 counter/seal，并通过
-    /// [`Self::start_next_cycle`] 与旧 Resolved ADKS 做单次 CAS。Relay `RouteAccepted` 本身
-    /// 绝不能调用这个 supersession seam。
+    /// 普通 higher Publish 调用方必须先重发旧 durable ACK，再预留 counter/seal，并通过
+    /// [`Self::start_next_cycle`] 与旧 Resolved ADKS 做单次 CAS。只有 durable-admit、验签并
+    /// 解密的 typed `DirectoryRevisionAdvance` 可以改用
+    /// [`Self::start_next_cycle_after_directory_advance`]；Relay `RouteAccepted` 本身绝不能调用
+    /// 这个 supersession seam。
     pub fn next_cycle_request(
         &self,
         observation: &SignedHigherRevisionObservationV1,
@@ -555,6 +557,28 @@ impl DurableKeySyncStateV1 {
         started_at_ms: u64,
         first: FrozenKeySyncSendV1,
     ) -> Result<Self, KeySyncError> {
+        self.start_next_cycle_with_ack_policy(observation, started_at_ms, first, true)
+    }
+
+    /// typed `DirectoryRevisionAdvance` 专属 supersession。该 notice 必须先经过 signed frame
+    /// 验证、durable replay admission 与 predecessor Catalog key 解密；它本身证明 machine
+    /// 已推进到新 revision，因此 next-cycle ADKS 不再保留或重发 predecessor ACK。
+    pub fn start_next_cycle_after_directory_advance(
+        &self,
+        observation: SignedHigherRevisionObservationV1,
+        started_at_ms: u64,
+        first: FrozenKeySyncSendV1,
+    ) -> Result<Self, KeySyncError> {
+        self.start_next_cycle_with_ack_policy(observation, started_at_ms, first, false)
+    }
+
+    fn start_next_cycle_with_ack_policy(
+        &self,
+        observation: SignedHigherRevisionObservationV1,
+        started_at_ms: u64,
+        first: FrozenKeySyncSendV1,
+        retain_predecessor_ack: bool,
+    ) -> Result<Self, KeySyncError> {
         let expected = self.next_cycle_request(&observation, started_at_ms)?;
         if first.request != expected
             || self
@@ -565,11 +589,16 @@ impl DurableKeySyncStateV1 {
             return Err(KeySyncError::ResponseConflict);
         }
         first.validate()?;
-        let retained_ack_basis = self
-            .latest_completed_ack_basis()
-            .ok_or(KeySyncError::InvalidCanonical)?;
+        let retained_ack_basis = if retain_predecessor_ack {
+            Some(
+                self.latest_completed_ack_basis()
+                    .ok_or(KeySyncError::InvalidCanonical)?,
+            )
+        } else {
+            None
+        };
         let mut next = Self::start(observation, started_at_ms, first)?;
-        next.retained_ack_basis = Some(retained_ack_basis);
+        next.retained_ack_basis = retained_ack_basis;
         next.validate()?;
         Ok(next)
     }

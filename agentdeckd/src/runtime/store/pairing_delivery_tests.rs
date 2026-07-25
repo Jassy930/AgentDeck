@@ -47,10 +47,7 @@ use super::pairing_delivery::{
 };
 use super::pairing_grant::{ConversationKeyRotation, GlobalKeyStateV1, PairingGrantPreparation};
 use super::pairing_grant_allocation::GrantAllocationProjection;
-use super::pairing_grant_allocation_tests::{
-    complete_active_membership_transition,
-    complete_active_membership_transition_with_production_finalize,
-};
+use super::pairing_grant_allocation_tests::complete_active_membership_transition;
 use super::pairing_grant_commit::{AcknowledgeGrantCommitted, GrantCommittedRecovery};
 use super::pairing_grant_tests::{
     awaiting_pairing, awaiting_pairing_with, awaiting_pairing_with_authorization,
@@ -303,7 +300,7 @@ async fn authorization_store_for_test(
         // completes this zero-cut transition before publisher admission or local revoke may start;
         // shared fixtures must model the same ordering instead of bypassing the fence.
         if production_finalize {
-            complete_active_membership_transition_with_production_finalize(&store, &clock).await;
+            complete_active_membership_transition(&store, &clock).await;
         } else {
             complete_active_zero_cut_transition(&store).await;
         }
@@ -489,7 +486,7 @@ pub(crate) async fn two_active_authorization_store_with_permissions_for_test(
         .await
         .expect("create catalog stream before second membership transition");
 
-    let (binding, data_cert) = make_active(&store).await;
+    let (binding, data_cert) = active_machine_material(&store).await;
     let (pairing_id, invite) = prepare_unused_pairing(
         &store,
         &binding,
@@ -926,6 +923,22 @@ fn tick(clock: &AtomicU64) {
     let _ = clock.fetch_add(1, Ordering::SeqCst);
 }
 
+async fn active_machine_material(
+    store: &RuntimeStoreHandle,
+) -> (
+    crate::runtime::model::MachineIdentityBinding,
+    agentdeck_protocol::relay_v2::SignedCertificate,
+) {
+    let Some(MachineEnrollmentState::Active(active)) = store
+        .load_machine_enrollment_state()
+        .await
+        .expect("load active machine enrollment fixture")
+    else {
+        panic!("fixture machine enrollment must remain active")
+    };
+    (active.binding.clone(), active.data_cert.clone())
+}
+
 async fn freeze_zero_cut_bootstrap_target(
     store: &RuntimeStoreHandle,
     clock: &AtomicU64,
@@ -987,9 +1000,9 @@ async fn freeze_bootstrap_target_with_update_set(
 
     tick(clock);
     store
-        .mark_key_transition_rotated(operation_id)
+        .finalize_key_directory_rotation(operation_id)
         .await
-        .expect("mark bootstrap transition rotated");
+        .expect("finalize bootstrap key-directory axes");
     tick(clock);
     store
         .freeze_key_updates(operation_id, updates)
@@ -1116,7 +1129,7 @@ async fn advance_global_revision_with_device(store: &RuntimeStoreHandle, clock: 
         )
         .await
         .expect("create catalog stream before higher global revision");
-    let (binding, data_cert) = make_active(store).await;
+    let (binding, data_cert) = active_machine_material(store).await;
     let preparation = awaiting_pairing_with(
         store,
         &binding,
@@ -1231,7 +1244,7 @@ async fn prepare_renewal_committed(
 
     // 再加入一个不同 DeviceSign 的设备，使随后的 Renew 同时拥有 target 与
     // 既有 non-target recipient；bootstrap proof 只能豁免前者。
-    let (binding, data_cert) = make_active(store).await;
+    let (binding, data_cert) = active_machine_material(store).await;
     let second_preparation = awaiting_pairing_with(
         store,
         &binding,
@@ -1308,7 +1321,7 @@ async fn prepare_renewal_committed(
     )
     .await;
 
-    let (binding, data_cert) = make_active(store).await;
+    let (binding, data_cert) = active_machine_material(store).await;
     let preparation = awaiting_pairing_with(
         store,
         &binding,

@@ -424,6 +424,6 @@ fn secret_bearing_types_have_redacted_debug_output() {
 
 #[test]
 fn physical_schema_upgrade_does_not_rotate_the_crypto_context() {
-    assert_eq!(RUNTIME_SCHEMA_VERSION, 14);
+    assert_eq!(RUNTIME_SCHEMA_VERSION, 15);
     assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
 }

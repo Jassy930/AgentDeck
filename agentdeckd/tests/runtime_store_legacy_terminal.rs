@@ -279,8 +279,8 @@ fn reauthenticate_runtime_ledger(
         message.extend_from_slice(&runtime_meta_count(connection, column).to_be_bytes());
     }
     let token = bundle
-        .blind_index(b"runtime.meta.ledger.v14", &message)
-        .expect("authenticate rewritten current-v14 Runtime ledger");
+        .blind_index(b"runtime.meta.ledger.v15", &message)
+        .expect("authenticate rewritten current-v15 Runtime ledger");
     assert_eq!(
         connection
             .execute(

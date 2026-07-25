@@ -31,6 +31,7 @@ pub enum PublicationClass {
     ConversationEvent,
     EpochBarrier,
     DirectedSnapshot,
+    DirectoryRevisionAdvance,
 }
 
 impl PublicationClass {
@@ -41,6 +42,7 @@ impl PublicationClass {
             Self::ConversationEvent => 2,
             Self::EpochBarrier => 3,
             Self::DirectedSnapshot => 4,
+            Self::DirectoryRevisionAdvance => 5,
         }
     }
 }

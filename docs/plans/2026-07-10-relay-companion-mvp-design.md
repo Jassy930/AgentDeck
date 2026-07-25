@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成；P4.4 MachineLink ingress/RuntimeCore dispatch 由 `cd7d9fb` 完成；P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成，收口时 Runtime wire 为 v4、physical schema 为 v14/35 表。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；P4/P5/P6 按 Task 进度分别为 6/7、0/9、0/4。P4.7、`p4-auto`、P4 Phase Exit、iOS 真实链路及 production native metadata 与 provisioned signed Keychain/LaunchAgent 均未完成或为 post-MVP gated/BLOCKED（2026-07-24） |
+| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成；P4.4 MachineLink ingress/RuntimeCore dispatch 由 `cd7d9fb` 完成；P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成，收口时 Runtime wire 为 v4、physical schema 为 v14/35 表。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；P4.7 automatic E2E、静态 real-slot contract 与 phase docs 已完成，P4 automatic scope 7/7、P4 automatic Phase Exit complete，P5/P6 仍为 0/9、0/4。`p4-auto` 已 PASS，`p4` 仍不受支持；fresh 顶层 Rust/Swift、Clippy/fmt/network/no-net/schema/docs/diff、local smoke/selfcheck/diagnostics 与 pre-closeout hash `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的双路 phase review 均通过。真实 iOS 链路、production native metadata、provisioned signed Keychain/LaunchAgent、真实 vendor、公网 WSS、第二台 Mac 与 destructive purge 继续 post-MVP gated/BLOCKED（2026-07-25） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -77,11 +77,14 @@ watch 使用 fresh authenticated bootstrap、canonical NDJSON、SIGINT/SIGTERM �
 `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`；watch `12/12`、
 `remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client
 `25/25` 与 protocol `244/244` 均通过，四 schema/三 crate Clippy/fmt/network/no-net/docs/diff 全绿。
-`spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。P4 按 Task 进度为
-6/7，iOS 仍只有 fixture 驱动骨架；当前 verifier
-只接受 `p0|p2|p3`，不宣称 `p4-auto` 或 P4 Phase PASS。P3.1 provisioned signed
-Keychain/LaunchAgent roundtrip 继续按方案 b 保持 post-MVP BLOCKED gate；物理设备与公网证据也继续
-post-MVP BLOCKED。完整实施仍必须满足 §17 的 Definition of Done。
+`spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。P4.7 automatic Task 与 P4 automatic
+Phase Exit 已完成，P4 按 Task 进度为 7/7；iOS 仍只有 fixture 驱动骨架。focused `p4-auto` 已 PASS，
+但 `p4` 仍不受支持；顶层 Rust/Swift、最终 diff/status、冻结 hash 与双路 review 已作为独立 phase gates
+补齐。pre-closeout candidate SHA-256 为
+`18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5`，双路 review 均 Approved、
+P0/P1/P2=0。P3.1 provisioned signed Keychain/LaunchAgent roundtrip、真实 vendor、物理设备、第二台 Mac、
+公网 WSS 与 destructive purge 继续按方案 b 保持 post-MVP BLOCKED gate。完整实施仍必须满足 §17 的
+Definition of Done。
 
 ## 1. 背景与当前问题
 
@@ -1715,15 +1718,23 @@ provisioned production-signed LaunchAgent/Keychain 仍按方案 b 保持 post-MV
   门禁完成后开放。P4.5 收口时 Runtime wire 为 v4，physical schema 为 v14/35 表。
 - P4.6 macOS persistent 远程 CLI automatic Task 已完成；production 使用 Keychain 中的真实 grant/private keys
   和 daemon receipts，Linux synthetic client 只用 ephemeral keys。本轮 P4.3↔P4.5 bootstrap proof/retention
-  hardening 不新增 Task 完成数；P4 仍为 **6/7**，P4.7、`p4-auto` 与 P4 Phase Exit 仍未完成。
+  hardening 本身不新增 Task 完成数；在该 hardening/P4.6 收口时 P4 仍为 **6/7**。后续 P4.7 automatic
+  E2E、静态 real-slot contract 与阶段文档已完成，focused `p4-auto`、独立顶层门禁、冻结 hash 与双路
+  phase review 均通过，P4 automatic scope 现为 **7/7**，P4 automatic Phase Exit complete。
 
 退出门禁：P4 的 machine identity、pairing、RemoteLink、远程 CLI 与 trust-reset/uninstall-purge 功能全部
 保留。本地 App/CLI 必须确认待配对设备指纹，远端不能自批；自动 E2E 以合成 Codex/Claude Code
 canonical adapter 穿透完整 RemoteLink/daemon receipt 链路；library-level injected/dev keystore 下的 CLI
-restart 必须读回 DeviceSign/DeviceHPKE/grant/counter/replay state，旧 credential JSON 不含 secret，Linux 与
-unsigned/ad-hoc macOS persistent pairing typed unsupported。MVP 主线只运行 `p4-auto`；real runner 本期只
-实现 versioned slot-contract/只读 preflight，不设置 `AGENTDECK_P4_REAL_E2E=1`，缺输入时输出
-`BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。真实 vendor login、公网 WSS、provisioned signed
+restart 必须读回 DeviceSign/DeviceHPKE/grant/counter/replay state，旧 credential JSON 不含 secret。Linux 只
+允许 ephemeral test keys；macOS production persistent pairing 必须使用 Data Protection Keychain，
+unsigned/ad-hoc 或 injected/file/dev keystore 降级均 typed unsupported。MVP 主线只运行 focused
+`p4-auto`；远端 cannot-confirm pairing 由独立 RuntimeCore principal gate 证明，不在 machine E2E 内。
+该 aggregate 不含顶层 `cargo test`、`swift test`、最终 diff/status、冻结 hash 或双路 phase review。
+real runner 本期只是静态 versioned slot sentinel：不读取参数或环境变量，不探测 prerequisite、不执行真实
+链路，固定输出完整 `missingInputs` 与 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`；真实
+preflight/execution 留给 post-MVP。MachineRoot 丢失仍按
+[`docs/RELAY_RUNBOOK.md`](../RELAY_RUNBOOK.md#machineroot-丢失后的-portable-purge-receipt) 的 portable
+purge receipt 流程处理。真实 vendor login、公网 WSS、provisioned signed
 Keychain/CLI restart 与 destructive trust-reset evidence 保留为 post-MVP BLOCKED 槽位；不削减功能实现，
 也不阻塞后续自动主线。
 

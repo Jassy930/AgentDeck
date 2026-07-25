@@ -5510,6 +5510,10 @@ async fn canonical_remote_revoke_fences_accepted_before_durable_backend_and_retr
         all_remote_permissions(),
     )
     .await;
+    store
+        .ensure_remote_catalog_publication_after_transition()
+        .await
+        .expect("ensure held revoke production Catalog carrier");
     let trust_domain = store
         .machine_trust_domain()
         .expect("derive held revoke trust domain");
@@ -5733,6 +5737,10 @@ async fn recovery_blocked_is_strictly_read_only_without_blocking_a_healthy_conve
         all_remote_permissions(),
     )
     .await;
+    store
+        .ensure_remote_catalog_publication_after_transition()
+        .await
+        .expect("ensure recovery-policy production Catalog carrier");
     let blocked_id = synthetic_runtime_id(RuntimeIdKind::Conversation, 0xb1);
     let healthy_id = synthetic_runtime_id(RuntimeIdKind::Conversation, 0xb2);
     for (conversation_id, adapter_seed, title) in

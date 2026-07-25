@@ -21,6 +21,7 @@ use agentdeck_protocol::relay_v2::{
 use agentdeck_protocol::runtime::RuntimeTransferCarrierV1;
 use async_trait::async_trait;
 
+use crate::runtime::events::RuntimeStreamTarget;
 use crate::runtime::publication::PublicationDriveReport;
 #[cfg(test)]
 use crate::runtime::store::PublicationPayloadKind;
@@ -35,12 +36,14 @@ use crate::runtime::store::{
 
 use super::counter::{CounterGuardBackend, CounterScope};
 use super::link::{RemoteLinkError, RemoteStreamPublisher};
-use super::publication_transport::PublicationDriveHandle;
+use super::publication_transport::{PublicationDriveError, PublicationDriveHandle};
 use super::publisher::{
     PublicationError, SignedPublicationCoordinator, SignedPublicationError,
     SignedPublicationRequest,
 };
-use super::transport::MachineDataAuthority;
+use super::transport::{
+    MachineDataAuthority, MachinePublicationHandle, MachineStreamRegistrationOutcome,
+};
 
 mod canonical;
 
@@ -532,26 +535,34 @@ impl SharedPublicationDrive for PublicationDriveHandle {
     ) -> Result<(), SharedPublisherError> {
         PublicationDriveHandle::notify_frozen_stream(self, publication_stream_id)
             .await
-            .map_err(|_| SharedPublisherError::DriveUnavailable)
+            .map_err(map_publication_drive_error)
     }
 
     async fn drive_round(&self) -> Result<PublicationDriveReport, SharedPublisherError> {
         PublicationDriveHandle::drive_round(self)
             .await
-            .map_err(|_| SharedPublisherError::DriveUnavailable)
+            .map_err(map_publication_drive_error)
     }
 
     async fn notify_reconnected(&self) -> Result<(), SharedPublisherError> {
         PublicationDriveHandle::notify_reconnected(self)
             .await
-            .map_err(|_| SharedPublisherError::DriveUnavailable)
+            .map_err(map_publication_drive_error)
     }
 
     async fn recover_pending(&self) -> Result<(), SharedPublisherError> {
         PublicationDriveHandle::recover_pending(self)
             .await
-            .map_err(|_| SharedPublisherError::DriveUnavailable)
+            .map_err(map_publication_drive_error)
     }
+}
+
+fn map_publication_drive_error(error: PublicationDriveError) -> SharedPublisherError {
+    crate::diag::log(
+        "remote_publication_drive_failure",
+        &format!("error={error}"),
+    );
+    SharedPublisherError::DriveUnavailable
 }
 
 pub(crate) trait SharedPublicationSigner: Send + Sync {
@@ -650,6 +661,48 @@ pub(crate) struct SharedStreamPublisher {
     backend: Arc<dyn SharedPublicationBackend>,
     drive: Arc<dyn SharedPublicationDrive>,
     signer: Arc<dyn SharedPublicationSigner>,
+    subscription: Option<SubscriptionStreamProvisioner>,
+}
+
+struct SubscriptionStreamProvisioner {
+    store: RuntimeStoreHandle,
+    registration: MachinePublicationHandle,
+}
+
+impl SubscriptionStreamProvisioner {
+    async fn prepare(&self, target: RuntimeStreamTarget) -> Result<(), SharedPublisherError> {
+        let scope = match target {
+            RuntimeStreamTarget::Catalog => PublicationScope::Catalog,
+            RuntimeStreamTarget::Conversation(conversation_id) => {
+                PublicationScope::Conversation(conversation_id)
+            }
+        };
+        let stream = self
+            .store
+            .ensure_subscription_publication_stream(scope)
+            .await
+            .map_err(|error| match error {
+                RuntimeStoreError::PublicationNeedsSnapshot => {
+                    SharedPublisherError::SnapshotRequired
+                }
+                _ => SharedPublisherError::BackendRejected,
+            })?;
+        match self
+            .registration
+            .register_stream_exact(
+                StreamRouteId::from_bytes(stream.stream_route),
+                StreamGenerationId::from_bytes(stream.generation),
+            )
+            .await
+            .map_err(|_| SharedPublisherError::StreamRegistrationFailed)?
+        {
+            MachineStreamRegistrationOutcome::Registered { .. } => Ok(()),
+            MachineStreamRegistrationOutcome::OutcomeUnknown => {
+                Err(SharedPublisherError::StreamRegistrationOutcomeUnknown)
+            }
+            MachineStreamRegistrationOutcome::Offline => Err(SharedPublisherError::RelayOffline),
+        }
+    }
 }
 
 impl SharedStreamPublisher {
@@ -667,7 +720,23 @@ impl SharedStreamPublisher {
             backend,
             drive,
             signer,
+            subscription: None,
         })
+    }
+
+    pub(crate) fn with_subscription_provisioning(
+        mut self,
+        store: RuntimeStoreHandle,
+        registration: MachinePublicationHandle,
+    ) -> Result<Self, SharedPublisherError> {
+        if registration.machine_route() != self.machine_route {
+            return Err(SharedPublisherError::InvalidSealAxes);
+        }
+        self.subscription = Some(SubscriptionStreamProvisioner {
+            store,
+            registration,
+        });
+        Ok(self)
     }
 
     pub(crate) async fn publish_runtime_bytes(
@@ -736,6 +805,21 @@ impl RemoteStreamPublisher for SharedStreamPublisher {
         true
     }
 
+    async fn prepare_subscription(
+        &self,
+        target: RuntimeStreamTarget,
+    ) -> Result<(), RemoteLinkError> {
+        let subscription = self
+            .subscription
+            .as_ref()
+            .ok_or(SharedPublisherError::StreamRegistrationUnavailable)
+            .map_err(remote_link_error)?;
+        subscription
+            .prepare(target)
+            .await
+            .map_err(remote_link_error)
+    }
+
     async fn publish_exact(&self, runtime_bytes: Arc<[u8]>) -> Result<(), RemoteLinkError> {
         self.publish_runtime_bytes(runtime_bytes)
             .await
@@ -761,6 +845,10 @@ impl RemoteStreamPublisher for SharedStreamPublisher {
 }
 
 fn remote_link_error(error: SharedPublisherError) -> RemoteLinkError {
+    crate::diag::log(
+        "remote_stream_publisher_failure",
+        &format!("code={}", error.code()),
+    );
     match error {
         SharedPublisherError::CounterRetired => RemoteLinkError::CounterRetired,
         _ => RemoteLinkError::StreamPublishFailed,
@@ -799,6 +887,12 @@ pub(crate) enum SharedPublisherError {
     CounterRetired,
     #[error("publication drive owner is unavailable")]
     DriveUnavailable,
+    #[error("subscription stream registration is not installed")]
+    StreamRegistrationUnavailable,
+    #[error("subscription stream registration failed")]
+    StreamRegistrationFailed,
+    #[error("subscription stream registration outcome is unknown")]
+    StreamRegistrationOutcomeUnknown,
     #[error("Relay publication outcome is unknown")]
     CommitOutcomeUnknown,
     #[error("Relay is offline")]
@@ -829,6 +923,13 @@ impl SharedPublisherError {
             Self::GenerationRotationBlocked => "daemon.remote.publisher.rotation_blocked",
             Self::CounterRetired => "daemon.remote.counter.retired",
             Self::DriveUnavailable => "daemon.remote.publisher.drive_unavailable",
+            Self::StreamRegistrationUnavailable => {
+                "daemon.remote.publisher.stream_registration_unavailable"
+            }
+            Self::StreamRegistrationFailed => "daemon.remote.publisher.stream_registration_failed",
+            Self::StreamRegistrationOutcomeUnknown => {
+                "daemon.remote.publisher.stream_registration_unknown"
+            }
             Self::CommitOutcomeUnknown => "daemon.remote.publisher.commit_unknown",
             Self::RelayOffline => "daemon.remote.publisher.relay_offline",
             Self::ExactCommitNotObserved => "daemon.remote.publisher.commit_not_observed",
@@ -885,7 +986,8 @@ mod tests {
         ActiveSenderCounterBinding, ConfigureConversation, ConfigureConversationOutcome,
         FrozenPublication, RetiredKeyOwnerKind, RetiredSharedKeyOwner, RuntimeBackfillPlan,
         RuntimeBackfillTarget, RuntimeStoreError, RuntimeStoreHandle,
-        active_authorization_store_for_test, complete_active_zero_cut_transition,
+        active_authorization_store_for_test,
+        complete_active_zero_cut_transition_with_counter_guard,
         production_aligned_active_authorization_store_for_test,
     };
     use crate::runtime::transfer_identity::{DurableStreamSource, DurableStreamTransferIdentity};
@@ -1034,6 +1136,8 @@ mod tests {
         }
         let database = root.path().join(format!("{}-{cut}.db", class.label()));
         let keys = Arc::new(MemoryKeyStore::new());
+        let counter_key_store: Arc<dyn KeyStore> = keys.clone();
+        let transition_guard = OwnedKeyStoreCounterGuardBackend::new(counter_key_store);
         let storage_kek = load_or_create_storage_kek(keys.as_ref(), &database)
             .expect("create production shared crash StorageKEK");
         let store = production_aligned_active_authorization_store_for_test(
@@ -1049,6 +1153,10 @@ mod tests {
             ],
         )
         .await;
+        store
+            .ensure_remote_catalog_publication_after_transition()
+            .await
+            .expect("ensure production shared crash Catalog carrier");
         let conversation_id = RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0xb1; 16])
             .expect("production shared crash conversation id");
         let descriptor = ConversationDescriptor {
@@ -1065,7 +1173,7 @@ mod tests {
             })
             .await
             .expect("create production shared crash conversation");
-        complete_active_zero_cut_transition(&store).await;
+        complete_active_zero_cut_transition_with_counter_guard(&store, &transition_guard).await;
 
         let item = match class {
             ProductionSharedCrashClass::Catalog => RuntimeStreamItem::CatalogDelta(CatalogDelta {
@@ -2247,6 +2355,12 @@ mod tests {
                 .expect("secure shared backend tempdir");
         }
         let store = active_authorization_store_for_test(&temp.path().join("runtime.db")).await;
+        let counter_store = MemoryKeyStore::new();
+        let guard = Arc::new(KeyStoreCounterGuardBackend::new(&counter_store));
+        store
+            .ensure_remote_catalog_publication_after_transition()
+            .await
+            .expect("ensure shared backend production Catalog carrier");
         let conversation_id = RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x61; 16])
             .expect("conversation id");
         let descriptor = ConversationDescriptor {
@@ -2263,7 +2377,7 @@ mod tests {
             })
             .await
             .expect("create immutable catalog journal row");
-        complete_active_zero_cut_transition(&store).await;
+        complete_active_zero_cut_transition_with_counter_guard(&store, guard.as_ref()).await;
         let second_conversation_id = RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0x63; 16])
             .expect("second conversation id");
         let second_descriptor = ConversationDescriptor {
@@ -2280,7 +2394,7 @@ mod tests {
             })
             .await
             .expect("create contiguous catalog journal tail");
-        complete_active_zero_cut_transition(&store).await;
+        complete_active_zero_cut_transition_with_counter_guard(&store, guard.as_ref()).await;
         let key_directory_revision = store
             .load_global_key_state()
             .await
@@ -2309,8 +2423,6 @@ mod tests {
         });
         let canonical = CanonicalSharedPublication::parse(runtime_bytes("volatile", item))
             .expect("canonical shared catalog item");
-        let counter_store = MemoryKeyStore::new();
-        let guard = Arc::new(KeyStoreCounterGuardBackend::new(&counter_store));
         let machine_route = MachineRouteId::from_bytes([0x71; 16]);
         let backend = RuntimeStoreSharedPublicationBackend::new(
             store.clone(),
@@ -2548,6 +2660,12 @@ mod tests {
                 .expect("secure shared transfer tempdir");
         }
         let store = active_authorization_store_for_test(&temp.path().join("runtime.db")).await;
+        let counter_store = MemoryKeyStore::new();
+        let guard = Arc::new(KeyStoreCounterGuardBackend::new(&counter_store));
+        store
+            .ensure_remote_catalog_publication_after_transition()
+            .await
+            .expect("ensure shared transfer production Catalog carrier");
         let mut changes = Vec::new();
         let mut first_revision = None;
         let mut through_revision = 0_u64;
@@ -2571,7 +2689,7 @@ mod tests {
                 })
                 .await
                 .expect("create large immutable catalog row");
-            complete_active_zero_cut_transition(&store).await;
+            complete_active_zero_cut_transition_with_counter_guard(&store, guard.as_ref()).await;
             first_revision.get_or_insert(created.catalog_revision);
             through_revision = created.catalog_revision;
             changes.push(CatalogChange::Upserted {
@@ -2614,8 +2732,6 @@ mod tests {
         let final_part = CanonicalSharedPublication::parse_transfer(final_carrier)
             .expect("canonical final publication");
 
-        let counter_store = MemoryKeyStore::new();
-        let guard = Arc::new(KeyStoreCounterGuardBackend::new(&counter_store));
         let machine_route = MachineRouteId::from_bytes([0x85; 16]);
         let backend = RuntimeStoreSharedPublicationBackend::new(
             store.clone(),

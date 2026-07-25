@@ -263,6 +263,34 @@ impl RuntimeCore {
         .map_err(RuntimeCoreError::into_failure)
     }
 
+    /// P4 automatic E2E 专用构造：除 synthetic vendor adapter 外仍使用 production
+    /// RuntimeCore/exec-gate 组合，并把 gate 固定到 Cargo 构建出的真实 daemon binary。
+    /// release build 不暴露该 seam，production 始终只允许 current-binary owner。
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn new_production_for_synthetic_e2e(
+        store: RuntimeStoreHandle,
+        router: Arc<AgentRouter>,
+        gate_binary: PathBuf,
+    ) -> Result<Self, RuntimeFailure> {
+        let machine_trust_domain = store
+            .machine_trust_domain()
+            .map_err(|error| RuntimeCoreError::Store(error).into_failure())?;
+        let execution = Arc::new(GatedExecutionCoordinator::for_synthetic_e2e(
+            router.clone(),
+            gate_binary,
+        ));
+        Self::with_execution_coordinator(
+            store,
+            router,
+            machine_trust_domain,
+            execution,
+            DEFAULT_ADAPTER_CONCURRENCY,
+            true,
+        )
+        .map_err(RuntimeCoreError::into_failure)
+    }
+
     /// daemon binary 在 main-loop exit receiver 建立后接入的 P3.10 production service。
     /// 构造只验证固定 bin root，不触碰 current、候选 artifact 或 Store。
     #[doc(hidden)]

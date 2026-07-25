@@ -20,8 +20,8 @@ use crate::runtime::store::key_transition::{
     RemoteTransitionIngressClass,
 };
 use crate::runtime::store::publication::{
-    EpochBarrierJournalIdentity, SharedJournalIdentity, SharedPublicationPreflight,
-    SharedPublicationPreflightRequest, SharedPublicationStreamProposal,
+    DirectoryAdvanceJournalIdentity, EpochBarrierJournalIdentity, SharedJournalIdentity,
+    SharedPublicationPreflight, SharedPublicationPreflightRequest, SharedPublicationStreamProposal,
     SharedPublicationTransactionBinding, TransactionSharedKeyAxes,
 };
 use crate::runtime::store::{
@@ -37,8 +37,10 @@ use super::publisher::{
     SignedPublicationRequest,
 };
 use super::transition::{
-    AuthenticatedCommittedStreamCut, EpochBarrierPublicationRequest, EpochBarrierPublicationTarget,
-    ExactEpochBarrierCommit, TransitionAnchor, TransitionBackend, TransitionCoordinatorError,
+    AuthenticatedCommittedStreamCut, DirectoryAdvancePublicationRequest,
+    DirectoryAdvancePublicationTarget, EpochBarrierPublicationRequest,
+    EpochBarrierPublicationTarget, ExactDirectoryAdvanceCommit, ExactEpochBarrierCommit,
+    TransitionAnchor, TransitionBackend, TransitionCatalogStream, TransitionCoordinatorError,
     TransitionMaterial, TransitionRecipientMaterial,
 };
 use super::transport::MachineDataAuthority;
@@ -267,6 +269,86 @@ impl RuntimeStoreTransitionBackend {
         Ok(committed)
     }
 
+    async fn acknowledged_directory_advance_target(
+        &self,
+        request: &DirectoryAdvancePublicationRequest,
+        publication_id: [u8; 16],
+    ) -> Result<DirectoryAdvancePublicationTarget, TransitionCoordinatorError> {
+        let stream = self
+            .store
+            .load_publication_stream_record(request.publication_stream_id)
+            .await
+            .map_err(map_transition_store_error)?;
+        let stream_seq = stream
+            .acknowledged_high_water
+            .ok_or(TransitionCoordinatorError::ExactReadbackMismatch)?;
+        let blob_sha256 = stream
+            .last_acknowledged_blob_hash
+            .ok_or(TransitionCoordinatorError::ExactReadbackMismatch)?;
+        if stream.publication_stream_id != request.publication_stream_id
+            || stream.stream_route != request.stream_route
+            || stream.generation != request.generation
+            || stream.last_acknowledged_publication_id != Some(publication_id)
+            || stream.committed_high_water != Some(stream_seq)
+            || stream.last_committed_blob_hash != Some(blob_sha256)
+            || stream.committed_inner_cursor != stream.acknowledged_inner_cursor
+            || stream.last_acknowledged_request_digest.is_none()
+        {
+            return Err(TransitionCoordinatorError::ExactReadbackMismatch);
+        }
+        Ok(directory_target_from_request(
+            request,
+            stream_seq,
+            blob_sha256,
+        ))
+    }
+
+    async fn directory_advance_commit_observed(
+        &self,
+        target: DirectoryAdvancePublicationTarget,
+    ) -> Result<bool, TransitionCoordinatorError> {
+        validate_directory_target_shape(target)?;
+        let publication_id = directory_advance_publication_id(target);
+        let stream = self
+            .store
+            .load_publication_stream_record(target.publication_stream_id)
+            .await
+            .map_err(map_transition_store_error)?;
+        if stream.publication_stream_id != target.publication_stream_id
+            || stream.stream_route != target.stream_route
+            || stream.generation != target.generation
+        {
+            return Err(TransitionCoordinatorError::BarrierMismatch);
+        }
+        if let Some(frozen) = self
+            .store
+            .load_frozen_publication(publication_id)
+            .await
+            .map_err(map_transition_store_error)?
+        {
+            if frozen.publication_stream_id != target.publication_stream_id
+                || frozen.stream_route != target.stream_route
+                || frozen.generation != target.generation
+                || frozen.stream_seq != target.stream_seq
+                || frozen.blob_sha256 != target.sealed_blob_sha256
+                || frozen.payload_kind != PublicationPayloadKind::Control
+                || frozen.inner_after.is_some()
+                || frozen.inner_through.is_some()
+            {
+                return Err(TransitionCoordinatorError::BarrierMismatch);
+            }
+        } else if stream.acknowledged_high_water != Some(target.stream_seq)
+            || stream.last_acknowledged_publication_id != Some(publication_id)
+            || stream.last_acknowledged_blob_hash != Some(target.sealed_blob_sha256)
+            || stream.committed_inner_cursor != stream.acknowledged_inner_cursor
+            || stream.last_acknowledged_request_digest.is_none()
+        {
+            return Err(TransitionCoordinatorError::BarrierMismatch);
+        }
+        Ok(stream.committed_high_water == Some(target.stream_seq)
+            && stream.last_committed_blob_hash == Some(target.sealed_blob_sha256))
+    }
+
     async fn drive_until_cuts_committed(
         &self,
         operation_id: [u8; 16],
@@ -360,6 +442,13 @@ impl TransitionBackend for RuntimeStoreTransitionBackend {
                             authorization_revision: recipient.authorization_revision,
                         })
                         .collect(),
+                    activation_catalog_stream: projection.activation_catalog_stream.map(|stream| {
+                        TransitionCatalogStream {
+                            publication_stream_id: stream.publication_stream_id,
+                            stream_route: stream.stream_route,
+                            generation: stream.generation,
+                        }
+                    }),
                 })
             })
             .transpose()
@@ -568,6 +657,181 @@ impl TransitionBackend for RuntimeStoreTransitionBackend {
         Err(TransitionCoordinatorError::UncommittedCut)
     }
 
+    async fn freeze_directory_advance(
+        &self,
+        request: DirectoryAdvancePublicationRequest,
+    ) -> Result<DirectoryAdvancePublicationTarget, TransitionCoordinatorError> {
+        validate_directory_advance_request(&request)?;
+        let identity = directory_journal_identity(&request);
+        let publication_id = identity.publication_id();
+        let preflight_request = SharedPublicationPreflightRequest {
+            publication_id,
+            scope: PublicationScope::Catalog,
+            inner_after: None,
+            inner_through: None,
+            payload_kind: PublicationPayloadKind::Control,
+            journal_identity: SharedJournalIdentity::DirectoryAdvance(identity),
+            canonical_item_bytes: request.canonical_control.clone(),
+        };
+        let preflight = self
+            .store
+            .preflight_shared_publication(
+                preflight_request.clone(),
+                SharedPublicationStreamProposal {
+                    publication_stream_id: request.publication_stream_id,
+                    stream_route: request.stream_route,
+                    generation: request.generation,
+                },
+            )
+            .await
+            .map_err(map_transition_store_error)?;
+        let (current_revision, key_id, existing_target) = match preflight {
+            SharedPublicationPreflight::AlreadyHandled => {
+                return self
+                    .acknowledged_directory_advance_target(&request, publication_id)
+                    .await;
+            }
+            SharedPublicationPreflight::RotationRequired(_) => {
+                return Err(TransitionCoordinatorError::SnapshotRequired);
+            }
+            SharedPublicationPreflight::Frozen {
+                publication_stream_id,
+                generation,
+                stream_seq,
+                blob_sha256,
+                key_directory_revision,
+                key_id,
+            } => {
+                let target = directory_target_from_request(&request, stream_seq, blob_sha256);
+                if publication_stream_id != request.publication_stream_id
+                    || generation != request.generation
+                    || key_directory_revision != request.from_revision
+                    || key_id != request.expected_key_id
+                {
+                    return Err(TransitionCoordinatorError::ExactReadbackMismatch);
+                }
+                (request.to_revision, key_id, Some(target))
+            }
+            SharedPublicationPreflight::Fresh {
+                publication_stream_id,
+                generation,
+                key_directory_revision,
+                key_id,
+            } => {
+                if publication_stream_id != request.publication_stream_id
+                    || generation != request.generation
+                    || key_directory_revision != request.to_revision
+                    || key_id != request.expected_key_id
+                {
+                    return Err(TransitionCoordinatorError::ExactReadbackMismatch);
+                }
+                (key_directory_revision, key_id, None)
+            }
+        };
+        let counter_scope = CounterScope::publication(
+            self.trust_domain,
+            request.expected_key_id,
+            request.publication_stream_id,
+        )
+        .map_err(|_| TransitionCoordinatorError::MaterialMismatch)?;
+        let signed_request = SignedPublicationRequest {
+            publication_id,
+            publication_stream_id: request.publication_stream_id,
+            machine_route: self.machine_route,
+            generation: StreamGenerationId::from_bytes(request.generation),
+            // Endpoint 仍持有 predecessor Catalog binding；header 必须保持可解密。
+            key_directory_revision: request.from_revision,
+            key_id,
+            counter_scope,
+            inner_after: None,
+            inner_through: None,
+            payload_kind: PublicationPayloadKind::Control,
+            sealer_retained_bytes: request.canonical_control.capacity(),
+        };
+        let binding = SharedPublicationTransactionBinding {
+            request: preflight_request,
+            expected_key_directory_revision: current_revision,
+            expected_key_id: key_id,
+        };
+        let machine_route = self.machine_route;
+        let authority = self.authority.clone();
+        let sealing_request = request.clone();
+        let frozen = match SignedPublicationCoordinator::new(&self.store, self.guard.as_ref())
+            .freeze_shared_signed(signed_request, binding, move |axes, shared| {
+                seal_directory_advance(
+                    machine_route,
+                    &authority,
+                    &sealing_request,
+                    axes.stream_route(),
+                    axes.generation(),
+                    axes.stream_seq(),
+                    axes.sender_counter(),
+                    shared,
+                )
+            })
+            .await
+        {
+            Ok(frozen) => frozen,
+            Err(SignedPublicationError::Store(
+                RuntimeStoreError::PublicationAlreadyAcknowledged,
+            )) => {
+                return self
+                    .acknowledged_directory_advance_target(&request, publication_id)
+                    .await;
+            }
+            Err(SignedPublicationError::Store(error)) => {
+                return Err(map_transition_store_error(error));
+            }
+            Err(_) => return Err(TransitionCoordinatorError::BackendRejected),
+        };
+        let target = directory_target_from_request(&request, frozen.stream_seq, frozen.blob_sha256);
+        if frozen.publication_id != publication_id
+            || frozen.publication_stream_id != request.publication_stream_id
+            || frozen.stream_route != request.stream_route
+            || frozen.generation != request.generation
+            || frozen.payload_kind != PublicationPayloadKind::Control
+            || frozen.inner_after.is_some()
+            || frozen.inner_through.is_some()
+            || existing_target.is_some_and(|existing| existing != target)
+        {
+            return Err(TransitionCoordinatorError::ExactReadbackMismatch);
+        }
+        Ok(target)
+    }
+
+    async fn drive_directory_advance_to_exact_commit(
+        &self,
+        target: DirectoryAdvancePublicationTarget,
+    ) -> Result<ExactDirectoryAdvanceCommit, TransitionCoordinatorError> {
+        if self.directory_advance_commit_observed(target).await? {
+            return Ok(ExactDirectoryAdvanceCommit { target });
+        }
+        self.drive
+            .notify_frozen_stream(target.publication_stream_id)
+            .await
+            .map_err(|error| self.map_publication_progress_error(error))?;
+        for _ in 0..MAX_TRANSITION_DRIVE_ROUNDS {
+            let report = self
+                .drive
+                .drive_round()
+                .await
+                .map_err(|error| self.map_publication_progress_error(error))?;
+            if self.directory_advance_commit_observed(target).await? {
+                return Ok(ExactDirectoryAdvanceCommit { target });
+            }
+            match self.classify_publication_report(&report) {
+                PublicationProgressWait::RetryTimer | PublicationProgressWait::Reconnect => {
+                    return Err(TransitionCoordinatorError::ProgressPending);
+                }
+                PublicationProgressWait::None => {}
+            }
+            if report.loaded == 0 && report.committed == 0 {
+                return Err(TransitionCoordinatorError::UncommittedCut);
+            }
+        }
+        Err(TransitionCoordinatorError::UncommittedCut)
+    }
+
     async fn mark_key_barriers_committed_exact(
         &self,
         operation_id: [u8; 16],
@@ -600,6 +864,21 @@ fn journal_identity(request: &EpochBarrierPublicationRequest) -> EpochBarrierJou
         key_directory_revision: request.expected_key_directory_revision,
         key_id: request.expected_key_id,
         barrier_sha256: request.barrier_sha256,
+    }
+}
+
+fn directory_journal_identity(
+    request: &DirectoryAdvancePublicationRequest,
+) -> DirectoryAdvanceJournalIdentity {
+    DirectoryAdvanceJournalIdentity {
+        operation_id: request.operation_id,
+        publication_stream_id: request.publication_stream_id,
+        stream_route: request.stream_route,
+        generation: request.generation,
+        from_revision: request.from_revision,
+        to_revision: request.to_revision,
+        key_id: request.expected_key_id,
+        control_sha256: request.control_sha256,
     }
 }
 
@@ -643,6 +922,36 @@ fn validate_barrier_request(
             .canonical_sha256()
             .map_err(|_| TransitionCoordinatorError::MaterialMismatch)?
             != request.barrier_sha256
+    {
+        return Err(TransitionCoordinatorError::MaterialMismatch);
+    }
+    Ok(())
+}
+
+fn validate_directory_advance_request(
+    request: &DirectoryAdvancePublicationRequest,
+) -> Result<(), TransitionCoordinatorError> {
+    let control = KeyControlV1::from_canonical_bytes(&request.canonical_control)
+        .map_err(|_| TransitionCoordinatorError::MaterialMismatch)?;
+    let KeyControlV1::DirectoryRevisionAdvance { ref advance, .. } = control else {
+        return Err(TransitionCoordinatorError::MaterialMismatch);
+    };
+    if request.operation_id == [0; 16]
+        || request.publication_stream_id == [0; 16]
+        || request.stream_route == [0; 16]
+        || request.generation == [0; 16]
+        || request.from_revision == 0
+        || request.from_revision.checked_add(1) != Some(request.to_revision)
+        || request.expected_key_id.purpose != agentdeck_protocol::e2ee::KeyPurpose::Catalog
+        || request.expected_key_id.epoch == 0
+        || request.control_sha256 == [0; 32]
+        || *advance != request.advance
+        || advance.from_key_directory_revision.value() != request.from_revision
+        || advance.to_key_directory_revision.value() != request.to_revision
+        || control
+            .canonical_sha256()
+            .map_err(|_| TransitionCoordinatorError::MaterialMismatch)?
+            != request.control_sha256
     {
         return Err(TransitionCoordinatorError::MaterialMismatch);
     }
@@ -716,6 +1025,68 @@ fn seal_epoch_barrier(
     Ok(wire)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn seal_directory_advance(
+    machine_route: MachineRouteId,
+    authority: &MachineDataAuthority,
+    request: &DirectoryAdvancePublicationRequest,
+    stream_route: StreamRouteId,
+    generation: StreamGenerationId,
+    stream_seq: u64,
+    sender_counter: u64,
+    shared: TransactionSharedKeyAxes,
+) -> Result<Vec<u8>, PublicationError> {
+    if stream_route.as_bytes() != &request.stream_route
+        || generation.as_bytes() != &request.generation
+        || shared.key_directory_revision != request.to_revision
+        || shared.key_id != request.expected_key_id
+    {
+        return Err(PublicationError::InvalidAxes);
+    }
+    let context = OuterContextV1 {
+        frame_kind: OuterFrameKind::CatalogPublish,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: Some(machine_route),
+        device_route: None,
+        stream_route: Some(stream_route),
+        request_route: None,
+        pair_route: None,
+        stream_generation: Some(generation),
+        stream_cursor: None,
+        stream_seq: Some(stream_seq),
+        message_key_epoch: shared.key_id.epoch,
+    };
+    let control = KeyControlV1::from_canonical_bytes(&request.canonical_control)
+        .map_err(|_| PublicationError::InvalidAxes)?;
+    let key = AeadSendingKey::with_derived_nonce_prefix(
+        shared.key_id,
+        shared.key_id.epoch,
+        request.from_revision,
+        shared.key,
+    );
+    let unsigned = seal_symmetric(
+        &key,
+        &context,
+        control.sealed_payload_kind(),
+        &request.canonical_control,
+        SenderCounter(sender_counter),
+    )
+    .map_err(|_| PublicationError::InvalidAxes)?;
+    let signed = authority
+        .sign_sealed(unsigned, &context)
+        .map_err(|_| PublicationError::InvalidAxes)?;
+    if signed.inner.key_id != request.expected_key_id
+        || signed.inner.key_epoch != request.expected_key_id.epoch
+        || signed.inner.key_directory_revision != request.from_revision
+    {
+        return Err(PublicationError::InvalidAxes);
+    }
+    let wire = signed.to_wire_bytes();
+    SignedSealedBlobV1::from_wire_bytes(&wire).map_err(|_| PublicationError::InvalidAxes)?;
+    Ok(wire)
+}
+
 fn target_from_request(
     request: &EpochBarrierPublicationRequest,
     sealed_blob_sha256: [u8; 32],
@@ -733,6 +1104,60 @@ fn target_from_request(
         barrier_sha256: request.barrier_sha256,
         sealed_blob_sha256,
     }
+}
+
+fn directory_target_from_request(
+    request: &DirectoryAdvancePublicationRequest,
+    stream_seq: u64,
+    sealed_blob_sha256: [u8; 32],
+) -> DirectoryAdvancePublicationTarget {
+    DirectoryAdvancePublicationTarget {
+        class: super::publisher::PublicationClass::DirectoryRevisionAdvance,
+        operation_id: request.operation_id,
+        publication_stream_id: request.publication_stream_id,
+        stream_route: request.stream_route,
+        generation: request.generation,
+        stream_seq,
+        from_revision: request.from_revision,
+        to_revision: request.to_revision,
+        key_id: request.expected_key_id,
+        control_sha256: request.control_sha256,
+        sealed_blob_sha256,
+    }
+}
+
+fn validate_directory_target_shape(
+    target: DirectoryAdvancePublicationTarget,
+) -> Result<(), TransitionCoordinatorError> {
+    if target.class != super::publisher::PublicationClass::DirectoryRevisionAdvance
+        || target.operation_id == [0; 16]
+        || target.publication_stream_id == [0; 16]
+        || target.stream_route == [0; 16]
+        || target.generation == [0; 16]
+        || target.from_revision == 0
+        || target.from_revision.checked_add(1) != Some(target.to_revision)
+        || target.key_id.purpose != agentdeck_protocol::e2ee::KeyPurpose::Catalog
+        || target.key_id.epoch == 0
+        || target.control_sha256 == [0; 32]
+        || target.sealed_blob_sha256 == [0; 32]
+    {
+        return Err(TransitionCoordinatorError::BarrierMismatch);
+    }
+    Ok(())
+}
+
+fn directory_advance_publication_id(target: DirectoryAdvancePublicationTarget) -> [u8; 16] {
+    DirectoryAdvanceJournalIdentity {
+        operation_id: target.operation_id,
+        publication_stream_id: target.publication_stream_id,
+        stream_route: target.stream_route,
+        generation: target.generation,
+        from_revision: target.from_revision,
+        to_revision: target.to_revision,
+        key_id: target.key_id,
+        control_sha256: target.control_sha256,
+    }
+    .publication_id()
 }
 
 fn validate_target_shape(

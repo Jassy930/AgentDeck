@@ -1,7 +1,7 @@
 //! Runtime store stream/backfill/snapshot/publication async facade 与 barrier capture。
 
 use super::*;
-use crate::runtime::events::WatchGeneration;
+use crate::runtime::events::{PinnedBackfillSource, StoreWatch, WatchGeneration};
 
 /// Worker 在 oneshot send 前就绑定 TEMP backfill pin 的 Drop cleanup。
 ///
@@ -31,6 +31,51 @@ impl ManagedBackfillPlan {
 impl Drop for ManagedBackfillPlan {
     fn drop(&mut self) {
         if let Some(RuntimeBackfillPlan::Pinned(pin)) = self.plan.take() {
+            let _ = self.cleanup_tx.send(StoreCleanup::BackfillPin(pin.pin_id));
+        }
+    }
+}
+
+/// delayed-finalize 的 overlap pin 在 worker reply -> oneshot -> pump attach 全程持有
+/// Drop cleanup。caller cancellation 即使发生在成功 send 后，或发生在 pump 第二次
+/// `ensure_current` 前，也不会让裸 pin 留到 TTL 才释放。
+pub(crate) struct ManagedSubscriptionPublicationOutcome {
+    outcome: Option<FinalizeSubscriptionPublicationOutcome>,
+    cleanup_tx: mpsc::UnboundedSender<StoreCleanup>,
+}
+
+impl ManagedSubscriptionPublicationOutcome {
+    fn new(
+        outcome: FinalizeSubscriptionPublicationOutcome,
+        cleanup_tx: mpsc::UnboundedSender<StoreCleanup>,
+    ) -> Self {
+        Self {
+            outcome: Some(outcome),
+            cleanup_tx,
+        }
+    }
+
+    /// pump 已通过最后一次 cancellation 检查后，将 worker guard 原子替换为正常
+    /// `PinnedBackfillSource` guard；此同步转换中间没有 await/cancellation point。
+    pub(crate) fn into_attached(
+        mut self,
+        watch: &StoreWatch,
+    ) -> (RelayCommittedCut, Option<PinnedBackfillSource>) {
+        let outcome = self
+            .outcome
+            .take()
+            .expect("managed publication outcome is consumed exactly once");
+        let source = outcome.overlap_pin.map(|pin| {
+            let cleanup = watch.backfill_pin_cleanup(pin.pin_id);
+            PinnedBackfillSource::new(pin, cleanup)
+        });
+        (outcome.cut, source)
+    }
+}
+
+impl Drop for ManagedSubscriptionPublicationOutcome {
+    fn drop(&mut self) {
+        if let Some(pin) = self.outcome.take().and_then(|outcome| outcome.overlap_pin) {
             let _ = self.cleanup_tx.send(StoreCleanup::BackfillPin(pin.pin_id));
         }
     }
@@ -734,6 +779,53 @@ impl RuntimeStoreHandle {
         .await?
     }
 
+    pub(crate) async fn ensure_subscription_publication_stream(
+        &self,
+        scope: PublicationScope,
+    ) -> Result<PublicationStreamRecord, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<NormalCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::EnsureSubscriptionPublicationStream { scope, reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn ensure_remote_catalog_publication_after_transition(
+        &self,
+    ) -> Result<Option<PublicationStreamRecord>, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<NormalCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::EnsureRemoteCatalogPublicationAfterTransition { reply },
+        )
+        .await?
+    }
+
+    pub(crate) async fn finalize_subscription_publication(
+        &self,
+        request: super::super::publication::FinalizeSubscriptionPublicationRequest,
+    ) -> Result<ManagedSubscriptionPublicationOutcome, RuntimeStoreError> {
+        let charge = memory_charge(size_of::<NormalCommand>(), &[])?;
+        dispatch_with_budget(
+            &self.normal_tx,
+            &self.normal_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Normal,
+            charge,
+            |reply| NormalCommand::FinalizeSubscriptionPublication { request, reply },
+        )
+        .await?
+    }
+
     pub(crate) async fn preflight_shared_publication(
         &self,
         request: super::super::publication::SharedPublicationPreflightRequest,
@@ -1012,6 +1104,16 @@ pub(super) fn send_backfill_pin_reply(
     let _ = reply.send(managed);
 }
 
+pub(super) fn send_subscription_publication_reply(
+    reply: oneshot::Sender<Result<ManagedSubscriptionPublicationOutcome, RuntimeStoreError>>,
+    result: Result<FinalizeSubscriptionPublicationOutcome, RuntimeStoreError>,
+    cleanup_tx: &mpsc::UnboundedSender<StoreCleanup>,
+) {
+    let managed = result
+        .map(|outcome| ManagedSubscriptionPublicationOutcome::new(outcome, cleanup_tx.clone()));
+    let _ = reply.send(managed);
+}
+
 pub(super) fn send_snapshot_build_pin_reply(
     reply: oneshot::Sender<Result<SnapshotMaterializationSource, RuntimeStoreError>>,
     result: Result<SnapshotBarrierSource, RuntimeStoreError>,
@@ -1103,42 +1205,46 @@ pub(super) fn register_stream_barrier_on_worker(
                 PublicationScope::Conversation(conversation_id)
             }
         };
-        let relay_committed = match super::super::publication::authenticate_directory(
-            &transaction,
-            &state.key_bundle,
-            &ledger,
-            publication_scope,
-        )? {
-            None => RelayCommittedCut::default(),
-            Some(publication) => {
-                let inner = agentdeck_protocol::runtime::StreamCursor::from_high_water(
-                    publication.committed_inner_cursor,
-                );
-                if inner
-                    .high_water()
-                    .zip(target_cut.high_water.high_water())
-                    .is_some_and(|(inner, high_water)| inner > high_water)
-                    || inner.high_water().is_some() && target_cut.high_water.high_water().is_none()
-                {
-                    return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        let relay_committed =
+            match super::super::publication::authenticate_subscription_publication_stream(
+                &transaction,
+                &state.key_bundle,
+                state.database_id,
+                &ledger,
+                publication_scope,
+            )? {
+                None => RelayCommittedCut::default(),
+                Some(publication) => {
+                    let inner = agentdeck_protocol::runtime::StreamCursor::from_high_water(
+                        publication.committed_inner_cursor,
+                    );
+                    if inner
+                        .high_water()
+                        .zip(target_cut.high_water.high_water())
+                        .is_some_and(|(inner, high_water)| inner > high_water)
+                        || inner.high_water().is_some()
+                            && target_cut.high_water.high_water().is_none()
+                    {
+                        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+                    }
+                    let stream_binding = super::super::publication::capture_stream_binding_permit(
+                        &transaction,
+                        &state.key_bundle,
+                        state.database_id,
+                        &publication,
+                    )?
+                    .ok_or(RuntimeStoreError::PublicationMismatch)?;
+                    RelayCommittedCut {
+                        publication_stream_id: Some(publication.publication_stream_id),
+                        generation: Some(publication.generation),
+                        outer: agentdeck_protocol::runtime::StreamCursor::from_high_water(
+                            publication.committed_high_water,
+                        ),
+                        inner,
+                        stream_binding: Some(stream_binding),
+                    }
                 }
-                let stream_binding = super::super::publication::capture_stream_binding_permit(
-                    &transaction,
-                    &state.key_bundle,
-                    state.database_id,
-                    &publication,
-                )?;
-                RelayCommittedCut {
-                    publication_stream_id: Some(publication.publication_stream_id),
-                    generation: Some(publication.generation),
-                    outer: agentdeck_protocol::runtime::StreamCursor::from_high_water(
-                        publication.committed_high_water,
-                    ),
-                    inner,
-                    stream_binding,
-                }
-            }
-        };
+            };
         let conversation_origin = match target {
             RuntimeStreamTarget::Catalog => None,
             RuntimeStreamTarget::Conversation(conversation_id) => Some(

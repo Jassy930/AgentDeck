@@ -5,15 +5,15 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$repo_root"
 
 if [[ $# -ne 1 ]]; then
-  printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2|p3>\n' >&2
+  printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2|p3|p4-auto>\n' >&2
   exit 2
 fi
 
 phase="$1"
 case "$phase" in
-  p0|p2|p3) ;;
+  p0|p2|p3|p4-auto) ;;
   *)
-    printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2|p3>\n' >&2
+    printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2|p3|p4-auto>\n' >&2
     exit 2
     ;;
 esac
@@ -185,12 +185,49 @@ run_p3() {
   run_gate 'iOS Simulator tests' verify_ios
 }
 
+run_p4_auto() {
+  run_gate 'Relay v2 daemon machine synthetic E2E + persistent CLI high-level path' \
+    cargo test -p agentdeckd --locked \
+      --test relay_v2_machine_e2e -- --test-threads=1 --nocapture
+  run_gate 'remote principal cannot confirm pairing' \
+    cargo test -p agentdeckd --lib --locked \
+      runtime::core::tests::pairing_administration_is_local_control_only_and_binds_create_owner \
+      -- --exact --test-threads=1
+  run_gate 'persistent CLI paired-state restart + real-slot contract' \
+    cargo test -p agentdeck-cli --locked \
+      --test e2e_remote_synthetic -- --test-threads=1 --nocapture
+  run_gate 'persistent CLI current V6 signed-frame crash readback' \
+    cargo test -p agentdeck-cli --locked \
+      --test remote_live_key_update \
+      directory_advance_crash_after_replay_commit_recovers_exact_signed_frame \
+      -- --exact --test-threads=1
+  run_gate 'daemon pairing state machine' \
+    cargo test -p agentdeckd --locked \
+      --test pairing_state_machine -- --test-threads=1
+  run_gate 'daemon machine trust-reset state machine' \
+    cargo test -p agentdeckd --locked \
+      --test machine_trust_reset -- --test-threads=1
+  run_gate 'remote CLI production composition boundary' \
+    cargo test -p agentdeck-cli --locked \
+      --test remote_production_composition -- --test-threads=1
+  run_gate 'Relay v2 outbound client' \
+    cargo test -p agentdeck-relay-client --locked
+  run_gate 'remote protocol contract' \
+    cargo test -p agentdeck-protocol --locked
+  run_gate 'daemon network boundary guard' \
+    bash scripts/check-daemon-network-boundary.sh
+  run_gate 'four protocol schema snapshots' verify_schema_snapshots
+  run_gate 'agent docs gate' scripts/verify-agent-docs.sh
+}
+
 if [[ "$phase" == 'p0' ]]; then
   run_p0
 elif [[ "$phase" == 'p2' ]]; then
   run_p2
-else
+elif [[ "$phase" == 'p3' ]]; then
   run_p3
+else
+  run_p4_auto
 fi
 
 printf 'verify-relay-companion-mvp %s: PASS\n' "$phase"

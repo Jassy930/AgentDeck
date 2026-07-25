@@ -712,7 +712,7 @@ fn runtime_ledger_token(
         );
     }
     *key_bundle
-        .blind_index(b"runtime.meta.ledger.v14", &message)
+        .blind_index(b"runtime.meta.ledger.v15", &message)
         .expect("authenticate Runtime boundary ledger")
         .as_bytes()
 }
@@ -1135,11 +1135,11 @@ async fn catalog_hwm_u64_max_returns_typed_exhaustion_and_inserts_no_additional_
                 [],
                 |row| row.get(0),
             )
-            .expect("read baseline current-v14 ledger token");
+            .expect("read baseline current-v15 ledger token");
         assert_eq!(
             runtime_ledger_token(&transaction, &key_bundle, database_id).as_slice(),
             stored_token,
-            "fixture current-v14 ledger encoder must match the store"
+            "fixture current-v15 ledger encoder must match the store"
         );
         assert_eq!(
             transaction

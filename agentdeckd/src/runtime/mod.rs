@@ -32,6 +32,9 @@ pub mod singleton;
 pub mod snapshot;
 pub mod store;
 pub(crate) mod subscription;
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod synthetic_e2e;
 pub mod transfer;
 pub(crate) mod transfer_identity;
 pub(crate) mod upgrade;

@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,6 +42,8 @@ use agentdeck_protocol::{
 };
 use tempfile::{NamedTempFile, TempDir};
 
+const RUNTIME_PROCESS_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentdeck")
 }
@@ -58,6 +61,25 @@ fn runtime_command(temp_root: &Path) -> Command {
     command
 }
 
+/// 多次启动 CLI 的 fixture 必须先创建 child，再通知 server 开始本轮 accept deadline。
+/// Unix socket backlog 会保存提前到达的连接，因此这同时消除了两轮 child 之间的调度空窗，
+/// 又保留了 child 已启动后 5 秒内必须连接的有界失败语义。
+fn spawned_runtime_output(
+    mut command: Command,
+    handoff: &mpsc::SyncSender<()>,
+) -> std::process::Output {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn Runtime CLI process");
+    if handoff.send(()).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("Runtime fixture server exited before client handoff");
+    }
+    child
+        .wait_with_output()
+        .expect("collect Runtime CLI output")
+}
+
 fn stdout_json(output: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
@@ -70,6 +92,7 @@ fn stdout_json(output: &std::process::Output) -> serde_json::Value {
 
 #[test]
 fn default_missing_socket_is_typed_and_never_spawns_legacy_daemon() {
+    let _guard = runtime_process_test_guard();
     let tmp = private_dir();
     let output = runtime_command(tmp.path())
         .env("TMPDIR", tmp.path())
@@ -164,12 +187,12 @@ fn private_json_file(value: &serde_json::Value) -> NamedTempFile {
     file
 }
 
-fn remote_process_test_guard() -> MutexGuard<'static, ()> {
+fn runtime_process_test_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("remote process test guard")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn accept_with_timeout(listener: &UnixListener, timeout: Duration) -> std::io::Result<UnixStream> {
@@ -205,7 +228,7 @@ fn accept_with_timeout(listener: &UnixListener, timeout: Duration) -> std::io::R
 }
 
 fn accept_hello(listener: &UnixListener) -> (BufReader<UnixStream>, UnixStream, String) {
-    let stream = accept_with_timeout(listener, Duration::from_secs(5))
+    let stream = accept_with_timeout(listener, RUNTIME_PROCESS_HANDOFF_TIMEOUT)
         .expect("accept Runtime client before deadline");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -235,6 +258,16 @@ fn accept_hello(listener: &UnixListener) -> (BufReader<UnixStream>, UnixStream, 
     (reader, writer, installation_id)
 }
 
+fn accept_spawned_hello(
+    listener: &UnixListener,
+    handoff: &mpsc::Receiver<()>,
+) -> (BufReader<UnixStream>, UnixStream, String) {
+    handoff
+        .recv()
+        .expect("Runtime client handoff before server accept");
+    accept_hello(listener)
+}
+
 #[test]
 fn fake_runtime_listener_accept_is_bounded() {
     let server = TestRuntimeServer::bind();
@@ -247,7 +280,7 @@ fn fake_runtime_listener_accept_is_bounded() {
 
 #[test]
 fn remote_machine_status_uses_runtime_uds_and_outputs_only_allowlisted_admin_action() {
-    let _guard = remote_process_test_guard();
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
     let server_thread = thread::spawn(move || {
@@ -294,7 +327,7 @@ fn remote_machine_status_uses_runtime_uds_and_outputs_only_allowlisted_admin_act
 
 #[test]
 fn remote_machine_enroll_imports_private_bundle_over_runtime_uds_without_echoing_secrets() {
-    let _guard = remote_process_test_guard();
+    let _guard = runtime_process_test_guard();
     let bundle = private_json_file(&runtime_fixture_payload("requestMachineEnroll")["bundle"]);
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
@@ -344,7 +377,7 @@ fn remote_machine_enroll_imports_private_bundle_over_runtime_uds_without_echoing
 
 #[test]
 fn remote_trust_reset_maps_runtime_failure_through_status_fallback() {
-    let _guard = remote_process_test_guard();
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
     let server_thread = thread::spawn(move || {
@@ -399,7 +432,7 @@ fn remote_trust_reset_maps_runtime_failure_through_status_fallback() {
 
 #[test]
 fn remote_machine_success_rejects_every_non_status_reply() {
-    let _guard = remote_process_test_guard();
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
     let server_thread = thread::spawn(move || {
@@ -427,7 +460,7 @@ fn remote_machine_success_rejects_every_non_status_reply() {
 
 #[test]
 fn remote_machine_runtime_failure_preserves_stable_code_and_failure_exit() {
-    let _guard = remote_process_test_guard();
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
     let server_thread = thread::spawn(move || {
@@ -456,6 +489,7 @@ fn remote_machine_runtime_failure_preserves_stable_code_and_failure_exit() {
 
 #[test]
 fn help_keeps_clap_success_output() {
+    let _guard = runtime_process_test_guard();
     let output = Command::new(bin())
         .arg("--help")
         .output()
@@ -497,13 +531,16 @@ fn codex_description() -> (
 
 #[test]
 fn debug_endpoint_reuses_isolated_installation_and_ping_only_performs_hello() {
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
     let installations = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&installations);
+    let (client_spawned_tx, client_spawned_rx) = mpsc::sync_channel(0);
     let server_thread = thread::spawn(move || {
         for _ in 0..2 {
-            let (mut reader, writer, installation_id) = accept_hello(&server.listener);
+            let (mut reader, writer, installation_id) =
+                accept_spawned_hello(&server.listener, &client_spawned_rx);
             observed.lock().unwrap().push(installation_id);
             drop(writer);
             let mut tail = Vec::new();
@@ -515,10 +552,9 @@ fn debug_endpoint_reuses_isolated_installation_and_ping_only_performs_hello() {
     });
 
     for _ in 0..2 {
-        let output = runtime_command(&temp_root)
-            .arg("ping")
-            .output()
-            .expect("run canonical ping");
+        let mut command = runtime_command(&temp_root);
+        command.arg("ping");
+        let output = spawned_runtime_output(command, &client_spawned_tx);
         assert!(
             output.status.success(),
             "stderr: {}",
@@ -534,12 +570,15 @@ fn debug_endpoint_reuses_isolated_installation_and_ping_only_performs_hello() {
 
 #[test]
 fn selfcheck_and_agent_commands_use_only_describe_agents_after_hello() {
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
+    let (client_spawned_tx, client_spawned_rx) = mpsc::sync_channel(0);
     let server_thread = thread::spawn(move || {
         let (descriptions, _, _) = codex_description();
         for _ in 0..3 {
-            let (mut reader, mut writer, _) = accept_hello(&server.listener);
+            let (mut reader, mut writer, _) =
+                accept_spawned_hello(&server.listener, &client_spawned_rx);
             let describe = read_envelope(&mut reader);
             assert!(matches!(
                 describe.body,
@@ -565,10 +604,9 @@ fn selfcheck_and_agent_commands_use_only_describe_agents_after_hello() {
         vec!["agent", "list"],
         vec!["agent", "capabilities", "--agent", "codex"],
     ] {
-        let output = runtime_command(&temp_root)
-            .args(arguments)
-            .output()
-            .expect("run DescribeAgents CLI command");
+        let mut command = runtime_command(&temp_root);
+        command.args(arguments);
+        let output = spawned_runtime_output(command, &client_spawned_tx);
         assert!(
             output.status.success(),
             "stderr: {}",
@@ -583,6 +621,7 @@ fn selfcheck_and_agent_commands_use_only_describe_agents_after_hello() {
 
 #[test]
 fn continue_accepts_pure_backfill_configuration_then_sends_prompt_directly() {
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
     let server_thread = thread::spawn(move || {
@@ -694,6 +733,7 @@ fn continue_accepts_pure_backfill_configuration_then_sends_prompt_directly() {
 
 #[test]
 fn continue_without_configuration_returns_typed_failure_after_legal_backfill() {
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
     let server_thread = thread::spawn(move || {
@@ -778,10 +818,13 @@ fn continue_without_configuration_returns_typed_failure_after_legal_backfill() {
 
 #[test]
 fn history_and_metadata_commands_keep_canonical_request_shapes() {
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
+    let (client_spawned_tx, client_spawned_rx) = mpsc::sync_channel(0);
     let server_thread = thread::spawn(move || {
-        let (mut reader, mut writer, _) = accept_hello(&server.listener);
+        let (mut reader, mut writer, _) =
+            accept_spawned_hello(&server.listener, &client_spawned_rx);
         let catalog = read_envelope(&mut reader);
         assert!(matches!(
             catalog.body,
@@ -810,7 +853,8 @@ fn history_and_metadata_commands_keep_canonical_request_shapes() {
             ),
         );
 
-        let (mut reader, mut writer, _) = accept_hello(&server.listener);
+        let (mut reader, mut writer, _) =
+            accept_spawned_hello(&server.listener, &client_spawned_rx);
         let subscribe = read_envelope(&mut reader);
         assert!(matches!(
             subscribe.body,
@@ -856,7 +900,8 @@ fn history_and_metadata_commands_keep_canonical_request_shapes() {
             RuntimeReply::Subscription(SubscriptionReceipt::Unsubscribed),
         );
 
-        let (mut reader, mut writer, _) = accept_hello(&server.listener);
+        let (mut reader, mut writer, _) =
+            accept_spawned_hello(&server.listener, &client_spawned_rx);
         let metadata = read_envelope(&mut reader);
         let RuntimeMessage::Request(RuntimeRequest::UpdateConversationMetadata(request)) =
             metadata.body
@@ -881,17 +926,16 @@ fn history_and_metadata_commands_keep_canonical_request_shapes() {
         );
     });
 
-    let list = runtime_command(&temp_root)
-        .args([
-            "history",
-            "list",
-            "--agent",
-            "codex",
-            "--cwd-filter",
-            "/tmp/history-cwd",
-        ])
-        .output()
-        .expect("run history list");
+    let mut list_command = runtime_command(&temp_root);
+    list_command.args([
+        "history",
+        "list",
+        "--agent",
+        "codex",
+        "--cwd-filter",
+        "/tmp/history-cwd",
+    ]);
+    let list = spawned_runtime_output(list_command, &client_spawned_tx);
     assert!(list.status.success());
     assert!(
         String::from_utf8(list.stdout)
@@ -899,10 +943,9 @@ fn history_and_metadata_commands_keep_canonical_request_shapes() {
             .contains("conversation-history")
     );
 
-    let read = runtime_command(&temp_root)
-        .args(["history", "read", "conversation-history"])
-        .output()
-        .expect("run history read");
+    let mut read_command = runtime_command(&temp_root);
+    read_command.args(["history", "read", "conversation-history"]);
+    let read = spawned_runtime_output(read_command, &client_spawned_tx);
     assert!(
         read.status.success(),
         "stderr: {}",
@@ -914,19 +957,18 @@ fn history_and_metadata_commands_keep_canonical_request_shapes() {
             .contains("unsubscribed")
     );
 
-    let rename = runtime_command(&temp_root)
-        .args([
-            "history",
-            "rename",
-            "conversation-history",
-            "Renamed canonically",
-            "--expected-entry-revision",
-            "4",
-            "--idempotency-key",
-            "metadata-stable-key",
-        ])
-        .output()
-        .expect("run history rename");
+    let mut rename_command = runtime_command(&temp_root);
+    rename_command.args([
+        "history",
+        "rename",
+        "conversation-history",
+        "Renamed canonically",
+        "--expected-entry-revision",
+        "4",
+        "--idempotency-key",
+        "metadata-stable-key",
+    ]);
+    let rename = spawned_runtime_output(rename_command, &client_spawned_tx);
     assert!(
         rename.status.success(),
         "stderr: {}",
@@ -940,6 +982,7 @@ fn history_and_metadata_commands_keep_canonical_request_shapes() {
 
 #[test]
 fn local_protocol_remote_and_legacy_argument_failures_never_connect_runtime() {
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
 
@@ -1033,19 +1076,23 @@ fn local_protocol_remote_and_legacy_argument_failures_never_connect_runtime() {
 
 #[test]
 fn debug_smoke_exposes_stable_installation_owner_queries_and_sync_summary() {
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
+    let (client_spawned_tx, client_spawned_rx) = mpsc::sync_channel(0);
     let server_thread = thread::spawn(move || {
         let mut installations = Vec::new();
 
-        let (mut reader, writer, installation_id) = accept_hello(&server.listener);
+        let (mut reader, writer, installation_id) =
+            accept_spawned_hello(&server.listener, &client_spawned_rx);
         installations.push(installation_id);
         drop(writer);
         let mut tail = Vec::new();
         reader.read_to_end(&mut tail).unwrap();
         assert!(tail.is_empty());
 
-        let (mut reader, mut writer, installation_id) = accept_hello(&server.listener);
+        let (mut reader, mut writer, installation_id) =
+            accept_spawned_hello(&server.listener, &client_spawned_rx);
         installations.push(installation_id);
         let send = read_envelope(&mut reader);
         let RuntimeMessage::Request(RuntimeRequest::SendPrompt(request)) = send.body else {
@@ -1064,7 +1111,8 @@ fn debug_smoke_exposes_stable_installation_owner_queries_and_sync_summary() {
             }),
         );
 
-        let (mut reader, mut writer, installation_id) = accept_hello(&server.listener);
+        let (mut reader, mut writer, installation_id) =
+            accept_spawned_hello(&server.listener, &client_spawned_rx);
         installations.push(installation_id);
         let foreign_query = read_envelope(&mut reader);
         assert!(matches!(
@@ -1086,7 +1134,8 @@ fn debug_smoke_exposes_stable_installation_owner_queries_and_sync_summary() {
             )),
         );
 
-        let (mut reader, mut writer, installation_id) = accept_hello(&server.listener);
+        let (mut reader, mut writer, installation_id) =
+            accept_spawned_hello(&server.listener, &client_spawned_rx);
         installations.push(installation_id);
         let own_query = read_envelope(&mut reader);
         assert!(matches!(
@@ -1113,7 +1162,8 @@ fn debug_smoke_exposes_stable_installation_owner_queries_and_sync_summary() {
 
         let (descriptions, capabilities, configuration) = codex_description();
         drop(descriptions);
-        let (mut reader, mut writer, installation_id) = accept_hello(&server.listener);
+        let (mut reader, mut writer, installation_id) =
+            accept_spawned_hello(&server.listener, &client_spawned_rx);
         installations.push(installation_id);
         let subscribe = read_envelope(&mut reader);
         assert!(matches!(
@@ -1203,73 +1253,68 @@ fn debug_smoke_exposes_stable_installation_owner_queries_and_sync_summary() {
         installations
     });
 
-    let installation = runtime_command(&temp_root)
-        .args(["runtime-smoke-for-test", "installation"])
-        .output()
-        .expect("read smoke installation");
+    let mut installation_command = runtime_command(&temp_root);
+    installation_command.args(["runtime-smoke-for-test", "installation"]);
+    let installation = spawned_runtime_output(installation_command, &client_spawned_tx);
     assert!(installation.status.success());
     let installation_json = stdout_json(&installation);
     assert_eq!(installation_json["operation"], "installation");
     assert_eq!(installation_json["ok"], true);
 
-    let send = runtime_command(&temp_root)
-        .args([
-            "runtime-smoke-for-test",
-            "send-prompt",
-            "--conversation-id",
-            "conversation-smoke",
-            "--idempotency-key",
-            "smoke-rust-key",
-            "--expected-configuration-revision",
-            "1",
-            "--prompt",
-            "smoke prompt",
-        ])
-        .output()
-        .expect("run smoke SendPrompt");
+    let mut send_command = runtime_command(&temp_root);
+    send_command.args([
+        "runtime-smoke-for-test",
+        "send-prompt",
+        "--conversation-id",
+        "conversation-smoke",
+        "--idempotency-key",
+        "smoke-rust-key",
+        "--expected-configuration-revision",
+        "1",
+        "--prompt",
+        "smoke prompt",
+    ]);
+    let send = spawned_runtime_output(send_command, &client_spawned_tx);
     assert!(send.status.success());
     assert_eq!(stdout_json(&send)["commandId"], "command-rust");
 
-    let foreign_query = runtime_command(&temp_root)
-        .args([
-            "runtime-smoke-for-test",
-            "query-receipt",
-            "--conversation-id",
-            "conversation-smoke",
-            "--command-id",
-            "command-swift",
-        ])
-        .output()
-        .expect("run cross-owner smoke QueryReceipt");
+    let mut foreign_query_command = runtime_command(&temp_root);
+    foreign_query_command.args([
+        "runtime-smoke-for-test",
+        "query-receipt",
+        "--conversation-id",
+        "conversation-smoke",
+        "--command-id",
+        "command-swift",
+    ]);
+    let foreign_query = spawned_runtime_output(foreign_query_command, &client_spawned_tx);
     assert_eq!(foreign_query.status.code(), Some(5));
     assert_eq!(
         stdout_json(&foreign_query)["error"]["code"],
         "daemon.runtime.invalid_state"
     );
 
-    let own_query = runtime_command(&temp_root)
-        .args([
-            "runtime-smoke-for-test",
-            "query-receipt",
-            "--conversation-id",
-            "conversation-smoke",
-            "--idempotency-key",
-            "smoke-rust-key",
-        ])
-        .output()
-        .expect("run owner-scoped smoke QueryReceipt");
+    let mut own_query_command = runtime_command(&temp_root);
+    own_query_command.args([
+        "runtime-smoke-for-test",
+        "query-receipt",
+        "--conversation-id",
+        "conversation-smoke",
+        "--idempotency-key",
+        "smoke-rust-key",
+    ]);
+    let own_query = spawned_runtime_output(own_query_command, &client_spawned_tx);
     assert!(own_query.status.success());
     assert_eq!(stdout_json(&own_query)["commandId"], "command-rust");
 
-    let subscribe = runtime_command(&temp_root)
-        .args([
-            "runtime-smoke-for-test",
-            "subscribe",
-            "--conversation-id",
-            "conversation-smoke",
-        ])
-        .output()
-        .expect("run smoke Subscribe");
+    let mut subscribe_command = runtime_command(&temp_root);
+    subscribe_command.args([
+        "runtime-smoke-for-test",
+        "subscribe",
+        "--conversation-id",
+        "conversation-smoke",
+    ]);
+    let subscribe = spawned_runtime_output(subscribe_command, &client_spawned_tx);
     assert!(
         subscribe.status.success(),
         "stderr: {}",
@@ -1296,12 +1341,15 @@ fn debug_smoke_exposes_stable_installation_owner_queries_and_sync_summary() {
 
 #[test]
 fn session_run_emits_only_canonical_runtime_v2_requests_and_ids() {
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
+    let (client_spawned_tx, client_spawned_rx) = mpsc::sync_channel(0);
     let server_thread = thread::spawn(move || {
         let (descriptions, capabilities, configuration) = codex_description();
         for attempt in 0..3 {
-            let (mut reader, mut writer, _) = accept_hello(&server.listener);
+            let (mut reader, mut writer, _) =
+                accept_spawned_hello(&server.listener, &client_spawned_rx);
 
             let describe = read_envelope(&mut reader);
             assert!(matches!(
@@ -1464,30 +1512,8 @@ fn session_run_emits_only_canonical_runtime_v2_requests_and_ids() {
 
     let mut outputs = Vec::new();
     for _ in 0..2 {
-        let output = runtime_command(&temp_root)
-            .args([
-                "session",
-                "run",
-                "--agent",
-                "codex",
-                "--cwd",
-                "/tmp/runtime-cli-cwd",
-                "--prompt",
-                "hello canonical runtime",
-                "--idempotency-key",
-                "stable-session-run",
-            ])
-            .output()
-            .expect("run canonical session");
-        assert!(
-            output.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        outputs.push(String::from_utf8(output.stdout).unwrap());
-    }
-    let conflict = runtime_command(&temp_root)
-        .args([
+        let mut command = runtime_command(&temp_root);
+        command.args([
             "session",
             "run",
             "--agent",
@@ -1495,12 +1521,32 @@ fn session_run_emits_only_canonical_runtime_v2_requests_and_ids() {
             "--cwd",
             "/tmp/runtime-cli-cwd",
             "--prompt",
-            "changed payload must conflict",
+            "hello canonical runtime",
             "--idempotency-key",
             "stable-session-run",
-        ])
-        .output()
-        .expect("run conflicting canonical session retry");
+        ]);
+        let output = spawned_runtime_output(command, &client_spawned_tx);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        outputs.push(String::from_utf8(output.stdout).unwrap());
+    }
+    let mut conflict_command = runtime_command(&temp_root);
+    conflict_command.args([
+        "session",
+        "run",
+        "--agent",
+        "codex",
+        "--cwd",
+        "/tmp/runtime-cli-cwd",
+        "--prompt",
+        "changed payload must conflict",
+        "--idempotency-key",
+        "stable-session-run",
+    ]);
+    let conflict = spawned_runtime_output(conflict_command, &client_spawned_tx);
     assert_eq!(conflict.status.code(), Some(5));
     assert!(
         String::from_utf8_lossy(&conflict.stdout).contains("daemon.command.idempotency_conflict"),
@@ -1523,6 +1569,7 @@ fn session_run_emits_only_canonical_runtime_v2_requests_and_ids() {
 
 #[test]
 fn synchronized_subscribe_has_an_absolute_reply_deadline() {
+    let _guard = runtime_process_test_guard();
     let server = TestRuntimeServer::bind();
     let temp_root = server.root.path().to_path_buf();
     let server_thread = thread::spawn(move || {

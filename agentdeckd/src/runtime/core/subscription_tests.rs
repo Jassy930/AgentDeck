@@ -2079,6 +2079,12 @@ async fn refreshed_catalog_snapshot_does_not_replay_its_covered_delta() {
         "snapshot-covered catalog delta must not be replayed before SyncComplete"
     );
     sync.acknowledge().expect("flush refresh sync");
+    assert!(
+        timeout(Duration::from_millis(100), receiver.recv())
+            .await
+            .is_err(),
+        "local subscription replayed a CatalogDelta already covered by its snapshot"
+    );
 
     core.disconnect(connection).await;
     core.shutdown().await.expect("shutdown core");

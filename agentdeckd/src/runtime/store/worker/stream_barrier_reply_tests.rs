@@ -7,6 +7,7 @@ use agentdeck_protocol::runtime::StreamCursor;
 use super::*;
 use crate::runtime::backfill::BarrierDecision;
 use crate::runtime::events::{RelayCommittedCut, StoreCleanup, WatchGeneration};
+use crate::runtime::store::publication;
 use crate::runtime::store::{ConversationDescriptor, NewConversation, RuntimeIdKind};
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
@@ -212,6 +213,130 @@ fn successful_backfill_pin_send_then_unpolled_receiver_drop_releases_exact_pin()
         )
         .expect("count direct backfill pin after cleanup");
     assert_eq!(remaining, 0);
+}
+
+#[test]
+fn publication_overlap_reply_receiver_drop_releases_exact_pin() {
+    // delayed-finalize 已在 worker 内完成 baseline + overlap pin，但 caller 的 biased
+    // cancellation 先赢，oneshot receiver 未 poll 就被丢弃；reply slot 必须拥有 cleanup。
+    let root = TestRoot::new();
+    let state = root.open_state();
+    let (cleanup_tx, mut cleanup_rx) = mpsc::unbounded_channel();
+    let mut hub = StoreCommitHub::with_cleanup_sender(cleanup_tx.clone());
+    let pin_id = [0x91; 16];
+    let first = crate::runtime::store::sequence::encode_sequence(0);
+    state
+        .connection
+        .execute(
+            "INSERT INTO temp.active_stream_pins (
+                 pin_id, scope, target_id, first_seq, through_seq,
+                 next_after_seq, expires_at_ms, state
+             ) VALUES (?1, 'catalog', NULL, ?2, ?2, NULL, 300000, 'active')",
+            rusqlite::params![&pin_id[..], &first],
+        )
+        .expect("insert delayed-finalize overlap pin");
+    let pin = RuntimeBackfillPin {
+        pin_id,
+        target: RuntimeBackfillTarget::Catalog,
+        after: None,
+        through: 0,
+        expires_at_ms: 300_000,
+    };
+    let (reply, caller) = oneshot::channel();
+
+    stream_pipeline::send_subscription_publication_reply(
+        reply,
+        Ok(FinalizeSubscriptionPublicationOutcome {
+            cut: RelayCommittedCut::default(),
+            overlap_pin: Some(pin),
+        }),
+        &cleanup_tx,
+    );
+    assert!(
+        cleanup_rx.try_recv().is_err(),
+        "receiver slot still owns publication overlap"
+    );
+    drop(caller);
+
+    let cleanup = cleanup_rx
+        .try_recv()
+        .expect("receiver drop enqueues exact publication overlap cleanup");
+    assert!(matches!(cleanup, StoreCleanup::BackfillPin(id) if id == pin_id));
+    apply_store_cleanup(&state, &mut hub, cleanup);
+    let remaining: i64 = state
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM temp.active_stream_pins WHERE pin_id = ?1",
+            [&pin_id[..]],
+            |row| row.get(0),
+        )
+        .expect("count publication overlap after receiver-drop cleanup");
+    assert_eq!(remaining, 0, "receiver drop cannot leave a retention pin");
+}
+
+#[test]
+fn publication_overlap_ensure_current_race_releases_exact_pin() {
+    // operation branch 已从 oneshot 取出成功 outcome 后，unsubscribe 可以在 pump 的
+    // 第二次 ensure_current 检查前生效。该检查返回 Cancelled 时 outcome 仍须是 guard，
+    // 不能已经退化为只有 TTL 的裸 RuntimeBackfillPin。
+    let root = TestRoot::new();
+    let state = root.open_state();
+    let (cleanup_tx, mut cleanup_rx) = mpsc::unbounded_channel();
+    let mut hub = StoreCommitHub::with_cleanup_sender(cleanup_tx.clone());
+    let pin_id = [0x92; 16];
+    let first = crate::runtime::store::sequence::encode_sequence(0);
+    state
+        .connection
+        .execute(
+            "INSERT INTO temp.active_stream_pins (
+                 pin_id, scope, target_id, first_seq, through_seq,
+                 next_after_seq, expires_at_ms, state
+             ) VALUES (?1, 'catalog', NULL, ?2, ?2, NULL, 300000, 'active')",
+            rusqlite::params![&pin_id[..], &first],
+        )
+        .expect("insert ensure-current race overlap pin");
+    let pin = RuntimeBackfillPin {
+        pin_id,
+        target: RuntimeBackfillTarget::Catalog,
+        after: None,
+        through: 0,
+        expires_at_ms: 300_000,
+    };
+    let (reply, mut caller) = oneshot::channel();
+
+    stream_pipeline::send_subscription_publication_reply(
+        reply,
+        Ok(FinalizeSubscriptionPublicationOutcome {
+            cut: RelayCommittedCut::default(),
+            overlap_pin: Some(pin),
+        }),
+        &cleanup_tx,
+    );
+    let managed = caller
+        .try_recv()
+        .expect("pump receives delayed-finalize reply")
+        .expect("delayed-finalize succeeds");
+    assert!(
+        cleanup_rx.try_recv().is_err(),
+        "received outcome keeps overlap guarded until attach"
+    );
+
+    // 等价于紧随其后的 ensure_current(job)? 观察到 cancellation 并提前返回。
+    drop(managed);
+    let cleanup = cleanup_rx
+        .try_recv()
+        .expect("ensure-current race enqueues exact overlap cleanup");
+    assert!(matches!(cleanup, StoreCleanup::BackfillPin(id) if id == pin_id));
+    apply_store_cleanup(&state, &mut hub, cleanup);
+    let remaining: i64 = state
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM temp.active_stream_pins WHERE pin_id = ?1",
+            [&pin_id[..]],
+            |row| row.get(0),
+        )
+        .expect("count publication overlap after ensure-current cleanup");
+    assert_eq!(remaining, 0, "cancellation cannot leave a retention pin");
 }
 
 #[test]
@@ -440,6 +565,82 @@ fn sync_complete_does_not_consume_snapshot_pin_quota() {
     assert!(registration.take_snapshot_source().is_none());
     assert!(hub.release(&registration.watch.token()));
     drop(state);
+}
+
+#[test]
+fn local_barrier_ignores_purge_retained_publication_lineage() {
+    // 威胁场景：machine purge 会为稳定 identity 保留 NeedsSnapshot publication row，
+    // 后续也可能只剩 Retired 历史。若 barrier 只看 publication directory，这两个
+    // local-only 状态会永久挡住本地 UDS subscription。
+    let root = TestRoot::new();
+    let (config, mut state) = root.open_config_state();
+    let stream = publication::ensure_subscription_publication_stream(
+        &mut state,
+        &config,
+        publication::PublicationScope::Catalog,
+        10,
+    )
+    .expect("create local catalog publication lineage");
+
+    let key_bundle = state.key_bundle.clone();
+    let database_id = state.database_id;
+    {
+        let transaction = state
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("begin local purge transaction");
+        let mut ledger = sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)
+            .expect("load local purge ledger");
+        publication::reset_for_machine_purge(&transaction, &key_bundle, database_id, &mut ledger)
+            .expect("retain authenticated NeedsSnapshot lineage");
+        publication::load_stream(&transaction, &key_bundle, stream.publication_stream_id)
+            .expect("purge lineage authenticates before commit");
+        transaction.commit().expect("commit local purge lineage");
+    }
+
+    let target = RuntimeStreamTarget::Catalog;
+    let mut hub = StoreCommitHub::default();
+    for (index, expected_state) in [
+        publication::PublicationStreamState::NeedsSnapshot,
+        publication::PublicationStreamState::Retired,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let current =
+            publication::load_stream(&state.connection, &key_bundle, stream.publication_stream_id)
+                .expect("load retained local publication lineage");
+        assert_eq!(current.state, expected_state);
+        let registration = register_stream_barrier_on_worker(
+            &state,
+            &config,
+            &mut hub,
+            RegisterStreamBarrier {
+                target,
+                generation: WatchGeneration::new(6 + index as u64).expect("generation"),
+                request: crate::runtime::backfill::BarrierRequest::Backfill {
+                    after: StreamCursor::BeforeFirst,
+                },
+            },
+        )
+        .expect("local-only barrier ignores historical publication state");
+        assert_eq!(registration.relay_committed, RelayCommittedCut::default());
+        assert!(hub.release(&registration.watch.token()));
+
+        if expected_state == publication::PublicationStreamState::NeedsSnapshot {
+            let transaction = state
+                .connection
+                .unchecked_transaction()
+                .expect("begin retired lineage transaction");
+            let mut retired = current;
+            retired.state = publication::PublicationStreamState::Retired;
+            retired.last_rotation_request_digest = Some([0x91; 32]);
+            retired.updated_at_ms = retired.updated_at_ms.saturating_add(1);
+            publication::update_stream(&transaction, &key_bundle, &retired)
+                .expect("persist authenticated Retired lineage");
+            transaction.commit().expect("commit Retired lineage");
+        }
+    }
 }
 
 #[test]

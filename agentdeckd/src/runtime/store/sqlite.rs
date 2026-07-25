@@ -32,18 +32,19 @@ use super::schema::{
     EXPECTED_TABLES, EXPECTED_TABLES_V1, EXPECTED_TABLES_V2, EXPECTED_TABLES_V3,
     EXPECTED_TABLES_V4, EXPECTED_TABLES_V5, EXPECTED_TABLES_V6, EXPECTED_TABLES_V7,
     EXPECTED_TABLES_V8, EXPECTED_TABLES_V9, EXPECTED_TABLES_V10, EXPECTED_TABLES_V11,
-    EXPECTED_TABLES_V12, EXPECTED_TABLES_V13, RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_DDL_V1,
-    RUNTIME_KEY_GENERATION, RUNTIME_MIGRATION_V2, RUNTIME_MIGRATION_V3, RUNTIME_MIGRATION_V4,
-    RUNTIME_MIGRATION_V5, RUNTIME_MIGRATION_V6, RUNTIME_MIGRATION_V7, RUNTIME_MIGRATION_V8,
-    RUNTIME_MIGRATION_V9, RUNTIME_MIGRATION_V10, RUNTIME_MIGRATION_V11, RUNTIME_MIGRATION_V12,
-    RUNTIME_MIGRATION_V13, RUNTIME_MIGRATION_V14, RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION,
-    RUNTIME_SCHEMA_VERSION_V5, RUNTIME_SCHEMA_VERSION_V6, RUNTIME_SCHEMA_VERSION_V7,
-    RUNTIME_SCHEMA_VERSION_V8, RUNTIME_SCHEMA_VERSION_V9, RUNTIME_SCHEMA_VERSION_V10,
-    RUNTIME_SCHEMA_VERSION_V11, RUNTIME_SCHEMA_VERSION_V12, RUNTIME_SCHEMA_VERSION_V13,
+    EXPECTED_TABLES_V12, EXPECTED_TABLES_V13, EXPECTED_TABLES_V14, RUNTIME_CRYPTO_CONTEXT_VERSION,
+    RUNTIME_DDL_V1, RUNTIME_KEY_GENERATION, RUNTIME_MIGRATION_V2, RUNTIME_MIGRATION_V3,
+    RUNTIME_MIGRATION_V4, RUNTIME_MIGRATION_V5, RUNTIME_MIGRATION_V6, RUNTIME_MIGRATION_V7,
+    RUNTIME_MIGRATION_V8, RUNTIME_MIGRATION_V9, RUNTIME_MIGRATION_V10, RUNTIME_MIGRATION_V11,
+    RUNTIME_MIGRATION_V12, RUNTIME_MIGRATION_V13, RUNTIME_MIGRATION_V14, RUNTIME_MIGRATION_V15,
+    RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V5,
+    RUNTIME_SCHEMA_VERSION_V6, RUNTIME_SCHEMA_VERSION_V7, RUNTIME_SCHEMA_VERSION_V8,
+    RUNTIME_SCHEMA_VERSION_V9, RUNTIME_SCHEMA_VERSION_V10, RUNTIME_SCHEMA_VERSION_V11,
+    RUNTIME_SCHEMA_VERSION_V12, RUNTIME_SCHEMA_VERSION_V13, RUNTIME_SCHEMA_VERSION_V14,
     schema_signature, schema_signature_v1, schema_signature_v2, schema_signature_v3,
     schema_signature_v4, schema_signature_v5, schema_signature_v6, schema_signature_v7,
     schema_signature_v8, schema_signature_v9, schema_signature_v10, schema_signature_v11,
-    schema_signature_v12, schema_signature_v13,
+    schema_signature_v12, schema_signature_v13, schema_signature_v14,
 };
 
 const DATABASE_MODE: u32 = 0o600;
@@ -144,7 +145,8 @@ mod migration_tests {
     use crate::runtime::store::cipher::RowAad;
     use crate::runtime::store::identity::{RuntimeId, RuntimeIdKind};
     use crate::runtime::store::schema::{
-        EXPECTED_TABLES_V14, RUNTIME_SCHEMA_VERSION_V13, RUNTIME_SCHEMA_VERSION_V14,
+        EXPECTED_TABLES_V15, RUNTIME_SCHEMA_VERSION_V13, RUNTIME_SCHEMA_VERSION_V14,
+        RUNTIME_SCHEMA_VERSION_V15,
     };
     use crate::runtime::store::sequence::{SequenceScope, decode_sequence, encode_sequence};
     use crate::runtime::store::worker::RuntimeStoreHandle;
@@ -564,6 +566,16 @@ mod migration_tests {
         Vec<Vec<rusqlite::types::Value>>,
         Vec<(String, Vec<Vec<u8>>)>,
     );
+    type PopulatedStrictV14Fixture = (
+        CipherEvidence,
+        Vec<(String, Vec<Vec<u8>>)>,
+        PublicationByteEvidence,
+    );
+    type ProjectedStrictV14Fixture = (
+        CipherEvidence,
+        Vec<(String, Vec<Vec<u8>>)>,
+        Option<PublicationByteEvidence>,
+    );
 
     fn publication_byte_evidence(connection: &Connection) -> PublicationByteEvidence {
         let stream_blobs = connection
@@ -783,28 +795,28 @@ mod migration_tests {
             .expect("recreate exact v13 key-update recovery index");
     }
 
-    /// 测试专用逆向投影：current v13 与历史 v12 只在 publication-stream CHECK 形态不同。
-    /// 必须复用冻结的 v4-v12 原始 DDL，让 `schema_manifest` 成为严格 legacy-v12 oracle，
-    /// 而不是手写的近似结构。
-    fn rebuild_v13_publication_shape_as_v12(connection: &Connection) {
+    /// 测试专用 publication 双表逆向投影。必须复用目标版本冻结 DDL，让
+    /// `schema_manifest` 成为严格 legacy oracle，而不是手写近似结构。
+    fn rebuild_publication_shape(connection: &Connection, source_suffix: u32, target_ddl: &str) {
         connection
-            .execute_batch(
-                "ALTER TABLE publication_outbox RENAME TO publication_outbox_v13;
-                 ALTER TABLE publication_streams RENAME TO publication_streams_v13;
+            .execute_batch(&format!(
+                "ALTER TABLE publication_outbox RENAME TO publication_outbox_v{source_suffix};
+                 ALTER TABLE publication_streams RENAME TO publication_streams_v{source_suffix};
                  DROP INDEX idx_publication_pending;
                  DROP INDEX idx_publication_active_catalog;
-                 DROP INDEX idx_publication_active_conversation;",
-            )
-            .expect("rename current publication tables for strict v12 projection");
+                 DROP INDEX idx_publication_active_conversation;"
+            ))
+            .expect("rename current publication tables for strict legacy projection");
         connection
             .execute_batch(ddl_statement(
-                RUNTIME_MIGRATION_V4,
+                target_ddl,
                 "CREATE TABLE publication_streams (",
             ))
-            .expect("recreate exact v12 publication stream table");
+            .expect("recreate exact legacy publication stream table");
         connection
             .execute(
-                "INSERT INTO publication_streams (
+                &format!(
+                    "INSERT INTO publication_streams (
                      publication_stream_id, scope, conversation_id, stream_route, generation,
                      counter_scope_token, sender_counter_high_water, reserved_high_water,
                      committed_high_water, committed_inner_cursor, acknowledged_high_water,
@@ -820,27 +832,29 @@ mod migration_tests {
                         last_acknowledged_publication_id, last_acknowledged_request_digest,
                         last_rotation_request_digest, rotation_serial, last_committed_blob_hash,
                         state, created_at_ms, updated_at_ms, metadata_token
-                 FROM publication_streams_v13",
+                 FROM publication_streams_v{source_suffix}"
+                ),
                 [],
             )
-            .expect("copy exact publication stream bytes into strict v12 shape");
+            .expect("copy exact publication stream bytes into strict legacy shape");
         for prefix in [
             "CREATE UNIQUE INDEX idx_publication_active_catalog",
             "CREATE UNIQUE INDEX idx_publication_active_conversation",
         ] {
             connection
-                .execute_batch(ddl_statement(RUNTIME_MIGRATION_V4, prefix))
-                .expect("recreate exact v12 publication stream index");
+                .execute_batch(ddl_statement(target_ddl, prefix))
+                .expect("recreate exact legacy publication stream index");
         }
         connection
             .execute_batch(ddl_statement(
-                RUNTIME_MIGRATION_V4,
+                target_ddl,
                 "CREATE TABLE publication_outbox (",
             ))
-            .expect("recreate exact v12 publication outbox table");
+            .expect("recreate exact legacy publication outbox table");
         connection
             .execute(
-                "INSERT INTO publication_outbox (
+                &format!(
+                    "INSERT INTO publication_outbox (
                      publication_id, publication_stream_id, generation, stream_seq,
                      counter_scope_token, sender_counter, inner_after_seq, inner_through_seq,
                      payload_kind, blob_sha256, logical_blob_bytes, created_at_ms,
@@ -850,22 +864,31 @@ mod migration_tests {
                         counter_scope_token, sender_counter, inner_after_seq, inner_through_seq,
                         payload_kind, blob_sha256, logical_blob_bytes, created_at_ms,
                         metadata_token, sealed_publication
-                 FROM publication_outbox_v13",
+                 FROM publication_outbox_v{source_suffix}"
+                ),
                 [],
             )
-            .expect("copy exact publication outbox bytes into strict v12 shape");
+            .expect("copy exact publication outbox bytes into strict legacy shape");
         connection
             .execute_batch(ddl_statement(
-                RUNTIME_MIGRATION_V4,
+                target_ddl,
                 "CREATE INDEX idx_publication_pending",
             ))
-            .expect("recreate exact v12 publication outbox index");
+            .expect("recreate exact legacy publication outbox index");
         connection
-            .execute_batch(
-                "DROP TABLE publication_outbox_v13;
-                 DROP TABLE publication_streams_v13;",
-            )
+            .execute_batch(&format!(
+                "DROP TABLE publication_outbox_v{source_suffix};
+                 DROP TABLE publication_streams_v{source_suffix};"
+            ))
             .expect("drop current publication projection tables");
+    }
+
+    fn rebuild_v13_publication_shape_as_v12(connection: &Connection) {
+        rebuild_publication_shape(connection, 13, RUNTIME_MIGRATION_V4);
+    }
+
+    fn rebuild_v15_publication_shape_as_v14(connection: &Connection) {
+        rebuild_publication_shape(connection, 15, RUNTIME_MIGRATION_V13);
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -2453,6 +2476,279 @@ mod migration_tests {
         (before, authenticated_before)
     }
 
+    fn build_populated_strict_v14_fixture(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+    ) -> PopulatedStrictV14Fixture {
+        let config =
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk);
+        let mut state = open(
+            &config,
+            load_or_create_storage_kek(keys, &root.database())
+                .expect("create populated strict v14 KEK"),
+        )
+        .expect("create current source for populated strict v14 projection");
+        let publication_stream_id = [0xB1; 16];
+        let generation = [0xB2; 16];
+        super::super::publication::create_publication_stream(
+            &mut state,
+            &config,
+            publication_stream_id,
+            super::super::publication::PublicationScope::Catalog,
+            [0xB3; 16],
+            generation,
+            1,
+        )
+        .expect("create populated strict v14 publication stream");
+        super::super::publication::freeze_publication(
+            &mut state,
+            &config,
+            super::super::publication::FreezePublicationRequest {
+                publication_id: [0xB4; 16],
+                publication_stream_id,
+                generation,
+                counter_scope_token: [0xB5; 32],
+                sender_counter: 1,
+                inner_after: None,
+                inner_through: Some(0),
+                payload_kind: super::super::publication::PublicationPayloadKind::Catalog,
+                blob: vec![0xB6; 96],
+            },
+            2,
+        )
+        .expect("freeze populated strict v14 publication outbox row");
+        drop(state);
+
+        let (cipher, authenticated, publication) =
+            project_current_fixture_to_strict_v14(root, keys);
+        (
+            cipher,
+            authenticated,
+            publication.expect("populated strict v14 fixture retains an outbox row"),
+        )
+    }
+
+    fn project_current_fixture_to_strict_v14(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+    ) -> ProjectedStrictV14Fixture {
+        let mut connection = Connection::open(root.database())
+            .expect("open current source for strict v14 projection");
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable foreign keys for exact v14 inverse projection");
+        let meta = read_meta(&connection)
+            .expect("read current meta for strict v14 projection")
+            .expect("current meta exists for strict v14 projection");
+        let storage_kek = load_or_create_storage_kek(keys, &root.database())
+            .expect("reload populated strict v14 KEK");
+        let key_bundle = RuntimeKeyBundle::unwrap(
+            &storage_kek,
+            &KeyWrapAad {
+                schema_family: RUNTIME_SCHEMA_FAMILY.as_bytes(),
+                schema_version: RUNTIME_CRYPTO_CONTEXT_VERSION,
+                database_id: &meta.database_id,
+            },
+            &meta.wrapped_key_bundle,
+        )
+        .expect("unwrap populated strict v14 key bundle");
+        let legacy_token = runtime_ledger_token_v14(&key_bundle, meta.database_id, &meta.ledger)
+            .expect("authenticate populated strict v14 ledger");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin exact populated v14 projection");
+        rebuild_v15_publication_shape_as_v14(&transaction);
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE runtime_meta
+                     SET schema_version = ?1, schema_signature = ?2, metadata_token = ?3
+                     WHERE singleton = 1 AND schema_version = ?4
+                       AND schema_signature = ?5 AND metadata_token = ?6",
+                    params![
+                        i64::from(RUNTIME_SCHEMA_VERSION_V14),
+                        &schema_signature_v14()[..],
+                        &legacy_token[..],
+                        i64::from(RUNTIME_SCHEMA_VERSION),
+                        &schema_signature()[..],
+                        &meta.metadata_token,
+                    ],
+                )
+                .expect("publish authenticated populated strict v14 meta"),
+            1
+        );
+        transaction
+            .commit()
+            .expect("commit exact populated strict v14 projection");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint populated strict v14 fixture");
+        let legacy = read_and_validate_legacy_v14_schema(&connection)
+            .expect("validate populated strict v14 schema and meta");
+        verify_runtime_ledger_token_v14(&key_bundle, &legacy)
+            .expect("verify populated strict v14 ledger token");
+        super::super::journal::validate_store_integrity(
+            &connection,
+            &key_bundle,
+            legacy.database_id,
+        )
+        .expect("validate populated strict v14 authenticated rows");
+        let publication_before = (legacy.ledger.publication_outbox_count > 0)
+            .then(|| publication_byte_evidence(&connection));
+        let authenticated_before = authenticated_blob_evidence(&connection);
+        drop(connection);
+        (
+            cipher_evidence(&root.database()),
+            authenticated_before,
+            publication_before,
+        )
+    }
+
+    struct StrictV14RotationBaselineFixture {
+        publication_stream_id: [u8; 16],
+        generation: [u8; 16],
+        counter_scope_token: [u8; 32],
+        catalog_high_water: u64,
+    }
+
+    async fn build_strict_v14_rotation_baseline_fixture(
+        root: &TestRoot,
+        keys: &MemoryKeyStore,
+    ) -> StrictV14RotationBaselineFixture {
+        let config =
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk);
+        let store = RuntimeStoreHandle::open(
+            config.clone(),
+            load_or_create_storage_kek(keys, &root.database())
+                .expect("create rotation-baseline strict v14 KEK"),
+        )
+        .await
+        .expect("open current store for strict v14 rotation baseline");
+        let conversation = store
+            .create_conversation(conversation(
+                0xC1,
+                b"strict v14 production rotation baseline",
+            ))
+            .await
+            .expect("create catalog revision H for strict v14 rotation baseline");
+        let publication_stream_id = [0xC2; 16];
+        let initial_generation = [0xC3; 16];
+        let counter_scope_token = [0xC4; 32];
+        store
+            .create_publication_stream(
+                publication_stream_id,
+                super::super::publication::PublicationScope::Catalog,
+                [0xC5; 16],
+                initial_generation,
+            )
+            .await
+            .expect("create production catalog publication stream");
+        let frozen = store
+            .freeze_publication(super::super::publication::FreezePublicationRequest {
+                publication_id: [0xC6; 16],
+                publication_stream_id,
+                generation: initial_generation,
+                counter_scope_token,
+                sender_counter: 1,
+                inner_after: None,
+                inner_through: Some(conversation.catalog_revision),
+                payload_kind: super::super::publication::PublicationPayloadKind::Catalog,
+                blob: b"strict-v14-catalog-through-h".to_vec(),
+            })
+            .await
+            .expect("freeze production catalog publication through H");
+        store
+            .acknowledge_publication_commit(
+                publication_stream_id,
+                initial_generation,
+                frozen.stream_seq,
+                frozen.blob_sha256,
+            )
+            .await
+            .expect("commit production catalog publication through H");
+        store
+            .acknowledge_publication_delivery(
+                publication_stream_id,
+                initial_generation,
+                frozen.stream_seq,
+                frozen.blob_sha256,
+            )
+            .await
+            .expect("ack production catalog publication through H");
+        store
+            .shutdown()
+            .await
+            .expect("shutdown production rotation-baseline worker");
+
+        let mut state = open(
+            &config,
+            load_or_create_storage_kek(keys, &root.database())
+                .expect("reload rotation-baseline KEK for production rollover"),
+        )
+        .expect("open raw current store for production rollover");
+        super::super::snapshot::refresh_catalog_snapshot(
+            &mut state,
+            &config,
+            None,
+            agentdeck_protocol::runtime::StreamCursor::At(conversation.catalog_revision),
+        )
+        .expect("materialize ready catalog snapshot covering H");
+        let rotation_now_ms = {
+            let key_bundle = &state.key_bundle;
+            let transaction = state
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin authenticated NeedsSnapshot transition");
+            let mut stream = super::super::publication::load_stream(
+                &transaction,
+                key_bundle,
+                publication_stream_id,
+            )
+            .expect("authenticate pre-rotation catalog stream");
+            stream.state = super::super::publication::PublicationStreamState::NeedsSnapshot;
+            let rotation_now_ms = stream.updated_at_ms;
+            super::super::publication::update_stream(&transaction, key_bundle, &stream)
+                .expect("persist authenticated NeedsSnapshot transition");
+            transaction
+                .commit()
+                .expect("commit authenticated NeedsSnapshot transition");
+            rotation_now_ms
+        };
+        let rotated = super::super::publication::rotate_publication_stream(
+            &mut state,
+            &config,
+            super::super::publication::RotatePublicationStreamRequest {
+                publication_stream_id,
+                expected_generation: initial_generation,
+            },
+            rotation_now_ms,
+        )
+        .expect("perform production catalog generation rollover");
+        assert_ne!(rotated.generation, initial_generation);
+        assert_eq!(rotated.rotation_serial, 1);
+        assert_eq!(rotated.reserved_high_water, None);
+        assert_eq!(rotated.committed_high_water, None);
+        assert_eq!(rotated.acknowledged_high_water, None);
+        assert_eq!(
+            rotated.committed_inner_cursor,
+            Some(conversation.catalog_revision)
+        );
+        assert_eq!(
+            rotated.acknowledged_inner_cursor,
+            Some(conversation.catalog_revision)
+        );
+        assert!(rotated.last_rotation_request_digest.is_some());
+        drop(state);
+
+        project_current_fixture_to_strict_v14(root, keys);
+        StrictV14RotationBaselineFixture {
+            publication_stream_id,
+            generation: rotated.generation,
+            counter_scope_token,
+            catalog_high_water: conversation.catalog_revision,
+        }
+    }
+
     fn build_populated_strict_v13_key_update_fixture(
         root: &TestRoot,
         keys: &MemoryKeyStore,
@@ -2536,6 +2832,7 @@ mod migration_tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("begin exact populated v13 projection");
         rebuild_v14_key_update_shape_as_v13(&transaction);
+        rebuild_v15_publication_shape_as_v14(&transaction);
         assert_eq!(
             transaction
                 .execute(
@@ -3312,7 +3609,7 @@ mod migration_tests {
     }
 
     #[test]
-    fn v12_v13_v14_ledger_tokens_rotate_domain_without_changing_projection() {
+    fn v12_through_v15_ledger_tokens_rotate_domain_without_changing_projection() {
         let key_bundle = RuntimeKeyBundle::fresh(RUNTIME_KEY_GENERATION).expect("fresh test keys");
         let database_id = [0x4c; 16];
         let ledger = RuntimeLedger::default();
@@ -3320,12 +3617,17 @@ mod migration_tests {
             .expect("authenticate v12 ledger");
         let token_v13 = runtime_ledger_token_v13(&key_bundle, database_id, &ledger)
             .expect("authenticate v13 ledger");
-        let token_v14 = runtime_ledger_token(&key_bundle, database_id, &ledger)
+        let token_v14 = runtime_ledger_token_v14(&key_bundle, database_id, &ledger)
             .expect("authenticate v14 ledger");
+        let token_v15 = runtime_ledger_token(&key_bundle, database_id, &ledger)
+            .expect("authenticate v15 ledger");
 
         assert_ne!(token_v12, token_v13);
         assert_ne!(token_v12, token_v14);
         assert_ne!(token_v13, token_v14);
+        assert_ne!(token_v12, token_v15);
+        assert_ne!(token_v13, token_v15);
+        assert_ne!(token_v14, token_v15);
     }
 
     #[tokio::test]
@@ -3686,8 +3988,548 @@ mod migration_tests {
     }
 
     #[tokio::test]
-    async fn populated_strict_v13_migrates_to_v14_without_changing_key_update_bytes() {
-        let root = TestRoot::new("populated-strict-v13-to-v14");
+    async fn populated_strict_v14_migrates_to_v15_without_changing_publication_bytes() {
+        let root = TestRoot::new("populated-strict-v14-to-v15");
+        let keys = MemoryKeyStore::new();
+        let (cipher_before, authenticated_before, publication_before) =
+            build_populated_strict_v14_fixture(&root, &keys);
+
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload populated strict v14 KEK"),
+        )
+        .await
+        .expect("migrate populated strict v14 fixture to v15");
+        let snapshot = store.inspect().await.expect("inspect migrated v15 store");
+        assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION_V15);
+        assert_eq!(snapshot.table_names, EXPECTED_TABLES_V15);
+        store.shutdown().await.expect("shutdown migrated v15 store");
+
+        assert_eq!(
+            cipher_evidence(&root.database()),
+            cipher_before,
+            "v14 to v15 must preserve wrapped key and row ciphertext byte-exact"
+        );
+        let connection =
+            Connection::open(root.database()).expect("inspect populated v14-to-v15 database");
+        assert_eq!(
+            authenticated_blob_evidence(&connection),
+            authenticated_before,
+            "v14 to v15 must preserve every non-meta token and sealed blob byte-exact"
+        );
+        assert_eq!(
+            publication_byte_evidence(&connection),
+            publication_before,
+            "v14 to v15 must preserve publication IDs, hashes, tokens and sealed blob"
+        );
+        assert_eq!(
+            schema_manifest(&connection).expect("read migrated v15 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V15).expect("build exact v15 manifest")
+        );
+        let temporary_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name IN ('publication_streams_v14', 'publication_outbox_v14')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count v15 migration temporary tables");
+        assert_eq!(temporary_table_count, 0);
+        let foreign_key_violation_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("count migrated v15 foreign-key violations");
+        assert_eq!(foreign_key_violation_count, 0);
+        drop(connection);
+
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_fault_injector(Arc::new(
+                FailMigrationBeforeCommit {
+                    failed: AtomicBool::new(false),
+                },
+            )),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload migrated v15 KEK"),
+        )
+        .await
+        .expect("reopen current v15 without attempting a second migration");
+        reopened.shutdown().await.expect("shutdown reopened v15");
+        let reopened_connection =
+            Connection::open(root.database()).expect("inspect reopened current v15");
+        assert_eq!(
+            publication_byte_evidence(&reopened_connection),
+            publication_before
+        );
+    }
+
+    #[tokio::test]
+    async fn v15_migrated_rotation_baseline_survives_commit_restart_delivery_ack() {
+        let root = TestRoot::new("strict-v14-v15-production-rotation-baseline");
+        let keys = MemoryKeyStore::new();
+        let fixture = build_strict_v14_rotation_baseline_fixture(&root, &keys).await;
+
+        let migrated = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload production rotation-baseline strict v14 KEK"),
+        )
+        .await
+        .expect("migrate production rotation baseline from strict v14 to v15");
+        assert_eq!(
+            migrated
+                .inspect()
+                .await
+                .expect("inspect migrated production rotation baseline")
+                .schema_version,
+            RUNTIME_SCHEMA_VERSION_V15
+        );
+        let baseline = migrated
+            .load_publication_stream_record(fixture.publication_stream_id)
+            .await
+            .expect("authenticate migrated BeforeFirst/H baseline");
+        assert_eq!(baseline.generation, fixture.generation);
+        assert_eq!(baseline.reserved_high_water, None);
+        assert_eq!(baseline.committed_high_water, None);
+        assert_eq!(baseline.acknowledged_high_water, None);
+        assert_eq!(
+            baseline.committed_inner_cursor,
+            Some(fixture.catalog_high_water)
+        );
+        assert_eq!(
+            baseline.acknowledged_inner_cursor,
+            Some(fixture.catalog_high_water)
+        );
+        assert!(baseline.last_rotation_request_digest.is_some());
+        assert!(
+            migrated
+                .load_pending_publications(fixture.publication_stream_id)
+                .await
+                .expect("load empty migrated rotation baseline outbox")
+                .is_empty()
+        );
+        assert_eq!(
+            migrated
+                .load_publication_barrier(fixture.publication_stream_id)
+                .await
+                .expect("load migrated BeforeFirst/H barrier"),
+            super::super::publication::PublicationBarrierCut {
+                publication_stream_id: fixture.publication_stream_id,
+                generation: fixture.generation,
+                committed_outer_cursor: None,
+                committed_inner_cursor: Some(fixture.catalog_high_water),
+            }
+        );
+
+        let frozen = migrated
+            .freeze_publication(super::super::publication::FreezePublicationRequest {
+                publication_id: [0xC7; 16],
+                publication_stream_id: fixture.publication_stream_id,
+                generation: fixture.generation,
+                counter_scope_token: fixture.counter_scope_token,
+                sender_counter: 2,
+                inner_after: Some(fixture.catalog_high_water),
+                inner_through: Some(
+                    fixture
+                        .catalog_high_water
+                        .checked_add(1)
+                        .expect("catalog H + 1 remains bounded"),
+                ),
+                payload_kind: super::super::publication::PublicationPayloadKind::Catalog,
+                blob: b"strict-v14-migrated-catalog-h-plus-one".to_vec(),
+            })
+            .await
+            .expect("freeze H to H+1 after v15 migration");
+        assert_eq!(frozen.stream_seq, 0);
+        assert_eq!(frozen.inner_after, Some(fixture.catalog_high_water));
+        assert_eq!(frozen.inner_through, Some(fixture.catalog_high_water + 1));
+        assert_eq!(
+            migrated
+                .load_pending_publications(fixture.publication_stream_id)
+                .await
+                .expect("load migrated frozen H to H+1 publication")
+                .len(),
+            1
+        );
+        let committed = migrated
+            .acknowledge_publication_commit(
+                fixture.publication_stream_id,
+                fixture.generation,
+                frozen.stream_seq,
+                frozen.blob_sha256,
+            )
+            .await
+            .expect("persist Relay COMMIT for migrated H to H+1 publication");
+        assert_eq!(committed.committed_outer_cursor, Some(0));
+        assert_eq!(
+            committed.committed_inner_cursor,
+            Some(fixture.catalog_high_water + 1)
+        );
+        migrated
+            .shutdown()
+            .await
+            .expect("shutdown after migrated Relay COMMIT");
+
+        let delivery_repair = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload migrated COMMIT-before-ACK KEK"),
+        )
+        .await
+        .expect("reopen migrated COMMIT-before-ACK baseline");
+        let lagging = delivery_repair
+            .load_publication_stream_record(fixture.publication_stream_id)
+            .await
+            .expect("authenticate migrated COMMIT-before-ACK lag");
+        assert_eq!(lagging.committed_high_water, Some(0));
+        assert_eq!(
+            lagging.committed_inner_cursor,
+            Some(fixture.catalog_high_water + 1)
+        );
+        assert_eq!(lagging.acknowledged_high_water, None);
+        assert_eq!(
+            lagging.acknowledged_inner_cursor,
+            Some(fixture.catalog_high_water)
+        );
+        assert_eq!(
+            delivery_repair
+                .load_pending_publications(fixture.publication_stream_id)
+                .await
+                .expect("reload committed publication pending local ACK")
+                .len(),
+            1
+        );
+        let acknowledged = delivery_repair
+            .acknowledge_publication_delivery(
+                fixture.publication_stream_id,
+                fixture.generation,
+                frozen.stream_seq,
+                frozen.blob_sha256,
+            )
+            .await
+            .expect("persist local delivery ACK after restart");
+        assert_eq!(acknowledged.acknowledged_outer_cursor, Some(0));
+        assert_eq!(
+            acknowledged.acknowledged_inner_cursor,
+            Some(fixture.catalog_high_water + 1)
+        );
+        delivery_repair
+            .shutdown()
+            .await
+            .expect("shutdown after repaired local delivery ACK");
+
+        let final_reopen = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload fully acknowledged migrated baseline KEK"),
+        )
+        .await
+        .expect("reopen fully acknowledged migrated baseline");
+        assert!(
+            final_reopen
+                .load_pending_publications(fixture.publication_stream_id)
+                .await
+                .expect("load empty outbox after final reopen")
+                .is_empty()
+        );
+        let final_stream = final_reopen
+            .load_publication_stream_record(fixture.publication_stream_id)
+            .await
+            .expect("authenticate fully acknowledged migrated stream");
+        assert_eq!(final_stream.committed_high_water, Some(0));
+        assert_eq!(final_stream.acknowledged_high_water, Some(0));
+        assert_eq!(
+            final_stream.committed_inner_cursor,
+            Some(fixture.catalog_high_water + 1)
+        );
+        assert_eq!(
+            final_stream.acknowledged_inner_cursor,
+            Some(fixture.catalog_high_water + 1)
+        );
+        final_reopen
+            .shutdown()
+            .await
+            .expect("shutdown fully acknowledged migrated baseline");
+    }
+
+    #[tokio::test]
+    async fn strict_v14_capacity_rejection_precedes_v15_artifact_rewrite() {
+        let root = TestRoot::new("strict-v14-v15-capacity");
+        let keys = MemoryKeyStore::new();
+        build_populated_strict_v14_fixture(&root, &keys);
+
+        let legacy_connection = Connection::open(root.database())
+            .expect("open strict v14 for exact migration capacity projection");
+        let legacy = read_and_validate_legacy_v14_schema(&legacy_connection)
+            .expect("authenticate strict v14 migration capacity ledger");
+        assert_eq!(legacy.ledger.publication_stream_count, 1);
+        assert_eq!(legacy.ledger.publication_outbox_count, 1);
+        assert!(legacy.ledger.publication_outbox_bytes > 0);
+        let publication_projection = legacy
+            .ledger
+            .publication_stream_count
+            .checked_mul(8 * 1024)
+            .and_then(|stream_bytes| {
+                legacy
+                    .ledger
+                    .publication_outbox_count
+                    .checked_mul(8 * 1024)
+                    .and_then(|row_bytes| stream_bytes.checked_add(row_bytes))
+            })
+            .and_then(|row_bytes| row_bytes.checked_add(legacy.ledger.publication_outbox_bytes))
+            .expect("strict v14 publication projection remains bounded");
+        assert!(publication_projection > 0);
+        let migration_reserve = safety_reserve_bytes_for_ledger(&legacy.ledger)
+            .expect("compute strict v14 migration safety reserve")
+            .checked_add(RUNTIME_WRITE_SAFETY_MARGIN_BYTES)
+            .expect("strict v14 migration reserve remains bounded");
+        let filesystem_total_bytes = 4 * 1024 * 1024 * 1024;
+        let required_available_bytes = filesystem_reserve_bytes(filesystem_total_bytes)
+            .checked_add(migration_reserve)
+            .and_then(|required| required.checked_add(publication_projection))
+            .expect("exact strict v14 migration requirement remains bounded");
+        drop(legacy_connection);
+        let before = artifact_evidence(&root.database());
+
+        let rejected_observations = Arc::new(AtomicU64::new(0));
+
+        let error = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationThresholdDisk {
+                filesystem_total_bytes,
+                filesystem_available_bytes: required_available_bytes - 1,
+                observations: Arc::clone(&rejected_observations),
+            }),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload capacity-rejected strict v14 KEK"),
+        )
+        .await
+        .expect_err("v15 migration capacity gate must reject strict v14 before DDL");
+        assert!(matches!(
+            error,
+            RuntimeStoreError::DiskLow {
+                available_bytes,
+                required_available_bytes: required,
+            } if available_bytes == required_available_bytes - 1
+                && required == required_available_bytes
+        ));
+        assert!(rejected_observations.load(Ordering::SeqCst) > 0);
+        assert_eq!(artifact_evidence(&root.database()), before);
+        let legacy = Connection::open(root.database()).expect("inspect capacity-rejected v14");
+        assert_eq!(
+            schema_manifest(&legacy).expect("read capacity-rejected v14 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V14)
+                .expect("build exact capacity-rejected v14 manifest")
+        );
+        drop(legacy);
+
+        let admitted_observations = Arc::new(AtomicU64::new(0));
+        let migrated = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationThresholdDisk {
+                filesystem_total_bytes,
+                filesystem_available_bytes: required_available_bytes,
+                observations: Arc::clone(&admitted_observations),
+            }),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload exact-capacity strict v14 KEK"),
+        )
+        .await
+        .expect("exact publication-aware capacity threshold admits v15 migration");
+        assert_eq!(
+            migrated
+                .inspect()
+                .await
+                .expect("inspect exactly admitted v15 migration")
+                .schema_version,
+            RUNTIME_SCHEMA_VERSION_V15
+        );
+        migrated
+            .shutdown()
+            .await
+            .expect("shutdown exactly admitted v15 migration");
+        assert!(admitted_observations.load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn wrong_kek_rejects_strict_v14_before_v15_artifact_rewrite() {
+        let root = TestRoot::new("strict-v14-v15-wrong-kek");
+        let keys = MemoryKeyStore::new();
+        build_populated_strict_v14_fixture(&root, &keys);
+        let before = artifact_evidence(&root.database());
+        let wrong_keys = MemoryKeyStore::new();
+        let wrong_namespace = root.0.join("wrong-v14-key-namespace.db");
+        let wrong_kek = load_or_create_storage_kek(&wrong_keys, &wrong_namespace)
+            .expect("create independent wrong strict v14 KEK");
+
+        RuntimeStoreHandle::open(RuntimeStoreConfig::new(root.database()), wrong_kek)
+            .await
+            .expect_err("wrong KEK must reject strict v14 before v15 migration");
+        assert_eq!(artifact_evidence(&root.database()), before);
+        let legacy = Connection::open(root.database()).expect("inspect wrong-KEK strict v14");
+        assert_eq!(
+            schema_manifest(&legacy).expect("read wrong-KEK strict v14 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V14)
+                .expect("build exact wrong-KEK v14 manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_v14_publication_rejects_before_v15_artifact_rewrite() {
+        let root = TestRoot::new("strict-v14-v15-publication-tamper");
+        let keys = MemoryKeyStore::new();
+        build_populated_strict_v14_fixture(&root, &keys);
+        let connection =
+            Connection::open(root.database()).expect("open strict v14 publication tamper fixture");
+        let mut sealed: Vec<u8> = connection
+            .query_row(
+                "SELECT sealed_publication FROM publication_outbox LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read strict v14 publication ciphertext");
+        sealed[0] ^= 0x80;
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE publication_outbox SET sealed_publication = ?1",
+                    params![sealed],
+                )
+                .expect("tamper strict v14 publication ciphertext"),
+            1
+        );
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint strict v14 publication tamper fixture");
+        drop(connection);
+        let before = artifact_evidence(&root.database());
+
+        RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload tampered strict v14 KEK"),
+        )
+        .await
+        .expect_err("tampered v14 publication must reject before v15 migration");
+        assert_eq!(artifact_evidence(&root.database()), before);
+        let legacy = Connection::open(root.database()).expect("inspect rejected tampered v14");
+        assert_eq!(
+            schema_manifest(&legacy).expect("read rejected tampered v14 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V14)
+                .expect("build exact rejected tampered v14 manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn v15_before_commit_fault_rolls_back_to_exact_v14_then_retries() {
+        let root = TestRoot::new("strict-v14-v15-before-commit");
+        let keys = MemoryKeyStore::new();
+        let (cipher_before, authenticated_before, publication_before) =
+            build_populated_strict_v14_fixture(&root, &keys);
+        let artifacts_before = artifact_evidence(&root.database());
+        let error = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database())
+                .with_capacity_probe(MigrationGenerousDisk)
+                .with_fault_injector(Arc::new(FailMigrationBeforeCommit {
+                    failed: AtomicBool::new(false),
+                })),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload strict v14 before-COMMIT KEK"),
+        )
+        .await
+        .expect_err("before-COMMIT fault must abort v15 migration");
+        assert!(matches!(error, RuntimeStoreError::WorkerStopped));
+        assert_eq!(artifact_evidence(&root.database()), artifacts_before);
+        assert_eq!(cipher_evidence(&root.database()), cipher_before);
+        let legacy = Connection::open(root.database()).expect("inspect rolled-back strict v14");
+        assert_eq!(authenticated_blob_evidence(&legacy), authenticated_before);
+        assert_eq!(publication_byte_evidence(&legacy), publication_before);
+        assert_eq!(
+            schema_manifest(&legacy).expect("read rolled-back strict v14 manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V14)
+                .expect("build exact rolled-back strict v14 manifest")
+        );
+        drop(legacy);
+
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database()).with_capacity_probe(MigrationGenerousDisk),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("retry strict v14 migration KEK"),
+        )
+        .await
+        .expect("retry rolled-back v15 migration");
+        assert_eq!(
+            reopened
+                .inspect()
+                .await
+                .expect("inspect retried v15 migration")
+                .schema_version,
+            RUNTIME_SCHEMA_VERSION_V15
+        );
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown retried v15 migration");
+    }
+
+    #[tokio::test]
+    async fn v15_after_commit_unknown_reopens_without_second_migration() {
+        let root = TestRoot::new("strict-v14-v15-after-commit");
+        let keys = MemoryKeyStore::new();
+        let (cipher_before, authenticated_before, publication_before) =
+            build_populated_strict_v14_fixture(&root, &keys);
+        let error = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database())
+                .with_capacity_probe(MigrationGenerousDisk)
+                .with_fault_injector(Arc::new(FailMigrationAfterCommit {
+                    failed: AtomicBool::new(false),
+                })),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload strict v14 after-COMMIT KEK"),
+        )
+        .await
+        .expect_err("after-COMMIT fault must surface unknown v15 migration outcome");
+        assert!(matches!(
+            error,
+            RuntimeStoreError::CommitOutcomeUnknown {
+                operation: RuntimeCommitOperation::MigrateSchema
+            }
+        ));
+
+        let reopened = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(root.database())
+                .with_capacity_probe(MigrationGenerousDisk)
+                .with_fault_injector(Arc::new(FailMigrationBeforeCommit {
+                    failed: AtomicBool::new(false),
+                })),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload committed v15 migration KEK"),
+        )
+        .await
+        .expect("reopen committed v15 migration without a second rewrite");
+        assert_eq!(
+            reopened
+                .inspect()
+                .await
+                .expect("inspect reopened committed v15 migration")
+                .schema_version,
+            RUNTIME_SCHEMA_VERSION_V15
+        );
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown reopened committed v15 migration");
+        assert_eq!(cipher_evidence(&root.database()), cipher_before);
+        let connection =
+            Connection::open(root.database()).expect("inspect reopened committed v15 database");
+        assert_eq!(
+            authenticated_blob_evidence(&connection),
+            authenticated_before
+        );
+        assert_eq!(publication_byte_evidence(&connection), publication_before);
+    }
+
+    #[tokio::test]
+    async fn populated_strict_v13_migrates_to_current_without_changing_key_update_bytes() {
+        let root = TestRoot::new("populated-strict-v13-to-current");
         let keys = MemoryKeyStore::new();
         let (row_before, authenticated_before) =
             build_populated_strict_v13_key_update_fixture(&root, &keys);
@@ -3698,27 +4540,34 @@ mod migration_tests {
                 .expect("reload populated strict v13 KEK"),
         )
         .await
-        .expect("migrate populated strict v13 fixture to v14");
-        let snapshot = store.inspect().await.expect("inspect migrated v14 store");
-        assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION_V14);
-        assert_eq!(snapshot.table_names, EXPECTED_TABLES_V14);
-        store.shutdown().await.expect("shutdown migrated v14 store");
+        .expect("migrate populated strict v13 fixture to current");
+        let snapshot = store
+            .inspect()
+            .await
+            .expect("inspect migrated current store");
+        assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION_V15);
+        assert_eq!(snapshot.table_names, EXPECTED_TABLES_V15);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown migrated current store");
 
         let connection =
-            Connection::open(root.database()).expect("inspect populated v13-to-v14 database");
+            Connection::open(root.database()).expect("inspect populated v13-to-current database");
         assert_eq!(
             key_update_row_evidence(&connection),
             row_before,
-            "v13 to v14 must preserve every key-update column byte-exact"
+            "v13 to current must preserve every key-update column byte-exact"
         );
         assert_eq!(
             authenticated_blob_evidence(&connection),
             authenticated_before,
-            "v13 to v14 must preserve every non-meta token and sealed blob byte-exact"
+            "v13 to current must preserve every non-meta token and sealed blob byte-exact"
         );
         assert_eq!(
-            schema_manifest(&connection).expect("read migrated v14 manifest"),
-            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V14).expect("build exact v14 manifest")
+            schema_manifest(&connection).expect("read migrated current manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V15)
+                .expect("build exact current manifest")
         );
         let temporary_table_count: i64 = connection
             .query_row(
@@ -3734,7 +4583,7 @@ mod migration_tests {
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get(0)
             })
-            .expect("count migrated v14 foreign-key violations");
+            .expect("count migrated current foreign-key violations");
         assert_eq!(foreign_key_violation_count, 0);
         drop(connection);
 
@@ -3744,13 +4593,17 @@ mod migration_tests {
                     failed: AtomicBool::new(false),
                 },
             )),
-            load_or_create_storage_kek(&keys, &root.database()).expect("reload migrated v14 KEK"),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload migrated current KEK"),
         )
         .await
-        .expect("reopen current v14 without attempting a second migration");
-        reopened.shutdown().await.expect("shutdown reopened v14");
+        .expect("reopen current without attempting a second migration");
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown reopened current store");
         let reopened_connection =
-            Connection::open(root.database()).expect("inspect reopened current v14");
+            Connection::open(root.database()).expect("inspect reopened current store");
         assert_eq!(key_update_row_evidence(&reopened_connection), row_before);
     }
 
@@ -3847,7 +4700,7 @@ mod migration_tests {
     }
 
     #[tokio::test]
-    async fn populated_strict_v12_migrates_to_v14_without_changing_publication_bytes() {
+    async fn populated_strict_v12_migrates_to_current_without_changing_publication_bytes() {
         let root = TestRoot::new("populated-strict-v12-to-v13");
         let keys = MemoryKeyStore::new();
         let (cipher_before, authenticated_before, publication_before) =
@@ -3859,32 +4712,39 @@ mod migration_tests {
                 .expect("reload populated strict v12 KEK"),
         )
         .await
-        .expect("migrate populated strict v12 fixture to v14");
-        let snapshot = store.inspect().await.expect("inspect migrated v14 store");
-        assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION_V14);
-        assert_eq!(snapshot.table_names, EXPECTED_TABLES_V14);
-        store.shutdown().await.expect("shutdown migrated v14 store");
+        .expect("migrate populated strict v12 fixture to current");
+        let snapshot = store
+            .inspect()
+            .await
+            .expect("inspect migrated current store");
+        assert_eq!(snapshot.schema_version, RUNTIME_SCHEMA_VERSION_V15);
+        assert_eq!(snapshot.table_names, EXPECTED_TABLES_V15);
+        store
+            .shutdown()
+            .await
+            .expect("shutdown migrated current store");
 
         assert_eq!(
             cipher_evidence(&root.database()),
             cipher_before,
-            "v12 to v14 must preserve wrapped key and pre-existing row ciphertext byte-exact"
+            "v12 to current must preserve wrapped key and pre-existing row ciphertext byte-exact"
         );
         let connection =
-            Connection::open(root.database()).expect("inspect populated v12-to-v14 database");
+            Connection::open(root.database()).expect("inspect populated v12-to-current database");
         assert_eq!(
             authenticated_blob_evidence(&connection),
             authenticated_before,
-            "v12 to v14 must preserve every non-meta token and sealed blob byte-exact"
+            "v12 to current must preserve every non-meta token and sealed blob byte-exact"
         );
         assert_eq!(
             publication_byte_evidence(&connection),
             publication_before,
-            "v12 to v14 must preserve publication IDs, generations, hashes, tokens and sealed blob"
+            "v12 to current must preserve publication IDs, generations, hashes, tokens and sealed blob"
         );
         assert_eq!(
-            schema_manifest(&connection).expect("read migrated v14 manifest"),
-            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V14).expect("build exact v14 manifest")
+            schema_manifest(&connection).expect("read migrated current manifest"),
+            expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V15)
+                .expect("build exact current manifest")
         );
         let temporary_table_count: i64 = connection
             .query_row(
@@ -3899,7 +4759,7 @@ mod migration_tests {
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get(0)
             })
-            .expect("count migrated v14 foreign-key violations");
+            .expect("count migrated current foreign-key violations");
         assert_eq!(foreign_key_violation_count, 0);
         drop(connection);
 
@@ -3909,13 +4769,17 @@ mod migration_tests {
                     failed: AtomicBool::new(false),
                 },
             )),
-            load_or_create_storage_kek(&keys, &root.database()).expect("reload migrated v14 KEK"),
+            load_or_create_storage_kek(&keys, &root.database())
+                .expect("reload migrated current KEK"),
         )
         .await
-        .expect("reopen current v14 without attempting a second migration");
-        reopened.shutdown().await.expect("shutdown reopened v14");
+        .expect("reopen current without attempting a second migration");
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown reopened current store");
         let reopened_connection =
-            Connection::open(root.database()).expect("inspect reopened current v14");
+            Connection::open(root.database()).expect("inspect reopened current store");
         assert_eq!(
             publication_byte_evidence(&reopened_connection),
             publication_before
@@ -4843,7 +5707,8 @@ mod migration_tests {
                 | LegacySchemaVersion::V10
                 | LegacySchemaVersion::V11
                 | LegacySchemaVersion::V12
-                | LegacySchemaVersion::V13 => {
+                | LegacySchemaVersion::V13
+                | LegacySchemaVersion::V14 => {
                     unreachable!("table only covers legacy v1-v4")
                 }
             };
@@ -4870,7 +5735,8 @@ mod migration_tests {
                 | LegacySchemaVersion::V10
                 | LegacySchemaVersion::V11
                 | LegacySchemaVersion::V12
-                | LegacySchemaVersion::V13 => {
+                | LegacySchemaVersion::V13
+                | LegacySchemaVersion::V14 => {
                     unreachable!("table only covers legacy v1-v4")
                 }
             }
@@ -6049,6 +6915,12 @@ mod migration_tests {
 
     struct MigrationGenerousDisk;
 
+    struct MigrationThresholdDisk {
+        filesystem_total_bytes: u64,
+        filesystem_available_bytes: u64,
+        observations: Arc<AtomicU64>,
+    }
+
     struct TamperAfterLegacyAuthentication {
         tampered: AtomicBool,
     }
@@ -6089,6 +6961,32 @@ mod migration_tests {
                 shm_bytes: artifact_bytes(&sidecar(database_path, "-shm"))?,
                 filesystem_total_bytes: 1024 * 1024 * 1024 * 1024,
                 filesystem_available_bytes: 1024 * 1024 * 1024 * 1024,
+            })
+        }
+    }
+
+    impl RuntimeCapacityProbe for MigrationThresholdDisk {
+        fn observe(
+            &self,
+            database_path: &Path,
+        ) -> Result<RuntimeCapacityObservation, RuntimeCapacityProbeError> {
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            let artifact_bytes = |path: &Path| -> Result<u64, RuntimeCapacityProbeError> {
+                match fs::metadata(path) {
+                    Ok(metadata) => Ok(metadata.len()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                    Err(source) => Err(RuntimeCapacityProbeError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    }),
+                }
+            };
+            Ok(RuntimeCapacityObservation {
+                main_bytes: artifact_bytes(database_path)?,
+                wal_bytes: artifact_bytes(&sidecar(database_path, "-wal"))?,
+                shm_bytes: artifact_bytes(&sidecar(database_path, "-shm"))?,
+                filesystem_total_bytes: self.filesystem_total_bytes,
+                filesystem_available_bytes: self.filesystem_available_bytes,
             })
         }
     }
@@ -6660,6 +7558,7 @@ enum SchemaState {
     LegacyV11(MetaRow, StoreFileIdentity),
     LegacyV12(MetaRow, StoreFileIdentity),
     LegacyV13(MetaRow, StoreFileIdentity),
+    LegacyV14(MetaRow, StoreFileIdentity),
     Current(MetaRow, StoreFileIdentity),
 }
 
@@ -6678,6 +7577,7 @@ enum LegacySchemaVersion {
     V11,
     V12,
     V13,
+    V14,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6860,6 +7760,14 @@ where
             identity,
             LegacySchemaVersion::V13,
         ),
+        SchemaState::LegacyV14(meta, identity) => open_legacy(
+            config,
+            storage_path,
+            &storage_kek,
+            meta,
+            identity,
+            LegacySchemaVersion::V14,
+        ),
         SchemaState::Current(meta, identity) => open_current(
             config,
             storage_path,
@@ -6931,6 +7839,7 @@ fn open_fresh(
         transaction.execute_batch(RUNTIME_MIGRATION_V12)?;
         transaction.execute_batch(RUNTIME_MIGRATION_V13)?;
         transaction.execute_batch(RUNTIME_MIGRATION_V14)?;
+        transaction.execute_batch(RUNTIME_MIGRATION_V15)?;
         transaction.execute(
             "INSERT INTO runtime_meta (
                  singleton, schema_family, schema_version, schema_signature,
@@ -7090,6 +7999,7 @@ fn open_legacy(
         LegacySchemaVersion::V11 => verify_runtime_ledger_token_v11(&key_bundle, &inspected)?,
         LegacySchemaVersion::V12 => verify_runtime_ledger_token_v12(&key_bundle, &inspected)?,
         LegacySchemaVersion::V13 => verify_runtime_ledger_token_v13(&key_bundle, &inspected)?,
+        LegacySchemaVersion::V14 => verify_runtime_ledger_token_v14(&key_bundle, &inspected)?,
     }
 
     validate_database_file(&storage_path)?;
@@ -7113,6 +8023,7 @@ fn open_legacy(
         LegacySchemaVersion::V11 => read_and_validate_legacy_v11_schema(&connection)?,
         LegacySchemaVersion::V12 => read_and_validate_legacy_v12_schema(&connection)?,
         LegacySchemaVersion::V13 => read_and_validate_legacy_v13_schema(&connection)?,
+        LegacySchemaVersion::V14 => read_and_validate_legacy_v14_schema(&connection)?,
     };
     if !same_meta(&inspected, &current) {
         return Err(RuntimeStoreError::SchemaInspectionRaced);
@@ -7141,7 +8052,8 @@ fn open_legacy(
         | LegacySchemaVersion::V10
         | LegacySchemaVersion::V11
         | LegacySchemaVersion::V12
-        | LegacySchemaVersion::V13 => {
+        | LegacySchemaVersion::V13
+        | LegacySchemaVersion::V14 => {
             super::journal::validate_store_integrity(
                 &connection,
                 &key_bundle,
@@ -7170,6 +8082,7 @@ fn open_legacy(
             | LegacySchemaVersion::V11
             | LegacySchemaVersion::V12
             | LegacySchemaVersion::V13
+            | LegacySchemaVersion::V14
     ) {
         0
     } else {
@@ -7185,7 +8098,22 @@ fn open_legacy(
         .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
             field: "v14 key-update migration projection bytes",
         })?;
-    let migration_projection = match legacy_version {
+    let publication_shape_projection = current
+        .ledger
+        .publication_stream_count
+        .checked_mul(8 * 1024)
+        .and_then(|stream_bytes| {
+            current
+                .ledger
+                .publication_outbox_count
+                .checked_mul(8 * 1024)
+                .and_then(|row_bytes| stream_bytes.checked_add(row_bytes))
+        })
+        .and_then(|row_bytes| row_bytes.checked_add(current.ledger.publication_outbox_bytes))
+        .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+            field: "v15 publication migration projection bytes",
+        })?;
+    let prior_migration_projection = match legacy_version {
         LegacySchemaVersion::V4 => v5_projection,
         LegacySchemaVersion::V5
         | LegacySchemaVersion::V6
@@ -7193,7 +8121,8 @@ fn open_legacy(
         | LegacySchemaVersion::V8
         | LegacySchemaVersion::V9
         | LegacySchemaVersion::V10
-        | LegacySchemaVersion::V11 => 0,
+        | LegacySchemaVersion::V11
+        | LegacySchemaVersion::V14 => 0,
         LegacySchemaVersion::V12 | LegacySchemaVersion::V13 => key_update_shape_projection,
         LegacySchemaVersion::V1 | LegacySchemaVersion::V2 | LegacySchemaVersion::V3 => {
             super::stream::migration_projection_bytes(&connection)?
@@ -7203,6 +8132,11 @@ fn open_legacy(
                 })?
         }
     };
+    let migration_projection = prior_migration_projection
+        .checked_add(publication_shape_projection)
+        .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+            field: "combined v15 migration projection bytes",
+        })?;
     evaluate_migration_capacity_before_wal(
         &connection,
         &storage_path,
@@ -7225,6 +8159,7 @@ fn open_legacy(
         LegacySchemaVersion::V11 => schema_signature_v11(),
         LegacySchemaVersion::V12 => schema_signature_v12(),
         LegacySchemaVersion::V13 => schema_signature_v13(),
+        LegacySchemaVersion::V14 => schema_signature_v14(),
     };
     let new_signature = schema_signature();
     let old_token = match legacy_version {
@@ -7267,6 +8202,9 @@ fn open_legacy(
         LegacySchemaVersion::V13 => {
             runtime_ledger_token_v13(&key_bundle, current.database_id, &current.ledger)?
         }
+        LegacySchemaVersion::V14 => {
+            runtime_ledger_token_v14(&key_bundle, current.database_id, &current.ledger)?
+        }
     };
     let mut transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // 容量 probe 与 BEGIN 之间不能沿用先前认证结果：同 UID 的另一 SQLite
@@ -7287,6 +8225,7 @@ fn open_legacy(
         LegacySchemaVersion::V11 => read_and_validate_legacy_v11_schema(&transaction)?,
         LegacySchemaVersion::V12 => read_and_validate_legacy_v12_schema(&transaction)?,
         LegacySchemaVersion::V13 => read_and_validate_legacy_v13_schema(&transaction)?,
+        LegacySchemaVersion::V14 => read_and_validate_legacy_v14_schema(&transaction)?,
     };
     if !same_meta(&current, &locked) {
         return Err(RuntimeStoreError::SchemaInspectionRaced);
@@ -7316,6 +8255,7 @@ fn open_legacy(
         LegacySchemaVersion::V11 => verify_runtime_ledger_token_v11(&key_bundle, &locked)?,
         LegacySchemaVersion::V12 => verify_runtime_ledger_token_v12(&key_bundle, &locked)?,
         LegacySchemaVersion::V13 => verify_runtime_ledger_token_v13(&key_bundle, &locked)?,
+        LegacySchemaVersion::V14 => verify_runtime_ledger_token_v14(&key_bundle, &locked)?,
     }
     if legacy_version != LegacySchemaVersion::V1 {
         super::journal::validate_store_integrity(&transaction, &key_bundle, locked.database_id)?;
@@ -7341,6 +8281,7 @@ fn open_legacy(
             | LegacySchemaVersion::V11
             | LegacySchemaVersion::V12
             | LegacySchemaVersion::V13
+            | LegacySchemaVersion::V14
     ) {
         current.ledger.clone()
     } else {
@@ -7363,6 +8304,7 @@ fn open_legacy(
             | LegacySchemaVersion::V11
             | LegacySchemaVersion::V12
             | LegacySchemaVersion::V13
+            | LegacySchemaVersion::V14
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V5)?;
         super::configuration::materialize_legacy_v4_states(
@@ -7381,6 +8323,7 @@ fn open_legacy(
             | LegacySchemaVersion::V11
             | LegacySchemaVersion::V12
             | LegacySchemaVersion::V13
+            | LegacySchemaVersion::V14
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V6)?;
     }
@@ -7393,6 +8336,7 @@ fn open_legacy(
             | LegacySchemaVersion::V11
             | LegacySchemaVersion::V12
             | LegacySchemaVersion::V13
+            | LegacySchemaVersion::V14
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V7)?;
     }
@@ -7404,6 +8348,7 @@ fn open_legacy(
             | LegacySchemaVersion::V11
             | LegacySchemaVersion::V12
             | LegacySchemaVersion::V13
+            | LegacySchemaVersion::V14
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V8)?;
     }
@@ -7414,6 +8359,7 @@ fn open_legacy(
             | LegacySchemaVersion::V11
             | LegacySchemaVersion::V12
             | LegacySchemaVersion::V13
+            | LegacySchemaVersion::V14
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V9)?;
     }
@@ -7423,25 +8369,35 @@ fn open_legacy(
             | LegacySchemaVersion::V11
             | LegacySchemaVersion::V12
             | LegacySchemaVersion::V13
+            | LegacySchemaVersion::V14
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V10)?;
     }
     if !matches!(
         legacy_version,
-        LegacySchemaVersion::V11 | LegacySchemaVersion::V12 | LegacySchemaVersion::V13
+        LegacySchemaVersion::V11
+            | LegacySchemaVersion::V12
+            | LegacySchemaVersion::V13
+            | LegacySchemaVersion::V14
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V11)?;
     }
     if !matches!(
         legacy_version,
-        LegacySchemaVersion::V12 | LegacySchemaVersion::V13
+        LegacySchemaVersion::V12 | LegacySchemaVersion::V13 | LegacySchemaVersion::V14
     ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V12)?;
     }
-    if legacy_version != LegacySchemaVersion::V13 {
+    if !matches!(
+        legacy_version,
+        LegacySchemaVersion::V13 | LegacySchemaVersion::V14
+    ) {
         transaction.execute_batch(RUNTIME_MIGRATION_V13)?;
     }
-    transaction.execute_batch(RUNTIME_MIGRATION_V14)?;
+    if legacy_version != LegacySchemaVersion::V14 {
+        transaction.execute_batch(RUNTIME_MIGRATION_V14)?;
+    }
+    transaction.execute_batch(RUNTIME_MIGRATION_V15)?;
     let new_token = runtime_ledger_token(&key_bundle, current.database_id, &migrated_ledger)?;
     if transaction.execute(
         "UPDATE runtime_meta
@@ -7526,6 +8482,7 @@ fn open_legacy(
                 LegacySchemaVersion::V11 => 11_i64,
                 LegacySchemaVersion::V12 => 12_i64,
                 LegacySchemaVersion::V13 => 13_i64,
+                LegacySchemaVersion::V14 => 14_i64,
             },
             &old_signature[..],
             &old_token[..],
@@ -7745,6 +8702,16 @@ fn inspect_schema(path: &Path, storage_kek: &StorageKek) -> Result<SchemaState, 
                     )?;
                     SchemaState::LegacyV13(legacy, identity.clone())
                 }
+                RUNTIME_SCHEMA_VERSION_V14 if family == RUNTIME_SCHEMA_FAMILY => {
+                    let legacy = read_and_validate_legacy_v14_schema(connection)?;
+                    validate_legacy_before_read_write_open(
+                        connection,
+                        storage_kek,
+                        &legacy,
+                        LegacySchemaVersion::V14,
+                    )?;
+                    SchemaState::LegacyV14(legacy, identity.clone())
+                }
                 RUNTIME_SCHEMA_VERSION if family == RUNTIME_SCHEMA_FAMILY => {
                     let current = read_and_validate_current_schema(connection)?;
                     // WAL recovery 的 schema inspection 已在私有 rescue 副本上看到完整
@@ -7807,6 +8774,7 @@ fn validate_legacy_before_read_write_open(
         LegacySchemaVersion::V11 => verify_runtime_ledger_token_v11(&key_bundle, legacy)?,
         LegacySchemaVersion::V12 => verify_runtime_ledger_token_v12(&key_bundle, legacy)?,
         LegacySchemaVersion::V13 => verify_runtime_ledger_token_v13(&key_bundle, legacy)?,
+        LegacySchemaVersion::V14 => verify_runtime_ledger_token_v14(&key_bundle, legacy)?,
     }
     if legacy_version == LegacySchemaVersion::V5 {
         reject_legacy_v5_native_projection(connection)?;
@@ -7832,7 +8800,8 @@ fn validate_legacy_before_read_write_open(
         | LegacySchemaVersion::V10
         | LegacySchemaVersion::V11
         | LegacySchemaVersion::V12
-        | LegacySchemaVersion::V13 => {
+        | LegacySchemaVersion::V13
+        | LegacySchemaVersion::V14 => {
             super::journal::validate_store_integrity(connection, &key_bundle, legacy.database_id)?;
         }
     }
@@ -8185,6 +9154,28 @@ fn read_and_validate_legacy_v13_schema(
         || meta.metadata_token.len() != 32
         || table_names(connection)? != EXPECTED_TABLES_V13
         || schema_manifest(connection)? != expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V13)?
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(meta)
+}
+
+fn read_and_validate_legacy_v14_schema(
+    connection: &Connection,
+) -> Result<MetaRow, RuntimeStoreError> {
+    let Some(meta) =
+        read_meta(connection).map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+    else {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    };
+    if meta.family != RUNTIME_SCHEMA_FAMILY
+        || meta.version != RUNTIME_SCHEMA_VERSION_V14
+        || meta.signature != schema_signature_v14()
+        || meta.key_generation != RUNTIME_KEY_GENERATION
+        || meta.wrapped_key_bundle.len() != WRAPPED_KEY_BUNDLE_V1_LEN
+        || meta.metadata_token.len() != 32
+        || table_names(connection)? != EXPECTED_TABLES_V14
+        || schema_manifest(connection)? != expected_schema_manifest(RUNTIME_SCHEMA_VERSION_V14)?
     {
         return Err(RuntimeStoreError::UnknownOrCorruptSchema);
     }
@@ -9774,6 +10765,21 @@ fn expected_schema_manifest(version: u32) -> Result<Vec<SchemaObject>, RuntimeSt
             connection.execute_batch(RUNTIME_MIGRATION_V12)?;
             connection.execute_batch(RUNTIME_MIGRATION_V13)?;
         }
+        RUNTIME_SCHEMA_VERSION_V14 => {
+            connection.execute_batch(RUNTIME_MIGRATION_V2)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V3)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V4)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V5)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V6)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V7)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V8)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V9)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V10)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V11)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V12)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V13)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V14)?;
+        }
         RUNTIME_SCHEMA_VERSION => {
             connection.execute_batch(RUNTIME_MIGRATION_V2)?;
             connection.execute_batch(RUNTIME_MIGRATION_V3)?;
@@ -9788,6 +10794,7 @@ fn expected_schema_manifest(version: u32) -> Result<Vec<SchemaObject>, RuntimeSt
             connection.execute_batch(RUNTIME_MIGRATION_V12)?;
             connection.execute_batch(RUNTIME_MIGRATION_V13)?;
             connection.execute_batch(RUNTIME_MIGRATION_V14)?;
+            connection.execute_batch(RUNTIME_MIGRATION_V15)?;
         }
         _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
     }
@@ -10077,13 +11084,23 @@ fn runtime_ledger_token_v13(
     Ok(*token.as_bytes())
 }
 
-fn runtime_ledger_token(
+fn runtime_ledger_token_v14(
     key_bundle: &RuntimeKeyBundle,
     database_id: [u8; 16],
     ledger: &RuntimeLedger,
 ) -> Result<[u8; 32], RuntimeStoreError> {
     let message = runtime_ledger_message_v12(database_id, ledger);
     let token = key_bundle.blind_index(super::schema::RUNTIME_LEDGER_DOMAIN_V14, &message)?;
+    Ok(*token.as_bytes())
+}
+
+fn runtime_ledger_token(
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &RuntimeLedger,
+) -> Result<[u8; 32], RuntimeStoreError> {
+    let message = runtime_ledger_message_v12(database_id, ledger);
+    let token = key_bundle.blind_index(super::schema::RUNTIME_LEDGER_DOMAIN_V15, &message)?;
     Ok(*token.as_bytes())
 }
 
@@ -10309,6 +11326,17 @@ fn verify_runtime_ledger_token_v13(
     Ok(())
 }
 
+fn verify_runtime_ledger_token_v14(
+    key_bundle: &RuntimeKeyBundle,
+    meta: &MetaRow,
+) -> Result<(), RuntimeStoreError> {
+    let expected = runtime_ledger_token_v14(key_bundle, meta.database_id, &meta.ledger)?;
+    if meta.metadata_token.as_slice() != expected {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(())
+}
+
 pub(crate) fn load_runtime_ledger(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
@@ -10331,6 +11359,7 @@ pub(crate) fn load_runtime_ledger(
         RUNTIME_SCHEMA_VERSION_V11 => read_meta_v11(connection)?,
         RUNTIME_SCHEMA_VERSION_V12 => read_meta_v12(connection)?,
         RUNTIME_SCHEMA_VERSION_V13 => read_meta(connection)?,
+        RUNTIME_SCHEMA_VERSION_V14 => read_meta(connection)?,
         RUNTIME_SCHEMA_VERSION => read_meta(connection)?,
         _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
     }
@@ -10351,6 +11380,7 @@ pub(crate) fn load_runtime_ledger(
         RUNTIME_SCHEMA_VERSION_V11 => verify_runtime_ledger_token_v11(key_bundle, &meta)?,
         RUNTIME_SCHEMA_VERSION_V12 => verify_runtime_ledger_token_v12(key_bundle, &meta)?,
         RUNTIME_SCHEMA_VERSION_V13 => verify_runtime_ledger_token_v13(key_bundle, &meta)?,
+        RUNTIME_SCHEMA_VERSION_V14 => verify_runtime_ledger_token_v14(key_bundle, &meta)?,
         RUNTIME_SCHEMA_VERSION => verify_runtime_ledger_token(key_bundle, &meta)?,
         _ => unreachable!("version matched above"),
     }
@@ -10782,6 +11812,9 @@ pub(crate) fn read_rescue_index(
         }
         (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION_V13) => {
             read_and_validate_legacy_v13_schema(connection)?;
+        }
+        (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION_V14) => {
+            read_and_validate_legacy_v14_schema(connection)?;
         }
         (RUNTIME_SCHEMA_FAMILY, RUNTIME_SCHEMA_VERSION) => {
             read_and_validate_current_schema(connection)?;

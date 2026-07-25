@@ -5665,7 +5665,7 @@ async fn emergency_replay_debt_survives_real_binding_replacement_until_determini
  {
     const MIB: usize = 1024 * 1024;
     const REPLAY_HEADROOM: usize = 96;
-    const EMERGENCY_REPLAY_DEBT_BYTES: usize = 97 + 32;
+    const EMERGENCY_REPLAY_DEBT_BYTES: usize = 129 + 32;
     const REPLAY_PRUNE_COUNTER_DISTANCE: u64 = 4_096;
 
     let fixture = PairingFixture::new().with_conversation_stream(CONVERSATION_STREAM_ROUTE);
@@ -5818,7 +5818,7 @@ async fn emergency_replay_debt_survives_real_binding_replacement_until_determini
         catalog_transfer_publish_frame(stream_seq, sender_counter, incoming_carrier.clone());
 
     // Ninety-six bytes of headroom can carry one retired-subscription outbox, but remain smaller
-    // than a fresh 97-byte replay tuple. The first preserving CAS must
+    // than a fresh 129-byte replay tuple. The first preserving CAS must
     // therefore cross the lowered normal limit; the emergency exact CAS must atomically install
     // that replay tuple and the Catalog marker without deleting the Conversation records.
     let production = production_capacity_store(&store, &root, normal_limit);
@@ -5884,7 +5884,7 @@ async fn emergency_replay_debt_survives_real_binding_replacement_until_determini
     assert_eq!(
         emergency_catalog_bytes.len(),
         installed_catalog_bytes.len() + EMERGENCY_REPLAY_DEBT_BYTES,
-        "one emergency replay tuple and its domain-separated debt hash consume the exact 129-byte credit",
+        "one emergency replay tuple and its domain-separated debt hash consume the exact 161-byte credit",
     );
     assert_eq!(
         bindings
@@ -6040,7 +6040,7 @@ async fn emergency_replay_debt_survives_real_binding_replacement_until_determini
             .expect("encode replacement plus cleanup outbox")
             .len(),
         emergency_catalog_bytes.len() + 32,
-        "same-scope replacement adds only one fixed-width retired subscription and retains the 129-byte emergency debt",
+        "same-scope replacement adds only one fixed-width retired subscription and retains the 161-byte emergency debt",
     );
     assert_eq!(
         replaced_bindings
@@ -6752,7 +6752,7 @@ async fn consecutive_distinct_bindings_use_emergency_capacity_without_prior_stat
 async fn same_binding_second_emergency_rejects_without_pruning_then_transfers_credit_after_pruning()
 {
     const REPLACEMENT_HEADROOM: usize = 96;
-    const EMERGENCY_REPLAY_DEBT_BYTES: usize = 97 + 32;
+    const EMERGENCY_REPLAY_DEBT_BYTES: usize = 129 + 32;
     const REPLAY_PRUNE_COUNTER_DISTANCE: u64 = 4_096;
 
     let fixture = PairingFixture::new();
@@ -8478,7 +8478,7 @@ async fn partial_subscription_transfer_expires_without_waiting_for_another_frame
 }
 
 #[tokio::test]
-async fn snapshot_and_backfill_modes_cannot_be_mixed_direct_or_compact() {
+async fn snapshot_then_backfill_advances_the_bootstrap_direct_or_compact() {
     for (seed, script) in [
         (0xc4, SubscriptionScript::CatalogSnapshotThenBackfill),
         (0xc6, SubscriptionScript::CatalogCompactSnapshotThenBackfill),
@@ -8497,18 +8497,52 @@ async fn snapshot_and_backfill_modes_cannot_be_mixed_direct_or_compact() {
         let mut reducer = CapturingSubscriptionReducer::new(catalog_requested_cursor());
         let mut rng = DeterministicRng::new([seed.wrapping_add(1); 32]);
 
-        assert!(
-            runtime
-                .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
-                .await
-                .is_err(),
-            "one bootstrap must choose exactly one of snapshot or backfill"
+        let outcome = runtime
+            .subscribe(catalog_requested_cursor(), &mut reducer, &mut rng)
+            .await
+            .expect("snapshot base may be followed by exact contiguous backfill");
+        assert_eq!(reducer.applied().len(), 2);
+        assert!(matches!(
+            &reducer.applied()[0],
+            RemoteSubscriptionBootstrapItem::CatalogSnapshot(_)
+        ));
+        assert!(matches!(
+            &reducer.applied()[1],
+            RemoteSubscriptionBootstrapItem::Backfill(BackfillChunk::Catalog { .. })
+        ));
+        assert_eq!(
+            reducer.inner_cursor(),
+            &RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(1),
+            }
         );
-        assert!(reducer.applied().is_empty());
-        assert_eq!(reducer.inner_cursor(), &catalog_requested_cursor());
-        assert_only_runtime_subscribe_send(&sent);
+        let expected_binding = catalog_stream_binding(
+            StreamCursor::At(CATALOG_OUTER_HIGH_WATER),
+            StreamCursor::At(0),
+        );
+        assert_eq!(outcome.binding(), &expected_binding);
+        assert_binding_controls(
+            &sent,
+            outcome.binding(),
+            true,
+            Some(CATALOG_OUTER_HIGH_WATER),
+        );
         drop(runtime);
-        assert_no_durable_stream_binding(&store, &root, &fixture);
+        assert_durable_stream_progress(
+            &store,
+            &root,
+            &fixture,
+            &expected_binding,
+            StreamCursor::At(CATALOG_OUTER_HIGH_WATER),
+            StreamCursor::At(CATALOG_OUTER_HIGH_WATER),
+            RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(0),
+            },
+            RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(1),
+            },
+            None,
+        );
     }
 }
 

@@ -24,20 +24,28 @@ const LEGACY_STREAM_STATE_VERSION: u16 = 1;
 const PREVIOUS_STREAM_STATE_VERSION: u16 = 2;
 const RETIRED_STREAM_STATE_VERSION: u16 = 3;
 const EPOCH_BARRIER_STREAM_STATE_VERSION: u16 = 4;
-const STREAM_STATE_VERSION: u16 = 5;
+const EMERGENCY_REPLAY_STREAM_STATE_VERSION: u16 = 5;
+const STREAM_STATE_VERSION: u16 = 6;
 const STREAM_STATE_HEADER_LEN: usize = 12;
 const MAX_CONVERSATION_ID_BYTES: usize = 1_024;
 const MAX_LEGACY_DURABLE_STREAM_STATE_BYTES: usize = 16 * 1_024;
-const MAX_DURABLE_STREAM_STATE_BYTES: usize = 512 * 1_024;
+// 4,096 个 V6 fixed-width replay tuple 已占 528,384 bytes；保留 binding、inner cursor、
+// pending barrier 与 receipt 的固定余量，同时仍受 paired-state 128 MiB 总硬界约束。
+const MAX_DURABLE_STREAM_STATE_BYTES: usize = 640 * 1_024;
 const MAX_STREAM_REPLAY_ENTRIES: usize = 4_096;
 const MAX_STREAM_REPLAY_DISTANCE: u64 = 4_095;
-/// V4 replay tuple 的 canonical fixed width。Emergency capacity reservation 必须在
+/// V4/V5 replay tuple 的 legacy canonical fixed width。V6 在末尾追加 signed frame hash。
+const DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES: usize = 1 + 8 + 8 + 16 + 16 + 8 + 8 + 32;
+/// V6 replay tuple 的 canonical fixed width。Emergency capacity reservation 必须在
 /// payload kind 仍加密、尚不能 AEAD open 时容纳这一条 authenticated admission。
-pub(crate) const DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES: usize = 1 + 8 + 8 + 16 + 16 + 8 + 8 + 32;
-/// V5 以一个 domain-separated SHA-256 精确绑定由 emergency reserve 接纳的 replay
-/// tuple。presence tag 在所有 V5 binding 中固定存在，因此 debt 的实际增量只有 hash。
+pub(crate) const DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES: usize =
+    DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES + 32;
+/// V5 引入并由 V6 保留的 domain-separated SHA-256，精确绑定 emergency reserve 接纳的
+/// replay tuple。presence tag 在所有 V5/V6 binding 中固定存在，因此 debt 增量只有 hash。
 pub(crate) const EMERGENCY_REPLAY_DEBT_METADATA_BYTES: usize = 32;
-const EMERGENCY_REPLAY_DEBT_HASH_DOMAIN: &[u8] = b"AgentDeck/DurableStreamEmergencyReplayDebtV1\0";
+const LEGACY_EMERGENCY_REPLAY_DEBT_HASH_DOMAIN: &[u8] =
+    b"AgentDeck/DurableStreamEmergencyReplayDebtV1\0";
+const EMERGENCY_REPLAY_DEBT_HASH_DOMAIN: &[u8] = b"AgentDeck/DurableStreamEmergencyReplayDebtV2\0";
 // 单 connection 的 live subscription quota 同为 64；handoff cleanup 不允许越过该硬界。
 const MAX_RETIRED_SUBSCRIPTIONS: usize = 64;
 pub(crate) const MAX_DURABLE_STREAM_BINDINGS: usize = 4_096;
@@ -50,6 +58,7 @@ pub struct DurableStreamReplayTupleV1 {
     stream_generation: StreamGenerationId,
     stream_seq: u64,
     sender_counter: u64,
+    signed_frame_sha256: [u8; 32],
     ciphertext_sha256: [u8; 32],
 }
 
@@ -82,6 +91,11 @@ impl DurableStreamReplayTupleV1 {
     #[must_use]
     pub const fn sender_counter(self) -> u64 {
         self.sender_counter
+    }
+
+    #[must_use]
+    pub const fn signed_frame_sha256(self) -> [u8; 32] {
+        self.signed_frame_sha256
     }
 
     #[must_use]
@@ -147,6 +161,17 @@ pub(crate) enum StreamPublishDisposition {
     PendingDuplicate,
     AppliedDuplicate,
     NonceReuseQuarantined,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryAdvanceOuterResolution {
+    /// 普通 higher-revision business Publish 没有旧 revision replay admission，不能借
+    /// ADKS `Resolved` 推进 outer cut。
+    NotAdmitted,
+    /// exact control 已被先前 transaction 或后续累计 cut 覆盖；调用方只需补发 ACK。
+    AlreadyApplied,
+    /// exact predecessor replay tuple 已认证，candidate 只推进 outer applied。
+    Commit(Box<DurableStreamBindingV1>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -369,12 +394,12 @@ impl DurableStreamBindingV1 {
         self.replay_entries.len()
     }
 
-    /// Emergency capacity 的 exact credit：一条 V4 fixed-width tuple，以及 V5 中从
-    /// `None` 变为 `Some(hash)` 新增的 32-byte metadata。presence tag 属于普通 V5 base。
+    /// Emergency capacity 的 exact credit：一条 V6 fixed-width tuple，以及从 `None`
+    /// 变为 `Some(hash)` 新增的 32-byte metadata。presence tag 属于普通 V6 base。
     #[must_use]
     pub(crate) const fn emergency_replay_debt_credit_bytes(&self) -> usize {
         if self.emergency_replay_debt.is_some() {
-            DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES
+            DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES
         } else {
             0
         }
@@ -442,7 +467,8 @@ impl DurableStreamBindingV1 {
     /// 在 AEAD open 之前 durable admit 一条已完成 canonical outer/header/AAD/signature
     /// 验证的 Publish。新 tuple 必须是 exact-next outer sequence；sender counter 可在
     /// 4096 数值窗口内乱序到达，但 floor 以下的 unseen counter 会被拒绝。相同 tuple 只
-    /// 区分 pending/applied 幂等重放，同 counter 不同 ciphertext 会持久化 quarantine。
+    /// 区分 pending/applied 幂等重放；同 counter 的 signed frame 或 ciphertext 任一漂移都会
+    /// 持久化 quarantine。
     #[cfg(test)]
     pub(crate) fn admit_publish(
         &self,
@@ -450,10 +476,12 @@ impl DurableStreamBindingV1 {
         sender_counter: u64,
         ciphertext_sha256: [u8; 32],
     ) -> Result<(Self, StreamPublishDisposition), RemoteStreamStateError> {
+        // 单元测试旧入口使用 deterministic 非零 frame hash；production 必须走下方显式入口。
         self.admit_publish_at_authenticated_revision(
             self.binding.key_directory_revision,
             stream_seq,
             sender_counter,
+            ciphertext_sha256,
             ciphertext_sha256,
         )
     }
@@ -466,11 +494,13 @@ impl DurableStreamBindingV1 {
         authenticated_revision: KeyDirectoryRevision,
         stream_seq: u64,
         sender_counter: u64,
+        signed_frame_sha256: [u8; 32],
         ciphertext_sha256: [u8; 32],
     ) -> Result<(Self, StreamPublishDisposition), RemoteStreamStateError> {
         self.validate()?;
         if authenticated_revision.value() == 0
             || authenticated_revision.value() > self.binding.key_directory_revision.value()
+            || signed_frame_sha256 == [0; 32]
             || ciphertext_sha256 == [0; 32]
             || StreamCursor::At(stream_seq).checked_next().is_err()
         {
@@ -493,6 +523,7 @@ impl DurableStreamBindingV1 {
                 || replay.stream_route != self.binding.stream_route
                 || replay.stream_generation != self.binding.stream_generation
                 || replay.stream_seq != stream_seq
+                || replay.signed_frame_sha256 != signed_frame_sha256
                 || replay.ciphertext_sha256 != ciphertext_sha256
             {
                 let mut quarantined = self.clone();
@@ -539,6 +570,7 @@ impl DurableStreamBindingV1 {
             stream_generation: self.binding.stream_generation,
             stream_seq,
             sender_counter,
+            signed_frame_sha256,
             ciphertext_sha256,
         };
         let insertion = match pending
@@ -592,6 +624,7 @@ impl DurableStreamBindingV1 {
             added.key_directory_revision,
             added.stream_seq,
             added.sender_counter,
+            added.signed_frame_sha256,
             added.ciphertext_sha256,
         )?;
         if disposition != StreamPublishDisposition::Fresh || replayed != *self {
@@ -628,6 +661,7 @@ impl DurableStreamBindingV1 {
             added.key_directory_revision,
             added.stream_seq,
             added.sender_counter,
+            added.signed_frame_sha256,
             added.ciphertext_sha256,
         )?;
         if disposition != StreamPublishDisposition::Fresh
@@ -656,13 +690,15 @@ impl DurableStreamBindingV1 {
 
     /// 在 AEAD open 前只接纳当前 shared-key scope 的 exact-next epoch/revision barrier
     /// carrier。future scope 不从网络输入推导，只允许由当前 durable binding 唯一计算出的
-    /// `(same purpose, epoch+1, revision+1)`；pending tuple 在 activation 前独立持久化。
-    pub(crate) fn admit_pending_epoch_barrier(
+    /// `(same purpose, epoch+1, revision+1)`；pending tuple 在 activation 前独立持久化完整
+    /// signed-frame/ciphertext identity。
+    pub(crate) fn admit_pending_epoch_barrier_with_signed_frame(
         &self,
         key_id: KeyId,
         key_directory_revision: KeyDirectoryRevision,
         stream_seq: u64,
         sender_counter: u64,
+        signed_frame_sha256: [u8; 32],
         ciphertext_sha256: [u8; 32],
     ) -> Result<(Self, StreamPublishDisposition), RemoteStreamStateError> {
         self.validate()?;
@@ -683,6 +719,7 @@ impl DurableStreamBindingV1 {
             .map_err(|_| RemoteStreamStateError::InvalidCanonical)?;
         if self.replay_quarantined
             || self.inner_observed != self.inner_applied
+            || signed_frame_sha256 == [0; 32]
             || ciphertext_sha256 == [0; 32]
             || key_id.purpose != self.binding.key_id.purpose
             || key_id.epoch != expected_epoch
@@ -700,6 +737,7 @@ impl DurableStreamBindingV1 {
             stream_generation: self.binding.stream_generation,
             stream_seq,
             sender_counter,
+            signed_frame_sha256,
             ciphertext_sha256,
         };
         if let Some(existing) = self.pending_epoch_barrier {
@@ -719,6 +757,7 @@ impl DurableStreamBindingV1 {
                 return Err(RemoteStreamStateError::InvalidCanonical);
             }
             if existing_tuple.sender_counter == sender_counter
+                && existing_tuple.signed_frame_sha256 == signed_frame_sha256
                 && existing_tuple.ciphertext_sha256 == ciphertext_sha256
             {
                 return Ok((self.clone(), StreamPublishDisposition::PendingDuplicate));
@@ -754,6 +793,25 @@ impl DurableStreamBindingV1 {
         });
         pending.validate()?;
         Ok((pending, StreamPublishDisposition::Fresh))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_pending_epoch_barrier(
+        &self,
+        key_id: KeyId,
+        key_directory_revision: KeyDirectoryRevision,
+        stream_seq: u64,
+        sender_counter: u64,
+        ciphertext_sha256: [u8; 32],
+    ) -> Result<(Self, StreamPublishDisposition), RemoteStreamStateError> {
+        self.admit_pending_epoch_barrier_with_signed_frame(
+            key_id,
+            key_directory_revision,
+            stream_seq,
+            sender_counter,
+            ciphertext_sha256,
+            ciphertext_sha256,
+        )
     }
 
     /// 只在 pending carrier 已完成新 key AEAD open，且 payload 是精确 epoch barrier 时原子
@@ -970,6 +1028,77 @@ impl DurableStreamBindingV1 {
         Ok((committed, mode))
     }
 
+    /// ADKS 已 `Resolved` 后，以 observation 的完整 publication/replay identity 判定
+    /// `DirectoryRevisionAdvance` 是否拥有 outer-only commit 权限。当前 binding 必须已经由
+    /// UpdateSet rewrap 到 exact `to_revision`；唯一可提交的 predecessor tuple 仍绑定
+    /// `from_revision`。没有 tuple 表示普通 higher-revision business Publish，保持不推进。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_directory_revision_advance_outer(
+        &self,
+        from_revision: KeyDirectoryRevision,
+        to_revision: KeyDirectoryRevision,
+        key_id: KeyId,
+        stream_route: StreamRouteId,
+        stream_generation: StreamGenerationId,
+        stream_seq: u64,
+        sender_counter: u64,
+        signed_frame_sha256: [u8; 32],
+        ciphertext_sha256: [u8; 32],
+    ) -> Result<DirectoryAdvanceOuterResolution, RemoteStreamStateError> {
+        self.validate()?;
+        if self.replay_quarantined
+            || self.pending_epoch_barrier.is_some()
+            || from_revision.value() == 0
+            || from_revision.next().ok() != Some(to_revision)
+            || key_id.purpose != KeyPurpose::Catalog
+            || key_id.epoch == 0
+            || signed_frame_sha256 == [0; 32]
+            || ciphertext_sha256 == [0; 32]
+            || StreamCursor::At(stream_seq).checked_next().is_err()
+        {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+
+        let replay = self.replay_entries.iter().find(|entry| {
+            entry.stream_route == stream_route
+                && entry.stream_generation == stream_generation
+                && entry.stream_seq == stream_seq
+        });
+        if let Some(replay) = replay
+            && (replay.key_directory_revision != from_revision
+                || replay.key_id != key_id
+                || replay.sender_counter != sender_counter
+                || replay.signed_frame_sha256 != signed_frame_sha256
+                || replay.ciphertext_sha256 != ciphertext_sha256)
+        {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+        let Some(_replay) = replay else {
+            // 普通 higher-revision business Publish 不会先以旧 revision 进入 durable
+            // replay window。rotation 还可能让 binding 停在旧 epoch/revision 等待
+            // EpochBarrier，因此必须在校验 notice 专属 candidate 轴之前零写返回。
+            return Ok(DirectoryAdvanceOuterResolution::NotAdmitted);
+        };
+        if self.binding.key_directory_revision != to_revision
+            || self.binding.key_id != key_id
+            || self.binding.stream_route != stream_route
+            || self.binding.stream_generation != stream_generation
+        {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+
+        if cursor_cmp(self.outer_applied, StreamCursor::At(stream_seq)) != Ordering::Less {
+            return Ok(DirectoryAdvanceOuterResolution::AlreadyApplied);
+        }
+        if self.outer_applied.checked_next().ok() != Some(stream_seq) {
+            return Err(RemoteStreamStateError::InvalidCanonical);
+        }
+        let mut committed = self.clone();
+        committed.outer_applied = StreamCursor::At(stream_seq);
+        committed.validate()?;
+        Ok(DirectoryAdvanceOuterResolution::Commit(Box::new(committed)))
+    }
+
     /// 提交一条已经完成 signature、durable replay admission、AEAD 与 compact carrier
     /// 校验的 live `TransferPart`。中间片只推进 exact-next Relay outer cut；完成片另按
     /// authenticated durable source 的完整连续范围推进 inner observed/applied。该入口不
@@ -1088,17 +1217,30 @@ impl DurableStreamBindingV1 {
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, RemoteStreamStateError> {
-        self.canonical_v4_or_v5_bytes(STREAM_STATE_VERSION)
+        self.canonical_v4_v5_or_v6_bytes(STREAM_STATE_VERSION)
     }
 
     fn legacy_v4_canonical_bytes(&self) -> Result<Vec<u8>, RemoteStreamStateError> {
-        self.canonical_v4_or_v5_bytes(EPOCH_BARRIER_STREAM_STATE_VERSION)
+        self.canonical_v4_v5_or_v6_bytes(EPOCH_BARRIER_STREAM_STATE_VERSION)
     }
 
-    fn canonical_v4_or_v5_bytes(&self, version: u16) -> Result<Vec<u8>, RemoteStreamStateError> {
+    fn legacy_v5_canonical_bytes(&self) -> Result<Vec<u8>, RemoteStreamStateError> {
+        self.canonical_v4_v5_or_v6_bytes(EMERGENCY_REPLAY_STREAM_STATE_VERSION)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy_v5_canonical_bytes_for_test(
+        &self,
+    ) -> Result<Vec<u8>, RemoteStreamStateError> {
+        self.legacy_v5_canonical_bytes()
+    }
+
+    fn canonical_v4_v5_or_v6_bytes(&self, version: u16) -> Result<Vec<u8>, RemoteStreamStateError> {
         if !matches!(
             version,
-            EPOCH_BARRIER_STREAM_STATE_VERSION | STREAM_STATE_VERSION
+            EPOCH_BARRIER_STREAM_STATE_VERSION
+                | EMERGENCY_REPLAY_STREAM_STATE_VERSION
+                | STREAM_STATE_VERSION
         ) || (version == EPOCH_BARRIER_STREAM_STATE_VERSION
             && self.emergency_replay_debt.is_some())
         {
@@ -1118,14 +1260,22 @@ impl DurableStreamBindingV1 {
         body.push(u8::from(self.replay_quarantined));
         put_replay_count(&mut body, self.replay_entries.len())?;
         for replay in &self.replay_entries {
-            put_replay_tuple_v4(&mut body, replay);
+            if version == STREAM_STATE_VERSION {
+                put_replay_tuple_v6(&mut body, replay);
+            } else {
+                put_replay_tuple_v4(&mut body, replay);
+            }
         }
         put_retired_subscriptions(&mut body, &self.retired_subscriptions)?;
         match self.pending_epoch_barrier {
             None => body.push(0),
             Some(pending) => {
                 body.push(1);
-                put_replay_tuple_v4(&mut body, &pending.replay_tuple);
+                if version == STREAM_STATE_VERSION {
+                    put_replay_tuple_v6(&mut body, &pending.replay_tuple);
+                } else {
+                    put_replay_tuple_v4(&mut body, &pending.replay_tuple);
+                }
                 body.push(u8::from(pending.replay_quarantined));
             }
         }
@@ -1139,12 +1289,24 @@ impl DurableStreamBindingV1 {
                 put_bytes(&mut body, &ack)?;
             }
         }
-        if version == STREAM_STATE_VERSION {
+        if matches!(
+            version,
+            EMERGENCY_REPLAY_STREAM_STATE_VERSION | STREAM_STATE_VERSION
+        ) {
             match self.emergency_replay_debt {
                 None => body.push(0),
                 Some(hash) => {
                     body.push(1);
-                    body.extend_from_slice(&hash);
+                    if version == EMERGENCY_REPLAY_STREAM_STATE_VERSION {
+                        let replay = self
+                            .replay_entries
+                            .iter()
+                            .find(|entry| emergency_replay_debt_hash(entry) == hash)
+                            .ok_or(RemoteStreamStateError::InvalidCanonical)?;
+                        body.extend_from_slice(&legacy_emergency_replay_debt_hash(replay));
+                    } else {
+                        body.extend_from_slice(&hash);
+                    }
                 }
             }
         }
@@ -1222,6 +1384,7 @@ impl DurableStreamBindingV1 {
                 | PREVIOUS_STREAM_STATE_VERSION
                 | RETIRED_STREAM_STATE_VERSION
                 | EPOCH_BARRIER_STREAM_STATE_VERSION
+                | EMERGENCY_REPLAY_STREAM_STATE_VERSION
                 | STREAM_STATE_VERSION
         ) || (version == LEGACY_STREAM_STATE_VERSION
             && bytes.len() > MAX_LEGACY_DURABLE_STREAM_STATE_BYTES)
@@ -1288,6 +1451,7 @@ impl DurableStreamBindingV1 {
             PREVIOUS_STREAM_STATE_VERSION
             | RETIRED_STREAM_STATE_VERSION
             | EPOCH_BARRIER_STREAM_STATE_VERSION
+            | EMERGENCY_REPLAY_STREAM_STATE_VERSION
             | STREAM_STATE_VERSION => {
                 let inner_observed = decoder.inner_cursor()?;
                 let inner_applied = decoder.inner_cursor()?;
@@ -1303,13 +1467,13 @@ impl DurableStreamBindingV1 {
                 }
                 let mut replay_entries = Vec::with_capacity(replay_count);
                 for _ in 0..replay_count {
-                    replay_entries.push(
-                        if matches!(
-                            version,
-                            EPOCH_BARRIER_STREAM_STATE_VERSION | STREAM_STATE_VERSION
-                        ) {
+                    replay_entries.push(match version {
+                        STREAM_STATE_VERSION => decode_replay_tuple_v6(&mut decoder)?,
+                        EPOCH_BARRIER_STREAM_STATE_VERSION
+                        | EMERGENCY_REPLAY_STREAM_STATE_VERSION => {
                             decode_replay_tuple_v4(&mut decoder)?
-                        } else {
+                        }
+                        PREVIOUS_STREAM_STATE_VERSION | RETIRED_STREAM_STATE_VERSION => {
                             DurableStreamReplayTupleV1 {
                                 key_id: binding.key_id,
                                 key_directory_revision: binding.key_directory_revision,
@@ -1317,15 +1481,18 @@ impl DurableStreamBindingV1 {
                                 stream_generation: StreamGenerationId::from_bytes(decoder.fixed()?),
                                 stream_seq: decoder.u64()?,
                                 sender_counter: decoder.u64()?,
+                                signed_frame_sha256: [0; 32],
                                 ciphertext_sha256: decoder.fixed()?,
                             }
-                        },
-                    );
+                        }
+                        _ => return Err(RemoteStreamStateError::InvalidCanonical),
+                    });
                 }
                 let retired_subscriptions = if matches!(
                     version,
                     RETIRED_STREAM_STATE_VERSION
                         | EPOCH_BARRIER_STREAM_STATE_VERSION
+                        | EMERGENCY_REPLAY_STREAM_STATE_VERSION
                         | STREAM_STATE_VERSION
                 ) {
                     decode_retired_subscriptions(&mut decoder)?
@@ -1334,12 +1501,18 @@ impl DurableStreamBindingV1 {
                 };
                 let (pending_epoch_barrier, latest_stream_applied_ack_basis) = if matches!(
                     version,
-                    EPOCH_BARRIER_STREAM_STATE_VERSION | STREAM_STATE_VERSION
+                    EPOCH_BARRIER_STREAM_STATE_VERSION
+                        | EMERGENCY_REPLAY_STREAM_STATE_VERSION
+                        | STREAM_STATE_VERSION
                 ) {
                     let pending = match decoder.u8()? {
                         0 => None,
                         1 => Some(PendingEpochBarrierV1 {
-                            replay_tuple: decode_replay_tuple_v4(&mut decoder)?,
+                            replay_tuple: if version == STREAM_STATE_VERSION {
+                                decode_replay_tuple_v6(&mut decoder)?
+                            } else {
+                                decode_replay_tuple_v4(&mut decoder)?
+                            },
                             replay_quarantined: decode_bool(&mut decoder)?,
                         }),
                         _ => return Err(RemoteStreamStateError::InvalidCanonical),
@@ -1358,7 +1531,10 @@ impl DurableStreamBindingV1 {
                 } else {
                     (None, None)
                 };
-                let emergency_replay_debt = if version == STREAM_STATE_VERSION {
+                let emergency_replay_debt = if matches!(
+                    version,
+                    EMERGENCY_REPLAY_STREAM_STATE_VERSION | STREAM_STATE_VERSION
+                ) {
                     match decoder.u8()? {
                         0 => None,
                         1 => Some(decoder.fixed()?),
@@ -1400,6 +1576,7 @@ impl DurableStreamBindingV1 {
             PREVIOUS_STREAM_STATE_VERSION => value.legacy_v2_canonical_bytes()?,
             RETIRED_STREAM_STATE_VERSION => value.legacy_v3_canonical_bytes()?,
             EPOCH_BARRIER_STREAM_STATE_VERSION => value.legacy_v4_canonical_bytes()?,
+            EMERGENCY_REPLAY_STREAM_STATE_VERSION => value.legacy_v5_canonical_bytes()?,
             STREAM_STATE_VERSION => value.canonical_bytes()?,
             _ => return Err(RemoteStreamStateError::InvalidCanonical),
         };
@@ -1822,17 +1999,43 @@ fn put_replay_tuple_v4(output: &mut Vec<u8>, replay: &DurableStreamReplayTupleV1
     put_replay_tuple_legacy(output, replay);
 }
 
-fn emergency_replay_debt_hash(replay: &DurableStreamReplayTupleV1) -> [u8; 32] {
+fn put_replay_tuple_v6(output: &mut Vec<u8>, replay: &DurableStreamReplayTupleV1) {
+    put_replay_tuple_v4(output, replay);
+    output.extend_from_slice(&replay.signed_frame_sha256);
+}
+
+fn legacy_emergency_replay_debt_hash(replay: &DurableStreamReplayTupleV1) -> [u8; 32] {
     let mut canonical = Vec::with_capacity(
-        EMERGENCY_REPLAY_DEBT_HASH_DOMAIN.len() + DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES,
+        LEGACY_EMERGENCY_REPLAY_DEBT_HASH_DOMAIN.len() + DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES,
     );
-    canonical.extend_from_slice(EMERGENCY_REPLAY_DEBT_HASH_DOMAIN);
+    canonical.extend_from_slice(LEGACY_EMERGENCY_REPLAY_DEBT_HASH_DOMAIN);
     put_replay_tuple_v4(&mut canonical, replay);
     debug_assert_eq!(
         canonical.len(),
-        EMERGENCY_REPLAY_DEBT_HASH_DOMAIN.len() + DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES,
+        LEGACY_EMERGENCY_REPLAY_DEBT_HASH_DOMAIN.len() + DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES,
     );
     sha256(&canonical)
+}
+
+fn current_emergency_replay_debt_hash(replay: &DurableStreamReplayTupleV1) -> [u8; 32] {
+    let mut canonical = Vec::with_capacity(
+        EMERGENCY_REPLAY_DEBT_HASH_DOMAIN.len() + DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES,
+    );
+    canonical.extend_from_slice(EMERGENCY_REPLAY_DEBT_HASH_DOMAIN);
+    put_replay_tuple_v6(&mut canonical, replay);
+    debug_assert_eq!(
+        canonical.len(),
+        EMERGENCY_REPLAY_DEBT_HASH_DOMAIN.len() + DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES,
+    );
+    sha256(&canonical)
+}
+
+fn emergency_replay_debt_hash(replay: &DurableStreamReplayTupleV1) -> [u8; 32] {
+    if replay.signed_frame_sha256 == [0; 32] {
+        legacy_emergency_replay_debt_hash(replay)
+    } else {
+        current_emergency_replay_debt_hash(replay)
+    }
 }
 
 fn decode_replay_tuple_v4(
@@ -1848,8 +2051,17 @@ fn decode_replay_tuple_v4(
         stream_generation: StreamGenerationId::from_bytes(decoder.fixed()?),
         stream_seq: decoder.u64()?,
         sender_counter: decoder.u64()?,
+        signed_frame_sha256: [0; 32],
         ciphertext_sha256: decoder.fixed()?,
     })
+}
+
+fn decode_replay_tuple_v6(
+    decoder: &mut Decoder<'_>,
+) -> Result<DurableStreamReplayTupleV1, RemoteStreamStateError> {
+    let mut replay = decode_replay_tuple_v4(decoder)?;
+    replay.signed_frame_sha256 = decoder.fixed()?;
+    Ok(replay)
 }
 
 fn put_retired_subscriptions(
@@ -2176,7 +2388,7 @@ mod tests {
         (count_offset, entries_offset)
     }
 
-    fn v5_replay_entry_offsets(canonical: &[u8]) -> (usize, usize) {
+    fn v6_replay_entry_offsets(canonical: &[u8]) -> (usize, usize) {
         assert_eq!(
             u16::from_be_bytes([canonical[4], canonical[5]]),
             STREAM_STATE_VERSION
@@ -2536,6 +2748,7 @@ mod tests {
                     stream_generation: state.binding.stream_generation,
                     stream_seq: counter,
                     sender_counter: counter,
+                    signed_frame_sha256: [u8::try_from(counter % 251 + 1).unwrap(); 32],
                     ciphertext_sha256: [u8::try_from(counter % 251 + 1).unwrap(); 32],
                 }
             }),
@@ -2687,6 +2900,7 @@ mod tests {
                     stream_generation: state.binding.stream_generation,
                     stream_seq: 0,
                     sender_counter: 10,
+                    signed_frame_sha256: [0xc1; 32],
                     ciphertext_sha256: [0xc1; 32],
                 },
                 DurableStreamReplayTupleV1 {
@@ -2696,6 +2910,7 @@ mod tests {
                     stream_generation: state.binding.stream_generation,
                     stream_seq: 1,
                     sender_counter: 11,
+                    signed_frame_sha256: [0xc2; 32],
                     ciphertext_sha256: [0xc2; 32],
                 },
                 DurableStreamReplayTupleV1 {
@@ -2705,6 +2920,7 @@ mod tests {
                     stream_generation: state.binding.stream_generation,
                     stream_seq: 2,
                     sender_counter: 12,
+                    signed_frame_sha256: [0xc3; 32],
                     ciphertext_sha256: [0xc3; 32],
                 },
             ],
@@ -2775,6 +2991,7 @@ mod tests {
                     0,
                     10,
                     [0x71; 32],
+                    [0x71; 32],
                 )
                 .unwrap()
                 .1,
@@ -2787,6 +3004,7 @@ mod tests {
                     KeyDirectoryRevision::new(4),
                     1,
                     30,
+                    [0x75; 32],
                     [0x75; 32],
                 )
                 .is_err(),
@@ -2915,6 +3133,7 @@ mod tests {
                 stream_generation: initial.binding.stream_generation,
                 stream_seq: 0,
                 sender_counter: 0,
+                signed_frame_sha256: [0x41; 32],
                 ciphertext_sha256: [0x41; 32],
             }],
             ..initial.clone()
@@ -2941,6 +3160,7 @@ mod tests {
                 stream_generation: initial.binding.stream_generation,
                 stream_seq: 1,
                 sender_counter: 0,
+                signed_frame_sha256: [0x42; 32],
                 ciphertext_sha256: [0x42; 32],
             }],
             ..initial
@@ -2948,6 +3168,207 @@ mod tests {
         assert_eq!(
             skipped.canonical_bytes().unwrap_err(),
             RemoteStreamStateError::InvalidCanonical
+        );
+    }
+
+    #[test]
+    fn v6_replay_tuple_roundtrips_signed_frame_identity_and_conflicts_on_hash_change() {
+        let initial = catalog(0x72);
+        let revision = initial.binding().key_directory_revision;
+        let (pending, disposition) = initial
+            .admit_publish_at_authenticated_revision(revision, 0, 17, [0xa1; 32], [0xb1; 32])
+            .expect("admit fully bound v6 replay tuple");
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+        let tuple = pending.replay_tuple().expect("pending replay tuple");
+        assert_eq!(tuple.signed_frame_sha256(), [0xa1; 32]);
+        assert_eq!(tuple.ciphertext_sha256(), [0xb1; 32]);
+
+        let canonical = pending.canonical_bytes().expect("encode v6 replay tuple");
+        assert_eq!(
+            u16::from_be_bytes([canonical[4], canonical[5]]),
+            STREAM_STATE_VERSION,
+        );
+        let reopened = DurableStreamBindingV1::from_canonical_bytes(&canonical)
+            .expect("reopen v6 replay tuple");
+        assert_eq!(reopened, pending);
+        assert_eq!(
+            reopened
+                .admit_publish_at_authenticated_revision(revision, 0, 17, [0xa1; 32], [0xb1; 32],)
+                .unwrap()
+                .1,
+            StreamPublishDisposition::PendingDuplicate,
+        );
+
+        let (quarantined, disposition) = reopened
+            .admit_publish_at_authenticated_revision(revision, 0, 17, [0xa2; 32], [0xb1; 32])
+            .expect("signed-frame conflict must become durable quarantine");
+        assert_eq!(disposition, StreamPublishDisposition::NonceReuseQuarantined);
+        assert!(quarantined.replay_quarantined());
+        assert!(
+            initial
+                .admit_publish_at_authenticated_revision(revision, 0, 17, [0; 32], [0xb1; 32],)
+                .is_err(),
+            "fresh admission must reject the legacy zero-hash sentinel",
+        );
+    }
+
+    #[test]
+    fn v6_pending_epoch_barrier_binds_signed_frame_identity() {
+        let initial = catalog(0x73);
+        let barrier = next_epoch_barrier(&initial);
+        let key_id = KeyId {
+            purpose: initial.binding().key_id.purpose,
+            epoch: barrier.new_epoch,
+        };
+        let (pending, disposition) = initial
+            .admit_pending_epoch_barrier_with_signed_frame(
+                key_id,
+                barrier.key_directory_revision,
+                0,
+                19,
+                [0xc1; 32],
+                [0xd1; 32],
+            )
+            .expect("admit fully bound staged barrier tuple");
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+        let canonical = pending.canonical_bytes().expect("encode staged v6 tuple");
+        let reopened = DurableStreamBindingV1::from_canonical_bytes(&canonical)
+            .expect("reopen staged v6 tuple");
+        let tuple = reopened
+            .pending_epoch_barrier()
+            .expect("pending barrier")
+            .replay_tuple();
+        assert_eq!(tuple.signed_frame_sha256(), [0xc1; 32]);
+        assert_eq!(tuple.ciphertext_sha256(), [0xd1; 32]);
+        assert_eq!(
+            reopened
+                .admit_pending_epoch_barrier_with_signed_frame(
+                    key_id,
+                    barrier.key_directory_revision,
+                    0,
+                    19,
+                    [0xc1; 32],
+                    [0xd1; 32],
+                )
+                .unwrap()
+                .1,
+            StreamPublishDisposition::PendingDuplicate,
+        );
+
+        let (quarantined, disposition) = reopened
+            .admit_pending_epoch_barrier_with_signed_frame(
+                key_id,
+                barrier.key_directory_revision,
+                0,
+                19,
+                [0xc2; 32],
+                [0xd1; 32],
+            )
+            .expect("staged signed-frame conflict must become durable quarantine");
+        assert_eq!(disposition, StreamPublishDisposition::NonceReuseQuarantined);
+        assert!(
+            quarantined
+                .pending_epoch_barrier()
+                .expect("quarantined pending barrier")
+                .replay_quarantined(),
+        );
+    }
+
+    #[test]
+    fn legacy_v4_v5_zero_signed_hash_never_becomes_duplicate_after_v6_upgrade() {
+        let initial = catalog(0x74);
+        let revision = initial.binding().key_directory_revision;
+        let (fresh, disposition) = initial
+            .admit_publish_at_authenticated_revision(revision, 0, 23, [0xe1; 32], [0xf1; 32])
+            .expect("construct current replay tuple for legacy projection");
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+
+        let legacy_v4 = fresh
+            .legacy_v4_canonical_bytes()
+            .expect("encode exact legacy v4 fixture");
+        assert_eq!(
+            u16::from_be_bytes([legacy_v4[4], legacy_v4[5]]),
+            EPOCH_BARRIER_STREAM_STATE_VERSION,
+        );
+        let reopened_v4 = DurableStreamBindingV1::from_canonical_bytes(&legacy_v4)
+            .expect("reopen exact legacy v4 fixture");
+        assert_eq!(
+            reopened_v4
+                .replay_tuple()
+                .expect("legacy v4 tuple")
+                .signed_frame_sha256(),
+            [0; 32],
+        );
+        assert_eq!(
+            reopened_v4
+                .admit_publish_at_authenticated_revision(revision, 0, 23, [0xe1; 32], [0xf1; 32],)
+                .unwrap()
+                .1,
+            StreamPublishDisposition::NonceReuseQuarantined,
+            "legacy v4 tuple cannot authenticate a later signed frame",
+        );
+        let upgraded_v4 = DurableStreamBindingV1::from_canonical_bytes(
+            &reopened_v4
+                .canonical_bytes()
+                .expect("upgrade v4 tuple to v6"),
+        )
+        .expect("reopen upgraded v4 tuple");
+        assert_eq!(
+            upgraded_v4
+                .replay_tuple()
+                .expect("upgraded legacy tuple")
+                .signed_frame_sha256(),
+            [0; 32],
+        );
+        assert_eq!(
+            upgraded_v4
+                .admit_publish_at_authenticated_revision(revision, 0, 23, [0xe1; 32], [0xf1; 32],)
+                .unwrap()
+                .1,
+            StreamPublishDisposition::NonceReuseQuarantined,
+            "v6 re-encoding must preserve the legacy fail-close sentinel",
+        );
+
+        let debt = fresh
+            .with_emergency_replay_debt_from(&initial)
+            .expect("construct legacy v5 debt fixture");
+        let legacy_v5_base = initial
+            .legacy_v5_canonical_bytes()
+            .expect("encode legacy v5 base");
+        let legacy_v5 = debt
+            .legacy_v5_canonical_bytes()
+            .expect("encode exact legacy v5 debt fixture");
+        assert_eq!(
+            u16::from_be_bytes([legacy_v5[4], legacy_v5[5]]),
+            EMERGENCY_REPLAY_STREAM_STATE_VERSION,
+        );
+        assert_eq!(
+            legacy_v5.len() - legacy_v5_base.len(),
+            DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES,
+            "legacy v5 debt remains byte-exact at 129 bytes",
+        );
+        let reopened_v5 = DurableStreamBindingV1::from_canonical_bytes(&legacy_v5)
+            .expect("reopen exact legacy v5 debt fixture");
+        assert_eq!(
+            reopened_v5
+                .replay_tuple()
+                .expect("legacy v5 tuple")
+                .signed_frame_sha256(),
+            [0; 32],
+        );
+        let upgraded_v5 = DurableStreamBindingV1::from_canonical_bytes(
+            &reopened_v5
+                .canonical_bytes()
+                .expect("upgrade v5 debt to v6"),
+        )
+        .expect("reopen upgraded v5 debt");
+        assert_eq!(
+            upgraded_v5
+                .admit_publish_at_authenticated_revision(revision, 0, 23, [0xe1; 32], [0xf1; 32],)
+                .unwrap()
+                .1,
+            StreamPublishDisposition::NonceReuseQuarantined,
+            "legacy v5 debt cannot bless a new signed frame after v6 upgrade",
         );
     }
 
@@ -3043,14 +3464,14 @@ mod tests {
     }
 
     #[test]
-    fn v5_emergency_replay_debt_roundtrips_and_rejects_missing_duplicate_or_tampered_match() {
+    fn v6_emergency_replay_debt_roundtrips_and_rejects_missing_duplicate_or_tampered_match() {
         let initial = catalog(0x3a);
         let initial_len = initial.canonical_bytes().unwrap().len();
         let (fresh, disposition) = initial.admit_publish(0, 17, [0x61; 32]).unwrap();
         assert_eq!(disposition, StreamPublishDisposition::Fresh);
         assert_eq!(
             fresh.canonical_bytes().unwrap().len() - initial_len,
-            DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES,
+            DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES,
         );
 
         let debt = fresh
@@ -3059,13 +3480,13 @@ mod tests {
         assert!(debt.emergency_replay_debt.is_some());
         assert_eq!(
             debt.emergency_replay_debt_credit_bytes(),
-            DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES,
+            DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES,
         );
         let canonical = debt.canonical_bytes().unwrap();
         assert_eq!(
             canonical.len() - initial_len,
-            DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES,
-            "actual V5 encoded delta must equal the exact debt credit",
+            DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES,
+            "actual V6 encoded delta must equal the exact debt credit",
         );
         assert_eq!(
             DurableStreamBindingV1::from_canonical_bytes(&canonical).unwrap(),
@@ -3084,10 +3505,10 @@ mod tests {
             RemoteStreamStateError::InvalidCanonical,
         );
 
-        let (count_offset, entries_offset) = v5_replay_entry_offsets(&canonical);
+        let (count_offset, entries_offset) = v6_replay_entry_offsets(&canonical);
         let mut missing_match = canonical.clone();
         missing_match[count_offset..count_offset + 4].copy_from_slice(&0_u32.to_be_bytes());
-        missing_match.drain(entries_offset..entries_offset + DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES);
+        missing_match.drain(entries_offset..entries_offset + DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES);
         rewrite_declared_stream_state_body_len(&mut missing_match);
         assert_eq!(
             DurableStreamBindingV1::from_canonical_bytes(&missing_match).unwrap_err(),
@@ -3097,11 +3518,11 @@ mod tests {
         let mut duplicate_match = canonical.clone();
         duplicate_match[count_offset..count_offset + 4].copy_from_slice(&2_u32.to_be_bytes());
         let replay = duplicate_match
-            [entries_offset..entries_offset + DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES]
+            [entries_offset..entries_offset + DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES]
             .to_vec();
         duplicate_match.splice(
-            entries_offset + DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES
-                ..entries_offset + DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES,
+            entries_offset + DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES
+                ..entries_offset + DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES,
             replay,
         );
         rewrite_declared_stream_state_body_len(&mut duplicate_match);
@@ -3249,6 +3670,7 @@ mod tests {
             stream_generation: acked.binding.stream_generation,
             stream_seq: 9,
             sender_counter: 3,
+            signed_frame_sha256: [0x43; 32],
             ciphertext_sha256: [0x43; 32],
         };
         let lagging_ack = DurableStreamBindingV1 {
@@ -3370,6 +3792,131 @@ mod tests {
                     cursor: StreamCursor::At(11),
                 })
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn outer_only_control_commit_preserves_both_inner_cursors_and_replay_identity() {
+        let mut raw = binding(
+            StreamRouteId::from_bytes([0x34; 16]),
+            0x44,
+            RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(5),
+            },
+        );
+        raw.stream_cursor = StreamCursor::At(7);
+        let state = DurableStreamBindingV1::from_subscription_bootstrap(
+            raw,
+            RuntimeInnerCursor::Catalog {
+                cursor: StreamCursor::At(8),
+            },
+        )
+        .expect("install overlap-capable Catalog state");
+        let (pending_at_from, disposition) = state
+            .admit_publish(8, 108, [0x81; 32])
+            .expect("durably admit revision advance control");
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+        let pending = pending_at_from
+            .with_rewrapped_key_revision(KeyDirectoryRevision::new(5))
+            .expect("install exact-next UpdateSet rewrap");
+        let before_observed = pending.inner_observed().clone();
+        let before_applied = pending.inner_applied().clone();
+        let before_replay = pending.replay_tuple();
+
+        let DirectoryAdvanceOuterResolution::Commit(committed) = pending
+            .resolve_directory_revision_advance_outer(
+                KeyDirectoryRevision::new(4),
+                KeyDirectoryRevision::new(5),
+                pending.binding().key_id,
+                pending.binding().stream_route,
+                pending.binding().stream_generation,
+                8,
+                108,
+                [0x81; 32],
+                [0x81; 32],
+            )
+            .expect("classify exact outer-only control")
+        else {
+            panic!("exact admitted control must produce an outer commit candidate");
+        };
+        assert_eq!(committed.outer_applied(), StreamCursor::At(8));
+        assert_eq!(committed.inner_observed(), &before_observed);
+        assert_eq!(committed.inner_applied(), &before_applied);
+        assert_eq!(committed.replay_tuple(), before_replay);
+        assert_eq!(
+            committed
+                .resolve_directory_revision_advance_outer(
+                    KeyDirectoryRevision::new(4),
+                    KeyDirectoryRevision::new(5),
+                    committed.binding().key_id,
+                    committed.binding().stream_route,
+                    committed.binding().stream_generation,
+                    8,
+                    108,
+                    [0x81; 32],
+                    [0x81; 32],
+                )
+                .unwrap(),
+            DirectoryAdvanceOuterResolution::AlreadyApplied,
+        );
+        assert!(
+            pending
+                .resolve_directory_revision_advance_outer(
+                    KeyDirectoryRevision::new(4),
+                    KeyDirectoryRevision::new(5),
+                    pending.binding().key_id,
+                    pending.binding().stream_route,
+                    pending.binding().stream_generation,
+                    8,
+                    108,
+                    [0xee; 32],
+                    [0x81; 32],
+                )
+                .is_err(),
+            "matching seq with a different signed-frame hash must fail closed",
+        );
+
+        let ordinary_higher = state
+            .with_rewrapped_key_revision(KeyDirectoryRevision::new(5))
+            .expect("ordinary higher UpdateSet rewrap");
+        assert_eq!(
+            ordinary_higher
+                .resolve_directory_revision_advance_outer(
+                    KeyDirectoryRevision::new(4),
+                    KeyDirectoryRevision::new(5),
+                    ordinary_higher.binding().key_id,
+                    ordinary_higher.binding().stream_route,
+                    ordinary_higher.binding().stream_generation,
+                    8,
+                    108,
+                    [0x81; 32],
+                    [0x81; 32],
+                )
+                .unwrap(),
+            DirectoryAdvanceOuterResolution::NotAdmitted,
+            "ordinary higher Publish has no durable predecessor tuple",
+        );
+
+        let rotated_key = KeyId {
+            purpose: state.binding().key_id.purpose,
+            epoch: state.binding().key_id.epoch + 1,
+        };
+        assert_eq!(
+            state
+                .resolve_directory_revision_advance_outer(
+                    KeyDirectoryRevision::new(4),
+                    KeyDirectoryRevision::new(5),
+                    rotated_key,
+                    state.binding().stream_route,
+                    state.binding().stream_generation,
+                    8,
+                    108,
+                    [0x81; 32],
+                    [0x81; 32],
+                )
+                .unwrap(),
+            DirectoryAdvanceOuterResolution::NotAdmitted,
+            "ordinary rotated-key Publish waits for EpochBarrier and has no notice replay tuple",
         );
     }
 
@@ -3556,7 +4103,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_bootstrap_state_decodes_and_the_next_write_upgrades_to_v4() {
+    fn legacy_v1_bootstrap_state_decodes_and_the_next_write_upgrades_to_v6() {
         let mut binding = binding(
             StreamRouteId::from_bytes([0x35; 16]),
             0x45,
@@ -3801,6 +4348,7 @@ mod tests {
                 stream_generation,
                 stream_seq: value,
                 sender_counter: value,
+                signed_frame_sha256: [u8::try_from(value % 251 + 1).unwrap(); 32],
                 ciphertext_sha256: [u8::try_from(value % 251 + 1).unwrap(); 32],
             })
             .collect();
@@ -3907,7 +4455,11 @@ mod tests {
         assert_eq!(u16::from_be_bytes([v2[4], v2[5]]), 2);
 
         let migrated = DurableStreamBindingV1::from_canonical_bytes(&v2).unwrap();
-        assert_eq!(migrated, state);
+        let mut expected = state;
+        for replay in &mut expected.replay_entries {
+            replay.signed_frame_sha256 = [0; 32];
+        }
+        assert_eq!(migrated, expected);
         assert!(migrated.retired_subscriptions().is_empty());
         let upgraded = migrated.canonical_bytes().unwrap();
         assert_eq!(

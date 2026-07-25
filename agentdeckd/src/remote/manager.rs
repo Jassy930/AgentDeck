@@ -1582,6 +1582,11 @@ impl RemoteManager {
                     return Err(error);
                 }
             };
+            let delivery_commit_rx = state
+                .pairing
+                .as_ref()
+                .ok_or_else(|| admin_error(REMOTE_STATE_CONFLICT))?
+                .subscribe_delivery_commits();
             let lane = match state.transport.as_mut() {
                 Some(transport) => transport
                     .take_business_lane()
@@ -1595,9 +1600,9 @@ impl RemoteManager {
                     return Err(error);
                 }
             };
-            (pending, lane, core)
+            (pending, lane, core, delivery_commit_rx)
         };
-        let (pending, claimed_lane, core) = prepared;
+        let (pending, claimed_lane, core, delivery_commit_rx) = prepared;
         let mut lane = Some(claimed_lane);
         let machine_route = MachineRouteId::from_bytes(pending.machine_route);
         let machine_data = pending.machine_data;
@@ -1620,6 +1625,7 @@ impl RemoteManager {
                 .publication_handle();
             let transition_reconnect_rx = machine_publication.subscribe_authenticated_reconnects();
             let pending_reconnect_rx = machine_publication.subscribe_authenticated_reconnects();
+            let subscription_registration = machine_publication.clone();
             let publication_owner =
                 PublicationDriveOwner::open(self.store.clone(), machine_publication)
                     .await
@@ -1641,6 +1647,29 @@ impl RemoteManager {
             let guard = Arc::new(OwnedKeyStoreCounterGuardBackend::new(Arc::clone(
                 &self.key_store,
             )));
+            let shared_backend = Arc::new(
+                RuntimeStoreSharedPublicationBackend::new(
+                    self.store.clone(),
+                    Arc::clone(&guard),
+                    machine_route,
+                )
+                .map_err(shared_publisher_error)?,
+            );
+            let publisher = Arc::new(
+                SharedStreamPublisher::new(
+                    machine_route,
+                    shared_backend,
+                    Arc::new(publication_drive.clone()),
+                    Arc::new(machine_data.clone()),
+                )
+                .and_then(|publisher| {
+                    publisher.with_subscription_provisioning(
+                        self.store.clone(),
+                        subscription_registration,
+                    )
+                })
+                .map_err(shared_publisher_error)?,
+            );
             let transition_owner = KeyTransitionRecoveryOwner::start_with_authenticated_reconnect(
                 self.store.clone(),
                 Arc::clone(&self.key_store),
@@ -1648,6 +1677,7 @@ impl RemoteManager {
                 machine_data.clone(),
                 publication_drive.clone(),
                 transition_reconnect_rx,
+                Some(delivery_commit_rx),
             )
             .map_err(transition_recovery_error)?;
             let transition_handle = transition_owner.handle();
@@ -1693,20 +1723,6 @@ impl RemoteManager {
                 }
                 state.maintenance = Some(Box::new(maintenance_owner));
             }
-
-            let shared_backend = Arc::new(
-                RuntimeStoreSharedPublicationBackend::new(self.store.clone(), guard, machine_route)
-                    .map_err(shared_publisher_error)?,
-            );
-            let publisher = Arc::new(
-                SharedStreamPublisher::new(
-                    machine_route,
-                    shared_backend,
-                    Arc::new(publication_drive),
-                    Arc::new(machine_data.clone()),
-                )
-                .map_err(shared_publisher_error)?,
-            );
             let sealer = Arc::new(DeviceReplyTxSealer::new(
                 self.store.clone(),
                 Arc::clone(&self.key_store),

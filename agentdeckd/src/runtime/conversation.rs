@@ -164,6 +164,23 @@ struct ConversationHandle {
     quiescent: Arc<AtomicBool>,
 }
 
+impl ConversationHandle {
+    fn request_shutdown(&self) {
+        // shutdown watch 必须先于 admission sender 关闭发布。两者可被不同 Tokio
+        // worker 并发观察；若先 close ingress，actor 会把正常 shutdown 误判成
+        // admission worker 异常退出并永久写入 RecoveryBlocked。
+        self.shutdown.send_replace(true);
+        self.prompt_ingress.close();
+    }
+}
+
+fn owner_shutdown_requested(shutdown: &mut watch::Receiver<bool>) -> bool {
+    if shutdown.has_changed().is_err() {
+        return true;
+    }
+    *shutdown.borrow_and_update()
+}
+
 /// 一页 Removed reconciliation 的 actor-side capability。只有在持有每会话
 /// projector/mutation guard 且 actor 已发布 quiescent 时才会签发。
 pub(crate) struct ProjectionReconciliationLease {
@@ -214,15 +231,17 @@ impl PromptIngress {
         )
     }
 
-    fn try_send(
-        &self,
-        command: PromptCommand,
-    ) -> Result<(), mpsc::error::TrySendError<PromptCommand>> {
+    fn try_send(&self, command: PromptCommand) -> Result<(), ConversationError> {
         let state = self.state.lock().expect("prompt ingress lock poisoned");
-        if !state.accepting {
-            return Err(mpsc::error::TrySendError::Closed(command));
-        }
-        state.prompt_tx.try_send(command)
+        let result = if state.accepting {
+            state.prompt_tx.try_send(command)
+        } else {
+            Err(mpsc::error::TrySendError::Closed(command))
+        };
+        // TrySendError 持有完整 PromptCommand（含 authorization guard）。必须先释放
+        // ingress mutex，再映射并 drop rejected command，保持原有失败路径的析构顺序。
+        drop(state);
+        result.map_err(map_mailbox_error)
     }
 
     fn close(&self) {
@@ -472,17 +491,14 @@ impl ConversationRegistry {
         // guard 持有到 actor 已完成 durable admission + queue registration 并回复。
         let _serialization = handle.projector_mutation_guard.clone().lock_owned().await;
         let (reply, result) = oneshot::channel();
-        handle
-            .prompt_ingress
-            .try_send(PromptCommand {
-                principal,
-                authorization_guard,
-                idempotency_key,
-                expected_configuration_revision,
-                payload,
-                reply,
-            })
-            .map_err(map_mailbox_error)?;
+        handle.prompt_ingress.try_send(PromptCommand {
+            principal,
+            authorization_guard,
+            idempotency_key,
+            expected_configuration_revision,
+            payload,
+            reply,
+        })?;
         result
             .await
             .map_err(|_| ConversationError::ActorUnavailable)?
@@ -574,8 +590,7 @@ impl ConversationRegistry {
         // guards 仍由 `quiescent` 整页持有；先让所有 actor 同时进入 shutdown，
         // 再共用一个 deadline。500 个候选不能各自获得完整 shutdown_grace。
         for registration in &registrations {
-            registration.handle.prompt_ingress.close();
-            registration.handle.shutdown.send_replace(true);
+            registration.handle.request_shutdown();
         }
         let joined = tokio::time::timeout(self.shutdown_grace, async {
             for registration in &mut registrations {
@@ -804,10 +819,7 @@ impl ConversationRegistry {
 
         let mut actors = std::mem::take(&mut *self.actors.lock().await);
         for registration in actors.values() {
-            registration.handle.prompt_ingress.close();
-        }
-        for registration in actors.values() {
-            registration.handle.shutdown.send_replace(true);
+            registration.handle.request_shutdown();
         }
 
         let joined = tokio::time::timeout(self.shutdown_grace, async {
@@ -1252,6 +1264,11 @@ impl ConversationActor {
     async fn run(mut self) {
         let mut control_burst = 0_usize;
         loop {
+            // owner 可在 actor 位于其它 ready branch 时发布 shutdown。每轮先读取
+            // retained watch value，避免只依赖 `changed()` branch 的调度顺序。
+            if !self.shutdown_requested && owner_shutdown_requested(&mut self.shutdown_rx) {
+                self.begin_shutdown().await;
+            }
             self.publish_quiescence();
             if self.shutdown_requested && self.active.is_none() && !self.admission_open {
                 break;
@@ -1299,7 +1316,14 @@ impl ConversationActor {
                     None => {
                         control_burst = 0;
                         self.admission_open = false;
-                        if !self.shutdown_requested && !self.recovery_blocked {
+                        // request_shutdown 先发布 watch，再关闭 ingress；即使 select
+                        // 先消费 admission=None，也必须把已发布的 owner shutdown 当成
+                        // 正常退出，不能伪造 RecoveryBlocked。sender 消失与 shutdown
+                        // watch 分支保持同义，同样进入正常 shutdown。
+                        let owner_shutdown = owner_shutdown_requested(&mut self.shutdown_rx);
+                        if owner_shutdown {
+                            self.begin_shutdown().await;
+                        } else if !self.shutdown_requested && !self.recovery_blocked {
                             self.enter_recovery_blocked_and_stop_approvals().await;
                         }
                     },
@@ -3158,7 +3182,6 @@ async fn execute_command(
     {
         return;
     }
-
     let prepared = match execution
         .prepare(RuntimeExecutionContext {
             conversation: conversation.clone(),
@@ -3640,6 +3663,17 @@ pub(crate) mod tests {
     use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn admission_close_observes_a_previously_published_owner_shutdown() {
+        let (shutdown, mut receiver) = watch::channel(false);
+        shutdown.send_replace(true);
+
+        assert!(
+            owner_shutdown_requested(&mut receiver),
+            "admission close must not outrun an already-published owner shutdown"
+        );
+    }
 
     fn configuration_test_conversation(agent_kind: AgentKind) -> ConversationRecord {
         ConversationRecord {
@@ -8296,6 +8330,42 @@ pub(crate) mod tests {
             CommandState::Canceled,
         )
         .await;
+
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_command_shutdown_does_not_persist_recovery_blocked() {
+        // 威胁场景：owner shutdown 与 prompt worker 关闭会唤醒两个 ready branch。
+        // 即使 actor 先观察 admission=None，零 command 的正常退出也不得伪造
+        // orphan-process 风险并永久写入 RecoveryBlocked。
+        let root = TestRoot::new("zero-command-shutdown");
+        let database = root.0.join("runtime.db");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 0xE4).await;
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(DisabledExecutionCoordinator),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xE4),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation, Vec::new())
+            .await
+            .expect("install zero-command actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+
+        registry.shutdown().await.expect("shutdown actors");
+        assert_eq!(
+            read_only_conversation_lifecycle(&database),
+            "active",
+            "graceful zero-command shutdown must preserve the durable lifecycle"
+        );
 
         store.shutdown().await.expect("shutdown store");
     }

@@ -177,9 +177,10 @@ pub(crate) mod b64_vec {
 
 pub use context::{OuterContextError, OuterContextV1, OuterFrameKind};
 pub use key_control::{
-    DirectoryCurrentV1, KEY_CONTROL_MAX_ID_BYTES, KEY_UPDATE_SET_MAX_CANONICAL_BYTES,
-    KEY_UPDATE_SET_MAX_KEYS, KeyControlRequestV1, KeyControlV1, KeySyncRequestV1, KeyUpdateAckV1,
-    KeyUpdateSetV1, STREAM_BINDING_MAX_CANONICAL_BYTES, StreamAppliedAckV1, StreamBindingV1,
+    DirectoryCurrentV1, DirectoryRevisionAdvanceV1, KEY_CONTROL_MAX_ID_BYTES,
+    KEY_UPDATE_SET_MAX_CANONICAL_BYTES, KEY_UPDATE_SET_MAX_KEYS, KeyControlRequestV1, KeyControlV1,
+    KeySyncRequestV1, KeyUpdateAckV1, KeyUpdateSetV1, STREAM_BINDING_MAX_CANONICAL_BYTES,
+    StreamAppliedAckV1, StreamBindingV1,
 };
 pub use key_recovery::{
     DEVICE_KEY_RECOVERY_HPKE_ENC_BYTES, DEVICE_KEY_RECOVERY_MAX_CIPHERTEXT_BYTES,

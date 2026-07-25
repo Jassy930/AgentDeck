@@ -71,7 +71,7 @@ use super::key_generation::{
     validate_normal_update_transition,
 };
 use super::key_sync::{
-    DurableKeySyncStateV1, KeySyncUpdateSetHandoff, KeyUpdateAckBasisV1,
+    DurableKeySyncStateV1, KeySyncCoordinationStatus, KeySyncUpdateSetHandoff, KeyUpdateAckBasisV1,
     SignedHigherRevisionObservationV1,
 };
 use super::keychain::{
@@ -80,7 +80,7 @@ use super::keychain::{
 };
 use super::pending::{PendingInvitePublicProjection, VerifiedPendingPairResponse};
 use super::stream_state::{
-    DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES, DurableStreamBindingV1,
+    DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES, DirectoryAdvanceOuterResolution, DurableStreamBindingV1,
     EMERGENCY_REPLAY_DEBT_METADATA_BYTES, MAX_DURABLE_STREAM_BINDINGS, StreamPublishDisposition,
     decode_stream_bindings, encode_stream_bindings,
 };
@@ -132,7 +132,7 @@ const fn checked_capacity_mul(left: usize, right: usize) -> usize {
 /// collection framing；实际 replay tuple 为 fixed width。
 const V6_EMERGENCY_BINDING_HEADROOM: usize = checked_capacity_add(
     checked_capacity_add(
-        checked_capacity_add(4, DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES),
+        checked_capacity_add(4, DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES),
         EMERGENCY_REPLAY_DEBT_METADATA_BYTES,
     ),
     checked_capacity_add(4, MAX_NEEDS_BOOTSTRAP_MARKER_RECORD_BYTES),
@@ -144,24 +144,57 @@ const V6_EMERGENCY_HEADROOM: usize =
 const V6_NORMAL_STATE_PLAINTEXT_LIMIT: usize =
     checked_capacity_sub(MAX_CRYPTO_STATE_PLAINTEXT_LEN, V6_EMERGENCY_HEADROOM);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct V6CapacityAccounting {
+    emergency_credit_bytes: usize,
+    stream_projection_extra_bytes: usize,
+}
+
+fn v6_capacity_accounting(
+    stream_cursors: &[Vec<u8>],
+    transfer_records: &[Vec<u8>],
+) -> Result<V6CapacityAccounting, PairedPromotionError> {
+    let bindings =
+        decode_stream_bindings(stream_cursors).map_err(|_| PairedPromotionError::InvalidState)?;
+    let (stream_credit, stream_projection_extra_bytes) =
+        bindings.into_iter().zip(stream_cursors).try_fold(
+            (0_usize, 0_usize),
+            |(credit, projection), (binding, raw)| {
+                let current_len = binding
+                    .canonical_bytes()
+                    .map_err(|_| PairedPromotionError::InvalidState)?
+                    .len();
+                let projection_extra = current_len
+                    .checked_sub(raw.len())
+                    .ok_or(PairedPromotionError::InvalidState)?;
+                Ok((
+                    credit
+                        .checked_add(binding.emergency_replay_debt_credit_bytes())
+                        .ok_or(PairedPromotionError::InvalidState)?,
+                    projection
+                        .checked_add(projection_extra)
+                        .ok_or(PairedPromotionError::InvalidState)?,
+                ))
+            },
+        )?;
+    let marker_credit = bootstrap_marker_credit_bytes_records(transfer_records)
+        .map_err(|_| PairedPromotionError::InvalidState)?;
+    let emergency_credit_bytes = stream_credit
+        .checked_add(marker_credit)
+        .filter(|credit| *credit <= V6_EMERGENCY_HEADROOM)
+        .ok_or(PairedPromotionError::InvalidState)?;
+    Ok(V6CapacityAccounting {
+        emergency_credit_bytes,
+        stream_projection_extra_bytes,
+    })
+}
+
+#[cfg(test)]
 fn v6_exact_emergency_credit_bytes(
     stream_cursors: &[Vec<u8>],
     transfer_records: &[Vec<u8>],
 ) -> Result<usize, PairedPromotionError> {
-    let stream_credit = decode_stream_bindings(stream_cursors)
-        .map_err(|_| PairedPromotionError::InvalidState)?
-        .into_iter()
-        .try_fold(0_usize, |credit, binding| {
-            credit
-                .checked_add(binding.emergency_replay_debt_credit_bytes())
-                .ok_or(PairedPromotionError::InvalidState)
-        })?;
-    let marker_credit = bootstrap_marker_credit_bytes_records(transfer_records)
-        .map_err(|_| PairedPromotionError::InvalidState)?;
-    stream_credit
-        .checked_add(marker_credit)
-        .filter(|credit| *credit <= V6_EMERGENCY_HEADROOM)
-        .ok_or(PairedPromotionError::InvalidState)
+    Ok(v6_capacity_accounting(stream_cursors, transfer_records)?.emergency_credit_bytes)
 }
 
 fn v6_base_plaintext_usage(
@@ -266,8 +299,13 @@ fn validate_v6_encoded_capacity_with_context(
         return Err(PairedPromotionError::StateCapacity);
     }
     if runtime_state_mutation_authority == RuntimeStateMutationAuthority::Production {
-        let emergency_credit = v6_exact_emergency_credit_bytes(stream_cursors, transfer_records)?;
-        let base_usage = v6_base_plaintext_usage(encoded_len, emergency_credit)?;
+        let accounting = v6_capacity_accounting(stream_cursors, transfer_records)?;
+        let logical_encoded_len = encoded_len
+            .checked_add(accounting.stream_projection_extra_bytes)
+            .filter(|length| *length <= MAX_CRYPTO_STATE_PLAINTEXT_LEN)
+            .ok_or(PairedPromotionError::StateCapacity)?;
+        let base_usage =
+            v6_base_plaintext_usage(logical_encoded_len, accounting.emergency_credit_bytes)?;
         live_transfer_candidate_capacity.validate_normal(base_usage)?;
     }
     Ok(())
@@ -1361,7 +1399,7 @@ mod pending_epoch_barrier_audit_tests {
         };
         DurableStreamBindingV1::from_stream_binding(binding)
             .expect("valid catalog binding")
-            .admit_pending_epoch_barrier(
+            .admit_pending_epoch_barrier_with_signed_frame(
                 KeyId {
                     purpose: KeyPurpose::Catalog,
                     epoch: 4,
@@ -1369,6 +1407,7 @@ mod pending_epoch_barrier_audit_tests {
                 KeyDirectoryRevision::new(5),
                 0,
                 9,
+                [0x46; 32],
                 [0x45; 32],
             )
             .expect("valid pending barrier")
@@ -1696,6 +1735,14 @@ pub(crate) enum VerifiedStreamPublish {
     Higher(Box<VerifiedHigherStreamPublish>),
 }
 
+/// 当前-key Publish 在 durable replay admission 后的唯一解释结果。普通 Runtime payload
+/// 继续交给 reducer；只有用旧 Catalog revision 打开并完成 canonical `from -> to` 校验的
+/// control 才能铸造 ADKS observation。
+pub(crate) enum VerifiedStreamDelivery {
+    Runtime(SealedPayloadV1),
+    DirectoryRevisionAdvance(SignedHigherRevisionObservationV1),
+}
+
 pub(crate) struct VerifiedCurrentStreamPublish {
     verified: VerifiedSealedBlobV1,
     context: OuterContextV1,
@@ -1703,6 +1750,7 @@ pub(crate) struct VerifiedCurrentStreamPublish {
     header_directory_revision: u64,
     stream_seq: u64,
     counter: u64,
+    signed_frame_sha256: [u8; 32],
     ciphertext_sha256: [u8; 32],
 }
 
@@ -1718,6 +1766,7 @@ pub(crate) struct VerifiedStagedEpochBarrierPublish {
     brand: StreamPublishBrand,
     stream_seq: u64,
     counter: u64,
+    signed_frame_sha256: [u8; 32],
     ciphertext_sha256: [u8; 32],
 }
 
@@ -1924,6 +1973,11 @@ impl VerifiedCurrentStreamPublish {
     }
 
     #[must_use]
+    pub(crate) const fn signed_frame_sha256(&self) -> [u8; 32] {
+        self.signed_frame_sha256
+    }
+
+    #[must_use]
     pub(crate) const fn ciphertext_sha256(&self) -> [u8; 32] {
         self.ciphertext_sha256
     }
@@ -1950,6 +2004,11 @@ impl VerifiedStagedEpochBarrierPublish {
     #[must_use]
     pub(crate) const fn counter(&self) -> u64 {
         self.counter
+    }
+
+    #[must_use]
+    pub(crate) const fn signed_frame_sha256(&self) -> [u8; 32] {
+        self.signed_frame_sha256
     }
 
     #[must_use]
@@ -2360,6 +2419,84 @@ impl OpenedPairedMachine<'_> {
         &self,
     ) -> Result<Option<DurableKeySyncStateV1>, PairedPromotionError> {
         self.audited.state.durable_key_sync_state()
+    }
+
+    /// ADKS `Resolved` 后消费与 observation 精确匹配的旧-revision Catalog replay tuple。
+    /// 没有 tuple 是普通 higher-revision business Publish，返回 `None` 且零写；tuple 存在
+    /// 但任一 revision/key/route/generation/seq/counter/signed-frame/ciphertext hash 漂移都
+    /// fail-close。
+    pub(crate) fn commit_resolved_directory_advance_outer<R: CryptoRng>(
+        &mut self,
+        expected_state: &DurableKeySyncStateV1,
+        rng: &mut R,
+    ) -> Result<Option<DurableStreamBindingV1>, PairedPromotionError> {
+        if expected_state.status() != KeySyncCoordinationStatus::Resolved {
+            return Err(PairedPromotionError::Conflict);
+        }
+        self.refresh_mutable_state()?;
+        self.recover_pending_guard()?;
+        self.refresh_mutable_state()?;
+        let installed_state = self
+            .audited
+            .state
+            .durable_key_sync_state()?
+            .ok_or(PairedPromotionError::Conflict)?;
+        if &installed_state != expected_state {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let observation = installed_state.observation();
+        let from_revision = observation.known_key_directory_revision();
+        let to_revision = observation.observed_key_directory_revision();
+        if observation.observed_key_id().purpose != KeyPurpose::Catalog
+            || from_revision.next().ok() != Some(to_revision)
+        {
+            return Ok(None);
+        }
+        if observation.machine_route() != self.audited.identity.machine_route
+            || observation.device_route() != self.audited.device_route
+            || observation.grant_serial() != self.audited.grant_serial
+            || observation.root_trust_epoch() != self.audited.trust_epoch
+            || observation.key_slot_stream_route().is_some()
+            || installed_state.current_known_key_directory_revision() != to_revision
+            || self.audited.effective_directory_revision != to_revision
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        let mut matching = self
+            .audited
+            .state
+            .durable_stream_bindings()?
+            .into_iter()
+            .filter(|binding| {
+                binding.binding().stream_route == observation.publication_stream_route()
+                    && binding.binding().stream_generation
+                        == observation.publication_stream_generation()
+            });
+        let current = matching.next().ok_or(PairedPromotionError::Conflict)?;
+        if matching.next().is_some() {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let resolution = current
+            .resolve_directory_revision_advance_outer(
+                from_revision,
+                to_revision,
+                observation.observed_key_id(),
+                observation.publication_stream_route(),
+                observation.publication_stream_generation(),
+                observation.publication_stream_seq(),
+                observation.sender_counter(),
+                observation.signed_frame_sha256(),
+                observation.ciphertext_sha256(),
+            )
+            .map_err(|_| PairedPromotionError::Conflict)?;
+        match resolution {
+            DirectoryAdvanceOuterResolution::NotAdmitted => Ok(None),
+            DirectoryAdvanceOuterResolution::AlreadyApplied => Ok(Some(current)),
+            DirectoryAdvanceOuterResolution::Commit(replacement) => self
+                .commit_stream_state_transition(&current, replacement.as_ref(), rng)
+                .map(Some),
+        }
     }
 
     /// 返回 open-time 已完成 canonical、MachineDataSign 与 DeviceHPKE 全审计的 generation
@@ -4208,6 +4345,10 @@ impl OpenedPairedMachine<'_> {
                 .map_err(|_| PairedPromotionError::InvalidState)?,
         );
         let ciphertext_sha256 = sha256(&header.ciphertext);
+        let signed_frame_sha256 = sha256(&encode(&OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::Publish(publish.clone()),
+        }));
         // 连续 same-epoch rewrap 保留同一 raw key/nonce domain 与 durable replay window。
         // 任一旧 revision 只在该 tuple 已被当前 binding 精确记录时可继续进入 runtime
         // 分类；fresh predecessor 仍是 rollback。NonceReuse 也必须进入 durable quarantine
@@ -4222,6 +4363,7 @@ impl OpenedPairedMachine<'_> {
                     KeyDirectoryRevision::new(header.key_directory_revision),
                     publish.stream_seq,
                     counter,
+                    signed_frame_sha256,
                     ciphertext_sha256,
                 )
                 .is_ok_and(|(_, disposition)| {
@@ -4276,6 +4418,7 @@ impl OpenedPairedMachine<'_> {
                         brand: staged_brand,
                         stream_seq: publish.stream_seq,
                         counter,
+                        signed_frame_sha256,
                         ciphertext_sha256,
                     },
                 )));
@@ -4285,10 +4428,6 @@ impl OpenedPairedMachine<'_> {
                 return Err(PairedPromotionError::Conflict);
             }
             let key_slot_stream_route = stream_key_slot_route(header.key_id, publish.stream_route)?;
-            let signed_frame_sha256 = sha256(&encode(&OpaqueRouteFrame {
-                version: RELAY_PROTOCOL_VERSION,
-                body: RelayFrameBody::Publish(publish.clone()),
-            }));
             let observation = SignedHigherRevisionObservationV1::new(
                 self.audited.identity.machine_route,
                 self.audited.device_route,
@@ -4338,6 +4477,7 @@ impl OpenedPairedMachine<'_> {
             header_directory_revision,
             stream_seq: publish.stream_seq,
             counter,
+            signed_frame_sha256,
             ciphertext_sha256,
         };
         let committed_barrier_duplicate = durable
@@ -4348,6 +4488,7 @@ impl OpenedPairedMachine<'_> {
                     KeyDirectoryRevision::new(header_directory_revision),
                     publish.stream_seq,
                     counter,
+                    signed_frame_sha256,
                     ciphertext_sha256,
                 )
                 .is_ok_and(|(_, disposition)| {
@@ -4435,6 +4576,7 @@ impl OpenedPairedMachine<'_> {
                     KeyDirectoryRevision::new(candidate.header_directory_revision),
                     candidate.stream_seq,
                     candidate.counter,
+                    candidate.signed_frame_sha256,
                     candidate.ciphertext_sha256,
                 )
                 .map_err(|_| PairedPromotionError::Conflict)?;
@@ -4444,6 +4586,90 @@ impl OpenedPairedMachine<'_> {
         }
         open_sealed_payload(stream_key, &candidate.context, candidate.verified)
             .map_err(PairedPromotionError::Crypto)
+    }
+
+    /// durable admission readback 后才允许解释 current-key payload。该 capability 同时证明
+    /// admitted 是当前唯一 binding、replay tuple 为 exact pending duplicate，并把 canonical
+    /// Catalog `DirectoryRevisionAdvance` 绑定到 signed frame/hash/route/generation/counter。
+    pub(crate) fn open_verified_stream_delivery(
+        &self,
+        admitted: &DurableStreamBindingV1,
+        candidate: VerifiedCurrentStreamPublish,
+    ) -> Result<VerifiedStreamDelivery, PairedPromotionError> {
+        let installed = self
+            .audited
+            .state
+            .durable_stream_bindings()?
+            .into_iter()
+            .filter(|state| state == admitted)
+            .count();
+        let (_, disposition) = admitted
+            .admit_publish_at_authenticated_revision(
+                candidate.header_directory_revision(),
+                candidate.stream_seq(),
+                candidate.counter(),
+                candidate.signed_frame_sha256(),
+                candidate.ciphertext_sha256(),
+            )
+            .map_err(|_| PairedPromotionError::Conflict)?;
+        if installed != 1 || disposition != StreamPublishDisposition::PendingDuplicate {
+            return Err(PairedPromotionError::Conflict);
+        }
+
+        let header_revision = candidate.header_directory_revision();
+        let stream_seq = candidate.stream_seq();
+        let sender_counter = candidate.counter();
+        let signed_frame_sha256 = candidate.signed_frame_sha256();
+        let ciphertext_sha256 = candidate.ciphertext_sha256();
+        let brand = candidate.brand;
+        let opened = self.open_verified_stream_publish(candidate)?;
+        if opened.payload_kind != SealedPayloadKind::KeyUpdate {
+            return Ok(VerifiedStreamDelivery::Runtime(opened));
+        }
+        let Ok(control) = KeyControlV1::from_canonical_bytes(&opened.payload) else {
+            return Ok(VerifiedStreamDelivery::Runtime(opened));
+        };
+        let KeyControlV1::DirectoryRevisionAdvance { advance, .. } = control else {
+            return Ok(VerifiedStreamDelivery::Runtime(opened));
+        };
+        advance.validate().map_err(PairedPromotionError::Protocol)?;
+        let from_revision = advance.from_key_directory_revision;
+        let to_revision = advance.to_key_directory_revision;
+        let binding_revision = admitted.binding().key_directory_revision;
+        if brand.key_id.purpose != KeyPurpose::Catalog
+            || brand.key_id != admitted.binding().key_id
+            || header_revision != from_revision
+            || !matches!(binding_revision, revision if revision == from_revision || revision == to_revision)
+            || !matches!(
+                self.audited.effective_directory_revision,
+                revision if revision == from_revision || revision == to_revision
+            )
+            || brand.stream_route != admitted.binding().stream_route
+            || brand.stream_generation != admitted.binding().stream_generation
+            || brand.frame_kind != OuterFrameKind::CatalogPublish
+        {
+            return Err(PairedPromotionError::Conflict);
+        }
+        let observation = SignedHigherRevisionObservationV1::new(
+            self.audited.identity.machine_route,
+            self.audited.device_route,
+            self.audited.grant_serial,
+            self.audited.trust_epoch,
+            from_revision,
+            to_revision,
+            brand.key_id,
+            None,
+            brand.stream_route,
+            brand.stream_generation,
+            stream_seq,
+            sender_counter,
+            signed_frame_sha256,
+            ciphertext_sha256,
+        )
+        .map_err(|_| PairedPromotionError::InvalidState)?;
+        Ok(VerifiedStreamDelivery::DirectoryRevisionAdvance(
+            observation,
+        ))
     }
 
     /// 把 staged-key Publish 的 replay tuple 先单独 durable admission。ADKG/current binding
@@ -4486,11 +4712,12 @@ impl OpenedPairedMachine<'_> {
             return Err(PairedPromotionError::Conflict);
         }
         let (admitted, disposition) = durable
-            .admit_pending_epoch_barrier(
+            .admit_pending_epoch_barrier_with_signed_frame(
                 candidate.key_id(),
                 candidate.key_directory_revision(),
                 candidate.stream_seq(),
                 candidate.counter(),
+                candidate.signed_frame_sha256(),
                 candidate.ciphertext_sha256(),
             )
             .map_err(|_| PairedPromotionError::Conflict)?;
@@ -4528,6 +4755,7 @@ impl OpenedPairedMachine<'_> {
             || tuple.key_directory_revision() != candidate.key_directory_revision()
             || tuple.stream_seq() != candidate.stream_seq()
             || tuple.sender_counter() != candidate.counter()
+            || tuple.signed_frame_sha256() != candidate.signed_frame_sha256()
             || tuple.ciphertext_sha256() != candidate.ciphertext_sha256()
         {
             return Err(PairedPromotionError::Conflict);
@@ -11084,7 +11312,7 @@ mod counter_reservation_tests {
     fn v6_emergency_headroom_covers_every_durable_binding_exactly() {
         let per_binding = checked_capacity_add(
             checked_capacity_add(
-                checked_capacity_add(4, DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES),
+                checked_capacity_add(4, DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES),
                 EMERGENCY_REPLAY_DEBT_METADATA_BYTES,
             ),
             checked_capacity_add(4, MAX_NEEDS_BOOTSTRAP_MARKER_RECORD_BYTES),
@@ -11102,7 +11330,7 @@ mod counter_reservation_tests {
                 .expect("normal plus emergency capacity"),
             MAX_CRYPTO_STATE_PLAINTEXT_LEN,
         );
-        let exact_max_credit = DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES
+        let exact_max_credit = DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES
             + EMERGENCY_REPLAY_DEBT_METADATA_BYTES
             + 4
             + MAX_NEEDS_BOOTSTRAP_MARKER_RECORD_BYTES;
@@ -11131,7 +11359,7 @@ mod counter_reservation_tests {
         ));
 
         let debt_credit =
-            DURABLE_STREAM_REPLAY_TUPLE_V4_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES;
+            DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES;
         let with_marker = v6_base_plaintext_usage(
             normal_limit + debt_credit + actual_short_marker_credit,
             debt_credit + actual_short_marker_credit,
@@ -11983,6 +12211,32 @@ mod counter_reservation_tests {
         .unwrap()
     }
 
+    fn legacy_v5_emergency_debt_stream_binding() -> (Vec<u8>, Vec<u8>) {
+        let initial =
+            DurableStreamBindingV1::from_canonical_bytes(&canonical_catalog_stream_binding())
+                .expect("decode initial catalog binding");
+        let (fresh, disposition) = initial
+            .admit_publish_at_authenticated_revision(
+                KeyDirectoryRevision::new(1),
+                0,
+                17,
+                [0x46; 32],
+                [0x47; 32],
+            )
+            .expect("admit one current V6 replay tuple");
+        assert_eq!(disposition, StreamPublishDisposition::Fresh);
+        let debt = fresh
+            .with_emergency_replay_debt_from(&initial)
+            .expect("mark exact emergency replay debt");
+        (
+            initial
+                .legacy_v5_canonical_bytes_for_test()
+                .expect("encode legacy V5 base binding"),
+            debt.legacy_v5_canonical_bytes_for_test()
+                .expect("encode legacy V5 debt binding"),
+        )
+    }
+
     fn canonical_bootstrap_key_generation_state() -> Vec<u8> {
         let revision = KeyDirectoryRevision::new(1);
         let device_route = DeviceRouteId::from_bytes([0x45; 16]);
@@ -12025,6 +12279,89 @@ mod counter_reservation_tests {
             }
             _ => panic!("unsupported legacy test version"),
         }
+    }
+
+    #[test]
+    fn legacy_v5_emergency_debt_uses_logical_v6_capacity_without_migration() {
+        const SIGNED_FRAME_SHA256_BYTES: usize = 32;
+        const LEGACY_V5_REPLAY_TUPLE_BYTES: usize =
+            DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES - SIGNED_FRAME_SHA256_BYTES;
+
+        let (legacy_base, legacy_debt) = legacy_v5_emergency_debt_stream_binding();
+        assert_eq!(
+            legacy_debt.len() - legacy_base.len(),
+            LEGACY_V5_REPLAY_TUPLE_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES,
+            "legacy V5 physically adds one 97-byte tuple plus the 32-byte debt hash",
+        );
+        let current_debt = DurableStreamBindingV1::from_canonical_bytes(&legacy_debt)
+            .expect("strict legacy V5 debt readback")
+            .canonical_bytes()
+            .expect("project legacy debt to current V6");
+        assert_eq!(
+            current_debt.len() - legacy_debt.len(),
+            SIGNED_FRAME_SHA256_BYTES,
+            "equivalent V6 projection must restore the signed-frame hash",
+        );
+
+        let PairedCryptoState::V6(mut value) = v6_state_with_transfer_records(Vec::new()) else {
+            unreachable!()
+        };
+        value.stream_cursors = vec![legacy_debt.clone()];
+        value.durable_key_generation_state = Some(canonical_bootstrap_key_generation_state());
+        let legacy = PairedCryptoState::V5(value);
+        let legacy_outer_before = legacy.encode().expect("encode outer legacy V5 state");
+        let records = legacy.shared_durable_transfer_records();
+        let streams = legacy.durable_stream_binding_bytes();
+        let raw_encoded_len = legacy
+            .validate_current_v6_stream_transfer_capacity(streams, records.as_slice())
+            .expect("measure raw equivalent V6 outer shape");
+        let accounting = v6_capacity_accounting(streams, records.as_slice())
+            .expect("measure logical V6 stream projection");
+        assert_eq!(
+            accounting.stream_projection_extra_bytes,
+            SIGNED_FRAME_SHA256_BYTES,
+        );
+        assert_eq!(
+            accounting.emergency_credit_bytes,
+            DURABLE_STREAM_REPLAY_TUPLE_V6_BYTES + EMERGENCY_REPLAY_DEBT_METADATA_BYTES,
+        );
+        let logical_encoded_len = raw_encoded_len
+            .checked_add(accounting.stream_projection_extra_bytes)
+            .expect("bounded logical V6 length");
+        let required =
+            v6_base_plaintext_usage(logical_encoded_len, accounting.emergency_credit_bytes)
+                .expect("exact normal capacity requirement");
+        assert!(required > 0);
+
+        assert!(matches!(
+            validate_equivalent_v6_normal_capacity_with_context(
+                RuntimeStateMutationAuthority::Production,
+                LiveTransferCandidateCapacity {
+                    plaintext_limit: required - 1,
+                },
+                &legacy,
+            ),
+            Err(PairedPromotionError::StateCapacity),
+        ));
+        validate_equivalent_v6_normal_capacity_with_context(
+            RuntimeStateMutationAuthority::Production,
+            LiveTransferCandidateCapacity {
+                plaintext_limit: required,
+            },
+            &legacy,
+        )
+        .expect("exact logical V6 normal capacity must succeed");
+
+        assert_eq!(
+            legacy.encode().expect("re-encode outer legacy V5 state"),
+            legacy_outer_before,
+            "capacity projection must not migrate or rewrite outer legacy state",
+        );
+        assert_eq!(
+            legacy.durable_stream_binding_bytes(),
+            std::slice::from_ref(&legacy_debt),
+            "capacity projection must preserve exact inner legacy bytes",
+        );
     }
 
     #[test]

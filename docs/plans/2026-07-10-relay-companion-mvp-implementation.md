@@ -1074,10 +1074,11 @@ ignored/BLOCKED；P3.7 exec gate 主体、边界裁决、两个 prepare finding 
 聚焦门禁，最终完整自动门禁与独立终审均已通过，并由 `5568e93` 完成主体 scoped commit、
 `c9d2146` / `5713be4` 补齐真实 release 前取消与 sentinel 退出窗口门禁；P3.8 production UDS 与后续
 P3.9 shared-daemon client 与 P3.10 LaunchAgent Task 已完成；P3.10 code/test commit 为 `19622ab`，
-后续 Phase hardening code baseline 为 `9efb28d`，P3 automatic scope 已完成 6/6 Phase Exit；P4
-已由 P4.1–P4.6 推进到 6/7；P4.6 persistent remote CLI 已完成 automatic Task，current
-Runtime wire 为 v5；2026-07-24 的冻结范围与门禁证据见 Task P4.6 收口段。
-当前 verifier 仍只接受 `p0|p2|p3`，不宣称 P4 Phase PASS。
+  后续 Phase hardening code baseline 为 `9efb28d`，P3 automatic scope 已完成 6/6 Phase Exit；P4
+  已由 P4.1–P4.7 推进到 7/7。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire
+  为 v5；2026-07-24 的冻结范围与门禁证据见 Task P4.6 收口段。P4.7 focused `p4-auto` 与独立顶层
+  Rust/Swift、静态门禁、冻结 hash、双路 phase review 均已通过，P4 automatic Phase Exit complete；
+  `p4` 仍不受支持。
 
 ### Task P3.6-A：先冻结 Runtime/E2EE contract 与跨语言 wire
 
@@ -2470,8 +2471,8 @@ P3.9 固定以下迁移边界：
   真实 Codex/CC login 与 provisioned signed Keychain 继续是 post-MVP BLOCKED 槽位，不冒充本 Task 证据。
   P3.9 至此完成；P3.10 已由 `19622ab` 完成 Task 收口并通过完整 verifier 与双路 Task 终审；后续
   Phase review hardening 已由 `773a2b3` / `0057824` / `81cc314` / `9efb28d` 收口，P3 automatic scope
-  已完成 6/6 Phase Exit。后续 P4.1–P4.5 已完成，P4.6 已完成 automatic Task；P4 按
-  Task 进度为 6/7。
+  已完成 6/6 Phase Exit。后续 P4.1–P4.7 与 P4 automatic Phase Exit 已完成；P4 按 Task 进度为
+  7/7。
 
 ### Task P3.10：实现 LaunchAgent 安装、versioned upgrade 与保留数据的 uninstall
 
@@ -2481,8 +2482,8 @@ P3.9 固定以下迁移边界：
 > code/test，并由 `19622ab` scoped commit。冻结 candidate 的完整
 > `bash scripts/verify-relay-companion-mvp.sh p3` 已 exit 0，两路 Task review 均 Approved、无 P0/P1/P2；
 > 隔离 ephemeral UDS 已完成 install→stage→ACK→idle→手动 current restart→Hello；后续 Phase review
-> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。后续 P4.1–P4.5 已完成，P4.6 已形成
-> automatic Task complete；P4 按 Task 进度为 6/7。
+> hardening 与独立 P3 Phase Exit 证据见本 Task 后的 6/6 checklist。后续 P4.1–P4.7 与 P4 automatic
+> Phase Exit 已完成；P4 按 Task 进度为 7/7。
 
 **前置冻结：** local-only typed `StageUpgrade` request/reply、授权与错误语义已纳入 P3.9-C0-A 的 Runtime
 v2 contract；P3.9 的历史基线固定返回 typed feature-unavailable，P3.10 implementation 已用 durable/flush-ACK
@@ -2561,14 +2562,14 @@ focused tests + scoped Clippy/fmt，不做子片级双路终审、全量慢门�
 - [x] 四 schema、daemon network boundary、agent docs、local smoke、diagnostics 与 scoped diff/status 全绿；
   冻结 candidate 的两路 phase code review 均为 P0/P1/P2=0。
 - [x] P3 标记为 `complete (automatic scope)`；provisioned production-signed LaunchAgent/Keychain
-  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。后续 P4.1–P4.5 已完成，P4.6 已形成
-  automatic Task complete；P4 按 Task 进度为 6/7。
+  roundtrip 继续作为 post-MVP BLOCKED 槽位，不属于 PASS。后续 P4.1–P4.7 与 P4 automatic Phase Exit
+  已完成；P4 按 Task 进度为 7/7。
 
 ---
 
 ## Phase P4：Machine identity、Pairing 与 RemoteLink
 
-> **当前状态（2026-07-24）：P4.6 automatic Task complete，P4 为 6/7。** P4.1 machine identity/guard、P4.2
+> **当前状态（2026-07-25）：P4.7 automatic Task 与 P4 automatic Phase Exit complete，P4 为 7/7。** P4.1 machine identity/guard、P4.2
 > certificate/enrollment/control-only RemoteTransport/trust reset、P4.3 PairInvite/DeviceGrant/auth ledger 与
 > P4.4 MachineLink ingress/RuntimeCore dispatch automatic scope 已完成 Task 级完整门禁与双路 Approved；
 > P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成并通过同一冻结候选上的双路终审。
@@ -2576,8 +2577,10 @@ focused tests + scoped Clippy/fmt，不做子片级双路终审、全量慢门�
 > 升至 v5；冻结 code/test scope 为 29 paths，blob-manifest SHA-256 为
 > `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`。automatic gates 已通过；
 > `spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。
-> P4.7 与 P4 Phase Exit 仍未完成，其 checkbox 保持未勾。此前 0/7、1/7、2/7、3/7、4/7
-> 分别是 P4.1/P4.2/P4.3/P4.4/P4.5 开始前的历史基线。
+> P4.7 的 `p4-auto`、fresh 顶层 Rust/Swift、三组 Clippy、fmt、network/no-net、schema/docs/diff、local
+> Runtime smoke、ephemeral selfcheck、diagnostics 与双路 phase review 已全部通过；pre-closeout candidate
+> SHA-256 为 `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5`。此前
+> 0/7、1/7、2/7、3/7、4/7、5/7、6/7 分别是各 P4 Task 推进中的历史基线，不随当前 7/7 结论改写。
 
 ### Task P4.1：扩展 macOS Keychain 为 Machine identity 与 CounterGuard（零 cert/enrollment/RemoteLink）
 
@@ -2957,12 +2960,13 @@ Cargo manifest、lockfile 或 network-boundary 脚本。最大 production 子片
 doc-test 零失败；`runtime_store_boundaries` `5/5`（256 MiB，282.85 秒），Clippy、fmt、diff 全绿。
 `spec/security` 与 `quality` 双路终审使用同一冻结 hash
 `88ac6c486a7446b5fe4613388f66ee25561a7529a2fd0f8904844217730a896f`，P0/P1/P2=0。
-当前 `scripts/verify-relay-companion-mvp.sh` 仍只接受 `p0|p2|p3`；本 Task 不声称 `p4`、`p4-auto`
-或 P4 Phase PASS。P3.1 方案 b 与 production signing/物理设备/公网 post-MVP BLOCKED 保持不变。
+当前 working-tree `scripts/verify-relay-companion-mvp.sh` 接受 `p0|p2|p3|p4-auto`，但 `p4` 不受支持；
+本 Task 的既有证据不声称当前 `p4-auto` 或 P4 Phase PASS。P3.1 方案 b 与 production signing/物理设备/
+公网 post-MVP BLOCKED 保持不变。
 
 ### Task P4.6：实现 macOS persistent remote CLI Keychain 与真实 daemon receipts
 
-> **状态（2026-07-24）：automatic Task complete，P4 为 6/7。** current Runtime wire 已因 catalog
+> **历史状态（2026-07-24）：automatic Task complete，P4 当时为 6/7。** current Runtime wire 已因 catalog
 > exact page chain 升至 v5。`pair`、`machines`、`conversations`、`watch`、`prompt`、`approve`、
 > `retry-approval`、`revoke-self` 均已接入；冻结 code/test scope 为 29 paths，blob-manifest SHA-256 为
 > `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`。P4.7、`p4-auto`、
@@ -3045,15 +3049,18 @@ final run 在同一 hash 上 exit 0（14 分 16 秒）：lib `194/194`、main `5
 `1/1`（24.11 秒），requested-live
 capacity/complete/duplicate 分别为 `363/190/3 MiB`，不是 RSS。四 schema、CLI/protocol/relay-client
 Clippy `-D warnings`、fmt、network/no-net、docs 与 diff 全绿。`spec/security` 与 `quality` 终审均已在
-同一 hash 上 Approved，P0/P1/P2=0。P4 按 Task 进度为 6/7；P4.7、`p4-auto`、
+同一 hash 上 Approved，P0/P1/P2=0。截至该 P4.6 Task 收口时，P4 按 Task 进度为 6/7；当时的
+working-tree candidate 已提供 focused `p4-auto`，但尚无本轮 PASS、冻结 candidate hash 或双路 phase
+review。P4.7、当时的 `p4-auto` PASS、
 P4 Phase Exit、iOS 真实链路与
 production-signed/物理设备/公网 post-MVP 槽位保持未完成或 BLOCKED。
 
 #### P4.3↔P4.5 production hardening：pairing bootstrap proof、legacy recovery 与 Close retention
 
-**边界：** 本切片收紧 P4.3 pairing receipt 与 P4.5 key transition 的交界，不新增 Phase Task，不改变
+**历史边界：** 本切片收紧 P4.3 pairing receipt 与 P4.5 key transition 的交界，不新增 Phase Task，不改变
 Runtime v5、physical schema v14/35、Relay v2 或 E2EE v1。ADKT sealed row 的写 codec 单独升为 v3，继续
-严格读取 v1/v2。P4 仍为 **6/7**；以下实现不能勾选 P4.7、`p4-auto` 或 P4 Phase Exit。
+严格读取 v1/v2。该 hardening 独立门禁完成时 P4 仍为 **6/7**；以下实现本身不能勾选 P4.7、
+`p4-auto` 或 P4 Phase Exit，后续完成状态以上方 P4.7 收口段为准。
 
 - exact DeviceSign `PairResponseReceived` 已作为 Add/Renew 目标设备的 durable bootstrap install proof 写入
   ADKT v3；proof/binding 的 `Debug` 完全 redacted，且 proof 存在后禁止 transition cancel。
@@ -3087,17 +3094,32 @@ roundtrip 或 `Some(nonzero)` 断言替代。
 
 ### Task P4.7：远程 CLI 合成 E2E、真实槽位 contract 与阶段文档收口
 
+> **状态（2026-07-25，automatic Task complete）：** focused `p4-auto` 已 PASS，但 `p4` 仍不受支持。
+> `p4-auto` 不含顶层 `cargo test`、`swift test`、最终 diff/status、冻结 hash 或双路 review；这些独立
+> phase gates 已全部补齐。pre-closeout candidate SHA-256 为
+> `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5`，`spec/security` 与 `quality`
+> phase review 均 Approved、P0/P1/P2=0。P4 automatic scope 为 **7/7**，P4 automatic Phase Exit complete。
+> current physical schema 已单调推进到 v15/35 表；P4.5 收口时 v14/35 表的
+> 历史基线不改。v15 不增表，只放宽带 authenticated rotation provenance 的 Relay
+> COMMIT→local ACK 合法 crash window，允许 `acknowledged_inner <= committed_inner`。legacy
+> v1–v14 必须先完成 rescue committed-state 与事务内二次认证，再原子迁移到 v15；
+> 既有 ciphertext、非 meta token 与 wrapped key 保持 byte-exact。
+
 **Files:**
+- Create: `agentdeckd/src/runtime/synthetic_e2e.rs`
 - Create: `agentdeckd/tests/relay_v2_machine_e2e.rs`
 - Create: `agentdeck-cli/tests/e2e_remote_synthetic.rs`
 - Create: `scripts/run-relay-companion-p4-real-e2e.sh`
+- Modify: `agentdeckd/src/runtime/mod.rs`, `agentdeckd/src/runtime/core.rs`, `agentdeckd/src/runtime/execution.rs`
 - Modify: `scripts/verify-relay-companion-mvp.sh`
-- Modify: `README.md`, `ARCHITECTURE.md`, `docs/QUALITY.md`, `docs/AGENT_DIAGNOSTICS.md`, `docs/index.md`, `AGENTS.md`, `docs/RELAY_RUNBOOK.md`
+- Modify: `AGENTS.md`, `README.md`, `ARCHITECTURE.md`, `docs/QUALITY.md`, `docs/AGENT_DIAGNOSTICS.md`,
+  `docs/RELAY_RUNBOOK.md`, `docs/index.md`, `docs/plans/README.md`、Relay design/implementation 与
+  `.superpowers/sdd/progress.md`
 
-- [ ] Step 1: 写默认合成 E2E 与 real-slot contract tests。`p4-auto` 不需 vendor login，以 synthetic Codex/CC adapter + injected/dev keystore/signature verifier 完成 enroll→invite→PairRequest→same-UID 本地 pending fingerprint 读回/approve→grant→catalog→open→prompt→approval→reconnect/replay→revoke，并证明远端 confirm 被拒、receipt 来自真实 daemon Runtime。`scripts/run-relay-companion-p4-real-e2e.sh` 在 MVP 只实现只读 preflight/slot contract：检查 provisioned release-signed daemon/CLI、TeamIdentifier/entitlement/access-group、公开 WSS、两个 vendor login 与 disposable destructive profile 等缺失输入；缺任一项立即输出 versioned `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。主线不得主动执行真实 signed Keychain、vendor 或 destructive purge 流程，也不得生成真实 evidence；这些执行体留 post-MVP 扩展。
-- [ ] Step 2: 运行 `bash scripts/verify-relay-companion-mvp.sh p4-auto`。 Expected: FAIL，脚本尚未编排新RemoteLink/CLI suites或文档仍称remote skeleton。
-- [ ] Step 3: 扩展 verifier 和入口文档；记录 Linux 仅支持 ephemeral test client、macOS production persistent Keychain 不降级、root-lost reset 步骤，以及 real runner 在 MVP 仅为 post-MVP slot-contract preflight。
-- [ ] Step 4: 先运行自动 candidate 门禁：
+- [x] Step 1: 写默认合成 E2E 与 real-slot contract tests。`p4-auto` 不需 vendor login，以 synthetic Codex/CC adapter + injected/dev keystore/signature verifier 完成 enroll→invite→PairRequest→same-UID 本地 pending fingerprint 读回/approve→grant→catalog→open→prompt→approval→reconnect/replay→revoke，并证明 receipt 来自真实 daemon Runtime。完整 high-level persistent remote CLI 路径由 `agentdeckd/tests/relay_v2_machine_e2e.rs` 通过 `PersistentRemoteComposition` 与 persistent API 承担；`agentdeck-cli/tests/e2e_remote_synthetic.rs` 只承担 paired-state restart、legacy ADSB v3 migration 与 real-slot contract，不得单独称为完整 CLI E2E。current V6 replay tuple 的非零 signed-frame hash 与 crash/cold-readback 由 `remote_live_key_update::directory_advance_crash_after_replay_commit_recovers_exact_signed_frame` 证明；legacy v3 的零 sentinel 不得冒充 current duplicate evidence。远端 confirm 被拒必须由独立 RuntimeCore principal gate 证明，不放进 machine E2E 自证。zero-cut Add 必须由 exact `PairResponseReceived` proof 直接把 target 推进为 Acked/`BusinessReady`；E2E 不得注入 unsolicited KeyUpdateAck 掩盖 pairing→transition 接线缺口。`scripts/run-relay-companion-p4-real-e2e.sh` 在 MVP 只是静态 fail-closed slot sentinel：不读取参数或环境变量，不探测 provisioned release signing、TeamIdentifier/entitlement/access-group、公开 WSS、vendor login 或 disposable destructive profile，也不执行真实链路；它固定输出完整 `missingInputs` 与 versioned `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。真实 preflight/execution 留 post-MVP，主线不得主动执行真实 signed Keychain、vendor 或 destructive purge 流程，也不得生成真实 evidence。
+- [x] Step 2: 运行 `bash scripts/verify-relay-companion-mvp.sh p4-auto`；focused aggregate 已完整 exit 0。
+- [x] Step 3: 扩展 verifier 和入口文档；记录 Linux 仅支持 ephemeral test client、macOS production persistent Keychain 不降级、root-lost reset 交叉链接，以及 real runner 在 MVP 仅为静态 post-MVP slot sentinel、不是 prerequisite preflight。
+- [x] Step 4: 运行自动 candidate 门禁：
   ```bash
   cargo test
   swift test
@@ -3105,25 +3127,36 @@ roundtrip 或 `Some(nonzero)` 断言替代。
   bash scripts/verify-relay-companion-mvp.sh p4-auto
   scripts/verify-agent-docs.sh
   ```
-  Expected: 全部 exit 0，只证明 P4 automatic candidate。MVP 主线不得设置
-  `AGENTDECK_P4_REAL_E2E=1` 或主动运行真实 runner；只由 contract tests 校验其缺输入 preflight 会输出
-  Global Constraints 规定的 versioned BLOCKED NDJSON，且零 mutation/evidence/summary。P4 的
+  上述命令全部 exit 0，只证明 P4 automatic candidate；`p4-auto` focused aggregate 自身不替代顶层
+  `cargo test`、`swift test`、最终 diff/status、冻结 hash 或双路 review，这些独立门禁也已另行通过。
+  MVP 主线不主动运行真实 runner；参数或环境变量（包括历史设想的 `AGENTDECK_P4_REAL_E2E=1`）都不会
+  启用执行路径。只由 contract tests 校验静态 sentinel 固定输出 Global Constraints 规定的完整
+  `missingInputs` 与 versioned BLOCKED NDJSON，且零 mutation/evidence/summary。P4 的
   pairing/RemoteLink/远程 CLI 功能与 synthetic Codex/CC harness 全保留；`p4-auto` 全绿并完成 P4 Phase
   Exit 后即可进入后续 MVP 主线。真实 vendor/公网/provisioned signed Keychain/CLI restart 与 destructive
   trust-reset/uninstall-purge/readback/reinstall 全部作为 post-MVP 外部证据槽位保持 BLOCKED；不得记 PASS 或
   宣称 stable production signing 已完成。
-- [ ] Step 5: `git status --short --branch`，清理临时Keychain accounts、DB、invite与logs。
-- [ ] Step 6: 提交 automatic candidate 与 gated harness。精确展开本 task pathspec 后执行
+- [x] Step 5: `git status --short --branch`，确认无临时 Keychain accounts、DB、invite 或 logs 混入候选。
+- [x] Step 6: automatic candidate 与 gated harness 已冻结为单一精确 scoped commit 边界。精确展开本 task pathspec 后执行
   `git commit -m "test(remote): 建立 P4 自动门禁与真实槽位 contract"`；若 real gate BLOCKED，文档必须保留该状态，
   不得把本提交命名或描述为真实双 agent 已收口。
 
-### P4 Phase Exit（独立 checklist，未完成）
+### P4 Phase Exit（独立 checklist，automatic scope complete）
 
-- [ ] 从已提交 P4.1–P4.7 automatic candidate 运行完整 `p4-auto`，确认 machine identity、pairing、唯一 RemoteLink、远程 CLI、synthetic Codex/CC prompt/approval/history、reconnect/replay/revoke 与 trust-reset 自动闭环全部 PASS。
-- [ ] 读回 automatic keystore/signature 注入只存在于 library/test harness；production daemon/CLI 只接受发行签名 Data Protection Keychain，且无 CLI/env/config file-keystore 降级面。
-- [ ] 只运行 real runner 的 contract/preflight tests，不设置 `AGENTDECK_P4_REAL_E2E=1`；所有缺输入槽位必须是 allowlist 内 versioned `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。
-- [ ] 运行 daemon network boundary、四 schema、Rust/Swift、docs/diff/status 门禁，并在冻结 diff/hash 上完成独立 `spec/security` 与 `quality` phase review，清零 P0/P1/P2。
-- [ ] automatic 项未全部 PASS 时不得用 post-MVP BLOCKED 槽位使 phase 聚合器 exit 0；上述 checklist 全部完成前不得进入 P5 共享实现。
+- [x] 从冻结的 P4.1–P4.7 automatic candidate 运行完整 `p4-auto`，确认 machine identity、pairing、唯一 RemoteLink、远程 CLI、synthetic Codex/CC prompt/approval/history、reconnect/replay/revoke 与 trust-reset 自动闭环全部 PASS。
+- [x] 读回 automatic keystore/signature 注入只存在于 library/test harness；production daemon/CLI 只接受发行签名 Data Protection Keychain，且无 CLI/env/config file-keystore 降级面。
+- [x] 只运行 real runner 的静态 contract/sentinel tests；确认它不读取参数/env、不探测或执行，且固定完整 `missingInputs` 与 allowlist 内 versioned `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。真实 preflight/execution 保留 post-MVP。
+- [x] 运行 daemon network boundary、四 schema、Rust/Swift、docs/diff/status 门禁，并在冻结 diff/hash 上完成独立 `spec/security` 与 `quality` phase review，清零 P0/P1/P2。
+- [x] automatic 项全部 PASS；post-MVP BLOCKED 槽位未被计作 PASS，P4 automatic Phase Exit complete，可进入 P5 共享实现。
+
+**P4.7 / P4 automatic Phase Exit 收口证据（2026-07-25）：** pre-closeout review candidate SHA-256
+为 `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5`。`p4-auto`、fresh
+`cargo test --locked`、`swift test`（577/577）、三组 Clippy、fmt、daemon network/no-net、四 schema、
+agent docs、diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics 全部通过；`spec/security` 与
+`quality` 均 Approved，P0/P1/P2=0。verifier 仍不支持 `p4`。production-signed Keychain/LaunchAgent、
+真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与 destructive purge 继续保持 post-MVP
+`BLOCKED`；静态 runner 仍只输出 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不生成真实证据。
+P5/P6 仍为 0/9、0/4。
 
 ---
 

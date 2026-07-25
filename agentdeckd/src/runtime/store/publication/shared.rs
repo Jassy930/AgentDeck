@@ -17,6 +17,8 @@ use super::*;
 use crate::runtime::transfer_identity::{DurableStreamSource, DurableStreamTransferIdentity};
 
 const EPOCH_BARRIER_PUBLICATION_ID_DOMAIN: &[u8] = b"AgentDeck/EpochBarrierPublicationIdV1\0";
+const DIRECTORY_ADVANCE_PUBLICATION_ID_DOMAIN: &[u8] =
+    b"AgentDeck/DirectoryAdvancePublicationIdV1\0";
 
 /// EpochBarrier 的 Store-authenticated durable identity。所有字段都来自已冻结的
 /// `BarriersFrozen` cut；generic `Control` payload 无法构造或旁路这条 identity。
@@ -48,6 +50,49 @@ impl EpochBarrierJournalIdentity {
     }
 }
 
+/// `ActivateConversation` zero-cut 的 Store-authenticated Catalog notice identity。
+///
+/// transaction 使用已经推进到 `to_revision` 的当前 Catalog raw key；sealed header
+/// 刻意保留 `from_revision`，让仍停在 predecessor directory 的 device 能验证并解密。
+/// identity 同时绑定 operation、stream、revision、key 与 canonical control，普通
+/// Catalog `Control` 因而无法借用这条 transition fence bypass。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DirectoryAdvanceJournalIdentity {
+    pub operation_id: [u8; 16],
+    pub publication_stream_id: [u8; 16],
+    pub stream_route: [u8; 16],
+    pub generation: [u8; 16],
+    pub from_revision: u64,
+    pub to_revision: u64,
+    pub key_id: KeyId,
+    pub control_sha256: [u8; 32],
+}
+
+impl DirectoryAdvanceJournalIdentity {
+    pub(crate) fn publication_id(self) -> [u8; 16] {
+        let mut digest = Sha256::new();
+        digest.update(DIRECTORY_ADVANCE_PUBLICATION_ID_DOMAIN);
+        digest.update(self.operation_id);
+        digest.update(self.publication_stream_id);
+        digest.update(self.stream_route);
+        digest.update(self.generation);
+        digest.update(self.from_revision.to_be_bytes());
+        digest.update(self.to_revision.to_be_bytes());
+        digest.update([match self.key_id.purpose {
+            KeyPurpose::Catalog => 0,
+            KeyPurpose::ConversationDek => 1,
+            KeyPurpose::DeviceCommandTx => 2,
+            KeyPurpose::DeviceReplyTx => 3,
+        }]);
+        digest.update(self.key_id.epoch.to_be_bytes());
+        digest.update(self.control_sha256);
+        let digest: [u8; 32] = digest.finalize().into();
+        digest[..16]
+            .try_into()
+            .expect("SHA-256 prefix has a fixed sixteen-byte length")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SharedJournalIdentity {
     CatalogRange,
@@ -58,6 +103,7 @@ pub(crate) enum SharedJournalIdentity {
         identity: DurableStreamTransferIdentity,
     },
     EpochBarrier(EpochBarrierJournalIdentity),
+    DirectoryAdvance(DirectoryAdvanceJournalIdentity),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,7 +192,7 @@ pub(crate) fn preflight_shared_publication(
             && request.scope == PublicationScope::Catalog
             && !matches!(
                 request.journal_identity,
-                SharedJournalIdentity::EpochBarrier(_)
+                SharedJournalIdentity::EpochBarrier(_) | SharedJournalIdentity::DirectoryAdvance(_)
             );
     if needs_catalog_create {
         super::super::sqlite::admit_ordinary_write(
@@ -175,7 +221,7 @@ pub(crate) fn preflight_shared_publication(
         None if request.scope == PublicationScope::Catalog
             && !matches!(
                 request.journal_identity,
-                SharedJournalIdentity::EpochBarrier(_)
+                SharedJournalIdentity::EpochBarrier(_) | SharedJournalIdentity::DirectoryAdvance(_)
             ) =>
         {
             let next_count = ledger
@@ -282,6 +328,9 @@ fn classify_existing_or_fresh(
     if let SharedJournalIdentity::EpochBarrier(identity) = request.journal_identity {
         validate_epoch_barrier_stream(stream, identity)?;
     }
+    if let SharedJournalIdentity::DirectoryAdvance(identity) = request.journal_identity {
+        validate_directory_advance_stream(stream, identity)?;
+    }
     if stream.last_acknowledged_publication_id == Some(request.publication_id)
         && stream.acknowledged_inner_cursor == request.inner_through
     {
@@ -305,6 +354,13 @@ fn classify_existing_or_fresh(
         {
             return Err(RuntimeStoreError::PublicationMismatch);
         }
+        if let SharedJournalIdentity::DirectoryAdvance(identity) = request.journal_identity
+            && (frozen.publication_stream_id != identity.publication_stream_id
+                || frozen.stream_route != identity.stream_route
+                || frozen.generation != identity.generation)
+        {
+            return Err(RuntimeStoreError::PublicationMismatch);
+        }
         let counter_key_id = super::super::remote_counter::load_frozen_key_id_for_publication(
             connection,
             key_bundle,
@@ -322,6 +378,12 @@ fn classify_existing_or_fresh(
                     if signed.inner.key_id != identity.key_id
                         || signed.inner.key_directory_revision
                             != identity.key_directory_revision
+            )
+            || matches!(
+                request.journal_identity,
+                SharedJournalIdentity::DirectoryAdvance(identity)
+                    if signed.inner.key_id != identity.key_id
+                        || signed.inner.key_directory_revision != identity.from_revision
             )
         {
             return Err(RuntimeStoreError::UnknownOrCorruptSchema);
@@ -387,6 +449,9 @@ pub(crate) fn shared_transaction_key_axes(
             return Err(RuntimeStoreError::PublicationMismatch);
         }
     }
+    if let SharedJournalIdentity::DirectoryAdvance(identity) = binding.request.journal_identity {
+        validate_directory_advance_stream(stream, identity)?;
+    }
     validate_journal(transaction, key_bundle, database_id, &binding.request)?;
     validate_transfer_order(
         transaction,
@@ -419,8 +484,23 @@ fn validate_epoch_barrier_stream(
     Ok(())
 }
 
+fn validate_directory_advance_stream(
+    stream: &PublicationStreamRecord,
+    identity: DirectoryAdvanceJournalIdentity,
+) -> Result<(), RuntimeStoreError> {
+    if stream.scope != PublicationScope::Catalog
+        || stream.publication_stream_id != identity.publication_stream_id
+        || stream.stream_route != identity.stream_route
+        || stream.generation != identity.generation
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    Ok(())
+}
+
 /// 普通 shared journal 在 active transition 到 `BarriersCommitted` 前一律拒绝新
-/// freeze。唯一旁路是带完整 frozen-cut 轴的 EpochBarrier identity；不能按
+/// freeze。旁路只允许带完整 frozen-cut 轴的 EpochBarrier，或 exact
+/// `ActivateConversation/BarriersFrozen` DirectoryAdvance identity；不能按
 /// `payload_kind == Control` 泛化放行。
 fn ensure_shared_freeze_allowed(
     connection: &Connection,
@@ -440,6 +520,15 @@ fn ensure_shared_freeze_allowed(
         }
         SharedJournalIdentity::EpochBarrier(identity) => {
             super::super::key_transition::authorize_epoch_barrier_identity(
+                connection,
+                key_bundle,
+                database_id,
+                identity,
+                None,
+            )
+        }
+        SharedJournalIdentity::DirectoryAdvance(identity) => {
+            super::super::key_transition::authorize_directory_advance_identity(
                 connection,
                 key_bundle,
                 database_id,
@@ -549,6 +638,13 @@ fn validate_request(request: &SharedPublicationPreflightRequest) -> Result<(), R
         (scope, PublicationPayloadKind::Control, SharedJournalIdentity::EpochBarrier(identity)) => {
             validate_epoch_barrier_identity_shape(request.publication_id, scope, identity)
         }
+        (
+            PublicationScope::Catalog,
+            PublicationPayloadKind::Control,
+            SharedJournalIdentity::DirectoryAdvance(identity),
+        ) if request.inner_after.is_none() && request.inner_through.is_none() => {
+            validate_directory_advance_identity_shape(request.publication_id, identity)
+        }
         _ => Err(RuntimeStoreError::PublicationMismatch),
     }
 }
@@ -581,6 +677,26 @@ fn validate_epoch_barrier_identity_shape(
         || identity.key_id.purpose != expected_purpose
         || identity.key_id.epoch == 0
         || identity.barrier_sha256 == [0; 32]
+        || publication_id != identity.publication_id()
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    Ok(())
+}
+
+fn validate_directory_advance_identity_shape(
+    publication_id: [u8; 16],
+    identity: DirectoryAdvanceJournalIdentity,
+) -> Result<(), RuntimeStoreError> {
+    if identity.operation_id == [0; 16]
+        || identity.publication_stream_id == [0; 16]
+        || identity.stream_route == [0; 16]
+        || identity.generation == [0; 16]
+        || identity.from_revision == 0
+        || identity.from_revision.checked_add(1) != Some(identity.to_revision)
+        || identity.key_id.purpose != KeyPurpose::Catalog
+        || identity.key_id.epoch == 0
+        || identity.control_sha256 == [0; 32]
         || publication_id != identity.publication_id()
     {
         return Err(RuntimeStoreError::PublicationMismatch);
@@ -631,6 +747,29 @@ fn validate_journal(
             database_id,
             identity,
             Some(&barrier),
+        );
+    }
+    if let SharedJournalIdentity::DirectoryAdvance(identity) = request.journal_identity {
+        let control = KeyControlV1::from_canonical_bytes(&request.canonical_item_bytes)
+            .map_err(|_| RuntimeStoreError::PublicationMismatch)?;
+        let KeyControlV1::DirectoryRevisionAdvance { ref advance, .. } = control else {
+            return Err(RuntimeStoreError::PublicationMismatch);
+        };
+        if advance.from_key_directory_revision.value() != identity.from_revision
+            || advance.to_key_directory_revision.value() != identity.to_revision
+            || control
+                .canonical_sha256()
+                .map_err(|_| RuntimeStoreError::PublicationMismatch)?
+                != identity.control_sha256
+        {
+            return Err(RuntimeStoreError::PublicationMismatch);
+        }
+        return super::super::key_transition::authorize_directory_advance_identity(
+            connection,
+            key_bundle,
+            database_id,
+            identity,
+            Some(advance),
         );
     }
     let _requested: RuntimeStreamItem = serde_json::from_slice(&request.canonical_item_bytes)
@@ -892,7 +1031,9 @@ fn transfer_scope(identity: DurableStreamTransferIdentity) -> PublicationScope {
 
 #[cfg(test)]
 mod epoch_barrier_identity_tests {
-    use agentdeck_protocol::e2ee::{EpochBarrierV1, KeyControlV1, KeyId, KeyPurpose};
+    use agentdeck_protocol::e2ee::{
+        DirectoryRevisionAdvanceV1, EpochBarrierV1, KeyControlV1, KeyId, KeyPurpose,
+    };
     use agentdeck_protocol::relay_v2::{KeyDirectoryRevision, StreamGenerationId, StreamRouteId};
     use agentdeck_protocol::runtime::{RuntimeInnerCursor, StreamCursor};
 
@@ -931,6 +1072,37 @@ mod epoch_barrier_identity_tests {
         )
         .canonical_bytes()
         .expect("canonical EpochBarrier control")
+    }
+
+    fn directory_advance_identity() -> DirectoryAdvanceJournalIdentity {
+        let advance = DirectoryRevisionAdvanceV1 {
+            from_key_directory_revision: KeyDirectoryRevision::new(2),
+            to_key_directory_revision: KeyDirectoryRevision::new(3),
+        };
+        DirectoryAdvanceJournalIdentity {
+            operation_id: [0x61; 16],
+            publication_stream_id: [0x22; 16],
+            stream_route: [0x33; 16],
+            generation: [0x44; 16],
+            from_revision: 2,
+            to_revision: 3,
+            key_id: KeyId {
+                purpose: KeyPurpose::Catalog,
+                epoch: 2,
+            },
+            control_sha256: KeyControlV1::directory_revision_advance(advance)
+                .canonical_sha256()
+                .expect("canonical directory advance hash"),
+        }
+    }
+
+    fn directory_advance_control() -> Vec<u8> {
+        KeyControlV1::directory_revision_advance(DirectoryRevisionAdvanceV1 {
+            from_key_directory_revision: KeyDirectoryRevision::new(2),
+            to_key_directory_revision: KeyDirectoryRevision::new(3),
+        })
+        .canonical_bytes()
+        .expect("canonical directory advance control")
     }
 
     #[test]
@@ -982,6 +1154,96 @@ mod epoch_barrier_identity_tests {
         direct_operation_id.publication_id = identity.operation_id;
         assert!(matches!(
             validate_request(&direct_operation_id),
+            Err(RuntimeStoreError::PublicationMismatch)
+        ));
+    }
+
+    #[test]
+    fn directory_advance_publication_id_binds_every_authority_axis() {
+        let baseline = directory_advance_identity();
+        let baseline_id = baseline.publication_id();
+        assert_ne!(baseline_id, baseline.operation_id);
+
+        let mut variants = Vec::new();
+        let mut changed = baseline;
+        changed.operation_id[0] ^= 1;
+        variants.push(changed);
+        changed = baseline;
+        changed.publication_stream_id[0] ^= 1;
+        variants.push(changed);
+        changed = baseline;
+        changed.stream_route[0] ^= 1;
+        variants.push(changed);
+        changed = baseline;
+        changed.generation[0] ^= 1;
+        variants.push(changed);
+        changed = baseline;
+        changed.from_revision = 1;
+        variants.push(changed);
+        changed = baseline;
+        changed.to_revision = 4;
+        variants.push(changed);
+        changed = baseline;
+        changed.key_id.purpose = KeyPurpose::ConversationDek;
+        variants.push(changed);
+        changed = baseline;
+        changed.key_id.epoch += 1;
+        variants.push(changed);
+        changed = baseline;
+        changed.control_sha256[0] ^= 1;
+        variants.push(changed);
+
+        for variant in variants {
+            assert_ne!(baseline_id, variant.publication_id());
+        }
+    }
+
+    #[test]
+    fn ordinary_catalog_control_cannot_claim_directory_advance_bypass() {
+        let control = directory_advance_control();
+        let generic = SharedPublicationPreflightRequest {
+            publication_id: [0x66; 16],
+            scope: PublicationScope::Catalog,
+            inner_after: None,
+            inner_through: None,
+            payload_kind: PublicationPayloadKind::Control,
+            journal_identity: SharedJournalIdentity::CatalogRange,
+            canonical_item_bytes: control.clone(),
+        };
+        assert!(matches!(
+            validate_request(&generic),
+            Err(RuntimeStoreError::PublicationMismatch)
+        ));
+
+        let identity = directory_advance_identity();
+        let dedicated = SharedPublicationPreflightRequest {
+            publication_id: identity.publication_id(),
+            scope: PublicationScope::Catalog,
+            inner_after: None,
+            inner_through: None,
+            payload_kind: PublicationPayloadKind::Control,
+            journal_identity: SharedJournalIdentity::DirectoryAdvance(identity),
+            canonical_item_bytes: control,
+        };
+        validate_request(&dedicated).expect("exact directory advance outer shape");
+
+        let mut with_inner_cursor = dedicated.clone();
+        with_inner_cursor.inner_after = Some(1);
+        with_inner_cursor.inner_through = Some(2);
+        assert!(matches!(
+            validate_request(&with_inner_cursor),
+            Err(RuntimeStoreError::PublicationMismatch)
+        ));
+
+        let mut wrong_revision = identity;
+        wrong_revision.to_revision += 1;
+        let invalid = SharedPublicationPreflightRequest {
+            publication_id: wrong_revision.publication_id(),
+            journal_identity: SharedJournalIdentity::DirectoryAdvance(wrong_revision),
+            ..dedicated
+        };
+        assert!(matches!(
+            validate_request(&invalid),
             Err(RuntimeStoreError::PublicationMismatch)
         ));
     }

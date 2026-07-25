@@ -1,5 +1,7 @@
 #[path = "support/runtime_descriptor.rs"]
 mod runtime_descriptor;
+#[path = "support/store_admission.rs"]
+mod store_admission;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,7 +32,7 @@ use rusqlite::{Connection, OpenFlags, ToSql, Transaction};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 const EVIDENCE_MAX_ROWS_PER_TABLE: usize = 64;
-// `runtime_meta` 是当前 v14 schema 中最宽的表；证据快照仍保持精确硬上界。
+// `runtime_meta` 是当前 v15 schema 中最宽的表；证据快照仍保持精确硬上界。
 const EVIDENCE_MAX_COLUMNS_PER_TABLE: usize = 81;
 const EVIDENCE_MAX_BYTES_PER_TABLE: usize = 8 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
@@ -211,10 +213,14 @@ fn assert_commit_unknown(error: RuntimeStoreError, expected: RuntimeCommitOperat
     );
 }
 
-struct TestRoot(PathBuf);
+struct TestRoot {
+    path: PathBuf,
+    _permit: store_admission::Permit,
+}
 
 impl TestRoot {
     fn new(label: &str) -> Self {
+        let permit = store_admission::acquire();
         let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let path = Path::new("/tmp").join(format!(
             "agentdeckd-runtime-command-configuration-{label}-{}-{sequence}",
@@ -228,22 +234,25 @@ impl TestRoot {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
                 .expect("secure command configuration test root");
         }
-        Self(path)
+        Self {
+            path,
+            _permit: permit,
+        }
     }
 
     fn database(&self) -> PathBuf {
-        self.0.join("runtime.db")
+        self.path.join("runtime.db")
     }
 
     fn storage_kek(&self, keys: &MemoryKeyStore) -> StorageKek {
-        load_or_create_storage_kek(keys, &self.0.join("key-state.db"))
+        load_or_create_storage_kek(keys, &self.path.join("key-state.db"))
             .expect("load command configuration test StorageKEK")
     }
 }
 
 impl Drop for TestRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 

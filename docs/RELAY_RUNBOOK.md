@@ -7,9 +7,13 @@ binary 已在 P2.9 原子切换为仅 Relay v2；P2.10 又以真实 Direct TLS/S
 control-only RemoteTransport、两条 trust reset 与安全 uninstall purge；P4.3 又由 `518380e`、`b28f995`、
 `55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成 Runtime v4、schema v10、本机确认 pairing、DeviceGrant/
 DeviceAuthorization/KeyDirectory、auth ledger 与 revoke；P4.4 `cd7d9fb` 接通业务 ingress/Core，P4.5
-`c6ef387`、`88b3c42` 又完成 signed publication/counter recovery，并把 current physical schema 推进到
-v14/35 表。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；
-P4 按 Task 进度为 6/7，P4.7、P4 Phase Exit 与 iOS 真实链路仍未完成。因此本页不是“公网 Companion 已上线”或
+`c6ef387`、`88b3c42` 又完成 signed publication/counter recovery，并把当时的 physical schema 推进到
+v14/35 表。P4.7 已将 current physical schema 推进到 v15/35 表；P4.6
+persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；
+P4.7 automatic Task 与 P4 automatic Phase Exit 已完成，P4 按 Task 进度为 7/7。focused `p4-auto`、
+独立顶层门禁、pre-closeout hash
+`18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 与双路 phase review 均通过；
+`p4` 仍不受支持。因此本页不是“公网 Companion 已上线”、真实 iOS/第二台 Mac 已闭环或
 production-signed LaunchAgent/Keychain 已 PASS 的证明。
 
 ## 部署不变量
@@ -102,7 +106,8 @@ anchor/expiry 会在网络前 conflict。
 
 P4.3 已提供下节 `remote pairing ...` 与 exact `remote revoke` 本机管理面；P4.6 已接入
 `remote pair|machines|conversations|watch|prompt|approve|retry-approval|revoke-self`；旧
-`sessions/send/deny/ping` 命令面已删除。P4.6 automatic Task 已完成，计为 P4 的第 6/7 项。
+`sessions/send/deny/ping` 命令面已删除。P4.6 automatic Task 已完成，历史上计为 P4 的第 6/7 项；
+后续 P4.7 已完成，当前 P4 automatic scope 为 7/7。
 automatic gate 使用 injected dev/ephemeral keystore 与 hermetic namespace；真实 production 命令仍要求
 provisioned、release-signed daemon/CLI 与正确 entitlement，当前槽位保持 post-MVP BLOCKED，不能由
 automatic PASS 代替。
@@ -184,7 +189,8 @@ absolute TTL。Relay 即使在最后一个 part 前永久静默，CLI runtime �
 artifact 不含该入口，也不能由 CLI/env/config 设置。prepared ADST v2 的 Normal/EmergencyBootstrapMarker
 mode 位于 AEAD 认证内容，guard commitment 绑定完整 sealed sidecar；legacy v1 只解释为 Normal。4095→4096
 marker 的 guard-first/active-first crash cut 均可恢复，cleanup 只允许 exact owner unlink+retry，缺失后 reseal
-或 commitment conflict 必须 fail-close。P4.7 与 P4 Phase Exit 尚未完成。
+或 commitment conflict 必须 fail-close。P4.7 与 P4 automatic Phase Exit 已完成；该 automatic 结论不包含
+production-signed Keychain、真实 vendor、公网 WSS 或真实 iOS 链路。
 
 P4.4 完成 ingress/Core dispatch：Relay v2 outer、DeviceSign/AAD/replay/AEAD 和本机 auth-ledger
 exact recheck 全部通过后，才把 `RemotePrincipal` 交给 RuntimeCore。invalid grant/signature/AAD/
@@ -195,6 +201,22 @@ Runtime DB 冻结 exact blob→Relay Publish COMMIT→local ACK；retry、outcom
 recovery 未全部通过前 admission 保持关闭。P4.5 本身当时不含 persistent remote CLI 或 iOS 真链路；
 上节命令面属于 P4.6 automatic Task，不能倒算为 P4.5 证据。不得为了调试绕过 admission，也不得把内部
 publication PASS 当作远程 E2E；iOS 真链路仍未完成。
+
+如果 DB 仍保留上一条 exact `Frozen` publication，而 CounterGuard 已为下一块进入 `Pending`，只有
+Pending 的 `previous_high_water` 与该 Frozen 的 `reserved_end`、`previous_db_anchor` 与该 Frozen 的
+`db_anchor` 两组都逐字一致，才允许把下一整块记录为 gap 并恢复 Stable guard；旧 Frozen 仍按原 identity
+恢复。任一轴分叉都退休 sender key，禁止把旧 blob 误作当前 Pending、复用其 counter 或手工改 anchor。
+诊断中 `remote_stream_publisher_failure` 应继续读其 typed `daemon.remote.publisher.*` code；
+`remote_publication_drive_failure` 表示唯一 drive owner 不可用。两者都要求保留 frozen outbox 与 remote
+fence，不得另起 owner、reseal 或伪造 local ACK。
+
+current Runtime physical schema 为 v15/35 表，不新增表。v15 允许带 authenticated rotation
+provenance 的 publication 在 Relay COMMIT 后、local ACK 前持久化有序落后：
+`acknowledged_inner <= committed_inner`；其他 provenance/hash/counter 约束仍 fail-close。在这个
+crash window 遇到重启或 outcome unknown 时，仅恢复同一 frozen publication 并继续 local ACK，禁止
+reseal、换 counter 或手改 DB。legacy v1–v14 必须先完成 rescue committed-state 认证，再在
+`BEGIN IMMEDIATE` 后、任何 DDL 前二次认证并原子迁移到 v15；失败时保留
+main/WAL/SHM/journal 证据，不原地修表。
 
 ## 创建并本机确认 PairInvite
 
@@ -229,7 +251,8 @@ agentdeck remote revoke --device <device-route-id> --grant-serial <serial>
 pairing drain 与 retirement 共用唯一 control owner：drain 绝对 deadline 为 10 秒，可被 shutdown 取消；
 失败时保留 durable state并 exact retry。P4.3 本身不提供业务 Runtime dispatch；后续 P4.4 已接入
 严格 ingress/Core；后续 P4.5 已完成 signed publication/counter recovery。P4.6 persistent remote CLI 已形成
-automatic Task complete，但 P4.7、P4 Phase Exit、production-signed 与 iOS 真链路仍未完成。
+automatic Task complete；后续 P4.7 与 P4 automatic Phase Exit 也已完成。production-signed 与 iOS 真链路
+仍未完成，继续 post-MVP BLOCKED。
 
 ### Pairing receipt 与 key-transition 恢复
 
@@ -417,7 +440,10 @@ signature、receipt、terminal 或 request/response bytes 出现在日志中均�
 ```bash
 bash scripts/verify-relay-companion-mvp.sh p2
 
-# P4.6 automatic Task（P4 聚合 verifier 到 P4.7 才建立）
+# P4.7 focused aggregate（已 PASS；单独运行不等于完整 Phase Exit）
+bash scripts/verify-relay-companion-mvp.sh p4-auto
+
+# P4.6 automatic Task 的既有直接门禁
 cargo test -p agentdeck-cli --locked --no-fail-fast -- --test-threads=1
 cargo test -p agentdeck-relay-client --locked -- --test-threads=1
 cargo test -p agentdeck-protocol --locked
@@ -440,6 +466,21 @@ daemon network-boundary、四份 schema 快照、文档与运行数据 git-statu
 `remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client
 `25/25` 与 protocol `244/244` 均通过，四 schema、三 crate Clippy、fmt、network/no-net、docs 与 diff
 全绿。`spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。当前 verifier
-不支持 `p4`/`p4-auto`，不得虚构尚未由 P4.7
-建立的 aggregate PASS。R0/R1 命令和
-`--bootstrap-secret` 只属于历史记录，不得用于当前部署或验收。
+接受 `p0|p2|p3|p4-auto`，但 `p4` 不受支持；`p4-auto` 只聚合 focused machine/CLI/state-machine/
+protocol/schema/network/docs 门禁，不含顶层 `cargo test`、`swift test`、最终 diff/status、冻结 candidate
+hash 或双路 phase review。远端不能确认 pairing 由独立 RuntimeCore principal gate 证明，不在 machine E2E
+内。P4.7 收口时 `p4-auto` 已 PASS；fresh `cargo test --locked`、`swift test` 577/577、三组 Clippy、fmt、
+network/no-net、四 schema、agent docs、diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics 也已
+单独通过。pre-closeout review candidate SHA-256 为
+`18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5`；`spec/security` 与 `quality`
+均 Approved，P0/P1/P2=0。P4 automatic scope 7/7，P4 automatic Phase Exit complete。
+
+`scripts/run-relay-companion-p4-real-e2e.sh` 当前只是静态 fail-closed slot sentinel：不读取参数或环境
+变量，不探测 signing/entitlement/WSS/vendor login/disposable profile，也不执行真实链路；固定输出完整
+`missingInputs` 与 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。它不是 prerequisite
+preflight，真实 preflight/execution 留给 post-MVP。Linux 只允许 ephemeral test keys；macOS production
+persistent pairing 必须使用 Data Protection Keychain，不得降级到 injected/file/dev keystore。MachineRoot
+丢失时回到本手册的 [portable purge receipt 流程](#machineroot-丢失后的-portable-purge-receipt)，静态
+sentinel 不生成 receipt 或删除授权。production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、
+物理真机/真实 iOS、第二台 Mac 与 destructive purge 继续 post-MVP BLOCKED；P5/P6 仍为 0/9、0/4。
+R0/R1 命令和 `--bootstrap-secret` 只属于历史记录，不得用于当前部署或验收。

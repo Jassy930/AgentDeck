@@ -532,7 +532,7 @@ async fn catalog_create_commit_notifies_registered_watch() {
 }
 
 #[tokio::test]
-async fn barrier_uses_only_relay_committed_publication_cut() {
+async fn local_barrier_ignores_committed_publication_without_remote_authority() {
     let root = TestRoot::new("relay-committed-cut");
     let keys = MemoryKeyStore::new();
     let store = RuntimeStoreHandle::open(
@@ -594,7 +594,7 @@ async fn barrier_uses_only_relay_committed_publication_cut() {
         .await
         .expect("release frozen barrier watch");
 
-    store
+    let committed_cut = store
         .acknowledge_publication_commit(
             publication_stream_id,
             generation,
@@ -603,7 +603,13 @@ async fn barrier_uses_only_relay_committed_publication_cut() {
         )
         .await
         .expect("Relay durable commit");
-    let committed_barrier = store
+    assert_eq!(committed_cut.committed_outer_cursor, Some(0));
+    assert_eq!(committed_cut.committed_inner_cursor, Some(0));
+
+    // Publication lineage 本身不是 remote authority。没有经过认证的 active authorization
+    // 时，普通 Runtime barrier 必须保持 local-only；即使底层 publication commit 已持久化，
+    // 也不能暴露 Relay cut 或 StreamBinding。
+    let local_barrier_after_commit = store
         .register_stream_barrier(RegisterStreamBarrier {
             target: RuntimeStreamTarget::Catalog,
             generation: WatchGeneration::new(11).expect("generation"),
@@ -612,9 +618,15 @@ async fn barrier_uses_only_relay_committed_publication_cut() {
             },
         })
         .await
-        .expect("capture Relay-committed barrier");
-    assert_eq!(committed_barrier.relay_committed.outer, StreamCursor::At(0));
-    assert_eq!(committed_barrier.relay_committed.inner, StreamCursor::At(0));
+        .expect("capture local-only barrier after Relay commit");
+    assert_eq!(
+        local_barrier_after_commit.relay_committed,
+        RelayCommittedCut::default()
+    );
+    store
+        .release_stream_watch(local_barrier_after_commit.watch.token())
+        .await
+        .expect("release local-only barrier watch");
     store.shutdown().await.expect("shutdown store");
 }
 

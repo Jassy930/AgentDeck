@@ -10,14 +10,16 @@ use agentdeck_protocol::e2ee::DeviceAuthorizationV1;
 use agentdeck_protocol::relay_v2::{
     KeyDirectoryRevision, MachineRouteId, RelayGrant, RelayServerId, RootKeyId, TrustEpoch,
 };
+use rusqlite::{Connection, Transaction};
 
 use crate::runtime::model::{
     MachineEnrollmentState, MachineIdentityLifecycle, RuntimeStoreConfig, RuntimeStoreError,
 };
 
+use super::cipher::RuntimeKeyBundle;
 use super::key_transition::{
-    KeyTransitionOperation, KeyTransitionPhase, KeyTransitionRecipient, KeyTransitionRecovery,
-    KeyTransitionStreamScope, KeyTransitionTarget,
+    KeyTransitionOperation, KeyTransitionPhase, KeyTransitionRecipient, KeyTransitionRecord,
+    KeyTransitionRecovery, KeyTransitionStreamScope, KeyTransitionTarget,
 };
 use super::pairing_authorization::{AuthorizationLifecycle, load_authorizations};
 use super::pairing_grant::{GlobalKeyStateV1, load_global_key_state};
@@ -40,12 +42,20 @@ pub(crate) struct TransitionRecipientProjection {
     pub(crate) authorization_revision: KeyDirectoryRevision,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransitionCatalogStreamProjection {
+    pub(crate) publication_stream_id: [u8; 16],
+    pub(crate) stream_route: [u8; 16],
+    pub(crate) generation: [u8; 16],
+}
+
 #[derive(Clone)]
 pub(crate) struct TransitionMaterialProjection {
     pub(crate) recovery: KeyTransitionRecovery,
     pub(crate) global_keys: Arc<GlobalKeyStateV1>,
     pub(crate) anchor: TransitionAnchorProjection,
     pub(crate) recipients: Vec<TransitionRecipientProjection>,
+    pub(crate) activation_catalog_stream: Option<TransitionCatalogStreamProjection>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,57 +69,57 @@ pub(crate) struct TransitionCommittedCutProjection {
     pub(crate) committed_inner_cursor: Option<u64>,
 }
 
-pub(crate) fn load_transition_material_projection(
-    state: &RuntimeSqlite,
-    machine_trust_domain: [u8; 32],
-) -> Result<Option<TransitionMaterialProjection>, RuntimeStoreError> {
-    if machine_trust_domain == [0; 32] {
-        return Err(RuntimeStoreError::PublicationMismatch);
-    }
-    let Some(recovery) = super::key_transition::load_active_key_transition(state)? else {
-        return Ok(None);
-    };
-    let global = load_global_key_state(&state.connection, &state.key_bundle, state.database_id)?
-        .ok_or(RuntimeStoreError::PublicationMismatch)?;
-    let identity = super::machine_identity::load_machine_identity_state(
-        &state.connection,
-        &state.key_bundle,
-        state.database_id,
-    )?
-    .ok_or(RuntimeStoreError::MachineIdentityMissing)?;
-    let remote = super::machine_remote::load_machine_enrollment_state(
-        &state.connection,
-        &state.key_bundle,
-        state.database_id,
-    )?
-    .ok_or(RuntimeStoreError::MachineRemoteConflict)?;
+struct ValidatedTransitionAuthorizations {
+    relay_server_id: RelayServerId,
+    machine_route: MachineRouteId,
+    root_key_id: RootKeyId,
+    trust_epoch: TrustEpoch,
+    recipients: Vec<TransitionRecipientProjection>,
+}
+
+/// `mark_key_barriers_committed` 的最后一道 durable authorization fence。
+///
+/// 参数刻意要求调用方持有现成 transaction，避免 coordinator 先前生成的 material
+/// projection 与最终 phase mutation 分属两笔事务。所有 authorization rows、MachineRoot
+/// 与 trust binding 都必须在写 transition/ledger 前重新认证。
+pub(super) fn validate_transition_authorizations_in_transaction(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    transition: &KeyTransitionRecord,
+) -> Result<(), RuntimeStoreError> {
+    let _ = validate_transition_authorizations(transaction, key_bundle, database_id, transition)?;
+    Ok(())
+}
+
+fn validate_transition_authorizations(
+    connection: &Connection,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    transition: &KeyTransitionRecord,
+) -> Result<ValidatedTransitionAuthorizations, RuntimeStoreError> {
+    let identity =
+        super::machine_identity::load_machine_identity_state(connection, key_bundle, database_id)?
+            .ok_or(RuntimeStoreError::MachineIdentityMissing)?;
+    let remote =
+        super::machine_remote::load_machine_enrollment_state(connection, key_bundle, database_id)?
+            .ok_or(RuntimeStoreError::MachineRemoteConflict)?;
     let MachineEnrollmentState::Active(remote) = remote else {
         return Err(RuntimeStoreError::MachineRemoteConflict);
     };
-    let authorizations =
-        load_authorizations(&state.connection, &state.key_bundle, state.database_id)?;
+    let authorizations = load_authorizations(connection, key_bundle, database_id)?;
 
-    if recovery.transition.phase == KeyTransitionPhase::Complete
-        || recovery.transition.terminal.is_some()
-        || recovery.transition.to_revision == 0
-        || recovery.transition.from_revision.checked_add(1) != Some(recovery.transition.to_revision)
-        || global.revision != recovery.transition.to_revision
-        || global.state.revision().value() != global.revision
-        || identity.lifecycle != MachineIdentityLifecycle::Active
-    {
-        return Err(RuntimeStoreError::PublicationMismatch);
-    }
-
-    let expected_binding_revision = match recovery.transition.phase {
-        KeyTransitionPhase::DrainingOld => recovery.transition.from_revision,
+    let expected_binding_revision = match transition.phase {
+        KeyTransitionPhase::DrainingOld => transition.from_revision,
         KeyTransitionPhase::RotatedPreparingUpdates
         | KeyTransitionPhase::UpdatesFrozen
         | KeyTransitionPhase::BarriersFrozen
-        | KeyTransitionPhase::BarriersCommitted => recovery.transition.to_revision,
-        KeyTransitionPhase::Complete => unreachable!("terminal phase rejected above"),
+        | KeyTransitionPhase::BarriersCommitted => transition.to_revision,
+        KeyTransitionPhase::Complete => return Err(RuntimeStoreError::PublicationMismatch),
     };
     let binding = &identity.binding;
-    if binding.key_directory_revision != expected_binding_revision
+    if identity.lifecycle != MachineIdentityLifecycle::Active
+        || binding.key_directory_revision != expected_binding_revision
         || remote.binding != *binding
         || remote.record.relay_server_id != *remote.connection.relay_server_id.as_bytes()
         || remote.record.machine_route == [0; 16]
@@ -139,13 +149,13 @@ pub(crate) fn load_transition_material_projection(
             grant_serial: authorization.grant_serial.value(),
         })
         .collect::<Vec<_>>();
-    if current_roster != recovery.transition.recipients {
+    if current_roster != transition.recipients {
         return Err(RuntimeStoreError::PublicationMismatch);
     }
 
-    let revision = KeyDirectoryRevision::new(recovery.transition.to_revision);
+    let revision = KeyDirectoryRevision::new(transition.to_revision);
     let mut recipients = Vec::with_capacity(current.len());
-    for (expected, authorization) in recovery.transition.recipients.iter().zip(current) {
+    for (expected, authorization) in transition.recipients.iter().zip(current) {
         if authorization.key_directory_revision != revision.value()
             || authorization.device_route.as_bytes() != &expected.device_route
             || authorization.grant_serial.value() != expected.grant_serial
@@ -170,17 +180,90 @@ pub(crate) fn load_transition_material_projection(
         });
     }
 
+    Ok(ValidatedTransitionAuthorizations {
+        relay_server_id: remote.connection.relay_server_id,
+        machine_route: MachineRouteId::from_bytes(remote.record.machine_route),
+        root_key_id: RootKeyId::from_bytes(binding.root_key_id),
+        trust_epoch: TrustEpoch::new(binding.trust_epoch),
+        recipients,
+    })
+}
+
+pub(crate) fn load_transition_material_projection(
+    state: &RuntimeSqlite,
+    machine_trust_domain: [u8; 32],
+) -> Result<Option<TransitionMaterialProjection>, RuntimeStoreError> {
+    if machine_trust_domain == [0; 32] {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    let Some(recovery) = super::key_transition::load_active_key_transition(state)? else {
+        return Ok(None);
+    };
+    let global = load_global_key_state(&state.connection, &state.key_bundle, state.database_id)?
+        .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    if recovery.transition.phase == KeyTransitionPhase::Complete
+        || recovery.transition.terminal.is_some()
+        || recovery.transition.to_revision == 0
+        || recovery.transition.from_revision.checked_add(1) != Some(recovery.transition.to_revision)
+        || global.revision != recovery.transition.to_revision
+        || global.state.revision().value() != global.revision
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    let validated = validate_transition_authorizations(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &recovery.transition,
+    )?;
+
+    let activation_catalog_stream =
+        if recovery.transition.operation == KeyTransitionOperation::ActivateConversation {
+            let ledger = super::sqlite::load_runtime_ledger(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            )?;
+            let streams = super::publication::authenticate_directory_records(
+                &state.connection,
+                &state.key_bundle,
+                &ledger,
+            )?;
+            let mut catalog = streams.into_iter().filter(|stream| {
+                stream.scope == super::publication::PublicationScope::Catalog
+                    && matches!(
+                        stream.state,
+                        super::publication::PublicationStreamState::Active
+                            | super::publication::PublicationStreamState::NeedsSnapshot
+                    )
+            });
+            let stream = catalog
+                .next()
+                .ok_or(RuntimeStoreError::PublicationMismatch)?;
+            if catalog.next().is_some() {
+                return Err(RuntimeStoreError::PublicationMismatch);
+            }
+            Some(TransitionCatalogStreamProjection {
+                publication_stream_id: stream.publication_stream_id,
+                stream_route: stream.stream_route,
+                generation: stream.generation,
+            })
+        } else {
+            None
+        };
+
     Ok(Some(TransitionMaterialProjection {
         recovery,
         global_keys: Arc::new(global.state),
         anchor: TransitionAnchorProjection {
-            relay_server_id: remote.connection.relay_server_id,
-            machine_route: MachineRouteId::from_bytes(remote.record.machine_route),
-            root_key_id: RootKeyId::from_bytes(binding.root_key_id),
-            trust_epoch: TrustEpoch::new(binding.trust_epoch),
+            relay_server_id: validated.relay_server_id,
+            machine_route: validated.machine_route,
+            root_key_id: validated.root_key_id,
+            trust_epoch: validated.trust_epoch,
             machine_trust_domain,
         },
-        recipients,
+        recipients: validated.recipients,
+        activation_catalog_stream,
     }))
 }
 

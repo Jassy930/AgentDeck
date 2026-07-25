@@ -26,11 +26,17 @@ use rusqlite::Connection;
 mod runtime_configuration;
 #[path = "support/runtime_descriptor.rs"]
 mod runtime_descriptor;
+#[path = "support/store_admission.rs"]
+mod store_admission;
 
-struct TestRoot(PathBuf);
+struct TestRoot {
+    path: PathBuf,
+    _permit: store_admission::Permit,
+}
 
 impl TestRoot {
     fn new(label: &str) -> Self {
+        let permit = store_admission::acquire();
         let path = std::env::temp_dir().join(format!(
             "agentdeck-admin-upgrade-{label}-{}",
             std::process::id()
@@ -39,17 +45,20 @@ impl TestRoot {
         fs::create_dir(&path).expect("create admin upgrade test root");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
             .expect("secure admin upgrade test root");
-        Self(path)
+        Self {
+            path,
+            _permit: permit,
+        }
     }
 
     fn database(&self) -> PathBuf {
-        self.0.join("runtime.db")
+        self.path.join("runtime.db")
     }
 }
 
 impl Drop for TestRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 

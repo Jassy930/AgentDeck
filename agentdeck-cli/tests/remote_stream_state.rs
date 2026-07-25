@@ -43,7 +43,7 @@ const CONVERSATION_GENERATION: StreamGenerationId = StreamGenerationId::from_byt
 const LEGACY_MUTABLE_STATE_VERSION: u16 = 2;
 const TRANSFER_RUNTIME_STATE_VERSION: u16 = 6;
 const DURABLE_STREAM_STATE_HEADER_BYTES: usize = 12;
-const EMERGENCY_REPLAY_DEBT_HASH_DOMAIN: &[u8] = b"AgentDeck/DurableStreamEmergencyReplayDebtV1\0";
+const EMERGENCY_REPLAY_DEBT_HASH_DOMAIN: &[u8] = b"AgentDeck/DurableStreamEmergencyReplayDebtV2\0";
 
 struct NoopMutationObserver;
 
@@ -235,8 +235,8 @@ fn indexed_conversation_binding(fixture: &PairingFixture, index: u64) -> StreamB
     )
 }
 
-fn catalog_v5_replay_offsets(canonical: &[u8]) -> (usize, usize) {
-    assert_eq!(u16::from_be_bytes([canonical[4], canonical[5]]), 5);
+fn catalog_v6_replay_offsets(canonical: &[u8]) -> (usize, usize) {
+    assert_eq!(u16::from_be_bytes([canonical[4], canonical[5]]), 6);
     let binding_len = u32::from_be_bytes(canonical[12..16].try_into().unwrap()) as usize;
     let count_offset = DURABLE_STREAM_STATE_HEADER_BYTES + 4 + binding_len + 2 * 9 + 2 * 10 + 1;
     assert_eq!(&canonical[count_offset..count_offset + 4], &[0; 4]);
@@ -253,8 +253,8 @@ fn valid_emergency_debt_canonical(
     binding: &StreamBindingV1,
 ) -> (Vec<u8>, usize, usize) {
     let mut canonical = initial.canonical_bytes().unwrap();
-    let (count_offset, entries_offset) = catalog_v5_replay_offsets(&canonical);
-    let mut replay = Vec::with_capacity(97);
+    let (count_offset, entries_offset) = catalog_v6_replay_offsets(&canonical);
+    let mut replay = Vec::with_capacity(129);
     replay.push(0); // Catalog key purpose
     replay.extend_from_slice(&binding.key_id.epoch.to_be_bytes());
     replay.extend_from_slice(&binding.key_directory_revision.value().to_be_bytes());
@@ -263,14 +263,15 @@ fn valid_emergency_debt_canonical(
     replay.extend_from_slice(&0_u64.to_be_bytes());
     replay.extend_from_slice(&17_u64.to_be_bytes());
     replay.extend_from_slice(&[0x61; 32]);
-    assert_eq!(replay.len(), 97);
+    replay.extend_from_slice(&[0x62; 32]);
+    assert_eq!(replay.len(), 129);
 
     canonical[count_offset..count_offset + 4].copy_from_slice(&1_u32.to_be_bytes());
     canonical.splice(entries_offset..entries_offset, replay.iter().copied());
     assert_eq!(
         canonical.last(),
         Some(&0),
-        "initial V5 debt tag must be absent"
+        "initial V6 debt tag must be absent"
     );
     *canonical.last_mut().unwrap() = 1;
     let mut debt_input = EMERGENCY_REPLAY_DEBT_HASH_DOMAIN.to_vec();
@@ -406,7 +407,7 @@ fn catalog_stream_binding_is_atomic_idempotent_and_restart_durable() {
 }
 
 #[test]
-fn v5_emergency_debt_decoder_rejects_tampered_duplicate_and_missing_replay_tuple() {
+fn v6_emergency_debt_decoder_rejects_tampered_duplicate_and_missing_replay_tuple() {
     let fixture = PairingFixture::new();
     let store = MemoryRemoteKeyStore::new();
     let temp = tempfile::tempdir().expect("debt decoder root");
@@ -441,6 +442,14 @@ fn v5_emergency_debt_decoder_rejects_tampered_duplicate_and_missing_replay_tuple
     assert_eq!(
         DurableStreamBindingV1::from_canonical_bytes(&tampered).unwrap_err(),
         RemoteStreamStateError::InvalidCanonical
+    );
+
+    let mut tampered_signed_frame = canonical.clone();
+    tampered_signed_frame[entries_offset + replay_len - 1] ^= 1;
+    assert_eq!(
+        DurableStreamBindingV1::from_canonical_bytes(&tampered_signed_frame).unwrap_err(),
+        RemoteStreamStateError::InvalidCanonical,
+        "V6 emergency debt must bind the complete replay tuple including signed-frame identity",
     );
 
     let count_offset = entries_offset - 4;

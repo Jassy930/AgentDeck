@@ -95,11 +95,21 @@ paired-state V6 durable transfer 的 TTL 不依赖下一帧，prepared ADST v2 m
 SHA-256 为 `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`；watch `12/12`、
 `remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client
 `25/25` 与 protocol `244/244` 均通过，四 schema/三 crate Clippy/fmt/network/no-net/docs/diff 全绿。
-`spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。P4 按 Task 进度为 6/7。
-当前 verifier 只接受 `p0|p2|p3`，不宣称 `p4`、`p4-auto` 或 P4 Phase PASS。Companion E2E 仍未完成；
+`spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。P4.7 automatic Task 与 P4 automatic
+Phase Exit 已完成，P4 按 Task 进度为 7/7。verifier 接受 `p0|p2|p3|p4-auto`，但 `p4` 仍不受支持；
+`p4-auto` focused aggregate 已 PASS，但它本身不含顶层 `cargo test`、`swift test`、最终 diff/status、
+冻结 hash 或双路 phase review。fresh `cargo test --locked`、`swift test`（577/577）、三组 Clippy、fmt、
+network/no-net、schema/docs/diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics 已单独通过；
+`spec/security`、`quality` 在 pre-closeout candidate SHA-256
+`18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上均 Approved，P0/P1/P2=0。
+远端 cannot-confirm pairing 由独立 RuntimeCore principal gate 证明；
+real runner 当前只是不读参数/env、不探测或执行的静态 fail-closed sentinel，固定输出完整
+`missingInputs` 与 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，真实 preflight/execution 留
+post-MVP。Linux 仅 ephemeral test keys，macOS production persistent Keychain 不降级；root-lost 流程交叉
+引用 `docs/RELAY_RUNBOOK.md`。真实 iOS Companion E2E 仍属于 P5、尚未完成；
 P3.1 方案 b、production-signed
-Keychain/LaunchAgent、物理 iPhone/第二台 Mac 与公网证据继续作为 post-MVP BLOCKED 槽位；P4.7 与 P4
-Phase Exit 仍未完成。
+Keychain/LaunchAgent、真实 vendor、物理 iPhone/第二台 Mac、公网 WSS 与 destructive purge 证据继续作为
+post-MVP BLOCKED 槽位。
 
 ```text
 docs/plans/

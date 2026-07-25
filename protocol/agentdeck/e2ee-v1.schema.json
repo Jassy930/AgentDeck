@@ -561,6 +561,29 @@
       "title": "DeviceKeyRecoveryTbsV1",
       "type": "object"
     },
+    "DirectoryRevisionAdvanceV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "Catalog key/epoch 不变时，由 active `ActivateConversation` transition 发布的 authenticated exact-next directory revision 通知。它只声明 `from -> to`，不承载 key material、不旋转 epoch，也不推进 Runtime inner cursor。",
+      "properties": {
+        "fromKeyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toKeyDirectoryRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fromKeyDirectoryRevision",
+        "toKeyDirectoryRevision"
+      ],
+      "title": "DirectoryRevisionAdvanceV1",
+      "type": "object"
+    },
     "EpochBarrierV1": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "additionalProperties": false,
@@ -1142,6 +1165,27 @@
           ],
           "type": "object"
         },
+        "DirectoryRevisionAdvanceV1": {
+          "additionalProperties": false,
+          "description": "Catalog key/epoch 不变时，由 active `ActivateConversation` transition 发布的 authenticated exact-next directory revision 通知。它只声明 `from -> to`，不承载 key material、不旋转 epoch，也不推进 Runtime inner cursor。",
+          "properties": {
+            "fromKeyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "toKeyDirectoryRevision": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "fromKeyDirectoryRevision",
+            "toKeyDirectoryRevision"
+          ],
+          "type": "object"
+        },
         "EpochBarrierV1": {
           "additionalProperties": false,
           "description": "成员/epoch 变化时在每个 active stream 记录的 epoch barrier（design §7.2 / §9.2）。 同时含外层 generation/cursor 与 tagged inner cursor；剩余设备从 `next(C)` 使用新 key。",
@@ -1614,6 +1658,31 @@
           },
           "required": [
             "binding",
+            "formatVersion",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "advance": {
+              "$ref": "#/definitions/DirectoryRevisionAdvanceV1"
+            },
+            "formatVersion": {
+              "format": "uint16",
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "directoryRevisionAdvance"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "advance",
             "formatVersion",
             "kind"
           ],

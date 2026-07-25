@@ -6656,6 +6656,7 @@ pub(crate) fn validate_store_integrity(
         }
         super::schema::RUNTIME_SCHEMA_VERSION_V12
         | super::schema::RUNTIME_SCHEMA_VERSION_V13
+        | super::schema::RUNTIME_SCHEMA_VERSION_V14
         | super::schema::RUNTIME_SCHEMA_VERSION => {
             super::machine_identity::validate_v8_integrity(
                 connection,

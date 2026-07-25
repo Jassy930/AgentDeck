@@ -1004,7 +1004,10 @@ impl PairingStore for FakeStore {
                 .and_then(|terminal| terminal.close.clone())
                 .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
             self.order.lock().unwrap().push("delivery-replay");
-            return Ok(DeliveryOutcome { close });
+            return Ok(DeliveryOutcome {
+                close,
+                newly_committed: false,
+            });
         }
         let response = state
             .committed
@@ -1049,7 +1052,10 @@ impl PairingStore for FakeStore {
                 "delivery-commit"
             },
         );
-        Ok(DeliveryOutcome { close })
+        Ok(DeliveryOutcome {
+            close,
+            newly_committed: true,
+        })
     }
 
     async fn load_revocation_target(
@@ -1799,6 +1805,7 @@ struct TestActor {
     cancel_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
     health_rx: watch::Receiver<PairingCoordinatorHealth>,
+    delivery_commit_rx: watch::Receiver<u64>,
     event_tx: mpsc::UnboundedSender<Result<PairingTransportEvent, PairingAdministrationError>>,
     sent_rx: mpsc::UnboundedReceiver<OpenPairRoute>,
     sent_data_rx: mpsc::UnboundedReceiver<PairData>,
@@ -1857,6 +1864,7 @@ async fn spawn_production_drain_actor(
         epoch: 0,
         failure_code: None,
     });
+    let (delivery_commit_tx, _delivery_commit_rx) = watch::channel(0);
     let actor = PairingCoordinator::new_for_test(
         store,
         Box::new(ProductionPairingLane(lane)),
@@ -1873,6 +1881,7 @@ async fn spawn_production_drain_actor(
         PairingCoordinatorSignals {
             health_tx,
             admission_tx: admission_tx.clone(),
+            delivery_commit_tx,
         },
     );
     let task = tokio::spawn(actor.run(command_rx, cancel_rx, ready_tx));
@@ -1943,6 +1952,7 @@ async fn spawn_actor_with_startup_send_failure(
         epoch: 0,
         failure_code: None,
     });
+    let (delivery_commit_tx, delivery_commit_rx) = watch::channel(0);
     let actor = PairingCoordinator::new_for_test(
         store,
         Box::new(lane),
@@ -1962,6 +1972,7 @@ async fn spawn_actor_with_startup_send_failure(
         PairingCoordinatorSignals {
             health_tx,
             admission_tx: admission_tx.clone(),
+            delivery_commit_tx,
         },
     );
     let task = tokio::spawn(actor.run(command_rx, cancel_rx, ready_tx));
@@ -1977,6 +1988,7 @@ async fn spawn_actor_with_startup_send_failure(
             cancel_tx,
             task,
             health_rx,
+            delivery_commit_rx,
             event_tx,
             sent_rx,
             sent_data_rx,
@@ -2053,6 +2065,7 @@ fn test_owner(
         epoch: 0,
         failure_code: None,
     });
+    let (delivery_commit_tx, delivery_commit_rx) = watch::channel(0);
     let actor = PairingCoordinator::new_for_test(
         store,
         Box::new(OwnerTestLane),
@@ -2069,6 +2082,7 @@ fn test_owner(
         PairingCoordinatorSignals {
             health_tx,
             admission_tx: admission_tx.clone(),
+            delivery_commit_tx,
         },
     );
     let task = tokio::spawn(actor.run(command_rx, cancel_rx, ready_tx));
@@ -2083,6 +2097,7 @@ fn test_owner(
             cancel_tx,
             task: Some(task),
             health_rx,
+            delivery_commit_rx,
             shutdown_deadline: None,
         },
         ready_rx,
@@ -2145,6 +2160,7 @@ async fn spawn_store_backed_actor(
         epoch: 0,
         failure_code: None,
     });
+    let (delivery_commit_tx, delivery_commit_rx) = watch::channel(0);
     let actor = PairingCoordinator::new_for_test(
         Arc::new(ProductionPairingStore(store)),
         Box::new(lane),
@@ -2161,6 +2177,7 @@ async fn spawn_store_backed_actor(
         PairingCoordinatorSignals {
             health_tx,
             admission_tx: admission_tx.clone(),
+            delivery_commit_tx,
         },
     );
     let task = tokio::spawn(actor.run(command_rx, cancel_rx, ready_tx));
@@ -2179,6 +2196,7 @@ async fn spawn_store_backed_actor(
         cancel_tx,
         task,
         health_rx,
+        delivery_commit_rx,
         event_tx,
         sent_rx,
         sent_data_rx,
@@ -4826,6 +4844,16 @@ async fn valid_endpoint_receipt_commits_delivery_before_close_and_late_receipts_
         .event_tx
         .send(Ok(PairingTransportEvent::PairData(receipt.clone())))
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), actor.delivery_commit_rx.changed())
+        .await
+        .expect("durable delivery commit must wake observers")
+        .expect("delivery commit watch remains open");
+    assert_eq!(*actor.delivery_commit_rx.borrow(), 1);
+    assert_eq!(
+        store.lifecycle(pairing_id),
+        PairingInviteLifecycle::Delivered,
+        "watch must become visible only after the durable lifecycle is Delivered"
+    );
     let close = actor.sent_close_rx.recv().await.unwrap();
     assert_eq!(close.pair_route, receipt.pair_route);
     assert_eq!(
@@ -4870,6 +4898,16 @@ async fn valid_endpoint_receipt_commits_delivery_before_close_and_late_receipts_
             .is_err(),
         "RouteAccepted and late receipt must not enqueue another Close"
     );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            actor.delivery_commit_rx.changed()
+        )
+        .await
+        .is_err(),
+        "late duplicate receipt must not publish another durable-progress wake"
+    );
+    assert_eq!(*actor.delivery_commit_rx.borrow(), 1);
     assert_eq!(
         store.lifecycle(pairing_id),
         PairingInviteLifecycle::Delivered
@@ -4971,11 +5009,25 @@ async fn encrypted_receipt_tamper_corpus_is_zero_write_zero_close_then_valid_rec
             .iter()
             .all(|entry| !entry.starts_with("delivery"))
     );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            actor.delivery_commit_rx.changed()
+        )
+        .await
+        .is_err(),
+        "invalid receipt corpus must not publish durable progress"
+    );
+    assert_eq!(*actor.delivery_commit_rx.borrow(), 0);
 
     actor
         .event_tx
         .send(Ok(PairingTransportEvent::PairData(valid)))
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), actor.delivery_commit_rx.changed())
+        .await
+        .expect("subsequent valid receipt must wake observers")
+        .expect("delivery commit watch remains open");
     actor.sent_close_rx.recv().await.unwrap();
     assert_eq!(
         store.lifecycle(pairing_id),
@@ -5007,6 +5059,16 @@ async fn delivery_and_close_faults_recover_without_open_or_response_replay() {
         store.lifecycle(pairing_id),
         PairingInviteLifecycle::GrantCommitted
     );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            first.delivery_commit_rx.changed()
+        )
+        .await
+        .is_err(),
+        "BeforeCommit failure must not publish durable progress"
+    );
+    assert_eq!(*first.delivery_commit_rx.borrow(), 0);
 
     store.fail_delivery_before_commit(false);
     store.delivery_commit_unknown_readback(true);
@@ -5015,6 +5077,16 @@ async fn delivery_and_close_faults_recover_without_open_or_response_replay() {
         .event_tx
         .send(Ok(PairingTransportEvent::PairData(receipt.clone())))
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), first.delivery_commit_rx.changed())
+        .await
+        .expect("unknown-readback recovery must still wake observers")
+        .expect("delivery commit watch remains open");
+    assert_eq!(*first.delivery_commit_rx.borrow(), 1);
+    assert_eq!(
+        store.lifecycle(pairing_id),
+        PairingInviteLifecycle::Delivered,
+        "Close send failure must not hide the already durable delivery"
+    );
     let recovered_close = first.sent_close_rx.recv().await.unwrap();
     assert_eq!(first.reconnects.load(Ordering::SeqCst), 1);
     assert_eq!(

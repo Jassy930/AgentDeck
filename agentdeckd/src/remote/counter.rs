@@ -539,6 +539,27 @@ pub fn reconcile_counter_recovery(
                 abandoned_through: reserved_through,
             })
         }
+        // 上一条 publication 已冻结过时，DB 的 stable head 合法保持 `Frozen`；下一次
+        // reservation 若在 guard Pending 后、DB freeze 前崩溃，pending 携带的 previous
+        // high-water/anchor 仍能逐字证明该 Frozen row 就是唯一 predecessor。只允许整块
+        // 跳号，绝不能把旧 blob 当成当前 pending 的 RetryFrozen。
+        (
+            CounterGuardBody::Pending {
+                previous_high_water,
+                reserved_through,
+                previous_db_anchor,
+                ..
+            },
+            CounterDbBody::Frozen {
+                reserved_through: db_reserved_through,
+                exact_anchor,
+                ..
+            },
+        ) if previous_high_water == db_reserved_through && previous_db_anchor == exact_anchor => {
+            Ok(CounterRecovery::GuardAheadGap {
+                abandoned_through: reserved_through,
+            })
+        }
         (
             CounterGuardBody::Pending {
                 reserved_through,
@@ -930,6 +951,29 @@ mod tests {
         let stale = CounterDbState::unchanged(token, 1_024, [0x44; 32]).unwrap();
         assert_eq!(
             reconcile_counter_recovery(&stable, &stale).unwrap(),
+            CounterRecovery::RetireKey
+        );
+    }
+
+    #[test]
+    fn recovery_records_gap_when_next_pending_follows_exact_prior_frozen_row() {
+        let token = publication_scope().token();
+        let pending =
+            CounterGuardState::pending(token, 2_048, 3_072, [0x51; 16], [0x52; 16], [0x53; 32])
+                .unwrap();
+        let prior_frozen =
+            CounterDbState::frozen(token, 2_048, [0x54; 16], [0x55; 16], [0x53; 32]).unwrap();
+        assert_eq!(
+            reconcile_counter_recovery(&pending, &prior_frozen).unwrap(),
+            CounterRecovery::GuardAheadGap {
+                abandoned_through: 3_072,
+            }
+        );
+
+        let forked =
+            CounterDbState::frozen(token, 2_048, [0x54; 16], [0x55; 16], [0x56; 32]).unwrap();
+        assert_eq!(
+            reconcile_counter_recovery(&pending, &forked).unwrap(),
             CounterRecovery::RetireKey
         );
     }

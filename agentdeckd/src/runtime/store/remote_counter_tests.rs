@@ -8,7 +8,6 @@ use std::sync::{
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, KeyId, KeyPurpose,
 };
-use agentdeck_protocol::relay_v2::{StreamGenerationId, StreamRouteId};
 
 use crate::remote::counter::{COUNTER_BLOCK_SIZE, CounterScope};
 use crate::runtime::model::{ConversationDescriptor, NewConversation};
@@ -25,12 +24,12 @@ use super::remote_counter::{
 };
 use super::{
     ActiveSenderCounterBinding, PublicationScope, RuntimeId, RuntimeIdKind, RuntimeStoreHandle,
-    active_authorization_store_with_pending_transition_for_test,
-    matching_bootstrap_update_for_test,
+    production_aligned_active_authorization_store_for_test,
 };
 use crate::runtime::model::{RuntimeClock, RuntimeClockError, RuntimeStoreConfig};
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
+use super::pairing_grant_tests::complete_active_zero_cut_transition;
 use super::pairing_tests::artifact_bytes;
 
 #[derive(Clone)]
@@ -85,70 +84,6 @@ async fn active_directed_binding(store: &RuntimeStoreHandle) -> super::RemoteRep
         .expect("active directed reply binding")
 }
 
-async fn complete_zero_cut_with_production_finalize(store: &RuntimeStoreHandle) {
-    let recovery = store
-        .load_active_key_transition()
-        .await
-        .expect("load pending zero-cut transition")
-        .expect("pending zero-cut transition exists");
-    let operation_id = recovery.transition.operation_id;
-    store
-        .finalize_key_directory_rotation(operation_id)
-        .await
-        .expect("finalize production key-directory axes");
-    let mut updates = Vec::with_capacity(recovery.transition.recipients.len());
-    for recipient in &recovery.transition.recipients {
-        updates.push(matching_bootstrap_update_for_test(store, *recipient).await);
-    }
-    store
-        .freeze_key_updates(operation_id, updates.clone())
-        .await
-        .expect("freeze fixture key updates");
-    store
-        .freeze_key_barriers(operation_id, Vec::new())
-        .await
-        .expect("freeze fixture zero-cut barriers");
-    store
-        .mark_key_barriers_committed(operation_id)
-        .await
-        .expect("commit fixture zero-cut barriers");
-    let committed = store
-        .load_active_key_transition()
-        .await
-        .expect("reload bootstrap-receipt committed transition")
-        .expect("bootstrap transition remains active before explicit completion");
-    for record in committed.updates {
-        match record.lifecycle {
-            super::key_transition::KeyUpdateLifecycle::Acked => {
-                assert!(record.canonical_ack.is_some());
-            }
-            super::key_transition::KeyUpdateLifecycle::Frozen => {
-                let update = updates
-                    .iter()
-                    .find(|update| update.recipient == record.recipient)
-                    .expect("frozen fixture update remains in the exact input set");
-                store
-                    .acknowledge_key_update(AcknowledgeKeyUpdate {
-                        operation_id,
-                        recipient: update.recipient,
-                        key_revision: update.key_revision,
-                        update_hash: canonical_update_hash(&update.canonical_update_set)
-                            .expect("fixture update hash"),
-                        canonical_ack: format!("fixture-ack-{:?}", update.recipient).into_bytes(),
-                        acknowledged_at_ms: 0,
-                    })
-                    .await
-                    .expect("ack non-bootstrap fixture key update");
-            }
-            other => panic!("unexpected fixture update lifecycle: {other:?}"),
-        }
-    }
-    store
-        .complete_key_transition(operation_id)
-        .await
-        .expect("complete fixture zero-cut transition");
-}
-
 async fn production_aligned_authorization_store(database: &std::path::Path) -> RuntimeStoreHandle {
     production_aligned_authorization_store_with_keys(database)
         .await
@@ -161,14 +96,18 @@ async fn production_aligned_authorization_store_with_keys(
     let keys = MemoryKeyStore::new();
     let storage_kek =
         load_or_create_storage_kek(&keys, database).expect("create counter fixture StorageKEK");
-    let store = active_authorization_store_with_pending_transition_for_test(
+    let store = production_aligned_active_authorization_store_for_test(
         database,
         storage_kek,
         vec![AuthorizationCapabilityV1::Catalog],
         vec![AuthorizationPermissionV1::CatalogRead],
     )
     .await;
-    complete_zero_cut_with_production_finalize(&store).await;
+    store
+        .ensure_remote_catalog_publication_after_transition()
+        .await
+        .expect("ensure counter fixture Catalog carrier")
+        .expect("active counter fixture authorization requires a Catalog carrier");
     (store, keys)
 }
 
@@ -522,17 +461,7 @@ async fn stage_shared_recovery(scope: PublicationScope, expected_purpose: KeyPur
     let root = secure_tempdir();
     let store = production_aligned_authorization_store(&root.path().join("runtime.db")).await;
     match scope {
-        PublicationScope::Catalog => {
-            store
-                .create_publication_stream(
-                    [0xd1; 16],
-                    PublicationScope::Catalog,
-                    *StreamRouteId::from_bytes([0xd2; 16]).as_bytes(),
-                    *StreamGenerationId::from_bytes([0xd3; 16]).as_bytes(),
-                )
-                .await
-                .expect("create catalog publication stream");
-        }
+        PublicationScope::Catalog => {}
         PublicationScope::Conversation(conversation_id) => {
             store
                 .create_conversation(NewConversation {
@@ -550,7 +479,7 @@ async fn stage_shared_recovery(scope: PublicationScope, expected_purpose: KeyPur
                 })
                 .await
                 .expect("create paired conversation");
-            complete_zero_cut_with_production_finalize(&store).await;
+            complete_active_zero_cut_transition(&store).await;
         }
     }
 
@@ -766,30 +695,16 @@ async fn unbound_active_sender_requires_trust_reset_without_rewriting_retired_sc
     let root = secure_tempdir();
     let database = root.path().join("runtime.db");
     let store = production_aligned_authorization_store(&database).await;
-    let publication_stream_id = [0xf3; 16];
-    store
-        .create_publication_stream(
-            publication_stream_id,
-            PublicationScope::Catalog,
-            *StreamRouteId::from_bytes([0xf4; 16]).as_bytes(),
-            *StreamGenerationId::from_bytes([0xf5; 16]).as_bytes(),
-        )
-        .await
-        .expect("create active catalog sender");
-    let old_key_id = store
+    let (publication_stream_id, old_key_id) = store
         .load_active_sender_counter_bindings()
         .await
         .expect("load catalog sender inventory")
         .into_iter()
         .find_map(|binding| match binding {
             ActiveSenderCounterBinding::SharedPublication {
-                publication_stream_id: active_stream,
+                publication_stream_id,
                 key_id,
-            } if active_stream == publication_stream_id
-                && key_id.purpose == KeyPurpose::Catalog =>
-            {
-                Some(key_id)
-            }
+            } if key_id.purpose == KeyPurpose::Catalog => Some((publication_stream_id, key_id)),
             _ => None,
         })
         .expect("active catalog sender binding");

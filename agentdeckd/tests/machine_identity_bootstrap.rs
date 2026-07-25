@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use agentdeck_crypto::sha256;
@@ -32,13 +32,48 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PARALLEL_BOOTSTRAP_FIXTURES: usize = 4;
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+static AVAILABLE_BOOTSTRAP_FIXTURES: Mutex<usize> = Mutex::new(MAX_PARALLEL_BOOTSTRAP_FIXTURES);
+static BOOTSTRAP_FIXTURE_AVAILABLE: Condvar = Condvar::new();
 
 #[derive(Debug)]
-struct TestRoot(PathBuf);
+struct BootstrapFixtureSlot;
+
+impl BootstrapFixtureSlot {
+    fn acquire() -> Self {
+        let available = AVAILABLE_BOOTSTRAP_FIXTURES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut available = BOOTSTRAP_FIXTURE_AVAILABLE
+            .wait_while(available, |available| *available == 0)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *available -= 1;
+        Self
+    }
+}
+
+impl Drop for BootstrapFixtureSlot {
+    fn drop(&mut self) {
+        let mut available = AVAILABLE_BOOTSTRAP_FIXTURES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(*available < MAX_PARALLEL_BOOTSTRAP_FIXTURES);
+        *available += 1;
+        BOOTSTRAP_FIXTURE_AVAILABLE.notify_one();
+    }
+}
+
+#[derive(Debug)]
+struct TestRoot(PathBuf, BootstrapFixtureSlot);
 
 impl TestRoot {
     fn new(_label: &str) -> Self {
+        // macOS 的默认进程 fd 上限通常只有 256。每个真实 runtime store 会同时保留
+        // writer、8 个只读 WAL connection 及其 DB/WAL/SHM 描述符；libtest 默认并行
+        // 启动全部 18 项时会先耗尽 fd，掩盖成 read-only pool 初始化失败。这里只约束
+        // integration fixture 的并行驻留量，不改变 production read pool 的容量或校验。
+        let fixture_slot = BootstrapFixtureSlot::acquire();
         let path = Path::new("/tmp").join(format!(
             "adb-{}-{}",
             std::process::id(),
@@ -51,7 +86,7 @@ impl TestRoot {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
                 .expect("secure bootstrap test root");
         }
-        Self(path)
+        Self(path, fixture_slot)
     }
 
     fn database(&self) -> PathBuf {

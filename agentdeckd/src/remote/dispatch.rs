@@ -659,6 +659,10 @@ pub(crate) mod test_support {
             all_permissions(),
         )
         .await;
+        store
+            .ensure_remote_catalog_publication_after_transition()
+            .await
+            .expect("ensure recovery-policy production Catalog carrier");
         let blocked = RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0xb1; 16])
             .expect("valid blocked conversation id");
         let healthy = RuntimeId::from_bytes(RuntimeIdKind::Conversation, [0xb2; 16])

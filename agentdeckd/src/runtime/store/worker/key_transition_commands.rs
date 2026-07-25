@@ -475,14 +475,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use agentdeck_protocol::e2ee::{KeyId, KeyPurpose};
+    use agentdeck_protocol::e2ee::{
+        AuthorizationCapabilityV1, AuthorizationPermissionV1, KeyId, KeyPurpose,
+    };
     use agentdeck_protocol::relay_v2::{DeviceRouteId, GrantSerial, MachineRouteId, TrustEpoch};
 
     use crate::remote::counter::{COUNTER_BLOCK_SIZE, CounterScope};
     use crate::runtime::model::{RuntimeClock, RuntimeClockError};
-    use crate::runtime::store::publication::{
-        FreezePublicationRequest, PublicationPayloadKind, PublicationScope,
-    };
+    use crate::runtime::store::publication::{FreezePublicationRequest, PublicationPayloadKind};
     use crate::runtime::store::remote_counter::RemoteCounterGapRequest;
     use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
@@ -532,20 +532,97 @@ mod tests {
         (root, clock, store)
     }
 
+    async fn open_active_authorization_store(
+        now_ms: u64,
+    ) -> (
+        tempfile::TempDir,
+        Arc<AtomicU64>,
+        RuntimeStoreHandle,
+        key_transition::KeyTransitionRecipient,
+        u64,
+    ) {
+        let root = tempfile::tempdir().expect("create counter-recovery handle test root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+                .expect("secure counter-recovery handle test root");
+        }
+        let database = root.path().join("runtime.db");
+        let key_state = root.path().join("key-state.db");
+        let keys = MemoryKeyStore::new();
+        let initialized =
+            crate::runtime::store::production_aligned_active_authorization_store_for_test(
+                &database,
+                load_or_create_storage_kek(&keys, &key_state)
+                    .expect("create counter-recovery handle StorageKEK"),
+                vec![AuthorizationCapabilityV1::Catalog],
+                vec![AuthorizationPermissionV1::CatalogRead],
+            )
+            .await;
+        initialized
+            .shutdown()
+            .await
+            .expect("close initialized counter-recovery handle store");
+
+        let clock = Arc::new(AtomicU64::new(now_ms));
+        let store = RuntimeStoreHandle::open(
+            RuntimeStoreConfig::new(database)
+                .with_clock(ManualClock(clock.clone()))
+                .with_capacity_probe(crate::runtime::store::pairing_tests::GenerousCapacity),
+            load_or_create_storage_kek(&keys, &key_state)
+                .expect("reload counter-recovery handle StorageKEK"),
+        )
+        .await
+        .expect("reopen counter-recovery handle store with manual clock");
+        let authorization = store
+            .load_active_remote_ingress(
+                MachineRouteId::from_bytes([0x32; 16]),
+                DeviceRouteId::from_bytes([0xd1; 16]),
+            )
+            .await
+            .expect("load real counter-recovery authorization");
+        let recipient = key_transition::KeyTransitionRecipient {
+            device_route: *authorization.device_route().as_bytes(),
+            grant_serial: authorization.grant_serial().value(),
+        };
+        let revision = authorization.key_directory_revision().value();
+        assert!(
+            revision > 0,
+            "active authorization has a predecessor revision"
+        );
+        if let Some(plan) = store
+            .load_pending_counter_retirement_plan()
+            .await
+            .expect("load bootstrap counter-retirement plan")
+        {
+            assert!(
+                plan.scope_tokens.is_empty(),
+                "bootstrap fixture must not bypass CounterGuard readback"
+            );
+            store
+                .apply_counter_retirement_after_guard_readback(plan)
+                .await
+                .expect("collect bootstrap counter-retirement fixture");
+        }
+        (root, clock, store, recipient, revision)
+    }
+
     #[tokio::test]
     async fn handle_serializes_transition_recovery_keysync_and_business_fence() {
-        let (_root, clock, store) = open_store(100).await;
+        let now_ms = crate::runtime::store::pairing_tests::NOW_MS
+            + key_transition::COUNTER_RETIREMENT_RETENTION_MS
+            + 100;
+        let (_root, clock, store, member, to_revision) =
+            open_active_authorization_store(now_ms).await;
         let operation_id = [0x31; 16];
-        let member = recipient(0x41, 7);
+        let from_revision = to_revision - 1;
         let begin = key_transition::BeginKeyTransition {
             operation_id,
-            operation: key_transition::KeyTransitionOperation::ActivateConversation,
-            target: key_transition::KeyTransitionTarget::Conversation {
-                conversation_id: [0x51; 16],
-                stream_route: [0x52; 16],
-            },
-            from_revision: 8,
-            to_revision: 9,
+            operation: key_transition::KeyTransitionOperation::CounterRecovery,
+            target: key_transition::KeyTransitionTarget::Device(member),
+            from_revision,
+            to_revision,
             recipients: vec![member],
             replay_retirement: None,
             // Caller time is deliberately untrusted; the blocking worker owns it.
@@ -561,7 +638,7 @@ mod tests {
         let active = active
             .expect("load serialized recovery")
             .expect("transition is active");
-        assert_eq!(started.created_at_ms, 100);
+        assert_eq!(started.created_at_ms, now_ms);
         assert_eq!(active.transition, started);
         assert!(active.updates.is_empty());
         assert!(matches!(
@@ -583,25 +660,25 @@ mod tests {
                 .expect("key control ingress remains available");
         }
 
-        clock.store(101, Ordering::SeqCst);
+        clock.store(now_ms + 1, Ordering::SeqCst);
         store
             .mark_key_transition_rotated(operation_id)
             .await
             .expect("record completed guard rotation");
         let update = key_transition::FrozenKeyUpdate {
             recipient: member,
-            key_revision: 9,
+            key_revision: to_revision,
             canonical_update_set: b"exact-handle-key-update".to_vec(),
         };
-        clock.store(102, Ordering::SeqCst);
+        clock.store(now_ms + 2, Ordering::SeqCst);
         store
             .freeze_key_updates(operation_id, vec![update.clone()])
             .await
             .expect("freeze exact update through handle");
         let query = key_transition::KeySyncRead {
             recipient: member,
-            known_revision: 8,
-            requested_revision: 9,
+            known_revision: from_revision,
+            requested_revision: to_revision,
         };
         assert_eq!(
             store
@@ -620,7 +697,7 @@ mod tests {
         assert!(matches!(
             store
                 .load_key_update_for_sync(key_transition::KeySyncRead {
-                    known_revision: 7,
+                    known_revision: to_revision,
                     ..query
                 })
                 .await,
@@ -631,19 +708,19 @@ mod tests {
             .await
             .expect("load active transition with update")
             .expect("transition remains active");
-        assert_eq!(active.transition.state_changed_at_ms, 102);
+        assert_eq!(active.transition.state_changed_at_ms, now_ms + 2);
         assert_eq!(active.updates.len(), 1);
 
-        clock.store(103, Ordering::SeqCst);
+        clock.store(now_ms + 3, Ordering::SeqCst);
         store
             .freeze_key_barriers(operation_id, Vec::new())
             .await
-            .expect("activation has an empty barrier set");
-        clock.store(104, Ordering::SeqCst);
+            .expect("device counter recovery has an empty barrier set");
+        clock.store(now_ms + 4, Ordering::SeqCst);
         store
             .mark_key_barriers_committed(operation_id)
             .await
-            .expect("commit empty activation barrier set");
+            .expect("commit empty counter-recovery barrier set");
         store
             .check_remote_transition_ingress(
                 key_transition::RemoteTransitionIngressClass::ControlPlaneReady,
@@ -658,7 +735,7 @@ mod tests {
                 .await,
             Err(RuntimeStoreError::InvalidStateTransition)
         ));
-        clock.store(105, Ordering::SeqCst);
+        clock.store(now_ms + 5, Ordering::SeqCst);
         assert!(matches!(
             store.complete_key_transition(operation_id).await,
             Err(RuntimeStoreError::InvalidStateTransition)
@@ -669,7 +746,7 @@ mod tests {
         let ack = key_transition::AcknowledgeKeyUpdate {
             operation_id,
             recipient: member,
-            key_revision: 9,
+            key_revision: to_revision,
             update_hash,
             canonical_ack: b"exact-handle-key-ack".to_vec(),
             acknowledged_at_ms: 1,
@@ -678,13 +755,13 @@ mod tests {
             .acknowledge_key_update(ack.clone())
             .await
             .expect("record exact key update ACK");
-        assert_eq!(first_ack.state_changed_at_ms, 105);
-        clock.store(106, Ordering::SeqCst);
+        assert_eq!(first_ack.state_changed_at_ms, now_ms + 5);
+        clock.store(now_ms + 6, Ordering::SeqCst);
         let replayed_ack = store
             .acknowledge_key_update(ack)
             .await
             .expect("new worker time does not conflict with exact ACK replay");
-        assert_eq!(replayed_ack.state_changed_at_ms, 105);
+        assert_eq!(replayed_ack.state_changed_at_ms, now_ms + 5);
         let completed = store
             .complete_key_transition(operation_id)
             .await
@@ -709,34 +786,34 @@ mod tests {
 
     #[tokio::test]
     async fn handle_relay_commit_is_not_stream_applied_ack() {
-        let (_root, clock, store) = open_store(400).await;
-        let publication_stream_id = [0x21; 16];
-        let stream_route = [0x22; 16];
-        let generation = [0x23; 16];
-        store
-            .create_publication_stream(
-                publication_stream_id,
-                PublicationScope::Catalog,
-                stream_route,
-                generation,
-            )
+        let now_ms = crate::runtime::store::pairing_tests::NOW_MS
+            + key_transition::COUNTER_RETIREMENT_RETENTION_MS
+            + 400;
+        let (_root, clock, store, member, to_revision) =
+            open_active_authorization_store(now_ms).await;
+        let from_revision = to_revision - 1;
+        let catalog = store
+            .ensure_remote_catalog_publication_after_transition()
             .await
-            .expect("create catalog publication stream");
+            .expect("ensure real Catalog publication stream")
+            .expect("active authorization requires a Catalog publication stream");
+        let publication_stream_id = catalog.publication_stream_id;
+        let stream_route = catalog.stream_route;
+        let generation = catalog.generation;
 
         let operation_id = [0x24; 16];
-        let member = recipient(0x25, 7);
         let replay_scope =
             remote_replay::canonical_device_command_scope([0x29; 16], 3, member.device_route, 6, 6)
                 .expect("freeze full old DeviceCommandTx axes");
-        clock.store(401, Ordering::SeqCst);
+        clock.store(now_ms + 1, Ordering::SeqCst);
         store
             .begin_key_transition_with_global_lineage_for_test(
                 key_transition::BeginKeyTransition {
                     operation_id,
                     operation: key_transition::KeyTransitionOperation::Renew,
                     target: key_transition::KeyTransitionTarget::Device(member),
-                    from_revision: 4,
-                    to_revision: 5,
+                    from_revision,
+                    to_revision,
                     recipients: vec![member],
                     replay_retirement: Some(
                         key_transition::ReplayRetirement::pending_device_command(replay_scope, 7)
@@ -748,19 +825,19 @@ mod tests {
             )
             .await
             .expect("begin add transition");
-        clock.store(402, Ordering::SeqCst);
+        clock.store(now_ms + 2, Ordering::SeqCst);
         store
             .mark_key_transition_rotated(operation_id)
             .await
             .expect("record completed key guard rotation");
         let canonical_update_set = b"new-member-handle-update".to_vec();
-        clock.store(403, Ordering::SeqCst);
+        clock.store(now_ms + 3, Ordering::SeqCst);
         store
             .freeze_key_updates(
                 operation_id,
                 vec![key_transition::FrozenKeyUpdate {
                     recipient: member,
-                    key_revision: 5,
+                    key_revision: to_revision,
                     canonical_update_set: canonical_update_set.clone(),
                 }],
             )
@@ -780,12 +857,12 @@ mod tests {
             new_epoch: 8,
             epoch_barrier_sha256,
         };
-        clock.store(404, Ordering::SeqCst);
+        clock.store(now_ms + 4, Ordering::SeqCst);
         store
             .freeze_key_barriers(operation_id, vec![cut])
             .await
             .expect("freeze exact committed cut");
-        clock.store(405, Ordering::SeqCst);
+        clock.store(now_ms + 5, Ordering::SeqCst);
         let frozen = store
             .freeze_publication(FreezePublicationRequest {
                 publication_id: [0x27; 16],
@@ -800,7 +877,7 @@ mod tests {
             })
             .await
             .expect("freeze barrier publication");
-        clock.store(406, Ordering::SeqCst);
+        clock.store(now_ms + 6, Ordering::SeqCst);
         store
             .acknowledge_publication_commit(
                 publication_stream_id,
@@ -810,17 +887,17 @@ mod tests {
             )
             .await
             .expect("record Relay COMMIT");
-        clock.store(407, Ordering::SeqCst);
+        clock.store(now_ms + 7, Ordering::SeqCst);
         store
             .mark_key_barriers_committed(operation_id)
             .await
             .expect("record exact barrier set committed");
-        clock.store(408, Ordering::SeqCst);
+        clock.store(now_ms + 8, Ordering::SeqCst);
         store
             .acknowledge_key_update(key_transition::AcknowledgeKeyUpdate {
                 operation_id,
                 recipient: member,
-                key_revision: 5,
+                key_revision: to_revision,
                 update_hash: key_transition::canonical_update_hash(&canonical_update_set)
                     .expect("hash exact member update"),
                 canonical_ack: b"member-key-update-ack".to_vec(),
@@ -829,7 +906,7 @@ mod tests {
             .await
             .expect("record key update ACK");
 
-        clock.store(409, Ordering::SeqCst);
+        clock.store(now_ms + 9, Ordering::SeqCst);
         assert!(matches!(
             store.complete_key_transition(operation_id).await,
             Err(RuntimeStoreError::InvalidStateTransition)
@@ -837,7 +914,7 @@ mod tests {
         let stream_ack = key_transition::AcknowledgeStreamApplied {
             operation_id,
             recipient: member,
-            key_revision: 5,
+            key_revision: to_revision,
             scope: key_transition::KeyTransitionStreamScope::Catalog,
             stream_route,
             stream_generation: generation,
@@ -853,13 +930,13 @@ mod tests {
             .acknowledge_stream_applied(stream_ack.clone())
             .await
             .expect("record StreamAppliedAck");
-        assert_eq!(first.state_changed_at_ms, 409);
-        clock.store(410, Ordering::SeqCst);
+        assert_eq!(first.state_changed_at_ms, now_ms + 9);
+        clock.store(now_ms + 10, Ordering::SeqCst);
         let replayed = store
             .acknowledge_stream_applied(stream_ack)
             .await
             .expect("exact StreamAppliedAck ignores later worker time");
-        assert_eq!(replayed.state_changed_at_ms, 409);
+        assert_eq!(replayed.state_changed_at_ms, now_ms + 9);
         store
             .complete_key_transition(operation_id)
             .await
@@ -923,7 +1000,7 @@ mod tests {
             .expect("materialize old catalog counter row");
 
         clock.store(
-            410 + key_transition::COUNTER_RETIREMENT_RETENTION_MS - 1,
+            now_ms + 10 + key_transition::COUNTER_RETIREMENT_RETENTION_MS - 1,
             Ordering::SeqCst,
         );
         assert!(
@@ -934,7 +1011,7 @@ mod tests {
                 .is_none()
         );
         clock.store(
-            410 + key_transition::COUNTER_RETIREMENT_RETENTION_MS,
+            now_ms + 10 + key_transition::COUNTER_RETIREMENT_RETENTION_MS,
             Ordering::SeqCst,
         );
         let plan = store

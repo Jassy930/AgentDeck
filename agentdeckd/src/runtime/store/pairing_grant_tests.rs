@@ -13,9 +13,10 @@ use agentdeck_crypto::{
 };
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
-    E2EE_FORMAT_VERSION, KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyId, KeyPurpose,
-    KeyUpdateInfoV1, KeyUpdateSetV1, KeyUpdateV1, MachineDataSignerBindingV1, OuterContextV1,
-    OuterFrameKind, PairResponseInfoV1, PairResponsePlaintextV1,
+    DirectoryRevisionAdvanceV1, E2EE_FORMAT_VERSION, KeyControlV1, KeyDirectorySignatureContextV1,
+    KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1, KeyUpdateSetV1, KeyUpdateV1,
+    MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairResponseInfoV1,
+    PairResponsePlaintextV1, UnsignedSealedBlobV1,
 };
 use agentdeck_protocol::relay_v2::frame::{
     GrantCommitted, InstallGrant, OpaqueRouteFrame, RelayFrameBody,
@@ -27,6 +28,10 @@ use agentdeck_protocol::relay_v2::{
 use agentdeck_protocol::runtime::{RUNTIME_PROTOCOL_VERSION, StreamCursor};
 use tokio::sync::Semaphore;
 
+use crate::remote::counter::{
+    COUNTER_BLOCK_SIZE, CounterGuardBackend, CounterGuardCas, CounterGuardState, CounterScope,
+};
+use crate::remote::identity::MachineIdentityError;
 use crate::runtime::backfill::BarrierRequest;
 use crate::runtime::catalog_snapshot::CatalogSnapshotProvider;
 use crate::runtime::connection::PrincipalIssuer;
@@ -54,7 +59,13 @@ use super::pairing_tests::{
     make_active, pending_envelope, prepare_unused_pairing, verified_request,
     verified_request_with_authorization,
 };
-use super::publication::PublicationScope;
+use super::publication::{
+    DirectoryAdvanceJournalIdentity, FreezeSignedPublicationRequest, PublicationPayloadKind,
+    PublicationScope, SharedJournalIdentity, SharedPublicationPreflight,
+    SharedPublicationPreflightRequest, SharedPublicationStreamProposal,
+    SharedPublicationTransactionBinding,
+};
+use super::remote_counter::RemoteCounterReservation;
 use super::sqlite::RuntimeLedger;
 
 const ROOT_SEED: [u8; 32] = [0x41; 32];
@@ -2348,6 +2359,20 @@ fn grant_committed_frame(recovery: &super::pairing_grant_tx::GrantPreparingRecov
 }
 
 pub(crate) async fn complete_active_zero_cut_transition(store: &RuntimeStoreHandle) {
+    complete_active_zero_cut_transition_inner(store, None).await;
+}
+
+pub(crate) async fn complete_active_zero_cut_transition_with_counter_guard(
+    store: &RuntimeStoreHandle,
+    guard: &dyn CounterGuardBackend<Error = MachineIdentityError>,
+) {
+    complete_active_zero_cut_transition_inner(store, Some(guard)).await;
+}
+
+async fn complete_active_zero_cut_transition_inner(
+    store: &RuntimeStoreHandle,
+    guard: Option<&dyn CounterGuardBackend<Error = MachineIdentityError>>,
+) {
     let recovery = store
         .load_active_key_transition()
         .await
@@ -2389,9 +2414,9 @@ pub(crate) async fn complete_active_zero_cut_transition(store: &RuntimeStoreHand
     .canonical_bytes()
     .expect("encode canonical zero-cut key update fixture");
     store
-        .mark_key_transition_rotated(operation_id)
+        .finalize_key_directory_rotation(operation_id)
         .await
-        .expect("mark zero-cut transition rotated");
+        .expect("finalize zero-cut directory rotation");
     store
         .freeze_key_updates(
             operation_id,
@@ -2407,6 +2432,11 @@ pub(crate) async fn complete_active_zero_cut_transition(store: &RuntimeStoreHand
         .freeze_key_barriers(operation_id, Vec::new())
         .await
         .expect("freeze empty old-audience barrier set");
+    if recovery.transition.operation
+        == super::key_transition::KeyTransitionOperation::ActivateConversation
+    {
+        commit_zero_cut_directory_advance(store, guard).await;
+    }
     store
         .mark_key_barriers_committed(operation_id)
         .await
@@ -2444,6 +2474,236 @@ pub(crate) async fn complete_active_zero_cut_transition(store: &RuntimeStoreHand
         .complete_key_transition(operation_id)
         .await
         .expect("complete zero-cut transition");
+}
+
+/// Store 层 fixture 不持有 live Relay 或 MachineData signer，但 `ActivateConversation`
+/// 在推进 barrier phase 前仍必须经过与 production 相同的 DirectoryRevisionAdvance
+/// durable freeze -> Relay COMMIT -> local delivery 状态机。这里使用 synthetic signature
+/// 构造 canonical signed wire shape；remote transition tests 负责 crypto composition，
+/// 本 helper 则保留完整 Store authorization、counter、journal 与 publication 不变量。
+async fn commit_zero_cut_directory_advance(
+    store: &RuntimeStoreHandle,
+    guard: Option<&dyn CounterGuardBackend<Error = MachineIdentityError>>,
+) {
+    let material = store
+        .load_transition_material_projection()
+        .await
+        .expect("load zero-cut transition material")
+        .expect("zero-cut transition material exists");
+    let transition = material.recovery.transition;
+    assert_eq!(
+        transition.operation,
+        super::key_transition::KeyTransitionOperation::ActivateConversation
+    );
+    assert_eq!(
+        transition.phase,
+        super::key_transition::KeyTransitionPhase::BarriersFrozen
+    );
+    assert!(transition.cuts.is_empty());
+    let stream = material
+        .activation_catalog_stream
+        .expect("activation Catalog publication stream exists");
+    let mut catalog_keys = material
+        .global_keys
+        .current_shared_keys()
+        .expect("load current zero-cut shared keys")
+        .into_iter()
+        .filter(|view| view.purpose == KeyPurpose::Catalog && view.stream_route.is_none());
+    let catalog_key = catalog_keys
+        .next()
+        .expect("unique current zero-cut Catalog key");
+    assert!(catalog_keys.next().is_none());
+    let key_id = KeyId {
+        purpose: KeyPurpose::Catalog,
+        epoch: catalog_key.epoch,
+    };
+    let advance = DirectoryRevisionAdvanceV1 {
+        from_key_directory_revision: KeyDirectoryRevision::new(transition.from_revision),
+        to_key_directory_revision: KeyDirectoryRevision::new(transition.to_revision),
+    };
+    advance
+        .validate()
+        .expect("validate zero-cut directory advance");
+    let control = KeyControlV1::directory_revision_advance(advance);
+    let canonical_control = control
+        .canonical_bytes()
+        .expect("encode zero-cut directory advance");
+    let identity = DirectoryAdvanceJournalIdentity {
+        operation_id: transition.operation_id,
+        publication_stream_id: stream.publication_stream_id,
+        stream_route: stream.stream_route,
+        generation: stream.generation,
+        from_revision: transition.from_revision,
+        to_revision: transition.to_revision,
+        key_id,
+        control_sha256: control
+            .canonical_sha256()
+            .expect("hash zero-cut directory advance"),
+    };
+    let publication_id = identity.publication_id();
+    let preflight_request = SharedPublicationPreflightRequest {
+        publication_id,
+        scope: PublicationScope::Catalog,
+        inner_after: None,
+        inner_through: None,
+        payload_kind: PublicationPayloadKind::Control,
+        journal_identity: SharedJournalIdentity::DirectoryAdvance(identity),
+        canonical_item_bytes: canonical_control,
+    };
+    let preflight = store
+        .preflight_shared_publication(
+            preflight_request.clone(),
+            SharedPublicationStreamProposal {
+                publication_stream_id: stream.publication_stream_id,
+                stream_route: stream.stream_route,
+                generation: stream.generation,
+            },
+        )
+        .await
+        .expect("preflight zero-cut directory advance");
+    let (preflight_revision, preflight_key_id) = match preflight {
+        SharedPublicationPreflight::Fresh {
+            publication_stream_id,
+            generation,
+            key_directory_revision,
+            key_id,
+        } => {
+            assert_eq!(publication_stream_id, stream.publication_stream_id);
+            assert_eq!(generation, stream.generation);
+            (key_directory_revision, key_id)
+        }
+        other => panic!("expected fresh zero-cut directory advance, got {other:?}"),
+    };
+    assert_eq!(preflight_revision, transition.to_revision);
+    assert_eq!(preflight_key_id, key_id);
+
+    let counter_scope = CounterScope::publication(
+        material.anchor.machine_trust_domain,
+        key_id,
+        stream.publication_stream_id,
+    )
+    .expect("derive zero-cut Catalog counter scope");
+    store
+        .register_remote_counter_guard_scope(counter_scope.token())
+        .await
+        .expect("register zero-cut Catalog CounterGuard scope");
+    let counter = store
+        .load_remote_counter_record(counter_scope.token(), key_id)
+        .await
+        .expect("load zero-cut Catalog counter genesis");
+    let reserved_end = counter
+        .reserved_end
+        .checked_add(COUNTER_BLOCK_SIZE)
+        .expect("zero-cut Catalog counter capacity");
+    let pending = guard.map(|guard| {
+        let expected = guard
+            .load_guard(&counter_scope)
+            .expect("load zero-cut Catalog CounterGuard state");
+        let pending = CounterGuardState::pending(
+            counter_scope.token(),
+            counter.reserved_end,
+            reserved_end,
+            publication_id,
+            publication_id,
+            counter.db_anchor,
+        )
+        .expect("build zero-cut Catalog CounterGuard pending state");
+        assert_eq!(
+            guard
+                .compare_and_swap_guard(&counter_scope, expected, pending)
+                .expect("persist zero-cut Catalog CounterGuard pending state"),
+            CounterGuardCas::Swapped(pending)
+        );
+        pending
+    });
+    store
+        .mark_remote_counter_guard_scope_materialized(counter_scope.token())
+        .await
+        .expect("materialize zero-cut Catalog CounterGuard scope");
+    let from_revision = transition.from_revision;
+    let to_revision = transition.to_revision;
+    let expected_stream_route = stream.stream_route;
+    let frozen = store
+        .freeze_signed_publication(FreezeSignedPublicationRequest {
+            publication_id,
+            publication_stream_id: stream.publication_stream_id,
+            generation: stream.generation,
+            counter: RemoteCounterReservation {
+                scope_token: counter_scope.token(),
+                key_id,
+                previous_reserved_end: counter.reserved_end,
+                reserved_end,
+                previous_db_anchor: counter.db_anchor,
+                reservation_id: publication_id,
+                publication_id,
+            },
+            inner_after: None,
+            inner_through: None,
+            payload_kind: PublicationPayloadKind::Control,
+            shared_binding: Some(SharedPublicationTransactionBinding {
+                request: preflight_request,
+                expected_key_directory_revision: preflight_revision,
+                expected_key_id: preflight_key_id,
+            }),
+            sealer_retained_bytes: 0,
+            sealer: Box::new(
+                move |axes: super::publication::TransactionPublicationAxes| {
+                    assert_eq!(axes.stream_route, expected_stream_route);
+                    let shared = axes
+                        .shared_key
+                        .expect("zero-cut directory advance receives shared key axes");
+                    assert_eq!(shared.key_directory_revision, to_revision);
+                    assert_eq!(shared.key_id, key_id);
+                    let mut nonce = [0xa7; 12];
+                    nonce[4..].copy_from_slice(&axes.sender_counter.to_be_bytes());
+                    Ok(UnsignedSealedBlobV1::new(
+                        key_id,
+                        key_id.epoch,
+                        from_revision,
+                        nonce,
+                        vec![0xa8; 16],
+                    )
+                    .attach_signature(Ed25519Signature([0xa9; 64]))
+                    .to_wire_bytes())
+                },
+            ),
+        })
+        .await
+        .expect("freeze zero-cut directory advance");
+    if let (Some(guard), Some(pending)) = (guard, pending) {
+        let stable = CounterGuardState::stable(
+            counter_scope.token(),
+            reserved_end,
+            frozen
+                .counter_db_anchor
+                .expect("zero-cut directory advance freezes counter DB anchor"),
+        )
+        .expect("build zero-cut Catalog CounterGuard stable state");
+        assert_eq!(
+            guard
+                .compare_and_swap_guard(&counter_scope, Some(pending), stable)
+                .expect("persist zero-cut Catalog CounterGuard stable state"),
+            CounterGuardCas::Swapped(stable)
+        );
+    }
+    store
+        .acknowledge_publication_commit(
+            stream.publication_stream_id,
+            stream.generation,
+            frozen.stream_seq,
+            frozen.blob_sha256,
+        )
+        .await
+        .expect("record zero-cut directory advance Relay COMMIT");
+    store
+        .acknowledge_publication_delivery(
+            stream.publication_stream_id,
+            stream.generation,
+            frozen.stream_seq,
+            frozen.blob_sha256,
+        )
+        .await
+        .expect("record zero-cut directory advance local delivery");
 }
 
 #[tokio::test]

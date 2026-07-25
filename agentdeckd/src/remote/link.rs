@@ -18,15 +18,18 @@ use agentdeck_protocol::relay_v2::frame::{Reply, SealedBlob, Send as RouteSend};
 use agentdeck_protocol::relay_v2::{DeviceRouteId, MachineRouteId, RequestRouteId};
 use agentdeck_protocol::runtime::identity::MessageId;
 use agentdeck_protocol::runtime::{
-    MAX_RUNTIME_JSON_FRAME_BYTES, RuntimeEnvelope, RuntimeMessage, RuntimeReply, RuntimeRequest,
-    RuntimeTransferCarrierV1, RuntimeTransferChannel,
+    BackfillRequest, MAX_RUNTIME_JSON_FRAME_BYTES, RuntimeEnvelope, RuntimeInnerCursor,
+    RuntimeMessage, RuntimeReply, RuntimeRequest, RuntimeTransferCarrierV1, RuntimeTransferChannel,
 };
 use async_trait::async_trait;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::runtime::events::RuntimeStreamTarget;
 use crate::runtime::store::key_transition::TransitionSnapshotPermit;
-use crate::runtime::store::{RemoteReplyAuthorization, RuntimeStoreHandle, StreamBindingPermit};
+use crate::runtime::store::{
+    RemoteReplyAuthorization, RuntimeId, RuntimeIdKind, RuntimeStoreHandle, StreamBindingPermit,
+};
 use crate::runtime::{
     ConnectionFramingProfile, ConnectionId, ConnectionSink, ConnectionWrite,
     EncodedRuntimeFrameKind, RemotePrincipalActivation, RuntimeCore,
@@ -178,6 +181,13 @@ pub(crate) trait DirectedReplySealer: Send + Sync {
 #[async_trait]
 pub(crate) trait RemoteStreamPublisher: Send + Sync {
     fn admission_ready(&self) -> bool;
+
+    async fn prepare_subscription(
+        &self,
+        _target: RuntimeStreamTarget,
+    ) -> Result<(), RemoteLinkError> {
+        Err(RemoteLinkError::StreamPublisherUnavailable)
+    }
 
     async fn publish_exact(&self, runtime_bytes: Arc<[u8]>) -> Result<(), RemoteLinkError>;
 
@@ -1355,6 +1365,7 @@ async fn run_remote_link(
                                 &mut dispatches,
                                 &cleanup,
                                 &tasks,
+                                publisher.as_ref(),
                                 key_control.as_ref(),
                                 &mut ingress_mode,
                                 send,
@@ -1465,6 +1476,7 @@ async fn dispatch_send(
     dispatches: &mut JoinSet<CoreDispatchCompletion>,
     cleanup: &RemoteLinkConnectionCleanup,
     tasks: &Arc<RemoteLinkTaskTracker>,
+    publisher: &dyn RemoteStreamPublisher,
     key_control: &dyn AuthenticatedKeyControlIngressHandler,
     ingress_mode: &mut RemoteLinkIngressMode,
     send: RouteSend,
@@ -1491,6 +1503,9 @@ async fn dispatch_send(
         return Err(RemoteLinkError::CoreRejected);
     };
     let route_lifecycle = ReplyRouteLifecycle::for_request(request);
+    if let Some(target) = subscription_target(request)? {
+        publisher.prepare_subscription(target).await?;
+    }
     let (principal, authorization, envelope, device_route, request_route, replay) =
         activated.into_parts();
     let connection_key = connection_key(&authorization);
@@ -1602,6 +1617,34 @@ async fn dispatch_send(
         }
     });
     Ok(())
+}
+
+fn subscription_target(
+    request: &RuntimeRequest,
+) -> Result<Option<RuntimeStreamTarget>, RemoteLinkError> {
+    let conversation = |conversation_id: &agentdeck_protocol::runtime::ConversationId| {
+        RuntimeId::parse_canonical(RuntimeIdKind::Conversation, conversation_id.as_str())
+            .map(RuntimeStreamTarget::Conversation)
+            .map_err(|_| RemoteLinkError::CoreRejected)
+    };
+    match request {
+        RuntimeRequest::Subscribe {
+            inner_cursor: RuntimeInnerCursor::Catalog { .. },
+        }
+        | RuntimeRequest::Backfill(BackfillRequest::Catalog { .. }) => {
+            Ok(Some(RuntimeStreamTarget::Catalog))
+        }
+        RuntimeRequest::Subscribe {
+            inner_cursor:
+                RuntimeInnerCursor::Conversation {
+                    conversation_id, ..
+                },
+        }
+        | RuntimeRequest::Backfill(BackfillRequest::Conversation {
+            conversation_id, ..
+        }) => conversation(conversation_id).map(Some),
+        _ => Ok(None),
+    }
 }
 
 /// authenticated ingress 的最后一道 pre-Core 边界。Control 在这里消费且永远不调用

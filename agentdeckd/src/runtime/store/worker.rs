@@ -72,6 +72,7 @@ use super::metadata::{
     UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
 };
 use super::publication::{
+    FinalizeSubscriptionPublicationOutcome, FinalizeSubscriptionPublicationRequest,
     FreezePublicationRequest, FreezeSignedPublicationRequest, FrozenPublication,
     PublicationAcknowledgement, PublicationBarrierCut, PublicationScope, PublicationStreamRecord,
     RotatePublicationStreamRequest, SharedPublicationPreflight, SharedPublicationPreflightRequest,
@@ -3521,6 +3522,19 @@ enum NormalCommand {
         generation: [u8; 16],
         reply: oneshot::Sender<Result<PublicationStreamRecord, RuntimeStoreError>>,
     },
+    EnsureSubscriptionPublicationStream {
+        scope: PublicationScope,
+        reply: oneshot::Sender<Result<PublicationStreamRecord, RuntimeStoreError>>,
+    },
+    EnsureRemoteCatalogPublicationAfterTransition {
+        reply: oneshot::Sender<Result<Option<PublicationStreamRecord>, RuntimeStoreError>>,
+    },
+    FinalizeSubscriptionPublication {
+        request: FinalizeSubscriptionPublicationRequest,
+        reply: oneshot::Sender<
+            Result<stream_pipeline::ManagedSubscriptionPublicationOutcome, RuntimeStoreError>,
+        >,
+    },
     PreflightSharedPublication {
         request: SharedPublicationPreflightRequest,
         proposal: SharedPublicationStreamProposal,
@@ -4372,7 +4386,13 @@ fn run(
                 }
                 command = normal_commands.recv(), if normal_open => {
                     match command {
-                        Some(command) => handle_normal(command, &mut state, &config, &mut commit_hub),
+                        Some(command) => handle_normal(
+                            command,
+                            &mut state,
+                            &config,
+                            &mut commit_hub,
+                            &cleanup_tx,
+                        ),
                         None => normal_open = false,
                     }
                 }
@@ -4457,6 +4477,7 @@ fn handle_normal(
     state: &mut sqlite::RuntimeSqlite,
     config: &RuntimeStoreConfig,
     commit_hub: &mut StoreCommitHub,
+    cleanup_tx: &mpsc::UnboundedSender<StoreCleanup>,
 ) {
     let Queued {
         command,
@@ -4565,6 +4586,15 @@ fn handle_normal(
                 drop(build_permit);
             }
             NormalCommand::CreatePublicationStream { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::EnsureSubscriptionPublicationStream { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::EnsureRemoteCatalogPublicationAfterTransition { reply } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::FinalizeSubscriptionPublication { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
             NormalCommand::PreflightSharedPublication { reply, .. } => {
@@ -4690,7 +4720,20 @@ fn handle_normal(
             let mut effects = CommandStreamEffects::default();
             let result =
                 journal::create_conversation(state, config, input, descriptor_bytes, &mut effects);
-            let result = notify_after_durable_outcome(result, state, config, commit_hub, &effects);
+            let result = match key_transition::ensure_no_active_transition_for_business(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            ) {
+                Ok(()) => notify_after_durable_outcome(result, state, config, commit_hub, &effects),
+                // Activation transaction 与 CatalogDelta 同时 COMMIT；terminal handler
+                // 会在 exact transition completion 后重新认证 HWM 并通知 watcher。
+                Err(RuntimeStoreError::InvalidStateTransition) => result,
+                Err(_) => {
+                    fail_closed_stream_effects(commit_hub, &effects);
+                    result
+                }
+            };
             let _ = reply.send(result);
         }
         NormalCommand::ConfigureConversation {
@@ -4897,6 +4940,62 @@ fn handle_normal(
                 });
             let _ = reply.send(result);
         }
+        NormalCommand::EnsureSubscriptionPublicationStream { scope, reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    super::publication::ensure_subscription_publication_stream(
+                        state, config, scope, now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::EnsureRemoteCatalogPublicationAfterTransition { reply } => {
+            let result = config
+                .clock
+                .now_ms()
+                .map_err(RuntimeStoreError::from)
+                .and_then(|now| {
+                    super::publication::ensure_remote_catalog_publication_after_transition(
+                        state, config, now,
+                    )
+                });
+            let _ = reply.send(result);
+        }
+        NormalCommand::FinalizeSubscriptionPublication { request, reply } => {
+            let result = if request.watch_token.target() != request.target
+                || !commit_hub.contains_watch(&request.watch_token)
+            {
+                Err(RuntimeStoreError::PublicationMismatch)
+            } else {
+                config
+                    .clock
+                    .now_ms()
+                    .map_err(RuntimeStoreError::from)
+                    .and_then(|now| {
+                        let target = request.target;
+                        let captured_high_water = request.captured_high_water;
+                        let cut = super::publication::finalize_subscription_publication(
+                            state, config, request, now,
+                        )?;
+                        let overlap_pin = if cut.stream_binding.is_some() {
+                            pin_subscription_publication_overlap(
+                                state,
+                                target,
+                                cut.inner,
+                                captured_high_water,
+                                now,
+                            )?
+                        } else {
+                            None
+                        };
+                        Ok(FinalizeSubscriptionPublicationOutcome { cut, overlap_pin })
+                    })
+            };
+            stream_pipeline::send_subscription_publication_reply(reply, result, cleanup_tx);
+        }
         NormalCommand::PreflightSharedPublication {
             request,
             proposal,
@@ -5084,6 +5183,17 @@ fn handle_normal(
                 .and_then(|now| {
                     key_transition::complete_key_transition(state, config, operation_id, now)
                 });
+            if result.as_ref().is_ok_and(|record| {
+                record.operation == key_transition::KeyTransitionOperation::ActivateConversation
+                    && record.terminal == Some(key_transition::KeyTransitionTerminal::Completed)
+            }) {
+                notify_authenticated_target(
+                    state,
+                    config,
+                    commit_hub,
+                    RuntimeStreamTarget::Catalog,
+                );
+            }
             let _ = reply.send(result);
         }
         NormalCommand::TryCompleteKeyTransition {
@@ -5097,6 +5207,23 @@ fn handle_normal(
                 .and_then(|now| {
                     key_transition::try_complete_key_transition(state, config, operation_id, now)
                 });
+            if result.as_ref().is_ok_and(|completion| {
+                matches!(
+                    completion,
+                    key_transition::KeyTransitionCompletion::Completed(record)
+                        if record.operation
+                            == key_transition::KeyTransitionOperation::ActivateConversation
+                            && record.terminal
+                                == Some(key_transition::KeyTransitionTerminal::Completed)
+                )
+            }) {
+                notify_authenticated_target(
+                    state,
+                    config,
+                    commit_hub,
+                    RuntimeStreamTarget::Catalog,
+                );
+            }
             let _ = reply.send(result);
         }
         NormalCommand::CancelKeyTransition {
@@ -6507,28 +6634,83 @@ fn notify_after_durable_outcome<T>(
         return result;
     }
     for target in effects.targets() {
-        if !commit_hub.has_watchers(target) {
-            continue;
-        }
-        match config
-            .fault_injector
-            .before_operation(RuntimeStoreOperation::StreamNotificationReadback)
-            .and_then(|()| stream::load_authenticated_target_cut(state, target))
-        {
-            Ok(cut) => {
-                commit_hub.notify_committed(target, cut.high_water);
-            }
-            Err(_) => {
-                commit_hub.fail_closed(target);
-                let target_kind = match target {
-                    RuntimeStreamTarget::Catalog => "catalog",
-                    RuntimeStreamTarget::Conversation(_) => "conversation",
-                };
-                crate::diag::log("runtime_stream_notification_readback_failed", target_kind);
-            }
-        }
+        notify_authenticated_target(state, config, commit_hub, target);
     }
     result
+}
+
+fn fail_closed_stream_effects(commit_hub: &mut StoreCommitHub, effects: &CommandStreamEffects) {
+    for target in effects.targets() {
+        if commit_hub.has_watchers(target) {
+            fail_closed_stream_target(commit_hub, target);
+        }
+    }
+}
+
+/// baseline CAS/readback 与 exact overlap pin 必须留在同一个串行 worker command。
+/// 这样 retention mutation 不可能插入 fresh cut 与 pin 之间；pin 失败也发生在
+/// StreamBinding 下发前。`Current` 表示 `B == captured H`，无需额外 pin。
+fn pin_subscription_publication_overlap(
+    state: &sqlite::RuntimeSqlite,
+    target: RuntimeStreamTarget,
+    baseline: agentdeck_protocol::runtime::StreamCursor,
+    captured_high_water: agentdeck_protocol::runtime::StreamCursor,
+    now_ms: u64,
+) -> Result<Option<RuntimeBackfillPin>, RuntimeStoreError> {
+    let Some(through) = captured_high_water.high_water() else {
+        return if baseline.high_water().is_none() {
+            Ok(None)
+        } else {
+            Err(RuntimeStoreError::PublicationMismatch)
+        };
+    };
+    let target = match target {
+        RuntimeStreamTarget::Catalog => RuntimeBackfillTarget::Catalog,
+        RuntimeStreamTarget::Conversation(conversation_id) => {
+            RuntimeBackfillTarget::Conversation(conversation_id)
+        }
+    };
+    match stream::acquire_backfill_pin_at(state, target, baseline.high_water(), through, now_ms) {
+        Ok(RuntimeBackfillPlan::Current { high_water }) if high_water == Some(through) => Ok(None),
+        Ok(RuntimeBackfillPlan::Pinned(pin)) => Ok(Some(pin)),
+        Ok(RuntimeBackfillPlan::Current { .. }) => Err(RuntimeStoreError::PublicationMismatch),
+        Err(RuntimeStoreError::BackfillNeedSnapshot) => {
+            Err(RuntimeStoreError::PublicationNeedsSnapshot)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn notify_authenticated_target(
+    state: &sqlite::RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    commit_hub: &mut StoreCommitHub,
+    target: RuntimeStreamTarget,
+) {
+    if !commit_hub.has_watchers(target) {
+        return;
+    }
+    match config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::StreamNotificationReadback)
+        .and_then(|()| stream::load_authenticated_target_cut(state, target))
+    {
+        Ok(cut) => {
+            commit_hub.notify_committed(target, cut.high_water);
+        }
+        Err(_) => {
+            fail_closed_stream_target(commit_hub, target);
+        }
+    }
+}
+
+fn fail_closed_stream_target(commit_hub: &mut StoreCommitHub, target: RuntimeStreamTarget) {
+    commit_hub.fail_closed(target);
+    let target_kind = match target {
+        RuntimeStreamTarget::Catalog => "catalog",
+        RuntimeStreamTarget::Conversation(_) => "conversation",
+    };
+    crate::diag::log("runtime_stream_notification_readback_failed", target_kind);
 }
 
 mod critical_command;
@@ -6539,6 +6721,9 @@ mod oversized_event_page_tests;
 
 #[cfg(test)]
 mod stream_barrier_reply_tests;
+
+#[cfg(test)]
+mod subscription_publication_finalize_tests;
 
 #[cfg(test)]
 mod shutdown_tests;

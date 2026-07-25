@@ -11,15 +11,26 @@ use crate::runtime::model::{
     RuntimeStoreError, RuntimeStoreFaultInjector, RuntimeStoreOperation,
 };
 use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
-use agentdeck_protocol::e2ee::{KeyId, KeyPurpose, KeyUpdateSetV1, KeyUpdateV1};
+use agentdeck_protocol::e2ee::{
+    AuthorizationCapabilityV1, AuthorizationPermissionV1, KeyId, KeyPurpose, KeyUpdateSetV1,
+    KeyUpdateV1,
+};
 use agentdeck_protocol::relay_v2::auth::Ed25519Signature;
+use agentdeck_protocol::relay_v2::frame::{InstallGrant, OpaqueRouteFrame, RelayFrameBody};
 use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, KeyDirectoryRevision as RelayKeyDirectoryRevision, StreamRouteId,
+};
+use agentdeck_protocol::relay_v2::{
+    GrantSerial, RELAY_PROTOCOL_VERSION, RootKeyId, TrustEpoch, encode,
 };
 use agentdeck_protocol::runtime::sync::StreamCursor;
 use tempfile::TempDir;
 
 use super::identity::{RuntimeId, RuntimeIdKind};
+use super::pairing_tests::{GenerousCapacity, TestRoot};
+use super::{
+    active_authorization_store_with_pending_transition_for_test, matching_bootstrap_update_for_test,
+};
 
 fn recipient(route: u8, serial: u64) -> KeyTransitionRecipient {
     KeyTransitionRecipient {
@@ -51,6 +62,20 @@ fn begin_key_transition(
         );
     }
     key_transition_api::begin_key_transition(state, config, input)
+}
+
+fn mark_key_barriers_committed(
+    state: &mut super::sqlite::RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    operation_id: [u8; 16],
+    committed_at_ms: u64,
+) -> Result<KeyTransitionRecord, RuntimeStoreError> {
+    key_transition_api::mark_key_barriers_committed_without_authorization_revalidation_for_test(
+        state,
+        config,
+        operation_id,
+        committed_at_ms,
+    )
 }
 
 fn maximal_canonical_key_update_set() -> Vec<u8> {
@@ -186,6 +211,598 @@ fn open_test_state() -> (
         .expect("create key-transition StorageKEK");
     let state = super::sqlite::open(&config, kek).expect("open key-transition sqlite state");
     (root, keys, config, state)
+}
+
+async fn open_authorized_barriers_frozen_state(
+    label: &str,
+) -> (
+    TestRoot,
+    RuntimeStoreConfig,
+    super::sqlite::RuntimeSqlite,
+    [u8; 16],
+) {
+    let root = TestRoot::new(label);
+    let keys = MemoryKeyStore::new();
+    let store = active_authorization_store_with_pending_transition_for_test(
+        &root.database(),
+        load_or_create_storage_kek(&keys, &root.database())
+            .expect("load authorization fixture StorageKEK"),
+        vec![AuthorizationCapabilityV1::Catalog],
+        vec![AuthorizationPermissionV1::CatalogRead],
+    )
+    .await;
+
+    let recovery = store
+        .load_active_key_transition()
+        .await
+        .expect("load authorization fixture transition")
+        .expect("authorization fixture transition exists");
+    assert_eq!(recovery.transition.operation, KeyTransitionOperation::Add);
+    assert_eq!(recovery.transition.phase, KeyTransitionPhase::DrainingOld);
+    assert_eq!(recovery.transition.recipients.len(), 1);
+    assert!(recovery.transition.cuts.is_empty());
+    let operation_id = recovery.transition.operation_id;
+    store
+        .finalize_key_directory_rotation(operation_id)
+        .await
+        .expect("finalize authorization fixture key-directory rotation");
+    let mut updates = Vec::with_capacity(recovery.transition.recipients.len());
+    for recipient in recovery.transition.recipients {
+        updates.push(matching_bootstrap_update_for_test(&store, recipient).await);
+    }
+    store
+        .freeze_key_updates(operation_id, updates)
+        .await
+        .expect("freeze authorization fixture update");
+    store
+        .freeze_key_barriers(operation_id, Vec::new())
+        .await
+        .expect("freeze authorization fixture zero-cut barriers");
+    let frozen = store
+        .load_active_key_transition()
+        .await
+        .expect("reload frozen authorization fixture")
+        .expect("frozen authorization fixture remains active");
+    assert_eq!(frozen.transition.phase, KeyTransitionPhase::BarriersFrozen);
+    store
+        .shutdown()
+        .await
+        .expect("shutdown authorization fixture store");
+
+    let config = RuntimeStoreConfig::new(root.database()).with_capacity_probe(GenerousCapacity);
+    let state = super::sqlite::open(
+        &config,
+        load_or_create_storage_kek(&keys, &root.database())
+            .expect("reload authorization fixture StorageKEK"),
+    )
+    .expect("reopen authorization fixture SQLite");
+    (root, config, state, operation_id)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BarrierAuthorizationTamper {
+    Ciphertext,
+    MetadataToken,
+    CanonicalAuthorization,
+    GrantAndMachineRoot,
+    Revision,
+    Roster,
+}
+
+impl BarrierAuthorizationTamper {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ciphertext => "ciphertext",
+            Self::MetadataToken => "metadata-token",
+            Self::CanonicalAuthorization => "canonical-authorization",
+            Self::GrantAndMachineRoot => "grant-machine-root",
+            Self::Revision => "revision",
+            Self::Roster => "roster",
+        }
+    }
+
+    fn matches_error(self, error: &RuntimeStoreError) -> bool {
+        match self {
+            Self::Ciphertext => matches!(error, RuntimeStoreError::Cipher(_)),
+            Self::MetadataToken | Self::CanonicalAuthorization => {
+                matches!(error, RuntimeStoreError::UnknownOrCorruptSchema)
+            }
+            Self::GrantAndMachineRoot | Self::Revision | Self::Roster => {
+                matches!(error, RuntimeStoreError::PublicationMismatch)
+            }
+        }
+    }
+}
+
+fn authorization_primary_key(device_route: DeviceRouteId, grant_serial: GrantSerial) -> [u8; 24] {
+    let mut primary_key = [0_u8; 24];
+    primary_key[..16].copy_from_slice(device_route.as_bytes());
+    primary_key[16..].copy_from_slice(&grant_serial.value().to_be_bytes());
+    primary_key
+}
+
+fn sealed_authorization(
+    state: &super::sqlite::RuntimeSqlite,
+    device_route: DeviceRouteId,
+    grant_serial: GrantSerial,
+) -> Vec<u8> {
+    state
+        .connection
+        .query_row(
+            "SELECT sealed_authorization FROM remote_authorization_ledger
+             WHERE device_route = ?1 AND grant_serial = ?2",
+            rusqlite::params![
+                device_route.as_bytes().as_slice(),
+                super::sequence::encode_sequence(grant_serial.value()),
+            ],
+            |row| row.get(0),
+        )
+        .expect("load authorization ciphertext")
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct BarrierCommitRawRows {
+    transition: (Vec<u8>, String, Vec<u8>, i64, Vec<u8>),
+    authorizations: Vec<RawAuthorizationRow>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RawAuthorizationRow {
+    device_route: Vec<u8>,
+    grant_serial: String,
+    lifecycle: String,
+    database_id: Vec<u8>,
+    device_sign_fingerprint: Vec<u8>,
+    grant_hash: Vec<u8>,
+    authorization_hash: Vec<u8>,
+    key_directory_revision: String,
+    sealed_authorization: Vec<u8>,
+    sealed_authorization_bytes: i64,
+    revocation_hash: Option<Vec<u8>>,
+    sealed_revocation: Option<Vec<u8>>,
+    sealed_revocation_bytes: Option<i64>,
+    created_at_ms: i64,
+    state_changed_at_ms: i64,
+    metadata_token: Vec<u8>,
+}
+
+fn barrier_commit_raw_rows(
+    state: &super::sqlite::RuntimeSqlite,
+    operation_id: [u8; 16],
+) -> BarrierCommitRawRows {
+    let transition = state
+        .connection
+        .query_row(
+            "SELECT operation_id, phase, sealed_state, sealed_state_bytes, metadata_token
+             FROM remote_key_transitions WHERE operation_id = ?1",
+            [&operation_id[..]],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("load raw barrier transition row");
+    let mut statement = state
+        .connection
+        .prepare(
+            "SELECT device_route, grant_serial, lifecycle, database_id,
+                    device_sign_fingerprint, grant_hash, authorization_hash,
+                    key_directory_revision, sealed_authorization, sealed_authorization_bytes,
+                    revocation_hash, sealed_revocation, sealed_revocation_bytes,
+                    created_at_ms, state_changed_at_ms, metadata_token
+             FROM remote_authorization_ledger ORDER BY device_route, grant_serial",
+        )
+        .expect("prepare raw authorization snapshot");
+    let authorizations = statement
+        .query_map([], |row| {
+            Ok(RawAuthorizationRow {
+                device_route: row.get(0)?,
+                grant_serial: row.get(1)?,
+                lifecycle: row.get(2)?,
+                database_id: row.get(3)?,
+                device_sign_fingerprint: row.get(4)?,
+                grant_hash: row.get(5)?,
+                authorization_hash: row.get(6)?,
+                key_directory_revision: row.get(7)?,
+                sealed_authorization: row.get(8)?,
+                sealed_authorization_bytes: row.get(9)?,
+                revocation_hash: row.get(10)?,
+                sealed_revocation: row.get(11)?,
+                sealed_revocation_bytes: row.get(12)?,
+                created_at_ms: row.get(13)?,
+                state_changed_at_ms: row.get(14)?,
+                metadata_token: row.get(15)?,
+            })
+        })
+        .expect("query raw authorization snapshot")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect raw authorization snapshot");
+    BarrierCommitRawRows {
+        transition,
+        authorizations,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_authenticated_authorization(
+    state: &mut super::sqlite::RuntimeSqlite,
+    existing: &super::pairing_authorization::AuthenticatedAuthorization,
+    device_route: DeviceRouteId,
+    grant_serial: GrantSerial,
+    lifecycle: super::pairing_authorization::AuthorizationLifecycle,
+    key_directory_revision: u64,
+    grant: &agentdeck_protocol::relay_v2::RelayGrant,
+    authorization: &agentdeck_protocol::e2ee::DeviceAuthorizationV1,
+) {
+    let canonical_relay_grant = grant.canonical_bytes();
+    let canonical_install_frame = encode(&OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::InstallGrant(InstallGrant {
+            grant: grant.clone(),
+        }),
+    });
+    let canonical_authorization = authorization
+        .canonical_bytes()
+        .expect("encode rewritten authorization");
+    let payload = super::pairing_authorization::encode_authorization_payload(
+        &canonical_relay_grant,
+        &canonical_install_frame,
+        &canonical_authorization,
+    )
+    .expect("encode rewritten authorization payload");
+    let primary_key = authorization_primary_key(device_route, grant_serial);
+    let sealed = super::pairing_grant::seal_row(
+        &state.key_bundle,
+        state.database_id,
+        b"remote_authorization_ledger",
+        &primary_key,
+        b"sealed_authorization",
+        payload.as_slice(),
+        super::pairing_authorization::MAX_AUTHORIZATION_PLAINTEXT_BYTES,
+    )
+    .expect("seal rewritten authorization payload");
+    let grant_hash = grant.canonical_sha256();
+    let authorization_hash = authorization
+        .canonical_sha256()
+        .expect("hash rewritten authorization");
+    let token = super::pairing_authorization::authorization_token(
+        &state.key_bundle,
+        state.database_id,
+        device_route,
+        grant_serial,
+        lifecycle,
+        existing.device_sign_fingerprint,
+        grant_hash,
+        authorization_hash,
+        key_directory_revision,
+        &sealed,
+        existing.created_at_ms,
+        existing.state_changed_at_ms,
+    )
+    .expect("authenticate rewritten authorization row");
+    assert_eq!(
+        state
+            .connection
+            .execute(
+                "UPDATE remote_authorization_ledger
+                 SET device_route = ?1, grant_serial = ?2, lifecycle = ?3,
+                     grant_hash = ?4, authorization_hash = ?5,
+                     key_directory_revision = ?6, sealed_authorization = ?7,
+                     sealed_authorization_bytes = ?8, metadata_token = ?9
+                 WHERE device_route = ?10 AND grant_serial = ?11",
+                rusqlite::params![
+                    device_route.as_bytes().as_slice(),
+                    super::sequence::encode_sequence(grant_serial.value()),
+                    lifecycle.as_str(),
+                    &grant_hash[..],
+                    &authorization_hash[..],
+                    super::sequence::encode_sequence(key_directory_revision),
+                    &sealed,
+                    i64::try_from(sealed.len()).expect("rewritten authorization size fits i64"),
+                    &token[..],
+                    existing.device_route.as_bytes().as_slice(),
+                    super::sequence::encode_sequence(existing.grant_serial.value()),
+                ],
+            )
+            .expect("rewrite authenticated authorization row"),
+        1
+    );
+}
+
+fn rewrite_noncanonical_authorization(
+    state: &mut super::sqlite::RuntimeSqlite,
+    existing: &super::pairing_authorization::AuthenticatedAuthorization,
+) {
+    let mut noncanonical = existing.canonical_authorization.expose_secret().to_vec();
+    noncanonical.push(0xff);
+    let payload = super::pairing_authorization::encode_authorization_payload(
+        &existing.canonical_relay_grant,
+        &existing.canonical_install_frame,
+        &noncanonical,
+    )
+    .expect("encode noncanonical authorization payload");
+    let primary_key = authorization_primary_key(existing.device_route, existing.grant_serial);
+    let sealed = super::pairing_grant::seal_row(
+        &state.key_bundle,
+        state.database_id,
+        b"remote_authorization_ledger",
+        &primary_key,
+        b"sealed_authorization",
+        payload.as_slice(),
+        super::pairing_authorization::MAX_AUTHORIZATION_PLAINTEXT_BYTES,
+    )
+    .expect("seal noncanonical authorization payload");
+    let token = super::pairing_authorization::authorization_token(
+        &state.key_bundle,
+        state.database_id,
+        existing.device_route,
+        existing.grant_serial,
+        existing.lifecycle,
+        existing.device_sign_fingerprint,
+        existing.grant_hash,
+        existing.authorization_hash,
+        existing.key_directory_revision,
+        &sealed,
+        existing.created_at_ms,
+        existing.state_changed_at_ms,
+    )
+    .expect("authenticate noncanonical authorization row");
+    assert_eq!(
+        state
+            .connection
+            .execute(
+                "UPDATE remote_authorization_ledger
+                 SET sealed_authorization = ?1, sealed_authorization_bytes = ?2,
+                     metadata_token = ?3
+                 WHERE device_route = ?4 AND grant_serial = ?5",
+                rusqlite::params![
+                    &sealed,
+                    i64::try_from(sealed.len()).expect("noncanonical authorization size fits i64"),
+                    &token[..],
+                    existing.device_route.as_bytes().as_slice(),
+                    super::sequence::encode_sequence(existing.grant_serial.value()),
+                ],
+            )
+            .expect("write noncanonical authorization row"),
+        1
+    );
+}
+
+fn apply_barrier_authorization_tamper(
+    state: &mut super::sqlite::RuntimeSqlite,
+    target: BarrierAuthorizationTamper,
+) {
+    let mut authorizations = super::pairing_authorization::load_authorizations(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+    )
+    .expect("load pristine authorization tamper row");
+    assert_eq!(authorizations.len(), 1);
+    let existing = authorizations.remove(0);
+    match target {
+        BarrierAuthorizationTamper::MetadataToken => {
+            assert_eq!(
+                state
+                    .connection
+                    .execute(
+                        "UPDATE remote_authorization_ledger SET metadata_token = ?1
+                         WHERE device_route = ?2 AND grant_serial = ?3",
+                        rusqlite::params![
+                            &[0xff_u8; 32][..],
+                            existing.device_route.as_bytes().as_slice(),
+                            super::sequence::encode_sequence(existing.grant_serial.value()),
+                        ],
+                    )
+                    .expect("tamper authorization metadata token"),
+                1
+            );
+        }
+        BarrierAuthorizationTamper::Ciphertext => {
+            let mut sealed =
+                sealed_authorization(state, existing.device_route, existing.grant_serial);
+            let last = sealed
+                .last_mut()
+                .expect("authorization ciphertext is non-empty");
+            *last ^= 0x01;
+            let token = super::pairing_authorization::authorization_token(
+                &state.key_bundle,
+                state.database_id,
+                existing.device_route,
+                existing.grant_serial,
+                existing.lifecycle,
+                existing.device_sign_fingerprint,
+                existing.grant_hash,
+                existing.authorization_hash,
+                existing.key_directory_revision,
+                &sealed,
+                existing.created_at_ms,
+                existing.state_changed_at_ms,
+            )
+            .expect("authenticate tampered ciphertext metadata");
+            assert_eq!(
+                state
+                    .connection
+                    .execute(
+                        "UPDATE remote_authorization_ledger
+                         SET sealed_authorization = ?1, metadata_token = ?2
+                         WHERE device_route = ?3 AND grant_serial = ?4",
+                        rusqlite::params![
+                            &sealed,
+                            &token[..],
+                            existing.device_route.as_bytes().as_slice(),
+                            super::sequence::encode_sequence(existing.grant_serial.value()),
+                        ],
+                    )
+                    .expect("tamper authorization ciphertext"),
+                1
+            );
+        }
+        BarrierAuthorizationTamper::CanonicalAuthorization => {
+            rewrite_noncanonical_authorization(state, &existing);
+        }
+        BarrierAuthorizationTamper::GrantAndMachineRoot => {
+            let mut grant = existing.grant.clone();
+            grant.root_key_id = RootKeyId::from_bytes([0xb8; 16]);
+            grant.trust_epoch = TrustEpoch::new(grant.trust_epoch.value() + 1);
+            let mut authorization = existing.authorization.clone();
+            authorization.root_key_id = grant.root_key_id;
+            authorization.trust_epoch = grant.trust_epoch;
+            authorization.grant_hash = grant.canonical_sha256();
+            rewrite_authenticated_authorization(
+                state,
+                &existing,
+                existing.device_route,
+                existing.grant_serial,
+                existing.lifecycle,
+                existing.key_directory_revision,
+                &grant,
+                &authorization,
+            );
+        }
+        BarrierAuthorizationTamper::Revision => {
+            let mut authorization = existing.authorization.clone();
+            authorization.grant_hash = existing.grant.canonical_sha256();
+            rewrite_authenticated_authorization(
+                state,
+                &existing,
+                existing.device_route,
+                existing.grant_serial,
+                existing.lifecycle,
+                existing.key_directory_revision + 1,
+                &existing.grant,
+                &authorization,
+            );
+        }
+        BarrierAuthorizationTamper::Roster => {
+            let device_route = DeviceRouteId::from_bytes([0xb9; 16]);
+            let mut grant = existing.grant.clone();
+            grant.device_route = device_route;
+            let mut authorization = existing.authorization.clone();
+            authorization.device_route = device_route;
+            authorization.grant_hash = grant.canonical_sha256();
+            rewrite_authenticated_authorization(
+                state,
+                &existing,
+                device_route,
+                existing.grant_serial,
+                existing.lifecycle,
+                existing.key_directory_revision,
+                &grant,
+                &authorization,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mark_key_barriers_committed_accepts_pristine_authorization_after_material_read() {
+    // 显式锁定 production symbol；本文件同名 legacy wrapper 不参与 focused gate。
+    let production_mark = key_transition_api::mark_key_barriers_committed;
+    let (_root, config, mut state, operation_id) =
+        open_authorized_barriers_frozen_state("barrier-auth-pristine").await;
+    super::transition_material::load_transition_material_projection(&state, [0x91; 32])
+        .expect("read pristine coordinator material")
+        .expect("pristine coordinator material exists");
+    let committed_at_ms = load_active_key_transition(&state)
+        .expect("load pristine frozen transition")
+        .expect("pristine frozen transition remains active")
+        .transition
+        .state_changed_at_ms
+        + 1;
+    let committed = production_mark(&mut state, &config, operation_id, committed_at_ms)
+        .expect("pristine authorization permits barrier commit");
+    assert_eq!(committed.phase, KeyTransitionPhase::BarriersCommitted);
+    assert_eq!(
+        load_active_key_transition(&state)
+            .expect("reload pristine committed transition")
+            .expect("pristine committed transition remains active")
+            .transition
+            .phase,
+        KeyTransitionPhase::BarriersCommitted
+    );
+}
+
+#[tokio::test]
+async fn mark_key_barriers_committed_reauthenticates_authorization_matrix_without_writes() {
+    // 若误走本文件的 cfg(test) legacy wrapper，本矩阵会错误提交 tampered state；固定
+    // production function item 后，六类必须全部由事务内 revalidation 拒绝。
+    let production_mark = key_transition_api::mark_key_barriers_committed;
+    for target in [
+        BarrierAuthorizationTamper::Ciphertext,
+        BarrierAuthorizationTamper::MetadataToken,
+        BarrierAuthorizationTamper::CanonicalAuthorization,
+        BarrierAuthorizationTamper::GrantAndMachineRoot,
+        BarrierAuthorizationTamper::Revision,
+        BarrierAuthorizationTamper::Roster,
+    ] {
+        let label = format!("barrier-auth-{}", target.label());
+        let (_root, config, mut state, operation_id) =
+            open_authorized_barriers_frozen_state(&label).await;
+        super::transition_material::load_transition_material_projection(&state, [0x91; 32])
+            .expect("read coordinator material before authorization tamper")
+            .expect("coordinator material exists before authorization tamper");
+        apply_barrier_authorization_tamper(&mut state, target);
+        let before_transition = load_active_key_transition(&state)
+            .expect("load transition before authorization rejection")
+            .expect("tampered authorization leaves transition active");
+        assert_eq!(
+            before_transition.transition.phase,
+            KeyTransitionPhase::BarriersFrozen
+        );
+        let before_ledger = super::sqlite::load_runtime_ledger(
+            &state.connection,
+            &state.key_bundle,
+            state.database_id,
+        )
+        .expect("load ledger before authorization rejection");
+        let before_rows = barrier_commit_raw_rows(&state, operation_id);
+        let before_changes = state.connection.total_changes();
+        let committed_at_ms = before_transition.transition.state_changed_at_ms + 1;
+
+        let error = production_mark(&mut state, &config, operation_id, committed_at_ms)
+            .expect_err("authorization tamper must reject barrier commit");
+        assert!(
+            target.matches_error(&error),
+            "target={target:?}, error={error:?}"
+        );
+        assert!(matches!(
+            ensure_remote_ingress_allowed(&state, RemoteTransitionIngressClass::Business),
+            Err(RuntimeStoreError::InvalidStateTransition)
+        ));
+        assert_eq!(
+            state.connection.total_changes(),
+            before_changes,
+            "target={target:?}"
+        );
+        assert_eq!(
+            super::sqlite::load_runtime_ledger(
+                &state.connection,
+                &state.key_bundle,
+                state.database_id,
+            )
+            .expect("reload ledger after authorization rejection"),
+            before_ledger,
+            "target={target:?}"
+        );
+        assert_eq!(
+            load_active_key_transition(&state)
+                .expect("reload transition after authorization rejection")
+                .expect("rejected transition remains active"),
+            before_transition,
+            "target={target:?}"
+        );
+        assert_eq!(
+            barrier_commit_raw_rows(&state, operation_id),
+            before_rows,
+            "target={target:?}"
+        );
+    }
 }
 
 fn assert_v12_audit(state: &super::sqlite::RuntimeSqlite) {
@@ -1557,7 +2174,7 @@ fn durable_final_ack_reopen_try_complete_releases_transition_slot() {
         &config,
         BeginKeyTransition {
             operation_id,
-            operation: KeyTransitionOperation::Add,
+            operation: KeyTransitionOperation::CounterRecovery,
             target: KeyTransitionTarget::Device(member),
             from_revision: 0,
             to_revision: 1,
@@ -2082,7 +2699,7 @@ fn maximum_attached_key_update_row_seals_and_reopens_byte_exact() {
 }
 
 #[test]
-fn activate_conversation_runs_exact_phase_ack_and_business_fence_contract() {
+fn activate_conversation_requires_exact_directory_advance_before_barriers_committed() {
     let (_root, _keys, config, mut state) = open_test_state();
     let operation_id = [0x31; 16];
     let roster = vec![recipient(0x41, 7)];
@@ -2166,73 +2783,24 @@ fn activate_conversation_runs_exact_phase_ack_and_business_fence_contract() {
     );
     freeze_key_barriers(&mut state, &config, operation_id, Vec::new(), 103)
         .expect("conversation activation uses an empty stream cut");
-    mark_key_barriers_committed(&mut state, &config, operation_id, 104)
-        .expect("mark empty activation barrier committed");
+    let changes_before_commit = state.connection.total_changes();
+    assert!(matches!(
+        mark_key_barriers_committed(&mut state, &config, operation_id, 104),
+        Err(RuntimeStoreError::PublicationMismatch)
+    ));
+    assert_eq!(state.connection.total_changes(), changes_before_commit);
+    let recovery = load_active_key_transition(&state)
+        .expect("load activation after rejected proofless commit")
+        .expect("proofless activation remains fenced");
+    assert_eq!(
+        recovery.transition.phase,
+        KeyTransitionPhase::BarriersFrozen
+    );
+    assert_v12_audit(&state);
     assert!(matches!(
         ensure_remote_ingress_allowed(&state, RemoteTransitionIngressClass::Business),
         Err(RuntimeStoreError::InvalidStateTransition)
     ));
-
-    assert!(matches!(
-        complete_key_transition(&mut state, &config, operation_id, 105),
-        Err(RuntimeStoreError::InvalidStateTransition)
-    ));
-    let update_hash = canonical_update_hash(&updates[0].canonical_update_set).expect("update hash");
-    assert!(matches!(
-        acknowledge_key_update(
-            &mut state,
-            &config,
-            AcknowledgeKeyUpdate {
-                operation_id,
-                recipient: roster[0],
-                key_revision: 9,
-                update_hash: [0x99; 32],
-                canonical_ack: b"exact-ack".to_vec(),
-                acknowledged_at_ms: 105,
-            },
-        ),
-        Err(RuntimeStoreError::PublicationMismatch)
-    ));
-    acknowledge_key_update(
-        &mut state,
-        &config,
-        AcknowledgeKeyUpdate {
-            operation_id,
-            recipient: roster[0],
-            key_revision: 9,
-            update_hash,
-            canonical_ack: b"exact-ack".to_vec(),
-            acknowledged_at_ms: 105,
-        },
-    )
-    .expect("bind exact ACK to exact update");
-    acknowledge_key_update(
-        &mut state,
-        &config,
-        AcknowledgeKeyUpdate {
-            operation_id,
-            recipient: roster[0],
-            key_revision: 9,
-            update_hash,
-            canonical_ack: b"exact-ack".to_vec(),
-            acknowledged_at_ms: 106,
-        },
-    )
-    .expect("exact key ACK replay preserves first timestamp");
-    let completed = complete_key_transition(&mut state, &config, operation_id, 106)
-        .expect("complete only after every recipient ACK");
-    assert_eq!(completed.terminal, Some(KeyTransitionTerminal::Completed));
-    assert_eq!(
-        completed.retain_until_ms,
-        Some(106 + KEY_TRANSITION_TOMBSTONE_RETENTION_MS)
-    );
-    assert_v12_audit(&state);
-    assert!(
-        load_active_key_transition(&state)
-            .expect("load terminal recovery state")
-            .is_none()
-    );
-    assert!(ensure_remote_ingress_allowed(&state, RemoteTransitionIngressClass::Business).is_ok());
 }
 
 #[test]
@@ -2240,20 +2808,14 @@ fn key_update_ack_resolver_rejects_ambiguous_retained_candidates() {
     let (_root, _keys, config, mut state) = open_test_state();
     let member = recipient(0x42, 8);
     let canonical_update_set = b"same-revision-update".to_vec();
-    for (operation_id, conversation_id, stream_route, base) in [
-        ([0x43; 16], [0x44; 16], [0x45; 16], 200_u64),
-        ([0x46; 16], [0x47; 16], [0x48; 16], 210_u64),
-    ] {
+    for (operation_id, base) in [([0x43; 16], 200_u64), ([0x46; 16], 210_u64)] {
         begin_key_transition(
             &mut state,
             &config,
             BeginKeyTransition {
                 operation_id,
-                operation: KeyTransitionOperation::ActivateConversation,
-                target: KeyTransitionTarget::Conversation {
-                    conversation_id,
-                    stream_route,
-                },
+                operation: KeyTransitionOperation::CounterRecovery,
+                target: KeyTransitionTarget::Device(member),
                 from_revision: 8,
                 to_revision: 9,
                 recipients: vec![member],
@@ -2277,9 +2839,9 @@ fn key_update_ack_resolver_rejects_ambiguous_retained_candidates() {
         )
         .expect("freeze duplicate-revision fixture update");
         freeze_key_barriers(&mut state, &config, operation_id, Vec::new(), base + 3)
-            .expect("freeze empty activation barrier");
+            .expect("freeze empty counter-recovery barrier");
         mark_key_barriers_committed(&mut state, &config, operation_id, base + 4)
-            .expect("commit empty activation barrier");
+            .expect("commit empty counter-recovery barrier");
         acknowledge_key_update(
             &mut state,
             &config,
@@ -2750,11 +3312,8 @@ fn add_revoke_roster_rules_and_post_rotation_cancel_are_fail_closed() {
         &config,
         BeginKeyTransition {
             operation_id,
-            operation: KeyTransitionOperation::ActivateConversation,
-            target: KeyTransitionTarget::Conversation {
-                conversation_id: [0x69; 16],
-                stream_route: [0x6a; 16],
-            },
+            operation: KeyTransitionOperation::Add,
+            target: KeyTransitionTarget::Device(member),
             from_revision: 1,
             to_revision: 2,
             recipients: vec![member],
@@ -2815,7 +3374,7 @@ fn add_revoke_roster_rules_and_post_rotation_cancel_are_fail_closed() {
     ));
 
     freeze_key_barriers(&mut state, &config, operation_id, Vec::new(), 207)
-        .expect("freeze empty activation barrier cut");
+        .expect("freeze empty counter-recovery barrier cut");
     assert!(matches!(
         cancel_key_transition(&mut state, &config, operation_id, 208),
         Err(RuntimeStoreError::InvalidStateTransition)
@@ -2837,7 +3396,7 @@ fn add_revoke_roster_rules_and_post_rotation_cancel_are_fail_closed() {
     ));
 
     mark_key_barriers_committed(&mut state, &config, operation_id, 209)
-        .expect("commit empty activation barrier cut");
+        .expect("commit empty counter-recovery barrier cut");
     assert!(matches!(
         cancel_key_transition(&mut state, &config, operation_id, 210),
         Err(RuntimeStoreError::InvalidStateTransition)
@@ -2961,11 +3520,8 @@ fn complete_gc_fixture(
         config,
         BeginKeyTransition {
             operation_id,
-            operation: KeyTransitionOperation::ActivateConversation,
-            target: KeyTransitionTarget::Conversation {
-                conversation_id: [operation_id[0].wrapping_add(2); 16],
-                stream_route: [operation_id[0].wrapping_add(3); 16],
-            },
+            operation: KeyTransitionOperation::Add,
+            target: KeyTransitionTarget::Device(member),
             from_revision: 1,
             to_revision: 2,
             recipients: vec![member],
@@ -2973,7 +3529,7 @@ fn complete_gc_fixture(
             created_at_ms: base,
         },
     )
-    .expect("begin GC fixture transition");
+    .expect("begin GC fixture zero-cut Add transition");
     mark_rotated_preparing_updates(state, config, operation_id, base + 1)
         .expect("rotate GC fixture transition");
     let canonical_update_set = vec![operation_id[0]; 32];
@@ -2990,7 +3546,7 @@ fn complete_gc_fixture(
     )
     .expect("freeze GC fixture update");
     freeze_key_barriers(state, config, operation_id, Vec::new(), base + 3)
-        .expect("freeze GC fixture empty barriers");
+        .expect("freeze GC fixture empty counter-recovery barriers");
     mark_key_barriers_committed(state, config, operation_id, base + 4)
         .expect("commit GC fixture empty barriers");
     acknowledge_key_update(
@@ -3006,13 +3562,17 @@ fn complete_gc_fixture(
         },
     )
     .expect("ack GC fixture update");
-    complete_key_transition(state, config, operation_id, terminal_at_ms)
+    let completed = complete_key_transition(state, config, operation_id, terminal_at_ms)
         .expect("complete GC fixture transition");
     let trust_domain = [0x7a; 32];
     let retirement_at_ms = terminal_at_ms + COUNTER_RETIREMENT_RETENTION_MS;
+    assert_eq!(
+        completed.counter_retirement,
+        CounterRetirementLifecycle::Pending
+    );
     let plan = load_pending_counter_retirement_plan(state, trust_domain, retirement_at_ms)
         .expect("load GC fixture counter-retirement plan")
-        .expect("completed transition requires explicit counter-retirement finalization");
+        .expect("completed zero-cut Add requires explicit empty counter-retirement finalization");
     assert!(plan.scope_tokens.is_empty());
     assert_eq!(
         apply_counter_retirement_after_guard_readback(
@@ -3029,6 +3589,70 @@ fn complete_gc_fixture(
             manifest_rows_deleted: 0,
         }
     );
+}
+
+fn complete_counter_recovery_fixture(
+    state: &mut super::sqlite::RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    operation_id: [u8; 16],
+    terminal_at_ms: u64,
+) -> KeyTransitionRecipient {
+    let member = recipient(
+        operation_id[0].wrapping_add(1),
+        u64::from(operation_id[0]) + 1,
+    );
+    let base = terminal_at_ms - 5;
+    begin_key_transition(
+        state,
+        config,
+        BeginKeyTransition {
+            operation_id,
+            operation: KeyTransitionOperation::CounterRecovery,
+            target: KeyTransitionTarget::Device(member),
+            from_revision: 1,
+            to_revision: 2,
+            recipients: vec![member],
+            replay_retirement: None,
+            created_at_ms: base,
+        },
+    )
+    .expect("begin matching-update counter-recovery fixture");
+    mark_rotated_preparing_updates(state, config, operation_id, base + 1)
+        .expect("rotate matching-update fixture");
+    let canonical_update_set = vec![operation_id[0]; 32];
+    freeze_key_updates(
+        state,
+        config,
+        operation_id,
+        vec![FrozenKeyUpdate {
+            recipient: member,
+            key_revision: 2,
+            canonical_update_set: canonical_update_set.clone(),
+        }],
+        base + 2,
+    )
+    .expect("freeze matching-update fixture");
+    freeze_key_barriers(state, config, operation_id, Vec::new(), base + 3)
+        .expect("freeze matching-update empty barriers");
+    mark_key_barriers_committed(state, config, operation_id, base + 4)
+        .expect("commit matching-update empty barriers");
+    acknowledge_key_update(
+        state,
+        config,
+        AcknowledgeKeyUpdate {
+            operation_id,
+            recipient: member,
+            key_revision: 2,
+            update_hash: canonical_update_hash(&canonical_update_set)
+                .expect("matching-update hash"),
+            canonical_ack: vec![operation_id[0].wrapping_add(4); 16],
+            acknowledged_at_ms: terminal_at_ms,
+        },
+    )
+    .expect("ack matching-update fixture");
+    complete_key_transition(state, config, operation_id, terminal_at_ms)
+        .expect("complete matching-update fixture");
+    member
 }
 
 fn transition_row_count(state: &super::sqlite::RuntimeSqlite, operation_id: [u8; 16]) -> u64 {
@@ -3149,11 +3773,7 @@ fn fresh_bootstrap_reconcile_requires_a_matching_add_or_renew_transition() {
 fn legacy_collected_proof_read_rejects_a_matching_update_without_matching_transition() {
     let (_root, _keys, config, mut state) = open_test_state();
     let operation_id = [0xd3; 16];
-    complete_gc_fixture(&mut state, &config, operation_id, 20);
-    let exact_recipient = recipient(
-        operation_id[0].wrapping_add(1),
-        u64::from(operation_id[0]) + 1,
-    );
+    let exact_recipient = complete_counter_recovery_fixture(&mut state, &config, operation_id, 20);
     let error = match load_pairing_bootstrap_install_proof(
         &state.connection,
         &state.key_bundle,

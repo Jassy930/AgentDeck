@@ -57,6 +57,7 @@ pub(crate) enum TransitionStoreStage {
     Rotation,
     Completion,
     ReplayRetirement,
+    CatalogProvision,
 }
 
 impl TransitionStoreStage {
@@ -65,6 +66,7 @@ impl TransitionStoreStage {
             Self::Rotation => "daemon.remote.transition.rotation_store_failed",
             Self::Completion => "daemon.remote.transition.completion_store_failed",
             Self::ReplayRetirement => "daemon.remote.transition.replay_retirement_store_failed",
+            Self::CatalogProvision => "daemon.remote.transition.catalog_provision_store_failed",
         }
     }
 }
@@ -79,6 +81,8 @@ pub(crate) enum KeyTransitionRecoveryError {
     CompletionStore,
     #[error("device-command replay retirement Store recovery failed")]
     ReplayRetirementStore,
+    #[error("remote Catalog provisioning after transition failed")]
+    CatalogProvisionStore,
     #[error("key-transition {0:?} Store progress is temporarily unavailable")]
     RetryableStore(TransitionStoreStage),
     #[error("key-transition publication is waiting for an authenticated Relay reconnect")]
@@ -104,6 +108,9 @@ impl KeyTransitionRecoveryError {
             Self::CompletionStore => "daemon.remote.transition.completion_store_failed",
             Self::ReplayRetirementStore => {
                 "daemon.remote.transition.replay_retirement_store_failed"
+            }
+            Self::CatalogProvisionStore => {
+                "daemon.remote.transition.catalog_provision_store_failed"
             }
             Self::RetryableStore(stage) => stage.code(),
             Self::ReconnectPending => "daemon.remote.transition.reconnect_pending",
@@ -138,6 +145,7 @@ fn map_transition_store_recovery_error(
         TransitionStoreStage::Rotation => KeyTransitionRecoveryError::RotationStore,
         TransitionStoreStage::Completion => KeyTransitionRecoveryError::CompletionStore,
         TransitionStoreStage::ReplayRetirement => KeyTransitionRecoveryError::ReplayRetirementStore,
+        TransitionStoreStage::CatalogProvision => KeyTransitionRecoveryError::CatalogProvisionStore,
     }
 }
 
@@ -222,6 +230,27 @@ impl KeyTransitionRecoveryOwner {
             authority,
             publication_drive,
             None,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_delivery_commits(
+        store: RuntimeStoreHandle,
+        key_store: Arc<dyn KeyStore>,
+        machine_route: MachineRouteId,
+        authority: MachineDataAuthority,
+        publication_drive: PublicationDriveHandle,
+        delivery_commit_rx: watch::Receiver<u64>,
+    ) -> Result<Self, KeyTransitionRecoveryError> {
+        Self::start_inner(
+            store,
+            key_store,
+            machine_route,
+            authority,
+            publication_drive,
+            None,
+            Some(delivery_commit_rx),
         )
     }
 
@@ -234,6 +263,7 @@ impl KeyTransitionRecoveryOwner {
         authority: MachineDataAuthority,
         publication_drive: PublicationDriveHandle,
         authenticated_reconnect_rx: AuthenticatedBusinessReconnects,
+        delivery_commit_rx: Option<watch::Receiver<u64>>,
     ) -> Result<Self, KeyTransitionRecoveryError> {
         Self::start_inner(
             store,
@@ -242,6 +272,7 @@ impl KeyTransitionRecoveryOwner {
             authority,
             publication_drive,
             Some(authenticated_reconnect_rx),
+            delivery_commit_rx,
         )
     }
 
@@ -252,6 +283,7 @@ impl KeyTransitionRecoveryOwner {
         authority: MachineDataAuthority,
         publication_drive: PublicationDriveHandle,
         authenticated_reconnect_rx: Option<AuthenticatedBusinessReconnects>,
+        mut delivery_commit_rx: Option<watch::Receiver<u64>>,
     ) -> Result<Self, KeyTransitionRecoveryError> {
         let backend = RuntimeStoreTransitionBackend::new(
             store.clone(),
@@ -263,7 +295,13 @@ impl KeyTransitionRecoveryOwner {
         let (command_tx, command_rx) = mpsc::channel(TRANSITION_COMMAND_CAPACITY);
         let (health_tx, health_rx) = watch::channel(None);
         let (progress_tx, progress_rx) = watch::channel(TransitionProgress::Idle);
-        let control_plane_progress_requested = Arc::new(AtomicBool::new(false));
+        // Pairing owner 的根 receiver 可能在 transition owner 启动前已经观察到
+        // durable delivery commit。subscribe() 会继承 seen version，因此这里必须
+        // 显式读取 sticky generation，不能只等待后续 changed()。
+        let initially_requested = delivery_commit_rx
+            .as_mut()
+            .is_some_and(|receiver| *receiver.borrow_and_update() > 0);
+        let control_plane_progress_requested = Arc::new(AtomicBool::new(initially_requested));
         #[cfg(test)]
         let attempt_count = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn(run_transition_owner(
@@ -272,6 +310,7 @@ impl KeyTransitionRecoveryOwner {
             key_store,
             publication_drive,
             authenticated_reconnect_rx,
+            delivery_commit_rx,
             command_rx,
             Arc::clone(&control_plane_progress_requested),
             #[cfg(test)]
@@ -381,6 +420,15 @@ impl Drop for SlowTransitionShutdownDrop {
     }
 }
 
+async fn wait_delivery_commit(
+    receiver: Option<&mut watch::Receiver<u64>>,
+) -> Result<(), watch::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "唯一 owner task 显式取得全部 durable backend、wake、health、progress 与 shutdown ownership 轴"
@@ -391,6 +439,7 @@ async fn run_transition_owner(
     key_store: Arc<dyn KeyStore>,
     publication_drive: PublicationDriveHandle,
     mut authenticated_reconnect_rx: Option<AuthenticatedBusinessReconnects>,
+    mut delivery_commit_rx: Option<watch::Receiver<u64>>,
     mut command_rx: mpsc::Receiver<TransitionCommand>,
     control_plane_progress_requested: Arc<AtomicBool>,
     #[cfg(test)] attempt_count: Arc<AtomicUsize>,
@@ -431,6 +480,14 @@ async fn run_transition_owner(
                     tokio::select! {
                         biased;
                         command = command_rx.recv() => command,
+                        changed = wait_delivery_commit(delivery_commit_rx.as_mut()) => {
+                            if changed.is_ok() {
+                                control_plane_progress_requested.store(true, Ordering::Release);
+                            } else {
+                                delivery_commit_rx = None;
+                            }
+                            continue;
+                        }
                         () = tokio::time::sleep_until(deadline) => {
                             retry_at = None;
                             // OutcomeUnknown/Store busy 保持 Ready/commit-pending，可直接按
@@ -462,6 +519,16 @@ async fn run_transition_owner(
                             tokio::select! {
                                 biased;
                                 command = command_rx.recv() => command,
+                                delivery = wait_delivery_commit(delivery_commit_rx.as_mut()) => {
+                                    if delivery.is_ok() {
+                                        // Offline receipt 只锁存 Store 进展；它不能替代同一
+                                        // MachineLink supervisor 的 authenticated reconnect。
+                                        control_plane_progress_requested.store(true, Ordering::Release);
+                                    } else {
+                                        delivery_commit_rx = None;
+                                    }
+                                    continue;
+                                }
                                 changed = reconnect_rx.changed() => {
                                     if changed.is_err() {
                                         let result = Err(KeyTransitionRecoveryError::Coordinator(
@@ -479,6 +546,11 @@ async fn run_transition_owner(
                                         continue;
                                     }
                                     reconnect_waiting = false;
+                                    // 同一 reconnect drive 会读取全部已提交 proof；把当前
+                                    // sticky generation 一并标记 seen，避免随后重复重驱。
+                                    if let Some(receiver) = delivery_commit_rx.as_mut() {
+                                        let _ = *receiver.borrow_and_update();
+                                    }
                                     control_plane_progress_requested.store(false, Ordering::Release);
                                     #[cfg(test)]
                                     attempt_count.fetch_add(1, Ordering::AcqRel);
@@ -504,10 +576,34 @@ async fn run_transition_owner(
                                 }
                             }
                         }
-                        None => command_rx.recv().await,
+                        None => {
+                            tokio::select! {
+                                biased;
+                                command = command_rx.recv() => command,
+                                delivery = wait_delivery_commit(delivery_commit_rx.as_mut()) => {
+                                    if delivery.is_ok() {
+                                        control_plane_progress_requested.store(true, Ordering::Release);
+                                    } else {
+                                        delivery_commit_rx = None;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                     }
                 } else {
-                    command_rx.recv().await
+                    tokio::select! {
+                        biased;
+                        command = command_rx.recv() => command,
+                        delivery = wait_delivery_commit(delivery_commit_rx.as_mut()) => {
+                            if delivery.is_ok() {
+                                control_plane_progress_requested.store(true, Ordering::Release);
+                            } else {
+                                delivery_commit_rx = None;
+                            }
+                            continue;
+                        }
+                    }
                 }
             }
         };
@@ -690,6 +786,7 @@ async fn drive_to_business_ready(
                 // transition 可能在首次 recovery read 后被另一 ACK 路径收口；
                 // 返回 business permit 前必须再做一次幂等 retirement readback。
                 apply_pending_replay_retirement(store).await?;
+                ensure_remote_catalog_publication_after_transition(store).await?;
                 backend.check_business_ingress_allowed().await?;
                 return Ok(TransitionReadiness::NoActiveTransition);
             }
@@ -721,6 +818,7 @@ async fn drive_to_business_ready(
                     }
                     KeyTransitionCompletion::Completed(_) => {
                         apply_pending_replay_retirement(store).await?;
+                        ensure_remote_catalog_publication_after_transition(store).await?;
                         store
                             .check_remote_transition_ingress(RemoteTransitionIngressClass::Business)
                             .await
@@ -747,6 +845,18 @@ async fn apply_pending_replay_retirement(
         .await
         .map_err(|error| {
             map_transition_store_recovery_error(TransitionStoreStage::ReplayRetirement, error)
+        })?;
+    Ok(())
+}
+
+async fn ensure_remote_catalog_publication_after_transition(
+    store: &RuntimeStoreHandle,
+) -> Result<(), KeyTransitionRecoveryError> {
+    let _ = store
+        .ensure_remote_catalog_publication_after_transition()
+        .await
+        .map_err(|error| {
+            map_transition_store_recovery_error(TransitionStoreStage::CatalogProvision, error)
         })?;
     Ok(())
 }

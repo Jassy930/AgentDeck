@@ -30,13 +30,13 @@ use agentdeck_crypto::{
     AeadReceivingKey, AeadSendingKey, HpkeEnvelopeV1, HpkePublicKey, SecretAeadKey, SenderCounter,
     VerifyingKey, hpke_seal_base, open_sealed_payload,
     rand_core::{TryCryptoRng, TryRng},
-    seal_symmetric, sign_key_update, sign_sealed, verify_sealed,
+    seal_symmetric, sha256, sign_key_update, sign_sealed, verify_sealed,
 };
 use agentdeck_protocol::e2ee::{
-    DirectoryCurrentV1, E2EE_FORMAT_VERSION, KeyControlRequestV1, KeyControlV1, KeyId, KeyPurpose,
-    KeyUpdateAckV1, KeyUpdateInfoV1, KeyUpdateSetV1, KeyUpdateV1, MachineDataSignerBindingV1,
-    OuterContextV1, OuterFrameKind, SealedPayloadKind, SignedSealedBlobV1, StreamBindingV1,
-    UnsignedSealedBlobV1,
+    DirectoryCurrentV1, DirectoryRevisionAdvanceV1, E2EE_FORMAT_VERSION, KeyControlRequestV1,
+    KeyControlV1, KeyId, KeyPurpose, KeyUpdateAckV1, KeyUpdateInfoV1, KeyUpdateSetV1, KeyUpdateV1,
+    MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, SealedPayloadKind,
+    SignedSealedBlobV1, StreamBindingV1, UnsignedSealedBlobV1,
 };
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, Publish, Reply, RouteAccepted, SealedBlob, Send as RelaySend,
@@ -109,6 +109,7 @@ impl TryCryptoRng for FixedRouteRng {}
 #[derive(Default)]
 struct RecordingObserver {
     stages: Mutex<Vec<PairedMutationStage>>,
+    crash_after_state_stage_cleared: Mutex<bool>,
 }
 
 impl RecordingObserver {
@@ -119,11 +120,30 @@ impl RecordingObserver {
     fn snapshot(&self) -> Vec<PairedMutationStage> {
         self.stages.lock().expect("mutation stages").clone()
     }
+
+    fn arm_crash_after_state_stage_cleared(&self) {
+        let mut armed = self
+            .crash_after_state_stage_cleared
+            .lock()
+            .expect("mutation crash arm");
+        assert!(!*armed, "mutation crash observer is already armed");
+        *armed = true;
+    }
 }
 
 impl PairedMutationObserver for RecordingObserver {
     fn after_stage(&self, stage: PairedMutationStage) {
         self.stages.lock().expect("mutation stages").push(stage);
+        let should_crash = stage == PairedMutationStage::StateStageCleared && {
+            let mut armed = self
+                .crash_after_state_stage_cleared
+                .lock()
+                .expect("mutation crash arm");
+            std::mem::take(&mut *armed)
+        };
+        if should_crash {
+            panic!("automatic crash after durable paired-state CAS cleanup");
+        }
     }
 }
 
@@ -367,6 +387,7 @@ struct KeyUpdateTransport {
     queue_key_sync_route_accepted: bool,
     queue_ack_route_accepted: bool,
     fail_after_recording_ack: bool,
+    fail_after_recording_stream_ack: bool,
     key_sync_send_count: usize,
     fail_on_key_sync_send: Option<usize>,
     extra_key_sync_route_accepted_on_send: Option<usize>,
@@ -404,6 +425,7 @@ impl KeyUpdateTransport {
                 queue_key_sync_route_accepted: false,
                 queue_ack_route_accepted: true,
                 fail_after_recording_ack: false,
+                fail_after_recording_stream_ack: false,
                 key_sync_send_count: 0,
                 fail_on_key_sync_send: None,
                 extra_key_sync_route_accepted_on_send: None,
@@ -425,6 +447,7 @@ impl KeyUpdateTransport {
                 queue_key_sync_route_accepted: false,
                 queue_ack_route_accepted: true,
                 fail_after_recording_ack: false,
+                fail_after_recording_stream_ack: false,
                 key_sync_send_count: 0,
                 fail_on_key_sync_send: None,
                 extra_key_sync_route_accepted_on_send: None,
@@ -452,6 +475,7 @@ impl KeyUpdateTransport {
                 queue_key_sync_route_accepted: false,
                 queue_ack_route_accepted: false,
                 fail_after_recording_ack: false,
+                fail_after_recording_stream_ack: false,
                 key_sync_send_count: 0,
                 fail_on_key_sync_send: None,
                 extra_key_sync_route_accepted_on_send: None,
@@ -494,6 +518,11 @@ impl KeyUpdateTransport {
         self
     }
 
+    fn with_stream_ack_failure(mut self) -> Self {
+        self.fail_after_recording_stream_ack = true;
+        self
+    }
+
     fn with_extra_key_sync_route_accepted_on_send(mut self, send_number: usize) -> Self {
         assert!(send_number > 0);
         self.extra_key_sync_route_accepted_on_send = Some(send_number);
@@ -517,6 +546,7 @@ impl KeyUpdateTransport {
                 queue_key_sync_route_accepted: false,
                 queue_ack_route_accepted,
                 fail_after_recording_ack,
+                fail_after_recording_stream_ack: false,
                 key_sync_send_count: 0,
                 fail_on_key_sync_send: None,
                 extra_key_sync_route_accepted_on_send: None,
@@ -541,6 +571,7 @@ impl KeyUpdateTransport {
                 queue_key_sync_route_accepted: true,
                 queue_ack_route_accepted: true,
                 fail_after_recording_ack: false,
+                fail_after_recording_stream_ack: false,
                 key_sync_send_count: 0,
                 fail_on_key_sync_send: None,
                 extra_key_sync_route_accepted_on_send: None,
@@ -557,8 +588,19 @@ impl RemoteRuntimeTransport for KeyUpdateTransport {
     async fn send(&mut self, frame: ExactRelayFrame) -> Result<(), RemoteRuntimeTransportError> {
         let bytes = frame.into_bytes();
         let decoded = decode(&bytes).expect("runtime only sends canonical Relay frames");
-        let RelayFrameBody::Send(send) = decoded.body else {
-            panic!("key update flow may only emit opaque Relay Send")
+        let send = match decoded.body {
+            RelayFrameBody::Ack(_) => {
+                self.sent.lock().expect("sent recorder").push(bytes);
+                if self.fail_after_recording_stream_ack {
+                    self.fail_after_recording_stream_ack = false;
+                    return Err(RemoteRuntimeTransportError::Failed(
+                        "injected post-record stream ACK transport failure".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            RelayFrameBody::Send(send) => send,
+            _ => panic!("key update flow may only emit opaque Relay Send or stream ACK"),
         };
         let control =
             open_command_control(&send.sealed_blob.0, send.request_route, &self.device_sign);
@@ -912,6 +954,85 @@ fn update_set_at_revision(
 
 fn higher_publish() -> OpaqueRouteFrame {
     higher_publish_at(UPDATE_REVISION, CATALOG_EPOCH + 1, [0x82; 32])
+}
+
+fn directory_advance_publish() -> OpaqueRouteFrame {
+    directory_advance_publish_at(
+        KEY_DIRECTORY_REVISION,
+        KEY_DIRECTORY_REVISION,
+        UPDATE_REVISION,
+        CATALOG_STREAM_ROUTE,
+        CATALOG_STREAM_GENERATION,
+        OUTER_HIGH_WATER + 1,
+        705,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn directory_advance_publish_at(
+    header_revision: u64,
+    from_revision: u64,
+    to_revision: u64,
+    stream_route: StreamRouteId,
+    stream_generation: StreamGenerationId,
+    stream_seq: u64,
+    sender_counter: u64,
+) -> OpaqueRouteFrame {
+    let context = OuterContextV1 {
+        frame_kind: OuterFrameKind::CatalogPublish,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: Some(remote_pairing::MACHINE_ROUTE),
+        device_route: None,
+        stream_route: Some(stream_route),
+        request_route: None,
+        pair_route: None,
+        stream_generation: Some(stream_generation),
+        stream_cursor: None,
+        stream_seq: Some(stream_seq),
+        message_key_epoch: CATALOG_EPOCH,
+    };
+    let advance = DirectoryRevisionAdvanceV1 {
+        from_key_directory_revision: KeyDirectoryRevision::new(from_revision),
+        to_key_directory_revision: KeyDirectoryRevision::new(to_revision),
+    };
+    advance
+        .validate()
+        .expect("canonical directory revision advance");
+    let control = KeyControlV1::directory_revision_advance(advance);
+    let key = AeadSendingKey::with_derived_nonce_prefix(
+        KeyId {
+            purpose: KeyPurpose::Catalog,
+            epoch: CATALOG_EPOCH,
+        },
+        CATALOG_EPOCH,
+        header_revision,
+        SecretAeadKey::from_bytes([0x71; 32]),
+    );
+    let unsigned = seal_symmetric(
+        &key,
+        &context,
+        control.sealed_payload_kind(),
+        &control
+            .canonical_bytes()
+            .expect("canonical DirectoryRevisionAdvance control"),
+        SenderCounter(sender_counter),
+    )
+    .expect("seal DirectoryRevisionAdvance publication");
+    let signed = sign_sealed(
+        unsigned,
+        &PairingFixture::machine_data_signing_key(),
+        &context,
+    );
+    OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::Publish(Publish {
+            stream_route,
+            generation: stream_generation,
+            stream_seq,
+            sealed_blob: SealedBlob(signed.to_wire_bytes()),
+        }),
+    }
 }
 
 fn higher_publish_at(
@@ -1270,6 +1391,18 @@ fn sent_command(
     let revision = signed.inner.key_directory_revision;
     let control = open_command_control(&send.sealed_blob.0, send.request_route, device_sign);
     (send.request_route, revision, control)
+}
+
+fn sent_stream_ack_cuts(sent: &[Vec<u8>]) -> Vec<(StreamRouteId, StreamGenerationId, u64)> {
+    sent.iter()
+        .filter_map(|bytes| {
+            let frame = decode(bytes).expect("decode outbound Relay frame");
+            let RelayFrameBody::Ack(ack) = frame.body else {
+                return None;
+            };
+            Some((ack.stream_route, ack.generation, ack.up_to_seq))
+        })
+        .collect()
 }
 
 fn reducer() -> RejectingReducer {
@@ -1882,6 +2015,701 @@ async fn pending_send_accepts_intermediate_reply_after_multiple_rewraps_and_reop
             .expect("terminal reopen sends")
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn directory_advance_crash_after_replay_commit_recovers_exact_signed_frame() {
+    let fixture = PairingFixture::new();
+    let store = Arc::new(MemoryRemoteKeyStore::new());
+    let temp = tempfile::tempdir().expect("directory advance replay-to-ADKS crash state root");
+    let root = state_root(&temp);
+    let observer = Arc::new(RecordingObserver::default());
+    let (_recipient, device_sign) =
+        promote_and_install_binding(&fixture, store.as_ref(), &root, observer.clone(), 0x8f);
+    let advance = directory_advance_publish();
+    let signed_frame_sha256 = sha256(&encode(&advance));
+    let ciphertext_sha256 = match &advance.body {
+        RelayFrameBody::Publish(publish) => {
+            let signed = SignedSealedBlobV1::from_wire_bytes(&publish.sealed_blob.0)
+                .expect("directory advance carries canonical signed payload");
+            sha256(&signed.inner.ciphertext)
+        }
+        _ => panic!("directory advance fixture must be a Publish"),
+    };
+    let (transport, sent_before_crash) =
+        KeyUpdateTransport::for_script(advance.clone(), VecDeque::new(), false, false, device_sign);
+
+    observer.arm_crash_after_state_stage_cleared();
+    let task_store = Arc::clone(&store);
+    let task_root = root.clone();
+    let task_observer = Arc::clone(&observer);
+    let task_identity = fixture.identity();
+    let crashed = tokio::spawn(async move {
+        let opened = PairedMachineStore::new_with_mutation_observer(
+            task_store.as_ref(),
+            INSTALLATION_ID,
+            &task_root,
+            task_observer,
+        )
+        .open_exact(task_identity)
+        .expect("open replay-to-ADKS crash fixture");
+        let mut runtime = RemoteRuntime::new(opened, transport);
+        let mut reducer = LiveCatalogReducer::at(INNER_HIGH_WATER);
+        runtime.receive_stream_frame(&mut reducer).await
+    })
+    .await;
+    assert!(crashed.is_err(), "observer must terminate the receive task");
+    assert!(crashed.unwrap_err().is_panic());
+    assert!(
+        sent_before_crash
+            .lock()
+            .expect("pre-crash sent frames")
+            .is_empty(),
+        "the replay-tuple CAS cut occurs before any KeySync probe",
+    );
+    assert_eq!(
+        observer
+            .snapshot()
+            .iter()
+            .filter(|stage| **stage == PairedMutationStage::StateStageCleared)
+            .count(),
+        1,
+        "the injected crash must cut immediately after the first paired-state CAS",
+    );
+
+    let reopened = PairedMachineStore::new(store.as_ref(), INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("cold-open replay tuple committed before ADKS");
+    let binding = reopened
+        .durable_stream_bindings()
+        .expect("read crash-cut stream binding")
+        .pop()
+        .expect("one Catalog binding");
+    let replay = binding
+        .replay_tuple()
+        .expect("directory advance replay tuple survived the crash");
+    assert_eq!(replay.stream_seq(), OUTER_HIGH_WATER + 1);
+    assert_eq!(replay.sender_counter(), 705);
+    assert_eq!(replay.signed_frame_sha256(), signed_frame_sha256);
+    assert_eq!(replay.ciphertext_sha256(), ciphertext_sha256);
+    assert_eq!(binding.outer_applied(), StreamCursor::At(OUTER_HIGH_WATER));
+    assert_eq!(
+        binding.inner_observed(),
+        &RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(INNER_HIGH_WATER),
+        },
+    );
+    assert_eq!(binding.inner_applied(), binding.inner_observed());
+    assert!(
+        reopened
+            .durable_key_sync_state()
+            .expect("read crash-cut ADKS")
+            .is_none(),
+        "the first CAS must not imply that the independent ADKS CAS committed",
+    );
+    drop(reopened);
+
+    observer.clear();
+    let (retry_transport, retry_sent) =
+        KeyUpdateTransport::for_script(advance, VecDeque::new(), false, false, device_sign);
+    let reopened = PairedMachineStore::new_with_mutation_observer(
+        store.as_ref(),
+        INSTALLATION_ID,
+        &root,
+        observer.clone(),
+    )
+    .open_exact(fixture.identity())
+    .expect("reopen exact directory advance retry");
+    let mut runtime = RemoteRuntime::new(reopened, retry_transport);
+    let mut reducer = LiveCatalogReducer::at(INNER_HIGH_WATER);
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::KeySyncPending { attempt: 1 })
+    ));
+    assert_eq!(reducer.applied, 0);
+    assert_eq!(
+        observer
+            .snapshot()
+            .iter()
+            .filter(|stage| **stage == PairedMutationStage::StateStageCleared)
+            .count(),
+        1,
+        "exact replay skips a second tuple CAS and commits only the new ADKS",
+    );
+    assert_eq!(
+        retry_sent.lock().expect("retry sent frames").len(),
+        1,
+        "exact replay starts one bounded KeySync probe",
+    );
+    drop(runtime);
+
+    let reopened = PairedMachineStore::new(store.as_ref(), INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen ADKS created by exact frame retry");
+    let retried_binding = reopened
+        .durable_stream_bindings()
+        .expect("read retried stream binding")
+        .pop()
+        .expect("one Catalog binding");
+    assert_eq!(retried_binding.replay_tuple(), Some(replay));
+    let active = reopened
+        .durable_key_sync_state()
+        .expect("read retry ADKS")
+        .expect("exact retry creates ADKS");
+    assert_eq!(active.status(), KeySyncCoordinationStatus::Active);
+    assert_eq!(
+        active.observation().signed_frame_sha256(),
+        replay.signed_frame_sha256(),
+    );
+    assert_eq!(
+        active.observation().ciphertext_sha256(),
+        replay.ciphertext_sha256(),
+    );
+    assert_eq!(
+        retried_binding.outer_applied(),
+        StreamCursor::At(OUTER_HIGH_WATER),
+        "ADKS coordination still cannot advance the business outer cut",
+    );
+}
+
+#[tokio::test]
+async fn directory_advance_replay_is_durable_before_cold_recovery_commits_outer_only() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("directory advance cold-recovery state root");
+    let root = state_root(&temp);
+    let observer = Arc::new(RecordingObserver::default());
+    let (recipient, device_sign) =
+        promote_and_install_binding(&fixture, &store, &root, observer, 0x91);
+    let update = update_set_at_revision(
+        &fixture,
+        &recipient,
+        UPDATE_REVISION,
+        CATALOG_EPOCH,
+        [0x71; 32],
+        0x92,
+    );
+    let (transport, _) = KeyUpdateTransport::for_script(
+        directory_advance_publish(),
+        VecDeque::from([ScriptedKeySyncReply::UpdateSet {
+            update_set: update.clone(),
+            header_revision: UPDATE_REVISION,
+        }]),
+        true,
+        false,
+        device_sign,
+    );
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open directory advance fixture");
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = LiveCatalogReducer::at(INNER_HIGH_WATER);
+
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::KeySyncPending { attempt: 1 })
+    ));
+    assert_eq!(reducer.applied, 0);
+    assert_eq!(
+        reducer.inner_cursor(),
+        &RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(INNER_HIGH_WATER),
+        }
+    );
+    drop(runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen after durable directory advance admission");
+    let before = reopened
+        .durable_stream_bindings()
+        .expect("read admitted Catalog binding")
+        .pop()
+        .expect("one Catalog binding");
+    assert_eq!(before.outer_applied(), StreamCursor::At(OUTER_HIGH_WATER));
+    assert_eq!(before.inner_observed(), reducer.inner_cursor());
+    assert_eq!(before.inner_applied(), reducer.inner_cursor());
+    let replay = before
+        .replay_tuple()
+        .expect("old revision replay is durable");
+    assert_eq!(
+        replay.key_directory_revision(),
+        KeyDirectoryRevision::new(KEY_DIRECTORY_REVISION)
+    );
+    assert_eq!(replay.stream_seq(), OUTER_HIGH_WATER + 1);
+    assert_eq!(replay.sender_counter(), 705);
+    let active = reopened
+        .durable_key_sync_state()
+        .expect("read active directory advance ADKS")
+        .expect("directory advance starts durable KeySync");
+    assert_eq!(active.status(), KeySyncCoordinationStatus::Active);
+
+    let (recovery_transport, recovery_sent) = KeyUpdateTransport::for_recovery(
+        VecDeque::from([ScriptedKeySyncReply::UpdateSet {
+            update_set: update,
+            header_revision: UPDATE_REVISION,
+        }]),
+        device_sign,
+    );
+    let mut recovered = RemoteRuntime::new(reopened, recovery_transport);
+    recovered
+        .recover_durable_key_sync()
+        .await
+        .expect("cold recovery installs keys, ACKs update, then commits directory advance");
+    let recovery_sent = recovery_sent
+        .lock()
+        .expect("directory advance recovery sent frames")
+        .clone();
+    assert_eq!(
+        sent_stream_ack_cuts(&recovery_sent),
+        vec![(
+            CATALOG_STREAM_ROUTE,
+            CATALOG_STREAM_GENERATION,
+            OUTER_HIGH_WATER + 1,
+        )]
+    );
+
+    drop(recovered);
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen committed directory advance");
+    let committed = reopened
+        .durable_stream_bindings()
+        .expect("read committed Catalog binding")
+        .pop()
+        .expect("one Catalog binding");
+    assert_eq!(
+        committed.binding().key_directory_revision,
+        KeyDirectoryRevision::new(UPDATE_REVISION)
+    );
+    assert_eq!(
+        committed.outer_applied(),
+        StreamCursor::At(OUTER_HIGH_WATER + 1)
+    );
+    assert_eq!(
+        committed.outer_acked(),
+        StreamCursor::At(OUTER_HIGH_WATER + 1)
+    );
+    assert_eq!(committed.inner_observed(), reducer.inner_cursor());
+    assert_eq!(committed.inner_applied(), reducer.inner_cursor());
+    assert_eq!(reducer.applied, 0, "control never enters the reducer");
+}
+
+#[tokio::test]
+async fn directory_advance_stream_ack_failure_recovers_committed_outer_without_inner_reapply() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("directory advance ACK crash state root");
+    let root = state_root(&temp);
+    let observer = Arc::new(RecordingObserver::default());
+    let (recipient, device_sign) =
+        promote_and_install_binding(&fixture, &store, &root, observer, 0x93);
+    let update = update_set_at_revision(
+        &fixture,
+        &recipient,
+        UPDATE_REVISION,
+        CATALOG_EPOCH,
+        [0x71; 32],
+        0x94,
+    );
+    let (transport, first_sent) = KeyUpdateTransport::for_script(
+        directory_advance_publish(),
+        VecDeque::from([ScriptedKeySyncReply::UpdateSet {
+            update_set: update,
+            header_revision: UPDATE_REVISION,
+        }]),
+        true,
+        false,
+        device_sign,
+    );
+    let transport = transport.with_stream_ack_failure();
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open directory advance ACK crash fixture");
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = LiveCatalogReducer::at(INNER_HIGH_WATER);
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::KeySyncPending { attempt: 1 })
+    ));
+    let error = runtime
+        .receive_stream_frame(&mut reducer)
+        .await
+        .expect_err("stream ACK failure occurs after durable outer commit");
+    assert_eq!(error.code(), "remote.runtime.transport_failed");
+    assert_eq!(
+        sent_stream_ack_cuts(&first_sent.lock().expect("failed stream ACK frames").clone()),
+        vec![(
+            CATALOG_STREAM_ROUTE,
+            CATALOG_STREAM_GENERATION,
+            OUTER_HIGH_WATER + 1,
+        )]
+    );
+    drop(runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen after committed outer / failed ACK");
+    let pending_ack = reopened
+        .durable_stream_bindings()
+        .expect("read pending stream ACK binding")
+        .pop()
+        .expect("one Catalog binding");
+    assert_eq!(
+        pending_ack.outer_applied(),
+        StreamCursor::At(OUTER_HIGH_WATER + 1)
+    );
+    assert_ne!(pending_ack.outer_acked(), pending_ack.outer_applied());
+    assert_eq!(pending_ack.inner_observed(), reducer.inner_cursor());
+    assert_eq!(pending_ack.inner_applied(), reducer.inner_cursor());
+
+    let (recovery_transport, recovery_sent) =
+        KeyUpdateTransport::for_recovery(VecDeque::new(), device_sign);
+    let mut recovered = RemoteRuntime::new(reopened, recovery_transport);
+    recovered
+        .recover_durable_key_sync()
+        .await
+        .expect("resolved cold recovery re-ACKs update then retries cumulative stream ACK");
+    assert_eq!(
+        sent_stream_ack_cuts(
+            &recovery_sent
+                .lock()
+                .expect("retried stream ACK frames")
+                .clone()
+        ),
+        vec![(
+            CATALOG_STREAM_ROUTE,
+            CATALOG_STREAM_GENERATION,
+            OUTER_HIGH_WATER + 1,
+        )]
+    );
+    drop(recovered);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen after stream ACK retry");
+    let recovered = reopened
+        .durable_stream_bindings()
+        .expect("read ACKed binding")
+        .pop()
+        .expect("one Catalog binding");
+    assert_eq!(recovered.outer_acked(), recovered.outer_applied());
+    assert_eq!(recovered.inner_observed(), reducer.inner_cursor());
+    assert_eq!(recovered.inner_applied(), reducer.inner_cursor());
+    assert_eq!(reducer.applied, 0);
+}
+
+#[tokio::test]
+async fn consecutive_directory_advances_do_not_reack_the_predecessor_revision() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("consecutive directory-advance state root");
+    let root = state_root(&temp);
+    let observer = Arc::new(RecordingObserver::default());
+    let (recipient, device_sign) =
+        promote_and_install_binding(&fixture, &store, &root, observer, 0x95);
+    let first = update_set_at_revision(
+        &fixture,
+        &recipient,
+        UPDATE_REVISION,
+        CATALOG_EPOCH,
+        [0x71; 32],
+        0x96,
+    );
+    let second = update_set_at_revision(
+        &fixture,
+        &recipient,
+        SECOND_UPDATE_REVISION,
+        CATALOG_EPOCH,
+        [0x71; 32],
+        0x97,
+    );
+    let second_advance = directory_advance_publish_at(
+        UPDATE_REVISION,
+        UPDATE_REVISION,
+        SECOND_UPDATE_REVISION,
+        CATALOG_STREAM_ROUTE,
+        CATALOG_STREAM_GENERATION,
+        OUTER_HIGH_WATER + 2,
+        706,
+    );
+    let (transport, sent) = KeyUpdateTransport::for_script(
+        directory_advance_publish(),
+        VecDeque::from([
+            ScriptedKeySyncReply::UpdateSet {
+                update_set: first,
+                header_revision: UPDATE_REVISION,
+            },
+            ScriptedKeySyncReply::UpdateSet {
+                update_set: second,
+                header_revision: SECOND_UPDATE_REVISION,
+            },
+        ]),
+        false,
+        false,
+        device_sign,
+    );
+    let transport = transport.with_publish_after_ack(second_advance);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open consecutive directory-advance fixture");
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = LiveCatalogReducer::at(INNER_HIGH_WATER);
+
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::KeySyncPending { attempt: 1 })
+    ));
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::KeyUpdateInstalled {
+            key_directory_revision: UPDATE_REVISION,
+            next_attempt: None,
+        })
+    ));
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::KeySyncPending { attempt: 1 })
+    ));
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::KeyUpdateInstalled {
+            key_directory_revision: SECOND_UPDATE_REVISION,
+            next_attempt: None,
+        })
+    ));
+
+    let sent = sent
+        .lock()
+        .expect("consecutive directory-advance sent frames")
+        .clone();
+    assert_eq!(sent.len(), 6);
+    let (_, first_probe_revision, first_probe) = sent_command(&sent[0], &device_sign);
+    let (_, first_ack_revision, first_ack) = sent_command(&sent[1], &device_sign);
+    let (_, second_probe_revision, second_probe) = sent_command(&sent[3], &device_sign);
+    let (_, second_ack_revision, second_ack) = sent_command(&sent[4], &device_sign);
+    assert!(matches!(first_probe, KeyControlRequestV1::KeySync { .. }));
+    assert!(matches!(
+        first_ack,
+        KeyControlRequestV1::KeyUpdateAck { .. }
+    ));
+    assert!(matches!(second_probe, KeyControlRequestV1::KeySync { .. }));
+    assert!(matches!(
+        second_ack,
+        KeyControlRequestV1::KeyUpdateAck { .. }
+    ));
+    assert_eq!(first_probe_revision, UPDATE_REVISION);
+    assert_eq!(first_ack_revision, UPDATE_REVISION);
+    assert_eq!(second_probe_revision, SECOND_UPDATE_REVISION);
+    assert_eq!(second_ack_revision, SECOND_UPDATE_REVISION);
+    assert_eq!(
+        sent_stream_ack_cuts(&sent),
+        vec![
+            (
+                CATALOG_STREAM_ROUTE,
+                CATALOG_STREAM_GENERATION,
+                OUTER_HIGH_WATER + 1,
+            ),
+            (
+                CATALOG_STREAM_ROUTE,
+                CATALOG_STREAM_GENERATION,
+                OUTER_HIGH_WATER + 2,
+            ),
+        ]
+    );
+    assert_eq!(reducer.applied, 0, "control never enters the reducer");
+    drop(runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen after consecutive directory advances");
+    let state = reopened
+        .durable_key_sync_state()
+        .expect("read second resolved ADKS")
+        .expect("second directory advance remains durable");
+    assert_eq!(state.status(), KeySyncCoordinationStatus::Resolved);
+    assert_eq!(state.attempt(), 1);
+    assert_eq!(
+        state
+            .latest_completed_ack_basis()
+            .expect("second completion basis")
+            .key_directory_revision()
+            .value(),
+        SECOND_UPDATE_REVISION
+    );
+    let binding = reopened
+        .durable_stream_bindings()
+        .expect("read twice-advanced Catalog binding")
+        .pop()
+        .expect("one Catalog binding");
+    assert_eq!(
+        binding.binding().key_directory_revision.value(),
+        SECOND_UPDATE_REVISION
+    );
+    assert_eq!(
+        binding.outer_applied(),
+        StreamCursor::At(OUTER_HIGH_WATER + 2)
+    );
+    assert_eq!(binding.outer_acked(), binding.outer_applied());
+}
+
+#[tokio::test]
+async fn directory_advance_supersession_probe_failure_cold_retries_only_the_new_probe() {
+    let fixture = PairingFixture::new();
+    let store = MemoryRemoteKeyStore::new();
+    let temp = tempfile::tempdir().expect("directory-advance supersession recovery state root");
+    let root = state_root(&temp);
+    let observer = Arc::new(RecordingObserver::default());
+    let (recipient, device_sign) =
+        promote_and_install_binding(&fixture, &store, &root, observer, 0x98);
+    let first = update_set_at_revision(
+        &fixture,
+        &recipient,
+        UPDATE_REVISION,
+        CATALOG_EPOCH,
+        [0x71; 32],
+        0x99,
+    );
+    let second = update_set_at_revision(
+        &fixture,
+        &recipient,
+        SECOND_UPDATE_REVISION,
+        CATALOG_EPOCH,
+        [0x71; 32],
+        0x9a,
+    );
+    let second_advance = directory_advance_publish_at(
+        UPDATE_REVISION,
+        UPDATE_REVISION,
+        SECOND_UPDATE_REVISION,
+        CATALOG_STREAM_ROUTE,
+        CATALOG_STREAM_GENERATION,
+        OUTER_HIGH_WATER + 2,
+        706,
+    );
+    let (transport, first_sent) = KeyUpdateTransport::for_script(
+        directory_advance_publish(),
+        VecDeque::from([ScriptedKeySyncReply::UpdateSet {
+            update_set: first,
+            header_revision: UPDATE_REVISION,
+        }]),
+        false,
+        false,
+        device_sign,
+    );
+    let transport = transport
+        .with_publish_after_ack(second_advance)
+        .with_key_sync_send_failure(2);
+    let opened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("open directory-advance supersession fixture");
+    let mut runtime = RemoteRuntime::new(opened, transport);
+    let mut reducer = LiveCatalogReducer::at(INNER_HIGH_WATER);
+
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::KeySyncPending { attempt: 1 })
+    ));
+    assert!(matches!(
+        runtime.receive_stream_frame(&mut reducer).await,
+        Ok(RemoteStreamFrameOutcome::KeyUpdateInstalled {
+            key_directory_revision: UPDATE_REVISION,
+            next_attempt: None,
+        })
+    ));
+    let error = runtime
+        .receive_stream_frame(&mut reducer)
+        .await
+        .expect_err("new-cycle probe fails after typed-notice ADKS CAS");
+    assert_eq!(error.code(), "remote.runtime.transport_failed");
+    let first_sent = first_sent
+        .lock()
+        .expect("directory-advance pre-crash sent frames")
+        .clone();
+    assert_eq!(first_sent.len(), 4);
+    let frozen_probe = first_sent[3].clone();
+    let (_, frozen_revision, frozen_control) = sent_command(&frozen_probe, &device_sign);
+    assert_eq!(frozen_revision, SECOND_UPDATE_REVISION);
+    assert!(matches!(
+        frozen_control,
+        KeyControlRequestV1::KeySync { .. }
+    ));
+    assert_eq!(
+        sent_stream_ack_cuts(&first_sent),
+        vec![(
+            CATALOG_STREAM_ROUTE,
+            CATALOG_STREAM_GENERATION,
+            OUTER_HIGH_WATER + 1,
+        )]
+    );
+    drop(runtime);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen typed-notice ADKS after probe send failure");
+    let active = reopened
+        .durable_key_sync_state()
+        .expect("read superseding ADKS")
+        .expect("superseding ADKS remains durable");
+    assert_eq!(active.status(), KeySyncCoordinationStatus::Active);
+    assert_eq!(
+        active.latest_completed_ack_basis(),
+        None,
+        "typed notice proves predecessor completion; old ACK must not survive the CAS"
+    );
+    assert_eq!(
+        active
+            .active_send()
+            .expect("new probe remains frozen")
+            .exact_send_bytes(),
+        frozen_probe.as_slice()
+    );
+
+    let (recovery_transport, recovery_sent) = KeyUpdateTransport::for_recovery(
+        VecDeque::from([ScriptedKeySyncReply::UpdateSet {
+            update_set: second,
+            header_revision: SECOND_UPDATE_REVISION,
+        }]),
+        device_sign,
+    );
+    let mut recovered = RemoteRuntime::new(reopened, recovery_transport);
+    recovered
+        .recover_durable_key_sync()
+        .await
+        .expect("cold recovery exact-retries only the new probe and finishes the notice");
+    let recovery_sent = recovery_sent
+        .lock()
+        .expect("directory-advance recovery sent frames")
+        .clone();
+    assert_eq!(recovery_sent.len(), 3);
+    assert_eq!(recovery_sent[0], frozen_probe);
+    let (_, new_ack_revision, new_ack) = sent_command(&recovery_sent[1], &device_sign);
+    assert_eq!(new_ack_revision, SECOND_UPDATE_REVISION);
+    assert!(matches!(new_ack, KeyControlRequestV1::KeyUpdateAck { .. }));
+    assert_eq!(
+        sent_stream_ack_cuts(&recovery_sent),
+        vec![(
+            CATALOG_STREAM_ROUTE,
+            CATALOG_STREAM_GENERATION,
+            OUTER_HIGH_WATER + 2,
+        )]
+    );
+    drop(recovered);
+
+    let reopened = PairedMachineStore::new(&store, INSTALLATION_ID, &root)
+        .open_exact(fixture.identity())
+        .expect("reopen after typed-notice cold recovery");
+    let binding = reopened
+        .durable_stream_bindings()
+        .expect("read recovered Catalog binding")
+        .pop()
+        .expect("one Catalog binding");
+    assert_eq!(
+        binding.outer_applied(),
+        StreamCursor::At(OUTER_HIGH_WATER + 2)
+    );
+    assert_eq!(binding.outer_acked(), binding.outer_applied());
+    assert_eq!(reducer.applied, 0);
 }
 
 #[tokio::test]

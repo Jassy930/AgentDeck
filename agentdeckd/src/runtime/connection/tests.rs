@@ -1055,6 +1055,93 @@ fn verified_remote_can_resolve_without_an_is_local_shortcut() {
         .expect("issuer-granted remote resolve");
 }
 
+fn rotating_remote_binding(
+    revision: u64,
+    command_key_epoch: u64,
+    authorization_hash_seed: u8,
+) -> RemoteCommandAuthorizationBinding {
+    RemoteCommandAuthorizationBinding::new(
+        [0xD1; 32],
+        agentdeck_protocol::relay_v2::MachineRouteId::from_bytes([0x11; 16]),
+        agentdeck_protocol::relay_v2::DeviceRouteId::from_bytes([0x22; 16]),
+        agentdeck_protocol::relay_v2::GrantSerial::new(7),
+        [0x33; 32],
+        [authorization_hash_seed; 32],
+        agentdeck_protocol::relay_v2::KeyDirectoryRevision::new(revision),
+        command_key_epoch,
+        vec![
+            AuthorizationPermissionV1::CatalogRead,
+            AuthorizationPermissionV1::RevokeSelf,
+        ],
+    )
+    .expect("canonical rotating remote binding")
+}
+
+#[test]
+fn remote_rotation_reuses_shared_lease_but_freezes_each_current_binding_snapshot() {
+    let issuer = PrincipalIssuer::local_only([0xD1; 32]);
+    let revision_one = rotating_remote_binding(1, 4, 0x41);
+    let first = issuer
+        .issue_verified_remote(revision_one.clone())
+        .expect("issue revision-one remote principal");
+    let revision_three = rotating_remote_binding(3, 5, 0x41);
+    let current = issuer
+        .issue_verified_remote(revision_three.clone())
+        .expect("a Store-current higher revision refreshes the principal snapshot");
+
+    assert_eq!(first.authorization_key(), current.authorization_key());
+    assert_eq!(
+        first.remote_command_authorization_binding(),
+        Some(revision_one),
+        "an in-flight old command keeps its exact ADC2 authorization snapshot"
+    );
+    assert_eq!(
+        current.remote_command_authorization_binding(),
+        Some(revision_three.clone())
+    );
+    let exact_replay = issuer
+        .issue_verified_remote(revision_three.clone())
+        .expect("the same Store-current proof reuses the shared lease");
+    assert_eq!(
+        exact_replay.remote_command_authorization_binding(),
+        Some(revision_three.clone())
+    );
+
+    let device = canonical_device_handle([0x22; 16]).expect("canonical device handle");
+    let revoke = issuer
+        .remote_principal_for_revoke(&device, GrantSerial::new(7))
+        .expect("lookup current remote principal")
+        .expect("current remote principal exists");
+    assert_eq!(
+        revoke.remote_command_authorization_binding(),
+        Some(revision_three.clone()),
+        "offline revoke sees the latest monotonic binding"
+    );
+
+    assert!(matches!(
+        issuer.issue_verified_remote(rotating_remote_binding(2, 5, 0x41)),
+        Err(PrincipalAccessError::PermissionConflict)
+    ));
+    assert!(matches!(
+        issuer.issue_verified_remote(rotating_remote_binding(3, 5, 0x44)),
+        Err(PrincipalAccessError::PermissionConflict)
+    ));
+    assert!(matches!(
+        issuer.issue_verified_remote(rotating_remote_binding(4, 6, 0x44)),
+        Err(PrincipalAccessError::PermissionConflict)
+    ));
+
+    current.finish_revoke();
+    assert!(matches!(
+        first.try_enter(),
+        Err(PrincipalAccessError::Revoked)
+    ));
+    assert!(
+        matches!(exact_replay.try_enter(), Err(PrincipalAccessError::Revoked)),
+        "all revision snapshots share one revoke lease"
+    );
+}
+
 #[tokio::test]
 async fn approval_guard_holds_the_shared_lease_through_revoking() {
     let issuer = PrincipalIssuer::local_only([0xC6; 32]);

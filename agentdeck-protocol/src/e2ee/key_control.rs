@@ -279,6 +279,54 @@ impl DirectoryCurrentV1 {
     }
 }
 
+/// Catalog key/epoch 不变时，由 active `ActivateConversation` transition 发布的
+/// authenticated exact-next directory revision 通知。它只声明 `from -> to`，不承载
+/// key material、不旋转 epoch，也不推进 Runtime inner cursor。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectoryRevisionAdvanceV1 {
+    pub from_key_directory_revision: KeyDirectoryRevision,
+    pub to_key_directory_revision: KeyDirectoryRevision,
+}
+
+impl DirectoryRevisionAdvanceV1 {
+    pub fn validate(&self) -> Result<(), PairingError> {
+        if self.from_key_directory_revision.value() == 0
+            || self
+                .from_key_directory_revision
+                .next()
+                .map_err(|_| PairingError::InvalidField("directory revision advance exhausted"))?
+                != self.to_key_directory_revision
+        {
+            return Err(PairingError::InvalidField("directory revision advance"));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PairingError> {
+        self.validate()?;
+        let mut encoder = Enc::new();
+        encoder.domain(b"AgentDeck/DirectoryRevisionAdvanceV1\0");
+        encoder.u64(self.from_key_directory_revision.value());
+        encoder.u64(self.to_key_directory_revision.value());
+        Ok(encoder.finish())
+    }
+
+    pub fn canonical_sha256(&self) -> Result<[u8; 32], PairingError> {
+        Ok(sha256(&self.canonical_bytes()?))
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, PairingError> {
+        let mut decoder = bounded_small_decoder(bytes, "directory revision advance")?;
+        decoder.domain(b"AgentDeck/DirectoryRevisionAdvanceV1\0")?;
+        let value = Self {
+            from_key_directory_revision: KeyDirectoryRevision::new(decoder.u64()?),
+            to_key_directory_revision: KeyDirectoryRevision::new(decoder.u64()?),
+        };
+        finish_small(value, decoder, bytes, Self::canonical_bytes)
+    }
+}
+
 /// Remote endpoint 构造 Relay `Subscribe` 所需的 authenticated publication binding。
 ///
 /// 该 carrier 只出现在 MachineDataSign + DeviceReplyTx 保护的定向 E2EE reply 内；
@@ -594,6 +642,10 @@ pub enum KeyControlV1 {
         format_version: u16,
         binding: StreamBindingV1,
     },
+    DirectoryRevisionAdvance {
+        format_version: u16,
+        advance: DirectoryRevisionAdvanceV1,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -620,6 +672,10 @@ enum KeyControlWire {
     StreamBinding {
         format_version: u16,
         binding: StreamBindingV1,
+    },
+    DirectoryRevisionAdvance {
+        format_version: u16,
+        advance: DirectoryRevisionAdvanceV1,
     },
 }
 
@@ -655,6 +711,13 @@ impl From<&KeyControlV1> for KeyControlWire {
             } => Self::StreamBinding {
                 format_version: *format_version,
                 binding: binding.clone(),
+            },
+            KeyControlV1::DirectoryRevisionAdvance {
+                format_version,
+                advance,
+            } => Self::DirectoryRevisionAdvance {
+                format_version: *format_version,
+                advance: advance.clone(),
             },
         }
     }
@@ -692,6 +755,13 @@ impl From<KeyControlWire> for KeyControlV1 {
             } => Self::StreamBinding {
                 format_version,
                 binding,
+            },
+            KeyControlWire::DirectoryRevisionAdvance {
+                format_version,
+                advance,
+            } => Self::DirectoryRevisionAdvance {
+                format_version,
+                advance,
             },
         }
     }
@@ -745,6 +815,11 @@ enum KeyControlSchema {
         format_version: u16,
         binding: StreamBindingV1,
     },
+    DirectoryRevisionAdvance {
+        #[schemars(rename = "formatVersion", range(min = 1))]
+        format_version: u16,
+        advance: DirectoryRevisionAdvanceV1,
+    },
 }
 
 impl JsonSchema for KeyControlV1 {
@@ -794,6 +869,13 @@ impl KeyControlV1 {
         }
     }
 
+    pub fn directory_revision_advance(advance: DirectoryRevisionAdvanceV1) -> Self {
+        Self::DirectoryRevisionAdvance {
+            format_version: E2EE_FORMAT_VERSION,
+            advance,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), PairingError> {
         match self {
             Self::UpdateSet {
@@ -840,6 +922,15 @@ impl KeyControlV1 {
                 }
                 binding.validate()
             }
+            Self::DirectoryRevisionAdvance {
+                format_version,
+                advance,
+            } => {
+                if *format_version != E2EE_FORMAT_VERSION {
+                    return Err(PairingError::UnsupportedVersion);
+                }
+                advance.validate()
+            }
         }
     }
 
@@ -881,6 +972,14 @@ impl KeyControlV1 {
                 encoder.u8(3);
                 encoder.u16(*format_version);
                 encoder.bytes(&binding.canonical_bytes()?);
+            }
+            Self::DirectoryRevisionAdvance {
+                format_version,
+                advance,
+            } => {
+                encoder.u8(4);
+                encoder.u16(*format_version);
+                encoder.bytes(&advance.canonical_bytes()?);
             }
         }
         let bytes = encoder.finish();
@@ -926,6 +1025,12 @@ impl KeyControlV1 {
                 format_version,
                 binding: StreamBindingV1::from_canonical_bytes(
                     decoder.bytes(STREAM_BINDING_MAX_CANONICAL_BYTES)?,
+                )?,
+            },
+            4 => Self::DirectoryRevisionAdvance {
+                format_version,
+                advance: DirectoryRevisionAdvanceV1::from_canonical_bytes(
+                    decoder.bytes(KEY_CONTROL_SMALL_CANONICAL_BYTES)?,
                 )?,
             },
             _ => return Err(PairingError::InvalidEncoding("key control kind")),
@@ -1500,6 +1605,12 @@ impl ValidateControl for StreamAppliedAckV1 {
 }
 
 impl ValidateControl for DirectoryCurrentV1 {
+    fn validate_control(&self) -> Result<(), PairingError> {
+        self.validate()
+    }
+}
+
+impl ValidateControl for DirectoryRevisionAdvanceV1 {
     fn validate_control(&self) -> Result<(), PairingError> {
         self.validate()
     }

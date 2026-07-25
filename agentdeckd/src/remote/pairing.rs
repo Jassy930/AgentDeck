@@ -124,6 +124,7 @@ struct PairingAdmissionFence {
 struct PairingCoordinatorSignals {
     health_tx: watch::Sender<PairingCoordinatorHealth>,
     admission_tx: watch::Sender<PairingAdmissionFence>,
+    delivery_commit_tx: watch::Sender<u64>,
 }
 
 struct PairingCommandEnvelope {
@@ -659,6 +660,7 @@ pub(crate) struct PairingCoordinatorOwner {
     cancel_tx: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
     health_rx: watch::Receiver<PairingCoordinatorHealth>,
+    delivery_commit_rx: watch::Receiver<u64>,
     shutdown_deadline: Option<tokio::time::Instant>,
 }
 
@@ -686,6 +688,7 @@ impl PairingCoordinatorOwner {
             epoch: 0,
             failure_code: None,
         });
+        let (delivery_commit_tx, delivery_commit_rx) = watch::channel(0);
         let task = tokio::spawn(
             PairingCoordinator::new(
                 Arc::new(ProductionPairingStore(store)),
@@ -697,6 +700,7 @@ impl PairingCoordinatorOwner {
                 PairingCoordinatorSignals {
                     health_tx,
                     admission_tx: admission_tx.clone(),
+                    delivery_commit_tx,
                 },
             )
             .run(command_rx, cancel_rx, ready_tx),
@@ -711,6 +715,7 @@ impl PairingCoordinatorOwner {
             cancel_tx,
             task: Some(task),
             health_rx,
+            delivery_commit_rx,
             shutdown_deadline: None,
         };
         let ready = await_pairing_startup(&mut owner, ready_rx, shutdown_rx).await;
@@ -720,6 +725,11 @@ impl PairingCoordinatorOwner {
     #[must_use]
     pub(crate) fn handle(&self) -> PairingCoordinatorHandle {
         self.handle.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn subscribe_delivery_commits(&self) -> watch::Receiver<u64> {
+        self.delivery_commit_rx.clone()
     }
 
     #[must_use]
@@ -777,7 +787,9 @@ impl PairingCoordinatorOwner {
             epoch: 0,
             failure_code: None,
         });
+        let (delivery_commit_tx, delivery_commit_rx) = watch::channel(0);
         let task = tokio::spawn(async move {
+            let _delivery_commit_tx = delivery_commit_tx;
             loop {
                 tokio::select! {
                     biased;
@@ -805,6 +817,7 @@ impl PairingCoordinatorOwner {
                 cancel_tx,
                 task: Some(task),
                 health_rx,
+                delivery_commit_rx,
                 shutdown_deadline: None,
             },
             health_tx,
@@ -824,8 +837,10 @@ impl PairingCoordinatorOwner {
             epoch: 0,
             failure_code: None,
         });
+        let (delivery_commit_tx, delivery_commit_rx) = watch::channel(0);
         let task = tokio::spawn(async move {
             let _ready_tx = ready_tx;
+            let _delivery_commit_tx = delivery_commit_tx;
             std::future::pending::<()>().await;
         });
         (
@@ -839,6 +854,7 @@ impl PairingCoordinatorOwner {
                 cancel_tx,
                 task: Some(task),
                 health_rx,
+                delivery_commit_rx,
                 shutdown_deadline: None,
             },
             ready_rx,
@@ -1299,6 +1315,7 @@ impl DeliveryProofInput {
 
 struct DeliveryOutcome {
     close: DurableClose,
+    newly_committed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1686,13 +1703,17 @@ fn committed_response_from_store(
 
 fn delivery_outcome_from_store(
     outcome: AcknowledgePairResponseReceivedOutcome,
+    commit_outcome_unknown: bool,
 ) -> Result<DeliveryOutcome, PairingAdministrationError> {
-    let close = match outcome {
-        AcknowledgePairResponseReceivedOutcome::Delivered { close }
-        | AcknowledgePairResponseReceivedOutcome::Replayed { close } => close,
+    let (close, newly_committed) = match outcome {
+        AcknowledgePairResponseReceivedOutcome::Delivered { close } => (close, true),
+        AcknowledgePairResponseReceivedOutcome::Replayed { close } => {
+            (close, commit_outcome_unknown)
+        }
     };
     Ok(DeliveryOutcome {
         close: DurableClose::from_store(&close)?,
+        newly_committed,
     })
 }
 
@@ -2284,21 +2305,23 @@ impl PairingStore for ProductionPairingStore {
                 proof,
             ))
             .await;
-        let outcome = match first {
+        let (outcome, commit_outcome_unknown) = match first {
             Err(RuntimeStoreError::CommitOutcomeUnknown {
                 operation: RuntimeCommitOperation::AcknowledgePairResponseReceived,
-            }) => self
-                .0
-                .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
-                    input.pairing_id,
-                    proof,
-                ))
-                .await
-                .map_err(store_error)?,
-            Ok(outcome) => outcome,
+            }) => (
+                self.0
+                    .acknowledge_pair_response_received(AcknowledgePairResponseReceived::new(
+                        input.pairing_id,
+                        proof,
+                    ))
+                    .await
+                    .map_err(store_error)?,
+                true,
+            ),
+            Ok(outcome) => (outcome, false),
             Err(error) => return Err(store_error(error)),
         };
-        let outcome = delivery_outcome_from_store(outcome)?;
+        let outcome = delivery_outcome_from_store(outcome, commit_outcome_unknown)?;
         if outcome.close.pairing_id != input.pairing_id
             || outcome.close.pair_route != input.pair_route
         {
@@ -2796,6 +2819,7 @@ struct PairingCoordinator {
     health_tx: watch::Sender<PairingCoordinatorHealth>,
     admission_epoch: u64,
     admission_tx: watch::Sender<PairingAdmissionFence>,
+    delivery_commit_tx: watch::Sender<u64>,
 }
 
 impl PairingCoordinator {
@@ -2811,6 +2835,7 @@ impl PairingCoordinator {
         let PairingCoordinatorSignals {
             health_tx,
             admission_tx,
+            delivery_commit_tx,
         } = signals;
         Self {
             store,
@@ -2830,6 +2855,7 @@ impl PairingCoordinator {
             health_tx,
             admission_epoch: 0,
             admission_tx,
+            delivery_commit_tx,
         }
     }
 
@@ -2845,6 +2871,7 @@ impl PairingCoordinator {
         let PairingCoordinatorSignals {
             health_tx,
             admission_tx,
+            delivery_commit_tx,
         } = signals;
         Self {
             store,
@@ -2861,6 +2888,7 @@ impl PairingCoordinator {
             health_tx,
             admission_epoch: 0,
             admission_tx,
+            delivery_commit_tx,
         }
     }
 
@@ -4190,6 +4218,10 @@ impl PairingCoordinator {
         if outcome.close.pairing_id != pairing_id || outcome.close.pair_route != response.pair_route
         {
             return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+        }
+        if outcome.newly_committed {
+            self.delivery_commit_tx
+                .send_modify(|commits| *commits = commits.saturating_add(1));
         }
         self.send_recovered_close(outcome.close).await
     }

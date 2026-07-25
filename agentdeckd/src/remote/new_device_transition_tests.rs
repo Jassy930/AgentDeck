@@ -430,6 +430,13 @@ impl RemoteStreamPublisher for ObservingSharedPublisher {
         RemoteStreamPublisher::admission_ready(&self.inner)
     }
 
+    async fn prepare_subscription(
+        &self,
+        target: crate::runtime::events::RuntimeStreamTarget,
+    ) -> Result<(), RemoteLinkError> {
+        RemoteStreamPublisher::prepare_subscription(&self.inner, target).await
+    }
+
     async fn publish_exact(&self, runtime_bytes: Arc<[u8]>) -> Result<(), RemoteLinkError> {
         let observed = serde_json::from_slice::<RuntimeEnvelope>(runtime_bytes.as_ref())
             .ok()
@@ -1196,7 +1203,8 @@ async fn full_link_transition_snapshot_flushes_before_ack_then_publishes_contigu
     let business = transport
         .take_business_lane()
         .expect("take the unique full-link business lane");
-    let publication = PublicationDriveOwner::open(store.clone(), business.publication_handle())
+    let machine_publication = business.publication_handle();
+    let publication = PublicationDriveOwner::open(store.clone(), machine_publication.clone())
         .await
         .expect("open the unique full-link publication owner");
     let publication_drive = publication.handle();
@@ -1337,6 +1345,9 @@ async fn full_link_transition_snapshot_flushes_before_ack_then_publishes_contigu
         Arc::new(publication_drive.clone()),
         Arc::new(machine_data.clone()),
     )
+    .and_then(|publisher| {
+        publisher.with_subscription_provisioning(store.clone(), machine_publication)
+    })
     .expect("construct production shared publisher");
     let sealer = Arc::new(ObservingTransitionSealer::new(
         DeviceReplyTxSealer::new(store.clone(), key_store, machine_data),

@@ -18,10 +18,11 @@ use super::schema::{
     RUNTIME_KEY_UPDATE_MAX_CANONICAL_BYTES, RUNTIME_KEY_UPDATE_MAX_PLAINTEXT_BYTES,
     RUNTIME_KEY_UPDATE_MAX_SEALED_STATE_BYTES,
 };
-use super::sqlite::{RuntimeSqlite, SafetyReserveProjection};
+use super::sqlite::{RuntimeLedger, RuntimeSqlite, SafetyReserveProjection};
 
 mod codec;
 mod completion;
+mod directory_advance;
 mod epoch_barrier;
 mod integrity;
 mod lifecycle;
@@ -33,9 +34,10 @@ use completion::has_all_stream_applied_acks;
 pub(crate) use completion::{
     cancel_key_transition, complete_key_transition, try_complete_key_transition,
 };
+pub(crate) use directory_advance::authorize_directory_advance_identity;
 pub(crate) use epoch_barrier::authorize_epoch_barrier_identity;
 pub(crate) use integrity::validate_v12_integrity;
-use integrity::{verify_barrier_commit, verify_exact_committed_cuts};
+use integrity::{verify_exact_committed_cuts, verify_transition_publication_commit};
 pub(crate) use lifecycle::{
     apply_counter_retirement_after_guard_readback, apply_pending_replay_retirement,
     begin_key_transition, canonical_update_hash, ensure_key_transition_slot_available,
@@ -1461,18 +1463,85 @@ pub(crate) fn mark_key_barriers_committed(
     let ledger = super::sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)?;
     let authenticated = load_transition(&transaction, &key_bundle, database_id, operation_id)?
         .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    if matches!(
+        authenticated.record.phase,
+        KeyTransitionPhase::BarriersFrozen | KeyTransitionPhase::BarriersCommitted
+    ) {
+        super::transition_material::validate_transition_authorizations_in_transaction(
+            &transaction,
+            &key_bundle,
+            database_id,
+            &authenticated.record,
+        )?;
+    }
+    let (record, committed) = mark_authenticated_key_barriers_committed(
+        transaction,
+        &key_bundle,
+        database_id,
+        ledger,
+        authenticated,
+        committed_at_ms,
+    )?;
+    if committed {
+        super::sqlite::latch_post_commit_capacity(state, config);
+    }
+    Ok(record)
+}
+
+/// 早期 key-transition 单元测试只构造 ADKT/publication substrate，不构造 P4.3
+/// MachineRoot/enrollment/authorization ledger。它们继续通过本 test-only seam 隔离测试
+/// phase/ACK/GC 语义；production 入口和 authorization focused matrix 始终走上方完整 gate。
+#[cfg(test)]
+pub(super) fn mark_key_barriers_committed_without_authorization_revalidation_for_test(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    operation_id: [u8; 16],
+    committed_at_ms: u64,
+) -> Result<KeyTransitionRecord, RuntimeStoreError> {
+    validate_nonzero(operation_id)?;
+    admit_transition_write(state, config, 128 * 1024)?;
+    let key_bundle = state.key_bundle.clone();
+    let database_id = state.database_id;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)?;
+    let authenticated = load_transition(&transaction, &key_bundle, database_id, operation_id)?
+        .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    let (record, committed) = mark_authenticated_key_barriers_committed(
+        transaction,
+        &key_bundle,
+        database_id,
+        ledger,
+        authenticated,
+        committed_at_ms,
+    )?;
+    if committed {
+        super::sqlite::latch_post_commit_capacity(state, config);
+    }
+    Ok(record)
+}
+
+fn mark_authenticated_key_barriers_committed(
+    transaction: Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: RuntimeLedger,
+    authenticated: AuthenticatedTransition,
+    committed_at_ms: u64,
+) -> Result<(KeyTransitionRecord, bool), RuntimeStoreError> {
     if authenticated.record.phase == KeyTransitionPhase::BarriersCommitted {
         transaction.rollback()?;
-        return Ok(authenticated.record);
+        return Ok((authenticated.record, false));
     }
     if authenticated.record.phase != KeyTransitionPhase::BarriersFrozen {
         return Err(RuntimeStoreError::InvalidStateTransition);
     }
-    verify_barrier_commit(
+    verify_transition_publication_commit(
         &transaction,
-        &key_bundle,
+        key_bundle,
+        database_id,
         &authenticated.record,
-        &authenticated.record.cuts,
     )?;
     let mut changed = authenticated.record.clone();
     require_monotonic_time(changed.state_changed_at_ms, committed_at_ms)?;
@@ -1481,7 +1550,7 @@ pub(crate) fn mark_key_barriers_committed(
     let mut next = ledger.clone();
     replace_transition(
         &transaction,
-        &key_bundle,
+        key_bundle,
         database_id,
         &authenticated,
         &changed,
@@ -1489,14 +1558,13 @@ pub(crate) fn mark_key_barriers_committed(
     )?;
     let _ = super::sqlite::update_runtime_ledger(
         &transaction,
-        &key_bundle,
+        key_bundle,
         database_id,
         &ledger,
         &next,
     )?;
     transaction.commit()?;
-    super::sqlite::latch_post_commit_capacity(state, config);
-    Ok(changed)
+    Ok((changed, true))
 }
 
 pub(crate) fn acknowledge_key_update(

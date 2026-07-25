@@ -217,6 +217,50 @@ pub(in crate::runtime::store) fn capture_stream_binding_permit(
     }))
 }
 
+/// 普通 subscription delayed-finalize 的 identity-only 复核。captured permit 的
+/// cut 可以在 materialize 期间被 Relay COMMIT 推进，因此这里只锁定 current
+/// provenance、scope/route/generation/key identity；caller 随后单独校验新 cut 不超过
+/// 本次 captured Runtime H。
+#[allow(clippy::too_many_arguments)]
+pub(in crate::runtime::store) fn authenticate_current_subscription_stream(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    permit: &StreamBindingPermit,
+    expected_scope: PublicationScope,
+    expected_publication_stream_id: [u8; 16],
+    expected_generation: [u8; 16],
+    expected_outer: StreamCursor,
+    expected_inner: StreamCursor,
+) -> Result<PublicationStreamRecord, RuntimeStoreError> {
+    if !matches!(&permit.provenance, StreamBindingProvenance::Current)
+        || permit.scope != expected_scope
+        || permit.publication_stream_id != expected_publication_stream_id
+        || permit.generation != expected_generation
+        || permit.outer != expected_outer
+        || permit.inner != expected_inner
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    let ledger = super::super::sqlite::load_runtime_ledger(transaction, key_bundle, database_id)?;
+    let stream = super::authenticate_directory(transaction, key_bundle, &ledger, expected_scope)?
+        .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    if stream.publication_stream_id != permit.publication_stream_id
+        || stream.scope != permit.scope
+        || stream.stream_route != permit.stream_route
+        || stream.generation != permit.generation
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    let identity =
+        super::shared::current_shared_key_identity(key_bundle, database_id, transaction, &stream)?
+            .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    if identity != (permit.key_directory_revision, permit.key_id) {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    Ok(stream)
+}
+
 /// active Add transition 的 directed snapshot 专用 binding capture。
 ///
 /// EpochBarrier 已把 current publication row 推进到 `barrier_sequence/H`；wire binding

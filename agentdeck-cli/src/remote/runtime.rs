@@ -58,7 +58,8 @@ use super::key_sync::{
 };
 use super::paired_machine::{
     AuthorizedRuntimeRequest, OpaqueRuntimeState, OpenedPairedMachine, PairedPromotionError,
-    VerifiedDirectedReply, VerifiedRevocationTerminal, VerifiedStreamPublish,
+    VerifiedDirectedReply, VerifiedRevocationTerminal, VerifiedStreamDelivery,
+    VerifiedStreamPublish,
 };
 use super::stream_state::{
     DurableStreamBindingV1, StreamDirectApplyMode, StreamPublishDisposition,
@@ -605,6 +606,15 @@ impl RemoteRuntimeError {
 struct PendingKeySyncRoute {
     attempt: u8,
     outstanding_acceptances: usize,
+}
+
+/// 只有已经 durable admission、MachineDataSign 验证并用 predecessor Catalog key 解密的
+/// `DirectoryRevisionAdvance` 才能证明 machine 已接受上一轮 revision。普通 higher Publish
+/// 不具备这个能力，仍须先重封 predecessor `KeyUpdateAck`。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeySyncObservationSource {
+    HigherPublish,
+    DirectoryRevisionAdvance,
 }
 
 fn request_route_is_owned(
@@ -1434,7 +1444,10 @@ where
                     }
                     VerifiedStreamPublish::Higher(candidate) => {
                         return self
-                            .coordinate_key_sync((*candidate).into_observation())
+                            .coordinate_key_sync(
+                                (*candidate).into_observation(),
+                                KeySyncObservationSource::HigherPublish,
+                            )
                             .await;
                     }
                 };
@@ -1444,6 +1457,7 @@ where
                         candidate.header_directory_revision(),
                         candidate.stream_seq(),
                         candidate.counter(),
+                        candidate.signed_frame_sha256(),
                         candidate.ciphertext_sha256(),
                     )
                     .map_err(|_| RemoteRuntimeError::CounterReplay)?;
@@ -1492,7 +1506,20 @@ where
                         Err(error) => return Err(error.into()),
                     }
                 };
-                let opened = self.machine.open_verified_stream_publish(candidate)?;
+                let opened = match self
+                    .machine
+                    .open_verified_stream_delivery(&admitted, candidate)?
+                {
+                    VerifiedStreamDelivery::Runtime(opened) => opened,
+                    VerifiedStreamDelivery::DirectoryRevisionAdvance(observation) => {
+                        return self
+                            .coordinate_key_sync(
+                                observation,
+                                KeySyncObservationSource::DirectoryRevisionAdvance,
+                            )
+                            .await;
+                    }
+                };
                 if opened.payload_kind == SealedPayloadKind::TransferPart {
                     return self
                         .receive_live_transfer_part(reducer, admitted, stream_seq, opened)
@@ -1868,7 +1895,13 @@ where
                 // ACK 的 CounterGuard reservation、seal 与 transport Send 必须先完成；只有
                 // 此后才能冻结/提交下一次 probe，避免 restart 观察到“已继续但未 ACK”。
                 self.send_key_update_ack(&ack).await?;
-                let next_attempt = self.continue_key_sync_after_ack(committed_state).await?;
+                let next_attempt = self
+                    .continue_key_sync_after_ack(committed_state.clone())
+                    .await?;
+                if committed_state.status() == KeySyncCoordinationStatus::Resolved {
+                    self.finalize_resolved_directory_advance(&committed_state)
+                        .await?;
+                }
                 Ok(RemoteStreamFrameOutcome::KeyUpdateInstalled {
                     key_directory_revision: revision.value(),
                     next_attempt,
@@ -1883,7 +1916,9 @@ where
                 self.retry_after_directory_current(state, reply.request_route, status, now_ms)
                     .await
             }
-            KeyControlV1::EpochBarrier { .. } | KeyControlV1::StreamBinding { .. } => {
+            KeyControlV1::EpochBarrier { .. }
+            | KeyControlV1::StreamBinding { .. }
+            | KeyControlV1::DirectoryRevisionAdvance { .. } => {
                 Err(RemoteRuntimeError::InvalidReply(
                     "KeySync Reply carries an unrelated key-control variant",
                 ))
@@ -1941,7 +1976,10 @@ where
             .ok_or(RemoteRuntimeError::InvalidDurableState)?;
         let ack = self.machine.key_update_ack_from_basis(basis)?;
         self.send_key_update_ack(&ack).await?;
-        self.continue_key_sync_after_ack(state).await?;
+        self.continue_key_sync_after_ack(state.clone()).await?;
+        if state.status() == KeySyncCoordinationStatus::Resolved {
+            self.finalize_resolved_directory_advance(&state).await?;
+        }
         Ok(())
     }
 
@@ -1975,7 +2013,38 @@ where
             }
         }
 
-        self.pump_durable_key_sync_recovery().await
+        self.pump_durable_key_sync_recovery().await?;
+        let resolved = self
+            .machine
+            .durable_key_sync_state()?
+            .ok_or(RemoteRuntimeError::InvalidDurableState)?;
+        if resolved.status() == KeySyncCoordinationStatus::Resolved {
+            self.finalize_resolved_directory_advance(&resolved).await?;
+        }
+        Ok(())
+    }
+
+    /// UpdateSet/ADKS 已 durable `Resolved` 且 KeyUpdateAck 已成功进入 transport 后，才允许
+    /// 消费旧-revision control 的 exact replay tuple。普通 higher Publish 返回 `None`，不
+    /// 推进 outer；已提交但 ACK 未落盘的 crash cut 会在这里重发 cumulative Relay ACK。
+    async fn finalize_resolved_directory_advance(
+        &mut self,
+        state: &DurableKeySyncStateV1,
+    ) -> Result<(), RemoteRuntimeError> {
+        if state.status() != KeySyncCoordinationStatus::Resolved {
+            return Err(RemoteRuntimeError::InvalidDurableState);
+        }
+        let mut mutation_rng = SystemMutationRng::new()?;
+        let Some(committed) = self
+            .machine
+            .commit_resolved_directory_advance_outer(state, &mut mutation_rng)?
+        else {
+            return Ok(());
+        };
+        if committed.outer_acked() == committed.outer_applied() {
+            return Ok(());
+        }
+        self.send_stream_ack(&committed).await
     }
 
     /// 建连后、业务交付前重封所有 durable StreamAppliedAck basis。每次重封使用新的
@@ -2400,6 +2469,7 @@ where
     async fn coordinate_key_sync(
         &mut self,
         observation: SignedHigherRevisionObservationV1,
+        source: KeySyncObservationSource,
     ) -> Result<RemoteStreamFrameOutcome, RemoteRuntimeError> {
         let now_ms = unix_time_ms()?;
         let current = self.machine.durable_key_sync_state()?;
@@ -2440,12 +2510,15 @@ where
                 }
                 KeySyncCoordinationStatus::Resolved => {
                     // 新 signed observation 是唯一允许 supersede Resolved ADKS 的输入。
-                    // 先只读验证，随后必须先重发旧 ACK；只有 ACK Send 成功后，才允许
-                    // durable 冻结从刚安装 revision 出发的新 attempt-1 probe。
+                    // 普通 higher Publish 必须先重发旧 ACK；typed DirectoryRevisionAdvance
+                    // 已经以 durable replay tuple + predecessor Catalog key 证明 daemon/machine
+                    // 推进到新 revision，此时重发旧 revision ACK 会被 rollback guard 隔离。
                     current
                         .next_cycle_request(&observation, now_ms)
                         .map_err(key_sync_runtime_error)?;
-                    self.resume_pending_key_update_ack().await?;
+                    if source == KeySyncObservationSource::HigherPublish {
+                        self.resume_pending_key_update_ack().await?;
+                    }
                     let started_at_ms = unix_time_ms()?;
                     let request = current
                         .next_cycle_request(&observation, started_at_ms)
@@ -2465,9 +2538,18 @@ where
                     let exact_send = self.encode_key_control_send(request_route, signed)?;
                     let frozen = FrozenKeySyncSendV1::new(request, exact_send)
                         .map_err(key_sync_runtime_error)?;
-                    let replacement = current
-                        .start_next_cycle(observation, started_at_ms, frozen)
-                        .map_err(key_sync_runtime_error)?;
+                    let replacement = match source {
+                        KeySyncObservationSource::HigherPublish => current
+                            .start_next_cycle(observation, started_at_ms, frozen)
+                            .map_err(key_sync_runtime_error)?,
+                        KeySyncObservationSource::DirectoryRevisionAdvance => current
+                            .start_next_cycle_after_directory_advance(
+                                observation,
+                                started_at_ms,
+                                frozen,
+                            )
+                            .map_err(key_sync_runtime_error)?,
+                    };
                     self.machine.commit_key_sync_state_transition(
                         Some(&current),
                         Some(&replacement),
@@ -3796,11 +3878,9 @@ where
             }
             RuntimeReply::Backfill(chunk) if payload_kind == SealedPayloadKind::BackfillChunk => {
                 self.require_subscribed()?;
-                if !matches!(&self.catalog_page_chain, CatalogPageChain::NotStarted)
-                    || self.conversation_snapshot_seen
-                {
+                if matches!(&self.catalog_page_chain, CatalogPageChain::Expect(_)) {
                     return Err(RemoteRuntimeError::InvalidReply(
-                        "Backfill cannot be mixed with a snapshot bootstrap",
+                        "Backfill arrived before the final snapshot page",
                     ));
                 }
                 let next = self.next_after_backfill(&chunk)?;

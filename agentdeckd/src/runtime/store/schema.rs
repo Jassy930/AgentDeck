@@ -18,7 +18,8 @@ pub const RUNTIME_SCHEMA_VERSION_V11: u32 = 11;
 pub const RUNTIME_SCHEMA_VERSION_V12: u32 = 12;
 pub const RUNTIME_SCHEMA_VERSION_V13: u32 = 13;
 pub const RUNTIME_SCHEMA_VERSION_V14: u32 = 14;
-pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V14;
+pub const RUNTIME_SCHEMA_VERSION_V15: u32 = 15;
+pub const RUNTIME_SCHEMA_VERSION: u32 = RUNTIME_SCHEMA_VERSION_V15;
 /// 协议允许的最大 canonical KeyUpdateSet；Store admission 与 physical CHECK 共用此事实源。
 pub const RUNTIME_KEY_UPDATE_MAX_CANONICAL_BYTES: usize = KEY_UPDATE_SET_MAX_CANONICAL_BYTES;
 /// ADKU codec 的最大明文；physical sealed-state CHECK 还必须加固定行密文开销。
@@ -82,6 +83,8 @@ pub const RUNTIME_LEDGER_DOMAIN_V12: &[u8] = b"runtime.meta.ledger.v12";
 pub const RUNTIME_LEDGER_DOMAIN_V13: &[u8] = b"runtime.meta.ledger.v13";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const RUNTIME_LEDGER_DOMAIN_V14: &[u8] = b"runtime.meta.ledger.v14";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RUNTIME_LEDGER_DOMAIN_V15: &[u8] = b"runtime.meta.ledger.v15";
 pub const EXPECTED_TABLES_V1: [&str; 7] = [
     "commands",
     "conversations",
@@ -361,10 +364,34 @@ pub const EXPECTED_TABLES_V12: [&str; 35] = [
 ];
 pub const EXPECTED_TABLES_V13: [&str; 35] = EXPECTED_TABLES_V12;
 pub const EXPECTED_TABLES_V14: [&str; 35] = EXPECTED_TABLES_V13;
-pub const EXPECTED_TABLES: [&str; 35] = EXPECTED_TABLES_V14;
+pub const EXPECTED_TABLES_V15: [&str; 35] = EXPECTED_TABLES_V14;
+pub const EXPECTED_TABLES: [&str; 35] = EXPECTED_TABLES_V15;
 
 pub fn schema_signature() -> [u8; 32] {
-    schema_signature_v14()
+    schema_signature_v15()
+}
+
+pub fn schema_signature_v15() -> [u8; 32] {
+    static SIGNATURE: OnceLock<[u8; 32]> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| {
+        let mut digest = Sha256::new();
+        digest.update(RUNTIME_DDL_V1.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V2.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V3.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V4.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V5.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V6.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V7.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V8.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V9.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V10.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V11.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V12.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V13.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V14.as_bytes());
+        digest.update(RUNTIME_MIGRATION_V15.as_bytes());
+        digest.finalize().into()
+    })
 }
 
 pub fn schema_signature_v14() -> [u8; 32] {
@@ -2812,6 +2839,269 @@ CREATE INDEX idx_remote_key_update_recovery
     ON remote_key_update_outbox(operation_id, lifecycle, device_route, grant_serial);
 "#;
 
+/// P4.7 v15 publication COMMIT/local-ACK crash-window shape。
+///
+/// v13/v14 允许 authenticated rotation baseline `(BeforeFirst, H)`，但错误地要求
+/// outer ACK 仍为 `BeforeFirst` 时 committed/acknowledged inner cursor 必须相等。
+/// Relay COMMIT 与后续 local delivery ACK 是两个独立事务；首个新 generation frame
+/// COMMIT 后必须持久化 `(committed=0/H+1, acknowledged=BeforeFirst/H)`。v15 同时
+/// 重建 parent/outbox，保留全部 opaque ciphertext、hash、token 与 crypto context，只把
+/// 该合法窗口放宽为带 rotation provenance 的 `acknowledged_inner <= committed_inner`；
+/// inner 单调性同时作为独立于 outer ACK 状态的全局不变量，禁止任何已 ACK inner cut
+/// 领先 committed inner cut。
+pub const RUNTIME_MIGRATION_V15: &str = r#"
+PRAGMA defer_foreign_keys = ON;
+
+ALTER TABLE publication_outbox RENAME TO publication_outbox_v14;
+ALTER TABLE publication_streams RENAME TO publication_streams_v14;
+DROP INDEX idx_publication_pending;
+DROP INDEX idx_publication_active_catalog;
+DROP INDEX idx_publication_active_conversation;
+
+CREATE TABLE publication_streams (
+    publication_stream_id BLOB PRIMARY KEY
+        CHECK(typeof(publication_stream_id) = 'blob' AND length(publication_stream_id) = 16),
+    scope TEXT NOT NULL CHECK(scope IN ('catalog', 'conversation')),
+    conversation_id BLOB
+        CHECK(conversation_id IS NULL OR (
+            typeof(conversation_id) = 'blob' AND length(conversation_id) = 16
+        )),
+    stream_route BLOB NOT NULL
+        CHECK(typeof(stream_route) = 'blob' AND length(stream_route) = 16),
+    generation BLOB NOT NULL
+        CHECK(typeof(generation) = 'blob' AND length(generation) = 16),
+    counter_scope_token BLOB CHECK(
+        counter_scope_token IS NULL OR (
+            typeof(counter_scope_token) = 'blob' AND length(counter_scope_token) = 32
+        )
+    ),
+    sender_counter_high_water TEXT CHECK(
+        sender_counter_high_water IS NULL OR (
+            typeof(sender_counter_high_water) = 'text'
+            AND length(sender_counter_high_water) = 20
+            AND sender_counter_high_water NOT GLOB '*[^0-9]*'
+            AND sender_counter_high_water <= '18446744073709551615'
+        )
+    ),
+    reserved_high_water TEXT CHECK(
+        reserved_high_water IS NULL OR (
+            typeof(reserved_high_water) = 'text' AND length(reserved_high_water) = 20
+            AND reserved_high_water NOT GLOB '*[^0-9]*'
+            AND reserved_high_water <= '18446744073709551615'
+        )
+    ),
+    committed_high_water TEXT CHECK(
+        committed_high_water IS NULL OR (
+            typeof(committed_high_water) = 'text' AND length(committed_high_water) = 20
+            AND committed_high_water NOT GLOB '*[^0-9]*'
+            AND committed_high_water <= '18446744073709551615'
+        )
+    ),
+    committed_inner_cursor TEXT CHECK(
+        committed_inner_cursor IS NULL OR (
+            typeof(committed_inner_cursor) = 'text'
+            AND length(committed_inner_cursor) = 20
+            AND committed_inner_cursor NOT GLOB '*[^0-9]*'
+            AND committed_inner_cursor <= '18446744073709551615'
+        )
+    ),
+    acknowledged_high_water TEXT CHECK(
+        acknowledged_high_water IS NULL OR (
+            typeof(acknowledged_high_water) = 'text'
+            AND length(acknowledged_high_water) = 20
+            AND acknowledged_high_water NOT GLOB '*[^0-9]*'
+            AND acknowledged_high_water <= '18446744073709551615'
+        )
+    ),
+    acknowledged_inner_cursor TEXT CHECK(
+        acknowledged_inner_cursor IS NULL OR (
+            typeof(acknowledged_inner_cursor) = 'text'
+            AND length(acknowledged_inner_cursor) = 20
+            AND acknowledged_inner_cursor NOT GLOB '*[^0-9]*'
+            AND acknowledged_inner_cursor <= '18446744073709551615'
+        )
+    ),
+    last_acknowledged_blob_hash BLOB CHECK(
+        last_acknowledged_blob_hash IS NULL OR (
+            typeof(last_acknowledged_blob_hash) = 'blob'
+            AND length(last_acknowledged_blob_hash) = 32
+        )
+    ),
+    last_acknowledged_publication_id BLOB CHECK(
+        last_acknowledged_publication_id IS NULL OR (
+            typeof(last_acknowledged_publication_id) = 'blob'
+            AND length(last_acknowledged_publication_id) = 16
+        )
+    ),
+    last_acknowledged_request_digest BLOB CHECK(
+        last_acknowledged_request_digest IS NULL OR (
+            typeof(last_acknowledged_request_digest) = 'blob'
+            AND length(last_acknowledged_request_digest) = 32
+        )
+    ),
+    last_rotation_request_digest BLOB CHECK(
+        last_rotation_request_digest IS NULL OR (
+            typeof(last_rotation_request_digest) = 'blob'
+            AND length(last_rotation_request_digest) = 32
+        )
+    ),
+    rotation_serial TEXT NOT NULL CHECK(
+        typeof(rotation_serial) = 'text' AND length(rotation_serial) = 20
+        AND rotation_serial NOT GLOB '*[^0-9]*'
+        AND rotation_serial <= '18446744073709551615'
+    ),
+    last_committed_blob_hash BLOB CHECK(
+        last_committed_blob_hash IS NULL OR (
+            typeof(last_committed_blob_hash) = 'blob'
+            AND length(last_committed_blob_hash) = 32
+        )
+    ),
+    state TEXT NOT NULL CHECK(state IN ('active', 'needsSnapshot', 'retired')),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    CHECK((scope = 'catalog' AND conversation_id IS NULL)
+       OR (scope = 'conversation' AND conversation_id IS NOT NULL)),
+    CHECK(committed_high_water IS NULL OR reserved_high_water IS NOT NULL),
+    CHECK(committed_high_water IS NULL OR committed_high_water <= reserved_high_water),
+    CHECK(acknowledged_high_water IS NULL OR committed_high_water IS NOT NULL),
+    CHECK(acknowledged_high_water IS NULL OR acknowledged_high_water <= committed_high_water),
+    CHECK(acknowledged_inner_cursor IS NULL OR (
+        committed_inner_cursor IS NOT NULL
+        AND acknowledged_inner_cursor <= committed_inner_cursor
+    )),
+    CHECK((committed_high_water IS NULL
+           AND last_committed_blob_hash IS NULL
+           AND (committed_inner_cursor IS NULL OR (
+               rotation_serial > '00000000000000000000'
+               AND last_rotation_request_digest IS NOT NULL
+               AND acknowledged_high_water IS NULL
+               AND acknowledged_inner_cursor IS committed_inner_cursor)))
+       OR (committed_high_water IS NOT NULL
+           AND last_committed_blob_hash IS NOT NULL)),
+    CHECK((acknowledged_high_water IS NULL
+           AND last_acknowledged_blob_hash IS NULL
+           AND (acknowledged_inner_cursor IS NULL OR (
+               rotation_serial > '00000000000000000000'
+               AND last_rotation_request_digest IS NOT NULL
+               AND committed_inner_cursor IS NOT NULL
+               AND acknowledged_inner_cursor <= committed_inner_cursor)))
+       OR (acknowledged_high_water IS NOT NULL
+           AND last_acknowledged_blob_hash IS NOT NULL)),
+    CHECK((counter_scope_token IS NULL AND sender_counter_high_water IS NULL)
+       OR (counter_scope_token IS NOT NULL AND sender_counter_high_water IS NOT NULL)),
+    CHECK((last_acknowledged_publication_id IS NULL
+           AND last_acknowledged_request_digest IS NULL)
+       OR (last_acknowledged_publication_id IS NOT NULL
+           AND last_acknowledged_request_digest IS NOT NULL)),
+    UNIQUE(publication_stream_id, generation),
+    UNIQUE(stream_route, generation),
+    UNIQUE(counter_scope_token),
+    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+INSERT INTO publication_streams (
+    publication_stream_id, scope, conversation_id, stream_route, generation,
+    counter_scope_token, sender_counter_high_water, reserved_high_water,
+    committed_high_water, committed_inner_cursor, acknowledged_high_water,
+    acknowledged_inner_cursor, last_acknowledged_blob_hash,
+    last_acknowledged_publication_id, last_acknowledged_request_digest,
+    last_rotation_request_digest, rotation_serial, last_committed_blob_hash,
+    state, created_at_ms, updated_at_ms, metadata_token
+)
+SELECT publication_stream_id, scope, conversation_id, stream_route, generation,
+       counter_scope_token, sender_counter_high_water, reserved_high_water,
+       committed_high_water, committed_inner_cursor, acknowledged_high_water,
+       acknowledged_inner_cursor, last_acknowledged_blob_hash,
+       last_acknowledged_publication_id, last_acknowledged_request_digest,
+       last_rotation_request_digest, rotation_serial, last_committed_blob_hash,
+       state, created_at_ms, updated_at_ms, metadata_token
+FROM publication_streams_v14;
+
+CREATE UNIQUE INDEX idx_publication_active_catalog
+    ON publication_streams(scope) WHERE scope = 'catalog' AND state = 'active';
+CREATE UNIQUE INDEX idx_publication_active_conversation
+    ON publication_streams(conversation_id)
+    WHERE scope = 'conversation' AND state = 'active';
+
+CREATE TABLE publication_outbox (
+    publication_id BLOB PRIMARY KEY
+        CHECK(typeof(publication_id) = 'blob' AND length(publication_id) = 16),
+    publication_stream_id BLOB NOT NULL
+        CHECK(typeof(publication_stream_id) = 'blob' AND length(publication_stream_id) = 16),
+    generation BLOB NOT NULL
+        CHECK(typeof(generation) = 'blob' AND length(generation) = 16),
+    stream_seq TEXT NOT NULL CHECK(
+        typeof(stream_seq) = 'text' AND length(stream_seq) = 20
+        AND stream_seq NOT GLOB '*[^0-9]*'
+        AND stream_seq <= '18446744073709551615'
+    ),
+    counter_scope_token BLOB NOT NULL
+        CHECK(typeof(counter_scope_token) = 'blob' AND length(counter_scope_token) = 32),
+    sender_counter TEXT NOT NULL CHECK(
+        typeof(sender_counter) = 'text' AND length(sender_counter) = 20
+        AND sender_counter NOT GLOB '*[^0-9]*'
+        AND sender_counter <= '18446744073709551615'
+    ),
+    inner_after_seq TEXT CHECK(
+        inner_after_seq IS NULL OR (
+            typeof(inner_after_seq) = 'text' AND length(inner_after_seq) = 20
+            AND inner_after_seq NOT GLOB '*[^0-9]*'
+            AND inner_after_seq <= '18446744073709551615'
+        )
+    ),
+    inner_through_seq TEXT CHECK(
+        inner_through_seq IS NULL OR (
+            typeof(inner_through_seq) = 'text' AND length(inner_through_seq) = 20
+            AND inner_through_seq NOT GLOB '*[^0-9]*'
+            AND inner_through_seq <= '18446744073709551615'
+        )
+    ),
+    payload_kind TEXT NOT NULL CHECK(
+        payload_kind IN ('event', 'catalog', 'snapshot', 'control')
+    ),
+    blob_sha256 BLOB NOT NULL
+        CHECK(typeof(blob_sha256) = 'blob' AND length(blob_sha256) = 32),
+    logical_blob_bytes INTEGER NOT NULL
+        CHECK(logical_blob_bytes BETWEEN 1 AND 4194304),
+    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+    metadata_token BLOB NOT NULL
+        CHECK(typeof(metadata_token) = 'blob' AND length(metadata_token) = 32),
+    sealed_publication BLOB NOT NULL CHECK(
+        typeof(sealed_publication) = 'blob'
+        AND length(sealed_publication) BETWEEN 40 AND 4194344
+    ),
+    CHECK((inner_after_seq IS NULL AND inner_through_seq IS NULL)
+       OR (inner_through_seq IS NOT NULL
+           AND (inner_after_seq IS NULL OR inner_after_seq < inner_through_seq))),
+    UNIQUE(publication_stream_id, generation, stream_seq),
+    UNIQUE(counter_scope_token, sender_counter),
+    FOREIGN KEY(publication_stream_id, generation)
+        REFERENCES publication_streams(publication_stream_id, generation)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+INSERT INTO publication_outbox (
+    publication_id, publication_stream_id, generation, stream_seq,
+    counter_scope_token, sender_counter, inner_after_seq, inner_through_seq,
+    payload_kind, blob_sha256, logical_blob_bytes, created_at_ms,
+    metadata_token, sealed_publication
+)
+SELECT publication_id, publication_stream_id, generation, stream_seq,
+       counter_scope_token, sender_counter, inner_after_seq, inner_through_seq,
+       payload_kind, blob_sha256, logical_blob_bytes, created_at_ms,
+       metadata_token, sealed_publication
+FROM publication_outbox_v14;
+
+CREATE INDEX idx_publication_pending
+    ON publication_outbox(publication_stream_id, generation, stream_seq);
+
+DROP TABLE publication_outbox_v14;
+DROP TABLE publication_streams_v14;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3011,7 +3301,7 @@ mod tests {
 
     #[test]
     fn stream_schema_advances_to_v4_with_six_bounded_store_tables() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V15);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         for table in [
             "event_stream_index",
@@ -3027,7 +3317,7 @@ mod tests {
 
     #[test]
     fn approval_physical_schema_remains_v3_compatible_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V15);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V3.len(), 10);
         assert!(EXPECTED_TABLES_V3.contains(&"approval_ledger"));
@@ -3135,6 +3425,14 @@ mod tests {
         connection
     }
 
+    fn v15_structural_connection() -> Connection {
+        let connection = v14_structural_connection();
+        connection
+            .execute_batch(RUNTIME_MIGRATION_V15)
+            .expect("apply v15 structural migration");
+        connection
+    }
+
     fn insert_v13_rotation_baseline(
         connection: &Connection,
         identity_byte: u8,
@@ -3170,7 +3468,7 @@ mod tests {
 
     #[test]
     fn v6_adds_projection_and_effect_fence_sidecars_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V15);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V6, 6);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V5.len(), 20);
@@ -3201,7 +3499,7 @@ mod tests {
 
     #[test]
     fn v7_adds_machine_wide_admin_command_ledger_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V15);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V7, 7);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V7.len(), 23);
@@ -3581,7 +3879,7 @@ mod tests {
 
     #[test]
     fn v12_adds_authenticated_key_transition_and_update_outbox_without_rotating_crypto_context() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V15);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V12, 12);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V11.len(), 32);
@@ -3644,12 +3942,12 @@ mod tests {
 
     #[test]
     fn v13_rebuilds_publication_tables_and_only_accepts_authenticated_inner_baseline() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V15);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V13, 13);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V13, EXPECTED_TABLES_V12);
         assert_eq!(EXPECTED_TABLES_V14, EXPECTED_TABLES_V13);
-        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V14);
+        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V15);
         assert_ne!(schema_signature(), schema_signature_v13());
         assert_ne!(schema_signature_v12(), schema_signature_v13());
         assert_eq!(RUNTIME_LEDGER_DOMAIN_V13, b"runtime.meta.ledger.v13");
@@ -3746,12 +4044,13 @@ mod tests {
 
     #[test]
     fn v14_rebuilds_key_update_outbox_with_protocol_and_codec_capacity() {
-        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V14);
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V15);
         assert_eq!(RUNTIME_SCHEMA_VERSION_V14, 14);
         assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
         assert_eq!(EXPECTED_TABLES_V14, EXPECTED_TABLES_V13);
-        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V14);
-        assert_eq!(schema_signature(), schema_signature_v14());
+        assert_eq!(EXPECTED_TABLES_V15, EXPECTED_TABLES_V14);
+        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V15);
+        assert_ne!(schema_signature(), schema_signature_v14());
         assert_ne!(schema_signature_v13(), schema_signature_v14());
         assert_eq!(RUNTIME_LEDGER_DOMAIN_V14, b"runtime.meta.ledger.v14");
 
@@ -3793,6 +4092,144 @@ mod tests {
                 row.get(0)
             })
             .expect("count v14 foreign-key violations");
+        assert_eq!(foreign_key_violation_count, 0);
+    }
+
+    #[test]
+    fn v15_accepts_authenticated_commit_before_local_ack_and_rejects_invalid_lag() {
+        assert_eq!(RUNTIME_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION_V15);
+        assert_eq!(RUNTIME_SCHEMA_VERSION_V15, 15);
+        assert_eq!(RUNTIME_CRYPTO_CONTEXT_VERSION, 1);
+        assert_eq!(EXPECTED_TABLES_V15, EXPECTED_TABLES_V14);
+        assert_eq!(EXPECTED_TABLES, EXPECTED_TABLES_V15);
+        assert_eq!(schema_signature(), schema_signature_v15());
+        assert_ne!(schema_signature_v14(), schema_signature_v15());
+        assert_eq!(RUNTIME_LEDGER_DOMAIN_V15, b"runtime.meta.ledger.v15");
+
+        let connection = v15_structural_connection();
+        assert_eq!(table_names(&connection), EXPECTED_TABLES_V15);
+        let publication_sql = table_sql(&connection, "publication_streams");
+        assert!(publication_sql.contains("committed_inner_cursor IS NOT NULL"));
+        assert!(publication_sql.contains("acknowledged_inner_cursor <= committed_inner_cursor"));
+        assert!(publication_sql.contains(
+            "CHECK(acknowledged_inner_cursor IS NULL OR (\n        committed_inner_cursor IS NOT NULL"
+        ));
+
+        let rotation_digest = [0xA6_u8; 32];
+        insert_v13_rotation_baseline(
+            &connection,
+            0x21,
+            Some("00000000000000000041"),
+            Some("00000000000000000041"),
+            "00000000000000000001",
+            Some(&rotation_digest),
+        )
+        .expect("insert authenticated rotation baseline");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE publication_streams
+                     SET reserved_high_water = '00000000000000000000',
+                         committed_high_water = '00000000000000000000',
+                         committed_inner_cursor = '00000000000000000042',
+                         last_committed_blob_hash = ?1
+                     WHERE publication_stream_id = ?2",
+                    params![&[0xA7_u8; 32][..], &[0x21_u8; 16][..]],
+                )
+                .expect("persist Relay COMMIT ahead of local delivery ACK"),
+            1
+        );
+        let persisted: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = connection
+            .query_row(
+                "SELECT committed_high_water, committed_inner_cursor,
+                        acknowledged_high_water, acknowledged_inner_cursor
+                 FROM publication_streams WHERE publication_stream_id = ?1",
+                [&[0x21_u8; 16][..]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read persisted COMMIT/local-ACK crash window");
+        assert_eq!(
+            persisted,
+            (
+                Some("00000000000000000000".to_owned()),
+                Some("00000000000000000042".to_owned()),
+                None,
+                Some("00000000000000000041".to_owned()),
+            )
+        );
+
+        assert!(
+            connection
+                .execute(
+                    "UPDATE publication_streams
+                     SET acknowledged_inner_cursor = '00000000000000000043'
+                     WHERE publication_stream_id = ?1",
+                    [&[0x21_u8; 16][..]],
+                )
+                .is_err(),
+            "acknowledged inner cursor must not advance beyond committed inner"
+        );
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE publication_streams
+                     SET acknowledged_high_water = '00000000000000000000',
+                         acknowledged_inner_cursor = '00000000000000000042',
+                         last_acknowledged_blob_hash = ?1,
+                         last_acknowledged_publication_id = ?2,
+                         last_acknowledged_request_digest = ?3
+                     WHERE publication_stream_id = ?4",
+                    params![
+                        &[0xA7_u8; 32][..],
+                        &[0xA8_u8; 16][..],
+                        &[0xA9_u8; 32][..],
+                        &[0x21_u8; 16][..],
+                    ],
+                )
+                .expect("persist caught-up local delivery ACK"),
+            1
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE publication_streams
+                     SET acknowledged_inner_cursor = '00000000000000000043'
+                     WHERE publication_stream_id = ?1",
+                    [&[0x21_u8; 16][..]],
+                )
+                .is_err(),
+            "outer ACK branch must still reject acknowledged inner beyond committed inner"
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE publication_streams SET committed_inner_cursor = NULL
+                     WHERE publication_stream_id = ?1",
+                    [&[0x21_u8; 16][..]],
+                )
+                .is_err(),
+            "acknowledged inner cursor always requires a non-null committed inner cursor"
+        );
+
+        let legacy_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name IN ('publication_streams_v14', 'publication_outbox_v14')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count temporary v14 publication tables");
+        assert_eq!(legacy_table_count, 0);
+        let foreign_key_violation_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("count v15 foreign-key violations");
         assert_eq!(foreign_key_violation_count, 0);
     }
 

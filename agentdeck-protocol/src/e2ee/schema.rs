@@ -76,6 +76,10 @@ pub fn e2ee_schema() -> serde_json::Value {
     insert_schema!("KeyUpdateInfoV1", keys::KeyUpdateInfoV1);
     insert_schema!("KeyControlV1", key_control::KeyControlV1);
     insert_schema!("KeyControlRequestV1", key_control::KeyControlRequestV1);
+    insert_schema!(
+        "DirectoryRevisionAdvanceV1",
+        key_control::DirectoryRevisionAdvanceV1
+    );
     insert_schema!("KeyUpdateSetV1", key_control::KeyUpdateSetV1);
     insert_schema!("KeySyncRequestV1", key_control::KeySyncRequestV1);
     insert_schema!("KeyUpdateAckV1", key_control::KeyUpdateAckV1);

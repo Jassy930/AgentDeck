@@ -8,9 +8,11 @@ mod shared;
 use agentdeck_protocol::e2ee::keys::{KeyId, KeyPurpose};
 use agentdeck_protocol::e2ee::payload::SignedSealedBlobV1;
 use agentdeck_protocol::relay_v2::StreamRouteId;
+use agentdeck_protocol::runtime::StreamCursor;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
+use crate::runtime::events::{RelayCommittedCut, RuntimeStreamTarget, StoreWatchToken};
 use crate::runtime::model::{
     RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
 };
@@ -23,7 +25,9 @@ use super::identity::{
 use super::remote_counter::{RemoteCounterFreezeAxes, RemoteCounterReservation};
 use super::sequence::{SequenceScope, decode_sequence, encode_sequence, next_sequence};
 use super::sqlite::{RuntimeLedger, RuntimeSqlite};
-use super::stream::{metadata_mac, open_v4_row, optional_field, seal_v4_row, sqlite_u64};
+use super::stream::{
+    RuntimeBackfillPin, metadata_mac, open_v4_row, optional_field, seal_v4_row, sqlite_u64,
+};
 use super::{RetiredKeyOwnerKind, RetiredSharedKeyOwner};
 
 pub(crate) use binding::StreamBindingPermit;
@@ -37,8 +41,8 @@ pub(super) use directory::{
 pub(crate) use rotation::LAST_RELAY_STREAM_SEQ;
 pub(super) use rotation::{reset_for_machine_purge, rotate_publication_stream};
 pub(crate) use shared::{
-    EpochBarrierJournalIdentity, SharedJournalIdentity, SharedPublicationPreflight,
-    SharedPublicationPreflightRequest, SharedPublicationStreamProposal,
+    DirectoryAdvanceJournalIdentity, EpochBarrierJournalIdentity, SharedJournalIdentity,
+    SharedPublicationPreflight, SharedPublicationPreflightRequest, SharedPublicationStreamProposal,
     SharedPublicationTransactionBinding, TransactionSharedKeyAxes,
 };
 pub(super) use shared::{preflight_shared_publication, shared_transaction_key_axes};
@@ -54,6 +58,9 @@ const STREAM_TOKEN_DOMAIN: &[u8] = b"publication.stream.v1";
 const OUTBOX_TOKEN_DOMAIN: &[u8] = b"publication.outbox.v1";
 const FREEZE_REQUEST_DIGEST_DOMAIN: &[u8] = b"publication.freeze-request.v1";
 const FIRST_REMOTE_BASELINE_DOMAIN: &[u8] = b"publication.first-remote-baseline.v1";
+const SUBSCRIPTION_SNAPSHOT_BASELINE_DOMAIN: &[u8] =
+    b"publication.subscription-snapshot-baseline.v1";
+const SUBSCRIPTION_BASELINE_CLOSED_DOMAIN: &[u8] = b"publication.subscription-baseline-closed.v1";
 
 #[derive(Clone, Copy)]
 struct PublicationLimits {
@@ -180,6 +187,26 @@ pub(crate) struct FreezeSignedPublicationRequest {
     pub shared_binding: Option<SharedPublicationTransactionBinding>,
     pub sealer_retained_bytes: usize,
     pub sealer: Box<dyn TransactionPublicationSealer>,
+}
+
+/// 普通 subscription 在任何 StreamBinding 下发前执行的 delayed-finalize 请求。
+/// `captured` 是 register barrier 同一 authenticated cut 取得的 capability；Store
+/// 仍会重新认证 exact stream identity、当前 cut、snapshot directory 与 watcher。
+#[derive(Clone)]
+pub(crate) struct FinalizeSubscriptionPublicationRequest {
+    pub target: RuntimeStreamTarget,
+    pub captured_high_water: StreamCursor,
+    pub durable_snapshot_base: Option<StreamCursor>,
+    pub captured: RelayCommittedCut,
+    pub watch_token: StoreWatchToken,
+}
+
+/// delayed-finalize 的 fresh authenticated cut 与 binding 前已经固定的 publication
+/// overlap。worker 在同一个串行 command 内完成 baseline CAS/readback 和 exact
+/// `B→captured H` pin；pump 只有持有该结果后才允许发送 StreamBinding。
+pub(crate) struct FinalizeSubscriptionPublicationOutcome {
+    pub cut: RelayCommittedCut,
+    pub overlap_pin: Option<RuntimeBackfillPin>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -476,6 +503,454 @@ pub(super) fn create_publication_stream(
         RuntimeCommitOperation::CreatePublicationStream,
     )?;
     Ok(record)
+}
+
+/// 远程 Subscribe/Backfill 进入 RuntimeCore 前准备 exact Relay stream identity。
+///
+/// Catalog 在 first-device zero-cut Add 完成前允许没有 publication row；首次业务订阅
+/// 才在这里单事务分配并持久化三个 opaque axes。Conversation identity 必须已经由
+/// conversation activation 与 canonical row 同事务建立，缺失时禁止补造第二条映射。
+/// 重试始终先认证完整 directory，并逐字返回已有 Active row。
+pub(super) fn ensure_subscription_publication_stream(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    scope: PublicationScope,
+    now_ms: u64,
+) -> Result<PublicationStreamRecord, RuntimeStoreError> {
+    validate_scope(scope)?;
+
+    let pre_ledger = super::sqlite::load_runtime_ledger(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+    )?;
+    let pre_directory =
+        authenticate_directory_records(&state.connection, &state.key_bundle, &pre_ledger)?;
+    if let Some(existing) = select_subscription_stream(&pre_directory, scope)? {
+        return Ok(existing);
+    }
+    if scope != PublicationScope::Catalog {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+
+    super::sqlite::admit_ordinary_write(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &state.storage_path,
+        &mut state.admission_state,
+        config.capacity_probe.as_ref(),
+        1024 * 1024,
+        super::sqlite::SafetyReserveProjection::Current,
+    )?;
+
+    let database_id = state.database_id;
+    let key_bundle = &state.key_bundle;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, key_bundle, database_id)?;
+    let directory = authenticate_directory_records(&transaction, key_bundle, &ledger)?;
+    if let Some(existing) = select_subscription_stream(&directory, scope)? {
+        drop(transaction);
+        return Ok(existing);
+    }
+
+    let next_count = ledger
+        .publication_stream_count
+        .checked_add(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if next_count > MAX_PUBLICATION_STREAMS {
+        return Err(RuntimeStoreError::ConversationLimit);
+    }
+    let [publication_stream_id, stream_route, generation] =
+        allocate_publication_axes(&transaction, config)?;
+    let record = PublicationStreamRecord {
+        publication_stream_id,
+        scope,
+        stream_route,
+        generation,
+        counter_scope_token: None,
+        sender_counter_high_water: None,
+        reserved_high_water: None,
+        committed_high_water: None,
+        committed_inner_cursor: None,
+        last_committed_blob_hash: None,
+        acknowledged_high_water: None,
+        acknowledged_inner_cursor: None,
+        last_acknowledged_blob_hash: None,
+        last_acknowledged_publication_id: None,
+        last_acknowledged_request_digest: None,
+        last_rotation_request_digest: None,
+        rotation_serial: 0,
+        state: PublicationStreamState::Active,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    };
+    insert_stream(&transaction, key_bundle, &record)?;
+    let mut next = ledger.clone();
+    next.publication_stream_count = next_count;
+    let _pending_targets = super::sqlite::update_runtime_ledger(
+        &transaction,
+        key_bundle,
+        database_id,
+        &ledger,
+        &next,
+    )?;
+    commit_with_faults(
+        transaction,
+        config,
+        RuntimeStoreOperation::CreatePublicationStreamBeforeCommit,
+        RuntimeCommitOperation::CreatePublicationStream,
+    )?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    after_commit(
+        config,
+        RuntimeStoreOperation::CreatePublicationStreamAfterCommit,
+        RuntimeCommitOperation::CreatePublicationStream,
+    )?;
+    Ok(record)
+}
+
+/// transition owner 在确认当前没有 active transition 后，为至少一个 Active remote
+/// authorization 预建唯一 Catalog carrier。首设备 Add 尚未完成时必须保持空目录，
+/// 否则动态 projection 会把 genesis Catalog 纳入 Add barrier，而尚未启动的客户端
+/// 无法 ACK。Add terminal 后本入口可幂等创建；升级自愈也复用同一认证 readback。
+pub(super) fn ensure_remote_catalog_publication_after_transition(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    now_ms: u64,
+) -> Result<Option<PublicationStreamRecord>, RuntimeStoreError> {
+    if super::key_transition::load_active_key_transition(state)?.is_some() {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let authorizations = super::pairing_authorization::load_authorizations(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+    )?;
+    if !authorizations.iter().any(|authorization| {
+        authorization.lifecycle == super::pairing_authorization::AuthorizationLifecycle::Active
+    }) {
+        return Ok(None);
+    }
+    ensure_subscription_publication_stream(state, config, PublicationScope::Catalog, now_ms)
+        .map(Some)
+}
+
+fn select_subscription_stream(
+    directory: &[PublicationStreamRecord],
+    scope: PublicationScope,
+) -> Result<Option<PublicationStreamRecord>, RuntimeStoreError> {
+    let mut active = None;
+    let mut needs_snapshot = false;
+    for stream in directory.iter().filter(|stream| stream.scope == scope) {
+        match stream.state {
+            PublicationStreamState::Active => {
+                if active.replace(stream.clone()).is_some() {
+                    return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+                }
+            }
+            PublicationStreamState::NeedsSnapshot => {
+                if needs_snapshot {
+                    return Err(RuntimeStoreError::PublicationMismatch);
+                }
+                needs_snapshot = true;
+            }
+            PublicationStreamState::Retired => {}
+        }
+    }
+    if active.is_none() && needs_snapshot {
+        return Err(RuntimeStoreError::PublicationNeedsSnapshot);
+    }
+    Ok(active)
+}
+
+/// Generic barrier capture 必须以完整认证后的当前 remote authority 判断是否需要
+/// binding，而不能把历史 publication lineage 当作授权力。local-only 会忽略 purge
+/// 保留的 NeedsSnapshot/Retired；remote-required 则只接受 Active，NeedsSnapshot 在
+/// binding 前 typed fail，Retired-only/真正缺失都以 mismatch fail-close。
+pub(super) fn authenticate_subscription_publication_stream(
+    transaction: &Transaction<'_>,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    ledger: &RuntimeLedger,
+    scope: PublicationScope,
+) -> Result<Option<PublicationStreamRecord>, RuntimeStoreError> {
+    let directory = authenticate_directory_records(transaction, key_bundle, ledger)?;
+    // publication lineage 会在 machine purge 后刻意保留为 NeedsSnapshot；它本身不能
+    // 证明当前仍有 remote reader。必须同时认证授权账本与 key directory，并以
+    // Active authorization 决定该 scope 是否仍需 Relay binding。否则 purge 后的
+    // 本地 UDS subscription 会被旧 lineage 永久挡住。
+    super::pairing::validate_v10_integrity(transaction, key_bundle, database_id, ledger)?;
+    if ledger.remote_authorization_active_count == 0 {
+        return Ok(None);
+    }
+    select_subscription_stream(&directory, scope)?
+        .ok_or(RuntimeStoreError::PublicationMismatch)
+        .map(Some)
+}
+
+/// 在普通 subscription 的首个业务 frame/SyncComplete 下发前，永久关闭 pristine
+/// stream 的 baseline opportunity。可信 durable snapshot 可把 BeforeFirst 推到 S；
+/// 其他路径只能关闭在 BeforeFirst，且必须证明 BF→captured H 仍可完整 replay。
+/// 一旦关闭或已有任何 publication lineage，后续调用只读回 current cut，绝不前跳。
+pub(super) fn finalize_subscription_publication(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    request: FinalizeSubscriptionPublicationRequest,
+    now_ms: u64,
+) -> Result<RelayCommittedCut, RuntimeStoreError> {
+    let FinalizeSubscriptionPublicationRequest {
+        target,
+        captured_high_water,
+        durable_snapshot_base,
+        captured,
+        watch_token: _,
+    } = request;
+    let expected_scope = publication_scope_for_target(target);
+    let publication_stream_id = captured
+        .publication_stream_id
+        .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    let generation = captured
+        .generation
+        .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    let captured_permit = captured
+        .stream_binding
+        .as_ref()
+        .ok_or(RuntimeStoreError::PublicationMismatch)?;
+
+    let key_bundle = state.key_bundle.clone();
+    let database_id = state.database_id;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    super::key_transition::ensure_no_active_transition_for_business(
+        &transaction,
+        &key_bundle,
+        database_id,
+    )?;
+    let ledger = super::sqlite::load_runtime_ledger(&transaction, &key_bundle, database_id)?;
+    let mut stream = binding::authenticate_current_subscription_stream(
+        &transaction,
+        &key_bundle,
+        database_id,
+        captured_permit,
+        expected_scope,
+        publication_stream_id,
+        generation,
+        captured.outer,
+        captured.inner,
+    )?;
+    let target_cut = super::stream::load_authenticated_target_cut_in(
+        &transaction,
+        &key_bundle,
+        database_id,
+        &ledger,
+        target,
+    )?;
+    if !cursor_at_or_before(captured_high_water, target_cut.high_water)
+        || !cursor_at_or_before(
+            StreamCursor::from_high_water(stream.committed_inner_cursor),
+            captured_high_water,
+        )
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+
+    let stream_outbox_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM publication_outbox
+         WHERE publication_stream_id = ?1 AND generation = ?2",
+        params![&stream.publication_stream_id[..], &stream.generation[..]],
+        |row| row.get(0),
+    )?;
+    let fully_pristine = stream.state == PublicationStreamState::Active
+        && stream.counter_scope_token.is_none()
+        && stream.sender_counter_high_water.is_none()
+        && stream.reserved_high_water.is_none()
+        && stream.committed_high_water.is_none()
+        && stream.committed_inner_cursor.is_none()
+        && stream.last_committed_blob_hash.is_none()
+        && stream.acknowledged_high_water.is_none()
+        && stream.acknowledged_inner_cursor.is_none()
+        && stream.last_acknowledged_blob_hash.is_none()
+        && stream.last_acknowledged_publication_id.is_none()
+        && stream.last_acknowledged_request_digest.is_none()
+        && stream.last_rotation_request_digest.is_none()
+        && stream.rotation_serial == 0
+        && stream_outbox_count == 0;
+
+    if !fully_pristine {
+        drop(transaction);
+        return current_relay_cut(state, &stream);
+    }
+    if now_ms < stream.updated_at_ms {
+        return Err(RuntimeStoreError::ClockRegressed {
+            persisted_ms: stream.updated_at_ms,
+            observed_ms: now_ms,
+        });
+    }
+
+    let baseline = match durable_snapshot_base {
+        Some(snapshot_base) if snapshot_base.high_water().is_some() => {
+            if !cursor_at_or_before(snapshot_base, captured_high_water) {
+                return Err(RuntimeStoreError::PublicationMismatch);
+            }
+            let reference = super::snapshot::authenticate_directory(
+                &transaction,
+                &key_bundle,
+                &ledger,
+                target,
+            )?
+            .ok_or(RuntimeStoreError::PublicationNeedsSnapshot)?;
+            if reference.target != target || reference.base != snapshot_base {
+                return Err(RuntimeStoreError::PublicationNeedsSnapshot);
+            }
+            let snapshot_high_water = snapshot_base
+                .high_water()
+                .ok_or(RuntimeStoreError::PublicationMismatch)?;
+            let covered = match target {
+                RuntimeStreamTarget::Catalog => {
+                    super::snapshot::authenticated_catalog_snapshot_covers(
+                        &transaction,
+                        &key_bundle,
+                        snapshot_high_water,
+                    )?
+                }
+                RuntimeStreamTarget::Conversation(conversation_id) => {
+                    super::snapshot::authenticated_conversation_snapshot_covers(
+                        &transaction,
+                        &key_bundle,
+                        conversation_id,
+                        snapshot_high_water,
+                    )?
+                }
+            };
+            if !covered {
+                return Err(RuntimeStoreError::PublicationNeedsSnapshot);
+            }
+            Some(snapshot_high_water)
+        }
+        Some(StreamCursor::BeforeFirst) | None => {
+            if !retained_range_covers(
+                None,
+                captured_high_water.high_water(),
+                target_cut.retained_floor,
+            ) {
+                return Err(RuntimeStoreError::PublicationNeedsSnapshot);
+            }
+            None
+        }
+        Some(StreamCursor::At(_)) => unreachable!("guarded by high_water above"),
+    };
+
+    // Exact retry/non-pristine reconnect is a pure authenticated readback and must remain
+    // available under low-capacity recovery. Admission applies only to the pristine CAS,
+    // after every snapshot/retention precondition has passed but before the first mutation.
+    super::sqlite::admit_safety_write(
+        &transaction,
+        &key_bundle,
+        database_id,
+        &state.storage_path,
+        config.capacity_probe.as_ref(),
+    )?;
+    stream.committed_inner_cursor = baseline;
+    stream.acknowledged_inner_cursor = baseline;
+    stream.last_rotation_request_digest = Some(subscription_baseline_digest(&stream, baseline));
+    stream.rotation_serial = 1;
+    stream.updated_at_ms = now_ms;
+    update_stream(&transaction, &key_bundle, &stream)?;
+    commit_with_faults(
+        transaction,
+        config,
+        RuntimeStoreOperation::FinalizeSubscriptionPublicationBeforeCommit,
+        RuntimeCommitOperation::FinalizeSubscriptionPublication,
+    )?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    after_commit(
+        config,
+        RuntimeStoreOperation::FinalizeSubscriptionPublicationAfterCommit,
+        RuntimeCommitOperation::FinalizeSubscriptionPublication,
+    )?;
+    current_relay_cut(state, &stream)
+}
+
+fn current_relay_cut(
+    state: &RuntimeSqlite,
+    expected: &PublicationStreamRecord,
+) -> Result<RelayCommittedCut, RuntimeStoreError> {
+    let transaction = Transaction::new_unchecked(&state.connection, TransactionBehavior::Deferred)?;
+    let ledger =
+        super::sqlite::load_runtime_ledger(&transaction, &state.key_bundle, state.database_id)?;
+    let stream = authenticate_directory(&transaction, &state.key_bundle, &ledger, expected.scope)?
+        .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    if stream.publication_stream_id != expected.publication_stream_id
+        || stream.stream_route != expected.stream_route
+        || stream.generation != expected.generation
+    {
+        return Err(RuntimeStoreError::PublicationMismatch);
+    }
+    let stream_binding = binding::capture_stream_binding_permit(
+        &transaction,
+        &state.key_bundle,
+        state.database_id,
+        &stream,
+    )?
+    .ok_or(RuntimeStoreError::PublicationMismatch)?;
+    Ok(RelayCommittedCut {
+        publication_stream_id: Some(stream.publication_stream_id),
+        generation: Some(stream.generation),
+        outer: StreamCursor::from_high_water(stream.committed_high_water),
+        inner: StreamCursor::from_high_water(stream.committed_inner_cursor),
+        stream_binding: Some(stream_binding),
+    })
+}
+
+fn publication_scope_for_target(target: RuntimeStreamTarget) -> PublicationScope {
+    match target {
+        RuntimeStreamTarget::Catalog => PublicationScope::Catalog,
+        RuntimeStreamTarget::Conversation(conversation_id) => {
+            PublicationScope::Conversation(conversation_id)
+        }
+    }
+}
+
+fn cursor_at_or_before(candidate: StreamCursor, ceiling: StreamCursor) -> bool {
+    match (candidate.high_water(), ceiling.high_water()) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(candidate), Some(ceiling)) => candidate <= ceiling,
+    }
+}
+
+fn retained_range_covers(after: Option<u64>, through: Option<u64>, floor: Option<u64>) -> bool {
+    let Some(through) = through else {
+        return true;
+    };
+    if after.is_some_and(|after| after >= through) {
+        return true;
+    }
+    let Some(first) = after.map_or(Some(0), |after| after.checked_add(1)) else {
+        return false;
+    };
+    floor.is_some_and(|floor| first >= floor)
+}
+
+fn subscription_baseline_digest(
+    stream: &PublicationStreamRecord,
+    baseline: Option<u64>,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(if baseline.is_some() {
+        SUBSCRIPTION_SNAPSHOT_BASELINE_DOMAIN
+    } else {
+        SUBSCRIPTION_BASELINE_CLOSED_DOMAIN
+    });
+    digest.update(stream.publication_stream_id);
+    digest.update(stream.stream_route);
+    digest.update(stream.generation);
+    digest.update(baseline.unwrap_or(0).to_be_bytes());
+    digest.finalize().into()
 }
 
 pub(super) fn freeze_publication(
@@ -1012,7 +1487,21 @@ pub(super) fn freeze_signed_publication(
     }
     let publication_owner = shared_owner_axes
         .map(|(key_directory_revision, key_id)| {
-            validate_shared_signed_blob(&blob, key_directory_revision, key_id)?;
+            let expected_header_revision =
+                shared_binding
+                    .as_ref()
+                    .map_or(key_directory_revision, |binding| {
+                        match binding.request.journal_identity {
+                            SharedJournalIdentity::DirectoryAdvance(identity) => {
+                                identity.from_revision
+                            }
+                            SharedJournalIdentity::CatalogRange
+                            | SharedJournalIdentity::Event { .. }
+                            | SharedJournalIdentity::Transfer { .. }
+                            | SharedJournalIdentity::EpochBarrier(_) => key_directory_revision,
+                        }
+                    });
+            validate_shared_signed_blob(&blob, expected_header_revision, key_id)?;
             publication_retention_owner(publication_id, stream.stream_route, key_id)
         })
         .transpose()?;
@@ -1919,6 +2408,7 @@ pub(super) fn load_stream(
         || record.committed_high_water.is_some() != record.last_committed_blob_hash.is_some()
         || record.acknowledged_high_water > record.committed_high_water
         || record.acknowledged_high_water.is_some() != record.last_acknowledged_blob_hash.is_some()
+        || !valid_inner_cursor_order(&record)
         || record.last_acknowledged_publication_id.is_some()
             != record.last_acknowledged_request_digest.is_some()
         || !valid_rotation_lineage(&record)
@@ -2007,6 +2497,7 @@ pub(super) fn load_stream_read(
         || record.committed_high_water.is_some() != record.last_committed_blob_hash.is_some()
         || record.acknowledged_high_water > record.committed_high_water
         || record.acknowledged_high_water.is_some() != record.last_acknowledged_blob_hash.is_some()
+        || !valid_inner_cursor_order(&record)
         || record.last_acknowledged_publication_id.is_some()
             != record.last_acknowledged_request_digest.is_some()
         || !valid_rotation_lineage(&record)
@@ -2043,7 +2534,7 @@ fn load_outbox_by_stream_seq(
         .ok_or(RuntimeStoreError::PublicationMismatch)
 }
 
-fn load_optional_outbox(
+pub(super) fn load_optional_outbox(
     connection: &Connection,
     key_bundle: &RuntimeKeyBundle,
     database_id: [u8; 16],
@@ -2687,6 +3178,14 @@ fn valid_rotation_lineage(record: &PublicationStreamRecord) -> bool {
         (_, None, PublicationStreamState::NeedsSnapshot) => true,
         (_, None, PublicationStreamState::Active | PublicationStreamState::Retired) => false,
     }
+}
+
+fn valid_inner_cursor_order(record: &PublicationStreamRecord) -> bool {
+    record.acknowledged_inner_cursor.is_none_or(|acknowledged| {
+        record
+            .committed_inner_cursor
+            .is_some_and(|committed| acknowledged <= committed)
+    })
 }
 
 fn validate_inner_range(

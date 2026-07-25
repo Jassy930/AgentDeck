@@ -648,7 +648,7 @@ fixture 泄漏，或把 test-only admission 暴露为运行时配置。
 | P3.2/P3.3 code | 常见内部原因 | 下一步 |
 | --- | --- | --- |
 | `daemon.runtime.store_invalid` | path/type/owner/mode/nlink、busy/count/byte config 或 operation input 不合法 | 核对 0700 namespace、0600 artifacts 和固定 config；拒绝 symlink/hardlink，不自动放宽 |
-| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、command/execution/event/approval/stream/snapshot/publication/configuration/projection/effect-fence/admin-command/machine-identity totals 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；legacy v1–v13 必须先在 rescue committed-state 上完成对应 ledger token 与既有行全量认证，再打开原库 RW 并走内置原子 migration 到 current v14（35 张表），不能原地猜测/手改 schema |
+| `daemon.runtime.schema_incompatible` | schema family/version/signature/live manifest、typed canonical descriptor/row linkage、逐 conversation HWM、authenticated metadata、command/execution/event/approval/stream/snapshot/publication/configuration/projection/effect-fence/admin-command/machine-identity totals 或两类 adapter-state total 不一致 | 停止写入并保留 main/WAL/SHM/journal；legacy v1–v14 必须先在 rescue committed-state 上完成对应 ledger token 与既有行全量认证，再打开原库 RW 并在任何 DDL 前二次认证，最后原子 migration 到 current v15（35 张表）；不能原地猜测/手改 schema |
 | `daemon.runtime.store_unavailable` | worker/shutdown/commit outcome、clock/capacity probe、SQLite/I/O、sequence coordination，或 bounded checkpoint 被 reader pin 住 | 对 unknown outcome 用完全相同 stable ID/idempotency/full request 重试；Configure after-COMMIT unknown 可能已产生唯一 `ConfigurationChanged`，exact retry 应读回 Replayed 而不是换 key；checkpoint blocked 时停止新副作用、释放 reader 并保留 WAL，其他错误保留 evidence 后重启/修复底层 I/O |
 | `daemon.runtime.store_busy` | normal/safety/read lane 的 count 或 retained-allocation byte permit 已满 | 客户端退避并保持同一 idempotency key；不要并发重发新 key |
 | `daemon.runtime.recovering` | 已冻结 paged recovery barrier，终页尚未核账并 finish | 继续使用上一页返回的 exact cursor；RuntimeCore 逐页消费，终页 finish 后再开放请求，不得并行 mutation |
@@ -809,7 +809,10 @@ P4.2 又由 `a6842bc` 完成 Link/Data cert、enrollment workflow、receipt IO�
 RemoteTransport 与 trust reset；P4.3 又完成 PairInvite/DeviceGrant/auth ledger/revoke/control handoff；
 P4.4 由 `cd7d9fb` 完成 MachineLink ingress/RuntimeCore dispatch；P4.5 由 `c6ef387`、`88b3c42`
 完成 signed publication、key/counter/replay crash recovery。P4.6 persistent remote CLI automatic Task
-已完成，current Runtime wire 为 v5；P4 按 Task 进度为 6/7。P4.7 与 P4 Phase Exit 仍未完成。
+已完成，current Runtime wire 为 v5；P4.7 automatic Task 与 P4 automatic Phase Exit 也已完成，P4 按
+Task 进度为 7/7。focused `p4-auto`、独立顶层门禁、pre-closeout hash
+`18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 与双路 phase review 均通过；
+`p4` 仍不受支持。
 
 ### P4.1 machine identity / Keychain guard 排障
 
@@ -974,7 +977,7 @@ RuntimeCore/Store。
 | code | 含义 | 下一步 |
 | --- | --- | --- |
 | `daemon.remote.ingress.invalid_outer` / `invalid_sealed_blob` / `invalid_key_binding` | Relay route/context、canonical sealed blob 或 DeviceCommandTx key epoch/revision 不匹配 | 在 Core 前拒绝；核对 current Relay v2 / E2EE v1 wire 与 key directory，禁止宽松 decode |
-| `daemon.remote.ingress.invalid_signature` / `replay_rejected` / `invalid_ciphertext` | DeviceSign、counter+ciphertext replay tuple 或 AEAD 验证失败 | 丢弃 frame 并保留 current replay window；不调用 Core、不返回业务成功 |
+| `daemon.remote.ingress.invalid_signature` / `replay_rejected` / `invalid_ciphertext` | DeviceSign、counter+signed-frame+ciphertext replay tuple 或 AEAD 验证失败 | 丢弃 frame 并保留 current replay window；不调用 Core、不返回业务成功；legacy 零 signed-frame sentinel 只用于 exact readback，不视为 current duplicate |
 | `daemon.remote.ingress.authorization_denied` | device/grant 不是 Active，或 crypto 后 exact-current auth-ledger recheck 因 revoke/renew/key revision 变化失败 | 保持 fail-close；读取本机 auth ledger，禁止缓存旧 grant 绕过 recheck |
 | `daemon.remote.ingress.invalid_runtime_request` | 解密 payload 不是 current Runtime v5 request | 拒绝且不猜测版本/类型；四个协议版本轴不得联动升级 |
 | `daemon.remote.link.generation_replaced` / `transport_failed` / `closed` | active business generation 被新连接替换，或 transport/actor 结束 | 丢弃 stale generation 的 reply route并由唯一 supervisor 有界恢复；不创建第二 owner |
@@ -991,12 +994,27 @@ blob/streamSeq/counter/event range → Relay Publish COMMIT → local ACK`。out
 offline 或进程重启都只能由唯一 transition owner/dispatcher 复用冻结 artifact 恢复；不得 reseal、换
 counter、创建第二 driver，或让普通 drive 绕过 remote fence。
 
+若上一条 publication 仍是 DB 中的 exact `Frozen` predecessor，而 CounterGuard 已为下一次 reservation
+进入 `Pending`，恢复只能在 `previous_high_water == Frozen.reserved_end` 且
+`previous_db_anchor == Frozen.db_anchor` 同时成立时，把下一整块记为 gap 后收敛为新的 Stable guard；旧
+Frozen blob 仍按原 publication identity 恢复，绝不能被当成当前 Pending 的 retry。任一 high-water、anchor、
+scope、reservation 或 publication 轴分叉都必须退休 sender key 并保持 admission fail-close。
+
+current physical schema 为 v15/35 表。v15 只放宽带 authenticated rotation provenance 的
+Relay COMMIT→local ACK 合法 crash window：此时 acknowledged inner cursor 可落后于 committed
+inner cursor，但不得超前。重启后应恢复同一 frozen publication 并继续 local ACK，不得手改
+`publication_streams`、伪造 ACK 或回退 schema。P4.5 收口时 v14/35 表的历史基线保持不变；
+v15 已随 P4.7 automatic Task 与 P4 automatic Phase Exit 收口；这不改变 P4.5 的历史 schema 基线，
+也不表示真实公网、production-signed 或 iOS 链路已经完成。
+
 | code | 含义 | 下一步 |
 | --- | --- | --- |
 | `daemon.remote.transition.recovery_timed_out` | durable transition 或其 required ACK 未在绝对 deadline 内完成 | 保持 remote fence 与冻结 state；修复 Store/transport 后只让唯一 owner 继续，不得绕过 owner 开放 admission |
 | `daemon.remote.transition.progress_pending` | publication outcome unknown、commit pending 或 typed Store busy，尚不能证明 durable progress | 唯一 owner 按 250 ms→30 s 有界退避复用 exact request/blob；不得 reseal、换 idempotency binding 或创建第二 driver |
 | `daemon.remote.transition.reconnect_pending` | Relay offline，transition 只能等待 authenticated generation replacement | 等待认证 transport generation 变化后由同一 owner 恢复；不做 timer retry，普通 drive 不得绕过 |
 | `remote.transport.publication_offline` | activation/generation 仍有效，但当前 authenticated session reader offline | dispatcher 停放冻结 exact blob；authenticated reconnect 后重发同一 artifact，不 ACK、不重封 |
+| diagnostic event `remote_stream_publisher_failure` | shared publisher 在 canonicalization、transaction axes/key、CounterGuard、subscription registration、exact COMMIT/ACK 或 bounded drive 阶段 fail-close；日志只带 typed `daemon.remote.publisher.*` code | 先按该 typed code 区分 invalid input、snapshot/rotation、retired counter、offline/unknown outcome 或 drive failure；保留 remote fence 与 frozen artifact，不伪造 Runtime success、不重封或另建 publisher |
+| diagnostic event `remote_publication_drive_failure` | 唯一 publication drive owner 的 notify/drive/reconnect recovery 返回 typed error，并统一降级为 `daemon.remote.publisher.drive_unavailable` | 保留 outbox、CounterGuard 与同一 owner 的恢复权；修复 Store/transport 后 exact retry。不得删除 frozen row、切换 counter、手工 ACK 或启动第二 drive owner |
 
 #### P4.6 persistent CLI durable transfer / watch（automatic Task complete）
 
@@ -1037,10 +1055,36 @@ scope 为 29 paths，blob-manifest SHA-256 为
 `remote_persistent_machines` `11/11`、release allocator `1/1`、relay-client `25/25`、protocol
 `244/244` 与完整 CLI package final run 均通过，四 schema、三 crate Clippy、fmt、network/no-net、docs、diff
 全绿。`spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。
-`p4-auto`、P4 Phase Exit 与 production-signed Keychain 仍未闭合，不能把 marker 行为写成
-production-signed 或真实公网 watch PASS。真实 entitlement/access-group roundtrip 继续保持 post-MVP BLOCKED。
+这些 P4.6 证据本身不等于 P4.7 Phase PASS；后续 focused `p4-auto`、独立顶层门禁、冻结 hash 与双路
+phase review 已通过，P4.7 automatic Task 与 P4 automatic Phase Exit complete。production-signed Keychain
+仍未闭合，不能把 marker 行为写成 production-signed 或真实公网 watch PASS。真实
+entitlement/access-group roundtrip 继续保持 post-MVP BLOCKED。
 8 MiB lowered-cap 只在 `debug_assertions` automatic test build 中存在，release artifact 不编译该入口，
-production CLI/env/config 也不能选择该值；P4.7 与 P4 Phase Exit 仍未完成。
+production CLI/env/config 也不能选择该值。
+
+#### P4.7 automatic complete 与真实槽位诊断边界（post-MVP BLOCKED）
+
+`p4-auto` 只是 machine/CLI/state-machine/protocol/schema/network/docs 的 focused aggregate，不包含顶层
+`cargo test`、`swift test`、最终 diff/status、冻结 candidate hash 或独立 `spec/security`、`quality`
+phase review。remote principal 不能确认 pairing 由单独的 RuntimeCore principal gate 证明，不应在 machine
+E2E 内寻找或伪造同一证据。
+
+P4.7 收口时 `p4-auto`、fresh `cargo test --locked`、`swift test` 577/577、三组 Clippy、fmt、
+network/no-net、四 schema、agent docs、diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics 均通过。
+pre-closeout review candidate SHA-256 为
+`18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5`；`spec/security` 与 `quality`
+均 Approved，P0/P1/P2=0。verifier 仍不支持 `p4`；上述独立证据不能从单独一次 `p4-auto` 反推。
+
+`scripts/run-relay-companion-p4-real-e2e.sh` 目前只是一条静态 fail-closed slot sentinel。它不读取参数或
+环境变量，不探测签名、entitlement、WSS、vendor login 或 disposable profile，也不执行真实链路；输出始终
+包含固定完整 `missingInputs`，并保持 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。因此
+“missingInputs 已列出”不等于真实 prerequisite preflight 已执行；真实 preflight/execution 留给 post-MVP。
+Linux synthetic client 只允许 ephemeral test keys，macOS production persistent pairing 必须使用 Data
+Protection Keychain 且没有 file/dev keystore 降级。MachineRoot 丢失按
+[`RELAY_RUNBOOK.md` 的 portable purge receipt 流程](RELAY_RUNBOOK.md#machineroot-丢失后的-portable-purge-receipt)
+处理；static sentinel 不生成 receipt，也不提供删除授权。
+production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与
+destructive purge 继续 post-MVP BLOCKED；P5/P6 仍为 0/9、0/4。
 
 #### Trust reset 与本地 cleanup
 

@@ -1874,6 +1874,7 @@ struct BindingGateSealer {
 struct RecordingPublisher {
     calls: Mutex<Vec<Arc<[u8]>>>,
     transfer_calls: Mutex<Vec<RuntimeTransferCarrierV1>>,
+    preparations: Mutex<Vec<crate::runtime::events::RuntimeStreamTarget>>,
     reconnects: AtomicUsize,
     release: tokio::sync::Notify,
 }
@@ -2020,6 +2021,17 @@ impl RemoteStreamPublisher for RecordingPublisher {
         true
     }
 
+    async fn prepare_subscription(
+        &self,
+        target: crate::runtime::events::RuntimeStreamTarget,
+    ) -> Result<(), RemoteLinkError> {
+        self.preparations
+            .lock()
+            .expect("record subscription preparation")
+            .push(target);
+        Ok(())
+    }
+
     async fn publish_exact(&self, runtime_bytes: Arc<[u8]>) -> Result<(), RemoteLinkError> {
         self.calls
             .lock()
@@ -2051,6 +2063,13 @@ impl RemoteStreamPublisher for RecordingPublisher {
 impl RemoteStreamPublisher for FailingPublisher {
     fn admission_ready(&self) -> bool {
         true
+    }
+
+    async fn prepare_subscription(
+        &self,
+        _target: crate::runtime::events::RuntimeStreamTarget,
+    ) -> Result<(), RemoteLinkError> {
+        Err(RemoteLinkError::StreamPublishFailed)
     }
 
     async fn publish_exact(&self, _runtime_bytes: Arc<[u8]>) -> Result<(), RemoteLinkError> {

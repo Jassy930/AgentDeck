@@ -1,12 +1,12 @@
 //! P4.5 key-control canonical wire 与 MachineDataSign 绑定契约。
 
 use agentdeck_protocol::e2ee::{
-    CanonicalKeyUpdateTbs, DirectoryCurrentV1, E2EE_FORMAT_VERSION, EpochBarrierV1,
-    KEY_CONTROL_MAX_ID_BYTES, KEY_UPDATE_SET_MAX_KEYS, KeyControlRequestV1, KeyControlV1, KeyId,
-    KeyPurpose, KeySyncRequestV1, KeyUpdateAckV1, KeyUpdateInfoV1, KeyUpdateSetV1,
-    KeyUpdateSignatureSigner, KeyUpdateSignatureVerifier, KeyUpdateTbsV1, KeyUpdateV1,
-    MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairingError, SealedPayloadKind,
-    StreamAppliedAckV1,
+    CanonicalKeyUpdateTbs, DirectoryCurrentV1, DirectoryRevisionAdvanceV1, E2EE_FORMAT_VERSION,
+    EpochBarrierV1, KEY_CONTROL_MAX_ID_BYTES, KEY_UPDATE_SET_MAX_KEYS, KeyControlRequestV1,
+    KeyControlV1, KeyId, KeyPurpose, KeySyncRequestV1, KeyUpdateAckV1, KeyUpdateInfoV1,
+    KeyUpdateSetV1, KeyUpdateSignatureSigner, KeyUpdateSignatureVerifier, KeyUpdateTbsV1,
+    KeyUpdateV1, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairingError,
+    SealedPayloadKind, StreamAppliedAckV1,
 };
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::StreamCursor;
@@ -502,6 +502,81 @@ fn directory_current_is_an_authenticated_exact_next_revision_status() {
     let mut zero_current = status;
     zero_current.current_key_directory_revision = RelayKeyDirectoryRevision::new(0);
     assert!(zero_current.validate().is_err());
+}
+
+#[test]
+fn directory_revision_advance_is_strict_exact_next_key_update_control() {
+    let advance = DirectoryRevisionAdvanceV1 {
+        from_key_directory_revision: RelayKeyDirectoryRevision::new(12),
+        to_key_directory_revision: RelayKeyDirectoryRevision::new(13),
+    };
+    let control = KeyControlV1::directory_revision_advance(advance.clone());
+    let canonical = control.canonical_bytes().unwrap();
+
+    assert_eq!(control.sealed_payload_kind(), SealedPayloadKind::KeyUpdate);
+    assert_eq!(
+        DirectoryRevisionAdvanceV1::from_canonical_bytes(&advance.canonical_bytes().unwrap())
+            .unwrap(),
+        advance
+    );
+    assert_eq!(
+        KeyControlV1::from_canonical_bytes(&canonical).unwrap(),
+        control
+    );
+
+    let json = serde_json::to_value(&control).unwrap();
+    assert_eq!(json["kind"], "directoryRevisionAdvance");
+    assert_eq!(json["advance"]["fromKeyDirectoryRevision"], 12);
+    assert_eq!(json["advance"]["toKeyDirectoryRevision"], 13);
+    assert_eq!(
+        serde_json::from_value::<KeyControlV1>(json.clone()).unwrap(),
+        control
+    );
+
+    let mut unknown_outer = json.clone();
+    unknown_outer["relayOuterFamily"] = serde_json::json!("publish");
+    assert!(serde_json::from_value::<KeyControlV1>(unknown_outer).is_err());
+    let mut unknown_inner = json;
+    unknown_inner["advance"]["allowGap"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<KeyControlV1>(unknown_inner).is_err());
+
+    let invalid = [
+        DirectoryRevisionAdvanceV1 {
+            from_key_directory_revision: RelayKeyDirectoryRevision::new(0),
+            to_key_directory_revision: RelayKeyDirectoryRevision::new(1),
+        },
+        DirectoryRevisionAdvanceV1 {
+            from_key_directory_revision: RelayKeyDirectoryRevision::new(12),
+            to_key_directory_revision: RelayKeyDirectoryRevision::new(14),
+        },
+        DirectoryRevisionAdvanceV1 {
+            from_key_directory_revision: RelayKeyDirectoryRevision::new(12),
+            to_key_directory_revision: RelayKeyDirectoryRevision::new(11),
+        },
+        DirectoryRevisionAdvanceV1 {
+            from_key_directory_revision: RelayKeyDirectoryRevision::new(u64::MAX),
+            to_key_directory_revision: RelayKeyDirectoryRevision::new(u64::MAX),
+        },
+    ];
+    for value in invalid {
+        assert!(value.validate().is_err());
+        assert!(value.canonical_bytes().is_err());
+        let invalid_json = serde_json::json!({
+            "kind": "directoryRevisionAdvance",
+            "formatVersion": E2EE_FORMAT_VERSION,
+            "advance": {
+                "fromKeyDirectoryRevision": value.from_key_directory_revision.value(),
+                "toKeyDirectoryRevision": value.to_key_directory_revision.value(),
+            },
+        });
+        assert!(
+            serde_json::from_value::<KeyControlV1>(invalid_json).is_err(),
+            "invalid advance must be rejected by the validated key-control carrier"
+        );
+    }
+
+    let kind_offset = b"AgentDeck/KeyControlV1\0".len();
+    assert_eq!(canonical[kind_offset], 4);
 }
 
 fn key_sync_request() -> KeySyncRequestV1 {

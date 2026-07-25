@@ -898,6 +898,7 @@ impl PreparedSubscription {
                 emit_subscription_receipt: self.emit_subscription_receipt,
                 transition_snapshot: self.transition_snapshot,
                 pending_permit: Some(self.pending_permit),
+                publication_overlap: None,
             })
             .await;
             if let Err(error) = completion_coordinator.finish_job_exact(key, generation) {
