@@ -28,7 +28,7 @@ final class NoVendorBranchInUITests: XCTestCase {
         for case let url as URL in enumerator {
             guard url.pathExtension == "swift" else { continue }
             if Self.whitelist.contains(url.lastPathComponent) { continue }
-            let content = try String(contentsOf: url)
+            let content = try String(contentsOf: url, encoding: .utf8)
             let range = NSRange(content.startIndex..., in: content)
             pattern.enumerateMatches(in: content, range: range) { match, _, _ in
                 guard let m = match, let r = Range(m.range, in: content) else { return }
