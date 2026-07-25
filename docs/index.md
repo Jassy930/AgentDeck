@@ -17,7 +17,8 @@
   和排查流程。
 - `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.10、P3 Phase、P4.1–P4.7
   machine identity/enrollment/pairing/RemoteLink ingress/signed publication/persistent CLI/watch、production
-  UDS/client/install/smoke、P4 automatic Phase Exit/静态 real-slot sentinel 与文档结构检查入口。
+  UDS/client/install/smoke、P4 automatic Phase Exit/静态 real-slot sentinel、P5.1 shared SessionSource facade
+  与文档结构检查入口。
 - `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
   enrollment、daemon 本机 status/trust-reset、安全 uninstall purge、fingerprint-bound readback、
   portable signed root-lost purge receipt、P4.5 recovery-gated egress admission，以及 P4.6 persistent
@@ -92,8 +93,9 @@
   `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`；watch `12/12`、
   `remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client
   `25/25` 与 protocol `244/244` 均通过，静态门禁全绿。`spec/security` 与 `quality` 终审均 Approved，
-  P0/P1/P2=0。P4.7 automatic Task 与 P4 automatic Phase Exit 已完成，P4–P6 按 Task 进度为
-  7/7、0/9、0/4。`p4-auto` 已 PASS；`p4` 仍不受支持，且 focused aggregate 本身不包含顶层
+  P0/P1/P2=0。P4.7 automatic Task 与 P4 automatic Phase Exit 已完成；P5.1 又建立共享
+  `AgentDeckSessionSource` facade、typed state/receipt 与显式 SwiftPM/iOS product 依赖图。P4–P6 按 Task
+  进度为 7/7、1/9、0/4。`p4-auto` 已 PASS；`p4` 仍不受支持，且 focused aggregate 本身不包含顶层
   Rust/Swift、最终 diff/status、冻结 hash 或双路 review。上述独立门禁与双路 review 已在
   pre-closeout candidate SHA-256
   `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上补齐并通过。
@@ -102,8 +104,8 @@
   `missingInputs` 与 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。Linux 只用 ephemeral test
   keys，macOS production persistent Keychain 不降级；root-lost 流程以 `RELAY_RUNBOOK.md` 为准。P3.1 方案 b、production-signed
   LaunchAgent/Keychain、物理设备与公网证据继续作为 post-MVP BLOCKED。P5 MVP 只以 iOS Simulator
-  自动 E2E 退出，本机第二客户端归 P6 synthetic DoD；P4 automatic complete 不表示真实 iOS Companion、
-  第二台 Mac 或 destructive purge 已完成。
+  自动 E2E 退出，本机第二客户端归 P6 synthetic DoD；P5.2–P5.9 与 P5 Phase Exit 仍未完成，P5.1/P4
+  automatic complete 都不表示真实 iOS Companion、第二台 Mac 或 destructive purge 已完成。
 
 ## 协议资料
 

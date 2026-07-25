@@ -178,7 +178,7 @@ cargo build --release -p agentdeck-cli  # 产出 target/release/agentdeck
 swift build -c release           # 产出 .build/release/AgentDeck
 ```
 
-## iOS Companion（fixture 驱动，先前端后链路）
+## iOS Companion（共享 facade 已建立，界面仍由 fixture 驱动）
 
 AgentDeck Mobile 是与 macOS 主客户端配套的 iPhone companion，用协议对齐的 fixture 回放代替真实链路，在模拟器上完整跑通 R3 companion 界面骨架，接 Relay 时 UI 层零迁移。
 
@@ -190,7 +190,7 @@ ios/
 ├── AgentDeckMobile/
 │   ├── App/                     # AppDelegate / SceneDelegate / 导航
 │   ├── Screens/                 # 各屏 VC + @Observable view model
-│   ├── DataSource/              # MobileSessionSource 协议 + FixtureSessionSource
+│   ├── DataSource/              # 旧 MobileSessionSource + FixtureSessionSource（P5.5 再迁移）
 │   ├── DesignTokens.swift       # 生成物：UIKit 版 token（禁止手改）
 │   └── Fixtures/                # 协议语义对齐的 JSON fixture（见 ios/Fixtures/）
 └── AgentDeckMobileTests/
@@ -205,9 +205,14 @@ cd ios && xcodegen generate && \
     -destination 'platform=iOS Simulator,name=iPhone 17' test
 ```
 
-iOS 端唯一数据入口是 `MobileSessionSource` 协议（本期实现为 `FixtureSessionSource`，bundle 内 JSON 回放）；杀 app 重置 fixture 状态，不依赖 daemon 或网络。
+iOS App/Test target 已显式声明 `AgentDeckCore`、`AgentDeckSessionSource` 与 `AgentDeckRelayClient` 三个
+product 依赖；RelayClient 已传递链接 SessionSource，因此 XcodeGen 对后者使用 `link: false` 保留
+module/build edge，避免生成重复 product wrapper。`CoreLinkTests` 会实际 import/构造三模块类型验证链接。
+共享 `SessionSource` facade 已在 P5.1 建立；当前 `SceneDelegate` 仍注入旧的
+`FixtureSessionSource`（bundle 内 JSON 回放），旧 `MobileSessionSource`/models 要到 P5.5 才迁移。
+因此杀 app 仍会重置 fixture 状态，当前界面不依赖 daemon 或网络，也不构成真实 Relay 链路证据。
 
-## Relay Companion MVP 实施状态（P4.7 automatic Task complete；P4 automatic 7/7 / Phase Exit complete）
+## Relay Companion MVP 实施状态（P5.1 complete；P5 为 1/9）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -217,6 +222,13 @@ ignored/BLOCKED 槽位，不阻塞 MVP/P3 exit，也不表示 stable production 
 P5 MVP 仅以 iOS Simulator 自动 E2E 退出，本机第二客户端归入 P6 synthetic DoD；物理设备、公网与干净
 Linux 证据为 post-MVP BLOCKED 槽位。详见
 [`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`](docs/plans/2026-07-18-relay-companion-mvp-course-correction.md)。
+P5.1 已建立 `AgentDeckSessionSource -> AgentDeckCore`、
+`AgentDeckRelayClient -> AgentDeckCore + AgentDeckSessionSource` 的显式 SwiftPM 依赖图，并让 macOS
+executable 显式链接三个共享 product；iOS App/Test 显式声明三 product，并通过 RelayClient 传递链接
+SessionSource。facade 固定为非 `@MainActor` 的异步观察协议、
+typed resource/connection/receipt/pairing 状态和独立的本机 pairing administration capability；共享 target
+只依赖 Foundation/Swift Concurrency 与 `AgentDeckCore`。本项只计 P5 的 1/9；Relay source、旧 iOS fixture
+迁移、真实网络/Keychain、AppKit registry、Simulator 自动 E2E 与 P5 Phase Exit 仍未完成。
 P3.10 已由 code/test commit `19622ab` 完成 Task 收口：当时把 Runtime schema 推进到 v7，并新增 authenticated machine-wide
 `admin_commands` ledger，并实现 30 天 retention、容量准入、exact replay/conflict 与 COMMIT-unknown
 收敛；`StageUpgrade` 只有在 exact reply 完整 flush ACK 后才 arm，随后经 active→idle fence、候选
@@ -831,8 +843,8 @@ execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 
 Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/test 提交分别为 `b818f81` / `d68cc02`。
 普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS。P3.10 LaunchAgent
 安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；基于 `9efb28d` 的独立 P3 Phase
-Exit 已完成；P4.1–P4.7 automatic Task 与 P4 automatic Phase Exit 已收口，P4–P6 按 Task 进度计为
-7/7、0/9、0/4。`p4-auto` 已 PASS，`p4` 仍不受支持；完整 Phase Exit 还由 pre-closeout candidate
+Exit 已完成；P4.1–P4.7 automatic Task 与 P4 automatic Phase Exit 已收口，P5.1 shared facade 也已完成；
+P4–P6 按 Task 进度计为 7/7、1/9、0/4。`p4-auto` 已 PASS，`p4` 仍不受支持；完整 P4 Phase Exit 还由 pre-closeout candidate
 SHA-256 `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的顶层门禁和
 `spec/security`、`quality` 双路 Approved review 共同支撑，P0/P1/P2=0。P3.1 provisioned signed
 Keychain roundtrip 继续是 post-MVP BLOCKED 槽位，不阻塞 automatic closeout；P5/P6 物理设备/公网/Linux

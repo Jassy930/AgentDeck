@@ -3156,7 +3156,7 @@ agent docs、diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics �
 `quality` 均 Approved，P0/P1/P2=0。verifier 仍不支持 `p4`。production-signed Keychain/LaunchAgent、
 真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与 destructive purge 继续保持 post-MVP
 `BLOCKED`；静态 runner 仍只输出 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不生成真实证据。
-P5/P6 仍为 0/9、0/4。
+P5.1 shared facade 已于后续完成；P5/P6 当前为 1/9、0/4。
 
 ---
 
@@ -3164,7 +3164,8 @@ P5/P6 仍为 0/9、0/4。
 
 > **执行前审计（2026-07-20）：0/9 Task 完成。** 当前只有 Relay crypto/wire、P3.9 本机 Runtime 与
 > fixture UI 基线；P5.1–P5.9 production source、真实 Simulator Relay E2E 与 post-MVP slot runner 均未实现。
-> 以下 checkbox 全部保持未勾，不能把可复用基线记为 P5 进度。
+> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-26）：P5.1 已完成，P5 为
+> 1/9；P5.2–P5.9 与 P5 Phase Exit 仍未完成。**
 
 ### Task P5.1：建立 AgentDeckSessionSource target 与强类型 facade
 
@@ -3173,6 +3174,7 @@ P5/P6 仍为 0/9、0/4。
 - Create: `Tests/AgentDeckSessionSourceTests/{SessionSourceContractTests,LocalPairingAdministrationTests,ResourceStateTests}.swift`
 - Modify: `Package.swift`
 - Modify: `ios/project.yml`
+- Modify: `ios/AgentDeckMobileTests/CoreLinkTests.swift`
 - Delete after migration: `ios/AgentDeckMobile/DataSource/{MobileSessionSource,MobileSessionModels}.swift`
 
 **Facade:**
@@ -3198,12 +3200,20 @@ public protocol LocalPairingAdministration: Sendable {
 
 **Target edges:** `AgentDeckSessionSource -> AgentDeckCore`；`AgentDeckRelayClient -> AgentDeckCore + AgentDeckSessionSource`；macOS `AgentDeck` executable 与iOS `AgentDeckMobile` app均显式依赖`AgentDeckCore + AgentDeckSessionSource + AgentDeckRelayClient`；tests依赖各自被测target。
 
-- [ ] Step 1: 写 compile-time/behavior tests。protocol无`@MainActor`，所有cross-actor types Sendable；观察方法必须async；`ResourceState`精确四态；`ConversationUpdate`精确snapshot/event/commandState/connectionState；`PairingProgress`精确preparing/waitingForLocalConfirmation/paired/canceled/expired；`LocalPairingAdministration`与普通SessionSource分离且confirm/cancel receipt支持AlreadyHandled；共享模型不含fixture的`streamResource`。
-- [ ] Step 2: 运行 `swift test --filter AgentDeckSessionSourceTests`。 Expected: FAIL，target不存在。
-- [ ] Step 3: 按上述target edges修改Package与`ios/project.yml`，增加`AgentDeckSessionSource` library/test target并更新P1.6已存在的RelayClient；为迁移提供typealias但不复制wire类型。 XcodeGen App target必须列出三个SPM product，不编辑生成的xcodeproj/Info.plist。
-- [ ] Step 4: 重跑SessionSource tests与 `swift test`。 Expected: PASS，AgentDeckCore仍无CryptoKit/UIKit/AppKit/network import。
-- [ ] Step 5: 运行 `rg -n 'import (CryptoKit|UIKit|AppKit|Network)' Sources/AgentDeckCore Sources/AgentDeckSessionSource`。 Expected: 0 matches。
-- [ ] Step 6: 提交。 `git add Package.swift Sources/AgentDeckSessionSource Tests/AgentDeckSessionSourceTests ios/project.yml ios/AgentDeckMobile/DataSource && git commit -m "feat(swift): 建立共享 SessionSource facade"`
+- [x] Step 1: 写 compile-time/behavior tests。protocol无`@MainActor`，所有cross-actor types Sendable；观察方法必须async；`ResourceState`精确四态；`ConversationUpdate`精确snapshot/event/commandState/connectionState；`PairingProgress`精确preparing/waitingForLocalConfirmation/paired/canceled/expired；`LocalPairingAdministration`与普通SessionSource分离且confirm/cancel receipt支持AlreadyHandled；共享模型不含fixture的`streamResource`。
+- [x] Step 2: 运行 `swift test --filter AgentDeckSessionSourceTests`。 Expected: FAIL，target不存在。
+- [x] Step 3: 按上述target edges修改Package与`ios/project.yml`，增加`AgentDeckSessionSource` library/test target并更新P1.6已存在的RelayClient；为迁移提供typealias但不复制wire类型。 XcodeGen App target必须列出三个SPM product，不编辑生成的xcodeproj/Info.plist。
+- [x] Step 4: 重跑SessionSource tests与 `swift test`。 Expected: PASS，AgentDeckCore仍无CryptoKit/UIKit/AppKit/network import。
+- [x] Step 5: 运行 `rg -n 'import (CryptoKit|UIKit|AppKit|Network)' Sources/AgentDeckCore Sources/AgentDeckSessionSource`。 Expected: 0 matches。
+- [x] Step 6: 精确暂存本 Task 的 code/test/iOS 接线与同步文档后提交。`git commit -m "feat(swift): 建立共享 SessionSource facade"`
+
+**P5.1 自动门禁证据（2026-07-26）：** test discovery 读回 15 个真实 case；全包
+warnings-as-errors 编译下 focused `15/15`、strict SessionSource target build、完整 Swift
+`557 XCTest + 35 Swift Testing` 与 iOS Simulator `21/21` 均通过。三份 contract test 使用普通 public
+import；平台/network/fixture/unsafe token 扫描、Swift format、agent docs 与 diff check 全绿。XcodeGen
+App/Test 均显式声明 Core/SessionSource/RelayClient；SessionSource product 使用 `link: false`，由
+RelayClient target edge 传递链接，clean dependency scan 无 missing-edge warning，CoreLinkTests 实际构造
+三模块类型。旧 fixture 保留到 P5.5；P5.2–P5.9、P5 Phase Exit 与全部真实设备/公网槽位仍未完成。
 
 ### Task P5.2：实现 Apple Keychain、CryptoStateStore 与 Swift counter/replay IO
 

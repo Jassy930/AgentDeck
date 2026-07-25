@@ -19,6 +19,12 @@ targets:
     dependencies:
       - package: AgentDeck
         product: AgentDeckCore
+      - package: AgentDeck
+        product: AgentDeckSessionSource
+        # RelayClient 已传递链接该 target；保留 module/build edge，二者解耦时必须恢复直接 link。
+        link: false
+      - package: AgentDeck
+        product: AgentDeckRelayClient
     info:
       path: AgentDeckMobile/Info.plist
       properties:
@@ -41,6 +47,14 @@ targets:
       - AgentDeckMobileTests
     dependencies:
       - target: AgentDeckMobile
+      - package: AgentDeck
+        product: AgentDeckCore
+      - package: AgentDeck
+        product: AgentDeckSessionSource
+        # RelayClient 已传递链接该 target；保留 module/build edge，二者解耦时必须恢复直接 link。
+        link: false
+      - package: AgentDeck
+        product: AgentDeckRelayClient
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES

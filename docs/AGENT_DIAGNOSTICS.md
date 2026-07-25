@@ -1084,7 +1084,7 @@ Protection Keychain 且没有 file/dev keystore 降级。MachineRoot 丢失按
 [`RELAY_RUNBOOK.md` 的 portable purge receipt 流程](RELAY_RUNBOOK.md#machineroot-丢失后的-portable-purge-receipt)
 处理；static sentinel 不生成 receipt，也不提供删除授权。
 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与
-destructive purge 继续 post-MVP BLOCKED；P5/P6 仍为 0/9、0/4。
+destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade 已完成，P5/P6 当前为 1/9、0/4。
 
 #### Trust reset 与本地 cleanup
 

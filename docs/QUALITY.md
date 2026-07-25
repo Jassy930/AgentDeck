@@ -1054,8 +1054,8 @@ P4.3 已由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad
 DeviceGrant/auth ledger/revoke/control handoff；P4.4 又由 `cd7d9fb` 收口 MachineLink ingress/
 RuntimeCore dispatch；P4.5 由 `c6ef387`、`88b3c42` 收口 signed publication、key/counter/replay crash
 recovery。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；
-P4.7 automatic Task 与 P4 automatic Phase Exit 已完成，P4 按 Task 进度为 7/7。P5/P6 自动实现仍为
-0/9、0/4，尚未完成。
+P4.7 automatic Task 与 P4 automatic Phase Exit 已完成，P4 按 Task 进度为 7/7。P5.1 shared facade
+已完成；P5/P6 自动实现为 1/9、0/4，P5.2–P5.9 与 P5 Phase Exit 尚未完成。
 
 ## Relay Companion MVP P3.8-A local Runtime UDS transport primitives 门禁
 
@@ -2500,7 +2500,54 @@ CLI/env/config injected/file/dev keystore 降级面。MachineRoot 丢失时按
 [`RELAY_RUNBOOK.md`](RELAY_RUNBOOK.md#machineroot-丢失后的-portable-purge-receipt) 的 portable purge
 receipt 流程处理，不得用 sentinel 或 synthetic receipt 代替。
 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与
-destructive purge 继续保持 post-MVP BLOCKED，不属于 P4 automatic PASS；P5/P6 仍为 0/9、0/4。
+destructive purge 继续保持 post-MVP BLOCKED，不属于 P4 automatic PASS；P5/P6 当前为 1/9、0/4，
+其中 P5.1 只完成 shared facade。
+
+## Relay Companion MVP P5.1 shared SessionSource facade 门禁
+
+P5.1 只验收共享 Swift facade、公共可见性、target 依赖方向与 macOS/iOS compile-link，不验收
+RelaySessionSource、bounded broadcaster、Keychain/WSS、旧 fixture 迁移或真实 Companion 链路。
+
+```bash
+# 确认不是 0-test 假绿，再执行全包 warnings-as-errors 编译 + focused behavior tests
+swift test list | rg 'AgentDeckSessionSourceTests'
+RUSTC_WRAPPER= swift test -Xswiftc -warnings-as-errors \
+  --filter AgentDeckSessionSourceTests
+
+# 新共享 target 严格构建与完整 Swift 回归
+swift build --target AgentDeckSessionSource -Xswiftc -warnings-as-errors
+RUSTC_WRAPPER= swift test
+
+# 公共边界与格式
+rg -n 'import (CryptoKit|UIKit|AppKit|Network)|URLSession|streamResource|@MainActor|@unchecked Sendable|@preconcurrency|nonisolated\(unsafe\)' \
+  Sources/AgentDeckSessionSource
+rg -n 'import (CryptoKit|UIKit|AppKit|Network)' \
+  Sources/AgentDeckCore Sources/AgentDeckSessionSource
+swift format lint --strict \
+  Sources/AgentDeckSessionSource/*.swift \
+  Tests/AgentDeckSessionSourceTests/*.swift \
+  ios/AgentDeckMobileTests/CoreLinkTests.swift
+
+# XcodeGen 是工程事实源；不得提交生成的 xcodeproj/Info.plist
+cd ios && xcodegen generate && \
+  xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
+    -destination 'platform=iOS Simulator,name=iPhone 17' test
+
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+`ResourceState`、`ConversationUpdate`、`PairingProgress` 必须分别保持精确 4/4/5 cases；receipt 必须是
+当前 Core 类型的 identity alias。`MachineSummary` 必须公开 typed connection state，不能用 Bool
+initializer 压缩离线原因；三份 contract test 必须使用普通 `import AgentDeckSessionSource`，避免
+`@testable` 掩盖 public API 缺口。iOS App/Test target 必须显式声明 Core、SessionSource、RelayClient；
+SessionSource product 使用 `link: false`，由 RelayClient 的 target edge 提供传递链接，避免重复 product
+wrapper。fresh Xcode dependency scan 不得报告缺失 Core edge，`CoreLinkTests` 必须实际 import/构造三模块类型；
+若 RelayClient 将来不再依赖 SessionSource，则必须恢复 SessionSource direct link。
+
+当前 Task 自动证据为 focused `15/15`、完整 Swift `557 XCTest + 35 Swift Testing`、iOS Simulator
+`21/21`，strict target/full-package compile、格式、平台/fixture 泄漏扫描与 diff 均通过。旧
+`MobileSessionSource`/models/fixture 保留到 P5.5，P5.2–P5.9 与 P5 Phase Exit 继续未完成。
 
 ## AppKit 重写后的验证清单
 
@@ -2648,6 +2695,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P4.5 signed publication / counter recovery | 核对 `c6ef387` + `88b3c42`，运行 remote focused `430/430`、完整 daemon package（lib `1579/3 ignored`、main `7/7`、256 MiB boundary `5/5`）、Clippy/fmt/diff 与冻结 hash 双路终审。只证明当时 Runtime v4/schema v14/35 下 daemon 侧 exact sealing/outbox/Relay COMMIT/local ACK、key/counter/replay crash recovery；后续 P4.6 完成时 P4 当时为 6/7，该历史 Task 证据本身不等于后续 P4.7 `p4-auto` 或 P4 Phase PASS。P4.7 已另行收口；不得把 automatic PASS 冒充真实设备/公网或 production-signed PASS |
 | Relay Companion MVP P4.6 persistent remote CLI | 2026-07-24 automatic Task complete；冻结 29-path code/test scope，blob-manifest SHA-256 `32e7c85620e6e88b407f2403715c52c5a9a5d30aa20d7fb800bdefabe8a1c858`。watch `12/12`、`remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client `25/25`、protocol `244/244` 与全部静态门禁均通过；`spec/security` 与 `quality` 均 Approved、P0/P1/P2=0。current Runtime 为 v5；`pair|machines|conversations|watch|prompt|approve|retry-approval|revoke-self` 已接入。P4 在该 Task 收口时为 6/7，production-signed Keychain 保持 post-MVP BLOCKED；既有 Task 证据不等于后续 P4.7 `p4-auto` 或 P4 Phase PASS |
 | Relay Companion MVP P4.7 automatic E2E / real slot / phase docs | automatic Task 与 P4 automatic Phase Exit complete，P4 为 7/7。focused `p4-auto`、fresh `cargo test --locked`、Swift 577/577、三组 Clippy、fmt、network/no-net、schema/docs/diff、local smoke/selfcheck/diagnostics 与 pre-closeout hash `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的双路 review 均通过，P0/P1/P2=0；`p4` 仍不受支持。远端 cannot-confirm pairing 由独立 RuntimeCore principal gate 证明。runner 不读参数/env、不探测或执行，只固定输出完整 missingInputs 与 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`；production-signed、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac与 destructive purge 继续 post-MVP BLOCKED |
+| Relay Companion MVP P5.1 shared SessionSource facade | 运行本页 test discovery、全包 warnings-as-errors focused `15/15`、strict target build、完整 Swift `557 XCTest + 35 Swift Testing`、iOS Simulator `21/21`、public import、Swift format、平台/fixture 泄漏、docs/diff 门禁。只证明 facade/typed state/receipt 与 Core←SessionSource←RelayClient←App 依赖图；旧 fixture 迁移、RelaySessionSource、bounded stream、Keychain/WSS、真实 iOS 与 P5 Phase Exit 均未完成，P5 当前只计 1/9 |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

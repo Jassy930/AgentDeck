@@ -54,6 +54,14 @@ agentdeckd
 ## 分层边界
 
 - `Sources/AgentDeck/`：macOS 原生 UI、会话模型、历史回放和本地交互。UI 只能通过 `CapabilityRouter` 消费 `SessionCapabilities` 决定渲染路径，禁止直接读 vendor 字段或硬编码 `if agentKind == .codex` 分支。
+- `Sources/AgentDeckCore/`：macOS/iOS 共享的中立协议模型、reducer 与 presentation；不得 import
+  CryptoKit、Network、AppKit 或 UIKit。
+- `Sources/AgentDeckSessionSource/`：P5.1 建立的平台无关观察/命令 facade，只依赖 Foundation、Swift
+  Concurrency 与 `AgentDeckCore`。它不拥有网络、crypto、Keychain、UI 或 fixture；普通远程 source 与本机
+  pairing administration 是两个独立 capability。
+- `Sources/AgentDeckRelayClient/`：共享 Relay wire/crypto/client 层，显式依赖 `AgentDeckCore` 与
+  `AgentDeckSessionSource`。P5.1 只冻结依赖方向；production `RelaySessionSource`、存储与 WSS 生命周期由
+  P5.2–P5.4 继续实现。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/local/`：当前为本地 Runtime v5 framing；它在 P4.2 Runtime v3 machine administration 与
@@ -747,6 +755,26 @@ conversation/key，不能伪造身份连续性。
   均 Approved，P0/P1/P2=0。因此 Task P4.7 complete，P4 automatic scope 7/7，P4 automatic Phase Exit
   complete。该完成边界不覆盖 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理
   iPhone/第二台 Mac 或 destructive purge；这些真实槽位继续保持 post-MVP BLOCKED。
+
+### Relay Companion MVP P5.1 SessionSource facade 不变量
+
+- 依赖方向固定为 `AgentDeckCore <- AgentDeckSessionSource <- AgentDeckRelayClient <- macOS/iOS app`；
+  App/Test target 显式声明三个 product。iOS 的 SessionSource product edge 使用 `link: false`，因为
+  RelayClient 已传递链接该 target；这只消除重复 wrapper，不取消 module/build dependency。Core 与
+  SessionSource 不得反向 import Relay client；未来若 RelayClient 不再依赖 SessionSource，iOS 必须恢复
+  SessionSource 的直接 link。
+- `SessionSource` 不带 protocol 级 `@MainActor`；machines/conversations/conversation/inbox 都是
+  `async -> AsyncStream` factory，所有跨 actor facade/model/receipt 都必须 `Sendable`。
+- `ResourceState` 精确为 loading/ready/stale/failed 四态；`ConversationUpdate` 精确承载
+  `ConversationSnapshotV2`、`RuntimeEventV2`、`CommandStatusReceiptV2` 与 typed connection state；
+  `PairingProgress` 精确为 preparing/waiting/paired/canceled/expired 五态。
+- command/approval/revoke/pairing administration receipt 直接 alias 当前 `AgentDeckCore` 类型，不复制
+  wire DTO；`LocalPairingAdministration` 不继承 `SessionSource`，远程 source 不能获得本机批准能力。
+- `MachineSummary` 以 `SessionConnectionState` 为唯一连接事实，不提供把离线原因压成 Bool 的 public
+  initializer；`ConversationSummary` 不携带 fixture-only `streamResource`。
+- P5.1 只完成 facade、公共模型、依赖图与 compile/link contract。旧 iOS
+  `MobileSessionSource`/models/fixture 在 P5.5 前继续留在 app target，`SceneDelegate` 仍注入 fixture；
+  因此本项不证明 RelaySessionSource、bounded broadcaster、WSS/Keychain、真实 iOS 或 P5 Phase Exit。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 
