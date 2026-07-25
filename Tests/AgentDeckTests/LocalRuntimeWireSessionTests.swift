@@ -87,6 +87,7 @@ final class LocalRuntimeWireSessionTests: XCTestCase {
           "entryRevision": 3,
         ] as [String: Any]
       ],
+      "currentPageCursor": NSNull(),
       "nextPageCursor": NSNull(),
     ])
     try harness.peer.writeTransfer(
@@ -103,6 +104,7 @@ final class LocalRuntimeWireSessionTests: XCTestCase {
     XCTAssertEqual(catalog.entries.count, 1)
     XCTAssertEqual(catalog.entries[0].conversationID.rawValue, "conversation-transfer")
     XCTAssertEqual(catalog.entries[0].title, "Transferred")
+    XCTAssertNil(catalog.currentPageCursor)
     XCTAssertNil(catalog.nextPageCursor)
     await harness.session.close()
   }

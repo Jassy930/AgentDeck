@@ -12,7 +12,7 @@ final class RuntimeSelfcheckRunnerTests: XCTestCase {
     XCTAssertEqual(execution.exitCode, 0)
     XCTAssertEqual(
       String(decoding: execution.stdout, as: UTF8.self),
-      #"{"agents":["claude_code","codex"],"ok":true,"protocolVersion":4,"reply":"selfcheck"}"#
+      #"{"agents":["claude_code","codex"],"ok":true,"protocolVersion":5,"reply":"selfcheck"}"#
         + "\n"
     )
     XCTAssertTrue(execution.stderr.isEmpty)

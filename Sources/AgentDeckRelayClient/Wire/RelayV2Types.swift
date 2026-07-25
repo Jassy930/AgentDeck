@@ -3,7 +3,7 @@ import Foundation
 
 public let relayProtocolVersionV2: UInt16 = 2
 /// E2EE info 中独立携带的当前 Runtime wire 版本；不改变 Relay v2 版本轴。
-public let relayE2ECurrentRuntimeProtocolVersionV4: UInt16 = 4
+public let relayE2ECurrentRuntimeProtocolVersionV5: UInt16 = 5
 
 public enum RelayWireCodecError: Error, Equatable, Sendable {
     case oversize
@@ -2140,7 +2140,7 @@ public enum RelayV2JSONCodec {
             )
             try requireVersion(
                 value.info.runtimeProtocolVersion,
-                expected: relayE2ECurrentRuntimeProtocolVersionV4,
+                expected: relayE2ECurrentRuntimeProtocolVersionV5,
                 field: "info.runtimeProtocolVersion"
             )
             try requireNonzero(value.info.relayServerId, count: 16, field: "info.relayServerId")
