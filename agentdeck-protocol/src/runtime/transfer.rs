@@ -271,6 +271,7 @@ struct CompletedTransfer {
     part_count: u32,
     total_bytes: u64,
     total_sha256: [u8; 32],
+    part_hashes: BTreeMap<u32, [u8; 32]>,
     completed_at_ms: u64,
 }
 
@@ -318,7 +319,13 @@ impl TransferReassembler {
         env: TransferEnvelope,
         now_ms: u64,
     ) -> Result<TransferProgress, TransferError> {
-        env.validate()?;
+        if let Err(error) = env.validate() {
+            // 与 Swift assembler 保持 fail-close parity：只要还能从 carrier 取得
+            // transfer_id，offending envelope 的结构/大小校验失败也必须终止同 ID
+            // 已存在的 partial，不能让后续合法 part 续接旧状态。
+            self.drop_transfer(&env.transfer_id);
+            return Err(error);
+        }
         self.accept_validated(channel, env, now_ms)
     }
 
@@ -329,7 +336,10 @@ impl TransferReassembler {
         env: TransferEnvelope,
         now_ms: u64,
     ) -> Result<TransferProgress, TransferError> {
-        env.validate_json_part()?;
+        if let Err(error) = env.validate_json_part() {
+            self.drop_transfer(&env.transfer_id);
+            return Err(error);
+        }
         self.accept_validated(channel, env, now_ms)
     }
 
@@ -379,6 +389,10 @@ impl TransferReassembler {
             {
                 return Err(TransferError::HashMismatch);
             }
+            let replay_part_hash: [u8; 32] = Sha256::digest(&env.part).into();
+            if done.part_hashes.get(&env.part_index) != Some(&replay_part_hash) {
+                return Err(TransferError::HashMismatch);
+            }
             return Ok(TransferProgress::AlreadyComplete);
         }
 
@@ -389,11 +403,17 @@ impl TransferReassembler {
 
         // 重组内存上界（跨全部 active transfer）。
         let incoming = env.part.len() as u64;
-        let projected = self
-            .buffered_bytes
-            .checked_add(incoming)
-            .ok_or(TransferError::ReassemblyFull)?;
+        let projected = match self.buffered_bytes.checked_add(incoming) {
+            Some(projected) => projected,
+            None => {
+                self.drop_transfer(&env.transfer_id);
+                return Err(TransferError::ReassemblyFull);
+            }
+        };
         if projected > self.max_reassembly_bytes {
+            // offending transfer 已不能在本 connection budget 内继续；按 design §9.7
+            // fail-close 并释放它此前的 partial bytes，不能留下可被后续 part 续接的半状态。
+            self.drop_transfer(&env.transfer_id);
             return Err(TransferError::ReassemblyFull);
         }
 
@@ -449,6 +469,11 @@ impl TransferReassembler {
         for (_idx, bytes) in entry.parts.iter() {
             assembled.extend_from_slice(bytes);
         }
+        let part_hashes = entry
+            .parts
+            .iter()
+            .map(|(index, bytes)| (*index, Sha256::digest(bytes).into()))
+            .collect();
         let expected = entry.total_sha256;
         self.drop_transfer(&env.transfer_id);
         self.buffered_bytes = self.buffered_bytes.saturating_sub(assembly_bytes);
@@ -463,9 +488,10 @@ impl TransferReassembler {
                 part_count: env.part_count,
                 total_bytes: env.total_bytes,
                 total_sha256: env.total_sha256,
+                part_hashes,
                 completed_at_ms: now_ms,
             },
-        );
+        )?;
         Ok(TransferProgress::Complete(assembled))
     }
 
@@ -489,17 +515,18 @@ impl TransferReassembler {
         }
     }
 
-    fn remember_completed(&mut self, id: TransferId, completed: CompletedTransfer) {
-        if self.completed.len() >= MAX_COMPLETED_TRANSFER_TOMBSTONES
-            && let Some(oldest) = self
-                .completed
-                .iter()
-                .min_by_key(|(_, value)| value.completed_at_ms)
-                .map(|(id, _)| id.clone())
+    fn remember_completed(
+        &mut self,
+        id: TransferId,
+        completed: CompletedTransfer,
+    ) -> Result<(), TransferError> {
+        if !self.completed.contains_key(&id)
+            && self.completed.len() >= MAX_COMPLETED_TRANSFER_TOMBSTONES
         {
-            self.completed.remove(&oldest);
+            return Err(TransferError::ReassemblyFull);
         }
         self.completed.insert(id, completed);
+        Ok(())
     }
 }
 

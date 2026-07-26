@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成；P4.4 MachineLink ingress/RuntimeCore dispatch 由 `cd7d9fb` 完成；P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成，收口时 Runtime wire 为 v4、physical schema 为 v14/35 表。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；P4.7 automatic E2E、静态 real-slot contract 与 phase docs 已完成，P4 automatic scope 7/7、P4 automatic Phase Exit complete。P5.1 shared `AgentDeckSessionSource` facade 与 P5.2 Keychain/crash-safe CryptoState 已完成，P5/P6 当前为 2/9、0/4；P5.3–P5.9 与 P5 Phase Exit 仍未完成。`p4-auto` 已 PASS，`p4` 仍不受支持；fresh 顶层 Rust/Swift、Clippy/fmt/network/no-net/schema/docs/diff、local smoke/selfcheck/diagnostics 与 pre-closeout hash `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的双路 phase review 均通过。真实 iOS 链路、production native metadata、provisioned signed Keychain/LaunchAgent、真实 vendor、公网 WSS、第二台 Mac 与 destructive purge 继续 post-MVP gated/BLOCKED（2026-07-26） |
+| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成；P4.4 MachineLink ingress/RuntimeCore dispatch 由 `cd7d9fb` 完成；P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成，收口时 Runtime wire 为 v4、physical schema 为 v14/35 表。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；P4.7 automatic E2E、静态 real-slot contract 与 phase docs 已完成，P4 automatic scope 7/7、P4 automatic Phase Exit complete。P5.1 shared `AgentDeckSessionSource` facade、P5.2 Keychain/crash-safe CryptoState 与 P5.3 WSS/SPKI pin/per-connection transfer primitive 已完成，P5/P6 当前为 3/9、0/4；P5.4–P5.9 与 P5 Phase Exit 仍未完成。`p4-auto` 已 PASS，`p4` 仍不受支持；fresh 顶层 Rust/Swift、Clippy/fmt/network/no-net/schema/docs/diff、local smoke/selfcheck/diagnostics 与 pre-closeout hash `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的双路 phase review 均通过。真实 iOS 链路、production native metadata、provisioned signed Keychain/LaunchAgent、真实 vendor、公网 WSS、第二台 Mac 与 destructive purge 继续 post-MVP gated/BLOCKED（2026-07-26） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -1271,6 +1271,11 @@ transport-specific representability 同样必须校验：JSON/UDS 的 `totalByte
 transfer、128 MiB logical reassembly bytes，全局 512 MiB；completed tombstone 每 connection 256、全局
 8,192，absolute TTL 5 分钟。metadata/duplicate conflict、hash/length 错误、超限、TTL 或 disconnect 都会
 终止该易失 connection-owned assembly；计数使用 checked arithmetic，零字节 part 仍占 active-transfer 配额。
+completed tombstone 必须保存每个 part 的 SHA-256，metadata 相同但 part bytes 冲突的 replay 仍须
+fail-close；256/connection 到界时拒绝 offending completion，不得淘汰 absolute TTL 内的 dedup。P5.3
+`TransferAssembler` 先冻结上述 per-connection primitive 与 generation scope；512 MiB/8,192 的
+process-global owner 由 P5.4 `MachineConnection` shared coordinator 安装。因此单个 assembler 通过只表示
+P5.3 component complete，不构成 global budget、RelaySessionSource 或 P5 Phase Exit 证据。
 
 P4.6 persistent CLI 的 authenticated live-stream `TransferPart` 是另一条 durable 路径：paired-state V6
 把 exact stream binding 与 transfer records 放进同一 sealed CAS。partial 在 transport disconnect、进程
@@ -1339,7 +1344,8 @@ transfer 的证据。
 | read-only WAL pool | 8 connections；128 MiB retained pages；64 rows/8 MiB per page |
 | publication dispatcher | 64 rows/8 MiB per page；16 MiB global memory |
 | publication outbox | 2,000 rows/64 MiB per stream；10,000 rows/512 MiB global；unacked no-evict |
-| connection writer | 512 frames/16 MiB，transport flush ACK 后释放 |
+| Swift incoming | regular 512 frames/16 MiB + urgent reserve 4 frames/8 MiB；aggregate 516/24 MiB |
+| connection writer | application 512 frames/16 MiB + control reserve 8 frames/1 MiB；aggregate 520/17 MiB，transport flush ACK 后释放 |
 
 ### 9.9 P3.6 当前实现与验证边界（2026-07-15）
 
@@ -1476,7 +1482,7 @@ Challenge、PairRoute、connection registry、writer queues、heartbeat timers �
 - `ws://` 只允许 loopback 且显式 `--allow-insecure-loopback`。
 - 反向代理终止 TLS 时 Relay 必须 bind loopback 并显式启用 proxy mode，禁止直接暴露明文 listener。
 - Rust WS client 编译 rustls；Swift 使用 `URLSessionWebSocketTask`。
-- 公开 CA 正常验证；自签部署由 enrollment bundle/PairInvite 携带 current+next SHA-256 DER SPKI pinset，pin mismatch fail-closed。
+- 公开 CA 正常验证；自签部署由 enrollment bundle/PairInvite 携带 current+next SHA-256 DER SPKI pinset，pin mismatch fail-closed。Swift pinned self-signed 模式先匹配 exact leaf SPKI，再把同一 leaf 设为显式 trust anchor 运行 SSL hostname/time/EKU/结构校验，并依赖 TLS CertificateVerify 证明私钥持有；不把 leaf-anchor 模式描述成验证了 anchor 自签 signature。
 - machine enrollment 与 device pairing 都必须在发送 code/secret/public identity 前完成 CA 或 pin 验证；所有客户端禁止 redirect、host 切换和 scheme downgrade。
 - 证书轮换先把 next pin 放入已签 key directory/invite，再切证书，最后退休 old pin；设备错过完整轮换窗口时 fail-closed，并要求从被控机器重新取得 PairInvite，而不是提供“忽略证书”按钮。
 
@@ -1520,6 +1526,17 @@ Challenge、PairRoute、connection registry、writer queues、heartbeat timers �
 - `URLSessionWebSocketTask` wire client、版本握手、frame limits、backoff/jitter。
 - CryptoKit HPKE/ChaChaPoly/AAD/counter。
 - `KeyStore` protocol；iOS/macOS 分别实现 Keychain adapter。
+
+P5.3 的 transport owner API 固定绑定不可复用 generation；concurrent connect 使用 waiter single-flight，
+取消只移除自己。connect attempt、application/control write 与 physical cleanup 分别固定 30 秒/10 秒/5 秒
+absolute deadline；正常 close 依次读回 task `didComplete` 与 session `didBecomeInvalid` 后才解除 generation
+屏障，单独 WebSocket `didClose` 不足。超时 cleanup 永久 poison 当前 transport；force 路径先解除 graceful
+waiter，但自身仍等真实 session invalidation，failed-connect 在确认前不得回到 idle。write timeout 绑定
+generation + outbound ID 并返回 outcome unknown。Foundation
+`maximumMessageSize` 使用 4 MiB + 1 byte prefilter headroom，应用 codec 仍在 decode 前精确拒绝 4 MiB + 1。
+Relay Ping 使用 control reserve 自动 Pong，`ServerRestarting` 使用 urgent reserve 交付 terminal 并清理普通
+queue。真实公网 WSS、RelaySessionSource 与 Simulator Relay E2E 仍分别属于 post-MVP/P5.4/P5.9，不由
+P5.3 component tests 代替。
 
 `AgentDeckCore` 继续只放中立模型、`RuntimeEvent`、reducer 和 presentation，不 import 网络/CryptoKit/UI framework。
 

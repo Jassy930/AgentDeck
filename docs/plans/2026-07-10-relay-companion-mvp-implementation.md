@@ -3156,7 +3156,8 @@ agent docs、diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics �
 `quality` 均 Approved，P0/P1/P2=0。verifier 仍不支持 `p4`。production-signed Keychain/LaunchAgent、
 真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与 destructive purge 继续保持 post-MVP
 `BLOCKED`；静态 runner 仍只输出 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不生成真实证据。
-P5.1 shared facade 与 P5.2 crash-safe client storage 已于后续完成；P5/P6 当前为 2/9、0/4。
+P5.1 shared facade、P5.2 crash-safe client storage 与 P5.3 WSS/pin/per-connection transfer primitive 已于
+后续完成；P5/P6 当前为 3/9、0/4。
 
 ---
 
@@ -3164,8 +3165,8 @@ P5.1 shared facade 与 P5.2 crash-safe client storage 已于后续完成；P5/P6
 
 > **执行前审计（2026-07-20）：0/9 Task 完成。** 当前只有 Relay crypto/wire、P3.9 本机 Runtime 与
 > fixture UI 基线；P5.1–P5.9 production source、真实 Simulator Relay E2E 与 post-MVP slot runner 均未实现。
-> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-26）：P5.1–P5.2 已完成，
-> P5 为 2/9；P5.3–P5.9 与 P5 Phase Exit 仍未完成。**
+> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-26）：P5.1–P5.3 已完成，
+> P5 为 3/9；P5.4–P5.9 与 P5 Phase Exit 仍未完成。**
 
 ### Task P5.1：建立 AgentDeckSessionSource target 与强类型 facade
 
@@ -3213,8 +3214,8 @@ warnings-as-errors 编译下 focused `15/15`、strict SessionSource target build
 import；平台/network/fixture/unsafe token 扫描、Swift format、agent docs 与 diff check 全绿。XcodeGen
 App/Test 均显式声明 Core/SessionSource/RelayClient；SessionSource product 使用 `link: false`，由
 RelayClient target edge 传递链接，clean dependency scan 无 missing-edge warning，CoreLinkTests 实际构造
-三模块类型。旧 fixture 保留到 P5.5；P5.2 已按下节独立收口，P5.3–P5.9、P5 Phase Exit 与全部真实
-设备/公网槽位仍未完成。
+三模块类型。旧 fixture 保留到 P5.5；P5.2/P5.3 已按下节分别独立收口，P5.4–P5.9、P5 Phase Exit 与
+全部真实设备/公网槽位仍未完成。
 
 ### Task P5.2：实现 Apple Keychain、CryptoStateStore 与 Swift counter/replay IO
 
@@ -3253,7 +3254,8 @@ Swift `649 XCTest / 4 SKIP + 35 Swift Testing`、iOS storage `5/5` 与全量 Sim
 Rust `agentdeck-crypto + agentdeck-protocol`、新文件 strict format、production unsafe/弱 Keychain
 policy/secret/transcript 扫描、agent docs 与 tracked/untracked diff check 全绿；双路终审 P0/P1/P2=0。
 production-signed Data Protection Keychain 与物理 iPhone locked/unlocked Complete readback 继续
-post-MVP BLOCKED，不计 PASS；P5.3–P5.9、WSS/RelaySessionSource 与 P5 Phase Exit 仍未完成。
+post-MVP BLOCKED，不计 PASS；后续 P5.3 已独立收口，P5.4–P5.9、RelaySessionSource 与 P5 Phase Exit
+仍未完成。
 
 ### Task P5.3：实现 Swift RelayWebSocketTransport、SPKI pin 与 transfer assembler
 
@@ -3265,24 +3267,38 @@ post-MVP BLOCKED，不计 PASS；P5.3–P5.9、WSS/RelaySessionSource 与 P5 Pha
 **Core interface:**
 ```swift
 public actor RelayWebSocketTransport {
-    public func connect() async throws
-    public func incomingFrames() async -> AsyncThrowingStream<OpaqueRouteFrame, Error>
-    public func send(_ frame: OpaqueRouteFrame) async throws
-    public func close() async
+    public func connect() async throws -> RelayTransportGeneration
+    public func incomingFrames(on generation: RelayTransportGeneration) -> AsyncThrowingStream<ReceivedRelayFrame, Error>
+    public func send(_ frame: RelayV2OutboundFrame, on generation: RelayTransportGeneration) async throws
+    public func close(generation: RelayTransportGeneration) async throws
+    public func shutdown() async
 }
 ```
 
-- [ ] Step 1: 写注入式transport tests。 注入WebSocket task factory/clock/jitter；覆盖仅wss、public CA、current/next DER SPKI、pin mismatch、redirect/host/scheme、4MiB frame、exponential backoff、server restart；transfer覆盖1/64/65 parts、3.5/64MiB、乱序、duplicate-same/conflict、5m/hash/128MiB。
-- [ ] Step 2: 运行三套tests。 Expected: FAIL，transport/assembler不存在。
-- [ ] Step 3: 实现URLSessionWebSocketTask actor与pinned delegate。 transport只解析Relay outer wire，不解Runtime payload；incoming/writer各受512 frames/16MiB上界约束，drop/overflow关闭当前generation而非无界缓存；pin失败没有绕过回调；assembler在完整hash前不返回payload。
-- [ ] Step 4: 重跑tests与 P1 cross-language crypto gate。 Expected: PASS，网络tests不依赖公网。
-- [ ] Step 5: 运行Swift concurrency warnings as errors构建。
-- [ ] Step 6: 提交。 `git add Sources/AgentDeckRelayClient Tests/AgentDeckRelayClientTests && git commit -m "feat(swift): 实现 WSS pin 与有界分片传输"`
+- [x] Step 1: 写注入式transport tests。 注入WebSocket task factory/clock/jitter；覆盖仅wss、public CA、current/next DER SPKI、pin mismatch、redirect/host/scheme、4MiB frame、exponential backoff、server restart；transfer覆盖1/64/65 parts、3.5/64MiB、乱序、duplicate-same/conflict、5m/hash/128MiB。
+- [x] Step 2: 运行三套tests。 Expected: FAIL，transport/assembler不存在。
+- [x] Step 3: 实现URLSessionWebSocketTask actor与pinned delegate。 transport只解析Relay outer wire，不解Runtime payload；incoming regular/application writer各受512 frames/16MiB上界，另保留4 frames/8MiB urgent incoming与8 frames/1MiB control writer reserve，aggregate分别为516/24MiB和520/17MiB；drop/overflow关闭当前generation而非无界缓存；connect/write/physical cleanup 固定30秒/10秒/5秒绝对期限，正常close依次等task `didComplete`与session `didBecomeInvalid`，timeout按exact generation/outbound ID fail-close；pin失败没有绕过回调；assembler在完整hash前不返回payload。
+- [x] Step 4: 重跑tests与 P1 cross-language crypto gate。 Expected: PASS，网络tests不依赖公网。
+- [x] Step 5: 运行Swift concurrency warnings as errors构建。
+- [x] Step 6: 提交。 `git add Sources/AgentDeckRelayClient Tests/AgentDeckRelayClientTests agentdeck-protocol README.md ARCHITECTURE.md docs && git commit -m "feat(swift): 实现 WSS pin 与有界分片传输"`
+
+**P5.3 自动门禁证据（2026-07-26）：** 三组 focused `60/60`（Transport 34、TLS 11、Assembler
+15），并连续 10 轮稳定；strict `AgentDeckRelayClient` 完整 tests
+`181 executed / 4 entitlement SKIP / 0 failure`，strict target build、完整 Swift
+`709 XCTest / 4 SKIP + 35 Swift Testing`、iOS 17 Simulator `26/26` 均通过。Rust transfer
+`24/24`、完整 `agentdeck-protocol`、Runtime contract `50/50`、crypto vectors `20/20` 与 cross-language
+crypto gate，Swift/Rust strict format、docs 与 diff check 全绿。首轮 Simulator 编译准确暴露
+`Synchronization.Mutex` 仅支持 iOS 18，已改为 iOS 16+ `OSAllocatedUnfairLock` 并以同一全量 Simulator
+gate 读回；独立终审又补齐 writer deadline、task+session close 双 readback、failed-Hello force invalidation、
+next pin、1009 与 Rust validation fail-close parity，最终 P0/P1/P2=0。process-global 512 MiB/8,192
+tombstone owner 归 P5.4 shared connection coordinator，本项不宣称 global gate、RelaySessionSource、真实
+公网 WSS、物理 iPhone 或 P5 Phase Exit 已完成。
 
 ### Task P5.4：实现 MachineConnection、bounded broadcaster 与 RelaySessionSource
 
 **Files:**
 - Create: `Sources/AgentDeckRelayClient/Connection/{MachineConnection,MachineConnectionStateMachine}.swift`
+- Create: `Sources/AgentDeckRelayClient/Transfer/TransferAssemblyBudgetCoordinator.swift`
 - Create: `Sources/AgentDeckRelayClient/Crypto/{MachineDataVerifier,DeviceRequestSigner}.swift`
 - Create: `Sources/AgentDeckRelayClient/Streaming/BoundedBroadcaster.swift`
 - Create: `Sources/AgentDeckRelayClient/Source/{RelaySessionSource,CatalogReducer,ConversationReducer,InboxReducer}.swift`
@@ -3294,9 +3310,9 @@ public enum RelaySourceScope: Sendable { case allPairedMachines; case machine(St
 public actor RelaySessionSource: SessionSource { /* one MachineConnection per paired machine */ }
 ```
 
-- [ ] Step 1: 写source/auth tests。入站固定顺序`outer bounds/domain/trust/serial/revision → MachineDataSign TBS verify → replay tuple → AEAD open → Runtime decode → reducer`；出站DeviceRequestSigner固定`Runtime encode → AEAD → outer-bound TBS → DeviceSign`。forged event、lower revision、unknown higher revision/key-sync exhaustion、bad AAD/tag均不得推进cursor/reducer；PairPending映射waitingForLocalConfirmation，signed canceled/expired为terminal，PairResponseReceived必须在本地paired record原子提升后发送且exact retry。resource stream`.bufferingNewest(1)`，conversation 512；drop通过`ConversationUpdate.connectionState(.lagged(reason: .bufferDropped))`轮换内部generation并snapshot/barrier，但用户observation stream保持存活；cold process launch因不存transcript必须先daemon snapshot/barrier，再增量resume。revoked/incompatible/securityError才fatal。
+- [ ] Step 1: 写source/auth tests。入站固定顺序`outer bounds/domain/trust/serial/revision → MachineDataSign TBS verify → replay tuple → AEAD open → Runtime decode → reducer`；出站DeviceRequestSigner固定`Runtime encode → AEAD → outer-bound TBS → DeviceSign`。forged event、lower revision、unknown higher revision/key-sync exhaustion、bad AAD/tag均不得推进cursor/reducer；PairPending映射waitingForLocalConfirmation，signed canceled/expired为terminal，PairResponseReceived必须在本地paired record原子提升后发送且exact retry。resource stream`.bufferingNewest(1)`，conversation 512；drop通过`ConversationUpdate.connectionState(.lagged(reason: .bufferDropped))`轮换内部generation并snapshot/barrier，但用户observation stream保持存活；cold process launch因不存transcript必须先daemon snapshot/barrier，再增量resume。revoked/incompatible/securityError才fatal。另以 process-scoped `TransferAssemblyBudgetCoordinator` 覆盖全部 `MachineConnection`：parts 缓存和 final assembly 双份峰值都必须在分配前原子预留，global 上限为 512 MiB；completed tombstone 在写入前预留，global 上限为 8,192。至少用 5 条各逼近 128 MiB 的 connection 与 8,192/+1 seam 证明跨连接 fail-close、no-evict 与完整释放。
 - [ ] Step 2: 运行四套tests。 Expected: FAIL，MachineConnection/RelaySessionSource不存在。
-- [ ] Step 3: 实现MachineDataVerifier、DeviceRequestSigner、connection supervisor、bounded broadcaster、reducers与source。MachineDataVerifier必须把SignedSealedBlobV1验成VerifiedSealedBlobV1后才允许AEAD open；DeviceRequestSigner只能发送SignedSealedBlobV1。pair返回PairingProgress stream，持久化paired record后以DeviceSign发送/重试PairResponseReceived。只有签名/AEAD/inner验证完成后才能持久化cursor/revision；exact duplicate再按eventId去重；offline send立即typed failure。
+- [ ] Step 3: 实现MachineDataVerifier、DeviceRequestSigner、connection supervisor、shared transfer budget coordinator、bounded broadcaster、reducers与source。MachineDataVerifier必须把SignedSealedBlobV1验成VerifiedSealedBlobV1后才允许AEAD open；DeviceRequestSigner只能发送SignedSealedBlobV1。pair返回PairingProgress stream，持久化paired record后以DeviceSign发送/重试PairResponseReceived。只有签名/AEAD/inner验证完成后才能持久化cursor/revision；exact duplicate再按eventId去重；offline send立即typed failure。shared coordinator 必须在 part/final assembly/tombstone allocation 之前 reserve，并在 complete、validation/hash/length failure、TTL、disconnect、reset 与 owner teardown 的所有 terminal 路径 exact release；cap 满时拒绝 offending transfer/completion，禁止 post-hoc 统计、临时超配或驱逐 TTL 内 tombstone。
 - [ ] Step 4: 重跑tests并做10,000 events慢消费者压力、前后台与kill/relaunch恢复。 Expected: 无静默丢失/无无界内存；lag只重建内部generation，外层observation继续；冷启动不会从非零cursor拼出不完整transcript；伪造frame不改变任何state。
 - [ ] Step 5: 运行Swift tests和Instruments非门控内存上限smoke。
 - [ ] Step 6: 提交。 `git add Sources/AgentDeckRelayClient Tests/AgentDeckRelayClientTests && git commit -m "feat(swift): 建立 RelaySessionSource 与有界状态流"`

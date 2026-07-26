@@ -61,7 +61,9 @@ agentdeckd
   pairing administration 是两个独立 capability。
 - `Sources/AgentDeckRelayClient/`：共享 Relay wire/crypto/client 层，显式依赖 `AgentDeckCore` 与
   `AgentDeckSessionSource`。P5.2 已实现 Apple Keychain、typed sealed CryptoState、counter/replay 与 paired
-  marker；production `RelaySessionSource`、WSS 与 connection 生命周期仍由 P5.3–P5.4 实现。
+  marker；P5.3 已实现 generation-scoped WSS、TLS pin、bounded transport 与 per-connection transfer
+  assembler。production `RelaySessionSource`、`MachineConnection` 与 process-global transfer coordinator
+  继续由 P5.4 实现。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/local/`：当前为本地 Runtime v5 framing；它在 P4.2 Runtime v3 machine administration 与
@@ -800,6 +802,39 @@ conversation/key，不能伪造身份连续性。
 - 本节只证明 P5.2 本地 primitive。SwiftPM 无 entitlement 时的 SecItem `-34018` 与 Simulator 非物理
   Complete readback均明确保持 production-signed/物理 iPhone post-MVP BLOCKED；WSS、RelaySessionSource、
   真实 pairing/command 闭环和 P5 Phase Exit 仍未完成。
+
+### Relay Companion MVP P5.3 WSS / TLS pin / transfer 不变量
+
+- `RelayWebSocketTransport` 只接收 canonical `wss://` root origin，并固定拼出 `/v2/connect` 或
+  `/v2/pair`；拒绝 userinfo、path、query、fragment、非法 port 与全部 HTTP redirect。transport 自己只发送一次
+  current Relay v2 Hello，调用方不能选择版本或补发 Hello。所有 owner API 都绑定不可复用的
+  `RelayTransportGeneration`；`shutdown()` 只用于全局 teardown，普通 owner 使用
+  `send(_:on:)`、`incomingFrames(on:)` 与 `close(generation:)`。
+- concurrent connect 是 actor-owned single-flight：每个 waiter 有同步 cancellation latch，取消只移除自己，
+  最后一个 waiter 才取消 worker。attempt 固定 30 秒、application/control write 固定 10 秒、任何 physical
+  socket cleanup 固定 5 秒 absolute deadline。正常 close 必须依次读回 task `didComplete` 与 session
+  `didBecomeInvalid` 才解除 generation 屏障；WebSocket `didClose` 单独不算 physical cleanup。cleanup 不合作时
+  当前 transport 永久进入 `connection_cleanup_stalled`，不再制造新 attempt。
+  worker 在 factory、start、Hello 前后同时检查 shared gate 与 Task cancellation；旧 generation 的迟到 socket
+  只能 force-close，不能安装。write timeout 绑定 generation + outbound ID，返回 outcome unknown，迟到 timer
+  不能关闭新 generation。
+- TLS policy 只有三种互斥模式：public CA；public CA + current/next SPKI pin；current/next SPKI pinned
+  self-signed。pin 精确为 `SHA-256(完整 DER SubjectPublicKeyInfo TLV)`。self-signed 模式先匹配 exact leaf
+  SPKI，再把同一 leaf 设为显式 trust anchor 运行 SSL hostname/time/EKU/结构校验，并由 TLS
+  CertificateVerify 证明私钥持有；它不声称验证 leaf 作为 anchor 的自签 signature。pin mismatch、CA failure、
+  host mismatch 都 fail-closed，没有 fallback。
+- URLSession prefilter 使用 `4 MiB + 1 byte` headroom，避免 Foundation 把“达到阈值”误判为 oversized；应用
+  codec 仍精确接受 4 MiB、在 decode 前拒绝 4 MiB + 1。incoming regular lane 是 512 frames/16 MiB，另有
+  4 frames/8 MiB urgent reserve，aggregate 为 516/24 MiB；application writer 是 512/16 MiB，另有
+  8 frames/1 MiB control reserve，aggregate 为 520/17 MiB。所有 frame/byte overflow 都关闭当前 generation，
+  不静默丢帧。Relay Ping 由 transport 自动 Pong；`ServerRestarting` 会先清普通入站与 queued writes，保留
+  urgent terminal，并把 in-flight application send 标为 outcome unknown。
+- `TransferAssembler` 绑定 connection UUID + exact generation，直接消费 current compact carrier；每
+  connection 最多 64 active、parts+assembly 峰值共 128 MiB、absolute TTL 5 分钟、256 个 completed
+  tombstone。tombstone 保存每个 part hash，conflicting replay fail-close；cap 满时拒绝新 completion，绝不
+  淘汰 TTL 内 dedup。metadata/hash/length/duplicate/stale scope 任一错误都先释放 offending partial。设计要求的
+  512 MiB process-global reassembly 与 8,192 global tombstone owner 由 P5.4 shared connection coordinator
+  安装；P5.3 的单 assembler 结果不能冒充全局门禁、RelaySessionSource 或端到端完成。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 

@@ -10,9 +10,10 @@
 
 use agentdeck_protocol::runtime::identity::{MessageId, TransferId};
 use agentdeck_protocol::runtime::transfer::{
-    MAX_JSON_TRANSFER_PARTS, MAX_PART_BYTES, MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES,
-    MAX_TRANSFER_PARTS, RuntimeTransferCarrierV1, RuntimeTransferChannel, TRANSFER_TTL_MS,
-    TransferEnvelope, TransferError, TransferProgress, TransferReassembler,
+    MAX_COMPLETED_TRANSFER_TOMBSTONES, MAX_JSON_TRANSFER_PARTS, MAX_PART_BYTES,
+    MAX_REASSEMBLY_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_PARTS, RuntimeTransferCarrierV1,
+    RuntimeTransferChannel, TRANSFER_TTL_MS, TransferEnvelope, TransferError, TransferProgress,
+    TransferReassembler,
 };
 use sha2::{Digest, Sha256};
 
@@ -422,6 +423,83 @@ fn reassembly_cap_enforced_across_transfers() {
 }
 
 #[test]
+fn reassembly_cap_overflow_aborts_the_offending_existing_transfer() {
+    let payload = vec![7_u8; 4];
+    let parts = split(&payload, 2);
+    let mut reassembler = TransferReassembler::with_limits(3, TRANSFER_TTL_MS);
+
+    reassembler
+        .accept(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+        .unwrap();
+    assert_eq!(reassembler.buffered_bytes(), 2);
+    assert_eq!(
+        reassembler
+            .accept(RuntimeTransferChannel::Reply, parts[1].clone(), 1)
+            .unwrap_err(),
+        TransferError::ReassemblyFull
+    );
+    assert_eq!(
+        reassembler.buffered_bytes(),
+        0,
+        "fail-close must release the offending partial transfer"
+    );
+}
+
+#[test]
+fn validation_error_aborts_existing_partial_for_compact_and_json_profiles() {
+    let payload = vec![0x7A_u8; 4];
+    let parts = split(&payload, 2);
+
+    let mut compact = TransferReassembler::new();
+    compact
+        .accept(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+        .unwrap();
+    assert_eq!(compact.buffered_bytes(), 2);
+    let invalid_compact = TransferEnvelope {
+        transfer_id: parts[0].transfer_id.clone(),
+        part_index: 1,
+        part_count: MAX_TRANSFER_PARTS + 1,
+        total_sha256: parts[0].total_sha256,
+        total_bytes: parts[0].total_bytes,
+        part: parts[1].part.clone(),
+    };
+    assert_eq!(
+        compact
+            .accept(RuntimeTransferChannel::Reply, invalid_compact, 1)
+            .unwrap_err(),
+        TransferError::TooLarge
+    );
+    assert_eq!(
+        compact.buffered_bytes(),
+        0,
+        "compact validation failure must release the same-ID partial"
+    );
+
+    let mut json = TransferReassembler::new();
+    json.accept_json(RuntimeTransferChannel::Reply, parts[0].clone(), 0)
+        .unwrap();
+    assert_eq!(json.buffered_bytes(), 2);
+    let invalid_json = TransferEnvelope {
+        transfer_id: parts[0].transfer_id.clone(),
+        part_index: 1,
+        part_count: MAX_JSON_TRANSFER_PARTS + 1,
+        total_sha256: parts[0].total_sha256,
+        total_bytes: parts[0].total_bytes,
+        part: parts[1].part.clone(),
+    };
+    assert_eq!(
+        json.accept_json(RuntimeTransferChannel::Reply, invalid_json, 1)
+            .unwrap_err(),
+        TransferError::TooLarge
+    );
+    assert_eq!(
+        json.buffered_bytes(),
+        0,
+        "JSON validation failure must release the same-ID partial"
+    );
+}
+
+#[test]
 fn envelope_round_trips_with_base64_wire() {
     let env = TransferEnvelope::new(
         TransferId::new("t1"),
@@ -480,7 +558,71 @@ fn completed_tombstone_prevents_double_complete_and_binds_channel() {
             .unwrap(),
         TransferProgress::AlreadyComplete
     ));
-    assert!(r.accept(RuntimeTransferChannel::Stream, part, 2).is_err());
+    let conflicting_replay = TransferEnvelope::new(
+        part.transfer_id.clone(),
+        part.part_index,
+        part.part_count,
+        part.total_sha256,
+        part.total_bytes,
+        vec![b'X'; part.part.len()],
+    )
+    .unwrap();
+    assert_eq!(
+        r.accept(RuntimeTransferChannel::Reply, conflicting_replay, 2)
+            .unwrap_err(),
+        TransferError::HashMismatch
+    );
+    assert!(r.accept(RuntimeTransferChannel::Stream, part, 3).is_err());
+}
+
+#[test]
+fn completed_tombstone_cap_rejects_new_completion_without_evicting_live_dedup() {
+    let mut reassembler = TransferReassembler::new();
+    let mut first = None;
+    for index in 0..MAX_COMPLETED_TRANSFER_TOMBSTONES {
+        let payload = vec![index as u8];
+        let envelope = TransferEnvelope::new(
+            TransferId::new(format!("completed-{index}")),
+            0,
+            1,
+            sha256(&payload),
+            1,
+            payload,
+        )
+        .unwrap();
+        if index == 0 {
+            first = Some(envelope.clone());
+        }
+        assert!(matches!(
+            reassembler
+                .accept(RuntimeTransferChannel::Reply, envelope, index as u64)
+                .unwrap(),
+            TransferProgress::Complete(_)
+        ));
+    }
+
+    let overflow_payload = vec![0xFF];
+    let overflow = TransferEnvelope::new(
+        TransferId::new("completed-overflow"),
+        0,
+        1,
+        sha256(&overflow_payload),
+        1,
+        overflow_payload,
+    )
+    .unwrap();
+    assert_eq!(
+        reassembler
+            .accept(RuntimeTransferChannel::Reply, overflow, 1_000)
+            .unwrap_err(),
+        TransferError::ReassemblyFull
+    );
+    assert!(matches!(
+        reassembler
+            .accept(RuntimeTransferChannel::Reply, first.unwrap(), 1_001)
+            .unwrap(),
+        TransferProgress::AlreadyComplete
+    ));
 }
 
 #[test]

@@ -1084,8 +1084,8 @@ Protection Keychain 且没有 file/dev keystore 降级。MachineRoot 丢失按
 [`RELAY_RUNBOOK.md` 的 portable purge receipt 流程](RELAY_RUNBOOK.md#machineroot-丢失后的-portable-purge-receipt)
 处理；static sentinel 不生成 receipt，也不提供删除授权。
 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与
-destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade 与 P5.2 crash-safe client storage 已完成，
-P5/P6 当前为 2/9、0/4。
+destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade、P5.2 crash-safe client storage 与 P5.3
+WSS/pin/per-connection transfer primitive 已完成，P5/P6 当前为 3/9、0/4。
 
 #### P5.2 client storage / counter / replay failure
 
@@ -1112,6 +1112,38 @@ durable quarantine + retired guard，不能手改 guard/state 让它继续 activ
 Simulator 可验证 CryptoState roundtrip、backup exclusion、tamper fail-close 和 production protection policy
 配置，但 CoreSimulator 当前把 protection readback 固定显示为 `CompleteUntilFirstUserAuthentication`；只有物理
 iPhone 的锁屏/解锁 readback 能关闭真实 `Complete` 证据槽位。
+
+#### P5.3 WSS / TLS pin / transfer failure
+
+P5.3 transport 只拥有一个 physical WSS generation。`connect()` 的 generation 不能复用；普通 owner 必须把
+`send`、`incomingFrames` 与 `close` 都绑定该 generation。close 只有依次读回 task `didComplete` 与 session
+`didBecomeInvalid` 才解除旧 generation，WebSocket `didClose` 单独不算完成；connect/write/cleanup 任一绝对
+deadline 到界都 fail-close，禁止新旧 socket 重叠或让
+半开 write 永久占用 in-flight continuation。`shutdown()` 只用于 composition root teardown，不是普通重连入口。
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `remote.transport.endpoint_invalid` | origin 不是 canonical `wss://` root，或带 userinfo/path/query/fragment/非法 port | 修正 Relay origin；不要拼接 `/v2/connect`、允许 redirect 或降级 `ws/http` |
+| `remote.transport.tls_pinset_invalid` / `tls_challenge_invalid` / `tls_hostname_mismatch` / `tls_trust_failed` / `tls_pin_mismatch` / `tls_certificate_invalid` | TLS policy/pin、challenge host、public trust 或 leaf DER-SPKI 校验失败 | fail-close；从可信 PairInvite/key directory 更新 current+next pin。不得点“忽略证书”或回退 public CA/pin-only |
+| `remote.transport.connection_timed_out` | connection attempt 的 30 秒绝对 deadline 到界 | 关闭 exact attempt；由 P5.4 supervisor 按 typed reconnect policy 重试，不复用 generation |
+| `remote.transport.connection_cleanup_stalled` | canceled attempt 或 physical close 未在 5 秒内读回 terminal cleanup | 当前 transport 已 poison；销毁 composition owner 后重建，保留 socket/delegate 时序诊断，不在同实例继续 connect |
+| `remote.transport.outcome_unknown` | application write 进入 socket 后失败、取消、restart 或绝对 write deadline 到界 | 不把它当作“命令未执行”；按原 idempotency key/Runtime receipt 恢复，只关闭 exact generation |
+| `remote.transport.stale_generation` / `canceled` | caller 使用旧 generation，或自己的 connect/incoming/send waiter 被取消 | 丢弃旧 owner token；等待当前 close/cleanup 完成后由 supervisor 新建 generation，不重放 Hello |
+| `remote.transport.frame_too_large` / `frame_invalid` / `text_message` / `peer_closed` | 数据超过 4 MiB（含 local/peer 1009）、outer frame 非 canonical binary、收到 text，或 peer 以 typed code 关闭 | 关闭 exact generation；不要把 text/oversize 当成 Runtime payload。1000/1001/1002/1008/1009/1011/1012/1013 保留稳定诊断语义 |
+| `remote.transport.incoming_backpressure` / `outgoing_backpressure` | regular/urgent 或 application/control 的 frame/byte 任一预算耗尽 | 当前 generation fail-close；修复慢消费者/生产者，不调高为无界缓存 |
+| `remote.transport.server_restarting` | 已验证 `ServerRestarting`，携带 drain deadline | 交付 urgent terminal，清空普通 incoming/queued application；in-flight application 视为 outcome unknown，deadline 后叠加 jittered backoff |
+| `remote.transfer.too_large` / `hash_mismatch` / `expired` / `reassembly_full` / `stale_scope` | per-connection transfer 的结构/长度/hash/duplicate/TTL/budget 或 connection+generation scope 不合法 | 释放 offending partial 并从完整 snapshot/cut 重建；不得续接旧 partial、驱逐 TTL 内 tombstone或返回未验完整 payload |
+
+incoming regular 固定 512 frames/16 MiB，urgent reserve 4 frames/8 MiB；application writer 固定
+512 frames/16 MiB，control reserve 8 frames/1 MiB。aggregate 分别是 516/24 MiB 与 520/17 MiB；这两轴
+同时是 hard cap。`TransferAssembler` 只证明每 connection 64 active、parts+assembly 峰值 128 MiB、
+256 completed tombstone 与 absolute TTL 5 分钟；process-global 512 MiB/8,192 必须由 P5.4 shared
+coordinator 在 allocation 前 reserve。看到多个 connection 总占用越界时，不要把 P5.3 component gate 当作
+global 证据。
+
+pinned self-signed 的准确含义是：先匹配 exact leaf DER-SPKI，再把该 leaf 作为显式 anchor 运行
+hostname/time/EKU/结构验证，并由 TLS CertificateVerify 证明 pinned private-key possession；它不验证 anchor
+的自签 signature。真实公网 WSS 与物理设备仍是 post-MVP BLOCKED，P5.3 automatic tests 不替代这些证据。
 
 #### Trust reset 与本地 cleanup
 

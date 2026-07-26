@@ -13,12 +13,12 @@
 
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2、P4.2–P4.3 machine/pairing lifecycle、
   P4.4 RemoteLink ingress、P4.5 signed publication/counter recovery、P4.6 persistent CLI/watch 与 durable
-  transfer recovery、conversation-scoped recovery、daemon install/upgrade failure code、v1 marker 显式 reset
-  和排查流程。
+  transfer recovery、P5.2 client storage、P5.3 WSS/TLS pin/per-connection transfer、conversation-scoped
+  recovery、daemon install/upgrade failure code、v1 marker 显式 reset 和排查流程。
 - `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.10、P3 Phase、P4.1–P4.7
   machine identity/enrollment/pairing/RemoteLink ingress/signed publication/persistent CLI/watch、production
   UDS/client/install/smoke、P4 automatic Phase Exit/静态 real-slot sentinel、P5.1 shared SessionSource facade、
-  P5.2 Keychain/crash-safe CryptoState 与文档结构检查入口。
+  P5.2 Keychain/crash-safe CryptoState、P5.3 WSS/SPKI pin/transfer assembler 与文档结构检查入口。
 - `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
   enrollment、daemon 本机 status/trust-reset、安全 uninstall purge、fingerprint-bound readback、
   portable signed root-lost purge receipt、P4.5 recovery-gated egress admission，以及 P4.6 persistent
@@ -96,7 +96,9 @@
   P0/P1/P2=0。P4.7 automatic Task 与 P4 automatic Phase Exit 已完成；P5.1 又建立共享
   `AgentDeckSessionSource` facade、typed state/receipt 与显式 SwiftPM/iOS product 依赖图；P5.2 已建立
   typed Apple Keychain account、ADCS v1 sealed state、counter/state Pending recovery、4096 replay window 与
-  marker-last paired store。P4–P6 按 Task 进度为 7/7、2/9、0/4。`p4-auto` 已 PASS；`p4` 仍不受支持，
+  marker-last paired store；P5.3 已建立 generation-scoped WSS、current/next DER-SPKI pin、bounded
+  incoming/writer 与 per-connection transfer assembler。P4–P6 按 Task 进度为 7/7、3/9、0/4。`p4-auto`
+  已 PASS；`p4` 仍不受支持，
   且 focused aggregate 本身不包含顶层
   Rust/Swift、最终 diff/status、冻结 hash 或双路 review。上述独立门禁与双路 review 已在
   pre-closeout candidate SHA-256
@@ -106,9 +108,9 @@
   `missingInputs` 与 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。Linux 只用 ephemeral test
   keys，macOS production persistent Keychain 不降级；root-lost 流程以 `RELAY_RUNBOOK.md` 为准。P3.1 方案 b、production-signed
   LaunchAgent/Keychain、物理设备与公网证据继续作为 post-MVP BLOCKED。P5 MVP 只以 iOS Simulator
-  自动 E2E 退出，本机第二客户端归 P6 synthetic DoD；P5.3–P5.9 与 P5 Phase Exit 仍未完成，P5.1/P5.2/P4
-  automatic complete 都不表示真实 iOS Companion、production-signed Keychain、第二台 Mac 或 destructive
-  purge 已完成。
+  自动 E2E 退出，本机第二客户端归 P6 synthetic DoD；P5.4–P5.9 与 P5 Phase Exit 仍未完成，P5.1–P5.3/P4
+  automatic complete 都不表示 process-global transfer budget、RelaySessionSource、真实 iOS Companion、
+  production-signed Keychain、第二台 Mac 或 destructive purge 已完成。
 
 ## 协议资料
 

@@ -212,7 +212,7 @@ module/build edge，避免生成重复 product wrapper。`CoreLinkTests` 会实�
 `FixtureSessionSource`（bundle 内 JSON 回放），旧 `MobileSessionSource`/models 要到 P5.5 才迁移。
 因此杀 app 仍会重置 fixture 状态，当前界面不依赖 daemon 或网络，也不构成真实 Relay 链路证据。
 
-## Relay Companion MVP 实施状态（P5.2 complete；P5 为 2/9）
+## Relay Companion MVP 实施状态（P5.3 complete；P5 为 3/9）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -240,7 +240,20 @@ quarantine + retire。receive replay 固定 4,096-entry window，并区分 exact
 paired marker 另用 `StoredPairedMachineRecordV1`，不复用 facade 的 `PairedMachine` 名称，也不保存
 grant/private key。自动门禁为 RelayClient `121 executed / 4 entitlement SKIP`、完整 Swift
 `649 XCTest / 4 SKIP + 35 Swift Testing`、iOS storage `5/5` 与全量 Simulator `26/26`；SKIP 不计 PASS。
-P5 当前只计 2/9；Relay source、旧 iOS fixture 迁移、WSS、AppKit registry、Simulator
+P5.3 已加入 generation-scoped `RelayWebSocketTransport`、三种互斥 TLS policy、current/next DER SPKI
+pin、全 redirect 拒绝、固定 Relay v2 Hello、Relay Ping/Pong、typed peer close 与
+`ServerRestarting` drain。普通 incoming/application writer 分别为 512 frames/16 MiB，另有
+urgent incoming 4 frames/8 MiB 与 control writer 8 frames/1 MiB reserve；aggregate 上界公开为
+516 frames/24 MiB 与 520 frames/17 MiB。connect 使用 waiter single-flight；attempt/write/physical cleanup
+分别有 30 秒/10 秒/5 秒 absolute deadline，正常 close 只有依次读回 task `didComplete` 与 session
+`didBecomeInvalid` 后才解除 generation 屏障，WebSocket `didClose` 本身不够。不合作 cleanup 会永久 poison
+当前 transport，迟到 generation 只能 force-close；write timeout 返回
+outcome unknown 且不能由迟到 timer 误杀新 generation。
+compact transfer assembler 固定 64 active、128 MiB/connection、5 分钟与 256 个 no-evict tombstone，完整
+length/hash 和 per-part replay hash 通过前不返回 payload。process-global 512 MiB/8,192 tombstone owner 留给
+P5.4 connection coordinator，P5.3 不宣称全局门禁已完成。
+
+P5 当前计 3/9；RelaySessionSource、旧 iOS fixture 迁移、AppKit registry、Simulator
 自动 Relay E2E 与 P5 Phase Exit 仍未完成。当前 SwiftPM runner 的 Data Protection Keychain 因缺 entitlement
 返回 `-34018`，真实 SecItem 用例明确 SKIP；iOS Simulator 也固定回报
 `CompleteUntilFirstUserAuthentication`，不能代替物理 iPhone 锁屏 readback。这两项继续留在 post-MVP
@@ -859,8 +872,9 @@ execution 已由 `c0ed6cd` / `f4141f0` / `fb1629a` 完成，B4 managed metadata 
 Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/test 提交分别为 `b818f81` / `d68cc02`。
 普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS。P3.10 LaunchAgent
 安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；基于 `9efb28d` 的独立 P3 Phase
-Exit 已完成；P4.1–P4.7 automatic Task 与 P4 automatic Phase Exit 已收口，P5.1 shared facade 与 P5.2
-crash-safe client storage 也已完成；P4–P6 按 Task 进度计为 7/7、2/9、0/4。`p4-auto` 已 PASS，`p4`
+Exit 已完成；P4.1–P4.7 automatic Task 与 P4 automatic Phase Exit 已收口，P5.1 shared facade、P5.2
+crash-safe client storage 与 P5.3 WSS/pin/transfer primitive 也已完成；P4–P6 按 Task 进度计为
+7/7、3/9、0/4。`p4-auto` 已 PASS，`p4`
 仍不受支持；完整 P4 Phase Exit 还由 pre-closeout candidate
 SHA-256 `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的顶层门禁和
 `spec/security`、`quality` 双路 Approved review 共同支撑，P0/P1/P2=0。P3.1 provisioned signed
