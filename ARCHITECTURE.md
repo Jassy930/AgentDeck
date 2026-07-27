@@ -65,7 +65,8 @@ agentdeckd
   assembler；P5.4 automatic Task 已接上 production `MachineConnection`/verified ingress、process-global
   transfer coordinator、bounded broadcaster/reducers、scoped `RelaySessionSource`、typed command 与 pairing
   handler；P5.5 已让 iOS fixture/ViewModel 直接实现并消费共享 `SessionSource`，同时把 canonical reducer
-  下沉到 `AgentDeckCore`。iOS 发行 composition 与 AppKit registry 仍分别属于 P5.6、P5.7/P5.8。
+  下沉到 `AgentDeckCore`；P5.6 又让 iOS Release composition 默认拥有真实 `RelaySessionSource`、完整邀请
+  配对与前后台冷恢复，fixture 仅留 Debug preview/test。AppKit registry 仍属于 P5.7/P5.8。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/local/`：当前为本地 Runtime v5 framing；它在 P4.2 Runtime v3 machine administration 与
@@ -778,8 +779,8 @@ conversation/key，不能伪造身份连续性。
   initializer；`ConversationSummary` 不携带 fixture-only `streamResource`。
 - P5.1 只完成 facade、公共模型、依赖图与 compile/link contract；当时旧 iOS
   `MobileSessionSource`/models/fixture 仍留在 app target。P5.5 已删除这套平行协议并迁移到共享
-  `SessionSource`，但 `SceneDelegate` 仍注入 preview/test fixture；因此 P5.1/P5.5 都不证明发行
-  Relay composition、真实 iOS 链路或 P5 Phase Exit。
+  `SessionSource`，但 P5.5 candidate 的 `SceneDelegate` 仍注入 preview/test fixture；因此 P5.1/P5.5 自身都不
+  证明发行 Relay composition。该切换已由后续 P5.6 完成，P5.9 真实 iOS Relay E2E 与 P5 Phase Exit 仍待完成。
 
 ### Relay Companion MVP P5.2 client CryptoState 不变量
 
@@ -880,7 +881,7 @@ conversation/key，不能伪造身份连续性。
 - paired record/marker 的内部 `ADPR`/`ADPM` codec 在 P5.4 增加 MachineRoot public key 与 Data certificate 后
   固定为 version 2；version 1 缺少重新验证 production connection 所需的信任材料，不能从 fingerprint 或 grant
   安全重建，因此只允许 fail-closed，不做猜测式迁移。该 hard cutover 仅覆盖尚未发布真实配对入口的 pre-MVP
-  developer artifact；production migration contract 必须在 P5.6 首次真实 pairing 发布前重新冻结。
+  developer artifact；P5.6 在首次 Release composition 发布前读回并继续冻结 version 2，未新增猜测迁移。
 - paired marker phase 保持 committed=0、cleanup=1，并新增 staged=2。PairResponse 后只允许原子写完整 staged
   credential；`list`、`load` 与 `openConnectionMaterial` 在 matching `PairRouteClosed` 前都必须隐藏，随后才以
   exact CAS 提升 committed。`relay.route.not_found` 即使精确关联 receipt frame，也可能只是 daemon 离线，不能
@@ -895,8 +896,9 @@ conversation/key，不能伪造身份连续性。
 
 - iOS 唯一数据协议已从 app 内私有 `MobileSessionSource` 切到共享 `SessionSource`；四组 ViewModel 只依赖
   facade model/receipt/connection state，不 import Relay wire、CryptoKit 或 concrete production source。
-  `FixtureSessionSource` 是 actor/Sendable 的 preview/test 实现，不是发行 source；`SceneDelegate` 的真实
-  Relay composition、扫码配对、credential lifecycle 与前后台恢复仍由 P5.6 接管。
+  `FixtureSessionSource` 是 actor/Sendable 的 preview/test 实现，不是发行 source；P5.5 收口时
+  `SceneDelegate` 的真实 Relay composition、扫码配对、credential lifecycle 与前后台恢复仍由 P5.6 接管，
+  后续已按独立 Task 完成。
 - `RuntimeConversationState` 与 canonical item/cursor projection 位于 `AgentDeckCore`，macOS、Relay client、
   fixture 与 iOS ViewModel 不再各自生成替代 identity。snapshot 原子替换 baseline；event 只接受 exact-next
   cursor、同 conversation 和稳定 item/entity/command binding；失败不得留下半更新。
@@ -948,8 +950,44 @@ conversation/key，不能伪造身份连续性。
 - P5.5 automatic 证据为顶层 Swift `980 XCTest / 4 skipped + 35 Swift Testing / 0 failure`，以及
   Core/Relay/protocol、Rust producer/store integrity、SessionDetail/fixture 与 fresh Simulator 门禁；精确命令
   和最终计数见 `docs/QUALITY.md`。
-  P5 进度为 5/9；P5.6–P5.9 与 P5 Phase Exit 仍未完成，真实公网、物理 iPhone、production-signed
-  Keychain、第二台 Mac 与真实 vendor 继续 post-MVP BLOCKED。
+  P5.5 收口时 P5 进度为 5/9，P5.6–P5.9 与 P5 Phase Exit 仍未完成；后续 P5.6 已按下节独立收口。
+  真实公网、物理 iPhone、production-signed Keychain、第二台 Mac 与真实 vendor 继续 post-MVP BLOCKED。
+
+### Relay Companion MVP P5.6 iOS production composition / pairing lifecycle 不变量
+
+- Release `SceneDelegate` 只能通过 `CompositionRoot.production()` 构造真实 `RelaySessionSource`；
+  `FixtureSessionSource` 的 launch argument、解析和安装入口全部位于 `#if DEBUG`，Release binary 不得出现
+  `--agentdeck-fixture-source`、`installFixtureSource` 或 `usesFixtureSource` 字符串。UI 继续只消费
+  `SessionSource`，不 downcast concrete source，也不拼 Relay/crypto bytes。
+- iOS app state 固定在当前用户 Application Support 的 `AgentDeck/clients/ios-app`。installation identity 是
+  canonical、非全零 UUID，重复打开保持不变；根目录/identity file 分别固定 0700/0600、Complete protection
+  与 backup exclusion，损坏记录 fail-close，不静默轮换。Simulator 不能替代 production-signed Keychain 或
+  物理 iPhone 锁屏下的 data-protection readback。
+- 输入只接受去除首尾空白后的完整 `agentdeck-pair:v1:` base64url 邀请，UTF-8 上限 8 KiB；短 PIN、错误
+  version/expiry/WSS URL/server ID/pin/root fingerprint 都在本地 inspect 阶段拒绝。inspect 只展示完整机器名、
+  Relay host、MachineRoot fingerprint 与 current/next pin trust preview，用户显式确认前不得创建网络连接。
+- `AVCaptureSession` 的配置、start 与 stop 只在专用串行 capture queue 执行；每次扫码页 appearance 生成 exact
+  visibility UUID，且只有 view visible + scene active 才能持有；scene deactivation 同步失效并排队 exact stop，
+  reactivation 必须新建 generation。metadata proxy 固定携带 UUID 回 MainActor，并在 metadata queue barrier 后才
+  释放；迟到权限回调、start completion、旧 metadata 与旧 stop 不能启动、停止或提交新 generation 的邀请。
+- Pairing ViewModel 每次 operation 持有唯一 ID，所有 progress/state 写入和 task-slot 清理都要求 exact ID；
+  旧 `pair()` 在返回 progress stream 前迟到取消，不能 ABA 清空 replacement。production pairing handler 的
+  latest-wins admission 必须 cancel、主动关闭并 join 全部旧 worker/WSS，才允许读取 replacement durable state
+  或创建新 transport；consumer cancellation、未消费 stream 与 app shutdown 都走 exact transport cleanup。
+- `CompositionRoot` 是 scene 内唯一 source owner。UIKit callback 先同步 capture foreground/background intent
+  revision，再由单一 FIFO worker fulfill；旧 opening 或迟到 foreground 只能 shutdown/join，不能覆盖较新
+  background。后台主动停止 WSS 且不申请 background execution mode；回前台必须等待旧 generation 完整
+  teardown，再 cold-open 新 source，由 `RelaySessionSource` 执行 outer + inner resume。
+- `RevocationReceipt.committed` 只表示 daemon durable 接收请求，不能删除本机材料；只有 machines stream 的
+  verified `.revoked` terminal 才删除 exact paired record。离线 local forget 每一层确认及最终删除入口都复核
+  `.relayUnavailable/.machineOffline` 资格，重连会取消 destructive flow 并释放 UIKit presentation gate；每代
+  manager 只持有 exact paired-record snapshot，旧 generation 不能按 machine ID 删除新 pairing。
+- P5.6 automatic 证据为 focused Pairing/AppLifecycle/ViewController `42/42`、fresh iOS Simulator
+  `133/133`、RelayClient `445 executed / 4 entitlement SKIP`、顶层 Swift
+  `985 XCTest / 4 skipped + 35 Swift Testing / 0 failure`，以及 Release generic Simulator build、fixture
+  surface scan、strict Swift format、agent docs 与 diff 门禁。P5 当前为 6/9；P5.7–P5.9 与 P5 Phase Exit、
+  真实 temp Relay 编排、公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 与
+  destructive purge 均未由本 Task 证明。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 

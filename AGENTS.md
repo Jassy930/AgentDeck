@@ -27,7 +27,10 @@
 - `protocol/` 中 Codex schema 必须来自官方 `codex app-server generate-json-schema`，不要手写或逆向猜测协议（K8）。
 - AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）；CC 原生 history/session 文件仍是唯一权威事实源。仅允许 Runtime DB 的 `claude_code_adapter_state` 保存 StorageKEK 保护、可从本机唯一 regular/non-memory native JSONL 明确重建的 `adapterStateKey → session id` 派生索引；不按 title/cwd/mtime 猜旧 key，不保存 title/archive/status/transcript，不建 `cc-meta/`，不进入 common catalog、日志、Relay 或客户端 wire（K9、N8）。
 - AgentDeck stable run record 与 diagnostic log 固定写入当前 EUID 的 OS account home 下 `Library/Application Support/AgentDeck/`；ephemeral 实例写入随机 0700 temp namespace，均不得写入用户项目 git（K5）。
-- `Sources/AgentDeckCore/` 是 macOS/iOS 共享的平台无关层，禁止 import AppKit/UIKit；`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是共享 `SessionSource`；当前发行 composition 仍注入 `FixtureSessionSource`，真实 Relay composition 属后续 P5.6（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
+- `Sources/AgentDeckCore/` 是 macOS/iOS 共享的平台无关层，禁止 import AppKit/UIKit；`ios/` 是 UIKit companion
+  前端，唯一数据入口是共享 `SessionSource`。P5.6 后 Release composition 默认构造真实
+  `RelaySessionSource`，`FixtureSessionSource` 只允许 Debug preview/test；P5.9 的固定拓扑 Relay E2E 与真实
+  外部设备/公网门禁仍不得由注入测试冒充（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
 
 ## 工作规则
 

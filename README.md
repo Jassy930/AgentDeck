@@ -178,9 +178,11 @@ cargo build --release -p agentdeck-cli  # 产出 target/release/agentdeck
 swift build -c release           # 产出 .build/release/AgentDeck
 ```
 
-## iOS Companion（共享 SessionSource 已接入，发行 composition 仍由 fixture 驱动）
+## iOS Companion（发行 composition 已接真实 Relay；fixture 仅限 Debug preview/test）
 
-AgentDeck Mobile 是与 macOS 主客户端配套的 iPhone companion，用协议对齐的 fixture 回放代替真实链路，在模拟器上完整跑通 R3 companion 界面骨架，接 Relay 时 UI 层零迁移。
+AgentDeck Mobile 是与 macOS 主客户端配套的 iPhone companion。发行路径由真实 `RelaySessionSource`
+驱动；协议对齐的 fixture 只保留给 Debug preview/test。P5.6 已接入扫码/完整邀请粘贴、显式信任确认、
+本机配对材料管理和前后台冷恢复，但真实 synthetic Relay 编排仍由 P5.9 单独验收。
 
 `ios/` 目录结构：
 
@@ -199,7 +201,7 @@ ios/
 前置依赖：Xcode 16+（iOS 17 模拟器），`brew install xcodegen`。
 
 ```bash
-# iOS 工程生成 + 构建 + 单测（fixture 驱动，无真实链路）
+# iOS 工程生成 + 构建 + 单测（注入 fake transport；不等于真实公网链路）
 cd ios && xcodegen generate && \
   xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
     -destination 'platform=iOS Simulator,name=iPhone 17' test
@@ -212,11 +214,15 @@ module/build edge，避免生成重复 product wrapper。`CoreLinkTests` 会实�
 `MobileSessionSource`/models，并把四组 ViewModel、cell 与 input 状态机迁到同一 facade。bundle 内五份
 fixture 现以 canonical `ConversationSnapshotV2` + `RuntimeEventV2` 回放，复用下沉到
 `AgentDeckCore` 的 `RuntimeConversationState`/canonical projection；`FixtureSessionSource` 是
-actor/Sendable、有界 observation 的 preview/test 实现。当前 `SceneDelegate` 仍直接注入该 fixture，发行
-composition、真实配对与前后台恢复属于 P5.6。因此杀 app 仍会重置 fixture 状态，当前界面不依赖 daemon
-或网络，也不构成真实 Relay 链路证据。
+actor/Sendable、有界 observation 的 preview/test 实现。P5.6 的 `CompositionRoot` 已让 Release
+`SceneDelegate` 默认从 `Application Support/AgentDeck/clients/ios-app` 的持久 installation identity 与
+paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口只在 `#if DEBUG` 可达，Release binary
+不含该降级面。进入后台会 shutdown/join 当前 source、pairing worker 与 WSS，回前台创建新 generation，
+由 outer cursor 与 inner event sequence 继续恢复；本期仍不申请后台常驻或 APNs。扫码/粘贴只接受完整
+`agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
+不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Companion MVP 实施状态（P5.5 automatic complete；P5 为 5/9）
+## Relay Companion MVP 实施状态（P5.6 automatic complete；P5 为 6/9）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -328,14 +334,26 @@ P5.5 以 52 个 code/test/fixture path 的 content manifest
 Error-contract matrix，顶层 `swift test` 为 `980 XCTest / 4 skipped + 35 Swift Testing / 0 failure`，
 warnings-as-errors focused 为 `91/91`，fresh iOS Simulator 为 `91/91`。matching canonical Failed 先于
 accepted/replayed receipt 到达时会收敛并恢复 draft；fixture 单条 Failed 只推进一次资源 revision。最终
-Rust/文档门禁结果见 `docs/QUALITY.md`。P5 当前为 5/9；P5.6–P5.9、发行
-`SceneDelegate` composition、AppKit registry、
-Simulator 自动 Relay E2E 与 P5 Phase Exit 仍未完成。
+Rust/文档门禁结果见 `docs/QUALITY.md`。P5.5 收口时 P5 为 5/9；当时 P5.6–P5.9、发行
+`SceneDelegate` composition、AppKit registry、Simulator 自动 Relay E2E 与 P5 Phase Exit 均未完成。
 当前 SwiftPM runner 的 Data Protection Keychain 因缺 entitlement
 返回 `-34018`，真实 SecItem 用例明确 SKIP；iOS Simulator 也固定回报
 `CompleteUntilFirstUserAuthentication`，不能代替物理 iPhone 锁屏 readback。这两项继续留在 post-MVP
 production-signed/物理设备槽位。真实公网 WSS、第二台 Mac 与真实 Codex/Claude Code vendor 同样继续
 `BLOCKED`，不得写成 PASS。
+
+P5.6 已把 Release composition 切到真实 `RelaySessionSource`，并完成完整 PairInvite 本地检查、QR/粘贴、
+信任预览、用户确认后才联网、exact invite retry、signed terminal 后删 key、离线双重确认 local forget，
+以及前后台 source generation 冷重建。配对采用 latest-wins admission：replacement 必须 cancel、关闭并 join
+旧 worker/WSS 后才创建新 transport；ViewModel 另以 operation identity 防止迟到旧任务 ABA 清空新任务槽位。
+场景 lifecycle callback 会同步 capture intent，再由单一 FIFO worker 执行，迟到 foreground 不能覆盖较新
+background。QR capture 的配置/start/stop 固定在专用串行队列；只有页面可见且 scene active 时才持有 exact
+UUID，scene deactivation 会立即失效并排队 stop，重新激活生成新代。迟到的权限、start completion、metadata
+或 stop 都不能影响新 generation。fresh automatic 证据为 P5.6 focused `42/42`、iOS Simulator `133/133`、RelayClient
+`445 executed / 4 entitlement SKIP`、顶层 Swift `985 XCTest / 4 skipped + 35 Swift Testing / 0 failure`，
+Release generic Simulator build 与 fixture-surface 静态扫描均通过。P5 当前为 6/9；P5.7–P5.9 与 P5 Phase
+Exit 仍未完成，真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 与
+destructive purge 继续 post-MVP `BLOCKED`。
 P3.10 已由 code/test commit `19622ab` 完成 Task 收口：当时把 Runtime schema 推进到 v7，并新增 authenticated machine-wide
 `admin_commands` ledger，并实现 30 天 retention、容量准入、exact replay/conflict 与 COMMIT-unknown
 收敛；`StageUpgrade` 只有在 exact reply 完整 flush ACK 后才 arm，随后经 active→idle fence、候选
@@ -953,14 +971,14 @@ Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/tes
 安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；基于 `9efb28d` 的独立 P3 Phase
 Exit 已完成；P4.1–P4.7 automatic Task 与 P4 automatic Phase Exit 已收口，P5.1 shared facade、P5.2
 crash-safe client storage、P5.3 WSS/pin/transfer primitive 与 P5.4 MachineConnection/bounded source
-automatic Task 已完成；P5.5 又完成 shared SessionSource/canonical fixture 与 receipt UI 迁移。P4–P6 按
-Task 进度计为 7/7、5/9、0/4。`p4-auto` 已 PASS，`p4`
+automatic Task 已完成；P5.5 又完成 shared SessionSource/canonical fixture 与 receipt UI 迁移，P5.6 已完成
+iOS 发行 Relay composition、production pairing UI 与前后台生命周期。P4–P6 按 Task 进度计为 7/7、6/9、0/4。`p4-auto` 已 PASS，`p4`
 仍不受支持；完整 P4 Phase Exit 还由 pre-closeout candidate
 SHA-256 `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的顶层门禁和
 `spec/security`、`quality` 双路 Approved review 共同支撑，P0/P1/P2=0。P3.1 provisioned signed
 Keychain roundtrip 继续是 post-MVP BLOCKED 槽位，不阻塞 automatic closeout；P5/P6 物理设备/公网/Linux
-证据也是 post-MVP，不冒充 PASS。P4 automatic complete 不表示 production-signed remote `watch`、真实
-iOS Companion、第二台 Mac 或 destructive purge 已完成。
+证据也是 post-MVP，不冒充 PASS。P5.6 automatic complete 只证明 production composition 与注入测试路径，
+不表示公网 WSS、物理 iPhone、第二台 Mac、真实 vendor 或 destructive purge 已完成。
 具体命令与资源矩阵见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## agentdeck CLI（参考客户端 / E2E 驱动）

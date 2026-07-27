@@ -1085,9 +1085,10 @@ Protection Keychain 且没有 file/dev keystore 降级。MachineRoot 丢失按
 [`RELAY_RUNBOOK.md` 的 portable purge receipt 流程](RELAY_RUNBOOK.md#machineroot-丢失后的-portable-purge-receipt)
 处理；static sentinel 不生成 receipt，也不提供删除授权。
 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与
-destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade、P5.2 crash-safe client storage 与 P5.3
-WSS/pin/per-connection transfer primitive 已完成；P5.4 MachineConnection/bounded source automatic Task 也已
-完成，P5.5 canonical fixture/receipt UI automatic Task 又已收口，P5/P6 当前进度为 5/9、0/4。
+destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade、P5.2 crash-safe client storage、P5.3
+WSS/pin/per-connection transfer primitive、P5.4 MachineConnection/bounded source、P5.5 canonical
+fixture/receipt UI 与 P5.6 iOS production composition/pairing lifecycle automatic Task 已收口，P5/P6 当前
+进度为 6/9、0/4。P5.6 automatic 证据不替代 P5.9 fixed-topology Relay E2E 或任何外部门禁。
 
 #### P5.2 client storage / counter / replay failure
 
@@ -1168,9 +1169,9 @@ route/counter 或扩大 buffer 来“恢复”。
 
 若 pre-MVP developer Keychain 中仍有 `ADPR`/`ADPM` version 1 paired marker，P5.4 cold open 会返回
 `PairedMachineStoreError.invalidRecord` 并保持零迁移、零自动删除。version 1 没有 MachineRoot public key 与
-Data certificate，无法从 fingerprint/grant 安全重建；因此不要手改 marker 或降级验证。该 artifact 尚未通过
-P5.6 真实 pairing 入口发布，当前恢复方式只能是在明确授权后清理对应 developer state 并重新配对；正式升级/
-migration contract 必须在 P5.6 首次发布前冻结。
+Data certificate，无法从 fingerprint/grant 安全重建；因此不要手改 marker 或降级验证。P5.6 Release composition
+发布前已复核并继续冻结 version 2 hard cutover：v1 developer artifact 不是受支持的 migration input，当前恢复
+方式只能是在明确授权后清理对应 developer state 并重新配对。
 
 resource observation 只保留 newest-one；conversation observer cap 为 64、每 observer queue 为 512。第 65 个
 observer 只拒绝 offending admission，不能重启已有 observation。process-shared transfer budget 必须在
@@ -1197,7 +1198,7 @@ expiry 清理，合法 partial promotion 仍精确回滚。
 2026-07-27 的非门控 Instruments Allocations smoke 启动 `dist/AgentDeck.app --selfcheck`，exit 0、duration
 2.639832 秒；trace 只在 `/tmp/agentdeck-p54-instruments.rt5Mo5/p54-agentdeck-selfcheck.trace`，不得提交。
 它不是 RelaySessionSource 长跑、真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac 或真实
-vendor 证据。后续 P5.5 已独立完成 iOS facade/fixture/receipt 迁移；P5.6–P5.9 与 P5 Phase Exit 继续未完成。
+vendor 证据。P5.4 收口后，P5.5、P5.6 已分别独立完成；当前 P5.7–P5.9 与 P5 Phase Exit 继续未完成。
 
 #### P5.5 iOS canonical / receipt 乱序诊断
 
@@ -1237,10 +1238,21 @@ Runtime v5 没有为本次收紧升级 wire version：commandless Error 保留 d
 只允许 Store-owned fixed Failed terminal。若 fixture、Relay 或 macOS 把前者投影为 failed inbox/turn terminal，
 或把后者留在 active turn 后继续接收下一 `TurnStarted`，都属于同 candidate 的 reducer bug。
 
-当前 `SceneDelegate` 仍注入 `FixtureSessionSource`；因此 Simulator 中看到 connected、prompt、approval 或
-reconnect UI 只证明 P5.5 presentation/fixture 语义，不证明发行 `RelaySessionSource` composition。真实 composition
-属于 P5.6，真实公网 WSS、物理 iPhone、production-signed Keychain、第二台 Mac 与真实 vendor 继续
-post-MVP BLOCKED；P5 Phase Exit 未完成。
+#### P5.6 iOS production composition / pairing lifecycle 诊断
+
+P5.5 candidate 当时的 `SceneDelegate` 仍注入 `FixtureSessionSource`；因此该 Task 的 connected、prompt、
+approval 或 reconnect UI 只证明 presentation/fixture 语义。P5.6 已把 Release composition 切到真实
+`RelaySessionSource`，fixture 只在 Debug preview/test 可达；若普通 Release 启动仍出现 fixture machine，或
+Release binary 命中 fixture launch/install 字符串，应按 packaging/security regression 处理。P5.7–P5.9 与
+P5 Phase Exit 是 automatic 必做项，当前仍未完成；其中 P5.9 必须跑 fixed-topology Simulator Relay E2E，不能
+标成 post-MVP BLOCKED。真实公网 WSS、物理 iPhone、production-signed Keychain、第二台 Mac、真实 vendor 与
+destructive purge 才继续属于 post-MVP `BLOCKED`。
+
+若扫码页离开、scene deactivation 或重新激活后仍被旧权限回调、start completion、metadata 或 stop 改写，应按
+capture generation 隔离回归处理：配置/start/stop 必须只在专用串行队列执行，只有 view visible + scene active
+才持有 exact UUID；metadata proxy 要保留到 metadata queue barrier 后，MainActor 仅在 UUID 仍属于当前
+generation 时更新 UI 或提交邀请。Simulator 自动门禁不替代物理 iPhone 的相机权限、交互式返回与锁屏
+data-protection readback。
 
 #### Trust reset 与本地 cleanup
 

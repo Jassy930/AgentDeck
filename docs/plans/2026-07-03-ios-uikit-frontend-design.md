@@ -1,16 +1,16 @@
-# AgentDeck iOS UIKit 前端设计（fixture 驱动，先前端后链路）
+# AgentDeck iOS UIKit 前端设计（原 fixture 前端基线；P5.6 已接 production composition）
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Implemented（P5.5 automatic；发行 composition 待 P5.6） |
+| 状态 | Implemented（P5.6 automatic complete；P5.9 Relay E2E 待完成） |
 | 日期 | 2026-07-03 |
-| 最近更新 | 2026-07-27 |
-| 主题 | iOS UIKit companion 前端骨架，用 canonical SessionSource fixture 回放代替真实链路 |
+| 最近更新 | 2026-07-28 |
+| 主题 | iOS UIKit companion；fixture 基线保留给 Debug preview/test，Release 使用真实 RelaySessionSource composition |
 | 关联 | `NORTH_STAR.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、`designs/agentdeck-design-system/` |
 
 ## 1. 背景和用户问题
 
-`2026-07-01-agentdeck-mobile-relay-design.md` 已确认手机端方向：薄 Relay + `agentdeckd` remote mode + iOS UIKit companion，原路线是 R0-R2 先做服务端、R3 再做 iOS。本设计把 R3 的**前端部分提前**：不等 Relay 与 remote mode，先用协议对齐的 fixture 回放把 iOS UIKit 界面骨架完整跑起来，验证产品形态与渲染语义；真实链路（配对、网络、通知、实机）后置。
+`2026-07-01-agentdeck-mobile-relay-design.md` 已确认手机端方向：薄 Relay + `agentdeckd` remote mode + iOS UIKit companion，原路线是 R0-R2 先做服务端、R3 再做 iOS。本设计把 R3 的**前端部分提前**：当时先用协议对齐的 fixture 回放把 iOS UIKit 界面骨架完整跑起来，验证产品形态与渲染语义。后续 P5.6 已接入 Release production composition、配对网络与 lifecycle；P5.9 真实 Relay/daemon 固定拓扑 E2E、通知和实机仍后置。
 
 ## 2. 目标
 
@@ -20,11 +20,12 @@
 - 把平台无关的协议类型与会话模型抽成共享 SPM 库，macOS / iOS 共同依赖，边界由编译器保证。
 - iOS 视觉沿用 `designs/agentdeck-design-system` 同一份 token SSOT。
 
-## 3. 非目标
+## 3. 原始非目标与后续边界
 
-- 不做 Relay、remote mode、任何网络代码或 daemon 直连。
-- 不做真实扫码配对、相机权限、APNs 推送。
-- 不做数据持久化（杀 app 重置 fixture 状态）。
+- 2026-07-03 的 fixture 前端切片不做 Relay、remote mode、网络、真实扫码或数据持久化；这些原始边界已由
+  P5.2–P5.6 的共享 client、Release Relay composition、QR/完整邀请配对与 paired-state 持久化增量取代。
+- 仍不做 APNs、后台常驻、离线 transcript 数据库或由 iOS 直连 daemon；后台固定停止 WSS，回前台 cold
+  rebuild source 后 resume。
 - 不做 iPad 适配、横屏、明暗主题切换。
 - 不做 iOS 端编辑器、文件浏览器、Git 面板（沿用 relay 设计的 companion 边界）。
 
@@ -63,9 +64,9 @@
 
 - `AgentDeckCore` 只含 Foundation/Observation 代码，不得 import AppKit/UIKit；canonical item/cursor projection
   与 `RuntimeConversationState` 已下沉至此，macOS、Relay client 与 iOS 共用同一 reducer。
-- iOS app 的唯一数据入口是共享 `SessionSource`；`FixtureSessionSource` 只用于 preview/test。production
-  `RelaySessionSource` 已在共享 client target 存在，但当前 `SceneDelegate` 的发行 composition 切换、真实配对
-  与生命周期接线属于 P5.6，视图层不应 downcast concrete source。
+- iOS app 的唯一数据入口是共享 `SessionSource`；`FixtureSessionSource` 只用于 Debug preview/test。P5.6 后
+  Release `SceneDelegate` 默认通过 `CompositionRoot.production()` 构造
+  `RelaySessionSource(.allPairedMachines)`；视图层不得 downcast concrete source。
 - 会话渲染路径按 `SessionCapabilities` 路由，禁止 `if agentKind == .codex` 硬编码分支（沿用 N2）。
 - vendor 原词（审批文案、徽章）原样展示，不强行统一语义。
 
@@ -92,7 +93,10 @@
    归并，不在点击时直接假定成功。
 5. **prompt 输入栏**：固定底部、多行增高；发送后显示绑定 idempotency key 的本地 pending row，收到
    Accepted/Replayed 后按 commandID 等待 canonical user item 并替换，fixture 再回一条 assistant 响应。
-6. **配对屏**（modal）：扫码区域 UI 占位（不接相机）+ 手动粘贴配对码 + 已配对设备列表与注销按钮，全部假数据。
+6. **配对屏**（modal）：原 fixture 前端切片只有扫码占位、手动粘贴与假设备；P5.6 已接入真实相机 QR、完整
+   PairInvite 粘贴、信任预览、用户确认后联网，以及 verified revoke / 离线 local forget。相机配置/start/stop
+   在专用串行队列执行；只有 view visible + scene active 才持有 exact UUID，scene deactivation/activation 形成
+   stop/new generation，UUID 同时约束 start、metadata 与 stop。短 PIN 仍不支持。
 7. **收件箱**：app 内事件列表（等待审批、turn 完成、失败），点击跳转对应会话。不做 APNs。
 
 ## 7. 数据流与 fixture
@@ -143,9 +147,10 @@ fixture 场景清单（bundle 内按场景分文件）：
 - 失败会话：中途报错的错误态。
 - 空状态：无会话的机器。
 
-fixture 状态机：source 内存维持 canonical snapshot、exact-next cursor、prompt/approval idempotency replay 与
+Debug fixture 状态机：source 内存维持 canonical snapshot、exact-next cursor、prompt/approval idempotency replay 与
 有界 transcript。审批连续发布 `Claimed → Applying → Applied` 后返回 Applied receipt；prompt 返回
-Accepted/Replayed，再发布同 commandID 的 canonical user/assistant/terminal。切屏返回状态保持，杀 app 重置。
+Accepted/Replayed，再发布同 commandID 的 canonical user/assistant/terminal。切屏返回状态保持；只有 fixture
+状态会在杀 app 后重置，production paired material 位于固定 Application Support/Keychain namespace。
 
 ## 8. 设计系统对接
 
@@ -160,7 +165,9 @@ Accepted/Replayed，再发布同 commandID 的 canonical user/assistant/terminal
   event；fixture 是 canonical contract 的检验点，坏了必须立刻可见。
 - 暂态断流显示 Relay unavailable / machine offline / reconnecting / lagged；revoked、incompatible、
   securityError 是不可逆 terminal，取消 observation、prompt 与 approval task 并禁止后续操作。
-- 本期无网络与磁盘日志需求；不写入 `~/Library/Application Support/AgentDeck/`。
+- 原 fixture 前端切片没有网络，也不写 Application Support。P5.6 production composition 已使用 WSS，并把
+  installation identity、paired-state 文件固定到当前用户 `Library/Application Support/AgentDeck/clients/ios-app`；
+  vendor token、Relay DB、运行日志与用户项目数据仍不得写入该目录或项目 git。
 
 ## 10. 测试与验收标准
 
@@ -218,15 +225,16 @@ DerivedData iOS Simulator 与 Rust fixed Error producer/integrity 的精确计�
 2. **DesignTokens 实名**：iOS `DesignTokens.swift` 生成的语义色实名为 `text`、`text2`、`surface`（来自设计 SSOT `tokens.json` 的实际 key），设计期草案内文描述曾引用 `fg`/`fgMuted`/`bgRaised` 作为占位名称，以生成物为准。
 3. **强制暗色**：iOS app 在 `SceneDelegate` 中对 `UIWindow` 设置 `overrideUserInterfaceStyle = .dark`，与 macOS 端设计风格一致（纯暗色 token 设计，本期不做明暗切换）。
 4. **VM 未用 @Observable**：实现为普通 `@MainActor` class + `onUpdate` 闭包（UIKit 无自动观察，四屏一致），设计文档 §7 中"每屏一个 `@Observable` view model"的描述属于草案占位，以实现为准。
-5. **typed 断流/终态 presentation 已实现，真实重连未接线**：四组 ViewModel 能区分暂态与 fatal state；
-   当前 `SceneDelegate` 仍注入 fixture，因此真实 WSS 重连与发行 lifecycle 证据后置到 P5.6/P5.9。
+5. **typed 断流/终态 presentation 与 production lifecycle 已分阶段接线**：P5.5 的四组 ViewModel 能区分
+   暂态与 fatal state；P5.6 又完成 Release `RelaySessionSource` composition、background shutdown/join 与
+   foreground cold generation。固定拓扑 Relay/daemon E2E 仍后置到 P5.9。
 6. **机器卡片「最近心跳」字段本期未在 UI 展示**：`MachineSummary` 中已计算 `lastHeartbeat` 字段，但本期 UI 未展示，待 Relay 接入后随真实心跳数据一起在机器卡片显示。
 
 ## 12. 后续衔接
 
-- P5.6 新增发行 composition root，把 `SceneDelegate` 从 preview/test `FixtureSessionSource` 切到既有
-  `RelaySessionSource`，并接真实扫码、credential 与前后台 lifecycle；不恢复或复制
-  `MobileSessionSource`。
+- P5.6 已新增发行 composition root，把 `SceneDelegate` 从 preview/test `FixtureSessionSource` 切到既有
+  `RelaySessionSource`，并接完整邀请扫码/粘贴、credential 管理与前后台 lifecycle；未恢复或复制
+  `MobileSessionSource`。fixture launch argument 与安装入口只在 Debug 编译。
 - 收件箱升级为 APNs 通知入口（沿用 relay 设计的通知 hook）。
 - P5.9 在 fresh temp Relay + 真实 P4 daemon RemoteLink + synthetic vendor adapter + production Swift client +
   iOS Simulator 固定拓扑验收真实 source composition；物理 iPhone、公网、production-signed Keychain、第二

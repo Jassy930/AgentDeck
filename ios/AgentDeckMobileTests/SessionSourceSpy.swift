@@ -30,9 +30,44 @@ actor SessionSourceSpy: SessionSource {
     case suspended
   }
 
+  enum PairInviteInspectionBehavior: Sendable {
+    case immediate(PairingPreview)
+    case failure(SessionSourceFailure)
+    case suspended
+  }
+
+  enum PairingBehavior: Sendable {
+    case finished([PairingProgress])
+    case failure(SessionSourceFailure)
+    case suspended
+    case suspendedBeforeStream
+  }
+
+  enum RevocationBehavior: Sendable {
+    case immediate(RevocationReceipt)
+    case failure(SessionSourceFailure)
+    case suspended
+  }
+
   private struct PendingApprovalContinuation {
     let approvalID: String
     let continuation: CheckedContinuation<ApprovalReceipt, any Error>
+  }
+
+  private struct PendingInspectionContinuation {
+    let encodedInvite: String
+    let continuation: CheckedContinuation<PairingPreview, any Error>
+  }
+
+  private struct PendingPairingContinuation {
+    let encodedInvite: String
+    let continuation:
+      CheckedContinuation<AsyncThrowingStream<PairingProgress, any Error>, any Error>
+  }
+
+  private struct PendingRevocationContinuation {
+    let machineID: String
+    let continuation: CheckedContinuation<RevocationReceipt, any Error>
   }
 
   private var machineContinuation: AsyncStream<ResourceState<[MachineSummary]>>.Continuation?
@@ -52,6 +87,13 @@ actor SessionSourceSpy: SessionSource {
   private var promptCalls: [PromptCall] = []
   private var approvalCalls: [ApprovalCall] = []
   private var retryApprovalIDs: [String] = []
+  private var inspectionCalls: [String] = []
+  private var pairingCalls: [String] = []
+  private var revocationCalls: [String] = []
+  private var pairingTerminations = 0
+  private var shutdowns = 0
+  private var shutdownSuspended = false
+  private var shutdownContinuation: CheckedContinuation<Void, Never>?
 
   private var commandBehavior: CommandBehavior = .immediate(
     .accepted(
@@ -66,9 +108,23 @@ actor SessionSourceSpy: SessionSource {
   private var retryBehavior: ApprovalBehavior = .immediate(
     .applied(RuntimeApprovalID(rawValue: "approval-default"))
   )
+  private var inspectionBehavior: PairInviteInspectionBehavior = .failure(
+    SessionSourceFailure(code: .invalidPairInvite)
+  )
+  private var pairingBehavior: PairingBehavior = .failure(
+    SessionSourceFailure(code: .invalidPairInvite)
+  )
+  private var revocationBehavior: RevocationBehavior = .failure(
+    SessionSourceFailure(code: .unknown)
+  )
   private var pendingCommand: CheckedContinuation<CommandReceipt, any Error>?
   private var pendingApprovals: [PendingApprovalContinuation] = []
   private var pendingRetry: CheckedContinuation<ApprovalReceipt, any Error>?
+  private var pendingInspections: [PendingInspectionContinuation] = []
+  private var pendingPairings: [PendingPairingContinuation] = []
+  private var pairingContinuations: [AsyncThrowingStream<PairingProgress, any Error>.Continuation] =
+    []
+  private var pendingRevocations: [PendingRevocationContinuation] = []
 
   func machines() async -> AsyncStream<ResourceState<[MachineSummary]>> {
     machineSubscriptions += 1
@@ -123,22 +179,58 @@ actor SessionSourceSpy: SessionSource {
   }
 
   func inspectPairInvite(_ encoded: String) async throws -> PairingPreview {
-    _ = encoded
-    throw SessionSourceFailure(code: .invalidPairInvite)
+    inspectionCalls.append(encoded)
+    switch inspectionBehavior {
+    case .immediate(let preview):
+      return preview
+    case .failure(let error):
+      throw error
+    case .suspended:
+      return try await withCheckedThrowingContinuation { continuation in
+        pendingInspections.append(
+          PendingInspectionContinuation(
+            encodedInvite: encoded,
+            continuation: continuation
+          )
+        )
+      }
+    }
   }
 
   func pair(
     _ encodedInvite: String
   ) async throws -> AsyncThrowingStream<PairingProgress, any Error> {
-    _ = encodedInvite
-    return AsyncThrowingStream { continuation in
-      continuation.finish(throwing: SessionSourceFailure(code: .invalidPairInvite))
+    pairingCalls.append(encodedInvite)
+    if case .suspendedBeforeStream = pairingBehavior {
+      return try await withCheckedThrowingContinuation { continuation in
+        pendingPairings.append(
+          PendingPairingContinuation(
+            encodedInvite: encodedInvite,
+            continuation: continuation
+          )
+        )
+      }
     }
+    return makePairingStream(behavior: pairingBehavior)
   }
 
   func revokeSelf(machineID: String) async throws -> RevocationReceipt {
-    _ = machineID
-    throw SessionSourceFailure(code: .unknown)
+    revocationCalls.append(machineID)
+    switch revocationBehavior {
+    case .immediate(let receipt):
+      return receipt
+    case .failure(let error):
+      throw error
+    case .suspended:
+      return try await withCheckedThrowingContinuation { continuation in
+        pendingRevocations.append(
+          PendingRevocationContinuation(
+            machineID: machineID,
+            continuation: continuation
+          )
+        )
+      }
+    }
   }
 
   func sendPrompt(
@@ -244,6 +336,18 @@ actor SessionSourceSpy: SessionSource {
     retryBehavior = behavior
   }
 
+  func setInspectionBehavior(_ behavior: PairInviteInspectionBehavior) {
+    inspectionBehavior = behavior
+  }
+
+  func setPairingBehavior(_ behavior: PairingBehavior) {
+    pairingBehavior = behavior
+  }
+
+  func setRevocationBehavior(_ behavior: RevocationBehavior) {
+    revocationBehavior = behavior
+  }
+
   func completeCommand(with receipt: CommandReceipt) {
     pendingCommand?.resume(returning: receipt)
     pendingCommand = nil
@@ -281,6 +385,103 @@ actor SessionSourceSpy: SessionSource {
     pendingRetry = nil
   }
 
+  func completeInspection(
+    encodedInvite: String,
+    with preview: PairingPreview
+  ) {
+    guard
+      let index = pendingInspections.firstIndex(where: {
+        $0.encodedInvite == encodedInvite
+      })
+    else { return }
+    pendingInspections.remove(at: index).continuation.resume(returning: preview)
+  }
+
+  func failInspection(
+    encodedInvite: String,
+    with error: any Error
+  ) {
+    guard
+      let index = pendingInspections.firstIndex(where: {
+        $0.encodedInvite == encodedInvite
+      })
+    else { return }
+    pendingInspections.remove(at: index).continuation.resume(throwing: error)
+  }
+
+  func completePairingBeforeStream(encodedInvite: String) {
+    guard
+      let index = pendingPairings.firstIndex(where: {
+        $0.encodedInvite == encodedInvite
+      })
+    else { return }
+    let pending = pendingPairings.remove(at: index)
+    pending.continuation.resume(
+      returning: makePairingStream(behavior: .suspended)
+    )
+  }
+
+  func failPairingBeforeStream(
+    encodedInvite: String,
+    with error: any Error
+  ) {
+    guard
+      let index = pendingPairings.firstIndex(where: {
+        $0.encodedInvite == encodedInvite
+      })
+    else { return }
+    pendingPairings.remove(at: index).continuation.resume(throwing: error)
+  }
+
+  func emitPairing(_ progress: PairingProgress) {
+    pairingContinuations.first?.yield(progress)
+  }
+
+  func finishPairing() {
+    guard !pairingContinuations.isEmpty else { return }
+    pairingContinuations.removeFirst().finish()
+  }
+
+  func failPairing(with error: any Error) {
+    guard !pairingContinuations.isEmpty else { return }
+    pairingContinuations.removeFirst().finish(throwing: error)
+  }
+
+  func completeRevocation(
+    machineID: String,
+    with receipt: RevocationReceipt
+  ) {
+    guard
+      let index = pendingRevocations.firstIndex(where: {
+        $0.machineID == machineID
+      })
+    else { return }
+    pendingRevocations.remove(at: index).continuation.resume(returning: receipt)
+  }
+
+  func shutdown() async {
+    shutdowns += 1
+    for continuation in pairingContinuations {
+      continuation.finish()
+    }
+    pairingContinuations.removeAll(keepingCapacity: false)
+    if shutdownSuspended {
+      await withCheckedContinuation { continuation in
+        shutdownContinuation = continuation
+      }
+    }
+  }
+
+  func suspendShutdown() {
+    shutdownSuspended = true
+  }
+
+  func releaseShutdown() {
+    shutdownSuspended = false
+    shutdownContinuation?.resume()
+    shutdownContinuation = nil
+  }
+
   func machineSubscriptionCount() -> Int { machineSubscriptions }
   func conversationListSubscriptionCount() -> Int { conversationListSubscriptions }
   func conversationSubscriptionCount() -> Int { conversationSubscriptions }
@@ -292,6 +493,11 @@ actor SessionSourceSpy: SessionSource {
   func recordedPromptCalls() -> [PromptCall] { promptCalls }
   func recordedApprovalCalls() -> [ApprovalCall] { approvalCalls }
   func recordedRetryApprovalIDs() -> [String] { retryApprovalIDs }
+  func recordedInspectionCalls() -> [String] { inspectionCalls }
+  func recordedPairingCalls() -> [String] { pairingCalls }
+  func recordedRevocationCalls() -> [String] { revocationCalls }
+  func pairingTerminationCount() -> Int { pairingTerminations }
+  func shutdownCount() -> Int { shutdowns }
 
   func waitForMachineSubscriptions(_ count: Int) async {
     await waitUntil("machine subscriptions >= \(count)") {
@@ -332,6 +538,36 @@ actor SessionSourceSpy: SessionSource {
   func waitForRetryCalls(_ count: Int) async {
     await waitUntil("approval retry calls >= \(count)") {
       retryApprovalIDs.count >= count
+    }
+  }
+
+  func waitForInspectionCalls(_ count: Int) async {
+    await waitUntil("pair invite inspection calls >= \(count)") {
+      inspectionCalls.count >= count
+    }
+  }
+
+  func waitForPairingCalls(_ count: Int) async {
+    await waitUntil("pairing calls >= \(count)") {
+      pairingCalls.count >= count
+    }
+  }
+
+  func waitForRevocationCalls(_ count: Int) async {
+    await waitUntil("revocation calls >= \(count)") {
+      revocationCalls.count >= count
+    }
+  }
+
+  func waitForPairingTerminations(_ count: Int) async {
+    await waitUntil("pairing terminations >= \(count)") {
+      pairingTerminations >= count
+    }
+  }
+
+  func waitForShutdowns(_ count: Int) async {
+    await waitUntil("shutdowns >= \(count)") {
+      shutdowns >= count
     }
   }
 
@@ -377,6 +613,41 @@ actor SessionSourceSpy: SessionSource {
   private func recordConversationListTermination() { conversationListTerminations += 1 }
   private func recordConversationTermination() { conversationTerminations += 1 }
   private func recordInboxTermination() { inboxTerminations += 1 }
+
+  private func recordPairingTermination() { pairingTerminations += 1 }
+
+  private func installPairingContinuation(
+    _ continuation: AsyncThrowingStream<PairingProgress, any Error>.Continuation,
+    behavior: PairingBehavior
+  ) {
+    switch behavior {
+    case .finished(let progress):
+      for value in progress {
+        continuation.yield(value)
+      }
+      continuation.finish()
+    case .failure(let error):
+      continuation.finish(throwing: error)
+    case .suspended:
+      pairingContinuations.append(continuation)
+    case .suspendedBeforeStream:
+      XCTFail("suspendedBeforeStream 必须在创建 stream 前处理")
+      continuation.finish()
+    }
+  }
+
+  private func makePairingStream(
+    behavior: PairingBehavior
+  ) -> AsyncThrowingStream<PairingProgress, any Error> {
+    let pair = AsyncThrowingStream<PairingProgress, any Error>.makeStream(
+      bufferingPolicy: .bufferingNewest(4)
+    )
+    pair.continuation.onTermination = { [weak self] _ in
+      Task { await self?.recordPairingTermination() }
+    }
+    installPairingContinuation(pair.continuation, behavior: behavior)
+    return pair.stream
+  }
 }
 
 enum SessionSourceTestValues {

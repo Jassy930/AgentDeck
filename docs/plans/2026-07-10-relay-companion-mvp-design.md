@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成；P4.4 MachineLink ingress/RuntimeCore dispatch 由 `cd7d9fb` 完成；P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成，收口时 Runtime wire 为 v4、physical schema 为 v14/35 表。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；P4.7 automatic E2E、静态 real-slot contract 与 phase docs 已完成，P4 automatic scope 7/7、P4 automatic Phase Exit complete。P5.1 shared `AgentDeckSessionSource` facade、P5.2 Keychain/crash-safe CryptoState、P5.3 WSS/SPKI pin/per-connection transfer primitive、P5.4 bounded production source 与 P5.5 canonical fixture/receipt UI automatic Task 已完成，P5/P6 当前为 5/9、0/4；P5.6–P5.9 与 P5 Phase Exit 仍未完成。`p4-auto` 已 PASS，`p4` 仍不受支持；fresh 顶层 Rust/Swift、Clippy/fmt/network/no-net/schema/docs/diff、local smoke/selfcheck/diagnostics 与 pre-closeout hash `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的双路 phase review 均通过。真实 iOS 链路、production native metadata、provisioned signed Keychain/LaunchAgent、真实 vendor、公网 WSS、第二台 Mac 与 destructive purge 继续 post-MVP gated/BLOCKED（2026-07-27） |
+| 状态 | Approved target；P3/P4 automatic Phase Exit 已完成。P5.1–P5.6 automatic Task 已完成，P5/P6 当前为 6/9、0/4；P5.7–P5.9 与 P5 Phase Exit 是 automatic 必做项，仍未完成，其中 P5.9 fixed-topology Simulator Relay E2E 不得标成外部门禁。production native metadata、provisioned signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理 iPhone、第二台 Mac 与 destructive purge 才继续属于 post-MVP gated/BLOCKED（2026-07-28）；历史提交与精确门禁见 implementation/QUALITY。 |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -78,7 +78,7 @@ watch 使用 fresh authenticated bootstrap、canonical NDJSON、SIGINT/SIGTERM �
 `remote_persistent_machines` `11/11`、完整 CLI package final run exit 0、release allocator `1/1`、relay-client
 `25/25` 与 protocol `244/244` 均通过，四 schema/三 crate Clippy/fmt/network/no-net/docs/diff 全绿。
 `spec/security` 与 `quality` 终审均 Approved，P0/P1/P2=0。P4.7 automatic Task 与 P4 automatic
-Phase Exit 已完成，P4 按 Task 进度为 7/7；iOS 仍只有 fixture 驱动骨架。focused `p4-auto` 已 PASS，
+Phase Exit 已完成，P4 按 Task 进度为 7/7；P4.7 收口当时 iOS 仍只有 fixture 驱动骨架。focused `p4-auto` 已 PASS，
 但 `p4` 仍不受支持；顶层 Rust/Swift、最终 diff/status、冻结 hash 与双路 review 已作为独立 phase gates
 补齐。pre-closeout candidate SHA-256 为
 `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5`，双路 review 均 Approved、
@@ -86,11 +86,11 @@ P0/P1/P2=0。P3.1 provisioned signed Keychain/LaunchAgent roundtrip、真实 ven
 公网 WSS 与 destructive purge 继续按方案 b 保持 post-MVP BLOCKED gate。完整实施仍必须满足 §17 的
 Definition of Done。
 
-## 1. 背景与当前问题
+## 1. 背景与设计时问题
 
-### 1.1 已有基础
+### 1.1 已有基础（设计时基线）
 
-当前仓库已经具备可以复用的基础：
+2026-07-10 设计时仓库已经具备以下可复用基础；后续完成状态以本文顶部状态栏与实施计划为准：
 
 - `agentdeck-protocol/src/remote/` 已有 Relay frame/control/data/fleet 契约和 schema 快照。
 - `agentdeck-relay` 已有 WebSocket server、鉴权骨架、SQLite store、事件缓冲、ACK 与重放补拉测试。
@@ -99,9 +99,9 @@ Definition of Done。
 - iOS 已有 UIKit Machine/Session/Inbox/Detail/Pairing 屏幕、`MobileSessionSource` 抽象和 fixture 测试。
 - `Sources/AgentDeckCore/` 已能在 macOS/iOS 共享协议模型、reducer 与 presentation。
 
-### 1.2 当前实现不能作为 Companion MVP 的原因
+### 1.2 设计时实现不能作为 Companion MVP 的原因
 
-现状审计确认了以下阻塞：
+当时的现状审计确认了以下阻塞；这些条目记录设计动机，不表示 2026-07-28 仍全部未修：
 
 1. Relay 配置了 TLS 但 binary 未编译 TLS feature 时会告警后回退明文；WSS 客户端本身也没有完整 TLS 能力。
 2. CLI 配对只保存 bearer 元数据，未保存新生成的签名/box 私钥，现有配对不能形成真实端到端身份。
@@ -1557,6 +1557,11 @@ macOS executable 侧增加 `LocalDaemonSessionSource`（current RuntimeEnvelope 
 `SessionSource`，不在 UI 层写 `if agentKind` 或直接处理 Relay crypto。iOS 发行版只注册 Relay source，
 Fixture source 仅注入 preview/test。
 
+P5.6 已实现上述 iOS 发行边界：Release `SceneDelegate` 默认由 `CompositionRoot` 从持久 installation identity
+与 paired-record snapshot 构造真实 `RelaySessionSource`；fixture launch argument 与安装入口只在 Debug 编译。
+每次 paired material 变化或前后台切换都会关闭并 join 旧 source generation 后 cold-open，新旧 generation
+不得同时拥有 WSS。
+
 ### 13.2 共享 SessionSource（原 MobileSessionSource）契约
 
 去掉 protocol 级 `@MainActor`。所有观察方法固定为 `async -> AsyncStream<...>`，使 actor-isolated `RelaySessionSource` 可以先注册有界 continuation 再返回 stream；不采用同步 nonisolated factory。观察流返回 typed resource state：
@@ -1616,6 +1621,16 @@ broadcast 不能使用默认无界缓冲：catalog/machine/session resource stat
 - App 进入后台主动停止 WSS；daemon turn 继续。
 - 回前台重新连接并同时按 outer stream generation/cursor 与 inner eventSeq/catalogRevision resume；任一层 gap 都自动切 daemon backfill/snapshot。
 - 本期不请求后台常驻或 APNs entitlement。
+
+**P5.6 automatic 实现边界（2026-07-28）：** 完整邀请本地 inspect 与 trust preview 在用户确认前零网络；
+pairing replacement 固定 cancel/close/join 旧 worker/WSS，ViewModel 用 exact operation ID 阻断 pre-stream
+cancellation ABA。scene callback 同步 capture intent，再由 FIFO worker fulfillment，迟到 foreground 不得覆盖
+background。扫码器的 capture 配置/start/stop 固定在专用串行队列，只有 view visible + scene active 才持有
+exact UUID；scene deactivation 会 stop，reactivation 产生新 generation，permission/start/metadata/stop 都必须
+exact-match。verified revoked terminal 与离线双重确认 local forget 分离，重连会取消破坏性流程。fresh focused
+`42/42`、iOS Simulator `133/133`、RelayClient `445/4 entitlement SKIP`、完整 Swift
+`985/4 skipped + 35` 与 Release 静态门禁均通过。该证据只完成 P5.6，不代替 P5.9 fixed-topology Relay E2E、
+production-signed Keychain、物理 iPhone 或公网 WSS。
 
 ### 13.6 远程 macOS 与 CLI
 
@@ -1769,6 +1784,9 @@ Keychain/CLI restart 与 destructive trust-reset evidence 保留为 post-MVP BLO
 
 - `AgentDeckSessionSource` facade、`AgentDeckRelayClient`、iOS/远程 macOS RelaySessionSource、AppKit SessionSourceRegistry、Keychain、扫码/粘贴。
 - typed UI state/receipt、single subscription、前后台 resume。
+- P5.6 已完成 iOS Release composition、完整 PairInvite QR/粘贴与用户确认、verified revoke/offline forget，
+  以及 foreground/background source generation；AppKit registry 仍由 P5.7/P5.8、固定 topology E2E 由 P5.9
+  接管。
 
 退出门禁：只要求 iOS Simulator 自动 E2E。固定 topology 是 temp TLS Relay + 真实 P4 `agentdeckd`
 RemoteLink + synthetic Codex/CC adapter + same-UID local UDS pairing approval + production Swift Relay client +

@@ -29,6 +29,7 @@ targets:
       path: AgentDeckMobile/Info.plist
       properties:
         UILaunchScreen: {}
+        NSCameraUsageDescription: 扫描 AgentDeck 完整配对二维码
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -58,3 +59,17 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
+schemes:
+  AgentDeckMobile:
+    build:
+      targets:
+        AgentDeckMobile: all
+        AgentDeckMobileTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - AgentDeckMobileTests
+      commandLineArguments:
+        "--agentdeck-fixture-source": true

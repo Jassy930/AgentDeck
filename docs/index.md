@@ -14,13 +14,14 @@
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2、P4.2–P4.3 machine/pairing lifecycle、
   P4.4 RemoteLink ingress、P4.5 signed publication/counter recovery、P4.6 persistent CLI/watch 与 durable
   transfer recovery、P5.2 client storage、P5.3 WSS/TLS pin/per-connection transfer、conversation-scoped
-  recovery，以及 P5.4 MachineConnection/key-sync/bounded source typed failure、daemon install/upgrade failure
-  code、v1 marker 显式 reset 和排查流程。
+  recovery、P5.4 MachineConnection/key-sync/bounded source typed failure、P5.5 canonical/receipt 乱序，以及
+  P5.6 Release composition/pairing lifecycle、daemon install/upgrade failure code、v1 marker 显式 reset 和排查流程。
 - `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.10、P3 Phase、P4.1–P4.7
   machine identity/enrollment/pairing/RemoteLink ingress/signed publication/persistent CLI/watch、production
   UDS/client/install/smoke、P4 automatic Phase Exit/静态 real-slot sentinel、P5.1 shared SessionSource facade、
   P5.2 Keychain/crash-safe CryptoState、P5.3 WSS/SPKI pin/transfer assembler、P5.4 exact Swift manifest/
-  MachineConnection/RelaySessionSource 与文档结构检查入口。
+  MachineConnection/RelaySessionSource、P5.5 canonical fixture/receipt UI、P5.6 iOS production
+  composition/pairing lifecycle 与文档结构检查入口。
 - `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
   enrollment、daemon 本机 status/trust-reset、安全 uninstall purge、fingerprint-bound readback、
   portable signed root-lost purge receipt、P4.5 recovery-gated egress admission，以及 P4.6 persistent
@@ -34,7 +35,8 @@
 
 ### iOS 前端计划（2026-07-03）
 
-- `plans/2026-07-03-ios-uikit-frontend-design.md`：iOS UIKit companion 前端设计（fixture 驱动，R3 界面骨架，状态：Implemented）。
+- `plans/2026-07-03-ios-uikit-frontend-design.md`：iOS UIKit companion 前端设计；记录原 fixture R3 界面骨架，
+  并同步 P5.6 Release Relay composition、完整邀请配对与前后台 lifecycle 的当前边界。
 - `plans/2026-07-03-ios-uikit-frontend-implementation.md`：iOS UIKit companion 前端实施计划（Task 1–15，含 AgentDeckCore 共享库抽取）。
 
 ### Relay R0 契约 spike（2026-07-07，历史）
@@ -104,8 +106,9 @@
   RelaySessionSource 与 typed command/pairing path，并补齐 unsubscribe single-flight retirement、满 update queue
   shutdown 解锁以及 staged→committed pairing visibility gate；P5.5 又把 iOS fixture/ViewModel 迁移到共享
   `SessionSource` 与 Core canonical reducer，并以 32-identity cap、snapshot mid-turn inference、event-seq retry
-  fence、retired-operation 校验与 terminal-only turn advance 保留审批证据。P4–P6 按 Task 进度上限为
-  7/7、5/9、0/4。`p4-auto`
+  fence、retired-operation 校验与 terminal-only turn advance 保留审批证据；P5.6 已把 iOS Release composition
+  切到真实 Relay source，并接入完整邀请配对与前后台 generation lifecycle。P4–P6 按 Task 进度上限为
+  7/7、6/9、0/4。`p4-auto`
   已 PASS；`p4` 仍不受支持，
   且 focused aggregate 本身不包含顶层
   Rust/Swift、最终 diff/status、冻结 hash 或双路 review。上述独立门禁与双路 review 已在
@@ -127,11 +130,11 @@
   把 command-bound fixed Error 固定为唯一 Failed terminal，commandless Error 保持非终态 diagnostic。
   fresh automatic 证据含顶层 Swift `980 XCTest / 4 skipped + 35 Swift Testing`、warnings-as-errors focused
   `91/91` 与 iOS Simulator `91/91`；上一 command terminal 不消费下一 prompt receipt 的反例也已冻结；
-  其余 Rust 精确结果见 `QUALITY.md`。P5 为 5/9；P5.6–P5.9 与 P5
-  Phase Exit 仍未完成。
-  P5.1–P5.5/P4 automatic 完成项都不表示
-  真实 iOS Companion、真实公网 WSS、production-signed Keychain、第二台 Mac、真实 vendor 或 destructive
-  purge 已完成。
+  其余 Rust 精确结果见 `QUALITY.md`。该 Task 收口时 P5 为 5/9。P5.6 后续以 focused `42/42`、Relay
+  shutdown `56/56`、RelayClient `445/4 SKIP`、顶层 Swift `985/4 SKIP + 35`、iOS `133/133` 与 Release
+  fixture-surface 门禁独立完成；当前 P5 为 6/9，P5.7–P5.9 与 P5 Phase Exit 仍未完成。
+  P5.1–P5.6/P4 automatic 完成项都不表示 P5.9 fixed-topology Simulator Relay E2E、真实公网 WSS、production-signed
+  Keychain、第二台 Mac、真实 vendor 或 destructive purge 已完成。
 
 ## 协议资料
 

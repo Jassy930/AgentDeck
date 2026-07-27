@@ -492,7 +492,8 @@ persistent pairing 必须使用 Data Protection Keychain，不得降级到 injec
 丢失时回到本手册的 [portable purge receipt 流程](#machineroot-丢失后的-portable-purge-receipt)，静态
 sentinel 不生成 receipt 或删除授权。production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、
 物理真机/真实 iOS、第二台 Mac 与 destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade、P5.2
-crash-safe client storage、P5.3 WSS/pin/per-connection transfer primitive、P5.4 bounded production source 与
-P5.5 canonical fixture/receipt UI automatic Task 已完成，P5/P6 当前为 5/9、0/4。P5.6 发行 composition 与
-P5 Phase Exit 仍未完成。
+crash-safe client storage、P5.3 WSS/pin/per-connection transfer primitive、P5.4 bounded production source、
+P5.5 canonical fixture/receipt UI 与 P5.6 iOS production composition/pairing lifecycle automatic Task 已完成，
+P5/P6 当前为 6/9、0/4。P5.7–P5.9 与 P5 Phase Exit 仍未完成；P5.6 的注入式 Simulator 证据不等于公网、
+物理 iPhone 或真实 vendor 链路。
 R0/R1 命令和 `--bootstrap-secret` 只属于历史记录，不得用于当前部署或验收。

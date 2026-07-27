@@ -2,16 +2,36 @@ import AgentDeckSessionSource
 import UIKit
 
 final class MachineListViewController: UIViewController {
+    typealias PairingViewModelFactory = @MainActor (any SessionSource) -> PairingViewModel
+
     private let source: any SessionSource
     private let viewModel: MachineListViewModel
+    private let pairingViewModelFactory: PairingViewModelFactory
+    private var initialPairInvite: String?
     private var collectionView: UICollectionView!
     private var dataSource: UICollectionViewDiffableDataSource<Int, String>!
     private let emptyView = MobileEmptyStateView(title: "还没有机器", subtitle: "用右上角「配对」把 Mac 接入")
 
-    init(source: any SessionSource) {
+    init(
+        source: any SessionSource,
+        pairingViewModelFactory: @escaping PairingViewModelFactory,
+        initialPairInvite: String?
+    ) {
         self.source = source
         self.viewModel = MachineListViewModel(source: source)
+        self.pairingViewModelFactory = pairingViewModelFactory
+        self.initialPairInvite = initialPairInvite
         super.init(nibName: nil, bundle: nil)
+    }
+
+    /// Preview/旧调用点的显式降级入口。它允许配对，但本地 material 删除会 fail-close；
+    /// 发行 composition 必须注入持有正确 local store 与 generation 的 factory。
+    convenience init(source: any SessionSource) {
+        self.init(
+            source: source,
+            pairingViewModelFactory: { PairingViewModel(source: $0) },
+            initialPairInvite: nil
+        )
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -40,6 +60,13 @@ final class MachineListViewController: UIViewController {
         viewModel.onUpdate = { [weak self] in self?.applySnapshot() }
         viewModel.start()
         applySnapshot()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        guard let initialPairInvite, presentedViewController == nil else { return }
+        self.initialPairInvite = nil
+        presentPairing(initialInvite: initialPairInvite)
     }
 
     private func configureCollectionView() {
@@ -137,7 +164,17 @@ final class MachineListViewController: UIViewController {
     }
 
     @objc private func openPairing() {
-        present(UINavigationController(rootViewController: PairingViewController()), animated: true)
+        presentPairing(initialInvite: nil)
+    }
+
+    private func presentPairing(initialInvite: String?) {
+        guard presentedViewController == nil else { return }
+        let pairingViewModel = pairingViewModelFactory(source)
+        let pairing = PairingViewController(
+            viewModel: pairingViewModel,
+            initialInvite: initialInvite
+        )
+        present(UINavigationController(rootViewController: pairing), animated: true)
     }
 
     @objc private func openInbox() {
