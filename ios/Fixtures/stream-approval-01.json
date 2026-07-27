@@ -1,8 +1,169 @@
-[
-  { "delayMs": 0, "event": { "type": "sessionStarted", "sessionId": "sess-approval-01", "threadId": "t3", "agentKind": "codex" } },
-  { "delayMs": 100, "itemId": "a1", "event": { "type": "agentItem", "sessionId": "sess-approval-01", "threadId": "t3", "agentKind": "codex", "item": { "kind": "userMessage", "text": "执行本周的数据库迁移", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 200, "awaitApproval": true, "event": { "type": "actionRequest", "sessionId": "sess-approval-01", "threadId": "t3", "agentKind": "codex", "request": { "requestId": "req-1", "kind": "executeCommand", "summary": "uv run alembic upgrade head", "vendor": { "agentKind": "codex", "approvalPolicyAtDecision": "on-request", "sandboxAtDecision": "workspace-write", "canPersist": true } } } },
-  { "delayMs": 600, "itemId": "a2", "event": { "type": "agentItem", "sessionId": "sess-approval-01", "threadId": "t3", "agentKind": "codex", "item": { "kind": "shell", "command": "uv run alembic upgrade head", "status": "completed", "exitCode": 0, "durationMs": 3200, "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 300, "itemId": "a3", "event": { "type": "agentItem", "sessionId": "sess-approval-01", "threadId": "t3", "agentKind": "codex", "item": { "kind": "assistantMessage", "text": "迁移已执行完成，共应用 3 个 revision。", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 300, "event": { "type": "turnComplete", "sessionId": "sess-approval-01", "threadId": "t3", "agentKind": "codex", "summary": { "totalInputTokens": 700, "totalOutputTokens": 150, "elapsedMs": 4100 } } }
-]
+{
+  "snapshot": {
+    "conversationId": "sess-approval-01",
+    "baseEventCursor": "beforeFirst",
+    "configurationState": {
+      "configurationRevision": 1,
+      "configuration": {
+        "vendorControl": {
+          "agentKind": "codex",
+          "configuration": {
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write",
+            "reasoningEffort": "high"
+          }
+        }
+      }
+    },
+    "items": [
+      {
+        "kind": "capabilities",
+        "commandId": null,
+        "itemId": null,
+        "entityId": null,
+        "capabilities": {
+          "agentKind": "codex",
+          "agentVersion": "fixture",
+          "features": [],
+          "vendor": {
+            "agentKind": "codex",
+            "sandboxModes": [],
+            "persistenceSupported": false,
+            "reasoningEffortLevels": []
+          }
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "delayMs": 0,
+      "event": {
+        "conversationId": "sess-approval-01",
+        "eventId": "event-approval-01-0",
+        "eventSeq": 0,
+        "commandId": "command-approval-01",
+        "itemId": null,
+        "entityId": null,
+        "body": {
+          "kind": "turnStarted",
+          "turn_id": "turn-approval-01"
+        }
+      }
+    },
+    {
+      "delayMs": 100,
+      "event": {
+        "conversationId": "sess-approval-01",
+        "eventId": "event-approval-01-1",
+        "eventSeq": 1,
+        "commandId": "command-approval-01",
+        "itemId": "a1",
+        "entityId": "entity-a1",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "userMessage",
+            "text": "执行本周的数据库迁移",
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 200,
+      "awaitApproval": true,
+      "event": {
+        "conversationId": "sess-approval-01",
+        "eventId": "event-approval-01-2",
+        "eventSeq": 2,
+        "commandId": "command-approval-01",
+        "itemId": null,
+        "entityId": null,
+        "body": {
+          "kind": "actionRequest",
+          "turn_id": "turn-approval-01",
+          "approval_id": "approval-1",
+          "request": {
+            "requestId": "req-1",
+            "kind": "executeCommand",
+            "summary": "uv run alembic upgrade head",
+            "vendor": {
+              "agentKind": "codex",
+              "approvalPolicyAtDecision": "on-request",
+              "sandboxAtDecision": "workspace-write",
+              "canPersist": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 600,
+      "event": {
+        "conversationId": "sess-approval-01",
+        "eventId": "event-approval-01-6",
+        "eventSeq": 6,
+        "commandId": "command-approval-01",
+        "itemId": "a2",
+        "entityId": "entity-a2",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "shell",
+            "command": "uv run alembic upgrade head",
+            "status": "completed",
+            "exitCode": 0,
+            "durationMs": 3200,
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 300,
+      "event": {
+        "conversationId": "sess-approval-01",
+        "eventId": "event-approval-01-7",
+        "eventSeq": 7,
+        "commandId": "command-approval-01",
+        "itemId": "a3",
+        "entityId": "entity-a3",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "assistantMessage",
+            "text": "迁移已执行完成，共应用 3 个 revision。",
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 300,
+      "event": {
+        "conversationId": "sess-approval-01",
+        "eventId": "event-approval-01-8",
+        "eventSeq": 8,
+        "commandId": "command-approval-01",
+        "itemId": null,
+        "entityId": null,
+        "body": {
+          "kind": "turnCompleted",
+          "turn_id": "turn-approval-01",
+          "summary": {
+            "totalInputTokens": 700,
+            "totalOutputTokens": 150,
+            "elapsedMs": 4100
+          }
+        }
+      }
+    }
+  ]
+}

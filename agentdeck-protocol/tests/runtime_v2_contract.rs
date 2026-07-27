@@ -2812,6 +2812,76 @@ fn runtime_event_identity_matrix_is_strict() {
 }
 
 #[test]
+fn command_bound_error_is_the_fixed_failed_terminal_while_commandless_error_is_diagnostic() {
+    let conversation_id = ConversationId::new("conversation-error-contract");
+    let event_id = EventId::new("event-error-contract");
+    let command_id = CommandId::new("command-error-contract");
+    let terminal_failure = RuntimeFailure::new(
+        failure::DAEMON_RUNTIME_EXECUTION_FAILED,
+        "agent execution failed",
+    );
+
+    let terminal = RuntimeEvent::new(
+        conversation_id.clone(),
+        event_id.clone(),
+        7,
+        Some(command_id.clone()),
+        None,
+        None,
+        RuntimeEventBody::Error {
+            failure: terminal_failure.clone(),
+        },
+    )
+    .expect("the fixed command-bound failure is the Runtime v5 Failed terminal");
+    let encoded = serde_json::to_vec(&terminal).expect("encode fixed Failed terminal");
+    serde_json::from_slice::<RuntimeEvent>(&encoded).expect("decode fixed Failed terminal");
+
+    for invalid_failure in [
+        RuntimeFailure::new("daemon.runtime.other", "agent execution failed"),
+        RuntimeFailure::new(
+            failure::DAEMON_RUNTIME_EXECUTION_FAILED,
+            "adapter supplied failure text",
+        ),
+        terminal_failure
+            .clone()
+            .with_diagnostic("private-adapter-diagnostic"),
+    ] {
+        assert!(
+            RuntimeEvent::new(
+                conversation_id.clone(),
+                event_id.clone(),
+                7,
+                Some(command_id.clone()),
+                None,
+                None,
+                RuntimeEventBody::Error {
+                    failure: invalid_failure,
+                },
+            )
+            .is_err(),
+            "command-bound Error must reject every non-fixed failure tuple"
+        );
+    }
+
+    let diagnostic = RuntimeEvent::new(
+        conversation_id,
+        event_id,
+        8,
+        None,
+        None,
+        None,
+        RuntimeEventBody::Error {
+            failure: RuntimeFailure::new("daemon.test.diagnostic", "conversation diagnostic")
+                .with_diagnostic("bounded-diagnostic-ref"),
+        },
+    )
+    .expect("commandless Error remains a conversation diagnostic");
+    let diagnostic = serde_json::to_vec(&diagnostic).expect("encode commandless diagnostic");
+    serde_json::from_slice::<RuntimeEvent>(&diagnostic)
+        .expect("decode commandless diagnostic without terminal semantics");
+}
+
+#[test]
 fn required_null_schema_properties_accept_null_and_remain_required() {
     fn allows_null(schema: &serde_json::Value) -> bool {
         match schema.get("type") {

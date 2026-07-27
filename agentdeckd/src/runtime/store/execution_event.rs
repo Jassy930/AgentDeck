@@ -1,4 +1,4 @@
-//! Store-owned execution Item/Error canonical builder。
+//! Store-owned execution Item canonical builder。
 //!
 //! 威胁场景：若 adapter 或调用方能提交 raw `RuntimeEvent`/bytes，恶意或失控的
 //! adapter 可伪造 command、turn、item/entity identity，或把原始错误文本写入 durable
@@ -9,13 +9,13 @@ use std::io::{self, Write};
 
 use agentdeck_protocol::AgentItem;
 use agentdeck_protocol::runtime::identity::{CommandId, ConversationId, EntityId, EventId, ItemId};
-use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeEventBody, RuntimeFailure};
+use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeEventBody};
 
 use crate::runtime::model::{EventRecord, MAX_RUNTIME_EVENT_BYTES, RuntimeStoreError};
 
 use super::{RuntimeId, RuntimeIdKind};
 
-/// RuntimeCore 提交 execution Item/Error 的唯一 release 输入。body 完全私有，只能由
+/// RuntimeCore 提交 execution Item 的唯一 release 输入。body 完全私有，只能由
 /// typed constructors 建立；调用方不能提交 raw RuntimeEvent、bytes 或 ProtocolError。
 #[derive(Clone)]
 pub struct AppendExecutionEvent {
@@ -47,22 +47,6 @@ impl AppendExecutionEvent {
                 entity_id,
                 item,
             },
-        }
-    }
-
-    #[must_use]
-    pub fn execution_failed(
-        conversation_id: RuntimeId,
-        command_id: RuntimeId,
-        turn_id: RuntimeId,
-        event_id: RuntimeId,
-    ) -> Self {
-        Self {
-            conversation_id,
-            command_id,
-            turn_id,
-            event_id,
-            body: ExecutionEventBody::Error(SanitizedExecutionEventFailure::ExecutionFailed),
         }
     }
 
@@ -103,7 +87,7 @@ pub enum AppendExecutionEventOutcome {
 
 /// 一条 execution event 必须绑定的 daemon-owned durable identity。
 ///
-/// `turn_id` 不进入当前 Runtime `Item`/`Error` wire body，但会随准备结果保留，供
+/// `turn_id` 不进入当前 Runtime `Item` wire body，但会随准备结果保留，供
 /// journal transaction 与当前 Started row 做 exact match；调用方不能从 adapter
 /// payload 恢复或替换它。
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -150,31 +134,6 @@ impl fmt::Debug for ExecutionEventIdentity {
     }
 }
 
-/// Transient adapter failure 到 durable Error 的零载荷 allowlist。
-///
-/// 新增 variant 必须先登记稳定 Runtime failure code/message；本类型刻意没有
-/// String、`ProtocolError` 或 diagnostic reference 字段。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SanitizedExecutionEventFailure {
-    ExecutionFailed,
-}
-
-impl SanitizedExecutionEventFailure {
-    const fn code(self) -> &'static str {
-        match self {
-            Self::ExecutionFailed => {
-                agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED
-            }
-        }
-    }
-
-    const fn message(self) -> &'static str {
-        match self {
-            Self::ExecutionFailed => "agent execution failed",
-        }
-    }
-}
-
 /// Store 唯一接受的 execution event typed body；没有 raw bytes/RuntimeEvent 入口。
 #[derive(Clone)]
 enum ExecutionEventBody {
@@ -183,14 +142,12 @@ enum ExecutionEventBody {
         entity_id: EntityId,
         item: AgentItem,
     },
-    Error(SanitizedExecutionEventFailure),
 }
 
 impl fmt::Debug for ExecutionEventBody {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self {
             Self::Item { .. } => "Item",
-            Self::Error(_) => "Error",
         };
         formatter
             .debug_struct("ExecutionEventBody")
@@ -397,13 +354,6 @@ fn build_execution_event(
                 RuntimeEventBody::Item { item },
             )
         }
-        ExecutionEventBody::Error(failure) => (
-            None,
-            None,
-            RuntimeEventBody::Error {
-                failure: RuntimeFailure::new(failure.code(), failure.message()),
-            },
-        ),
     };
 
     let runtime_event = RuntimeEvent::new(
@@ -604,36 +554,6 @@ mod tests {
         assert!(!prepared_debug.contains("secret-item-id"));
         assert!(!prepared_debug.contains(&identity.turn_id.to_canonical_string()));
         assert!(prepared_debug.contains("canonical_bytes"));
-    }
-
-    #[test]
-    fn error_uses_only_fixed_failure_without_diagnostic_reference() {
-        let identity = identity();
-        let prepared = build_execution_event(
-            identity,
-            ExecutionEventBody::Error(SanitizedExecutionEventFailure::ExecutionFailed),
-        )
-        .expect("build sanitized error event");
-        prepared
-            .validate_exact_binding(identity)
-            .expect("error remains command/turn bound without item identity");
-
-        let decoded: RuntimeEvent =
-            serde_json::from_slice(prepared.canonical_bytes()).expect("decode error event");
-        assert_eq!(
-            decoded.command_id.as_ref().map(CommandId::as_str),
-            Some(identity.command_id.to_canonical_string().as_str())
-        );
-        assert!(decoded.item_id.is_none() && decoded.entity_id.is_none());
-        let RuntimeEventBody::Error { failure } = decoded.body else {
-            panic!("sanitized execution failure must become Error");
-        };
-        assert_eq!(
-            failure.code,
-            agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED
-        );
-        assert_eq!(failure.message, "agent execution failed");
-        assert_eq!(failure.diagnostic_ref, None);
     }
 
     #[test]

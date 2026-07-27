@@ -6,7 +6,7 @@ mod runtime_event_tamper;
 mod store_admission;
 
 use agentdeck_protocol::runtime::identity::{CommandId, EntityId, ItemId, TurnId};
-use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeEventBody, RuntimeFailure};
+use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeEventBody};
 use agentdeck_protocol::{AgentItem, AgentItemMeta};
 use agentdeckd::runtime::store::{RuntimeIdKind, RuntimeStoreError};
 
@@ -15,22 +15,34 @@ use runtime_event_tamper::{
 };
 
 fn exact_length_error_payload(event: &RuntimeEvent, target_len: usize, code: &str) -> Vec<u8> {
-    let mut candidate = event.clone();
-    candidate.item_id = None;
-    candidate.entity_id = None;
-    candidate.body = RuntimeEventBody::Error {
-        failure: RuntimeFailure::new(code, ""),
-    };
+    let mut candidate = serde_json::to_value(event).expect("encode Error corruption source");
+    candidate["itemId"] = serde_json::Value::Null;
+    candidate["entityId"] = serde_json::Value::Null;
+    candidate["body"] = serde_json::json!({
+        "kind": "error",
+        "failure": {"code": code, "message": "", "diagnosticRef": null}
+    });
     let base = serde_json::to_vec(&candidate).expect("encode base Error corruption");
     let padding = target_len
         .checked_sub(base.len())
         .expect("source event is large enough for canonical Error corruption");
-    candidate.body = RuntimeEventBody::Error {
-        failure: RuntimeFailure::new(code, "x".repeat(padding)),
-    };
+    candidate["body"]["failure"]["message"] = serde_json::json!("x".repeat(padding));
     let payload = serde_json::to_vec(&candidate).expect("encode exact-length Error corruption");
     assert_eq!(payload.len(), target_len);
     payload
+}
+
+fn fixed_terminal_error_payload(event: &RuntimeEvent) -> Vec<u8> {
+    let mut candidate = event.clone();
+    candidate.item_id = None;
+    candidate.entity_id = None;
+    candidate.body = RuntimeEventBody::Error {
+        failure: agentdeck_protocol::runtime::RuntimeFailure::new(
+            agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED,
+            "agent execution failed",
+        ),
+    };
+    serde_json::to_vec(&candidate).expect("encode fixed command-bound Error")
 }
 
 fn exact_length_raw_item_payload(event: &RuntimeEvent, target_len: usize) -> Vec<u8> {
@@ -179,6 +191,32 @@ async fn forged_pointer_and_nonpointer_noncanonical_or_unsupported_body_fail_clo
     );
     unsupported.reseal_same_length(&unsupported.item, &payload);
     assert_reopen_rejected(&unsupported, "non-pointer unsupported canonical Error").await;
+}
+
+#[tokio::test]
+async fn historical_nonterminal_command_bound_error_fails_closed_after_valid_aead_reseal() {
+    // 威胁场景：旧 daemon 曾把 fixed command-bound Error 作为普通 execution event
+    // 写在 Started 与真正 terminal 之间。它在 Runtime v5 wire 上形似合法 Failed，
+    // 但没有 terminal_event_id 权威指针；重启必须拒绝而不能恢复成双重终态。
+    let fixture = RuntimeEventTamperFixture::create_with_fixed_error_sized_item(
+        "nonterminal-fixed-error",
+        0xA9,
+    )
+    .await;
+    let item: RuntimeEvent =
+        serde_json::from_slice(&fixture.item.payload).expect("decode sizing Item source");
+    let payload = fixed_terminal_error_payload(&item);
+    assert_eq!(
+        payload.len(),
+        fixture.item.payload.len(),
+        "sizing fixture keeps every authenticated byte-count field unchanged"
+    );
+    fixture.reseal_same_length(&fixture.item, &payload);
+    assert_reopen_rejected(
+        &fixture,
+        "fixed command-bound Error without terminal_event_id",
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -1,7 +1,6 @@
-import AgentDeckCore
 import Foundation
 
-enum RuntimeConversationStateError: Error, Equatable, Sendable {
+public enum RuntimeConversationStateError: Error, Equatable, Sendable {
   case emptyConversationID
   case emptyTurnID
   case emptyApprovalID
@@ -26,44 +25,51 @@ enum RuntimeConversationStateError: Error, Equatable, Sendable {
   case commandIdentityMismatch
   case pendingApprovalConflict
   case approvalIdentityMismatch
+  case approvalDecisionMismatch
+  case approvalStateTransitionInvalid
   case unresolvedPendingApproval
 }
 
-struct RuntimeConversationActiveTurn: Equatable, Sendable {
-  let turnID: RuntimeTurnID
-  let commandID: RuntimeCommandID
+public struct RuntimeConversationActiveTurn: Equatable, Sendable {
+  public let turnID: RuntimeTurnID
+  public let commandID: RuntimeCommandID
 }
 
-struct RuntimeConversationPendingApproval: Sendable {
-  let turnID: RuntimeTurnID
-  let commandID: RuntimeCommandID
-  let approvalID: RuntimeApprovalID
-  let requestID: String
-  let request: RuntimeActionRequestV1
+public struct RuntimeConversationPendingApproval: Sendable {
+  public let turnID: RuntimeTurnID
+  public let commandID: RuntimeCommandID
+  public let approvalID: RuntimeApprovalID
+  public let requestID: String
+  public let request: RuntimeActionRequestV1
 }
 
-struct RuntimeConversationApprovalResolution: Sendable {
-  let turnID: RuntimeTurnID
-  let commandID: RuntimeCommandID
-  let approvalID: RuntimeApprovalID
-  let requestID: String?
-  let decision: ActionDecisionKind?
-  let deliveryState: ApprovalDeliveryStateV1
+public struct RuntimeConversationApprovalResolution: Sendable {
+  public let turnID: RuntimeTurnID
+  public let commandID: RuntimeCommandID
+  public let approvalID: RuntimeApprovalID
+  public let requestID: String?
+  public let decision: ActionDecisionKind?
+  public let deliveryState: ApprovalDeliveryStateV1
 }
 
-enum RuntimeConversationTurnTerminal: Sendable {
+public enum RuntimeConversationTurnTerminal: Sendable {
   case completed(
     turnID: RuntimeTurnID,
     commandID: RuntimeCommandID,
     summary: RuntimeTurnSummaryV1
   )
   case interrupted(turnID: RuntimeTurnID, commandID: RuntimeCommandID)
+  case failed(
+    turnID: RuntimeTurnID?,
+    commandID: RuntimeCommandID,
+    failure: RuntimeFailureV1
+  )
 }
 
-struct RuntimeConversationFailure: Sendable {
-  let turnID: RuntimeTurnID?
-  let commandID: RuntimeCommandID?
-  let value: RuntimeFailureV1
+public struct RuntimeConversationFailure: Sendable {
+  public let turnID: RuntimeTurnID?
+  public let commandID: RuntimeCommandID?
+  public let value: RuntimeFailureV1
 }
 
 private enum RuntimeConversationBaselineTurnInferenceState {
@@ -78,31 +84,33 @@ private enum RuntimeConversationBaselineTurnInferenceState {
 /// 该类型只接受 daemon 签发的 conversation/event/item/entity/command identity，不创建
 /// `session-*`、`thread-*` 或 `ai-N` 替代身份。每个入口都先在值副本上完整归约，成功后才
 /// swap，因此 cursor、item 与 lifecycle state 不会在失败时产生半更新。
-struct RuntimeConversationState {
-  private static let maxPendingApprovals = 32
+public struct RuntimeConversationState {
+  private static let maximumApprovalIdentitiesPerTurn = 32
 
-  let conversationID: RuntimeConversationID
+  public let conversationID: RuntimeConversationID
 
-  private(set) var capabilities: RuntimeSessionCapabilitiesV1?
-  private(set) var configurationState: RuntimeConversationConfigurationStateV2?
-  private(set) var cursorState: RuntimeCanonicalEventCursorState
-  private(set) var canonicalItemIdentities: [RuntimeCanonicalItemIdentity] = []
-  private(set) var activeTurn: RuntimeConversationActiveTurn?
-  private(set) var pendingApprovals: [RuntimeConversationPendingApproval] = []
-  private(set) var lastApprovalResolution: RuntimeConversationApprovalResolution?
-  private(set) var turnTerminal: RuntimeConversationTurnTerminal?
-  private(set) var failure: RuntimeConversationFailure?
+  public private(set) var capabilities: RuntimeSessionCapabilitiesV1?
+  public private(set) var configurationState: RuntimeConversationConfigurationStateV2?
+  public private(set) var cursorState: RuntimeCanonicalEventCursorState
+  public private(set) var canonicalItemIdentities: [RuntimeCanonicalItemIdentity] = []
+  public private(set) var activeTurn: RuntimeConversationActiveTurn?
+  public private(set) var pendingApprovals: [RuntimeConversationPendingApproval] = []
+  public private(set) var lastApprovalResolution: RuntimeConversationApprovalResolution?
+  public private(set) var turnTerminal: RuntimeConversationTurnTerminal?
+  public private(set) var failure: RuntimeConversationFailure?
 
   private var itemStore = AgentItemStore()
   private var itemIdentityState = RuntimeCanonicalIdentityState()
   private var identityIndexByItemID: [RuntimeItemID: Int] = [:]
   private var pendingApprovalIndexByID: [RuntimeApprovalID: Int] = [:]
+  private var approvalResolutionsByID: [RuntimeApprovalID: RuntimeConversationApprovalResolution] =
+    [:]
   private var baselineTurnInference: RuntimeConversationBaselineTurnInferenceState = .unavailable
 
-  var items: [UIItem] { itemStore.items }
-  var pendingApproval: RuntimeConversationPendingApproval? { pendingApprovals.first }
+  public var items: [UIItem] { itemStore.items }
+  public var pendingApproval: RuntimeConversationPendingApproval? { pendingApprovals.first }
 
-  init(conversationID: RuntimeConversationID) throws {
+  public init(conversationID: RuntimeConversationID) throws {
     guard !conversationID.rawValue.isEmpty else {
       throw RuntimeConversationStateError.emptyConversationID
     }
@@ -114,7 +122,7 @@ struct RuntimeConversationState {
   }
 
   /// Snapshot 是完整 baseline：成功时原子替换旧 transcript/cursor/lifecycle 投影。
-  mutating func apply(_ snapshot: ConversationSnapshotV2) throws {
+  public mutating func apply(_ snapshot: ConversationSnapshotV2) throws {
     guard snapshot.conversationID == conversationID else {
       throw RuntimeConversationStateError.conversationMismatch(
         expected: conversationID,
@@ -154,7 +162,7 @@ struct RuntimeConversationState {
   }
 
   /// 只消费当前 inner cursor 后的 conversation backfill；catalog、错 scope、错 range 均拒绝。
-  mutating func apply(_ backfill: RuntimeBackfillChunkV2) throws {
+  public mutating func apply(_ backfill: RuntimeBackfillChunkV2) throws {
     var next = self
     switch backfill {
     case .catalog:
@@ -187,13 +195,13 @@ struct RuntimeConversationState {
   }
 
   /// 消费 exact-next live event；任何 body/cursor/identity 失败都保留调用前状态。
-  mutating func apply(_ event: RuntimeEventV2) throws {
+  public mutating func apply(_ event: RuntimeEventV2) throws {
     var next = self
     try next.reduce(event)
     self = next
   }
 
-  func identity(for itemID: RuntimeItemID) -> RuntimeCanonicalItemIdentity? {
+  public func identity(for itemID: RuntimeItemID) -> RuntimeCanonicalItemIdentity? {
     guard let index = identityIndexByItemID[itemID],
       canonicalItemIdentities.indices.contains(index)
     else {
@@ -235,6 +243,7 @@ struct RuntimeConversationState {
       baselineTurnInference = .consumed
       pendingApprovals.removeAll(keepingCapacity: true)
       pendingApprovalIndexByID.removeAll(keepingCapacity: true)
+      approvalResolutionsByID.removeAll(keepingCapacity: true)
       lastApprovalResolution = nil
       turnTerminal = nil
       failure = nil
@@ -270,14 +279,22 @@ struct RuntimeConversationState {
       turnTerminal = .interrupted(turnID: turnID, commandID: commandID)
       failure = nil
     case .error(let value):
-      let associatedTurnID = activeTurn.flatMap { turn in
-        event.commandID == turn.commandID ? turn.turnID : nil
+      if let eventCommandID = event.commandID {
+        let commandID = try requiredCommandID(eventCommandID)
+        let turnID = try reduceFailed(commandID: commandID)
+        turnTerminal = .failed(turnID: turnID, commandID: commandID, failure: value)
+        failure = RuntimeConversationFailure(
+          turnID: turnID,
+          commandID: commandID,
+          value: value
+        )
+      } else {
+        failure = RuntimeConversationFailure(
+          turnID: nil,
+          commandID: nil,
+          value: value
+        )
       }
-      failure = RuntimeConversationFailure(
-        turnID: associatedTurnID,
-        commandID: event.commandID,
-        value: value
-      )
     }
     cursorState = nextCursor
   }
@@ -387,9 +404,13 @@ struct RuntimeConversationState {
       throw RuntimeConversationStateError.emptyApprovalRequestID
     }
     try bindLifecycleTurn(turnID: turnID, commandID: commandID)
-    guard pendingApprovals.count < Self.maxPendingApprovals,
+    guard approvalIdentityCount < Self.maximumApprovalIdentitiesPerTurn,
       pendingApprovalIndexByID[approvalID] == nil,
+      approvalResolutionsByID[approvalID] == nil,
       !pendingApprovals.contains(where: {
+        $0.turnID == turnID && $0.requestID == request.requestID
+      }),
+      !approvalResolutionsByID.values.contains(where: {
         $0.turnID == turnID && $0.requestID == request.requestID
       })
     else {
@@ -418,7 +439,7 @@ struct RuntimeConversationState {
     try validateApprovalID(approvalID)
     try bindLifecycleTurn(turnID: turnID, commandID: commandID)
 
-    let requestID: String?
+    let resolution: RuntimeConversationApprovalResolution
     if let pendingIndex = pendingApprovalIndexByID[approvalID] {
       let pendingApproval = pendingApprovals[pendingIndex]
       guard pendingApproval.turnID == turnID,
@@ -427,24 +448,67 @@ struct RuntimeConversationState {
       else {
         throw RuntimeConversationStateError.approvalIdentityMismatch
       }
-      requestID = pendingApproval.requestID
+      try validateInitialApprovalResolution(
+        decision: decision,
+        deliveryState: deliveryState
+      )
+      resolution = RuntimeConversationApprovalResolution(
+        turnID: turnID,
+        commandID: commandID,
+        approvalID: approvalID,
+        requestID: pendingApproval.requestID,
+        decision: decision,
+        deliveryState: deliveryState
+      )
       pendingApprovals.remove(at: pendingIndex)
       rebuildPendingApprovalIndex(startingAt: pendingIndex)
+    } else if let previous = approvalResolutionsByID[approvalID] {
+      guard previous.turnID == turnID,
+        previous.commandID == commandID,
+        previous.approvalID == approvalID
+      else {
+        throw RuntimeConversationStateError.approvalIdentityMismatch
+      }
+      try validateApprovalTransition(
+        from: previous,
+        decision: decision,
+        deliveryState: deliveryState
+      )
+      resolution = RuntimeConversationApprovalResolution(
+        turnID: turnID,
+        commandID: commandID,
+        approvalID: approvalID,
+        requestID: previous.requestID,
+        decision: decision,
+        deliveryState: deliveryState
+      )
     } else {
       // Snapshot 不携带 lifecycle ledger；baseline 之后首次看到 resolution 时不臆造 requestId。
       guard baselineTurnInference == .bound else {
         throw RuntimeConversationStateError.approvalIdentityMismatch
       }
-      requestID = nil
+      guard approvalIdentityCount < Self.maximumApprovalIdentitiesPerTurn else {
+        throw RuntimeConversationStateError.pendingApprovalConflict
+      }
+      try validateInferredApprovalResolution(
+        decision: decision,
+        deliveryState: deliveryState
+      )
+      resolution = RuntimeConversationApprovalResolution(
+        turnID: turnID,
+        commandID: commandID,
+        approvalID: approvalID,
+        requestID: nil,
+        decision: decision,
+        deliveryState: deliveryState
+      )
     }
-    lastApprovalResolution = RuntimeConversationApprovalResolution(
-      turnID: turnID,
-      commandID: commandID,
-      approvalID: approvalID,
-      requestID: requestID,
-      decision: decision,
-      deliveryState: deliveryState
-    )
+    approvalResolutionsByID[approvalID] = resolution
+    lastApprovalResolution = resolution
+  }
+
+  private var approvalIdentityCount: Int {
+    pendingApprovals.count + approvalResolutionsByID.count
   }
 
   private mutating func reduceTerminal(
@@ -455,7 +519,13 @@ struct RuntimeConversationState {
     try bindLifecycleTurn(turnID: turnID, commandID: commandID)
     if pendingApprovals.contains(where: {
       $0.turnID == turnID && $0.commandID == commandID
-    }) {
+    })
+      || approvalResolutionsByID.values.contains(where: {
+        $0.turnID == turnID
+          && $0.commandID == commandID
+          && Self.approvalDeliveryRemainsActive($0.deliveryState)
+      })
+    {
       throw RuntimeConversationStateError.unresolvedPendingApproval
     }
     if let activeTurn,
@@ -465,6 +535,20 @@ struct RuntimeConversationState {
       self.activeTurn = nil
       baselineTurnInference = .consumed
     }
+  }
+
+  private mutating func reduceFailed(
+    commandID: RuntimeCommandID
+  ) throws -> RuntimeTurnID? {
+    guard let activeTurn else {
+      guard baselineTurnInference == .available else {
+        throw RuntimeConversationStateError.turnStartRequired
+      }
+      baselineTurnInference = .consumed
+      return nil
+    }
+    try reduceTerminal(turnID: activeTurn.turnID, commandID: commandID)
+    return activeTurn.turnID
   }
 
   private mutating func bindLifecycleTurn(
@@ -510,6 +594,71 @@ struct RuntimeConversationState {
     pendingApprovalIndexByID = pendingApprovalIndexByID.filter { $0.value < firstIndex }
     for index in firstIndex..<pendingApprovals.count {
       pendingApprovalIndexByID[pendingApprovals[index].approvalID] = index
+    }
+  }
+
+  private func validateInitialApprovalResolution(
+    decision: ActionDecisionKind?,
+    deliveryState: ApprovalDeliveryStateV1
+  ) throws {
+    switch deliveryState {
+    case .claimed:
+      guard decision != nil else {
+        throw RuntimeConversationStateError.approvalDecisionMismatch
+      }
+    case .expired:
+      guard decision == nil else {
+        throw RuntimeConversationStateError.approvalDecisionMismatch
+      }
+    case .applying, .applied, .deliveryFailed:
+      throw RuntimeConversationStateError.approvalStateTransitionInvalid
+    }
+  }
+
+  private func validateInferredApprovalResolution(
+    decision: ActionDecisionKind?,
+    deliveryState: ApprovalDeliveryStateV1
+  ) throws {
+    switch deliveryState {
+    case .claimed, .applying, .applied, .deliveryFailed:
+      guard decision != nil else {
+        throw RuntimeConversationStateError.approvalDecisionMismatch
+      }
+    case .expired:
+      break
+    }
+  }
+
+  private func validateApprovalTransition(
+    from previous: RuntimeConversationApprovalResolution,
+    decision: ActionDecisionKind?,
+    deliveryState: ApprovalDeliveryStateV1
+  ) throws {
+    switch (previous.deliveryState, deliveryState) {
+    case (.claimed, .applying),
+      (.claimed, .expired),
+      (.applying, .applied),
+      (.applying, .deliveryFailed),
+      (.applying, .expired),
+      (.deliveryFailed, .applying),
+      (.deliveryFailed, .expired):
+      break
+    default:
+      throw RuntimeConversationStateError.approvalStateTransitionInvalid
+    }
+    guard let winner = previous.decision, decision == winner else {
+      throw RuntimeConversationStateError.approvalDecisionMismatch
+    }
+  }
+
+  private static func approvalDeliveryRemainsActive(
+    _ state: ApprovalDeliveryStateV1
+  ) -> Bool {
+    switch state {
+    case .claimed, .applying, .deliveryFailed:
+      true
+    case .applied, .expired:
+      false
     }
   }
 

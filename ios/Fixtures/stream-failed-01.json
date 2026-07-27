@@ -1,6 +1,121 @@
-[
-  { "delayMs": 0, "event": { "type": "sessionStarted", "sessionId": "sess-failed-01", "threadId": "t4", "agentKind": "claude_code" } },
-  { "delayMs": 100, "itemId": "f1", "event": { "type": "agentItem", "sessionId": "sess-failed-01", "threadId": "t4", "agentKind": "claude_code", "item": { "kind": "userMessage", "text": "把所有依赖升级到最新", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 500, "itemId": "f2", "event": { "type": "agentItem", "sessionId": "sess-failed-01", "threadId": "t4", "agentKind": "claude_code", "item": { "kind": "shell", "command": "bun update", "status": "failed", "exitCode": 1, "durationMs": 9200, "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 300, "event": { "type": "error", "sessionId": "sess-failed-01", "error": { "code": "cc.turn.failed", "message": "bun update 失败：peer dependency 冲突（react@19 与 legacy-ui@2）", "diagnosticRef": null } } }
-]
+{
+  "snapshot": {
+    "conversationId": "sess-failed-01",
+    "baseEventCursor": "beforeFirst",
+    "configurationState": {
+      "configurationRevision": 1,
+      "configuration": {
+        "vendorControl": {
+          "agentKind": "claude_code",
+          "configuration": {
+            "permissionMode": "default",
+            "model": null,
+            "effort": null,
+            "outputStyle": null
+          }
+        }
+      }
+    },
+    "items": [
+      {
+        "kind": "capabilities",
+        "commandId": null,
+        "itemId": null,
+        "entityId": null,
+        "capabilities": {
+          "agentKind": "claude_code",
+          "agentVersion": "fixture",
+          "features": [],
+          "vendor": {
+            "agentKind": "claude_code",
+            "permissionModes": [],
+            "outputStyles": [],
+            "hooksSupported": [],
+            "cliVersion": "fixture"
+          }
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "delayMs": 0,
+      "event": {
+        "conversationId": "sess-failed-01",
+        "eventId": "event-failed-01-0",
+        "eventSeq": 0,
+        "commandId": "command-failed-01",
+        "itemId": null,
+        "entityId": null,
+        "body": {
+          "kind": "turnStarted",
+          "turn_id": "turn-failed-01"
+        }
+      }
+    },
+    {
+      "delayMs": 100,
+      "event": {
+        "conversationId": "sess-failed-01",
+        "eventId": "event-failed-01-1",
+        "eventSeq": 1,
+        "commandId": "command-failed-01",
+        "itemId": "f1",
+        "entityId": "entity-f1",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "userMessage",
+            "text": "把所有依赖升级到最新",
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 500,
+      "event": {
+        "conversationId": "sess-failed-01",
+        "eventId": "event-failed-01-2",
+        "eventSeq": 2,
+        "commandId": "command-failed-01",
+        "itemId": "f2",
+        "entityId": "entity-f2",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "shell",
+            "command": "bun update",
+            "status": "failed",
+            "exitCode": 1,
+            "durationMs": 9200,
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 300,
+      "event": {
+        "conversationId": "sess-failed-01",
+        "eventId": "event-failed-01-3",
+        "eventSeq": 3,
+        "commandId": "command-failed-01",
+        "itemId": null,
+        "entityId": null,
+        "body": {
+          "kind": "error",
+          "failure": {
+            "code": "daemon.runtime.execution_failed",
+            "message": "agent execution failed",
+            "diagnosticRef": null
+          }
+        }
+      }
+    }
+  ]
+}

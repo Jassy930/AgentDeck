@@ -1,12 +1,66 @@
 {
   "machines": [
-    { "id": "mac-studio", "name": "Mac Studio", "isOnline": true, "lastHeartbeatSecondsAgo": 12 },
-    { "id": "macbook-air", "name": "MacBook Air", "isOnline": false, "lastHeartbeatSecondsAgo": 7200 }
+    {
+      "id": "mac-studio",
+      "name": "Mac Studio",
+      "connectionState": "connected",
+      "lastHeartbeatSecondsAgo": 12
+    },
+    {
+      "id": "macbook-air",
+      "name": "MacBook Air",
+      "connectionState": "machineOffline",
+      "lastHeartbeatSecondsAgo": 7200
+    }
   ],
   "sessions": [
-    { "id": "sess-codex-01", "machineId": "mac-studio", "title": "重构 IPC 重连逻辑", "cwd": "~/Documents/glm/AgentDeck", "agentKind": "codex", "group": "active", "stream": "stream-codex-01" },
-    { "id": "sess-cc-01", "machineId": "mac-studio", "title": "补充历史聚合测试", "cwd": "~/Documents/glm/AgentDeck", "agentKind": "claude_code", "group": "active", "stream": "stream-cc-01" },
-    { "id": "sess-approval-01", "machineId": "mac-studio", "title": "运行数据库迁移脚本", "cwd": "~/work/api-server", "agentKind": "codex", "group": "waitingApproval", "stream": "stream-approval-01" },
-    { "id": "sess-failed-01", "machineId": "mac-studio", "title": "升级依赖到最新版", "cwd": "~/work/web-app", "agentKind": "claude_code", "group": "recent", "stream": "stream-failed-01" }
+    {
+      "id": "sess-codex-01",
+      "machineId": "mac-studio",
+      "title": "重构 IPC 重连逻辑",
+      "cwd": "~/Documents/glm/AgentDeck",
+      "agentKind": "codex",
+      "group": "active",
+      "lastActiveMs": 4000,
+      "archived": false,
+      "revision": 1,
+      "stream": "stream-codex-01"
+    },
+    {
+      "id": "sess-cc-01",
+      "machineId": "mac-studio",
+      "title": "补充历史聚合测试",
+      "cwd": "~/Documents/glm/AgentDeck",
+      "agentKind": "claude_code",
+      "group": "active",
+      "lastActiveMs": 3000,
+      "archived": false,
+      "revision": 1,
+      "stream": "stream-cc-01"
+    },
+    {
+      "id": "sess-approval-01",
+      "machineId": "mac-studio",
+      "title": "运行数据库迁移脚本",
+      "cwd": "~/work/api-server",
+      "agentKind": "codex",
+      "group": "waitingApproval",
+      "lastActiveMs": 2000,
+      "archived": false,
+      "revision": 1,
+      "stream": "stream-approval-01"
+    },
+    {
+      "id": "sess-failed-01",
+      "machineId": "mac-studio",
+      "title": "升级依赖到最新版",
+      "cwd": "~/work/web-app",
+      "agentKind": "claude_code",
+      "group": "recent",
+      "lastActiveMs": 1000,
+      "archived": false,
+      "revision": 1,
+      "stream": "stream-failed-01"
+    }
   ]
 }

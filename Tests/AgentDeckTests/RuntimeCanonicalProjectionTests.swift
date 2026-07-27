@@ -1,8 +1,7 @@
-import AgentDeckCore
 import Foundation
 import XCTest
 
-@testable import AgentDeck
+@testable import AgentDeckCore
 
 final class RuntimeCanonicalProjectionTests: XCTestCase {
   func testSnapshotAndEventShareCanonicalProjectionWithoutSyntheticIdentity() throws {

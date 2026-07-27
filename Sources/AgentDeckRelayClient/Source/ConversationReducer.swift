@@ -34,10 +34,26 @@ private struct RelayPendingApproval: Sendable {
   let request: RuntimeActionRequestV1
 }
 
+private struct RelayApprovalResolution: Sendable {
+  let turnID: RuntimeTurnID
+  let commandID: RuntimeCommandID
+  let approvalID: RuntimeApprovalID
+  let requestID: String?
+  let winner: ActionDecisionKind?
+  let deliveryState: ApprovalDeliveryStateV1
+}
+
+private enum RelayBaselineTurnInferenceState: Sendable {
+  case unavailable
+  case available
+  case bound
+  case consumed
+}
+
 /// Source-facing conversation reducer。它保留 daemon canonical identity、approval
 /// requestID 与 exact-next cursor；不生成 UI 替代 ID，也不接触 raw wire/crypto。
 struct ConversationReducer: Sendable {
-  private static let maximumPendingApprovals = 32
+  private static let maximumApprovalIdentitiesPerTurn = 32
   private static let maximumFingerprints = 4_096
 
   let machineID: String
@@ -49,6 +65,8 @@ struct ConversationReducer: Sendable {
   private var activeTurn: RelayActiveTurn?
   private var pendingApprovals: [RuntimeApprovalID: RelayPendingApproval] = [:]
   private var pendingApprovalOrder: [RuntimeApprovalID] = []
+  private var approvalResolutions: [RuntimeApprovalID: RelayApprovalResolution] = [:]
+  private var baselineTurnInference: RelayBaselineTurnInferenceState
   private var completedEventID: RuntimeEventID?
   private var failedEventID: RuntimeEventID?
   private var eventFingerprints: [UInt64: Data] = [:]
@@ -90,6 +108,11 @@ struct ConversationReducer: Sendable {
     cursor = snapshot.baseEventCursor
     self.capabilities = capabilities
     configurationState = snapshot.configurationState
+    if case .at = snapshot.baseEventCursor {
+      baselineTurnInference = .available
+    } else {
+      baselineTurnInference = .unavailable
+    }
   }
 
   @discardableResult
@@ -198,6 +221,10 @@ struct ConversationReducer: Sendable {
       let commandID = try Self.requiredCommandID(event)
       guard activeTurn == nil else { throw RelaySourceReducerError.activeTurnConflict }
       activeTurn = RelayActiveTurn(turnID: turnID, commandID: commandID)
+      baselineTurnInference = .consumed
+      pendingApprovals.removeAll(keepingCapacity: true)
+      pendingApprovalOrder.removeAll(keepingCapacity: true)
+      approvalResolutions.removeAll(keepingCapacity: true)
       completedEventID = nil
       failedEventID = nil
 
@@ -207,14 +234,19 @@ struct ConversationReducer: Sendable {
         throw RelaySourceReducerError.emptyApprovalID
       }
       let commandID = try Self.requiredCommandID(event)
-      guard activeTurn == RelayActiveTurn(turnID: turnID, commandID: commandID) else {
-        throw RelaySourceReducerError.turnStartRequired
-      }
+      try bindLifecycleTurn(turnID: turnID, commandID: commandID)
       guard !request.requestID.isEmpty else {
         throw RelaySourceReducerError.emptyRequestID
       }
       guard pendingApprovals[approvalID] == nil,
-        pendingApprovals.count < Self.maximumPendingApprovals
+        approvalResolutions[approvalID] == nil,
+        !pendingApprovals.values.contains(where: {
+          $0.turnID == turnID && $0.request.requestID == request.requestID
+        }),
+        !approvalResolutions.values.contains(where: {
+          $0.turnID == turnID && $0.requestID == request.requestID
+        }),
+        approvalIdentityCount < Self.maximumApprovalIdentitiesPerTurn
       else {
         throw RelaySourceReducerError.approvalConflict
       }
@@ -226,36 +258,144 @@ struct ConversationReducer: Sendable {
       )
       pendingApprovalOrder.append(approvalID)
 
-    case .approvalResolved(let turnID, let approvalID, _, _):
+    case .approvalResolved(let turnID, let approvalID, let decision, let deliveryState):
       try Self.validate(turnID)
       guard !approvalID.rawValue.isEmpty else {
         throw RelaySourceReducerError.emptyApprovalID
       }
       let commandID = try Self.requiredCommandID(event)
-      guard let pending = pendingApprovals[approvalID],
-        pending.turnID == turnID,
-        pending.commandID == commandID
-      else {
-        throw RelaySourceReducerError.approvalIdentityMismatch
+      try bindLifecycleTurn(turnID: turnID, commandID: commandID)
+      let resolution: RelayApprovalResolution
+      if let pending = pendingApprovals[approvalID] {
+        guard pending.turnID == turnID,
+          pending.commandID == commandID,
+          pending.approvalID == approvalID
+        else {
+          throw RelaySourceReducerError.approvalIdentityMismatch
+        }
+        try Self.validateInitialApprovalResolution(
+          decision: decision,
+          deliveryState: deliveryState
+        )
+        resolution = RelayApprovalResolution(
+          turnID: turnID,
+          commandID: commandID,
+          approvalID: approvalID,
+          requestID: pending.request.requestID,
+          winner: decision,
+          deliveryState: deliveryState
+        )
+        pendingApprovals.removeValue(forKey: approvalID)
+        pendingApprovalOrder.removeAll { $0 == approvalID }
+      } else if let previous = approvalResolutions[approvalID] {
+        guard previous.turnID == turnID,
+          previous.commandID == commandID,
+          previous.approvalID == approvalID
+        else {
+          throw RelaySourceReducerError.approvalIdentityMismatch
+        }
+        try Self.validateApprovalTransition(
+          from: previous,
+          decision: decision,
+          deliveryState: deliveryState
+        )
+        resolution = RelayApprovalResolution(
+          turnID: turnID,
+          commandID: commandID,
+          approvalID: approvalID,
+          requestID: previous.requestID,
+          winner: decision,
+          deliveryState: deliveryState
+        )
+      } else {
+        guard baselineTurnInference == .bound else {
+          throw RelaySourceReducerError.approvalIdentityMismatch
+        }
+        guard approvalIdentityCount < Self.maximumApprovalIdentitiesPerTurn else {
+          throw RelaySourceReducerError.approvalConflict
+        }
+        try Self.validateInferredApprovalResolution(
+          decision: decision,
+          deliveryState: deliveryState
+        )
+        resolution = RelayApprovalResolution(
+          turnID: turnID,
+          commandID: commandID,
+          approvalID: approvalID,
+          requestID: nil,
+          winner: decision,
+          deliveryState: deliveryState
+        )
       }
-      pendingApprovals.removeValue(forKey: approvalID)
-      pendingApprovalOrder.removeAll { $0 == approvalID }
+      approvalResolutions[approvalID] = resolution
 
     case .turnCompleted(let turnID, _), .turnInterrupted(let turnID):
       try Self.validate(turnID)
       let commandID = try Self.requiredCommandID(event)
-      guard activeTurn == RelayActiveTurn(turnID: turnID, commandID: commandID) else {
-        throw RelaySourceReducerError.turnIdentityMismatch
-      }
-      guard !pendingApprovals.values.contains(where: { $0.turnID == turnID }) else {
-        throw RelaySourceReducerError.unresolvedApproval
-      }
-      activeTurn = nil
+      try reduceTerminal(turnID: turnID, commandID: commandID)
       completedEventID = event.eventID
 
     case .error:
+      guard event.commandID != nil else { break }
+      let commandID = try Self.requiredCommandID(event)
+      try reduceFailed(commandID: commandID)
       failedEventID = event.eventID
     }
+  }
+
+  private var approvalIdentityCount: Int {
+    pendingApprovals.count + approvalResolutions.count
+  }
+
+  private mutating func reduceFailed(
+    commandID: RuntimeCommandID
+  ) throws {
+    guard let activeTurn else {
+      guard baselineTurnInference == .available else {
+        throw RelaySourceReducerError.turnStartRequired
+      }
+      baselineTurnInference = .consumed
+      return
+    }
+    try reduceTerminal(turnID: activeTurn.turnID, commandID: commandID)
+  }
+
+  private mutating func reduceTerminal(
+    turnID: RuntimeTurnID,
+    commandID: RuntimeCommandID
+  ) throws {
+    try bindLifecycleTurn(turnID: turnID, commandID: commandID)
+    guard
+      !pendingApprovals.values.contains(where: {
+        $0.turnID == turnID && $0.commandID == commandID
+      }),
+      !approvalResolutions.values.contains(where: {
+        $0.turnID == turnID
+          && $0.commandID == commandID
+          && Self.approvalDeliveryRemainsActive($0.deliveryState)
+      })
+    else {
+      throw RelaySourceReducerError.unresolvedApproval
+    }
+    activeTurn = nil
+    baselineTurnInference = .consumed
+  }
+
+  private mutating func bindLifecycleTurn(
+    turnID: RuntimeTurnID,
+    commandID: RuntimeCommandID
+  ) throws {
+    if let activeTurn {
+      guard activeTurn == RelayActiveTurn(turnID: turnID, commandID: commandID) else {
+        throw RelaySourceReducerError.turnIdentityMismatch
+      }
+      return
+    }
+    guard baselineTurnInference == .available else {
+      throw RelaySourceReducerError.turnStartRequired
+    }
+    activeTurn = RelayActiveTurn(turnID: turnID, commandID: commandID)
+    baselineTurnInference = .bound
   }
 
   private mutating func rememberFingerprint(_ fingerprint: Data, sequence: UInt64) {
@@ -276,5 +416,70 @@ struct ConversationReducer: Sendable {
 
   private static func validate(_ turnID: RuntimeTurnID) throws {
     guard !turnID.rawValue.isEmpty else { throw RelaySourceReducerError.emptyTurnID }
+  }
+
+  private static func validateInitialApprovalResolution(
+    decision: ActionDecisionKind?,
+    deliveryState: ApprovalDeliveryStateV1
+  ) throws {
+    switch deliveryState {
+    case .claimed:
+      guard decision != nil else {
+        throw RelaySourceReducerError.approvalIdentityMismatch
+      }
+    case .expired:
+      guard decision == nil else {
+        throw RelaySourceReducerError.approvalIdentityMismatch
+      }
+    case .applying, .applied, .deliveryFailed:
+      throw RelaySourceReducerError.approvalConflict
+    }
+  }
+
+  private static func validateInferredApprovalResolution(
+    decision: ActionDecisionKind?,
+    deliveryState: ApprovalDeliveryStateV1
+  ) throws {
+    switch deliveryState {
+    case .claimed, .applying, .applied, .deliveryFailed:
+      guard decision != nil else {
+        throw RelaySourceReducerError.approvalIdentityMismatch
+      }
+    case .expired:
+      break
+    }
+  }
+
+  private static func validateApprovalTransition(
+    from previous: RelayApprovalResolution,
+    decision: ActionDecisionKind?,
+    deliveryState: ApprovalDeliveryStateV1
+  ) throws {
+    switch (previous.deliveryState, deliveryState) {
+    case (.claimed, .applying),
+      (.claimed, .expired),
+      (.applying, .applied),
+      (.applying, .deliveryFailed),
+      (.applying, .expired),
+      (.deliveryFailed, .applying),
+      (.deliveryFailed, .expired):
+      break
+    default:
+      throw RelaySourceReducerError.approvalConflict
+    }
+    guard let winner = previous.winner, decision == winner else {
+      throw RelaySourceReducerError.approvalIdentityMismatch
+    }
+  }
+
+  private static func approvalDeliveryRemainsActive(
+    _ state: ApprovalDeliveryStateV1
+  ) -> Bool {
+    switch state {
+    case .claimed, .applying, .deliveryFailed:
+      true
+    case .applied, .expired:
+      false
+    }
   }
 }

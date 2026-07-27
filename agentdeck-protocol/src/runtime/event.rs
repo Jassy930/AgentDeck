@@ -77,7 +77,14 @@ impl RuntimeEvent {
             | RuntimeEventBody::TurnInterrupted { .. } => {
                 no_item_identity && self.command_id.is_some()
             }
-            RuntimeEventBody::Error { .. } => no_item_identity,
+            RuntimeEventBody::Error { failure } => {
+                no_item_identity
+                    && (self.command_id.is_none()
+                        || (failure.code
+                            == crate::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED
+                            && failure.message == "agent execution failed"
+                            && failure.diagnostic_ref.is_none()))
+            }
         };
         if valid {
             Ok(())

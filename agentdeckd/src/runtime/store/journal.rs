@@ -6354,7 +6354,7 @@ fn validate_all_event_metadata(
 }
 
 /// 动态审计真实 authenticated event rows，而不是从 command state 固定推导每条命令
-/// 必须恰有一或两条事件。这样 Item/Error/approval 事件可以增长，同时 orphan、gap、
+/// 必须恰有一或两条事件。这样 Item/approval 事件可以增长，同时 orphan、gap、
 /// 错 command/turn 与 pointer body 漂移仍然 fail-close。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DynamicEventIntegritySummary {
@@ -6524,11 +6524,6 @@ fn validate_dynamic_event_ledger(
                 super::execution_event::validate_durable_item(item_id, entity_id, &item)
                     .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
             }
-            agentdeck_protocol::runtime::RuntimeEventBody::Error { failure }
-                if failure.code
-                    == agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED
-                    && failure.message == "agent execution failed"
-                    && failure.diagnostic_ref.is_none() => {}
             agentdeck_protocol::runtime::RuntimeEventBody::ActionRequest {
                 turn_id: event_turn,
                 ..
@@ -7934,7 +7929,14 @@ fn validate_legacy_canonical_terminal_body(
                 turn_id: event_turn,
             },
         ) => event_turn.as_str() == turn_id.to_canonical_string(),
-        (CommandState::Failed, agentdeck_protocol::runtime::RuntimeEventBody::Error { .. }) => true,
+        (
+            CommandState::Failed,
+            agentdeck_protocol::runtime::RuntimeEventBody::Error { failure },
+        ) => {
+            failure.code == agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED
+                && failure.message == "agent execution failed"
+                && failure.diagnostic_ref.is_none()
+        }
         _ => false,
     };
     if valid {

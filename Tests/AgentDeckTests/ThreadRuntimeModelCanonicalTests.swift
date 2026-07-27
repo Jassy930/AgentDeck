@@ -188,6 +188,79 @@ final class ThreadRuntimeModelCanonicalTests: XCTestCase {
     XCTAssertEqual(model.updatedAt, beforeUpdatedAt)
   }
 
+  func testDiagnosticErrorKeepsRunningAndCommandBoundErrorBecomesFailedTerminal() throws {
+    let id = conversationID("conversation-1")
+    let command = commandID("command-1")
+    let turn = turnID("turn-1")
+    let model = try ThreadRuntimeModel(
+      conversationID: id,
+      agentKind: .codex,
+      cwd: nil,
+      initialPhase: .ready
+    )
+    try model.apply(snapshot(conversationID: id, baseCursor: .beforeFirst, items: []))
+    try model.apply(
+      event(
+        conversationID: id,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: command,
+        body: .turnStarted(turnID: turn)
+      )
+    )
+
+    let nextCommand = commandID("command-2")
+    model.projectBootstrapPromptReceipt(
+      "after failure",
+      receipt: .accepted(
+        commandID: nextCommand,
+        queuePosition: 1,
+        configurationRevision: 1
+      )
+    )
+    XCTAssertEqual(model.queuedPrompts, ["after failure"])
+
+    let diagnosticAction = try model.apply(
+      event(
+        conversationID: id,
+        sequence: 1,
+        eventID: "event-diagnostic",
+        body: .error(RuntimeFailureV1(code: "daemon.adapter.warning", message: "retrying"))
+      )
+    )
+    XCTAssertNil(diagnosticAction)
+    XCTAssertEqual(model.phase, .running)
+    XCTAssertEqual(model.errorMessage, "retrying")
+    XCTAssertEqual(model.queuedPrompts, ["after failure"])
+
+    let terminalAction = try model.apply(
+      event(
+        conversationID: id,
+        sequence: 2,
+        eventID: "event-failed",
+        commandID: command,
+        body: .error(terminalFailure())
+      )
+    )
+    XCTAssertNil(terminalAction)
+    XCTAssertEqual(model.phase, .failed)
+    XCTAssertEqual(model.errorMessage, "agent execution failed")
+    XCTAssertEqual(model.queuedPrompts, ["after failure"])
+
+    try model.apply(
+      event(
+        conversationID: id,
+        sequence: 3,
+        eventID: "event-next-started",
+        commandID: nextCommand,
+        body: .turnStarted(turnID: turnID("turn-2"))
+      )
+    )
+    XCTAssertEqual(model.phase, .running)
+    XCTAssertNil(model.errorMessage)
+    XCTAssertTrue(model.queuedPrompts.isEmpty)
+  }
+
   func testMultipleApprovalsBuildExactIntentWithoutEagerRemoval() throws {
     let id = conversationID("conversation-1")
     let turn = turnID("turn-1")
@@ -305,13 +378,13 @@ final class ThreadRuntimeModelCanonicalTests: XCTestCase {
       event(
         conversationID: id,
         sequence: 3,
-        eventID: "event-resolved-2",
+        eventID: "event-claimed-2",
         commandID: command,
         body: .approvalResolved(
           turnID: turn,
           approvalID: approvalID("approval-2"),
           decision: .deny,
-          state: .applied
+          state: .claimed
         )
       )
     )
@@ -330,13 +403,41 @@ final class ThreadRuntimeModelCanonicalTests: XCTestCase {
       event(
         conversationID: id,
         sequence: 4,
-        eventID: "event-resolved-1",
+        eventID: "event-applying-2",
+        commandID: command,
+        body: .approvalResolved(
+          turnID: turn,
+          approvalID: approvalID("approval-2"),
+          decision: .deny,
+          state: .applying
+        )
+      )
+    )
+    try model.apply(
+      event(
+        conversationID: id,
+        sequence: 5,
+        eventID: "event-applied-2",
+        commandID: command,
+        body: .approvalResolved(
+          turnID: turn,
+          approvalID: approvalID("approval-2"),
+          decision: .deny,
+          state: .applied
+        )
+      )
+    )
+    try model.apply(
+      event(
+        conversationID: id,
+        sequence: 6,
+        eventID: "event-expired-1",
         commandID: command,
         body: .approvalResolved(
           turnID: turn,
           approvalID: approvalID("approval-1"),
-          decision: .approve,
-          state: .applied
+          decision: nil,
+          state: .expired
         )
       )
     )
@@ -349,7 +450,7 @@ final class ThreadRuntimeModelCanonicalTests: XCTestCase {
     let action = try model.apply(
       event(
         conversationID: id,
-        sequence: 5,
+        sequence: 7,
         eventID: "event-complete",
         commandID: command,
         body: .turnCompleted(turnID: turn, summary: try turnSummary())
@@ -376,7 +477,7 @@ final class ThreadRuntimeModelCanonicalTests: XCTestCase {
     try model.apply(
       event(
         conversationID: id,
-        sequence: 6,
+        sequence: 8,
         eventID: "event-queued-start",
         commandID: queuedCommand,
         body: .turnStarted(turnID: turnID("turn-queued-next"))
@@ -1187,6 +1288,13 @@ final class ThreadRuntimeModelCanonicalTests: XCTestCase {
         "totalInputTokens": NSNull(),
         "totalOutputTokens": NSNull(),
       ]
+    )
+  }
+
+  private func terminalFailure() -> RuntimeFailureV1 {
+    RuntimeFailureV1(
+      code: "daemon.runtime.execution_failed",
+      message: "agent execution failed"
     )
   }
 

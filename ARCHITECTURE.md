@@ -64,7 +64,8 @@ agentdeckd
   marker；P5.3 已实现 generation-scoped WSS、TLS pin、bounded transport 与 per-connection transfer
   assembler；P5.4 automatic Task 已接上 production `MachineConnection`/verified ingress、process-global
   transfer coordinator、bounded broadcaster/reducers、scoped `RelaySessionSource`、typed command 与 pairing
-  handler。旧 iOS fixture 迁移与 AppKit registry 仍分别属于 P5.5/P5.8。
+  handler；P5.5 已让 iOS fixture/ViewModel 直接实现并消费共享 `SessionSource`，同时把 canonical reducer
+  下沉到 `AgentDeckCore`。iOS 发行 composition 与 AppKit registry 仍分别属于 P5.6、P5.7/P5.8。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/local/`：当前为本地 Runtime v5 framing；它在 P4.2 Runtime v3 machine administration 与
@@ -775,9 +776,10 @@ conversation/key，不能伪造身份连续性。
   wire DTO；`LocalPairingAdministration` 不继承 `SessionSource`，远程 source 不能获得本机批准能力。
 - `MachineSummary` 以 `SessionConnectionState` 为唯一连接事实，不提供把离线原因压成 Bool 的 public
   initializer；`ConversationSummary` 不携带 fixture-only `streamResource`。
-- P5.1 只完成 facade、公共模型、依赖图与 compile/link contract。旧 iOS
-  `MobileSessionSource`/models/fixture 在 P5.5 前继续留在 app target，`SceneDelegate` 仍注入 fixture；
-  因此本项不证明 RelaySessionSource、bounded broadcaster、WSS/Keychain、真实 iOS 或 P5 Phase Exit。
+- P5.1 只完成 facade、公共模型、依赖图与 compile/link contract；当时旧 iOS
+  `MobileSessionSource`/models/fixture 仍留在 app target。P5.5 已删除这套平行协议并迁移到共享
+  `SessionSource`，但 `SceneDelegate` 仍注入 preview/test fixture；因此 P5.1/P5.5 都不证明发行
+  Relay composition、真实 iOS 链路或 P5 Phase Exit。
 
 ### Relay Companion MVP P5.2 client CryptoState 不变量
 
@@ -871,9 +873,10 @@ conversation/key，不能伪造身份连续性。
   scope、late observer、shutdown/join、catalog/conversation/inbox reducer 与 typed command/pairing path 都保持
   actor 隔离。最后一个 conversation observer 退出时必须先完成 Runtime unsubscribe receipt、Relay outer
   unsubscribe 与 correlation retirement；该 single-flight retirement 返回前，同 conversation replacement 必须
-  拒绝且 retirement 继续计入全局/per-machine observer cap，避免 unsubscribe ABA。P5.4 automatic complete 不证明
-  旧 iOS fixture 已迁移、AppKit registry、Simulator Relay E2E、真实公网
-  WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 或 P5 Phase Exit。
+  拒绝且 retirement 继续计入全局/per-machine observer cap，避免 unsubscribe ABA。P5.4 单项收口时不证明
+  iOS fixture/ViewModel 已迁移；该迁移已由 P5.5 单独完成。P5.4/P5.5 仍都不证明发行 composition、AppKit
+  registry、Simulator Relay E2E、真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、
+  真实 vendor 或 P5 Phase Exit。
 - paired record/marker 的内部 `ADPR`/`ADPM` codec 在 P5.4 增加 MachineRoot public key 与 Data certificate 后
   固定为 version 2；version 1 缺少重新验证 production connection 所需的信任材料，不能从 fingerprint 或 grant
   安全重建，因此只允许 fail-closed，不做猜测式迁移。该 hard cutover 仅覆盖尚未发布真实配对入口的 pre-MVP
@@ -887,6 +890,66 @@ conversation/key，不能伪造身份连续性。
   与裸 `promote` 写入口保持 module-internal；marker 缺失的 partial rollback 在删除前必须用 exact snapshot、
   promotion ID 与 guard commitment 重建 bootstrap permit 并审计 CounterGuard。requestPrepared 与合法 partial
   promotion 仍分别按绝对 expiry 清理和精确回滚。
+
+### Relay Companion MVP P5.5 canonical fixture / receipt UI 不变量
+
+- iOS 唯一数据协议已从 app 内私有 `MobileSessionSource` 切到共享 `SessionSource`；四组 ViewModel 只依赖
+  facade model/receipt/connection state，不 import Relay wire、CryptoKit 或 concrete production source。
+  `FixtureSessionSource` 是 actor/Sendable 的 preview/test 实现，不是发行 source；`SceneDelegate` 的真实
+  Relay composition、扫码配对、credential lifecycle 与前后台恢复仍由 P5.6 接管。
+- `RuntimeConversationState` 与 canonical item/cursor projection 位于 `AgentDeckCore`，macOS、Relay client、
+  fixture 与 iOS ViewModel 不再各自生成替代 identity。snapshot 原子替换 baseline；event 只接受 exact-next
+  cursor、同 conversation 和稳定 item/entity/command binding；失败不得留下半更新。
+- Runtime v5 `Error` 以 command binding 唯一区分语义：`commandID == nil` 是 conversation diagnostic，不能
+  结束 active turn、推进 queued prompt 或生成 failed inbox；`commandID != nil` 是 Failed terminal，且 failure
+  必须精确为 `daemon.runtime.execution_failed / agent execution failed / diagnosticRef=null`。execution event
+  lane 不再接收 adapter transient Error；fatal adapter completion 只由 command terminal builder 生成一次
+  fixed Error。Failed 与 Completed/Interrupted 共用 command、approval terminal 与一次性 snapshot baseline
+  gate；snapshot direct Failed 的 `turnID` 可为空，只能依赖全库唯一 commandID 消费一次 baseline。旧开发库中
+  不由 `terminal_event_id` 指向的 command-bound Error 必须在 open-time integrity audit fail-close。
+- canonical approval ledger 绑定 turn/command/approval/request identity 与唯一赢家；同一 turn 的 requestID
+  在 pending 与 resolved ledger 全程唯一，不能换 approvalID 重用。初始 resolution 只允许
+  pending `→ Claimed(winner)` 或 `→ Expired(nil)`；后续只允许
+  `Claimed → Applying|Expired`、`Applying → Applied|DeliveryFailed|Expired`、
+  `DeliveryFailed → Applying|Expired`，且每一步必须复用相同 winner。Relay source reducer 与 Core reducer
+  保持同一状态约束；pending + resolved identity 合计每 turn 最多 32，第 33 个必须在 cursor/ledger 零修改
+  前原子拒绝。`.at(H)` snapshot 后可把首个 lifecycle event 绑定为一次 mid-turn inference，包括直接
+  terminal；绑定被消费后必须重新看到 `turnStarted`。尚处于 Claimed/Applying/DeliveryFailed 的 turn 不能
+  伪装 terminal。
+- command/approval receipt 与 canonical stream 是两个独立到达轴。ViewModel 把同 operation epoch 的 receipt
+  作为 UI floor，只有 canonical 追到同一或更后状态后才交回主导权；迟到 Claimed/Applying 不能把 receipt
+  已证明的 Applied、DeliveryFailed 或 Expired 回退。DeliveryFailed 的 delivery retry 只有在 canonical 已观察
+  对应 failure 后才能成立，旧 Applying 不得当作新 round。fresh snapshot 只是同一 observation 的 generation
+  barrier：不得取消同 identity operation，或清空 context、receipt、transport-unknown retry 与 canonical
+  terminal floor；新 generation 的 transition counter 保持单调。backfill 重现相同 approvalID 时必须精确匹配
+  turn/command/request identity，错绑立即 security terminal；合法 Applied/Expired 可覆盖恢复前 DeliveryFailed
+  floor。resolve/retry operation 与 receipt 都记录 canonical event-seq fence；retry 只接受 fence 后的新
+  Applying。canonical 先收口时最多保留 32 条 retired-operation 证据，迟到 receipt 仍须匹配 approvalID 与
+  winner。新 turn 只允许清理 Applied、Expired 或等价 terminal AlreadyHandled；任何非终态旧卡都 fail-close。
+  `.at(H)` snapshot 后直接到达 matching turn terminal 时也执行相同门禁，不能让 terminal event 静默清掉或
+  保留可点击的 pending 卡。lagged recovery snapshot 成功接受后 connection 恢复 connected，但初始
+  connecting snapshot 不冒充恢复。
+- prompt transport outcome unknown 只允许同文本复用原 idempotency key；canonical user item 必须以 receipt
+  commandID 精确匹配后替换本地 pending row。receipt 到达后若 canonical 已有 terminal，也只能在 terminal
+  commandID 与 receipt commandID 精确相同时收口；上一 command 的 Completed/Interrupted/Failed terminal
+  不得消费下一 prompt。approval transport outcome unknown 只允许以原决定和原 key 重试；single-flight task、
+  operation token 与取消保证迟到 response 不覆盖新 operation。
+- bare `.expired` receipt 不携带赢家，且只对应 Pending 无赢家过期，UI 必须显示 `.expired(nil)`；已 claim
+  后过期由 daemon 返回 `.alreadyHandled(winner, .expired)`。bare Expired 后出现 canonical winner、
+  approvalID/turnID/commandID/requestID 或 canonical/receipt winner 不一致，以及
+  `.revoked`、`.incompatible`、`.securityError`，均进入不可逆 terminal、取消 observation/command/approval
+  task 并禁止后续操作。
+- 五份 bundle fixture 直接承载 canonical `ConversationSnapshotV2` 与 `RuntimeEventV2`；首帧为 snapshot，
+  随后发布 typed connection state。resource observation 为 newest-one，conversation buffer 为 512；overflow
+  终止 lagged 旧 subscriber，late subscriber 从更新后的 fresh snapshot 连续恢复。fixture 审批按
+  `Claimed → Applying → Applied` 发布 exact-next event，并返回确定 receipt；pair/revoke 只返回 typed refusal。
+- Machine/Session/Inbox 的 `.failed` resource state 必须清空旧 ready 投影并触发一次 `onUpdate`；retryable
+  只表示可重试，不能让旧列表遮蔽当前错误。
+- P5.5 automatic 证据为顶层 Swift `980 XCTest / 4 skipped + 35 Swift Testing / 0 failure`，以及
+  Core/Relay/protocol、Rust producer/store integrity、SessionDetail/fixture 与 fresh Simulator 门禁；精确命令
+  和最终计数见 `docs/QUALITY.md`。
+  P5 进度为 5/9；P5.6–P5.9 与 P5 Phase Exit 仍未完成，真实公网、物理 iPhone、production-signed
+  Keychain、第二台 Mac 与真实 vendor 继续 post-MVP BLOCKED。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 
@@ -1316,9 +1379,10 @@ conversation/key，不能伪造身份连续性。
 - adapter 的 cold prepare hook 必须借用不可由 safe external code 构造的
   `PrepareAdapterTurnCapability`。daemon-owned handle 保存 exact binding，并在 consumption 时对虚
   `exec_spec()` 返回值重新核对，不能只信任 prepare 时的一次 getter 调用。
-- dynamic Item/Error 只有 Store-owned typed constructor；adapter/caller 不能写 raw RuntimeEvent、bytes
-  或原始 ProtocolError。Fresh append/approval 必须匹配 authenticated Started/turn 和 released Fence；
-  Error 只能映射到固定 `daemon.runtime.execution_failed`，不持久化 vendor stderr/path/token。
+- dynamic Item 只有 Store-owned typed constructor；adapter/caller 不能写 raw RuntimeEvent、bytes
+  或原始 ProtocolError。Fresh append/approval 必须匹配 authenticated Started/turn 和 released Fence。
+  execution lane 不再持久化 transient Error；fatal completion 的 Failed 只由 command terminal builder 映射到
+  固定 `daemon.runtime.execution_failed`，不持久化 vendor stderr/path/token/diagnostic reference。
 - prepared event receiver 只有在 durable release permit 已提交且 cold release 调用成功后才开始转发；
   release 失败必须先丢弃 receiver，再 fence control 并写 Interrupted。该顺序防止 prepare 阶段预排的
   approval 越过 gate 失败边界。

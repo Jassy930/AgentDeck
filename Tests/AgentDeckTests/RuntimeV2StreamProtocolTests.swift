@@ -247,7 +247,7 @@ final class RuntimeV2StreamProtocolTests: XCTestCase {
             (["kind": "turnCompleted", "turn_id": "turn-1", "summary": turnSummary()], "command-1", NSNull(), NSNull()),
             (["kind": "turnInterrupted", "turn_id": "turn-1"], "command-1", NSNull(), NSNull()),
             (["kind": "error", "failure": failure()], NSNull(), NSNull(), NSNull()),
-            (["kind": "error", "failure": failure("command failure")], "command-error", NSNull(), NSNull()),
+            (["kind": "error", "failure": terminalFailure()], "command-error", NSNull(), NSNull()),
         ]
         for (index, value) in cases.enumerated() {
             let wire = event(
@@ -333,6 +333,39 @@ final class RuntimeV2StreamProtocolTests: XCTestCase {
                 itemID: nil,
                 entityID: nil,
                 body: .turnStarted(turnID: RuntimeTurnID(rawValue: "turn-1"))
+            )
+        )
+    }
+
+    func testCommandBoundErrorRequiresFixedDaemonFailureTuple() throws {
+        let invalidFailures: [[String: Any]] = [
+            failure(),
+            [
+                "code": "daemon.runtime.execution_failed", "message": "wrong message",
+                "diagnosticRef": NSNull(),
+            ],
+            [
+                "code": "daemon.runtime.execution_failed", "message": "agent execution failed",
+                "diagnosticRef": "diag-not-allowed",
+            ],
+        ]
+        for invalidFailure in invalidFailures {
+            let wire = event(
+                body: ["kind": "error", "failure": invalidFailure],
+                commandID: "command-invalid"
+            )
+            try assertDecodeFails(RuntimeEventV2.self, wire)
+        }
+
+        XCTAssertThrowsError(
+            try RuntimeEventV2(
+                conversationID: RuntimeConversationID(rawValue: "conversation-1"),
+                eventID: RuntimeEventID(rawValue: "event-invalid-terminal-failure"),
+                eventSeq: 0,
+                commandID: RuntimeCommandID(rawValue: "command-1"),
+                itemID: nil,
+                entityID: nil,
+                body: .error(RuntimeFailureV1(code: "daemon.test", message: "failure"))
             )
         )
     }
@@ -521,6 +554,13 @@ final class RuntimeV2StreamProtocolTests: XCTestCase {
 
     private func failure(_ message: String = "failure") -> [String: Any] {
         ["code": "daemon.test", "message": message, "diagnosticRef": NSNull()]
+    }
+
+    private func terminalFailure() -> [String: Any] {
+        [
+            "code": "daemon.runtime.execution_failed", "message": "agent execution failed",
+            "diagnosticRef": NSNull(),
+        ]
     }
 
 }

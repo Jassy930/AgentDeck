@@ -7,8 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agentdeck_protocol::runtime::RuntimeEvent;
-use agentdeck_protocol::runtime::identity::{CommandId, EntityId, ItemId};
+use agentdeck_protocol::runtime::identity::{CommandId, ConversationId, EntityId, EventId, ItemId};
+use agentdeck_protocol::runtime::{RuntimeEvent, RuntimeEventBody, RuntimeFailure};
 use agentdeck_protocol::{AgentItem, AgentItemMeta, TurnSummary};
 use agentdeckd::runtime::model::MAX_RUNTIME_EVENT_BYTES;
 use agentdeckd::runtime::store::cipher::{KeyWrapAad, RowAad, RuntimeKeyBundle};
@@ -84,6 +84,14 @@ pub(crate) struct RuntimeEventTamperFixture {
 
 impl RuntimeEventTamperFixture {
     pub(crate) async fn create(label: &str, seed: u8) -> Self {
+        Self::create_inner(label, seed, false).await
+    }
+
+    pub(crate) async fn create_with_fixed_error_sized_item(label: &str, seed: u8) -> Self {
+        Self::create_inner(label, seed, true).await
+    }
+
+    async fn create_inner(label: &str, seed: u8, match_fixed_error_size: bool) -> Self {
         let root = TestRoot::new(label);
         let keys = MemoryKeyStore::new();
         let store = RuntimeStoreHandle::open(
@@ -156,16 +164,72 @@ impl RuntimeEventTamperFixture {
             .await
             .expect("release tamper execution");
         let item_event_id = runtime_id(RuntimeIdKind::Event, seed.wrapping_add(3));
+        let (item_id, entity_id, item_text) = if match_fixed_error_size {
+            let error = RuntimeEvent::new(
+                ConversationId::new(conversation_id.to_canonical_string()),
+                EventId::new(item_event_id.to_canonical_string()),
+                started
+                    .event_seq
+                    .checked_add(1)
+                    .expect("fixture event sequence has headroom"),
+                Some(CommandId::new(command.command_id.to_canonical_string())),
+                None,
+                None,
+                RuntimeEventBody::Error {
+                    failure: RuntimeFailure::new(
+                        agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED,
+                        "agent execution failed",
+                    ),
+                },
+            )
+            .expect("fixed command-bound Error is protocol-valid");
+            let error_len = serde_json::to_vec(&error)
+                .expect("encode fixed Error sizing target")
+                .len();
+            let item_id = ItemId::new("i");
+            let entity_id = EntityId::new("e");
+            let empty_item = RuntimeEvent::new(
+                ConversationId::new(conversation_id.to_canonical_string()),
+                EventId::new(item_event_id.to_canonical_string()),
+                started
+                    .event_seq
+                    .checked_add(1)
+                    .expect("fixture event sequence has headroom"),
+                Some(CommandId::new(command.command_id.to_canonical_string())),
+                Some(item_id.clone()),
+                Some(entity_id.clone()),
+                RuntimeEventBody::Item {
+                    item: AgentItem::AssistantMessage {
+                        text: String::new(),
+                        meta: AgentItemMeta::default(),
+                    },
+                },
+            )
+            .expect("minimal sizing Item is protocol-valid");
+            let item_len = serde_json::to_vec(&empty_item)
+                .expect("encode minimal sizing Item")
+                .len();
+            let text_len = error_len
+                .checked_sub(item_len)
+                .expect("fixed Error must fit a padded minimal Item row");
+            (item_id, entity_id, "x".repeat(text_len))
+        } else {
+            (
+                ItemId::new("tamper-item-id"),
+                EntityId::new("tamper-entity-id"),
+                "real released adapter output".to_owned(),
+            )
+        };
         let item = match store
             .append_execution_event(AppendExecutionEvent::item(
                 conversation_id,
                 command.command_id,
                 turn_id,
                 item_event_id,
-                ItemId::new("tamper-item-id"),
-                EntityId::new("tamper-entity-id"),
+                item_id,
+                entity_id,
                 AgentItem::AssistantMessage {
-                    text: "real released adapter output".to_owned(),
+                    text: item_text,
                     meta: AgentItemMeta::default(),
                 },
             ))

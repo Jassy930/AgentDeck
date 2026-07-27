@@ -447,6 +447,8 @@ final class ThreadRuntimeModel {
     switch event.body {
     case .turnCompleted, .turnInterrupted:
       return prepareQueueDispatchIfPossible()
+    case .error where event.commandID != nil:
+      return prepareQueueDispatchIfPossible()
     default:
       return nil
     }
@@ -721,7 +723,7 @@ final class ThreadRuntimeModel {
   }
 
   private func refreshPhase(preservingStarting: Bool) {
-    if conversationState.failure != nil {
+    if case .failed? = conversationState.turnTerminal {
       phase = .failed
     } else if !conversationState.pendingApprovals.isEmpty {
       phase = .waitingApproval
@@ -765,7 +767,8 @@ final class ThreadRuntimeModel {
     }
     switch state.turnTerminal {
     case .completed(_, let terminalCommandID, _),
-      .interrupted(_, let terminalCommandID):
+      .interrupted(_, let terminalCommandID),
+      .failed(_, let terminalCommandID, _):
       return terminalCommandID == commandID
     case nil:
       return false

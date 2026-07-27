@@ -1,7 +1,144 @@
-[
-  { "delayMs": 0, "event": { "type": "sessionStarted", "sessionId": "sess-cc-01", "threadId": "t2", "agentKind": "claude_code" } },
-  { "delayMs": 100, "itemId": "c1", "event": { "type": "agentItem", "sessionId": "sess-cc-01", "threadId": "t2", "agentKind": "claude_code", "item": { "kind": "userMessage", "text": "给跨 agent 历史聚合补边界测试", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 500, "itemId": "c2", "event": { "type": "agentItem", "sessionId": "sess-cc-01", "threadId": "t2", "agentKind": "claude_code", "item": { "kind": "toolCall", "name": "Read", "args": { "file_path": "Tests/AgentDeckTests/HistorySidebarUnifiedHistoryTests.swift" }, "result": "读取 220 行", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 600, "itemId": "c3", "event": { "type": "agentItem", "sessionId": "sess-cc-01", "threadId": "t2", "agentKind": "claude_code", "item": { "kind": "assistantMessage", "text": "已有测试覆盖了合并排序，缺空列表与重复 threadId 两个边界，我来补上。", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 400, "event": { "type": "turnComplete", "sessionId": "sess-cc-01", "threadId": "t2", "agentKind": "claude_code", "summary": { "totalInputTokens": 900, "totalOutputTokens": 310, "elapsedMs": 5200 } } }
-]
+{
+  "snapshot": {
+    "conversationId": "sess-cc-01",
+    "baseEventCursor": "beforeFirst",
+    "configurationState": {
+      "configurationRevision": 1,
+      "configuration": {
+        "vendorControl": {
+          "agentKind": "claude_code",
+          "configuration": {
+            "permissionMode": "default",
+            "model": null,
+            "effort": null,
+            "outputStyle": null
+          }
+        }
+      }
+    },
+    "items": [
+      {
+        "kind": "capabilities",
+        "commandId": null,
+        "itemId": null,
+        "entityId": null,
+        "capabilities": {
+          "agentKind": "claude_code",
+          "agentVersion": "fixture",
+          "features": [],
+          "vendor": {
+            "agentKind": "claude_code",
+            "permissionModes": [],
+            "outputStyles": [],
+            "hooksSupported": [],
+            "cliVersion": "fixture"
+          }
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "delayMs": 0,
+      "event": {
+        "conversationId": "sess-cc-01",
+        "eventId": "event-cc-01-0",
+        "eventSeq": 0,
+        "commandId": "command-cc-01",
+        "itemId": null,
+        "entityId": null,
+        "body": {
+          "kind": "turnStarted",
+          "turn_id": "turn-cc-01"
+        }
+      }
+    },
+    {
+      "delayMs": 100,
+      "event": {
+        "conversationId": "sess-cc-01",
+        "eventId": "event-cc-01-1",
+        "eventSeq": 1,
+        "commandId": "command-cc-01",
+        "itemId": "c1",
+        "entityId": "entity-c1",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "userMessage",
+            "text": "给跨 agent 历史聚合补边界测试",
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 500,
+      "event": {
+        "conversationId": "sess-cc-01",
+        "eventId": "event-cc-01-2",
+        "eventSeq": 2,
+        "commandId": "command-cc-01",
+        "itemId": "c2",
+        "entityId": "entity-c2",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "toolCall",
+            "name": "Read",
+            "args": {
+              "file_path": "Tests/AgentDeckTests/HistorySidebarUnifiedHistoryTests.swift"
+            },
+            "result": "读取 220 行",
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 600,
+      "event": {
+        "conversationId": "sess-cc-01",
+        "eventId": "event-cc-01-3",
+        "eventSeq": 3,
+        "commandId": "command-cc-01",
+        "itemId": "c3",
+        "entityId": "entity-c3",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "assistantMessage",
+            "text": "已有测试覆盖了合并排序，缺空列表与重复 threadId 两个边界，我来补上。",
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 400,
+      "event": {
+        "conversationId": "sess-cc-01",
+        "eventId": "event-cc-01-4",
+        "eventSeq": 4,
+        "commandId": "command-cc-01",
+        "itemId": null,
+        "entityId": null,
+        "body": {
+          "kind": "turnCompleted",
+          "turn_id": "turn-cc-01",
+          "summary": {
+            "totalInputTokens": 900,
+            "totalOutputTokens": 310,
+            "elapsedMs": 5200
+          }
+        }
+      }
+    }
+  ]
+}

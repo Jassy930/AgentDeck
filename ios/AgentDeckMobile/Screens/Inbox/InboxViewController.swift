@@ -1,13 +1,14 @@
+import AgentDeckSessionSource
 import UIKit
 
 final class InboxViewController: UIViewController {
-    private let source: MobileSessionSource
+    private let source: any SessionSource
     private let viewModel: InboxViewModel
     private var collectionView: UICollectionView!
     private var dataSource: UICollectionViewDiffableDataSource<Int, String>!
     private let emptyView = MobileEmptyStateView(title: "收件箱为空", subtitle: "等待审批、已完成、失败的会话会在这里显示")
 
-    init(source: MobileSessionSource) {
+    init(source: any SessionSource) {
         self.source = source
         self.viewModel = InboxViewModel(source: source)
         super.init(nibName: nil, bundle: nil)
@@ -59,7 +60,8 @@ final class InboxViewController: UIViewController {
             collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ])
-        let registration = UICollectionView.CellRegistration<UICollectionViewListCell, InboxItem> { [weak self] cell, _, inboxItem in
+        let registration = UICollectionView.CellRegistration<UICollectionViewListCell, InboxItem> {
+            [weak self] cell, _, inboxItem in
             // 覆盖 insetGrouped 默认白底，使用设计系统 surface token
             var bgConfig = UIBackgroundConfiguration.listGroupedCell()
             bgConfig.backgroundColor = DesignTokens.surface
@@ -83,10 +85,12 @@ final class InboxViewController: UIViewController {
             cell.contentConfiguration = content
             cell.accessories = [.disclosureIndicator()]
         }
-        dataSource = UICollectionViewDiffableDataSource<Int, String>(collectionView: collectionView) {
+        dataSource = UICollectionViewDiffableDataSource<Int, String>(collectionView: collectionView)
+        {
             [weak self] collectionView, indexPath, itemID in
             guard let inboxItem = self?.item(for: itemID) else { return nil }
-            return collectionView.dequeueConfiguredReusableCell(using: registration, for: indexPath, item: inboxItem)
+            return collectionView.dequeueConfiguredReusableCell(
+                using: registration, for: indexPath, item: inboxItem)
         }
     }
 
@@ -98,6 +102,22 @@ final class InboxViewController: UIViewController {
         snapshot.reconfigureItems(snapshot.itemIdentifiers.filter(existing.contains))
         dataSource.apply(snapshot, animatingDifferences: false)
         emptyView.isHidden = !viewModel.items.isEmpty
+        if viewModel.items.isEmpty {
+            switch viewModel.resourceState {
+            case .loading:
+                emptyView.update(title: "正在加载收件箱…", subtitle: nil)
+            case .failed(let error, _):
+                emptyView.update(
+                    title: "无法加载收件箱",
+                    subtitle: error.message ?? error.code.rawValue
+                )
+            case .ready, .stale:
+                emptyView.update(
+                    title: "收件箱为空",
+                    subtitle: "等待审批、已完成、失败的会话会在这里显示"
+                )
+            }
+        }
     }
 }
 
@@ -105,8 +125,13 @@ extension InboxViewController: UICollectionViewDelegate {
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         collectionView.deselectItem(at: indexPath, animated: true)
         guard let itemID = dataSource.itemIdentifier(for: indexPath),
-              let inboxItem = item(for: itemID) else { return }
-        let vc = SessionDetailViewController(source: source, sessionID: inboxItem.sessionID, title: inboxItem.title)
+            let inboxItem = item(for: itemID)
+        else { return }
+        let vc = SessionDetailViewController(
+            source: source,
+            conversationID: inboxItem.conversationID,
+            title: inboxItem.title
+        )
         navigationController?.pushViewController(vc, animated: true)
     }
 }

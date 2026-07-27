@@ -1,13 +1,15 @@
+import AgentDeckCore
+import AgentDeckSessionSource
 import UIKit
 
 final class SessionListViewController: UIViewController {
-    private let source: MobileSessionSource
+    private let source: any SessionSource
     private let viewModel: SessionListViewModel
     private var collectionView: UICollectionView!
-    private var dataSource: UICollectionViewDiffableDataSource<SessionGroup, String>!
+    private var dataSource: UICollectionViewDiffableDataSource<ConversationGroup, String>!
     private let emptyView = MobileEmptyStateView(title: "这台机器还没有会话", subtitle: nil)
 
-    init(source: MobileSessionSource, machineID: String) {
+    init(source: any SessionSource, machineID: String) {
         self.source = source
         self.viewModel = SessionListViewModel(source: source, machineID: machineID)
         super.init(nibName: nil, bundle: nil)
@@ -33,7 +35,7 @@ final class SessionListViewController: UIViewController {
         applySnapshot()
     }
 
-    private func headerTitle(_ group: SessionGroup) -> String {
+    private func headerTitle(_ group: ConversationGroup) -> String {
         switch group {
         case .waitingApproval: return "等待审批"
         case .active: return "活跃"
@@ -41,7 +43,15 @@ final class SessionListViewController: UIViewController {
         }
     }
 
-    private func session(for id: String) -> SessionSummary? {
+    /// 纯展示文案映射；渲染路径仍由 capability/item 数据决定（N2）。
+    private static func vendorDisplayName(_ kind: AgentKind) -> String {
+        switch kind {
+        case .codex: "Codex"
+        case .claudeCode: "Claude Code"
+        }
+    }
+
+    private func session(for id: String) -> ConversationSummary? {
         for (_, sessions) in viewModel.groups {
             if let match = sessions.first(where: { $0.id == id }) { return match }
         }
@@ -63,7 +73,9 @@ final class SessionListViewController: UIViewController {
             collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ])
-        let cellReg = UICollectionView.CellRegistration<UICollectionViewListCell, SessionSummary> { cell, _, session in
+        let cellReg = UICollectionView.CellRegistration<
+            UICollectionViewListCell, ConversationSummary
+        > { cell, _, session in
             // 覆盖 insetGrouped 默认白底，使用设计系统 surface token
             var bgConfig = UIBackgroundConfiguration.listGroupedCell()
             bgConfig.backgroundColor = DesignTokens.surface
@@ -72,7 +84,7 @@ final class SessionListViewController: UIViewController {
 
             var content = UIListContentConfiguration.subtitleCell()
             content.text = session.title
-            content.secondaryText = "\(vendorDisplayName(session.agentKind)) · \(session.cwd)"
+            content.secondaryText = "\(Self.vendorDisplayName(session.agentKind)) · \(session.cwd)"
             content.textProperties.color = DesignTokens.text
             content.secondaryTextProperties.color = DesignTokens.text2
             cell.contentConfiguration = content
@@ -87,10 +99,13 @@ final class SessionListViewController: UIViewController {
             content.text = headerTitle(group)
             header.contentConfiguration = content
         }
-        dataSource = UICollectionViewDiffableDataSource<SessionGroup, String>(collectionView: collectionView) {
+        dataSource = UICollectionViewDiffableDataSource<ConversationGroup, String>(
+            collectionView: collectionView
+        ) {
             [weak self] collectionView, indexPath, sessionID in
             guard let session = self?.session(for: sessionID) else { return nil }
-            return collectionView.dequeueConfiguredReusableCell(using: cellReg, for: indexPath, item: session)
+            return collectionView.dequeueConfiguredReusableCell(
+                using: cellReg, for: indexPath, item: session)
         }
         dataSource.supplementaryViewProvider = { collectionView, kind, indexPath in
             collectionView.dequeueConfiguredReusableSupplementary(using: headerReg, for: indexPath)
@@ -98,7 +113,7 @@ final class SessionListViewController: UIViewController {
     }
 
     private func applySnapshot() {
-        var snapshot = NSDiffableDataSourceSnapshot<SessionGroup, String>()
+        var snapshot = NSDiffableDataSourceSnapshot<ConversationGroup, String>()
         for (group, sessions) in viewModel.groups {
             snapshot.appendSections([group])
             snapshot.appendItems(sessions.map(\.id), toSection: group)
@@ -107,6 +122,19 @@ final class SessionListViewController: UIViewController {
         snapshot.reconfigureItems(snapshot.itemIdentifiers.filter(existing.contains))
         dataSource.apply(snapshot, animatingDifferences: false)
         emptyView.isHidden = !viewModel.groups.isEmpty
+        if viewModel.groups.isEmpty {
+            switch viewModel.resourceState {
+            case .loading:
+                emptyView.update(title: "正在加载会话…", subtitle: nil)
+            case .failed(let error, _):
+                emptyView.update(
+                    title: "无法加载会话",
+                    subtitle: error.message ?? error.code.rawValue
+                )
+            case .ready, .stale:
+                emptyView.update(title: "这台机器还没有会话", subtitle: nil)
+            }
+        }
     }
 }
 
@@ -114,8 +142,13 @@ extension SessionListViewController: UICollectionViewDelegate {
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         collectionView.deselectItem(at: indexPath, animated: true)
         guard let sessionID = dataSource.itemIdentifier(for: indexPath),
-              let session = session(for: sessionID) else { return }
-        let vc = SessionDetailViewController(source: source, sessionID: session.id, title: session.title)
+            let session = session(for: sessionID)
+        else { return }
+        let vc = SessionDetailViewController(
+            source: source,
+            conversationID: session.id,
+            title: session.title
+        )
         navigationController?.pushViewController(vc, animated: true)
     }
 }

@@ -1,8 +1,12 @@
-import UIKit
 import AgentDeckCore
+import AgentDeckSessionSource
+import UIKit
 
 final class SessionDetailViewController: UIViewController {
-    private enum Section: Hashable { case conversation; case approval }
+    private enum Section: Hashable {
+        case conversation
+        case approval
+    }
 
     private let viewModel: SessionDetailViewModel
     private var collectionView: UICollectionView!
@@ -11,8 +15,8 @@ final class SessionDetailViewController: UIViewController {
     private let errorBanner = ErrorBannerView()
     private let inputBar = MobileInputBarView()
 
-    init(source: MobileSessionSource, sessionID: String, title: String) {
-        self.viewModel = SessionDetailViewModel(source: source, sessionID: sessionID)
+    init(source: any SessionSource, conversationID: String, title: String) {
+        self.viewModel = SessionDetailViewModel(source: source, conversationID: conversationID)
         super.init(nibName: nil, bundle: nil)
         self.title = title
     }
@@ -46,12 +50,15 @@ final class SessionDetailViewController: UIViewController {
         let userReg = UICollectionView.CellRegistration<UserPromptCell, UIItem> { cell, _, item in
             cell.configure(with: item)
         }
-        let textReg = UICollectionView.CellRegistration<AssistantTextCell, UIItem> { cell, _, item in
+        let textReg = UICollectionView.CellRegistration<AssistantTextCell, UIItem> {
+            cell, _, item in
             cell.configure(with: item)
         }
         // item 为 (rowID, presentation) 元组：presentation 由 cellProvider 计算一次传入，
         // 配置闭包内不再调用 make(from:)。
-        let collapsibleReg = UICollectionView.CellRegistration<CollapsibleItemCell, (String, CollapsiblePresentation)> {
+        let collapsibleReg = UICollectionView.CellRegistration<
+            CollapsibleItemCell, (String, CollapsiblePresentation)
+        > {
             [weak self] cell, _, pair in
             guard let self else { return }
             let (rowID, presentation) = pair
@@ -78,20 +85,25 @@ final class SessionDetailViewController: UIViewController {
             cell.configure(with: presentation, state: self.viewModel.approvalState)
             cell.onApprove = { [weak self] in self?.viewModel.resolveApproval(approve: true) }
             cell.onDeny = { [weak self] in self?.viewModel.resolveApproval(approve: false) }
+            cell.onRetry = { [weak self] in self?.viewModel.retryApprovalDelivery() }
         }
-        dataSource = UICollectionViewDiffableDataSource<Section, String>(collectionView: collectionView) {
+        dataSource = UICollectionViewDiffableDataSource<Section, String>(
+            collectionView: collectionView
+        ) {
             [weak self] collectionView, indexPath, rowID in
             guard let self else { return nil }
             // 审批卡片：固定 item ID
             if rowID == "approval-card" {
                 guard self.viewModel.pendingApproval != nil else { return UICollectionViewCell() }
-                return collectionView.dequeueConfiguredReusableCell(using: approvalReg, for: indexPath, item: ())
+                return collectionView.dequeueConfiguredReusableCell(
+                    using: approvalReg, for: indexPath, item: ())
             }
             guard let row = self.viewModel.rows.first(where: { $0.id == rowID }) else { return nil }
             // 渲染路径由 row 数据（role / item.kind）决定，不看 agentKind（N2）。
             switch row.role {
             case .userPrompt:
-                return collectionView.dequeueConfiguredReusableCell(using: userReg, for: indexPath, item: row.item)
+                return collectionView.dequeueConfiguredReusableCell(
+                    using: userReg, for: indexPath, item: row.item)
             case .assistantItem:
                 // 优先走折叠 cell；非折叠 kind 降级到文本 cell。make(from:) 只算一次，
                 // 结果经元组直接传入 registration。
@@ -99,7 +111,8 @@ final class SessionDetailViewController: UIViewController {
                     return collectionView.dequeueConfiguredReusableCell(
                         using: collapsibleReg, for: indexPath, item: (rowID, presentation))
                 } else {
-                    return collectionView.dequeueConfiguredReusableCell(using: textReg, for: indexPath, item: row.item)
+                    return collectionView.dequeueConfiguredReusableCell(
+                        using: textReg, for: indexPath, item: row.item)
                 }
             }
         }
@@ -109,21 +122,29 @@ final class SessionDetailViewController: UIViewController {
         inputBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(inputBar)
         NSLayoutConstraint.activate([
-            inputBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: DesignTokens.sp3),
-            inputBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -DesignTokens.sp3),
-            inputBar.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor, constant: -DesignTokens.sp2),
-            collectionView.bottomAnchor.constraint(equalTo: inputBar.topAnchor, constant: -DesignTokens.sp2),
+            inputBar.leadingAnchor.constraint(
+                equalTo: view.leadingAnchor, constant: DesignTokens.sp3),
+            inputBar.trailingAnchor.constraint(
+                equalTo: view.trailingAnchor, constant: -DesignTokens.sp3),
+            inputBar.bottomAnchor.constraint(
+                equalTo: view.keyboardLayoutGuide.topAnchor, constant: -DesignTokens.sp2),
+            collectionView.bottomAnchor.constraint(
+                equalTo: inputBar.topAnchor, constant: -DesignTokens.sp2),
         ])
         inputBar.onSend = { [weak self] text in self?.viewModel.sendPrompt(text) }
+        inputBar.onTextChange = { [weak self] text in self?.viewModel.updateDraft(text) }
     }
 
     private func configureErrorBanner() {
         errorBanner.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(errorBanner)
         NSLayoutConstraint.activate([
-            errorBanner.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: DesignTokens.sp2),
-            errorBanner.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: DesignTokens.sp4),
-            errorBanner.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -DesignTokens.sp4),
+            errorBanner.topAnchor.constraint(
+                equalTo: view.safeAreaLayoutGuide.topAnchor, constant: DesignTokens.sp2),
+            errorBanner.leadingAnchor.constraint(
+                equalTo: view.leadingAnchor, constant: DesignTokens.sp4),
+            errorBanner.trailingAnchor.constraint(
+                equalTo: view.trailingAnchor, constant: -DesignTokens.sp4),
         ])
     }
 
@@ -145,6 +166,11 @@ final class SessionDetailViewController: UIViewController {
         }
         snapshot.reconfigureItems(reconfigureIDs)
         dataSource.apply(snapshot, animatingDifferences: false)
+        inputBar.configure(
+            draft: viewModel.draftText,
+            state: viewModel.promptState,
+            isEnabled: !viewModel.isTerminal
+        )
         if let last = ids.last, let indexPath = dataSource.indexPath(for: last) {
             collectionView.scrollToItem(at: indexPath, at: .bottom, animated: false)
         }

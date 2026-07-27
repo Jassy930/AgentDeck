@@ -197,6 +197,915 @@ final class RelaySessionSourceTests: XCTestCase {
     XCTAssertEqual(reducer.cursor, .at(1))
   }
 
+  func testConversationReducerTracksParallelApprovalChainsAndPendingExpiry() throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-1")
+    let commandID = RuntimeCommandID(rawValue: "command-1")
+    let turnID = RuntimeTurnID(rawValue: "turn-1")
+    let firstApprovalID = RuntimeApprovalID(rawValue: "approval-1")
+    let secondApprovalID = RuntimeApprovalID(rawValue: "approval-2")
+    var reducer = try ConversationReducer(
+      machineID: "machine-1",
+      snapshot: conversationSnapshot(conversationID: conversationID, base: .beforeFirst)
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+    for (sequence, approvalID, requestID) in [
+      (UInt64(1), firstApprovalID, "request-1"),
+      (UInt64(2), secondApprovalID, "request-2"),
+    ] {
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: sequence,
+          eventID: "event-action-\(sequence)",
+          commandID: commandID,
+          body: .actionRequest(
+            turnID: turnID,
+            approvalID: approvalID,
+            request: try actionRequest(requestID: requestID)
+          )
+        )
+      )
+    }
+
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 3,
+        eventID: "event-expired-2",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: secondApprovalID,
+          decision: nil,
+          state: .expired
+        )
+      )
+    )
+    XCTAssertEqual(reducer.projection.pendingApprovals.map(\.approvalID), ["approval-1"])
+
+    for (sequence, deliveryState) in [
+      (UInt64(4), ApprovalDeliveryStateV1.claimed),
+      (UInt64(5), .applying),
+      (UInt64(6), .applied),
+    ] {
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: sequence,
+          eventID: "event-\(deliveryState.rawValue)-1",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: firstApprovalID,
+            decision: .approve,
+            state: deliveryState
+          )
+        )
+      )
+    }
+    XCTAssertTrue(reducer.projection.pendingApprovals.isEmpty)
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 7,
+        eventID: "event-completed",
+        commandID: commandID,
+        body: .turnInterrupted(turnID: turnID)
+      )
+    )
+    XCTAssertEqual(reducer.cursor, .at(7))
+  }
+
+  func testConversationReducerKeepsRetryWinnerUntilExpiry() throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-1")
+    let commandID = RuntimeCommandID(rawValue: "command-1")
+    let turnID = RuntimeTurnID(rawValue: "turn-1")
+    let approvalID = RuntimeApprovalID(rawValue: "approval-1")
+    var reducer = try ConversationReducer(
+      machineID: "machine-1",
+      snapshot: conversationSnapshot(conversationID: conversationID, base: .beforeFirst)
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 1,
+        eventID: "event-action",
+        commandID: commandID,
+        body: .actionRequest(
+          turnID: turnID,
+          approvalID: approvalID,
+          request: try actionRequest(requestID: "request-1")
+        )
+      )
+    )
+    for (sequence, deliveryState) in [
+      (UInt64(2), ApprovalDeliveryStateV1.claimed),
+      (UInt64(3), .applying),
+      (UInt64(4), .deliveryFailed),
+    ] {
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: sequence,
+          eventID: "event-\(deliveryState.rawValue)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: approvalID,
+            decision: .deny,
+            state: deliveryState
+          )
+        )
+      )
+    }
+
+    let prematureTerminal = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 5,
+      eventID: "event-premature-terminal",
+      commandID: commandID,
+      body: .turnInterrupted(turnID: turnID)
+    )
+    XCTAssertThrowsError(try reducer.apply(prematureTerminal))
+    XCTAssertEqual(reducer.cursor, .at(4))
+
+    for (sequence, deliveryState) in [
+      (UInt64(5), ApprovalDeliveryStateV1.applying),
+      (UInt64(6), .expired),
+    ] {
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: sequence,
+          eventID: "event-retry-\(deliveryState.rawValue)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: approvalID,
+            decision: .deny,
+            state: deliveryState
+          )
+        )
+      )
+    }
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 7,
+        eventID: "event-terminal",
+        commandID: commandID,
+        body: .turnInterrupted(turnID: turnID)
+      )
+    )
+    XCTAssertEqual(reducer.cursor, .at(7))
+  }
+
+  func testConversationReducerRejectsRequestIDReuseWhilePendingAndResolved() throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-1")
+    let commandID = RuntimeCommandID(rawValue: "command-1")
+    let turnID = RuntimeTurnID(rawValue: "turn-1")
+    let firstApprovalID = RuntimeApprovalID(rawValue: "approval-1")
+    let secondApprovalID = RuntimeApprovalID(rawValue: "approval-2")
+    var reducer = try ConversationReducer(
+      machineID: "machine-1",
+      snapshot: conversationSnapshot(conversationID: conversationID, base: .beforeFirst)
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 1,
+        eventID: "event-approval-1",
+        commandID: commandID,
+        body: .actionRequest(
+          turnID: turnID,
+          approvalID: firstApprovalID,
+          request: try actionRequest(requestID: "request-shared")
+        )
+      )
+    )
+
+    let duplicateWhilePending = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 2,
+      eventID: "event-duplicate-pending-request",
+      commandID: commandID,
+      body: .actionRequest(
+        turnID: turnID,
+        approvalID: secondApprovalID,
+        request: try actionRequest(requestID: "request-shared")
+      )
+    )
+    XCTAssertThrowsError(try reducer.apply(duplicateWhilePending)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .approvalConflict)
+    }
+    XCTAssertEqual(reducer.cursor, .at(1))
+    XCTAssertEqual(reducer.projection.pendingApprovals.map(\.approvalID), ["approval-1"])
+
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 2,
+        eventID: "event-claimed-1",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: firstApprovalID,
+          decision: .approve,
+          state: .claimed
+        )
+      )
+    )
+    let duplicateAfterResolution = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 3,
+      eventID: "event-duplicate-resolved-request",
+      commandID: commandID,
+      body: .actionRequest(
+        turnID: turnID,
+        approvalID: secondApprovalID,
+        request: try actionRequest(requestID: "request-shared")
+      )
+    )
+    XCTAssertThrowsError(try reducer.apply(duplicateAfterResolution)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .approvalConflict)
+    }
+    XCTAssertEqual(reducer.cursor, .at(2))
+    XCTAssertTrue(reducer.projection.pendingApprovals.isEmpty)
+  }
+
+  func testConversationReducerRejectsWinnerChangeAndBackwardTransitionAtomically() throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-1")
+    let commandID = RuntimeCommandID(rawValue: "command-1")
+    let turnID = RuntimeTurnID(rawValue: "turn-1")
+    let approvalID = RuntimeApprovalID(rawValue: "approval-1")
+    var reducer = try ConversationReducer(
+      machineID: "machine-1",
+      snapshot: conversationSnapshot(conversationID: conversationID, base: .beforeFirst)
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 1,
+        eventID: "event-action",
+        commandID: commandID,
+        body: .actionRequest(
+          turnID: turnID,
+          approvalID: approvalID,
+          request: try actionRequest(requestID: "request-1")
+        )
+      )
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 2,
+        eventID: "event-claimed",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: approvalID,
+          decision: .approve,
+          state: .claimed
+        )
+      )
+    )
+
+    let changedWinner = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 3,
+      eventID: "event-changed-winner",
+      commandID: commandID,
+      body: .approvalResolved(
+        turnID: turnID,
+        approvalID: approvalID,
+        decision: .deny,
+        state: .applying
+      )
+    )
+    XCTAssertThrowsError(try reducer.apply(changedWinner)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .approvalIdentityMismatch)
+    }
+    XCTAssertEqual(reducer.cursor, .at(2))
+
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 3,
+        eventID: "event-applying",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: approvalID,
+          decision: .approve,
+          state: .applying
+        )
+      )
+    )
+    let backward = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 4,
+      eventID: "event-backward",
+      commandID: commandID,
+      body: .approvalResolved(
+        turnID: turnID,
+        approvalID: approvalID,
+        decision: .approve,
+        state: .claimed
+      )
+    )
+    XCTAssertThrowsError(try reducer.apply(backward)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .approvalConflict)
+    }
+    XCTAssertEqual(reducer.cursor, .at(3))
+  }
+
+  func testConversationReducerCapsAllApprovalIdentitiesPerTurnAtomically() throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-1")
+    let commandID = RuntimeCommandID(rawValue: "command-1")
+    let turnID = RuntimeTurnID(rawValue: "turn-1")
+    var reducer = try ConversationReducer(
+      machineID: "machine-1",
+      snapshot: conversationSnapshot(conversationID: conversationID, base: .beforeFirst)
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+
+    for index in 0..<31 {
+      let actionSequence = UInt64(index * 2 + 1)
+      let approvalID = RuntimeApprovalID(rawValue: "approval-\(index)")
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: actionSequence,
+          eventID: "event-action-\(index)",
+          commandID: commandID,
+          body: .actionRequest(
+            turnID: turnID,
+            approvalID: approvalID,
+            request: try actionRequest(requestID: "request-\(index)")
+          )
+        )
+      )
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: actionSequence + 1,
+          eventID: "event-claimed-\(index)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: approvalID,
+            decision: .approve,
+            state: .claimed
+          )
+        )
+      )
+    }
+
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 63,
+        eventID: "event-action-31",
+        commandID: commandID,
+        body: .actionRequest(
+          turnID: turnID,
+          approvalID: RuntimeApprovalID(rawValue: "approval-31"),
+          request: try actionRequest(requestID: "request-31")
+        )
+      )
+    )
+    XCTAssertEqual(reducer.cursor, .at(63))
+    XCTAssertEqual(reducer.projection.pendingApprovals.map(\.approvalID), ["approval-31"])
+    let overflow = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 64,
+      eventID: "event-action-overflow",
+      commandID: commandID,
+      body: .actionRequest(
+        turnID: turnID,
+        approvalID: RuntimeApprovalID(rawValue: "approval-overflow"),
+        request: try actionRequest(requestID: "request-overflow")
+      )
+    )
+    XCTAssertThrowsError(try reducer.apply(overflow)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .approvalConflict)
+    }
+    XCTAssertEqual(reducer.cursor, .at(63))
+    XCTAssertEqual(reducer.projection.pendingApprovals.map(\.approvalID), ["approval-31"])
+    XCTAssertEqual(reducer.projection.pendingApprovals.map(\.requestID), ["request-31"])
+
+    var nextSequence: UInt64 = 64
+    for index in 0..<31 {
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: nextSequence,
+          eventID: "event-applying-existing-\(index)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: RuntimeApprovalID(rawValue: "approval-\(index)"),
+            decision: .approve,
+            state: .applying
+          )
+        )
+      )
+      nextSequence += 1
+    }
+    XCTAssertEqual(reducer.projection.pendingApprovals.map(\.approvalID), ["approval-31"])
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: nextSequence,
+        eventID: "event-claimed-existing-pending",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: RuntimeApprovalID(rawValue: "approval-31"),
+          decision: .approve,
+          state: .claimed
+        )
+      )
+    )
+    XCTAssertEqual(reducer.cursor, .at(nextSequence))
+    XCTAssertTrue(reducer.projection.pendingApprovals.isEmpty)
+  }
+
+  func testConversationReducerSnapshotBaselineInferenceBindsOneExactTurn() throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-1")
+    let commandID = RuntimeCommandID(rawValue: "command-before-snapshot")
+    let turnID = RuntimeTurnID(rawValue: "turn-before-snapshot")
+    var reducer = try ConversationReducer(
+      machineID: "machine-1",
+      snapshot: conversationSnapshot(conversationID: conversationID, base: .at(7))
+    )
+
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 8,
+        eventID: "event-inferred-resolution",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: RuntimeApprovalID(rawValue: "approval-before-snapshot"),
+          decision: .approve,
+          state: .applied
+        )
+      )
+    )
+    XCTAssertEqual(reducer.cursor, .at(8))
+    XCTAssertTrue(reducer.projection.pendingApprovals.isEmpty)
+
+    let wrongCommand = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 9,
+      eventID: "event-wrong-command",
+      commandID: RuntimeCommandID(rawValue: "command-other"),
+      body: .turnInterrupted(turnID: turnID)
+    )
+    XCTAssertThrowsError(try reducer.apply(wrongCommand)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .turnIdentityMismatch)
+    }
+    XCTAssertEqual(reducer.cursor, .at(8))
+
+    let wrongTurn = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 9,
+      eventID: "event-wrong-turn",
+      commandID: commandID,
+      body: .turnInterrupted(turnID: RuntimeTurnID(rawValue: "turn-other"))
+    )
+    XCTAssertThrowsError(try reducer.apply(wrongTurn)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .turnIdentityMismatch)
+    }
+    XCTAssertEqual(reducer.cursor, .at(8))
+
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 9,
+        eventID: "event-terminal",
+        commandID: commandID,
+        body: .turnInterrupted(turnID: turnID)
+      )
+    )
+    XCTAssertEqual(reducer.cursor, .at(9))
+    XCTAssertEqual(reducer.projection.completedEventID, "event-terminal")
+
+    let actionWithoutNextStart = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 10,
+      eventID: "event-action-without-next-start",
+      commandID: RuntimeCommandID(rawValue: "command-next"),
+      body: .actionRequest(
+        turnID: RuntimeTurnID(rawValue: "turn-next"),
+        approvalID: RuntimeApprovalID(rawValue: "approval-next"),
+        request: try actionRequest(requestID: "request-next")
+      )
+    )
+    XCTAssertThrowsError(try reducer.apply(actionWithoutNextStart)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .turnStartRequired)
+    }
+    XCTAssertEqual(reducer.cursor, .at(9))
+    XCTAssertTrue(reducer.projection.pendingApprovals.isEmpty)
+  }
+
+  func testConversationReducerSnapshotBaselineInferenceAcceptsDirectTerminalOnlyOnce() throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-1")
+    let commandID = RuntimeCommandID(rawValue: "command-before-snapshot")
+    let turnID = RuntimeTurnID(rawValue: "turn-before-snapshot")
+    let terminalBodies: [(name: String, body: RuntimeEventBodyV2)] = [
+      (
+        "completed",
+        .turnCompleted(turnID: turnID, summary: try turnSummary())
+      ),
+      ("interrupted", .turnInterrupted(turnID: turnID)),
+    ]
+
+    for terminal in terminalBodies {
+      var reducer = try ConversationReducer(
+        machineID: "machine-1",
+        snapshot: conversationSnapshot(conversationID: conversationID, base: .at(7))
+      )
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: 8,
+          eventID: "event-direct-\(terminal.name)",
+          commandID: commandID,
+          body: terminal.body
+        )
+      )
+      XCTAssertEqual(reducer.cursor, .at(8))
+      XCTAssertEqual(reducer.projection.completedEventID, "event-direct-\(terminal.name)")
+
+      let actionWithoutStart = try runtimeEvent(
+        conversationID: conversationID,
+        sequence: 9,
+        eventID: "event-action-without-start-\(terminal.name)",
+        commandID: RuntimeCommandID(rawValue: "command-next"),
+        body: .actionRequest(
+          turnID: RuntimeTurnID(rawValue: "turn-next"),
+          approvalID: RuntimeApprovalID(rawValue: "approval-next"),
+          request: try actionRequest(requestID: "request-next")
+        )
+      )
+      XCTAssertThrowsError(try reducer.apply(actionWithoutStart)) { error in
+        XCTAssertEqual(error as? RelaySourceReducerError, .turnStartRequired)
+      }
+      XCTAssertEqual(reducer.cursor, .at(8))
+
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: 9,
+          eventID: "event-next-started-\(terminal.name)",
+          commandID: RuntimeCommandID(rawValue: "command-next"),
+          body: .turnStarted(turnID: RuntimeTurnID(rawValue: "turn-next"))
+        )
+      )
+      XCTAssertEqual(reducer.cursor, .at(9))
+    }
+  }
+
+  func testConversationReducerBaselineInferenceRequiresPriorCursorAndCapsInferredLedger()
+    throws
+  {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-1")
+    let commandID = RuntimeCommandID(rawValue: "command-before-snapshot")
+    let turnID = RuntimeTurnID(rawValue: "turn-before-snapshot")
+    var reducer = try ConversationReducer(
+      machineID: "machine-1",
+      snapshot: conversationSnapshot(conversationID: conversationID, base: .beforeFirst)
+    )
+    let resolutionWithoutBaseline = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 0,
+      eventID: "event-resolution-without-baseline",
+      commandID: commandID,
+      body: .approvalResolved(
+        turnID: turnID,
+        approvalID: RuntimeApprovalID(rawValue: "approval-no-baseline"),
+        decision: nil,
+        state: .expired
+      )
+    )
+    XCTAssertThrowsError(try reducer.apply(resolutionWithoutBaseline)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .turnStartRequired)
+    }
+    XCTAssertEqual(reducer.cursor, .beforeFirst)
+
+    reducer = try ConversationReducer(
+      machineID: "machine-1",
+      snapshot: conversationSnapshot(conversationID: conversationID, base: .at(4))
+    )
+    for index in 0..<32 {
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: UInt64(index + 5),
+          eventID: "event-inferred-claimed-\(index)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: RuntimeApprovalID(rawValue: "approval-inferred-\(index)"),
+            decision: .approve,
+            state: .claimed
+          )
+        )
+      )
+    }
+    XCTAssertEqual(reducer.cursor, .at(36))
+
+    let overflow = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 37,
+      eventID: "event-inferred-overflow",
+      commandID: commandID,
+      body: .approvalResolved(
+        turnID: turnID,
+        approvalID: RuntimeApprovalID(rawValue: "approval-inferred-overflow"),
+        decision: .approve,
+        state: .claimed
+      )
+    )
+    XCTAssertThrowsError(try reducer.apply(overflow)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .approvalConflict)
+    }
+    XCTAssertEqual(reducer.cursor, .at(36))
+
+    var nextSequence: UInt64 = 37
+    for index in 0..<32 {
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: nextSequence,
+          eventID: "event-inferred-applying-\(index)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: RuntimeApprovalID(rawValue: "approval-inferred-\(index)"),
+            decision: .approve,
+            state: .applying
+          )
+        )
+      )
+      nextSequence += 1
+    }
+    for index in 0..<32 {
+      _ = try reducer.apply(
+        runtimeEvent(
+          conversationID: conversationID,
+          sequence: nextSequence,
+          eventID: "event-inferred-applied-\(index)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: RuntimeApprovalID(rawValue: "approval-inferred-\(index)"),
+            decision: .approve,
+            state: .applied
+          )
+        )
+      )
+      nextSequence += 1
+    }
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: nextSequence,
+        eventID: "event-inferred-terminal",
+        commandID: commandID,
+        body: .turnInterrupted(turnID: turnID)
+      )
+    )
+    XCTAssertEqual(reducer.cursor, .at(nextSequence))
+
+    let secondTerminal = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: nextSequence + 1,
+      eventID: "event-second-terminal",
+      commandID: RuntimeCommandID(rawValue: "command-next"),
+      body: .turnInterrupted(turnID: RuntimeTurnID(rawValue: "turn-next"))
+    )
+    XCTAssertThrowsError(try reducer.apply(secondTerminal)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .turnStartRequired)
+    }
+    XCTAssertEqual(reducer.cursor, .at(nextSequence))
+  }
+
+  func testConversationReducerCommandlessDiagnosticDoesNotTerminateActiveTurn() throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-1")
+    let commandID = RuntimeCommandID(rawValue: "command-1")
+    let turnID = RuntimeTurnID(rawValue: "turn-1")
+    var reducer = try ConversationReducer(
+      machineID: "machine-1",
+      snapshot: conversationSnapshot(conversationID: conversationID, base: .beforeFirst)
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 1,
+        eventID: "event-diagnostic",
+        body: .error(RuntimeFailureV1(code: "daemon.adapter.warning", message: "retrying"))
+      )
+    )
+    XCTAssertNil(reducer.projection.failedEventID)
+
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 2,
+        eventID: "event-failed",
+        commandID: commandID,
+        body: .error(terminalFailure())
+      )
+    )
+    XCTAssertEqual(reducer.projection.failedEventID, "event-failed")
+    XCTAssertNil(reducer.projection.completedEventID)
+
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 3,
+        eventID: "event-next-started",
+        commandID: RuntimeCommandID(rawValue: "command-2"),
+        body: .turnStarted(turnID: RuntimeTurnID(rawValue: "turn-2"))
+      )
+    )
+    XCTAssertNil(reducer.projection.failedEventID)
+  }
+
+  func testConversationReducerFailedRejectsWrongCommandAndUnresolvedApprovalAtomically() throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-1")
+    let commandID = RuntimeCommandID(rawValue: "command-1")
+    let turnID = RuntimeTurnID(rawValue: "turn-1")
+    var reducer = try ConversationReducer(
+      machineID: "machine-1",
+      snapshot: conversationSnapshot(conversationID: conversationID, base: .beforeFirst)
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+
+    let wrongCommand = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 1,
+      eventID: "event-wrong-command",
+      commandID: RuntimeCommandID(rawValue: "command-other"),
+      body: .error(terminalFailure())
+    )
+    XCTAssertThrowsError(try reducer.apply(wrongCommand)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .turnIdentityMismatch)
+    }
+    XCTAssertEqual(reducer.cursor, .at(0))
+
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 1,
+        eventID: "event-approval",
+        commandID: commandID,
+        body: .actionRequest(
+          turnID: turnID,
+          approvalID: RuntimeApprovalID(rawValue: "approval-1"),
+          request: try actionRequest(requestID: "request-1")
+        )
+      )
+    )
+    let unresolvedFailure = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 2,
+      eventID: "event-unresolved-failure",
+      commandID: commandID,
+      body: .error(terminalFailure())
+    )
+    XCTAssertThrowsError(try reducer.apply(unresolvedFailure)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .unresolvedApproval)
+    }
+    XCTAssertEqual(reducer.cursor, .at(1))
+    XCTAssertEqual(reducer.projection.pendingApprovals.map(\.approvalID), ["approval-1"])
+    XCTAssertNil(reducer.projection.failedEventID)
+
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 2,
+        eventID: "event-claimed",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: RuntimeApprovalID(rawValue: "approval-1"),
+          decision: .approve,
+          state: .claimed
+        )
+      )
+    )
+    let activeDeliveryFailure = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 3,
+      eventID: "event-active-delivery-failure",
+      commandID: commandID,
+      body: .error(terminalFailure())
+    )
+    XCTAssertThrowsError(try reducer.apply(activeDeliveryFailure)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .unresolvedApproval)
+    }
+    XCTAssertEqual(reducer.cursor, .at(2))
+    XCTAssertTrue(reducer.projection.pendingApprovals.isEmpty)
+    XCTAssertNil(reducer.projection.failedEventID)
+  }
+
+  func testConversationReducerSnapshotDirectFailedConsumesInferenceOnlyOnce() throws {
+    let conversationID = RuntimeConversationID(rawValue: "conversation-1")
+    var reducer = try ConversationReducer(
+      machineID: "machine-1",
+      snapshot: conversationSnapshot(conversationID: conversationID, base: .at(7))
+    )
+    _ = try reducer.apply(
+      runtimeEvent(
+        conversationID: conversationID,
+        sequence: 8,
+        eventID: "event-direct-failed",
+        commandID: RuntimeCommandID(rawValue: "command-before-snapshot"),
+        body: .error(terminalFailure())
+      )
+    )
+    XCTAssertEqual(reducer.projection.failedEventID, "event-direct-failed")
+
+    let duplicateTerminal = try runtimeEvent(
+      conversationID: conversationID,
+      sequence: 9,
+      eventID: "event-second-failed",
+      commandID: RuntimeCommandID(rawValue: "command-next"),
+      body: .error(terminalFailure())
+    )
+    XCTAssertThrowsError(try reducer.apply(duplicateTerminal)) { error in
+      XCTAssertEqual(error as? RelaySourceReducerError, .turnStartRequired)
+    }
+    XCTAssertEqual(reducer.cursor, .at(8))
+    XCTAssertEqual(reducer.projection.failedEventID, "event-direct-failed")
+  }
+
   func testInboxIsDerivedOnlyFromVerifiedCatalogAndConversationProjections() throws {
     let conversationID = RuntimeConversationID(rawValue: "conversation-1")
     let catalog = try CatalogReducer(
@@ -1578,6 +2487,24 @@ private func actionRequest(requestID: String) throws -> RuntimeActionRequestV1 {
         "canPersist": false,
       ],
     ]
+  )
+}
+
+private func turnSummary() throws -> RuntimeTurnSummaryV1 {
+  try decode(
+    RuntimeTurnSummaryV1.self,
+    [
+      "elapsedMs": 42,
+      "totalInputTokens": NSNull(),
+      "totalOutputTokens": NSNull(),
+    ]
+  )
+}
+
+private func terminalFailure() -> RuntimeFailureV1 {
+  RuntimeFailureV1(
+    code: "daemon.runtime.execution_failed",
+    message: "agent execution failed"
   )
 }
 

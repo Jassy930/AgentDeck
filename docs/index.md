@@ -102,7 +102,10 @@
   incoming/writer 与 per-connection transfer assembler；P5.4 automatic Task 已建立 shared
   transfer budget、authenticated MachineConnection/key-sync ingress、bounded broadcaster/reducers、scoped
   RelaySessionSource 与 typed command/pairing path，并补齐 unsubscribe single-flight retirement、满 update queue
-  shutdown 解锁以及 staged→committed pairing visibility gate。P4–P6 按 Task 进度上限为 7/7、4/9、0/4。`p4-auto`
+  shutdown 解锁以及 staged→committed pairing visibility gate；P5.5 又把 iOS fixture/ViewModel 迁移到共享
+  `SessionSource` 与 Core canonical reducer，并以 32-identity cap、snapshot mid-turn inference、event-seq retry
+  fence、retired-operation 校验与 terminal-only turn advance 保留审批证据。P4–P6 按 Task 进度上限为
+  7/7、5/9、0/4。`p4-auto`
   已 PASS；`p4` 仍不受支持，
   且 focused aggregate 本身不包含顶层
   Rust/Swift、最终 diff/status、冻结 hash 或双路 review。上述独立门禁与双路 review 已在
@@ -118,9 +121,15 @@
   `4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f` 候选上通过 `225/225` focused、
   RelayClient `429/4 SKIP`、完整 Swift `958/4 SKIP + 35`、iOS `26/26` 与完整 Rust/cross-language/static
   门禁；exact scope 为 34 Rust/fixture + 69 Swift + 6 docs = 109 paths。两笔提交按 `34 → 75` 有序依赖，
-  第一笔只承诺 Rust scoped-green，完整绿色证据属于组合候选。P5 为 4/9。P5.5–P5.9 与 P5
+  第一笔只承诺 Rust scoped-green，完整绿色证据属于组合候选。P5.5 以 code/test/fixture content manifest
+  `8dd8610966430a5cf640617da53e34d91bf379fe0ad495ea2ef719a6fec9d5ba` 冻结 52 + 10 docs = 62-path scope；
+  除 SessionSource/receipt 迁移外，又在不升级 Runtime v5 的前提下删除 transient canonical Error producer，
+  把 command-bound fixed Error 固定为唯一 Failed terminal，commandless Error 保持非终态 diagnostic。
+  fresh automatic 证据含顶层 Swift `980 XCTest / 4 skipped + 35 Swift Testing`、warnings-as-errors focused
+  `91/91` 与 iOS Simulator `91/91`；上一 command terminal 不消费下一 prompt receipt 的反例也已冻结；
+  其余 Rust 精确结果见 `QUALITY.md`。P5 为 5/9；P5.6–P5.9 与 P5
   Phase Exit 仍未完成。
-  P5.1–P5.4/P4 automatic 完成项都不表示旧 iOS fixture 已迁移、
+  P5.1–P5.5/P4 automatic 完成项都不表示
   真实 iOS Companion、真实公网 WSS、production-signed Keychain、第二台 Mac、真实 vendor 或 destructive
   purge 已完成。
 

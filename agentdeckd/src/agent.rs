@@ -603,8 +603,8 @@ fn adapter_prepare_binding_mismatch() -> ProtocolError {
 
 /// 新 Runtime execution 的中立 adapter 输出。ActionRequest 不在此枚举中：canonical
 /// approval 继续只走 P3.5 daemon-owned bound delivery，禁止退回 execution-id lookup。
-/// `Error` 也只是一条 transient adapter 信号；Store 端必须先映射到固定 allowlist，
-/// 禁止直接持久化 adapter message 或 diagnostic reference。
+/// fatal adapter failure 只通过 completion `Err` 返回，由 Store-owned terminal builder
+/// 生成唯一固定 Error；execution event lane 不承载 transient Error。
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct AdapterItemKey(String);
 
@@ -643,7 +643,6 @@ pub enum AdapterEvent {
         item: AgentItem,
     },
     TurnComplete(TurnSummary),
-    Error(ProtocolError),
     VendorControl(VendorControlPayload),
     VendorPanelEvent(VendorPanelPayload),
 }
@@ -653,7 +652,6 @@ impl fmt::Debug for AdapterEvent {
         let variant = match self {
             Self::Item { .. } => "Item",
             Self::TurnComplete(_) => "TurnComplete",
-            Self::Error(_) => "Error",
             Self::VendorControl(_) => "VendorControl",
             Self::VendorPanelEvent(_) => "VendorPanelEvent",
         };
@@ -2410,17 +2408,19 @@ mod typed_boundary_tests {
 
     #[test]
     fn adapter_event_debug_never_exposes_adapter_payloads() {
-        let event = AdapterEvent::Error(ProtocolError {
-            code: "vendor-private-code".into(),
-            message: "vendor private diagnostic sentinel".into(),
-            diagnostic_ref: Some("vendor-private-reference".into()),
-        });
+        let event = AdapterEvent::Item {
+            key: AdapterItemKey::new("vendor-private-correlation-key")
+                .expect("bounded private adapter item key"),
+            item: AgentItem::AssistantMessage {
+                text: "vendor private diagnostic sentinel".into(),
+                meta: Default::default(),
+            },
+        };
         let debug = format!("{event:?}");
-        assert!(debug.contains("Error"));
+        assert!(debug.contains("Item"));
         for private in [
-            "vendor-private-code",
+            "vendor-private-correlation-key",
             "vendor private diagnostic sentinel",
-            "vendor-private-reference",
         ] {
             assert!(
                 !debug.contains(private),

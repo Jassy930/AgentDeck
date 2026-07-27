@@ -2482,12 +2482,6 @@ async fn append_adapter_event(
                 item,
             )
         }
-        AdapterEvent::Error(_) => super::store::AppendExecutionEvent::execution_failed(
-            conversation_id,
-            command_id,
-            turn_id,
-            event_id,
-        ),
         AdapterEvent::TurnComplete(_)
         | AdapterEvent::VendorControl(_)
         | AdapterEvent::VendorPanelEvent(_) => return Err(()),
@@ -3635,7 +3629,8 @@ pub(crate) mod tests {
 
     use crate::runtime::store::{SanitizedTerminalFailure, TerminalState};
     use agentdeck_protocol::runtime::{
-        CodexConversationConfiguration, ConversationConfiguration, VendorConfigurationSnapshot,
+        CodexConversationConfiguration, ConversationConfiguration, RuntimeEventBody,
+        VendorConfigurationSnapshot,
     };
     use agentdeck_protocol::{
         ActionDecision, ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta,
@@ -3656,9 +3651,9 @@ pub(crate) mod tests {
     use crate::runtime::store::{
         CommandReceiptSelector, CommandState, ConfigurationRecord, ConfigureConversation,
         ConfigureConversationOutcome, ConversationDescriptor, IdempotencyOwner, NewConversation,
-        QueryCommandReceipt, RecoveryCursor, RuntimeClock, RuntimeClockError,
-        RuntimeCommitOperation, RuntimeIdKind, RuntimeStoreConfig, RuntimeStoreFaultInjector,
-        RuntimeStoreOperation,
+        QueryCommandReceipt, RecoveryCursor, RuntimeBackfillPlan, RuntimeBackfillTarget,
+        RuntimeClock, RuntimeClockError, RuntimeCommitOperation, RuntimeIdKind, RuntimeStoreConfig,
+        RuntimeStoreFaultInjector, RuntimeStoreOperation,
     };
     use crate::security::{MemoryKeyStore, load_or_create_storage_kek};
 
@@ -5016,6 +5011,7 @@ pub(crate) mod tests {
 
     #[derive(Clone, Copy, Default)]
     struct FakeBehavior {
+        adapter_failure: bool,
         completion_error: bool,
         release_error: bool,
         cancel_fails: bool,
@@ -5126,7 +5122,11 @@ pub(crate) mod tests {
                 if inner.behavior.completion_error {
                     return Err(RuntimeExecutionError::CompletionClosed);
                 }
-                let terminal = if completion_control.canceled.load(Ordering::SeqCst) {
+                let terminal = if inner.behavior.adapter_failure {
+                    // Production GatedExecutionRelease maps a fatal adapter completion `Err`
+                    // to this one Store-owned terminal after both event bridges have drained.
+                    CommandTerminal::failed(SanitizedTerminalFailure::execution_failed())
+                } else if completion_control.canceled.load(Ordering::SeqCst) {
                     // Production driver 在 exact-group cancel 后从 vendor stdout 读到 EOF，
                     // release owner 只能先给出 Failed；用户取消语义必须由 actor 的 typed
                     // race state 覆盖，fake 不能替 production 偷做这个判断。
@@ -5274,6 +5274,17 @@ pub(crate) mod tests {
                 FakeBehavior {
                     completion_error: true,
                     cancel_fails,
+                    ..FakeBehavior::default()
+                },
+            )
+        }
+
+        fn adapter_failure() -> Self {
+            Self::new(
+                false,
+                false,
+                FakeBehavior {
+                    adapter_failure: true,
                     ..FakeBehavior::default()
                 },
             )
@@ -8737,6 +8748,95 @@ pub(crate) mod tests {
         .await;
         assert_eq!(fake.cancel_count(command.command_id), 1);
         assert_eq!(fake.active(), 0, "Interrupted requires a reaped group");
+
+        registry.shutdown().await.expect("shutdown actors");
+        store.shutdown().await.expect("shutdown store");
+    }
+
+    #[tokio::test]
+    async fn fatal_adapter_completion_writes_one_store_owned_failed_terminal() {
+        let root = TestRoot::new("adapter-failure-terminal");
+        let store = root.open().await;
+        finish_recovery(&store).await;
+        let conversation = create_conversation(&store, 54).await;
+        let fake = FakeCoordinator::adapter_failure();
+        let registry = ConversationRegistry::new(
+            store.clone(),
+            Arc::new(fake.clone()),
+            runtime_id(RuntimeIdKind::DaemonBoot, 0xB8),
+            1,
+        )
+        .expect("registry");
+        registry
+            .install(conversation.clone(), Vec::new())
+            .await
+            .expect("actor");
+        registry
+            .enable_scheduling()
+            .await
+            .expect("enable scheduling");
+        let principal = local_principal(54);
+        let command = command(
+            &submit(
+                &registry,
+                conversation.conversation_id,
+                &principal,
+                "adapter-failure",
+                "fatal adapter completion",
+            )
+            .await,
+        );
+        wait_for_receipt_state(
+            &store,
+            conversation.conversation_id,
+            command.command_id,
+            &principal,
+            CommandState::Failed,
+        )
+        .await;
+
+        let RuntimeBackfillPlan::Pinned(pin) = store
+            .acquire_backfill_pin(
+                RuntimeBackfillTarget::Conversation(conversation.conversation_id),
+                // seq0=ConfigurationChanged, seq1=TurnStarted；fatal completion 后只允许
+                // seq2 这一条 Store-owned Error terminal。
+                Some(1),
+            )
+            .await
+            .expect("pin failed-command terminal suffix")
+        else {
+            panic!("fatal adapter completion must publish one terminal event");
+        };
+        let page = store
+            .load_event_backfill_page(pin, Some(1))
+            .await
+            .expect("load failed-command terminal suffix");
+        assert!(page.complete);
+        assert_eq!(
+            page.events.len(),
+            1,
+            "no transient Error may precede terminal"
+        );
+        let event = &page.events[0];
+        assert_eq!(
+            event.command_id.as_ref().map(|value| value.as_str()),
+            Some(command.command_id.to_canonical_string().as_str())
+        );
+        let RuntimeEventBody::Error { failure } = &event.body else {
+            panic!("fatal adapter completion must end in Error");
+        };
+        assert_eq!(
+            failure.code,
+            agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED
+        );
+        assert_eq!(failure.message, "agent execution failed");
+        assert!(failure.diagnostic_ref.is_none());
+        let completion = page.completion().clone();
+        drop(page);
+        store
+            .complete_backfill_page(completion)
+            .await
+            .expect("complete failed-command terminal page");
 
         registry.shutdown().await.expect("shutdown actors");
         store.shutdown().await.expect("shutdown store");

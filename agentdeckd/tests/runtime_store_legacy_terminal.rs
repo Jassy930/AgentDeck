@@ -785,7 +785,10 @@ async fn legacy_v1_accepted_opaque_reopens_but_canonical_is_rejected() {
         None,
         None,
         RuntimeEventBody::Error {
-            failure: RuntimeFailure::new("legacy.accepted", "canonical accepted terminal"),
+            failure: RuntimeFailure::new(
+                agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED,
+                "agent execution failed",
+            ),
         },
     )
     .expect("build canonical accepted event");

@@ -1,8 +1,7 @@
-import AgentDeckCore
 import Foundation
 import XCTest
 
-@testable import AgentDeck
+@testable import AgentDeckCore
 
 final class RuntimeConversationStateTests: XCTestCase {
   func testSnapshotBuildsCanonicalConversationStateWithoutSyntheticIdentity() throws {
@@ -265,13 +264,13 @@ final class RuntimeConversationStateTests: XCTestCase {
       event(
         conversationID: conversationID,
         sequence: 2,
-        eventID: "event-resolved",
+        eventID: "event-claimed",
         commandID: commandID,
         body: .approvalResolved(
           turnID: turnID,
           approvalID: approvalID,
           decision: .approve,
-          state: .applied
+          state: .claimed
         )
       )
     )
@@ -281,12 +280,46 @@ final class RuntimeConversationStateTests: XCTestCase {
     XCTAssertEqual(state.lastApprovalResolution?.approvalID, approvalID)
     XCTAssertEqual(state.lastApprovalResolution?.requestID, "request-1")
     XCTAssertEqual(state.lastApprovalResolution?.decision, .approve)
-    XCTAssertEqual(state.lastApprovalResolution?.deliveryState, .applied)
+    XCTAssertEqual(state.lastApprovalResolution?.deliveryState, .claimed)
 
     try state.apply(
       event(
         conversationID: conversationID,
         sequence: 3,
+        eventID: "event-applying",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: approvalID,
+          decision: .approve,
+          state: .applying
+        )
+      )
+    )
+    XCTAssertEqual(state.lastApprovalResolution?.requestID, "request-1")
+    XCTAssertEqual(state.lastApprovalResolution?.decision, .approve)
+    XCTAssertEqual(state.lastApprovalResolution?.deliveryState, .applying)
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 4,
+        eventID: "event-applied",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: approvalID,
+          decision: .approve,
+          state: .applied
+        )
+      )
+    )
+    XCTAssertEqual(state.lastApprovalResolution?.deliveryState, .applied)
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 5,
         eventID: "event-completed",
         commandID: commandID,
         body: .turnCompleted(turnID: turnID, summary: try turnSummary())
@@ -302,7 +335,187 @@ final class RuntimeConversationStateTests: XCTestCase {
     XCTAssertEqual(completedTurnID, turnID)
     XCTAssertEqual(completedCommandID, commandID)
     XCTAssertEqual(summary.elapsedMs, 42)
-    XCTAssertEqual(state.cursorState.cursor, .at(3))
+    XCTAssertEqual(state.cursorState.cursor, .at(5))
+  }
+
+  func testCommandlessDiagnosticDoesNotTerminateActiveTurn() throws {
+    let conversationID = id(RuntimeConversationID.self, "conversation-1")
+    let commandID = id(RuntimeCommandID.self, "command-1")
+    let turnID = id(RuntimeTurnID.self, "turn-1")
+    var state = try RuntimeConversationState(conversationID: conversationID)
+    try state.apply(snapshot(conversationID: conversationID, baseCursor: .beforeFirst, items: []))
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 1,
+        eventID: "event-diagnostic",
+        body: .error(RuntimeFailureV1(code: "daemon.adapter.warning", message: "retrying"))
+      )
+    )
+    XCTAssertEqual(state.activeTurn?.turnID, turnID)
+    XCTAssertNil(state.turnTerminal)
+    XCTAssertNil(state.failure?.turnID)
+    XCTAssertNil(state.failure?.commandID)
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 2,
+        eventID: "event-completed",
+        commandID: commandID,
+        body: .turnCompleted(turnID: turnID, summary: try turnSummary())
+      )
+    )
+    XCTAssertNil(state.activeTurn)
+    XCTAssertNil(state.failure)
+  }
+
+  func testCommandBoundErrorTerminatesExactTurnAndAllowsNextStart() throws {
+    let conversationID = id(RuntimeConversationID.self, "conversation-1")
+    let commandID = id(RuntimeCommandID.self, "command-1")
+    let turnID = id(RuntimeTurnID.self, "turn-1")
+    var state = try RuntimeConversationState(conversationID: conversationID)
+    try state.apply(snapshot(conversationID: conversationID, baseCursor: .beforeFirst, items: []))
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 1,
+        eventID: "event-failed",
+        commandID: commandID,
+        body: .error(terminalFailure())
+      )
+    )
+    XCTAssertNil(state.activeTurn)
+    guard
+      case .failed(let failedTurnID, let failedCommandID, let failure)? = state.turnTerminal
+    else {
+      return XCTFail("expected failed terminal")
+    }
+    XCTAssertEqual(failedTurnID, turnID)
+    XCTAssertEqual(failedCommandID, commandID)
+    XCTAssertEqual(failure.code, "daemon.runtime.execution_failed")
+    XCTAssertEqual(state.failure?.turnID, turnID)
+    XCTAssertEqual(state.failure?.commandID, commandID)
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 2,
+        eventID: "event-next-started",
+        commandID: id(RuntimeCommandID.self, "command-2"),
+        body: .turnStarted(turnID: id(RuntimeTurnID.self, "turn-2"))
+      )
+    )
+    XCTAssertEqual(state.activeTurn?.turnID.rawValue, "turn-2")
+    XCTAssertNil(state.turnTerminal)
+    XCTAssertNil(state.failure)
+  }
+
+  func testCommandBoundErrorRejectsWrongCommandAndUnresolvedApprovalAtomically() throws {
+    let conversationID = id(RuntimeConversationID.self, "conversation-1")
+    let commandID = id(RuntimeCommandID.self, "command-1")
+    let turnID = id(RuntimeTurnID.self, "turn-1")
+    var state = try RuntimeConversationState(conversationID: conversationID)
+    try state.apply(snapshot(conversationID: conversationID, baseCursor: .beforeFirst, items: []))
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+
+    let wrongCommand = try event(
+      conversationID: conversationID,
+      sequence: 1,
+      eventID: "event-wrong-command",
+      commandID: id(RuntimeCommandID.self, "command-other"),
+      body: .error(terminalFailure())
+    )
+    XCTAssertThrowsError(try state.apply(wrongCommand)) { error in
+      XCTAssertEqual(error as? RuntimeConversationStateError, .commandIdentityMismatch)
+    }
+    XCTAssertEqual(state.cursorState.cursor, .at(0))
+    XCTAssertEqual(state.activeTurn?.commandID, commandID)
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 1,
+        eventID: "event-approval",
+        commandID: commandID,
+        body: .actionRequest(
+          turnID: turnID,
+          approvalID: id(RuntimeApprovalID.self, "approval-1"),
+          request: try actionRequest(requestID: "request-1")
+        )
+      )
+    )
+    let unresolvedFailure = try event(
+      conversationID: conversationID,
+      sequence: 2,
+      eventID: "event-unresolved-failure",
+      commandID: commandID,
+      body: .error(terminalFailure())
+    )
+    XCTAssertThrowsError(try state.apply(unresolvedFailure)) { error in
+      XCTAssertEqual(error as? RuntimeConversationStateError, .unresolvedPendingApproval)
+    }
+    XCTAssertEqual(state.cursorState.cursor, .at(1))
+    XCTAssertEqual(state.pendingApproval?.approvalID.rawValue, "approval-1")
+    XCTAssertEqual(state.activeTurn?.turnID, turnID)
+    XCTAssertNil(state.turnTerminal)
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 2,
+        eventID: "event-claimed",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: id(RuntimeApprovalID.self, "approval-1"),
+          decision: .approve,
+          state: .claimed
+        )
+      )
+    )
+    let activeDeliveryFailure = try event(
+      conversationID: conversationID,
+      sequence: 3,
+      eventID: "event-active-delivery-failure",
+      commandID: commandID,
+      body: .error(terminalFailure())
+    )
+    XCTAssertThrowsError(try state.apply(activeDeliveryFailure)) { error in
+      XCTAssertEqual(error as? RuntimeConversationStateError, .unresolvedPendingApproval)
+    }
+    XCTAssertEqual(state.cursorState.cursor, .at(2))
+    XCTAssertEqual(state.lastApprovalResolution?.deliveryState, .claimed)
+    XCTAssertEqual(state.activeTurn?.turnID, turnID)
+    XCTAssertNil(state.turnTerminal)
   }
 
   func testApprovalIdentityFailureKeepsPendingAndCursorUnchanged() throws {
@@ -396,8 +609,8 @@ final class RuntimeConversationStateTests: XCTestCase {
         body: .approvalResolved(
           turnID: turnID,
           approvalID: id(RuntimeApprovalID.self, "approval-2"),
-          decision: .deny,
-          state: .applied
+          decision: nil,
+          state: .expired
         )
       )
     )
@@ -406,7 +619,483 @@ final class RuntimeConversationStateTests: XCTestCase {
     XCTAssertEqual(state.pendingApproval?.approvalID.rawValue, "approval-1")
     XCTAssertEqual(state.lastApprovalResolution?.approvalID.rawValue, "approval-2")
     XCTAssertEqual(state.lastApprovalResolution?.requestID, "request-2")
+    XCTAssertNil(state.lastApprovalResolution?.decision)
+    XCTAssertEqual(state.lastApprovalResolution?.deliveryState, .expired)
     XCTAssertEqual(state.cursorState.cursor, .at(3))
+  }
+
+  func testApprovalRequestIDCannotBeReusedWhilePendingOrAfterResolution() throws {
+    let conversationID = id(RuntimeConversationID.self, "conversation-1")
+    let commandID = id(RuntimeCommandID.self, "command-1")
+    let turnID = id(RuntimeTurnID.self, "turn-1")
+    let firstApprovalID = id(RuntimeApprovalID.self, "approval-1")
+    let secondApprovalID = id(RuntimeApprovalID.self, "approval-2")
+    var state = try RuntimeConversationState(conversationID: conversationID)
+    try state.apply(snapshot(conversationID: conversationID, baseCursor: .beforeFirst, items: []))
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 1,
+        eventID: "event-approval-1",
+        commandID: commandID,
+        body: .actionRequest(
+          turnID: turnID,
+          approvalID: firstApprovalID,
+          request: try actionRequest(requestID: "request-shared")
+        )
+      )
+    )
+
+    let duplicateWhilePending = try event(
+      conversationID: conversationID,
+      sequence: 2,
+      eventID: "event-duplicate-pending-request",
+      commandID: commandID,
+      body: .actionRequest(
+        turnID: turnID,
+        approvalID: secondApprovalID,
+        request: try actionRequest(requestID: "request-shared")
+      )
+    )
+    XCTAssertThrowsError(try state.apply(duplicateWhilePending)) { error in
+      XCTAssertEqual(error as? RuntimeConversationStateError, .pendingApprovalConflict)
+    }
+    XCTAssertEqual(state.cursorState.cursor, .at(1))
+    XCTAssertEqual(state.pendingApprovals.map(\.approvalID), [firstApprovalID])
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 2,
+        eventID: "event-claimed-1",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: firstApprovalID,
+          decision: .approve,
+          state: .claimed
+        )
+      )
+    )
+    let duplicateAfterResolution = try event(
+      conversationID: conversationID,
+      sequence: 3,
+      eventID: "event-duplicate-resolved-request",
+      commandID: commandID,
+      body: .actionRequest(
+        turnID: turnID,
+        approvalID: secondApprovalID,
+        request: try actionRequest(requestID: "request-shared")
+      )
+    )
+    XCTAssertThrowsError(try state.apply(duplicateAfterResolution)) { error in
+      XCTAssertEqual(error as? RuntimeConversationStateError, .pendingApprovalConflict)
+    }
+    XCTAssertEqual(state.cursorState.cursor, .at(2))
+    XCTAssertTrue(state.pendingApprovals.isEmpty)
+    XCTAssertEqual(state.lastApprovalResolution?.approvalID, firstApprovalID)
+    XCTAssertEqual(state.lastApprovalResolution?.requestID, "request-shared")
+  }
+
+  func testApprovalIdentityLimitCountsPendingAndResolvedWithoutPartialOverflowMutation() throws {
+    let conversationID = id(RuntimeConversationID.self, "conversation-1")
+    let commandID = id(RuntimeCommandID.self, "command-1")
+    let turnID = id(RuntimeTurnID.self, "turn-1")
+    var state = try RuntimeConversationState(conversationID: conversationID)
+    try state.apply(snapshot(conversationID: conversationID, baseCursor: .beforeFirst, items: []))
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+
+    var nextSequence: UInt64 = 1
+    for index in 1...30 {
+      try state.apply(
+        event(
+          conversationID: conversationID,
+          sequence: nextSequence,
+          eventID: "event-approval-\(index)",
+          commandID: commandID,
+          body: .actionRequest(
+            turnID: turnID,
+            approvalID: id(RuntimeApprovalID.self, "approval-\(index)"),
+            request: try actionRequest(requestID: "request-\(index)")
+          )
+        )
+      )
+      nextSequence += 1
+      try state.apply(
+        event(
+          conversationID: conversationID,
+          sequence: nextSequence,
+          eventID: "event-claimed-\(index)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: id(RuntimeApprovalID.self, "approval-\(index)"),
+            decision: .approve,
+            state: .claimed
+          )
+        )
+      )
+      nextSequence += 1
+    }
+    for index in 31...32 {
+      try state.apply(
+        event(
+          conversationID: conversationID,
+          sequence: nextSequence,
+          eventID: "event-approval-\(index)",
+          commandID: commandID,
+          body: .actionRequest(
+            turnID: turnID,
+            approvalID: id(RuntimeApprovalID.self, "approval-\(index)"),
+            request: try actionRequest(requestID: "request-\(index)")
+          )
+        )
+      )
+      nextSequence += 1
+    }
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: nextSequence,
+        eventID: "event-claimed-31",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: id(RuntimeApprovalID.self, "approval-31"),
+          decision: .approve,
+          state: .claimed
+        )
+      )
+    )
+    nextSequence += 1
+
+    let overflow = try event(
+      conversationID: conversationID,
+      sequence: nextSequence,
+      eventID: "event-approval-33",
+      commandID: commandID,
+      body: .actionRequest(
+        turnID: turnID,
+        approvalID: id(RuntimeApprovalID.self, "approval-33"),
+        request: try actionRequest(requestID: "request-33")
+      )
+    )
+    XCTAssertThrowsError(try state.apply(overflow)) { error in
+      XCTAssertEqual(error as? RuntimeConversationStateError, .pendingApprovalConflict)
+    }
+    XCTAssertEqual(state.cursorState.cursor, .at(nextSequence - 1))
+    XCTAssertEqual(
+      state.pendingApprovals.map(\.approvalID),
+      [id(RuntimeApprovalID.self, "approval-32")]
+    )
+    XCTAssertEqual(state.pendingApproval?.requestID, "request-32")
+    XCTAssertEqual(state.lastApprovalResolution?.approvalID.rawValue, "approval-31")
+    XCTAssertEqual(state.lastApprovalResolution?.requestID, "request-31")
+    XCTAssertEqual(state.lastApprovalResolution?.deliveryState, .claimed)
+    XCTAssertEqual(state.activeTurn?.turnID, turnID)
+    XCTAssertEqual(state.activeTurn?.commandID, commandID)
+
+    // 每个已 resolution 的 identity 都仍可沿原 ledger 合法推进，证明 overflow 未替换或清空 ledger。
+    for index in 1...31 {
+      try state.apply(
+        event(
+          conversationID: conversationID,
+          sequence: nextSequence,
+          eventID: "event-applying-\(index)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: id(RuntimeApprovalID.self, "approval-\(index)"),
+            decision: .approve,
+            state: .applying
+          )
+        )
+      )
+      XCTAssertEqual(state.lastApprovalResolution?.requestID, "request-\(index)")
+      nextSequence += 1
+    }
+    XCTAssertEqual(
+      state.pendingApprovals.map(\.approvalID),
+      [id(RuntimeApprovalID.self, "approval-32")]
+    )
+  }
+
+  func testSnapshotInferredApprovalIdentityLimitRejectsOverflowTransactionally() throws {
+    let conversationID = id(RuntimeConversationID.self, "conversation-1")
+    let commandID = id(RuntimeCommandID.self, "command-before-snapshot")
+    let turnID = id(RuntimeTurnID.self, "turn-before-snapshot")
+    var state = try RuntimeConversationState(conversationID: conversationID)
+    try state.apply(snapshot(conversationID: conversationID, baseCursor: .at(10), items: []))
+
+    var nextSequence: UInt64 = 11
+    for index in 1...32 {
+      try state.apply(
+        event(
+          conversationID: conversationID,
+          sequence: nextSequence,
+          eventID: "event-inferred-claimed-\(index)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: id(RuntimeApprovalID.self, "approval-\(index)"),
+            decision: .approve,
+            state: .claimed
+          )
+        )
+      )
+      nextSequence += 1
+    }
+
+    let overflow = try event(
+      conversationID: conversationID,
+      sequence: nextSequence,
+      eventID: "event-inferred-claimed-33",
+      commandID: commandID,
+      body: .approvalResolved(
+        turnID: turnID,
+        approvalID: id(RuntimeApprovalID.self, "approval-33"),
+        decision: .approve,
+        state: .claimed
+      )
+    )
+    XCTAssertThrowsError(try state.apply(overflow)) { error in
+      XCTAssertEqual(error as? RuntimeConversationStateError, .pendingApprovalConflict)
+    }
+    XCTAssertEqual(state.cursorState.cursor, .at(nextSequence - 1))
+    XCTAssertTrue(state.pendingApprovals.isEmpty)
+    XCTAssertEqual(state.lastApprovalResolution?.approvalID.rawValue, "approval-32")
+    XCTAssertNil(state.lastApprovalResolution?.requestID)
+    XCTAssertEqual(state.lastApprovalResolution?.decision, .approve)
+    XCTAssertEqual(state.lastApprovalResolution?.deliveryState, .claimed)
+    XCTAssertEqual(state.activeTurn?.turnID, turnID)
+    XCTAssertEqual(state.activeTurn?.commandID, commandID)
+
+    // Snapshot 推断出的全部 identity 仍保留原绑定；overflow 不能污染 cursor 或 resolution ledger。
+    for index in 1...32 {
+      try state.apply(
+        event(
+          conversationID: conversationID,
+          sequence: nextSequence,
+          eventID: "event-inferred-applying-\(index)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: id(RuntimeApprovalID.self, "approval-\(index)"),
+            decision: .approve,
+            state: .applying
+          )
+        )
+      )
+      XCTAssertNil(state.lastApprovalResolution?.requestID)
+      nextSequence += 1
+    }
+  }
+
+  func testApprovalDeliveryFailureRetryAndExpiryKeepExactWinnerBinding() throws {
+    let conversationID = id(RuntimeConversationID.self, "conversation-1")
+    let commandID = id(RuntimeCommandID.self, "command-1")
+    let turnID = id(RuntimeTurnID.self, "turn-1")
+    let approvalID = id(RuntimeApprovalID.self, "approval-1")
+    var state = try RuntimeConversationState(conversationID: conversationID)
+    try state.apply(snapshot(conversationID: conversationID, baseCursor: .beforeFirst, items: []))
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 1,
+        eventID: "event-approval",
+        commandID: commandID,
+        body: .actionRequest(
+          turnID: turnID,
+          approvalID: approvalID,
+          request: try actionRequest(requestID: "request-1")
+        )
+      )
+    )
+
+    for (sequence, deliveryState) in [
+      (UInt64(2), ApprovalDeliveryStateV1.claimed),
+      (UInt64(3), .applying),
+      (UInt64(4), .deliveryFailed),
+      (UInt64(5), .applying),
+    ] {
+      try state.apply(
+        event(
+          conversationID: conversationID,
+          sequence: sequence,
+          eventID: "event-\(deliveryState.rawValue)-\(sequence)",
+          commandID: commandID,
+          body: .approvalResolved(
+            turnID: turnID,
+            approvalID: approvalID,
+            decision: .approve,
+            state: deliveryState
+          )
+        )
+      )
+      XCTAssertEqual(state.lastApprovalResolution?.requestID, "request-1")
+      XCTAssertEqual(state.lastApprovalResolution?.decision, .approve)
+      XCTAssertEqual(state.lastApprovalResolution?.deliveryState, deliveryState)
+    }
+
+    let prematureTerminal = try event(
+      conversationID: conversationID,
+      sequence: 6,
+      eventID: "event-premature-terminal",
+      commandID: commandID,
+      body: .turnInterrupted(turnID: turnID)
+    )
+    XCTAssertThrowsError(try state.apply(prematureTerminal))
+    XCTAssertEqual(state.cursorState.cursor, .at(5))
+    XCTAssertEqual(state.activeTurn?.turnID, turnID)
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 6,
+        eventID: "event-expired",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: approvalID,
+          decision: .approve,
+          state: .expired
+        )
+      )
+    )
+    XCTAssertEqual(state.lastApprovalResolution?.requestID, "request-1")
+    XCTAssertEqual(state.lastApprovalResolution?.deliveryState, .expired)
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 7,
+        eventID: "event-terminal",
+        commandID: commandID,
+        body: .turnInterrupted(turnID: turnID)
+      )
+    )
+    XCTAssertNil(state.activeTurn)
+  }
+
+  func testApprovalWinnerChangeAndBackwardTransitionAreAtomic() throws {
+    let conversationID = id(RuntimeConversationID.self, "conversation-1")
+    let commandID = id(RuntimeCommandID.self, "command-1")
+    let turnID = id(RuntimeTurnID.self, "turn-1")
+    let approvalID = id(RuntimeApprovalID.self, "approval-1")
+    var state = try RuntimeConversationState(conversationID: conversationID)
+    try state.apply(snapshot(conversationID: conversationID, baseCursor: .beforeFirst, items: []))
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 0,
+        eventID: "event-started",
+        commandID: commandID,
+        body: .turnStarted(turnID: turnID)
+      )
+    )
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 1,
+        eventID: "event-approval",
+        commandID: commandID,
+        body: .actionRequest(
+          turnID: turnID,
+          approvalID: approvalID,
+          request: try actionRequest(requestID: "request-1")
+        )
+      )
+    )
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 2,
+        eventID: "event-claimed",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: approvalID,
+          decision: .approve,
+          state: .claimed
+        )
+      )
+    )
+
+    let changedWinner = try event(
+      conversationID: conversationID,
+      sequence: 3,
+      eventID: "event-changed-winner",
+      commandID: commandID,
+      body: .approvalResolved(
+        turnID: turnID,
+        approvalID: approvalID,
+        decision: .deny,
+        state: .applying
+      )
+    )
+    XCTAssertThrowsError(try state.apply(changedWinner)) { error in
+      XCTAssertEqual(error as? RuntimeConversationStateError, .approvalDecisionMismatch)
+    }
+    XCTAssertEqual(state.cursorState.cursor, .at(2))
+    XCTAssertEqual(state.lastApprovalResolution?.decision, .approve)
+    XCTAssertEqual(state.lastApprovalResolution?.deliveryState, .claimed)
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 3,
+        eventID: "event-applying",
+        commandID: commandID,
+        body: .approvalResolved(
+          turnID: turnID,
+          approvalID: approvalID,
+          decision: .approve,
+          state: .applying
+        )
+      )
+    )
+    let backward = try event(
+      conversationID: conversationID,
+      sequence: 4,
+      eventID: "event-backward",
+      commandID: commandID,
+      body: .approvalResolved(
+        turnID: turnID,
+        approvalID: approvalID,
+        decision: .approve,
+        state: .claimed
+      )
+    )
+    XCTAssertThrowsError(try state.apply(backward)) { error in
+      XCTAssertEqual(error as? RuntimeConversationStateError, .approvalStateTransitionInvalid)
+    }
+    XCTAssertEqual(state.cursorState.cursor, .at(3))
+    XCTAssertEqual(state.lastApprovalResolution?.deliveryState, .applying)
   }
 
   func testLiveItemIdentityConflictAndGapDoNotPartiallyAdvanceState() throws {
@@ -509,7 +1198,7 @@ final class RuntimeConversationStateTests: XCTestCase {
     XCTAssertEqual(state.capabilities?.agentKind, .codex)
   }
 
-  func testSnapshotBaselineCanObserveTerminalAndErrorWithoutInventingTurnIdentity() throws {
+  func testSnapshotBaselineCanObserveTerminalAndDiagnosticWithoutInventingTurnIdentity() throws {
     let conversationID = id(RuntimeConversationID.self, "conversation-1")
     var state = try RuntimeConversationState(conversationID: conversationID)
     try state.apply(snapshot(conversationID: conversationID, baseCursor: .at(7), items: []))
@@ -540,15 +1229,53 @@ final class RuntimeConversationStateTests: XCTestCase {
         conversationID: conversationID,
         sequence: 9,
         eventID: "event-error",
-        commandID: commandID,
         body: .error(RuntimeFailureV1(code: "daemon.test", message: "failed"))
       )
     )
-    XCTAssertEqual(state.failure?.commandID, commandID)
+    XCTAssertNil(state.failure?.commandID)
     XCTAssertNil(state.failure?.turnID)
     XCTAssertEqual(state.failure?.value.code, "daemon.test")
     XCTAssertEqual(state.failure?.value.message, "failed")
     XCTAssertEqual(state.cursorState.cursor, .at(9))
+  }
+
+  func testSnapshotBaselineDirectFailedConsumesInferenceOnlyOnce() throws {
+    let conversationID = id(RuntimeConversationID.self, "conversation-1")
+    let commandID = id(RuntimeCommandID.self, "command-before-snapshot")
+    var state = try RuntimeConversationState(conversationID: conversationID)
+    try state.apply(snapshot(conversationID: conversationID, baseCursor: .at(7), items: []))
+
+    try state.apply(
+      event(
+        conversationID: conversationID,
+        sequence: 8,
+        eventID: "event-direct-failed",
+        commandID: commandID,
+        body: .error(terminalFailure())
+      )
+    )
+    guard
+      case .failed(let failedTurnID, let failedCommandID, let failure)? = state.turnTerminal
+    else {
+      return XCTFail("expected direct failed terminal")
+    }
+    XCTAssertNil(failedTurnID)
+    XCTAssertEqual(failedCommandID, commandID)
+    XCTAssertEqual(failure.message, "agent execution failed")
+    XCTAssertNil(state.activeTurn)
+    XCTAssertEqual(state.cursorState.cursor, .at(8))
+
+    let duplicateTerminal = try event(
+      conversationID: conversationID,
+      sequence: 9,
+      eventID: "event-second-failed",
+      commandID: id(RuntimeCommandID.self, "command-next"),
+      body: .error(terminalFailure())
+    )
+    XCTAssertThrowsError(try state.apply(duplicateTerminal)) { error in
+      XCTAssertEqual(error as? RuntimeConversationStateError, .turnStartRequired)
+    }
+    XCTAssertEqual(state.cursorState.cursor, .at(8))
   }
 
   func testSnapshotBaselineInferenceBindsResolutionAndTerminalToOneExactTurn() throws {
@@ -695,7 +1422,7 @@ final class RuntimeConversationStateTests: XCTestCase {
       sequence: 0,
       eventID: "event-empty-command",
       commandID: id(RuntimeCommandID.self, ""),
-      body: .error(RuntimeFailureV1(code: "daemon.test", message: "invalid"))
+      body: .error(terminalFailure())
     )
     XCTAssertThrowsError(try state.apply(emptyCommand)) { error in
       XCTAssertEqual(error as? RuntimeConversationStateError, .emptyCommandID)
@@ -856,6 +1583,13 @@ final class RuntimeConversationStateTests: XCTestCase {
         "totalInputTokens": NSNull(),
         "totalOutputTokens": NSNull(),
       ]
+    )
+  }
+
+  private func terminalFailure() -> RuntimeFailureV1 {
+    RuntimeFailureV1(
+      code: "daemon.runtime.execution_failed",
+      message: "agent execution failed"
     )
   }
 

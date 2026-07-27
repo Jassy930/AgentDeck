@@ -657,7 +657,7 @@ fixture 泄漏，或把 test-only admission 暴露为运行时配置。
 | `daemon.runtime.store_full` | main+WAL+SHM projected footprint、SQLite page budget、configuration/pin/metadata count/charged-bytes/active cap、native live/nonlive/physical identity/private-reference cap，或剩余 safety obligation 接近/超过 2 GiB | 停止普通写；exact replay 仍应保持只读；projector candidate 保持 pending、零 ACK并等待 30 秒 refresh；仅在安全写自身复核通过时完成终态，禁止手工删除 WAL/ledger/projection row |
 | `daemon.runtime.crypto_failed` | StorageKEK unwrap、row AEAD、blind token 或 generation 校验失败 | 视为 key/domain/tamper 故障；恢复原 Keychain item 和正确签名环境，禁止新建 KEK |
 | `daemon.runtime.invalid_state` | stable ID/kind、clock monotonicity、queue head、fence/release、terminal/sequence 状态冲突，或 adapterStateKey 已绑定另一 namespace/不同 resume ref | 读取 canonical command/recovery/private-state 状态；错误 turn/nonce/fence 或 vendor ref 不能强制覆盖；CC 映射只能从明确 native history entry 重建，不按 title/cwd 猜测 |
-| `daemon.runtime.execution_failed` | 已获 durable release 的 turn 在 adapter/vendor 执行期失败；event journal 只保存固定 `agent execution failed`，不持久化 vendor stderr、token、路径或 diagnostic reference | 以原 commandId/eventId 查询 durable Error 并按同 eventId exact replay；详细原因只查本机脱敏 diagnostic log，不把原始 vendor 错误补写进 Runtime event |
+| `daemon.runtime.execution_failed` | 已获 durable release 的 turn 在 adapter/vendor 执行期失败；唯一 canonical 形态是带 commandID 的 Failed terminal，message 固定为 `agent execution failed` 且 diagnosticRef 为空。execution lane 不再保存 transient Error | 以原 commandId/eventId 查询 command terminal 并按同 eventId exact replay；详细原因只查本机脱敏 diagnostic log。若历史 command-bound Error 没有被 `terminal_event_id` 指向，保留 DB/WAL/SHM 并按 schema corruption 处理，禁止猜测迁移或把它当普通 warning |
 | `daemon.conversation.not_found` | Configure 或其他 conversation-scoped 请求引用不存在的 canonical conversation | 先用 Catalog/Start receipt 核对 conversationId；不要创建同 ID 占位记录或把缺失降级为 rev0 |
 | `daemon.conversation.configuration_required` | production `SendPrompt` 指向 fresh/unconfigured conversation，当前 authenticated configuration revision 为 rev0/NULL；即使 caller 传 0 或非零 expected revision 也不能准入 | 先用 `DescribeAgents` 取得该 agent 的 default configuration，再对同一 conversation 执行 `ConfigureConversation(expectedRevision=0)`；收到 Applied/Replayed rev1 后用该 revision 重发 prompt，不能把 rev0 当可执行默认值 |
 | `daemon.conversation.configuration_conflict` | production `SendPrompt.expectedConfigurationRevision` 与当前 authenticated configuration head 不一致；常见于另一个 writer 已推进配置 | 读取最新 configuration state，确认新配置后以新的 idempotency key 发起新 prompt；若是在重试既有 Accepted command，应按原 key/commandId 查询 receipt，不能把 expected revision 改写后复用旧 key |
@@ -1087,7 +1087,7 @@ Protection Keychain 且没有 file/dev keystore 降级。MachineRoot 丢失按
 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与
 destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade、P5.2 crash-safe client storage 与 P5.3
 WSS/pin/per-connection transfer primitive 已完成；P5.4 MachineConnection/bounded source automatic Task 也已
-完成，P5/P6 当前进度为 4/9、0/4。
+完成，P5.5 canonical fixture/receipt UI automatic Task 又已收口，P5/P6 当前进度为 5/9、0/4。
 
 #### P5.2 client storage / counter / replay failure
 
@@ -1197,7 +1197,50 @@ expiry 清理，合法 partial promotion 仍精确回滚。
 2026-07-27 的非门控 Instruments Allocations smoke 启动 `dist/AgentDeck.app --selfcheck`，exit 0、duration
 2.639832 秒；trace 只在 `/tmp/agentdeck-p54-instruments.rt5Mo5/p54-agentdeck-selfcheck.trace`，不得提交。
 它不是 RelaySessionSource 长跑、真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac 或真实
-vendor 证据。P5.5–P5.9 与 P5 Phase Exit 继续未完成。
+vendor 证据。后续 P5.5 已独立完成 iOS facade/fixture/receipt 迁移；P5.6–P5.9 与 P5 Phase Exit 继续未完成。
+
+#### P5.5 iOS canonical / receipt 乱序诊断
+
+P5.5 后，iOS ViewModel 不再消费私有 `MobileSessionSource` 事件，而是把共享 `SessionSource` 的 canonical
+snapshot/event、command status、typed connection state 与异步 receipt 视为不同到达轴。排障时必须同时保留
+conversationID、turnID、commandID、approvalID、requestID、idempotency key、canonical event sequence 与 receipt
+到达顺序；只截一张最终 UI 图无法判断是正常追平、transport outcome unknown 还是安全错绑。
+
+| typed state / 现象 | 含义 | 下一步 |
+| --- | --- | --- |
+| 收到 `commandID=null` 的 canonical Error，但当前 turn 仍在 streaming | conversation diagnostic，不是 Failed terminal | 保留 failure 文本用于诊断，但不得清 active turn、派发下一 prompt、生成 failed inbox 或停止 streaming；后续 Item/Completed 仍按 exact-next 接受 |
+| command-bound Error 的 code/message/diagnosticRef 不是固定 tuple，或同 command 已有 terminal | Runtime v5 authenticated event 违反唯一 Failed terminal 契约 | ingress/reducer 立即 security fail-close，保持 cursor/approval/queue 零漂移；不要把 vendor 文本改写后重试，也不要升级 Runtime 版本掩盖同 candidate 漂移 |
+| `PromptSubmissionState.failed` 且源错误为 `.transportUnavailable` | 请求是否到达 daemon 未知；同文本仍绑定原 idempotency key | 只让用户重试同一文本并复用原 key；收到 Accepted/Replayed 后按 commandID 等待 canonical user item，禁止换 key 猜测未执行 |
+| 下一 prompt 收到 Accepted/Replayed 后 queued row 消失，但 canonical 只有上一 command 的 terminal | receipt reconcile 错把旧 Completed/Interrupted/Failed 当成当前 prompt 证据 | 对照 receipt 与 terminal 的 commandID；只有逐字一致才可收口 pending prompt。保留新 queued row 并等待其 canonical user/terminal，禁止按“最近 terminal”跨 command 消费 |
+| receipt 已 Applied，但 UI 随后看到旧 Claimed/Applying | canonical stream 仍在追赶同一 operation epoch，receipt 是临时 UI floor | 保留两轴证据并等待 canonical Applied；不得把 UI 回退为 submitting，也不要人为补发审批 |
+| receipt 为 DeliveryFailed，但旧 canonical Applying 仍在 | delivery failure 尚未在 canonical 轴出现，当前不能证明新 retry round 已开始 | 等待同 approvalID/winner 的 canonical DeliveryFailed；只有随后 DeliveryFailed → Applying 才是合法 retry，禁止把旧 Applying 当作 retry 成功 |
+| canonical DeliveryFailed 后重试仍被旧 Applying 满足，或新 round 状态倒退 | retry operation 没有绑定 event-seq fence，或把 fence 前旧前缀当成新证据 | 对照 retry 发起时的 canonical event sequence；只有严格大于 fence 的 Applying/Applied 才属于新 round。保留原 idempotency key，不补发第二次决定 |
+| `.lagged` 后 fresh snapshot 已到，但审批卡回退或同步横幅不消失 | recovery snapshot 被错误当成审批账本 reset，或 UI 未完成 generation barrier | 保留同 observation 的 context/receipt/retry/operation 与 terminal floor；核对 backfill 的 turn/command/approval/request identity。snapshot 成功后应恢复 connected，任何错绑必须 security fail-close |
+| 新 `turnStarted` 或 snapshot 后 direct turn terminal 到达，但旧状态仍是 Pending/Submitting/DeliveryFailed | 非终态 approval 被错误退休或继续保持可点击，canonical journal 存在分叉或缺帧 | 必须进入 `.securityError`。只有 Applied、Expired 或等价 terminal AlreadyHandled 可以跨 turn；direct Failed 没有 turnID 时只可用全库唯一 commandID 绑定，matching terminal event 本身不能替代 approval terminal 证据 |
+| canonical 已终态但异步 receipt 更晚到达 | 正常的双轴乱序；ViewModel 会在最多 32 条 retired-operation 证据内继续校验 | 核对 receipt approvalID 与 canonical winner；完全一致则保持终态，不一致立即 security fail-close。队列满不是可恢复网络错误 |
+| bare `.expired` receipt 显示 `.expired(nil)` | Pending 在 claim 前过期，没有 winner；已 claim 的过期会返回 `.alreadyHandled(winner, .expired)` | 不填本地提交决定；若后续同 identity 的 canonical 带 winner，视为 authenticated state fork 并 security fail-close |
+| `.alreadyHandled(approvalID, decision, state)` | first-valid winner 已由 daemon 决定，可能来自另一客户端 | 显示 receipt winner/state；只在 state 为 DeliveryFailed 时按同 winner 请求 delivery retry，不允许反向决定 |
+| receipt approvalID 与当前 context 不同，或 receipt/canonical 都有 winner 且不一致 | 身份错绑、迟到跨 operation response 或 authenticated state fork | 立即进入 `.securityError` terminal，取消 observation/prompt/approval task，保留原序列用于审计；不得清 state 后继续 |
+| `.revoked` / `.incompatible` / `.securityError` 从 observation 或 command/approval failure 到达 | 不可恢复 terminal，而非普通网络波动 | 禁止后续 prompt/approval；完成 source/credential cleanup readback后再按升级或重新配对流程处理，不进入 reconnect loop |
+| fixture subscriber 收到 `.lagged(.bufferDropped)` 后结束 | preview/test consumer 填满 512 buffer，旧 generation 已终止 | 新建 observation，并确认首帧为更新后的 fresh snapshot、sequence 连续；不得继续使用旧 stream |
+| Machine/Session/Inbox 收到 retryable `.failed` 后仍显示旧 ready 行 | ViewModel 没有把错误态与旧缓存投影分离，用户可能误判资源仍可用 | `.failed` 必须清空旧列表/分组并触发一次 `onUpdate`；retryable 只控制重试入口，不能保留旧 ready 数据遮蔽错误 |
+
+如果 fixture 解码或 canonical reducer 失败，`FixtureSessionSource`/ViewModel 会发出或进入
+`SessionConnectionState.securityError`，而不是跳过坏 event。先检查 fixture 是否以
+`ConversationSnapshotV2` 起始、capabilities 是否为 snapshot 第一项、后续 `RuntimeEventV2.eventSeq` 是否
+exact-next，以及 approval 的 turn/command/approval/request identity 与赢家是否连续。fixture 的
+`inspectPairInvite`/`pair`/`revokeSelf` 明确返回 typed refusal，因为它只用于 preview/test。
+Core 与 Relay reducer 对每个 turn 的 pending + resolved approval identity 总量都限制为 32；若第 33 个
+identity 被接受、overflow 后 cursor/ledger 变化，或 `.at(H)` snapshot 的一次 mid-turn inference 被第二个 turn
+复用，都应按 reducer/security bug 处理，而不是扩大上限或跳过事件。
+Runtime v5 没有为本次收紧升级 wire version：commandless Error 保留 diagnostic 兼容面，command-bound Error 则
+只允许 Store-owned fixed Failed terminal。若 fixture、Relay 或 macOS 把前者投影为 failed inbox/turn terminal，
+或把后者留在 active turn 后继续接收下一 `TurnStarted`，都属于同 candidate 的 reducer bug。
+
+当前 `SceneDelegate` 仍注入 `FixtureSessionSource`；因此 Simulator 中看到 connected、prompt、approval 或
+reconnect UI 只证明 P5.5 presentation/fixture 语义，不证明发行 `RelaySessionSource` composition。真实 composition
+属于 P5.6，真实公网 WSS、物理 iPhone、production-signed Keychain、第二台 Mac 与真实 vendor 继续
+post-MVP BLOCKED；P5 Phase Exit 未完成。
 
 #### Trust reset 与本地 cleanup
 

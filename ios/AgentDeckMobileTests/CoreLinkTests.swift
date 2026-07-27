@@ -4,21 +4,22 @@ import AgentDeckSessionSource
 import XCTest
 
 final class CoreLinkTests: XCTestCase {
-  func testServerEventDecodesOnIOS() throws {
-    let json = #"{"type":"sessionStarted","sessionId":"s1","threadId":null,"agentKind":"codex"}"#
-    let event = try JSONDecoder().decode(ServerEvent.self, from: Data(json.utf8))
-    guard case .sessionStarted(let sid, _, let kind) = event else {
-      return XCTFail("expected sessionStarted")
+    func testCanonicalConversationProjectionLinksOnIOS() throws {
+        let snapshot = try SessionSourceTestValues.snapshot(conversationID: "conversation-ios")
+        var projection = try RuntimeConversationState(
+            conversationID: RuntimeConversationID(rawValue: "conversation-ios")
+        )
+        try projection.apply(snapshot)
+
+        XCTAssertEqual(projection.items.count, 0)
+        XCTAssertEqual(projection.capabilities?.agentKind, .codex)
     }
-    XCTAssertEqual(sid, "s1")
-    XCTAssertEqual(kind, .codex)
-  }
 
-  func testSharedSessionSourceAndRelayClientLinkOnIOS() {
-    let failure = SessionSourceFailure(code: .transportUnavailable)
-    let hello = RelayV2Hello(protocolVersion: relayProtocolVersionV2)
+    func testSharedSessionSourceAndRelayClientLinkOnIOS() {
+        let failure = SessionSourceFailure(code: .transportUnavailable)
+        let hello = RelayV2Hello(protocolVersion: relayProtocolVersionV2)
 
-    XCTAssertEqual(failure.code, .transportUnavailable)
-    XCTAssertEqual(hello.protocolVersion, relayProtocolVersionV2)
-  }
+        XCTAssertEqual(failure.code, .transportUnavailable)
+        XCTAssertEqual(hello.protocolVersion, relayProtocolVersionV2)
+    }
 }

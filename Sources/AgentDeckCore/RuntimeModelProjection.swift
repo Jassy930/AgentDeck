@@ -1,10 +1,9 @@
-import AgentDeckCore
 import Foundation
 
 /// Runtime canonical 数据进入 App model 前的纯校验错误。
 ///
 /// 这些错误只描述本地投影不变量；wire decode 与 daemon failure code 仍由各自边界负责。
-enum RuntimeCanonicalProjectionError: Error, Equatable, Sendable {
+public enum RuntimeCanonicalProjectionError: Error, Equatable, Sendable {
   case emptyConversationID
   case emptyEventID
   case emptyItemID
@@ -28,12 +27,12 @@ enum RuntimeCanonicalProjectionError: Error, Equatable, Sendable {
 }
 
 /// daemon 签发的稳定 UI item 身份。App 不再生成 `ai-N` 之类的替代 ID。
-struct RuntimeCanonicalItemIdentity: Equatable, Sendable {
-  let itemID: RuntimeItemID
-  let entityID: RuntimeEntityID
-  let commandID: RuntimeCommandID?
+public struct RuntimeCanonicalItemIdentity: Equatable, Sendable {
+  public let itemID: RuntimeItemID
+  public let entityID: RuntimeEntityID
+  public let commandID: RuntimeCommandID?
 
-  init(
+  public init(
     itemID: RuntimeItemID,
     entityID: RuntimeEntityID,
     commandID: RuntimeCommandID?
@@ -202,12 +201,12 @@ struct RuntimeCanonicalIdentityState: Sendable {
 }
 
 /// Conversation snapshot 的 base cursor 与后续 canonical event 的连续性状态。
-struct RuntimeCanonicalEventCursorState: Equatable, Sendable {
-  let conversationID: RuntimeConversationID
-  let cursor: RuntimeStreamCursorV1
-  let lastEventID: RuntimeEventID?
+public struct RuntimeCanonicalEventCursorState: Equatable, Sendable {
+  public let conversationID: RuntimeConversationID
+  public let cursor: RuntimeStreamCursorV1
+  public let lastEventID: RuntimeEventID?
 
-  init(
+  public init(
     conversationID: RuntimeConversationID,
     baseCursor: RuntimeStreamCursorV1,
     lastEventID: RuntimeEventID? = nil
@@ -224,7 +223,7 @@ struct RuntimeCanonicalEventCursorState: Equatable, Sendable {
   }
 
   /// 只接受 exact next sequence。重复、回退与 gap 都不会产生新状态。
-  func reducing(_ event: RuntimeEventV2) throws -> Self {
+  public func reducing(_ event: RuntimeEventV2) throws -> Self {
     guard event.conversationID == conversationID else {
       throw RuntimeCanonicalProjectionError.conversationMismatch
     }
@@ -255,14 +254,14 @@ struct RuntimeCanonicalEventCursorState: Equatable, Sendable {
 }
 
 /// Catalog 等全局 revision 轴的 exact-next 纯 reducer。
-struct RuntimeCanonicalRevisionState: Equatable, Sendable {
-  let cursor: RuntimeStreamCursorV1
+public struct RuntimeCanonicalRevisionState: Equatable, Sendable {
+  public let cursor: RuntimeStreamCursorV1
 
-  init(baseCursor: RuntimeStreamCursorV1) {
+  public init(baseCursor: RuntimeStreamCursorV1) {
     cursor = baseCursor
   }
 
-  func reducing(_ revision: UInt64) throws -> Self {
+  public func reducing(_ revision: UInt64) throws -> Self {
     let expected: UInt64
     do {
       expected = try cursor.checkedNext()

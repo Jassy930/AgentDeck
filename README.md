@@ -178,7 +178,7 @@ cargo build --release -p agentdeck-cli  # 产出 target/release/agentdeck
 swift build -c release           # 产出 .build/release/AgentDeck
 ```
 
-## iOS Companion（共享 facade 已建立，界面仍由 fixture 驱动）
+## iOS Companion（共享 SessionSource 已接入，发行 composition 仍由 fixture 驱动）
 
 AgentDeck Mobile 是与 macOS 主客户端配套的 iPhone companion，用协议对齐的 fixture 回放代替真实链路，在模拟器上完整跑通 R3 companion 界面骨架，接 Relay 时 UI 层零迁移。
 
@@ -189,8 +189,8 @@ ios/
 ├── project.yml                  # XcodeGen 声明式工程（xcodeproj 不入库）
 ├── AgentDeckMobile/
 │   ├── App/                     # AppDelegate / SceneDelegate / 导航
-│   ├── Screens/                 # 各屏 VC + @Observable view model
-│   ├── DataSource/              # 旧 MobileSessionSource + FixtureSessionSource（P5.5 再迁移）
+│   ├── Screens/                 # 各屏 VC + @MainActor view model
+│   ├── DataSource/              # 共享 SessionSource 的 preview/test fixture 实现
 │   ├── DesignTokens.swift       # 生成物：UIKit 版 token（禁止手改）
 │   └── Fixtures/                # 协议语义对齐的 JSON fixture（见 ios/Fixtures/）
 └── AgentDeckMobileTests/
@@ -208,11 +208,15 @@ cd ios && xcodegen generate && \
 iOS App/Test target 已显式声明 `AgentDeckCore`、`AgentDeckSessionSource` 与 `AgentDeckRelayClient` 三个
 product 依赖；RelayClient 已传递链接 SessionSource，因此 XcodeGen 对后者使用 `link: false` 保留
 module/build edge，避免生成重复 product wrapper。`CoreLinkTests` 会实际 import/构造三模块类型验证链接。
-共享 `SessionSource` facade 已在 P5.1 建立；当前 `SceneDelegate` 仍注入旧的
-`FixtureSessionSource`（bundle 内 JSON 回放），旧 `MobileSessionSource`/models 要到 P5.5 才迁移。
-因此杀 app 仍会重置 fixture 状态，当前界面不依赖 daemon 或网络，也不构成真实 Relay 链路证据。
+共享 `SessionSource` facade 已在 P5.1 建立，P5.5 又删除 iOS 私有的
+`MobileSessionSource`/models，并把四组 ViewModel、cell 与 input 状态机迁到同一 facade。bundle 内五份
+fixture 现以 canonical `ConversationSnapshotV2` + `RuntimeEventV2` 回放，复用下沉到
+`AgentDeckCore` 的 `RuntimeConversationState`/canonical projection；`FixtureSessionSource` 是
+actor/Sendable、有界 observation 的 preview/test 实现。当前 `SceneDelegate` 仍直接注入该 fixture，发行
+composition、真实配对与前后台恢复属于 P5.6。因此杀 app 仍会重置 fixture 状态，当前界面不依赖 daemon
+或网络，也不构成真实 Relay 链路证据。
 
-## Relay Companion MVP 实施状态（P5.4 automatic complete；P5 为 4/9）
+## Relay Companion MVP 实施状态（P5.5 automatic complete；P5 为 5/9）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -281,12 +285,52 @@ iOS Simulator `26/26`。同一未变 Rust candidate
 `4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f` 的完整 `cargo test --locked`
 与 Rust/cross-language/static gates 全绿；提交范围由 34 Rust/fixture + 69 Swift + 6 docs 的 exact
 109-path manifest 机械约束。两笔提交是 `34 → 75` 的有序依赖栈：第一笔只承诺 Rust scoped-green，第二笔
-必须以第一笔为父；完整绿色证据只属于组合候选。P5 当前为 4/9，下一项仍是 P5.5。已执行一次非门控
+必须以第一笔为父；完整绿色证据只属于组合候选。P5.4 收口时 P5 为 4/9。已执行一次非门控
 Instruments Allocations smoke：
 `dist/AgentDeck.app --selfcheck` exit 0、约 2.64 秒，trace 仅位于
 `/tmp/agentdeck-p54-instruments.rt5Mo5/p54-agentdeck-selfcheck.trace`，不提交仓库。
 
-P5.5–P5.9、旧 iOS fixture 迁移、AppKit registry、Simulator 自动 Relay E2E 与 P5 Phase Exit 仍未完成。
+P5.5 已把 canonical reducer/投影从 macOS executable 下沉到 `AgentDeckCore`，让 macOS、Relay reducer 与
+iOS fixture 共用 daemon identity、exact-next cursor 和审批 lifecycle 约束。审批链只接受
+`Claimed → Applying → Applied`、`Applying → DeliveryFailed → Applying → Applied`，并允许
+Claimed/Applying/DeliveryFailed 以同一赢家转 Expired，或 Pending 直接转 `Expired(nil)`；所有转换绑定
+approval/turn/command/request identity 和唯一赢家，同一 turn 的 requestID 在 pending/resolved ledger 全程
+唯一，pending + resolved approval identity 总量固定为每 turn 32；达到上限后的第 33 个 identity 在修改
+cursor 或 ledger 前原子拒绝。`.at(H)` snapshot 不携带 lifecycle ledger 时，只允许首个 lifecycle event
+绑定一次 exact turn/command，并可直接收口 terminal；该推断不能跨第二个 turn 重用。iOS receipt 是独立到达的 UI
+floor：同 operation epoch 内迟到 canonical 不能把 Applied/DeliveryFailed/Expired 回退；canonical 追平后才
+接管。delivery retry 还绑定 canonical event-seq fence，只有 fence 之后的新 Applying 才属于新 round；canonical
+先到时最多保留 32 条 retired-operation 证据校验迟到 receipt，赢家或 approvalID 冲突一律 fail-close。fresh
+recovery snapshot 只开启新的 canonical generation，不清 approval context、receipt、retry key、在途 operation
+或 terminal floor；backfill 必须复用 exact turn/command/approval/request identity，否则 security fail-close。
+新 turn 只允许退休 Applied、Expired 或等价 terminal AlreadyHandled 投影，任何 pending/submitting/failure
+非终态都会进入 security terminal；snapshot 后直接到达 matching turn terminal 也不能绕过该门禁。成功接受
+lagged recovery snapshot 后 connection 恢复 connected 并清理同步提示。
+transport-unknown prompt/approval 以相同 idempotency key 重试，command receipt 按 commandID 精确
+过滤；旧 command 的 Completed/Interrupted/Failed terminal 不得消费下一 prompt 的 Accepted/Replayed receipt；
+approvalID 或 canonical/receipt 赢家不一致以及 revoked/incompatible/securityError 都不可逆
+fail-close。bare Expired receipt 只表示 Pending 无赢家过期，UI 保持 `.expired(nil)`；已 claim 后过期由
+daemon 返回 `AlreadyHandled(winner, Expired)`，若 bare Expired 后又出现 canonical winner 则视为状态分叉。
+Machine/Session/Inbox 的 retryable `.failed` 会清空旧 ready 投影并立即通知 UI，避免错误态被缓存行遮住。
+
+P5.5 同时消除了 Runtime v5 `.error` 的双重语义：daemon execution lane 不再发布 transient canonical
+Error；fatal adapter completion 只由 command terminal builder 生成一次 fixed
+`daemon.runtime.execution_failed / agent execution failed / diagnosticRef=null`。`commandID == nil` 的 Error
+仍是 conversation diagnostic，不结束 active turn，也不生成 Relay/fixture failed inbox；`commandID != nil`
+的 Error 必须是上述 fixed tuple，并与 Completed/Interrupted 共用 command、一次性 snapshot baseline 与未决审批
+terminal gate。该收紧不升级 Runtime v5 wire；旧开发库若含非 terminal pointer 的 command-bound Error，启动
+integrity audit 会 fail-close，不能猜测迁移。Core、Relay、macOS 与 iOS 均允许
+`TurnStarted → Failed → 下一 TurnStarted`，但错误 command、重复 terminal 或未终态 approval 必须原子拒绝。
+
+P5.5 以 52 个 code/test/fixture path 的 content manifest
+`8dd8610966430a5cf640617da53e34d91bf379fe0ad495ea2ef719a6fec9d5ba` 和 10 个 tracked docs path 冻结 exact
+62-path scope。fresh automatic 证据为：focused Core/Relay/Runtime protocol、SessionDetail、fixture 与 Rust
+Error-contract matrix，顶层 `swift test` 为 `980 XCTest / 4 skipped + 35 Swift Testing / 0 failure`，
+warnings-as-errors focused 为 `91/91`，fresh iOS Simulator 为 `91/91`。matching canonical Failed 先于
+accepted/replayed receipt 到达时会收敛并恢复 draft；fixture 单条 Failed 只推进一次资源 revision。最终
+Rust/文档门禁结果见 `docs/QUALITY.md`。P5 当前为 5/9；P5.6–P5.9、发行
+`SceneDelegate` composition、AppKit registry、
+Simulator 自动 Relay E2E 与 P5 Phase Exit 仍未完成。
 当前 SwiftPM runner 的 Data Protection Keychain 因缺 entitlement
 返回 `-34018`，真实 SecItem 用例明确 SKIP；iOS Simulator 也固定回报
 `CompleteUntilFirstUserAuthentication`，不能代替物理 iPhone 锁屏 readback。这两项继续留在 post-MVP
@@ -843,11 +887,12 @@ integration test 进程同时存活的真实 RuntimeStore fixture 限为 4；每
 P3.7 的 typed journal 前置分片把 `ExecutionId`、`AgentTurnRequest`、
 `AdapterStateHandle` 和有界脱敏 `ExecSpec` 绑定到 daemon-owned cold prepare。adapter hook 只能由
 不可构造的 daemon capability 调用；prepared handle 在真正读取 spec 时再次核对 exact execution/state，
-恶意虚 getter 不能在首次校验后切换到另一 execution。fresh Item/Error/approval 只允许在 matching
+恶意虚 getter 不能在首次校验后切换到另一 execution。fresh Item/approval 只允许在 matching
 Started + Fence + durable release 之后由 Store-owned builder 写入；release 失败会丢弃整个 prepared
 event receiver，不会把未越过 gate 的 approval 持久化。event row、HWM、stream index、ledger 和 watcher
 在同一 COMMIT，open-time audit 会验证 dynamic rows 与
-`startedAt <= releaseAuthorizedAt <= terminalAt`，Error 只保存固定脱敏 failure。
+`startedAt <= releaseAuthorizedAt <= terminalAt`。Failed Error 只允许由 command terminal builder 保存固定脱敏
+failure；execution event lane 不再持久化 transient Error。
 该前置分片的 fixture、typed adapter prepare 与 typed execution journal 已分别提交为
 `819aa5e` / `1acf8b8` / `3f22cf0`。
 
@@ -908,8 +953,8 @@ Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/tes
 安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；基于 `9efb28d` 的独立 P3 Phase
 Exit 已完成；P4.1–P4.7 automatic Task 与 P4 automatic Phase Exit 已收口，P5.1 shared facade、P5.2
 crash-safe client storage、P5.3 WSS/pin/transfer primitive 与 P5.4 MachineConnection/bounded source
-automatic Task 已完成。P4–P6 按 Task 进度计为
-7/7、4/9、0/4。`p4-auto` 已 PASS，`p4`
+automatic Task 已完成；P5.5 又完成 shared SessionSource/canonical fixture 与 receipt UI 迁移。P4–P6 按
+Task 进度计为 7/7、5/9、0/4。`p4-auto` 已 PASS，`p4`
 仍不受支持；完整 P4 Phase Exit 还由 pre-closeout candidate
 SHA-256 `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的顶层门禁和
 `spec/security`、`quality` 双路 Approved review 共同支撑，P0/P1/P2=0。P3.1 provisioned signed

@@ -1,29 +1,52 @@
+import AgentDeckSessionSource
 import Foundation
 
 @MainActor
 final class SessionListViewModel {
-    private let source: MobileSessionSource
+    private let source: any SessionSource
     private let machineID: String
-    private(set) var groups: [(group: SessionGroup, sessions: [SessionSummary])] = []
+    private(set) var resourceState: ResourceState<[ConversationSummary]> = .loading(previous: nil)
+    private(set) var groups: [(group: ConversationGroup, sessions: [ConversationSummary])] = []
     var onUpdate: (() -> Void)?
     private var task: Task<Void, Never>?
 
-    init(source: MobileSessionSource, machineID: String) {
+    init(source: any SessionSource, machineID: String) {
         self.source = source
         self.machineID = machineID
     }
 
     func start() {
-        task = Task { [weak self] in
-            guard let source = self?.source, let machineID = self?.machineID else { return }
-            let stream = source.sessions(machineID: machineID)
-            for await sessions in stream {
-                self?.groups = [SessionGroup.waitingApproval, .active, .recent].compactMap { group in
-                    let matched = sessions.filter { $0.group == group }
-                    return matched.isEmpty ? nil : (group, matched)
-                }
-                self?.onUpdate?()
+        guard task == nil else { return }
+        let source = source
+        let machineID = machineID
+        task = Task { [weak self, source, machineID] in
+            let stream = await source.conversations(machineID: machineID)
+            for await state in stream {
+                guard !Task.isCancelled, let self else { break }
+                consume(state)
             }
+            guard let self else { return }
+            task = nil
+        }
+    }
+
+    private func consume(_ state: ResourceState<[ConversationSummary]>) {
+        resourceState = state
+        switch state {
+        case .loading(let previous):
+            if let previous { rebuildGroups(from: previous) }
+        case .ready(let value, _), .stale(let value, _):
+            rebuildGroups(from: value)
+        case .failed:
+            groups = []
+        }
+        onUpdate?()
+    }
+
+    private func rebuildGroups(from conversations: [ConversationSummary]) {
+        groups = [ConversationGroup.waitingApproval, .active, .recent].compactMap { group in
+            let matches = conversations.filter { $0.group == group }
+            return matches.isEmpty ? nil : (group, matches)
         }
     }
 

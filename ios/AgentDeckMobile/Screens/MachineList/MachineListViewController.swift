@@ -1,13 +1,14 @@
+import AgentDeckSessionSource
 import UIKit
 
 final class MachineListViewController: UIViewController {
-    private let source: MobileSessionSource
+    private let source: any SessionSource
     private let viewModel: MachineListViewModel
     private var collectionView: UICollectionView!
     private var dataSource: UICollectionViewDiffableDataSource<Int, String>!
     private let emptyView = MobileEmptyStateView(title: "还没有机器", subtitle: "用右上角「配对」把 Mac 接入")
 
-    init(source: MobileSessionSource) {
+    init(source: any SessionSource) {
         self.source = source
         self.viewModel = MachineListViewModel(source: source)
         super.init(nibName: nil, bundle: nil)
@@ -20,10 +21,12 @@ final class MachineListViewController: UIViewController {
         title = "AgentDeck"
         view.backgroundColor = DesignTokens.bg
         navigationItem.rightBarButtonItems = [
-            UIBarButtonItem(image: UIImage(systemName: "qrcode.viewfinder"), style: .plain,
-                            target: self, action: #selector(openPairing)),
-            UIBarButtonItem(image: UIImage(systemName: "tray"), style: .plain,
-                            target: self, action: #selector(openInbox)),
+            UIBarButtonItem(
+                image: UIImage(systemName: "qrcode.viewfinder"), style: .plain,
+                target: self, action: #selector(openPairing)),
+            UIBarButtonItem(
+                image: UIImage(systemName: "tray"), style: .plain,
+                target: self, action: #selector(openInbox)),
         ]
         configureCollectionView()
         view.addSubview(emptyView)
@@ -53,7 +56,9 @@ final class MachineListViewController: UIViewController {
             collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ])
-        let registration = UICollectionView.CellRegistration<UICollectionViewListCell, MachineSummary> { cell, _, machine in
+        let registration = UICollectionView.CellRegistration<
+            UICollectionViewListCell, MachineSummary
+        > { cell, _, machine in
             // 覆盖系统默认白色 cell 背景，使用设计系统 surface token
             var bgConfig = UIBackgroundConfiguration.listGroupedCell()
             bgConfig.backgroundColor = DesignTokens.surface
@@ -62,12 +67,20 @@ final class MachineListViewController: UIViewController {
 
             var content = UIListContentConfiguration.subtitleCell()
             content.text = machine.name
-            let status = machine.isOnline ? "在线" : "离线"
-            content.secondaryText = "\(status) · \(machine.activeSessionCount) 活跃会话"
+            let presentation = MachineRowPresentation.make(from: machine)
+            content.secondaryText =
+                "\(presentation.statusText) · \(machine.activeConversationCount) 活跃会话"
             content.textProperties.color = DesignTokens.text
             content.secondaryTextProperties.color = DesignTokens.text2
             content.image = UIImage(systemName: "circle.fill")
-            content.imageProperties.tintColor = machine.isOnline ? DesignTokens.accent : DesignTokens.text2
+            content.imageProperties.tintColor = {
+                switch presentation.indicator {
+                case .healthy: DesignTokens.accent
+                case .neutral: DesignTokens.text2
+                case .warning: DesignTokens.warn
+                case .danger: DesignTokens.danger
+                }
+            }()
             content.imageProperties.maximumSize = CGSize(width: 10, height: 10)
             cell.contentConfiguration = content
             var accessories: [UICellAccessory] = [.disclosureIndicator()]
@@ -82,14 +95,19 @@ final class MachineListViewController: UIViewController {
                 // 若用 999 直接赋值，layer.masksToBounds 截断后视觉正常，但不如语义清晰。
                 badge.layer.cornerRadius = 10
                 badge.layer.masksToBounds = true
-                accessories.append(.customView(configuration: .init(customView: badge, placement: .trailing())))
+                accessories.append(
+                    .customView(configuration: .init(customView: badge, placement: .trailing())))
             }
             cell.accessories = accessories
         }
-        dataSource = UICollectionViewDiffableDataSource<Int, String>(collectionView: collectionView) {
+        dataSource = UICollectionViewDiffableDataSource<Int, String>(collectionView: collectionView)
+        {
             [weak self] collectionView, indexPath, machineID in
-            guard let machine = self?.viewModel.machines.first(where: { $0.id == machineID }) else { return nil }
-            return collectionView.dequeueConfiguredReusableCell(using: registration, for: indexPath, item: machine)
+            guard let machine = self?.viewModel.machines.first(where: { $0.id == machineID }) else {
+                return nil
+            }
+            return collectionView.dequeueConfiguredReusableCell(
+                using: registration, for: indexPath, item: machine)
         }
     }
 
@@ -97,11 +115,25 @@ final class MachineListViewController: UIViewController {
         var snapshot = NSDiffableDataSourceSnapshot<Int, String>()
         snapshot.appendSections([0])
         snapshot.appendItems(viewModel.machines.map(\.id))
-        snapshot.reconfigureItems(viewModel.machines.map(\.id).filter { id in
-            dataSource.snapshot().itemIdentifiers.contains(id)
-        })
+        snapshot.reconfigureItems(
+            viewModel.machines.map(\.id).filter { id in
+                dataSource.snapshot().itemIdentifiers.contains(id)
+            })
         dataSource.apply(snapshot, animatingDifferences: false)
         emptyView.isHidden = !viewModel.machines.isEmpty
+        if viewModel.machines.isEmpty {
+            switch viewModel.resourceState {
+            case .loading:
+                emptyView.update(title: "正在加载机器…", subtitle: nil)
+            case .failed(let error, _):
+                emptyView.update(
+                    title: "无法加载机器",
+                    subtitle: error.message ?? error.code.rawValue
+                )
+            case .ready, .stale:
+                emptyView.update(title: "还没有机器", subtitle: "用右上角「配对」把 Mac 接入")
+            }
+        }
     }
 
     @objc private func openPairing() {
@@ -109,14 +141,18 @@ final class MachineListViewController: UIViewController {
     }
 
     @objc private func openInbox() {
-        navigationController?.pushViewController(InboxViewController(source: source), animated: true)
+        navigationController?.pushViewController(
+            InboxViewController(source: source), animated: true)
     }
 }
 
 extension MachineListViewController: UICollectionViewDelegate {
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         collectionView.deselectItem(at: indexPath, animated: true)
-        guard let machineID = dataSource.itemIdentifier(for: indexPath) else { return }
+        guard let machineID = dataSource.itemIdentifier(for: indexPath),
+            let machine = viewModel.machines.first(where: { $0.id == machineID }),
+            MachineRowPresentation.make(from: machine).isSelectable
+        else { return }
         navigationController?.pushViewController(
             SessionListViewController(source: source, machineID: machineID), animated: true)
     }

@@ -1303,10 +1303,11 @@ P3/P4 自动 scope 可以携该 BLOCKED closeout，但始终不得把 signed rou
 `AgentTurnRequest`、`AdapterStateHandle`、bounded/redacted `ExecSpec` 与 daemon-owned
 `PreparedAgentTurnHandle`；daemon 在 prepare 返回时与 handle consumption 时两次校验虚 getter 的 exact
 execution/state binding。
-canonical Item/Error 已改为 Store-owned typed append。fresh dynamic
+canonical Item/Error 在 P3.7 当时已改为 Store-owned typed append；P5.5 后 execution lane 又删除 transient
+Error producer，fixed Error 只由 command terminal builder 生成。fresh dynamic
 event 与 approval 必须绑定 authenticated Started/turn 与 released Fence，且
 `createdAt >= releaseAuthorizedAt`；caller 不能提交 raw event/bytes/error，
-失败只落固定 `daemon.runtime.execution_failed`。canonical template 在单 build permit 下构造、按实际
+失败 terminal 只落固定 `daemon.runtime.execution_failed`。canonical template 在单 build permit 下构造、按实际
 retained allocation 计费，并在 transaction 内按真实 eventSeq 原地 finalize；event row/HWM/index/
 ledger/watcher 同一 COMMIT，open-time audit 对真实 dynamic rows fail-close。prepared event receiver 只在
 cold release 调用成功后转发，release 失败先丢弃 receiver，不能注册预排 approval。legacy terminal 已按
@@ -3157,7 +3158,8 @@ agent docs、diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics �
 真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与 destructive purge 继续保持 post-MVP
 `BLOCKED`；静态 runner 仍只输出 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不生成真实证据。
 P5.1 shared facade、P5.2 crash-safe client storage、P5.3 WSS/pin/per-connection transfer primitive 与
-P5.4 MachineConnection/bounded source automatic Task 已于后续完成，P5/P6 当前进度为 4/9、0/4。
+P5.4 MachineConnection/bounded source、P5.5 canonical fixture/receipt UI automatic Task 已于后续完成，
+P5/P6 当前进度为 5/9、0/4。
 
 ---
 
@@ -3165,8 +3167,8 @@ P5.4 MachineConnection/bounded source automatic Task 已于后续完成，P5/P6 
 
 > **执行前审计（2026-07-20）：0/9 Task 完成。** 当前只有 Relay crypto/wire、P3.9 本机 Runtime 与
 > fixture UI 基线；P5.1–P5.9 production source、真实 Simulator Relay E2E 与 post-MVP slot runner 均未实现。
-> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-27）：P5.1–P5.4 automatic
-> Task 已完成，P5 为 4/9。P5.5–P5.9 与 P5 Phase Exit 仍未完成。**
+> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-27）：P5.1–P5.5 automatic
+> Task 已完成，P5 为 5/9。P5.6–P5.9 与 P5 Phase Exit 仍未完成。**
 
 ### Task P5.1：建立 AgentDeckSessionSource target 与强类型 facade
 
@@ -3380,14 +3382,25 @@ iOS Simulator `26/26`。首轮 Simulator 暴露 file-protection 两种 Foundatio
 负例锁定 `invalidRecord` 与零 Keychain mutation。同一 Rust candidate
 `4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f` 上完整 `cargo test --locked`
 exit 0，Rust/cross-language/static gates 全绿。提交按 `34 Rust/fixture → 69 Swift + 6 docs` 有序堆叠；第一笔
-只承诺 Rust scoped-green，完整门禁属于第二笔落地后的组合候选。历史 Step 2 RED 未保留且不伪造。P5 为 4/9，P5.5–P5.9
-与 P5 Phase Exit 继续未完成。真实公网 WSS、production-signed Data Protection Keychain、物理 iPhone、
+只承诺 Rust scoped-green，完整门禁属于第二笔落地后的组合候选。历史 Step 2 RED 未保留且不伪造。P5.4
+收口时 P5 为 4/9；后续 P5.5 已独立完成。P5.6–P5.9 与 P5 Phase Exit 继续未完成。真实公网 WSS、
+production-signed Data Protection Keychain、物理 iPhone、
 第二台 Mac与真实 Codex/Claude Code vendor 全部继续 post-MVP `BLOCKED`。
 
 ### Task P5.5：迁移 Fixture 与 iOS ViewModel 到真实 receipt 语义
 
 **Files:**
+- Move: `Sources/AgentDeck/{RuntimeConversationState,RuntimeModelProjection}.swift` → `Sources/AgentDeckCore/`
+- Modify: `Sources/AgentDeck/{ThreadRuntimeModel}.swift`
+- Modify: `Sources/AgentDeckCore/Protocol/RuntimeV2StreamTypes.swift`
+- Modify: `Sources/AgentDeckRelayClient/Source/ConversationReducer.swift`
+- Modify: `Tests/{AgentDeckRelayClientTests/RelaySessionSourceTests,AgentDeckTests/RuntimeCanonicalProjectionTests,AgentDeckTests/RuntimeConversationStateTests,AgentDeckTests/ThreadRuntimeModelCanonicalTests}.swift`
+- Modify: `Tests/AgentDeckTests/RuntimeV2StreamProtocolTests.swift`
+- Modify: `agentdeck-protocol/{src/runtime/event.rs,tests/runtime_v2_contract.rs}`
+- Modify: `agentdeckd/src/{agent.rs,codex/runtime_translate_tests.rs,runtime/conversation.rs,runtime/store/execution_event.rs,runtime/store/journal.rs}`
+- Modify: `agentdeckd/tests/{runtime_store_execution_event.rs,runtime_store_execution_event_tamper.rs,runtime_store_legacy_terminal.rs,support/runtime_event_tamper.rs}`
 - Modify: `ios/AgentDeckMobile/DataSource/{FixtureSessionSource,FixtureFormat}.swift`
+- Delete: `ios/AgentDeckMobile/DataSource/{MobileSessionSource,MobileSessionModels}.swift`
 - Modify: `ios/Fixtures/*.json`
 - Modify: `ios/AgentDeckMobile/Screens/MachineList/MachineListViewModel.swift`
 - Modify: `ios/AgentDeckMobile/Screens/SessionList/SessionListViewModel.swift`
@@ -3395,13 +3408,59 @@ exit 0，Rust/cross-language/static gates 全绿。提交按 `34 Rust/fixture �
 - Modify: `ios/AgentDeckMobile/Screens/SessionDetail/Cells/ApprovalCardCell.swift`
 - Modify: `ios/AgentDeckMobile/Screens/Inbox/InboxViewModel.swift`
 - Modify: `ios/AgentDeckMobileTests/{FixtureSessionSourceTests,SessionDetailViewModelTests,MachineListViewModelTests,SessionListViewModelTests,InboxViewModelTests}.swift`
+- Create: `ios/AgentDeckMobileTests/SessionSourceSpy.swift`
 
-- [ ] Step 1: 先改tests为async SessionSource契约。 断言`start()`幂等且恰好一个subscription task；sendPrompt不调用start；sending→accepted/queued→canonical UserMessage commandId替换；offline保留draft；approval submitting→Applied；AlreadyHandled显示赢家+state；DeliveryFailed只能retry同决定；machine row分别呈现Relay不可达、machine offline、reconnecting、revoked、incompatible、securityError。
-- [ ] Step 2: 运行iOS tests。 Expected: FAIL，现有source同步/无界/void receipt且viewmodel乐观更新。
-- [ ] Step 3: 把FixtureSessionSource改为actor/Sendable facade实现，fixture返回确定receipt并使用bounded stream；迁移四组ViewModel和cell/input状态机。 fixture仍只用于preview/test。
-- [ ] Step 4: 运行 `cd ios && xcodegen generate && xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile -destination 'platform=iOS Simulator,name=iPhone 17' test`。 Expected: 全部PASS；sendPrompt不会产生第二subscription。
-- [ ] Step 5: 运行 `swift test`，确认shared targets无回归。
-- [ ] Step 6: 提交。 `git add ios Package.swift Sources Tests && git commit -m "refactor(ios): 切换 SessionSource 与 daemon receipt 语义"`
+- [x] Step 1: tests 已迁到 async `SessionSource` 契约。锁定 `start()` 幂等/单 observation、prompt
+  single-flight 与 commandID canonical 替换、transport-unknown 同 key 重试、approval receipt/canonical 乱序、
+  fresh snapshot generation floor/lagged 恢复、AlreadyHandled/DeliveryFailed/Expired、fatal fail-close 与六类
+  typed machine state；补齐每 turn 32 approval identity、`.at(H)` mid-turn direct terminal、event-seq retry fence、
+  retired-operation 迟到 receipt、新 turn terminal-only 清理、snapshot direct-terminal fail-close 及资源
+  `.failed` 清缓存反例；另锁定 commandless Error 非终态、fixed command-bound Failed、错误 tuple、fatal completion
+  单 terminal、历史 nonterminal command-bound Error reopen fail-close。固定 sleep 已换成
+  `approvalResponseGeneration` / `onUpdate` 确定性完成信号。
+- [x] Step 2: 接管时没有保留可复算的历史 RED，因此不补写不存在的失败结果；以 current-tree discovery、
+  focused 反例与 fresh DerivedData 全量覆盖替代，并明确该事实。
+- [x] Step 3: `RuntimeConversationState`/canonical projection 已下沉 `AgentDeckCore`；Core 与 Relay reducer
+  共同约束 approval identity、同一 turn 的 requestID 在 pending/resolved ledger 全程唯一、赢家与
+  `Claimed → Applying → Applied`、
+  `Applying → DeliveryFailed → Applying → Applied`、Claimed/Applying/DeliveryFailed 同赢家 Expired 以及
+  `Pending → Expired(nil)`。旧
+  `MobileSessionSource`/models 已删除；`FixtureSessionSource` 已改为 actor/Sendable、有界 shared facade，五份
+  fixture 直接承载 canonical snapshot + Runtime v2 event。四组 ViewModel/cell/input 已迁移真实 receipt 语义；
+  fixture 仍只用于 preview/test。Core/Relay ledger 合计限制 pending + resolved identity 为每 turn 32；snapshot
+  mid-turn inference 只消费一次 exact turn/command。SessionDetail retry 以 canonical event sequence 划分 round，
+  canonical 先终态时保留最多 32 条 retired-operation 证据；非终态旧 approval 遇到新 turn 必须 fail-close。
+- [x] Step 4: fresh DerivedData iOS Simulator 全量与 focused SessionDetail/fixture/资源 ViewModel 通过；精确
+  最终计数记录在 `docs/QUALITY.md`。sendPrompt/approval 均由 single-flight task 与
+  operation identity 约束，不创建第二 observation；matching canonical Failed 先于 accepted/replayed receipt
+  到达时会恢复 draft 且不留下 queued row；上一 command 的 Completed terminal 不会消费下一 prompt receipt。
+  资源 `.failed` 清空旧 ready 投影并立即通知 UI，fixture 单条 command-bound Failed 只推进一次资源 revision。
+- [x] Step 5: Core/Relay/Runtime protocol、Rust producer/store/integrity focused matrix 与顶层回归通过；顶层
+  `swift test` 为 `980 XCTest / 4 skipped + 35 Swift Testing / 0 failure`。SKIP 不计 PASS，但四项均为既有
+  entitlement 槽位。完整命令与最终计数记录在 `docs/QUALITY.md`。
+- [x] Step 6: 以 exact path manifest 收口本阶段代码、fixture、测试与文档，提交信息固定为
+  `refactor(ios): 切换 SessionSource 与 daemon receipt 语义`；52 个 code/test/fixture path 的 content manifest
+  为 `8dd8610966430a5cf640617da53e34d91bf379fe0ad495ea2ef719a6fec9d5ba`，另含 10 个 tracked docs，exact scope
+  为 62 paths。不目录级暂存、不混入其它 WIP、不 push。
+
+**P5.5 automatic 完成边界（2026-07-27）：** receipt 与 canonical 是独立到达轴；同 operation epoch 的
+receipt 作为 UI floor，canonical 追平后才接管，迟到 Claimed/Applying 不得回退 Applied/DeliveryFailed/Expired。
+fresh snapshot 只轮换 canonical generation，保留同 identity context/receipt/retry/in-flight operation 与
+terminal floor；lagged barrier 成功后恢复 connected，turn/command/approval/request 错绑统一 security
+fail-close。retry 以 event-seq fence 拒绝旧 round，迟到 receipt 继续经有界 retired-operation 证据校验；新 turn
+或 snapshot 后 direct terminal 都不能清理/保留可操作的非终态 approval。direct Expired receipt 不携带 winner，先保持 `.expired(nil)`；approvalID 或双方明确
+winner 不一致统一 security fail-close。`.revoked/.incompatible/.securityError` 从 observation、prompt 或 approval
+任一路到达都进入不可逆终态。P5 进度为 5/9；当前 `SceneDelegate` 仍注入 fixture，发行 composition/真实 pairing 属
+P5.6。P5.6–P5.9 与 P5 Phase Exit 未完成；真实公网 WSS、production-signed Data Protection Keychain、物理
+iPhone、第二台 Mac 与真实 Codex/Claude Code vendor 继续 post-MVP `BLOCKED`。
+
+Runtime v5 Error 额外固定为：commandless Error 只记录 conversation diagnostic，不结束 active turn 或生成
+failed inbox；command-bound Error 必须精确为
+`daemon.runtime.execution_failed / agent execution failed / diagnosticRef=null`，是唯一 Failed terminal，并与
+Completed/Interrupted 共用 command、approval 与一次性 snapshot baseline gate。daemon 已删除 transient
+`AdapterEvent::Error`/execution-event Error producer；fatal adapter completion 只经 Store-owned terminal builder
+落一条 Error。旧开发 DB 中不由 `terminal_event_id` 指向的 command-bound Error 在 startup audit fail-close。
+本轮不升级 Runtime v5，避免无必要地切断 current cert/grant/pairing trust domain。
 
 ### Task P5.6：实现 iOS 真配对、扫码/粘贴与前后台恢复
 

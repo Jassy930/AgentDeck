@@ -405,6 +405,15 @@ P4.3 pairing trust realm 使用前，任何曾生成 Runtime v1 签名材料的�
 历史 Runtime TBS 开发凭据。当前本地 trust-reset 必须走上述 Runtime v5 命令与 signed proof；不得手改
 SQLite、Keychain 或签名版本来伪造完成。
 
+P5.5 对 `.error` 做的是 current Runtime v5 内的语义收紧，不生成新 cert/grant，也不要求 re-enroll/re-pair：
+commandless Error 仍是 conversation diagnostic；command-bound Error 只允许 fixed
+`daemon.runtime.execution_failed / agent execution failed / diagnosticRef=null`，且必须由 command
+`terminal_event_id` 指向。旧 pre-release 开发 DB 若曾把相同 fixed Error 写成 Started 与真正 terminal 之间的
+普通 execution event，current daemon 会在 open-time integrity audit 拒绝该库。此时保留 main/WAL/SHM 与
+diagnostic evidence，使用受控的开发 state reset 或可信备份恢复；禁止手改 pointer、删除单行或把 Error
+重新解释为 warning。production 尚无已发布迁移承诺，未来若需要保留这类历史必须另行设计 authenticated
+migration，不能在本 runbook 中临时绕过。
+
 ## 常见 failure code
 
 | code | 含义 | 处理 |
@@ -483,5 +492,7 @@ persistent pairing 必须使用 Data Protection Keychain，不得降级到 injec
 丢失时回到本手册的 [portable purge receipt 流程](#machineroot-丢失后的-portable-purge-receipt)，静态
 sentinel 不生成 receipt 或删除授权。production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、
 物理真机/真实 iOS、第二台 Mac 与 destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade、P5.2
-crash-safe client storage 与 P5.3 WSS/pin/per-connection transfer primitive 已完成，P5/P6 当前为 3/9、0/4。
+crash-safe client storage、P5.3 WSS/pin/per-connection transfer primitive、P5.4 bounded production source 与
+P5.5 canonical fixture/receipt UI automatic Task 已完成，P5/P6 当前为 5/9、0/4。P5.6 发行 composition 与
+P5 Phase Exit 仍未完成。
 R0/R1 命令和 `--bootstrap-secret` 只属于历史记录，不得用于当前部署或验收。

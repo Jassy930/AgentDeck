@@ -1,11 +1,250 @@
-[
-  { "delayMs": 0, "event": { "type": "sessionStarted", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex" } },
-  { "delayMs": 100, "itemId": "i1", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "userMessage", "text": "把 IPC 重连改成指数退避", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 400, "itemId": "i2", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "reasoning", "text": "需要先确认现有重连在 ipc.rs 的位置，然后加退避与上限。", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 500, "itemId": "i3", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "shell", "command": "rg -n \"reconnect\" agentdeckd/src", "status": "completed", "exitCode": 0, "durationMs": 180, "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 400, "itemId": "i4", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "assistantMessage", "text": "找到重连入口，", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 300, "itemId": "i4", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "assistantMessage", "text": "找到重连入口，我把固定 1s 间隔改成 **指数退避**（上限 30s），", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 300, "itemId": "i4", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "assistantMessage", "text": "找到重连入口，我把固定 1s 间隔改成 **指数退避**（上限 30s），并补了抖动，避免雪崩重连。", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 500, "itemId": "i5", "event": { "type": "agentItem", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "item": { "kind": "diff", "files": [ { "path": "agentdeckd/src/ipc.rs", "status": "modified", "patch": "@@ -41,7 +41,12 @@\n-    sleep(Duration::from_secs(1));\n+    let backoff = base * 2u32.pow(attempt.min(5));\n+    sleep(jitter(backoff));" } ], "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 400, "event": { "type": "turnComplete", "sessionId": "sess-codex-01", "threadId": "t1", "agentKind": "codex", "summary": { "totalInputTokens": 1200, "totalOutputTokens": 460, "elapsedMs": 8400 } } }
-]
+{
+  "snapshot": {
+    "conversationId": "sess-codex-01",
+    "baseEventCursor": "beforeFirst",
+    "configurationState": {
+      "configurationRevision": 1,
+      "configuration": {
+        "vendorControl": {
+          "agentKind": "codex",
+          "configuration": {
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write",
+            "reasoningEffort": "high"
+          }
+        }
+      }
+    },
+    "items": [
+      {
+        "kind": "capabilities",
+        "commandId": null,
+        "itemId": null,
+        "entityId": null,
+        "capabilities": {
+          "agentKind": "codex",
+          "agentVersion": "fixture",
+          "features": [],
+          "vendor": {
+            "agentKind": "codex",
+            "sandboxModes": [],
+            "persistenceSupported": false,
+            "reasoningEffortLevels": []
+          }
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "delayMs": 0,
+      "event": {
+        "conversationId": "sess-codex-01",
+        "eventId": "event-codex-01-0",
+        "eventSeq": 0,
+        "commandId": "command-codex-01",
+        "itemId": null,
+        "entityId": null,
+        "body": {
+          "kind": "turnStarted",
+          "turn_id": "turn-codex-01"
+        }
+      }
+    },
+    {
+      "delayMs": 100,
+      "event": {
+        "conversationId": "sess-codex-01",
+        "eventId": "event-codex-01-1",
+        "eventSeq": 1,
+        "commandId": "command-codex-01",
+        "itemId": "i1",
+        "entityId": "entity-i1",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "userMessage",
+            "text": "把 IPC 重连改成指数退避",
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 400,
+      "event": {
+        "conversationId": "sess-codex-01",
+        "eventId": "event-codex-01-2",
+        "eventSeq": 2,
+        "commandId": "command-codex-01",
+        "itemId": "i2",
+        "entityId": "entity-i2",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "reasoning",
+            "text": "需要先确认现有重连在 ipc.rs 的位置，然后加退避与上限。",
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 500,
+      "event": {
+        "conversationId": "sess-codex-01",
+        "eventId": "event-codex-01-3",
+        "eventSeq": 3,
+        "commandId": "command-codex-01",
+        "itemId": "i3",
+        "entityId": "entity-i3",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "shell",
+            "command": "rg -n \"reconnect\" agentdeckd/src",
+            "status": "completed",
+            "exitCode": 0,
+            "durationMs": 180,
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 400,
+      "event": {
+        "conversationId": "sess-codex-01",
+        "eventId": "event-codex-01-4",
+        "eventSeq": 4,
+        "commandId": "command-codex-01",
+        "itemId": "i4",
+        "entityId": "entity-i4",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "assistantMessage",
+            "text": "找到重连入口，",
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 300,
+      "event": {
+        "conversationId": "sess-codex-01",
+        "eventId": "event-codex-01-5",
+        "eventSeq": 5,
+        "commandId": "command-codex-01",
+        "itemId": "i4",
+        "entityId": "entity-i4",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "assistantMessage",
+            "text": "找到重连入口，我把固定 1s 间隔改成 **指数退避**（上限 30s），",
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 300,
+      "event": {
+        "conversationId": "sess-codex-01",
+        "eventId": "event-codex-01-6",
+        "eventSeq": 6,
+        "commandId": "command-codex-01",
+        "itemId": "i4",
+        "entityId": "entity-i4",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "assistantMessage",
+            "text": "找到重连入口，我把固定 1s 间隔改成 **指数退避**（上限 30s），并补了抖动，避免雪崩重连。",
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 500,
+      "event": {
+        "conversationId": "sess-codex-01",
+        "eventId": "event-codex-01-7",
+        "eventSeq": 7,
+        "commandId": "command-codex-01",
+        "itemId": "i5",
+        "entityId": "entity-i5",
+        "body": {
+          "kind": "item",
+          "item": {
+            "kind": "diff",
+            "files": [
+              {
+                "path": "agentdeckd/src/ipc.rs",
+                "status": "modified",
+                "patch": "@@ -41,7 +41,12 @@\n-    sleep(Duration::from_secs(1));\n+    let backoff = base * 2u32.pow(attempt.min(5));\n+    sleep(jitter(backoff));"
+              }
+            ],
+            "meta": {
+              "vendorExtensions": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 400,
+      "event": {
+        "conversationId": "sess-codex-01",
+        "eventId": "event-codex-01-8",
+        "eventSeq": 8,
+        "commandId": null,
+        "itemId": null,
+        "entityId": null,
+        "body": {
+          "kind": "error",
+          "failure": {
+            "code": "daemon.runtime.recoverable_diagnostic",
+            "message": "transient adapter diagnostic",
+            "diagnosticRef": "diagnostic-codex-01"
+          }
+        }
+      }
+    },
+    {
+      "delayMs": 400,
+      "event": {
+        "conversationId": "sess-codex-01",
+        "eventId": "event-codex-01-9",
+        "eventSeq": 9,
+        "commandId": "command-codex-01",
+        "itemId": null,
+        "entityId": null,
+        "body": {
+          "kind": "turnCompleted",
+          "turn_id": "turn-codex-01",
+          "summary": {
+            "totalInputTokens": 1200,
+            "totalOutputTokens": 460,
+            "elapsedMs": 8400
+          }
+        }
+      }
+    }
+  ]
+}

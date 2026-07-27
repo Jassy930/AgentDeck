@@ -725,8 +725,13 @@ public struct RuntimeEventV2: RuntimeV2FlattenedPayload {
             valid = hasItemIdentity && (!isUserMessage || commandID != nil)
         case .turnStarted, .actionRequest, .approvalResolved, .turnCompleted, .turnInterrupted:
             valid = commandID != nil && hasNoItemIdentity
-        case .error:
-            valid = hasNoItemIdentity
+        case .error(let failure):
+            valid =
+                hasNoItemIdentity
+                && (commandID == nil
+                    || (failure.code == "daemon.runtime.execution_failed"
+                        && failure.message == "agent execution failed"
+                        && failure.diagnosticRef == nil))
         }
         guard valid else {
             throw RuntimeV2StreamMirrorError.invalidEventIdentity

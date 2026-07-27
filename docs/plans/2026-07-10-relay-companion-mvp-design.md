@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成；P4.4 MachineLink ingress/RuntimeCore dispatch 由 `cd7d9fb` 完成；P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成，收口时 Runtime wire 为 v4、physical schema 为 v14/35 表。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；P4.7 automatic E2E、静态 real-slot contract 与 phase docs 已完成，P4 automatic scope 7/7、P4 automatic Phase Exit complete。P5.1 shared `AgentDeckSessionSource` facade、P5.2 Keychain/crash-safe CryptoState 与 P5.3 WSS/SPKI pin/per-connection transfer primitive 已完成，P5/P6 当前为 3/9、0/4；P5.4–P5.9 与 P5 Phase Exit 仍未完成。`p4-auto` 已 PASS，`p4` 仍不受支持；fresh 顶层 Rust/Swift、Clippy/fmt/network/no-net/schema/docs/diff、local smoke/selfcheck/diagnostics 与 pre-closeout hash `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的双路 phase review 均通过。真实 iOS 链路、production native metadata、provisioned signed Keychain/LaunchAgent、真实 vendor、公网 WSS、第二台 Mac 与 destructive purge 继续 post-MVP gated/BLOCKED（2026-07-26） |
+| 状态 | Approved target；P3 automatic scope 已从 code baseline `9efb28d` 完成 6/6 Phase Exit。P4.1 machine identity/guard 已完成；P4.2 Runtime v3/schema v9、certificate/enrollment/control-only RemoteTransport/trust reset 由 `a6842bc` 完成；P4.3 Runtime v4/schema v10、PairInvite/DeviceGrant/auth ledger/revoke/control handoff 由 `518380e`、`b28f995`、`55be98f`、`ba3629f`、`4ec3d2f`、`fe3a9ad`、`3b4b977` 完成；P4.4 MachineLink ingress/RuntimeCore dispatch 由 `cd7d9fb` 完成；P4.5 signed publication/counter recovery 由 `c6ef387`、`88b3c42` 完成，收口时 Runtime wire 为 v4、physical schema 为 v14/35 表。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；P4.7 automatic E2E、静态 real-slot contract 与 phase docs 已完成，P4 automatic scope 7/7、P4 automatic Phase Exit complete。P5.1 shared `AgentDeckSessionSource` facade、P5.2 Keychain/crash-safe CryptoState、P5.3 WSS/SPKI pin/per-connection transfer primitive、P5.4 bounded production source 与 P5.5 canonical fixture/receipt UI automatic Task 已完成，P5/P6 当前为 5/9、0/4；P5.6–P5.9 与 P5 Phase Exit 仍未完成。`p4-auto` 已 PASS，`p4` 仍不受支持；fresh 顶层 Rust/Swift、Clippy/fmt/network/no-net/schema/docs/diff、local smoke/selfcheck/diagnostics 与 pre-closeout hash `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的双路 phase review 均通过。真实 iOS 链路、production native metadata、provisioned signed Keychain/LaunchAgent、真实 vendor、公网 WSS、第二台 Mac 与 destructive purge 继续 post-MVP gated/BLOCKED（2026-07-27） |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -1551,7 +1551,7 @@ P5.3 component tests 代替。
 
 UIKit ViewModel 保持 `@MainActor`，只消费 source 状态。
 
-macOS executable 侧增加 `LocalDaemonSessionSource`（current RuntimeEnvelope v3 over UDS）与
+macOS executable 侧增加 `LocalDaemonSessionSource`（current RuntimeEnvelope v5 over UDS）与
 `SessionSourceRegistry`。registry 把“本机”绑定到唯一 UDS source，把每台 paired remote machine 绑定到
 独立 RelaySessionSource；`WorkbenchModel`/AppKit controller 只按选中的 machine scope 消费统一
 `SessionSource`，不在 UI 层写 `if agentKind` 或直接处理 Relay crypto。iOS 发行版只注册 Relay source，
@@ -1574,8 +1574,11 @@ conversation stream 返回：
 - `connectionState`。
 
 瞬时断网不结束 observation stream；MachineConnection 自动 reconnect/resume。fatal revoked/incompatible/securityError 进入终止状态。
+Runtime v5 的 commandless Error 只是 conversation diagnostic，不结束 observation/active turn；带 commandID 的
+Error 只允许 fixed `daemon.runtime.execution_failed / agent execution failed / null` 并作为 Failed terminal。
+Relay/fixture inbox 只能从后一种 terminal Error 派生 failed item。
 
-broadcast 不能使用默认无界缓冲：catalog/machine/session resource state 使用 `.bufferingNewest(1)`，conversation event channel 固定最多 512 条。`yield` 返回 dropped 时 source 必须发出 typed `lagged` 状态并终止本 generation，随后重新走 snapshot/barrier；任何事件都不能静默丢弃。`inbox()` 不是 Relay 独立目录，而是由已验证的 Catalog/Conversation reducers 从 canonical pending approvals/errors 派生。
+broadcast 不能使用默认无界缓冲：catalog/machine/session resource state 使用 `.bufferingNewest(1)`，conversation event channel 固定最多 512 条。`yield` 返回 dropped 时 source 必须发出 typed `lagged` 状态并终止本 generation，随后重新走 snapshot/barrier；任何事件都不能静默丢弃。`inbox()` 不是 Relay 独立目录，而是由已验证的 Catalog/Conversation reducers 从 canonical pending approvals/terminal errors 派生。
 
 命令必须 `async throws` 并返回 daemon receipt；配对返回可观察的 progress stream：
 
@@ -1588,7 +1591,10 @@ broadcast 不能使用默认无界缓冲：catalog/machine/session resource stat
 ### 13.3 UI 行为
 
 - `SessionDetailViewModel` 每个 conversation 恰好一个 subscription task；sendPrompt 不再调用 `start()` 建第二个流。
-- prompt 先显示 sending；daemon Accepted 后显示 queued；canonical UserMessage event 以 commandId 替换临时行。
+- prompt 先显示 sending；daemon Accepted 后显示 queued；canonical UserMessage event 以 commandId 替换临时行；
+  canonical terminal 也必须 commandId 精确匹配，上一 command 的 terminal 不得消费下一 prompt receipt。
+- commandless Error 保持 streaming；command-bound Failed 收口当前 command，并允许下一 prompt 开始新 turn。
+  snapshot direct Failed 的 turnID 可为空，此时必须以全局唯一 commandID 和 terminal-only approval 证据归并。
 - approval 点击后进入 submitting；收到 Applied 才显示“已应用”；AlreadyHandled 显示“已在另一控制端裁决”、不可变决定及当前 delivery state，DeliveryFailed 提供“重试同一决定”而不允许改判。
 - 离线时保留输入草稿并明确失败，不把旧 prompt 静默排队到数分钟后自动发送。
 - 同一 idempotency key 只用于“不确定 daemon 是否已接受”的传输重试。

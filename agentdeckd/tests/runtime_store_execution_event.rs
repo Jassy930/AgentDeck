@@ -625,8 +625,13 @@ async fn append_after_commit_unknown_converges_with_the_same_event_id() {
         .expect("open fault-injected store");
     let (conversation_id, command_id, turn_id) = started_turn(&store, 0x41).await;
     let event_id = runtime_id(RuntimeIdKind::Event, 0x44);
-    let input =
-        AppendExecutionEvent::execution_failed(conversation_id, command_id, turn_id, event_id);
+    let input = item_input(
+        conversation_id,
+        command_id,
+        turn_id,
+        event_id,
+        "after-COMMIT replay item",
+    );
     assert!(matches!(
         store.append_execution_event(input.clone()).await,
         Err(RuntimeStoreError::CommitOutcomeUnknown {
@@ -642,16 +647,14 @@ async fn append_after_commit_unknown_converges_with_the_same_event_id() {
         AppendExecutionEventOutcome::Appended { .. } => panic!("committed append must replay"),
     };
     assert_eq!(event.event_id, event_id);
-    let decoded: RuntimeEvent = serde_json::from_slice(&event.payload).expect("decode error event");
-    let RuntimeEventBody::Error { failure } = decoded.body else {
-        panic!("expected sanitized Error");
+    let decoded: RuntimeEvent = serde_json::from_slice(&event.payload).expect("decode Item event");
+    let RuntimeEventBody::Item {
+        item: AgentItem::AssistantMessage { text, .. },
+    } = decoded.body
+    else {
+        panic!("expected canonical assistant Item");
     };
-    assert_eq!(
-        failure.code,
-        agentdeck_protocol::runtime::failure::DAEMON_RUNTIME_EXECUTION_FAILED
-    );
-    assert_eq!(failure.message, "agent execution failed");
-    assert_eq!(failure.diagnostic_ref, None);
+    assert_eq!(text, "after-COMMIT replay item");
     assert_eq!(event.event_seq, 2);
     let second_replay = match store
         .append_execution_event(input)
@@ -839,7 +842,7 @@ async fn append_before_commit_fault_rolls_back_and_first_retry_appends_once() {
 }
 
 #[tokio::test]
-async fn small_lane_accepts_small_error_and_rejects_only_the_actual_large_item() {
+async fn small_lane_accepts_small_item_and_rejects_only_the_actual_large_item() {
     let root = TestRoot::new("small-lane");
     let keys = MemoryKeyStore::new();
     let store = RuntimeStoreHandle::open(
@@ -851,14 +854,15 @@ async fn small_lane_accepts_small_error_and_rejects_only_the_actual_large_item()
     let (conversation_id, command_id, turn_id) = started_turn(&store, 0x51).await;
     assert!(matches!(
         store
-            .append_execution_event(AppendExecutionEvent::execution_failed(
+            .append_execution_event(item_input(
                 conversation_id,
                 command_id,
                 turn_id,
                 runtime_id(RuntimeIdKind::Event, 0x54),
+                "small canonical Item",
             ))
             .await
-            .expect("small Error must not require a 64 MiB lane"),
+            .expect("small Item must not require a 64 MiB lane"),
         AppendExecutionEventOutcome::Appended { .. }
     ));
 

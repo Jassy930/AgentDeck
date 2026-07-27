@@ -56,9 +56,6 @@ fn recorded_turn_uses_only_neutral_item_keys_and_typed_items() {
                     items.push(item);
                 }
                 CodexRuntimeOutput::TurnComplete(summary) => terminal = Some(summary),
-                CodexRuntimeOutput::Event(AdapterEvent::Error(error)) => {
-                    panic!("recorded fixture produced typed error: {}", error.code)
-                }
                 CodexRuntimeOutput::Approval { .. }
                 | CodexRuntimeOutput::Diagnostic { .. }
                 | CodexRuntimeOutput::Event(AdapterEvent::TurnComplete(_))
