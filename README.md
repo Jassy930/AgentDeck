@@ -212,7 +212,7 @@ module/build edge，避免生成重复 product wrapper。`CoreLinkTests` 会实�
 `FixtureSessionSource`（bundle 内 JSON 回放），旧 `MobileSessionSource`/models 要到 P5.5 才迁移。
 因此杀 app 仍会重置 fixture 状态，当前界面不依赖 daemon 或网络，也不构成真实 Relay 链路证据。
 
-## Relay Companion MVP 实施状态（P5.3 complete；P5 为 3/9）
+## Relay Companion MVP 实施状态（P5.4 automatic complete；P5 为 4/9）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -251,13 +251,47 @@ urgent incoming 4 frames/8 MiB 与 control writer 8 frames/1 MiB reserve；aggre
 outcome unknown 且不能由迟到 timer 误杀新 generation。
 compact transfer assembler 固定 64 active、128 MiB/connection、5 分钟与 256 个 no-evict tombstone，完整
 length/hash 和 per-part replay hash 通过前不返回 payload。process-global 512 MiB/8,192 tombstone owner 留给
-P5.4 connection coordinator，P5.3 不宣称全局门禁已完成。
+P5.4 connection coordinator，P5.3 自身不宣称全局门禁已完成。
 
-P5 当前计 3/9；RelaySessionSource、旧 iOS fixture 迁移、AppKit registry、Simulator
-自动 Relay E2E 与 P5 Phase Exit 仍未完成。当前 SwiftPM runner 的 Data Protection Keychain 因缺 entitlement
+P5.4 已实现并收口 process-shared `TransferAssemblyBudgetCoordinator`、authenticated
+`MachineConnection`/verified ingress、bounded broadcaster/reducers、scoped `RelaySessionSource`、typed
+Runtime command 与 pairing handler。入站必须依次完成 outer/trust/revision、MachineDataSign、durable replay、
+AEAD 与 Runtime decode，source 只接收带 permit 的 verified delivery，并在 durable commit 后才更新 reducer/
+broadcast。live key rotation 只接收 exact-next signed update set，并由逐 stream epoch barrier 激活；两 slot
+rotation 可部分恢复，30 秒绝对 deadline、request/proof reservation、512 control-route cap、generation teardown
+与 reconnect recovery 均 fail-close。resource observation 使用 newest-one；conversation 每 observer 为 512，
+overflow 只轮换内部 generation，外层 observation 经 fresh snapshot/barrier 后继续。最后一个 conversation
+observer 退出时，source 必须先取得 Runtime `Unsubscribe` receipt，再发送 exact Relay outer unsubscribe 并退休
+correlation binding；single-flight retirement 完成前，同 conversation 不得重建且继续占用全局/单机容量。
+`MachineConnection.shutdown()` 固定先 cancel supervisor、关闭 update channel 解除满队列 producer，再 teardown
+generation 并 join，保证已入队前缀可读且不会因第 513 个 send 挂起而死锁。pair response 后只写 durable
+`staged` marker；正式 machine 列表、load 与 connection material 只接受在 matching `PairRouteClosed` 后 CAS 为
+`committed` 的 marker。`relay.route.not_found` 即使与 receipt frame 精确关联，也只能表示路由当前不可用，不能
+证明 daemon 已 durable 接收 receipt；此时必须保留 responsePrepared + staged promotion 并继续 reconciliation。
+完整 response promotion 可跨 invite expiry 隐藏保留，避免远端已进入 Delivered 时删除本地 credential；尚未发
+response 的 requestPrepared 仍按绝对 expiry 清理。committed promotion carrier 与裸 `promote` 写入口保持
+module-internal；marker 缺失的 partial rollback 在任何删除前都必须把 CounterGuard 与 exact snapshot、
+promotion ID、state/bootstrap commitment 重新绑定并审计。
+
+原计划 Step 2 的历史 RED 在本次接管时没有保留，文档不会补写不存在的失败记录；最终验收使用 test
+discovery 与冻结树 fresh coverage。69-path Swift candidate 为
+`42f47dc2eecfcd0ca312b9178583246aad48b9f59d6413fc9814052cb7e1cd1c`：focused `225/225`、
+RelayClient `429 executed / 4 entitlement SKIP`、完整 Swift `958 XCTest / 4 SKIP + 35 Swift Testing`、
+iOS Simulator `26/26`。同一未变 Rust candidate
+`4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f` 的完整 `cargo test --locked`
+与 Rust/cross-language/static gates 全绿；提交范围由 34 Rust/fixture + 69 Swift + 6 docs 的 exact
+109-path manifest 机械约束。两笔提交是 `34 → 75` 的有序依赖栈：第一笔只承诺 Rust scoped-green，第二笔
+必须以第一笔为父；完整绿色证据只属于组合候选。P5 当前为 4/9，下一项仍是 P5.5。已执行一次非门控
+Instruments Allocations smoke：
+`dist/AgentDeck.app --selfcheck` exit 0、约 2.64 秒，trace 仅位于
+`/tmp/agentdeck-p54-instruments.rt5Mo5/p54-agentdeck-selfcheck.trace`，不提交仓库。
+
+P5.5–P5.9、旧 iOS fixture 迁移、AppKit registry、Simulator 自动 Relay E2E 与 P5 Phase Exit 仍未完成。
+当前 SwiftPM runner 的 Data Protection Keychain 因缺 entitlement
 返回 `-34018`，真实 SecItem 用例明确 SKIP；iOS Simulator 也固定回报
 `CompleteUntilFirstUserAuthentication`，不能代替物理 iPhone 锁屏 readback。这两项继续留在 post-MVP
-production-signed/物理设备槽位，不得写成 PASS。
+production-signed/物理设备槽位。真实公网 WSS、第二台 Mac 与真实 Codex/Claude Code vendor 同样继续
+`BLOCKED`，不得写成 PASS。
 P3.10 已由 code/test commit `19622ab` 完成 Task 收口：当时把 Runtime schema 推进到 v7，并新增 authenticated machine-wide
 `admin_commands` ledger，并实现 30 天 retention、容量准入、exact replay/conflict 与 COMMIT-unknown
 收敛；`StageUpgrade` 只有在 exact reply 完整 flush ACK 后才 arm，随后经 active→idle fence、候选
@@ -873,8 +907,9 @@ Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/tes
 普通 GUI、Rust CLI 与 Swift `--selfcheck` 已默认走 OS-account shared-daemon UDS。P3.10 LaunchAgent
 安装/升级/保留数据卸载已由 `19622ab` 完成 Task 门禁与双路终审；基于 `9efb28d` 的独立 P3 Phase
 Exit 已完成；P4.1–P4.7 automatic Task 与 P4 automatic Phase Exit 已收口，P5.1 shared facade、P5.2
-crash-safe client storage 与 P5.3 WSS/pin/transfer primitive 也已完成；P4–P6 按 Task 进度计为
-7/7、3/9、0/4。`p4-auto` 已 PASS，`p4`
+crash-safe client storage、P5.3 WSS/pin/transfer primitive 与 P5.4 MachineConnection/bounded source
+automatic Task 已完成。P4–P6 按 Task 进度计为
+7/7、4/9、0/4。`p4-auto` 已 PASS，`p4`
 仍不受支持；完整 P4 Phase Exit 还由 pre-closeout candidate
 SHA-256 `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的顶层门禁和
 `spec/security`、`quality` 双路 Approved review 共同支撑，P0/P1/P2=0。P3.1 provisioned signed

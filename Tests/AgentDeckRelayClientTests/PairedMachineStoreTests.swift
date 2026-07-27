@@ -1,9 +1,12 @@
-import AgentDeckRelayClient
+import AgentDeckCore
+import CryptoKit
 import Foundation
 import XCTest
 
+@testable import AgentDeckRelayClient
+
 final class PairedMachineStoreTests: XCTestCase {
-  func testPreparedPromotionIsSendableRedactedAndClosedTyped() throws {
+  func testPreparedPromotionIsSendableRedactedAndModuleInternal() throws {
     requireSendable(StoredPairedMachineRecordV1.self)
     requireSendable(PreparedPairedMachinePromotionV1.self)
     requireSendable(PairedMachineStoreError.self)
@@ -40,7 +43,16 @@ final class PairedMachineStoreTests: XCTestCase {
       encoding: .utf8
     )
     XCTAssertFalse(source.contains("public func persist("))
-    XCTAssertTrue(source.contains("public func promote("))
+    XCTAssertFalse(source.contains("public func promote("))
+    XCTAssertFalse(source.contains("public struct PreparedPairedMachinePromotionV1"))
+    let carrierStart = try XCTUnwrap(
+      source.range(of: "struct PreparedPairedMachinePromotionV1")
+    )
+    let carrierEnd = try XCTUnwrap(
+      source.range(of: "/// cold-open", range: carrierStart.upperBound..<source.endIndex)
+    )
+    let carrierSource = source[carrierStart.lowerBound..<carrierEnd.lowerBound]
+    XCTAssertFalse(carrierSource.contains("public "))
   }
 
   func testRecordRejectsZeroTrustRoutesServerAndPins() throws {
@@ -94,6 +106,17 @@ final class PairedMachineStoreTests: XCTestCase {
         deviceSignPrivateKey: valid.deviceSignPrivateKey,
         deviceHPKEPrivateKey: valid.deviceHPKEPrivateKey,
         deviceGrant: valid.deviceGrant,
+        deviceStorageKEK: valid.deviceStorageKEK,
+        initialCryptoState: valid.initialCryptoState
+      )
+    }
+    assertStoreError(.invalidPromotion) {
+      try PreparedPairedMachinePromotionV1(
+        record: valid.record,
+        promotionID32: valid.promotionID32,
+        deviceSignPrivateKey: valid.deviceSignPrivateKey,
+        deviceHPKEPrivateKey: valid.deviceHPKEPrivateKey,
+        deviceGrant: corruptLastByte(valid.deviceGrant),
         deviceStorageKEK: valid.deviceStorageKEK,
         initialCryptoState: valid.initialCryptoState
       )
@@ -207,7 +230,7 @@ final class PairedMachineStoreTests: XCTestCase {
       ciphertextHash: firstHash,
       observedAtMS: 100
     )
-    XCTAssertEqual(firstDisposition, .fresh)
+    XCTAssertEqual(firstDisposition.disposition, .fresh)
     do {
       _ = try await coordinator.admitReplay(
         scope: scope,
@@ -326,6 +349,14 @@ final class PairedMachineStoreTests: XCTestCase {
     let malformedEnvironment = try TestEnvironment()
     defer { malformedEnvironment.removeSandbox() }
     let prepared = try makePrepared()
+
+    var legacyRecord = try PairedMachineRecordCodec.encode(prepared.record)
+    XCTAssertEqual(legacyRecord.prefix(4), Data("ADPR".utf8))
+    legacyRecord[5] = 1
+    XCTAssertThrowsError(try PairedMachineRecordCodec.decode(legacyRecord)) { error in
+      XCTAssertEqual(error as? PairedMachineStoreError, .invalidRecord)
+    }
+
     let malformedStore = malformedEnvironment.store(for: prepared.record)
     await malformedEnvironment.keyStore.force(
       Data("not-a-marker".utf8),
@@ -337,6 +368,28 @@ final class PairedMachineStoreTests: XCTestCase {
     } catch {
       XCTAssertEqual(error as? PairedMachineStoreError, .invalidRecord)
     }
+
+    let legacyEnvironment = try TestEnvironment()
+    defer { legacyEnvironment.removeSandbox() }
+    let legacyStore = legacyEnvironment.store(for: prepared.record)
+    _ = try await legacyStore.promote(prepared)
+    let legacyMarkerKey = try pairedKey(prepared.record, purpose: .commitMarker)
+    let legacyMarkerValue = await legacyEnvironment.keyStore.value(for: legacyMarkerKey)
+    var legacyMarker = try XCTUnwrap(legacyMarkerValue)
+    XCTAssertEqual(legacyMarker.prefix(4), Data("ADPM".utf8))
+    legacyMarker[5] = 1
+    await legacyEnvironment.keyStore.force(legacyMarker, for: legacyMarkerKey)
+    await legacyEnvironment.keyStore.resetMutationLog()
+    do {
+      _ = try await legacyStore.list()
+      XCTFail("legacy v1 marker 必须零迁移 fail-close")
+    } catch {
+      XCTAssertEqual(error as? PairedMachineStoreError, .invalidRecord)
+    }
+    let legacyMutationCount = await legacyEnvironment.keyStore.mutationCount
+    let legacyValueCount = await legacyEnvironment.keyStore.valueCount
+    XCTAssertEqual(legacyMutationCount, 0)
+    XCTAssertEqual(legacyValueCount, 6)
 
     let tamperedEnvironment = try TestEnvironment()
     defer { tamperedEnvironment.removeSandbox() }
@@ -578,7 +631,8 @@ final class PairedMachineStoreTests: XCTestCase {
       keyStore: environment.keyStore,
       stateRootURL: environment.rootURL,
       clientKind: .macOSApp,
-      installationID: UUID()
+      installationID: UUID(),
+      testingFileProtectionPolicy: .completeUntilFirstUserAuthentication
     )
 
     do {
@@ -589,6 +643,88 @@ final class PairedMachineStoreTests: XCTestCase {
     }
     let valueCount = await environment.keyStore.valueCount
     XCTAssertEqual(valueCount, 0)
+  }
+
+  func testColdOpenReturnsOnlyFullyAuditedRedactedConnectionCapability() async throws {
+    requireSendable(PairedMachineConnectionMaterial.self)
+    let environment = try TestEnvironment()
+    defer { environment.removeSandbox() }
+    let prepared = try makePrepared()
+    let store = environment.store(for: prepared.record)
+    _ = try await store.promote(prepared)
+
+    let opened = try await store.openConnectionMaterial(
+      rootFingerprint: prepared.record.machineRootFingerprint,
+      machineRoute: prepared.record.machineRoute
+    )
+    let material = try XCTUnwrap(opened)
+    XCTAssertEqual(material.record, prepared.record)
+    XCTAssertEqual(material.relayGrant.grant.machineRoute, prepared.record.machineRoute)
+    XCTAssertEqual(
+      material.machineDataCertificate.certificate,
+      prepared.record.machineDataCertificate
+    )
+
+    let reflected = String(reflecting: material)
+    XCTAssertTrue(reflected.contains("<redacted>"))
+    for secret in [
+      prepared.deviceSignPrivateKey,
+      prepared.deviceHPKEPrivateKey,
+      prepared.deviceGrant,
+      prepared.deviceStorageKEK.rawRepresentation,
+    ] {
+      XCTAssertFalse(reflected.contains(secret.base64EncodedString()))
+      XCTAssertFalse(reflected.contains(secret.map { String(format: "%02x", $0) }.joined()))
+    }
+
+    let deviceSignKey = try pairedKey(
+      prepared.record,
+      purpose: .deviceSignPrivateKey
+    )
+    await environment.keyStore.force(
+      corruptLastByte(prepared.deviceSignPrivateKey),
+      for: deviceSignKey
+    )
+    do {
+      _ = try await store.openConnectionMaterial(
+        rootFingerprint: prepared.record.machineRootFingerprint,
+        machineRoute: prepared.record.machineRoute
+      )
+      XCTFail("cold-open must re-audit every bound dependency")
+    } catch {
+      XCTAssertEqual(error as? PairedMachineStoreError, .persistenceMismatch)
+    }
+  }
+
+  func testColdOpenCapabilityAddsNoPublicRawSecretGetter() throws {
+    let repositoryRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let source = try String(
+      contentsOf: repositoryRoot.appendingPathComponent(
+        "Sources/AgentDeckRelayClient/Storage/PairedMachineStore.swift"
+      ),
+      encoding: .utf8
+    )
+
+    // promotion carrier 与 cold-open capability 都不得公开 private-key 字段，
+    // 更不得公开对称 key 或通用 secret getter。
+    XCTAssertEqual(source.occurrences(of: "public let deviceSignPrivateKey"), 0)
+    XCTAssertEqual(source.occurrences(of: "public let deviceHPKEPrivateKey"), 0)
+    for forbidden in [
+      "public var deviceSignPrivateKey",
+      "public var deviceHPKEPrivateKey",
+      "public let rawCommandKey",
+      "public var rawCommandKey",
+      "public let rawReceivingKey",
+      "public var rawReceivingKey",
+      "public func loadSecret",
+      "public func getSecret",
+      "public func rawRepresentation",
+    ] {
+      XCTAssertFalse(source.contains(forbidden), "forbidden raw getter: \(forbidden)")
+    }
   }
 
   private func requireSendable<Value: Sendable>(_: Value.Type) {}
@@ -614,7 +750,8 @@ private struct TestEnvironment {
       keyStore: keyStore,
       stateRootURL: rootURL,
       clientKind: record.clientKind,
-      installationID: record.installationID
+      installationID: record.installationID,
+      testingFileProtectionPolicy: .completeUntilFirstUserAuthentication
     )
   }
 
@@ -701,6 +838,13 @@ private actor MemoryPairedKeyStore: PairedMarkerListingKeyStore {
       $0.account.hasPrefix(prefix)
         && $0.account.hasSuffix("/\(PairedKeyStorePurpose.commitMarker.rawValue)")
     }.sorted { $0.account < $1.account }
+  }
+
+  func pendingPairingRecoveryKeys(
+    clientKind: RelayClientKind,
+    installationID: UUID
+  ) async throws -> [KeyStoreKey] {
+    []
   }
 
   func failAfterMutation(_ ordinal: Int) {
@@ -821,12 +965,41 @@ private func makePrepared(index: UInt8 = 1) throws -> PreparedPairedMachinePromo
     replayStates: [replay],
     streamStates: [cursor]
   )
+  let deviceSignPrivateKey = Data(repeating: 0xA0 &+ index, count: 32)
+  let deviceSigningKey = try Curve25519.Signing.PrivateKey(
+    rawRepresentation: deviceSignPrivateKey
+  )
+  let unsignedGrant = RelayV2Grant(
+    machineRoute: record.machineRoute,
+    deviceRoute: record.deviceRoute,
+    deviceSignPubkey: deviceSigningKey.publicKey.rawRepresentation,
+    grantSerial: record.grantSerial,
+    rootKeyId: record.machineDataCertificate.rootKeyId,
+    trustEpoch: record.trustEpoch,
+    signature: Data(repeating: 1, count: 64)
+  )
+  let grant = RelayV2Grant(
+    machineRoute: unsignedGrant.machineRoute,
+    deviceRoute: unsignedGrant.deviceRoute,
+    deviceSignPubkey: unsignedGrant.deviceSignPubkey,
+    grantSerial: unsignedGrant.grantSerial,
+    rootKeyId: unsignedGrant.rootKeyId,
+    trustEpoch: unsignedGrant.trustEpoch,
+    signature: try RelayCrypto.sign(
+      RelayGrantCredentialVerifier.toBeSigned(
+        unsignedGrant,
+        relayServerID: record.relayServerID,
+        machineRootFingerprint: record.machineRootFingerprint
+      ),
+      key: pairedMachineRootSigningKey(index: index)
+    )
+  )
   return try PreparedPairedMachinePromotionV1(
     record: record,
     promotionID32: Data(repeating: 0xE0 &+ index, count: 32),
-    deviceSignPrivateKey: Data(repeating: 0xA0 &+ index, count: 32),
+    deviceSignPrivateKey: deviceSignPrivateKey,
     deviceHPKEPrivateKey: Data(repeating: 0xB0 &+ index, count: 32),
-    deviceGrant: Data("device-grant-\(index)".utf8),
+    deviceGrant: try RelayGrantCanonicalCodec.encode(grant),
     deviceStorageKEK: DeviceStorageKEK(
       rawRepresentation: Data(repeating: 0xC0 &+ index, count: 32)
     ),
@@ -840,7 +1013,9 @@ private func makeRecord(
   machineName: String? = nil,
   relayURL: URL? = nil,
   relayServerID: Data? = nil,
+  machineRootPublicKey: Data? = nil,
   machineRootFingerprint: Data? = nil,
+  machineDataCertificate: RelayV2SignedCertificate? = nil,
   machineRoute: Data? = nil,
   deviceRoute: Data? = nil,
   currentSPKIPin: Data? = nil,
@@ -848,24 +1023,140 @@ private func makeRecord(
   grantSerial: UInt64? = nil,
   trustEpoch: UInt64? = nil
 ) throws -> StoredPairedMachineRecordV1 {
-  try StoredPairedMachineRecordV1(
+  let resolvedRelayServerID = relayServerID ?? Data(repeating: 0x10 &+ index, count: 16)
+  let resolvedMachineRoute = machineRoute ?? Data(repeating: 0x30 &+ index, count: 16)
+  let resolvedTrustEpoch = trustEpoch ?? UInt64(3 + index)
+  let rootSigningKey = try pairedMachineRootSigningKey(index: index)
+  let resolvedRootPublicKey =
+    machineRootPublicKey ?? rootSigningKey.publicKey.rawRepresentation
+  let resolvedRootFingerprint =
+    machineRootFingerprint ?? CanonicalCodec.sha256(resolvedRootPublicKey)
+  let resolvedDataCertificate: RelayV2SignedCertificate
+  if let machineDataCertificate {
+    resolvedDataCertificate = machineDataCertificate
+  } else {
+    resolvedDataCertificate = try pairedMachineDataCertificate(
+      index: index,
+      rootSigningKey: rootSigningKey,
+      rootFingerprint: CanonicalCodec.sha256(rootSigningKey.publicKey.rawRepresentation),
+      relayServerID: resolvedRelayServerID,
+      machineRoute: resolvedMachineRoute,
+      trustEpoch: resolvedTrustEpoch
+    )
+  }
+  return try StoredPairedMachineRecordV1(
     clientKind: .macOSApp,
     installationID: installationID
       ?? UUID(uuidString: "20000000-0000-0000-0000-000000000001")!,
     machineID: "machine-\(index)",
     machineName: machineName ?? "Machine \(index)",
     relayURL: relayURL ?? URL(string: "wss://relay.example.com:8443/")!,
-    relayServerID: relayServerID ?? Data(repeating: 0x10 &+ index, count: 16),
-    machineRootFingerprint: machineRootFingerprint
-      ?? Data(repeating: 0x20 &+ index, count: 32),
-    machineRoute: machineRoute ?? Data(repeating: 0x30 &+ index, count: 16),
+    relayServerID: resolvedRelayServerID,
+    machineRootPublicKey: resolvedRootPublicKey,
+    machineRootFingerprint: resolvedRootFingerprint,
+    machineDataCertificate: resolvedDataCertificate,
+    machineRoute: resolvedMachineRoute,
     deviceRoute: deviceRoute ?? Data(repeating: 0x40 &+ index, count: 16),
     currentSPKIPin: currentSPKIPin ?? Data(repeating: 0x50 &+ index, count: 32),
     nextSPKIPin: nextSPKIPin ?? Data(repeating: 0x60 &+ index, count: 32),
     grantSerial: grantSerial ?? UInt64(7 + index),
-    trustEpoch: trustEpoch ?? UInt64(3 + index),
+    trustEpoch: resolvedTrustEpoch,
     createdAtMS: 1_750_000_000_000 + UInt64(index)
   )
+}
+
+private func pairedMachineRootSigningKey(
+  index: UInt8
+) throws -> Curve25519.Signing.PrivateKey {
+  try Curve25519.Signing.PrivateKey(
+    rawRepresentation: Data(repeating: 0x70 &+ index, count: 32)
+  )
+}
+
+private func pairedMachineDataCertificate(
+  index: UInt8,
+  rootSigningKey: Curve25519.Signing.PrivateKey,
+  rootFingerprint: Data,
+  relayServerID: Data,
+  machineRoute: Data,
+  trustEpoch: UInt64
+) throws -> RelayV2SignedCertificate {
+  let dataSigningKey = try Curve25519.Signing.PrivateKey(
+    rawRepresentation: Data(repeating: 0x78 &+ index, count: 32)
+  )
+  let rootKeyID = Data(repeating: 0x68 &+ index, count: 16)
+  let unsigned = RelayV2SignedCertificate(
+    subjectPubkey: dataSigningKey.publicKey.rawRepresentation,
+    certRole: .data,
+    generation: UInt64(2 + index),
+    rootKeyId: rootKeyID,
+    trustEpoch: trustEpoch,
+    notAfterMs: 4_000_000_000_000,
+    signature: Data(repeating: 1, count: 64)
+  )
+  let tbs = ToBeSignedV1(
+    objectType: .dataCert,
+    signatureFormatVersion: 1,
+    relayProtocolVersion: relayProtocolVersionV2,
+    runtimeProtocolVersion: runtimeProtocolVersionCurrent,
+    e2eeFormatVersion: 1,
+    relayServerID: relayServerID,
+    machineRoute: machineRoute,
+    deviceRoute: nil,
+    streamRoute: nil,
+    requestRoute: nil,
+    streamGeneration: nil,
+    streamCursor: nil,
+    roleScope: "machine-data",
+    signingKeyFingerprint: rootFingerprint,
+    rootKeyID: rootKeyID,
+    trustEpoch: trustEpoch,
+    serialOrGeneration: unsigned.generation,
+    notAfterMS: unsigned.notAfterMs,
+    signedObjectSHA256: CanonicalCodec.sha256(
+      pairedCertificateUnsignedCanonicalBytes(unsigned)
+    )
+  )
+  return RelayV2SignedCertificate(
+    subjectPubkey: unsigned.subjectPubkey,
+    certRole: unsigned.certRole,
+    generation: unsigned.generation,
+    rootKeyId: unsigned.rootKeyId,
+    trustEpoch: unsigned.trustEpoch,
+    notAfterMs: unsigned.notAfterMs,
+    signature: try RelayCrypto.sign(tbs, key: rootSigningKey)
+  )
+}
+
+private func pairedCertificateUnsignedCanonicalBytes(
+  _ certificate: RelayV2SignedCertificate
+) -> Data {
+  var output = Data("AgentDeck/SignedCertificateUnsignedV1\0".utf8)
+  appendPairedBytes(certificate.subjectPubkey, to: &output)
+  output.append(certificate.certRole == .link ? 0 : 1)
+  appendPairedInteger(certificate.generation, to: &output)
+  appendPairedBytes(certificate.rootKeyId, to: &output)
+  appendPairedInteger(certificate.trustEpoch, to: &output)
+  if let notAfterMS = certificate.notAfterMs {
+    output.append(1)
+    appendPairedInteger(notAfterMS, to: &output)
+  } else {
+    output.append(0)
+  }
+  return output
+}
+
+private func appendPairedBytes(_ value: Data, to output: inout Data) {
+  appendPairedInteger(UInt32(value.count), to: &output)
+  output.append(value)
+}
+
+private func appendPairedInteger<Value: FixedWidthInteger>(
+  _ value: Value,
+  to output: inout Data
+) {
+  var encoded = value.bigEndian
+  Swift.withUnsafeBytes(of: &encoded) { output.append(contentsOf: $0) }
 }
 
 private func corruptLastByte(_ input: Data) -> Data {
@@ -892,7 +1183,9 @@ private func makeStateStore(
   try FileCryptoStateStore(
     rootURL: environment.rootURL,
     identity: makeIdentity(prepared.record),
-    storageKey: prepared.deviceStorageKEK
+    storageKey: prepared.deviceStorageKEK,
+    testHooks: .none,
+    testingFileProtectionPolicy: .completeUntilFirstUserAuthentication
   )
 }
 
@@ -920,5 +1213,18 @@ private func assertStoreError<Result>(
     XCTFail("expected \(expected)", file: file, line: line)
   } catch {
     XCTAssertEqual(error as? PairedMachineStoreError, expected, file: file, line: line)
+  }
+}
+
+extension String {
+  fileprivate func occurrences(of needle: String) -> Int {
+    guard !needle.isEmpty else { return 0 }
+    var count = 0
+    var remainder = self[...]
+    while let range = remainder.range(of: needle) {
+      count += 1
+      remainder = remainder[range.upperBound...]
+    }
+    return count
   }
 }

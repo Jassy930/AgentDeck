@@ -61,6 +61,10 @@ public enum OuterFrameKind: String, Codable, Sendable {
     case pairRequest
     case pairResponse
     case keyUpdate
+    case pairPending
+    case pairResponseReceived
+    case deviceKeyRecovery
+    case pairTerminal
 
     var canonicalTag: UInt8 {
         switch self {
@@ -71,6 +75,10 @@ public enum OuterFrameKind: String, Codable, Sendable {
         case .pairRequest: 4
         case .pairResponse: 5
         case .keyUpdate: 6
+        case .pairPending: 7
+        case .pairResponseReceived: 8
+        case .deviceKeyRecovery: 9
+        case .pairTerminal: 10
         }
     }
 }
@@ -232,6 +240,7 @@ public struct OuterContextV1: Equatable, Sendable {
     public var streamCursor: StreamCursor?
     public var streamSeq: UInt64?
     public var messageKeyEpoch: UInt64
+    public var pairRoute: Data?
 
     public init(
         frameKind: OuterFrameKind,
@@ -244,7 +253,8 @@ public struct OuterContextV1: Equatable, Sendable {
         streamGeneration: Data?,
         streamCursor: StreamCursor?,
         streamSeq: UInt64?,
-        messageKeyEpoch: UInt64
+        messageKeyEpoch: UInt64,
+        pairRoute: Data? = nil
     ) {
         self.frameKind = frameKind
         self.relayProtocolVersion = relayProtocolVersion
@@ -257,6 +267,34 @@ public struct OuterContextV1: Equatable, Sendable {
         self.streamCursor = streamCursor
         self.streamSeq = streamSeq
         self.messageKeyEpoch = messageKeyEpoch
+        self.pairRoute = pairRoute
+    }
+
+    func validateShape() throws {
+        let isPairing: Bool
+        switch frameKind {
+        case .pairRequest, .pairResponse, .pairPending, .pairResponseReceived, .pairTerminal:
+            isPairing = true
+        case .catalogPublish, .conversationPublish, .directedReply, .uplinkSend,
+            .keyUpdate, .deviceKeyRecovery:
+            isPairing = false
+        }
+        if isPairing {
+            guard pairRoute.map({ $0.count == 16 && $0.contains(where: { $0 != 0 }) }) == true,
+                machineRoute == nil,
+                deviceRoute == nil,
+                streamRoute == nil,
+                requestRoute == nil,
+                streamGeneration == nil,
+                streamCursor == nil,
+                streamSeq == nil,
+                messageKeyEpoch == 0
+            else {
+                throw RelayCryptoError.invalidKey(field: "outerContext.pairingShape")
+            }
+        } else if pairRoute != nil {
+            throw RelayCryptoError.invalidKey(field: "outerContext.pairRoute")
+        }
     }
 }
 
@@ -338,6 +376,7 @@ public enum CanonicalCodec {
     }
 
     public static func encodeAAD(_ context: OuterContextV1) throws -> Data {
+        try context.validateShape()
         var encoder = Encoder()
         encoder.domain("AgentDeck/OuterContextV1\0")
         encoder.u8(context.frameKind.canonicalTag)
@@ -351,6 +390,10 @@ public enum CanonicalCodec {
         encoder.optionalCursor(context.streamCursor)
         encoder.optionalU64(context.streamSeq)
         encoder.u64(context.messageKeyEpoch)
+        if let pairRoute = context.pairRoute {
+            encoder.domain("AgentDeck/OuterContextPairRouteV1\0")
+            try encoder.bytes(pairRoute, field: "pairRoute", exactLength: 16)
+        }
         return encoder.finish()
     }
 

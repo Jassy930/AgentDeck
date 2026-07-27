@@ -16,6 +16,7 @@ final class CryptoStateStoreTests: XCTestCase {
     requireSendable(FileCryptoStateStore.self)
 
     XCTAssertEqual(CryptoStateSnapshot.maximumDataBytes, 128 * 1024 * 1024)
+    XCTAssertEqual(FileCryptoStateStore.fileProtectionPolicy, .complete)
     XCTAssertEqual(RelayClientKind.macOSApp.rawValue, "macos-app")
     XCTAssertEqual(RelayClientKind.iOSApp.rawValue, "ios-app")
     XCTAssertEqual(RelayClientKind.cli.rawValue, "cli")
@@ -254,10 +255,10 @@ final class CryptoStateStoreTests: XCTestCase {
     XCTAssertEqual(resourceValues.isExcludedFromBackup, true)
     #if os(macOS)
       if let protection = resourceValues.fileProtection {
-        XCTAssertEqual(protection, .complete)
+        XCTAssertEqual(protection, .completeUntilFirstUserAuthentication)
       }
     #else
-      XCTAssertEqual(resourceValues.fileProtection, .complete)
+      XCTAssertEqual(resourceValues.fileProtection, .completeUntilFirstUserAuthentication)
     #endif
 
     do {
@@ -666,7 +667,8 @@ final class CryptoStateStoreTests: XCTestCase {
       rootURL: rootURL,
       identity: fixture.identity(),
       storageKey: DeviceStorageKEK(rawRepresentation: keyBytes),
-      testHooks: testHooks
+      testHooks: testHooks,
+      testingFileProtectionPolicy: .completeUntilFirstUserAuthentication
     )
   }
 

@@ -73,6 +73,47 @@ public struct AeadSendingKey: Sendable, CustomDebugStringConvertible {
         symmetricKey = SymmetricKey(data: rawKey)
     }
 
+    /// 在不暴露或复制 raw bytes 的前提下，为同一 key identity 绑定新的 revision/payload
+    /// capability。nonce prefix 与 SymmetricKey 保持逐字相同。
+    func rebinding(
+        keyDirectoryRevision: UInt64,
+        payloadKind: SealedPayloadKind
+    ) throws -> Self {
+        guard keyDirectoryRevision > 0 else {
+            throw RelayCryptoError.invalidKey(field: "keyDirectoryRevision")
+        }
+        return try Self(
+            keyID: keyID,
+            epoch: epoch,
+            keyDirectoryRevision: keyDirectoryRevision,
+            noncePrefix: noncePrefix,
+            payloadKind: payloadKind,
+            symmetricKey: symmetricKey
+        )
+    }
+
+    private init(
+        keyID: KeyIDV1,
+        epoch: UInt64,
+        keyDirectoryRevision: UInt64,
+        noncePrefix: Data,
+        payloadKind: SealedPayloadKind,
+        symmetricKey: SymmetricKey
+    ) throws {
+        guard keyID.epoch == epoch,
+            keyDirectoryRevision > 0,
+            noncePrefix.count == 4
+        else {
+            throw RelayCryptoError.invalidKey(field: "aead capability rebind")
+        }
+        self.keyID = keyID
+        self.epoch = epoch
+        self.keyDirectoryRevision = keyDirectoryRevision
+        self.noncePrefix = noncePrefix
+        self.payloadKind = payloadKind
+        self.symmetricKey = symmetricKey
+    }
+
     public var debugDescription: String {
         "AeadSendingKey(<redacted>)"
     }
@@ -295,7 +336,7 @@ public enum RelayCrypto {
 
     static func encodeSealedPayload(_ value: RelaySealedPayloadV1) throws -> Data {
         guard value.formatVersion == 1,
-              let payloadLength = UInt32(exactly: value.payload.count)
+            let payloadLength = UInt32(exactly: value.payload.count)
         else {
             throw RelayCryptoError.sealFailure
         }
@@ -309,19 +350,20 @@ public enum RelayCrypto {
 
     static func decodeSealedPayload(_ data: Data) throws -> RelaySealedPayloadV1 {
         guard data.count >= 12,
-              data.prefix(5) == Data("ADSP1".utf8)
+            data.prefix(5) == Data("ADSP1".utf8)
         else {
             throw RelayCryptoError.badCiphertext
         }
         let bytes = [UInt8](data.prefix(12))
         let version = (UInt16(bytes[5]) << 8) | UInt16(bytes[6])
-        let payloadLength = (UInt32(bytes[8]) << 24)
+        let payloadLength =
+            (UInt32(bytes[8]) << 24)
             | (UInt32(bytes[9]) << 16)
             | (UInt32(bytes[10]) << 8)
             | UInt32(bytes[11])
         guard version == 1,
-              let kind = SealedPayloadKind(canonicalTag: bytes[7]),
-              Int(payloadLength) == data.count - 12
+            let kind = SealedPayloadKind(canonicalTag: bytes[7]),
+            Int(payloadLength) == data.count - 12
         else {
             throw RelayCryptoError.badCiphertext
         }

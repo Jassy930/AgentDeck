@@ -26,6 +26,77 @@ final class DeviceCryptoStateTests: XCTestCase {
       decoded.streamStates.map(\.innerCursor), original.streamStates.map(\.innerCursor))
   }
 
+  func testKeySyncEpisodeRoundTripsAndKeepsOneAbsoluteAttemptBudget() throws {
+    let initial = try makeState(securityState: .active)
+    let targetRevision = initial.keyDirectory.revision + 1
+    let startedAtMS: UInt64 = 1_000_000
+    let begun = try initial.startingOrResumingKeySyncEpisode(
+      targetRevision: targetRevision,
+      observedKeyID: KeyIDV1(purpose: .catalog, epoch: 2),
+      streamRoute: nil,
+      observedAtMS: startedAtMS
+    )
+    let first = try XCTUnwrap(begun.keySyncEpisode)
+    XCTAssertEqual(first.attempt, 1)
+    XCTAssertEqual(first.startedAtMS, startedAtMS)
+    XCTAssertEqual(
+      first.expiresAtMS,
+      startedAtMS + DeviceKeySyncEpisodeV1.deadlineMilliseconds
+    )
+    XCTAssertEqual(
+      try DeviceCryptoStateCodec.decode(DeviceCryptoStateCodec.encode(begun)),
+      begun
+    )
+
+    let exactResume = try begun.startingOrResumingKeySyncEpisode(
+      targetRevision: targetRevision,
+      observedKeyID: KeyIDV1(purpose: .catalog, epoch: 99),
+      streamRoute: nil,
+      observedAtMS: startedAtMS + 1
+    )
+    XCTAssertEqual(exactResume, begun, "同 revision probe 不能刷新 durable episode")
+
+    let second = try begun.recordingKeySyncAttemptFailure(
+      targetRevision: targetRevision,
+      attempt: 1,
+      observedAtMS: startedAtMS + 2
+    )
+    XCTAssertEqual(second.keySyncEpisode?.attempt, 2)
+    XCTAssertEqual(second.keySyncEpisode?.expiresAtMS, first.expiresAtMS)
+    let third = try second.recordingKeySyncAttemptFailure(
+      targetRevision: targetRevision,
+      attempt: 2,
+      observedAtMS: startedAtMS + 3
+    )
+    let exhausted = try third.recordingKeySyncAttemptFailure(
+      targetRevision: targetRevision,
+      attempt: 3,
+      observedAtMS: startedAtMS + 4
+    )
+    XCTAssertEqual(exhausted.keySyncEpisode?.attempt, 3)
+    XCTAssertEqual(exhausted.keySyncEpisode?.exhausted, true)
+    XCTAssertThrowsError(
+      try exhausted.startingOrResumingKeySyncEpisode(
+        targetRevision: targetRevision,
+        observedKeyID: KeyIDV1(purpose: .catalog, epoch: 2),
+        streamRoute: nil,
+        observedAtMS: startedAtMS + 5
+      )
+    ) { error in
+      XCTAssertEqual(error as? DeviceCryptoStateError, .keySyncEpisodeEnded)
+    }
+    XCTAssertThrowsError(
+      try begun.startingOrResumingKeySyncEpisode(
+        targetRevision: targetRevision,
+        observedKeyID: KeyIDV1(purpose: .catalog, epoch: 2),
+        streamRoute: nil,
+        observedAtMS: startedAtMS - 1
+      )
+    ) { error in
+      XCTAssertEqual(error as? DeviceCryptoStateError, .invalidClock)
+    }
+  }
+
   func testCanonicalEncoderEnforcesBudgetBeforeReturningOversizedBytes() throws {
     let state = try makeState()
     let encoded = try DeviceCryptoStateCodec.encode(state)
@@ -61,6 +132,9 @@ final class DeviceCryptoStateTests: XCTestCase {
         "securityState",
         "replayStates",
         "streamStates",
+        "keyLifecycle",
+        "pendingStreamBindings",
+        "keySyncEpisode",
       ])
     XCTAssertFalse(propertyNames.contains("data"))
     XCTAssertFalse(propertyNames.contains("snapshot"))
@@ -427,7 +501,16 @@ final class DeviceCryptoStateTests: XCTestCase {
       replayStates: maximumReplays,
       streamStates: []
     )
-    XCTAssertEqual(maximumReplayState.replayStates.count, DeviceCryptoStateV1.maximumReplayStates)
+    // 单份 directory 仍最多有 1,026 个 receive keys；state 的 4,096 总上限还要
+    // 容纳 current keys 与 25 小时 retention 内的 retired replay tombstones。
+    XCTAssertEqual(
+      maximumReplayState.replayStates.count,
+      DeviceKeyDirectoryV1.maximumEntries - 1
+    )
+    XCTAssertLessThan(
+      maximumReplayState.replayStates.count,
+      DeviceCryptoStateV1.maximumReplayStates
+    )
     assertStateError(.invalidState) {
       try makeState(
         securityState: .active,
@@ -443,7 +526,10 @@ final class DeviceCryptoStateTests: XCTestCase {
         streamRoute: identifier16(UInt64(index)),
         generation: identifier16(UInt64(index) + 10_000),
         outerCursor: index.isMultiple(of: 2) ? .beforeFirst : .at(UInt64(index)),
-        innerCursor: .catalog(.at(UInt64(index)))
+        innerCursor: .conversation(
+          id: "maximum-stream-\(index)",
+          cursor: .at(UInt64(index))
+        )
       )
     }
     let maximumStreamState = try makeState(
@@ -597,9 +683,11 @@ final class DeviceCryptoStateTests: XCTestCase {
         innerCursor: .conversation(id: "conversation-at", cursor: .at(55))
       ),
     ]
-    let state = try makeState(streamStates: cursorStates)
-    let decoded = try DeviceCryptoStateCodec.decode(DeviceCryptoStateCodec.encode(state))
-    XCTAssertEqual(decoded.streamStates, cursorStates)
+    for cursorState in cursorStates {
+      let state = try makeState(streamStates: [cursorState])
+      let decoded = try DeviceCryptoStateCodec.decode(DeviceCryptoStateCodec.encode(state))
+      XCTAssertEqual(decoded.streamStates, [cursorState])
+    }
 
     assertStateError(.invalidCursor) {
       try makeStreamState(innerCursor: .conversation(id: "", cursor: .beforeFirst))
@@ -762,6 +850,30 @@ final class DeviceCryptoStateTests: XCTestCase {
           "完整 canonical commitment 必须绑定 \(axis)[\(index)]"
         )
       }
+    }
+  }
+
+  func testPublishedTransferCommitsOnlyExactContiguousOuterRange() throws {
+    let state = try makeState(securityState: .active)
+    let committed = try state.advancingPublishedTransferProgress(
+      streamRoute: Fixture.streamRouteA,
+      streamGeneration: Fixture.generationA,
+      firstStreamSequence: 0,
+      lastStreamSequence: 2,
+      innerCursor: .catalog(.at(18))
+    )
+    XCTAssertEqual(committed.stateRevision, state.stateRevision + 1)
+    XCTAssertEqual(committed.streamStates[0].outerCursor, .at(2))
+    XCTAssertEqual(committed.streamStates[0].innerCursor, .catalog(.at(18)))
+
+    assertStateError(.invalidCursor) {
+      try state.advancingPublishedTransferProgress(
+        streamRoute: Fixture.streamRouteA,
+        streamGeneration: Fixture.generationA,
+        firstStreamSequence: 1,
+        lastStreamSequence: 2,
+        innerCursor: .catalog(.at(18))
+      )
     }
   }
 }

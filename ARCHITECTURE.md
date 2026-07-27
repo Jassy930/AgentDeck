@@ -62,8 +62,9 @@ agentdeckd
 - `Sources/AgentDeckRelayClient/`：共享 Relay wire/crypto/client 层，显式依赖 `AgentDeckCore` 与
   `AgentDeckSessionSource`。P5.2 已实现 Apple Keychain、typed sealed CryptoState、counter/replay 与 paired
   marker；P5.3 已实现 generation-scoped WSS、TLS pin、bounded transport 与 per-connection transfer
-  assembler。production `RelaySessionSource`、`MachineConnection` 与 process-global transfer coordinator
-  继续由 P5.4 实现。
+  assembler；P5.4 automatic Task 已接上 production `MachineConnection`/verified ingress、process-global
+  transfer coordinator、bounded broadcaster/reducers、scoped `RelaySessionSource`、typed command 与 pairing
+  handler。旧 iOS fixture 迁移与 AppKit registry 仍分别属于 P5.5/P5.8。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/local/`：当前为本地 Runtime v5 framing；它在 P4.2 Runtime v3 machine administration 与
@@ -835,6 +836,57 @@ conversation/key，不能伪造身份连续性。
   淘汰 TTL 内 dedup。metadata/hash/length/duplicate/stale scope 任一错误都先释放 offending partial。设计要求的
   512 MiB process-global reassembly 与 8,192 global tombstone owner 由 P5.4 shared connection coordinator
   安装；P5.3 的单 assembler 结果不能冒充全局门禁、RelaySessionSource 或端到端完成。
+
+### Relay Companion MVP P5.4 MachineConnection / RelaySessionSource 不变量
+
+- `TransferAssemblyBudgetCoordinator.shared` 是进程内全部 production `MachineConnection` 的唯一预算
+  owner；part cache 与 final assembly 都必须在分配前预留，累计 reassembly hard cap 为 512 MiB；completed
+  tombstone 在写入前预留，hard cap 为 8,192。reservation 绑定 connection + generation scope，并在
+  complete、hash/length/validation failure、TTL、disconnect/reset、owner teardown 与 noncopyable owner
+  destruction 时 exact release；禁止瞬时超配、事后计数或驱逐 TTL 内 tombstone。
+- `MachineConnection` 每次 transport generation 都重新完成 challenge、root-bound Relay grant 与 DeviceSign
+  authentication，只有 verified resume 后才交付 Runtime。入站顺序固定为 outer canonical/bounds → trust/
+  grant serial/revision → MachineDataSign → durable replay admission → AEAD → Runtime decode；source 只能消费
+  `VerifiedRuntimeDelivery`，并在 durable commit permit 成功后才推进 correlation、reducer 与 broadcaster。
+  出站只接受 `DeviceRequestSigner` 产生的 outer-bound signed sealed blob。
+- live key rotation 只允许 exact-next `KeyUpdateSetV1` durable stage，再由 exact stream
+  `DeviceEpochBarrierV1` 激活；catalog/conversation 两 slot 可分步激活，未到 barrier 的 slot 继续 staged。
+  affected stream 单独 pause/recover，key-sync 使用 30 秒绝对 deadline；durable barrier proof 先发 semantic
+  `StreamAppliedAck`，再发 Relay outer ACK。reconnect、物理 rebind 与 exact duplicate 只恢复同一 proof/
+  predecessor alias，alias 不能打开普通 rollback 数据。
+- business request route 在任一 `await` 前取得 provisional owner；control ACK 也先 reserve 唯一 pending route，
+  sign/register 后原子迁移为 live route。pending/live/historical route 共用 generation namespace，control route
+  hard cap 为 512。`cancelPrepared` 若 correlation 已有 prepared mutation 或 tombstone 无法安全退休，必须结束
+  exact generation，不能吞错后留下可提交的 subscription、复活旧 binding 或让迟到 RouteAccepted 消费新 owner。
+- `MachineConnection.shutdown()` 的顺序固定为 cancel supervisor → finish update channel → teardown active
+  generation → join。finish 必须先解除满 512 队列上的 pending producer，再等待 supervisor；消费者仍可读完
+  已入队前缀，第 513 条不得越过关闭边界。该顺序同时保证 generation teardown 与 shared transfer budget
+  只结算一次。
+- resource broadcaster 对每个观察者只保留 newest-one；conversation 队列固定 512，observer admission 先于
+  retain，单 broadcaster 最多 64 observers。overflow 原子清旧队列、轮换内部 generation并先发布
+  `.lagged(.bufferDropped)`；用户持有的外层 observation 不结束，只能在 fresh snapshot + `SyncComplete`
+  barrier 后恢复 live。cold process 不保存 transcript，必须从 daemon snapshot/barrier 启动，不能从持久化非零
+  cursor 拼接历史。
+- `RelaySessionSource` 按 `RelaySourceScope` 为 paired machine 建立唯一 connection owner；machine/all-machine
+  scope、late observer、shutdown/join、catalog/conversation/inbox reducer 与 typed command/pairing path 都保持
+  actor 隔离。最后一个 conversation observer 退出时必须先完成 Runtime unsubscribe receipt、Relay outer
+  unsubscribe 与 correlation retirement；该 single-flight retirement 返回前，同 conversation replacement 必须
+  拒绝且 retirement 继续计入全局/per-machine observer cap，避免 unsubscribe ABA。P5.4 automatic complete 不证明
+  旧 iOS fixture 已迁移、AppKit registry、Simulator Relay E2E、真实公网
+  WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 或 P5 Phase Exit。
+- paired record/marker 的内部 `ADPR`/`ADPM` codec 在 P5.4 增加 MachineRoot public key 与 Data certificate 后
+  固定为 version 2；version 1 缺少重新验证 production connection 所需的信任材料，不能从 fingerprint 或 grant
+  安全重建，因此只允许 fail-closed，不做猜测式迁移。该 hard cutover 仅覆盖尚未发布真实配对入口的 pre-MVP
+  developer artifact；production migration contract 必须在 P5.6 首次真实 pairing 发布前重新冻结。
+- paired marker phase 保持 committed=0、cleanup=1，并新增 staged=2。PairResponse 后只允许原子写完整 staged
+  credential；`list`、`load` 与 `openConnectionMaterial` 在 matching `PairRouteClosed` 前都必须隐藏，随后才以
+  exact CAS 提升 committed。`relay.route.not_found` 即使精确关联 receipt frame，也可能只是 daemon 离线，不能
+  充当 durable delivery/terminal proof；该结果必须保留 responsePrepared + staged marker。完整 promotion 可跨
+  本机 invite expiry 隐藏并继续 reconciliation，因为 daemon 的 Delivered grant 不参加 TTL sweep；无 exact
+  Close 证明不得开放 connection，也不得删除可能仍对应 active grant 的 credential。committed promotion carrier
+  与裸 `promote` 写入口保持 module-internal；marker 缺失的 partial rollback 在删除前必须用 exact snapshot、
+  promotion ID 与 guard commitment 重建 bootstrap permit 并审计 CounterGuard。requestPrepared 与合法 partial
+  promotion 仍分别按绝对 expiry 清理和精确回滚。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 

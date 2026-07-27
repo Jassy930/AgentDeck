@@ -14,11 +14,13 @@
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、Relay v2、P4.2–P4.3 machine/pairing lifecycle、
   P4.4 RemoteLink ingress、P4.5 signed publication/counter recovery、P4.6 persistent CLI/watch 与 durable
   transfer recovery、P5.2 client storage、P5.3 WSS/TLS pin/per-connection transfer、conversation-scoped
-  recovery、daemon install/upgrade failure code、v1 marker 显式 reset 和排查流程。
+  recovery，以及 P5.4 MachineConnection/key-sync/bounded source typed failure、daemon install/upgrade failure
+  code、v1 marker 显式 reset 和排查流程。
 - `QUALITY.md`：按变更范围选择验证命令，以及 Companion MVP P2、P3.1–P3.10、P3 Phase、P4.1–P4.7
   machine identity/enrollment/pairing/RemoteLink ingress/signed publication/persistent CLI/watch、production
   UDS/client/install/smoke、P4 automatic Phase Exit/静态 real-slot sentinel、P5.1 shared SessionSource facade、
-  P5.2 Keychain/crash-safe CryptoState、P5.3 WSS/SPKI pin/transfer assembler 与文档结构检查入口。
+  P5.2 Keychain/crash-safe CryptoState、P5.3 WSS/SPKI pin/transfer assembler、P5.4 exact Swift manifest/
+  MachineConnection/RelaySessionSource 与文档结构检查入口。
 - `RELAY_RUNBOOK.md`：production Relay v2 Direct TLS、本机 admin UDS、machine
   enrollment、daemon 本机 status/trust-reset、安全 uninstall purge、fingerprint-bound readback、
   portable signed root-lost purge receipt、P4.5 recovery-gated egress admission，以及 P4.6 persistent
@@ -97,7 +99,10 @@
   `AgentDeckSessionSource` facade、typed state/receipt 与显式 SwiftPM/iOS product 依赖图；P5.2 已建立
   typed Apple Keychain account、ADCS v1 sealed state、counter/state Pending recovery、4096 replay window 与
   marker-last paired store；P5.3 已建立 generation-scoped WSS、current/next DER-SPKI pin、bounded
-  incoming/writer 与 per-connection transfer assembler。P4–P6 按 Task 进度为 7/7、3/9、0/4。`p4-auto`
+  incoming/writer 与 per-connection transfer assembler；P5.4 automatic Task 已建立 shared
+  transfer budget、authenticated MachineConnection/key-sync ingress、bounded broadcaster/reducers、scoped
+  RelaySessionSource 与 typed command/pairing path，并补齐 unsubscribe single-flight retirement、满 update queue
+  shutdown 解锁以及 staged→committed pairing visibility gate。P4–P6 按 Task 进度上限为 7/7、4/9、0/4。`p4-auto`
   已 PASS；`p4` 仍不受支持，
   且 focused aggregate 本身不包含顶层
   Rust/Swift、最终 diff/status、冻结 hash 或双路 review。上述独立门禁与双路 review 已在
@@ -108,9 +113,16 @@
   `missingInputs` 与 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。Linux 只用 ephemeral test
   keys，macOS production persistent Keychain 不降级；root-lost 流程以 `RELAY_RUNBOOK.md` 为准。P3.1 方案 b、production-signed
   LaunchAgent/Keychain、物理设备与公网证据继续作为 post-MVP BLOCKED。P5 MVP 只以 iOS Simulator
-  自动 E2E 退出，本机第二客户端归 P6 synthetic DoD；P5.4–P5.9 与 P5 Phase Exit 仍未完成，P5.1–P5.3/P4
-  automatic complete 都不表示 process-global transfer budget、RelaySessionSource、真实 iOS Companion、
-  production-signed Keychain、第二台 Mac 或 destructive purge 已完成。
+  自动 E2E 退出，本机第二客户端归 P6 synthetic DoD；P5.4 已在 Swift
+  `42f47dc2eecfcd0ca312b9178583246aad48b9f59d6413fc9814052cb7e1cd1c` 与 Rust
+  `4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f` 候选上通过 `225/225` focused、
+  RelayClient `429/4 SKIP`、完整 Swift `958/4 SKIP + 35`、iOS `26/26` 与完整 Rust/cross-language/static
+  门禁；exact scope 为 34 Rust/fixture + 69 Swift + 6 docs = 109 paths。两笔提交按 `34 → 75` 有序依赖，
+  第一笔只承诺 Rust scoped-green，完整绿色证据属于组合候选。P5 为 4/9。P5.5–P5.9 与 P5
+  Phase Exit 仍未完成。
+  P5.1–P5.4/P4 automatic 完成项都不表示旧 iOS fixture 已迁移、
+  真实 iOS Companion、真实公网 WSS、production-signed Keychain、第二台 Mac、真实 vendor 或 destructive
+  purge 已完成。
 
 ## 协议资料
 

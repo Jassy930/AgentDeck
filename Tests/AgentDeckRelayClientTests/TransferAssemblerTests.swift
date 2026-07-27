@@ -55,6 +55,7 @@ final class TransferAssemblerTests: XCTestCase {
       try assembler.accept(carrier, scope: stale, nowMS: 0)
     }
     XCTAssertThrowsError(try assembler.sweepExpired(scope: stale, nowMS: 1))
+    XCTAssertThrowsError(try assembler.nextAbsoluteExpiryMS(scope: stale))
     XCTAssertThrowsError(try assembler.reset(scope: stale))
     guard
       case .complete(let completed) = try assembler.accept(
@@ -477,6 +478,155 @@ final class TransferAssemblerTests: XCTestCase {
     XCTAssertEqual(assembler.bufferedBytes, 0)
   }
 
+  func testNextAbsoluteExpiryUsesEarliestActiveOrCompletedDeadline() throws {
+    let scope = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 71)
+    )
+    let coordinator = TransferAssemblyBudgetCoordinator()
+    var assembler = TransferAssembler(
+      scope: scope,
+      budgetCoordinator: coordinator,
+      ttlMilliseconds: 10
+    )
+    let activePayload = Data("ab".utf8)
+    let active = try makeCarrier(
+      transferID: "deadline-active",
+      index: 0,
+      count: 2,
+      totalHash: digest(activePayload),
+      totalBytes: 2,
+      part: Data("a".utf8)
+    )
+    let completedPayload = Data("z".utf8)
+    let completed = try makeCarrier(
+      transferID: "deadline-completed",
+      index: 0,
+      count: 1,
+      totalHash: digest(completedPayload),
+      totalBytes: 1,
+      part: completedPayload
+    )
+
+    _ = try assembler.accept(active, scope: scope, nowMS: 100)
+    _ = try assembler.accept(completed, scope: scope, nowMS: 103)
+    XCTAssertEqual(try assembler.nextAbsoluteExpiryMS(scope: scope), 110)
+
+    _ = try assembler.accept(active, scope: scope, nowMS: 109)
+    XCTAssertEqual(
+      try assembler.nextAbsoluteExpiryMS(scope: scope),
+      110,
+      "duplicate part must not renew the absolute deadline"
+    )
+    XCTAssertEqual(
+      try assembler.sweepExpired(scope: scope, nowMS: 110).map(\.rawValue),
+      ["deadline-active"]
+    )
+    XCTAssertEqual(try assembler.nextAbsoluteExpiryMS(scope: scope), 113)
+
+    try assembler.discardCompleted(
+      transferID: completed.transfer.transferID,
+      scope: scope
+    )
+    XCTAssertNil(try assembler.nextAbsoluteExpiryMS(scope: scope))
+    XCTAssertEqual(
+      coordinator.usage,
+      TransferAssemblyBudgetUsage(
+        reassemblyBytes: 0,
+        completedTombstones: 0,
+        reservationCount: 0
+      )
+    )
+  }
+
+  func testAbsoluteExpirySaturatesWithoutWrapping() throws {
+    let scope = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 72)
+    )
+    let coordinator = TransferAssemblyBudgetCoordinator()
+    var assembler = TransferAssembler(
+      scope: scope,
+      budgetCoordinator: coordinator,
+      ttlMilliseconds: 10
+    )
+    let payload = Data("ab".utf8)
+    _ = try assembler.accept(
+      makeCarrier(
+        transferID: "deadline-overflow",
+        index: 0,
+        count: 2,
+        totalHash: digest(payload),
+        totalBytes: 2,
+        part: Data("a".utf8)
+      ),
+      scope: scope,
+      nowMS: UInt64.max - 5
+    )
+
+    XCTAssertEqual(try assembler.nextAbsoluteExpiryMS(scope: scope), UInt64.max)
+    XCTAssertTrue(
+      try assembler.sweepExpired(scope: scope, nowMS: UInt64.max - 1).isEmpty
+    )
+    XCTAssertEqual(
+      try assembler.sweepExpired(scope: scope, nowMS: UInt64.max).map(\.rawValue),
+      ["deadline-overflow"]
+    )
+    XCTAssertNil(try assembler.nextAbsoluteExpiryMS(scope: scope))
+    XCTAssertEqual(coordinator.usage.reassemblyBytes, 0)
+    XCTAssertEqual(coordinator.usage.reservationCount, 0)
+  }
+
+  func testSweepReleasesExpiredCompletedTombstoneBehindClockRollback() throws {
+    let scope = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 73)
+    )
+    let coordinator = TransferAssemblyBudgetCoordinator()
+    var assembler = TransferAssembler(
+      scope: scope,
+      budgetCoordinator: coordinator,
+      ttlMilliseconds: 10
+    )
+    let firstPayload = Data("first".utf8)
+    let first = try makeCarrier(
+      transferID: "rollback-first",
+      index: 0,
+      count: 1,
+      totalHash: digest(firstPayload),
+      totalBytes: UInt64(firstPayload.count),
+      part: firstPayload
+    )
+    let rolledBackPayload = Data("second".utf8)
+    let rolledBack = try makeCarrier(
+      transferID: "rollback-second",
+      index: 0,
+      count: 1,
+      totalHash: digest(rolledBackPayload),
+      totalBytes: UInt64(rolledBackPayload.count),
+      part: rolledBackPayload
+    )
+
+    _ = try assembler.accept(first, scope: scope, nowMS: 200)
+    _ = try assembler.accept(rolledBack, scope: scope, nowMS: 100)
+    XCTAssertEqual(coordinator.usage.completedTombstones, 2)
+
+    XCTAssertTrue(try assembler.sweepExpired(scope: scope, nowMS: 110).isEmpty)
+    XCTAssertEqual(coordinator.usage.completedTombstones, 1)
+    XCTAssertEqual(coordinator.usage.reservationCount, 1)
+    XCTAssertEqual(try assembler.nextAbsoluteExpiryMS(scope: scope), 210)
+
+    try assembler.discardCompleted(transferID: first.transfer.transferID, scope: scope)
+    XCTAssertEqual(
+      coordinator.usage,
+      TransferAssemblyBudgetUsage(
+        reassemblyBytes: 0,
+        completedTombstones: 0,
+        reservationCount: 0
+      )
+    )
+  }
+
   func testZeroBytePartsStillConsumeTheSixtyFourActiveTransferSlots() throws {
     var assembler = TransferAssembler()
     for index in 0..<TransferAssembler.maximumActiveTransfers {
@@ -615,6 +765,33 @@ final class TransferAssemblerTests: XCTestCase {
       return XCTFail("reset must remove the completed tombstone")
     }
   }
+
+  func testDiscardedCompletedTransferCanReassembleWithoutResettingOtherOwners() throws {
+    let scope = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 91)
+    )
+    let payload = Data("retry-after-source-discard".utf8)
+    let carrier = try makeCarrier(
+      transferID: "discarded-complete",
+      index: 0,
+      count: 1,
+      totalHash: digest(payload),
+      totalBytes: UInt64(payload.count),
+      part: payload
+    )
+    var assembler = TransferAssembler(scope: scope)
+    guard case .complete = try assembler.accept(carrier, scope: scope, nowMS: 1) else {
+      return XCTFail("first assembly must complete")
+    }
+    try assembler.discardCompleted(
+      transferID: carrier.transfer.transferID,
+      scope: scope
+    )
+    guard case .complete = try assembler.accept(carrier, scope: scope, nowMS: 2) else {
+      return XCTFail("discard must permit exact reassembly")
+    }
+  }
 }
 
 private func makeCarrier(
@@ -696,4 +873,4 @@ private enum FixtureError: Error {
   case invalidHex
 }
 
-private func requireSendable<T: Sendable>(_: T.Type) {}
+private func requireSendable<T: ~Copyable & Sendable>(_: T.Type) {}

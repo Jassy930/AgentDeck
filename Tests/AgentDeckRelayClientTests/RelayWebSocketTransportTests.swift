@@ -395,6 +395,34 @@ final class RelayWebSocketTransportTests: XCTestCase {
     }
   }
 
+  func testUnsupportedWireVersionRemainsTypedForSupervisorIncompatibleState() async throws {
+    let connection = FakeRelayWebSocketConnection()
+    let transport = try makeTransport(
+      factory: FakeRelayWebSocketConnectionFactory(connections: [connection])
+    )
+    let generation = try await transport.connect()
+    let stream = await transport.incomingFrames(on: generation)
+    var iterator = stream.makeAsyncIterator()
+    var unsupported = try RelayWireCodecV2.encodeFixture(
+      RelayV2Frame(
+        version: relayProtocolVersionV2,
+        body: .pong(nonce: 1)
+      )
+    )
+    unsupported[5] = 0
+    unsupported[6] = 3
+
+    await connection.push(.data(unsupported))
+    do {
+      _ = try await iterator.next()
+      XCTFail("unsupported version must terminate the generation")
+    } catch let error as RelayTransportError {
+      XCTAssertEqual(error, .unsupportedVersion(3))
+    }
+    let closeCode = await connection.closeEvents.last?.code
+    XCTAssertEqual(closeCode, .protocolError)
+  }
+
   func testExactFourMiBFrameIsAcceptedAndPlusOneClosesWith1009() async throws {
     let exactConnection = FakeRelayWebSocketConnection()
     let exactTransport = try makeTransport(

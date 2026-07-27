@@ -12,6 +12,7 @@ final class AppleKeychainStoreTests: XCTestCase {
     let machineRoute = try randomNonzeroData(count: 16)
 
     let pendingPurposes: [PendingKeyStorePurpose] = [
+      .recoveryIntent,
       .pairingRecord,
       .deviceSignPrivateKey,
       .deviceHPKEPrivateKey,
@@ -346,6 +347,37 @@ final class AppleKeychainStoreTests: XCTestCase {
       installationID: installationID
     )
     XCTAssertEqual(markers.map(\.account), [first.account, second.account].sorted())
+
+    let inviteHash = try randomNonzeroData(count: 32)
+    let recoveryIntent = try KeyStoreKey.pending(
+      clientKind: .macOSApp,
+      installationID: installationID,
+      inviteHash: inviteHash,
+      purpose: .recoveryIntent
+    )
+    let pendingRecord = try KeyStoreKey.pending(
+      clientKind: .macOSApp,
+      installationID: installationID,
+      inviteHash: inviteHash,
+      purpose: .pairingRecord
+    )
+    let pendingPrivateKey = try KeyStoreKey.pending(
+      clientKind: .macOSApp,
+      installationID: installationID,
+      inviteHash: inviteHash,
+      purpose: .deviceSignPrivateKey
+    )
+    for (index, key) in [recoveryIntent, pendingRecord, pendingPrivateKey].enumerated() {
+      _ = try await store.persistImmutable(Data("pending-\(index)".utf8), for: key)
+    }
+    let pendingMarkers = try await store.pendingPairingRecoveryKeys(
+      clientKind: .macOSApp,
+      installationID: installationID
+    )
+    XCTAssertEqual(
+      pendingMarkers.map(\.account),
+      [recoveryIntent.account, pendingRecord.account].sorted()
+    )
 
     let weakMarker = try KeyStoreKey.paired(
       clientKind: .macOSApp,

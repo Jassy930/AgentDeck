@@ -6,6 +6,9 @@ enum CryptoStatePersistenceStage: Equatable, Sendable {
   case stateGuardPendingDurable
   case stateDurable
   case guardStableDurable
+  case keyTransitionGuardPendingDurable
+  case keyTransitionStateDurable
+  case keyTransitionGuardStableDurable
   case securityQuarantineDurable
 }
 
@@ -39,10 +42,127 @@ struct CounterBootstrapEvidence: Equatable, Sendable {
   let initialGuardCommitment: Data
 }
 
+/// 只有 exact KeyUpdateSet 已经 sealed-state durable 且 CounterGuard stable readback 后才能 mint。
+struct DurableKeyUpdateAckPermit: Sendable, CustomDebugStringConvertible {
+  let trustScope: DeviceCryptoTrustScopeV1
+  let keyDirectoryRevision: UInt64
+  let updateSetSHA256: Data
+
+  fileprivate init(
+    trustScope: DeviceCryptoTrustScopeV1,
+    keyDirectoryRevision: UInt64,
+    updateSetSHA256: Data
+  ) throws {
+    guard keyDirectoryRevision > 0,
+      updateSetSHA256.count == 32,
+      updateSetSHA256.contains(where: { $0 != 0 })
+    else {
+      throw DeviceKeyLifecycleError.invalidState
+    }
+    self.trustScope = trustScope
+    self.keyDirectoryRevision = keyDirectoryRevision
+    self.updateSetSHA256 = updateSetSHA256
+  }
+
+  var debugDescription: String {
+    "DurableKeyUpdateAckPermit(revision: \(keyDirectoryRevision), proof: <redacted>)"
+  }
+}
+
+/// 只有 exact barrier activation 与 cursor/replay/key CAS durable 后才能 mint。
+struct DurableStreamAppliedAckPermit: Sendable, CustomDebugStringConvertible {
+  let trustScope: DeviceCryptoTrustScopeV1
+  let streamRoute: Data
+  let streamGeneration: Data
+  let appliedStreamSequence: UInt64
+  let innerCursor: DeviceInnerCursorV1
+  let keyDirectoryRevision: UInt64
+  let keyEpoch: UInt64
+  let epochBarrierSHA256: Data
+
+  fileprivate init(
+    trustScope: DeviceCryptoTrustScopeV1,
+    barrier: DeviceEpochBarrierV1
+  ) throws {
+    guard barrier.canonicalSHA256.count == 32,
+      barrier.canonicalSHA256.contains(where: { $0 != 0 })
+    else {
+      throw DeviceKeyLifecycleError.invalidBarrier
+    }
+    self.trustScope = trustScope
+    streamRoute = barrier.streamRoute
+    streamGeneration = barrier.streamGeneration
+    appliedStreamSequence = barrier.appliedStreamSequence
+    innerCursor = barrier.innerCursor
+    keyDirectoryRevision = barrier.keyDirectoryRevision
+    keyEpoch = barrier.newEpoch
+    epochBarrierSHA256 = barrier.canonicalSHA256
+  }
+
+  var debugDescription: String {
+    "DurableStreamAppliedAckPermit(revision: \(keyDirectoryRevision), proof: <redacted>)"
+  }
+}
+
+struct DurableKeyUpdateInstallResult: Sendable {
+  let snapshot: CryptoStateSnapshot
+  let acknowledgementPermit: DurableKeyUpdateAckPermit
+}
+
+struct DurableStreamActivationResult: Sendable {
+  let snapshot: CryptoStateSnapshot
+  let acknowledgementPermit: DurableStreamAppliedAckPermit
+}
+
+struct DurableKeyLifecycleAcknowledgementRecovery: Sendable {
+  let streamAppliedPermits: [DurableStreamAppliedAckPermit]
+  let directoryAdvanceProof: DeviceDirectoryRevisionAdvanceV1?
+}
+
+struct DurableStreamBindingInstallResult: Sendable {
+  let snapshot: CryptoStateSnapshot
+  let binding: DeviceDurableStreamBindingV1
+  let retiredBinding: DeviceDurableStreamBindingV1?
+  let disposition: DeviceStreamBindingInstallDisposition
+}
+
+/// replay tuple 经过 CounterGuard recovery 与 durable admission 后的 authenticated
+/// continuation token。fresh 返回 committed successor；duplicate/stale 返回同一轮
+/// guard-recovered stable snapshot，ingress 不需要也不得绕过 coordinator 直读 state file。
+struct DurableReplayAdmissionProofV1: Equatable, Sendable {
+  let scope: DeviceCryptoKeyScopeV1
+  let counter: UInt64
+  let ciphertextHash: Data
+  let replayStatus: DeviceReplayStatusV1
+}
+
+public struct DurableReplayAdmissionResult: Equatable, Sendable {
+  public let disposition: ReplayDisposition
+  public let snapshot: CryptoStateSnapshot
+  let admissionProof: DurableReplayAdmissionProofV1
+
+  fileprivate init(
+    disposition: ReplayDisposition,
+    snapshot: CryptoStateSnapshot,
+    admissionProof: DurableReplayAdmissionProofV1
+  ) {
+    self.disposition = disposition
+    self.snapshot = snapshot
+    self.admissionProof = admissionProof
+  }
+}
+
 /// 统一拥有 machine lease、CounterGuard 与完整 sealed-state transition。
 ///
 /// `CounterAllocator` 只消费本 actor 在三段 durable readback 后返回的 block。
 public actor DurableCryptoStateCoordinator: CounterBlockReserving {
+  private enum StateFirstMutationAllowance {
+    case none
+    case pendingStreamBindings
+    case keySyncEpisode
+    case securityQuarantine
+  }
+
   private let stateStore: FileCryptoStateStore
   private let keyStore: any KeyStore
   private let guardKey: KeyStoreKey
@@ -104,6 +224,44 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     return try await bootstrapUnlocked(permit)
   }
 
+  /// marker-last promotion 尚未写 marker 时，只接受与初始 sealed state 和
+  /// exact promotion ID 完全一致的 bootstrap guard。回滚不得仅凭非空 bytes
+  /// 删除可能属于其他 promotion 的 CounterGuard。
+  static func auditInitialBootstrapGuard(
+    _ guardData: Data,
+    snapshot: CryptoStateSnapshot,
+    promotionID: Data
+  ) throws {
+    let permit = try CounterBootstrapPermit(
+      snapshot: snapshot,
+      promotionID: promotionID
+    )
+    let scope = try CounterGuardScope(
+      state: permit.snapshot.state,
+      promotionID: permit.promotionID
+    )
+    let stable = CounterGuardStable(
+      stateRevision: permit.snapshot.state.stateRevision,
+      reservedHighWater: permit.snapshot.state.senderCounter.reservedHighWater,
+      stateCommitment: permit.snapshot.commitment
+    )
+    let initialGuardCommitment = CounterGuardState.bootstrapCommitment(
+      scope: scope,
+      initialStateCommitment: permit.snapshot.commitment
+    )
+    let expected = CounterGuardState.stable(
+      CounterGuardEnvelope(
+        bootstrapScope: scope,
+        currentScope: scope,
+        initialStateCommitment: permit.snapshot.commitment,
+        initialGuardCommitment: initialGuardCommitment,
+        phase: .stable(stable)
+      ))
+    guard try CounterGuardState.decode(guardData) == expected else {
+      throw CounterAllocatorError.epochRetirementRequired
+    }
+  }
+
   func auditBootstrap(
     _ evidence: CounterBootstrapEvidence,
     promotionID: Data,
@@ -119,7 +277,7 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     }
     var guardState = try CounterGuardState.decode(guardData)
     switch guardState {
-    case .pending, .statePending:
+    case .pending, .statePending, .keyTransitionPending:
       _ = try await recoverStableState()
       guard let recoveredData = try await keyStore.load(guardKey) else {
         throw CounterAllocatorError.epochRetirementRequired
@@ -143,7 +301,7 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
       envelope = stableEnvelope
     case .retired(let retiredEnvelope):
       guard case .retired(let retired) = retiredEnvelope.phase,
-        scopeMatches(retiredEnvelope.scope, state: snapshot.state),
+        scopeMatches(retiredEnvelope.currentScope, state: snapshot.state),
         snapshot.state.securityState != .active,
         retired.stateRevision == snapshot.state.stateRevision,
         retired.reservedHighWater == snapshot.state.senderCounter.reservedHighWater,
@@ -152,10 +310,10 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
         throw CounterAllocatorError.epochRetirementRequired
       }
       envelope = retiredEnvelope
-    case .pending, .statePending:
+    case .pending, .statePending, .keyTransitionPending:
       throw CounterAllocatorError.invalidGuard
     }
-    guard envelope.scope.promotionID == promotionID,
+    guard envelope.bootstrapScope.promotionID == promotionID,
       envelope.initialStateCommitment == evidence.initialStateCommitment,
       envelope.initialGuardCommitment == evidence.initialGuardCommitment
     else {
@@ -205,7 +363,8 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
         nextStateCommitment: candidate.commitment
       )
       let pendingEnvelope = CounterGuardEnvelope(
-        scope: recovered.envelope.scope,
+        bootstrapScope: recovered.envelope.bootstrapScope,
+        currentScope: recovered.envelope.currentScope,
         initialStateCommitment: recovered.envelope.initialStateCommitment,
         initialGuardCommitment: recovered.envelope.initialGuardCommitment,
         phase: .pending(pending)
@@ -237,7 +396,8 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
         stateCommitment: candidate.commitment
       )
       let stableEnvelope = CounterGuardEnvelope(
-        scope: recovered.envelope.scope,
+        bootstrapScope: recovered.envelope.bootstrapScope,
+        currentScope: recovered.envelope.currentScope,
         initialStateCommitment: recovered.envelope.initialStateCommitment,
         initialGuardCommitment: recovered.envelope.initialGuardCommitment,
         phase: .stable(nextStable)
@@ -263,7 +423,7 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     counter: UInt64,
     ciphertextHash: Data,
     observedAtMS: UInt64
-  ) async throws -> ReplayDisposition {
+  ) async throws -> DurableReplayAdmissionResult {
     try await withMachineLease {
       let recovered = try await recoverStableState()
       switch recovered.snapshot.state.securityState {
@@ -281,7 +441,19 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
       else {
         throw DeviceCryptoStateError.missingReplayState
       }
-      guard replay.status == .active else {
+      guard observedAtMS > 0 else {
+        throw DeviceCryptoStateError.invalidClock
+      }
+      let acceptsFresh: Bool
+      switch replay.status {
+      case .active:
+        acceptsFresh = true
+      case .retired(_, let deleteAfterMS):
+        guard observedAtMS < deleteAfterMS else {
+          throw CounterAllocatorError.epochRetirementRequired
+        }
+        acceptsFresh = false
+      case .quarantined:
         throw CounterAllocatorError.epochRetirementRequired
       }
       var window = try ReplayWindow(snapshot: replay.window)
@@ -290,7 +462,38 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
           counter: counter,
           ciphertextHash: ciphertextHash
         )
-        guard disposition == .fresh else { return disposition }
+        if disposition == .fresh, !acceptsFresh {
+          let quarantined = try recovered.snapshot.state.quarantining(
+            reason: .keyRevisionRollback,
+            scope: scope,
+            observedAtMS: observedAtMS
+          )
+          try await commitStateFirst(
+            recovered: recovered,
+            candidate: CryptoStateSnapshot(quarantined),
+            mutationAllowance: .securityQuarantine
+          )
+          let quarantinedRecovered = try await recoverStableState()
+          try await retireGuard(
+            quarantinedRecovered,
+            reason: .keyRevisionRollback
+          )
+          try await observer?(.securityQuarantineDurable)
+          throw CounterAllocatorError.epochRetirementRequired
+        }
+        let proof = DurableReplayAdmissionProofV1(
+          scope: scope,
+          counter: counter,
+          ciphertextHash: ciphertextHash,
+          replayStatus: replay.status
+        )
+        guard disposition == .fresh else {
+          return DurableReplayAdmissionResult(
+            disposition: disposition,
+            snapshot: recovered.snapshot,
+            admissionProof: proof
+          )
+        }
         let nextReplay = try DeviceReplayStateV1(
           scope: scope,
           window: window.snapshot,
@@ -302,7 +505,15 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
           recovered: recovered,
           candidate: nextSnapshot
         )
-        return .fresh
+        let committed = try await recoverStableState()
+        guard committed.snapshot == nextSnapshot else {
+          throw CryptoStateStoreError.persistenceReadbackFailed
+        }
+        return DurableReplayAdmissionResult(
+          disposition: .fresh,
+          snapshot: committed.snapshot,
+          admissionProof: proof
+        )
       } catch RelayCryptoError.nonceReuse {
         let quarantined = try recovered.snapshot.state.quarantining(
           reason: .nonceReuse,
@@ -311,7 +522,8 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
         )
         try await commitStateFirst(
           recovered: recovered,
-          candidate: CryptoStateSnapshot(quarantined)
+          candidate: CryptoStateSnapshot(quarantined),
+          mutationAllowance: .securityQuarantine
         )
         let quarantinedRecovered = try await recoverStableState()
         try await retireGuard(quarantinedRecovered, reason: .nonceReuse)
@@ -340,6 +552,484 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     }
   }
 
+  /// authenticated daemon StreamBinding 的唯一 durable install seam。所有 authority、
+  /// key identity、revision、target 与 generation/cursor 规则先在纯 state transition
+  /// 完成；错误 binding 在任何 state/guard 写入前失败。CAS + full readback 后调用方才
+  /// 能注册 correlation owner 并发送 Relay Subscribe。
+  func installStreamBinding(
+    expected: CryptoStateSnapshot,
+    binding: DaemonStreamBindingV1
+  ) async throws -> DurableStreamBindingInstallResult {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      let transition = try expected.state.installingStreamBinding(binding)
+      let candidate = try CryptoStateSnapshot(transition.state)
+      if candidate != expected {
+        try await commitStateFirst(
+          recovered: recovered,
+          candidate: candidate,
+          mutationAllowance: .pendingStreamBindings
+        )
+      }
+      guard try await stateStore.load() == candidate else {
+        throw CryptoStateStoreError.persistenceReadbackFailed
+      }
+      return DurableStreamBindingInstallResult(
+        snapshot: candidate,
+        binding: transition.installed,
+        retiredBinding: transition.retired,
+        disposition: transition.disposition
+      )
+    }
+  }
+
+  /// production subscription 的最终 atomic cut：Runtime bootstrap 已提交后，最后到达的
+  /// verified StreamBinding 与 synchronized inner cursor 在同一 state CAS 中提升为 live
+  /// route/generation。返回旧 binding 供 transport owner 在 Subscribe 前精确退休。
+  func commitSubscriptionBootstrap(
+    expected: CryptoStateSnapshot,
+    binding: DaemonStreamBindingV1,
+    synchronizedInnerCursor: DeviceInnerCursorV1
+  ) async throws -> DurableStreamBindingInstallResult {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      let transition = try expected.state.committingSubscriptionBootstrap(
+        binding,
+        synchronizedInnerCursor: synchronizedInnerCursor
+      )
+      let candidate = try CryptoStateSnapshot(transition.state)
+      if candidate != expected {
+        try await commitStateFirst(
+          recovered: recovered,
+          candidate: candidate,
+          mutationAllowance: .pendingStreamBindings
+        )
+      }
+      guard try await stateStore.load() == candidate else {
+        throw CryptoStateStoreError.persistenceReadbackFailed
+      }
+      return DurableStreamBindingInstallResult(
+        snapshot: candidate,
+        binding: transition.installed,
+        retiredBinding: transition.retired,
+        disposition: transition.disposition
+      )
+    }
+  }
+
+  /// Source 已提交最终 SyncComplete scratch reducer 后，原子提升 exact pending
+  /// StreamBinding 为 live generation/cursor。generic non-counter seam 不允许删除或
+  /// 改写 pending binding，避免绕过 bootstrap completion gate。
+  @discardableResult
+  func commitSynchronizedStreamProgress(
+    expected: CryptoStateSnapshot,
+    streamRoute: Data,
+    streamGeneration: Data,
+    outerCursor: StreamCursor,
+    innerCursor: DeviceInnerCursorV1
+  ) async throws -> CryptoStateSnapshot {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      let candidate = try CryptoStateSnapshot(
+        expected.state.advancingSynchronizedStreamProgress(
+          streamRoute: streamRoute,
+          streamGeneration: streamGeneration,
+          outerCursor: outerCursor,
+          innerCursor: innerCursor
+        ))
+      if candidate != expected {
+        try await commitStateFirst(
+          recovered: recovered,
+          candidate: candidate,
+          mutationAllowance: .pendingStreamBindings
+        )
+      }
+      guard try await stateStore.load() == candidate else {
+        throw CryptoStateStoreError.persistenceReadbackFailed
+      }
+      return candidate
+    }
+  }
+
+  /// 由已验证的 exact-next KeyDirectory 构造并提交 crash-safe successor。
+  /// sender/replay/cursor 规则由 `DeviceCryptoStateV1` 统一生成，调用方不能自行遗忘
+  /// counter block 或 receive replay window。
+  @discardableResult
+  func advanceKeyDirectory(
+    expected: CryptoStateSnapshot,
+    to nextDirectory: DeviceKeyDirectoryV1,
+    senderCounter nextSender: DeviceSenderCounterV1
+  ) async throws -> CryptoStateSnapshot {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      let candidate: CryptoStateSnapshot
+      do {
+        candidate = try CryptoStateSnapshot(
+          expected.state.advancingKeyDirectory(
+            to: nextDirectory,
+            senderCounter: nextSender,
+            retiredAtMS: clock()
+          ))
+      } catch DeviceCryptoStateError.invalidKeyTransition {
+        try await retireAndQuarantine(recovered, reason: .keyRevisionRollback)
+      }
+      try await commitKeyDirectoryTransition(recovered: recovered, candidate: candidate)
+      return candidate
+    }
+  }
+
+  /// repository / recovery tests 使用的 exact replacement seam。它仍执行完整 canonical
+  /// successor 验证，不能退化成 `commitNonCounterState` 的 statePending。
+  func advanceKeyDirectory(
+    expected: CryptoStateSnapshot,
+    replacement: CryptoStateSnapshot
+  ) async throws {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      do {
+        try validateKeyDirectoryTransition(
+          previous: expected.state,
+          next: replacement.state
+        )
+      } catch DeviceCryptoStateError.invalidKeyTransition {
+        try await retireAndQuarantine(recovered, reason: .keyRevisionRollback)
+      }
+      try await commitKeyDirectoryTransition(recovered: recovered, candidate: replacement)
+    }
+  }
+
+  /// 已验签 KeyUpdate 在 HPKE / plaintext lineage 阶段失败时的 typed fail-close seam。
+  /// verifier 先持久化 quarantine + retired guard，随后才把原始 security error 返回连接层。
+  func quarantineKeyDirectoryViolation(
+    expected: CryptoStateSnapshot
+  ) async throws {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      do {
+        try await retireAndQuarantine(recovered, reason: .keyRevisionRollback)
+      } catch CounterAllocatorError.epochRetirementRequired {
+        return
+      }
+    }
+  }
+
+  /// 首个 authenticated exact-next probe 的唯一 durable admission。若同一 episode
+  /// 已存在则只做完整 active/readback 核对；不会刷新 startedAt/expiresAt 或 attempt。
+  @discardableResult
+  func beginOrResumeKeySyncEpisode(
+    targetRevision: UInt64,
+    observedKeyID: KeyIDV1,
+    streamRoute: Data?,
+    observedAtMS: UInt64
+  ) async throws -> CryptoStateSnapshot {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      let candidate = try CryptoStateSnapshot(
+        recovered.snapshot.state.startingOrResumingKeySyncEpisode(
+          targetRevision: targetRevision,
+          observedKeyID: observedKeyID,
+          streamRoute: streamRoute,
+          observedAtMS: observedAtMS
+        ))
+      if candidate != recovered.snapshot {
+        try await commitStateFirst(
+          recovered: recovered,
+          candidate: candidate,
+          mutationAllowance: .keySyncEpisode
+        )
+      }
+      guard try await stateStore.load() == candidate else {
+        throw CryptoStateStoreError.persistenceReadbackFailed
+      }
+      return candidate
+    }
+  }
+
+  /// 已验签 DirectoryCurrent 后，先 durable 推进 attempt（或标记第 3 次耗尽），调用方
+  /// 才能发送下一次 request / 发布 terminal。
+  @discardableResult
+  func recordKeySyncAttemptFailure(
+    targetRevision: UInt64,
+    attempt: UInt8,
+    observedAtMS: UInt64
+  ) async throws -> CryptoStateSnapshot {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      let candidate = try CryptoStateSnapshot(
+        recovered.snapshot.state.recordingKeySyncAttemptFailure(
+          targetRevision: targetRevision,
+          attempt: attempt,
+          observedAtMS: observedAtMS
+        ))
+      try await commitStateFirst(
+        recovered: recovered,
+        candidate: candidate,
+        mutationAllowance: .keySyncEpisode
+      )
+      guard try await stateStore.load() == candidate else {
+        throw CryptoStateStoreError.persistenceReadbackFailed
+      }
+      return candidate
+    }
+  }
+
+  /// MachineConnection absolute timer 到点后的 durable fail-close cut。调用方即使在
+  /// request signing 后持有旧 snapshot，也只能按 recovered exact episode 结束。
+  @discardableResult
+  func expireKeySyncEpisode(observedAtMS: UInt64) async throws -> CryptoStateSnapshot {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      let candidate = try CryptoStateSnapshot(
+        recovered.snapshot.state.expiringKeySyncEpisode(observedAtMS: observedAtMS)
+      )
+      try await commitStateFirst(
+        recovered: recovered,
+        candidate: candidate,
+        mutationAllowance: .keySyncEpisode
+      )
+      guard try await stateStore.load() == candidate else {
+        throw CryptoStateStoreError.persistenceReadbackFailed
+      }
+      return candidate
+    }
+  }
+
+  /// production KeyUpdateSet ingress：整 set verify/open/roster 后一次 durable stage；成功
+  /// readback 才返回 ACK permit。exact retry 零写但会重读完整 cold-open inventory。
+  func stageKeyUpdateSet(
+    expected: CryptoStateSnapshot,
+    canonicalBytes: Data,
+    expectedConversationRoutes: [Data],
+    observedAtMS: UInt64? = nil,
+    verifier: KeyUpdateSetVerifier
+  ) async throws -> DurableKeyUpdateInstallResult {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      guard let episode = expected.state.keySyncEpisode else {
+        throw DeviceCryptoStateError.invalidKeySyncEpisode
+      }
+      try episode.validateActive(at: observedAtMS ?? clock())
+      let candidateState = try verifier.prepareDurableStage(
+        state: expected.state,
+        canonicalBytes: canonicalBytes,
+        expectedConversationRoutes: expectedConversationRoutes
+      )
+      let candidate = try CryptoStateSnapshot(candidateState)
+      if candidate != expected {
+        try await commitKeyLifecycleStatePending(
+          recovered: recovered,
+          candidate: candidate
+        )
+      }
+      _ = try verifier.auditColdOpen(
+        state: candidate.state,
+        expectedConversationRoutes: expectedConversationRoutes
+      )
+      guard let transition = candidate.state.keyLifecycle?.stagedTransition,
+        candidate.state.keySyncEpisode == episode,
+        transition.toRevision == episode.targetRevision,
+        transition.canonicalUpdateSet == canonicalBytes,
+        try await stateStore.load() == candidate
+      else {
+        throw CryptoStateStoreError.persistenceReadbackFailed
+      }
+      return DurableKeyUpdateInstallResult(
+        snapshot: candidate,
+        acknowledgementPermit: try DurableKeyUpdateAckPermit(
+          trustScope: candidate.state.trustScope,
+          keyDirectoryRevision: transition.toRevision,
+          updateSetSHA256: transition.updateSetSHA256
+        )
+      )
+    }
+  }
+
+  /// exact barrier、cursor、replay 与 single-slot activation 同一 CAS；partial barrier 保持
+  /// current CounterGuard scope，最后一个 proof 才以 keyTransitionPending 切 revision。
+  func applyEpochBarrier(
+    expected: CryptoStateSnapshot,
+    barrier: DeviceEpochBarrierV1
+  ) async throws -> DurableStreamActivationResult {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      let now = clock()
+      let candidateState = try expected.state.applyingEpochBarrier(
+        barrier,
+        activatedAtMS: now
+      )
+      let candidate = try CryptoStateSnapshot(candidateState)
+      if candidate != expected {
+        guard let episode = expected.state.keySyncEpisode else {
+          throw DeviceCryptoStateError.invalidKeySyncEpisode
+        }
+        try episode.validateActive(at: now)
+        if candidate.state.senderCounter.keyDirectoryRevision
+          == expected.state.senderCounter.keyDirectoryRevision
+        {
+          try await commitKeyLifecycleStatePending(
+            recovered: recovered,
+            candidate: candidate
+          )
+        } else {
+          try await commitKeyTransitionPending(
+            recovered: recovered,
+            candidate: candidate
+          )
+        }
+      }
+      guard try await stateStore.load() == candidate else {
+        throw CryptoStateStoreError.persistenceReadbackFailed
+      }
+      return DurableStreamActivationResult(
+        snapshot: candidate,
+        acknowledgementPermit: try DurableStreamAppliedAckPermit(
+          trustScope: candidate.state.trustScope,
+          barrier: barrier
+        )
+      )
+    }
+  }
+
+  /// ActivateConversation cuts 为空时只接受 current Catalog 上 exact-next revision proof。
+  @discardableResult
+  func applyDirectoryRevisionAdvance(
+    expected: CryptoStateSnapshot,
+    advance: DeviceDirectoryRevisionAdvanceV1
+  ) async throws -> CryptoStateSnapshot {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      guard let episode = expected.state.keySyncEpisode else {
+        throw DeviceCryptoStateError.invalidKeySyncEpisode
+      }
+      try episode.validateActive(at: clock())
+      let candidate = try CryptoStateSnapshot(
+        expected.state.applyingDirectoryRevisionAdvance(advance)
+      )
+      try await commitKeyTransitionPending(recovered: recovered, candidate: candidate)
+      return candidate
+    }
+  }
+
+  func auditColdOpen(
+    expected: CryptoStateSnapshot,
+    expectedConversationRoutes: [Data],
+    verifier: KeyUpdateSetVerifier
+  ) async throws -> AuditedDeviceKeyInventoryV1 {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      return try verifier.auditColdOpen(
+        state: recovered.snapshot.state,
+        expectedConversationRoutes: expectedConversationRoutes
+      )
+    }
+  }
+
+  /// 从 stable sealed-state readback 恢复所有仍可安全重发的 lifecycle ACK basis。
+  /// proof 不被消费：Relay/daemon ACK outcome-unknown 时，下一次 cold-open 仍可重封。
+  func recoverKeyLifecycleAcknowledgements(
+    expected: CryptoStateSnapshot
+  ) async throws -> DurableKeyLifecycleAcknowledgementRecovery {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      let state = recovered.snapshot.state
+      let basis = try state.auditingKeyLifecycleAcknowledgementBasis()
+      let permits = try basis.epochBarriers.map {
+        try DurableStreamAppliedAckPermit(
+          trustScope: state.trustScope,
+          barrier: $0
+        )
+      }
+      return DurableKeyLifecycleAcknowledgementRecovery(
+        streamAppliedPermits: permits,
+        directoryAdvanceProof: basis.directoryAdvance
+      )
+    }
+  }
+
+  func recoverStreamAppliedAcknowledgement(
+    expected: CryptoStateSnapshot,
+    barrier: DeviceEpochBarrierV1
+  ) async throws -> DurableStreamAppliedAckPermit {
+    let recovery = try await recoverKeyLifecycleAcknowledgements(expected: expected)
+    guard
+      let permit = recovery.streamAppliedPermits.first(where: {
+        $0.epochBarrierSHA256 == barrier.canonicalSHA256
+          && $0.streamRoute == barrier.streamRoute
+          && $0.streamGeneration == barrier.streamGeneration
+          && $0.appliedStreamSequence == barrier.appliedStreamSequence
+      })
+    else {
+      throw DeviceKeyLifecycleError.invalidBarrier
+    }
+    return permit
+  }
+
+  func validateRecoveredDirectoryAdvance(
+    expected: CryptoStateSnapshot,
+    advance: DeviceDirectoryRevisionAdvanceV1
+  ) async throws {
+    let recovery = try await recoverKeyLifecycleAcknowledgements(expected: expected)
+    guard recovery.directoryAdvanceProof == advance else {
+      throw DeviceKeyLifecycleError.invalidDirectoryAdvance
+    }
+  }
+
+  @discardableResult
+  func garbageCollectRetiredKeys(
+    expected: CryptoStateSnapshot,
+    nowMS: UInt64
+  ) async throws -> CryptoStateSnapshot {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      let candidate = try CryptoStateSnapshot(
+        expected.state.garbageCollectingRetiredKeys(nowMS: nowMS)
+      )
+      if candidate != expected {
+        try await commitKeyLifecycleStatePending(
+          recovered: recovered,
+          candidate: candidate
+        )
+      }
+      return candidate
+    }
+  }
+
   private func recoverStableState() async throws -> RecoveredCounterState {
     guard let snapshot = try await stateStore.load() else {
       throw CounterAllocatorError.epochRetirementRequired
@@ -352,7 +1042,7 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     do {
       guardState = try CounterGuardState.decode(guardData)
     } catch {
-      try await quarantineWithoutUsableGuard(snapshot)
+      try await quarantineAndRetireCorruptGuard(snapshot: snapshot, guardData: guardData)
       throw CounterAllocatorError.invalidGuard
     }
 
@@ -377,19 +1067,22 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
       // Stable guard 与 state 不一致时没有可信的 expected-next commitment，禁止只凭
       // revision +1 猜测这是合法 crash cut。合法 non-counter transition 必须先写
       // statePending，其他分叉一律隔离并退休。
-      let recovered = RecoveredCounterState(
+      let reason: DeviceCryptoSecurityReason =
+        snapshot.state.keyDirectory.revision < envelope.currentScope.keyDirectoryRevision
+        ? .keyRevisionRollback
+        : .authenticatedStateRollback
+      try await failCloseKeyTransition(
         snapshot: snapshot,
         envelope: envelope,
-        stable: stable,
-        guardData: guardData
+        guardData: guardData,
+        reason: reason
       )
-      try await retireAndQuarantine(recovered, reason: .authenticatedStateRollback)
 
     case .pending(let envelope):
       guard case .pending(let pending) = envelope.phase else {
         throw CounterAllocatorError.invalidGuard
       }
-      guard scopeMatches(envelope.scope, state: snapshot.state) else {
+      guard scopeMatches(envelope.currentScope, state: snapshot.state) else {
         let previous = RecoveredCounterState(
           snapshot: snapshot,
           envelope: envelope,
@@ -443,7 +1136,8 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
         stateCommitment: pending.nextStateCommitment
       )
       let stableEnvelope = CounterGuardEnvelope(
-        scope: envelope.scope,
+        bootstrapScope: envelope.bootstrapScope,
+        currentScope: envelope.currentScope,
         initialStateCommitment: envelope.initialStateCommitment,
         initialGuardCommitment: envelope.initialGuardCommitment,
         phase: .stable(stable)
@@ -468,7 +1162,7 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
       guard case .statePending(let pending) = envelope.phase else {
         throw CounterAllocatorError.invalidGuard
       }
-      guard scopeMatches(envelope.scope, state: snapshot.state) else {
+      guard scopeMatches(envelope.currentScope, state: snapshot.state) else {
         let previous = RecoveredCounterState(
           snapshot: snapshot,
           envelope: envelope,
@@ -510,7 +1204,68 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
       }
 
       let stableEnvelope = CounterGuardEnvelope(
-        scope: envelope.scope,
+        bootstrapScope: envelope.bootstrapScope,
+        currentScope: envelope.currentScope,
+        initialStateCommitment: envelope.initialStateCommitment,
+        initialGuardCommitment: envelope.initialGuardCommitment,
+        phase: .stable(stable)
+      )
+      let stableData = try CounterGuardState.stable(stableEnvelope).encode()
+      try await keyStore.compareAndReplaceExact(
+        expected: guardData,
+        replacement: stableData,
+        for: guardKey
+      )
+      guard try await keyStore.load(guardKey) == stableData else {
+        throw KeyStoreError.persistenceReadbackFailed
+      }
+      return RecoveredCounterState(
+        snapshot: snapshot,
+        envelope: stableEnvelope,
+        stable: stable,
+        guardData: stableData
+      )
+
+    case .keyTransitionPending(let envelope):
+      guard case .keyTransitionPending(let pending) = envelope.phase else {
+        throw CounterAllocatorError.invalidGuard
+      }
+
+      let stable: CounterGuardStable
+      let currentScope: CounterGuardScope
+      if stableMatchesState(
+        pending.previous,
+        envelope: envelope,
+        snapshot: snapshot
+      ) {
+        // Crash before state CAS: exact previous state is the only legal rollback cut.
+        stable = pending.previous
+        currentScope = envelope.currentScope
+      } else if scopeMatches(pending.nextScope, state: snapshot.state),
+        snapshot.state.stateRevision == pending.nextStateRevision,
+        snapshot.state.senderCounter.reservedHighWater == pending.nextReservedHighWater,
+        snapshot.commitment == pending.nextStateCommitment
+      {
+        // Crash after state CAS: only the exact next scope + full-state commitment
+        // captured in Keychain can be finalized.
+        stable = CounterGuardStable(
+          stateRevision: pending.nextStateRevision,
+          reservedHighWater: pending.nextReservedHighWater,
+          stateCommitment: pending.nextStateCommitment
+        )
+        currentScope = pending.nextScope
+      } else {
+        try await failCloseKeyTransition(
+          snapshot: snapshot,
+          envelope: envelope,
+          guardData: guardData,
+          reason: .keyRevisionRollback
+        )
+      }
+
+      let stableEnvelope = CounterGuardEnvelope(
+        bootstrapScope: envelope.bootstrapScope,
+        currentScope: currentScope,
         initialStateCommitment: envelope.initialStateCommitment,
         initialGuardCommitment: envelope.initialGuardCommitment,
         phase: .stable(stable)
@@ -554,7 +1309,8 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     )
     let guardState = CounterGuardState.stable(
       CounterGuardEnvelope(
-        scope: scope,
+        bootstrapScope: scope,
+        currentScope: scope,
         initialStateCommitment: durable.commitment,
         initialGuardCommitment: initialGuardCommitment,
         phase: .stable(stable)
@@ -562,15 +1318,15 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     let encoded = try guardState.encode()
 
     if let existing = try await keyStore.load(guardKey) {
-      guard existing == encoded,
-        try CounterGuardState.decode(existing) == guardState
-      else {
+      guard try CounterGuardState.decode(existing) == guardState else {
         throw CounterAllocatorError.epochRetirementRequired
       }
     } else {
       _ = try await keyStore.persistImmutable(encoded, for: guardKey)
     }
-    guard try await keyStore.load(guardKey) == encoded else {
+    guard let persisted = try await keyStore.load(guardKey),
+      try CounterGuardState.decode(persisted) == guardState
+    else {
       throw KeyStoreError.persistenceReadbackFailed
     }
     return CounterBootstrapEvidence(
@@ -581,11 +1337,13 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
 
   private func commitStateFirst(
     recovered: RecoveredCounterState,
-    candidate: CryptoStateSnapshot
+    candidate: CryptoStateSnapshot,
+    mutationAllowance: StateFirstMutationAllowance = .none
   ) async throws {
     try validateStateFirstTransition(
       previous: recovered.snapshot.state,
-      next: candidate.state
+      next: candidate.state,
+      mutationAllowance: mutationAllowance
     )
 
     let pending = CounterGuardStatePending(
@@ -594,7 +1352,8 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
       nextStateCommitment: candidate.commitment
     )
     let pendingEnvelope = CounterGuardEnvelope(
-      scope: recovered.envelope.scope,
+      bootstrapScope: recovered.envelope.bootstrapScope,
+      currentScope: recovered.envelope.currentScope,
       initialStateCommitment: recovered.envelope.initialStateCommitment,
       initialGuardCommitment: recovered.envelope.initialGuardCommitment,
       phase: .statePending(pending)
@@ -625,7 +1384,8 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
       stateCommitment: candidate.commitment
     )
     let nextEnvelope = CounterGuardEnvelope(
-      scope: recovered.envelope.scope,
+      bootstrapScope: recovered.envelope.bootstrapScope,
+      currentScope: recovered.envelope.currentScope,
       initialStateCommitment: recovered.envelope.initialStateCommitment,
       initialGuardCommitment: recovered.envelope.initialGuardCommitment,
       phase: .stable(nextStable)
@@ -642,18 +1402,275 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     try await observer?(.guardStableDurable)
   }
 
-  private func validateStateFirstTransition(
+  private func commitKeyDirectoryTransition(
+    recovered: RecoveredCounterState,
+    candidate: CryptoStateSnapshot
+  ) async throws {
+    try validateKeyDirectoryTransition(
+      previous: recovered.snapshot.state,
+      next: candidate.state
+    )
+    try await commitKeyTransitionPending(recovered: recovered, candidate: candidate)
+  }
+
+  private func commitKeyLifecycleStatePending(
+    recovered: RecoveredCounterState,
+    candidate: CryptoStateSnapshot
+  ) async throws {
+    let revision = recovered.snapshot.state.stateRevision.addingReportingOverflow(1)
+    guard !revision.overflow,
+      candidate.state.stateRevision == revision.partialValue,
+      candidate.state.trustScope == recovered.snapshot.state.trustScope,
+      candidate.state.keyDirectory == recovered.snapshot.state.keyDirectory,
+      candidate.state.senderCounter == recovered.snapshot.state.senderCounter,
+      candidate.state.securityState == recovered.snapshot.state.securityState,
+      candidate.state.pendingStreamBindings
+        == recovered.snapshot.state.pendingStreamBindings,
+      candidate.state.keySyncEpisode == recovered.snapshot.state.keySyncEpisode
+    else {
+      throw DeviceKeyLifecycleError.invalidState
+    }
+    let pending = CounterGuardStatePending(
+      previous: recovered.stable,
+      nextStateRevision: candidate.state.stateRevision,
+      nextStateCommitment: candidate.commitment
+    )
+    let pendingEnvelope = CounterGuardEnvelope(
+      bootstrapScope: recovered.envelope.bootstrapScope,
+      currentScope: recovered.envelope.currentScope,
+      initialStateCommitment: recovered.envelope.initialStateCommitment,
+      initialGuardCommitment: recovered.envelope.initialGuardCommitment,
+      phase: .statePending(pending)
+    )
+    let pendingData = try CounterGuardState.statePending(pendingEnvelope).encode()
+    try await keyStore.compareAndReplaceExact(
+      expected: recovered.guardData,
+      replacement: pendingData,
+      for: guardKey
+    )
+    guard try await keyStore.load(guardKey) == pendingData else {
+      throw KeyStoreError.persistenceReadbackFailed
+    }
+    try await observer?(.stateGuardPendingDurable)
+
+    try await stateStore.compareAndReplaceExact(
+      expected: recovered.snapshot,
+      replacement: candidate
+    )
+    guard try await stateStore.load() == candidate else {
+      throw CryptoStateStoreError.persistenceReadbackFailed
+    }
+    try await observer?(.stateDurable)
+
+    let stable = CounterGuardStable(
+      stateRevision: candidate.state.stateRevision,
+      reservedHighWater: candidate.state.senderCounter.reservedHighWater,
+      stateCommitment: candidate.commitment
+    )
+    let stableEnvelope = CounterGuardEnvelope(
+      bootstrapScope: recovered.envelope.bootstrapScope,
+      currentScope: recovered.envelope.currentScope,
+      initialStateCommitment: recovered.envelope.initialStateCommitment,
+      initialGuardCommitment: recovered.envelope.initialGuardCommitment,
+      phase: .stable(stable)
+    )
+    let stableData = try CounterGuardState.stable(stableEnvelope).encode()
+    try await keyStore.compareAndReplaceExact(
+      expected: pendingData,
+      replacement: stableData,
+      for: guardKey
+    )
+    guard try await keyStore.load(guardKey) == stableData else {
+      throw KeyStoreError.persistenceReadbackFailed
+    }
+    try await observer?(.guardStableDurable)
+  }
+
+  private func commitKeyTransitionPending(
+    recovered: RecoveredCounterState,
+    candidate: CryptoStateSnapshot
+  ) async throws {
+    let revision = recovered.snapshot.state.stateRevision.addingReportingOverflow(1)
+    guard !revision.overflow,
+      candidate.state.stateRevision == revision.partialValue,
+      candidate.state.trustScope == recovered.snapshot.state.trustScope,
+      candidate.state.securityState == recovered.snapshot.state.securityState,
+      candidate.state.pendingStreamBindings
+        == recovered.snapshot.state.pendingStreamBindings,
+      keySyncEpisodeTransitionIsValid(
+        previous: recovered.snapshot.state,
+        next: candidate.state
+      )
+    else {
+      throw DeviceKeyLifecycleError.invalidState
+    }
+    let nextScope = try CounterGuardScope(
+      state: candidate.state,
+      promotionID: recovered.envelope.bootstrapScope.promotionID
+    )
+    let pending = CounterGuardKeyTransitionPending(
+      previous: recovered.stable,
+      nextScope: nextScope,
+      nextStateRevision: candidate.state.stateRevision,
+      nextReservedHighWater: candidate.state.senderCounter.reservedHighWater,
+      nextStateCommitment: candidate.commitment
+    )
+    let pendingEnvelope = CounterGuardEnvelope(
+      bootstrapScope: recovered.envelope.bootstrapScope,
+      currentScope: recovered.envelope.currentScope,
+      initialStateCommitment: recovered.envelope.initialStateCommitment,
+      initialGuardCommitment: recovered.envelope.initialGuardCommitment,
+      phase: .keyTransitionPending(pending)
+    )
+    let pendingData = try CounterGuardState.keyTransitionPending(pendingEnvelope).encode()
+    try await keyStore.compareAndReplaceExact(
+      expected: recovered.guardData,
+      replacement: pendingData,
+      for: guardKey
+    )
+    guard try await keyStore.load(guardKey) == pendingData else {
+      throw KeyStoreError.persistenceReadbackFailed
+    }
+    try await observer?(.keyTransitionGuardPendingDurable)
+
+    try await stateStore.compareAndReplaceExact(
+      expected: recovered.snapshot,
+      replacement: candidate
+    )
+    guard try await stateStore.load() == candidate else {
+      throw CryptoStateStoreError.persistenceReadbackFailed
+    }
+    try await observer?(.keyTransitionStateDurable)
+
+    let nextStable = CounterGuardStable(
+      stateRevision: candidate.state.stateRevision,
+      reservedHighWater: candidate.state.senderCounter.reservedHighWater,
+      stateCommitment: candidate.commitment
+    )
+    let nextEnvelope = CounterGuardEnvelope(
+      bootstrapScope: recovered.envelope.bootstrapScope,
+      currentScope: nextScope,
+      initialStateCommitment: recovered.envelope.initialStateCommitment,
+      initialGuardCommitment: recovered.envelope.initialGuardCommitment,
+      phase: .stable(nextStable)
+    )
+    let nextData = try CounterGuardState.stable(nextEnvelope).encode()
+    try await keyStore.compareAndReplaceExact(
+      expected: pendingData,
+      replacement: nextData,
+      for: guardKey
+    )
+    guard try await keyStore.load(guardKey) == nextData else {
+      throw KeyStoreError.persistenceReadbackFailed
+    }
+    try await observer?(.keyTransitionGuardStableDurable)
+  }
+
+  private func validateKeyDirectoryTransition(
     previous: DeviceCryptoStateV1,
     next: DeviceCryptoStateV1
+  ) throws {
+    guard next.trustScope == previous.trustScope,
+      next.securityState == previous.securityState,
+      next.streamStates == previous.streamStates
+    else {
+      throw DeviceCryptoStateError.invalidKeyTransition
+    }
+
+    var retirementTime: UInt64?
+    for old in previous.replayStates {
+      guard let successor = next.replayStates.first(where: { $0.scope == old.scope }) else {
+        throw DeviceCryptoStateError.invalidKeyTransition
+      }
+      guard case .retired(let retiredAtMS, let deleteAfterMS) = successor.status else {
+        continue
+      }
+      if case .retired = old.status { continue }
+      let retentionEnd = retiredAtMS.addingReportingOverflow(
+        ReplayWindow.retiredWindowRetentionMilliseconds
+      )
+      guard !retentionEnd.overflow,
+        deleteAfterMS == retentionEnd.partialValue,
+        retirementTime == nil || retirementTime == retiredAtMS
+      else {
+        throw DeviceCryptoStateError.invalidKeyTransition
+      }
+      retirementTime = retiredAtMS
+    }
+
+    let canonical = try previous.advancingKeyDirectory(
+      to: next.keyDirectory,
+      senderCounter: next.senderCounter,
+      retiredAtMS: retirementTime ?? 1
+    )
+    guard canonical == next else {
+      throw DeviceCryptoStateError.invalidKeyTransition
+    }
+  }
+
+  private func keySyncEpisodeTransitionIsValid(
+    previous: DeviceCryptoStateV1,
+    next: DeviceCryptoStateV1
+  ) -> Bool {
+    if next.senderCounter.keyDirectoryRevision
+      == previous.senderCounter.keyDirectoryRevision
+    {
+      return next.keySyncEpisode == previous.keySyncEpisode
+    }
+    let successor = previous.senderCounter.keyDirectoryRevision.addingReportingOverflow(1)
+    guard !successor.overflow,
+      next.senderCounter.keyDirectoryRevision == successor.partialValue
+    else {
+      return false
+    }
+    switch previous.keySyncEpisode {
+    case nil:
+      return next.keySyncEpisode == nil
+    case .some(let episode):
+      return episode.targetRevision == next.senderCounter.keyDirectoryRevision
+        && !episode.exhausted
+        && next.keySyncEpisode == nil
+    }
+  }
+
+  private func validateStateFirstTransition(
+    previous: DeviceCryptoStateV1,
+    next: DeviceCryptoStateV1,
+    mutationAllowance: StateFirstMutationAllowance = .none
   ) throws {
     let revision = previous.stateRevision.addingReportingOverflow(1)
     guard !revision.overflow,
       next.stateRevision == revision.partialValue,
       next.trustScope == previous.trustScope,
       next.keyDirectory == previous.keyDirectory,
-      next.senderCounter == previous.senderCounter
+      next.senderCounter == previous.senderCounter,
+      next.keyLifecycle == previous.keyLifecycle
     else {
       throw CounterAllocatorError.invalidState
+    }
+    switch mutationAllowance {
+    case .none:
+      guard next.pendingStreamBindings == previous.pendingStreamBindings,
+        next.keySyncEpisode == previous.keySyncEpisode
+      else {
+        throw CounterAllocatorError.invalidState
+      }
+    case .pendingStreamBindings:
+      guard next.keySyncEpisode == previous.keySyncEpisode else {
+        throw CounterAllocatorError.invalidState
+      }
+    case .keySyncEpisode:
+      guard next.pendingStreamBindings == previous.pendingStreamBindings else {
+        throw CounterAllocatorError.invalidState
+      }
+    case .securityQuarantine:
+      guard previous.securityState == .active,
+        next.securityState != .active,
+        next.pendingStreamBindings == previous.pendingStreamBindings,
+        next.keySyncEpisode == nil
+      else {
+        throw CounterAllocatorError.invalidState
+      }
     }
   }
 
@@ -775,7 +1792,7 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     envelope: CounterGuardEnvelope,
     snapshot: CryptoStateSnapshot
   ) -> Bool {
-    scopeMatches(envelope.scope, state: snapshot.state)
+    scopeMatches(envelope.currentScope, state: snapshot.state)
       && stable.stateRevision == snapshot.state.stateRevision
       && stable.reservedHighWater == snapshot.state.senderCounter.reservedHighWater
       && stable.stateCommitment == snapshot.commitment
@@ -815,6 +1832,84 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     try await observer?(.securityQuarantineDurable)
   }
 
+  private func quarantineAndRetireCorruptGuard(
+    snapshot: CryptoStateSnapshot,
+    guardData: Data
+  ) async throws {
+    let observedAtMS = clock()
+    let quarantined: CryptoStateSnapshot
+    if snapshot.state.securityState == .active {
+      quarantined = try CryptoStateSnapshot(
+        snapshot.state.quarantining(
+          reason: .authenticatedStateRollback,
+          scope: nil,
+          observedAtMS: observedAtMS
+        ))
+      try await stateStore.compareAndReplaceExact(
+        expected: snapshot,
+        replacement: quarantined
+      )
+    } else {
+      quarantined = snapshot
+    }
+    guard try await stateStore.load() == quarantined else {
+      throw CryptoStateStoreError.persistenceReadbackFailed
+    }
+
+    let bootstrapScope: CounterGuardScope
+    let initialStateCommitment: Data
+    let initialGuardCommitment: Data
+    if let binding = CounterGuardState.salvageBootstrapBinding(guardData) {
+      bootstrapScope = binding.scope
+      initialStateCommitment = binding.initialStateCommitment
+      initialGuardCommitment = binding.initialGuardCommitment
+    } else {
+      var seed = Data("AgentDeck/CorruptCounterGuardRetirementV1\0".utf8)
+      seed.append(guardData)
+      var promotionID = CanonicalCodec.sha256(seed)
+      if promotionID.allSatisfy({ $0 == 0 }) {
+        promotionID = Data(repeating: 0xFF, count: 32)
+      }
+      bootstrapScope = try CounterGuardScope(
+        state: snapshot.state,
+        promotionID: promotionID
+      )
+      initialStateCommitment = snapshot.commitment
+      initialGuardCommitment = CounterGuardState.bootstrapCommitment(
+        scope: bootstrapScope,
+        initialStateCommitment: initialStateCommitment
+      )
+    }
+    let terminalScope = try CounterGuardScope(
+      state: quarantined.state,
+      promotionID: bootstrapScope.promotionID
+    )
+    let retired = CounterGuardRetired(
+      reason: .authenticatedStateRollback,
+      retiredAtMS: observedAtMS,
+      stateRevision: quarantined.state.stateRevision,
+      reservedHighWater: quarantined.state.senderCounter.reservedHighWater,
+      stateCommitment: quarantined.commitment
+    )
+    let envelope = CounterGuardEnvelope(
+      bootstrapScope: bootstrapScope,
+      currentScope: terminalScope,
+      initialStateCommitment: initialStateCommitment,
+      initialGuardCommitment: initialGuardCommitment,
+      phase: .retired(retired)
+    )
+    let retiredData = try CounterGuardState.retired(envelope).encode()
+    try await keyStore.compareAndReplaceExact(
+      expected: guardData,
+      replacement: retiredData,
+      for: guardKey
+    )
+    guard try await keyStore.load(guardKey) == retiredData else {
+      throw KeyStoreError.persistenceReadbackFailed
+    }
+    try await observer?(.securityQuarantineDurable)
+  }
+
   private func retireAndQuarantine(
     _ recovered: RecoveredCounterState,
     reason: DeviceCryptoSecurityReason
@@ -842,6 +1937,66 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     throw CounterAllocatorError.epochRetirementRequired
   }
 
+  /// key transition pending 可能面对 previous、exact-next 之外的任意 authenticated
+  /// sibling。此时旧 currentScope 已不能描述磁盘 state；先对当前 full state 做 durable
+  /// quarantine，再以同一 immutable bootstrap authority 派生 terminal currentScope。
+  private func failCloseKeyTransition(
+    snapshot: CryptoStateSnapshot,
+    envelope: CounterGuardEnvelope,
+    guardData: Data,
+    reason: DeviceCryptoSecurityReason
+  ) async throws -> Never {
+    let observedAtMS = clock()
+    let quarantined: CryptoStateSnapshot
+    if snapshot.state.securityState == .active {
+      quarantined = try CryptoStateSnapshot(
+        snapshot.state.quarantining(
+          reason: reason,
+          scope: nil,
+          observedAtMS: observedAtMS
+        ))
+      try await stateStore.compareAndReplaceExact(
+        expected: snapshot,
+        replacement: quarantined
+      )
+    } else {
+      quarantined = snapshot
+    }
+    guard try await stateStore.load() == quarantined else {
+      throw CryptoStateStoreError.persistenceReadbackFailed
+    }
+
+    let terminalScope = try CounterGuardScope(
+      state: quarantined.state,
+      promotionID: envelope.bootstrapScope.promotionID
+    )
+    let retired = CounterGuardRetired(
+      reason: reason,
+      retiredAtMS: observedAtMS,
+      stateRevision: quarantined.state.stateRevision,
+      reservedHighWater: quarantined.state.senderCounter.reservedHighWater,
+      stateCommitment: quarantined.commitment
+    )
+    let retiredEnvelope = CounterGuardEnvelope(
+      bootstrapScope: envelope.bootstrapScope,
+      currentScope: terminalScope,
+      initialStateCommitment: envelope.initialStateCommitment,
+      initialGuardCommitment: envelope.initialGuardCommitment,
+      phase: .retired(retired)
+    )
+    let retiredData = try CounterGuardState.retired(retiredEnvelope).encode()
+    try await keyStore.compareAndReplaceExact(
+      expected: guardData,
+      replacement: retiredData,
+      for: guardKey
+    )
+    guard try await keyStore.load(guardKey) == retiredData else {
+      throw KeyStoreError.persistenceReadbackFailed
+    }
+    try await observer?(.securityQuarantineDurable)
+    throw CounterAllocatorError.epochRetirementRequired
+  }
+
   private func retireGuard(
     _ recovered: RecoveredCounterState,
     reason: DeviceCryptoSecurityReason
@@ -855,7 +2010,8 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
       stateCommitment: recovered.snapshot.commitment
     )
     let retiredEnvelope = CounterGuardEnvelope(
-      scope: recovered.envelope.scope,
+      bootstrapScope: recovered.envelope.bootstrapScope,
+      currentScope: recovered.envelope.currentScope,
       initialStateCommitment: recovered.envelope.initialStateCommitment,
       initialGuardCommitment: recovered.envelope.initialGuardCommitment,
       phase: .retired(retired)
@@ -988,6 +2144,39 @@ private struct CounterGuardScope: Equatable, Sendable {
       reservedHighWater: 0,
       reservationID: Data(repeating: 0, count: 16)
     )
+    let normalizedLifecycle: DeviceKeyLifecycleStateV1?
+    if state.senderCounter.keyDirectoryRevision == state.keyDirectory.revision {
+      normalizedLifecycle = nil
+    } else {
+      let slots = try state.keyDirectory.entries.map { entry in
+        var fingerprintInput = Data("AgentDeck/CounterGuardLiveKeySlotV1\0".utf8)
+        fingerprintInput.append(entry.keyID.purpose.canonicalTag)
+        fingerprintInput.appendInteger(entry.keyID.epoch)
+        fingerprintInput.append(entry.streamRoute ?? Data(repeating: 0, count: 16))
+        fingerprintInput.append(entry.enc)
+        fingerprintInput.append(entry.wrappedKey)
+        let carrier = try DeviceStoredKeyCarrierV1(
+          keyID: entry.keyID,
+          streamRoute: entry.streamRoute,
+          keyDirectoryRevision: state.keyDirectory.revision,
+          secretFingerprint: CanonicalCodec.sha256(fingerprintInput),
+          source: .bootstrapDirectory
+        )
+        return try DeviceKeySlotStateV1(
+          id: carrier.slotID,
+          current: carrier,
+          staged: nil,
+          retired: []
+        )
+      }
+      normalizedLifecycle = try DeviceKeyLifecycleStateV1(
+        activeRevision: state.senderCounter.keyDirectoryRevision,
+        activeUpdateSet: nil,
+        stagedTransition: nil,
+        slots: slots,
+        retiredSecretFingerprints: []
+      )
+    }
     let invariant = try DeviceCryptoStateV1(
       stateRevision: 1,
       trustScope: state.trustScope,
@@ -995,7 +2184,8 @@ private struct CounterGuardScope: Equatable, Sendable {
       senderCounter: initialSender,
       securityState: .active,
       replayStates: [],
-      streamStates: []
+      streamStates: [],
+      keyLifecycle: normalizedLifecycle
     )
     return try CryptoStateSnapshot(invariant).commitment
   }
@@ -1021,6 +2211,14 @@ private struct CounterGuardStatePending: Equatable, Sendable {
   let nextStateCommitment: Data
 }
 
+private struct CounterGuardKeyTransitionPending: Equatable, Sendable {
+  let previous: CounterGuardStable
+  let nextScope: CounterGuardScope
+  let nextStateRevision: UInt64
+  let nextReservedHighWater: UInt64
+  let nextStateCommitment: Data
+}
+
 private struct CounterGuardRetired: Equatable, Sendable {
   let reason: DeviceCryptoSecurityReason
   let retiredAtMS: UInt64
@@ -1033,24 +2231,36 @@ private enum CounterGuardPhase: Equatable, Sendable {
   case stable(CounterGuardStable)
   case pending(CounterGuardPending)
   case statePending(CounterGuardStatePending)
+  case keyTransitionPending(CounterGuardKeyTransitionPending)
   case retired(CounterGuardRetired)
 }
 
 private struct CounterGuardEnvelope: Equatable, Sendable {
-  let scope: CounterGuardScope
+  /// pairing bootstrap 时的 immutable scope；initialGuardCommitment 永远只绑定它。
+  let bootstrapScope: CounterGuardScope
+  /// 当前可消费 sender/replay state 的 scope；只能由 typed key transition exact 推进。
+  let currentScope: CounterGuardScope
   let initialStateCommitment: Data
   let initialGuardCommitment: Data
   let phase: CounterGuardPhase
+}
+
+private struct CounterGuardBootstrapBinding: Sendable {
+  let scope: CounterGuardScope
+  let initialStateCommitment: Data
+  let initialGuardCommitment: Data
 }
 
 private enum CounterGuardState: Equatable, Sendable {
   case stable(CounterGuardEnvelope)
   case pending(CounterGuardEnvelope)
   case statePending(CounterGuardEnvelope)
+  case keyTransitionPending(CounterGuardEnvelope)
   case retired(CounterGuardEnvelope)
 
   private static let magic = Data("ADCG".utf8)
-  private static let version: UInt16 = 2
+  private static let legacyVersion: UInt16 = 2
+  private static let version: UInt16 = 3
 
   func encode() throws -> Data {
     let envelope: CounterGuardEnvelope
@@ -1064,16 +2274,22 @@ private enum CounterGuardState: Equatable, Sendable {
       envelope = value
       phaseTag = 1
       guard case .pending = value.phase else { throw CounterAllocatorError.invalidGuard }
+    case .retired(let value):
+      envelope = value
+      phaseTag = 2
+      guard case .retired = value.phase else { throw CounterAllocatorError.invalidGuard }
     case .statePending(let value):
       envelope = value
       phaseTag = 3
       guard case .statePending = value.phase else {
         throw CounterAllocatorError.invalidGuard
       }
-    case .retired(let value):
+    case .keyTransitionPending(let value):
       envelope = value
-      phaseTag = 2
-      guard case .retired = value.phase else { throw CounterAllocatorError.invalidGuard }
+      phaseTag = 4
+      guard case .keyTransitionPending = value.phase else {
+        throw CounterAllocatorError.invalidGuard
+      }
     }
     try Self.validateEnvelope(envelope)
 
@@ -1081,33 +2297,28 @@ private enum CounterGuardState: Equatable, Sendable {
     data.appendInteger(Self.version)
     data.append(phaseTag)
     data.append(0)
-    data.append(envelope.scope.promotionID)
-    data.appendInteger(envelope.scope.trustEpoch)
-    data.appendInteger(envelope.scope.keyDirectoryRevision)
-    data.appendInteger(envelope.scope.keyEpoch)
-    data.append(envelope.scope.noncePrefix)
-    data.append(contentsOf: [0, 0, 0, 0])
-    data.append(envelope.scope.invariantCommitment)
+    Self.appendScope(envelope.bootstrapScope, to: &data)
+    Self.appendScope(envelope.currentScope, to: &data)
     data.append(envelope.initialStateCommitment)
     data.append(envelope.initialGuardCommitment)
     switch envelope.phase {
     case .stable(let stable):
-      data.appendInteger(stable.stateRevision)
-      data.appendInteger(stable.reservedHighWater)
-      data.append(stable.stateCommitment)
+      Self.appendStable(stable, to: &data)
     case .pending(let pending):
-      data.appendInteger(pending.previous.stateRevision)
-      data.appendInteger(pending.previous.reservedHighWater)
-      data.append(pending.previous.stateCommitment)
+      Self.appendStable(pending.previous, to: &data)
       data.appendInteger(pending.nextStateRevision)
       data.appendInteger(pending.nextHighWater)
       data.append(pending.reservationID)
       data.append(pending.nextStateCommitment)
     case .statePending(let pending):
-      data.appendInteger(pending.previous.stateRevision)
-      data.appendInteger(pending.previous.reservedHighWater)
-      data.append(pending.previous.stateCommitment)
+      Self.appendStable(pending.previous, to: &data)
       data.appendInteger(pending.nextStateRevision)
+      data.append(pending.nextStateCommitment)
+    case .keyTransitionPending(let pending):
+      Self.appendStable(pending.previous, to: &data)
+      Self.appendScope(pending.nextScope, to: &data)
+      data.appendInteger(pending.nextStateRevision)
+      data.appendInteger(pending.nextReservedHighWater)
       data.append(pending.nextStateCommitment)
     case .retired(let retired):
       data.append(retired.reason.rawValue)
@@ -1122,126 +2333,180 @@ private enum CounterGuardState: Equatable, Sendable {
 
   static func decode(_ data: Data) throws -> Self {
     var decoder = GuardDecoder(data: data)
-    guard try decoder.fixed(count: 4) == magic,
-      try decoder.u16() == version
-    else {
+    guard try decoder.fixed(count: 4) == magic else {
       throw CounterAllocatorError.invalidGuard
     }
-    let phase = try decoder.u8()
+    let decodedVersion = try decoder.u16()
+    guard decodedVersion == legacyVersion || decodedVersion == version else {
+      throw CounterAllocatorError.invalidGuard
+    }
+    let phaseTag = try decoder.u8()
     guard try decoder.u8() == 0 else { throw CounterAllocatorError.invalidGuard }
-    let scope = try CounterGuardScope(
-      promotionID: decoder.fixed(count: 32),
-      trustEpoch: decoder.u64(),
-      keyDirectoryRevision: decoder.u64(),
-      keyEpoch: decoder.u64(),
-      noncePrefix: decoder.fixed(count: 4),
-      invariantCommitment: {
-        guard try decoder.fixed(count: 4).allSatisfy({ $0 == 0 }) else {
-          throw CounterAllocatorError.invalidGuard
-        }
-        return try decoder.fixed(count: 32)
-      }()
-    )
+    let bootstrapScope = try decodeScope(from: &decoder)
+    let currentScope =
+      decodedVersion == legacyVersion
+      ? bootstrapScope
+      : try decodeScope(from: &decoder)
     let initialStateCommitment = try decoder.fixed(count: 32)
     let initialGuardCommitment = try decoder.fixed(count: 32)
-    let envelope: CounterGuardEnvelope
-    switch phase {
+    let phase: CounterGuardPhase
+    switch phaseTag {
     case 0:
-      let stable = CounterGuardStable(
-        stateRevision: try decoder.u64(),
-        reservedHighWater: try decoder.u64(),
-        stateCommitment: try decoder.fixed(count: 32)
-      )
-      envelope = CounterGuardEnvelope(
-        scope: scope,
-        initialStateCommitment: initialStateCommitment,
-        initialGuardCommitment: initialGuardCommitment,
-        phase: .stable(stable)
-      )
-      guard decoder.isAtEnd else { throw CounterAllocatorError.invalidGuard }
-      try validateEnvelope(envelope)
-      return .stable(envelope)
+      phase = .stable(try decodeStable(from: &decoder))
     case 1:
-      let previous = CounterGuardStable(
-        stateRevision: try decoder.u64(),
-        reservedHighWater: try decoder.u64(),
-        stateCommitment: try decoder.fixed(count: 32)
-      )
-      let pending = CounterGuardPending(
-        previous: previous,
-        nextStateRevision: try decoder.u64(),
-        nextHighWater: try decoder.u64(),
-        reservationID: try decoder.fixed(count: 16),
-        nextStateCommitment: try decoder.fixed(count: 32)
-      )
-      envelope = CounterGuardEnvelope(
-        scope: scope,
-        initialStateCommitment: initialStateCommitment,
-        initialGuardCommitment: initialGuardCommitment,
-        phase: .pending(pending)
-      )
-      guard decoder.isAtEnd else { throw CounterAllocatorError.invalidGuard }
-      try validateEnvelope(envelope)
-      return .pending(envelope)
+      phase = .pending(
+        CounterGuardPending(
+          previous: try decodeStable(from: &decoder),
+          nextStateRevision: try decoder.u64(),
+          nextHighWater: try decoder.u64(),
+          reservationID: try decoder.fixed(count: 16),
+          nextStateCommitment: try decoder.fixed(count: 32)
+        ))
     case 2:
       guard let reason = DeviceCryptoSecurityReason(rawValue: try decoder.u8()),
         try decoder.fixed(count: 7).allSatisfy({ $0 == 0 })
       else {
         throw CounterAllocatorError.invalidGuard
       }
-      let retired = CounterGuardRetired(
-        reason: reason,
-        retiredAtMS: try decoder.u64(),
-        stateRevision: try decoder.u64(),
-        reservedHighWater: try decoder.u64(),
-        stateCommitment: try decoder.fixed(count: 32)
-      )
-      envelope = CounterGuardEnvelope(
-        scope: scope,
-        initialStateCommitment: initialStateCommitment,
-        initialGuardCommitment: initialGuardCommitment,
-        phase: .retired(retired)
-      )
-      guard decoder.isAtEnd else { throw CounterAllocatorError.invalidGuard }
-      try validateEnvelope(envelope)
-      return .retired(envelope)
+      phase = .retired(
+        CounterGuardRetired(
+          reason: reason,
+          retiredAtMS: try decoder.u64(),
+          stateRevision: try decoder.u64(),
+          reservedHighWater: try decoder.u64(),
+          stateCommitment: try decoder.fixed(count: 32)
+        ))
     case 3:
-      let previous = CounterGuardStable(
-        stateRevision: try decoder.u64(),
-        reservedHighWater: try decoder.u64(),
-        stateCommitment: try decoder.fixed(count: 32)
-      )
-      let pending = CounterGuardStatePending(
-        previous: previous,
-        nextStateRevision: try decoder.u64(),
-        nextStateCommitment: try decoder.fixed(count: 32)
-      )
-      envelope = CounterGuardEnvelope(
-        scope: scope,
-        initialStateCommitment: initialStateCommitment,
-        initialGuardCommitment: initialGuardCommitment,
-        phase: .statePending(pending)
-      )
-      guard decoder.isAtEnd else { throw CounterAllocatorError.invalidGuard }
-      try validateEnvelope(envelope)
-      return .statePending(envelope)
+      phase = .statePending(
+        CounterGuardStatePending(
+          previous: try decodeStable(from: &decoder),
+          nextStateRevision: try decoder.u64(),
+          nextStateCommitment: try decoder.fixed(count: 32)
+        ))
+    case 4 where decodedVersion == version:
+      phase = .keyTransitionPending(
+        CounterGuardKeyTransitionPending(
+          previous: try decodeStable(from: &decoder),
+          nextScope: try decodeScope(from: &decoder),
+          nextStateRevision: try decoder.u64(),
+          nextReservedHighWater: try decoder.u64(),
+          nextStateCommitment: try decoder.fixed(count: 32)
+        ))
     default:
       throw CounterAllocatorError.invalidGuard
     }
+    guard decoder.isAtEnd else { throw CounterAllocatorError.invalidGuard }
+    let envelope = CounterGuardEnvelope(
+      bootstrapScope: bootstrapScope,
+      currentScope: currentScope,
+      initialStateCommitment: initialStateCommitment,
+      initialGuardCommitment: initialGuardCommitment,
+      phase: phase
+    )
+    try validateEnvelope(envelope)
+    switch phase {
+    case .stable: return .stable(envelope)
+    case .pending: return .pending(envelope)
+    case .retired: return .retired(envelope)
+    case .statePending: return .statePending(envelope)
+    case .keyTransitionPending: return .keyTransitionPending(envelope)
+    }
+  }
+
+  /// decode 已 fail 时只抢救 immutable bootstrap binding，用于把损坏 guard 原子替换成
+  /// terminal retired marker；不会据此恢复 active state。v3 与 legacy v2 两种布局都尝试。
+  fileprivate static func salvageBootstrapBinding(
+    _ data: Data
+  ) -> CounterGuardBootstrapBinding? {
+    func decodeBinding(hasCurrentScope: Bool) -> CounterGuardBootstrapBinding? {
+      do {
+        var decoder = GuardDecoder(data: data)
+        guard try decoder.fixed(count: 4) == magic else { return nil }
+        _ = try decoder.u16()
+        _ = try decoder.u8()
+        guard try decoder.u8() == 0 else { return nil }
+        let bootstrapScope = try decodeScope(from: &decoder)
+        if hasCurrentScope { _ = try decodeScope(from: &decoder) }
+        let initialStateCommitment = try decoder.fixed(count: 32)
+        let initialGuardCommitment = try decoder.fixed(count: 32)
+        guard initialStateCommitment.count == 32,
+          !initialStateCommitment.allSatisfy({ $0 == 0 }),
+          initialGuardCommitment
+            == bootstrapCommitment(
+              scope: bootstrapScope,
+              initialStateCommitment: initialStateCommitment
+            )
+        else {
+          return nil
+        }
+        return CounterGuardBootstrapBinding(
+          scope: bootstrapScope,
+          initialStateCommitment: initialStateCommitment,
+          initialGuardCommitment: initialGuardCommitment
+        )
+      } catch {
+        return nil
+      }
+    }
+    return decodeBinding(hasCurrentScope: true) ?? decodeBinding(hasCurrentScope: false)
+  }
+
+  private static func appendScope(_ scope: CounterGuardScope, to data: inout Data) {
+    data.append(scope.promotionID)
+    data.appendInteger(scope.trustEpoch)
+    data.appendInteger(scope.keyDirectoryRevision)
+    data.appendInteger(scope.keyEpoch)
+    data.append(scope.noncePrefix)
+    data.append(contentsOf: [0, 0, 0, 0])
+    data.append(scope.invariantCommitment)
+  }
+
+  private static func decodeScope(from decoder: inout GuardDecoder) throws -> CounterGuardScope {
+    let promotionID = try decoder.fixed(count: 32)
+    let trustEpoch = try decoder.u64()
+    let keyDirectoryRevision = try decoder.u64()
+    let keyEpoch = try decoder.u64()
+    let noncePrefix = try decoder.fixed(count: 4)
+    guard try decoder.fixed(count: 4).allSatisfy({ $0 == 0 }) else {
+      throw CounterAllocatorError.invalidGuard
+    }
+    return try CounterGuardScope(
+      promotionID: promotionID,
+      trustEpoch: trustEpoch,
+      keyDirectoryRevision: keyDirectoryRevision,
+      keyEpoch: keyEpoch,
+      noncePrefix: noncePrefix,
+      invariantCommitment: decoder.fixed(count: 32)
+    )
+  }
+
+  private static func appendStable(_ stable: CounterGuardStable, to data: inout Data) {
+    data.appendInteger(stable.stateRevision)
+    data.appendInteger(stable.reservedHighWater)
+    data.append(stable.stateCommitment)
+  }
+
+  private static func decodeStable(from decoder: inout GuardDecoder) throws -> CounterGuardStable {
+    CounterGuardStable(
+      stateRevision: try decoder.u64(),
+      reservedHighWater: try decoder.u64(),
+      stateCommitment: try decoder.fixed(count: 32)
+    )
   }
 
   private static func validateEnvelope(_ envelope: CounterGuardEnvelope) throws {
     guard envelope.initialStateCommitment.count == 32,
       !envelope.initialStateCommitment.allSatisfy({ $0 == 0 }),
       envelope.initialGuardCommitment.count == 32,
-      !envelope.initialGuardCommitment.allSatisfy({ $0 == 0 })
-    else {
-      throw CounterAllocatorError.invalidGuard
-    }
-    guard
+      !envelope.initialGuardCommitment.allSatisfy({ $0 == 0 }),
+      envelope.bootstrapScope.promotionID == envelope.currentScope.promotionID,
+      envelope.bootstrapScope.trustEpoch == envelope.currentScope.trustEpoch,
+      envelope.currentScope.keyDirectoryRevision
+        >= envelope.bootstrapScope.keyDirectoryRevision,
+      envelope.currentScope.keyEpoch >= envelope.bootstrapScope.keyEpoch,
       envelope.initialGuardCommitment
         == bootstrapCommitment(
-          scope: envelope.scope,
+          scope: envelope.bootstrapScope,
           initialStateCommitment: envelope.initialStateCommitment
         )
     else {
@@ -1273,6 +2538,36 @@ private enum CounterGuardState: Equatable, Sendable {
       let revision = pending.previous.stateRevision.addingReportingOverflow(1)
       guard !revision.overflow,
         pending.nextStateRevision == revision.partialValue,
+        pending.nextStateCommitment.count == 32,
+        !pending.nextStateCommitment.allSatisfy({ $0 == 0 }),
+        pending.nextStateCommitment != pending.previous.stateCommitment
+      else {
+        throw CounterAllocatorError.invalidGuard
+      }
+    case .keyTransitionPending(let pending):
+      try validateStable(pending.previous)
+      let stateRevision = pending.previous.stateRevision.addingReportingOverflow(1)
+      let directoryRevision = envelope.currentScope.keyDirectoryRevision
+        .addingReportingOverflow(1)
+      let keyEpoch = envelope.currentScope.keyEpoch.addingReportingOverflow(1)
+      let senderContinues =
+        pending.nextScope.keyEpoch == envelope.currentScope.keyEpoch
+        && pending.nextScope.noncePrefix == envelope.currentScope.noncePrefix
+        && pending.nextReservedHighWater == pending.previous.reservedHighWater
+      let senderRotates =
+        !keyEpoch.overflow
+        && pending.nextScope.keyEpoch == keyEpoch.partialValue
+        && pending.nextScope.noncePrefix != envelope.currentScope.noncePrefix
+        && !pending.nextScope.noncePrefix.allSatisfy({ $0 == 0 })
+        && pending.nextReservedHighWater == 0
+      guard !stateRevision.overflow,
+        !directoryRevision.overflow,
+        pending.nextScope.promotionID == envelope.currentScope.promotionID,
+        pending.nextScope.trustEpoch == envelope.currentScope.trustEpoch,
+        pending.nextScope.keyDirectoryRevision == directoryRevision.partialValue,
+        pending.nextScope.invariantCommitment != envelope.currentScope.invariantCommitment,
+        senderContinues || senderRotates,
+        pending.nextStateRevision == stateRevision.partialValue,
         pending.nextStateCommitment.count == 32,
         !pending.nextStateCommitment.allSatisfy({ $0 == 0 }),
         pending.nextStateCommitment != pending.previous.stateCommitment

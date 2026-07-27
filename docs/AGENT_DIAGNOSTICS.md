@@ -903,6 +903,7 @@ receipt trust-reset 不做网络或删除，只返回该安全操作提示。
 | `remote.transport.frame_forbidden` | control-only MachineLink 收到业务 frame | 立即关闭该 transport并调查 Relay/client；P4.2不得向 RuntimeCore dispatch |
 | `remote.transport.route_mismatch` / `closed` | retirement route错绑或 transport已关闭 | 保留 frozen retirement，以同一 durable state在新认证连接上恢复 |
 | `remote.transport.start_permit_unavailable` / `authenticator_still_shared` | permit被重复消费，或 authenticator尚未唯一归还 | fail-close manager；检查 owner/lifetime，禁止 Clone/共享 key owner |
+| `remote.transport.pairing_entropy_contract_violation` | 版本锁定的 HPKE consumer 没有恰好请求一次 32-byte IKM，而是请求错误长度、word API 或重复取值 | 丢弃本次 artifact 并 fail-close；核对 `hpke` 锁定版本与 `OneShotHpkeSeedRng` contract tests，禁止回退到可复制或通用 RNG owner |
 
 底层 `relay.client.*` / `relay.tls.*` code 继续按本页 Relay client/TLS 表处理。初次 connect 失败只保留一个不可
 Clone 的 exact retry state，重拨必须复用相同 authenticator、cert与 start permit；不得生成新 route/cert。
@@ -1085,7 +1086,8 @@ Protection Keychain 且没有 file/dev keystore 降级。MachineRoot 丢失按
 处理；static sentinel 不生成 receipt，也不提供删除授权。
 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与
 destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade、P5.2 crash-safe client storage 与 P5.3
-WSS/pin/per-connection transfer primitive 已完成，P5/P6 当前为 3/9、0/4。
+WSS/pin/per-connection transfer primitive 已完成；P5.4 MachineConnection/bounded source automatic Task 也已
+完成，P5/P6 当前进度为 4/9、0/4。
 
 #### P5.2 client storage / counter / replay failure
 
@@ -1144,6 +1146,58 @@ global 证据。
 pinned self-signed 的准确含义是：先匹配 exact leaf DER-SPKI，再把该 leaf 作为显式 anchor 运行
 hostname/time/EKU/结构验证，并由 TLS CertificateVerify 证明 pinned private-key possession；它不验证 anchor
 的自签 signature。真实公网 WSS 与物理设备仍是 post-MVP BLOCKED，P5.3 automatic tests 不替代这些证据。
+
+#### P5.4 MachineConnection / RelaySessionSource typed failure
+
+P5.4 Swift client 当前用 facade state、stable transfer code 与 module-internal typed error 分层表达故障；不要把
+内部 enum 名称写成 daemon/Relay wire failure code。排查时先确认 exact connection + transport generation，
+再读 durable CryptoState/key-sync episode、request correlation 与 source observation，禁止通过清 state、复用
+route/counter 或扩大 buffer 来“恢复”。
+
+| typed state / failure | 含义 | 下一步 |
+| --- | --- | --- |
+| `SessionConnectionState.relayUnavailable` / `.machineOffline` / `.reconnecting` | 暂态 transport、Relay 或 machine 可达性变化 | 保持外层 observation；等待 supervisor 在旧 generation 完整 teardown 后以 fresh challenge/resume 重连，不手工重放 Hello |
+| `SessionConnectionState.lagged(.bufferDropped)` | conversation 慢消费者填满 512 队列，旧内部 generation 已失效 | 等待同一外层 observation 收到 lag marker、fresh snapshot 与 `SyncComplete` barrier；不要继续消费旧排队 event |
+| `SessionConnectionState.lagged(.cursorGap)` / `.lagged(.snapshotRequired)` | outer/inner cursor 不连续，或 key barrier 要求该 target 重建 | 只重订阅受影响 catalog/conversation；从 fresh snapshot/barrier 恢复，禁止用 alias 打开普通 rollback payload |
+| `ProductionMachineConnectionVerifiedIngressError.keySyncTimedOut` / `.keySyncMismatch` | 30 秒 absolute deadline 到界，或 update/barrier/revision/route 不属于 exact active episode | 关闭 exact generation并从 durable episode恢复；不得重置 deadline、合成完整 directory 或跳过 barrier |
+| `ProductionMachineConnectionVerifiedIngressError.outboundCapacity` | transport action/control request route 的 512 hard cap 或 reservation 不可满足 | 让已发 control route取得 matching RouteAccepted，或结束 generation；不得复用业务 route、取消 reservation 后继续签名或调高 cap |
+| `MachineRequestCorrelationError.preparedMutationPending` / `.capacityExceeded` / `.routeCollision` | request/subscription 已有待 durable commit mutation，或 pending/live/historical namespace 已满/碰撞 | cancel 必须 fail-close exact generation；不能吞掉 unregister 失败后让旧 StreamBinding 继续 commit/Subscribe |
+| `TransferAssemblerError.reassemblyFull` | per-connection 或 process-global 512 MiB/8,192 budget 在 allocation 前拒绝 | 丢弃 offending transfer/completion并确认 exact reservation release；不得临时超配或驱逐 5 分钟 TTL 内 tombstone |
+| `SessionConnectionState.revoked` / `.incompatible` / `.securityError` | root-signed terminal、协议不兼容或验证/crypto 安全失败 | 这是 fatal observation terminal；完成 connection shutdown/paired cleanup readback后重新配对或升级，不进入普通 reconnect loop |
+| `SessionSourceFailureCode.transportUnavailable` / `.machineOffline` | command 在 source shutdown、离线或无 active generation 时发起 | 返回 typed failure，不离线排队；恢复 observation 后由调用方按原 idempotency key重新发起 |
+
+若 pre-MVP developer Keychain 中仍有 `ADPR`/`ADPM` version 1 paired marker，P5.4 cold open 会返回
+`PairedMachineStoreError.invalidRecord` 并保持零迁移、零自动删除。version 1 没有 MachineRoot public key 与
+Data certificate，无法从 fingerprint/grant 安全重建；因此不要手改 marker 或降级验证。该 artifact 尚未通过
+P5.6 真实 pairing 入口发布，当前恢复方式只能是在明确授权后清理对应 developer state 并重新配对；正式升级/
+migration contract 必须在 P5.6 首次发布前冻结。
+
+resource observation 只保留 newest-one；conversation observer cap 为 64、每 observer queue 为 512。第 65 个
+observer 只拒绝 offending admission，不能重启已有 observation。process-shared transfer budget 必须在
+complete、validation/hash/length failure、TTL、disconnect/reset 与 owner teardown 后读回 exact release。
+key-sync semantic ACK 先于 Relay outer ACK；签名失败、generation teardown 或 reconnect 后只能恢复同一
+barrier hash 的 durable proof。
+
+最后一个 conversation observer 退出后，该 conversation 会进入 single-flight retirement：先等待 Runtime
+`Unsubscribe` receipt，再退休 correlation binding并发送 exact Relay outer unsubscribe。retirement 返回前同一
+conversation 的 replacement 必须被拒绝，且该条目继续占用全局/per-machine observer cap；不要把这段时间误判为
+泄漏后清 state。unsubscribe 任一步失败会 fail-close 对应 machine/generation，不能跳过旧 retirement 建新 binding。
+若 shutdown 在 update queue 已满时停住，核对顺序必须是 cancel supervisor → finish update channel → teardown
+generation → join；消费者可读完已排队的 512 条前缀，第 513 个 pending send 必须由 finish 解锁且不得越界交付。
+
+pairing 恢复时看到完整 `staged` marker 并不表示 machine 已配对可见。只有 matching `PairRouteClosed` 才能把它
+CAS 为 `committed`；在此之前 `list/load/openConnectionMaterial` 都必须隐藏。`relay.route.not_found` 即使带有
+精确关联的 receipt frame hash，也可能只是 daemon 离线，必须按 transport unavailable 处理并保留
+responsePrepared + staged marker。完整 promotion 可跨 invite expiry 继续 reconciliation，因为远端 Delivered
+grant 不会被 TTL sweep 自动撤销；无 exact Close proof 时，既不能开放连接，也不能删除可能仍绑定 active grant
+的 credential。marker 缺失的 partial rollback 若已存在 CounterGuard，必须先验证其 promotion ID、state 与
+bootstrap commitment 绑定；malformed 或 foreign guard 必须零 mutation fail-close。requestPrepared 仍按绝对
+expiry 清理，合法 partial promotion 仍精确回滚。
+
+2026-07-27 的非门控 Instruments Allocations smoke 启动 `dist/AgentDeck.app --selfcheck`，exit 0、duration
+2.639832 秒；trace 只在 `/tmp/agentdeck-p54-instruments.rt5Mo5/p54-agentdeck-selfcheck.trace`，不得提交。
+它不是 RelaySessionSource 长跑、真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac 或真实
+vendor 证据。P5.5–P5.9 与 P5 Phase Exit 继续未完成。
 
 #### Trust reset 与本地 cleanup
 

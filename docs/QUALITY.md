@@ -1055,8 +1055,9 @@ DeviceGrant/auth ledger/revoke/control handoff；P4.4 又由 `cd7d9fb` 收口 Ma
 RuntimeCore dispatch；P4.5 由 `c6ef387`、`88b3c42` 收口 signed publication、key/counter/replay crash
 recovery。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime wire 为 v5；
 P4.7 automatic Task 与 P4 automatic Phase Exit 已完成，P4 按 Task 进度为 7/7。P5.1 shared facade、
-P5.2 crash-safe client storage 与 P5.3 WSS/pin/per-connection transfer primitive 已完成；P5/P6 自动实现为
-3/9、0/4，P5.4–P5.9 与 P5 Phase Exit 尚未完成。
+P5.2 crash-safe client storage、P5.3 WSS/pin/per-connection transfer primitive 与 P5.4
+MachineConnection/bounded source automatic Task 已完成。P5/P6 当前进度为 4/9、0/4；P5.5–P5.9 与 P5
+Phase Exit 尚未完成。
 
 ## Relay Companion MVP P3.8-A local Runtime UDS transport primitives 门禁
 
@@ -2501,9 +2502,10 @@ CLI/env/config injected/file/dev keystore 降级面。MachineRoot 丢失时按
 [`RELAY_RUNBOOK.md`](RELAY_RUNBOOK.md#machineroot-丢失后的-portable-purge-receipt) 的 portable purge
 receipt 流程处理，不得用 sentinel 或 synthetic receipt 代替。
 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与
-destructive purge 继续保持 post-MVP BLOCKED，不属于 P4 automatic PASS；P5/P6 当前为 3/9、0/4，
+destructive purge 继续保持 post-MVP BLOCKED，不属于 P4 automatic PASS；P5/P6 当前进度上限为 4/9、0/4，
 其中 P5.1 完成 shared facade，P5.2 完成 crash-safe client storage，P5.3 完成 WSS/pin 与
-per-connection transfer primitive。
+per-connection transfer primitive，P5.4 完成 MachineConnection、shared transfer coordinator 与 bounded
+source automatic Task。
 
 ## Relay Companion MVP P5.1 shared SessionSource facade 门禁
 
@@ -2672,6 +2674,257 @@ RelayClient `181 executed / 4 entitlement SKIP / 0 failure`，strict target buil
 `OSAllocatedUnfairLock` 后重跑全量通过。真实公网 WSS、物理设备与 P5 Phase Exit 仍未完成；P5.4 global
 coordinator 是后续 blocking gate。
 
+## Relay Companion MVP P5.4 MachineConnection / bounded source 门禁
+
+P5.4 验收 production `MachineConnection`/verified ingress、process-global transfer budget、bounded
+broadcaster/reducers、scoped `RelaySessionSource`、typed command/pairing 与 cross-language crypto/wire 接线。
+原计划 Step 2 的历史 RED 在接管大型 WIP 时没有保留，不得补写；以 current-tree discovery、fresh focused 与
+完整 target/package rerun 替代。filter 必须先由 discovery 证明非空，最终计数只从冻结候选的 fresh 输出回填。
+
+```bash
+# 当前 P5.4 行为 suite；先 discovery，禁止 0-test filter 假绿
+p54_suites='BoundedBroadcasterTests|DeviceRequestSignerTests|KeyDirectoryVerifierTests|KeyUpdateSetVerifierTests|MachineConnectionTests|MachineDataVerifierTests|MachineRequestCorrelationTests|MachineTerminalVerifierTests|PendingPairingStoreTests|PairedMachineStoreTests|PairingPromotionBuilderTests|PairRequestCryptoTests|PairResponseCryptoTests|PairTerminalVerifierTests|ProductionMachineConnectionVerifiedIngressTests|ProductionRelayPairingCommandHandlerTests|RelayResumeTests|RelayRuntimeCommandClientTests|RelaySessionSourceTests|TransferAssemblyBudgetCoordinatorTests'
+swift test list | rg "$p54_suites"
+RUSTC_WRAPPER= swift test -Xswiftc -warnings-as-errors --filter "$p54_suites"
+
+# RelayClient strict/full Swift、共享 target 与 iOS Simulator 回归
+RUSTC_WRAPPER= swift test -Xswiftc -warnings-as-errors \
+  --filter AgentDeckRelayClientTests
+swift build --target AgentDeckRelayClient -Xswiftc -warnings-as-errors
+RUSTC_WRAPPER= swift test
+cd ios && xcodegen generate && \
+  xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
+    -destination 'platform=iOS Simulator,name=iPhone 17' test
+cd ..
+
+# Rust/cross-language pairing、E2EE 与 Relay v2 parity
+RUSTC_WRAPPER= cargo test -p agentdeck-crypto
+RUSTC_WRAPPER= cargo test -p agentdeck-protocol
+RUSTC_WRAPPER= cargo test -p agentdeck-relay --features server,tls
+bash scripts/verify-cross-language-crypto.sh
+
+# 临时 slice/worktree 若要复用当前仓库源码，必须使用独立 CARGO_TARGET_DIR；Rust 的 env! 宏会把
+# CARGO_MANIFEST_DIR 编入 test binary，共用 target 可能让 snapshot gate 误读已删除的临时路径。
+# 若已污染，只清理受影响 package 的生成物后在权威 worktree fresh 重跑，禁止生成或改写 snapshot 来掩盖。
+
+# P5.4 精确 Swift strict-format manifest。禁止替换为整个 Sources/Tests/Swift 目录。
+p54_swift_manifest=(
+  Sources/AgentDeckCore/Protocol/RuntimeV2WireCodec.swift
+  Sources/AgentDeckRelayClient/Connection/MachineConnection.swift
+  Sources/AgentDeckRelayClient/Connection/MachineConnectionStateMachine.swift
+  Sources/AgentDeckRelayClient/Connection/MachineConnectionUpdates.swift
+  Sources/AgentDeckRelayClient/Connection/MachineRequestCorrelation.swift
+  Sources/AgentDeckRelayClient/Connection/ProductionMachineConnectionVerifiedIngress.swift
+  Sources/AgentDeckRelayClient/Crypto/CanonicalCodec.swift
+  Sources/AgentDeckRelayClient/Crypto/DeviceRequestSigner.swift
+  Sources/AgentDeckRelayClient/Crypto/KeyControlCodec.swift
+  Sources/AgentDeckRelayClient/Crypto/KeyDirectoryVerifier.swift
+  Sources/AgentDeckRelayClient/Crypto/KeyLifecycleProofs.swift
+  Sources/AgentDeckRelayClient/Crypto/KeyUpdateSetVerifier.swift
+  Sources/AgentDeckRelayClient/Crypto/MachineDataVerifier.swift
+  Sources/AgentDeckRelayClient/Crypto/MachineTerminalVerifier.swift
+  Sources/AgentDeckRelayClient/Crypto/PairRequestCrypto.swift
+  Sources/AgentDeckRelayClient/Crypto/PairResponseCrypto.swift
+  Sources/AgentDeckRelayClient/Crypto/PairTerminalVerifier.swift
+  Sources/AgentDeckRelayClient/Crypto/RelayCredentials.swift
+  Sources/AgentDeckRelayClient/Crypto/RelayCrypto.swift
+  Sources/AgentDeckRelayClient/Source/CatalogReducer.swift
+  Sources/AgentDeckRelayClient/Source/ConversationReducer.swift
+  Sources/AgentDeckRelayClient/Source/InboxReducer.swift
+  Sources/AgentDeckRelayClient/Source/ProductionRelayPairingCommandHandler.swift
+  Sources/AgentDeckRelayClient/Source/RelayConversationResumeCoordinator.swift
+  Sources/AgentDeckRelayClient/Source/RelayRuntimeCommandClient.swift
+  Sources/AgentDeckRelayClient/Source/RelaySessionSource.swift
+  Sources/AgentDeckRelayClient/Storage/AppleKeychainStore.swift
+  Sources/AgentDeckRelayClient/Storage/DeviceCryptoState.swift
+  Sources/AgentDeckRelayClient/Storage/DurableCryptoStateCoordinator.swift
+  Sources/AgentDeckRelayClient/Storage/FileCryptoStateStore.swift
+  Sources/AgentDeckRelayClient/Storage/KeyStore.swift
+  Sources/AgentDeckRelayClient/Storage/PairedMachineStore.swift
+  Sources/AgentDeckRelayClient/Storage/PairingPromotionBuilder.swift
+  Sources/AgentDeckRelayClient/Storage/PendingPairingStore.swift
+  Sources/AgentDeckRelayClient/Streaming/BoundedBroadcaster.swift
+  Sources/AgentDeckRelayClient/Transfer/TransferAssembler.swift
+  Sources/AgentDeckRelayClient/Transfer/TransferAssemblyBudgetCoordinator.swift
+  Sources/AgentDeckRelayClient/Transport/RelayWebSocketTransport.swift
+  Sources/AgentDeckRelayClient/Wire/RelayV2Types.swift
+  Tests/AgentDeckRelayClientTests/AppleKeychainStoreTests.swift
+  Tests/AgentDeckRelayClientTests/BoundedBroadcasterTests.swift
+  Tests/AgentDeckRelayClientTests/CryptoStateStoreTests.swift
+  Tests/AgentDeckRelayClientTests/DaemonKeyControlCodecTests.swift
+  Tests/AgentDeckRelayClientTests/DeviceCryptoStateTests.swift
+  Tests/AgentDeckRelayClientTests/DeviceRequestSignerTests.swift
+  Tests/AgentDeckRelayClientTests/DurableCryptoStateCoordinatorTests.swift
+  Tests/AgentDeckRelayClientTests/KeyDirectoryVerifierTests.swift
+  Tests/AgentDeckRelayClientTests/KeyUpdateSetVerifierTests.swift
+  Tests/AgentDeckRelayClientTests/MachineConnectionTests.swift
+  Tests/AgentDeckRelayClientTests/MachineDataVerifierTests.swift
+  Tests/AgentDeckRelayClientTests/MachineRequestCorrelationTests.swift
+  Tests/AgentDeckRelayClientTests/MachineTerminalVerifierTests.swift
+  Tests/AgentDeckRelayClientTests/PairRequestCryptoTests.swift
+  Tests/AgentDeckRelayClientTests/PairResponseCryptoTests.swift
+  Tests/AgentDeckRelayClientTests/PairTerminalVerifierTests.swift
+  Tests/AgentDeckRelayClientTests/PairedMachineStoreTests.swift
+  Tests/AgentDeckRelayClientTests/PairingPromotionBuilderTests.swift
+  Tests/AgentDeckRelayClientTests/PendingPairingStoreTests.swift
+  Tests/AgentDeckRelayClientTests/ProductionMachineConnectionVerifiedIngressTests.swift
+  Tests/AgentDeckRelayClientTests/ProductionRelayPairingCommandHandlerTests.swift
+  Tests/AgentDeckRelayClientTests/RelayResumeTests.swift
+  Tests/AgentDeckRelayClientTests/RelayRuntimeCommandClientTests.swift
+  Tests/AgentDeckRelayClientTests/RelaySessionSourceTests.swift
+  Tests/AgentDeckRelayClientTests/RelayV2TypedPairDataFactoryTests.swift
+  Tests/AgentDeckRelayClientTests/RelayV2WireTests.swift
+  Tests/AgentDeckRelayClientTests/RelayWebSocketTransportTests.swift
+  Tests/AgentDeckRelayClientTests/TransferAssemblerTests.swift
+  Tests/AgentDeckRelayClientTests/TransferAssemblyBudgetCoordinatorTests.swift
+  Tests/AgentDeckTests/RuntimeV2WireCodecTests.swift
+)
+for file in "${p54_swift_manifest[@]}"; do test -f "$file" || exit 1; done
+diff \
+  <(printf '%s\n' "${p54_swift_manifest[@]}" | sort -u) \
+  <({ git diff --name-only HEAD -- '*.swift'; git ls-files --others --exclude-standard -- '*.swift'; } | sort -u)
+
+# P5.4 剩余 40 路径同样必须精确冻结；三组并集必须等于当前 109-path 工作集。
+p54_rust_manifest=(
+  agentdeckd/src/runtime/store/cipher.rs
+  agentdeck-crypto/src/lib.rs
+  agentdeck-crypto/src/pairing.rs
+  agentdeck-crypto/tests/golden_vectors.rs
+  agentdeck-crypto/tests/pairing_v1_crypto.rs
+  agentdeck-protocol/src/e2ee/context.rs
+  agentdeck-protocol/src/e2ee/mod.rs
+  agentdeck-protocol/src/e2ee/pairing.rs
+  agentdeck-protocol/src/e2ee/pairing_control.rs
+  agentdeck-protocol/src/e2ee/schema.rs
+  agentdeck-protocol/src/relay_v2/failure.rs
+  agentdeck-protocol/src/relay_v2/mod.rs
+  agentdeck-protocol/tests/pairing_v1_contract.rs
+  agentdeck-protocol/tests/relay_v2_contract.rs
+  agentdeck-relay/src/v2/auth/access.rs
+  agentdeck-relay/src/v2/core/pair_route.rs
+  agentdeck-relay/src/v2/core/writer.rs
+  agentdeck-relay/src/v2/server/connection.rs
+  agentdeck-relay/tests/relay_v2_auth_e2e.rs
+  agentdeck-relay/tests/relay_v2_tls_e2e.rs
+  agentdeckd/Cargo.toml
+  agentdeckd/src/remote/bootstrap.rs
+  agentdeckd/src/remote/pairing.rs
+  agentdeckd/src/remote/pairing_tests.rs
+  agentdeckd/src/remote/transport.rs
+  agentdeckd/src/runtime/model.rs
+  agentdeckd/src/runtime/store/pairing.rs
+  agentdeckd/src/runtime/store/pairing_grant_allocation_tests.rs
+  agentdeckd/src/runtime/store/pairing_terminal.rs
+  agentdeckd/src/runtime/store/pairing_terminal_tests.rs
+  agentdeckd/src/runtime/store/worker.rs
+  protocol/agentdeck/crypto-vectors-v1.json
+  protocol/agentdeck/e2ee-v1.schema.json
+  protocol/agentdeck/fixtures/relay-v2-wire-vectors.json
+)
+p54_docs_manifest=(
+  ARCHITECTURE.md
+  README.md
+  docs/AGENT_DIAGNOSTICS.md
+  docs/QUALITY.md
+  docs/index.md
+  docs/plans/2026-07-10-relay-companion-mvp-implementation.md
+)
+p54_all_manifest=(
+  "${p54_rust_manifest[@]}"
+  "${p54_swift_manifest[@]}"
+  "${p54_docs_manifest[@]}"
+)
+test "${#p54_rust_manifest[@]}" -eq 34
+test "${#p54_docs_manifest[@]}" -eq 6
+test "${#p54_all_manifest[@]}" -eq 109
+for file in "${p54_all_manifest[@]}"; do test -f "$file" || exit 1; done
+diff \
+  <(printf '%s\n' "${p54_all_manifest[@]}" | sort -u) \
+  <({ git diff --name-only HEAD; git ls-files --others --exclude-standard; } | sort -u)
+
+# 这 4 个既有大文件沿用已提交的 4-space 风格，避免为 P5.4 制造整文件缩进 churn；
+# 其余 65 个文件使用当前 swift-format 默认配置。两组并集仍必须精确等于上面的 69-path manifest。
+p54_swift_four_space_compat=(
+  Sources/AgentDeckRelayClient/Crypto/CanonicalCodec.swift
+  Sources/AgentDeckRelayClient/Crypto/RelayCrypto.swift
+  Sources/AgentDeckRelayClient/Wire/RelayV2Types.swift
+  Tests/AgentDeckRelayClientTests/RelayV2WireTests.swift
+)
+p54_swift_default_manifest=()
+for file in "${p54_swift_manifest[@]}"; do
+  case "$file" in
+    Sources/AgentDeckRelayClient/Crypto/CanonicalCodec.swift | \
+      Sources/AgentDeckRelayClient/Crypto/RelayCrypto.swift | \
+      Sources/AgentDeckRelayClient/Wire/RelayV2Types.swift | \
+      Tests/AgentDeckRelayClientTests/RelayV2WireTests.swift) ;;
+    *) p54_swift_default_manifest+=("$file") ;;
+  esac
+done
+test "${#p54_swift_default_manifest[@]}" -eq 65
+test "$((${#p54_swift_default_manifest[@]} + ${#p54_swift_four_space_compat[@]}))" -eq 69
+swift format lint --strict "${p54_swift_default_manifest[@]}"
+swift format lint --strict --configuration '{"indentation":{"spaces":4}}' \
+  "${p54_swift_four_space_compat[@]}"
+
+# production 边界与文档；下列 rg 期望无输出
+rg -n '@preconcurrency|nonisolated\(unsafe\)|URLSession|import Network' \
+  Sources/AgentDeckRelayClient/Connection \
+  Sources/AgentDeckRelayClient/Source \
+  Sources/AgentDeckRelayClient/Streaming
+rg -n 'RuntimeEnvelopeV2|SignedSealedBlobV1|rawEnvelope|sealedBlob' \
+  Sources/AgentDeckRelayClient/Source/{CatalogReducer,ConversationReducer,InboxReducer,RelayConversationResumeCoordinator,RelaySessionSource}.swift
+scripts/verify-agent-docs.sh
+git diff --check
+
+# 两笔 scoped commit 都必须在正式 index 上复核；禁止目录级 git add。
+# 第一笔暂存后传 p54_rust_manifest；提交并清空 index 后，第二笔传 Swift + docs manifest。
+verify_p54_staged_manifest() {
+  diff \
+    <(git diff --cached --name-only | sort -u) \
+    <(printf '%s\n' "$@" | sort -u)
+  git diff --cached --check
+}
+verify_p54_staged_manifest "${p54_rust_manifest[@]}"
+# verify_p54_staged_manifest "${p54_swift_manifest[@]}" "${p54_docs_manifest[@]}"
+```
+
+automatic contract 必须覆盖：五条近 128 MiB owner 与 8,192/+1 global seam；part/final/tombstone
+pre-allocation reserve 及全部 terminal release；10,000-event slow consumer、newest-one resource、512
+conversation queue、64/+1 observer admission、lag generation + snapshot/barrier；cold/warm resume；scope/multi-
+machine/shutdown join；outer→signature→replay→AEAD→Runtime→durable permit→reducer 顺序；forgery/rollback/
+bad tag 零进展；exact-next key update、two-slot partial activation、30 秒 deadline、semantic ACK/proof/rebind/
+reconnect；pending/live/historical request-route 唯一性、512/+1 cap，以及 cancel 无法安全注销时 exact generation
+teardown。最后 observer 退出必须完成 Runtime receipt、Relay outer unsubscribe 与 correlation retirement；同
+conversation replacement 在 single-flight retirement 返回前禁止且继续计容量。满 512 update queue 时 shutdown
+必须先 finish channel 解锁第 513 个 pending producer，再 teardown/join，并保留恰好 512 条已入队前缀。
+production pairing 必须在完整 durable staged promotion 后发送 byte-identical retriable receipt；marker 只有在
+matching `PairRouteClosed` 后 committed 可见。exact-correlated `relay.route.not_found` 仍必须保留
+responsePrepared + staged marker、零 committed mutation；marker-missing partial rollback 还必须覆盖 malformed 与
+foreign-promotion CounterGuard 的零 mutation 反例，且公开源码不得暴露裸 `public func promote(` 写旁路。
+
+Instruments 只做非门控 macOS smoke，不替代 10,000-event deterministic gate，也不产生可提交 artifact。
+2026-07-27 的 `Allocations` trace 启动 `dist/AgentDeck.app --selfcheck`，target exit 0、duration
+`2.639832s`，trace 为 `/tmp/agentdeck-p54-instruments.rt5Mo5/p54-agentdeck-selfcheck.trace`（约 7.5 MiB）。
+可用 `xcrun xctrace export --input <trace> --toc` 读回；`.trace` 必须留在 `/tmp`，不得加入 Git。
+
+**P5.4 automatic 收口证据（2026-07-27）：** 69-path Swift code/test candidate SHA-256 为
+`42f47dc2eecfcd0ca312b9178583246aad48b9f59d6413fc9814052cb7e1cd1c`；Rust/fixture candidate
+SHA-256 为 `4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f`。fresh discovery
+`225`，P5.4 warnings-as-errors `225/225`，RelayClient `429 executed / 4 entitlement SKIP / 0 failure`，
+strict target build PASS，完整 Swift `958 XCTest / 4 SKIP + 35 Swift Testing`，iOS Simulator `26/26`。
+首轮 Simulator 准确暴露 `URLFileProtection` 与 `FileProtectionType` raw-value alias 不同；production setter/
+hook 改为显式语义映射、readback 改为同类型比较后，macOS exact `14/14` 与 Simulator 全量重跑均通过。
+paired-store test 还把当前 `ADPR`/`ADPM` version byte 精确降为 v1，读回必须 `invalidRecord` 且
+Keychain mutation 为 0，锁定 pre-MVP hard cutover 的 fail-closed 行为。
+同一未变 Rust candidate 上的 `RUSTC_WRAPPER= cargo test --locked --quiet -- --test-threads=1` exit 0（CLI lib
+`199/199`、daemon discovery `1677`、daemon lib `1674 passed / 3 ignored`、Store 慢组 `81/81`、256 MiB
+慢项 `5/5`），Relay `server,tls`、cross-language crypto、四 schema、
+Clippy、fmt、network/no-net、local Runtime smoke、ephemeral selfcheck 与 diagnostics 均通过。提交拓扑固定为
+`34 Rust/fixture → 69 Swift + 6 docs` 的有序依赖栈：第一笔只承诺 Rust scoped-green，第二笔必须以前者为父，
+完整门禁与 109-path 证据只属于组合候选。P5.4 完成后
+P5 为 4/9；真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor、
+P5.5–P5.9 与 P5 Phase Exit 继续 `BLOCKED`/未完成。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -2821,6 +3074,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P5.1 shared SessionSource facade | 运行本页 test discovery、全包 warnings-as-errors focused `15/15`、strict target build、完整 Swift `557 XCTest + 35 Swift Testing`、iOS Simulator `21/21`、public import、Swift format、平台/fixture 泄漏、docs/diff 门禁。只证明 facade/typed state/receipt 与 Core←SessionSource←RelayClient←App 依赖图；旧 fixture 迁移、RelaySessionSource、bounded stream、Keychain/WSS、真实 iOS 与 P5 Phase Exit 均未完成，P5 当前只计 1/9 |
 | Relay Companion MVP P5.2 Keychain / crash-safe CryptoState | 运行本页七组 Swift storage/state/counter/replay/paired tests、strict RelayClient/完整 Swift、iOS storage focused/全量 Simulator、格式/secret/docs/diff 与双路终审。只证明 typed account、ADCS v1 sealed file、counter Pending→state→Stable、non-counter statePending exact commitment、4096 replay window 与 paired marker；SwiftPM `-34018` SecItem 和 Simulator 非真实 Complete readback 均明确保留为 production-signed/物理设备 BLOCKED。该 Task 收口时 P5 只计 2/9；后续 P5.3 已独立完成，RelaySessionSource 与 P5 Phase Exit 仍未完成 |
 | Relay Companion MVP P5.3 WSS / SPKI pin / per-connection transfer | 运行本页三组 focused、strict RelayClient/完整 Swift、iOS Simulator、Rust transfer/Runtime/crypto、cross-language、format/static/docs/diff 与独立终审。只证明 generation-scoped WSS、三种 TLS policy、bounded writer/incoming 与 per-connection assembler；P5.4 process-global 512 MiB/8,192 coordinator、RelaySessionSource、真实公网/物理设备与 P5 Phase Exit 均未完成，P5 当前只计 3/9 |
+| Relay Companion MVP P5.4 MachineConnection / bounded source | 2026-07-27 automatic Task complete；冻结 69-path Swift candidate `42f47dc2eecfcd0ca312b9178583246aad48b9f59d6413fc9814052cb7e1cd1c` 与 Rust candidate `4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f`，并以 34 Rust/fixture + 69 Swift + 6 docs 的 exact 109-path manifest 约束 `34 → 75` 有序提交栈；第一笔只承诺 Rust scoped-green，完整绿色证据属于组合候选。discovery/focused `225/225`、RelayClient `429/4 SKIP`、完整 Swift `958/4 SKIP + 35`、iOS `26/26`、完整 Rust/cross-language/static/docs/diff 与独立终审通过；历史 Step 2 RED 未保留且不伪造。只证明 automatic MachineConnection/key-sync、shared 512 MiB/8,192 budget、bounded broadcaster/reducers、RelaySessionSource 与 typed command/pairing；P5 为 4/9。真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor、P5.5–P5.9 与 P5 Phase Exit 继续 BLOCKED/未完成 |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## 协议 schema 漂移测试

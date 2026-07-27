@@ -8,6 +8,7 @@ public enum RelayClientKind: String, Codable, Sendable {
 }
 
 public enum PendingKeyStorePurpose: String, Codable, Sendable {
+  case recoveryIntent = "pending-pairing-recovery-intent.v1"
   case pairingRecord = "pending-pairing-record.v1"
   case deviceSignPrivateKey = "device-sign-private-key.v1"
   case deviceHPKEPrivateKey = "device-hpke-private-key.v1"
@@ -46,6 +47,13 @@ public struct KeyStoreKey: Hashable, Sendable, CustomDebugStringConvertible {
     installationID: UUID
   ) -> String {
     "\(clientKind.rawValue)/\(installationID.uuidString.lowercased())/"
+  }
+
+  public static func pendingMarkerPrefix(
+    clientKind: RelayClientKind,
+    installationID: UUID
+  ) -> String {
+    "pending/\(clientKind.rawValue)/\(installationID.uuidString.lowercased())/"
   }
 
   public static func pending(
@@ -181,6 +189,13 @@ public protocol KeyStore: Sendable {
 /// Keychain-native paired marker enumeration；不建立第二份可漂移 index。
 public protocol PairedMarkerListingKeyStore: KeyStore {
   func pairedCommitMarkerKeys(
+    clientKind: RelayClientKind,
+    installationID: UUID
+  ) async throws -> [KeyStoreKey]
+
+  /// Keychain-native pending recovery enumeration；只返回无 secret intent 与
+  /// pairing record marker，不把 private-key account 暴露成通用枚举面。
+  func pendingPairingRecoveryKeys(
     clientKind: RelayClientKind,
     installationID: UUID
   ) async throws -> [KeyStoreKey]

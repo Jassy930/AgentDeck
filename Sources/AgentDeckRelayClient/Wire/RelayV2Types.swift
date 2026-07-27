@@ -181,7 +181,8 @@ public enum RelayV2AuthProof: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: RelayJSONCodingKey.self)
         guard container.allKeys.count == 1, let variant = container.allKeys.first else {
             throw DecodingError.dataCorrupted(
-                .init(codingPath: decoder.codingPath, debugDescription: "AuthProof needs one variant")
+                .init(
+                    codingPath: decoder.codingPath, debugDescription: "AuthProof needs one variant")
             )
         }
         switch variant.stringValue {
@@ -192,12 +193,12 @@ public enum RelayV2AuthProof: Codable, Equatable, Sendable {
                 allowed: ["machine_route", "link_cert"]
             )
             let value = try container.decode(MachineLinkProofWire.self, forKey: variant)
-            self = .machineLink(machineRoute: value.machine_route, linkCert: value.link_cert)
+            self = .machineLink(machineRoute: value.machineRoute, linkCert: value.linkCert)
         case "device":
             let nestedDecoder = try container.superDecoder(forKey: variant)
             try rejectRelayUnknownKeys(nestedDecoder, allowed: ["relay_grant"])
             let value = try container.decode(DeviceProofWire.self, forKey: variant)
-            self = .device(relayGrant: value.relay_grant)
+            self = .device(relayGrant: value.relayGrant)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: variant,
@@ -212,12 +213,12 @@ public enum RelayV2AuthProof: Codable, Equatable, Sendable {
         switch self {
         case .machineLink(let machineRoute, let linkCert):
             try container.encode(
-                MachineLinkProofWire(machine_route: machineRoute, link_cert: linkCert),
+                MachineLinkProofWire(machineRoute: machineRoute, linkCert: linkCert),
                 forKey: relayKey("machineLink")
             )
         case .device(let relayGrant):
             try container.encode(
-                DeviceProofWire(relay_grant: relayGrant),
+                DeviceProofWire(relayGrant: relayGrant),
                 forKey: relayKey("device")
             )
         }
@@ -238,7 +239,9 @@ public enum RelayV2AcceptedRef: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: RelayJSONCodingKey.self)
         guard container.allKeys.count == 1, let variant = container.allKeys.first else {
             throw DecodingError.dataCorrupted(
-                .init(codingPath: decoder.codingPath, debugDescription: "AcceptedRef needs one variant")
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "AcceptedRef needs one variant")
             )
         }
         switch variant.stringValue {
@@ -248,21 +251,21 @@ public enum RelayV2AcceptedRef: Codable, Equatable, Sendable {
                 allowed: ["request_route"]
             )
             let value = try container.decode(RequestAcceptedWire.self, forKey: variant)
-            self = .request(requestRoute: value.request_route)
+            self = .request(requestRoute: value.requestRoute)
         case "streamFrame":
             try rejectRelayUnknownKeys(
                 container.superDecoder(forKey: variant),
                 allowed: ["stream_route", "stream_seq"]
             )
             let value = try container.decode(StreamAcceptedWire.self, forKey: variant)
-            self = .streamFrame(streamRoute: value.stream_route, streamSeq: value.stream_seq)
+            self = .streamFrame(streamRoute: value.streamRoute, streamSeq: value.streamSeq)
         case "pairFrame":
             try rejectRelayUnknownKeys(
                 container.superDecoder(forKey: variant),
                 allowed: ["pair_route"]
             )
             let value = try container.decode(PairAcceptedWire.self, forKey: variant)
-            self = .pairFrame(pairRoute: value.pair_route)
+            self = .pairFrame(pairRoute: value.pairRoute)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: variant,
@@ -277,17 +280,17 @@ public enum RelayV2AcceptedRef: Codable, Equatable, Sendable {
         switch self {
         case .request(let requestRoute):
             try container.encode(
-                RequestAcceptedWire(request_route: requestRoute),
+                RequestAcceptedWire(requestRoute: requestRoute),
                 forKey: relayKey("request")
             )
         case .streamFrame(let streamRoute, let streamSeq):
             try container.encode(
-                StreamAcceptedWire(stream_route: streamRoute, stream_seq: streamSeq),
+                StreamAcceptedWire(streamRoute: streamRoute, streamSeq: streamSeq),
                 forKey: relayKey("streamFrame")
             )
         case .pairFrame(let pairRoute):
             try container.encode(
-                PairAcceptedWire(pair_route: pairRoute),
+                PairAcceptedWire(pairRoute: pairRoute),
                 forKey: relayKey("pairFrame")
             )
         }
@@ -322,6 +325,7 @@ public enum RelayEndpointWireType: String, Sendable {
     case pairInvite = "PairInviteV1"
     case pairRequest = "PairRequestV1"
     case pairPending = "PairPendingV1"
+    case pairTerminal = "PairTerminalV1"
     case pairingControlEnvelope = "PairingControlEnvelopeV1"
     case pairResponse = "PairResponseV1"
     case pairResponseReceived = "PairResponseReceivedV1"
@@ -406,6 +410,31 @@ public struct RelayPairPendingV1: Codable, Sendable {
         try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
         let container = try decoder.container(keyedBy: CodingKeys.self)
         requestHash = try container.decode(Data.self, forKey: .requestHash)
+        signature = try container.decode(Data.self, forKey: .signature)
+    }
+}
+
+public enum RelayPairTerminalOutcomeV1: String, Codable, Sendable {
+    case canceled
+    case expired
+}
+
+public struct RelayPairTerminalV1: Codable, Sendable {
+    public var machineRoute: Data
+    public var requestHash: Data
+    public var outcome: RelayPairTerminalOutcomeV1
+    public var signature: Data
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case machineRoute, requestHash, outcome, signature
+    }
+
+    public init(from decoder: Decoder) throws {
+        try rejectRelayUnknownKeys(decoder, allowed: CodingKeys.all)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        machineRoute = try container.decode(Data.self, forKey: .machineRoute)
+        requestHash = try container.decode(Data.self, forKey: .requestHash)
+        outcome = try container.decode(RelayPairTerminalOutcomeV1.self, forKey: .outcome)
         signature = try container.decode(Data.self, forKey: .signature)
     }
 }
@@ -656,12 +685,14 @@ public enum RelayRuntimeInnerCursorV1: Codable, Sendable {
         case "conversation":
             try rejectRelayUnknownKeys(decoder, allowed: ["scope", "conversationId", "cursor"])
             self = .conversation(
-                conversationID: try container.decode(String.self, forKey: relayKey("conversationId")),
+                conversationID: try container.decode(
+                    String.self, forKey: relayKey("conversationId")),
                 cursor: try container.decode(StreamCursor.self, forKey: relayKey("cursor"))
             )
         default:
             throw DecodingError.dataCorrupted(
-                .init(codingPath: decoder.codingPath, debugDescription: "invalid inner cursor scope")
+                .init(
+                    codingPath: decoder.codingPath, debugDescription: "invalid inner cursor scope")
             )
         }
     }
@@ -732,6 +763,7 @@ public enum RelayEndpointPayloadV1: Sendable {
     case pairInvite(RelayPairInviteV1)
     case pairRequest(RelayPairRequestV1)
     case pairPending(RelayPairPendingV1)
+    case pairTerminal(RelayPairTerminalV1)
     case pairingControlEnvelope(RelayPairingControlEnvelopeV1)
     case pairResponse(RelayPairResponseV1)
     case pairResponseReceived(RelayPairResponseReceivedV1)
@@ -1033,7 +1065,8 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
             )
         case .authenticate(let proof, let signature):
             try container.encode("authenticate", forKey: .frameKind)
-            try container.encode(AuthenticateWire(proof: proof, signature: signature), forKey: .frame)
+            try container.encode(
+                AuthenticateWire(proof: proof, signature: signature), forKey: .frame)
         case .authenticated(let heartbeatIntervalSecs):
             try container.encode("authenticated", forKey: .frameKind)
             try container.encode(
@@ -1041,7 +1074,7 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
                 forKey: .frame
             )
         case .openPairRoute(let machineRoute, let pairRoute, let absoluteExpiryMs),
-             .pairRouteOpened(let machineRoute, let pairRoute, let absoluteExpiryMs):
+            .pairRouteOpened(let machineRoute, let pairRoute, let absoluteExpiryMs):
             let name = kind == 4 ? "openPairRoute" : "pairRouteOpened"
             try container.encode(name, forKey: .frameKind)
             try container.encode(
@@ -1054,7 +1087,8 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
             )
         case .pairData(let pairRoute, let sealedBlob):
             try container.encode("pairData", forKey: .frameKind)
-            try container.encode(PairDataWire(pairRoute: pairRoute, sealedBlob: sealedBlob), forKey: .frame)
+            try container.encode(
+                PairDataWire(pairRoute: pairRoute, sealedBlob: sealedBlob), forKey: .frame)
         case .closePairRoute(let machineRoute, let pairRoute):
             try container.encode("closePairRoute", forKey: .frameKind)
             try container.encode(
@@ -1063,7 +1097,8 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
             )
         case .pairRouteClosed(let pairRoute, let outcome):
             try container.encode("pairRouteClosed", forKey: .frameKind)
-            try container.encode(PairRouteClosedWire(pairRoute: pairRoute, outcome: outcome), forKey: .frame)
+            try container.encode(
+                PairRouteClosedWire(pairRoute: pairRoute, outcome: outcome), forKey: .frame)
         case .registerStream(let machineRoute, let streamRoute, let generation):
             try container.encode("registerStream", forKey: .frameKind)
             try container.encode(
@@ -1125,7 +1160,7 @@ public enum RelayV2FrameBody: Codable, Equatable, Sendable {
                 forKey: .frame
             )
         case .send(let deviceRoute, let requestRoute, let sealedBlob),
-             .reply(let deviceRoute, let requestRoute, let sealedBlob):
+            .reply(let deviceRoute, let requestRoute, let sealedBlob):
             try container.encode(kind == 16 ? "send" : "reply", forKey: .frameKind)
             try container.encode(
                 DirectedDataWire(
@@ -1345,7 +1380,9 @@ public struct RelayV2OutboundFrame: Sendable {
         control(.hello(RelayV2Hello(protocolVersion: protocolVersion)))
     }
 
-    public static func pairData(
+    /// JSON endpoint mirror 只供 wire fixture/parity tests；production pairing 必须使用
+    /// strict canonical binary carrier 的 typed factory，不能把 JSON bytes 发到 Rust endpoint。
+    static func fixturePairData(
         pairRoute: Data,
         payload: RelayEndpointPayloadV1
     ) throws -> Self {
@@ -1353,13 +1390,31 @@ public struct RelayV2OutboundFrame: Sendable {
         case .pairRequest, .pairingControlEnvelope, .pairResponse:
             break
         case .pairInvite, .pairPending, .pairResponseReceived, .deviceAuthorization,
-             .keyDirectory, .keyUpdate, .epochBarrier, .sealedPayload:
+            .pairTerminal, .keyDirectory, .keyUpdate, .epochBarrier, .sealedPayload:
             throw RelayWireCodecError.invalidValue(field: "PairData.payload")
         }
         return Self(
             body: .pairData(
                 pairRoute: pairRoute,
                 sealedBlob: try RelayV2JSONCodec.encodeEndpoint(payload)
+            )
+        )
+    }
+
+    static func pairData(_ carrier: OpaquePairRequestCarrier) -> Self {
+        Self(
+            body: .pairData(
+                pairRoute: carrier.pairRoute,
+                sealedBlob: carrier.canonicalBytes
+            )
+        )
+    }
+
+    static func pairData(_ carrier: OpaquePairResponseReceivedCarrier) -> Self {
+        Self(
+            body: .pairData(
+                pairRoute: carrier.pairRoute,
+                sealedBlob: carrier.canonicalBytes
             )
         )
     }
@@ -1427,8 +1482,12 @@ public struct RelayV2OutboundFrame: Sendable {
     }
 }
 
-private enum RelayV2SignedSealedBlobCodec {
+enum RelayV2SignedSealedBlobCodec {
     private static let domain = Data("AgentDeck/SealedBlobV1\0".utf8)
+    private static let formatVersion: UInt16 = 1
+    private static let nonceBytes = 12
+    private static let signatureBytes = 64
+    private static let minimumCiphertextBytes = 16
 
     static func remainingBudget(afterOuterBytes outerBytes: Int) throws -> Int {
         let (budget, overflow) = RelayWireCodecV2.maxFrameBytes.subtractingReportingOverflow(
@@ -1444,29 +1503,48 @@ private enum RelayV2SignedSealedBlobCodec {
         _ value: SignedSealedBlobV1,
         maxEncodedBytes: Int
     ) throws -> Data {
-        guard value.inner.formatVersion == 1 else {
+        guard maxEncodedBytes >= 0 else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
+        guard value.inner.formatVersion == formatVersion else {
             throw RelayWireCodecError.unsupportedVersion(value.inner.formatVersion)
         }
-        guard value.inner.nonce.count == 12 else {
+        guard value.inner.keyID.epoch > 0 else {
+            throw RelayWireCodecError.invalidValue(field: "keyID.epoch")
+        }
+        guard value.inner.keyEpoch == value.inner.keyID.epoch else {
+            throw RelayWireCodecError.invalidValue(field: "keyEpoch")
+        }
+        guard value.inner.keyDirectoryRevision > 0 else {
+            throw RelayWireCodecError.invalidValue(field: "keyDirectoryRevision")
+        }
+        guard value.inner.nonce.count == nonceBytes else {
             throw RelayWireCodecError.invalidLength(
                 field: "nonce",
-                expected: 12,
+                expected: nonceBytes,
                 actual: value.inner.nonce.count
             )
         }
-        guard value.signature.count == 64 else {
+        guard value.inner.ciphertext.count >= minimumCiphertextBytes else {
+            throw RelayWireCodecError.invalidValue(field: "ciphertext")
+        }
+        guard value.signature.count == signatureBytes else {
             throw RelayWireCodecError.invalidLength(
                 field: "signature",
-                expected: 64,
+                expected: signatureBytes,
                 actual: value.signature.count
             )
+        }
+        guard value.signature.contains(where: { $0 != 0 }) else {
+            throw RelayWireCodecError.invalidValue(field: "signature")
         }
 
         guard UInt32(exactly: value.inner.ciphertext.count) != nil else {
             throw RelayWireCodecError.lengthOutOfBounds
         }
 
-        let fixedCapacity = domain.count + 2 + 1 + 8 + 8 + 8 + 4 + 12 + 4 + 64
+        let fixedCapacity =
+            domain.count + 2 + 1 + 8 + 8 + 8 + 4 + nonceBytes + 4 + signatureBytes
         let (capacity, capacityOverflow) = fixedCapacity.addingReportingOverflow(
             value.inner.ciphertext.count
         )
@@ -1490,6 +1568,86 @@ private enum RelayV2SignedSealedBlobCodec {
         return output
     }
 
+    static func decode(
+        _ data: Data,
+        maxEncodedBytes: Int
+    ) throws -> SignedSealedBlobV1 {
+        guard maxEncodedBytes >= 0 else {
+            throw RelayWireCodecError.lengthOutOfBounds
+        }
+        guard data.count <= maxEncodedBytes else {
+            throw RelayWireCodecError.oversize
+        }
+
+        var reader = RelayBinaryReader(data)
+        guard try reader.raw(count: domain.count) == domain else {
+            throw RelayWireCodecError.badMagic
+        }
+        let decodedVersion = try reader.u16()
+        guard decodedVersion == formatVersion else {
+            throw RelayWireCodecError.unsupportedVersion(decodedVersion)
+        }
+
+        let purposeTag = try reader.u8()
+        let purpose: KeyPurpose
+        switch purposeTag {
+        case 0: purpose = .catalog
+        case 1: purpose = .conversationDEK
+        case 2: purpose = .deviceCommandTx
+        case 3: purpose = .deviceReplyTx
+        case let tag: throw RelayWireCodecError.invalidEnumTag(tag)
+        }
+
+        let keyIDEpoch = try reader.u64()
+        guard keyIDEpoch > 0 else {
+            throw RelayWireCodecError.invalidValue(field: "keyID.epoch")
+        }
+        let keyEpoch = try reader.u64()
+        guard keyEpoch == keyIDEpoch else {
+            throw RelayWireCodecError.invalidValue(field: "keyEpoch")
+        }
+        let keyDirectoryRevision = try reader.u64()
+        guard keyDirectoryRevision > 0 else {
+            throw RelayWireCodecError.invalidValue(field: "keyDirectoryRevision")
+        }
+
+        let nonce = try reader.bytes()
+        guard nonce.count == nonceBytes else {
+            throw RelayWireCodecError.invalidLength(
+                field: "nonce",
+                expected: nonceBytes,
+                actual: nonce.count
+            )
+        }
+        let ciphertext = try reader.bytes()
+        guard ciphertext.count >= minimumCiphertextBytes else {
+            throw RelayWireCodecError.invalidValue(field: "ciphertext")
+        }
+        let signature = try reader.raw(count: signatureBytes)
+        guard signature.contains(where: { $0 != 0 }) else {
+            throw RelayWireCodecError.invalidValue(field: "signature")
+        }
+        guard reader.isAtEnd else {
+            throw RelayWireCodecError.trailingBytes
+        }
+
+        let decoded = SignedSealedBlobV1(
+            inner: UnsignedSealedBlobV1(
+                formatVersion: decodedVersion,
+                keyID: KeyIDV1(purpose: purpose, epoch: keyIDEpoch),
+                keyEpoch: keyEpoch,
+                keyDirectoryRevision: keyDirectoryRevision,
+                nonce: nonce,
+                ciphertext: ciphertext
+            ),
+            signature: signature
+        )
+        guard try encode(decoded, maxEncodedBytes: maxEncodedBytes) == data else {
+            throw RelayWireCodecError.invalidValue(field: "signedSealedBlob")
+        }
+        return decoded
+    }
+
     private static func appendLengthPrefixed(
         _ value: Data,
         field: String,
@@ -1511,8 +1669,9 @@ private enum RelayV2SignedSealedBlobCodec {
 extension StreamCursor: Codable {
     public init(from decoder: Decoder) throws {
         if let single = try? decoder.singleValueContainer(),
-           let value = try? single.decode(String.self),
-           value == "beforeFirst" {
+            let value = try? single.decode(String.self),
+            value == "beforeFirst"
+        {
             self = .beforeFirst
             return
         }
@@ -1561,15 +1720,24 @@ private struct ChallengeWire: Codable {
     let connectionInstance: Data
     let challengeNonce: Data
 }
-private struct AuthenticateWire: Codable { let proof: RelayV2AuthProof; let signature: Data }
+private struct AuthenticateWire: Codable {
+    let proof: RelayV2AuthProof
+    let signature: Data
+}
 private struct AuthenticatedWire: Codable { let heartbeatIntervalSecs: UInt16 }
 private struct OpenPairRouteWire: Codable {
     let machineRoute: Data
     let pairRoute: Data
     let absoluteExpiryMs: UInt64
 }
-private struct PairDataWire: Codable { let pairRoute: Data; let sealedBlob: Data }
-private struct ClosePairRouteWire: Codable { let machineRoute: Data; let pairRoute: Data }
+private struct PairDataWire: Codable {
+    let pairRoute: Data
+    let sealedBlob: Data
+}
+private struct ClosePairRouteWire: Codable {
+    let machineRoute: Data
+    let pairRoute: Data
+}
 private struct PairRouteClosedWire: Codable {
     let pairRoute: Data
     let outcome: RelayV2PairRouteCloseOutcome
@@ -1590,8 +1758,15 @@ private struct SubscribeWire: Codable {
     let generation: Data
     let cursor: StreamCursor
 }
-private struct StreamIdentityWire: Codable { let streamRoute: Data; let generation: Data }
-private struct AckWire: Codable { let streamRoute: Data; let generation: Data; let upToSeq: UInt64 }
+private struct StreamIdentityWire: Codable {
+    let streamRoute: Data
+    let generation: Data
+}
+private struct AckWire: Codable {
+    let streamRoute: Data
+    let generation: Data
+    let upToSeq: UInt64
+}
 private struct GapWire: Codable {
     let streamRoute: Data
     let generation: Data
@@ -1639,13 +1814,44 @@ private struct PairingHelloWire: Codable {
     let pairRoute: Data
 }
 private struct MachineLinkProofWire: Codable {
-    let machine_route: Data
-    let link_cert: RelayV2SignedCertificate
+    let machineRoute: Data
+    let linkCert: RelayV2SignedCertificate
+
+    private enum CodingKeys: String, CodingKey {
+        case machineRoute = "machine_route"
+        case linkCert = "link_cert"
+    }
 }
-private struct DeviceProofWire: Codable { let relay_grant: RelayV2Grant }
-private struct RequestAcceptedWire: Codable { let request_route: Data }
-private struct StreamAcceptedWire: Codable { let stream_route: Data; let stream_seq: UInt64 }
-private struct PairAcceptedWire: Codable { let pair_route: Data }
+private struct DeviceProofWire: Codable {
+    let relayGrant: RelayV2Grant
+
+    private enum CodingKeys: String, CodingKey {
+        case relayGrant = "relay_grant"
+    }
+}
+private struct RequestAcceptedWire: Codable {
+    let requestRoute: Data
+
+    private enum CodingKeys: String, CodingKey {
+        case requestRoute = "request_route"
+    }
+}
+private struct StreamAcceptedWire: Codable {
+    let streamRoute: Data
+    let streamSeq: UInt64
+
+    private enum CodingKeys: String, CodingKey {
+        case streamRoute = "stream_route"
+        case streamSeq = "stream_seq"
+    }
+}
+private struct PairAcceptedWire: Codable {
+    let pairRoute: Data
+
+    private enum CodingKeys: String, CodingKey {
+        case pairRoute = "pair_route"
+    }
+}
 
 public enum RelayV2JSONCodec {
     public static func decodeFrame(_ data: Data) throws -> RelayV2Frame {
@@ -1659,7 +1865,8 @@ public enum RelayV2JSONCodec {
         }
         try exactKeys(body, allowed: ["frameKind", "frame"], path: "frame.body")
         guard let frameKind = body["frameKind"] as? String,
-              let payload = body["frame"] as? [String: Any] else {
+            let payload = body["frame"] as? [String: Any]
+        else {
             throw RelayWireCodecError.unknownKind(UInt16.max)
         }
         switch frameKind {
@@ -1676,9 +1883,9 @@ public enum RelayV2JSONCodec {
         case "routeAccepted":
             try exactKeys(payload, allowed: ["accepted"], path: "frame.body.frame")
             guard let accepted = payload["accepted"] as? [String: Any],
-                  accepted.count == 1,
-                  let variant = accepted.keys.first,
-                  let acceptedPayload = accepted[variant] as? [String: Any]
+                accepted.count == 1,
+                let variant = accepted.keys.first,
+                let acceptedPayload = accepted[variant] as? [String: Any]
             else {
                 throw RelayWireCodecError.unknownField("frame.body.frame.accepted")
             }
@@ -1807,9 +2014,9 @@ public enum RelayV2JSONCodec {
         case "authenticate":
             try exactKeys(payload, allowed: ["proof", "signature"], path: "frame.body.frame")
             guard let proof = payload["proof"] as? [String: Any],
-                  proof.count == 1,
-                  let variant = proof.keys.first,
-                  let proofPayload = proof[variant] as? [String: Any]
+                proof.count == 1,
+                let variant = proof.keys.first,
+                let proofPayload = proof[variant] as? [String: Any]
             else {
                 throw RelayWireCodecError.unknownField("frame.body.frame.proof")
             }
@@ -1895,6 +2102,8 @@ public enum RelayV2JSONCodec {
             payload = .pairRequest(try decoder.decode(RelayPairRequestV1.self, from: data))
         case .pairPending:
             payload = .pairPending(try decoder.decode(RelayPairPendingV1.self, from: data))
+        case .pairTerminal:
+            payload = .pairTerminal(try decoder.decode(RelayPairTerminalV1.self, from: data))
         case .pairingControlEnvelope:
             payload = .pairingControlEnvelope(
                 try decoder.decode(RelayPairingControlEnvelopeV1.self, from: data)
@@ -1929,6 +2138,7 @@ public enum RelayV2JSONCodec {
         case .pairInvite(let value): return try encoder.encode(value)
         case .pairRequest(let value): return try encoder.encode(value)
         case .pairPending(let value): return try encoder.encode(value)
+        case .pairTerminal(let value): return try encoder.encode(value)
         case .pairingControlEnvelope(let value): return try encoder.encode(value)
         case .pairResponse(let value): return try encoder.encode(value)
         case .pairResponseReceived(let value): return try encoder.encode(value)
@@ -1966,6 +2176,12 @@ public enum RelayV2JSONCodec {
             )
         case .pairPending:
             try exactKeys(object, allowed: ["requestHash", "signature"], path: path)
+        case .pairTerminal:
+            try exactKeys(
+                object,
+                allowed: ["machineRoute", "requestHash", "outcome", "signature"],
+                path: path
+            )
         case .pairingControlEnvelope:
             try exactKeys(object, allowed: ["formatVersion", "enc", "ciphertext"], path: path)
         case .pairResponse:
@@ -2027,7 +2243,7 @@ public enum RelayV2JSONCodec {
                 try exactKeys(cursor, allowed: ["at"], path: "\(path).streamCursor")
             }
             guard let innerCursor = object["innerCursor"] as? [String: Any],
-                  let scope = innerCursor["scope"] as? String
+                let scope = innerCursor["scope"] as? String
             else {
                 throw RelayWireCodecError.unknownField("\(path).innerCursor")
             }
@@ -2104,11 +2320,11 @@ public enum RelayV2JSONCodec {
                 field: "machineRootFingerprint"
             )
             guard Data(SHA256.hash(data: value.machineRootPubkey)) == value.machineRootFingerprint,
-                  value.expiresAtMs > 0,
-                  value.dataSignCert.certRole == .data,
-                  value.dataSignCert.generation > 0,
-                  value.dataSignCert.trustEpoch > 0,
-                  value.dataSignCert.notAfterMs != 0
+                value.expiresAtMs > 0,
+                value.dataSignCert.certRole == .data,
+                value.dataSignCert.generation > 0,
+                value.dataSignCert.trustEpoch > 0,
+                value.dataSignCert.notAfterMs != 0
             else {
                 throw RelayWireCodecError.invalidValue(field: "PairInviteV1")
             }
@@ -2125,6 +2341,10 @@ public enum RelayV2JSONCodec {
                 field: "deviceProofSignature"
             )
         case .pairPending(let value):
+            try requireNonzero(value.requestHash, count: 32, field: "requestHash")
+            try requireNonzero(value.signature, count: 64, field: "signature")
+        case .pairTerminal(let value):
+            try requireNonzero(value.machineRoute, count: 16, field: "machineRoute")
             try requireNonzero(value.requestHash, count: 32, field: "requestHash")
             try requireNonzero(value.signature, count: 64, field: "signature")
         case .pairingControlEnvelope(let value):
@@ -2232,9 +2452,9 @@ public enum RelayV2JSONCodec {
 
     private static func validatePairingDisplayName(_ value: String) throws {
         guard !value.isEmpty,
-              value.utf8.count <= 128,
-              value.trimmingCharacters(in: .whitespacesAndNewlines) == value,
-              !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+            value.utf8.count <= 128,
+            value.trimmingCharacters(in: .whitespacesAndNewlines) == value,
+            !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
         else {
             throw RelayWireCodecError.invalidValue(field: "machineDisplayName")
         }
@@ -2243,15 +2463,15 @@ public enum RelayV2JSONCodec {
     private static func validatePairingWSSURL(_ value: String) throws {
         let components = URLComponents(string: value)
         guard value.utf8.count <= 2 * 1024,
-              components?.scheme == "wss",
-              components?.host != nil,
-              components?.user == nil,
-              components?.password == nil,
-              components?.query == nil,
-              components?.fragment == nil,
-              components?.port != 0,
-              components?.percentEncodedPath == "/",
-              components?.string == value
+            components?.scheme == "wss",
+            components?.host != nil,
+            components?.user == nil,
+            components?.password == nil,
+            components?.query == nil,
+            components?.fragment == nil,
+            components?.port != 0,
+            components?.percentEncodedPath == "/",
+            components?.string == value
         else {
             throw RelayWireCodecError.invalidValue(field: "wssUrl")
         }
@@ -2276,16 +2496,16 @@ public enum RelayV2JSONCodec {
         try requireNonzero(value.rootKeyId, count: 16, field: "rootKeyId")
         try requireNonzero(value.signature, count: 64, field: "signature")
         guard !value.capabilities.isEmpty,
-              value.capabilities.count <= RelayAuthorizationCapabilityV1.allCases.count,
-              value.capabilities == value.capabilities.sorted(by: capabilityPrecedes),
-              Set(value.capabilities.map(\.rawValue)).count == value.capabilities.count,
-              !value.permissions.isEmpty,
-              value.permissions.count <= RelayAuthorizationPermissionV1.allCases.count,
-              value.permissions == value.permissions.sorted(by: permissionPrecedes),
-              Set(value.permissions.map(\.rawValue)).count == value.permissions.count,
-              value.permissions.allSatisfy({ permission in
-                  value.capabilities.contains(requiredCapability(for: permission))
-              })
+            value.capabilities.count <= RelayAuthorizationCapabilityV1.allCases.count,
+            value.capabilities == value.capabilities.sorted(by: capabilityPrecedes),
+            Set(value.capabilities.map(\.rawValue)).count == value.capabilities.count,
+            !value.permissions.isEmpty,
+            value.permissions.count <= RelayAuthorizationPermissionV1.allCases.count,
+            value.permissions == value.permissions.sorted(by: permissionPrecedes),
+            Set(value.permissions.map(\.rawValue)).count == value.permissions.count,
+            value.permissions.allSatisfy({ permission in
+                value.capabilities.contains(requiredCapability(for: permission))
+            })
         else {
             throw RelayWireCodecError.invalidValue(
                 field: "DeviceAuthorizationV1.authorization"
@@ -2433,7 +2653,7 @@ public enum RelayWireCodecV2 {
         case .authenticated(let heartbeatIntervalSecs):
             writer.u16(heartbeatIntervalSecs)
         case .openPairRoute(let machineRoute, let pairRoute, let absoluteExpiryMs),
-             .pairRouteOpened(let machineRoute, let pairRoute, let absoluteExpiryMs):
+            .pairRouteOpened(let machineRoute, let pairRoute, let absoluteExpiryMs):
             try writer.fixed(machineRoute, count: 16, field: "machineRoute")
             try writer.fixed(pairRoute, count: 16, field: "pairRoute")
             writer.u64(absoluteExpiryMs)
@@ -2476,7 +2696,7 @@ public enum RelayWireCodecV2 {
             try writer.fixed(generation, count: 16, field: "generation")
             writer.cursor(currentCursor)
         case .send(let deviceRoute, let requestRoute, let sealedBlob),
-             .reply(let deviceRoute, let requestRoute, let sealedBlob):
+            .reply(let deviceRoute, let requestRoute, let sealedBlob):
             try writer.fixed(deviceRoute, count: 16, field: "deviceRoute")
             try writer.fixed(requestRoute, count: 16, field: "requestRoute")
             try writer.bytes(sealedBlob, field: "sealedBlob")
@@ -3021,8 +3241,8 @@ private func rejectRelayUnknownKeys(_ decoder: Decoder, allowed: Set<String>) th
     }
 }
 
-private extension CaseIterable where Self: CodingKey {
-    static var all: Set<String> {
+extension CaseIterable where Self: CodingKey {
+    fileprivate static var all: Set<String> {
         Set(allCases.map(\.stringValue))
     }
 }

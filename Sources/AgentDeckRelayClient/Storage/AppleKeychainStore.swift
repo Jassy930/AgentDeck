@@ -193,6 +193,57 @@ public actor AppleKeychainStore: PairedMarkerListingKeyStore {
     return keys.sorted { $0.account < $1.account }
   }
 
+  public func pendingPairingRecoveryKeys(
+    clientKind: RelayClientKind,
+    installationID: UUID
+  ) async throws -> [KeyStoreKey] {
+    guard isNonzeroRelayInstallationID(installationID) else {
+      throw KeyStoreError.invalidAccount
+    }
+    let items = try allServiceItems()
+    let prefix = KeyStoreKey.pendingMarkerPrefix(
+      clientKind: clientKind,
+      installationID: installationID
+    )
+    let allowedSuffixes = [
+      "/\(PendingKeyStorePurpose.recoveryIntent.rawValue)",
+      "/\(PendingKeyStorePurpose.pairingRecord.rawValue)",
+    ]
+    var keys: [KeyStoreKey] = []
+    for item in items {
+      guard let account = item[kSecAttrAccount as String] as? String,
+        account.hasPrefix(prefix),
+        allowedSuffixes.contains(where: account.hasSuffix)
+      else {
+        continue
+      }
+      let key = try KeyStoreKey.validated(account: account)
+      _ = try Self.validate(item, for: key)
+      keys.append(key)
+    }
+    return keys.sorted { $0.account < $1.account }
+  }
+
+  private func allServiceItems() throws -> [[String: Any]] {
+    var query: [CFString: Any] = [
+      kSecClass: kSecClassGenericPassword,
+      kSecAttrService: Self.service,
+      kSecAttrSynchronizable: kSecAttrSynchronizableAny,
+      kSecReturnAttributes: true,
+      kSecReturnData: true,
+      kSecMatchLimit: kSecMatchLimitAll,
+    ]
+    #if os(macOS)
+      query[kSecUseDataProtectionKeychain] = true
+    #endif
+    let result = backend.copyMatching(query)
+    if result.status == errSecItemNotFound { return [] }
+    guard result.status == errSecSuccess else {
+      throw backendError(result.status)
+    }
+    return try Self.decodeItems(result.value)
+  }
+
   private func loadValidated(_ key: KeyStoreKey) throws -> Data? {
     var query = identityQuery(for: key)
     // 查询同 identity 下的所有同步策略，随后显式拒绝旧的 synchronizable item；

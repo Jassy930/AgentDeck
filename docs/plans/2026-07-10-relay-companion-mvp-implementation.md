@@ -3156,8 +3156,8 @@ agent docs、diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics �
 `quality` 均 Approved，P0/P1/P2=0。verifier 仍不支持 `p4`。production-signed Keychain/LaunchAgent、
 真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与 destructive purge 继续保持 post-MVP
 `BLOCKED`；静态 runner 仍只输出 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不生成真实证据。
-P5.1 shared facade、P5.2 crash-safe client storage 与 P5.3 WSS/pin/per-connection transfer primitive 已于
-后续完成；P5/P6 当前为 3/9、0/4。
+P5.1 shared facade、P5.2 crash-safe client storage、P5.3 WSS/pin/per-connection transfer primitive 与
+P5.4 MachineConnection/bounded source automatic Task 已于后续完成，P5/P6 当前进度为 4/9、0/4。
 
 ---
 
@@ -3165,8 +3165,8 @@ P5.1 shared facade、P5.2 crash-safe client storage 与 P5.3 WSS/pin/per-connect
 
 > **执行前审计（2026-07-20）：0/9 Task 完成。** 当前只有 Relay crypto/wire、P3.9 本机 Runtime 与
 > fixture UI 基线；P5.1–P5.9 production source、真实 Simulator Relay E2E 与 post-MVP slot runner 均未实现。
-> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-26）：P5.1–P5.3 已完成，
-> P5 为 3/9；P5.4–P5.9 与 P5 Phase Exit 仍未完成。**
+> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-27）：P5.1–P5.4 automatic
+> Task 已完成，P5 为 4/9。P5.5–P5.9 与 P5 Phase Exit 仍未完成。**
 
 ### Task P5.1：建立 AgentDeckSessionSource target 与强类型 facade
 
@@ -3297,12 +3297,16 @@ tombstone owner 归 P5.4 shared connection coordinator，本项不宣称 global 
 ### Task P5.4：实现 MachineConnection、bounded broadcaster 与 RelaySessionSource
 
 **Files:**
-- Create: `Sources/AgentDeckRelayClient/Connection/{MachineConnection,MachineConnectionStateMachine}.swift`
+- Create: `Sources/AgentDeckRelayClient/Connection/{MachineConnection,MachineConnectionStateMachine,MachineConnectionUpdates,MachineRequestCorrelation,ProductionMachineConnectionVerifiedIngress}.swift`
 - Create: `Sources/AgentDeckRelayClient/Transfer/TransferAssemblyBudgetCoordinator.swift`
-- Create: `Sources/AgentDeckRelayClient/Crypto/{MachineDataVerifier,DeviceRequestSigner}.swift`
+- Create: `Sources/AgentDeckRelayClient/Crypto/{MachineDataVerifier,MachineTerminalVerifier,DeviceRequestSigner,KeyControlCodec,KeyDirectoryVerifier,KeyLifecycleProofs,KeyUpdateSetVerifier,PairRequestCrypto,PairResponseCrypto,PairTerminalVerifier,RelayCredentials}.swift`
 - Create: `Sources/AgentDeckRelayClient/Streaming/BoundedBroadcaster.swift`
-- Create: `Sources/AgentDeckRelayClient/Source/{RelaySessionSource,CatalogReducer,ConversationReducer,InboxReducer}.swift`
-- Create: `Tests/AgentDeckRelayClientTests/{MachineDataVerifierTests,DeviceRequestSignerTests,BoundedBroadcasterTests,MachineConnectionTests,RelaySessionSourceTests,RelayResumeTests}.swift`
+- Create: `Sources/AgentDeckRelayClient/Source/{RelaySessionSource,CatalogReducer,ConversationReducer,InboxReducer,RelayConversationResumeCoordinator,RelayRuntimeCommandClient,ProductionRelayPairingCommandHandler}.swift`
+- Create: `Sources/AgentDeckRelayClient/Storage/{PairingPromotionBuilder,PendingPairingStore}.swift`
+- Modify: Core Runtime codec 与 RelayClient canonical crypto/storage/transfer/transport/wire 的必要接线，以及对应 tests。
+- Test: production ingress/correlation/key lifecycle/pairing/source/resume/global budget 等精确 suites；69-path
+  Swift strict-format manifest 以 `docs/QUALITY.md` 的 P5.4 小节为唯一门禁，不得用整个 `Sources`/`Tests`
+  目录替代。
 
 **Source scope:**
 ```swift
@@ -3310,12 +3314,75 @@ public enum RelaySourceScope: Sendable { case allPairedMachines; case machine(St
 public actor RelaySessionSource: SessionSource { /* one MachineConnection per paired machine */ }
 ```
 
-- [ ] Step 1: 写source/auth tests。入站固定顺序`outer bounds/domain/trust/serial/revision → MachineDataSign TBS verify → replay tuple → AEAD open → Runtime decode → reducer`；出站DeviceRequestSigner固定`Runtime encode → AEAD → outer-bound TBS → DeviceSign`。forged event、lower revision、unknown higher revision/key-sync exhaustion、bad AAD/tag均不得推进cursor/reducer；PairPending映射waitingForLocalConfirmation，signed canceled/expired为terminal，PairResponseReceived必须在本地paired record原子提升后发送且exact retry。resource stream`.bufferingNewest(1)`，conversation 512；drop通过`ConversationUpdate.connectionState(.lagged(reason: .bufferDropped))`轮换内部generation并snapshot/barrier，但用户observation stream保持存活；cold process launch因不存transcript必须先daemon snapshot/barrier，再增量resume。revoked/incompatible/securityError才fatal。另以 process-scoped `TransferAssemblyBudgetCoordinator` 覆盖全部 `MachineConnection`：parts 缓存和 final assembly 双份峰值都必须在分配前原子预留，global 上限为 512 MiB；completed tombstone 在写入前预留，global 上限为 8,192。至少用 5 条各逼近 128 MiB 的 connection 与 8,192/+1 seam 证明跨连接 fail-close、no-evict 与完整释放。
-- [ ] Step 2: 运行四套tests。 Expected: FAIL，MachineConnection/RelaySessionSource不存在。
-- [ ] Step 3: 实现MachineDataVerifier、DeviceRequestSigner、connection supervisor、shared transfer budget coordinator、bounded broadcaster、reducers与source。MachineDataVerifier必须把SignedSealedBlobV1验成VerifiedSealedBlobV1后才允许AEAD open；DeviceRequestSigner只能发送SignedSealedBlobV1。pair返回PairingProgress stream，持久化paired record后以DeviceSign发送/重试PairResponseReceived。只有签名/AEAD/inner验证完成后才能持久化cursor/revision；exact duplicate再按eventId去重；offline send立即typed failure。shared coordinator 必须在 part/final assembly/tombstone allocation 之前 reserve，并在 complete、validation/hash/length failure、TTL、disconnect、reset 与 owner teardown 的所有 terminal 路径 exact release；cap 满时拒绝 offending transfer/completion，禁止 post-hoc 统计、临时超配或驱逐 TTL 内 tombstone。
-- [ ] Step 4: 重跑tests并做10,000 events慢消费者压力、前后台与kill/relaunch恢复。 Expected: 无静默丢失/无无界内存；lag只重建内部generation，外层observation继续；冷启动不会从非零cursor拼出不完整transcript；伪造frame不改变任何state。
-- [ ] Step 5: 运行Swift tests和Instruments非门控内存上限smoke。
-- [ ] Step 6: 提交。 `git add Sources/AgentDeckRelayClient Tests/AgentDeckRelayClientTests && git commit -m "feat(swift): 建立 RelaySessionSource 与有界状态流"`
+**当前 key-sync 实现边界（2026-07-27，automatic complete）：** `KeyDirectoryV1` verifier 服务 pairing
+bootstrap/cold-open，并在交付 opened capability 前精确核对 roster、epoch 与 conversation route；production
+live rotation 只允许逐项验证并 durable stage 已签名的 `KeyUpdateSetV1`，再由 exact
+`DeviceEpochBarrierV1` 在 committed cut 激活对应 slot。catalog/conversation 两 slot 可部分激活，未到 barrier
+的 slot 继续 staged；affected stream 单独 pause/recover。30 秒 absolute deadline、semantic
+`StreamAppliedAck`→Relay outer ACK 顺序、reconnect durable proof recovery、physical rebind、exact predecessor
+alias、request/proof reservation 与 512 control-route cap 均已接入 production ingress。legacy full-directory
+durable seam 只保留 repository compatibility，并与 production live ingress 隔离；proof alias 不得打开普通
+rollback data。
+
+**PairTerminal daemon 前置硬化（2026-07-26，独立 candidate）：** 不提升 SQLite schema；request-bound
+cancel/expiry 先原子提交 winner receipt 与 `ClosePairRoute` outbox，再由 authenticated pairing record 重建
+exact `PairTerminal` TBS、当前 Data certificate 与 DeviceHPKE recipient。Runtime DB 密钥通过用途隔离 PRF
+绑定 database、pairing、recipient 和完整 TBS，派生可重放的一次性 HPKE seed，关闭“seal 已完成但 carrier
+尚未 COMMIT”真实崩溃窗口；seed 只进入精确版本锁定、不可复制的 `OneShotHpkeSeedRng` owner。该 owner
+只接受一次 32-byte IKM；错误长度、word API 或重复请求都触发 typed contract violation 并丢弃 artifact，未消费
+与已消费 owner 均擦除 seed。preparation 只能 move 唯一 seed owner；seed 消费后才允许复制不含 secret 的 identity/
+frozen carrier metadata 用于 COMMIT-unknown retry。carrier durable 后
+必须依次完成 `PairData` writer flush、`ClosePairRoute`，两帧由同一 supervisor command 顺序写入，reader 只在
+closing binding 安装后恢复；任何 writer outcome-unknown 都不得越过 Close。Relay Error 以 exact canonical
+frame SHA-256 写入 `inReplyTo`，daemon 只对 current generation、exact durable TerminalData、closing route 的
+一次 `relay.route.not_found` 做内部收敛，随后继续接受 matching `Closed` / `AlreadyAbsent`；错 hash、普通
+PairData、其他 code 或重复 Error 均保持 fail-close。actor 故障切点、production Store post-grant revocation
+组合测试和真实 DirectTLS Relay 的 requester-offline / Close-ACK-lost 两个 cut 均要求 byte-exact readback；
+组合测试以同一 future 的 producer/receiver barrier 消除全包调度 timeout，不延长产品 deadline。本切片不
+代表 `MachineConnection`、`RelaySessionSource` 或 P5.4 完成。
+
+**paired record hard cutover：** P5.4 为 cold-open 审计补入 MachineRoot public key 与 Data certificate，内部
+`ADPR`/`ADPM` codec 因此固定升为 version 2。version 1 没有可安全重建这些信任材料的来源，只能
+fail-closed，禁止用 fingerprint/grant 猜测迁移。该格式仅存在于尚未经 P5.6 真实 pairing 入口发布的 pre-MVP
+developer artifact；P5.6 首次发布前必须重新冻结正式 migration/upgrade contract。
+
+**pairing visibility gate：** marker phase 保持 committed=0、cleanup=1，并新增 staged=2。PairResponse 后只写
+durable staged marker；`list/load/openConnectionMaterial` 在 matching `PairRouteClosed` 前都不可见，Close readback
+后才 exact-CAS 为 committed。exact-correlated `relay.route.not_found` 也可能来自 daemon 离线，不能证明 durable
+receipt delivery，必须保留 responsePrepared + staged marker。完整 marker 可跨 invite TTL 保留并 exact retry；
+daemon 的 Delivered grant 不参加 TTL sweep，因此无 Close 证明时既不能开放连接，也不能删除 credential。
+committed promotion carrier/裸 `promote` 写入口必须保持 module-internal；marker-missing partial rollback 在删除
+前必须审计 CounterGuard 的 promotion ID、state 与 bootstrap commitment 绑定。requestPrepared 仍按绝对 expiry
+清理，合法 partial promotion 仍精确回滚。
+
+- [x] Step 1: 写source/auth tests。入站固定顺序`outer bounds/domain/trust/serial/revision → MachineDataSign TBS verify → replay tuple → AEAD open → Runtime decode → reducer`；出站DeviceRequestSigner固定`Runtime encode → AEAD → outer-bound TBS → DeviceSign`。forged event、lower revision、unknown higher revision/key-sync exhaustion、bad AAD/tag均不得推进cursor/reducer；PairPending映射waitingForLocalConfirmation，signed canceled/expired为terminal，PairResponseReceived必须在完整本地paired record durable staged 后发送且exact retry，并仅在 Close 证实后 committed 可见。resource stream`.bufferingNewest(1)`，conversation 512；drop通过`ConversationUpdate.connectionState(.lagged(reason: .bufferDropped))`轮换内部generation并snapshot/barrier，但用户observation stream保持存活；cold process launch因不存transcript必须先daemon snapshot/barrier，再增量resume。最后 observer 退出必须完成 Runtime/Relay unsubscribe 和 correlation retirement，返回前同 conversation replacement 禁止且继续计容量。revoked/incompatible/securityError才fatal。另以 process-scoped `TransferAssemblyBudgetCoordinator` 覆盖全部 `MachineConnection`：parts 缓存和 final assembly 双份峰值都必须在分配前原子预留，global 上限为 512 MiB；completed tombstone 在写入前预留，global 上限为 8,192。至少用 5 条各逼近 128 MiB 的 connection 与 8,192/+1 seam 证明跨连接 fail-close、no-evict 与完整释放。
+- [x] Step 2: 原计划要求先运行四套 tests 得到历史 RED；本次从已有大型 WIP 接管时没有保留该 RED transcript，禁止事后伪造。替代证据固定为 current-tree test discovery、逐 suite fresh coverage 与完整 target/package fresh rerun；最终计数在冻结候选后回填。
+- [x] Step 3: 实现MachineDataVerifier、DeviceRequestSigner、connection supervisor、shared transfer budget coordinator、bounded broadcaster、reducers与source。MachineDataVerifier必须把SignedSealedBlobV1验成VerifiedSealedBlobV1后才允许AEAD open；DeviceRequestSigner只能发送SignedSealedBlobV1。pair返回PairingProgress stream，先持久化完整 staged paired record，再以DeviceSign发送/重试PairResponseReceived；只有 matching terminal proof 才提升 committed。只有签名/AEAD/inner验证完成后才能持久化cursor/revision；exact duplicate再按eventId去重；offline send立即typed failure。shared coordinator 必须在 part/final assembly/tombstone allocation 之前 reserve，并在 complete、validation/hash/length failure、TTL、disconnect、reset 与 owner teardown 的所有 terminal 路径 exact release；cap 满时拒绝 offending transfer/completion，禁止 post-hoc 统计、临时超配或驱逐 TTL 内 tombstone。
+- [x] Step 4: 重跑tests并做10,000 events慢消费者压力、前后台与kill/relaunch恢复。 Expected: 无静默丢失/无无界内存；lag只重建内部generation，外层observation继续；冷启动不会从非零cursor拼出不完整transcript；伪造frame不改变任何state。另以 512 次顺序 observer 退出证明 unsubscribe 不泄漏 binding，并以真实 512 满 update queue + 第 513 个 pending send 证明 shutdown 先 finish channel、不会 join 死锁或越界交付。
+- [x] Step 5: 运行Swift tests和Instruments非门控内存上限smoke。2026-07-27 的 Allocations smoke 启动 `dist/AgentDeck.app --selfcheck`，exit 0、duration 2.639832 秒；7.5 MiB trace 只保存在 `/tmp/agentdeck-p54-instruments.rt5Mo5/p54-agentdeck-selfcheck.trace`，不纳入提交，也不作为真实 Companion/公网或物理设备性能结论。
+- [x] Step 6: 在 fresh 总计数、最终 diff 与独立终审读回后，严格使用 `docs/QUALITY.md` 的 34-path
+  Rust/fixture、69-path Swift 与 6-path docs manifest；三组并集必须精确等于 109-path 工作集。第一笔只暂存
+  34-path PairTerminal/Rust hardening，执行 staged-name diff 与 `git diff --cached --check` 后提交，且只承诺 Rust
+  scoped-green；清空 index 后，第二笔只暂存 69 Swift + 6 docs，同样读回 cached diff，并必须以前一提交为父。
+  完整绿色证据只属于 `34 → 75` 组合候选。禁止 `git add Sources/AgentDeckRelayClient`、
+  `git add Tests/AgentDeckRelayClientTests` 或 `git add .`。第二笔提交固定为
+  `git commit -m "feat(swift): 建立 RelaySessionSource 与有界状态流"`。
+
+**P5.4 automatic 收口证据（2026-07-27）：** production ingress 已完成 two-slot partial activation、
+durable semantic ACK/proof recovery、physical rebind/reconnect、request/control route reservation、512/+1 cap、
+generation teardown 与 pairing promotion/retry；source/global budget/broadcaster/command/cold resume 均有当前树
+deterministic coverage。冻结 69-path Swift candidate
+`42f47dc2eecfcd0ca312b9178583246aad48b9f59d6413fc9814052cb7e1cd1c` 上，discovery 与 P5.4
+warnings-as-errors 均为 `225/225`，`ProductionMachineConnectionVerifiedIngressTests` `25/25`，RelayClient
+`429 executed / 4 entitlement SKIP / 0 failure`，完整 Swift `958 XCTest / 4 SKIP + 35 Swift Testing`，
+iOS Simulator `26/26`。首轮 Simulator 暴露 file-protection 两种 Foundation 类型的 raw-value alias 差异，
+改为显式语义映射后 macOS exact `14/14` 与 Simulator 全量重跑通过；paired-store 又以 v1 version byte
+负例锁定 `invalidRecord` 与零 Keychain mutation。同一 Rust candidate
+`4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f` 上完整 `cargo test --locked`
+exit 0，Rust/cross-language/static gates 全绿。提交按 `34 Rust/fixture → 69 Swift + 6 docs` 有序堆叠；第一笔
+只承诺 Rust scoped-green，完整门禁属于第二笔落地后的组合候选。历史 Step 2 RED 未保留且不伪造。P5 为 4/9，P5.5–P5.9
+与 P5 Phase Exit 继续未完成。真实公网 WSS、production-signed Data Protection Keychain、物理 iPhone、
+第二台 Mac与真实 Codex/Claude Code vendor 全部继续 post-MVP `BLOCKED`。
 
 ### Task P5.5：迁移 Fixture 与 iOS ViewModel 到真实 receipt 语义
 

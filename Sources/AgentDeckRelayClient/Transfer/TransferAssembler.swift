@@ -66,8 +66,13 @@ public enum TransferAssemblyProgress: Sendable {
 /// 单个 Relay connection generation 拥有的 compact transfer 纯状态机。
 ///
 /// 调用方先使用 `RuntimeWireCodec.decodeTransferCarrier` 解码 `ADRT1`，本类型只负责
-/// binding、TTL、内存预算、幂等和完整 SHA-256。connection 断开时必须调用 `reset()`。
-public struct TransferAssembler: Sendable {
+/// binding、TTL、内存预算、幂等和完整 SHA-256。connection 断开时应立即调用
+/// `reset()`，不应把 `deinit` 兜底当作正常 disconnect/TTL 清理机制。
+///
+/// assembler 持有 process-global coordinator reservation，因此必须保持单 owner。
+/// `~Copyable` 禁止 partial state 被复制后双重推进或 reset；`deinit` 则保证
+/// owner 未走显式 disconnect/reset 时仍会释放 exact scope 预算。
+public struct TransferAssembler: ~Copyable, Sendable {
   public static let maximumActiveTransfers = 64
   public static let maximumReassemblyBytes: UInt64 = 128 * 1024 * 1024
   public static let transferTTLMilliseconds: UInt64 = 300_000
@@ -78,17 +83,34 @@ public struct TransferAssembler: Sendable {
   private let ttlMilliseconds: UInt64
   private let maxCompletedTombstones: Int
   private let scope: TransferAssemblyScope
+  private let budgetCoordinator: TransferAssemblyBudgetCoordinator
 
   private var active: [RuntimeTransferID: ActiveTransfer] = [:]
   private var completed: [RuntimeTransferID: CompletedTransfer] = [:]
   private var completedOrder: [RuntimeTransferID] = []
   private(set) var bufferedBytes: UInt64 = 0
 
+  /// 使用 process-global shared coordinator 的 production initializer。
+  /// owner 必须在 exact generation disconnect/reset 时调用 `reset(scope:)`；
+  /// 只有 owner teardown 的异常路径才依赖 `deinit` 同步兜底。
   public init(scope: TransferAssemblyScope) {
+    self.init(scope: scope, budgetCoordinator: .shared)
+  }
+
+  init(
+    scope: TransferAssemblyScope,
+    budgetCoordinator: TransferAssemblyBudgetCoordinator,
+    ttlMilliseconds: UInt64 = Self.transferTTLMilliseconds
+  ) {
+    precondition(
+      ttlMilliseconds > 0
+        && ttlMilliseconds <= Self.transferTTLMilliseconds
+    )
     self.scope = scope
+    self.budgetCoordinator = budgetCoordinator
     maxActiveTransfers = Self.maximumActiveTransfers
     maxReassemblyBytes = Self.maximumReassemblyBytes
-    ttlMilliseconds = Self.transferTTLMilliseconds
+    self.ttlMilliseconds = ttlMilliseconds
     maxCompletedTombstones = Self.maximumCompletedTombstones
   }
 
@@ -97,6 +119,7 @@ public struct TransferAssembler: Sendable {
       connectionID: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)),
       generation: RelayTransportGeneration(rawValue: 1)
     )
+    budgetCoordinator = TransferAssemblyBudgetCoordinator()
     maxActiveTransfers = Self.maximumActiveTransfers
     maxReassemblyBytes = Self.maximumReassemblyBytes
     ttlMilliseconds = Self.transferTTLMilliseconds
@@ -117,10 +140,15 @@ public struct TransferAssembler: Sendable {
       connectionID: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)),
       generation: RelayTransportGeneration(rawValue: 1)
     )
+    budgetCoordinator = TransferAssemblyBudgetCoordinator()
     self.maxActiveTransfers = maxActiveTransfers
     self.maxReassemblyBytes = maxReassemblyBytes
     self.ttlMilliseconds = ttlMilliseconds
     self.maxCompletedTombstones = maxCompletedTombstones
+  }
+
+  deinit {
+    budgetCoordinator.releaseAll(scope: scope)
   }
 
   var activeTransferCount: Int { active.count }
@@ -191,7 +219,8 @@ public struct TransferAssembler: Sendable {
         binding: binding,
         startedAtMS: nowMS,
         parts: [:],
-        bufferedBytes: 0
+        bufferedBytes: 0,
+        partReservation: nil
       )
     }
 
@@ -209,6 +238,19 @@ public struct TransferAssembler: Sendable {
     guard !transferOverflow, transferBytes <= current.binding.totalBytes else {
       dropActive(transferID)
       throw TransferAssemblerError.hashMismatch
+    }
+
+    do {
+      current.partReservation = try budgetCoordinator.reservePartBytes(
+        scope: scope,
+        reservation: current.partReservation,
+        additionalBytes: incomingBytes
+      )
+    } catch {
+      if active[transferID] != nil {
+        dropActive(transferID)
+      }
+      throw error
     }
 
     current.parts[carrier.transfer.partIndex] = carrier.transfer.part
@@ -233,33 +275,72 @@ public struct TransferAssembler: Sendable {
       dropActive(transferID)
       throw TransferAssemblerError.reassemblyFull
     }
+    let assemblyReservation: TransferAssemblyByteReservation
+    do {
+      assemblyReservation = try budgetCoordinator.reserveAssemblyBytes(
+        scope: scope,
+        bytes: assemblyBytes
+      )
+    } catch {
+      dropActive(transferID)
+      throw error
+    }
     bufferedBytes = peakBytes
+    defer {
+      releaseAssembly(bytes: assemblyBytes)
+      budgetCoordinator.release(assemblyReservation)
+    }
 
     var assembled = Data()
     assembled.reserveCapacity(Int(assemblyBytes))
     for index in 0..<current.binding.partCount {
       guard let bytes = current.parts[index] else {
         dropActive(transferID)
-        releaseAssembly(bytes: assemblyBytes)
         throw TransferAssemblerError.hashMismatch
       }
       assembled.append(bytes)
     }
-    let partHashes = current.parts.mapValues(Self.sha256)
-    dropActive(transferID)
-    releaseAssembly(bytes: assemblyBytes)
 
     guard Self.sha256(assembled) == current.binding.totalSHA256 else {
+      dropActive(transferID)
       throw TransferAssemblerError.hashMismatch
     }
-    try rememberCompleted(
-      transferID: transferID,
-      value: CompletedTransfer(
-        binding: current.binding,
-        partHashes: partHashes,
-        completedAtMS: nowMS
+
+    guard completed.count < maxCompletedTombstones else {
+      dropActive(transferID)
+      throw TransferAssemblerError.reassemblyFull
+    }
+    let tombstoneReservation: TransferAssemblyTombstoneReservation
+    do {
+      tombstoneReservation = try budgetCoordinator.reserveTombstone(scope: scope)
+    } catch {
+      dropActive(transferID)
+      throw error
+    }
+    var tombstoneCommitted = false
+    defer {
+      if !tombstoneCommitted {
+        budgetCoordinator.release(tombstoneReservation)
+      }
+    }
+
+    let partHashes = current.parts.mapValues(Self.sha256)
+    do {
+      try rememberCompleted(
+        transferID: transferID,
+        value: CompletedTransfer(
+          binding: current.binding,
+          partHashes: partHashes,
+          completedAtMS: nowMS,
+          tombstoneReservation: tombstoneReservation
+        )
       )
-    )
+      tombstoneCommitted = true
+    } catch {
+      dropActive(transferID)
+      throw error
+    }
+    dropActive(transferID)
     return .complete(
       TransferAssembly(
         messageID: current.binding.messageID,
@@ -276,11 +357,33 @@ public struct TransferAssembler: Sendable {
     reset()
   }
 
+  /// Source 丢弃尚未提交 reducer/cursor 的完整 transfer 时，精确释放 tombstone，
+  /// 允许 Relay 对同一 authenticated parts 做一次完整重放。其他 active/completed
+  /// transfer 不受影响。
+  mutating func discardCompleted(
+    transferID: RuntimeTransferID,
+    scope expectedScope: TransferAssemblyScope
+  ) throws {
+    guard expectedScope == scope else { throw TransferAssemblerError.staleScope }
+    guard let removed = completed.removeValue(forKey: transferID) else { return }
+    completedOrder.removeAll { $0 == transferID }
+    budgetCoordinator.release(removed.tombstoneReservation)
+  }
+
   mutating func reset() {
+    for value in active.values {
+      if let reservation = value.partReservation {
+        budgetCoordinator.release(reservation)
+      }
+    }
+    for value in completed.values {
+      budgetCoordinator.release(value.tombstoneReservation)
+    }
     active.removeAll(keepingCapacity: false)
     completed.removeAll(keepingCapacity: false)
     completedOrder.removeAll(keepingCapacity: false)
     bufferedBytes = 0
+    budgetCoordinator.releaseAll(scope: scope)
   }
 
   /// 供 connection owner 的单调 timer 调用；即使 Relay 静默也会在 absolute TTL
@@ -294,6 +397,35 @@ public struct TransferAssembler: Sendable {
     return sweepExpired(nowMS: nowMS)
   }
 
+  /// generation owner 用它把唯一 timer 安装到当前最早 absolute expiry。active parts 与
+  /// completed tombstone 共用同一 TTL；空状态返回 `nil`。
+  func nextAbsoluteExpiryMS(
+    scope expectedScope: TransferAssemblyScope
+  ) throws -> UInt64? {
+    guard expectedScope == scope else { throw TransferAssemblerError.staleScope }
+    return nextAbsoluteExpiryMS()
+  }
+
+  func nextAbsoluteExpiryMS() -> UInt64? {
+    let configuredTTL = ttlMilliseconds
+    var earliest: UInt64?
+    for value in active.values {
+      let expiry = Self.absoluteExpiryMS(
+        after: value.startedAtMS,
+        ttlMilliseconds: configuredTTL
+      )
+      earliest = earliest.map { min($0, expiry) } ?? expiry
+    }
+    for value in completed.values {
+      let expiry = Self.absoluteExpiryMS(
+        after: value.completedAtMS,
+        ttlMilliseconds: configuredTTL
+      )
+      earliest = earliest.map { min($0, expiry) } ?? expiry
+    }
+    return earliest
+  }
+
   @discardableResult
   mutating func sweepExpired(nowMS: UInt64) -> [RuntimeTransferID] {
     let expiredActive = active.compactMap { transferID, value in
@@ -303,14 +435,18 @@ public struct TransferAssembler: Sendable {
       dropActive(transferID)
     }
 
-    while let oldestID = completedOrder.first {
-      guard let tombstone = completed[oldestID] else {
-        completedOrder.removeFirst()
-        continue
+    // `clock` 可能回拨，completedAtMS 不保证和 insertion order 同调；固定上界只有
+    // 256，直接扫描可避免较晚插入但已到期的 tombstone 被队首永久阻塞。
+    let expiredCompleted = completed.compactMap { transferID, value in
+      isExpired(value.completedAtMS, nowMS: nowMS) ? transferID : nil
+    }
+    if !expiredCompleted.isEmpty {
+      let expiredSet = Set(expiredCompleted)
+      completedOrder.removeAll { expiredSet.contains($0) }
+      for transferID in expiredCompleted {
+        guard let removed = completed.removeValue(forKey: transferID) else { continue }
+        budgetCoordinator.release(removed.tombstoneReservation)
       }
-      guard isExpired(tombstone.completedAtMS, nowMS: nowMS) else { break }
-      completedOrder.removeFirst()
-      completed.removeValue(forKey: oldestID)
     }
     return expiredActive
   }
@@ -340,28 +476,43 @@ public struct TransferAssembler: Sendable {
     }
   }
 
+  private static func absoluteExpiryMS(
+    after startedAtMS: UInt64,
+    ttlMilliseconds: UInt64
+  ) -> UInt64 {
+    let expiry = startedAtMS.addingReportingOverflow(ttlMilliseconds)
+    return expiry.overflow ? .max : expiry.partialValue
+  }
+
   private func isExpired(_ startedAtMS: UInt64, nowMS: UInt64) -> Bool {
-    let elapsed = nowMS >= startedAtMS ? nowMS - startedAtMS : 0
-    return elapsed >= ttlMilliseconds
+    nowMS
+      >= Self.absoluteExpiryMS(
+        after: startedAtMS,
+        ttlMilliseconds: ttlMilliseconds
+      )
   }
 
   private mutating func dropActive(_ transferID: RuntimeTransferID) {
     guard let removed = active.removeValue(forKey: transferID) else { return }
-    bufferedBytes =
-      bufferedBytes >= removed.bufferedBytes
-      ? bufferedBytes - removed.bufferedBytes
-      : 0
+    if let reservation = removed.partReservation {
+      budgetCoordinator.release(reservation)
+    }
+    let (remaining, underflow) = bufferedBytes.subtractingReportingOverflow(removed.bufferedBytes)
+    precondition(!underflow, "transfer parts accounting underflow")
+    bufferedBytes = remaining
   }
 
   private mutating func releaseAssembly(bytes: UInt64) {
-    bufferedBytes = bufferedBytes >= bytes ? bufferedBytes - bytes : 0
+    let (remaining, underflow) = bufferedBytes.subtractingReportingOverflow(bytes)
+    precondition(!underflow, "transfer assembly accounting underflow")
+    bufferedBytes = remaining
   }
 
   private mutating func rememberCompleted(
     transferID: RuntimeTransferID,
     value: CompletedTransfer
   ) throws {
-    guard completed[transferID] != nil || completed.count < maxCompletedTombstones else {
+    guard completed[transferID] == nil, completed.count < maxCompletedTombstones else {
       throw TransferAssemblerError.reassemblyFull
     }
     completed[transferID] = value
@@ -407,10 +558,12 @@ private struct ActiveTransfer: Sendable {
   let startedAtMS: UInt64
   var parts: [UInt32: Data]
   var bufferedBytes: UInt64
+  var partReservation: TransferAssemblyByteReservation?
 }
 
 private struct CompletedTransfer: Sendable {
   let binding: TransferBinding
   let partHashes: [UInt32: Data]
   let completedAtMS: UInt64
+  let tombstoneReservation: TransferAssemblyTombstoneReservation
 }

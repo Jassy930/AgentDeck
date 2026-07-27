@@ -20,6 +20,7 @@ public actor FileCryptoStateStore: CryptoStateStore {
   private nonisolated let lockURL: URL
   private nonisolated let identity: CryptoStateIdentity
   private nonisolated let storageKey: DeviceStorageKEK
+  private nonisolated let configuredFileProtectionPolicy: URLFileProtection
   private nonisolated let ioQueue: DispatchQueue
   private nonisolated let testHooks: FileCryptoStateStoreTestHooks
 
@@ -35,6 +36,7 @@ public actor FileCryptoStateStore: CryptoStateStore {
     self.rootURL = standardizedRoot
     self.identity = identity
     self.storageKey = storageKey
+    configuredFileProtectionPolicy = Self.fileProtectionPolicy
     stateURL = Self.stateURL(rootURL: standardizedRoot, identity: identity)
     lockURL = Self.lockURL(rootURL: standardizedRoot, identity: identity)
     ioQueue = DispatchQueue(
@@ -47,15 +49,23 @@ public actor FileCryptoStateStore: CryptoStateStore {
     rootURL: URL,
     identity: CryptoStateIdentity,
     storageKey: DeviceStorageKEK,
-    testHooks: FileCryptoStateStoreTestHooks
+    testHooks: FileCryptoStateStoreTestHooks,
+    testingFileProtectionPolicy: URLFileProtection = FileCryptoStateStore.fileProtectionPolicy
   ) throws {
     guard rootURL.isFileURL, rootURL.path.hasPrefix("/") else {
+      throw CryptoStateStoreError.invalidIdentity
+    }
+    guard
+      testingFileProtectionPolicy == .complete
+        || testingFileProtectionPolicy == .completeUntilFirstUserAuthentication
+    else {
       throw CryptoStateStoreError.invalidIdentity
     }
     let standardizedRoot = rootURL.standardizedFileURL
     self.rootURL = standardizedRoot
     self.identity = identity
     self.storageKey = storageKey
+    configuredFileProtectionPolicy = testingFileProtectionPolicy
     stateURL = Self.stateURL(rootURL: standardizedRoot, identity: identity)
     lockURL = Self.lockURL(rootURL: standardizedRoot, identity: identity)
     ioQueue = DispatchQueue(
@@ -779,10 +789,15 @@ public actor FileCryptoStateStore: CryptoStateStore {
       values.isExcludedFromBackup = true
       try mutableURL.setResourceValues(values)
       try FileManager.default.setAttributes(
-        [.protectionKey: FileProtectionType.complete],
+        [
+          .protectionKey: configuredFileProtectionType
+        ],
         ofItemAtPath: temporary.url.path
       )
-      testHooks.protectionDidApply(temporary.url, .complete)
+      testHooks.protectionDidApply(
+        temporary.url,
+        configuredFileProtectionType
+      )
 
       try verifyTemporary(temporary, directories: directories)
       try verifyProtectionAttributes(at: temporary.url)
@@ -891,10 +906,21 @@ public actor FileCryptoStateStore: CryptoStateStore {
       throw CryptoStateStoreError.backupExclusionMissing
     }
     #if !targetEnvironment(simulator)
-      guard readback.fileProtection == Self.fileProtectionPolicy else {
+      guard readback.fileProtection == configuredFileProtectionPolicy else {
         throw CryptoStateStoreError.fileProtectionMissing
       }
     #endif
+  }
+
+  private nonisolated var configuredFileProtectionType: FileProtectionType {
+    switch configuredFileProtectionPolicy {
+    case .complete:
+      .complete
+    case .completeUntilFirstUserAuthentication:
+      .completeUntilFirstUserAuthentication
+    default:
+      preconditionFailure("unsupported file-protection policy")
+    }
   }
 
   private nonisolated func verifyDescriptorIdentity(

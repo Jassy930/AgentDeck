@@ -100,6 +100,7 @@ public enum RelayTransportError: Error, Equatable, Sendable {
   case textMessage
   case frameTooLarge
   case invalidFrame
+  case unsupportedVersion(UInt16)
   case incomingBackpressure
   case outgoingBackpressure
   case outcomeUnknown
@@ -123,6 +124,7 @@ public enum RelayTransportError: Error, Equatable, Sendable {
     case .textMessage: "remote.transport.text_message"
     case .frameTooLarge: "remote.transport.frame_too_large"
     case .invalidFrame: "remote.transport.frame_invalid"
+    case .unsupportedVersion: "relay.version.unsupported"
     case .incomingBackpressure: "remote.transport.incoming_backpressure"
     case .outgoingBackpressure: "remote.transport.outgoing_backpressure"
     case .outcomeUnknown: "remote.transport.outcome_unknown"
@@ -1437,6 +1439,14 @@ public actor RelayWebSocketTransport {
               generation,
               error: .frameTooLarge,
               closeCode: .messageTooBig,
+              discardIncoming: true
+            )
+            return
+          } catch RelayWireCodecError.unsupportedVersion(let version) {
+            await finishGeneration(
+              generation,
+              error: .unsupportedVersion(version),
+              closeCode: .protocolError,
               discardIncoming: true
             )
             return
