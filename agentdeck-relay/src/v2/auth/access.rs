@@ -207,6 +207,11 @@ impl fmt::Debug for ActivePairRoute {
 pub struct PairRouteView {
     pub now_ms: u64,
     pub active_route: Option<ActivePairRoute>,
+    /// 查询的 exact PairRoute 在其 absolute expiry 前已经关闭。
+    ///
+    /// 该位只供 `/v2/pair` 对持有原始 invite route 的重连方返回一次可关联的
+    /// terminal readback；unknown/expired route 继续与不存在保持相同结果。
+    pub tombstoned: bool,
 }
 
 impl fmt::Debug for PairRouteView {
@@ -215,6 +220,7 @@ impl fmt::Debug for PairRouteView {
             .debug_struct("PairRouteView")
             .field("now_ms", &self.now_ms)
             .field("has_active_route", &self.active_route.is_some())
+            .field("tombstoned", &self.tombstoned)
             .finish()
     }
 }

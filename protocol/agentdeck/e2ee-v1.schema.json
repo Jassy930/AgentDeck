@@ -2682,6 +2682,13 @@
                 "deviceKeyRecovery"
               ],
               "type": "string"
+            },
+            {
+              "description": "daemon 取消或过期 pairing request 的 MachineDataSign + DeviceHPKE terminal control。",
+              "enum": [
+                "pairTerminal"
+              ],
+              "type": "string"
             }
           ]
         },
@@ -3752,10 +3759,148 @@
       "title": "PairResponseV1",
       "type": "object"
     },
+    "PairTerminalOutcomeV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Pairing request 的 daemon-signed terminal outcome。\n\n该 plaintext 复用 [`super::PairingControlEnvelopeV1`] 由 DeviceHPKE 加密；Relay 只能 看到 carrier，不能区分 canceled/expired，也看不到 machine/request identity。",
+      "enum": [
+        "canceled",
+        "expired"
+      ],
+      "title": "PairTerminalOutcomeV1",
+      "type": "string"
+    },
+    "PairTerminalTbsV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "PairTerminalOutcomeV1": {
+          "description": "Pairing request 的 daemon-signed terminal outcome。\n\n该 plaintext 复用 [`super::PairingControlEnvelopeV1`] 由 DeviceHPKE 加密；Relay 只能 看到 carrier，不能区分 canceled/expired，也看不到 machine/request identity。",
+          "enum": [
+            "canceled",
+            "expired"
+          ],
+          "type": "string"
+        }
+      },
+      "description": "PairTerminal 的 MachineDataSign TBS。绑定完整 invite trust domain、exact request 和 MachineDataSign certificate identity，不复用 PairPending 或通用 sealed-blob TBS。",
+      "properties": {
+        "aadSha256": {
+          "type": "string"
+        },
+        "e2eeFormatVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "expiryMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "infoSha256": {
+          "type": "string"
+        },
+        "inviteHash": {
+          "type": "string"
+        },
+        "machineRoute": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/definitions/PairTerminalOutcomeV1"
+        },
+        "pairRoute": {
+          "type": "string"
+        },
+        "relayProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "relayServerId": {
+          "type": "string"
+        },
+        "requestHash": {
+          "type": "string"
+        },
+        "runtimeProtocolVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "signingCredentialSha256": {
+          "type": "string"
+        },
+        "signingKeyFingerprint": {
+          "type": "string"
+        },
+        "signingKeyGeneration": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "aadSha256",
+        "e2eeFormatVersion",
+        "expiryMs",
+        "infoSha256",
+        "inviteHash",
+        "machineRoute",
+        "outcome",
+        "pairRoute",
+        "relayProtocolVersion",
+        "relayServerId",
+        "requestHash",
+        "runtimeProtocolVersion",
+        "signingCredentialSha256",
+        "signingKeyFingerprint",
+        "signingKeyGeneration"
+      ],
+      "title": "PairTerminalTbsV1",
+      "type": "object"
+    },
+    "PairTerminalV1": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "PairTerminalOutcomeV1": {
+          "description": "Pairing request 的 daemon-signed terminal outcome。\n\n该 plaintext 复用 [`super::PairingControlEnvelopeV1`] 由 DeviceHPKE 加密；Relay 只能 看到 carrier，不能区分 canceled/expired，也看不到 machine/request identity。",
+          "enum": [
+            "canceled",
+            "expired"
+          ],
+          "type": "string"
+        }
+      },
+      "description": "与 exact machine/request 绑定的 pairing 终态；由 MachineDataSign 签名。",
+      "properties": {
+        "machineRoute": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/definitions/PairTerminalOutcomeV1"
+        },
+        "requestHash": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "machineRoute",
+        "outcome",
+        "requestHash",
+        "signature"
+      ],
+      "title": "PairTerminalV1",
+      "type": "object"
+    },
     "PairingControlEnvelopeV1": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "additionalProperties": false,
-      "description": "PairPending 等已签名 pairing control plaintext 的 HPKE carrier。Relay 只能看到 `enc+ciphertext`，看不到 requestHash 或 control subtype。",
+      "description": "PairPending/PairTerminal 等已签名 pairing control plaintext 的 HPKE carrier。Relay 只能看到 `enc+ciphertext`，看不到 requestHash 或 control subtype。",
       "properties": {
         "ciphertext": {
           "type": "string"

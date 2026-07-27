@@ -12,6 +12,7 @@ use std::cell::RefCell;
 
 use chacha20poly1305::aead::{Aead, AeadInOut, KeyInit, Payload, Tag};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use hmac::digest::FixedOutput;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use thiserror::Error;
@@ -338,9 +339,13 @@ impl RuntimeKeyBundle {
         let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.blind_index_key)
             .map_err(|_| CipherError::InvalidEncoding)?;
         mac.update(message.as_ref());
-        let output = mac.finalize().into_bytes();
-        let bytes: [u8; KEY_LEN] = output.into();
-        Ok(BlindIndex(bytes))
+        // HMAC 直接写入最终 Drop-zeroize owner 的同一 32-byte 存储；`from_mut_slice`
+        // 只创建借用视图，不产生普通 `Output` 或第二份 `[u8; 32]` secret 临时值。
+        let mut index = BlindIndex([0_u8; KEY_LEN]);
+        mac.finalize_into(hmac::digest::Output::<HmacSha256>::from_mut_slice(
+            &mut index.0,
+        ));
+        Ok(index)
     }
 
     pub(crate) fn read_only_capability(&self) -> RuntimeReadCryptoCapability {

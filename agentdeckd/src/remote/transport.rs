@@ -7,12 +7,13 @@
 //! 不认证 Runtime payload，也不持有 canonical 业务状态。
 
 use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use agentdeck_crypto::rand_core::SeedableRng;
+use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
 #[cfg(test)]
 use agentdeck_crypto::{
     DeviceKeyRecoverySealAuthority,
@@ -25,10 +26,11 @@ use agentdeck_crypto::{
 use agentdeck_protocol::e2ee::{
     DeviceAuthorizationV1, DeviceKeyRecoveryInfoV1, DeviceKeyRecoveryReplyV1, E2EE_FORMAT_VERSION,
     KeyDirectoryEntry, KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyUpdateInfoV1,
-    KeyUpdateSetV1, KeyUpdateV1, MachineDataSignerBindingV1, OuterContextV1, PairRequestInfoV1,
-    PairResponseInfoV1, PairResponsePlaintextV1, PairResponseV1, PairingControlEnvelopeV1,
-    SignedSealedBlobV1, UnsignedSealedBlobV1,
+    KeyUpdateSetV1, KeyUpdateV1, MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind,
+    PairRequestInfoV1, PairResponseInfoV1, PairResponsePlaintextV1, PairResponseV1, PairTerminalV1,
+    PairingControlEnvelopeV1, SignedSealedBlobV1, UnsignedSealedBlobV1,
 };
+use agentdeck_protocol::relay_v2::failure::RELAY_ROUTE_NOT_FOUND;
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, AuthProof, Authenticate, Challenge, ClosePairRoute, GrantCommitted, InstallGrant,
     OpenPairRoute, PairData, PairRouteClosed, PairRouteOpened, Publish, RegisterStream, Reply,
@@ -38,17 +40,16 @@ use agentdeck_protocol::relay_v2::frame::{
 use agentdeck_protocol::relay_v2::{
     AuthenticationRole, AuthenticationTranscriptV1, DeviceRevocation, DeviceRouteId, GrantSerial,
     KeyDirectoryRevision, MAX_FRAME_BYTES, MachineRouteId, OpaqueRouteFrame, PairRouteId,
-    RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId, SignedCertificate, StreamGenerationId,
-    StreamRouteId, TrustEpoch, encode,
+    RELAY_PROTOCOL_VERSION, RelayFailure, RelayFrameBody, RequestRouteId, SignedCertificate,
+    StreamGenerationId, StreamRouteId, TrustEpoch, encode, relay_frame_reply_reference,
 };
 use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use agentdeck_relay_client::{LinkAuthenticator, RelayClient, RelayClientConfig, RelayClientError};
 use async_trait::async_trait;
-use rand_chacha::ChaCha20Rng;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::local::listener::RemoteStartPermit;
 
@@ -90,6 +91,18 @@ trait MachineLinkOwner: Send + Sync {
         signer: &MachineDataSignerBindingV1,
         rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
     ) -> Result<PairingControlEnvelopeV1, MachinePairingError>;
+
+    fn seal_pair_terminal(
+        &self,
+        _recipient: &HpkePublicKey,
+        _info: &PairRequestInfoV1,
+        _context: &OuterContextV1,
+        _terminal: PairTerminalV1,
+        _signer: &MachineDataSignerBindingV1,
+        _rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<PairingControlEnvelopeV1, MachinePairingError> {
+        Err(MachinePairingError::ContextMismatch)
+    }
 
     fn sign_relay_grant(
         &self,
@@ -219,6 +232,20 @@ impl MachineLinkOwner for MachineLinkIdentityOwner {
             request_hash,
             signer,
             rng,
+        )
+    }
+
+    fn seal_pair_terminal(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairRequestInfoV1,
+        context: &OuterContextV1,
+        terminal: PairTerminalV1,
+        signer: &MachineDataSignerBindingV1,
+        rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<PairingControlEnvelopeV1, MachinePairingError> {
+        MachineLinkIdentityOwner::seal_pair_terminal(
+            self, recipient, info, context, terminal, signer, rng,
         )
     }
 
@@ -743,17 +770,15 @@ impl MachineDataAuthority {
             .map_err(|_| pairing_authority_mismatch())?;
         let owner = self.verified_owner()?;
         let mut rng = pairing_crypto_rng(|bytes| getrandom::fill(bytes).map_err(|_| ()))?;
-        owner
-            .owner
-            .seal_device_key_recovery_reply(
-                &self.anchor,
-                request.recipient,
-                &info,
-                &context,
-                request.update_set,
-                &mut rng,
-            )
-            .map_err(map_pairing_authority_error)
+        let sealed = owner.owner.seal_device_key_recovery_reply(
+            &self.anchor,
+            request.recipient,
+            &info,
+            &context,
+            request.update_set,
+            &mut rng,
+        );
+        rng.finish(sealed)?.map_err(map_pairing_authority_error)
     }
 
     pub(crate) fn sign_key_directory(
@@ -832,7 +857,8 @@ impl MachineDataAuthority {
         self.validate_key_update_axes(info, context)?;
         let _owner = self.verified_owner()?;
         let mut rng = pairing_crypto_rng(source)?;
-        crypto_seal_key_directory_entry(recipient, info, context, key, &mut rng)
+        let sealed = crypto_seal_key_directory_entry(recipient, info, context, key, &mut rng);
+        rng.finish(sealed)?
             .map_err(|_| supervisor_failure("remote.transport.pairing_crypto_failed"))
     }
 
@@ -926,6 +952,63 @@ impl PairingMachineAuthority {
         )
     }
 
+    pub(crate) fn seal_pair_terminal(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairRequestInfoV1,
+        context: &OuterContextV1,
+        terminal: PairTerminalV1,
+        expected_data_certificate: &SignedCertificate,
+        hpke_seed: Zeroizing<[u8; 32]>,
+    ) -> Result<PairingControlEnvelopeV1, RemoteTransportError> {
+        let mut rng = pairing_crypto_rng_from_seed(hpke_seed);
+        let sealed = self.seal_pair_terminal_with_rng(
+            recipient,
+            info,
+            context,
+            terminal,
+            expected_data_certificate,
+            &mut rng,
+        );
+        rng.finish(sealed)?
+    }
+
+    fn seal_pair_terminal_with_rng(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairRequestInfoV1,
+        context: &OuterContextV1,
+        terminal: PairTerminalV1,
+        expected_data_certificate: &SignedCertificate,
+        rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<PairingControlEnvelopeV1, RemoteTransportError> {
+        if expected_data_certificate != &self.anchor.data_certificate
+            || info.relay_server_id != self.anchor.relay_server_id
+            || info.pair_route != context.pair_route.unwrap_or(info.pair_route)
+            || info.expiry_ms == 0
+            || context.frame_kind != OuterFrameKind::PairTerminal
+            || context.pair_route != Some(info.pair_route)
+            || context.validate().is_err()
+            || terminal.machine_route != self.anchor.machine_route
+            || terminal.request_hash == [0; 32]
+            || terminal.signature.0 != [0; 64]
+        {
+            return Err(pairing_authority_mismatch());
+        }
+        let owner = self.verified_owner()?;
+        owner
+            .owner
+            .seal_pair_terminal(
+                recipient,
+                info,
+                context,
+                terminal,
+                &self.machine_data.data_signer,
+                rng,
+            )
+            .map_err(map_pairing_authority_error)
+    }
+
     fn seal_pair_pending_with_entropy_source<F>(
         &self,
         recipient: &HpkePublicKey,
@@ -942,17 +1025,15 @@ impl PairingMachineAuthority {
         }
         let owner = self.verified_owner()?;
         let mut rng = pairing_crypto_rng(source)?;
-        owner
-            .owner
-            .seal_pair_pending(
-                recipient,
-                info,
-                context,
-                request_hash,
-                &self.machine_data.data_signer,
-                &mut rng,
-            )
-            .map_err(map_pairing_authority_error)
+        let sealed = owner.owner.seal_pair_pending(
+            recipient,
+            info,
+            context,
+            request_hash,
+            &self.machine_data.data_signer,
+            &mut rng,
+        );
+        rng.finish(sealed)?.map_err(map_pairing_authority_error)
     }
 
     #[cfg(test)]
@@ -1099,10 +1180,15 @@ impl PairingMachineAuthority {
     {
         let owner = self.verified_owner()?;
         let mut rng = pairing_crypto_rng(source)?;
-        owner
-            .owner
-            .seal_pair_response(&self.anchor, recipient, info, context, plaintext, &mut rng)
-            .map_err(map_pairing_authority_error)
+        let sealed = owner.owner.seal_pair_response(
+            &self.anchor,
+            recipient,
+            info,
+            context,
+            plaintext,
+            &mut rng,
+        );
+        rng.finish(sealed)?.map_err(map_pairing_authority_error)
     }
 
     #[cfg(test)]
@@ -1141,15 +1227,129 @@ impl PairingMachineAuthority {
     }
 }
 
-/// 先以 fallible OS source 取得 256-bit seed，再交给 rand_core 0.10 的成熟
-/// ChaCha20 CSPRNG。production 不使用 hpke 内部会 panic 的 `UnwrapErr(SysRng)`。
-fn pairing_crypto_rng<F>(mut source: F) -> Result<ChaCha20Rng, RemoteTransportError>
+/// 固定 X25519 HPKE suite 的一次性 IKM owner。
+///
+/// `hpke` 0.14 的 X25519 KEM 必须恰好请求一次 32-byte IKM，并会在派生 ephemeral
+/// keypair 后清零其目标 buffer。本 owner 只在该 exact request 上交付 seed；任何 word
+/// API、错误长度或重复请求都只返回零并记录契约违例。调用方在 seal 返回后必须调用
+/// [`Self::finish`]，否则不能接受已经构造出的 artifact。
+struct OneShotHpkeSeedRng {
+    seed: Option<Zeroizing<[u8; 32]>>,
+    request_count: u8,
+    shape_mismatch: bool,
+    #[cfg(test)]
+    seed_wipe_observer: Option<Arc<AtomicBool>>,
+}
+
+impl OneShotHpkeSeedRng {
+    fn new(seed: Zeroizing<[u8; 32]>) -> Self {
+        Self {
+            seed: Some(seed),
+            request_count: 0,
+            shape_mismatch: false,
+            #[cfg(test)]
+            seed_wipe_observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_seed_wipe_observer(seed: Zeroizing<[u8; 32]>) -> (Self, Arc<AtomicBool>) {
+        let observer = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                seed: Some(seed),
+                request_count: 0,
+                shape_mismatch: false,
+                seed_wipe_observer: Some(Arc::clone(&observer)),
+            },
+            observer,
+        )
+    }
+
+    fn finish<T, E>(self, result: Result<T, E>) -> Result<Result<T, E>, RemoteTransportError> {
+        let exact_success = self.request_count == 1 && !self.shape_mismatch && self.seed.is_none();
+        if self.shape_mismatch || (result.is_ok() && !exact_success) {
+            return Err(RemoteTransportError::PairingEntropyContractViolation);
+        }
+        Ok(result)
+    }
+
+    fn record_request(&mut self) {
+        self.request_count = self.request_count.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    fn observe_seed_wipe(&self, seed: &[u8; 32]) {
+        if let Some(observer) = &self.seed_wipe_observer {
+            observer.store(seed.iter().all(|byte| *byte == 0), Ordering::SeqCst);
+        }
+    }
+}
+
+impl TryRng for OneShotHpkeSeedRng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        self.record_request();
+        self.shape_mismatch = true;
+        Ok(0)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        self.record_request();
+        self.shape_mismatch = true;
+        Ok(0)
+    }
+
+    fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), Self::Error> {
+        self.record_request();
+        if self.request_count == 1
+            && destination.len() == 32
+            && !self.shape_mismatch
+            && let Some(mut seed) = self.seed.take()
+        {
+            destination.copy_from_slice(seed.as_ref());
+            seed.zeroize();
+            #[cfg(test)]
+            self.observe_seed_wipe(&seed);
+            return Ok(());
+        }
+        self.shape_mismatch = true;
+        destination.fill(0);
+        Ok(())
+    }
+}
+
+impl TryCryptoRng for OneShotHpkeSeedRng {}
+
+impl Drop for OneShotHpkeSeedRng {
+    fn drop(&mut self) {
+        if let Some(seed) = self.seed.as_mut() {
+            seed.zeroize();
+            #[cfg(test)]
+            if let Some(observer) = &self.seed_wipe_observer {
+                observer.store(seed.iter().all(|byte| *byte == 0), Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// 先以 fallible OS source 取得 X25519 HPKE 所需的 256-bit IKM。production 不使用
+/// hpke 内部会 panic 的 `UnwrapErr(SysRng)`。
+fn pairing_crypto_rng<F>(mut source: F) -> Result<OneShotHpkeSeedRng, RemoteTransportError>
 where
     F: FnMut(&mut [u8]) -> Result<(), ()>,
 {
     let mut seed = Zeroizing::new([0_u8; 32]);
     source(seed.as_mut()).map_err(|()| RemoteTransportError::PairingEntropyUnavailable)?;
-    Ok(ChaCha20Rng::from_seed(*seed))
+    Ok(OneShotHpkeSeedRng::new(seed))
+}
+
+/// 接管 Store 对 exact PairTerminal identity 派生的用途隔离 IKM owner。seed 的
+/// durable/replay 不变量由 `PairTerminalPreparation` 保证；transport 不接受 PairTerminal
+/// 的系统熵路径，避免 seal 完成但 carrier COMMIT 前崩溃后产生不同密文。
+fn pairing_crypto_rng_from_seed(seed: Zeroizing<[u8; 32]>) -> OneShotHpkeSeedRng {
+    OneShotHpkeSeedRng::new(seed)
 }
 
 impl fmt::Debug for PairingMachineAuthority {
@@ -1219,6 +1419,8 @@ pub enum RemoteTransportError {
     PairingGenerationExhausted,
     #[error("pairing transport could not obtain cryptographic entropy")]
     PairingEntropyUnavailable,
+    #[error("pairing HPKE consumer violated the one-shot 32-byte entropy contract")]
+    PairingEntropyContractViolation,
     #[error("remote supervisor failed: {code}")]
     SupervisorFailed { code: String },
     #[error("machine retirement construction failed: {0}")]
@@ -1249,6 +1451,9 @@ impl RemoteTransportError {
             Self::PublicationAckMismatch => "remote.transport.publication_ack_mismatch",
             Self::PairingGenerationExhausted => "remote.transport.pairing_generation_exhausted",
             Self::PairingEntropyUnavailable => "remote.transport.pairing_entropy_unavailable",
+            Self::PairingEntropyContractViolation => {
+                "remote.transport.pairing_entropy_contract_violation"
+            }
             Self::SupervisorFailed { code } => code,
             Self::Retirement(error) => error.code(),
         }
@@ -1398,6 +1603,7 @@ const INITIAL_PAIRING_GENERATION: u64 = 1;
 enum PairingCommand {
     Open(OpenPairRoute),
     Data(PairData),
+    TerminalData(PairData),
     InstallGrant(InstallGrant),
     Close(ClosePairRoute),
     RevokeDevice(RevokeDevice),
@@ -1407,7 +1613,9 @@ impl PairingCommand {
     fn frame(&self) -> OpaqueRouteFrame {
         let body = match self {
             Self::Open(frame) => RelayFrameBody::OpenPairRoute(frame.clone()),
-            Self::Data(frame) => RelayFrameBody::PairData(frame.clone()),
+            Self::Data(frame) | Self::TerminalData(frame) => {
+                RelayFrameBody::PairData(frame.clone())
+            }
             Self::InstallGrant(frame) => RelayFrameBody::InstallGrant(frame.clone()),
             Self::Close(frame) => RelayFrameBody::ClosePairRoute(frame.clone()),
             Self::RevokeDevice(frame) => RelayFrameBody::RevokeDevice(frame.clone()),
@@ -1439,11 +1647,18 @@ struct RevocationBinding {
     revocation: DeviceRevocation,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct TerminalReplayBinding {
+    pair_route: PairRouteId,
+    reply_reference: String,
+}
+
 #[derive(Clone, Default)]
 struct PairingBindings {
     routes: Vec<PairRouteBinding>,
     grants: Vec<GrantBinding>,
     revocations: Vec<RevocationBinding>,
+    terminal_replays: Vec<TerminalReplayBinding>,
     completed_routes: Vec<PairRouteId>,
     completed_grants: Vec<GrantBinding>,
     completed_revocations: Vec<RevocationBinding>,
@@ -1499,6 +1714,54 @@ impl PairingBindings {
                 };
                 if !bound.opened || bound.closing {
                     return Err(RemoteTransportError::PairingBindingMismatch);
+                }
+                if next
+                    .terminal_replays
+                    .iter()
+                    .any(|replay| replay.pair_route == data.pair_route)
+                {
+                    return Err(RemoteTransportError::PairingBindingMismatch);
+                }
+            }
+            PairingCommand::TerminalData(data) => {
+                if is_zero_pair_route(data.pair_route) {
+                    return Err(RemoteTransportError::PairingBindingMismatch);
+                }
+                if let Some(bound) = next
+                    .routes
+                    .iter()
+                    .find(|bound| bound.pair_route == data.pair_route)
+                {
+                    if bound.closing {
+                        return Err(RemoteTransportError::PairingBindingMismatch);
+                    }
+                } else {
+                    // Durable PairTerminal 必须能在 daemon/reconnect 丢失易失 route binding
+                    // 后先逐字节重发，再进入 ClosePairRoute。该 typed command 只由 pairing
+                    // actor 的 authenticated terminal recovery 构造。
+                    ensure_pairing_capacity(next.routes.len())?;
+                    next.routes.push(PairRouteBinding {
+                        pair_route: data.pair_route,
+                        absolute_expiry_ms: None,
+                        opened: true,
+                        closing: false,
+                    });
+                }
+                let reply_reference = relay_frame_reply_reference(&frame);
+                if let Some(replay) = next
+                    .terminal_replays
+                    .iter()
+                    .find(|replay| replay.pair_route == data.pair_route)
+                {
+                    if replay.reply_reference != reply_reference {
+                        return Err(RemoteTransportError::PairingBindingMismatch);
+                    }
+                } else {
+                    ensure_pairing_capacity(next.terminal_replays.len())?;
+                    next.terminal_replays.push(TerminalReplayBinding {
+                        pair_route: data.pair_route,
+                        reply_reference,
+                    });
                 }
             }
             PairingCommand::InstallGrant(install) => {
@@ -1619,7 +1882,7 @@ impl PairingBindings {
     }
 
     fn accept_pair_frame(
-        &self,
+        &mut self,
         accepted: RouteAccepted,
     ) -> Result<PairingTransportEvent, RemoteTransportError> {
         let AcceptedRef::PairFrame { pair_route } = accepted.accepted else {
@@ -1632,10 +1895,41 @@ impl PairingBindings {
         else {
             return Err(RemoteTransportError::FrameForbidden);
         };
-        if !bound.opened || bound.closing {
+        let terminal_closing = bound.closing
+            && self
+                .terminal_replays
+                .iter()
+                .any(|replay| replay.pair_route == pair_route);
+        if !bound.opened || (bound.closing && !terminal_closing) {
             return Err(RemoteTransportError::PairingBindingMismatch);
         }
         Ok(PairingTransportEvent::PairFrameAccepted(accepted))
+    }
+
+    fn consume_expected_terminal_not_found(&mut self, failure: &RelayFailure) -> bool {
+        if failure.code != RELAY_ROUTE_NOT_FOUND {
+            return false;
+        }
+        let Some(reference) = failure.in_reply_to.as_deref() else {
+            return false;
+        };
+        let Some(index) = self
+            .terminal_replays
+            .iter()
+            .position(|replay| replay.reply_reference == reference)
+        else {
+            return false;
+        };
+        let pair_route = self.terminal_replays[index].pair_route;
+        let closing = self
+            .routes
+            .iter()
+            .any(|bound| bound.pair_route == pair_route && bound.opened && bound.closing);
+        if !closing {
+            return false;
+        }
+        self.terminal_replays.swap_remove(index);
+        true
     }
 
     fn accept_closed(
@@ -1651,6 +1945,8 @@ impl PairingBindings {
                 return Err(RemoteTransportError::PairingBindingMismatch);
             }
             self.routes.swap_remove(index);
+            self.terminal_replays
+                .retain(|replay| replay.pair_route != closed.pair_route);
             remember_completed(&mut self.completed_routes, closed.pair_route);
             return Ok(PairingTransportEvent::PairRouteClosed(closed));
         }
@@ -2361,6 +2657,33 @@ impl PairingTransportLane {
         self.send_command(PairingCommand::Data(frame)).await
     }
 
+    #[cfg(test)]
+    async fn send_pair_terminal_data(&self, frame: PairData) -> Result<(), RemoteTransportError> {
+        self.send_command(PairingCommand::TerminalData(frame)).await
+    }
+
+    /// 把 durable PairTerminal writer flush 与同 route Close 放进一个 supervisor command。
+    /// 两帧仍按 PairData→Close 顺序写入唯一 session；reader 只有在 closing binding 已安装后
+    /// 才继续处理 Relay 回包，避免 expected terminal miss 抢跑 matching Close ACK。
+    pub(crate) async fn send_pair_terminal_and_close(
+        &self,
+        terminal: PairData,
+        close: ClosePairRoute,
+    ) -> Result<(), RemoteTransportError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SupervisorCommand::PairingTerminal {
+                terminal,
+                close,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| RemoteTransportError::Closed)?;
+        response_rx
+            .await
+            .map_err(|_| RemoteTransportError::Closed)?
+    }
+
     pub(crate) async fn send_install_grant(
         &self,
         frame: InstallGrant,
@@ -2590,6 +2913,11 @@ enum SupervisorCommand {
     },
     Pairing {
         command: PairingCommand,
+        response: oneshot::Sender<Result<(), RemoteTransportError>>,
+    },
+    PairingTerminal {
+        terminal: PairData,
+        close: ClosePairRoute,
         response: oneshot::Sender<Result<(), RemoteTransportError>>,
     },
     BusinessReply {
@@ -3279,6 +3607,7 @@ async fn run_control_supervisor(
                             }
                         }
                         Ok(InboundDispatch::PublicationCommitted) => {}
+                        Ok(InboundDispatch::ExpectedTerminalReplayMiss) => {}
                         Ok(InboundDispatch::Shared { control, pairing_failure }) => {
                             let mut control = Some(Ok(Some(control)));
                             let pairing_dispatch = {
@@ -3428,6 +3757,54 @@ async fn handle_supervisor_command(
                 .send(command.frame())
                 .await
                 .map_err(RemoteTransportError::Client);
+            match &result {
+                Ok(()) => *state.pairing_bindings = next_bindings,
+                Err(error) => {
+                    state.publication_bindings.resolve_unknown();
+                    set_supervisor_failure(health, error.code());
+                    *reader_enabled = false;
+                }
+            }
+            let _ = response.send(result);
+        }
+        SupervisorCommand::PairingTerminal {
+            terminal,
+            close,
+            response,
+        } => {
+            if session_shutdown {
+                let _ = response.send(Err(RemoteTransportError::Closed));
+                return;
+            }
+            if !*reader_enabled {
+                let error = health
+                    .borrow()
+                    .clone()
+                    .map(supervisor_failure)
+                    .unwrap_or(RemoteTransportError::Closed);
+                let _ = response.send(Err(error));
+                return;
+            }
+            let terminal = PairingCommand::TerminalData(terminal);
+            let close = PairingCommand::Close(close);
+            let next_bindings = state
+                .pairing_bindings
+                .prepare_outbound(machine_route, &terminal)
+                .and_then(|next| next.prepare_outbound(machine_route, &close));
+            let next_bindings = match next_bindings {
+                Ok(next) => next,
+                Err(error) => {
+                    let _ = response.send(Err(error));
+                    return;
+                }
+            };
+            let result = match session.send(terminal.frame()).await {
+                Ok(()) => session
+                    .send(close.frame())
+                    .await
+                    .map_err(RemoteTransportError::Client),
+                Err(error) => Err(RemoteTransportError::Client(error)),
+            };
             match &result {
                 Ok(()) => *state.pairing_bindings = next_bindings,
                 Err(error) => {
@@ -3717,6 +4094,7 @@ enum InboundDispatch {
         encoded_len: usize,
     },
     PublicationCommitted,
+    ExpectedTerminalReplayMiss,
     Shared {
         control: RemoteControl,
         pairing_failure: SafeFailure,
@@ -3755,6 +4133,12 @@ fn decode_inbound(
                     canonical_frame_bytes,
                 },
             )))
+        }
+        RelayFrameBody::Error(failure)
+            if failure.has_safe_code()
+                && pairing_bindings.consume_expected_terminal_not_found(&failure) =>
+        {
+            Ok(InboundDispatch::ExpectedTerminalReplayMiss)
         }
         RelayFrameBody::Error(failure) if failure.has_safe_code() => {
             let safe = SafeFailure { code: failure.code };
@@ -4284,16 +4668,17 @@ pub(crate) mod tests {
 
     use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
     use agentdeck_crypto::{
-        HpkePrivateKey, SecretAeadKey, SignatureBytes, SigningKey, open_key_directory_entry,
-        open_pair_pending, open_pair_response, sign_authentication_transcript, sign_key_update,
-        sign_sealed, sign_tbs, verify_authentication_transcript, verify_device_authorization,
-        verify_key_directory, verify_key_update, verify_sealed, verify_tbs,
+        HpkePrivateKey, PairTerminalExpectedV1, SecretAeadKey, SignatureBytes, SigningKey,
+        open_key_directory_entry, open_pair_pending, open_pair_response, open_pair_terminal,
+        sign_authentication_transcript, sign_key_update, sign_sealed, sign_tbs,
+        verify_authentication_transcript, verify_device_authorization, verify_key_directory,
+        verify_key_update, verify_sealed, verify_tbs,
     };
     use agentdeck_protocol::e2ee::{
         AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
         E2EE_FORMAT_VERSION, KeyDirectoryEntry, KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1,
         KeyUpdateV1, OuterContextV1, OuterFrameKind, PairRequestInfoV1, PairResponseInfoV1,
-        PairResponsePlaintextV1, UnsignedSealedBlobV1,
+        PairResponsePlaintextV1, PairTerminalOutcomeV1, PairTerminalV1, UnsignedSealedBlobV1,
     };
     use agentdeck_protocol::relay_v2::frame::{
         AcceptedRef, ClosePairRoute, GrantCommitted, InstallGrant, OpenPairRoute, PairData,
@@ -4450,6 +4835,26 @@ pub(crate) mod tests {
                 info,
                 context,
                 update_set,
+                &mut rng,
+            )?)
+        }
+
+        fn seal_pair_terminal(
+            &self,
+            recipient: &HpkePublicKey,
+            info: &PairRequestInfoV1,
+            context: &OuterContextV1,
+            terminal: PairTerminalV1,
+            signer: &MachineDataSignerBindingV1,
+            mut rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+        ) -> Result<PairingControlEnvelopeV1, MachinePairingError> {
+            Ok(agentdeck_crypto::seal_pair_terminal(
+                recipient,
+                info,
+                context,
+                terminal,
+                &self.data_signing_key,
+                signer,
                 &mut rng,
             )?)
         }
@@ -4711,6 +5116,26 @@ pub(crate) mod tests {
                 info,
                 context,
                 request_hash,
+                &SigningKey::from_seed(&[0x33; 32]),
+                signer,
+                &mut rng,
+            )?)
+        }
+
+        fn seal_pair_terminal(
+            &self,
+            recipient: &HpkePublicKey,
+            info: &PairRequestInfoV1,
+            context: &OuterContextV1,
+            terminal: PairTerminalV1,
+            signer: &MachineDataSignerBindingV1,
+            mut rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+        ) -> Result<PairingControlEnvelopeV1, MachinePairingError> {
+            Ok(agentdeck_crypto::seal_pair_terminal(
+                recipient,
+                info,
+                context,
+                terminal,
                 &SigningKey::from_seed(&[0x33; 32]),
                 signer,
                 &mut rng,
@@ -6878,6 +7303,47 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn durable_terminal_data_can_rebind_after_restart_but_never_crosses_close() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .expect("take pairing lane");
+        let pair_route = PairRouteId::from_bytes([0xaa; 16]);
+        let carrier = PairData {
+            pair_route,
+            sealed_blob: SealedBlob(vec![0xab; 96]),
+        };
+        lane.send_pair_terminal_data(carrier.clone())
+            .await
+            .expect("durable terminal may restore an unbound server-side route");
+        lane.send_close_pair_route(ClosePairRoute {
+            machine_route: ROUTE,
+            pair_route,
+        })
+        .await
+        .expect("Close follows the terminal writer flush");
+        assert_eq!(
+            fixture.harness.sent.lock().expect("sent frames").as_slice(),
+            &[
+                frame(RelayFrameBody::PairData(carrier.clone())),
+                frame(RelayFrameBody::ClosePairRoute(ClosePairRoute {
+                    machine_route: ROUTE,
+                    pair_route,
+                })),
+            ]
+        );
+        assert_eq!(
+            lane.send_pair_terminal_data(carrier)
+                .await
+                .expect_err("terminal cannot cross the local Close fence")
+                .code(),
+            "remote.transport.pairing_binding_mismatch"
+        );
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn pairing_runtime_take_is_atomic_binds_data_certificate_and_is_single_use() {
         let mut fixture = connected_fixture(Vec::new(), None).await;
         let runtime = fixture
@@ -6945,6 +7411,59 @@ pub(crate) mod tests {
             .expect("open and verify PairPending")
             .request_hash,
             request_hash
+        );
+
+        let terminal_context = pairing_outer_context(OuterFrameKind::PairTerminal, pair_route);
+        let terminal_hpke_seed = [0xb6; 32];
+        let terminal = runtime
+            .authority
+            .seal_pair_terminal(
+                &device_hpke_public,
+                &request_info,
+                &terminal_context,
+                PairTerminalV1 {
+                    machine_route: ROUTE,
+                    request_hash,
+                    outcome: PairTerminalOutcomeV1::Canceled,
+                    signature: Ed25519Signature([0; 64]),
+                },
+                &fixture.data_cert,
+                Zeroizing::new(terminal_hpke_seed),
+            )
+            .expect("seal typed PairTerminal with current Data certificate");
+        let terminal_replay = runtime
+            .authority
+            .seal_pair_terminal(
+                &device_hpke_public,
+                &request_info,
+                &terminal_context,
+                PairTerminalV1 {
+                    machine_route: ROUTE,
+                    request_hash,
+                    outcome: PairTerminalOutcomeV1::Canceled,
+                    signature: Ed25519Signature([0; 64]),
+                },
+                &fixture.data_cert,
+                Zeroizing::new(terminal_hpke_seed),
+            )
+            .expect("replay typed PairTerminal from the durable HPKE seed");
+        assert_eq!(
+            terminal_replay, terminal,
+            "the same durable terminal seed must reproduce the exact HPKE carrier"
+        );
+        assert_eq!(
+            open_pair_terminal(
+                &device_hpke_private,
+                &request_info,
+                &terminal_context,
+                PairTerminalExpectedV1::new(ROUTE, request_hash).unwrap(),
+                &terminal,
+                &machine_data.verifying_key(),
+                &signer,
+            )
+            .expect("open and verify PairTerminal")
+            .outcome,
+            PairTerminalOutcomeV1::Canceled
         );
 
         let device_signing = SigningKey::from_seed(&[0xb5; 32]);
@@ -7214,6 +7733,101 @@ pub(crate) mod tests {
         fixture.transport.shutdown().await;
     }
 
+    #[test]
+    fn one_shot_hpke_rng_matches_real_x25519_contract_and_wipes_consumed_seed() {
+        let (_, recipient) = HpkePrivateKey::derive_keypair(&[0x59; 32]);
+        let (mut rng, wiped) =
+            OneShotHpkeSeedRng::with_seed_wipe_observer(Zeroizing::new([0x5a; 32]));
+        let sealed = agentdeck_crypto::hpke_seal_base(
+            &recipient,
+            b"one-shot-hpke-ikm-contract",
+            b"aad",
+            b"plaintext",
+            &mut rng,
+        );
+        assert!(
+            wiped.load(Ordering::SeqCst),
+            "the unique seed owner must be zeroized immediately after the exact IKM request"
+        );
+        let sealed = rng
+            .finish(sealed)
+            .expect("real X25519 HPKE must request one exact 32-byte IKM")
+            .expect("real HPKE seal succeeds");
+        assert_eq!(sealed.enc.len(), 32);
+    }
+
+    #[test]
+    fn one_shot_hpke_rng_drop_wipes_an_unconsumed_seed() {
+        let (rng, wiped) = OneShotHpkeSeedRng::with_seed_wipe_observer(Zeroizing::new([0x5b; 32]));
+        drop(rng);
+        assert!(
+            wiped.load(Ordering::SeqCst),
+            "all pre-HPKE error paths must wipe the still-owned seed"
+        );
+    }
+
+    #[test]
+    fn one_shot_hpke_rng_rejects_wrong_repeated_and_word_requests() {
+        let mut wrong_length = OneShotHpkeSeedRng::new(Zeroizing::new([0x5c; 32]));
+        let mut wrong_output = [0xa5; 31];
+        wrong_length
+            .try_fill_bytes(&mut wrong_output)
+            .expect("one-shot RNG is infallible");
+        assert_eq!(wrong_output, [0; 31]);
+        assert_eq!(
+            wrong_length
+                .finish::<(), ()>(Ok(()))
+                .expect_err("wrong IKM length must discard the artifact")
+                .code(),
+            "remote.transport.pairing_entropy_contract_violation"
+        );
+
+        let mut repeated = OneShotHpkeSeedRng::new(Zeroizing::new([0x5d; 32]));
+        let mut first = Zeroizing::new([0_u8; 32]);
+        repeated
+            .try_fill_bytes(first.as_mut())
+            .expect("one-shot RNG is infallible");
+        assert_eq!(first.as_ref(), &[0x5d; 32]);
+        let mut second = [0xa5; 32];
+        repeated
+            .try_fill_bytes(&mut second)
+            .expect("one-shot RNG is infallible");
+        assert_eq!(second, [0; 32]);
+        assert_eq!(
+            repeated
+                .finish::<(), ()>(Ok(()))
+                .expect_err("a repeated request must discard the artifact")
+                .code(),
+            "remote.transport.pairing_entropy_contract_violation"
+        );
+
+        let mut word32 = OneShotHpkeSeedRng::new(Zeroizing::new([0x5e; 32]));
+        assert_eq!(
+            word32.try_next_u32().expect("one-shot RNG is infallible"),
+            0
+        );
+        assert_eq!(
+            word32
+                .finish::<(), ()>(Ok(()))
+                .expect_err("u32 requests must discard the artifact")
+                .code(),
+            "remote.transport.pairing_entropy_contract_violation"
+        );
+
+        let mut word64 = OneShotHpkeSeedRng::new(Zeroizing::new([0x5f; 32]));
+        assert_eq!(
+            word64.try_next_u64().expect("one-shot RNG is infallible"),
+            0
+        );
+        assert_eq!(
+            word64
+                .finish::<(), ()>(Ok(()))
+                .expect_err("u64 requests must discard the artifact")
+                .code(),
+            "remote.transport.pairing_entropy_contract_violation"
+        );
+    }
+
     #[tokio::test]
     async fn pairing_runtime_rejects_wrong_data_cert_role_relay_and_route_without_consuming_lane() {
         let root = SigningKey::from_seed(&[0x31; 32]);
@@ -7376,6 +7990,173 @@ pub(crate) mod tests {
             ));
             fixture.transport.shutdown().await;
         }
+    }
+
+    fn terminal_data(pair_route: PairRouteId, seed: u8) -> PairData {
+        PairData {
+            pair_route,
+            sealed_blob: SealedBlob(vec![seed; 96]),
+        }
+    }
+
+    fn correlated_failure(data: &PairData, code: &str) -> OpaqueRouteFrame {
+        let outbound = frame(RelayFrameBody::PairData(data.clone()));
+        frame(RelayFrameBody::Error(
+            RelayFailure::new(code, "redacted test failure")
+                .in_reply_to(relay_frame_reply_reference(&outbound)),
+        ))
+    }
+
+    async fn assert_terminal_miss_yields_matching_close(
+        lane: &mut PairingTransportLane,
+        harness: &Harness,
+        pair_route: PairRouteId,
+        outcome: PairRouteCloseOutcome,
+    ) {
+        let terminal = terminal_data(pair_route, 0xd1);
+        lane.send_pair_terminal_and_close(
+            terminal.clone(),
+            ClosePairRoute {
+                machine_route: ROUTE,
+                pair_route,
+            },
+        )
+        .await
+        .expect("atomically flush terminal then Close");
+        harness.push_incoming(correlated_failure(&terminal, RELAY_ROUTE_NOT_FOUND));
+        let closed = PairRouteClosed {
+            pair_route,
+            outcome,
+        };
+        harness.push_incoming(frame(RelayFrameBody::PairRouteClosed(closed.clone())));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), lane.next_event())
+                .await
+                .expect("matching Close ACK must not be starved")
+                .expect("expected terminal miss is not a transport failure"),
+            Some(PairingTransportEvent::PairRouteClosed(observed)) if observed == closed
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_not_found_for_offline_pairing_peer_does_not_preempt_closed_ack() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        let pair_route = PairRouteId::from_bytes([0xd1; 16]);
+        open_bound_route(&mut lane, &fixture.harness, pair_route, 10_021).await;
+
+        assert_terminal_miss_yields_matching_close(
+            &mut lane,
+            &fixture.harness,
+            pair_route,
+            PairRouteCloseOutcome::Closed,
+        )
+        .await;
+        assert_eq!(fixture.harness.reconnects.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            lane.generation.load(Ordering::Acquire),
+            INITIAL_PAIRING_GENERATION
+        );
+        fixture.transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_not_found_after_lost_close_ack_does_not_preempt_already_absent_ack() {
+        let mut fixture = connected_fixture(Vec::new(), None).await;
+        let mut lane = fixture
+            .transport
+            .take_pairing_lane(fixture.data_cert.clone())
+            .unwrap();
+        lane.reconnect()
+            .await
+            .expect("model daemon restart with a fresh transport generation");
+        let pair_route = PairRouteId::from_bytes([0xd2; 16]);
+
+        assert_terminal_miss_yields_matching_close(
+            &mut lane,
+            &fixture.harness,
+            pair_route,
+            PairRouteCloseOutcome::AlreadyAbsent,
+        )
+        .await;
+        assert_eq!(fixture.harness.reconnects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            lane.generation.load(Ordering::Acquire),
+            INITIAL_PAIRING_GENERATION + 1
+        );
+        fixture.transport.shutdown().await;
+    }
+
+    #[test]
+    fn terminal_not_found_suppression_requires_exact_current_closing_one_shot_binding() {
+        let pair_route = PairRouteId::from_bytes([0xd3; 16]);
+        let terminal = terminal_data(pair_route, 0xd3);
+        let terminal_command = PairingCommand::TerminalData(terminal.clone());
+        let close_command = PairingCommand::Close(ClosePairRoute {
+            machine_route: ROUTE,
+            pair_route,
+        });
+        let exact_failure = || correlated_failure(&terminal, RELAY_ROUTE_NOT_FOUND);
+        let decode = |bindings: &mut PairingBindings, frame: OpaqueRouteFrame| {
+            decode_inbound(
+                ROUTE,
+                INITIAL_PAIRING_GENERATION,
+                bindings,
+                &mut PublicationBindings::default(),
+                frame,
+            )
+        };
+
+        let mut nonclosing = PairingBindings::default()
+            .prepare_outbound(ROUTE, &terminal_command)
+            .unwrap();
+        assert!(matches!(
+            decode(&mut nonclosing, exact_failure()),
+            Ok(InboundDispatch::Shared { .. })
+        ));
+
+        let closing = PairingBindings::default()
+            .prepare_outbound(ROUTE, &terminal_command)
+            .unwrap()
+            .prepare_outbound(ROUTE, &close_command)
+            .unwrap();
+        let mut wrong_hash = closing.clone();
+        assert!(matches!(
+            decode(
+                &mut wrong_hash,
+                correlated_failure(&terminal_data(pair_route, 0xd4), RELAY_ROUTE_NOT_FOUND),
+            ),
+            Ok(InboundDispatch::Shared { .. })
+        ));
+        let mut other_code = closing.clone();
+        assert!(matches!(
+            decode(
+                &mut other_code,
+                correlated_failure(&terminal, "relay.route.forbidden"),
+            ),
+            Ok(InboundDispatch::Shared { .. })
+        ));
+        let mut normal_data = closing.clone();
+        assert!(matches!(
+            decode(
+                &mut normal_data,
+                correlated_failure(&terminal_data(pair_route, 0xd5), RELAY_ROUTE_NOT_FOUND),
+            ),
+            Ok(InboundDispatch::Shared { .. })
+        ));
+
+        let mut exact_once = closing;
+        assert!(matches!(
+            decode(&mut exact_once, exact_failure()),
+            Ok(InboundDispatch::ExpectedTerminalReplayMiss)
+        ));
+        assert!(matches!(
+            decode(&mut exact_once, exact_failure()),
+            Ok(InboundDispatch::Shared { .. })
+        ));
     }
 
     #[tokio::test]

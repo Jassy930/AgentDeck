@@ -11,7 +11,7 @@ use agentdeck_protocol::relay_v2::frame::{
 };
 use agentdeck_protocol::relay_v2::{
     ConnectionInstanceId, MAX_FRAME_BYTES, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFailure,
-    RelayFrameBody, decode,
+    RelayFrameBody, decode, relay_frame_reply_reference,
 };
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -334,20 +334,25 @@ async fn pairing_handshake(
     if services.draining.load(Ordering::Acquire) {
         return Err(draining_failure());
     }
-    let pairing_hello = match next_application_frame(stream, &services.network_ingress).await {
+    let pairing_hello_frame = match next_application_frame(stream, &services.network_ingress).await
+    {
         Ok(Some((
-            OpaqueRouteFrame {
+            frame @ OpaqueRouteFrame {
                 version: RELAY_PROTOCOL_VERSION,
-                body: RelayFrameBody::PairingHello(pairing_hello),
+                body: RelayFrameBody::PairingHello(_),
             },
             _network_permit,
-        ))) => pairing_hello,
+        ))) => frame,
         Ok(_) | Err(_) => {
             return Err(RelayFailure::new(
                 "relay.auth.handshake_invalid",
                 "expected PairingHello",
             ));
         }
+    };
+    let reply_reference = relay_frame_reply_reference(&pairing_hello_frame);
+    let RelayFrameBody::PairingHello(pairing_hello) = pairing_hello_frame.body else {
+        unreachable!("PairingHello pattern was checked above")
     };
     let WirePairingHello {
         relay_server_id,
@@ -360,6 +365,14 @@ async fn pairing_handshake(
         ));
     }
     let view = services.core.pair_route_view(pair_route).await?;
+    if view.tombstoned {
+        let failure = writer
+            .try_begin_pair_route_unavailable(reply_reference)
+            .map_err(|_| {
+                RelayFailure::new("relay.connection.backpressure", "connection unavailable")
+            })?;
+        return Err(failure);
+    }
     let access = authorize_pairing_route(
         AuthorizationPairingHello {
             protocol_version: RELAY_PROTOCOL_VERSION,
@@ -455,7 +468,11 @@ async fn reader_loop(
         if services.draining.load(Ordering::Acquire) {
             continue;
         }
-        if let Err(error) = services.core.handle(&access, inbound).await {
+        let reply_reference = relay_frame_reply_reference(&inbound);
+        if let Err(mut error) = services.core.handle(&access, inbound).await {
+            if error.in_reply_to.is_none() {
+                error.in_reply_to = Some(reply_reference);
+            }
             writer
                 .try_enqueue_control(frame(RelayFrameBody::Error(error)))
                 .map_err(|_| {

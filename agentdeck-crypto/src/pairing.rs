@@ -10,14 +10,14 @@ use agentdeck_protocol::e2ee::{
     KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyId, KeyUpdateInfoV1,
     MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairInviteV1, PairPendingV1,
     PairRequestInfoV1, PairRequestPlaintextV1, PairRequestV1, PairResponseInfoV1,
-    PairResponsePlaintextV1, PairResponseReceivedV1, PairResponseV1, PairingControlEnvelopeV1,
-    PairingEnvelopeTbsV1, PairingError,
+    PairResponsePlaintextV1, PairResponseReceivedV1, PairResponseV1, PairTerminalOutcomeV1,
+    PairTerminalV1, PairingControlEnvelopeV1, PairingEnvelopeTbsV1, PairingError,
 };
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::{
     CertRole, Ed25519Signature, PublicKeyBytes, RelayGrant, SignedCertificate,
 };
-use agentdeck_protocol::relay_v2::id::{RelayServerId, StreamRouteId};
+use agentdeck_protocol::relay_v2::id::{MachineRouteId, RelayServerId, StreamRouteId};
 use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -127,6 +127,59 @@ pub struct PairResponseSealAuthority<'a> {
     pub machine_data_signing_key: &'a SigningKey,
     pub signer: &'a MachineDataSignerBindingV1,
     pub machine_root_verifying_key: &'a VerifyingKey,
+}
+
+/// PairTerminal 验证必须匹配的本地 pending identity。
+///
+/// 字段私有，避免调用方在 open 后才选择性比较其中一个轴。该 expectation 必须来自本地
+/// pending record，不能从收到的 terminal plaintext 反向构造。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PairTerminalExpectedV1 {
+    machine_route: MachineRouteId,
+    request_hash: [u8; 32],
+}
+
+impl std::fmt::Debug for PairTerminalExpectedV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PairTerminalExpectedV1([REDACTED])")
+    }
+}
+
+impl PairTerminalExpectedV1 {
+    pub fn new(machine_route: MachineRouteId, request_hash: [u8; 32]) -> Result<Self, CryptoError> {
+        if machine_route.as_bytes().iter().all(|byte| *byte == 0)
+            || request_hash.iter().all(|byte| *byte == 0)
+        {
+            return Err(CryptoError::InvalidPairing(PairingError::InvalidField(
+                "PairTerminal expectation",
+            )));
+        }
+        Ok(Self {
+            machine_route,
+            request_hash,
+        })
+    }
+
+    #[must_use]
+    pub const fn machine_route(&self) -> MachineRouteId {
+        self.machine_route
+    }
+
+    #[must_use]
+    pub const fn request_hash(&self) -> [u8; 32] {
+        self.request_hash
+    }
+
+    fn validate_terminal(&self, terminal: &PairTerminalV1) -> Result<(), CryptoError> {
+        if terminal.machine_route != self.machine_route
+            || terminal.request_hash != self.request_hash
+        {
+            return Err(CryptoError::InvalidPairing(
+                PairingError::ContextBindingMismatch,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for PairResponseSealAuthority<'_> {
@@ -787,6 +840,109 @@ pub fn open_pair_pending(
     Ok(pending)
 }
 
+/// 用 exact PairTerminal typed TBS 产生 MachineDataSign 签名。
+pub fn sign_pair_terminal(
+    machine_data_signing_key: &SigningKey,
+    info: &PairRequestInfoV1,
+    context: &OuterContextV1,
+    signer: &MachineDataSignerBindingV1,
+    mut terminal: PairTerminalV1,
+) -> Result<PairTerminalV1, CryptoError> {
+    require_signer(
+        &machine_data_signing_key.verifying_key(),
+        signer.signing_key_fingerprint,
+    )?;
+    let tbs = terminal.signature_tbs(info, context, signer)?;
+    terminal.signature = sign_validated_terminal_tbs(machine_data_signing_key, &tbs)?;
+    terminal.canonical_bytes()?;
+    Ok(terminal)
+}
+
+/// 验证 PairTerminal 的 exact local pending identity、MachineDataSign provenance 与 typed TBS。
+pub fn verify_pair_terminal(
+    machine_data_verifying_key: &VerifyingKey,
+    info: &PairRequestInfoV1,
+    context: &OuterContextV1,
+    expected: PairTerminalExpectedV1,
+    signer: &MachineDataSignerBindingV1,
+    terminal: &PairTerminalV1,
+) -> Result<(), CryptoError> {
+    terminal.validate()?;
+    expected.validate_terminal(terminal)?;
+    require_signer(machine_data_verifying_key, signer.signing_key_fingerprint)?;
+    let tbs = terminal.signature_tbs(info, context, signer)?;
+    verify_validated_terminal_tbs(machine_data_verifying_key, &tbs, &terminal.signature)
+}
+
+/// MachineDataSign 后用 recipient DeviceHPKE 封装 PairTerminal。
+pub fn seal_pair_terminal<R: ::hpke::rand_core::CryptoRng>(
+    recipient_device_hpke: &HpkePublicKey,
+    info: &PairRequestInfoV1,
+    context: &OuterContextV1,
+    terminal: PairTerminalV1,
+    machine_data_signing_key: &SigningKey,
+    signer: &MachineDataSignerBindingV1,
+    rng: &mut R,
+) -> Result<PairingControlEnvelopeV1, CryptoError> {
+    let terminal = sign_pair_terminal(machine_data_signing_key, info, context, signer, terminal)?;
+    let sealed = hpke_seal_base(
+        recipient_device_hpke,
+        &info.encode(),
+        &context.encode_aad(),
+        &terminal.canonical_bytes()?,
+        rng,
+    )?;
+    let envelope = PairingControlEnvelopeV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        enc: sealed.enc,
+        ciphertext: sealed.ciphertext,
+    };
+    envelope.validate()?;
+    Ok(envelope)
+}
+
+/// 用 recipient DeviceHPKE 打开 PairTerminal，并在返回前完成 exact expectation 与签名验证。
+pub fn open_pair_terminal(
+    recipient_device_hpke: &HpkePrivateKey,
+    info: &PairRequestInfoV1,
+    context: &OuterContextV1,
+    expected: PairTerminalExpectedV1,
+    envelope: &PairingControlEnvelopeV1,
+    machine_data_verifying_key: &VerifyingKey,
+    signer: &MachineDataSignerBindingV1,
+) -> Result<PairTerminalV1, CryptoError> {
+    envelope.validate()?;
+    require_signer(machine_data_verifying_key, signer.signing_key_fingerprint)?;
+
+    // 在 HPKE 前先 fail-close caller-provided route/AAD 与 signer shape；plaintext identity
+    // 只能在 open 后比较，但绝不返回尚未验签/未匹配 expectation 的值。
+    let probe = PairTerminalV1 {
+        machine_route: expected.machine_route,
+        request_hash: expected.request_hash,
+        outcome: PairTerminalOutcomeV1::Canceled,
+        signature: Ed25519Signature([0; 64]),
+    };
+    probe.signature_tbs(info, context, signer)?;
+
+    let opened = hpke_open_base(
+        recipient_device_hpke,
+        &info.encode(),
+        &context.encode_aad(),
+        &hpke_envelope(&envelope.enc, &envelope.ciphertext),
+    )?;
+    let terminal =
+        PairTerminalV1::from_canonical_bytes(&opened).map_err(|_| CryptoError::BadCiphertext)?;
+    verify_pair_terminal(
+        machine_data_verifying_key,
+        info,
+        context,
+        expected,
+        signer,
+        &terminal,
+    )?;
+    Ok(terminal)
+}
+
 pub fn sign_device_authorization(
     root_signing_key: &SigningKey,
     relay_server_id: RelayServerId,
@@ -916,6 +1072,23 @@ fn sign_validated_pending_tbs(
 fn verify_validated_pending_tbs(
     key: &VerifyingKey,
     tbs: &agentdeck_protocol::e2ee::PairPendingTbsV1,
+    signature: &Ed25519Signature,
+) -> Result<(), CryptoError> {
+    tbs.validate()?;
+    verify_raw(key, &tbs.encode()?, signature)
+}
+
+fn sign_validated_terminal_tbs(
+    key: &SigningKey,
+    tbs: &agentdeck_protocol::e2ee::PairTerminalTbsV1,
+) -> Result<Ed25519Signature, CryptoError> {
+    tbs.validate()?;
+    Ok(sign_raw(key, &tbs.encode()?))
+}
+
+fn verify_validated_terminal_tbs(
+    key: &VerifyingKey,
+    tbs: &agentdeck_protocol::e2ee::PairTerminalTbsV1,
     signature: &Ed25519Signature,
 ) -> Result<(), CryptoError> {
     tbs.validate()?;

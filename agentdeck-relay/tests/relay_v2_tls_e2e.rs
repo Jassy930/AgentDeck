@@ -13,16 +13,17 @@ use agentdeck_crypto::{SigningKey, sha256, sign_authentication_transcript, sign_
 use agentdeck_protocol::relay_v2::auth::{
     AuthenticationRole, AuthenticationTranscriptV1, CertRole,
 };
-use agentdeck_protocol::relay_v2::failure::RELAY_ROUTE_FORBIDDEN;
+use agentdeck_protocol::relay_v2::failure::{RELAY_ROUTE_FORBIDDEN, RELAY_ROUTE_NOT_FOUND};
 use agentdeck_protocol::relay_v2::frame::{
-    AuthProof, Authenticate, Hello, OpenPairRoute, PairData, PairingHello, RevocationCommitted,
-    SealedBlob, Subscribe,
+    AuthProof, Authenticate, ClosePairRoute, Hello, OpenPairRoute, PairData, PairRouteCloseOutcome,
+    PairingHello, RevocationCommitted, SealedBlob, Subscribe,
 };
 use agentdeck_protocol::relay_v2::{
     DeviceRevocation, DeviceRouteId, Ed25519Signature, GrantSerial, LinkGeneration,
     MAX_FRAME_BYTES, MachineRouteId, OpaqueRouteFrame, PairRouteId, PublicKeyBytes,
     RELAY_PROTOCOL_VERSION, RelayFrameBody, RelayGrant, RelayServerId, RootKeyId,
     SignedCertificate, StreamCursor, StreamGenerationId, StreamRouteId, TrustEpoch, decode, encode,
+    relay_frame_reply_reference,
 };
 use agentdeck_relay::config::{
     RelayV2ServerConfig, RelayV2StoreSettings, RelayV2TlsPaths, RelayV2TransportMode,
@@ -354,6 +355,64 @@ async fn authenticate_machine(socket: &mut TestSocket, realm: &SeededRealm) {
         receive_relay_frame(socket).await.body,
         RelayFrameBody::Authenticated(_)
     ));
+}
+
+async fn open_pair_route(
+    socket: &mut TestSocket,
+    realm: &SeededRealm,
+    pair_route: PairRouteId,
+    absolute_expiry_ms: u64,
+) {
+    socket
+        .send(Message::Binary(
+            encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::OpenPairRoute(OpenPairRoute {
+                    machine_route: realm.machine_route,
+                    pair_route,
+                    absolute_expiry_ms,
+                }),
+            })
+            .into(),
+        ))
+        .await
+        .expect("send real Relay OpenPairRoute");
+    let RelayFrameBody::PairRouteOpened(opened) = receive_relay_frame(socket).await.body else {
+        panic!("real Relay must acknowledge OpenPairRoute");
+    };
+    assert_eq!(opened.machine_route, realm.machine_route);
+    assert_eq!(opened.pair_route, pair_route);
+    assert_eq!(opened.absolute_expiry_ms, absolute_expiry_ms);
+}
+
+async fn connect_pairing_route(
+    address: SocketAddr,
+    realm: &SeededRealm,
+    pair_route: PairRouteId,
+) -> TestSocket {
+    let mut pairing = connect_path(address, "/v2/pair").await;
+    pairing
+        .send(Message::Binary(encode(&hello()).into()))
+        .await
+        .expect("send pairing Hello");
+    pairing
+        .send(Message::Binary(
+            encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::PairingHello(PairingHello {
+                    relay_server_id: realm.relay_server_id,
+                    pair_route,
+                }),
+            })
+            .into(),
+        ))
+        .await
+        .expect("send PairingHello");
+    assert!(matches!(
+        receive_relay_frame(&mut pairing).await.body,
+        RelayFrameBody::Authenticated(_)
+    ));
+    pairing
 }
 
 async fn assert_rejected_without_application_binary(mut socket: TestSocket) {
@@ -704,6 +763,225 @@ async fn production_v2_client_authenticates_against_the_real_relay_listener() {
         .shutdown()
         .await
         .expect("shutdown real Relay listener");
+}
+
+#[tokio::test]
+async fn real_relay_terminal_miss_then_close_converges_for_offline_and_lost_ack_replay() {
+    let temp = TempDir::new().expect("tempdir");
+    let (config, _) = server_config(&temp);
+    let realm = seed_realm(&config, false).await;
+    let handle = RelayV2ServerHandle::start(config)
+        .await
+        .expect("start seeded real Relay server");
+    let mut machine = connect(handle.public_addr()).await;
+    authenticate_machine(&mut machine, &realm).await;
+
+    // Active route，但 pairing requester 已离线：terminal PairData 返回 exact-correlated
+    // not_found，随后同一 machine Close 仍必须提交 Closed。
+    let offline_route = PairRouteId::from_bytes([0xd1; 16]);
+    let offline_expiry = unix_now_ms().saturating_add(60_000);
+    open_pair_route(&mut machine, &realm, offline_route, offline_expiry).await;
+    let offline_terminal = OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::PairData(PairData {
+            pair_route: offline_route,
+            sealed_blob: SealedBlob(vec![0xd1; 96]),
+        }),
+    };
+    machine
+        .send(Message::Binary(encode(&offline_terminal).into()))
+        .await
+        .expect("flush terminal toward offline pairing requester");
+    let RelayFrameBody::Error(offline_error) = receive_relay_frame(&mut machine).await.body else {
+        panic!("offline terminal replay must return correlated route error");
+    };
+    assert_eq!(offline_error.code, RELAY_ROUTE_NOT_FOUND);
+    let offline_reference = relay_frame_reply_reference(&offline_terminal);
+    assert_eq!(
+        offline_error.in_reply_to.as_deref(),
+        Some(offline_reference.as_str())
+    );
+    machine
+        .send(Message::Binary(
+            encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::ClosePairRoute(ClosePairRoute {
+                    machine_route: realm.machine_route,
+                    pair_route: offline_route,
+                }),
+            })
+            .into(),
+        ))
+        .await
+        .expect("close active route after terminal miss");
+    let RelayFrameBody::PairRouteClosed(offline_closed) =
+        receive_relay_frame(&mut machine).await.body
+    else {
+        panic!("terminal miss must not prevent Closed");
+    };
+    assert_eq!(offline_closed.pair_route, offline_route);
+    assert_eq!(offline_closed.outcome, PairRouteCloseOutcome::Closed);
+
+    // 第二条 route 让 pairing peer 作为 Relay COMMIT witness。machine Close ACK 不读取便
+    // 丢弃连接；新 generation 重放 exact terminal 后应得到 correlated not_found，再由
+    // Close 的 AlreadyAbsent 收敛，证明 tombstone + ACK lost/restart cut。
+    let replay_route = PairRouteId::from_bytes([0xd2; 16]);
+    let replay_expiry = unix_now_ms().saturating_add(60_000);
+    open_pair_route(&mut machine, &realm, replay_route, replay_expiry).await;
+    let mut pairing = connect_pairing_route(handle.public_addr(), &realm, replay_route).await;
+    let replay_terminal = OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::PairData(PairData {
+            pair_route: replay_route,
+            sealed_blob: SealedBlob(vec![0xd2; 96]),
+        }),
+    };
+    machine
+        .send(Message::Binary(encode(&replay_terminal).into()))
+        .await
+        .expect("flush terminal before close cut");
+    assert_eq!(
+        receive_relay_frame(&mut pairing).await,
+        replay_terminal,
+        "pairing peer witnesses terminal flush"
+    );
+    assert!(matches!(
+        receive_relay_frame(&mut machine).await.body,
+        RelayFrameBody::RouteAccepted(_)
+    ));
+    machine
+        .send(Message::Binary(
+            encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::ClosePairRoute(ClosePairRoute {
+                    machine_route: realm.machine_route,
+                    pair_route: replay_route,
+                }),
+            })
+            .into(),
+        ))
+        .await
+        .expect("flush Close whose machine ACK will be lost");
+    let RelayFrameBody::PairRouteClosed(commit_witness) =
+        receive_relay_frame(&mut pairing).await.body
+    else {
+        panic!("pairing peer must witness committed Close");
+    };
+    assert_eq!(commit_witness.pair_route, replay_route);
+    assert_eq!(commit_witness.outcome, PairRouteCloseOutcome::Closed);
+    drop(machine);
+    drop(pairing);
+
+    // Pairing 侧也在 Close ACK 丢失后重连：只有持有 exact tombstoned route 的
+    // PairingHello 得到 canonical correlated failure，且该 failure flush 后断链。
+    let mut pairing_retry = connect_path(handle.public_addr(), "/v2/pair").await;
+    pairing_retry
+        .send(Message::Binary(encode(&hello()).into()))
+        .await
+        .expect("send retry pairing Hello");
+    let tombstone_hello = OpaqueRouteFrame {
+        version: RELAY_PROTOCOL_VERSION,
+        body: RelayFrameBody::PairingHello(PairingHello {
+            relay_server_id: realm.relay_server_id,
+            pair_route: replay_route,
+        }),
+    };
+    pairing_retry
+        .send(Message::Binary(encode(&tombstone_hello).into()))
+        .await
+        .expect("send PairingHello for exact tombstone");
+    let RelayFrameBody::Error(tombstone_error) = receive_relay_frame(&mut pairing_retry).await.body
+    else {
+        panic!("exact tombstone handshake must return a correlated failure");
+    };
+    assert_eq!(tombstone_error.code, RELAY_ROUTE_NOT_FOUND);
+    let tombstone_reference = relay_frame_reply_reference(&tombstone_hello);
+    assert_eq!(
+        tombstone_error.in_reply_to.as_deref(),
+        Some(tombstone_reference.as_str())
+    );
+    assert_rejected_without_application_binary(pairing_retry).await;
+
+    // 未曾存在的 route 继续静默 fail-close，不能借同一 endpoint 构造 existence oracle。
+    let mut unknown_pairing = connect_path(handle.public_addr(), "/v2/pair").await;
+    unknown_pairing
+        .send(Message::Binary(encode(&hello()).into()))
+        .await
+        .expect("send unknown-route pairing Hello");
+    unknown_pairing
+        .send(Message::Binary(
+            encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::PairingHello(PairingHello {
+                    relay_server_id: realm.relay_server_id,
+                    pair_route: PairRouteId::from_bytes([0xde; 16]),
+                }),
+            })
+            .into(),
+        ))
+        .await
+        .expect("send unknown PairingHello");
+    assert_rejected_without_application_binary(unknown_pairing).await;
+
+    let mut wrong_server_pairing = connect_path(handle.public_addr(), "/v2/pair").await;
+    wrong_server_pairing
+        .send(Message::Binary(encode(&hello()).into()))
+        .await
+        .expect("send wrong-server pairing Hello");
+    wrong_server_pairing
+        .send(Message::Binary(
+            encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::PairingHello(PairingHello {
+                    relay_server_id: RelayServerId::from_bytes([0xdf; 16]),
+                    pair_route: replay_route,
+                }),
+            })
+            .into(),
+        ))
+        .await
+        .expect("send exact tombstone under wrong Relay identity");
+    assert_rejected_without_application_binary(wrong_server_pairing).await;
+
+    let mut replacement = connect(handle.public_addr()).await;
+    authenticate_machine(&mut replacement, &realm).await;
+    replacement
+        .send(Message::Binary(encode(&replay_terminal).into()))
+        .await
+        .expect("restart replays exact durable terminal");
+    let RelayFrameBody::Error(replay_error) = receive_relay_frame(&mut replacement).await.body
+    else {
+        panic!("tombstone terminal replay must return correlated route error");
+    };
+    assert_eq!(replay_error.code, RELAY_ROUTE_NOT_FOUND);
+    let replay_reference = relay_frame_reply_reference(&replay_terminal);
+    assert_eq!(
+        replay_error.in_reply_to.as_deref(),
+        Some(replay_reference.as_str())
+    );
+    replacement
+        .send(Message::Binary(
+            encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::ClosePairRoute(ClosePairRoute {
+                    machine_route: realm.machine_route,
+                    pair_route: replay_route,
+                }),
+            })
+            .into(),
+        ))
+        .await
+        .expect("retry Close against real tombstone");
+    let RelayFrameBody::PairRouteClosed(replayed_close) =
+        receive_relay_frame(&mut replacement).await.body
+    else {
+        panic!("restart Close must return AlreadyAbsent");
+    };
+    assert_eq!(replayed_close.pair_route, replay_route);
+    assert_eq!(replayed_close.outcome, PairRouteCloseOutcome::AlreadyAbsent);
+
+    drop(replacement);
+    handle.shutdown().await.expect("shutdown real Relay server");
 }
 
 #[tokio::test]

@@ -4,21 +4,23 @@ use ed25519_dalek::Signer;
 
 use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
 use agentdeck_crypto::{
-    CryptoError, HpkePrivateKey, PairResponseExpectedV1, PairResponseSealAuthority, SecretAeadKey,
-    SigningKey, derive_nonce_prefix, hpke_seal_base, open_pair_pending, open_pair_request,
-    open_pair_request_verified, open_pair_response, open_pair_response_received,
-    open_pair_response_verified, seal_key_directory_entry, seal_pair_pending, seal_pair_request,
-    seal_pair_response, seal_pair_response_received, sha256, sign_device_authorization,
-    sign_key_directory, sign_pair_response_received, sign_tbs, verify_device_authorization,
-    verify_pair_request_envelope, verify_pair_response_envelope, verify_pair_response_received,
+    CryptoError, HpkePrivateKey, PairResponseExpectedV1, PairResponseSealAuthority,
+    PairTerminalExpectedV1, SecretAeadKey, SigningKey, derive_nonce_prefix, hpke_seal_base,
+    open_pair_pending, open_pair_request, open_pair_request_verified, open_pair_response,
+    open_pair_response_received, open_pair_response_verified, open_pair_terminal,
+    seal_key_directory_entry, seal_pair_pending, seal_pair_request, seal_pair_response,
+    seal_pair_response_received, seal_pair_terminal, sha256, sign_device_authorization,
+    sign_key_directory, sign_pair_response_received, sign_pair_terminal, sign_tbs,
+    verify_device_authorization, verify_pair_request_envelope, verify_pair_response_envelope,
+    verify_pair_response_received, verify_pair_terminal,
 };
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,
     DeviceAuthorizationV1, E2EE_FORMAT_VERSION, KeyDirectoryEntry, KeyDirectorySignatureContextV1,
     KeyDirectoryV1, KeyId, KeyPurpose, KeyUpdateInfoV1, MachineDataSignerBindingV1, OuterContextV1,
     OuterFrameKind, PairInviteV1, PairRequestInfoV1, PairRequestPlaintextV1, PairResponseInfoV1,
-    PairResponsePlaintextV1, PairResponseReceivedV1, PairResponseV1, PairingEnvelopeTbsV1,
-    PairingError,
+    PairResponsePlaintextV1, PairResponseReceivedV1, PairResponseV1, PairTerminalOutcomeV1,
+    PairTerminalV1, PairingEnvelopeTbsV1, PairingError,
 };
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
 use agentdeck_protocol::relay_v2::auth::{
@@ -1287,6 +1289,289 @@ fn pair_pending_is_signed_then_hpke_encrypted_and_request_hash_is_not_relay_visi
             &signer,
         ),
         Err(CryptoError::BadCiphertext)
+    );
+}
+
+#[test]
+fn pair_terminal_sign_verify_binds_exact_pending_identity_outcome_and_certificate() {
+    let data = SigningKey::from_seed(&[0xd1; 32]);
+    let root = SigningKey::from_seed(&[0xd2; 32]);
+    let certificate = signed_data_certificate(&root, &data);
+    let signer = MachineDataSignerBindingV1::from_certificate(&certificate).unwrap();
+    let request_hash = [0xd3; 32];
+    let expected = PairTerminalExpectedV1::new(machine_route(), request_hash).unwrap();
+    let expected_debug = format!("{expected:?}");
+    assert!(expected_debug.contains("[REDACTED]"));
+    assert!(!expected_debug.contains("d3d3d3d3"));
+    let info = request_info();
+    let terminal_context = context(OuterFrameKind::PairTerminal);
+    let signed = sign_pair_terminal(
+        &data,
+        &info,
+        &terminal_context,
+        &signer,
+        PairTerminalV1 {
+            machine_route: machine_route(),
+            request_hash,
+            outcome: PairTerminalOutcomeV1::Canceled,
+            signature: Ed25519Signature([0; 64]),
+        },
+    )
+    .unwrap();
+    verify_pair_terminal(
+        &data.verifying_key(),
+        &info,
+        &terminal_context,
+        expected,
+        &signer,
+        &signed,
+    )
+    .unwrap();
+
+    let mut outcome = signed.clone();
+    outcome.outcome = PairTerminalOutcomeV1::Expired;
+    assert_eq!(
+        verify_pair_terminal(
+            &data.verifying_key(),
+            &info,
+            &terminal_context,
+            expected,
+            &signer,
+            &outcome,
+        ),
+        Err(CryptoError::BadSignature)
+    );
+    let mut signature = signed.clone();
+    signature.signature.0[0] ^= 1;
+    assert_eq!(
+        verify_pair_terminal(
+            &data.verifying_key(),
+            &info,
+            &terminal_context,
+            expected,
+            &signer,
+            &signature,
+        ),
+        Err(CryptoError::BadSignature)
+    );
+
+    let wrong_request = PairTerminalExpectedV1::new(machine_route(), [0xd4; 32]).unwrap();
+    assert_eq!(
+        verify_pair_terminal(
+            &data.verifying_key(),
+            &info,
+            &terminal_context,
+            wrong_request,
+            &signer,
+            &signed,
+        ),
+        Err(CryptoError::InvalidPairing(
+            PairingError::ContextBindingMismatch
+        ))
+    );
+    let wrong_machine =
+        PairTerminalExpectedV1::new(MachineRouteId::from_bytes([0xd5; 16]), request_hash).unwrap();
+    assert_eq!(
+        verify_pair_terminal(
+            &data.verifying_key(),
+            &info,
+            &terminal_context,
+            wrong_machine,
+            &signer,
+            &signed,
+        ),
+        Err(CryptoError::InvalidPairing(
+            PairingError::ContextBindingMismatch
+        ))
+    );
+
+    let mut changed_certificate = certificate;
+    changed_certificate.signature.0[0] ^= 1;
+    let changed_signer =
+        MachineDataSignerBindingV1::from_certificate(&changed_certificate).unwrap();
+    assert_eq!(
+        verify_pair_terminal(
+            &data.verifying_key(),
+            &info,
+            &terminal_context,
+            expected,
+            &changed_signer,
+            &signed,
+        ),
+        Err(CryptoError::BadSignature),
+        "the full MachineDataSign certificate hash is part of the TBS"
+    );
+
+    let other_data = SigningKey::from_seed(&[0xd6; 32]);
+    assert!(matches!(
+        verify_pair_terminal(
+            &other_data.verifying_key(),
+            &info,
+            &terminal_context,
+            expected,
+            &signer,
+            &signed,
+        ),
+        Err(CryptoError::InvalidKey(_))
+    ));
+    assert_eq!(
+        verify_pair_terminal(
+            &data.verifying_key(),
+            &info,
+            &context(OuterFrameKind::PairPending),
+            expected,
+            &signer,
+            &signed,
+        ),
+        Err(CryptoError::InvalidPairing(
+            PairingError::ContextBindingMismatch
+        ))
+    );
+}
+
+#[test]
+fn pair_terminal_device_hpke_open_is_strict_on_aad_request_route_cert_and_tamper() {
+    let data = SigningKey::from_seed(&[0xe1; 32]);
+    let root = SigningKey::from_seed(&[0xe2; 32]);
+    let certificate = signed_data_certificate(&root, &data);
+    let signer = MachineDataSignerBindingV1::from_certificate(&certificate).unwrap();
+    let (device_private, device_public) = HpkePrivateKey::derive_keypair(&[0xe3; 32]);
+    let info = request_info();
+    let terminal_context = context(OuterFrameKind::PairTerminal);
+    let request_hash = [0xe4; 32];
+    let expected = PairTerminalExpectedV1::new(machine_route(), request_hash).unwrap();
+    let mut rng = DeterministicRng::new([0xe5; 32]);
+    let envelope = seal_pair_terminal(
+        &device_public,
+        &info,
+        &terminal_context,
+        PairTerminalV1 {
+            machine_route: machine_route(),
+            request_hash,
+            outcome: PairTerminalOutcomeV1::Expired,
+            signature: Ed25519Signature([0; 64]),
+        },
+        &data,
+        &signer,
+        &mut rng,
+    )
+    .unwrap();
+
+    let relay_visible = serde_json::to_value(&envelope).unwrap();
+    assert_eq!(relay_visible.as_object().unwrap().len(), 3);
+    for hidden in ["machineRoute", "requestHash", "outcome", "signature"] {
+        assert!(relay_visible.get(hidden).is_none());
+    }
+    assert_eq!(
+        open_pair_terminal(
+            &device_private,
+            &info,
+            &terminal_context,
+            expected,
+            &envelope,
+            &data.verifying_key(),
+            &signer,
+        )
+        .unwrap()
+        .outcome,
+        PairTerminalOutcomeV1::Expired
+    );
+
+    let mut tampered = envelope.clone();
+    tampered.ciphertext[0] ^= 1;
+    assert_eq!(
+        open_pair_terminal(
+            &device_private,
+            &info,
+            &terminal_context,
+            expected,
+            &tampered,
+            &data.verifying_key(),
+            &signer,
+        ),
+        Err(CryptoError::BadCiphertext)
+    );
+
+    let wrong_request = PairTerminalExpectedV1::new(machine_route(), [0xe6; 32]).unwrap();
+    assert_eq!(
+        open_pair_terminal(
+            &device_private,
+            &info,
+            &terminal_context,
+            wrong_request,
+            &envelope,
+            &data.verifying_key(),
+            &signer,
+        ),
+        Err(CryptoError::InvalidPairing(
+            PairingError::ContextBindingMismatch
+        ))
+    );
+
+    let mut changed_info = info.clone();
+    changed_info.pair_route = PairRouteId::from_bytes([0xe7; 16]);
+    let mut changed_context = terminal_context.clone();
+    changed_context.pair_route = Some(changed_info.pair_route);
+    assert_eq!(
+        open_pair_terminal(
+            &device_private,
+            &changed_info,
+            &changed_context,
+            expected,
+            &envelope,
+            &data.verifying_key(),
+            &signer,
+        ),
+        Err(CryptoError::BadCiphertext),
+        "PairRequestInfo and exact PairTerminal AAD are both HPKE-bound"
+    );
+
+    let mut changed_certificate = certificate;
+    changed_certificate.generation = LinkGeneration::new(4);
+    let changed_signer =
+        MachineDataSignerBindingV1::from_certificate(&changed_certificate).unwrap();
+    assert_eq!(
+        open_pair_terminal(
+            &device_private,
+            &info,
+            &terminal_context,
+            expected,
+            &envelope,
+            &data.verifying_key(),
+            &changed_signer,
+        ),
+        Err(CryptoError::BadSignature)
+    );
+
+    let (_, other_device_public) = HpkePrivateKey::derive_keypair(&[0xe8; 32]);
+    let mut other_rng = DeterministicRng::new([0xe9; 32]);
+    let other_recipient = seal_pair_terminal(
+        &other_device_public,
+        &info,
+        &terminal_context,
+        PairTerminalV1 {
+            machine_route: machine_route(),
+            request_hash,
+            outcome: PairTerminalOutcomeV1::Canceled,
+            signature: Ed25519Signature([0; 64]),
+        },
+        &data,
+        &signer,
+        &mut other_rng,
+    )
+    .unwrap();
+    assert_eq!(
+        open_pair_terminal(
+            &device_private,
+            &info,
+            &terminal_context,
+            expected,
+            &other_recipient,
+            &data.verifying_key(),
+            &signer,
+        ),
+        Err(CryptoError::BadCiphertext),
+        "only the intended DeviceHPKE recipient can open the carrier"
     );
 }
 

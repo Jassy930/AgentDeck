@@ -11,7 +11,10 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use agentdeck_protocol::relay_v2::{OpaqueRouteFrame, encode};
+use agentdeck_protocol::relay_v2::failure::RELAY_ROUTE_NOT_FOUND;
+use agentdeck_protocol::relay_v2::{
+    OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFailure, RelayFrameBody, encode,
+};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -23,7 +26,7 @@ pub const DEFAULT_NORMAL_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_CONTROL_MAX_FRAMES: usize = 16;
 /// 关键 control 的默认预留 byte 上限（1 MiB）。
 pub const DEFAULT_CONTROL_MAX_BYTES: usize = 1024 * 1024;
-/// 单个 revoke/retirement terminal frame 的硬上限（4 KiB）。
+/// 单个 protocol terminal frame 的硬上限（4 KiB）。
 pub const TERMINAL_MAX_BYTES: usize = 4 * 1024;
 /// 全 Core 同时 queued/in-flight terminal 的硬 frame 上限。
 pub const GLOBAL_TERMINAL_MAX_FRAMES: usize = 4_096;
@@ -89,6 +92,8 @@ pub enum WriterCloseReason {
     Revoked,
     /// root-signed machine retirement terminal 已 flush 或达到 deadline。
     Retired,
+    /// exact PairRoute tombstone readback 已 flush；不代表 principal authentication。
+    PairRouteUnavailable,
 }
 
 /// 普通连接退出尝试关闭 writer 时的原子结果。
@@ -96,7 +101,7 @@ pub enum WriterCloseReason {
 pub enum WriterCloseResult {
     Closed,
     AlreadyClosed(WriterCloseReason),
-    /// revoke/retirement terminal 已接管 writer；普通 reader/socket 退出不得清掉它。
+    /// protocol terminal 已接管 writer；普通 reader/socket 退出不得清掉它。
     TerminalInProgress,
 }
 
@@ -115,6 +120,7 @@ pub enum BeginTerminalError {
     FrameTooLarge,
     Capacity,
     InvalidCloseReason,
+    InvalidFrame,
 }
 
 impl std::error::Error for BeginTerminalError {}
@@ -127,8 +133,9 @@ impl fmt::Display for BeginTerminalError {
             Self::FrameTooLarge => formatter.write_str("terminal frame exceeds hard limit"),
             Self::Capacity => formatter.write_str("global terminal reserve is exhausted"),
             Self::InvalidCloseReason => {
-                formatter.write_str("terminal requires revoked or retired close reason")
+                formatter.write_str("terminal requires a protocol terminal close reason")
             }
+            Self::InvalidFrame => formatter.write_str("terminal frame is invalid"),
         }
     }
 }
@@ -897,6 +904,47 @@ impl OutboundWriter {
         ) {
             return Err(BeginTerminalError::InvalidCloseReason);
         }
+        self.try_begin_terminal_with_reason(frame, close_reason)
+    }
+
+    /// exact PairRoute tombstone 的唯一 pre-auth terminal surface。
+    ///
+    /// 调用方只能提供当前 PairingHello 的 canonical frame hash；failure code/message 与
+    /// close reason 在这里固定，不能借通用 terminal API 伪造其它 pre-auth 结果。
+    pub(crate) fn try_begin_pair_route_unavailable(
+        &self,
+        reply_reference: String,
+    ) -> Result<RelayFailure, BeginTerminalError> {
+        let Some(digest) = reply_reference.strip_prefix("frame-sha256:") else {
+            return Err(BeginTerminalError::InvalidFrame);
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(BeginTerminalError::InvalidFrame);
+        }
+        let failure = RelayFailure::new(
+            RELAY_ROUTE_NOT_FOUND,
+            "pair route is unavailable or expired",
+        )
+        .in_reply_to(reply_reference);
+        self.try_begin_terminal_with_reason(
+            OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::Error(failure.clone()),
+            },
+            WriterCloseReason::PairRouteUnavailable,
+        )?;
+        Ok(failure)
+    }
+
+    fn try_begin_terminal_with_reason(
+        &self,
+        frame: OpaqueRouteFrame,
+        close_reason: WriterCloseReason,
+    ) -> Result<TerminalAdmission, BeginTerminalError> {
         if let Some(reason) = self.shared.lock().close_reason {
             return Err(BeginTerminalError::Closed(reason));
         }
@@ -1975,6 +2023,42 @@ mod tests {
             .expect("one terminal only")
             .mark_flushed();
         assert_eq!(writer.close_reason(), Some(WriterCloseReason::Revoked));
+    }
+
+    #[tokio::test]
+    async fn pair_route_unavailable_terminal_is_typed_correlated_and_narrow() {
+        let (writer, mut receiver) = OutboundWriter::channel();
+        let reference = format!("frame-sha256:{}", "a5".repeat(32));
+        let failure = writer
+            .try_begin_pair_route_unavailable(reference.clone())
+            .expect("stage exact PairRoute tombstone terminal");
+        assert_eq!(failure.code, RELAY_ROUTE_NOT_FOUND);
+        assert_eq!(failure.in_reply_to.as_deref(), Some(reference.as_str()));
+
+        let terminal = receiver.recv().await.expect("terminal delivery");
+        let RelayFrameBody::Error(decoded) =
+            decode(terminal.encoded()).expect("canonical terminal").body
+        else {
+            panic!("PairRoute tombstone must emit Error");
+        };
+        assert_eq!(decoded, failure);
+        terminal.mark_flushed();
+        assert_eq!(
+            writer.close_reason(),
+            Some(WriterCloseReason::PairRouteUnavailable)
+        );
+
+        let (invalid, mut invalid_receiver) = OutboundWriter::channel();
+        assert_eq!(
+            invalid.try_begin_pair_route_unavailable("frame-sha256:ABC".to_owned()),
+            Err(BeginTerminalError::InvalidFrame)
+        );
+        assert_eq!(
+            invalid.try_begin_terminal(replay_complete(), WriterCloseReason::PairRouteUnavailable,),
+            Err(BeginTerminalError::InvalidCloseReason)
+        );
+        assert!(invalid.close(WriterCloseReason::Explicit));
+        assert!(invalid_receiver.recv().await.is_none());
     }
 
     #[tokio::test]

@@ -397,9 +397,14 @@ impl PairRouteRegistry {
             }
             Some(RouteState::Active(_)) | Some(RouteState::Tombstone(_)) | None => None,
         };
+        let tombstoned = matches!(
+            self.routes.get(&pair_route),
+            Some(RouteState::Tombstone(route)) if now_ms < route.absolute_expiry_ms
+        );
         PairRouteView {
             now_ms,
             active_route,
+            tombstoned,
         }
     }
 
@@ -1172,13 +1177,20 @@ mod tests {
         assert_eq!(active.machine_route, owner);
         assert_eq!(active.pair_route, pair);
         assert_eq!(active.absolute_expiry_ms, expiry);
-        assert!(registry.view(route(4), NOW_MS + 9).active_route.is_none());
-        assert!(registry.view(pair, expiry).active_route.is_none());
+        assert!(!view.tombstoned);
+        let unknown = registry.view(route(4), NOW_MS + 9);
+        assert!(unknown.active_route.is_none());
+        assert!(!unknown.tombstoned);
+        let expired = registry.view(pair, expiry);
+        assert!(expired.active_route.is_none());
+        assert!(!expired.tombstoned);
 
         registry
             .close(owner, close(owner, pair), NOW_MS + 9)
             .expect("close");
-        assert!(registry.view(pair, NOW_MS + 9).active_route.is_none());
+        let tombstone = registry.view(pair, NOW_MS + 9);
+        assert!(tombstone.active_route.is_none());
+        assert!(tombstone.tombstoned);
     }
 
     #[test]

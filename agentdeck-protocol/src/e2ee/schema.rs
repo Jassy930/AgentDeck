@@ -44,6 +44,8 @@ pub fn e2ee_schema() -> serde_json::Value {
     insert_schema!("PairRequestPlaintextV1", pairing::PairRequestPlaintextV1);
     insert_schema!("PairRequestV1", pairing::PairRequestV1);
     insert_schema!("PairPendingV1", pairing::PairPendingV1);
+    insert_schema!("PairTerminalOutcomeV1", pairing::PairTerminalOutcomeV1);
+    insert_schema!("PairTerminalV1", pairing::PairTerminalV1);
     insert_schema!("PairResponseV1", pairing::PairResponseV1);
     insert_schema!("PairResponsePlaintextV1", pairing::PairResponsePlaintextV1);
     insert_schema!("PairResponseReceivedV1", pairing::PairResponseReceivedV1);
@@ -56,6 +58,7 @@ pub fn e2ee_schema() -> serde_json::Value {
         pairing::MachineDataSignerBindingV1
     );
     insert_schema!("PairPendingTbsV1", pairing_control::PairPendingTbsV1);
+    insert_schema!("PairTerminalTbsV1", pairing_control::PairTerminalTbsV1);
     insert_schema!(
         "PairResponseReceivedTbsV1",
         pairing_control::PairResponseReceivedTbsV1

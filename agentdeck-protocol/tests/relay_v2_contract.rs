@@ -10,8 +10,8 @@ use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, DeviceAuthorizationV1,
     E2EE_FORMAT_VERSION, EpochBarrierV1, KeyDirectoryEntry, KeyDirectoryV1, KeyId, KeyPurpose,
     KeyUpdateV1, PairInviteV1, PairPendingV1, PairRequestV1, PairResponseInfoV1,
-    PairResponseReceivedV1, PairResponseV1, PairingControlEnvelopeV1, SealedPayloadKind,
-    SealedPayloadV1, UnsignedSealedBlobV1,
+    PairResponseReceivedV1, PairResponseV1, PairTerminalOutcomeV1, PairTerminalV1,
+    PairingControlEnvelopeV1, SealedPayloadKind, SealedPayloadV1, UnsignedSealedBlobV1,
 };
 use agentdeck_protocol::relay_v2::auth::{
     CertRole, DeviceRevocation, Ed25519Signature, PublicKeyBytes, RelayGrant, SignedCertificate,
@@ -383,6 +383,12 @@ fn endpoint_wire_vectors() -> Vec<serde_json::Value> {
         request_hash: [0x31; 32],
         signature: sig(),
     };
+    let pair_terminal = PairTerminalV1 {
+        machine_route: mr(),
+        request_hash: [0x31; 32],
+        outcome: PairTerminalOutcomeV1::Canceled,
+        signature: sig(),
+    };
     let pair_response_received = PairResponseReceivedV1 {
         request_hash: [0x31; 32],
         grant_hash: [0x32; 32],
@@ -443,6 +449,11 @@ fn endpoint_wire_vectors() -> Vec<serde_json::Value> {
             "case": "pairPending",
             "wireType": "PairPendingV1",
             "value": serde_json::to_value(pair_pending).unwrap(),
+        }),
+        serde_json::json!({
+            "case": "pairTerminal",
+            "wireType": "PairTerminalV1",
+            "value": serde_json::to_value(pair_terminal).unwrap(),
         }),
         serde_json::json!({
             "case": "pairingControlEnvelope",

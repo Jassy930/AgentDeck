@@ -195,10 +195,12 @@ pub use pairing::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,
     DeviceAuthorizationV1, MachineDataSignerBindingV1, PairInviteV1, PairPendingV1,
     PairRequestInfoV1, PairRequestPlaintextV1, PairRequestV1, PairResponseInfoV1,
-    PairResponsePlaintextV1, PairResponseReceivedV1, PairResponseV1, PairingEnvelopeKindV1,
-    PairingEnvelopeTbsV1, PairingError,
+    PairResponsePlaintextV1, PairResponseReceivedV1, PairResponseV1, PairTerminalOutcomeV1,
+    PairTerminalV1, PairingEnvelopeKindV1, PairingEnvelopeTbsV1, PairingError,
 };
-pub use pairing_control::{PairPendingTbsV1, PairResponseReceivedTbsV1, PairingControlEnvelopeV1};
+pub use pairing_control::{
+    PairPendingTbsV1, PairResponseReceivedTbsV1, PairTerminalTbsV1, PairingControlEnvelopeV1,
+};
 pub use payload::{
     SealedBlobSignatureVerifier, SealedPayloadKind, SealedPayloadV1, SignedSealedBlobV1,
     UnsignedSealedBlobV1, VerifiedSealedBlobV1,

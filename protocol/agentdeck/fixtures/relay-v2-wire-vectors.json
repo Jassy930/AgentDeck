@@ -69,6 +69,16 @@
       "wireType": "PairPendingV1"
     },
     {
+      "case": "pairTerminal",
+      "value": {
+        "machineRoute": "EREREREREREREREREREREQ==",
+        "outcome": "canceled",
+        "requestHash": "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE=",
+        "signature": "sLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsA=="
+      },
+      "wireType": "PairTerminalV1"
+    },
+    {
       "case": "pairingControlEnvelope",
       "value": {
         "ciphertext": "NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU=",

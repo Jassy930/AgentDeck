@@ -27,6 +27,8 @@ pub enum OuterFrameKind {
     PairResponseReceived,
     /// DeviceReplyTx counter recovery 的独立 DeviceHPKE reply；不使用 reply AEAD key/counter。
     DeviceKeyRecovery,
+    /// daemon 取消或过期 pairing request 的 MachineDataSign + DeviceHPKE terminal control。
+    PairTerminal,
 }
 
 impl OuterFrameKind {
@@ -42,6 +44,7 @@ impl OuterFrameKind {
             OuterFrameKind::PairPending => 7,
             OuterFrameKind::PairResponseReceived => 8,
             OuterFrameKind::DeviceKeyRecovery => 9,
+            OuterFrameKind::PairTerminal => 10,
         }
     }
 }
@@ -181,6 +184,7 @@ impl OuterContextV1 {
                 | OuterFrameKind::PairResponse
                 | OuterFrameKind::PairPending
                 | OuterFrameKind::PairResponseReceived
+                | OuterFrameKind::PairTerminal
         );
         if pairing {
             if self.pair_route.is_none()

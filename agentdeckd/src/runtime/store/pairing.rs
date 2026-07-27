@@ -39,8 +39,8 @@ use super::identity::{
 use super::schema::{RUNTIME_CRYPTO_CONTEXT_VERSION, RUNTIME_SCHEMA_FAMILY};
 use super::sqlite::{RuntimeLedger, RuntimeSqlite};
 
-const PAIRING_TABLE: &[u8] = b"remote_pairings";
-const PAIRING_COLUMN: &[u8] = b"sealed_state";
+pub(super) const PAIRING_TABLE: &[u8] = b"remote_pairings";
+pub(super) const PAIRING_COLUMN: &[u8] = b"sealed_state";
 const OUTBOX_TABLE: &[u8] = b"remote_control_outbox";
 const OUTBOX_COLUMN: &[u8] = b"sealed_frame";
 const PAIRING_PAYLOAD_MAGIC_V1: &[u8; 4] = b"ADP1";
@@ -48,6 +48,7 @@ const PAIRING_PAYLOAD_MAGIC_V2: &[u8; 4] = b"ADP2";
 const PAIRING_PAYLOAD_MAGIC_V3: &[u8; 4] = b"ADP3";
 const PAIRING_PAYLOAD_MAGIC_V4: &[u8; 4] = b"ADP4";
 const PAIRING_PAYLOAD_MAGIC_V5: &[u8; 4] = b"ADP5";
+const PAIRING_PAYLOAD_MAGIC_V6: &[u8; 4] = b"ADP6";
 const PAIRING_METADATA_DOMAIN: &[u8] = b"remote.pairing.metadata.v1";
 const PAIRING_REQUEST_METADATA_DOMAIN: &[u8] = b"remote.pairing.metadata.v2";
 const PAIRING_GRANT_METADATA_DOMAIN: &[u8] = b"remote.pairing.metadata.v3";
@@ -236,6 +237,7 @@ pub(crate) struct PairingInviteRecord {
     pub(super) canonical_install_frame: Option<Vec<u8>>,
     pub(super) global_key_state_hash: Option<[u8; 32]>,
     pub(super) delivery_receipt_hash: Option<[u8; 32]>,
+    pub(super) canonical_pair_terminal_frame: Option<Vec<u8>>,
 }
 
 pub(crate) struct PairPendingPreparation {
@@ -454,6 +456,7 @@ struct StoredPayload {
     canonical_install_frame: Option<Vec<u8>>,
     global_key_state_hash: Option<[u8; 32]>,
     delivery_receipt_hash: Option<[u8; 32]>,
+    canonical_pair_terminal_frame: Option<Vec<u8>>,
 }
 
 pub(super) struct AuthenticatedPairingRow {
@@ -755,8 +758,10 @@ fn decode_payload(encoded: &[u8]) -> Result<StoredPayload, RuntimeStoreError> {
         decode_fields(encoded, PAIRING_PAYLOAD_MAGIC_V3, 11)?
     } else if encoded.get(..4) == Some(&PAIRING_PAYLOAD_MAGIC_V4[..]) {
         decode_fields(encoded, PAIRING_PAYLOAD_MAGIC_V4, 19)?
-    } else {
+    } else if encoded.get(..4) == Some(&PAIRING_PAYLOAD_MAGIC_V5[..]) {
         decode_fields(encoded, PAIRING_PAYLOAD_MAGIC_V5, 20)?
+    } else {
+        decode_fields(encoded, PAIRING_PAYLOAD_MAGIC_V6, 21)?
     };
     let owner = fields[0].to_vec();
     super::journal::decode_canonical_owner(&owner)?;
@@ -799,10 +804,7 @@ fn decode_payload(encoded: &[u8]) -> Result<StoredPayload, RuntimeStoreError> {
                 .try_into()
                 .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?,
         );
-        let pending = (fields.len() >= 11).then(|| fields[10].to_vec());
-        if pending.as_ref().is_some_and(Vec::is_empty) {
-            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-        }
+        let pending = (fields.len() >= 11 && !fields[10].is_empty()).then(|| fields[10].to_vec());
         (Some(request), Some(plaintext), Some(received), pending)
     };
     let (
@@ -814,7 +816,7 @@ fn decode_payload(encoded: &[u8]) -> Result<StoredPayload, RuntimeStoreError> {
         canonical_pair_response,
         canonical_install_frame,
         global_key_state_hash,
-    ) = if fields.len() >= 19 {
+    ) = if fields.len() >= 19 && fields[11..19].iter().any(|field| !field.is_empty()) {
         let required = |index: usize| {
             let value = fields[index];
             (!value.is_empty())
@@ -846,14 +848,23 @@ fn decode_payload(encoded: &[u8]) -> Result<StoredPayload, RuntimeStoreError> {
     } else {
         (None, None, None, None, None, None, None, None)
     };
-    let delivery_receipt_hash = if fields.len() == 20 {
-        let hash: [u8; 32] = fields[19]
-            .try_into()
-            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
-        if hash == [0; 32] {
-            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
-        }
-        Some(hash)
+    let delivery_receipt_hash =
+        if (fields.len() == 20 || fields.len() == 21) && !fields[19].is_empty() {
+            let hash: [u8; 32] = fields[19]
+                .try_into()
+                .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+            if hash == [0; 32] {
+                return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+            }
+            Some(hash)
+        } else {
+            None
+        };
+    let canonical_pair_terminal_frame = if fields.len() == 21 {
+        (!fields[20].is_empty())
+            .then(|| fields[20].to_vec())
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+            .into()
     } else {
         None
     };
@@ -879,10 +890,11 @@ fn decode_payload(encoded: &[u8]) -> Result<StoredPayload, RuntimeStoreError> {
         canonical_install_frame,
         global_key_state_hash,
         delivery_receipt_hash,
+        canonical_pair_terminal_frame,
     })
 }
 
-fn seal(
+pub(super) fn seal(
     key_bundle: &RuntimeKeyBundle,
     database_id: [u8; 16],
     table: &[u8],
@@ -1083,6 +1095,33 @@ fn exact_pending_frame(
     Ok(envelope)
 }
 
+pub(super) fn exact_pair_terminal_frame(
+    bytes: &[u8],
+    expected_pair_route: PairRouteId,
+) -> Result<PairingControlEnvelopeV1, RuntimeStoreError> {
+    let frame = exact_frame(bytes)?;
+    let RelayFrameBody::PairData(PairData {
+        pair_route,
+        sealed_blob,
+    }) = frame.body
+    else {
+        return Err(RuntimeStoreError::PairingConflict);
+    };
+    if pair_route != expected_pair_route {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    let envelope = PairingControlEnvelopeV1::from_canonical_bytes(&sealed_blob.0)
+        .map_err(|_| RuntimeStoreError::PairingConflict)?;
+    if envelope
+        .canonical_bytes()
+        .map_err(|_| RuntimeStoreError::PairingConflict)?
+        != sealed_blob.0
+    {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    Ok(envelope)
+}
+
 fn frozen_frames(
     machine_route: [u8; 16],
     pair_route: [u8; 16],
@@ -1148,7 +1187,9 @@ fn validate_invite_binding(
     Ok(())
 }
 
-fn pair_request_info(invite: &PairInviteV1) -> Result<PairRequestInfoV1, RuntimeStoreError> {
+pub(super) fn pair_request_info(
+    invite: &PairInviteV1,
+) -> Result<PairRequestInfoV1, RuntimeStoreError> {
     Ok(PairRequestInfoV1 {
         e2ee_format_version: E2EE_FORMAT_VERSION,
         runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
@@ -1165,7 +1206,7 @@ fn pair_request_context(invite: &PairInviteV1) -> OuterContextV1 {
     pairing_context(invite, OuterFrameKind::PairRequest)
 }
 
-fn pairing_context(invite: &PairInviteV1, frame_kind: OuterFrameKind) -> OuterContextV1 {
+pub(super) fn pairing_context(invite: &PairInviteV1, frame_kind: OuterFrameKind) -> OuterContextV1 {
     OuterContextV1 {
         frame_kind,
         relay_protocol_version: RELAY_PROTOCOL_VERSION,
@@ -1373,6 +1414,13 @@ fn authenticate_pairing_row(
         Some(frame) => exact_pending_frame(frame, pair_route).is_ok(),
         None => true,
     };
+    let terminal_is_exact = match payload.canonical_pair_terminal_frame.as_deref() {
+        Some(frame) => {
+            exact_pair_terminal_frame(frame, PairRouteId::from_bytes(*pair_route.as_bytes()))
+                .is_ok()
+        }
+        None => true,
+    };
     let grant_payload_absent = payload.grant_hash.is_none()
         && payload.response_hash.is_none()
         && payload.canonical_relay_grant.is_none()
@@ -1399,17 +1447,20 @@ fn authenticate_pairing_row(
                 && device_sign_fingerprint.is_none()
                 && request_material.is_none()
                 && payload.canonical_pending_frame.is_none()
+                && payload.canonical_pair_terminal_frame.is_none()
                 && grant_payload_absent
         }
         PairingInviteLifecycle::Preparing => {
             request_material == request_hash.zip(device_sign_fingerprint)
                 && payload.canonical_pending_frame.is_none()
+                && payload.canonical_pair_terminal_frame.is_none()
                 && grant_payload_absent
         }
         PairingInviteLifecycle::AwaitingLocalConfirmation => {
             request_material == request_hash.zip(device_sign_fingerprint)
                 && payload.canonical_pending_frame.is_some()
                 && pending_is_exact
+                && payload.canonical_pair_terminal_frame.is_none()
                 && grant_payload_absent
         }
         PairingInviteLifecycle::GrantPreparing
@@ -1418,6 +1469,7 @@ fn authenticate_pairing_row(
             request_material == request_hash.zip(device_sign_fingerprint)
                 && payload.canonical_pending_frame.is_some()
                 && pending_is_exact
+                && payload.canonical_pair_terminal_frame.is_none()
                 && grant_payload_present
                 && payload.delivery_receipt_hash.is_none()
         }
@@ -1425,6 +1477,7 @@ fn authenticate_pairing_row(
             request_material == request_hash.zip(device_sign_fingerprint)
                 && payload.canonical_pending_frame.is_some()
                 && pending_is_exact
+                && payload.canonical_pair_terminal_frame.is_none()
                 && grant_payload_present
                 && payload.delivery_receipt_hash.is_some()
         }
@@ -1439,7 +1492,13 @@ fn authenticate_pairing_row(
                 && request_material == request_hash.zip(device_sign_fingerprint)
                 && payload.canonical_pending_frame.is_some()
                 && payload.delivery_receipt_hash.is_none();
-            pending_is_exact && (pregrant_canceled || revoked_local_canceled)
+            terminal_is_exact
+                && payload
+                    .canonical_pair_terminal_frame
+                    .as_ref()
+                    .is_none_or(|_| request_material.is_some())
+                && pending_is_exact
+                && (pregrant_canceled || revoked_local_canceled)
         }
         PairingInviteLifecycle::Expired => {
             let pregrant_expired = grant_payload_absent
@@ -1452,6 +1511,11 @@ fn authenticate_pairing_row(
                 && payload.canonical_pending_frame.is_some()
                 && payload.delivery_receipt_hash.is_none();
             state_changed_at_ms >= expires_at_ms
+                && terminal_is_exact
+                && payload
+                    .canonical_pair_terminal_frame
+                    .as_ref()
+                    .is_none_or(|_| request_material.is_some())
                 && pending_is_exact
                 && (pregrant_expired || revoked_orphan_expired)
         }
@@ -1487,6 +1551,7 @@ fn authenticate_pairing_row(
             canonical_install_frame: payload.canonical_install_frame,
             global_key_state_hash: payload.global_key_state_hash,
             delivery_receipt_hash: payload.delivery_receipt_hash,
+            canonical_pair_terminal_frame: payload.canonical_pair_terminal_frame,
         },
         owner: payload.owner,
         idempotency_key: payload.idempotency_key,
@@ -2155,6 +2220,131 @@ pub(super) fn encode_delivered_payload(
             canonical_install_frame,
             &global_key_state_hash,
             &delivery_receipt_hash,
+        ],
+    )?);
+    if encoded.len() > MAX_PAIRING_STATE_PLAINTEXT_BYTES {
+        return Err(RuntimeStoreError::PayloadTooLarge);
+    }
+    Ok(encoded)
+}
+
+pub(super) fn encode_pair_terminal_payload(
+    current: &AuthenticatedPairingRow,
+    canonical_terminal_frame: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, RuntimeStoreError> {
+    if !matches!(
+        current.record.lifecycle,
+        PairingInviteLifecycle::Canceled | PairingInviteLifecycle::Expired
+    ) || current.record.canonical_pair_terminal_frame.is_some()
+        || canonical_terminal_frame.is_empty()
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    let request = current
+        .record
+        .canonical_pair_request
+        .as_ref()
+        .ok_or(RuntimeStoreError::InvalidStateTransition)?;
+    let plaintext = current
+        .record
+        .canonical_pair_request_plaintext
+        .as_ref()
+        .ok_or(RuntimeStoreError::InvalidStateTransition)?;
+    let received_at_ms = current
+        .record
+        .request_received_at_ms
+        .ok_or(RuntimeStoreError::InvalidStateTransition)?;
+    let received = received_at_ms.to_be_bytes();
+    let empty: &[u8] = &[];
+    let pending = current
+        .record
+        .canonical_pending_frame
+        .as_deref()
+        .unwrap_or(empty);
+    let grant_hash = current
+        .record
+        .grant_hash
+        .as_ref()
+        .map_or(empty, <[u8; 32]>::as_slice);
+    let response_hash = current
+        .record
+        .response_hash
+        .as_ref()
+        .map_or(empty, <[u8; 32]>::as_slice);
+    let canonical_relay_grant = current
+        .record
+        .canonical_relay_grant
+        .as_deref()
+        .unwrap_or(empty);
+    let canonical_device_authorization = current
+        .record
+        .canonical_device_authorization
+        .as_ref()
+        .map_or(empty, SecretBytes::expose_secret);
+    let canonical_key_directory_view = current
+        .record
+        .canonical_key_directory_view
+        .as_ref()
+        .map_or(empty, SecretBytes::expose_secret);
+    let canonical_pair_response = current
+        .record
+        .canonical_pair_response
+        .as_ref()
+        .map_or(empty, SecretBytes::expose_secret);
+    let canonical_install_frame = current
+        .record
+        .canonical_install_frame
+        .as_deref()
+        .unwrap_or(empty);
+    let global_key_state_hash = current
+        .record
+        .global_key_state_hash
+        .as_ref()
+        .map_or(empty, <[u8; 32]>::as_slice);
+    let delivery_receipt_hash = current
+        .record
+        .delivery_receipt_hash
+        .as_ref()
+        .map_or(empty, <[u8; 32]>::as_slice);
+    let grant_presence = [
+        grant_hash,
+        response_hash,
+        canonical_relay_grant,
+        canonical_device_authorization,
+        canonical_key_directory_view,
+        canonical_pair_response,
+        canonical_install_frame,
+        global_key_state_hash,
+    ];
+    if grant_presence.iter().any(|field| !field.is_empty())
+        && grant_presence.iter().any(|field| field.is_empty())
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let encoded = Zeroizing::new(encode_fields(
+        PAIRING_PAYLOAD_MAGIC_V6,
+        &[
+            &current.owner,
+            current.idempotency_key.as_bytes(),
+            current.record.canonical_invite.expose_secret(),
+            current.record.invite_hpke_private_key.expose_secret(),
+            &current.record.canonical_open_frame,
+            &current.expected_terminal,
+            &current.input_hash,
+            request.expose_secret(),
+            plaintext.expose_secret(),
+            &received,
+            pending,
+            grant_hash,
+            response_hash,
+            canonical_relay_grant,
+            canonical_device_authorization,
+            canonical_key_directory_view,
+            canonical_pair_response,
+            canonical_install_frame,
+            global_key_state_hash,
+            delivery_receipt_hash,
+            canonical_terminal_frame,
         ],
     )?);
     if encoded.len() > MAX_PAIRING_STATE_PLAINTEXT_BYTES {

@@ -52,10 +52,12 @@ use super::pairing_revocation::{BeginDeviceRevocation, BeginDeviceRevocationOutc
 use super::pairing_revocation_ack::{
     AcknowledgeRevocationCommitted, AcknowledgeRevocationCommittedOutcome,
 };
-use super::pairing_terminal::{PairingTerminalAction, PairingTerminalizeOutcome};
+use super::pairing_terminal::{
+    CommitPairTerminal, PairingTerminalAction, PairingTerminalizeOutcome,
+};
 use super::pairing_tests::{
     GenerousCapacity, MACHINE_ROUTE, NOW_MS, RELAY, TestClock, TestRoot, artifact_bytes,
-    make_active,
+    make_active, pending_envelope,
 };
 use super::publication::{
     FreezeSignedPublicationRequest, PublicationPayloadKind, PublicationScope,
@@ -594,6 +596,28 @@ async fn cancel_and_close(
         PairingTerminalizeOutcome::Transitioned { close, .. } => close,
         other => panic!("fresh cancel must transition: {other:?}"),
     };
+    let mut recovery = store
+        .list_pairing_terminal_recovery()
+        .await
+        .expect("load canceled terminal recovery");
+    if let Some(mut preparation) = recovery
+        .iter_mut()
+        .find(|recovery| recovery.close().pairing_id() == pairing_id)
+        .and_then(|recovery| recovery.take_preparation())
+    {
+        drop(
+            preparation
+                .take_hpke_seed()
+                .expect("sealing consumes the unique terminal seed owner"),
+        );
+        store
+            .commit_pair_terminal(
+                CommitPairTerminal::new(preparation, pending_envelope(0xe7))
+                    .expect("freeze canceled PairTerminal carrier"),
+            )
+            .await
+            .expect("commit canceled PairTerminal carrier");
+    }
     store
         .acknowledge_pair_route_close(pairing_id, pair_route_closed_frame(close.pair_route()))
         .await

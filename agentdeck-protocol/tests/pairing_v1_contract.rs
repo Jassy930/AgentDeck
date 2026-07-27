@@ -6,7 +6,8 @@ use agentdeck_protocol::e2ee::pairing::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,
     DeviceAuthorizationV1, MachineDataSignerBindingV1, PAIR_INVITE_MAX_TTL_MS, PairInviteV1,
     PairPendingV1, PairRequestInfoV1, PairRequestPlaintextV1, PairRequestV1, PairResponseInfoV1,
-    PairResponsePlaintextV1, PairResponseReceivedV1, PairResponseV1, PairingError,
+    PairResponsePlaintextV1, PairResponseReceivedV1, PairResponseV1, PairTerminalOutcomeV1,
+    PairTerminalV1, PairingError,
 };
 use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, OuterContextV1, OuterFrameKind};
 use agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION;
@@ -241,6 +242,15 @@ fn pending() -> PairPendingV1 {
     PairPendingV1 {
         request_hash: request().canonical_sha256().unwrap(),
         signature: sig(0xb1),
+    }
+}
+
+fn pair_terminal(outcome: PairTerminalOutcomeV1) -> PairTerminalV1 {
+    PairTerminalV1 {
+        machine_route: machine_route(),
+        request_hash: request().canonical_sha256().unwrap(),
+        outcome,
+        signature: sig(0xb3),
     }
 }
 
@@ -582,6 +592,219 @@ fn pair_pending_tbs_binds_request_invite_route_and_machine_data_signer() {
 }
 
 #[test]
+fn pair_terminal_has_independent_unsigned_full_and_tbs_domains() {
+    let terminal = pair_terminal(PairTerminalOutcomeV1::Canceled);
+    let unsigned = terminal.unsigned_canonical_bytes().unwrap();
+    let canonical = terminal.canonical_bytes().unwrap();
+    assert!(unsigned.starts_with(b"AgentDeck/PairTerminalUnsignedV1\0"));
+    assert!(canonical.starts_with(b"AgentDeck/PairTerminalV1\0"));
+    assert_eq!(
+        unsigned.last(),
+        Some(&0),
+        "canceled outcome tag is frozen at 0"
+    );
+    assert_eq!(
+        PairTerminalV1::from_canonical_bytes(&canonical).unwrap(),
+        terminal
+    );
+
+    let signer = MachineDataSignerBindingV1::from_certificate(&invite().data_sign_cert).unwrap();
+    let tbs = terminal
+        .signature_tbs(
+            &request_info(),
+            &pair_context(OuterFrameKind::PairTerminal),
+            &signer,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+    assert!(tbs.starts_with(b"AgentDeck/PairTerminalTbsV1\0"));
+
+    let expired = pair_terminal(PairTerminalOutcomeV1::Expired);
+    assert_eq!(
+        expired.unsigned_canonical_bytes().unwrap().last(),
+        Some(&1),
+        "expired outcome tag is frozen at 1"
+    );
+    assert_ne!(
+        terminal.canonical_sha256().unwrap(),
+        expired.canonical_sha256().unwrap()
+    );
+
+    let mut signature_only = terminal.clone();
+    signature_only.signature.0[0] ^= 1;
+    assert_eq!(
+        tbs,
+        signature_only
+            .signature_tbs(
+                &request_info(),
+                &pair_context(OuterFrameKind::PairTerminal),
+                &signer,
+            )
+            .unwrap()
+            .encode()
+            .unwrap(),
+        "TBS must exclude its own signature"
+    );
+    assert_ne!(
+        terminal.canonical_sha256().unwrap(),
+        signature_only.canonical_sha256().unwrap(),
+        "full canonical hash must include the signature"
+    );
+}
+
+#[test]
+fn pair_terminal_tbs_binds_all_identity_trust_info_and_exact_aad_axes() {
+    let terminal = pair_terminal(PairTerminalOutcomeV1::Canceled);
+    let info = request_info();
+    let context = pair_context(OuterFrameKind::PairTerminal);
+    let signer = MachineDataSignerBindingV1::from_certificate(&invite().data_sign_cert).unwrap();
+    let base = terminal
+        .signature_tbs(&info, &context, &signer)
+        .unwrap()
+        .encode()
+        .unwrap();
+
+    let mut machine = terminal.clone();
+    machine.machine_route = MachineRouteId::from_bytes([0x12; 16]);
+    assert_ne!(
+        base,
+        machine
+            .signature_tbs(&info, &context, &signer)
+            .unwrap()
+            .encode()
+            .unwrap()
+    );
+    let mut request = terminal.clone();
+    request.request_hash[0] ^= 1;
+    assert_ne!(
+        base,
+        request
+            .signature_tbs(&info, &context, &signer)
+            .unwrap()
+            .encode()
+            .unwrap()
+    );
+    assert_ne!(
+        base,
+        pair_terminal(PairTerminalOutcomeV1::Expired)
+            .signature_tbs(&info, &context, &signer)
+            .unwrap()
+            .encode()
+            .unwrap()
+    );
+
+    let mut changed_info = info.clone();
+    changed_info.expiry_ms += 1;
+    assert_ne!(
+        base,
+        terminal
+            .signature_tbs(&changed_info, &context, &signer)
+            .unwrap()
+            .encode()
+            .unwrap()
+    );
+    let mut changed_context = context.clone();
+    changed_context.e2ee_format_version += 1;
+    assert_eq!(
+        terminal
+            .signature_tbs(&info, &changed_context, &signer)
+            .unwrap_err(),
+        PairingError::ContextBindingMismatch
+    );
+    let mut wrong_route_context = context.clone();
+    wrong_route_context.pair_route = Some(pair_route(0x56));
+    assert_eq!(
+        terminal
+            .signature_tbs(&info, &wrong_route_context, &signer)
+            .unwrap_err(),
+        PairingError::ContextBindingMismatch
+    );
+    assert_eq!(
+        terminal
+            .signature_tbs(&info, &pair_context(OuterFrameKind::PairPending), &signer,)
+            .unwrap_err(),
+        PairingError::ContextBindingMismatch
+    );
+
+    let mut generation = signer.clone();
+    generation.generation = LinkGeneration::new(2);
+    assert_ne!(
+        base,
+        terminal
+            .signature_tbs(&info, &context, &generation)
+            .unwrap()
+            .encode()
+            .unwrap()
+    );
+    let mut certificate = signer.clone();
+    certificate.certificate_sha256[0] ^= 1;
+    assert_ne!(
+        base,
+        terminal
+            .signature_tbs(&info, &context, &certificate)
+            .unwrap()
+            .encode()
+            .unwrap()
+    );
+    let mut fingerprint = signer;
+    fingerprint.signing_key_fingerprint[0] ^= 1;
+    assert_ne!(
+        base,
+        terminal
+            .signature_tbs(&info, &context, &fingerprint)
+            .unwrap()
+            .encode()
+            .unwrap()
+    );
+}
+
+#[test]
+fn pair_terminal_ingress_rejects_unknown_zero_oversize_and_noncanonical_values() {
+    let terminal = pair_terminal(PairTerminalOutcomeV1::Canceled);
+    let mut json = serde_json::to_value(&terminal).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<PairTerminalV1>(json).is_err());
+
+    let mut unknown_outcome = serde_json::to_value(&terminal).unwrap();
+    unknown_outcome["outcome"] = serde_json::json!("revoked");
+    assert!(serde_json::from_value::<PairTerminalV1>(unknown_outcome).is_err());
+
+    for invalid in [
+        PairTerminalV1 {
+            machine_route: MachineRouteId::from_bytes([0; 16]),
+            ..terminal.clone()
+        },
+        PairTerminalV1 {
+            request_hash: [0; 32],
+            ..terminal.clone()
+        },
+        PairTerminalV1 {
+            signature: Ed25519Signature([0; 64]),
+            ..terminal.clone()
+        },
+    ] {
+        assert!(
+            serde_json::from_value::<PairTerminalV1>(serde_json::to_value(invalid).unwrap())
+                .is_err()
+        );
+    }
+
+    let mut trailing = terminal.canonical_bytes().unwrap();
+    trailing.push(0);
+    assert!(PairTerminalV1::from_canonical_bytes(&trailing).is_err());
+    assert!(PairTerminalV1::from_canonical_bytes(&vec![0; 513]).is_err());
+
+    let unsigned = terminal.unsigned_canonical_bytes().unwrap();
+    let mut unknown_tag = terminal.canonical_bytes().unwrap();
+    let outcome_offset = b"AgentDeck/PairTerminalV1\0".len() + 4 + unsigned.len() - 1;
+    unknown_tag[outcome_offset] = 2;
+    assert!(PairTerminalV1::from_canonical_bytes(&unknown_tag).is_err());
+}
+
+#[test]
 fn pairing_control_envelope_hides_pending_request_hash_from_relay_visible_shape() {
     let envelope = PairingControlEnvelopeV1 {
         format_version: E2EE_FORMAT_VERSION,
@@ -677,6 +900,34 @@ fn outer_context_pair_route_is_bound_without_drifting_non_pairing_bytes() {
     let mut missing = request;
     missing.pair_route = None;
     assert!(missing.validate().is_err());
+
+    let tag_offset = b"AgentDeck/OuterContextV1\0".len();
+    for (kind, expected_tag) in [
+        (OuterFrameKind::CatalogPublish, 0),
+        (OuterFrameKind::ConversationPublish, 1),
+        (OuterFrameKind::DirectedReply, 2),
+        (OuterFrameKind::UplinkSend, 3),
+        (OuterFrameKind::PairRequest, 4),
+        (OuterFrameKind::PairResponse, 5),
+        (OuterFrameKind::KeyUpdate, 6),
+        (OuterFrameKind::PairPending, 7),
+        (OuterFrameKind::PairResponseReceived, 8),
+        (OuterFrameKind::DeviceKeyRecovery, 9),
+        (OuterFrameKind::PairTerminal, 10),
+    ] {
+        let mut value = pair_context(kind);
+        if !matches!(
+            kind,
+            OuterFrameKind::PairRequest
+                | OuterFrameKind::PairResponse
+                | OuterFrameKind::PairPending
+                | OuterFrameKind::PairResponseReceived
+                | OuterFrameKind::PairTerminal
+        ) {
+            value.pair_route = None;
+        }
+        assert_eq!(value.encode_aad()[tag_offset], expected_tag);
+    }
 }
 
 #[test]

@@ -6,6 +6,9 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use super::{OpaqueRouteFrame, encode};
 
 // —— relay.version.* ——
 pub const RELAY_VERSION_UNSUPPORTED: &str = "relay.version.unsupported";
@@ -39,6 +42,24 @@ pub const RELAY_DISK_LOW: &str = "relay.disk.low";
 
 // —— relay 侧 transport 层的 remote.* ——
 pub const REMOTE_TRANSPORT_TLS_PIN_MISMATCH: &str = "remote.transport.tls_pin_mismatch";
+
+const RELAY_FRAME_REPLY_REFERENCE_PREFIX: &str = "frame-sha256:";
+
+/// 为 Relay 对 exact inbound frame 的失败生成不泄露 payload 的稳定关联键。
+///
+/// 该值只用于 `RelayFailure.in_reply_to`；小写 hex 与固定长度避免 daemon 对模糊、截断或
+/// 非 canonical reference 做恢复判断。
+pub fn relay_frame_reply_reference(frame: &OpaqueRouteFrame) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(encode(frame));
+    let mut reference = String::with_capacity(RELAY_FRAME_REPLY_REFERENCE_PREFIX.len() + 64);
+    reference.push_str(RELAY_FRAME_REPLY_REFERENCE_PREFIX);
+    for byte in digest {
+        reference.push(char::from(HEX[usize::from(byte >> 4)]));
+        reference.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    reference
+}
 
 /// Relay 外层通用失败（wire 上是稳定 `code` 字符串）。绝不携带业务明文；
 /// `in_reply_to` 只做请求关联，脱敏后关联日志（design §14）。
@@ -97,6 +118,40 @@ impl std::fmt::Debug for RelayFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay_v2::frame::{PairData, SealedBlob};
+    use crate::relay_v2::{PairRouteId, RELAY_PROTOCOL_VERSION, RelayFrameBody};
+
+    fn pair_data_frame(route_seed: u8, payload: &[u8]) -> OpaqueRouteFrame {
+        OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::PairData(PairData {
+                pair_route: PairRouteId::from_bytes([route_seed; 16]),
+                sealed_blob: SealedBlob(payload.to_vec()),
+            }),
+        }
+    }
+
+    #[test]
+    fn frame_reply_reference_is_canonical_fixed_length_and_exact() {
+        let frame = pair_data_frame(0x31, b"terminal-carrier");
+        let reference = relay_frame_reply_reference(&frame);
+        assert_eq!(reference.len(), "frame-sha256:".len() + 64);
+        assert!(reference.starts_with("frame-sha256:"));
+        assert!(
+            reference["frame-sha256:".len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(reference, relay_frame_reply_reference(&frame));
+        assert_ne!(
+            reference,
+            relay_frame_reply_reference(&pair_data_frame(0x31, b"terminal-carrier-2"))
+        );
+        assert_ne!(
+            reference,
+            relay_frame_reply_reference(&pair_data_frame(0x32, b"terminal-carrier"))
+        );
+    }
 
     #[test]
     fn failure_debug_redacts_message_reference_and_invalid_code() {

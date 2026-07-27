@@ -1106,6 +1106,22 @@ impl RuntimeStoreHandle {
         .await?
     }
 
+    pub(crate) async fn commit_pair_terminal(
+        &self,
+        input: pairing_terminal::CommitPairTerminal,
+    ) -> Result<pairing_terminal::CommitPairTerminalOutcome, RuntimeStoreError> {
+        let retained = input.retained_bytes();
+        dispatch_with_budget(
+            &self.safety_tx,
+            &self.safety_budget,
+            &self.lifecycle,
+            RuntimeStoreLane::Safety,
+            memory_charge(size_of::<SafetyCommand>(), &[retained])?,
+            |reply| SafetyCommand::CommitPairTerminal { input, reply },
+        )
+        .await?
+    }
+
     #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
     pub(crate) async fn terminalize_due_pairings(
         &self,
@@ -3719,6 +3735,11 @@ enum SafetyCommand {
         reply:
             oneshot::Sender<Result<pairing_terminal::PairingTerminalizeOutcome, RuntimeStoreError>>,
     },
+    CommitPairTerminal {
+        input: pairing_terminal::CommitPairTerminal,
+        reply:
+            oneshot::Sender<Result<pairing_terminal::CommitPairTerminalOutcome, RuntimeStoreError>>,
+    },
     #[allow(dead_code)] // P4 pairing coordinator consumes the staged Store capability.
     TerminalizeDuePairings {
         reply: oneshot::Sender<
@@ -5337,6 +5358,9 @@ fn handle_safety(
             SafetyCommand::TerminalizePairing { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
+            SafetyCommand::CommitPairTerminal { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
             SafetyCommand::TerminalizeDuePairings { reply } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
@@ -5601,6 +5625,9 @@ fn handle_safety(
                     pairing_terminal::terminalize_pairing(state, config, pairing_id, action, now)
                 });
             let _ = reply.send(result);
+        }
+        SafetyCommand::CommitPairTerminal { input, reply } => {
+            let _ = reply.send(pairing_terminal::commit_pair_terminal(state, config, input));
         }
         SafetyCommand::TerminalizeDuePairings { reply } => {
             let result = config

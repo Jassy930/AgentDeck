@@ -17,16 +17,16 @@ use agentdeck_protocol::e2ee::PairResponseInfoV1;
 use agentdeck_protocol::e2ee::pairing::PAIR_INVITE_MAX_TTL_MS;
 use agentdeck_protocol::e2ee::{
     E2EE_FORMAT_VERSION, OuterContextV1, OuterFrameKind, PairInviteV1, PairRequestInfoV1,
-    PairRequestV1, PairResponseV1, PairingControlEnvelopeV1,
+    PairRequestV1, PairResponseV1, PairTerminalV1, PairingControlEnvelopeV1,
 };
 use agentdeck_protocol::relay_v2::frame::{
     ClosePairRoute, GrantCommitted, InstallGrant, OpenPairRoute, PairData, PairRouteClosed,
     PairRouteOpened, RelayFrameBody, RevocationCommitted, RevokeDevice, SealedBlob,
 };
 use agentdeck_protocol::relay_v2::{
-    DeviceRevocation, DeviceRouteId, Digest32, GrantSerial, OpaqueRouteFrame, PairRouteId,
-    PublicKeyBytes, RELAY_PROTOCOL_VERSION, RelayGrant, RelayServerId, SignedCertificate, decode,
-    encode,
+    DeviceRevocation, DeviceRouteId, Digest32, Ed25519Signature, GrantSerial, OpaqueRouteFrame,
+    PairRouteId, PublicKeyBytes, RELAY_PROTOCOL_VERSION, RelayGrant, RelayServerId,
+    SignedCertificate, decode, encode,
 };
 use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use agentdeck_protocol::runtime::identity::{
@@ -49,8 +49,8 @@ use crate::runtime::store::pairing::{
 };
 use crate::runtime::store::pairing_grant::{ConfirmPairingGrant, PairingGrantPreparation};
 use crate::runtime::store::pairing_terminal::{
-    PairingCloseProjection, PairingTerminalAction, PairingTerminalRecovery,
-    PairingTerminalizeOutcome,
+    CommitPairTerminal, CommitPairTerminalOutcome, PairTerminalPreparation, PairingCloseProjection,
+    PairingTerminalAction, PairingTerminalRecovery, PairingTerminalizeOutcome,
 };
 use crate::runtime::store::{
     AcknowledgeGrantCommitted, AcknowledgeGrantCommittedOutcome,
@@ -991,6 +991,68 @@ impl DurableClose {
     }
 }
 
+struct DurableTerminal {
+    close: DurableClose,
+    preparation: Option<PairTerminalPreparation>,
+    carrier: Option<PairData>,
+}
+
+impl fmt::Debug for DurableTerminal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DurableTerminal([REDACTED])")
+    }
+}
+
+impl DurableTerminal {
+    fn from_store(
+        mut recovery: PairingTerminalRecovery,
+    ) -> Result<Self, PairingAdministrationError> {
+        let close = DurableClose::from_store(recovery.close())?;
+        let carrier = recovery
+            .carrier()
+            .map(|projection| {
+                let canonical = projection.canonical_frame();
+                let frame =
+                    decode(canonical).map_err(|_| pairing_error(PAIRING_TERMINAL_INVALID))?;
+                if frame.version != RELAY_PROTOCOL_VERSION || encode(&frame) != canonical {
+                    return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+                }
+                let RelayFrameBody::PairData(data) = frame.body else {
+                    return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+                };
+                if data.pair_route != close.pair_route
+                    || projection.pair_route() != close.pair_route
+                {
+                    return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+                }
+                let envelope = PairingControlEnvelopeV1::from_canonical_bytes(&data.sealed_blob.0)
+                    .map_err(|_| pairing_error(PAIRING_TERMINAL_INVALID))?;
+                if envelope
+                    .canonical_bytes()
+                    .map_err(|_| pairing_error(PAIRING_TERMINAL_INVALID))?
+                    != data.sealed_blob.0
+                {
+                    return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+                }
+                Ok(data)
+            })
+            .transpose()?;
+        let preparation = recovery.take_preparation();
+        if preparation.is_some() && carrier.is_some()
+            || preparation.as_ref().is_some_and(|value| {
+                value.pairing_id() != close.pairing_id || value.pair_route() != close.pair_route
+            })
+        {
+            return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+        }
+        Ok(Self {
+            close,
+            preparation,
+            carrier,
+        })
+    }
+}
+
 struct TerminalOutcome {
     pairing_id: RuntimeId,
     reply: PairingReceipt,
@@ -1743,14 +1805,14 @@ fn begin_revocation_from_store(
 }
 
 fn terminal_recovery_from_store(
-    recovery: &PairingTerminalRecovery,
-) -> Result<DurableClose, PairingAdministrationError> {
+    recovery: PairingTerminalRecovery,
+) -> Result<DurableTerminal, PairingAdministrationError> {
     let (pairing_id, _) = terminal_receipt_identity(recovery.receipt())?;
-    let close = DurableClose::from_store(recovery.close())?;
-    if close.pairing_id != pairing_id {
+    let terminal = DurableTerminal::from_store(recovery)?;
+    if terminal.close.pairing_id != pairing_id {
         return Err(pairing_error(PAIRING_TERMINAL_INVALID));
     }
-    Ok(close)
+    Ok(terminal)
 }
 
 struct DurableInvite {
@@ -2015,7 +2077,15 @@ trait PairingStore: Send + Sync {
 
     async fn terminalize_due(&self) -> Result<Vec<TerminalOutcome>, PairingAdministrationError>;
 
-    async fn recover_terminals(&self) -> Result<Vec<DurableClose>, PairingAdministrationError>;
+    async fn commit_terminal(
+        &self,
+        _preparation: PairTerminalPreparation,
+        _envelope: PairingControlEnvelopeV1,
+    ) -> Result<DurableTerminal, PairingAdministrationError> {
+        Err(pairing_error(PAIRING_TERMINAL_INVALID))
+    }
+
+    async fn recover_terminals(&self) -> Result<Vec<DurableTerminal>, PairingAdministrationError>;
 
     async fn acknowledge_close(
         &self,
@@ -2576,12 +2646,38 @@ impl PairingStore for ProductionPairingStore {
             .collect()
     }
 
-    async fn recover_terminals(&self) -> Result<Vec<DurableClose>, PairingAdministrationError> {
+    async fn commit_terminal(
+        &self,
+        preparation: PairTerminalPreparation,
+        envelope: PairingControlEnvelopeV1,
+    ) -> Result<DurableTerminal, PairingAdministrationError> {
+        let input = CommitPairTerminal::new(preparation, envelope).map_err(store_error)?;
+        let retry = input.retry_copy().map_err(store_error)?;
+        let first = self.0.commit_pair_terminal(input).await;
+        let outcome = match first {
+            Err(RuntimeStoreError::CommitOutcomeUnknown {
+                operation: RuntimeCommitOperation::CommitPairTerminal,
+            }) => self
+                .0
+                .commit_pair_terminal(retry)
+                .await
+                .map_err(store_error)?,
+            Ok(outcome) => outcome,
+            Err(error) => return Err(store_error(error)),
+        };
+        let recovery = match outcome {
+            CommitPairTerminalOutcome::Committed { recovery }
+            | CommitPairTerminalOutcome::Replayed { recovery } => recovery,
+        };
+        DurableTerminal::from_store(recovery)
+    }
+
+    async fn recover_terminals(&self) -> Result<Vec<DurableTerminal>, PairingAdministrationError> {
         self.0
             .list_pairing_terminal_recovery()
             .await
             .map_err(store_error)?
-            .iter()
+            .into_iter()
             .map(terminal_recovery_from_store)
             .collect()
     }
@@ -2639,6 +2735,11 @@ impl PairingStore for ProductionPairingStore {
 trait PairingLane: Send {
     async fn send_open(&self, frame: OpenPairRoute) -> Result<(), PairingAdministrationError>;
     async fn send_data(&self, frame: PairData) -> Result<(), PairingAdministrationError>;
+    async fn send_terminal_and_close(
+        &self,
+        terminal: PairData,
+        close: ClosePairRoute,
+    ) -> Result<(), PairingAdministrationError>;
     async fn send_install(&self, frame: InstallGrant) -> Result<(), PairingAdministrationError>;
     async fn send_revoke(&self, frame: RevokeDevice) -> Result<(), PairingAdministrationError>;
     async fn send_close(&self, frame: ClosePairRoute) -> Result<(), PairingAdministrationError>;
@@ -2662,6 +2763,17 @@ impl PairingLane for ProductionPairingLane {
 
     async fn send_data(&self, frame: PairData) -> Result<(), PairingAdministrationError> {
         self.0.send_pair_data(frame).await.map_err(transport_error)
+    }
+
+    async fn send_terminal_and_close(
+        &self,
+        terminal: PairData,
+        close: ClosePairRoute,
+    ) -> Result<(), PairingAdministrationError> {
+        self.0
+            .send_pair_terminal_and_close(terminal, close)
+            .await
+            .map_err(transport_error)
     }
 
     async fn send_install(&self, frame: InstallGrant) -> Result<(), PairingAdministrationError> {
@@ -2717,6 +2829,13 @@ trait PairingAuthority: Send {
         response: &DurableResponse,
         canonical_envelope: &[u8],
     ) -> Result<DeliveryProofInput, PairingAdministrationError>;
+
+    fn seal_terminal(
+        &self,
+        _preparation: &mut PairTerminalPreparation,
+    ) -> Result<PairingControlEnvelopeV1, PairingAdministrationError> {
+        Err(pairing_error(PAIRING_TERMINAL_INVALID))
+    }
 
     fn freeze_revocation(
         &self,
@@ -2787,6 +2906,31 @@ impl PairingAuthority for ProductionPairingAuthority {
         response
             .verify_receipt(canonical_envelope)
             .map(|proof| DeliveryProofInput::from_verified(response.pairing_id, proof))
+    }
+
+    fn seal_terminal(
+        &self,
+        preparation: &mut PairTerminalPreparation,
+    ) -> Result<PairingControlEnvelopeV1, PairingAdministrationError> {
+        let terminal = PairTerminalV1 {
+            machine_route: preparation.machine_route(),
+            request_hash: preparation.request_hash(),
+            outcome: preparation.outcome(),
+            signature: Ed25519Signature([0; 64]),
+        };
+        let hpke_seed = preparation
+            .take_hpke_seed()
+            .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
+        self.authority
+            .seal_pair_terminal(
+                preparation.recipient(),
+                preparation.info(),
+                preparation.context(),
+                terminal,
+                preparation.data_sign_certificate(),
+                hpke_seed,
+            )
+            .map_err(transport_error)
     }
 
     fn freeze_revocation(
@@ -3235,8 +3379,8 @@ impl PairingCoordinator {
 
     async fn advance_drain(&mut self) -> Result<bool, PairingAdministrationError> {
         self.prepare_drain_transitions().await?;
-        for close in self.store.recover_terminals().await? {
-            self.send_recovered_close(close).await?;
+        for terminal in self.store.recover_terminals().await? {
+            self.send_recovered_terminal(terminal).await?;
         }
         self.drive_next_revocation().await?;
         self.drain_is_complete().await
@@ -3646,14 +3790,14 @@ impl PairingCoordinator {
             let terminals = self.store.recover_terminals().await?;
             let mut matching = terminals
                 .into_iter()
-                .filter(|close| close.pairing_id == pairing_id);
-            let close = matching
+                .filter(|terminal| terminal.close.pairing_id == pairing_id);
+            let terminal = matching
                 .next()
                 .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
             if matching.next().is_some() {
                 return Err(pairing_error(PAIRING_TERMINAL_INVALID));
             }
-            self.send_recovered_close(close).await?;
+            self.send_recovered_terminal(terminal).await?;
         }
         self.drive_next_revocation().await
     }
@@ -3698,6 +3842,21 @@ impl PairingCoordinator {
             return Err(pairing_error(PAIRING_GRANT_RECOVERY_UNAVAILABLE));
         }
         Ok(response)
+    }
+
+    async fn recovered_terminal(
+        &mut self,
+        pairing_id: RuntimeId,
+    ) -> Result<Option<DurableTerminal>, PairingAdministrationError> {
+        let terminals = self.store.recover_terminals().await?;
+        let mut matching = terminals
+            .into_iter()
+            .filter(|terminal| terminal.close.pairing_id == pairing_id);
+        let terminal = matching.next();
+        if matching.next().is_some() {
+            return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+        }
+        Ok(terminal)
     }
 
     async fn match_grant_commit(
@@ -3853,8 +4012,8 @@ impl PairingCoordinator {
                 if replay_existing {
                     match self.store.recover_terminals().await {
                         Ok(terminals) => {
-                            for close in terminals {
-                                if let Err(error) = self.send_recovered_close(close).await {
+                            for terminal in terminals {
+                                if let Err(error) = self.send_recovered_terminal(terminal).await {
                                     if is_transport_failure(&error) {
                                         self.set_transport_failure(&error);
                                     } else {
@@ -3905,7 +4064,14 @@ impl PairingCoordinator {
         let Some(close) = outcome.close else {
             return Ok(());
         };
-        self.send_recovered_close(close).await
+        let terminal = self
+            .recovered_terminal(outcome.pairing_id)
+            .await?
+            .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
+        if terminal.close.pair_route != close.pair_route || terminal.close.frame != close.frame {
+            return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+        }
+        self.send_recovered_terminal(terminal).await
     }
 
     fn settle_terminal_waiters(
@@ -3951,6 +4117,39 @@ impl PairingCoordinator {
             .is_some_and(|existing| existing != close.pairing_id)
         {
             return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+        }
+        self.opened_routes.remove(close.pair_route.as_bytes());
+        self.lane.send_close(close.frame).await
+    }
+
+    async fn send_recovered_terminal(
+        &mut self,
+        mut terminal: DurableTerminal,
+    ) -> Result<(), PairingAdministrationError> {
+        if let Some(mut preparation) = terminal.preparation.take() {
+            let envelope = self.authority.seal_terminal(&mut preparation)?;
+            terminal = self.store.commit_terminal(preparation, envelope).await?;
+        }
+        if terminal.preparation.is_some() {
+            return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+        }
+        let close = terminal.close;
+        if self
+            .routes
+            .insert(*close.pair_route.as_bytes(), close.pairing_id)
+            .is_some_and(|existing| existing != close.pairing_id)
+        {
+            return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+        }
+        if let Some(carrier) = terminal.carrier {
+            self.opened_routes.remove(close.pair_route.as_bytes());
+            // 唯一 supervisor 在不轮询 reader 的临界区内依次完成 PairTerminal writer
+            // flush 与 Close writer flush；任一路径 error 都视为 outcome-unknown，保留
+            // durable carrier/Close。closing binding 先于 Relay Error/ACK 可见。
+            return self
+                .lane
+                .send_terminal_and_close(carrier, close.frame)
+                .await;
         }
         self.opened_routes.remove(close.pair_route.as_bytes());
         self.lane.send_close(close.frame).await
@@ -4342,8 +4541,8 @@ impl PairingCoordinator {
         }
         let mut recovered_orphan_revocation_ids = HashSet::new();
         let mut terminal_ids = HashSet::new();
-        for close in &terminals {
-            if !terminal_ids.insert(close.pairing_id) {
+        for terminal in &terminals {
+            if !terminal_ids.insert(terminal.close.pairing_id) {
                 return Err(pairing_error(PAIRING_TERMINAL_INVALID));
             }
         }
@@ -4403,7 +4602,8 @@ impl PairingCoordinator {
                 }
             }
         }
-        for close in &terminals {
+        for terminal in &terminals {
+            let close = &terminal.close;
             if routes
                 .insert(*close.pair_route.as_bytes(), close.pairing_id)
                 .is_some_and(|existing| existing != close.pairing_id)
@@ -4433,8 +4633,8 @@ impl PairingCoordinator {
                 self.lane.send_open(invite.open()?).await?;
             }
         }
-        for close in terminals {
-            self.lane.send_close(close.frame).await?;
+        for terminal in terminals {
+            self.send_recovered_terminal(terminal).await?;
         }
         self.routes = routes;
         self.drive_next_revocation().await?;

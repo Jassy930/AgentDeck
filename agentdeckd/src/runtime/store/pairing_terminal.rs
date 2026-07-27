@@ -2,14 +2,24 @@
 
 use std::collections::HashSet;
 
-use agentdeck_protocol::relay_v2::frame::{
-    ClosePairRoute, OpaqueRouteFrame, PairRouteCloseOutcome, PairRouteClosed, RelayFrameBody,
+use agentdeck_crypto::HpkePublicKey;
+use agentdeck_protocol::e2ee::{
+    MachineDataSignerBindingV1, OuterContextV1, OuterFrameKind, PairInviteV1, PairRequestInfoV1,
+    PairRequestPlaintextV1, PairTerminalOutcomeV1, PairTerminalV1, PairingControlEnvelopeV1,
 };
-use agentdeck_protocol::relay_v2::{PairRouteId, RELAY_PROTOCOL_VERSION, decode, encode};
+use agentdeck_protocol::relay_v2::auth::Ed25519Signature;
+use agentdeck_protocol::relay_v2::frame::{
+    ClosePairRoute, OpaqueRouteFrame, PairData, PairRouteCloseOutcome, PairRouteClosed,
+    RelayFrameBody, SealedBlob,
+};
+use agentdeck_protocol::relay_v2::{
+    MachineRouteId, PairRouteId, RELAY_PROTOCOL_VERSION, SignedCertificate, decode, encode,
+};
 use agentdeck_protocol::runtime::identity::PairingId;
 use agentdeck_protocol::runtime::{PairingReceipt, PairingState};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::runtime::model::{
     RuntimeCommitOperation, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
@@ -23,6 +33,7 @@ use super::sqlite::RuntimeSqlite;
 
 const RECEIPT_METADATA_DOMAIN: &[u8] = b"remote.pairing.receipt.metadata.v2";
 const CLOSE_OPERATION_DOMAIN: &[u8] = b"remote.control.close-pair-route.operation.v1";
+const PAIR_TERMINAL_HPKE_SEED_DOMAIN: &[u8] = b"remote.pairing.terminal.hpke-seed.v1";
 const OUTBOX_METADATA_DOMAIN: &[u8] = b"remote.control.outbox.metadata.v1";
 const OUTBOX_TABLE: &[u8] = b"remote_control_outbox";
 const OUTBOX_COLUMN: &[u8] = b"sealed_frame";
@@ -163,6 +174,8 @@ impl ConfirmedReceiptWrite {
 pub(crate) struct PairingTerminalRecovery {
     receipt: PairingReceipt,
     close: PairingCloseProjection,
+    preparation: Option<PairTerminalPreparation>,
+    carrier: Option<PairTerminalCarrierProjection>,
 }
 
 impl PairingTerminalRecovery {
@@ -175,6 +188,256 @@ impl PairingTerminalRecovery {
     pub(crate) const fn close(&self) -> &PairingCloseProjection {
         &self.close
     }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) const fn preparation(&self) -> Option<&PairTerminalPreparation> {
+        self.preparation.as_ref()
+    }
+
+    /// 将恢复记录持有的唯一 HPKE seed owner 移交给上层 coordinator。
+    ///
+    /// preparation 只能 move，不能从只读投影复制；carrier 已持久化时该值固定为 `None`。
+    #[must_use]
+    pub(crate) fn take_preparation(&mut self) -> Option<PairTerminalPreparation> {
+        self.preparation.take()
+    }
+
+    #[must_use]
+    pub(crate) const fn carrier(&self) -> Option<&PairTerminalCarrierProjection> {
+        self.carrier.as_ref()
+    }
+}
+
+pub(crate) struct PairTerminalPreparation {
+    pairing_id: RuntimeId,
+    pair_route: PairRouteId,
+    machine_route: MachineRouteId,
+    request_hash: [u8; 32],
+    outcome: PairTerminalOutcomeV1,
+    info: PairRequestInfoV1,
+    context: OuterContextV1,
+    recipient: HpkePublicKey,
+    data_sign_certificate: SignedCertificate,
+    hpke_seed_commitment: [u8; 32],
+    hpke_seed: Option<Zeroizing<[u8; 32]>>,
+}
+
+impl std::fmt::Debug for PairTerminalPreparation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PairTerminalPreparation([REDACTED])")
+    }
+}
+
+impl PairTerminalPreparation {
+    #[must_use]
+    pub(crate) const fn pairing_id(&self) -> RuntimeId {
+        self.pairing_id
+    }
+
+    #[must_use]
+    pub(crate) const fn pair_route(&self) -> PairRouteId {
+        self.pair_route
+    }
+
+    #[must_use]
+    pub(crate) const fn machine_route(&self) -> MachineRouteId {
+        self.machine_route
+    }
+
+    #[must_use]
+    pub(crate) const fn request_hash(&self) -> [u8; 32] {
+        self.request_hash
+    }
+
+    #[must_use]
+    pub(crate) const fn outcome(&self) -> PairTerminalOutcomeV1 {
+        self.outcome
+    }
+
+    #[must_use]
+    pub(crate) const fn info(&self) -> &PairRequestInfoV1 {
+        &self.info
+    }
+
+    #[must_use]
+    pub(crate) const fn context(&self) -> &OuterContextV1 {
+        &self.context
+    }
+
+    #[must_use]
+    pub(crate) const fn recipient(&self) -> &HpkePublicKey {
+        &self.recipient
+    }
+
+    #[must_use]
+    pub(crate) const fn data_sign_certificate(&self) -> &SignedCertificate {
+        &self.data_sign_certificate
+    }
+
+    /// 只允许交给同一 generation 的 `PairingMachineAuthority` 作为 HPKE CSPRNG seed。
+    ///
+    /// 该 seed 由 Runtime DB 密钥对 exact terminal identity 做用途隔离 PRF 得到；同一
+    /// durable winner 在 carrier COMMIT 前崩溃后会逐字节重放，其他 pairing、outcome、
+    /// recipient 或签名 credential 都不能复用。
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn hpke_seed(&self) -> Option<&[u8; 32]> {
+        self.hpke_seed.as_deref()
+    }
+
+    /// 将唯一 seed owner 交给 transport。取出后 preparation 仍保留非 secret identity，
+    /// 可继续用于 carrier COMMIT；重复 seal 固定 fail-close，不能退化为零 seed。
+    pub(crate) fn take_hpke_seed(&mut self) -> Option<Zeroizing<[u8; 32]>> {
+        self.hpke_seed.take()
+    }
+
+    /// 只复制已经消费 seed 的非 secret terminal identity，供 COMMIT-unknown 精确重试。
+    ///
+    /// seal 前的 preparation 是唯一 secret owner；任何仍持有 seed 的值都必须 fail-close，
+    /// 不能借由 retry artifact 复制。
+    fn duplicate_after_seed_consumed(&self) -> Result<Self, RuntimeStoreError> {
+        if self.hpke_seed.is_some() {
+            return Err(RuntimeStoreError::PairingConflict);
+        }
+        Ok(Self {
+            pairing_id: self.pairing_id,
+            pair_route: self.pair_route,
+            machine_route: self.machine_route,
+            request_hash: self.request_hash,
+            outcome: self.outcome,
+            info: self.info.clone(),
+            context: self.context.clone(),
+            recipient: self.recipient.clone(),
+            data_sign_certificate: self.data_sign_certificate.clone(),
+            hpke_seed_commitment: self.hpke_seed_commitment,
+            hpke_seed: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        pairing_id: RuntimeId,
+        machine_route: MachineRouteId,
+        request_hash: [u8; 32],
+        outcome: PairTerminalOutcomeV1,
+        canonical_invite: &[u8],
+        canonical_request_plaintext: &[u8],
+        hpke_seed: [u8; 32],
+    ) -> Result<Self, RuntimeStoreError> {
+        let invite = PairInviteV1::from_canonical_bytes(canonical_invite)
+            .map_err(|_| RuntimeStoreError::PairingConflict)?;
+        let plaintext = PairRequestPlaintextV1::from_canonical_bytes(canonical_request_plaintext)
+            .map_err(|_| RuntimeStoreError::PairingConflict)?;
+        let recipient = HpkePublicKey::from_bytes(&plaintext.device_hpke_pubkey.0)
+            .map_err(|_| RuntimeStoreError::PairingConflict)?;
+        let info = super::pairing::pair_request_info(&invite)?;
+        let context = super::pairing::pairing_context(&invite, OuterFrameKind::PairTerminal);
+        let hpke_seed_commitment = terminal_hpke_seed_commitment(&hpke_seed);
+        Ok(Self {
+            pairing_id,
+            pair_route: invite.pair_route,
+            machine_route,
+            request_hash,
+            outcome,
+            info,
+            context,
+            recipient,
+            data_sign_certificate: invite.data_sign_cert,
+            hpke_seed_commitment,
+            hpke_seed: Some(Zeroizing::new(hpke_seed)),
+        })
+    }
+}
+
+pub(crate) struct CommitPairTerminal {
+    preparation: PairTerminalPreparation,
+    canonical_frame: Vec<u8>,
+}
+
+impl std::fmt::Debug for CommitPairTerminal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CommitPairTerminal([REDACTED])")
+    }
+}
+
+impl CommitPairTerminal {
+    pub(crate) fn new(
+        preparation: PairTerminalPreparation,
+        envelope: PairingControlEnvelopeV1,
+    ) -> Result<Self, RuntimeStoreError> {
+        envelope
+            .validate()
+            .map_err(|_| RuntimeStoreError::PairingConflict)?;
+        let canonical_envelope = envelope
+            .canonical_bytes()
+            .map_err(|_| RuntimeStoreError::PairingConflict)?;
+        if PairingControlEnvelopeV1::from_canonical_bytes(&canonical_envelope)
+            .map_err(|_| RuntimeStoreError::PairingConflict)?
+            != envelope
+        {
+            return Err(RuntimeStoreError::PairingConflict);
+        }
+        let canonical_frame = encode(&OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::PairData(PairData {
+                pair_route: preparation.pair_route,
+                sealed_blob: SealedBlob(canonical_envelope),
+            }),
+        });
+        super::pairing::exact_pair_terminal_frame(&canonical_frame, preparation.pair_route)?;
+        Ok(Self {
+            preparation,
+            canonical_frame,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn canonical_frame(&self) -> &[u8] {
+        &self.canonical_frame
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.canonical_frame.capacity()
+    }
+
+    /// 构造仅含非 secret metadata 与 frozen carrier 的 COMMIT-unknown 重试副本。
+    pub(crate) fn retry_copy(&self) -> Result<Self, RuntimeStoreError> {
+        Ok(Self {
+            preparation: self.preparation.duplicate_after_seed_consumed()?,
+            canonical_frame: self.canonical_frame.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PairTerminalCarrierProjection {
+    pair_route: PairRouteId,
+    canonical_frame: Vec<u8>,
+}
+
+impl std::fmt::Debug for PairTerminalCarrierProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PairTerminalCarrierProjection([REDACTED])")
+    }
+}
+
+impl PairTerminalCarrierProjection {
+    #[must_use]
+    pub(crate) const fn pair_route(&self) -> PairRouteId {
+        self.pair_route
+    }
+
+    #[must_use]
+    pub(crate) fn canonical_frame(&self) -> &[u8] {
+        &self.canonical_frame
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum CommitPairTerminalOutcome {
+    Committed { recovery: PairingTerminalRecovery },
+    Replayed { recovery: PairingTerminalRecovery },
 }
 
 #[derive(Debug)]
@@ -1610,17 +1873,331 @@ pub(crate) fn list_pairing_terminal_recovery(
         .terminal
         .close_outboxes
         .iter()
-        .map(|close| {
-            let receipt = directory
-                .terminal
-                .receipt(close.pairing_id)
-                .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
-            Ok(PairingTerminalRecovery {
-                receipt: receipt.receipt.clone(),
-                close: close.projection.duplicate(),
+        .map(|close| terminal_recovery(&directory, close, key_bundle, database_id))
+        .collect()
+}
+
+fn terminal_preparation(
+    pairing: &AuthenticatedPairingRow,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+) -> Result<Option<PairTerminalPreparation>, RuntimeStoreError> {
+    let outcome = match pairing.record.lifecycle {
+        PairingInviteLifecycle::Canceled => PairTerminalOutcomeV1::Canceled,
+        PairingInviteLifecycle::Expired => PairTerminalOutcomeV1::Expired,
+        PairingInviteLifecycle::Delivered => return Ok(None),
+        _ => return Err(RuntimeStoreError::UnknownOrCorruptSchema),
+    };
+    let Some(request_hash) = pairing.record.request_hash else {
+        if pairing.record.canonical_pair_request.is_some()
+            || pairing.record.canonical_pair_request_plaintext.is_some()
+            || pairing.record.request_received_at_ms.is_some()
+            || pairing.record.canonical_pair_terminal_frame.is_some()
+        {
+            return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+        }
+        return Ok(None);
+    };
+    let invite =
+        PairInviteV1::from_canonical_bytes(pairing.record.canonical_invite.expose_secret())
+            .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if invite
+        .canonical_bytes()
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+        != pairing.record.canonical_invite.expose_secret()
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let canonical_plaintext = pairing
+        .record
+        .canonical_pair_request_plaintext
+        .as_ref()
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?
+        .expose_secret();
+    let plaintext = PairRequestPlaintextV1::from_canonical_bytes(canonical_plaintext)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if plaintext
+        .canonical_bytes()
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?
+        != canonical_plaintext
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let recipient = HpkePublicKey::from_bytes(&plaintext.device_hpke_pubkey.0)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let info = super::pairing::pair_request_info(&invite)?;
+    let context = super::pairing::pairing_context(&invite, OuterFrameKind::PairTerminal);
+    context
+        .validate()
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if info.pair_route.as_bytes() != pairing.record.pair_route.as_bytes()
+        || info.relay_server_id.as_bytes() != &pairing.record.relay_server_id
+        || info.expiry_ms != pairing.record.expires_at_ms
+        || request_hash == [0; 32]
+    {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    let terminal = PairTerminalV1 {
+        machine_route: MachineRouteId::from_bytes(pairing.record.machine_route),
+        request_hash,
+        outcome,
+        signature: Ed25519Signature([0; 64]),
+    };
+    let signer = MachineDataSignerBindingV1::from_certificate(&invite.data_sign_cert)
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let terminal_tbs = terminal
+        .signature_tbs(&info, &context, &signer)
+        .and_then(|tbs| tbs.encode())
+        .map_err(|_| RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let terminal_tbs_sha256: [u8; 32] = Sha256::digest(&terminal_tbs).into();
+    let mut seed_binding = Zeroizing::new(Vec::with_capacity(16 + 16 + 32 + 32));
+    seed_binding.extend_from_slice(&database_id);
+    seed_binding.extend_from_slice(pairing.record.pairing_id.as_bytes());
+    seed_binding.extend_from_slice(&recipient.to_bytes());
+    seed_binding.extend_from_slice(&terminal_tbs_sha256);
+    let derived = key_bundle.blind_index(PAIR_TERMINAL_HPKE_SEED_DOMAIN, seed_binding.as_ref())?;
+    let mut hpke_seed = Zeroizing::new([0_u8; 32]);
+    hpke_seed.copy_from_slice(derived.as_bytes());
+    let hpke_seed_commitment = terminal_hpke_seed_commitment(&hpke_seed);
+    Ok(Some(PairTerminalPreparation {
+        pairing_id: pairing.record.pairing_id,
+        pair_route: invite.pair_route,
+        machine_route: MachineRouteId::from_bytes(pairing.record.machine_route),
+        request_hash,
+        outcome,
+        info,
+        context,
+        recipient,
+        data_sign_certificate: invite.data_sign_cert,
+        hpke_seed_commitment,
+        hpke_seed: Some(hpke_seed),
+    }))
+}
+
+fn terminal_recovery(
+    directory: &super::pairing::PairingDirectory,
+    close: &AuthenticatedCloseOutbox,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+) -> Result<PairingTerminalRecovery, RuntimeStoreError> {
+    let receipt = directory
+        .terminal
+        .receipt(close.pairing_id)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let pairing = directory
+        .pairings
+        .iter()
+        .find(|pairing| pairing.record.pairing_id == close.pairing_id)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    let preparation = terminal_preparation(pairing, key_bundle, database_id)?;
+    let carrier = pairing
+        .record
+        .canonical_pair_terminal_frame
+        .as_ref()
+        .map(|canonical| {
+            super::pairing::exact_pair_terminal_frame(canonical, close.projection.pair_route)?;
+            Ok::<_, RuntimeStoreError>(PairTerminalCarrierProjection {
+                pair_route: close.projection.pair_route,
+                canonical_frame: canonical.clone(),
             })
         })
-        .collect()
+        .transpose()?;
+    if carrier.is_some() && preparation.is_none() {
+        return Err(RuntimeStoreError::UnknownOrCorruptSchema);
+    }
+    Ok(PairingTerminalRecovery {
+        receipt: receipt.receipt.clone(),
+        close: close.projection.duplicate(),
+        preparation: carrier.is_none().then_some(preparation).flatten(),
+        carrier,
+    })
+}
+
+fn validate_commit_preparation(
+    expected: &PairTerminalPreparation,
+    supplied: &PairTerminalPreparation,
+) -> Result<(), RuntimeStoreError> {
+    if expected.pairing_id != supplied.pairing_id
+        || expected.pair_route != supplied.pair_route
+        || expected.machine_route != supplied.machine_route
+        || expected.request_hash != supplied.request_hash
+        || expected.outcome != supplied.outcome
+        || expected.info != supplied.info
+        || expected.context != supplied.context
+        || expected.recipient.to_bytes() != supplied.recipient.to_bytes()
+        || expected.data_sign_certificate != supplied.data_sign_certificate
+        || expected.hpke_seed_commitment != supplied.hpke_seed_commitment
+        || expected.hpke_seed.is_none()
+        || supplied.hpke_seed.is_some()
+    {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    Ok(())
+}
+
+fn terminal_hpke_seed_commitment(seed: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"agentdeck.runtime.pair-terminal.hpke-seed-commitment.v1");
+    hasher.update(seed);
+    hasher.finalize().into()
+}
+
+fn classify_terminal_carrier(
+    directory: &super::pairing::PairingDirectory,
+    key_bundle: &RuntimeKeyBundle,
+    database_id: [u8; 16],
+    input: &CommitPairTerminal,
+) -> Result<Option<PairingTerminalRecovery>, RuntimeStoreError> {
+    let pairing = directory
+        .pairings
+        .iter()
+        .find(|pairing| pairing.record.pairing_id == input.preparation.pairing_id)
+        .ok_or(RuntimeStoreError::PairingConflict)?;
+    let expected = terminal_preparation(pairing, key_bundle, database_id)?
+        .ok_or(RuntimeStoreError::InvalidStateTransition)?;
+    validate_commit_preparation(&expected, &input.preparation)?;
+    super::pairing::exact_pair_terminal_frame(
+        input.canonical_frame(),
+        input.preparation.pair_route,
+    )?;
+    let close = directory
+        .terminal
+        .close(input.preparation.pairing_id)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    match pairing.record.canonical_pair_terminal_frame.as_deref() {
+        Some(canonical) if canonical == input.canonical_frame() => {
+            terminal_recovery(directory, close, key_bundle, database_id).map(Some)
+        }
+        Some(_) => Err(RuntimeStoreError::PairingConflict),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn commit_pair_terminal(
+    state: &mut RuntimeSqlite,
+    config: &RuntimeStoreConfig,
+    input: CommitPairTerminal,
+) -> Result<CommitPairTerminalOutcome, RuntimeStoreError> {
+    let directory =
+        super::pairing::load_directory(&state.connection, &state.key_bundle, state.database_id)?;
+    if let Some(recovery) =
+        classify_terminal_carrier(&directory, &state.key_bundle, state.database_id, &input)?
+    {
+        return Ok(CommitPairTerminalOutcome::Replayed { recovery });
+    }
+    super::sqlite::admit_safety_write(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+        &state.storage_path,
+        config.capacity_probe.as_ref(),
+    )?;
+
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let directory =
+        super::pairing::load_directory(&transaction, &state.key_bundle, state.database_id)?;
+    if let Some(recovery) =
+        classify_terminal_carrier(&directory, &state.key_bundle, state.database_id, &input)?
+    {
+        return Ok(CommitPairTerminalOutcome::Replayed { recovery });
+    }
+    let pairing = directory
+        .pairings
+        .iter()
+        .find(|pairing| pairing.record.pairing_id == input.preparation.pairing_id)
+        .ok_or(RuntimeStoreError::PairingConflict)?;
+    let payload = super::pairing::encode_pair_terminal_payload(pairing, input.canonical_frame())?;
+    let sealed_state = super::pairing::seal(
+        &state.key_bundle,
+        state.database_id,
+        super::pairing::PAIRING_TABLE,
+        pairing.record.pairing_id.as_bytes(),
+        super::pairing::PAIRING_COLUMN,
+        payload.as_slice(),
+        super::pairing::MAX_PAIRING_STATE_PLAINTEXT_BYTES,
+    )?;
+    let metadata_token = super::pairing::pairing_row_token(
+        &state.key_bundle,
+        state.database_id,
+        pairing.record.pairing_id,
+        pairing.record.lifecycle,
+        pairing.record.relay_server_id,
+        pairing.record.machine_route,
+        pairing.record.pair_route,
+        pairing.record.expires_at_ms,
+        pairing.record.created_at_ms,
+        pairing.record.state_changed_at_ms,
+        pairing.record.request_hash,
+        pairing.record.device_sign_fingerprint,
+        pairing.record.grant_hash,
+        pairing.record.response_hash,
+        &sealed_state,
+    )?;
+    let mut next = directory.ledger.clone();
+    next.remote_pairing_sealed_bytes = next
+        .remote_pairing_sealed_bytes
+        .checked_sub(pairing.sealed_state_bytes)
+        .and_then(|bytes| bytes.checked_add(u64::try_from(sealed_state.len()).unwrap_or(u64::MAX)))
+        .ok_or(RuntimeStoreError::CapacityArithmeticOverflow {
+            field: "remote_pairing_sealed_bytes",
+        })?;
+    if next.remote_pairing_sealed_bytes > super::pairing::MAX_PAIRING_SEALED_BYTES {
+        return Err(RuntimeStoreError::PairingLimit);
+    }
+    if transaction.execute(
+        "UPDATE remote_pairings
+         SET sealed_state = ?1, sealed_state_bytes = ?2, metadata_token = ?3
+         WHERE pairing_id = ?4 AND lifecycle = ?5 AND state_changed_at_ms = ?6
+           AND request_hash = ?7 AND metadata_token = ?8",
+        params![
+            &sealed_state,
+            i64::try_from(sealed_state.len()).map_err(|_| RuntimeStoreError::PayloadTooLarge)?,
+            &metadata_token[..],
+            &pairing.record.pairing_id.as_bytes()[..],
+            match pairing.record.lifecycle {
+                PairingInviteLifecycle::Canceled => "canceled",
+                PairingInviteLifecycle::Expired => "expired",
+                _ => return Err(RuntimeStoreError::InvalidStateTransition),
+            },
+            i64::try_from(pairing.record.state_changed_at_ms)
+                .map_err(|_| RuntimeStoreError::TimeOutOfRange)?,
+            pairing
+                .record
+                .request_hash
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+            &pairing.metadata_token[..],
+        ],
+    )? != 1
+    {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    let _ = super::sqlite::update_runtime_ledger(
+        &transaction,
+        &state.key_bundle,
+        state.database_id,
+        &directory.ledger,
+        &next,
+    )?;
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::CommitPairTerminalBeforeCommit)?;
+    super::sqlite::commit_transaction(transaction, RuntimeCommitOperation::CommitPairTerminal)?;
+    super::sqlite::latch_post_commit_capacity(state, config);
+    config
+        .fault_injector
+        .before_operation(RuntimeStoreOperation::CommitPairTerminalAfterCommit)
+        .map_err(|_| RuntimeStoreError::CommitOutcomeUnknown {
+            operation: RuntimeCommitOperation::CommitPairTerminal,
+        })?;
+    let directory =
+        super::pairing::load_directory(&state.connection, &state.key_bundle, state.database_id)?;
+    let recovery =
+        classify_terminal_carrier(&directory, &state.key_bundle, state.database_id, &input)?
+            .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    Ok(CommitPairTerminalOutcome::Committed { recovery })
 }
 
 fn exact_close_terminal(
@@ -1666,6 +2243,20 @@ fn replayed_close_ack(
     }))
 }
 
+fn require_terminal_carrier_before_close(
+    pairing: &AuthenticatedPairingRow,
+) -> Result<(), RuntimeStoreError> {
+    if matches!(
+        pairing.record.lifecycle,
+        PairingInviteLifecycle::Canceled | PairingInviteLifecycle::Expired
+    ) && pairing.record.request_hash.is_some()
+        && pairing.record.canonical_pair_terminal_frame.is_none()
+    {
+        return Err(RuntimeStoreError::InvalidStateTransition);
+    }
+    Ok(())
+}
+
 pub(crate) fn acknowledge_pair_route_close(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
@@ -1696,6 +2287,7 @@ pub(crate) fn acknowledge_pair_route_close(
     ) {
         return Err(RuntimeStoreError::PairingConflict);
     }
+    require_terminal_carrier_before_close(pairing)?;
     exact_close_terminal(&canonical_terminal, pairing.record.pair_route)?;
     if directory.terminal.close(pairing_id).is_none()
         || directory.terminal.receipt(pairing_id).is_none()
@@ -1734,6 +2326,7 @@ pub(crate) fn acknowledge_pair_route_close(
         .position(|pairing| pairing.record.pairing_id == pairing_id)
         .ok_or(RuntimeStoreError::PairingConflict)?;
     let pairing = directory.pairings.swap_remove(pairing_index);
+    require_terminal_carrier_before_close(&pairing)?;
     if pairing.record.lifecycle == PairingInviteLifecycle::Delivered {
         super::pairing_delivery::ensure_durable_bootstrap_install_proof(
             &transaction,

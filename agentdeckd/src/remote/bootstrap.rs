@@ -11,17 +11,17 @@ use std::fmt;
 use agentdeck_crypto::{
     CryptoError, DeviceKeyRecoverySealAuthority, HpkePublicKey, PairResponseSealAuthority,
     SignatureBytes, ValidatedRelayReceiptVerifyKey, VerifyingKey, seal_device_key_recovery_reply,
-    seal_pair_pending, seal_pair_response, sha256, sign_authentication_transcript,
-    sign_device_authorization, sign_key_directory as crypto_sign_key_directory,
-    sign_key_update as crypto_sign_key_update, sign_sealed as crypto_sign_sealed, sign_tbs,
-    verify_tbs,
+    seal_pair_pending, seal_pair_response, seal_pair_terminal, sha256,
+    sign_authentication_transcript, sign_device_authorization,
+    sign_key_directory as crypto_sign_key_directory, sign_key_update as crypto_sign_key_update,
+    sign_sealed as crypto_sign_sealed, sign_tbs, verify_tbs,
 };
 use agentdeck_protocol::e2ee::{
     DeviceAuthorizationV1, DeviceKeyRecoveryInfoV1, DeviceKeyRecoveryReplyV1,
     KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyUpdateInfoV1, KeyUpdateSetV1, KeyUpdateV1,
     MachineDataSignerBindingV1, OuterContextV1, PairRequestInfoV1, PairResponseInfoV1,
-    PairResponsePlaintextV1, PairResponseV1, PairingControlEnvelopeV1, SignedSealedBlobV1,
-    UnsignedSealedBlobV1,
+    PairResponsePlaintextV1, PairResponseV1, PairTerminalV1, PairingControlEnvelopeV1,
+    SignedSealedBlobV1, UnsignedSealedBlobV1,
 };
 use agentdeck_protocol::relay_v2::{
     AuthenticationTranscriptV1, CertRole, DeviceRevocation, Ed25519Signature, LinkGeneration,
@@ -907,6 +907,26 @@ impl MachineLinkIdentityOwner {
             info,
             context,
             request_hash,
+            self.identity.material.data_signing_key(),
+            signer,
+            &mut rng,
+        )?)
+    }
+
+    pub(super) fn seal_pair_terminal(
+        &self,
+        recipient: &HpkePublicKey,
+        info: &PairRequestInfoV1,
+        context: &OuterContextV1,
+        terminal: PairTerminalV1,
+        signer: &MachineDataSignerBindingV1,
+        mut rng: &mut dyn agentdeck_crypto::rand_core::CryptoRng,
+    ) -> Result<PairingControlEnvelopeV1, MachinePairingError> {
+        Ok(seal_pair_terminal(
+            recipient,
+            info,
+            context,
+            terminal,
             self.identity.material.data_signing_key(),
             signer,
             &mut rng,

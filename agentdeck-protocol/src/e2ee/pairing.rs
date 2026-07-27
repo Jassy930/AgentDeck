@@ -811,6 +811,87 @@ pub struct PairPendingV1 {
     pub signature: Ed25519Signature,
 }
 
+/// Pairing request 的 daemon-signed terminal outcome。
+///
+/// 该 plaintext 复用 [`super::PairingControlEnvelopeV1`] 由 DeviceHPKE 加密；Relay 只能
+/// 看到 carrier，不能区分 canceled/expired，也看不到 machine/request identity。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum PairTerminalOutcomeV1 {
+    Canceled,
+    Expired,
+}
+
+impl PairTerminalOutcomeV1 {
+    /// frozen canonical tag：append-only，不能随 enum 声明顺序漂移。
+    #[must_use]
+    pub const fn canonical_tag(self) -> u8 {
+        match self {
+            Self::Canceled => 0,
+            Self::Expired => 1,
+        }
+    }
+
+    pub(crate) fn from_tag(tag: u8) -> Result<Self, PairingError> {
+        match tag {
+            0 => Ok(Self::Canceled),
+            1 => Ok(Self::Expired),
+            _ => Err(PairingError::InvalidEncoding("PairTerminal outcome")),
+        }
+    }
+}
+
+/// 与 exact machine/request 绑定的 pairing 终态；由 MachineDataSign 签名。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "PairTerminalWireV1"
+)]
+pub struct PairTerminalV1 {
+    pub machine_route: MachineRouteId,
+    #[serde(with = "b64_32")]
+    #[schemars(with = "String")]
+    pub request_hash: [u8; 32],
+    pub outcome: PairTerminalOutcomeV1,
+    pub signature: Ed25519Signature,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairTerminalWireV1 {
+    machine_route: MachineRouteId,
+    #[serde(with = "b64_32")]
+    request_hash: [u8; 32],
+    outcome: PairTerminalOutcomeV1,
+    signature: Ed25519Signature,
+}
+
+impl TryFrom<PairTerminalWireV1> for PairTerminalV1 {
+    type Error = PairingError;
+
+    fn try_from(value: PairTerminalWireV1) -> Result<Self, Self::Error> {
+        let terminal = Self {
+            machine_route: value.machine_route,
+            request_hash: value.request_hash,
+            outcome: value.outcome,
+            signature: value.signature,
+        };
+        terminal.validate()?;
+        Ok(terminal)
+    }
+}
+
+impl std::fmt::Debug for PairTerminalV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairTerminalV1")
+            .field("outcome", &self.outcome)
+            .field("terminal_material", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PairPendingWireV1 {

@@ -3303,6 +3303,7 @@ fn pairing_access_is_strictly_limited_to_its_active_route() {
             pair_route,
             absolute_expiry_ms: 100,
         }),
+        tombstoned: false,
     };
     let access = authorize_pairing_route(hello, &view).expect("active route");
     let pair_data = OpaqueRouteFrame {
@@ -3419,6 +3420,7 @@ fn pairing_access_is_strictly_limited_to_its_active_route() {
             &PairRouteView {
                 now_ms: 100,
                 active_route: view.active_route,
+                tombstoned: false,
             },
         )
         .expect_err("expired")
@@ -3443,6 +3445,7 @@ fn pairing_access_is_strictly_limited_to_its_active_route() {
             &PairRouteView {
                 now_ms: 0,
                 active_route: None,
+                tombstoned: false,
             },
         )
         .expect_err("unknown route")

@@ -11,7 +11,7 @@ use agentdeck_crypto::{
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,
     MachineDataSignerBindingV1, PairRequestPlaintextV1, PairResponsePlaintextV1,
-    PairResponseReceivedV1,
+    PairResponseReceivedV1, PairTerminalOutcomeV1,
 };
 use agentdeck_protocol::relay_v2::failure::RelayFailure;
 use agentdeck_protocol::relay_v2::frame::{PairRouteCloseOutcome, RetireMachine, ServerRestarting};
@@ -105,6 +105,7 @@ struct FakeStoreState {
     revoked: BTreeMap<RevocationKey, DeviceRevocation>,
     delivered_receipt_hashes: BTreeMap<RuntimeId, [u8; 32]>,
     last_close_ack: Option<Vec<u8>>,
+    failed_terminal_carrier: Option<PairData>,
 }
 
 #[derive(Clone)]
@@ -112,6 +113,8 @@ struct FakeTerminal {
     decision: PairingDecision,
     receipt: PairingReceipt,
     close: Option<DurableClose>,
+    preparation_pending: bool,
+    carrier: Option<PairData>,
 }
 
 #[derive(Default)]
@@ -140,6 +143,7 @@ struct FakeStore {
     delivery_commit_unknown_readback: AtomicBool,
     fail_close_ack_before_commit: AtomicBool,
     close_ack_unknown_readback: AtomicBool,
+    fail_terminal_before_commit: AtomicBool,
     expose_stale_committed_recovery: AtomicBool,
     fail_revocation_begin: AtomicBool,
     fail_orphan_grant_ack: AtomicBool,
@@ -173,6 +177,7 @@ impl FakeStore {
             delivery_commit_unknown_readback: AtomicBool::new(false),
             fail_close_ack_before_commit: AtomicBool::new(false),
             close_ack_unknown_readback: AtomicBool::new(false),
+            fail_terminal_before_commit: AtomicBool::new(false),
             expose_stale_committed_recovery: AtomicBool::new(false),
             fail_revocation_begin: AtomicBool::new(false),
             fail_orphan_grant_ack: AtomicBool::new(false),
@@ -368,6 +373,50 @@ impl FakeStore {
             .collect()
     }
 
+    /// Fake store 只保存 durable recipe；每次恢复都重新派生唯一 preparation owner，
+    /// 不在内存状态中保留或复制 HPKE seed。
+    fn terminal_preparation_locked(
+        state: &FakeStoreState,
+        pairing_id: RuntimeId,
+    ) -> Result<Option<PairTerminalPreparation>, PairingAdministrationError> {
+        let terminal = state
+            .terminals
+            .get(&pairing_id)
+            .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
+        if !terminal.preparation_pending {
+            return Ok(None);
+        }
+        let stored = state
+            .by_id
+            .get(&pairing_id)
+            .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
+        let request_hash = stored
+            .request_hash
+            .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
+        let plaintext = stored
+            .canonical_plaintext
+            .as_deref()
+            .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
+        let outcome = match terminal.decision {
+            PairingDecision::Cancel => PairTerminalOutcomeV1::Canceled,
+            PairingDecision::Expire => PairTerminalOutcomeV1::Expired,
+            PairingDecision::Confirm => {
+                return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+            }
+        };
+        PairTerminalPreparation::for_test(
+            pairing_id,
+            MACHINE_ROUTE,
+            request_hash,
+            outcome,
+            &stored.canonical_invite,
+            plaintext,
+            request_hash,
+        )
+        .map(Some)
+        .map_err(store_error)
+    }
+
     fn terminalize_locked(
         state: &mut FakeStoreState,
         pairing_id: RuntimeId,
@@ -440,12 +489,20 @@ impl FakeStore {
             pair_route: stored.pair_route,
             frame,
         };
+        let preparation_pending = match (stored.request_hash, stored.canonical_plaintext.as_deref())
+        {
+            (Some(_), Some(_)) => true,
+            (None, None) => false,
+            _ => return Err(pairing_error(PAIRING_TERMINAL_INVALID)),
+        };
         state.terminals.insert(
             pairing_id,
             FakeTerminal {
                 decision: winner,
                 receipt: receipt.clone(),
                 close: Some(close.clone()),
+                preparation_pending,
+                carrier: None,
             },
         );
         Ok(TerminalOutcome {
@@ -865,6 +922,8 @@ impl PairingStore for FakeStore {
                 decision: PairingDecision::Confirm,
                 receipt: receipt.clone(),
                 close: None,
+                preparation_pending: false,
+                carrier: None,
             },
         );
         state.authorizations.insert(
@@ -1375,15 +1434,80 @@ impl PairingStore for FakeStore {
             .collect()
     }
 
-    async fn recover_terminals(&self) -> Result<Vec<DurableClose>, PairingAdministrationError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
+    async fn recover_terminals(&self) -> Result<Vec<DurableTerminal>, PairingAdministrationError> {
+        let state = self.state.lock().unwrap();
+        state
             .terminals
-            .values()
-            .filter_map(|terminal| terminal.close.clone())
-            .collect())
+            .iter()
+            .filter(|(_, terminal)| terminal.close.is_some())
+            .map(|(pairing_id, terminal)| {
+                Ok(DurableTerminal {
+                    close: terminal
+                        .close
+                        .clone()
+                        .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?,
+                    preparation: Self::terminal_preparation_locked(&state, *pairing_id)?,
+                    carrier: terminal.carrier.clone(),
+                })
+            })
+            .collect()
+    }
+
+    async fn commit_terminal(
+        &self,
+        preparation: PairTerminalPreparation,
+        envelope: PairingControlEnvelopeV1,
+    ) -> Result<DurableTerminal, PairingAdministrationError> {
+        let pairing_id = preparation.pairing_id();
+        let pair_route = preparation.pair_route();
+        let request_hash = preparation.request_hash();
+        let outcome = preparation.outcome();
+        let input = CommitPairTerminal::new(preparation, envelope).map_err(store_error)?;
+        let decoded =
+            decode(input.canonical_frame()).map_err(|_| pairing_error(PAIRING_TERMINAL_INVALID))?;
+        let RelayFrameBody::PairData(carrier) = decoded.body else {
+            return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+        };
+        if self
+            .fail_terminal_before_commit
+            .swap(false, Ordering::SeqCst)
+        {
+            self.state.lock().unwrap().failed_terminal_carrier = Some(carrier);
+            return Err(pairing_error("daemon.runtime.store_unavailable"));
+        }
+        let mut state = self.state.lock().unwrap();
+        let expected = Self::terminal_preparation_locked(&state, pairing_id)?;
+        if expected.as_ref().is_some_and(|expected| {
+            expected.pair_route() != pair_route
+                || expected.request_hash() != request_hash
+                || expected.outcome() != outcome
+        }) {
+            return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+        }
+        let terminal = state
+            .terminals
+            .get_mut(&pairing_id)
+            .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
+        if terminal.carrier.is_none() && expected.is_none() {
+            return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+        }
+        if let Some(existing) = &terminal.carrier {
+            if existing != &carrier {
+                return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+            }
+        } else {
+            terminal.carrier = Some(carrier.clone());
+            terminal.preparation_pending = false;
+            self.order.lock().unwrap().push("terminal-carrier-commit");
+        }
+        Ok(DurableTerminal {
+            close: terminal
+                .close
+                .clone()
+                .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?,
+            preparation: None,
+            carrier: Some(carrier),
+        })
     }
 
     async fn acknowledge_close(
@@ -1401,6 +1525,9 @@ impl PairingStore for FakeStore {
             .get(&pairing_id)
             .cloned()
             .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
+        if terminal.preparation_pending {
+            return Err(pairing_error(PAIRING_TERMINAL_INVALID));
+        }
         let close = terminal
             .close
             .ok_or_else(|| pairing_error(PAIRING_TERMINAL_INVALID))?;
@@ -1508,6 +1635,24 @@ impl PairingLane for FakeLane {
             .map_err(|_| pairing_error(PAIRING_TRANSPORT))
     }
 
+    async fn send_terminal_and_close(
+        &self,
+        terminal: PairData,
+        close: ClosePairRoute,
+    ) -> Result<(), PairingAdministrationError> {
+        self.order.lock().unwrap().push("send-terminal");
+        if self.fail_send.load(Ordering::SeqCst) {
+            return Err(pairing_error(self.send_failure_code));
+        }
+        self.sent_data_tx
+            .send(terminal)
+            .map_err(|_| pairing_error(PAIRING_TRANSPORT))?;
+        self.order.lock().unwrap().push("send-close");
+        self.sent_close_tx
+            .send(close)
+            .map_err(|_| pairing_error(PAIRING_TRANSPORT))
+    }
+
     async fn send_install(&self, frame: InstallGrant) -> Result<(), PairingAdministrationError> {
         self.order.lock().unwrap().push("send-grant");
         if self.fail_send.load(Ordering::SeqCst) {
@@ -1585,6 +1730,7 @@ impl PairingPendingSink for FakePendingSink {
 
 struct FakeAuthority {
     seals: Arc<AtomicUsize>,
+    terminal_seals: Arc<AtomicUsize>,
     grant_freezes: Arc<AtomicUsize>,
     grant_axes: Arc<StdMutex<Vec<(u64, u64)>>>,
     fail_grant_freeze: Arc<AtomicBool>,
@@ -1634,6 +1780,29 @@ impl PairingAuthority for FakeAuthority {
             preparation.pairing_id,
             preparation.request_hash,
         ))
+    }
+
+    fn seal_terminal(
+        &self,
+        preparation: &mut PairTerminalPreparation,
+    ) -> Result<PairingControlEnvelopeV1, PairingAdministrationError> {
+        assert_eq!(
+            preparation.context().frame_kind,
+            OuterFrameKind::PairTerminal
+        );
+        assert_eq!(
+            preparation.context().pair_route,
+            Some(preparation.pair_route())
+        );
+        self.terminal_seals.fetch_add(1, Ordering::SeqCst);
+        let hpke_seed = preparation
+            .take_hpke_seed()
+            .expect("test terminal preparation owns one HPKE seed");
+        Ok(PairingControlEnvelopeV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            enc: hpke_seed.to_vec(),
+            ciphertext: preparation.request_hash().to_vec(),
+        })
     }
 
     fn verify_delivery(
@@ -1693,6 +1862,20 @@ impl PairingAuthority for StoreBackedTestAuthority {
             format_version: E2EE_FORMAT_VERSION,
             enc: vec![0x91; 32],
             ciphertext: preparation.request_hash.to_vec(),
+        })
+    }
+
+    fn seal_terminal(
+        &self,
+        preparation: &mut PairTerminalPreparation,
+    ) -> Result<PairingControlEnvelopeV1, PairingAdministrationError> {
+        let hpke_seed = preparation
+            .take_hpke_seed()
+            .expect("test terminal preparation owns one HPKE seed");
+        Ok(PairingControlEnvelopeV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            enc: hpke_seed.to_vec(),
+            ciphertext: preparation.request_hash().to_vec(),
         })
     }
 
@@ -1816,6 +1999,7 @@ struct TestActor {
     shared_control_yields: Arc<AtomicUsize>,
     fail_shared_control_yield: Arc<AtomicBool>,
     seals: Arc<AtomicUsize>,
+    terminal_seals: Arc<AtomicUsize>,
     grant_freezes: Arc<AtomicUsize>,
     grant_axes: Arc<StdMutex<Vec<(u64, u64)>>>,
     fail_grant_freeze: Arc<AtomicBool>,
@@ -1870,6 +2054,7 @@ async fn spawn_production_drain_actor(
         Box::new(ProductionPairingLane(lane)),
         Box::new(FakeAuthority {
             seals: Arc::new(AtomicUsize::new(0)),
+            terminal_seals: Arc::new(AtomicUsize::new(0)),
             grant_freezes: Arc::new(AtomicUsize::new(0)),
             grant_axes: Arc::new(StdMutex::new(Vec::new())),
             fail_grant_freeze: Arc::new(AtomicBool::new(false)),
@@ -1921,6 +2106,7 @@ async fn spawn_actor_with_startup_send_failure(
     let shared_control_yields = Arc::new(AtomicUsize::new(0));
     let fail_shared_control_yield = Arc::new(AtomicBool::new(false));
     let seals = Arc::new(AtomicUsize::new(0));
+    let terminal_seals = Arc::new(AtomicUsize::new(0));
     let grant_freezes = Arc::new(AtomicUsize::new(0));
     let grant_axes = Arc::new(StdMutex::new(Vec::new()));
     let fail_grant_freeze = Arc::new(AtomicBool::new(false));
@@ -1958,6 +2144,7 @@ async fn spawn_actor_with_startup_send_failure(
         Box::new(lane),
         Box::new(FakeAuthority {
             seals: Arc::clone(&seals),
+            terminal_seals: Arc::clone(&terminal_seals),
             grant_freezes: Arc::clone(&grant_freezes),
             grant_axes: Arc::clone(&grant_axes),
             fail_grant_freeze: Arc::clone(&fail_grant_freeze),
@@ -1999,6 +2186,7 @@ async fn spawn_actor_with_startup_send_failure(
             shared_control_yields,
             fail_shared_control_yield,
             seals,
+            terminal_seals,
             grant_freezes,
             grant_axes,
             fail_grant_freeze,
@@ -2021,6 +2209,14 @@ impl PairingLane for OwnerTestLane {
     }
 
     async fn send_data(&self, _frame: PairData) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn send_terminal_and_close(
+        &self,
+        _terminal: PairData,
+        _close: ClosePairRoute,
+    ) -> Result<(), PairingAdministrationError> {
         Ok(())
     }
 
@@ -2071,6 +2267,7 @@ fn test_owner(
         Box::new(OwnerTestLane),
         Box::new(FakeAuthority {
             seals: Arc::new(AtomicUsize::new(0)),
+            terminal_seals: Arc::new(AtomicUsize::new(0)),
             grant_freezes: Arc::new(AtomicUsize::new(0)),
             grant_axes: Arc::new(StdMutex::new(Vec::new())),
             fail_grant_freeze: Arc::new(AtomicBool::new(false)),
@@ -2119,6 +2316,7 @@ async fn spawn_store_backed_actor(
     let shared_control_yields = Arc::new(AtomicUsize::new(0));
     let fail_shared_control_yield = Arc::new(AtomicBool::new(false));
     let seals = Arc::new(AtomicUsize::new(0));
+    let terminal_seals = Arc::new(AtomicUsize::new(0));
     let grant_freezes = Arc::new(AtomicUsize::new(0));
     let grant_axes = Arc::new(StdMutex::new(Vec::new()));
     let fail_grant_freeze = Arc::new(AtomicBool::new(false));
@@ -2207,6 +2405,7 @@ async fn spawn_store_backed_actor(
         shared_control_yields,
         fail_shared_control_yield,
         seals,
+        terminal_seals,
         grant_freezes,
         grant_axes,
         fail_grant_freeze,
@@ -2333,6 +2532,23 @@ impl TryRng for DeterministicRng {
 }
 
 impl TryCryptoRng for DeterministicRng {}
+
+#[derive(Clone)]
+struct StoreBackedClock(Arc<AtomicU64>);
+
+impl crate::runtime::model::RuntimeClock for StoreBackedClock {
+    fn now_ms(&self) -> Result<u64, crate::runtime::model::RuntimeClockError> {
+        let system_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| crate::runtime::model::RuntimeClockError::BeforeUnixEpoch)?
+            .as_millis()
+            .try_into()
+            .map_err(|_| crate::runtime::model::RuntimeClockError::OutOfRange)?;
+        // 组合测试初始化可能在全量并发下超过 PairInvite 的 relay tick guard；正常阶段
+        // 跟随墙钟，只有显式快进到 expiry/revocation cut 后才由测试值接管。
+        Ok(self.0.load(Ordering::SeqCst).max(system_now_ms))
+    }
+}
 
 fn pair_request(invite: &PairInviteV1, seed: u8) -> PairData {
     let device_signing_key = SigningKey::from_seed(&[seed; 32]);
@@ -2482,7 +2698,15 @@ async fn receive_pairing_frame<T>(
     receiver: &mut mpsc::UnboundedReceiver<T>,
     label: &'static str,
 ) -> T {
-    tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+    receive_pairing_frame_with_timeout(receiver, label, Duration::from_secs(5)).await
+}
+
+async fn receive_pairing_frame_with_timeout<T>(
+    receiver: &mut mpsc::UnboundedReceiver<T>,
+    label: &'static str,
+    timeout: Duration,
+) -> T {
+    tokio::time::timeout(timeout, receiver.recv())
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
         .unwrap_or_else(|| panic!("channel closed while waiting for {label}"))
@@ -2615,6 +2839,25 @@ async fn create_opened_invite(actor: &mut TestActor, key: &str) -> PairInvite {
         .expect("timed out waiting for CreatePairInvite")
         .expect("CreatePairInvite task must join")
         .expect("CreatePairInvite must succeed")
+}
+
+async fn create_opened_invite_with_registered_receiver(
+    actor: &mut TestActor,
+    key: &str,
+) -> PairInvite {
+    let handle = actor.handle.clone();
+    let create = handle.create(owner(), request(key));
+    tokio::pin!(create);
+    let open = tokio::select! {
+        result = &mut create => {
+            panic!("CreatePairInvite completed before OpenPairRoute: {result:?}")
+        }
+        frame = actor.sent_rx.recv() => {
+            frame.expect("store-backed actor closed before sending OpenPairRoute")
+        }
+    };
+    actor.event_tx.send(Ok(opened(&open))).unwrap();
+    create.await.expect("CreatePairInvite must succeed")
 }
 
 async fn create_pending_pairing(
@@ -3797,6 +4040,173 @@ async fn grant_preparing_drain_preserves_exact_install_ack_revoke_ack_close_orde
 }
 
 #[tokio::test]
+async fn production_store_post_grant_revocation_flushes_terminal_carrier_before_close() {
+    let root = tempfile::Builder::new()
+        .prefix("agentdeck-pair-terminal-revocation-")
+        .tempdir()
+        .expect("create post-grant terminal composition root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("secure post-grant terminal composition root");
+    }
+    let database = root.path().join("runtime.db");
+    let keys = MemoryKeyStore::new();
+    let clock = Arc::new(AtomicU64::new(
+        unix_now_ms().expect("read composition clock"),
+    ));
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(database.clone()).with_clock(StoreBackedClock(Arc::clone(&clock))),
+        load_or_create_storage_kek(&keys, &database)
+            .expect("create post-grant terminal StorageKEK"),
+    )
+    .await
+    .expect("open post-grant terminal Store");
+    let (binding, data_certificate) = crate::runtime::store::make_active_for_test(&store).await;
+    let mut actor = spawn_store_backed_actor(store.clone(), binding, data_certificate).await;
+    let composition_timeout = Duration::from_secs(30);
+
+    let invite =
+        create_opened_invite_with_registered_receiver(&mut actor, "post-grant-terminal").await;
+    let pairing_id =
+        RuntimeId::parse_canonical(RuntimeIdKind::Pairing, invite.pairing_id.as_str()).unwrap();
+    let (request, _) = store_backed_pair_request(&invite.invite, 0xd1, 0xd2, 31);
+    actor
+        .event_tx
+        .send(Ok(PairingTransportEvent::PairData(request)))
+        .unwrap();
+    receive_pairing_frame_with_timeout(
+        &mut actor.sent_data_rx,
+        "post-grant PairPending",
+        composition_timeout,
+    )
+    .await;
+    assert!(matches!(
+        actor.handle.confirm(pairing_id).await.unwrap(),
+        PairingReceipt::Confirmed { .. }
+    ));
+    let install = receive_pairing_frame_with_timeout(
+        &mut actor.sent_grant_rx,
+        "post-grant InstallGrant",
+        composition_timeout,
+    )
+    .await;
+    crate::runtime::store::complete_active_zero_cut_transition(&store).await;
+    clock.fetch_add(600_000, Ordering::SeqCst);
+    assert_eq!(
+        store
+            .list_due_orphan_revocation_targets()
+            .await
+            .expect("read due post-grant revocation targets")
+            .len(),
+        1,
+        "expired GrantPreparing must become an orphan revocation target"
+    );
+
+    let drain_handle = actor.handle.clone();
+    let mut drain = tokio::spawn(async move { drain_handle.begin_drain().await });
+    let replayed_install = tokio::select! {
+        result = &mut drain => panic!("drain ended before orphan InstallGrant replay: {result:?}"),
+        frame = receive_pairing_frame_with_timeout(
+            &mut actor.sent_grant_rx,
+            "orphan InstallGrant replay",
+            composition_timeout,
+        ) => frame,
+    };
+    assert_eq!(replayed_install, install);
+    actor
+        .event_tx
+        .send(Ok(PairingTransportEvent::GrantCommitted(grant_committed(
+            &replayed_install,
+        ))))
+        .unwrap();
+    let revoke = receive_pairing_frame_with_timeout(
+        &mut actor.sent_revoke_rx,
+        "orphan RevokeDevice",
+        composition_timeout,
+    )
+    .await;
+    actor
+        .event_tx
+        .send(Ok(PairingTransportEvent::RevocationCommitted(
+            revocation_committed(&revoke),
+        )))
+        .unwrap();
+
+    let terminal = receive_pairing_frame_with_timeout(
+        &mut actor.sent_data_rx,
+        "post-grant PairTerminal carrier",
+        composition_timeout,
+    )
+    .await;
+    assert_eq!(terminal.pair_route, invite.invite.pair_route);
+    let envelope = PairingControlEnvelopeV1::from_canonical_bytes(&terminal.sealed_blob.0)
+        .expect("post-grant PairTerminal is a canonical control envelope");
+    assert_eq!(
+        envelope.canonical_bytes().unwrap(),
+        terminal.sealed_blob.0,
+        "production Store recovery must feed an exact canonical terminal carrier"
+    );
+    let terminal_recovery = store
+        .list_pairing_terminal_recovery()
+        .await
+        .expect("read durable post-grant PairTerminal");
+    assert_eq!(terminal_recovery.len(), 1);
+    assert_eq!(
+        store
+            .load_pairing_invite(pairing_id)
+            .await
+            .expect("read post-grant pairing lifecycle")
+            .expect("pairing remains until Close ACK")
+            .lifecycle(),
+        PairingInviteLifecycle::Expired
+    );
+    assert_eq!(
+        terminal_recovery[0]
+            .carrier()
+            .expect("post-grant carrier must commit before writer flush")
+            .canonical_frame(),
+        encode(&OpaqueRouteFrame {
+            version: RELAY_PROTOCOL_VERSION,
+            body: RelayFrameBody::PairData(terminal.clone()),
+        })
+    );
+    let close = receive_pairing_frame_with_timeout(
+        &mut actor.sent_close_rx,
+        "post-grant ClosePairRoute",
+        composition_timeout,
+    )
+    .await;
+    assert_eq!(close.pair_route, invite.invite.pair_route);
+    actor.event_tx.send(Ok(closed(&close))).unwrap();
+    tokio::time::timeout(composition_timeout, drain)
+        .await
+        .expect("post-grant drain must finish after Close ACK")
+        .expect("post-grant drain task must join")
+        .expect("post-grant drain must succeed");
+    assert!(
+        store
+            .list_pairing_terminal_recovery()
+            .await
+            .expect("read terminal recovery after Close ACK")
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_revocation_recovery()
+            .await
+            .expect("read revocation recovery after Close ACK")
+            .is_empty()
+    );
+    actor.stop().await;
+    store
+        .shutdown()
+        .await
+        .expect("shutdown post-grant terminal Store");
+}
+
+#[tokio::test]
 async fn drain_restart_and_reconnect_replay_only_the_current_durable_frame() {
     let store = Arc::new(FakeStore::default());
     let mut first = spawn_actor(Arc::clone(&store)).await;
@@ -4213,6 +4623,191 @@ async fn verified_pair_request_commits_pending_before_exact_send_and_local_publi
     tokio::task::yield_now().await;
     assert_eq!(&*actor.published.lock().unwrap(), &listed);
     actor.stop().await;
+}
+
+#[tokio::test]
+async fn request_terminal_commits_carrier_then_flushes_before_close_and_restart_reuses_bytes() {
+    let order = Arc::new(StdMutex::new(Vec::new()));
+    let store = Arc::new(FakeStore::with_order(Arc::clone(&order)));
+    let mut first = spawn_actor(Arc::clone(&store)).await;
+    let (invite, pairing_id) = create_pending_pairing(&mut first, "terminal-ordering", 0x67).await;
+
+    let receipt = first
+        .handle
+        .cancel(pairing_id)
+        .await
+        .expect("cancel request-bound pairing");
+    assert!(matches!(receipt, PairingReceipt::Canceled { .. }));
+    let frozen_carrier = first
+        .sent_data_rx
+        .recv()
+        .await
+        .expect("PairTerminal carrier must flush before Close");
+    let frozen_close = first
+        .sent_close_rx
+        .recv()
+        .await
+        .expect("Close follows successful terminal flush");
+    assert_eq!(frozen_carrier.pair_route, invite.invite.pair_route);
+    assert_eq!(frozen_close.pair_route, invite.invite.pair_route);
+    assert_eq!(first.terminal_seals.load(Ordering::SeqCst), 1);
+    {
+        let observed = order.lock().unwrap();
+        let winner = observed
+            .iter()
+            .position(|entry| *entry == "terminal-commit")
+            .expect("winner commit");
+        let carrier = observed
+            .iter()
+            .position(|entry| *entry == "terminal-carrier-commit")
+            .expect("carrier commit");
+        let flushed = observed
+            .iter()
+            .position(|entry| *entry == "send-terminal")
+            .expect("terminal flush");
+        let close = observed
+            .iter()
+            .position(|entry| *entry == "send-close")
+            .expect("close send");
+        assert!(winner < carrier && carrier < flushed && flushed < close);
+    }
+    first.stop().await;
+
+    let mut restarted = spawn_actor(Arc::clone(&store)).await;
+    let replayed_carrier = restarted
+        .sent_data_rx
+        .recv()
+        .await
+        .expect("restart replays durable PairTerminal");
+    let replayed_close = restarted
+        .sent_close_rx
+        .recv()
+        .await
+        .expect("restart closes only after terminal replay");
+    assert_eq!(replayed_carrier, frozen_carrier);
+    assert_eq!(replayed_close, frozen_close);
+    assert_eq!(
+        restarted.terminal_seals.load(Ordering::SeqCst),
+        0,
+        "durable recovery must never reseal"
+    );
+    restarted
+        .event_tx
+        .send(Ok(PairingTransportEvent::PairRouteClosed(
+            PairRouteClosed {
+                pair_route: invite.invite.pair_route,
+                outcome: PairRouteCloseOutcome::Closed,
+            },
+        )))
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(store.count(), 0);
+    restarted.stop().await;
+}
+
+#[tokio::test]
+async fn terminal_seal_before_carrier_commit_crash_restarts_with_identical_bytes() {
+    let store = Arc::new(FakeStore::default());
+    let mut first = spawn_actor(Arc::clone(&store)).await;
+    let (invite, pairing_id) =
+        create_pending_pairing(&mut first, "terminal-precommit-crash", 0x69).await;
+    store
+        .fail_terminal_before_commit
+        .store(true, Ordering::SeqCst);
+
+    let error = first
+        .handle
+        .cancel(pairing_id)
+        .await
+        .expect_err("fault cut after seal must stop before carrier durability");
+    assert_eq!(error.code(), "daemon.runtime.store_unavailable");
+    assert!(first.sent_data_rx.try_recv().is_err());
+    assert!(first.sent_close_rx.try_recv().is_err());
+    assert_eq!(first.terminal_seals.load(Ordering::SeqCst), 1);
+    let failed_carrier = store
+        .state
+        .lock()
+        .unwrap()
+        .failed_terminal_carrier
+        .clone()
+        .expect("fault harness observes the sealed but uncommitted carrier");
+    let before_restart = store
+        .recover_terminals()
+        .await
+        .expect("winner remains durable after the pre-commit cut");
+    assert_eq!(before_restart.len(), 1);
+    assert!(before_restart[0].preparation.is_some());
+    assert!(before_restart[0].carrier.is_none());
+    first.stop().await;
+
+    let mut restarted = spawn_actor(Arc::clone(&store)).await;
+    let replayed_carrier = restarted
+        .sent_data_rx
+        .recv()
+        .await
+        .expect("restart reseals and flushes the terminal carrier");
+    assert_eq!(
+        replayed_carrier, failed_carrier,
+        "the durable PRF seed must reproduce the pre-crash HPKE carrier byte-for-byte"
+    );
+    restarted
+        .sent_close_rx
+        .recv()
+        .await
+        .expect("Close follows the recovered carrier flush");
+    assert_eq!(restarted.terminal_seals.load(Ordering::SeqCst), 1);
+    restarted
+        .event_tx
+        .send(Ok(PairingTransportEvent::PairRouteClosed(
+            PairRouteClosed {
+                pair_route: invite.invite.pair_route,
+                outcome: PairRouteCloseOutcome::Closed,
+            },
+        )))
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(store.count(), 0);
+    restarted.stop().await;
+}
+
+#[tokio::test]
+async fn terminal_flush_outcome_unknown_never_sends_close_and_restart_replays_durable_carrier() {
+    let store = Arc::new(FakeStore::default());
+    let mut first = spawn_actor(Arc::clone(&store)).await;
+    let (_, pairing_id) = create_pending_pairing(&mut first, "terminal-flush-unknown", 0x68).await;
+    first.fail_send.store(true, Ordering::SeqCst);
+    first
+        .handle
+        .cancel(pairing_id)
+        .await
+        .expect("winner remains committed when terminal flush is outcome-unknown");
+    assert!(first.sent_data_rx.try_recv().is_err());
+    assert!(first.sent_close_rx.try_recv().is_err());
+    assert_eq!(first.terminal_seals.load(Ordering::SeqCst), 1);
+    let durable = store
+        .recover_terminals()
+        .await
+        .expect("terminal remains durable");
+    assert_eq!(durable.len(), 1);
+    let exact = durable[0]
+        .carrier
+        .clone()
+        .expect("carrier commit precedes first flush attempt");
+    first.stop().await;
+
+    let mut restarted = spawn_actor(Arc::clone(&store)).await;
+    assert_eq!(
+        restarted.sent_data_rx.recv().await.unwrap(),
+        exact,
+        "restart must replay the committed carrier byte-for-byte"
+    );
+    restarted
+        .sent_close_rx
+        .recv()
+        .await
+        .expect("Close is sent only after replay flush succeeds");
+    assert_eq!(restarted.terminal_seals.load(Ordering::SeqCst), 0);
+    restarted.stop().await;
 }
 
 #[tokio::test]

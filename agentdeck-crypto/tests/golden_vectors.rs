@@ -19,22 +19,29 @@ use std::path::Path;
 
 use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
 use agentdeck_crypto::{
-    AeadReceivingKey, AeadSendingKey, CryptoError, HpkeEnvelopeV1, HpkePrivateKey, SecretAeadKey,
-    SenderCounter, SignatureBytes, SigningKey, VerifyingKey, hpke_open_base, hpke_seal_base,
-    open_sealed_payload, open_symmetric, seal_symmetric, sha256, sign_sealed, sign_tbs,
-    verify_sealed, verify_tbs,
+    AeadReceivingKey, AeadSendingKey, CryptoError, HpkeEnvelopeV1, HpkePrivateKey,
+    PairTerminalExpectedV1, SecretAeadKey, SenderCounter, SignatureBytes, SigningKey, VerifyingKey,
+    hpke_open_base, hpke_seal_base, open_pair_terminal, open_sealed_payload, open_symmetric,
+    seal_pair_terminal, seal_symmetric, sha256, sign_key_update, sign_pair_terminal, sign_sealed,
+    sign_tbs, verify_sealed, verify_tbs,
 };
-use agentdeck_protocol::e2ee::PairingControlEnvelopeV1;
 use agentdeck_protocol::e2ee::context::{OuterContextV1, OuterFrameKind};
-use agentdeck_protocol::e2ee::keys::{KeyId, KeyPurpose, KeyUpdateInfoV1};
+use agentdeck_protocol::e2ee::keys::{
+    KeyDirectoryEntry, KeyDirectorySignatureContextV1, KeyDirectoryV1, KeyId, KeyPurpose,
+    KeyUpdateInfoV1, KeyUpdateV1,
+};
 use agentdeck_protocol::e2ee::pairing::{
     MachineDataSignerBindingV1, PairPendingV1, PairRequestInfoV1, PairRequestV1,
-    PairResponseInfoV1, PairResponseReceivedV1, PairResponseV1,
+    PairResponseInfoV1, PairResponseReceivedV1, PairResponseV1, PairTerminalOutcomeV1,
+    PairTerminalV1,
 };
 use agentdeck_protocol::e2ee::payload::SealedPayloadKind;
 use agentdeck_protocol::e2ee::tbs::{SignedObjectType, ToBeSignedV1};
+use agentdeck_protocol::e2ee::{KeyUpdateSetV1, PairingControlEnvelopeV1};
 use agentdeck_protocol::relay_v2::StreamCursor;
-use agentdeck_protocol::relay_v2::auth::Ed25519Signature;
+use agentdeck_protocol::relay_v2::auth::{
+    CertRole, Ed25519Signature, PublicKeyBytes, SignedCertificate,
+};
 use agentdeck_protocol::relay_v2::id::{
     DeviceRouteId, GrantSerial, KeyDirectoryRevision, LinkGeneration, MachineRouteId, PairRouteId,
     RelayServerId, RootKeyId, StreamGenerationId, StreamRouteId, TrustEpoch,
@@ -113,11 +120,13 @@ fn hex(b: &[u8]) -> String {
 // —— 固定 fixtures ——
 
 const ED_SEED: [u8; 32] = [0x01; 32];
+const DATA_SIGN_SEED: [u8; 32] = [0x72; 32];
 const AEAD_KEY: [u8; 32] = [0x11; 32];
 const NONCE_PREFIX: [u8; 4] = [0xAA, 0xBB, 0xCC, 0xDD];
 const SENDER_COUNTER: u64 = 0x0102_0304_0506_0708;
 const HPKE_IKM: [u8; 32] = [0x42; 32];
 const HPKE_RNG_SEED: [u8; 32] = [0x24; 32];
+const PAIR_TERMINAL_HPKE_RNG_SEED: [u8; 32] = [0x26; 32];
 
 fn mr() -> MachineRouteId {
     MachineRouteId::from_bytes([0x11; 16])
@@ -305,6 +314,216 @@ fn build_vectors() -> serde_json::Value {
     let envelope = hpke_seal_base(&hpke_pub, &hpke_info, &hpke_aad, HPKE_PLAINTEXT, &mut rng)
         .expect("hpke_seal_base");
 
+    // KeyDirectory / KeyUpdate canonical 与 TBS（P5.4 Swift verifier 的跨语言事实源）。
+    let data_signing = SigningKey::from_seed(&DATA_SIGN_SEED);
+    let data_certificate = SignedCertificate {
+        subject_pubkey: PublicKeyBytes(data_signing.verifying_key().to_bytes()),
+        cert_role: CertRole::Data,
+        generation: LinkGeneration::new(4),
+        root_key_id: rk(),
+        trust_epoch: TrustEpoch::new(3),
+        not_after_ms: Some(4_000_000_000_000),
+        signature: Ed25519Signature([0xe3; 64]),
+    };
+    let key_directory_signer =
+        MachineDataSignerBindingV1::from_certificate(&data_certificate).unwrap();
+    let key_directory = KeyDirectoryV1 {
+        revision: KeyDirectoryRevision::new(2),
+        entries: vec![
+            KeyDirectoryEntry {
+                key_id: KeyId {
+                    purpose: KeyPurpose::Catalog,
+                    epoch: 1,
+                },
+                device_route: dr(),
+                stream_route: None,
+                enc: vec![0xc1; 32],
+                wrapped_key: vec![0xd1; 48],
+            },
+            KeyDirectoryEntry {
+                key_id: key_id(),
+                device_route: dr(),
+                stream_route: Some(StreamRouteId::from_bytes([0x33; 16])),
+                enc: envelope.enc.clone(),
+                wrapped_key: envelope.ciphertext.clone(),
+            },
+            KeyDirectoryEntry {
+                key_id: KeyId {
+                    purpose: KeyPurpose::DeviceCommandTx,
+                    epoch: 1,
+                },
+                device_route: dr(),
+                stream_route: None,
+                enc: vec![0xc2; 32],
+                wrapped_key: vec![0xd2; 48],
+            },
+            KeyDirectoryEntry {
+                key_id: KeyId {
+                    purpose: KeyPurpose::DeviceReplyTx,
+                    epoch: 1,
+                },
+                device_route: dr(),
+                stream_route: None,
+                enc: vec![0xc3; 32],
+                wrapped_key: vec![0xd3; 48],
+            },
+        ],
+        signature: Ed25519Signature([0xe1; 64]),
+    };
+    let key_directory_context = KeyDirectorySignatureContextV1 {
+        relay_server_id: rs(),
+        machine_route: mr(),
+        device_route: dr(),
+        grant_serial: GrantSerial::new(9),
+        root_trust_epoch: TrustEpoch::new(3),
+    };
+    let key_directory_tbs = key_directory
+        .signature_tbs(&key_directory_context, &key_directory_signer)
+        .unwrap()
+        .encode()
+        .unwrap();
+    let key_update = KeyUpdateV1 {
+        key_directory_revision: KeyDirectoryRevision::new(2),
+        key_id: key_id(),
+        device_route: dr(),
+        stream_route: Some(StreamRouteId::from_bytes([0x33; 16])),
+        enc: envelope.enc.clone(),
+        wrapped_key: envelope.ciphertext.clone(),
+        signature: Ed25519Signature([0xe2; 64]),
+    };
+    let key_update_tbs = key_update
+        .signature_tbs(
+            &key_update_info(),
+            &outer_sample_for_key_update(),
+            &key_directory_signer,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+    let signed_conversation_update = sign_key_update(
+        &data_signing,
+        &key_directory_signer,
+        &key_update_info(),
+        &outer_sample_for_key_update(),
+        KeyUpdateV1 {
+            signature: Ed25519Signature([0; 64]),
+            ..key_update.clone()
+        },
+    )
+    .unwrap();
+    let catalog_info = KeyUpdateInfoV1 {
+        e2ee_format_version: 1,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        relay_server_id: rs(),
+        machine_route: mr(),
+        device_route: dr(),
+        stream_route: None,
+        grant_serial: GrantSerial::new(9),
+        root_trust_epoch: TrustEpoch::new(3),
+        key_directory_revision: KeyDirectoryRevision::new(2),
+        key_purpose: KeyPurpose::Catalog,
+        key_epoch: 1,
+    };
+    let catalog_context = OuterContextV1 {
+        frame_kind: OuterFrameKind::KeyUpdate,
+        relay_protocol_version: 2,
+        e2ee_format_version: 1,
+        machine_route: Some(mr()),
+        device_route: Some(dr()),
+        stream_route: None,
+        request_route: None,
+        pair_route: None,
+        stream_generation: None,
+        stream_cursor: None,
+        stream_seq: None,
+        message_key_epoch: 1,
+    };
+    let mut catalog_rng = DeterministicRng::new([0x25; 32]);
+    let catalog_envelope = hpke_seal_base(
+        &hpke_pub,
+        &catalog_info.encode(),
+        &catalog_context.encode_aad(),
+        &[0x44; 32],
+        &mut catalog_rng,
+    )
+    .unwrap();
+    let signed_catalog_update = sign_key_update(
+        &data_signing,
+        &key_directory_signer,
+        &catalog_info,
+        &catalog_context,
+        KeyUpdateV1 {
+            key_directory_revision: KeyDirectoryRevision::new(2),
+            key_id: KeyId {
+                purpose: KeyPurpose::Catalog,
+                epoch: 1,
+            },
+            device_route: dr(),
+            stream_route: None,
+            enc: catalog_envelope.enc,
+            wrapped_key: catalog_envelope.ciphertext,
+            signature: Ed25519Signature([0; 64]),
+        },
+    )
+    .unwrap();
+    let key_update_set = KeyUpdateSetV1 {
+        key_directory_revision: KeyDirectoryRevision::new(2),
+        device_route: dr(),
+        updates: vec![
+            signed_catalog_update.clone(),
+            signed_conversation_update.clone(),
+        ],
+    };
+
+    // PairTerminal 独立 canonical/TBS/signature + DeviceHPKE KAT。使用 fresh RNG，禁止
+    // 改变既有 hpke_base_kat 或 key-update vectors 的随机流。
+    let pair_terminal_context = pairing_context(OuterFrameKind::PairTerminal);
+    let pair_terminal_unsigned = PairTerminalV1 {
+        machine_route: mr(),
+        request_hash: [0x02; 32],
+        outcome: PairTerminalOutcomeV1::Canceled,
+        signature: Ed25519Signature([0; 64]),
+    };
+    let pair_terminal_tbs = pair_terminal_unsigned
+        .signature_tbs(
+            &pair_request_info(),
+            &pair_terminal_context,
+            &key_directory_signer,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+    let signed_pair_terminal = sign_pair_terminal(
+        &data_signing,
+        &pair_request_info(),
+        &pair_terminal_context,
+        &key_directory_signer,
+        pair_terminal_unsigned.clone(),
+    )
+    .unwrap();
+    let mut pair_terminal_rng = DeterministicRng::new(PAIR_TERMINAL_HPKE_RNG_SEED);
+    let pair_terminal_envelope = seal_pair_terminal(
+        &hpke_pub,
+        &pair_request_info(),
+        &pair_terminal_context,
+        pair_terminal_unsigned,
+        &data_signing,
+        &key_directory_signer,
+        &mut pair_terminal_rng,
+    )
+    .unwrap();
+    let opened_pair_terminal = open_pair_terminal(
+        &hpke_priv,
+        &pair_request_info(),
+        &pair_terminal_context,
+        PairTerminalExpectedV1::new(mr(), [0x02; 32]).unwrap(),
+        &pair_terminal_envelope,
+        &data_signing.verifying_key(),
+        &key_directory_signer,
+    )
+    .unwrap();
+    assert_eq!(opened_pair_terminal, signed_pair_terminal);
+
     // Pairing canonical envelopes / dedicated TBS（P4.3）。
     let pair_request = PairRequestV1 {
         format_version: 1,
@@ -402,6 +621,55 @@ fn build_vectors() -> serde_json::Value {
             "pairRequestInfoHex": hex(&pair_request_info().encode()),
             "pairResponseInfoHex": hex(&pair_response_info().encode()),
             "keyUpdateInfoHex": hex(&key_update_info().encode()),
+        },
+        "key_directory_update_canonical": {
+            "name": "key_directory_update_canonical",
+            "description": "KeyDirectoryV1/KeyUpdateV1 canonical bytes and exact MachineDataSign TBS bindings (P5.4).",
+            "keyDirectoryUnsignedHex": hex(&key_directory.unsigned_canonical_bytes().unwrap()),
+            "keyDirectoryCanonicalHex": hex(&key_directory.canonical_bytes().unwrap()),
+            "keyDirectoryTbsHex": hex(&key_directory_tbs),
+            "keyUpdateUnsignedHex": hex(&key_update.unsigned_canonical_bytes().unwrap()),
+            "keyUpdateCanonicalHex": hex(&key_update.canonical_bytes().unwrap()),
+            "keyUpdateTbsHex": hex(&key_update_tbs),
+            "dataSigningSeedHex": hex(&DATA_SIGN_SEED),
+            "dataCertificateCanonicalHex": hex(&data_certificate.canonical_bytes()),
+        },
+        "key_update_set_canonical": {
+            "name": "key_update_set_canonical",
+            "description": "Two independently MachineDataSign-signed KeyUpdateV1 carriers in strict KeyUpdateSetV1 order (P5.4).",
+            "canonicalHex": hex(&key_update_set.canonical_bytes().unwrap()),
+            "sha256Hex": hex(&key_update_set.canonical_sha256().unwrap()),
+            "keyDirectoryRevision": key_update_set.key_directory_revision.value(),
+            "deviceRouteHex": hex(key_update_set.device_route.as_bytes()),
+            "updateCanonicalHexes": key_update_set
+                .updates
+                .iter()
+                .map(|update| hex(&update.canonical_bytes().unwrap()))
+                .collect::<Vec<_>>(),
+        },
+        "pair_terminal": {
+            "name": "pair_terminal",
+            "description": "P5.4 MachineDataSign-signed canceled terminal bound to exact pairing trust/request axes and sealed only to the pending DeviceHPKE recipient.",
+            "outcome": "canceled",
+            "outcomeTag": signed_pair_terminal.outcome.canonical_tag(),
+            "machineRouteHex": hex(signed_pair_terminal.machine_route.as_bytes()),
+            "requestHashHex": hex(&signed_pair_terminal.request_hash),
+            "unsignedCanonicalHex": hex(&signed_pair_terminal.unsigned_canonical_bytes().unwrap()),
+            "canonicalHex": hex(&signed_pair_terminal.canonical_bytes().unwrap()),
+            "sha256Hex": hex(&signed_pair_terminal.canonical_sha256().unwrap()),
+            "tbsHex": hex(&pair_terminal_tbs),
+            "signatureHex": hex(&signed_pair_terminal.signature.0),
+            "infoHex": hex(&pair_request_info().encode()),
+            "aadHex": hex(&pair_terminal_context.encode_aad()),
+            "dataSigningSeedHex": hex(&DATA_SIGN_SEED),
+            "dataCertificateCanonicalHex": hex(&data_certificate.canonical_bytes()),
+            "recipientIkmHex": hex(&HPKE_IKM),
+            "recipientPrivHex": hex(&hpke_priv.to_bytes()),
+            "recipientPubHex": hex(&hpke_pub.to_bytes()),
+            "rngSeedHex": hex(&PAIR_TERMINAL_HPKE_RNG_SEED),
+            "envelopeCanonicalHex": hex(&pair_terminal_envelope.canonical_bytes().unwrap()),
+            "envelopeEncHex": hex(&pair_terminal_envelope.enc),
+            "envelopeCiphertextHex": hex(&pair_terminal_envelope.ciphertext),
         },
         "pairing_canonical": {
             "name": "pairing_canonical",

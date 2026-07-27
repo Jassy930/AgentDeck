@@ -10,6 +10,7 @@ use agentdeck_protocol::relay_v2::frame::{
 };
 use agentdeck_protocol::runtime::{PairingReceipt, PairingState};
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 use crate::runtime::model::{
     IdempotencyOwner, RuntimeStoreConfig, RuntimeStoreError, RuntimeStoreOperation,
@@ -23,7 +24,8 @@ use super::pairing::{
     PreparePairingInviteOutcome,
 };
 use super::pairing_terminal::{
-    PairingTerminalAction, PairingTerminalizeOutcome, RECEIPT_RETENTION_MS,
+    CommitPairTerminal, CommitPairTerminalOutcome, PairingTerminalAction,
+    PairingTerminalizeOutcome, RECEIPT_RETENTION_MS,
 };
 use super::pairing_tests::{
     GenerousCapacity, NOW_MS, OneShotFault, TestClock, TestRoot, artifact_bytes,
@@ -348,6 +350,278 @@ async fn cancel_terminalizes_all_pregrant_states_and_freezes_first_winner() {
             }
         ));
         store.shutdown().await.expect("shutdown canceled store");
+    }
+}
+
+#[tokio::test]
+async fn request_bound_terminal_freezes_carrier_before_close_and_replays_exact_bytes() {
+    let root = TestRoot::new("request-bound-terminal-carrier");
+    let keys = MemoryKeyStore::new();
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let store = open_store(&root, &keys, clock).await;
+    let (binding, data_cert) = make_active(&store).await;
+    let pair_route = PairRouteId::from_bytes([0x5a; 16]);
+    let (pairing_id, _) = prepare_lifecycle(
+        &store,
+        &binding,
+        &data_cert,
+        SetupLifecycle::AwaitingLocalConfirmation,
+        pair_route,
+        0x5b,
+        0x5c,
+        "request-bound-terminal-carrier",
+        NOW_MS + 300_000,
+    )
+    .await;
+
+    store
+        .terminalize_pairing(pairing_id, PairingTerminalAction::Cancel)
+        .await
+        .expect("commit terminal winner before HPKE sealing");
+    let mut recovery = store
+        .list_pairing_terminal_recovery()
+        .await
+        .expect("load request-bound terminal preparation");
+    assert_eq!(recovery.len(), 1);
+    assert!(recovery[0].carrier().is_none());
+    let mut preparation = recovery[0]
+        .take_preparation()
+        .expect("request-bound terminal must require a carrier");
+    assert_eq!(preparation.pairing_id(), pairing_id);
+    assert_eq!(preparation.pair_route(), pair_route);
+    assert_eq!(preparation.info().pair_route, pair_route);
+    assert_eq!(preparation.context().pair_route, Some(pair_route));
+    assert_eq!(
+        preparation.context().frame_kind,
+        agentdeck_protocol::e2ee::OuterFrameKind::PairTerminal
+    );
+    assert_eq!(preparation.data_sign_certificate(), &data_cert);
+    let expected_hpke_seed = preparation
+        .take_hpke_seed()
+        .expect("preparation owns one HPKE seed");
+    assert_ne!(expected_hpke_seed.as_ref(), &[0; 32]);
+    let expected_hpke_seed_hash: [u8; 32] = Sha256::digest(expected_hpke_seed.as_ref()).into();
+    drop(expected_hpke_seed);
+
+    let close_ack = closed_terminal(pair_route, PairRouteCloseOutcome::Closed);
+    let before_early_close = artifact_bytes(&root.database());
+    assert!(matches!(
+        store
+            .acknowledge_pair_route_close(pairing_id, close_ack.clone())
+            .await,
+        Err(RuntimeStoreError::InvalidStateTransition)
+    ));
+    assert_eq!(artifact_bytes(&root.database()), before_early_close);
+
+    store
+        .shutdown()
+        .await
+        .expect("crash cut after terminal preparation");
+    let store = open_store(&root, &keys, Arc::new(AtomicU64::new(NOW_MS))).await;
+    let mut restarted_recovery = store
+        .list_pairing_terminal_recovery()
+        .await
+        .expect("rederive terminal preparation after restart");
+    let preparation = restarted_recovery[0]
+        .take_preparation()
+        .expect("uncommitted carrier requires a restart preparation");
+    assert_eq!(
+        preparation
+            .hpke_seed()
+            .map(|seed| <[u8; 32]>::from(Sha256::digest(seed))),
+        Some(expected_hpke_seed_hash),
+        "same Runtime DB and terminal identity must rederive the exact HPKE seed"
+    );
+    let before_unsealed_commit = artifact_bytes(&root.database());
+    let unsealed_input = CommitPairTerminal::new(preparation, pending_envelope(0x5d))
+        .expect("freeze unsealed negative carrier input");
+    assert!(matches!(
+        unsealed_input.retry_copy(),
+        Err(RuntimeStoreError::PairingConflict)
+    ));
+    assert!(matches!(
+        store.commit_pair_terminal(unsealed_input).await,
+        Err(RuntimeStoreError::PairingConflict)
+    ));
+    assert_eq!(artifact_bytes(&root.database()), before_unsealed_commit);
+
+    let mut retry_recovery = store
+        .list_pairing_terminal_recovery()
+        .await
+        .expect("rederive preparation after rejected unsealed commit");
+    let mut preparation = retry_recovery[0]
+        .take_preparation()
+        .expect("rejected input must not consume durable recovery state");
+    let committed_seed = preparation
+        .take_hpke_seed()
+        .expect("sealing consumes the unique rederived HPKE seed owner");
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::digest(committed_seed.as_ref())),
+        expected_hpke_seed_hash
+    );
+
+    let input = CommitPairTerminal::new(preparation, pending_envelope(0x5d))
+        .expect("freeze canonical PairTerminal carrier input");
+    let expected_frame = input.canonical_frame().to_vec();
+    let committed = store
+        .commit_pair_terminal(input.retry_copy().expect("copy seed-free retry input"))
+        .await
+        .expect("persist PairTerminal carrier");
+    let committed_recovery = match committed {
+        CommitPairTerminalOutcome::Committed { recovery } => recovery,
+        CommitPairTerminalOutcome::Replayed { .. } => panic!("first carrier commit is fresh"),
+    };
+    assert!(committed_recovery.preparation().is_none());
+    assert_eq!(
+        committed_recovery
+            .carrier()
+            .expect("committed carrier projection")
+            .canonical_frame(),
+        expected_frame
+    );
+
+    let before_replay = artifact_bytes(&root.database());
+    let replayed = store
+        .commit_pair_terminal(input)
+        .await
+        .expect("exact carrier retry");
+    assert!(matches!(
+        replayed,
+        CommitPairTerminalOutcome::Replayed { .. }
+    ));
+    assert_eq!(artifact_bytes(&root.database()), before_replay);
+
+    store.shutdown().await.expect("shutdown before restart");
+    let reopened = open_store(&root, &keys, Arc::new(AtomicU64::new(NOW_MS))).await;
+    let restarted = reopened
+        .list_pairing_terminal_recovery()
+        .await
+        .expect("recover frozen carrier after restart");
+    assert_eq!(restarted.len(), 1);
+    assert!(restarted[0].preparation().is_none());
+    assert_eq!(
+        restarted[0]
+            .carrier()
+            .expect("restart reuses frozen carrier")
+            .canonical_frame(),
+        expected_frame
+    );
+    reopened
+        .acknowledge_pair_route_close(pairing_id, close_ack)
+        .await
+        .expect("Close ACK is admitted only after carrier durability");
+    reopened.shutdown().await.expect("shutdown carrier test");
+}
+
+#[tokio::test]
+async fn pair_terminal_carrier_commit_faults_converge_by_exact_retry() {
+    for (label, operation, committed) in [
+        (
+            "pair-terminal-before-commit",
+            RuntimeStoreOperation::CommitPairTerminalBeforeCommit,
+            false,
+        ),
+        (
+            "pair-terminal-after-commit",
+            RuntimeStoreOperation::CommitPairTerminalAfterCommit,
+            true,
+        ),
+    ] {
+        let root = TestRoot::new(label);
+        let keys = MemoryKeyStore::new();
+        let clock = Arc::new(AtomicU64::new(NOW_MS));
+        let setup = open_store(&root, &keys, clock.clone()).await;
+        let (binding, data_cert) = make_active(&setup).await;
+        let route = PairRouteId::from_bytes([if committed { 0x6a } else { 0x6b }; 16]);
+        let (pairing_id, _) = prepare_lifecycle(
+            &setup,
+            &binding,
+            &data_cert,
+            SetupLifecycle::Preparing,
+            route,
+            0x6c,
+            0x6d,
+            label,
+            NOW_MS + 300_000,
+        )
+        .await;
+        setup
+            .terminalize_pairing(pairing_id, PairingTerminalAction::Cancel)
+            .await
+            .expect("commit winner before carrier fault");
+        let mut recovery = setup
+            .list_pairing_terminal_recovery()
+            .await
+            .expect("load carrier preparation");
+        let mut preparation = recovery[0]
+            .take_preparation()
+            .expect("request material requires PairTerminal");
+        let _sealed_seed = preparation
+            .take_hpke_seed()
+            .expect("sealing consumes the unique HPKE seed owner");
+        let input = CommitPairTerminal::new(preparation, pending_envelope(0x6e))
+            .expect("freeze exact carrier input");
+        let expected = input.canonical_frame().to_vec();
+        setup.shutdown().await.expect("shutdown carrier setup");
+
+        let faulted = RuntimeStoreHandle::open(
+            config(&root, clock.clone()).with_fault_injector(Arc::new(OneShotFault {
+                operation,
+                fired: AtomicBool::new(false),
+            })),
+            load_or_create_storage_kek(&keys, &root.database()).expect("reload StorageKEK"),
+        )
+        .await
+        .expect("open faulted carrier store");
+        let error = faulted
+            .commit_pair_terminal(input.retry_copy().expect("copy seed-free retry input"))
+            .await
+            .expect_err("carrier cut must surface");
+        assert_eq!(
+            matches!(error, RuntimeStoreError::CommitOutcomeUnknown { .. }),
+            committed
+        );
+        let after_cut = faulted
+            .list_pairing_terminal_recovery()
+            .await
+            .expect("audit carrier cut");
+        assert_eq!(after_cut.len(), 1);
+        if committed {
+            assert_eq!(
+                after_cut[0]
+                    .carrier()
+                    .expect("post-commit cut retains exact carrier")
+                    .canonical_frame(),
+                expected
+            );
+        } else {
+            assert!(after_cut[0].carrier().is_none());
+            assert!(after_cut[0].preparation().is_some());
+        }
+        let replay = faulted
+            .commit_pair_terminal(input)
+            .await
+            .expect("retry exact frozen carrier");
+        match (committed, replay) {
+            (true, CommitPairTerminalOutcome::Replayed { .. })
+            | (false, CommitPairTerminalOutcome::Committed { .. }) => {}
+            (_, other) => panic!("unexpected exact retry outcome: {other:?}"),
+        }
+        let recovered = faulted
+            .list_pairing_terminal_recovery()
+            .await
+            .expect("final carrier recovery");
+        assert_eq!(
+            recovered[0]
+                .carrier()
+                .expect("carrier durable after retry")
+                .canonical_frame(),
+            expected
+        );
+        faulted
+            .shutdown()
+            .await
+            .expect("shutdown carrier fault store");
     }
 }
 
@@ -1085,6 +1359,7 @@ enum TamperTarget {
     ReceiptIdempotencyToken,
     ReceiptInputHash,
     CloseOutbox,
+    MissingRequestMaterial,
     PairingLifecycle,
     Ledger,
 }
@@ -1113,6 +1388,12 @@ fn apply_offline_tamper(database: &Path, target: TamperTarget) {
              WHERE operation_kind = 'closePairRoute'",
             [],
         ),
+        TamperTarget::MissingRequestMaterial => connection.execute(
+            "UPDATE remote_pairings
+             SET request_hash = X'0303030303030303030303030303030303030303030303030303030303030303',
+                 device_sign_fingerprint = X'0404040404040404040404040404040404040404040404040404040404040404'",
+            [],
+        ),
         TamperTarget::PairingLifecycle => connection.execute(
             "UPDATE remote_pairings SET lifecycle = 'expired' WHERE lifecycle = 'canceled'",
             [],
@@ -1136,6 +1417,7 @@ async fn offline_terminal_tamper_fails_full_open_without_rewriting_artifacts() {
         TamperTarget::ReceiptIdempotencyToken,
         TamperTarget::ReceiptInputHash,
         TamperTarget::CloseOutbox,
+        TamperTarget::MissingRequestMaterial,
         TamperTarget::PairingLifecycle,
         TamperTarget::Ledger,
     ]

@@ -42,7 +42,7 @@ pub use enrollment::{
     Digest32, ENROLLMENT_BUNDLE_VERSION, EnrollmentBundleV2, EnrollmentCode,
     MachineEnrollmentRequestV1, MachineEnrollmentResponseV1, enrollment_receipt_hash,
 };
-pub use failure::RelayFailure;
+pub use failure::{RelayFailure, relay_frame_reply_reference};
 pub use frame::{OpaqueRouteFrame, PairingHello, RelayFrameBody};
 pub use id::{
     ConnectionInstanceId, DeviceRouteId, GrantSerial, KeyDirectoryRevision, LinkGeneration,
