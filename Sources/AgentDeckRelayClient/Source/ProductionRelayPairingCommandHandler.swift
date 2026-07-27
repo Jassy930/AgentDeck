@@ -132,6 +132,14 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
   private let reconnectPolicy: RelayReconnectPolicy
   private let deviceDisplayName: String
   private let attemptDeadlineMilliseconds: UInt64
+  private var pairingTasks: [UUID: Task<Void, Never>] = [:]
+  private var pairingTransports: [UUID: any RelayPairingTransportSession] = [:]
+  private var pairingTransportShutdownTasks: [UUID: Task<Void, Never>] = [:]
+  private var pairingPreparations = 0
+  private var pairingPreparationWaiters: [CheckedContinuation<Void, Never>] = []
+  private var shuttingDown = false
+  private var shutdownComplete = false
+  private var shutdownWaiters: [CheckedContinuation<Void, Never>] = []
 
   init(
     pairedMachineStore: PairedMachineStore,
@@ -154,6 +162,48 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
     self.attemptDeadlineMilliseconds = attemptDeadlineMilliseconds
   }
 
+  func shutdown() async {
+    if shutdownComplete { return }
+    if shuttingDown {
+      await withCheckedContinuation { continuation in
+        shutdownWaiters.append(continuation)
+      }
+      return
+    }
+    shuttingDown = true
+
+    let tasks = Array(pairingTasks.values)
+    for task in tasks {
+      task.cancel()
+    }
+    let transportWorkerIDs = Set(pairingTransports.keys).union(
+      pairingTransportShutdownTasks.keys
+    )
+    await withTaskGroup(of: Void.self) { group in
+      for workerID in transportWorkerIDs {
+        group.addTask {
+          await self.shutdownTransport(for: workerID)
+        }
+      }
+    }
+    for task in tasks {
+      await task.value
+    }
+    pairingTasks.removeAll(keepingCapacity: false)
+    if pairingPreparations > 0 {
+      await withCheckedContinuation { continuation in
+        pairingPreparationWaiters.append(continuation)
+      }
+    }
+
+    shutdownComplete = true
+    let waiters = shutdownWaiters
+    shutdownWaiters.removeAll(keepingCapacity: false)
+    for waiter in waiters {
+      waiter.resume()
+    }
+  }
+
   func inspectPairInvite(_ encoded: String) async throws -> PairingPreview {
     try await recoverDurablePairingState()
     let invite = try decodeInvite(encoded, enforcingExpiry: true)
@@ -174,7 +224,17 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
   func pair(
     _ encodedInvite: String
   ) async throws -> AsyncThrowingStream<PairingProgress, Error> {
+    try await acquirePairingPreparation()
+    defer { finishPairingPreparation() }
+
+    // AsyncStream cancellation cannot await its onTermination cleanup. Treat a new
+    // pair request as an explicit supersession barrier: cancel/close/join every old
+    // worker before reading or creating durable state for the replacement invite.
+    // This also serializes two concurrent callers through the same latest-wins gate.
+    await cancelAndJoinAllPairingWorkers()
+    try requireAcceptingPairing()
     try await recoverDurablePairingState()
+    try requireAcceptingPairing()
     // responsePrepared + staged promotion 是 outcome-unknown durable transaction；即使
     // invite 已到期也必须允许用原 URI 恢复 Close/terminal reconciliation。
     let invite = try decodeInvite(encodedInvite, enforcingExpiry: false)
@@ -191,6 +251,7 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
     if let restored {
       initial = restored
     } else if let paired = try await existingPairedMachine(for: invite) {
+      try requireAcceptingPairing()
       return Self.finishedStream(.paired(paired))
     } else {
       initial = try await pendingStore.prepare(
@@ -199,6 +260,7 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
         nowMilliseconds: clock.nowMilliseconds()
       )
     }
+    try requireAcceptingPairing()
 
     switch initial {
     case .terminal(let outcome):
@@ -207,46 +269,78 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
       guard let paired = try await pairedMachine(machineRoute: machineRoute) else {
         throw SessionSourceFailure(code: .storageUnavailable)
       }
+      try requireAcceptingPairing()
       return Self.finishedStream(.paired(paired))
     case .active(let prepared):
-      return AsyncThrowingStream(
+      let streamPair = AsyncThrowingStream<PairingProgress, Error>.makeStream(
         bufferingPolicy: .bufferingNewest(4)
-      ) { continuation in
-        let task = Task { [weak self] in
-          guard let self else {
-            continuation.finish(
-              throwing: SessionSourceFailure(code: .storageUnavailable)
-            )
-            return
-          }
-          _ = continuation.yield(.preparing)
-          do {
-            let result = try await self.runPairing(
-              invite: invite,
-              authorization: authorization,
-              initialPrepared: prepared,
-              pendingStore: pendingStore,
-              continuation: continuation
-            )
-            switch result {
-            case .paired(let machine):
-              _ = continuation.yield(.paired(machine))
-            case .terminal(let outcome):
-              _ = continuation.yield(Self.progress(for: outcome))
-            }
-            continuation.finish()
-          } catch is CancellationError {
-            continuation.finish()
-          } catch {
-            continuation.finish(throwing: Self.publicError(error))
-          }
+      )
+      let stream = streamPair.stream
+      let continuation = streamPair.continuation
+      let workerID = UUID()
+      let task = Task { [weak self] in
+        guard let self else {
+          continuation.finish(
+            throwing: SessionSourceFailure(code: .storageUnavailable)
+          )
+          return
         }
-        continuation.onTermination = { @Sendable _ in task.cancel() }
+        await self.runPairingWorker(
+          workerID: workerID,
+          invite: invite,
+          authorization: authorization,
+          initialPrepared: prepared,
+          pendingStore: pendingStore,
+          continuation: continuation
+        )
       }
+      pairingTasks[workerID] = task
+      continuation.onTermination = { @Sendable [weak self] _ in
+        Task { [weak self] in
+          await self?.cancelPairingWorker(workerID)
+        }
+      }
+      return stream
+    }
+  }
+
+  private func runPairingWorker(
+    workerID: UUID,
+    invite: PairInviteV1,
+    authorization: AuthorizationRequestV1,
+    initialPrepared: PreparedPendingPairingV1,
+    pendingStore: PendingPairingStore,
+    continuation: AsyncThrowingStream<PairingProgress, Error>.Continuation
+  ) async {
+    defer { pairingTasks.removeValue(forKey: workerID) }
+    do {
+      try requireActivePairingWorker()
+      _ = continuation.yield(.preparing)
+      let result = try await runPairing(
+        workerID: workerID,
+        invite: invite,
+        authorization: authorization,
+        initialPrepared: initialPrepared,
+        pendingStore: pendingStore,
+        continuation: continuation
+      )
+      try requireActivePairingWorker()
+      switch result {
+      case .paired(let machine):
+        _ = continuation.yield(.paired(machine))
+      case .terminal(let outcome):
+        _ = continuation.yield(Self.progress(for: outcome))
+      }
+      continuation.finish()
+    } catch is CancellationError {
+      continuation.finish()
+    } catch {
+      continuation.finish(throwing: Self.publicError(error))
     }
   }
 
   private func runPairing(
+    workerID: UUID,
     invite: PairInviteV1,
     authorization: AuthorizationRequestV1,
     initialPrepared: PreparedPendingPairingV1,
@@ -257,7 +351,7 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
     var attempt: UInt32 = 0
 
     while attempt < Self.maximumReconnectAttempts {
-      try Task.checkCancellation()
+      try requireActivePairingWorker()
       let now = clock.nowMilliseconds()
       var promotionState = try await pairingPromotionStateIfPresent(prepared: prepared)
       if case .committed(let record) = promotionState {
@@ -291,7 +385,9 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
         }
       }
 
+      try requireActivePairingWorker()
       let transport = try transportFactory.makeTransport(for: invite)
+      pairingTransports[workerID] = transport
       do {
         let result = try await runAttemptWithDeadline(
           transport: transport,
@@ -302,11 +398,12 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
           continuation: continuation,
           allowPastInviteExpiry: promotionState != nil
         )
-        await transport.shutdown()
+        await shutdownTransport(for: workerID)
+        try requireActivePairingWorker()
         return result
       } catch {
-        await transport.shutdown()
-        try Task.checkCancellation()
+        await shutdownTransport(for: workerID)
+        try requireActivePairingWorker()
         guard Self.isRetryableTransportFailure(error),
           attempt + 1 < Self.maximumReconnectAttempts
         else {
@@ -356,6 +453,83 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
       }
     }
     throw SessionSourceFailure(code: .transportUnavailable)
+  }
+
+  private func requireAcceptingPairing() throws {
+    try Task.checkCancellation()
+    guard !shuttingDown else {
+      throw SessionSourceFailure(code: .commandRejected)
+    }
+  }
+
+  private func acquirePairingPreparation() async throws {
+    while pairingPreparations > 0 {
+      await withCheckedContinuation { continuation in
+        pairingPreparationWaiters.append(continuation)
+      }
+      try requireAcceptingPairing()
+    }
+    try requireAcceptingPairing()
+    pairingPreparations = 1
+  }
+
+  private func finishPairingPreparation() {
+    precondition(pairingPreparations > 0)
+    pairingPreparations -= 1
+    guard pairingPreparations == 0 else { return }
+    let waiters = pairingPreparationWaiters
+    pairingPreparationWaiters.removeAll(keepingCapacity: false)
+    for waiter in waiters {
+      waiter.resume()
+    }
+  }
+
+  private func requireActivePairingWorker() throws {
+    try Task.checkCancellation()
+    guard !shuttingDown else { throw CancellationError() }
+  }
+
+  private func cancelPairingWorker(_ workerID: UUID) async {
+    let task = pairingTasks[workerID]
+    task?.cancel()
+    await shutdownTransport(for: workerID)
+    await task?.value
+    pairingTasks.removeValue(forKey: workerID)
+  }
+
+  private func cancelAndJoinAllPairingWorkers() async {
+    let workerIDs = Set(pairingTasks.keys)
+      .union(pairingTransports.keys)
+      .union(pairingTransportShutdownTasks.keys)
+    await withTaskGroup(of: Void.self) { group in
+      for workerID in workerIDs {
+        group.addTask {
+          await self.cancelPairingWorker(workerID)
+        }
+      }
+    }
+  }
+
+  private func shutdownTransport(for workerID: UUID) async {
+    if let task = pairingTransportShutdownTasks[workerID] {
+      await task.value
+      pairingTransportShutdownTasks.removeValue(forKey: workerID)
+      return
+    }
+    guard let transport = pairingTransports.removeValue(forKey: workerID) else { return }
+    let task = Task {
+      await transport.shutdown()
+    }
+    pairingTransportShutdownTasks[workerID] = task
+    await task.value
+    pairingTransportShutdownTasks.removeValue(forKey: workerID)
+  }
+
+  func debugActivePairingLifecycleCounts() -> (workers: Int, transports: Int) {
+    (
+      pairingTasks.count,
+      pairingTransports.count + pairingTransportShutdownTasks.count
+    )
   }
 
   private func recoverDurablePairingState() async throws {
@@ -442,7 +616,9 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
   ) async throws -> ProductionRelayPairingAttemptResult {
     var activePrepared = prepared
     let generation = try await transport.connect()
+    try requireActivePairingWorker()
     let stream = await transport.incomingFrames(on: generation)
+    try requireActivePairingWorker()
     let pairingHello = RelayV2OutboundFrame.control(
       .pairingHello(
         relayServerId: invite.relayServerID,
@@ -458,6 +634,7 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
     var announcedPending = false
     var promoted = try await promotedRecordIfPresent(prepared: activePrepared)
     for try await received in stream {
+      try requireActivePairingWorker()
       guard received.generation == generation else {
         throw SessionSourceFailure(code: .securityError)
       }
@@ -525,6 +702,9 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
           }
 
         case .terminal(let outcome):
+          try requireActivePairingWorker()
+          // promotion cleanup 与 pending terminal 是一个不可中断的 durable 收敛单元；
+          // cancellation 只允许落在单元两侧，不能制造已删 material 的 responsePrepared。
           if case .responsePrepared(let response) = activePrepared.record.phase {
             if case .committed? = try await pairedMachineStore.pairingPromotionState(
               prepared: activePrepared,
@@ -541,9 +721,11 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
             try await pairedMachineStore.deleteExact(promoted)
           }
           try await pendingStore.stageTerminal(outcome, for: activePrepared)
+          try requireActivePairingWorker()
           return .terminal(outcome)
 
         case .response(let verified):
+          try requireActivePairingWorker()
           let staged = try await stageResponse(
             verified,
             prepared: prepared,
@@ -556,6 +738,7 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
           )
           activePrepared = staged.prepared
           _ = try await pairedMachineStore.stagePairingPromotion(promotion)
+          try requireActivePairingWorker()
           if let promoted, promoted != promotion.record {
             throw SessionSourceFailure(code: .securityError)
           }
@@ -568,6 +751,7 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
           promoted = promotion.record
 
         case .persistedResponseReplay:
+          try requireActivePairingWorker()
           guard case .responsePrepared(let response) = activePrepared.record.phase,
             promoted != nil
           else {
@@ -582,6 +766,7 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
         }
 
       case .pairRouteClosed(let pairRoute, let outcome):
+        try requireActivePairingWorker()
         guard pairRoute == invite.pairRoute,
           outcome == .closed || outcome == .alreadyAbsent,
           let promoted,
@@ -589,6 +774,8 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
         else {
           throw SessionSourceFailure(code: .securityError)
         }
+        // committed visibility 与 pending completed 同样连续收敛；若前者成功，必须先
+        // 完成后者再观察 cancellation，避免把普通 supersession 变成恢复切点。
         let committed = try await pairedMachineStore.finalizePairingPromotion(
           prepared: activePrepared,
           response: response
@@ -597,6 +784,7 @@ actor ProductionRelayPairingCommandHandler: RelayPairingCommandHandling {
           throw SessionSourceFailure(code: .securityError)
         }
         try await pendingStore.markCompleted(for: activePrepared)
+        try requireActivePairingWorker()
         try? await transport.close(generation: generation)
         return .paired(committed.pairedMachine)
 

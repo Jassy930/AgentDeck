@@ -1567,18 +1567,20 @@ final class RelaySessionSourceTests: XCTestCase {
   }
 
   func testRelaySessionSourceShutdownJoinsConsumersAndConnections() async throws {
-    let (source, connection, _) = try makeSourceHarness()
+    let (source, connection, commands) = try makeSourceHarness()
     _ = await source.machines()
 
     await source.shutdown()
 
     let shutdownCount = await connection.shutdownCount()
     XCTAssertEqual(shutdownCount, 1)
+    let commandShutdownCount = await commands.shutdownCount()
+    XCTAssertEqual(commandShutdownCount, 1)
   }
 
   func testConcurrentShutdownWaitsForSameBarrierAndPostShutdownCannotResubscribe() async throws {
     let connection = AssemblySpyConnection(blockShutdown: true)
-    let commands = AssemblySpyCommandClient()
+    let commands = AssemblySpyCommandClient(blockShutdown: true)
     let source = try RelaySessionSource(
       scope: .machine("machine-1"),
       machines: [
@@ -1600,7 +1602,11 @@ final class RelaySessionSourceTests: XCTestCase {
       await source.shutdown()
       await firstCompletion.markCompleted()
     }
-    let shutdownEntered = await eventually { await connection.shutdownCount() == 1 }
+    let shutdownEntered = await eventually {
+      let connectionCount = await connection.shutdownCount()
+      let commandCount = await commands.shutdownCount()
+      return connectionCount == 1 && commandCount == 1
+    }
     XCTAssertTrue(shutdownEntered)
     let second = Task {
       await source.shutdown()
@@ -1611,6 +1617,13 @@ final class RelaySessionSourceTests: XCTestCase {
     XCTAssertFalse(secondCompletedEarly)
 
     await connection.releaseShutdowns()
+    for _ in 0..<100 { await Task.yield() }
+    let completedBeforeCommandJoin = await firstCompletion.completedValue()
+    XCTAssertFalse(
+      completedBeforeCommandJoin,
+      "connection 已退出时，source 仍必须等待 command/pairing teardown"
+    )
+    await commands.releaseShutdowns()
     let bothCompleted = await eventually {
       let firstDone = await firstCompletion.completedValue()
       let secondDone = await secondCompletion.completedValue()
@@ -2743,13 +2756,37 @@ private actor AssemblySpyCommandClient: RelaySessionSourceCommandClient {
   private var conversationSubscriptionFailure: SessionSourceFailureCode?
   private var blockConversationUnsubscribe: Bool
   private var conversationUnsubscribeWaiters: [CheckedContinuation<Void, Never>] = []
+  private var blockShutdown: Bool
+  private var shutdowns = 0
+  private var shutdownWaiters: [CheckedContinuation<Void, Never>] = []
 
   init(
     conversationSubscriptionFailure: SessionSourceFailureCode? = nil,
-    blockConversationUnsubscribe: Bool = false
+    blockConversationUnsubscribe: Bool = false,
+    blockShutdown: Bool = false
   ) {
     self.conversationSubscriptionFailure = conversationSubscriptionFailure
     self.blockConversationUnsubscribe = blockConversationUnsubscribe
+    self.blockShutdown = blockShutdown
+  }
+
+  func shutdown() async {
+    shutdowns += 1
+    guard blockShutdown else { return }
+    await withCheckedContinuation { continuation in
+      shutdownWaiters.append(continuation)
+    }
+  }
+
+  func shutdownCount() -> Int { shutdowns }
+
+  func releaseShutdowns() {
+    blockShutdown = false
+    let waiters = shutdownWaiters
+    shutdownWaiters.removeAll(keepingCapacity: false)
+    for waiter in waiters {
+      waiter.resume()
+    }
   }
 
   func subscribe(

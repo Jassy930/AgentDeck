@@ -67,6 +67,16 @@ final class RelayRuntimeCommandClientTests: XCTestCase {
     XCTAssertEqual(records[0].requestID.rawValue, "unsubscribe-request-1")
   }
 
+  func testShutdownForwardsToPairingOwner() async throws {
+    let pairing = RuntimePairingHandlerSpy()
+    let client = try RelayRuntimeCommandClient(endpoints: [:], pairing: pairing)
+
+    await client.shutdown()
+
+    let shutdownCount = await pairing.shutdownCount()
+    XCTAssertEqual(shutdownCount, 1)
+  }
+
   func testPromptUsesIdempotentEnvelopeAndRevisionBoundContract() async throws {
     let endpoint = RuntimeEndpointSpy(machineID: "machine-1", grantSerial: 7)
     await endpoint.enqueue(
@@ -318,6 +328,24 @@ private actor RuntimeEndpointSpy: MachineRuntimeRequestEndpoint {
 
 private enum RuntimeEndpointSpyError: Error {
   case missingReply
+}
+
+private actor RuntimePairingHandlerSpy: RelayPairingCommandHandling {
+  private var shutdowns = 0
+
+  func shutdown() {
+    shutdowns += 1
+  }
+
+  func inspectPairInvite(_: String) async throws -> PairingPreview {
+    throw SessionSourceFailure(code: .commandRejected)
+  }
+
+  func pair(_: String) async throws -> AsyncThrowingStream<PairingProgress, Error> {
+    throw SessionSourceFailure(code: .commandRejected)
+  }
+
+  func shutdownCount() -> Int { shutdowns }
 }
 
 private func assertSessionFailure(

@@ -11,6 +11,8 @@ public enum RelaySourceScope: Sendable {
 /// DeviceRequestSigner、request correlation 与 exact retry；Source 只提供已验证 reducer baseline。
 /// Pairing 由同一 PairedMachineStore namespace 的 production handler 独立拥有。
 public protocol RelaySessionSourceCommandClient: Sendable {
+  func shutdown() async
+
   func subscribe(
     machineID: String,
     target: RuntimeSubscriptionTargetV1,
@@ -610,6 +612,8 @@ public actor RelaySessionSource: SessionSource {
       task.cancel()
     }
 
+    async let commandClientShutdown: Void = commandClient.shutdown()
+
     for machineID in connections.keys {
       beginConnectionShutdown(machineID)
     }
@@ -620,6 +624,7 @@ public actor RelaySessionSource: SessionSource {
     for task in tasks.values {
       await task.value
     }
+    await commandClientShutdown
 
     for observation in conversationObservations.values {
       await observation.broadcaster.finish()

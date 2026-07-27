@@ -530,6 +530,223 @@ final class ProductionRelayPairingCommandHandlerTests: XCTestCase {
     }
     XCTAssertEqual(pending.record.phase, .requestPrepared)
   }
+
+  func testShutdownClosesAndJoinsActivePairingAndRejectsNewPairing() async throws {
+    let fixture = try PairingHandlerFixture(index: 13)
+    defer { fixture.removeStateRoot() }
+    let firstTransport = PairingHandlerScriptedTransport(
+      generation: 131,
+      blockConnect: true,
+      blockShutdown: true
+    )
+    let handler = fixture.makeHandler(
+      transportFactory: PairingHandlerTransportFactory(
+        transports: [firstTransport]
+      )
+    )
+    let firstStream = try await handler.pair(fixture.encodedInvite)
+    let firstProgressTask = Task { await pairingHandlerCollectResult(firstStream) }
+    await firstTransport.waitForConnectCount(1)
+
+    let firstCompletion = PairingHandlerCompletionProbe()
+    let secondCompletion = PairingHandlerCompletionProbe()
+    let firstShutdown = Task {
+      await handler.shutdown()
+      await firstCompletion.markCompleted()
+    }
+    await firstTransport.waitForShutdownCount(1)
+    let firstCompletedEarly = await firstCompletion.completedValue()
+    XCTAssertFalse(firstCompletedEarly)
+
+    let secondShutdown = Task {
+      await handler.shutdown()
+      await secondCompletion.markCompleted()
+    }
+    for _ in 0..<100 { await Task.yield() }
+    let secondCompletedEarly = await secondCompletion.completedValue()
+    XCTAssertFalse(
+      secondCompletedEarly,
+      "并发 shutdown 必须等待同一个 pairing/WSS join barrier"
+    )
+    await assertPairingHandlerSessionFailure(.commandRejected) {
+      try await handler.pair(fixture.encodedInvite)
+    }
+
+    await firstTransport.releaseShutdown()
+    for _ in 0..<100 { await Task.yield() }
+    let completedBeforeWorkerJoin = await firstCompletion.completedValue()
+    XCTAssertFalse(
+      completedBeforeWorkerJoin,
+      "WSS shutdown 返回后，handler 仍必须 join 尚未退出的 pairing worker"
+    )
+    await firstTransport.releaseConnect()
+    _ = await firstShutdown.value
+    _ = await secondShutdown.value
+    guard case .success(let firstProgress) = await firstProgressTask.value else {
+      return XCTFail("shutdown cancellation 应正常结束 pairing progress stream")
+    }
+    XCTAssertEqual(firstProgress, [.preparing])
+    let firstCompleted = await firstCompletion.completedValue()
+    let secondCompleted = await secondCompletion.completedValue()
+    let firstTransportShutdownCount = await firstTransport.shutdownCount
+    XCTAssertTrue(firstCompleted)
+    XCTAssertTrue(secondCompleted)
+    XCTAssertEqual(firstTransportShutdownCount, 1)
+
+    await handler.shutdown()
+    let repeatedFirstCount = await firstTransport.shutdownCount
+    XCTAssertEqual(repeatedFirstCount, 1, "重复 shutdown 必须幂等")
+    await assertPairingHandlerSessionFailure(.commandRejected) {
+      try await handler.pair(fixture.encodedInvite)
+    }
+  }
+
+  func testReplacementPairCancelsClosesAndJoinsOldWorkerBeforeOpeningNewWSS() async throws {
+    let fixture = try PairingHandlerFixture(index: 16)
+    defer { fixture.removeStateRoot() }
+    let firstTransport = PairingHandlerScriptedTransport(
+      generation: 161,
+      blockConnect: true,
+      blockShutdown: true
+    )
+    let secondTransport = PairingHandlerScriptedTransport(generation: 162)
+    let factory = PairingHandlerTransportFactory(
+      transports: [firstTransport, secondTransport]
+    )
+    let handler = fixture.makeHandler(transportFactory: factory)
+    let firstStream = try await handler.pair(fixture.encodedInvite)
+    let firstProgressTask = Task { await pairingHandlerCollectResult(firstStream) }
+    await firstTransport.waitForConnectCount(1)
+
+    let replacementCompletion = PairingHandlerCompletionProbe()
+    let replacement = Task {
+      let stream = try await handler.pair(fixture.encodedInvite)
+      await replacementCompletion.markCompleted()
+      return stream
+    }
+    await firstTransport.waitForShutdownCount(1)
+    XCTAssertEqual(factory.makeCount, 1, "旧 WSS shutdown/join 前不得创建 replacement transport")
+    let replacementCompletedBeforeShutdown = await replacementCompletion.completedValue()
+    XCTAssertFalse(replacementCompletedBeforeShutdown)
+
+    await firstTransport.releaseShutdown()
+    for _ in 0..<100 { await Task.yield() }
+    XCTAssertEqual(factory.makeCount, 1, "旧 worker 尚卡在 connect 时仍不得越过 join barrier")
+    let replacementCompletedBeforeJoin = await replacementCompletion.completedValue()
+    XCTAssertFalse(replacementCompletedBeforeJoin)
+
+    await firstTransport.releaseConnect()
+    let secondStream = try await replacement.value
+    let secondProgressTask = Task { await pairingHandlerCollectResult(secondStream) }
+    await secondTransport.waitForConnectCount(1)
+    XCTAssertEqual(factory.makeCount, 2)
+    guard case .success(let firstProgress) = await firstProgressTask.value else {
+      return XCTFail("superseded pairing stream 应正常结束")
+    }
+    XCTAssertEqual(firstProgress, [.preparing])
+
+    await handler.shutdown()
+    guard case .success(let secondProgress) = await secondProgressTask.value else {
+      return XCTFail("replacement pairing stream 应在 shutdown 时正常结束")
+    }
+    XCTAssertEqual(secondProgress, [.preparing])
+    let firstShutdownCount = await firstTransport.shutdownCount
+    let secondShutdownCount = await secondTransport.shutdownCount
+    XCTAssertEqual(firstShutdownCount, 1)
+    XCTAssertEqual(secondShutdownCount, 1)
+  }
+
+  func testConsumerCancellationClosesExactTransportAndJoinsWorker() async throws {
+    let fixture = try PairingHandlerFixture(index: 14)
+    defer { fixture.removeStateRoot() }
+    let transport = PairingHandlerScriptedTransport(
+      generation: 141,
+      blockConnect: true,
+      blockShutdown: true
+    )
+    let handler = fixture.makeHandler(
+      transportFactory: PairingHandlerTransportFactory(transports: [transport])
+    )
+    let stream = try await handler.pair(fixture.encodedInvite)
+    let consumer = Task { await pairingHandlerCollectResult(stream) }
+    await transport.waitForConnectCount(1)
+    let activeCounts = await handler.debugActivePairingLifecycleCounts()
+    XCTAssertEqual(activeCounts.workers, 1)
+    XCTAssertEqual(activeCounts.transports, 1)
+
+    consumer.cancel()
+    guard case .success(let progress) = await consumer.value else {
+      return XCTFail("consumer cancellation 应正常结束本地 progress iterator")
+    }
+    XCTAssertEqual(progress, [.preparing])
+    await transport.waitForShutdownCount(1)
+    let closingCounts = await handler.debugActivePairingLifecycleCounts()
+    XCTAssertEqual(closingCounts.workers, 1, "transport connect 未释放前 worker 必须仍可被 join")
+    XCTAssertEqual(closingCounts.transports, 1, "in-flight exact WSS shutdown 必须保持可 join")
+
+    let globalCompletion = PairingHandlerCompletionProbe()
+    let globalShutdown = Task {
+      await handler.shutdown()
+      await globalCompletion.markCompleted()
+    }
+    for _ in 0..<100 { await Task.yield() }
+    let completedBeforeTransportClose = await globalCompletion.completedValue()
+    XCTAssertFalse(
+      completedBeforeTransportClose,
+      "global shutdown 必须 join consumer termination 已启动的 exact WSS shutdown"
+    )
+
+    await transport.releaseShutdown()
+    for _ in 0..<100 { await Task.yield() }
+    let completedBeforeWorkerJoin = await globalCompletion.completedValue()
+    XCTAssertFalse(completedBeforeWorkerJoin, "WSS 已关后仍必须 join blocked pairing worker")
+
+    await transport.releaseConnect()
+    _ = await globalShutdown.value
+    var finalCounts = await handler.debugActivePairingLifecycleCounts()
+    for _ in 0..<1_000 where finalCounts.workers != 0 || finalCounts.transports != 0 {
+      await Task.yield()
+      finalCounts = await handler.debugActivePairingLifecycleCounts()
+    }
+    XCTAssertEqual(finalCounts.workers, 0)
+    XCTAssertEqual(finalCounts.transports, 0)
+
+    await handler.shutdown()
+    let shutdownCount = await transport.shutdownCount
+    XCTAssertEqual(shutdownCount, 1, "global shutdown 不得重复关闭已由 consumer 回收的 WSS")
+  }
+
+  func testDroppingUnconsumedProgressStreamClosesExactTransport() async throws {
+    let fixture = try PairingHandlerFixture(index: 15)
+    defer { fixture.removeStateRoot() }
+    let transport = PairingHandlerScriptedTransport(
+      generation: 151,
+      blockConnect: true
+    )
+    let handler = fixture.makeHandler(
+      transportFactory: PairingHandlerTransportFactory(transports: [transport])
+    )
+    var stream: AsyncThrowingStream<PairingProgress, Error>? = try await handler.pair(
+      fixture.encodedInvite
+    )
+    await transport.waitForConnectCount(1)
+    XCTAssertNotNil(stream)
+
+    stream = nil
+    await transport.waitForShutdownCount(1)
+    await transport.releaseConnect()
+    var finalCounts = await handler.debugActivePairingLifecycleCounts()
+    for _ in 0..<1_000 where finalCounts.workers != 0 || finalCounts.transports != 0 {
+      await Task.yield()
+      finalCounts = await handler.debugActivePairingLifecycleCounts()
+    }
+    XCTAssertEqual(finalCounts.workers, 0)
+    XCTAssertEqual(finalCounts.transports, 0)
+
+    await handler.shutdown()
+    let shutdownCount = await transport.shutdownCount
+    XCTAssertEqual(shutdownCount, 1)
+  }
 }
 
 private final class PairingHandlerFixture: @unchecked Sendable {
@@ -823,28 +1040,76 @@ private actor PairingHandlerScriptedTransport: RelayPairingTransportSession {
     let continuation: CheckedContinuation<[RelayV2Frame], Never>
   }
 
+  private struct ShutdownWaiter {
+    let count: Int
+    let continuation: CheckedContinuation<Void, Never>
+  }
+
+  private struct ConnectWaiter {
+    let count: Int
+    let continuation: CheckedContinuation<Void, Never>
+  }
+
   private let generation: RelayTransportGeneration
   private let automaticallyAuthenticatePairingHello: Bool
+  private let blockConnect: Bool
+  private let blockShutdown: Bool
   private let stream: AsyncThrowingStream<ReceivedRelayFrame, any Error>
   private let continuation: AsyncThrowingStream<ReceivedRelayFrame, any Error>.Continuation
   private var incomingClaimed = false
+  private var connectCount = 0
+  private var connectWaiters: [ConnectWaiter] = []
+  private var connectReleaseWaiters: [CheckedContinuation<Void, Never>] = []
+  private var connectReleased = false
   private var sentFrames: [RelayV2Frame] = []
   private var frameWaiters: [FrameWaiter] = []
   private var closedGenerations: [RelayTransportGeneration] = []
   private(set) var shutdownCount = 0
+  private var shutdownWaiters: [ShutdownWaiter] = []
+  private var shutdownReleaseWaiters: [CheckedContinuation<Void, Never>] = []
+  private var shutdownReleased = false
 
   init(
     generation: UInt64,
-    automaticallyAuthenticatePairingHello: Bool = true
+    automaticallyAuthenticatePairingHello: Bool = true,
+    blockConnect: Bool = false,
+    blockShutdown: Bool = false
   ) {
     self.generation = RelayTransportGeneration(rawValue: generation)
     self.automaticallyAuthenticatePairingHello = automaticallyAuthenticatePairingHello
+    self.blockConnect = blockConnect
+    self.blockShutdown = blockShutdown
     var captured: AsyncThrowingStream<ReceivedRelayFrame, any Error>.Continuation?
     stream = AsyncThrowingStream { captured = $0 }
     continuation = captured!
   }
 
-  func connect() async throws -> RelayTransportGeneration { generation }
+  func connect() async throws -> RelayTransportGeneration {
+    connectCount += 1
+    resumeConnectWaiters()
+    if blockConnect, !connectReleased {
+      await withCheckedContinuation { continuation in
+        connectReleaseWaiters.append(continuation)
+      }
+    }
+    return generation
+  }
+
+  func waitForConnectCount(_ count: Int) async {
+    if connectCount >= count { return }
+    await withCheckedContinuation { continuation in
+      connectWaiters.append(ConnectWaiter(count: count, continuation: continuation))
+    }
+  }
+
+  func releaseConnect() {
+    connectReleased = true
+    let waiters = connectReleaseWaiters
+    connectReleaseWaiters.removeAll(keepingCapacity: false)
+    for waiter in waiters {
+      waiter.resume()
+    }
+  }
 
   func incomingFrames(
     on expectedGeneration: RelayTransportGeneration
@@ -883,7 +1148,29 @@ private actor PairingHandlerScriptedTransport: RelayPairingTransportSession {
 
   func shutdown() async {
     shutdownCount += 1
+    resumeShutdownWaiters()
+    if blockShutdown, !shutdownReleased {
+      await withCheckedContinuation { continuation in
+        shutdownReleaseWaiters.append(continuation)
+      }
+    }
     continuation.finish()
+  }
+
+  func waitForShutdownCount(_ count: Int) async {
+    if shutdownCount >= count { return }
+    await withCheckedContinuation { continuation in
+      shutdownWaiters.append(ShutdownWaiter(count: count, continuation: continuation))
+    }
+  }
+
+  func releaseShutdown() {
+    shutdownReleased = true
+    let waiters = shutdownReleaseWaiters
+    shutdownReleaseWaiters.removeAll(keepingCapacity: false)
+    for waiter in waiters {
+      waiter.resume()
+    }
   }
 
   func waitForSentFrameCount(_ count: Int) async -> [RelayV2Frame] {
@@ -924,6 +1211,40 @@ private actor PairingHandlerScriptedTransport: RelayPairingTransportSession {
     }
     frameWaiters = remaining
   }
+
+  private func resumeConnectWaiters() {
+    var remaining: [ConnectWaiter] = []
+    for waiter in connectWaiters {
+      if connectCount >= waiter.count {
+        waiter.continuation.resume()
+      } else {
+        remaining.append(waiter)
+      }
+    }
+    connectWaiters = remaining
+  }
+
+  private func resumeShutdownWaiters() {
+    var remaining: [ShutdownWaiter] = []
+    for waiter in shutdownWaiters {
+      if shutdownCount >= waiter.count {
+        waiter.continuation.resume()
+      } else {
+        remaining.append(waiter)
+      }
+    }
+    shutdownWaiters = remaining
+  }
+}
+
+private actor PairingHandlerCompletionProbe {
+  private var completed = false
+
+  func markCompleted() {
+    completed = true
+  }
+
+  func completedValue() -> Bool { completed }
 }
 
 private final class PairingHandlerTransportFactory:

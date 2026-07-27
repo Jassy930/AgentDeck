@@ -28,11 +28,14 @@ protocol MachineRuntimeRequestEndpoint: Sendable {
 }
 
 protocol RelayPairingCommandHandling: Sendable {
+  func shutdown() async
   func inspectPairInvite(_ encoded: String) async throws -> PairingPreview
   func pair(_ encodedInvite: String) async throws -> AsyncThrowingStream<PairingProgress, Error>
 }
 
 private struct MissingRelayPairingCommandHandler: RelayPairingCommandHandling {
+  func shutdown() async {}
+
   func inspectPairInvite(_: String) async throws -> PairingPreview {
     throw SessionSourceFailure(code: .commandRejected)
   }
@@ -72,6 +75,10 @@ struct RelayRuntimeCommandClient: RelaySessionSourceCommandClient {
     self.endpoints = endpoints
     self.pairing = pairing
     self.messageIDGenerator = messageIDGenerator
+  }
+
+  func shutdown() async {
+    await pairing.shutdown()
   }
 
   func subscribe(
