@@ -1963,7 +1963,7 @@ mod tests {
         )
         .unwrap();
 
-        for index in 0..=MAX_COMPLETED_TRANSFER_TOMBSTONES {
+        for index in 0..MAX_COMPLETED_TRANSFER_TOMBSTONES {
             let transfer_id = if index == 0 {
                 retained_id.clone()
             } else {
@@ -1985,6 +1985,13 @@ mod tests {
             assert!(matches!(progress, TransferProgress::Complete(_)));
             state.remember_completed(transfer_id, "original-message", now_ms);
         }
+        // inner reassembler 的 TTL 内 tombstone 采用 no-evict 上限；这里单独推进
+        // outer binding 的 FIFO，显式构造两层状态失配并验证 fail-close。
+        state.remember_completed(
+            TransferId::new("outer-only-completion"),
+            "original-message",
+            now_ms,
+        );
         assert_eq!(state.completed.len(), MAX_COMPLETED_TRANSFER_TOMBSTONES);
         assert!(!state.completed.contains_key(&retained_id));
 
