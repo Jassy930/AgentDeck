@@ -387,17 +387,28 @@ final class FixtureSessionSourceTests: XCTestCase {
         )
         XCTAssertNotEqual(terminalSequence, UInt64.max)
 
-        let slowConsumer = Task { () -> Bool in
-            var sawLagged = false
-            for await update in slowStream {
-                if case .connectionState(.lagged(reason: .bufferDropped)) = update {
-                    sawLagged = true
-                }
+        let slowConsumer = Task { () -> (firstWasLagged: Bool, streamEnded: Bool) in
+            var iterator = slowStream.makeAsyncIterator()
+            let first = await iterator.next()
+            let firstWasLagged: Bool
+            if case .connectionState(.lagged(reason: .bufferDropped))? = first {
+                firstWasLagged = true
+            } else {
+                firstWasLagged = false
             }
-            return sawLagged
+            let second = await iterator.next()
+            return (firstWasLagged, second == nil)
         }
-        let slowSawLagged = await awaitValue(from: slowConsumer)
-        XCTAssertEqual(slowSawLagged, true, "slow subscriber 必须 lagged 后结束 generation")
+        let observedSlowOutcome = await awaitValue(from: slowConsumer)
+        let slowOutcome = try XCTUnwrap(
+            observedSlowOutcome,
+            "slow subscriber 应在 overflow 后及时结束"
+        )
+        XCTAssertTrue(
+            slowOutcome.firstWasLagged,
+            "overflow 必须原子清队列，使 slow subscriber 的下一项直接为 lagged"
+        )
+        XCTAssertTrue(slowOutcome.streamEnded, "lagged 后必须结束旧 generation")
 
         var lateIterator = await source.conversation(
             conversationID: "sess-cc-01"

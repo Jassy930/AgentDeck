@@ -40,11 +40,17 @@ actor FixtureSessionSource: SessionSource {
         let receipt: ApprovalReceipt
     }
 
+    private struct ConversationSubscriber {
+        var queue: [ConversationUpdate]
+        var waiter: CheckedContinuation<ConversationUpdate?, Never>?
+        var finished: Bool
+    }
+
     private final class Playback {
         let fixture: FixtureConversation
         let connectionState: SessionConnectionState
         var transcript: [ConversationUpdate]
-        var subscribers: [UUID: AsyncStream<ConversationUpdate>.Continuation] = [:]
+        var subscribers: [UUID: ConversationSubscriber] = [:]
         var approvalGate: CheckedContinuation<Void, Never>?
         var pendingApproval: PendingApproval?
         var approvalOutcomes: [RuntimeApprovalID: ApprovalOutcome] = [:]
@@ -256,10 +262,8 @@ actor FixtureSessionSource: SessionSource {
     }
 
     func conversation(conversationID: String) async -> AsyncStream<ConversationUpdate> {
-        let pair = AsyncStream<ConversationUpdate>.makeStream(
-            bufferingPolicy: .bufferingNewest(Self.conversationBufferLimit)
-        )
         guard let playback = ensurePlayback(conversationID: conversationID) else {
+            let pair = AsyncStream<ConversationUpdate>.makeStream()
             pair.continuation.yield(.connectionState(.securityError))
             pair.continuation.finish()
             return pair.stream
@@ -267,15 +271,29 @@ actor FixtureSessionSource: SessionSource {
 
         playback.refreshCompactedTranscriptForLateSubscriber()
         let id = UUID()
-        playback.subscribers[id] = pair.continuation
-        for update in playback.transcript {
-            pair.continuation.yield(update)
-        }
-        pair.continuation.onTermination = { [weak self] _ in
-            Task { await self?.removeConversationSubscriber(id, conversationID: conversationID) }
-        }
+        playback.subscribers[id] = ConversationSubscriber(
+            queue: playback.transcript,
+            waiter: nil,
+            finished: false
+        )
         startPlaybackIfNeeded(conversationID: conversationID, playback: playback)
-        return pair.stream
+        return AsyncStream(
+            unfolding: { [weak self] in
+                guard let self else { return nil }
+                return await self.nextConversationUpdate(
+                    subscriberID: id,
+                    conversationID: conversationID
+                )
+            },
+            onCancel: { [weak self] in
+                Task {
+                    await self?.removeConversationSubscriber(
+                        id,
+                        conversationID: conversationID
+                    )
+                }
+            }
+        )
     }
 
     func inbox() async -> AsyncStream<ResourceState<[InboxItem]>> {
@@ -713,14 +731,25 @@ actor FixtureSessionSource: SessionSource {
             playback.transcript.append(update)
         }
         for subscriberID in Array(playback.subscribers.keys) {
-            guard let continuation = playback.subscribers[subscriberID] else { continue }
-            let result = continuation.yield(update)
-            if case .dropped = result {
-                continuation.yield(
+            guard var subscriber = playback.subscribers[subscriberID], !subscriber.finished else {
+                continue
+            }
+            if let waiter = subscriber.waiter {
+                subscriber.waiter = nil
+                playback.subscribers[subscriberID] = subscriber
+                waiter.resume(returning: update)
+            } else if subscriber.queue.count >= Self.conversationBufferLimit {
+                // AsyncStream continuation 的内部 buffer 无法清空；若先丢旧事件再排
+                // lagged，reducer 会先看到断序事件并误判 securityError。队列由 actor
+                // 持有后，可以原子失效旧 generation，让 marker 成为下一项并随即结束。
+                subscriber.queue = [
                     .connectionState(.lagged(reason: .bufferDropped))
-                )
-                continuation.finish()
-                playback.subscribers[subscriberID] = nil
+                ]
+                subscriber.finished = true
+                playback.subscribers[subscriberID] = subscriber
+            } else {
+                subscriber.queue.append(update)
+                playback.subscribers[subscriberID] = subscriber
             }
         }
     }
@@ -874,8 +903,41 @@ actor FixtureSessionSource: SessionSource {
         conversationListSubscribers[id] = nil
     }
 
+    private func nextConversationUpdate(
+        subscriberID: UUID,
+        conversationID: String
+    ) async -> ConversationUpdate? {
+        guard let playback = playbacks[conversationID],
+            var subscriber = playback.subscribers[subscriberID]
+        else {
+            return nil
+        }
+        if !subscriber.queue.isEmpty {
+            let next = subscriber.queue.removeFirst()
+            playback.subscribers[subscriberID] = subscriber
+            return next
+        }
+        if subscriber.finished {
+            playback.subscribers[subscriberID] = nil
+            return nil
+        }
+        return await withCheckedContinuation { continuation in
+            guard var current = playback.subscribers[subscriberID] else {
+                continuation.resume(returning: nil)
+                return
+            }
+            precondition(current.waiter == nil, "conversation stream 不允许并发 next()")
+            current.waiter = continuation
+            playback.subscribers[subscriberID] = current
+        }
+    }
+
     private func removeConversationSubscriber(_ id: UUID, conversationID: String) {
-        playbacks[conversationID]?.subscribers[id] = nil
+        guard let subscriber = playbacks[conversationID]?.subscribers.removeValue(forKey: id)
+        else {
+            return
+        }
+        subscriber.waiter?.resume(returning: nil)
     }
 
     private func removeInboxSubscriber(_ id: UUID) {
