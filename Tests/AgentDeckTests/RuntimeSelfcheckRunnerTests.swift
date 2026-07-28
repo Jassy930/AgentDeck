@@ -104,6 +104,19 @@ final class RuntimeSelfcheckRunnerTests: XCTestCase {
     }
     XCTAssertTrue(selfcheckSource.contains("RuntimeSelfcheckRunner"))
     XCTAssertTrue(diagnosticsSource.contains("runDaemonOneShot"))
+    XCTAssertTrue(main.contains("let execution = runBlockingAsync"))
+    XCTAssertFalse(main.contains("let execution = await"))
+    XCTAssertFalse(main.contains("appComposition = try await"))
+    XCTAssertTrue(main.contains("app.run()"))
+  }
+
+  func testBlockingAsyncBridgeCompletesHeadlessCommandWithoutAsyncMain() {
+    let value = runBlockingAsync {
+      await Task.yield()
+      return 42
+    }
+
+    XCTAssertEqual(value, 42)
   }
 
   private func failureCode(in data: Data) -> String? {

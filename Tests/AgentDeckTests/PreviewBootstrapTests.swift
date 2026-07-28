@@ -1,11 +1,13 @@
 import XCTest
+import AppKit
 
 @testable import AgentDeck
 
 @MainActor
 final class PreviewBootstrapTests: XCTestCase {
   func testPreviewCompositionSelectsExplicitFixtureWithoutLocalCapabilities() async throws {
-    let composition = try await PreviewBootstrap.makeComposition()
+    let composition = try PreviewBootstrap.makeComposition()
+    try await composition.prepare()
     let selection = await composition.selectedMachineScope.selection()
 
     XCTAssertEqual(selection?.context.scope, .fixture(id: "preview"))
@@ -32,6 +34,117 @@ final class PreviewBootstrapTests: XCTestCase {
     XCTAssertEqual(model.workbench.catalogEntries.count, MockDaemonScript.historyList().count)
     XCTAssertEqual(model.historyThreads.count, MockDaemonScript.historyList().count)
     XCTAssertFalse(model.historyGroups.isEmpty, "preview 应通过 Runtime v2 fixture 加载到 mock 历史")
+  }
+
+  func testPreviewCompositionLoadsCatalogAfterFixtureScopeSelection() async throws {
+    let composition = try PreviewBootstrap.makeComposition()
+    try await composition.prepare()
+    let model = composition.model
+    defer { model.teardown() }
+
+    model.loadHistory()
+
+    for _ in 0..<200 {
+      if !model.isLoadingHistory { break }
+      try await Task.sleep(for: .milliseconds(5))
+    }
+
+    XCTAssertFalse(model.isLoadingHistory, "preview composition 的 catalog 加载应在有界等待内完成")
+    XCTAssertNil(model.historyErrorMessage)
+    XCTAssertEqual(model.historyThreads.count, MockDaemonScript.historyList().count)
+
+    await composition.shutdown()
+  }
+
+  func testPreviewCompositionPublishesCatalogIntoLiveSidebar() async throws {
+    let composition = try PreviewBootstrap.makeComposition()
+    try await composition.prepare()
+    let model = composition.model
+    defer { model.teardown() }
+    let sidebar = HistorySidebarViewController(model: model)
+    _ = sidebar.view
+    let outline = try XCTUnwrap(firstSubview(of: NSOutlineView.self, in: sidebar.view))
+
+    model.loadHistory()
+
+    for _ in 0..<200 {
+      if outline.numberOfRows > 0 { break }
+      try await Task.sleep(for: .milliseconds(5))
+    }
+
+    XCTAssertGreaterThan(outline.numberOfRows, 0)
+    XCTAssertNil(model.historyErrorMessage)
+
+    await composition.shutdown()
+  }
+
+  func testPreviewCompositionAcceptsNewSessionDraftThroughViewController() async throws {
+    let composition = try PreviewBootstrap.makeComposition()
+    try await composition.prepare()
+    let model = composition.model
+    defer { model.teardown() }
+    let controller = SessionViewController(model: model)
+    let form = CodexSessionOptionsForm()
+    form.loadViewIfNeeded()
+    let draft = try NewSessionDialog.buildConversationDraft(
+      agentKind: .codex,
+      vendorForm: form,
+      cwd: FileManager.default.temporaryDirectory,
+      prompt: "preview ui admission"
+    )
+
+    XCTAssertTrue(controller.handleNewConversationDraft(draft))
+
+    for _ in 0..<400 {
+      if let runtime = model.workbench.selectedRuntime,
+        runtime.phase == .ready,
+        runtime.items.contains(where: { $0.text == "preview ui admission" })
+      {
+        break
+      }
+      try await Task.sleep(for: .milliseconds(5))
+    }
+
+    let runtime = try XCTUnwrap(model.workbench.selectedRuntime)
+    XCTAssertEqual(runtime.phase, .ready)
+    XCTAssertTrue(runtime.items.contains(where: { $0.text == "preview ui admission" }))
+    XCTAssertNil(model.errorMessage)
+
+    await composition.shutdown()
+  }
+
+  func testPreviewWindowLifecycleLoadsAndOpensPrimaryConversation() async throws {
+    let composition = try PreviewBootstrap.makeComposition()
+    let model = composition.model
+    defer { model.teardown() }
+    let controller = SessionViewController(model: model)
+    let window = NSWindow(contentViewController: controller)
+    window.makeKeyAndOrderFront(nil)
+    defer { window.close() }
+    let delegate = AppDelegate(
+      profile: .dev,
+      composition: composition,
+      preview: true,
+      terminationReply: { _ in }
+    )
+
+    delegate.startPreviewBootstrapIfNeeded()
+
+    for _ in 0..<400 {
+      if model.workbench.selectedConversationID?.rawValue == MockDaemonScript.primaryThreadId {
+        break
+      }
+      try await Task.sleep(for: .milliseconds(5))
+    }
+
+    XCTAssertEqual(
+      model.workbench.selectedConversationID?.rawValue,
+      MockDaemonScript.primaryThreadId
+    )
+    XCTAssertNil(model.historyErrorMessage)
+    XCTAssertNil(model.errorMessage)
+
+    await composition.shutdown()
   }
 
   func testPreviewPromptCompletesSyntheticRuntimeTurn() async throws {
@@ -66,4 +179,16 @@ final class PreviewBootstrapTests: XCTestCase {
       })
     )
   }
+}
+
+@MainActor
+private func firstSubview<T: NSView>(of type: T.Type, in root: NSView) -> T? {
+  if let match = root as? T { return match }
+  for subview in root.subviews {
+    if let match = firstSubview(of: type, in: subview) { return match }
+  }
+  if let scrollView = root as? NSScrollView, let documentView = scrollView.documentView {
+    return firstSubview(of: type, in: documentView)
+  }
+  return nil
 }

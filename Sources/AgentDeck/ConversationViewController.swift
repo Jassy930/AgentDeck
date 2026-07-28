@@ -1,6 +1,33 @@
 import AppKit
 import AgentDeckCore
 
+/// 行高缓存的结构化内容版本。字段按值比较，避免把多个 revision / 长度
+/// 线性折叠为一个 Int 时产生可构造碰撞。
+private struct ConversationRowContentVersion: Hashable {
+    var textRevision: UInt64 = 0
+    var outputRevision: UInt64 = 0
+    var diffRevision: UInt64 = 0
+    var descriptionText = ""
+    var reasoningExpanded = false
+    var disclosureExpanded = false
+    var expandedToolPayload: [String] = []
+}
+
+/// 与设计系统 `.wb-stream` / `.wb-col` / `.wb-composer` 对齐的主内容布局度量。
+/// inspector 有数据且空间足够时，正文和 composer 都在
+/// `24 ... (width - 290)` 区域内居中；无数据或窄于响应式门槛时，左右各保留
+/// 24pt，避免一个不可见或放不下的面板继续挤压正文。
+enum ConversationLayoutMetrics {
+    static let contentMaxWidth: CGFloat = 620
+    /// 窄窗仍需留给 composer 的最低可用宽度；低于这一门槛时优先折叠 inspector。
+    static let contentMinimumWidth: CGFloat = 252
+    static let horizontalInset: CGFloat = 24
+    static let inspectorReserve: CGFloat = 290
+    static let minimumInspectorPaneWidth = horizontalInset + inspectorReserve + contentMinimumWidth
+    static let environmentTop: CGFloat = 12
+    static let environmentTrailing: CGFloat = 20
+}
+
 // MARK: - ConversationViewController (Task 8)
 //
 // Assembles the conversation pane from the pieces built in Tasks 2–7:
@@ -62,13 +89,35 @@ final class ConversationViewController: NSViewController {
     /// Compared against a freshly rebuilt sequence in `modelDidChange()` so a
     /// pure streaming-text flush (identical id sequence) skips the full reload
     /// and only re-measures the rows whose content actually grew.
-    private var displayedRowSignatures: [(id: String, version: Int)] = []
+    private var displayedRowSignatures: [(id: String, version: ConversationRowContentVersion)] = []
+
+    /// Static presentation fields (tool status, duration, payload, command,
+    /// path, etc.) do not flow through `StreamingTextBuffer`. Keep a separate
+    /// version sequence so an in-place start → result update reconfigures only
+    /// the affected visible row, while pure 30fps buffer growth still avoids a
+    /// cell reload and only re-measures height.
+    private var displayedRowConfigurationVersions: [Int] = []
 
     /// Per-item disclosure expansion state for the collapsible tool rows
     /// (shell output / fileEdit diff). Held here so it SURVIVES cell reuse and
     /// the streaming reconfigure path (C1): a cell restores its expanded state
     /// from this set in `configure` instead of hard-resetting to collapsed.
     private var expandedItemIds: Set<String> = []
+    /// Group disclosure is structural (it inserts/removes the original member
+    /// rows), so keep it separate from per-item payload disclosure state.
+    private var expandedToolGroupIds: Set<String> = []
+    /// Distinguishes a newly formed live group from one the user deliberately
+    /// collapsed. A new group inherits expansion when its former singleton was
+    /// already open; later model flushes must not reopen a manually closed one.
+    private var knownToolGroupIds: Set<String> = []
+    /// Reasoning auto-expands while a turn runs, so an explicit user collapse
+    /// needs a separate override instead of being indistinguishable from the
+    /// default "not manually expanded" state.
+    private var collapsedReasoningItemIds: Set<String> = []
+    /// 会话切换会重用同一个 controller，而不同 runtime 的合成 item ID
+    /// 都可能从 `ai-1` 开始。用 viewport identity 识别切换并清空 disclosure
+    /// 状态，避免上一个会话的展开/收起选择串到下一个会话。
+    private var displayedConversationViewportIdentity: String?
 
     // MARK: Views
 
@@ -76,6 +125,12 @@ final class ConversationViewController: NSViewController {
     private let tableView = NSTableView()
     private lazy var inputBar = InputBarView(model: model)
     private lazy var environmentPanel = CodexEnvironmentPanelView(model: model)
+    private let contentRegionGuide = NSLayoutGuide()
+    private let contentColumnGuide = NSLayoutGuide()
+    private var contentTrailingWithoutInspector: NSLayoutConstraint?
+    private var contentTrailingWithInspector: NSLayoutConstraint?
+    private var environmentPanelConstraints: [NSLayoutConstraint] = []
+    private var isEnvironmentPanelPresented: Bool?
     private let errorCell = ErrorCellView()
     private let warningCell = WarningCellView()
     private let approvalCard = ApprovalCardView()
@@ -121,50 +176,79 @@ final class ConversationViewController: NSViewController {
         configureScrollView()
         configureFooter()
 
+        root.addLayoutGuide(contentRegionGuide)
+        root.addLayoutGuide(contentColumnGuide)
         root.addSubview(scrollView)
-        root.addSubview(environmentPanel)
         root.addSubview(footerStack)
         root.addSubview(inputBar)
 
-        // Fill the available pane width (capped below at ≤ 900 / ≤ 860) rather
-        // than *demanding* a fixed 900/860. A fixed `equalToConstant` makes the
-        // content view's Auto Layout `fittingSize` want that exact width; since
-        // the window is created via `NSWindow(contentViewController:)`, the
-        // window resizes to satisfy that fitting size — so opening a session
-        // (empty pane → conversation pane) grew the window from ~920 to ~1620pt.
-        // Expanding relative to the pane width keeps the transcript at its 900pt
-        // cap on wide windows while letting `fittingSize` stay small, so the
-        // window no longer jumps. (systematic-debugging: window↔fitting tie.)
-        let preferredTranscriptWidth = scrollView.widthAnchor.constraint(equalTo: root.widthAnchor)
-        preferredTranscriptWidth.priority = .defaultHigh
-        let preferredInputWidth = inputBar.widthAnchor.constraint(equalTo: root.widthAnchor)
-        preferredInputWidth.priority = .defaultHigh
+        scrollView.setAccessibilityIdentifier("conversation-transcript")
+        footerStack.setAccessibilityIdentifier("conversation-footer")
+        inputBar.setAccessibilityIdentifier("conversation-input-bar")
+
+        // `.wb-col` 与 `.wb-composer` 共用同一个内容列：最大 620pt，在可用区域内
+        // 居中。`width == region.width` 只有 defaultHigh，620pt 上限不会反向撑大
+        // contentViewController 的 fittingSize，保留“打开会话不放大窗口”的不变量。
+        let preferredColumnWidth = contentColumnGuide.widthAnchor.constraint(
+            equalTo: contentRegionGuide.widthAnchor
+        )
+        preferredColumnWidth.priority = .defaultHigh
+
+        let withoutInspector = contentRegionGuide.trailingAnchor.constraint(
+            equalTo: root.trailingAnchor,
+            constant: -ConversationLayoutMetrics.horizontalInset
+        )
+        let withInspector = contentRegionGuide.trailingAnchor.constraint(
+            equalTo: root.trailingAnchor,
+            constant: -ConversationLayoutMetrics.inspectorReserve
+        )
+        contentTrailingWithoutInspector = withoutInspector
+        contentTrailingWithInspector = withInspector
+
+        environmentPanelConstraints = [
+            environmentPanel.topAnchor.constraint(
+                equalTo: root.topAnchor,
+                constant: ConversationLayoutMetrics.environmentTop
+            ),
+            environmentPanel.trailingAnchor.constraint(
+                equalTo: root.trailingAnchor,
+                constant: -ConversationLayoutMetrics.environmentTrailing
+            ),
+        ]
 
         NSLayoutConstraint.activate([
+            contentRegionGuide.leadingAnchor.constraint(
+                equalTo: root.leadingAnchor,
+                constant: ConversationLayoutMetrics.horizontalInset
+            ),
+
+            contentColumnGuide.centerXAnchor.constraint(equalTo: contentRegionGuide.centerXAnchor),
+            contentColumnGuide.leadingAnchor.constraint(greaterThanOrEqualTo: contentRegionGuide.leadingAnchor),
+            contentColumnGuide.trailingAnchor.constraint(lessThanOrEqualTo: contentRegionGuide.trailingAnchor),
+            contentColumnGuide.widthAnchor.constraint(greaterThanOrEqualToConstant: 1),
+            contentColumnGuide.widthAnchor.constraint(
+                lessThanOrEqualToConstant: ConversationLayoutMetrics.contentMaxWidth
+            ),
+            preferredColumnWidth,
+
             scrollView.topAnchor.constraint(equalTo: root.topAnchor),
-            scrollView.centerXAnchor.constraint(equalTo: root.centerXAnchor, constant: -70),
-            preferredTranscriptWidth,
-            scrollView.widthAnchor.constraint(lessThanOrEqualToConstant: 900),
-            scrollView.leadingAnchor.constraint(greaterThanOrEqualTo: root.leadingAnchor, constant: 34),
-            scrollView.trailingAnchor.constraint(lessThanOrEqualTo: environmentPanel.leadingAnchor, constant: -24),
+            scrollView.leadingAnchor.constraint(equalTo: contentColumnGuide.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: contentColumnGuide.trailingAnchor),
 
             footerStack.topAnchor.constraint(equalTo: scrollView.bottomAnchor),
-            footerStack.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
-            footerStack.widthAnchor.constraint(equalTo: inputBar.widthAnchor),
+            footerStack.leadingAnchor.constraint(equalTo: contentColumnGuide.leadingAnchor),
+            footerStack.trailingAnchor.constraint(equalTo: contentColumnGuide.trailingAnchor),
 
             inputBar.topAnchor.constraint(equalTo: footerStack.bottomAnchor),
-            inputBar.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
-            preferredInputWidth,
-            inputBar.widthAnchor.constraint(lessThanOrEqualToConstant: 860),
-            inputBar.leadingAnchor.constraint(greaterThanOrEqualTo: root.leadingAnchor, constant: 34),
+            inputBar.leadingAnchor.constraint(equalTo: contentColumnGuide.leadingAnchor),
+            inputBar.trailingAnchor.constraint(equalTo: contentColumnGuide.trailingAnchor),
             inputBar.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
-
-            environmentPanel.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
-            environmentPanel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
         ])
 
         self.view = root
+        refreshEnvironmentPanelPresentation()
 
+        displayedConversationViewportIdentity = model.conversationViewportIdentity
         rebuildRows()
         bindModel()
         observeBoundsChanges()
@@ -182,10 +266,14 @@ final class ConversationViewController: NSViewController {
 
     override func viewDidLayout() {
         super.viewDidLayout()
+        // environmentInfo 有值也不能在窄窗强占 290pt；先按本轮真实宽度决定
+        // inspector 是否参与布局，再测量正文列宽。
+        refreshEnvironmentPanelPresentation()
         let width = columnWidth
         guard abs(width - lastLaidOutColumnWidth) > 0.5 else { return }
         lastLaidOutColumnWidth = width
         cache.invalidateAll()
+        refreshFooter()
         if !rows.isEmpty {
             tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<rows.count))
         }
@@ -264,26 +352,40 @@ final class ConversationViewController: NSViewController {
             _ = self.model.selectedItems
             _ = self.model.selectedPhase
             _ = self.model.shouldShowReasoningExpanded
+            _ = self.model.conversationViewportIdentity
             _ = self.model.scrollToLatestRequest
             _ = self.model.selectedActionRequest
             _ = self.model.selectedErrorMessage
             _ = self.model.selectedWarningMessage
-        _ = self.model.promptComposerOwner
-        _ = self.model.sendingPrompts
-        _ = self.model.isComposerAdmissionInFlight
-        _ = self.model.isConversationBootstrapAdmissionInFlight
-        _ = self.model.canRetryConversationStart
-        _ = self.model.canRetryPromptlessConversationStart
-        _ = self.model.queuedPrompts
-        _ = self.model.retryRequiredPromptDraft
-      }, onChange: { [weak self] in
+            _ = self.model.promptComposerOwner
+            _ = self.model.sendingPrompts
+            _ = self.model.isComposerAdmissionInFlight
+            _ = self.model.isConversationBootstrapAdmissionInFlight
+            _ = self.model.canRetryConversationStart
+            _ = self.model.canRetryPromptlessConversationStart
+            _ = self.model.queuedPrompts
+            _ = self.model.retryRequiredPromptDraft
+            _ = self.model.environmentInfo
+        }, onChange: { [weak self] in
             self?.modelDidChange()
         })
     }
 
     private func modelDidChange() {
+        refreshEnvironmentPanelPresentation()
+        let viewportChanged = displayedConversationViewportIdentity
+            != model.conversationViewportIdentity
         let previousExpansion = lastReasoningExpanded
         let previousSignatures = displayedRowSignatures
+        let previousConfigurationVersions = displayedRowConfigurationVersions
+        if viewportChanged {
+            displayedConversationViewportIdentity = model.conversationViewportIdentity
+            expandedItemIds.removeAll()
+            expandedToolGroupIds.removeAll()
+            knownToolGroupIds.removeAll()
+            collapsedReasoningItemIds.removeAll()
+            cache.invalidateAll()
+        }
         rebuildRows()
         // The reasoning rows auto-expand/collapse with the running phase; their
         // height changes when that flips, so drop their cached heights.
@@ -292,7 +394,12 @@ final class ConversationViewController: NSViewController {
             invalidateReasoningHeights()
         }
 
-        applyRowUpdate(previousSignatures: previousSignatures, reasoningFlipped: reasoningFlipped)
+        applyRowUpdate(
+            previousSignatures: previousSignatures,
+            previousConfigurationVersions: previousConfigurationVersions,
+            reasoningFlipped: reasoningFlipped,
+            forceFullReload: viewportChanged
+        )
 
         refreshFooter()
     inputBar.refreshPromptStatus()
@@ -320,9 +427,19 @@ final class ConversationViewController: NSViewController {
     ///   and selection (C2) is protected by the streaming-view unchanged guards,
     ///   so the reload no longer destroys user state.
     private func applyRowUpdate(
-        previousSignatures: [(id: String, version: Int)],
-        reasoningFlipped: Bool
+        previousSignatures: [(id: String, version: ConversationRowContentVersion)],
+        previousConfigurationVersions: [Int],
+        reasoningFlipped: Bool,
+        forceFullReload: Bool = false
     ) {
+        if forceFullReload {
+            // 即使新 viewport 为空也必须 reload，否则旧会话的可见 cell 会残留。
+            tableView.reloadData()
+            if !rows.isEmpty {
+                tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<rows.count))
+            }
+            return
+        }
         let diff = ConversationRowsDiff.decide(
             previous: previousSignatures,
             next: displayedRowSignatures
@@ -330,6 +447,15 @@ final class ConversationViewController: NSViewController {
         switch diff {
         case .sameRows(let changedIndexes):
             var heightIndexes = IndexSet(changedIndexes)
+            var reloadIndexes = IndexSet(
+                rows.indices.filter { index in
+                    guard previousConfigurationVersions.indices.contains(index),
+                          displayedRowConfigurationVersions.indices.contains(index)
+                    else { return true }
+                    return previousConfigurationVersions[index]
+                        != displayedRowConfigurationVersions[index]
+                }
+            )
             if reasoningFlipped {
                 // The reasoning rows toggle their visible body with the running
                 // phase; reload just those so `configure` re-applies the
@@ -339,18 +465,25 @@ final class ConversationViewController: NSViewController {
                         .filter { $0.element.item.kind == "reasoning" }
                         .map(\.offset)
                 )
-                if !reasoningIndexes.isEmpty {
-                    tableView.reloadData(
-                        forRowIndexes: reasoningIndexes,
-                        columnIndexes: IndexSet(integer: 0)
-                    )
-                    heightIndexes.formUnion(reasoningIndexes)
-                }
+                reloadIndexes.formUnion(reasoningIndexes)
+            }
+            if !reloadIndexes.isEmpty {
+                tableView.reloadData(
+                    forRowIndexes: reloadIndexes,
+                    columnIndexes: IndexSet(integer: 0)
+                )
+                heightIndexes.formUnion(reloadIndexes)
             }
             if !heightIndexes.isEmpty {
+                // 每个流式版本只保留当前 row 的一个缓存项。否则逐 token
+                // 版本会永久堆积；结构化 key 还可能持有展开 payload 的 String。
+                for index in heightIndexes where rows.indices.contains(index) {
+                    cache.invalidate(rowId: rows[index].id)
+                }
                 tableView.noteHeightOfRows(withIndexesChanged: heightIndexes)
             }
         case .structural:
+            cache.invalidateAll()
             tableView.reloadData()
             if !rows.isEmpty {
                 tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<rows.count))
@@ -368,8 +501,34 @@ final class ConversationViewController: NSViewController {
 
     private func rebuildRows() {
         let turns = makeConversationTurns(from: model.selectedItems)
-        rows = ConversationDisplayRowBuilder.rows(from: turns)
+        var rebuilt = ConversationDisplayRowBuilder.rows(
+            from: turns,
+            toolGrouping: .consecutiveActivity,
+            expandedToolGroupIds: expandedToolGroupIds
+        )
+
+        // If an expanded singleton receives a second execution item and turns
+        // into a group, keep the user's open detail visible exactly once. A
+        // known group that the user collapsed stays collapsed on later flushes.
+        var inheritedExpansion = false
+        for group in rebuilt.compactMap(\.toolActivityGroup) {
+            if !knownToolGroupIds.contains(group.disclosureId),
+               group.activityItems.contains(where: { expandedItemIds.contains($0.id) }) {
+                inheritedExpansion = expandedToolGroupIds.insert(group.disclosureId).inserted
+                    || inheritedExpansion
+            }
+            knownToolGroupIds.insert(group.disclosureId)
+        }
+        if inheritedExpansion {
+            rebuilt = ConversationDisplayRowBuilder.rows(
+                from: turns,
+                toolGrouping: .consecutiveActivity,
+                expandedToolGroupIds: expandedToolGroupIds
+            )
+        }
+        rows = rebuilt
         displayedRowSignatures = rows.map { ($0.id, contentVersion(for: $0)) }
+        displayedRowConfigurationVersions = rows.map(configurationVersion(for:))
         lastReasoningExpanded = model.shouldShowReasoningExpanded
     }
 
@@ -400,7 +559,38 @@ final class ConversationViewController: NSViewController {
     }
 
     private var footerWidth: CGFloat {
-        max(view.bounds.width, 1)
+        max(footerStack.bounds.width, scrollView.bounds.width, 1)
+    }
+
+    /// `environmentInfo == nil` 表示真实应用没有可展示的数据源。即使有数据，
+    /// 窄窗不足以同时保留 252pt composer 和 inspector 时也会响应式折叠。
+    /// 折叠时把面板移出层级并停用 root 约束，让 260pt 面板不参与 fittingSize，
+    /// 同时把内容区域的 trailing reserve 从 290pt 恢复为普通 24pt。
+    private func refreshEnvironmentPanelPresentation() {
+        guard isViewLoaded else { return }
+        let shouldShow = model.environmentInfo != nil
+            && view.bounds.width >= ConversationLayoutMetrics.minimumInspectorPaneWidth
+        guard isEnvironmentPanelPresented != shouldShow else { return }
+        isEnvironmentPanelPresented = shouldShow
+
+        if shouldShow {
+            contentTrailingWithoutInspector?.isActive = false
+            contentTrailingWithInspector?.isActive = true
+            if environmentPanel.superview == nil {
+                view.addSubview(environmentPanel)
+                NSLayoutConstraint.activate(environmentPanelConstraints)
+            }
+            environmentPanel.isHidden = false
+        } else {
+            contentTrailingWithInspector?.isActive = false
+            contentTrailingWithoutInspector?.isActive = true
+            environmentPanel.isHidden = true
+            if environmentPanel.superview != nil {
+                NSLayoutConstraint.deactivate(environmentPanelConstraints)
+                environmentPanel.removeFromSuperview()
+            }
+        }
+        view.needsLayout = true
     }
 
     // MARK: Scroll spy
@@ -520,27 +710,89 @@ final class ConversationViewController: NSViewController {
         return max(tableView.bounds.width, scrollView.contentView.bounds.width, 1)
     }
 
-    /// A coarse content version for the height cache: changes whenever the
-    /// rendered text length changes (streaming append, replace, or disclosure
-    /// expansion state for reasoning). Combined with rowId × width, this keeps
-    /// the cache fresh without per-token invalidation.
-    private func contentVersion(for row: ConversationDisplayRow) -> Int {
+    /// Buffer revisions catch both growth and replacement (`abc` → `中`) while
+    /// the structured key keeps independent fields from cancelling each other.
+    private func contentVersion(for row: ConversationDisplayRow) -> ConversationRowContentVersion {
+        // The collapsed group header has a fixed one-line height; membership,
+        // summary and status changes belong to configurationVersion instead.
+        if row.toolActivityGroup != nil { return ConversationRowContentVersion() }
         let item = row.item
-        var version = item.textBuffer.text.utf8.count
-        version = version &* 31 &+ item.outputBuffer.text.utf8.count
-        version = version &* 31 &+ item.diffBuffer.text.utf8.count
-        version = version &* 31 &+ item.descriptionText.utf8.count
-        if row.item.kind == "reasoning", model.shouldShowReasoningExpanded {
-            version = version &* 31 &+ 1  // distinct key for the expanded body
+        let disclosureExpanded = (item.kind == "shell"
+            || item.kind == "fileEdit"
+            || item.kind == "toolCall")
+            && expandedItemIds.contains(item.id)
+        return ConversationRowContentVersion(
+            textRevision: item.textBuffer.revision,
+            outputRevision: item.outputBuffer.revision,
+            diffRevision: item.diffBuffer.revision,
+            descriptionText: item.descriptionText,
+            reasoningExpanded: item.kind == "reasoning" && isReasoningExpanded(item.id),
+            disclosureExpanded: disclosureExpanded,
+            expandedToolPayload: item.kind == "toolCall" && disclosureExpanded
+                ? [item.arguments, item.result, item.errorText]
+                : []
+        )
+    }
+
+    /// Version of values copied into static AppKit controls during `configure`.
+    /// Streaming buffers are deliberately excluded: their views are already
+    /// bound to the same buffer object and update without cell reconfiguration.
+    private func configurationVersion(for row: ConversationDisplayRow) -> Int {
+        let item = row.item
+        var hasher = Hasher()
+        hasher.combine(row.presentationKind)
+
+        if let group = row.toolActivityGroup {
+            hasher.combine(group.disclosureId)
+            hasher.combine(group.members.map(\.id))
+            hasher.combine(ToolActivityGroupPresentation.summary(group.members))
+            hasher.combine(ToolActivityGroupPresentation.statusSummary(group.members))
+            hasher.combine(ToolActivityGroupPresentation.semanticStatus(group.members))
+            return hasher.finalize()
         }
-        // A collapsible row that the user expanded measures taller (its body is
-        // included). Fold the expanded flag into the version so the height cache
-        // re-measures when it flips. (C1)
-        if (item.kind == "shell" || item.kind == "fileEdit" || item.kind == "toolCall"),
-           expandedItemIds.contains(item.id) {
-            version = version &* 31 &+ 2
+
+        switch item.kind {
+        case "shell":
+            hasher.combine(item.command)
+            hasher.combine(item.statusName)
+            hasher.combine(item.cwdText)
+            hasher.combine(item.durationMs)
+            hasher.combine(item.sourceName)
+            hasher.combine(item.processId)
+            hasher.combine(item.exitCode)
+            hasher.combine(!item.output.isEmpty)
+        case "fileEdit":
+            hasher.combine(item.path)
+            hasher.combine(item.statusName)
+            hasher.combine(!item.diff.isEmpty)
+        case "webSearch":
+            hasher.combine(item.action)
+            hasher.combine(item.query)
+            hasher.combine(item.actionQuery)
+            hasher.combine(item.queries)
+            hasher.combine(item.url)
+            hasher.combine(item.pattern)
+        case "toolCall":
+            hasher.combine(item.server)
+            hasher.combine(item.namespace)
+            hasher.combine(item.tool)
+            hasher.combine(item.action)
+            hasher.combine(item.activityKind)
+            hasher.combine(item.activityEvent)
+            hasher.combine(item.arguments)
+            hasher.combine(item.result)
+            hasher.combine(item.errorText)
+            hasher.combine(item.success)
+            hasher.combine(item.statusName)
+            hasher.combine(item.durationMs)
+            hasher.combine(item.resourceUri)
+        default:
+            // Message/reasoning/shell-output/diff bodies update through their
+            // bound buffers. Other static kinds keep the existing structural
+            // reload behavior and do not need per-flush reconfiguration here.
+            break
         }
-        return version
+        return hasher.finalize()
     }
 
     /// Row height = factory height, plus — for reasoning rows that are
@@ -549,16 +801,23 @@ final class ConversationViewController: NSViewController {
     /// which expands when `model.shouldShowReasoningExpanded` is true.
     private func computeHeight(for row: ConversationDisplayRow, width: CGFloat) -> CGFloat {
         var height = ConversationRowFactory.height(for: row, width: width)
-        if row.item.kind == "reasoning", model.shouldShowReasoningExpanded {
+        if row.item.kind == "reasoning", isReasoningExpanded(row.item.id) {
             height += reasoningExpandedBodyHeight(for: row, width: width)
         }
         // The factory counts only the collapsed disclosure header for shell /
         // fileEdit / toolCall rows; when the user has expanded one, add its body
         // (output / diff / JSON payload) so the row reserves room for it. (C1)
-        if expandedItemIds.contains(row.item.id) {
+        if row.toolActivityGroup == nil,
+           row.item.kind != "reasoning",
+           expandedItemIds.contains(row.item.id) {
             height += disclosureBodyHeight(for: row, width: width)
         }
         return height
+    }
+
+    private func isReasoningExpanded(_ itemId: String) -> Bool {
+        !collapsedReasoningItemIds.contains(itemId)
+            && (model.shouldShowReasoningExpanded || expandedItemIds.contains(itemId))
     }
 
     /// Height of an expanded shell-output / fileEdit-diff body, measured the
@@ -571,10 +830,10 @@ final class ConversationViewController: NSViewController {
         switch item.kind {
         case "shell":
             text = item.outputBuffer.text
-            font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+            font = ConversationRowMetrics.monoCalloutFont
         case "fileEdit":
             text = item.diffBuffer.text
-            font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            font = ConversationRowMetrics.monoCalloutFont
         case "toolCall":
             // 展开后显示美化 JSON（payloadLabel 用 monoCaptionFont，stack 间距 5）。
             let payload = ToolPresentation.toolPayload(item)
@@ -592,16 +851,21 @@ final class ConversationViewController: NSViewController {
         return 4 + measuredTextHeight(attributed, width: contentW)
     }
 
-    /// Height of the auto-expanded reasoning body (small secondary streaming
-    /// text), measured the same way the factory measures wrapped text. The
-    /// contentStack spacing (5) precedes the body.
+    /// Height of the expanded reasoning body, measured from the same markdown
+    /// attributed string rendered by `ReasoningCellView`.
     private func reasoningExpandedBodyHeight(for row: ConversationDisplayRow, width: CGFloat) -> CGFloat {
         let text = row.item.textBuffer.text
-        guard !text.isEmpty else { return 0 }
         let contentW = max(width - ConversationRowCellView.horizontalInset * 2, 1)
-        let font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-        let attributed = NSAttributedString(string: text, attributes: [.font: font])
-        return 5 + measuredTextHeight(attributed, width: contentW)
+        let attributed = MarkdownAttributedStringBuilder.attributedString(
+            from: text,
+            style: .reasoning
+        )
+        // Reasoning 的空正文 view 折叠为 0 高，但作为第二个 arranged view
+        // 仍保留设计系统的 4pt stack spacing；渲染出可见文字后再加正文高度。
+        let bodyHeight = attributed.length == 0
+            ? 0
+            : measuredTextHeight(attributed, width: contentW)
+        return DesignTokens.sp1 + bodyHeight
     }
 
     // MARK: Cell registration
@@ -636,6 +900,7 @@ extension ConversationViewController: NSTableViewDelegate {
             // Hand the cell the persisted disclosure store BEFORE configuring so
             // collapsible cells (shell / fileEdit) restore their expansion (C1).
             conversationCell.disclosureStore = self
+            conversationCell.applyTurnSpacing(for: displayRow)
             conversationCell.configure(row: displayRow, width: columnWidth, model: model)
         }
         return cell
@@ -664,15 +929,81 @@ extension ConversationViewController: NSTableViewDelegate {
 
 extension ConversationViewController: ConversationDisclosureStateStore {
     func isItemExpanded(_ itemId: String) -> Bool {
-        expandedItemIds.contains(itemId)
+        expandedItemIds.contains(itemId) || expandedToolGroupIds.contains(itemId)
+    }
+
+    func isItemCollapsed(_ itemId: String) -> Bool {
+        collapsedReasoningItemIds.contains(itemId)
     }
 
     /// Persist the toggle, then re-measure the affected row so the table opens /
     /// closes room for the disclosure body. The cell itself already showed /
     /// hid the body; this only updates the reserved height.
     func setItem(_ itemId: String, expanded: Bool) {
+        if let groupIndex = rows.firstIndex(where: {
+            $0.toolActivityGroup?.disclosureId == itemId
+        }), let group = rows[groupIndex].toolActivityGroup {
+            knownToolGroupIds.insert(itemId)
+            let changed = expanded
+                ? expandedToolGroupIds.insert(itemId).inserted
+                : expandedToolGroupIds.remove(itemId) != nil
+            guard changed else { return }
+
+            // Keep the table's existing row views and apply the exact member
+            // insertion/removal. A synchronous full `reloadData()` from inside
+            // the disclosure button action can leave recycled row layers at
+            // their pre-reload coordinates until a later structural refresh,
+            // which makes expanded history rows visibly overlap.
+            let memberIndexes = IndexSet(
+                integersIn: (groupIndex + 1)..<(groupIndex + 1 + group.members.count)
+            )
+            // Group toggle is a structural insert/remove path that bypasses
+            // `applyRowUpdate(.structural)`. 清空摘要和全部成员版本，避免
+            // 隐藏期间变化的展开 payload 旧 key 被长期保留。
+            cache.invalidateAll()
+            rebuildRows()
+
+            tableView.beginUpdates()
+            if expanded {
+                tableView.insertRows(at: memberIndexes, withAnimation: [])
+            } else {
+                tableView.removeRows(at: memberIndexes, withAnimation: [])
+            }
+            tableView.endUpdates()
+            tableView.reloadData(
+                forRowIndexes: IndexSet(integer: groupIndex),
+                columnIndexes: IndexSet(integer: 0)
+            )
+
+            var heightIndexes = IndexSet(integer: groupIndex)
+            if expanded { heightIndexes.formUnion(memberIndexes) }
+            tableView.noteHeightOfRows(withIndexesChanged: heightIndexes)
+            // AppKit can retain pre-insertion row origins even after updating
+            // the new heights (the row frames grow, while following rows keep
+            // their stale y). Reload after the structural delta so every row
+            // origin is rebuilt from the same height cache.
+            tableView.reloadData()
+            tableView.needsLayout = true
+            tableView.layoutSubtreeIfNeeded()
+            tableView.needsDisplay = true
+            tableView.displayIfNeeded()
+            recomputeTopVisibleTurn()
+            return
+        }
+
+        let isReasoning = rows.contains {
+            $0.item.id == itemId && $0.item.kind == "reasoning"
+        }
         let changed: Bool
-        if expanded {
+        if isReasoning, expanded {
+            let inserted = expandedItemIds.insert(itemId).inserted
+            let removed = collapsedReasoningItemIds.remove(itemId) != nil
+            changed = inserted || removed
+        } else if isReasoning {
+            let removed = expandedItemIds.remove(itemId) != nil
+            let inserted = collapsedReasoningItemIds.insert(itemId).inserted
+            changed = removed || inserted
+        } else if expanded {
             changed = expandedItemIds.insert(itemId).inserted
         } else {
             changed = expandedItemIds.remove(itemId) != nil
@@ -680,7 +1011,8 @@ extension ConversationViewController: ConversationDisclosureStateStore {
         guard changed else { return }
 
         var indexes = IndexSet()
-        for (offset, row) in rows.enumerated() where row.item.id == itemId {
+        for (offset, row) in rows.enumerated()
+        where row.toolActivityGroup == nil && row.item.id == itemId {
             cache.invalidate(rowId: row.id)
             // Keep the cached signature in sync so the next streaming flush sees
             // the new expanded version and does not force a redundant reload.

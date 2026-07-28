@@ -15,18 +15,18 @@ struct HistoryThreadRowPresentation: Equatable {
     let unreadEventCount: Int
 
     init(
-        threadId: String,
-        selectedThreadId: String?,
-        openingThreadId: String?,
-        hoveredThreadId: String?,
+        threadIdentity: HistoryThreadIdentity,
+        selectedThreadIdentity: HistoryThreadIdentity?,
+        openingThreadIdentity: HistoryThreadIdentity?,
+        hoveredThreadIdentity: HistoryThreadIdentity?,
         runtimePhase: SessionModel.Phase? = nil,
         unreadEventCount: Int = 0
     ) {
-        if openingThreadId == threadId {
+        if openingThreadIdentity == threadIdentity {
             visualState = .opening
-        } else if selectedThreadId == threadId {
+        } else if selectedThreadIdentity == threadIdentity {
             visualState = .selected
-        } else if hoveredThreadId == threadId {
+        } else if hoveredThreadIdentity == threadIdentity {
             visualState = .hovered
         } else {
             visualState = .idle

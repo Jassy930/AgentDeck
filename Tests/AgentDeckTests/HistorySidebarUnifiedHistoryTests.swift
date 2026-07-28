@@ -5,6 +5,27 @@ import AgentDeckCore
 
 @MainActor
 final class HistorySidebarUnifiedHistoryTests: XCTestCase {
+    func testHoverCoordinatorClearsPreviousRowWithoutMouseExited() {
+        let first = HistoryThreadRowView()
+        let second = HistoryThreadRowView()
+        let coordinator = HistoryThreadHoverCoordinator()
+
+        coordinator.update(row: first, isHovered: true)
+        XCTAssertTrue(first.isHovered)
+        XCTAssertFalse(second.isHovered)
+
+        // 滚动时旧 cell 可能收不到 mouseExited；新 cell 的 mouseEntered
+        // 仍必须原子地转移唯一 hover 所有权。
+        coordinator.update(row: second, isHovered: true)
+        XCTAssertFalse(first.isHovered)
+        XCTAssertTrue(second.isHovered)
+
+        // 延迟到达的旧 cell mouseExited 不能清掉当前 hover。
+        coordinator.update(row: first, isHovered: false)
+        XCTAssertFalse(first.isHovered)
+        XCTAssertTrue(second.isHovered)
+    }
+
     func testSidebarDoesNotExposeAgentKindSwitch() {
         let model = SessionModel()
         let vc = HistorySidebarViewController(model: model)
@@ -29,10 +50,10 @@ final class HistorySidebarUnifiedHistoryTests: XCTestCase {
             agentKind: .claudeCode
         )
         let presentation = HistoryThreadRowPresentation(
-            threadId: thread.id,
-            selectedThreadId: nil,
-            openingThreadId: nil,
-            hoveredThreadId: nil,
+            threadIdentity: HistoryThreadIdentity(thread),
+            selectedThreadIdentity: nil,
+            openingThreadIdentity: nil,
+            hoveredThreadIdentity: nil,
             runtimePhase: nil
         )
 
@@ -53,6 +74,35 @@ final class HistorySidebarUnifiedHistoryTests: XCTestCase {
         XCTAssertFalse(visibleText.contains("Codex"))
         XCTAssertFalse(visibleText.contains("Claude Code"))
         XCTAssertFalse(visibleText.contains("claude_code"))
+
+        XCTAssertTrue(row.toolTip?.contains(thread.displayTitle) == true)
+        XCTAssertEqual(row.accessibilityLabel(), thread.displayTitle)
+        XCTAssertTrue((row.accessibilityValue() as? String)?.contains(thread.status) == true)
+    }
+
+    func testSameRawThreadIdDoesNotShareSelectionOpeningOrRuntimePhaseAcrossAgents() {
+        let codexIdentity = HistoryThreadIdentity(agentKind: .codex, conversationID: "shared")
+        let claudeIdentity = HistoryThreadIdentity(agentKind: .claudeCode, conversationID: "shared")
+
+        let codex = HistoryThreadRowPresentation(
+            threadIdentity: codexIdentity,
+            selectedThreadIdentity: claudeIdentity,
+            openingThreadIdentity: codexIdentity,
+            hoveredThreadIdentity: nil,
+            runtimePhase: .running
+        )
+        let claude = HistoryThreadRowPresentation(
+            threadIdentity: claudeIdentity,
+            selectedThreadIdentity: claudeIdentity,
+            openingThreadIdentity: codexIdentity,
+            hoveredThreadIdentity: nil,
+            runtimePhase: .ready
+        )
+
+        XCTAssertEqual(codex.visualState, .opening)
+        XCTAssertEqual(codex.runtimePhase, .running)
+        XCTAssertEqual(claude.visualState, .selected)
+        XCTAssertEqual(claude.runtimePhase, .ready)
     }
 
     private static func allViews(_ root: NSView) -> [NSView] {

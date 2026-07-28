@@ -8,11 +8,15 @@
         {
           "path": "AgentDeck Design System.html",
           "createdAt": "2026-07-01T14:33:15.230Z",
-          "status": "needs-review"
+          "status": "needs-review",
+          "viewport": {
+            "width": 1280,
+            "height": 820
+          }
         }
       ]
     }
   },
   "createdAt": "2026-07-01T14:33:15.230Z",
-  "updatedAt": "2026-07-01T14:33:15.230Z"
+  "updatedAt": "2026-07-22T10:23:51Z"
 }

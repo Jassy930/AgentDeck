@@ -38,6 +38,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+use super::is_collaboration_tool_name;
 use agentdeck_protocol::runtime::ConversationConfiguration;
 use agentdeck_protocol::{
     AgentItem, AgentItemMeta, AgentKind, DiffFile, DiffStatus, HistoryListItem,
@@ -1471,7 +1472,7 @@ pub fn parse_session_jsonl(
                             let text = extract_tool_result_text(block);
                             if let Some((name, input)) = in_flight.remove(id) {
                                 current.push(tool_result_to_agent_item(
-                                    &name, &input, is_error, &text,
+                                    id, &name, &input, is_error, &text,
                                 ));
                             } else {
                                 current.push(AgentItem::Raw {
@@ -1535,7 +1536,7 @@ pub fn parse_session_jsonl(
                             ) {
                                 let input = block.get("input").cloned().unwrap_or(Value::Null);
                                 in_flight.insert(id.to_string(), (name.to_string(), input.clone()));
-                                current.push(tool_use_to_agent_item(name, &input));
+                                current.push(tool_use_to_agent_item(id, name, &input));
                             }
                         }
                         _ => {}
@@ -1560,7 +1561,7 @@ pub fn parse_session_jsonl(
 /// Map a `tool_use` block onto an `AgentItem` (Shell / Diff /
 /// ToolCall depending on the tool name). Mirrors translator logic but
 /// without mutable state.
-fn tool_use_to_agent_item(name: &str, input: &Value) -> AgentItem {
+fn tool_use_to_agent_item(tool_use_id: &str, name: &str, input: &Value) -> AgentItem {
     match name {
         "Bash" => {
             let command = input
@@ -1573,25 +1574,31 @@ fn tool_use_to_agent_item(name: &str, input: &Value) -> AgentItem {
                 status: ShellStatus::Running,
                 exit_code: None,
                 duration_ms: None,
-                meta: AgentItemMeta::default(),
+                meta: tool_meta(tool_use_id, name),
             }
         }
         "Edit" | "Write" | "MultiEdit" => AgentItem::Diff {
             files: diff_files_from_tool_use(name, input),
-            meta: AgentItemMeta::default(),
+            meta: tool_meta(tool_use_id, name),
         },
-        _ => AgentItem::ToolCall {
-            name: name.to_string(),
-            args: input.clone(),
-            result: None,
-            meta: AgentItemMeta::default(),
-        },
+        _ => {
+            let mut meta = tool_meta(tool_use_id, name);
+            meta.vendor_extensions
+                .insert("status".into(), serde_json::json!("inProgress"));
+            AgentItem::ToolCall {
+                name: name.to_string(),
+                args: input.clone(),
+                result: None,
+                meta,
+            }
+        }
     }
 }
 
 /// Build a finalized AgentItem from a tool_result given the matching
 /// original tool_use's name + input.
 fn tool_result_to_agent_item(
+    tool_use_id: &str,
     name: &str,
     input: &Value,
     is_error: bool,
@@ -1614,20 +1621,42 @@ fn tool_result_to_agent_item(
                 // Native JSONL 的 tool_result 只携带 is_error；没有权威进程退出码。
                 exit_code: None,
                 duration_ms: None,
-                meta: AgentItemMeta::default(),
+                meta: tool_meta(tool_use_id, name),
             }
         }
         "Edit" | "Write" | "MultiEdit" => AgentItem::Diff {
             files: diff_files_from_tool_use(name, input),
-            meta: AgentItemMeta::default(),
+            meta: tool_meta(tool_use_id, name),
         },
-        _ => AgentItem::ToolCall {
-            name: name.to_string(),
-            args: input.clone(),
-            result: Some(serde_json::json!(result_text)),
-            meta: AgentItemMeta::default(),
-        },
+        _ => {
+            let mut meta = tool_meta(tool_use_id, name);
+            meta.vendor_extensions.insert(
+                "status".into(),
+                serde_json::json!(if is_error { "failed" } else { "completed" }),
+            );
+            if is_error {
+                meta.vendor_extensions
+                    .insert("isError".into(), serde_json::json!(true));
+            }
+            AgentItem::ToolCall {
+                name: name.to_string(),
+                args: input.clone(),
+                result: Some(serde_json::json!(result_text)),
+                meta,
+            }
+        }
     }
+}
+
+fn tool_meta(tool_use_id: &str, tool_name: &str) -> AgentItemMeta {
+    let mut meta = AgentItemMeta::default();
+    meta.vendor_extensions
+        .insert("toolUseId".into(), serde_json::json!(tool_use_id));
+    if is_collaboration_tool_name(tool_name) {
+        meta.vendor_extensions
+            .insert("activityKind".into(), serde_json::json!("collaboration"));
+    }
+    meta
 }
 
 fn diff_files_from_tool_use(tool_name: &str, input: &Value) -> Vec<DiffFile> {
@@ -1871,10 +1900,14 @@ mod tests {
         assert!(matches!(items[0], AgentItem::UserMessage { .. }));
         match &items[1] {
             AgentItem::Shell {
-                command, status, ..
+                command,
+                status,
+                meta,
+                ..
             } => {
                 assert_eq!(command, "ls");
                 assert!(matches!(status, ShellStatus::Running));
+                assert_eq!(meta.vendor_extensions["toolUseId"], "t1");
             }
             other => panic!("expected Shell tool_use, got {other:?}"),
         }
@@ -1883,13 +1916,92 @@ mod tests {
                 command,
                 status,
                 exit_code,
+                meta,
                 ..
             } => {
                 assert_eq!(command, "ls");
                 assert!(matches!(status, ShellStatus::Completed));
                 assert_eq!(*exit_code, None);
+                assert_eq!(meta.vendor_extensions["toolUseId"], "t1");
             }
             other => panic!("expected Shell tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_session_jsonl_generic_tool_snapshots_share_tool_use_id() {
+        let content = r#"
+{"type":"user","message":{"role":"user","content":"read it"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"/tmp/a"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"done","is_error":false}]}}
+"#;
+        let resp = parse_session_jsonl(content, ThreadId("x".into())).unwrap();
+        let items = &resp.turns[0].items;
+        assert_eq!(items.len(), 3);
+
+        match &items[1] {
+            AgentItem::ToolCall { result, meta, .. } => {
+                assert!(result.is_none());
+                assert_eq!(meta.vendor_extensions["toolUseId"], "read-1");
+                assert_eq!(meta.vendor_extensions["status"], "inProgress");
+                assert!(!meta.vendor_extensions.contains_key("activityKind"));
+            }
+            other => panic!("expected in-progress ToolCall, got {other:?}"),
+        }
+        match &items[2] {
+            AgentItem::ToolCall { result, meta, .. } => {
+                assert_eq!(result, &Some(serde_json::json!("done")));
+                assert_eq!(meta.vendor_extensions["toolUseId"], "read-1");
+                assert_eq!(meta.vendor_extensions["status"], "completed");
+                assert!(!meta.vendor_extensions.contains_key("activityKind"));
+            }
+            other => panic!("expected completed ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_session_jsonl_collaboration_tool_keeps_neutral_marker() {
+        let content = r#"
+{"type":"user","message":{"role":"user","content":"delegate it"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"agent-1","name":"Agent","input":{"description":"review","subagent_type":"Explore","prompt":"inspect UI"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-1","content":"done","is_error":false}]}}
+"#;
+        let resp = parse_session_jsonl(content, ThreadId("x".into())).unwrap();
+        let items = &resp.turns[0].items;
+        assert_eq!(items.len(), 3);
+
+        for item in &items[1..] {
+            match item {
+                AgentItem::ToolCall { meta, .. } => {
+                    assert_eq!(meta.vendor_extensions["toolUseId"], "agent-1");
+                    assert_eq!(meta.vendor_extensions["activityKind"], "collaboration");
+                }
+                other => panic!("expected collaboration ToolCall, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn generic_tool_result_preserves_failure_metadata() {
+        let item = tool_result_to_agent_item(
+            "tool-use-1",
+            "Read",
+            &serde_json::json!({ "file_path": "/tmp/missing" }),
+            true,
+            "file not found",
+        );
+
+        match item {
+            AgentItem::ToolCall { result, meta, .. } => {
+                assert_eq!(result, Some(serde_json::json!("file not found")));
+                assert_eq!(meta.vendor_extensions["toolUseId"], "tool-use-1");
+                assert_eq!(
+                    meta.vendor_extensions["status"],
+                    serde_json::json!("failed")
+                );
+                assert_eq!(meta.vendor_extensions["isError"], serde_json::json!(true));
+            }
+            other => panic!("expected ToolCall failure, got {other:?}"),
         }
     }
 

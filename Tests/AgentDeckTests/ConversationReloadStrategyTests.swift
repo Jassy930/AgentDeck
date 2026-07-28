@@ -51,7 +51,8 @@ final class ConversationReloadStrategyTests: XCTestCase {
     }
 
     func testEmptyToEmptyIsSameRows() {
-        let diff = ConversationRowsDiff.decide(previous: [], next: [])
+        let empty: [(id: String, version: Int)] = []
+        let diff = ConversationRowsDiff.decide(previous: empty, next: empty)
         XCTAssertEqual(diff, .sameRows(changedIndexes: []))
     }
 }

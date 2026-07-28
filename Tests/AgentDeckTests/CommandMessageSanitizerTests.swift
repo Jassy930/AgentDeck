@@ -21,6 +21,12 @@ final class CommandMessageSanitizerTests: XCTestCase {
         XCTAssertNil(CommandMessageSanitizer.sanitize(userText: raw))
     }
 
+    func testLocalCommandStdoutStderrBlocksAreDropped() {
+        let raw = "<local-command-stdout>Set model to \u{1B}[1mFable 5\u{1B}[22m</local-command-stdout>"
+            + "<local-command-stderr>warning</local-command-stderr>"
+        XCTAssertNil(CommandMessageSanitizer.sanitize(userText: raw))
+    }
+
     // MARK: 真实消息保留
 
     func testPlainUserMessageIsUnchanged() {
@@ -48,10 +54,12 @@ final class CommandMessageSanitizerTests: XCTestCase {
                    text: "<local-command-caveat>Caveat…</local-command-caveat>"),
             UIItem(id: "c2", lifecycle: "completed", kind: "user",
                    text: "<command-name>/clear</command-name><command-message>clear</command-message><command-args></command-args>"),
+            UIItem(id: "c3", lifecycle: "completed", kind: "user",
+                   text: "<local-command-stdout>Set model to Fable 5</local-command-stdout>"),
             UIItem(id: "u1", lifecycle: "completed", kind: "user", text: "真实问题：帮我收录资料"),
             UIItem(id: "m1", lifecycle: "completed", kind: "message", text: "好的，我先建任务清单。"),
         ])
-        XCTAssertEqual(turns.count, 1, "两条命令噪声轮次应被丢弃，仅剩真实轮次")
+        XCTAssertEqual(turns.count, 1, "三条命令噪声轮次应被丢弃，仅剩真实轮次")
         XCTAssertEqual(turns.first?.user?.id, "u1")
         XCTAssertEqual(turns.first?.user?.text, "真实问题：帮我收录资料")
         XCTAssertEqual(turns.first?.assistantItems.map(\.id), ["m1"])

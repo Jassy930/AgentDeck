@@ -14,7 +14,7 @@ enum PreviewBootstrap {
   /// Preview 也显式走 registry 的 fixture scope；底层 concrete source 即使拥有
   /// local administration 实现，fixture handle 仍不会暴露这些 capability。
   @MainActor
-  static func makeComposition() async throws -> PreviewAppSessionSourceComposition {
+  static func makeComposition() throws -> PreviewAppSessionSourceComposition {
     let binding = SessionModel.makeFixtureBinding(
       runtimeWire: PreviewRuntimeWireSession(),
       machineID: "preview-fixture"
@@ -39,20 +39,18 @@ enum PreviewBootstrap {
       ),
       remoteFactory: { _ in throw PreviewCompositionError.remoteScopeUnavailable }
     )
-    try await registry.registerFixture(
-      SessionSourceRegistration(
-        scope: .fixture(id: "preview"),
-        source: binding.source,
-        capabilities: SessionSourceCapabilities(),
-        lifecycle: binding.source
-      )
+    let fixtureRegistration = try SessionSourceRegistration(
+      scope: .fixture(id: "preview"),
+      source: binding.source,
+      capabilities: SessionSourceCapabilities(),
+      lifecycle: binding.source
     )
     let selectedMachineScope = SelectedMachineScopeGenerationOwner(registry: registry)
-    _ = try await selectedMachineScope.select(.fixture(id: "preview"))
     return PreviewAppSessionSourceComposition(
       model: binding.model,
       registry: registry,
-      selectedMachineScope: selectedMachineScope
+      selectedMachineScope: selectedMachineScope,
+      fixtureRegistration: fixtureRegistration
     )
   }
 }
@@ -66,15 +64,34 @@ final class PreviewAppSessionSourceComposition: AppSessionSourceCompositionOwner
   let model: SessionModel
   let registry: SessionSourceRegistry
   let selectedMachineScope: SelectedMachineScopeGenerationOwner
+  private let fixtureRegistration: SessionSourceRegistration?
+  private var didRegisterFixture = false
+  private var isPrepared = false
 
   init(
     model: SessionModel,
     registry: SessionSourceRegistry,
-    selectedMachineScope: SelectedMachineScopeGenerationOwner
+    selectedMachineScope: SelectedMachineScopeGenerationOwner,
+    fixtureRegistration: SessionSourceRegistration? = nil
   ) {
     self.model = model
     self.registry = registry
     self.selectedMachineScope = selectedMachineScope
+    self.fixtureRegistration = fixtureRegistration
+  }
+
+  func prepare() async throws {
+    guard !isPrepared else { return }
+    guard let fixtureRegistration else {
+      isPrepared = true
+      return
+    }
+    if !didRegisterFixture {
+      try await registry.registerFixture(fixtureRegistration)
+      didRegisterFixture = true
+    }
+    _ = try await selectedMachineScope.select(.fixture(id: "preview"))
+    isPrepared = true
   }
 
   func shutdown() async {

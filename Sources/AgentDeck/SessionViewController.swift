@@ -1,6 +1,131 @@
 import AppKit
 import AgentDeckCore
 
+private enum SidebarLayout {
+    static let initialWidth: CGFloat = 216
+    static let minimumWidth: CGFloat = 200
+    static let maximumWidth: CGFloat = 280
+}
+
+/// `fullSizeContentView` 会让内容树一直铺到窗口 frame 内侧。最右 8pt 由根视图
+/// 自己作为 resize responder 接管，避免把事件交回 AppKit 私有 frame view 后
+/// 在空态、会话态或回合轨道上丢失拖拽序列；`AgentDeckWindow.sendEvent(_:)`
+/// 继续覆盖其内侧命中带，作为窗口层兜底。
+final class WindowResizeAwareRootView: NSView {
+    private var trailingResizeOrigin: (frame: NSRect, pointerX: CGFloat)?
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard bounds.contains(point) else { return nil }
+        if trailingResizeRect.contains(point) {
+            return self
+        }
+        return super.hitTest(point)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if handleTrailingResizeEvent(
+            type: event.type,
+            locationInView: convert(event.locationInWindow, from: nil),
+            pointerX: resizePointerX(for: event)
+        ) {
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        if handleTrailingResizeEvent(
+            type: event.type,
+            locationInView: convert(event.locationInWindow, from: nil),
+            pointerX: resizePointerX(for: event)
+        ) {
+            return
+        }
+        super.mouseDragged(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if handleTrailingResizeEvent(
+            type: event.type,
+            locationInView: convert(event.locationInWindow, from: nil),
+            pointerX: resizePointerX(for: event)
+        ) {
+            return
+        }
+        super.mouseUp(with: event)
+    }
+
+    @discardableResult
+    func handleTrailingResizeEvent(
+        type: NSEvent.EventType,
+        locationInView: NSPoint,
+        pointerX: CGFloat
+    ) -> Bool {
+        switch type {
+        case .leftMouseDown:
+            guard trailingResizeRect.contains(locationInView),
+                  let window,
+                  window.styleMask.contains(.resizable) else {
+                return false
+            }
+            trailingResizeOrigin = (window.frame, pointerX)
+            return true
+
+        case .leftMouseDragged:
+            guard let origin = trailingResizeOrigin, let window else { return false }
+            let nextFrame = AgentDeckWindow.resizedFrame(
+                from: origin.frame,
+                deltaX: pointerX - origin.pointerX,
+                minimumWidth: window.minSize.width,
+                maximumWidth: window.maxSize.width
+            )
+            window.setFrame(nextFrame, display: true)
+            return true
+
+        case .leftMouseUp:
+            guard trailingResizeOrigin != nil else { return false }
+            trailingResizeOrigin = nil
+            return true
+
+        default:
+            return false
+        }
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(trailingResizeCursorRect, cursor: .resizeLeftRight)
+    }
+
+    private var trailingResizeRect: NSRect {
+        NSRect(
+            x: max(bounds.minX, bounds.maxX - TurnJumpRailLayout.windowResizeGutter),
+            y: bounds.minY,
+            width: min(bounds.width, TurnJumpRailLayout.windowResizeGutter),
+            height: bounds.height
+        )
+    }
+
+    private var trailingResizeCursorRect: NSRect {
+        NSRect(
+            x: max(bounds.minX, bounds.maxX - AgentDeckWindow.trailingResizeCaptureWidth),
+            y: bounds.minY,
+            width: min(bounds.width, AgentDeckWindow.trailingResizeCaptureWidth),
+            height: bounds.height
+        )
+    }
+
+    private func resizePointerX(for event: NSEvent) -> CGFloat {
+        AgentDeckWindow.resizePointerX(
+            eventScreenX: event.cgEvent?.location.x,
+            locationInWindowX: event.locationInWindow.x,
+            windowMinX: window?.frame.minX ?? 0
+        )
+    }
+}
+
 // MARK: - SessionViewController (Task 11)
 //
 // Top-level AppKit view controller that assembles all session sub-views into
@@ -12,14 +137,14 @@ import AgentDeckCore
 //   │  NSSplitView                                       │
 //   │  ┌──────────┬─────────────────────────────────┐   │
 //   │  │ History  │ Content (EmptyState OR           │   │
-//   │  │ Sidebar  │  ConversationVC + RailOverlay)   │   │
-//   │  │  ~260pt  │                                  │   │
+//   │  │ Sidebar  │  ConversationVC │ 44pt Rail)     │   │
+//   │  │  ~216pt  │                                  │   │
 //   │  └──────────┴─────────────────────────────────┘   │
 //   └────────────────────────────────────────────────────┘
 //
 // cwd == nil  → content = EmptyStateView
-// cwd != nil  → content = ConversationViewController
-//               with TurnJumpRailView overlaid on the trailing edge (~28pt wide)
+// cwd != nil  → content = ConversationViewController followed by a dedicated
+//               44pt TurnJumpRailView trailing column (never covering content)
 //
 // Wiring:
 //   conversationVC.onTopVisibleTurnChanged → rail.syncSelection(topVisibleTurnId:)
@@ -66,7 +191,7 @@ final class SessionViewController: NSViewController {
     private let contentContainer = NSView()
     private let contentBodyContainer = NSView()
 
-    /// Composite view that holds conversationVC.view + rail overlay.
+    /// Composite view that lays out conversationVC.view beside the rail.
     private let conversationComposite = NSView()
 
     // MARK: - Split view (retained for deferred initial-width application)
@@ -94,7 +219,7 @@ final class SessionViewController: NSViewController {
     // MARK: - View lifecycle
 
     override func loadView() {
-        let root = NSView()
+        let root = WindowResizeAwareRootView()
         root.translatesAutoresizingMaskIntoConstraints = false
         root.wantsLayer = true
         // 透明：让侧栏 .behindWindow 毛玻璃不被根视图实色遮挡（内容区自绘不透明底）。
@@ -112,22 +237,25 @@ final class SessionViewController: NSViewController {
         // 面板。设计系统要的是齐平满高的侧栏 + 一道从顶到底的竖分割线（dividerStyle=.thin），
         // 侧栏底色由 HistorySidebarViewController 自绘 sidebarBackground，无需材质。
         let sidebarItem = NSSplitViewItem(viewController: historySidebarVC)
-        // 设计系统 .workbench 侧栏列宽 232px；min/max 200–280 允许用户拖拽微调。
-        sidebarItem.minimumThickness = 200
-        sidebarItem.maximumThickness = 280
+        // 紧凑侧栏默认 216pt；min/max 200–280 允许用户拖拽微调。
+        sidebarItem.minimumThickness = SidebarLayout.minimumWidth
+        sidebarItem.maximumThickness = SidebarLayout.maximumWidth
         sidebarItem.preferredThicknessFraction = NSSplitViewItem.unspecifiedDimension
         // 不收起：原生窗口的最小内容宽度（~760，由内容区约束决定）够不着设计的 <760 隐藏断点，
-        // 自动收起实际不可达；且收起会引发标题压红绿灯。改为固定 232 + 可拖拽 + 内容随窗口伸缩。
+        // 自动收起实际不可达；且收起会引发标题压红绿灯。改为固定 216 + 可拖拽 + 内容随窗口伸缩。
         sidebarItem.canCollapse = false
 
-        let sidebarWidth = historySidebarVC.view.widthAnchor.constraint(equalToConstant: 232)
+        let sidebarWidth = historySidebarVC.view.widthAnchor.constraint(
+            equalToConstant: SidebarLayout.initialWidth
+        )
         sidebarWidth.priority = .required
         sidebarWidth.isActive = true
         sidebarWidthConstraint = sidebarWidth
         splitVC.sidebarWidthConstraint = sidebarWidth
 
         let contentItem = NSSplitViewItem(viewController: makeContentContainerVC())
-        contentItem.minimumThickness = 300
+        // 保留会话正文原有的 300pt 最小宽度，轨道使用额外的独立尾列。
+        contentItem.minimumThickness = 300 + TurnJumpRailLayout.width
 
         splitVC.addSplitViewItem(sidebarItem)
         splitVC.addSplitViewItem(contentItem)
@@ -162,10 +290,10 @@ final class SessionViewController: NSViewController {
     override func viewDidLayout() {
         super.viewDidLayout()
         guard let sv = splitVC?.splitView, sv.frame.width > 0 else { return }
-        // 首次布局设初始宽度 232（此时 split 已有真实 frame，setPosition 才生效）。
+        // 首次布局设初始宽度 216（此时 split 已有真实 frame，setPosition 才生效）。
         if !didApplyInitialSidebarWidth {
-            sv.setPosition(232, ofDividerAt: 0)
-            sidebarWidthConstraint?.constant = 232
+            sv.setPosition(SidebarLayout.initialWidth, ofDividerAt: 0)
+            sidebarWidthConstraint?.constant = SidebarLayout.initialWidth
             didApplyInitialSidebarWidth = true
         }
     }
@@ -224,7 +352,7 @@ final class SessionViewController: NSViewController {
         return vc
     }
 
-    // MARK: - Conversation composite (conversationVC.view + rail overlay)
+    // MARK: - Conversation composite (conversationVC.view + dedicated rail column)
 
     private func buildConversationComposite() {
         // Add conversationVC as a child so its view lifecycle is properly managed
@@ -235,14 +363,16 @@ final class SessionViewController: NSViewController {
         conversationComposite.translatesAutoresizingMaskIntoConstraints = false
         conversationComposite.addSubview(convView)
 
-        // Rail: trailing overlay, 28pt wide, full height
+        // Rail: dedicated 44pt trailing column, with 36pt navigation interaction
+        // and an 8pt native window-resize gutter at the outside edge. It must
+        // not overlay the composer, transcript, or environment panel.
         rail.translatesAutoresizingMaskIntoConstraints = false
         conversationComposite.addSubview(rail)
 
         NSLayoutConstraint.activate([
             convView.topAnchor.constraint(equalTo: conversationComposite.topAnchor),
             convView.leadingAnchor.constraint(equalTo: conversationComposite.leadingAnchor),
-            convView.trailingAnchor.constraint(equalTo: conversationComposite.trailingAnchor),
+            convView.trailingAnchor.constraint(equalTo: rail.leadingAnchor),
             convView.bottomAnchor.constraint(equalTo: conversationComposite.bottomAnchor),
 
             rail.topAnchor.constraint(equalTo: conversationComposite.topAnchor),
@@ -403,7 +533,10 @@ private final class SidebarWidthSplitViewController: NSSplitViewController {
         ofSubviewAt dividerIndex: Int
     ) -> CGFloat {
         guard dividerIndex == 0 else { return proposedPosition }
-        let width = min(max(proposedPosition, 200), 280)
+        let width = min(
+            max(proposedPosition, SidebarLayout.minimumWidth),
+            SidebarLayout.maximumWidth
+        )
         sidebarWidthConstraint?.constant = width
         return width
     }

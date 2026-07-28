@@ -66,7 +66,7 @@ func runDaemonOneShot(args daemonArgs: [String]) -> Int32 {
   guard let path = DaemonClient.locateDaemon() else {
     FileHandle.standardError.write(
       Data(
-        "AgentDeck FATAL: agentdeckd not found at target/{debug,release}/agentdeckd or PATH\n".utf8)
+        "AgentDeck FATAL: agentdeckd not found via AGENTDECK_DAEMON_PATH, app bundle, target/{debug,release}, or PATH\n".utf8)
     )
     return 1
   }
@@ -96,6 +96,39 @@ func runDaemonOneShot(args daemonArgs: [String]) -> Int32 {
   return process.terminationStatus
 }
 
+private final class BlockingAsyncResultBox<Value: Sendable>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: Value?
+
+  func store(_ value: Value) {
+    lock.lock()
+    self.value = value
+    lock.unlock()
+  }
+
+  func take() -> Value {
+    lock.lock()
+    defer { lock.unlock() }
+    return value!
+  }
+}
+
+/// Headless command 允许同步等待 async Runtime；GUI 入口本身必须保持同步，
+/// 否则在 async main task 内调用阻塞式 `NSApplication.run()` 会占住 MainActor，
+/// App 启动后创建的 MainActor operation 永远无法获得执行机会。
+func runBlockingAsync<Value: Sendable>(
+  _ operation: @escaping @Sendable () async -> Value
+) -> Value {
+  let result = BlockingAsyncResultBox<Value>()
+  let completed = DispatchSemaphore(value: 0)
+  Task.detached {
+    result.store(await operation())
+    completed.signal()
+  }
+  completed.wait()
+  return result.take()
+}
+
 enum RuntimeTestOnlyArgumentGuard {
   static func shouldReject(arguments: [String]) -> Bool {
     arguments.dropFirst().contains { argument in
@@ -118,7 +151,7 @@ enum RuntimeTestOnlyArgumentGuard {
 
 #if DEBUG
   if CommandLine.arguments.contains("--runtime-smoke-for-test") {
-    let execution = await RuntimeSmokeRunner().run()
+    let execution = runBlockingAsync { await RuntimeSmokeRunner().run() }
     if !execution.stdout.isEmpty {
       FileHandle.standardOutput.write(execution.stdout)
     }
@@ -153,18 +186,19 @@ do {
 if CommandLine.arguments.contains("--selfcheck") {
   #if DEBUG
     let selfcheckArguments = CommandLine.arguments
-    let runner = RuntimeSelfcheckRunner(wireFactory: {
-      if let wire = try RuntimeSmokeEnvironment.selfcheckWire(
-        arguments: selfcheckArguments
-      ) {
-        return wire
-      }
-      return OSAccountRuntimeWireSession()
-    })
+    let execution = runBlockingAsync {
+      await RuntimeSelfcheckRunner(wireFactory: {
+        if let wire = try RuntimeSmokeEnvironment.selfcheckWire(
+          arguments: selfcheckArguments
+        ) {
+          return wire
+        }
+        return OSAccountRuntimeWireSession()
+      }).run()
+    }
   #else
-    let runner = RuntimeSelfcheckRunner()
+    let execution = runBlockingAsync { await RuntimeSelfcheckRunner().run() }
   #endif
-  let execution = await runner.run()
   if !execution.stdout.isEmpty {
     FileHandle.standardOutput.write(execution.stdout)
   }
@@ -207,7 +241,7 @@ let app = NSApplication.shared
 let appComposition: any AppSessionSourceCompositionOwner
 do {
   if previewMode {
-    appComposition = try await PreviewBootstrap.makeComposition()
+    appComposition = try PreviewBootstrap.makeComposition()
   } else {
     appComposition = try AppSessionSourceComposition.production()
   }

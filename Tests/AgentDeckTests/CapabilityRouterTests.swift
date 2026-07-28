@@ -79,6 +79,27 @@ final class CapabilityRouterTests: XCTestCase {
         XCTAssertNotNil(AgentKindIcon.image(for: .codex))
         XCTAssertNotNil(AgentKindIcon.image(for: .claudeCode))
     }
+
+    func testAgentKindIconCachesDecodedImagesForHistoryRowReuse() throws {
+        let fullCodex = try XCTUnwrap(AgentKindIcon.image(for: .codex))
+        let fullCodexSize = fullCodex.size
+        let firstCodex = try XCTUnwrap(AgentKindIcon.compactImage(for: .codex))
+        let secondCodex = try XCTUnwrap(AgentKindIcon.compactImage(for: .codex))
+        let firstClaude = try XCTUnwrap(AgentKindIcon.compactImage(for: .claudeCode))
+        let secondClaude = try XCTUnwrap(AgentKindIcon.compactImage(for: .claudeCode))
+
+        XCTAssertTrue(
+            firstCodex === secondCodex,
+            "历史侧栏复用行时不应重复解析 Codex SVG 资源"
+        )
+        XCTAssertTrue(
+            firstClaude === secondClaude,
+            "历史侧栏复用行时不应重复解析 Claude Code SVG 资源"
+        )
+        XCTAssertFalse(fullCodex === firstCodex, "紧凑图不得修改共享原图尺寸")
+        XCTAssertEqual(fullCodex.size, fullCodexSize)
+        XCTAssertEqual(firstCodex.size, NSSize(width: 18, height: 18))
+    }
 }
 
 // MARK: - Capabilities stubs

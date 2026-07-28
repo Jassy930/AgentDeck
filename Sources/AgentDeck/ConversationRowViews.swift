@@ -39,7 +39,12 @@ import AgentDeckCore
 @MainActor
 protocol ConversationDisclosureStateStore: AnyObject {
     func isItemExpanded(_ itemId: String) -> Bool
+    func isItemCollapsed(_ itemId: String) -> Bool
     func setItem(_ itemId: String, expanded: Bool)
+}
+
+extension ConversationDisclosureStateStore {
+    func isItemCollapsed(_ itemId: String) -> Bool { false }
 }
 
 // MARK: - Shared metrics & helpers
@@ -47,17 +52,20 @@ protocol ConversationDisclosureStateStore: AnyObject {
 /// Layout constants shared by cells and the factory's height math. Centralised
 /// so the rendered height and the measured height never drift.
 enum ConversationRowMetrics {
-    /// Body / callout text (SwiftUI `.callout` ≈ systemFontSize - 1 ≈ 12).
-    static let calloutSize: CGFloat = NSFont.systemFontSize - 1
-    /// Caption text (SwiftUI `.caption`).
-    static let captionSize: CGFloat = NSFont.smallSystemFontSize
+    static let bodySize = DesignTokens.typeBody
+    static let calloutSize = DesignTokens.typeCallout
+    static let captionSize = DesignTokens.typeCaption
+    static let monoSize = DesignTokens.typeMono
+    static let itemVerticalPadding = DesignTokens.sp1
+    static let turnEndSpacing = DesignTokens.sp5
 
+    static var bodyFont: NSFont { ConversationTypography.bodyFont }
     static var calloutFont: NSFont { .systemFont(ofSize: calloutSize) }
     static var calloutMediumFont: NSFont { .systemFont(ofSize: calloutSize, weight: .medium) }
     static var captionFont: NSFont { .systemFont(ofSize: captionSize) }
     static var captionSemiboldFont: NSFont { .systemFont(ofSize: captionSize, weight: .semibold) }
-    static var monoCalloutFont: NSFont { .monospacedSystemFont(ofSize: calloutSize, weight: .regular) }
-    static var monoCalloutMediumFont: NSFont { .monospacedSystemFont(ofSize: calloutSize, weight: .medium) }
+    static var monoCalloutFont: NSFont { .monospacedSystemFont(ofSize: monoSize, weight: .regular) }
+    static var monoCalloutMediumFont: NSFont { .monospacedSystemFont(ofSize: monoSize, weight: .medium) }
     static var monoCaptionFont: NSFont { .monospacedSystemFont(ofSize: captionSize, weight: .regular) }
 
     /// Single-line height for a font (used by the factory's fixed-element math).
@@ -109,12 +117,13 @@ enum ConversationRowControls {
 /// `contentStack`.
 class ConversationRowCellView: NSTableCellView {
 
-    /// Horizontal inset applied to every row (SwiftUI stream `.padding(.leading, 20)`).
+    /// Transcript items and composer share one horizontal axis. Component-level
+    /// padding belongs inside the component (bubble/code block), not around every row.
     /// `nonisolated` so the factory's (MainActor) height math and any layout
     /// helper can read this pure constant without isolation noise.
-    nonisolated static let horizontalInset: CGFloat = 20
-    /// Default vertical padding for assistant tool rows (`.padding(.vertical, 10)`).
-    var verticalPadding: CGFloat { 10 }
+    nonisolated static let horizontalInset: CGFloat = 0
+    /// 设计系统 `.item` 的上下内距。
+    var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
 
     let contentStack: NSStackView = {
         let stack = NSStackView()
@@ -167,6 +176,15 @@ class ConversationRowCellView: NSTableCellView {
         bottomConstraint?.constant = verticalPadding
     }
 
+    /// Adds the design-system `.turn` rhythm only after the final visible row
+    /// in a turn. Reset both branches on reuse so a former last row cannot keep
+    /// stale bottom spacing after grouping expands or collapses.
+    func applyTurnSpacing(for row: ConversationDisplayRow) {
+        topConstraint?.constant = verticalPadding
+        bottomConstraint?.constant = verticalPadding
+            + (row.lastInTurn ? ConversationRowMetrics.turnEndSpacing : 0)
+    }
+
     /// Remove every arranged subview so a reused cell starts clean.
     func resetContent() {
         for view in contentStack.arrangedSubviews {
@@ -210,21 +228,32 @@ final class UserPromptCellView: ConversationRowCellView {
         applyVerticalPadding()
         bubble.translatesAutoresizingMaskIntoConstraints = false
         bubble.wantsLayer = true
-        bubble.layer?.cornerRadius = 7
-        bubble.layer?.backgroundColor = NSColor.quaternarySystemFill.cgColor
+        bubble.layer?.cornerRadius = DesignTokens.radiusMd
+        bubble.layer?.cornerCurve = .continuous
+        bubble.layer?.backgroundColor = DesignTokens.surface2.cgColor
+        bubble.layer?.borderWidth = 1
+        bubble.layer?.borderColor = DesignTokens.border.cgColor
 
         bodyLabel.translatesAutoresizingMaskIntoConstraints = false
         bubble.addSubview(bodyLabel)
         NSLayoutConstraint.activate([
             bodyLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
             bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
-            bodyLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 10),
-            bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -10),
+            bodyLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 11),
+            bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -11),
         ])
 
         contentStack.addArrangedSubview(bubble)
         bubble.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor).isActive = true
-        bubble.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor).isActive = true
+        bubble.trailingAnchor.constraint(lessThanOrEqualTo: contentStack.trailingAnchor).isActive = true
+        bubble.widthAnchor.constraint(
+            lessThanOrEqualTo: contentStack.widthAnchor,
+            multiplier: 0.82
+        ).isActive = true
+        contentStack.trailingAnchor.constraint(
+            equalTo: trailingAnchor,
+            constant: -ConversationRowCellView.horizontalInset
+        ).isActive = true
     }
 
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
@@ -233,10 +262,14 @@ final class UserPromptCellView: ConversationRowCellView {
         bodyLabel.preferredMaxLayoutWidth = UserPromptCellView.bodyWidth(forRowWidth: width)
     }
 
-    /// 气泡内 markdown 正文宽度：行宽减去流插入，再减去气泡水平内边距（14 + 14）。
+    /// 气泡内 markdown 正文最大宽度：正文轴的 82%，再减去水平内边距。
     /// 纯计算，`nonisolated` 供 factory 计算高度复用。
     nonisolated static func bodyWidth(forRowWidth width: CGFloat) -> CGFloat {
-        max(width - horizontalInset * 2 - 14 - 14, 1)
+        max(maximumBubbleWidth(forRowWidth: width) - 14 - 14, 1)
+    }
+
+    nonisolated static func maximumBubbleWidth(forRowWidth width: CGFloat) -> CGFloat {
+        max((width - horizontalInset * 2) * 0.82, 1)
     }
 }
 
@@ -250,7 +283,7 @@ final class UserPromptCellView: ConversationRowCellView {
 /// Height (factory) is measured from the SAME markdown attributed string, so
 /// measurement and rendering can never disagree.
 final class MessageCellView: ConversationRowCellView {
-    override var verticalPadding: CGFloat { 4 }
+    override var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
 
     private let streamingView = StreamingTextContainerView()
 
@@ -261,6 +294,13 @@ final class MessageCellView: ConversationRowCellView {
         contentStack.addArrangedSubview(streamingView)
         streamingView.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor).isActive = true
         streamingView.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor).isActive = true
+        // Streaming text has no horizontal intrinsic width. Keep the stack on
+        // the full transcript axis so Markdown does not collapse to 0pt in
+        // standalone previews or during an early table-layout pass.
+        contentStack.trailingAnchor.constraint(
+            equalTo: trailingAnchor,
+            constant: -ConversationRowCellView.horizontalInset
+        ).isActive = true
     }
 
     required init?(coder: NSCoder) { super.init(coder: coder) }
@@ -270,31 +310,66 @@ final class MessageCellView: ConversationRowCellView {
     }
 }
 
-// MARK: - Reasoning (collapsible, monospaced streaming)
+// MARK: - Reasoning (collapsible, markdown streaming)
 
 /// Ports `ReasoningRow`: a disclosure labelled "Reasoning", default-collapsed,
-/// auto-expanded while a turn is running. The body is small secondary-coloured
-/// streaming text.
+/// auto-expanded while a turn is running. The body uses the design-system
+/// reasoning typography and secondary colour while preserving inline markdown.
 final class ReasoningCellView: ConversationRowCellView {
-    override var verticalPadding: CGFloat { 8 }
+    override var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
 
-    private let disclosure = ConversationRowControls.disclosureButton(title: "Reasoning")
+    private let headerRow = NSStackView()
+    private let disclosure = ConversationRowControls.disclosureButton(title: "")
+    private let titleLabel = ConversationRowControls.label(
+        font: ConversationRowMetrics.monoCaptionFont,
+        color: DesignTokens.text3,
+        selectable: false
+    )
     private let streamingView = StreamingTextContainerView()
     private var bodyConstraints: [NSLayoutConstraint] = []
+    private var itemId = ""
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         applyVerticalPadding()
-        disclosure.title = "Reasoning"
-        disclosure.font = ConversationRowMetrics.calloutFont
+        contentStack.spacing = DesignTokens.sp1
+        headerRow.orientation = .horizontal
+        headerRow.alignment = .centerY
+        headerRow.spacing = 6
+        headerRow.translatesAutoresizingMaskIntoConstraints = false
+
+        titleLabel.stringValue = "思考过程"
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+        titleLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         disclosure.target = self
         disclosure.action = #selector(toggle)
+        disclosure.toolTip = "展开思考过程"
+        disclosure.setAccessibilityLabel("思考过程")
+        disclosure.setContentHuggingPriority(.required, for: .horizontal)
+        disclosure.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        headerRow.addArrangedSubview(disclosure)
+        headerRow.addArrangedSubview(titleLabel)
+        streamingView.collapsesWhenEmpty = true
         streamingView.translatesAutoresizingMaskIntoConstraints = false
-        contentStack.addArrangedSubview(disclosure)
+        contentStack.addArrangedSubview(headerRow)
         contentStack.addArrangedSubview(streamingView)
         bodyConstraints = [
+            // StreamingTextContainerView has no horizontal intrinsic size. The
+            // base cell only caps the stack's trailing edge, so without this
+            // exact edge the stack shrinks to the short disclosure header and
+            // renders reasoning as a narrow, word-wrapped column.
+            contentStack.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -ConversationRowCellView.horizontalInset
+            ),
+            headerRow.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor),
             streamingView.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor),
             streamingView.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor),
+            disclosure.widthAnchor.constraint(equalToConstant: 16),
+            disclosure.heightAnchor.constraint(equalToConstant: 16),
         ]
         NSLayoutConstraint.activate(bodyConstraints)
     }
@@ -302,23 +377,28 @@ final class ReasoningCellView: ConversationRowCellView {
     required init?(coder: NSCoder) { super.init(coder: coder) }
 
     @objc private func toggle() {
-        setExpanded(disclosure.state == .on)
+        let expanded = disclosure.state == .on
+        setExpanded(expanded)
+        disclosureStore?.setItem(itemId, expanded: expanded)
     }
 
     private func setExpanded(_ expanded: Bool) {
         disclosure.state = expanded ? .on : .off
+        disclosure.toolTip = expanded ? "收起思考过程" : "展开思考过程"
+        disclosure.setAccessibilityHelp(disclosure.toolTip)
         streamingView.isHidden = !expanded
     }
 
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
-        streamingView.bindBuffer(
-            to: row.item.textBuffer,
-            font: .systemFont(ofSize: NSFont.smallSystemFontSize),
-            color: DesignTokens.text2
-        )
+        itemId = row.item.id
+        streamingView.bindMarkdownBuffer(to: row.item.textBuffer, style: .reasoning)
         // Default-collapsed; auto-expand while the selected turn is running
         // (mirrors `model.shouldShowReasoningExpanded`).
-        setExpanded(model.shouldShowReasoningExpanded)
+        let explicitlyCollapsed = disclosureStore?.isItemCollapsed(itemId) ?? false
+        let expanded = !explicitlyCollapsed
+            && (model.shouldShowReasoningExpanded
+                || (disclosureStore?.isItemExpanded(itemId) ?? false))
+        setExpanded(expanded)
     }
 }
 
@@ -395,7 +475,7 @@ final class ShellCellView: ConversationRowCellView {
             disclosure.title = ToolPresentation.outputLabel(item.output)
             outputView.bindBuffer(
                 to: item.outputBuffer,
-                font: .monospacedSystemFont(ofSize: 13, weight: .regular),
+                font: ConversationRowMetrics.monoCalloutFont,
                 color: DesignTokens.text2
             )
         }
@@ -445,6 +525,14 @@ final class FileEditCellView: ConversationRowCellView {
         contentStack.addArrangedSubview(statusLabel)
         contentStack.addArrangedSubview(disclosure)
         contentStack.addArrangedSubview(diffView)
+        // A multiline NSTextField has no reliable horizontal intrinsic width.
+        // Without an exact trailing edge, a file row created by an inserted
+        // tool-group member can collapse to the width of "modified" and render
+        // an absolute path almost vertically until the next full table reload.
+        contentStack.trailingAnchor.constraint(
+            equalTo: trailingAnchor,
+            constant: -ConversationRowCellView.horizontalInset
+        ).isActive = true
         pin(pathLabel)
         pin(statusLabel)
         pin(diffView)
@@ -473,6 +561,7 @@ final class FileEditCellView: ConversationRowCellView {
         itemId = item.id
 
         pathLabel.stringValue = item.path
+        pathLabel.toolTip = item.path
         pathLabel.preferredMaxLayoutWidth = contentWidth(forRowWidth: width)
 
         statusLabel.stringValue = item.statusName
@@ -484,7 +573,7 @@ final class FileEditCellView: ConversationRowCellView {
             disclosure.title = ToolPresentation.outputLabel(item.diff, noun: "diff")
             diffView.bindBuffer(
                 to: item.diffBuffer,
-                font: .monospacedSystemFont(ofSize: 12, weight: .regular),
+                font: ConversationRowMetrics.monoCalloutFont,
                 color: DesignTokens.text
             )
         }
@@ -677,13 +766,174 @@ final class HookPromptCellView: ConversationRowCellView {
     }
 }
 
-/// Ports "toolCall" / MCP: header + tool name + metadata + payload labels.
+/// A semantic summary for a burst of execution records. The controller keeps
+/// the group as one virtualized row while collapsed and restores the original
+/// rows underneath it when expanded, so every tool's payload and intermediate
+/// reasoning remain available without nesting table cells inside one giant row.
+final class ToolActivityGroupCellView: ConversationRowCellView {
+    override var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
+
+    private let summaryRow = NSStackView()
+    private let disclosure = ConversationRowControls.disclosureButton(title: "")
+    private let icon = NSImageView()
+    private let summaryLabel = ConversationRowControls.label(
+        font: ConversationRowMetrics.calloutFont,
+        color: DesignTokens.text2,
+        selectable: false
+    )
+    private let spacer = NSView()
+    private let statusLabel = ConversationRowControls.label(
+        font: ConversationRowMetrics.monoCaptionFont,
+        color: DesignTokens.text3,
+        selectable: false
+    )
+
+    private var disclosureId = ""
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        applyVerticalPadding()
+
+        summaryRow.orientation = .horizontal
+        summaryRow.alignment = .centerY
+        summaryRow.spacing = 7
+        summaryRow.translatesAutoresizingMaskIntoConstraints = false
+
+        disclosure.target = self
+        disclosure.action = #selector(toggle)
+        disclosure.setContentHuggingPriority(.required, for: .horizontal)
+        disclosure.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.imageScaling = .scaleProportionallyDown
+        icon.contentTintColor = DesignTokens.text3
+        icon.setAccessibilityElement(false)
+
+        summaryLabel.maximumNumberOfLines = 1
+        summaryLabel.lineBreakMode = .byTruncatingTail
+        summaryLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        summaryLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        statusLabel.maximumNumberOfLines = 1
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.setContentHuggingPriority(.required, for: .horizontal)
+        statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        summaryRow.addArrangedSubview(icon)
+        summaryRow.addArrangedSubview(summaryLabel)
+        summaryRow.addArrangedSubview(statusLabel)
+        summaryRow.addArrangedSubview(spacer)
+        summaryRow.addArrangedSubview(disclosure)
+        contentStack.addArrangedSubview(summaryRow)
+
+        NSLayoutConstraint.activate([
+            contentStack.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -ConversationRowCellView.horizontalInset
+            ),
+            summaryRow.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor),
+            summaryRow.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor),
+            summaryRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 18),
+            disclosure.widthAnchor.constraint(equalToConstant: 16),
+            disclosure.heightAnchor.constraint(equalToConstant: 16),
+            icon.widthAnchor.constraint(equalToConstant: 14),
+            icon.heightAnchor.constraint(equalToConstant: 14),
+        ])
+    }
+
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+
+    @objc private func toggle() {
+        disclosureStore?.setItem(disclosureId, expanded: disclosure.state == .on)
+    }
+
+    override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
+        guard let group = row.toolActivityGroup else {
+            disclosureId = ""
+            summaryLabel.stringValue = "执行过程"
+            statusLabel.stringValue = ""
+            statusLabel.isHidden = true
+            disclosure.isHidden = true
+            return
+        }
+
+        disclosureId = group.disclosureId
+        let summary = ToolActivityGroupPresentation.summary(group.members)
+        let semanticStatus = ToolActivityGroupPresentation.semanticStatus(group.members)
+        let status = ToolActivityGroupPresentation.statusSummary(group.members)
+        let expanded = disclosureStore?.isItemExpanded(group.disclosureId) ?? false
+
+        disclosure.isHidden = false
+        disclosure.state = expanded ? .on : .off
+        disclosure.toolTip = expanded ? "收起执行过程详情" : "展开执行过程详情"
+        disclosure.setAccessibilityLabel(disclosure.toolTip)
+
+        icon.image = Self.icon(for: ToolActivityGroupPresentation.primaryCategory(in: group.members))
+        summaryLabel.stringValue = summary
+        summaryLabel.toolTip = summary
+        statusLabel.stringValue = status
+        statusLabel.textColor = Self.statusColor(for: semanticStatus)
+        statusLabel.isHidden = status.isEmpty
+
+        let state = expanded ? "已展开" : "已折叠"
+        setAccessibilityLabel([summary, status, state].filter { !$0.isEmpty }.joined(separator: "，"))
+    }
+
+    private static func icon(for category: ToolActivityCategory) -> NSImage? {
+        let symbol: String
+        switch category {
+        case .read: symbol = "book"
+        case .command: symbol = "terminal"
+        case .edit: symbol = "square.and.pencil"
+        case .search: symbol = "magnifyingglass"
+        case .image: symbol = "photo.on.rectangle"
+        case .collaboration: symbol = "person.2"
+        case .tool: symbol = "wrench"
+        case .mixed: symbol = "list.bullet.rectangle"
+        }
+        return NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            ?? NSImage(systemSymbolName: "wrench.and.screwdriver", accessibilityDescription: nil)
+    }
+
+    private static func statusColor(for status: String) -> NSColor {
+        switch status.lowercased() {
+        case "running", "starting", "pending": return DesignTokens.running
+        case "completed", "complete", "done", "success": return DesignTokens.text3
+        case "failed", "failure", "error": return DesignTokens.danger
+        default: return DesignTokens.text3
+        }
+    }
+}
+
+/// Compact tool-call row: one collapsed summary line (icon + tool + target +
+/// status + disclosure) and the full payload beneath it only when expanded.
+/// Keeping the tool name and target on the first line makes adjacent `Read`
+/// calls identifiable without spending four transcript rows per call.
 final class ToolCallCellView: ConversationRowCellView {
-    private let header = ToolHeaderView(systemImage: "wrench.and.screwdriver", title: "Tool call")
+    override var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
+
+    private let summaryRow = NSStackView()
+    private let icon = NSImageView()
     private let nameLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCalloutMediumFont, color: DesignTokens.text)
-    private let metadataLabel = ConversationRowControls.label(
-        font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text3)
+        font: ConversationRowMetrics.calloutMediumFont,
+        color: DesignTokens.text,
+        selectable: false
+    )
+    private let contextLabel = ConversationRowControls.label(
+        font: ConversationRowMetrics.monoCaptionFont,
+        color: DesignTokens.text2,
+        selectable: false
+    )
+    private let statusLabel = ConversationRowControls.label(
+        font: ConversationRowMetrics.monoCaptionFont,
+        color: DesignTokens.text2,
+        selectable: false
+    )
+    private let spacer = NSView()
     private let disclosure = ConversationRowControls.disclosureButton(title: "")
     private let payloadLabel = ConversationRowControls.label(
         font: ConversationRowMetrics.monoCaptionFont, color: DesignTokens.text2)
@@ -694,14 +944,68 @@ final class ToolCallCellView: ConversationRowCellView {
         super.init(frame: frameRect)
         applyVerticalPadding()
         contentStack.spacing = 5
+
+        summaryRow.orientation = .horizontal
+        summaryRow.alignment = .centerY
+        summaryRow.spacing = 7
+        summaryRow.translatesAutoresizingMaskIntoConstraints = false
+
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.imageScaling = .scaleProportionallyDown
+        icon.contentTintColor = DesignTokens.text3
+        icon.setAccessibilityElement(false)
+
+        for label in [nameLabel, contextLabel, statusLabel] {
+            label.maximumNumberOfLines = 1
+        }
+        nameLabel.lineBreakMode = .byTruncatingTail
+        nameLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        nameLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        contextLabel.lineBreakMode = .byTruncatingMiddle
+        contextLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        contextLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.setContentHuggingPriority(.required, for: .horizontal)
+        statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
         disclosure.target = self
         disclosure.action = #selector(toggle)
-        contentStack.addArrangedSubview(header)
-        contentStack.addArrangedSubview(nameLabel)
-        contentStack.addArrangedSubview(metadataLabel)
-        contentStack.addArrangedSubview(disclosure)
+        disclosure.title = ""
+        disclosure.toolTip = "Show tool details"
+        disclosure.setAccessibilityLabel("Show tool details")
+        disclosure.setContentHuggingPriority(.required, for: .horizontal)
+        disclosure.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        summaryRow.addArrangedSubview(icon)
+        summaryRow.addArrangedSubview(nameLabel)
+        summaryRow.addArrangedSubview(contextLabel)
+        summaryRow.addArrangedSubview(statusLabel)
+        summaryRow.addArrangedSubview(spacer)
+        summaryRow.addArrangedSubview(disclosure)
+
+        contentStack.addArrangedSubview(summaryRow)
         contentStack.addArrangedSubview(payloadLabel)
-        pin(nameLabel); pin(metadataLabel); pin(payloadLabel)
+        pin(summaryRow)
+        pin(payloadLabel)
+
+        NSLayoutConstraint.activate([
+            // The base cell intentionally permits natural-width stacks, but a
+            // compact header needs the full transcript width so its path can
+            // truncate only after status/disclosure have been reserved.
+            contentStack.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -ConversationRowCellView.horizontalInset
+            ),
+            icon.widthAnchor.constraint(equalToConstant: 14),
+            icon.heightAnchor.constraint(equalToConstant: 14),
+            summaryRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 18),
+            disclosure.widthAnchor.constraint(equalToConstant: 18),
+            disclosure.heightAnchor.constraint(equalToConstant: 18),
+        ])
     }
 
     required init?(coder: NSCoder) { super.init(coder: coder) }
@@ -721,29 +1025,74 @@ final class ToolCallCellView: ConversationRowCellView {
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
         let item = row.item
         itemId = item.id
-        header.update(
-            systemImage: "wrench.and.screwdriver",
-            title: item.toolKind == "mcp" ? "MCP tool" : "Tool call"
-        )
         let contentW = contentWidth(forRowWidth: width)
-        nameLabel.stringValue = ToolPresentation.toolName(item)
-        nameLabel.preferredMaxLayoutWidth = contentW
+        let toolName = ToolPresentation.toolName(item)
+        let context = ToolPresentation.toolContextSummary(item)
+        let semanticStatus = ToolPresentation.toolStatus(item)
+        let status = ToolPresentation.toolStatusSummary(item)
 
-        let metadata = ToolPresentation.toolMetadata(item)
-        metadataLabel.stringValue = metadata.joined(separator: " · ")
-        metadataLabel.isHidden = metadata.isEmpty
+        icon.image = Self.toolIcon(for: toolName, activityKind: item.activityKind)
+        nameLabel.stringValue = toolName
+        nameLabel.toolTip = toolName
+        contextLabel.stringValue = context
+        contextLabel.toolTip = context
+        contextLabel.isHidden = context.isEmpty
+        statusLabel.stringValue = status
+        statusLabel.textColor = Self.statusColor(for: semanticStatus)
+        statusLabel.isHidden = status.isEmpty
 
         // 参数/结果默认折叠：对话流保持干净，展开时才显示美化后的 JSON。
         let payload = ToolPresentation.toolPayload(item)
         let hasPayload = !payload.isEmpty
         disclosure.isHidden = !hasPayload
-        disclosure.title = ToolPresentation.outputLabel(payload, noun: "details")
+        disclosure.toolTip = hasPayload
+            ? ToolPresentation.outputLabel(payload, noun: "details")
+            : nil
         payloadLabel.stringValue = payload
         payloadLabel.preferredMaxLayoutWidth = contentW
 
         let expanded = hasPayload && (disclosureStore?.isItemExpanded(item.id) ?? false)
         disclosure.state = expanded ? .on : .off
         payloadLabel.isHidden = !expanded
+
+        let accessibilityParts = [toolName, context, status].filter { !$0.isEmpty }
+        setAccessibilityLabel(accessibilityParts.joined(separator: ", "))
+    }
+
+    private static func toolIcon(for name: String, activityKind: String) -> NSImage? {
+        let lowered = name.lowercased()
+        let preferredSymbol: String
+        if activityKind.caseInsensitiveCompare("collaboration") == .orderedSame {
+            preferredSymbol = "person.2"
+        } else if lowered.contains("read") {
+            preferredSymbol = "doc.text.magnifyingglass"
+        } else if ["grep", "glob", "search", "find"].contains(where: lowered.contains) {
+            preferredSymbol = "magnifyingglass"
+        } else if lowered.contains("fetch") || lowered.contains("web") {
+            preferredSymbol = "globe"
+        } else if lowered.contains("task") {
+            preferredSymbol = "checklist"
+        } else {
+            preferredSymbol = "wrench.and.screwdriver"
+        }
+        return NSImage(systemSymbolName: preferredSymbol, accessibilityDescription: nil)
+            ?? NSImage(systemSymbolName: "wrench.and.screwdriver", accessibilityDescription: nil)
+    }
+
+    private static func statusColor(for status: String) -> NSColor {
+        let normalized = status.lowercased()
+        if ["running", "starting", "pending", "inprogress", "in_progress", "in progress"]
+            .contains(normalized) {
+            return DesignTokens.running
+        }
+        if ["completed", "complete", "done", "success", "succeeded"]
+            .contains(normalized) {
+            return DesignTokens.text3
+        }
+        if ["failed", "failure", "error"].contains(normalized) {
+            return DesignTokens.danger
+        }
+        return DesignTokens.text2
     }
 }
 
@@ -888,7 +1237,7 @@ final class MediaCellView: ConversationRowCellView {
 /// Ports "contextCompaction": a lone tool header (no body).
 final class ContextCompactionCellView: ConversationRowCellView {
     private let header = ToolHeaderView(
-        systemImage: "arrow.down.right.and.arrow.up.left", title: "Context compacted")
+        systemImage: "arrow.down.right.and.arrow.up.left", title: "上下文已压缩")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -899,13 +1248,13 @@ final class ContextCompactionCellView: ConversationRowCellView {
     required init?(coder: NSCoder) { super.init(coder: coder) }
 
     override func configure(row: ConversationDisplayRow, width: CGFloat, model: SessionModel) {
-        header.update(systemImage: "arrow.down.right.and.arrow.up.left", title: "Context compacted")
+        header.update(systemImage: "arrow.down.right.and.arrow.up.left", title: "上下文已压缩")
     }
 }
 
 /// Ports the default branch: neutralized unknown ("raw") — tertiary callout.
 final class RawCellView: ConversationRowCellView {
-    override var verticalPadding: CGFloat { 8 }
+    override var verticalPadding: CGFloat { ConversationRowMetrics.itemVerticalPadding }
 
     private let bodyLabel = ConversationRowControls.label(
         font: ConversationRowMetrics.calloutFont, color: DesignTokens.text3)

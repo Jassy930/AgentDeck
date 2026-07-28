@@ -4,6 +4,7 @@
 //! 只保存 neutral adapterStateKey。
 
 pub mod adapter;
+pub(crate) mod app_server;
 pub mod capabilities;
 mod driver;
 #[cfg(test)]

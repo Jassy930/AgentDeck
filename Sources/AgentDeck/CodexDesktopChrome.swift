@@ -39,6 +39,7 @@ enum CodexDesktopChrome {
 final class CodexContentHeaderView: NSView {
     private weak var model: SessionModel?
     private let binder = ObservationBinder()
+    private let openLocationHandler: (URL) -> Void
 
     private let titleLabel: NSTextField = {
         let label = NSTextField(labelWithString: "AgentDeck")
@@ -62,8 +63,14 @@ final class CodexContentHeaderView: NSView {
     private let openLocationButton = NSButton(title: "打开位置⌄", target: nil, action: nil)
     private let controlsButton = NSButton()
 
-    init(model: SessionModel) {
+    init(
+        model: SessionModel,
+        openLocationHandler: @escaping (URL) -> Void = { url in
+            _ = NSWorkspace.shared.open(url)
+        }
+    ) {
         self.model = model
+        self.openLocationHandler = openLocationHandler
         super.init(frame: .zero)
         build()
         bind()
@@ -90,12 +97,19 @@ final class CodexContentHeaderView: NSView {
         openLocationButton.bezelStyle = .inline
         openLocationButton.isBordered = false
         openLocationButton.contentTintColor = DesignTokens.text2
+        openLocationButton.target = self
+        openLocationButton.action = #selector(handleOpenLocation)
+        openLocationButton.toolTip = "在 Finder 中打开"
+        openLocationButton.setAccessibilityIdentifier("codex-open-location")
         openLocationButton.translatesAutoresizingMaskIntoConstraints = false
 
         controlsButton.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "界面选项")
         controlsButton.bezelStyle = .inline
         controlsButton.isBordered = false
         controlsButton.contentTintColor = DesignTokens.text2
+        controlsButton.setAccessibilityIdentifier("codex-content-controls")
+        // 尚无对应设置/界面选项流程；不展示一个看似可点却没有 action 的控件。
+        controlsButton.isHidden = true
         controlsButton.translatesAutoresizingMaskIntoConstraints = false
 
         // 设计系统：agent 图标 + 标题 + cwd 灰字（无「…」）
@@ -159,6 +173,11 @@ final class CodexContentHeaderView: NSView {
         openLocationButton.isHidden = model.cwd == nil
     }
 
+    @objc private func handleOpenLocation() {
+        guard let cwd = model?.cwd else { return }
+        openLocationHandler(cwd)
+    }
+
     deinit {
         let b = binder
         Task { @MainActor in b.invalidate() }
@@ -187,6 +206,7 @@ final class CodexEnvironmentPanelView: NSView {
 
     private func build() {
         translatesAutoresizingMaskIntoConstraints = false
+        setAccessibilityIdentifier("codex-environment-panel")
         CodexDesktopChrome.roundedPanel(self, radius: DesignTokens.radiusLg, shadow: true)
 
         // 标题：变更 Changes
@@ -231,11 +251,19 @@ final class CodexEnvironmentPanelView: NSView {
     }
 
     private func refresh() {
-        let info = model?.environmentInfo
-        changesValue.stringValue = info?.changesSummary ?? "+0 -0"
-        fileCountValue.stringValue = info?.fileCountSummary ?? "0 文件"
-        branchValue.stringValue = info?.branch ?? "—"
-        commitValue.stringValue = info?.commit ?? "—"
+        guard let info = model?.environmentInfo else {
+            isHidden = true
+            changesValue.stringValue = ""
+            fileCountValue.stringValue = ""
+            branchValue.stringValue = ""
+            commitValue.stringValue = ""
+            return
+        }
+        isHidden = false
+        changesValue.stringValue = info.changesSummary
+        fileCountValue.stringValue = info.fileCountSummary
+        branchValue.stringValue = info.branch ?? "—"
+        commitValue.stringValue = info.commit ?? "—"
     }
 
     private func keyValueRow(_ key: String, value: NSTextField) -> NSView {

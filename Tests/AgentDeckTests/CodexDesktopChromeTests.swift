@@ -30,6 +30,26 @@ final class CodexDesktopChromeTests: XCTestCase {
             "右侧内容区应拥有 Codex Desktop 风格的 thread header"
         )
     }
+
+    func testContentHeaderOpensCurrentDirectoryAndHidesUnsupportedControls() throws {
+        let model = makeTestSessionModel()
+        let cwd = URL(fileURLWithPath: NSTemporaryDirectory())
+        model.cwd = cwd
+        var openedURL: URL?
+        let header = CodexContentHeaderView(model: model) { url in
+            openedURL = url
+        }
+        header.frame = NSRect(x: 0, y: 0, width: 900, height: 44)
+        header.layoutSubtreeIfNeeded()
+
+        let openButton = try XCTUnwrap(header.button(id: "codex-open-location"))
+        XCTAssertFalse(openButton.isHidden)
+        openButton.performClick(nil)
+        XCTAssertEqual(openedURL, cwd)
+
+        let controls = try XCTUnwrap(header.button(id: "codex-content-controls"))
+        XCTAssertTrue(controls.isHidden, "未实现的界面选项不应显示为伪控件")
+    }
 }
 
 private extension NSView {

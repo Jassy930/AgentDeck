@@ -1481,7 +1481,7 @@ impl NativeParserState {
                             .ok_or(NativeHistoryError::RetainedBudget)?,
                     )?;
                     let text = super::extract_tool_result_text(&block);
-                    let item = tool_result_to_agent_item(&name, &input, is_error, &text);
+                    let item = tool_result_to_agent_item(&tool_id, &name, &input, is_error, &text);
                     self.push_item(
                         turn_key,
                         derive_item_key(record_uuid, b"tool-result", Some(tool_id.as_bytes())),
@@ -1573,7 +1573,7 @@ impl NativeParserState {
                     budget.reserve_persistent(clone_bound)?;
                     let item_key =
                         derive_item_key(record_uuid, b"tool-use", Some(tool_id.as_bytes()));
-                    let item = tool_use_to_agent_item(&name, &input);
+                    let item = tool_use_to_agent_item(&tool_id, &name, &input);
                     if !self.seen_tool_ids.insert(tool_id.clone()) {
                         return Err(NativeHistoryError::DuplicateKey { line });
                     }

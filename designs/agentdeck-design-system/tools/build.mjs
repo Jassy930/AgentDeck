@@ -99,6 +99,7 @@ function swiftColor(v) {
   return `NSColor(srgbRed: ${f4(c.r)}, green: ${f4(c.g)}, blue: ${f4(c.b)}, alpha: ${f4(c.a)})`;
 }
 function genSwift() {
+  const g = src.global;
   const L = [];
   L.push("// 生成物 · 由 tools/build.mjs 从 tokens/tokens.json 生成，禁止手改。");
   L.push("// AppKit 主题契约：视图读 Theme / Platform，禁止 `if theme == .x`。");
@@ -115,6 +116,10 @@ function genSwift() {
   L.push("}");
   L.push("public struct Radii { public let lg, md, sm, pill: CGFloat }");
   L.push("public struct Fonts { public let ui, display, mono: [String] }");
+  L.push("public struct Typography {");
+  L.push("  public let displayXl, display, title, body, callout, caption, mono: CGFloat");
+  L.push("  public let lineHeightCJK, lineHeightLatin: CGFloat");
+  L.push("}");
   L.push("public struct Structure {");
   L.push("  public let statusShape: StatusShape");
   L.push("  public let surfaceMode: SurfaceMode");
@@ -128,6 +133,7 @@ function genSwift() {
   L.push("  public let color: Palette");
   L.push("  public let radius: Radii");
   L.push("  public let font: Fonts");
+  L.push("  public let typography: Typography");
   L.push("  public let structure: Structure");
   L.push("}\n");
 
@@ -141,6 +147,7 @@ function genSwift() {
     L.push(`    color: Palette(\n      ${pal}\n    ),`);
     L.push(`    radius: Radii(lg: ${t.radius.lg}, md: ${t.radius.md}, sm: ${t.radius.sm}, pill: ${t.radius.pill}),`);
     L.push(`    font: Fonts(ui: [${t.font.ui.map((x) => `"${x}"`).join(", ")}], display: [${t.font.display.map((x) => `"${x}"`).join(", ")}], mono: [${t.font.mono.map((x) => `"${x}"`).join(", ")}]),`);
+    L.push(`    typography: Typography(displayXl: ${g.type.displayXl}, display: ${g.type.display}, title: ${g.type.title}, body: ${g.type.body}, callout: ${g.type.callout}, caption: ${g.type.caption}, mono: ${g.type.mono}, lineHeightCJK: ${g.lineHeight.cjk}, lineHeightLatin: ${g.lineHeight.latin}),`);
     L.push(`    structure: Structure(statusShape: .${st.statusShape}, surfaceMode: .${st.surfaceMode}, composerForm: .${st.composerForm}, iconMode: .${st.iconMode}, labelCase: .${st.labelCase})`);
     L.push(`  )`);
   }
@@ -202,6 +209,14 @@ function genAppSwift() {
   L.push("");
   L.push("    // 间距（4pt 基准）");
   for (const [k, v] of Object.entries(g.spacing)) L.push(`    static let sp${k}: CGFloat = ${v}`);
+  L.push("");
+  L.push("    // 排版（字号与行高倍率）");
+  for (const [k, v] of Object.entries(g.type)) {
+    const swiftKey = k.charAt(0).toUpperCase() + k.slice(1);
+    L.push(`    static let type${swiftKey}: CGFloat = ${v}`);
+  }
+  L.push(`    static let lineHeightCJK: CGFloat = ${g.lineHeight.cjk}`);
+  L.push(`    static let lineHeightLatin: CGFloat = ${g.lineHeight.latin}`);
   L.push("");
   L.push("    // 阴影（分层柔光，供 roundedPanel 使用）");
   L.push("    static let panelShadowColor = NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.42)");

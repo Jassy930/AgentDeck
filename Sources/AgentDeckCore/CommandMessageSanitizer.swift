@@ -6,6 +6,7 @@ import Foundation
 ///   `<local-command-caveat>Caveat: …</local-command-caveat>`
 ///   `<command-name>/clear</command-name><command-message>…</command-message><command-args>…</command-args>`
 ///   `<command-stdout>…</command-stdout>` / `<command-stderr>…</command-stderr>`
+///   `<local-command-stdout>…</local-command-stdout>` / `<local-command-stderr>…</local-command-stderr>`
 /// 这些是 CLI 内部管道，不属于用户真正输入。设计系统的对话流是干净的
 /// 「用户气泡 + 助手 item」轮次，不应出现这些标签。
 ///
@@ -20,6 +21,8 @@ public enum CommandMessageSanitizer {
         "command-args",
         "command-stdout",
         "command-stderr",
+        "local-command-stdout",
+        "local-command-stderr",
         "command-contents",
     ]
 

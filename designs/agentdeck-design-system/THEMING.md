@@ -77,7 +77,7 @@ showcase.js     运行时：主题切换（?t= 参数 / localStorage）、导航
 |---|---|---|
 | `--k-cmd-border` / `--k-cmd-border-left` / `--k-cmd-bg` | `1px solid var(--border)` / 同 / `var(--surface-inset)` | 命令块构造（Terminal 左描边 accent；Warm 代码图） |
 | `--k-title-font` | `var(--font-display)` | 标题字体（Warm 衬线） |
-| `--k-composer-bg` | `var(--surface)` | Composer 背景 |
+| `--k-composer-bg` | `var(--surface-2)` | Composer 提升一层的悬浮背景 |
 | `--k-composer-prefix` | `""` | 输入前提示符（Terminal `"> "`） |
 | `--k-composer-caret` | `""` | 行尾块光标（Terminal `"▊"`，自动闪烁） |
 | `--k-composer-slash` | `""` | 占位符后的 slash 提示（Linear `"   /  唤起命令"`） |

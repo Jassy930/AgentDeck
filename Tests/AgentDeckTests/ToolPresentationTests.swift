@@ -129,6 +129,135 @@ struct ToolPresentationToolNameTests {
         item.tool = "read"
         #expect(ToolPresentation.toolName(item) == "read")
     }
+
+    @Test("empty generic tool name has a readable fallback")
+    func emptyGenericToolNameHasReadableFallback() {
+        let item = makeItem()
+        #expect(ToolPresentation.toolName(item) == "Tool")
+    }
+}
+
+@Suite("ToolPresentation.toolContextSummary")
+struct ToolPresentationToolContextSummaryTests {
+
+    @Test("Read file_path is surfaced in the collapsed summary")
+    func readFilePathIsSurfaced() {
+        var item = makeItem()
+        item.tool = "Read"
+        item.arguments = #"{"file_path":"/tmp/first.swift","limit":200}"#
+        #expect(ToolPresentation.toolContextSummary(item) == "path: /tmp/first.swift")
+    }
+
+    @Test("consecutive Read calls expose different paths")
+    func consecutiveReadsExposeDifferentPaths() {
+        var first = makeItem(id: "read-1")
+        first.tool = "Read"
+        first.arguments = #"{"file_path":"/repo/First.swift"}"#
+        var second = makeItem(id: "read-2")
+        second.tool = "Read"
+        second.arguments = #"{"file_path":"/repo/Second.swift"}"#
+
+        #expect(ToolPresentation.toolContextSummary(first) == "path: /repo/First.swift")
+        #expect(ToolPresentation.toolContextSummary(second) == "path: /repo/Second.swift")
+        #expect(
+            ToolPresentation.toolContextSummary(first)
+                != ToolPresentation.toolContextSummary(second)
+        )
+    }
+
+    @Test("query and path are both retained so adjacent searches are identifiable")
+    func queryAndPathAreBothRetained() {
+        var item = makeItem()
+        item.tool = "Grep"
+        item.arguments = #"{"pattern":"ToolCallCellView","path":"/repo/Sources"}"#
+        #expect(
+            ToolPresentation.toolContextSummary(item)
+                == "query: ToolCallCellView · path: /repo/Sources"
+        )
+    }
+
+    @Test("node_repl title makes adjacent generic js calls identifiable")
+    func nodeReplTitleIsSurfaced() {
+        var item = makeItem()
+        item.server = "node_repl"
+        item.tool = "js"
+        item.arguments = #"{"code":"...","title":"确认 AgentDeck 窗口","timeout_ms":30000}"#
+        #expect(ToolPresentation.toolContextSummary(item) == "确认 AgentDeck 窗口")
+    }
+
+    @Test("resource URI is a fallback when arguments have no target")
+    func resourceUriFallback() {
+        var item = makeItem()
+        item.arguments = #"{"limit":20}"#
+        item.resourceUri = "file:///tmp/resource.txt"
+        #expect(
+            ToolPresentation.toolContextSummary(item)
+                == "path: file:///tmp/resource.txt"
+        )
+    }
+
+    @Test("non-target task arguments stay out of the compact summary")
+    func nonTargetArgumentsStayOut() {
+        var item = makeItem()
+        item.tool = "TaskCreate"
+        item.arguments = #"{"subject":"收录厂家参数","description":"完整说明"}"#
+        #expect(ToolPresentation.toolContextSummary(item).isEmpty)
+    }
+}
+
+@Suite("ToolPresentation.toolStatus")
+struct ToolPresentationToolStatusTests {
+
+    @Test("explicit failure wins over a stale completed status")
+    func explicitFailureWins() {
+        var item = makeItem()
+        item.statusName = "completed"
+        item.success = false
+        #expect(ToolPresentation.toolStatus(item) == "failed")
+    }
+
+    @Test("result implies completed when no explicit status exists")
+    func resultImpliesCompleted() {
+        var item = makeItem(lifecycle: "running")
+        item.result = #"{"ok":true}"#
+        #expect(ToolPresentation.toolStatus(item) == "completed")
+    }
+
+    @Test("legacy lifecycle remains the final fallback")
+    func lifecycleFallback() {
+        let item = makeItem(lifecycle: "running")
+        #expect(ToolPresentation.toolStatus(item) == "running")
+    }
+
+    @Test("collapsed status is localized and includes a compact duration")
+    func localizedStatusIncludesDuration() {
+        var item = makeItem()
+        item.statusName = "completed"
+        item.durationMs = 1_449
+        #expect(ToolPresentation.toolStatusSummary(item) == "已完成 · 1.4s")
+    }
+
+    @Test("official inProgress status remains visibly active")
+    func camelCaseInProgressIsLocalized() {
+        var item = makeItem()
+        item.statusName = "inProgress"
+        #expect(ToolPresentation.toolStatusSummary(item) == "进行中")
+    }
+
+    @Test("collaboration events describe activity without inventing run status")
+    func collaborationActivityEventIsLocalized() {
+        for (activityEvent, expected) in [
+            ("started", "已开始工作"),
+            ("interacted", "已更新"),
+            ("interrupted", "已中断"),
+        ] {
+            var item = makeItem(lifecycle: "completed")
+            item.activityKind = "collaboration"
+            item.activityEvent = activityEvent
+            #expect(ToolPresentation.toolStatus(item) == activityEvent)
+            #expect(ToolPresentation.toolStatusSummary(item) == expected)
+        }
+    }
 }
 
 @Suite("ToolPresentation.toolMetadata")

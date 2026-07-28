@@ -111,6 +111,7 @@ agentdeckd
 - **K8**：vendor schema 不手写，Codex 协议来自官方 `codex app-server generate-json-schema`。
 - **K9**：AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）。
 - **K10**：`schema_matches_committed_snapshot` 漂移测试随 `cargo test` 运行；协议类型变更未重生成快照则失败。
+- **K11**：历史管理请求的 `requestId` 在线协议中保持可选以兼容旧客户端；当前 Swift 与 CLI 客户端必须始终发送唯一值，daemon 必须在成功和错误终态回复中原样回显。客户端只接受与当前请求严格匹配的回复，并忽略其他请求或已超时请求的迟到回复。
 
 ### 新增不变量（N 系列，v0.2 起）
 

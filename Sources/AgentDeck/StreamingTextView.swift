@@ -34,8 +34,150 @@ enum StreamingTextStorageSynchronizer {
     }
 }
 
+/// TextKit 1 自定义背景绘制：inline code 使用低对比圆角胶囊，fenced code
+/// 使用整列圆角容器。装饰属性由 `MarkdownAttributedStringBuilder` 写入，
+/// 文本本身仍保持普通字符，因此复制、选择、流式替换和测高都不受影响。
+final class InlineCodeLayoutManager: NSLayoutManager {
+    override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
+        guard glyphsToShow.length > 0,
+              let storage = textStorage,
+              let container = textContainers.first else {
+            super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
+            return
+        }
+
+        let characterRange = characterRange(
+            forGlyphRange: glyphsToShow,
+            actualGlyphRange: nil
+        )
+        drawCodeBlocks(
+            in: storage,
+            characterRange: characterRange,
+            visibleGlyphRange: glyphsToShow,
+            container: container,
+            origin: origin
+        )
+        drawInlineCode(
+            in: storage,
+            characterRange: characterRange,
+            visibleGlyphRange: glyphsToShow,
+            container: container,
+            origin: origin
+        )
+
+        // Selection/link backgrounds stay above the custom surfaces.
+        super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
+    }
+
+    private func drawCodeBlocks(
+        in storage: NSTextStorage,
+        characterRange: NSRange,
+        visibleGlyphRange: NSRange,
+        container: NSTextContainer,
+        origin: NSPoint
+    ) {
+        storage.enumerateAttribute(.agentDeckCodeBlock, in: characterRange) { value, range, _ in
+            guard value != nil else { return }
+            let glyphRange = self.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            let visible = NSIntersectionRange(glyphRange, visibleGlyphRange)
+            guard visible.length > 0 else { return }
+
+            var minY = CGFloat.greatestFiniteMagnitude
+            var maxY = -CGFloat.greatestFiniteMagnitude
+            self.enumerateLineFragments(forGlyphRange: visible) { lineRect, _, _, _, _ in
+                minY = min(minY, lineRect.minY)
+                maxY = max(maxY, lineRect.maxY)
+            }
+            guard minY.isFinite, maxY.isFinite, maxY > minY else { return }
+
+            let rect = NSRect(
+                x: origin.x,
+                y: origin.y + minY - 2,
+                width: max(container.containerSize.width, 1),
+                height: maxY - minY + 4
+            )
+            Self.drawRoundedSurface(
+                rect: rect,
+                radius: DesignTokens.radiusSm,
+                fill: DesignTokens.surfaceInset,
+                border: DesignTokens.border
+            )
+        }
+    }
+
+    private func drawInlineCode(
+        in storage: NSTextStorage,
+        characterRange: NSRange,
+        visibleGlyphRange: NSRange,
+        container: NSTextContainer,
+        origin: NSPoint
+    ) {
+        storage.enumerateAttribute(.agentDeckInlineCode, in: characterRange) { value, range, _ in
+            guard value != nil else { return }
+            let glyphRange = self.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            let visible = NSIntersectionRange(glyphRange, visibleGlyphRange)
+            guard visible.length > 0 else { return }
+
+            self.enumerateLineFragments(forGlyphRange: visible) { _, _, _, lineGlyphRange, _ in
+                let segment = NSIntersectionRange(visible, lineGlyphRange)
+                guard segment.length > 0 else { return }
+                var rect = self.boundingRect(forGlyphRange: segment, in: container)
+                guard !rect.isEmpty else { return }
+                // `boundingRect` 会继承正文 24pt 的 CJK 行框；胶囊本身只按
+                // mono 字形高度 + 2pt 上下留白绘制，避免看起来像整行选区。
+                let desiredHeight = min(
+                    rect.height,
+                    ceil(ConversationTypography.monoFont.boundingRectForFont.height) + 4
+                )
+                rect.origin.y = rect.midY - desiredHeight / 2
+                rect.size.height = desiredHeight
+                rect = rect.insetBy(dx: -3, dy: 0)
+                rect.origin.x += origin.x
+                rect.origin.y += origin.y
+                let radius = min(DesignTokens.radiusSm, rect.height / 2)
+                Self.drawRoundedSurface(
+                    rect: rect,
+                    radius: radius,
+                    fill: DesignTokens.surface2,
+                    border: DesignTokens.border
+                )
+            }
+        }
+    }
+
+    private static func drawRoundedSurface(
+        rect: NSRect,
+        radius: CGFloat,
+        fill: NSColor,
+        border: NSColor
+    ) {
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        let aligned = rect.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(
+            roundedRect: aligned,
+            xRadius: radius,
+            yRadius: radius
+        )
+        fill.setFill()
+        path.fill()
+        border.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+}
+
 final class StreamingTextContainerView: NSView {
-    private let textView = CoordinatedStreamingTextView(frame: .zero)
+    private let textView: CoordinatedStreamingTextView = {
+        let storage = NSTextStorage()
+        let layoutManager = InlineCodeLayoutManager()
+        let container = NSTextContainer(
+            size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        )
+        storage.addLayoutManager(layoutManager)
+        layoutManager.addTextContainer(container)
+        return CoordinatedStreamingTextView(frame: .zero, textContainer: container)
+    }()
     private var measuredHeight: CGFloat = 1
     private var lastFont: NSFont?
     private var lastTextColor: NSColor?
@@ -46,6 +188,14 @@ final class StreamingTextContainerView: NSView {
     /// `MarkdownAttributedStringBuilder` and replaces the storage — the builder
     /// owns the attributes, so the plain-text font/color path is bypassed.
     private var markdownStyle: MarkdownStyle?
+    /// Reasoning 的正文允许在尚未收到内容时折叠为 0 高；一旦 buffer
+    /// 流入文本，intrinsic height 会随同一次更新恢复。
+    var collapsesWhenEmpty = false {
+        didSet {
+            guard collapsesWhenEmpty != oldValue else { return }
+            recalculateHeight(for: max(bounds.width, 1))
+        }
+    }
     private lazy var selectionOwner = SessionTextSelectionOwner { [weak self] in
         self?.textView.clearSelection()
     }
@@ -106,7 +256,9 @@ final class StreamingTextContainerView: NSView {
         // storage — wiping any in-progress text selection (C2). The buffer's
         // own observer already pushes new tokens into the storage, so keep the
         // existing subscription and selection untouched.
-        if markdownStyle != nil, observedBuffer === buffer {
+        if let markdownStyle,
+           markdownStyle.isVisuallyEquivalent(to: style),
+           observedBuffer === buffer {
             return
         }
         unbind()
@@ -141,6 +293,10 @@ final class StreamingTextContainerView: NSView {
     /// code / link), not just plain text.
     var currentAttributedText: NSAttributedString {
         textView.textStorage ?? NSTextStorage()
+    }
+
+    var usesInlineCodeLayoutManagerForTesting: Bool {
+        textView.layoutManager is InlineCodeLayoutManager
     }
 
     /// The text view's current selection. Exposed so tests can assert that a
@@ -198,15 +354,20 @@ final class StreamingTextContainerView: NSView {
         }
         let storage = textView.textStorage ?? NSTextStorage()
         let attributed = MarkdownAttributedStringBuilder.attributedString(from: fullText, style: style)
-        // Mirror the plain path's `.unchanged` early-return: when the rendered
-        // STRING already matches what is displayed, rewriting the storage would
-        // be a no-op visually but would still collapse the user's selection (C2).
-        if storage.string == attributed.string {
+        // Mirror the plain path's `.unchanged` early-return, but compare the
+        // complete attributed value: identical visible text can still acquire
+        // markdown emphasis or a new paragraph style.
+        if storage.isEqual(to: attributed) {
             return
         }
+        let preservesSelection = storage.string == attributed.string
+        let selectedRanges = preservesSelection ? textView.selectedRanges : []
         storage.beginEditing()
         storage.setAttributedString(attributed)
         storage.endEditing()
+        if preservesSelection {
+            textView.selectedRanges = selectedRanges
+        }
     }
 
     private func currentAttributes() -> [NSAttributedString.Key: Any] {
@@ -270,10 +431,28 @@ final class StreamingTextContainerView: NSView {
             return
         }
 
+        if collapsesWhenEmpty, textView.string.isEmpty {
+            updateMeasuredHeight(0)
+            return
+        }
+
         layoutManager.ensureLayout(for: textContainer)
         let usedRect = layoutManager.usedRect(for: textContainer)
-        let lineHeight = textView.font?.boundingRectForFont.height ?? 1
+        let lineHeight: CGFloat
+        if let markdownStyle {
+            lineHeight = ConversationTypography.targetLineHeight(
+                for: markdownStyle.bodyFont,
+                text: textView.string,
+                language: markdownStyle.lineHeightLanguage
+            )
+        } else {
+            lineHeight = textView.font?.boundingRectForFont.height ?? 1
+        }
         let nextHeight = max(ceil(usedRect.height), ceil(lineHeight), 1)
+        updateMeasuredHeight(nextHeight)
+    }
+
+    private func updateMeasuredHeight(_ nextHeight: CGFloat) {
         if abs(nextHeight - measuredHeight) > 0.5 {
             measuredHeight = nextHeight
             invalidateIntrinsicContentSize()

@@ -47,6 +47,7 @@ final class StreamingTextCoreTests: XCTestCase {
 
         let view = StreamingTextContainerView(frame: .zero)
         view.bindMarkdownBuffer(to: buffer, style: .standard)
+        XCTAssertTrue(view.usesInlineCodeLayoutManagerForTesting)
 
         let attributed = view.currentAttributedText
         // The rendered plain string drops the markdown syntax markers.
@@ -90,6 +91,104 @@ final class StreamingTextCoreTests: XCTestCase {
             boldFont!.fontDescriptor.symbolicTraits.contains(.bold),
             "跨多次 append 形成的 **bold** 仍应整体重算为粗体"
         )
+    }
+
+    func testMarkdownReplaceUpdatesAttributesWhenRenderedStringIsUnchanged() throws {
+        let buffer = StreamingTextBuffer()
+        buffer.replace(with: "plain")
+        let view = StreamingTextContainerView(frame: .zero)
+        view.bindMarkdownBuffer(to: buffer, style: .standard)
+        let selection = NSRange(location: 1, length: 3)
+        view.selectedRangeForTesting = selection
+
+        buffer.replace(with: "**plain**")
+
+        XCTAssertEqual(view.currentText, "plain")
+        let font = try XCTUnwrap(
+            view.currentAttributedText.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertTrue(
+            font.fontDescriptor.symbolicTraits.contains(.bold),
+            "显示字符串相同但 markdown 属性变化时仍必须更新 text storage"
+        )
+        XCTAssertEqual(
+            view.selectedRangeForTesting,
+            selection,
+            "仅 Markdown 属性变化时必须保留用户正在选择的可见文本"
+        )
+    }
+
+    func testCollapsibleEmptyMarkdownHasZeroHeightAndExpandsWhenTextArrives() {
+        let buffer = StreamingTextBuffer()
+        let view = StreamingTextContainerView(
+            frame: NSRect(x: 0, y: 0, width: 280, height: 1)
+        )
+        view.collapsesWhenEmpty = true
+        view.bindMarkdownBuffer(to: buffer, style: .reasoning)
+
+        XCTAssertEqual(view.fittingHeight(for: 280), 0, accuracy: 0.001)
+
+        buffer.append("中")
+
+        XCTAssertEqual(
+            view.fittingHeight(for: 280),
+            ceil(DesignTokens.typeCallout * DesignTokens.lineHeightCJK),
+            accuracy: 0.5,
+            "空 reasoning 收到首个 token 后必须恢复设计系统正文行高"
+        )
+    }
+
+    func testRebindSameMarkdownBufferAppliesChangedTypographyStyle() throws {
+        let buffer = StreamingTextBuffer()
+        buffer.replace(with: "reasoning text")
+        let view = StreamingTextContainerView(frame: .zero)
+        view.bindMarkdownBuffer(to: buffer, style: .standard)
+        view.bindMarkdownBuffer(to: buffer, style: .reasoning)
+
+        let font = try XCTUnwrap(
+            view.currentAttributedText.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        )
+        let color = try XCTUnwrap(
+            view.currentAttributedText.attribute(.foregroundColor, at: 0, effectiveRange: nil)
+                as? NSColor
+        )
+        XCTAssertEqual(font.pointSize, DesignTokens.typeCallout)
+        XCTAssertTrue(color.isEqual(DesignTokens.text2))
+    }
+
+    func testMarkdownFittingHeightMatchesSharedAttributedMeasurement() {
+        let cases: [(text: String, style: MarkdownStyle)] = [
+            ("中文第一行\n中文第二行包含 **重点**", .standard),
+            ("English first line\nEnglish second line with **emphasis**", .standard),
+            ("| 项目 | 占用 |\n| --- | ---: |\n| APFS 数据卷 | 847 GiB / 926 GiB |", .standard),
+            ("先梳理依赖\n再执行修复", .reasoning),
+            ("Inspect dependencies\nThen implement the fix", .reasoning),
+        ]
+
+        for width: CGFloat in [280, 620] {
+            for testCase in cases {
+                let buffer = StreamingTextBuffer()
+                buffer.replace(with: testCase.text)
+                let view = StreamingTextContainerView(
+                    frame: NSRect(x: 0, y: 0, width: width, height: 1)
+                )
+                view.bindMarkdownBuffer(to: buffer, style: testCase.style)
+                let expected = measuredTextHeight(
+                    MarkdownAttributedStringBuilder.attributedString(
+                        from: testCase.text,
+                        style: testCase.style
+                    ),
+                    width: width
+                )
+
+                XCTAssertEqual(
+                    view.fittingHeight(for: width),
+                    expected,
+                    accuracy: 0.5,
+                    "width=\(width), text=\(testCase.text) 的渲染和测高必须同源"
+                )
+            }
+        }
     }
 
     /// C2: re-binding the SAME markdown buffer object (the streaming

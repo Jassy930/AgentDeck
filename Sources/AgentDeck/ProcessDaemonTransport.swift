@@ -70,7 +70,9 @@ final class ProcessDaemonTransport: DaemonTransport, @unchecked Sendable {
             return
         }
         guard let path = DaemonClient.locateDaemon() else {
-            throw DaemonError.binaryNotFound("target/{debug,release}/agentdeckd or PATH")
+            throw DaemonError.binaryNotFound(
+                "AGENTDECK_DAEMON_PATH, app bundle, target/{debug,release}, or PATH"
+            )
         }
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = Self.stdioDaemonArguments

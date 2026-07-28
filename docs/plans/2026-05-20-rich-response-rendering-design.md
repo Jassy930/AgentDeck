@@ -1,5 +1,10 @@
 # Rich Response Rendering 设计
 
+> 状态说明：本文记录早期 SwiftUI/Textual 方案；2026-06-29 AppKit 重写后，
+> 当前主路径已改为 `NSTextView` + `MarkdownAttributedStringBuilder`。表格基础渲染
+> 于 2026-07-23 采用 `NSTextTable` 落地；本文列出的复制 Markdown/TSV、宽表横向
+> 滚动和转置仍是后续增强，不属于基础渲染完成边界。
+
 ## 背景
 
 AgentDeck 当前已经把 Codex 返回的 `message`、`reasoning`、`shell` 和

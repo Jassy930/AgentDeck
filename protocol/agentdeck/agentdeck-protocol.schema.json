@@ -687,6 +687,12 @@
                     "list"
                   ],
                   "type": "string"
+                },
+                "requestId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
@@ -705,6 +711,12 @@
                     "read"
                   ],
                   "type": "string"
+                },
+                "requestId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "threadId": {
                   "type": "string"
@@ -729,6 +741,12 @@
                   ],
                   "type": "string"
                 },
+                "requestId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "threadId": {
                   "type": "string"
                 }
@@ -752,6 +770,12 @@
                   ],
                   "type": "string"
                 },
+                "requestId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "threadId": {
                   "type": "string"
                 }
@@ -774,6 +798,12 @@
                     "rename"
                   ],
                   "type": "string"
+                },
+                "requestId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "threadId": {
                   "type": "string"
@@ -1401,6 +1431,12 @@
                 "list"
               ],
               "type": "string"
+            },
+            "requestId": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -1419,6 +1455,12 @@
                 "read"
               ],
               "type": "string"
+            },
+            "requestId": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "threadId": {
               "type": "string"
@@ -1443,6 +1485,12 @@
               ],
               "type": "string"
             },
+            "requestId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "threadId": {
               "type": "string"
             }
@@ -1466,6 +1514,12 @@
               ],
               "type": "string"
             },
+            "requestId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "threadId": {
               "type": "string"
             }
@@ -1488,6 +1542,12 @@
                 "rename"
               ],
               "type": "string"
+            },
+            "requestId": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "threadId": {
               "type": "string"

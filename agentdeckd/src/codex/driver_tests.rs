@@ -48,14 +48,14 @@ static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 #[test]
 fn initialize_version_gate_accepts_exact_version_for_any_nonempty_originator() {
     for user_agent in [
-        "agentdeck/0.144.1 (test)",
-        "Codex Desktop/0.144.1 (test override)",
+        "agentdeck/0.145.0 (test)",
+        "Codex Desktop/0.145.0 (test override)",
     ] {
         validate_initialize_version(&json!({"userAgent": user_agent}))
             .expect("exact schema version");
     }
     let mismatch = validate_initialize_version(&json!({
-        "userAgent": "agentdeck/0.145.0 (future)"
+        "userAgent": "agentdeck/0.146.0 (future)"
     }))
     .expect_err("future schema drift must fail before thread/start");
     assert_eq!(mismatch.code, "codex-version-mismatch");
@@ -120,7 +120,7 @@ async fn canonical_adapter_capabilities_use_preseeded_version_without_vendor_pro
     let adapter = CodexAdapter::with_state_vault(test.store.codex_adapter_state_vault_for_test());
 
     let capabilities = adapter.capabilities();
-    assert_eq!(capabilities.agent_version, "codex-cli 0.144.1");
+    assert_eq!(capabilities.agent_version, "codex-cli 0.145.0");
 
     test.close().await;
 }
@@ -764,7 +764,7 @@ while IFS= read -r line; do
   count=$((count + 1))
   case "$count" in
     1)
-      printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.144.1 (test)"}}'
+      printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.145.0 (test)"}}'
       ;;
     2)
       printf '%s\n' '{"id":2,"result":{"thread":{"id":"fixture-thread"}}}'
@@ -788,7 +788,7 @@ while IFS= read -r line; do
   count=$((count + 1))
   case "$count" in
     1)
-      printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.144.1 (test)"}}'
+      printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.145.0 (test)"}}'
       ;;
     2)
       printf '%s\n' '{"id":2,"result":{"thread":{"id":"fixture-thread"}}}'
@@ -812,7 +812,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$AGENTDECK_CODEX_DRIVER_LOG"
   count=$((count + 1))
   case "$count" in
-    1) printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.144.1 (test)"}}' ;;
+    1) printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.145.0 (test)"}}' ;;
     2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"fixture-thread"}}}' ;;
     3)
       printf '%s\n' '{"method":"turn/started","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","items":[],"itemsView":"notLoaded","status":"inProgress","error":null}}}'
@@ -830,7 +830,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$AGENTDECK_CODEX_DRIVER_LOG"
   count=$((count + 1))
   case "$count" in
-    1) printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.144.1 (test)"}}' ;;
+    1) printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.145.0 (test)"}}' ;;
     2) printf '%s\n' '{"id":2,"result":{"threadId":"fixture-thread"}}'; exit 0 ;;
   esac
 done
@@ -842,7 +842,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$AGENTDECK_CODEX_DRIVER_LOG"
   count=$((count + 1))
   case "$count" in
-    1) printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.144.1 (test)"}}' ;;
+    1) printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.145.0 (test)"}}' ;;
     2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"fixture-thread"}}}' ;;
     3)
       printf '%s\n' '{"id":3,"result":{"turn":{"id":"fixture-turn"}}}'
@@ -859,7 +859,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$AGENTDECK_CODEX_DRIVER_LOG"
   count=$((count + 1))
   case "$count" in
-    1) printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.144.1 (test)"}}' ;;
+    1) printf '%s\n' '{"id":1,"result":{"userAgent":"agentdeck/0.145.0 (test)"}}' ;;
     2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"fixture-thread"}}}' ;;
     3)
       printf '%s\n' '{"id":3,"error":{"code":-32000,"message":"rejected"}}'

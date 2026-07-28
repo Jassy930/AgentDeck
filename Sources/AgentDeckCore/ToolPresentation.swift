@@ -54,7 +54,96 @@ public enum ToolPresentation {
         if let prefix {
             return "\(prefix)/\(item.tool)"
         }
-        return item.tool
+        if !item.tool.isEmpty { return item.tool }
+        return item.toolKind == "mcp" ? "MCP tool" : "Tool"
+    }
+
+    /// Compact, discriminating context for a tool-call header. Tool payloads
+    /// often contain a large JSON object, but the path/query target is enough
+    /// to tell adjacent `Read` / `Grep` calls apart while they are collapsed.
+    /// Full arguments remain available in `toolPayload(_:)`.
+    public static func toolContextSummary(_ item: UIItem) -> String {
+        var fields: [String: Any] = [:]
+        if let data = item.arguments.data(using: .utf8),
+           let decoded = try? JSONSerialization.jsonObject(with: data),
+           let dictionary = decoded as? [String: Any] {
+            fields = dictionary
+        }
+
+        // Malformed/adapter-specific payloads can contain aliases such as both
+        // `file_path` and `filePath`; keep the first value instead of trapping
+        // on duplicate normalized keys.
+        var normalizedFields: [String: Any] = [:]
+        for key in fields.keys.sorted() where normalizedFields[normalizedKey(key)] == nil {
+            normalizedFields[normalizedKey(key)] = fields[key]
+        }
+        var parts: [String] = []
+
+        // Some generic MCP surfaces (notably node_repl/computer-use) expose a
+        // user-facing operation label in `title`. Without it every call
+        // collapses to the same opaque tool name such as `js`.
+        let titleKeys = ["title", "displaytitle", "operationtitle", "label"]
+        if !item.action.isEmpty {
+            parts.append(compactPreview(item.action))
+        } else if let title = firstDisplayValue(in: normalizedFields, keys: titleKeys) {
+            parts.append(title)
+        }
+
+        let queryKeys = ["query", "pattern", "searchquery", "searchterm", "needle", "glob"]
+        if let query = firstDisplayValue(in: normalizedFields, keys: queryKeys) {
+            parts.append("query: \(query)")
+        }
+
+        let pathKeys = [
+            "filepath", "path", "notebookpath", "directorypath", "directory",
+            "folder", "cwd", "root", "url", "uri",
+        ]
+        if let path = firstDisplayValue(in: normalizedFields, keys: pathKeys) {
+            parts.append("path: \(path)")
+        } else if parts.isEmpty, !item.resourceUri.isEmpty {
+            parts.append("path: \(compactPreview(item.resourceUri))")
+        }
+
+        return parts.joined(separator: " · ")
+    }
+
+    /// One canonical status for the compact header. Prefer explicit failure
+    /// evidence, then adapter status, then completion evidence, and finally
+    /// the neutral lifecycle value carried by legacy history items.
+    public static func toolStatus(_ item: UIItem) -> String {
+        if item.success == false || !item.errorText.isEmpty { return "failed" }
+        if item.activityKind.caseInsensitiveCompare("collaboration") == .orderedSame,
+           !item.activityEvent.isEmpty {
+            return item.activityEvent
+        }
+        if !item.statusName.isEmpty { return item.statusName }
+        if item.success == true || !item.result.isEmpty { return "completed" }
+        return item.lifecycle
+    }
+
+    /// Localized, compact status shown in the collapsed tool row. The raw
+    /// status remains available through `toolStatus(_:)` for semantic color
+    /// mapping and tests; this function is presentation-only.
+    public static func toolStatusSummary(_ item: UIItem) -> String {
+        let rawStatus = toolStatus(item)
+        let localized: String
+        switch rawStatus.lowercased() {
+        case "started": localized = "已开始工作"
+        case "interacted": localized = "已更新"
+        case "interrupted": localized = "已中断"
+        case "running", "starting", "inprogress", "in_progress", "in progress": localized = "进行中"
+        case "pending", "queued": localized = "等待中"
+        case "completed", "complete", "done", "success", "succeeded": localized = "已完成"
+        case "failed", "failure", "error": localized = "失败"
+        case "canceled", "cancelled": localized = "已取消"
+        default: localized = rawStatus
+        }
+
+        guard let durationMs = item.durationMs else { return localized }
+        let duration = durationMs < 1_000
+            ? "\(durationMs)ms"
+            : String(format: "%.1fs", Double(durationMs) / 1_000)
+        return [localized, duration].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
     /// Caption parts for a generic tool-call row (status, success/failed,
@@ -89,5 +178,32 @@ public enum ToolPresentation {
               let string = String(data: pretty, encoding: .utf8)
         else { return compact }
         return string
+    }
+
+    private static func normalizedKey(_ key: String) -> String {
+        key.lowercased().filter { $0.isLetter || $0.isNumber }
+    }
+
+    private static func firstDisplayValue(
+        in fields: [String: Any],
+        keys: [String]
+    ) -> String? {
+        for key in keys {
+            guard let value = fields[key] else { continue }
+            if let string = value as? String, !string.isEmpty {
+                let preview = compactPreview(string)
+                if !preview.isEmpty { return preview }
+            }
+            if let number = value as? NSNumber {
+                return number.stringValue
+            }
+        }
+        return nil
+    }
+
+    private static func compactPreview(_ value: String, limit: Int = 180) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > limit else { return trimmed }
+        return String(trimmed.prefix(limit - 1)) + "…"
     }
 }

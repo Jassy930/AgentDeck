@@ -338,7 +338,7 @@
           <div style="width:1px;height:26px;background:var(--separator)"></div>
           <span class="iconbtn"><i data-lucide="plus"></i></span>
           <span class="iconbtn"><i data-lucide="mic"></i></span>
-          <span class="iconbtn iconbtn--send"><i data-lucide="arrow-up"></i></span>
+          <button type="button" class="iconbtn iconbtn--send" aria-label="发送消息" title="发送消息"><i data-lucide="arrow-up"></i></button>
         </div>
       </div>
 
@@ -367,13 +367,11 @@
         <div class="composer" style="max-width:560px">
           <div class="composer__input"><span class="ph">给 Agent 下达指令，或 @ 引用文件…</span></div>
           <div class="composer__bar">
-            <span class="iconbtn"><i data-lucide="plus"></i></span>
             <span class="tag tag--perm"><i data-lucide="shield"></i>workspace-write</span>
             <span class="tag tag--plan"><i data-lucide="list-checks"></i>Plan</span>
             <span class="spacer"></span>
             <span class="tag tag--effort">high</span>
-            <span class="iconbtn"><i data-lucide="mic"></i></span>
-            <span class="iconbtn iconbtn--send"><i data-lucide="arrow-up"></i></span>
+            <button type="button" class="iconbtn iconbtn--send" aria-label="发送消息" title="发送消息"><i data-lucide="arrow-up"></i></button>
           </div>
         </div>
       </div>
@@ -564,7 +562,7 @@ src/auth/service.ts</div></div>
     <section id="desktop" class="section">
       <div class="section__head">
         <h2>桌面工作台 · Desktop</h2>
-        <p>透明标题栏 + 全高侧栏的经典布局：左侧跨 Agent 的历史，右侧是流式会话、悬浮 composer、右上环境面板与右缘轮次导航。这是主场景。</p>
+        <p>透明标题栏 + 紧凑全高侧栏：左侧跨 Agent 历史支持新建与搜索，右侧流式会话和 composer 共用内容轴；环境数据缺失时不占位，右缘轮次导航提供摘要与完整命中区。</p>
       </div>
 
       <div class="wbscene">
@@ -583,10 +581,8 @@ src/auth/service.ts</div></div>
         <!-- 侧栏 -->
         <aside class="wb-side">
           <div class="wb-side__actions">
-            <div class="wb-act"><i data-lucide="square-pen"></i>新对话</div>
-            <div class="wb-act"><i data-lucide="search"></i>搜索</div>
-            <div class="wb-act"><i data-lucide="clock"></i>已安排</div>
-            <div class="wb-act"><i data-lucide="puzzle"></i>插件</div>
+            <button type="button" class="wb-act"><i data-lucide="square-pen"></i>新对话</button>
+            <button type="button" class="wb-act"><i data-lucide="search"></i>搜索</button>
           </div>
           <div class="wb-side__title"><span class="eyebrow">项目</span><span class="sp"></span><span class="iconbtn" style="width:24px;height:24px"><i data-lucide="plus" style="width:14px;height:14px"></i></span></div>
           <div class="wb-side__list">
@@ -620,7 +616,6 @@ src/auth/service.ts</div></div>
             <span class="cwd">~/glm/AgentDeck</span>
             <span class="sp"></span>
             <span class="iconbtn"><i data-lucide="folder-open"></i></span>
-            <span class="iconbtn"><i data-lucide="sliders-horizontal"></i></span>
           </div>
 
           <!-- Linear 专属：顶部命令栏 + ⌘K + 过滤芯片 -->
@@ -653,22 +648,36 @@ src/api/session.ts</div></div></div></div>
                 <div class="envpanel__sec"><span class="eyebrow">Git</span><div class="env-line"><span>分支</span><span>main</span></div><div class="env-line"><span>提交</span><span>a1b2c3d</span></div></div>
               </div>
             </div>
-
-            <!-- 轮次导航 -->
-            <div class="wb-rail"><i></i><i class="on"></i><i></i><i></i></div>
           </div>
+
+          <!-- 独立 44pt 尾列：不覆盖正文、composer 或环境面板 -->
+          <nav class="wb-rail" aria-label="对话回合导航">
+            <button type="button" class="wb-rail__target" aria-label="第 1 回合：拆分 auth service" title="第 1 回合 · 拆分 auth service" data-summary="第 1 回合 · 拆分 auth service">
+              <span class="wb-rail__dot" aria-hidden="true"></span>
+            </button>
+            <button type="button" class="wb-rail__target" aria-label="第 2 回合：修复 token 刷新竞态" aria-current="step" title="第 2 回合 · 修复 token 刷新竞态" data-summary="第 2 回合 · 修复 token 刷新竞态">
+              <span class="wb-rail__dot" aria-hidden="true"></span>
+            </button>
+            <button type="button" class="wb-rail__target" aria-label="第 3 回合：补齐单元测试" title="第 3 回合 · 补齐单元测试" data-summary="第 3 回合 · 补齐单元测试">
+              <span class="wb-rail__dot" aria-hidden="true"></span>
+            </button>
+            <button type="button" class="wb-rail__target" aria-label="第 4 回合：运行验证" title="第 4 回合 · 运行验证" data-summary="第 4 回合 · 运行验证">
+              <span class="wb-rail__dot" aria-hidden="true"></span>
+            </button>
+            <button type="button" class="wb-rail__target wb-rail__target--latest" aria-label="跳到最新消息" title="跳到最新消息" data-summary="跳到最新消息">
+              <span class="wb-rail__latest" aria-hidden="true">⌄</span>
+            </button>
+          </nav>
 
           <!-- 悬浮 composer -->
           <div class="wb-composer">
             <div class="composer">
               <div class="composer__input"><span class="ph">继续对话，或 @ 引用文件…</span></div>
               <div class="composer__bar">
-                <span class="iconbtn"><i data-lucide="plus"></i></span>
                 <span class="tag tag--perm"><i data-lucide="shield"></i>workspace-write</span>
                 <span class="spacer"></span>
                 <span class="tag tag--effort">high</span>
-                <span class="iconbtn"><i data-lucide="mic"></i></span>
-                <span class="iconbtn iconbtn--send"><i data-lucide="arrow-up"></i></span>
+                <button type="button" class="iconbtn iconbtn--send" aria-label="发送消息" title="发送消息"><i data-lucide="arrow-up"></i></button>
               </div>
             </div>
           </div>
@@ -797,7 +806,7 @@ src/api/session.ts</div></div></div></div>
                     <span class="iconbtn"><i data-lucide="plus"></i></span>
                     <span class="spacer"></span>
                     <span class="iconbtn"><i data-lucide="mic"></i></span>
-                    <span class="iconbtn iconbtn--send"><i data-lucide="arrow-up"></i></span>
+                    <button type="button" class="iconbtn iconbtn--send" aria-label="发送消息" title="发送消息"><i data-lucide="arrow-up"></i></button>
                   </div>
                 </div>
               </div>
@@ -930,7 +939,7 @@ src/api/session.ts</div></div></div></div>
               <div class="m-composer">
                 <div class="composer">
                   <div class="composer__input" style="padding:11px 14px 4px"><span class="ph">输入消息，或让它继续运行…</span></div>
-                  <div class="composer__bar"><span class="iconbtn"><i data-lucide="plus"></i></span><span class="spacer"></span><span class="iconbtn"><i data-lucide="mic"></i></span><span class="iconbtn iconbtn--send"><i data-lucide="arrow-up"></i></span></div>
+                  <div class="composer__bar"><span class="iconbtn"><i data-lucide="plus"></i></span><span class="spacer"></span><span class="iconbtn"><i data-lucide="mic"></i></span><button type="button" class="iconbtn iconbtn--send" aria-label="发送消息" title="发送消息"><i data-lucide="arrow-up"></i></button></div>
                 </div>
               </div>
             </div>

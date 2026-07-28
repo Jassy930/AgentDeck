@@ -22,7 +22,7 @@ enum ConversationRowFactory {
         case .userPrompt:
             return NSUserInterfaceItemIdentifier("userPrompt")
         case .assistantItem:
-            return NSUserInterfaceItemIdentifier("assistant.\(row.item.kind)")
+            return NSUserInterfaceItemIdentifier("assistant.\(row.presentationKind)")
         }
     }
 
@@ -35,6 +35,7 @@ enum ConversationRowFactory {
     static func makeCell(for row: ConversationDisplayRow) -> NSTableCellView {
         let cell = makeBareCell(for: row)
         cell.identifier = reuseIdentifier(for: row)
+        (cell as? ConversationRowCellView)?.applyTurnSpacing(for: row)
         return cell
     }
 
@@ -44,7 +45,7 @@ enum ConversationRowFactory {
         case .userPrompt:
             return UserPromptCellView()
         case .assistantItem:
-            return makeAssistantCell(kind: row.item.kind)
+            return makeAssistantCell(kind: row.presentationKind)
         }
     }
 
@@ -58,6 +59,7 @@ enum ConversationRowFactory {
         case "webSearch": return WebSearchCellView()
         case "plan", "reviewMode": return LabelledBlockCellView()
         case "hookPrompt": return HookPromptCellView()
+        case "toolActivityGroup": return ToolActivityGroupCellView()
         case "toolCall": return ToolCallCellView()
         case "collabAgentToolCall": return CollabAgentCellView()
         case "media": return MediaCellView()
@@ -74,24 +76,27 @@ enum ConversationRowFactory {
     /// — the table never reserves height for hidden disclosure content.
     @MainActor
     static func height(for row: ConversationDisplayRow, width: CGFloat) -> CGFloat {
+        let contentHeight: CGFloat
         switch row.role {
         case .userPrompt:
-            return userPromptHeight(row: row, width: width)
+            contentHeight = userPromptHeight(row: row, width: width)
         case .assistantItem:
-            return assistantHeight(row: row, width: width)
+            contentHeight = assistantHeight(row: row, width: width)
         }
+        return contentHeight + (row.lastInTurn ? ConversationRowMetrics.turnEndSpacing : 0)
     }
 
     // MARK: - Height: per role/kind
 
     private static let verticalGap: CGFloat = 5
     private static let tightGap: CGFloat = 4
+    private static let itemVerticalPadding = ConversationRowMetrics.itemVerticalPadding
 
     private static func userPromptHeight(row: ConversationDisplayRow, width: CGFloat) -> CGFloat {
-        // padding(.vertical, 8) outer + bubble inner padding (10 top + 10 bottom).
+        // padding(.vertical, 8) outer + bubble inner padding (11 top + 11 bottom).
         // 「You」标题与左边条已移除，高度只含气泡内边距 + 正文。
         let outer: CGFloat = 8 * 2
-        let bubbleInset: CGFloat = 10 * 2
+        let bubbleInset: CGFloat = 11 * 2
         let bodyWidth = UserPromptCellView.bodyWidth(forRowWidth: width)
         let body = measuredTextHeight(
             MarkdownAttributedStringBuilder.attributedString(from: row.item.text),
@@ -104,25 +109,28 @@ enum ConversationRowFactory {
         let item = row.item
         let contentW = max(width - ConversationRowCellView.horizontalInset * 2, 1)
 
-        switch item.kind {
+        switch row.presentationKind {
         case "message":
             // padding(.vertical, 4) + streaming RICH markdown. Measured from the
             // SAME markdown attributed string the cell renders (design §5), so
             // measurement and rendering can never diverge.
-            let pad: CGFloat = 4 * 2
+            let pad = itemVerticalPadding * 2
             let attributed = MarkdownAttributedStringBuilder.attributedString(from: item.text, style: .standard)
             return pad + max(measuredTextHeight(attributed, width: contentW),
-                             ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutFont))
+                             ConversationTypography.targetLineHeight(
+                                for: ConversationRowMetrics.bodyFont,
+                                text: item.text
+                             ))
 
         case "reasoning":
-            // padding(.vertical, 8) + the "Reasoning" disclosure header. The
+            // `.item` padding + the reasoning disclosure header. The
             // streamed body is collapsed by default, so it is NOT counted here.
-            let pad: CGFloat = 8 * 2
+            let pad = itemVerticalPadding * 2
             return pad + disclosureHeaderHeight
 
         case "shell":
-            // padding(.vertical, 10) + command + (metadata?) + (disclosure?) + (exit?)
-            var h: CGFloat = 10 * 2
+            // `.item` padding + command + (metadata?) + (disclosure?) + (exit?)
+            var h = itemVerticalPadding * 2
             h += textHeight("$ \(item.command)", font: ConversationRowMetrics.monoCalloutFont, width: contentW)
             let metadata = ToolPresentation.shellMetadata(item)
             if !metadata.isEmpty {
@@ -137,7 +145,7 @@ enum ConversationRowFactory {
             return h
 
         case "fileEdit":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += textHeight(item.path, font: ConversationRowMetrics.monoCalloutMediumFont, width: contentW)
             if !item.statusName.isEmpty {
                 h += tightGap + ConversationRowMetrics.lineHeight(ConversationRowMetrics.monoCaptionFont)
@@ -148,7 +156,7 @@ enum ConversationRowFactory {
             return h
 
         case "webSearch":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
             if !item.query.isEmpty {
                 h += verticalGap + textHeight(item.query, font: ConversationRowMetrics.calloutFont, width: contentW)
@@ -165,7 +173,7 @@ enum ConversationRowFactory {
             return h
 
         case "plan", "reviewMode":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
             let body = item.kind == "plan" ? item.text : item.review
             if !body.isEmpty {
@@ -174,7 +182,7 @@ enum ConversationRowFactory {
             return h
 
         case "hookPrompt":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
             for fragment in item.fragments {
                 h += verticalGap
@@ -184,23 +192,29 @@ enum ConversationRowFactory {
             }
             return h
 
+        case "toolActivityGroup":
+            // One semantic summary line; member rows are inserted only when
+            // the group disclosure is expanded by the controller.
+            let compactVerticalPadding = itemVerticalPadding * 2
+            let compactHeaderHeight = max(
+                ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutFont),
+                18
+            )
+            return compactVerticalPadding + compactHeaderHeight
+
         case "toolCall":
-            var h: CGFloat = 10 * 2
-            h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
-            h += verticalGap + textHeight(ToolPresentation.toolName(item),
-                                          font: ConversationRowMetrics.monoCalloutMediumFont, width: contentW)
-            let metadata = ToolPresentation.toolMetadata(item)
-            if !metadata.isEmpty {
-                h += verticalGap + ConversationRowMetrics.lineHeight(ConversationRowMetrics.monoCaptionFont)
-            }
-            // 参数/结果默认折叠：只算 disclosure 头（展开后的载荷高度由控制器补上）。
-            if !ToolPresentation.toolPayload(item).isEmpty {
-                h += verticalGap + disclosureHeaderHeight
-            }
-            return h
+            // Collapsed tool calls are always one compact summary line. The
+            // full payload is still measured by ConversationViewController
+            // when disclosure state is expanded.
+            let compactVerticalPadding = itemVerticalPadding * 2
+            let compactHeaderHeight = max(
+                ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutMediumFont),
+                18
+            )
+            return compactVerticalPadding + compactHeaderHeight
 
         case "collabAgentToolCall":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
             let metadata = [item.tool, item.statusName, item.model, item.reasoningEffort].filter { !$0.isEmpty }
             if !metadata.isEmpty {
@@ -215,7 +229,7 @@ enum ConversationRowFactory {
             return h
 
         case "media":
-            var h: CGFloat = 10 * 2
+            var h = itemVerticalPadding * 2
             h += ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)  // header
             let preview = MediaPreviewPresentation(item: item)
             if let image = preview.localImage {
@@ -232,11 +246,11 @@ enum ConversationRowFactory {
             return h
 
         case "contextCompaction":
-            // padding(.vertical, 10) + lone header.
-            return 10 * 2 + ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)
+            return itemVerticalPadding * 2
+                + ConversationRowMetrics.lineHeight(ConversationRowMetrics.captionSemiboldFont)
 
         default: // raw
-            let pad: CGFloat = 8 * 2
+            let pad = itemVerticalPadding * 2
             return pad + max(textHeight(item.descriptionText, font: ConversationRowMetrics.calloutFont, width: contentW),
                              ConversationRowMetrics.lineHeight(ConversationRowMetrics.calloutFont))
         }

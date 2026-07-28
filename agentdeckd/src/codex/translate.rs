@@ -47,9 +47,9 @@
 //!
 //! ## Unknown methods
 //!
-//! Unknown `item/*` notifications: surface as `AgentItem::Raw` with the
-//! method name and full JSON payload (so a future Codex version doesn't
-//! silently drop data). Unknown non-`item/` lifecycle notifications
+//! Unknown `item/*` notifications: surface as `AgentItem::Raw` with a bounded
+//! method/type identifier and a fixed withheld placeholder. Vendor JSON stays
+//! inside the adapter. Unknown non-`item/` lifecycle notifications
 //! (`thread/tokenUsage/updated`, `turn/diff/updated`, etc.) yield no
 //! events — Task 3B can wire those into vendor panel events later.
 
@@ -399,8 +399,8 @@ impl CodexTranslator {
             "item/autoApprovalReview/started" | "item/autoApprovalReview/completed" => Vec::new(),
             other if other.starts_with("item/") => {
                 // Unknown item-level notification. Don't drop; produce a Raw
-                // item carrying the method + payload so the issue is
-                // visible end-to-end.
+                // item carrying only a bounded identifier and fixed withheld
+                // placeholder so the issue stays visible without vendor JSON.
                 vec![self.raw_event_for_unknown_method(other, &json!({"params": params}))]
             }
             _ => Vec::new(),
@@ -488,7 +488,7 @@ impl CodexTranslator {
             .map(|p| p.kind)
             .unwrap_or(completed_kind);
         if matches!(kind, InFlightKind::Shell) {
-            let status = match shell_status_from(item) {
+            let status = match terminal_shell_status_from(item) {
                 Ok(status) => status,
                 Err(error) => {
                     return vec![ServerEvent::Error {
@@ -505,80 +505,7 @@ impl CodexTranslator {
             .as_ref()
             .map(|p| p.accumulated_text.clone())
             .unwrap_or_default();
-
-        let agent_item = match kind {
-            InFlightKind::AssistantMessage => {
-                // Prefer Codex's authoritative final text; fall back to our
-                // delta accumulator if the completed payload is missing it.
-                let text = item
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or(accumulated);
-                AgentItem::AssistantMessage {
-                    text,
-                    meta: assistant_meta(item),
-                }
-            }
-            InFlightKind::Reasoning => {
-                let text = {
-                    let final_text = reasoning_text(item);
-                    if !final_text.is_empty() {
-                        final_text
-                    } else {
-                        accumulated
-                    }
-                };
-                AgentItem::Reasoning {
-                    text,
-                    meta: AgentItemMeta::default(),
-                }
-            }
-            InFlightKind::Shell => unreachable!("shell completion returned above"),
-            InFlightKind::Diff => {
-                let files = diff_files(item);
-                AgentItem::Diff {
-                    files,
-                    meta: AgentItemMeta::default(),
-                }
-            }
-            InFlightKind::Plan => {
-                let steps = plan_steps(item, &accumulated);
-                AgentItem::Plan {
-                    steps,
-                    meta: AgentItemMeta::default(),
-                }
-            }
-            InFlightKind::Image => AgentItem::ImageReference {
-                saved_path: item
-                    .get("savedPath")
-                    .or_else(|| item.get("path"))
-                    .and_then(Value::as_str)
-                    .map(Into::into),
-                original_path: item.get("path").and_then(Value::as_str).map(Into::into),
-                meta: AgentItemMeta::default(),
-            },
-            InFlightKind::ToolCall => AgentItem::ToolCall {
-                name: tool_name(item),
-                args: item.get("arguments").cloned().unwrap_or(Value::Null),
-                result: item.get("result").cloned(),
-                meta: tool_meta(item),
-            },
-            InFlightKind::UserMessage => AgentItem::UserMessage {
-                text: user_message_text(item),
-                meta: AgentItemMeta::default(),
-            },
-            InFlightKind::Raw => AgentItem::Raw {
-                raw_kind: item
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
-                raw_payload: serde_json::to_string(item).unwrap_or_default(),
-                meta: AgentItemMeta::default(),
-            },
-        };
+        let agent_item = completed_item_to_agent_item(item, kind, &accumulated);
 
         vec![self.agent_item_event(agent_item, params)]
     }
@@ -586,31 +513,11 @@ impl CodexTranslator {
     // ── shell event builder (used for both Running + Completed/Failed) ─────
 
     fn shell_event(&self, item: &Value, status: ShellStatus) -> ServerEvent {
-        let cmd = item
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let exit_code = item
-            .get("exitCode")
-            .and_then(Value::as_i64)
-            .map(|v| v as i32);
-        let duration_ms = item
-            .get("durationMs")
-            .and_then(Value::as_i64)
-            .and_then(|v| if v < 0 { None } else { Some(v as u64) });
-        let item_payload = AgentItem::Shell {
-            command: cmd,
-            status,
-            exit_code,
-            duration_ms,
-            meta: AgentItemMeta::default(),
-        };
         ServerEvent::AgentItem {
             session_id: self.session_id.clone(),
             thread_id: self.resolve_thread_id(item),
             agent_kind: AgentKind::Codex,
-            item: item_payload,
+            item: shell_agent_item(item, status),
         }
     }
 
@@ -800,14 +707,13 @@ impl CodexTranslator {
     }
 
     fn raw_event_for_unknown_method(&self, method: &str, frame: &Value) -> ServerEvent {
-        let raw_payload = serde_json::to_string(frame).unwrap_or_default();
         ServerEvent::AgentItem {
             session_id: self.session_id.clone(),
             thread_id: self.resolve_thread_id(frame),
             agent_kind: AgentKind::Codex,
             item: AgentItem::Raw {
-                raw_kind: method.to_string(),
-                raw_payload,
+                raw_kind: safe_vendor_identifier(method),
+                raw_payload: WITHHELD_VENDOR_RAW_PAYLOAD.into(),
                 meta: AgentItemMeta::default(),
             },
         }
@@ -834,6 +740,22 @@ fn thread_id_from_params(params: &Value) -> Option<&str> {
 
 // ── classification + field extraction helpers ───────────────────────────────
 
+const WITHHELD_VENDOR_RAW_PAYLOAD: &str = "[vendor payload withheld]";
+const MAX_VENDOR_IDENTIFIER_BYTES: usize = 64;
+
+fn safe_vendor_identifier(identifier: &str) -> String {
+    if !identifier.is_empty()
+        && identifier.len() <= MAX_VENDOR_IDENTIFIER_BYTES
+        && identifier.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/')
+        })
+    {
+        identifier.to_string()
+    } else {
+        "unknown".into()
+    }
+}
+
 pub(super) fn classify(item: &Value) -> InFlightKind {
     match item.get("type").and_then(Value::as_str).unwrap_or("") {
         "agentMessage" => InFlightKind::AssistantMessage,
@@ -842,11 +764,110 @@ pub(super) fn classify(item: &Value) -> InFlightKind {
         "fileChange" => InFlightKind::Diff,
         "plan" => InFlightKind::Plan,
         "imageView" | "imageGeneration" => InFlightKind::Image,
-        "mcpToolCall" | "dynamicToolCall" | "collabAgentToolCall" | "webSearch" => {
-            InFlightKind::ToolCall
-        }
+        "mcpToolCall"
+        | "dynamicToolCall"
+        | "collabAgentToolCall"
+        | "subAgentActivity"
+        | "contextCompaction"
+        | "webSearch" => InFlightKind::ToolCall,
         "userMessage" => InFlightKind::UserMessage,
         _ => InFlightKind::Raw,
+    }
+}
+
+/// Map one fully materialized `ThreadItem` from `thread/read` through the
+/// same completed-item mapping used by the live notification stream.
+pub(super) fn history_item_to_agent_item(item: &Value) -> AgentItem {
+    completed_item_to_agent_item(item, classify(item), "")
+}
+
+fn completed_item_to_agent_item(item: &Value, kind: InFlightKind, accumulated: &str) -> AgentItem {
+    match kind {
+        InFlightKind::AssistantMessage => {
+            // Prefer Codex's authoritative final text; fall back to the live
+            // delta accumulator when an item/completed payload is sparse.
+            let text = item
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .unwrap_or(accumulated)
+                .to_string();
+            AgentItem::AssistantMessage {
+                text,
+                meta: assistant_meta(item),
+            }
+        }
+        InFlightKind::Reasoning => {
+            let final_text = reasoning_text(item);
+            AgentItem::Reasoning {
+                text: if final_text.is_empty() {
+                    accumulated.to_string()
+                } else {
+                    final_text
+                },
+                meta: AgentItemMeta::default(),
+            }
+        }
+        InFlightKind::Shell => shell_agent_item(item, shell_status_from(item)),
+        InFlightKind::Diff => AgentItem::Diff {
+            files: diff_files(item),
+            meta: AgentItemMeta::default(),
+        },
+        InFlightKind::Plan => AgentItem::Plan {
+            steps: plan_steps(item, accumulated),
+            meta: AgentItemMeta::default(),
+        },
+        InFlightKind::Image => AgentItem::ImageReference {
+            saved_path: item
+                .get("savedPath")
+                .or_else(|| item.get("path"))
+                .and_then(Value::as_str)
+                .map(Into::into),
+            original_path: item.get("path").and_then(Value::as_str).map(Into::into),
+            meta: AgentItemMeta::default(),
+        },
+        InFlightKind::ToolCall => AgentItem::ToolCall {
+            name: tool_name(item),
+            args: tool_args(item),
+            result: tool_result(item),
+            meta: tool_meta(item),
+        },
+        InFlightKind::UserMessage => AgentItem::UserMessage {
+            text: user_message_text(item),
+            meta: AgentItemMeta::default(),
+        },
+        InFlightKind::Raw => AgentItem::Raw {
+            raw_kind: safe_vendor_identifier(
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            ),
+            raw_payload: WITHHELD_VENDOR_RAW_PAYLOAD.into(),
+            meta: AgentItemMeta::default(),
+        },
+    }
+}
+
+fn shell_agent_item(item: &Value, status: ShellStatus) -> AgentItem {
+    let command = item
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let exit_code = item
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let duration_ms = item
+        .get("durationMs")
+        .and_then(Value::as_i64)
+        .and_then(|value| u64::try_from(value).ok());
+    AgentItem::Shell {
+        command,
+        status,
+        exit_code,
+        duration_ms,
+        meta: AgentItemMeta::default(),
     }
 }
 
@@ -877,14 +898,44 @@ pub(super) fn tool_meta(item: &Value) -> AgentItemMeta {
             meta.vendor_extensions.insert(key.to_string(), v.clone());
         }
     }
+    if let Some(app_context) = item.get("appContext") {
+        for (source, target) in [("resourceUri", "resourceUri"), ("actionName", "actionName")] {
+            if let Some(value) = app_context.get(source) {
+                meta.vendor_extensions
+                    .insert(target.to_string(), value.clone());
+            }
+        }
+    }
     if let Some(kind) = item.get("type").and_then(Value::as_str) {
         meta.vendor_extensions
             .insert("codexToolKind".to_string(), json!(kind));
+        if matches!(kind, "collabAgentToolCall" | "subAgentActivity") {
+            // The shared UI must not need to understand a Codex item name in
+            // order to keep collaboration controls outside ordinary execution
+            // summaries. Carry only the neutral semantic across the trunk.
+            meta.vendor_extensions
+                .insert("activityKind".to_string(), json!("collaboration"));
+        }
+        if kind == "subAgentActivity" {
+            if let Some(activity_event @ ("started" | "interacted" | "interrupted")) =
+                item.get("kind").and_then(Value::as_str)
+            {
+                meta.vendor_extensions
+                    .insert("activityEvent".to_string(), json!(activity_event));
+            }
+        }
+        if kind == "contextCompaction" {
+            meta.vendor_extensions
+                .insert("activityKind".to_string(), json!("contextMaintenance"));
+        }
     }
     meta
 }
 
 pub(super) fn tool_name(item: &Value) -> String {
+    if item.get("type").and_then(Value::as_str) == Some("subAgentActivity") {
+        return sub_agent_activity_name(item);
+    }
     item.get("tool")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -895,6 +946,63 @@ pub(super) fn tool_name(item: &Value) -> String {
                 .unwrap_or("tool")
                 .to_string()
         })
+}
+
+fn sub_agent_activity_name(item: &Value) -> String {
+    let component = item
+        .get("agentPath")
+        .and_then(Value::as_str)
+        .and_then(|path| path.rsplit('/').find(|part| !part.is_empty()))
+        .unwrap_or("subagent");
+    let readable = component.replace('_', " ").replace('-', " ");
+    let readable = readable.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = readable.chars();
+    let Some(first) = characters.next() else {
+        return "Subagent".into();
+    };
+    format!("{}{}", first.to_uppercase(), characters.as_str())
+}
+
+fn object_with_present_fields(item: &Value, fields: &[&str]) -> Value {
+    let mut object = serde_json::Map::new();
+    for field in fields {
+        if let Some(value) = item.get(*field) {
+            object.insert((*field).to_string(), value.clone());
+        }
+    }
+    Value::Object(object)
+}
+
+fn tool_args(item: &Value) -> Value {
+    match item.get("type").and_then(Value::as_str).unwrap_or("") {
+        "webSearch" => object_with_present_fields(item, &["query", "action"]),
+        "collabAgentToolCall" => object_with_present_fields(
+            item,
+            &[
+                "prompt",
+                "model",
+                "reasoningEffort",
+                "receiverThreadIds",
+                "senderThreadId",
+            ],
+        ),
+        "subAgentActivity" => {
+            object_with_present_fields(item, &["id", "agentPath", "agentThreadId", "kind"])
+        }
+        _ => item.get("arguments").cloned().unwrap_or(Value::Null),
+    }
+}
+
+fn tool_result(item: &Value) -> Option<Value> {
+    match item.get("type").and_then(Value::as_str).unwrap_or("") {
+        "dynamicToolCall" => Some(object_with_present_fields(
+            item,
+            &["contentItems", "success"],
+        )),
+        "webSearch" => Some(object_with_present_fields(item, &["results"])),
+        "collabAgentToolCall" => Some(object_with_present_fields(item, &["agentsStates"])),
+        _ => item.get("result").cloned(),
+    }
 }
 
 pub(super) fn reasoning_text(item: &Value) -> String {
@@ -921,20 +1029,14 @@ pub(super) fn user_message_text(item: &Value) -> String {
         .map(|content| {
             content
                 .iter()
-                .filter_map(|part| {
-                    if part.get("type").and_then(Value::as_str) == Some("text") {
-                        part.get("text").and_then(Value::as_str)
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(user_input_text)
                 .collect::<Vec<_>>()
                 .join("\n\n")
         })
         .unwrap_or_default()
 }
 
-pub(super) fn shell_status_from(item: &Value) -> Result<ShellStatus, ProtocolError> {
+pub(super) fn terminal_shell_status_from(item: &Value) -> Result<ShellStatus, ProtocolError> {
     match item.get("status").and_then(Value::as_str) {
         Some("completed") => Ok(ShellStatus::Completed),
         Some("failed") => Ok(ShellStatus::Failed),
@@ -953,25 +1055,94 @@ pub(super) fn shell_status_from(item: &Value) -> Result<ShellStatus, ProtocolErr
     }
 }
 
+/// Keep every official `UserInput` variant visible in history replay. The
+/// neutral protocol only has a text user-message today, so non-text inputs use
+/// compact readable references instead of silently becoming an empty message.
+fn user_input_text(part: &Value) -> Option<String> {
+    let kind = part.get("type").and_then(Value::as_str)?;
+    match kind {
+        "text" => part.get("text").and_then(Value::as_str).map(str::to_string),
+        "image" => part
+            .get("url")
+            .and_then(Value::as_str)
+            .map(|value| format!("[image: {value}]")),
+        "localImage" => part
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|value| format!("[local image: {value}]")),
+        "audio" => part
+            .get("url")
+            .and_then(Value::as_str)
+            .map(|value| format!("[audio: {value}]")),
+        "localAudio" => part
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|value| format!("[local audio: {value}]")),
+        "skill" | "mention" => {
+            let name = part.get("name").and_then(Value::as_str).unwrap_or(kind);
+            let path = part.get("path").and_then(Value::as_str).unwrap_or("");
+            Some(if path.is_empty() {
+                format!("[{kind}: {name}]")
+            } else {
+                format!("[{kind}: {name} ({path})]")
+            })
+        }
+        other => Some(format!("[unsupported input: {other}]")),
+    }
+}
+
+fn shell_status_from(item: &Value) -> ShellStatus {
+    let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+    match status {
+        "inProgress" => ShellStatus::Running,
+        "completed" | "success" => ShellStatus::Completed,
+        "failed" | "error" => ShellStatus::Failed,
+        "canceled" | "cancelled" | "declined" => ShellStatus::Canceled,
+        _ => {
+            // Fall back to exit code when status is missing/unknown.
+            match item.get("exitCode").and_then(Value::as_i64) {
+                Some(0) => ShellStatus::Completed,
+                Some(_) => ShellStatus::Failed,
+                None => ShellStatus::Completed,
+            }
+        }
+    }
+}
+
 pub(super) fn diff_files(item: &Value) -> Vec<DiffFile> {
     item.get("changes")
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
                 .map(|change| {
-                    let path = change
+                    let original_path = change
                         .get("path")
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    let status = match change.get("kind").and_then(Value::as_str).unwrap_or("") {
+                    let kind_value = change.get("kind");
+                    let kind = kind_value
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            kind_value
+                                .and_then(Value::as_object)
+                                .and_then(|object| object.get("type"))
+                                .and_then(Value::as_str)
+                        })
+                        .unwrap_or("");
+                    let move_path = kind_value
+                        .and_then(Value::as_object)
+                        .and_then(|object| object.get("move_path"))
+                        .and_then(Value::as_str);
+                    let status = match kind {
                         "add" | "added" | "create" => DiffStatus::Added,
                         "delete" | "deleted" | "remove" => DiffStatus::Deleted,
                         "rename" | "renamed" => DiffStatus::Renamed,
+                        "update" if move_path.is_some() => DiffStatus::Renamed,
                         _ => DiffStatus::Modified,
                     };
                     DiffFile {
-                        path: std::path::PathBuf::from(path),
+                        path: std::path::PathBuf::from(move_path.unwrap_or(&original_path)),
                         status,
                         patch: change
                             .get("diff")
@@ -1350,6 +1521,213 @@ mod tests {
     }
 
     #[test]
+    fn completed_shell_mapping_preserves_in_progress_and_declined_statuses() {
+        let in_progress = history_item_to_agent_item(&json!({
+            "id": "shell-running",
+            "type": "commandExecution",
+            "command": "sleep 1",
+            "status": "inProgress"
+        }));
+        assert!(matches!(
+            in_progress,
+            AgentItem::Shell {
+                status: ShellStatus::Running,
+                ..
+            }
+        ));
+
+        let declined = history_item_to_agent_item(&json!({
+            "id": "shell-declined",
+            "type": "commandExecution",
+            "command": "rm file",
+            "status": "declined"
+        }));
+        assert!(matches!(
+            declined,
+            AgentItem::Shell {
+                status: ShellStatus::Canceled,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn shared_tool_mapping_preserves_official_web_dynamic_and_collab_fields() {
+        let web = history_item_to_agent_item(&json!({
+            "id": "web-1",
+            "type": "webSearch",
+            "query": "rust app-server",
+            "action": { "type": "search", "query": "rust app-server" },
+            "results": [{ "url": "https://example.com" }]
+        }));
+        match web {
+            AgentItem::ToolCall {
+                name, args, result, ..
+            } => {
+                assert_eq!(name, "webSearch");
+                assert_eq!(args["query"], "rust app-server");
+                assert_eq!(args["action"]["type"], "search");
+                assert_eq!(
+                    result.expect("web result")["results"][0]["url"],
+                    "https://example.com"
+                );
+            }
+            other => panic!("expected web ToolCall, got {other:?}"),
+        }
+
+        let dynamic = history_item_to_agent_item(&json!({
+            "id": "dynamic-1",
+            "type": "dynamicToolCall",
+            "tool": "lookup",
+            "arguments": { "key": "value" },
+            "contentItems": [{ "type": "inputText", "text": "found" }],
+            "success": true,
+            "status": "completed"
+        }));
+        match dynamic {
+            AgentItem::ToolCall {
+                name, args, result, ..
+            } => {
+                assert_eq!(name, "lookup");
+                assert_eq!(args["key"], "value");
+                let result = result.expect("dynamic result");
+                assert_eq!(result["contentItems"][0]["text"], "found");
+                assert_eq!(result["success"], true);
+            }
+            other => panic!("expected dynamic ToolCall, got {other:?}"),
+        }
+
+        let mcp = history_item_to_agent_item(&json!({
+            "id": "mcp-1",
+            "type": "mcpToolCall",
+            "server": "node_repl",
+            "tool": "js",
+            "arguments": { "code": "..." },
+            "status": "completed",
+            "appContext": {
+                "connectorId": "computer-use",
+                "resourceUri": "app://agentdeck",
+                "actionName": "确认 AgentDeck 窗口"
+            }
+        }));
+        match mcp {
+            AgentItem::ToolCall { meta, .. } => {
+                assert_eq!(meta.vendor_extensions["resourceUri"], "app://agentdeck");
+                assert_eq!(meta.vendor_extensions["actionName"], "确认 AgentDeck 窗口");
+                assert!(!meta.vendor_extensions.contains_key("activityKind"));
+            }
+            other => panic!("expected MCP ToolCall, got {other:?}"),
+        }
+
+        let collab = history_item_to_agent_item(&json!({
+            "id": "collab-1",
+            "type": "collabAgentToolCall",
+            "tool": "spawnAgent",
+            "prompt": "review this",
+            "receiverThreadIds": ["child-1"],
+            "senderThreadId": "parent-1",
+            "agentsStates": {
+                "child-1": { "status": "completed", "message": null }
+            },
+            "status": "completed"
+        }));
+        match collab {
+            AgentItem::ToolCall {
+                name,
+                args,
+                result,
+                meta,
+            } => {
+                assert_eq!(name, "spawnAgent");
+                assert_eq!(meta.vendor_extensions["activityKind"], "collaboration");
+                assert_eq!(args["prompt"], "review this");
+                assert_eq!(args["receiverThreadIds"][0], "child-1");
+                assert_eq!(args["senderThreadId"], "parent-1");
+                assert_eq!(
+                    result.expect("collab result")["agentsStates"]["child-1"]["status"],
+                    "completed"
+                );
+            }
+            other => panic!("expected collab ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_tool_mapping_preserves_subagent_activity_without_inventing_status() {
+        for activity_event in ["started", "interacted", "interrupted"] {
+            let item = history_item_to_agent_item(&json!({
+                "id": format!("activity-{activity_event}"),
+                "type": "subAgentActivity",
+                "kind": activity_event,
+                "agentThreadId": "child-1",
+                "agentPath": "/root/tool_ui_trace",
+                "vendorSecret": "must-not-cross"
+            }));
+
+            match item {
+                AgentItem::ToolCall {
+                    name,
+                    args,
+                    result,
+                    meta,
+                } => {
+                    assert_eq!(name, "Tool ui trace");
+                    assert_eq!(args["id"], format!("activity-{activity_event}"));
+                    assert_eq!(args["agentPath"], "/root/tool_ui_trace");
+                    assert_eq!(args["agentThreadId"], "child-1");
+                    assert_eq!(args["kind"], activity_event);
+                    assert!(args.get("vendorSecret").is_none());
+                    assert!(result.is_none());
+                    assert_eq!(meta.vendor_extensions["codexToolKind"], "subAgentActivity");
+                    assert_eq!(meta.vendor_extensions["activityKind"], "collaboration");
+                    assert_eq!(meta.vendor_extensions["activityEvent"], activity_event);
+                    assert!(!meta.vendor_extensions.contains_key("status"));
+                }
+                other => panic!("expected subagent activity ToolCall, got {other:?}"),
+            }
+        }
+
+        let unknown = history_item_to_agent_item(&json!({
+            "id": "activity-future",
+            "type": "subAgentActivity",
+            "kind": "futureEvent",
+            "agentThreadId": "child-1",
+            "agentPath": "/root/tool_ui_trace"
+        }));
+        match unknown {
+            AgentItem::ToolCall { meta, .. } => {
+                assert_eq!(meta.vendor_extensions["activityKind"], "collaboration");
+                assert!(!meta.vendor_extensions.contains_key("activityEvent"));
+            }
+            other => panic!("expected future subagent activity ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_tool_mapping_lowers_context_compaction_to_neutral_maintenance_activity() {
+        let item = history_item_to_agent_item(&json!({
+            "id": "compact-1",
+            "type": "contextCompaction"
+        }));
+
+        match item {
+            AgentItem::ToolCall {
+                name,
+                args,
+                result,
+                meta,
+            } => {
+                assert_eq!(name, "contextCompaction");
+                assert!(args.is_null());
+                assert!(result.is_none());
+                assert_eq!(meta.vendor_extensions["codexToolKind"], "contextCompaction");
+                assert_eq!(meta.vendor_extensions["activityKind"], "contextMaintenance");
+            }
+            other => panic!("expected context maintenance ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn approval_request_emits_action_request_with_codex_vendor_block() {
         let mut t = CodexTranslator::with_policy(
             SessionId("s1".into()),
@@ -1418,7 +1796,7 @@ mod tests {
         let events = t.translate_value(&json!({
             "method": "item/completed",
             "params": {"item": {"id": "x", "type": "newFutureItem",
-                                "vendorSecret": "do-not-care"}}
+                                "vendorSecret": "sk-history-secret-must-not-cross-k9"}}
         }));
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -1432,9 +1810,74 @@ mod tests {
                 ..
             } => {
                 assert_eq!(raw_kind, "newFutureItem");
-                assert!(raw_payload.contains("newFutureItem"));
+                assert_eq!(raw_payload, WITHHELD_VENDOR_RAW_PAYLOAD);
+                assert!(!raw_payload.contains("sk-history-secret"));
             }
             other => panic!("expected Raw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_history_item_keeps_only_safe_type_and_fixed_placeholder() {
+        let item = history_item_to_agent_item(&json!({
+            "id": "future-1",
+            "type": "futureItemV2",
+            "vendorSecret": "sk-history-secret-must-not-cross-k9",
+            "nested": { "token": "vendor-token-value" }
+        }));
+        let AgentItem::Raw {
+            raw_kind,
+            raw_payload,
+            ..
+        } = item
+        else {
+            panic!("expected Raw history item");
+        };
+
+        assert_eq!(raw_kind, "futureItemV2");
+        assert_eq!(raw_payload, WITHHELD_VENDOR_RAW_PAYLOAD);
+        assert!(!raw_payload.contains("sk-history-secret"));
+        assert!(!raw_payload.contains("vendor-token-value"));
+
+        let unsafe_type = history_item_to_agent_item(&json!({
+            "type": "future item: sk-type-secret",
+            "vendorSecret": "still-hidden"
+        }));
+        assert!(matches!(
+            unsafe_type,
+            AgentItem::Raw { raw_kind, raw_payload, .. }
+                if raw_kind == "unknown" && raw_payload == WITHHELD_VENDOR_RAW_PAYLOAD
+        ));
+    }
+
+    #[test]
+    fn history_user_message_keeps_every_official_input_variant_visible() {
+        let item = history_item_to_agent_item(&json!({
+            "id": "user-1",
+            "type": "userMessage",
+            "content": [
+                { "type": "text", "text": "hello" },
+                { "type": "image", "url": "https://example.test/a.png" },
+                { "type": "localImage", "path": "/tmp/a.png" },
+                { "type": "audio", "url": "https://example.test/a.wav" },
+                { "type": "localAudio", "path": "/tmp/a.wav" },
+                { "type": "skill", "name": "review", "path": "/skills/review" },
+                { "type": "mention", "name": "README", "path": "/repo/README.md" }
+            ]
+        }));
+        let AgentItem::UserMessage { text, .. } = item else {
+            panic!("expected UserMessage");
+        };
+        for expected in [
+            "hello",
+            "[image: https://example.test/a.png]",
+            "[local image: /tmp/a.png]",
+            "[audio: https://example.test/a.wav]",
+            "[local audio: /tmp/a.wav]",
+            "[skill: review (/skills/review)]",
+            "[mention: README (/repo/README.md)]",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
         }
     }
 

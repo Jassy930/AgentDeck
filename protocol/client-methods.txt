@@ -7,7 +7,9 @@ account/read
 account/sendAddCreditsNudgeEmail
 account/usage/read
 account/workspaceMessages/read
+app/installed
 app/list
+app/read
 command/exec
 command/exec/resize
 command/exec/terminate

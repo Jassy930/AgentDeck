@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；R0 complete，R1 pending |
+| 状态 | In execution；R0、R1 complete，R2 pending |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -164,11 +164,11 @@ scripts/verify-agent-docs.sh
 
 ### Tasks
 
-- [ ] R1.1：只读生成 merge-base、冲突面和 path manifest。
-- [ ] R1.2：合入 `master`，逐文件解决冲突；禁止整侧覆盖。
-- [ ] R1.3：先跑 Swift/AppKit focused 和 P5.7 dual-scope，再跑 P4 automatic。
-- [ ] R1.4：完整 Rust/Swift/iOS/运行态门禁与双路 review。
-- [ ] R1.5：提交唯一 master-sync commit，读回 clean status。
+- [x] R1.1：只读生成 merge-base、冲突面和 path manifest。
+- [x] R1.2：合入 `master`，逐文件解决冲突；禁止整侧覆盖。
+- [x] R1.3：先跑 Swift/AppKit focused 和 P5.7 dual-scope，再跑 P4 automatic。
+- [x] R1.4：完整 Rust/Swift/iOS/运行态门禁与双路 review。
+- [x] R1.5：提交唯一 master-sync commit，读回 clean status。
 
 ### Focused gates
 
@@ -200,6 +200,56 @@ git status --short --branch
 - 启动 App，读回本机历史、输入栏、会话切换和窗口交互无主线回归。
 - local scope 只走 UDS；remote source 走真实 RemoteLink；事件不串线。
 - App 关闭不终止 stable daemon；test/preview 不接触 production namespace。
+
+### Pre-closeout readback（2026-07-28）
+
+- merge-base 为 `81f4c27db519556b90c245ce83f6a308d453b0e3`；冻结 rescue HEAD 为
+  `1950f939135e9acc1ed824456b66961041217015`，`master` / `MERGE_HEAD` 为
+  `8f895eaecbf7ea22e27d66293917ee9c31c4a34e`。同步前 `HEAD...master` 为 `275/36`，master
+  输入共 120 个路径；40 个文本冲突已逐文件解决，`git ls-files -u` 为空。
+- 最终候选相对 rescue HEAD 为 116 个路径、`+15178/-4925`。其中 115 个为 master 同步与集成修复路径，
+  另 1 个为本 rescue 实施计划；大部分体量来自 master 已提交的 AppKit 富渲染、
+  Codex 0.145.0 官方 schema/`thread/list`/`thread/read` 兼容与打包脚本，不是 R1 新增 Relay 平台。
+  冲突收敛继续保留 Runtime v5 canonical UDS、singleton stable daemon、`SessionSource`、exec/metadata gate 和
+  canonical `conversationID`；普通 GUI 没有新增 daemon child。
+- master 侧旧 `DaemonLaunchTests`、`SessionModelHistoryMutationTests` 与
+  `SessionModelHistoryNavigationTests` 没有进入最终树：前者验证 App-owned daemon，后两者验证直接 history
+  mutation/navigation，均与 rescue 冻结边界冲突。相同行为由 shared-daemon transport、Runtime metadata、
+  canonical catalog/sidebar 与 composer integration 测试覆盖。
+- 打包 Preview 首轮运行出现“窗口可交互但历史永远 loading、异步新会话不执行”。LLDB 读回
+  `runtimeConnectionAvailable=false` 且 operation task 已创建未调度；根因是 `main.swift` 顶层 `await` 把入口变为
+  async main，随后同一 MainActor task 阻塞在 `NSApplication.run()`。修复把 headless async selfcheck/smoke 收进
+  `runBlockingAsync`，GUI 恢复同步入口；Preview fixture 的 register/select 延后到事件循环后的 `prepare()`，
+  history 使用 completion barrier，不再 MainActor 轮询。
+- focused warnings-as-errors 为 `35 passed / 0 failed`；`p4-auto`、local Runtime smoke、diagnostics 和 fresh iOS
+  `133/133` 已通过。重新打包 `./script/build_and_run.sh --verify` PASS；真实 Preview 显示 3 条历史、可切换会话，
+  新会话 `relay rescue ui qa` 收到 synthetic terminal，窗口从 `929x760` 缩放为 `859x760`，关闭后进程 exit 0。
+  stable selfcheck 因当前账号没有 production-signed LaunchAgent/socket 继续 typed `BLOCKED`，不记为 PASS。
+- 当前仍处于 `git merge --no-ff --no-commit master`。R1.4 最终全量门禁、候选 hash 和双路 review，以及 R1.5
+  唯一 merge commit/clean status 尚未完成；不得把本段 pre-closeout 证据写成 R1 complete。
+
+### Final automatic gate readback（2026-07-28）
+
+- `RUSTC_WRAPPER= swift test -Xswiftc -warnings-as-errors`：`1152 XCTest passed / 4 Keychain entitlement skipped`
+  与 `48 Swift Testing passed`，零失败。
+- `RUSTC_WRAPPER= cargo test --locked --no-fail-fast -- --test-threads=1`：exit 0；daemon lib
+  `1708 passed / 3 ignored`，其余 workspace integration/doc-test 零失败。额外 ignored 仅为交互式 P5.7 host、
+  外部 fixture、production-signed Keychain 和显式慢/手动门禁，均未计入 PASS。
+- `p4-auto`、隔离 local Runtime smoke 与 diagnostics 均 exit 0；smoke 读回双安装身份、双 owner command、
+  owner-scoped receipt、共享 Runtime 收敛且 `fallbackSpawned=false`。四份 schema diff、daemon network/no-net、
+  `cargo fmt --check`、agent docs 与 `git diff --check` 全部 exit 0。
+- fresh DerivedData iPhone 17 Simulator `.xcresult` 读回 `133 passed / 0 failed / 0 skipped`。production-signed
+  stable selfcheck 继续 typed `BLOCKED`，不计入 automatic PASS。
+- 冻结 code/test/config manifest 为 96 个路径，按 `git blob-or-DELETED + path` 排序后的 SHA-256 为
+  `43f172a6fed614883b8df9280337014473b4d3021818a12779e908d42d19cd8f`；完整 116-path
+  `name-status` manifest SHA-256 为 `e491aef9260def4e1f2c0a15f31b26a97a74912b0cc43633030eb2ecb008524b`。
+  最终双路复审在同一 code/test hash 上均为 Approved，`P0/P1/P2=0`；本节随唯一 master-sync merge commit
+  原子收口，提交后读回 clean，R1 complete。
+- `spec/security` 复审确认 Runtime v5 / Relay v2 / E2EE v1、唯一 local UDS、per-machine remote source、
+  Runtime exec/metadata gate、vendor-token 边界和 canonical conversation identity 未被 master 同步改写。
+  `quality/Git` 复审确认被删除的三份 master 测试只覆盖已拒绝的 App-owned/direct-history 模型，正式路径已有
+  shared-daemon、Runtime metadata、sidebar/composer 与 Preview lifecycle 回归；冲突标记、二进制、DB、日志、
+  secret 和构建产物均未进入 manifest。两路均无剩余 P0/P1/P2。
 
 ### Exit
 
@@ -441,7 +491,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | 阶段 | 状态 | Candidate | 自动门禁 | 运行/UI读回 | Review | Git 状态 |
 |---|---|---|---|---|---|---|
 | R0 基线冻结 | complete | code `e400c1c`；本阶段 docs commit | `p4-auto` PASS；Swift 50/50；docs/diff PASS | real daemon + local UDS/RemoteLink PASS | 双路 P0/P1/P2=0 | scoped commit 后 clean |
-| R1 master 同步 | pending | — | — | — | — | — |
+| R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | pending | — | — | — | — | — |
 | R3 P5.8-lite | pending | — | — | — | — | — |
 | R4 Simulator E2E | pending | — | — | — | — | — |

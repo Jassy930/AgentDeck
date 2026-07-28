@@ -23,6 +23,47 @@ final class FakeTransport: DaemonTransport {
     func sent(containing needle: String) -> Bool { sentLines.contains { $0.contains(needle) } }
 }
 
+/// 等待 MainActor 模型状态异步收口，同时把执行机会让给主队列。
+@MainActor
+func waitUntil(
+    timeout: Duration = .seconds(2),
+    condition: @MainActor () -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !condition(), clock.now < deadline {
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    return condition()
+}
+
+/// 纯 UI 测试使用的 dormant Runtime v5 wire。它不启动 daemon，也不提供第二套
+/// execution owner；一旦测试意外触发 I/O 就立即失败。
+private enum TestDormantRuntimeWireError: Error {
+    case unexpectedUse
+}
+
+private struct TestDormantRuntimeWire: AppRuntimeWireSession {
+    func start() async throws { throw TestDormantRuntimeWireError.unexpectedUse }
+    func request(_ request: RuntimeRequestV2) async throws -> RuntimeReplyV2 {
+        throw TestDormantRuntimeWireError.unexpectedUse
+    }
+    func beginAppSynchronizedRequest(
+        _ request: RuntimeRequestV2
+    ) async throws -> any AppRuntimeWireReplySequence {
+        throw TestDormantRuntimeWireError.unexpectedUse
+    }
+    func nextStream() async throws -> LocalRuntimeStreamFrame {
+        throw TestDormantRuntimeWireError.unexpectedUse
+    }
+    func close() async {}
+}
+
+@MainActor
+func makeTestSessionModel() -> SessionModel {
+    SessionModel(runtimeWire: TestDormantRuntimeWire())
+}
+
 // MARK: - Spy 替身：捕获交互出口
 
 @MainActor

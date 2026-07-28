@@ -45,6 +45,17 @@ enum DesignTokens {
     static let sp10: CGFloat = 40
     static let sp12: CGFloat = 48
 
+    // 排版（字号与行高倍率）
+    static let typeDisplayXl: CGFloat = 34
+    static let typeDisplay: CGFloat = 24
+    static let typeTitle: CGFloat = 16
+    static let typeBody: CGFloat = 14
+    static let typeCallout: CGFloat = 13
+    static let typeCaption: CGFloat = 11
+    static let typeMono: CGFloat = 12.5
+    static let lineHeightCJK: CGFloat = 1.72
+    static let lineHeightLatin: CGFloat = 1.45
+
     // 阴影（分层柔光，供 roundedPanel 使用）
     static let panelShadowColor = NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.42)
     static let panelShadowBlur: CGFloat = 26

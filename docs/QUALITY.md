@@ -3566,6 +3566,83 @@ WSS、第二台 Mac、真实 vendor、Linux systemd 与 destructive purge 继续
 `BLOCKED` 槽位；R0 没有创建 remote/tag、没有 push，也没有把这些 absence 写成 PASS。两路最终 review
 分别检查事实源/安全停止线与命令/文档/Git hygiene，均要求 `P0=0 / P1=0 / P2=0` 后才允许提交。
 
+## Relay Companion MVP rescue R1 master 同步候选门禁
+
+R1 只同步 master 并修复集成回归，不新增 Relay feature。merge-base 为
+`81f4c27db519556b90c245ce83f6a308d453b0e3`；rescue HEAD 为
+`1950f939135e9acc1ed824456b66961041217015`，master / `MERGE_HEAD` 为
+`8f895eaecbf7ea22e27d66293917ee9c31c4a34e`。master 输入 120 个路径，40 个文本冲突逐文件解决；最终候选
+相对 rescue HEAD 为 116 个路径、`+15178/-4925`，其中 115 个为同步/修复路径、1 个为 rescue 计划；
+`git ls-files -u` 为 0。该规模主要来自 master 已提交的
+AppKit 富渲染、Codex 0.145.0 官方 schema 与 history compatibility、设计系统和 bundle 验证，不得记成 R1
+重新实现了一套 Relay/本地运行平台。
+
+冲突结果必须同时满足以下门禁：
+
+- 保留唯一 current Runtime v5 UDS、singleton stable daemon、SessionSource registry、exec gate 与 Runtime
+  metadata gate；普通 GUI 不得 spawn daemon child，App termination 只关闭/等待当前 client owners。
+- Codex 0.145.0 的共享 app-server process/RPC primitive 与 `thread/list`、`thread/read` 只属于 adapter
+  compatibility；vendor stderr/解码内容继续丢弃或脱敏，不形成第二个 common history/runtime owner。
+- CC Rename/Archive/Unarchive 与其他历史写仍须经过 Runtime metadata gate。master 新增的 App-owned daemon
+  launch test 和直接 `SessionModel` history mutation/navigation tests 不进入候选；shared-daemon、Runtime metadata、
+  canonical catalog/sidebar/composer 测试继续覆盖正式路径。
+- UI 使用 canonical `conversationID` / `RuntimeConversationID`。agent-kind 判断只允许 identity/capability/presentation
+  数据映射，不允许代替 `CapabilityRouter` 选择 UI 控制路径。
+- protocol 版本保持 Runtime v5 / Relay v2 / E2EE v1；schema 必须与生成器一致，不新增物理版本。
+
+原生 Preview 在首次打包运行中暴露了一个 MainActor starvation：`main.swift` 的顶层 `await` 使 GUI 入口成为
+async main，随后阻塞式 `NSApplication.run()` 占住 MainActor；AppKit 同步回调仍工作，但新建的 MainActor task
+永远无法调度。修复后 GUI 入口保持同步，只有 headless selfcheck/runtime smoke 经 `runBlockingAsync` 等待 async
+Runtime；Preview fixture register/select 在事件循环后的 `prepare()` 执行，history bootstrap 使用显式 completion
+barrier。新增 composition、live sidebar、新会话 admission、窗口生命周期和 blocking bridge 回归测试。
+
+pre-closeout 证据：focused warnings-as-errors `35/35`；fresh iOS Simulator `133/133`；`p4-auto`、local Runtime
+smoke、diagnostics 与 `./script/build_and_run.sh --verify` PASS。真实 Preview 读回 3 条历史、会话切换、输入栏、
+新会话 `relay rescue ui qa` 的 synthetic terminal、右缘 `929x760 -> 859x760` resize，关闭后 exit 0 且无本轮
+残留进程。旧 PID `32750` 属于 2026-07-21 的外部 daemon，不终止也不计入 R1 证据。stable
+`swift run AgentDeck -- --selfcheck` 缺少当前账号 production-signed LaunchAgent/socket，继续 typed `BLOCKED`。
+
+最终候选只有在下列命令全部完成、同一代码/测试内容 hash 的 `spec/security` 与 `quality/Git` 复审均为
+`P0=0 / P1=0 / P2=0`，并创建唯一 merge commit 后才能把 R1 标为 complete：
+
+```bash
+RUSTC_WRAPPER= swift test -Xswiftc -warnings-as-errors
+cargo test --locked --no-fail-fast -- --test-threads=1
+bash scripts/verify-relay-companion-mvp.sh p4-auto
+bash scripts/run-local-runtime-smoke.sh
+swift run AgentDeck -- --diagnostics-report --json
+(cd ios && RUSTC_WRAPPER= xcodebuild -quiet -derivedDataPath "$fresh_dd" \
+  -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
+  -destination 'platform=iOS Simulator,name=iPhone 17' test)
+cargo run -q -p agentdeck-cli --locked -- protocol schema | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+cargo run -q -p agentdeck-cli --locked -- protocol runtime-schema | diff - protocol/agentdeck/runtime-protocol.schema.json
+cargo run -q -p agentdeck-cli --locked -- protocol relay-schema | diff - protocol/agentdeck/relay-v2.schema.json
+cargo run -q -p agentdeck-cli --locked -- protocol e2ee-schema | diff - protocol/agentdeck/e2ee-v1.schema.json
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+scripts/verify-agent-docs.sh
+cargo fmt --all -- --check
+git diff --check
+```
+
+final automatic gate 读回（2026-07-28）：warnings-as-errors Swift 为 `1152 XCTest / 4 Keychain entitlement
+skipped + 48 Swift Testing`，零失败；串行完整 Rust workspace exit 0，daemon lib `1708 passed / 3 ignored`，
+其余 integration/doc-test 零失败。`p4-auto`、隔离 local Runtime smoke、diagnostics、四份 schema、daemon
+network/no-net、fmt、agent docs 与 diff 全部 exit 0；fresh iPhone 17 Simulator `.xcresult` 为
+`133 passed / 0 failed / 0 skipped`。运行 smoke 读回双安装身份、双 owner command、owner-scoped receipt、共享
+Runtime 收敛且 `fallbackSpawned=false`。code/test/config manifest 为 96 paths，按
+`git blob-or-DELETED + path` 排序后的 SHA-256 是
+`43f172a6fed614883b8df9280337014473b4d3021818a12779e908d42d19cd8f`；完整 116-path `name-status`
+manifest SHA-256 是 `e491aef9260def4e1f2c0a15f31b26a97a74912b0cc43633030eb2ecb008524b`。这些是
+automatic/frozen-candidate 证据；production-signed stable selfcheck 仍为 typed `BLOCKED`。
+
+同一 code/test hash 的最终 `spec/security` 与 `quality/Git` 复审均 Approved，`P0/P1/P2=0`。前者读回唯一
+local UDS、per-machine remote source、Runtime exec/metadata gate、vendor-token 边界、canonical conversation
+identity 和三条协议版本轴；后者核对被删除的三份 master 测试只覆盖已拒绝的 App-owned/direct-history 模型，
+正式 shared-daemon、Runtime metadata、sidebar/composer 和 Preview lifecycle 回归仍在，并确认无冲突标记、
+二进制、DB、日志、secret 或构建产物进入 manifest。本节随唯一 master-sync merge commit 原子收口；提交后
+读回 clean，R1 complete，且未 push。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。
@@ -3581,7 +3658,7 @@ swift build
 swift test   # 覆盖：markdown builder、display-row、observation binder、
              #         行高缓存、契约一致性、rail 几何、Codex chrome smoke tests
 
-# GUI bundle 启动验证（避免 raw SwiftPM GUI 启动差异）
+# GUI bundle 启动验证（同时检查 bundle 内 agentdeckd 子进程）
 ./script/build_and_run.sh --verify
 
 # headless 自检（IPC 生命周期 + 日志/脱敏）
@@ -3598,17 +3675,39 @@ cargo test
 
 下列项目无法通过单元测试覆盖，须每次发布前人工验证：
 
-- [ ] 应用可通过 `./script/build_and_run.sh --verify` 启动为 `dist/AgentDeck.app`
+- [ ] `./script/build_and_run.sh --verify` 读回 App/daemon 实际 executable path、
+      SwiftPM 图标资源 bundle、`Info.plist` 与 Mach-O `minos=15.0`，再确认目标 bundle 两个进程均已启动
+      （不能只以进程名、PPID 或 App 进程存在作为成功）
 - [ ] 应用正常启动，窗口标题显示 `AgentDeck Dev`（debug 构建）
 - [ ] 空态首屏对齐 Codex Desktop：透明标题栏、全高左侧侧栏、居中大标题、圆角 composer、连接卡片和底部速率提示
 - [ ] 会话态对齐 Codex Desktop：右侧 thread header、右上环境信息面板、底部悬浮 composer
-- [ ] 左侧历史侧栏（NSOutlineView）宽度约 260pt，可自由拖动分割线
+- [ ] 左侧历史侧栏（NSOutlineView）默认宽度约 216pt，可在 200–280pt 间拖动分割线
+- [ ] 项目加号与会话尾部图标紧邻分割线，右侧没有明显无效留白
+- [ ] 侧栏「新对话」可进入新会话空态；「搜索」可展开输入框并实时过滤；未实现入口不显示
 - [ ] 拖动左侧历史侧栏分割线后，点击/切换会话时分割线保持在用户拖动后的宽度
 - [ ] 历史列表刷新后按项目 `cwd` 分组展示
+- [ ] 加载数百条真实历史时，侧栏不因逐行重复查找/解码 agent SVG 图标而卡在上一帧转圈；图标资源只加载一次
+- [ ] 鼠标停在历史侧栏不动并连续滚动时，最多只有指针当前所在的一行显示 hover 高亮；滚动经过的复用行不得残留多个圆角高亮块，选中行状态不受影响
 - [ ] 新建会话（点击项目旁加号）→ 右侧显示空状态视图
 - [ ] 发送第一条 prompt → 会话流开始流式渲染（reasoning / shell / file-edit 行）
+- [ ] 1280×820 标准窗口下会话流、工具摘要与 composer 共用水平内容轴，不再由每行额外 20pt 缩进制造宽度断层；每个回合最后一行保留 20pt 语义尾距，同一回合内部仍保持紧凑
+- [ ] 用户消息使用 `surface2 + border + radius-md`，水平/垂直内距为 14/11pt，短消息按内容收缩、长消息最大不超过正文轴 82%，窄窗下不产生负宽度或约束冲突
+- [ ] 会话流 assistant 正文使用 14pt `body`，reasoning 正文使用 13pt `callout` + `text2` 并正确渲染 Markdown，shell / diff 使用 12.5pt `mono`；各类 assistant item 上下内距统一为 4pt，连续内容密度自然且无忽松忽紧
+- [ ] assistant / reasoning Markdown 的纯拉丁段落按 `1.45`、CJK 或中西混排段落按 `1.72` 行高渲染；渲染与表格测高一致，等字节中西文替换也须刷新行高，空 reasoning 不虚构正文行；仅 Markdown 属性变化时保留当前文字选区，展开/收起及流式更新后均无裁切、覆盖或异常留白
+- [ ] Markdown 标题、列表与 fenced code 不显示 `##` 或 fence 等字面语法；行内代码为低对比圆角代码胶囊，fenced code 为独立代码容器，长路径换行后每段背景连续且不遮挡相邻正文
+- [ ] GFM 表格不显示 `|` / `---` 结构原文；表头、细分隔线、左/中/右对齐、单元格 inline Markdown 和 CJK/长内容换行正确，表格前后正文无裁切或异常留白；流式半截表格保持可读原文并在分隔行完整后升级为原生表格
+- [ ] `<local-command-stdout>` / `<local-command-stderr>` 等本地命令包装和 ANSI 内容不得进入用户气泡；纯包装轮次从会话流隐藏，真实用户正文仍原样保留
+- [ ] 没有环境/变更数据时右上面板完全折叠且不保留宽度；有数据但空间不足时也优先折叠以保留至少 252pt composer，窗口恢复后自动显示
+- [ ] 顶栏只显示已接通的打开目录动作；composer 使用 `surface2` 悬浮背景，输入与占位符使用 14pt `body`，单行整体高度约 100pt，只显示已接通的发送动作且按钮命中区不小于 44pt
+- [ ] 工具调用默认以紧凑单行显示 MCP server/tool、中文动作标题或关键路径、真实状态与耗时；展开后再看参数与结果，禁止把不同操作都退化成重复的 `js / completed`；同一 Claude Code `toolUseId` 从进行中更新为单个终态行，不残留重复状态
+- [ ] 同一回合连续 2 条及以上执行记录默认聚合为“已读取文件并运行命令”等自然语言摘要；失败/进行中状态紧跟摘要且保留语义色，日常完成态只在有完整耗时时显示低权重耗时，不重复显示“数量 · 已完成”或亮绿色；允许把仅位于两次执行之间的 reasoning 收进组内，但正文、媒体、协作动态及回合边界必须截断普通工具聚合；展开后按原顺序恢复全部工具、命令、文件修改、中间 reasoning 和各自 payload，文件路径须使用正文可用宽度而非竖向碎裂；收起期间 payload 继续增长后再展开，行高和单项状态仍须刷新且各行不得重叠
+- [ ] 真实 Codex `subAgentActivity` 不得显示 `unsupported item type`：单条动态须以独立紧凑协作行显示可读任务名及“已开始工作 / 已更新 / 已中断”；同一回合、同一任务名连续 2 条及以上动态须形成独立的“任务名 · N 条协作动态”摘要，并收起其间 reasoning，展开后按原顺序恢复；不同任务、普通工具、正文、媒体与上下文压缩不得混入该组，摘要必须保留最后一条真实事件描述，也不能把历史 `started` 误标成当前进行中
+- [ ] 真实 Codex `contextCompaction` 不得显示 `unsupported item type`，须以独立“上下文已压缩”系统行呈现并截断前后工具聚合
+- [ ] reasoning 默认折叠，但折叠头必须完整显示「思考过程」，不能因 disclosure 压缩只剩单个 `R` 字符；切换会话时不得继承上一会话同名 item 的展开/收起状态
+- [ ] 展开后的 reasoning 正文（包括工具聚合内的中间 reasoning）必须使用会话正文可用宽度，不能收缩成标题宽度或逐词换行；渲染宽度须与行高测量宽度一致，不得裁切或覆盖相邻行
 - [ ] 高风险操作触发 approve / deny 控件
-- [ ] TurnJumpRail 导航点随轮次更新；点击可跳转
+- [ ] TurnJumpRail 是独立 44pt 尾列，不覆盖会话正文、composer 或环境面板；窗口根内容层最右 8pt 必须由显式 resize responder 接管鼠标序列，不能返回 `nil` 后依赖 AppKit 私有 frame hit-testing，`AgentDeckWindow.sendEvent(_:)` 同时在 frame 层捕获最右 16pt 作为兜底；拖拽宽度增量必须使用当前 CGEvent 的全局 X，不能依赖可能冻结的全局鼠标快照或受窗口 frame 变化影响的相对坐标；确保空态与会话态从右侧中部和右下角均可连续拉宽，缩小后仍可再次放大，轨道中心区域、滚轮、↑↓/Home/End 与 VoiceOver 自定义动作保持可用
+- [ ] 开启 macOS「减少动态效果」后 TurnJumpRail 直接跳变，不运行滚动或悬停定时动画
 - [ ] 继续历史会话：点击历史行 → 右侧回放历史 items
 - [ ] Cmd-Q 正常退出
 - [ ] 选中一段会话文字 → 点击会话区空白处 → 选区清除；点击另一段文字 → 选区切换（跨 cell 单选）
@@ -3677,11 +3776,12 @@ cargo install cargo-llvm-cov
 | 变更范围 | 最小验证 |
 | --- | --- |
 | Rust daemon、IPC、Codex adapter、history list 性能、run record、diagnostics | `cargo test`；涉及运行态再跑 `swift run AgentDeck -- --selfcheck` |
+| macOS App 打包、daemon 定位或启动错误传播 | `swift test --filter 'DaemonLocatorTests|HistoryDaemonLaunchTests'`；`bash -n script/build_and_run.sh`；`./script/build_and_run.sh --verify` |
 | Swift UI、会话模型、历史回放、live session 侧栏可见性、富文本渲染、选择/滚动行为 | `swift test` |
 | approval / action request / action decision | `cargo test approval`；`swift test --filter approval`；再跑完整 `cargo test`、`swift test`、`swift run AgentDeck -- --selfcheck` |
 | 诊断日志、自检、数据目录、profile、密钥脱敏 | `cargo test`；stable Runtime 用 `swift run AgentDeck -- --selfcheck`；`swift run AgentDeck -- --diagnostics-report --json`；涉及旧 profile 日志时只加跑 `swift run AgentDeck -- --diagnostics-report --json --profile dev`，不得把 Runtime selfcheck 切回 dev namespace |
 | 文档结构、AGENTS 入口、计划规则 | `scripts/verify-agent-docs.sh` |
-| 协议 schema 或 app-server 方法 | `cargo test`；核对 `protocol/SPIKE_FINDINGS.md` 和 `protocol/CODEX_VERSION.txt` |
+| Codex vendor schema 或 app-server 方法 | 按下方“Codex vendor schema 快照”重新生成；独立快照逐字比较、聚合 schema 规范化比较；再运行 `cargo test` |
 | agentdeck-protocol 类型变更 | `cargo test`（漂移测试自动运行）；若漂移测试失败须先重新生成快照（见下） |
 | 参考客户端 CLI（agentdeck-cli）、Transport、Client | `cargo test -p agentdeck-cli`；再跑完整 `cargo test` |
 | Relay Companion MVP P0 基线或 v1 reset | 迭代时跑 `bash scripts/tests/reset-relay-v1-dev-state.sh`；提交前跑一次 `bash scripts/verify-relay-companion-mvp.sh p0` |
@@ -3721,9 +3821,73 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P5.7 macOS SessionSource registry | 2026-07-28 automatic Task complete；`40 prerequisite + 23 registry + 7 docs = 70 paths`，content hash 分别为 `85a46da6d79e56f6da1efd2e67b8851b1b264d7e796ded50334a7769b0af680f` 与 `df38994a015d0bd7014618a75afb6988b9dfec926a19f92cc5e4c8843788bcf6`。完成唯一 local UDS source、per-machine remote registry、typed local capability、真实 dual-scope host、Genesis/business-ready、typed snapshot recovery、observation reentrancy、`SessionModel` operation join 与 Preview/AppRuntime exact-pump barrier；Swift `1061/4 skipped + 35`、Rust daemon lib `1683/3 ignored`、main `7/7`、慢组与双路终审均通过。P5 当前为 7/9；P5.8–P5.9 与 P5 Phase Exit 仍未完成，真实公网、物理设备、production-signed Keychain、第二 Mac、真实 vendor 与 destructive purge 继续 post-MVP `BLOCKED` |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
-## 协议 schema 漂移测试
+## Codex vendor schema 快照
 
-`cargo test` 会在 `agentdeck-protocol` 测试套件中运行 `schema_matches_committed_snapshot`：比较 schemars 从 Rust 类型实时生成的 JSON Schema 与 `protocol/agentdeck/agentdeck-protocol.schema.json` 快照。若两者不一致，说明协议类型已变更但快照未更新，测试失败。
+`protocol/ClientRequest.json` 等文件是 Codex app-server 的 vendor 协议快照，
+与 AgentDeck 自身 schemars 生成的
+`protocol/agentdeck/agentdeck-protocol.schema.json` 是两套独立门禁。
+`cargo test` 通过不能证明本机 Codex 版本与 vendor 快照一致。
+
+升级刷新或同版本复验时，都先在临时目录 fail-closed 生成，并记录本机
+Codex 的实际版本：
+
+```bash
+CODEX_BIN="$(command -v codex)"
+ACTUAL_VERSION="$("$CODEX_BIN" --version)"
+SCHEMA_DIR="$(mktemp -d /tmp/agentdeck-codex-schema.XXXXXX)"
+"$CODEX_BIN" app-server generate-json-schema --out "$SCHEMA_DIR"
+
+jq -er '
+  .oneOf as $requests
+  | if (($requests | type) != "array") or (($requests | length) == 0) then
+      error("ClientRequest.oneOf missing or empty")
+    elif any($requests[];
+      ((.properties.method.enum | type) != "array")
+      or ((.properties.method.enum | length) != 1)
+      or ((.properties.method.enum[0] | type) != "string")) then
+      error("unexpected ClientRequest method schema")
+    else
+      [$requests[].properties.method.enum[0]] as $methods
+      | if (($methods | length) != ($methods | unique | length)) then
+          error("duplicate ClientRequest methods")
+        else $methods | sort[] end
+    end
+' "$SCHEMA_DIR/ClientRequest.json" > "$SCHEMA_DIR/client-methods.txt"
+```
+
+升级刷新时，将 `ClientRequest.json`、`JSONRPCMessage.json`、
+`ServerNotification.json`、`ServerRequest.json`、
+`codex_app_server_protocol.v2.schemas.json` 与 `client-methods.txt` 复制到
+`protocol/`，再把 `ACTUAL_VERSION` 写入 `CODEX_VERSION.txt`。同版本复验时先运行：
+
+```bash
+test "$ACTUAL_VERSION" = "$(cat protocol/CODEX_VERSION.txt)"
+```
+
+四个独立 schema 与 `client-methods.txt` 的输出顺序稳定，提交前逐文件运行
+`cmp`。聚合的 `codex_app_server_protocol.v2.schemas.json` 中 definitions 顺序
+可能在相同版本的两次官方生成之间变化，必须用 `jq -S` 规范化后比较，不能把
+raw byte 顺序差异误判成协议漂移：
+
+```bash
+jq -S . protocol/codex_app_server_protocol.v2.schemas.json \
+  > "$SCHEMA_DIR/committed-v2.normalized.json"
+jq -S . "$SCHEMA_DIR/codex_app_server_protocol.v2.schemas.json" \
+  > "$SCHEMA_DIR/generated-v2.normalized.json"
+cmp "$SCHEMA_DIR/committed-v2.normalized.json" \
+  "$SCHEMA_DIR/generated-v2.normalized.json"
+```
+
+确认 method 表行数和内容一致后，再运行 `cargo test`、
+`scripts/verify-agent-docs.sh` 和 `git diff --check`。当前稳定合约不使用
+`--experimental`；只有客户端显式启用 `experimentalApi` 时才建立独立实验基线。
+
+## AgentDeck IPC schema 漂移测试
+
+`cargo test` 会在 `agentdeck-protocol` 测试套件中运行
+`schema_matches_committed_snapshot`：比较 schemars 从 Rust 类型实时生成的
+JSON Schema 与 `protocol/agentdeck/agentdeck-protocol.schema.json` 快照。若两者
+不一致，说明 AgentDeck IPC 类型已变更但快照未更新，测试失败。
 
 重新生成快照：
 

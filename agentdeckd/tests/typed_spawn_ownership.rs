@@ -185,7 +185,7 @@ fn canonical_runtime_capabilities_use_preseeded_versions_without_vendor_spawn() 
             "Codex",
             include_str!("../src/codex/adapter.rs") as &str,
             "CANONICAL_CODEX_VERSION",
-            "codex-cli 0.144.1",
+            "codex-cli 0.145.0",
         ),
         (
             "Claude Code",
@@ -208,7 +208,7 @@ fn canonical_runtime_capabilities_use_preseeded_versions_without_vendor_spawn() 
             source.contains(&format!(
                 "const {version_constant}: &str = \"{stable_version}\";"
             )),
-            "{name} canonical version must remain a stable non-probing placeholder"
+            "{name} canonical version must remain stable and non-probing"
         );
     }
 }

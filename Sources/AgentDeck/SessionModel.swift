@@ -3,6 +3,19 @@ import AgentDeckSessionSource
 import Foundation
 import Observation
 
+struct HistoryThreadIdentity: Hashable, Sendable {
+    let agentKind: AgentKind
+    let conversationID: String
+
+    init(agentKind: AgentKind, conversationID: String) {
+        self.agentKind = agentKind
+        self.conversationID = conversationID
+    }
+
+    init(_ thread: HistoryThreadSummary) {
+        self.init(agentKind: thread.agentKind, conversationID: thread.id)
+    }
+}
 struct HistoryOpenTiming: Equatable {
   let conversationID: RuntimeConversationID
   let itemCount: Int
@@ -260,6 +273,7 @@ final class SessionModel {
   private var retryRequiredConversationBootstrapAdmission: ConversationBootstrapAdmission?
   private var bootstrapComposerLineageID: UUID?
   private var didRequestInitialHistoryRefresh = false
+  private var historyLoadWaiters: [CheckedContinuation<Void, Never>] = []
   private var historyCurrentProjectOnly = false
   private var catalogSubscribed = false
   private var wantsCatalogSubscription = false
@@ -542,6 +556,34 @@ final class SessionModel {
 
   var selectedSidebarConversationID: String? {
     selectedHistoryConversationID?.rawValue ?? workbench.selectedConversationID?.rawValue
+  }
+
+  /// 侧栏的去歧义 identity 只是一层 presentation：真实路由仍使用 daemon 分配的
+  /// canonical `RuntimeConversationID`，不会重新引入 vendor session registry。
+  var openingHistoryThreadIdentity: HistoryThreadIdentity? {
+    guard let conversationID = openingHistoryConversationID,
+      let thread = historyThreads.first(where: { $0.id == conversationID.rawValue })
+    else { return nil }
+    return HistoryThreadIdentity(thread)
+  }
+
+  var selectedSidebarThreadIdentity: HistoryThreadIdentity? {
+    guard let rawValue = selectedSidebarConversationID else { return nil }
+    if let thread = historyThreads.first(where: { $0.id == rawValue }) {
+      return HistoryThreadIdentity(thread)
+    }
+    guard let runtime = workbench.selectedRuntime,
+      runtime.conversationID.rawValue == rawValue
+    else { return nil }
+    return HistoryThreadIdentity(agentKind: runtime.agentKind, conversationID: rawValue)
+  }
+
+  func runtime(for thread: HistoryThreadSummary) -> ThreadRuntimeModel? {
+    let conversationID = RuntimeConversationID(rawValue: thread.id)
+    guard let runtime = workbench.runtime(conversationID: conversationID),
+      runtime.agentKind == thread.agentKind
+    else { return nil }
+    return runtime
   }
 
   var selectedItems: [UIItem] {
@@ -1039,6 +1081,13 @@ final class SessionModel {
     historyThreads = threads
   }
 
+  /// Preview/纯 UI 测试的显式 fixture seam。真实会话始终从 selected Runtime 的
+  /// canonical projection 读取，调用方不能借此修改任何 daemon state。
+  func replaceFixtureItems(_ fixtureItems: [UIItem]) {
+    precondition(workbench.selectedRuntime == nil)
+    items = fixtureItems
+  }
+
   func shouldAutoRefreshHistoryOnAppear() -> Bool {
     guard !didRequestInitialHistoryRefresh else { return false }
     didRequestInitialHistoryRefresh = true
@@ -1048,6 +1097,19 @@ final class SessionModel {
   func loadHistoryOnAppear() {
     guard shouldAutoRefreshHistoryOnAppear() else { return }
     loadHistory()
+  }
+
+  /// 等待当前 catalog load 到达 terminal。Preview bootstrap 使用这条显式 barrier，
+  /// 避免在 MainActor 上轮询并饿死同 executor 的 Runtime activation。
+  func waitForHistoryLoad() async {
+    guard isLoadingHistory else { return }
+    await withCheckedContinuation { continuation in
+      if isLoadingHistory {
+        historyLoadWaiters.append(continuation)
+      } else {
+        continuation.resume()
+      }
+    }
   }
 
   func loadHistory(currentProjectOnly: Bool = false) {
@@ -1060,9 +1122,7 @@ final class SessionModel {
     operationTasks.launch { [weak self] in
       guard let self else { return }
       var operationLease: RuntimeCoordinatorLease?
-      defer {
-        if !isTornDown { isLoadingHistory = false }
-      }
+      defer { finishHistoryLoad() }
       do {
         _ = try await ensureRuntimeStarted()
         guard !isTornDown else { return }
@@ -1098,6 +1158,13 @@ final class SessionModel {
         historyErrorMessage = String(describing: error)
       }
     }
+  }
+
+  private func finishHistoryLoad() {
+    isLoadingHistory = false
+    let waiters = historyLoadWaiters
+    historyLoadWaiters.removeAll(keepingCapacity: false)
+    for waiter in waiters { waiter.resume() }
   }
 
   func openHistoryThread(_ thread: HistoryThreadSummary) {
@@ -1361,7 +1428,7 @@ final class SessionModel {
     subscribedConversationIDs.removeAll()
     conversationSubscriptionLastUsed.removeAll()
     workbench.cancelPendingSynchronization()
-    isLoadingHistory = false
+    finishHistoryLoad()
     phase = .closed
     runtimeConnectionLease = nil
     runtimeConnectionAvailable = false

@@ -1,6 +1,7 @@
 //! Claude Code stream-json → typed Runtime execution output。
 //!
-//! vendor session/tool identity 只用于 adapter 私有关联；输出只携带单调
+//! vendor session identity 只用于 adapter 私有关联；tool identity 仅进入
+//! `AgentItemMeta.vendor_extensions` 供同一工具生命周期折叠。输出仍使用单调
 //! `AdapterItemKey` 与中立 `AgentItem`，不构造 SessionId/ThreadId/RuntimeEvent。
 
 use std::collections::{HashMap, HashSet};
@@ -12,6 +13,8 @@ use agentdeck_protocol::{
 use serde_json::{Value, json};
 
 use crate::agent::{AdapterEvent, AdapterItemKey};
+
+use super::is_collaboration_tool_name;
 
 const MAX_TRANSLATED_ITEMS_PER_TURN: u64 = 10_000;
 // 这是 translator 持有的 id/name/JSON input 的逻辑 payload 预算；现有 item 上限
@@ -453,7 +456,7 @@ impl ClaudeCodeRuntimeTranslator {
             .filter(|retained| *retained <= self.retained_byte_limit)
             .ok_or_else(|| fixed_error("cc-retained-state-limit"))?;
         let key = self.next_key()?;
-        let item = tool_item(name, &input, None, false);
+        let item = tool_item(id, name, &input, None, false);
         self.in_flight_tools.insert(
             id.to_owned(),
             ToolUseRecord {
@@ -495,7 +498,7 @@ impl ClaudeCodeRuntimeTranslator {
             .unwrap_or(false);
         let result = tool_result_text(block);
         let key = record.key.clone();
-        let item = tool_item(&record.name, &record.input, Some(result), is_error);
+        let item = tool_item(id, &record.name, &record.input, Some(result), is_error);
         let (completed_id, _) = self
             .in_flight_tools
             .remove_entry(id)
@@ -658,7 +661,13 @@ fn tool_record_retained_bytes(id: &str, name: &str, input: &Value) -> Result<usi
         .ok_or_else(|| fixed_error("cc-retained-state-limit"))
 }
 
-fn tool_item(name: &str, input: &Value, result: Option<String>, is_error: bool) -> AgentItem {
+fn tool_item(
+    tool_use_id: &str,
+    name: &str,
+    input: &Value,
+    result: Option<String>,
+    is_error: bool,
+) -> AgentItem {
     match name {
         "Bash" => AgentItem::Shell {
             command: input
@@ -677,14 +686,24 @@ fn tool_item(name: &str, input: &Value, result: Option<String>, is_error: bool) 
             // 不能把成功/失败布尔值伪造成 0/1。
             exit_code: None,
             duration_ms: None,
-            meta: AgentItemMeta::default(),
+            meta: tool_meta(tool_use_id, name),
         },
         "Edit" | "Write" | "MultiEdit" => AgentItem::Diff {
             files: diff_files(name, input),
-            meta: AgentItemMeta::default(),
+            meta: tool_meta(tool_use_id, name),
         },
         _ => {
-            let mut meta = AgentItemMeta::default();
+            let mut meta = tool_meta(tool_use_id, name);
+            meta.vendor_extensions.insert(
+                "status".into(),
+                json!(if result.is_none() {
+                    "inProgress"
+                } else if is_error {
+                    "failed"
+                } else {
+                    "completed"
+                }),
+            );
             if is_error {
                 meta.vendor_extensions.insert("isError".into(), json!(true));
             }
@@ -696,6 +715,17 @@ fn tool_item(name: &str, input: &Value, result: Option<String>, is_error: bool) 
             }
         }
     }
+}
+
+fn tool_meta(tool_use_id: &str, tool_name: &str) -> AgentItemMeta {
+    let mut meta = AgentItemMeta::default();
+    meta.vendor_extensions
+        .insert("toolUseId".into(), json!(tool_use_id));
+    if is_collaboration_tool_name(tool_name) {
+        meta.vendor_extensions
+            .insert("activityKind".into(), json!("collaboration"));
+    }
+    meta
 }
 
 fn diff_files(tool: &str, input: &Value) -> Vec<DiffFile> {

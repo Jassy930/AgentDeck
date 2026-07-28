@@ -14,7 +14,7 @@ use agentdeck_protocol::{
 use serde_json::{Value, json};
 
 use super::adapter::{validate_absolute_normal_path, validated_permission_profile};
-use super::translate::{plan_steps, reasoning_text, shell_status_from, user_message_text};
+use super::translate::{plan_steps, reasoning_text, terminal_shell_status_from, user_message_text};
 use crate::agent::{AdapterEvent, AdapterItemKey};
 use crate::record::redact;
 
@@ -816,7 +816,7 @@ fn build_item(
             },
             meta: AgentItemMeta::default(),
         },
-        RuntimeItemKind::Shell => shell_item(item, shell_status_from(item)?),
+        RuntimeItemKind::Shell => shell_item(item, terminal_shell_status_from(item)?),
         RuntimeItemKind::Diff => AgentItem::Diff {
             files: runtime_diff_files(item)?,
             meta: terminal_status_meta(item, &["completed", "failed", "declined"])?,

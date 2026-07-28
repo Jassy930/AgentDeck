@@ -14,11 +14,20 @@ func measuredTextHeight(_ attributed: NSAttributedString, width: CGFloat) -> CGF
 
 /// 行高缓存：键 = rowId × version × width。版本或宽度变化即未命中。
 final class RowHeightCache {
-    private struct Key: Hashable { let rowId: String; let version: Int; let width: CGFloat }
+    private struct Key: Hashable {
+        let rowId: String
+        let version: AnyHashable
+        let width: CGFloat
+    }
     private var store: [Key: CGFloat] = [:]
 
-    func height(rowId: String, version: Int, width: CGFloat, compute: () -> CGFloat) -> CGFloat {
-        let key = Key(rowId: rowId, version: version, width: width)
+    func height<Version: Hashable>(
+        rowId: String,
+        version: Version,
+        width: CGFloat,
+        compute: () -> CGFloat
+    ) -> CGFloat {
+        let key = Key(rowId: rowId, version: AnyHashable(version), width: width)
         if let cached = store[key] { return cached }
         let value = compute()
         store[key] = value

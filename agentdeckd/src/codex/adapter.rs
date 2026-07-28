@@ -38,6 +38,9 @@ use crate::agent::{
     CanonicalAgentEvent, CanonicalAgentEventSender, CanonicalAgentSessionHandle,
     CanonicalHistoryRead, ExecSpec, PrepareAdapterTurnCapability, PreparedAgentTurn,
 };
+use crate::codex::app_server::{
+    StderrTail, drain_child_stderr, kill_process_group, request_response, spawn_child, write_frame,
+};
 use crate::codex::capabilities::{build_codex_capabilities, probe_codex_version};
 use crate::codex::driver::CodexPreparedTurn;
 use crate::codex::state::CodexStateRepository;
@@ -56,15 +59,14 @@ use agentdeck_protocol::{
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc};
 
-pub(super) const CANONICAL_CODEX_CLI_VERSION: &str = "0.144.1";
-const CANONICAL_CODEX_VERSION: &str = "codex-cli 0.144.1";
+pub(super) const CANONICAL_CODEX_CLI_VERSION: &str = "0.145.0";
+const CANONICAL_CODEX_VERSION: &str = "codex-cli 0.145.0";
 
 /// One approval-routing entry. Carries everything `submit_decision` needs
 /// to build the right JSON-RPC response body (the body shape differs by
@@ -91,6 +93,8 @@ struct SessionState {
     /// Populated by the pump on every `ActionRequest`; consumed by
     /// `submit_decision`.
     approval_routes: Mutex<HashMap<String, ApprovalRoute>>,
+    /// Continuously drained bounded stderr tail for structured failures.
+    stderr_tail: StderrTail,
     /// Thread id captured from `thread/start` / `thread/resume`.
     #[allow(dead_code)]
     thread_id: ThreadId,
@@ -148,208 +152,6 @@ impl CodexAdapter {
     fn capabilities_for_v2(&self) -> SessionCapabilities {
         let version = self.cli_version.get_or_init(probe_codex_version).clone();
         build_codex_capabilities(version)
-    }
-
-    /// Locate the `codex` binary. Mirrors v1_legacy's `locate_codex`: GUI-
-    /// launched macOS apps inherit a stripped PATH so we probe common
-    /// install locations in addition to PATH.
-    fn locate_codex() -> Result<String, ProtocolError> {
-        if let Ok(out) = std::process::Command::new("/usr/bin/which")
-            .arg("codex")
-            .output()
-            && out.status.success()
-        {
-            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !p.is_empty() {
-                return Ok(p);
-            }
-        }
-        for cand in [
-            "/opt/homebrew/bin/codex",
-            "/usr/local/bin/codex",
-            "/usr/bin/codex",
-        ] {
-            if std::path::Path::new(cand).exists() {
-                return Ok(cand.to_string());
-            }
-        }
-        Err(ProtocolError {
-            code: "codex-not-found".into(),
-            message: "codex binary not found on PATH or common locations".into(),
-            diagnostic_ref: None,
-        })
-    }
-
-    /// Build the PATH env passed to the codex child. Matches v1_legacy
-    /// behavior so MCP servers / sandbox helpers find their auxiliary
-    /// tools even when the daemon was launched from a GUI app.
-    fn child_path_env(base: Option<&str>) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        for path in [
-            "/usr/local/bin",
-            "/opt/homebrew/bin",
-            "/usr/bin",
-            "/bin",
-            "/usr/sbin",
-            "/sbin",
-        ] {
-            parts.push(path.into());
-        }
-        if let Some(base) = base {
-            for path in base.split(':').filter(|p| !p.is_empty()) {
-                if !parts.iter().any(|existing| existing == path) {
-                    parts.push(path.into());
-                }
-            }
-        }
-        parts.join(":")
-    }
-
-    /// Spawn one `codex app-server` child. Pipes stdio; on Unix puts the
-    /// child in its own process group so the whole subtree can be
-    /// SIGKILLed via `kill(-pgid, SIGKILL)` on cancel/drop.
-    fn spawn_child(cwd: &Path) -> Result<Child, ProtocolError> {
-        let codex = Self::locate_codex()?;
-        let child_path = Self::child_path_env(std::env::var("PATH").ok().as_deref());
-        let mut cmd = Command::new(codex);
-        cmd.arg("app-server")
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("PATH", child_path)
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
-        cmd.spawn().map_err(|e| ProtocolError {
-            code: "codex-spawn-failed".into(),
-            message: format!("failed to spawn codex app-server: {e}"),
-            diagnostic_ref: None,
-        })
-    }
-
-    /// Write one JSON-RPC frame as a newline-delimited line (Codex's
-    /// wire framing — see protocol/SPIKE_FINDINGS.md).
-    async fn write_frame<W>(stdin: &mut W, frame: &Value) -> Result<(), ProtocolError>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let mut line = serde_json::to_string(frame).map_err(|e| ProtocolError {
-            code: "codex-encode-failed".into(),
-            message: format!("serialize codex frame: {e}"),
-            diagnostic_ref: None,
-        })?;
-        line.push('\n');
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| ProtocolError {
-                code: "codex-stdin-write-failed".into(),
-                message: format!("write to codex stdin: {e}"),
-                diagnostic_ref: None,
-            })?;
-        stdin.flush().await.map_err(|e| ProtocolError {
-            code: "codex-stdin-write-failed".into(),
-            message: format!("flush codex stdin: {e}"),
-            diagnostic_ref: None,
-        })?;
-        Ok(())
-    }
-
-    /// Read one JSON-RPC frame from the stdout reader. Returns Ok(None)
-    /// on EOF so callers can distinguish disconnect from malformed JSON.
-    async fn read_frame(
-        reader: &mut BufReader<tokio::process::ChildStdout>,
-        line_buf: &mut String,
-    ) -> Result<Option<Value>, ProtocolError> {
-        line_buf.clear();
-        let n = reader
-            .read_line(line_buf)
-            .await
-            .map_err(|e| ProtocolError {
-                code: "codex-stdout-read-failed".into(),
-                message: format!("read codex stdout: {e}"),
-                diagnostic_ref: None,
-            })?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let v = serde_json::from_str(line_buf.trim()).map_err(|e| ProtocolError {
-            code: "codex-malformed-json".into(),
-            message: format!("malformed codex frame: {e}"),
-            diagnostic_ref: None,
-        })?;
-        Ok(Some(v))
-    }
-
-    /// Send a JSON-RPC request and wait (within a bounded timeout) for
-    /// its matching response. Used only during the handshake — once the
-    /// pump task takes over stdout, the adapter writes fire-and-forget
-    /// requests and lets the translator surface results.
-    async fn request_response(
-        stdin: &mut ChildStdin,
-        reader: &mut BufReader<tokio::process::ChildStdout>,
-        line_buf: &mut String,
-        id: u64,
-        method: &str,
-        params: Value,
-        timeout: Duration,
-    ) -> Result<Value, ProtocolError> {
-        let req = json!({ "id": id, "method": method, "params": params });
-        Self::write_frame(stdin, &req).await?;
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(ProtocolError {
-                    code: "codex-handshake-timeout".into(),
-                    message: format!("timed out waiting for {method} response"),
-                    diagnostic_ref: None,
-                });
-            }
-            let frame =
-                match tokio::time::timeout(remaining, Self::read_frame(reader, line_buf)).await {
-                    Ok(Ok(Some(v))) => v,
-                    Ok(Ok(None)) => {
-                        return Err(ProtocolError {
-                            code: "codex-disconnected".into(),
-                            message: format!("codex closed stdout before {method} response"),
-                            diagnostic_ref: None,
-                        });
-                    }
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        return Err(ProtocolError {
-                            code: "codex-handshake-timeout".into(),
-                            message: format!("timed out waiting for {method} response"),
-                            diagnostic_ref: None,
-                        });
-                    }
-                };
-            if frame.get("id").and_then(Value::as_u64) == Some(id) {
-                if let Some(err) = frame.get("error").filter(|v| !v.is_null()) {
-                    return Err(ProtocolError {
-                        code: "codex-protocol-error".into(),
-                        message: format!(
-                            "codex {method} error: {}",
-                            err.get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("(no message)")
-                        ),
-                        diagnostic_ref: None,
-                    });
-                }
-                return Ok(frame.get("result").cloned().unwrap_or(Value::Null));
-            }
-            // Notifications received during handshake are intentionally
-            // dropped: the adapter already emitted SessionStarted +
-            // SessionCapabilities, and `thread/start` returns the
-            // thread id authoritatively. We don't feed them into the
-            // translator because the pump hasn't started and we'd
-            // double-handle on its first tick.
-        }
     }
 
     /// Convert `CodexSessionOptions` into the params object for Codex's
@@ -422,7 +224,7 @@ impl CodexAdapter {
             })
             .await;
 
-        let mut child = Self::spawn_child(cwd)?;
+        let mut child = spawn_child(cwd)?;
         let mut stdin = child.stdin.take().ok_or_else(|| ProtocolError {
             code: "codex-spawn-failed".into(),
             message: "codex child missing stdin pipe".into(),
@@ -433,9 +235,7 @@ impl CodexAdapter {
             message: "codex child missing stdout pipe".into(),
             diagnostic_ref: None,
         })?;
-        // Drop stderr: v1_legacy mined it for disconnect diagnostics,
-        // but the v2 surface routes errors through ServerEvent::Error.
-        let _ = child.stderr.take();
+        let stderr_tail = drain_child_stderr(&mut child)?;
 
         let mut reader = BufReader::new(stdout);
         let mut next_rpc_id: u64 = 1;
@@ -445,7 +245,7 @@ impl CodexAdapter {
         // 1. initialize
         let init_id = next_rpc_id;
         next_rpc_id += 1;
-        Self::request_response(
+        request_response(
             &mut stdin,
             &mut reader,
             &mut line_buf,
@@ -453,6 +253,7 @@ impl CodexAdapter {
             "initialize",
             json!({ "clientInfo": { "name": "agentdeck", "version": "0.2.0" } }),
             HANDSHAKE_TIMEOUT,
+            &stderr_tail,
         )
         .await?;
 
@@ -460,7 +261,7 @@ impl CodexAdapter {
         let thread_id = if let Some(tid) = resume_thread_id.clone() {
             let resume_id = next_rpc_id;
             next_rpc_id += 1;
-            let result = Self::request_response(
+            let result = request_response(
                 &mut stdin,
                 &mut reader,
                 &mut line_buf,
@@ -468,6 +269,7 @@ impl CodexAdapter {
                 "thread/resume",
                 json!({ "threadId": tid.0 }),
                 HANDSHAKE_TIMEOUT,
+                &stderr_tail,
             )
             .await?;
             validate_resume_result_thread_id(&result, &tid)?;
@@ -475,7 +277,7 @@ impl CodexAdapter {
         } else {
             let start_id = next_rpc_id;
             next_rpc_id += 1;
-            let result = Self::request_response(
+            let result = request_response(
                 &mut stdin,
                 &mut reader,
                 &mut line_buf,
@@ -483,6 +285,7 @@ impl CodexAdapter {
                 "thread/start",
                 Self::thread_start_params(cwd, opts),
                 HANDSHAKE_TIMEOUT,
+                &stderr_tail,
             )
             .await?;
             // Wire shape verified by v1_legacy: thread id is at
@@ -496,7 +299,8 @@ impl CodexAdapter {
                     code: "codex-protocol-error".into(),
                     message: "thread/start: no thread.id in result".into(),
                     diagnostic_ref: None,
-                })?;
+                })
+                .map_err(|error| stderr_tail.enrich_error(error))?;
             ThreadId(id)
         };
 
@@ -518,7 +322,7 @@ impl CodexAdapter {
         if let Some(prompt) = &prompt {
             let turn_id = next_rpc_id;
             next_rpc_id += 1;
-            Self::write_frame(
+            write_frame(
                 &mut stdin,
                 &json!({
                     "id": turn_id,
@@ -526,7 +330,8 @@ impl CodexAdapter {
                     "params": Self::turn_start_params(&thread_id, prompt, opts),
                 }),
             )
-            .await?;
+            .await
+            .map_err(|error| stderr_tail.enrich_error(error))?;
         }
         let _ = next_rpc_id; // counter no longer needed; pump takes over
 
@@ -548,6 +353,7 @@ impl CodexAdapter {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             approval_routes: Mutex::new(HashMap::new()),
+            stderr_tail,
             thread_id: thread_id.clone(),
         });
 
@@ -612,14 +418,15 @@ async fn stdout_pump(
             Ok(0) => break, // EOF: codex disconnected
             Ok(_) => {}
             Err(e) => {
+                let error = state.stderr_tail.enrich_error(ProtocolError {
+                    code: "codex-stdout-read-failed".into(),
+                    message: format!("read codex stdout: {e}"),
+                    diagnostic_ref: None,
+                });
                 let _ = events
                     .send(ServerEvent::Error {
                         session_id: Some(session_id.clone()),
-                        error: ProtocolError {
-                            code: "codex-stdout-read-failed".into(),
-                            message: format!("read codex stdout: {e}"),
-                            diagnostic_ref: None,
-                        },
+                        error,
                     })
                     .await;
                 break;
@@ -1020,7 +827,9 @@ impl Agent for CodexAdapter {
                     diagnostic_ref: None,
                 })?
         };
-        deliver_approval_decision(&state.approval_routes, &state.stdin, &decision).await
+        deliver_approval_decision(&state.approval_routes, &state.stdin, &decision)
+            .await
+            .map_err(|error| state.stderr_tail.enrich_error(error))
     }
 
     async fn submit_vendor_control(
@@ -1045,22 +854,20 @@ impl Agent for CodexAdapter {
         }
     }
 
-    /// Task 4C — Phase 4 finalization: wire codex's stub history layer
-    /// onto the trait. v0.2 returns empty for List and structured
-    /// "not-supported" errors for the mutating ops; the unified
-    /// `HistoryRequest` protocol still works end-to-end across both
-    /// adapters (cross-agent List from the router merges these results
-    /// with CC's real history). v0.3 replaces `codex::history` stubs
-    /// with `thread/list` + `thread/read` over a short-lived
-    /// `codex app-server` child.
+    /// Route neutral history requests through Codex's official app-server
+    /// history APIs. List/read use a short-lived `codex app-server` child;
+    /// mutating operations remain explicit not-supported responses until
+    /// their product semantics are approved.
     async fn handle_history(
         &self,
         request: HistoryRequest,
     ) -> Result<HistoryResponse, ProtocolError> {
         use crate::codex::history;
         match request {
-            HistoryRequest::List { cwd_filter, .. } => {
-                let items = history::list_history(cwd_filter.as_deref()).await?;
+            HistoryRequest::List {
+                cwd_filter, limit, ..
+            } => {
+                let items = history::list_history(cwd_filter.as_deref(), limit).await?;
                 Ok(HistoryResponse::List(items))
             }
             HistoryRequest::Read { thread_id, .. } => {
@@ -1093,20 +900,8 @@ impl Agent for CodexAdapter {
             // Abort the stdout pump first so no further events race the
             // child kill.
             handle.pump_abort.abort();
-            // Explicit child kill: belt-and-suspenders for kill_on_drop.
             let mut child = handle.state.child.lock().await;
-            let _ = child.start_kill();
-            // Best-effort group kill on Unix to catch the MCP subtree
-            // (v1_legacy proved kill_on_drop alone leaves orphans —
-            // codex re-execs into a forked app-server).
-            #[cfg(unix)]
-            {
-                if let Some(pid) = child.id() {
-                    unsafe {
-                        libc_kill(-(pid as i32), SIGKILL);
-                    }
-                }
-            }
+            kill_process_group(&mut child);
         }
         Ok(())
     }
@@ -1127,15 +922,7 @@ impl Drop for CodexAdapter {
             for handle in map.values() {
                 handle.pump_abort.abort();
                 if let Ok(mut child) = handle.state.child.try_lock() {
-                    let _ = child.start_kill();
-                    #[cfg(unix)]
-                    {
-                        if let Some(pid) = child.id() {
-                            unsafe {
-                                libc_kill(-(pid as i32), SIGKILL);
-                            }
-                        }
-                    }
+                    kill_process_group(&mut child);
                 }
             }
         }
@@ -1192,9 +979,35 @@ where
     let result = approval_response_body(&route.method, &route.params, decision)?;
     let frame = json!({ "id": route.rpc_id, "result": result });
     let mut writer = stdin.lock().await;
-    CodexAdapter::write_frame(&mut *writer, &frame).await?;
+    write_decision_frame(&mut *writer, &frame).await?;
     drop(writer);
     routes.remove(&decision.request_id);
+    Ok(())
+}
+
+async fn write_decision_frame<W>(writer: &mut W, frame: &Value) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut line = serde_json::to_string(frame).map_err(|error| ProtocolError {
+        code: "codex-encode-failed".into(),
+        message: format!("serialize codex frame: {error}"),
+        diagnostic_ref: None,
+    })?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|error| ProtocolError {
+            code: "codex-stdin-write-failed".into(),
+            message: format!("write to codex stdin: {error}"),
+            diagnostic_ref: None,
+        })?;
+    writer.flush().await.map_err(|error| ProtocolError {
+        code: "codex-stdin-write-failed".into(),
+        message: format!("flush codex stdin: {error}"),
+        diagnostic_ref: None,
+    })?;
     Ok(())
 }
 
@@ -1523,18 +1336,6 @@ pub(super) fn reasoning_effort_str(e: CodexReasoningEffort) -> &'static str {
         CodexReasoningEffort::Medium => "medium",
         CodexReasoningEffort::High => "high",
     }
-}
-
-// ── libc binding for group-kill (Unix only) ─────────────────────────────────
-//
-// Mirrors v1_legacy: one symbol, kept here to avoid pulling the `libc`
-// crate. Negative pid = "every process in the group whose pgid == pid".
-#[cfg(unix)]
-const SIGKILL: i32 = 9;
-#[cfg(unix)]
-unsafe extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 #[cfg(test)]

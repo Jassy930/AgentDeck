@@ -55,15 +55,15 @@ final class HistoryGroupRowView: NSView {
         addSubview(addButton)
 
         NSLayoutConstraint.activate([
-            // 缩进对齐会话内缩块：list padding 8 + projgroup padding 12 = 20
-            nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
+            // 紧凑侧栏：项目名保留 16pt 层级缩进，右侧加号贴近分隔线。
+            nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
             nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
 
             countLabel.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 6),
             countLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
             countLabel.trailingAnchor.constraint(lessThanOrEqualTo: addButton.leadingAnchor, constant: -6),
 
-            addButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -20),
+            addButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             addButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             addButton.widthAnchor.constraint(equalToConstant: 18),
             addButton.heightAnchor.constraint(equalToConstant: 18),
@@ -77,17 +77,48 @@ final class HistoryGroupRowView: NSView {
     func configure(with group: HistoryProjectGroup) {
         nameLabel.stringValue = group.projectName
         countLabel.stringValue = "\(group.threads.count)"
-        addButton.toolTip = "New session in \(group.projectName)"
+        nameLabel.toolTip = group.projectName
+        toolTip = group.cwd
+        addButton.toolTip = "在 \(group.projectName) 中新建会话"
+        addButton.setAccessibilityLabel("在 \(group.projectName) 中新建会话")
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel(group.projectName)
+        setAccessibilityValue("\(group.threads.count) 个会话")
     }
 }
 
 // MARK: - Thread Row View
 
+/// 侧栏 hover 的单一所有者。滚动期间 AppKit 可能让新 cell 收到
+/// `mouseEntered`，却不保证旧 cell 及时收到 `mouseExited`；协调器在新行进入时
+/// 主动清掉上一行，保证复用列表中最多只有一个悬停高亮。
+@MainActor
+final class HistoryThreadHoverCoordinator {
+    private weak var hoveredRow: HistoryThreadRowView?
+
+    func update(row: HistoryThreadRowView, isHovered: Bool) {
+        if isHovered {
+            if hoveredRow !== row {
+                hoveredRow?.setHovered(false)
+                hoveredRow = row
+            }
+            row.setHovered(true)
+            return
+        }
+
+        row.setHovered(false)
+        if hoveredRow === row {
+            hoveredRow = nil
+        }
+    }
+}
+
 /// NSTableCellView-style view for a HistoryThreadSummary row.
 /// Mirrors the SwiftUI `historyThreadRow` visual treatment.
 final class HistoryThreadRowView: NSView {
     // MARK: Subviews
-    /// 内缩圆角高亮块（设计 .thread：list padding 8 + radius-sm；.sel/.hover 自绘底色）。
+    /// 内缩圆角高亮块（设计 .thread：list padding 6 + radius-sm；.sel/.hover 自绘底色）。
     private let highlightView = NSView()
     private let accentBar = NSView()
     private let runtimeDotView = NSView()
@@ -97,8 +128,11 @@ final class HistoryThreadRowView: NSView {
 
     /// 当前选中/展示态与悬停态，共同决定高亮块底色。
     private var currentVisualState: HistoryThreadRowPresentation.VisualState = .idle
-    private var hovered = false
+    private(set) var isHovered = false
     private var hoverTracking: NSTrackingArea?
+
+    /// 由侧栏控制器接入单一 hover coordinator；独立使用时回落到本行状态。
+    var onHoverChanged: ((HistoryThreadRowView, Bool) -> Void)?
 
     /// Size constraints for the runtime dot — updated on configure so the dot
     /// truly resizes between 5pt (cached) and 7pt (unread). Auto Layout owns
@@ -177,8 +211,8 @@ final class HistoryThreadRowView: NSView {
             accentBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
             accentBar.widthAnchor.constraint(equalToConstant: 3),
 
-            // 内容左缩进表示层级（子项缩进到 24，比分组名 20 更靠右）
-            runtimeDotView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
+            // 内容左缩进表示层级（子项缩进到 20，比分组名 16 更靠右）
+            runtimeDotView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
             runtimeDotView.centerYAnchor.constraint(equalTo: centerYAnchor),
             runtimeDotWidth,
             runtimeDotHeight,
@@ -188,13 +222,13 @@ final class HistoryThreadRowView: NSView {
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
             titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: agentIcon.leadingAnchor, constant: -6),
 
-            agentIcon.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            agentIcon.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             agentIcon.centerYAnchor.constraint(equalTo: centerYAnchor),
             agentIcon.widthAnchor.constraint(equalToConstant: 13),
             agentIcon.heightAnchor.constraint(equalToConstant: 13),
 
             // Opening spinner（覆盖 agent 图标位置）
-            openingProgress.trailingAnchor.constraint(equalTo: highlightView.trailingAnchor, constant: -11),
+            openingProgress.trailingAnchor.constraint(equalTo: highlightView.trailingAnchor, constant: -8),
             openingProgress.centerYAnchor.constraint(equalTo: centerYAnchor),
             openingProgress.widthAnchor.constraint(equalToConstant: 12),
             openingProgress.heightAnchor.constraint(equalToConstant: 12),
@@ -209,6 +243,7 @@ final class HistoryThreadRowView: NSView {
         titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: fontWeight)
         titleLabel.textColor = presentation.isEmphasized ? DesignTokens.text : DesignTokens.text2
         titleLabel.stringValue = thread.displayTitle
+        titleLabel.toolTip = thread.displayTitle
 
         // 尾随 agent 图标（设计系统）；meta（status · 运行态 · 日期）转为 tooltip
         agentIcon.image = AgentKindIcon.compactImage(for: thread.agentKind)
@@ -217,7 +252,8 @@ final class HistoryThreadRowView: NSView {
             metaParts.append(runtimeStatus)
         }
         metaParts.append(Self.updatedLabel(thread.updatedAt))
-        toolTip = metaParts.joined(separator: " · ")
+        let statusDescription = metaParts.joined(separator: " · ")
+        toolTip = "\(thread.displayTitle)\n\(statusDescription)"
 
         // Accent bar
         let accentColor = Self.accentBarColor(presentation)
@@ -225,7 +261,7 @@ final class HistoryThreadRowView: NSView {
 
         // 内缩块高亮：选中/展开 → surface2；悬停 → surface；否则透明（cell 复用时重置悬停）
         currentVisualState = presentation.visualState
-        hovered = false
+        isHovered = false
         updateHighlight()
 
         // Runtime dot — size driven by Auto Layout constraints (5pt cached / 7pt unread)
@@ -253,7 +289,11 @@ final class HistoryThreadRowView: NSView {
         }
 
         // Accessibility
-        setAccessibilityLabel("Open thread, \(thread.displayTitle)")
+        setAccessibilityElement(true)
+        setAccessibilityRole(.row)
+        setAccessibilityLabel(thread.displayTitle)
+        setAccessibilityValue(statusDescription)
+        setAccessibilityHelp("打开会话")
     }
 
     // MARK: Highlight & hover
@@ -266,9 +306,15 @@ final class HistoryThreadRowView: NSView {
         case .hovered:
             color = DesignTokens.surface
         case .idle:
-            color = hovered ? DesignTokens.surface : .clear
+            color = isHovered ? DesignTokens.surface : .clear
         }
         highlightView.layer?.backgroundColor = color.cgColor
+    }
+
+    func setHovered(_ hovered: Bool) {
+        guard isHovered != hovered else { return }
+        isHovered = hovered
+        updateHighlight()
     }
 
     override func updateTrackingAreas() {
@@ -283,13 +329,19 @@ final class HistoryThreadRowView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        hovered = true
-        updateHighlight()
+        if let onHoverChanged {
+            onHoverChanged(self, true)
+        } else {
+            setHovered(true)
+        }
     }
 
     override func mouseExited(with event: NSEvent) {
-        hovered = false
-        updateHighlight()
+        if let onHoverChanged {
+            onHoverChanged(self, false)
+        } else {
+            setHovered(false)
+        }
     }
 
     // MARK: Helpers

@@ -20,16 +20,74 @@ final class HistorySidebarSmokeTests: XCTestCase {
         let model = SessionModel()
         let vc = HistorySidebarViewController(model: model)
         _ = vc.view  // trigger loadView
-        func allViews(_ root: NSView) -> [NSView] {
-            var result = [root]
-            for s in root.subviews { result += allViews(s) }
-            if let sv = root as? NSScrollView, let doc = sv.documentView {
-                result += allViews(doc)
-            }
-            return result
-        }
-        let hasOutline = allViews(vc.view).contains { $0 is NSOutlineView }
+        let hasOutline = Self.allViews(vc.view).contains { $0 is NSOutlineView }
         XCTAssertTrue(hasOutline, "Expected NSOutlineView in view hierarchy")
+    }
+
+    func testEmptyStateDoesNotPromiseUnsupportedPersistedHistory() throws {
+        let vc = HistorySidebarViewController(model: SessionModel())
+        _ = vc.view
+        let label = try XCTUnwrap(vc.view.descendant(id: "sidebar-empty-history") as? NSTextField)
+
+        XCTAssertTrue(label.stringValue.contains("当前支持的历史"))
+        XCTAssertFalse(label.stringValue.contains("扫描已持久化"))
+    }
+
+    func testOutlineColumnFillsVisibleSidebarWidth() throws {
+        let model = makeTestSessionModel()
+        model.setHistoryThreads([
+            HistoryThreadSummary(
+                id: "t1",
+                name: "A complete thread title",
+                preview: "preview",
+                cwd: "/tmp/project",
+                createdAt: 1,
+                updatedAt: 2,
+                status: "ready",
+                modelProvider: "openai",
+                source: "codex",
+                agentKind: .codex
+            ),
+        ])
+        let vc = HistorySidebarViewController(model: model)
+        let window = NSWindow(contentViewController: vc)
+        window.setContentSize(NSSize(width: 216, height: 640))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+
+        let scrollView = try XCTUnwrap(Self.allViews(vc.view).compactMap { $0 as? NSScrollView }.first)
+        let outlineView = try XCTUnwrap(scrollView.documentView as? NSOutlineView)
+        outlineView.reloadData()
+        outlineView.expandItem(nil, expandChildren: true)
+        let column = try XCTUnwrap(outlineView.tableColumns.first)
+        let visibleWidth = scrollView.contentView.bounds.width
+
+        XCTAssertGreaterThan(visibleWidth, 0)
+        let threadRow = (0..<outlineView.numberOfRows).first {
+            outlineView.item(atRow: $0) is HistoryThreadSummary
+        }
+        let row = try XCTUnwrap(threadRow)
+        let cell = try XCTUnwrap(outlineView.view(atColumn: 0, row: row, makeIfNecessary: true))
+        XCTAssertEqual(
+            column.width + cell.frame.minX,
+            visibleWidth,
+            accuracy: 1,
+            "The column must compensate for the source-list leading inset without leaving a trailing gutter"
+        )
+        XCTAssertEqual(
+            cell.frame.maxX,
+            visibleWidth,
+            accuracy: 1,
+            "Thread cells must reach the visible trailing edge"
+        )
+
+        window.setContentSize(NSSize(width: 250, height: 640))
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+        let resizedVisibleWidth = scrollView.contentView.bounds.width
+        let resizedCell = try XCTUnwrap(outlineView.view(atColumn: 0, row: row, makeIfNecessary: true))
+        XCTAssertEqual(column.width + resizedCell.frame.minX, resizedVisibleWidth, accuracy: 1)
+        XCTAssertEqual(resizedCell.frame.maxX, resizedVisibleWidth, accuracy: 1)
     }
 
     // MARK: - clickedRow → thread resolver
@@ -105,5 +163,16 @@ final class HistorySidebarSmokeTests: XCTestCase {
         XCTAssertNil(HistorySidebarViewController.thread(forClickedRow: -1, in: ov))
         XCTAssertNil(HistorySidebarViewController.thread(forClickedRow: 999, in: ov))
         _ = ds
+    }
+
+    private static func allViews(_ root: NSView) -> [NSView] {
+        var result = [root]
+        for subview in root.subviews {
+            result += allViews(subview)
+        }
+        if let scrollView = root as? NSScrollView, let documentView = scrollView.documentView {
+            result += allViews(documentView)
+        }
+        return result
     }
 }

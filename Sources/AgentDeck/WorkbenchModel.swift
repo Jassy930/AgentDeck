@@ -27,7 +27,6 @@ enum WorkbenchModelError: Error, Equatable, Sendable {
   )
   case draftConversationNotSynchronized(RuntimeConversationID)
 }
-
 enum WorkbenchRuntimeAction: Equatable, Sendable {
   case drainNextPrompt(
     conversationID: RuntimeConversationID,

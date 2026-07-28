@@ -5,7 +5,6 @@ import Observation
 enum RuntimeAction: Equatable, Sendable {
   case drainNextPrompt(prompt: String, idempotencyKey: RuntimeIdempotencyKey)
 }
-
 private struct PendingRuntimePromptAdmission: Sendable {
   let prompt: String
   let idempotencyKey: RuntimeIdempotencyKey

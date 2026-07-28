@@ -102,6 +102,11 @@ message / reasoning / shell / diff 长文本交给 AppKit `NSTextView` +
 `NSTextStorage` 增量追加；会话流由虚拟化 NSTableView 按需渲染可见行，
 避免在 token 流中反复布局整个视图树。
 
+会话正文的 Markdown 由原生 TextKit 渲染，支持标题、列表、引用、链接、
+行内/块代码和 GFM 表格。表格使用 `NSTextTable` 在会话宽度内自动分栏与换行，
+保留表头样式、分隔行声明的左/中/右对齐以及单元格内的 inline Markdown；
+流式阶段尚未形成合法表头与分隔行时继续显示可读原文，不会吞掉半截内容。
+
 ## 历史会话（跨 agent）
 
 v0.2 的历史侧栏与 CLI 都消费 Runtime `Catalog`。公开身份只有 daemon 签发的
@@ -116,6 +121,11 @@ app-server 原生历史导入**尚未接通；这只表示升级前的 Codex thr
 Codex conversation 恒为空。daemon 仅在 adapter 私域把 conversation 绑定到已验证的 Codex thread 或
 Claude Code session；后续 adapter 可内部调用 `thread/resume` / `--resume`，但 raw vendor identity 永不进入
 common wire、日志、Relay 或 CLI 参数。
+
+隔离的 legacy history compatibility adapter 已同步 Codex 0.145.0 官方 app-server
+`thread/list` / `thread/read(includeTurns: true)` shape，并复用中立 translator；它用于运维兼容验证，
+不等于 production Runtime 已完成既有 Codex thread 导入。Codex archive / unarchive / rename 仍明确拒绝，
+不得绕过 Runtime metadata gate 伪装成功。
 
 **既有 Claude Code 历史**的事实源仍是当前 OS account 的
 `~/.claude/projects/<encoded_cwd>/<id>.jsonl`。C0-C production projector 逐层执行
@@ -1148,11 +1158,13 @@ daemon spawn/fallback；使用前须已有 canonical stable daemon。P3.10 已�
 `agentdeck daemon install|status|uninstall`，P4.2 已接通 authenticated `--purge` 与本机 machine admin；
 automatic gate 使用隔离 dev/ephemeral/injected harness，production-signed LaunchAgent/Keychain 仍是
 post-MVP BLOCKED 槽位；
-自动开发链路继续使用 `scripts/run-local-runtime-smoke.sh` 的私有 ephemeral harness）：
+自动开发链路继续使用 `scripts/run-local-runtime-smoke.sh` 的私有 ephemeral harness）。App bundle 会携带
+同版本 CLI/daemon 运维 helper 与 SwiftPM 图标资源，但普通 GUI 不启动 helper，也不成为第二个 daemon owner；
+`AGENTDECK_DAEMON_PATH` 只用于显式 one-shot/harness 定位，不改变 Runtime stable UDS 入口：
 
 ```bash
-./script/build_and_run.sh        # 构建 SwiftPM 产物，临时打包 dist/AgentDeck.app 并启动
-./script/build_and_run.sh --verify  # 启动后确认 AgentDeck 进程存在
+./script/build_and_run.sh        # 构建 Swift + Rust daemon，打包 dist/AgentDeck.app 并启动
+./script/build_and_run.sh --verify  # 读回 App/daemon 绝对路径及 macOS 15 最低版本后确认启动
 swift run AgentDeck               # 本地 debug 构建默认使用 dev profile
 swift run AgentDeck -- --selfcheck  # 无窗口自检: Hello + DescribeAgents，失败不 fallback
 swift run AgentDeck -- --diagnostics-report --json  # 输出机器可读诊断报告
@@ -1166,6 +1178,13 @@ macOS 前端使用纯 AppKit。当前主窗口外壳对齐 Codex Desktop：透�
 全高左侧历史/项目侧栏、右侧 thread header、Codex 风格空态 composer、
 会话态悬浮 composer 和右侧环境信息面板。外观层仍保持 v0.2 统一壳边界：
 vendor 控件由 `CapabilityRouter` 装配，daemon / IPC / history 模型不因视觉同步而改动。
+同一回合的连续执行记录会在 macOS 会话流中默认折叠为自然语言工作摘要；
+正文、媒体与回合边界会截断聚合，展开后仍按原顺序显示全部工具、命令、文件修改、
+中间 reasoning 与单项详情。Codex 的同一子任务若连续产生两条及以上协作动态，
+也会把其间 reasoning 收进独立的可展开摘要；不同子任务或普通工具不会混入该组，
+摘要始终保留最新的“已开始工作 / 已更新 / 已中断”。单条子任务动态仍以紧凑行显示，
+不退化为 unsupported raw item，也不把历史活动误标成仍在运行；官方上下文压缩记录
+则显示为独立的“上下文已压缩”系统行。
 
 Profile：
 
@@ -1221,9 +1240,11 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history
 
 ### 协议
 
-`protocol/` 是从官方 `codex app-server generate-json-schema` 生成的
-协议 schema（非逆向）。`protocol/SPIKE_FINDINGS.md` 记录实测的 wire
-framing（逐行 JSONL）。codex 版本固定在 `protocol/CODEX_VERSION.txt`。
+`protocol/` 原样固化官方 `codex app-server generate-json-schema` 生成物中
+的关键快照（非逆向）。`client-methods.txt` 从 `ClientRequest.json`
+确定性派生，不手写。`protocol/SPIKE_FINDINGS.md` 记录实测的 wire
+framing（逐行 JSONL），Codex 版本固定在 `protocol/CODEX_VERSION.txt`；
+刷新与校验步骤见 `docs/QUALITY.md`。
 
 ### 本地数据（AgentDeck 管理，绝不进你的 git）
 

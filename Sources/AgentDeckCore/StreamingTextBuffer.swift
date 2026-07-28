@@ -10,17 +10,22 @@ public enum StreamingTextBufferChange: Equatable {
 public final class StreamingTextBuffer: @unchecked Sendable {
     private var observers: [UUID: (StreamingTextBufferChange) -> Void] = [:]
     public private(set) var text = ""
+    /// 单调递增的内容版本。会话表格用它做 O(1) 行高缓存失效，避免仅按
+    /// UTF-8 字节数判断时漏掉 `abc` → `中` 这类等字节替换。
+    public private(set) var revision: UInt64 = 0
 
     public init() {}
 
     public func append(_ suffix: String) {
         guard !suffix.isEmpty else { return }
         text.append(contentsOf: suffix)
+        revision &+= 1
         notify(.append(suffix))
     }
 
     public func replace(with nextText: String) {
         text = nextText
+        revision &+= 1
         notify(.replace(nextText))
     }
 

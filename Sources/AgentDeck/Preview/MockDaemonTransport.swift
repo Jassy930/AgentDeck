@@ -67,13 +67,18 @@ final class MockDaemonTransport: DaemonTransport {
         switch req {
         case .list:
             response = .list(MockDaemonScript.historyList())
-        case .read(let threadId, _):
+        case .read(let threadId, _, _):
             response = .read(MockDaemonScript.readResponse(threadId: threadId))
         case .archive, .unarchive, .rename:
             response = .ack
         }
-        guard let responseJSON = try? String(data: encoder.encode(response), encoding: .utf8) else { return }
-        emit("{\"reply\":\"history\",\"response\":\(responseJSON)}")
+        guard let responseData = try? encoder.encode(response),
+              let responseObject = try? JSONSerialization.jsonObject(with: responseData) else { return }
+        var extra: [String: Any] = ["response": responseObject]
+        if let requestId = req.requestId {
+            extra["requestId"] = requestId
+        }
+        emitAdmin(reply: "history", extra: extra)
     }
 
     private func emitLiveTurn(threadId: String) {
