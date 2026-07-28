@@ -3591,6 +3591,35 @@ failure，且页面不含 request hash、secret、grant 或 key material。退�
 保持 ignored。两路终审在同一 code/test hash 上均 Approved，P0/P1/P2=0；R3 exact scoped commit 后 clean，
 未 push。P5 当前为 8/9；P5.9、真实设备/公网/vendor/production signing 仍 pending/BLOCKED。
 
+## Relay Companion MVP rescue R4.1 fixed-topology Simulator E2E RED
+
+R4.1 只建立独立 UI test target/scheme 和 runner contract，不修改 production behavior。首个 UI test 只能读取
+orchestrator 注入的绝对、非 symlink、私有权限、最大 64 KiB 的 PairInvite 文件；缺少或不安全输入必须失败，
+禁止 fixture fallback。runner contract 冻结六组件 topology、one-line JSON、零 mutation 和 unknown argument
+exit 2；R4.2 必须实现该接口，不能让 test 自己搭第二套 Runtime。
+
+```bash
+# Expected RED 1：runner 尚未实现
+bash scripts/tests/run-relay-companion-simulator-e2e.sh
+
+# Expected RED 2：UI target 可发现/可编译，但缺少 private invite path 时 fail-close
+cd ios
+xcodegen generate
+xcodebuild -project AgentDeckMobile.xcodeproj -scheme RelayCompanionE2E \
+  -destination 'platform=iOS Simulator,name=iPhone 17' \
+  -only-testing:AgentDeckMobileUITests/RelayCompanionUITests/testPairingReachesLocalConfirmation \
+  test
+```
+
+2026-07-28 fresh RED：script contract exit 1，精确原因为 missing executable runner；UI test build 成功后
+`1 failed / 0 passed`、xcodebuild exit 65，精确 error 为 `missingPrivateInvitePath`，test body 0.55 秒完成。
+此时未 launch App、未访问网络/Keychain、未创建配对或授权记录，也没有仓库内运行 artifact；生成的
+`ios/AgentDeckMobile.xcodeproj/` 继续被 `.gitignore` 排除。该证据只关闭 R4.1 RED，不表示 R4.2–R4.9、
+P5.9 或 P5 automatic Phase Exit 完成。3-path test/config content hash 为
+`0662ac6ed04e8cd672f8e1bb5d2dda10ed5b9bfd02fc3a612159af1390f82958`；原 `AgentDeckMobile` scheme fresh
+`133/133`、零失败，UI test strict four-space format、shell `bash -n`、docs 与 diff 均 PASS。expected RED
+只存在于显式 R4 runner/UI E2E 入口，不污染既有 automatic gate。
+
 ## Relay Companion MVP rescue R0 基线冻结证据
 
 R0 只冻结事实、执行入口和既有 automatic baseline，不修改生产代码，也不提前执行 master merge、协议治理或

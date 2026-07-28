@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；R0–R3 complete，R4 pending |
+| 状态 | In execution；R0–R3 complete，R4.1 RED complete、R4.2 pending |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -399,7 +399,7 @@ git diff --check
 
 ### Tasks
 
-- [ ] R4.1：脚本 contract tests 和 UI E2E RED。
+- [x] R4.1：脚本 contract tests 和 UI E2E RED。
 - [ ] R4.2：synthetic adapter host 与 temp Relay/daemon orchestrator。
 - [ ] R4.3：production Swift client + iOS UI 完成 pair/list/open/prompt/approval。
 - [ ] R4.4：client/daemon relaunch、cursor/backfill reconnect 与 revoke terminal。
@@ -408,6 +408,25 @@ git diff --check
 - [ ] R4.7：同步文档并提交 R4 implementation candidate。
 - [ ] R4.8：同一 committed candidate 连续三次 fresh E2E。
 - [ ] R4.9：同一 candidate 双路 review、cleanup 与 clean status；若修改代码，从 R4.7 重来。
+
+### R4.1 RED readback（2026-07-28）
+
+- 入口 HEAD 为 R3 scoped commit `216dbb3`，工作树 clean；本切片只新增独立
+  `AgentDeckMobileUITests` target / `RelayCompanionE2E` scheme、首个 production pairing UI test 和 runner
+  contract test，不修改 production app、Runtime、Relay、协议或 remote macOS UI。
+- `bash scripts/tests/run-relay-companion-simulator-e2e.sh` 按预期 exit 1，唯一失败为缺少可执行
+  `scripts/run-relay-companion-simulator-e2e.sh`；contract 已冻结单一六组件 topology、one-line JSON、零 mutation
+  与 unknown argument exit 2。
+- `xcodegen generate` 后，`xcodebuild -project AgentDeckMobile.xcodeproj -scheme RelayCompanionE2E
+  -destination 'platform=iOS Simulator,name=iPhone 17'
+  -only-testing:AgentDeckMobileUITests/RelayCompanionUITests/testPairingReachesLocalConfirmation test` 能发现、编译并
+  启动 UI test；在没有 `AGENTDECK_RELAY_E2E_INVITE_PATH` 时于 0.55 秒 fail-close，test 1 failed、exit 65。
+  App 未 launch，未触发网络、Keychain、pairing 或其他 mutation；没有 fixture fallback。
+- 3-path test/config content hash 为 `0662ac6ed04e8cd672f8e1bb5d2dda10ed5b9bfd02fc3a612159af1390f82958`；
+  原 `AgentDeckMobile` scheme 仍为 `133/133`、零失败，UI test strict four-space format、shell `bash -n`、
+  docs 与 diff 均 PASS。expected RED 只存在于显式 R4 runner/UI E2E 入口，不污染既有 automatic gate。
+- 下一步只允许 R4.2 提供 runner `--contract` 与 private invite/host orchestration；不得通过 skip、fixture、固定
+  sleep、放宽 0600 文件校验或把 expected RED 写成 PASS 来消除失败。
 
 ### Automatic gates
 
@@ -525,7 +544,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
-| R4 Simulator E2E | pending | — | — | — | — | — |
+| R4 Simulator E2E | in progress | R4.1 hash `0662ac6e` | 原 iOS 133/133 PASS；runner contract exit 1、UI test 1 failed / xcodebuild 65（后两项为 expected RED） | UI target 可发现/可编译；缺 private invite 时 fail-close，零 mutation | R4.1 仅冻结缺口，phase review 尚未开始 | R4 WIP；未 push |
 | R5 MVP 收口 | pending | — | — | — | — | — |
 
 状态只能按实际证据更新。focused PASS 不得把 Phase 标为 complete；外部 BLOCKED 不得改写为 PASS。

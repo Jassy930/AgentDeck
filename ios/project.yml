@@ -59,6 +59,16 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
+  AgentDeckMobileUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - AgentDeckMobileUITests
+    dependencies:
+      - target: AgentDeckMobile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
   AgentDeckMobile:
     build:
@@ -73,3 +83,14 @@ schemes:
         - AgentDeckMobileTests
       commandLineArguments:
         "--agentdeck-fixture-source": true
+  RelayCompanionE2E:
+    build:
+      targets:
+        AgentDeckMobile: all
+        AgentDeckMobileUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - AgentDeckMobileUITests
