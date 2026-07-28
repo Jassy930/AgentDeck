@@ -224,13 +224,20 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 
 ## Relay Companion MVP 实施状态（P5.7 automatic complete；P5 为 7/9）
 
-2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
+2026-07-28 起，剩余 Relay 工作按
+[`Relay Companion MVP 救援实施计划`](docs/plans/2026-07-28-relay-companion-mvp-rescue-implementation.md)
+执行：先冻结基线并同步 `master`，再冻结协议所有权，只补被控 Mac 的本机 pending-device 确认 UI 和
+固定拓扑 iOS Simulator E2E，最后以 `p5` verifier、三次 fresh run、双路 review、文档与 clean Git 状态
+收口 automatic MVP。原计划 P6、远程 macOS 完整控制面、真实设备/公网/vendor/production-signing 证据
+全部后置，不再进入当前 MVP。
+
+2026-07-18 纠偏曾让主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
 消失或自洽旧快照留给 P4 CounterGuard。同 UID 在线攻击作为 residual risk 不再扩展。P3.1
 采用方案 b：MVP 接受 dev/ephemeral Keychain 路径，provisioned signed roundtrip 移入 post-MVP
 ignored/BLOCKED 槽位，不阻塞 MVP/P3 exit，也不表示 stable production signing 已完成。P4 功能全保留；
-P5 MVP 仅以 iOS Simulator 自动 E2E 退出，本机第二客户端归入 P6 synthetic DoD；物理设备、公网与干净
-Linux 证据为 post-MVP BLOCKED 槽位。详见
+P5 MVP 仅以 iOS Simulator 自动 E2E 退出；当时把本机第二客户端归入 P6 synthetic DoD。该 P6 执行范围现已
+由 rescue 计划后置；物理设备、公网与干净 Linux 证据仍为 post-MVP BLOCKED 槽位。历史决策详见
 [`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`](docs/plans/2026-07-18-relay-companion-mvp-course-correction.md)。
 P5.1 已建立 `AgentDeckSessionSource -> AgentDeckCore`、
 `AgentDeckRelayClient -> AgentDeckCore + AgentDeckSessionSource` 的显式 SwiftPM 依赖图，并让 macOS
@@ -373,9 +380,10 @@ conversation snapshot，并最多重试三轮；selected-machine observation 在
 不等待自身，retired task 最终由外部 barrier join；`SessionModel` 的全部异步业务 task 进入唯一 operation
 registry，shutdown 停止 admission、cancel 并等待真实 terminal；Preview 显式注册 fixture scope，
 `AppRuntimeCoordinator.close()` 捕获并 join exact pump，handler 派生 task 不能继承 identity 绕过 join。
-精确 manifest、fresh 命令和双路终审证据见 `docs/QUALITY.md`。P5.7 已独立收口，P5 当前为 7/9；P5.8 AppKit machine picker/remote pairing/receipt UI、P5.9 与
-P5 Phase Exit 仍未完成。真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 与
-destructive purge 继续 post-MVP `BLOCKED`。
+精确 manifest、fresh 命令和双路终审证据见 `docs/QUALITY.md`。P5.7 已独立收口，P5 当前为 7/9；当前剩余
+范围只含 P5.8-lite 本机 pending-device 确认 UI、P5.9 fixed-topology Simulator E2E 与 P5 automatic Phase
+Exit。旧 P5.8 remote macOS machine picker/pairing/receipt UI、真实公网 WSS、production-signed Keychain、
+物理 iPhone、第二台 Mac、真实 vendor 与 destructive purge 全部转为 post-MVP `BLOCKED`。
 P3.10 已由 code/test commit `19622ab` 完成 Task 收口：当时把 Runtime schema 推进到 v7，并新增 authenticated machine-wide
 `admin_commands` ledger，并实现 30 天 retention、容量准入、exact replay/conflict 与 COMMIT-unknown
 收敛；`StageUpgrade` 只有在 exact reply 完整 flush ACK 后才 arm，随后经 active→idle fence、候选

@@ -58,10 +58,15 @@
 ### Relay Companion MVP（2026-07-10）
 
 - `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-18-relay-companion-mvp-course-correction.md`：上位纠偏决策；固定 Task 粒度执行、
-  Runtime store 离线篡改 fail-close / 同 UID 在线 residual risk，以及 P5/P6 自动 MVP 与 post-MVP
-  BLOCKED 证据槽位边界。
-- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6 的逐文件 TDD 执行清单。P0–P2、
+- `plans/2026-07-28-relay-companion-mvp-rescue-implementation.md`：当前唯一执行计划；保留 P0–P5.7
+  已验证基础，把剩余范围收敛为基线冻结、master 同步、协议治理、P5.8-lite 本机确认 UI、固定拓扑
+  Simulator E2E 与 automatic MVP 收口六阶段。每阶段都有入口、自动门禁、运行/UI 读回、证据、双路 review、
+  cleanup 和 clean Git 状态退出条件；P6 与真实设备/公网/vendor 证据全部后置。
+- `plans/2026-07-18-relay-companion-mvp-course-correction.md`：历史纠偏决策；其 Task 粒度门禁、Runtime
+  store 离线篡改 fail-close / 同 UID 在线 residual risk 继续约束已实现基线，未完成执行范围由 rescue
+  计划覆盖。
+- `plans/2026-07-10-relay-companion-mvp-implementation.md`：历史 P0–P6 逐文件 TDD 清单；保留已完成证据，
+  未完成的 P5.8–P6 已由 2026-07-28 rescue 计划覆盖，不再直接执行。P0–P2、
   P3.2–P3.8、P3.9-C0-A0/A1/A2 已完成；C0-B3a/B3b/B4/B5 已分别完成并通过
   Task 完整门禁与双路终审；C0-C native history projection 已完成并通过 Task 完整门禁与双路终审，真实当前
   账号 JSONL smoke、Swift 与 iOS Simulator 门禁已通过，production native metadata 仍在 claim 前 post-MVP
@@ -121,7 +126,7 @@
   `missingInputs` 与 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`。Linux 只用 ephemeral test
   keys，macOS production persistent Keychain 不降级；root-lost 流程以 `RELAY_RUNBOOK.md` 为准。P3.1 方案 b、production-signed
   LaunchAgent/Keychain、物理设备与公网证据继续作为 post-MVP BLOCKED。P5 MVP 只以 iOS Simulator
-  自动 E2E 退出，本机第二客户端归 P6 synthetic DoD；P5.4 已在 Swift
+  自动 E2E 退出；原 course-correction 中的本机第二客户端/P6 synthetic DoD 已由 rescue 计划整体后置。P5.4 已在 Swift
   `42f47dc2eecfcd0ca312b9178583246aad48b9f59d6413fc9814052cb7e1cd1c` 与 Rust
   `4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f` 候选上通过 `225/225` focused、
   RelayClient `429/4 SKIP`、完整 Swift `958/4 SKIP + 35`、iOS `26/26` 与完整 Rust/cross-language/static
@@ -136,9 +141,9 @@
   shutdown `56/56`、RelayClient `445/4 SKIP`、顶层 Swift `985/4 SKIP + 35`、iOS `133/133` 与 Release
   fixture-surface 门禁独立完成；P5.7 exact scope 为 `40 prerequisite + 23 registry + 7 docs = 70 paths`，Genesis
   snapshot recovery、selected-scope reentrancy、`SessionModel` operation join 与 Preview/AppRuntime pump barrier
-  均已闭环，fresh 门禁与双路终审见 `QUALITY.md`。当前 P5 为 7/9；P5.8–P5.9 与 P5 Phase Exit 仍未完成。
-  P5.1–P5.7/P4 automatic 完成项都不表示 P5.9 fixed-topology Simulator Relay E2E、真实公网 WSS、production-signed
-  Keychain、第二台 Mac、真实 vendor 或 destructive purge 已完成。
+  均已闭环，fresh 门禁与双路终审见 `QUALITY.md`。当前 P5 为 7/9；rescue 范围内的 P5.8-lite、P5.9 与
+  P5 automatic Phase Exit 仍未完成。P5.1–P5.7/P4 automatic 完成项都不表示 P5.9 fixed-topology Simulator
+  Relay E2E、真实公网 WSS、production-signed Keychain、第二台 Mac、真实 vendor 或 destructive purge 已完成。
 
 ## 协议资料
 

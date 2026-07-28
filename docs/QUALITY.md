@@ -3532,9 +3532,39 @@ strict format（37 default + 2 个 4-space compatibility）、agent docs 与 dif
 前轮独立 `spec/security` 终审发现的 active-conversation Genesis snapshot recovery、observation handler 重入
 self-join、`SessionModel` 非结构化 task join 与 Preview/AppRuntime exact-pump barrier 已逐项修复并加入反例。
 最终 40-path prerequisite hash 与 23-path registry hash 已冻结；`spec/security`、`quality` 在最终 70-path
-候选上的结论均为 `P0=0 / P1=0 / P2=0`。P5.7 已独立收口，P5 当前为 7/9。P5.8 可见 AppKit machine picker/remote pairing/receipt UI、
-P5.9 fixed-topology Simulator Relay E2E 与 P5 Phase Exit 继续未完成；真实公网 WSS、production-signed Keychain、
-物理 iPhone、第二台 Mac、真实 Codex/Claude Code vendor 与 destructive purge 继续 post-MVP `BLOCKED`，不计 PASS。
+候选上的结论均为 `P0=0 / P1=0 / P2=0`。P5.7 已独立收口，P5 当前为 7/9。2026-07-28 rescue 后，
+剩余范围只含 P5.8-lite 本机 pending-device 确认 UI、P5.9 fixed-topology Simulator Relay E2E 与 P5 automatic
+Phase Exit；旧 remote macOS picker/pairing/receipt UI、真实公网 WSS、production-signed Keychain、物理 iPhone、
+第二台 Mac、真实 Codex/Claude Code vendor 与 destructive purge 全部 post-MVP `BLOCKED`，不计 PASS。
+
+## Relay Companion MVP rescue R0 基线冻结证据
+
+R0 只冻结事实、执行入口和既有 automatic baseline，不修改生产代码，也不提前执行 master merge、协议治理或
+P5.8-lite。代码基线为 commit `e400c1cc81cb00ae8d6452ce90dd87d2c85eb17f`、tree
+`f676da3a6fe8088ff911f205b2386a9a7221de16`；入口读回时原分支 `codex/relay-companion-mvp` 无 upstream，
+相对本地 `master` 为 `36 behind / 274 ahead`。后续工作已切到 `codex/relay-mvp-rescue`，R1 必须独立处理
+这 36 个主线提交，不能混入 R0。
+
+2026-07-28 fresh 自动证据：
+
+- `bash scripts/verify-relay-companion-mvp.sh p4-auto` exit 0。真实 daemon/Relay synthetic E2E、local-only
+  pairing principal、persistent CLI、trust reset、Relay client、Runtime v5/Relay v2/E2EE v1 schema、daemon
+  network boundary 和文档门禁全部 PASS；其中交互式 P5.7 Swift host 为既有 `1 ignored`，不计作真实设备、
+  公网或 vendor 证据。
+- `RUSTC_WRAPPER= swift test --filter
+  'AppDelegateTerminationTests|LocalDaemonSessionSourceTests|MachineScopeRealIntegrationTests|MachineScopeRoutingTests|SessionSourceRegistryTests'`
+  exit 0，`50 passed / 0 failed`；其中真实 local UDS + P4 daemon RemoteLink dual-scope integration 为 `1/1`。
+- 最终 `scripts/verify-agent-docs.sh`、`git diff --check` 与新计划尾随空白检查 exit 0；变更范围仅为
+  `AGENTS.md`、README、Relay runbook/index、计划导航、旧计划覆盖告示、本 rescue 计划和本质量证据。
+- cleanup 进程读回未发现本轮启动的 `agentdeck-relay`、`agentdeckd` 或 synthetic adapter；另有一个非 R0
+  owned 的既存 PID `32750`，命令位于 `/private/tmp/agentdeck-p44-baseline/.../agentdeckd`，启动时间为
+  2026-07-21 16:10:59，早于本轮七天。R0 不终止、不认领该外部残留；R1 继续隔离，不能把它计为新泄漏或
+  当前 stable daemon 证据。
+
+运行读回只证明 R0 automatic baseline 可重放。production-signed Keychain/LaunchAgent、物理 iPhone、公网
+WSS、第二台 Mac、真实 vendor、Linux systemd 与 destructive purge 继续使用原 versioned post-MVP
+`BLOCKED` 槽位；R0 没有创建 remote/tag、没有 push，也没有把这些 absence 写成 PASS。两路最终 review
+分别检查事实源/安全停止线与命令/文档/Git hygiene，均要求 `P0=0 / P1=0 / P2=0` 后才允许提交。
 
 ## AppKit 重写后的验证清单
 

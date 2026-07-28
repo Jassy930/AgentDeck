@@ -1,5 +1,11 @@
 # AgentDeck Relay Companion MVP 实施计划
 
+> **执行范围已于 2026-07-28 收口：** 本文保留 P0–P5.7 的历史实施清单和已验证证据；尚未完成的
+> P5.8、P5.9、P5 Phase Exit 与 P6 不再直接执行。当前唯一执行事实源是
+> `docs/plans/2026-07-28-relay-companion-mvp-rescue-implementation.md`。任何后续工作必须满足 rescue
+> 计划的阶段入口、自动门禁、运行/UI 读回、双路 review、文档和 clean Git 状态闭环；不得继续按本文
+> 原 P6 范围扩张。
+
 > **执行 harness：** 按 task TDD、独立 spec/security/quality review、scoped commit 推进。旧计划提到的
 > `superpowers:*` skill 在当前 harness 不可用，不得声称已调用；使用当前可用的独立 subagent review 与
 > controller fresh gates 等价执行。Steps 使用 checkbox（`- [ ]`）追踪。

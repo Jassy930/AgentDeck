@@ -37,10 +37,11 @@
 
 现有计划暂时保留在 `docs/plans/` 根目录，避免为了归档制造大规模文件移动。后续当计划数量继续增长时，再引入：
 
-当前 active Relay 事实源是 `2026-07-10-relay-companion-mvp-design.md`、
+当前 active Relay 目标架构事实源是 `2026-07-10-relay-companion-mvp-design.md`；当前唯一执行事实源是
+`2026-07-28-relay-companion-mvp-rescue-implementation.md`。旧
 `2026-07-10-relay-companion-mvp-implementation.md` 与上位增量
-`2026-07-18-relay-companion-mvp-course-correction.md`；后者固定 Task 粒度门禁、Runtime store 离线
-篡改边界和 P5/P6 MVP 外部验收范围。P3.6-A/P3.6-B/P3.6-C/P3.6-D 已分别提交为
+`2026-07-18-relay-companion-mvp-course-correction.md` 保留历史清单、已验证证据、Task 粒度门禁和 Runtime
+store 离线篡改边界；其中未完成的 P5.8–P6 已被 rescue 计划覆盖，不再直接执行。P3.6-A/P3.6-B/P3.6-C/P3.6-D 已分别提交为
 `7731d1e`/`02cc640`/`694f2d9`/`b668d8f`，默认并发完整 daemon gate 已 exit 0。P3.7 已在
 `819aa5e` / `1acf8b8` / `3f22cf0` 前置分片之上实现 current-binary exec-gate、typed driver/durable
 ACK、cooperative-descendant PGID fencing、两遍 recovery 与 production bootstrap；边界已裁决排除显式

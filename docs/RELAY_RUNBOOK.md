@@ -494,6 +494,8 @@ sentinel 不生成 receipt 或删除授权。production-signed Keychain/LaunchAg
 物理真机/真实 iOS、第二台 Mac 与 destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade、P5.2
 crash-safe client storage、P5.3 WSS/pin/per-connection transfer primitive、P5.4 bounded production source、
 P5.5 canonical fixture/receipt UI 与 P5.6 iOS production composition/pairing lifecycle automatic Task 已完成，
-P5/P6 当前为 6/9、0/4。P5.7–P5.9 与 P5 Phase Exit 仍未完成；P5.6 的注入式 Simulator 证据不等于公网、
-物理 iPhone 或真实 vendor 链路。
+P5/P6 当前历史进度为 7/9、0/4；P5.7 已完成，P5.8–P5.9 与 P5 Phase Exit 尚未完成。2026-07-28 起
+剩余执行范围由 `docs/plans/2026-07-28-relay-companion-mvp-rescue-implementation.md` 收口：P5.8 只保留
+被控 Mac 本机 pending-device 确认 UI，P5.9 只保留固定拓扑 Simulator E2E；原 P6 与真实公网、物理 iPhone、
+第二台 Mac、production signing 或真实 vendor 链路全部后置。
 R0/R1 命令和 `--bootstrap-secret` 只属于历史记录，不得用于当前部署或验收。
