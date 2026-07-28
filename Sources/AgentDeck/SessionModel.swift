@@ -1,4 +1,5 @@
 import AgentDeckCore
+import AgentDeckSessionSource
 import Foundation
 import Observation
 
@@ -102,19 +103,92 @@ enum SessionRuntimeModelError: Error, Equatable, CustomStringConvertible {
   }
 }
 
-/// Runtime v2 App session model。Production 只持有 AppRuntimeCoordinator；不持有、
-/// 不创建、也不关闭 legacy DaemonClient。所有 catalog/history/prompt/approval/config/
-/// metadata 操作都经 shared-daemon RuntimeEnvelope wire。
+/// 保留旧 `SessionModel(runtimeWireFactory:)` 的 MainActor 测试 seam，同时让 source 只捕获
+/// 可跨 actor 的 global-actor box，不把非 Sendable factory 直接逃逸到 actor 内。
+@MainActor
+private final class SessionRuntimeWireFactoryBox {
+  private let factory: @MainActor () -> any AppRuntimeWireSession
+
+  init(_ factory: @escaping @MainActor () -> any AppRuntimeWireSession) {
+    self.factory = factory
+  }
+
+  func makeWire() -> any AppRuntimeWireSession {
+    factory()
+  }
+}
+
+private struct SessionOperationShutdownEntry: Sendable {
+  let cancel: @Sendable () -> Void
+  let join: @Sendable () async -> Void
+}
+
+/// `SessionModel` 发起的所有异步业务操作的唯一 owner。
+///
+/// Task 正常结束时会从 registry 移除；shutdown 先停止 admission、原子取走并 cancel
+/// 全部 Task，再由 model 的 retained barrier 等待每个异构 Task 的真实 terminal。
+@MainActor
+private final class SessionOperationTaskRegistry {
+  private var tasks: [UUID: SessionOperationShutdownEntry] = [:]
+  private var acceptsOperations = true
+
+  @discardableResult
+  func launch(
+    _ operation: @escaping @MainActor @Sendable () async -> Void
+  ) -> Task<Void, Never> {
+    precondition(acceptsOperations, "Session operation started after shutdown")
+    let id = UUID()
+    let task = Task { @MainActor [weak self] in
+      defer { self?.finish(id) }
+      await operation()
+    }
+    tasks[id] = SessionOperationShutdownEntry(
+      cancel: { task.cancel() },
+      join: { await task.value }
+    )
+    return task
+  }
+
+  func launchThrowing<Success: Sendable>(
+    _ operation: @escaping @MainActor @Sendable () async throws -> Success
+  ) -> Task<Success, Error> {
+    precondition(acceptsOperations, "Session operation started after shutdown")
+    let id = UUID()
+    let task = Task<Success, Error> { @MainActor [weak self] in
+      defer { self?.finish(id) }
+      return try await operation()
+    }
+    tasks[id] = SessionOperationShutdownEntry(
+      cancel: { task.cancel() },
+      join: { _ = await task.result }
+    )
+    return task
+  }
+
+  func cancelAndTakeForShutdown() -> [SessionOperationShutdownEntry] {
+    guard acceptsOperations else { return [] }
+    acceptsOperations = false
+    let captured = Array(tasks.values)
+    tasks.removeAll(keepingCapacity: false)
+    for task in captured { task.cancel() }
+    return captured
+  }
+
+  private func finish(_ id: UUID) {
+    tasks.removeValue(forKey: id)
+  }
+}
+
+/// current Runtime v5 outer / `RuntimeEnvelopeV2` DTO App session model。Production 只持有 typed local administration facade；
+/// UDS wire/coordinator 的创建、generation 和 close 全部由 `LocalDaemonSessionSource` 独占。
+/// 所有 catalog/history/prompt/approval/config/metadata 操作都经同一 source lease。
 @MainActor
 @Observable
 final class SessionModel {
   /// 与 daemon P3.6 的 connection-bound hard cap 保持一致；catalog 也占一个 live slot。
   private static let maximumLiveSubscriptionsPerConnection = 64
 
-  private struct RuntimeCoordinatorLease {
-    let coordinator: AppRuntimeCoordinator
-    let generation: UInt64
-  }
+  private typealias RuntimeCoordinatorLease = LocalConversationConnectionLease
 
   private struct HistoryOpenIntent {
     let generation: UInt64
@@ -166,18 +240,17 @@ final class SessionModel {
 
   let workbench: WorkbenchModel
 
-  private var coordinator: AppRuntimeCoordinator?
+  private let localRuntimeAdministration: any LocalConversationAdministration
+  private let ownedLocalSourceLifecycle: (any SessionSourceLifecycle)?
+  private let supportsRuntimeConnectionReplacement: Bool
   private let inboundBridge: SessionRuntimeInboundBridge
-  private let runtimeWireFactory: (@MainActor () -> any AppRuntimeWireSession)?
+  private var runtimeConnectionLease: RuntimeCoordinatorLease?
   private var runtimeConnectionGeneration: UInt64 = 0
-  private var runtimeConnectionNeedsReplacement = false
+  private var runtimeConnectionAvailable = false
   private var runtimeConnectionRequiresSubscriptionRestore = false
-  private var runtimeCoordinatorCloseTask: Task<Void, Never>?
-  private var runtimeCoordinatorCloseGeneration: UInt64?
   private var runtimeBootstrapTask: Task<RuntimeAgentDescriptionsV2, Error>?
   private var runtimeBootstrapTaskID: UInt64?
   private var nextRuntimeBootstrapTaskID: UInt64 = 0
-  private var runtimeCoordinatorStarted = false
   private var conversationStartTask: Task<Void, Never>?
   private var conversationStartTaskID: UInt64?
   private var nextConversationStartTaskID: UInt64 = 0
@@ -201,35 +274,155 @@ final class SessionModel {
   private var conversationViewportRevision = 0
   private var tickTimer: Timer?
   private var isTornDown = false
+  private let operationTasks = SessionOperationTaskRegistry()
+  private var shutdownBarrier: Task<Void, Never>?
 
   convenience init() {
     self.init(runtimeWireFactory: { OSAccountRuntimeWireSession() })
   }
 
   convenience init(runtimeWire: any AppRuntimeWireSession) {
-    self.init(runtimeWire: runtimeWire, runtimeWireFactory: nil)
+    let workbench = WorkbenchModel()
+    let bridge = SessionRuntimeInboundBridge(workbench: workbench)
+    let source = Self.makeLocalSource(
+      runtimeWire: runtimeWire,
+      bridge: bridge
+    )
+    self.init(
+      workbench: workbench,
+      inboundBridge: bridge,
+      localRuntimeAdministration: source,
+      ownedLocalSourceLifecycle: source,
+      supportsRuntimeConnectionReplacement: false
+    )
   }
 
   convenience init(
     runtimeWireFactory: @escaping @MainActor () -> any AppRuntimeWireSession
   ) {
-    self.init(runtimeWire: nil, runtimeWireFactory: runtimeWireFactory)
-  }
-
-  private init(
-    runtimeWire: (any AppRuntimeWireSession)?,
-    runtimeWireFactory: (@MainActor () -> any AppRuntimeWireSession)?
-  ) {
     let workbench = WorkbenchModel()
     let bridge = SessionRuntimeInboundBridge(workbench: workbench)
+    let factoryBox = SessionRuntimeWireFactoryBox(runtimeWireFactory)
+    let source = LocalDaemonSessionSource(
+      runtimeWireFactory: { await factoryBox.makeWire() },
+      machineID: "session-model-private",
+      connectionActivation: { generation in
+        await bridge.activate(connectionGeneration: generation)
+      },
+      inboundHandler: { inbound, generation in
+        try await bridge.ingest(inbound, connectionGeneration: generation)
+      },
+      terminationHandler: { generation, failure in
+        await bridge.connectionTerminated(
+          connectionGeneration: generation,
+          failure: failure
+        )
+      }
+    )
+    self.init(
+      workbench: workbench,
+      inboundBridge: bridge,
+      localRuntimeAdministration: source,
+      ownedLocalSourceLifecycle: source,
+      supportsRuntimeConnectionReplacement: true
+    )
+  }
+
+  init(
+    workbench: WorkbenchModel,
+    inboundBridge: SessionRuntimeInboundBridge,
+    localRuntimeAdministration: any LocalConversationAdministration,
+    ownedLocalSourceLifecycle: (any SessionSourceLifecycle)? = nil,
+    supportsRuntimeConnectionReplacement: Bool = true
+  ) {
     self.workbench = workbench
-    inboundBridge = bridge
-    self.runtimeWireFactory = runtimeWireFactory
-    coordinator = runtimeWire.map {
-      Self.makeCoordinator(wire: $0, bridge: bridge, connectionGeneration: 0)
-    }
-    runtimeConnectionNeedsReplacement = runtimeWire == nil
-    bridge.model = self
+    self.inboundBridge = inboundBridge
+    self.localRuntimeAdministration = localRuntimeAdministration
+    self.ownedLocalSourceLifecycle = ownedLocalSourceLifecycle
+    self.supportsRuntimeConnectionReplacement = supportsRuntimeConnectionReplacement
+    inboundBridge.model = self
+  }
+
+  static func makeProductionLocalBinding(
+    installation: LocalClientInstallation
+  ) -> (model: SessionModel, source: LocalDaemonSessionSource) {
+    let workbench = WorkbenchModel()
+    let bridge = SessionRuntimeInboundBridge(workbench: workbench)
+    let source = LocalDaemonSessionSource(
+      installation: installation,
+      connectionActivation: { generation in
+        await bridge.activate(connectionGeneration: generation)
+      },
+      inboundHandler: { inbound, generation in
+        try await bridge.ingest(inbound, connectionGeneration: generation)
+      },
+      terminationHandler: { generation, failure in
+        await bridge.connectionTerminated(
+          connectionGeneration: generation,
+          failure: failure
+        )
+      }
+    )
+    let model = SessionModel(
+      workbench: workbench,
+      inboundBridge: bridge,
+      localRuntimeAdministration: source
+    )
+    return (model, source)
+  }
+
+  /// Preview composition 的显式 fixture binding。model 与 fixture registry handle
+  /// 共用同一个 source owner，但 local-only capabilities 不会从 fixture handle 暴露。
+  static func makeFixtureBinding(
+    runtimeWire: any AppRuntimeWireSession,
+    machineID: String
+  ) -> (model: SessionModel, source: LocalDaemonSessionSource) {
+    let workbench = WorkbenchModel()
+    let bridge = SessionRuntimeInboundBridge(workbench: workbench)
+    let source = LocalDaemonSessionSource(
+      runtimeWire: runtimeWire,
+      machineID: machineID,
+      connectionActivation: { generation in
+        await bridge.activate(connectionGeneration: generation)
+      },
+      inboundHandler: { inbound, generation in
+        try await bridge.ingest(inbound, connectionGeneration: generation)
+      },
+      terminationHandler: { generation, failure in
+        await bridge.connectionTerminated(
+          connectionGeneration: generation,
+          failure: failure
+        )
+      }
+    )
+    let model = SessionModel(
+      workbench: workbench,
+      inboundBridge: bridge,
+      localRuntimeAdministration: source
+    )
+    return (model, source)
+  }
+
+  private static func makeLocalSource(
+    runtimeWire: any AppRuntimeWireSession,
+    bridge: SessionRuntimeInboundBridge
+  ) -> LocalDaemonSessionSource {
+    LocalDaemonSessionSource(
+      runtimeWire: runtimeWire,
+      machineID: "session-model-private",
+      connectionActivation: { generation in
+        await bridge.activate(connectionGeneration: generation)
+      },
+      inboundHandler: { inbound, generation in
+        try await bridge.ingest(inbound, connectionGeneration: generation)
+      },
+      terminationHandler: { generation, failure in
+        await bridge.connectionTerminated(
+          connectionGeneration: generation,
+          failure: failure
+        )
+      }
+    )
   }
 
   var shouldShowReasoningExpanded: Bool {
@@ -401,7 +594,10 @@ final class SessionModel {
     let needsTick = phase == .running || phase == .starting
     if needsTick && tickTimer == nil {
       tickTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-        Task { @MainActor in self?.tickNow = .now }
+        Task { @MainActor [weak self] in
+          guard let self, !isTornDown else { return }
+          tickNow = .now
+        }
       }
     } else if !needsTick {
       tickTimer?.invalidate()
@@ -676,7 +872,7 @@ final class SessionModel {
     warningMessage = nil
     nextConversationStartTaskID &+= 1
     let taskID = nextConversationStartTaskID
-    let task = Task { [weak self] in
+    let task = operationTasks.launch { [weak self] in
       guard let self else { return }
       defer { finishConversationStartTask(taskID: taskID) }
       var operationLease: RuntimeCoordinatorLease?
@@ -692,7 +888,10 @@ final class SessionModel {
           )
           try requireCurrentRuntimeCoordinator(lease)
           do {
-            let result = try await lease.coordinator.startConversation(draft)
+            let result = try await localRuntimeAdministration.startConversation(
+              draft,
+              using: lease
+            )
             try requireCurrentRuntimeCoordinator(lease)
             subscribedConversationIDs.insert(result.conversationID)
             touchConversationSubscription(result.conversationID)
@@ -852,13 +1051,13 @@ final class SessionModel {
   }
 
   func loadHistory(currentProjectOnly: Bool = false) {
-    guard !isLoadingHistory else { return }
+    guard !isTornDown, !isLoadingHistory else { return }
     isLoadingHistory = true
     wantsCatalogSubscription = true
     historyCurrentProjectOnly = currentProjectOnly
     historyErrorMessage = nil
 
-    Task { [weak self] in
+    operationTasks.launch { [weak self] in
       guard let self else { return }
       var operationLease: RuntimeCoordinatorLease?
       defer {
@@ -873,10 +1072,13 @@ final class SessionModel {
           guard let cursor = workbench.catalogCursor else {
             throw WorkbenchModelError.catalogUnavailable
           }
-          _ = try await lease.coordinator.backfillCatalog(after: cursor)
+          _ = try await localRuntimeAdministration.backfillCatalog(
+            after: cursor,
+            using: lease
+          )
           try requireCurrentRuntimeCoordinator(lease)
         } else {
-          let pages = try await lease.coordinator.loadCatalog()
+          let pages = try await localRuntimeAdministration.loadCatalog(using: lease)
           try requireCurrentRuntimeCoordinator(lease)
           try workbench.installCatalog(snapshotPages: pages)
           guard let cursor = workbench.catalogCursor else {
@@ -899,6 +1101,7 @@ final class SessionModel {
   }
 
   func openHistoryThread(_ thread: HistoryThreadSummary) {
+    guard !isTornDown else { return }
     guard !hasBootstrapConversationIntent else {
       historyErrorMessage =
         "Finish or retry the pending conversation start before opening history"
@@ -918,7 +1121,7 @@ final class SessionModel {
       startedAt: .now
     )
     guard historyOpenDrainTask == nil else { return }
-    historyOpenDrainTask = Task { [weak self] in
+    historyOpenDrainTask = operationTasks.launch { [weak self] in
       await self?.drainHistoryOpenIntents()
     }
   }
@@ -1021,13 +1224,14 @@ final class SessionModel {
     decision: ActionDecisionKind,
     persist: Bool = false
   ) {
+    guard !isTornDown else { return }
     do {
       let intent = try workbench.approvalDecisionIntent(
         for: pending,
         decision: decision,
         persist: persist
       )
-      Task { [weak self] in
+      operationTasks.launch { [weak self] in
         guard let self else { return }
         var operationLease: RuntimeCoordinatorLease?
         do {
@@ -1043,11 +1247,12 @@ final class SessionModel {
               using: lease
             )
           }
-          _ = try await lease.coordinator.resolveApproval(
+          _ = try await localRuntimeAdministration.resolveApproval(
             conversationID: intent.conversationID,
             turnID: intent.turnID,
             approvalID: intent.approvalID,
-            decision: intent.decision
+            decision: intent.decision,
+            using: lease
           )
           try requireCurrentRuntimeCoordinator(lease)
         } catch {
@@ -1068,6 +1273,7 @@ final class SessionModel {
     conversationID: RuntimeConversationID,
     mutation: RuntimeAgentControlMutation
   ) {
+    guard !isTornDown else { return }
     do {
       guard let runtime = workbench.runtime(conversationID: conversationID) else {
         throw SessionRuntimeModelError.conversationUnavailable(conversationID)
@@ -1085,7 +1291,7 @@ final class SessionModel {
         expectedConfigurationRevision: state.configurationRevision,
         configuration: next
       )
-      Task { [weak self] in
+      operationTasks.launch { [weak self] in
         guard let self else { return }
         var operationLease: RuntimeCoordinatorLease?
         do {
@@ -1099,14 +1305,18 @@ final class SessionModel {
             runtime,
             using: lease
           )
-          let receipt = try await lease.coordinator.configureConversation(request)
+          let receipt = try await localRuntimeAdministration.configureConversation(
+            request,
+            using: lease
+          )
           try requireCurrentRuntimeCoordinator(lease)
           if case .conflict(_, let currentRevision) = receipt {
             runtime.warningMessage =
               "configuration changed at revision \(currentRevision); resyncing"
-            _ = try await lease.coordinator.backfillConversation(
+            _ = try await localRuntimeAdministration.backfillConversation(
               conversationID: conversationID,
-              after: runtime.cursor
+              after: runtime.cursor,
+              using: lease
             )
             try requireCurrentRuntimeCoordinator(lease)
           }
@@ -1127,17 +1337,20 @@ final class SessionModel {
   func teardown() {
     guard !isTornDown else { return }
     isTornDown = true
+    let retainedOperations = operationTasks.cancelAndTakeForShutdown()
     inboundBridge.deactivate()
     tickTimer?.invalidate()
-    runtimeBootstrapTask?.cancel()
+    tickTimer = nil
     runtimeBootstrapTask = nil
     runtimeBootstrapTaskID = nil
-    conversationStartTask?.cancel()
     conversationStartTask = nil
     conversationStartTaskID = nil
-    historyOpenDrainTask?.cancel()
     historyOpenDrainTask = nil
     pendingHistoryOpenIntent = nil
+    let liveAdmissionWaiters = liveSubscriptionAdmissionWaiters
+    liveSubscriptionAdmissionWaiters.removeAll(keepingCapacity: false)
+    liveSubscriptionAdmissionHeld = false
+    for waiter in liveAdmissionWaiters { waiter.resume() }
     workbench.cancelConversationStart()
     pendingConversationBootstrapAdmission = nil
     retryRequiredConversationBootstrapAdmission = nil
@@ -1150,9 +1363,23 @@ final class SessionModel {
     workbench.cancelPendingSynchronization()
     isLoadingHistory = false
     phase = .closed
-    let activeCoordinator = coordinator
-    coordinator = nil
-    Task { await activeCoordinator?.close() }
+    runtimeConnectionLease = nil
+    runtimeConnectionAvailable = false
+    let ownedLocalSourceLifecycle = ownedLocalSourceLifecycle
+    shutdownBarrier = Task {
+      if let ownedLocalSourceLifecycle {
+        await ownedLocalSourceLifecycle.shutdown()
+        await ownedLocalSourceLifecycle.join()
+      }
+      for operation in retainedOperations { await operation.join() }
+    }
+  }
+
+  /// `teardown()` 负责同步关闭 admission；该 async barrier 只在全部 model operation
+  /// 与 model-owned source generation 都到达 terminal 后返回。
+  func shutdown() async {
+    teardown()
+    await shutdownBarrier?.value
   }
 
   fileprivate func didApplyInbound(
@@ -1188,99 +1415,35 @@ final class SessionModel {
     )
   }
 
-  private static func makeCoordinator(
-    wire: any AppRuntimeWireSession,
-    bridge: SessionRuntimeInboundBridge,
-    connectionGeneration: UInt64
-  ) -> AppRuntimeCoordinator {
-    AppRuntimeCoordinator(
-      wire: wire,
-      inboundHandler: { inbound in
-        try await bridge.ingest(
-          inbound,
-          connectionGeneration: connectionGeneration
-        )
-      },
-      terminationHandler: {
-        bridge.connectionTerminated(connectionGeneration: connectionGeneration)
-      }
-    )
-  }
-
   private func installFreshRuntimeCoordinatorIfNeeded() async throws {
-    while true {
-      if let closeTask = runtimeCoordinatorCloseTask,
-        let closeGeneration = runtimeCoordinatorCloseGeneration
-      {
-        await closeTask.value
-        if runtimeCoordinatorCloseGeneration == closeGeneration {
-          runtimeCoordinatorCloseTask = nil
-          runtimeCoordinatorCloseGeneration = nil
-        }
-        continue
-      }
-      guard !isTornDown else { throw CancellationError() }
-      guard let activeCoordinator = coordinator else { break }
-      let activeGeneration = runtimeConnectionGeneration
-      let requiresFreshConnection = await activeCoordinator.requiresFreshConnection()
-      guard !isTornDown else { throw CancellationError() }
-      guard coordinator === activeCoordinator,
-        runtimeConnectionGeneration == activeGeneration
-      else {
-        continue
-      }
-      guard requiresFreshConnection else { return }
-
-      runtimeConnectionGeneration &+= 1
-      inboundBridge.activate(connectionGeneration: runtimeConnectionGeneration)
-      coordinator = nil
-      runtimeConnectionNeedsReplacement = true
-      runtimeConnectionRequiresSubscriptionRestore = true
-      runtimeCoordinatorStarted = false
-      runtimeBootstrapTask?.cancel()
-      runtimeBootstrapTask = nil
-      runtimeBootstrapTaskID = nil
-      catalogSubscribed = false
-      subscribedConversationIDs.removeAll()
-      conversationSubscriptionLastUsed.removeAll()
-      workbench.cancelPendingSynchronization()
-
-      let closeTask = Task { await activeCoordinator.close() }
-      runtimeCoordinatorCloseTask = closeTask
-      runtimeCoordinatorCloseGeneration = activeGeneration
-    }
     guard !isTornDown else { throw CancellationError() }
-    guard coordinator == nil || runtimeConnectionNeedsReplacement else { return }
-    guard let runtimeWireFactory else {
+    if let lease = runtimeConnectionLease,
+      runtimeConnectionAvailable,
+      !(await localRuntimeAdministration.requiresFreshConnection(lease))
+    {
+      return
+    }
+    let lease = try await localRuntimeAdministration.connectionLease()
+    try await localRuntimeAdministration.requireCurrentConnection(lease)
+    guard !isTornDown, runtimeConnectionAvailable,
+      runtimeConnectionGeneration == lease.generation
+    else {
       throw AppRuntimeCoordinatorError.closed
     }
-
-    runtimeConnectionGeneration &+= 1
-    let generation = runtimeConnectionGeneration
-    let freshCoordinator = Self.makeCoordinator(
-      wire: runtimeWireFactory(),
-      bridge: inboundBridge,
-      connectionGeneration: generation
-    )
-    inboundBridge.activate(connectionGeneration: generation)
-    coordinator = freshCoordinator
-    runtimeConnectionNeedsReplacement = false
+    runtimeConnectionLease = lease
   }
 
   private func currentRuntimeCoordinatorLease() throws -> RuntimeCoordinatorLease {
-    guard !isTornDown, !runtimeConnectionNeedsReplacement, let coordinator else {
+    guard !isTornDown, runtimeConnectionAvailable, let runtimeConnectionLease else {
       throw AppRuntimeCoordinatorError.closed
     }
-    return RuntimeCoordinatorLease(
-      coordinator: coordinator,
-      generation: runtimeConnectionGeneration
-    )
+    return runtimeConnectionLease
   }
 
   private func requireCurrentRuntimeCoordinator(_ lease: RuntimeCoordinatorLease) throws {
-    guard !isTornDown, !runtimeConnectionNeedsReplacement,
+    guard !isTornDown, runtimeConnectionAvailable,
       runtimeConnectionGeneration == lease.generation,
-      coordinator === lease.coordinator
+      runtimeConnectionLease == lease
     else {
       throw AppRuntimeCoordinatorError.closed
     }
@@ -1291,55 +1454,80 @@ final class SessionModel {
   ) -> Bool {
     guard !isTornDown else { return false }
     guard let lease else { return true }
-    return runtimeConnectionGeneration == lease.generation
-      && coordinator === lease.coordinator
+    return runtimeConnectionAvailable
+      && runtimeConnectionGeneration == lease.generation
+      && runtimeConnectionLease == lease
   }
 
   private func invalidateRuntimeConnectionIfNeeded(
     after error: Error,
     failedCoordinator lease: RuntimeCoordinatorLease?
   ) async {
-    guard runtimeWireFactory != nil, let lease else { return }
-    let coordinatorClosed = await lease.coordinator.requiresFreshConnection()
+    guard supportsRuntimeConnectionReplacement, let lease else { return }
+    let coordinatorClosed = await localRuntimeAdministration.requiresFreshConnection(lease)
     guard coordinatorClosed || Self.requiresFreshRuntimeConnection(after: error),
+      runtimeConnectionAvailable,
       runtimeConnectionGeneration == lease.generation,
-      coordinator === lease.coordinator
+      runtimeConnectionLease == lease
     else { return }
-
-    runtimeConnectionGeneration &+= 1
-    inboundBridge.activate(connectionGeneration: runtimeConnectionGeneration)
-    coordinator = nil
-    runtimeConnectionNeedsReplacement = true
-    runtimeConnectionRequiresSubscriptionRestore = true
-    runtimeCoordinatorStarted = false
-    runtimeBootstrapTask?.cancel()
-    runtimeBootstrapTask = nil
-    runtimeBootstrapTaskID = nil
-    catalogSubscribed = false
-    subscribedConversationIDs.removeAll()
-    conversationSubscriptionLastUsed.removeAll()
-    workbench.cancelPendingSynchronization()
-
-    let closeTask = Task { await lease.coordinator.close() }
-    runtimeCoordinatorCloseTask = closeTask
-    runtimeCoordinatorCloseGeneration = lease.generation
-    await closeTask.value
+    let reason = LocalConversationConnectionInvalidationReason.failure(
+      LocalDaemonSessionSource.publicFailure(error)
+    )
+    _ = await localRuntimeAdministration.invalidateConnection(lease, reason: reason)
   }
 
-  /// Stream pump 的异常终止只在旧 wire 的真实 close barrier 完成后到达这里。
-  /// 不热循环建连接；只原子废弃旧 generation，让下一次用户操作直接创建 fresh wire。
-  fileprivate func runtimeConnectionTerminated(connectionGeneration: UInt64) {
-    guard !isTornDown, runtimeWireFactory != nil,
-      runtimeConnectionGeneration == connectionGeneration,
-      coordinator != nil
-    else { return }
+  fileprivate func runtimeConnectionActivated(connectionGeneration: UInt64) {
+    guard !isTornDown else { return }
+    let replacesPriorConnection =
+      runtimeConnectionGeneration != 0
+      && runtimeConnectionGeneration != connectionGeneration
+    runtimeConnectionGeneration = connectionGeneration
+    runtimeConnectionAvailable = true
+    runtimeConnectionLease = nil
+    if replacesPriorConnection {
+      runtimeConnectionRequiresSubscriptionRestore = true
+    }
+    resetRuntimeSubscriptionLedger()
+  }
 
-    runtimeConnectionGeneration &+= 1
-    inboundBridge.activate(connectionGeneration: runtimeConnectionGeneration)
-    coordinator = nil
-    runtimeConnectionNeedsReplacement = true
-    runtimeConnectionRequiresSubscriptionRestore = true
-    runtimeCoordinatorStarted = false
+  /// Stream pump 异常终止只废弃 source 通知的 exact generation。不热循环建连；
+  /// 下一次用户操作由 source cold-open 新 wire，并在首帧前激活新 generation。
+  fileprivate func runtimeConnectionTerminated(
+    connectionGeneration: UInt64,
+    failure: SessionSourceFailure
+  ) {
+    guard !isTornDown,
+      runtimeConnectionGeneration == connectionGeneration,
+      runtimeConnectionAvailable
+    else { return }
+    runtimeConnectionAvailable = false
+    runtimeConnectionLease = nil
+    let terminal =
+      failure.code == .revoked
+      || failure.code == .incompatible
+      || failure.code == .securityError
+    runtimeConnectionRequiresSubscriptionRestore = !terminal
+    resetRuntimeSubscriptionLedger()
+    let message = failure.message ?? failure.code.rawValue
+    if terminal {
+      if let runtime = workbench.selectedRuntime {
+        runtime.recordOperationError(message)
+      } else {
+        errorMessage = message
+        phase = .failed
+      }
+    } else {
+      let reconnectingMessage =
+        "Local daemon connection closed (\(message)); the next action will reconnect"
+      if let runtime = workbench.selectedRuntime {
+        runtime.warningMessage = reconnectingMessage
+      } else {
+        warningMessage = reconnectingMessage
+      }
+    }
+  }
+
+  private func resetRuntimeSubscriptionLedger() {
     runtimeBootstrapTask?.cancel()
     runtimeBootstrapTask = nil
     runtimeBootstrapTaskID = nil
@@ -1347,12 +1535,6 @@ final class SessionModel {
     subscribedConversationIDs.removeAll()
     conversationSubscriptionLastUsed.removeAll()
     workbench.cancelPendingSynchronization()
-    let message = "Local daemon connection closed; the next action will reconnect"
-    if let runtime = workbench.selectedRuntime {
-      runtime.warningMessage = message
-    } else {
-      warningMessage = message
-    }
   }
 
   private func restoreRequiredSubscriptions(
@@ -1389,7 +1571,10 @@ final class SessionModel {
         using: lease
       )
       try requireCurrentRuntimeCoordinator(lease)
-      _ = try await lease.coordinator.synchronizeCatalog(cursor: cursor)
+      _ = try await localRuntimeAdministration.synchronizeCatalog(
+        cursor: cursor,
+        using: lease
+      )
       try requireCurrentRuntimeCoordinator(lease)
       catalogSubscribed = true
     }
@@ -1414,9 +1599,10 @@ final class SessionModel {
         using: lease
       )
       try requireCurrentRuntimeCoordinator(lease)
-      _ = try await lease.coordinator.synchronizeConversation(
+      _ = try await localRuntimeAdministration.synchronizeConversation(
         conversationID: conversationID,
-        cursor: runtime.cursor
+        cursor: runtime.cursor,
+        using: lease
       )
       try requireCurrentRuntimeCoordinator(lease)
       subscribedConversationIDs.insert(conversationID)
@@ -1461,7 +1647,10 @@ final class SessionModel {
       throw SessionRuntimeModelError.subscriptionCapacityUnavailable
     }
     try requireCurrentRuntimeCoordinator(lease)
-    try await lease.coordinator.unsubscribeConversation(victim)
+    try await localRuntimeAdministration.unsubscribeConversation(
+      victim,
+      using: lease
+    )
     try requireCurrentRuntimeCoordinator(lease)
     subscribedConversationIDs.remove(victim)
     conversationSubscriptionLastUsed.removeValue(forKey: victim)
@@ -1517,15 +1706,10 @@ final class SessionModel {
 
     nextRuntimeBootstrapTaskID &+= 1
     let taskID = nextRuntimeBootstrapTaskID
-    let task = Task { [weak self] in
+    let task = operationTasks.launchThrowing { [weak self] in
       guard let self else { throw CancellationError() }
       guard !isTornDown else { throw CancellationError() }
-      if !runtimeCoordinatorStarted {
-        try await lease.coordinator.start()
-        try requireCurrentRuntimeCoordinator(lease)
-        runtimeCoordinatorStarted = true
-      }
-      let descriptions = try await lease.coordinator.describeAgents()
+      let descriptions = try await localRuntimeAdministration.describeAgents(using: lease)
       try requireCurrentRuntimeCoordinator(lease)
       if runtimeConnectionRequiresSubscriptionRestore {
         try await restoreRequiredSubscriptions(
@@ -1547,6 +1731,7 @@ final class SessionModel {
     _ admission: ConversationBootstrapAdmission,
     preservingBootstrapComposerLineage: Bool = false
   ) {
+    guard !isTornDown else { return }
     precondition(pendingConversationBootstrapAdmission == nil)
     if !preservingBootstrapComposerLineage || bootstrapComposerLineageID == nil {
       bootstrapComposerLineageID = UUID()
@@ -1558,7 +1743,7 @@ final class SessionModel {
     errorMessage = nil
     warningMessage = nil
 
-    Task { [weak self] in
+    operationTasks.launch { [weak self] in
       guard let self else { return }
       do {
         let descriptions = try await ensureRuntimeStarted()
@@ -1733,6 +1918,7 @@ final class SessionModel {
     idempotencyKey: RuntimeIdempotencyKey,
     conversationID: RuntimeConversationID
   ) {
+    guard !isTornDown else { return }
     guard let runtime = workbench.runtime(conversationID: conversationID) else {
       recordOperationFailure(
         SessionRuntimeModelError.conversationUnavailable(conversationID),
@@ -1754,7 +1940,7 @@ final class SessionModel {
       if presentsAdmissionAsStarting {
         runtime.phase = .starting
       }
-      Task { [weak self] in
+      operationTasks.launch { [weak self] in
         guard let self else { return }
         var operationLease: RuntimeCoordinatorLease?
         do {
@@ -1765,11 +1951,12 @@ final class SessionModel {
           let lease = try currentRuntimeCoordinatorLease()
           operationLease = lease
           try await synchronizeConversationIfNeeded(runtime, using: lease)
-          let receipt = try await lease.coordinator.sendPrompt(
+          let receipt = try await localRuntimeAdministration.sendPrompt(
             conversationID: conversationID,
             idempotencyKey: idempotencyKey,
             expectedConfigurationRevision: revision,
-            prompt: payload
+            prompt: payload,
+            using: lease
           )
           try requireCurrentRuntimeCoordinator(lease)
           let nextAction = runtime.acknowledgeQueuedPrompt(
@@ -1819,6 +2006,7 @@ final class SessionModel {
     for thread: HistoryThreadSummary,
     mutation: RuntimeConversationMetadataMutationV2
   ) {
+    guard !isTornDown else { return }
     guard let conversationID = authoritativeConversationID(for: thread.id),
       let entry = workbench.catalogEntry(conversationID: conversationID)
     else {
@@ -1832,7 +2020,7 @@ final class SessionModel {
       mutation: mutation
     )
 
-    Task { [weak self] in
+    operationTasks.launch { [weak self] in
       guard let self else { return }
       var operationLease: RuntimeCoordinatorLease?
       do {
@@ -1842,7 +2030,10 @@ final class SessionModel {
         guard !isTornDown else { return }
         let lease = try currentRuntimeCoordinatorLease()
         operationLease = lease
-        let receipt = try await lease.coordinator.updateConversationMetadata(request)
+        let receipt = try await localRuntimeAdministration.updateConversationMetadata(
+          request,
+          using: lease
+        )
         try requireCurrentRuntimeCoordinator(lease)
         if case .conflict(_, let currentRevision) = receipt {
           throw SessionRuntimeModelError.metadataConflict(
@@ -1962,6 +2153,7 @@ final class SessionModel {
     case .unexpectedReply,
       .receiptConversationMismatch,
       .receiptApprovalMismatch,
+      .receiptPairingMismatch,
       .receiptConfigurationRevisionMismatch,
       .closed,
       .missingSubscriptionReceipt,
@@ -2013,6 +2205,7 @@ final class SessionModel {
       .unexpectedReply,
       .receiptConversationMismatch,
       .receiptApprovalMismatch,
+      .receiptPairingMismatch,
       .receiptConfigurationRevisionMismatch,
       .catalogPageCursorMismatch:
       return true
@@ -2232,13 +2425,20 @@ final class SessionRuntimeInboundBridge {
     model?.didApplyInbound(inbound, action: action)
   }
 
-  func connectionTerminated(connectionGeneration: UInt64) {
+  func connectionTerminated(
+    connectionGeneration: UInt64,
+    failure: SessionSourceFailure
+  ) {
     guard acceptsInbound, connectionGeneration == activeConnectionGeneration else { return }
-    model?.runtimeConnectionTerminated(connectionGeneration: connectionGeneration)
+    model?.runtimeConnectionTerminated(
+      connectionGeneration: connectionGeneration,
+      failure: failure
+    )
   }
 
   func activate(connectionGeneration: UInt64) {
     activeConnectionGeneration = connectionGeneration
+    model?.runtimeConnectionActivated(connectionGeneration: connectionGeneration)
   }
 
   func deactivate() {

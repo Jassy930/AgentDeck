@@ -66,7 +66,9 @@ agentdeckd
   transfer coordinator、bounded broadcaster/reducers、scoped `RelaySessionSource`、typed command 与 pairing
   handler；P5.5 已让 iOS fixture/ViewModel 直接实现并消费共享 `SessionSource`，同时把 canonical reducer
   下沉到 `AgentDeckCore`；P5.6 又让 iOS Release composition 默认拥有真实 `RelaySessionSource`、完整邀请
-  配对与前后台冷恢复，fixture 仅留 Debug preview/test。AppKit registry 仍属于 P5.7/P5.8。
+  配对与前后台冷恢复，fixture 仅留 Debug preview/test；P5.7 已建立 macOS 唯一本机 UDS source、按机器隔离的
+  remote source registry 与 shutdown/join barrier。可见的 AppKit machine picker、remote pairing 与 receipt
+  控制面仍属于 P5.8。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/local/`：当前为本地 Runtime v5 framing；它在 P4.2 Runtime v3 machine administration 与
@@ -985,9 +987,39 @@ conversation/key，不能伪造身份连续性。
 - P5.6 automatic 证据为 focused Pairing/AppLifecycle/ViewController `42/42`、fresh iOS Simulator
   `133/133`、RelayClient `445 executed / 4 entitlement SKIP`、顶层 Swift
   `985 XCTest / 4 skipped + 35 Swift Testing / 0 failure`，以及 Release generic Simulator build、fixture
-  surface scan、strict Swift format、agent docs 与 diff 门禁。P5 当前为 6/9；P5.7–P5.9 与 P5 Phase Exit、
+  surface scan、strict Swift format、agent docs 与 diff 门禁。P5.6 收口时 P5 为 6/9；后续 P5.7 已独立收口，
+  当前为 7/9。P5.8–P5.9 与 P5 Phase Exit、
   真实 temp Relay 编排、公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 与
   destructive purge 均未由本 Task 证明。
+
+### Relay Companion MVP P5.7 macOS SessionSource registry 不变量
+
+- `LocalDaemonSessionSource` 是 macOS 本机 current Runtime v5 UDS 的唯一 owner；同一 app composition 不能创建
+  第二个本机 wire owner，也不能把本机请求绕到 Relay。`SessionSourceRegistry` 对 local key 只返回该 source，
+  对每个 paired remote machine 只返回独立 `RelaySessionSource(.machine(id))`。
+- UI/model 只按 `MachineScopeKey` 取得 `any SessionSource`。本机批准能力通过 registry 的 typed optional
+  `LocalPairingAdministration` 提供；remote 与 fixture 必须返回 `nil`，禁止对 concrete source downcast。
+- scope replacement 绑定递增 generation：先取消旧 observation，再 shutdown + join 旧 model/source；旧 scope 的
+  catalog、conversation、receipt 或 failure 即使迟到也不能改写当前 scope。remote pairing/material 变化不能
+  重建或关闭本机 UDS owner。
+- local wire EOF、protocol fault 与 daemon offline 映射为 typed resource/connection failure；下一次用户操作可
+  cold-open fresh UDS generation，但同 generation 不热循环重连。fatal revoked/incompatible/securityError 不得
+  降级成普通 reconnect。
+- business-ready 同时绑定 exact connection ID 与 Relay transport generation；Catalog/Conversation 只能在
+  exact current ready scope 后订阅。first-member Genesis `0 → 1` barrier 的 replay admission、activation 与
+  semantic/outer ACK 分离持久化，三个 CounterGuard durable cut 均须可恢复；stale tuple 零写且不产出 action。
+- active-conversation Genesis snapshot recovery 只响应 typed `daemon.runtime.snapshot_required`：真实 RuntimeCore/store
+  只 materialize Catalog 与缺失 conversation snapshot，重新采样当前 H，并在三轮恢复上界内 retry；其他错误零
+  snapshot 写。selected-machine observation 的 handler 内重入不能 self-join，旧 task 进入 retired 集合并由外部
+  shutdown barrier 完整 join。
+- `SessionModel` 的异步业务 task 必须全部进入唯一 operation registry；shutdown 先停止 admission，再 cancel 并
+  等待每个 task 的真实 terminal。Preview fixture scope 必须显式进入 composition；`AppRuntimeCoordinator` 外部
+  `close()` 必须捕获并 join exact pump，handler 派生 task 不得继承 pump identity 绕过 join。
+- app termination 必须等待 `SessionModel`、selected-scope owner 与 registry 的 shutdown + join 后再回复 AppKit；
+  只关闭当前 client fd/pump，不向共享 daemon 发送 shutdown。
+- P5.7 只证明 registry/routing foundation、typed local capability、shutdown barrier 与真实 dual-scope host
+  integration。AppKit machine picker、remote pairing sheet、pending-device approval 与 receipt UI 仍属 P5.8；
+  P5.9 fixed-topology Simulator Relay E2E 与 P5 Phase Exit 仍未完成。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 

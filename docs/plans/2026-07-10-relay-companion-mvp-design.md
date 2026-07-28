@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Approved target；P3/P4 automatic Phase Exit 已完成。P5.1–P5.6 automatic Task 已完成，P5/P6 当前为 6/9、0/4；P5.7–P5.9 与 P5 Phase Exit 是 automatic 必做项，仍未完成，其中 P5.9 fixed-topology Simulator Relay E2E 不得标成外部门禁。production native metadata、provisioned signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理 iPhone、第二台 Mac 与 destructive purge 才继续属于 post-MVP gated/BLOCKED（2026-07-28）；历史提交与精确门禁见 implementation/QUALITY。 |
+| 状态 | Approved target；P3/P4 automatic Phase Exit 已完成。P5.1–P5.7 automatic Task 已完成，P5/P6 当前为 7/9、0/4；P5.8–P5.9 与 P5 Phase Exit 是 automatic 必做项，仍未完成，其中 P5.9 fixed-topology Simulator Relay E2E 不得标成外部门禁。production native metadata、provisioned signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理 iPhone、第二台 Mac 与 destructive purge 才继续属于 post-MVP gated/BLOCKED（2026-07-28）；历史提交与精确门禁见 implementation/QUALITY。 |
 | 日期 | 2026-07-10 |
 | 主题 | 单机单常驻 daemon、多读者/多写者但 daemon 串行裁决、按机器独立配对、Relay 严格最小可见、真实 iOS Companion 的端到端方案 |
 | 关联 | `NORTH_STAR.md`、`README.md`、`ARCHITECTURE.md`、`docs/plans/2026-07-18-relay-companion-mvp-course-correction.md`、Relay R0/R1a/R1b 设计与实施文档、`docs/plans/2026-07-03-ios-uikit-frontend-design.md` |
@@ -1562,6 +1562,16 @@ P5.6 已实现上述 iOS 发行边界：Release `SceneDelegate` 默认由 `Compo
 每次 paired material 变化或前后台切换都会关闭并 join 旧 source generation 后 cold-open，新旧 generation
 不得同时拥有 WSS。
 
+P5.7 已实现 macOS registry/routing foundation：本机固定复用唯一 current Runtime v5 UDS source，每台远程
+机器使用独立 `RelaySessionSource(.machine(id))`；scope generation 会取消并 join 旧 observation/model，typed
+optional capability 只向 local scope 暴露 `LocalPairingAdministration`。App termination 等待 composition
+完整 shutdown；真实 P4 daemon RemoteLink + synthetic adapter 与 local UDS 的双 scope integration 已验证事件
+不串线。终审 hardening 还要求：typed snapshot prerequisite 才能经真实 RuntimeCore/store materialize Catalog
+与缺失 conversation snapshot 并有界 retry；observation handler 重入不得 self-join；`SessionModel` 全部业务 task
+进入唯一 registry 并在 shutdown 真实 join；Preview fixture scope 与 `AppRuntimeCoordinator` exact pump 必须纳入
+同一 composition barrier。该完成边界不包含 P5.8 的可见 AppKit picker/pairing/receipt UI，也不替代 P5.9
+Simulator E2E。
+
 ### 13.2 共享 SessionSource（原 MobileSessionSource）契约
 
 去掉 protocol 级 `@MainActor`。所有观察方法固定为 `async -> AsyncStream<...>`，使 actor-isolated `RelaySessionSource` 可以先注册有界 continuation 再返回 stream；不采用同步 nonisolated factory。观察流返回 typed resource state：
@@ -1785,7 +1795,7 @@ Keychain/CLI restart 与 destructive trust-reset evidence 保留为 post-MVP BLO
 - `AgentDeckSessionSource` facade、`AgentDeckRelayClient`、iOS/远程 macOS RelaySessionSource、AppKit SessionSourceRegistry、Keychain、扫码/粘贴。
 - typed UI state/receipt、single subscription、前后台 resume。
 - P5.6 已完成 iOS Release composition、完整 PairInvite QR/粘贴与用户确认、verified revoke/offline forget，
-  以及 foreground/background source generation；AppKit registry 仍由 P5.7/P5.8、固定 topology E2E 由 P5.9
+  以及 foreground/background source generation；AppKit registry foundation 已由 P5.7 完成，可见控制面由 P5.8、固定 topology E2E 由 P5.9
   接管。
 
 退出门禁：只要求 iOS Simulator 自动 E2E。固定 topology 是 temp TLS Relay + 真实 P4 `agentdeckd`

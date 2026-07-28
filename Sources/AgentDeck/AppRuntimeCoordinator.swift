@@ -35,9 +35,9 @@ enum AppRuntimeInbound: Sendable {
 }
 
 typealias AppRuntimeInboundHandler =
-  @MainActor @Sendable (AppRuntimeInbound) async throws -> Void
+  @Sendable (AppRuntimeInbound) async throws -> Void
 
-typealias AppRuntimeTerminationHandler = @MainActor @Sendable () async -> Void
+typealias AppRuntimeTerminationHandler = @Sendable () async -> Void
 
 enum AppRuntimeOperation: String, Equatable, Sendable {
   case describeAgents
@@ -49,7 +49,11 @@ enum AppRuntimeOperation: String, Equatable, Sendable {
   case backfill
   case sendPrompt
   case resolveApproval
+  case retryApproval
   case updateConversationMetadata
+  case listPendingPairings
+  case confirmPairing
+  case cancelPairing
 }
 
 enum AppRuntimeReplyKind: String, Equatable, Sendable {
@@ -96,6 +100,10 @@ enum AppRuntimeCoordinatorError: Error, Equatable, Sendable {
   case receiptApprovalMismatch(
     expected: RuntimeApprovalID,
     actual: RuntimeApprovalID
+  )
+  case receiptPairingMismatch(
+    expected: RuntimePairingID,
+    actual: RuntimePairingID
   )
   case receiptConfigurationRevisionMismatch(expected: UInt64, actual: UInt64)
   case configurationConflict(
@@ -145,7 +153,7 @@ struct AppRuntimeConversationStartFailure: Error, @unchecked Sendable {
   let partialResult: AppRuntimeConversationStartResult?
 }
 
-/// Runtime v2 的 App-level sequencing owner。
+/// current Runtime v5 outer / `RuntimeEnvelopeV2` DTO 的 App-level sequencing owner。
 ///
 /// - 只有这个 actor 调用 `nextStream()`；
 /// - Subscribe/Backfill 在 actor reentrancy 期间保持单飞，messageId 相关的 unary control 可并行；
@@ -504,6 +512,60 @@ actor AppRuntimeCoordinator {
     return receipt
   }
 
+  func retryApprovalDelivery(
+    conversationID: RuntimeConversationID,
+    approvalID: RuntimeApprovalID
+  ) async throws -> ApprovalReceiptV1 {
+    try requireRunning()
+    let reply = try await request(
+      .retryApproval(conversationID: conversationID, approvalID: approvalID)
+    )
+    guard case .approval(let receipt) = reply else {
+      throw unexpected(operation: .retryApproval, expected: .approval, actual: reply)
+    }
+    let actual = Self.approvalID(from: receipt)
+    guard actual == approvalID else {
+      throw AppRuntimeCoordinatorError.receiptApprovalMismatch(
+        expected: approvalID,
+        actual: actual
+      )
+    }
+    return receipt
+  }
+
+  func listPendingPairings() async throws -> [RuntimePendingPairingV4] {
+    try requireRunning()
+    let reply = try await request(.listPendingPairings(scope: .localOnly))
+    guard case .pendingPairings(let pairings) = reply else {
+      throw unexpected(
+        operation: .listPendingPairings,
+        expected: .pendingPairings,
+        actual: reply
+      )
+    }
+    return pairings
+  }
+
+  func confirmPairing(
+    _ pairingID: RuntimePairingID
+  ) async throws -> RuntimePairingReceiptV4 {
+    try await pairingDecision(
+      request: .confirmPairing(pairingID: pairingID, scope: .localOnly),
+      operation: .confirmPairing,
+      expectedPairingID: pairingID
+    )
+  }
+
+  func cancelPairing(
+    _ pairingID: RuntimePairingID
+  ) async throws -> RuntimePairingReceiptV4 {
+    try await pairingDecision(
+      request: .cancelPairing(pairingID: pairingID, scope: .localOnly),
+      operation: .cancelPairing,
+      expectedPairingID: pairingID
+    )
+  }
+
   func updateConversationMetadata(
     _ mutation: RuntimeConversationMetadataMutationRequestV2
   ) async throws -> RuntimeConversationMetadataReceiptV2 {
@@ -529,11 +591,14 @@ actor AppRuntimeCoordinator {
   }
 
   func close() async {
+    let pump = streamPump
     switch state {
     case .closed:
+      await joinStreamPump(pump)
       return
     case .closing:
       await finishClosing()
+      await joinStreamPump(pump)
       return
     case .idle, .starting, .running:
       lifecycleGeneration &+= 1
@@ -542,9 +607,9 @@ actor AppRuntimeCoordinator {
     synchronizationActive = false
     streamGateWaiter?.resume()
     streamGateWaiter = nil
-    streamPump?.cancel()
-    streamPump = nil
+    pump?.cancel()
     await finishClosing()
+    await joinStreamPump(pump)
   }
 
   private func request(_ request: RuntimeRequestV2) async throws -> RuntimeReplyV2 {
@@ -574,6 +639,29 @@ actor AppRuntimeCoordinator {
       )
     }
     try validateConfigurationReceipt(receipt, expected: configuration.conversationID)
+    return receipt
+  }
+
+  private func pairingDecision(
+    request: RuntimeRequestV2,
+    operation: AppRuntimeOperation,
+    expectedPairingID: RuntimePairingID
+  ) async throws -> RuntimePairingReceiptV4 {
+    try requireRunning()
+    let reply = try await self.request(request)
+    guard case .pairing(let receipt) = reply else {
+      throw unexpected(operation: operation, expected: .pairing, actual: reply)
+    }
+    if case .failed(let failure) = receipt {
+      throw Self.daemonFailure(failure)
+    }
+    let actual = Self.pairingID(from: receipt)
+    guard actual == expectedPairingID else {
+      throw AppRuntimeCoordinatorError.receiptPairingMismatch(
+        expected: expectedPairingID,
+        actual: actual
+      )
+    }
     return receipt
   }
 
@@ -626,6 +714,8 @@ actor AppRuntimeCoordinator {
       var replies: [RuntimeReplyV2] = []
       replies.reserveCapacity(4)
       var subscriptionGeneration: RuntimeStreamGeneration?
+      var catalogSnapshots: [RuntimeCatalogSnapshotV2] = []
+      var receivedCatalogBackfill = false
       var terminal: RuntimeSyncCompleteV1?
 
       while let reply = try await sequence.next() {
@@ -651,6 +741,23 @@ actor AppRuntimeCoordinator {
           subscriptionGeneration = generation
         case .subscription(.unsubscribed):
           throw AppRuntimeCoordinatorError.unexpectedUnsubscribeReceipt
+        case .catalog(let page):
+          guard case .catalog = target else {
+            throw AppRuntimeCoordinatorError.synchronizationTargetMismatch
+          }
+          // Subscribe(Catalog) 只允许 snapshot pages → optional backfill → terminal；
+          // 显式 Backfill(Catalog) 则完全不允许 daemon 退回 snapshot page。
+          guard operation == .subscribe, !receivedCatalogBackfill else {
+            throw unexpected(
+              operation: operation,
+              expected: .backfill,
+              actual: reply
+            )
+          }
+          guard catalogSnapshots.count < Self.maximumCatalogPages else {
+            throw AppRuntimeCoordinatorError.catalogPageLimitExceeded
+          }
+          catalogSnapshots.append(page)
         case .snapshot(let snapshot):
           guard case .conversation(let conversationID) = target,
             snapshot.conversationID == conversationID
@@ -661,6 +768,7 @@ actor AppRuntimeCoordinator {
           guard Self.backfill(chunk, matches: target) else {
             throw AppRuntimeCoordinatorError.synchronizationTargetMismatch
           }
+          if case .catalog = target { receivedCatalogBackfill = true }
         case .syncComplete(let sync):
           guard Self.innerCursor(sync.innerCursor, matches: target) else {
             throw AppRuntimeCoordinatorError.synchronizationTargetMismatch
@@ -692,6 +800,11 @@ actor AppRuntimeCoordinator {
       guard let terminal else {
         throw AppRuntimeCoordinatorError.missingSynchronizationTerminal
       }
+      if !catalogSnapshots.isEmpty {
+        // Subscribe(Catalog) 的 snapshot 可能跨多页。先在 staging 区验证完整
+        // cursor chain，避免 malformed/未终止分页被逐页转发给 projection。
+        _ = try RuntimeCatalogModel(snapshotPages: catalogSnapshots)
+      }
 
       // 只有完整 sequence 已读到 nil 且 terminal 全部验证后才发布。整个 publish
       // 期间 synchronizationActive 仍为 true，因此 live stream 最多在 pump 内持有一帧。
@@ -703,7 +816,7 @@ actor AppRuntimeCoordinator {
       return AppRuntimeSynchronizationResult(replies: replies, terminal: terminal)
     } catch {
       if let activeSequence { await activeSequence.cancel() }
-      await failSynchronizationClosed()
+      await failSynchronizationClosed(error)
       throw error
     }
   }
@@ -788,19 +901,24 @@ actor AppRuntimeCoordinator {
 
   /// 同步序列或 MainActor publish 失败后不能继续把 live stream 叠加到不完整投影。
   /// 这里只 close 当前 client wire；不发送 daemon shutdown/unsubscribe。
-  private func failSynchronizationClosed() async {
+  private func failSynchronizationClosed(_ error: any Error) async {
+    if firstStreamFailure == nil { firstStreamFailure = error }
+    let pump = streamPump
     switch state {
     case .running:
       lifecycleGeneration &+= 1
       state = .closing
-      streamPump?.cancel()
-      streamPump = nil
     case .closing:
       break
     case .idle, .starting, .closed:
       return
     }
+    synchronizationActive = false
+    streamGateWaiter?.resume()
+    streamGateWaiter = nil
+    pump?.cancel()
     await finishClosing()
+    await joinStreamPump(pump)
   }
 
   private func finishSynchronization() {
@@ -859,6 +977,14 @@ actor AppRuntimeCoordinator {
     state = .closed
   }
 
+  /// 对外 shutdown barrier 必须等待 handler 与 pump 全部到达 terminal。
+  /// pump 自身的 fault-close 走 `runStreamPump()` 内部路径，不重入这个 join。
+  private func joinStreamPump(_ task: Task<Void, Never>?) async {
+    guard let task else { return }
+    await task.value
+    streamPump = nil
+  }
+
   private func unexpected(
     operation: AppRuntimeOperation,
     expected: AppRuntimeReplyKind,
@@ -889,6 +1015,21 @@ actor AppRuntimeCoordinator {
       .expired(let approvalID),
       .alreadyHandled(let approvalID, _, _):
       approvalID
+    }
+  }
+
+  private static func pairingID(
+    from receipt: RuntimePairingReceiptV4
+  ) -> RuntimePairingID {
+    switch receipt {
+    case .confirmed(let pairingID),
+      .canceled(let pairingID),
+      .expired(let pairingID),
+      .replayed(let pairingID, _, _),
+      .alreadyHandled(let pairingID, _, _):
+      pairingID
+    case .failed:
+      preconditionFailure("failed pairing receipts are unwrapped before identity validation")
     }
   }
 

@@ -4,6 +4,17 @@ import XCTest
 
 @MainActor
 final class PreviewBootstrapTests: XCTestCase {
+  func testPreviewCompositionSelectsExplicitFixtureWithoutLocalCapabilities() async throws {
+    let composition = try await PreviewBootstrap.makeComposition()
+    let selection = await composition.selectedMachineScope.selection()
+
+    XCTAssertEqual(selection?.context.scope, .fixture(id: "preview"))
+    XCTAssertNil(selection?.handle.localPairingAdministration)
+    XCTAssertNil(selection?.handle.localConversationAdministration)
+
+    await composition.shutdown()
+  }
+
   func testPreviewModelHasEnvironmentInfoAndLoadsRuntimeCatalog() async throws {
     let model = PreviewBootstrap.makeSessionModel()
     defer { model.teardown() }

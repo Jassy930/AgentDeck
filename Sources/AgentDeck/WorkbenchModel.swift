@@ -44,7 +44,7 @@ struct WorkbenchConversationDraftContext: Sendable {
   fileprivate(set) var conversationID: RuntimeConversationID?
 }
 
-/// Runtime v2 App model 的 typed registry 与 MainActor ingress owner。
+/// current Runtime v5 outer / `RuntimeEnvelopeV2` DTO App model 的 typed registry 与 MainActor ingress owner。
 ///
 /// Canonical cursor/items/approval ledger 始终由每个 `ThreadRuntimeModel` 内的
 /// `RuntimeConversationState` 持有；Workbench 只负责 typed selection、catalog、同步 barrier
@@ -219,6 +219,7 @@ final class WorkbenchModel {
     case .subscription(.subscribed(let generation)):
       guard stage.subscriptionGeneration == nil,
         stage.target == nil,
+        stage.catalogSnapshots.isEmpty,
         stage.conversationPayloads.isEmpty,
         stage.catalogBackfills.isEmpty
       else {
@@ -229,6 +230,14 @@ final class WorkbenchModel {
       return nil
     case .subscription(.unsubscribed):
       throw WorkbenchModelError.unexpectedSynchronizedReply
+    case .catalog(let page):
+      try stage.bind(.catalog)
+      guard stage.conversationPayloads.isEmpty, stage.catalogBackfills.isEmpty else {
+        throw WorkbenchModelError.synchronizationTargetConflict
+      }
+      stage.catalogSnapshots.append(page)
+      pendingSynchronization = stage
+      return nil
     case .snapshot(let snapshot):
       try stage.bind(.conversation(snapshot.conversationID))
       stage.conversationPayloads.append(.snapshot(snapshot))
@@ -330,8 +339,14 @@ final class WorkbenchModel {
     _ stage: PendingSynchronization,
     terminalCursor: RuntimeStreamCursorV1
   ) throws {
-    guard var nextCatalog = catalog else {
-      throw WorkbenchModelError.catalogUnavailable
+    var nextCatalog: RuntimeCatalogModel
+    if stage.catalogSnapshots.isEmpty {
+      guard let existing = catalog else {
+        throw WorkbenchModelError.catalogUnavailable
+      }
+      nextCatalog = existing
+    } else {
+      nextCatalog = try RuntimeCatalogModel(snapshotPages: stage.catalogSnapshots)
     }
     for backfill in stage.catalogBackfills {
       guard case .catalog(let range, let deltas) = backfill else {
@@ -470,6 +485,7 @@ private struct PendingSynchronization {
 
   var subscriptionGeneration: RuntimeStreamGeneration?
   var target: Target?
+  var catalogSnapshots: [RuntimeCatalogSnapshotV2] = []
   var conversationPayloads: [RuntimeConversationSynchronizationPayload] = []
   var catalogBackfills: [RuntimeBackfillChunkV2] = []
 

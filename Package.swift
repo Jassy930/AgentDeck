@@ -42,7 +42,7 @@ let package = Package(
             ],
             path: "Sources/AgentDeck",
             resources: [
-                .process("Resources"),
+                .process("Resources")
             ]
         ),
         .testTarget(
@@ -50,6 +50,8 @@ let package = Package(
             dependencies: [
                 "AgentDeck",
                 "AgentDeckCore",
+                .target(name: "AgentDeckSessionSource"),
+                .target(name: "AgentDeckRelayClient"),
             ],
             path: "Tests/AgentDeckTests"
         ),

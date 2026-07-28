@@ -1087,8 +1087,9 @@ Protection Keychain 且没有 file/dev keystore 降级。MachineRoot 丢失按
 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真机/真实 iOS、第二台 Mac 与
 destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade、P5.2 crash-safe client storage、P5.3
 WSS/pin/per-connection transfer primitive、P5.4 MachineConnection/bounded source、P5.5 canonical
-fixture/receipt UI 与 P5.6 iOS production composition/pairing lifecycle automatic Task 已收口，P5/P6 当前
-进度为 6/9、0/4。P5.6 automatic 证据不替代 P5.9 fixed-topology Relay E2E 或任何外部门禁。
+fixture/receipt UI、P5.6 iOS production composition/pairing lifecycle 与 P5.7 macOS SessionSource registry
+automatic Task 已收口，P5/P6 当前进度为 7/9、0/4。P5.7 automatic 证据不替代 P5.8 可见 AppKit 控制面、
+P5.9 fixed-topology Relay E2E 或任何外部门禁。
 
 #### P5.2 client storage / counter / replay failure
 
@@ -1198,7 +1199,7 @@ expiry 清理，合法 partial promotion 仍精确回滚。
 2026-07-27 的非门控 Instruments Allocations smoke 启动 `dist/AgentDeck.app --selfcheck`，exit 0、duration
 2.639832 秒；trace 只在 `/tmp/agentdeck-p54-instruments.rt5Mo5/p54-agentdeck-selfcheck.trace`，不得提交。
 它不是 RelaySessionSource 长跑、真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac 或真实
-vendor 证据。P5.4 收口后，P5.5、P5.6 已分别独立完成；当前 P5.7–P5.9 与 P5 Phase Exit 继续未完成。
+vendor 证据。P5.4 收口后，P5.5–P5.7 已分别独立完成；当前 P5.8–P5.9 与 P5 Phase Exit 继续未完成。
 
 #### P5.5 iOS canonical / receipt 乱序诊断
 
@@ -1243,8 +1244,9 @@ Runtime v5 没有为本次收紧升级 wire version：commandless Error 保留 d
 P5.5 candidate 当时的 `SceneDelegate` 仍注入 `FixtureSessionSource`；因此该 Task 的 connected、prompt、
 approval 或 reconnect UI 只证明 presentation/fixture 语义。P5.6 已把 Release composition 切到真实
 `RelaySessionSource`，fixture 只在 Debug preview/test 可达；若普通 Release 启动仍出现 fixture machine，或
-Release binary 命中 fixture launch/install 字符串，应按 packaging/security regression 处理。P5.7–P5.9 与
-P5 Phase Exit 是 automatic 必做项，当前仍未完成；其中 P5.9 必须跑 fixed-topology Simulator Relay E2E，不能
+Release binary 命中 fixture launch/install 字符串，应按 packaging/security regression 处理。P5.6 收口时
+P5.7–P5.9 与 P5 Phase Exit 尚未完成；后续 P5.7 已独立收口。当前 P5.8–P5.9 与 P5 Phase Exit 仍未完成；
+其中 P5.9 必须跑 fixed-topology Simulator Relay E2E，不能
 标成 post-MVP BLOCKED。真实公网 WSS、物理 iPhone、production-signed Keychain、第二台 Mac、真实 vendor 与
 destructive purge 才继续属于 post-MVP `BLOCKED`。
 
@@ -1253,6 +1255,23 @@ capture generation 隔离回归处理：配置/start/stop 必须只在专用串�
 才持有 exact UUID；metadata proxy 要保留到 metadata queue barrier 后，MainActor 仅在 UUID 仍属于当前
 generation 时更新 UI 或提交邀请。Simulator 自动门禁不替代物理 iPhone 的相机权限、交互式返回与锁屏
 data-protection readback。
+
+#### P5.7 macOS local/remote SessionSource registry 诊断
+
+| typed state / 现象 | 含义 | 下一步 |
+| --- | --- | --- |
+| local scope 返回 `.transportUnavailable`，diagnostic 为 `daemon.client.socket_missing` | 当前 OS account 没有运行中的 canonical daemon；stable `swift run AgentDeck -- --selfcheck` 不能据此记为产品 PASS | 先核对 LaunchAgent/UDS owner；开发门禁使用 hermetic local-runtime smoke 与 ephemeral daemon selfcheck，禁止为通过测试临时改 stable socket |
+| 切换 machine 后旧 catalog/conversation 又覆盖当前 UI | selected-scope generation 没有在 replacement 前取消并 join 旧 observation/model | 核对 generation、scope key 与 shutdown/join 顺序；旧 generation 的任何 update 必须被丢弃，不要只清可见列表 |
+| remote/fixture scope 出现本机 pending-device approve/cancel 能力 | registry 泄漏了 local-only capability，或 UI 对 concrete source 做 downcast | 只从 registry 读取 typed optional `LocalPairingAdministration`；remote/fixture 必须为 `nil`，按 security regression 处理 |
+| remote source 已 transport connected，但 Catalog/Conversation 提前订阅或串到另一台机器 | business-ready 未同时绑定 exact connection ID + transport generation，或复用了 `.allPairedMachines` owner | 每台 remote machine 固定独立 `.machine(id)` source；只有 exact current ready scope 能开始订阅，generation 变化必须先退休旧 correlation |
+| Genesis barrier 重启后反复 ACK、缺 ACK 或出现 phantom activation | replay admission、activation、CounterGuard stable 与 ACK permit 的 crash cut 恢复不完整 | 分别检查 `stateGuardPendingDurable`、`stateDurable`、`guardStableDurable`；只有 exact durable proof 可恢复 permit，stale tuple 必须零 mutation/零 action |
+| confirm 反复返回 `daemon.runtime.snapshot_required` | RuntimeCore snapshot materialization 未覆盖当前 H，或 retry 超出三轮恢复上界 | 只为 typed snapshot prerequisite materialize Catalog 与缺失 conversation snapshot并重新采样 H；其他错误不得触发 snapshot 写入，第四次 prerequisite 必须原样返回 |
+| observation handler 内重入 `select`/`shutdown` 卡死 | selected-scope owner 正在等待或取消自身 observation task | 识别 current task，禁止 self-join；将旧 task 移入 retired 集合，最终只由外部 shutdown barrier 完整 join |
+| 退出 App 后 blocked prompt/inbound handler 仍存活，或 termination 过早回复 | `SessionModel` operation registry 漏记业务 task，或 coordinator 把 wire close 当成 pump terminal | 停止 admission 后 cancel/join 全 registry；Preview 必须显式注册 fixture scope，外部 `close()` 捕获并 join exact pump，handler 派生 close 不得跳过 join |
+
+P5.7 的真实 dual-scope integration 使用本机 UDS 与由真实 P4 daemon RemoteLink 支撑的 remote source；synthetic
+adapter 只替代 vendor，不替代 daemon/PairingCoordinator/RemoteLink。该证据不包含 P5.8 的可见 picker、remote
+pair sheet、pending-device approval 或 receipt UI，也不包含 P5.9 Simulator UI E2E。
 
 #### Trust reset 与本地 cleanup
 

@@ -286,8 +286,10 @@ final class AppRuntimeCoordinatorTests: XCTestCase {
 
     let publishedCount = await published.count()
     let closeCount = await wire.closeCount()
+    let terminalFailure = await coordinator.streamFailure() as? AppRuntimeCoordinatorError
     XCTAssertEqual(publishedCount, 0)
     XCTAssertEqual(closeCount, 1)
+    XCTAssertEqual(terminalFailure, .synchronizationTargetMismatch)
   }
 
   func testMissingTerminalPublishesNoPartiallyValidatedSynchronization() async throws {
@@ -317,6 +319,220 @@ final class AppRuntimeCoordinatorTests: XCTestCase {
       XCTFail("unterminated synchronization unexpectedly succeeded")
     } catch let error as AppRuntimeCoordinatorError {
       XCTAssertEqual(error, .missingSynchronizationTerminal)
+    }
+
+    let publishedCount = await published.count()
+    let closeCount = await wire.closeCount()
+    XCTAssertEqual(publishedCount, 0)
+    XCTAssertEqual(closeCount, 1)
+  }
+
+  func testCatalogSynchronizationAcceptsCompletePagedSnapshotBeforePublishing() async throws {
+    let next = RuntimeCatalogPageCursor(rawValue: "catalog-page-2")
+    let first = try RuntimeCatalogSnapshotV2(
+      baseCatalogCursor: .at(4),
+      entries: [],
+      currentPageCursor: nil,
+      nextPageCursor: next
+    )
+    let second = try RuntimeCatalogSnapshotV2(
+      baseCatalogCursor: .at(4),
+      entries: [],
+      currentPageCursor: next,
+      nextPageCursor: nil
+    )
+    let published = AppRuntimePublishedReplyProbe()
+    let wire = AppRuntimeFakeWire(
+      synchronizedReplies: [
+        [
+          .subscription(
+            .subscribed(streamGeneration: RuntimeStreamGeneration(rawValue: "generation-1"))
+          ),
+          .catalog(first),
+          .catalog(second),
+          .syncComplete(try catalogSyncComplete(cursor: .at(4))),
+        ]
+      ]
+    )
+    let coordinator = AppRuntimeCoordinator(wire: wire) { inbound in
+      guard case .synchronizedReply = inbound else { return }
+      await published.record()
+    }
+    try await coordinator.start()
+
+    let result = try await coordinator.synchronizeCatalog(cursor: .beforeFirst)
+
+    XCTAssertEqual(
+      result.replies.map(\.testKind),
+      [
+        "subscription", "catalog", "catalog", "syncComplete",
+      ])
+    let publishedCount = await published.count()
+    XCTAssertEqual(publishedCount, 4)
+    await coordinator.close()
+  }
+
+  func testCatalogSynchronizationRejectsMalformedPageChainBeforePublishing() async throws {
+    let expected = RuntimeCatalogPageCursor(rawValue: "catalog-page-2")
+    let actual = RuntimeCatalogPageCursor(rawValue: "catalog-page-3")
+    let first = try RuntimeCatalogSnapshotV2(
+      baseCatalogCursor: .at(4),
+      entries: [],
+      currentPageCursor: nil,
+      nextPageCursor: expected
+    )
+    let skipped = try RuntimeCatalogSnapshotV2(
+      baseCatalogCursor: .at(4),
+      entries: [],
+      currentPageCursor: actual,
+      nextPageCursor: nil
+    )
+    let published = AppRuntimePublishedReplyProbe()
+    let wire = AppRuntimeFakeWire(
+      synchronizedReplies: [
+        [
+          .subscription(
+            .subscribed(streamGeneration: RuntimeStreamGeneration(rawValue: "generation-1"))
+          ),
+          .catalog(first),
+          .catalog(skipped),
+          .syncComplete(try catalogSyncComplete(cursor: .at(4))),
+        ]
+      ]
+    )
+    let coordinator = AppRuntimeCoordinator(wire: wire) { inbound in
+      guard case .synchronizedReply = inbound else { return }
+      await published.record()
+    }
+    try await coordinator.start()
+
+    do {
+      _ = try await coordinator.synchronizeCatalog(cursor: .beforeFirst)
+      XCTFail("malformed Catalog snapshot chain unexpectedly succeeded")
+    } catch {
+      XCTAssertEqual(
+        error as? RuntimeCatalogModelError,
+        .snapshotPageCursorMismatch(expected: expected, actual: actual, pageIndex: 1)
+      )
+    }
+
+    let publishedCount = await published.count()
+    let closeCount = await wire.closeCount()
+    XCTAssertEqual(publishedCount, 0)
+    XCTAssertEqual(closeCount, 1)
+  }
+
+  func testCatalogSynchronizationRejectsUnterminatedPagesBeforePublishing() async throws {
+    let next = RuntimeCatalogPageCursor(rawValue: "catalog-page-2")
+    let first = try RuntimeCatalogSnapshotV2(
+      baseCatalogCursor: .at(4),
+      entries: [],
+      currentPageCursor: nil,
+      nextPageCursor: next
+    )
+    let published = AppRuntimePublishedReplyProbe()
+    let wire = AppRuntimeFakeWire(
+      synchronizedReplies: [
+        [
+          .subscription(
+            .subscribed(streamGeneration: RuntimeStreamGeneration(rawValue: "generation-1"))
+          ),
+          .catalog(first),
+          .syncComplete(try catalogSyncComplete(cursor: .at(4))),
+        ]
+      ]
+    )
+    let coordinator = AppRuntimeCoordinator(wire: wire) { inbound in
+      guard case .synchronizedReply = inbound else { return }
+      await published.record()
+    }
+    try await coordinator.start()
+
+    do {
+      _ = try await coordinator.synchronizeCatalog(cursor: .beforeFirst)
+      XCTFail("unterminated Catalog snapshot unexpectedly succeeded")
+    } catch {
+      XCTAssertEqual(error as? RuntimeCatalogModelError, .snapshotDidNotTerminate)
+    }
+
+    let publishedCount = await published.count()
+    let closeCount = await wire.closeCount()
+    XCTAssertEqual(publishedCount, 0)
+    XCTAssertEqual(closeCount, 1)
+  }
+
+  func testCatalogSynchronizationRejectsSnapshotPageAfterBackfillBeforePublishing() async throws {
+    let page = try RuntimeCatalogSnapshotV2(
+      baseCatalogCursor: .at(5),
+      entries: [],
+      currentPageCursor: nil,
+      nextPageCursor: nil
+    )
+    let published = AppRuntimePublishedReplyProbe()
+    let wire = AppRuntimeFakeWire(
+      synchronizedReplies: [
+        [
+          .subscription(
+            .subscribed(streamGeneration: RuntimeStreamGeneration(rawValue: "generation-1"))
+          ),
+          .backfill(try catalogBackfill(after: .at(4), through: 5)),
+          .catalog(page),
+          .syncComplete(try catalogSyncComplete(cursor: .at(5))),
+        ]
+      ]
+    )
+    let coordinator = AppRuntimeCoordinator(wire: wire) { inbound in
+      guard case .synchronizedReply = inbound else { return }
+      await published.record()
+    }
+    try await coordinator.start()
+
+    do {
+      _ = try await coordinator.synchronizeCatalog(cursor: .at(4))
+      XCTFail("Catalog snapshot page after backfill unexpectedly succeeded")
+    } catch let error as AppRuntimeCoordinatorError {
+      XCTAssertEqual(
+        error,
+        .unexpectedReply(operation: .subscribe, expected: .backfill, actual: .catalog)
+      )
+    }
+
+    let publishedCount = await published.count()
+    let closeCount = await wire.closeCount()
+    XCTAssertEqual(publishedCount, 0)
+    XCTAssertEqual(closeCount, 1)
+  }
+
+  func testCatalogBackfillRejectsSnapshotPageBeforePublishing() async throws {
+    let page = try RuntimeCatalogSnapshotV2(
+      baseCatalogCursor: .at(4),
+      entries: [],
+      currentPageCursor: nil,
+      nextPageCursor: nil
+    )
+    let published = AppRuntimePublishedReplyProbe()
+    let wire = AppRuntimeFakeWire(
+      synchronizedReplies: [
+        [
+          .catalog(page),
+          .syncComplete(try catalogSyncComplete(cursor: .at(4))),
+        ]
+      ]
+    )
+    let coordinator = AppRuntimeCoordinator(wire: wire) { inbound in
+      guard case .synchronizedReply = inbound else { return }
+      await published.record()
+    }
+    try await coordinator.start()
+
+    do {
+      _ = try await coordinator.backfillCatalog(after: .at(3))
+      XCTFail("Backfill(Catalog) unexpectedly accepted a Catalog snapshot page")
+    } catch let error as AppRuntimeCoordinatorError {
+      XCTAssertEqual(
+        error,
+        .unexpectedReply(operation: .backfill, expected: .backfill, actual: .catalog)
+      )
     }
 
     let publishedCount = await published.count()
@@ -584,13 +800,79 @@ final class AppRuntimeCoordinatorTests: XCTestCase {
     }
   }
 
+  func testCloseWaitsForCancellationInsensitiveInboundHandlerToReachTerminal() async throws {
+    let wire = AppRuntimeFakeWire()
+    let inboundGate = AppRuntimeBlockingInboundGate()
+    let completion = AppRuntimeCloseCompletionProbe()
+    let coordinator = AppRuntimeCoordinator(wire: wire) { inbound in
+      guard case .stream = inbound else { return }
+      await inboundGate.consume()
+    }
+    try await coordinator.start()
+    try await wire.waitForStreamReads(1)
+    await wire.emitStream(messageID: "stream-blocked-inbound")
+    try await inboundGate.waitUntilEntered()
+
+    let closeTask = Task {
+      await coordinator.close()
+      await completion.markCompleted()
+    }
+    try await wire.waitForCloseCount(1)
+    let completedWhileHandlerBlocked = await completion.isCompleted()
+    XCTAssertFalse(completedWhileHandlerBlocked)
+
+    await inboundGate.release()
+    await closeTask.value
+    let completedAfterHandlerTerminal = await completion.isCompleted()
+    let observedCancellation = await inboundGate.observedCancellation()
+    let closeCount = await wire.closeCount()
+    XCTAssertTrue(completedAfterHandlerTerminal)
+    XCTAssertTrue(observedCancellation)
+    XCTAssertEqual(closeCount, 1)
+  }
+
+  func testHandlerSpawnedCloseCannotInheritPumpIdentityAndSkipJoin() async throws {
+    let wire = AppRuntimeFakeWire()
+    let inboundGate = AppRuntimeBlockingInboundGate()
+    let completion = AppRuntimeCloseCompletionProbe()
+    let coordinatorReference = AppRuntimeCoordinatorReference()
+    let coordinator = AppRuntimeCoordinator(wire: wire) { inbound in
+      guard case .stream = inbound else { return }
+      Task {
+        guard let coordinator = await coordinatorReference.get() else { return }
+        await coordinator.close()
+        await completion.markCompleted()
+      }
+      await inboundGate.consume()
+    }
+    await coordinatorReference.set(coordinator)
+    try await coordinator.start()
+    try await wire.waitForStreamReads(1)
+    await wire.emitStream(messageID: "stream-handler-spawned-close")
+    try await inboundGate.waitUntilEntered()
+    try await wire.waitForCloseCount(1)
+
+    let completedWhileHandlerBlocked = await completion.isCompleted()
+    XCTAssertFalse(completedWhileHandlerBlocked)
+
+    await inboundGate.release()
+    for _ in 0..<1_000 {
+      if await completion.isCompleted() { break }
+      await Task.yield()
+    }
+    let completedAfterHandlerTerminal = await completion.isCompleted()
+    let closeCount = await wire.closeCount()
+    XCTAssertTrue(completedAfterHandlerTerminal)
+    XCTAssertEqual(closeCount, 1)
+  }
+
   func testUnexpectedStreamTerminationNotifiesExactlyOnceAfterCloseBarrier() async throws {
     let wire = AppRuntimeFakeWire(blockClose: true)
     let probe = await MainActor.run { AppRuntimeTerminationProbe() }
     let coordinator = AppRuntimeCoordinator(
       wire: wire,
       inboundHandler: { _ in },
-      terminationHandler: { probe.record() }
+      terminationHandler: { await probe.record() }
     )
 
     try await coordinator.start()
@@ -655,6 +937,77 @@ final class AppRuntimeCoordinatorTests: XCTestCase {
     let requestCount = await candidate.requestCount()
     XCTAssertEqual(closeCount, 1)
     XCTAssertEqual(requestCount, 0)
+  }
+
+  func testLocalAdministrationCommandsUseTypedRuntimeRequests() async throws {
+    let pairingID = RuntimePairingID(rawValue: "pairing-local")
+    let approvalID = RuntimeApprovalID(rawValue: "approval-retry")
+    let pending = try RuntimePendingPairingV4(
+      pairingID: pairingID,
+      requestHash: Data(repeating: 0x11, count: 32),
+      deviceSignFingerprint: Data(repeating: 0x22, count: 32),
+      requestedAtMs: 10,
+      expiresAtMs: 20
+    )
+    let wire = AppRuntimeFakeWire(
+      unaryReplies: [
+        .pendingPairings([pending]),
+        .pairing(.confirmed(pairingID)),
+        .pairing(.canceled(pairingID)),
+        .approval(.deliveryFailed(approvalID)),
+      ]
+    )
+    let coordinator = AppRuntimeCoordinator(wire: wire) { _ in }
+
+    try await coordinator.start()
+    let listed = try await coordinator.listPendingPairings()
+    let confirmed = try await coordinator.confirmPairing(pairingID)
+    let canceled = try await coordinator.cancelPairing(pairingID)
+    let retried = try await coordinator.retryApprovalDelivery(
+      conversationID: RuntimeConversationID(rawValue: "conversation-local"),
+      approvalID: approvalID
+    )
+
+    XCTAssertEqual(listed.map(\.pairingID), [pairingID])
+    guard case .confirmed(let confirmedID) = confirmed else {
+      return XCTFail("expected confirmed pairing receipt")
+    }
+    XCTAssertEqual(confirmedID, pairingID)
+    guard case .canceled(let canceledID) = canceled else {
+      return XCTFail("expected canceled pairing receipt")
+    }
+    XCTAssertEqual(canceledID, pairingID)
+    guard case .deliveryFailed(let retriedID) = retried else {
+      return XCTFail("expected deliveryFailed retry receipt")
+    }
+    XCTAssertEqual(retriedID, approvalID)
+    let requestKinds = await wire.controlRequestKinds()
+    XCTAssertEqual(
+      requestKinds,
+      ["listPendingPairings", "confirmPairing", "cancelPairing", "retryApproval"]
+    )
+    await coordinator.close()
+  }
+
+  func testLocalAdministrationRejectsMismatchedReceiptIdentities() async throws {
+    let expectedPairingID = RuntimePairingID(rawValue: "pairing-expected")
+    let actualPairingID = RuntimePairingID(rawValue: "pairing-other")
+    let wire = AppRuntimeFakeWire(
+      unaryReplies: [.pairing(.confirmed(actualPairingID))]
+    )
+    let coordinator = AppRuntimeCoordinator(wire: wire) { _ in }
+
+    try await coordinator.start()
+    do {
+      _ = try await coordinator.confirmPairing(expectedPairingID)
+      XCTFail("mismatched pairing receipt unexpectedly succeeded")
+    } catch let error as AppRuntimeCoordinatorError {
+      XCTAssertEqual(
+        error,
+        .receiptPairingMismatch(expected: expectedPairingID, actual: actualPairingID)
+      )
+    }
+    await coordinator.close()
   }
 
   private func assertDaemonFailure(
@@ -831,6 +1184,14 @@ private actor AppRuntimeFakeWire: AppRuntimeWireSession {
   func waitUntilCloseBlocked() async throws {
     for _ in 0..<1_000 {
       if closeBlocked { return }
+      await Task.yield()
+    }
+    throw AppRuntimeTestError.timeout
+  }
+
+  func waitForCloseCount(_ expected: Int) async throws {
+    for _ in 0..<1_000 {
+      if closes >= expected { return }
       await Task.yield()
     }
     throw AppRuntimeTestError.timeout
@@ -1051,6 +1412,57 @@ private actor AppRuntimeCloseCompletionProbe {
   }
 }
 
+private actor AppRuntimeCoordinatorReference {
+  private var coordinator: AppRuntimeCoordinator?
+
+  func set(_ coordinator: AppRuntimeCoordinator) {
+    self.coordinator = coordinator
+  }
+
+  func get() -> AppRuntimeCoordinator? {
+    coordinator
+  }
+}
+
+private actor AppRuntimeBlockingInboundGate {
+  private var entered = false
+  private var released = false
+  private var cancellationObserved = false
+  private var continuation: CheckedContinuation<Void, Never>?
+
+  func consume() async {
+    entered = true
+    if !released {
+      await withCheckedContinuation { continuation in
+        if released {
+          continuation.resume()
+        } else {
+          self.continuation = continuation
+        }
+      }
+    }
+    cancellationObserved = Task.isCancelled
+  }
+
+  func waitUntilEntered() async throws {
+    for _ in 0..<1_000 {
+      if entered { return }
+      await Task.yield()
+    }
+    throw AppRuntimeTestError.timeout
+  }
+
+  func release() {
+    released = true
+    continuation?.resume()
+    continuation = nil
+  }
+
+  func observedCancellation() -> Bool {
+    cancellationObserved
+  }
+}
+
 private actor AppRuntimePublishedReplyProbe {
   private var publishedCount = 0
 
@@ -1131,6 +1543,10 @@ extension RuntimeRequestV2 {
     case .updateConversationMetadata: "updateConversationMetadata"
     case .sendPrompt: "sendPrompt"
     case .resolveApproval: "resolveApproval"
+    case .retryApproval: "retryApproval"
+    case .listPendingPairings: "listPendingPairings"
+    case .confirmPairing: "confirmPairing"
+    case .cancelPairing: "cancelPairing"
     default: "other"
     }
   }
@@ -1140,6 +1556,7 @@ extension RuntimeReplyV2 {
   fileprivate var testKind: String {
     switch self {
     case .subscription: "subscription"
+    case .catalog: "catalog"
     case .snapshot: "snapshot"
     case .backfill: "backfill"
     case .syncComplete: "syncComplete"
@@ -1185,6 +1602,43 @@ private func syncComplete(
   return try JSONDecoder().decode(
     RuntimeSyncCompleteV1.self,
     from: JSONSerialization.data(withJSONObject: object)
+  )
+}
+
+private func catalogSyncComplete(
+  cursor: RuntimeStreamCursorV1
+) throws -> RuntimeSyncCompleteV1 {
+  let cursorObject: Any
+  switch cursor {
+  case .beforeFirst:
+    cursorObject = "beforeFirst"
+  case .at(let value):
+    cursorObject = ["at": value]
+  }
+  let object: [String: Any] = [
+    "streamGeneration": "generation-1",
+    "streamCursor": ["at": 3],
+    "innerCursor": [
+      "scope": "catalog",
+      "cursor": cursorObject,
+    ],
+    "keyDirectoryRevision": 2,
+  ]
+  return try JSONDecoder().decode(
+    RuntimeSyncCompleteV1.self,
+    from: JSONSerialization.data(withJSONObject: object)
+  )
+}
+
+private func catalogBackfill(
+  after cursor: RuntimeStreamCursorV1,
+  through revision: UInt64
+) throws -> RuntimeBackfillChunkV2 {
+  .catalog(
+    range: try RuntimeBackfillRangeV1(after: cursor, through: .at(revision)),
+    deltas: [
+      RuntimeCatalogDeltaV2(catalogRevision: revision, changes: [])
+    ]
   )
 }
 

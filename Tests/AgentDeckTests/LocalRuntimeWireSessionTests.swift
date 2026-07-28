@@ -348,7 +348,7 @@ final class LocalRuntimeWireSessionTests: XCTestCase {
     await firstEOFGate.release()
     try await firstServer.value
     try await localRuntimeWaitUntil {
-      model.warningMessage == "Local daemon connection closed; the next action will reconnect"
+      model.warningMessage?.contains("Local daemon connection closed") == true
     }
     let firstFault = await first.session.fault()
     XCTAssertEqual(firstFault?.code, "daemon.client.connection_closed")

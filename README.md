@@ -222,7 +222,7 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Companion MVP 实施状态（P5.6 automatic complete；P5 为 6/9）
+## Relay Companion MVP 实施状态（P5.7 automatic complete；P5 为 7/9）
 
 2026-07-18 纠偏后，主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -351,8 +351,30 @@ background。QR capture 的配置/start/stop 固定在专用串行队列；只�
 UUID，scene deactivation 会立即失效并排队 stop，重新激活生成新代。迟到的权限、start completion、metadata
 或 stop 都不能影响新 generation。fresh automatic 证据为 P5.6 focused `42/42`、iOS Simulator `133/133`、RelayClient
 `445 executed / 4 entitlement SKIP`、顶层 Swift `985 XCTest / 4 skipped + 35 Swift Testing / 0 failure`，
-Release generic Simulator build 与 fixture-surface 静态扫描均通过。P5 当前为 6/9；P5.7–P5.9 与 P5 Phase
-Exit 仍未完成，真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 与
+Release generic Simulator build 与 fixture-surface 静态扫描均通过。P5.6 收口时 P5 为 6/9；当时 P5.7–P5.9
+与 P5 Phase Exit 仍未完成。
+
+P5.7 已把 macOS 本机 current Runtime v5 UDS 封装为唯一 `LocalDaemonSessionSource`，并由
+`SessionSourceRegistry` 固定路由：本机 scope 永远复用该 UDS owner，每台远程机器各自拥有
+`RelaySessionSource(.machine(id))`，preview/test fixture 只能显式注入。`SessionModel` 与
+`WorkbenchModel` 只消费统一 `SessionSource` 和 typed optional `LocalPairingAdministration`，remote/fixture
+不能通过 concrete downcast 获得本机批准能力。machine scope 切换由 generation owner 先取消旧 observation，
+再等待旧 model/source shutdown + join，迟到旧 generation 不能写入当前 UI；App termination 同样等待
+model、scope 与 registry 完整退出后才回复 AppKit。
+
+本次还补齐了远端 first-member Genesis `0 → 1` barrier 与 business-ready 前置门禁：ready 同时绑定 exact
+connection ID 与 transport generation，Catalog/Conversation 只在当前 ready scope 上订阅；Genesis replay
+admission、activation 与 ACK 可跨三个 CounterGuard durable cut 恢复，stale counter 必须零 mutation、零
+transport action，ACK 逐项绑定 authority、route、generation、sequence、inner cursor、revision、epoch 与
+barrier hash。真实 P4 daemon RemoteLink + synthetic adapter 与本机 UDS 的双 scope integration 已证明事件不
+串线；synthetic adapter 不替代 P5.9 的 fixed-topology Simulator UI E2E。终审修复还补齐四个 shutdown/recovery
+不变量：只有 typed `daemon.runtime.snapshot_required` 才通过真实 RuntimeCore/store materialize Catalog 与缺失
+conversation snapshot，并最多重试三轮；selected-machine observation 在 handler 内重入 `select`/`shutdown` 时
+不等待自身，retired task 最终由外部 barrier join；`SessionModel` 的全部异步业务 task 进入唯一 operation
+registry，shutdown 停止 admission、cancel 并等待真实 terminal；Preview 显式注册 fixture scope，
+`AppRuntimeCoordinator.close()` 捕获并 join exact pump，handler 派生 task 不能继承 identity 绕过 join。
+精确 manifest、fresh 命令和双路终审证据见 `docs/QUALITY.md`。P5.7 已独立收口，P5 当前为 7/9；P5.8 AppKit machine picker/remote pairing/receipt UI、P5.9 与
+P5 Phase Exit 仍未完成。真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 与
 destructive purge 继续 post-MVP `BLOCKED`。
 P3.10 已由 code/test commit `19622ab` 完成 Task 收口：当时把 Runtime schema 推进到 v7，并新增 authenticated machine-wide
 `admin_commands` ledger，并实现 30 天 retention、容量准入、exact replay/conflict 与 COMMIT-unknown
@@ -972,7 +994,8 @@ Simulator 门禁已通过；C0-C、P3.9-A/B/C3/D/E Task 已完成，D/E code/tes
 Exit 已完成；P4.1–P4.7 automatic Task 与 P4 automatic Phase Exit 已收口，P5.1 shared facade、P5.2
 crash-safe client storage、P5.3 WSS/pin/transfer primitive 与 P5.4 MachineConnection/bounded source
 automatic Task 已完成；P5.5 又完成 shared SessionSource/canonical fixture 与 receipt UI 迁移，P5.6 已完成
-iOS 发行 Relay composition、production pairing UI 与前后台生命周期。P4–P6 按 Task 进度计为 7/7、6/9、0/4。`p4-auto` 已 PASS，`p4`
+iOS 发行 Relay composition、production pairing UI 与前后台生命周期，P5.7 已完成 macOS SessionSource registry
+与四项 recovery/shutdown hardening。P4–P6 按 Task 进度计为 7/7、7/9、0/4。`p4-auto` 已 PASS，`p4`
 仍不受支持；完整 P4 Phase Exit 还由 pre-closeout candidate
 SHA-256 `18654fa9c398383dafcefa1542c8e48f8c460f1f521806880c5dab083bdb29f5` 上的顶层门禁和
 `spec/security`、`quality` 双路 Approved review 共同支撑，P0/P1/P2=0。P3.1 provisioned signed

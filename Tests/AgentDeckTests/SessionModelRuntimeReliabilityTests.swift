@@ -344,6 +344,10 @@ final class SessionModelRuntimeReliabilityTests: XCTestCase {
     await firstWire.failStreamUnexpectedly()
     try await firstWire.waitForClose()
     try await waitUntil { model.selectedWarningMessage != nil }
+    XCTAssertEqual(
+      model.selectedWarningMessage,
+      "Local daemon connection closed (Runtime stream terminated unexpectedly); the next action will reconnect"
+    )
     model.openHistoryThread(threads[1])
 
     try await waitUntil { model.workbench.selectedConversationID == requiredEntry.conversationID }
@@ -471,9 +475,9 @@ final class SessionModelRuntimeReliabilityTests: XCTestCase {
   func testOldGenerationStartFailureClearsPendingBootstrapForExactRetry() async throws {
     let firstWire = try SessionReliabilityWire(
       promptOutcomes: [],
-      catalogTransportFailuresRemaining: 1,
       gatedHistoryConversationIDs: [SessionReliabilityWire.conversationID],
-      latchTransportFailures: true
+      latchTransportFailures: true,
+      gateStartConversationRequest: true
     )
     let secondWire = try SessionReliabilityWire(promptOutcomes: [.success])
     let factory = SessionReliabilityWireFactory([firstWire, secondWire])
@@ -484,8 +488,11 @@ final class SessionModelRuntimeReliabilityTests: XCTestCase {
     )
 
     XCTAssertTrue(model.startConversation(original))
+    try await firstWire.waitForStartRequestCount(1)
+    try await firstWire.waitForStreamReadCount(1)
+    await firstWire.releaseStartConversationRequest()
     try await firstWire.waitForSynchronizationRequest(SessionReliabilityWire.conversationID)
-    model.loadHistory()
+    await firstWire.failStreamUnexpectedly()
     try await firstWire.waitForClose()
     try await waitUntil { model.retryableConversationDraft != nil }
 
@@ -1569,16 +1576,33 @@ final class SessionModelRuntimeReliabilityTests: XCTestCase {
     )
   }
 
-  func testTeardownPreventsLatePromptFailureFromMutatingClosedModel() async throws {
-    let wire = try SessionReliabilityWire(promptOutcomes: [.gatedSuccess])
+  func testShutdownCancelsAndJoinsBlockedPromptWithoutLateMutation() async throws {
+    let wire = try SessionReliabilityWire(
+      promptOutcomes: [.gatedSuccess],
+      releaseGatedPromptOnClose: false
+    )
     let model = SessionModel(runtimeWire: wire)
     let runtime = try await prepareQueuedPromptDispatch(model: model, wire: wire)
     XCTAssertEqual(runtime.phase, .running)
 
-    model.teardown()
+    var shutdownCompleted = false
+    let shutdownTask = Task { @MainActor in
+      await model.shutdown()
+      shutdownCompleted = true
+    }
     try await wire.waitForClose()
-    try await Task.sleep(for: .milliseconds(10))
+    for _ in 0..<10 { await Task.yield() }
 
+    XCTAssertFalse(
+      shutdownCompleted,
+      "shutdown must still be joining the previously unowned prompt operation"
+    )
+    XCTAssertEqual(model.phase, .closed)
+
+    await wire.releaseGatedPromptSuccess()
+    await shutdownTask.value
+
+    XCTAssertTrue(shutdownCompleted)
     XCTAssertEqual(model.phase, .closed)
     XCTAssertEqual(runtime.phase, .running)
     XCTAssertNil(runtime.errorMessage)
@@ -1713,6 +1737,8 @@ private actor SessionReliabilityWire: AppRuntimeWireSession {
   private let latchTransportFailures: Bool
   private let gateClose: Bool
   private let gateFirstUnsubscribe: Bool
+  private let gateStartConversationRequest: Bool
+  private let releaseGatedPromptOnClose: Bool
   private var promptOutcomes: [SessionReliabilityPromptOutcome]
   private var latchedTransportFailure: RuntimeEnvelopeClientFailure?
   private var operationLog: [String] = []
@@ -1723,6 +1749,7 @@ private actor SessionReliabilityWire: AppRuntimeWireSession {
   private var startCallCount = 0
   private var describeRequestCount = 0
   private var startRequestCount = 0
+  private var streamReadCount = 0
   private var configureRequestCount = 0
   private var startIdempotencyKeys: [RuntimeIdempotencyKey] = []
   private var startAgentKinds: [AgentKind] = []
@@ -1740,6 +1767,8 @@ private actor SessionReliabilityWire: AppRuntimeWireSession {
   private var unsubscribeConversationIDs: [RuntimeConversationID] = []
   private var firstUnsubscribeGateReleased = false
   private var firstUnsubscribeContinuation: CheckedContinuation<Void, Never>?
+  private var startConversationGateReleased = false
+  private var startConversationContinuation: CheckedContinuation<Void, Never>?
   private var activeConversationAgentKind: AgentKind = .codex
   private var historySyncRequestCounts: [RuntimeConversationID: Int] = [:]
   private var synchronizationRequestCounts: [RuntimeConversationID: Int] = [:]
@@ -1771,7 +1800,9 @@ private actor SessionReliabilityWire: AppRuntimeWireSession {
     historyTransportFailureConversationIDs: Set<RuntimeConversationID> = [],
     latchTransportFailures: Bool = false,
     gateClose: Bool = false,
-    gateFirstUnsubscribe: Bool = false
+    gateFirstUnsubscribe: Bool = false,
+    gateStartConversationRequest: Bool = false,
+    releaseGatedPromptOnClose: Bool = true
   ) throws {
     self.promptOutcomes = promptOutcomes
     self.describeFailuresRemaining = describeFailuresRemaining
@@ -1789,6 +1820,8 @@ private actor SessionReliabilityWire: AppRuntimeWireSession {
     self.latchTransportFailures = latchTransportFailures
     self.gateClose = gateClose
     self.gateFirstUnsubscribe = gateFirstUnsubscribe
+    self.gateStartConversationRequest = gateStartConversationRequest
+    self.releaseGatedPromptOnClose = releaseGatedPromptOnClose
     catalogEntries = historyEntries
     let codexCapabilities = try reliabilityCodexCapabilities()
     let claudeCodeCapabilities = try reliabilityClaudeCodeCapabilities()
@@ -1866,6 +1899,16 @@ private actor SessionReliabilityWire: AppRuntimeWireSession {
       startCwds.append(cwd)
       activeConversationAgentKind = agentKind
       operationLog.append("start-conversation")
+      if gateStartConversationRequest, !startConversationGateReleased {
+        await withCheckedContinuation { continuation in
+          if startConversationGateReleased {
+            continuation.resume()
+          } else {
+            precondition(startConversationContinuation == nil)
+            startConversationContinuation = continuation
+          }
+        }
+      }
       if startTransportFailuresRemaining > 0 {
         startTransportFailuresRemaining -= 1
         throw latchIfRequested(
@@ -2106,6 +2149,7 @@ private actor SessionReliabilityWire: AppRuntimeWireSession {
 
   func nextStream() async throws -> LocalRuntimeStreamFrame {
     guard !isClosed else { throw SessionReliabilityWireError.closed }
+    streamReadCount += 1
     if let pendingStreamFailure {
       self.pendingStreamFailure = nil
       throw pendingStreamFailure
@@ -2124,8 +2168,11 @@ private actor SessionReliabilityWire: AppRuntimeWireSession {
     operationLog.append("close")
     streamContinuation?.resume(throwing: SessionReliabilityWireError.closed)
     streamContinuation = nil
-    gatedPromptContinuation?.resume(throwing: SessionReliabilityWireError.closed)
-    gatedPromptContinuation = nil
+    if releaseGatedPromptOnClose {
+      gatedPromptContinuation?.resume(throwing: SessionReliabilityWireError.closed)
+      gatedPromptContinuation = nil
+    }
+    releaseStartConversationRequest()
     releaseFirstUnsubscribe()
     for sequence in gatedHistorySequences.values { await sequence.cancel() }
     gatedHistorySequences.removeAll()
@@ -2209,6 +2256,22 @@ private actor SessionReliabilityWire: AppRuntimeWireSession {
   func waitForDescribeRequestCount(_ expected: Int) async throws {
     for _ in 0..<400 {
       if describeRequestCount >= expected { return }
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    throw SessionReliabilityWireError.timeout
+  }
+
+  func waitForStartRequestCount(_ expected: Int) async throws {
+    for _ in 0..<400 {
+      if startRequestCount >= expected { return }
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    throw SessionReliabilityWireError.timeout
+  }
+
+  func waitForStreamReadCount(_ expected: Int) async throws {
+    for _ in 0..<400 {
+      if streamReadCount >= expected { return }
       try await Task.sleep(for: .milliseconds(5))
     }
     throw SessionReliabilityWireError.timeout
@@ -2300,6 +2363,12 @@ private actor SessionReliabilityWire: AppRuntimeWireSession {
     firstUnsubscribeGateReleased = true
     firstUnsubscribeContinuation?.resume()
     firstUnsubscribeContinuation = nil
+  }
+
+  func releaseStartConversationRequest() {
+    startConversationGateReleased = true
+    startConversationContinuation?.resume()
+    startConversationContinuation = nil
   }
 
   func failStreamUnexpectedly() {

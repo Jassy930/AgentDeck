@@ -91,6 +91,102 @@ final class WorkbenchRuntimeV2Tests: XCTestCase {
     XCTAssertEqual(workbench.catalogCursor, .beforeFirst)
   }
 
+  func testSynchronizedCatalogSnapshotAndBackfillReplaceBaselineOnlyAtTerminal() throws {
+    let oldID = conversationID("conversation-old")
+    let nextID = conversationID("conversation-next")
+    let workbench = WorkbenchModel()
+    try workbench.installCatalog(
+      snapshotPages: [
+        try catalogPage(
+          cursor: .beforeFirst,
+          entries: [catalogEntry(id: oldID, title: "Old")]
+        )
+      ]
+    )
+    let snapshot = try catalogPage(
+      cursor: .at(4),
+      entries: [catalogEntry(id: nextID, title: "Snapshot", entryRevision: 1)]
+    )
+    let updated = catalogEntry(
+      id: nextID,
+      title: "Backfilled",
+      lastActiveMs: 2_000,
+      entryRevision: 2
+    )
+    let backfill = RuntimeBackfillChunkV2.catalog(
+      range: try RuntimeBackfillRangeV1(after: .at(4), through: .at(5)),
+      deltas: [
+        RuntimeCatalogDeltaV2(
+          catalogRevision: 5,
+          changes: [.upserted(entry: updated)]
+        )
+      ]
+    )
+
+    XCTAssertNil(
+      try workbench.ingest(
+        .synchronizedReply(
+          .subscription(.subscribed(streamGeneration: generation("generation-1")))
+        )
+      )
+    )
+    XCTAssertNil(try workbench.ingest(.synchronizedReply(.catalog(snapshot))))
+    XCTAssertNil(try workbench.ingest(.synchronizedReply(.backfill(backfill))))
+    XCTAssertEqual(workbench.catalogEntries.map(\.conversationID), [oldID])
+    XCTAssertEqual(workbench.catalogCursor, .beforeFirst)
+
+    XCTAssertNil(
+      try workbench.ingest(
+        .synchronizedReply(.syncComplete(try catalogSyncComplete(cursor: .at(5))))
+      )
+    )
+    XCTAssertEqual(workbench.catalogEntries.map(\.conversationID), [nextID])
+    XCTAssertEqual(workbench.catalogEntries.first?.title, "Backfilled")
+    XCTAssertEqual(workbench.catalogCursor, .at(5))
+    XCTAssertNil(workbench.runtime(conversationID: oldID))
+    XCTAssertEqual(workbench.runtime(conversationID: nextID)?.title, "Backfilled")
+  }
+
+  func testMalformedSynchronizedCatalogPagesLeaveExistingBaselineUntouched() throws {
+    let oldID = conversationID("conversation-old")
+    let nextID = conversationID("conversation-next")
+    let workbench = WorkbenchModel()
+    try workbench.installCatalog(
+      snapshotPages: [
+        try catalogPage(
+          cursor: .beforeFirst,
+          entries: [catalogEntry(id: oldID, title: "Old")]
+        )
+      ]
+    )
+    let unterminated = try RuntimeCatalogSnapshotV2(
+      baseCatalogCursor: .at(4),
+      entries: [catalogEntry(id: nextID, title: "Uncommitted")],
+      currentPageCursor: nil,
+      nextPageCursor: RuntimeCatalogPageCursor(rawValue: "catalog-page-2")
+    )
+
+    XCTAssertNil(
+      try workbench.ingest(
+        .synchronizedReply(
+          .subscription(.subscribed(streamGeneration: generation("generation-1")))
+        )
+      )
+    )
+    XCTAssertNil(try workbench.ingest(.synchronizedReply(.catalog(unterminated))))
+    XCTAssertThrowsError(
+      try workbench.ingest(
+        .synchronizedReply(.syncComplete(try catalogSyncComplete(cursor: .at(4))))
+      )
+    ) { error in
+      XCTAssertEqual(error as? RuntimeCatalogModelError, .snapshotDidNotTerminate)
+    }
+    XCTAssertEqual(workbench.catalogEntries.map(\.conversationID), [oldID])
+    XCTAssertEqual(workbench.catalogCursor, .beforeFirst)
+    XCTAssertEqual(workbench.runtime(conversationID: oldID)?.title, "Old")
+    XCTAssertNil(workbench.runtime(conversationID: nextID))
+  }
+
   func testSynchronizedConversationRepliesStageUntilTerminalAndRollbackAsOneUnit() throws {
     let id = conversationID("conversation-1")
     let workbench = WorkbenchModel()
@@ -777,6 +873,23 @@ final class WorkbenchRuntimeV2Tests: XCTestCase {
         "innerCursor": [
           "scope": "conversation",
           "conversationId": conversationID.rawValue,
+          "cursor": cursorObject(cursor),
+        ],
+        "keyDirectoryRevision": 0,
+      ]
+    )
+  }
+
+  private func catalogSyncComplete(
+    cursor: RuntimeStreamCursorV1
+  ) throws -> RuntimeSyncCompleteV1 {
+    try decode(
+      RuntimeSyncCompleteV1.self,
+      [
+        "streamGeneration": "generation-1",
+        "streamCursor": "beforeFirst",
+        "innerCursor": [
+          "scope": "catalog",
           "cursor": cursorObject(cursor),
         ],
         "keyDirectoryRevision": 0,

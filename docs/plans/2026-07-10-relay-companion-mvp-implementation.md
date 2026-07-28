@@ -3159,7 +3159,8 @@ agent docs、diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics �
 `BLOCKED`；静态 runner 仍只输出 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不生成真实证据。
 P5.1 shared facade、P5.2 crash-safe client storage、P5.3 WSS/pin/per-connection transfer primitive 与
 P5.4 MachineConnection/bounded source、P5.5 canonical fixture/receipt UI 与 P5.6 iOS production
-composition/pairing lifecycle automatic Task 已于后续完成，P5/P6 当前进度为 6/9、0/4。
+composition/pairing lifecycle、P5.7 macOS SessionSource registry automatic Task 已于后续完成，P5/P6
+当前进度为 7/9、0/4。
 
 ---
 
@@ -3167,8 +3168,8 @@ composition/pairing lifecycle automatic Task 已于后续完成，P5/P6 当前�
 
 > **执行前审计（2026-07-20）：0/9 Task 完成。** 当前只有 Relay crypto/wire、P3.9 本机 Runtime 与
 > fixture UI 基线；P5.1–P5.9 production source、真实 Simulator Relay E2E 与 post-MVP slot runner 均未实现。
-> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-28）：P5.1–P5.6 automatic
-> Task 已完成，P5 为 6/9。P5.7–P5.9 与 P5 Phase Exit 仍未完成。**
+> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-28）：P5.1–P5.7 automatic
+> Task 已完成，P5 为 7/9。P5.8–P5.9 与 P5 Phase Exit 仍未完成。**
 
 ### Task P5.1：建立 AgentDeckSessionSource target 与强类型 facade
 
@@ -3383,7 +3384,7 @@ iOS Simulator `26/26`。首轮 Simulator 暴露 file-protection 两种 Foundatio
 `4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f` 上完整 `cargo test --locked`
 exit 0，Rust/cross-language/static gates 全绿。提交按 `34 Rust/fixture → 69 Swift + 6 docs` 有序堆叠；第一笔
 只承诺 Rust scoped-green，完整门禁属于第二笔落地后的组合候选。历史 Step 2 RED 未保留且不伪造。P5.4
-收口时 P5 为 4/9；后续 P5.5、P5.6 已分别独立完成。当前 P5.7–P5.9 与 P5 Phase Exit 继续未完成。
+收口时 P5 为 4/9；后续 P5.5、P5.6、P5.7 已分别独立完成。当前 P5.8–P5.9 与 P5 Phase Exit 继续未完成。
 真实公网 WSS、production-signed Data Protection Keychain、物理 iPhone、第二台 Mac 与真实 Codex/Claude
 Code vendor 全部继续 post-MVP `BLOCKED`。
 
@@ -3452,7 +3453,7 @@ fail-close。retry 以 event-seq fence 拒绝旧 round，迟到 receipt 继续�
 winner，先保持 `.expired(nil)`；approvalID 或双方明确 winner 不一致统一 security fail-close。
 `.revoked/.incompatible/.securityError` 从 observation、prompt 或 approval 任一路到达都进入不可逆终态。
 P5.5 收口时 P5 进度为 5/9，`SceneDelegate` 仍注入 fixture，发行 composition/真实 pairing 留给 P5.6；
-后续 P5.6 已按下节独立收口。当前 P5.7–P5.9 与 P5 Phase Exit 未完成；真实公网 WSS、production-signed
+后续 P5.6、P5.7 已按后续小节独立收口。当前 P5.8–P5.9 与 P5 Phase Exit 未完成；真实公网 WSS、production-signed
 Data Protection Keychain、物理 iPhone、第二台 Mac 与真实 Codex/Claude Code vendor 继续 post-MVP `BLOCKED`。
 
 Runtime v5 Error 额外固定为：commandless Error 只记录 conversation diagnostic，不结束 active turn 或生成
@@ -3510,26 +3511,40 @@ RelayClient production/test 路径，提供 pairing replacement 与 source shutd
 installation UUID；fixture 仅在 Debug preview/test 可达。pairing UI 在完整本地 inspect/trust preview 和用户确认
 前零网络；handler replacement 先 cancel/close/join 旧 worker/WSS，ViewModel 以 exact operation identity 阻断
 迟到旧任务清槽。scene lifecycle 同步 capture intent 后由 FIFO worker 执行，后台 shutdown/join、前台 cold-open
-新 generation；verified revoke 与离线 local forget 保持不同删除门禁。P5 当前为 6/9；P5.7–P5.9 与 P5 Phase
-Exit 仍未完成。真实公网 WSS、production-signed Data Protection Keychain、物理 iPhone、第二台 Mac、真实
+新 generation；verified revoke 与离线 local forget 保持不同删除门禁。P5.6 收口时 P5 为 6/9；当时
+P5.7–P5.9 与 P5 Phase Exit 仍未完成。后续 P5.7 已按下节独立完成。真实公网 WSS、production-signed
+Data Protection Keychain、物理 iPhone、第二台 Mac、真实
 Codex/Claude Code vendor 与 destructive purge 继续 post-MVP `BLOCKED`。
 
 ### Task P5.7：建立 macOS LocalDaemonSessionSource 与 SessionSourceRegistry
 
 **Files:**
-- Create: `Sources/AgentDeck/SessionSources/{LocalDaemonSessionSource,SessionSourceRegistry,AppSessionSourceComposition}.swift`
-- Create: `Tests/AgentDeckTests/{LocalDaemonSessionSourceTests,SessionSourceRegistryTests,MachineScopeRoutingTests}.swift`
-- Modify: `Sources/AgentDeck/{SessionModel,WorkbenchModel,ThreadRuntimeModel,AppDelegate}.swift`
-- Modify: `Package.swift`
+- Create: `Sources/AgentDeck/SessionSources/{LocalDaemonSessionSource,LocalDaemonSessionSource+FailureMapping,LocalDaemonSessionSource+RuntimeOperations,LocalDaemonSessionSourceSupport,SessionSourceRegistry,AppSessionSourceComposition}.swift`
+- Move: `Sources/AgentDeckRelayClient/Streaming/BoundedBroadcaster.swift` → `Sources/AgentDeckSessionSource/Streaming/BoundedBroadcaster.swift`；对应 tests 同步移到 `AgentDeckSessionSourceTests`。
+- Create: `Tests/AgentDeckTests/{AppDelegateTerminationTests,LocalDaemonSessionSourceTests,SessionSourceRegistryTests,MachineScopeRoutingTests,MachineScopeRealIntegrationTests}.swift`
+- Modify: `Sources/AgentDeck/{AppDelegate,AppRuntimeCoordinator,Preview/PreviewBootstrap,SessionModel,WorkbenchModel,main}.swift`、对应 tests 与 `Package.swift`。
+- Prerequisite hardening: `AgentDeckRelayClient` 的 MachineConnection/verified ingress/key lifecycle/source/storage 与 tests；`agentdeckd` remote/runtime Genesis、snapshot permit、publication/subscription 与真实 machine E2E。
 
-**Registry rule:** local machine固定指向RuntimeEnvelope v2 UDS source；每台remote machine是独立`RelaySessionSource(.machine(id))`；UI只按machine scope取得`any SessionSource`；本机流量永不绕Relay。
+**Registry rule:** local machine固定指向 current RuntimeEnvelope v5 UDS source；每台remote machine是独立`RelaySessionSource(.machine(id))`；UI只按machine scope取得`any SessionSource`；本机流量永不绕Relay。
 
-- [ ] Step 1: 写registry/routing tests。local/remote同SessionSource facade、切machine取消旧observation、remote pair不影响local、local daemon offline typed state、preview显式fixture、ThreadRuntime使用canonical IDs且approval在receipt前不移除；只有local machine scope从registry取得`LocalPairingAdministration`，remote/fixture返回nil，禁止concrete downcast。
-- [ ] Step 2: 运行三套Swift tests。 Expected: FAIL，registry/source不存在。
-- [ ] Step 3: 封装现有RuntimeEnvelopeClient为LocalDaemonSessionSource并让它通过UDS实现`LocalPairingAdministration`，建立composition/registry的typed optional capability并迁移models。UI/model层不importCryptoKit或Relay wire，remote RelaySessionSource不实现本地批准能力。
-- [ ] Step 4: 重跑 Swift tests，并同时连接 local test daemon 与由真实 P4 daemon RemoteLink + synthetic adapter 支撑的 remote source。Expected: 两个 scope 事件不串线，本机 socket 仍是 UDS；synthetic adapter 不替代 remote daemon/PairingCoordinator/RemoteLink。
-- [ ] Step 5: 运行N2/vendor branch lint与network boundary。
-- [ ] Step 6: 提交。 `git add Package.swift Sources Tests && git commit -m "feat(macos): 统一本地与远程 SessionSource 路由"`
+- [x] Step 1: registry/routing tests 已覆盖 local/remote 同 facade、scope replacement 取消旧 observation、remote pair 不影响 local、offline typed state、preview 显式 fixture、canonical IDs/receipt，以及仅 local scope 提供 typed `LocalPairingAdministration`。
+- [x] Step 2: 接管时原始 RED transcript 未保留，不补写不存在的失败记录；以 test discovery、冻结候选 fresh focused 与完整回归替代，并在 QUALITY 明确记录该豁免。
+- [x] Step 3: `LocalDaemonSessionSource` 已封装 current Runtime v5 UDS 并实现本机 administration；composition/registry 只公开 typed optional capability。production 主文件按职责拆为 1,617/345/145/76 行子片，低于 1,800 行预拆线。
+- [x] Step 4: Swift 回归与真实 dual-scope integration 已通过：local 使用真实 UDS；remote 使用真实 P4 daemon RemoteLink + synthetic adapter，两个 scope 事件不串线。synthetic adapter 不替代 daemon/PairingCoordinator/RemoteLink。
+- [x] Step 5: N2/NoVendorBranchInUI、daemon network/no-net、schema、Clippy、format、docs/diff 与运行态 smoke/selfcheck/diagnostics 门禁见 QUALITY。
+- [x] Step 6: 四项终审阻塞已闭环：真实 RuntimeCore/store Genesis snapshot recovery、observation handler 重入
+  self-join 隔离、`SessionModel` operation registry 与 Preview/AppRuntime exact-pump shutdown barrier。fresh Swift
+  `1061 XCTest / 4 skipped + 35 Swift Testing`、Rust daemon lib `1683 passed / 3 ignored` 及 scoped 门禁均通过，
+  双路复审 `P0/P1/P2=0`；exact scope 为 `40 prerequisite + 23 registry + 7 docs = 70 paths`，按两笔 scoped
+  commit 提交且不 push。
+
+**P5.7 automatic 完成边界（2026-07-28）：** automatic scope 只包含 registry/routing foundation、typed local
+capability、selected-scope generation、shutdown/join barrier、Genesis/business-ready prerequisite、真实
+dual-scope host integration，以及 typed snapshot recovery、observation reentrancy、`SessionModel` operation join
+与 Preview/AppRuntime pump barrier。AppDelegate 当前仍把 local composition model 交给既有
+`SessionViewController`；可见 machine picker、remote pairing/pending-device approval、receipt UI 由 P5.8
+完成。P5 当前为 7/9；P5.9 fixed-topology Simulator Relay E2E 与 P5 Phase Exit 继续未完成；真实公网、签名 Keychain、物理
+iPhone、第二台 Mac、真实 vendor 与 destructive purge 继续 post-MVP `BLOCKED`。
 
 ### Task P5.8：接入 AppKit machine scope、远程配对与 receipt UI
 

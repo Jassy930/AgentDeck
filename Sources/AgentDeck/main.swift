@@ -204,6 +204,24 @@ if galleryMode {
     Data("[AgentDeck] gallery mode: design-system component gallery\n".utf8))
 }
 let app = NSApplication.shared
-let delegate = AppDelegate(profile: launchProfile, preview: previewMode, gallery: galleryMode)
+let appComposition: any AppSessionSourceCompositionOwner
+do {
+  if previewMode {
+    appComposition = try await PreviewBootstrap.makeComposition()
+  } else {
+    appComposition = try AppSessionSourceComposition.production()
+  }
+} catch {
+  FileHandle.standardError.write(
+    Data("AgentDeck FATAL: failed to construct session sources: \(error)\n".utf8)
+  )
+  exit(1)
+}
+let delegate = AppDelegate(
+  profile: launchProfile,
+  composition: appComposition,
+  preview: previewMode,
+  gallery: galleryMode
+)
 app.delegate = delegate
 app.run()

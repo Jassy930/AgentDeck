@@ -107,8 +107,10 @@
   shutdown 解锁以及 staged→committed pairing visibility gate；P5.5 又把 iOS fixture/ViewModel 迁移到共享
   `SessionSource` 与 Core canonical reducer，并以 32-identity cap、snapshot mid-turn inference、event-seq retry
   fence、retired-operation 校验与 terminal-only turn advance 保留审批证据；P5.6 已把 iOS Release composition
-  切到真实 Relay source，并接入完整邀请配对与前后台 generation lifecycle。P4–P6 按 Task 进度上限为
-  7/7、6/9、0/4。`p4-auto`
+  切到真实 Relay source，并接入完整邀请配对与前后台 generation lifecycle；P5.7 已建立 macOS 唯一本机 UDS
+  source、按机器隔离的 remote source registry、typed local capability、scope generation 与 shutdown/join
+  barrier，并用真实 P4 daemon RemoteLink + synthetic adapter 验证 local/remote 双 scope 不串线。P4–P6 按
+  Task 进度上限为 7/7、7/9、0/4。`p4-auto`
   已 PASS；`p4` 仍不受支持，
   且 focused aggregate 本身不包含顶层
   Rust/Swift、最终 diff/status、冻结 hash 或双路 review。上述独立门禁与双路 review 已在
@@ -132,8 +134,10 @@
   `91/91` 与 iOS Simulator `91/91`；上一 command terminal 不消费下一 prompt receipt 的反例也已冻结；
   其余 Rust 精确结果见 `QUALITY.md`。该 Task 收口时 P5 为 5/9。P5.6 后续以 focused `42/42`、Relay
   shutdown `56/56`、RelayClient `445/4 SKIP`、顶层 Swift `985/4 SKIP + 35`、iOS `133/133` 与 Release
-  fixture-surface 门禁独立完成；当前 P5 为 6/9，P5.7–P5.9 与 P5 Phase Exit 仍未完成。
-  P5.1–P5.6/P4 automatic 完成项都不表示 P5.9 fixed-topology Simulator Relay E2E、真实公网 WSS、production-signed
+  fixture-surface 门禁独立完成；P5.7 exact scope 为 `40 prerequisite + 23 registry + 7 docs = 70 paths`，Genesis
+  snapshot recovery、selected-scope reentrancy、`SessionModel` operation join 与 Preview/AppRuntime pump barrier
+  均已闭环，fresh 门禁与双路终审见 `QUALITY.md`。当前 P5 为 7/9；P5.8–P5.9 与 P5 Phase Exit 仍未完成。
+  P5.1–P5.7/P4 automatic 完成项都不表示 P5.9 fixed-topology Simulator Relay E2E、真实公网 WSS、production-signed
   Keychain、第二台 Mac、真实 vendor 或 destructive purge 已完成。
 
 ## 协议资料
