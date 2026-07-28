@@ -988,10 +988,9 @@ conversation/key，不能伪造身份连续性。
 - P5.6 automatic 证据为 focused Pairing/AppLifecycle/ViewController `42/42`、fresh iOS Simulator
   `133/133`、RelayClient `445 executed / 4 entitlement SKIP`、顶层 Swift
   `985 XCTest / 4 skipped + 35 Swift Testing / 0 failure`，以及 Release generic Simulator build、fixture
-  surface scan、strict Swift format、agent docs 与 diff 门禁。P5.6 收口时 P5 为 6/9；后续 P5.7 已独立收口，
-  当前为 7/9。P5.8–P5.9 与 P5 Phase Exit、
-  真实 temp Relay 编排、公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 与
-  destructive purge 均未由本 Task 证明。
+  surface scan、strict Swift format、agent docs 与 diff 门禁。P5.6 收口时 P5 为 6/9；后续 P5.7 与 rescue
+  P5.8-lite 已分别独立收口，当前为 8/9。P5.9 与 P5 Phase Exit、真实 temp Relay 编排、公网 WSS、
+  production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 与 destructive purge 均未由本 Task 证明。
 
 ### Relay Companion MVP P5.7 macOS SessionSource registry 不变量
 
@@ -1019,8 +1018,25 @@ conversation/key，不能伪造身份连续性。
 - app termination 必须等待 `SessionModel`、selected-scope owner 与 registry 的 shutdown + join 后再回复 AppKit；
   只关闭当前 client fd/pump，不向共享 daemon 发送 shutdown。
 - P5.7 只证明 registry/routing foundation、typed local capability、shutdown barrier 与真实 dual-scope host
-  integration。AppKit machine picker、remote pairing sheet、pending-device approval 与 receipt UI 仍属 P5.8；
-  P5.9 fixed-topology Simulator Relay E2E 与 P5 Phase Exit 仍未完成。
+  integration；后续 rescue R3 已单独完成 P5.8-lite pending-device approval。AppKit machine picker、remote
+  pairing sheet 与 remote receipt UI 已移出 MVP；P5.9 fixed-topology Simulator Relay E2E 与 P5 Phase Exit
+  仍未完成。
+
+### Relay Companion MVP rescue R3 本机配对控制面不变量
+
+- production composition 只把既有唯一 `LocalDaemonSessionSource` 作为 typed
+  `LocalPairingAdministration` 暴露给 AppDelegate；Preview/fixture 与 remote source 不提供该能力，因此菜单
+  和面板不可能通过当前 machine scope 或 concrete downcast 获得远程批准入口。
+- `PendingDeviceApprovalController` 只依赖 facade。每次 confirm/cancel 绑定 pairing ID、request hash、完整
+  32-byte DeviceSign fingerprint 与 expiry；同 ID 身份变化、迟到结果或 receipt 返回不同 ID 都 fail-close，
+  不把旧结果应用到新请求。
+- 每个 pairing ID 同时只允许一个决定；terminal receipt 到 pending stream 删行之间继续锁存禁用，防止 UI
+  重复提交。AlreadyHandled 必须保留 winner/state，transport、expired、canceled 与 security failure 保持不同
+  typed 状态；仅 retryable transport/unknown failure 可再次操作。
+- 面板显示完整、可复制的 DeviceSign fingerprint，但不显示 request hash、secret、grant、私钥或 wire DTO。
+  关闭/重开面板只影响 AppKit window，不创建第二 UDS owner，不关闭 shared daemon、其他 machine scope 或 turn。
+- R3 不改 local IPC v2、Runtime v5、Relay v2、E2EE v1，不增加 machine picker、remote pairing sheet、远程
+  macOS 控制面或新的本地运行平台；下一条生产链路只能由 R4 fixed-topology Simulator E2E 接入。
 
 ### Relay Companion MVP P3.2 Runtime persistence 不变量
 

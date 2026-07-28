@@ -62,10 +62,10 @@
 ### Relay Companion MVP（2026-07-10）
 
 - `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-28-relay-companion-mvp-rescue-implementation.md`：当前唯一执行计划；保留 P0–P5.7
-  已验证基础，把剩余范围收敛为基线冻结、master 同步、协议治理、P5.8-lite 本机确认 UI、固定拓扑
-  Simulator E2E 与 automatic MVP 收口六阶段。每阶段都有入口、自动门禁、运行/UI 读回、证据、双路 review、
-  cleanup 和 clean Git 状态退出条件；P6 与真实设备/公网/vendor 证据全部后置。
+- `plans/2026-07-28-relay-companion-mvp-rescue-implementation.md`：当前唯一执行计划；R0–R3 已完成基线
+  冻结、master 同步、协议治理与 P5.8-lite 本机确认 UI，当前只执行固定拓扑 Simulator E2E 和 automatic
+  MVP 收口。每阶段都有入口、自动门禁、运行/UI 读回、证据、双路 review、cleanup 和 clean Git 状态退出
+  条件；P6 与真实设备/公网/vendor 证据全部后置。
 - `plans/2026-07-18-relay-companion-mvp-course-correction.md`：历史纠偏决策；其 Task 粒度门禁、Runtime
   store 离线篡改 fail-close / 同 UID 在线 residual risk 继续约束已实现基线，未完成执行范围由 rescue
   计划覆盖。
@@ -145,8 +145,9 @@
   shutdown `56/56`、RelayClient `445/4 SKIP`、顶层 Swift `985/4 SKIP + 35`、iOS `133/133` 与 Release
   fixture-surface 门禁独立完成；P5.7 exact scope 为 `40 prerequisite + 23 registry + 7 docs = 70 paths`，Genesis
   snapshot recovery、selected-scope reentrancy、`SessionModel` operation join 与 Preview/AppRuntime pump barrier
-  均已闭环，fresh 门禁与双路终审见 `QUALITY.md`。当前 P5 为 7/9；rescue 范围内的 P5.8-lite、P5.9 与
-  P5 automatic Phase Exit 仍未完成。P5.1–P5.7/P4 automatic 完成项都不表示 P5.9 fixed-topology Simulator
+  均已闭环，fresh 门禁与双路终审见 `QUALITY.md`。rescue R3 的 P5.8-lite 本机 pending-device 控制面也已
+  独立闭环，当前 P5 为 8/9；P5.9 与 P5 automatic Phase Exit 仍未完成。P5.1–P5.8-lite/P4 automatic 完成项
+  都不表示 P5.9 fixed-topology Simulator
   Relay E2E、真实公网 WSS、production-signed Keychain、第二台 Mac、真实 vendor 或 destructive purge 已完成。
 
 ## 协议资料

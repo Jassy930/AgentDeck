@@ -1088,8 +1088,8 @@ production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理真�
 destructive purge 继续 post-MVP BLOCKED；P5.1 shared facade、P5.2 crash-safe client storage、P5.3
 WSS/pin/per-connection transfer primitive、P5.4 MachineConnection/bounded source、P5.5 canonical
 fixture/receipt UI、P5.6 iOS production composition/pairing lifecycle 与 P5.7 macOS SessionSource registry
-automatic Task 已收口，P5/P6 当前进度为 7/9、0/4。P5.7 automatic 证据不替代 P5.8 可见 AppKit 控制面、
-P5.9 fixed-topology Relay E2E 或任何外部门禁。
+automatic Task 已收口，rescue R3 又完成 P5.8-lite 本机 AppKit pending-device 控制面，P5/P6 当前进度为
+8/9、0/4。P5.8-lite automatic 证据不替代 P5.9 fixed-topology Relay E2E 或任何外部门禁。
 
 #### P5.2 client storage / counter / replay failure
 
@@ -1199,7 +1199,7 @@ expiry 清理，合法 partial promotion 仍精确回滚。
 2026-07-27 的非门控 Instruments Allocations smoke 启动 `dist/AgentDeck.app --selfcheck`，exit 0、duration
 2.639832 秒；trace 只在 `/tmp/agentdeck-p54-instruments.rt5Mo5/p54-agentdeck-selfcheck.trace`，不得提交。
 它不是 RelaySessionSource 长跑、真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac 或真实
-vendor 证据。P5.4 收口后，P5.5–P5.7 已分别独立完成；当前 P5.8–P5.9 与 P5 Phase Exit 继续未完成。
+vendor 证据。P5.4 收口后，P5.5–P5.8-lite 已分别独立完成；当前只剩 P5.9 与 P5 Phase Exit 未完成。
 
 #### P5.5 iOS canonical / receipt 乱序诊断
 
@@ -1245,7 +1245,8 @@ P5.5 candidate 当时的 `SceneDelegate` 仍注入 `FixtureSessionSource`；因�
 approval 或 reconnect UI 只证明 presentation/fixture 语义。P5.6 已把 Release composition 切到真实
 `RelaySessionSource`，fixture 只在 Debug preview/test 可达；若普通 Release 启动仍出现 fixture machine，或
 Release binary 命中 fixture launch/install 字符串，应按 packaging/security regression 处理。P5.6 收口时
-P5.7–P5.9 与 P5 Phase Exit 尚未完成；后续 P5.7 已独立收口。当前 P5.8–P5.9 与 P5 Phase Exit 仍未完成；
+P5.7–P5.9 与 P5 Phase Exit 当时尚未完成；后续 P5.7 与 rescue P5.8-lite 已独立收口。当前只剩 P5.9 与
+P5 Phase Exit 未完成；
 其中 P5.9 必须跑 fixed-topology Simulator Relay E2E，不能
 标成 post-MVP BLOCKED。真实公网 WSS、物理 iPhone、production-signed Keychain、第二台 Mac、真实 vendor 与
 destructive purge 才继续属于 post-MVP `BLOCKED`。
@@ -1270,8 +1271,19 @@ data-protection readback。
 | 退出 App 后 blocked prompt/inbound handler 仍存活，或 termination 过早回复 | `SessionModel` operation registry 漏记业务 task，或 coordinator 把 wire close 当成 pump terminal | 停止 admission 后 cancel/join 全 registry；Preview 必须显式注册 fixture scope，外部 `close()` 捕获并 join exact pump，handler 派生 close 不得跳过 join |
 
 P5.7 的真实 dual-scope integration 使用本机 UDS 与由真实 P4 daemon RemoteLink 支撑的 remote source；synthetic
-adapter 只替代 vendor，不替代 daemon/PairingCoordinator/RemoteLink。该证据不包含 P5.8 的可见 picker、remote
-pair sheet、pending-device approval 或 receipt UI，也不包含 P5.9 Simulator UI E2E。
+adapter 只替代 vendor，不替代 daemon/PairingCoordinator/RemoteLink。后续 rescue R3 只补齐本机
+pending-device approval；可见 picker、remote pair sheet/receipt UI 仍属 post-MVP，P5.9 Simulator UI E2E
+仍未完成。
+
+#### Rescue R3 本机 pending-device 面板诊断
+
+| typed state / 现象 | 含义 | 下一步 |
+| --- | --- | --- |
+| 面板显示“本机 Runtime 暂不可用” | local UDS 当前不可达；没有发生授权，也不能把失败误当空列表 | 核对 stable LaunchAgent/UDS owner；开发验证用 hermetic local-runtime smoke，不临时占用 canonical socket |
+| 同一 pairing 行在处理中仍可再次点击，或 terminal 后立即恢复按钮 | UI 未保持 per-ID single-flight/terminal 锁存 | 保留当前 identity 的 in-flight/terminal gate，直到 pending stream 真正删行；不得靠重复请求碰运气 |
+| 同一 pairing ID 的 fingerprint/request hash/expiry 变化后旧结果覆盖新行 | mutation 未绑定完整 pending identity，存在 ABA | 立即锁为 security failure；迟到结果和不同 receipt ID 都必须 fail-close，不授予权限 |
+| 面板或日志出现 request hash、secret、grant、私钥 | UI/诊断越过最小披露边界 | 只显示完整 DeviceSign fingerprint；按安全回归处理并清理 artifact，禁止提交截图/日志 |
+| Preview/fixture 或 remote scope 出现“本机配对请求…” | composition 泄漏 local-only administration capability | 菜单只由 production local composition 安装；禁止 downcast concrete source 或按 vendor/machine kind 分支 |
 
 #### Trust reset 与本地 cleanup
 

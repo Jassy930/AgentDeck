@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；R0、R1、R2 complete，R3 pending |
+| 状态 | In execution；R0–R3 complete，R4 pending |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -332,12 +332,12 @@ scripts/verify-agent-docs.sh
 
 ### Tasks
 
-- [ ] R3.1：assembly/state tests 证明只有 local scope 有 `LocalPairingAdministration`。
-- [ ] R3.2：approve/cancel single-flight、AlreadyHandled、fingerprint 绑定和迟到结果反例。
-- [ ] R3.3：最小 UI；普通 controller 只依赖 protocol，不 downcast concrete source。
-- [ ] R3.4：focused/full Swift、selfcheck、NoVendorBranch/static 门禁。
-- [ ] R3.5：真实打开 fixture/local UI，读回所有状态。
-- [ ] R3.6：双路 review、文档、clean status 和 scoped commit。
+- [x] R3.1：assembly/state tests 证明只有 local scope 有 `LocalPairingAdministration`。
+- [x] R3.2：approve/cancel single-flight、AlreadyHandled、fingerprint 绑定和迟到结果反例。
+- [x] R3.3：最小 UI；普通 controller 只依赖 protocol，不 downcast concrete source。
+- [x] R3.4：focused/full Swift、selfcheck、NoVendorBranch/static 门禁。
+- [x] R3.5：真实打开 fixture/local UI，读回所有状态。
+- [x] R3.6：双路 review、文档、clean status 和 scoped commit。
 
 ### Automatic gates
 
@@ -361,6 +361,21 @@ git diff --check
 ### Exit
 
 被控 Mac 具备 iOS pairing 所需最小本地控制面；无 remote macOS/协议扩张；自动与可见读回 PASS。
+
+### Final gate readback（2026-07-28）
+
+- 5-path code/test content hash 为 `9c3bd63c9e56ef244d0d72da3192cfe3ade31b80c7a41675ee804355b56720ba`；
+  未修改 local IPC v2、Runtime v5、Relay v2、E2EE v1、schema、daemon 或 Relay 实现。
+- focused `46/46`；顶层 warnings-as-errors 为 `1161 XCTest / 4 skipped / 0 failed + 48 Swift Testing / 0 failed`；
+  ownership、changed-file strict format 与 diff 门禁均 exit 0。
+- stable `swift run AgentDeck -- --selfcheck` 真实读回 `daemon.client.socket_missing`，作为当前账号 canonical
+  daemon 缺失的环境 `BLOCKED`，不计 PASS；hermetic local-runtime smoke 用真实 ephemeral daemon/UDS 完成
+  Rust + Swift selfcheck、双 installation、receipt/replay/stream/cleanup，exit 0。
+- `build_and_run.sh --verify` 读回 exact bundle/helper/resource/minos 后，用真实 AppKit 菜单打开“本机配对请求…”；
+  stable daemon 缺失时面板显示 typed transport failure。fixture AppKit tests 读回完整 fingerprint、confirm/cancel、
+  AlreadyHandled、expired/canceled/security failure，且 request hash/key material 不可见。
+- 最终 `spec/security` 与 `quality/Git` 在同一冻结 code/test hash 上均 Approved，P0/P1/P2=0；R3 exact scoped
+  commit 后 clean，未 push。remote picker/pairing sheet、P5.9、真实设备/公网/vendor 仍 pending/BLOCKED。
 
 ## 10. Phase R4：固定拓扑 Simulator E2E 与 P5 verifier
 
@@ -509,7 +524,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R0 基线冻结 | complete | code `e400c1c`；本阶段 docs commit | `p4-auto` PASS；Swift 50/50；docs/diff PASS | real daemon + local UDS/RemoteLink PASS | 双路 P0/P1/P2=0 | scoped commit 后 clean |
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
-| R3 P5.8-lite | pending | — | — | — | — | — |
+| R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
 | R4 Simulator E2E | pending | — | — | — | — | — |
 | R5 MVP 收口 | pending | — | — | — | — | — |
 

@@ -64,6 +64,7 @@ final class PreviewAppSessionSourceComposition: AppSessionSourceCompositionOwner
   let model: SessionModel
   let registry: SessionSourceRegistry
   let selectedMachineScope: SelectedMachineScopeGenerationOwner
+  let localPairingAdministration: (any LocalPairingAdministration)? = nil
   private let fixtureRegistration: SessionSourceRegistration?
   private var didRegisterFixture = false
   private var isPrepared = false

@@ -21,6 +21,8 @@ final class AppSessionSourceComposition {
   let registry: SessionSourceRegistry
   let selectedMachineScope: SelectedMachineScopeGenerationOwner
 
+  var localPairingAdministration: (any LocalPairingAdministration)? { localSource }
+
   // registry 的 remote factory 也会强持有 provider；composition 再显式持有，令
   // shared-store ownership 在对象图中可见，而不是只藏在 escaping closure 内。
   private let pairedMachineStoreProvider: MacOSPairedMachineStoreProvider

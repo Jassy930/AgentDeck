@@ -1,13 +1,17 @@
+import AgentDeckSessionSource
 import AppKit
 
 @MainActor
 protocol AppSessionSourceCompositionOwner: AnyObject {
     var model: SessionModel { get }
+    var localPairingAdministration: (any LocalPairingAdministration)? { get }
     func prepare() async throws
     func shutdown() async
 }
 
 extension AppSessionSourceCompositionOwner {
+    var localPairingAdministration: (any LocalPairingAdministration)? { nil }
+
     func prepare() async throws {}
 }
 
@@ -109,6 +113,8 @@ final class AgentDeckWindow: NSWindow {
 /// drives `NSApp`/window/menu APIs.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    static let pendingDeviceApprovalMenuTitle = "本机配对请求…"
+
     private let profile: AgentDeckProfile
     private var window: NSWindow?
     private let composition: any AppSessionSourceCompositionOwner
@@ -119,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let terminationReply: @MainActor @Sendable (Bool) -> Void
     private var previewBootstrapTask: Task<Void, Never>?
     private var terminationTask: Task<Void, Never>?
+    private var pendingDeviceApprovalWindowController: NSWindowController?
     private var didReplyToTermination = false
 
     init(
@@ -266,12 +273,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Reproduces the former SwiftUI Cmd-Q command (`AgentDeckQuitCommand`).
-    private func installMainMenu() {
+    func makeMainMenu() -> NSMenu {
         let mainMenu = NSMenu()
         let appItem = NSMenuItem()
         mainMenu.addItem(appItem)
 
         let appMenu = NSMenu()
+        if !gallery, composition.localPairingAdministration != nil {
+            let pendingItem = appMenu.addItem(
+                withTitle: Self.pendingDeviceApprovalMenuTitle,
+                action: #selector(showPendingDeviceApprovals(_:)),
+                keyEquivalent: ""
+            )
+            pendingItem.target = self
+            appMenu.addItem(.separator())
+        }
         appMenu.addItem(
             withTitle: AgentDeckQuitCommand.title,
             action: #selector(NSApplication.terminate(_:)),
@@ -279,6 +295,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         appItem.submenu = appMenu
 
-        NSApp.mainMenu = mainMenu
+        return mainMenu
+    }
+
+    private func installMainMenu() {
+        NSApp.mainMenu = makeMainMenu()
+    }
+
+    @objc private func showPendingDeviceApprovals(_ sender: Any?) {
+        guard let administration = composition.localPairingAdministration else { return }
+        if let windowController = pendingDeviceApprovalWindowController {
+            windowController.showWindow(sender)
+            windowController.window?.makeKeyAndOrderFront(sender)
+            return
+        }
+
+        let controller = PendingDeviceApprovalController(administration: administration)
+        let panel = NSWindow(contentViewController: controller)
+        panel.title = "本机配对请求"
+        panel.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        panel.setContentSize(NSSize(width: 680, height: 460))
+        panel.minSize = NSSize(width: 640, height: 420)
+        panel.center()
+        let windowController = NSWindowController(window: panel)
+        pendingDeviceApprovalWindowController = windowController
+        windowController.showWindow(sender)
+        panel.makeKeyAndOrderFront(sender)
     }
 }

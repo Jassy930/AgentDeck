@@ -232,14 +232,13 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Companion MVP 实施状态（P5.7 automatic complete；P5 为 7/9）
+## Relay Companion MVP 实施状态（P5.8-lite automatic complete；P5 为 8/9）
 
 2026-07-28 起，剩余 Relay 工作按
 [`Relay Companion MVP 救援实施计划`](docs/plans/2026-07-28-relay-companion-mvp-rescue-implementation.md)
-执行：先冻结基线并同步 `master`，再冻结协议所有权，只补被控 Mac 的本机 pending-device 确认 UI 和
-固定拓扑 iOS Simulator E2E，最后以 `p5` verifier、三次 fresh run、双路 review、文档与 clean Git 状态
-收口 automatic MVP。原计划 P6、远程 macOS 完整控制面、真实设备/公网/vendor/production-signing 证据
-全部后置，不再进入当前 MVP。
+执行：基线冻结、`master` 同步、协议所有权治理与 P5.8-lite 被控 Mac 本机 pending-device 确认 UI 已完成；
+当前只剩固定拓扑 iOS Simulator E2E 与最终 `p5` verifier/三次 fresh run/双路 review 收口。原计划 P6、
+远程 macOS 完整控制面、真实设备/公网/vendor/production-signing 证据全部后置，不再进入当前 MVP。
 
 2026-07-18 纠偏曾让主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
@@ -390,10 +389,14 @@ conversation snapshot，并最多重试三轮；selected-machine observation 在
 不等待自身，retired task 最终由外部 barrier join；`SessionModel` 的全部异步业务 task 进入唯一 operation
 registry，shutdown 停止 admission、cancel 并等待真实 terminal；Preview 显式注册 fixture scope，
 `AppRuntimeCoordinator.close()` 捕获并 join exact pump，handler 派生 task 不能继承 identity 绕过 join。
-精确 manifest、fresh 命令和双路终审证据见 `docs/QUALITY.md`。P5.7 已独立收口，P5 当前为 7/9；当前剩余
-范围只含 P5.8-lite 本机 pending-device 确认 UI、P5.9 fixed-topology Simulator E2E 与 P5 automatic Phase
-Exit。旧 P5.8 remote macOS machine picker/pairing/receipt UI、真实公网 WSS、production-signed Keychain、
-物理 iPhone、第二台 Mac、真实 vendor 与 destructive purge 全部转为 post-MVP `BLOCKED`。
+精确 manifest、fresh 命令和双路终审证据见 `docs/QUALITY.md`。P5.7 已独立收口；rescue R3 又只增加
+production composition 的“本机配对请求…”入口和注入 `LocalPairingAdministration` 的最小 AppKit 面板，
+完整展示 DeviceSign fingerprint，并对 confirm/cancel single-flight、terminal 锁存、AlreadyHandled、
+同 ID 换指纹、receipt ID 不匹配与 typed failure fail-close。remote/fixture 没有批准入口，且没有增加协议、
+remote macOS picker 或 pairing sheet。P5 当前为 8/9；剩余只含 P5.9 fixed-topology Simulator E2E 与 P5
+automatic Phase Exit。旧 P5.8 remote macOS machine picker/pairing/receipt UI、真实公网 WSS、
+production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 与 destructive purge 全部保持 post-MVP
+`BLOCKED`。
 P3.10 已由 code/test commit `19622ab` 完成 Task 收口：当时把 Runtime schema 推进到 v7，并新增 authenticated machine-wide
 `admin_commands` ledger，并实现 30 天 retention、容量准入、exact replay/conflict 与 COMMIT-unknown
 收敛；`StageUpgrade` 只有在 exact reply 完整 flush ACK 后才 arm，随后经 active→idle fence、候选
