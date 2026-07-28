@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；R0、R1 complete，R2 pending |
+| 状态 | In execution；R0、R1、R2 complete，R3 pending |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -270,16 +270,17 @@ git status --short --branch
 
 - 四条协议轴列出 Rust owner、Swift mirror、schema、fixture、版本常量。
 - schema 是生成物；E2EE canonical bytes 由 Rust codec 定义，Swift 以互操作 vectors 证明一致。
-- UI 只消费 SessionSource domain model，不 import wire 类型。
+- SessionSource 与登记的 UI 边界不 import 或直接引用 Relay/Runtime/E2EE wire 类型；既有 Runtime
+  adapter/coordinator 不在 R2 迁移 DTO。
 - 版本/schema/mirror 变化必须更新 ownership 并触发完整 parity gate。
 
 ### Tasks
 
-- [ ] R2.1：写 ownership verifier RED tests。
-- [ ] R2.2：生成 current manifest，不改变 wire bytes。
-- [ ] R2.3：增加 UI/domain 静态边界和四 schema parity 门禁。
-- [ ] R2.4：运行 protocol/crypto/Swift focused、schema diff 与双路 review。
-- [ ] R2.5：提交治理工件，读回无协议/DB版本变化。
+- [x] R2.1：写 ownership verifier RED tests。
+- [x] R2.2：生成 current manifest，不改变 wire bytes。
+- [x] R2.3：增加唯一源目录库存、UI/domain 静态边界和四 schema parity 门禁。
+- [x] R2.4：运行 protocol/crypto/Swift focused、schema diff 与双路 review。
+- [x] R2.5：提交治理工件，读回无协议/DB版本变化。
 
 ### Automatic gates
 
@@ -296,6 +297,21 @@ cargo run -q -p agentdeck-cli --locked -- protocol e2ee-schema | diff - protocol
 git diff --check
 scripts/verify-agent-docs.sh
 ```
+
+### Final automatic gate readback（2026-07-28）
+
+- ownership 仓库/隔离正例及 coordinated version、Swift mirror、未登记源、SessionSource 越层、UI wire、
+  generated schema 六个反例全部按预期通过。
+- Rust protocol 为 `251 tests + 4 doctests`，Rust crypto 为 `66 tests + 1 doctest`；Swift focused 为
+  `817 executed / 4 entitlement skipped / 0 failed`，skip 不计入 PASS。
+- local IPC v2、Runtime v5、Relay v2、E2EE v1 四份 schema 的 CLI 生成字节逐一 diff exit 0；相对 R1 HEAD
+  `19d187a` 没有 protocol/crypto/Swift mirror/schema diff，也没有 Runtime DB physical schema 变化。
+- 3-path governance content hash 为
+  `14a0c95b0d9a0cd3e0a5ef102157ab60f4233a21c4328bdec1b8953be1d92588`；完整 7-path name manifest hash 为
+  `d2c1d2adf9e769b57105d89edeb76e2e9cdcc1e519cb91d32f01154feedcdf2e`。
+- `spec/security` 复审收紧未登记源、完整 E2EE owner、协调版本漂移、Package 依赖旁路与注释声明误判；
+  重新冻结后 `spec/security`、`quality/Git` 均 Approved，`P0/P1/P2=0`。R2 没有用户运行/UI 行为变化，
+  真实运行读回是 production ownership verifier 与四个 CLI schema generator。
 
 ### Exit
 
@@ -492,7 +508,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 |---|---|---|---|---|---|---|
 | R0 基线冻结 | complete | code `e400c1c`；本阶段 docs commit | `p4-auto` PASS；Swift 50/50；docs/diff PASS | real daemon + local UDS/RemoteLink PASS | 双路 P0/P1/P2=0 | scoped commit 后 clean |
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
-| R2 协议治理 | pending | — | — | — | — | — |
+| R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | pending | — | — | — | — | — |
 | R4 Simulator E2E | pending | — | — | — | — | — |
 | R5 MVP 收口 | pending | — | — | — | — | — |

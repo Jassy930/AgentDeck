@@ -1564,13 +1564,31 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 
 ## 协议即契约
 
-`agentdeck-protocol` crate 是 IPC 协议的唯一事实源：
+Rust owner 是四条 wire 协议轴的唯一事实源，版本彼此独立：local IPC v2、Runtime v5、Relay v2、
+E2EE v1。前三条类型 owner 位于 `agentdeck-protocol` 对应 namespace；E2EE 的 DTO/canonical TBS 位于
+`agentdeck-protocol::e2ee`，实际 canonical/AEAD/HPKE/signature codec 位于 `agentdeck-crypto`。Swift
+`AgentDeckCore/Protocol`、`AgentDeckRelayClient/Wire` 和 `AgentDeckRelayClient/Crypto` 只作 mirror，通过
+schema、wire fixture 与跨语言 crypto vectors 证明一致，不能成为第二协议事实源。Runtime DB physical schema
+是独立存储轴，不等于 Runtime wire 版本。
 
-- `PROTOCOL_VERSION`：当前为 2（v0.2 起）。
-- `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v2 公共类型。
-- 快照：`protocol/agentdeck/agentdeck-protocol.schema.json`（`UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` 重生成）。
-- 漂移测试随 `cargo test` 运行。
-- 中立性测试（`neutrality_tests.rs`）守护 N1/N4。
+`protocol/agentdeck/protocol-ownership.json` 固定每条轴的版本声明、Rust owner、Swift mirror、schema、fixture
+及内容 hash；`sourceInventoryRoots` 要求协议目录内每个文件恰好归属一个 group。验证器同时实时导出四份
+schema 做 byte parity，并守护以下依赖边界：
+
+- `AgentDeckSessionSource` target 只能依赖 `AgentDeckCore`。
+- 登记的 UI roots、SessionSource 与常见 UI 文件不得 import `AgentDeckRelayClient` 或直接引用
+  Relay/Runtime/E2EE wire DTO。
+- composition/runtime client seam 继续接触 transport 与 Core wire codec；manifest 纳管的 view/controller 与
+  SessionSource 边界只读取 domain/session state。既有 Runtime adapter/coordinator 不在 R2 迁移 DTO。
+
+```bash
+bash scripts/verify-agentdeck-protocol-ownership.sh
+bash scripts/tests/verify-agentdeck-protocol-ownership.sh
+```
+
+local IPC 的 `protocol_schema()` 继续聚合全部 v2 公共类型；四份 schema 快照的重生成命令见
+`protocol/agentdeck/README.md`。标准 Rust 测试继续运行 schema 漂移与 `neutrality_tests.rs` 的 N1/N4
+守护；ownership verifier 额外阻止漏登记文件、owner/mirror/hash 漂移和 UI 越层。
 
 ## 变更指引
 

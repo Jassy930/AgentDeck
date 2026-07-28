@@ -3643,6 +3643,51 @@ identity 和三条协议版本轴；后者核对被删除的三份 master 测试
 二进制、DB、日志、secret 或构建产物进入 manifest。本节随唯一 master-sync merge commit 原子收口；提交后
 读回 clean，R1 complete，且未 push。
 
+## Relay Companion MVP rescue R2 协议所有权门禁
+
+R2 只增加治理工件，不迁移 DTO/Protobuf、不修改 wire bytes，也不提升协议或 Runtime DB physical schema。
+冻结值为 local IPC v2、Runtime v5、Relay v2、E2EE v1。机器事实源是
+`protocol/agentdeck/protocol-ownership.json`；它列出每条轴的 Rust owner、Swift mirror、schema、fixture、
+版本声明与内容 hash，并以固定 `sourceInventoryRoots` 保证协议目录内没有未登记或重复归属的源文件。
+
+RED 首次读回为缺少 production verifier；补齐后第一次仓库验证暴露 `Package.swift` 同名 product/target 的
+定位误报，已收紧为具体 target 依赖数组。随后的对抗性检查又发现“已登记文件漂移可失败，但新增未登记
+DTO 可漏过”和 E2EE codec owner 覆盖不足，现已把 `agentdeck-crypto` production source/test、完整 Swift
+Crypto mirror 与协议目录库存纳入唯一归属门禁。隔离 verifier tests 必须覆盖：正例、版本漂移、Swift mirror
+漂移、未登记协议源、SessionSource 越层、UI wire 泄漏、生成 schema 漂移。
+
+R2 收口命令：
+
+```bash
+bash scripts/tests/verify-agentdeck-protocol-ownership.sh
+bash scripts/verify-agentdeck-protocol-ownership.sh
+cargo test -p agentdeck-protocol --locked
+cargo test -p agentdeck-crypto --locked
+swift test --filter 'Runtime|Relay|Crypto|Wire|SessionSource'
+cargo run -q -p agentdeck-cli --locked -- protocol schema | diff - protocol/agentdeck/agentdeck-protocol.schema.json
+cargo run -q -p agentdeck-cli --locked -- protocol runtime-schema | diff - protocol/agentdeck/runtime-protocol.schema.json
+cargo run -q -p agentdeck-cli --locked -- protocol relay-schema | diff - protocol/agentdeck/relay-v2.schema.json
+cargo run -q -p agentdeck-cli --locked -- protocol e2ee-schema | diff - protocol/agentdeck/e2ee-v1.schema.json
+git diff --check
+scripts/verify-agent-docs.sh
+```
+
+只有上述门禁全绿、R1 的四份 schema bytes 与版本声明无变化、同一治理 candidate 的 `spec/security` 与
+`quality/Git` 复审均无 P0/P1/P2、精确提交后工作树 clean，R2 才可标记 complete。
+
+2026-07-28 final readback：ownership 仓库正例、隔离正例及 coordinated version、Swift mirror、未登记源、
+SessionSource 越层、UI wire、generated schema 六个反例全部按预期通过；protocol 为 `251 tests + 4
+doctests`，crypto 为 `66 tests + 1 doctest`，Swift focused 为 `817 executed / 4 entitlement skipped / 0
+failed`。四份 schema byte diff、agent docs、Bash syntax 与 `git diff --check` 均 exit 0；skip 未计入 PASS。
+相对 R1 HEAD `19d187a` 没有 protocol/crypto/Swift mirror/schema diff，版本仍为 `2/5/2/1`。
+
+最终治理工件为 3 个路径，按 `path + file SHA-256` 聚合的 content hash 是
+`14a0c95b0d9a0cd3e0a5ef102157ab60f4233a21c4328bdec1b8953be1d92588`；完整 7-path name manifest hash 是
+`d2c1d2adf9e769b57105d89edeb76e2e9cdcc1e519cb91d32f01154feedcdf2e`。`spec/security` 首轮发现并修复
+未登记新源、E2EE owner 覆盖、协调版本漂移、依赖数组旁路与注释声明误判，重新冻结后
+`spec/security`、`quality/Git` 均 Approved，`P0/P1/P2=0`。本阶段无用户运行/UI 行为变化，运行读回由真实
+ownership verifier 与四个 CLI schema generator 完成。
+
 ## AppKit 重写后的验证清单
 
 前端已完成 SwiftUI→AppKit 全量重写（Tasks 1–12）。以下验证项应在每次涉及前端改动后运行，也是里程碑收口的最低门控。

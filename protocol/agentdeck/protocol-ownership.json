@@ -1,0 +1,263 @@
+{
+  "schemaVersion": 1,
+  "sourceInventoryRoots": [
+    "Sources/AgentDeckCore/Protocol",
+    "Sources/AgentDeckRelayClient/Crypto",
+    "Sources/AgentDeckRelayClient/Wire",
+    "agentdeck-crypto/src",
+    "agentdeck-crypto/tests",
+    "agentdeck-protocol/src",
+    "protocol/agentdeck/fixtures"
+  ],
+  "axes": {
+    "e2ee": {
+      "version": {
+        "path": "agentdeck-protocol/src/e2ee/mod.rs",
+        "symbol": "E2EE_FORMAT_VERSION",
+        "value": 1,
+        "declaration": "pub const E2EE_FORMAT_VERSION: u16 = 1;"
+      },
+      "rust": {
+        "paths": [
+          "agentdeck-crypto/Cargo.toml",
+          "agentdeck-crypto/src/aead.rs",
+          "agentdeck-crypto/src/canonical.rs",
+          "agentdeck-crypto/src/counter.rs",
+          "agentdeck-crypto/src/error.rs",
+          "agentdeck-crypto/src/hpke.rs",
+          "agentdeck-crypto/src/key_directory.rs",
+          "agentdeck-crypto/src/key_recovery.rs",
+          "agentdeck-crypto/src/key_update.rs",
+          "agentdeck-crypto/src/lib.rs",
+          "agentdeck-crypto/src/pairing.rs",
+          "agentdeck-crypto/src/replay.rs",
+          "agentdeck-crypto/src/sealed_blob.rs",
+          "agentdeck-crypto/src/signature.rs",
+          "agentdeck-crypto/tests/counter_recovery.rs",
+          "agentdeck-crypto/tests/golden_vectors.rs",
+          "agentdeck-crypto/tests/key_directory_crypto.rs",
+          "agentdeck-crypto/tests/key_recovery.rs",
+          "agentdeck-crypto/tests/key_update_signature.rs",
+          "agentdeck-crypto/tests/nonce_prefix_derivation.rs",
+          "agentdeck-crypto/tests/pairing_v1_crypto.rs",
+          "agentdeck-crypto/tests/relay_admin_purge_receipt.rs",
+          "agentdeck-crypto/tests/replay_window.rs",
+          "agentdeck-protocol/src/e2ee/context.rs",
+          "agentdeck-protocol/src/e2ee/key_control.rs",
+          "agentdeck-protocol/src/e2ee/key_recovery.rs",
+          "agentdeck-protocol/src/e2ee/keys.rs",
+          "agentdeck-protocol/src/e2ee/mod.rs",
+          "agentdeck-protocol/src/e2ee/pairing.rs",
+          "agentdeck-protocol/src/e2ee/pairing_control.rs",
+          "agentdeck-protocol/src/e2ee/pairing_response.rs",
+          "agentdeck-protocol/src/e2ee/payload.rs",
+          "agentdeck-protocol/src/e2ee/schema.rs",
+          "agentdeck-protocol/src/e2ee/tbs.rs"
+        ],
+        "contentSha256": "b0f7ab6d5de5b47071824883f3bfaf73b1d46d9c0bb397946523c95b248dc54f"
+      },
+      "swift": {
+        "paths": [
+          "Sources/AgentDeckRelayClient/Crypto/CanonicalCodec.swift",
+          "Sources/AgentDeckRelayClient/Crypto/CounterAllocator.swift",
+          "Sources/AgentDeckRelayClient/Crypto/DeviceRequestSigner.swift",
+          "Sources/AgentDeckRelayClient/Crypto/KeyControlCodec.swift",
+          "Sources/AgentDeckRelayClient/Crypto/KeyDirectoryVerifier.swift",
+          "Sources/AgentDeckRelayClient/Crypto/KeyLifecycleProofs.swift",
+          "Sources/AgentDeckRelayClient/Crypto/KeyUpdateSetVerifier.swift",
+          "Sources/AgentDeckRelayClient/Crypto/MachineDataVerifier.swift",
+          "Sources/AgentDeckRelayClient/Crypto/MachineTerminalVerifier.swift",
+          "Sources/AgentDeckRelayClient/Crypto/PairRequestCrypto.swift",
+          "Sources/AgentDeckRelayClient/Crypto/PairResponseCrypto.swift",
+          "Sources/AgentDeckRelayClient/Crypto/PairTerminalVerifier.swift",
+          "Sources/AgentDeckRelayClient/Crypto/RelayCredentials.swift",
+          "Sources/AgentDeckRelayClient/Crypto/RelayCrypto.swift",
+          "Sources/AgentDeckRelayClient/Crypto/ReplayWindow.swift"
+        ],
+        "contentSha256": "80b4ce2d011a9b285f063dea95d2520890125db83ccc99fa9d6be3b7c1b986bb"
+      },
+      "schema": {
+        "path": "protocol/agentdeck/e2ee-v1.schema.json",
+        "sha256": "e55fa9796f36e760545451d9cb3be72131449e316977d8d1dca5cb68a8d8c748"
+      },
+      "fixtures": {
+        "paths": [
+          "protocol/agentdeck/crypto-vectors-v1.json"
+        ],
+        "contentSha256": "8a2339f3e81226bb986d1e575d2fd307480d716722d76e6362309e6b3a6405a0"
+      },
+      "schemaCommand": "e2ee-schema"
+    },
+    "localIpc": {
+      "version": {
+        "path": "agentdeck-protocol/src/lib.rs",
+        "symbol": "PROTOCOL_VERSION",
+        "value": 2,
+        "declaration": "pub const PROTOCOL_VERSION: u32 = 2;"
+      },
+      "rust": {
+        "paths": [
+          "agentdeck-protocol/src/capabilities.rs",
+          "agentdeck-protocol/src/lib.rs",
+          "agentdeck-protocol/src/neutrality_tests.rs",
+          "agentdeck-protocol/src/transport.rs",
+          "agentdeck-protocol/src/trunk.rs",
+          "agentdeck-protocol/src/vendor/claude_code.rs",
+          "agentdeck-protocol/src/vendor/codex.rs",
+          "agentdeck-protocol/src/vendor/mod.rs"
+        ],
+        "contentSha256": "0cd042a31cfb505e61b22cb87b67ab9c8478fc772c176d7457ad64a895136533"
+      },
+      "swift": {
+        "paths": [
+          "Sources/AgentDeckCore/Protocol/V2Types.swift"
+        ],
+        "contentSha256": "1352f6479f954e8505816d54f4e6218be7f0e10f78867161d6e36533a6ff695e"
+      },
+      "schema": {
+        "path": "protocol/agentdeck/agentdeck-protocol.schema.json",
+        "sha256": "5d94c180c685593b6b63514255c48ea2faecc88366fbeae118e9babc3b568b71"
+      },
+      "fixtures": {
+        "paths": [],
+        "contentSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "schemaCommand": "schema"
+    },
+    "relay": {
+      "version": {
+        "path": "agentdeck-protocol/src/relay_v2/mod.rs",
+        "symbol": "RELAY_PROTOCOL_VERSION",
+        "value": 2,
+        "declaration": "pub const RELAY_PROTOCOL_VERSION: u16 = 2;"
+      },
+      "rust": {
+        "paths": [
+          "agentdeck-protocol/src/relay_v2/admin_receipt.rs",
+          "agentdeck-protocol/src/relay_v2/auth.rs",
+          "agentdeck-protocol/src/relay_v2/codec.rs",
+          "agentdeck-protocol/src/relay_v2/cursor.rs",
+          "agentdeck-protocol/src/relay_v2/enrollment.rs",
+          "agentdeck-protocol/src/relay_v2/failure.rs",
+          "agentdeck-protocol/src/relay_v2/frame.rs",
+          "agentdeck-protocol/src/relay_v2/id.rs",
+          "agentdeck-protocol/src/relay_v2/mod.rs",
+          "agentdeck-protocol/src/relay_v2/schema.rs"
+        ],
+        "contentSha256": "8b8be6309a3b980ee23ad0b7f87f19980795cec409234d111a2974a8e1918144"
+      },
+      "swift": {
+        "paths": [
+          "Sources/AgentDeckRelayClient/Wire/RelayV2Types.swift"
+        ],
+        "contentSha256": "90c90601b95a118c98c520eb84420ccccb370a61b94bc6a3142004f56bdf75b4"
+      },
+      "schema": {
+        "path": "protocol/agentdeck/relay-v2.schema.json",
+        "sha256": "77de0d4dab67712a97d20b4bf6d773d73bf0fc62381c3ce0f713ed03016c96df"
+      },
+      "fixtures": {
+        "paths": [
+          "protocol/agentdeck/fixtures/relay-v2-wire-vectors.json"
+        ],
+        "contentSha256": "bf66f8ea1001d99f4ffd8553b43e9b8e8e7719c673f6a09fcda84d52ebb4acf0"
+      },
+      "schemaCommand": "relay-schema"
+    },
+    "runtime": {
+      "version": {
+        "path": "agentdeck-protocol/src/runtime/mod.rs",
+        "symbol": "RUNTIME_PROTOCOL_VERSION",
+        "value": 5,
+        "declaration": "pub const RUNTIME_PROTOCOL_VERSION: u16 = 5;"
+      },
+      "rust": {
+        "paths": [
+          "agentdeck-protocol/src/runtime/catalog.rs",
+          "agentdeck-protocol/src/runtime/command.rs",
+          "agentdeck-protocol/src/runtime/configuration.rs",
+          "agentdeck-protocol/src/runtime/durable_transfer.rs",
+          "agentdeck-protocol/src/runtime/envelope.rs",
+          "agentdeck-protocol/src/runtime/event.rs",
+          "agentdeck-protocol/src/runtime/failure.rs",
+          "agentdeck-protocol/src/runtime/identity.rs",
+          "agentdeck-protocol/src/runtime/metadata.rs",
+          "agentdeck-protocol/src/runtime/mod.rs",
+          "agentdeck-protocol/src/runtime/receipt.rs",
+          "agentdeck-protocol/src/runtime/schema.rs",
+          "agentdeck-protocol/src/runtime/sync.rs",
+          "agentdeck-protocol/src/runtime/transfer.rs",
+          "agentdeck-protocol/src/runtime/upgrade.rs"
+        ],
+        "contentSha256": "eaa475fa58833afe3f3be97baf7fe758f336ce55b61d355bd6b950e44214ff0c"
+      },
+      "swift": {
+        "paths": [
+          "Sources/AgentDeckCore/Protocol/RuntimeV2StreamTypes.swift",
+          "Sources/AgentDeckCore/Protocol/RuntimeV2Types.swift",
+          "Sources/AgentDeckCore/Protocol/RuntimeV2WireCodec.swift",
+          "Sources/AgentDeckCore/Protocol/RuntimeWireTypes.swift"
+        ],
+        "contentSha256": "dc0fdfc5581a6abdb707a994530ce6b69bcae0b440f33a8b7c099bce5fdd4874"
+      },
+      "schema": {
+        "path": "protocol/agentdeck/runtime-protocol.schema.json",
+        "sha256": "31e563f8b9795b9cd5502382deb83d2010eeb3e42d117a48e74d46523b105ba1"
+      },
+      "fixtures": {
+        "paths": [
+          "protocol/agentdeck/fixtures/runtime-v1-wire.jsonl",
+          "protocol/agentdeck/fixtures/runtime-v2-wire.jsonl",
+          "protocol/agentdeck/fixtures/runtime-v3-wire.jsonl",
+          "protocol/agentdeck/fixtures/runtime-v4-wire.jsonl",
+          "protocol/agentdeck/fixtures/runtime-v5-wire.jsonl"
+        ],
+        "contentSha256": "1922f0f8efe518b99800328962a774aeb82613411036bbc54eefab02a36cc16f"
+      },
+      "schemaCommand": "runtime-schema"
+    }
+  },
+  "boundaries": {
+    "packageManifest": "Package.swift",
+    "sessionSourceRoot": "Sources/AgentDeckSessionSource",
+    "ui": {
+      "sourceRoot": "Sources/AgentDeck",
+      "roots": [
+        "Sources/AgentDeck/agent",
+        "Sources/AgentDeck/capability",
+        "Sources/AgentDeck/common",
+        "Sources/AgentDeck/session"
+      ],
+      "rootFileSuffixes": [
+        "Badge.swift",
+        "Chrome.swift",
+        "Controller.swift",
+        "Dialog.swift",
+        "Form.swift",
+        "Panel.swift",
+        "Picker.swift",
+        "Presentation.swift",
+        "RowFactory.swift",
+        "View.swift",
+        "ViewController.swift"
+      ],
+      "forbiddenImports": [
+        "AgentDeckRelayClient"
+      ],
+      "forbiddenWirePatterns": [
+        {
+          "id": "e2ee-wire",
+          "regex": "\\b(?:E2EE|OuterContextV1|SealedPayloadKind|SignedSealedBlobWireV1)\\b"
+        },
+        {
+          "id": "relay-wire",
+          "regex": "\\bRelayV2[A-Za-z0-9_]*\\b"
+        },
+        {
+          "id": "runtime-wire",
+          "regex": "\\bRuntime(?:Request|Reply|Envelope|StreamItem|TransferCarrier|WireCodec)V?[0-9]*\\b"
+        }
+      ]
+    }
+  }
+}

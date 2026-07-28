@@ -12,6 +12,36 @@
 | Relay v2（endpoint ⇄ relay 外层可见字段） | `agentdeck_protocol::relay_v2::RELAY_PROTOCOL_VERSION` = 2 | `relay-v2.schema.json` | `agentdeck_protocol::relay_v2::relay_v2_schema()` | `agentdeck protocol relay-schema` | `UPDATE_RELAY_SCHEMA=1 cargo test -p agentdeck-protocol relay_v2_schema_matches_committed_snapshot` |
 | E2EE（endpoint 侧密文/签名契约） | `agentdeck_protocol::e2ee::E2EE_FORMAT_VERSION` = 1 | `e2ee-v1.schema.json` | `agentdeck_protocol::e2ee::e2ee_schema()` | `agentdeck protocol e2ee-schema` | `UPDATE_E2EE_SCHEMA=1 cargo test -p agentdeck-protocol e2ee_schema_matches_committed_snapshot` |
 
+## 协议所有权 manifest
+
+`protocol-ownership.json` 是四条版本轴的机器可读所有权清单。Rust 类型/codec 是 wire
+事实源；Swift 文件是显式 mirror，不是第二份可独立演进的协议；schema 与 fixture 也是各自版本轴的
+受控产物。每组文件按路径排序，并以
+`SHA256(path + "\\t" + SHA256(file bytes) + "\\n")` 聚合为 `contentSha256`。
+
+`sourceInventoryRoots` 冻结全部协议源目录。目录内每个普通文件必须恰好归属一个 Rust、Swift 或
+fixture group；新增未登记文件、重复归属、删除 owner、改写版本声明或修改已登记内容都会失败。manifest
+还固定四份 schema 的单文件 hash，并逐字节比较 CLI 实时生成结果，避免只更新 hash 而漏掉生成事实源。
+
+```bash
+bash scripts/verify-agentdeck-protocol-ownership.sh
+bash scripts/tests/verify-agentdeck-protocol-ownership.sh
+```
+
+第二条命令在隔离 fixture 中验证正例，并覆盖版本漂移、Swift mirror 漂移、未登记协议源、
+`AgentDeckSessionSource` 越层依赖、UI wire 泄漏和生成 schema 漂移等反例。边界规则固定为：
+
+- `AgentDeckSessionSource` Swift target 只能依赖 `AgentDeckCore`，不能依赖 `AgentDeckRelayClient`。
+- manifest 登记的 UI roots、SessionSource 全部源文件和常见 UI 后缀文件不得 import
+  `AgentDeckRelayClient`，也不得直接引用 Relay v2、Runtime 或 E2EE wire DTO。
+- App 的 composition/runtime client seam 仍可组装 Relay client 并调用 Core wire codec；manifest 纳管的
+  view/controller 与 SessionSource 边界只接收 domain/session state。既有 Runtime adapter/coordinator 不在
+  R2 做 DTO 迁移，也不得扩张成第二协议 owner。
+
+Relay rescue 期间四条版本轴冻结为表中值，禁止通过修改 manifest 放行 wire 变化。rescue 之后若确需改
+wire，必须先对单独版本轴做升版决策，再同步 Rust owner、Swift mirror、fixture、schema、manifest 和本节，
+最后运行 ownership、protocol/crypto/Swift focused 与四份 schema parity 门禁。
+
 Runtime v3 曾在 v2 中立契约上增加 P4.2 本机 machine enrollment/status/trust-reset 管理面；
 Runtime v4 又 additive 增加 P4.3 PairInvite、pending pairing、confirm/cancel 与 exact device revoke 的
 local-only administration。current Runtime v5 为 Catalog snapshot 增加 required-null
