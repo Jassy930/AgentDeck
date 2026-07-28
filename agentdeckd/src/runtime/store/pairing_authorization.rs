@@ -272,6 +272,34 @@ impl RemoteReplyAuthorization {
             reply_key_epoch: u64::from(marker).max(1),
         }
     }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_snapshot_permit_test(
+        machine_trust_domain: [u8; 32],
+        machine_route: MachineRouteId,
+        trust_epoch: TrustEpoch,
+        device_route: DeviceRouteId,
+        grant_serial: GrantSerial,
+        device_sign_fingerprint: [u8; 32],
+        authorization_hash: [u8; 32],
+        device_hpke_public_key: [u8; 32],
+        key_directory_revision: KeyDirectoryRevision,
+        reply_key_epoch: u64,
+    ) -> Self {
+        Self {
+            machine_trust_domain,
+            machine_route,
+            trust_epoch,
+            device_route,
+            grant_serial,
+            device_sign_fingerprint,
+            authorization_hash,
+            device_hpke_public_key,
+            key_directory_revision,
+            reply_key_epoch,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -318,6 +346,17 @@ impl CurrentRemoteAuthorizationProof {
 
     pub(crate) fn remote_reply_authorization(&self) -> RemoteReplyAuthorization {
         self.active.remote_reply_authorization()
+    }
+
+    /// 构造“全目录 metadata token 已推进，设备稳定授权轴未变”的旧
+    /// proof，仅供 transition snapshot permit 回归。调用前必须释放其他
+    /// `ActiveRemoteIngressProof` clone，避免测试隔空改写共享 capability。
+    #[cfg(test)]
+    pub(crate) fn with_stale_directory_metadata_token_for_test(mut self) -> Self {
+        let material = Arc::get_mut(&mut self.active.material)
+            .expect("snapshot permit fixture owns the only Active authorization proof");
+        material.directory_metadata_token[0] ^= 0xff;
+        self
     }
 }
 

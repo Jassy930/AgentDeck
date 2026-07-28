@@ -1144,7 +1144,7 @@ actor MachineRequestCorrelationOwner {
     runtimeGeneration: RuntimeStreamGeneration,
     syncCut: SubscriptionSyncCut
   ) -> Bool {
-    guard canonicalUUIDBytes(runtimeGeneration) == binding.streamGeneration,
+    guard canonicalUUIDBytes(runtimeGeneration)?.contains(where: { $0 != 0 }) == true,
       syncCut.streamGeneration == runtimeGeneration,
       runtimeCursor(binding.streamCursor) == syncCut.streamCursor,
       binding.keyDirectoryRevision == syncCut.keyDirectoryRevision
@@ -1199,8 +1199,9 @@ actor MachineRequestCorrelationOwner {
     }
   }
 
-  /// Mirrors daemon `canonical_uuid_matches`: accepted IDs must be lowercase canonical
-  /// hyphenated UUID strings and must map byte-for-byte to the outer generation.
+  /// Runtime subscription generation 与 Relay publication generation 是独立轴。这里仅
+  /// 认证前者为非零、lowercase canonical UUID；outer generation 由 durable
+  /// StreamBinding 自身及后续 Relay frame correlation 约束。
   private static func canonicalUUIDBytes(
     _ generation: RuntimeStreamGeneration
   ) -> Data? {

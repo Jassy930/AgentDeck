@@ -108,6 +108,13 @@ enum MachineConnectionVerifiedIngressOutcome: Sendable {
   case relayUnavailable
 }
 
+private enum MachineConnectionPostDrainAction: Sendable {
+  case keySyncSucceeded(
+    acceptedRevision: UInt64,
+    recoveryTargets: [VerifiedRuntimeTarget]
+  )
+}
+
 /// post-auth generation 的唯一 raw-frame consumer seam。
 ///
 /// production 实现必须在 `receive` 内调用 `MachineInboundPipeline`（或处理经过同等
@@ -396,6 +403,7 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
   private var activeTransport: (any MachineConnectionTransport)?
   private var activeGeneration: RelayTransportGeneration?
   private var activeScope: TransferAssemblyScope?
+  private var businessReadyScope: TransferAssemblyScope?
   private var keySyncDeadlineTask: Task<Void, Never>?
   private var keySyncDeadlineScope: TransferAssemblyScope?
   private var keySyncDeadlineToken: UUID?
@@ -552,6 +560,13 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
 
   func currentConnectionState() -> SessionConnectionState {
     stateMachine.connectionState
+  }
+
+  func readinessSnapshot() -> MachineConnectionReadinessSnapshot {
+    MachineConnectionReadinessSnapshot(
+      connectionScope: activeScope,
+      readyScope: businessReadyScope
+    )
   }
 
   func debugPendingUpdateSendCount() async -> Int {
@@ -752,6 +767,7 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
         activeTransport = transport
         activeGeneration = generation
         activeScope = scope
+        businessReadyScope = nil
 
         let incoming = await transport.incomingFrames(on: generation)
         let heartbeat = try await Self.authenticate(
@@ -773,6 +789,7 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
         }
         let resumedKeySync = try await verifiedIngress.keySyncEpisodeStatus(scope: scope)
         try await synchronizeKeySyncDeadline(scope: scope)
+        await publishConnectionScope(scope)
         await handle(.connected(generation: generation))
         if let resumedKeySync {
           await handle(
@@ -783,6 +800,8 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
           guard !stateMachine.shouldFinishObservations else {
             throw MachineConnectionSupervisorFailure.terminalAlreadyPublished
           }
+        } else {
+          await publishBusinessReady(scope)
         }
         reconnectAttempt = 0
         try await readAuthenticatedFrames(
@@ -936,9 +955,18 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
       case .publish, .reply, .gap, .replayComplete, .routeAccepted, .error,
         .revocationCommitted, .retirementCommitted, .ack:
         let outcome = try await verifiedIngress.receive(frame, scope: scope)
-        try await apply(outcome, generation: generation)
+        let postDrain = try await apply(
+          outcome,
+          generation: generation,
+          scope: scope
+        )
         try await synchronizeKeySyncDeadline(scope: scope)
         try await drainIngressTransportActions(
+          generation: generation,
+          scope: scope
+        )
+        try await completePostDrainAction(
+          postDrain,
           generation: generation,
           scope: scope
         )
@@ -953,11 +981,12 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
 
   private func apply(
     _ outcome: MachineConnectionVerifiedIngressOutcome,
-    generation: RelayTransportGeneration
-  ) async throws {
+    generation: RelayTransportGeneration,
+    scope: TransferAssemblyScope
+  ) async throws -> MachineConnectionPostDrainAction? {
     switch outcome {
     case .ignored:
-      return
+      return nil
     case .delivery(let delivery):
       switch delivery.target {
       case .request:
@@ -976,31 +1005,30 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
       try await sendIngressTransportActions(
         frames,
         generation: generation,
-        scope: activeScope
+        scope: scope
       )
+      return nil
     case .streamRecoveryRequired(let target, let reason):
       try await publishStreamRecovery(target: target, reason: reason)
+      return nil
     case .keySyncRequired(let observedRevision):
       await handle(.keySyncRequired(observedRevision: observedRevision))
       guard !stateMachine.shouldFinishObservations else {
         throw MachineConnectionSupervisorFailure.terminalAlreadyPublished
       }
+      return nil
     case .keySyncAttemptFailed(let observedRevision):
       await handle(.keySyncAttemptFailed(observedRevision: observedRevision))
       if stateMachine.shouldFinishObservations {
         throw MachineConnectionSupervisorFailure.terminalAlreadyPublished
       }
+      return nil
     case .keySyncSucceeded(let acceptedRevision, let recoveryTargets):
-      cancelKeySyncDeadline(scope: activeScope)
-      await handle(
-        .keySyncSucceeded(
-          generation: generation,
-          acceptedRevision: acceptedRevision
-        )
+      cancelKeySyncDeadline(scope: scope)
+      return .keySyncSucceeded(
+        acceptedRevision: acceptedRevision,
+        recoveryTargets: recoveryTargets
       )
-      for target in recoveryTargets {
-        try await publishStreamRecovery(target: target, reason: .snapshotRequired)
-      }
     case .revoked:
       throw MachineConnectionSupervisorFailure.revoked
     case .incompatible:
@@ -1011,6 +1039,39 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
       throw MachineConnectionSupervisorFailure.machineOffline
     case .relayUnavailable:
       throw MachineConnectionSupervisorFailure.relayUnavailable
+    }
+    return nil
+  }
+
+  private func completePostDrainAction(
+    _ action: MachineConnectionPostDrainAction?,
+    generation: RelayTransportGeneration,
+    scope: TransferAssemblyScope
+  ) async throws {
+    guard let action else { return }
+    guard activeGeneration == generation, activeScope == scope else {
+      throw MachineConnectionSupervisorFailure.transport(.staleGeneration)
+    }
+    switch action {
+    case .keySyncSucceeded(let acceptedRevision, let recoveryTargets):
+      await handle(
+        .keySyncSucceeded(
+          generation: generation,
+          acceptedRevision: acceptedRevision
+        )
+      )
+      guard !stateMachine.shouldFinishObservations,
+        activeGeneration == generation,
+        activeScope == scope
+      else {
+        throw MachineConnectionSupervisorFailure.terminalAlreadyPublished
+      }
+      // 先把所有 target 标为需要 snapshot，再发布同 scope ready。Source 因此只会
+      // 为每个 target 发一次 fresh Subscribe，且不会让 partial barrier 触发抢跑。
+      for target in recoveryTargets {
+        try await publishStreamRecovery(target: target, reason: .snapshotRequired)
+      }
+      await publishBusinessReady(scope)
     }
   }
 
@@ -1029,6 +1090,20 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
     case .producerInvariantViolation:
       await failClosedIfProducerInvariantBroke(result)
       throw MachineConnectionSupervisorFailure.terminalAlreadyPublished
+    }
+  }
+
+  private func publishConnectionScope(_ scope: TransferAssemblyScope?) async {
+    let result = await updateChannel.send(.connectionScope(scope))
+    await failClosedIfProducerInvariantBroke(result)
+  }
+
+  private func publishBusinessReady(_ scope: TransferAssemblyScope) async {
+    guard activeScope == scope, activeGeneration == scope.generation else { return }
+    let result = await updateChannel.send(.businessReady(scope))
+    await failClosedIfProducerInvariantBroke(result)
+    if result == .sent, activeScope == scope, activeGeneration == scope.generation {
+      businessReadyScope = scope
     }
   }
 
@@ -1370,6 +1445,8 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
     activeTransport = nil
     activeGeneration = nil
     activeScope = nil
+    businessReadyScope = nil
+    await publishConnectionScope(nil)
 
     if !deadlineAlreadyForcedClose {
       do {

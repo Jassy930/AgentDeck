@@ -437,6 +437,225 @@ final class KeyUpdateSetVerifierTests: XCTestCase {
     }
   }
 
+  func testBootstrapEpochZeroRebuildsFullRosterAndAdvancesIndependentSlots() throws {
+    let bootstrap = try makeBootstrapEpochZeroFixture()
+    var state = bootstrap.initialState
+
+    for barrier in bootstrap.barriers {
+      state = try bootstrap.crypto.setVerifier.prepareBootstrapEpochBarrier(
+        state: state,
+        barrier: barrier,
+        expectedConversationRoutes: bootstrap.expectedConversationRoutes
+      )
+    }
+
+    XCTAssertEqual(
+      state.stateRevision,
+      bootstrap.initialState.stateRevision + UInt64(bootstrap.barriers.count)
+    )
+    XCTAssertEqual(state.keyLifecycle?.slots.count, 5)
+    XCTAssertEqual(
+      state.keyLifecycle?.slot(purpose: .catalog, streamRoute: nil)?.current?.activationProof,
+      bootstrap.barriers[0]
+    )
+    for (route, barrier) in zip(
+      bootstrap.expectedConversationRoutes, bootstrap.barriers.dropFirst())
+    {
+      let slot = try XCTUnwrap(
+        state.keyLifecycle?.slot(purpose: .conversationDEK, streamRoute: route)
+      )
+      XCTAssertEqual(slot.current?.activationProof, barrier)
+      XCTAssertNil(slot.staged)
+      XCTAssertTrue(slot.retired.isEmpty)
+    }
+    XCTAssertNil(
+      state.keyLifecycle?.slot(purpose: .deviceCommandTx, streamRoute: nil)?.current?
+        .activationProof
+    )
+    XCTAssertNil(
+      state.keyLifecycle?.slot(purpose: .deviceReplyTx, streamRoute: nil)?.current?
+        .activationProof
+    )
+    XCTAssertFalse(state.replayStates.contains { $0.scope.keyID.epoch == 0 })
+    XCTAssertTrue(state.keyLifecycle?.slots.allSatisfy { $0.retired.isEmpty } == true)
+
+    let basis = try state.auditingKeyLifecycleAcknowledgementBasis()
+    XCTAssertEqual(basis.epochBarriers, bootstrap.barriers)
+    XCTAssertNil(basis.directoryAdvance)
+    _ = try bootstrap.crypto.setVerifier.auditColdOpen(
+      state: state,
+      expectedConversationRoutes: bootstrap.expectedConversationRoutes
+    )
+
+    XCTAssertThrowsError(
+      try bootstrap.crypto.setVerifier.prepareBootstrapEpochBarrier(
+        state: state,
+        barrier: bootstrap.barriers[0],
+        expectedConversationRoutes: bootstrap.expectedConversationRoutes
+      )
+    ) { error in
+      XCTAssertEqual(error as? DeviceKeyLifecycleError, .invalidBarrier)
+    }
+  }
+
+  func testBootstrapEpochZeroRejectsEveryRouteCursorSlotAndRevisionMismatch() throws {
+    let bootstrap = try makeBootstrapEpochZeroFixture()
+    let catalog = bootstrap.barriers[0]
+    let mismatches = try [
+      DeviceEpochBarrierV1(
+        streamRoute: Data(repeating: 0xD1, count: 16),
+        streamGeneration: catalog.streamGeneration,
+        streamCursor: catalog.streamCursor,
+        innerCursor: catalog.innerCursor,
+        oldEpoch: 0,
+        newEpoch: 1,
+        keyDirectoryRevision: catalog.keyDirectoryRevision
+      ),
+      DeviceEpochBarrierV1(
+        streamRoute: catalog.streamRoute,
+        streamGeneration: Data(repeating: 0xD2, count: 16),
+        streamCursor: catalog.streamCursor,
+        innerCursor: catalog.innerCursor,
+        oldEpoch: 0,
+        newEpoch: 1,
+        keyDirectoryRevision: catalog.keyDirectoryRevision
+      ),
+      DeviceEpochBarrierV1(
+        streamRoute: catalog.streamRoute,
+        streamGeneration: catalog.streamGeneration,
+        streamCursor: .at(1),
+        innerCursor: catalog.innerCursor,
+        oldEpoch: 0,
+        newEpoch: 1,
+        keyDirectoryRevision: catalog.keyDirectoryRevision
+      ),
+      DeviceEpochBarrierV1(
+        streamRoute: catalog.streamRoute,
+        streamGeneration: catalog.streamGeneration,
+        streamCursor: catalog.streamCursor,
+        innerCursor: .catalog(.at(1)),
+        oldEpoch: 0,
+        newEpoch: 1,
+        keyDirectoryRevision: catalog.keyDirectoryRevision
+      ),
+      DeviceEpochBarrierV1(
+        streamRoute: catalog.streamRoute,
+        streamGeneration: catalog.streamGeneration,
+        streamCursor: catalog.streamCursor,
+        innerCursor: .conversation(id: "wrong-slot", cursor: .beforeFirst),
+        oldEpoch: 0,
+        newEpoch: 1,
+        keyDirectoryRevision: catalog.keyDirectoryRevision
+      ),
+      DeviceEpochBarrierV1(
+        streamRoute: catalog.streamRoute,
+        streamGeneration: catalog.streamGeneration,
+        streamCursor: catalog.streamCursor,
+        innerCursor: catalog.innerCursor,
+        oldEpoch: 0,
+        newEpoch: 1,
+        keyDirectoryRevision: catalog.keyDirectoryRevision + 1
+      ),
+      DeviceEpochBarrierV1(
+        streamRoute: catalog.streamRoute,
+        streamGeneration: catalog.streamGeneration,
+        streamCursor: catalog.streamCursor,
+        innerCursor: catalog.innerCursor,
+        oldEpoch: 1,
+        newEpoch: 2,
+        keyDirectoryRevision: catalog.keyDirectoryRevision
+      ),
+    ]
+
+    for mismatch in mismatches {
+      XCTAssertThrowsError(
+        try bootstrap.crypto.setVerifier.prepareBootstrapEpochBarrier(
+          state: bootstrap.initialState,
+          barrier: mismatch,
+          expectedConversationRoutes: bootstrap.expectedConversationRoutes
+        )
+      ) { error in
+        XCTAssertEqual(error as? DeviceKeyLifecycleError, .invalidBarrier)
+      }
+    }
+    XCTAssertThrowsError(
+      try bootstrap.crypto.setVerifier.prepareBootstrapEpochBarrier(
+        state: bootstrap.initialState,
+        barrier: catalog,
+        expectedConversationRoutes: [bootstrap.expectedConversationRoutes[0]]
+      )
+    ) { error in
+      XCTAssertEqual(
+        error as? DeviceKeyLifecycleError,
+        .invalidRoster,
+        "unexpected error: \(String(reflecting: error))"
+      )
+    }
+  }
+
+  func testStoredCarrierRejectsActivationProofForWrongPurposeRouteOrSource() throws {
+    let bootstrap = try makeBootstrapEpochZeroFixture()
+    let catalogBarrier = bootstrap.barriers[0]
+    let conversationBarrier = bootstrap.barriers[1]
+    let catalogEntry = try XCTUnwrap(
+      bootstrap.initialState.keyDirectory.entries.first(where: {
+        $0.keyID.purpose == .catalog
+      })
+    )
+    let commandEntry = try XCTUnwrap(
+      bootstrap.initialState.keyDirectory.entries.first(where: {
+        $0.keyID.purpose == .deviceCommandTx
+      })
+    )
+
+    XCTAssertThrowsError(
+      try DeviceStoredKeyCarrierV1(
+        keyID: commandEntry.keyID,
+        streamRoute: commandEntry.streamRoute,
+        keyDirectoryRevision: bootstrap.initialState.keyDirectory.revision,
+        secretFingerprint: Data(repeating: 0xE1, count: 32),
+        source: .bootstrapDirectory,
+        activationProof: catalogBarrier
+      )
+    ) { error in
+      XCTAssertEqual(error as? DeviceKeyLifecycleError, .invalidCarrier)
+    }
+    XCTAssertThrowsError(
+      try DeviceStoredKeyCarrierV1(
+        keyID: catalogEntry.keyID,
+        streamRoute: catalogEntry.streamRoute,
+        keyDirectoryRevision: bootstrap.initialState.keyDirectory.revision,
+        secretFingerprint: Data(repeating: 0xE2, count: 32),
+        source: .bootstrapDirectory,
+        activationProof: conversationBarrier
+      )
+    ) { error in
+      XCTAssertEqual(error as? DeviceKeyLifecycleError, .invalidCarrier)
+    }
+
+    let signedCatalog = try bootstrap.crypto.signedUpdate(
+      purpose: .catalog,
+      streamRoute: nil,
+      rawKey: Data(repeating: 0x51, count: 32),
+      // Keep every proof identity axis valid so rejection specifically proves
+      // that a signed-update carrier cannot consume a bootstrap 0 -> 1 proof.
+      epoch: 1,
+      revision: bootstrap.initialState.keyDirectory.revision
+    )
+    XCTAssertThrowsError(
+      try DeviceStoredKeyCarrierV1(
+        keyID: signedCatalog.keyID,
+        streamRoute: signedCatalog.streamRoute,
+        keyDirectoryRevision: signedCatalog.keyDirectoryRevision,
+        secretFingerprint: Data(repeating: 0xE3, count: 32),
+        source: .signedUpdate(KeyUpdateCanonicalCodec.encode(signedCatalog)),
+        activationProof: catalogBarrier
+      )
+    ) { error in
+      XCTAssertEqual(error as? DeviceKeyLifecycleError, .invalidCarrier)
+    }
+  }
+
   func testExactBarrierActivatesOnlyItsSlotAndRetiredMaterialGCLeavesReuseTombstone()
     throws
   {
@@ -1703,6 +1922,83 @@ struct LifecycleTestMaterial {
   let rawKeyByte: UInt8
 
   var rawKey: Data { Data(repeating: rawKeyByte, count: 32) }
+}
+
+struct BootstrapEpochZeroFixture {
+  let crypto: KeyUpdateSetCryptoFixture
+  let initialState: DeviceCryptoStateV1
+  let expectedConversationRoutes: [Data]
+  let barriers: [DeviceEpochBarrierV1]
+}
+
+func makeBootstrapEpochZeroFixture() throws -> BootstrapEpochZeroFixture {
+  let crypto = try KeyUpdateSetCryptoFixture()
+  let catalogStreamRoute = Data(repeating: 0xC1, count: 16)
+  let conversationRoutes = [
+    Data(repeating: 0xC2, count: 16),
+    Data(repeating: 0xC3, count: 16),
+  ]
+  let directory = try crypto.signedDirectory(
+    revision: crypto.revision,
+    materials: lifecycleBootstrapMaterials(
+      conversations: [
+        LifecycleTestMaterial(
+          purpose: .conversationDEK,
+          epoch: 1,
+          streamRoute: conversationRoutes[0],
+          rawKeyByte: 0x44
+        ),
+        LifecycleTestMaterial(
+          purpose: .conversationDEK,
+          epoch: 1,
+          streamRoute: conversationRoutes[1],
+          rawKeyByte: 0x45
+        ),
+      ]
+    )
+  )
+  let streamStates = try [
+    DeviceStreamCursorStateV1(
+      streamRoute: catalogStreamRoute,
+      generation: Data(repeating: 0xC4, count: 16),
+      outerCursor: .beforeFirst,
+      innerCursor: .catalog(.beforeFirst)
+    ),
+    DeviceStreamCursorStateV1(
+      streamRoute: conversationRoutes[0],
+      generation: Data(repeating: 0xC5, count: 16),
+      outerCursor: .beforeFirst,
+      innerCursor: .conversation(id: "bootstrap-conversation-a", cursor: .beforeFirst)
+    ),
+    DeviceStreamCursorStateV1(
+      streamRoute: conversationRoutes[1],
+      generation: Data(repeating: 0xC6, count: 16),
+      outerCursor: .beforeFirst,
+      innerCursor: .conversation(id: "bootstrap-conversation-b", cursor: .beforeFirst)
+    ),
+  ]
+  let initialState = try lifecycleState(
+    fixture: crypto,
+    directory: directory.directory,
+    streamStates: streamStates
+  )
+  let barriers = try streamStates.map { stream in
+    try DeviceEpochBarrierV1(
+      streamRoute: stream.streamRoute,
+      streamGeneration: stream.generation,
+      streamCursor: stream.outerCursor,
+      innerCursor: stream.innerCursor,
+      oldEpoch: 0,
+      newEpoch: 1,
+      keyDirectoryRevision: crypto.revision
+    )
+  }
+  return BootstrapEpochZeroFixture(
+    crypto: crypto,
+    initialState: initialState,
+    expectedConversationRoutes: conversationRoutes,
+    barriers: barriers
+  )
 }
 
 private struct KeySyncReplyFrameFixture {

@@ -914,6 +914,45 @@ public actor DurableCryptoStateCoordinator: CounterBlockReserving {
     }
   }
 
+  /// 首个 remote member 的 `0 -> 1` barrier 只提交 bootstrap carrier 的 exact
+  /// activation proof 与 stream cut；sender revision/counter scope 和 key material 均不变。
+  func applyBootstrapEpochBarrier(
+    expected: CryptoStateSnapshot,
+    barrier: DeviceEpochBarrierV1,
+    expectedConversationRoutes: [Data],
+    verifier: KeyUpdateSetVerifier
+  ) async throws -> DurableStreamActivationResult {
+    try await withMachineLease {
+      let recovered = try await recoverStableState()
+      guard recovered.snapshot == expected else {
+        throw CryptoStateStoreError.compareAndReplaceMismatch
+      }
+      let candidate = try CryptoStateSnapshot(
+        verifier.prepareBootstrapEpochBarrier(
+          state: expected.state,
+          barrier: barrier,
+          expectedConversationRoutes: expectedConversationRoutes
+        )
+      )
+      if candidate != expected {
+        try await commitKeyLifecycleStatePending(
+          recovered: recovered,
+          candidate: candidate
+        )
+      }
+      guard try await stateStore.load() == candidate else {
+        throw CryptoStateStoreError.persistenceReadbackFailed
+      }
+      return DurableStreamActivationResult(
+        snapshot: candidate,
+        acknowledgementPermit: try DurableStreamAppliedAckPermit(
+          trustScope: candidate.state.trustScope,
+          barrier: barrier
+        )
+      )
+    }
+  }
+
   /// ActivateConversation cuts 为空时只接受 current Catalog 上 exact-next revision proof。
   @discardableResult
   func applyDirectoryRevisionAdvance(

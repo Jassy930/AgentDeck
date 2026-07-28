@@ -23,6 +23,7 @@ use crate::runtime::store::identity::{RuntimeId, RuntimeIdKind};
 use crate::runtime::store::key_transition::{
     FrozenKeyUpdate, KeyTransitionOperation, KeyTransitionPhase, KeyTransitionRecovery,
     KeyTransitionStreamCut, KeyTransitionStreamScope, KeyTransitionTarget, KeyUpdateLifecycle,
+    KeyUpdateRecord,
 };
 use crate::runtime::store::pairing_grant::GlobalKeyStateV1;
 
@@ -594,7 +595,7 @@ fn validate_update_freeze_readback(
     expected: &[FrozenKeyUpdate],
     readback: &KeyTransitionRecovery,
 ) -> Result<(), TransitionCoordinatorError> {
-    if !same_transition_axes(&material.recovery, readback)
+    if !same_transition_axes_allowing_bootstrap_install(&material.recovery, readback)
         || readback.transition.phase != KeyTransitionPhase::UpdatesFrozen
         || !readback.transition.cuts.is_empty()
         || readback.transition.update_count != expected.len() as u64
@@ -671,7 +672,46 @@ fn validate_existing_updates(
     Ok(())
 }
 
-fn same_transition_axes(expected: &KeyTransitionRecovery, actual: &KeyTransitionRecovery) -> bool {
+fn same_transition_axes_allowing_bootstrap_install(
+    expected: &KeyTransitionRecovery,
+    actual: &KeyTransitionRecovery,
+) -> bool {
+    if !same_transition_axes_without_bootstrap_proof(expected, actual) {
+        return false;
+    }
+    match (
+        expected.transition.bootstrap_install_proof.as_ref(),
+        actual.transition.bootstrap_install_proof.as_ref(),
+    ) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => expected == actual,
+        (None, Some(proof)) => {
+            let binding = &proof.binding;
+            proof.operation_id == actual.transition.operation_id
+                && matches!(
+                    (actual.transition.operation, actual.transition.target),
+                    (
+                        KeyTransitionOperation::Add | KeyTransitionOperation::Renew,
+                        KeyTransitionTarget::Device(target),
+                    ) if target.device_route == binding.device_route
+                        && target.grant_serial == binding.grant_serial
+                )
+                && binding.key_revision == actual.transition.to_revision
+                && actual.transition.recipients.iter().any(|recipient| {
+                    recipient.device_route == binding.device_route
+                        && recipient.grant_serial == binding.grant_serial
+                })
+                && actual.transition.terminal.is_none()
+                && !binding.canonical_receipt.is_empty()
+        }
+        (Some(_), None) => false,
+    }
+}
+
+fn same_transition_axes_without_bootstrap_proof(
+    expected: &KeyTransitionRecovery,
+    actual: &KeyTransitionRecovery,
+) -> bool {
     expected.transition.operation_id == actual.transition.operation_id
         && expected.transition.operation == actual.transition.operation
         && expected.transition.target == actual.transition.target
@@ -679,8 +719,40 @@ fn same_transition_axes(expected: &KeyTransitionRecovery, actual: &KeyTransition
         && expected.transition.to_revision == actual.transition.to_revision
         && expected.transition.terminal == actual.transition.terminal
         && expected.transition.recipients == actual.transition.recipients
-        && expected.transition.bootstrap_install_proof == actual.transition.bootstrap_install_proof
         && expected.transition.created_at_ms == actual.transition.created_at_ms
+}
+
+fn same_or_monotonic_acked_update(expected: &KeyUpdateRecord, actual: &KeyUpdateRecord) -> bool {
+    if expected.operation_id != actual.operation_id
+        || expected.recipient != actual.recipient
+        || expected.key_revision != actual.key_revision
+        || expected.canonical_update_set != actual.canonical_update_set
+        || expected.snapshot_flushes != actual.snapshot_flushes
+        || expected.stream_applied_acks != actual.stream_applied_acks
+        || expected.created_at_ms != actual.created_at_ms
+    {
+        return false;
+    }
+    match (expected.lifecycle, actual.lifecycle) {
+        (KeyUpdateLifecycle::Frozen, KeyUpdateLifecycle::Frozen) => {
+            expected.canonical_ack.is_none()
+                && actual.canonical_ack.is_none()
+                && expected.state_changed_at_ms == actual.state_changed_at_ms
+        }
+        (KeyUpdateLifecycle::Frozen, KeyUpdateLifecycle::Acked) => {
+            expected.canonical_ack.is_none()
+                && actual
+                    .canonical_ack
+                    .as_ref()
+                    .is_some_and(|canonical| !canonical.is_empty())
+                && expected.state_changed_at_ms <= actual.state_changed_at_ms
+        }
+        (KeyUpdateLifecycle::Acked, KeyUpdateLifecycle::Acked) => {
+            expected.canonical_ack == actual.canonical_ack
+                && expected.state_changed_at_ms == actual.state_changed_at_ms
+        }
+        _ => false,
+    }
 }
 
 fn build_barriers_from_committed(
@@ -730,11 +802,17 @@ fn validate_barrier_freeze_readback(
     expected: &[KeyTransitionStreamCut],
     readback: &KeyTransitionRecovery,
 ) -> Result<(), TransitionCoordinatorError> {
-    if !same_transition_axes(&material.recovery, readback)
+    if !same_transition_axes_allowing_bootstrap_install(&material.recovery, readback)
         || readback.transition.phase != KeyTransitionPhase::BarriersFrozen
         || readback.transition.cuts != expected
         || readback.transition.update_count != material.recovery.transition.update_count
-        || readback.updates != material.recovery.updates
+        || readback.updates.len() != material.recovery.updates.len()
+        || !material
+            .recovery
+            .updates
+            .iter()
+            .zip(&readback.updates)
+            .all(|(expected, actual)| same_or_monotonic_acked_update(expected, actual))
     {
         return Err(TransitionCoordinatorError::ExactReadbackMismatch);
     }

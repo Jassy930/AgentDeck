@@ -7,6 +7,23 @@
 use agentdeck_protocol::runtime::sync::StreamCursor;
 
 use super::*;
+use crate::runtime::model::RemoteCommandAuthorizationBinding;
+use crate::runtime::store::pairing_authorization::RemoteReplyAuthorization;
+
+/// Snapshot permit 不绑定全目录 metadata token：同一 transition 的 barrier
+/// COMMIT 可以合法推进该 token。这里只冻结 command/reply 真正会改变
+/// 设备业务授权的稳定轴，并让两份 binding 共同完整覆盖它们。
+fn validate_transition_snapshot_authorization_bindings(
+    frozen_command: &RemoteCommandAuthorizationBinding,
+    current_command: &RemoteCommandAuthorizationBinding,
+    frozen_reply: &RemoteReplyAuthorization,
+    current_reply: &RemoteReplyAuthorization,
+) -> Result<(), RuntimeStoreError> {
+    if current_command != frozen_command || current_reply != frozen_reply {
+        return Err(RuntimeStoreError::PairingConflict);
+    }
+    Ok(())
+}
 
 /// RemoteLink 只能用 Store-current opaque proof 构造的 transition snapshot 请求。
 /// requested cursor 也进入同一次 Store 决策，避免调用方把普通 Backfill/After 游标
@@ -231,14 +248,26 @@ pub(crate) fn resolve_transition_snapshot_permit(
     machine_trust_domain: [u8; 32],
     request: TransitionSnapshotRequest,
 ) -> Result<TransitionSnapshotPermit, RuntimeStoreError> {
-    let current = super::super::pairing_authorization::recheck_active_remote_ingress(
+    let frozen = request.authorization.active();
+    let current = super::super::pairing_authorization::load_active_remote_ingress(
         &state.connection,
         &state.key_bundle,
         state.database_id,
         machine_trust_domain,
-        request.authorization.active(),
+        frozen.machine_route(),
+        frozen.device_route(),
     )?;
-    let active = current.active();
+    // dispatcher 已在 replay admission 前完成一次 strict metadata-token recheck；此处
+    // 可能与同一 transition owner 的 barrier COMMIT 并发，不能把无关的全目录 token
+    // 前进误判成 authorization 变化。command 与 reply 两份稳定 binding 仍逐轴相等，
+    // 因而 revoke/regrant、权限、签名键、transport key 或 revision 变化都会 fail-close。
+    validate_transition_snapshot_authorization_bindings(
+        &frozen.command_authorization_binding()?,
+        &current.command_authorization_binding()?,
+        &frozen.remote_reply_authorization(),
+        &current.remote_reply_authorization(),
+    )?;
+    let active = &current;
     resolve_bound_transition_snapshot_permit(
         state,
         TransitionSnapshotQuery {
@@ -693,4 +722,231 @@ fn same_snapshot_flush(
         && left.epoch_barrier_sha256 == right.epoch_barrier_sha256
         && left.authorization_hash == right.authorization_hash
         && left.sync_complete_sha256 == right.sync_complete_sha256
+}
+
+#[cfg(test)]
+mod tests {
+    use agentdeck_protocol::e2ee::AuthorizationPermissionV1;
+    use agentdeck_protocol::relay_v2::{
+        DeviceRouteId, GrantSerial, KeyDirectoryRevision, MachineRouteId, TrustEpoch,
+    };
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct CommandBindingFixture {
+        machine_trust_domain: [u8; 32],
+        machine_route: MachineRouteId,
+        device_route: DeviceRouteId,
+        grant_serial: GrantSerial,
+        device_sign_fingerprint: [u8; 32],
+        authorization_hash: [u8; 32],
+        key_directory_revision: KeyDirectoryRevision,
+        command_key_epoch: u64,
+        permissions: Vec<AuthorizationPermissionV1>,
+    }
+
+    impl CommandBindingFixture {
+        fn binding(&self) -> RemoteCommandAuthorizationBinding {
+            RemoteCommandAuthorizationBinding::new(
+                self.machine_trust_domain,
+                self.machine_route,
+                self.device_route,
+                self.grant_serial,
+                self.device_sign_fingerprint,
+                self.authorization_hash,
+                self.key_directory_revision,
+                self.command_key_epoch,
+                self.permissions.clone(),
+            )
+            .expect("build valid snapshot command authorization fixture")
+        }
+    }
+
+    fn command_fixture() -> CommandBindingFixture {
+        CommandBindingFixture {
+            machine_trust_domain: [0x11; 32],
+            machine_route: MachineRouteId::from_bytes([0x12; 16]),
+            device_route: DeviceRouteId::from_bytes([0x13; 16]),
+            grant_serial: GrantSerial::new(1),
+            device_sign_fingerprint: [0x14; 32],
+            authorization_hash: [0x15; 32],
+            key_directory_revision: KeyDirectoryRevision::new(1),
+            command_key_epoch: 1,
+            permissions: vec![AuthorizationPermissionV1::CatalogRead],
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ReplyBindingFixture {
+        machine_trust_domain: [u8; 32],
+        machine_route: MachineRouteId,
+        trust_epoch: TrustEpoch,
+        device_route: DeviceRouteId,
+        grant_serial: GrantSerial,
+        device_sign_fingerprint: [u8; 32],
+        authorization_hash: [u8; 32],
+        device_hpke_public_key: [u8; 32],
+        key_directory_revision: KeyDirectoryRevision,
+        reply_key_epoch: u64,
+    }
+
+    impl ReplyBindingFixture {
+        fn binding(self) -> RemoteReplyAuthorization {
+            RemoteReplyAuthorization::for_snapshot_permit_test(
+                self.machine_trust_domain,
+                self.machine_route,
+                self.trust_epoch,
+                self.device_route,
+                self.grant_serial,
+                self.device_sign_fingerprint,
+                self.authorization_hash,
+                self.device_hpke_public_key,
+                self.key_directory_revision,
+                self.reply_key_epoch,
+            )
+        }
+    }
+
+    fn reply_fixture() -> ReplyBindingFixture {
+        ReplyBindingFixture {
+            machine_trust_domain: [0x11; 32],
+            machine_route: MachineRouteId::from_bytes([0x12; 16]),
+            trust_epoch: TrustEpoch::new(1),
+            device_route: DeviceRouteId::from_bytes([0x13; 16]),
+            grant_serial: GrantSerial::new(1),
+            device_sign_fingerprint: [0x14; 32],
+            authorization_hash: [0x15; 32],
+            device_hpke_public_key: [0x16; 32],
+            key_directory_revision: KeyDirectoryRevision::new(1),
+            reply_key_epoch: 1,
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum StableAuthorizationAxis {
+        CommandMachineTrustDomain,
+        CommandMachineRoute,
+        CommandDeviceRoute,
+        CommandGrantSerial,
+        CommandDeviceSignFingerprint,
+        CommandAuthorizationHash,
+        CommandKeyDirectoryRevision,
+        CommandKeyEpoch,
+        CommandPermissions,
+        ReplyMachineTrustDomain,
+        ReplyMachineRoute,
+        ReplyTrustEpoch,
+        ReplyDeviceRoute,
+        ReplyGrantSerial,
+        ReplyDeviceSignFingerprint,
+        ReplyAuthorizationHash,
+        ReplyDeviceHpkePublicKey,
+        ReplyKeyDirectoryRevision,
+        ReplyKeyEpoch,
+    }
+
+    const STABLE_AUTHORIZATION_AXES: [StableAuthorizationAxis; 19] = [
+        StableAuthorizationAxis::CommandMachineTrustDomain,
+        StableAuthorizationAxis::CommandMachineRoute,
+        StableAuthorizationAxis::CommandDeviceRoute,
+        StableAuthorizationAxis::CommandGrantSerial,
+        StableAuthorizationAxis::CommandDeviceSignFingerprint,
+        StableAuthorizationAxis::CommandAuthorizationHash,
+        StableAuthorizationAxis::CommandKeyDirectoryRevision,
+        StableAuthorizationAxis::CommandKeyEpoch,
+        StableAuthorizationAxis::CommandPermissions,
+        StableAuthorizationAxis::ReplyMachineTrustDomain,
+        StableAuthorizationAxis::ReplyMachineRoute,
+        StableAuthorizationAxis::ReplyTrustEpoch,
+        StableAuthorizationAxis::ReplyDeviceRoute,
+        StableAuthorizationAxis::ReplyGrantSerial,
+        StableAuthorizationAxis::ReplyDeviceSignFingerprint,
+        StableAuthorizationAxis::ReplyAuthorizationHash,
+        StableAuthorizationAxis::ReplyDeviceHpkePublicKey,
+        StableAuthorizationAxis::ReplyKeyDirectoryRevision,
+        StableAuthorizationAxis::ReplyKeyEpoch,
+    ];
+
+    fn authorization_binding_with_changed_axis(
+        axis: StableAuthorizationAxis,
+    ) -> (RemoteCommandAuthorizationBinding, RemoteReplyAuthorization) {
+        let mut command = command_fixture();
+        let mut reply = reply_fixture();
+        match axis {
+            StableAuthorizationAxis::CommandMachineTrustDomain => {
+                command.machine_trust_domain = [0x81; 32];
+            }
+            StableAuthorizationAxis::CommandMachineRoute => {
+                command.machine_route = MachineRouteId::from_bytes([0x82; 16]);
+            }
+            StableAuthorizationAxis::CommandDeviceRoute => {
+                command.device_route = DeviceRouteId::from_bytes([0x83; 16]);
+            }
+            StableAuthorizationAxis::CommandGrantSerial => {
+                command.grant_serial = GrantSerial::new(2);
+            }
+            StableAuthorizationAxis::CommandDeviceSignFingerprint => {
+                command.device_sign_fingerprint = [0x84; 32];
+            }
+            StableAuthorizationAxis::CommandAuthorizationHash => {
+                command.authorization_hash = [0x85; 32];
+            }
+            StableAuthorizationAxis::CommandKeyDirectoryRevision => {
+                command.key_directory_revision = KeyDirectoryRevision::new(2);
+            }
+            StableAuthorizationAxis::CommandKeyEpoch => command.command_key_epoch = 2,
+            StableAuthorizationAxis::CommandPermissions => {
+                command.permissions = vec![AuthorizationPermissionV1::ConversationRead];
+            }
+            StableAuthorizationAxis::ReplyMachineTrustDomain => {
+                reply.machine_trust_domain = [0x91; 32];
+            }
+            StableAuthorizationAxis::ReplyMachineRoute => {
+                reply.machine_route = MachineRouteId::from_bytes([0x92; 16]);
+            }
+            StableAuthorizationAxis::ReplyTrustEpoch => reply.trust_epoch = TrustEpoch::new(2),
+            StableAuthorizationAxis::ReplyDeviceRoute => {
+                reply.device_route = DeviceRouteId::from_bytes([0x93; 16]);
+            }
+            StableAuthorizationAxis::ReplyGrantSerial => {
+                reply.grant_serial = GrantSerial::new(2);
+            }
+            StableAuthorizationAxis::ReplyDeviceSignFingerprint => {
+                reply.device_sign_fingerprint = [0x94; 32];
+            }
+            StableAuthorizationAxis::ReplyAuthorizationHash => {
+                reply.authorization_hash = [0x95; 32];
+            }
+            StableAuthorizationAxis::ReplyDeviceHpkePublicKey => {
+                reply.device_hpke_public_key = [0x96; 32];
+            }
+            StableAuthorizationAxis::ReplyKeyDirectoryRevision => {
+                reply.key_directory_revision = KeyDirectoryRevision::new(2);
+            }
+            StableAuthorizationAxis::ReplyKeyEpoch => reply.reply_key_epoch = 2,
+        }
+        (command.binding(), reply.binding())
+    }
+
+    #[test]
+    fn every_stable_authorization_axis_change_fails_closed() {
+        let frozen_command = command_fixture().binding();
+        let frozen_reply = reply_fixture().binding();
+        for axis in STABLE_AUTHORIZATION_AXES {
+            let (current_command, current_reply) = authorization_binding_with_changed_axis(axis);
+            assert!(
+                matches!(
+                    validate_transition_snapshot_authorization_bindings(
+                        &frozen_command,
+                        &current_command,
+                        &frozen_reply,
+                        &current_reply,
+                    ),
+                    Err(RuntimeStoreError::PairingConflict)
+                ),
+                "stable authorization axis {axis:?} must fail closed"
+            );
+        }
+    }
 }

@@ -1,6 +1,6 @@
 import XCTest
 
-@testable import AgentDeckRelayClient
+@testable import AgentDeckSessionSource
 
 final class BoundedBroadcasterTests: XCTestCase {
   func testObserverAdmissionAcceptsExactCapAndRejectsPlusOneWithoutRetainingIt() async {

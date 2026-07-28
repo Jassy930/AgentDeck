@@ -95,6 +95,10 @@ const REMOTE_STATE_CONFLICT: &str = "daemon.remote.enrollment.state_conflict";
 const REMOTE_QUIESCENCE_UNKNOWN: &str = "daemon.remote.quiescence_unknown";
 const PAIRING_DRAIN_WAIT_DEADLINE: Duration = Duration::from_secs(10);
 const BUSINESS_STARTUP_DEADLINE: Duration = Duration::from_secs(30);
+/// snapshot build 与 confirm 之间允许 current H 合法推进。重采样必须有界，避免
+/// 持续活跃会话让一次 local administration 永久占用；三轮可收敛两次连续漂移，
+/// 再失败则保留 Store 的 typed snapshot_required 供 caller 重试。
+const REMOTE_MEMBERSHIP_SNAPSHOT_RECOVERY_ROUNDS: usize = 3;
 const PAIRING_DRAIN_PENDING: &str = "daemon.pairing.drain_pending";
 const PAIRING_ACTIVE: &str = "daemon.pairing.active";
 const ROOT_PRESENT_RECEIPT_FORBIDDEN: &str =
@@ -1728,8 +1732,10 @@ impl RemoteManager {
                 Arc::clone(&self.key_store),
                 machine_data,
             ));
-            let key_control =
-                Arc::new(StoreBackedKeyControlIngressHandler::new(self.store.clone()));
+            let key_control = Arc::new(StoreBackedKeyControlIngressHandler::with_transition_owner(
+                self.store.clone(),
+                transition_handle,
+            ));
             let admitted_lane = lane
                 .take()
                 .ok_or_else(|| admin_error(REMOTE_STATE_CONFLICT))?;
@@ -2669,16 +2675,49 @@ impl PairingAdministration for RemoteManager {
             let state = self.state.lock().await;
             require_running_armed(&state)
                 .map_err(|error| PairingAdministrationError::new(error.code()))?;
-            let pairing = state.pairing.as_ref().ok_or_else(pairing_unavailable)?;
-            if let Some(code) = pairing.local_blocked_code() {
+            if let Some(code) = state
+                .pairing
+                .as_ref()
+                .and_then(PairingCoordinatorOwner::local_blocked_code)
+            {
                 return Err(PairingAdministrationError::new(code));
             }
-            pairing.handle()
+            let handle = state.pairing.as_ref().map(PairingCoordinatorOwner::handle);
+            #[cfg(test)]
+            let handle = state.pairing_handle_for_test.clone().or(handle);
+            handle.ok_or_else(pairing_unavailable)?
         };
         // Grant freeze、Store CAS、InstallGrant send 与其后的 key transition 均不得占用
         // manager mutex。新设备收到 PairResponse 前不可能回 transition ACK；receipt
         // 产生后只向已有 owner 投递推进请求，不再同步等待 Relay/endpoint 状态。
-        let receipt = handle.confirm(pairing_id).await?;
+        let mut recovery_round = 0_usize;
+        let receipt = loop {
+            match handle.confirm(pairing_id).await {
+                Ok(receipt) => break receipt,
+                Err(error)
+                    if error.code() == "daemon.runtime.snapshot_required"
+                        && recovery_round < REMOTE_MEMBERSHIP_SNAPSHOT_RECOVERY_ROUNDS =>
+                {
+                    recovery_round += 1;
+                    let core =
+                        self.runtime_core
+                            .get()
+                            .and_then(Weak::upgrade)
+                            .ok_or_else(|| {
+                                PairingAdministrationError::new(
+                                    "daemon.remote.runtime_core_unavailable",
+                                )
+                            })?;
+                    core.refresh_snapshots_for_remote_membership()
+                        .await
+                        .map_err(|failure| PairingAdministrationError::new(failure.code))?;
+                    // confirm transaction 是最终 authority：若 Catalog/conversation H 在
+                    // build 后继续推进，它会再次返回 snapshot_required，并进入下一轮
+                    // 有界重采样；任何其他错误都原样 fail-close，禁止触发额外写入。
+                }
+                Err(error) => return Err(error),
+            }
+        };
         self.request_transition_control_plane_progress().await;
         Ok(receipt)
     }

@@ -396,6 +396,15 @@ pub(crate) async fn complete_active_membership_transition(
                     .recheck_active_remote_ingress(&ingress)
                     .await
                     .expect("recheck new-device transition authorization");
+                drop(ingress);
+                let current = current.with_stale_directory_metadata_token_for_test();
+                assert!(
+                    matches!(
+                        store.recheck_active_remote_ingress(current.active()).await,
+                        Err(RuntimeStoreError::PairingConflict)
+                    ),
+                    "strict recheck must observe the synthetic directory metadata-token advance"
+                );
                 let permit = store
                     .resolve_transition_snapshot_permit(
                         super::key_transition::TransitionSnapshotRequest::new(
@@ -405,7 +414,7 @@ pub(crate) async fn complete_active_membership_transition(
                         ),
                     )
                     .await
-                    .expect("resolve required new-device snapshot permit");
+                    .expect("resolve snapshot permit after directory-only metadata progress");
                 let authorization_hash = permit.authorization_hash();
                 next_time(clock);
                 store
@@ -1010,6 +1019,35 @@ async fn renewal_reuses_route_increments_serial_and_atomically_supersedes_previo
     assert_eq!(global.device_count(), 1);
     assert_eq!(global.revision().value(), 2);
     store.shutdown().await.expect("shutdown renewal store");
+}
+
+#[tokio::test]
+async fn add_snapshot_permit_survives_directory_only_metadata_progress() {
+    let root = TestRoot::new("grant-add-snapshot-directory-token-progress");
+    let keys = MemoryKeyStore::new();
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let store = RuntimeStoreHandle::open(
+        config(&root, clock.clone()),
+        load_or_create_storage_kek(&keys, &root.database()).expect("load StorageKEK"),
+    )
+    .await
+    .expect("open snapshot permit regression store");
+    let (binding, data_cert) = make_active(&store).await;
+
+    let grant = first_delivered(&store, &clock, &binding, &data_cert).await;
+    assert_eq!(grant.grant_serial, GrantSerial::new(1));
+    assert!(
+        store
+            .load_active_key_transition()
+            .await
+            .expect("load completed Add transition")
+            .is_none(),
+        "successful directed snapshots and ACKs must complete the Add transition"
+    );
+    store
+        .shutdown()
+        .await
+        .expect("shutdown snapshot permit regression store");
 }
 
 #[tokio::test]

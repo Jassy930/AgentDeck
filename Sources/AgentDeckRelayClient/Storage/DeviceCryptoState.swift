@@ -583,7 +583,11 @@ struct DeviceStoredKeyCarrierV1: Equatable, Sendable, CustomDebugStringConvertib
     }
     switch source {
     case .bootstrapDirectory:
-      guard activationProof == nil else {
+      guard
+        activationProof.map({
+          $0.oldEpoch == 0 && $0.newEpoch == 1 && keyID.epoch == 1
+        }) ?? true
+      else {
         throw DeviceKeyLifecycleError.invalidCarrier
       }
     case .signedUpdate(let canonical):
@@ -602,7 +606,13 @@ struct DeviceStoredKeyCarrierV1: Equatable, Sendable, CustomDebugStringConvertib
     }
     if let activationProof {
       guard activationProof.keyDirectoryRevision == keyDirectoryRevision,
-        activationProof.newEpoch == keyID.epoch
+        activationProof.newEpoch == keyID.epoch,
+        Self.activationProofMatchesCarrier(
+          activationProof,
+          keyID: keyID,
+          streamRoute: streamRoute,
+          source: source
+        )
       else {
         throw DeviceKeyLifecycleError.invalidCarrier
       }
@@ -613,6 +623,29 @@ struct DeviceStoredKeyCarrierV1: Equatable, Sendable, CustomDebugStringConvertib
     self.secretFingerprint = secretFingerprint
     self.source = source
     self.activationProof = activationProof
+  }
+
+  private static func activationProofMatchesCarrier(
+    _ proof: DeviceEpochBarrierV1,
+    keyID: KeyIDV1,
+    streamRoute: Data?,
+    source: DeviceStoredKeyCarrierSourceV1
+  ) -> Bool {
+    switch (keyID.purpose, proof.innerCursor) {
+    case (.catalog, .catalog):
+      guard streamRoute == nil else { return false }
+    case (.conversationDEK, .conversation):
+      guard streamRoute == proof.streamRoute else { return false }
+    case (.catalog, .conversation), (.conversationDEK, .catalog),
+      (.deviceCommandTx, _), (.deviceReplyTx, _):
+      return false
+    }
+    switch source {
+    case .bootstrapDirectory:
+      return proof.oldEpoch == 0 && proof.newEpoch == 1 && keyID.epoch == 1
+    case .signedUpdate:
+      return proof.oldEpoch > 0
+    }
   }
 
   var slotID: DeviceKeySlotIDV1 {
@@ -1911,6 +1944,107 @@ public struct DeviceCryptoStateV1: Equatable, Sendable, CustomDebugStringConvert
     )
   }
 
+  /// 首个 remote member 收到的 `0 -> 1` barrier 不旋转本地已由 PairResponse
+  /// bootstrap 的 epoch-1 material；它只把 exact committed stream cut 与 durable
+  /// `StreamAppliedAck` basis 绑定到该 carrier。`oldEpoch == 0` 是“此前没有 shared
+  /// sender”的 sentinel，不能伪造 retired predecessor 或 replay scope。该迁移严格
+  /// 单向；已提交 proof 的 exact duplicate 必须走 ACK recovery，fresh 重封不得再进入。
+  func applyingBootstrapEpochBarrier(
+    _ barrier: DeviceEpochBarrierV1
+  ) throws -> Self {
+    guard securityState == .active,
+      barrier.oldEpoch == 0,
+      barrier.newEpoch == 1,
+      let lifecycle = keyLifecycle,
+      lifecycle.stagedTransition == nil,
+      lifecycle.activeRevision == barrier.keyDirectoryRevision,
+      senderCounter.keyDirectoryRevision == barrier.keyDirectoryRevision
+    else {
+      throw DeviceKeyLifecycleError.invalidBarrier
+    }
+    let slotID: DeviceKeySlotIDV1
+    switch barrier.innerCursor {
+    case .catalog:
+      slotID = try DeviceKeySlotIDV1(purpose: .catalog, streamRoute: nil)
+    case .conversation:
+      slotID = try DeviceKeySlotIDV1(
+        purpose: .conversationDEK,
+        streamRoute: barrier.streamRoute
+      )
+    }
+    guard
+      let streamIndex = streamStates.firstIndex(where: {
+        $0.streamRoute == barrier.streamRoute
+      }),
+      streamStates[streamIndex].generation == barrier.streamGeneration,
+      let slotIndex = lifecycle.slots.firstIndex(where: { $0.id == slotID })
+    else {
+      throw DeviceKeyLifecycleError.invalidBarrier
+    }
+
+    let slot = lifecycle.slots[slotIndex]
+    guard streamStates[streamIndex].outerCursor == barrier.streamCursor,
+      streamStates[streamIndex].innerCursor == barrier.innerCursor,
+      let current = slot.current,
+      current.source == .bootstrapDirectory,
+      current.activationProof == nil,
+      current.keyID.epoch == 1,
+      current.keyDirectoryRevision == barrier.keyDirectoryRevision,
+      slot.staged == nil,
+      slot.retired.isEmpty
+    else {
+      throw DeviceKeyLifecycleError.invalidBarrier
+    }
+    let currentScope = DeviceCryptoKeyScopeV1(
+      keyID: current.keyID,
+      streamRoute: current.streamRoute
+    )
+    guard
+      replayStates.contains(where: {
+        $0.scope == currentScope && $0.status == .active
+      })
+    else {
+      throw DeviceKeyLifecycleError.invalidBarrier
+    }
+
+    var nextSlots = lifecycle.slots
+    nextSlots[slotIndex] = try DeviceKeySlotStateV1(
+      id: slot.id,
+      current: current.withActivationProof(barrier),
+      staged: nil,
+      retired: []
+    )
+    var nextStreams = streamStates
+    nextStreams[streamIndex] = try DeviceStreamCursorStateV1(
+      streamRoute: barrier.streamRoute,
+      generation: barrier.streamGeneration,
+      outerCursor: .at(barrier.appliedStreamSequence),
+      innerCursor: barrier.innerCursor
+    )
+    let nextLifecycle = try DeviceKeyLifecycleStateV1(
+      activeRevision: lifecycle.activeRevision,
+      activeUpdateSet: lifecycle.activeUpdateSet,
+      stagedTransition: nil,
+      lastDirectoryAdvanceProof: lifecycle.lastDirectoryAdvanceProof,
+      slots: nextSlots,
+      retiredSecretFingerprints: lifecycle.retiredSecretFingerprints
+    )
+    let nextRevision = stateRevision.addingReportingOverflow(1)
+    guard !nextRevision.overflow else { throw DeviceCryptoStateError.invalidState }
+    return try Self(
+      stateRevision: nextRevision.partialValue,
+      trustScope: trustScope,
+      keyDirectory: keyDirectory,
+      senderCounter: senderCounter,
+      securityState: securityState,
+      replayStates: replayStates,
+      streamStates: nextStreams,
+      keyLifecycle: nextLifecycle,
+      pendingStreamBindings: pendingStreamBindings,
+      keySyncEpisode: keySyncEpisode
+    )
+  }
+
   /// ActivateConversation 没有 EpochBarrier cuts；它在 current Catalog key 下发布 exact
   /// DirectoryRevisionAdvance。只有该 proof 与 durable catalog cut 对齐时才激活 epoch-1 新 slot。
   func applyingDirectoryRevisionAdvance(
@@ -2058,32 +2192,45 @@ public struct DeviceCryptoStateV1: Equatable, Sendable, CustomDebugStringConvert
         keyID: current.keyID,
         streamRoute: current.streamRoute
       )
+      let predecessorMatches: Bool
+      if proof.oldEpoch == 0 {
+        predecessorMatches =
+          current.source == .bootstrapDirectory
+          && current.keyID.epoch == 1
+          && predecessors.isEmpty
+          && slot.retired.isEmpty
+      } else {
+        predecessorMatches = predecessors.count == 1
+      }
       guard seenProofs.insert(proof.canonicalSHA256).inserted,
         slot.id == proofSlot,
         slot.staged == nil,
         current.keyDirectoryRevision == proof.keyDirectoryRevision,
         current.keyID.epoch == proof.newEpoch,
         revisionPhaseMatches,
-        predecessors.count == 1,
+        predecessorMatches,
         replayStates.contains(where: {
           $0.scope == currentScope && $0.status == .active
         })
       else {
         throw DeviceKeyLifecycleError.coldOpenAuditFailed
       }
-      let predecessor = predecessors[0]
-      let predecessorScope = DeviceCryptoKeyScopeV1(
-        keyID: predecessor.carrier.keyID,
-        streamRoute: predecessor.carrier.streamRoute
-      )
-      guard
-        replayStates.contains(where: { replay in
-          guard replay.scope == predecessorScope else { return false }
-          guard case .retired(_, let deleteAfterMS) = replay.status else { return false }
-          return deleteAfterMS == predecessor.deleteAfterMS
-        }),
-        try streamStateCoversActivationProof(proof)
-      else {
+      if let predecessor = predecessors.first {
+        let predecessorScope = DeviceCryptoKeyScopeV1(
+          keyID: predecessor.carrier.keyID,
+          streamRoute: predecessor.carrier.streamRoute
+        )
+        guard
+          replayStates.contains(where: { replay in
+            guard replay.scope == predecessorScope else { return false }
+            guard case .retired(_, let deleteAfterMS) = replay.status else { return false }
+            return deleteAfterMS == predecessor.deleteAfterMS
+          })
+        else {
+          throw DeviceKeyLifecycleError.coldOpenAuditFailed
+        }
+      }
+      guard try streamStateCoversActivationProof(proof) else {
         throw DeviceKeyLifecycleError.coldOpenAuditFailed
       }
       barriers.append(proof)

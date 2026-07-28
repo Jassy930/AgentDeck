@@ -306,10 +306,67 @@ pub(super) fn stage_conversation_publication_in_transaction(
         return Err(RuntimeStoreError::ConversationLimit);
     }
     let [publication_stream_id, stream_route, generation] =
-        allocate_publication_axes(transaction, config)?;
+        allocate_publication_axes(transaction, config, &[])?;
     let record = PublicationStreamRecord {
         publication_stream_id,
         scope: PublicationScope::Conversation(conversation_id),
+        stream_route,
+        generation,
+        counter_scope_token: None,
+        sender_counter_high_water: None,
+        reserved_high_water: None,
+        committed_high_water: None,
+        committed_inner_cursor: None,
+        last_committed_blob_hash: None,
+        acknowledged_high_water: None,
+        acknowledged_inner_cursor: None,
+        last_acknowledged_blob_hash: None,
+        last_acknowledged_publication_id: None,
+        last_acknowledged_request_digest: None,
+        last_rotation_request_digest: None,
+        rotation_serial: 0,
+        state: PublicationStreamState::Active,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    };
+    insert_stream(transaction, key_bundle, &record)?;
+    ledger.publication_stream_count = next_count;
+    Ok(record)
+}
+
+/// 首个 remote member 加入时，如果本机已经存在 active conversation，则必须在同一
+/// grant/transition 事务内先建立唯一 Catalog publication identity。否则新设备需要先
+/// 从 Catalog 发现 conversation，却又只能在缺失 Catalog cut 的 transition 完成后读取
+/// Catalog，形成不可恢复的活性环。
+///
+/// 本 helper 不自开事务、不 commit、不写 ledger singleton。`reserved_ids` 覆盖同一事务
+/// 尚未落表的 control outbox/transition identity，避免测试熵源碰撞时把两个 axis 分配为
+/// 同一值。已有 Active Catalog row 只做 authenticated replay；NeedsSnapshot 或重复 current
+/// row 继续 fail-close。
+pub(super) fn stage_first_remote_catalog_publication_in_transaction(
+    transaction: &Transaction<'_>,
+    config: &RuntimeStoreConfig,
+    key_bundle: &RuntimeKeyBundle,
+    ledger: &mut RuntimeLedger,
+    now_ms: u64,
+    reserved_ids: &[[u8; 16]],
+) -> Result<PublicationStreamRecord, RuntimeStoreError> {
+    let directory = authenticate_directory_records(transaction, key_bundle, ledger)?;
+    if let Some(existing) = select_subscription_stream(&directory, PublicationScope::Catalog)? {
+        return Ok(existing);
+    }
+    let next_count = ledger
+        .publication_stream_count
+        .checked_add(1)
+        .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    if next_count > MAX_PUBLICATION_STREAMS {
+        return Err(RuntimeStoreError::ConversationLimit);
+    }
+    let [publication_stream_id, stream_route, generation] =
+        allocate_publication_axes(transaction, config, reserved_ids)?;
+    let record = PublicationStreamRecord {
+        publication_stream_id,
+        scope: PublicationScope::Catalog,
         stream_route,
         generation,
         counter_scope_token: None,
@@ -359,6 +416,7 @@ pub(super) fn load_conversation_publication_mapping(
 fn allocate_publication_axes(
     transaction: &Transaction<'_>,
     config: &RuntimeStoreConfig,
+    reserved_ids: &[[u8; 16]],
 ) -> Result<[[u8; 16]; 3], RuntimeStoreError> {
     let mut source = config
         .id_source
@@ -377,7 +435,7 @@ fn allocate_publication_axes(
                 .into());
             }
             let bytes = *candidate.as_bytes();
-            let already_reserved = axes[..index].contains(&bytes);
+            let already_reserved = reserved_ids.contains(&bytes) || axes[..index].contains(&bytes);
             let persisted: i64 = transaction.query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM publication_streams
@@ -507,10 +565,12 @@ pub(super) fn create_publication_stream(
 
 /// 远程 Subscribe/Backfill 进入 RuntimeCore 前准备 exact Relay stream identity。
 ///
-/// Catalog 在 first-device zero-cut Add 完成前允许没有 publication row；首次业务订阅
-/// 才在这里单事务分配并持久化三个 opaque axes。Conversation identity 必须已经由
-/// conversation activation 与 canonical row 同事务建立，缺失时禁止补造第二条映射。
-/// 重试始终先认证完整 directory，并逐字返回已有 Active row。
+/// 真正空机器的 first-device zero-cut Add 完成前允许没有 Catalog publication row；完成后
+/// 首次业务订阅可在这里单事务分配三个 opaque axes。若 Add 前已有 active conversation，
+/// pairing confirm 必须已经同事务建立 Catalog carrier，本入口不能绕过 active transition
+/// 临时补造。Conversation identity 必须已经由 conversation activation 与 canonical row
+/// 同事务建立，缺失时禁止补造第二条映射。重试始终先认证完整 directory，并逐字返回
+/// 已有 Active row。
 pub(super) fn ensure_subscription_publication_stream(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
@@ -564,7 +624,7 @@ pub(super) fn ensure_subscription_publication_stream(
         return Err(RuntimeStoreError::ConversationLimit);
     }
     let [publication_stream_id, stream_route, generation] =
-        allocate_publication_axes(&transaction, config)?;
+        allocate_publication_axes(&transaction, config, &[])?;
     let record = PublicationStreamRecord {
         publication_stream_id,
         scope,
@@ -613,9 +673,9 @@ pub(super) fn ensure_subscription_publication_stream(
 }
 
 /// transition owner 在确认当前没有 active transition 后，为至少一个 Active remote
-/// authorization 预建唯一 Catalog carrier。首设备 Add 尚未完成时必须保持空目录，
-/// 否则动态 projection 会把 genesis Catalog 纳入 Add barrier，而尚未启动的客户端
-/// 无法 ACK。Add terminal 后本入口可幂等创建；升级自愈也复用同一认证 readback。
+/// authorization 补建唯一 Catalog carrier。该入口只覆盖真正空机器的 zero-cut Add 以及
+/// 旧状态自愈；首设备 Add 前已有 active conversation 时，Catalog carrier 必须由 pairing
+/// confirm 与 grant/key-transition 同事务建立并纳入 genesis barrier，不能延迟到这里。
 pub(super) fn ensure_remote_catalog_publication_after_transition(
     state: &mut RuntimeSqlite,
     config: &RuntimeStoreConfig,
@@ -2309,6 +2369,61 @@ pub(super) fn initialize_first_remote_member_baselines(
         update_stream(transaction, key_bundle, &stream)?;
     }
     Ok(())
+}
+
+/// first-member confirm 因 snapshot prerequisite fail-close 后的只读恢复计划。
+///
+/// 该读取复用与 confirm 相同的 authenticated publication directory、conversation
+/// parent H 与 snapshot coverage 判定，只返回当前确实缺失 durable coverage 的
+/// managed conversation。Runtime 随后会在统一 snapshot budget 下逐个重建；期间 H
+/// 继续推进是允许的，最终仍由 confirm transaction 重新认证全部 current cut。
+pub(super) fn load_first_remote_member_missing_snapshot_conversations(
+    state: &RuntimeSqlite,
+) -> Result<Vec<RuntimeId>, RuntimeStoreError> {
+    let ledger = super::sqlite::load_runtime_ledger(
+        &state.connection,
+        &state.key_bundle,
+        state.database_id,
+    )?;
+    let streams = authenticate_directory_records(&state.connection, &state.key_bundle, &ledger)?;
+    let conversation_ids = streams
+        .iter()
+        .filter_map(|stream| match (stream.scope, stream.state) {
+            (PublicationScope::Conversation(conversation_id), PublicationStreamState::Active) => {
+                Some(Ok(conversation_id))
+            }
+            (PublicationScope::Conversation(_), PublicationStreamState::NeedsSnapshot) => {
+                Some(Err(RuntimeStoreError::PublicationNeedsSnapshot))
+            }
+            (PublicationScope::Conversation(_), PublicationStreamState::Retired)
+            | (PublicationScope::Catalog, _) => None,
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let high_waters = super::journal::load_authenticated_conversation_event_high_waters(
+        &state.connection,
+        &state.key_bundle,
+        &conversation_ids,
+    )?;
+    let mut missing = Vec::new();
+    for conversation_id in conversation_ids {
+        let Some(high_water) = high_waters
+            .get(&conversation_id)
+            .copied()
+            .ok_or(RuntimeStoreError::ConversationNotFound)?
+        else {
+            continue;
+        };
+        if !super::snapshot::authenticated_conversation_snapshot_covers(
+            &state.connection,
+            &state.key_bundle,
+            conversation_id,
+            high_water,
+        )? {
+            missing.push(conversation_id);
+        }
+    }
+    missing.sort_by_key(|conversation_id| *conversation_id.as_bytes());
+    Ok(missing)
 }
 
 fn load_optional_stream(

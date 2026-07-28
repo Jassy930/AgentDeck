@@ -1245,6 +1245,110 @@ final class RelaySessionSourceTests: XCTestCase {
     XCTAssertEqual(secondClaims, 0)
   }
 
+  func testCatalogSubscriptionWaitsForExactBusinessReadyScopeAndIgnoresStaleReady()
+    async throws
+  {
+    let connection = AssemblySpyConnection(startsBusinessReady: false)
+    let commands = AssemblySpyCommandClient()
+    let source = try RelaySessionSource(
+      scope: .machine("machine-1"),
+      machines: [
+        PairedMachine(
+          id: "machine-1",
+          name: "One",
+          relayHost: "relay.example",
+          rootFingerprint: Data(repeating: 1, count: 32)
+        )
+      ],
+      connections: ["machine-1": connection],
+      commandClient: commands
+    )
+
+    _ = await source.conversations(machineID: "machine-1")
+    var subscriptionCount = await commands.catalogSubscriptionCount()
+    XCTAssertEqual(subscriptionCount, 0)
+
+    let first = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 1)
+    )
+    await connection.send(.connectionScope(first))
+    await connection.send(.connectionState(.connected))
+    for _ in 0..<100 { await Task.yield() }
+    subscriptionCount = await commands.catalogSubscriptionCount()
+    XCTAssertEqual(
+      subscriptionCount,
+      0,
+      "transport connected 不能冒充 control ACK 已 flush"
+    )
+
+    await connection.send(.businessReady(first))
+    let firstReady = await eventually { await commands.catalogSubscriptionCount() == 1 }
+    XCTAssertTrue(firstReady)
+    await connection.send(.businessReady(first))
+    for _ in 0..<100 { await Task.yield() }
+    subscriptionCount = await commands.catalogSubscriptionCount()
+    XCTAssertEqual(subscriptionCount, 1, "duplicate ready 必须幂等")
+
+    let second = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 1)
+    )
+    await connection.send(.connectionScope(second))
+    await connection.send(.businessReady(first))
+    for _ in 0..<100 { await Task.yield() }
+    subscriptionCount = await commands.catalogSubscriptionCount()
+    XCTAssertEqual(
+      subscriptionCount,
+      1,
+      "旧 connectionID 的 ready 不能越过 fresh transport generation"
+    )
+
+    await connection.send(.businessReady(second))
+    let secondReady = await eventually { await commands.catalogSubscriptionCount() == 2 }
+    XCTAssertTrue(secondReady)
+    await source.shutdown()
+  }
+
+  func testLateConversationObservationReplaysCurrentConnectedState() async throws {
+    let connection = AssemblySpyConnection()
+    let commands = AssemblySpyCommandClient()
+    let source = try RelaySessionSource(
+      scope: .machine("machine-1"),
+      machines: [
+        PairedMachine(
+          id: "machine-1",
+          name: "One",
+          relayHost: "relay.example",
+          rootFingerprint: Data(repeating: 1, count: 32)
+        )
+      ],
+      connections: ["machine-1": connection],
+      commandClient: commands
+    )
+
+    var machines = await source.machines().makeAsyncIterator()
+    await connection.send(.connectionState(.connected))
+    var observedConnectedMachine = false
+    for _ in 0..<2 {
+      guard let state = await machines.next() else { break }
+      if case .ready(let summaries, _) = state,
+        summaries.first?.connectionState == .connected
+      {
+        observedConnectedMachine = true
+        break
+      }
+    }
+    XCTAssertTrue(observedConnectedMachine)
+
+    let stream = await source.conversation(conversationID: "late-connected-conversation")
+    var iterator = stream.makeAsyncIterator()
+    guard case .connectionState(.connected)? = await iterator.next() else {
+      return XCTFail("late conversation observer 必须立即读到 current connected")
+    }
+    await source.shutdown()
+  }
+
   func testMultiMachineAssemblyFailureShutsDownAndJoinsAlreadyStartedOwners() async throws {
     let firstConnection = AssemblySpyConnection(machineID: "machine-1", blockShutdown: true)
     let provider = AssemblySpyProvider(
@@ -1672,7 +1776,13 @@ final class RelaySessionSourceTests: XCTestCase {
     XCTAssertEqual(firstCount, 0, "failed subscription is not recorded as successful")
 
     await commands.setConversationSubscriptionFailure(nil)
+    let reconnectScope = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 2)
+    )
+    await connection.send(.connectionScope(reconnectScope))
     await connection.send(.connectionState(.connected))
+    await connection.send(.businessReady(reconnectScope))
     guard case .connectionState(.lagged(reason: .snapshotRequired))? = await iterator.next() else {
       return XCTFail("reconnect 必须轮换 generation 并重试 fresh snapshot")
     }
@@ -2639,6 +2749,8 @@ private actor AssemblySpyConnection: RelayMachineConnectionOwner {
   private let failPreparedCommit: Bool
   private let blockPreparedCommit: Bool
   private let blockShutdown: Bool
+  private let startsBusinessReady: Bool
+  private let initialScope: TransferAssemblyScope
   private var committedPrepared = 0
   private var discardedPrepared = 0
   private var startedPreparedCommits = 0
@@ -2650,12 +2762,18 @@ private actor AssemblySpyConnection: RelayMachineConnectionOwner {
     machineID: String = "machine-1",
     failPreparedCommit: Bool = false,
     blockPreparedCommit: Bool = false,
-    blockShutdown: Bool = false
+    blockShutdown: Bool = false,
+    startsBusinessReady: Bool = true
   ) {
     self.machineID = machineID
     self.failPreparedCommit = failPreparedCommit
     self.blockPreparedCommit = blockPreparedCommit
     self.blockShutdown = blockShutdown
+    self.startsBusinessReady = startsBusinessReady
+    initialScope = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 1)
+    )
   }
 
   func updates() async -> AsyncStream<MachineConnectionUpdate> {
@@ -2664,10 +2782,21 @@ private actor AssemblySpyConnection: RelayMachineConnectionOwner {
       bufferingPolicy: .bufferingNewest(512)
     )
     continuation = pair.continuation
+    if startsBusinessReady {
+      pair.continuation.yield(.connectionScope(initialScope))
+      pair.continuation.yield(.businessReady(initialScope))
+    }
     return pair.stream
   }
 
   func claimCount() -> Int { claims }
+
+  func readinessSnapshot() -> MachineConnectionReadinessSnapshot {
+    MachineConnectionReadinessSnapshot(
+      connectionScope: startsBusinessReady ? initialScope : nil,
+      readyScope: startsBusinessReady ? initialScope : nil
+    )
+  }
 
   func expectedGrantSerial() async throws -> UInt64 { 1 }
 
@@ -2741,6 +2870,8 @@ private actor AssemblySpyConnection: RelayMachineConnectionOwner {
   func send(_ update: MachineConnectionUpdate) {
     continuation?.yield(update)
   }
+
+  func readyScope() -> TransferAssemblyScope { initialScope }
 }
 
 private actor AssemblySpyCommandClient: RelaySessionSourceCommandClient {

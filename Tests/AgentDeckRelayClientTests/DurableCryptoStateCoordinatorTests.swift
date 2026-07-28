@@ -791,6 +791,20 @@ final class DurableCryptoStateCoordinatorTests: XCTestCase {
     XCTAssertEqual(duplicateActivation.snapshot, activated.snapshot)
   }
 
+  func testBootstrapEpochBarrierStateGuardPendingCrashRetriesWithoutPhantomPermit()
+    async throws
+  {
+    try await exerciseBootstrapEpochBarrierCrashCut(.stateGuardPendingDurable)
+  }
+
+  func testBootstrapEpochBarrierStateDurableCrashRecoversExactPermit() async throws {
+    try await exerciseBootstrapEpochBarrierCrashCut(.stateDurable)
+  }
+
+  func testBootstrapEpochBarrierGuardStableCrashRecoversExactPermit() async throws {
+    try await exerciseBootstrapEpochBarrierCrashCut(.guardStableDurable)
+  }
+
   func testStagedDirectoryAdvanceUsesCurrentHeaderReplayAndActivatesPrecreatedConversationScope()
     async throws
   {
@@ -2202,6 +2216,169 @@ final class DurableCryptoStateCoordinatorTests: XCTestCase {
     XCTAssertEqual(recovered.state.senderCounter.reservedHighWater, 2 * CounterBlock.size)
     let recoveredGuard = await environment.keyStore.value(for: environment.guardKey)
     assertGuardPhase(recoveredGuard, .stable)
+  }
+
+  private func exerciseBootstrapEpochBarrierCrashCut(
+    _ crashStage: CryptoStatePersistenceStage
+  ) async throws {
+    let bootstrap = try makeBootstrapEpochZeroFixture()
+    let environment = try CoordinatorTestEnvironment(
+      initialState: bootstrap.initialState,
+      identity: coordinatorIdentity(
+        state: bootstrap.initialState,
+        installationID: "F2000000-0000-0000-0000-000000000001",
+        machineID: "bootstrap-epoch-barrier-crash"
+      )
+    )
+    defer { environment.removeSandbox() }
+    try await environment.persistInitialAndBootstrap()
+    let initial = environment.initialSnapshot
+    let barrier = bootstrap.barriers[0]
+    let unrelatedBarrier = bootstrap.barriers[1]
+    let candidate = try CryptoStateSnapshot(
+      bootstrap.crypto.setVerifier.prepareBootstrapEpochBarrier(
+        state: initial.state,
+        barrier: barrier,
+        expectedConversationRoutes: bootstrap.expectedConversationRoutes
+      )
+    )
+    let crashing = try environment.makeCoordinator(observer: { stage in
+      if stage == crashStage {
+        throw InjectedCoordinatorCrash(stage: stage)
+      }
+    })
+
+    await assertAsyncError(InjectedCoordinatorCrash(stage: crashStage)) {
+      try await crashing.applyBootstrapEpochBarrier(
+        expected: initial,
+        barrier: barrier,
+        expectedConversationRoutes: bootstrap.expectedConversationRoutes,
+        verifier: bootstrap.crypto.setVerifier
+      )
+    }
+
+    let cutState = try await loadedState(environment)
+    let cutGuard = await environment.keyStore.value(for: environment.guardKey)
+    switch crashStage {
+    case .stateGuardPendingDurable:
+      XCTAssertEqual(cutState, initial)
+      assertGuardPhase(cutGuard, .statePending)
+    case .stateDurable:
+      XCTAssertEqual(cutState, candidate)
+      assertGuardPhase(cutGuard, .statePending)
+    case .guardStableDurable:
+      XCTAssertEqual(cutState, candidate)
+      assertGuardPhase(cutGuard, .stable)
+    case .guardPendingDurable, .keyTransitionGuardPendingDurable,
+      .keyTransitionStateDurable, .keyTransitionGuardStableDurable,
+      .securityQuarantineDurable:
+      XCTFail("bootstrap epoch barrier 不应触发 \(crashStage) crash cut")
+    }
+
+    let restarted = try environment.makeCoordinator(
+      stateStore: environment.makeStateStore()
+    )
+    let permit: DurableStreamAppliedAckPermit
+    if crashStage == .stateGuardPendingDurable {
+      // state CAS 前只有 pending guard，没有 activation proof；cold-open 必须先回滚
+      // guard，且不得凭 pending metadata 提前 mint ACK permit。随后 exact retry 才提交。
+      await assertAsyncError(DeviceKeyLifecycleError.invalidBarrier) {
+        try await restarted.recoverStreamAppliedAcknowledgement(
+          expected: initial,
+          barrier: barrier
+        )
+      }
+      let recoveredInitial = try await loadedState(environment)
+      XCTAssertEqual(recoveredInitial, initial)
+      assertGuardPhase(
+        await environment.keyStore.value(for: environment.guardKey),
+        .stable
+      )
+      _ = try await restarted.auditColdOpen(
+        expected: initial,
+        expectedConversationRoutes: bootstrap.expectedConversationRoutes,
+        verifier: bootstrap.crypto.setVerifier
+      )
+      let retried = try await restarted.applyBootstrapEpochBarrier(
+        expected: initial,
+        barrier: barrier,
+        expectedConversationRoutes: bootstrap.expectedConversationRoutes,
+        verifier: bootstrap.crypto.setVerifier
+      )
+      XCTAssertEqual(retried.snapshot, candidate)
+      permit = retried.acknowledgementPermit
+    } else {
+      // state CAS 已 durable 时，exact retry 走 proof recovery；既不能遗漏 ACK，
+      // 也不能再次执行单向 bootstrap activation。
+      permit = try await restarted.recoverStreamAppliedAcknowledgement(
+        expected: candidate,
+        barrier: barrier
+      )
+    }
+
+    let resolvedState = try await loadedState(environment)
+    XCTAssertEqual(resolvedState, candidate)
+    let stableGuard = await environment.keyStore.value(for: environment.guardKey)
+    assertGuardPhase(stableGuard, .stable)
+    assertStreamAppliedPermit(permit, matches: barrier, state: candidate.state)
+    _ = try await restarted.auditColdOpen(
+      expected: candidate,
+      expectedConversationRoutes: bootstrap.expectedConversationRoutes,
+      verifier: bootstrap.crypto.setVerifier
+    )
+
+    await assertAsyncError(DeviceKeyLifecycleError.invalidBarrier) {
+      try await restarted.recoverStreamAppliedAcknowledgement(
+        expected: candidate,
+        barrier: unrelatedBarrier
+      )
+    }
+
+    let exactRetryPermit = try await restarted.recoverStreamAppliedAcknowledgement(
+      expected: candidate,
+      barrier: barrier
+    )
+    assertStreamAppliedPermit(exactRetryPermit, matches: barrier, state: candidate.state)
+    let stateAfterExactRetry = try await loadedState(environment)
+    XCTAssertEqual(stateAfterExactRetry, candidate)
+    let guardAfterExactRetry = await environment.keyStore.value(for: environment.guardKey)
+    XCTAssertEqual(
+      guardAfterExactRetry,
+      stableGuard,
+      "exact ACK recovery 必须零写"
+    )
+  }
+
+  private func assertStreamAppliedPermit(
+    _ permit: DurableStreamAppliedAckPermit,
+    matches barrier: DeviceEpochBarrierV1,
+    state: DeviceCryptoStateV1,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    XCTAssertEqual(permit.trustScope, state.trustScope, file: file, line: line)
+    XCTAssertEqual(permit.streamRoute, barrier.streamRoute, file: file, line: line)
+    XCTAssertEqual(permit.streamGeneration, barrier.streamGeneration, file: file, line: line)
+    XCTAssertEqual(
+      permit.appliedStreamSequence,
+      barrier.appliedStreamSequence,
+      file: file,
+      line: line
+    )
+    XCTAssertEqual(permit.innerCursor, barrier.innerCursor, file: file, line: line)
+    XCTAssertEqual(
+      permit.keyDirectoryRevision,
+      barrier.keyDirectoryRevision,
+      file: file,
+      line: line
+    )
+    XCTAssertEqual(permit.keyEpoch, barrier.newEpoch, file: file, line: line)
+    XCTAssertEqual(
+      permit.epochBarrierSHA256,
+      barrier.canonicalSHA256,
+      file: file,
+      line: line
+    )
   }
 
   func testSubscriptionBootstrapBindingPersistsExactLiveCutAcrossRestart() async throws {

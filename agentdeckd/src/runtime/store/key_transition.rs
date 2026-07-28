@@ -1932,18 +1932,23 @@ pub(crate) fn load_active_key_transition(
     }))
 }
 
-#[cfg(test)]
-pub(crate) fn load_key_transition_for_capacity_test(
+/// 在单个 Store worker turn 内按 operation id 返回完整认证 recovery。
+///
+/// freeze 命令使用该入口在 commit 后立即构造 reply，避免把“写入”和“读回”
+/// 拆成两条可被 ACK 插队的 Store command。这里也保留 completed transition 的
+/// 幂等读回能力，因此不能退化为 `load_active_key_transition`。
+pub(crate) fn load_key_transition(
     state: &RuntimeSqlite,
     operation_id: [u8; 16],
 ) -> Result<KeyTransitionRecovery, RuntimeStoreError> {
+    validate_nonzero(operation_id)?;
     let transition = load_transition(
         &state.connection,
         &state.key_bundle,
         state.database_id,
         operation_id,
     )?
-    .ok_or(RuntimeStoreError::UnknownOrCorruptSchema)?;
+    .ok_or(RuntimeStoreError::PublicationMismatch)?;
     let updates = load_updates_for_operation(
         &state.connection,
         &state.key_bundle,
@@ -1957,6 +1962,14 @@ pub(crate) fn load_key_transition_for_capacity_test(
         transition: transition.record,
         updates,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn load_key_transition_for_capacity_test(
+    state: &RuntimeSqlite,
+    operation_id: [u8; 16],
+) -> Result<KeyTransitionRecovery, RuntimeStoreError> {
+    load_key_transition(state, operation_id)
 }
 
 /// Catalog retention 的持久 fence。active transition row 本身已由 metadata token +

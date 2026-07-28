@@ -2583,12 +2583,45 @@ actor ProductionMachineConnectionVerifiedIngress:
       }
 
     case .epochBarrier(let barrier):
-      return try await recoverCommittedEpochBarrier(
-        barrier,
-        context: context,
-        replay: replay,
-        scope: scope
-      )
+      switch replay.disposition {
+      case .fresh where barrier.oldEpoch == 0:
+        return try await applyBootstrapEpochBarrier(
+          barrier,
+          context: context,
+          replay: replay,
+          scope: scope
+        )
+      case .exactDuplicate where barrier.oldEpoch == 0:
+        do {
+          return try await recoverCommittedEpochBarrier(
+            barrier,
+            context: context,
+            replay: replay,
+            scope: scope
+          )
+        } catch DeviceKeyLifecycleError.invalidBarrier {
+          // replay admission 与 activation 是两笔 crash-safe CAS。若前者已提交而
+          // 后者尚未开始，exact retry 必须在新的 transport reservation 下补做
+          // 单向 bootstrap activation，不能永久卡在“duplicate but no proof”。
+          return try await applyBootstrapEpochBarrier(
+            barrier,
+            context: context,
+            replay: replay,
+            scope: scope
+          )
+        }
+      case .exactDuplicate:
+        return try await recoverCommittedEpochBarrier(
+          barrier,
+          context: context,
+          replay: replay,
+          scope: scope
+        )
+      case .fresh:
+        throw ProductionMachineConnectionVerifiedIngressError.unsupportedKeyControl
+      case .stale:
+        return .ignored
+      }
 
     case .directoryRevisionAdvance(let advance):
       let boundAdvance = try advance.binding(to: context)
@@ -2611,6 +2644,77 @@ actor ProductionMachineConnectionVerifiedIngress:
 
     case .updateSet, .directoryCurrent:
       throw ProductionMachineConnectionVerifiedIngressError.unsupportedKeyControl
+    }
+  }
+
+  private func applyBootstrapEpochBarrier(
+    _ barrier: DeviceEpochBarrierV1,
+    context: OuterContextV1,
+    replay: DurableReplayAdmissionResult,
+    scope: TransferAssemblyScope
+  ) async throws -> MachineConnectionVerifiedIngressOutcome {
+    guard replay.disposition == .fresh || replay.disposition == .exactDuplicate,
+      barrier.oldEpoch == 0,
+      context.streamRoute == barrier.streamRoute,
+      context.streamGeneration == barrier.streamGeneration,
+      context.streamSeq == barrier.appliedStreamSequence,
+      let reservation = try await reserveControlActionCapacity(
+        actionCount: 2,
+        scope: scope
+      )
+    else {
+      throw ProductionMachineConnectionVerifiedIngressError.unsupportedKeyControl
+    }
+    do {
+      let activated = try await coordinator.applyBootstrapEpochBarrier(
+        expected: replay.snapshot,
+        barrier: barrier,
+        expectedConversationRoutes: expectedConversationRoutes,
+        verifier: keyUpdateVerifier
+      )
+      snapshot = activated.snapshot
+      let ownsProof = try claimStreamAppliedProof(
+        barrier.canonicalSHA256,
+        reservation: reservation.token,
+        scope: scope
+      )
+      try await refreshRuntimeCapabilities(expected: activated.snapshot)
+      if !ownsProof {
+        await releaseTransportActionReservation(reservation.token, scope: scope)
+        try queueOuterAcknowledgement(
+          streamRoute: barrier.streamRoute,
+          streamGeneration: barrier.streamGeneration,
+          upToSeq: barrier.appliedStreamSequence,
+          scope: scope
+        )
+        return .ignored
+      }
+      let signed = try await requestSigner.signStreamAppliedAcknowledgement(
+        permit: activated.acknowledgementPermit,
+        authority: try keyControlAuthority(),
+        requestRoute: reservation.requestRoute
+      )
+      let frame = try RelayV2OutboundFrame.send(
+        deviceRoute: deviceRoute,
+        requestRoute: reservation.requestRoute,
+        sealedBlob: signed.sealedBlob
+      )
+      try registerControlAction(
+        frame,
+        requestRoute: reservation.requestRoute,
+        reservation: reservation.token,
+        proofSHA256: barrier.canonicalSHA256,
+        followingAcknowledgement: PublishAcknowledgement(
+          streamRoute: barrier.streamRoute,
+          streamGeneration: barrier.streamGeneration,
+          upToSeq: barrier.appliedStreamSequence
+        ),
+        scope: scope
+      )
+      return .ignored
+    } catch {
+      await releaseTransportActionReservation(reservation.token, scope: scope)
+      throw error
     }
   }
 

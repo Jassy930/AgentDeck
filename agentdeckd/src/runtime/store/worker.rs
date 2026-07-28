@@ -3586,12 +3586,12 @@ enum NormalCommand {
     FreezeKeyUpdates {
         operation_id: [u8; 16],
         updates: Vec<key_transition::FrozenKeyUpdate>,
-        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecovery, RuntimeStoreError>>,
     },
     FreezeKeyBarriers {
         operation_id: [u8; 16],
         cuts: Vec<key_transition::KeyTransitionStreamCut>,
-        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecord, RuntimeStoreError>>,
+        reply: oneshot::Sender<Result<key_transition::KeyTransitionRecovery, RuntimeStoreError>>,
     },
     MarkKeyBarriersCommitted {
         operation_id: [u8; 16],
@@ -4209,6 +4209,9 @@ enum ReadCommand {
     LoadPendingPublicationStreams {
         reply: oneshot::Sender<Result<Vec<[u8; 16]>, RuntimeStoreError>>,
     },
+    LoadFirstRemoteMemberMissingSnapshotConversations {
+        reply: oneshot::Sender<Result<Vec<RuntimeId>, RuntimeStoreError>>,
+    },
     RegisterStreamBarrier {
         request: RegisterStreamBarrier,
         reply: oneshot::Sender<Result<StreamBarrierRegistration, RuntimeStoreError>>,
@@ -4639,11 +4642,13 @@ fn handle_normal(
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
             NormalCommand::BeginKeyTransition { reply, .. }
-            | NormalCommand::FreezeKeyUpdates { reply, .. }
-            | NormalCommand::FreezeKeyBarriers { reply, .. }
             | NormalCommand::MarkKeyBarriersCommitted { reply, .. }
             | NormalCommand::CompleteKeyTransition { reply, .. }
             | NormalCommand::CancelKeyTransition { reply, .. } => {
+                let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
+            }
+            NormalCommand::FreezeKeyUpdates { reply, .. }
+            | NormalCommand::FreezeKeyBarriers { reply, .. } => {
                 let _ = reply.send(Err(RuntimeStoreError::RecoveryInProgress));
             }
             NormalCommand::TryCompleteKeyTransition { reply, .. } => {
@@ -5120,7 +5125,11 @@ fn handle_normal(
                 .map_err(RuntimeStoreError::from)
                 .and_then(|now| {
                     key_transition::freeze_key_updates(state, config, operation_id, updates, now)
-                });
+                })
+                // 仍在同一个 Store worker turn 内完成认证读回；普通
+                // KeyUpdateAck/PairResponseReceived 不可能插到 freeze commit 与
+                // recovery snapshot 之间。
+                .and_then(|_| key_transition::load_key_transition(state, operation_id));
             let _ = reply.send(result);
         }
         NormalCommand::FreezeKeyBarriers {
@@ -5134,7 +5143,10 @@ fn handle_normal(
                 .map_err(RuntimeStoreError::from)
                 .and_then(|now| {
                     key_transition::freeze_key_barriers(state, config, operation_id, cuts, now)
-                });
+                })
+                // 与 update freeze 一样，返回当前 worker turn 的 exact recovery，
+                // 避免 ACK 在第二条 load command 前推进 lifecycle。
+                .and_then(|_| key_transition::load_key_transition(state, operation_id));
             let _ = reply.send(result);
         }
         NormalCommand::MarkKeyBarriersCommitted {
@@ -6502,6 +6514,11 @@ fn handle_read(
                 &state.key_bundle,
                 state.database_id,
             ));
+        }
+        ReadCommand::LoadFirstRemoteMemberMissingSnapshotConversations { reply } => {
+            let _ = reply.send(
+                super::publication::load_first_remote_member_missing_snapshot_conversations(state),
+            );
         }
         ReadCommand::RegisterStreamBarrier { request, reply } => {
             let result = register_stream_barrier_on_worker(state, config, commit_hub, request);

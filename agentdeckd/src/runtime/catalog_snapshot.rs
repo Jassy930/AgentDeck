@@ -339,6 +339,67 @@ impl CatalogSnapshotProvider {
             .await
     }
 
+    /// fresh first-member pairing 在冻结 Catalog genesis cut 前，只需要把当前 exact H
+    /// 持久化成 authenticated durable baseline，不需要签发页面 cursor 或向任何 principal
+    /// 暴露内容。该内部刷新与普通 Catalog page 共用同一个 operation gate、Store barrier
+    /// 和全局 128 MiB build budget，不能另建一套不计费的 snapshot 路径。
+    pub(crate) async fn refresh_current_durable_baseline(
+        &self,
+    ) -> Result<ReadySnapshotReference, CatalogSnapshotProviderError> {
+        let generation = self
+            .next_one_shot_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| CatalogSnapshotProviderError::GenerationExhausted)?;
+        let mut registration = self
+            .store
+            .register_stream_barrier(RegisterStreamBarrier {
+                target: RuntimeStreamTarget::Catalog,
+                generation: WatchGeneration::new(generation)
+                    .ok_or(CatalogSnapshotProviderError::GenerationExhausted)?,
+                request: super::backfill::BarrierRequest::Subscribe {
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            })
+            .await?;
+        let source = registration
+            .take_catalog_snapshot_source()
+            .ok_or(CatalogSnapshotProviderError::MissingSnapshotSource)?;
+        let (mode, source, frozen) = source.into_parts();
+        if mode != CatalogSnapshotMaterializationMode::DurableRefresh
+            || registration.target != RuntimeStreamTarget::Catalog
+            || frozen != registration.high_water
+            || source
+                .as_ref()
+                .is_some_and(|reference| reference.target != RuntimeStreamTarget::Catalog)
+        {
+            return Err(CatalogSnapshotProviderError::InvalidRegistration);
+        }
+
+        let _operation = self.operation_gate.lock().await;
+        let refresh = self
+            .store
+            .preflight_catalog_snapshot_refresh(source.clone(), frozen)
+            .await?;
+        let reference = if refresh.refresh_required {
+            let memory = CatalogMemoryLease::reserve(
+                self.memory.clone(),
+                self.global_memory.clone(),
+                refresh.peak_retained_bytes,
+            )?;
+            self.store
+                .refresh_catalog_snapshot(source, frozen, memory.shared_permit()?)
+                .await?
+        } else {
+            source.ok_or(CatalogSnapshotProviderError::MissingSnapshotSource)?
+        };
+        if reference.target != RuntimeStreamTarget::Catalog || reference.base != frozen {
+            return Err(CatalogSnapshotProviderError::InvalidRegistration);
+        }
+        Ok(reference)
+    }
+
     /// 在建 barrier/watch/task 前同步预留全局 one-shot quota。调用方必须先同时
     /// 预留 per-connection quota；失败路径不会产生 store side effect。
     pub(crate) fn reserve_one_shot(

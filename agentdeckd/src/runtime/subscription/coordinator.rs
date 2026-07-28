@@ -52,6 +52,8 @@ pub(crate) enum SubscriptionPumpError {
     Connection(#[from] ConnectionError),
     #[error(transparent)]
     Catalog(#[from] CatalogSnapshotProviderError),
+    #[error("runtime snapshot recovery failed: {0}")]
+    Snapshot(String),
     #[error("one-shot catalog job identity is exhausted")]
     CatalogJobIdentityExhausted,
     #[error("one-shot catalog admission reached its absolute deadline")]
@@ -179,6 +181,57 @@ impl SubscriptionCoordinator {
                 barrier_ttl_ms: AtomicU64::new(BARRIER_TTL_MS),
             }),
         }
+    }
+
+    /// fresh first-member pairing 的内部 durable baseline 恢复。Catalog 与全部当前
+    /// 缺失的 managed conversation 都复用同一个 128 MiB budget/build gate；conversation
+    /// 逐个 capture + materialize，因而即使目录达到上限，也不会无界创建 task/pin 或
+    /// 同时保留多份大 DTO。该路径不建立订阅、不发送 frame。
+    pub(crate) async fn refresh_snapshots_for_remote_membership(
+        &self,
+    ) -> Result<(), SubscriptionPumpError> {
+        let missing = self
+            .inner
+            .store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await?;
+        // 先完成 authenticated publication/conversation 只读计划，再允许第一笔
+        // snapshot write；authority/NeedsSnapshot/corruption 失败不得顺手刷新 Catalog。
+        self.inner
+            .catalog_snapshots
+            .refresh_current_durable_baseline()
+            .await?;
+        for conversation_id in missing {
+            let source = self
+                .inner
+                .store
+                .acquire_snapshot_build_source(conversation_id)
+                .await?;
+            let reduced = super::reducer::materialize(
+                &self.inner.store,
+                self.inner.router.clone(),
+                source,
+                self.inner.snapshot_build_budget.clone(),
+                self.inner.snapshot_build_gate.clone(),
+            )
+            .await
+            .map_err(|error| SubscriptionPumpError::Snapshot(error.to_string()))?;
+            let (_snapshot, payload, _history_command_ids, _memory_permit) = reduced.into_parts();
+            if matches!(
+                &payload,
+                super::reducer::ReducedSnapshotPayload::Durable { .. }
+            ) {
+                continue;
+            }
+            // NativeProjected/transition-only materialization 不能伪装成 durable baseline。
+            // 先精确释放 TEMP pin，再保持 typed snapshot prerequisite fail-close。
+            payload
+                .release_after_flush(&self.inner.store, self.inner.router.clone())
+                .await
+                .map_err(|error| SubscriptionPumpError::Snapshot(error.to_string()))?;
+            return Err(RuntimeStoreError::PublicationNeedsSnapshot.into());
+        }
+        Ok(())
     }
 
     pub(crate) async fn prepare(

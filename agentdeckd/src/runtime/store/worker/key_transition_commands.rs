@@ -111,7 +111,7 @@ impl RuntimeStoreHandle {
         &self,
         operation_id: [u8; 16],
         updates: Vec<key_transition::FrozenKeyUpdate>,
-    ) -> Result<key_transition::KeyTransitionRecord, RuntimeStoreError> {
+    ) -> Result<key_transition::KeyTransitionRecovery, RuntimeStoreError> {
         let retained = retained_key_updates_bytes(&updates, updates.capacity())?;
         dispatch_with_budget(
             &self.normal_tx,
@@ -132,7 +132,7 @@ impl RuntimeStoreHandle {
         &self,
         operation_id: [u8; 16],
         cuts: Vec<key_transition::KeyTransitionStreamCut>,
-    ) -> Result<key_transition::KeyTransitionRecord, RuntimeStoreError> {
+    ) -> Result<key_transition::KeyTransitionRecovery, RuntimeStoreError> {
         let retained =
             retained_vec_bytes::<key_transition::KeyTransitionStreamCut>(cuts.capacity())?;
         dispatch_with_budget(
@@ -671,10 +671,19 @@ mod tests {
             canonical_update_set: b"exact-handle-key-update".to_vec(),
         };
         clock.store(now_ms + 2, Ordering::SeqCst);
-        store
+        let update_recovery = store
             .freeze_key_updates(operation_id, vec![update.clone()])
             .await
             .expect("freeze exact update through handle");
+        assert_eq!(
+            update_recovery.transition.phase,
+            key_transition::KeyTransitionPhase::UpdatesFrozen
+        );
+        assert_eq!(update_recovery.updates.len(), 1);
+        assert_eq!(
+            update_recovery.updates[0].canonical_update_set,
+            update.canonical_update_set
+        );
         let query = key_transition::KeySyncRead {
             recipient: member,
             known_revision: from_revision,
@@ -712,10 +721,15 @@ mod tests {
         assert_eq!(active.updates.len(), 1);
 
         clock.store(now_ms + 3, Ordering::SeqCst);
-        store
+        let barrier_recovery = store
             .freeze_key_barriers(operation_id, Vec::new())
             .await
             .expect("device counter recovery has an empty barrier set");
+        assert_eq!(
+            barrier_recovery.transition.phase,
+            key_transition::KeyTransitionPhase::BarriersFrozen
+        );
+        assert_eq!(barrier_recovery.updates, update_recovery.updates);
         clock.store(now_ms + 4, Ordering::SeqCst);
         store
             .mark_key_barriers_committed(operation_id)

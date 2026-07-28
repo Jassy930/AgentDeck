@@ -213,6 +213,10 @@ public actor RelaySessionSource: SessionSource {
   /// 窗口内仍然准确；同 target 不能在旧 retirement 的跨 actor await 中 ABA 重建。
   private var conversationRetirements: [String: String] = [:]
   private var connectionStates: [String: SessionConnectionState] = [:]
+  /// transport generation 不能单独标识 production reconnect（每轮 fresh transport 可从
+  /// 1 重新计数）；业务门禁必须绑定 connectionID + generation 的完整 exact scope。
+  private var connectionScopes: [String: TransferAssemblyScope] = [:]
+  private var businessReadyScopes: [String: TransferAssemblyScope] = [:]
   /// fatal terminal 是 per-machine 单向 latch。任何迟到 transport update、reconnect 或
   /// observation recovery 都不能把 revoked/incompatible/securityError 改回在线。
   private var fatalConnectionStates: [String: SessionConnectionState] = [:]
@@ -495,6 +499,14 @@ public actor RelaySessionSource: SessionSource {
         conversationObservations.removeValue(forKey: conversationID)
         return observationCapacityConversationStream()
       }
+      // Machine 可能早于 conversation ViewModel 进入 connected。late observer 必须先
+      // 取得当前非默认连接态，不能只能等待下一次 reconnect 才知道 endpoint 已在线。
+      if let currentState = connectionStates[machineID], currentState != .connecting {
+        _ = await broadcaster.publish(
+          .connectionState(currentState),
+          on: generation
+        )
+      }
       await issueConversationSubscription(
         machineID: machineID,
         conversationID: runtimeID,
@@ -710,7 +722,21 @@ public actor RelaySessionSource: SessionSource {
         return
       }
       updateTasks[machineID] = task
-      await beginCatalogSubscription(machineID)
+      let readiness = await connection.readinessSnapshot()
+      guard lifecycleIsCurrent(expectedLifecycleGeneration) else { return }
+      guard
+        readiness.readyScope == nil
+          || readiness.readyScope == readiness.connectionScope
+      else {
+        await failMachine(machineID, state: .securityError)
+        continue
+      }
+      if let scope = readiness.connectionScope {
+        await receive(.connectionScope(scope), from: machineID)
+      }
+      if let scope = readiness.readyScope {
+        await receive(.businessReady(scope), from: machineID)
+      }
     }
     guard lifecycleIsCurrent(expectedLifecycleGeneration) else { return }
     await publishMachines()
@@ -730,22 +756,40 @@ public actor RelaySessionSource: SessionSource {
         await failMachine(machineID, state: state)
         return
       }
-      let previous = connectionStates[machineID] ?? .connecting
       connectionStates[machineID] = state
       bumpResourceRevision()
       await publishMachines()
       await publishConnectionState(state, machineID: machineID)
       await publishCatalogStaleness(state, machineID: machineID)
-      if state == .connected,
-        previous == .relayUnavailable || previous == .machineOffline || previous == .reconnecting
-      {
-        await beginCatalogSubscription(machineID)
-        let conversationIDs = conversationObservations.compactMap { conversationID, observation in
-          observation.machineID == machineID ? conversationID : nil
-        }
-        for conversationID in conversationIDs {
-          await recoverConversation(conversationID, reason: .snapshotRequired)
-        }
+      if state != .connected {
+        connectionScopes.removeValue(forKey: machineID)
+        businessReadyScopes.removeValue(forKey: machineID)
+      }
+
+    case .connectionScope(let scope):
+      guard let scope else {
+        connectionScopes.removeValue(forKey: machineID)
+        businessReadyScopes.removeValue(forKey: machineID)
+        return
+      }
+      if connectionScopes[machineID] != scope {
+        connectionScopes[machineID] = scope
+        businessReadyScopes.removeValue(forKey: machineID)
+      }
+
+    case .businessReady(let scope):
+      guard connectionScopes[machineID] == scope,
+        businessReadyScopes[machineID] != scope
+      else {
+        return
+      }
+      businessReadyScopes[machineID] = scope
+      await beginCatalogSubscription(machineID)
+      let conversationIDs = conversationObservations.compactMap { conversationID, observation in
+        observation.machineID == machineID ? conversationID : nil
+      }
+      for conversationID in conversationIDs.sorted() {
+        await recoverConversation(conversationID, reason: .snapshotRequired)
       }
 
     case .streamRecoveryRequired(let target, let reason):
@@ -1201,6 +1245,11 @@ public actor RelaySessionSource: SessionSource {
 
   private func beginCatalogSubscription(_ machineID: String) async {
     guard !shuttingDown, fatalConnectionStates[machineID] == nil else { return }
+    guard let currentScope = connectionScopes[machineID],
+      businessReadyScopes[machineID] == currentScope
+    else {
+      return
+    }
     let requestID = makeSubscriptionRequestID()
     catalogActiveSubscriptions.removeValue(forKey: machineID)
     catalogBootstraps[machineID] = CatalogBootstrap(requestID: requestID)
@@ -1223,6 +1272,11 @@ public actor RelaySessionSource: SessionSource {
     requestID: RuntimeMessageID
   ) async {
     guard !shuttingDown, fatalConnectionStates[machineID] == nil else { return }
+    guard let currentScope = connectionScopes[machineID],
+      businessReadyScopes[machineID] == currentScope
+    else {
+      return
+    }
     do {
       try await commandClient.subscribe(
         machineID: machineID,
@@ -1359,6 +1413,10 @@ public actor RelaySessionSource: SessionSource {
       }
     }
     connectionStates[machineID] = effectiveState
+    if effectiveState != .connected {
+      connectionScopes.removeValue(forKey: machineID)
+      businessReadyScopes.removeValue(forKey: machineID)
+    }
     bumpResourceRevision()
     await publishMachines()
     await publishConnectionState(effectiveState, machineID: machineID)

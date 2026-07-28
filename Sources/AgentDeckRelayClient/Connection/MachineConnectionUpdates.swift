@@ -6,13 +6,26 @@ import Foundation
 /// raw Relay frame、`RuntimeEnvelopeV2` 与未验签 sealed blob 均不得进入此协议。
 protocol MachineConnectionUpdateSource: Sendable {
   func updates() async -> AsyncStream<MachineConnectionUpdate>
+  /// claim update stream 后的 exact actor readback；用于消除 owner 已经 ready、consumer
+  /// 尚未开始迭代之间的启动窗口。readyScope 只能为 nil 或等于 connectionScope。
+  func readinessSnapshot() async -> MachineConnectionReadinessSnapshot
   func commit(_ delivery: VerifiedRuntimeDelivery) async throws
   func discard(_ delivery: VerifiedRuntimeDelivery) async
   func shutdown() async
 }
 
+struct MachineConnectionReadinessSnapshot: Equatable, Sendable {
+  let connectionScope: TransferAssemblyScope?
+  let readyScope: TransferAssemblyScope?
+}
+
 enum MachineConnectionUpdate: Sendable {
   case connectionState(SessionConnectionState)
+  /// 当前已认证的 physical connection + transport generation。Source 只能把同一
+  /// exact scope 的 `businessReady` 当作业务订阅许可；reconnect 会先清空该 scope。
+  case connectionScope(TransferAssemblyScope?)
+  /// resume/control ACK 已全部真实写入 transport 后的一次性业务就绪边界。
+  case businessReady(TransferAssemblyScope)
   case delivery(VerifiedRuntimeDelivery)
   case streamRecoveryRequired(target: VerifiedRuntimeTarget, reason: SessionLagReason)
 }

@@ -82,6 +82,21 @@ impl Drop for ManagedSubscriptionPublicationOutcome {
 }
 
 impl RuntimeStoreHandle {
+    /// 返回 first-member confirm 当前缺少 exact durable snapshot coverage 的
+    /// conversation。读取在唯一 Store worker 上认证 publication directory、parent H
+    /// 与 snapshot row；不创建 pin、不写 durable state。
+    pub(crate) async fn load_first_remote_member_missing_snapshot_conversations(
+        &self,
+    ) -> Result<Vec<super::super::RuntimeId>, RuntimeStoreError> {
+        dispatch(
+            &self.read_tx,
+            &self.lifecycle,
+            RuntimeStoreLane::Read,
+            |reply| ReadCommand::LoadFirstRemoteMemberMissingSnapshotConversations { reply },
+        )
+        .await?
+    }
+
     /// watcher 注册、H capture、retained/snapshot/publication cut 均在唯一 store
     /// worker 的同一个短 ReadCommand 内完成；返回前不保留 SQLite transaction。
     pub async fn register_stream_barrier(

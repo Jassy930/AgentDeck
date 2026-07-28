@@ -4,13 +4,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agentdeck_crypto::rand_core::{TryCryptoRng, TryRng};
 use agentdeck_crypto::{
-    HpkePrivateKey, SigningKey, ValidatedRelayReceiptSignerIdentityV1, sha256,
-    sign_relay_admin_purge_receipt,
+    HpkePrivateKey, SigningKey, ValidatedRelayReceiptSignerIdentityV1, open_pair_request_verified,
+    seal_pair_request, sha256, sign_relay_admin_purge_receipt,
 };
-use agentdeck_protocol::e2ee::{E2EE_FORMAT_VERSION, KeyId, KeyPurpose, PairInviteV1};
+use agentdeck_protocol::e2ee::{
+    AuthorizationCapabilityV1, AuthorizationPermissionV1, AuthorizationRequestV1,
+    E2EE_FORMAT_VERSION, KeyId, KeyPurpose, OuterContextV1, OuterFrameKind, PairInviteV1,
+    PairRequestInfoV1, PairRequestPlaintextV1, PairingControlEnvelopeV1,
+};
 use agentdeck_protocol::relay_v2::failure::RelayFailure;
-use agentdeck_protocol::relay_v2::frame::{RelayFrameBody, RetirementCommitted};
+use agentdeck_protocol::relay_v2::frame::{PairRouteOpened, RelayFrameBody, RetirementCommitted};
 use agentdeck_protocol::relay_v2::{
     Digest32, ENROLLMENT_BUNDLE_VERSION, EnrollmentBundleV2, EnrollmentCode,
     MachineEnrollmentResponseV1, MachineRouteId, OpaqueRouteFrame, PairRouteId, PublicKeyBytes,
@@ -19,12 +24,14 @@ use agentdeck_protocol::relay_v2::{
     RelayAdminPurgeTombstoneV1, RelayMachineTombstoneKindV1, RelayServerId, RootKeyId, TrustEpoch,
     admin_purge_tombstone_hash, encode, enrollment_receipt_hash, purge_request_hash,
 };
-use agentdeck_protocol::runtime::identity::{DeviceHandle, GrantSerial};
+use agentdeck_protocol::runtime::identity::{DeviceHandle, GrantSerial, PairingId};
 use agentdeck_protocol::runtime::{
-    ArtifactSha256, LocalOnlyAdministration, MachineEnrollRequest,
-    MachineRemoteLifecycle as WireLifecycle, RevocationReceipt, TrustResetRequest,
-    UninstallPurgePlanV1,
+    ArtifactSha256, CodexConversationConfiguration, ConversationConfiguration,
+    LocalOnlyAdministration, MachineEnrollRequest, MachineRemoteLifecycle as WireLifecycle,
+    RUNTIME_PROTOCOL_VERSION, RevocationReceipt, TrustResetRequest, UninstallPurgePlanV1,
+    VendorConfigurationSnapshot,
 };
+use agentdeck_protocol::{CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode};
 use agentdeck_relay_client::{RelayClientConfig, RelayClientError};
 
 use crate::config::{DaemonConfig, DaemonStartupOptions};
@@ -41,16 +48,21 @@ use crate::remote::identity::{
     MACHINE_LINK_SIGN_ACCOUNT, MACHINE_ROOT_SIGN_ACCOUNT,
 };
 use crate::remote::workflow::{EnrollmentEndpoint, MachineEnrollmentWorkflow};
+use crate::runtime::model::ConversationDescriptor;
 use crate::runtime::remote_administration::RemoteAdministration;
 use crate::runtime::store::IdempotencyOwner;
+use crate::runtime::store::pairing::{
+    AcceptPairRequest, CommitPairPending, PairingInviteLifecycle,
+};
 use crate::runtime::store::pairing::{PreparePairingInvite, PreparePairingInviteOutcome};
 use crate::runtime::store::{
-    ActiveMachineEnrollmentState, LocalDeletedMachineEnrollmentState, MachineEnrollmentState,
-    MachineRemoteLifecycle, MachineRemoteStateRecord, MachineTrustResetKind,
-    PublicationPayloadKind, PublicationScope, RuntimeStoreConfig, RuntimeStoreHandle,
-    active_authorization_store_for_test,
+    ActiveMachineEnrollmentState, ConfigureConversation, ConfigureConversationOutcome,
+    LocalDeletedMachineEnrollmentState, MachineEnrollmentState, MachineIdentityBinding,
+    MachineRemoteLifecycle, MachineRemoteStateRecord, MachineTrustResetKind, NewConversation,
+    PublicationPayloadKind, PublicationScope, RuntimeId, RuntimeIdKind, RuntimeStoreConfig,
+    RuntimeStoreHandle, active_authorization_store_for_test,
 };
-use crate::runtime::{PairingAdministration, RevocationAdministration};
+use crate::runtime::{PairingAdministration, PairingAdministrationError, RevocationAdministration};
 use crate::security::{KeyStore, MemoryKeyStore, SecretBytes, load_or_create_storage_kek};
 
 use super::{
@@ -492,6 +504,909 @@ async fn finish_fixture(manager: RemoteManager, fixture: ManagerFixture) {
         .shutdown()
         .await
         .expect("shutdown manager fixture Store");
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+struct StoreBackedConfirmFixture {
+    root: PathBuf,
+    database: PathBuf,
+    keys: Arc<MemoryKeyStore>,
+    store: RuntimeStoreHandle,
+    config: DaemonConfig,
+    binding: MachineIdentityBinding,
+    data_certificate: agentdeck_protocol::relay_v2::SignedCertificate,
+}
+
+async fn store_backed_confirm_fixture(label: &str) -> StoreBackedConfirmFixture {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let root = Path::new("/tmp").join(format!("adm-{label}-{}", &suffix[..8]));
+    fs::create_dir(&root).expect("create store-backed confirm fixture root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("secure store-backed confirm fixture root");
+    }
+    let keys = Arc::new(MemoryKeyStore::new());
+    let database = root.join("runtime.db");
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(database.clone()),
+        load_or_create_storage_kek(keys.as_ref(), &database)
+            .expect("create store-backed confirm StorageKEK"),
+    )
+    .await
+    .expect("open store-backed confirm Store");
+    let (binding, data_certificate) = crate::runtime::store::make_active_for_test(&store).await;
+    let home = root.join("h");
+    fs::create_dir_all(home.join("Library/Application Support"))
+        .expect("create store-backed confirm fixture home");
+    let config = DaemonConfig::resolve_with_roots(
+        DaemonStartupOptions {
+            ephemeral: false,
+            no_remote: false,
+            stdio_compat: false,
+            profile: None,
+            stable_keychain_access_group: Some(
+                "A1B2C3D4E5.com.agentdeck.agentdeckd.stable".to_owned(),
+            ),
+        },
+        &home,
+        &root,
+    )
+    .expect("resolve store-backed confirm config");
+    StoreBackedConfirmFixture {
+        root,
+        database,
+        keys,
+        store,
+        config,
+        binding,
+        data_certificate,
+    }
+}
+
+struct ManagerPairingRng(u64);
+
+impl TryRng for ManagerPairingRng {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.try_next_u64()? as u32)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        Ok(self.0)
+    }
+
+    fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), Self::Error> {
+        for chunk in destination.chunks_mut(8) {
+            let bytes = self.try_next_u64()?.to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+        Ok(())
+    }
+}
+
+impl TryCryptoRng for ManagerPairingRng {}
+
+fn manager_pair_request_info(invite: &PairInviteV1) -> PairRequestInfoV1 {
+    PairRequestInfoV1 {
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
+        relay_server_id: invite.relay_server_id,
+        pair_route: invite.pair_route,
+        invite_hash: invite
+            .canonical_sha256()
+            .expect("hash store-backed confirm invite"),
+        expiry_ms: invite.expires_at_ms,
+    }
+}
+
+fn manager_pair_context(invite: &PairInviteV1, frame_kind: OuterFrameKind) -> OuterContextV1 {
+    OuterContextV1 {
+        frame_kind,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        e2ee_format_version: E2EE_FORMAT_VERSION,
+        machine_route: None,
+        device_route: None,
+        stream_route: None,
+        request_route: None,
+        pair_route: Some(invite.pair_route),
+        stream_generation: None,
+        stream_cursor: None,
+        stream_seq: None,
+        message_key_epoch: 0,
+    }
+}
+
+async fn seed_store_backed_awaiting_confirmation(fixture: &StoreBackedConfirmFixture) -> RuntimeId {
+    let active = active_state(&fixture.store).await;
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("store-backed confirm clock after epoch")
+            .as_millis(),
+    )
+    .expect("store-backed confirm clock fits u64");
+    let pair_route = PairRouteId::from_bytes([0xb1; 16]);
+    let invite_private_seed = [0xb2; 32];
+    let invite_private =
+        HpkePrivateKey::from_bytes(&invite_private_seed).expect("valid pairing HPKE private key");
+    let invite_public: [u8; 32] = invite_private
+        .public_key()
+        .to_bytes()
+        .try_into()
+        .expect("pairing HPKE public key is 32 bytes");
+    let invite = PairInviteV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        relay_protocol_version: RELAY_PROTOCOL_VERSION,
+        pair_route,
+        invite_secret: [0xb3; 32],
+        invite_hpke_pubkey: PublicKeyBytes(invite_public),
+        wss_url: "wss://relay.example.test:8443/".to_owned(),
+        relay_server_id: active.connection.relay_server_id,
+        current_spki_pin: [0x52; 32],
+        next_spki_pin: [0x53; 32],
+        expires_at_ms: now_ms + 300_000,
+        machine_root_pubkey: PublicKeyBytes(fixture.binding.root_public_key),
+        machine_root_fingerprint: fixture.binding.root_fingerprint,
+        data_sign_cert: fixture.data_certificate.clone(),
+        machine_display_name: "snapshot recovery pairing".to_owned(),
+    };
+    let prepared = fixture
+        .store
+        .prepare_pairing_invite(PreparePairingInvite::new(
+            IdempotencyOwner::Local {
+                machine_trust_domain: fixture
+                    .store
+                    .machine_trust_domain()
+                    .expect("load store-backed pairing trust domain"),
+                uid: 501,
+                client_installation_id: [0xb4; 16],
+            },
+            "snapshot-recovery-pairing".to_owned(),
+            SecretBytes::new(
+                invite
+                    .canonical_bytes()
+                    .expect("encode store-backed confirm invite"),
+            ),
+            SecretBytes::new(invite_private_seed.to_vec()),
+        ))
+        .await
+        .expect("prepare store-backed confirm pairing");
+    let pairing_id = match prepared {
+        PreparePairingInviteOutcome::Prepared { invite } => invite.pairing_id(),
+        other => panic!("fresh store-backed pairing must prepare, got {other:?}"),
+    };
+    fixture
+        .store
+        .acknowledge_pair_route_open(
+            pairing_id,
+            encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::PairRouteOpened(PairRouteOpened {
+                    machine_route: MachineRouteId::from_bytes(active.record.machine_route),
+                    pair_route,
+                    absolute_expiry_ms: invite.expires_at_ms,
+                }),
+            }),
+        )
+        .await
+        .expect("acknowledge store-backed PairRoute open");
+
+    let device_signing_key = SigningKey::from_seed(&[0xb5; 32]);
+    let (_, device_hpke_public_key) = HpkePrivateKey::derive_keypair(&[0xb6; 32]);
+    let plaintext = PairRequestPlaintextV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        invite_secret: invite.invite_secret,
+        device_sign_pubkey: PublicKeyBytes(device_signing_key.verifying_key().to_bytes()),
+        device_hpke_pubkey: PublicKeyBytes(
+            device_hpke_public_key
+                .to_bytes()
+                .try_into()
+                .expect("device HPKE public key is 32 bytes"),
+        ),
+        authorization_request: AuthorizationRequestV1 {
+            format_version: E2EE_FORMAT_VERSION,
+            device_display_name: "snapshot recovery device".to_owned(),
+            capabilities: vec![AuthorizationCapabilityV1::Catalog],
+            permissions: vec![AuthorizationPermissionV1::CatalogRead],
+        },
+    };
+    let info = manager_pair_request_info(&invite);
+    let context = manager_pair_context(&invite, OuterFrameKind::PairRequest);
+    let request = seal_pair_request(
+        &invite_private.public_key(),
+        &info,
+        &context,
+        &plaintext,
+        &device_signing_key,
+        &mut ManagerPairingRng(0xb7),
+    )
+    .expect("seal store-backed PairRequest");
+    let verified = open_pair_request_verified(
+        &invite_private,
+        &info,
+        &context,
+        &invite.invite_secret,
+        &request,
+    )
+    .expect("verify store-backed PairRequest");
+    let request_hash = verified.request_hash();
+    fixture
+        .store
+        .accept_pair_request(AcceptPairRequest::new(pairing_id, verified))
+        .await
+        .expect("accept store-backed PairRequest");
+    let pending = PairingControlEnvelopeV1 {
+        format_version: E2EE_FORMAT_VERSION,
+        enc: vec![0xb8; 32],
+        ciphertext: vec![0xb9; 96],
+    };
+    pending
+        .validate()
+        .expect("store-backed pending envelope is valid");
+    fixture
+        .store
+        .commit_pair_pending(CommitPairPending::new(pairing_id, request_hash, pending))
+        .await
+        .expect("commit store-backed PairPending");
+    assert_eq!(
+        fixture
+            .store
+            .load_pairing_invite(pairing_id)
+            .await
+            .expect("load store-backed pending pairing")
+            .expect("store-backed pending pairing exists")
+            .lifecycle(),
+        PairingInviteLifecycle::AwaitingLocalConfirmation
+    );
+    pairing_id
+}
+
+type EventJournalRow = (
+    Vec<u8>,
+    String,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    i64,
+    i64,
+    Vec<u8>,
+    Vec<u8>,
+);
+
+#[derive(Debug, Eq, PartialEq)]
+struct UnrelatedDurableReadback {
+    machine_remote: (String, String, Vec<u8>, Vec<u8>, Vec<u8>),
+    event_journal: Vec<EventJournalRow>,
+    command_count: i64,
+}
+
+fn unrelated_durable_readback(database: &Path) -> UnrelatedDurableReadback {
+    let connection =
+        rusqlite::Connection::open(database).expect("open unrelated durable readback connection");
+    let machine_remote = connection
+        .query_row(
+            "SELECT lifecycle, trust_epoch, request_hash, sealed_state, metadata_token \
+             FROM machine_remote_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("read unrelated machine enrollment state");
+    let event_journal = connection
+        .prepare(
+            "SELECT conversation_id, event_seq, event_id, command_id, logical_event_bytes, \
+                    created_at_ms, metadata_token, sealed_event \
+             FROM event_journal ORDER BY conversation_id, event_seq",
+        )
+        .expect("prepare unrelated event journal readback")
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        })
+        .expect("query unrelated event journal readback")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect unrelated event journal readback");
+    let command_count = connection
+        .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+        .expect("count unrelated commands");
+    UnrelatedDurableReadback {
+        machine_remote,
+        event_journal,
+        command_count,
+    }
+}
+
+async fn create_snapshot_required_conversation(store: &RuntimeStoreHandle, seed: u8) -> RuntimeId {
+    let conversation_id = RuntimeId::from_bytes(RuntimeIdKind::Conversation, [seed; 16])
+        .expect("manager snapshot recovery conversation id");
+    store
+        .create_conversation(NewConversation {
+            conversation_id,
+            adapter_state_key: RuntimeId::from_bytes(
+                RuntimeIdKind::AdapterState,
+                [seed.wrapping_add(1); 16],
+            )
+            .expect("manager snapshot recovery adapter state id"),
+            descriptor: ConversationDescriptor {
+                agent_kind: agentdeck_protocol::AgentKind::Codex,
+                title: Some("pre-pairing snapshot recovery".to_owned()),
+                cwd: PathBuf::from("/tmp/agentdeck-manager-snapshot-recovery"),
+            },
+        })
+        .await
+        .expect("create manager snapshot recovery conversation");
+    let outcome = store
+        .configure_conversation(ConfigureConversation {
+            conversation_id,
+            owner: IdempotencyOwner::Local {
+                machine_trust_domain: store
+                    .machine_trust_domain()
+                    .expect("load manager snapshot recovery trust domain"),
+                uid: 501,
+                client_installation_id: [seed.wrapping_add(2); 16],
+            },
+            idempotency_key: format!("manager-snapshot-recovery-{seed}"),
+            expected_configuration_revision: 0,
+            configuration: ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+                CodexConversationConfiguration::new(
+                    CodexApprovalPolicy::OnRequest,
+                    CodexSandboxMode::WorkspaceWrite,
+                    CodexReasoningEffort::Medium,
+                ),
+            )),
+        })
+        .await
+        .expect("append manager snapshot recovery event");
+    assert!(matches!(
+        outcome,
+        ConfigureConversationOutcome::Applied { .. }
+    ));
+    conversation_id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_actor_store_confirm_materializes_snapshot_then_retries_exactly_once() {
+    let fixture = store_backed_confirm_fixture("confirm-real-snapshot").await;
+    let conversation_id = create_snapshot_required_conversation(&fixture.store, 0x91).await;
+    let pairing_id = seed_store_backed_awaiting_confirmation(&fixture).await;
+    assert_eq!(
+        fixture
+            .store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await
+            .expect("read initial missing snapshot set"),
+        vec![conversation_id]
+    );
+    let before_unrelated = unrelated_durable_readback(&fixture.database);
+    assert_eq!(
+        rusqlite::Connection::open(&fixture.database)
+            .expect("open pre-confirm snapshot count connection")
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count pre-confirm snapshots"),
+        0,
+        "fixture must begin without catalog or conversation snapshot shortcuts"
+    );
+
+    let manager = RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Disabled,
+    );
+    let core = Arc::new(
+        crate::runtime::RuntimeCore::new(
+            fixture.store.clone(),
+            Arc::new(crate::runtime::AgentRouter::with_runtime_store(
+                fixture.store.clone(),
+            )),
+            fixture
+                .store
+                .machine_trust_domain()
+                .expect("load store-backed confirm trust domain"),
+        )
+        .expect("construct store-backed confirm RuntimeCore"),
+    );
+    assert!(manager.install_runtime_core(&core));
+    let (owner, mut confirm_observer) =
+        crate::remote::pairing::PairingCoordinatorOwner::store_backed_confirm_observed_for_test(
+            fixture.store.clone(),
+            fixture.binding.clone(),
+            fixture.data_certificate.clone(),
+        )
+        .await;
+    {
+        let mut state = manager.state.lock().await;
+        state.enabled = true;
+        state.armed = true;
+        state.pairing = Some(owner);
+        assert!(state.pairing_handle_for_test.is_none());
+    }
+
+    let receipt = manager
+        .confirm(pairing_id)
+        .await
+        .expect("manager recovers the real snapshot prerequisite and confirms");
+    assert!(matches!(
+        receipt,
+        agentdeck_protocol::runtime::PairingReceipt::Confirmed { .. }
+    ));
+    let first = tokio::time::timeout(Duration::from_secs(2), confirm_observer.recv())
+        .await
+        .expect("first real confirm observation timeout")
+        .expect("first real confirm observation exists");
+    assert_eq!(
+        first
+            .expect_err("first real confirm must expose the Store prerequisite")
+            .code(),
+        "daemon.runtime.snapshot_required"
+    );
+    let second = tokio::time::timeout(Duration::from_secs(2), confirm_observer.recv())
+        .await
+        .expect("second real confirm observation timeout")
+        .expect("second real confirm observation exists")
+        .expect("second real confirm succeeds after RuntimeCore materialization");
+    assert_eq!(second, receipt);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), confirm_observer.recv())
+            .await
+            .is_err(),
+        "successful second confirm must not issue a third actor command"
+    );
+    assert!(
+        fixture
+            .store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await
+            .expect("read recovered missing snapshot set")
+            .is_empty(),
+        "RuntimeCore must durably cover the exact current conversation H"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .load_pairing_invite(pairing_id)
+            .await
+            .expect("load confirmed store-backed pairing")
+            .expect("confirmed store-backed pairing remains pending Relay ACK")
+            .lifecycle(),
+        PairingInviteLifecycle::GrantPreparing
+    );
+
+    let (snapshot_rows, authorization_lifecycles, outbox_count) = {
+        let connection = rusqlite::Connection::open(&fixture.database)
+            .expect("open post-confirm composition readback");
+        let snapshot_rows = connection
+            .prepare(
+                "SELECT target_scope, conversation_id, base_cursor \
+                 FROM snapshots ORDER BY target_scope, conversation_id",
+            )
+            .expect("prepare snapshot composition readback")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .expect("query snapshot composition readback")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect snapshot composition readback");
+        let authorization_lifecycles = connection
+            .prepare("SELECT lifecycle FROM remote_authorization_ledger ORDER BY grant_serial")
+            .expect("prepare authorization readback")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query authorization readback")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect authorization readback");
+        let outbox_count = connection
+            .query_row("SELECT COUNT(*) FROM remote_control_outbox", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count confirm outbox rows");
+        (snapshot_rows, authorization_lifecycles, outbox_count)
+    };
+    assert_eq!(
+        snapshot_rows,
+        vec![
+            (
+                "catalog".to_owned(),
+                None,
+                Some("00000000000000000000".to_owned())
+            ),
+            (
+                "conversation".to_owned(),
+                Some(conversation_id.as_bytes().to_vec()),
+                Some("00000000000000000000".to_owned()),
+            ),
+        ],
+        "recovery writes exactly the catalog baseline and the one missing conversation snapshot"
+    );
+    assert_eq!(authorization_lifecycles, vec!["grantPreparing"]);
+    assert_eq!(outbox_count, 1);
+    assert_eq!(
+        unrelated_durable_readback(&fixture.database),
+        before_unrelated,
+        "snapshot recovery and confirm must not rewrite machine enrollment, journal events, or commands"
+    );
+
+    manager.shutdown().await;
+    drop(manager);
+    core.shutdown()
+        .await
+        .expect("shutdown store-backed confirm RuntimeCore");
+    drop(core);
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_recovers_active_conversation_snapshots_and_retries_after_h_drift() {
+    let mut fixture = active_fixture("confirm-snapshot-h-drift").await;
+    let conversation_id = create_snapshot_required_conversation(&fixture.store, 0xa1).await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let core = Arc::new(
+        crate::runtime::RuntimeCore::new(
+            fixture.store.clone(),
+            Arc::new(crate::runtime::AgentRouter::with_runtime_store(
+                fixture.store.clone(),
+            )),
+            fixture
+                .store
+                .machine_trust_domain()
+                .expect("load confirm recovery trust domain"),
+        )
+        .expect("construct confirm recovery RuntimeCore"),
+    );
+    assert!(manager.install_runtime_core(&core));
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test =
+            Some(crate::remote::pairing::PairingCoordinatorHandle::confirm_test_double(entered_tx));
+    }
+    let pairing_id = RuntimeId::from_bytes(RuntimeIdKind::Pairing, [0xb1; 16])
+        .expect("confirm recovery pairing id");
+    let operation = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.confirm(pairing_id).await })
+    };
+
+    entered_rx
+        .recv()
+        .await
+        .expect("first confirm reaches pairing actor")
+        .send(Err(PairingAdministrationError::new(
+            "daemon.runtime.snapshot_required",
+        )))
+        .expect("release first snapshot prerequisite");
+    let second = tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("first snapshot recovery timeout")
+        .expect("second confirm reaches pairing actor");
+    assert!(
+        fixture
+            .store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await
+            .expect("recheck first recovery coverage")
+            .is_empty()
+    );
+
+    // 模拟 retry transaction 看见 build 之后推进的新 H，并要求第二轮重采样。
+    assert!(matches!(
+        fixture
+            .store
+            .configure_conversation(ConfigureConversation {
+                conversation_id,
+                owner: IdempotencyOwner::Local {
+                    machine_trust_domain: fixture
+                        .store
+                        .machine_trust_domain()
+                        .expect("load drift owner trust domain"),
+                    uid: 501,
+                    client_installation_id: [0xb2; 16],
+                },
+                idempotency_key: "manager-snapshot-drift".to_owned(),
+                expected_configuration_revision: 1,
+                configuration: ConversationConfiguration::new(VendorConfigurationSnapshot::Codex(
+                    CodexConversationConfiguration::new(
+                        CodexApprovalPolicy::OnRequest,
+                        CodexSandboxMode::WorkspaceWrite,
+                        CodexReasoningEffort::High,
+                    )
+                ),),
+            })
+            .await
+            .expect("advance H before confirm retry"),
+        ConfigureConversationOutcome::Applied { .. }
+    ));
+    second
+        .send(Err(PairingAdministrationError::new(
+            "daemon.runtime.snapshot_required",
+        )))
+        .expect("release drifted snapshot prerequisite");
+    let third = tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("second snapshot recovery timeout")
+        .expect("third confirm reaches pairing actor");
+    assert!(
+        fixture
+            .store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await
+            .expect("recheck drift recovery coverage")
+            .is_empty()
+    );
+    let receipt = agentdeck_protocol::runtime::PairingReceipt::Confirmed {
+        pairing_id: PairingId::new(pairing_id.to_canonical_string()),
+    };
+    third
+        .send(Ok(receipt.clone()))
+        .expect("release successful confirm receipt");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), operation)
+            .await
+            .expect("confirm recovery result timeout")
+            .expect("join confirm recovery")
+            .expect("confirm converges after H drift"),
+        receipt
+    );
+
+    let manager = Arc::try_unwrap(manager)
+        .unwrap_or_else(|_| panic!("confirm recovery drops all manager owners"));
+    manager.shutdown().await;
+    drop(manager);
+    core.shutdown()
+        .await
+        .expect("shutdown confirm recovery core");
+    drop(core);
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_snapshot_recovery_stops_after_three_rounds_and_returns_fourth_error() {
+    let mut fixture = active_fixture("confirm-snap-bound").await;
+    let conversation_id = create_snapshot_required_conversation(&fixture.store, 0xe1).await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let core = Arc::new(
+        crate::runtime::RuntimeCore::new(
+            fixture.store.clone(),
+            Arc::new(crate::runtime::AgentRouter::with_runtime_store(
+                fixture.store.clone(),
+            )),
+            fixture
+                .store
+                .machine_trust_domain()
+                .expect("load bounded recovery trust domain"),
+        )
+        .expect("construct bounded recovery RuntimeCore"),
+    );
+    assert!(manager.install_runtime_core(&core));
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test =
+            Some(crate::remote::pairing::PairingCoordinatorHandle::confirm_test_double(entered_tx));
+    }
+    let pairing_id = RuntimeId::from_bytes(RuntimeIdKind::Pairing, [0xe2; 16])
+        .expect("bounded recovery pairing id");
+    let operation = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.confirm(pairing_id).await })
+    };
+
+    let mut current = tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+        .await
+        .expect("initial bounded confirm timeout")
+        .expect("initial bounded confirm reaches pairing actor");
+    let efforts = [
+        CodexReasoningEffort::High,
+        CodexReasoningEffort::Low,
+        CodexReasoningEffort::Medium,
+    ];
+    for (recovery_round, effort) in efforts.into_iter().enumerate() {
+        current
+            .send(Err(PairingAdministrationError::new(
+                "daemon.runtime.snapshot_required",
+            )))
+            .unwrap_or_else(|_| panic!("release snapshot prerequisite round {recovery_round}"));
+        current = tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("snapshot recovery round {recovery_round} timeout"))
+            .unwrap_or_else(|| {
+                panic!("confirm retry round {recovery_round} reaches pairing actor")
+            });
+        assert!(
+            fixture
+                .store
+                .load_first_remote_member_missing_snapshot_conversations()
+                .await
+                .unwrap_or_else(|_| panic!("read recovery coverage round {recovery_round}"))
+                .is_empty(),
+            "snapshot recovery round {recovery_round} must cover its captured H"
+        );
+
+        // 每轮成功恢复后再推进 H；前三次 retry 因而都必须执行真实 conversation
+        // snapshot recovery，而第四次 typed error 达到上限后不得覆盖最后一次漂移。
+        assert!(matches!(
+            fixture
+                .store
+                .configure_conversation(ConfigureConversation {
+                    conversation_id,
+                    owner: IdempotencyOwner::Local {
+                        machine_trust_domain: fixture
+                            .store
+                            .machine_trust_domain()
+                            .expect("load bounded recovery owner trust domain"),
+                        uid: 501,
+                        client_installation_id: [0xe3 + recovery_round as u8; 16],
+                    },
+                    idempotency_key: format!("bounded-snapshot-drift-{recovery_round}"),
+                    expected_configuration_revision: recovery_round as u64 + 1,
+                    configuration: ConversationConfiguration::new(
+                        VendorConfigurationSnapshot::Codex(CodexConversationConfiguration::new(
+                            CodexApprovalPolicy::OnRequest,
+                            CodexSandboxMode::WorkspaceWrite,
+                            effort,
+                        ),),
+                    ),
+                })
+                .await
+                .unwrap_or_else(|_| panic!("advance bounded H after round {recovery_round}")),
+            ConfigureConversationOutcome::Applied { .. }
+        ));
+    }
+
+    current
+        .send(Err(PairingAdministrationError::new(
+            "daemon.runtime.snapshot_required",
+        )))
+        .expect("release fourth snapshot prerequisite");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), operation)
+            .await
+            .expect("bounded confirm result timeout")
+            .expect("join bounded confirm")
+            .expect_err("fourth snapshot prerequisite must remain terminal")
+            .code(),
+        "daemon.runtime.snapshot_required"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await
+            .expect("read final uncovered H"),
+        vec![conversation_id],
+        "fourth snapshot prerequisite must not trigger a fourth recovery"
+    );
+    assert!(
+        entered_rx.try_recv().is_err(),
+        "bounded recovery must not issue a fifth confirm"
+    );
+    assert_eq!(
+        efforts.len(),
+        super::REMOTE_MEMBERSHIP_SNAPSHOT_RECOVERY_ROUNDS,
+        "test drift count must track the production recovery bound"
+    );
+
+    let manager = Arc::try_unwrap(manager)
+        .unwrap_or_else(|_| panic!("bounded recovery drops all manager owners"));
+    manager.shutdown().await;
+    drop(manager);
+    core.shutdown()
+        .await
+        .expect("shutdown bounded recovery core");
+    drop(core);
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_snapshot_confirm_failure_preserves_zero_snapshot_writes() {
+    let mut fixture = active_fixture("confirm-zero-write").await;
+    let conversation_id = create_snapshot_required_conversation(&fixture.store, 0xc1).await;
+    let manager = Arc::new(RemoteManager::new(
+        fixture.store.clone(),
+        fixture.keys.clone(),
+        fixture.config.clone(),
+        RemoteBootstrapOutcome::Active(fixture.identity.take().unwrap()),
+    ));
+    let core = Arc::new(
+        crate::runtime::RuntimeCore::new(
+            fixture.store.clone(),
+            Arc::new(crate::runtime::AgentRouter::with_runtime_store(
+                fixture.store.clone(),
+            )),
+            fixture
+                .store
+                .machine_trust_domain()
+                .expect("load zero-write trust domain"),
+        )
+        .expect("construct zero-write RuntimeCore"),
+    );
+    assert!(manager.install_runtime_core(&core));
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut state = manager.state.lock().await;
+        state.armed = true;
+        state.pairing_handle_for_test =
+            Some(crate::remote::pairing::PairingCoordinatorHandle::confirm_test_double(entered_tx));
+    }
+    let pairing_id =
+        RuntimeId::from_bytes(RuntimeIdKind::Pairing, [0xd1; 16]).expect("zero-write pairing id");
+    let operation = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.confirm(pairing_id).await })
+    };
+    entered_rx
+        .recv()
+        .await
+        .expect("non-snapshot confirm reaches pairing actor")
+        .send(Err(PairingAdministrationError::new(
+            "daemon.runtime.invalid_state",
+        )))
+        .expect("release non-snapshot failure");
+    assert_eq!(
+        operation
+            .await
+            .expect("join non-snapshot confirm")
+            .expect_err("non-snapshot failure must remain terminal")
+            .code(),
+        "daemon.runtime.invalid_state"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await
+            .expect("non-snapshot failure snapshot readback"),
+        vec![conversation_id],
+        "non-snapshot failure must not trigger Catalog/conversation recovery writes"
+    );
+    assert!(
+        entered_rx.try_recv().is_err(),
+        "non-snapshot failure must not retry confirm"
+    );
+
+    let manager = Arc::try_unwrap(manager)
+        .unwrap_or_else(|_| panic!("zero-write test drops all manager owners"));
+    manager.shutdown().await;
+    drop(manager);
+    core.shutdown().await.expect("shutdown zero-write core");
+    drop(core);
     let _ = fs::remove_dir_all(fixture.root);
 }
 

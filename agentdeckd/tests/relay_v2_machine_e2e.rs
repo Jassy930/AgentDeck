@@ -7,10 +7,14 @@
 #![cfg(all(unix, debug_assertions))]
 
 use std::collections::HashSet;
+use std::env;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -85,13 +89,20 @@ use agentdeckd::security::{MemoryKeyStore, load_or_create_storage_kek};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rand_chacha::ChaCha20Rng;
 use rusqlite::{Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
 use tempfile::Builder as TempDirBuilder;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Notify, oneshot};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
 const RECEIPT_SIGNER_SEED: [u8; 32] = [0x74; 32];
 const REMOTE_CLI_TEAM: &str = "A1B2C3D4E5";
+const P57_HOST_PROTOCOL: &str = "agentdeck-p57-host/v1";
+const P57_HOST_ENABLE_ENV: &str = "AGENTDECK_P57_HOST";
+const P57_HOST_MAX_COMMAND_BYTES: usize = 4 * 1_024;
+const P57_HOST_MAX_WAIT_MS: u64 = 30_000;
+static P57_HOST_OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn remote_cli_access_group() -> String {
     format!("{REMOTE_CLI_TEAM}{REMOTE_CLI_ACCESS_GROUP_SUFFIX}")
@@ -369,6 +380,23 @@ fn runtime_command_count(database: &Path) -> i64 {
     .expect("open Runtime DB read-only for command count")
     .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
     .expect("read Runtime command count")
+}
+
+fn runtime_transition_counts(database: &Path) -> (i64, i64) {
+    Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open Runtime DB read-only for transition state")
+    .query_row(
+        "SELECT remote_key_transition_active_count,
+                (SELECT COUNT(*) FROM publication_streams
+                 WHERE scope = 'catalog' AND state = 'active')
+         FROM runtime_meta WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .expect("read Runtime active transition and Catalog carrier counts")
 }
 
 fn copy_directory_tree(source: &Path, destination: &Path) {
@@ -2191,6 +2219,246 @@ async fn smoke_persistent_mutations(
     ));
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
+enum P57HostCommand {
+    Status {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    WaitFor {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        condition: P57HostWaitCondition,
+        #[serde(rename = "timeoutMs")]
+        timeout_ms: u64,
+    },
+    Shutdown {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum P57HostWaitCondition {
+    PendingPairing,
+    BusinessReady,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct P57HostReady {
+    kind: &'static str,
+    protocol: &'static str,
+    root_path: String,
+    home_path: String,
+    socket_path: String,
+    invite_path: String,
+    runtime_database_path: String,
+    relay_database_path: String,
+    pid: u32,
+    invite_file_mode: u32,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct P57HostEvidence {
+    machine_remote_lifecycle: MachineRemoteLifecycle,
+    failure_code: Option<String>,
+    pending_pairing_count: usize,
+    relay_grant_total: i64,
+    relay_grant_active: i64,
+    active_transition_count: i64,
+    active_catalog_stream_count: i64,
+    runtime_command_count: i64,
+    socket_is_unix: bool,
+    socket_mode: u32,
+}
+
+impl P57HostEvidence {
+    fn satisfies(&self, condition: P57HostWaitCondition) -> bool {
+        match condition {
+            P57HostWaitCondition::PendingPairing => {
+                self.pending_pairing_count == 1
+                    && self.relay_grant_total == 0
+                    && self.relay_grant_active == 0
+            }
+            P57HostWaitCondition::BusinessReady => {
+                self.machine_remote_lifecycle == MachineRemoteLifecycle::Active
+                    && self.pending_pairing_count == 0
+                    && self.relay_grant_total == 1
+                    && self.relay_grant_active == 1
+                    && self.active_transition_count == 0
+                    && self.active_catalog_stream_count == 1
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct P57HostStatus<'a> {
+    kind: &'static str,
+    protocol: &'static str,
+    request_id: &'a str,
+    evidence: P57HostEvidence,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct P57HostWait<'a> {
+    kind: &'static str,
+    protocol: &'static str,
+    request_id: &'a str,
+    condition: P57HostWaitCondition,
+    satisfied: bool,
+    evidence: P57HostEvidence,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct P57HostError<'a> {
+    kind: &'static str,
+    protocol: &'static str,
+    request_id: Option<&'a str>,
+    code: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct P57HostStopped<'a> {
+    kind: &'static str,
+    protocol: &'static str,
+    request_id: Option<&'a str>,
+    invite_removed: bool,
+    socket_exists: bool,
+}
+
+fn emit_p57_host_record(value: &impl Serialize) {
+    let stdout = io::stdout();
+    let mut locked = stdout.lock();
+    // libtest 会先打印不带换行的 `test <name> ... `。首条记录主动换行，保证
+    // Swift Process 可以逐行只接受以 `{` 开头的严格 NDJSON，而不必解析 harness 文本。
+    if !P57_HOST_OUTPUT_STARTED.swap(true, Ordering::SeqCst) {
+        locked
+            .write_all(b"\n")
+            .expect("separate P5.7 host NDJSON from libtest prefix");
+    }
+    serde_json::to_writer(&mut locked, value).expect("encode P5.7 host NDJSON record");
+    locked
+        .write_all(b"\n")
+        .expect("terminate P5.7 host NDJSON record");
+    locked.flush().expect("flush P5.7 host NDJSON record");
+}
+
+fn write_p57_host_invite(root: &Path, invite: &agentdeck_protocol::e2ee::PairInviteV1) -> PathBuf {
+    let path = root.join("pair-invite.secret");
+    let encoded = invite
+        .encode_uri(unix_now_ms())
+        .expect("encode fresh P5.7 host pair invite");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .expect("create private P5.7 host invite file");
+    file.write_all(encoded.as_bytes())
+        .expect("write private P5.7 host invite file");
+    file.sync_all().expect("sync private P5.7 host invite file");
+    let metadata = fs::symlink_metadata(&path).expect("read P5.7 host invite metadata");
+    assert!(metadata.file_type().is_file());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    path
+}
+
+async fn p57_host_evidence(
+    local: &RuntimeUnixClient,
+    socket: &Path,
+    runtime_db: &Path,
+    relay_db: &Path,
+) -> P57HostEvidence {
+    let RuntimeReply::MachineRemoteStatus(machine_status) = unary(
+        local,
+        RuntimeRequest::MachineRemoteStatus {
+            scope: LocalOnlyAdministration::LocalOnly,
+        },
+    )
+    .await
+    else {
+        panic!("P5.7 host status returned unrelated Runtime reply");
+    };
+    let pending_reply = unary(
+        local,
+        RuntimeRequest::ListPendingPairings {
+            scope: LocalOnlyAdministration::LocalOnly,
+        },
+    )
+    .await;
+    let pending_pairing_count = match pending_reply {
+        RuntimeReply::PendingPairings { pairings } => pairings.len(),
+        // BarriersCommitted intentionally fences ordinary Runtime requests until every
+        // device has durably ACKed the committed cuts. The wait probe must keep polling
+        // through that expected transient state; MachineRemoteStatus + transition rows
+        // below still prevent it from reporting BusinessReady early.
+        RuntimeReply::Failure(failure)
+            if failure.code == "daemon.remote.transition.business_fenced" =>
+        {
+            0
+        }
+        RuntimeReply::Failure(failure) => panic!(
+            "P5.7 host pending readback failed with code {}; {}",
+            failure.code,
+            runtime_remote_diagnostic(runtime_db)
+        ),
+        other => panic!("P5.7 host pending readback returned unrelated Runtime reply: {other:?}"),
+    };
+    let (relay_grant_total, relay_grant_active) = relay_device_grant_counts(relay_db);
+    let (active_transition_count, active_catalog_stream_count) =
+        runtime_transition_counts(runtime_db);
+    let socket_metadata = fs::symlink_metadata(socket).ok();
+    P57HostEvidence {
+        machine_remote_lifecycle: machine_status.lifecycle,
+        failure_code: machine_status
+            .failure_code
+            .as_ref()
+            .map(|code| code.as_str().to_owned()),
+        pending_pairing_count,
+        relay_grant_total,
+        relay_grant_active,
+        active_transition_count,
+        active_catalog_stream_count,
+        runtime_command_count: runtime_command_count(runtime_db),
+        socket_is_unix: socket_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.file_type().is_socket()),
+        socket_mode: socket_metadata
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+            .unwrap_or_default(),
+    }
+}
+
+async fn wait_for_p57_host_evidence(
+    local: &RuntimeUnixClient,
+    socket: &Path,
+    runtime_db: &Path,
+    relay_db: &Path,
+    condition: P57HostWaitCondition,
+    timeout_ms: u64,
+) -> (bool, P57HostEvidence) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let evidence = p57_host_evidence(local, socket, runtime_db, relay_db).await;
+        if evidence.satisfies(condition) {
+            return (true, evidence);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return (false, evidence);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_daemon_remote_link_runs_both_synthetic_agents_and_revokes_cleanly() {
     Box::pin(async move {
@@ -2642,4 +2910,290 @@ async fn real_daemon_remote_link_runs_both_synthetic_agents_and_revokes_cleanly(
         relay.shutdown().await.expect("shutdown Relay server");
     })
     .await;
+}
+
+/// P5.7 Swift Process 专用的交互式 component host。
+///
+/// 该测试保持 ignored，且还要求显式环境门禁，避免普通 `cargo test --ignored`
+/// 意外等待 stdin。stdout 只输出无 secret NDJSON；完整 bearer invite 始终只存在于
+/// ready 记录指向的 0600 临时文件。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "interactive P5.7 Swift SessionSource host"]
+async fn p57_real_dual_scope_ndjson_host() {
+    assert_eq!(
+        env::var(P57_HOST_ENABLE_ENV).as_deref(),
+        Ok("1"),
+        "interactive P5.7 host requires {P57_HOST_ENABLE_ENV}=1"
+    );
+
+    let root = TempDirBuilder::new()
+        .prefix("ad-p57-host-")
+        .tempdir_in("/tmp")
+        .expect("P5.7 host temp root");
+    let root_path = fs::canonicalize(root.path()).expect("canonicalize P5.7 host temp root");
+    let relay_db = root_path.join("relay-store/relay.db");
+    let (relay, bundle) = start_relay(&root_path)
+        .await
+        .expect("start real P5.7 host Relay Direct TLS server");
+    let config = stable_daemon_config(&root_path);
+    let singleton =
+        SingletonGuard::acquire(config.paths()).expect("acquire isolated P5.7 host singleton");
+    let daemon_keys = Arc::new(MemoryKeyStore::new());
+    let storage_kek = load_or_create_storage_kek(daemon_keys.as_ref(), &config.paths().runtime_db)
+        .expect("load isolated P5.7 host StorageKEK");
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(config.paths().runtime_db.clone()),
+        storage_kek,
+    )
+    .await
+    .expect("open P5.7 host Runtime store");
+    let bootstrap = reconcile_machine_identity(&config, &store, daemon_keys.as_ref())
+        .await
+        .expect("bootstrap P5.7 host machine identity");
+    let manager = Arc::new(RemoteManager::new(
+        store.clone(),
+        daemon_keys,
+        config.clone(),
+        bootstrap,
+    ));
+    let router = Arc::new(synthetic_e2e::agent_router());
+    let core = RuntimeCore::new_production_for_synthetic_e2e(
+        store.clone(),
+        router,
+        PathBuf::from(env!("CARGO_BIN_EXE_agentdeckd")),
+    )
+    .expect("construct P5.7 host production RuntimeCore with synthetic vendor adapters")
+    .with_remote_administration(manager.clone())
+    .with_pairing_administration(manager.clone())
+    .with_revocation_administration(manager.clone())
+    .with_conversation_activation(manager.clone());
+    assert!(manager.install_pairing_pending_sink(core.pairing_pending_sink()));
+    let core = Arc::new(core);
+    assert!(manager.install_runtime_core(&core));
+    let (_, recovery_ready) = core
+        .recover_for_startup()
+        .await
+        .expect("recover P5.7 host RuntimeCore");
+    let mut listener =
+        BoundLocalListener::bind_after_recovery(recovery_ready, &config, &singleton, core.clone())
+            .await
+            .expect("bind P5.7 host stable Runtime UDS");
+    let socket = listener.local_ready_permit().socket_path().to_path_buf();
+    let remote_start = listener
+        .take_remote_start_permit()
+        .expect("P5.7 host stable listener yields remote start permit");
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let manager_for_shutdown = manager.clone();
+    let listener_task = tokio::spawn(async move {
+        listener
+            .serve_until(async move {
+                let _ = stop_rx.await;
+                manager_for_shutdown.shutdown().await;
+                Ok(())
+            })
+            .await
+    });
+    manager
+        .arm(remote_start)
+        .await
+        .expect("arm P5.7 host RemoteManager");
+
+    let local_home = root_path.join("runtime-host-client-home");
+    fs::create_dir(&local_home).expect("create isolated P5.7 host Runtime client home");
+    fs::set_permissions(&local_home, fs::Permissions::from_mode(0o700))
+        .expect("secure isolated P5.7 host Runtime client home");
+    let local_installation_id = CliInstallationStore::injected_for_test(local_home)
+        .load_or_create()
+        .expect("create stable P5.7 host Runtime installation identity");
+    let local = RuntimeUnixClient::connect_injected_with_installation(
+        InjectedEndpoint::for_test(socket.clone()),
+        local_installation_id,
+    )
+    .await
+    .expect("connect P5.7 host same-UID Runtime UDS");
+    let enrollment = unary(
+        &local,
+        RuntimeRequest::MachineEnroll(MachineEnrollRequest {
+            bundle,
+            scope: LocalOnlyAdministration::LocalOnly,
+        }),
+    )
+    .await;
+    assert!(matches!(enrollment, RuntimeReply::MachineRemoteStatus(_)));
+    let RuntimeReply::PairInvite(invite_reply) = unary(
+        &local,
+        RuntimeRequest::CreatePairInvite(CreatePairInviteRequest {
+            display_name: "P5.7 Swift dual-scope host".to_owned(),
+            idempotency_key: IdempotencyKey::new("p57-real-dual-scope-invite"),
+            scope: LocalOnlyAdministration::LocalOnly,
+        }),
+    )
+    .await
+    else {
+        panic!("P5.7 host create PairInvite returned unrelated Runtime reply");
+    };
+    let invite_path = write_p57_host_invite(&root_path, invite_reply.invite.as_ref());
+    let invite_file_mode = fs::symlink_metadata(&invite_path)
+        .expect("read P5.7 host invite mode")
+        .permissions()
+        .mode()
+        & 0o777;
+    let home_path = root_path.join("home");
+    let initial_evidence =
+        p57_host_evidence(&local, &socket, &config.paths().runtime_db, &relay_db).await;
+    assert!(initial_evidence.socket_is_unix);
+    assert_eq!(initial_evidence.socket_mode, 0o600);
+    assert_eq!(initial_evidence.pending_pairing_count, 0);
+    assert_eq!(initial_evidence.relay_grant_total, 0);
+    assert_eq!(initial_evidence.relay_grant_active, 0);
+    emit_p57_host_record(&P57HostReady {
+        kind: "ready",
+        protocol: P57_HOST_PROTOCOL,
+        root_path: root_path.to_string_lossy().into_owned(),
+        home_path: home_path.to_string_lossy().into_owned(),
+        socket_path: socket.to_string_lossy().into_owned(),
+        invite_path: invite_path.to_string_lossy().into_owned(),
+        runtime_database_path: config.paths().runtime_db.to_string_lossy().into_owned(),
+        relay_database_path: relay_db.to_string_lossy().into_owned(),
+        pid: std::process::id(),
+        invite_file_mode,
+    });
+
+    let mut shutdown_request_id = None;
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(_) => {
+                emit_p57_host_record(&P57HostError {
+                    kind: "error",
+                    protocol: P57_HOST_PROTOCOL,
+                    request_id: None,
+                    code: "host.command.read_failed",
+                });
+                break;
+            }
+        };
+        if line.len() > P57_HOST_MAX_COMMAND_BYTES {
+            emit_p57_host_record(&P57HostError {
+                kind: "error",
+                protocol: P57_HOST_PROTOCOL,
+                request_id: None,
+                code: "host.command.too_large",
+            });
+            continue;
+        }
+        let command = match serde_json::from_str::<P57HostCommand>(&line) {
+            Ok(command) => command,
+            Err(_) => {
+                emit_p57_host_record(&P57HostError {
+                    kind: "error",
+                    protocol: P57_HOST_PROTOCOL,
+                    request_id: None,
+                    code: "host.command.invalid",
+                });
+                continue;
+            }
+        };
+        let request_id = match &command {
+            P57HostCommand::Status { request_id }
+            | P57HostCommand::WaitFor { request_id, .. }
+            | P57HostCommand::Shutdown { request_id } => request_id,
+        };
+        if request_id.is_empty()
+            || request_id.len() > 64
+            || !request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        {
+            emit_p57_host_record(&P57HostError {
+                kind: "error",
+                protocol: P57_HOST_PROTOCOL,
+                request_id: None,
+                code: "host.command.request_id_invalid",
+            });
+            continue;
+        }
+
+        match command {
+            P57HostCommand::Status { request_id } => {
+                let evidence =
+                    p57_host_evidence(&local, &socket, &config.paths().runtime_db, &relay_db).await;
+                emit_p57_host_record(&P57HostStatus {
+                    kind: "status",
+                    protocol: P57_HOST_PROTOCOL,
+                    request_id: &request_id,
+                    evidence,
+                });
+            }
+            P57HostCommand::WaitFor {
+                request_id,
+                condition,
+                timeout_ms,
+            } => {
+                if timeout_ms == 0 || timeout_ms > P57_HOST_MAX_WAIT_MS {
+                    emit_p57_host_record(&P57HostError {
+                        kind: "error",
+                        protocol: P57_HOST_PROTOCOL,
+                        request_id: Some(&request_id),
+                        code: "host.command.timeout_invalid",
+                    });
+                    continue;
+                }
+                let (satisfied, evidence) = wait_for_p57_host_evidence(
+                    &local,
+                    &socket,
+                    &config.paths().runtime_db,
+                    &relay_db,
+                    condition,
+                    timeout_ms,
+                )
+                .await;
+                emit_p57_host_record(&P57HostWait {
+                    kind: "waitFor",
+                    protocol: P57_HOST_PROTOCOL,
+                    request_id: &request_id,
+                    condition,
+                    satisfied,
+                    evidence,
+                });
+            }
+            P57HostCommand::Shutdown { request_id } => {
+                shutdown_request_id = Some(request_id);
+                break;
+            }
+        }
+    }
+
+    local
+        .close()
+        .await
+        .expect("close P5.7 host local Runtime client");
+    let invite_removed = match fs::remove_file(&invite_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => panic!("remove P5.7 host invite file: {error}"),
+    };
+    stop_tx
+        .send(())
+        .expect("signal P5.7 host daemon listener shutdown");
+    listener_task
+        .await
+        .expect("join P5.7 host daemon listener task")
+        .expect("stop P5.7 host daemon listener");
+    core.shutdown()
+        .await
+        .expect("shutdown P5.7 host RuntimeCore");
+    relay
+        .shutdown()
+        .await
+        .expect("shutdown P5.7 host Relay server");
+    emit_p57_host_record(&P57HostStopped {
+        kind: "stopped",
+        protocol: P57_HOST_PROTOCOL,
+        request_id: shutdown_request_id.as_deref(),
+        invite_removed,
+        socket_exists: socket.exists(),
+    });
 }

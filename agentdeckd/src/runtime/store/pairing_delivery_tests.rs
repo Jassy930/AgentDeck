@@ -617,15 +617,6 @@ pub(crate) async fn pending_new_device_transition_fixture_for_test(
         })
         .await
         .expect("create transition conversation");
-    store
-        .create_publication_stream(
-            [0x21; 16],
-            PublicationScope::Catalog,
-            [0x22; 16],
-            [0x23; 16],
-        )
-        .await
-        .expect("create catalog stream before first remote-device transition");
 
     assert!(matches!(
         store
@@ -736,6 +727,19 @@ pub(crate) async fn pending_new_device_transition_fixture_for_test(
         .await
         .expect("store exact conversation ready snapshot");
 
+    let catalog_streams_before_confirm: i64 = rusqlite::Connection::open(database)
+        .expect("open pre-confirm publication directory")
+        .query_row(
+            "SELECT COUNT(*) FROM publication_streams WHERE scope = 'catalog'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count pre-confirm Catalog publication streams");
+    assert_eq!(
+        catalog_streams_before_confirm, 0,
+        "fixture must exercise production pairing-time Catalog creation"
+    );
+
     let conversation_stream_id: Vec<u8> = rusqlite::Connection::open(database)
         .expect("open transition stream mapping")
         .query_row(
@@ -797,6 +801,18 @@ pub(crate) async fn pending_new_device_transition_fixture_for_test(
         ConfirmPairingGrantOutcome::Confirmed { recovery, .. } => recovery,
         other => panic!("first remote device must confirm: {other:?}"),
     };
+    let catalog_streams_after_confirm: i64 = rusqlite::Connection::open(database)
+        .expect("open post-confirm publication directory")
+        .query_row(
+            "SELECT COUNT(*) FROM publication_streams WHERE scope = 'catalog' AND state = 'active'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count post-confirm active Catalog publication streams");
+    assert_eq!(
+        catalog_streams_after_confirm, 1,
+        "pairing confirm must atomically create the unique Catalog carrier"
+    );
     clock.store(NOW_MS + 5, Ordering::SeqCst);
     let committed = match store
         .acknowledge_grant_committed(AcknowledgeGrantCommitted::new(

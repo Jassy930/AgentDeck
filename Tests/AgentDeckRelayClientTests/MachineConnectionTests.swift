@@ -67,7 +67,7 @@ final class MachineConnectionTests: XCTestCase {
     await connection.start()
     await assertNextConnectionState(.connecting, iterator: &iterator)
     await assertNextConnectionState(.connected, iterator: &iterator)
-    guard case .delivery(let received)? = await iterator.next() else {
+    guard let received = await nextDelivery(iterator: &iterator) else {
       await connection.shutdown()
       return XCTFail("verified ingress delivery must reach Source channel")
     }
@@ -106,6 +106,137 @@ final class MachineConnectionTests: XCTestCase {
     let endedScopeCount = await ingress.endedScopes.count
     XCTAssertEqual(endedScopeCount, 1)
     XCTAssertEqual(budget.usage, .zero)
+  }
+
+  func testKeySyncBusinessReadyPublishesOnlyAfterControlAckTransportSend() async throws {
+    let fixture = try makeSupervisorAuthenticationFixture()
+    let generation = RelayTransportGeneration(rawValue: 401)
+    let transport = try SupervisorTransport(
+      generation: generation,
+      frames: [
+        supervisorFrame(
+          generation: generation,
+          body: .challenge(
+            relayServerId: fixture.relayServerID,
+            connectionInstance: fixture.connectionInstance,
+            challengeNonce: fixture.challengeNonce
+          )
+        ),
+        supervisorFrame(
+          generation: generation,
+          body: .authenticated(heartbeatIntervalSecs: 17)
+        ),
+        supervisorFrame(
+          generation: generation,
+          body: .routeAccepted(
+            accepted: .request(requestRoute: Data(repeating: 0x91, count: 16))
+          )
+        ),
+      ]
+    )
+    let acknowledgement = RelayV2OutboundFrame.control(.ping(nonce: 0xA11C))
+    let ingress = SupervisorIngress(
+      outcomes: [.keySyncSucceeded(acceptedRevision: 1, recoveryTargets: [])],
+      resumedKeySyncStatus: MachineKeySyncEpisodeStatus(observedRevision: 1, attempt: 1),
+      transportActions: [acknowledgement]
+    )
+    let connection = MachineConnection(
+      machineID: "machine-supervisor",
+      transportBuilder: { transport },
+      authenticator: fixture.authenticator,
+      verifiedIngress: ingress,
+      transferBudgetCoordinator: TransferAssemblyBudgetCoordinator(),
+      reconnectSleeper: ImmediateMachineConnectionSleeper(),
+      clock: FixedMachineConnectionClock(now: 1_000),
+      jitterSource: FixedMachineConnectionJitter(value: 0.5)
+    )
+    var iterator = await connection.updates().makeAsyncIterator()
+    await connection.start()
+    await assertNextConnectionState(.connecting, iterator: &iterator)
+    await assertNextConnectionState(.connected, iterator: &iterator)
+
+    var readyScope: TransferAssemblyScope?
+    while let update = await iterator.next() {
+      if case .businessReady(let scope) = update {
+        readyScope = scope
+        break
+      }
+    }
+    let sent = await transport.sentFrames
+    XCTAssertEqual(sent.count, 2, "Authenticate 后必须先真实写出 control ACK")
+    guard sent.count == 2, case .ping(let nonce) = sent[1].body else {
+      await connection.shutdown()
+      return XCTFail("second transport write must be the drained control ACK")
+    }
+    XCTAssertEqual(nonce, 0xA11C)
+    XCTAssertEqual(readyScope?.generation, generation)
+    await connection.shutdown()
+  }
+
+  func testKeySyncControlAckSendFailureNeverPublishesBusinessReady() async throws {
+    let fixture = try makeSupervisorAuthenticationFixture()
+    let generation = RelayTransportGeneration(rawValue: 402)
+    let transport = try SupervisorTransport(
+      generation: generation,
+      frames: [
+        supervisorFrame(
+          generation: generation,
+          body: .challenge(
+            relayServerId: fixture.relayServerID,
+            connectionInstance: fixture.connectionInstance,
+            challengeNonce: fixture.challengeNonce
+          )
+        ),
+        supervisorFrame(
+          generation: generation,
+          body: .authenticated(heartbeatIntervalSecs: 17)
+        ),
+        supervisorFrame(
+          generation: generation,
+          body: .routeAccepted(
+            accepted: .request(requestRoute: Data(repeating: 0x92, count: 16))
+          )
+        ),
+      ],
+      failSendAtIndex: 1
+    )
+    let ingress = SupervisorIngress(
+      outcomes: [.keySyncSucceeded(acceptedRevision: 1, recoveryTargets: [])],
+      resumedKeySyncStatus: MachineKeySyncEpisodeStatus(observedRevision: 1, attempt: 1),
+      transportActions: [.control(.ping(nonce: 0xFA11))]
+    )
+    let sleeper = RecordingLongMachineConnectionSleeper()
+    let connection = MachineConnection(
+      machineID: "machine-supervisor",
+      transportBuilder: { transport },
+      authenticator: fixture.authenticator,
+      verifiedIngress: ingress,
+      transferBudgetCoordinator: TransferAssemblyBudgetCoordinator(),
+      reconnectSleeper: sleeper,
+      clock: FixedMachineConnectionClock(now: 1_000),
+      jitterSource: FixedMachineConnectionJitter(value: 0.5)
+    )
+    var iterator = await connection.updates().makeAsyncIterator()
+    await connection.start()
+
+    var sawReady = false
+    var sawReconnect = false
+    while let update = await iterator.next() {
+      switch update {
+      case .businessReady:
+        sawReady = true
+      case .connectionState(.reconnecting):
+        sawReconnect = true
+      case .connectionState, .connectionScope, .delivery, .streamRecoveryRequired:
+        break
+      }
+      if sawReconnect { break }
+    }
+    XCTAssertTrue(sawReconnect)
+    XCTAssertFalse(sawReady, "failed ACK write must leave business admission closed")
+    let sent = await transport.sentFrames
+    XCTAssertEqual(sent.count, 1, "failed control ACK must not be recorded as sent")
+    await connection.shutdown()
   }
 
   func testRuntimeEndpointSendsOnExactGenerationAndAwaitsDirectedReply() async throws {
@@ -432,7 +563,7 @@ final class MachineConnectionTests: XCTestCase {
     await connection.start()
     await assertNextConnectionState(.connecting, iterator: &iterator)
     await assertNextConnectionState(.connected, iterator: &iterator)
-    guard case .delivery(let receivedFirst)? = await iterator.next() else {
+    guard let receivedFirst = await nextDelivery(iterator: &iterator) else {
       return XCTFail("first prepared delivery must reach Source")
     }
 
@@ -444,7 +575,7 @@ final class MachineConnectionTests: XCTestCase {
     XCTAssertTrue(blocked, "next frame must not pass unresolved durable cut")
 
     try await connection.commit(receivedFirst)
-    guard case .delivery(let receivedSecond)? = await iterator.next() else {
+    guard let receivedSecond = await nextDelivery(iterator: &iterator) else {
       return XCTFail("exact commit 后 supervisor 才能读取下一帧")
     }
     XCTAssertNil(receivedSecond.ingressPermit)
@@ -498,7 +629,7 @@ final class MachineConnectionTests: XCTestCase {
     await connection.start()
     await assertNextConnectionState(.connecting, iterator: &iterator)
     await assertNextConnectionState(.connected, iterator: &iterator)
-    guard case .delivery? = await iterator.next() else {
+    guard await nextDelivery(iterator: &iterator) != nil else {
       return XCTFail("prepared delivery must reach Source before shutdown")
     }
     let waiterInstalled = await eventuallyMachineConnectionTest {
@@ -553,6 +684,10 @@ final class MachineConnectionTests: XCTestCase {
     await connection.start()
     await assertNextConnectionState(.connecting, iterator: &iterator)
     await assertNextConnectionState(.connected, iterator: &iterator)
+    guard case .businessReady? = await iterator.next() else {
+      await connection.shutdown()
+      return XCTFail("zero-cut generation must publish business readiness")
+    }
     XCTAssertNotEqual(budget.usage, .zero)
 
     for _ in 0..<512 {
@@ -1988,13 +2123,18 @@ private actor EndpointSupervisorIngress: MachineConnectionVerifiedIngress {
   }
 }
 
-private actor SupervisorIngress: MachineConnectionVerifiedIngress {
+private actor SupervisorIngress:
+  MachineConnectionVerifiedIngress,
+  MachineConnectionIngressTransportActionSource
+{
   private let resume: [RelayV2OutboundFrame]
   private var outcomes: [MachineConnectionVerifiedIngressOutcome]
   private let reserveBudgetOnResume: Bool
   private let budgetCoordinator: TransferAssemblyBudgetCoordinator?
   private let blocksPreparedResolution: Bool
   private let keySyncDeadlineMilliseconds: UInt64?
+  private let resumedKeySyncStatus: MachineKeySyncEpisodeStatus?
+  private var queuedTransportActions: [RelayV2OutboundFrame]
   private var keySyncDeadlineActive = false
   private var resolutionWaiters:
     [MachineVerifiedDeliveryPermit: CheckedContinuation<Void, any Error>] = [:]
@@ -2014,7 +2154,9 @@ private actor SupervisorIngress: MachineConnectionVerifiedIngress {
     reserveBudgetOnResume: Bool = false,
     budgetCoordinator: TransferAssemblyBudgetCoordinator? = nil,
     blocksPreparedResolution: Bool = false,
-    keySyncDeadlineMilliseconds: UInt64? = nil
+    keySyncDeadlineMilliseconds: UInt64? = nil,
+    resumedKeySyncStatus: MachineKeySyncEpisodeStatus? = nil,
+    transportActions: [RelayV2OutboundFrame] = []
   ) {
     resume = resumeFrames
     self.outcomes = outcomes
@@ -2022,6 +2164,8 @@ private actor SupervisorIngress: MachineConnectionVerifiedIngress {
     self.budgetCoordinator = budgetCoordinator
     self.blocksPreparedResolution = blocksPreparedResolution
     self.keySyncDeadlineMilliseconds = keySyncDeadlineMilliseconds
+    self.resumedKeySyncStatus = resumedKeySyncStatus
+    queuedTransportActions = transportActions
   }
 
   var pendingResolutionCount: Int { resolutionWaiters.count }
@@ -2083,6 +2227,26 @@ private actor SupervisorIngress: MachineConnectionVerifiedIngress {
       throw MachineConnectionSupervisorFailure.securityError
     }
     return keySyncDeadlineActive ? keySyncDeadlineMilliseconds : nil
+  }
+
+  func keySyncEpisodeStatus(
+    scope: TransferAssemblyScope
+  ) async throws -> MachineKeySyncEpisodeStatus? {
+    guard activeScopes.contains(scope), !terminalScopes.contains(scope) else {
+      throw MachineConnectionSupervisorFailure.securityError
+    }
+    return resumedKeySyncStatus
+  }
+
+  func drainTransportActions(
+    scope: TransferAssemblyScope
+  ) async throws -> [RelayV2OutboundFrame] {
+    guard activeScopes.contains(scope), !terminalScopes.contains(scope) else {
+      throw MachineConnectionSupervisorFailure.securityError
+    }
+    let actions = queuedTransportActions
+    queuedTransportActions.removeAll(keepingCapacity: false)
+    return actions
   }
 
   func commit(_ delivery: VerifiedRuntimeDelivery) async throws {
@@ -2224,8 +2388,26 @@ private func assertNextConnectionState(
   file: StaticString = #filePath,
   line: UInt = #line
 ) async {
-  let actual = await iterator.next()?.connectionState
+  let actual = await nextConnectionState(iterator: &iterator)
   XCTAssertEqual(actual, expected, file: file, line: line)
+}
+
+private func nextConnectionState(
+  iterator: inout AsyncStream<MachineConnectionUpdate>.Iterator
+) async -> SessionConnectionState? {
+  while let update = await iterator.next() {
+    if let state = update.connectionState { return state }
+  }
+  return nil
+}
+
+private func nextDelivery(
+  iterator: inout AsyncStream<MachineConnectionUpdate>.Iterator
+) async -> VerifiedRuntimeDelivery? {
+  while let update = await iterator.next() {
+    if case .delivery(let delivery) = update { return delivery }
+  }
+  return nil
 }
 
 private func requireSendable<T: Sendable>(_: T.Type) {}

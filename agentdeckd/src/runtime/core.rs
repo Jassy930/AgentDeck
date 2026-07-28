@@ -85,7 +85,7 @@ use super::store::{
     RemotePrincipalRegistration, RuntimeId, RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle,
     SnapshotOrigin, UpdateConversationMetadataOutcome, UpdateManagedConversationMetadata,
 };
-use super::subscription::coordinator::SubscriptionCoordinator;
+use super::subscription::coordinator::{SubscriptionCoordinator, SubscriptionPumpError};
 use super::upgrade::{
     DisabledUpgradeService, DurableUpgradeService, PreparedUpgrade, UpgradeService,
 };
@@ -359,6 +359,19 @@ impl RuntimeCore {
     #[doc(hidden)]
     pub fn pairing_pending_sink(&self) -> Arc<dyn PairingPendingSink> {
         Arc::new(RuntimePairingPendingSink::new(self.connections.clone()))
+    }
+
+    /// RemoteManager 在 fresh pairing confirm 因 current durable baseline 不足而
+    /// fail-close 后调用。该入口不接收 principal、不返回 snapshot 内容，只复用
+    /// RuntimeCore 唯一 SubscriptionCoordinator 的共享 budget 持久化 Catalog 与全部
+    /// 缺失 conversation 的 exact captured H。
+    pub(crate) async fn refresh_snapshots_for_remote_membership(
+        &self,
+    ) -> Result<(), RuntimeFailure> {
+        self.subscriptions
+            .refresh_snapshots_for_remote_membership()
+            .await
+            .map_err(SubscriptionPumpError::into_failure)
     }
 
     fn with_execution_coordinator(

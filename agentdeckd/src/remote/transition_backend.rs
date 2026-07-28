@@ -459,11 +459,15 @@ impl TransitionBackend for RuntimeStoreTransitionBackend {
         operation_id: [u8; 16],
         updates: Vec<FrozenKeyUpdate>,
     ) -> Result<KeyTransitionRecovery, TransitionCoordinatorError> {
-        self.store
+        let recovery = self
+            .store
             .freeze_key_updates(operation_id, updates)
             .await
             .map_err(map_transition_store_error)?;
-        self.reload_exact(operation_id).await
+        if recovery.transition.operation_id != operation_id {
+            return Err(TransitionCoordinatorError::ExactReadbackMismatch);
+        }
+        Ok(recovery)
     }
 
     async fn drive_old_key_outbox_to_committed(
@@ -478,11 +482,15 @@ impl TransitionBackend for RuntimeStoreTransitionBackend {
         operation_id: [u8; 16],
         cuts: Vec<KeyTransitionStreamCut>,
     ) -> Result<KeyTransitionRecovery, TransitionCoordinatorError> {
-        self.store
+        let recovery = self
+            .store
             .freeze_key_barriers(operation_id, cuts)
             .await
             .map_err(map_transition_store_error)?;
-        self.reload_exact(operation_id).await
+        if recovery.transition.operation_id != operation_id {
+            return Err(TransitionCoordinatorError::ExactReadbackMismatch);
+        }
+        Ok(recovery)
     }
 
     async fn freeze_epoch_barrier(

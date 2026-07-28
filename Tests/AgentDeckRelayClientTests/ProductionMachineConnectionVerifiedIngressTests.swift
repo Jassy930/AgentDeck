@@ -2039,6 +2039,46 @@ final class ProductionMachineConnectionVerifiedIngressTests: XCTestCase {
     }
   }
 
+  func testCatalogBootstrapKeepsRuntimeAndRelayGenerationsIndependent() async throws {
+    let fixture = try await ProductionIngressCryptoFixture.make()
+    defer { fixture.removeSandbox() }
+    let ingress = try await ProductionMachineConnectionVerifiedIngress.open(
+      material: fixture.material,
+      expectedConversationRoutes: [],
+      clock: { ProductionIngressCryptoFixture.fixedTimeMS }
+    )
+    let scope = productionIngressScope(43)
+    _ = try await ingress.resumeFrames(
+      generation: scope.generation,
+      scope: scope,
+      heartbeatIntervalSeconds: 31
+    )
+    let streamRoute = Data(repeating: 0xD3, count: 16)
+    let relayGeneration = Data(repeating: 0xD4, count: 16)
+    let runtimeGeneration = Data(repeating: 0xD5, count: 16)
+
+    let actions = try await productionIngressBootstrapCatalog(
+      ingress: ingress,
+      fixture: fixture,
+      scope: scope,
+      messageID: RuntimeMessageID(rawValue: "independent-runtime-relay-generation"),
+      streamRoute: streamRoute,
+      streamGeneration: relayGeneration,
+      runtimeStreamGeneration: runtimeGeneration,
+      firstCounter: 1
+    )
+
+    guard
+      case .subscribe(let subscribedRoute, let subscribedGeneration, _) =
+        try productionIngressDecodedFrame(try XCTUnwrap(actions.first)).body
+    else {
+      return XCTFail("durable binding must subscribe the Relay publication generation")
+    }
+    XCTAssertEqual(subscribedRoute, streamRoute)
+    XCTAssertEqual(subscribedGeneration, relayGeneration)
+    XCTAssertNotEqual(runtimeGeneration, relayGeneration)
+  }
+
   func testGenerationEndedReleasesPendingDirectedReplyWaiter() async throws {
     let fixture = try await ProductionIngressCryptoFixture.make()
     defer { fixture.removeSandbox() }
@@ -2407,6 +2447,269 @@ final class ProductionMachineConnectionVerifiedIngressTests: XCTestCase {
         reservationCount: 0
       )
     )
+  }
+
+  func testBootstrapBarrierExactRetryCompletesReplayAdmissionActivationGap() async throws {
+    let routes = ProductionIngressRequestRouteSequence(
+      bootstrapFallback: { throw ProductionIngressTestHarnessError.requestRouteExhausted }
+    )
+    routes.enqueue([Data(repeating: 0xD1, count: 16)])
+    let harness = try await productionIngressBootstrapCatalogBarrierHarness(
+      scopeIndex: 79,
+      requestRouteGenerator: { try routes.next() }
+    )
+    defer { harness.fixture.removeSandbox() }
+
+    let beforeFailureValue = try await harness.fixture.stateStore.load()
+    let beforeFailure = try XCTUnwrap(beforeFailureValue)
+    XCTAssertNil(beforeFailure.state.keyLifecycle)
+    do {
+      _ = try await harness.ingress.receive(
+        harness.barrierFrame,
+        scope: harness.scope
+      )
+      XCTFail("injected reservation failure must interrupt before bootstrap activation")
+    } catch {
+      XCTAssertEqual(
+        error as? ProductionIngressTestHarnessError,
+        .requestRouteExhausted
+      )
+    }
+
+    let admittedValue = try await harness.fixture.stateStore.load()
+    let admitted = try XCTUnwrap(admittedValue)
+    XCTAssertNil(admitted.state.keyLifecycle, "replay CAS must not imply activation proof")
+    XCTAssertEqual(admitted.state.stateRevision, beforeFailure.state.stateRevision + 1)
+    XCTAssertEqual(
+      admitted.state.replayStates.first(where: {
+        $0.scope.keyID == KeyIDV1(purpose: .catalog, epoch: 1)
+          && $0.scope.streamRoute == nil
+      })?.window.highWater,
+      1
+    )
+    let failedActions = try await harness.ingress.drainTransportActions(scope: harness.scope)
+    XCTAssertTrue(failedActions.isEmpty)
+
+    await harness.ingress.generationEnded(scope: harness.scope)
+    let reopened = try await ProductionMachineConnectionVerifiedIngress.open(
+      material: PairedMachineConnectionMaterial(
+        record: harness.fixture.material.record,
+        deviceSigningKey: harness.fixture.material.deviceSigningKey,
+        deviceHPKEPrivateKey: harness.fixture.material.deviceHPKEPrivateKey,
+        relayGrant: harness.fixture.material.relayGrant,
+        machineDataCertificate: harness.fixture.material.machineDataCertificate,
+        auditedCryptoState: admitted,
+        cryptoStateStore: harness.fixture.material.cryptoStateStore,
+        cryptoStateCoordinator: harness.fixture.material.cryptoStateCoordinator
+      ),
+      expectedConversationRoutes: [],
+      clock: { ProductionIngressCryptoFixture.fixedTimeMS },
+      requestRouteGenerator: { try routes.next() }
+    )
+    let reopenedScope = productionIngressScope(81)
+    _ = try await reopened.resumeFrames(
+      generation: reopenedScope.generation,
+      scope: reopenedScope,
+      heartbeatIntervalSeconds: 31
+    )
+    let retryFrame = try productionIngressEpochBarrierPublish(
+      fixture: harness.fixture,
+      generation: reopenedScope.generation,
+      barrier: harness.barrier,
+      counter: 1,
+      keyDirectoryRevision: harness.fixture.currentRevision,
+      rawKeyByte: 0x41,
+      keyID: KeyIDV1(purpose: .catalog, epoch: 1)
+    )
+
+    // recoverCommitted 会先用一条 route 核对 durable proof；发现 admission-only cut 后
+    // 释放该 reservation，再用第二条 route 补做 activation + ACK。
+    routes.enqueue([
+      Data(repeating: 0xD2, count: 16),
+      Data(repeating: 0xD3, count: 16),
+    ])
+    assertProductionIngressIgnored(
+      try await reopened.receive(
+        retryFrame,
+        scope: reopenedScope
+      )
+    )
+    let actions = try await reopened.drainTransportActions(scope: reopenedScope)
+    XCTAssertEqual(actions.count, 2)
+    let semantic = try productionIngressSend(try XCTUnwrap(actions.first))
+    XCTAssertEqual(semantic.requestRoute, Data(repeating: 0xD3, count: 16))
+    guard
+      case .streamAppliedAck(let acknowledgement) = try productionIngressOpenDeviceControl(
+        semantic,
+        fixture: harness.fixture
+      ),
+      case .ack(let streamRoute, let generation, let upToSeq) =
+        try productionIngressDecodedFrame(actions[1]).body
+    else {
+      return XCTFail("gap recovery must order semantic StreamAppliedAck before outer ACK")
+    }
+    XCTAssertEqual(
+      acknowledgement.authority,
+      try DeviceKeyControlAuthorityV1(
+        machineRoute: harness.fixture.crypto.machineRoute,
+        deviceRoute: harness.fixture.crypto.deviceRoute,
+        grantSerial: harness.fixture.material.record.grantSerial,
+        rootTrustEpoch: harness.fixture.material.record.trustEpoch
+      )
+    )
+    XCTAssertEqual(acknowledgement.streamRoute, harness.barrier.streamRoute)
+    XCTAssertEqual(acknowledgement.streamGeneration, harness.barrier.streamGeneration)
+    XCTAssertEqual(
+      acknowledgement.appliedStreamSequence,
+      harness.barrier.appliedStreamSequence
+    )
+    XCTAssertEqual(acknowledgement.innerCursor, .catalog(cursor: .beforeFirst))
+    XCTAssertEqual(
+      acknowledgement.keyDirectoryRevision,
+      harness.barrier.keyDirectoryRevision
+    )
+    XCTAssertEqual(acknowledgement.keyEpoch, harness.barrier.newEpoch)
+    XCTAssertEqual(acknowledgement.epochBarrierSHA256, harness.barrier.canonicalSHA256)
+    XCTAssertEqual(streamRoute, harness.barrier.streamRoute)
+    XCTAssertEqual(generation, harness.barrier.streamGeneration)
+    XCTAssertEqual(upToSeq, harness.barrier.appliedStreamSequence)
+
+    let activatedValue = try await harness.fixture.stateStore.load()
+    let activated = try XCTUnwrap(activatedValue)
+    let catalog = try XCTUnwrap(
+      activated.state.keyLifecycle?.slot(purpose: .catalog, streamRoute: nil)
+    )
+    XCTAssertEqual(catalog.current?.activationProof, harness.barrier)
+    XCTAssertNil(catalog.staged)
+    XCTAssertTrue(catalog.retired.isEmpty, "epoch-0 sentinel must not create a predecessor")
+    XCTAssertEqual(
+      activated.state.senderCounter.keyDirectoryRevision,
+      harness.fixture.currentRevision
+    )
+    XCTAssertFalse(activated.state.replayStates.contains { $0.scope.keyID.epoch == 0 })
+    await reopened.generationEnded(scope: reopenedScope)
+  }
+
+  func testBootstrapBarrierStaleCounterHasZeroMutationAndZeroAction() async throws {
+    let harness = try await productionIngressBootstrapCatalogBarrierHarness(scopeIndex: 82)
+    defer { harness.fixture.removeSandbox() }
+
+    let highCounterFrame = try productionIngressEpochBarrierPublish(
+      fixture: harness.fixture,
+      generation: harness.scope.generation,
+      barrier: harness.barrier,
+      counter: ReplayWindow.windowSize,
+      keyDirectoryRevision: harness.fixture.currentRevision,
+      rawKeyByte: 0x41,
+      keyID: KeyIDV1(purpose: .catalog, epoch: 1)
+    )
+    assertProductionIngressIgnored(
+      try await harness.ingress.receive(highCounterFrame, scope: harness.scope)
+    )
+    let committedActions = try await harness.ingress.drainTransportActions(scope: harness.scope)
+    XCTAssertEqual(committedActions.count, 2)
+
+    let stateBeforeValue = try await harness.fixture.stateStore.load()
+    let stateBefore = try XCTUnwrap(stateBeforeValue)
+    let keyStoreMutationsBefore = await harness.fixture.keyStore.mutationCount
+    await harness.fixture.persistenceRecorder.reset()
+
+    let staleFrame = try productionIngressEpochBarrierPublish(
+      fixture: harness.fixture,
+      generation: harness.scope.generation,
+      barrier: harness.barrier,
+      counter: 0,
+      keyDirectoryRevision: harness.fixture.currentRevision,
+      rawKeyByte: 0x41,
+      keyID: KeyIDV1(purpose: .catalog, epoch: 1)
+    )
+    assertProductionIngressIgnored(
+      try await harness.ingress.receive(staleFrame, scope: harness.scope)
+    )
+
+    let staleActions = try await harness.ingress.drainTransportActions(scope: harness.scope)
+    let persistenceStages = await harness.fixture.persistenceRecorder.snapshot()
+    let stateAfter = try await harness.fixture.stateStore.load()
+    let keyStoreMutationsAfter = await harness.fixture.keyStore.mutationCount
+    XCTAssertTrue(staleActions.isEmpty)
+    XCTAssertEqual(persistenceStages, [])
+    XCTAssertEqual(stateAfter, stateBefore)
+    XCTAssertEqual(keyStoreMutationsAfter, keyStoreMutationsBefore)
+  }
+
+  func testBootstrapBarrierFreshResealCannotRemintAcknowledgement() async throws {
+    let harness = try await productionIngressBootstrapCatalogBarrierHarness(scopeIndex: 80)
+    defer { harness.fixture.removeSandbox() }
+
+    assertProductionIngressIgnored(
+      try await harness.ingress.receive(
+        harness.barrierFrame,
+        scope: harness.scope
+      )
+    )
+    let firstActions = try await harness.ingress.drainTransportActions(scope: harness.scope)
+    XCTAssertEqual(firstActions.count, 2)
+    let firstSemantic = try productionIngressSend(try XCTUnwrap(firstActions.first))
+    try await assertProductionIngressIgnored(
+      harness.ingress.receive(
+        try productionIngressReceivedFrame(
+          generation: harness.scope.generation,
+          body: .routeAccepted(
+            accepted: .request(requestRoute: firstSemantic.requestRoute)
+          )
+        ),
+        scope: harness.scope
+      )
+    )
+    let routeAcceptedActions = try await harness.ingress.drainTransportActions(
+      scope: harness.scope
+    )
+    XCTAssertTrue(routeAcceptedActions.isEmpty)
+    let committedValue = try await harness.fixture.stateStore.load()
+    let committed = try XCTUnwrap(committedValue)
+
+    let freshReseal = try productionIngressEpochBarrierPublish(
+      fixture: harness.fixture,
+      generation: harness.scope.generation,
+      barrier: harness.barrier,
+      counter: 2,
+      keyDirectoryRevision: harness.fixture.currentRevision,
+      rawKeyByte: 0x41,
+      keyID: KeyIDV1(purpose: .catalog, epoch: 1)
+    )
+    do {
+      _ = try await harness.ingress.receive(freshReseal, scope: harness.scope)
+      XCTFail("fresh counter/ciphertext must not turn a committed semantic barrier into a new ACK")
+    } catch {
+      XCTAssertEqual(error as? DeviceKeyLifecycleError, .invalidBarrier)
+    }
+    let rejectedActions = try await harness.ingress.drainTransportActions(scope: harness.scope)
+    XCTAssertTrue(rejectedActions.isEmpty)
+
+    let rejectedValue = try await harness.fixture.stateStore.load()
+    let rejected = try XCTUnwrap(rejectedValue)
+    XCTAssertEqual(rejected.state.keyLifecycle, committed.state.keyLifecycle)
+    XCTAssertEqual(rejected.state.streamStates, committed.state.streamStates)
+    XCTAssertEqual(rejected.state.senderCounter, committed.state.senderCounter)
+    XCTAssertEqual(rejected.state.keyDirectory, committed.state.keyDirectory)
+    XCTAssertEqual(rejected.state.stateRevision, committed.state.stateRevision + 1)
+    XCTAssertEqual(
+      rejected.state.replayStates.first(where: {
+        $0.scope.keyID == KeyIDV1(purpose: .catalog, epoch: 1)
+          && $0.scope.streamRoute == nil
+      })?.window.highWater,
+      2
+    )
+
+    // 原始 ciphertext 的 exact duplicate 仍是唯一允许重封 ACK 的 recovery 路径。
+    assertProductionIngressIgnored(
+      try await harness.ingress.receive(
+        harness.barrierFrame,
+        scope: harness.scope
+      )
+    )
+    let recoveredActions = try await harness.ingress.drainTransportActions(scope: harness.scope)
+    XCTAssertEqual(recoveredActions.count, 2)
   }
 
   func testConcurrentDirectedPrepareCannotOverwriteCommittedBarrierActions() async throws {
@@ -3128,6 +3431,8 @@ private struct ProductionIngressCryptoFixture {
   let keyVerifier: KeyDirectoryVerifier
   let material: PairedMachineConnectionMaterial
   let stateStore: FileCryptoStateStore
+  let keyStore: ProductionIngressMemoryKeyStore
+  let persistenceRecorder: ProductionIngressPersistenceStageRecorder
   let conversationKeyBytes: [Data: UInt8]
 
   var currentRevision: UInt64 { crypto.revision - 1 }
@@ -3137,13 +3442,18 @@ private struct ProductionIngressCryptoFixture {
   static func make(
     conversationRoutes: [Data] = [],
     preactivatedBarrierCount: Int = 0,
-    stagedConversationActivation: Data? = nil
+    stagedConversationActivation: Data? = nil,
+    materializeInitialLifecycle: Bool = true
   ) async throws -> Self {
     precondition(preactivatedBarrierCount >= 0)
     precondition(preactivatedBarrierCount == 0 || stagedConversationActivation == nil)
     precondition(
       preactivatedBarrierCount == 0 || preactivatedBarrierCount == conversationRoutes.count)
     precondition(stagedConversationActivation.map({ conversationRoutes.contains($0) }) ?? true)
+    precondition(
+      materializeInitialLifecycle
+        || (preactivatedBarrierCount == 0 && stagedConversationActivation == nil)
+    )
     let crypto = try KeyUpdateSetCryptoFixture()
     let conversationKeyBytes = Dictionary(
       uniqueKeysWithValues: conversationRoutes.enumerated().map { index, route in
@@ -3355,7 +3665,7 @@ private struct ProductionIngressCryptoFixture {
       securityState: initialState.securityState,
       replayStates: initialState.replayStates,
       streamStates: initialState.streamStates,
-      keyLifecycle: initialState.keyLifecycle,
+      keyLifecycle: materializeInitialLifecycle ? initialState.keyLifecycle : nil,
       pendingStreamBindings: initialState.pendingStreamBindings,
       keySyncEpisode: initialState.keySyncEpisode
     )
@@ -3391,6 +3701,7 @@ private struct ProductionIngressCryptoFixture {
       throw ProductionIngressTestHarnessError.initialStateNotCreated
     }
     let keyStore = ProductionIngressMemoryKeyStore()
+    let persistenceRecorder = ProductionIngressPersistenceStageRecorder()
     let guardKey = try KeyStoreKey.paired(
       clientKind: record.clientKind,
       installationID: record.installationID,
@@ -3404,7 +3715,9 @@ private struct ProductionIngressCryptoFixture {
       stateStore: stateStore,
       keyStore: keyStore,
       guardKey: guardKey,
-      observer: nil,
+      observer: { stage in
+        await persistenceRecorder.record(stage)
+      },
       reservationIDGenerator: {
         var uuid = UUID().uuid
         return withUnsafeBytes(of: &uuid) { Data($0) }
@@ -3435,6 +3748,8 @@ private struct ProductionIngressCryptoFixture {
       keyVerifier: keyVerifier,
       material: material,
       stateStore: stateStore,
+      keyStore: keyStore,
+      persistenceRecorder: persistenceRecorder,
       conversationKeyBytes: conversationKeyBytes
     )
   }
@@ -3525,6 +3840,7 @@ private struct ProductionIngressCryptoFixture {
 
 private actor ProductionIngressMemoryKeyStore: KeyStore {
   private var values: [KeyStoreKey: Data] = [:]
+  private(set) var mutationCount = 0
 
   func load(_ key: KeyStoreKey) async throws -> Data? {
     values[key]
@@ -3539,6 +3855,7 @@ private actor ProductionIngressMemoryKeyStore: KeyStore {
       return .alreadyPresent
     }
     values[key] = data
+    mutationCount += 1
     return .inserted
   }
 
@@ -3554,6 +3871,7 @@ private actor ProductionIngressMemoryKeyStore: KeyStore {
       throw KeyStoreError.compareAndReplaceMismatch
     }
     values[key] = replacement
+    mutationCount += 1
   }
 
   func deleteExact(expected: Data, for key: KeyStoreKey) async throws {
@@ -3564,10 +3882,27 @@ private actor ProductionIngressMemoryKeyStore: KeyStore {
       throw KeyStoreError.compareAndReplaceMismatch
     }
     values.removeValue(forKey: key)
+    mutationCount += 1
   }
 }
 
-private enum ProductionIngressTestHarnessError: Error {
+private actor ProductionIngressPersistenceStageRecorder {
+  private var stages: [CryptoStatePersistenceStage] = []
+
+  func record(_ stage: CryptoStatePersistenceStage) {
+    stages.append(stage)
+  }
+
+  func reset() {
+    stages.removeAll(keepingCapacity: true)
+  }
+
+  func snapshot() -> [CryptoStatePersistenceStage] {
+    stages
+  }
+}
+
+private enum ProductionIngressTestHarnessError: Error, Equatable {
   case initialStateNotCreated
   case expectedSend
   case expectedDelivery
@@ -3685,6 +4020,77 @@ private struct ProductionIngressStagedCatalogBarrierHarness {
   let barrier: DeviceEpochBarrierV1
   let barrierFrame: ReceivedRelayFrame
   let updateReply: ReceivedRelayFrame
+}
+
+private struct ProductionIngressBootstrapCatalogBarrierHarness {
+  let fixture: ProductionIngressCryptoFixture
+  let ingress: ProductionMachineConnectionVerifiedIngress
+  let scope: TransferAssemblyScope
+  let barrier: DeviceEpochBarrierV1
+  let barrierFrame: ReceivedRelayFrame
+}
+
+private func productionIngressBootstrapCatalogBarrierHarness(
+  scopeIndex: UInt64,
+  requestRouteGenerator: @escaping @Sendable () throws -> Data = {
+    var uuid = UUID().uuid
+    return withUnsafeBytes(of: &uuid) { Data($0) }
+  }
+) async throws -> ProductionIngressBootstrapCatalogBarrierHarness {
+  let fixture = try await ProductionIngressCryptoFixture.make(
+    materializeInitialLifecycle: false
+  )
+  do {
+    let ingress = try await ProductionMachineConnectionVerifiedIngress.open(
+      material: fixture.material,
+      expectedConversationRoutes: [],
+      clock: { ProductionIngressCryptoFixture.fixedTimeMS },
+      requestRouteGenerator: requestRouteGenerator
+    )
+    let scope = productionIngressScope(scopeIndex)
+    _ = try await ingress.resumeFrames(
+      generation: scope.generation,
+      scope: scope,
+      heartbeatIntervalSeconds: 31
+    )
+    _ = try await productionIngressBootstrapCatalog(
+      ingress: ingress,
+      fixture: fixture,
+      scope: scope,
+      messageID: RuntimeMessageID(rawValue: "bootstrap-barrier-\(scopeIndex)"),
+      streamRoute: productionIngressKeySyncStreamRoute,
+      streamGeneration: productionIngressKeySyncStreamGeneration,
+      firstCounter: 1
+    )
+    let barrier = try DeviceEpochBarrierV1(
+      streamRoute: productionIngressKeySyncStreamRoute,
+      streamGeneration: productionIngressKeySyncStreamGeneration,
+      streamCursor: .beforeFirst,
+      innerCursor: .catalog(.beforeFirst),
+      oldEpoch: 0,
+      newEpoch: 1,
+      keyDirectoryRevision: fixture.currentRevision
+    )
+    let barrierFrame = try productionIngressEpochBarrierPublish(
+      fixture: fixture,
+      generation: scope.generation,
+      barrier: barrier,
+      counter: 1,
+      keyDirectoryRevision: fixture.currentRevision,
+      rawKeyByte: 0x41,
+      keyID: KeyIDV1(purpose: .catalog, epoch: 1)
+    )
+    return ProductionIngressBootstrapCatalogBarrierHarness(
+      fixture: fixture,
+      ingress: ingress,
+      scope: scope,
+      barrier: barrier,
+      barrierFrame: barrierFrame
+    )
+  } catch {
+    fixture.removeSandbox()
+    throw error
+  }
 }
 
 private func productionIngressStagedCatalogBarrierHarness(
@@ -3889,6 +4295,7 @@ private func productionIngressBootstrapCatalog(
   messageID: RuntimeMessageID,
   streamRoute: Data,
   streamGeneration: Data,
+  runtimeStreamGeneration: Data? = nil,
   firstCounter: UInt64,
   after: RuntimeStreamCursorV1 = .beforeFirst,
   synchronizedOuterCursor: RuntimeStreamCursorV1? = nil,
@@ -3898,7 +4305,9 @@ private func productionIngressBootstrapCatalog(
 ) async throws -> [RelayV2OutboundFrame] {
   let effectiveKeyDirectoryRevision = keyDirectoryRevision ?? fixture.currentRevision
   let runtimeGeneration = RuntimeStreamGeneration(
-    rawValue: productionIngressCanonicalUUIDString(streamGeneration)
+    rawValue: productionIngressCanonicalUUIDString(
+      runtimeStreamGeneration ?? streamGeneration
+    )
   )
   let prepared = try await ingress.prepareSubscription(
     target: .catalog,
@@ -4507,7 +4916,10 @@ private func productionIngressEpochBarrierPublish(
   fixture: ProductionIngressCryptoFixture,
   generation: RelayTransportGeneration,
   barrier: DeviceEpochBarrierV1,
-  counter: UInt64
+  counter: UInt64,
+  keyDirectoryRevision: UInt64? = nil,
+  rawKeyByte: UInt8 = 0x51,
+  keyID: KeyIDV1? = nil
 ) throws -> ReceivedRelayFrame {
   let context = OuterContextV1(
     frameKind: .catalogPublish,
@@ -4525,9 +4937,9 @@ private func productionIngressEpochBarrierPublish(
   let signed = try productionIngressSignedPayload(
     payload: DaemonKeyControlCanonicalCodec.encode(.epochBarrier(barrier)),
     payloadKind: .keyUpdate,
-    keyDirectoryRevision: fixture.nextRevision,
-    rawKey: Data(repeating: 0x51, count: 32),
-    keyID: fixture.nextCatalogKeyID,
+    keyDirectoryRevision: keyDirectoryRevision ?? fixture.nextRevision,
+    rawKey: Data(repeating: rawKeyByte, count: 32),
+    keyID: keyID ?? fixture.nextCatalogKeyID,
     counter: counter,
     context: context,
     signingKey: fixture.crypto.dataSigningKey

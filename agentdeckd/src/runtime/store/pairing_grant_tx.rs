@@ -943,14 +943,25 @@ pub(crate) fn confirm_pairing_grant(
         state.database_id,
         &directory.ledger,
     )?;
-    if transition_operation == super::key_transition::KeyTransitionOperation::Add
+    let first_remote_member = transition_operation
+        == super::key_transition::KeyTransitionOperation::Add
         && transition_from_revision == 0
-        && transition_recipients.len() == 1
-    {
+        && transition_recipients.len() == 1;
+    if first_remote_member && !active_stream_routes.is_empty() {
+        let _ = super::publication::stage_first_remote_catalog_publication_in_transaction(
+            &transaction,
+            config,
+            &state.key_bundle,
+            &mut next,
+            now_ms,
+            &[*outbox_id.as_bytes()],
+        )?;
+    }
+    if first_remote_member {
         super::publication::initialize_first_remote_member_baselines(
             &transaction,
             &state.key_bundle,
-            &directory.ledger,
+            &next,
             now_ms,
         )?;
     }

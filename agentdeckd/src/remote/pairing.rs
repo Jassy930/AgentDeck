@@ -7,6 +7,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentdeck_crypto::{
@@ -43,11 +45,15 @@ use zeroize::Zeroizing;
 
 use crate::runtime::model::RuntimeCommitOperation;
 use crate::runtime::pairing_administration::{PairingAdministrationError, PairingPendingSink};
+#[cfg(test)]
+use crate::runtime::store::MachineIdentityBinding;
 use crate::runtime::store::pairing::{
     AcceptPairRequest, AcceptPairRequestOutcome, CommitPairPending, CommitPairPendingOutcome,
     PairingInviteLifecycle, PairingInviteRecord, PreparePairingInvite, PreparePairingInviteOutcome,
 };
 use crate::runtime::store::pairing_grant::{ConfirmPairingGrant, PairingGrantPreparation};
+#[cfg(test)]
+use crate::runtime::store::pairing_grant::{ConversationKeyRotation, GlobalKeyStateV1};
 use crate::runtime::store::pairing_terminal::{
     CommitPairTerminal, CommitPairTerminalOutcome, PairTerminalPreparation, PairingCloseProjection,
     PairingTerminalAction, PairingTerminalRecovery, PairingTerminalizeOutcome,
@@ -466,6 +472,27 @@ impl PairingCoordinatorHandle {
     }
 
     #[cfg(test)]
+    pub(super) fn confirm_test_double(
+        entered: mpsc::UnboundedSender<
+            oneshot::Sender<Result<PairingReceipt, PairingAdministrationError>>,
+        >,
+    ) -> Self {
+        let (command_tx, mut command_rx) =
+            mpsc::channel::<PairingCommandEnvelope>(PAIRING_COMMAND_CAPACITY);
+        tokio::spawn(async move {
+            while let Some(envelope) = command_rx.recv().await {
+                let PairingCommand::Confirm { reply, .. } = envelope.command else {
+                    return;
+                };
+                if entered.send(reply).is_err() {
+                    return;
+                }
+            }
+        });
+        Self::for_test(command_tx)
+    }
+
+    #[cfg(test)]
     pub(super) fn revocation_test_double(
         entered: oneshot::Sender<(DeviceHandle, RuntimeGrantSerial)>,
         release: oneshot::Receiver<()>,
@@ -720,6 +747,79 @@ impl PairingCoordinatorOwner {
         };
         let ready = await_pairing_startup(&mut owner, ready_rx, shutdown_rx).await;
         (owner, recoverable_startup_ready(ready))
+    }
+
+    /// manager/store 组合门禁使用的最小 actor harness。这里只替换 transport、熵源与
+    /// pending sink；命令队列、PairingCoordinator actor、ProductionPairingStore 以及
+    /// confirm transaction 都沿用 production 实现。observer 仅记录 actor 的真实结果，
+    /// 不参与返回值或错误注入。
+    #[cfg(test)]
+    pub(super) async fn store_backed_confirm_observed_for_test(
+        store: RuntimeStoreHandle,
+        binding: MachineIdentityBinding,
+        data_certificate: SignedCertificate,
+    ) -> (
+        Self,
+        mpsc::UnboundedReceiver<Result<PairingReceipt, PairingAdministrationError>>,
+    ) {
+        let (command_tx, command_rx) = mpsc::channel(PAIRING_COMMAND_CAPACITY);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (health_tx, health_rx) = watch::channel(PairingCoordinatorHealth::Starting);
+        let (admission_tx, admission_rx) = watch::channel(PairingAdmissionFence {
+            epoch: 0,
+            failure_code: None,
+        });
+        let (delivery_commit_tx, delivery_commit_rx) = watch::channel(0);
+        let (confirm_observer_tx, confirm_observer_rx) = mpsc::unbounded_channel();
+        let invite_context = PairingInviteContext {
+            wss_url: "wss://relay.example.test:8443/".to_owned(),
+            current_spki_pin: [0x52; 32],
+            next_spki_pin: [0x53; 32],
+            relay_server_id: crate::runtime::store::PAIRING_TEST_RELAY,
+            machine_root_pubkey: PublicKeyBytes(binding.root_public_key),
+            machine_root_fingerprint: binding.root_fingerprint,
+            data_sign_cert: data_certificate.clone(),
+        };
+        let actor = PairingCoordinator::new_for_test(
+            Arc::new(ProductionPairingStore(store)),
+            Box::new(StoreBackedConfirmTestLane),
+            Box::new(StoreBackedConfirmTestAuthority {
+                binding,
+                data_certificate,
+                freeze_ordinal: AtomicUsize::new(0),
+            }),
+            invite_context,
+            Arc::new(StoreBackedConfirmPendingSink),
+            PairingCoordinatorSignals {
+                health_tx,
+                admission_tx: admission_tx.clone(),
+                delivery_commit_tx,
+            },
+        )
+        .with_confirm_observer_for_test(confirm_observer_tx);
+        let task = tokio::spawn(actor.run(command_rx, cancel_rx, ready_tx));
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .expect("store-backed confirm actor startup timeout")
+            .expect("store-backed confirm actor startup channel remains open")
+            .expect("store-backed confirm actor startup succeeds");
+        (
+            Self {
+                handle: PairingCoordinatorHandle {
+                    command_tx,
+                    health_rx: health_rx.clone(),
+                    admission_rx,
+                    _admission_tx: admission_tx,
+                },
+                cancel_tx,
+                task: Some(task),
+                health_rx,
+                delivery_commit_rx,
+                shutdown_deadline: None,
+            },
+            confirm_observer_rx,
+        )
     }
 
     #[must_use]
@@ -2944,6 +3044,191 @@ impl PairingAuthority for ProductionPairingAuthority {
     }
 }
 
+#[cfg(test)]
+struct StoreBackedConfirmPendingSink;
+
+#[cfg(test)]
+impl PairingPendingSink for StoreBackedConfirmPendingSink {
+    fn publish(&self, _pending: PendingPairing) -> Result<usize, PairingAdministrationError> {
+        Ok(0)
+    }
+}
+
+#[cfg(test)]
+struct StoreBackedConfirmTestLane;
+
+#[cfg(test)]
+#[async_trait]
+impl PairingLane for StoreBackedConfirmTestLane {
+    async fn send_open(&self, _frame: OpenPairRoute) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn send_data(&self, _frame: PairData) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn send_terminal_and_close(
+        &self,
+        _terminal: PairData,
+        _close: ClosePairRoute,
+    ) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn send_install(&self, _frame: InstallGrant) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn send_revoke(&self, _frame: RevokeDevice) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn send_close(&self, _frame: ClosePairRoute) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn reconnect(&self) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    fn yield_shared_control(&mut self) -> Result<(), PairingAdministrationError> {
+        Ok(())
+    }
+
+    async fn next_event(
+        &mut self,
+    ) -> Result<Option<PairingTransportEvent>, PairingAdministrationError> {
+        std::future::pending().await
+    }
+}
+
+/// 该 authority 只为 store-backed 组合门禁提供确定性 entropy。所有 allocation、
+/// artifact 验证及 commit CAS 仍由 production Store 执行；未被 confirm 使用的能力
+/// 固定 fail-close，避免测试 harness 意外扩展行为面。
+#[cfg(test)]
+struct StoreBackedConfirmTestAuthority {
+    binding: MachineIdentityBinding,
+    data_certificate: SignedCertificate,
+    freeze_ordinal: AtomicUsize,
+}
+
+#[cfg(test)]
+impl StoreBackedConfirmTestAuthority {
+    fn secret(seed: u8) -> SecretBytes {
+        SecretBytes::new(vec![seed; 32])
+    }
+}
+
+#[cfg(test)]
+impl PairingAuthority for StoreBackedConfirmTestAuthority {
+    fn seal_pending(
+        &self,
+        _preparation: &PendingPreparation,
+    ) -> Result<PairingControlEnvelopeV1, PairingAdministrationError> {
+        Err(pairing_error(PAIRING_GRANT_RECOVERY_UNAVAILABLE))
+    }
+
+    fn freeze_grant(
+        &self,
+        preparation: &GrantPreparationInput,
+        allocation: GrantAllocationInput,
+    ) -> Result<FrozenGrantInput, PairingAdministrationError> {
+        let production = preparation
+            .production
+            .as_ref()
+            .ok_or_else(|| pairing_error(PAIRING_GRANT_RECOVERY_UNAVAILABLE))?;
+        let ordinal = self.freeze_ordinal.fetch_add(1, Ordering::SeqCst);
+        let entropy_base: u8 = if ordinal == 0 { 0xc1 } else { 0xe1 };
+        let (device_route, grant_serial, global) = match allocation {
+            GrantAllocationInput::Production(GrantAllocationProjection::New {
+                current_global_keys,
+                active_conversation_routes,
+                ..
+            }) => {
+                if current_global_keys.is_some() {
+                    return Err(pairing_error(PAIRING_GRANT_RECOVERY_UNAVAILABLE));
+                }
+                let route = DeviceRouteId::from_bytes([0xd1; 16]);
+                let conversation_keys = active_conversation_routes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, stream_route)| {
+                        let index = u8::try_from(index)
+                            .map_err(|_| pairing_error(PAIRING_GRANT_RECOVERY_UNAVAILABLE))?;
+                        Ok(ConversationKeyRotation::new(
+                            stream_route,
+                            Self::secret(entropy_base.wrapping_add(4_u8.wrapping_add(index))),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, PairingAdministrationError>>()?;
+                let global = GlobalKeyStateV1::bootstrap_with_conversations(
+                    1,
+                    1,
+                    Self::secret(entropy_base),
+                    route,
+                    1,
+                    Self::secret(entropy_base.wrapping_add(1)),
+                    1,
+                    Self::secret(entropy_base.wrapping_add(2)),
+                    conversation_keys,
+                )
+                .map_err(store_error)?;
+                (route, GrantSerial::new(1), global)
+            }
+            GrantAllocationInput::Production(GrantAllocationProjection::Renew {
+                device_route,
+                next_serial,
+                current_global_keys,
+                ..
+            }) => {
+                let global = current_global_keys
+                    .renew_for_device(
+                        device_route,
+                        Self::secret(entropy_base),
+                        Self::secret(entropy_base.wrapping_add(1)),
+                        Self::secret(entropy_base.wrapping_add(2)),
+                    )
+                    .map_err(store_error)?;
+                (device_route, next_serial, global)
+            }
+            GrantAllocationInput::Test { .. } => {
+                return Err(pairing_error(PAIRING_GRANT_RECOVERY_UNAVAILABLE));
+            }
+        };
+        let input = crate::runtime::store::grant_input_with_for_test(
+            production,
+            &self.binding,
+            &self.data_certificate,
+            device_route,
+            grant_serial,
+            global,
+            None,
+            entropy_base.wrapping_add(3),
+        );
+        Ok(FrozenGrantInput {
+            pairing_id: preparation.pairing_id,
+            request_hash: preparation.request_hash,
+            production: Some(input),
+        })
+    }
+
+    fn verify_delivery(
+        &self,
+        _response: &DurableResponse,
+        _canonical_envelope: &[u8],
+    ) -> Result<DeliveryProofInput, PairingAdministrationError> {
+        Err(pairing_error(PAIRING_GRANT_RECOVERY_UNAVAILABLE))
+    }
+
+    fn freeze_revocation(
+        &self,
+        _grant: &RelayGrant,
+    ) -> Result<DeviceRevocation, PairingAdministrationError> {
+        Err(pairing_error(PAIRING_GRANT_RECOVERY_UNAVAILABLE))
+    }
+}
+
 struct PairingCoordinator {
     store: Arc<dyn PairingStore>,
     lane: Box<dyn PairingLane>,
@@ -2964,6 +3249,9 @@ struct PairingCoordinator {
     admission_epoch: u64,
     admission_tx: watch::Sender<PairingAdmissionFence>,
     delivery_commit_tx: watch::Sender<u64>,
+    #[cfg(test)]
+    confirm_observer:
+        Option<mpsc::UnboundedSender<Result<PairingReceipt, PairingAdministrationError>>>,
 }
 
 impl PairingCoordinator {
@@ -3000,6 +3288,8 @@ impl PairingCoordinator {
             admission_epoch: 0,
             admission_tx,
             delivery_commit_tx,
+            #[cfg(test)]
+            confirm_observer: None,
         }
     }
 
@@ -3033,7 +3323,17 @@ impl PairingCoordinator {
             admission_epoch: 0,
             admission_tx,
             delivery_commit_tx,
+            confirm_observer: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_confirm_observer_for_test(
+        mut self,
+        observer: mpsc::UnboundedSender<Result<PairingReceipt, PairingAdministrationError>>,
+    ) -> Self {
+        self.confirm_observer = Some(observer);
+        self
     }
 
     async fn run(
@@ -3206,6 +3506,10 @@ impl PairingCoordinator {
             }
             PairingCommand::Confirm { pairing_id, reply } => {
                 let result = self.confirm(pairing_id).await;
+                #[cfg(test)]
+                if let Some(observer) = &self.confirm_observer {
+                    let _ = observer.send(result.clone());
+                }
                 let _ = reply.send(result);
             }
             PairingCommand::RevokeDevice {

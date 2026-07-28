@@ -5,6 +5,7 @@
 //! 与 opaque Current proof，并把业务 fence/控制消费委托给 Store-backed handler。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agentdeck_protocol::e2ee::{
     DirectoryCurrentV1, E2EE_FORMAT_VERSION, KeyControlRequestV1, KeyUpdateSetV1,
@@ -29,6 +30,10 @@ use crate::runtime::store::{
     ActiveRemoteIngressProof, CurrentRemoteAuthorizationProof, RemoteReplyAuthorization, RuntimeId,
     RuntimeIdKind, RuntimeStoreError, RuntimeStoreHandle,
 };
+
+use super::transition_owner::KeyTransitionRecoveryHandle;
+
+const TRANSITION_SNAPSHOT_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Relay outer 在完整 authenticated admission 后冻结的 exact directed reply 路由。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,6 +276,7 @@ impl AuthenticatedKeyControlIngressHandler for BusinessOnlyKeyControlIngressHand
 pub(crate) struct StoreBackedKeyControlIngressHandler {
     store: RuntimeStoreHandle,
     clock: Arc<dyn RuntimeClock>,
+    transition: Option<KeyTransitionRecoveryHandle>,
 }
 
 impl StoreBackedKeyControlIngressHandler {
@@ -279,17 +285,47 @@ impl StoreBackedKeyControlIngressHandler {
         reason = "P4.5 manager composition installs this handler after transition recovery"
     )]
     pub(crate) fn new(store: RuntimeStoreHandle) -> Self {
-        Self::with_clock(store, Arc::new(SystemRuntimeClock))
+        Self::with_clock(store, Arc::new(SystemRuntimeClock), None)
     }
 
-    fn with_clock(store: RuntimeStoreHandle, clock: Arc<dyn RuntimeClock>) -> Self {
-        Self { store, clock }
+    pub(crate) fn with_transition_owner(
+        store: RuntimeStoreHandle,
+        transition: KeyTransitionRecoveryHandle,
+    ) -> Self {
+        Self::with_clock(store, Arc::new(SystemRuntimeClock), Some(transition))
+    }
+
+    fn with_clock(
+        store: RuntimeStoreHandle,
+        clock: Arc<dyn RuntimeClock>,
+        transition: Option<KeyTransitionRecoveryHandle>,
+    ) -> Self {
+        Self {
+            store,
+            clock,
+            transition,
+        }
     }
 
     fn observed_at_ms(&self) -> Result<u64, KeyControlIngressError> {
         self.clock
             .now_ms()
             .map_err(|_| KeyControlIngressError::StoreRejected)
+    }
+
+    async fn resolve_transition_snapshot(
+        &self,
+        authorization: &CurrentRemoteAuthorizationProof,
+        scope: KeyTransitionStreamScope,
+        cursor: StreamCursor,
+    ) -> Result<TransitionSnapshotPermit, RuntimeStoreError> {
+        self.store
+            .resolve_transition_snapshot_permit(TransitionSnapshotRequest::new(
+                authorization.clone(),
+                scope,
+                cursor,
+            ))
+            .await
     }
 
     async fn authorize_business_ingress_inner(
@@ -314,21 +350,55 @@ impl StoreBackedKeyControlIngressHandler {
                 // 都不能借这条窄 capability 进入 Core。
                 let (scope, cursor) = transition_snapshot_axes(envelope)
                     .ok_or(KeyControlIngressError::TransitionFenced)?;
-                let permit = self
-                    .store
-                    .resolve_transition_snapshot_permit(TransitionSnapshotRequest::new(
-                        authorization.clone(),
-                        scope,
-                        cursor,
-                    ))
+                let permit = match self
+                    .resolve_transition_snapshot(authorization, scope, cursor)
                     .await
-                    .map_err(|error| match error {
-                        RuntimeStoreError::InvalidStateTransition
-                        | RuntimeStoreError::PublicationMismatch => {
-                            KeyControlIngressError::TransitionFenced
+                {
+                    Ok(permit) => permit,
+                    Err(RuntimeStoreError::InvalidStateTransition) => {
+                        let transition = self
+                            .transition
+                            .as_ref()
+                            .ok_or(KeyControlIngressError::TransitionFenced)?;
+                        tokio::time::timeout(
+                            TRANSITION_SNAPSHOT_READINESS_TIMEOUT,
+                            transition.drive_to_business_ready(),
+                        )
+                        .await
+                        .map_err(|_| KeyControlIngressError::TransitionFenced)?
+                        .map_err(|_| KeyControlIngressError::TransitionFenced)?;
+
+                        // owner 完成幂等推进后必须重新走 Store-current 决策。zero-cut
+                        // transition 可能已经完成，此时该 Subscribe 是普通业务；有 cut
+                        // 的 Add 则只能凭本次 freshly resolved opaque permit 进入 Core。
+                        match self
+                            .store
+                            .check_remote_transition_ingress(RemoteTransitionIngressClass::Business)
+                            .await
+                        {
+                            Ok(()) => return Ok(BusinessIngressAdmission::BusinessReady),
+                            Err(RuntimeStoreError::InvalidStateTransition) => self
+                                .resolve_transition_snapshot(authorization, scope, cursor)
+                                .await
+                                .map_err(|error| match error {
+                                    RuntimeStoreError::InvalidStateTransition
+                                    | RuntimeStoreError::PublicationMismatch => {
+                                        KeyControlIngressError::TransitionFenced
+                                    }
+                                    _ => KeyControlIngressError::StoreRejected,
+                                })?,
+                            Err(_) => {
+                                return Err(KeyControlIngressError::StoreRejected);
+                            }
                         }
-                        _ => KeyControlIngressError::StoreRejected,
-                    })?;
+                    }
+                    Err(RuntimeStoreError::PublicationMismatch) => {
+                        return Err(KeyControlIngressError::TransitionFenced);
+                    }
+                    Err(_) => {
+                        return Err(KeyControlIngressError::StoreRejected);
+                    }
+                };
                 Ok(BusinessIngressAdmission::TransitionSnapshot(Box::new(
                     permit,
                 )))

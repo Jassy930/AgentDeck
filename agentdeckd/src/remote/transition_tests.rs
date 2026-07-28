@@ -864,6 +864,8 @@ struct FakeTransitionState {
     old_key_drives: usize,
     business_checks: usize,
     corrupt_commit_readback: bool,
+    bootstrap_proof_on_update_freeze: Option<PairingBootstrapInstallProof>,
+    ack_on_barrier_freeze: Option<Vec<u8>>,
 }
 
 struct FakeTransitionBackend {
@@ -888,6 +890,8 @@ impl FakeTransitionBackend {
                 old_key_drives: 0,
                 business_checks: 0,
                 corrupt_commit_readback: false,
+                bootstrap_proof_on_update_freeze: None,
+                ack_on_barrier_freeze: None,
             }),
         }
     }
@@ -910,6 +914,9 @@ impl TransitionBackend for FakeTransitionBackend {
         let mut state = self.state.lock().expect("backend lock");
         if state.material.recovery.transition.operation_id != operation_id {
             return Err(TransitionCoordinatorError::BackendRejected);
+        }
+        if let Some(proof) = state.bootstrap_proof_on_update_freeze.clone() {
+            state.material.recovery.transition.bootstrap_install_proof = Some(proof);
         }
         state.frozen_updates = updates.clone();
         state.material.recovery.transition.phase = KeyTransitionPhase::UpdatesFrozen;
@@ -970,6 +977,19 @@ impl TransitionBackend for FakeTransitionBackend {
         let mut state = self.state.lock().expect("backend lock");
         if state.material.recovery.transition.operation_id != operation_id {
             return Err(TransitionCoordinatorError::BackendRejected);
+        }
+        if let Some(canonical_ack) = state.ack_on_barrier_freeze.clone() {
+            let update = state
+                .material
+                .recovery
+                .updates
+                .first_mut()
+                .ok_or(TransitionCoordinatorError::BackendRejected)?;
+            if update.lifecycle == KeyUpdateLifecycle::Frozen {
+                update.lifecycle = KeyUpdateLifecycle::Acked;
+                update.canonical_ack = Some(canonical_ack);
+                update.state_changed_at_ms = update.state_changed_at_ms.saturating_add(1);
+            }
         }
         state.material.recovery.transition.phase = KeyTransitionPhase::BarriersFrozen;
         state.material.recovery.transition.cuts = cuts;
@@ -1570,6 +1590,73 @@ async fn update_freeze_readback_accepts_only_bootstrap_target_as_preacked() {
     }
     assert_eq!(state.old_key_drives, 0);
     assert!(state.barrier_requests.is_empty());
+}
+
+#[tokio::test]
+async fn update_freeze_accepts_authenticated_bootstrap_proof_arriving_after_material_load() {
+    let proof = material_with_bootstrap_proof()
+        .recovery
+        .transition
+        .bootstrap_install_proof
+        .expect("race fixture has bootstrap proof");
+    let target = KeyTransitionRecipient {
+        device_route: proof.binding.device_route,
+        grant_serial: proof.binding.grant_serial,
+    };
+    let backend = FakeTransitionBackend::new(material(), Vec::new());
+    backend
+        .state
+        .lock()
+        .expect("backend lock")
+        .bootstrap_proof_on_update_freeze = Some(proof);
+    let authority = RecordingAuthority::default();
+    let coordinator = TransitionCoordinator::new(&backend, &authority);
+
+    assert_eq!(
+        coordinator.advance_once().await,
+        Ok(TransitionAdvance::UpdatesFrozen { recipient_count: 2 })
+    );
+    let state = backend.state.lock().expect("backend lock");
+    let target_update = state
+        .material
+        .recovery
+        .updates
+        .iter()
+        .find(|update| update.recipient == target)
+        .expect("bootstrap target update exists");
+    assert_eq!(target_update.lifecycle, KeyUpdateLifecycle::Acked);
+    assert!(
+        target_update
+            .canonical_ack
+            .as_ref()
+            .is_some_and(|canonical| !canonical.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn barrier_freeze_accepts_authenticated_ack_progress_after_material_load() {
+    let backend = FakeTransitionBackend::new(updates_frozen_material(), exact_committed_cuts());
+    backend
+        .state
+        .lock()
+        .expect("backend lock")
+        .ack_on_barrier_freeze = Some(b"concurrent-key-update-ack".to_vec());
+    let authority = RecordingAuthority::default();
+    let coordinator = TransitionCoordinator::new(&backend, &authority);
+
+    assert_eq!(
+        coordinator.advance_once().await,
+        Ok(TransitionAdvance::ControlPlaneReady { barrier_count: 3 })
+    );
+    let state = backend.state.lock().expect("backend lock");
+    assert_eq!(
+        state.material.recovery.updates[0].lifecycle,
+        KeyUpdateLifecycle::Acked
+    );
+    assert_eq!(
+        state.material.recovery.updates[0].canonical_ack.as_deref(),
+        Some(b"concurrent-key-update-ack".as_slice())
+    );
 }
 
 #[tokio::test]

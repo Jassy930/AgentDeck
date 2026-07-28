@@ -465,7 +465,9 @@ final class MachineRequestCorrelationTests: XCTestCase {
     let messageID = RuntimeMessageID(rawValue: "catalog-subscription")
     let streamRoute = Data(repeating: 0x61, count: 16)
     let relayGeneration = correlationIdentifier(marker: 0x62, index: 0)
-    let runtimeGeneration = canonicalUUIDString(relayGeneration)
+    let runtimeGeneration = canonicalUUIDString(
+      correlationIdentifier(marker: 0x63, index: 0)
+    )
     try await owner.registerPendingSubscription(
       requestRoute: route,
       messageID: messageID,

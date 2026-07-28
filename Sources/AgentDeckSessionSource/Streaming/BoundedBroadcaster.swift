@@ -108,8 +108,10 @@ public actor BoundedBroadcaster<Element: Sendable> {
     )
 
     return AsyncStream<Element>(
-      unfolding: { [weak self] in
-        guard let self else { return nil }
+      // Iterator 必须在 drain 已排队的 terminal/control marker 前强持有
+      // broadcaster。Source 可以先释放 owner record；若这里 weak capture，
+      // broadcaster 会在慢观察者读 marker 前析构并把流静默截断。
+      unfolding: {
         return await self.next(for: observerID)
       },
       onCancel: { [weak self] in

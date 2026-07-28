@@ -737,6 +737,58 @@ struct KeyUpdateSetVerifier: Sendable {
     )
   }
 
+  /// PairResponse 的初始 state 为兼容既有 durable schema 可暂不物化 lifecycle。
+  /// 首个 `0 -> 1` barrier 到达时，在同一个 candidate 中从已签名 bootstrap directory
+  /// 重建完整 carrier roster，并绑定 exact activation proof；中间 lifecycle 不单独落盘。
+  func prepareBootstrapEpochBarrier(
+    state: DeviceCryptoStateV1,
+    barrier: DeviceEpochBarrierV1,
+    expectedConversationRoutes: [Data]
+  ) throws -> DeviceCryptoStateV1 {
+    guard state.securityState == .active,
+      keyVerifier.trustMatches(state.trustScope),
+      barrier.oldEpoch == 0,
+      barrier.newEpoch == 1,
+      barrier.keyDirectoryRevision == state.senderCounter.keyDirectoryRevision
+    else {
+      throw DeviceKeyLifecycleError.invalidBarrier
+    }
+    let expectedRoutes = try normalizedConversationRoutes(expectedConversationRoutes)
+    let baseline: DeviceCryptoStateV1
+    if state.keyLifecycle == nil {
+      let lifecycle: DeviceKeyLifecycleStateV1
+      do {
+        lifecycle = try bootstrapLifecycle(
+          state: state,
+          expectedConversationRoutes: expectedRoutes
+        )
+      } catch KeyDirectoryVerifierError.invalidBootstrapRoster {
+        // 该入口对调用方暴露的是 durable lifecycle transition；bootstrap
+        // directory 的 roster mismatch 也必须归一为同一 fail-close contract。
+        throw DeviceKeyLifecycleError.invalidRoster
+      }
+      baseline = try DeviceCryptoStateV1(
+        stateRevision: state.stateRevision,
+        trustScope: state.trustScope,
+        keyDirectory: state.keyDirectory,
+        senderCounter: state.senderCounter,
+        securityState: state.securityState,
+        replayStates: state.replayStates,
+        streamStates: state.streamStates,
+        keyLifecycle: lifecycle,
+        pendingStreamBindings: state.pendingStreamBindings,
+        keySyncEpisode: state.keySyncEpisode
+      )
+    } else {
+      _ = try auditColdOpen(
+        state: state,
+        expectedConversationRoutes: expectedRoutes
+      )
+      baseline = state
+    }
+    return try baseline.applyingBootstrapEpochBarrier(barrier)
+  }
+
   /// cold-open 在返回任何运行时 key 前重验 bootstrap directory、完整 active/staged set 与
   /// 每个 retained carrier，并重新执行 exact roster / fingerprint lineage 对账。
   func auditColdOpen(

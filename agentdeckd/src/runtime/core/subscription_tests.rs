@@ -2763,3 +2763,126 @@ async fn stale_subscription_generation_cannot_enqueue_after_resubscribe() {
     );
     core.shutdown().await.expect("shutdown core");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_membership_snapshot_recovery_covers_all_missing_conversations_and_h_drift() {
+    let root = TestRoot::new("remote-membership-snapshot-recovery");
+    let core = core(&root).await;
+    let first = catalog_conversation(0x81);
+    let second = catalog_conversation(0x91);
+    let first_id = first.conversation_id;
+    let second_id = second.conversation_id;
+    core.store
+        .create_conversation(first)
+        .await
+        .expect("create first pre-pairing conversation");
+    core.store
+        .create_conversation(second)
+        .await
+        .expect("create second pre-pairing conversation");
+    let owner = crate::runtime::store::IdempotencyOwner::Local {
+        machine_trust_domain: core
+            .store
+            .machine_trust_domain()
+            .expect("load snapshot recovery trust domain"),
+        uid: 501,
+        client_installation_id: [0xa1; 16],
+    };
+    for (conversation_id, key) in [(first_id, "first-h0"), (second_id, "second-h0")] {
+        assert!(matches!(
+            core.store
+                .configure_conversation(ConfigureConversation {
+                    conversation_id,
+                    owner: owner.clone(),
+                    idempotency_key: key.to_owned(),
+                    expected_configuration_revision: 0,
+                    configuration: codex_configuration(CodexReasoningEffort::Medium),
+                })
+                .await
+                .expect("append pre-pairing conversation event"),
+            ConfigureConversationOutcome::Applied { .. }
+        ));
+    }
+    assert_eq!(
+        core.store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await
+            .expect("plan all missing conversation snapshots"),
+        vec![first_id, second_id]
+    );
+
+    // Catalog budget contract 是 fail-fast；占满 RuntimeCore 唯一的 128 MiB pool 时，
+    // recovery 必须零写返回，不能等待或另建未计费路径。
+    let held_budget = core.subscriptions.exhaust_snapshot_budget_for_test().await;
+    assert_eq!(
+        core.refresh_snapshots_for_remote_membership()
+            .await
+            .expect_err("exhausted shared budget must fail closed")
+            .code,
+        DAEMON_RUNTIME_READ_UNAVAILABLE
+    );
+    assert_eq!(
+        core.store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await
+            .expect("budget failure snapshot readback"),
+        vec![first_id, second_id]
+    );
+    drop(held_budget);
+    timeout(
+        Duration::from_secs(5),
+        core.refresh_snapshots_for_remote_membership(),
+    )
+    .await
+    .expect("initial snapshot recovery timeout")
+    .expect("refresh all initial durable baselines");
+    assert!(
+        core.store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await
+            .expect("recheck initial snapshot coverage")
+            .is_empty()
+    );
+
+    // 模拟 build 完成后、confirm retry 前 first conversation 的 H 合法推进。
+    assert!(matches!(
+        core.store
+            .configure_conversation(ConfigureConversation {
+                conversation_id: first_id,
+                owner,
+                idempotency_key: "first-h1".to_owned(),
+                expected_configuration_revision: 1,
+                configuration: codex_configuration(CodexReasoningEffort::High),
+            })
+            .await
+            .expect("advance first conversation H between recovery and retry"),
+        ConfigureConversationOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        core.store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await
+            .expect("plan only drifted conversation snapshot"),
+        vec![first_id]
+    );
+    core.refresh_snapshots_for_remote_membership()
+        .await
+        .expect("refresh drifted conversation cut");
+    assert!(
+        core.store
+            .load_first_remote_member_missing_snapshot_conversations()
+            .await
+            .expect("recheck drifted snapshot coverage")
+            .is_empty()
+    );
+    assert_eq!(
+        core.store
+            .load_conversation_snapshot(first_id)
+            .await
+            .expect("load refreshed first snapshot")
+            .expect("first snapshot exists")
+            .base_event_seq,
+        Some(1)
+    );
+    core.shutdown().await.expect("shutdown recovery core");
+}
