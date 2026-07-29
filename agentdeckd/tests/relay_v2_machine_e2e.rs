@@ -2292,6 +2292,7 @@ enum P57HostCommand {
 enum P57HostWaitCondition {
     PendingPairing,
     BusinessReady,
+    DualScopeBusinessReady,
     BusinessMutated,
     Revoked,
 }
@@ -2348,18 +2349,9 @@ impl P57HostEvidence {
                     && self.relay_grant_total == 0
                     && self.relay_grant_active == 0
             }
-            P57HostWaitCondition::BusinessReady => {
-                self.machine_remote_lifecycle == MachineRemoteLifecycle::Active
-                    && self.pending_pairing_count == 0
-                    && self.relay_grant_total == 1
-                    && self.relay_grant_active == 1
-                    && self.active_transition_count == 0
-                    && self.active_catalog_stream_count == 1
-                    && self.runtime_active_writer_count == 2
-                    && self.runtime_live_subscription_count == 2
-                    && self.runtime_barrier_subscription_count == 0
-                    && self.runtime_snapshot_sender_count == 0
-                    && self.runtime_subscription_job_count == 2
+            P57HostWaitCondition::BusinessReady => self.satisfies_business_ready(2, 2, 2),
+            P57HostWaitCondition::DualScopeBusinessReady => {
+                self.satisfies_dual_scope_business_ready()
             }
             P57HostWaitCondition::BusinessMutated => {
                 self.runtime_command_count == 1
@@ -2379,6 +2371,84 @@ impl P57HostEvidence {
             }
         }
     }
+
+    fn satisfies_business_ready(
+        &self,
+        expected_active_writers: usize,
+        expected_live_subscriptions: usize,
+        expected_subscription_jobs: usize,
+    ) -> bool {
+        self.satisfies_business_ready_base()
+            && self.runtime_active_writer_count == expected_active_writers
+            && self.runtime_live_subscription_count == expected_live_subscriptions
+            && self.runtime_subscription_job_count == expected_subscription_jobs
+    }
+
+    fn satisfies_dual_scope_business_ready(&self) -> bool {
+        self.satisfies_business_ready_base()
+            && self.runtime_active_writer_count == 3
+            && (3..=4).contains(&self.runtime_live_subscription_count)
+            && self.runtime_subscription_job_count == self.runtime_live_subscription_count
+    }
+
+    fn satisfies_business_ready_base(&self) -> bool {
+        self.machine_remote_lifecycle == MachineRemoteLifecycle::Active
+            && self.pending_pairing_count == 0
+            && self.relay_grant_total == 1
+            && self.relay_grant_active == 1
+            && self.active_transition_count == 0
+            && self.active_catalog_stream_count == 1
+            && self.runtime_barrier_subscription_count == 0
+            && self.runtime_snapshot_sender_count == 0
+    }
+}
+
+#[test]
+fn p57_host_readiness_keeps_single_remote_and_dual_scope_topologies_exact() {
+    let mut evidence = P57HostEvidence {
+        machine_remote_lifecycle: MachineRemoteLifecycle::Active,
+        failure_code: None,
+        pending_pairing_count: 0,
+        relay_grant_total: 1,
+        relay_grant_active: 1,
+        active_transition_count: 0,
+        active_catalog_stream_count: 1,
+        runtime_command_count: 0,
+        runtime_completed_command_count: 0,
+        runtime_approval_total: 0,
+        runtime_approval_applied: 0,
+        runtime_revoked_authorization_count: 0,
+        runtime_active_writer_count: 2,
+        runtime_live_subscription_count: 2,
+        runtime_barrier_subscription_count: 0,
+        runtime_snapshot_sender_count: 0,
+        runtime_subscription_job_count: 2,
+        daemon_generation: 1,
+        socket_is_unix: true,
+        socket_mode: 0o600,
+    };
+
+    assert!(evidence.satisfies(P57HostWaitCondition::BusinessReady));
+    assert!(!evidence.satisfies(P57HostWaitCondition::DualScopeBusinessReady));
+
+    evidence.runtime_active_writer_count = 3;
+    evidence.runtime_live_subscription_count = 3;
+    evidence.runtime_subscription_job_count = 3;
+    assert!(!evidence.satisfies(P57HostWaitCondition::BusinessReady));
+    assert!(evidence.satisfies(P57HostWaitCondition::DualScopeBusinessReady));
+
+    evidence.runtime_live_subscription_count = 4;
+    evidence.runtime_subscription_job_count = 4;
+    assert!(evidence.satisfies(P57HostWaitCondition::DualScopeBusinessReady));
+
+    evidence.runtime_subscription_job_count = 5;
+    assert!(!evidence.satisfies(P57HostWaitCondition::DualScopeBusinessReady));
+    evidence.runtime_live_subscription_count = 5;
+    assert!(!evidence.satisfies(P57HostWaitCondition::DualScopeBusinessReady));
+    evidence.runtime_live_subscription_count = 4;
+    evidence.runtime_subscription_job_count = 4;
+    evidence.runtime_active_writer_count = 2;
+    assert!(!evidence.satisfies(P57HostWaitCondition::DualScopeBusinessReady));
 }
 
 #[derive(Serialize)]

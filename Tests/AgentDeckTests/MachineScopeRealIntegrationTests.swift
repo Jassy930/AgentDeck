@@ -274,7 +274,7 @@ final class MachineScopeRealIntegrationTests: XCTestCase {
 
     let businessReady = try await p57Stage("host business-ready readback") {
       try await host.waitFor(
-        .businessReady,
+        .dualScopeBusinessReady,
         timeoutMilliseconds: 30_000
       )
     }
@@ -286,9 +286,19 @@ final class MachineScopeRealIntegrationTests: XCTestCase {
       businessEvidence.relayGrantTotal == 1,
       businessEvidence.relayGrantActive == 1,
       businessEvidence.activeTransitionCount == 0,
-      businessEvidence.activeCatalogStreamCount == 1
+      businessEvidence.activeCatalogStreamCount == 1,
+      businessEvidence.runtimeActiveWriterCount == 3,
+      (3...4).contains(businessEvidence.runtimeLiveSubscriptionCount),
+      businessEvidence.runtimeBarrierSubscriptionCount == 0,
+      businessEvidence.runtimeSnapshotSenderCount == 0,
+      businessEvidence.runtimeSubscriptionJobCount
+        == businessEvidence.runtimeLiveSubscriptionCount
     else {
-      throw P57IntegrationError.assertion("host did not enter business-ready RemoteLink state")
+      throw P57IntegrationError.assertion(
+        "host did not enter dual-scope business-ready RemoteLink state: "
+          + "satisfied=\(String(describing: businessReady.satisfied)); "
+          + "evidence=\(String(describing: businessReady.evidence))"
+      )
     }
 
     let prompt = "P5.7 real dual-scope prompt"
@@ -512,6 +522,11 @@ private struct P57HostEvidence: Decodable, Sendable {
   let activeTransitionCount: Int64
   let activeCatalogStreamCount: Int64
   let runtimeCommandCount: Int64
+  let runtimeActiveWriterCount: Int
+  let runtimeLiveSubscriptionCount: Int
+  let runtimeBarrierSubscriptionCount: Int
+  let runtimeSnapshotSenderCount: Int
+  let runtimeSubscriptionJobCount: Int
   let socketIsUnix: Bool
   let socketMode: UInt32
 }
@@ -559,6 +574,7 @@ private struct P57HostEvent: Decodable, Sendable {
 private enum P57HostWaitCondition: String, Codable, Sendable {
   case pendingPairing
   case businessReady
+  case dualScopeBusinessReady
 }
 
 private struct P57HostCommand: Encodable {
