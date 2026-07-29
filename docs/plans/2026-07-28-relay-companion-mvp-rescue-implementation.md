@@ -257,6 +257,34 @@ gitStatus:
   replacement candidate 的 R4.8 计数。本次 docs-only scoped commit 生成新的 R4.7 committed candidate；其后
   必须从零连续执行三次 fresh lifecycle、完整 `p5`、`p4-auto` 与双路 review，期间任何仓库修改都使证据失效。
 
+### R4.8 revision rollover 重开与第二次 replacement R4.7（2026-07-29）
+
+- 上述 failure cleanup 文档提交生成的 committed candidate 为
+  `0f601aeb2e551ae95025e3ad09b99d3c8144a10d`。在它的首轮 fresh lifecycle 调试中，key directory revision
+  前进后长期 subscription job 被拆除；因此该轮不计作 R4.8，`0f601ae` 及其后的重复性/全量/review 证据均不得
+  继续使用。
+- 根因是 RemoteLink 的 `DeviceConnectionKey` 错误包含 request-scoped `authorization_hash` 与
+  `key_directory_revision`。subscription 准备推进 revision 后，下一条 prompt 会把同一授权身份误判为新连接，
+  断开旧 Runtime connection，并连带销毁已建立的 catalog/conversation subscription job。
+- replacement 将 connection identity 收敛为 trust domain、machine/device route、grant serial 与 device-sign
+  fingerprint；每个 ingress 仍携带本次 Store-current principal。Core 只允许相同稳定 identity 且共享同一
+  revoke lease 的 request principal 挂到连接，command binding、snapshot、catalog 与 subscription pump 均使用
+  本次 request snapshot。grant/设备身份变化仍断开，单纯 revision rollover 不再拆连接。
+- 新增 `remote_connection_identity_survives_key_directory_revision_rollover` 与
+  `remote_envelope_uses_request_scoped_principal_after_revision_rollover`：后者证明 revision 42 prompt 不会回退到
+  connection 上的 revision 41 binding，且 revision 41 建立的 live subscription/job 在请求后仍保持 `1/1`。
+  P5.7 host evidence 同时把 `BusinessMutated` 收紧为 writers `2`、live subscriptions `2`、barriers `0`、
+  snapshot senders `0`、jobs `2`，不再只凭 durable business count 假阳性通过。
+- replacement implementation commit 为 `769a5992e1eeb55f719a56d55ac87abc5b03a486`，tree 为
+  `2f285772922a1071c2cacceb0c191018d5ba0c40`，8-path code/test manifest SHA-256 为
+  `606bfb9061291aa0bd2361277dd3004ccfb1e487a6b45d9c6536214fee9130e6`，相对本地 `master` 为
+  `0 behind / 289 ahead`。focused regression `2/2`、RemoteLink `33/33`、machine E2E
+  `2 passed / 1 interactive ignored`、daemon lib `1713 passed / 3 ignored / 0 failed`、两组 warnings-as-errors
+  Clippy、integration compile、format、network/no-net 与 diff 均通过。
+- 本次只更新本计划与 `docs/QUALITY.md`，以 docs-only scoped commit 再次生成 R4.7 committed candidate。提交后
+  必须读回 commit/tree/clean status；R4.8 三次 fresh lifecycle、完整 `p5`、`p4-auto` 与 R4.9 双路 review
+  全部从该新 candidate 的零状态重新计数。
+
 ### Automatic gates
 
 ```bash
@@ -540,7 +568,7 @@ git diff --check
 - [x] R4.4：client/daemon relaunch、cursor/backfill reconnect 与 revoke terminal。
 - [x] R4.5：外部 runner 严格只读 BLOCKED preflight，固定以 exit 78 表示预期未解锁。
 - [x] R4.6：扩展 verifier `p5`；automatic 缺失/失败必须非零，外部 BLOCKED 不计入 PASS。
-- [x] R4.7：failure cleanup 修复后重新同步文档并提交 replacement implementation candidate。
+- [x] R4.7：revision rollover 修复后重新同步文档并提交第二次 replacement implementation candidate。
 - [ ] R4.8：在 replacement committed candidate 上从零连续执行三次 fresh E2E。
 - [ ] R4.9：同一 replacement candidate 执行完整 `p5`/`p4-auto`、双路 review、cleanup 与 clean status；若修改
   代码，从 R4.7 重来。
@@ -753,7 +781,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
-| R4 Simulator E2E | in progress（reopened） | replacement implementation `5bd57ba` / tree `37b7bbe`；2-path hash `fd5a6c5e` | final syntax/双根 orphan contract/diff PASS；旧 candidate 的三次 lifecycle 与全量门禁已失效 | 首版修复 lifecycle/`p5` PASS；final host-root fallback 尚须在新 candidate 上从零重跑三次 | 旧双路 review 已失效；replacement review 待 R4.9 | implementation 已 exact commit；本次 docs-only commit 生成 replacement R4.7；未 push |
-| R5 MVP 收口 | paused | `5966c98` 已失效 | R5.2 首轮 Rust/Swift/iOS/P4 PASS 只作诊断；`p5` 暴露 orphan | PID 54930 已精确清理；当前无已知 Relay/daemon/booted Simulator | 必须等待 replacement R4.9 | 回到 R4.8；R5.1–R5.6 全部重跑 |
+| R4 Simulator E2E | in progress（reopened） | replacement implementation `769a599` / tree `2f28577`；8-path hash `606bfb9` | focused `2/2`、RemoteLink `33/33`、machine E2E `2/1 ignored`、daemon lib `1713/3 ignored`、Clippy/compile/format/network/docs/diff PASS | `0f601ae` 首轮暴露 revision rollover subscription teardown，不计数；新 candidate 尚须从零重跑三次 | 旧双路 review再次失效；replacement review 待 R4.9 | implementation 已 exact commit；本次 docs-only commit 生成第二次 replacement R4.7；未 push |
+| R5 MVP 收口 | paused | `5966c98`、`0f601ae` 均已失效 | 既有 R5.2 与首轮 R4.8 结果只作诊断，不可拼接 | PID 54930 已精确清理；当前无已知 Relay/daemon/booted Simulator | 必须等待第二次 replacement R4.9 | 回到 R4.8；R5.1–R5.6 全部重跑 |
 
 状态只能按实际证据更新。focused PASS 不得把 Phase 标为 complete；外部 BLOCKED 不得改写为 PASS。
