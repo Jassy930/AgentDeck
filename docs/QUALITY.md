@@ -4037,6 +4037,53 @@ SHA-256 固定为 `8031eef7ce3825addc8f86ef96edea3b2151c8353a61bdb5fb492d7b05b2f
 都会使计数失效并回到 R4.7。物理 iPhone、第二台 Mac、公网 WSS、真实 vendor 与 production signing 继续保持
 versioned post-MVP `BLOCKED`，不计 PASS。
 
+## Relay Companion MVP rescue R4.9 Acked stream-applied ACK 终审重开
+
+第三次 replacement candidate 为 `eaa1c5a1de6aaea0ba56643b42e8663925ea6b08`，tree 为
+`5b08d42a1d6d1a4efadc087c407f61b530865f59`。连续三次 fresh lifecycle、完整 `p5` 与 `p4-auto` 均已 PASS，
+但 spec/security 终审随后发现 `same_or_monotonic_committed_update()` 的 `Acked → Acked` 分支仍错误要求
+`state_changed_at_ms` 完全一致。真实 Store 的 `acknowledge_stream_applied()` 会在新增已认证 stream ACK 后把该
+timestamp 推进到 `acknowledged_at_ms`；旧 Fake Store 没有同步这一语义，回归也只覆盖
+`Frozen → Acked + stream ACK`。因此 `eaa1c5a` 的上述运行结果全部失效，只能保留为诊断证据。
+
+新比较契约继续要求 canonical ACK 完全一致、旧 stream ACK 集合是新集合的子集；集合未增长时 timestamp 必须
+完全一致，严格增长时才允许单调前进。其他稳定轴与不可变 bytes 仍精确比较，timestamp-only 漂移继续在 business
+ingress 前 fail-close。Fake Store 现与生产 Store 一样，在新增 stream ACK 时同步推进 update timestamp。
+
+replacement implementation commit 为 `33625506259d2ee46a1c8d0342d42ddce846208c`，tree 为
+`1cfef041438b76094b5a8e18cb0d31a629cb1d58`，相对本地 `master` 为 `0 behind / 293 ahead`。本切片冻结以下
+2-path code/test manifest；tracked docs 不进入 hash：
+
+```bash
+acked_stream_progress_manifest=(
+  agentdeckd/src/remote/transition.rs
+  agentdeckd/src/remote/transition_tests.rs
+)
+test "${#acked_stream_progress_manifest[@]}" -eq 2
+for manifest_item in "${acked_stream_progress_manifest[@]}"; do
+  test -f "$manifest_item" || exit 1
+  printf 'blob %s %s\n' "$(git hash-object "$manifest_item")" "$manifest_item"
+done | LC_ALL=C sort | shasum -a 256
+```
+
+SHA-256 固定为 `ce3158fca4eb68b7feac9bbf497ec5167b49471eb27184faa504541c0da7a7ee`。fresh implementation
+门禁结果：
+
+- COMMIT/readback focused `5/5`，transition suite `35/35`；
+- `relay_v2_machine_e2e` 为 `2 passed / 1 interactive ignored / 0 failed`；
+- daemon lib 为 `1718 passed / 3 ignored / 0 failed`；
+- integration test compile、lib/E2E 两组 warnings-as-errors Clippy、Rust format、daemon network/no-net、agent docs
+  与 `git diff --check` 全部 exit 0；
+- 完整 `p5` PASS：daemon generation 2 完成 command/approval/revoke `1/1/1`，restart marker、history recovery、
+  Relay plaintext absent，host/root/invite/socket/Simulator cleanup 全部 absent；SessionSource `25/25`，RelayClient
+  `457 executed / 4 external entitlement skipped / 0 failed`。这仍只是 implementation gate，不计作新 candidate
+  的 R4.8/R4.9 证据。
+
+本节与 rescue implementation 计划用 docs-only scoped commit 第四次生成 replacement R4.7 committed candidate。
+提交后必须读回 commit/tree 与 clean status，并从零连续执行三次 fresh lifecycle、完整 `p5`/`p4-auto`、双路
+review 和 cleanup；任何仓库修改都会使计数失效。物理 iPhone、第二台 Mac、公网 WSS、真实 vendor 与
+production signing 继续保持 versioned post-MVP `BLOCKED`，不计 PASS。
+
 ## Relay Companion MVP rescue R0 基线冻结证据
 
 R0 只冻结事实、执行入口和既有 automatic baseline，不修改生产代码，也不提前执行 master merge、协议治理或
@@ -4365,7 +4412,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P5.6 iOS production composition / pairing lifecycle | 2026-07-28 automatic Task complete；11 iOS code/test content manifest `8cf47be71709bcd4648341eaa5cd7b693a00f6e871dfb586fbda76ee8662a2fb` + 10 docs = exact 21 paths。Pairing/AppLifecycle focused `42/42`、pre-stream ABA 10 轮、Relay shutdown `56/56`、RelayClient `445/4 entitlement SKIP`、顶层 Swift `985/4 skipped + 35`、fresh iOS `133/133`、Release build/fixture scan、strict format/docs/diff 均通过。只证明 Release Relay composition、完整邀请扫码/粘贴与确认、exact pairing/capture generation/replacement、verified revoke/offline forget 和前后台 source generation；P5.6 收口时 P5 为 6/9，P5.7–P5.9 与 P5 Phase Exit 当时未完成；后续 P5.7 已独立完成。真实公网、物理 iPhone、production-signed Keychain、第二 Mac、真实 vendor 与 destructive purge 继续 post-MVP `BLOCKED` |
 | Relay Companion MVP P5.7 macOS SessionSource registry | 2026-07-28 automatic Task complete；`40 prerequisite + 23 registry + 7 docs = 70 paths`，content hash 分别为 `85a46da6d79e56f6da1efd2e67b8851b1b264d7e796ded50334a7769b0af680f` 与 `df38994a015d0bd7014618a75afb6988b9dfec926a19f92cc5e4c8843788bcf6`。完成唯一 local UDS source、per-machine remote registry、typed local capability、真实 dual-scope host、Genesis/business-ready、typed snapshot recovery、observation reentrancy、`SessionModel` operation join 与 Preview/AppRuntime exact-pump barrier；Swift `1061/4 skipped + 35`、Rust daemon lib `1683/3 ignored`、main `7/7`、慢组与双路终审均通过。P5.7 收口时 P5 为 7/9；后续 rescue P5.8-lite 已完成，当前只剩 P5.9 与 P5 Phase Exit。真实公网、物理设备、production-signed Keychain、第二 Mac、真实 vendor 与 destructive purge 继续 post-MVP `BLOCKED` |
 | Relay Companion MVP rescue R3 P5.8-lite 本机 pending-device 控制面 | 2026-07-28 automatic Task complete；冻结 5-path code/test manifest SHA-256 `9c3bd63c9e56ef244d0d72da3192cfe3ade31b80c7a41675ee804355b56720ba`。只增加 production local composition 的“本机配对请求…”入口和注入 `LocalPairingAdministration` 的 AppKit 面板；Preview/fixture 与 remote scope 无入口。focused `46/46`、顶层 warnings-as-errors `1161 XCTest / 4 skipped + 48 Swift Testing`、ownership、strict format、docs、diff 与双路终审均通过，P0/P1/P2=0；真实 bundle 读回菜单、完整 DeviceSign fingerprint 与 typed transport failure。stable canonical daemon 缺失保持环境 `BLOCKED`，不计 PASS；machine picker、remote pairing/receipt UI、协议变更、真实公网/设备/vendor/production signing 继续 post-MVP `BLOCKED`。R3 收口后 P5 为 8/9，只剩 P5.9 与 automatic Phase Exit |
-| Relay Companion MVP rescue R4 fixed-topology Simulator E2E / P5 Phase Exit | 2026-07-29 transition/readiness reopened。旧 `3fb83e8`/`5966c98` 先因 exec-gate orphan 失效，`0f601ae` 又暴露 revision rollover subscription teardown；其 replacement candidate `f7d2e68` 的完整 `p5` 再暴露 transition COMMIT/readback TOCTOU 与 restart readiness 假阳性。第三次 replacement implementation `dc24c54` / tree `40365af`、3-path hash `8031eef` 已通过 focused `3/3`、transition `33/33`、machine E2E `2/1 ignored`、daemon lib `1716/3 ignored`、完整 `p5`、Clippy/compile/format/network/diff；新 docs-only candidate 上仍须从零重跑三次 lifecycle、完整 `p5`/`p4-auto` 与双路 review。外部槽位继续 post-MVP BLOCKED，不计 PASS |
+| Relay Companion MVP rescue R4 fixed-topology Simulator E2E / P5 Phase Exit | 2026-07-30 Acked stream ACK 终审重开。旧 `3fb83e8`/`5966c98` 因 exec-gate orphan 失效，`0f601ae` 暴露 revision rollover teardown，`f7d2e68` 暴露 transition readback/restart readiness；第三次 candidate `eaa1c5a` 虽三轮 lifecycle、`p5`、`p4-auto` PASS，终审仍发现 `Acked → Acked + stream ACK` timestamp 合法竞态。第四次 replacement implementation `3362550` / tree `1cfef04`、2-path hash `ce3158f` 已通过 focused `5/5`、transition `35/35`、machine E2E `2/1 ignored`、daemon lib `1718/3 ignored`、完整 `p5`、Clippy/compile/format/network/docs/diff；新 docs-only candidate 上仍须从零重跑三次 lifecycle、完整 `p5`/`p4-auto` 与双路 review。外部槽位继续 post-MVP BLOCKED，不计 PASS |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## Codex vendor schema 快照

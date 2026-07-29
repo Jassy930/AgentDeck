@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；第三次 replacement R4.7 已冻结，R4.8 pending；R5 暂停 |
+| 状态 | In execution；终审重开后第四次 replacement R4.7 已冻结，R4.8 pending；R5 暂停 |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -316,6 +316,36 @@ gitStatus:
 - 物理 iPhone、第二台 Mac、公网 WSS、真实 vendor 与 production signing 继续保持 versioned post-MVP
   `BLOCKED`，不计入 automatic PASS，也不能用 Simulator 或本机结果替代。
 
+### R4.9 Acked stream-applied ACK 终审重开（2026-07-30）
+
+- 第三次 replacement docs candidate 为 `eaa1c5a1de6aaea0ba56643b42e8663925ea6b08`，tree 为
+  `5b08d42a1d6d1a4efadc087c407f61b530865f59`。它的连续三次 fresh lifecycle、完整 `p5` 与 `p4-auto`
+  虽然全部 PASS，但 spec/security 终审发现合法竞态未覆盖，因此这些结果只保留为诊断证据，不得计作
+  R4.8/R4.9 或 P5 Phase Exit 完成。
+- 漏洞位于 `same_or_monotonic_committed_update()` 的 `Acked → Acked` 分支：旧比较器要求
+  `state_changed_at_ms` 完全一致，而真实 Store 的 `acknowledge_stream_applied()` 在新增已认证 stream ACK 后会把
+  timestamp 推进到 `acknowledged_at_ms`。旧 Fake Store 未同步该行为，既有回归也只覆盖
+  `Frozen → Acked + stream ACK`，因此会把“原快照已 Acked、mark 后新增 stream ACK”的合法 readback 误报为
+  `daemon.remote.transition.readback_mismatch`。
+- 修复后的边界为：canonical ACK 必须完全一致；旧 stream ACK 集合必须是新集合的子集；集合未增长时 timestamp
+  必须完全一致，严格增长时才允许 timestamp 单调前进。operation/recipient/revision、canonical update bytes、
+  snapshot flushes、created time 与其他稳定轴继续精确比较，timestamp-only 漂移仍 fail-close。Fake Store 同步在
+  新增 stream ACK 时推进 `state_changed_at_ms`。
+- replacement implementation commit 为 `33625506259d2ee46a1c8d0342d42ddce846208c`，tree 为
+  `1cfef041438b76094b5a8e18cb0d31a629cb1d58`，相对本地 `master` 为 `0 behind / 293 ahead`；2-path
+  code/test manifest SHA-256 为 `ce3158fca4eb68b7feac9bbf497ec5167b49471eb27184faa504541c0da7a7ee`。
+  新增“already Acked 后合法增长”和“无增长 timestamp 漂移拒绝”两项回归。
+- fresh implementation gates：COMMIT/readback focused `5/5`、transition `35/35`、machine E2E
+  `2 passed / 1 interactive ignored`、daemon lib `1718 passed / 3 ignored / 0 failed`；integration compile、两组
+  warnings-as-errors Clippy、format、network/no-net、agent docs 与 diff 全部 exit 0。完整 `p5` 也 PASS，daemon
+  generation 2 完成 command/approval/revoke `1/1/1`、restart marker 与 history recovery，Relay plaintext 和全部
+  owned cleanup 均 absent；SessionSource `25/25`、RelayClient `457 executed / 4 external skipped / 0 failed`。
+  这些结果只证明 implementation 具备重新冻结资格，不计作新 committed candidate 的 R4.8/R4.9 证据。
+- 本次只更新本计划与 `docs/QUALITY.md`，以 docs-only scoped commit 第四次生成 replacement R4.7 committed
+  candidate。提交后必须读回 commit/tree/clean status，并从零连续执行三次 fresh lifecycle、完整 `p5`、
+  `p4-auto`、双路 review 与 cleanup；期间任何仓库修改都会使计数再次失效。物理 iPhone、第二台 Mac、公网
+  WSS、真实 vendor 与 production signing 继续保持 versioned post-MVP `BLOCKED`。
+
 ### Automatic gates
 
 ```bash
@@ -599,7 +629,7 @@ git diff --check
 - [x] R4.4：client/daemon relaunch、cursor/backfill reconnect 与 revoke terminal。
 - [x] R4.5：外部 runner 严格只读 BLOCKED preflight，固定以 exit 78 表示预期未解锁。
 - [x] R4.6：扩展 verifier `p5`；automatic 缺失/失败必须非零，外部 BLOCKED 不计入 PASS。
-- [x] R4.7：transition COMMIT/readback 与 restart readiness 修复后重新同步文档并提交第三次 replacement
+- [x] R4.7：Acked stream-applied ACK 终审修复后重新同步文档并提交第四次 replacement
   implementation candidate。
 - [ ] R4.8：在 replacement committed candidate 上从零连续执行三次 fresh E2E。
 - [ ] R4.9：同一 replacement candidate 执行完整 `p5`/`p4-auto`、双路 review、cleanup 与 clean status；若修改
@@ -813,7 +843,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
-| R4 Simulator E2E | in progress（reopened） | replacement implementation `dc24c54` / tree `40365af`；3-path hash `8031eef` | focused `3/3`、transition `33/33`、machine E2E `2/1 ignored`、daemon lib `1716/3 ignored`、完整 `p5`、Clippy/compile/format/network/docs/diff PASS | `f7d2e68` 的完整 `p5` 暴露 transition COMMIT/readback TOCTOU 与 restart readiness 假阳性，不计数；新 candidate 尚须从零重跑三次 | 旧双路 review再次失效；replacement review 待 R4.9 | implementation 已 exact commit；本次 docs-only commit 生成第三次 replacement R4.7；未 push |
-| R5 MVP 收口 | paused | `5966c98`、`0f601ae`、`f7d2e68` 均已失效 | 既有 R5.2、R4.8 与 implementation 全量结果只作诊断/实现门禁，不可拼接 | PID 54930 已精确清理；当前无已知 Relay/daemon/booted Simulator | 必须等待第三次 replacement R4.9 | 回到 R4.8；R5.1–R5.6 全部重跑 |
+| R4 Simulator E2E | in progress（reopened） | replacement implementation `3362550` / tree `1cfef04`；2-path hash `ce3158f` | focused `5/5`、transition `35/35`、machine E2E `2/1 ignored`、daemon lib `1718/3 ignored`、完整 `p5`、Clippy/compile/format/network/docs/diff PASS | `eaa1c5a` 虽三轮 lifecycle、`p5`、`p4-auto` PASS，但终审发现 Acked→Acked stream ACK 合法竞态，全部不计数；新 candidate 尚须从零重跑 | 旧双路 review再次失效；replacement review 待 R4.9 | implementation 已 exact commit；本次 docs-only commit 生成第四次 replacement R4.7；未 push |
+| R5 MVP 收口 | paused | `5966c98`、`0f601ae`、`f7d2e68`、`eaa1c5a` 均已失效 | 既有 R5.2、R4.8 与 implementation 全量结果只作诊断/实现门禁，不可拼接 | 旧 PID 54930 已精确清理；当前 implementation `p5` cleanup PASS | 必须等待第四次 replacement R4.9 | 回到 R4.8；R5.1–R5.6 全部重跑 |
 
 状态只能按实际证据更新。focused PASS 不得把 Phase 标为 complete；外部 BLOCKED 不得改写为 PASS。
