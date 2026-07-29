@@ -868,6 +868,7 @@ struct FakeTransitionState {
     ack_on_barrier_freeze: Option<Vec<u8>>,
     ack_on_barrier_commit: Option<Vec<u8>>,
     stream_ack_on_barrier_commit: bool,
+    timestamp_drift_on_barrier_commit: bool,
     corrupt_update_on_barrier_commit: bool,
 }
 
@@ -897,6 +898,7 @@ impl FakeTransitionBackend {
                 ack_on_barrier_freeze: None,
                 ack_on_barrier_commit: None,
                 stream_ack_on_barrier_commit: false,
+                timestamp_drift_on_barrier_commit: false,
                 corrupt_update_on_barrier_commit: false,
             }),
         }
@@ -1113,6 +1115,7 @@ impl TransitionBackend for FakeTransitionBackend {
                 .updates
                 .first_mut()
                 .ok_or(TransitionCoordinatorError::BackendRejected)?;
+            let acknowledged_at_ms = update.state_changed_at_ms.saturating_add(1);
             update.stream_applied_acks.push(StreamAppliedAckRecord {
                 scope: cut.scope,
                 stream_route: cut.stream_route,
@@ -1123,8 +1126,18 @@ impl TransitionBackend for FakeTransitionBackend {
                 key_epoch: cut.new_epoch,
                 epoch_barrier_sha256: cut.epoch_barrier_sha256,
                 canonical_ack: b"concurrent-stream-applied-ack".to_vec(),
-                acknowledged_at_ms: update.state_changed_at_ms.saturating_add(1),
+                acknowledged_at_ms,
             });
+            update.state_changed_at_ms = acknowledged_at_ms;
+        }
+        if state.timestamp_drift_on_barrier_commit {
+            let update = state
+                .material
+                .recovery
+                .updates
+                .first_mut()
+                .ok_or(TransitionCoordinatorError::BackendRejected)?;
+            update.state_changed_at_ms = update.state_changed_at_ms.saturating_add(1);
         }
         if state.corrupt_update_on_barrier_commit {
             let update = state
@@ -1762,6 +1775,75 @@ async fn barrier_commit_readback_accepts_stream_ack_after_mark() {
     assert_eq!(
         update.stream_applied_acks[0].canonical_ack,
         b"concurrent-stream-applied-ack"
+    );
+}
+
+#[tokio::test]
+async fn barrier_commit_readback_accepts_stream_ack_for_already_acked_update_after_mark() {
+    let mut material = updates_frozen_material();
+    let update = material
+        .recovery
+        .updates
+        .first_mut()
+        .expect("already-acked update fixture");
+    update.lifecycle = KeyUpdateLifecycle::Acked;
+    update.canonical_ack = Some(b"existing-key-update-ack".to_vec());
+    update.state_changed_at_ms = update.state_changed_at_ms.saturating_add(1);
+    let expected_canonical_ack = update.canonical_ack.clone();
+
+    let backend = FakeTransitionBackend::new(material, exact_committed_cuts());
+    backend
+        .state
+        .lock()
+        .expect("backend lock")
+        .stream_ack_on_barrier_commit = true;
+    let authority = RecordingAuthority::default();
+    let coordinator = TransitionCoordinator::new(&backend, &authority);
+
+    assert_eq!(
+        coordinator.advance_once().await,
+        Ok(TransitionAdvance::ControlPlaneReady { barrier_count: 3 })
+    );
+    let state = backend.state.lock().expect("backend lock");
+    let update = &state.material.recovery.updates[0];
+    assert_eq!(update.lifecycle, KeyUpdateLifecycle::Acked);
+    assert_eq!(update.canonical_ack, expected_canonical_ack);
+    assert_eq!(update.stream_applied_acks.len(), 1);
+    assert_eq!(
+        update.state_changed_at_ms,
+        update.stream_applied_acks[0].acknowledged_at_ms
+    );
+}
+
+#[tokio::test]
+async fn barrier_commit_readback_rejects_timestamp_drift_without_stream_ack_growth() {
+    let mut material = updates_frozen_material();
+    let update = material
+        .recovery
+        .updates
+        .first_mut()
+        .expect("already-acked update fixture");
+    update.lifecycle = KeyUpdateLifecycle::Acked;
+    update.canonical_ack = Some(b"existing-key-update-ack".to_vec());
+    update.state_changed_at_ms = update.state_changed_at_ms.saturating_add(1);
+
+    let backend = FakeTransitionBackend::new(material, exact_committed_cuts());
+    backend
+        .state
+        .lock()
+        .expect("backend lock")
+        .timestamp_drift_on_barrier_commit = true;
+    let authority = RecordingAuthority::default();
+    let coordinator = TransitionCoordinator::new(&backend, &authority);
+
+    assert_eq!(
+        coordinator.advance_once().await,
+        Err(TransitionCoordinatorError::ExactReadbackMismatch)
+    );
+    assert_eq!(
+        backend.state.lock().expect("backend lock").business_checks,
+        0,
+        "timestamp-only drift must be rejected before entering business"
     );
 }
 

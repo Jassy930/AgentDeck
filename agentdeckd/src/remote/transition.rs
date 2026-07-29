@@ -782,6 +782,7 @@ fn same_or_monotonic_committed_update(
     {
         return false;
     }
+    let stream_ack_set_grew = actual.stream_applied_acks.len() > expected.stream_applied_acks.len();
     match (expected.lifecycle, actual.lifecycle) {
         (KeyUpdateLifecycle::Frozen, KeyUpdateLifecycle::Frozen) => {
             expected.canonical_ack.is_none()
@@ -799,7 +800,11 @@ fn same_or_monotonic_committed_update(
         }
         (KeyUpdateLifecycle::Acked, KeyUpdateLifecycle::Acked) => {
             expected.canonical_ack == actual.canonical_ack
-                && expected.state_changed_at_ms == actual.state_changed_at_ms
+                && if stream_ack_set_grew {
+                    expected.state_changed_at_ms <= actual.state_changed_at_ms
+                } else {
+                    expected.state_changed_at_ms == actual.state_changed_at_ms
+                }
         }
         _ => false,
     }
