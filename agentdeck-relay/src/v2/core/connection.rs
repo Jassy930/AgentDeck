@@ -1017,7 +1017,13 @@ impl ConnectionRegistry {
             cancel.cancel();
         }
         entry.replay_key = None;
+        // `activate()` can race a transport-owned close: the old socket writer may
+        // already have recorded `Disconnected` while the replacement activation is
+        // still ahead of the queued Core disconnect command. Preserve the writer's
+        // first-writer-wins reason so cleanup does not downgrade a proven transport
+        // loss to the caller's generic `Replaced` reason.
         entry.writer.close(reason);
+        let close_reason = entry.writer.close_reason().unwrap_or(reason);
         let access = entry.access.take();
         let principal = access
             .as_ref()
@@ -1027,7 +1033,7 @@ impl ConnectionRegistry {
             connection,
             access,
             principal,
-            close_reason: reason,
+            close_reason,
         })
     }
 
@@ -1451,6 +1457,36 @@ mod tests {
         assert_eq!(old_writer.close_reason(), Some(WriterCloseReason::Explicit));
         assert!(registry.validates(&new_access));
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn replacement_cleanup_preserves_preexisting_transport_disconnect() {
+        let mut registry = ConnectionRegistry::new(4);
+        let (old_writer, _old_receiver) = WriterHandle::channel();
+        let (new_writer, _new_receiver) = WriterHandle::channel();
+        registry
+            .attach_pending(connection(1), old_writer.clone(), 0)
+            .expect("attach old machine transport");
+        registry
+            .activate(machine_access(1, 9), 10, WriterCloseReason::Replaced)
+            .expect("activate old machine transport");
+        registry
+            .attach_pending(connection(2), new_writer, 0)
+            .expect("attach replacement machine transport");
+
+        assert!(old_writer.close(WriterCloseReason::Disconnected));
+        let cleanup = registry
+            .activate(machine_access(2, 9), 20, WriterCloseReason::Replaced)
+            .expect("activate replacement machine transport")
+            .expect("old machine transport cleanup");
+
+        assert_eq!(cleanup.connection, connection(1));
+        assert_eq!(cleanup.principal, Some(PrincipalRoute::Machine(machine(9))));
+        assert_eq!(cleanup.close_reason, WriterCloseReason::Disconnected);
+        assert_eq!(
+            old_writer.close_reason(),
+            Some(WriterCloseReason::Disconnected)
+        );
     }
 
     #[test]
