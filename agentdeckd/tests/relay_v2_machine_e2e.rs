@@ -101,8 +101,11 @@ const REMOTE_CLI_TEAM: &str = "A1B2C3D4E5";
 const P57_HOST_PROTOCOL: &str = "agentdeck-p57-host/v1";
 const P57_HOST_ENABLE_ENV: &str = "AGENTDECK_P57_HOST";
 const P57_HOST_PARENT_ENV: &str = "AGENTDECK_P57_HOST_PARENT";
+const P57_HOST_SCENARIO_ENV: &str = "AGENTDECK_P57_HOST_SCENARIO";
+const P57_HOST_R43_SCENARIO: &str = "r43-business";
+const P57_HOST_R43_CONVERSATION_TITLE: &str = "R4.3 synthetic Codex";
 const P57_HOST_MAX_COMMAND_BYTES: usize = 4 * 1_024;
-const P57_HOST_MAX_WAIT_MS: u64 = 30_000;
+const P57_HOST_MAX_WAIT_MS: u64 = 120_000;
 static P57_HOST_OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn p57_host_parent() -> PathBuf {
@@ -126,6 +129,15 @@ fn p57_host_parent() -> PathBuf {
             .is_some_and(|name| name.starts_with("ar4."))
     );
     parent
+}
+
+fn p57_host_scenario() -> Option<&'static str> {
+    match env::var(P57_HOST_SCENARIO_ENV).as_deref() {
+        Err(env::VarError::NotPresent) => None,
+        Ok(P57_HOST_R43_SCENARIO) => Some(P57_HOST_R43_SCENARIO),
+        Ok(other) => panic!("unsupported P5.7 host scenario: {other}"),
+        Err(env::VarError::NotUnicode(_)) => panic!("P5.7 host scenario must be UTF-8"),
+    }
 }
 
 fn remote_cli_access_group() -> String {
@@ -2257,6 +2269,10 @@ enum P57HostCommand {
         #[serde(rename = "timeoutMs")]
         timeout_ms: u64,
     },
+    ApprovePendingPairing {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     Shutdown {
         #[serde(rename = "requestId")]
         request_id: String,
@@ -2283,6 +2299,9 @@ struct P57HostReady {
     relay_database_path: String,
     pid: u32,
     invite_file_mode: u32,
+    scenario: Option<&'static str>,
+    conversation_id: Option<String>,
+    conversation_title: Option<&'static str>,
 }
 
 #[derive(Clone, Serialize)]
@@ -2296,6 +2315,9 @@ struct P57HostEvidence {
     active_transition_count: i64,
     active_catalog_stream_count: i64,
     runtime_command_count: i64,
+    runtime_completed_command_count: i64,
+    runtime_approval_total: i64,
+    runtime_approval_applied: i64,
     socket_is_unix: bool,
     socket_mode: u32,
 }
@@ -2337,6 +2359,15 @@ struct P57HostWait<'a> {
     request_id: &'a str,
     condition: P57HostWaitCondition,
     satisfied: bool,
+    evidence: P57HostEvidence,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct P57HostPairingApproved<'a> {
+    kind: &'static str,
+    protocol: &'static str,
+    request_id: &'a str,
     evidence: P57HostEvidence,
 }
 
@@ -2396,6 +2427,62 @@ fn write_p57_host_invite(root: &Path, invite: &agentdeck_protocol::e2ee::PairInv
     path
 }
 
+async fn create_p57_r43_conversation(local: &RuntimeUnixClient, root: &Path) -> ConversationId {
+    let RuntimeReply::ConversationStart(ConversationStartReceipt {
+        conversation_id,
+        replayed: false,
+    }) = unary(
+        local,
+        RuntimeRequest::Start(ConversationStart {
+            agent_kind: AgentKind::Codex,
+            idempotency_key: IdempotencyKey::new("r43-ui-start-codex"),
+            cwd: root.to_path_buf(),
+            title: Some(P57_HOST_R43_CONVERSATION_TITLE.to_owned()),
+        }),
+    )
+    .await
+    else {
+        panic!("R4.3 host failed to create a fresh Codex conversation");
+    };
+    let configured = unary(
+        local,
+        RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
+            conversation_id.clone(),
+            IdempotencyKey::new("r43-ui-configure-codex"),
+            0,
+            conversation_configuration(AgentKind::Codex),
+        )),
+    )
+    .await;
+    assert!(matches!(
+        configured,
+        RuntimeReply::Configuration(
+            agentdeck_protocol::runtime::ConfigurationReceipt::Applied {
+                conversation_id: configured_id,
+                configuration_revision: 1,
+            }
+        ) if configured_id == conversation_id
+    ));
+    conversation_id
+}
+
+fn runtime_business_counts(database: &Path) -> (i64, i64, i64) {
+    Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open Runtime DB read-only for business counts")
+    .query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM commands WHERE state = 'completed'),
+            (SELECT COUNT(*) FROM approval_ledger),
+            (SELECT COUNT(*) FROM approval_ledger WHERE state = 'applied')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .expect("read Runtime business counts")
+}
+
 async fn p57_host_evidence(
     local: &RuntimeUnixClient,
     socket: &Path,
@@ -2440,6 +2527,8 @@ async fn p57_host_evidence(
     let (relay_grant_total, relay_grant_active) = relay_device_grant_counts(relay_db);
     let (active_transition_count, active_catalog_stream_count) =
         runtime_transition_counts(runtime_db);
+    let (runtime_completed_command_count, runtime_approval_total, runtime_approval_applied) =
+        runtime_business_counts(runtime_db);
     let socket_metadata = fs::symlink_metadata(socket).ok();
     P57HostEvidence {
         machine_remote_lifecycle: machine_status.lifecycle,
@@ -2453,6 +2542,9 @@ async fn p57_host_evidence(
         active_transition_count,
         active_catalog_stream_count,
         runtime_command_count: runtime_command_count(runtime_db),
+        runtime_completed_command_count,
+        runtime_approval_total,
+        runtime_approval_applied,
         socket_is_unix: socket_metadata
             .as_ref()
             .is_some_and(|metadata| metadata.file_type().is_socket()),
@@ -2951,6 +3043,7 @@ async fn p57_real_dual_scope_ndjson_host() {
     );
 
     let host_parent = p57_host_parent();
+    let host_scenario = p57_host_scenario();
     let root = TempDirBuilder::new()
         .prefix("ad-p57-host-")
         .tempdir_in(host_parent)
@@ -3045,6 +3138,11 @@ async fn p57_real_dual_scope_ndjson_host() {
     )
     .await;
     assert!(matches!(enrollment, RuntimeReply::MachineRemoteStatus(_)));
+    let r43_conversation = match host_scenario {
+        Some(P57_HOST_R43_SCENARIO) => Some(create_p57_r43_conversation(&local, &root_path).await),
+        None => None,
+        Some(_) => unreachable!("P5.7 host scenario was validated above"),
+    };
     let RuntimeReply::PairInvite(invite_reply) = unary(
         &local,
         RuntimeRequest::CreatePairInvite(CreatePairInviteRequest {
@@ -3082,6 +3180,13 @@ async fn p57_real_dual_scope_ndjson_host() {
         relay_database_path: relay_db.to_string_lossy().into_owned(),
         pid: std::process::id(),
         invite_file_mode,
+        scenario: host_scenario,
+        conversation_id: r43_conversation
+            .as_ref()
+            .map(|conversation_id| conversation_id.as_str().to_owned()),
+        conversation_title: r43_conversation
+            .as_ref()
+            .map(|_| P57_HOST_R43_CONVERSATION_TITLE),
     });
 
     let mut shutdown_request_id = None;
@@ -3124,6 +3229,7 @@ async fn p57_real_dual_scope_ndjson_host() {
         let request_id = match &command {
             P57HostCommand::Status { request_id }
             | P57HostCommand::WaitFor { request_id, .. }
+            | P57HostCommand::ApprovePendingPairing { request_id }
             | P57HostCommand::Shutdown { request_id } => request_id,
         };
         if request_id.is_empty()
@@ -3181,6 +3287,66 @@ async fn p57_real_dual_scope_ndjson_host() {
                     request_id: &request_id,
                     condition,
                     satisfied,
+                    evidence,
+                });
+            }
+            P57HostCommand::ApprovePendingPairing { request_id } => {
+                let pending = unary(
+                    &local,
+                    RuntimeRequest::ListPendingPairings {
+                        scope: LocalOnlyAdministration::LocalOnly,
+                    },
+                )
+                .await;
+                let RuntimeReply::PendingPairings { mut pairings } = pending else {
+                    emit_p57_host_record(&P57HostError {
+                        kind: "error",
+                        protocol: P57_HOST_PROTOCOL,
+                        request_id: Some(&request_id),
+                        code: "host.approve.pending_read_failed",
+                    });
+                    continue;
+                };
+                if pairings.len() != 1 {
+                    emit_p57_host_record(&P57HostError {
+                        kind: "error",
+                        protocol: P57_HOST_PROTOCOL,
+                        request_id: Some(&request_id),
+                        code: "host.approve.pending_count_invalid",
+                    });
+                    continue;
+                }
+                let pairing_id = pairings.remove(0).pairing_id;
+                let confirmed = unary(
+                    &local,
+                    RuntimeRequest::ConfirmPairing {
+                        pairing_id: pairing_id.clone(),
+                        scope: LocalOnlyAdministration::LocalOnly,
+                    },
+                )
+                .await;
+                if !matches!(
+                    confirmed,
+                    RuntimeReply::Pairing(
+                        agentdeck_protocol::runtime::PairingReceipt::Confirmed {
+                            pairing_id: confirmed_id,
+                        }
+                    ) if confirmed_id == pairing_id
+                ) {
+                    emit_p57_host_record(&P57HostError {
+                        kind: "error",
+                        protocol: P57_HOST_PROTOCOL,
+                        request_id: Some(&request_id),
+                        code: "host.approve.confirm_failed",
+                    });
+                    continue;
+                }
+                let evidence =
+                    p57_host_evidence(&local, &socket, &config.paths().runtime_db, &relay_db).await;
+                emit_p57_host_record(&P57HostPairingApproved {
+                    kind: "approvePendingPairing",
+                    protocol: P57_HOST_PROTOCOL,
+                    request_id: &request_id,
                     evidence,
                 });
             }

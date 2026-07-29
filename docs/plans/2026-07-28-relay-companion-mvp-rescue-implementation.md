@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；R0–R3 complete，R4.1 RED complete、R4.2 pending |
+| 状态 | In execution；R0–R3 complete，R4.1–R4.3 complete、R4.4 pending |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -403,7 +403,7 @@ git diff --check
 - [x] R4.1：脚本 contract tests 和 UI E2E RED。
 - [x] R4.2：复用 synthetic adapter host，完成 temp Relay/daemon/Simulator orchestrator 与 waiting/零授权/cleanup
   闭环。
-- [ ] R4.3：production Swift client + iOS UI 完成 pair/list/open/prompt/approval。
+- [x] R4.3：production Swift client + iOS UI 完成 pair/list/open/prompt/approval。
 - [ ] R4.4：client/daemon relaunch、cursor/backfill reconnect 与 revoke terminal。
 - [ ] R4.5：外部 runner 严格只读 BLOCKED preflight，固定以 exit 78 表示预期未解锁。
 - [ ] R4.6：扩展 verifier `p5`；automatic 缺失/失败必须非零，外部 BLOCKED 不计入 PASS。
@@ -461,6 +461,34 @@ git diff --check
   `f18609bb95fd9e4d267ea86c64867604c93703645773138ddd481b1f58cb252b`；文档不进入该 hash，避免证据自引用。
 - 该 PASS 只关闭 R4.2 的真实 host + requester waiting + 零授权 + cleanup；list/open、prompt/approval、
   relaunch/reconnect、revoke terminal 仍属于 R4.3/R4.4，P5.9 与 P5 Phase 继续保持未完成。
+
+### R4.3 business-smoke readback（2026-07-29）
+
+- R4.3 没有新增协议、schema、Runtime/Relay 版本或第二套本地平台。既有 P5.7 host 只增加 env-gated
+  `r43-business` test scenario：经真实 Runtime UDS 预建一条 Codex 会话、提供 same-UID
+  `approvePendingPairing` 命令，并从 Runtime DB 只读汇总 command/approval terminal 计数。production iOS 改动仅为
+  machine/session/event/input/approval 控件补稳定 accessibility identifier 和交互式键盘收起，不增加测试旁路。
+- runner 新增 `--business-smoke`，编排顺序固定为：启动 production UI → host 精确读回
+  `pendingPairingCount=1` 且零 grant/command → same-UID local approve → 等待 machine active、单一 catalog stream、
+  transition 清零 → UI list/open/prompt/approval → host terminal readback。默认完整入口仍 exit 1 + `INCOMPLETE`，
+  `remaining` 只收敛为 `relaunch-reconnect` 与 `revoke-terminal`，不能把本切片写成 P5.9 PASS。
+- 首轮真实运行发现 cold Xcode build 超过原 30 秒 pending wait，runner 随即 fail-close 并完整清理；修复只把 host
+  test protocol 的有界 wait cap 扩为 120 秒，没有加入固定 sleep。第二轮读回 pending/local grant 成功，但 UI 在
+  host 批准后仍等待瞬态 status label，页面切换使 test 自身退出，daemon 因缺少客户端 ACK 正确保持
+  `daemon.remote.transition.business_fenced`。R4.2 已独立验证该 UI waiting 标签；R4.3 改由 host 精确拥有中间态
+  断言，UI 继续拥有批准后的业务断言。两轮失败均复核 owned Simulator、host PID 和 `/private/tmp/ar4.*` absent。
+- fresh `--business-smoke` 最终一行 JSON 为 `mode=business-smoke / status=PASS`；host 读回
+  `runtimeCommandCount=1 / runtimeCompletedCommandCount=1 / runtimeApprovalTotal=1 /
+  runtimeApprovalApplied=1`。production Swift client 实际打开 `R4.3 synthetic Codex`，发送
+  `R4.3 UI prompt sentinel`，显示 synthetic adapter 经 daemon/Relay 返回的 assistant item 与 canonical approval，
+  并读回“已应用批准”。Relay SQLite、存在时的 WAL/SHM 均未发现 prompt、assistant 或 approval sentinel 明文。
+- cleanup JSON 证明 host PID/root、invite、UDS 与 owned Simulator 全部 absent。回归门禁为 Rust focused
+  `2 passed / 1 interactive host ignored`、scoped Clippy/format/runner contract/Swift strict format PASS；顶层 Swift
+  `1161 XCTest / 4 entitlement skipped + 48 Swift Testing` 零失败；原 iOS scheme `133/133` 零失败；docs/diff
+  同步门禁 PASS。
+- 9-path code/test/runner content manifest 按 `git blob + path` 排序后的 SHA-256 为
+  `5561551ea1a2678c8bc14cb950efa359c1728f86a6c4832e0f8f4f1de17f090d`；文档不进入该 hash。R4.4 的
+  relaunch/reconnect/revoke terminal、R4.5–R4.9、完整 P5.9 与 P5 Phase Exit 仍未完成。
 
 ### Automatic gates
 
@@ -578,7 +606,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
-| R4 Simulator E2E | in progress | R4.1 hash `0662ac6e` | 原 iOS 133/133 PASS；runner contract exit 1、UI test 1 failed / xcodebuild 65（后两项为 expected RED） | UI target 可发现/可编译；缺 private invite 时 fail-close，零 mutation | R4.1 仅冻结缺口，phase review 尚未开始 | R4 WIP；未 push |
+| R4 Simulator E2E | in progress | R4.1 hash `0662ac6e`；R4.2 hash `f18609bb`；R4.3 hash `5561551e` | business-smoke PASS；Rust 2/1 ignored；Swift 1161/4 skip + 48；iOS 133/133；contract/Clippy/format/docs/diff PASS | pair/local approve/list/open/prompt/approval terminal 与 plaintext-absence/cleanup PASS；reconnect/revoke pending | R4.1–R4.3 Task 证据已闭环；phase review 尚未开始 | R4.3 scoped commit 后 clean；未 push |
 | R5 MVP 收口 | pending | — | — | — | — | — |
 
 状态只能按实际证据更新。focused PASS 不得把 Phase 标为 complete；外部 BLOCKED 不得改写为 PASS。

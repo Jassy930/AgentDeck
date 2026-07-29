@@ -40,6 +40,8 @@ final class SessionDetailViewController: UIViewController {
         let layout = UICollectionViewCompositionalLayout.list(using: config)
         collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
         collectionView.backgroundColor = DesignTokens.bg
+        collectionView.accessibilityIdentifier = "session.events"
+        collectionView.keyboardDismissMode = .interactive
         collectionView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(collectionView)
         NSLayoutConstraint.activate([

@@ -58,8 +58,8 @@ printf '%s\n' "$incomplete_record" | jq -e '
   and .mode == "full"
   and .status == "INCOMPLETE"
   and .mutations == 0
-  and .availableModes == ["contract", "host-smoke"]
-  and .remaining == ["business-flow", "relaunch-reconnect", "revoke-terminal"]
+  and .availableModes == ["contract", "host-smoke", "business-smoke"]
+  and .remaining == ["relaunch-reconnect", "revoke-terminal"]
 ' >/dev/null || fail "unfinished full E2E did not fail closed"
 
 printf 'relay companion simulator E2E contract: PASS\n'

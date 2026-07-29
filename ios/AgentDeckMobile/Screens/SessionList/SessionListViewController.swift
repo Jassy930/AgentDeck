@@ -65,6 +65,7 @@ final class SessionListViewController: UIViewController {
         let layout = UICollectionViewCompositionalLayout.list(using: config)
         collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
         collectionView.delegate = self
+        collectionView.accessibilityIdentifier = "sessions.list"
         collectionView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(collectionView)
         NSLayoutConstraint.activate([
@@ -88,6 +89,7 @@ final class SessionListViewController: UIViewController {
             content.textProperties.color = DesignTokens.text
             content.secondaryTextProperties.color = DesignTokens.text2
             cell.contentConfiguration = content
+            cell.accessibilityIdentifier = "sessions.row.\(session.id)"
             cell.accessories = [.disclosureIndicator()]
         }
         let headerReg = UICollectionView.SupplementaryRegistration<UICollectionViewListCell>(

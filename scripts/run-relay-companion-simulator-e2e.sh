@@ -8,13 +8,15 @@ emit_contract() {
 }
 
 emit_incomplete() {
-  printf '%s\n' '{"schemaVersion":1,"gate":"relay-companion-simulator-e2e","mode":"full","status":"INCOMPLETE","mutations":0,"availableModes":["contract","host-smoke"],"remaining":["business-flow","relaunch-reconnect","revoke-terminal"]}'
+  printf '%s\n' '{"schemaVersion":1,"gate":"relay-companion-simulator-e2e","mode":"full","status":"INCOMPLETE","mutations":0,"availableModes":["contract","host-smoke","business-smoke"],"remaining":["relaunch-reconnect","revoke-terminal"]}'
 }
 
 usage_error() {
-  printf 'usage: %s [--contract|--host-smoke]\n' "$0" >&2
+  printf 'usage: %s [--contract|--host-smoke|--business-smoke]\n' "$0" >&2
   exit 2
 }
+
+run_mode=""
 
 case "$#" in
   0)
@@ -27,7 +29,8 @@ case "$#" in
         emit_contract
         exit 0
         ;;
-      --host-smoke) ;;
+      --host-smoke) run_mode="host-smoke" ;;
+      --business-smoke) run_mode="business-smoke" ;;
       *) usage_error ;;
     esac
     ;;
@@ -35,7 +38,7 @@ case "$#" in
 esac
 
 fail() {
-  printf 'relay companion simulator host smoke: FAIL: %s\n' "$1" >&2
+  printf 'relay companion simulator E2E: FAIL: %s\n' "$1" >&2
   if [[ -n "${host_stderr:-}" && -f "$host_stderr" ]]; then
     printf '%s\n' 'host stderr tail:' >&2
     tail -n 80 "$host_stderr" >&2 || true
@@ -62,7 +65,7 @@ fail() {
   exit 1
 }
 
-for dependency in cargo jq xcodebuild xcodegen xcrun mktemp chmod kill pgrep ps stat tail; do
+for dependency in cargo env grep jq xcodebuild xcodegen xcrun mktemp chmod kill pgrep ps stat tail; do
   command -v "$dependency" >/dev/null 2>&1 \
     || fail "missing required command: $dependency"
 done
@@ -82,6 +85,7 @@ derived_data="$runner_root/DerivedData"
 
 cargo_pid=""
 host_pid=""
+xcode_pid=""
 host_root=""
 host_invite=""
 host_socket=""
@@ -150,6 +154,39 @@ force_stop_host() {
   fi
 }
 
+force_stop_xcode() {
+  if pid_is_alive "$xcode_pid"; then
+    terminate_owned_pid "$xcode_pid"
+    if ! wait_until_absent "$xcode_pid" 5; then
+      kill -KILL "$xcode_pid" >/dev/null 2>&1 || true
+    fi
+  fi
+  if [[ -n "$xcode_pid" ]]; then
+    wait "$xcode_pid" >/dev/null 2>&1 || true
+  fi
+}
+
+wait_for_xcode() {
+  local deadline xcode_status
+  deadline=$(( $(date +%s) + 300 ))
+  while pid_is_alive "$xcode_pid" && ! pid_is_zombie "$xcode_pid"; do
+    if [[ "$(date +%s)" -ge "$deadline" ]]; then
+      terminate_owned_pid "$xcode_pid"
+      wait_until_absent "$xcode_pid" 5 || kill -KILL "$xcode_pid" >/dev/null 2>&1 || true
+      wait "$xcode_pid" >/dev/null 2>&1 || true
+      fail "xcodebuild exceeded the 300 second hard deadline"
+    fi
+    sleep 0.1
+  done
+  set +e
+  wait "$xcode_pid"
+  xcode_status=$?
+  set -e
+  [[ "$xcode_status" -eq 0 ]] \
+    || fail "production Companion UI test failed with exit $xcode_status"
+  xcode_pid=""
+}
+
 read_host_json() {
   local expected_kind="$1"
   local expected_request_id="$2"
@@ -211,6 +248,7 @@ cleanup() {
   fi
   cleanup_started=1
 
+  force_stop_xcode
   stop_simulator
   if [[ "$host_graceful" -ne 1 ]]; then
     force_stop_host
@@ -242,7 +280,14 @@ exec 3<>"$host_input"
 exec 4<>"$host_output"
 
 printf '%s\n' "RUN: start existing real Relay/daemon host generation $runner_generation" >&2
-AGENTDECK_P57_HOST=1 AGENTDECK_P57_HOST_PARENT="$runner_root" \
+host_environment=(
+  "AGENTDECK_P57_HOST=1"
+  "AGENTDECK_P57_HOST_PARENT=$runner_root"
+)
+if [[ "$run_mode" == "business-smoke" ]]; then
+  host_environment+=("AGENTDECK_P57_HOST_SCENARIO=r43-business")
+fi
+env -u AGENTDECK_P57_HOST_SCENARIO "${host_environment[@]}" \
   cargo test -p agentdeckd --test relay_v2_machine_e2e \
   p57_real_dual_scope_ndjson_host -- \
   --ignored --exact --nocapture --test-threads=1 \
@@ -260,6 +305,20 @@ host_socket="$(printf '%s\n' "$host_record" | jq -er '.socketPath')"
 host_home="$(printf '%s\n' "$host_record" | jq -er '.homePath')"
 runtime_db="$(printf '%s\n' "$host_record" | jq -er '.runtimeDatabasePath')"
 relay_db="$(printf '%s\n' "$host_record" | jq -er '.relayDatabasePath')"
+
+if [[ "$run_mode" == "business-smoke" ]]; then
+  printf '%s\n' "$host_record" | jq -e '
+    .scenario == "r43-business"
+    and (.conversationId | type == "string" and length > 0)
+    and .conversationTitle == "R4.3 synthetic Codex"
+  ' >/dev/null || fail "R4.3 host ready record did not attest the business scenario"
+else
+  printf '%s\n' "$host_record" | jq -e '
+    .scenario == null
+    and .conversationId == null
+    and .conversationTitle == null
+  ' >/dev/null || fail "R4.2 host smoke unexpectedly enabled a business scenario"
+fi
 
 [[ "$host_pid" =~ ^[0-9]+$ ]] || fail "host ready PID is not numeric"
 pid_is_alive "$cargo_pid" || fail "cargo wrapper exited after host ready"
@@ -292,7 +351,13 @@ runtime_id="$(xcrun simctl list runtimes -j | jq -er \
   '[.runtimes[] | select(.platform == "iOS" and .isAvailable == true)] | last | .identifier')"
 [[ -n "$device_type" && -n "$runtime_id" ]] \
   || fail "available iPhone 17 device type or iOS runtime is missing"
-simulator_name="AgentDeck Relay R4.2 $runner_generation"
+if [[ "$run_mode" == "business-smoke" ]]; then
+  simulator_name="AgentDeck Relay R4.3 $runner_generation"
+  selected_ui_test="testPairListOpenPromptApproval"
+else
+  simulator_name="AgentDeck Relay R4.2 $runner_generation"
+  selected_ui_test="testPairingReachesLocalConfirmation"
+fi
 simulator_udid="$(xcrun simctl create "$simulator_name" "$device_type" "$runtime_id")"
 [[ "$simulator_udid" =~ ^[0-9A-Fa-f-]{36}$ ]] || fail "simctl returned an invalid UDID"
 xcrun simctl boot "$simulator_udid"
@@ -315,34 +380,17 @@ xcodebuild \
   -test-timeouts-enabled YES \
   -default-test-execution-time-allowance 120 \
   -maximum-test-execution-time-allowance 180 \
-  -only-testing:AgentDeckMobileUITests/RelayCompanionUITests/testPairingReachesLocalConfirmation \
+  "-only-testing:AgentDeckMobileUITests/RelayCompanionUITests/$selected_ui_test" \
   AGENTDECK_RELAY_E2E_INVITE_PATH="$host_invite" \
   test >"$xcode_log" 2>&1 &
 xcode_pid=$!
 set -e
 
-xcode_deadline=$(( $(date +%s) + 300 ))
-while pid_is_alive "$xcode_pid" && ! pid_is_zombie "$xcode_pid"; do
-  if [[ "$(date +%s)" -ge "$xcode_deadline" ]]; then
-    terminate_owned_pid "$xcode_pid"
-    wait_until_absent "$xcode_pid" 5 || kill -KILL "$xcode_pid" >/dev/null 2>&1 || true
-    wait "$xcode_pid" >/dev/null 2>&1 || true
-    fail "xcodebuild exceeded the 300 second hard deadline"
-  fi
-  sleep 0.1
-done
-set +e
-wait "$xcode_pid"
-xcode_status=$?
-set -e
-[[ "$xcode_status" -eq 0 ]] \
-  || fail "production Companion UI test failed with exit $xcode_status"
-
-wait_request="r42-pending-$runner_generation"
+wait_request="pairing-pending-$runner_generation"
 send_host_command \
-  "{\"op\":\"waitFor\",\"requestId\":\"$wait_request\",\"condition\":\"pendingPairing\",\"timeoutMs\":30000}" \
+  "{\"op\":\"waitFor\",\"requestId\":\"$wait_request\",\"condition\":\"pendingPairing\",\"timeoutMs\":120000}" \
   || fail "could not send pending-pairing readback to real host"
-read_host_json waitFor "$wait_request" 40 \
+read_host_json waitFor "$wait_request" 140 \
   || fail "real host did not return pending-pairing readback"
 printf '%s\n' "$host_record" | jq -e '
   .satisfied == true
@@ -356,7 +404,71 @@ printf '%s\n' "$host_record" | jq -e '
 ' >/dev/null || fail "pairing waiting state was not exact or authorization mutated early"
 pending_record="$host_record"
 
-shutdown_request="r42-shutdown-$runner_generation"
+if [[ "$run_mode" == "business-smoke" ]]; then
+  approve_request="r43-approve-$runner_generation"
+  send_host_command \
+    "{\"op\":\"approvePendingPairing\",\"requestId\":\"$approve_request\"}" \
+    || fail "could not send same-UID local pairing approval to real host"
+  read_host_json approvePendingPairing "$approve_request" 40 \
+    || fail "real host did not return local pairing approval readback"
+  printf '%s\n' "$host_record" | jq -e '
+    .evidence.pendingPairingCount == 0
+    and .evidence.relayGrantTotal == 1
+    and .evidence.relayGrantActive == 1
+    and .evidence.runtimeCommandCount == 0
+  ' >/dev/null || fail "local pairing approval did not create exactly one active grant"
+
+  business_request="r43-business-ready-$runner_generation"
+  send_host_command \
+    "{\"op\":\"waitFor\",\"requestId\":\"$business_request\",\"condition\":\"businessReady\",\"timeoutMs\":30000}" \
+    || fail "could not send business-ready wait to real host"
+  read_host_json waitFor "$business_request" 40 \
+    || fail "real host did not return business-ready readback"
+  printf '%s\n' "$host_record" | jq -e '
+    .satisfied == true
+    and .condition == "businessReady"
+    and .evidence.machineRemoteLifecycle == "active"
+    and .evidence.pendingPairingCount == 0
+    and .evidence.relayGrantTotal == 1
+    and .evidence.relayGrantActive == 1
+    and .evidence.activeTransitionCount == 0
+    and .evidence.activeCatalogStreamCount == 1
+  ' >/dev/null || fail "paired machine did not reach exact business-ready state"
+fi
+
+wait_for_xcode
+
+business_record=""
+if [[ "$run_mode" == "business-smoke" ]]; then
+  status_request="r43-status-$runner_generation"
+  send_host_command \
+    "{\"op\":\"status\",\"requestId\":\"$status_request\"}" \
+    || fail "could not send R4.3 business evidence readback to real host"
+  read_host_json status "$status_request" 40 \
+    || fail "real host did not return R4.3 business evidence"
+  printf '%s\n' "$host_record" | jq -e '
+    .evidence.machineRemoteLifecycle == "active"
+    and .evidence.runtimeCommandCount == 1
+    and .evidence.runtimeCompletedCommandCount == 1
+    and .evidence.runtimeApprovalTotal == 1
+    and .evidence.runtimeApprovalApplied == 1
+  ' >/dev/null || fail "R4.3 prompt/approval did not produce exact Runtime evidence"
+  business_record="$host_record"
+
+  for relay_path in "$relay_db" "$relay_db-wal" "$relay_db-shm"; do
+    [[ -f "$relay_path" ]] || continue
+    for plaintext in \
+      "R4.3 UI prompt sentinel" \
+      "synthetic Codex response" \
+      "synthetic codex approval"; do
+      if grep -aFq "$plaintext" "$relay_path"; then
+        fail "Relay persistence contains forbidden business plaintext"
+      fi
+    done
+  done
+fi
+
+shutdown_request="shutdown-$runner_generation"
 send_host_command \
   "{\"op\":\"shutdown\",\"requestId\":\"$shutdown_request\"}" \
   || fail "could not send graceful shutdown to real host"
@@ -391,5 +503,14 @@ grant_active="$(printf '%s\n' "$pending_record" | jq -er '.evidence.relayGrantAc
 rm -rf "$runner_root"
 cleanup_started=1
 trap - EXIT HUP INT TERM
-printf '{"schemaVersion":1,"gate":"relay-companion-simulator-e2e","mode":"host-smoke","status":"PASS","pendingPairingCount":%s,"relayGrantTotal":%s,"relayGrantActive":%s,"cleanup":{"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"simulatorAbsent":true}}\n' \
-  "$pending_count" "$grant_total" "$grant_active"
+if [[ "$run_mode" == "business-smoke" ]]; then
+  command_count="$(printf '%s\n' "$business_record" | jq -er '.evidence.runtimeCommandCount')"
+  completed_count="$(printf '%s\n' "$business_record" | jq -er '.evidence.runtimeCompletedCommandCount')"
+  approval_total="$(printf '%s\n' "$business_record" | jq -er '.evidence.runtimeApprovalTotal')"
+  approval_applied="$(printf '%s\n' "$business_record" | jq -er '.evidence.runtimeApprovalApplied')"
+  printf '{"schemaVersion":1,"gate":"relay-companion-simulator-e2e","mode":"business-smoke","status":"PASS","runtimeCommandCount":%s,"runtimeCompletedCommandCount":%s,"runtimeApprovalTotal":%s,"runtimeApprovalApplied":%s,"relayPlaintextAbsent":true,"cleanup":{"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"simulatorAbsent":true}}\n' \
+    "$command_count" "$completed_count" "$approval_total" "$approval_applied"
+else
+  printf '{"schemaVersion":1,"gate":"relay-companion-simulator-e2e","mode":"host-smoke","status":"PASS","pendingPairingCount":%s,"relayGrantTotal":%s,"relayGrantActive":%s,"cleanup":{"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"simulatorAbsent":true}}\n' \
+    "$pending_count" "$grant_total" "$grant_active"
+fi

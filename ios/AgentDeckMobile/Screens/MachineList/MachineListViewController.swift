@@ -75,6 +75,7 @@ final class MachineListViewController: UIViewController {
         let layout = UICollectionViewCompositionalLayout.list(using: config)
         collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
         collectionView.delegate = self
+        collectionView.accessibilityIdentifier = "machines.list"
         collectionView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(collectionView)
         NSLayoutConstraint.activate([
@@ -110,6 +111,7 @@ final class MachineListViewController: UIViewController {
             }()
             content.imageProperties.maximumSize = CGSize(width: 10, height: 10)
             cell.contentConfiguration = content
+            cell.accessibilityIdentifier = "machines.row.\(machine.id)"
             var accessories: [UICellAccessory] = [.disclosureIndicator()]
             if machine.pendingApprovalCount > 0 {
                 let badge = UILabel()

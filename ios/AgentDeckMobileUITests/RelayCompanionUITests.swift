@@ -9,6 +9,8 @@ import XCTest
 final class RelayCompanionUITests: XCTestCase {
     private static let invitePathEnvironment = "AGENTDECK_RELAY_E2E_INVITE_PATH"
     private static let inviteResourceName = "RelayCompanionPairInvite"
+    private static let conversationTitle = "R4.3 synthetic Codex"
+    private static let promptSentinel = "R4.3 UI prompt sentinel"
 
     override func setUp() {
         super.setUp()
@@ -16,24 +18,82 @@ final class RelayCompanionUITests: XCTestCase {
     }
 
     func testPairingReachesLocalConfirmation() throws {
+        let app = try launchPairingApp()
+        try beginPairing(in: app)
+        waitForPairingWaiting(in: app)
+    }
+
+    func testPairListOpenPromptApproval() throws {
+        let app = try launchPairingApp()
+        try beginPairing(in: app)
+
+        let machineList = app.collectionViews["machines.list"]
+        XCTAssertTrue(machineList.waitForExistence(timeout: 90))
+        let machine = machineList.cells.firstMatch
+        XCTAssertTrue(machine.waitForExistence(timeout: 90), "配对后未出现真实机器行")
+        let online = NSPredicate(format: "label CONTAINS %@", "在线")
+        expectation(for: online, evaluatedWith: machine)
+        waitForExpectations(timeout: 60)
+        machine.tap()
+
+        let sessionList = app.collectionViews["sessions.list"]
+        XCTAssertTrue(sessionList.waitForExistence(timeout: 30))
+        let conversation = app.staticTexts[Self.conversationTitle]
+        XCTAssertTrue(conversation.waitForExistence(timeout: 60), "真实 catalog 未出现预建会话")
+        conversation.tap()
+
+        let input = app.textViews["session.prompt.input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 45), "production 会话详情未打开")
+        input.tap()
+        input.typeText(Self.promptSentinel)
+        let send = app.buttons["session.prompt.send"]
+        XCTAssertTrue(send.isEnabled)
+        send.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["synthetic Codex response"].waitForExistence(timeout: 60),
+            "synthetic adapter 输出未经过真实 daemon/Relay 到达 UI"
+        )
+        XCTAssertTrue(
+            app.staticTexts["synthetic codex approval"].waitForExistence(timeout: 60),
+            "真实 canonical approval 未到达 UI"
+        )
+        let events = app.collectionViews["session.events"]
+        events.swipeUp()
+        let approve = app.buttons["session.approval.approve"]
+        XCTAssertTrue(approve.waitForExistence(timeout: 30))
+        approve.tap()
+
+        let state = app.staticTexts["session.approval.state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 30))
+        let applied = NSPredicate(format: "label CONTAINS %@", "已应用批准")
+        expectation(for: applied, evaluatedWith: state)
+        waitForExpectations(timeout: 60)
+    }
+
+    private func launchPairingApp() throws -> XCUIApplication {
         let invite = try loadPrivateInvite()
         let app = XCUIApplication()
         app.launchArguments = ["--pair-invite", invite]
         app.launch()
+        return app
+    }
 
+    private func beginPairing(in app: XCUIApplication) throws {
         let inviteField = app.textFields["pairing.complete-invite"]
         XCTAssertTrue(
             inviteField.waitForExistence(timeout: 30),
             "production Companion 未进入真实 pairing 页面；禁止用 fixture 代替"
         )
-
         let confirmation = app.alerts["确认配对这台机器？"]
         XCTAssertTrue(
             confirmation.waitForExistence(timeout: 45),
             "真实 PairInvite 未完成本地检查或 Relay/production source 未 ready"
         )
         confirmation.buttons["核对无误，开始配对"].tap()
+    }
 
+    private func waitForPairingWaiting(in app: XCUIApplication) {
         let status = app.staticTexts["pairing.status"]
         XCTAssertTrue(status.waitForExistence(timeout: 10))
         let waiting = NSPredicate(format: "label CONTAINS %@", "等待被控机器本地确认")

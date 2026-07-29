@@ -133,12 +133,18 @@ final class ApprovalCardCell: UICollectionViewCell {
         vendorLabel.font = .preferredFont(forTextStyle: .caption1)
         vendorLabel.textColor = DesignTokens.text2
         stateLabel.font = .preferredFont(forTextStyle: .subheadline)
+        accessibilityIdentifier = "session.approval.card"
+        summaryLabel.accessibilityIdentifier = "session.approval.summary"
+        stateLabel.accessibilityIdentifier = "session.approval.state"
         approveButton.setTitle("批准", for: .normal)
+        approveButton.accessibilityIdentifier = "session.approval.approve"
         approveButton.addAction(
             UIAction { [weak self] _ in self?.onApprove?() }, for: .touchUpInside)
         denyButton.setTitle("拒绝", for: .normal)
+        denyButton.accessibilityIdentifier = "session.approval.deny"
         denyButton.addAction(UIAction { [weak self] _ in self?.onDeny?() }, for: .touchUpInside)
         retryButton.setTitle("重试同一决定", for: .normal)
+        retryButton.accessibilityIdentifier = "session.approval.retry"
         retryButton.addAction(UIAction { [weak self] _ in self?.onRetry?() }, for: .touchUpInside)
         let buttons = UIStackView(arrangedSubviews: [approveButton, denyButton])
         buttons.axis = .horizontal

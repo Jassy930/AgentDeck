@@ -3641,8 +3641,46 @@ absent。
 
 动态 invite 只允许由 UI-test target 的 build phase按受限路径读取；test runner 在自身 sandbox 建立 mode 0600
 副本并在读取后删除。runner 只传路径，不传 invite 明文；没有输入时 UI test 继续 fail-close，不得回退 fixture。
-默认无参数入口在 R4.3/R4.4 前必须 exit 1 并输出 `status=INCOMPLETE`；`--contract` 只证明六组件 topology 和
-零 mutation，二者都不能写成完整 P5.9 PASS。
+R4.2 提交时，默认无参数入口必须 exit 1 并输出 `status=INCOMPLETE`；`--contract` 只证明六组件 topology 和
+零 mutation，二者都不能写成完整 P5.9 PASS。R4.3 增加的可用入口与剩余项见下一节。
+
+## Relay Companion MVP rescue R4.3 production business-smoke
+
+R4.3 在同一个 `p57_real_dual_scope_ndjson_host` 上增加 test-only `r43-business` scenario，并由 runner 选择
+production UI test；没有新增 host/runtime platform、协议、schema 或存储版本。host 通过真实 Runtime UDS 预建
+Codex 会话并执行 same-UID local approval；production iOS 只补稳定 accessibility identifier，测试没有 fixture 或
+自批 pairing 能力。
+
+```bash
+bash -n scripts/run-relay-companion-simulator-e2e.sh \
+  scripts/tests/run-relay-companion-simulator-e2e.sh
+bash scripts/tests/run-relay-companion-simulator-e2e.sh
+bash scripts/run-relay-companion-simulator-e2e.sh --business-smoke
+cargo test -p agentdeckd --test relay_v2_machine_e2e -- --test-threads=1
+cargo clippy -p agentdeckd --test relay_v2_machine_e2e -- \
+  -D warnings \
+  -A clippy::too_many_arguments \
+  -A clippy::collapsible_if \
+  -A clippy::collapsible_str_replace
+RUSTC_WRAPPER= swift test -Xswiftc -warnings-as-errors
+cd ios && xcodegen generate && \
+  xcodebuild -project AgentDeckMobile.xcodeproj -scheme AgentDeckMobile \
+    -destination 'platform=iOS Simulator,name=iPhone 17' test
+```
+
+fresh business-smoke 最终 JSON 精确读回
+`runtimeCommandCount=1 / runtimeCompletedCommandCount=1 / runtimeApprovalTotal=1 /
+runtimeApprovalApplied=1 / relayPlaintextAbsent=true`，并证明 host PID/root、invite、UDS、Simulator 全部 absent。
+UI 实际完成 pair → local approve → machine list → conversation list/open → prompt → assistant/approval → applied；
+Relay DB/WAL/SHM 不含三个业务 sentinel 明文。cold build timeout 与瞬态 waiting-label 竞态的失败轮次均 fail-close
+并清理；R4.2 继续拥有 production UI waiting 标签断言，R4.3 由 host 拥有 `pending=1 / grant=0 / command=0`
+中间态断言，未放宽授权边界。
+
+回归读回：Rust `2 passed / 1 interactive host ignored`；scoped Clippy、Rust/Shell/Swift format 与 contract PASS；
+顶层 Swift `1161 XCTest / 4 entitlement skipped + 48 Swift Testing` 零失败；原 iOS scheme `133/133` 零失败。
+9-path code/test/runner content manifest SHA-256 为
+`5561551ea1a2678c8bc14cb950efa359c1728f86a6c4832e0f8f4f1de17f090d`。本证据只关闭 R4.3；默认完整入口
+继续 exit 1 + `INCOMPLETE`，R4.4 reconnect/revoke、R4.5–R4.9、P5.9 与 P5 automatic Phase Exit 仍未完成。
 
 ## Relay Companion MVP rescue R0 基线冻结证据
 

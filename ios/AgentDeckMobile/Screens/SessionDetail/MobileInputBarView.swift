@@ -16,7 +16,9 @@ final class MobileInputBarView: UIView, UITextViewDelegate {
         textView.backgroundColor = .clear
         textView.isScrollEnabled = false
         textView.delegate = self
+        textView.accessibilityIdentifier = "session.prompt.input"
         sendButton.setImage(UIImage(systemName: "arrow.up"), for: .normal)
+        sendButton.accessibilityIdentifier = "session.prompt.send"
         sendButton.addAction(UIAction { [weak self] _ in self?.send() }, for: .touchUpInside)
         textView.translatesAutoresizingMaskIntoConstraints = false
         sendButton.translatesAutoresizingMaskIntoConstraints = false
