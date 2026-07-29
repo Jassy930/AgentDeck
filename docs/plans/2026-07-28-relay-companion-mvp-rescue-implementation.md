@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；R0–R4 complete，R5.1 complete、R5.2 pending |
+| 状态 | In execution；R4 failure-path 已重开并完成 replacement R4.7，R4.8 pending；R5 暂停 |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -214,6 +214,9 @@ gitStatus:
 
 ### R4.8/R4.9 重复性与 review 收口（2026-07-29）
 
+> 历史证据，已失效：后续 R5.2 首轮完整 `p5` 暴露 failure cleanup 遗留本轮 `agentdeckd --exec-gate`
+> 后代。下列重复性与 review 结论只属于旧 candidate `3fb83e8`，不得继续作为当前 R4/R5 完成证据。
+
 - committed candidate 为 `3fb83e83a34abd659e32b817cf1cabccf999ca79`，tree 为
   `d136544a47f64ffabe0e60a464cc7f8cd18f5f33`，相对本地 `master` 为 `0 behind / 285 ahead`。三次 fresh
   lifecycle E2E 全程保持同一 HEAD/tree，均在 daemon generation 2 完成 command `1/1`、approval `1/1`、
@@ -233,6 +236,26 @@ gitStatus:
   移出 worktree；`.build`/`target` 缓存未删除。最终无本 worktree Relay/daemon 残留、无 booted Simulator，
   candidate HEAD/tree 未漂移且 `git status --short --branch` clean。R4、P5.9 与 P5 automatic Phase Exit complete；
   最终 MVP candidate 仍必须继续通过 R5.2–R5.6，不能用本节提前宣布整体收口。
+
+### R4.9 failure-path 重开与 replacement R4.7（2026-07-29）
+
+- R5.2 在 closeout candidate `5966c9867848e4ea176d61eeeb296e0c2fb280c3` 上首轮完成 Rust 全量、Swift
+  全量、iOS `134/134` 与 `p4-auto`；完整 `p5` 已通过配对、本机批准和 business-ready，但 UI 在 60 秒内未
+  观察到 `synthetic Codex response`，`xcodebuild` exit 65。失败 trap 返回后仍存在本轮
+  `agentdeckd --exec-gate` PID `54930`、PPID `1`，经精确命令/启动时间核对后 TERM→KILL 并读回 absent。
+- 该残留证明旧 runner 未在父进程退出、TERM-resistant 后代 reparent 到 PID 1 时完成失败闭环，因此
+  `3fb83e8` 的 R4.9/P5 Phase Exit 与 `5966c98` 的 R5.1 candidate 全部失效；R5.2 的其余首轮 PASS 只保留为
+  诊断证据，不可拼接到 replacement candidate。
+- replacement implementation commit 为 `5bd57ba33d03abbf7a4fcb7fa2e427a30d329bc2`，tree 为
+  `37b7bbe240e601dcc7654349b97318c9e0bd28d5`，相对本地 `master` 为 `0 behind / 287 ahead`。runner 在停止
+  cargo 或 host 前递归冻结本轮 PID + `ps lstart` 身份树，TERM 后只 KILL 身份仍精确匹配的已捕获后代，并
+  等待其 absent/zombie；不按进程名全局扫描或杀进程。
+- contract 真实创建父进程与忽略 TERM 的子进程，分别覆盖 cargo-root 与 host-root 两条 reparent 清理路径；
+  `bash -n`、动态 contract、`git diff --check` 均 exit 0，测试后无 probe/Relay/daemon/exec-gate 残留。两路径
+  content manifest SHA-256 为 `fd5a6c5e93c1391f4536d5fd9b4746e859c1ad7ca660dbbcb58f60026de9bd61`。
+- 首版修复 WIP 的 fresh lifecycle 与完整 `p5` 已 PASS，但随后补齐 host-root fallback，因此这些运行结果不计作
+  replacement candidate 的 R4.8 计数。本次 docs-only scoped commit 生成新的 R4.7 committed candidate；其后
+  必须从零连续执行三次 fresh lifecycle、完整 `p5`、`p4-auto` 与双路 review，期间任何仓库修改都使证据失效。
 
 ### Automatic gates
 
@@ -517,9 +540,10 @@ git diff --check
 - [x] R4.4：client/daemon relaunch、cursor/backfill reconnect 与 revoke terminal。
 - [x] R4.5：外部 runner 严格只读 BLOCKED preflight，固定以 exit 78 表示预期未解锁。
 - [x] R4.6：扩展 verifier `p5`；automatic 缺失/失败必须非零，外部 BLOCKED 不计入 PASS。
-- [x] R4.7：同步文档并提交 R4 implementation candidate。
-- [x] R4.8：同一 committed candidate 连续三次 fresh E2E。
-- [x] R4.9：同一 candidate 双路 review、cleanup 与 clean status；若修改代码，从 R4.7 重来。
+- [x] R4.7：failure cleanup 修复后重新同步文档并提交 replacement implementation candidate。
+- [ ] R4.8：在 replacement committed candidate 上从零连续执行三次 fresh E2E。
+- [ ] R4.9：同一 replacement candidate 执行完整 `p5`/`p4-auto`、双路 review、cleanup 与 clean status；若修改
+  代码，从 R4.7 重来。
 
 ### R4.1 RED readback（2026-07-28）
 
@@ -650,7 +674,7 @@ test "$macos_rc" -eq 78
 
 ### Tasks
 
-- [x] R5.1：基于 R4 证据更新状态/文档，清理生成物并提交 closeout candidate。
+- [ ] R5.1：replacement R4.9 完成后，重新更新状态/文档、清理生成物并提交 closeout candidate。
 - [ ] R5.2：冻结最终 commit/tree/path hashes，运行完整 Rust/Swift/iOS/P4/P5 门禁。
 - [ ] R5.3：在同一最终 candidate 上执行 phase `spec/security`、`quality` review，清零 P0/P1/P2。
 - [ ] R5.4：逐项读取 post-MVP BLOCKED，确认 exit 78、零 mutation 和 versioned summary。
@@ -658,6 +682,9 @@ test "$macos_rc" -eq 78
 - [ ] R5.6：仓库保持只读和 clean，向用户报告；由用户决定是否 push/PR/合入。
 
 ### R5.1 closeout candidate（2026-07-29）
+
+> 已失效：本节生成的 `5966c98` candidate 在 R5.2 首轮 `p5` 暴露 failure-path orphan；当前必须先完成
+> replacement R4.8/R4.9，再重新执行 R5.1。
 
 - 本 Task 只更新本计划与 `docs/QUALITY.md`，把 R4.8/R4.9 的同 candidate 重复性、双路 review 和 cleanup
   证据写回 SSOT；不修改 production、test、runner、协议、schema 或版本。
@@ -726,7 +753,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
-| R4 Simulator E2E | complete | candidate `3fb83e8` / tree `d136544a`；R4.1–R4.6 hashes `0662ac6e` / `f18609bb` / `5561551e` / `383fa35e` / `50f725a2` / `9c4b7f1a` | 同 candidate 三次 fresh lifecycle、完整 `p5`、`p4-auto`、iOS 134/134、Swift 1169/4 skip + 48、Rust daemon 1711/3 ignored 与 workspace 全量零失败 | 三轮 generation 2 完成 prompt/approval/restart/history recovery/revoke，Relay plaintext absent、cleanup absent；两个实机槽位精确 BLOCKED/exit 78/零 mutation | spec/security 与 quality/Git Approved；P0/P1/P2=0 | R4.6 implementation + R4.7 candidate 分步提交；R4.9 clean；未 push |
-| R5 MVP 收口 | in progress | R5.1 docs-only closeout candidate | R4 证据已写回；R5.2 全量门禁待执行 | ignored 生成工程已清理；无本 worktree Relay/daemon 或 booted Simulator | R5 phase review 待 R5.3 | R5.1 精确提交后冻结 |
+| R4 Simulator E2E | in progress（reopened） | replacement implementation `5bd57ba` / tree `37b7bbe`；2-path hash `fd5a6c5e` | final syntax/双根 orphan contract/diff PASS；旧 candidate 的三次 lifecycle 与全量门禁已失效 | 首版修复 lifecycle/`p5` PASS；final host-root fallback 尚须在新 candidate 上从零重跑三次 | 旧双路 review 已失效；replacement review 待 R4.9 | implementation 已 exact commit；本次 docs-only commit 生成 replacement R4.7；未 push |
+| R5 MVP 收口 | paused | `5966c98` 已失效 | R5.2 首轮 Rust/Swift/iOS/P4 PASS 只作诊断；`p5` 暴露 orphan | PID 54930 已精确清理；当前无已知 Relay/daemon/booted Simulator | 必须等待 replacement R4.9 | 回到 R4.8；R5.1–R5.6 全部重跑 |
 
 状态只能按实际证据更新。focused PASS 不得把 Phase 标为 complete；外部 BLOCKED 不得改写为 PASS。
