@@ -3983,6 +3983,60 @@ commit/tree 与 clean status；R4.8 三次 fresh lifecycle、完整 `p5`/`p4-aut
 全部从该 candidate 重新计数。物理 iPhone、第二台 Mac、公网 WSS、真实 vendor 与 production signing 继续
 保持 post-MVP `BLOCKED`。
 
+## Relay Companion MVP rescue R4.8 transition COMMIT/readback 与 restart readiness 重开
+
+revision rollover 的 docs-only committed candidate 为
+`f7d2e681e247cd8098ad8941a7762c379abe5601`，tree 为
+`7b33ec2cf9c28d606868ff1f715cbaf32ab847dd`。后续完整 `p5` 先后暴露 transition COMMIT/readback TOCTOU 与
+restart readiness 假阳性，因此 `f7d2e68` 失效；旧三次 lifecycle、aggregate、全量和 review 证据，以及本轮任何
+局部 PASS 均不得拼接到新 candidate。
+
+第一处失败时 transition 已进入 `Add:BarriersCommitted`。endpoint 在 Store
+`mark_key_barriers_committed_exact()` 返回后、coordinator reload 前合法提交 KeyUpdate ACK，旧实现却将
+`BarriersFrozen` 内存快照与新 readback 做完整 equality，误报
+`daemon.remote.transition.readback_mismatch`；同一窗口也可能新增已认证 stream-applied ACK。修复继续精确验证
+operation/target/revision/recipient、cuts、canonical update bytes、snapshot flushes 和其他稳定轴，只接受 Store
+已认证的 `Frozen → Acked` 与 stream-applied ACK 集合单调增长。readback 仍经过
+`validate_existing_updates` / `validate_frozen_barrier_set`，不可变 bytes 或稳定轴漂移继续 fail-close。
+
+第二处失败时 restart 后 durable transition 已归零，但 production client 尚未完成订阅重连，host 就发布 marker；
+最后 evidence 为 writers `1`、live subscriptions `0`、jobs `0`，UI 因而合理收不到 marker。restart
+`BusinessReady` 现同时要求 writers `2`、live subscriptions `2`、barriers `0`、snapshot senders `0`、jobs `2`，
+超时记录会携带完整最后 evidence。
+
+replacement implementation commit 为 `dc24c542806fff427b306edb9eaa667c6f4625ac`，tree 为
+`40365af59d250f9e2aa385f8205b07fd26dbc33f`，相对本地 `master` 为 `0 behind / 291 ahead`。本切片冻结以下
+3-path code/test manifest；tracked docs 不进入 hash：
+
+```bash
+transition_readback_manifest=(
+  agentdeckd/src/remote/transition.rs
+  agentdeckd/src/remote/transition_tests.rs
+  agentdeckd/tests/relay_v2_machine_e2e.rs
+)
+test "${#transition_readback_manifest[@]}" -eq 3
+for manifest_item in "${transition_readback_manifest[@]}"; do
+  test -f "$manifest_item" || exit 1
+  printf 'blob %s %s\n' "$(git hash-object "$manifest_item")" "$manifest_item"
+done | LC_ALL=C sort | shasum -a 256
+```
+
+SHA-256 固定为 `8031eef7ce3825addc8f86ef96edea3b2151c8353a61bdb5fb492d7b05b2f974`。fresh 门禁结果：
+
+- COMMIT/readback focused regressions `3/3`，最终 transition suite `33/33`；
+- `relay_v2_machine_e2e` 为 `2 passed / 1 interactive ignored / 0 failed`；
+- daemon lib 为 `1716 passed / 3 ignored / 0 failed`，ignored 仍只对应显式手动/外部门禁；
+- daemon integration test compile、lib/E2E 两组 warnings-as-errors Clippy、`cargo fmt --all -- --check`、daemon
+  network boundary/no-net 与 `git diff --check` 全部 exit 0；
+- 修复 WIP 的完整 `p5` PASS：SessionSource `25/25`，RelayClient
+  `457 executed / 4 external entitlement skipped / 0 failed`。该结果是 implementation gate，不计作新 committed
+  candidate 的 R4.8/R4.9 证据。
+
+本节与 rescue implementation 计划用 docs-only scoped commit 第三次生成 replacement R4.7 committed candidate。
+提交后必须从零连续执行三次 fresh lifecycle、完整 `p5`/`p4-auto`、双路 review 与 cleanup；任何代码或文档修改
+都会使计数失效并回到 R4.7。物理 iPhone、第二台 Mac、公网 WSS、真实 vendor 与 production signing 继续保持
+versioned post-MVP `BLOCKED`，不计 PASS。
+
 ## Relay Companion MVP rescue R0 基线冻结证据
 
 R0 只冻结事实、执行入口和既有 automatic baseline，不修改生产代码，也不提前执行 master merge、协议治理或
@@ -4311,7 +4365,7 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P5.6 iOS production composition / pairing lifecycle | 2026-07-28 automatic Task complete；11 iOS code/test content manifest `8cf47be71709bcd4648341eaa5cd7b693a00f6e871dfb586fbda76ee8662a2fb` + 10 docs = exact 21 paths。Pairing/AppLifecycle focused `42/42`、pre-stream ABA 10 轮、Relay shutdown `56/56`、RelayClient `445/4 entitlement SKIP`、顶层 Swift `985/4 skipped + 35`、fresh iOS `133/133`、Release build/fixture scan、strict format/docs/diff 均通过。只证明 Release Relay composition、完整邀请扫码/粘贴与确认、exact pairing/capture generation/replacement、verified revoke/offline forget 和前后台 source generation；P5.6 收口时 P5 为 6/9，P5.7–P5.9 与 P5 Phase Exit 当时未完成；后续 P5.7 已独立完成。真实公网、物理 iPhone、production-signed Keychain、第二 Mac、真实 vendor 与 destructive purge 继续 post-MVP `BLOCKED` |
 | Relay Companion MVP P5.7 macOS SessionSource registry | 2026-07-28 automatic Task complete；`40 prerequisite + 23 registry + 7 docs = 70 paths`，content hash 分别为 `85a46da6d79e56f6da1efd2e67b8851b1b264d7e796ded50334a7769b0af680f` 与 `df38994a015d0bd7014618a75afb6988b9dfec926a19f92cc5e4c8843788bcf6`。完成唯一 local UDS source、per-machine remote registry、typed local capability、真实 dual-scope host、Genesis/business-ready、typed snapshot recovery、observation reentrancy、`SessionModel` operation join 与 Preview/AppRuntime exact-pump barrier；Swift `1061/4 skipped + 35`、Rust daemon lib `1683/3 ignored`、main `7/7`、慢组与双路终审均通过。P5.7 收口时 P5 为 7/9；后续 rescue P5.8-lite 已完成，当前只剩 P5.9 与 P5 Phase Exit。真实公网、物理设备、production-signed Keychain、第二 Mac、真实 vendor 与 destructive purge 继续 post-MVP `BLOCKED` |
 | Relay Companion MVP rescue R3 P5.8-lite 本机 pending-device 控制面 | 2026-07-28 automatic Task complete；冻结 5-path code/test manifest SHA-256 `9c3bd63c9e56ef244d0d72da3192cfe3ade31b80c7a41675ee804355b56720ba`。只增加 production local composition 的“本机配对请求…”入口和注入 `LocalPairingAdministration` 的 AppKit 面板；Preview/fixture 与 remote scope 无入口。focused `46/46`、顶层 warnings-as-errors `1161 XCTest / 4 skipped + 48 Swift Testing`、ownership、strict format、docs、diff 与双路终审均通过，P0/P1/P2=0；真实 bundle 读回菜单、完整 DeviceSign fingerprint 与 typed transport failure。stable canonical daemon 缺失保持环境 `BLOCKED`，不计 PASS；machine picker、remote pairing/receipt UI、协议变更、真实公网/设备/vendor/production signing 继续 post-MVP `BLOCKED`。R3 收口后 P5 为 8/9，只剩 P5.9 与 automatic Phase Exit |
-| Relay Companion MVP rescue R4 fixed-topology Simulator E2E / P5 Phase Exit | 2026-07-29 revision-rollover reopened。旧 `3fb83e8`/`5966c98` 先因 exec-gate orphan 失效，failure-cleanup candidate `0f601ae` 的首轮又暴露 revision rollover subscription teardown。第二次 replacement implementation `769a599` / tree `2f28577`、8-path hash `606bfb9` 已通过 focused `2/2`、RemoteLink `33/33`、machine E2E `2/1 ignored`、daemon lib `1713/3 ignored`、Clippy/compile/format/network/docs/diff；新 docs-only candidate 上仍须从零重跑三次 lifecycle、完整 `p5`/`p4-auto` 与双路 review。外部槽位继续 post-MVP BLOCKED，不计 PASS |
+| Relay Companion MVP rescue R4 fixed-topology Simulator E2E / P5 Phase Exit | 2026-07-29 transition/readiness reopened。旧 `3fb83e8`/`5966c98` 先因 exec-gate orphan 失效，`0f601ae` 又暴露 revision rollover subscription teardown；其 replacement candidate `f7d2e68` 的完整 `p5` 再暴露 transition COMMIT/readback TOCTOU 与 restart readiness 假阳性。第三次 replacement implementation `dc24c54` / tree `40365af`、3-path hash `8031eef` 已通过 focused `3/3`、transition `33/33`、machine E2E `2/1 ignored`、daemon lib `1716/3 ignored`、完整 `p5`、Clippy/compile/format/network/diff；新 docs-only candidate 上仍须从零重跑三次 lifecycle、完整 `p5`/`p4-auto` 与双路 review。外部槽位继续 post-MVP BLOCKED，不计 PASS |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 
 ## Codex vendor schema 快照
