@@ -373,6 +373,123 @@ final class MachineConnectionTests: XCTestCase {
     await connection.shutdown()
   }
 
+  func testCatalogSubscriptionRetriesExactFrameAfterFirstSilentAuthorizationDrop()
+    async throws
+  {
+    let fixture = try makeSupervisorAuthenticationFixture()
+    let generation = RelayTransportGeneration(rawValue: 305)
+    let transport = try SupervisorTransport(
+      generation: generation,
+      frames: try supervisorHandshakeFrames(
+        fixture: fixture,
+        generation: generation
+      )
+    )
+    let ingress = EndpointSupervisorIngress()
+    let connection = MachineConnection(
+      machineID: "machine-subscription-retry",
+      transportBuilder: { transport },
+      authenticator: fixture.authenticator,
+      verifiedIngress: ingress,
+      transferBudgetCoordinator: TransferAssemblyBudgetCoordinator(),
+      reconnectSleeper: ImmediateMachineConnectionSleeper(),
+      clock: FixedMachineConnectionClock(now: 1_000),
+      jitterSource: FixedMachineConnectionJitter(value: 0.5),
+      subscriptionRetryDelaysMilliseconds: [1, 1, 1]
+    )
+    let updates = await connection.updates()
+    var iterator = updates.makeAsyncIterator()
+    await connection.start()
+    await assertNextConnectionState(.connecting, iterator: &iterator)
+    await assertNextConnectionState(.connected, iterator: &iterator)
+
+    try await connection.beginSubscription(
+      target: .catalog,
+      after: .beforeFirst,
+      requestID: RuntimeMessageID(rawValue: "catalog-silent-first-drop")
+    )
+    let firstWasSent = await eventuallyMachineConnectionTest {
+      await transport.sentFrames.count == 2
+    }
+    XCTAssertTrue(firstWasSent, "Authenticated 后必须先发送首个 Runtime Catalog Subscribe")
+    var exactRetryWasSent = false
+    for _ in 0..<100 {
+      if await transport.sentFrames.count >= 3 {
+        exactRetryWasSent = true
+        break
+      }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    XCTAssertTrue(
+      exactRetryWasSent,
+      "首个 Subscribe 被静默丢弃后必须在同 generation 内发送有界 exact retry"
+    )
+    let sentBeforeResolution = await transport.sentFrames
+    if sentBeforeResolution.count >= 3 {
+      XCTAssertEqual(
+        try RelayWireCodecV2.encodeFixture(sentBeforeResolution[1]),
+        try RelayWireCodecV2.encodeFixture(sentBeforeResolution[2]),
+        "retry 必须复用 exact request route/counter/sealed frame，不能重复普通 command"
+      )
+    }
+
+    await ingress.completePreparedSubscription()
+    for _ in 0..<100 { await Task.yield() }
+    let prepareCount = await ingress.preparedSubscriptionCount
+    XCTAssertEqual(prepareCount, 1, "retry 不得重新 mint request route 或 sender counter")
+    await connection.shutdown()
+  }
+
+  func testSubscriptionRetryExhaustionCancelsOwnerAndRollsExactGeneration() async throws {
+    let fixture = try makeSupervisorAuthenticationFixture()
+    let generation = RelayTransportGeneration(rawValue: 306)
+    let transport = try SupervisorTransport(
+      generation: generation,
+      frames: try supervisorHandshakeFrames(
+        fixture: fixture,
+        generation: generation
+      )
+    )
+    let ingress = EndpointSupervisorIngress()
+    let connection = MachineConnection(
+      machineID: "machine-subscription-exhausted",
+      transportBuilder: { transport },
+      authenticator: fixture.authenticator,
+      verifiedIngress: ingress,
+      transferBudgetCoordinator: TransferAssemblyBudgetCoordinator(),
+      reconnectSleeper: RecordingLongMachineConnectionSleeper(),
+      clock: FixedMachineConnectionClock(now: 1_000),
+      jitterSource: FixedMachineConnectionJitter(value: 0.5),
+      subscriptionRetryDelaysMilliseconds: [1, 1]
+    )
+    let updates = await connection.updates()
+    var iterator = updates.makeAsyncIterator()
+    await connection.start()
+    await assertNextConnectionState(.connecting, iterator: &iterator)
+    await assertNextConnectionState(.connected, iterator: &iterator)
+
+    try await connection.beginSubscription(
+      target: .catalog,
+      after: .beforeFirst,
+      requestID: RuntimeMessageID(rawValue: "catalog-retry-exhausted")
+    )
+    let rolled = await eventuallyMachineConnectionTest {
+      let closed = await transport.closedGenerations
+      let canceled = await ingress.cancelCount
+      return closed == [generation] && canceled == 1
+    }
+    XCTAssertTrue(rolled, "有界 retry 耗尽后必须 cancel prepared owner 并轮换 exact generation")
+    let sent = await transport.sentFrames
+    XCTAssertEqual(sent.count, 3, "Authenticate + initial Subscribe + one exact retry 后必须停止")
+    XCTAssertEqual(
+      try RelayWireCodecV2.encodeFixture(sent[1]),
+      try RelayWireCodecV2.encodeFixture(sent[2])
+    )
+    let prepareCount = await ingress.preparedSubscriptionCount
+    XCTAssertEqual(prepareCount, 1)
+    await connection.shutdown()
+  }
+
   func testEndSubscriptionWaitsForRuntimeReceiptThenSendsExactOuterUnsubscribe() async throws {
     let fixture = try makeSupervisorAuthenticationFixture()
     let generation = RelayTransportGeneration(rawValue: 304)
@@ -1975,9 +2092,11 @@ private actor EndpointSupervisorIngress: MachineConnectionVerifiedIngress {
 
   private var activeScope: TransferAssemblyScope?
   private var pendingDirected: [MachinePreparedOutboundRequestToken: PendingDirected] = [:]
+  private var pendingSubscriptions: Set<MachinePreparedOutboundRequestToken> = []
   private var outcomes: [MachineConnectionVerifiedIngressOutcome]
   private let retirement: MachineSubscriptionRetirement
   private(set) var cancelCount = 0
+  private(set) var preparedSubscriptionCount = 0
   private(set) var preparedContracts: [MachineDirectedReplyContract] = []
   private var retiredTargets: [RuntimeSubscriptionTargetV1] = []
 
@@ -2049,10 +2168,27 @@ private actor EndpointSupervisorIngress: MachineConnectionVerifiedIngress {
     guard activeScope == scope else {
       throw MachineConnectionSupervisorFailure.securityError
     }
+    let token = MachinePreparedOutboundRequestToken()
+    pendingSubscriptions.insert(token)
+    preparedSubscriptionCount += 1
     return MachinePreparedOutboundRequest(
-      token: MachinePreparedOutboundRequestToken(),
+      token: token,
       frame: .control(.ping(nonce: 202))
     )
+  }
+
+  func preparedSubscriptionIsPending(
+    _ token: MachinePreparedOutboundRequestToken,
+    scope: TransferAssemblyScope
+  ) async throws -> Bool {
+    guard activeScope == scope else {
+      throw MachineConnectionSupervisorFailure.securityError
+    }
+    return pendingSubscriptions.contains(token)
+  }
+
+  func completePreparedSubscription() {
+    pendingSubscriptions.removeAll(keepingCapacity: false)
   }
 
   func cancelPrepared(
@@ -2061,6 +2197,7 @@ private actor EndpointSupervisorIngress: MachineConnectionVerifiedIngress {
   ) async {
     guard activeScope == scope else { return }
     cancelCount += 1
+    pendingSubscriptions.remove(token)
     let pending = pendingDirected.removeValue(forKey: token)
     pending?.waiter?.resume(throwing: CancellationError())
   }
@@ -2115,6 +2252,7 @@ private actor EndpointSupervisorIngress: MachineConnectionVerifiedIngress {
   func generationEnded(scope: TransferAssemblyScope) async {
     guard activeScope == scope else { return }
     activeScope = nil
+    pendingSubscriptions.removeAll(keepingCapacity: false)
     let waiters = pendingDirected.values.compactMap(\.waiter)
     pendingDirected.removeAll(keepingCapacity: false)
     for waiter in waiters {

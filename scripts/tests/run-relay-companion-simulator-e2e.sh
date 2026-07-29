@@ -52,6 +52,12 @@ grep -Fq -- '--lifecycle-smoke) run_mode="lifecycle-smoke"' "$runner" \
   || fail "focused lifecycle-smoke entry is missing"
 grep -Fq 'testFullLifecycleReconnectAndRevoke' "$ui_test" \
   || fail "full production lifecycle UI test is missing"
+grep -Fq 'private static let businessReadyUIWait: TimeInterval = 120' "$ui_test" \
+  || fail "UI wait must outlive the 90-second host businessReady authority"
+[[ "$(grep -Fc 'Self.businessReadyUIWait' "$ui_test")" == "3" ]] \
+  || fail "machine-online, catalog and prompt-readiness waits must share the bounded businessReady UI wait"
+grep -Fq 'let promptReady = NSPredicate(format: "enabled == true")' "$ui_test" \
+  || fail "production prompt must remain disabled until the conversation snapshot is committed"
 read_host_json_body="$(sed -n '/^read_host_json()/,/^}/p' "$runner")"
 printf '%s\n' "$read_host_json_body" | grep -Fq 'fail_if_xcode_exited || return 1' \
   || fail "host waits must surface an exited xcodebuild before their own timeout"

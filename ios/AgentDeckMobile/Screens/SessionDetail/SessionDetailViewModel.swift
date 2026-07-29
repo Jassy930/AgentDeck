@@ -93,7 +93,14 @@ final class SessionDetailViewModel {
   private(set) var connectionState: SessionConnectionState = .connecting
   var onUpdate: (() -> Void)?
 
+  /// transport connected 只证明 machine generation 在线；首个 conversation snapshot
+  /// 尚未提交时，configuration revision 与 canonical cursor 仍不可用于业务命令。
+  var canSubmitPrompt: Bool {
+    !isTerminal && connectionState == .connected && hasCommittedConversationProjection
+  }
+
   private var conversationState: RuntimeConversationState
+  private var hasCommittedConversationProjection = false
   private var pendingPrompt: PendingPrompt?
   private var retryablePrompt: PendingPrompt?
   private var approvalContext: ApprovalContext?
@@ -359,6 +366,7 @@ final class SessionDetailViewModel {
           wasRecoveringFromLag = false
         }
         try conversationState.apply(snapshot)
+        hasCommittedConversationProjection = true
         prepareApprovalProjectionForSnapshot()
         synchronizeConversationProjection()
         if wasRecoveringFromLag, !isTerminal {

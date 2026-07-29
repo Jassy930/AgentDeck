@@ -7,6 +7,13 @@ enum MachineKeySyncPolicy {
   static let deadlineMilliseconds = DeviceKeySyncEpisodeV1.deadlineMilliseconds
 }
 
+enum MachineSubscriptionRetryPolicy {
+  /// 首次 send 之外最多 6 次 exact retry；总确认窗口为 12.7 秒。只重发同一
+  /// prepared frame，不重新签名、不重新分配 request route/counter。
+  static let delaysMilliseconds: [UInt64] = [100, 200, 400, 800, 1_600, 3_200, 6_400]
+  static let maximumDelayCount = 7
+}
+
 struct MachineKeySyncEpisodeStatus: Equatable, Sendable {
   let observedRevision: UInt64
   let attempt: UInt8
@@ -168,6 +175,13 @@ protocol MachineConnectionVerifiedIngress: Sendable {
     scope: TransferAssemblyScope
   ) async throws -> MachinePreparedOutboundRequest
 
+  /// `true` 只表示 exact prepared subscription 仍未被 StreamBinding、typed failure
+  /// 或 generation teardown 消费。只读查询不得等待 Source reducer commit。
+  func preparedSubscriptionIsPending(
+    _ token: MachinePreparedOutboundRequestToken,
+    scope: TransferAssemblyScope
+  ) async throws -> Bool
+
   func cancelPrepared(
     _ token: MachinePreparedOutboundRequestToken,
     scope: TransferAssemblyScope
@@ -225,6 +239,13 @@ extension MachineConnectionVerifiedIngress {
     scope _: TransferAssemblyScope
   ) async throws -> MachinePreparedOutboundRequest {
     throw MachineConnectionSupervisorFailure.securityError
+  }
+
+  func preparedSubscriptionIsPending(
+    _: MachinePreparedOutboundRequestToken,
+    scope _: TransferAssemblyScope
+  ) async throws -> Bool {
+    false
   }
 
   func cancelPrepared(
@@ -396,6 +417,7 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
   private let clock: any MachineConnectionClock
   private let jitterSource: any MachineConnectionJitterSource
   private let handshakeDeadlineMilliseconds: UInt64
+  private let subscriptionRetryDelaysMilliseconds: [UInt64]
   private var stateMachine: MachineConnectionStateMachine
   private var started = false
   private var stopping = false
@@ -408,6 +430,9 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
   private var keySyncDeadlineScope: TransferAssemblyScope?
   private var keySyncDeadlineToken: UUID?
   private var keySyncDeadlineForcedCloseScope: TransferAssemblyScope?
+  private var subscriptionRetryTasks:
+    [MachinePreparedOutboundRequestToken: (scope: TransferAssemblyScope, task: Task<Void, Never>)] =
+      [:]
 
   private init(
     material: PairedMachineConnectionMaterial,
@@ -456,6 +481,7 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
     clock = WallMachineConnectionClock()
     jitterSource = SystemMachineConnectionJitterSource()
     handshakeDeadlineMilliseconds = Self.handshakeTimeoutMilliseconds
+    subscriptionRetryDelaysMilliseconds = MachineSubscriptionRetryPolicy.delaysMilliseconds
     stateMachine = MachineConnectionStateMachine(
       maximumKeySyncAttempts: maximumKeySyncAttempts
     )
@@ -491,10 +517,18 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
       SystemMachineConnectionJitterSource(),
     handshakeDeadlineMilliseconds: UInt64 =
       MachineConnection.handshakeTimeoutMilliseconds,
+    subscriptionRetryDelaysMilliseconds: [UInt64] =
+      MachineSubscriptionRetryPolicy.delaysMilliseconds,
     maximumKeySyncAttempts: UInt8 = 3
   ) {
     precondition(!machineID.isEmpty)
     precondition(handshakeDeadlineMilliseconds > 0)
+    precondition(
+      !subscriptionRetryDelaysMilliseconds.isEmpty
+        && subscriptionRetryDelaysMilliseconds.count
+          <= MachineSubscriptionRetryPolicy.maximumDelayCount
+        && subscriptionRetryDelaysMilliseconds.allSatisfy { $0 > 0 }
+    )
     machineIDValue = machineID
     self.grantSerial = grantSerial
     self.transportBuilder = transportBuilder
@@ -506,6 +540,7 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
     self.clock = clock
     self.jitterSource = jitterSource
     self.handshakeDeadlineMilliseconds = handshakeDeadlineMilliseconds
+    self.subscriptionRetryDelaysMilliseconds = subscriptionRetryDelaysMilliseconds
     stateMachine = MachineConnectionStateMachine(
       maximumKeySyncAttempts: maximumKeySyncAttempts
     )
@@ -611,6 +646,59 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
     } catch {
       await verifiedIngress.cancelPrepared(prepared.token, scope: capture.scope)
       throw Self.endpointError(error)
+    }
+    let retryTask = Task { [weak self] in
+      guard let self else { return }
+      await self.drivePreparedSubscriptionRetry(
+        prepared,
+        capture: capture
+      )
+    }
+    subscriptionRetryTasks[prepared.token] = (capture.scope, retryTask)
+  }
+
+  private func drivePreparedSubscriptionRetry(
+    _ prepared: MachinePreparedOutboundRequest,
+    capture: ActiveEndpointCapture
+  ) async {
+    defer { subscriptionRetryTasks.removeValue(forKey: prepared.token) }
+    for (index, delay) in subscriptionRetryDelaysMilliseconds.enumerated() {
+      do {
+        try await Task.sleep(for: .milliseconds(Int64(clamping: delay)))
+      } catch {
+        return
+      }
+      guard !Task.isCancelled, endpointCaptureIsCurrent(capture) else { return }
+      let pending: Bool
+      do {
+        pending = try await verifiedIngress.preparedSubscriptionIsPending(
+          prepared.token,
+          scope: capture.scope
+        )
+      } catch {
+        return
+      }
+      guard pending else { return }
+      guard index + 1 < subscriptionRetryDelaysMilliseconds.count else {
+        await verifiedIngress.cancelPrepared(prepared.token, scope: capture.scope)
+        await teardownActiveGeneration(
+          expectedScope: capture.scope,
+          excludingSubscriptionRetryToken: prepared.token
+        )
+        return
+      }
+      do {
+        // daemon 在 PairResponseReceived promotion 前可能静默拒绝首帧；这里只重发
+        // exact prepared bytes，不能重新 mint route/counter 或重复普通 command。
+        try await capture.transport.send(prepared.frame, on: capture.generation)
+      } catch {
+        await verifiedIngress.cancelPrepared(prepared.token, scope: capture.scope)
+        await teardownActiveGeneration(
+          expectedScope: capture.scope,
+          excludingSubscriptionRetryToken: prepared.token
+        )
+        return
+      }
     }
   }
 
@@ -1428,7 +1516,8 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
   }
 
   private func teardownActiveGeneration(
-    expectedScope: TransferAssemblyScope? = nil
+    expectedScope: TransferAssemblyScope? = nil,
+    excludingSubscriptionRetryToken: MachinePreparedOutboundRequestToken? = nil
   ) async {
     guard let transport = activeTransport,
       let generation = activeGeneration,
@@ -1447,6 +1536,22 @@ actor MachineConnection: MachineConnectionUpdateSource, MachineRuntimeRequestEnd
     activeScope = nil
     businessReadyScope = nil
     await publishConnectionScope(nil)
+
+    let subscriptionTasks = subscriptionRetryTasks.compactMap { token, value in
+      value.scope == scope && token != excludingSubscriptionRetryToken
+        ? (token, value.task)
+        : nil
+    }
+    if let excludingSubscriptionRetryToken {
+      subscriptionRetryTasks.removeValue(forKey: excludingSubscriptionRetryToken)
+    }
+    for (token, task) in subscriptionTasks {
+      subscriptionRetryTasks.removeValue(forKey: token)
+      task.cancel()
+    }
+    for (_, task) in subscriptionTasks {
+      await task.value
+    }
 
     if !deadlineAlreadyForcedClose {
       do {

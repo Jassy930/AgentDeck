@@ -171,7 +171,7 @@ final class SessionDetailViewController: UIViewController {
         inputBar.configure(
             draft: viewModel.draftText,
             state: viewModel.promptState,
-            isEnabled: !viewModel.isTerminal
+            isEnabled: viewModel.canSubmitPrompt
         )
         if let last = ids.last, let indexPath = dataSource.indexPath(for: last) {
             collectionView.scrollToItem(at: indexPath, at: .bottom, animated: false)

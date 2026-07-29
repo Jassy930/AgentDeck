@@ -8,6 +8,33 @@ import XCTest
 final class SessionDetailViewModelTests: XCTestCase {
   private let conversationID = "conversation-1"
 
+  func testPromptSubmissionReadinessWaitsForConnectedInitialSnapshot() async throws {
+    let source = SessionSourceSpy()
+    let vm = SessionDetailViewModel(source: source, conversationID: conversationID)
+
+    vm.start()
+    await source.waitForConversationSubscriptions(1)
+    XCTAssertFalse(vm.canSubmitPrompt)
+
+    await source.emitConversation(.connectionState(.connected))
+    await waitForMainActorState { vm.connectionState == .connected }
+    XCTAssertFalse(
+      vm.canSubmitPrompt,
+      "transport connected 不能替代 conversation snapshot/SyncComplete 闭环"
+    )
+
+    await source.emitConversation(
+      .snapshot(try SessionSourceTestValues.snapshot(conversationID: conversationID))
+    )
+    await waitForMainActorState { vm.canSubmitPrompt }
+
+    await source.emitConversation(.connectionState(.lagged(reason: .snapshotRequired)))
+    await waitForMainActorState {
+      vm.connectionState == .lagged(reason: .snapshotRequired)
+    }
+    XCTAssertFalse(vm.canSubmitPrompt)
+  }
+
   func testStartIsIdempotentAndSendPromptDoesNotResubscribe() async throws {
     let source = SessionSourceSpy()
     let vm = SessionDetailViewModel(source: source, conversationID: conversationID)

@@ -3782,6 +3782,81 @@ test "$macos_rc" -eq 78
 本节只关闭 R4.5 的 automatic slot-contract；物理 iPhone、第二台 Mac、公网 WSS 与真实 vendor 仍保持
 post-MVP `BLOCKED`，不能写成 PASS。R4.6 verifier、R4.7–R4.9、完整 P5.9 与 P5 Phase Exit 仍未完成。
 
+## Relay Companion MVP rescue R4.6 P5 aggregate verifier
+
+R4.6 将 R4 automatic 链路收进唯一 `p5` verifier，但不改变 P5 Phase 完成边界。先验证 verifier 自身的
+fail-close contract，再运行真实 aggregate：
+
+```bash
+bash -n scripts/verify-relay-companion-mvp.sh \
+  scripts/tests/verify-relay-companion-mvp-p5.sh
+bash scripts/tests/verify-relay-companion-mvp-p5.sh
+xcrun swift-format lint --strict \
+  --configuration '{"indentation":{"spaces":4}}' \
+  ios/AgentDeckMobileUITests/RelayCompanionUITests.swift
+bash scripts/tests/run-relay-companion-simulator-e2e.sh
+bash scripts/run-relay-companion-simulator-e2e.sh
+bash scripts/verify-relay-companion-mvp.sh p5
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+contract fixture 必须证明 automatic runner 缺失/失败时 verifier 非零；外部 runner 只有 exit 78 + exact
+versioned `BLOCKED` JSON 才能保留为外部槽位，exit 0、malformed JSON、额外行、非零 mutation 或 `PASS` 都是
+aggregate 失败。正常输出必须将两个外部槽位显示为 `BLOCKED:`，最终只允许：
+
+```text
+verify-relay-companion-mvp p5: PASS (automatic scope; external slots remain BLOCKED)
+```
+
+本轮先以 focused RED 稳定复现首个 Runtime Catalog `Subscribe` 在 daemon active ingress 建立前被静默丢弃，
+再只对 subscription 增加 generation-bound、可取消、有界的 exact retry。retry 复用同一 request route、
+sender counter 与 sealed frame；typed completion、generation teardown 或 12.7 秒窗口结束即停止，普通
+prompt/approval command 不进入盲重试。另一个独立竞态是 UI 在首个 conversation snapshot/SyncComplete
+提交前已允许 prompt；`SessionDetailViewModel.canSubmitPrompt` 现要求 connected + 首个 canonical snapshot
+已提交 + nonterminal，UI E2E 也必须等待 send button 明确 enabled。
+
+最终 fresh 证据：
+
+- subscription retry/production ingress/readiness focused suites、完整 RelayClient、Simulator runner contract、
+  verifier contract 与 `bash -n` 均 PASS；4-space UI test strict format PASS。既有 4-space
+  `SessionDetailViewController.swift` 只作一行同风格替换，以精确 diff 和 `git diff --check` 验证，禁止为本切片
+  制造整文件缩进 churn。
+- fresh `lifecycle-smoke` 在 daemon generation 2 完成 prompt、approval、restart/history recovery 与 revoke，
+  cleanup 进程和 artifact 读回全部 absent；完整 `p5` 最终打印唯一 automatic 汇总
+  `verify-relay-companion-mvp p5: PASS (automatic scope; external slots remain BLOCKED)`。
+- fresh iOS 为 `134/134`；完整 Swift 为 `1169 XCTest / 4 external entitlement skipped + 48 Swift Testing / 0
+  failure`；完整 `cargo test` exit 0，其中 daemon lib 为 `1711 passed / 3 ignored / 0 failed`，其余 workspace
+  integration 与 doctest 零失败。ignored 均为显式手动/外部门禁，不计入 PASS。
+
+本切片冻结以下 11-path code/test/runner manifest，tracked docs 不进入 hash：
+
+```bash
+r46_manifest=(
+  Sources/AgentDeckRelayClient/Connection/MachineConnection.swift
+  Sources/AgentDeckRelayClient/Connection/ProductionMachineConnectionVerifiedIngress.swift
+  Tests/AgentDeckRelayClientTests/MachineConnectionTests.swift
+  Tests/AgentDeckRelayClientTests/ProductionMachineConnectionVerifiedIngressTests.swift
+  ios/AgentDeckMobile/Screens/SessionDetail/SessionDetailViewController.swift
+  ios/AgentDeckMobile/Screens/SessionDetail/SessionDetailViewModel.swift
+  ios/AgentDeckMobileTests/SessionDetailViewModelTests.swift
+  ios/AgentDeckMobileUITests/RelayCompanionUITests.swift
+  scripts/tests/run-relay-companion-simulator-e2e.sh
+  scripts/tests/verify-relay-companion-mvp-p5.sh
+  scripts/verify-relay-companion-mvp.sh
+)
+test "${#r46_manifest[@]}" -eq 11
+for manifest_item in "${r46_manifest[@]}"; do
+  test -f "$manifest_item" || exit 1
+  printf 'blob %s %s\n' "$(git hash-object "$manifest_item")" "$manifest_item"
+done | LC_ALL=C sort | shasum -a 256
+```
+
+SHA-256 固定为 `9c4b7f1a31c4057da00d8f0de9bd2d82947f742c40e94208f4a6e7b288fb4f27`；旧
+`5bb1d1f69c363da81887055767be46e5478e2d3b6a70a9f8f5716cab5c88ca08` 已失效。R4.6 只关闭 automatic
+aggregate 与两处竞态；R4.7–R4.9、完整 P5.9/P5 Phase Exit，以及物理 iPhone、第二台 Mac、公网、真实
+vendor 与 production signing 仍未完成或保持 post-MVP `BLOCKED`。
+
 ## Relay Companion MVP rescue R0 基线冻结证据
 
 R0 只冻结事实、执行入口和既有 automatic baseline，不修改生产代码，也不提前执行 master merge、协议治理或

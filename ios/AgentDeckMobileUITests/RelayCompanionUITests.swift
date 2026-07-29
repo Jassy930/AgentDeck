@@ -13,6 +13,7 @@ final class RelayCompanionUITests: XCTestCase {
     private static let conversationTitle = "R4.3 synthetic Codex"
     private static let promptSentinel = "R4.3 UI prompt sentinel"
     private static let restartMarkerTitle = "R4.4 daemon restart marker"
+    private static let businessReadyUIWait: TimeInterval = 120
 
     override func setUp() {
         super.setUp()
@@ -133,13 +134,16 @@ final class RelayCompanionUITests: XCTestCase {
         XCTAssertTrue(machine.waitForExistence(timeout: 90), "配对后未出现真实机器行")
         let online = NSPredicate(format: "label CONTAINS %@", "在线")
         expectation(for: online, evaluatedWith: machine)
-        waitForExpectations(timeout: 60)
+        waitForExpectations(timeout: Self.businessReadyUIWait)
         machine.tap()
 
         let sessionList = app.collectionViews["sessions.list"]
         XCTAssertTrue(sessionList.waitForExistence(timeout: 30))
         let conversation = app.staticTexts[title]
-        XCTAssertTrue(conversation.waitForExistence(timeout: 60), "真实 catalog 未出现目标会话")
+        XCTAssertTrue(
+            conversation.waitForExistence(timeout: Self.businessReadyUIWait),
+            "真实 catalog 未出现目标会话"
+        )
         conversation.tap()
 
         let input = app.textViews["session.prompt.input"]
@@ -148,9 +152,12 @@ final class RelayCompanionUITests: XCTestCase {
 
     private func exercisePromptAndApproval(in app: XCUIApplication) {
         let input = app.textViews["session.prompt.input"]
+        let send = app.buttons["session.prompt.send"]
+        let promptReady = NSPredicate(format: "enabled == true")
+        expectation(for: promptReady, evaluatedWith: send)
+        waitForExpectations(timeout: Self.businessReadyUIWait)
         input.tap()
         input.typeText(Self.promptSentinel)
-        let send = app.buttons["session.prompt.send"]
         XCTAssertTrue(send.isEnabled)
         send.tap()
 

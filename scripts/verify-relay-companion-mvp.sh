@@ -5,15 +5,15 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$repo_root"
 
 if [[ $# -ne 1 ]]; then
-  printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2|p3|p4-auto>\n' >&2
+  printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2|p3|p4-auto|p5>\n' >&2
   exit 2
 fi
 
 phase="$1"
 case "$phase" in
-  p0|p2|p3|p4-auto) ;;
+  p0|p2|p3|p4-auto|p5) ;;
   *)
-    printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2|p3|p4-auto>\n' >&2
+    printf 'usage: scripts/verify-relay-companion-mvp.sh <p0|p2|p3|p4-auto|p5>\n' >&2
     exit 2
     ;;
 esac
@@ -58,6 +58,56 @@ verify_production_signed_slot() {
       "reasonCode", "schemaVersion", "status", "summaryGenerated"
     ] | sort)
   ' >/dev/null
+}
+
+verify_external_blocked_slot() {
+  local label="$1"
+  local runner="$2"
+  local expected_gate="$3"
+  local expected_reason="$4"
+  local record external_rc
+
+  printf 'RUN: %s\n' "$label"
+  set +e
+  record="$("$runner" 2>&1)"
+  external_rc=$?
+  set -e
+  if [[ "$external_rc" -ne 78 ]]; then
+    printf '%s\n' "$record" >&2
+    printf '%s must exit 78, got %s\n' "$label" "$external_rc" >&2
+    return 1
+  fi
+  if [[ "$(printf '%s\n' "$record" | wc -l | tr -d ' ')" != '1' ]]; then
+    printf '%s must emit exactly one JSON line\n' "$label" >&2
+    return 1
+  fi
+  if ! printf '%s\n' "$record" | jq -e \
+    --arg gate "$expected_gate" \
+    --arg reasonCode "$expected_reason" '
+      .schemaVersion == 1
+      and .gate == $gate
+      and .phase == "post-MVP"
+      and .status == "BLOCKED"
+      and .reasonCode == $reasonCode
+      and (.missingInputs | type) == "array"
+      and (.missingInputs | length) > 0
+      and (.missingInputs | all(type == "string" and length > 0))
+      and (.missingInputs | length) == (.missingInputs | unique | length)
+      and .mutations == 0
+      and .evidence == []
+      and .summaryGenerated == false
+      and .cleanup == {processesRemaining: 0, artifactsRemaining: 0}
+      and (keys | sort) == ([
+        "cleanup", "evidence", "gate", "missingInputs", "mutations", "phase",
+        "reasonCode", "schemaVersion", "status", "summaryGenerated"
+      ] | sort)
+    ' >/dev/null; then
+    printf '%s\n' "$record" >&2
+    printf '%s emitted an invalid BLOCKED record\n' "$label" >&2
+    return 1
+  fi
+
+  printf 'BLOCKED: %s (%s)\n' "$label" "$expected_reason"
 }
 
 verify_schema_snapshots() {
@@ -220,14 +270,40 @@ run_p4_auto() {
   run_gate 'agent docs gate' scripts/verify-agent-docs.sh
 }
 
-if [[ "$phase" == 'p0' ]]; then
-  run_p0
-elif [[ "$phase" == 'p2' ]]; then
-  run_p2
-elif [[ "$phase" == 'p3' ]]; then
-  run_p3
-else
-  run_p4_auto
-fi
+run_p5() {
+  run_gate 'Relay Companion Simulator runner contract' \
+    bash scripts/tests/run-relay-companion-simulator-e2e.sh
+  run_gate 'Relay Companion external BLOCKED slot contract' \
+    bash scripts/tests/run-relay-companion-external-blocked.sh
+  run_gate 'Relay Companion fixed-topology Simulator lifecycle' \
+    bash scripts/run-relay-companion-simulator-e2e.sh
+  run_gate 'Swift shared SessionSource tests' \
+    swift test --filter AgentDeckSessionSourceTests
+  run_gate 'Swift Relay client tests' \
+    swift test --filter AgentDeckRelayClientTests
+  run_gate 'agent docs gate' scripts/verify-agent-docs.sh
+  verify_external_blocked_slot \
+    'physical iPhone post-MVP slot' \
+    scripts/run-relay-companion-ios-device-smoke.sh \
+    'relay-companion-ios-device-smoke' \
+    'missing_external_ios_device_prerequisites'
+  verify_external_blocked_slot \
+    'second Mac post-MVP slot' \
+    scripts/run-relay-companion-macos-e2e.sh \
+    'relay-companion-macos-e2e' \
+    'missing_external_macos_e2e_prerequisites'
+}
 
-printf 'verify-relay-companion-mvp %s: PASS\n' "$phase"
+case "$phase" in
+  p0) run_p0 ;;
+  p2) run_p2 ;;
+  p3) run_p3 ;;
+  p4-auto) run_p4_auto ;;
+  p5) run_p5 ;;
+esac
+
+if [[ "$phase" == 'p5' ]]; then
+  printf 'verify-relay-companion-mvp p5: PASS (automatic scope; external slots remain BLOCKED)\n'
+else
+  printf 'verify-relay-companion-mvp %s: PASS\n' "$phase"
+fi

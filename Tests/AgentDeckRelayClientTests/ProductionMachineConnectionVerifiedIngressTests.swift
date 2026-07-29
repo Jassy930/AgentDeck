@@ -100,6 +100,11 @@ final class ProductionMachineConnectionVerifiedIngressTests: XCTestCase {
       requestID: fencedMessageID,
       scope: scope
     )
+    let fencedPendingBeforeReply = try await ingress.preparedSubscriptionIsPending(
+      fencedPrepared.token,
+      scope: scope
+    )
+    XCTAssertTrue(fencedPendingBeforeReply)
     let fencedOutbound = try productionIngressSend(fencedPrepared.frame)
     try await assertProductionIngressIgnored(
       ingress.receive(
@@ -136,6 +141,11 @@ final class ProductionMachineConnectionVerifiedIngressTests: XCTestCase {
     guard case .relayUnavailable = fencedOutcome else {
       return XCTFail("transition fence 必须成为可重连 transient outcome")
     }
+    let fencedPendingAfterReply = try await ingress.preparedSubscriptionIsPending(
+      fencedPrepared.token,
+      scope: scope
+    )
+    XCTAssertFalse(fencedPendingAfterReply)
 
     let snapshotMessageID = RuntimeMessageID(rawValue: "subscription-snapshot-required")
     let snapshotPrepared = try await ingress.prepareSubscription(
@@ -183,6 +193,11 @@ final class ProductionMachineConnectionVerifiedIngressTests: XCTestCase {
       scope: scope
     )
     await ingress.cancelPrepared(retryPrepared.token, scope: scope)
+    let pendingAfterCancel = try await ingress.preparedSubscriptionIsPending(
+      retryPrepared.token,
+      scope: scope
+    )
+    XCTAssertFalse(pendingAfterCancel)
   }
 
   func testExactNextProbeQueuesSignedKeySyncAndDurableUpdateSetQueuesAck() async throws {

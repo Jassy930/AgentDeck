@@ -912,6 +912,23 @@ actor ProductionMachineConnectionVerifiedIngress:
     currentRecord.waiter = nil
   }
 
+  func preparedSubscriptionIsPending(
+    _ token: MachinePreparedOutboundRequestToken,
+    scope: TransferAssemblyScope
+  ) async throws -> Bool {
+    guard let active = generation,
+      active.scope == scope,
+      !active.ending
+    else {
+      throw ProductionMachineConnectionVerifiedIngressError.generationEnded
+    }
+    guard let record = active.outboundByToken[token] else { return false }
+    guard case .subscription = record.kind else {
+      throw ProductionMachineConnectionVerifiedIngressError.invalidConfiguration
+    }
+    return true
+  }
+
   func awaitDirectedReply(
     _ token: MachinePreparedOutboundRequestToken,
     scope: TransferAssemblyScope
