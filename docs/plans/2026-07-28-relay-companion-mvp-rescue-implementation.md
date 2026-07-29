@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；R0–R3 complete，R4.1–R4.4 complete、R4.5 pending |
+| 状态 | In execution；R0–R3 complete，R4.1–R4.5 complete、R4.6 pending |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -151,6 +151,23 @@ gitStatus:
 - 20-path code/test/runner manifest SHA-256 为
   `383fa35e4476db10f7016f8dbb92a9bb11cd34423f7e5d94be12f287a4ffc927`；文档不进入该 hash。
   该证据只关闭 R4.4；R4.5–R4.9、完整 P5.9 与 P5 Phase Exit 仍未完成。
+
+### R4.5 external BLOCKED slot readback（2026-07-29）
+
+- 新增物理 iPhone 与第二台 Mac 两个独立 runner；它们各自固定为四行 `/bin/sh` 静态 sentinel，唯一行为是
+  输出一行 versioned JSON 并 `exit 78`。runner 不读取参数或环境变量，不探测设备、SSH、公网、真实
+  PairInvite、签名、Keychain 或 vendor login，也不创建进程、文件、授权、配对或证据。
+- 两条 JSON 都精确保持 `phase=post-MVP / status=BLOCKED / mutations=0 / evidence=[] /
+  summaryGenerated=false`，列出各自完整 `missingInputs`；`cleanup.processesRemaining=0 /
+  artifactsRemaining=0` 只读回静态 sentinel 的零残留，不冒充真实 preflight 或实机 evidence。
+- 独立 contract test 先以缺少 runner 的 exit 1 取得 RED，再验证默认调用与 hostile env/参数调用均返回
+  同一 record 和 exit 78。测试同时锁定四行 source、exact keys/数组、单行 stdout，并比较隔离
+  HOME/TMPDIR/cwd 的路径+内容快照及仓库 status，全部无变化。
+- `bash -n` 与 contract test 均 PASS。3-path code/test content manifest 按
+  `blob <git hash-object> <path>` C-locale 排序后的 SHA-256 为
+  `50f725a2c479f7b352bc33023d51a4ab6ea0c97d2cbe1365143a348a10bedbcd`；文档不进入该 hash。
+  该证据只关闭 R4.5；物理 iPhone、第二台 Mac、公网、真实 vendor 仍是 post-MVP `BLOCKED`，R4.6–R4.9、
+  完整 P5.9 与 P5 Phase Exit 仍未完成。
 
 ### Automatic gates
 
@@ -433,7 +450,7 @@ git diff --check
   闭环。
 - [x] R4.3：production Swift client + iOS UI 完成 pair/list/open/prompt/approval。
 - [x] R4.4：client/daemon relaunch、cursor/backfill reconnect 与 revoke terminal。
-- [ ] R4.5：外部 runner 严格只读 BLOCKED preflight，固定以 exit 78 表示预期未解锁。
+- [x] R4.5：外部 runner 严格只读 BLOCKED preflight，固定以 exit 78 表示预期未解锁。
 - [ ] R4.6：扩展 verifier `p5`；automatic 缺失/失败必须非零，外部 BLOCKED 不计入 PASS。
 - [ ] R4.7：同步文档并提交 R4 implementation candidate。
 - [ ] R4.8：同一 committed candidate 连续三次 fresh E2E。
@@ -634,7 +651,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
-| R4 Simulator E2E | in progress | R4.1 hash `0662ac6e`；R4.2 hash `f18609bb`；R4.3 hash `5561551e`；R4.4 hash `383fa35e` | lifecycle-smoke PASS；Rust aggregate/Clippy/fmt PASS；Swift 1167/4 skip + 48；iOS 133/133；contract/network/docs/diff PASS | pair/local approve/list/open/prompt/approval/relaunch/reconnect/revoke 与 plaintext-absence/cleanup PASS | R4.1–R4.4 Task 证据已闭环；R4.5 与 phase review 尚未开始 | R4.4 scoped commit 本次收口；未 push |
+| R4 Simulator E2E | in progress | R4.1 hash `0662ac6e`；R4.2 hash `f18609bb`；R4.3 hash `5561551e`；R4.4 hash `383fa35e`；R4.5 hash `50f725a2` | lifecycle-smoke PASS；Rust aggregate/Clippy/fmt PASS；Swift 1167/4 skip + 48；iOS 133/133；Simulator/external contract、network/docs/diff PASS | automatic pair→revoke 与 plaintext-absence/cleanup PASS；两个实机槽位精确 BLOCKED/exit 78/零 mutation | R4.1–R4.5 Task 证据已闭环；R4.6 与 phase review 尚未开始 | R4.4 已 scoped commit；R4.5 本次收口；未 push |
 | R5 MVP 收口 | pending | — | — | — | — | — |
 
 状态只能按实际证据更新。focused PASS 不得把 Phase 标为 complete；外部 BLOCKED 不得改写为 PASS。

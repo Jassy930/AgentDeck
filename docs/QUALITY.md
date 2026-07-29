@@ -3748,6 +3748,40 @@ command `1/1 completed`、approval `1/1 applied`、revoked authorization `1`、g
 R4.4；R4.5–R4.9、完整 P5.9 与 P5 Phase Exit 仍未完成，物理 iPhone、第二台 Mac、公网和真实
 vendor 仍是 post-MVP `BLOCKED`。
 
+## Relay Companion MVP rescue R4.5 external BLOCKED slot contract
+
+R4.5 只增加两个 post-MVP 实机槽位的静态 sentinel 和一个独立契约测试，不增加执行平台、网络探测、
+签名/Keychain 探测、SSH、PairInvite、设备访问或真实 evidence 生成：
+
+```bash
+bash -n scripts/run-relay-companion-ios-device-smoke.sh \
+  scripts/run-relay-companion-macos-e2e.sh \
+  scripts/tests/run-relay-companion-external-blocked.sh
+bash scripts/tests/run-relay-companion-external-blocked.sh
+
+set +e
+bash scripts/run-relay-companion-ios-device-smoke.sh; ios_rc=$?
+bash scripts/run-relay-companion-macos-e2e.sh; macos_rc=$?
+set -e
+test "$ios_rc" -eq 78
+test "$macos_rc" -eq 78
+```
+
+两个 runner 都固定为四行 `/bin/sh`：`set -eu`、单行 JSON、`exit 78`。JSON 精确包含
+`schemaVersion/gate/phase/status/reasonCode/missingInputs/mutations/evidence/summaryGenerated/cleanup`，其中
+`phase=post-MVP`、`status=BLOCKED`、`mutations=0`、`evidence=[]`、`summaryGenerated=false`，cleanup 为
+`processesRemaining=0 / artifactsRemaining=0`。missing inputs 只是声明缺口，不是本期真实 prerequisite probe。
+
+独立 contract test 先因缺少 runner 以 exit 1 RED，随后锁定四行 source 和 exact JSON；默认调用以及设置
+`AGENTDECK_REAL_E2E=1`、伪 WSS/invite、未知参数的 hostile 调用都必须输出相同 record 并 exit 78。测试前后
+隔离 HOME/TMPDIR/cwd 的路径与文件 hash 完全一致，仓库 status 也不变，因此没有授权、配对、运行数据、
+后台进程或证据 artifact。3-path code/test content manifest 按
+`blob <git hash-object> <path>` C-locale 排序后的 SHA-256 为
+`50f725a2c479f7b352bc33023d51a4ab6ea0c97d2cbe1365143a348a10bedbcd`；文档不进入 hash。
+
+本节只关闭 R4.5 的 automatic slot-contract；物理 iPhone、第二台 Mac、公网 WSS 与真实 vendor 仍保持
+post-MVP `BLOCKED`，不能写成 PASS。R4.6 verifier、R4.7–R4.9、完整 P5.9 与 P5 Phase Exit 仍未完成。
+
 ## Relay Companion MVP rescue R0 基线冻结证据
 
 R0 只冻结事实、执行入口和既有 automatic baseline，不修改生产代码，也不提前执行 master merge、协议治理或
