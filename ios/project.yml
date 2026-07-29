@@ -68,7 +68,37 @@ targets:
       - target: AgentDeckMobile
     settings:
       base:
+        AGENTDECK_RELAY_E2E_INVITE_PATH: ""
         GENERATE_INFOPLIST_FILE: YES
+    postBuildScripts:
+      - name: Stage private Relay E2E invite
+        basedOnDependencyAnalysis: false
+        script: |
+          set -eu
+          destination="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/RelayCompanionPairInvite.secret"
+          if [ -e "$destination" ]; then
+            /bin/rm "$destination"
+          fi
+          source_path="${AGENTDECK_RELAY_E2E_INVITE_PATH:-}"
+          if [ -z "$source_path" ]; then
+            exit 0
+          fi
+          case "$source_path" in
+            /private/tmp/ar4.*/ad-p57-host-*/pair-invite.secret) ;;
+            *)
+              printf 'unsafe Relay E2E invite source path\n' >&2
+              exit 1
+              ;;
+          esac
+          if [ ! -f "$source_path" ] || [ -L "$source_path" ]; then
+            printf 'Relay E2E invite source is not a regular file\n' >&2
+            exit 1
+          fi
+          if [ "$(/usr/bin/stat -f '%Lp' "$source_path")" != "600" ]; then
+            printf 'Relay E2E invite source mode is not 0600\n' >&2
+            exit 1
+          fi
+          /usr/bin/install -m 600 "$source_path" "$destination"
 schemes:
   AgentDeckMobile:
     build:

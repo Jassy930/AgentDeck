@@ -3,10 +3,12 @@ import XCTest
 
 /// R4 fixed-topology 的首个真实 UI 契约。
 ///
-/// invite 只通过 mode 0600 临时文件交给 UI test process；测试再复用 production
-/// `--pair-invite` 入口启动 App。没有显式 harness 输入时必须 RED，不能退回 fixture。
+/// Xcode 只把 invite 放入 fresh UI-test bundle；测试立即复制到自身 sandbox 的 mode 0600
+/// 临时文件并删除，再复用 production `--pair-invite` 入口启动 App。没有显式 harness
+/// 输入时必须 RED，不能退回 fixture。
 final class RelayCompanionUITests: XCTestCase {
     private static let invitePathEnvironment = "AGENTDECK_RELAY_E2E_INVITE_PATH"
+    private static let inviteResourceName = "RelayCompanionPairInvite"
 
     override func setUp() {
         super.setUp()
@@ -40,20 +42,34 @@ final class RelayCompanionUITests: XCTestCase {
     }
 
     private func loadPrivateInvite() throws -> String {
-        guard
-            let rawPath = ProcessInfo.processInfo.environment[Self.invitePathEnvironment],
-            rawPath.hasPrefix("/"),
-            !rawPath.contains("\n"),
-            !rawPath.contains("\r")
-        else {
-            throw RelayCompanionUIHarnessError.missingPrivateInvitePath
+        let environmentPath = ProcessInfo.processInfo.environment[Self.invitePathEnvironment]
+        let testBundle = Bundle(for: Self.self)
+        let resourceURL = testBundle.url(
+            forResource: Self.inviteResourceName,
+            withExtension: "secret"
+        )
+        if let environmentPath, let resourceURL, environmentPath != resourceURL.path {
+            throw RelayCompanionUIHarnessError.conflictingPrivateInvitePath
         }
 
-        let url = URL(fileURLWithPath: rawPath).standardizedFileURL
-        guard url.path == rawPath else {
-            throw RelayCompanionUIHarnessError.unsafePrivateInvitePath
+        let privateURL: URL
+        let removesPrivateCopy: Bool
+        if let environmentPath {
+            privateURL = try validatedInjectedURL(environmentPath)
+            removesPrivateCopy = false
+        } else if let resourceURL {
+            privateURL = try stagePrivateCopy(of: resourceURL)
+            removesPrivateCopy = true
+        } else {
+            throw RelayCompanionUIHarnessError.missingPrivateInvitePath
         }
-        let values = try url.resourceValues(forKeys: [
+        defer {
+            if removesPrivateCopy {
+                try? FileManager.default.removeItem(at: privateURL)
+            }
+        }
+
+        let values = try privateURL.resourceValues(forKeys: [
             .isRegularFileKey,
             .isSymbolicLinkKey,
             .fileSizeKey,
@@ -63,7 +79,7 @@ final class RelayCompanionUITests: XCTestCase {
         else {
             throw RelayCompanionUIHarnessError.unsafePrivateInvitePath
         }
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let attributes = try FileManager.default.attributesOfItem(atPath: privateURL.path)
         guard
             let permissions = attributes[.posixPermissions] as? NSNumber,
             permissions.uint16Value & 0o077 == 0
@@ -71,7 +87,7 @@ final class RelayCompanionUITests: XCTestCase {
             throw RelayCompanionUIHarnessError.unsafePrivateInvitePermissions
         }
 
-        let rawInvite = try String(contentsOf: url, encoding: .utf8)
+        let rawInvite = try String(contentsOf: privateURL, encoding: .utf8)
         let invite = rawInvite.trimmingCharacters(in: .whitespacesAndNewlines)
         guard invite.hasPrefix("agentdeck-pair:v1:"), !invite.contains("\n"),
             !invite.contains("\r"), invite.utf8.count <= 65_536
@@ -80,11 +96,75 @@ final class RelayCompanionUITests: XCTestCase {
         }
         return invite
     }
+
+    private func validatedInjectedURL(_ rawPath: String) throws -> URL {
+        guard
+            !rawPath.isEmpty,
+            rawPath.hasPrefix("/"),
+            !rawPath.contains("\n"),
+            !rawPath.contains("\r")
+        else {
+            throw RelayCompanionUIHarnessError.missingPrivateInvitePath
+        }
+        let url = URL(fileURLWithPath: rawPath).standardizedFileURL
+        guard normalizedTemporaryPath(url.path) == normalizedTemporaryPath(rawPath) else {
+            throw RelayCompanionUIHarnessError.unsafePrivateInvitePath
+        }
+        return url
+    }
+
+    private func stagePrivateCopy(of resourceURL: URL) throws -> URL {
+        let values = try resourceURL.resourceValues(forKeys: [
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+            .fileSizeKey,
+        ])
+        guard values.isRegularFile == true, values.isSymbolicLink != true,
+            let size = values.fileSize, size > 0, size <= 65_536
+        else {
+            throw RelayCompanionUIHarnessError.unsafeBundledInvite
+        }
+        let data = try Data(contentsOf: resourceURL)
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "relay-companion-invite-\(UUID().uuidString).secret"
+        )
+        let created = FileManager.default.createFile(
+            atPath: destination.path,
+            contents: nil,
+            attributes: [.posixPermissions: NSNumber(value: UInt16(0o600))]
+        )
+        guard created else {
+            throw RelayCompanionUIHarnessError.privateInviteCopyFailed
+        }
+        do {
+            let handle = try FileHandle(forWritingTo: destination)
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+            try handle.close()
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: UInt16(0o600))],
+                ofItemAtPath: destination.path
+            )
+            return destination
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+    }
+
+    private func normalizedTemporaryPath(_ path: String) -> String {
+        let privatePrefix = "/private/tmp/"
+        guard path.hasPrefix(privatePrefix) else { return path }
+        return "/tmp/" + String(path.dropFirst(privatePrefix.count))
+    }
 }
 
 private enum RelayCompanionUIHarnessError: Error {
     case missingPrivateInvitePath
+    case conflictingPrivateInvitePath
     case unsafePrivateInvitePath
     case unsafePrivateInvitePermissions
+    case unsafeBundledInvite
+    case privateInviteCopyFailed
     case invalidPrivateInvite
 }

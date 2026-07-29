@@ -100,9 +100,33 @@ const RECEIPT_SIGNER_SEED: [u8; 32] = [0x74; 32];
 const REMOTE_CLI_TEAM: &str = "A1B2C3D4E5";
 const P57_HOST_PROTOCOL: &str = "agentdeck-p57-host/v1";
 const P57_HOST_ENABLE_ENV: &str = "AGENTDECK_P57_HOST";
+const P57_HOST_PARENT_ENV: &str = "AGENTDECK_P57_HOST_PARENT";
 const P57_HOST_MAX_COMMAND_BYTES: usize = 4 * 1_024;
 const P57_HOST_MAX_WAIT_MS: u64 = 30_000;
 static P57_HOST_OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn p57_host_parent() -> PathBuf {
+    let Some(raw_parent) = env::var_os(P57_HOST_PARENT_ENV) else {
+        return PathBuf::from("/tmp");
+    };
+    let requested = PathBuf::from(raw_parent);
+    let parent = fs::canonicalize(&requested).expect("canonicalize injected P5.7 host parent");
+    assert_eq!(
+        requested, parent,
+        "injected P5.7 host parent must already be canonical"
+    );
+    let metadata = fs::symlink_metadata(&parent).expect("read injected P5.7 host parent metadata");
+    assert!(metadata.file_type().is_dir());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    assert_eq!(parent.parent(), Some(Path::new("/private/tmp")));
+    assert!(
+        parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("ar4."))
+    );
+    parent
+}
 
 fn remote_cli_access_group() -> String {
     format!("{REMOTE_CLI_TEAM}{REMOTE_CLI_ACCESS_GROUP_SUFFIX}")
@@ -2926,9 +2950,10 @@ async fn p57_real_dual_scope_ndjson_host() {
         "interactive P5.7 host requires {P57_HOST_ENABLE_ENV}=1"
     );
 
+    let host_parent = p57_host_parent();
     let root = TempDirBuilder::new()
         .prefix("ad-p57-host-")
-        .tempdir_in("/tmp")
+        .tempdir_in(host_parent)
         .expect("P5.7 host temp root");
     let root_path = fs::canonicalize(root.path()).expect("canonicalize P5.7 host temp root");
     let relay_db = root_path.join("relay-store/relay.db");

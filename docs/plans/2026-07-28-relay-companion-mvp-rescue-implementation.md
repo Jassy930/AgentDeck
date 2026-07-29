@@ -382,7 +382,8 @@ git diff --check
 ### Files
 
 - Create: `ios/AgentDeckMobileUITests/RelayCompanionUITests.swift`
-- Create: `agentdeck-cli/examples/synthetic_adapter_host.rs`
+- Reuse: `agentdeckd/tests/relay_v2_machine_e2e.rs` 中既有
+  `p57_real_dual_scope_ndjson_host`，禁止再建平行 host/runtime platform
 - Create: `scripts/run-relay-companion-simulator-e2e.sh`
 - Create: `scripts/tests/run-relay-companion-simulator-e2e.sh`
 - Create: physical iPhone/second-Mac read-only BLOCKED runners
@@ -400,7 +401,8 @@ git diff --check
 ### Tasks
 
 - [x] R4.1：脚本 contract tests 和 UI E2E RED。
-- [ ] R4.2：synthetic adapter host 与 temp Relay/daemon orchestrator。
+- [x] R4.2：复用 synthetic adapter host，完成 temp Relay/daemon/Simulator orchestrator 与 waiting/零授权/cleanup
+  闭环。
 - [ ] R4.3：production Swift client + iOS UI 完成 pair/list/open/prompt/approval。
 - [ ] R4.4：client/daemon relaunch、cursor/backfill reconnect 与 revoke terminal。
 - [ ] R4.5：外部 runner 严格只读 BLOCKED preflight，固定以 exit 78 表示预期未解锁。
@@ -427,6 +429,38 @@ git diff --check
   docs 与 diff 均 PASS。expected RED 只存在于显式 R4 runner/UI E2E 入口，不污染既有 automatic gate。
 - 下一步只允许 R4.2 提供 runner `--contract` 与 private invite/host orchestration；不得通过 skip、fixture、固定
   sleep、放宽 0600 文件校验或把 expected RED 写成 PASS 来消除失败。
+
+### R4.2 host-smoke readback（2026-07-29）
+
+- 没有创建 `synthetic_adapter_host.rs` 或第二套本地运行平台；runner 直接启动既有 ignored + env-gated
+  `p57_real_dual_scope_ndjson_host`。该 host 已组合 temp Direct TLS Relay、单例 daemon/RuntimeCore、
+  RemoteManager/RemoteLink、same-UID UDS、synthetic vendor adapter 和 mode 0600 PairInvite。
+- `scripts/run-relay-companion-simulator-e2e.sh` 现有三个 fail-closed 入口：`--contract` 一行 `READY` JSON 且零
+  mutation；`--host-smoke` 运行本切片闭环；默认完整入口固定 exit 1 + `INCOMPLETE`，在 R4.3/R4.4 前不能冒充
+  完整 E2E PASS。未知参数固定 exit 2。
+- 单一 Bash 3.2 orchestrator 通过 FIFO 持有 cargo wrapper PID、真实 host PID 与 fresh generation；严格解析
+  `agentdeck-p57-host/v1` NDJSON；host 的 test-only parent seam 被限制到 orchestrator 的 0700 root，使 ready
+  前失败也可精确回收。runner 校验 host root 0700、invite/Unix socket 0600、全部路径位于 owned root，并用
+  `simctl bootstatus` 等待独占 iPhone 17 Simulator ready，不用固定 sleep 代替 readiness。
+- 实测确认 xcodebuild shell env 不会透传 UI test，Simulator 进程也不能直接读取 Mac/Simulator 全局 tmp。
+  最终只在 `AgentDeckMobileUITests` target 增加短生命周期桥接：build phase 从受限
+  `/private/tmp/ar4.*/ad-p57-host-*/pair-invite.secret` 读取 mode 0600 文件，放入 fresh test bundle；UI test
+  立即在自身 sandbox 建立 mode 0600 私有副本、读取后删除，再调用 production `--pair-invite`。runner
+  只传路径，不把 invite 明文放入环境、脚本参数、stdout 或仓库；production App target 零改动。
+- fresh `--host-smoke` 最终一行 JSON 为 `status=PASS`，本机 host 读回
+  `pendingPairingCount=1 / relayGrantTotal=0 / relayGrantActive=0 / runtimeCommandCount=0`；graceful `shutdown`
+  又读回 `inviteRemoved=true / socketExists=false`，随后证明 host PID/root/invite/socket 与 owned Simulator 全部
+  absent。此前各失败轮次也走同一 trap，现场复核无 orphan PID、temp root 或 Simulator。
+- 提交前 fresh gates：runner shell/contract、Rust fmt、仅忽略 3 个 untouched Codex adapter 既有 lint 的
+  `relay_v2_machine_e2e` scoped Clippy、UI test strict format、docs 与 diff 均 exit 0；原 `AgentDeckMobile` scheme
+  `133/133`、零失败。无 invite 的 `RelayCompanionE2E` 仍按预期 exit 65，精确失败为
+  `missingPrivateInvitePath`，证明 bridge 不提供 stale/fallback 输入。未加豁免的 package Clippy 被
+  `agentdeckd/src/codex/{app_server,translate}.rs` 的 3 个既有 Rust 1.96 lint 阻断，不计 PASS，也未在本切片
+  扩张修复范围。
+- 5-path code/test manifest SHA-256 为
+  `f18609bb95fd9e4d267ea86c64867604c93703645773138ddd481b1f58cb252b`；文档不进入该 hash，避免证据自引用。
+- 该 PASS 只关闭 R4.2 的真实 host + requester waiting + 零授权 + cleanup；list/open、prompt/approval、
+  relaunch/reconnect、revoke terminal 仍属于 R4.3/R4.4，P5.9 与 P5 Phase 继续保持未完成。
 
 ### Automatic gates
 

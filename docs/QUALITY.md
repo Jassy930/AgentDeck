@@ -3620,6 +3620,30 @@ P5.9 或 P5 automatic Phase Exit 完成。3-path test/config content hash 为
 `133/133`、零失败，UI test strict four-space format、shell `bash -n`、docs 与 diff 均 PASS。expected RED
 只存在于显式 R4 runner/UI E2E 入口，不污染既有 automatic gate。
 
+## Relay Companion MVP rescue R4.2 host-smoke
+
+R4.2 复用 `agentdeckd/tests/relay_v2_machine_e2e.rs` 中既有的
+`p57_real_dual_scope_ndjson_host`，不创建第二套 daemon/Relay/runtime host。先验证静态 contract，再运行真实
+host-smoke：
+
+```bash
+bash -n scripts/run-relay-companion-simulator-e2e.sh
+bash scripts/tests/run-relay-companion-simulator-e2e.sh
+bash scripts/run-relay-companion-simulator-e2e.sh --host-smoke
+```
+
+`--host-smoke` 必须从 fresh private root 启动真实 Direct TLS Relay、单例 daemon/RuntimeCore、
+RemoteManager/RemoteLink、same-UID UDS、synthetic vendor adapter 和独占 iPhone 17 Simulator。UI 必须通过
+production Relay client 到达“等待被控机器本地确认”，随后 host 读回
+`pendingPairingCount=1 / relayGrantTotal=0 / relayGrantActive=0 / runtimeCommandCount=0`。最终只接受一行
+`mode=host-smoke / status=PASS` JSON，且 cleanup 字段必须证明 host PID/root、invite、UDS 和 Simulator 全部
+absent。
+
+动态 invite 只允许由 UI-test target 的 build phase按受限路径读取；test runner 在自身 sandbox 建立 mode 0600
+副本并在读取后删除。runner 只传路径，不传 invite 明文；没有输入时 UI test 继续 fail-close，不得回退 fixture。
+默认无参数入口在 R4.3/R4.4 前必须 exit 1 并输出 `status=INCOMPLETE`；`--contract` 只证明六组件 topology 和
+零 mutation，二者都不能写成完整 P5.9 PASS。
+
 ## Relay Companion MVP rescue R0 基线冻结证据
 
 R0 只冻结事实、执行入口和既有 automatic baseline，不修改生产代码，也不提前执行 master merge、协议治理或

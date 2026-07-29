@@ -45,4 +45,21 @@ unsupported_rc=$?
 set -e
 [[ "$unsupported_rc" -eq 2 ]] || fail "unknown arguments must exit 2"
 
+set +e
+incomplete_record="$(bash "$runner")"
+incomplete_rc=$?
+set -e
+[[ "$incomplete_rc" -eq 1 ]] || fail "unfinished full E2E must exit 1"
+[[ "$(printf '%s\n' "$incomplete_record" | wc -l | tr -d ' ')" == "1" ]] \
+  || fail "unfinished full E2E must emit exactly one JSON line"
+printf '%s\n' "$incomplete_record" | jq -e '
+  .schemaVersion == 1
+  and .gate == "relay-companion-simulator-e2e"
+  and .mode == "full"
+  and .status == "INCOMPLETE"
+  and .mutations == 0
+  and .availableModes == ["contract", "host-smoke"]
+  and .remaining == ["business-flow", "relaunch-reconnect", "revoke-terminal"]
+' >/dev/null || fail "unfinished full E2E did not fail closed"
+
 printf 'relay companion simulator E2E contract: PASS\n'
