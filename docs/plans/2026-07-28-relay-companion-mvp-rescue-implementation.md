@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；R4 与 P5 automatic Phase Exit 已完成；R5.1 closeout candidate 正在生成 |
+| 状态 | In execution；R5.2 暴露 dual-scope readiness 断言错误；R4/R5 已重开，正在生成 replacement R4.7 candidate |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -449,8 +449,38 @@ done | LC_ALL=C sort | shasum -a 256
   无冲突标记、二进制、DB、日志、secret 或运行数据进入 Git。
 - ignored 的 `ios/AgentDeckMobile.xcodeproj/` 与 `ios/AgentDeckMobile/Info.plist` 已移动到本机可恢复废纸篓；
   `.build`、`target`、`dist` 缓存未删除。最终读回无 Relay/daemon/runner/xcodebuild 进程、无 Booted Simulator，
-  HEAD/tree 未漂移且 `git status --short --branch` clean。R4、P5.9 与 P5 automatic Phase Exit complete；最终 MVP
-  仍必须在 R5 closeout candidate 上从零执行 R5.2–R5.6，禁止拼接本节结果。
+  HEAD/tree 未漂移且 `git status --short --branch` clean。该 candidate 当时关闭了 R4、P5.9 与 P5 automatic
+  Phase Exit；后续 R5.2 的反例已使本节 phase 结论失效，具体以紧随其后的重开记录为准。
+
+### R5.2 dual-scope readiness 反例与第七次 replacement R4.7（2026-07-30）
+
+- R5 closeout candidate 为 `2ddba9ba54820c37fce7efe698cd58d869be2314`，tree 为
+  `1f7e95f5d7543bebdd9e7f27513abc48cb9c0c8c`。同一 candidate 的完整 Rust workspace 为 daemon
+  `1719 passed / 3 ignored / 0 failed`，其余 integration/doctest 零失败；随后完整 Swift 在
+  `MachineScopeRealIntegrationTests` 稳定失败，focused 重跑仍可复现，host 30 秒内无法满足硬编码的
+  `BusinessReady`。因此 Rust PASS 只保留为该失效 candidate 的诊断证据，不得拼接到 replacement candidate。
+- 根因不是新本地运行平台、协议或 production runtime，而是同一个测试 host readiness 条件错误复用于两种合法
+  拓扑。单远端/Simulator 的稳定资源形态必须精确为 writer/live/job `2/2/2`；macOS dual-scope 还由 registry 持有
+  本机 source，稳定形态为 writer 精确 `3`、live/job 相等且为 `3` 或 `4`，barrier/snapshot sender 均为 `0`。
+  Swift 已独立读回 remote catalog 与 conversation connected，host 仍继续验证 transition complete、active grant、
+  semantic ACK 与资源残留，未放宽真实业务闭环。
+- `8cfdc0d` 的旧 R4 evidence 与 `2ddba9b` 的 R5 closeout candidate 均已失效；旧三次 lifecycle、aggregate、
+  全量与 review 结果不能作为当前 R4/R5 完成证据。R4 回到 replacement R4.7，R5 等待 R4.8/R4.9 再次闭合后
+  才能重新执行 R5.1–R5.6。
+- replacement implementation commit 为 `6dc2822942a418e144d38735a0a51892cf7a885d`，tree 为
+  `b887255f2a45d44f0eee1b2cf5b2e13b071828cc`，相对本地 `master` 为 `0 behind / 300 ahead`。本切片只修改
+  `agentdeckd/tests/relay_v2_machine_e2e.rs` 与
+  `Tests/AgentDeckTests/MachineScopeRealIntegrationTests.swift`，2-path content manifest SHA-256 为
+  `e8a8ea64101bb509dd55a61005296a48004e34cd12894a19403cc2e1a67993ec`；未修改 production、协议、schema、
+  storage 或版本。
+- fresh implementation gates：machine E2E `3 passed / 1 interactive ignored / 0 failed`；dual-scope focused 连续
+  `3/3 PASS`；完整 Swift `1169 XCTest / 4 external entitlement skipped / 0 failure + 48 Swift Testing PASS`；
+  Rust/Swift format、`git diff --check` 与 scoped Clippy 均 PASS。直接全局 `-D warnings` 只命中三项既有 Codex
+  adapter lint；按 `docs/QUALITY.md` 冻结 allow 列表重跑通过，没有修改无关代码。
+- 本节与 `docs/QUALITY.md` 以 docs-only scoped commit 生成第七次 replacement R4.7 candidate。提交后必须读回
+  commit/tree/clean status，并从零连续执行三次 fresh lifecycle、完整 `p5`、`p4-auto`、必要的完整
+  Rust/Swift/iOS 与静态门禁、双路 review 和 cleanup。物理 iPhone、第二台 Mac、公网 WSS、真实 vendor 与
+  production signing 继续保持 versioned post-MVP `BLOCKED`，不计 PASS。
 
 ### Automatic gates
 
@@ -468,7 +498,7 @@ scripts/verify-agent-docs.sh
 ### Manual/readback gates
 
 - 旧计划未完成 P5.8–P6 已被本计划覆盖，不再是默认入口。
-- 当前 P4=7/7、P5=7/9、P6=0/4 与 post-MVP BLOCKED 列表一致。
+- replacement R4.7 candidate 必须从零重跑，禁止沿用 `8cfdc0d` 的 phase completion；P6 与外部槽位仍不执行。
 - 没有创建额外远端、tag、push 或运行数据。
 
 ### Exit
@@ -870,7 +900,7 @@ test "$macos_rc" -eq 78
 
 ### Tasks
 
-- [x] R5.1：replacement R4.9 完成后，重新更新状态/文档、清理生成物并提交 closeout candidate。
+- [ ] R5.1：replacement R4.9 完成后，重新更新状态/文档、清理生成物并提交 closeout candidate。
 - [ ] R5.2：冻结最终 commit/tree/path hashes，运行完整 Rust/Swift/iOS/P4/P5 门禁。
 - [ ] R5.3：在同一最终 candidate 上执行 phase `spec/security`、`quality` review，清零 P0/P1/P2。
 - [ ] R5.4：逐项读取 post-MVP BLOCKED，确认 exit 78、零 mutation 和 versioned summary。
@@ -891,6 +921,9 @@ test "$macos_rc" -eq 78
   push、运行数据库、证书或密钥。任何提交后的仓库修改都会使 R5 candidate 失效并回到 R5.1。
 
 ### R5.1 restart handoff closeout candidate（2026-07-30）
+
+> 已失效：本节生成的 `2ddba9b` candidate 在 R5.2 完整 Swift 暴露 dual-scope readiness 断言错误；当前必须先
+> 完成第七次 replacement R4.7–R4.9，再重新执行 R5.1。
 
 - 本 Task 只更新本计划与 `docs/QUALITY.md`，把 replacement R4.8/R4.9 的重复性、`p5`/`p4-auto`、双路 review
   和 cleanup 写回事实源；不修改 production、test、runner、协议、schema、storage 或版本。
@@ -960,7 +993,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
-| R4 Simulator E2E | complete | evidence `8cfdc0d` / tree `dca2aa3`；implementation hash `7beefc9` | fresh lifecycle `3/3`、完整 `p5`/`p4-auto`、focused/Clippy/schema/network/docs 全部 PASS | generation 2 的 restart/history、command/approval/revoke、Relay plaintext absent 与完整 cleanup 每轮读回一致；外部槽位 BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | candidate 全程未漂移；ignored 生成物已移入废纸篓；clean；未 push |
-| R5 MVP 收口 | in progress（R5.1） | 本 docs-only scoped commit 生成新的 closeout candidate | R4 结果只作前置事实；R5.2 必须在新 candidate 上从零运行 | 生成物已清理；无 Relay/daemon/runner/xcodebuild 或 Booted Simulator | R5.3 待新 candidate 全量门禁后执行 | R5.1 只含 2 个文档；提交后须读回 clean；未 push |
+| R4 Simulator E2E | reopened（replacement R4.7） | implementation `6dc2822` / tree `b887255f`；2-path hash `e8a8ea6`；本 docs-only scoped commit 生成 evidence candidate | readiness focused、machine E2E、完整 Swift 与静态门禁 PASS；三次 fresh lifecycle、完整 `p5`/`p4-auto`、Rust/iOS 与双路 review 待新 candidate 从零执行 | 双拓扑资源不变量已精确区分；旧 `8cfdc0d` 运行读回只保留为历史诊断；外部槽位 BLOCKED | 新 candidate 双路 review 待执行 | 只含 2 个事实源文档；提交后须读回 clean；未 push |
+| R5 MVP 收口 | waiting for R4 | 旧 closeout `2ddba9b` 已失效 | 旧 Rust 全量只作诊断；R5.2–R5.6 不得拼接，待 R4 再次收口后从零执行 | 无新增 production/runtime；外部槽位保持 BLOCKED | 待 replacement R4.9 与新 R5 candidate | R4 文档候选提交后保持只读；未 push |
 
 状态只能按实际证据更新。focused PASS 不得把 Phase 标为 complete；外部 BLOCKED 不得改写为 PASS。
