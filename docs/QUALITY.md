@@ -3857,6 +3857,20 @@ SHA-256 固定为 `9c4b7f1a31c4057da00d8f0de9bd2d82947f742c40e94208f4a6e7b288fb4
 aggregate 与两处竞态；R4.7–R4.9、完整 P5.9/P5 Phase Exit，以及物理 iPhone、第二台 Mac、公网、真实
 vendor 与 production signing 仍未完成或保持 post-MVP `BLOCKED`。
 
+## Relay Companion MVP rescue R4.7 implementation candidate
+
+R4.7 不新增实现或测试，只把已经完整验证的 R4.6 implementation 冻结成后续重复性与 review 的单一 candidate。
+implementation commit 为 `9c15d72003e678c0ac7802bce03e076128da40a4`，tree 为
+`7855e052ab5f5a505f05774661af0ce775f2edf9`，11-path content hash 仍为
+`9c4b7f1a31c4057da00d8f0de9bd2d82947f742c40e94208f4a6e7b288fb4f27`；R4.6 提交后 status clean、未 push，
+相对本地 `master` 为 `0 behind / 284 ahead`。
+
+R4.7 只允许修改本节与 rescue implementation 计划，并以 docs-only scoped commit 生成 committed candidate。
+提交后必须读回 candidate commit/tree 和 clean status；R4.8 三次 fresh E2E 与 R4.9 双路 review 全部绑定该
+同一 HEAD。期间如 amend、切换 HEAD 或修改任何 tracked/untracked 文件，既有重复性计数不得继续使用，必须从
+R4.7 重新冻结。R4.7 本身不计作三次 fresh E2E、完整 P5.9 或 P5 Phase Exit；物理 iPhone、第二台 Mac、公网、
+production signing 与真实 vendor 继续保持 post-MVP `BLOCKED`。
+
 ## Relay Companion MVP rescue R0 基线冻结证据
 
 R0 只冻结事实、执行入口和既有 automatic baseline，不修改生产代码，也不提前执行 master merge、协议治理或
