@@ -32,7 +32,7 @@ use crate::runtime::store::key_transition::{
     KeyTransitionOperation, KeyTransitionPhase, KeyTransitionRecipient, KeyTransitionRecord,
     KeyTransitionRecovery, KeyTransitionStreamCut, KeyTransitionStreamScope, KeyTransitionTarget,
     KeyUpdateLifecycle, KeyUpdateRecord, PairingBootstrapInstallBinding,
-    PairingBootstrapInstallProof, RemoteTransitionIngressClass,
+    PairingBootstrapInstallProof, RemoteTransitionIngressClass, StreamAppliedAckRecord,
 };
 use crate::runtime::store::pairing_grant::{ConversationKeyRotation, GlobalKeyStateV1};
 use crate::runtime::store::remote_counter::{
@@ -866,6 +866,9 @@ struct FakeTransitionState {
     corrupt_commit_readback: bool,
     bootstrap_proof_on_update_freeze: Option<PairingBootstrapInstallProof>,
     ack_on_barrier_freeze: Option<Vec<u8>>,
+    ack_on_barrier_commit: Option<Vec<u8>>,
+    stream_ack_on_barrier_commit: bool,
+    corrupt_update_on_barrier_commit: bool,
 }
 
 struct FakeTransitionBackend {
@@ -892,6 +895,9 @@ impl FakeTransitionBackend {
                 corrupt_commit_readback: false,
                 bootstrap_proof_on_update_freeze: None,
                 ack_on_barrier_freeze: None,
+                ack_on_barrier_commit: None,
+                stream_ack_on_barrier_commit: false,
+                corrupt_update_on_barrier_commit: false,
             }),
         }
     }
@@ -1079,6 +1085,56 @@ impl TransitionBackend for FakeTransitionBackend {
             return Err(TransitionCoordinatorError::BackendRejected);
         }
         state.material.recovery.transition.phase = KeyTransitionPhase::BarriersCommitted;
+        if let Some(canonical_ack) = state.ack_on_barrier_commit.clone() {
+            let update = state
+                .material
+                .recovery
+                .updates
+                .first_mut()
+                .ok_or(TransitionCoordinatorError::BackendRejected)?;
+            if update.lifecycle == KeyUpdateLifecycle::Frozen {
+                update.lifecycle = KeyUpdateLifecycle::Acked;
+                update.canonical_ack = Some(canonical_ack);
+                update.state_changed_at_ms = update.state_changed_at_ms.saturating_add(1);
+            }
+        }
+        if state.stream_ack_on_barrier_commit {
+            let cut = *state
+                .material
+                .recovery
+                .transition
+                .cuts
+                .first()
+                .ok_or(TransitionCoordinatorError::BackendRejected)?;
+            let key_revision = state.material.recovery.transition.to_revision;
+            let update = state
+                .material
+                .recovery
+                .updates
+                .first_mut()
+                .ok_or(TransitionCoordinatorError::BackendRejected)?;
+            update.stream_applied_acks.push(StreamAppliedAckRecord {
+                scope: cut.scope,
+                stream_route: cut.stream_route,
+                stream_generation: cut.generation,
+                applied_stream_seq: cut.barrier_sequence,
+                inner_cursor: cut.relay_committed_inner,
+                key_revision,
+                key_epoch: cut.new_epoch,
+                epoch_barrier_sha256: cut.epoch_barrier_sha256,
+                canonical_ack: b"concurrent-stream-applied-ack".to_vec(),
+                acknowledged_at_ms: update.state_changed_at_ms.saturating_add(1),
+            });
+        }
+        if state.corrupt_update_on_barrier_commit {
+            let update = state
+                .material
+                .recovery
+                .updates
+                .first_mut()
+                .ok_or(TransitionCoordinatorError::BackendRejected)?;
+            update.canonical_update_set[0] ^= 0xff;
+        }
         Ok(state.material.recovery.clone())
     }
 
@@ -1656,6 +1712,78 @@ async fn barrier_freeze_accepts_authenticated_ack_progress_after_material_load()
     assert_eq!(
         state.material.recovery.updates[0].canonical_ack.as_deref(),
         Some(b"concurrent-key-update-ack".as_slice())
+    );
+}
+
+#[tokio::test]
+async fn barrier_commit_readback_accepts_key_update_ack_after_mark() {
+    let backend = FakeTransitionBackend::new(updates_frozen_material(), exact_committed_cuts());
+    backend
+        .state
+        .lock()
+        .expect("backend lock")
+        .ack_on_barrier_commit = Some(b"post-mark-key-update-ack".to_vec());
+    let authority = RecordingAuthority::default();
+    let coordinator = TransitionCoordinator::new(&backend, &authority);
+
+    assert_eq!(
+        coordinator.advance_once().await,
+        Ok(TransitionAdvance::ControlPlaneReady { barrier_count: 3 })
+    );
+    let state = backend.state.lock().expect("backend lock");
+    let update = &state.material.recovery.updates[0];
+    assert_eq!(update.lifecycle, KeyUpdateLifecycle::Acked);
+    assert_eq!(
+        update.canonical_ack.as_deref(),
+        Some(b"post-mark-key-update-ack".as_slice())
+    );
+    assert!(update.stream_applied_acks.is_empty());
+}
+
+#[tokio::test]
+async fn barrier_commit_readback_accepts_stream_ack_after_mark() {
+    let backend = FakeTransitionBackend::new(updates_frozen_material(), exact_committed_cuts());
+    {
+        let mut state = backend.state.lock().expect("backend lock");
+        state.ack_on_barrier_commit = Some(b"post-mark-key-update-ack".to_vec());
+        state.stream_ack_on_barrier_commit = true;
+    }
+    let authority = RecordingAuthority::default();
+    let coordinator = TransitionCoordinator::new(&backend, &authority);
+
+    assert_eq!(
+        coordinator.advance_once().await,
+        Ok(TransitionAdvance::ControlPlaneReady { barrier_count: 3 })
+    );
+    let state = backend.state.lock().expect("backend lock");
+    let update = &state.material.recovery.updates[0];
+    assert_eq!(update.lifecycle, KeyUpdateLifecycle::Acked);
+    assert_eq!(update.stream_applied_acks.len(), 1);
+    assert_eq!(
+        update.stream_applied_acks[0].canonical_ack,
+        b"concurrent-stream-applied-ack"
+    );
+}
+
+#[tokio::test]
+async fn barrier_commit_readback_still_rejects_immutable_update_drift() {
+    let backend = FakeTransitionBackend::new(updates_frozen_material(), exact_committed_cuts());
+    backend
+        .state
+        .lock()
+        .expect("backend lock")
+        .corrupt_update_on_barrier_commit = true;
+    let authority = RecordingAuthority::default();
+    let coordinator = TransitionCoordinator::new(&backend, &authority);
+
+    assert_eq!(
+        coordinator.advance_once().await,
+        Err(TransitionCoordinatorError::ExactReadbackMismatch)
+    );
+    assert_eq!(
+        backend.state.lock().expect("backend lock").business_checks,
+        0,
+        "corrupted readback must be rejected before entering business"
     );
 }
 

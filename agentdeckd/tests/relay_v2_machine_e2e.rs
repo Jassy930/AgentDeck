@@ -2355,6 +2355,11 @@ impl P57HostEvidence {
                     && self.relay_grant_active == 1
                     && self.active_transition_count == 0
                     && self.active_catalog_stream_count == 1
+                    && self.runtime_active_writer_count == 2
+                    && self.runtime_live_subscription_count == 2
+                    && self.runtime_barrier_subscription_count == 0
+                    && self.runtime_snapshot_sender_count == 0
+                    && self.runtime_subscription_job_count == 2
             }
             P57HostWaitCondition::BusinessMutated => {
                 self.runtime_command_count == 1
@@ -2424,6 +2429,16 @@ struct P57HostError<'a> {
     protocol: &'static str,
     request_id: Option<&'a str>,
     code: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct P57HostReadinessError<'a> {
+    kind: &'static str,
+    protocol: &'static str,
+    request_id: Option<&'a str>,
+    code: &'static str,
+    evidence: P57HostEvidence,
 }
 
 #[derive(Serialize)]
@@ -3544,7 +3559,7 @@ async fn p57_real_dual_scope_ndjson_host() {
                 );
                 daemon = Some(restarted);
                 let current = daemon.as_ref().expect("restarted P5.7 daemon is present");
-                let (satisfied, _pre_marker_evidence) = wait_for_p57_host_evidence(
+                let (satisfied, pre_marker_evidence) = wait_for_p57_host_evidence(
                     current.core.as_ref(),
                     &current.local,
                     &current.socket,
@@ -3556,11 +3571,12 @@ async fn p57_real_dual_scope_ndjson_host() {
                 )
                 .await;
                 if !satisfied {
-                    emit_p57_host_record(&P57HostError {
+                    emit_p57_host_record(&P57HostReadinessError {
                         kind: "error",
                         protocol: P57_HOST_PROTOCOL,
                         request_id: Some(&request_id),
                         code: "host.restart.business_not_ready",
+                        evidence: pre_marker_evidence,
                     });
                     continue;
                 }

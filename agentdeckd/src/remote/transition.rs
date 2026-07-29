@@ -393,15 +393,22 @@ where
             .backend
             .mark_key_barriers_committed_exact(frozen.transition.operation_id)
             .await?;
-        if committed.transition.phase != KeyTransitionPhase::BarriersCommitted
-            || committed.transition.operation_id != frozen.transition.operation_id
-            || committed.transition.to_revision != frozen.transition.to_revision
-            || committed.transition.recipients != frozen.transition.recipients
+        if !same_transition_axes_allowing_bootstrap_install(frozen, &committed)
+            || committed.transition.phase != KeyTransitionPhase::BarriersCommitted
             || committed.transition.cuts != frozen.transition.cuts
-            || committed.updates != frozen.updates
+            || committed.updates.len() != frozen.updates.len()
+            || !frozen
+                .updates
+                .iter()
+                .zip(&committed.updates)
+                .all(|(expected, actual)| same_or_monotonic_committed_update(expected, actual))
         {
             return Err(TransitionCoordinatorError::ExactReadbackMismatch);
         }
+        validate_existing_updates(&committed)?;
+        let mut committed_material = material.clone();
+        committed_material.recovery = committed;
+        validate_frozen_barrier_set(&committed_material)?;
         self.backend.check_business_ingress_allowed().await?;
         Ok(TransitionAdvance::ControlPlaneReady {
             barrier_count: frozen.transition.cuts.len(),
@@ -738,6 +745,49 @@ fn same_or_monotonic_acked_update(expected: &KeyUpdateRecord, actual: &KeyUpdate
             expected.canonical_ack.is_none()
                 && actual.canonical_ack.is_none()
                 && expected.state_changed_at_ms == actual.state_changed_at_ms
+        }
+        (KeyUpdateLifecycle::Frozen, KeyUpdateLifecycle::Acked) => {
+            expected.canonical_ack.is_none()
+                && actual
+                    .canonical_ack
+                    .as_ref()
+                    .is_some_and(|canonical| !canonical.is_empty())
+                && expected.state_changed_at_ms <= actual.state_changed_at_ms
+        }
+        (KeyUpdateLifecycle::Acked, KeyUpdateLifecycle::Acked) => {
+            expected.canonical_ack == actual.canonical_ack
+                && expected.state_changed_at_ms == actual.state_changed_at_ms
+        }
+        _ => false,
+    }
+}
+
+/// barrier COMMIT 与 authenticated endpoint ACK 可以在 Store mark 后、coordinator
+/// reload 前并发排序。不可变 update bytes 必须完全一致；只允许 Frozen→Acked 与
+/// 已验证 stream-applied ACK 集合单调增加，不能把合法进度误判为 readback corruption。
+fn same_or_monotonic_committed_update(
+    expected: &KeyUpdateRecord,
+    actual: &KeyUpdateRecord,
+) -> bool {
+    if expected.operation_id != actual.operation_id
+        || expected.recipient != actual.recipient
+        || expected.key_revision != actual.key_revision
+        || expected.canonical_update_set != actual.canonical_update_set
+        || expected.snapshot_flushes != actual.snapshot_flushes
+        || expected.created_at_ms != actual.created_at_ms
+        || expected
+            .stream_applied_acks
+            .iter()
+            .any(|ack| !actual.stream_applied_acks.contains(ack))
+    {
+        return false;
+    }
+    match (expected.lifecycle, actual.lifecycle) {
+        (KeyUpdateLifecycle::Frozen, KeyUpdateLifecycle::Frozen) => {
+            expected.canonical_ack.is_none()
+                && actual.canonical_ack.is_none()
+                && expected.state_changed_at_ms == actual.state_changed_at_ms
+                && expected.stream_applied_acks == actual.stream_applied_acks
         }
         (KeyUpdateLifecycle::Frozen, KeyUpdateLifecycle::Acked) => {
             expected.canonical_ack.is_none()
