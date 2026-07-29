@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；daemon restart handoff 修复后第六次 replacement R4.7 已冻结，R4.8 pending；R5 暂停 |
+| 状态 | In execution；R4 与 P5 automatic Phase Exit 已完成；R5.1 closeout candidate 正在生成 |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -427,6 +427,31 @@ done | LC_ALL=C sort | shasum -a 256
   提交后必须读回 commit/tree/clean status，并从零连续执行三次 fresh lifecycle、完整 `p5`、`p4-auto`、双路
   review 与 cleanup；任何仓库修改都会使计数再次失效。外部槽位继续保持 versioned post-MVP `BLOCKED`。
 
+### R4.8/R4.9 restart handoff committed candidate 收口（2026-07-30）
+
+- 唯一 evidence candidate 为 `8cfdc0d0bfd74186dafaf09da4333f97e10803a2`，tree 为
+  `dca2aa3c1a5da8c08bdd9f2b1eff83c825f754e9`，相对本地 `master` 为 `0 behind / 298 ahead`；三轮
+  lifecycle、aggregate、review 与 cleanup 全程未修改仓库或切换 HEAD。5-path implementation manifest 复算仍为
+  `7beefc9623398f2ef8527f2bbde624e11ed85332a39b504d1d4e8b23b4ecf185`。
+- 三次 fresh lifecycle 连续 `3/3 PASS`。每轮均读回 daemon generation `2`、restart marker、history recovery、
+  command `1/1`、approval `1/1`、revoke `1`、active grant `0`、Relay plaintext absent，以及
+  host/root/invite/socket/owned Simulator cleanup 全部 absent。
+- 同一 candidate 的完整 `p5` exit 0：SessionSource `25/25`；RelayClient
+  `457 executed / 4 external entitlement skipped / 0 failed`。随后 `p4-auto` exit 0：machine E2E
+  `2 passed / 1 interactive ignored`，persistent CLI、trust reset、Relay client、协议契约、四 schema、daemon
+  network/no-net 与文档门禁全部通过。物理 iPhone 与第二台 Mac 继续按 versioned contract `BLOCKED`，不计 PASS。
+- `spec/security` review 为 Approved，`P0/P1/P2=0`：确认 final Close 只在 Relay Core disconnect 与
+  dependent-device cleanup 后返回；同进程 reconnect 保持原路径；Active startup reservation 只开放既有 512 条 /
+  16 MiB 有界传输队列，不开放 Runtime，Dormant/Retire、未领取 lane、reservation drop 与 rollback 继续
+  fail-close；协议/schema/storage/version 与 vendor-token 边界均未改变。
+- `quality/Git` review 为 Approved，`P0/P1/P2=0`：健康 Close、device generation cut、reservation 首帧/drop 与
+  manager rollback 均有确定性回归；candidate 只比失效的 `cfa90b6` 增加 5 个 code/test 路径和 2 个事实源文档，
+  无冲突标记、二进制、DB、日志、secret 或运行数据进入 Git。
+- ignored 的 `ios/AgentDeckMobile.xcodeproj/` 与 `ios/AgentDeckMobile/Info.plist` 已移动到本机可恢复废纸篓；
+  `.build`、`target`、`dist` 缓存未删除。最终读回无 Relay/daemon/runner/xcodebuild 进程、无 Booted Simulator，
+  HEAD/tree 未漂移且 `git status --short --branch` clean。R4、P5.9 与 P5 automatic Phase Exit complete；最终 MVP
+  仍必须在 R5 closeout candidate 上从零执行 R5.2–R5.6，禁止拼接本节结果。
+
 ### Automatic gates
 
 ```bash
@@ -712,8 +737,8 @@ git diff --check
 - [x] R4.6：扩展 verifier `p5`；automatic 缺失/失败必须非零，外部 BLOCKED 不计入 PASS。
 - [x] R4.7：daemon restart close-handshake / startup reservation 修复后重新同步文档并提交第六次 replacement
   implementation candidate。
-- [ ] R4.8：在 replacement committed candidate 上从零连续执行三次 fresh E2E。
-- [ ] R4.9：同一 replacement candidate 执行完整 `p5`/`p4-auto`、双路 review、cleanup 与 clean status；若修改
+- [x] R4.8：在 replacement committed candidate 上从零连续执行三次 fresh E2E。
+- [x] R4.9：同一 replacement candidate 执行完整 `p5`/`p4-auto`、双路 review、cleanup 与 clean status；若修改
   代码，从 R4.7 重来。
 
 ### R4.1 RED readback（2026-07-28）
@@ -845,7 +870,7 @@ test "$macos_rc" -eq 78
 
 ### Tasks
 
-- [ ] R5.1：replacement R4.9 完成后，重新更新状态/文档、清理生成物并提交 closeout candidate。
+- [x] R5.1：replacement R4.9 完成后，重新更新状态/文档、清理生成物并提交 closeout candidate。
 - [ ] R5.2：冻结最终 commit/tree/path hashes，运行完整 Rust/Swift/iOS/P4/P5 门禁。
 - [ ] R5.3：在同一最终 candidate 上执行 phase `spec/security`、`quality` review，清零 P0/P1/P2。
 - [ ] R5.4：逐项读取 post-MVP BLOCKED，确认 exit 78、零 mutation 和 versioned summary。
@@ -864,6 +889,17 @@ test "$macos_rc" -eq 78
   candidate；R5.2 必须从提交后 clean 状态重新读回 commit/tree/path hashes，并把后续全部门禁绑定到新 candidate。
 - `ios/AgentDeckMobile.xcodeproj/` 已按 ignored 生成物清理；R5.1 不删除 `.build`/`target` 缓存，不创建 tag、远端、
   push、运行数据库、证书或密钥。任何提交后的仓库修改都会使 R5 candidate 失效并回到 R5.1。
+
+### R5.1 restart handoff closeout candidate（2026-07-30）
+
+- 本 Task 只更新本计划与 `docs/QUALITY.md`，把 replacement R4.8/R4.9 的重复性、`p5`/`p4-auto`、双路 review
+  和 cleanup 写回事实源；不修改 production、test、runner、协议、schema、storage 或版本。
+- R4 evidence candidate 固定为 `8cfdc0d0bfd74186dafaf09da4333f97e10803a2` / tree
+  `dca2aa3c1a5da8c08bdd9f2b1eff83c825f754e9`。包含本节的 docs-only scoped commit 生成新的最终 closeout
+  candidate；R5.2 必须从提交后 clean 状态重新读回 commit/tree/path hashes，并把完整 Rust/Swift/iOS/P4/P5、
+  R5.3 双路 review和 R5.4 external BLOCKED readback 全部绑定到该新 candidate。
+- 两个 ignored Xcode 生成物已移入可恢复废纸篓，`.build`、`target` 与 `dist` 未清理；未创建 tag、远端、push、
+  运行数据库、证书或密钥。任何提交后的仓库修改都会使 R5 candidate 失效并回到 R5.1。
 
 ### Final gates
 
@@ -924,7 +960,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
-| R4 Simulator E2E | in progress（reopened） | replacement implementation `46614b2` / tree `5a910ff`；5-path hash `7beefc9` | transport `57/57`、RelayClient `10/10`、server `4/4`、TLS `1/1`、连续三轮 WIP lifecycle 与完整 `p5`、scoped Clippy/静态门禁 PASS | `cfa90b6` 首轮 PASS、第二轮在 generation 2 以 `host.restart.business_not_ready` 失败；新 implementation 三轮均读回 command/approval/revoke 和 cleanup，但只作冻结资格 | 既有双路 review再次失效；replacement review 待 R4.9 | implementation 已 exact commit；本次 docs-only commit 生成第六次 replacement R4.7；未 push |
-| R5 MVP 收口 | paused | `5966c98`、`0f601ae`、`f7d2e68`、`eaa1c5a`、`20502c3`、`cfa90b6` 均已失效 | 既有 R5.2、R4.8 与 implementation 全量结果只作诊断/实现门禁，不可拼接 | 当前 implementation 三轮 lifecycle 与 `p5` cleanup PASS | 必须等待第六次 replacement R4.9 | 回到 R4.8；R5.1–R5.6 全部重跑 |
+| R4 Simulator E2E | complete | evidence `8cfdc0d` / tree `dca2aa3`；implementation hash `7beefc9` | fresh lifecycle `3/3`、完整 `p5`/`p4-auto`、focused/Clippy/schema/network/docs 全部 PASS | generation 2 的 restart/history、command/approval/revoke、Relay plaintext absent 与完整 cleanup 每轮读回一致；外部槽位 BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | candidate 全程未漂移；ignored 生成物已移入废纸篓；clean；未 push |
+| R5 MVP 收口 | in progress（R5.1） | 本 docs-only scoped commit 生成新的 closeout candidate | R4 结果只作前置事实；R5.2 必须在新 candidate 上从零运行 | 生成物已清理；无 Relay/daemon/runner/xcodebuild 或 Booted Simulator | R5.3 待新 candidate 全量门禁后执行 | R5.1 只含 2 个文档；提交后须读回 clean；未 push |
 
 状态只能按实际证据更新。focused PASS 不得把 Phase 标为 complete；外部 BLOCKED 不得改写为 PASS。
