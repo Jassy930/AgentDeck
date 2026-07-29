@@ -133,6 +133,7 @@ struct ActiveConnection {
     status_tx: watch::Sender<Option<RelayClientError>>,
     status_rx: watch::Receiver<Option<RelayClientError>>,
     cancel: CancellationToken,
+    writer_shutdown: CancellationToken,
     reader_task: Option<JoinHandle<()>>,
     writer_task: Option<JoinHandle<()>>,
 }
@@ -150,12 +151,14 @@ impl ActiveConnection {
         let inbound_budget = Arc::new(Semaphore::new(APPLICATION_QUEUE_BYTES));
         let urgent_budget = Arc::new(Semaphore::new(URGENT_QUEUE_BYTES));
         let cancel = CancellationToken::new();
+        let writer_shutdown = CancellationToken::new();
         let writer_task = tokio::spawn(writer_loop(
             sink,
             control_rx,
             data_rx,
             status_tx.clone(),
             cancel.clone(),
+            writer_shutdown.clone(),
         ));
         let reader_task = tokio::spawn(reader_loop(
             stream,
@@ -176,6 +179,7 @@ impl ActiveConnection {
             status_tx,
             status_rx,
             cancel,
+            writer_shutdown,
             reader_task: Some(reader_task),
             writer_task: Some(writer_task),
         }
@@ -246,6 +250,18 @@ impl ActiveConnection {
         self.cancel.cancel();
         join_or_abort_owned(&mut self.reader_task).await;
         join_or_abort_owned(&mut self.writer_task).await;
+    }
+
+    /// 最终 owner shutdown 使用的有界 close-handshake 屏障。
+    ///
+    /// writer 先发送 WebSocket Close；reader 保持存活，直到 peer 回 Close/EOF。
+    /// Relay server 只在 Core disconnect cleanup 完成后回 Close，因此本方法返回时，
+    /// 下一进程 generation 不会再抢在旧 machine disconnect 前完成 authentication。
+    async fn shutdown_confirmed(&mut self) {
+        self.writer_shutdown.cancel();
+        join_or_abort_owned(&mut self.writer_task).await;
+        join_or_abort_owned(&mut self.reader_task).await;
+        self.cancel.cancel();
     }
 }
 
@@ -321,6 +337,7 @@ async fn writer_loop<S>(
     mut data_rx: mpsc::Receiver<Outbound>,
     status: watch::Sender<Option<RelayClientError>>,
     cancel: CancellationToken,
+    writer_shutdown: CancellationToken,
 ) where
     S: futures_util::Sink<Message> + Unpin,
 {
@@ -328,6 +345,7 @@ async fn writer_loop<S>(
         let outbound = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            _ = writer_shutdown.cancelled() => break,
             control = control_rx.recv() => match control {
                 Some(control) => control,
                 None => match data_rx.recv().await { Some(data) => data, None => break },
@@ -669,6 +687,15 @@ impl RelayClient {
         }
         self.connection = None;
     }
+
+    /// 最终 transport owner shutdown：等待 Relay peer 的 close handshake 后再释放连接。
+    /// reconnect 仍使用 [`Self::shutdown`]，避免把同进程 replacement 改成 process-exit 语义。
+    pub async fn shutdown_confirmed(&mut self) {
+        if let Some(connection) = self.connection.as_mut() {
+            connection.shutdown_confirmed().await;
+        }
+        self.connection = None;
+    }
 }
 
 pub struct RelayEnrollmentClient;
@@ -991,6 +1018,7 @@ mod tests {
             data_rx,
             status_tx,
             cancel.clone(),
+            CancellationToken::new(),
         ));
         let budget = reserve_bytes(
             &Arc::new(Semaphore::new(1024)),
@@ -1081,6 +1109,7 @@ mod tests {
             status_tx,
             status_rx,
             cancel,
+            writer_shutdown: CancellationToken::new(),
             reader_task: Some(reader_task),
             writer_task: Some(writer_task),
         };
@@ -1168,6 +1197,7 @@ mod tests {
             status_tx,
             status_rx,
             cancel: CancellationToken::new(),
+            writer_shutdown: CancellationToken::new(),
             reader_task: None,
             writer_task: None,
         };
@@ -1235,6 +1265,7 @@ mod tests {
             status_tx,
             status_rx,
             cancel: CancellationToken::new(),
+            writer_shutdown: CancellationToken::new(),
             reader_task: None,
             writer_task: None,
         };

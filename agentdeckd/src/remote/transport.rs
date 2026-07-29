@@ -532,7 +532,7 @@ impl ControlSession for RelayControlSession {
     }
 
     async fn shutdown(&mut self) {
-        self.client.shutdown().await;
+        self.client.shutdown_confirmed().await;
     }
 }
 
@@ -1516,6 +1516,17 @@ struct RemoteTransportRetryState {
     machine_route: MachineRouteId,
     authenticator: Arc<MachineLinkAuthenticator>,
     start_permit: Option<RemoteStartPermit>,
+    business_startup: BusinessLaneStartup,
+}
+
+/// 决定 authenticated MachineLink reader 启动前是否已经为 Active business stack
+/// 保留唯一 bounded lane。`Dormant` 仍保持未领取业务 frame 必须 fail-close；
+/// `Reserved` 只用于已有 Active enrollment 的 recovery/enroll 路径，避免 device 先于
+/// pairing/business owner 恢复时把合法首帧误判成未领取。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BusinessLaneStartup {
+    Dormant,
+    Reserved,
 }
 
 impl RemoteTransportRetryState {
@@ -1528,6 +1539,7 @@ impl RemoteTransportRetryState {
             machine_route,
             authenticator,
             start_permit,
+            business_startup,
         } = self;
         match connect_preserving_ownership(&config, authenticator, start_permit, connector).await {
             Ok(ConnectedTransportOwnership {
@@ -1539,6 +1551,7 @@ impl RemoteTransportRetryState {
                 session,
                 authenticator,
                 start_permit,
+                business_startup,
             )),
             Err(FailedTransportOwnership {
                 error: client,
@@ -1551,6 +1564,7 @@ impl RemoteTransportRetryState {
                     machine_route,
                     authenticator,
                     start_permit,
+                    business_startup,
                 },
             }),
         }
@@ -3125,6 +3139,7 @@ impl ControlSupervisor {
     fn start(
         machine_route: MachineRouteId,
         session: Box<dyn ControlSession>,
+        business_startup: BusinessLaneStartup,
     ) -> (Self, PairingTransportLane, BusinessTransportLane) {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
@@ -3135,8 +3150,17 @@ impl ControlSupervisor {
         let (business_generation, business_generation_rx) =
             watch::channel(INITIAL_PAIRING_GENERATION);
         let business_bytes = Arc::new(Semaphore::new(BUSINESS_EVENT_BYTES_CAPACITY));
-        let business_enabled = Arc::new(AtomicBool::new(false));
-        let business_activation_epoch = Arc::new(AtomicU64::new(0));
+        // Active recovery 必须在 reader task 可见任何已重连 device 首帧前完成唯一
+        // business reservation。Dormant 仍从 disabled/epoch 0 开始并 fail-close。
+        let initial_business_activation_epoch = match business_startup {
+            BusinessLaneStartup::Dormant => 0,
+            BusinessLaneStartup::Reserved => 1,
+        };
+        let business_enabled = Arc::new(AtomicBool::new(matches!(
+            business_startup,
+            BusinessLaneStartup::Reserved
+        )));
+        let business_activation_epoch = Arc::new(AtomicU64::new(initial_business_activation_epoch));
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (health_tx, health_rx) = watch::channel(None);
         let task = tokio::spawn(run_control_supervisor(
@@ -3176,7 +3200,7 @@ impl ControlSupervisor {
             observed_generation: INITIAL_PAIRING_GENERATION,
             enabled: Arc::clone(&business_enabled),
             activation_epoch: Arc::clone(&business_activation_epoch),
-            admitted_activation_epoch: 0,
+            admitted_activation_epoch: initial_business_activation_epoch,
         };
         (
             Self {
@@ -3199,6 +3223,15 @@ impl ControlSupervisor {
         &self,
         lane: &mut BusinessTransportLane,
     ) -> Result<(), RemoteTransportError> {
+        if self.business_enabled.load(Ordering::Acquire)
+            && lane.admitted_activation_epoch != 0
+            && self.business_activation_epoch.load(Ordering::Acquire)
+                == lane.admitted_activation_epoch
+            && Arc::ptr_eq(&self.business_enabled, &lane.enabled)
+            && Arc::ptr_eq(&self.business_activation_epoch, &lane.activation_epoch)
+        {
+            return Ok(());
+        }
         if !Arc::ptr_eq(&self.business_enabled, &lane.enabled)
             || !Arc::ptr_eq(&self.business_activation_epoch, &lane.activation_epoch)
             || self.business_enabled.load(Ordering::Acquire)
@@ -4202,9 +4235,10 @@ impl RemoteTransport {
         session: Box<dyn ControlSession>,
         authenticator: Arc<MachineLinkAuthenticator>,
         start_permit: Option<RemoteStartPermit>,
+        business_startup: BusinessLaneStartup,
     ) -> Self {
         let (supervisor, pairing_lane, business_lane) =
-            ControlSupervisor::start(machine_route, session);
+            ControlSupervisor::start(machine_route, session, business_startup);
         Self {
             machine_route,
             supervisor: Some(supervisor),
@@ -4215,11 +4249,12 @@ impl RemoteTransport {
         }
     }
 
-    pub async fn connect(
+    pub(super) async fn connect(
         identity: ArmedRemoteIdentity,
         config: RelayClientConfig,
         machine_route: MachineRouteId,
         link_cert: SignedCertificate,
+        business_startup: BusinessLaneStartup,
     ) -> Result<Self, RemoteTransportConnectError> {
         let (identity, start_permit) = identity.into_transport_parts();
         let authenticator = Arc::new(MachineLinkAuthenticator::new(
@@ -4232,6 +4267,7 @@ impl RemoteTransport {
             machine_route,
             authenticator,
             Some(start_permit),
+            business_startup,
             &RelayControlConnector,
         )
         .await
@@ -4242,6 +4278,7 @@ impl RemoteTransport {
         machine_route: MachineRouteId,
         authenticator: Arc<MachineLinkAuthenticator>,
         start_permit: Option<RemoteStartPermit>,
+        business_startup: BusinessLaneStartup,
         connector: &dyn ControlConnector,
     ) -> Result<Self, RemoteTransportConnectError> {
         RemoteTransportRetryState {
@@ -4249,6 +4286,7 @@ impl RemoteTransport {
             machine_route,
             authenticator,
             start_permit,
+            business_startup,
         }
         .connect_with_connector(connector)
         .await
@@ -4641,6 +4679,7 @@ pub(super) fn active_pairing_transport_for_test(
             send_started,
             send_ready: send_ready_rx,
         }),
+        BusinessLaneStartup::Dormant,
     );
     supervisor
         .activate_pairing(&lane)
@@ -5485,6 +5524,19 @@ pub(crate) mod tests {
         incoming: Vec<OpaqueRouteFrame>,
         shutdown_gate: Option<Arc<ShutdownGate>>,
     ) -> ConnectedFixture {
+        connected_fixture_with_business_startup(
+            incoming,
+            shutdown_gate,
+            BusinessLaneStartup::Dormant,
+        )
+        .await
+    }
+
+    async fn connected_fixture_with_business_startup(
+        incoming: Vec<OpaqueRouteFrame>,
+        shutdown_gate: Option<Arc<ShutdownGate>>,
+        business_startup: BusinessLaneStartup,
+    ) -> ConnectedFixture {
         let root = SigningKey::from_seed(&[0x31; 32]);
         let link = SigningKey::from_seed(&[0x32; 32]);
         let link_verifying_key = link.verifying_key();
@@ -5526,10 +5578,16 @@ pub(crate) mod tests {
             RelayTlsPolicy::pinned_spki(vec![[0x51; 32]]).expect("valid pin policy"),
         )
         .expect("valid Relay config");
-        let transport =
-            RemoteTransport::connect_with_connector(config, ROUTE, authenticator, None, &connector)
-                .await
-                .expect("connect fake control session");
+        let transport = RemoteTransport::connect_with_connector(
+            config,
+            ROUTE,
+            authenticator,
+            None,
+            business_startup,
+            &connector,
+        )
+        .await
+        .expect("connect fake control session");
         ConnectedFixture {
             transport,
             harness,
@@ -6678,10 +6736,16 @@ pub(crate) mod tests {
             RelayTlsPolicy::pinned_spki(vec![[0x51; 32]]).expect("valid pin policy"),
         )
         .expect("valid Relay config");
-        let error =
-            RemoteTransport::connect_with_connector(config, ROUTE, authenticator, None, &connector)
-                .await
-                .expect_err("first connect must return retry ownership");
+        let error = RemoteTransport::connect_with_connector(
+            config,
+            ROUTE,
+            authenticator,
+            None,
+            BusinessLaneStartup::Dormant,
+            &connector,
+        )
+        .await
+        .expect_err("first connect must return retry ownership");
         assert_eq!(error.code(), "relay.client.offline");
         assert_eq!(owner_drops.load(Ordering::SeqCst), 0);
 
@@ -7144,6 +7208,54 @@ pub(crate) mod tests {
             assert_eq!(fixture.harness.session_drops.load(Ordering::SeqCst), 1);
             assert_eq!(fixture.owner_drops.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn active_startup_reservation_buffers_first_business_frame_before_lane_handoff() {
+        let device_route = DeviceRouteId::from_bytes([0x91; 16]);
+        let request_route = RequestRouteId::from_bytes([0x92; 16]);
+        let expected = Send {
+            device_route,
+            request_route,
+            sealed_blob: SealedBlob(vec![0x93]),
+        };
+        let mut fixture = connected_fixture_with_business_startup(
+            vec![frame(RelayFrameBody::Send(expected.clone()))],
+            None,
+            BusinessLaneStartup::Reserved,
+        )
+        .await;
+
+        let mut lane = fixture
+            .transport
+            .take_business_lane()
+            .expect("Active startup reservation hands off the unique business lane once");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), lane.next_event())
+                .await
+                .expect("reserved first business frame remains bounded")
+                .expect("reserved business lane remains healthy"),
+            Some(BusinessTransportEvent::Send(expected))
+        );
+        assert_eq!(fixture.transport.observed_failure_code(), None);
+
+        let shutdown_started = fixture.harness.shutdown_started.notified();
+        drop(lane);
+        fixture
+            .harness
+            .push_incoming(frame(RelayFrameBody::Send(Send {
+                device_route,
+                request_route: RequestRouteId::from_bytes([0x94; 16]),
+                sealed_blob: SealedBlob(vec![0x95]),
+            })));
+        tokio::time::timeout(Duration::from_secs(2), shutdown_started)
+            .await
+            .expect("dropped startup reservation restores fail-close");
+        assert_eq!(
+            fixture.transport.observed_failure_code().as_deref(),
+            Some("remote.transport.business_lane_unavailable")
+        );
+        fixture.transport.shutdown().await;
     }
 
     #[tokio::test]

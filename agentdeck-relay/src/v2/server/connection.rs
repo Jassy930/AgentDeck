@@ -24,7 +24,6 @@ use crate::v2::auth::{
     ChallengeRoute, ChallengeSource, PairingHello as AuthorizationPairingHello,
     authorize_pairing_route,
 };
-use crate::v2::core::writer::WriterCloseResult;
 use crate::v2::core::{RelayCore, WriterCloseReason, WriterHandle, WriterReceiver};
 
 /// HTTP/WS listener 与 codec 共用的硬上限。listener 必须在聚合分片时也应用该值。
@@ -240,7 +239,7 @@ async fn writer_loop(
     mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
     mut receiver: WriterReceiver,
     shutdown: CancellationToken,
-) {
+) -> futures_util::stream::SplitSink<WebSocket, Message> {
     loop {
         let delivery = tokio::select! {
             biased;
@@ -262,7 +261,7 @@ async fn writer_loop(
         }
         delivery.mark_flushed();
     }
-    let _ = tokio::time::timeout(Duration::from_millis(250), sink.close()).await;
+    sink
 }
 
 async fn principal_handshake(
@@ -517,7 +516,7 @@ pub(crate) async fn run_connection(accepted: AcceptedConnection, services: Conne
     let socket_writer = writer_loop(sink, receiver, connection_shutdown.clone());
     tokio::pin!(reader);
     tokio::pin!(socket_writer);
-    tokio::select! {
+    let mut socket_sink = tokio::select! {
         result = &mut reader => {
             if let Err(error) = result {
                 tracing::warn!(
@@ -526,22 +525,24 @@ pub(crate) async fn run_connection(accepted: AcceptedConnection, services: Conne
                     "Relay v2 connection rejected an inbound frame"
                 );
             }
-            if matches!(
-                writer.close_unless_terminalizing(WriterCloseReason::Disconnected),
-                WriterCloseResult::TerminalInProgress
-            ) {
-                // terminal-only reauth / revoke race：reader 退出不能覆盖 terminal。
-                // receiver 继续独占写出，直到 flush 自动 close 或 Core 2s deadline。
-                (&mut socket_writer).await;
-            }
+            // terminal-only reauth / revoke race：reader 退出不能覆盖 terminal。
+            // receiver 继续独占写出，直到 flush 自动 close 或 Core 2s deadline。
+            let _ = writer.close_unless_terminalizing(WriterCloseReason::Disconnected);
+            (&mut socket_writer).await
         }
-        _ = &mut socket_writer => {}
-        _ = services.shutdown.cancelled() => {}
-    }
+        sink = &mut socket_writer => sink,
+        _ = services.shutdown.cancelled() => {
+            connection_shutdown.cancel();
+            (&mut socket_writer).await
+        }
+    };
     connection_shutdown.cancel();
     let _ = writer.close_unless_terminalizing(WriterCloseReason::Disconnected);
     let _ = services.core.disconnect(connection).await;
     services.book.remove(connection);
+    // WebSocket Close 是 machine process-exit 的确认屏障：只有 Core cleanup（包括
+    // dependent-device reconnect）完成后才向 peer 回 Close。
+    let _ = tokio::time::timeout(Duration::from_millis(250), socket_sink.close()).await;
 }
 
 #[cfg(test)]

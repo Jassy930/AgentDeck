@@ -766,6 +766,74 @@ async fn production_v2_client_authenticates_against_the_real_relay_listener() {
 }
 
 #[tokio::test]
+async fn confirmed_machine_shutdown_completes_device_reconnect_cut_before_return() {
+    let temp = TempDir::new().expect("tempdir");
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("generate localhost TLS certificate");
+    let cert_path = temp.path().join("shutdown-confirmed-cert.pem");
+    let key_path = temp.path().join("shutdown-confirmed-key.pem");
+    std::fs::write(&cert_path, certified.cert.pem()).expect("write test certificate");
+    std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("write test key");
+    let certificate_der = certified.cert.der().to_vec();
+    let (_, certificate) =
+        X509Certificate::from_der(&certificate_der).expect("parse test certificate");
+    let spki_pin: [u8; 32] = Sha256::digest(certificate.tbs_certificate.subject_pki.raw).into();
+
+    let (mut config, _) = server_config(&temp);
+    config.transport = RelayV2TransportMode::DirectTls(RelayV2TlsPaths {
+        cert: cert_path,
+        key: key_path,
+    });
+    let realm = Arc::new(seed_realm(&config, false).await);
+    let handle = RelayV2ServerHandle::start(config)
+        .await
+        .expect("start real Relay listener");
+    let client_config = RelayV2ClientConfig::new(
+        &format!("wss://localhost:{}/", handle.public_addr().port()),
+        realm.relay_server_id,
+        RelayTlsPolicy::pinned_spki(vec![spki_pin]).expect("pinned policy"),
+    )
+    .expect("client config");
+    let authenticator: Arc<dyn LinkAuthenticator> = Arc::new(ClientMachineAuthenticator {
+        realm: Arc::clone(&realm),
+    });
+    let mut machine = RelayV2Client::connect(client_config, authenticator)
+        .await
+        .expect("authenticate production machine client");
+
+    let (mut device, _) = timeout(
+        IO_TIMEOUT,
+        connect_result(handle.public_addr(), "/v2/connect", certificate_der),
+    )
+    .await
+    .expect("device WSS handshake timeout")
+    .expect("device WSS exact certificate pin");
+    let challenge = hello_challenge(&mut device).await;
+    device
+        .send(Message::Binary(
+            encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::Authenticate(realm.device_authenticate(&challenge)),
+            })
+            .into(),
+        ))
+        .await
+        .expect("send active device Authenticate");
+    assert!(matches!(
+        receive_relay_frame(&mut device).await.body,
+        RelayFrameBody::Authenticated(_)
+    ));
+
+    machine.shutdown_confirmed().await;
+    assert_rejected_without_application_binary(device).await;
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown real Relay listener");
+}
+
+#[tokio::test]
 async fn real_relay_terminal_miss_then_close_converges_for_offline_and_lost_ack_replay() {
     let temp = TempDir::new().expect("tempdir");
     let (config, _) = server_config(&temp);

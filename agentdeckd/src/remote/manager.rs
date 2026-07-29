@@ -82,8 +82,8 @@ use super::transition_owner::{
     TransitionProgress, TransitionReadiness,
 };
 use super::transport::{
-    AuthenticatedBusinessReconnects, BusinessTransportLane, MachineDataAuthority,
-    PairingRuntimeParts, RemoteTransport, RemoteTransportConnectError,
+    AuthenticatedBusinessReconnects, BusinessLaneStartup, BusinessTransportLane,
+    MachineDataAuthority, PairingRuntimeParts, RemoteTransport, RemoteTransportConnectError,
 };
 use super::trust_reset::{MachineTrustResetWorkflow, MachineTrustResetWorkflowError};
 use super::workflow::MachineEnrollmentWorkflow;
@@ -1408,11 +1408,17 @@ impl RemoteManager {
             .take()
             .expect("identity presence checked under the manager mutex");
         let pairing_connection = connection.clone();
+        let business_startup = if data_cert.is_some() {
+            BusinessLaneStartup::Reserved
+        } else {
+            BusinessLaneStartup::Dormant
+        };
         match RemoteTransport::connect(
             identity.arm(permit),
             client_config,
             agentdeck_protocol::relay_v2::MachineRouteId::from_bytes(record.machine_route),
             link_cert,
+            business_startup,
         )
         .await
         {
