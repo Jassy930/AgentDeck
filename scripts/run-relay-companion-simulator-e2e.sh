@@ -105,6 +105,26 @@ pid_is_zombie() {
   [[ "$state" == Z* ]]
 }
 
+collect_owned_pid_tree() {
+  local pid="$1"
+  local child
+  local started
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    collect_owned_pid_tree "$child"
+  done
+  started="$(ps -o lstart= -p "$pid" 2>/dev/null || true)"
+  [[ -n "$started" ]] && printf '%s|%s\n' "$pid" "$started"
+}
+
+pid_identity_matches() {
+  local pid="$1"
+  local expected_started="$2"
+  local actual_started
+  actual_started="$(ps -o lstart= -p "$pid" 2>/dev/null || true)"
+  [[ -n "$expected_started" && "$actual_started" == "$expected_started" ]]
+}
+
 terminate_owned_pid() {
   local pid="$1"
   local child
@@ -164,6 +184,18 @@ wait_for_ui_lifecycle_fence() {
 }
 
 force_stop_host() {
+  local owned_pid
+  local owned_root_pid=""
+  local owned_started
+  local owned_pid_tree=""
+  if pid_is_alive "$cargo_pid"; then
+    owned_root_pid="$cargo_pid"
+  elif pid_is_alive "$host_pid"; then
+    owned_root_pid="$host_pid"
+  fi
+  if [[ -n "$owned_root_pid" ]]; then
+    owned_pid_tree="$(collect_owned_pid_tree "$owned_root_pid")"
+  fi
   if pid_is_alive "$cargo_pid"; then
     terminate_owned_pid "$cargo_pid"
     if ! wait_until_absent "$cargo_pid" 5; then
@@ -179,6 +211,19 @@ force_stop_host() {
       kill -KILL "$host_pid" >/dev/null 2>&1 || true
     fi
   fi
+  while IFS='|' read -r owned_pid owned_started; do
+    [[ -n "$owned_pid" ]] || continue
+    if pid_identity_matches "$owned_pid" "$owned_started" \
+      && pid_is_alive "$owned_pid" && ! pid_is_zombie "$owned_pid"; then
+      kill -KILL "$owned_pid" >/dev/null 2>&1 || true
+    fi
+  done <<<"$owned_pid_tree"
+  while IFS='|' read -r owned_pid owned_started; do
+    [[ -n "$owned_pid" ]] || continue
+    if pid_identity_matches "$owned_pid" "$owned_started"; then
+      wait_until_absent "$owned_pid" 5 || true
+    fi
+  done <<<"$owned_pid_tree"
   if [[ -n "$cargo_pid" ]]; then
     wait "$cargo_pid" >/dev/null 2>&1 || true
   fi
