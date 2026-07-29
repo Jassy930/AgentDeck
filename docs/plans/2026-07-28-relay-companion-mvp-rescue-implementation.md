@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；daemon restart replacement 竞态修复后第五次 replacement R4.7 已冻结，R4.8 pending；R5 暂停 |
+| 状态 | In execution；daemon restart handoff 修复后第六次 replacement R4.7 已冻结，R4.8 pending；R5 暂停 |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -378,6 +378,55 @@ gitStatus:
   三次 fresh lifecycle、完整 `p5`、`p4-auto`、双路 review 与 cleanup。外部槽位继续保持 versioned post-MVP
   `BLOCKED`。
 
+### R4.8 daemon restart close-handshake / startup reservation 重开（2026-07-30）
+
+- 第五次 replacement candidate `cfa90b6` 的首轮 fresh lifecycle PASS，但第二轮仍在 daemon generation `2`
+  读回 machine lifecycle `active`、writers/subscriptions/jobs `1/0/0`，最终以
+  `host.restart.business_not_ready` 失败。因此 `cfa90b6` 及其所有局部、重复性和 aggregate 结果失效，禁止拼接到
+  新 candidate。该反例证明仅保留 writer 的 `Disconnected` close reason 仍不足以闭合 process-exit 时序。
+- 第一层修复把 final process shutdown 与内部 reconnect 分开：Relay client 的 final shutdown 等待 peer WebSocket
+  Close，server 仅在 `Core::disconnect()` 和 dependent-device cleanup 完成后回 Close；内部 reconnect 继续使用原
+  快速 shutdown 路径。真实 TLS 回归
+  `confirmed_machine_shutdown_completes_device_reconnect_cut_before_return` 固定 machine shutdown 返回前 device 已被
+  当前 generation 拒绝。该屏障随后把失败推进为 `remote.transport.business_lane_unavailable`，证明 device generation
+  已刷新，但 fresh machine 的业务栈仍存在更靠后的启动窗口。
+- `arm()` 与 `enroll()` 虽都能请求 business startup，但由 `business_start_singleflight` 串行，重复领取不是根因。
+  真正窗口是 Active MachineLink 已认证且 pairing owner 正在启动时，supervisor reader 已可收到重连 device 的首个
+  `Send/RouteAccepted`，唯一 business lane 尚未激活，因而按未领取规则主动断开。修复只为具有 Data certificate 的
+  Active recovery/enroll 连接在 reader task 启动前建立唯一 startup reservation；首帧仍进入既有 512 条 / 16 MiB
+  有界队列，不触达 Runtime。Dormant/Retire 路径、未领取 lane、reservation drop 和 retry rollback 继续 fail-close。
+- replacement implementation commit 为 `46614b2c10c5e67f5bf3ca8e744c31a648c9858a`，tree 为
+  `5a910ffc2263d59645e185e2cff8c5159ca3799f`，相对本地 `master` 为 `0 behind / 297 ahead`。本切片冻结 5-path
+  code/test manifest，tracked docs 不进入 hash：
+
+```bash
+restart_handoff_manifest=(
+  agentdeck-relay-client/src/v2/connection.rs
+  agentdeck-relay/src/v2/server/connection.rs
+  agentdeck-relay/tests/relay_v2_tls_e2e.rs
+  agentdeckd/src/remote/manager.rs
+  agentdeckd/src/remote/transport.rs
+)
+test "${#restart_handoff_manifest[@]}" -eq 5
+for manifest_item in "${restart_handoff_manifest[@]}"; do
+  test -f "$manifest_item" || exit 1
+  printf 'blob %s %s\n' "$(git hash-object "$manifest_item")" "$manifest_item"
+done | LC_ALL=C sort | shasum -a 256
+```
+
+- manifest SHA-256 为 `7beefc9623398f2ef8527f2bbde624e11ed85332a39b504d1d4e8b23b4ecf185`。fresh focused
+  gates：transport `57/57`、RelayClient `10/10`、server connection `4/4`、TLS shutdown cut `1/1`、manager
+  rollback `1/1`；4 组 scoped warnings-as-errors Clippy、fmt、network/no-net、protocol ownership、agent docs 与
+  diff 全部 exit 0。
+- 未提交 implementation 连续三次 fresh lifecycle 均在 daemon generation `2` 精确读回 restart marker、history
+  recovery、command `1/1`、approval `1/1`、revoke `1`、active grant `0`、Relay plaintext absent 与完整 cleanup
+  absent。随后完整 `p5` exit 0：SessionSource `25/25`、RelayClient
+  `457 executed / 4 external entitlement skipped / 0 failed`，两个外部槽位仍按合同 `BLOCKED`。这些结果只证明
+  implementation 具备重新冻结资格，不计作新 committed candidate 的 R4.8/R4.9 证据。
+- 本次只更新本计划与 `docs/QUALITY.md`，以 docs-only scoped commit 第六次生成 replacement R4.7 candidate。
+  提交后必须读回 commit/tree/clean status，并从零连续执行三次 fresh lifecycle、完整 `p5`、`p4-auto`、双路
+  review 与 cleanup；任何仓库修改都会使计数再次失效。外部槽位继续保持 versioned post-MVP `BLOCKED`。
+
 ### Automatic gates
 
 ```bash
@@ -661,7 +710,7 @@ git diff --check
 - [x] R4.4：client/daemon relaunch、cursor/backfill reconnect 与 revoke terminal。
 - [x] R4.5：外部 runner 严格只读 BLOCKED preflight，固定以 exit 78 表示预期未解锁。
 - [x] R4.6：扩展 verifier `p5`；automatic 缺失/失败必须非零，外部 BLOCKED 不计入 PASS。
-- [x] R4.7：daemon restart replacement reconnect 修复后重新同步文档并提交第五次 replacement
+- [x] R4.7：daemon restart close-handshake / startup reservation 修复后重新同步文档并提交第六次 replacement
   implementation candidate。
 - [ ] R4.8：在 replacement committed candidate 上从零连续执行三次 fresh E2E。
 - [ ] R4.9：同一 replacement candidate 执行完整 `p5`/`p4-auto`、双路 review、cleanup 与 clean status；若修改
@@ -875,7 +924,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
-| R4 Simulator E2E | in progress（reopened） | replacement implementation `1049cc8` / tree `3b7c78e`；1-path hash `ce8b002` | focused `1/1`、Relay `server,tls` unit `130/130` + TLS E2E `13/13`、完整 `p5`、Clippy/format/diff PASS | `20502c3` 虽已有三轮 lifecycle PASS，但完整 `p5` 在 restart 后读回 writers/subscriptions/jobs `1/0/0` 并以 `host.restart.business_not_ready` 失败；新 implementation `p5` PASS 仅作资格门禁 | 既有双路 review再次失效；replacement review 待 R4.9 | implementation 已 exact commit；本次 docs-only commit 生成第五次 replacement R4.7；未 push |
-| R5 MVP 收口 | paused | `5966c98`、`0f601ae`、`f7d2e68`、`eaa1c5a`、`20502c3` 均已失效 | 既有 R5.2、R4.8 与 implementation 全量结果只作诊断/实现门禁，不可拼接 | 旧 PID 54930 已精确清理；当前 implementation `p5` cleanup PASS | 必须等待第五次 replacement R4.9 | 回到 R4.8；R5.1–R5.6 全部重跑 |
+| R4 Simulator E2E | in progress（reopened） | replacement implementation `46614b2` / tree `5a910ff`；5-path hash `7beefc9` | transport `57/57`、RelayClient `10/10`、server `4/4`、TLS `1/1`、连续三轮 WIP lifecycle 与完整 `p5`、scoped Clippy/静态门禁 PASS | `cfa90b6` 首轮 PASS、第二轮在 generation 2 以 `host.restart.business_not_ready` 失败；新 implementation 三轮均读回 command/approval/revoke 和 cleanup，但只作冻结资格 | 既有双路 review再次失效；replacement review 待 R4.9 | implementation 已 exact commit；本次 docs-only commit 生成第六次 replacement R4.7；未 push |
+| R5 MVP 收口 | paused | `5966c98`、`0f601ae`、`f7d2e68`、`eaa1c5a`、`20502c3`、`cfa90b6` 均已失效 | 既有 R5.2、R4.8 与 implementation 全量结果只作诊断/实现门禁，不可拼接 | 当前 implementation 三轮 lifecycle 与 `p5` cleanup PASS | 必须等待第六次 replacement R4.9 | 回到 R4.8；R5.1–R5.6 全部重跑 |
 
 状态只能按实际证据更新。focused PASS 不得把 Phase 标为 complete；外部 BLOCKED 不得改写为 PASS。

@@ -4129,6 +4129,60 @@ host/root/invite/socket/Simulator cleanup 全部 absent；SessionSource `25/25`�
 lifecycle、完整 `p5`/`p4-auto`、双路 review 与 cleanup。物理 iPhone、第二台 Mac、公网 WSS、真实 vendor 与
 production signing 继续保持 versioned post-MVP `BLOCKED`，不计 PASS。
 
+## Relay Companion MVP rescue R4.8 daemon restart handoff 再次重开
+
+第五次 replacement candidate `cfa90b6` 的首轮 fresh lifecycle PASS，第二轮却仍在 daemon generation `2`
+读回 machine lifecycle `active`、writers/subscriptions/jobs `1/0/0`，最终以
+`host.restart.business_not_ready` 失败。`cfa90b6` 及其所有局部、重复性和 aggregate 结果因此失效；仅保留
+writer 的 first-writer-wins `Disconnected` 不是完整 process-exit fence。
+
+修复把 final shutdown 与内部 reconnect 分离：Relay client final shutdown 等待 peer WebSocket Close；server 只在
+`Core::disconnect()` 与 dependent-device cleanup 完成后回 Close。内部 reconnect 仍使用原快速路径，不增加协议、
+Runtime、storage 或新运行平台。真实 TLS 回归
+`confirmed_machine_shutdown_completes_device_reconnect_cut_before_return` 固定 machine shutdown 返回前的 device
+generation cut。该屏障将下一处失败推进为 `remote.transport.business_lane_unavailable`：fresh machine 已认证、
+pairing owner 正在启动时，重连 device 的首个 `Send/RouteAccepted` 可能先于 business lane activation 到达。
+
+`arm()` 与 `enroll()` 的 business startup 由同一 singleflight 串行，重复领取不是根因。Active recovery/enroll 现在
+只在存在 Data certificate 时，于 supervisor reader task 启动前建立唯一 startup reservation；首帧仍受现有 512 条 /
+16 MiB 双预算约束，且 business owner 接管前不触达 Runtime。Dormant/Retire、真正未领取 lane、reservation drop 与
+startup rollback 继续 fail-close，确定性回归同时读回 reservation 前首帧与 drop 后
+`remote.transport.business_lane_unavailable`。
+
+replacement implementation commit 为 `46614b2c10c5e67f5bf3ca8e744c31a648c9858a`，tree 为
+`5a910ffc2263d59645e185e2cff8c5159ca3799f`，相对本地 `master` 为 `0 behind / 297 ahead`。5-path
+code/test manifest 可复算为：
+
+```bash
+restart_handoff_manifest=(
+  agentdeck-relay-client/src/v2/connection.rs
+  agentdeck-relay/src/v2/server/connection.rs
+  agentdeck-relay/tests/relay_v2_tls_e2e.rs
+  agentdeckd/src/remote/manager.rs
+  agentdeckd/src/remote/transport.rs
+)
+test "${#restart_handoff_manifest[@]}" -eq 5
+for manifest_item in "${restart_handoff_manifest[@]}"; do
+  test -f "$manifest_item" || exit 1
+  printf 'blob %s %s\n' "$(git hash-object "$manifest_item")" "$manifest_item"
+done | LC_ALL=C sort | shasum -a 256
+```
+
+SHA-256 固定为 `7beefc9623398f2ef8527f2bbde624e11ed85332a39b504d1d4e8b23b4ecf185`。fresh focused
+结果为 transport `57/57`、RelayClient `10/10`、server connection `4/4`、TLS shutdown cut `1/1`、manager
+rollback `1/1`。4 组 scoped warnings-as-errors Clippy、Rust format、daemon network/no-net、protocol ownership、
+agent docs 与 diff 全部 exit 0。
+
+未提交 implementation 连续三轮 fresh lifecycle 均 PASS：daemon generation `2`、restart marker、history recovery、
+command `1/1`、approval `1/1`、revoke `1`、active grant `0`、Relay plaintext absent，host/root/invite/socket/Simulator
+cleanup 全部 absent。随后完整 `p5` exit 0：SessionSource `25/25`、RelayClient
+`457 executed / 4 external entitlement skipped / 0 failed`；物理 iPhone 与第二台 Mac 继续按合同 `BLOCKED`。
+
+这些结果只证明 implementation 具备重新冻结资格，不计作新 committed candidate 的 R4.8/R4.9 证据。本节与
+rescue implementation 计划用 docs-only scoped commit 第六次生成 replacement R4.7 candidate；提交后必须读回
+commit/tree/clean status，并从零连续执行三次 fresh lifecycle、完整 `p5`/`p4-auto`、双路 review 与 cleanup。
+任何仓库修改都会使计数再次失效；外部槽位继续保持 versioned post-MVP `BLOCKED`。
+
 ## Relay Companion MVP rescue R0 基线冻结证据
 
 R0 只冻结事实、执行入口和既有 automatic baseline，不修改生产代码，也不提前执行 master merge、协议治理或
