@@ -607,6 +607,7 @@ final class PairingViewController: UIViewController, UITableViewDataSource, UITa
     content.textProperties.color = DesignTokens.text
     content.secondaryTextProperties.color = DesignTokens.text2
     cell.contentConfiguration = content
+    cell.accessibilityIdentifier = "pairing.machine.\(machine.id)"
     return cell
   }
 

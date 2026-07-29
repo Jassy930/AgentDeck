@@ -2082,6 +2082,7 @@ async fn send_reply_are_online_role_bound_trust_bound_and_do_not_require_a_seen_
         .disconnect(machine_a.access.connection_instance())
         .await
         .expect("machine goes offline");
+    assert_receiver_closed(&mut device_a).await;
     let machine_offline = fixture
         .core
         .handle(
@@ -2089,8 +2090,8 @@ async fn send_reply_are_online_role_bound_trust_bound_and_do_not_require_a_seen_
             send_frame(device_a_route, request_route(6), vec![0x47]),
         )
         .await
-        .expect_err("Send is online-only");
-    assert_eq!(machine_offline.code, RELAY_ROUTE_NOT_FOUND);
+        .expect_err("machine generation loss invalidates the old device generation");
+    assert_eq!(machine_offline.code, RELAY_AUTH_INVALID_GRANT);
 
     fixture
         .core

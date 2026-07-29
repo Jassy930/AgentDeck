@@ -213,6 +213,20 @@ final class RelayResumeTests: XCTestCase {
     )
     XCTAssertEqual(warm.requestedCursor, .at(41))
 
+    var reconnect = warm
+    reconnect.beginRecovery(resumeCommittedProjection: true)
+    XCTAssertEqual(
+      reconnect.requestedCursor,
+      .at(41),
+      "fresh transport recovery 必须保留真实进程内 baseline cursor"
+    )
+    reconnect.beginRecovery()
+    XCTAssertEqual(
+      reconnect.requestedCursor,
+      .beforeFirst,
+      "cursor-gap/snapshot-required recovery 必须继续 fail-closed 到 fresh snapshot"
+    )
+
     XCTAssertThrowsError(
       try RelayConversationResumeCoordinator(
         machineID: "machine-1",
@@ -247,6 +261,21 @@ final class RelayResumeTests: XCTestCase {
     XCTAssertEqual(noOp.committedProjection?.cursor, .at(41))
     XCTAssertNil(noOp.synchronizedSnapshot)
     XCTAssertTrue(noOp.synchronizedEvents.isEmpty)
+    XCTAssertEqual(
+      try noOp.accept(
+        delivery(
+          generation: generation,
+          outerCursor: .at(11),
+          payload: .publicationOverlap
+        )
+      ),
+      .publicationOverlap
+    )
+    XCTAssertEqual(
+      noOp.committedProjection?.cursor,
+      .at(41),
+      "publication overlap 只补 durable outer，不得重复修改已同步 projection"
+    )
   }
 
   func testBarrierMismatchAndFailedStagingNeverSwapCommittedProjection() throws {

@@ -175,6 +175,7 @@ pub(crate) struct ConnectionCleanup {
     pub connection: ConnectionInstanceId,
     pub access: Option<AccessContext>,
     pub principal: Option<PrincipalRoute>,
+    pub close_reason: WriterCloseReason,
 }
 
 impl std::fmt::Debug for ConnectionCleanup {
@@ -184,6 +185,7 @@ impl std::fmt::Debug for ConnectionCleanup {
             .field("connection", &self.connection.redacted())
             .field("has_access", &self.access.is_some())
             .field("principal", &self.principal)
+            .field("close_reason", &self.close_reason)
             .finish()
     }
 }
@@ -1025,7 +1027,32 @@ impl ConnectionRegistry {
             connection,
             access,
             principal,
+            close_reason: reason,
         })
+    }
+
+    /// Machine endpoint 的进程/transport generation 消失或重新 activation 后，旧 device
+    /// connection 上的 runtime subscription 不会被新 machine generation 自动继承。Relay
+    /// 必须关闭同一 machine 下的 active/pending device writers，让既有 device supervisor
+    /// 重新鉴权并 fresh-subscribe；只关闭内存连接态，不改 grant、stream 或密文持久化。
+    pub(crate) fn close_devices_for_machine(
+        &mut self,
+        machine: MachineRouteId,
+        reason: WriterCloseReason,
+    ) -> Vec<ConnectionCleanup> {
+        let devices = self
+            .entries
+            .iter()
+            .filter_map(|(connection, entry)| {
+                (is_device_for_machine(entry.access.as_ref(), machine)
+                    || is_device_principal_for_machine(entry.pending_principal, machine))
+                .then_some(*connection)
+            })
+            .collect::<Vec<_>>();
+        devices
+            .into_iter()
+            .filter_map(|connection| self.remove_and_close(connection, reason))
+            .collect()
     }
 
     pub(crate) fn remove_if_access_and_close(
@@ -1202,6 +1229,16 @@ fn next_after_cursor(cursor: StreamCursor) -> Option<u64> {
 fn is_device_for_machine(access: Option<&AccessContext>, machine: MachineRouteId) -> bool {
     matches!(
         access.and_then(AccessContext::principal_route),
+        Some(PrincipalRoute::Device { machine_route, .. }) if machine_route == machine
+    )
+}
+
+fn is_device_principal_for_machine(
+    principal: Option<PrincipalRoute>,
+    machine: MachineRouteId,
+) -> bool {
+    matches!(
+        principal,
         Some(PrincipalRoute::Device { machine_route, .. }) if machine_route == machine
     )
 }
@@ -1671,9 +1708,72 @@ mod tests {
             .expect("cleanup");
         assert_eq!(cleanup.connection, connection(6));
         assert!(cleanup.principal.is_some());
+        assert_eq!(cleanup.close_reason, WriterCloseReason::Shutdown);
         assert!(replay.cancel.is_cancelled());
         assert_eq!(writer.close_reason(), Some(WriterCloseReason::Shutdown));
         assert!(!registry.contains(connection(6)));
+    }
+
+    #[test]
+    fn machine_generation_loss_closes_only_its_device_connections() {
+        let mut registry = ConnectionRegistry::new(1);
+        let (same_writer, _same_receiver) = WriterHandle::channel();
+        let (pending_writer, _pending_receiver) = WriterHandle::channel();
+        let (other_writer, _other_receiver) = WriterHandle::channel();
+        let same = device_access(6, 7);
+        let other = device_access(8, 9);
+        for (access, writer) in [
+            (same.clone(), same_writer.clone()),
+            (other.clone(), other_writer.clone()),
+        ] {
+            registry
+                .attach_pending(access.connection_instance(), writer, 0)
+                .expect("attach device");
+            registry
+                .activate(access, 0, WriterCloseReason::Explicit)
+                .expect("activate device");
+        }
+        let pending = connection(10);
+        registry
+            .attach_pending(pending, pending_writer.clone(), 0)
+            .expect("attach pending device");
+        registry
+            .note_activation(
+                pending,
+                PrincipalRoute::Device {
+                    machine_route: machine(7),
+                    device_route: device(10),
+                },
+            )
+            .expect("note pending device principal");
+
+        let cleanups =
+            registry.close_devices_for_machine(machine(7), WriterCloseReason::Disconnected);
+
+        assert_eq!(cleanups.len(), 2);
+        assert!(
+            cleanups
+                .iter()
+                .any(|cleanup| cleanup.connection == same.connection_instance())
+        );
+        assert!(cleanups.iter().any(|cleanup| cleanup.connection == pending));
+        assert!(
+            cleanups
+                .iter()
+                .all(|cleanup| cleanup.close_reason == WriterCloseReason::Disconnected)
+        );
+        assert_eq!(
+            same_writer.close_reason(),
+            Some(WriterCloseReason::Disconnected)
+        );
+        assert_eq!(
+            pending_writer.close_reason(),
+            Some(WriterCloseReason::Disconnected)
+        );
+        assert_eq!(other_writer.close_reason(), None);
+        assert!(!registry.contains(same.connection_instance()));
+        assert!(!registry.contains(pending));
+        assert!(registry.contains(other.connection_instance()));
     }
 
     #[test]

@@ -3682,6 +3682,72 @@ Relay DB/WAL/SHM 不含三个业务 sentinel 明文。cold build timeout 与瞬�
 `5561551ea1a2678c8bc14cb950efa359c1728f86a6c4832e0f8f4f1de17f090d`。本证据只关闭 R4.3；默认完整入口
 继续 exit 1 + `INCOMPLETE`，R4.4 reconnect/revoke、R4.5–R4.9、P5.9 与 P5 automatic Phase Exit 仍未完成。
 
+## Relay Companion MVP rescue R4.4 lifecycle-smoke
+
+R4.4 复用已有 `p57_real_dual_scope_ndjson_host`、真实 daemon/RemoteLink/RuntimeCore、production Swift
+Relay client 和 iOS UI；没有新建本地 runtime/platform，也没有修改 Runtime v5、Relay v2、E2EE v1、
+IPC schema 或 Runtime DB physical schema。runner 的 `--lifecycle-smoke` 与默认入口现在都完成下列闭环：
+
+```text
+pair/local approve → list/open → prompt/approval terminal
+→ daemon restart → client relaunch → durable cursor/backfill recovery
+→ signed revoke terminal → credential/grant absence → owned cleanup
+```
+
+这个切片同时收窄了两个重连边界：Relay 只在 machine writer 以 `Disconnected`、
+`AuthorizationInvalidated` 或 `HeartbeatTimeout` 失去时级联关闭所属 device，普通慢读者背压
+不再关闭 request origin，cleanup 保留原始 close reason。Swift source 只对真正存在
+`committedProjection` 的 observation warm-resume；首次订阅失败、cursor gap 或无 baseline 仍轮换
+broadcaster generation 并要求 fresh snapshot。Runtime backfill 已覆盖的 Relay publication 只推进
+durable outer cursor，不重复 reduce 业务 item。
+
+```bash
+cargo test --no-fail-fast -- --test-threads=1
+cargo test -p agentdeck-relay --features server,tls \
+  --test relay_v2_route_e2e -- --test-threads=1
+cargo clippy -p agentdeck-relay --features server,tls \
+  --all-targets --no-deps -- -D warnings
+cargo clippy -p agentdeckd --lib --no-deps -- \
+  -D warnings \
+  -A clippy::too_many_arguments \
+  -A clippy::collapsible_if \
+  -A clippy::collapsible_str_replace
+cargo clippy -p agentdeckd --test relay_v2_machine_e2e --no-deps -- \
+  -D warnings \
+  -A clippy::too_many_arguments \
+  -A clippy::collapsible_if \
+  -A clippy::collapsible_str_replace
+cargo fmt --all -- --check
+bash -n scripts/run-relay-companion-simulator-e2e.sh \
+  scripts/tests/run-relay-companion-simulator-e2e.sh
+bash scripts/tests/run-relay-companion-simulator-e2e.sh
+bash scripts/run-relay-companion-simulator-e2e.sh --lifecycle-smoke
+bash scripts/check-daemon-network-boundary.sh
+bash scripts/check-daemon-no-net.sh
+bash scripts/verify-agentdeck-protocol-ownership.sh
+scripts/verify-agent-docs.sh
+git diff --check
+```
+
+完整 Rust aggregate exit 0：daemon unit `1711 passed / 3 ignored`，Relay route `15/15`、TLS `13/13`，
+workspace integration/doctest 零失败。fresh Swift warnings-as-errors 为
+`1167 XCTest / 4 skipped / 0 failed + 48 Swift Testing / 0 failed`；原 iOS scheme `133/133`。两组
+changed-file Swift strict format、scoped Clippy、Rust/Shell format、runner contract、network/no-net、protocol
+ownership、agent docs 与 diff 都通过。daemon lib Clippy 只沿用了未修改 Codex adapter 的三个已知
+Rust 1.96 lint 豁免；本轮新增 Relay code 未豁免 lint。
+
+fresh lifecycle 最终 JSON 精确读回 `daemonGeneration=2`、`clientRelaunchHistoryRecovered=true`、
+command `1/1 completed`、approval `1/1 applied`、revoked authorization `1`、grant `1 total / 0 active`、
+`relayPlaintextAbsent=true`，且 host PID/root、invite、UDS 和 owned Simulator 全部 absent。首个 fresh
+轮次暴露 R4.3 遗留的 30 秒 `businessReady` 窗口；诊断轮在同一代码上完整 PASS 后，
+只将该 readiness wait 调整为 90 秒，没有引入固定 sleep，xcode 提前退出仍立即 fail-close；
+调整后 fresh 轮次 PASS。
+
+20-path code/test/runner manifest SHA-256 为
+`383fa35e4476db10f7016f8dbb92a9bb11cd34423f7e5d94be12f287a4ffc927`；文档未进入 hash。本证据只关闭
+R4.4；R4.5–R4.9、完整 P5.9 与 P5 Phase Exit 仍未完成，物理 iPhone、第二台 Mac、公网和真实
+vendor 仍是 post-MVP `BLOCKED`。
+
 ## Relay Companion MVP rescue R0 基线冻结证据
 
 R0 只冻结事实、执行入口和既有 automatic baseline，不修改生产代码，也不提前执行 master merge、协议治理或

@@ -109,6 +109,29 @@ private struct CatalogActiveSubscription: Sendable {
   let generation: RuntimeStreamGeneration
 }
 
+private struct ConversationRecoveryOwner: Sendable, Equatable {
+  let conversationID: String
+  let requestID: RuntimeMessageID
+}
+
+private struct PendingConversationRecovery: Sendable {
+  let reason: SessionLagReason
+  /// 只有 fresh transport bootstrap 可以复用仍在进程内的 committed projection。
+  /// cursor-gap、snapshot-required 与本地 buffer overflow 必须继续从头快照。
+  let resumeCommittedProjection: Bool
+}
+
+/// daemon 每条 connection 只有一个 snapshot sender。fresh transport ready 后必须先让
+/// Catalog 到达 durable SyncComplete，再逐条恢复已经打开的 conversation；pending 集合
+/// 受 per-machine observation cap 约束，不会无界增长。
+private struct MachineBootstrapRecovery: Sendable {
+  let scope: TransferAssemblyScope
+  var catalogRequestID: RuntimeMessageID?
+  var catalogSynchronized = false
+  var pendingConversations: [String: PendingConversationRecovery]
+  var activeConversation: ConversationRecoveryOwner?
+}
+
 private struct BroadcastChannel<Element: Sendable>: Sendable {
   let broadcaster: BoundedBroadcaster<Element>
   let generation: BoundedBroadcastGeneration
@@ -224,6 +247,7 @@ public actor RelaySessionSource: SessionSource {
   private var catalogReducers: [String: CatalogReducer] = [:]
   private var catalogBootstraps: [String: CatalogBootstrap] = [:]
   private var catalogActiveSubscriptions: [String: CatalogActiveSubscription] = [:]
+  private var machineBootstrapRecoveries: [String: MachineBootstrapRecovery] = [:]
   private var updateTasks: [String: Task<Void, Never>] = [:]
   private var started = false
   private var shuttingDown = false
@@ -507,11 +531,18 @@ public actor RelaySessionSource: SessionSource {
           on: generation
         )
       }
-      await issueConversationSubscription(
+      if !enqueueConversationRecoveryDuringMachineBootstrap(
+        conversationID,
         machineID: machineID,
-        conversationID: runtimeID,
-        requestID: requestID
-      )
+        reason: .snapshotRequired
+      ) {
+        await issueConversationSubscription(
+          machineID: machineID,
+          conversationID: runtimeID,
+          after: resume.requestedCursor,
+          requestID: requestID
+        )
+      }
       return stream
     } catch {
       return terminalConversationStream(.securityError)
@@ -617,6 +648,7 @@ public actor RelaySessionSource: SessionSource {
     }
     shuttingDown = true
     lifecycleGeneration = UUID()
+    machineBootstrapRecoveries.removeAll(keepingCapacity: false)
 
     let tasks = updateTasks
     updateTasks.removeAll(keepingCapacity: false)
@@ -673,6 +705,14 @@ public actor RelaySessionSource: SessionSource {
 
   func debugRetainedConversationBootstrapItemCount(_ conversationID: String) -> Int? {
     conversationObservations[conversationID]?.resume.retainedBootstrapItemCount
+  }
+
+  func debugFatalConnectionState(_ machineID: String) -> SessionConnectionState? {
+    fatalConnectionStates[machineID]
+  }
+
+  func debugMachineBootstrapIsActive(_ machineID: String) -> Bool {
+    machineBootstrapRecoveries[machineID] != nil
   }
 
   func debugForceConversationRecovery(
@@ -764,17 +804,20 @@ public actor RelaySessionSource: SessionSource {
       if state != .connected {
         connectionScopes.removeValue(forKey: machineID)
         businessReadyScopes.removeValue(forKey: machineID)
+        machineBootstrapRecoveries.removeValue(forKey: machineID)
       }
 
     case .connectionScope(let scope):
       guard let scope else {
         connectionScopes.removeValue(forKey: machineID)
         businessReadyScopes.removeValue(forKey: machineID)
+        machineBootstrapRecoveries.removeValue(forKey: machineID)
         return
       }
       if connectionScopes[machineID] != scope {
         connectionScopes[machineID] = scope
         businessReadyScopes.removeValue(forKey: machineID)
+        machineBootstrapRecoveries.removeValue(forKey: machineID)
       }
 
     case .businessReady(let scope):
@@ -784,13 +827,31 @@ public actor RelaySessionSource: SessionSource {
         return
       }
       businessReadyScopes[machineID] = scope
-      await beginCatalogSubscription(machineID)
-      let conversationIDs = conversationObservations.compactMap { conversationID, observation in
-        observation.machineID == machineID ? conversationID : nil
+      let pending = conversationObservations.reduce(
+        into: [String: PendingConversationRecovery](),
+        { result, element in
+          if element.value.machineID == machineID {
+            result[element.key] = PendingConversationRecovery(
+              reason: .snapshotRequired,
+              resumeCommittedProjection: element.value.resume.committedProjection != nil
+            )
+          }
+        }
+      )
+      if pending.isEmpty {
+        machineBootstrapRecoveries.removeValue(forKey: machineID)
+      } else {
+        machineBootstrapRecoveries[machineID] = MachineBootstrapRecovery(
+          scope: scope,
+          catalogRequestID: nil,
+          pendingConversations: pending,
+          activeConversation: nil
+        )
       }
-      for conversationID in conversationIDs.sorted() {
-        await recoverConversation(conversationID, reason: .snapshotRequired)
-      }
+      await beginCatalogSubscription(
+        machineID,
+        resumeCommittedProjection: true
+      )
 
     case .streamRecoveryRequired(let target, let reason):
       switch target {
@@ -911,6 +972,16 @@ public actor RelaySessionSource: SessionSource {
     subscriptionRequestID: RuntimeMessageID
   ) async throws {
     switch delivery.payload {
+    case .publicationOverlap:
+      guard catalogBootstraps[machineID] == nil,
+        let active = catalogActiveSubscriptions[machineID],
+        active.requestID == subscriptionRequestID,
+        active.generation == delivery.streamGeneration
+      else {
+        throw RelaySourceReducerError.invalidBootstrapOrder
+      }
+      try await commitDelivery(delivery, machineID: machineID)
+
     case .typedReply(.subscription(let receipt)):
       guard var bootstrap = catalogBootstraps[machineID],
         bootstrap.requestID == subscriptionRequestID,
@@ -984,6 +1055,10 @@ public actor RelaySessionSource: SessionSource {
       )
       await publishMachines()
       await publishInbox()
+      await catalogDidSynchronize(
+        machineID: machineID,
+        requestID: subscriptionRequestID
+      )
 
     case .catalogDelta(let delta):
       guard catalogBootstraps[machineID] == nil,
@@ -1032,6 +1107,10 @@ public actor RelaySessionSource: SessionSource {
     let expectedStateToken = observation.stateToken
     let result = try observation.resume.accept(delivery)
     switch result {
+    case .publicationOverlap:
+      try await commitDelivery(delivery, machineID: delivery.machineID)
+      return
+
     case .staged, .suppressedUntilBarrier:
       try await commitDelivery(delivery, machineID: delivery.machineID)
       _ = await installCommittedObservation(
@@ -1072,6 +1151,11 @@ public actor RelaySessionSource: SessionSource {
       if updates.isEmpty {
         // warm exact-cursor resume 可合法只有 Subscribed + SyncComplete。已有
         // projection 与用户 outer stream 保持不变；BeforeFirst 仍由 coordinator 强制 snapshot。
+        await conversationRecoveryDidSynchronize(
+          machineID: delivery.machineID,
+          conversationID: conversationID.rawValue,
+          requestID: subscriptionRequestID
+        )
         return
       }
       if committed.awaitingBroadcastBarrier {
@@ -1119,6 +1203,11 @@ public actor RelaySessionSource: SessionSource {
           return
         }
       }
+      await conversationRecoveryDidSynchronize(
+        machineID: delivery.machineID,
+        conversationID: conversationID.rawValue,
+        requestID: subscriptionRequestID
+      )
 
     case .live:
       let update: ConversationUpdate
@@ -1191,21 +1280,91 @@ public actor RelaySessionSource: SessionSource {
     afterInvalidatingGeneration: (@Sendable () async -> Void)? = nil
   ) async {
     guard !shuttingDown,
+      let observation = conversationObservations[conversationID],
+      fatalConnectionStates[observation.machineID] == nil
+    else {
+      return
+    }
+    if let bootstrap = machineBootstrapRecoveries[observation.machineID],
+      bootstrap.scope == connectionScopes[observation.machineID],
+      bootstrap.scope == businessReadyScopes[observation.machineID]
+    {
+      if bootstrap.activeConversation?.conversationID != conversationID {
+        _ = enqueueConversationRecoveryDuringMachineBootstrap(
+          conversationID,
+          machineID: observation.machineID,
+          reason: reason
+        )
+        return
+      }
+      await startConversationRecovery(
+        conversationID,
+        reason: reason,
+        bootstrapScope: bootstrap.scope,
+        resumeCommittedProjection: false,
+        afterInvalidatingGeneration: afterInvalidatingGeneration
+      )
+      return
+    }
+    await startConversationRecovery(
+      conversationID,
+      reason: reason,
+      bootstrapScope: nil,
+      resumeCommittedProjection: false,
+      afterInvalidatingGeneration: afterInvalidatingGeneration
+    )
+  }
+
+  private func startConversationRecovery(
+    _ conversationID: String,
+    reason: SessionLagReason,
+    bootstrapScope: TransferAssemblyScope?,
+    resumeCommittedProjection: Bool,
+    afterInvalidatingGeneration: (@Sendable () async -> Void)? = nil
+  ) async {
+    guard !shuttingDown,
       var observation = conversationObservations[conversationID],
       fatalConnectionStates[observation.machineID] == nil
     else {
       return
     }
     let requestID = makeSubscriptionRequestID()
+    if let bootstrapScope {
+      guard var bootstrap = machineBootstrapRecoveries[observation.machineID],
+        bootstrap.scope == bootstrapScope,
+        bootstrap.catalogSynchronized,
+        bootstrap.activeConversation == nil
+          || bootstrap.activeConversation?.conversationID == conversationID
+      else {
+        return
+      }
+      bootstrap.pendingConversations.removeValue(forKey: conversationID)
+      bootstrap.activeConversation = ConversationRecoveryOwner(
+        conversationID: conversationID,
+        requestID: requestID
+      )
+      machineBootstrapRecoveries[observation.machineID] = bootstrap
+    }
     observation.subscriptionRequestID = requestID
-    observation.awaitingBroadcastBarrier = true
-    observation.resume.beginRecovery()
+    // fresh recovery 必须轮换 broadcaster generation，并用 snapshot 解除 barrier；warm
+    // transport reconnect 已持有 verified projection，只在 coordinator 内暂存增量即可。
+    // 若 exact cursor 没有增量，SyncComplete 本身就是完整 barrier，不能要求 daemon
+    // 重发旧 snapshot，也不能把用户 observation 留在 awaitingBarrier。
+    observation.awaitingBroadcastBarrier = !resumeCommittedProjection
+    observation.resume.beginRecovery(
+      resumeCommittedProjection: resumeCommittedProjection
+    )
     observation.stateToken = UUID()
     conversationObservations[conversationID] = observation
 
-    let broadcastGeneration = await observation.broadcaster.invalidateGeneration(
-      marker: .connectionState(.lagged(reason: reason))
-    )
+    let broadcastGeneration: BoundedBroadcastGeneration
+    if resumeCommittedProjection {
+      broadcastGeneration = observation.broadcastGeneration
+    } else {
+      broadcastGeneration = await observation.broadcaster.invalidateGeneration(
+        marker: .connectionState(.lagged(reason: reason))
+      )
+    }
     if let afterInvalidatingGeneration {
       await afterInvalidatingGeneration()
     }
@@ -1220,7 +1379,96 @@ public actor RelaySessionSource: SessionSource {
     await issueConversationSubscription(
       machineID: current.machineID,
       conversationID: RuntimeConversationID(rawValue: conversationID),
+      after: current.resume.requestedCursor,
       requestID: requestID
+    )
+  }
+
+  /// 返回 true 表示 exact machine bootstrap 已接管该 conversation，调用方不得并行
+  /// 发出 subscribe。重复请求只更新 reason，不扩大 pending 集合。
+  private func enqueueConversationRecoveryDuringMachineBootstrap(
+    _ conversationID: String,
+    machineID: String,
+    reason: SessionLagReason
+  ) -> Bool {
+    guard var bootstrap = machineBootstrapRecoveries[machineID],
+      bootstrap.scope == connectionScopes[machineID],
+      bootstrap.scope == businessReadyScopes[machineID]
+    else {
+      return false
+    }
+    if bootstrap.activeConversation?.conversationID != conversationID {
+      bootstrap.pendingConversations[conversationID] = PendingConversationRecovery(
+        reason: reason,
+        resumeCommittedProjection: false
+      )
+      machineBootstrapRecoveries[machineID] = bootstrap
+    }
+    return true
+  }
+
+  private func catalogDidSynchronize(
+    machineID: String,
+    requestID: RuntimeMessageID
+  ) async {
+    guard var bootstrap = machineBootstrapRecoveries[machineID],
+      bootstrap.catalogRequestID == requestID,
+      bootstrap.scope == connectionScopes[machineID],
+      bootstrap.scope == businessReadyScopes[machineID]
+    else {
+      return
+    }
+    bootstrap.catalogSynchronized = true
+    machineBootstrapRecoveries[machineID] = bootstrap
+    await startNextMachineBootstrapConversation(machineID: machineID)
+  }
+
+  private func conversationRecoveryDidSynchronize(
+    machineID: String,
+    conversationID: String,
+    requestID: RuntimeMessageID
+  ) async {
+    guard var bootstrap = machineBootstrapRecoveries[machineID],
+      bootstrap.scope == connectionScopes[machineID],
+      bootstrap.scope == businessReadyScopes[machineID],
+      bootstrap.activeConversation
+        == ConversationRecoveryOwner(
+          conversationID: conversationID,
+          requestID: requestID
+        )
+    else {
+      return
+    }
+    bootstrap.activeConversation = nil
+    machineBootstrapRecoveries[machineID] = bootstrap
+    await startNextMachineBootstrapConversation(machineID: machineID)
+  }
+
+  private func startNextMachineBootstrapConversation(machineID: String) async {
+    guard var bootstrap = machineBootstrapRecoveries[machineID],
+      bootstrap.scope == connectionScopes[machineID],
+      bootstrap.scope == businessReadyScopes[machineID],
+      bootstrap.catalogSynchronized,
+      bootstrap.activeConversation == nil
+    else {
+      return
+    }
+    bootstrap.pendingConversations = bootstrap.pendingConversations.filter {
+      conversationID, _ in
+      conversationObservations[conversationID]?.machineID == machineID
+    }
+    guard let conversationID = bootstrap.pendingConversations.keys.sorted().first,
+      let pending = bootstrap.pendingConversations.removeValue(forKey: conversationID)
+    else {
+      machineBootstrapRecoveries.removeValue(forKey: machineID)
+      return
+    }
+    machineBootstrapRecoveries[machineID] = bootstrap
+    await startConversationRecovery(
+      conversationID,
+      reason: pending.reason,
+      bootstrapScope: bootstrap.scope,
+      resumeCommittedProjection: pending.resumeCommittedProjection
     )
   }
 
@@ -1243,7 +1491,10 @@ public actor RelaySessionSource: SessionSource {
     await beginCatalogSubscription(machineID)
   }
 
-  private func beginCatalogSubscription(_ machineID: String) async {
+  private func beginCatalogSubscription(
+    _ machineID: String,
+    resumeCommittedProjection: Bool = false
+  ) async {
     guard !shuttingDown, fatalConnectionStates[machineID] == nil else { return }
     guard let currentScope = connectionScopes[machineID],
       businessReadyScopes[machineID] == currentScope
@@ -1251,13 +1502,25 @@ public actor RelaySessionSource: SessionSource {
       return
     }
     let requestID = makeSubscriptionRequestID()
+    let committedReducer = resumeCommittedProjection ? catalogReducers[machineID] : nil
+    let after = committedReducer?.cursor ?? .beforeFirst
+    if var recovery = machineBootstrapRecoveries[machineID],
+      recovery.scope == currentScope
+    {
+      recovery.catalogRequestID = requestID
+      recovery.catalogSynchronized = false
+      machineBootstrapRecoveries[machineID] = recovery
+    }
     catalogActiveSubscriptions.removeValue(forKey: machineID)
-    catalogBootstraps[machineID] = CatalogBootstrap(requestID: requestID)
+    catalogBootstraps[machineID] = CatalogBootstrap(
+      requestID: requestID,
+      stagedReducer: committedReducer
+    )
     do {
       try await commandClient.subscribe(
         machineID: machineID,
         target: .catalog,
-        after: .beforeFirst,
+        after: after,
         requestID: requestID
       )
     } catch {
@@ -1269,6 +1532,7 @@ public actor RelaySessionSource: SessionSource {
   private func issueConversationSubscription(
     machineID: String,
     conversationID: RuntimeConversationID,
+    after: RuntimeStreamCursorV1,
     requestID: RuntimeMessageID
   ) async {
     guard !shuttingDown, fatalConnectionStates[machineID] == nil else { return }
@@ -1281,7 +1545,7 @@ public actor RelaySessionSource: SessionSource {
       try await commandClient.subscribe(
         machineID: machineID,
         target: .conversation(conversationID: conversationID),
-        after: .beforeFirst,
+        after: after,
         requestID: requestID
       )
     } catch {
@@ -1416,6 +1680,7 @@ public actor RelaySessionSource: SessionSource {
     if effectiveState != .connected {
       connectionScopes.removeValue(forKey: machineID)
       businessReadyScopes.removeValue(forKey: machineID)
+      machineBootstrapRecoveries.removeValue(forKey: machineID)
     }
     bumpResourceRevision()
     await publishMachines()
@@ -1498,6 +1763,15 @@ public actor RelaySessionSource: SessionSource {
 
     conversationRetirements[conversationID] = observation.machineID
     defer { conversationRetirements.removeValue(forKey: conversationID) }
+    var shouldAdvanceMachineBootstrap = false
+    if var bootstrap = machineBootstrapRecoveries[observation.machineID] {
+      bootstrap.pendingConversations.removeValue(forKey: conversationID)
+      if bootstrap.activeConversation?.conversationID == conversationID {
+        bootstrap.activeConversation = nil
+        shouldAdvanceMachineBootstrap = true
+      }
+      machineBootstrapRecoveries[observation.machineID] = bootstrap
+    }
     conversationObservations.removeValue(forKey: conversationID)
     await observation.broadcaster.finish()
     if !shuttingDown, fatalConnectionStates[observation.machineID] == nil {
@@ -1518,6 +1792,9 @@ public actor RelaySessionSource: SessionSource {
     bumpResourceRevision()
     await publishMachines()
     await publishInbox()
+    if shouldAdvanceMachineBootstrap {
+      await startNextMachineBootstrapConversation(machineID: observation.machineID)
+    }
   }
 
   private func resolveMachineID(conversationID: String) throws -> String {

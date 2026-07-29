@@ -1564,6 +1564,51 @@ public struct DeviceCryptoStateV1: Equatable, Sendable, CustomDebugStringConvert
     )
   }
 
+  /// Subscription SyncComplete 可以经定向 backfill 先把 source inner 推进到 publication
+  /// binding 之后。随后重放的 Relay overlap 只允许 outer exact-next；incoming inner
+  /// 必须已经被 durable synchronized inner 覆盖，最终状态保留较新的 inner floor。
+  func advancingPublishedOverlapProgress(
+    streamRoute: Data,
+    streamGeneration: Data,
+    firstStreamSequence: UInt64,
+    lastStreamSequence: UInt64,
+    coveredInnerCursor: DeviceInnerCursorV1
+  ) throws -> Self {
+    guard securityState == .active,
+      firstStreamSequence <= lastStreamSequence,
+      let index = streamStates.firstIndex(where: { $0.streamRoute == streamRoute }),
+      streamStates[index].generation == streamGeneration,
+      streamStates[index].outerCursor.checkedNextForKeyLifecycle == firstStreamSequence,
+      Self.innerCursor(
+        streamStates[index].innerCursor,
+        isAtLeast: coveredInnerCursor
+      )
+    else {
+      throw DeviceCryptoStateError.invalidCursor
+    }
+    let nextRevision = stateRevision.addingReportingOverflow(1)
+    guard !nextRevision.overflow else { throw DeviceCryptoStateError.invalidState }
+    var nextStreams = streamStates
+    nextStreams[index] = try DeviceStreamCursorStateV1(
+      streamRoute: streamRoute,
+      generation: streamGeneration,
+      outerCursor: .at(lastStreamSequence),
+      innerCursor: streamStates[index].innerCursor
+    )
+    return try Self(
+      stateRevision: nextRevision.partialValue,
+      trustScope: trustScope,
+      keyDirectory: keyDirectory,
+      senderCounter: senderCounter,
+      securityState: securityState,
+      replayStates: replayStates,
+      streamStates: nextStreams,
+      keyLifecycle: keyLifecycle,
+      pendingStreamBindings: pendingStreamBindings,
+      keySyncEpisode: keySyncEpisode
+    )
+  }
+
   /// compact stream transfer 的 parts 逐帧通过 replay admission，但只有完整 hash 与
   /// Runtime decode/reducer 都成功后才一次提交 cursor。outer range 必须从当前 cut
   /// exact-next 开始且非空连续；inner logical item 仍只能 exact-next。

@@ -1264,7 +1264,11 @@ final class RelaySessionSourceTests: XCTestCase {
       commandClient: commands
     )
 
-    _ = await source.conversations(machineID: "machine-1")
+    let catalog = await source.conversations(machineID: "machine-1")
+    var catalogIterator = catalog.makeAsyncIterator()
+    guard case .loading? = await catalogIterator.next() else {
+      return XCTFail("首次 catalog observation 必须先发布 loading")
+    }
     var subscriptionCount = await commands.catalogSubscriptionCount()
     XCTAssertEqual(subscriptionCount, 0)
 
@@ -1285,6 +1289,45 @@ final class RelaySessionSourceTests: XCTestCase {
     await connection.send(.businessReady(first))
     let firstReady = await eventually { await commands.catalogSubscriptionCount() == 1 }
     XCTAssertTrue(firstReady)
+    let recordedFirstRequestID = await commands.latestCatalogSubscriptionRequestID()
+    let firstRequestID = try XCTUnwrap(recordedFirstRequestID)
+    let firstCursor = await commands.latestCatalogSubscriptionCursor()
+    XCTAssertEqual(firstCursor, .beforeFirst)
+    await sendCatalogSnapshotBarrier(
+      connection: connection,
+      requestID: firstRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "catalog-first-scope")
+    )
+    guard case .ready? = await catalogIterator.next() else {
+      return XCTFail("首个 catalog barrier 必须提交 warm-resume baseline")
+    }
+    await connection.send(
+      .delivery(
+        VerifiedRuntimeDelivery(
+          fixtureMachineID: "machine-1",
+          target: .catalog(subscriptionRequestID: firstRequestID),
+          streamGeneration: RuntimeStreamGeneration(rawValue: "catalog-first-scope"),
+          outerCursor: .at(11),
+          payload: .catalogDelta(
+            RuntimeCatalogDeltaV2(
+              catalogRevision: 0,
+              changes: [
+                .upserted(
+                  entry: conversationEntry(
+                    id: "warm-resume-conversation",
+                    title: "Warm resume",
+                    entryRevision: 1
+                  )
+                )
+              ]
+            )
+          )
+        )
+      )
+    )
+    guard case .ready? = await catalogIterator.next() else {
+      return XCTFail("live CatalogDelta 必须推进已提交 cursor")
+    }
     await connection.send(.businessReady(first))
     for _ in 0..<100 { await Task.yield() }
     subscriptionCount = await commands.catalogSubscriptionCount()
@@ -1307,6 +1350,344 @@ final class RelaySessionSourceTests: XCTestCase {
     await connection.send(.businessReady(second))
     let secondReady = await eventually { await commands.catalogSubscriptionCount() == 2 }
     XCTAssertTrue(secondReady)
+    let secondCursor = await commands.latestCatalogSubscriptionCursor()
+    XCTAssertEqual(
+      secondCursor,
+      .at(0),
+      "fresh transport 必须从已提交 Catalog cursor warm resume"
+    )
+    await source.shutdown()
+  }
+
+  func testReconnectSerializesCatalogAndConversationRecoveryBarriers() async throws {
+    let (source, connection, commands) = try makeSourceHarness()
+    let catalog = await source.conversations(machineID: "machine-1")
+    var catalogIterator = catalog.makeAsyncIterator()
+    guard case .loading? = await catalogIterator.next() else {
+      return XCTFail("首次 catalog observation 必须先发布 loading")
+    }
+    let recordedInitialCatalogRequestID = await commands.latestCatalogSubscriptionRequestID()
+    let initialCatalogRequestID = try XCTUnwrap(recordedInitialCatalogRequestID)
+    let initialCatalogGeneration = RuntimeStreamGeneration(rawValue: "catalog-initial")
+    await sendCatalogSnapshotBarrier(
+      connection: connection,
+      requestID: initialCatalogRequestID,
+      generation: initialCatalogGeneration
+    )
+    guard case .ready? = await catalogIterator.next() else {
+      return XCTFail("测试必须先建立 committed Catalog baseline")
+    }
+    await connection.send(
+      .delivery(
+        VerifiedRuntimeDelivery(
+          fixtureMachineID: "machine-1",
+          target: .catalog(subscriptionRequestID: initialCatalogRequestID),
+          streamGeneration: initialCatalogGeneration,
+          outerCursor: .at(11),
+          payload: .catalogDelta(
+            RuntimeCatalogDeltaV2(
+              catalogRevision: 0,
+              changes: [
+                .upserted(
+                  entry: conversationEntry(
+                    id: "conversation-a",
+                    title: "Conversation A",
+                    entryRevision: 1
+                  )
+                )
+              ]
+            )
+          )
+        )
+      )
+    )
+    guard case .ready? = await catalogIterator.next() else {
+      return XCTFail("测试必须先推进 committed Catalog cursor")
+    }
+
+    let firstID = RuntimeConversationID(rawValue: "conversation-a")
+    let secondID = RuntimeConversationID(rawValue: "conversation-b")
+    let firstStream = await source.conversation(conversationID: firstID.rawValue)
+    let secondStream = await source.conversation(conversationID: secondID.rawValue)
+    _ = firstStream
+    _ = secondStream
+    let recordedFirstRequestID = await commands.latestConversationSubscriptionRequestID(
+      firstID.rawValue
+    )
+    let recordedSecondRequestID = await commands.latestConversationSubscriptionRequestID(
+      secondID.rawValue
+    )
+    await sendConversationSnapshotBarrier(
+      connection: connection,
+      conversationID: firstID,
+      requestID: try XCTUnwrap(recordedFirstRequestID),
+      generation: RuntimeStreamGeneration(rawValue: "conversation-a-initial")
+    )
+    await sendConversationSnapshotBarrier(
+      connection: connection,
+      conversationID: secondID,
+      requestID: try XCTUnwrap(recordedSecondRequestID),
+      generation: RuntimeStreamGeneration(rawValue: "conversation-b-initial")
+    )
+
+    let reconnectScope = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 2)
+    )
+    await connection.send(.connectionScope(reconnectScope))
+    await connection.send(.connectionState(.connected))
+    await connection.send(.businessReady(reconnectScope))
+    let catalogRestarted = await eventually {
+      await commands.catalogSubscriptionCount() == 2
+    }
+    XCTAssertTrue(catalogRestarted)
+    let firstCountBeforeCatalogBarrier = await commands.conversationSubscriptionCount(
+      firstID.rawValue
+    )
+    let secondCountBeforeCatalogBarrier = await commands.conversationSubscriptionCount(
+      secondID.rawValue
+    )
+    let reconnectCatalogCursor = await commands.latestCatalogSubscriptionCursor()
+    XCTAssertEqual(firstCountBeforeCatalogBarrier, 1)
+    XCTAssertEqual(secondCountBeforeCatalogBarrier, 1)
+    XCTAssertEqual(
+      reconnectCatalogCursor,
+      .at(0),
+      "reconnect Catalog 必须从 committed cursor warm resume"
+    )
+
+    await source.debugForceConversationRecovery(secondID.rawValue)
+    let secondCountAfterQueuedRecovery = await commands.conversationSubscriptionCount(
+      secondID.rawValue
+    )
+    XCTAssertEqual(
+      secondCountAfterQueuedRecovery,
+      1,
+      "Catalog barrier 前外部 fresh recovery 只能去重排队"
+    )
+    let recordedReconnectCatalogRequestID = await commands.latestCatalogSubscriptionRequestID()
+    let reconnectCatalogRequestID = try XCTUnwrap(recordedReconnectCatalogRequestID)
+    await sendCatalogWarmBarrier(
+      connection: connection,
+      requestID: reconnectCatalogRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "catalog-reconnect-warm"),
+      innerCursor: .at(0)
+    )
+    let firstRecoveryStarted = await eventually {
+      await commands.conversationSubscriptionCount(firstID.rawValue) == 2
+    }
+    XCTAssertTrue(firstRecoveryStarted)
+    let firstReconnectCursor = await commands.latestConversationSubscriptionCursor(
+      firstID.rawValue
+    )
+    XCTAssertEqual(
+      firstReconnectCursor,
+      .at(0),
+      "fresh transport 必须从进程内 committed conversation cursor warm resume"
+    )
+    let secondCountWhileFirstActive = await commands.conversationSubscriptionCount(
+      secondID.rawValue
+    )
+    XCTAssertEqual(
+      secondCountWhileFirstActive,
+      1,
+      "同机只能有一条 active conversation bootstrap"
+    )
+
+    let recordedSupersededFirstRequestID = await commands.latestConversationSubscriptionRequestID(
+      firstID.rawValue
+    )
+    let supersededFirstRequestID = try XCTUnwrap(recordedSupersededFirstRequestID)
+    await source.debugForceConversationRecovery(firstID.rawValue)
+    let recordedCurrentFirstRequestID = await commands.latestConversationSubscriptionRequestID(
+      firstID.rawValue
+    )
+    let currentFirstRequestID = try XCTUnwrap(recordedCurrentFirstRequestID)
+    XCTAssertNotEqual(currentFirstRequestID, supersededFirstRequestID)
+    await sendConversationSnapshotBarrier(
+      connection: connection,
+      conversationID: firstID,
+      requestID: supersededFirstRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "conversation-a-superseded")
+    )
+    for _ in 0..<100 { await Task.yield() }
+    let secondCountAfterSupersededBarrier = await commands.conversationSubscriptionCount(
+      secondID.rawValue
+    )
+    XCTAssertEqual(
+      secondCountAfterSupersededBarrier,
+      1,
+      "superseded owner 的迟到 barrier 不得 ABA 推进队列"
+    )
+    await sendConversationSnapshotBarrier(
+      connection: connection,
+      conversationID: firstID,
+      requestID: currentFirstRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "conversation-a-recovered")
+    )
+    let secondRecoveryStarted = await eventually {
+      await commands.conversationSubscriptionCount(secondID.rawValue) == 2
+    }
+    XCTAssertTrue(secondRecoveryStarted)
+    let secondReconnectCursor = await commands.latestConversationSubscriptionCursor(
+      secondID.rawValue
+    )
+    XCTAssertEqual(
+      secondReconnectCursor,
+      .beforeFirst,
+      "machine bootstrap 期间收到的显式 recovery 必须覆盖 warm resume 并 fresh-recover"
+    )
+    let recordedCurrentSecondRequestID = await commands.latestConversationSubscriptionRequestID(
+      secondID.rawValue
+    )
+    let currentSecondRequestID = try XCTUnwrap(recordedCurrentSecondRequestID)
+    await sendConversationSnapshotBarrier(
+      connection: connection,
+      conversationID: secondID,
+      requestID: currentSecondRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "conversation-b-recovered")
+    )
+    await source.shutdown()
+  }
+
+  func testWarmReconnectAcceptsExactCursorSyncWithoutSnapshotOrBroadcastReset() async throws {
+    let (source, connection, commands) = try makeSourceHarness()
+    let conversationID = RuntimeConversationID(rawValue: "conversation-warm-no-op")
+    let stream = await source.conversation(conversationID: conversationID.rawValue)
+    _ = stream
+
+    let initialCatalogReady = await eventually {
+      await commands.catalogSubscriptionCount() == 1
+    }
+    XCTAssertTrue(initialCatalogReady)
+    let recordedInitialCatalogRequestID = await commands.latestCatalogSubscriptionRequestID()
+    let initialCatalogRequestID = try XCTUnwrap(recordedInitialCatalogRequestID)
+    await sendCatalogSnapshotBarrier(
+      connection: connection,
+      requestID: initialCatalogRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "catalog-warm-no-op-initial")
+    )
+
+    let recordedInitialConversationRequestID =
+      await commands
+      .latestConversationSubscriptionRequestID(conversationID.rawValue)
+    let initialConversationRequestID = try XCTUnwrap(recordedInitialConversationRequestID)
+    await sendConversationSnapshotBarrier(
+      connection: connection,
+      conversationID: conversationID,
+      requestID: initialConversationRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "conversation-warm-no-op-initial")
+    )
+    let baselineCommitted = await eventually {
+      await source.debugConversationCursor(conversationID.rawValue) == .at(0)
+    }
+    XCTAssertTrue(baselineCommitted)
+
+    let reconnectScope = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 2)
+    )
+    await connection.send(.connectionScope(reconnectScope))
+    await connection.send(.connectionState(.connected))
+    await connection.send(.businessReady(reconnectScope))
+    let catalogRestarted = await eventually {
+      await commands.catalogSubscriptionCount() == 2
+    }
+    XCTAssertTrue(catalogRestarted)
+    let recordedReconnectCatalogRequestID = await commands.latestCatalogSubscriptionRequestID()
+    let reconnectCatalogRequestID = try XCTUnwrap(recordedReconnectCatalogRequestID)
+    await sendCatalogWarmBarrier(
+      connection: connection,
+      requestID: reconnectCatalogRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "catalog-warm-no-op-reconnect"),
+      innerCursor: .beforeFirst
+    )
+
+    let conversationRestarted = await eventually {
+      await commands.conversationSubscriptionCount(conversationID.rawValue) == 2
+    }
+    XCTAssertTrue(conversationRestarted)
+    let reconnectCursor = await commands.latestConversationSubscriptionCursor(
+      conversationID.rawValue
+    )
+    XCTAssertEqual(reconnectCursor, .at(0))
+    let recordedReconnectConversationRequestID =
+      await commands
+      .latestConversationSubscriptionRequestID(conversationID.rawValue)
+    let reconnectConversationRequestID = try XCTUnwrap(
+      recordedReconnectConversationRequestID
+    )
+    await sendConversationWarmBarrier(
+      connection: connection,
+      conversationID: conversationID,
+      requestID: reconnectConversationRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "conversation-warm-no-op-reconnect"),
+      innerCursor: .at(0)
+    )
+
+    let completed = await eventually {
+      let fatal = await source.debugFatalConnectionState("machine-1")
+      let bootstrapActive = await source.debugMachineBootstrapIsActive("machine-1")
+      return fatal != nil || !bootstrapActive
+    }
+    XCTAssertTrue(completed)
+    let fatal = await source.debugFatalConnectionState("machine-1")
+    XCTAssertNil(fatal)
+    let finalCursor = await source.debugConversationCursor(conversationID.rawValue)
+    XCTAssertEqual(finalCursor, .at(0))
+    await source.shutdown()
+  }
+
+  func testReconnectScopeLossCannotAdvanceOldConversationRecoveryQueue() async throws {
+    let (source, connection, commands) = try makeSourceHarness()
+    let conversationID = "conversation-scope-loss"
+    let stream = await source.conversation(conversationID: conversationID)
+    _ = stream
+    let initialConversationCount = await commands.conversationSubscriptionCount(conversationID)
+    XCTAssertEqual(initialConversationCount, 1)
+
+    let reconnectScope = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 2)
+    )
+    await connection.send(.connectionScope(reconnectScope))
+    await connection.send(.businessReady(reconnectScope))
+    let recordedOldCatalogRequestID = await commands.latestCatalogSubscriptionRequestID()
+    let oldCatalogRequestID = try XCTUnwrap(recordedOldCatalogRequestID)
+    let replacementScope = TransferAssemblyScope(
+      connectionID: UUID(),
+      generation: RelayTransportGeneration(rawValue: 1)
+    )
+    await connection.send(.connectionScope(replacementScope))
+    await sendCatalogSnapshotBarrier(
+      connection: connection,
+      requestID: oldCatalogRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "catalog-old-scope")
+    )
+    for _ in 0..<100 { await Task.yield() }
+    let countAfterOldScopeBarrier = await commands.conversationSubscriptionCount(conversationID)
+    XCTAssertEqual(
+      countAfterOldScopeBarrier,
+      1,
+      "旧 scope 的 Catalog barrier 不得继续恢复 conversation"
+    )
+
+    await connection.send(.businessReady(replacementScope))
+    let freshCatalogStarted = await eventually {
+      await commands.catalogSubscriptionCount() == 3
+    }
+    XCTAssertTrue(freshCatalogStarted)
+    let recordedFreshCatalogRequestID = await commands.latestCatalogSubscriptionRequestID()
+    let freshCatalogRequestID = try XCTUnwrap(recordedFreshCatalogRequestID)
+    await sendCatalogSnapshotBarrier(
+      connection: connection,
+      requestID: freshCatalogRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "catalog-fresh-scope")
+    )
+    let conversationRecovered = await eventually {
+      await commands.conversationSubscriptionCount(conversationID) == 2
+    }
+    XCTAssertTrue(conversationRecovered)
     await source.shutdown()
   }
 
@@ -1768,6 +2149,19 @@ final class RelaySessionSourceTests: XCTestCase {
       commandClient: commands
     )
     let stream = await source.conversation(conversationID: "conversation-retry")
+    let recordedInitialCatalogRequestID = await commands.latestCatalogSubscriptionRequestID()
+    let initialCatalogRequestID = try XCTUnwrap(recordedInitialCatalogRequestID)
+    await sendCatalogSnapshotBarrier(
+      connection: connection,
+      requestID: initialCatalogRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "catalog-before-initial-failure")
+    )
+    let initialFailureProcessed = await eventually {
+      await !source.debugMachineBootstrapIsActive("machine-1")
+    }
+    guard initialFailureProcessed else {
+      return XCTFail("initial Catalog barrier 必须推进到 conversation subscribe failure")
+    }
     var iterator = stream.makeAsyncIterator()
     guard case .connectionState(.machineOffline)? = await iterator.next() else {
       return XCTFail("subscribe failure 必须越过 awaitingBarrier 成为可观察状态")
@@ -1783,6 +2177,22 @@ final class RelaySessionSourceTests: XCTestCase {
     await connection.send(.connectionScope(reconnectScope))
     await connection.send(.connectionState(.connected))
     await connection.send(.businessReady(reconnectScope))
+    for _ in 0..<100 { await Task.yield() }
+    let countBeforeCatalogBarrier = await commands.conversationSubscriptionCount(
+      "conversation-retry"
+    )
+    XCTAssertEqual(
+      countBeforeCatalogBarrier,
+      0,
+      "reconnect Catalog barrier 前不得争用 snapshot sender"
+    )
+    let recordedReconnectCatalogRequestID = await commands.latestCatalogSubscriptionRequestID()
+    let reconnectCatalogRequestID = try XCTUnwrap(recordedReconnectCatalogRequestID)
+    await sendCatalogSnapshotBarrier(
+      connection: connection,
+      requestID: reconnectCatalogRequestID,
+      generation: RuntimeStreamGeneration(rawValue: "catalog-before-conversation-retry")
+    )
     guard case .connectionState(.lagged(reason: .snapshotRequired))? = await iterator.next() else {
       return XCTFail("reconnect 必须轮换 generation 并重试 fresh snapshot")
     }
@@ -2497,6 +2907,94 @@ private func sendCatalogSnapshotBarrier(
   }
 }
 
+private func sendCatalogWarmBarrier(
+  connection: AssemblySpyConnection,
+  requestID: RuntimeMessageID,
+  generation: RuntimeStreamGeneration,
+  innerCursor: RuntimeStreamCursorV1
+) async {
+  do {
+    await connection.send(
+      .delivery(
+        VerifiedRuntimeDelivery(
+          fixtureMachineID: "machine-1",
+          target: .catalog(subscriptionRequestID: requestID),
+          streamGeneration: generation,
+          outerCursor: .at(20),
+          payload: .typedReply(.subscription(.subscribed(streamGeneration: generation)))
+        )
+      )
+    )
+    await connection.send(
+      .delivery(
+        VerifiedRuntimeDelivery(
+          fixtureMachineID: "machine-1",
+          target: .catalog(subscriptionRequestID: requestID),
+          streamGeneration: generation,
+          outerCursor: .at(20),
+          payload: .syncComplete(
+            try makeCatalogSyncComplete(
+              generation: generation,
+              outerCursor: .at(20),
+              innerCursor: innerCursor
+            )
+          )
+        )
+      )
+    )
+  } catch {
+    XCTFail("catalog warm bootstrap fixture 构造失败: \(error)")
+  }
+}
+
+private func sendConversationWarmBarrier(
+  connection: AssemblySpyConnection,
+  conversationID: RuntimeConversationID,
+  requestID: RuntimeMessageID,
+  generation: RuntimeStreamGeneration,
+  innerCursor: RuntimeStreamCursorV1
+) async {
+  do {
+    await connection.send(
+      .delivery(
+        VerifiedRuntimeDelivery(
+          fixtureMachineID: "machine-1",
+          target: .conversation(
+            conversationID: conversationID,
+            subscriptionRequestID: requestID
+          ),
+          streamGeneration: generation,
+          outerCursor: .at(20),
+          payload: .typedReply(.subscription(.subscribed(streamGeneration: generation)))
+        )
+      )
+    )
+    await connection.send(
+      .delivery(
+        VerifiedRuntimeDelivery(
+          fixtureMachineID: "machine-1",
+          target: .conversation(
+            conversationID: conversationID,
+            subscriptionRequestID: requestID
+          ),
+          streamGeneration: generation,
+          outerCursor: .at(20),
+          payload: .syncComplete(
+            try makeSyncComplete(
+              conversationID: conversationID,
+              outerCursor: .at(20),
+              generation: generation,
+              innerCursor: innerCursor
+            )
+          )
+        )
+      )
+    )
+  } catch {
+    XCTFail("conversation warm bootstrap fixture 构造失败: \(error)")
+  }
+}
+
 private func eventually(_ condition: () async -> Bool) async -> Bool {
   for _ in 0..<10_000 {
     if await condition() { return true }
@@ -2507,6 +3005,7 @@ private func eventually(_ condition: () async -> Bool) async -> Bool {
 
 private func payloadKind(_ payload: VerifiedRuntimePayload) -> String {
   switch payload {
+  case .publicationOverlap: "publicationOverlap"
   case .catalogSnapshot: "catalogSnapshot"
   case .catalogBackfill: "catalogBackfill"
   case .catalogDelta: "catalogDelta"
@@ -2878,6 +3377,7 @@ private actor AssemblySpyCommandClient: RelaySessionSourceCommandClient {
   private struct SubscriptionRequest: Sendable {
     let machineID: String
     let target: RuntimeSubscriptionTargetV1
+    let after: RuntimeStreamCursorV1
     let requestID: RuntimeMessageID
   }
 
@@ -2923,7 +3423,7 @@ private actor AssemblySpyCommandClient: RelaySessionSourceCommandClient {
   func subscribe(
     machineID: String,
     target: RuntimeSubscriptionTargetV1,
-    after _: RuntimeStreamCursorV1,
+    after: RuntimeStreamCursorV1,
     requestID: RuntimeMessageID
   ) async throws {
     if case .conversation = target, let conversationSubscriptionFailure {
@@ -2931,7 +3431,12 @@ private actor AssemblySpyCommandClient: RelaySessionSourceCommandClient {
     }
     subscribed.append(machineID)
     subscriptionRequests.append(
-      SubscriptionRequest(machineID: machineID, target: target, requestID: requestID)
+      SubscriptionRequest(
+        machineID: machineID,
+        target: target,
+        after: after,
+        requestID: requestID
+      )
     )
   }
 
@@ -2965,11 +3470,31 @@ private actor AssemblySpyCommandClient: RelaySessionSourceCommandClient {
     }.first
   }
 
+  func latestConversationSubscriptionCursor(
+    _ conversationID: String
+  ) -> RuntimeStreamCursorV1? {
+    subscriptionRequests.reversed().compactMap { request -> RuntimeStreamCursorV1? in
+      guard case .conversation(let candidate) = request.target,
+        candidate.rawValue == conversationID
+      else {
+        return nil
+      }
+      return request.after
+    }.first
+  }
+
   func latestCatalogSubscriptionRequestID() -> RuntimeMessageID? {
     subscriptionRequests.reversed().first { request in
       if case .catalog = request.target { return true }
       return false
     }?.requestID
+  }
+
+  func latestCatalogSubscriptionCursor() -> RuntimeStreamCursorV1? {
+    subscriptionRequests.reversed().first { request in
+      if case .catalog = request.target { return true }
+      return false
+    }?.after
   }
 
   func conversationSubscriptionCount(_ conversationID: String) -> Int {

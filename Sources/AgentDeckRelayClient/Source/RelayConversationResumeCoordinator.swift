@@ -6,6 +6,7 @@ enum RelayResumeDeliveryResult: Equatable, Sendable {
   case suppressedUntilBarrier
   case synchronized
   case live
+  case publicationOverlap
   case duplicate
   case staleGeneration
 }
@@ -88,8 +89,11 @@ struct RelayConversationResumeCoordinator: Sendable {
     }
   }
 
-  mutating func beginRecovery() {
-    requestedCursor = .beforeFirst
+  mutating func beginRecovery(resumeCommittedProjection: Bool = false) {
+    requestedCursor =
+      resumeCommittedProjection
+      ? committedReducer?.cursor ?? .beforeFirst
+      : .beforeFirst
     stagedReducer = nil
     stagedSnapshot = nil
     synchronizedSnapshot = nil
@@ -141,6 +145,12 @@ struct RelayConversationResumeCoordinator: Sendable {
     }
 
     switch delivery.payload {
+    case .publicationOverlap:
+      guard synchronized else {
+        throw RelaySourceReducerError.invalidBootstrapOrder
+      }
+      return .publicationOverlap
+
     case .conversationSnapshot(let snapshot):
       guard !synchronized, stagedSnapshot == nil, !backfillStarted,
         snapshot.conversationID == conversationID,

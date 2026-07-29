@@ -40,14 +40,14 @@ final class MachineListViewController: UIViewController {
         super.viewDidLoad()
         title = "AgentDeck"
         view.backgroundColor = DesignTokens.bg
-        navigationItem.rightBarButtonItems = [
-            UIBarButtonItem(
-                image: UIImage(systemName: "qrcode.viewfinder"), style: .plain,
-                target: self, action: #selector(openPairing)),
-            UIBarButtonItem(
-                image: UIImage(systemName: "tray"), style: .plain,
-                target: self, action: #selector(openInbox)),
-        ]
+        let pairingButton = UIBarButtonItem(
+            image: UIImage(systemName: "qrcode.viewfinder"), style: .plain,
+            target: self, action: #selector(openPairing))
+        pairingButton.accessibilityIdentifier = "machines.pair"
+        let inboxButton = UIBarButtonItem(
+            image: UIImage(systemName: "tray"), style: .plain,
+            target: self, action: #selector(openInbox))
+        navigationItem.rightBarButtonItems = [pairingButton, inboxButton]
         configureCollectionView()
         view.addSubview(emptyView)
         emptyView.translatesAutoresizingMaskIntoConstraints = false
@@ -129,8 +129,7 @@ final class MachineListViewController: UIViewController {
             }
             cell.accessories = accessories
         }
-        dataSource = UICollectionViewDiffableDataSource<Int, String>(collectionView: collectionView)
-        {
+        dataSource = UICollectionViewDiffableDataSource<Int, String>(collectionView: collectionView) {
             [weak self] collectionView, indexPath, machineID in
             guard let machine = self?.viewModel.machines.first(where: { $0.id == machineID }) else {
                 return nil

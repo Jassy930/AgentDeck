@@ -7,12 +7,8 @@ emit_contract() {
   printf '%s\n' '{"schemaVersion":1,"gate":"relay-companion-simulator-e2e","mode":"contract","status":"READY","mutations":0,"topology":["temp-direct-tls-relay","single-agentdeckd-remotelink","synthetic-vendor-adapter","same-uid-local-pairing","production-swift-relay-client","ios-simulator"]}'
 }
 
-emit_incomplete() {
-  printf '%s\n' '{"schemaVersion":1,"gate":"relay-companion-simulator-e2e","mode":"full","status":"INCOMPLETE","mutations":0,"availableModes":["contract","host-smoke","business-smoke"],"remaining":["relaunch-reconnect","revoke-terminal"]}'
-}
-
 usage_error() {
-  printf 'usage: %s [--contract|--host-smoke|--business-smoke]\n' "$0" >&2
+  printf 'usage: %s [--contract|--host-smoke|--business-smoke|--lifecycle-smoke]\n' "$0" >&2
   exit 2
 }
 
@@ -20,8 +16,7 @@ run_mode=""
 
 case "$#" in
   0)
-    emit_incomplete
-    exit 1
+    run_mode="full"
     ;;
   1)
     case "$1" in
@@ -31,6 +26,7 @@ case "$#" in
         ;;
       --host-smoke) run_mode="host-smoke" ;;
       --business-smoke) run_mode="business-smoke" ;;
+      --lifecycle-smoke) run_mode="lifecycle-smoke" ;;
       *) usage_error ;;
     esac
     ;;
@@ -82,6 +78,9 @@ host_transcript="$runner_root/host-transcript.log"
 xcode_log="$runner_root/xcodebuild.log"
 xcode_result="$runner_root/RelayCompanionE2E.xcresult"
 derived_data="$runner_root/DerivedData"
+ui_lifecycle_fence="$runner_root/ui-business-observed"
+ui_test_runner_bundle_id="dev.agentdeck.AgentDeckMobileUITests.xctrunner"
+ui_test_fence_name="RelayCompanionBusinessObserved.fence"
 
 cargo_pid=""
 host_pid=""
@@ -131,6 +130,37 @@ wait_until_absent() {
     sleep 0.1
   done
   return 0
+}
+
+wait_for_ui_lifecycle_fence() {
+  local deadline simulator_container simulator_fence
+  deadline=$(( $(date +%s) + 90 ))
+  while [[ "$(date +%s)" -lt "$deadline" ]]; do
+    simulator_container="$(
+      xcrun simctl get_app_container \
+        "$simulator_udid" "$ui_test_runner_bundle_id" data 2>/dev/null || true
+    )"
+    if [[ -n "$simulator_container" ]]; then
+      simulator_fence="$simulator_container/Documents/$ui_test_fence_name"
+      if [[ -f "$simulator_fence" && ! -L "$simulator_fence" ]] \
+        && [[ "$(stat -f '%Lp' "$simulator_fence")" == "600" ]] \
+        && grep -Fxq 'business-observed' "$simulator_fence"; then
+        (
+          umask 077
+          printf '%s\n' 'business-observed' >"$ui_lifecycle_fence"
+        )
+        [[ -f "$ui_lifecycle_fence" && ! -L "$ui_lifecycle_fence" ]] \
+          || fail "R4.4 runner lifecycle fence is not a regular file"
+        [[ "$(stat -f '%Lp' "$ui_lifecycle_fence")" == "600" ]] \
+          || fail "R4.4 runner lifecycle fence permissions are not 0600"
+        grep -Fxq 'business-observed' "$ui_lifecycle_fence" \
+          || fail "R4.4 runner lifecycle fence content is invalid"
+        return 0
+      fi
+    fi
+    sleep 0.1
+  done
+  return 1
 }
 
 force_stop_host() {
@@ -187,15 +217,27 @@ wait_for_xcode() {
   xcode_pid=""
 }
 
+fail_if_xcode_exited() {
+  [[ -n "$xcode_pid" ]] || return 0
+  if ! pid_is_alive "$xcode_pid" || pid_is_zombie "$xcode_pid"; then
+    wait_for_xcode
+    return 1
+  fi
+}
+
 read_host_json() {
   local expected_kind="$1"
   local expected_request_id="$2"
   local timeout_seconds="$3"
-  local deadline line
+  local deadline fragment line pending_line
   deadline=$(( $(date +%s) + timeout_seconds ))
   host_record=""
+  pending_line=""
   while [[ "$(date +%s)" -lt "$deadline" ]]; do
-    if IFS= read -r -t 1 line <&4; then
+    fragment=""
+    if IFS= read -r -t 1 fragment <&4; then
+      line="$pending_line$fragment"
+      pending_line=""
       printf '%s\n' "$line" >>"$host_transcript"
       if [[ "$line" == \{* ]] \
         && printf '%s\n' "$line" | jq -e \
@@ -207,8 +249,15 @@ read_host_json() {
         host_record="$line"
         return 0
       fi
-    elif [[ -n "$cargo_pid" ]] && ! pid_is_alive "$cargo_pid"; then
-      return 1
+    else
+      # bash `read -t` 可能在 newline 到达前已消费部分 FIFO bytes；失败状态下
+      # fragment 仍携带这些 bytes。必须跨 timeout 拼回同一 NDJSON record，否则会
+      # 丢掉开头的 `{` 并把真实 host fence 误判成超时。
+      pending_line="$pending_line$fragment"
+      fail_if_xcode_exited || return 1
+      if [[ -n "$cargo_pid" ]] && ! pid_is_alive "$cargo_pid"; then
+        return 1
+      fi
     fi
   done
   return 1
@@ -286,6 +335,8 @@ host_environment=(
 )
 if [[ "$run_mode" == "business-smoke" ]]; then
   host_environment+=("AGENTDECK_P57_HOST_SCENARIO=r43-business")
+elif [[ "$run_mode" == "lifecycle-smoke" || "$run_mode" == "full" ]]; then
+  host_environment+=("AGENTDECK_P57_HOST_SCENARIO=r44-lifecycle")
 fi
 env -u AGENTDECK_P57_HOST_SCENARIO "${host_environment[@]}" \
   cargo test -p agentdeckd --test relay_v2_machine_e2e \
@@ -309,12 +360,21 @@ relay_db="$(printf '%s\n' "$host_record" | jq -er '.relayDatabasePath')"
 if [[ "$run_mode" == "business-smoke" ]]; then
   printf '%s\n' "$host_record" | jq -e '
     .scenario == "r43-business"
+    and .daemonGeneration == 1
     and (.conversationId | type == "string" and length > 0)
     and .conversationTitle == "R4.3 synthetic Codex"
   ' >/dev/null || fail "R4.3 host ready record did not attest the business scenario"
+elif [[ "$run_mode" == "lifecycle-smoke" || "$run_mode" == "full" ]]; then
+  printf '%s\n' "$host_record" | jq -e '
+    .scenario == "r44-lifecycle"
+    and .daemonGeneration == 1
+    and (.conversationId | type == "string" and length > 0)
+    and .conversationTitle == "R4.3 synthetic Codex"
+  ' >/dev/null || fail "R4.4 host ready record did not attest the lifecycle scenario"
 else
   printf '%s\n' "$host_record" | jq -e '
     .scenario == null
+    and .daemonGeneration == 1
     and .conversationId == null
     and .conversationTitle == null
   ' >/dev/null || fail "R4.2 host smoke unexpectedly enabled a business scenario"
@@ -354,9 +414,18 @@ runtime_id="$(xcrun simctl list runtimes -j | jq -er \
 if [[ "$run_mode" == "business-smoke" ]]; then
   simulator_name="AgentDeck Relay R4.3 $runner_generation"
   selected_ui_test="testPairListOpenPromptApproval"
+  default_test_allowance=120
+  maximum_test_allowance=180
+elif [[ "$run_mode" == "lifecycle-smoke" || "$run_mode" == "full" ]]; then
+  simulator_name="AgentDeck Relay R4.4 $runner_generation"
+  selected_ui_test="testFullLifecycleReconnectAndRevoke"
+  default_test_allowance=300
+  maximum_test_allowance=420
 else
   simulator_name="AgentDeck Relay R4.2 $runner_generation"
   selected_ui_test="testPairingReachesLocalConfirmation"
+  default_test_allowance=120
+  maximum_test_allowance=180
 fi
 simulator_udid="$(xcrun simctl create "$simulator_name" "$device_type" "$runtime_id")"
 [[ "$simulator_udid" =~ ^[0-9A-Fa-f-]{36}$ ]] || fail "simctl returned an invalid UDID"
@@ -378,8 +447,8 @@ xcodebuild \
   -resultBundlePath "$xcode_result" \
   -parallel-testing-enabled NO \
   -test-timeouts-enabled YES \
-  -default-test-execution-time-allowance 120 \
-  -maximum-test-execution-time-allowance 180 \
+  -default-test-execution-time-allowance "$default_test_allowance" \
+  -maximum-test-execution-time-allowance "$maximum_test_allowance" \
   "-only-testing:AgentDeckMobileUITests/RelayCompanionUITests/$selected_ui_test" \
   AGENTDECK_RELAY_E2E_INVITE_PATH="$host_invite" \
   test >"$xcode_log" 2>&1 &
@@ -404,8 +473,8 @@ printf '%s\n' "$host_record" | jq -e '
 ' >/dev/null || fail "pairing waiting state was not exact or authorization mutated early"
 pending_record="$host_record"
 
-if [[ "$run_mode" == "business-smoke" ]]; then
-  approve_request="r43-approve-$runner_generation"
+if [[ "$run_mode" != "host-smoke" ]]; then
+  approve_request="local-approve-$runner_generation"
   send_host_command \
     "{\"op\":\"approvePendingPairing\",\"requestId\":\"$approve_request\"}" \
     || fail "could not send same-UID local pairing approval to real host"
@@ -418,11 +487,11 @@ if [[ "$run_mode" == "business-smoke" ]]; then
     and .evidence.runtimeCommandCount == 0
   ' >/dev/null || fail "local pairing approval did not create exactly one active grant"
 
-  business_request="r43-business-ready-$runner_generation"
+  business_request="business-ready-$runner_generation"
   send_host_command \
-    "{\"op\":\"waitFor\",\"requestId\":\"$business_request\",\"condition\":\"businessReady\",\"timeoutMs\":30000}" \
+    "{\"op\":\"waitFor\",\"requestId\":\"$business_request\",\"condition\":\"businessReady\",\"timeoutMs\":90000}" \
     || fail "could not send business-ready wait to real host"
-  read_host_json waitFor "$business_request" 40 \
+  read_host_json waitFor "$business_request" 100 \
     || fail "real host did not return business-ready readback"
   printf '%s\n' "$host_record" | jq -e '
     .satisfied == true
@@ -434,6 +503,47 @@ if [[ "$run_mode" == "business-smoke" ]]; then
     and .evidence.activeTransitionCount == 0
     and .evidence.activeCatalogStreamCount == 1
   ' >/dev/null || fail "paired machine did not reach exact business-ready state"
+fi
+
+restart_record=""
+if [[ "$run_mode" == "lifecycle-smoke" || "$run_mode" == "full" ]]; then
+  mutation_request="r44-business-mutated-$runner_generation"
+  send_host_command \
+    "{\"op\":\"waitFor\",\"requestId\":\"$mutation_request\",\"condition\":\"businessMutated\",\"timeoutMs\":120000}" \
+    || fail "could not send R4.4 business mutation wait to real host"
+  read_host_json waitFor "$mutation_request" 140 \
+    || fail "real host did not return R4.4 business mutation readback"
+  printf '%s\n' "$host_record" | jq -e '
+    .satisfied == true
+    and .condition == "businessMutated"
+    and .evidence.daemonGeneration == 1
+    and .evidence.runtimeCommandCount == 1
+    and .evidence.runtimeCompletedCommandCount == 1
+    and .evidence.runtimeApprovalTotal == 1
+    and .evidence.runtimeApprovalApplied == 1
+  ' >/dev/null || fail "R4.4 pre-restart business state was not exact"
+  wait_for_ui_lifecycle_fence \
+    || fail "production UI did not close the pre-restart approval observation fence"
+
+  restart_request="r44-restart-$runner_generation"
+  send_host_command \
+    "{\"op\":\"restartDaemon\",\"requestId\":\"$restart_request\"}" \
+    || fail "could not send real daemon restart command to host"
+  read_host_json restartDaemon "$restart_request" 100 \
+    || fail "real host did not return daemon restart evidence"
+  printf '%s\n' "$host_record" | jq -e '
+    .restartMarkerTitle == "R4.4 daemon restart marker"
+    and (.recoveredConversationId | type == "string" and length > 0)
+    and .metadataEntryRevision == 1
+    and .evidence.daemonGeneration == 2
+    and .evidence.machineRemoteLifecycle == "active"
+    and .evidence.activeTransitionCount == 0
+    and .evidence.activeCatalogStreamCount == 1
+    and .evidence.runtimeCommandCount == 1
+    and .evidence.runtimeCompletedCommandCount == 1
+    and .evidence.runtimeApprovalApplied == 1
+  ' >/dev/null || fail "daemon restart did not recover exact Runtime/business state"
+  restart_record="$host_record"
 fi
 
 wait_for_xcode
@@ -454,13 +564,36 @@ if [[ "$run_mode" == "business-smoke" ]]; then
     and .evidence.runtimeApprovalApplied == 1
   ' >/dev/null || fail "R4.3 prompt/approval did not produce exact Runtime evidence"
   business_record="$host_record"
+elif [[ "$run_mode" == "lifecycle-smoke" || "$run_mode" == "full" ]]; then
+  revoked_request="r44-revoked-$runner_generation"
+  send_host_command \
+    "{\"op\":\"waitFor\",\"requestId\":\"$revoked_request\",\"condition\":\"revoked\",\"timeoutMs\":120000}" \
+    || fail "could not send R4.4 revoke-terminal wait to real host"
+  read_host_json waitFor "$revoked_request" 140 \
+    || fail "real host did not return revoke-terminal readback"
+  printf '%s\n' "$host_record" | jq -e '
+    .satisfied == true
+    and .condition == "revoked"
+    and .evidence.daemonGeneration == 2
+    and .evidence.relayGrantTotal == 1
+    and .evidence.relayGrantActive == 0
+    and .evidence.runtimeRevokedAuthorizationCount == 1
+    and .evidence.runtimeCommandCount == 1
+    and .evidence.runtimeCompletedCommandCount == 1
+    and .evidence.runtimeApprovalTotal == 1
+    and .evidence.runtimeApprovalApplied == 1
+  ' >/dev/null || fail "R4.4 revoke did not reach exact verified terminal"
+  lifecycle_record="$host_record"
+fi
 
+if [[ "$run_mode" != "host-smoke" ]]; then
   for relay_path in "$relay_db" "$relay_db-wal" "$relay_db-shm"; do
     [[ -f "$relay_path" ]] || continue
     for plaintext in \
       "R4.3 UI prompt sentinel" \
       "synthetic Codex response" \
-      "synthetic codex approval"; do
+      "synthetic codex approval" \
+      "R4.4 daemon restart marker"; do
       if grep -aFq "$plaintext" "$relay_path"; then
         fail "Relay persistence contains forbidden business plaintext"
       fi
@@ -510,6 +643,18 @@ if [[ "$run_mode" == "business-smoke" ]]; then
   approval_applied="$(printf '%s\n' "$business_record" | jq -er '.evidence.runtimeApprovalApplied')"
   printf '{"schemaVersion":1,"gate":"relay-companion-simulator-e2e","mode":"business-smoke","status":"PASS","runtimeCommandCount":%s,"runtimeCompletedCommandCount":%s,"runtimeApprovalTotal":%s,"runtimeApprovalApplied":%s,"relayPlaintextAbsent":true,"cleanup":{"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"simulatorAbsent":true}}\n' \
     "$command_count" "$completed_count" "$approval_total" "$approval_applied"
+elif [[ "$run_mode" == "lifecycle-smoke" || "$run_mode" == "full" ]]; then
+  daemon_generation="$(printf '%s\n' "$lifecycle_record" | jq -er '.evidence.daemonGeneration')"
+  grant_total="$(printf '%s\n' "$lifecycle_record" | jq -er '.evidence.relayGrantTotal')"
+  grant_active="$(printf '%s\n' "$lifecycle_record" | jq -er '.evidence.relayGrantActive')"
+  command_count="$(printf '%s\n' "$lifecycle_record" | jq -er '.evidence.runtimeCommandCount')"
+  completed_count="$(printf '%s\n' "$lifecycle_record" | jq -er '.evidence.runtimeCompletedCommandCount')"
+  approval_total="$(printf '%s\n' "$lifecycle_record" | jq -er '.evidence.runtimeApprovalTotal')"
+  approval_applied="$(printf '%s\n' "$lifecycle_record" | jq -er '.evidence.runtimeApprovalApplied')"
+  revoked_count="$(printf '%s\n' "$lifecycle_record" | jq -er '.evidence.runtimeRevokedAuthorizationCount')"
+  printf '{"schemaVersion":1,"gate":"relay-companion-simulator-e2e","mode":"%s","status":"PASS","daemonGeneration":%s,"restartMarkerObserved":true,"clientRelaunchHistoryRecovered":true,"runtimeCommandCount":%s,"runtimeCompletedCommandCount":%s,"runtimeApprovalTotal":%s,"runtimeApprovalApplied":%s,"runtimeRevokedAuthorizationCount":%s,"relayGrantTotal":%s,"relayGrantActive":%s,"relayPlaintextAbsent":true,"cleanup":{"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"simulatorAbsent":true}}\n' \
+    "$run_mode" "$daemon_generation" "$command_count" "$completed_count" \
+    "$approval_total" "$approval_applied" "$revoked_count" "$grant_total" "$grant_active"
 else
   printf '{"schemaVersion":1,"gate":"relay-companion-simulator-e2e","mode":"host-smoke","status":"PASS","pendingPairingCount":%s,"relayGrantTotal":%s,"relayGrantActive":%s,"cleanup":{"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"simulatorAbsent":true}}\n' \
     "$pending_count" "$grant_total" "$grant_active"

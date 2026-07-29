@@ -96,6 +96,9 @@ struct MachineVerifiedDeliveryPermit: Hashable, Sendable {
 /// Verified Runtime ingress 的穷举 payload。Snapshot/Backfill 与 barrier 保留为
 /// 独立 case，避免 Source 从通用 reply 中猜测 bootstrap 顺序。
 enum VerifiedRuntimePayload: Sendable {
+  /// Runtime backfill 已把 reducer 推进到该 inner cursor；随后到达的 Relay
+  /// publication 只补齐 durable outer cursor，不得重复应用同一业务 item。
+  case publicationOverlap
   case catalogSnapshot(RuntimeCatalogSnapshotV2)
   case catalogBackfill(RuntimeBackfillChunkV2)
   case catalogDelta(RuntimeCatalogDeltaV2)

@@ -1042,7 +1042,7 @@ impl RuntimeCore {
                         connection_id,
                         message_id.clone(),
                         target,
-                        super::backfill::BarrierRequest::Subscribe { cursor },
+                        super::backfill::subscription_barrier_request(cursor),
                         true,
                     )
                     .await

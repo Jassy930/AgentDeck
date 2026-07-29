@@ -2398,8 +2398,23 @@ actor ProductionMachineConnectionVerifiedIngress:
       )
       return .ignored
     }
+    let publicationOverlap = replaySnapshot.state.streamStates.contains(where: {
+      $0.streamRoute == streamRoute
+        && $0.generation == relayGeneration
+        && Self.innerCursor($0.innerCursor, covers: innerCursor)
+    })
     let replacementState: DeviceCryptoStateV1
-    if let transferRange {
+    if publicationOverlap {
+      let first = transferRange?.lowerBound ?? streamSeq
+      let last = transferRange?.upperBound ?? streamSeq
+      replacementState = try replaySnapshot.state.advancingPublishedOverlapProgress(
+        streamRoute: streamRoute,
+        streamGeneration: relayGeneration,
+        firstStreamSequence: first,
+        lastStreamSequence: last,
+        coveredInnerCursor: innerCursor
+      )
+    } else if let transferRange {
       guard transferRange.upperBound == streamSeq else {
         throw ProductionMachineConnectionVerifiedIngressError.unsupportedTransfer
       }
@@ -2423,7 +2438,7 @@ actor ProductionMachineConnectionVerifiedIngress:
       target: correlated.target,
       streamGeneration: correlated.streamGeneration,
       outerCursor: correlated.outerCursor,
-      payload: payload,
+      payload: publicationOverlap ? .publicationOverlap : payload,
       scope: scope,
       expectedSnapshot: replaySnapshot,
       replacementSnapshot: replacement,
@@ -2471,6 +2486,17 @@ actor ProductionMachineConnectionVerifiedIngress:
           scope: scope
         )
         return .ignored
+      }
+      if case .failure(let failure) = correlated.reply {
+        guard case .active = try await correlation.commitPreparedCorrelation(prepared)
+        else {
+          return .ignored
+        }
+        removeOutboundRequest(requestRoute: requestRoute, scope: scope)
+        return Self.subscriptionFailureOutcome(
+          failure,
+          target: correlated.target
+        )
       }
       guard let streamGeneration = correlated.streamGeneration else {
         throw MachineRequestCorrelationError.invalidSubscriptionOrder
@@ -3959,6 +3985,37 @@ actor ProductionMachineConnectionVerifiedIngress:
     }
   }
 
+  private static func cursor(
+    _ candidate: StreamCursor,
+    isAtOrAfter previous: StreamCursor
+  ) -> Bool {
+    switch (candidate, previous) {
+    case (_, .beforeFirst):
+      return true
+    case (.beforeFirst, .at):
+      return false
+    case (.at(let candidate), .at(let previous)):
+      return candidate >= previous
+    }
+  }
+
+  private static func innerCursor(
+    _ candidate: DeviceInnerCursorV1,
+    covers covered: DeviceInnerCursorV1
+  ) -> Bool {
+    switch (candidate, covered) {
+    case (.catalog(let candidate), .catalog(let covered)):
+      return cursor(candidate, isAtOrAfter: covered)
+    case (
+      .conversation(let candidateID, let candidate),
+      .conversation(let coveredID, let covered)
+    ):
+      return candidateID == coveredID && cursor(candidate, isAtOrAfter: covered)
+    case (.catalog, .conversation), (.conversation, .catalog):
+      return false
+    }
+  }
+
   private static func failureOutcome(
     _ failure: RelayV2Failure
   ) -> MachineConnectionVerifiedIngressOutcome {
@@ -3969,6 +4026,37 @@ actor ProductionMachineConnectionVerifiedIngress:
       "relay.quota.exceeded", "relay.disk.low":
       return .relayUnavailable
     case "relay.version.unsupported":
+      return .incompatible
+    default:
+      return .securityError
+    }
+  }
+
+  /// Runtime subscribe 可以在 `Subscribed`/stream generation 之前合法返回 typed
+  /// Failure。该 reply 已完成 MachineDataSign、replay 与 exact request correlation，
+  /// 不能再被当成订阅顺序攻击；只允许固定 allowlist 决定 fresh snapshot 或重连。
+  private static func subscriptionFailureOutcome(
+    _ failure: RuntimeFailureV1,
+    target: VerifiedRuntimeTarget
+  ) -> MachineConnectionVerifiedIngressOutcome {
+    if failure.code == "daemon.runtime.snapshot_required"
+      || failure.message == "retained range requires a new snapshot"
+    {
+      return .streamRecoveryRequired(target: target, reason: .snapshotRequired)
+    }
+    switch failure.code {
+    case "daemon.remote.transition.business_fenced",
+      "daemon.remote.transition.progress_pending",
+      "daemon.remote.transition.reconnect_pending",
+      "daemon.runtime.connection_unavailable",
+      "daemon.runtime.read_unavailable",
+      "daemon.runtime.store_unavailable",
+      "daemon.runtime.store_busy",
+      "daemon.runtime.recovering",
+      "daemon.runtime.not_ready",
+      "daemon.runtime.disk_low":
+      return .relayUnavailable
+    case "daemon.runtime.protocol_mismatch":
       return .incompatible
     default:
       return .securityError

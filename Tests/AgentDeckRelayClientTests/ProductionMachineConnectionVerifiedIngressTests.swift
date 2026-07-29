@@ -78,6 +78,113 @@ final class ProductionMachineConnectionVerifiedIngressTests: XCTestCase {
     XCTAssertTrue(actions.isEmpty)
   }
 
+  func testVerifiedPreSubscriptionFailureCommitsOwnerAndMapsRetryPolicy() async throws {
+    let fixture = try await ProductionIngressCryptoFixture.make()
+    defer { fixture.removeSandbox() }
+    let ingress = try await ProductionMachineConnectionVerifiedIngress.open(
+      material: fixture.material,
+      expectedConversationRoutes: [],
+      clock: { ProductionIngressCryptoFixture.fixedTimeMS }
+    )
+    let scope = productionIngressScope(79)
+    _ = try await ingress.resumeFrames(
+      generation: scope.generation,
+      scope: scope,
+      heartbeatIntervalSeconds: 17
+    )
+
+    let fencedMessageID = RuntimeMessageID(rawValue: "subscription-fenced")
+    let fencedPrepared = try await ingress.prepareSubscription(
+      target: .catalog,
+      after: .beforeFirst,
+      requestID: fencedMessageID,
+      scope: scope
+    )
+    let fencedOutbound = try productionIngressSend(fencedPrepared.frame)
+    try await assertProductionIngressIgnored(
+      ingress.receive(
+        try productionIngressReceivedFrame(
+          generation: scope.generation,
+          body: .routeAccepted(
+            accepted: .request(requestRoute: fencedOutbound.requestRoute)
+          )
+        ),
+        scope: scope
+      )
+    )
+    let fencedOutcome = try await ingress.receive(
+      try productionIngressRuntimeReplyFrame(
+        fixture: fixture,
+        generation: scope.generation,
+        requestRoute: fencedOutbound.requestRoute,
+        envelope: RuntimeEnvelopeV2(
+          version: runtimeProtocolVersionCurrent,
+          messageID: fencedMessageID,
+          body: .reply(
+            .failure(
+              RuntimeFailureV1(
+                code: "daemon.remote.transition.business_fenced",
+                message: "business requests remain fenced"
+              )
+            )
+          )
+        ),
+        counter: 1
+      ),
+      scope: scope
+    )
+    guard case .relayUnavailable = fencedOutcome else {
+      return XCTFail("transition fence 必须成为可重连 transient outcome")
+    }
+
+    let snapshotMessageID = RuntimeMessageID(rawValue: "subscription-snapshot-required")
+    let snapshotPrepared = try await ingress.prepareSubscription(
+      target: .catalog,
+      after: .at(9),
+      requestID: snapshotMessageID,
+      scope: scope
+    )
+    let snapshotOutbound = try productionIngressSend(snapshotPrepared.frame)
+    let snapshotOutcome = try await ingress.receive(
+      try productionIngressRuntimeReplyFrame(
+        fixture: fixture,
+        generation: scope.generation,
+        requestRoute: snapshotOutbound.requestRoute,
+        envelope: RuntimeEnvelopeV2(
+          version: runtimeProtocolVersionCurrent,
+          messageID: snapshotMessageID,
+          body: .reply(
+            .failure(
+              RuntimeFailureV1(
+                code: "daemon.runtime.snapshot_required",
+                message: "retained range requires a new snapshot"
+              )
+            )
+          )
+        ),
+        counter: 2
+      ),
+      scope: scope
+    )
+    guard
+      case .streamRecoveryRequired(
+        .catalog(let deliveredRequestID),
+        .snapshotRequired
+      ) = snapshotOutcome
+    else {
+      return XCTFail("snapshot prerequisite 必须保留 exact target 并 fresh-recover")
+    }
+    XCTAssertEqual(deliveredRequestID, snapshotMessageID)
+
+    let retryPrepared = try await ingress.prepareSubscription(
+      target: .catalog,
+      after: .beforeFirst,
+      requestID: RuntimeMessageID(rawValue: "subscription-owner-reused"),
+      scope: scope
+    )
+    await ingress.cancelPrepared(retryPrepared.token, scope: scope)
+  }
+
   func testExactNextProbeQueuesSignedKeySyncAndDurableUpdateSetQueuesAck() async throws {
     let fixture = try await ProductionIngressCryptoFixture.make()
     defer { fixture.removeSandbox() }
@@ -1695,6 +1802,154 @@ final class ProductionMachineConnectionVerifiedIngressTests: XCTestCase {
     XCTAssertEqual(
       replacementReadback.state.streamStates[0].generation,
       replacementGeneration
+    )
+  }
+
+  func testReconnectConversationWarmResumePreservesDurableCursorFloor() async throws {
+    let conversationRoute = Data(repeating: 0xB5, count: 16)
+    let conversationGeneration = Data(repeating: 0xB6, count: 16)
+    let conversationID = RuntimeConversationID(rawValue: "conversation-warm-reconnect")
+    let fixture = try await ProductionIngressCryptoFixture.make(
+      conversationRoutes: [conversationRoute]
+    )
+    defer { fixture.removeSandbox() }
+    let ingress = try await ProductionMachineConnectionVerifiedIngress.open(
+      material: fixture.material,
+      expectedConversationRoutes: [conversationRoute],
+      clock: { ProductionIngressCryptoFixture.fixedTimeMS }
+    )
+    let firstScope = productionIngressScope(66)
+    _ = try await ingress.resumeFrames(
+      generation: firstScope.generation,
+      scope: firstScope,
+      heartbeatIntervalSeconds: 31
+    )
+    _ = try await productionIngressBootstrapConversation(
+      ingress: ingress,
+      fixture: fixture,
+      scope: firstScope,
+      messageID: RuntimeMessageID(rawValue: "conversation-warm-first"),
+      conversationID: conversationID,
+      streamRoute: conversationRoute,
+      streamGeneration: conversationGeneration,
+      firstCounter: 1
+    )
+    let published = try await ingress.receive(
+      try productionIngressConversationPublishFrame(
+        fixture: fixture,
+        generation: firstScope.generation,
+        conversationID: conversationID,
+        streamRoute: conversationRoute,
+        streamGeneration: conversationGeneration,
+        streamSequence: 0,
+        eventSequence: 0,
+        counter: 1
+      ),
+      scope: firstScope
+    )
+    guard case .delivery(let delivery) = published else {
+      return XCTFail("测试必须先建立 conversation durable cursor")
+    }
+    try await ingress.commit(delivery)
+    try await ingress.awaitResolution(delivery)
+    _ = try await ingress.drainTransportActions(scope: firstScope)
+
+    await ingress.generationEnded(scope: firstScope)
+    let reconnectScope = productionIngressScope(67)
+    _ = try await ingress.resumeFrames(
+      generation: reconnectScope.generation,
+      scope: reconnectScope,
+      heartbeatIntervalSeconds: 31
+    )
+    _ = try await productionIngressBootstrapConversation(
+      ingress: ingress,
+      fixture: fixture,
+      scope: reconnectScope,
+      messageID: RuntimeMessageID(rawValue: "conversation-warm-second"),
+      conversationID: conversationID,
+      streamRoute: conversationRoute,
+      streamGeneration: conversationGeneration,
+      firstCounter: 4,
+      after: .at(0),
+      synchronizedOuterCursor: .at(0),
+      bindingCursor: .at(0)
+    )
+
+    let readbackValue = try await fixture.stateStore.load()
+    let readback = try XCTUnwrap(readbackValue)
+    let stream = try XCTUnwrap(
+      readback.state.streamStates.first(where: {
+        $0.streamRoute == conversationRoute
+      })
+    )
+    XCTAssertEqual(stream.outerCursor, .at(0))
+    XCTAssertEqual(stream.innerCursor, .conversation(id: conversationID.rawValue, cursor: .at(0)))
+  }
+
+  func testReconnectBackfillOverlapAdvancesOnlyDurableOuterCursor() async throws {
+    let conversationRoute = Data(repeating: 0xB7, count: 16)
+    let conversationGeneration = Data(repeating: 0xB8, count: 16)
+    let conversationID = RuntimeConversationID(rawValue: "conversation-reconnect-overlap")
+    let fixture = try await ProductionIngressCryptoFixture.make(
+      conversationRoutes: [conversationRoute]
+    )
+    defer { fixture.removeSandbox() }
+    let ingress = try await ProductionMachineConnectionVerifiedIngress.open(
+      material: fixture.material,
+      expectedConversationRoutes: [conversationRoute],
+      clock: { ProductionIngressCryptoFixture.fixedTimeMS }
+    )
+    let scope = productionIngressScope(68)
+    _ = try await ingress.resumeFrames(
+      generation: scope.generation,
+      scope: scope,
+      heartbeatIntervalSeconds: 31
+    )
+    _ = try await productionIngressBootstrapConversation(
+      ingress: ingress,
+      fixture: fixture,
+      scope: scope,
+      messageID: RuntimeMessageID(rawValue: "conversation-overlap-bootstrap"),
+      conversationID: conversationID,
+      streamRoute: conversationRoute,
+      streamGeneration: conversationGeneration,
+      firstCounter: 1,
+      after: .at(0),
+      synchronizedOuterCursor: .at(0),
+      synchronizedInnerCursor: .at(1),
+      bindingCursor: .at(0)
+    )
+
+    let overlap = try await ingress.receive(
+      try productionIngressConversationPublishFrame(
+        fixture: fixture,
+        generation: scope.generation,
+        conversationID: conversationID,
+        streamRoute: conversationRoute,
+        streamGeneration: conversationGeneration,
+        streamSequence: 1,
+        eventSequence: 1,
+        counter: 1
+      ),
+      scope: scope
+    )
+    guard case .delivery(let delivery) = overlap else {
+      return XCTFail("Runtime backfill 已覆盖的 publication overlap 仍须交付 durable outer commit")
+    }
+    try await ingress.commit(delivery)
+    try await ingress.awaitResolution(delivery)
+
+    let readbackValue = try await fixture.stateStore.load()
+    let readback = try XCTUnwrap(readbackValue)
+    let stream = try XCTUnwrap(
+      readback.state.streamStates.first(where: {
+        $0.streamRoute == conversationRoute
+      })
+    )
+    XCTAssertEqual(stream.outerCursor, .at(1))
+    XCTAssertEqual(
+      stream.innerCursor,
+      .conversation(id: conversationID.rawValue, cursor: .at(1))
     )
   }
 
@@ -4431,14 +4686,18 @@ private func productionIngressBootstrapConversation(
   conversationID: RuntimeConversationID,
   streamRoute: Data,
   streamGeneration: Data,
-  firstCounter: UInt64
+  firstCounter: UInt64,
+  after: RuntimeStreamCursorV1 = .beforeFirst,
+  synchronizedOuterCursor: RuntimeStreamCursorV1? = nil,
+  synchronizedInnerCursor: RuntimeStreamCursorV1? = nil,
+  bindingCursor: StreamCursor = .beforeFirst
 ) async throws -> [RelayV2OutboundFrame] {
   let runtimeGeneration = RuntimeStreamGeneration(
     rawValue: productionIngressCanonicalUUIDString(streamGeneration)
   )
   let prepared = try await ingress.prepareSubscription(
     target: .conversation(conversationID: conversationID),
-    after: .beforeFirst,
+    after: after,
     requestID: messageID,
     scope: scope
   )
@@ -4479,11 +4738,11 @@ private func productionIngressBootstrapConversation(
 
   let innerCursor = RuntimeInnerCursorV1.conversation(
     conversationID: conversationID,
-    cursor: .beforeFirst
+    cursor: synchronizedInnerCursor ?? after
   )
   let sync = try productionIngressSyncComplete(
     streamGeneration: runtimeGeneration,
-    streamCursor: .beforeFirst,
+    streamCursor: synchronizedOuterCursor ?? after,
     innerCursor: innerCursor,
     keyDirectoryRevision: fixture.currentRevision
   )
@@ -4516,8 +4775,8 @@ private func productionIngressBootstrapConversation(
     ),
     streamRoute: streamRoute,
     streamGeneration: streamGeneration,
-    streamCursor: .beforeFirst,
-    innerCursor: innerCursor,
+    streamCursor: bindingCursor,
+    innerCursor: .conversation(conversationID: conversationID, cursor: after),
     keyDirectoryRevision: fixture.currentRevision,
     keyID: KeyIDV1(purpose: .conversationDEK, epoch: 1)
   )

@@ -13,6 +13,7 @@ fail() {
 [[ -x "$runner" ]] || fail "missing executable runner: $runner"
 [[ -f "$ui_test" ]] || fail "missing UI test: $ui_test"
 command -v jq >/dev/null 2>&1 || fail "missing command: jq"
+command -v sed >/dev/null 2>&1 || fail "missing command: sed"
 
 before_status="$(git -C "$repo_root" status --short --untracked-files=all)"
 record="$(bash "$runner" --contract)"
@@ -45,21 +46,25 @@ unsupported_rc=$?
 set -e
 [[ "$unsupported_rc" -eq 2 ]] || fail "unknown arguments must exit 2"
 
-set +e
-incomplete_record="$(bash "$runner")"
-incomplete_rc=$?
-set -e
-[[ "$incomplete_rc" -eq 1 ]] || fail "unfinished full E2E must exit 1"
-[[ "$(printf '%s\n' "$incomplete_record" | wc -l | tr -d ' ')" == "1" ]] \
-  || fail "unfinished full E2E must emit exactly one JSON line"
-printf '%s\n' "$incomplete_record" | jq -e '
-  .schemaVersion == 1
-  and .gate == "relay-companion-simulator-e2e"
-  and .mode == "full"
-  and .status == "INCOMPLETE"
-  and .mutations == 0
-  and .availableModes == ["contract", "host-smoke", "business-smoke"]
-  and .remaining == ["relaunch-reconnect", "revoke-terminal"]
-' >/dev/null || fail "unfinished full E2E did not fail closed"
+grep -Fq 'run_mode="full"' "$runner" \
+  || fail "default entry must select the full lifecycle gate"
+grep -Fq -- '--lifecycle-smoke) run_mode="lifecycle-smoke"' "$runner" \
+  || fail "focused lifecycle-smoke entry is missing"
+grep -Fq 'testFullLifecycleReconnectAndRevoke' "$ui_test" \
+  || fail "full production lifecycle UI test is missing"
+read_host_json_body="$(sed -n '/^read_host_json()/,/^}/p' "$runner")"
+printf '%s\n' "$read_host_json_body" | grep -Fq 'fail_if_xcode_exited || return 1' \
+  || fail "host waits must surface an exited xcodebuild before their own timeout"
+temporary_diag_marker='AGENTDECK_'"R44_DIAG"
+temporary_artifact_marker='AGENTDECK_'"R44_KEEP_FAILURE_ARTIFACTS"
+if grep -Fq "$temporary_diag_marker" "$runner"; then
+  fail "completed lifecycle runner must not retain temporary R4.4 diagnostics"
+fi
+if grep -Fq "$temporary_artifact_marker" "$runner"; then
+  fail "completed lifecycle runner must not retain private failure artifacts"
+fi
+if grep -Fq '"status":"INCOMPLETE"' "$runner"; then
+  fail "completed lifecycle runner must not retain an INCOMPLETE success path"
+fi
 
 printf 'relay companion simulator E2E contract: PASS\n'

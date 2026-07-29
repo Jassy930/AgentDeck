@@ -1143,6 +1143,69 @@ async fn revoked_device_reauthentication_flushes_exact_persisted_terminal_before
 }
 
 #[tokio::test]
+async fn machine_generation_loss_closes_existing_device_for_fresh_subscription() {
+    let temp = TempDir::new().expect("tempdir");
+    let (config, _) = server_config(&temp);
+    let realm = seed_realm(&config, false).await;
+    let handle = RelayV2ServerHandle::start(config)
+        .await
+        .expect("start seeded Relay server");
+
+    let mut first_machine = connect(handle.public_addr()).await;
+    authenticate_machine(&mut first_machine, &realm).await;
+
+    let mut device = connect(handle.public_addr()).await;
+    let challenge = hello_challenge(&mut device).await;
+    device
+        .send(Message::Binary(
+            encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::Authenticate(realm.device_authenticate(&challenge)),
+            })
+            .into(),
+        ))
+        .await
+        .expect("send active device Authenticate");
+    assert!(matches!(
+        receive_relay_frame(&mut device).await.body,
+        RelayFrameBody::Authenticated(_)
+    ));
+
+    first_machine
+        .close(None)
+        .await
+        .expect("close first machine generation");
+    assert_rejected_without_application_binary(device).await;
+
+    let mut gap_device = connect(handle.public_addr()).await;
+    let challenge = hello_challenge(&mut gap_device).await;
+    gap_device
+        .send(Message::Binary(
+            encode(&OpaqueRouteFrame {
+                version: RELAY_PROTOCOL_VERSION,
+                body: RelayFrameBody::Authenticate(realm.device_authenticate(&challenge)),
+            })
+            .into(),
+        ))
+        .await
+        .expect("reconnect device while machine generation is absent");
+    assert!(matches!(
+        receive_relay_frame(&mut gap_device).await.body,
+        RelayFrameBody::Authenticated(_)
+    ));
+
+    let mut replacement_machine = connect(handle.public_addr()).await;
+    authenticate_machine(&mut replacement_machine, &realm).await;
+    assert_rejected_without_application_binary(gap_device).await;
+
+    replacement_machine
+        .close(None)
+        .await
+        .expect("close replacement machine");
+    handle.shutdown().await.expect("shutdown seeded server");
+}
+
+#[tokio::test]
 async fn text_and_oversize_websocket_messages_are_rejected_without_application_output() {
     let temp = TempDir::new().expect("tempdir");
     let (handle, _) = start_server(&temp).await;

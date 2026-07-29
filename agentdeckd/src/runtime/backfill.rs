@@ -10,6 +10,17 @@ pub enum BarrierRequest {
     Backfill { after: StreamCursor },
 }
 
+/// Wire Subscribe(BeforeFirst) 没有 reducer baseline，必须强制 fresh snapshot；带已有
+/// cursor 的 warm Subscribe 已有调用方 projection，只需要复用 retained backfill/empty
+/// barrier 规划。内部 key-transition 仍可直接使用 `BarrierRequest::Subscribe` 强制冻结
+/// snapshot，不能被客户端 warm-resume 语义改写。
+pub(crate) const fn subscription_barrier_request(cursor: StreamCursor) -> BarrierRequest {
+    match cursor {
+        StreamCursor::BeforeFirst => BarrierRequest::Subscribe { cursor },
+        StreamCursor::At(_) => BarrierRequest::Backfill { after: cursor },
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BarrierInput {
     pub target: RuntimeStreamTarget,
@@ -106,4 +117,77 @@ pub fn plan_barrier(input: BarrierInput) -> Result<BarrierDecision, BarrierError
         through: high_water,
         committed_outer,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conversation_input(cursor: StreamCursor, high_water: StreamCursor) -> BarrierInput {
+        BarrierInput {
+            target: RuntimeStreamTarget::Catalog,
+            request: subscription_barrier_request(cursor),
+            high_water,
+            retained_floor: Some(0),
+            snapshot_base: StreamCursor::At(0),
+            committed_outer: StreamCursor::At(7),
+        }
+    }
+
+    #[test]
+    fn warm_subscribe_at_high_water_uses_empty_incremental_barrier() {
+        let decision = plan_barrier(conversation_input(StreamCursor::At(8), StreamCursor::At(8)))
+            .expect("plan warm exact-cursor subscribe");
+
+        assert_eq!(
+            decision,
+            BarrierDecision::SyncComplete {
+                through: StreamCursor::At(8),
+                committed_outer: StreamCursor::At(7),
+            }
+        );
+    }
+
+    #[test]
+    fn warm_subscribe_behind_high_water_uses_retained_backfill() {
+        let decision = plan_barrier(conversation_input(StreamCursor::At(6), StreamCursor::At(8)))
+            .expect("plan warm retained subscribe");
+
+        assert_eq!(
+            decision,
+            BarrierDecision::Backfill {
+                after: StreamCursor::At(6),
+                through: StreamCursor::At(8),
+                committed_outer: StreamCursor::At(7),
+            }
+        );
+    }
+
+    #[test]
+    fn fresh_subscribe_keeps_snapshot_barrier_while_internal_subscribe_stays_explicit() {
+        assert_eq!(
+            subscription_barrier_request(StreamCursor::BeforeFirst),
+            BarrierRequest::Subscribe {
+                cursor: StreamCursor::BeforeFirst,
+            }
+        );
+        assert_eq!(
+            plan_barrier(BarrierInput {
+                target: RuntimeStreamTarget::Catalog,
+                request: BarrierRequest::Subscribe {
+                    cursor: StreamCursor::At(8),
+                },
+                high_water: StreamCursor::At(8),
+                retained_floor: Some(0),
+                snapshot_base: StreamCursor::At(0),
+                committed_outer: StreamCursor::At(7),
+            })
+            .expect("plan internal forced snapshot"),
+            BarrierDecision::Snapshot {
+                base: StreamCursor::At(0),
+                through: StreamCursor::At(8),
+                committed_outer: StreamCursor::At(7),
+            }
+        );
+    }
 }

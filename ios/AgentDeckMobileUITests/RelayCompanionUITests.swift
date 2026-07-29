@@ -9,8 +9,10 @@ import XCTest
 final class RelayCompanionUITests: XCTestCase {
     private static let invitePathEnvironment = "AGENTDECK_RELAY_E2E_INVITE_PATH"
     private static let inviteResourceName = "RelayCompanionPairInvite"
+    private static let lifecycleFenceName = "RelayCompanionBusinessObserved.fence"
     private static let conversationTitle = "R4.3 synthetic Codex"
     private static let promptSentinel = "R4.3 UI prompt sentinel"
+    private static let restartMarkerTitle = "R4.4 daemon restart marker"
 
     override func setUp() {
         super.setUp()
@@ -26,49 +28,68 @@ final class RelayCompanionUITests: XCTestCase {
     func testPairListOpenPromptApproval() throws {
         let app = try launchPairingApp()
         try beginPairing(in: app)
+        try openOriginalConversation(in: app)
+        exercisePromptAndApproval(in: app)
+    }
 
-        let machineList = app.collectionViews["machines.list"]
-        XCTAssertTrue(machineList.waitForExistence(timeout: 90))
-        let machine = machineList.cells.firstMatch
-        XCTAssertTrue(machine.waitForExistence(timeout: 90), "配对后未出现真实机器行")
-        let online = NSPredicate(format: "label CONTAINS %@", "在线")
-        expectation(for: online, evaluatedWith: machine)
+    func testFullLifecycleReconnectAndRevoke() throws {
+        let app = try launchPairingApp()
+        try beginPairing(in: app)
+        try openOriginalConversation(in: app)
+        exercisePromptAndApproval(in: app)
+        try signalLifecycleFence()
+
+        navigateBack(in: app)
+        let restartMarker = app.staticTexts[Self.restartMarkerTitle]
+        guard restartMarker.waitForExistence(timeout: 120) else {
+            let originalTitleRemains = app.staticTexts[Self.conversationTitle].exists
+            navigateBack(in: app)
+            let machine = app.collectionViews["machines.list"].cells.firstMatch
+            let machineState = machine.waitForExistence(timeout: 5) ? machine.label : "absent"
+            XCTFail(
+                "真实 daemon 重启后未向现有 production client 发布 catalog marker；"
+                    + "originalTitleRemains=\(originalTitleRemains) machineState=\(machineState)"
+            )
+            return
+        }
+
+        app.terminate()
+        app.launchArguments = []
+        app.launch()
+        try openConversation(titled: Self.restartMarkerTitle, in: app)
+        XCTAssertTrue(
+            app.staticTexts["synthetic Codex response"].waitForExistence(timeout: 90),
+            "无 invite 冷启动后未恢复已提交 assistant history"
+        )
+        let approvalState = app.staticTexts["session.approval.state"]
+        XCTAssertTrue(approvalState.waitForExistence(timeout: 60))
+        let applied = NSPredicate(
+            format: "label CONTAINS %@ AND label CONTAINS %@", "批准", "已应用")
+        expectation(for: applied, evaluatedWith: approvalState)
         waitForExpectations(timeout: 60)
-        machine.tap()
 
-        let sessionList = app.collectionViews["sessions.list"]
-        XCTAssertTrue(sessionList.waitForExistence(timeout: 30))
-        let conversation = app.staticTexts[Self.conversationTitle]
-        XCTAssertTrue(conversation.waitForExistence(timeout: 60), "真实 catalog 未出现预建会话")
-        conversation.tap()
+        navigateBack(in: app)
+        navigateBack(in: app)
+        let pairingButton = app.buttons["machines.pair"]
+        XCTAssertTrue(pairingButton.waitForExistence(timeout: 30))
+        pairingButton.tap()
 
-        let input = app.textViews["session.prompt.input"]
-        XCTAssertTrue(input.waitForExistence(timeout: 45), "production 会话详情未打开")
-        input.tap()
-        input.typeText(Self.promptSentinel)
-        let send = app.buttons["session.prompt.send"]
-        XCTAssertTrue(send.isEnabled)
-        send.tap()
+        let pairedMachines = app.tables["pairing.paired-machines"]
+        XCTAssertTrue(pairedMachines.waitForExistence(timeout: 30))
+        let pairedMachine = pairedMachines.cells.firstMatch
+        XCTAssertTrue(pairedMachine.waitForExistence(timeout: 30))
+        pairedMachine.swipeLeft()
+        let revoke = app.buttons["在线撤销"]
+        XCTAssertTrue(revoke.waitForExistence(timeout: 15))
+        revoke.tap()
+        let confirmation = app.alerts.firstMatch
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 15))
+        confirmation.buttons["撤销授权"].tap()
 
         XCTAssertTrue(
-            app.staticTexts["synthetic Codex response"].waitForExistence(timeout: 60),
-            "synthetic adapter 输出未经过真实 daemon/Relay 到达 UI"
+            app.staticTexts["还没有机器"].waitForExistence(timeout: 120),
+            "verified revoke terminal 后本机 paired material 未被 production composition 清理"
         )
-        XCTAssertTrue(
-            app.staticTexts["synthetic codex approval"].waitForExistence(timeout: 60),
-            "真实 canonical approval 未到达 UI"
-        )
-        let events = app.collectionViews["session.events"]
-        events.swipeUp()
-        let approve = app.buttons["session.approval.approve"]
-        XCTAssertTrue(approve.waitForExistence(timeout: 30))
-        approve.tap()
-
-        let state = app.staticTexts["session.approval.state"]
-        XCTAssertTrue(state.waitForExistence(timeout: 30))
-        let applied = NSPredicate(format: "label CONTAINS %@", "已应用批准")
-        expectation(for: applied, evaluatedWith: state)
-        waitForExpectations(timeout: 60)
     }
 
     private func launchPairingApp() throws -> XCUIApplication {
@@ -99,6 +120,80 @@ final class RelayCompanionUITests: XCTestCase {
         let waiting = NSPredicate(format: "label CONTAINS %@", "等待被控机器本地确认")
         expectation(for: waiting, evaluatedWith: status)
         waitForExpectations(timeout: 45)
+    }
+
+    private func openOriginalConversation(in app: XCUIApplication) throws {
+        try openConversation(titled: Self.conversationTitle, in: app)
+    }
+
+    private func openConversation(titled title: String, in app: XCUIApplication) throws {
+        let machineList = app.collectionViews["machines.list"]
+        XCTAssertTrue(machineList.waitForExistence(timeout: 90))
+        let machine = machineList.cells.firstMatch
+        XCTAssertTrue(machine.waitForExistence(timeout: 90), "配对后未出现真实机器行")
+        let online = NSPredicate(format: "label CONTAINS %@", "在线")
+        expectation(for: online, evaluatedWith: machine)
+        waitForExpectations(timeout: 60)
+        machine.tap()
+
+        let sessionList = app.collectionViews["sessions.list"]
+        XCTAssertTrue(sessionList.waitForExistence(timeout: 30))
+        let conversation = app.staticTexts[title]
+        XCTAssertTrue(conversation.waitForExistence(timeout: 60), "真实 catalog 未出现目标会话")
+        conversation.tap()
+
+        let input = app.textViews["session.prompt.input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 45), "production 会话详情未打开")
+    }
+
+    private func exercisePromptAndApproval(in app: XCUIApplication) {
+        let input = app.textViews["session.prompt.input"]
+        input.tap()
+        input.typeText(Self.promptSentinel)
+        let send = app.buttons["session.prompt.send"]
+        XCTAssertTrue(send.isEnabled)
+        send.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["synthetic Codex response"].waitForExistence(timeout: 60),
+            "synthetic adapter 输出未经过真实 daemon/Relay 到达 UI"
+        )
+        XCTAssertTrue(
+            app.staticTexts["synthetic codex approval"].waitForExistence(timeout: 60),
+            "真实 canonical approval 未到达 UI"
+        )
+        let events = app.collectionViews["session.events"]
+        events.swipeUp()
+        let approve = app.buttons["session.approval.approve"]
+        XCTAssertTrue(approve.waitForExistence(timeout: 30))
+        approve.tap()
+
+        let state = app.staticTexts["session.approval.state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 30))
+        let applied = NSPredicate(format: "label CONTAINS %@", "已应用批准")
+        expectation(for: applied, evaluatedWith: state)
+        waitForExpectations(timeout: 60)
+    }
+
+    private func navigateBack(in app: XCUIApplication) {
+        let back = app.navigationBars.buttons.element(boundBy: 0)
+        XCTAssertTrue(back.waitForExistence(timeout: 30))
+        back.tap()
+    }
+
+    private func signalLifecycleFence() throws {
+        let documents = try XCTUnwrap(
+            FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        )
+        let destination = documents.appendingPathComponent(
+            Self.lifecycleFenceName,
+            isDirectory: false
+        )
+        try Data("business-observed\n".utf8).write(to: destination, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: UInt16(0o600))],
+            ofItemAtPath: destination.path
+        )
     }
 
     private func loadPrivateInvite() throws -> String {

@@ -59,7 +59,8 @@ use agentdeck_protocol::runtime::{
     ApprovalDeliveryState, ApprovalReceipt, BackfillChunk, BackfillRange,
     ClaudeCodeConversationConfiguration, CodexConversationConfiguration, CommandReceipt,
     ConfigureConversationRequest, ConversationConfiguration, ConversationConfigurationState,
-    ConversationId, ConversationSnapshot, ConversationStart, ConversationStartReceipt,
+    ConversationId, ConversationMetadataMutation, ConversationMetadataMutationRequest,
+    ConversationMetadataReceipt, ConversationSnapshot, ConversationStart, ConversationStartReceipt,
     CreatePairInviteRequest, IdempotencyKey, LocalOnlyAdministration, MachineEnrollRequest,
     MachineRemoteLifecycle, PromptPayload, QueryReceiptSelector, RevocationReceipt, RuntimeEvent,
     RuntimeEventBody, RuntimeInnerCursor, RuntimeReply, RuntimeRequest, RuntimeStreamItem,
@@ -103,7 +104,9 @@ const P57_HOST_ENABLE_ENV: &str = "AGENTDECK_P57_HOST";
 const P57_HOST_PARENT_ENV: &str = "AGENTDECK_P57_HOST_PARENT";
 const P57_HOST_SCENARIO_ENV: &str = "AGENTDECK_P57_HOST_SCENARIO";
 const P57_HOST_R43_SCENARIO: &str = "r43-business";
+const P57_HOST_R44_SCENARIO: &str = "r44-lifecycle";
 const P57_HOST_R43_CONVERSATION_TITLE: &str = "R4.3 synthetic Codex";
+const P57_HOST_R44_RESTART_MARKER_TITLE: &str = "R4.4 daemon restart marker";
 const P57_HOST_MAX_COMMAND_BYTES: usize = 4 * 1_024;
 const P57_HOST_MAX_WAIT_MS: u64 = 120_000;
 static P57_HOST_OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
@@ -135,6 +138,7 @@ fn p57_host_scenario() -> Option<&'static str> {
     match env::var(P57_HOST_SCENARIO_ENV).as_deref() {
         Err(env::VarError::NotPresent) => None,
         Ok(P57_HOST_R43_SCENARIO) => Some(P57_HOST_R43_SCENARIO),
+        Ok(P57_HOST_R44_SCENARIO) => Some(P57_HOST_R44_SCENARIO),
         Ok(other) => panic!("unsupported P5.7 host scenario: {other}"),
         Err(env::VarError::NotUnicode(_)) => panic!("P5.7 host scenario must be UTF-8"),
     }
@@ -2273,6 +2277,10 @@ enum P57HostCommand {
         #[serde(rename = "requestId")]
         request_id: String,
     },
+    RestartDaemon {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     Shutdown {
         #[serde(rename = "requestId")]
         request_id: String,
@@ -2284,6 +2292,8 @@ enum P57HostCommand {
 enum P57HostWaitCondition {
     PendingPairing,
     BusinessReady,
+    BusinessMutated,
+    Revoked,
 }
 
 #[derive(Serialize)]
@@ -2299,6 +2309,7 @@ struct P57HostReady {
     relay_database_path: String,
     pid: u32,
     invite_file_mode: u32,
+    daemon_generation: u64,
     scenario: Option<&'static str>,
     conversation_id: Option<String>,
     conversation_title: Option<&'static str>,
@@ -2318,6 +2329,8 @@ struct P57HostEvidence {
     runtime_completed_command_count: i64,
     runtime_approval_total: i64,
     runtime_approval_applied: i64,
+    runtime_revoked_authorization_count: i64,
+    daemon_generation: u64,
     socket_is_unix: bool,
     socket_mode: u32,
 }
@@ -2337,6 +2350,17 @@ impl P57HostEvidence {
                     && self.relay_grant_active == 1
                     && self.active_transition_count == 0
                     && self.active_catalog_stream_count == 1
+            }
+            P57HostWaitCondition::BusinessMutated => {
+                self.runtime_command_count == 1
+                    && self.runtime_completed_command_count == 1
+                    && self.runtime_approval_total == 1
+                    && self.runtime_approval_applied == 1
+            }
+            P57HostWaitCondition::Revoked => {
+                self.relay_grant_total == 1
+                    && self.relay_grant_active == 0
+                    && self.runtime_revoked_authorization_count == 1
             }
         }
     }
@@ -2368,6 +2392,18 @@ struct P57HostPairingApproved<'a> {
     kind: &'static str,
     protocol: &'static str,
     request_id: &'a str,
+    evidence: P57HostEvidence,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct P57HostDaemonRestarted<'a> {
+    kind: &'static str,
+    protocol: &'static str,
+    request_id: &'a str,
+    recovered_conversation_id: String,
+    restart_marker_title: &'static str,
+    metadata_entry_revision: u64,
     evidence: P57HostEvidence,
 }
 
@@ -2427,7 +2463,131 @@ fn write_p57_host_invite(root: &Path, invite: &agentdeck_protocol::e2ee::PairInv
     path
 }
 
-async fn create_p57_r43_conversation(local: &RuntimeUnixClient, root: &Path) -> ConversationId {
+struct P57DaemonInstance {
+    _singleton: SingletonGuard,
+    core: Arc<RuntimeCore>,
+    local: RuntimeUnixClient,
+    socket: PathBuf,
+    stop_tx: Option<oneshot::Sender<()>>,
+    listener_task: tokio::task::JoinHandle<()>,
+}
+
+impl P57DaemonInstance {
+    async fn shutdown(mut self) {
+        self.local
+            .close()
+            .await
+            .expect("close P5.7 host local Runtime client");
+        self.stop_tx
+            .take()
+            .expect("P5.7 daemon stop sender remains owned")
+            .send(())
+            .expect("signal P5.7 daemon listener shutdown");
+        self.listener_task
+            .await
+            .expect("join P5.7 daemon listener task");
+        self.core
+            .shutdown()
+            .await
+            .expect("shutdown P5.7 host RuntimeCore");
+    }
+}
+
+async fn start_p57_daemon_instance(
+    config: &DaemonConfig,
+    daemon_keys: Arc<MemoryKeyStore>,
+    local_home: &Path,
+) -> P57DaemonInstance {
+    let singleton =
+        SingletonGuard::acquire(config.paths()).expect("acquire isolated P5.7 host singleton");
+    let storage_kek = load_or_create_storage_kek(daemon_keys.as_ref(), &config.paths().runtime_db)
+        .expect("load isolated P5.7 host StorageKEK");
+    let store = RuntimeStoreHandle::open(
+        RuntimeStoreConfig::new(config.paths().runtime_db.clone()),
+        storage_kek,
+    )
+    .await
+    .expect("open P5.7 host Runtime store");
+    let bootstrap = reconcile_machine_identity(config, &store, daemon_keys.as_ref())
+        .await
+        .expect("bootstrap P5.7 host machine identity");
+    let manager = Arc::new(RemoteManager::new(
+        store.clone(),
+        daemon_keys,
+        config.clone(),
+        bootstrap,
+    ));
+    let router = Arc::new(synthetic_e2e::agent_router());
+    let core = RuntimeCore::new_production_for_synthetic_e2e(
+        store,
+        router,
+        PathBuf::from(env!("CARGO_BIN_EXE_agentdeckd")),
+    )
+    .expect("construct P5.7 host production RuntimeCore with synthetic vendor adapters")
+    .with_remote_administration(manager.clone())
+    .with_pairing_administration(manager.clone())
+    .with_revocation_administration(manager.clone())
+    .with_conversation_activation(manager.clone());
+    assert!(manager.install_pairing_pending_sink(core.pairing_pending_sink()));
+    let core = Arc::new(core);
+    assert!(manager.install_runtime_core(&core));
+    let (_, recovery_ready) = core
+        .recover_for_startup()
+        .await
+        .expect("recover P5.7 host RuntimeCore");
+    let mut listener =
+        BoundLocalListener::bind_after_recovery(recovery_ready, config, &singleton, core.clone())
+            .await
+            .expect("bind P5.7 host stable Runtime UDS");
+    let socket = listener.local_ready_permit().socket_path().to_path_buf();
+    let remote_start = listener
+        .take_remote_start_permit()
+        .expect("P5.7 host stable listener yields remote start permit");
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let manager_for_shutdown = manager.clone();
+    let listener_task = tokio::spawn(async move {
+        listener
+            .serve_until(async move {
+                let _ = stop_rx.await;
+                manager_for_shutdown.shutdown().await;
+                Ok(())
+            })
+            .await
+            .expect("stop P5.7 host daemon listener");
+    });
+    manager
+        .arm(remote_start)
+        .await
+        .expect("arm P5.7 host RemoteManager");
+
+    fs::create_dir_all(local_home).expect("create isolated P5.7 host Runtime client home");
+    fs::set_permissions(local_home, fs::Permissions::from_mode(0o700))
+        .expect("secure isolated P5.7 host Runtime client home");
+    let local_installation_id = CliInstallationStore::injected_for_test(local_home.to_path_buf())
+        .load_or_create()
+        .expect("create stable P5.7 host Runtime installation identity");
+    let local = RuntimeUnixClient::connect_injected_with_installation(
+        InjectedEndpoint::for_test(socket.clone()),
+        local_installation_id,
+    )
+    .await
+    .expect("connect P5.7 host same-UID Runtime UDS");
+    P57DaemonInstance {
+        _singleton: singleton,
+        core,
+        local,
+        socket,
+        stop_tx: Some(stop_tx),
+        listener_task,
+    }
+}
+
+async fn create_p57_conversation(
+    local: &RuntimeUnixClient,
+    root: &Path,
+    idempotency_prefix: &str,
+    title: &str,
+) -> ConversationId {
     let RuntimeReply::ConversationStart(ConversationStartReceipt {
         conversation_id,
         replayed: false,
@@ -2435,20 +2595,20 @@ async fn create_p57_r43_conversation(local: &RuntimeUnixClient, root: &Path) -> 
         local,
         RuntimeRequest::Start(ConversationStart {
             agent_kind: AgentKind::Codex,
-            idempotency_key: IdempotencyKey::new("r43-ui-start-codex"),
+            idempotency_key: IdempotencyKey::new(format!("{idempotency_prefix}-start-codex")),
             cwd: root.to_path_buf(),
-            title: Some(P57_HOST_R43_CONVERSATION_TITLE.to_owned()),
+            title: Some(title.to_owned()),
         }),
     )
     .await
     else {
-        panic!("R4.3 host failed to create a fresh Codex conversation");
+        panic!("P5.7 host failed to create a fresh Codex conversation");
     };
     let configured = unary(
         local,
         RuntimeRequest::ConfigureConversation(ConfigureConversationRequest::new(
             conversation_id.clone(),
-            IdempotencyKey::new("r43-ui-configure-codex"),
+            IdempotencyKey::new(format!("{idempotency_prefix}-configure-codex")),
             0,
             conversation_configuration(AgentKind::Codex),
         )),
@@ -2466,7 +2626,7 @@ async fn create_p57_r43_conversation(local: &RuntimeUnixClient, root: &Path) -> 
     conversation_id
 }
 
-fn runtime_business_counts(database: &Path) -> (i64, i64, i64) {
+fn runtime_business_counts(database: &Path) -> (i64, i64, i64, i64) {
     Connection::open_with_flags(
         database,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -2476,9 +2636,10 @@ fn runtime_business_counts(database: &Path) -> (i64, i64, i64) {
         "SELECT
             (SELECT COUNT(*) FROM commands WHERE state = 'completed'),
             (SELECT COUNT(*) FROM approval_ledger),
-            (SELECT COUNT(*) FROM approval_ledger WHERE state = 'applied')",
+            (SELECT COUNT(*) FROM approval_ledger WHERE state = 'applied'),
+            (SELECT COUNT(*) FROM remote_authorization_ledger WHERE lifecycle = 'revoked')",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )
     .expect("read Runtime business counts")
 }
@@ -2488,6 +2649,7 @@ async fn p57_host_evidence(
     socket: &Path,
     runtime_db: &Path,
     relay_db: &Path,
+    daemon_generation: u64,
 ) -> P57HostEvidence {
     let RuntimeReply::MachineRemoteStatus(machine_status) = unary(
         local,
@@ -2527,8 +2689,12 @@ async fn p57_host_evidence(
     let (relay_grant_total, relay_grant_active) = relay_device_grant_counts(relay_db);
     let (active_transition_count, active_catalog_stream_count) =
         runtime_transition_counts(runtime_db);
-    let (runtime_completed_command_count, runtime_approval_total, runtime_approval_applied) =
-        runtime_business_counts(runtime_db);
+    let (
+        runtime_completed_command_count,
+        runtime_approval_total,
+        runtime_approval_applied,
+        runtime_revoked_authorization_count,
+    ) = runtime_business_counts(runtime_db);
     let socket_metadata = fs::symlink_metadata(socket).ok();
     P57HostEvidence {
         machine_remote_lifecycle: machine_status.lifecycle,
@@ -2545,6 +2711,8 @@ async fn p57_host_evidence(
         runtime_completed_command_count,
         runtime_approval_total,
         runtime_approval_applied,
+        runtime_revoked_authorization_count,
+        daemon_generation,
         socket_is_unix: socket_metadata
             .as_ref()
             .is_some_and(|metadata| metadata.file_type().is_socket()),
@@ -2561,10 +2729,12 @@ async fn wait_for_p57_host_evidence(
     relay_db: &Path,
     condition: P57HostWaitCondition,
     timeout_ms: u64,
+    daemon_generation: u64,
 ) -> (bool, P57HostEvidence) {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        let evidence = p57_host_evidence(local, socket, runtime_db, relay_db).await;
+        let evidence =
+            p57_host_evidence(local, socket, runtime_db, relay_db, daemon_generation).await;
         if evidence.satisfies(condition) {
             return (true, evidence);
         }
@@ -3054,83 +3224,14 @@ async fn p57_real_dual_scope_ndjson_host() {
         .await
         .expect("start real P5.7 host Relay Direct TLS server");
     let config = stable_daemon_config(&root_path);
-    let singleton =
-        SingletonGuard::acquire(config.paths()).expect("acquire isolated P5.7 host singleton");
     let daemon_keys = Arc::new(MemoryKeyStore::new());
-    let storage_kek = load_or_create_storage_kek(daemon_keys.as_ref(), &config.paths().runtime_db)
-        .expect("load isolated P5.7 host StorageKEK");
-    let store = RuntimeStoreHandle::open(
-        RuntimeStoreConfig::new(config.paths().runtime_db.clone()),
-        storage_kek,
-    )
-    .await
-    .expect("open P5.7 host Runtime store");
-    let bootstrap = reconcile_machine_identity(&config, &store, daemon_keys.as_ref())
-        .await
-        .expect("bootstrap P5.7 host machine identity");
-    let manager = Arc::new(RemoteManager::new(
-        store.clone(),
-        daemon_keys,
-        config.clone(),
-        bootstrap,
-    ));
-    let router = Arc::new(synthetic_e2e::agent_router());
-    let core = RuntimeCore::new_production_for_synthetic_e2e(
-        store.clone(),
-        router,
-        PathBuf::from(env!("CARGO_BIN_EXE_agentdeckd")),
-    )
-    .expect("construct P5.7 host production RuntimeCore with synthetic vendor adapters")
-    .with_remote_administration(manager.clone())
-    .with_pairing_administration(manager.clone())
-    .with_revocation_administration(manager.clone())
-    .with_conversation_activation(manager.clone());
-    assert!(manager.install_pairing_pending_sink(core.pairing_pending_sink()));
-    let core = Arc::new(core);
-    assert!(manager.install_runtime_core(&core));
-    let (_, recovery_ready) = core
-        .recover_for_startup()
-        .await
-        .expect("recover P5.7 host RuntimeCore");
-    let mut listener =
-        BoundLocalListener::bind_after_recovery(recovery_ready, &config, &singleton, core.clone())
-            .await
-            .expect("bind P5.7 host stable Runtime UDS");
-    let socket = listener.local_ready_permit().socket_path().to_path_buf();
-    let remote_start = listener
-        .take_remote_start_permit()
-        .expect("P5.7 host stable listener yields remote start permit");
-    let (stop_tx, stop_rx) = oneshot::channel();
-    let manager_for_shutdown = manager.clone();
-    let listener_task = tokio::spawn(async move {
-        listener
-            .serve_until(async move {
-                let _ = stop_rx.await;
-                manager_for_shutdown.shutdown().await;
-                Ok(())
-            })
-            .await
-    });
-    manager
-        .arm(remote_start)
-        .await
-        .expect("arm P5.7 host RemoteManager");
-
     let local_home = root_path.join("runtime-host-client-home");
-    fs::create_dir(&local_home).expect("create isolated P5.7 host Runtime client home");
-    fs::set_permissions(&local_home, fs::Permissions::from_mode(0o700))
-        .expect("secure isolated P5.7 host Runtime client home");
-    let local_installation_id = CliInstallationStore::injected_for_test(local_home)
-        .load_or_create()
-        .expect("create stable P5.7 host Runtime installation identity");
-    let local = RuntimeUnixClient::connect_injected_with_installation(
-        InjectedEndpoint::for_test(socket.clone()),
-        local_installation_id,
-    )
-    .await
-    .expect("connect P5.7 host same-UID Runtime UDS");
+    let mut daemon_generation = 1_u64;
+    let mut daemon =
+        Some(start_p57_daemon_instance(&config, daemon_keys.clone(), &local_home).await);
+    let initial_daemon = daemon.as_ref().expect("initial P5.7 daemon is present");
     let enrollment = unary(
-        &local,
+        &initial_daemon.local,
         RuntimeRequest::MachineEnroll(MachineEnrollRequest {
             bundle,
             scope: LocalOnlyAdministration::LocalOnly,
@@ -3139,12 +3240,20 @@ async fn p57_real_dual_scope_ndjson_host() {
     .await;
     assert!(matches!(enrollment, RuntimeReply::MachineRemoteStatus(_)));
     let r43_conversation = match host_scenario {
-        Some(P57_HOST_R43_SCENARIO) => Some(create_p57_r43_conversation(&local, &root_path).await),
+        Some(P57_HOST_R43_SCENARIO | P57_HOST_R44_SCENARIO) => Some(
+            create_p57_conversation(
+                &initial_daemon.local,
+                &root_path,
+                "r43-ui",
+                P57_HOST_R43_CONVERSATION_TITLE,
+            )
+            .await,
+        ),
         None => None,
         Some(_) => unreachable!("P5.7 host scenario was validated above"),
     };
     let RuntimeReply::PairInvite(invite_reply) = unary(
-        &local,
+        &initial_daemon.local,
         RuntimeRequest::CreatePairInvite(CreatePairInviteRequest {
             display_name: "P5.7 Swift dual-scope host".to_owned(),
             idempotency_key: IdempotencyKey::new("p57-real-dual-scope-invite"),
@@ -3162,8 +3271,14 @@ async fn p57_real_dual_scope_ndjson_host() {
         .mode()
         & 0o777;
     let home_path = root_path.join("home");
-    let initial_evidence =
-        p57_host_evidence(&local, &socket, &config.paths().runtime_db, &relay_db).await;
+    let initial_evidence = p57_host_evidence(
+        &initial_daemon.local,
+        &initial_daemon.socket,
+        &config.paths().runtime_db,
+        &relay_db,
+        daemon_generation,
+    )
+    .await;
     assert!(initial_evidence.socket_is_unix);
     assert_eq!(initial_evidence.socket_mode, 0o600);
     assert_eq!(initial_evidence.pending_pairing_count, 0);
@@ -3174,12 +3289,13 @@ async fn p57_real_dual_scope_ndjson_host() {
         protocol: P57_HOST_PROTOCOL,
         root_path: root_path.to_string_lossy().into_owned(),
         home_path: home_path.to_string_lossy().into_owned(),
-        socket_path: socket.to_string_lossy().into_owned(),
+        socket_path: initial_daemon.socket.to_string_lossy().into_owned(),
         invite_path: invite_path.to_string_lossy().into_owned(),
         runtime_database_path: config.paths().runtime_db.to_string_lossy().into_owned(),
         relay_database_path: relay_db.to_string_lossy().into_owned(),
         pid: std::process::id(),
         invite_file_mode,
+        daemon_generation,
         scenario: host_scenario,
         conversation_id: r43_conversation
             .as_ref()
@@ -3230,6 +3346,7 @@ async fn p57_real_dual_scope_ndjson_host() {
             P57HostCommand::Status { request_id }
             | P57HostCommand::WaitFor { request_id, .. }
             | P57HostCommand::ApprovePendingPairing { request_id }
+            | P57HostCommand::RestartDaemon { request_id }
             | P57HostCommand::Shutdown { request_id } => request_id,
         };
         if request_id.is_empty()
@@ -3249,8 +3366,15 @@ async fn p57_real_dual_scope_ndjson_host() {
 
         match command {
             P57HostCommand::Status { request_id } => {
-                let evidence =
-                    p57_host_evidence(&local, &socket, &config.paths().runtime_db, &relay_db).await;
+                let current = daemon.as_ref().expect("P5.7 daemon is present for status");
+                let evidence = p57_host_evidence(
+                    &current.local,
+                    &current.socket,
+                    &config.paths().runtime_db,
+                    &relay_db,
+                    daemon_generation,
+                )
+                .await;
                 emit_p57_host_record(&P57HostStatus {
                     kind: "status",
                     protocol: P57_HOST_PROTOCOL,
@@ -3272,13 +3396,15 @@ async fn p57_real_dual_scope_ndjson_host() {
                     });
                     continue;
                 }
+                let current = daemon.as_ref().expect("P5.7 daemon is present for wait");
                 let (satisfied, evidence) = wait_for_p57_host_evidence(
-                    &local,
-                    &socket,
+                    &current.local,
+                    &current.socket,
                     &config.paths().runtime_db,
                     &relay_db,
                     condition,
                     timeout_ms,
+                    daemon_generation,
                 )
                 .await;
                 emit_p57_host_record(&P57HostWait {
@@ -3291,8 +3417,11 @@ async fn p57_real_dual_scope_ndjson_host() {
                 });
             }
             P57HostCommand::ApprovePendingPairing { request_id } => {
+                let current = daemon
+                    .as_ref()
+                    .expect("P5.7 daemon is present for pairing approval");
                 let pending = unary(
-                    &local,
+                    &current.local,
                     RuntimeRequest::ListPendingPairings {
                         scope: LocalOnlyAdministration::LocalOnly,
                     },
@@ -3318,7 +3447,7 @@ async fn p57_real_dual_scope_ndjson_host() {
                 }
                 let pairing_id = pairings.remove(0).pairing_id;
                 let confirmed = unary(
-                    &local,
+                    &current.local,
                     RuntimeRequest::ConfirmPairing {
                         pairing_id: pairing_id.clone(),
                         scope: LocalOnlyAdministration::LocalOnly,
@@ -3341,12 +3470,117 @@ async fn p57_real_dual_scope_ndjson_host() {
                     });
                     continue;
                 }
-                let evidence =
-                    p57_host_evidence(&local, &socket, &config.paths().runtime_db, &relay_db).await;
+                let evidence = p57_host_evidence(
+                    &current.local,
+                    &current.socket,
+                    &config.paths().runtime_db,
+                    &relay_db,
+                    daemon_generation,
+                )
+                .await;
                 emit_p57_host_record(&P57HostPairingApproved {
                     kind: "approvePendingPairing",
                     protocol: P57_HOST_PROTOCOL,
                     request_id: &request_id,
+                    evidence,
+                });
+            }
+            P57HostCommand::RestartDaemon { request_id } => {
+                if host_scenario != Some(P57_HOST_R44_SCENARIO) || daemon_generation != 1 {
+                    emit_p57_host_record(&P57HostError {
+                        kind: "error",
+                        protocol: P57_HOST_PROTOCOL,
+                        request_id: Some(&request_id),
+                        code: "host.restart.scenario_invalid",
+                    });
+                    continue;
+                }
+                let previous = daemon
+                    .take()
+                    .expect("P5.7 daemon is present before restart");
+                let expected_socket = previous.socket.clone();
+                previous.shutdown().await;
+                assert!(
+                    !expected_socket.exists(),
+                    "old Runtime socket remains after restart cut"
+                );
+
+                daemon_generation = daemon_generation
+                    .checked_add(1)
+                    .expect("P5.7 daemon generation remains bounded");
+                let restarted =
+                    start_p57_daemon_instance(&config, daemon_keys.clone(), &local_home).await;
+                assert_eq!(
+                    restarted.socket, expected_socket,
+                    "restarted daemon must recover the exact stable Runtime endpoint"
+                );
+                daemon = Some(restarted);
+                let current = daemon.as_ref().expect("restarted P5.7 daemon is present");
+                let (satisfied, _pre_marker_evidence) = wait_for_p57_host_evidence(
+                    &current.local,
+                    &current.socket,
+                    &config.paths().runtime_db,
+                    &relay_db,
+                    P57HostWaitCondition::BusinessReady,
+                    60_000,
+                    daemon_generation,
+                )
+                .await;
+                if !satisfied {
+                    emit_p57_host_record(&P57HostError {
+                        kind: "error",
+                        protocol: P57_HOST_PROTOCOL,
+                        request_id: Some(&request_id),
+                        code: "host.restart.business_not_ready",
+                    });
+                    continue;
+                }
+                let recovered_conversation_id = r43_conversation
+                    .as_ref()
+                    .expect("R4.4 lifecycle keeps the original conversation identity")
+                    .clone();
+                let marker = unary(
+                    &current.local,
+                    RuntimeRequest::UpdateConversationMetadata(
+                        ConversationMetadataMutationRequest::new(
+                            recovered_conversation_id.clone(),
+                            IdempotencyKey::new("r44-restart-marker"),
+                            0,
+                            ConversationMetadataMutation::rename(Some(
+                                P57_HOST_R44_RESTART_MARKER_TITLE.to_owned(),
+                            ))
+                            .expect("valid R4.4 restart marker title"),
+                        )
+                        .expect("valid R4.4 restart marker request"),
+                    ),
+                )
+                .await;
+                let metadata_entry_revision = match marker {
+                    RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Applied {
+                        conversation_id,
+                        entry_revision,
+                    }) if conversation_id == recovered_conversation_id && entry_revision == 1 => {
+                        entry_revision
+                    }
+                    other => panic!(
+                        "restarted daemon did not apply the exact marker metadata: {other:?}"
+                    ),
+                };
+                let evidence = p57_host_evidence(
+                    &current.local,
+                    &current.socket,
+                    &config.paths().runtime_db,
+                    &relay_db,
+                    daemon_generation,
+                )
+                .await;
+                emit_p57_host_record(&P57HostDaemonRestarted {
+                    kind: "restartDaemon",
+                    protocol: P57_HOST_PROTOCOL,
+                    request_id: &request_id,
+                    recovered_conversation_id: recovered_conversation_id.as_str().to_owned(),
+                    restart_marker_title: P57_HOST_R44_RESTART_MARKER_TITLE,
+                    metadata_entry_revision,
                     evidence,
                 });
             }
@@ -3357,25 +3591,14 @@ async fn p57_real_dual_scope_ndjson_host() {
         }
     }
 
-    local
-        .close()
-        .await
-        .expect("close P5.7 host local Runtime client");
     let invite_removed = match fs::remove_file(&invite_path) {
         Ok(()) => true,
         Err(error) if error.kind() == io::ErrorKind::NotFound => true,
         Err(error) => panic!("remove P5.7 host invite file: {error}"),
     };
-    stop_tx
-        .send(())
-        .expect("signal P5.7 host daemon listener shutdown");
-    listener_task
-        .await
-        .expect("join P5.7 host daemon listener task")
-        .expect("stop P5.7 host daemon listener");
-    core.shutdown()
-        .await
-        .expect("shutdown P5.7 host RuntimeCore");
+    let final_daemon = daemon.take().expect("P5.7 daemon is present for shutdown");
+    let final_socket = final_daemon.socket.clone();
+    final_daemon.shutdown().await;
     relay
         .shutdown()
         .await
@@ -3385,6 +3608,6 @@ async fn p57_real_dual_scope_ndjson_host() {
         protocol: P57_HOST_PROTOCOL,
         request_id: shutdown_request_id.as_deref(),
         invite_removed,
-        socket_exists: socket.exists(),
+        socket_exists: final_socket.exists(),
     });
 }

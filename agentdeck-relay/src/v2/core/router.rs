@@ -4,6 +4,7 @@
 //! socket 永远不能。每条命令在出队和 Store 返回后都重新验证 active authorization，
 //! replay page 则由短生命周期 task 拉取、回到 actor 后再做 epoch/current 复核与 FIFO 入队。
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -314,6 +315,7 @@ impl RelayCore {
             authorization,
             lifecycle,
             connections: ConnectionRegistry::new(config.max_subscriptions_per_connection),
+            device_refresh_pending: HashSet::new(),
             pair_routes: PairRouteRegistry::new(relay_server_id, config.pair_route_limits)?,
             draining: false,
             config,
@@ -508,6 +510,9 @@ struct RelayCoreActor {
     authorization: AuthorizationCoordinator,
     lifecycle: AuthorizationLifecycle,
     connections: ConnectionRegistry,
+    /// 有 device 的 machine generation 消失后保留到下一次 machine activation。
+    /// 关闭窗口内抢先重连的 device，随后立即删除；不持久化 grant/stream 状态。
+    device_refresh_pending: HashSet<MachineRouteId>,
     pair_routes: PairRouteRegistry,
     draining: bool,
     config: CoreConfig,
@@ -676,6 +681,10 @@ impl RelayCoreActor {
     }
 
     fn activate(&mut self, access: AccessContext) -> Result<(), RelayFailure> {
+        let activated_machine = match access.principal_route() {
+            Some(PrincipalRoute::Machine(machine)) => Some(machine),
+            _ => None,
+        };
         if access.machine_link_is_expired_at(self.now_ms) {
             self.close_connection(
                 access.connection_instance(),
@@ -724,6 +733,11 @@ impl RelayCoreActor {
             .map_err(connection_failure)?;
         if let Some(cleanup) = cleanup {
             self.finish_cleanup(cleanup);
+        }
+        if let Some(machine) = activated_machine
+            && self.device_refresh_pending.remove(&machine)
+        {
+            self.close_dependent_devices(machine, WriterCloseReason::Disconnected);
         }
         Ok(())
     }
@@ -2439,10 +2453,39 @@ impl RelayCoreActor {
         }
     }
 
-    fn finish_cleanup(&self, cleanup: ConnectionCleanup) {
+    fn finish_cleanup(&mut self, cleanup: ConnectionCleanup) {
+        let dependent_machine = match cleanup.principal {
+            Some(PrincipalRoute::Machine(machine))
+                if machine_disconnect_requires_device_reconnect(cleanup.close_reason) =>
+            {
+                Some(machine)
+            }
+            _ => None,
+        };
         if let Some(principal) = cleanup.principal {
             let _ = self.authorization.disconnect(principal, cleanup.connection);
         }
+        if let Some(machine) = dependent_machine
+            && self.close_dependent_devices(machine, cleanup.close_reason) > 0
+        {
+            // 旧 device 关闭后可能在 machine downtime 内先于新 generation 重连；
+            // 下一次该 machine activation 必须再关闭一次，fresh subscribe 才会
+            // 严格发生在新 machine writer 已激活之后。
+            self.device_refresh_pending.insert(machine);
+        }
+    }
+
+    fn close_dependent_devices(
+        &mut self,
+        machine: MachineRouteId,
+        reason: WriterCloseReason,
+    ) -> usize {
+        let devices = self.connections.close_devices_for_machine(machine, reason);
+        let closed = devices.len();
+        for device in devices {
+            self.finish_cleanup(device);
+        }
+        closed
     }
 
     async fn graceful_shutdown(&mut self) -> Result<(), RelayFailure> {
@@ -2466,6 +2509,29 @@ impl RelayCoreActor {
         }
         let _ = self.tasks.abort_and_join().await;
         let _ = self.authorization.shutdown().await;
+    }
+}
+
+/// 只把已证明旧 machine transport 不再可用的关闭原因向 device 级联。
+/// `Replaced` 也会出现在首次 grant transition 的同进程 re-auth；此时关闭 device
+/// 会截断尚未完成的 transition snapshot，因此不能把普通 activation replacement
+/// 等同于 daemon/process generation 丢失。
+fn machine_disconnect_requires_device_reconnect(reason: WriterCloseReason) -> bool {
+    match reason {
+        WriterCloseReason::Disconnected
+        | WriterCloseReason::AuthorizationInvalidated
+        | WriterCloseReason::HeartbeatTimeout => true,
+        WriterCloseReason::Explicit
+        | WriterCloseReason::Replaced
+        | WriterCloseReason::Shutdown
+        | WriterCloseReason::Lagged
+        | WriterCloseReason::CriticalBackpressure
+        | WriterCloseReason::ReceiverDropped
+        | WriterCloseReason::DeliveryDropped
+        | WriterCloseReason::AllWritersDropped
+        | WriterCloseReason::Revoked
+        | WriterCloseReason::Retired
+        | WriterCloseReason::PairRouteUnavailable => false,
     }
 }
 
@@ -2687,6 +2753,7 @@ mod tests {
             authorization,
             lifecycle,
             connections: ConnectionRegistry::new(config.max_subscriptions_per_connection),
+            device_refresh_pending: HashSet::new(),
             pair_routes: PairRouteRegistry::new(store.relay_server_id(), config.pair_route_limits)
                 .expect("pair registry"),
             draining: false,
