@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use agentdeck_protocol::e2ee::{KeyId, KeyPurpose, SignedSealedBlobV1, UnsignedSealedBlobV1};
 use agentdeck_protocol::relay_v2::{
-    DeviceRouteId, Ed25519Signature, MachineRouteId, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION,
-    RelayFrameBody, RequestRouteId,
+    DeviceRouteId, Ed25519Signature, GrantSerial as RelayGrantSerial, KeyDirectoryRevision,
+    MachineRouteId, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId,
+    TrustEpoch,
 };
 use agentdeck_protocol::runtime::command::{RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::failure::{
@@ -46,7 +47,8 @@ use super::dispatch::{
 use super::link::{
     DirectedReplyRoute, DirectedReplySeal, DirectedReplySealer, RemoteLinkError, RemoteLinkOwner,
     RemoteReplyPump, RemoteStreamPublisher, ReplyRouteBind, ReplyRouteLifecycle,
-    UnavailableDirectedReplySealer, UnavailableRemoteStreamPublisher, send_directed_reply_for_test,
+    UnavailableDirectedReplySealer, UnavailableRemoteStreamPublisher, connection_key,
+    send_directed_reply_for_test,
 };
 use super::replay::{ReplayDecision, ReplayError};
 use super::transport::active_pairing_transport_for_test;
@@ -58,6 +60,29 @@ const REQUEST_A: RequestRouteId = RequestRouteId::from_bytes([0x64; 16]);
 const REQUEST_B: RequestRouteId = RequestRouteId::from_bytes([0x65; 16]);
 const CONNECTION_A: ConnectionId = ConnectionId::from_test_bytes([0xa1; 16]);
 const CONNECTION_B: ConnectionId = ConnectionId::from_test_bytes([0xb2; 16]);
+
+#[test]
+fn remote_connection_identity_survives_key_directory_revision_rollover() {
+    let authorization = |revision| {
+        RemoteReplyAuthorization::for_snapshot_permit_test(
+            [0x11; 32],
+            MACHINE,
+            TrustEpoch::new(7),
+            DEVICE_A,
+            RelayGrantSerial::new(13),
+            [0x22; 32],
+            [0x33; 32],
+            [0x44; 32],
+            KeyDirectoryRevision::new(revision),
+            17,
+        )
+    };
+
+    assert!(
+        connection_key(&authorization(41)) == connection_key(&authorization(42)),
+        "request-scoped directory revision rollover must not replace the device Runtime connection"
+    );
+}
 
 struct GatedSelfRevocationAdministration {
     entered: tokio::sync::mpsc::UnboundedSender<(DeviceHandle, GrantSerial)>,
@@ -279,18 +304,17 @@ async fn two_pre_activated_fresh_self_revocations_only_enter_backend_once() {
     let RemotePrincipalActivation::NewOrExisting(second_principal) = second_principal else {
         panic!("second Fresh Active self-revoke must also pre-activate normally")
     };
-    // RemoteLink 会按 authorization key 复用既有 connection；第二个 activation 只证明
-    // B 也在 Active 时越过 pre-Core 边界，真正 mutation 仍从同一 connection dispatch。
-    drop(second_principal);
+    // RemoteLink 会按稳定 authorization identity 复用既有 connection；两个 request
+    // 仍分别携带各自 Store-current principal 进入 Core。
     let (sink, _writes) = tokio::sync::mpsc::channel::<ConnectionWrite>(2);
     let connection = core
-        .connect(first_principal, ConnectionSink::new(sink))
+        .connect(first_principal.clone(), ConnectionSink::new(sink))
         .expect("connect the shared pre-activated Fresh self-revoke principal");
 
     let first_handling = tokio::spawn({
         let core = core.clone();
         async move {
-            core.handle_remote_envelope(connection, first_envelope, first_replay)
+            core.handle_remote_envelope(connection, first_principal, first_envelope, first_replay)
                 .await
         }
     });
@@ -309,8 +333,13 @@ async fn two_pre_activated_fresh_self_revocations_only_enter_backend_once() {
     let mut second_handling = tokio::spawn({
         let core = core.clone();
         async move {
-            core.handle_remote_envelope(connection, second_envelope, second_replay)
-                .await
+            core.handle_remote_envelope(
+                connection,
+                second_principal,
+                second_envelope,
+                second_replay,
+            )
+            .await
         }
     });
     let (second_completed, unexpected) =

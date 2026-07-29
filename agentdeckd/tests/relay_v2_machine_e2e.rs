@@ -2330,6 +2330,11 @@ struct P57HostEvidence {
     runtime_approval_total: i64,
     runtime_approval_applied: i64,
     runtime_revoked_authorization_count: i64,
+    runtime_active_writer_count: usize,
+    runtime_live_subscription_count: usize,
+    runtime_barrier_subscription_count: usize,
+    runtime_snapshot_sender_count: usize,
+    runtime_subscription_job_count: usize,
     daemon_generation: u64,
     socket_is_unix: bool,
     socket_mode: u32,
@@ -2356,6 +2361,11 @@ impl P57HostEvidence {
                     && self.runtime_completed_command_count == 1
                     && self.runtime_approval_total == 1
                     && self.runtime_approval_applied == 1
+                    && self.runtime_active_writer_count == 2
+                    && self.runtime_live_subscription_count == 2
+                    && self.runtime_barrier_subscription_count == 0
+                    && self.runtime_snapshot_sender_count == 0
+                    && self.runtime_subscription_job_count == 2
             }
             P57HostWaitCondition::Revoked => {
                 self.relay_grant_total == 1
@@ -2645,6 +2655,7 @@ fn runtime_business_counts(database: &Path) -> (i64, i64, i64, i64) {
 }
 
 async fn p57_host_evidence(
+    core: &RuntimeCore,
     local: &RuntimeUnixClient,
     socket: &Path,
     runtime_db: &Path,
@@ -2696,6 +2707,13 @@ async fn p57_host_evidence(
         runtime_revoked_authorization_count,
     ) = runtime_business_counts(runtime_db);
     let socket_metadata = fs::symlink_metadata(socket).ok();
+    let (
+        runtime_active_writer_count,
+        runtime_live_subscription_count,
+        runtime_barrier_subscription_count,
+        runtime_snapshot_sender_count,
+        runtime_subscription_job_count,
+    ) = core.synthetic_e2e_subscription_metrics();
     P57HostEvidence {
         machine_remote_lifecycle: machine_status.lifecycle,
         failure_code: machine_status
@@ -2712,6 +2730,11 @@ async fn p57_host_evidence(
         runtime_approval_total,
         runtime_approval_applied,
         runtime_revoked_authorization_count,
+        runtime_active_writer_count,
+        runtime_live_subscription_count,
+        runtime_barrier_subscription_count,
+        runtime_snapshot_sender_count,
+        runtime_subscription_job_count,
         daemon_generation,
         socket_is_unix: socket_metadata
             .as_ref()
@@ -2723,6 +2746,7 @@ async fn p57_host_evidence(
 }
 
 async fn wait_for_p57_host_evidence(
+    core: &RuntimeCore,
     local: &RuntimeUnixClient,
     socket: &Path,
     runtime_db: &Path,
@@ -2734,7 +2758,7 @@ async fn wait_for_p57_host_evidence(
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         let evidence =
-            p57_host_evidence(local, socket, runtime_db, relay_db, daemon_generation).await;
+            p57_host_evidence(core, local, socket, runtime_db, relay_db, daemon_generation).await;
         if evidence.satisfies(condition) {
             return (true, evidence);
         }
@@ -3272,6 +3296,7 @@ async fn p57_real_dual_scope_ndjson_host() {
         & 0o777;
     let home_path = root_path.join("home");
     let initial_evidence = p57_host_evidence(
+        initial_daemon.core.as_ref(),
         &initial_daemon.local,
         &initial_daemon.socket,
         &config.paths().runtime_db,
@@ -3368,6 +3393,7 @@ async fn p57_real_dual_scope_ndjson_host() {
             P57HostCommand::Status { request_id } => {
                 let current = daemon.as_ref().expect("P5.7 daemon is present for status");
                 let evidence = p57_host_evidence(
+                    current.core.as_ref(),
                     &current.local,
                     &current.socket,
                     &config.paths().runtime_db,
@@ -3398,6 +3424,7 @@ async fn p57_real_dual_scope_ndjson_host() {
                 }
                 let current = daemon.as_ref().expect("P5.7 daemon is present for wait");
                 let (satisfied, evidence) = wait_for_p57_host_evidence(
+                    current.core.as_ref(),
                     &current.local,
                     &current.socket,
                     &config.paths().runtime_db,
@@ -3471,6 +3498,7 @@ async fn p57_real_dual_scope_ndjson_host() {
                     continue;
                 }
                 let evidence = p57_host_evidence(
+                    current.core.as_ref(),
                     &current.local,
                     &current.socket,
                     &config.paths().runtime_db,
@@ -3517,6 +3545,7 @@ async fn p57_real_dual_scope_ndjson_host() {
                 daemon = Some(restarted);
                 let current = daemon.as_ref().expect("restarted P5.7 daemon is present");
                 let (satisfied, _pre_marker_evidence) = wait_for_p57_host_evidence(
+                    current.core.as_ref(),
                     &current.local,
                     &current.socket,
                     &config.paths().runtime_db,
@@ -3567,6 +3596,7 @@ async fn p57_real_dual_scope_ndjson_host() {
                     ),
                 };
                 let evidence = p57_host_evidence(
+                    current.core.as_ref(),
                     &current.local,
                     &current.socket,
                     &config.paths().runtime_db,

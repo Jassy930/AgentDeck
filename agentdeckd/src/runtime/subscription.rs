@@ -383,7 +383,7 @@ impl SubscriptionRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fn metrics(&self) -> Result<(Usage, usize), SubscriptionRegistryError> {
         let state = self.lock()?;
         Ok((all_usage(&state)?, state.connections.len()))

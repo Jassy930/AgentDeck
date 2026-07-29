@@ -170,6 +170,17 @@ pub(crate) enum RemotePrincipalActivation {
     SelfRevocationRetry(RemoteSelfRevocationAdmission),
 }
 
+impl RemotePrincipalActivation {
+    /// connection 只持稳定 writer/subscription lifetime；每个 ingress 仍把当次
+    /// Store-current principal 快照带入 Core，不能回读首次 connect 的旧 ADC2 binding。
+    pub(crate) fn request_principal(&self) -> AuthenticatedPrincipal {
+        match self {
+            Self::NewOrExisting(principal) => principal.clone(),
+            Self::SelfRevocationRetry(admission) => admission.request_principal(),
+        }
+    }
+}
+
 /// 完整 durable replay admission 规范化后的 Core 中立分类。只有 byte-identical
 /// `ExactDuplicate` 能恢复已经 Revoking 的 self-revoke；Fresh 只允许首次 Active mutation。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -552,6 +563,24 @@ impl RuntimeCore {
         snapshot_senders
     }
 
+    /// debug-only synthetic E2E 读回。只暴露内存资源计数，不暴露 principal、
+    /// conversation identity 或任何协议/密钥材料。
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub fn synthetic_e2e_subscription_metrics(&self) -> (usize, usize, usize, usize, usize) {
+        let (live, barriers, snapshot_senders, jobs) = self
+            .subscriptions
+            .metrics()
+            .expect("read synthetic E2E subscription metrics");
+        (
+            self.connections.active_writer_count(),
+            live,
+            barriers,
+            snapshot_senders,
+            jobs,
+        )
+    }
+
     /// 消费与 exact Current proof 同源的 staged lease；调用方只有在本 activation
     /// 成功后才发布 replay candidate，随后方可进入 Core。其它 Active material、
     /// 其它 Core 或已经 Revoking/Revoked 的 shared lease 均 fail-close。
@@ -713,6 +742,17 @@ impl RuntimeCore {
                 return RuntimeReply::Failure(RuntimeCoreError::Connection(error).into_failure());
             }
         };
+        self.handle_admitted_with_principal(operation, principal, request, replay)
+            .await
+    }
+
+    async fn handle_admitted_with_principal(
+        &self,
+        operation: &RuntimeOperationGuard,
+        principal: AuthenticatedPrincipal,
+        request: RuntimeRequest,
+        replay: RemoteIngressReplayClass,
+    ) -> RuntimeReply {
         match self
             .handle_ready(operation, principal, request, replay)
             .await
@@ -729,8 +769,17 @@ impl RuntimeCore {
         connection_id: ConnectionId,
         envelope: RuntimeEnvelope,
     ) -> Result<(), RuntimeFailure> {
-        self.handle_envelope_with_replay(connection_id, envelope, RemoteIngressReplayClass::Fresh)
-            .await
+        let principal = self
+            .connections
+            .principal(connection_id)
+            .map_err(|error| RuntimeCoreError::Connection(error).into_failure())?;
+        self.handle_envelope_with_principal(
+            connection_id,
+            principal,
+            envelope,
+            RemoteIngressReplayClass::Fresh,
+        )
+        .await
     }
 
     /// RemoteLink 在完整 DeviceSign/AAD/replay/AEAD 与 local auth-ledger 验证后
@@ -739,23 +788,37 @@ impl RuntimeCore {
     pub(crate) async fn handle_remote_envelope(
         &self,
         connection_id: ConnectionId,
+        principal: AuthenticatedPrincipal,
         envelope: RuntimeEnvelope,
         replay: RemoteIngressReplayClass,
     ) -> Result<(), RuntimeFailure> {
-        self.handle_envelope_with_replay(connection_id, envelope, replay)
+        let principal = self.validate_remote_request_principal(connection_id, principal)?;
+        self.handle_envelope_with_principal(connection_id, principal, envelope, replay)
             .await
     }
 
-    async fn handle_envelope_with_replay(
+    fn validate_remote_request_principal(
         &self,
         connection_id: ConnectionId,
-        envelope: RuntimeEnvelope,
-        replay: RemoteIngressReplayClass,
-    ) -> Result<(), RuntimeFailure> {
-        let principal = self
+        principal: AuthenticatedPrincipal,
+    ) -> Result<AuthenticatedPrincipal, RuntimeFailure> {
+        let attached = self
             .connections
             .principal(connection_id)
             .map_err(|error| RuntimeCoreError::Connection(error).into_failure())?;
+        if !attached.shares_authorization_identity_and_lease(&principal) {
+            return Err(RuntimeCoreError::AuthorizationDenied.into_failure());
+        }
+        Ok(principal)
+    }
+
+    async fn handle_envelope_with_principal(
+        &self,
+        connection_id: ConnectionId,
+        principal: AuthenticatedPrincipal,
+        envelope: RuntimeEnvelope,
+        replay: RemoteIngressReplayClass,
+    ) -> Result<(), RuntimeFailure> {
         let operation = self
             .try_enter_operation()
             .map_err(RuntimeCoreError::into_failure)?;
@@ -823,13 +886,11 @@ impl RuntimeCore {
     pub(crate) async fn handle_transition_snapshot_envelope(
         &self,
         connection_id: ConnectionId,
+        principal: AuthenticatedPrincipal,
         envelope: RuntimeEnvelope,
         permit: TransitionSnapshotPermit,
     ) -> Result<(), RuntimeFailure> {
-        let principal = self
-            .connections
-            .principal(connection_id)
-            .map_err(|error| RuntimeCoreError::Connection(error).into_failure())?;
+        let principal = self.validate_remote_request_principal(connection_id, principal)?;
         let operation = self
             .try_enter_operation()
             .map_err(RuntimeCoreError::into_failure)?;
@@ -910,7 +971,13 @@ impl RuntimeCore {
         }
         match self
             .subscriptions
-            .prepare_transition_snapshot(connection_id, message_id.clone(), target, permit)
+            .prepare_transition_snapshot(
+                connection_id,
+                principal,
+                message_id.clone(),
+                target,
+                permit,
+            )
             .await
         {
             Ok(prepared) => prepared
@@ -998,7 +1065,7 @@ impl RuntimeCore {
                 };
                 match self
                     .subscriptions
-                    .start_catalog_request(connection_id, message_id.clone(), request)
+                    .start_catalog_request(connection_id, principal, message_id.clone(), request)
                     .await
                 {
                     Ok(()) => return Some(Ok(())),
@@ -1038,8 +1105,9 @@ impl RuntimeCore {
                 };
                 match self
                     .subscriptions
-                    .prepare(
+                    .prepare_with_principal(
                         connection_id,
+                        principal,
                         message_id.clone(),
                         target,
                         super::backfill::subscription_barrier_request(cursor),
@@ -1080,8 +1148,9 @@ impl RuntimeCore {
                 };
                 match self
                     .subscriptions
-                    .prepare(
+                    .prepare_with_principal(
                         connection_id,
+                        principal,
                         message_id.clone(),
                         target,
                         super::backfill::BarrierRequest::Backfill { after },
@@ -1137,7 +1206,7 @@ impl RuntimeCore {
             }
             other => {
                 let reply = self
-                    .handle_admitted_with_replay(operation, connection_id, other, replay)
+                    .handle_admitted_with_principal(operation, principal, other, replay)
                     .await;
                 return Some(self.enqueue_admitted(
                     operation,

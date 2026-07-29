@@ -234,6 +234,7 @@ impl SubscriptionCoordinator {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare(
         &self,
         connection_id: ConnectionId,
@@ -242,8 +243,32 @@ impl SubscriptionCoordinator {
         request: BarrierRequest,
         emit_subscription_receipt: bool,
     ) -> Result<PreparedSubscription, SubscriptionPumpError> {
+        let principal = self.inner.connections.principal(connection_id)?;
+        self.prepare_with_principal(
+            connection_id,
+            principal,
+            message_id,
+            target,
+            request,
+            emit_subscription_receipt,
+        )
+        .await
+    }
+
+    /// RemoteLink request-scoped 入口。connection 只证明 writer lifetime；snapshot、
+    /// catalog cursor 与 durable command binding 必须使用本次 Store-current principal。
+    pub(crate) async fn prepare_with_principal(
+        &self,
+        connection_id: ConnectionId,
+        principal: AuthenticatedPrincipal,
+        message_id: MessageId,
+        target: RuntimeStreamTarget,
+        request: BarrierRequest,
+        emit_subscription_receipt: bool,
+    ) -> Result<PreparedSubscription, SubscriptionPumpError> {
         self.prepare_inner(
             connection_id,
+            principal,
             message_id,
             SubscriptionBarrierPreparation::Standard { target, request },
             emit_subscription_receipt,
@@ -254,12 +279,14 @@ impl SubscriptionCoordinator {
     pub(crate) async fn prepare_transition_snapshot(
         &self,
         connection_id: ConnectionId,
+        principal: AuthenticatedPrincipal,
         message_id: MessageId,
         target: RuntimeStreamTarget,
         permit: TransitionSnapshotPermit,
     ) -> Result<PreparedSubscription, SubscriptionPumpError> {
         self.prepare_inner(
             connection_id,
+            principal,
             message_id,
             SubscriptionBarrierPreparation::TransitionSnapshot {
                 target,
@@ -273,6 +300,7 @@ impl SubscriptionCoordinator {
     async fn prepare_inner(
         &self,
         connection_id: ConnectionId,
+        principal: AuthenticatedPrincipal,
         message_id: MessageId,
         preparation: SubscriptionBarrierPreparation,
         emit_subscription_receipt: bool,
@@ -280,10 +308,10 @@ impl SubscriptionCoordinator {
         let target = preparation.target();
         // 快速拒绝明显不存在的连接，避免为伪造 ID 创建 coordination slot；随后
         // 仍在 connection 的 coordination gate 内重查并取得同一 pending semaphore。
-        let _ = self.inner.connections.principal(connection_id)?;
+        self.require_request_principal(connection_id, &principal)?;
         let coordination_gate = self.coordination_gate(connection_id)?;
         let coordination_guard = coordination_gate.lock().await;
-        let _ = self.inner.connections.principal(connection_id)?;
+        self.require_request_principal(connection_id, &principal)?;
         let pending_connection_slots = self.pending_connection_slots(connection_id)?;
         drop(coordination_guard);
         // 威胁场景：terminal sibling 持 gate 时快速 resubscribe 会把 previous
@@ -316,7 +344,7 @@ impl SubscriptionCoordinator {
         let needs_snapshot = matches!(registration.decision, BarrierDecision::Snapshot { .. });
         let now_ms = epoch_ms()?;
         let coordination_guard = coordination_gate.lock().await;
-        let principal = self.inner.connections.principal(connection_id)?;
+        self.require_request_principal(connection_id, &principal)?;
         let lease = self.inner.registry.install(
             connection_id,
             target,
@@ -355,10 +383,11 @@ impl SubscriptionCoordinator {
     pub(crate) async fn start_catalog_request(
         &self,
         connection_id: ConnectionId,
+        principal: AuthenticatedPrincipal,
         message_id: MessageId,
         request: CatalogRequest,
     ) -> Result<(), SubscriptionPumpError> {
-        let _ = self.inner.connections.principal(connection_id)?;
+        self.require_request_principal(connection_id, &principal)?;
         let deadline = tokio::time::Instant::now()
             .checked_add(Duration::from_millis(
                 self.inner.barrier_ttl_ms.load(Ordering::Acquire),
@@ -370,7 +399,7 @@ impl SubscriptionCoordinator {
             .map_err(|_| SubscriptionPumpError::CatalogJobExpired)?;
         // disconnect 在同一 gate 内先撤销 ConnectionRegistry admission；因此这里
         // 的第二次 principal 读取与 quota/task publish 对 disconnect 原子排序。
-        let principal = self.inner.connections.principal(connection_id)?;
+        self.require_request_principal(connection_id, &principal)?;
         let budget = self.inner.registry.reserve_transient(
             connection_id,
             request.page_cursor.is_none(),
@@ -444,6 +473,21 @@ impl SubscriptionCoordinator {
             ));
         }
         Ok(())
+    }
+
+    fn require_request_principal(
+        &self,
+        connection_id: ConnectionId,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<(), SubscriptionPumpError> {
+        let attached = self.inner.connections.principal(connection_id)?;
+        if attached.shares_authorization_identity_and_lease(principal) {
+            Ok(())
+        } else {
+            // 不向 subscription 层引入第二套 authorization failure family；Core 在
+            // 进入此处前已返回 typed authorization denial，这里只做并发 fail-close。
+            Err(ConnectionError::NotFound.into())
+        }
     }
 
     pub(crate) async fn unsubscribe(
@@ -570,10 +614,8 @@ impl SubscriptionCoordinator {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn metrics_for_test(
-        &self,
-    ) -> Result<(usize, usize, usize, usize), SubscriptionPumpError> {
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn metrics(&self) -> Result<(usize, usize, usize, usize), SubscriptionPumpError> {
         let (usage, _) = self.inner.registry.metrics()?;
         let jobs = self
             .inner
@@ -582,6 +624,13 @@ impl SubscriptionCoordinator {
             .map_err(|_| SubscriptionPumpError::Poisoned)?
             .len();
         Ok((usage.live, usage.barriers, usage.snapshot_senders, jobs))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn metrics_for_test(
+        &self,
+    ) -> Result<(usize, usize, usize, usize), SubscriptionPumpError> {
+        self.metrics()
     }
 
     #[cfg(test)]

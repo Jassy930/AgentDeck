@@ -912,11 +912,12 @@ fn validated_key_recovery_wire(
 }
 
 #[derive(Clone, Eq, PartialEq)]
-struct DeviceConnectionKey {
+pub(super) struct DeviceConnectionKey {
+    machine_trust_domain: [u8; 32],
+    machine_route: MachineRouteId,
     device_route: DeviceRouteId,
     grant_serial: u64,
-    authorization_hash: [u8; 32],
-    key_directory_revision: u64,
+    device_sign_fingerprint: [u8; 32],
 }
 
 struct RemoteConnection {
@@ -1508,6 +1509,7 @@ async fn dispatch_send(
     }
     let (principal, authorization, envelope, device_route, request_route, replay) =
         activated.into_parts();
+    let request_principal = principal.request_principal();
     let connection_key = connection_key(&authorization);
     let mut created_connection = false;
     let connection_id = match connections
@@ -1601,11 +1603,16 @@ async fn dispatch_send(
         let _task_guard = task_guard;
         let succeeded = match transition_snapshot {
             Some(permit) => core
-                .handle_transition_snapshot_envelope(connection_id, envelope, permit)
+                .handle_transition_snapshot_envelope(
+                    connection_id,
+                    request_principal,
+                    envelope,
+                    permit,
+                )
                 .await
                 .is_ok(),
             None => core
-                .handle_remote_envelope(connection_id, envelope, replay)
+                .handle_remote_envelope(connection_id, request_principal, envelope, replay)
                 .await
                 .is_ok(),
         };
@@ -1711,12 +1718,13 @@ pub(crate) async fn route_ingress_before_core_with_mode(
     }
 }
 
-fn connection_key(authorization: &RemoteReplyAuthorization) -> DeviceConnectionKey {
+pub(super) fn connection_key(authorization: &RemoteReplyAuthorization) -> DeviceConnectionKey {
     DeviceConnectionKey {
+        machine_trust_domain: authorization.machine_trust_domain(),
+        machine_route: authorization.machine_route(),
         device_route: authorization.device_route(),
         grant_serial: authorization.grant_serial().value(),
-        authorization_hash: authorization.authorization_hash(),
-        key_directory_revision: authorization.key_directory_revision().value(),
+        device_sign_fingerprint: authorization.device_sign_fingerprint(),
     }
 }
 

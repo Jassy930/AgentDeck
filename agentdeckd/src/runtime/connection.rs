@@ -84,6 +84,12 @@ impl RemoteSelfRevocationAdmission {
         self.authorization.is_none()
     }
 
+    /// RemoteLink 复用稳定连接时仍需把本次 Store-current principal 交给 Core。
+    /// clone 只共享同一 revoke lease，不复制或放宽 purpose-scoped admission。
+    pub(crate) fn request_principal(&self) -> AuthenticatedPrincipal {
+        self.principal.clone()
+    }
+
     pub(crate) fn into_parts(self) -> (AuthenticatedPrincipal, DeviceHandle, GrantSerial) {
         let Self {
             principal,
@@ -246,6 +252,13 @@ impl AuthenticatedPrincipal {
 
     pub(crate) fn authorization_key(&self) -> PrincipalAuthorizationKey {
         PrincipalAuthorizationKey(self.identity.clone())
+    }
+
+    /// request-scoped remote principal 只能挂到同一稳定身份、同一共享 revoke lease
+    /// 的 Runtime connection。exact command binding 故意不参与比较：它必须随每个
+    /// Store-current request 前进，而不能冻结在首次 connect 的 revision。
+    pub(crate) fn shares_authorization_identity_and_lease(&self, other: &Self) -> bool {
+        self.identity == other.identity && Arc::ptr_eq(&self.authorization, &other.authorization)
     }
 
     /// Durable prompt admission 只能冻结 Store proof 产生的 exact ADC2 binding。
@@ -1995,7 +2008,7 @@ impl ConnectionRegistry {
         self.entries.lock().map_or(0, |entries| entries.len())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn active_writer_count(&self) -> usize {
         DEFAULT_RUNTIME_CONNECTION_CAPACITY - self.connection_slots.available_permits()
     }

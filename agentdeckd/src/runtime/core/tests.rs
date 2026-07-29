@@ -7,7 +7,9 @@ use std::sync::{Barrier, Mutex as StdMutex};
 
 use agentdeck_protocol::e2ee::{AuthorizationCapabilityV1, AuthorizationPermissionV1};
 use agentdeck_protocol::relay_v2::enrollment::EnrollmentBundleV2;
-use agentdeck_protocol::relay_v2::{DeviceRouteId, MachineRouteId};
+use agentdeck_protocol::relay_v2::{
+    DeviceRouteId, GrantSerial as RelayGrantSerial, KeyDirectoryRevision, MachineRouteId,
+};
 use agentdeck_protocol::runtime::command::{CatalogRequest, RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::failure::{
     DAEMON_COMMAND_HISTORY_ONLY, DAEMON_COMMAND_NOT_FOUND,
@@ -5501,6 +5503,151 @@ fn all_remote_permissions() -> Vec<AuthorizationPermissionV1> {
 }
 
 #[tokio::test]
+async fn remote_envelope_uses_request_scoped_principal_after_revision_rollover() {
+    let root = TestRoot::new("request-scoped-remote-revision");
+    let core = core(&root).await;
+    assert_eq!(
+        core.recover().await.expect("recover request-scoped Core"),
+        RecoveryReport::default()
+    );
+    let local = connect_local(&core, 0x71).await;
+    let conversation = start_receipt(
+        core.handle(local, start_request("request-scoped-remote-start"))
+            .await,
+    );
+    configure_codex_revision_one(
+        &core,
+        local,
+        conversation.conversation_id.clone(),
+        "request-scoped-remote-configure",
+    )
+    .await;
+
+    let binding = |revision| {
+        crate::runtime::model::RemoteCommandAuthorizationBinding::new(
+            [0xA1; 32],
+            MachineRouteId::from_bytes([0x32; 16]),
+            DeviceRouteId::from_bytes([0xd1; 16]),
+            RelayGrantSerial::new(9),
+            [0x41; 32],
+            [0x42; 32],
+            KeyDirectoryRevision::new(revision),
+            3,
+            all_remote_permissions(),
+        )
+        .expect("construct request-scoped remote binding")
+    };
+    let connected_principal = core
+        .principal_issuer
+        .issue_verified_remote(binding(41))
+        .expect("issue connection revision principal");
+    let request_principal = core
+        .principal_issuer
+        .issue_verified_remote(binding(42))
+        .expect("issue next request revision principal");
+    assert!(connected_principal.shares_authorization_identity_and_lease(&request_principal));
+    let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(4);
+    let connection = core
+        .connect(connected_principal.clone(), ConnectionSink::new(sink))
+        .expect("connect stable remote writer");
+    let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(write) = receiver.recv().await {
+            let envelope: RuntimeEnvelope =
+                serde_json::from_slice(write.bytes()).expect("decode request-scoped Core write");
+            observed_tx
+                .send(envelope)
+                .expect("record request-scoped Core write");
+            write.acknowledge().expect("ACK request-scoped Core write");
+        }
+    });
+
+    core.handle_remote_envelope(
+        connection,
+        connected_principal,
+        RuntimeEnvelope {
+            version: RUNTIME_PROTOCOL_VERSION,
+            message_id: MessageId::new("request-scoped-remote-subscribe"),
+            body: RuntimeMessage::Request(RuntimeRequest::Subscribe {
+                inner_cursor: RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::BeforeFirst,
+                },
+            }),
+        },
+        RemoteIngressReplayClass::Fresh,
+    )
+    .await
+    .expect("install revision 41 catalog subscription");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let (live, barriers, snapshot_senders, jobs) = core
+                .subscriptions
+                .metrics_for_test()
+                .expect("read request-scoped subscription metrics");
+            if (live, barriers, snapshot_senders, jobs) == (1, 0, 0, 1) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("revision 41 subscription reaches live");
+
+    core.handle_remote_envelope(
+        connection,
+        request_principal.clone(),
+        RuntimeEnvelope {
+            version: RUNTIME_PROTOCOL_VERSION,
+            message_id: MessageId::new("request-scoped-remote-prompt"),
+            body: RuntimeMessage::Request(RuntimeRequest::SendPrompt(SendPromptRequest {
+                conversation_id: conversation.conversation_id,
+                idempotency_key: IdempotencyKey::new("request-scoped-remote-prompt"),
+                expected_configuration_revision: 1,
+                prompt: PromptPayload::new("use revision 42, not the connection snapshot")
+                    .expect("valid request-scoped prompt"),
+            })),
+        },
+        RemoteIngressReplayClass::Fresh,
+    )
+    .await
+    .expect("dispatch request-scoped remote prompt");
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let envelope = observed_rx
+                .recv()
+                .await
+                .expect("request-scoped reply stream");
+            if envelope.message_id.as_str() == "request-scoped-remote-prompt" {
+                break envelope;
+            }
+        }
+    })
+    .await
+    .expect("request-scoped prompt reply deadline");
+    assert!(matches!(
+        reply.body,
+        RuntimeMessage::Reply(RuntimeReply::Command(CommandReceipt::Accepted { .. }))
+    ));
+    assert_eq!(
+        core.subscriptions
+            .metrics_for_test()
+            .expect("read post-rollover subscription metrics"),
+        (1, 0, 0, 1),
+        "revision 42 request must preserve the revision 41 live subscription job"
+    );
+
+    assert_eq!(
+        core.conversations
+            .terminate_principal_accepted(&request_principal)
+            .await
+            .expect("terminate exact request-scoped accepted command"),
+        1,
+        "the accepted command must freeze revision 42 from the request, not revision 41 from the connection"
+    );
+    core.shutdown().await.expect("shutdown request-scoped Core");
+}
+
+#[tokio::test]
 async fn canonical_remote_revoke_fences_accepted_before_durable_backend_and_retries() {
     let root = TestRoot::new("canonical-remote-held-revoke");
     let store = active_authorization_store_with_permissions_for_test(
@@ -6361,7 +6508,7 @@ async fn transition_snapshot_authorizes_store_scope_before_parsing_request_axes(
         .expect("activate transition permission principal");
     let (sink, mut receiver) = mpsc::channel::<crate::runtime::ConnectionWrite>(4);
     let connection = core
-        .connect(principal, ConnectionSink::new(sink))
+        .connect(principal.clone(), ConnectionSink::new(sink))
         .expect("connect transition permission principal");
     let permit = crate::runtime::store::key_transition::TransitionSnapshotPermit::for_authorization_precedence_test(
         crate::runtime::store::key_transition::KeyTransitionStreamScope::Conversation([0x66; 16]),
@@ -6369,6 +6516,7 @@ async fn transition_snapshot_authorizes_store_scope_before_parsing_request_axes(
 
     core.handle_transition_snapshot_envelope(
         connection,
+        principal,
         RuntimeEnvelope {
             version: RUNTIME_PROTOCOL_VERSION,
             message_id: MessageId::new("transition-permission-precedence"),
