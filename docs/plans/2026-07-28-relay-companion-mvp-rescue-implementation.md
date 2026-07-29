@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；终审重开后第四次 replacement R4.7 已冻结，R4.8 pending；R5 暂停 |
+| 状态 | In execution；daemon restart replacement 竞态修复后第五次 replacement R4.7 已冻结，R4.8 pending；R5 暂停 |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -346,6 +346,38 @@ gitStatus:
   `p4-auto`、双路 review 与 cleanup；期间任何仓库修改都会使计数再次失效。物理 iPhone、第二台 Mac、公网
   WSS、真实 vendor 与 production signing 继续保持 versioned post-MVP `BLOCKED`。
 
+### R4.8 daemon restart replacement reconnect 重开（2026-07-30）
+
+- 第四次 replacement candidate 为 `20502c3721ddd8dda44d968964cf415d38ae370a`，tree 为
+  `60dd46b4097764b1824554577eec1e629073277f`。它的标准 lifecycle 曾连续三轮 PASS，但随后完整 `p5` 在 daemon
+  restart 后确定性读回 generation `2`、machine lifecycle `active`、active grant `1`、transition `0`、catalog
+  stream `1`，同时 writers `1`、live subscriptions `0`、jobs `0`，最终
+  `host.restart.business_not_ready`。因此 `20502c3` 及其三轮 lifecycle、局部/完整门禁结果全部失效，不得与新
+  candidate 拼接。
+- 根因是旧 daemon 正常关闭 WebSocket 后，Relay writer 已先记录 `Disconnected`；若新 daemon authentication
+  activation 先于旧连接排队的 `CoreCommand::Disconnect`，`ConnectionRegistry::activate()` 会以调用方的
+  `Replaced` 清理旧 generation。旧 `remove_and_close()` 没有读回 writer 已确定的 first-writer-wins close reason，
+  `finish_cleanup()` 因而不会按既有 `Disconnected` 规则关闭 dependent device。iOS socket 仍自认为在线，不会在
+  新 daemon generation 建立 fresh catalog/conversation subscriptions。
+- 修复只让 cleanup 返回 writer 实际保留的首个关闭原因：已关闭旧 transport 保持 `Disconnected`，普通活连接
+  replacement 仍为 `Replaced`，不会扩大同进程 re-auth/transition 的 device 级联语义。新增
+  `replacement_cleanup_preserves_preexisting_transport_disconnect` 固定“transport close 先于 replacement
+  activation”的竞态；既有 TLS E2E `machine_generation_loss_closes_existing_device_for_fresh_subscription` 继续证明
+  `Disconnected` 会要求 device fresh reconnect。
+- replacement implementation commit 为 `1049cc8dd0de1d1673b6c90bc39ead83a438629d`，tree 为
+  `3b7c78e69fc34491dbd220312089f43c8ae993ea`，相对本地 `master` 为 `0 behind / 295 ahead`；唯一 code/test
+  path 为 `agentdeck-relay/src/v2/core/connection.rs`，content manifest SHA-256 为
+  `ce8b002b451f70c54d1e0480ec0b640ce0788fc5005903b3b3085f5a9899ba82`。
+- fresh implementation gates：focused regression `1/1`；Relay `server,tls` 全包 exit 0（unit `130/130`、TLS
+  E2E `13/13`，其余 integration/doc-test 零失败）；warnings-as-errors Clippy、Rust format 与 diff 均 PASS。完整
+  `p5` 重新读回 daemon generation `2`、restart marker/history recovery、command/approval/revoke `1/1/1`、Relay
+  plaintext absent，host/root/invite/socket/Simulator cleanup 全部 absent；SessionSource `25/25`、RelayClient
+  `457 executed / 4 external skipped / 0 failed`。
+- 上述 `p5` 只证明 implementation 具备重新冻结资格，不计作新 candidate 的 R4.8/R4.9 证据。本次只更新本计划与
+  `docs/QUALITY.md`，以 docs-only scoped commit 第五次生成 replacement R4.7 candidate；提交后必须从零连续执行
+  三次 fresh lifecycle、完整 `p5`、`p4-auto`、双路 review 与 cleanup。外部槽位继续保持 versioned post-MVP
+  `BLOCKED`。
+
 ### Automatic gates
 
 ```bash
@@ -629,7 +661,7 @@ git diff --check
 - [x] R4.4：client/daemon relaunch、cursor/backfill reconnect 与 revoke terminal。
 - [x] R4.5：外部 runner 严格只读 BLOCKED preflight，固定以 exit 78 表示预期未解锁。
 - [x] R4.6：扩展 verifier `p5`；automatic 缺失/失败必须非零，外部 BLOCKED 不计入 PASS。
-- [x] R4.7：Acked stream-applied ACK 终审修复后重新同步文档并提交第四次 replacement
+- [x] R4.7：daemon restart replacement reconnect 修复后重新同步文档并提交第五次 replacement
   implementation candidate。
 - [ ] R4.8：在 replacement committed candidate 上从零连续执行三次 fresh E2E。
 - [ ] R4.9：同一 replacement candidate 执行完整 `p5`/`p4-auto`、双路 review、cleanup 与 clean status；若修改
@@ -843,7 +875,7 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R1 master 同步 | complete | merge parents `1950f93` + `8f895ea`；code/test hash `43f172a` | Swift 1152/4 skip + 48、Rust 1708/3 ignored、P4 automatic、local smoke、diagnostics、iOS 133/133 及全部静态门禁 PASS | 原生 Preview list/open/prompt/terminal/resize/cleanup PASS；stable signed selfcheck BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | 唯一 merge commit；提交后 clean；未 push |
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
-| R4 Simulator E2E | in progress（reopened） | replacement implementation `3362550` / tree `1cfef04`；2-path hash `ce3158f` | focused `5/5`、transition `35/35`、machine E2E `2/1 ignored`、daemon lib `1718/3 ignored`、完整 `p5`、Clippy/compile/format/network/docs/diff PASS | `eaa1c5a` 虽三轮 lifecycle、`p5`、`p4-auto` PASS，但终审发现 Acked→Acked stream ACK 合法竞态，全部不计数；新 candidate 尚须从零重跑 | 旧双路 review再次失效；replacement review 待 R4.9 | implementation 已 exact commit；本次 docs-only commit 生成第四次 replacement R4.7；未 push |
-| R5 MVP 收口 | paused | `5966c98`、`0f601ae`、`f7d2e68`、`eaa1c5a` 均已失效 | 既有 R5.2、R4.8 与 implementation 全量结果只作诊断/实现门禁，不可拼接 | 旧 PID 54930 已精确清理；当前 implementation `p5` cleanup PASS | 必须等待第四次 replacement R4.9 | 回到 R4.8；R5.1–R5.6 全部重跑 |
+| R4 Simulator E2E | in progress（reopened） | replacement implementation `1049cc8` / tree `3b7c78e`；1-path hash `ce8b002` | focused `1/1`、Relay `server,tls` unit `130/130` + TLS E2E `13/13`、完整 `p5`、Clippy/format/diff PASS | `20502c3` 虽已有三轮 lifecycle PASS，但完整 `p5` 在 restart 后读回 writers/subscriptions/jobs `1/0/0` 并以 `host.restart.business_not_ready` 失败；新 implementation `p5` PASS 仅作资格门禁 | 既有双路 review再次失效；replacement review 待 R4.9 | implementation 已 exact commit；本次 docs-only commit 生成第五次 replacement R4.7；未 push |
+| R5 MVP 收口 | paused | `5966c98`、`0f601ae`、`f7d2e68`、`eaa1c5a`、`20502c3` 均已失效 | 既有 R5.2、R4.8 与 implementation 全量结果只作诊断/实现门禁，不可拼接 | 旧 PID 54930 已精确清理；当前 implementation `p5` cleanup PASS | 必须等待第五次 replacement R4.9 | 回到 R4.8；R5.1–R5.6 全部重跑 |
 
 状态只能按实际证据更新。focused PASS 不得把 Phase 标为 complete；外部 BLOCKED 不得改写为 PASS。

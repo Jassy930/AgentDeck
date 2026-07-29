@@ -4084,6 +4084,51 @@ SHA-256 固定为 `ce3158fca4eb68b7feac9bbf497ec5167b49471eb27184faa504541c0da7a
 review 和 cleanup；任何仓库修改都会使计数失效。物理 iPhone、第二台 Mac、公网 WSS、真实 vendor 与
 production signing 继续保持 versioned post-MVP `BLOCKED`，不计 PASS。
 
+## Relay Companion MVP rescue R4.8 daemon restart replacement reconnect 重开
+
+第四次 replacement candidate `20502c3721ddd8dda44d968964cf415d38ae370a` / tree
+`60dd46b4097764b1824554577eec1e629073277f` 的标准 lifecycle 曾连续三轮 PASS，但随后完整 `p5` 在 daemon
+restart 后读回 generation `2`、machine lifecycle `active`、active grant `1`、transition `0`、catalog stream
+`1`，同时 writers `1`、live subscriptions `0`、jobs `0`，最终以 `host.restart.business_not_ready` 失败。
+`20502c3` 及其三轮 lifecycle、局部/完整门禁结果因此全部失效。
+
+旧 daemon 正常关闭 WebSocket 时，Relay writer 会先记录 first-writer-wins `Disconnected`。若新 daemon 的
+authentication activation 先于旧连接排队的 `CoreCommand::Disconnect`，旧
+`ConnectionRegistry::remove_and_close()` 会把 caller 的 `Replaced` 写入 cleanup，而不读回 writer 已确定的
+`Disconnected`。`finish_cleanup()` 按设计不会为普通 `Replaced` 关闭 dependent device，iOS socket 因而不会
+重连和重新发送 catalog/conversation subscriptions。
+
+修复只让 cleanup 返回 writer 实际保留的首个关闭原因；普通活连接 replacement 仍为 `Replaced`，不改变同进程
+re-auth/transition 语义。确定性回归
+`replacement_cleanup_preserves_preexisting_transport_disconnect` 覆盖 transport close 先于 replacement
+activation；既有 TLS E2E `machine_generation_loss_closes_existing_device_for_fresh_subscription` 继续覆盖 device
+fresh reconnect。
+
+replacement implementation commit 为 `1049cc8dd0de1d1673b6c90bc39ead83a438629d`，tree 为
+`3b7c78e69fc34491dbd220312089f43c8ae993ea`，相对本地 `master` 为 `0 behind / 295 ahead`。唯一 code/test
+path 为 `agentdeck-relay/src/v2/core/connection.rs`；manifest 复算命令：
+
+```bash
+restart_replacement_manifest=(agentdeck-relay/src/v2/core/connection.rs)
+test "${#restart_replacement_manifest[@]}" -eq 1
+for manifest_item in "${restart_replacement_manifest[@]}"; do
+  test -f "$manifest_item" || exit 1
+  printf 'blob %s %s\n' "$(git hash-object "$manifest_item")" "$manifest_item"
+done | LC_ALL=C sort | shasum -a 256
+```
+
+SHA-256 固定为 `ce8b002b451f70c54d1e0480ec0b640ce0788fc5005903b3b3085f5a9899ba82`。fresh implementation
+门禁结果：focused `1/1`；Relay `server,tls` 全包 exit 0（unit `130/130`、TLS E2E `13/13`，其余
+integration/doc-test 零失败）；warnings-as-errors Clippy、Rust format 与 diff PASS。完整 `p5` 重新读回 daemon
+generation `2`、restart marker/history recovery、command/approval/revoke `1/1/1`、Relay plaintext absent，
+host/root/invite/socket/Simulator cleanup 全部 absent；SessionSource `25/25`、RelayClient
+`457 executed / 4 external entitlement skipped / 0 failed`。
+
+该 `p5` 仍只是 implementation gate，不计作新 candidate 的 R4.8/R4.9 证据。本节与 rescue implementation
+计划用 docs-only scoped commit 第五次生成 replacement R4.7 candidate；提交后必须从零连续运行三次 fresh
+lifecycle、完整 `p5`/`p4-auto`、双路 review 与 cleanup。物理 iPhone、第二台 Mac、公网 WSS、真实 vendor 与
+production signing 继续保持 versioned post-MVP `BLOCKED`，不计 PASS。
+
 ## Relay Companion MVP rescue R0 基线冻结证据
 
 R0 只冻结事实、执行入口和既有 automatic baseline，不修改生产代码，也不提前执行 master merge、协议治理或
