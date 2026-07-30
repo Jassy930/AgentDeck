@@ -232,7 +232,7 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Web Test Companion（W0/W1 automatic complete）
+## Relay Web Test Companion（W0/W1/W2a/W2b automatic complete）
 
 `agentdeck-web-core` 已证明现有 Relay v2 codec、Runtime v5 request contract 与 E2EE v1 crypto 可以复用同一
 Rust 实现编译为 browser WASM；`web/relay-test-companion` 是 Bun 管理的最小测试页面与 host adapter，
@@ -257,7 +257,8 @@ identity 只在 `w1-test-fixture` feature 下编译；TypeScript 只传递 opaqu
 Rust/WASM contract、TypeScript ownership/unit 与真实 Relay/Chrome 场景：
 
 ```bash
-scripts/run-relay-web-companion-e2e.sh --all
+scripts/run-relay-web-companion-e2e.sh --contract
+scripts/run-relay-web-companion-e2e.sh --transport
 bash scripts/tests/run-relay-web-companion-e2e.sh
 ```
 
@@ -275,13 +276,27 @@ PairResponse 验证和 PairResponseReceived receipt 全由 Rust/WASM 持有，�
 scripts/run-relay-web-companion-e2e.sh --pairing
 ```
 
+W2b 在同一页、同一 `W2PairingSession` 内把已验证 DeviceSign/DeviceHPKE、grant、authorization 与 key
+directory 提升为 paired principal，没有重新创建身份。浏览器随后通过现有 `/v2/connect` 订阅 Catalog 与唯一
+Conversation，并对两条 bootstrap `EpochBarrier` 分别发送 signed `StreamAppliedAck` 与 Relay outer ACK；之后
+发送固定测试 prompt，认证观察 assistant、approval request、`ApprovalResolved(Applied)` 与
+`TurnCompleted`。approval 首次 `Claimed` 后只用现有 `RetryApproval` 读回 `Applied`，不补发第二个决定：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --business
+```
+
+fresh 门禁读回 command/completed `1/1`、approval total/applied `1/1`，并扫描 Relay DB/WAL/SHM、浏览器日志、
+DOM 与 Playwright output，确认 prompt、assistant、approval 明文 absent。`--all` 现在依次执行 W0/W1 contract、
+W1 transport、W2a pairing 与 W2b business。
+
 本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
 `http://127.0.0.1:4173/`；停止 server 后不保留业务或配对状态。
 
-这仍不是完整网页版或完整远程业务链路。W2a 只关闭 test TLS policy 下的浏览器配对事务，已验证的
-grant/key directory 目前只保留在 WASM 内存；尚未写入 IndexedDB paired state，也没有建立 principal
-`/v2/connect`。list/open/prompt/approval 属于 W2b，reload/reconnect/revoke 属于 W2c。公网 WSS、production
-SPKI pin、物理设备、第二台 Mac 与真实 vendor 继续独立 BLOCKED，不因 W0/W1/W2a 通过而改变。阶段事实源见
+这仍不是完整网页版。W2b 只关闭同页内存态的 pair→list/open→prompt→approval；已验证的 grant、密钥、
+counter、cursor 与 outbox 尚未提升到 IndexedDB durable paired state。reload/reconnect/backfill/revoke 属于
+W2c，完成前不能标记 W2 overall complete。公网 WSS、production SPKI pin、物理设备、第二台 Mac 与真实 vendor
+继续独立 BLOCKED，不因 W0–W2b 通过而改变。阶段事实源见
 [`Relay Web Test Companion 实施计划`](docs/plans/2026-07-30-relay-web-test-companion-implementation.md)。
 
 ## Relay Companion MVP 实施状态（P5.8-lite automatic complete；P5 为 8/9）

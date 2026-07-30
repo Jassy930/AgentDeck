@@ -44,7 +44,7 @@ agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge
 stable UDS。diagnostics report 不启动 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志；不要把
 diagnostics override 当成 stable ownership 配置。
 
-## Relay Web Test Companion W0/W1/W2a failure codes
+## Relay Web Test Companion W0/W1/W2a/W2b failure codes
 
 W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，尚未连接 Relay。以下 code 只在本地
 测试 host 中出现；它们不进入 daemon diagnostic log，也不能解释为远端业务失败：
@@ -88,11 +88,25 @@ W2a 的 pairing core 使用以下 code。它们只证明 automatic 浏览器配�
 | `web.remote.pairing.outcome_unknown` / `web.remote.pairing.timeout` | restart、AlreadyAbsent、EOF 或 deadline 前没有 matching Closed | W2a 不宣称成功；W2c durable recovery 接入前只能重新执行 fresh automatic run |
 | `web.remote.pairing.serialization_failed` | 脱敏 preview/evidence 无法序列化 | 关闭测试页并调查 Rust view model；不得把 raw wire/crypto bytes交给 UI 兜底 |
 
+W2b paired principal 使用以下 code；它们仍只属于本地 automatic test companion，不进入 daemon diagnostic log：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `web.remote.business.state_invalid` | principal 尚未 promoted、已有 pending request，或 list/open/prompt/approval 调用顺序非法 | 关闭当前 generation，从 fresh W2a 配对重跑；不得跳过 subscription/barrier 或并发发送业务 request |
+| `web.remote.business.handshake_rejected` / `relay_rejected` | `/v2/connect` challenge/auth 或 Relay route 被拒绝 | 核对同一 verified grant、Relay identity 与 active grant；不得改用新身份掩盖失败 |
+| `web.remote.business.crypto_failed` | directed reply、stream publish、key/binding、nonce/counter、签名或 AEAD 验证失败 | 立即终止本 generation；保留脱敏 stage，禁止把 raw key/wire 导出给 TypeScript |
+| `web.remote.business.frame_invalid` | Runtime reply、subscription snapshot/sync、bootstrap barrier、cursor、event identity 或 approval receipt 不符合当前状态 | 对照 Catalog/Conversation 两条流的 binding→barrier→semantic ACK→outer ACK 顺序；approval 首次 `Claimed` 是合法中间态，不能要求其直接 Applied |
+| `web.remote.business.authorization_denied` | verified authorization 不含请求需要的 capability/permission | 停止业务 mutation，重新核对 W2a 请求与本机批准范围；不能由 UI 绕过权限 |
+| `web.remote.business.outcome_unknown` | server restarting 或业务 outcome 无法在内存态 session 内确定 | W2c durable recovery 完成前，本轮不能算 PASS；fresh 配对重跑并核对 daemon ledger 是否已有副作用 |
+| `web.remote.business.counter_exhausted` | request/counter/evidence 计数溢出 | 视为安全终态并停止发送；不得回卷、复用 nonce 或清零后续跑 |
+| `web.remote.business.timeout` / `fence_retry_exhausted` / `fence_stage_invalid` | 有界窗口内业务未收敛，或 transition fence 超过 8 次/出现在非法阶段 | 读取脱敏 business evidence 定位 Catalog、Conversation、Prompt 或 Approval；不得用固定 sleep 或无限重试绕过 fence |
+
 W0 失败先运行 `bun run check` 和 `bun run test:browser -- --grep W0`。W1 失败用
 `scripts/run-relay-web-companion-e2e.sh --contract` 区分 contract/ownership，再用 `--transport` 复现真实
 Chrome→Relay 路径。W2a 失败用 `--pairing` 重放 fresh fixed-topology host，并以 runner 输出和 host NDJSON
-区分 pre-confirm、pending、local approve、receipt/Closed 或 cleanup 阶段。测试结束必须停止静态 server、关闭
-tab/profile、Relay/daemon 并删除本轮精确临时 root；cleanup 不使用全局浏览器数据或全局进程名删除。
+区分 pre-confirm、pending、local approve、receipt/Closed 或 cleanup 阶段；W2b 失败用 `--business` 查看脱敏
+Catalog/Conversation/Prompt/Approval evidence 和 host 精确计数。测试结束必须停止静态 server、关闭 tab/profile、
+Relay/daemon 并删除本轮精确临时 root；cleanup 不使用全局浏览器数据或全局进程名删除。
 
 ## Relay v1 历史 marker 与显式 reset
 

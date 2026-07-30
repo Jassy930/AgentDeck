@@ -3,9 +3,17 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 web_root="$repo_root/web/relay-test-companion"
+run_mode="pairing"
+case "${1:-}" in
+  "") ;;
+  --business) run_mode="business" ;;
+  *) printf 'usage: %s [--business]\n' "$0" >&2; exit 64 ;;
+esac
+gate_label="W2a"
+[[ "$run_mode" != "business" ]] || gate_label="W2b"
 
 fail() {
-  printf 'relay web companion W2a: FAIL: %s\n' "$1" >&2
+  printf 'relay web companion %s: FAIL: %s\n' "$gate_label" "$1" >&2
   if [[ -n "${browser_log:-}" && -f "$browser_log" ]]; then
     tail -n 80 "$browser_log" >&2 || true
   fi
@@ -158,7 +166,14 @@ mkfifo "$host_input" "$host_output"
 exec 3<>"$host_input"
 exec 4<>"$host_output"
 
-AGENTDECK_P57_HOST=1 AGENTDECK_P57_HOST_PARENT="$runner_root" \
+host_environment=(
+  "AGENTDECK_P57_HOST=1"
+  "AGENTDECK_P57_HOST_PARENT=$runner_root"
+)
+if [[ "$run_mode" == "business" ]]; then
+  host_environment+=("AGENTDECK_P57_HOST_SCENARIO=r43-business")
+fi
+env -u AGENTDECK_P57_HOST_SCENARIO "${host_environment[@]}" \
   cargo test -p agentdeckd --test relay_v2_machine_e2e \
   p57_real_dual_scope_ndjson_host -- \
   --ignored --exact --nocapture --test-threads=1 \
@@ -183,18 +198,33 @@ web_port="$(bun -e '
 [[ "$web_port" =~ ^[0-9]+$ ]] && [[ "$web_port" -ge 1 && "$web_port" -le 65535 ]] \
   || fail "could not reserve Web test port"
 
-printf '%s\n' "$host_record" | jq -e '
-  .scenario == null
-  and .daemonGeneration == 1
-  and (.relayWssOrigin | test("^wss://localhost:[0-9]+/$"))
-  and (.relaySpkiPinBase64 | test("^[A-Za-z0-9+/]{43}=$"))
-' >/dev/null || fail "host ready topology is not exact"
+if [[ "$run_mode" == "business" ]]; then
+  printf '%s\n' "$host_record" | jq -e '
+    .scenario == "r43-business"
+    and .daemonGeneration == 1
+    and (.conversationId | type == "string" and length > 0)
+    and .conversationTitle == "R4.3 synthetic Codex"
+    and (.relayWssOrigin | test("^wss://localhost:[0-9]+/$"))
+    and (.relaySpkiPinBase64 | test("^[A-Za-z0-9+/]{43}=$"))
+  ' >/dev/null || fail "business host ready topology is not exact"
+else
+  printf '%s\n' "$host_record" | jq -e '
+    .scenario == null
+    and .daemonGeneration == 1
+    and .conversationId == null
+    and .conversationTitle == null
+    and (.relayWssOrigin | test("^wss://localhost:[0-9]+/$"))
+    and (.relaySpkiPinBase64 | test("^[A-Za-z0-9+/]{43}=$"))
+  ' >/dev/null || fail "pairing host ready topology is not exact"
+fi
 case "$host_root" in "$runner_root"/ad-p57-host-*) ;; *) fail "host root escaped runner" ;; esac
 [[ -f "$host_invite" && ! -L "$host_invite" ]] || fail "invite is not regular"
 [[ "$(stat -f '%Lp' "$host_invite")" == "600" ]] || fail "invite mode is not 0600"
 [[ -S "$host_socket" && ! -L "$host_socket" ]] || fail "Runtime endpoint is not Unix socket"
 [[ "$(stat -f '%Lp' "$host_socket")" == "600" ]] || fail "Runtime socket mode is not 0600"
 
+browser_grep="W2a real browser pairing"
+[[ "$run_mode" != "business" ]] || browser_grep="W2b real browser business flow"
 (
   cd "$web_root"
   AGENTDECK_WEB_WSS_ORIGIN="$relay_origin" \
@@ -202,7 +232,7 @@ case "$host_root" in "$runner_root"/ad-p57-host-*) ;; *) fail "host root escaped
   AGENTDECK_W2_INVITE_PATH="$host_invite" \
   RELAY_WEB_TEST_PORT="$web_port" \
     bun run test:browser:built -- \
-    --grep "W2a real browser pairing"
+    --grep "$browser_grep"
 ) >"$browser_log" 2>&1 &
 browser_pid=$!
 
@@ -231,6 +261,29 @@ printf '%s\n' "$host_record" | jq -e '
   and .evidence.runtimeCommandCount == 0
 ' >/dev/null || fail "approval did not create exact grant"
 
+if [[ "$run_mode" == "business" ]]; then
+  mutated_request="w2b-mutated-$generation"
+  send_host_command \
+    "{\"op\":\"waitFor\",\"requestId\":\"$mutated_request\",\"condition\":\"webBusinessMutated\",\"timeoutMs\":120000}" \
+    || fail "could not request business mutation readback"
+  read_host_json waitFor "$mutated_request" 140 || fail "business mutation readback failed"
+  if ! printf '%s\n' "$host_record" | jq -e '
+    .satisfied == true
+    and .evidence.runtimeCommandCount == 1
+    and .evidence.runtimeCompletedCommandCount == 1
+    and .evidence.runtimeApprovalTotal == 1
+    and .evidence.runtimeApprovalApplied == 1
+    and .evidence.runtimeActiveWriterCount == 2
+    and .evidence.runtimeLiveSubscriptionCount == 2
+    and .evidence.runtimeBarrierSubscriptionCount == 0
+    and .evidence.runtimeSnapshotSenderCount == 0
+    and .evidence.runtimeSubscriptionJobCount == 2
+  ' >/dev/null; then
+    printf 'W2b mutation evidence: %s\n' "$host_record" >&2
+    fail "browser business flow did not mutate exactly once"
+  fi
+fi
+
 browser_deadline=$(( $(date +%s) + 150 ))
 while pid_is_running "$browser_pid"; do
   [[ "$(date +%s)" -lt "$browser_deadline" ]] || fail "browser pairing exceeded deadline"
@@ -242,29 +295,52 @@ browser_status=$?
 set -e
 browser_pid=""
 [[ "$browser_status" -eq 0 ]] || fail "browser pairing failed with exit $browser_status"
-grep -Fq "1 passed" "$browser_log" || fail "browser did not report one passing W2a test"
+grep -Fq "1 passed" "$browser_log" || fail "browser did not report one passing $gate_label test"
 if grep -aFq "agentdeck-pair:v1:" "$browser_log"; then
   fail "browser output leaked PairInvite"
+fi
+if [[ "$run_mode" == "business" ]] && grep -aEq \
+  'web-w2b-prompt-7fb7f299|synthetic Codex response|synthetic codex approval' "$browser_log"; then
+  fail "browser output leaked business plaintext"
 fi
 
 status_request="w2a-status-$generation"
 send_host_command "{\"op\":\"status\",\"requestId\":\"$status_request\"}" \
   || fail "could not request final status"
 read_host_json status "$status_request" 45 || fail "final status readback failed"
-printf '%s\n' "$host_record" | jq -e '
-  .evidence.machineRemoteLifecycle == "active"
-  and .evidence.pendingPairingCount == 0
-  and .evidence.relayGrantTotal == 1
-  and .evidence.relayGrantActive == 1
-  and .evidence.activeTransitionCount == 0
-  and .evidence.activeCatalogStreamCount == 1
-  and .evidence.runtimeCommandCount == 0
-' >/dev/null || fail "paired terminal did not settle exact host state"
+if [[ "$run_mode" == "business" ]]; then
+  printf '%s\n' "$host_record" | jq -e '
+    .evidence.machineRemoteLifecycle == "active"
+    and .evidence.pendingPairingCount == 0
+    and .evidence.relayGrantTotal == 1
+    and .evidence.relayGrantActive == 1
+    and .evidence.activeTransitionCount == 0
+    and .evidence.activeCatalogStreamCount == 1
+    and .evidence.runtimeCommandCount == 1
+    and .evidence.runtimeCompletedCommandCount == 1
+    and .evidence.runtimeApprovalTotal == 1
+    and .evidence.runtimeApprovalApplied == 1
+  ' >/dev/null || fail "business terminal did not settle exact host state"
+else
+  printf '%s\n' "$host_record" | jq -e '
+    .evidence.machineRemoteLifecycle == "active"
+    and .evidence.pendingPairingCount == 0
+    and .evidence.relayGrantTotal == 1
+    and .evidence.relayGrantActive == 1
+    and .evidence.activeTransitionCount == 0
+    and .evidence.activeCatalogStreamCount == 1
+    and .evidence.runtimeCommandCount == 0
+  ' >/dev/null || fail "paired terminal did not settle exact host state"
+fi
 
 for relay_path in "$relay_db" "$relay_db-wal" "$relay_db-shm"; do
   [[ -f "$relay_path" ]] || continue
   if grep -aFq "Relay Web Test Companion" "$relay_path"; then
     fail "Relay persistence contains Web device plaintext"
+  fi
+  if [[ "$run_mode" == "business" ]] && grep -aEq \
+    'web-w2b-prompt-7fb7f299|synthetic Codex response|synthetic codex approval' "$relay_path"; then
+    fail "Relay persistence contains business plaintext"
   fi
 done
 
@@ -291,4 +367,8 @@ host_graceful=1
 rm -rf "$runner_root"
 cleanup_started=1
 trap - EXIT HUP INT TERM
-printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2a","status":"PASS","preConfirmNetworkLocked":true,"pendingPairingCount":0,"relayGrantTotal":1,"relayGrantActive":1,"activeTransitionCount":0,"activeCatalogStreamCount":1,"runtimeCommandCount":0,"relayPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'
+if [[ "$run_mode" == "business" ]]; then
+  printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2b","status":"PASS","preConfirmNetworkLocked":true,"pendingPairingCount":0,"relayGrantTotal":1,"relayGrantActive":1,"activeTransitionCount":0,"activeCatalogStreamCount":1,"runtimeCommandCount":1,"runtimeCompletedCommandCount":1,"runtimeApprovalTotal":1,"runtimeApprovalApplied":1,"relayPlaintextAbsent":true,"browserPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'
+else
+  printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2a","status":"PASS","preConfirmNetworkLocked":true,"pendingPairingCount":0,"relayGrantTotal":1,"relayGrantActive":1,"activeTransitionCount":0,"activeCatalogStreamCount":1,"runtimeCommandCount":0,"relayPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'
+fi

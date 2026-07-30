@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2a automatic complete；W2b/W2c 尚未开始 |
+| 状态 | W0/W1/W2a/W2b automatic complete；W2c 尚未开始 |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -214,9 +214,9 @@ git status --short --branch
 - [ ] W2.2：复用 WASM HPKE/签名和 durable state 完成 pair request/response/terminal；被控 Mac 仍只经
   existing same-UID `LocalPairingAdministration` approve/cancel。W2a 已完成内存态 request/response/terminal
   与 verified material 保留；IndexedDB paired promotion 和 reload recovery 留给 W2c，所以本项尚未整体勾选。
-- [ ] W2.3：实现最小 machine/catalog/conversation 页面和 open/prompt/approval 操作；UI 只消费 typed
+- [x] W2.3：实现最小 machine/catalog/conversation 页面和 open/prompt/approval 操作；UI 只消费 typed
   WASM view state。
-- [ ] W2.4：runner 串起真实 RuntimeCore/RemoteLink、synthetic Codex/Claude Code、Relay 和浏览器，读回
+- [x] W2.4：runner 串起真实 RuntimeCore/RemoteLink、synthetic Codex/Claude Code、Relay 和浏览器，读回
   list/open/prompt/assistant/approval terminal。
 - [ ] W2.5：强制 page reload + WebSocket reconnect，验证 durable cursor/backfill、counter 单调和副作用不重复。
 - [ ] W2.6：执行 revoke-self，验证 signed terminal、浏览器材料清理、连接关闭和旧 identity 不可重连。
@@ -229,7 +229,7 @@ git status --short --branch
 ```bash
 bash scripts/run-relay-web-companion-e2e.sh --business
 cd web/relay-test-companion
-bun run test:e2e -- --grep 'W2'
+bun run check
 cd ../..
 bash scripts/run-relay-companion-simulator-e2e.sh
 bash scripts/verify-relay-companion-mvp.sh p5
@@ -253,8 +253,30 @@ git status --short --branch
   `pending=0/activeGrant=1/activeTransition=0/catalogStream=1/runtimeCommand=0`。
 - browser/host PID、host root、0600 invite、UDS 与 Playwright artifacts 全部 absent；Relay DB/WAL/SHM 中
   Web device display name 明文 absent。没有新增 Web daemon、本地 bridge、UDS→HTTP 或第二 Runtime。
-- 本证据只关闭 W2a。verified response/key directory 仍只在 WASM 内存，W2b/W2c 与 W2 overall 保持未完成；
-  iOS regression、物理设备、公网、production pin 和真实 vendor 状态均未由本切片改变。
+- 本证据只关闭 W2a；在该时点 verified response/key directory 仍只在 WASM 内存，W2b/W2c 与 W2 overall
+  均未完成。后续 W2b 证据见下节；iOS regression、物理设备、公网、production pin 和真实 vendor 状态均
+  未由 W2a 切片改变。
+
+### W2b 完成证据（2026-07-30）
+
+- `W2PairingSession` 在 matching Closed 后把原 DeviceSign/DeviceHPKE、`VerifiedPairResponseV1`、grant、
+  authorization 与 key directory 移交 `W2BusinessCore`，没有重新创建 identity、Runtime、daemon 或 bridge；
+  pairing material 被移走后，`receiptSent` 仍由独立单调证据保持 true。
+- Catalog 与 Conversation 均使用现有 `RuntimeRequest::Subscribe`。真实新设备 bootstrap 对两条流分别验证
+  `StreamBindingV1`/snapshot/SyncComplete/`EpochBarrierV1`，发送 signed `StreamAppliedAckV1`，在
+  `RouteAccepted` 后发送 outer ACK；没有新增 protocol/schema/version。
+- prompt、assistant 与 approval sentinel 只存在 Rust/WASM。fresh Chrome 真实观察 prompt Accepted、assistant、
+  approval request、首次 `Claimed`、canonical `ApprovalResolved(Applied)`、`RetryApproval` Applied 读回与
+  `TurnCompleted`；未补发第二个 approval 决定。
+- `scripts/run-relay-web-companion-e2e.sh --business` fresh PASS：host 为 command/completed `1/1`、approval
+  total/applied `1/1`、active Catalog stream `1`，活跃窗口 writer/subscription/job 精确为 `2/2/2`；Relay 与
+  browser 三项业务明文 absent，browser/host PID、host root、invite、UDS、Playwright artifacts 全部 absent。
+- W2a `--pairing` 与 W1 `--transport` 回归 PASS；既有 `scripts/run-relay-companion-simulator-e2e.sh` 完整 PASS，
+  读回 daemon generation 2、restart/history recovery、command/completed `1/1`、approval `1/1`、revoke `1`、
+  active grant `0`、Relay plaintext absent 与全部 cleanup absent。
+- 本证据只关闭 W2b。IndexedDB paired promotion、reload/reconnect/backfill/revoke 与 crash cut 仍由 W2c/W3
+  承担；W2 overall、正式 Web 产品、物理设备、公网、production pin/signing 与真实 vendor 均未完成或继续
+  BLOCKED。
 
 ### Required readback
 

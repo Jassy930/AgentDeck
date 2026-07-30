@@ -8,7 +8,11 @@ import {
   type WriterLease,
 } from "./storage.ts";
 import { runW1Transport, type W1WasmSessionConstructor } from "./w1-transport.ts";
-import { runW2Pairing, type W2WasmSessionConstructor } from "./w2-transport.ts";
+import {
+  runW2Business,
+  runW2Pairing,
+  type W2WasmSessionConstructor,
+} from "./w2-transport.ts";
 
 type WebCoreModule = Readonly<{
   default: () => Promise<unknown>;
@@ -97,6 +101,26 @@ const api: RelayTestApi = {
       status.textContent = result.pairing.paired
         ? "W2a 真实配对通过"
         : (result.failureCode ?? "W2a 配对失败");
+    }
+    return result;
+  },
+  async runW2Business(encodedInvite) {
+    const constructor = (await corePromise).W2PairingSession;
+    if (constructor === undefined) {
+      throw new Error("web.remote.w2_fixture_unavailable");
+    }
+    const result = await runW2Business(constructor, encodedInvite);
+    const passed =
+      result.failureCode === null &&
+      result.business?.commandCompleted === true &&
+      result.business.approvalReceiptApplied &&
+      result.business.approvalEventApplied;
+    const status = document.querySelector<HTMLElement>("#w2-status");
+    if (status !== null) {
+      status.dataset.state = passed ? "passed" : "failed";
+      status.textContent = passed
+        ? "W2b 真实业务闭环通过"
+        : (result.failureCode ?? "W2b 业务闭环失败");
     }
     return result;
   },

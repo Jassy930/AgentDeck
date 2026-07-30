@@ -764,7 +764,7 @@ conversation/key，不能伪造身份连续性。
   complete。该完成边界不覆盖 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理
   iPhone/第二台 Mac 或 destructive purge；这些真实槽位继续保持 post-MVP BLOCKED。
 
-### Relay Web Test Companion W2a pairing 不变量
+### Relay Web Test Companion W2a/W2b pairing 与业务不变量
 
 - 浏览器没有第二套 Runtime、daemon 或 UDS→HTTP bridge。`agentdeck-web-core` 直接复用
   `agentdeck-protocol` / `agentdeck-crypto`，TypeScript 只管理 WebSocket generation、deadline、opaque
@@ -777,9 +777,17 @@ conversation/key，不能伪造身份连续性。
 - 被控 machine 的授权赢家仍只能来自 existing same-UID `LocalPairingAdministration`；浏览器受限 pairing
   connection 不能远程 confirm。只有 verified response 后发出的 receipt 加 matching
   `PairRouteClosed::Closed` 才是 paired terminal，`Authenticated` 或 `RouteAccepted` 均不能冒充成功。
-- W2a 会在内存中保留完整 `VerifiedPairResponseV1`，为 W2b paired principal promotion 提供能力；当前不写
-  IndexedDB、不承诺 reload/reconnect。W2b 才接 list/open/prompt/approval，W2c 再接 durable promotion、
-  reload/reconnect/revoke。
+- W2a 会在内存中保留完整 `VerifiedPairResponseV1`；W2b 必须从同一 `W2PairingSession` 移交原 DeviceSign、
+  DeviceHPKE、grant、authorization 与 key directory，不能另造身份、第二 Runtime 或业务 bridge。
+- paired principal 的 Catalog 与 Conversation 都使用现有 `RuntimeRequest::Subscribe`。新设备 bootstrap 必须逐流
+  验证 `StreamBindingV1` 与 `EpochBarrierV1`，发送现有 signed `StreamAppliedAckV1`，收到其
+  `RouteAccepted` 后再发 Relay outer ACK；两条流均 active 前，业务 fence 只能有界重试，不能绕过 transition。
+- TypeScript 只编排 WebSocket generation、deadline/backoff、opaque bytes 与脱敏 evidence。测试 prompt、
+  assistant/approval 匹配文本、Runtime envelope、E2EE counter/cursor 与 approval 决定全部只存在 Rust/WASM。
+- approval receipt 与 canonical event 是独立到达轴：首次合法 `Claimed` 不能冒充 Applied；只有认证观察
+  `ApprovalResolved(Applied)` 后，才允许用现有 `RetryApproval` 读回 Applied，且 daemon ledger 仍须精确一条。
+- W2b 仍是同页内存态，不写 IndexedDB、不承诺 reload/reconnect/backfill/revoke。上述 durable promotion 与
+  identity 清理属于 W2c，W2c 完成前不能标记 W2 overall complete。
 
 ### Relay Companion MVP P5.1 SessionSource facade 不变量
 

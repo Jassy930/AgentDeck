@@ -20,7 +20,7 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
-## Relay Web Test Companion W0/W1/W2a 门禁（2026-07-30）
+## Relay Web Test Companion W0/W1/W2a/W2b 门禁（2026-07-30）
 
 W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
 `web/relay-test-companion/` 后运行：
@@ -82,9 +82,29 @@ runner 必须复用 P5.9 fixed-topology host，依次读回本地 preview、确�
 pending=0/active grant=1/active transition=0/catalog stream=1。browser/host PID、host root、邀请、UDS 和
 Playwright artifacts 必须 absent；Relay DB/WAL/SHM 不得出现 Web device display name 明文。
 
-W2a PASS 不代表 W2 complete。当前没有 IndexedDB paired promotion 或 principal `/v2/connect`；
-list/open/prompt/approval 属于 W2b，reload/reconnect/revoke 与 crash recovery 属于 W2c。物理设备、公网、
-production SPKI pin、真实 vendor 继续 BLOCKED。
+W2a 单独 PASS 不代表 W2 complete；它尚未建立 principal `/v2/connect`。该连接与
+list/open/prompt/approval 已由下述 W2b 关闭，但当前仍没有 IndexedDB paired promotion；
+reload/reconnect/revoke 与 crash recovery 属于 W2c/W3。物理设备、公网、production SPKI pin、真实 vendor
+继续 BLOCKED。
+
+W2b 的单命令门禁如下：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --business
+scripts/run-relay-web-companion-e2e.sh --all
+bash scripts/run-relay-companion-simulator-e2e.sh
+```
+
+`--business` 必须在同一个 WASM session 中从 W2a verified material 提升 paired principal，真实完成
+Catalog/Conversation 两条 subscription 的 bootstrap barrier、semantic ACK 和 outer ACK，再读回唯一目标
+conversation、prompt Accepted、assistant、approval request、approval receipt/event Applied 与
+TurnCompleted。host 必须精确为 command/completed `1/1`、approval total/applied `1/1`；两条 active stream
+对应 writer/subscription/job 都必须为 2。Relay DB/WAL/SHM、browser log、DOM 与 Playwright output 不得出现
+三项业务 sentinel 明文，browser/host PID、host root、invite、UDS 与 Playwright artifacts 必须 absent。
+
+W2b PASS 只关闭同页内存态 pair→list/open→prompt→approval；W2a evidence 中 `receiptSent` 在 material 提升后
+仍必须单调保持 true。IndexedDB paired promotion、reload/reconnect/backfill/revoke 和 crash cut 仍属 W2c/W3，
+不得把本节写成 W2 overall complete 或正式 Web 产品完成。
 
 ## Relay Companion MVP Task 粒度门禁（2026-07-18）
 

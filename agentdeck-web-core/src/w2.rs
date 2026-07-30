@@ -25,6 +25,7 @@ use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize};
 
 use crate::DeterministicRng;
+use crate::w2_business::{W2BusinessCore, W2BusinessEvidence};
 
 const WEB_DEVICE_DISPLAY_NAME: &str = "Relay Web Test Companion";
 
@@ -73,6 +74,22 @@ pub enum W2PairingError {
     EntropyUnavailable,
     #[error("web.remote.pairing.serialization_failed")]
     SerializationFailed,
+    #[error("web.remote.business.state_invalid")]
+    BusinessStateInvalid,
+    #[error("web.remote.business.frame_invalid")]
+    BusinessFrameInvalid,
+    #[error("web.remote.business.handshake_rejected")]
+    BusinessHandshakeRejected,
+    #[error("web.remote.business.crypto_failed")]
+    BusinessCryptoFailed,
+    #[error("web.remote.business.relay_rejected")]
+    BusinessRelayRejected,
+    #[error("web.remote.business.outcome_unknown")]
+    BusinessOutcomeUnknown,
+    #[error("web.remote.business.authorization_denied")]
+    BusinessAuthorizationDenied,
+    #[error("web.remote.business.counter_exhausted")]
+    BusinessCounterExhausted,
 }
 
 impl W2PairingError {
@@ -90,6 +107,14 @@ impl W2PairingError {
             Self::OutcomeUnknown => "web.remote.pairing.outcome_unknown",
             Self::EntropyUnavailable => "web.remote.pairing.entropy_unavailable",
             Self::SerializationFailed => "web.remote.pairing.serialization_failed",
+            Self::BusinessStateInvalid => "web.remote.business.state_invalid",
+            Self::BusinessFrameInvalid => "web.remote.business.frame_invalid",
+            Self::BusinessHandshakeRejected => "web.remote.business.handshake_rejected",
+            Self::BusinessCryptoFailed => "web.remote.business.crypto_failed",
+            Self::BusinessRelayRejected => "web.remote.business.relay_rejected",
+            Self::BusinessOutcomeUnknown => "web.remote.business.outcome_unknown",
+            Self::BusinessAuthorizationDenied => "web.remote.business.authorization_denied",
+            Self::BusinessCounterExhausted => "web.remote.business.counter_exhausted",
         }
     }
 }
@@ -144,9 +169,12 @@ pub struct W2PairingCore {
     invite: PairInviteV1,
     connect_url: String,
     phase: PairingPhase,
+    fingerprint_confirmed: bool,
     material: Option<PairingMaterial>,
+    business: Option<W2BusinessCore>,
     pending_observed: bool,
     response_verified: bool,
+    receipt_sent: bool,
     route_accepted_observed: bool,
     machine_route: Option<MachineRouteId>,
     device_route: Option<DeviceRouteId>,
@@ -177,9 +205,12 @@ impl W2PairingCore {
             invite,
             connect_url,
             phase: PairingPhase::Inspected,
+            fingerprint_confirmed: false,
             material: None,
+            business: None,
             pending_observed: false,
             response_verified: false,
+            receipt_sent: false,
             route_accepted_observed: false,
             machine_route: None,
             device_route: None,
@@ -269,6 +300,7 @@ impl W2PairingCore {
             response_hash: None,
             verified_response: None,
         });
+        self.fingerprint_confirmed = true;
         self.phase = PairingPhase::Confirmed;
         Ok(())
     }
@@ -365,6 +397,8 @@ impl W2PairingCore {
                 }
                 match closed.outcome {
                     PairRouteCloseOutcome::Closed => {
+                        let business = self.promote_business().map_err(|error| self.fail(error))?;
+                        self.business = Some(business);
                         self.phase = PairingPhase::Paired;
                         Ok(Vec::new())
                     }
@@ -387,22 +421,59 @@ impl W2PairingCore {
     #[must_use]
     pub fn evidence(&self) -> W2PairingEvidence {
         W2PairingEvidence {
-            fingerprint_confirmed: self.material.is_some(),
+            fingerprint_confirmed: self.fingerprint_confirmed,
             authenticated: matches!(
                 self.phase,
                 PairingPhase::RequestSent | PairingPhase::ReceiptSent | PairingPhase::Paired
             ),
             pending_observed: self.pending_observed,
             response_verified: self.response_verified,
-            receipt_sent: self
-                .material
-                .as_ref()
-                .is_some_and(|material| material.receipt_frame.is_some()),
+            receipt_sent: self.receipt_sent,
             route_accepted_observed: self.route_accepted_observed,
             paired: self.paired(),
             machine_route_present: self.machine_route.is_some(),
             device_route_present: self.device_route.is_some(),
         }
+    }
+
+    pub fn business_connect_url(&self) -> Result<&str, W2PairingError> {
+        self.business()?.connect_url()
+    }
+
+    pub fn business_start_hello(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        self.business_mut()?.start_hello()
+    }
+
+    pub fn business_accept_challenge(&mut self, bytes: &[u8]) -> Result<Vec<u8>, W2PairingError> {
+        self.business_mut()?.accept_challenge(bytes)
+    }
+
+    pub fn business_accept_authenticated(&mut self, bytes: &[u8]) -> Result<(), W2PairingError> {
+        self.business_mut()?.accept_authenticated(bytes)
+    }
+
+    pub fn business_start_catalog(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        self.business_mut()?.start_catalog()
+    }
+
+    pub fn business_start_conversation(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        self.business_mut()?.start_conversation()
+    }
+
+    pub fn business_start_prompt(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        self.business_mut()?.start_prompt()
+    }
+
+    pub fn business_start_approval(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        self.business_mut()?.start_approval()
+    }
+
+    pub fn business_accept_frame(&mut self, bytes: &[u8]) -> Result<Vec<u8>, W2PairingError> {
+        self.business_mut()?.accept_frame(bytes)
+    }
+
+    pub fn business_evidence(&self) -> Result<W2BusinessEvidence, W2PairingError> {
+        Ok(self.business()?.evidence())
     }
 
     fn accept_pair_data(&mut self, data: PairData, now_ms: u64) -> Result<Vec<u8>, W2PairingError> {
@@ -532,8 +603,46 @@ impl W2PairingCore {
         self.machine_route = Some(machine_route);
         self.device_route = Some(device_route);
         self.response_verified = true;
+        self.receipt_sent = true;
         self.phase = PairingPhase::ReceiptSent;
         Ok(receipt_frame)
+    }
+
+    fn promote_business(&mut self) -> Result<W2BusinessCore, W2PairingError> {
+        let material = self.material.take().ok_or(W2PairingError::StateInvalid)?;
+        let PairingMaterial {
+            device_signing_key,
+            device_hpke_private_key,
+            rng,
+            verified_response,
+            ..
+        } = material;
+        let verified_response = verified_response.ok_or(W2PairingError::StateInvalid)?;
+        W2BusinessCore::new(
+            &self.invite.wss_url,
+            device_signing_key,
+            device_hpke_private_key,
+            verified_response,
+            rng,
+        )
+    }
+
+    fn business(&self) -> Result<&W2BusinessCore, W2PairingError> {
+        if !self.paired() {
+            return Err(W2PairingError::BusinessStateInvalid);
+        }
+        self.business
+            .as_ref()
+            .ok_or(W2PairingError::BusinessStateInvalid)
+    }
+
+    fn business_mut(&mut self) -> Result<&mut W2BusinessCore, W2PairingError> {
+        if !self.paired() {
+            return Err(W2PairingError::BusinessStateInvalid);
+        }
+        self.business
+            .as_mut()
+            .ok_or(W2PairingError::BusinessStateInvalid)
     }
 
     fn fail(&mut self, error: W2PairingError) -> W2PairingError {
@@ -700,6 +809,62 @@ mod wasm {
         #[wasm_bindgen(js_name = evidenceJson)]
         pub fn evidence_json(&self) -> Result<String, JsValue> {
             serde_json::to_string(&self.core.evidence())
+                .map_err(|_| js_error(W2PairingError::SerializationFailed))
+        }
+
+        #[wasm_bindgen(js_name = businessConnectUrl)]
+        pub fn business_connect_url(&self) -> Result<String, JsValue> {
+            self.core
+                .business_connect_url()
+                .map(str::to_owned)
+                .map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessStartHello)]
+        pub fn business_start_hello(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core.business_start_hello().map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessAcceptChallenge)]
+        pub fn business_accept_challenge(&mut self, bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+            self.core.business_accept_challenge(bytes).map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessAcceptAuthenticated)]
+        pub fn business_accept_authenticated(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
+            self.core
+                .business_accept_authenticated(bytes)
+                .map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessStartCatalog)]
+        pub fn business_start_catalog(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core.business_start_catalog().map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessStartConversation)]
+        pub fn business_start_conversation(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core.business_start_conversation().map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessStartPrompt)]
+        pub fn business_start_prompt(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core.business_start_prompt().map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessStartApproval)]
+        pub fn business_start_approval(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core.business_start_approval().map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessAcceptFrame)]
+        pub fn business_accept_frame(&mut self, bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+            self.core.business_accept_frame(bytes).map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessEvidenceJson)]
+        pub fn business_evidence_json(&self) -> Result<String, JsValue> {
+            serde_json::to_string(&self.core.business_evidence().map_err(js_error)?)
                 .map_err(|_| js_error(W2PairingError::SerializationFailed))
         }
     }

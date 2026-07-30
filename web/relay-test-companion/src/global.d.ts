@@ -51,6 +51,40 @@ declare global {
     failureCode: string | null;
   }>;
 
+  type W2BusinessEvidence = Readonly<{
+    principalAuthenticated: boolean;
+    catalogRouteAccepted: boolean;
+    catalogEntryCount: number;
+    conversationTitle: string | null;
+    catalogSubscriptionActive: boolean;
+    businessFenceCount: number;
+    conversationRouteAccepted: boolean;
+    conversationOpen: boolean;
+    relaySubscriptionActive: boolean;
+    promptRouteAccepted: boolean;
+    promptAccepted: boolean;
+    assistantObserved: boolean;
+    approvalPending: boolean;
+    approvalSummaryMatched: boolean;
+    approvalRouteAccepted: boolean;
+    approvalReceiptApplied: boolean;
+    approvalEventApplied: boolean;
+    commandCompleted: boolean;
+    outerAckCount: number;
+  }>;
+
+  type W2BusinessTransportEvidence = Readonly<{
+    generation: number;
+    preview: W2PairingPreview;
+    preConfirmNetworkLocked: boolean;
+    binaryFramesSent: number;
+    pairingBinaryFramesSent: number;
+    businessBinaryFramesSent: number;
+    pairing: W2PairingEvidence;
+    business: W2BusinessEvidence | null;
+    failureCode: string | null;
+  }>;
+
   type RelayTestApi = Readonly<{
     contractSnapshot: () => Promise<Record<string, string>>;
     negativeSnapshot: () => Promise<Record<string, boolean>>;
@@ -65,6 +99,7 @@ declare global {
       caseName: W1TransportCase,
     ) => Promise<W1TransportEvidence>;
     runW2Pairing: (encodedInvite: string) => Promise<W2TransportEvidence>;
+    runW2Business: (encodedInvite: string) => Promise<W2BusinessTransportEvidence>;
     initializeState: (profileId: string, payload: string) => Promise<DurableStateRecord>;
     readState: (profileId: string) => Promise<DurableStateRecord | null>;
     commitExactRevision: (

@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2a automatic complete；W2b/W2c 尚未开始 |
+| 状态 | W0/W1/W2a/W2b automatic complete；W2c 尚未开始 |
 | 日期 | 2026-07-30 |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
 | 目标 | 用浏览器直接复用 Relay v2 + E2EE v1，增加一条低成本、可重复的远程业务闭环 |
@@ -45,9 +45,13 @@ Chrome 精确 SPKI 参数与 `w1-test-fixture` 固定 identity，只是 automati
 
 W2a 已继续复用 P5.9 fixed-topology host，关闭浏览器本地 PairInvite inspect、完整 fingerprint 确认前零网络、
 真实 `/v2/pair`、same-UID 本机批准和 matching Closed terminal。PairRequest/Pending/Response/receipt 均由
-Rust/WASM 处理，TypeScript 仍只转发 opaque binary。该切片把 verified response/key directory 留在 WASM
-内存，但尚未做 IndexedDB paired promotion，也未建立 principal connection；因此 list/open/prompt/approval
-归 W2b，reload/reconnect/revoke 归 W2c，W2 整体仍未完成。
+Rust/WASM 处理，TypeScript 仍只转发 opaque binary。
+
+W2b 已从同一 `W2PairingSession` 移交 verified response、原设备密钥、grant、authorization 与 key directory，
+建立真实 paired principal `/v2/connect`。Catalog/Conversation 复用现有 Subscribe、StreamBinding、EpochBarrier、
+StreamAppliedAck 与 outer ACK；随后完成 list/open/prompt/assistant/approval/TurnCompleted，daemon 读回
+command/completed `1/1`、approval total/applied `1/1`。这些材料仍只在 WASM 内存，尚未做 IndexedDB paired
+promotion；reload/reconnect/backfill/revoke 归 W2c，W2 整体仍未完成。
 
 ## 2. 目标与非目标
 

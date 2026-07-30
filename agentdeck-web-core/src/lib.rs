@@ -37,7 +37,11 @@ pub use w1::{
 #[cfg(feature = "w2-test-fixture")]
 mod w2;
 #[cfg(feature = "w2-test-fixture")]
+mod w2_business;
+#[cfg(feature = "w2-test-fixture")]
 pub use w2::{W2PairingCore, W2PairingError, W2PairingEvidence, W2PairingPreview};
+#[cfg(feature = "w2-test-fixture")]
+pub use w2_business::W2BusinessEvidence;
 
 const ED_SEED: [u8; 32] = [0x01; 32];
 const AEAD_KEY: [u8; 32] = [0x11; 32];
@@ -83,7 +87,7 @@ pub enum WebCoreError {
     SerializationFailed,
 }
 
-struct DeterministicRng {
+pub(crate) struct DeterministicRng {
     seed: [u8; 32],
     counter: u64,
     buffer: [u8; 32],
@@ -91,7 +95,7 @@ struct DeterministicRng {
 }
 
 impl DeterministicRng {
-    fn new(seed: [u8; 32]) -> Self {
+    pub(crate) fn new(seed: [u8; 32]) -> Self {
         Self {
             seed,
             counter: 0,

@@ -2293,6 +2293,7 @@ enum P57HostWaitCondition {
     PendingPairing,
     BusinessReady,
     DualScopeBusinessReady,
+    WebBusinessMutated,
     BusinessMutated,
     Revoked,
 }
@@ -2354,6 +2355,17 @@ impl P57HostEvidence {
             P57HostWaitCondition::BusinessReady => self.satisfies_business_ready(2, 2, 2),
             P57HostWaitCondition::DualScopeBusinessReady => {
                 self.satisfies_dual_scope_business_ready()
+            }
+            P57HostWaitCondition::WebBusinessMutated => {
+                self.runtime_command_count == 1
+                    && self.runtime_completed_command_count == 1
+                    && self.runtime_approval_total == 1
+                    && self.runtime_approval_applied == 1
+                    && self.runtime_active_writer_count == 2
+                    && self.runtime_live_subscription_count == 2
+                    && self.runtime_barrier_subscription_count == 0
+                    && self.runtime_snapshot_sender_count == 0
+                    && self.runtime_subscription_job_count == 2
             }
             P57HostWaitCondition::BusinessMutated => {
                 self.runtime_command_count == 1
@@ -2451,6 +2463,17 @@ fn p57_host_readiness_keeps_single_remote_and_dual_scope_topologies_exact() {
     evidence.runtime_subscription_job_count = 4;
     evidence.runtime_active_writer_count = 2;
     assert!(!evidence.satisfies(P57HostWaitCondition::DualScopeBusinessReady));
+
+    evidence.runtime_command_count = 1;
+    evidence.runtime_completed_command_count = 1;
+    evidence.runtime_approval_total = 1;
+    evidence.runtime_approval_applied = 1;
+    evidence.runtime_active_writer_count = 2;
+    evidence.runtime_live_subscription_count = 2;
+    evidence.runtime_subscription_job_count = 2;
+    assert!(evidence.satisfies(P57HostWaitCondition::WebBusinessMutated));
+    evidence.runtime_subscription_job_count = 1;
+    assert!(!evidence.satisfies(P57HostWaitCondition::WebBusinessMutated));
 }
 
 #[derive(Serialize)]

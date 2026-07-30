@@ -8,6 +8,16 @@ export type W2WasmSession = Readonly<{
   acceptPairFrame: (bytes: Uint8Array, nowMs: bigint) => Uint8Array;
   paired: () => boolean;
   evidenceJson: () => string;
+  businessConnectUrl: () => string;
+  businessStartHello: () => Uint8Array;
+  businessAcceptChallenge: (bytes: Uint8Array) => Uint8Array;
+  businessAcceptAuthenticated: (bytes: Uint8Array) => void;
+  businessStartCatalog: () => Uint8Array;
+  businessStartConversation: () => Uint8Array;
+  businessStartPrompt: () => Uint8Array;
+  businessStartApproval: () => Uint8Array;
+  businessAcceptFrame: (bytes: Uint8Array) => Uint8Array;
+  businessEvidenceJson: () => string;
   free: () => void;
 }>;
 
@@ -18,6 +28,7 @@ export type W2WasmSessionConstructor = new (
 
 const CONNECT_TIMEOUT_MS = 5_000;
 const PAIRING_TIMEOUT_MS = 120_000;
+const BUSINESS_TIMEOUT_MS = 120_000;
 let nextGeneration = 0;
 let activeGeneration: number | null = null;
 
@@ -99,7 +110,7 @@ function receiveBinary(socket: WebSocket, generation: number): Promise<Uint8Arra
   });
 }
 
-async function closeSocket(socket: WebSocket): Promise<void> {
+async function closeSocket(socket: WebSocket, reason: string): Promise<void> {
   if (socket.readyState === WebSocket.CLOSED) {
     return;
   }
@@ -107,7 +118,7 @@ async function closeSocket(socket: WebSocket): Promise<void> {
     socket.addEventListener("close", () => resolve(), { once: true });
   });
   if (socket.readyState !== WebSocket.CLOSING) {
-    socket.close(1000, "w2a complete");
+    socket.close(1000, reason);
   }
   await withDeadline(closed, 3_000, "web.remote.close_timeout").catch(() => undefined);
 }
@@ -117,16 +128,18 @@ function failureCode(error: unknown): string {
   return /(?:web|relay)\.[a-z0-9_.]+/u.exec(rendered)?.[0] ?? "web.remote.pairing.failed";
 }
 
-export async function runW2Pairing(
-  Session: W2WasmSessionConstructor,
-  encodedInvite: string,
+function pairingEvidence(session: W2WasmSession): W2PairingEvidence {
+  return JSON.parse(session.evidenceJson()) as W2PairingEvidence;
+}
+
+function businessEvidence(session: W2WasmSession): W2BusinessEvidence {
+  return JSON.parse(session.businessEvidenceJson()) as W2BusinessEvidence;
+}
+
+async function completePairing(
+  session: W2WasmSession,
+  generation: number,
 ): Promise<W2TransportEvidence> {
-  if (activeGeneration !== null) {
-    throw new Error("web.remote.single_flight");
-  }
-  const generation = ++nextGeneration;
-  activeGeneration = generation;
-  const session = new Session(encodedInvite, nowMs());
   const preview = JSON.parse(session.previewJson()) as W2PairingPreview;
   let preConfirmNetworkLocked = false;
   try {
@@ -168,7 +181,7 @@ export async function runW2Pairing(
       preview,
       preConfirmNetworkLocked,
       binaryFramesSent,
-      pairing: JSON.parse(session.evidenceJson()) as W2PairingEvidence,
+      pairing: pairingEvidence(session),
       failureCode: null,
     };
   } catch (error) {
@@ -177,11 +190,191 @@ export async function runW2Pairing(
       preview,
       preConfirmNetworkLocked,
       binaryFramesSent,
-      pairing: JSON.parse(session.evidenceJson()) as W2PairingEvidence,
+      pairing: pairingEvidence(session),
       failureCode: failureCode(error),
     };
   } finally {
-    await closeSocket(socket);
+    await closeSocket(socket, "w2 pairing complete");
+  }
+}
+
+function businessComplete(evidence: W2BusinessEvidence): boolean {
+  return (
+    evidence.principalAuthenticated &&
+    evidence.catalogRouteAccepted &&
+    evidence.catalogEntryCount === 1 &&
+    evidence.catalogSubscriptionActive &&
+    evidence.conversationRouteAccepted &&
+    evidence.conversationOpen &&
+    evidence.relaySubscriptionActive &&
+    evidence.promptRouteAccepted &&
+    evidence.promptAccepted &&
+    evidence.assistantObserved &&
+    evidence.approvalPending &&
+    evidence.approvalSummaryMatched &&
+    evidence.approvalRouteAccepted &&
+    evidence.approvalReceiptApplied &&
+    evidence.approvalEventApplied &&
+    evidence.commandCompleted &&
+    evidence.outerAckCount >= 5
+  );
+}
+
+async function completeBusiness(
+  session: W2WasmSession,
+  generation: number,
+): Promise<Readonly<{ evidence: W2BusinessEvidence; binaryFramesSent: number; failureCode: string | null }>> {
+  const socket = new WebSocket(session.businessConnectUrl());
+  socket.binaryType = "arraybuffer";
+  let binaryFramesSent = 0;
+  let conversationStarted = false;
+  let promptStarted = false;
+  let approvalStarted = false;
+  let approvalReadbackStarted = false;
+  let observedFenceCount = 0;
+  try {
+    await waitForOpen(socket, generation);
+    socket.send(session.businessStartHello());
+    binaryFramesSent += 1;
+    socket.send(session.businessAcceptChallenge(await receiveBinary(socket, generation)));
+    binaryFramesSent += 1;
+    session.businessAcceptAuthenticated(await receiveBinary(socket, generation));
+    socket.send(session.businessStartCatalog());
+    binaryFramesSent += 1;
+
+    await withDeadline(
+      (async () => {
+        while (!businessComplete(businessEvidence(session))) {
+          const action = session.businessAcceptFrame(await receiveBinary(socket, generation));
+          if (action.length > 0) {
+            socket.send(action);
+            binaryFramesSent += 1;
+          }
+          const evidence = businessEvidence(session);
+          if (evidence.businessFenceCount > observedFenceCount) {
+            observedFenceCount = evidence.businessFenceCount;
+            if (observedFenceCount > 8) {
+              throw new Error("web.remote.business.fence_retry_exhausted");
+            }
+            await new Promise<void>((resolve) => {
+              setTimeout(resolve, Math.min(100 * observedFenceCount, 500));
+            });
+            if (!evidence.catalogSubscriptionActive) {
+              socket.send(session.businessStartCatalog());
+            } else if (!evidence.conversationOpen) {
+              socket.send(session.businessStartConversation());
+            } else if (!evidence.promptAccepted) {
+              socket.send(session.businessStartPrompt());
+            } else if (!evidence.approvalReceiptApplied) {
+              socket.send(session.businessStartApproval());
+            } else {
+              throw new Error("web.remote.business.fence_stage_invalid");
+            }
+            binaryFramesSent += 1;
+            continue;
+          }
+          if (
+            !conversationStarted &&
+            evidence.catalogRouteAccepted &&
+            evidence.catalogEntryCount === 1 &&
+            evidence.catalogSubscriptionActive
+          ) {
+            socket.send(session.businessStartConversation());
+            binaryFramesSent += 1;
+            conversationStarted = true;
+          } else if (
+            !promptStarted &&
+            evidence.conversationOpen &&
+            evidence.relaySubscriptionActive
+          ) {
+            socket.send(session.businessStartPrompt());
+            binaryFramesSent += 1;
+            promptStarted = true;
+          } else if (
+            !approvalStarted &&
+            evidence.promptAccepted &&
+            evidence.approvalPending
+          ) {
+            socket.send(session.businessStartApproval());
+            binaryFramesSent += 1;
+            approvalStarted = true;
+          } else if (
+            !approvalReadbackStarted &&
+            evidence.approvalRouteAccepted &&
+            evidence.approvalEventApplied &&
+            !evidence.approvalReceiptApplied
+          ) {
+            socket.send(session.businessStartApproval());
+            binaryFramesSent += 1;
+            approvalReadbackStarted = true;
+          }
+        }
+      })(),
+      BUSINESS_TIMEOUT_MS,
+      "web.remote.business.timeout",
+    );
+    return { evidence: businessEvidence(session), binaryFramesSent, failureCode: null };
+  } catch (error) {
+    return {
+      evidence: businessEvidence(session),
+      binaryFramesSent,
+      failureCode: failureCode(error),
+    };
+  } finally {
+    await closeSocket(socket, "w2 business complete");
+  }
+}
+
+export async function runW2Pairing(
+  Session: W2WasmSessionConstructor,
+  encodedInvite: string,
+): Promise<W2TransportEvidence> {
+  if (activeGeneration !== null) {
+    throw new Error("web.remote.single_flight");
+  }
+  const generation = ++nextGeneration;
+  activeGeneration = generation;
+  const session = new Session(encodedInvite, nowMs());
+  try {
+    return await completePairing(session, generation);
+  } finally {
+    session.free();
+    if (activeGeneration === generation) {
+      activeGeneration = null;
+    }
+  }
+}
+
+export async function runW2Business(
+  Session: W2WasmSessionConstructor,
+  encodedInvite: string,
+): Promise<W2BusinessTransportEvidence> {
+  if (activeGeneration !== null) {
+    throw new Error("web.remote.single_flight");
+  }
+  const generation = ++nextGeneration;
+  activeGeneration = generation;
+  const session = new Session(encodedInvite, nowMs());
+  try {
+    const pairing = await completePairing(session, generation);
+    if (pairing.failureCode !== null || !pairing.pairing.paired) {
+      return {
+        ...pairing,
+        pairingBinaryFramesSent: pairing.binaryFramesSent,
+        businessBinaryFramesSent: 0,
+        business: null,
+      };
+    }
+    const business = await completeBusiness(session, generation);
+    return {
+      ...pairing,
+      binaryFramesSent: pairing.binaryFramesSent + business.binaryFramesSent,
+      pairingBinaryFramesSent: pairing.binaryFramesSent,
+      businessBinaryFramesSent: business.binaryFramesSent,
+      business: business.evidence,
+      failureCode: business.failureCode,
+    };
+  } finally {
     session.free();
     if (activeGeneration === generation) {
       activeGeneration = null;
