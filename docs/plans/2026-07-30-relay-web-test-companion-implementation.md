@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2 automatic complete；W3 未开始；W4 BLOCKED |
+| 状态 | W0/W1/W2 automatic complete；W3.1 complete，W3.2–W3.7 未开始；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -380,7 +380,7 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 
 ### Tasks
 
-- [ ] W3.1：为 counter reservation、sealed state commit、Stable finalize 三个 cut 增加 deterministic fault seam；
+- [x] W3.1：为 counter reservation、sealed state commit、Stable finalize 三个 cut 增加 deterministic fault seam；
   每个 cut 重启后只能整块跳号或 exact finalize。
 - [ ] W3.2：覆盖 replay/cursor statePending 的 previous rollback、exact next finalize 与 sibling/fork quarantine。
 - [ ] W3.3：启动第二 tab/worker，验证 Web Locks 排他、旧 generation/BroadcastChannel 失效和零重复发送。
@@ -389,9 +389,23 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 - [ ] W3.6：同一 committed candidate 连续三次 fresh 完成 W2 business + W3 recovery；任一轮失败重新计数。
 - [ ] W3.7：执行 spec/security 与 quality/Git 双路 review，清零 P0/P1/P2，更新文档并形成 W3 scoped commit。
 
+### W3.1 evidence（2026-07-30）
+
+- IndexedDB 新增独立 `counterGuard`，提交固定为 Pending guard、encrypted paired state、Stable guard 三段
+  transaction + readback；Pending 冻结 previous/next revision、commitment 和 next sealed bytes。
+- `scripts/run-relay-web-companion-e2e.sh --crash-cuts` 对三个 cut 各跑一轮 fresh Relay/daemon/Chrome：
+  `guardPendingDurable` 从 previous 完成 exact-next，`stateDurable` 从 exact-next 补 Stable，
+  `guardStableDurable` exact-open。注入后恢复前均为零 frame。
+- 三轮均整块跳过未暴露的 `256→512`，冷恢复后 reservation 为 `512→768`、最终 revision `4`；
+  command/completed、approval total/applied 各 `1/1`，revoke 后 active grant `0`，paired/KEK/guard 与所有
+  runner artifact absent。
+- 未启动 W3.2 replay/cursor fork、W3.3 tab contention、W3.4 browser kill、W3.5 故障代理、W3.6 三次
+  candidate 重复或 W3.7 双路终审；W3 overall 仍未完成。
+
 ### Gates
 
 ```bash
+bash scripts/run-relay-web-companion-e2e.sh --crash-cuts
 bash scripts/run-relay-web-companion-e2e.sh --recovery
 for run in 1 2 3; do
   bash scripts/run-relay-web-companion-e2e.sh --business

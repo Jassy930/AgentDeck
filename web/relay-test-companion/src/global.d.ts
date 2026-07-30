@@ -125,6 +125,35 @@ declare global {
     binaryFramesSent: number;
     storage: PairedStorageEvidence;
     reloadStatus: "active" | "revoked" | "missing";
+    reservationRecovery: W3ReservationRecovery | null;
+    failureCode: string | null;
+  }>;
+
+  type W3CrashCut =
+    | "guardPendingDurable"
+    | "stateDurable"
+    | "guardStableDurable";
+
+  type W3ReservationRecovery =
+    | "pendingPreviousFinalized"
+    | "pendingNextFinalized"
+    | "stableExact";
+
+  type W3ReservationStorageEvidence = Readonly<{
+    pairedRevision: number | null;
+    guardPhase: "pending" | "stable" | null;
+    guardRevision: number | null;
+    pendingPreviousRevision: number | null;
+    pendingNextRevision: number | null;
+    stagedCiphertextBytes: number;
+  }>;
+
+  type W3CrashCutEvidence = Readonly<{
+    cut: W3CrashCut;
+    revisionBefore: number;
+    faultInjected: boolean;
+    binaryFramesSent: 0;
+    storage: W3ReservationStorageEvidence;
     failureCode: string | null;
   }>;
 
@@ -161,6 +190,10 @@ declare global {
       profileId: string,
     ) => Promise<W2DurableStartEvidence>;
     runW2DurableRecover: (profileId: string) => Promise<W2DurableRecoveryEvidence>;
+    runW3ReservationCrash: (
+      profileId: string,
+      cut: W3CrashCut,
+    ) => Promise<W3CrashCutEvidence>;
     initializeState: (profileId: string, payload: string) => Promise<DurableStateRecord>;
     readState: (profileId: string) => Promise<DurableStateRecord | null>;
     commitExactRevision: (

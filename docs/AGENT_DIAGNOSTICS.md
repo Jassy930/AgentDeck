@@ -44,7 +44,7 @@ agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge
 stable UDS。diagnostics report 不启动 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志；不要把
 diagnostics override 当成 stable ownership 配置。
 
-## Relay Web Test Companion W0/W1/W2a/W2b/W2c/W2.7 failure codes
+## Relay Web Test Companion W0–W3.1 failure codes
 
 W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，尚未连接 Relay。以下 code 只在本地
 测试 host 中出现；它们不进入 daemon diagnostic log，也不能解释为远端业务失败：
@@ -113,6 +113,9 @@ daemon diagnostic log：
 | `web.remote.storage.pairedPromotionConflict` / `pairedRevisionConflict` / `revocationConflict` | promotion、普通提交或 revoke cleanup 的 expected revision/terminal 条件不精确 | transaction 必须 abort；重新读取唯一 current record，禁止 blind overwrite 或 sibling 合并 |
 | `web.remote.storage.revisionInvalid` / `pairedStateIncomplete` | revision 非 safe integer，或 paired record/KEK 缺一部分 | 视为损坏状态；停止自动恢复，不得猜测缺失材料 |
 | `web.remote.storage.revokedMaterialPresent` | revoked tombstone 与 paired material/KEK 同时存在 | 视为安全失败并停止；不得选择任意一边继续连接 |
+| `web.remote.storage.counterGuardInvalid` / `pairedStateInvalid` | counter guard 或 encrypted paired record 的 phase、revision、commitment、IV/密文形状非法 | 保留隔离 profile，停止联网；不得修补字段或绕过 commitment/AAD 校验 |
+| `web.remote.storage.counterGuardConflict` / `counterGuardFork` | durable stage 的 exact guard 已变化，或 paired state 既不是 pending previous 也不是 exact next | fail-close 且零 frame；对照 raw phase/revision/commitment，W3.2 前不得自动合并 sibling/fork |
+| `web.remote.storage.counterGuardRecoveryFailed` / `pairedCommitmentMismatch` | Pending 收口后未读回 Stable exact state，或解密 plaintext 的 SHA-256 与 sealed commitment 不一致 | 停止旧 identity；保留 profile 取证，不能回退旧 revision 或重新配对掩盖 |
 | `web.remote.durable.reconnect_timeout` / `recovery_timeout` | reload 后认证或 Catalog/Conversation recovery 未在有界窗口完成 | 读取 `recoveryStage` 与 host generation；不要用固定 sleep、无限重试或重新配对掩盖 cursor/gap 错误 |
 | `web.remote.durable.revocation_terminal_missing` | self-revoke 后未验证 MachineRoot-signed terminal | 保留材料，不执行删除；directed receipt 或 socket close 都不能单独充当权威 terminal |
 | `web.remote.durable.cleanup_readback_failed` | revoke cleanup 后没有读回 material/KEK absent + tombstone present + exact revision | 停止旧身份的任何重连并保留 profile 取证；不能只清内存或只删一层记录 |
@@ -143,8 +146,12 @@ Chrome→Relay 路径。W2a 失败用 `--pairing` 重放 fresh fixed-topology ho
 区分 pre-confirm、pending、local approve、receipt/Closed 或 cleanup 阶段；W2b 失败用 `--business` 查看脱敏
 Catalog/Conversation/Prompt/Approval evidence 和 host 精确计数；W2c 失败用 `--durable` 查看 exact
 revision/counter、`recoveryStage`、daemon generation 与 revoked readback；W2.7 失败用 `--negative` 对照 typed
-snapshot 与 daemon SQLite frozen counts。测试结束必须停止静态 server、关闭
-tab/profile、Relay/daemon 并删除本轮精确临时 root；cleanup 不使用全局浏览器数据或全局进程名删除。
+snapshot 与 daemon SQLite frozen counts；W3.1 失败用 `--crash-cuts` 确认具体 cut、
+`reservationRecovery`、revision `4`、`512→768` 与注入后
+零 frame。`pendingPreviousFinalized` 表示从 previous 完成 exact-next state 后 finalize，
+`pendingNextFinalized` 表示只补 Stable，`stableExact` 表示无需写入恢复；任何其他状态都不能联网。
+测试结束必须停止静态 server、关闭 tab/profile、Relay/daemon 并删除本轮精确临时 root；cleanup 不使用
+全局浏览器数据或全局进程名删除。
 
 ## Relay v1 历史 marker 与显式 reset
 

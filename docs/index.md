@@ -70,8 +70,9 @@
   浏览器测试链路；W0 WASM/浏览器持久状态、W1 真实 Chrome→临时 TLS Relay 直连、W2a 本机批准的
   `/v2/pair` terminal、W2b 同页 list/open/prompt/approval、W2c IndexedDB promotion、
   reload/reconnect/backfill/revoke 与 W2.7 approval loser/stale/replay/nonce-reuse 零 mutation 矩阵已 automatic
-  complete；W2.8 已用 Web aggregate 与 fixed-topology iOS/P5 回归完成 W2 automatic overall closeout。W3 的
-  crash-cut/tab contention/三次 fresh run尚未开始，W4 外部槽位继续 BLOCKED。
+  complete；W2.8 已用 Web aggregate 与 fixed-topology iOS/P5 回归完成 W2 automatic overall closeout。
+  W3.1 counter reservation 三个 crash cut 已完成；W3.2–W3.7 的 replay/cursor fork、tab contention、browser
+  kill、网络故障与三次 fresh run尚未开始，W4 外部槽位继续 BLOCKED。
   方案只允许 Rust/WASM 复用现有 Relay v2、Runtime v5 与 E2EE v1，
   TypeScript 只做 WebSocket/IndexedDB/UI host；按 W0–W3 关闭可行性、直连、业务与恢复 automatic 证据，
   W4 继续独立保留物理设备、公网与 production TLS 门禁。

@@ -20,7 +20,7 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
-## Relay Web Test Companion W0/W1/W2a/W2b/W2c/W2.7 门禁（2026-07-30）
+## Relay Web Test Companion W0–W3.1 门禁（2026-07-30）
 
 W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
 `web/relay-test-companion/` 后运行：
@@ -146,7 +146,21 @@ authorization 四项 SQLite 计数，并证明后到 resolve 与 Applied Retry �
 
 W2c PASS 关闭单轮 durable 正向链路，W2.7 PASS 关闭 negative/zero-mutation matrix。W2.8 还必须在同一
 candidate 上通过 `--all` 与 `verify-relay-companion-mvp.sh p5`；当前两者已 PASS，因此 W2 automatic overall
-complete。W3 的 deterministic crash cuts、第二 tab、网络故障与三次 fresh run尚未开始。
+complete。W3.1 的 counter reservation 三个 deterministic crash cut 已通过；W3.2–W3.7 的 replay/cursor
+fork、第二 tab、browser kill、网络故障与三次 fresh run尚未开始。
+
+W3.1 独立门禁如下；它不会提前执行 W3.2 之后的 tab contention、故障代理或三次 fresh run：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --crash-cuts
+```
+
+runner 对 `guardPendingDurable`、`stateDurable`、`guardStableDurable` 各执行一轮 fresh fixed-topology
+Relay/daemon/Chrome 生命周期。每轮必须读回注入后零 binary frame、冷恢复来源分别为
+`pendingPreviousFinalized` / `pendingNextFinalized` / `stableExact`、durable revision `4` 与 reservation
+`512→768`；command/completed 和 approval total/applied 始终各 `1/1`，最终 revoke、counter guard、paired
+material、KEK、browser/host/temp artifact 全部清理。
+
 W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED。
 
 本切片涉及的 daemon machine E2E 可用以下 scoped Clippy 复核：

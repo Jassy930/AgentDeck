@@ -6,11 +6,13 @@ runner="$repo_root/scripts/run-relay-web-companion-e2e.sh"
 pairing_runner="$repo_root/scripts/run-relay-web-companion-pairing-e2e.sh"
 business_runner="$repo_root/scripts/run-relay-web-companion-business-e2e.sh"
 durable_runner="$repo_root/scripts/run-relay-web-companion-durable-e2e.sh"
+crash_cuts_runner="$repo_root/scripts/run-relay-web-companion-crash-cuts-e2e.sh"
 
 bash -n "$runner"
 bash -n "$pairing_runner"
 bash -n "$business_runner"
 bash -n "$durable_runner"
+bash -n "$crash_cuts_runner"
 
 all_case="$(sed -n '/^[[:space:]]*--all)/,/^[[:space:]]*;;/p' "$runner")"
 printf '%s\n' "$all_case" | grep -Fq 'run_contract' \
@@ -33,6 +35,15 @@ printf '%s\n' "$durable_case" | grep -Fq 'run_durable' \
 negative_case="$(sed -n '/^[[:space:]]*--negative)/,/^[[:space:]]*;;/p' "$runner")"
 printf '%s\n' "$negative_case" | grep -Fq 'run_negative' \
   || { printf 'runner --negative omitted negative gate\n' >&2; exit 1; }
+
+crash_cuts_case="$(sed -n '/^[[:space:]]*--crash-cuts)/,/^[[:space:]]*;;/p' "$runner")"
+printf '%s\n' "$crash_cuts_case" | grep -Fq 'run_crash_cuts' \
+  || { printf 'runner --crash-cuts omitted crash-cut gate\n' >&2; exit 1; }
+
+for cut in guardPendingDurable stateDurable guardStableDurable; do
+  grep -Fq "$cut" "$crash_cuts_runner" \
+    || { printf 'crash-cut runner omitted %s\n' "$cut" >&2; exit 1; }
+done
 
 if "$runner" --unknown >/dev/null 2>&1; then
   printf 'runner accepted an unknown mode\n' >&2

@@ -124,6 +124,7 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page })
   const invitePath = process.env.AGENTDECK_W2_INVITE_PATH;
   const coordinationDir = process.env.AGENTDECK_W2_COORDINATION_DIR;
   const profileId = process.env.AGENTDECK_W2_PROFILE_ID;
+  const crashCut = process.env.AGENTDECK_W3_CRASH_CUT as W3CrashCut | undefined;
   if (invitePath === undefined || coordinationDir === undefined || profileId === undefined) {
     throw new Error("W2c runner contract is missing");
   }
@@ -179,20 +180,51 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page })
 
   await page.reload();
   await expect.poll(() => page.evaluate(() => document.documentElement.dataset.ready)).toBe("true");
+  if (crashCut !== undefined) {
+    const crashed = await page.evaluate(
+      async ({ profile, cut }) => globalThis.relayTestApi.runW3ReservationCrash(profile, cut),
+      { profile: profileId, cut: crashCut },
+    );
+    expect(crashed.failureCode, JSON.stringify(crashed)).toBeNull();
+    expect(crashed).toMatchObject({
+      cut: crashCut,
+      revisionBefore: 1,
+      faultInjected: true,
+      binaryFramesSent: 0,
+    });
+    const expectedPairedRevision = crashCut === "guardPendingDurable" ? 1 : 2;
+    const expectedGuardPhase = crashCut === "guardStableDurable" ? "stable" : "pending";
+    expect(crashed.storage).toMatchObject({
+      pairedRevision: expectedPairedRevision,
+      guardPhase: expectedGuardPhase,
+      guardRevision: crashCut === "guardStableDurable" ? 2 : null,
+      pendingPreviousRevision: crashCut === "guardStableDurable" ? null : 1,
+      pendingNextRevision: crashCut === "guardStableDurable" ? null : 2,
+    });
+    if (crashCut === "guardStableDurable") {
+      expect(crashed.storage.stagedCiphertextBytes).toBe(0);
+    } else {
+      expect(crashed.storage.stagedCiphertextBytes).toBeGreaterThan(16);
+    }
+    await page.reload();
+    await expect.poll(() => page.evaluate(() => document.documentElement.dataset.ready)).toBe(
+      "true",
+    );
+  }
   const recovered = await page.evaluate(
     async (profile) => globalThis.relayTestApi.runW2DurableRecover(profile),
     profileId,
   );
   expect(recovered.failureCode, JSON.stringify(recovered)).toBeNull();
-  expect(recovered.revision).toBe(3);
+  expect(recovered.revision).toBe(crashCut === undefined ? 3 : 4);
   expect(recovered.preActivationNetworkLocked).toBe(true);
   expect(recovered.reloadStatus).toBe("revoked");
   expect(recovered.business).toMatchObject({
     durablePromoted: true,
     durableRestored: true,
     reconnectAuthenticated: true,
-    counterReservationStart: 256,
-    counterReservationEnd: 512,
+    counterReservationStart: crashCut === undefined ? 256 : 512,
+    counterReservationEnd: crashCut === undefined ? 512 : 768,
     restartMarkerObserved: true,
     revocationReceiptCommitted: true,
     revocationTerminalVerified: true,
@@ -201,11 +233,20 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page })
     approvalEventApplied: true,
   });
   expect(recovered.business?.recoveryCatalogBackfillCount).toBeGreaterThanOrEqual(1);
+  expect(recovered.reservationRecovery).toBe(
+    crashCut === undefined
+      ? "stableExact"
+      : crashCut === "guardPendingDurable"
+        ? "pendingPreviousFinalized"
+        : crashCut === "stateDurable"
+          ? "pendingNextFinalized"
+          : "stableExact",
+  );
   expect(recovered.storage).toEqual({
     pairedPresent: false,
     kekPresent: false,
     revokedPresent: true,
-    revision: 3,
+    revision: crashCut === undefined ? 3 : 4,
     ciphertextBytes: 0,
   });
   expect(recovered.binaryFramesSent).toBeGreaterThanOrEqual(8);

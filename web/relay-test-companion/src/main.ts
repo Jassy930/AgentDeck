@@ -13,6 +13,7 @@ import {
   runW2DurableRecover,
   runW2DurableStart,
   runW2Pairing,
+  runW3ReservationCrash,
   type W2WasmSessionConstructor,
 } from "./w2-transport.ts";
 
@@ -167,6 +168,13 @@ const api: RelayTestApi = {
         : (result.failureCode ?? "W2c 恢复闭环失败");
     }
     return result;
+  },
+  async runW3ReservationCrash(profileId, cut) {
+    const constructor = (await corePromise).W2PairingSession;
+    if (constructor === undefined) {
+      throw new Error("web.remote.w2_fixture_unavailable");
+    }
+    return runW3ReservationCrash(constructor, profileId, cut);
   },
   initializeState,
   readState,

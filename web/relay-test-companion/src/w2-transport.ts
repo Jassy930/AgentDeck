@@ -2,8 +2,10 @@ import {
   commitPairedState,
   commitRevokedCleanup,
   inspectPairedStorage,
+  inspectReservationStorage,
   loadPairedState,
   promotePairedState,
+  type DurableCommitStage,
 } from "./storage.ts";
 
 export type W2WasmSession = Readonly<{
@@ -543,12 +545,14 @@ export async function runW2DurableRecover(
   let session: W2WasmSession | null = null;
   let revision: number | null = null;
   let preActivationNetworkLocked = false;
+  let reservationRecovery: W3ReservationRecovery | null = null;
   try {
     const loaded = await loadPairedState(profileId);
     if (loaded.status !== "active") {
       throw new Error(`web.remote.durable.${loaded.status}`);
     }
     revision = loaded.revision;
+    reservationRecovery = loaded.reservationRecovery;
     session = Session.restore(loaded.state);
     try {
       session.businessConnectUrl();
@@ -578,6 +582,7 @@ export async function runW2DurableRecover(
       binaryFramesSent: recovery.binaryFramesSent,
       storage: await inspectPairedStorage(profileId),
       reloadStatus: terminalLoad.status,
+      reservationRecovery,
       failureCode: null,
     };
   } catch (error) {
@@ -589,6 +594,89 @@ export async function runW2DurableRecover(
       binaryFramesSent: 0,
       storage: await inspectPairedStorage(profileId),
       reloadStatus: (await loadPairedState(profileId)).status,
+      reservationRecovery,
+      failureCode: failureCode(error),
+    };
+  } finally {
+    session?.free();
+    if (activeGeneration === generation) {
+      activeGeneration = null;
+    }
+  }
+}
+
+class InjectedReservationCrash extends Error {
+  constructor(readonly stage: DurableCommitStage) {
+    super(`web.remote.test.injected_crash.${stage}`);
+  }
+}
+
+function isW3CrashCut(value: string): value is W3CrashCut {
+  return (
+    value === "guardPendingDurable" ||
+    value === "stateDurable" ||
+    value === "guardStableDurable"
+  );
+}
+
+export async function runW3ReservationCrash(
+  Session: W2WasmSessionConstructor,
+  profileId: string,
+  cut: W3CrashCut,
+): Promise<W3CrashCutEvidence> {
+  if (activeGeneration !== null) {
+    throw new Error("web.remote.single_flight");
+  }
+  if (!isW3CrashCut(cut)) {
+    throw new Error("web.remote.durable.crash_cut_invalid");
+  }
+  const generation = ++nextGeneration;
+  activeGeneration = generation;
+  let session: W2WasmSession | null = null;
+  let revisionBefore = -1;
+  let faultInjected = false;
+  try {
+    const loaded = await loadPairedState(profileId);
+    if (loaded.status !== "active") {
+      throw new Error(`web.remote.durable.${loaded.status}`);
+    }
+    revisionBefore = loaded.revision;
+    session = Session.restore(loaded.state);
+    try {
+      await commitPairedState(
+        profileId,
+        revisionBefore,
+        session.businessExportDurableState(),
+        (stage) => {
+          if (stage === cut) {
+            throw new InjectedReservationCrash(stage);
+          }
+        },
+      );
+    } catch (error) {
+      if (!(error instanceof InjectedReservationCrash) || error.stage !== cut) {
+        throw error;
+      }
+      faultInjected = true;
+    }
+    if (!faultInjected) {
+      throw new Error("web.remote.durable.crash_cut_not_injected");
+    }
+    return {
+      cut,
+      revisionBefore,
+      faultInjected,
+      binaryFramesSent: 0,
+      storage: await inspectReservationStorage(profileId),
+      failureCode: null,
+    };
+  } catch (error) {
+    return {
+      cut,
+      revisionBefore,
+      faultInjected,
+      binaryFramesSent: 0,
+      storage: await inspectReservationStorage(profileId),
       failureCode: failureCode(error),
     };
   } finally {

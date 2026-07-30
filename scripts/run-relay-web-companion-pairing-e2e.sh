@@ -13,6 +13,16 @@ esac
 gate_label="W2a"
 [[ "$run_mode" != "business" ]] || gate_label="W2b"
 [[ "$run_mode" != "durable" ]] || gate_label="W2c"
+crash_cut="${AGENTDECK_W3_CRASH_CUT:-}"
+if [[ -n "$crash_cut" ]]; then
+  [[ "$run_mode" == "durable" ]] \
+    || { printf 'AGENTDECK_W3_CRASH_CUT requires --durable\n' >&2; exit 64; }
+  case "$crash_cut" in
+    guardPendingDurable|stateDurable|guardStableDurable) ;;
+    *) printf 'invalid AGENTDECK_W3_CRASH_CUT: %s\n' "$crash_cut" >&2; exit 64 ;;
+  esac
+  gate_label="W3.1/$crash_cut"
+fi
 
 fail() {
   printf 'relay web companion %s: FAIL: %s\n' "$gate_label" "$1" >&2
@@ -241,12 +251,16 @@ browser_grep="W2a real browser pairing"
 [[ "$run_mode" != "durable" ]] || browser_grep="W2c durable reload reconnect backfill and revoke"
 (
   cd "$web_root"
-  AGENTDECK_WEB_WSS_ORIGIN="$relay_origin" \
-  AGENTDECK_WEB_TEST_SPKI_PIN="$relay_spki_pin" \
-  AGENTDECK_W2_INVITE_PATH="$host_invite" \
-  AGENTDECK_W2_COORDINATION_DIR="$coordination_dir" \
-  AGENTDECK_W2_PROFILE_ID="$profile_id" \
-  RELAY_WEB_TEST_PORT="$web_port" \
+  browser_environment=(
+    "AGENTDECK_WEB_WSS_ORIGIN=$relay_origin"
+    "AGENTDECK_WEB_TEST_SPKI_PIN=$relay_spki_pin"
+    "AGENTDECK_W2_INVITE_PATH=$host_invite"
+    "AGENTDECK_W2_COORDINATION_DIR=$coordination_dir"
+    "AGENTDECK_W2_PROFILE_ID=$profile_id"
+    "RELAY_WEB_TEST_PORT=$web_port"
+  )
+  [[ -z "$crash_cut" ]] || browser_environment+=("AGENTDECK_W3_CRASH_CUT=$crash_cut")
+  env "${browser_environment[@]}" \
     bun run test:browser:built -- \
     --grep "$browser_grep"
 ) >"$browser_log" 2>&1 &
@@ -450,7 +464,23 @@ rm -rf "$runner_root"
 cleanup_started=1
 trap - EXIT HUP INT TERM
 if [[ "$run_mode" == "durable" ]]; then
-  printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2c","status":"PASS","daemonGeneration":2,"durableRevision":3,"counterReservationStart":256,"counterReservationEnd":512,"catalogBackfillObserved":true,"runtimeCommandCount":1,"runtimeCompletedCommandCount":1,"runtimeApprovalTotal":1,"runtimeApprovalApplied":1,"runtimeRevokedAuthorizationCount":1,"relayGrantActive":0,"relayPlaintextAbsent":true,"browserPlaintextAbsent":true,"cleanup":{"pairedMaterialAbsent":true,"kekAbsent":true,"revokedTombstonePresent":true,"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'
+  durable_revision=3
+  reservation_start=256
+  reservation_end=512
+  gate="relay-web-companion-w2c"
+  if [[ -n "$crash_cut" ]]; then
+    durable_revision=4
+    reservation_start=512
+    reservation_end=768
+    gate="relay-web-companion-w3-crash-cut"
+  fi
+  jq -cn \
+    --arg gate "$gate" \
+    --arg crashCut "$crash_cut" \
+    --argjson durableRevision "$durable_revision" \
+    --argjson counterReservationStart "$reservation_start" \
+    --argjson counterReservationEnd "$reservation_end" \
+    '{schemaVersion:1,gate:$gate,status:"PASS",crashCut:(if ($crashCut | length) > 0 then $crashCut else null end),daemonGeneration:2,durableRevision:$durableRevision,counterReservationStart:$counterReservationStart,counterReservationEnd:$counterReservationEnd,catalogBackfillObserved:true,runtimeCommandCount:1,runtimeCompletedCommandCount:1,runtimeApprovalTotal:1,runtimeApprovalApplied:1,runtimeRevokedAuthorizationCount:1,relayGrantActive:0,relayPlaintextAbsent:true,browserPlaintextAbsent:true,cleanup:{pairedMaterialAbsent:true,kekAbsent:true,revokedTombstonePresent:true,counterGuardAbsent:true,browserAbsent:true,hostPidAbsent:true,hostRootAbsent:true,inviteAbsent:true,socketAbsent:true,playwrightArtifactsAbsent:true}}'
 elif [[ "$run_mode" == "business" ]]; then
   printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2b","status":"PASS","preConfirmNetworkLocked":true,"pendingPairingCount":0,"relayGrantTotal":1,"relayGrantActive":1,"activeTransitionCount":0,"activeCatalogStreamCount":1,"runtimeCommandCount":1,"runtimeCompletedCommandCount":1,"runtimeApprovalTotal":1,"runtimeApprovalApplied":1,"relayPlaintextAbsent":true,"browserPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'
 else

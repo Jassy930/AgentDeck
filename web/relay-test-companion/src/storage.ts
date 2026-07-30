@@ -5,6 +5,7 @@ const STORE_NAME = "durable";
 const STATE_KEY = "state";
 const KEK_KEY = "kek";
 const PAIRED_KEY = "paired";
+const COUNTER_GUARD_KEY = "counterGuard";
 const REVOKED_KEY = "revoked";
 const PAIRED_AAD_DOMAIN = "AgentDeck/WebPairedStateV1\0";
 
@@ -29,9 +30,37 @@ export type WriterLease = Readonly<{
 type EncryptedPairedRecord = Readonly<{
   key: typeof PAIRED_KEY;
   revision: number;
+  stateCommitment: Uint8Array;
   iv: Uint8Array;
   ciphertext: Uint8Array;
 }>;
+
+type StableCounterGuardRecord = Readonly<{
+  key: typeof COUNTER_GUARD_KEY;
+  phase: "stable";
+  revision: number;
+  stateCommitment: Uint8Array;
+}>;
+
+type PendingCounterGuardRecord = Readonly<{
+  key: typeof COUNTER_GUARD_KEY;
+  phase: "pending";
+  previousRevision: number;
+  previousStateCommitment: Uint8Array;
+  nextRevision: number;
+  nextStateCommitment: Uint8Array;
+  nextIv: Uint8Array;
+  nextCiphertext: Uint8Array;
+}>;
+
+type CounterGuardRecord = StableCounterGuardRecord | PendingCounterGuardRecord;
+
+export type DurableCommitStage =
+  | "guardPendingDurable"
+  | "stateDurable"
+  | "guardStableDurable";
+
+export type DurableCommitObserver = (stage: DurableCommitStage) => void | Promise<void>;
 
 type RevokedRecord = Readonly<{
   key: typeof REVOKED_KEY;
@@ -40,7 +69,12 @@ type RevokedRecord = Readonly<{
 }>;
 
 export type PairedStateLoad =
-  | Readonly<{ status: "active"; revision: number; state: Uint8Array }>
+  | Readonly<{
+      status: "active";
+      revision: number;
+      state: Uint8Array;
+      reservationRecovery: W3ReservationRecovery;
+    }>
   | Readonly<{ status: "revoked"; revision: number }>
   | Readonly<{ status: "missing" }>;
 
@@ -50,6 +84,20 @@ export type PairedStorageEvidence = Readonly<{
   revokedPresent: boolean;
   revision: number | null;
   ciphertextBytes: number;
+}>;
+
+export type W3ReservationRecovery =
+  | "pendingPreviousFinalized"
+  | "pendingNextFinalized"
+  | "stableExact";
+
+export type W3ReservationStorageEvidence = Readonly<{
+  pairedRevision: number | null;
+  guardPhase: "pending" | "stable" | null;
+  guardRevision: number | null;
+  pendingPreviousRevision: number | null;
+  pendingNextRevision: number | null;
+  stagedCiphertextBytes: number;
 }>;
 
 function databaseName(profileId: string): string {
@@ -273,145 +321,359 @@ function cryptoBytes(value: Uint8Array): Uint8Array<ArrayBuffer> {
   return Uint8Array.from(value);
 }
 
-function pairedAad(profileId: string, revision: number): Uint8Array<ArrayBuffer> {
-  return new TextEncoder().encode(`${PAIRED_AAD_DOMAIN}${profileId}\0${revision}`);
+type PairedBundle = Readonly<{
+  paired: EncryptedPairedRecord | undefined;
+  guard: CounterGuardRecord | undefined;
+  revoked: RevokedRecord | undefined;
+  kek: CryptoKey | undefined;
+}>;
+
+type ActiveBundle = Readonly<{
+  paired: EncryptedPairedRecord;
+  guard: CounterGuardRecord;
+  kek: CryptoKey;
+}>;
+
+async function withStore<T>(
+  profileId: string,
+  mode: IDBTransactionMode,
+  body: (store: IDBObjectStore) => Promise<T>,
+): Promise<T> {
+  const database = await openDatabase(profileId);
+  const transaction = database.transaction(STORE_NAME, mode);
+  const completed = transactionDone(transaction);
+  try {
+    const result = await body(transaction.objectStore(STORE_NAME));
+    await completed;
+    return result;
+  } catch (error) {
+    try {
+      transaction.abort();
+    } catch {
+      // transaction 已完成时无需额外动作。
+    }
+    await completed.catch(() => undefined);
+    throw error;
+  } finally {
+    database.close();
+  }
+}
+
+async function readBundle(store: IDBObjectStore): Promise<PairedBundle> {
+  const [paired, guard, revoked, kekRecord] = await Promise.all([
+    requestResult(store.get(PAIRED_KEY)) as Promise<EncryptedPairedRecord | undefined>,
+    requestResult(store.get(COUNTER_GUARD_KEY)) as Promise<CounterGuardRecord | undefined>,
+    requestResult(store.get(REVOKED_KEY)) as Promise<RevokedRecord | undefined>,
+    requestResult(store.get(KEK_KEY)) as Promise<{ value?: CryptoKey } | undefined>,
+  ]);
+  return { paired, guard, revoked, kek: kekRecord?.value };
+}
+
+async function readPairedBundle(profileId: string): Promise<PairedBundle> {
+  return withStore(profileId, "readonly", readBundle);
+}
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index]);
+}
+
+function safeRevision(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function validBytes(value: unknown, size?: number): value is Uint8Array {
+  return value instanceof Uint8Array && (size === undefined || value.byteLength === size);
+}
+
+function validatePaired(record: EncryptedPairedRecord): void {
+  if (
+    record.key !== PAIRED_KEY ||
+    !safeRevision(record.revision) ||
+    !validBytes(record.stateCommitment, 32) ||
+    !validBytes(record.iv, 12) ||
+    !validBytes(record.ciphertext) ||
+    record.ciphertext.byteLength <= 16
+  ) {
+    throw new Error("web.remote.storage.pairedStateInvalid");
+  }
+}
+
+function validateGuard(record: CounterGuardRecord): void {
+  if (record.key !== COUNTER_GUARD_KEY) {
+    throw new Error("web.remote.storage.counterGuardInvalid");
+  }
+  if (record.phase === "stable") {
+    if (!safeRevision(record.revision) || !validBytes(record.stateCommitment, 32)) {
+      throw new Error("web.remote.storage.counterGuardInvalid");
+    }
+    return;
+  }
+  if (
+    record.phase !== "pending" ||
+    !safeRevision(record.previousRevision) ||
+    !safeRevision(record.nextRevision) ||
+    record.nextRevision !== record.previousRevision + 1 ||
+    !validBytes(record.previousStateCommitment, 32) ||
+    !validBytes(record.nextStateCommitment, 32) ||
+    equalBytes(record.previousStateCommitment, record.nextStateCommitment) ||
+    !validBytes(record.nextIv, 12) ||
+    !validBytes(record.nextCiphertext) ||
+    record.nextCiphertext.byteLength <= 16
+  ) {
+    throw new Error("web.remote.storage.counterGuardInvalid");
+  }
+}
+
+function activeBundle(bundle: PairedBundle, code: string): ActiveBundle {
+  if (
+    bundle.revoked !== undefined ||
+    bundle.paired === undefined ||
+    bundle.guard === undefined ||
+    !(bundle.kek instanceof CryptoKey)
+  ) {
+    throw new Error(code);
+  }
+  validatePaired(bundle.paired);
+  validateGuard(bundle.guard);
+  return { paired: bundle.paired, guard: bundle.guard, kek: bundle.kek };
+}
+
+function stableMatches(guard: StableCounterGuardRecord, paired: EncryptedPairedRecord): boolean {
+  return guard.revision === paired.revision && equalBytes(guard.stateCommitment, paired.stateCommitment);
+}
+
+function pendingMatches(
+  guard: PendingCounterGuardRecord,
+  paired: EncryptedPairedRecord,
+  side: "previous" | "next",
+): boolean {
+  return side === "previous"
+    ? guard.previousRevision === paired.revision &&
+        equalBytes(guard.previousStateCommitment, paired.stateCommitment)
+    : guard.nextRevision === paired.revision &&
+        equalBytes(guard.nextStateCommitment, paired.stateCommitment) &&
+        equalBytes(guard.nextIv, paired.iv) &&
+        equalBytes(guard.nextCiphertext, paired.ciphertext);
+}
+
+function samePending(left: PendingCounterGuardRecord, right: PendingCounterGuardRecord): boolean {
+  return (
+    left.previousRevision === right.previousRevision &&
+    left.nextRevision === right.nextRevision &&
+    equalBytes(left.previousStateCommitment, right.previousStateCommitment) &&
+    equalBytes(left.nextStateCommitment, right.nextStateCommitment) &&
+    equalBytes(left.nextIv, right.nextIv) &&
+    equalBytes(left.nextCiphertext, right.nextCiphertext)
+  );
+}
+
+function pairedFromPending(guard: PendingCounterGuardRecord): EncryptedPairedRecord {
+  return {
+    key: PAIRED_KEY,
+    revision: guard.nextRevision,
+    stateCommitment: guard.nextStateCommitment,
+    iv: guard.nextIv,
+    ciphertext: guard.nextCiphertext,
+  };
+}
+
+function stableFromPending(guard: PendingCounterGuardRecord): StableCounterGuardRecord {
+  return {
+    key: COUNTER_GUARD_KEY,
+    phase: "stable",
+    revision: guard.nextRevision,
+    stateCommitment: guard.nextStateCommitment,
+  };
+}
+
+async function commitment(state: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", cryptoBytes(state)));
+}
+
+function pairedAad(profileId: string, revision: number, digest: Uint8Array): Uint8Array<ArrayBuffer> {
+  const prefix = new TextEncoder().encode(`${PAIRED_AAD_DOMAIN}${profileId}\0${revision}\0`);
+  const aad = new Uint8Array(prefix.byteLength + digest.byteLength);
+  aad.set(prefix);
+  aad.set(digest, prefix.byteLength);
+  return aad;
 }
 
 async function encryptPairedState(
   profileId: string,
   revision: number,
   state: Uint8Array,
-): Promise<Readonly<{ iv: Uint8Array; ciphertext: Uint8Array }>> {
+  kek: CryptoKey,
+): Promise<EncryptedPairedRecord> {
   if (state.byteLength === 0 || state.byteLength > 256 * 1024) {
     throw new Error("web.remote.storage.pairedStateSizeInvalid");
   }
-  const kek = await ensureKek(profileId);
+  const stateCommitment = await commitment(state);
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const plaintext = cryptoBytes(state);
   const ciphertext = new Uint8Array(
     await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv, additionalData: pairedAad(profileId, revision) },
+      { name: "AES-GCM", iv, additionalData: pairedAad(profileId, revision, stateCommitment) },
       kek,
-      plaintext,
+      cryptoBytes(state),
     ),
   );
-  return { iv, ciphertext };
+  return { key: PAIRED_KEY, revision, stateCommitment, iv, ciphertext };
 }
 
-export async function promotePairedState(
+async function advancePending(
   profileId: string,
-  state: Uint8Array,
-): Promise<number> {
-  const encrypted = await encryptPairedState(profileId, 0, state);
-  const database = await openDatabase(profileId);
-  try {
-    const transaction = database.transaction(STORE_NAME, "readwrite");
-    const completed = transactionDone(transaction);
-    const store = transaction.objectStore(STORE_NAME);
-    const [paired, revoked] = await Promise.all([
-      requestResult(store.get(PAIRED_KEY)),
-      requestResult(store.get(REVOKED_KEY)),
-    ]);
-    if (paired !== undefined || revoked !== undefined) {
-      transaction.abort();
-      await completed.catch(() => undefined);
+  expected: PendingCounterGuardRecord,
+  from: "previous" | "next",
+): Promise<void> {
+  await withStore(profileId, "readwrite", async (store) => {
+    const active = activeBundle(await readBundle(store), "web.remote.storage.counterGuardConflict");
+    if (
+      active.guard.phase !== "pending" ||
+      !samePending(active.guard, expected) ||
+      !pendingMatches(active.guard, active.paired, from)
+    ) {
+      throw new Error("web.remote.storage.counterGuardFork");
+    }
+    await requestResult(
+      store.put(from === "previous" ? pairedFromPending(active.guard) : stableFromPending(active.guard)),
+    );
+  });
+}
+
+export async function promotePairedState(profileId: string, state: Uint8Array): Promise<number> {
+  const encrypted = await encryptPairedState(profileId, 0, state, await ensureKek(profileId));
+  await withStore(profileId, "readwrite", async (store) => {
+    const bundle = await readBundle(store);
+    if (bundle.paired !== undefined || bundle.guard !== undefined || bundle.revoked !== undefined) {
       throw new Error("web.remote.storage.pairedPromotionConflict");
     }
-    const record: EncryptedPairedRecord = {
-      key: PAIRED_KEY,
-      revision: 0,
-      iv: encrypted.iv,
-      ciphertext: encrypted.ciphertext,
-    };
-    await requestResult(store.add(record));
-    await completed;
-    return 0;
-  } finally {
-    database.close();
-  }
+    await Promise.all([
+      requestResult(store.add(encrypted)),
+      requestResult(
+        store.add({
+          key: COUNTER_GUARD_KEY,
+          phase: "stable",
+          revision: 0,
+          stateCommitment: encrypted.stateCommitment,
+        } satisfies StableCounterGuardRecord),
+      ),
+    ]);
+  });
+  return 0;
 }
 
 export async function commitPairedState(
   profileId: string,
   expectedRevision: number,
   state: Uint8Array,
+  observer?: DurableCommitObserver,
 ): Promise<number> {
   const nextRevision = expectedRevision + 1;
   if (!Number.isSafeInteger(nextRevision) || nextRevision <= expectedRevision) {
     throw new Error("web.remote.storage.revisionInvalid");
   }
-  const encrypted = await encryptPairedState(profileId, nextRevision, state);
-  const database = await openDatabase(profileId);
-  try {
-    const transaction = database.transaction(STORE_NAME, "readwrite");
-    const completed = transactionDone(transaction);
-    const store = transaction.objectStore(STORE_NAME);
-    const current = (await requestResult(store.get(PAIRED_KEY))) as
-      | EncryptedPairedRecord
-      | undefined;
-    const revoked = await requestResult(store.get(REVOKED_KEY));
-    if (current?.revision !== expectedRevision || revoked !== undefined) {
-      transaction.abort();
-      await completed.catch(() => undefined);
+  const initial = activeBundle(
+    await readPairedBundle(profileId),
+    "web.remote.storage.pairedRevisionConflict",
+  );
+  const encrypted = await encryptPairedState(profileId, nextRevision, state, initial.kek);
+  let pending: PendingCounterGuardRecord | null = null;
+  await withStore(profileId, "readwrite", async (store) => {
+    const active = activeBundle(
+      await readBundle(store),
+      "web.remote.storage.pairedRevisionConflict",
+    );
+    if (
+      active.paired.revision !== expectedRevision ||
+      active.guard.phase !== "stable" ||
+      !stableMatches(active.guard, active.paired)
+    ) {
       throw new Error("web.remote.storage.pairedRevisionConflict");
     }
-    await requestResult(
-      store.put({
-        key: PAIRED_KEY,
-        revision: nextRevision,
-        iv: encrypted.iv,
-        ciphertext: encrypted.ciphertext,
-      } satisfies EncryptedPairedRecord),
-    );
-    await completed;
-    return nextRevision;
-  } finally {
-    database.close();
+    pending = {
+      key: COUNTER_GUARD_KEY,
+      phase: "pending",
+      previousRevision: expectedRevision,
+      previousStateCommitment: active.paired.stateCommitment,
+      nextRevision,
+      nextStateCommitment: encrypted.stateCommitment,
+      nextIv: encrypted.iv,
+      nextCiphertext: encrypted.ciphertext,
+    };
+    await requestResult(store.put(pending));
+  });
+  if (pending === null) {
+    throw new Error("web.remote.storage.counterGuardConflict");
   }
+  await observer?.("guardPendingDurable");
+  await advancePending(profileId, pending, "previous");
+  await observer?.("stateDurable");
+  await advancePending(profileId, pending, "next");
+  await observer?.("guardStableDurable");
+  return nextRevision;
+}
+
+async function recoverPending(
+  profileId: string,
+  guard: PendingCounterGuardRecord,
+  paired: EncryptedPairedRecord,
+): Promise<W3ReservationRecovery> {
+  if (pendingMatches(guard, paired, "previous")) {
+    await advancePending(profileId, guard, "previous");
+    await advancePending(profileId, guard, "next");
+    return "pendingPreviousFinalized";
+  }
+  if (pendingMatches(guard, paired, "next")) {
+    await advancePending(profileId, guard, "next");
+    return "pendingNextFinalized";
+  }
+  throw new Error("web.remote.storage.counterGuardFork");
 }
 
 export async function loadPairedState(profileId: string): Promise<PairedStateLoad> {
-  const database = await openDatabase(profileId);
-  let paired: EncryptedPairedRecord | undefined;
-  let revoked: RevokedRecord | undefined;
-  let kek: CryptoKey | undefined;
-  try {
-    const transaction = database.transaction(STORE_NAME, "readonly");
-    const completed = transactionDone(transaction);
-    const store = transaction.objectStore(STORE_NAME);
-    [paired, revoked, kek] = await Promise.all([
-      requestResult(store.get(PAIRED_KEY)) as Promise<EncryptedPairedRecord | undefined>,
-      requestResult(store.get(REVOKED_KEY)) as Promise<RevokedRecord | undefined>,
-      requestResult(store.get(KEK_KEY)).then(
-        (record) => (record as { value?: CryptoKey } | undefined)?.value,
-      ),
-    ]);
-    await completed;
-  } finally {
-    database.close();
-  }
-  if (revoked !== undefined) {
-    if (paired !== undefined || kek !== undefined) {
+  let bundle = await readPairedBundle(profileId);
+  if (bundle.revoked !== undefined) {
+    if (bundle.paired !== undefined || bundle.guard !== undefined || bundle.kek !== undefined) {
       throw new Error("web.remote.storage.revokedMaterialPresent");
     }
-    return { status: "revoked", revision: revoked.revision };
+    return { status: "revoked", revision: bundle.revoked.revision };
   }
-  if (paired === undefined && kek === undefined) {
+  if (bundle.paired === undefined && bundle.guard === undefined && bundle.kek === undefined) {
     return { status: "missing" };
   }
-  if (paired === undefined || !(kek instanceof CryptoKey)) {
-    throw new Error("web.remote.storage.pairedStateIncomplete");
+  let active = activeBundle(bundle, "web.remote.storage.pairedStateIncomplete");
+  let reservationRecovery: W3ReservationRecovery = "stableExact";
+  if (active.guard.phase === "pending") {
+    reservationRecovery = await recoverPending(profileId, active.guard, active.paired);
+    bundle = await readPairedBundle(profileId);
+    active = activeBundle(bundle, "web.remote.storage.counterGuardRecoveryFailed");
   }
-  const plaintext = await crypto.subtle.decrypt(
-    {
-      name: "AES-GCM",
-      iv: cryptoBytes(paired.iv),
-      additionalData: pairedAad(profileId, paired.revision),
-    },
-    kek,
-    cryptoBytes(paired.ciphertext),
+  if (active.guard.phase !== "stable" || !stableMatches(active.guard, active.paired)) {
+    throw new Error("web.remote.storage.counterGuardFork");
+  }
+  const plaintext = new Uint8Array(
+    await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: cryptoBytes(active.paired.iv),
+        additionalData: pairedAad(
+          profileId,
+          active.paired.revision,
+          active.paired.stateCommitment,
+        ),
+      },
+      active.kek,
+      cryptoBytes(active.paired.ciphertext),
+    ),
   );
-  return { status: "active", revision: paired.revision, state: new Uint8Array(plaintext) };
+  if (!equalBytes(await commitment(plaintext), active.paired.stateCommitment)) {
+    throw new Error("web.remote.storage.pairedCommitmentMismatch");
+  }
+  return {
+    status: "active",
+    revision: active.paired.revision,
+    state: plaintext,
+    reservationRecovery,
+  };
 }
 
 export async function commitRevokedCleanup(
@@ -419,18 +681,13 @@ export async function commitRevokedCleanup(
   expectedRevision: number,
 ): Promise<number> {
   const nextRevision = expectedRevision + 1;
-  const database = await openDatabase(profileId);
-  try {
-    const transaction = database.transaction(STORE_NAME, "readwrite");
-    const completed = transactionDone(transaction);
-    const store = transaction.objectStore(STORE_NAME);
-    const current = (await requestResult(store.get(PAIRED_KEY))) as
-      | EncryptedPairedRecord
-      | undefined;
-    const revoked = await requestResult(store.get(REVOKED_KEY));
-    if (current?.revision !== expectedRevision || revoked !== undefined) {
-      transaction.abort();
-      await completed.catch(() => undefined);
+  await withStore(profileId, "readwrite", async (store) => {
+    const active = activeBundle(await readBundle(store), "web.remote.storage.revocationConflict");
+    if (
+      active.paired.revision !== expectedRevision ||
+      active.guard.phase !== "stable" ||
+      !stableMatches(active.guard, active.paired)
+    ) {
       throw new Error("web.remote.storage.revocationConflict");
     }
     await requestResult(
@@ -441,36 +698,41 @@ export async function commitRevokedCleanup(
       } satisfies RevokedRecord),
     );
     await requestResult(store.delete(PAIRED_KEY));
+    await requestResult(store.delete(COUNTER_GUARD_KEY));
     await requestResult(store.delete(KEK_KEY));
-    await completed;
-    return nextRevision;
-  } finally {
-    database.close();
+  });
+  return nextRevision;
+}
+
+export async function inspectReservationStorage(
+  profileId: string,
+): Promise<W3ReservationStorageEvidence> {
+  const { paired, guard } = await readPairedBundle(profileId);
+  if (paired !== undefined) {
+    validatePaired(paired);
   }
+  if (guard !== undefined) {
+    validateGuard(guard);
+  }
+  return {
+    pairedRevision: paired?.revision ?? null,
+    guardPhase: guard?.phase ?? null,
+    guardRevision: guard?.phase === "stable" ? guard.revision : null,
+    pendingPreviousRevision: guard?.phase === "pending" ? guard.previousRevision : null,
+    pendingNextRevision: guard?.phase === "pending" ? guard.nextRevision : null,
+    stagedCiphertextBytes: guard?.phase === "pending" ? guard.nextCiphertext.byteLength : 0,
+  };
 }
 
 export async function inspectPairedStorage(profileId: string): Promise<PairedStorageEvidence> {
-  const database = await openDatabase(profileId);
-  try {
-    const transaction = database.transaction(STORE_NAME, "readonly");
-    const completed = transactionDone(transaction);
-    const store = transaction.objectStore(STORE_NAME);
-    const [paired, kek, revoked] = await Promise.all([
-      requestResult(store.get(PAIRED_KEY)) as Promise<EncryptedPairedRecord | undefined>,
-      requestResult(store.get(KEK_KEY)),
-      requestResult(store.get(REVOKED_KEY)) as Promise<RevokedRecord | undefined>,
-    ]);
-    await completed;
-    return {
-      pairedPresent: paired !== undefined,
-      kekPresent: kek !== undefined,
-      revokedPresent: revoked !== undefined,
-      revision: paired?.revision ?? revoked?.revision ?? null,
-      ciphertextBytes: paired?.ciphertext.byteLength ?? 0,
-    };
-  } finally {
-    database.close();
-  }
+  const { paired, kek, revoked } = await readPairedBundle(profileId);
+  return {
+    pairedPresent: paired !== undefined,
+    kekPresent: kek !== undefined,
+    revokedPresent: revoked !== undefined,
+    revision: paired?.revision ?? revoked?.revision ?? null,
+    ciphertextBytes: paired?.ciphertext.byteLength ?? 0,
+  };
 }
 
 export async function acquireWriterLease(profileId: string): Promise<WriterLease> {

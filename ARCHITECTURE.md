@@ -764,7 +764,7 @@ conversation/key，不能伪造身份连续性。
   complete。该完成边界不覆盖 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理
   iPhone/第二台 Mac 或 destructive purge；这些真实槽位继续保持 post-MVP BLOCKED。
 
-### Relay Web Test Companion W2a/W2b/W2c/W2.7 pairing、业务、恢复与负向准入不变量
+### Relay Web Test Companion W2a–W3.1 pairing、业务、恢复与 crash-cut 不变量
 
 - 浏览器没有第二套 Runtime、daemon 或 UDS→HTTP bridge。`agentdeck-web-core` 直接复用
   `agentdeck-protocol` / `agentdeck-crypto`，TypeScript 只管理 WebSocket generation、deadline、opaque
@@ -792,6 +792,10 @@ conversation/key，不能伪造身份连续性。
   不可导出的 WebCrypto KEK 加密；promotion、普通状态提交与 revoke cleanup 都要求 exact revision CAS。
   任何业务 frame 发送前必须先提交 counter block reservation；reload 只从前一 reserved high-water 开始，
   允许整块跳号但禁止 nonce/counter 回卷或复用。
+- W3.1 的浏览器 counter guard 固定为 `Pending → encrypted paired state → Stable` 三段 transaction + readback。
+  Pending 同时冻结 previous/next revision、SHA-256 commitment 与 next sealed bytes；cold-open 只允许 previous
+  完成 exact-next state 后 finalize，或 exact-next state 直接 finalize。Stable 必须与 paired revision/commitment
+  完全一致；其他组合不得联网。故障发生在任一 cut 后，已保留但未暴露的 block 只能整块跳过。
 - `StreamBindingV1.inner_cursor` 表示 Relay publication cut，不是 reducer 已应用历史的唯一真相。directed
   bootstrap 的 `RuntimeSyncComplete.inner_cursor` 可在线性化窗口内高于该 cut；恢复时 durable reducer cursor
   只允许单调前进，后续 control ACK 只能推进 outer cursor，不能把 inner cursor 回退到旧 publication cut。
@@ -811,7 +815,8 @@ conversation/key，不能伪造身份连续性。
   必须在发送前 fail-close，不能靠新配对掩盖失败。
 - W2c automatic complete 关闭单轮 durable 正向链路，W2.7 automatic complete 关闭完整
   negative/zero-mutation matrix，W2.8 用同一 candidate 的 Web aggregate 与 fixed-topology iOS/P5 回归完成
-  W2 automatic overall closeout。W3 的 crash-cut、第二 tab、网络故障和三次 fresh run仍未完成；公网、
+  W2 automatic overall closeout。W3.1 counter reservation 三个 crash cut 已关闭；W3.2–W3.7 的
+  replay/cursor fork、第二 tab、browser kill、网络故障和三次 fresh run仍未完成；公网、
   物理设备、production signing/pin、第二台
   Mac 与真实 vendor 继续是 W4 外部门禁。
 
