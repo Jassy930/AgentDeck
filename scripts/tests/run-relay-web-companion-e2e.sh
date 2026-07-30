@@ -11,6 +11,7 @@ state_cuts_runner="$repo_root/scripts/run-relay-web-companion-state-cuts-e2e.sh"
 contention_runner="$repo_root/scripts/run-relay-web-companion-contention-e2e.sh"
 browser_kills_runner="$repo_root/scripts/run-relay-web-companion-browser-kills-e2e.sh"
 network_faults_runner="$repo_root/scripts/run-relay-web-companion-network-faults-e2e.sh"
+repeatability_runner="$repo_root/scripts/run-relay-web-companion-repeatability-e2e.sh"
 
 bash -n "$runner"
 bash -n "$pairing_runner"
@@ -21,6 +22,8 @@ bash -n "$state_cuts_runner"
 bash -n "$contention_runner"
 bash -n "$browser_kills_runner"
 bash -n "$network_faults_runner"
+bash -n "$repeatability_runner"
+"$repeatability_runner" --selfcheck >/dev/null
 
 all_case="$(sed -n '/^[[:space:]]*--all)/,/^[[:space:]]*;;/p' "$runner")"
 printf '%s\n' "$all_case" | grep -Fq 'run_contract' \
@@ -82,6 +85,20 @@ for fault in disconnect delay relayRestart; do
   grep -Fq "$fault" "$network_faults_runner" \
     || { printf 'network-fault runner omitted %s\n' "$fault" >&2; exit 1; }
 done
+
+repeatability_case="$(sed -n '/^[[:space:]]*--repeatability)/,/^[[:space:]]*;;/p' "$runner")"
+printf '%s\n' "$repeatability_case" | grep -Fq 'run_repeatability' \
+  || { printf 'runner --repeatability omitted repeatability gate\n' >&2; exit 1; }
+grep -Fq 'for run in 1 2 3' "$repeatability_runner" \
+  || { printf 'repeatability runner did not require exactly three runs\n' >&2; exit 1; }
+grep -Fq 'rev-parse HEAD^{commit}' "$repeatability_runner" \
+  || { printf 'repeatability runner omitted candidate commit lock\n' >&2; exit 1; }
+grep -Fq 'rev-parse HEAD^{tree}' "$repeatability_runner" \
+  || { printf 'repeatability runner omitted candidate tree lock\n' >&2; exit 1; }
+grep -Fq -- '--business' "$repeatability_runner" \
+  || { printf 'repeatability runner omitted W2 business\n' >&2; exit 1; }
+grep -Fq -- '--recovery' "$repeatability_runner" \
+  || { printf 'repeatability runner omitted W3 recovery\n' >&2; exit 1; }
 
 for cut in stateGuardPendingDurable stateDurable guardStableDurable; do
   grep -Fq "$cut" "$state_cuts_runner" \

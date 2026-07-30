@@ -464,14 +464,22 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
   Relay/browser plaintext 与 proxy/browser/host/root/invite/UDS/paired/KEK/guard cleanup 全部通过。
 - W3.6–W3.7 仍未完成，W3 overall 仍未完成；W4 外部槽位状态不变。
 
+### W3.6 runner candidate（2026-07-30）
+
+- 新增唯一 `--repeatability` 入口；启动前冻结 clean worktree 的 `HEAD commit + tree`，并在每个子门禁前后
+  拒绝 commit/tree 漂移或 tracked/untracked 工作区变化。
+- 每轮固定执行一次 W2b `--business` 与一次 W3.1/W3.2 `--recovery`，解析一个 W2b terminal、六个 W3
+  detail terminal 和两个 W3 aggregate terminal；计数、revoke、active grant、明文与 cleanup 逐项验证。
+- runner 固定三轮，不暴露降低轮数的环境变量；任一轮失败不会产出 W3.6 terminal，重新执行从第一轮计数。
+- 本节只说明 candidate gate 已具备；W3.6 仍保持未完成，直到同一已提交 candidate 的三轮 fresh 最终
+  terminal 实际 PASS 并记录证据。
+
 ### Gates
 
 ```bash
 bash scripts/run-relay-web-companion-e2e.sh --crash-cuts
 bash scripts/run-relay-web-companion-e2e.sh --recovery
-for run in 1 2 3; do
-  bash scripts/run-relay-web-companion-e2e.sh --business
-done
+bash scripts/run-relay-web-companion-e2e.sh --repeatability
 cd web/relay-test-companion
 bun run check
 bun run test:unit

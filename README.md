@@ -370,6 +370,18 @@ disconnect/delay 最终 revision `3`、reservation `256→512`；Relay restart �
 revision `4`、reservation `512→768`。三轮都要求 exactly-once host ledger、active grant `0`、代理
 `parsedProtocol=false`、业务明文 absent 与代理/浏览器/host 全部 cleanup。
 
+W3.6 使用唯一重复性入口冻结 clean worktree 的 `HEAD commit + tree`，连续三轮执行 W2b business 与
+W3.1/W3.2 recovery；每轮解析一个 W2b terminal、六个 recovery detail terminal 和两个 recovery aggregate
+terminal。任一轮发生候选漂移、计数偏差、明文/cleanup 失败或 terminal 缺失都会立即失败，重新执行时从第
+一轮重新计数：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --repeatability
+```
+
+只有最终 `relay-web-companion-w3.6` terminal 读回同一 candidate、`freshRuns=3` 与
+`allRunsConsistent=true` 后，才可把 W3.6 标记为完成；runner 存在本身不算通过。
+
 本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
 `http://127.0.0.1:4173/`。该入口只用于查看测试壳；需要 paired durable state、隔离 profile 和完整 cleanup
 时必须使用统一 runner，不在日常浏览器 profile 中手工保留测试身份。

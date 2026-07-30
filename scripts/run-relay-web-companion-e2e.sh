@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 web_root="$repo_root/web/relay-test-companion"
 
 usage() {
-  printf 'usage: %s --contract|--transport|--pairing|--business|--durable|--negative|--crash-cuts|--state-cuts|--contention|--browser-kills|--network-faults|--recovery|--all\n' "$0" >&2
+  printf 'usage: %s --contract|--transport|--pairing|--business|--durable|--negative|--crash-cuts|--state-cuts|--contention|--browser-kills|--network-faults|--recovery|--repeatability|--all\n' "$0" >&2
   exit 64
 }
 
@@ -93,6 +93,10 @@ run_recovery() {
   run_state_cuts
 }
 
+run_repeatability() {
+  bash "$repo_root/scripts/run-relay-web-companion-repeatability-e2e.sh"
+}
+
 test "$#" -eq 1 || usage
 case "$1" in
   --contract)
@@ -130,6 +134,9 @@ case "$1" in
     ;;
   --recovery)
     run_recovery
+    ;;
+  --repeatability)
+    run_repeatability
     ;;
   --all)
     run_contract

@@ -20,7 +20,7 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
-## Relay Web Test Companion W0–W3.5 门禁（2026-07-30）
+## Relay Web Test Companion W0–W3.5 与 W3.6 重复性门禁（2026-07-30）
 
 W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
 `web/relay-test-companion/` 后运行：
@@ -212,6 +212,20 @@ delay 对 client→Relay 每 chunk 注入 120 ms；relayRestart 必须真实关�
 bind/store/cert/signer 启动 generation `2`，并等 daemon machine link authenticated ready 后第二次恢复。
 前两轮 final revision `3`/reservation `256→512`，restart 为 revision `4`/`512→768`；全部要求 host
 exactly-once、active grant `0`、plaintext absent 与 proxy/browser/host artifact absent。
+
+W3.6 的唯一重复性入口如下：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --repeatability
+```
+
+入口启动前和每个子门禁前后都必须验证 worktree clean，且 `HEAD commit + tree` 与首轮冻结值完全一致。
+它固定连续执行三轮；每轮包含一次 W2b business 和一次 W3.1/W3.2 `--recovery`，必须精确解析一个 W2b
+terminal、六个 W3 detail terminal 与两个 W3 aggregate terminal。W2b 必须为 command/completed `1/1`、
+approval total/applied `1/1`、active grant `1`；每个 recovery detail 必须为 command/completed `1/1`、
+approval total/applied `1/1`、revoke `1`、active grant `0`。所有 terminal 都要求 plaintext absent 和完整
+cleanup。任一轮失败则本次入口无最终 PASS，下一次执行从第一轮重新计数；只有最终 W3.6 terminal 的
+`freshRuns=3`、candidate commit/tree 相同且 `allRunsConsistent=true` 才能作为完成证据。
 
 W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED。
 
