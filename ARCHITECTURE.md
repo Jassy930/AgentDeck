@@ -810,8 +810,9 @@ conversation/key，不能伪造身份连续性。
   才能合成同义 committed receipt。随后原子删除 paired material/KEK 并写 revoked tombstone；旧 identity
   必须在发送前 fail-close，不能靠新配对掩盖失败。
 - W2c automatic complete 关闭单轮 durable 正向链路，W2.7 automatic complete 关闭完整
-  negative/zero-mutation matrix；W2 overall 仍等待 W2.8 总体收口。W3 的 crash-cut、第二 tab、网络故障和
-  三次 fresh run仍未完成；公网、物理设备、production signing/pin、第二台
+  negative/zero-mutation matrix，W2.8 用同一 candidate 的 Web aggregate 与 fixed-topology iOS/P5 回归完成
+  W2 automatic overall closeout。W3 的 crash-cut、第二 tab、网络故障和三次 fresh run仍未完成；公网、
+  物理设备、production signing/pin、第二台
   Mac 与真实 vendor 继续是 W4 外部门禁。
 
 ### Relay Companion MVP P5.1 SessionSource facade 不变量

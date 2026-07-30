@@ -144,8 +144,9 @@ reply replay 与 stream nonce reuse 拒绝且 counter set 不变、未提交 res
 counter 不变。daemon E2E 必须对 Codex/Claude Code 分别冻结 completed command、approval total/applied、revoked
 authorization 四项 SQLite 计数，并证明后到 resolve 与 Applied Retry 前后逐项不变。
 
-W2c PASS 关闭单轮 durable 正向链路，W2.7 PASS 关闭 negative/zero-mutation matrix。W2 overall 仍等待 W2.8
-总体 runbook、回归与提交收口；W3 的 deterministic crash cuts、第二 tab、网络故障与三次 fresh run尚未开始。
+W2c PASS 关闭单轮 durable 正向链路，W2.7 PASS 关闭 negative/zero-mutation matrix。W2.8 还必须在同一
+candidate 上通过 `--all` 与 `verify-relay-companion-mvp.sh p5`；当前两者已 PASS，因此 W2 automatic overall
+complete。W3 的 deterministic crash cuts、第二 tab、网络故障与三次 fresh run尚未开始。
 W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED。
 
 本切片涉及的 daemon machine E2E 可用以下 scoped Clippy 复核：

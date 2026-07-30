@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2a/W2b/W2c/W2.7 automatic complete；W2 overall 等待 W2.8；W3 未开始；W4 BLOCKED |
+| 状态 | W0/W1/W2 automatic complete；W3 未开始；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -206,7 +206,7 @@ git status --short --branch
 2. **W2b business**：paired principal 的 list/open/prompt/approval。
 3. **W2c durability**：IndexedDB promotion、reload/reconnect/backfill 与 revoke。
 
-W2c 完成是标记 W2 complete 的必要条件；W2.7 完整负例矩阵现已关闭，W2 overall 还必须完成 W2.8 总体收口。
+W2c 完成是标记 W2 complete 的必要条件；W2.7 完整负例矩阵与 W2.8 总体收口现已关闭。
 
 ### Tasks
 
@@ -223,7 +223,7 @@ W2c 完成是标记 W2 complete 的必要条件；W2.7 完整负例矩阵现已�
 - [x] W2.7：加入 wrong invite/fingerprint、remote cannot-confirm pairing、approval loser、stale/replay/nonce reuse
   反例和零 mutation 断言。wrong invite/fingerprint、remote cannot-confirm、握手 replay 与 revoke 后旧身份零发送
   沿用 W2a/W2c 证据；新增生产 helper、native/WASM typed snapshot 与 daemon SQLite frozen counts 关闭剩余矩阵。
-- [ ] W2.8：更新 README/ARCHITECTURE/QUALITY/DIAGNOSTICS/runbook 中实际新增边界，形成 W2 overall scoped
+- [x] W2.8：更新 README/ARCHITECTURE/QUALITY/DIAGNOSTICS/runbook 中实际新增边界，形成 W2 overall scoped
   commit。W2.7 文档与独立提交不替代 W2 overall 的完整回归与收口。
 
 ### Gates
@@ -332,8 +332,26 @@ git status --short --branch
 - `scripts/run-relay-web-companion-e2e.sh --negative` automatic PASS：Web core native contracts、真实 Chromium
   W2.7 snapshot `1/1`、daemon machine E2E `1/1` 全绿。`--all` 已纳入该门禁，并再次读回 W2a/W2b/W2c 正向
   计数 command/completed `1/1`、approval total/applied `1/1`、revoke 后 active grant `0` 与全部 cleanup。
-- W2.7 只关闭 negative/zero-mutation matrix；W2 overall 仍等待 W2.8 总体 runbook、iOS/全量回归与 scoped
-  closeout。W3/W4 的边界不变。
+- W2.7 只关闭 negative/zero-mutation matrix；在该独立提交完成时，W2 overall 仍等待 W2.8 总体 runbook、
+  iOS/全量回归与 scoped closeout。当前 W2.8 结果见下节；W3/W4 的边界不变。
+
+### W2.8 完成证据（2026-07-30）
+
+- 在 W2.7 committed candidate `64366cb` 上重新运行 `scripts/run-relay-web-companion-e2e.sh --all`，W0/W1、
+  W2a pairing、W2b business、W2c durable 与 W2.7 negative 全绿。W2b/W2c 继续读回 command/completed
+  `1/1`、approval total/applied `1/1`，revoke 后 active grant `0`，所有浏览器/host/root/invite/UDS/artifact
+  cleanup absent。
+- `bash scripts/verify-relay-companion-mvp.sh p5` PASS：fixed-topology iOS Simulator 真实完成 pairing、业务、
+  daemon generation `1→2`、restart marker/history recovery 与 revoke；最终 Runtime revoke `1`、Relay active grant
+  `0`、Simulator/host/root/invite/socket absent。
+- SessionSource `25/25` 零失败；RelayClient 执行 `457` 个测试，4 个 production Data Protection Keychain
+  entitlement 用例按既定 post-MVP 外部门禁 skipped，其余零失败。物理 iPhone 与第二台 Mac runner 继续输出
+  versioned BLOCKED，不被 automatic 证据冒充 PASS。
+- Web core 两 feature 合并 contract、protocol/crypto 全矩阵与 schema snapshots、Web/daemon scoped Clippy、
+  daemon network/no-net、fmt、TypeScript ownership、agent docs、diff 与 cleanup 全绿。README、ARCHITECTURE、
+  QUALITY、DIAGNOSTICS、index 和两份 Web plan 已与实际边界同步。
+- W2 automatic overall complete；这不启动或关闭 W3，也不改变 W4 公网、物理设备、production
+  signing/pin、第二台 Mac 与真实 vendor 的 BLOCKED 状态。
 
 ### Required readback
 
@@ -350,8 +368,8 @@ git status --short --branch
 
 ### Exit
 
-W2c 单轮 fresh durable E2E、W2.7 完整负例矩阵与既有 iOS Simulator 权威回归已 PASS。W2 overall 仍等待
-W2.8 总体收口；该阶段仍不能标记物理设备、公网、production signing/pin、第二台 Mac 或真实 vendor PASS。
+W2c 单轮 fresh durable E2E、W2.7 完整负例矩阵与 W2.8 Web/iOS/P5 总体回归已 PASS，W2 automatic overall
+complete；该完成仍不能标记物理设备、公网、production signing/pin、第二台 Mac 或真实 vendor PASS。
 
 ## 7. Phase W3：durable recovery、隔离与重复性
 
@@ -428,7 +446,7 @@ W4 不由本机 automatic 结果自动解锁。进入前另建执行授权和证
 
 - [x] W0 证明 WASM parity 与 IndexedDB/Web Locks durable contract。
 - [x] W1 浏览器直连真实 Relay v2/E2EE，无业务 bridge。
-- [ ] W2 完成完整远程业务流，iOS E2E 不回归（W2c 正向 durable 与 W2.7 负例已完成；W2.8 仍开放）。
+- [x] W2 完成完整远程业务流，iOS E2E 不回归（W2a–W2.8 automatic overall complete）。
 - [ ] W3 crash/restart/tab contention 与三次 fresh run 全绿。
 - [ ] TypeScript 无 wire/crypto owner；Relay/Runtime/E2EE 版本未变。
 - [ ] 文档、diagnostics、quality、runbook 与实际一致。

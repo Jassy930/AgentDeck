@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2a/W2b/W2c/W2.7 automatic complete；W2 overall 等待 W2.8；W3 未开始；W4 BLOCKED |
+| 状态 | W0/W1/W2 automatic complete；W3 未开始；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
 | 目标 | 用浏览器直接复用 Relay v2 + E2EE v1，增加一条低成本、可重复的远程业务闭环 |
@@ -61,7 +61,12 @@ identity 重连在发送前失败。W2c automatic slice 已完成。
 W2.7 将 reply/stream replay set 的 COMMIT 推迟到完整密码学与语义准入成功之后，并抽取 approval receipt、
 stream exact-next、nonce uniqueness 与 durable reservation 的生产 helper。native 与 Chromium 共用 typed
 snapshot 关闭 12 项 negative/zero-mutation readback；daemon machine E2E 同时证明后到 approval resolve 与
-Applied Retry 前后 SQLite business counts 不变。W2.7 已完成，W2.8 overall 收口仍开放。
+Applied Retry 前后 SQLite business counts 不变。W2.7 已完成。
+
+W2.8 在同一 committed candidate `64366cb` 上重新通过 Web `--all` 与 P5 fixed-topology iOS lifecycle：
+Simulator 读回 daemon generation `2`、restart/history recovery、command/completed 与 approval total/applied
+`1/1`、revoke `1`、active grant `0` 和 cleanup absent；SessionSource `25/25`、RelayClient `457` 中 4 个
+production Keychain entitlement 用例按外部门禁 skipped，其余零失败。因此 W2 automatic overall complete。
 
 ## 2. 目标与非目标
 
@@ -217,8 +222,9 @@ WebSocket API 不暴露 peer certificate，也不允许应用执行等价的 SPK
 W0–W3 每阶段必须独立 scoped commit、focused gate、integration gate、运行读回、负例、cleanup、文档更新和
 `git status --short --branch` clean。代码候选变化会使本阶段旧证据失效。
 
-当前已完成 W2c automatic 正向链路与 W2.7 approval loser、stale/replay/nonce-reuse 零 mutation 矩阵；
-W2.8 overall closeout 仍开放。W3 deterministic crash cuts、第二 tab、网络故障和三次 fresh run尚未开始。
+当前已完成 W2c automatic 正向链路、W2.7 approval loser/stale/replay/nonce-reuse 零 mutation 矩阵与 W2.8
+overall closeout，W2 automatic overall complete。W3 deterministic crash cuts、第二 tab、网络故障和三次
+fresh run尚未开始。
 W4 的公网、物理设备、production signing/pin、第二台 Mac 与真实 vendor继续独立 BLOCKED。
 
 ## 10. 验收边界

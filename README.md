@@ -232,7 +232,7 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Web Test Companion（W0/W1/W2a/W2b/W2c/W2.7 automatic complete）
+## Relay Web Test Companion（W0/W1/W2 automatic complete）
 
 `agentdeck-web-core` 已证明现有 Relay v2 codec、Runtime v5 request contract 与 E2EE v1 crypto 可以复用同一
 Rust 实现编译为 browser WASM；`web/relay-test-companion` 是 Bun 管理的最小测试页面与 host adapter，
@@ -321,8 +321,9 @@ negative matrix。
 时必须使用统一 runner，不在日常浏览器 profile 中手工保留测试身份。
 
 这仍不是完整网页版。W2c 已关闭单轮 automatic 的 pair→业务→reload/reconnect/backfill→revoke 正向链路，
-W2.7 已关闭 approval loser 与 stale/replay/nonce-reuse 零 mutation 反例矩阵；W2 overall 仍等待 W2.8 总体
-runbook、回归与提交收口。W3 的 crash-cut、tab contention 和同一 candidate 三次 fresh run 尚未开始。公网 WSS、
+W2.7 已关闭 approval loser 与 stale/replay/nonce-reuse 零 mutation 反例矩阵；W2.8 又在同一 candidate 上完成
+Web aggregate、fixed-topology iOS Simulator、SessionSource/RelayClient 回归和 runbook 收口，因此 W2 automatic
+overall complete。W3 的 crash-cut、tab contention 和同一 candidate 三次 fresh run 尚未开始。公网 WSS、
 production SPKI pin/signing、物理设备、第二台 Mac 与真实 vendor 属于 W4，继续独立 BLOCKED。阶段事实源见
 [`Relay Web Test Companion 实施计划`](docs/plans/2026-07-30-relay-web-test-companion-implementation.md)。
 
