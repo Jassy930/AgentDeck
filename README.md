@@ -232,7 +232,7 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Web Test Companion（W0/W1/W2 complete；W3.1–W3.5 complete）
+## Relay Web Test Companion（W0/W1/W2 complete；W3.1–W3.6 complete）
 
 `agentdeck-web-core` 已证明现有 Relay v2 codec、Runtime v5 request contract 与 E2EE v1 crypto 可以复用同一
 Rust 实现编译为 browser WASM；`web/relay-test-companion` 是 Bun 管理的最小测试页面与 host adapter，
@@ -379,8 +379,10 @@ terminal。任一轮发生候选漂移、计数偏差、明文/cleanup 失败或
 scripts/run-relay-web-companion-e2e.sh --repeatability
 ```
 
-只有最终 `relay-web-companion-w3.6` terminal 读回同一 candidate、`freshRuns=3` 与
-`allRunsConsistent=true` 后，才可把 W3.6 标记为完成；runner 存在本身不算通过。
+冻结候选 `9597c16` / tree `b21c386b2002fa4052cabb9db1457153c30d4044` 已产出最终
+`relay-web-companion-w3.6` PASS：`freshRuns=3`、W2b terminal `3`、W3 detail terminal `18`、W3 aggregate
+terminal `6`、`allRunsConsistent=true`，三轮明文与 cleanup 全部 absent。因此 W3.6 automatic 已关闭；该
+证据不替代 W3.7 双路终审。
 
 本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
 `http://127.0.0.1:4173/`。该入口只用于查看测试壳；需要 paired durable state、隔离 profile 和完整 cleanup
@@ -389,8 +391,8 @@ scripts/run-relay-web-companion-e2e.sh --repeatability
 这仍不是完整网页版。W2c 已关闭单轮 automatic 的 pair→业务→reload/reconnect/backfill→revoke 正向链路，
 W2.7 已关闭 approval loser 与 stale/replay/nonce-reuse 零 mutation 反例矩阵；W2.8 又在同一 candidate 上完成
 Web aggregate、fixed-topology iOS Simulator、SessionSource/RelayClient 回归和 runbook 收口，因此 W2 automatic
-overall complete。W3.1/W3.2 两类 crash cut、W3.3 tab contention/generation 隔离、W3.4 真实 browser kill
-与 W3.5 网络故障均已关闭；W3.6–W3.7 的同一 candidate 三次 fresh run 与双路终审尚未完成。公网 WSS、
+overall complete。W3.1/W3.2 两类 crash cut、W3.3 tab contention/generation 隔离、W3.4 真实 browser kill、
+W3.5 网络故障与 W3.6 同一 candidate 三次 fresh run均已关闭；W3.7 双路终审尚未完成。公网 WSS、
 production SPKI pin/signing、物理设备、第二台 Mac 与真实 vendor 属于 W4，继续独立 BLOCKED。阶段事实源见
 [`Relay Web Test Companion 实施计划`](docs/plans/2026-07-30-relay-web-test-companion-implementation.md)。
 

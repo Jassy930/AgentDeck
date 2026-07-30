@@ -832,7 +832,7 @@ conversation/key，不能伪造身份连续性。
 - W2c automatic complete 关闭单轮 durable 正向链路，W2.7 automatic complete 关闭完整
   negative/zero-mutation matrix，W2.8 用同一 candidate 的 Web aggregate 与 fixed-topology iOS/P5 回归完成
   W2 automatic overall closeout。W3.1/W3.2 两类 crash cut、W3.3 第二 tab/generation 隔离、W3.4 真实
-  browser kill 与 W3.5 网络故障均已关闭；W3.6–W3.7 的三次 fresh run 与双路终审仍未完成；公网、
+  browser kill、W3.5 网络故障与 W3.6 同一 candidate 三次 fresh run均已关闭；W3.7 双路终审仍未完成；公网、
   物理设备、production signing/pin、第二台
   Mac 与真实 vendor 继续是 W4 外部门禁。
 

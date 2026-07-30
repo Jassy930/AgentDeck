@@ -146,8 +146,8 @@ authorization 四项 SQLite 计数，并证明后到 resolve 与 Applied Retry �
 
 W2c PASS 关闭单轮 durable 正向链路，W2.7 PASS 关闭 negative/zero-mutation matrix。W2.8 还必须在同一
 candidate 上通过 `--all` 与 `verify-relay-companion-mvp.sh p5`；当前两者已 PASS，因此 W2 automatic overall
-complete。W3.1/W3.2 两类 deterministic crash cut 与 W3.3 第二 tab/generation 隔离已通过；
-W3.4 真实 browser kill 与 W3.5 网络故障已完成；W3.6–W3.7 的三次 fresh run与双路终审尚未完成。
+complete。W3.1/W3.2 两类 deterministic crash cut、W3.3 第二 tab/generation 隔离、W3.4 真实 browser kill、
+W3.5 网络故障与 W3.6 三次 fresh run均已完成；W3.7 双路终审尚未完成。
 
 W3.1 独立门禁如下；它不会提前执行 W3.2 之后的 tab contention、故障代理或三次 fresh run：
 
@@ -226,6 +226,12 @@ approval total/applied `1/1`、active grant `1`；每个 recovery detail 必须�
 approval total/applied `1/1`、revoke `1`、active grant `0`。所有 terminal 都要求 plaintext absent 和完整
 cleanup。任一轮失败则本次入口无最终 PASS，下一次执行从第一轮重新计数；只有最终 W3.6 terminal 的
 `freshRuns=3`、candidate commit/tree 相同且 `allRunsConsistent=true` 才能作为完成证据。
+
+2026-07-30 冻结 candidate `9597c16e2f265bd41ca73d4760f329dcfd0900b6` / tree
+`b21c386b2002fa4052cabb9db1457153c30d4044` 连续三轮 fresh exit 0。最终 terminal 读回 W2b `3`、W3 detail
+`18`、W3 aggregate `6`、`allRunsConsistent=true`；每轮 command/completed 与 approval total/applied 各
+`1/1`，recovery revoke `1`、active grant `0`，plaintext 与 cleanup 全部 absent。W3.6 automatic complete；
+W3.7 仍须在后续 candidate 上执行完整门禁和双路终审。
 
 W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED。
 

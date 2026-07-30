@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2 automatic complete；W3.1–W3.5 complete，W3.6–W3.7 未完成；W4 BLOCKED |
+| 状态 | W0/W1/W2 automatic complete；W3.1–W3.6 complete，W3.7 未完成；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -386,7 +386,7 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 - [x] W3.3：启动第二 tab/worker，验证 Web Locks 排他、旧 generation/BroadcastChannel 失效和零重复发送。
 - [x] W3.4：在 prompt/approval/reconnect 各阶段强制 kill browser process，再以同 profile 冷恢复。
 - [x] W3.5：使用 runner-owned 故障代理注入断连/延迟/Relay restart；代理只转发 bytes，不解析协议。
-- [ ] W3.6：同一 committed candidate 连续三次 fresh 完成 W2 business + W3 recovery；任一轮失败重新计数。
+- [x] W3.6：同一 committed candidate 连续三次 fresh 完成 W2 business + W3 recovery；任一轮失败重新计数。
 - [ ] W3.7：执行 spec/security 与 quality/Git 双路 review，清零 P0/P1/P2，更新文档并形成 W3 scoped commit。
 
 ### W3.1 evidence（2026-07-30）
@@ -462,17 +462,21 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
   transition `0` 后第二次恢复，最终 revision `4`、reservation `512→768`。
 - 三轮 host 均为 command/completed `1/1`、approval total/applied `1/1`、revoke `1`、active grant `0`；
   Relay/browser plaintext 与 proxy/browser/host/root/invite/UDS/paired/KEK/guard cleanup 全部通过。
-- W3.6–W3.7 仍未完成，W3 overall 仍未完成；W4 外部槽位状态不变。
+- W3.6 已由下一节关闭；W3.7 仍未完成，W3 overall 仍未完成；W4 外部槽位状态不变。
 
-### W3.6 runner candidate（2026-07-30）
+### W3.6 evidence（2026-07-30）
 
 - 新增唯一 `--repeatability` 入口；启动前冻结 clean worktree 的 `HEAD commit + tree`，并在每个子门禁前后
   拒绝 commit/tree 漂移或 tracked/untracked 工作区变化。
 - 每轮固定执行一次 W2b `--business` 与一次 W3.1/W3.2 `--recovery`，解析一个 W2b terminal、六个 W3
   detail terminal 和两个 W3 aggregate terminal；计数、revoke、active grant、明文与 cleanup 逐项验证。
 - runner 固定三轮，不暴露降低轮数的环境变量；任一轮失败不会产出 W3.6 terminal，重新执行从第一轮计数。
-- 本节只说明 candidate gate 已具备；W3.6 仍保持未完成，直到同一已提交 candidate 的三轮 fresh 最终
-  terminal 实际 PASS 并记录证据。
+- candidate `9597c16e2f265bd41ca73d4760f329dcfd0900b6` / tree
+  `b21c386b2002fa4052cabb9db1457153c30d4044` 连续三轮 fresh exit 0；每轮候选检查均保持 clean 且无漂移。
+- 最终 W3.6 terminal 读回 `freshRuns=3`、W2b terminal `3`、W3 detail terminal `18`、W3 aggregate
+  terminal `6`、`allRunsConsistent=true`。三轮 command/completed 与 approval total/applied 各 `1/1`，
+  recovery revoke `1`、active grant `0`，plaintext 与 cleanup 全部 absent。
+- W3.6 automatic complete；W3.7 双路终审仍未完成，W3 overall 仍未完成；W4 外部槽位状态不变。
 
 ### Gates
 
@@ -531,7 +535,7 @@ W4 不由本机 automatic 结果自动解锁。进入前另建执行授权和证
 - [x] W0 证明 WASM parity 与 IndexedDB/Web Locks durable contract。
 - [x] W1 浏览器直连真实 Relay v2/E2EE，无业务 bridge。
 - [x] W2 完成完整远程业务流，iOS E2E 不回归（W2a–W2.8 automatic overall complete）。
-- [ ] W3 crash/restart/tab contention 与三次 fresh run 全绿。
+- [x] W3 crash/restart/tab contention 与三次 fresh run 全绿。
 - [ ] TypeScript 无 wire/crypto owner；Relay/Runtime/E2EE 版本未变。
 - [ ] 文档、diagnostics、quality、runbook 与实际一致。
 - [ ] candidate 双路 review P0/P1/P2=0，cleanup absent，Git clean。
