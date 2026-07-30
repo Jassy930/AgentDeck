@@ -20,7 +20,7 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
-## Relay Web Test Companion W0–W3.2 门禁（2026-07-30）
+## Relay Web Test Companion W0–W3.3 门禁（2026-07-30）
 
 W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
 `web/relay-test-companion/` 后运行：
@@ -146,8 +146,8 @@ authorization 四项 SQLite 计数，并证明后到 resolve 与 Applied Retry �
 
 W2c PASS 关闭单轮 durable 正向链路，W2.7 PASS 关闭 negative/zero-mutation matrix。W2.8 还必须在同一
 candidate 上通过 `--all` 与 `verify-relay-companion-mvp.sh p5`；当前两者已 PASS，因此 W2 automatic overall
-complete。W3.1 的 counter reservation 与 W3.2 replay/cursor statePending 三个 deterministic crash cut 已通过；
-W3.3–W3.7 的第二 tab、browser kill、网络故障与三次 fresh run尚未开始。
+complete。W3.1/W3.2 两类 deterministic crash cut 与 W3.3 第二 tab/generation 隔离已通过；
+W3.4–W3.7 的 browser kill、网络故障与三次 fresh run尚未开始。
 
 W3.1 独立门禁如下；它不会提前执行 W3.2 之后的 tab contention、故障代理或三次 fresh run：
 
@@ -174,6 +174,18 @@ scripts/run-relay-web-companion-e2e.sh --recovery
 各 `1/1`。独立 sibling 负例必须持久化 `quarantined(stateFork)`，返回
 `web.remote.storage.state_fork_quarantined`，保持零 frame；cleanup 后 profile 与 Playwright artifacts absent。
 `--recovery` 串行重跑 W3.1/W3.2，不执行 W3.3 之后的 tab/browser-kill/故障代理/三次 fresh 门禁。
+
+W3.3 独立门禁如下：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --contention
+```
+
+主 tab 在 paired revision `1`/Stable 持有 profile Web Lock 时，第二 tab 必须 acquire=false，并以
+`web.remote.writer_generation_missing` 在 load/mutation/send 前拒绝；交接后新 tab取得锁并发布
+BroadcastChannel activation，旧 tab必须读回 `relinquished=true`、`invalidatedByPeer=true`，迟到探针返回
+`web.remote.generation_stale`。两条探针均要求 binary frames `0`、canonical mutations `0`、revision/guard
+保持 `1`/Stable；随后 W2c recovery/revoke 仍精确一次并完整 cleanup。
 
 W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED。
 

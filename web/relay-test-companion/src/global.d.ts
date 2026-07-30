@@ -186,6 +186,24 @@ declare global {
     failureCode: string | null;
   }>;
 
+  type W3WriterGenerationSnapshot = Readonly<{
+    acquired: boolean;
+    relinquished: boolean;
+    invalidatedByPeer: boolean;
+    closed: boolean;
+  }>;
+
+  type W3LateGenerationEvidence = Readonly<{
+    rejectionCode: string | null;
+    binaryFramesSent: number;
+    canonicalMutationCount: number;
+    pairedRevisionBefore: number | null;
+    pairedRevisionAfter: number | null;
+    guardPhaseBefore: W3ReservationStorageEvidence["guardPhase"];
+    guardPhaseAfter: W3ReservationStorageEvidence["guardPhase"];
+    failureCode: string | null;
+  }>;
+
   type W2BusinessTransportEvidence = Readonly<{
     generation: number;
     preview: W2PairingPreview;
@@ -229,6 +247,11 @@ declare global {
       cut: W3StateCut,
     ) => Promise<W3StateCrashEvidence>;
     runW3StateForkProbe: (profileId: string) => Promise<W3StateForkEvidence>;
+    acquireWriterGeneration: (profileId: string) => Promise<boolean>;
+    relinquishWriterGeneration: (profileId: string) => Promise<void>;
+    releaseWriterGeneration: (profileId: string) => Promise<void>;
+    writerGenerationSnapshot: (profileId: string) => W3WriterGenerationSnapshot | null;
+    runW3LateGenerationProbe: (profileId: string) => Promise<W3LateGenerationEvidence>;
     initializeState: (profileId: string, payload: string) => Promise<DurableStateRecord>;
     readState: (profileId: string) => Promise<DurableStateRecord | null>;
     commitExactRevision: (

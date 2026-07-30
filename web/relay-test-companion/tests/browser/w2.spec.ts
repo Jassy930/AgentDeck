@@ -146,13 +146,14 @@ test("W2b real browser business flow closes prompt and approval", async ({ page 
   expect(consoleErrors).toEqual([]);
 });
 
-test("W2c durable reload reconnect backfill and revoke closes", async ({ page }) => {
+test("W2c durable reload reconnect backfill and revoke closes", async ({ page, context }) => {
   test.setTimeout(240_000);
   const invitePath = process.env.AGENTDECK_W2_INVITE_PATH;
   const coordinationDir = process.env.AGENTDECK_W2_COORDINATION_DIR;
   const profileId = process.env.AGENTDECK_W2_PROFILE_ID;
   const crashCut = process.env.AGENTDECK_W3_CRASH_CUT as W3CrashCut | undefined;
   const stateCut = process.env.AGENTDECK_W3_STATE_CUT as W3StateCut | undefined;
+  const writerContention = process.env.AGENTDECK_W3_CONTENTION === "1";
   if (invitePath === undefined || coordinationDir === undefined || profileId === undefined) {
     throw new Error("W2c runner contract is missing");
   }
@@ -166,8 +167,11 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page })
 
   await page.goto("/");
   await expect.poll(() => page.evaluate(() => document.documentElement.dataset.ready)).toBe("true");
-  if (crashCut !== undefined && stateCut !== undefined) {
-    throw new Error("W3 runner selected two crash families");
+  if (
+    Number(crashCut !== undefined) + Number(stateCut !== undefined) + Number(writerContention) >
+    1
+  ) {
+    throw new Error("W3 runner selected multiple fault families");
   }
   const started =
     stateCut === undefined
@@ -219,6 +223,67 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page })
     expect("ciphertextBytes" in started.storage ? started.storage.ciphertextBytes : 0).toBeGreaterThan(
       16,
     );
+  }
+  if (writerContention) {
+    expect(
+      await page.evaluate((profile) => globalThis.relayTestApi.writerGenerationSnapshot(profile), profileId),
+    ).toMatchObject({ acquired: true, relinquished: false, invalidatedByPeer: false });
+
+    const second = await context.newPage();
+    await second.goto("/");
+    await expect.poll(() => second.evaluate(() => document.documentElement.dataset.ready)).toBe("true");
+    await expect(
+      second.evaluate((profile) => globalThis.relayTestApi.acquireWriterGeneration(profile), profileId),
+    ).resolves.toBe(false);
+    const lockedProbe = await second.evaluate(
+      (profile) => globalThis.relayTestApi.runW3LateGenerationProbe(profile),
+      profileId,
+    );
+    expect(lockedProbe.failureCode, JSON.stringify(lockedProbe)).toBeNull();
+    expect(lockedProbe).toMatchObject({
+      rejectionCode: "web.remote.writer_generation_missing",
+      binaryFramesSent: 0,
+      canonicalMutationCount: 0,
+      pairedRevisionBefore: 1,
+      pairedRevisionAfter: 1,
+      guardPhaseBefore: "stable",
+      guardPhaseAfter: "stable",
+    });
+
+    await page.evaluate(
+      (profile) => globalThis.relayTestApi.relinquishWriterGeneration(profile),
+      profileId,
+    );
+    await expect(
+      second.evaluate((profile) => globalThis.relayTestApi.acquireWriterGeneration(profile), profileId),
+    ).resolves.toBe(true);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (profile) => globalThis.relayTestApi.writerGenerationSnapshot(profile),
+          profileId,
+        ),
+      )
+      .toMatchObject({ relinquished: true, invalidatedByPeer: true });
+    const staleProbe = await page.evaluate(
+      (profile) => globalThis.relayTestApi.runW3LateGenerationProbe(profile),
+      profileId,
+    );
+    expect(staleProbe.failureCode, JSON.stringify(staleProbe)).toBeNull();
+    expect(staleProbe).toMatchObject({
+      rejectionCode: "web.remote.generation_stale",
+      binaryFramesSent: 0,
+      canonicalMutationCount: 0,
+      pairedRevisionBefore: 1,
+      pairedRevisionAfter: 1,
+      guardPhaseBefore: "stable",
+      guardPhaseAfter: "stable",
+    });
+    await second.evaluate(
+      (profile) => globalThis.relayTestApi.releaseWriterGeneration(profile),
+      profileId,
+    );
+    await second.close();
   }
   await writeFile(`${coordinationDir}/business.ready`, "ready\n", { flag: "wx", mode: 0o600 });
 

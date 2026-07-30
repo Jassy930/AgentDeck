@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2 automatic complete；W3.1–W3.2 complete，W3.3–W3.7 未开始；W4 BLOCKED |
+| 状态 | W0/W1/W2 automatic complete；W3.1–W3.3 complete，W3.4–W3.7 未开始；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -383,7 +383,7 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 - [x] W3.1：为 counter reservation、sealed state commit、Stable finalize 三个 cut 增加 deterministic fault seam；
   每个 cut 重启后只能整块跳号或 exact finalize。
 - [x] W3.2：覆盖 replay/cursor statePending 的 previous rollback、exact next finalize 与 sibling/fork quarantine。
-- [ ] W3.3：启动第二 tab/worker，验证 Web Locks 排他、旧 generation/BroadcastChannel 失效和零重复发送。
+- [x] W3.3：启动第二 tab/worker，验证 Web Locks 排他、旧 generation/BroadcastChannel 失效和零重复发送。
 - [ ] W3.4：在 prompt/approval/reconnect 各阶段强制 kill browser process，再以同 profile 冷恢复。
 - [ ] W3.5：使用 runner-owned 故障代理注入断连/延迟/Relay restart；代理只转发 bytes，不解析协议。
 - [ ] W3.6：同一 committed candidate 连续三次 fresh 完成 W2 business + W3 recovery；任一轮失败重新计数。
@@ -399,8 +399,8 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 - 三轮均整块跳过未暴露的 `256→512`，冷恢复后 reservation 为 `512→768`、最终 revision `4`；
   command/completed、approval total/applied 各 `1/1`，revoke 后 active grant `0`，paired/KEK/guard 与所有
   runner artifact absent。
-- W3.2 已由下一节关闭；W3.3 tab contention、W3.4 browser kill、W3.5 故障代理、W3.6 三次 candidate
-  重复与 W3.7 双路终审仍未完成，W3 overall 仍未完成。
+- W3.2 已由下一节关闭；W3.3 tab contention 也已由其后独立阶段关闭。W3.4 browser kill、W3.5 故障
+  代理、W3.6 三次 candidate 重复与 W3.7 双路终审仍未完成，W3 overall 仍未完成。
 
 ### W3.2 evidence（2026-07-30）
 
@@ -417,7 +417,24 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 - 三个真实 state cut 均最终 revision `3`、reservation `256→512`、daemon generation `2`、
   command/completed 与 approval total/applied 各 `1/1`；revoke 后 active grant `0`，paired/KEK/guard、
   browser/host/root/invite/UDS/Playwright artifacts 全部 absent。
-- `--recovery` 同时重跑 W3.1 与 W3.2 聚合门禁并通过；W3.3–W3.7 与 W4 外部槽位状态不变。
+- `--recovery` 同时重跑 W3.1 与 W3.2 聚合门禁并通过；W3.3 已由下节关闭，W3.4–W3.7 与 W4 外部
+  槽位状态不变。
+
+### W3.3 evidence（2026-07-30）
+
+- 新增薄 `writer-generation.ts` host owner：profile 级 Web Lock 决定唯一写者，BroadcastChannel 只传递
+  schema-versioned opaque activation token。canonical state 仍只在 IndexedDB/WASM，不经 channel 复制。
+- W2c start、recover 与两类 W3 crash入口均实际进入 writer generation 门禁；start/crash 持锁到 reload，
+  recover/revoke 或失败 cleanup 后释放。第二 tab 获取不到锁时不进入 paired state load/mutation/send。
+- `scripts/run-relay-web-companion-e2e.sh --contention` 在真实 W2c fixed-topology 链路中读回：主 tab paired
+  revision `1`/Stable 时第二 tab acquire=false；其迟到探针为
+  `web.remote.writer_generation_missing`、binary frames `0`、canonical mutations `0`。
+- 主 tab显式 relinquish 后第二 tab取得锁并广播新 generation；旧 tab同时读回
+  `relinquished=true`、`invalidatedByPeer=true`，旧 generation 探针返回
+  `web.remote.generation_stale`，paired revision/guard 仍为 `1`/Stable，零 frame、零 mutation。
+- 随后正常 reload/reconnect/revoke 继续完成，最终 revision `3`、command/completed 与 approval
+  total/applied 各 `1/1`、active grant `0`、全部 runner artifact absent。`--recovery` 重跑 W3.1/W3.2 全绿。
+- W3.4–W3.7 与 W4 外部槽位状态不变。
 
 ### Gates
 

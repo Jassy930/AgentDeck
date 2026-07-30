@@ -1,12 +1,19 @@
 import {
   acquireWriterLease,
+  commitPairedProjectionState,
   commitExactRevision,
   createAndProveNonExtractableKek,
   deleteProfile,
   initializeState,
+  inspectReservationStorage,
+  loadPairedState,
   readState,
   type WriterLease,
 } from "./storage.ts";
+import {
+  acquireWriterGeneration,
+  type WriterGeneration,
+} from "./writer-generation.ts";
 import { runW1Transport, type W1WasmSessionConstructor } from "./w1-transport.ts";
 import {
   runW2Business,
@@ -34,6 +41,7 @@ type WebCoreModule = Readonly<{
 
 const wasmModuleUrl = "/wasm/agentdeck_web_core.js";
 const leases = new Map<string, WriterLease>();
+const writerGenerations = new Map<string, WriterGeneration>();
 
 const corePromise = (async (): Promise<WebCoreModule> => {
   const core = (await import(wasmModuleUrl)) as WebCoreModule;
@@ -43,6 +51,32 @@ const corePromise = (async (): Promise<WebCoreModule> => {
 
 function bytes(input: readonly number[]): Uint8Array {
   return Uint8Array.from(input);
+}
+
+function failureCode(error: unknown): string {
+  const rendered = error instanceof Error ? error.message : String(error);
+  return /(?:web|relay)\.[a-z0-9_.]+/u.exec(rendered)?.[0] ?? "web.remote.unexpected";
+}
+
+async function ensureWriterGeneration(profileId: string): Promise<WriterGeneration> {
+  const current = writerGenerations.get(profileId);
+  if (current !== undefined) {
+    current.assertCurrent();
+    return current;
+  }
+  const generation = await acquireWriterGeneration(profileId);
+  if (!generation.acquired) {
+    await generation.close();
+    throw new Error("web.remote.writer_locked");
+  }
+  writerGenerations.set(profileId, generation);
+  return generation;
+}
+
+async function closeWriterGeneration(profileId: string): Promise<void> {
+  const generation = writerGenerations.get(profileId);
+  writerGenerations.delete(profileId);
+  await generation?.close();
 }
 
 async function rejectsRelayFrame(input: readonly number[]): Promise<boolean> {
@@ -142,7 +176,14 @@ const api: RelayTestApi = {
     if (constructor === undefined) {
       throw new Error("web.remote.w2_fixture_unavailable");
     }
-    const result = await runW2DurableStart(constructor, encodedInvite, profileId);
+    await ensureWriterGeneration(profileId);
+    const result = await runW2DurableStart(constructor, encodedInvite, profileId).catch(async (error) => {
+      await closeWriterGeneration(profileId);
+      throw error;
+    });
+    if (result.failureCode !== null) {
+      await closeWriterGeneration(profileId);
+    }
     const status = document.querySelector<HTMLElement>("#w2-status");
     if (status !== null) {
       status.dataset.state = result.failureCode === null ? "running" : "failed";
@@ -157,7 +198,10 @@ const api: RelayTestApi = {
     if (constructor === undefined) {
       throw new Error("web.remote.w2_fixture_unavailable");
     }
-    const result = await runW2DurableRecover(constructor, profileId);
+    await ensureWriterGeneration(profileId);
+    const result = await runW2DurableRecover(constructor, profileId).finally(() =>
+      closeWriterGeneration(profileId),
+    );
     const passed =
       result.failureCode === null &&
       result.reloadStatus === "revoked" &&
@@ -176,16 +220,106 @@ const api: RelayTestApi = {
     if (constructor === undefined) {
       throw new Error("web.remote.w2_fixture_unavailable");
     }
-    return runW3ReservationCrash(constructor, profileId, cut);
+    await ensureWriterGeneration(profileId);
+    const result = await runW3ReservationCrash(constructor, profileId, cut).catch(async (error) => {
+      await closeWriterGeneration(profileId);
+      throw error;
+    });
+    if (result.failureCode !== null) {
+      await closeWriterGeneration(profileId);
+    }
+    return result;
   },
   async runW3StateCrashStart(encodedInvite, profileId, cut) {
     const constructor = (await corePromise).W2PairingSession;
     if (constructor === undefined) {
       throw new Error("web.remote.w2_fixture_unavailable");
     }
-    return runW3StateCrashStart(constructor, encodedInvite, profileId, cut);
+    await ensureWriterGeneration(profileId);
+    const result = await runW3StateCrashStart(constructor, encodedInvite, profileId, cut).catch(
+      async (error) => {
+        await closeWriterGeneration(profileId);
+        throw error;
+      },
+    );
+    if (result.failureCode !== null) {
+      await closeWriterGeneration(profileId);
+    }
+    return result;
   },
-  runW3StateForkProbe,
+  async runW3StateForkProbe(profileId) {
+    await ensureWriterGeneration(profileId);
+    try {
+      return await runW3StateForkProbe(profileId);
+    } finally {
+      await closeWriterGeneration(profileId);
+    }
+  },
+  async acquireWriterGeneration(profileId) {
+    try {
+      await ensureWriterGeneration(profileId);
+      return true;
+    } catch (error) {
+      if (failureCode(error) === "web.remote.writer_locked") {
+        return false;
+      }
+      throw error;
+    }
+  },
+  async relinquishWriterGeneration(profileId) {
+    const generation = writerGenerations.get(profileId);
+    if (generation === undefined) {
+      throw new Error("web.remote.writer_generation_missing");
+    }
+    await generation.relinquish();
+  },
+  async releaseWriterGeneration(profileId) {
+    await closeWriterGeneration(profileId);
+  },
+  writerGenerationSnapshot(profileId) {
+    return writerGenerations.get(profileId)?.snapshot() ?? null;
+  },
+  async runW3LateGenerationProbe(profileId) {
+    const before = await inspectReservationStorage(profileId);
+    let rejectionCode: string | null = null;
+    let binaryFramesSent = 0;
+    try {
+      const generation = writerGenerations.get(profileId);
+      if (generation === undefined) {
+        throw new Error("web.remote.writer_generation_missing");
+      }
+      generation.assertCurrent();
+      const loaded = await loadPairedState(profileId);
+      if (loaded.status !== "active") {
+        throw new Error(`web.remote.durable.${loaded.status}`);
+      }
+      generation.assertCurrent();
+      await commitPairedProjectionState(profileId, loaded.revision, loaded.state);
+      generation.assertCurrent();
+      binaryFramesSent += 1;
+    } catch (error) {
+      rejectionCode = failureCode(error);
+    }
+    const after = await inspectReservationStorage(profileId);
+    const canonicalMutationCount =
+      before.pairedRevision === after.pairedRevision && before.guardPhase === after.guardPhase ? 0 : 1;
+    const expectedRejection =
+      rejectionCode === "web.remote.writer_generation_missing" ||
+      rejectionCode === "web.remote.generation_stale";
+    return {
+      rejectionCode,
+      binaryFramesSent,
+      canonicalMutationCount,
+      pairedRevisionBefore: before.pairedRevision,
+      pairedRevisionAfter: after.pairedRevision,
+      guardPhaseBefore: before.guardPhase,
+      guardPhaseAfter: after.guardPhase,
+      failureCode:
+        expectedRejection && binaryFramesSent === 0 && canonicalMutationCount === 0
+          ? null
+          : "web.remote.durable.writer_contention_probe_failed",
+    };
+  },
   initializeState,
   readState,
   commitExactRevision,
@@ -208,7 +342,13 @@ const api: RelayTestApi = {
     leases.delete(profileId);
     await lease?.release();
   },
-  deleteProfile,
+  async deleteProfile(profileId) {
+    await closeWriterGeneration(profileId);
+    const lease = leases.get(profileId);
+    leases.delete(profileId);
+    await lease?.release();
+    await deleteProfile(profileId);
+  },
 };
 
 globalThis.relayTestApi = api;
