@@ -44,7 +44,7 @@ agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge
 stable UDS。diagnostics report 不启动 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志；不要把
 diagnostics override 当成 stable ownership 配置。
 
-## Relay Web Test Companion W0–W3.1 failure codes
+## Relay Web Test Companion W0–W3.2 failure codes
 
 W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，尚未连接 Relay。以下 code 只在本地
 测试 host 中出现；它们不进入 daemon diagnostic log，也不能解释为远端业务失败：
@@ -114,7 +114,9 @@ daemon diagnostic log：
 | `web.remote.storage.revisionInvalid` / `pairedStateIncomplete` | revision 非 safe integer，或 paired record/KEK 缺一部分 | 视为损坏状态；停止自动恢复，不得猜测缺失材料 |
 | `web.remote.storage.revokedMaterialPresent` | revoked tombstone 与 paired material/KEK 同时存在 | 视为安全失败并停止；不得选择任意一边继续连接 |
 | `web.remote.storage.counterGuardInvalid` / `pairedStateInvalid` | counter guard 或 encrypted paired record 的 phase、revision、commitment、IV/密文形状非法 | 保留隔离 profile，停止联网；不得修补字段或绕过 commitment/AAD 校验 |
-| `web.remote.storage.counterGuardConflict` / `counterGuardFork` | durable stage 的 exact guard 已变化，或 paired state 既不是 pending previous 也不是 exact next | fail-close 且零 frame；对照 raw phase/revision/commitment，W3.2 前不得自动合并 sibling/fork |
+| `web.remote.storage.counterGuardConflict` / `counterGuardFork` | durable stage 的 exact guard 已变化，或 paired state 既不是 pending previous 也不是 exact next | fail-close 且零 frame；对照 raw phase/revision/commitment，禁止自动合并 sibling/fork |
+| `web.remote.storage.state_fork_quarantined` | `statePending` 观察到既非 previous、也非 staged exact next 的同 scope sibling/fork；已原子写入 `quarantined(stateFork)` | 预期为零 frame；保留隔离 profile 取证，不得用 revision +1 猜测、合并 sibling 或静默重配对 |
+| `web.remote.storage.state_quarantined` | 冷启动读到已持久化的 state fork quarantine | 这是持续 fail-close 终态；只有显式撤销/清理流程可移除材料，普通恢复不得重新激活 |
 | `web.remote.storage.counterGuardRecoveryFailed` / `pairedCommitmentMismatch` | Pending 收口后未读回 Stable exact state，或解密 plaintext 的 SHA-256 与 sealed commitment 不一致 | 停止旧 identity；保留 profile 取证，不能回退旧 revision 或重新配对掩盖 |
 | `web.remote.durable.reconnect_timeout` / `recovery_timeout` | reload 后认证或 Catalog/Conversation recovery 未在有界窗口完成 | 读取 `recoveryStage` 与 host generation；不要用固定 sleep、无限重试或重新配对掩盖 cursor/gap 错误 |
 | `web.remote.durable.revocation_terminal_missing` | self-revoke 后未验证 MachineRoot-signed terminal | 保留材料，不执行删除；directed receipt 或 socket close 都不能单独充当权威 terminal |
@@ -150,6 +152,10 @@ snapshot 与 daemon SQLite frozen counts；W3.1 失败用 `--crash-cuts` 确认�
 `reservationRecovery`、revision `4`、`512→768` 与注入后
 零 frame。`pendingPreviousFinalized` 表示从 previous 完成 exact-next state 后 finalize，
 `pendingNextFinalized` 表示只补 Stable，`stableExact` 表示无需写入恢复；任何其他状态都不能联网。
+W3.2 失败用 `--state-cuts` 定位 state cut，或用 `--recovery` 同时回归两类 durable cut；
+`statePendingPreviousRetried` 表示先回滚 guard 后重试同一 staged candidate，
+`statePendingNextFinalized` 表示 paired state 已是 exact next、只补 Stable。sibling 负例必须读回
+`quarantined(stateFork)` 与零 frame，不能把 quarantine 当作可恢复成功。
 测试结束必须停止静态 server、关闭 tab/profile、Relay/daemon 并删除本轮精确临时 root；cleanup 不使用
 全局浏览器数据或全局进程名删除。
 

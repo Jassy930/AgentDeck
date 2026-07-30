@@ -1,8 +1,10 @@
 import {
+  commitPairedProjectionState,
   commitPairedState,
   commitRevokedCleanup,
   inspectPairedStorage,
   inspectReservationStorage,
+  injectStateSiblingForTest,
   loadPairedState,
   promotePairedState,
   type DurableCommitStage,
@@ -442,7 +444,7 @@ export async function runW2DurableStart(
     if (business.failureCode !== null || !businessComplete(business.evidence)) {
       throw new Error(business.failureCode ?? "web.remote.business.incomplete");
     }
-    revision = await commitPairedState(
+    revision = await commitPairedProjectionState(
       profileId,
       revision,
       session.businessExportDurableState(),
@@ -608,6 +610,157 @@ export async function runW2DurableRecover(
 class InjectedReservationCrash extends Error {
   constructor(readonly stage: DurableCommitStage) {
     super(`web.remote.test.injected_crash.${stage}`);
+  }
+}
+
+function isW3StateCut(value: string): value is W3StateCut {
+  return (
+    value === "stateGuardPendingDurable" ||
+    value === "stateDurable" ||
+    value === "guardStableDurable"
+  );
+}
+
+export async function runW3StateCrashStart(
+  Session: W2WasmSessionConstructor,
+  encodedInvite: string,
+  profileId: string,
+  cut: W3StateCut,
+): Promise<W3StateCrashEvidence> {
+  if (activeGeneration !== null) {
+    throw new Error("web.remote.single_flight");
+  }
+  if (!isW3StateCut(cut)) {
+    throw new Error("web.remote.durable.state_cut_invalid");
+  }
+  const generation = ++nextGeneration;
+  activeGeneration = generation;
+  const session = new Session(encodedInvite, nowMs());
+  let faultInjected = false;
+  try {
+    const pairing = await completePairing(session, generation);
+    if (pairing.failureCode !== null || !pairing.pairing.paired) {
+      throw new Error(pairing.failureCode ?? "web.remote.pairing.failed");
+    }
+    const revisionBefore = await promotePairedState(
+      profileId,
+      session.businessPrepareDurablePromotion(),
+    );
+    if (revisionBefore !== 0) {
+      throw new Error("web.remote.storage.pairedPromotionConflict");
+    }
+    session.businessActivateDurableState();
+    const business = await completeBusiness(session, generation);
+    if (business.failureCode !== null || !businessComplete(business.evidence)) {
+      throw new Error(business.failureCode ?? "web.remote.business.incomplete");
+    }
+    try {
+      await commitPairedProjectionState(
+        profileId,
+        revisionBefore,
+        session.businessExportDurableState(),
+        (stage) => {
+          if (stage === cut) {
+            throw new InjectedReservationCrash(stage);
+          }
+        },
+      );
+    } catch (error) {
+      if (!(error instanceof InjectedReservationCrash) || error.stage !== cut) {
+        throw error;
+      }
+      faultInjected = true;
+    }
+    if (!faultInjected) {
+      throw new Error("web.remote.durable.state_cut_not_injected");
+    }
+    return {
+      generation,
+      cut,
+      revisionBefore,
+      faultInjected,
+      recoveryBinaryFramesSent: 0,
+      pairing: pairing.pairing,
+      business: business.evidence,
+      storage: await inspectReservationStorage(profileId),
+      failureCode: null,
+    };
+  } catch (error) {
+    return {
+      generation,
+      cut,
+      revisionBefore: 0,
+      faultInjected,
+      recoveryBinaryFramesSent: 0,
+      pairing: pairingEvidence(session),
+      business: session.paired() ? businessEvidence(session) : null,
+      storage: await inspectReservationStorage(profileId),
+      failureCode: failureCode(error),
+    };
+  } finally {
+    session.free();
+    if (activeGeneration === generation) {
+      activeGeneration = null;
+    }
+  }
+}
+
+export async function runW3StateForkProbe(profileId: string): Promise<W3StateForkEvidence> {
+  let faultInjected = false;
+  let rejectionCode: string | null = null;
+  let durableRejectionCode: string | null = null;
+  try {
+    await promotePairedState(profileId, Uint8Array.of(1));
+    try {
+      await commitPairedProjectionState(profileId, 0, Uint8Array.of(2), (stage) => {
+        if (stage === "stateGuardPendingDurable") {
+          throw new InjectedReservationCrash(stage);
+        }
+      });
+    } catch (error) {
+      if (
+        !(error instanceof InjectedReservationCrash) ||
+        error.stage !== "stateGuardPendingDurable"
+      ) {
+        throw error;
+      }
+      faultInjected = true;
+    }
+    await injectStateSiblingForTest(profileId, Uint8Array.of(3));
+    try {
+      await loadPairedState(profileId);
+    } catch (error) {
+      rejectionCode = failureCode(error);
+    }
+    try {
+      await loadPairedState(profileId);
+    } catch (error) {
+      durableRejectionCode = failureCode(error);
+    }
+    const storage = await inspectReservationStorage(profileId);
+    return {
+      faultInjected,
+      rejectionCode,
+      durableRejectionCode,
+      binaryFramesSent: 0,
+      storage,
+      failureCode:
+        faultInjected &&
+        rejectionCode === "web.remote.storage.state_fork_quarantined" &&
+        durableRejectionCode === "web.remote.storage.state_quarantined" &&
+        storage.guardPhase === "quarantined"
+          ? null
+          : "web.remote.durable.state_fork_probe_failed",
+    };
+  } catch (error) {
+    return {
+      faultInjected,
+      rejectionCode,
+      durableRejectionCode,
+      binaryFramesSent: 0,
+      storage: await inspectReservationStorage(profileId),
+      failureCode: failureCode(error),
+    };
   }
 }
 

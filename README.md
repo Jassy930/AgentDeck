@@ -232,7 +232,7 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Web Test Companion（W0/W1/W2 complete；W3.1 complete）
+## Relay Web Test Companion（W0/W1/W2 complete；W3.1–W3.2 complete）
 
 `agentdeck-web-core` 已证明现有 Relay v2 codec、Runtime v5 request contract 与 E2EE v1 crypto 可以复用同一
 Rust 实现编译为 browser WASM；`web/relay-test-companion` 是 Bun 管理的最小测试页面与 host adapter，
@@ -325,6 +325,16 @@ previous 或 exact-next commitment。三个 cut 均证明注入后恢复前零 f
 scripts/run-relay-web-companion-e2e.sh --crash-cuts
 ```
 
+W3.2 把普通 replay/cursor/业务投影 checkpoint 与 counter reservation 分权：普通状态只走独立
+`statePending(previous Stable + exact next full-state commitment)`。三个 state cut 均在真实
+pair→business→reload/reconnect→revoke 链路中通过；previous 会先回滚 guard 再重试同一 staged candidate，
+exact next 只补 Stable，authenticated sibling/fork 则持久化为 `quarantined(stateFork)` 并在联网前拒绝：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --state-cuts
+scripts/run-relay-web-companion-e2e.sh --recovery
+```
+
 本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
 `http://127.0.0.1:4173/`。该入口只用于查看测试壳；需要 paired durable state、隔离 profile 和完整 cleanup
 时必须使用统一 runner，不在日常浏览器 profile 中手工保留测试身份。
@@ -332,8 +342,8 @@ scripts/run-relay-web-companion-e2e.sh --crash-cuts
 这仍不是完整网页版。W2c 已关闭单轮 automatic 的 pair→业务→reload/reconnect/backfill→revoke 正向链路，
 W2.7 已关闭 approval loser 与 stale/replay/nonce-reuse 零 mutation 反例矩阵；W2.8 又在同一 candidate 上完成
 Web aggregate、fixed-topology iOS Simulator、SessionSource/RelayClient 回归和 runbook 收口，因此 W2 automatic
-overall complete。W3.1 counter reservation 三个 crash cut 已关闭；W3.2–W3.7 的 replay/cursor fork、tab
-contention、真实 browser kill、网络故障与同一 candidate 三次 fresh run 尚未开始。公网 WSS、
+overall complete。W3.1 counter reservation 与 W3.2 replay/cursor statePending 三个 crash cut 均已关闭；
+W3.3–W3.7 的 tab contention、真实 browser kill、网络故障与同一 candidate 三次 fresh run 尚未开始。公网 WSS、
 production SPKI pin/signing、物理设备、第二台 Mac 与真实 vendor 属于 W4，继续独立 BLOCKED。阶段事实源见
 [`Relay Web Test Companion 实施计划`](docs/plans/2026-07-30-relay-web-test-companion-implementation.md)。
 

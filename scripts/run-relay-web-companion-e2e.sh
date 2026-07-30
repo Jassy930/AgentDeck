@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 web_root="$repo_root/web/relay-test-companion"
 
 usage() {
-  printf 'usage: %s --contract|--transport|--pairing|--business|--durable|--negative|--crash-cuts|--all\n' "$0" >&2
+  printf 'usage: %s --contract|--transport|--pairing|--business|--durable|--negative|--crash-cuts|--state-cuts|--recovery|--all\n' "$0" >&2
   exit 64
 }
 
@@ -72,6 +72,15 @@ run_crash_cuts() {
   bash "$repo_root/scripts/run-relay-web-companion-crash-cuts-e2e.sh"
 }
 
+run_state_cuts() {
+  bash "$repo_root/scripts/run-relay-web-companion-state-cuts-e2e.sh"
+}
+
+run_recovery() {
+  run_crash_cuts
+  run_state_cuts
+}
+
 test "$#" -eq 1 || usage
 case "$1" in
   --contract)
@@ -94,6 +103,12 @@ case "$1" in
     ;;
   --crash-cuts)
     run_crash_cuts
+    ;;
+  --state-cuts)
+    run_state_cuts
+    ;;
+  --recovery)
+    run_recovery
     ;;
   --all)
     run_contract

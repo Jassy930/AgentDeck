@@ -20,7 +20,7 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
-## Relay Web Test Companion W0–W3.1 门禁（2026-07-30）
+## Relay Web Test Companion W0–W3.2 门禁（2026-07-30）
 
 W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
 `web/relay-test-companion/` 后运行：
@@ -146,8 +146,8 @@ authorization 四项 SQLite 计数，并证明后到 resolve 与 Applied Retry �
 
 W2c PASS 关闭单轮 durable 正向链路，W2.7 PASS 关闭 negative/zero-mutation matrix。W2.8 还必须在同一
 candidate 上通过 `--all` 与 `verify-relay-companion-mvp.sh p5`；当前两者已 PASS，因此 W2 automatic overall
-complete。W3.1 的 counter reservation 三个 deterministic crash cut 已通过；W3.2–W3.7 的 replay/cursor
-fork、第二 tab、browser kill、网络故障与三次 fresh run尚未开始。
+complete。W3.1 的 counter reservation 与 W3.2 replay/cursor statePending 三个 deterministic crash cut 已通过；
+W3.3–W3.7 的第二 tab、browser kill、网络故障与三次 fresh run尚未开始。
 
 W3.1 独立门禁如下；它不会提前执行 W3.2 之后的 tab contention、故障代理或三次 fresh run：
 
@@ -160,6 +160,20 @@ Relay/daemon/Chrome 生命周期。每轮必须读回注入后零 binary frame�
 `pendingPreviousFinalized` / `pendingNextFinalized` / `stableExact`、durable revision `4` 与 reservation
 `512→768`；command/completed 和 approval total/applied 始终各 `1/1`，最终 revoke、counter guard、paired
 material、KEK、browser/host/temp artifact 全部清理。
+
+W3.2 独立与 aggregate 门禁如下：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --state-cuts
+scripts/run-relay-web-companion-e2e.sh --recovery
+```
+
+`--state-cuts` 对 `stateGuardPendingDurable`、`stateDurable`、`guardStableDurable` 各执行 fresh fixed-topology
+生命周期，必须分别读回 `statePendingPreviousRetried`、`statePendingNextFinalized`、`stableExact`，且恢复前
+零 binary frame、最终 revision `3`、reservation `256→512`、command/completed 与 approval total/applied
+各 `1/1`。独立 sibling 负例必须持久化 `quarantined(stateFork)`，返回
+`web.remote.storage.state_fork_quarantined`，保持零 frame；cleanup 后 profile 与 Playwright artifacts absent。
+`--recovery` 串行重跑 W3.1/W3.2，不执行 W3.3 之后的 tab/browser-kill/故障代理/三次 fresh 门禁。
 
 W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED。
 

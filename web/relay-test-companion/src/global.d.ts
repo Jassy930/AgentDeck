@@ -134,24 +134,53 @@ declare global {
     | "stateDurable"
     | "guardStableDurable";
 
+  type W3StateCut =
+    | "stateGuardPendingDurable"
+    | "stateDurable"
+    | "guardStableDurable";
+
   type W3ReservationRecovery =
     | "pendingPreviousFinalized"
     | "pendingNextFinalized"
+    | "statePendingPreviousRetried"
+    | "statePendingNextFinalized"
     | "stableExact";
 
   type W3ReservationStorageEvidence = Readonly<{
     pairedRevision: number | null;
-    guardPhase: "pending" | "stable" | null;
+    guardPhase: "pending" | "statePending" | "stable" | "quarantined" | null;
     guardRevision: number | null;
     pendingPreviousRevision: number | null;
     pendingNextRevision: number | null;
     stagedCiphertextBytes: number;
+    quarantineReason: "stateFork" | null;
   }>;
 
   type W3CrashCutEvidence = Readonly<{
     cut: W3CrashCut;
     revisionBefore: number;
     faultInjected: boolean;
+    binaryFramesSent: 0;
+    storage: W3ReservationStorageEvidence;
+    failureCode: string | null;
+  }>;
+
+  type W3StateCrashEvidence = Readonly<{
+    generation: number;
+    cut: W3StateCut;
+    revisionBefore: 0;
+    faultInjected: boolean;
+    recoveryBinaryFramesSent: 0;
+    pairing: W2PairingEvidence;
+    business: W2BusinessEvidence | null;
+    storage: W3ReservationStorageEvidence;
+    failureCode: string | null;
+  }>;
+
+  type W3StateForkEvidence = Readonly<{
+    faultInjected: boolean;
+    rejectionCode: string | null;
+    durableRejectionCode: string | null;
     binaryFramesSent: 0;
     storage: W3ReservationStorageEvidence;
     failureCode: string | null;
@@ -194,6 +223,12 @@ declare global {
       profileId: string,
       cut: W3CrashCut,
     ) => Promise<W3CrashCutEvidence>;
+    runW3StateCrashStart: (
+      encodedInvite: string,
+      profileId: string,
+      cut: W3StateCut,
+    ) => Promise<W3StateCrashEvidence>;
+    runW3StateForkProbe: (profileId: string) => Promise<W3StateForkEvidence>;
     initializeState: (profileId: string, payload: string) => Promise<DurableStateRecord>;
     readState: (profileId: string) => Promise<DurableStateRecord | null>;
     commitExactRevision: (

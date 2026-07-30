@@ -44,7 +44,7 @@ type StableCounterGuardRecord = Readonly<{
 
 type PendingCounterGuardRecord = Readonly<{
   key: typeof COUNTER_GUARD_KEY;
-  phase: "pending";
+  phase: "pending" | "statePending";
   previousRevision: number;
   previousStateCommitment: Uint8Array;
   nextRevision: number;
@@ -53,10 +53,22 @@ type PendingCounterGuardRecord = Readonly<{
   nextCiphertext: Uint8Array;
 }>;
 
-type CounterGuardRecord = StableCounterGuardRecord | PendingCounterGuardRecord;
+type QuarantinedCounterGuardRecord = Readonly<{
+  key: typeof COUNTER_GUARD_KEY;
+  phase: "quarantined";
+  reason: "stateFork";
+  observedRevision: number;
+  observedStateCommitment: Uint8Array;
+}>;
+
+type CounterGuardRecord =
+  | StableCounterGuardRecord
+  | PendingCounterGuardRecord
+  | QuarantinedCounterGuardRecord;
 
 export type DurableCommitStage =
   | "guardPendingDurable"
+  | "stateGuardPendingDurable"
   | "stateDurable"
   | "guardStableDurable";
 
@@ -89,15 +101,18 @@ export type PairedStorageEvidence = Readonly<{
 export type W3ReservationRecovery =
   | "pendingPreviousFinalized"
   | "pendingNextFinalized"
+  | "statePendingPreviousRetried"
+  | "statePendingNextFinalized"
   | "stableExact";
 
 export type W3ReservationStorageEvidence = Readonly<{
   pairedRevision: number | null;
-  guardPhase: "pending" | "stable" | null;
+  guardPhase: "pending" | "statePending" | "stable" | "quarantined" | null;
   guardRevision: number | null;
   pendingPreviousRevision: number | null;
   pendingNextRevision: number | null;
   stagedCiphertextBytes: number;
+  quarantineReason: "stateFork" | null;
 }>;
 
 function databaseName(profileId: string): string {
@@ -408,8 +423,18 @@ function validateGuard(record: CounterGuardRecord): void {
     }
     return;
   }
+  if (record.phase === "quarantined") {
+    if (
+      record.reason !== "stateFork" ||
+      !safeRevision(record.observedRevision) ||
+      !validBytes(record.observedStateCommitment, 32)
+    ) {
+      throw new Error("web.remote.storage.counterGuardInvalid");
+    }
+    return;
+  }
   if (
-    record.phase !== "pending" ||
+    (record.phase !== "pending" && record.phase !== "statePending") ||
     !safeRevision(record.previousRevision) ||
     !safeRevision(record.nextRevision) ||
     record.nextRevision !== record.previousRevision + 1 ||
@@ -456,8 +481,13 @@ function pendingMatches(
         equalBytes(guard.nextCiphertext, paired.ciphertext);
 }
 
+function isPendingGuard(record: CounterGuardRecord): record is PendingCounterGuardRecord {
+  return record.phase === "pending" || record.phase === "statePending";
+}
+
 function samePending(left: PendingCounterGuardRecord, right: PendingCounterGuardRecord): boolean {
   return (
+    left.phase === right.phase &&
     left.previousRevision === right.previousRevision &&
     left.nextRevision === right.nextRevision &&
     equalBytes(left.previousStateCommitment, right.previousStateCommitment) &&
@@ -527,7 +557,7 @@ async function advancePending(
   await withStore(profileId, "readwrite", async (store) => {
     const active = activeBundle(await readBundle(store), "web.remote.storage.counterGuardConflict");
     if (
-      active.guard.phase !== "pending" ||
+      !isPendingGuard(active.guard) ||
       !samePending(active.guard, expected) ||
       !pendingMatches(active.guard, active.paired, from)
     ) {
@@ -537,6 +567,43 @@ async function advancePending(
       store.put(from === "previous" ? pairedFromPending(active.guard) : stableFromPending(active.guard)),
     );
   });
+}
+
+async function beginPendingTransition(
+  profileId: string,
+  expectedRevision: number,
+  encrypted: EncryptedPairedRecord,
+  phase: PendingCounterGuardRecord["phase"],
+): Promise<PendingCounterGuardRecord> {
+  let pending: PendingCounterGuardRecord | null = null;
+  await withStore(profileId, "readwrite", async (store) => {
+    const active = activeBundle(
+      await readBundle(store),
+      "web.remote.storage.pairedRevisionConflict",
+    );
+    if (
+      active.paired.revision !== expectedRevision ||
+      active.guard.phase !== "stable" ||
+      !stableMatches(active.guard, active.paired)
+    ) {
+      throw new Error("web.remote.storage.pairedRevisionConflict");
+    }
+    pending = {
+      key: COUNTER_GUARD_KEY,
+      phase,
+      previousRevision: expectedRevision,
+      previousStateCommitment: active.paired.stateCommitment,
+      nextRevision: encrypted.revision,
+      nextStateCommitment: encrypted.stateCommitment,
+      nextIv: encrypted.iv,
+      nextCiphertext: encrypted.ciphertext,
+    };
+    await requestResult(store.put(pending));
+  });
+  if (pending === null) {
+    throw new Error("web.remote.storage.counterGuardConflict");
+  }
+  return pending;
 }
 
 export async function promotePairedState(profileId: string, state: Uint8Array): Promise<number> {
@@ -576,35 +643,37 @@ export async function commitPairedState(
     "web.remote.storage.pairedRevisionConflict",
   );
   const encrypted = await encryptPairedState(profileId, nextRevision, state, initial.kek);
-  let pending: PendingCounterGuardRecord | null = null;
-  await withStore(profileId, "readwrite", async (store) => {
-    const active = activeBundle(
-      await readBundle(store),
-      "web.remote.storage.pairedRevisionConflict",
-    );
-    if (
-      active.paired.revision !== expectedRevision ||
-      active.guard.phase !== "stable" ||
-      !stableMatches(active.guard, active.paired)
-    ) {
-      throw new Error("web.remote.storage.pairedRevisionConflict");
-    }
-    pending = {
-      key: COUNTER_GUARD_KEY,
-      phase: "pending",
-      previousRevision: expectedRevision,
-      previousStateCommitment: active.paired.stateCommitment,
-      nextRevision,
-      nextStateCommitment: encrypted.stateCommitment,
-      nextIv: encrypted.iv,
-      nextCiphertext: encrypted.ciphertext,
-    };
-    await requestResult(store.put(pending));
-  });
-  if (pending === null) {
-    throw new Error("web.remote.storage.counterGuardConflict");
-  }
+  const pending = await beginPendingTransition(profileId, expectedRevision, encrypted, "pending");
   await observer?.("guardPendingDurable");
+  await advancePending(profileId, pending, "previous");
+  await observer?.("stateDurable");
+  await advancePending(profileId, pending, "next");
+  await observer?.("guardStableDurable");
+  return nextRevision;
+}
+
+export async function commitPairedProjectionState(
+  profileId: string,
+  expectedRevision: number,
+  state: Uint8Array,
+  observer?: DurableCommitObserver,
+): Promise<number> {
+  const nextRevision = expectedRevision + 1;
+  if (!Number.isSafeInteger(nextRevision) || nextRevision <= expectedRevision) {
+    throw new Error("web.remote.storage.revisionInvalid");
+  }
+  const initial = activeBundle(
+    await readPairedBundle(profileId),
+    "web.remote.storage.pairedRevisionConflict",
+  );
+  const encrypted = await encryptPairedState(profileId, nextRevision, state, initial.kek);
+  const pending = await beginPendingTransition(
+    profileId,
+    expectedRevision,
+    encrypted,
+    "statePending",
+  );
+  await observer?.("stateGuardPendingDurable");
   await advancePending(profileId, pending, "previous");
   await observer?.("stateDurable");
   await advancePending(profileId, pending, "next");
@@ -629,6 +698,95 @@ async function recoverPending(
   throw new Error("web.remote.storage.counterGuardFork");
 }
 
+async function rollbackStatePending(
+  profileId: string,
+  expected: PendingCounterGuardRecord,
+): Promise<void> {
+  await withStore(profileId, "readwrite", async (store) => {
+    const active = activeBundle(await readBundle(store), "web.remote.storage.counterGuardConflict");
+    if (
+      active.guard.phase !== "statePending" ||
+      !samePending(active.guard, expected) ||
+      !pendingMatches(active.guard, active.paired, "previous")
+    ) {
+      throw new Error("web.remote.storage.counterGuardFork");
+    }
+    await requestResult(
+      store.put({
+        key: COUNTER_GUARD_KEY,
+        phase: "stable",
+        revision: expected.previousRevision,
+        stateCommitment: expected.previousStateCommitment,
+      } satisfies StableCounterGuardRecord),
+    );
+  });
+}
+
+async function retryStatePending(
+  profileId: string,
+  expected: PendingCounterGuardRecord,
+): Promise<void> {
+  await withStore(profileId, "readwrite", async (store) => {
+    const active = activeBundle(await readBundle(store), "web.remote.storage.counterGuardConflict");
+    if (
+      active.guard.phase !== "stable" ||
+      active.guard.revision !== expected.previousRevision ||
+      !stableMatches(active.guard, active.paired) ||
+      !equalBytes(active.guard.stateCommitment, expected.previousStateCommitment)
+    ) {
+      throw new Error("web.remote.storage.counterGuardFork");
+    }
+    await requestResult(store.put(expected));
+  });
+  await advancePending(profileId, expected, "previous");
+  await advancePending(profileId, expected, "next");
+}
+
+async function quarantineStateFork(
+  profileId: string,
+  expected: PendingCounterGuardRecord,
+  observed: EncryptedPairedRecord,
+): Promise<void> {
+  await withStore(profileId, "readwrite", async (store) => {
+    const active = activeBundle(await readBundle(store), "web.remote.storage.counterGuardConflict");
+    if (
+      active.guard.phase !== "statePending" ||
+      !samePending(active.guard, expected) ||
+      active.paired.revision !== observed.revision ||
+      !equalBytes(active.paired.stateCommitment, observed.stateCommitment)
+    ) {
+      throw new Error("web.remote.storage.counterGuardConflict");
+    }
+    await requestResult(
+      store.put({
+        key: COUNTER_GUARD_KEY,
+        phase: "quarantined",
+        reason: "stateFork",
+        observedRevision: observed.revision,
+        observedStateCommitment: observed.stateCommitment,
+      } satisfies QuarantinedCounterGuardRecord),
+    );
+  });
+}
+
+async function recoverStatePending(
+  profileId: string,
+  guard: PendingCounterGuardRecord,
+  paired: EncryptedPairedRecord,
+): Promise<W3ReservationRecovery> {
+  if (pendingMatches(guard, paired, "previous")) {
+    await rollbackStatePending(profileId, guard);
+    await retryStatePending(profileId, guard);
+    return "statePendingPreviousRetried";
+  }
+  if (pendingMatches(guard, paired, "next")) {
+    await advancePending(profileId, guard, "next");
+    return "statePendingNextFinalized";
+  }
+  await quarantineStateFork(profileId, guard, paired);
+  throw new Error("web.remote.storage.state_fork_quarantined");
+}
+
 export async function loadPairedState(profileId: string): Promise<PairedStateLoad> {
   let bundle = await readPairedBundle(profileId);
   if (bundle.revoked !== undefined) {
@@ -646,6 +804,12 @@ export async function loadPairedState(profileId: string): Promise<PairedStateLoa
     reservationRecovery = await recoverPending(profileId, active.guard, active.paired);
     bundle = await readPairedBundle(profileId);
     active = activeBundle(bundle, "web.remote.storage.counterGuardRecoveryFailed");
+  } else if (active.guard.phase === "statePending") {
+    reservationRecovery = await recoverStatePending(profileId, active.guard, active.paired);
+    bundle = await readPairedBundle(profileId);
+    active = activeBundle(bundle, "web.remote.storage.counterGuardRecoveryFailed");
+  } else if (active.guard.phase === "quarantined") {
+    throw new Error("web.remote.storage.state_quarantined");
   }
   if (active.guard.phase !== "stable" || !stableMatches(active.guard, active.paired)) {
     throw new Error("web.remote.storage.counterGuardFork");
@@ -674,6 +838,37 @@ export async function loadPairedState(profileId: string): Promise<PairedStateLoa
     state: plaintext,
     reservationRecovery,
   };
+}
+
+export async function injectStateSiblingForTest(
+  profileId: string,
+  state: Uint8Array,
+): Promise<void> {
+  const initial = activeBundle(
+    await readPairedBundle(profileId),
+    "web.remote.storage.counterGuardConflict",
+  );
+  if (initial.guard.phase !== "statePending") {
+    throw new Error("web.remote.storage.counterGuardConflict");
+  }
+  const expectedGuard = initial.guard;
+  const sibling = await encryptPairedState(
+    profileId,
+    expectedGuard.nextRevision,
+    state,
+    initial.kek,
+  );
+  await withStore(profileId, "readwrite", async (store) => {
+    const active = activeBundle(await readBundle(store), "web.remote.storage.counterGuardConflict");
+    if (
+      active.guard.phase !== "statePending" ||
+      !samePending(active.guard, expectedGuard) ||
+      !pendingMatches(active.guard, active.paired, "previous")
+    ) {
+      throw new Error("web.remote.storage.counterGuardConflict");
+    }
+    await requestResult(store.put(sibling));
+  });
 }
 
 export async function commitRevokedCleanup(
@@ -718,9 +913,11 @@ export async function inspectReservationStorage(
     pairedRevision: paired?.revision ?? null,
     guardPhase: guard?.phase ?? null,
     guardRevision: guard?.phase === "stable" ? guard.revision : null,
-    pendingPreviousRevision: guard?.phase === "pending" ? guard.previousRevision : null,
-    pendingNextRevision: guard?.phase === "pending" ? guard.nextRevision : null,
-    stagedCiphertextBytes: guard?.phase === "pending" ? guard.nextCiphertext.byteLength : 0,
+    pendingPreviousRevision: guard !== undefined && isPendingGuard(guard) ? guard.previousRevision : null,
+    pendingNextRevision: guard !== undefined && isPendingGuard(guard) ? guard.nextRevision : null,
+    stagedCiphertextBytes:
+      guard !== undefined && isPendingGuard(guard) ? guard.nextCiphertext.byteLength : 0,
+    quarantineReason: guard?.phase === "quarantined" ? guard.reason : null,
   };
 }
 

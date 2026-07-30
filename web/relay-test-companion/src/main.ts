@@ -14,6 +14,8 @@ import {
   runW2DurableStart,
   runW2Pairing,
   runW3ReservationCrash,
+  runW3StateCrashStart,
+  runW3StateForkProbe,
   type W2WasmSessionConstructor,
 } from "./w2-transport.ts";
 
@@ -176,6 +178,14 @@ const api: RelayTestApi = {
     }
     return runW3ReservationCrash(constructor, profileId, cut);
   },
+  async runW3StateCrashStart(encodedInvite, profileId, cut) {
+    const constructor = (await corePromise).W2PairingSession;
+    if (constructor === undefined) {
+      throw new Error("web.remote.w2_fixture_unavailable");
+    }
+    return runW3StateCrashStart(constructor, encodedInvite, profileId, cut);
+  },
+  runW3StateForkProbe,
   initializeState,
   readState,
   commitExactRevision,

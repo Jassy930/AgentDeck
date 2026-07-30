@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2 automatic complete；W3.1 complete，W3.2–W3.7 未开始；W4 BLOCKED |
+| 状态 | W0/W1/W2 automatic complete；W3.1–W3.2 complete，W3.3–W3.7 未开始；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -382,7 +382,7 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 
 - [x] W3.1：为 counter reservation、sealed state commit、Stable finalize 三个 cut 增加 deterministic fault seam；
   每个 cut 重启后只能整块跳号或 exact finalize。
-- [ ] W3.2：覆盖 replay/cursor statePending 的 previous rollback、exact next finalize 与 sibling/fork quarantine。
+- [x] W3.2：覆盖 replay/cursor statePending 的 previous rollback、exact next finalize 与 sibling/fork quarantine。
 - [ ] W3.3：启动第二 tab/worker，验证 Web Locks 排他、旧 generation/BroadcastChannel 失效和零重复发送。
 - [ ] W3.4：在 prompt/approval/reconnect 各阶段强制 kill browser process，再以同 profile 冷恢复。
 - [ ] W3.5：使用 runner-owned 故障代理注入断连/延迟/Relay restart；代理只转发 bytes，不解析协议。
@@ -399,8 +399,25 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 - 三轮均整块跳过未暴露的 `256→512`，冷恢复后 reservation 为 `512→768`、最终 revision `4`；
   command/completed、approval total/applied 各 `1/1`，revoke 后 active grant `0`，paired/KEK/guard 与所有
   runner artifact absent。
-- 未启动 W3.2 replay/cursor fork、W3.3 tab contention、W3.4 browser kill、W3.5 故障代理、W3.6 三次
-  candidate 重复或 W3.7 双路终审；W3 overall 仍未完成。
+- W3.2 已由下一节关闭；W3.3 tab contention、W3.4 browser kill、W3.5 故障代理、W3.6 三次 candidate
+  重复与 W3.7 双路终审仍未完成，W3 overall 仍未完成。
+
+### W3.2 evidence（2026-07-30）
+
+- 普通业务 checkpoint 已从 counter reservation 路径拆出，固定使用
+  `statePending(previous Stable + exact next full-state commitment)`；counter reservation 仍独占原
+  `Pending → encrypted state → Stable` 三段路径，两类 mutation 不再混用恢复语义。
+- `scripts/run-relay-web-companion-e2e.sh --state-cuts` 对 `stateGuardPendingDurable`、`stateDurable`、
+  `guardStableDurable` 各运行 fresh Relay/daemon/Chrome。冷恢复结果分别为
+  `statePendingPreviousRetried`、`statePendingNextFinalized`、`stableExact`，恢复前均为零 binary frame。
+- previous 路径先 exact 回滚 guard，再重试同一 staged candidate；exact next 只补 Stable。独立 Chromium
+  sibling 负例把同 revision 非 exact-next state 持久化为 `quarantined(stateFork)`，返回
+  `web.remote.storage.state_fork_quarantined`，且发送 frame 数为 `0`；再次打开返回
+  `web.remote.storage.state_quarantined`，禁止自动合并或重新配对掩盖。
+- 三个真实 state cut 均最终 revision `3`、reservation `256→512`、daemon generation `2`、
+  command/completed 与 approval total/applied 各 `1/1`；revoke 后 active grant `0`，paired/KEK/guard、
+  browser/host/root/invite/UDS/Playwright artifacts 全部 absent。
+- `--recovery` 同时重跑 W3.1 与 W3.2 聚合门禁并通过；W3.3–W3.7 与 W4 外部槽位状态不变。
 
 ### Gates
 

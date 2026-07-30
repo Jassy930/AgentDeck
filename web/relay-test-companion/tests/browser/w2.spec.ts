@@ -22,6 +22,33 @@ test("W2.7 WASM negative admission matrix is zero-mutation", async ({ page }) =>
   });
 });
 
+test("W3.2 statePending sibling is durably quarantined without network", async ({ page }) => {
+  const profileId = "w3-state-fork";
+  await page.goto("/");
+  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.ready)).toBe("true");
+  const result = await page.evaluate(
+    async (profile) => globalThis.relayTestApi.runW3StateForkProbe(profile),
+    profileId,
+  );
+  expect(result.failureCode, JSON.stringify(result)).toBeNull();
+  expect(result).toMatchObject({
+    faultInjected: true,
+    rejectionCode: "web.remote.storage.state_fork_quarantined",
+    durableRejectionCode: "web.remote.storage.state_quarantined",
+    binaryFramesSent: 0,
+    storage: {
+      pairedRevision: 1,
+      guardPhase: "quarantined",
+      quarantineReason: "stateFork",
+      stagedCiphertextBytes: 0,
+    },
+  });
+  await page.evaluate(async (profile) => globalThis.relayTestApi.deleteProfile(profile), profileId);
+  expect(
+    await page.evaluate(async (profile) => globalThis.relayTestApi.readState(profile), profileId),
+  ).toBeNull();
+});
+
 test("W2a real browser pairing reaches durable terminal", async ({ page }) => {
   test.setTimeout(150_000);
   const invitePath = process.env.AGENTDECK_W2_INVITE_PATH;
@@ -125,6 +152,7 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page })
   const coordinationDir = process.env.AGENTDECK_W2_COORDINATION_DIR;
   const profileId = process.env.AGENTDECK_W2_PROFILE_ID;
   const crashCut = process.env.AGENTDECK_W3_CRASH_CUT as W3CrashCut | undefined;
+  const stateCut = process.env.AGENTDECK_W3_STATE_CUT as W3StateCut | undefined;
   if (invitePath === undefined || coordinationDir === undefined || profileId === undefined) {
     throw new Error("W2c runner contract is missing");
   }
@@ -138,13 +166,41 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page })
 
   await page.goto("/");
   await expect.poll(() => page.evaluate(() => document.documentElement.dataset.ready)).toBe("true");
-  const started = await page.evaluate(
-    async ({ encodedInvite, profile }) =>
-      globalThis.relayTestApi.runW2DurableStart(encodedInvite, profile),
-    { encodedInvite: invite, profile: profileId },
-  );
+  if (crashCut !== undefined && stateCut !== undefined) {
+    throw new Error("W3 runner selected two crash families");
+  }
+  const started =
+    stateCut === undefined
+      ? await page.evaluate(
+          async ({ encodedInvite, profile }) =>
+            globalThis.relayTestApi.runW2DurableStart(encodedInvite, profile),
+          { encodedInvite: invite, profile: profileId },
+        )
+      : await page.evaluate(
+          async ({ encodedInvite, profile, cut }) =>
+            globalThis.relayTestApi.runW3StateCrashStart(encodedInvite, profile, cut),
+          { encodedInvite: invite, profile: profileId, cut: stateCut },
+        );
   expect(started.failureCode, JSON.stringify(started)).toBeNull();
-  expect(started.revision).toBe(1);
+  if (stateCut === undefined) {
+    expect("revision" in started ? started.revision : null).toBe(1);
+  } else {
+    expect(started).toMatchObject({
+      cut: stateCut,
+      revisionBefore: 0,
+      faultInjected: true,
+      recoveryBinaryFramesSent: 0,
+    });
+    const expectedPairedRevision = stateCut === "stateGuardPendingDurable" ? 0 : 1;
+    const expectedGuardPhase = stateCut === "guardStableDurable" ? "stable" : "statePending";
+    expect("storage" in started ? started.storage : null).toMatchObject({
+      pairedRevision: expectedPairedRevision,
+      guardPhase: expectedGuardPhase,
+      guardRevision: stateCut === "guardStableDurable" ? 1 : null,
+      pendingPreviousRevision: stateCut === "guardStableDurable" ? null : 0,
+      pendingNextRevision: stateCut === "guardStableDurable" ? null : 1,
+    });
+  }
   expect(started.business).toMatchObject({
     durablePromoted: true,
     commandCompleted: true,
@@ -153,13 +209,17 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page })
     counterReservationStart: 0,
     counterReservationEnd: 256,
   });
-  expect(started.storage).toMatchObject({
-    pairedPresent: true,
-    kekPresent: true,
-    revokedPresent: false,
-    revision: 1,
-  });
-  expect(started.storage.ciphertextBytes).toBeGreaterThan(16);
+  if (stateCut === undefined) {
+    expect(started.storage).toMatchObject({
+      pairedPresent: true,
+      kekPresent: true,
+      revokedPresent: false,
+      revision: 1,
+    });
+    expect("ciphertextBytes" in started.storage ? started.storage.ciphertextBytes : 0).toBeGreaterThan(
+      16,
+    );
+  }
   await writeFile(`${coordinationDir}/business.ready`, "ready\n", { flag: "wx", mode: 0o600 });
 
   await expect
@@ -234,8 +294,14 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page })
   });
   expect(recovered.business?.recoveryCatalogBackfillCount).toBeGreaterThanOrEqual(1);
   expect(recovered.reservationRecovery).toBe(
-    crashCut === undefined
-      ? "stableExact"
+    stateCut === "stateGuardPendingDurable"
+      ? "statePendingPreviousRetried"
+      : stateCut === "stateDurable"
+        ? "statePendingNextFinalized"
+        : stateCut === "guardStableDurable"
+          ? "stableExact"
+          : crashCut === undefined
+            ? "stableExact"
       : crashCut === "guardPendingDurable"
         ? "pendingPreviousFinalized"
         : crashCut === "stateDurable"
