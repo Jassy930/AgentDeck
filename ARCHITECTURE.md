@@ -808,6 +808,10 @@ conversation/key，不能伪造身份连续性。
   exact user-data-dir，但主 PID 必须变化。prompt cut 在 daemon restart 前先从 encrypted projection 恢复并
   完成 pending approval，避免把 daemon 合法 `Expired` 终态误报为 Applied。restart marker 是随 durable
   catalog cursor 单调持久化的语义事实；后续 exact-next recovery 不得清零该事实或倒退 cursor 重放 marker。
+- W3.5 的故障代理只能转发 TCP bytes，不终止 TLS、不解析 WebSocket/Relay/Runtime，也不持有任何 key 或
+  canonical state。断连与单向延迟只由连接/字节阈值触发；Relay restart 必须复用 exact bind、SQLite store、
+  TLS identity 与 receipt signer，generation `1→2` 后以 daemon machine-link authenticated readiness 放行恢复，
+  禁止固定 sleep 或把代理模拟断连写成真实 Relay restart。
 - `StreamBindingV1.inner_cursor` 表示 Relay publication cut，不是 reducer 已应用历史的唯一真相。directed
   bootstrap 的 `RuntimeSyncComplete.inner_cursor` 可在线性化窗口内高于该 cut；恢复时 durable reducer cursor
   只允许单调前进，后续 control ACK 只能推进 outer cursor，不能把 inner cursor 回退到旧 publication cut。
@@ -827,8 +831,8 @@ conversation/key，不能伪造身份连续性。
   必须在发送前 fail-close，不能靠新配对掩盖失败。
 - W2c automatic complete 关闭单轮 durable 正向链路，W2.7 automatic complete 关闭完整
   negative/zero-mutation matrix，W2.8 用同一 candidate 的 Web aggregate 与 fixed-topology iOS/P5 回归完成
-  W2 automatic overall closeout。W3.1/W3.2 两类 crash cut、W3.3 第二 tab/generation 隔离与 W3.4 真实
-  browser kill 均已关闭；W3.5–W3.7 的网络故障、三次 fresh run 与双路终审仍未完成；公网、
+  W2 automatic overall closeout。W3.1/W3.2 两类 crash cut、W3.3 第二 tab/generation 隔离、W3.4 真实
+  browser kill 与 W3.5 网络故障均已关闭；W3.6–W3.7 的三次 fresh run 与双路终审仍未完成；公网、
   物理设备、production signing/pin、第二台
   Mac 与真实 vendor 继续是 W4 外部门禁。
 

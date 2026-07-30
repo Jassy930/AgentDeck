@@ -369,6 +369,11 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page, c
   const crashCut = process.env.AGENTDECK_W3_CRASH_CUT as W3CrashCut | undefined;
   const stateCut = process.env.AGENTDECK_W3_STATE_CUT as W3StateCut | undefined;
   const writerContention = process.env.AGENTDECK_W3_CONTENTION === "1";
+  const networkFault = process.env.AGENTDECK_W3_NETWORK_FAULT as
+    | "disconnect"
+    | "delay"
+    | "relayRestart"
+    | undefined;
   if (invitePath === undefined || coordinationDir === undefined || profileId === undefined) {
     throw new Error("W2c runner contract is missing");
   }
@@ -383,8 +388,13 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page, c
   await page.goto("/");
   await expect.poll(() => page.evaluate(() => document.documentElement.dataset.ready)).toBe("true");
   if (
-    Number(crashCut !== undefined) + Number(stateCut !== undefined) + Number(writerContention) >
-    1
+    (networkFault !== undefined &&
+      !["disconnect", "delay", "relayRestart"].includes(networkFault)) ||
+    Number(crashCut !== undefined) +
+      Number(stateCut !== undefined) +
+      Number(writerContention) +
+      Number(networkFault !== undefined) >
+      1
   ) {
     throw new Error("W3 runner selected multiple fault families");
   }
@@ -551,20 +561,68 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page, c
       "true",
     );
   }
-  const recovered = await page.evaluate(
+  let recovered = await page.evaluate(
     async (profile) => globalThis.relayTestApi.runW2DurableRecover(profile),
     profileId,
   );
+  let recoveryAttempts = 1;
+  let firstFailureCode: string | null = null;
+  const retryFault = networkFault === "relayRestart";
+  if (retryFault) {
+    firstFailureCode = recovered.failureCode;
+    expect(
+      [
+        "web.remote.connection_closed",
+        "web.remote.connection_failed",
+        "web.remote.business.outcome_unknown",
+      ],
+      JSON.stringify(recovered),
+    ).toContain(firstFailureCode);
+    expect(recovered).toMatchObject({
+      revision: 2,
+      reloadStatus: "active",
+      storage: {
+        pairedPresent: true,
+        kekPresent: true,
+        revokedPresent: false,
+        revision: 2,
+      },
+    });
+    if (networkFault === "relayRestart") {
+      await expect
+        .poll(
+          async () => {
+            try {
+              return JSON.parse(
+                await readFile(`${coordinationDir}/relay-restart.done`, "utf8"),
+              ) as Record<string, unknown>;
+            } catch {
+              return null;
+            }
+          },
+          { timeout: 90_000 },
+        )
+        .toMatchObject({ schemaVersion: 1, relayGeneration: 2 });
+    }
+    recovered = await page.evaluate(
+      async (profile) => globalThis.relayTestApi.runW2DurableRecover(profile),
+      profileId,
+    );
+    recoveryAttempts += 1;
+  }
   expect(recovered.failureCode, JSON.stringify(recovered)).toBeNull();
-  expect(recovered.revision).toBe(crashCut === undefined ? 3 : 4);
+  const expectedRevision = crashCut !== undefined || retryFault ? 4 : 3;
+  const expectedCounterStart = crashCut !== undefined || retryFault ? 512 : 256;
+  const expectedCounterEnd = crashCut !== undefined || retryFault ? 768 : 512;
+  expect(recovered.revision).toBe(expectedRevision);
   expect(recovered.preActivationNetworkLocked).toBe(true);
   expect(recovered.reloadStatus).toBe("revoked");
   expect(recovered.business).toMatchObject({
     durablePromoted: true,
     durableRestored: true,
     reconnectAuthenticated: true,
-    counterReservationStart: crashCut === undefined ? 256 : 512,
-    counterReservationEnd: crashCut === undefined ? 512 : 768,
+    counterReservationStart: expectedCounterStart,
+    counterReservationEnd: expectedCounterEnd,
     restartMarkerObserved: true,
     revocationReceiptCommitted: true,
     revocationTerminalVerified: true,
@@ -592,10 +650,25 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page, c
     pairedPresent: false,
     kekPresent: false,
     revokedPresent: true,
-    revision: crashCut === undefined ? 3 : 4,
+    revision: expectedRevision,
     ciphertextBytes: 0,
   });
-  expect(recovered.binaryFramesSent).toBeGreaterThanOrEqual(8);
+  expect(recovered.binaryFramesSent).toBeGreaterThanOrEqual(retryFault ? 7 : 8);
+  if (networkFault !== undefined) {
+    await writeFile(
+      `${coordinationDir}/network-fault.evidence.json`,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        mode: networkFault,
+        firstFailureCode,
+        recoveryAttempts,
+        finalRevision: expectedRevision,
+        counterReservationStart: expectedCounterStart,
+        counterReservationEnd: expectedCounterEnd,
+      })}\n`,
+      { flag: "wx", mode: 0o600 },
+    );
+  }
   await expect(page.locator("#w2-status")).toHaveText("W2c reload/reconnect/revoke 闭环通过");
   await expect
     .poll(

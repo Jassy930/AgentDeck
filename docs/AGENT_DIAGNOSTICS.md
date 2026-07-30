@@ -44,7 +44,7 @@ agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge
 stable UDS。diagnostics report 不启动 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志；不要把
 diagnostics override 当成 stable ownership 配置。
 
-## Relay Web Test Companion W0–W3.4 failure codes
+## Relay Web Test Companion W0–W3.5 failure codes
 
 W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，尚未连接 Relay。以下 code 只在本地
 测试 host 中出现；它们不进入 daemon diagnostic log，也不能解释为远端业务失败：
@@ -124,6 +124,8 @@ daemon diagnostic log：
 | `web.remote.test.chrome_pid_missing` / `chrome_cdp_timeout` / `chrome_exited` | W3.4 runner-owned Chrome 未取得主 PID、CDP 未就绪或在连接前退出 | 核对系统 Chrome executable、独立 user-data-dir 和端口；不能退回 Playwright 普通 close 模拟 crash |
 | `web.remote.test.chrome_kill_timeout` / `chrome_already_terminal` | 精确 process-group `SIGKILL` 未在窗口内读回，或同一 managed process 被重复终止 | 保留 PID/PGID 证据并停止本轮；禁止按全局进程名杀浏览器或把 TERM/close 写成 crash PASS |
 | `web.remote.durable.pending_business_checkpoint_incomplete` | prompt cut 冷启动未在 daemon restart 前完成原 pending approval 与 command | 保留 encrypted profile 和 host ledger；不能先重启 daemon 后把合法 `Expired` 改写或伪报为 Applied |
+| `web.remote.test.fault_proxy_config_invalid` | W3.5 代理 listen/target/control/mode 不完整或越界 | 停止本轮；只允许 runner 生成的 loopback 端口、0700 control dir 与 disconnect/delay/relayRestart 三种 mode |
+| `web.remote.connection_closed` / `connection_failed` | 透明代理切断 TCP，或真实 Relay restart 关闭当前恢复连接 | 查看 proxy byte/connection evidence 与 durable revision；disconnect 可由 bounded reconnect 收敛，Relay restart 的首轮必须保留 active material 后再恢复 |
 | `web.remote.storage.counterGuardRecoveryFailed` / `pairedCommitmentMismatch` | Pending 收口后未读回 Stable exact state，或解密 plaintext 的 SHA-256 与 sealed commitment 不一致 | 停止旧 identity；保留 profile 取证，不能回退旧 revision 或重新配对掩盖 |
 | `web.remote.durable.reconnect_timeout` / `recovery_timeout` | reload 后认证或 Catalog/Conversation recovery 未在有界窗口完成 | 读取 `recoveryStage` 与 host generation；不要用固定 sleep、无限重试或重新配对掩盖 cursor/gap 错误 |
 | `web.remote.durable.revocation_terminal_missing` | self-revoke 后未验证 MachineRoot-signed terminal | 保留材料，不执行删除；directed receipt 或 socket close 都不能单独充当权威 terminal |
@@ -168,6 +170,9 @@ W3.3 失败用 `--contention`，同时核对第二 tab acquire、主 tab relinqu
 W3.4 失败用 `--browser-kills`，核对 prompt/approval/reconnect cut、主 PID、`SIGKILL` readback、同一 profile、
 revision/reservation 与 host exactly-once 计数。若第二次 recovery 停在 marker 之后，确认 durable
 `restartMarkerObserved` 随 catalog cursor 单调保留，不能倒退 cursor 重放旧 marker。
+W3.5 失败用 `--network-faults`，核对 proxy `parsedProtocol=false`、armed connection/byte count、delay 次数、
+Relay generation 与 machine-link readiness。真实 Relay restart 后必须等 lifecycle active、catalog stream `1`、
+transition `0`，不能用固定 sleep；proxy 关闭时不得丢弃尚在延迟队列中的 signed terminal。
 测试结束必须停止静态 server、关闭 tab/profile、Relay/daemon 并删除本轮精确临时 root；cleanup 不使用
 全局浏览器数据或全局进程名删除。
 

@@ -10,6 +10,7 @@ crash_cuts_runner="$repo_root/scripts/run-relay-web-companion-crash-cuts-e2e.sh"
 state_cuts_runner="$repo_root/scripts/run-relay-web-companion-state-cuts-e2e.sh"
 contention_runner="$repo_root/scripts/run-relay-web-companion-contention-e2e.sh"
 browser_kills_runner="$repo_root/scripts/run-relay-web-companion-browser-kills-e2e.sh"
+network_faults_runner="$repo_root/scripts/run-relay-web-companion-network-faults-e2e.sh"
 
 bash -n "$runner"
 bash -n "$pairing_runner"
@@ -19,6 +20,7 @@ bash -n "$crash_cuts_runner"
 bash -n "$state_cuts_runner"
 bash -n "$contention_runner"
 bash -n "$browser_kills_runner"
+bash -n "$network_faults_runner"
 
 all_case="$(sed -n '/^[[:space:]]*--all)/,/^[[:space:]]*;;/p' "$runner")"
 printf '%s\n' "$all_case" | grep -Fq 'run_contract' \
@@ -71,6 +73,14 @@ printf '%s\n' "$browser_kills_case" | grep -Fq 'run_browser_kills' \
 for cut in prompt approval reconnect; do
   grep -Fq "$cut" "$browser_kills_runner" \
     || { printf 'browser-kill runner omitted %s\n' "$cut" >&2; exit 1; }
+done
+
+network_faults_case="$(sed -n '/^[[:space:]]*--network-faults)/,/^[[:space:]]*;;/p' "$runner")"
+printf '%s\n' "$network_faults_case" | grep -Fq 'run_network_faults' \
+  || { printf 'runner --network-faults omitted network-fault gate\n' >&2; exit 1; }
+for fault in disconnect delay relayRestart; do
+  grep -Fq "$fault" "$network_faults_runner" \
+    || { printf 'network-fault runner omitted %s\n' "$fault" >&2; exit 1; }
 done
 
 for cut in stateGuardPendingDurable stateDurable guardStableDurable; do

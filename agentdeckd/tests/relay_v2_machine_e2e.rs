@@ -107,6 +107,9 @@ const P57_HOST_R43_SCENARIO: &str = "r43-business";
 const P57_HOST_R44_SCENARIO: &str = "r44-lifecycle";
 const P57_HOST_R43_CONVERSATION_TITLE: &str = "R4.3 synthetic Codex";
 const P57_HOST_R44_RESTART_MARKER_TITLE: &str = "R4.4 daemon restart marker";
+const P57_HOST_RELAY_BIND_ENV: &str = "AGENTDECK_P57_RELAY_BIND";
+const P57_HOST_RELAY_HEALTH_BIND_ENV: &str = "AGENTDECK_P57_RELAY_HEALTH_BIND";
+const P57_HOST_PUBLIC_WSS_URL_ENV: &str = "AGENTDECK_P57_PUBLIC_WSS_URL";
 const P57_HOST_MAX_COMMAND_BYTES: usize = 4 * 1_024;
 const P57_HOST_MAX_WAIT_MS: u64 = 120_000;
 static P57_HOST_OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
@@ -142,6 +145,35 @@ fn p57_host_scenario() -> Option<&'static str> {
         Ok(other) => panic!("unsupported P5.7 host scenario: {other}"),
         Err(env::VarError::NotUnicode(_)) => panic!("P5.7 host scenario must be UTF-8"),
     }
+}
+
+fn p57_relay_override() -> Option<(SocketAddr, SocketAddr, String)> {
+    let bind = env::var(P57_HOST_RELAY_BIND_ENV).ok();
+    let health_bind = env::var(P57_HOST_RELAY_HEALTH_BIND_ENV).ok();
+    let public_wss_url = env::var(P57_HOST_PUBLIC_WSS_URL_ENV).ok();
+    let (bind, health_bind, public_wss_url) = match (bind, health_bind, public_wss_url) {
+        (None, None, None) => return None,
+        (Some(bind), Some(health_bind), Some(public_wss_url)) => {
+            (bind, health_bind, public_wss_url)
+        }
+        _ => {
+            panic!("P5.7 Relay override must provide bind, health bind and public WSS URL together")
+        }
+    };
+    let bind = bind.parse::<SocketAddr>().expect("parse P5.7 Relay bind");
+    let health_bind = health_bind
+        .parse::<SocketAddr>()
+        .expect("parse P5.7 Relay health bind");
+    assert!(bind.ip().is_loopback() && bind.port() != 0);
+    assert!(health_bind.ip().is_loopback() && health_bind.port() != 0);
+    let public_port = public_wss_url
+        .strip_prefix("wss://localhost:")
+        .and_then(|value| value.strip_suffix('/'))
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .expect("P5.7 public WSS URL must be an exact localhost root origin");
+    assert_ne!(public_port, bind.port());
+    Some((bind, health_bind, public_wss_url))
 }
 
 fn remote_cli_access_group() -> String {
@@ -308,11 +340,29 @@ async fn start_relay(
     ),
     RelayV2ServerError,
 > {
+    let (bind, health_bind) = reserve_loopback_ports();
+    let public_wss_url = format!("wss://localhost:{}/", bind.port());
+    let config = build_relay_config(root, bind, health_bind, public_wss_url).await;
+    let handle = RelayV2ServerHandle::start(config).await?;
+    let bundle = create_relay_enrollment_bundle(
+        handle
+            .admin_socket_path()
+            .expect("test Relay keeps its admin socket"),
+    )
+    .await;
+    Ok((handle, bundle))
+}
+
+async fn build_relay_config(
+    root: &Path,
+    bind: SocketAddr,
+    health_bind: SocketAddr,
+    public_wss_url: String,
+) -> RelayV2ServerConfig {
     let (cert, key) = write_localhost_tls_identity(root);
     let identity = load_tls_identity(&TlsIdentityPaths::new(&cert, &key))
         .await
         .expect("load Relay test TLS identity");
-    let (bind, health_bind) = reserve_loopback_ports();
     let admin_dir = root.join("relay-admin");
     fs::create_dir(&admin_dir).expect("create Relay admin directory");
     fs::set_permissions(&admin_dir, fs::Permissions::from_mode(0o700))
@@ -321,8 +371,7 @@ async fn start_relay(
     let mut store = RelayV2StoreSettings::new(root.join("relay-store/relay.db"));
     store.disk_reserve_bytes = 0;
     store.disk_reserve_percent = 0;
-    let public_wss_url = format!("wss://localhost:{}/", bind.port());
-    let handle = RelayV2ServerHandle::start(RelayV2ServerConfig {
+    RelayV2ServerConfig {
         bind,
         health_bind,
         store,
@@ -334,9 +383,13 @@ async fn start_relay(
         }),
         receipt_signing_key: write_receipt_signing_key(root),
         log_level: "info".to_owned(),
-    })
-    .await?;
-    let response = AdminClient::new(admin_socket)
+    }
+}
+
+async fn create_relay_enrollment_bundle(
+    admin_socket: &Path,
+) -> agentdeck_protocol::relay_v2::EnrollmentBundleV2 {
+    let response = AdminClient::new(admin_socket.to_path_buf())
         .request(&AdminRequest::MachineEnrollCreate {})
         .await
         .expect("create one-shot machine enrollment bundle");
@@ -346,7 +399,7 @@ async fn start_relay(
     let AdminResult::EnrollmentBundle { bundle } = *result else {
         panic!("Relay admin returned unrelated result");
     };
-    Ok((handle, bundle))
+    bundle
 }
 
 fn stable_daemon_config(root: &Path) -> DaemonConfig {
@@ -2296,6 +2349,10 @@ enum P57HostCommand {
         #[serde(rename = "markerBeforeReadiness", default)]
         marker_before_readiness: bool,
     },
+    RestartRelay {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     Shutdown {
         #[serde(rename = "requestId")]
         request_id: String,
@@ -2333,6 +2390,15 @@ struct P57HostReady {
     scenario: Option<&'static str>,
     conversation_id: Option<String>,
     conversation_title: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct P57HostRelayRestarted<'a> {
+    kind: &'static str,
+    protocol: &'static str,
+    request_id: &'a str,
+    relay_generation: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -3412,13 +3478,34 @@ async fn p57_real_dual_scope_ndjson_host() {
         .expect("P5.7 host temp root");
     let root_path = fs::canonicalize(root.path()).expect("canonicalize P5.7 host temp root");
     let relay_db = root_path.join("relay-store/relay.db");
-    let (relay, bundle) = start_relay(&root_path)
-        .await
-        .expect("start real P5.7 host Relay Direct TLS server");
+    let (relay_bind, relay_health_bind, public_wss_url) =
+        p57_relay_override().unwrap_or_else(|| {
+            let (bind, health_bind) = reserve_loopback_ports();
+            (
+                bind,
+                health_bind,
+                format!("wss://localhost:{}/", bind.port()),
+            )
+        });
+    let relay_config =
+        build_relay_config(&root_path, relay_bind, relay_health_bind, public_wss_url).await;
+    let mut relay = Some(
+        RelayV2ServerHandle::start(relay_config.clone())
+            .await
+            .expect("start real P5.7 host Relay Direct TLS server"),
+    );
+    let bundle = create_relay_enrollment_bundle(
+        relay
+            .as_ref()
+            .and_then(|handle| handle.admin_socket_path())
+            .expect("P5.7 Relay keeps its admin socket"),
+    )
+    .await;
     let config = stable_daemon_config(&root_path);
     let daemon_keys = Arc::new(MemoryKeyStore::new());
     let local_home = root_path.join("runtime-host-client-home");
     let mut daemon_generation = 1_u64;
+    let mut relay_generation = 1_u64;
     let mut daemon =
         Some(start_p57_daemon_instance(&config, daemon_keys.clone(), &local_home).await);
     let initial_daemon = daemon.as_ref().expect("initial P5.7 daemon is present");
@@ -3544,6 +3631,7 @@ async fn p57_real_dual_scope_ndjson_host() {
             | P57HostCommand::WaitFor { request_id, .. }
             | P57HostCommand::ApprovePendingPairing { request_id }
             | P57HostCommand::RestartDaemon { request_id, .. }
+            | P57HostCommand::RestartRelay { request_id }
             | P57HostCommand::Shutdown { request_id } => request_id,
         };
         if request_id.is_empty()
@@ -3806,6 +3894,27 @@ async fn p57_real_dual_scope_ndjson_host() {
                     evidence,
                 });
             }
+            P57HostCommand::RestartRelay { request_id } => {
+                let previous = relay.take().expect("P5.7 Relay is present before restart");
+                previous
+                    .shutdown()
+                    .await
+                    .expect("shutdown P5.7 Relay before restart");
+                relay_generation = relay_generation
+                    .checked_add(1)
+                    .expect("P5.7 Relay generation remains bounded");
+                relay = Some(
+                    RelayV2ServerHandle::start(relay_config.clone())
+                        .await
+                        .expect("restart P5.7 Relay on the exact endpoint and store"),
+                );
+                emit_p57_host_record(&P57HostRelayRestarted {
+                    kind: "restartRelay",
+                    protocol: P57_HOST_PROTOCOL,
+                    request_id: &request_id,
+                    relay_generation,
+                });
+            }
             P57HostCommand::Shutdown { request_id } => {
                 shutdown_request_id = Some(request_id);
                 break;
@@ -3822,6 +3931,8 @@ async fn p57_real_dual_scope_ndjson_host() {
     let final_socket = final_daemon.socket.clone();
     final_daemon.shutdown().await;
     relay
+        .take()
+        .expect("P5.7 Relay is present for shutdown")
         .shutdown()
         .await
         .expect("shutdown P5.7 host Relay server");

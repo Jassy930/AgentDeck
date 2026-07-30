@@ -17,13 +17,18 @@ crash_cut="${AGENTDECK_W3_CRASH_CUT:-}"
 state_cut="${AGENTDECK_W3_STATE_CUT:-}"
 contention_mode="${AGENTDECK_W3_CONTENTION:-0}"
 browser_kill_cut="${AGENTDECK_W3_BROWSER_KILL_CUT:-}"
+network_fault="${AGENTDECK_W3_NETWORK_FAULT:-}"
 [[ "$contention_mode" == "0" || "$contention_mode" == "1" ]] \
   || { printf 'AGENTDECK_W3_CONTENTION must be 0 or 1\n' >&2; exit 64; }
 case "$browser_kill_cut" in
   ""|prompt|approval|reconnect) ;;
   *) printf 'invalid AGENTDECK_W3_BROWSER_KILL_CUT: %s\n' "$browser_kill_cut" >&2; exit 64 ;;
 esac
-if (( (${#crash_cut} > 0) + (${#state_cut} > 0) + (contention_mode == 1) + (${#browser_kill_cut} > 0) > 1 )); then
+case "$network_fault" in
+  ""|disconnect|delay|relayRestart) ;;
+  *) printf 'invalid AGENTDECK_W3_NETWORK_FAULT: %s\n' "$network_fault" >&2; exit 64 ;;
+esac
+if (( (${#crash_cut} > 0) + (${#state_cut} > 0) + (contention_mode == 1) + (${#browser_kill_cut} > 0) + (${#network_fault} > 0) > 1 )); then
   printf 'only one W3 fault family may be selected\n' >&2
   exit 64
 fi
@@ -55,11 +60,22 @@ if [[ -n "$browser_kill_cut" ]]; then
     || { printf 'AGENTDECK_W3_BROWSER_KILL_CUT requires --durable\n' >&2; exit 64; }
   gate_label="W3.4/$browser_kill_cut"
 fi
+if [[ -n "$network_fault" ]]; then
+  [[ "$run_mode" == "durable" ]] \
+    || { printf 'AGENTDECK_W3_NETWORK_FAULT requires --durable\n' >&2; exit 64; }
+  gate_label="W3.5/$network_fault"
+fi
 
 fail() {
   printf 'relay web companion %s: FAIL: %s\n' "$gate_label" "$1" >&2
   if [[ -n "${browser_log:-}" && -f "$browser_log" ]]; then
     tail -n 80 "$browser_log" >&2 || true
+  fi
+  if [[ -n "${proxy_log:-}" && -f "$proxy_log" ]]; then
+    tail -n 80 "$proxy_log" >&2 || true
+  fi
+  if [[ -n "${coordination_dir:-}" && -f "$coordination_dir/proxy.evidence.json" ]]; then
+    tail -n 1 "$coordination_dir/proxy.evidence.json" >&2 || true
   fi
   if [[ -n "${host_stderr:-}" && -f "$host_stderr" ]]; then
     tail -n 80 "$host_stderr" >&2 || true
@@ -84,6 +100,7 @@ host_output="$runner_root/host.stdout"
 host_stderr="$runner_root/host.stderr"
 host_transcript="$runner_root/host-transcript.log"
 browser_log="$runner_root/browser.log"
+proxy_log="$runner_root/fault-proxy.log"
 coordination_dir="$runner_root/w2c-coordination"
 profile_id="w2c-e2e"
 mkdir -m 700 "$coordination_dir"
@@ -91,6 +108,7 @@ mkdir -m 700 "$coordination_dir"
 cargo_pid=""
 host_pid=""
 browser_pid=""
+proxy_pid=""
 host_root=""
 host_invite=""
 host_socket=""
@@ -137,8 +155,13 @@ cleanup() {
     terminate_tree "$cargo_pid"
     wait_until_absent "$cargo_pid" 5 || kill -KILL "$cargo_pid" >/dev/null 2>&1 || true
   fi
+  if pid_is_running "$proxy_pid"; then
+    terminate_tree "$proxy_pid"
+    wait_until_absent "$proxy_pid" 5 || kill -KILL "$proxy_pid" >/dev/null 2>&1 || true
+  fi
   [[ -z "$browser_pid" ]] || wait "$browser_pid" >/dev/null 2>&1 || true
   [[ -z "$cargo_pid" ]] || wait "$cargo_pid" >/dev/null 2>&1 || true
+  [[ -z "$proxy_pid" ]] || wait "$proxy_pid" >/dev/null 2>&1 || true
   exec 3>&- || true
   exec 4>&- || true
   case "$host_root" in
@@ -212,6 +235,50 @@ send_host_command() {
   bun run build:w2
 )
 
+proxy_port=""
+relay_direct_port=""
+relay_health_port=""
+if [[ -n "$network_fault" ]]; then
+  ports_json="$(bun -e '
+    import { createServer } from "node:net";
+    const reserve = () => new Promise((resolve, reject) => {
+      const server = createServer();
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        if (address === null || typeof address === "string") throw new Error("invalid address");
+        const port = address.port;
+        server.close((error) => error === undefined ? resolve(port) : reject(error));
+      });
+    });
+    console.log(JSON.stringify(await Promise.all([reserve(), reserve(), reserve()])));
+  ')"
+  proxy_port="$(printf '%s\n' "$ports_json" | jq -er '.[0]')"
+  relay_direct_port="$(printf '%s\n' "$ports_json" | jq -er '.[1]')"
+  relay_health_port="$(printf '%s\n' "$ports_json" | jq -er '.[2]')"
+  env \
+    AGENTDECK_W3_PROXY_LISTEN_PORT="$proxy_port" \
+    AGENTDECK_W3_PROXY_TARGET_PORT="$relay_direct_port" \
+    AGENTDECK_W3_PROXY_CONTROL_DIR="$coordination_dir" \
+    AGENTDECK_W3_NETWORK_FAULT="$network_fault" \
+    bun run "$web_root/tests/browser/fault-proxy.ts" >"$proxy_log" 2>&1 &
+  proxy_pid=$!
+  proxy_deadline=$(( $(date +%s) + 15 ))
+  while [[ ! -f "$coordination_dir/proxy.ready.json" ]]; do
+    pid_is_running "$proxy_pid" || fail "fault proxy exited before ready"
+    [[ "$(date +%s)" -lt "$proxy_deadline" ]] || fail "fault proxy ready timeout"
+    sleep 0.1
+  done
+  jq -e \
+    --argjson listen "$proxy_port" \
+    --argjson target "$relay_direct_port" \
+    --arg mode "$network_fault" '
+      .schemaVersion == 1 and .listenPort == $listen and .targetPort == $target
+      and .mode == $mode and .parsedProtocol == false
+    ' "$coordination_dir/proxy.ready.json" >/dev/null \
+    || fail "fault proxy ready evidence is invalid"
+fi
+
 mkfifo "$host_input" "$host_output"
 exec 3<>"$host_input"
 exec 4<>"$host_output"
@@ -224,6 +291,13 @@ if [[ "$run_mode" == "business" ]]; then
   host_environment+=("AGENTDECK_P57_HOST_SCENARIO=r43-business")
 elif [[ "$run_mode" == "durable" ]]; then
   host_environment+=("AGENTDECK_P57_HOST_SCENARIO=r44-lifecycle")
+fi
+if [[ -n "$network_fault" ]]; then
+  host_environment+=(
+    "AGENTDECK_P57_RELAY_BIND=127.0.0.1:$relay_direct_port"
+    "AGENTDECK_P57_RELAY_HEALTH_BIND=127.0.0.1:$relay_health_port"
+    "AGENTDECK_P57_PUBLIC_WSS_URL=wss://localhost:$proxy_port/"
+  )
 fi
 env -u AGENTDECK_P57_HOST_SCENARIO "${host_environment[@]}" \
   cargo test -p agentdeckd --test relay_v2_machine_e2e \
@@ -301,6 +375,7 @@ browser_grep="W2a real browser pairing"
       "AGENTDECK_W3_BROWSER_PROFILE_ROOT=$runner_root/chrome-profile-$browser_kill_cut"
     )
   fi
+  [[ -z "$network_fault" ]] || browser_environment+=("AGENTDECK_W3_NETWORK_FAULT=$network_fault")
   env "${browser_environment[@]}" \
     bun run test:browser:built -- \
     --grep "$browser_grep"
@@ -379,6 +454,12 @@ if [[ "$run_mode" == "durable" ]]; then
     and .evidence.machineRemoteLifecycle == "active"
     and .evidence.relayGrantActive == 1
   ' >/dev/null || fail "daemon base readiness was not exact"
+  if [[ -n "$network_fault" ]]; then
+    printf '%s\n' "{\"schemaVersion\":1,\"mode\":\"$network_fault\"}" \
+      >"$coordination_dir/proxy.arm.tmp"
+    chmod 600 "$coordination_dir/proxy.arm.tmp"
+    mv "$coordination_dir/proxy.arm.tmp" "$coordination_dir/proxy.arm"
+  fi
   printf '%s\n' '{"markerBeforeReadiness":true}' >"$coordination_dir/restart.begin.tmp"
   chmod 600 "$coordination_dir/restart.begin.tmp"
   mv "$coordination_dir/restart.begin.tmp" "$coordination_dir/restart.begin"
@@ -401,6 +482,41 @@ if [[ "$run_mode" == "durable" ]]; then
   }' >"$restart_tmp"
   chmod 600 "$restart_tmp"
   mv "$restart_tmp" "$coordination_dir/restart.done"
+  if [[ "$network_fault" == "relayRestart" ]]; then
+    proxy_trigger_deadline=$(( $(date +%s) + 60 ))
+    while ! jq -e '.faultTriggered == true' "$coordination_dir/proxy.evidence.json" \
+      >/dev/null 2>&1; do
+      pid_is_running "$browser_pid" || fail "browser exited before Relay restart trigger"
+      pid_is_running "$proxy_pid" || fail "fault proxy exited before Relay restart trigger"
+      [[ "$(date +%s)" -lt "$proxy_trigger_deadline" ]] \
+        || fail "fault proxy did not trigger Relay restart"
+      sleep 0.1
+    done
+    relay_restart_request="w35-relay-restart-$generation"
+    send_host_command \
+      "{\"op\":\"restartRelay\",\"requestId\":\"$relay_restart_request\"}" \
+      || fail "could not request Relay restart"
+    read_host_json restartRelay "$relay_restart_request" 75 || fail "Relay restart readback failed"
+    printf '%s\n' "$host_record" | jq -e '.relayGeneration == 2' >/dev/null \
+      || fail "Relay restart generation was not exact"
+    relay_ready_request="w35-relay-ready-$generation"
+    send_host_command \
+      "{\"op\":\"waitFor\",\"requestId\":\"$relay_ready_request\",\"condition\":\"restartBaseReady\",\"timeoutMs\":60000}" \
+      || fail "could not request post-Relay-restart readiness"
+    read_host_json waitFor "$relay_ready_request" 75 \
+      || fail "post-Relay-restart readiness readback failed"
+    printf '%s\n' "$host_record" | jq -e '
+      .satisfied == true and .evidence.daemonGeneration == 2
+      and .evidence.machineRemoteLifecycle == "active"
+      and .evidence.activeTransitionCount == 0
+      and .evidence.activeCatalogStreamCount == 1
+      and .evidence.relayGrantActive == 1
+    ' >/dev/null || fail "post-Relay-restart machine link was not ready"
+    printf '%s\n' '{"schemaVersion":1,"relayGeneration":2}' \
+      >"$coordination_dir/relay-restart.done.tmp"
+    chmod 600 "$coordination_dir/relay-restart.done.tmp"
+    mv "$coordination_dir/relay-restart.done.tmp" "$coordination_dir/relay-restart.done"
+  fi
 fi
 
 browser_timeout=150
@@ -449,6 +565,50 @@ if [[ -n "$browser_kill_cut" ]]; then
       and .counterReservationEnd == $counterEnd
     ' "$browser_kill_evidence" >/dev/null \
     || fail "browser kill evidence is not exact"
+fi
+if [[ -n "$network_fault" ]]; then
+  network_fault_evidence="$coordination_dir/network-fault.evidence.json"
+  proxy_evidence="$coordination_dir/proxy.evidence.json"
+  [[ -f "$network_fault_evidence" && ! -L "$network_fault_evidence" ]] \
+    || fail "network fault browser evidence is missing"
+  [[ -f "$proxy_evidence" && ! -L "$proxy_evidence" ]] \
+    || fail "network fault proxy evidence is missing"
+  [[ "$(stat -f '%Lp' "$network_fault_evidence")" == "600" ]] \
+    || fail "network fault browser evidence mode is not 0600"
+  [[ "$(stat -f '%Lp' "$proxy_evidence")" == "600" ]] \
+    || fail "network fault proxy evidence mode is not 0600"
+  expected_fault_revision=4
+  expected_fault_counter_start=512
+  expected_fault_counter_end=768
+  expected_fault_attempts=2
+  if [[ "$network_fault" != "relayRestart" ]]; then
+    expected_fault_revision=3
+    expected_fault_counter_start=256
+    expected_fault_counter_end=512
+    expected_fault_attempts=1
+  fi
+  jq -e \
+    --arg mode "$network_fault" \
+    --argjson revision "$expected_fault_revision" \
+    --argjson counterStart "$expected_fault_counter_start" \
+    --argjson counterEnd "$expected_fault_counter_end" \
+    --argjson attempts "$expected_fault_attempts" '
+      .schemaVersion == 1 and .mode == $mode and .recoveryAttempts == $attempts
+      and .finalRevision == $revision and .counterReservationStart == $counterStart
+      and .counterReservationEnd == $counterEnd
+      and (if $mode == "relayRestart" then
+             (.firstFailureCode | type == "string" and length > 0)
+           else .firstFailureCode == null end)
+    ' "$network_fault_evidence" >/dev/null \
+    || fail "network fault browser evidence is not exact"
+  jq -e --arg mode "$network_fault" '
+      .schemaVersion == 1 and .mode == $mode and .parsedProtocol == false
+      and .faultTriggered == true and (.faultConnectionId | type == "number" and . > 0)
+      and (.connectionCount >= 4)
+      and (.clientToServerBytes + .serverToClientBytes >= 2048)
+      and (if $mode == "delay" then .delayApplications > 0 else .delayApplications == 0 end)
+    ' "$proxy_evidence" >/dev/null \
+    || fail "network fault proxy evidence is not exact"
 fi
 if [[ "$run_mode" != "pairing" ]] && grep -aEq \
   'web-w2b-prompt-7fb7f299|synthetic Codex response|synthetic codex approval|R4.4 daemon restart marker' "$browser_log"; then
@@ -531,6 +691,16 @@ host_graceful=1
 [[ ! -e "$host_socket" ]] || fail "Runtime socket remains after shutdown"
 [[ ! -e "$host_root" ]] || fail "host root remains after shutdown"
 [[ ! -e "$web_root/test-results" ]] || fail "Playwright artifacts remain after PASS"
+if [[ -n "$proxy_pid" ]]; then
+  terminate_tree "$proxy_pid"
+  wait_until_absent "$proxy_pid" 10 || fail "fault proxy remains after shutdown"
+  set +e
+  wait "$proxy_pid"
+  proxy_status=$?
+  set -e
+  [[ "$proxy_status" -eq 0 ]] || fail "fault proxy exited $proxy_status"
+  proxy_pid=""
+fi
 
 rm -rf "$runner_root"
 cleanup_started=1
@@ -556,6 +726,13 @@ if [[ "$run_mode" == "durable" ]]; then
       reservation_start=512
       reservation_end=768
     fi
+  elif [[ -n "$network_fault" ]]; then
+    gate="relay-web-companion-w3-network-fault"
+    if [[ "$network_fault" == "relayRestart" ]]; then
+      durable_revision=4
+      reservation_start=512
+      reservation_end=768
+    fi
   fi
   jq -cn \
     --arg gate "$gate" \
@@ -563,10 +740,12 @@ if [[ "$run_mode" == "durable" ]]; then
     --arg stateCut "$state_cut" \
     --argjson writerContention "$contention_mode" \
     --arg browserKillCut "$browser_kill_cut" \
+    --arg networkFault "$network_fault" \
+    --argjson relayGeneration "$([[ "$network_fault" == "relayRestart" ]] && printf 2 || printf 1)" \
     --argjson durableRevision "$durable_revision" \
     --argjson counterReservationStart "$reservation_start" \
     --argjson counterReservationEnd "$reservation_end" \
-    '{schemaVersion:1,gate:$gate,status:"PASS",crashCut:(if ($crashCut | length) > 0 then $crashCut else null end),stateCut:(if ($stateCut | length) > 0 then $stateCut else null end),writerContention:($writerContention == 1),browserKillCut:(if ($browserKillCut | length) > 0 then $browserKillCut else null end),daemonGeneration:2,durableRevision:$durableRevision,counterReservationStart:$counterReservationStart,counterReservationEnd:$counterReservationEnd,catalogBackfillObserved:true,runtimeCommandCount:1,runtimeCompletedCommandCount:1,runtimeApprovalTotal:1,runtimeApprovalApplied:1,runtimeRevokedAuthorizationCount:1,relayGrantActive:0,relayPlaintextAbsent:true,browserPlaintextAbsent:true,cleanup:{pairedMaterialAbsent:true,kekAbsent:true,revokedTombstonePresent:true,counterGuardAbsent:true,browserAbsent:true,hostPidAbsent:true,hostRootAbsent:true,inviteAbsent:true,socketAbsent:true,playwrightArtifactsAbsent:true}}'
+    '{schemaVersion:1,gate:$gate,status:"PASS",crashCut:(if ($crashCut | length) > 0 then $crashCut else null end),stateCut:(if ($stateCut | length) > 0 then $stateCut else null end),writerContention:($writerContention == 1),browserKillCut:(if ($browserKillCut | length) > 0 then $browserKillCut else null end),networkFault:(if ($networkFault | length) > 0 then $networkFault else null end),daemonGeneration:2,relayGeneration:$relayGeneration,durableRevision:$durableRevision,counterReservationStart:$counterReservationStart,counterReservationEnd:$counterReservationEnd,catalogBackfillObserved:true,runtimeCommandCount:1,runtimeCompletedCommandCount:1,runtimeApprovalTotal:1,runtimeApprovalApplied:1,runtimeRevokedAuthorizationCount:1,relayGrantActive:0,relayPlaintextAbsent:true,browserPlaintextAbsent:true,cleanup:{pairedMaterialAbsent:true,kekAbsent:true,revokedTombstonePresent:true,counterGuardAbsent:true,browserAbsent:true,proxyAbsent:true,hostPidAbsent:true,hostRootAbsent:true,inviteAbsent:true,socketAbsent:true,playwrightArtifactsAbsent:true}}'
 elif [[ "$run_mode" == "business" ]]; then
   printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2b","status":"PASS","preConfirmNetworkLocked":true,"pendingPairingCount":0,"relayGrantTotal":1,"relayGrantActive":1,"activeTransitionCount":0,"activeCatalogStreamCount":1,"runtimeCommandCount":1,"runtimeCompletedCommandCount":1,"runtimeApprovalTotal":1,"runtimeApprovalApplied":1,"relayPlaintextAbsent":true,"browserPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'
 else

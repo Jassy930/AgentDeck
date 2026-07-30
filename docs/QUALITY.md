@@ -20,7 +20,7 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
-## Relay Web Test Companion W0–W3.4 门禁（2026-07-30）
+## Relay Web Test Companion W0–W3.5 门禁（2026-07-30）
 
 W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
 `web/relay-test-companion/` 后运行：
@@ -147,7 +147,7 @@ authorization 四项 SQLite 计数，并证明后到 resolve 与 Applied Retry �
 W2c PASS 关闭单轮 durable 正向链路，W2.7 PASS 关闭 negative/zero-mutation matrix。W2.8 还必须在同一
 candidate 上通过 `--all` 与 `verify-relay-companion-mvp.sh p5`；当前两者已 PASS，因此 W2 automatic overall
 complete。W3.1/W3.2 两类 deterministic crash cut 与 W3.3 第二 tab/generation 隔离已通过；
-W3.4 真实 browser kill 已完成；W3.5–W3.7 的网络故障、三次 fresh run与双路终审尚未完成。
+W3.4 真实 browser kill 与 W3.5 网络故障已完成；W3.6–W3.7 的三次 fresh run与双路终审尚未完成。
 
 W3.1 独立门禁如下；它不会提前执行 W3.2 之后的 tab contention、故障代理或三次 fresh run：
 
@@ -199,6 +199,19 @@ pending approval，再进入 restart/recovery/revoke；prompt/reconnect 最终 r
 `512→768`，approval 最终 revision `3`、reservation `256→512`。三轮 host 均要求 command/completed 与
 approval total/applied 各 `1/1`、revoke `1`、active grant `0`，且 Relay/browser plaintext 和所有 runner
 artifact absent。
+
+W3.5 独立门禁如下：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --network-faults
+```
+
+三轮都必须通过 runner-owned TCP 透明代理，Relay TLS/SPKI 端到端不终止，proxy evidence 必须
+`parsedProtocol=false`。disconnect 在 armed connection 累计 2 KiB 后切断并由 bounded reconnect 恢复；
+delay 对 client→Relay 每 chunk 注入 120 ms；relayRestart 必须真实关闭 generation `1`，以同
+bind/store/cert/signer 启动 generation `2`，并等 daemon machine link authenticated ready 后第二次恢复。
+前两轮 final revision `3`/reservation `256→512`，restart 为 revision `4`/`512→768`；全部要求 host
+exactly-once、active grant `0`、plaintext absent 与 proxy/browser/host artifact absent。
 
 W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED。
 
