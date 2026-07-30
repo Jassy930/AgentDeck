@@ -26,6 +26,14 @@ use agentdeck_protocol::relay_v2::{
 use agentdeck_protocol::runtime::{RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "w1-test-fixture")]
+mod w1;
+#[cfg(feature = "w1-test-fixture")]
+pub use w1::{
+    W1_SENTINEL, W1TestIdentity, W1TransportCore, W1TransportError, W1TransportFault,
+    w1_test_identity,
+};
+
 const ED_SEED: [u8; 32] = [0x01; 32];
 const AEAD_KEY: [u8; 32] = [0x11; 32];
 const NONCE_PREFIX: [u8; 4] = [0xaa, 0xbb, 0xcc, 0xdd];
@@ -383,5 +391,99 @@ mod wasm {
         let snapshot = super::w0_negative_snapshot().map_err(js_error)?;
         serde_json::to_string(&snapshot)
             .map_err(|_| js_error(super::WebCoreError::SerializationFailed))
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "w1-test-fixture"))]
+mod w1_wasm {
+    use wasm_bindgen::prelude::*;
+
+    use super::{W1TransportCore, W1TransportFault};
+    use agentdeck_protocol::relay_v2::RelayServerId;
+
+    fn js_error(error: super::W1TransportError) -> JsValue {
+        JsValue::from_str(error.code())
+    }
+
+    fn relay_server_id(bytes: &[u8]) -> Result<RelayServerId, JsValue> {
+        let bytes: [u8; 16] = bytes
+            .try_into()
+            .map_err(|_| JsValue::from_str("web.remote.server_identity_invalid"))?;
+        Ok(RelayServerId::from_bytes(bytes))
+    }
+
+    fn fault(value: &str) -> Result<W1TransportFault, JsValue> {
+        match value {
+            "none" => Ok(W1TransportFault::None),
+            "tamperChallenge" => Ok(W1TransportFault::TamperChallenge),
+            "tamperSignature" => Ok(W1TransportFault::TamperSignature),
+            _ => Err(JsValue::from_str("web.remote.fault_invalid")),
+        }
+    }
+
+    #[wasm_bindgen(js_name = W1Session)]
+    pub struct W1Session {
+        core: W1TransportCore,
+    }
+
+    #[wasm_bindgen(js_class = W1Session)]
+    impl W1Session {
+        #[wasm_bindgen(constructor)]
+        pub fn new(origin: &str, expected_relay_server_id: &[u8]) -> Result<W1Session, JsValue> {
+            let expected = relay_server_id(expected_relay_server_id)?;
+            let core = W1TransportCore::new(origin, expected).map_err(js_error)?;
+            Ok(Self { core })
+        }
+
+        #[wasm_bindgen(js_name = connectUrl)]
+        pub fn connect_url(&self) -> String {
+            self.core.connect_url().to_owned()
+        }
+
+        #[wasm_bindgen(js_name = start)]
+        pub fn start(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core.start().map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = acceptChallenge)]
+        pub fn accept_challenge(
+            &mut self,
+            bytes: &[u8],
+            fault_name: &str,
+        ) -> Result<Vec<u8>, JsValue> {
+            self.core
+                .accept_challenge(bytes, fault(fault_name)?)
+                .map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = acceptAuthenticated)]
+        pub fn accept_authenticated(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
+            self.core.accept_authenticated(bytes).map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = registerStream)]
+        pub fn register_stream(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core.register_stream().map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = publishSentinel)]
+        pub fn publish_sentinel(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core.publish_sentinel().map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = acceptActiveFrame)]
+        pub fn accept_active_frame(&mut self, bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+            self.core.accept_active_frame(bytes).map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = sentinelAccepted)]
+        pub fn sentinel_accepted(&self) -> bool {
+            self.core.sentinel_accepted()
+        }
+
+        #[wasm_bindgen(js_name = oversizeFaultFrame)]
+        pub fn oversize_fault_frame(&self) -> Vec<u8> {
+            self.core.oversize_fault_frame()
+        }
     }
 }

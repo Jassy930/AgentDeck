@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0 automatic complete；W1 尚未开始 |
+| 状态 | W0/W1 automatic complete；W2 尚未开始 |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -43,7 +43,8 @@ scripts/tests/run-relay-web-companion-e2e.sh
 docs/plans/2026-07-30-relay-web-test-companion-*.md
 ```
 
-W0 已落地前两个目录和计划文档；Relay/daemon runner 只在 W1/W2 接入真实链路时新增，W0 不提前创建空壳。
+W0 已落地前两个目录和计划文档；W1 新增统一 runner 并只接入真实 Relay `/v2/connect`，没有新增 daemon、
+业务 bridge 或 Runtime host。daemon/synthetic vendor 的完整纵向编排仍从 W2 开始。
 
 若 W0 发现必须大规模拆分 `agentdeck-cli`，先只抽取 transport-neutral state owner；不得把整个 CLI、Tokio
 transport、Keychain 或 filesystem adapter 编译进 WASM。
@@ -141,35 +142,51 @@ Authenticated 和一条 sealed sentinel route；不经过业务 bridge。
 
 ### Tasks
 
-- [ ] W1.1：实现 WebSocket host adapter，只接受 fixed root `wss://` origin，并由 WASM 固定选择
-  `/v2/connect` 或 `/v2/pair`；拒绝 path/query/fragment、text frame 和 redirect。
-- [ ] W1.2：把现有 Relay v2 handshake 改造成 transport-neutral core；JS 只发送 WASM 产出的 binary bytes。
-- [ ] W1.3：加入 per-generation connect/write/cleanup deadline、single-flight 和旧 generation 隔离。
-- [ ] W1.4：runner 启动 fresh TLS Relay、隔离 Chromium 测试信任和预置 test principal，取得真实
+- [x] W1.1：实现 WebSocket host adapter，只接受 fixed root `wss://` origin，并由 WASM 固定选择
+  `/v2/connect`；拒绝 path/query/fragment、text frame 和 redirect。`/v2/pair` 保留给 W2。
+- [x] W1.2：把现有 Relay v2 handshake 改造成 transport-neutral core；JS 只发送 WASM 产出的 binary bytes。
+- [x] W1.3：加入 per-generation connect/write/cleanup deadline、single-flight 和旧 generation 隔离。
+- [x] W1.4：runner 启动 fresh TLS Relay、隔离 Chromium 测试信任和预置 test principal，取得真实
   Hello→Authenticated readback。
-- [ ] W1.5：覆盖 wrong relayServerId、tampered challenge/signature、replay、text/oversize、断线和 Relay
+- [x] W1.5：覆盖 wrong relayServerId、tampered challenge/signature、replay、text/oversize、断线和 Relay
   restart 负例；所有错误保持零业务 mutation。
-- [ ] W1.6：扫描 Relay DB/WAL/SHM、browser console/trace 和日志，确认 sentinel/plain secret absent。
-- [ ] W1.7：更新文档并形成 W1 scoped commit。
+- [x] W1.6：扫描 Relay DB/WAL/SHM、browser console/trace 和日志，确认 sentinel/plain secret absent。
+- [x] W1.7：更新文档并随本阶段形成 W1 scoped commit。
 
 ### Gates
 
 ```bash
+bash scripts/run-relay-web-companion-e2e.sh --all
 bash scripts/run-relay-web-companion-e2e.sh --contract
 bash scripts/run-relay-web-companion-e2e.sh --transport
-cd web/relay-test-companion
-bun run check
-bun run test:unit
-bun run test:e2e -- --grep 'W1'
-cd ../..
+bash scripts/tests/run-relay-web-companion-e2e.sh
 cargo test -p agentdeck-protocol -p agentdeck-crypto -p agentdeck-relay-client
-cargo test -p agentdeck-relay --features server,tls --test relay_v2_tls_e2e
+cargo test -p agentdeck-relay --features server,tls
+bash scripts/verify-relay-companion-mvp.sh p4-auto
+cargo clippy -p agentdeck-web-core --all-targets --features w1-test-fixture -- -D warnings
+cargo clippy -p agentdeck-relay --features server,tls --test relay_web_companion_w1_e2e -- -D warnings
+cargo fmt --all -- --check
 bash scripts/check-daemon-network-boundary.sh
 bash scripts/check-daemon-no-net.sh
 scripts/verify-agent-docs.sh
 git diff --check
 git status --short --branch
 ```
+
+### W1 完成证据（2026-07-30）
+
+- `agentdeck-web-core` contract `2/2` 通过：strict root WSS、固定 `/v2/connect`、状态推进、wrong identity 与
+  replay fail-close；WASM 只导出 opaque frame action，不导出固定私钥、TBS 或 AEAD plaintext。
+- TypeScript unit `2/2` 与 ownership gate 通过；薄 host 只负责 WebSocket lifecycle/deadline/single-flight/
+  generation 和 binary forwarding。
+- 真实 Chrome→临时 TLS Relay integration `1/1` 通过；内部逐轮执行首次 positive、7 个在线负例、Relay
+  unavailable 与 restart 后 positive。页面读回 `W1 真实 Relay 通过`，console error 为空。
+- wrong server、challenge/signature 篡改、Authenticate replay、text/oversize 和 disconnect 后 SQLite frame
+  count 保持 1；Relay restart 后相同 stream/seq 的重复发布仍保持 1，证明该切片幂等。
+- SQLite sealed blob 可按 E2EE v1 canonical wire 解码且不含 sentinel；Relay DB/WAL/SHM、浏览器 stdout/stderr、
+  Playwright output 与本轮临时 root 扫描均无 sentinel 明文，`test-results/` absent。
+- 既有 protocol/crypto/relay-client、Relay `server,tls` 全矩阵、`p4-auto`、两组 scoped Clippy、fmt、daemon
+  network boundary、四 schema、docs 与 diff gate 全绿。
 
 ### Exit
 
@@ -306,7 +323,7 @@ W4 不由本机 automatic 结果自动解锁。进入前另建执行授权和证
 ## 9. 总体收口清单
 
 - [x] W0 证明 WASM parity 与 IndexedDB/Web Locks durable contract。
-- [ ] W1 浏览器直连真实 Relay v2/E2EE，无业务 bridge。
+- [x] W1 浏览器直连真实 Relay v2/E2EE，无业务 bridge。
 - [ ] W2 完成完整远程业务流，iOS E2E 不回归。
 - [ ] W3 crash/restart/tab contention 与三次 fresh run 全绿。
 - [ ] TypeScript 无 wire/crypto owner；Relay/Runtime/E2EE 版本未变。

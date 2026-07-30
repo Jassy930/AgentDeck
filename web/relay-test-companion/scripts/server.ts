@@ -5,10 +5,32 @@ const distribution = resolve(webRoot, "dist");
 const wasmOutput = resolve(webRoot, "generated/agentdeck-web-core");
 const port = Number.parseInt(process.env.RELAY_WEB_TEST_PORT ?? "4173", 10);
 
+function relayConnectSource(): string {
+  const configured = process.env.AGENTDECK_W1_WSS_ORIGIN;
+  if (configured === undefined) {
+    return "'self'";
+  }
+  const origin = new URL(configured);
+  if (
+    origin.protocol !== "wss:" ||
+    origin.username !== "" ||
+    origin.password !== "" ||
+    origin.pathname !== "/" ||
+    origin.search !== "" ||
+    origin.hash !== "" ||
+    origin.port === "0"
+  ) {
+    throw new Error("web.remote.server.origin_invalid");
+  }
+  return `'self' ${origin.origin}`;
+}
+
+const connectSource = relayConnectSource();
+
 const securityHeaders = {
   "Cache-Control": "no-store",
   "Content-Security-Policy":
-    "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
+    `default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src ${connectSource}; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'`,
   "Cross-Origin-Opener-Policy": "same-origin",
   "Cross-Origin-Resource-Policy": "same-origin",
   "Permissions-Policy": "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
@@ -52,6 +74,9 @@ const server = Bun.serve({
     const { pathname } = new URL(request.url);
     if (pathname === "/healthz") {
       return new Response("ok", { headers: { ...securityHeaders, "Content-Type": "text/plain" } });
+    }
+    if (pathname === "/favicon.ico") {
+      return new Response(null, { status: 204, headers: securityHeaders });
     }
     if (pathname === "/") {
       return fileResponse(resolve(distribution, "index.html"));

@@ -22,9 +22,9 @@
       <section class="gate" aria-labelledby="gate-title">
         <div>
           <span class="gate-label">当前门禁</span>
-          <h2 id="gate-title">W0 · 可行性闭环</h2>
+          <h2 id="gate-title">W1 · 真实 Relay 直连</h2>
         </div>
-        <span id="w0-status" class="status" data-state="idle" aria-live="polite">等待验证</span>
+        <span id="w1-status" class="status" data-state="idle" aria-live="polite">等待验证</span>
       </section>
 
       <section class="cards" aria-label="验证边界">
@@ -41,7 +41,7 @@
         <article>
           <span class="ordinal">03</span>
           <h3>完成边界</h3>
-          <p>本页只形成自动化证据，不替代公网 WSS、物理设备或 production SPKI pin。</p>
+          <p>直连临时 TLS Relay 并验证密封路由；不替代公网 WSS、物理设备或 production SPKI pin。</p>
         </article>
       </section>
 
@@ -49,6 +49,7 @@
         <div>
           <h2>本页核心自检</h2>
           <p>运行共享向量与密码学篡改负例；完整 storage/locking 由浏览器测试执行。</p>
+          <span id="w0-status" class="status" data-state="idle" aria-live="polite">W0 等待验证</span>
         </div>
         <button id="run-selfcheck" type="button">运行 W0 自检</button>
         <pre id="evidence" aria-live="polite">尚未生成证据</pre>

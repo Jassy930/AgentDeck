@@ -20,7 +20,7 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
-## Relay Web Test Companion W0 门禁（2026-07-30）
+## Relay Web Test Companion W0/W1 门禁（2026-07-30）
 
 W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
 `web/relay-test-companion/` 后运行：
@@ -45,6 +45,26 @@ W0 PASS 只写为 `automatic test scope`：真实 Relay v2/WSS/E2EE 直连从 W1
 production SPKI pin、Keychain/FileProtection 和真实 vendor 仍不得由浏览器本机结果替代。生成的 `dist/`、
 `generated/`、Playwright profile/report 与测试结果不入库；阶段退出还须读回静态 server/browser 已停止、
 `scripts/verify-agent-docs.sh`、`git diff --check` 和 Git 状态。
+
+W1 的统一入口如下；`--contract` 只跑 Rust/WASM contract、TypeScript ownership/unit，`--transport` 只跑
+真实 Chrome→临时 TLS Relay 集成，阶段收口使用 `--all`：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --contract
+scripts/run-relay-web-companion-e2e.sh --transport
+scripts/run-relay-web-companion-e2e.sh --all
+bash scripts/tests/run-relay-web-companion-e2e.sh
+```
+
+W1 transport 必须读回 Hello→Authenticated、sealed sentinel accepted、Relay restart 后重复发布幂等且
+SQLite frame count 仍为 1；wrong server、challenge/signature 篡改、Authenticate replay、text/oversize、
+disconnect 和 unavailable 均须失败且不增加 frame。Relay DB/WAL/SHM、浏览器 stdout/stderr、Playwright output
+和本轮临时 root 中不得出现 sentinel 明文，`test-results/` 必须 absent。
+
+`w1-test-fixture` 只允许进入 W1 automatic build；固定测试私钥、TBS 与 AEAD plaintext 不得导出给 TypeScript，
+普通 W0 build 不含该 feature。Chrome 的精确 SPKI 参数只信任本轮 fresh `localhost` 证书，是隔离测试策略，
+不是 production pin。W1 PASS 只关闭 `/v2/connect` 的 test TLS/Relay v2 鉴权与 sealed route；`/v2/pair`、
+pair/list/open/prompt/approval/reload/revoke 从 W2 开始。
 
 ## Relay Companion MVP Task 粒度门禁（2026-07-18）
 

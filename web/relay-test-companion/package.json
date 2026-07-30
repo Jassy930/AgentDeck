@@ -7,10 +7,12 @@
   "trustedDependencies": ["wasm-pack"],
   "scripts": {
     "build": "bun run scripts/build.ts",
+    "build:w1": "AGENTDECK_WEB_CORE_FEATURES=w1-test-fixture bun run scripts/build.ts",
     "check": "tsc --noEmit && bun run scripts/check-protocol-ownership.ts",
     "serve:test": "bun run scripts/server.ts",
     "test:unit": "bun test tests/unit",
-    "test:browser": "bun run build && bun run scripts/test-browser.ts"
+    "test:browser": "bun run build && bun run scripts/test-browser.ts",
+    "test:browser:built": "bun run scripts/test-browser.ts"
   },
   "devDependencies": {
     "@playwright/test": "1.55.1",

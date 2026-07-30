@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0 Implemented（automatic test scope）；W1 尚未开始 |
+| 状态 | W0/W1 automatic complete；W2 尚未开始 |
 | 日期 | 2026-07-30 |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
 | 目标 | 用浏览器直接复用 Relay v2 + E2EE v1，增加一条低成本、可重复的远程业务闭环 |
@@ -34,7 +34,14 @@ pair → list/open → prompt → approval → relaunch/reconnect → revoke
 2026-07-30 已完成 W0：同一 Rust protocol/crypto 实现可原样编译为 browser WASM；Chrome 自动用例已关闭
 golden-vector parity、strict Relay/Runtime 负例、non-extractable WebCrypto KEK 的 IndexedDB structured clone、
 transaction abort rollback、exact revision CAS 与 Web Locks 第二 tab 拒绝。W0 没有新增业务 bridge、daemon、
-Relay/Runtime/E2EE 版本或 TypeScript wire/crypto owner；真实 Relay 连接仍属于 W1。
+Relay/Runtime/E2EE 版本或 TypeScript wire/crypto owner。
+
+W1 已用真实 Chrome、每轮 fresh `localhost` 证书和临时 TLS Relay 关闭 `/v2/connect` 的
+Hello→Challenge→Authenticate→Authenticated 与 sealed sentinel route。Relay restart 后重复发布保持一条
+SQLite frame，wrong identity、challenge/signature 篡改、Authenticate replay、text/oversize、disconnect 和
+unavailable 均为零新增 frame；DB/WAL/SHM、浏览器输出和临时 root 未发现 sentinel 明文。该证据使用隔离
+Chrome 精确 SPKI 参数与 `w1-test-fixture` 固定 identity，只是 automatic test policy；`/v2/pair` 和完整业务
+链路仍属于 W2，不能外推为 production pin 或完整网页版。
 
 ## 2. 目标与非目标
 

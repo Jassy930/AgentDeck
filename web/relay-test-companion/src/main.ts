@@ -7,6 +7,7 @@ import {
   readState,
   type WriterLease,
 } from "./storage.ts";
+import { runW1Transport, type W1WasmSessionConstructor } from "./w1-transport.ts";
 
 type WebCoreModule = Readonly<{
   default: () => Promise<unknown>;
@@ -16,6 +17,7 @@ type WebCoreModule = Readonly<{
   w0ValidateRelayFrame: (bytes: Uint8Array) => void;
   w0RuntimeRequestRoundtrip: (bytes: Uint8Array) => Uint8Array;
   w0CryptoTamperIsRejected: () => boolean;
+  W1Session?: W1WasmSessionConstructor;
 }>;
 
 const wasmModuleUrl = "/wasm/agentdeck_web_core.js";
@@ -68,6 +70,19 @@ const api: RelayTestApi = {
   async cryptoTamperRejected() {
     return (await corePromise).w0CryptoTamperIsRejected();
   },
+  async runW1Transport(origin, relayServerIdHex, caseName) {
+    const constructor = (await corePromise).W1Session;
+    if (constructor === undefined) {
+      throw new Error("web.remote.w1_fixture_unavailable");
+    }
+    const result = await runW1Transport(constructor, origin, relayServerIdHex, caseName);
+    const status = document.querySelector<HTMLElement>("#w1-status");
+    if (status !== null) {
+      status.dataset.state = result.sentinelAccepted ? "passed" : "failed";
+      status.textContent = result.sentinelAccepted ? "W1 真实 Relay 通过" : result.failureCode;
+    }
+    return result;
+  },
   initializeState,
   readState,
   commitExactRevision,
@@ -104,7 +119,7 @@ async function runPageSelfcheck(): Promise<void> {
   }
   button.disabled = true;
   status.dataset.state = "running";
-  status.textContent = "运行中";
+  status.textContent = "W0 运行中";
   try {
     const [snapshot, negatives, tamperRejected] = await Promise.all([
       api.contractSnapshot(),

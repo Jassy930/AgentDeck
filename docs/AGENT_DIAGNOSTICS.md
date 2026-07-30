@@ -44,7 +44,7 @@ agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge
 stable UDS。diagnostics report 不启动 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志；不要把
 diagnostics override 当成 stable ownership 配置。
 
-## Relay Web Test Companion W0 failure codes
+## Relay Web Test Companion W0/W1 failure codes
 
 W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，尚未连接 Relay。以下 code 只在本地
 测试 host 中出现；它们不进入 daemon diagnostic log，也不能解释为远端业务失败：
@@ -59,9 +59,24 @@ W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，�
 | `web.remote.storage.kekCloneFailed` | non-extractable `CryptoKey` 未能从 IndexedDB structured clone 读回 | 当前 Chromium 不满足 W0；停止 W1/W2，不得回退 extractable key 或明文 secret |
 | `web.remote.cleanup.unexpectedArtifacts` | PASS 后 Playwright output 除 `.last-run.json` 外仍有 trace/screenshot 等 artifact | 保留目录排查为何成功用例仍产出 artifact；不要让 cleanup 按目录递归删除证据 |
 
-若 W0 浏览器测试失败，先运行 `bun run check` 排除 TypeScript ownership 漂移，再用
-`bun run test:browser -- --grep W0` 复现。测试结束必须停止静态 server、关闭 tab/profile 并删除本轮
-IndexedDB profile；该 cleanup 不使用全局浏览器数据删除。
+W1 额外使用以下本地 test-host code；它们同样不进入 daemon diagnostic log：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `web.remote.origin_invalid` | WASM core 拒绝非 root WSS、带 credential/path/query/fragment 或非法端口的 origin | 只传固定 `wss://host:port/`；`/v2/connect` 必须由 WASM 选择 |
+| `web.remote.server_identity_mismatch` | Challenge 中的 Relay server identity 与预期不一致 | 立即终止本 generation；核对 fresh Relay 的只读 server id，不发送 Authenticate |
+| `web.remote.handshake_rejected` | Challenge/signature 篡改或 Relay 拒绝 Authenticate | 保留 typed stage/code；不得自动降级、重放或继续发布 |
+| `web.remote.single_flight` / `web.remote.generation_stale` | 同页已有 active connection，或旧 generation 回调到达 | 关闭并 join 旧 socket 后再建新 generation；旧回调不得推进状态 |
+| `web.remote.connect_failed` / `web.remote.connect_timeout` | TLS/WSS endpoint 不可达或 connect deadline 到期 | 核对本轮 Relay PID、端口、证书/SPKI；不要改用 `ws://` 绕过 |
+| `web.remote.text_frame_rejected` / `web.remote.frame_too_large` | Relay 收到非 binary 或超过 4 MiB 的 frame 并关闭连接 | 修正 host 发送边界；确认 SQLite frame count 未增加 |
+| `web.remote.replay_rejected` | 已完成鉴权后重放 Authenticate，被 Relay 拒绝 | 这是预期负例；确认连接未产生 sealed business frame |
+| `web.remote.sentinel_not_accepted` | 有界接收窗口内未见精确 stream receipt | 检查 Relay route/store 日志与 generation；不得仅凭 Authenticated 宣布 W1 PASS |
+| `web.remote.cleanup.unexpectedArtifacts` | PASS 后仍有 trace/screenshot/test result | 保留失败证据定位；成功收口必须让 `test-results/` absent |
+
+W0 失败先运行 `bun run check` 和 `bun run test:browser -- --grep W0`。W1 失败用
+`scripts/run-relay-web-companion-e2e.sh --contract` 区分 contract/ownership，再用 `--transport` 复现真实
+Chrome→Relay 路径。测试结束必须停止静态 server、关闭 tab/profile、Relay 并删除本轮精确临时 root；
+cleanup 不使用全局浏览器数据或全局进程名删除。
 
 ## Relay v1 历史 marker 与显式 reset
 

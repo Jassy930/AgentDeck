@@ -51,6 +51,7 @@ required-features = ["server"]
 [dev-dependencies]
 async-trait = "0.1"
 agentdeck-relay-client = { path = "../agentdeck-relay-client" }
+agentdeck-web-core = { path = "../agentdeck-web-core", features = ["w1-test-fixture"] }
 ureq = { version = "2", features = ["json"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 rustls-pki-types = "1"

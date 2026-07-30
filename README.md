@@ -232,7 +232,7 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Web Test Companion（W0 automatic complete）
+## Relay Web Test Companion（W0/W1 automatic complete）
 
 `agentdeck-web-core` 已证明现有 Relay v2 codec、Runtime v5 request contract 与 E2EE v1 crypto 可以复用同一
 Rust 实现编译为 browser WASM；`web/relay-test-companion` 是 Bun 管理的最小测试页面与 host adapter，
@@ -251,12 +251,26 @@ bun run test:unit
 bun run test:browser -- --grep W0
 ```
 
+W1 已让真实 Chrome 通过 binary WSS 直连每轮 fresh 的临时 TLS Relay，完成
+Hello→Challenge→Authenticate→Authenticated，并发布由 Rust/WASM 产生的 E2EE sealed sentinel。固定测试
+identity 只在 `w1-test-fixture` feature 下编译；TypeScript 只传递 opaque binary。统一入口会同时执行
+Rust/WASM contract、TypeScript ownership/unit 与真实 Relay/Chrome 场景：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --all
+bash scripts/tests/run-relay-web-companion-e2e.sh
+```
+
+W1 的负例覆盖 wrong server identity、challenge/signature 篡改、Authenticate 重放、text/oversize frame、
+主动断开与 Relay unavailable；Relay 重启后的重复发布保持幂等，SQLite 中仍只有一条 sealed frame。测试还会
+扫描 Relay DB/WAL/SHM、浏览器输出与临时目录，拒绝 sentinel 明文落盘。
+
 本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
 `http://127.0.0.1:4173/`；停止 server 后不保留业务或配对状态。
 
-这仍不是完整网页版或真实远程链路。浏览器直连 Relay、pair/list/open/prompt/approval/reload/revoke 分别属于
-W1/W2；公网 WSS、production SPKI pin、物理设备、第二台 Mac 与真实 vendor 继续独立 BLOCKED，不因 W0
-通过而改变。阶段事实源见
+这仍不是完整网页版或完整远程业务链路。W1 只关闭 test TLS policy 下的 `/v2/connect` 鉴权与 sealed route；
+pair/list/open/prompt/approval/reload/revoke 仍属于 W2。公网 WSS、production SPKI pin、物理设备、第二台 Mac
+与真实 vendor 继续独立 BLOCKED，不因 W0/W1 通过而改变。阶段事实源见
 [`Relay Web Test Companion 实施计划`](docs/plans/2026-07-30-relay-web-test-companion-implementation.md)。
 
 ## Relay Companion MVP 实施状态（P5.8-lite automatic complete；P5 为 8/9）
