@@ -112,6 +112,11 @@ P3.1 方案 b、production-signed
 Keychain/LaunchAgent、真实 vendor、物理 iPhone/第二台 Mac、公网 WSS 与 destructive purge 证据继续作为
 post-MVP BLOCKED 槽位。
 
+`2026-07-30-relay-web-test-companion-design.md` 与配套 implementation 是 automatic MVP 收口后的候选
+post-MVP 开发计划，目前状态为 Proposed，未替换上述 Relay 架构或 rescue 事实源。它只评估一条
+Rust/WASM + 薄 Web host 的浏览器自动测试链路；用户确认前不得实施，也不得把浏览器本机证据写成物理设备、
+公网 WSS、production signing 或第二台 Mac PASS。
+
 ```text
 docs/plans/
   active/
