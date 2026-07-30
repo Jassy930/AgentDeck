@@ -572,7 +572,7 @@ if [[ "$run_mode" == "lifecycle-smoke" || "$run_mode" == "full" ]]; then
 
   restart_request="r44-restart-$runner_generation"
   send_host_command \
-    "{\"op\":\"restartDaemon\",\"requestId\":\"$restart_request\"}" \
+    "{\"op\":\"restartDaemon\",\"requestId\":\"$restart_request\",\"markerBeforeReadiness\":true}" \
     || fail "could not send real daemon restart command to host"
   read_host_json restartDaemon "$restart_request" 100 \
     || fail "real host did not return daemon restart evidence"

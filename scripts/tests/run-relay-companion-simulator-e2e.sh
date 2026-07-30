@@ -50,6 +50,12 @@ grep -Fq 'run_mode="full"' "$runner" \
   || fail "default entry must select the full lifecycle gate"
 grep -Fq -- '--lifecycle-smoke) run_mode="lifecycle-smoke"' "$runner" \
   || fail "focused lifecycle-smoke entry is missing"
+restart_command_block="$(
+  sed -n '/restart_request="r44-restart-/,/could not send real daemon restart command to host/p' \
+    "$runner"
+)"
+printf '%s\n' "$restart_command_block" | grep -Fq '"markerBeforeReadiness\":true' \
+  || fail "daemon restart must commit the marker before base-readiness handoff"
 grep -Fq 'testFullLifecycleReconnectAndRevoke' "$ui_test" \
   || fail "full production lifecycle UI test is missing"
 grep -Fq 'private static let businessReadyUIWait: TimeInterval = 120' "$ui_test" \
