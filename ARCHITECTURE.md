@@ -764,7 +764,7 @@ conversation/key，不能伪造身份连续性。
   complete。该完成边界不覆盖 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理
   iPhone/第二台 Mac 或 destructive purge；这些真实槽位继续保持 post-MVP BLOCKED。
 
-### Relay Web Test Companion W2a–W3.3 pairing、业务、恢复与隔离不变量
+### Relay Web Test Companion W2a–W3 pairing、业务、恢复与隔离不变量
 
 - 浏览器没有第二套 Runtime、daemon 或 UDS→HTTP bridge。`agentdeck-web-core` 直接复用
   `agentdeck-protocol` / `agentdeck-crypto`，TypeScript 只管理 WebSocket generation、deadline、opaque
@@ -832,9 +832,9 @@ conversation/key，不能伪造身份连续性。
 - W2c automatic complete 关闭单轮 durable 正向链路，W2.7 automatic complete 关闭完整
   negative/zero-mutation matrix，W2.8 用同一 candidate 的 Web aggregate 与 fixed-topology iOS/P5 回归完成
   W2 automatic overall closeout。W3.1/W3.2 两类 crash cut、W3.3 第二 tab/generation 隔离、W3.4 真实
-  browser kill、W3.5 网络故障与 W3.6 同一 candidate 三次 fresh run均已关闭；W3.7 双路终审仍未完成；公网、
-  物理设备、production signing/pin、第二台
-  Mac 与真实 vendor 继续是 W4 外部门禁。
+  browser kill、W3.5 网络故障、W3.6 同一 candidate 三次 fresh run与 W3.7 双路终审均已关闭；Web
+  automatic scope 已实现且没有新增 daemon、Runtime、协议或业务 bridge。公网、物理设备、production
+  signing/pin、第二台 Mac 与真实 vendor 继续是 W4 外部门禁。
 
 ### Relay Companion MVP P5.1 SessionSource facade 不变量
 

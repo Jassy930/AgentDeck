@@ -1,7 +1,8 @@
 # AgentDeck Relay Companion MVP 实施计划
 
-> **执行范围已于 2026-07-28 收口：** 本文保留 P0–P5.7 的历史实施清单和已验证证据；尚未完成的
-> P5.8、P5.9、P5 Phase Exit 与 P6 不再直接执行。当前唯一执行事实源是
+> **执行范围已于 2026-07-28 收口：** 本文保留 P0–P5.7 的历史实施清单和已验证证据；原 P5.8、P5.9、
+> P5 Phase Exit 与 P6 不再直接执行。rescue replacement 已完成 P5.8-lite、P5.9 fixed-topology 与 P5
+> automatic Phase Exit；当前唯一执行事实源是
 > `docs/plans/2026-07-28-relay-companion-mvp-rescue-implementation.md`。任何后续工作必须满足 rescue
 > 计划的阶段入口、自动门禁、运行/UI 读回、双路 review、文档和 clean Git 状态闭环；不得继续按本文
 > 原 P6 范围扩张。
@@ -3165,8 +3166,9 @@ agent docs、diff、local Runtime smoke、ephemeral selfcheck 与 diagnostics �
 `BLOCKED`；静态 runner 仍只输出 `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不生成真实证据。
 P5.1 shared facade、P5.2 crash-safe client storage、P5.3 WSS/pin/per-connection transfer primitive 与
 P5.4 MachineConnection/bounded source、P5.5 canonical fixture/receipt UI 与 P5.6 iOS production
-composition/pairing lifecycle、P5.7 macOS SessionSource registry automatic Task 已于后续完成，P5/P6
-当前进度为 7/9、0/4。
+composition/pairing lifecycle、P5.7 macOS SessionSource registry automatic Task 已于后续完成；rescue
+replacement 又完成 P5.8-lite 与 P5.9 fixed-topology，P5 automatic scope 现为 9/9 complete。P6 保持 0/4，
+且不再属于当前 MVP 执行范围。
 
 ---
 
@@ -3174,8 +3176,9 @@ composition/pairing lifecycle、P5.7 macOS SessionSource registry automatic Task
 
 > **执行前审计（2026-07-20）：0/9 Task 完成。** 当前只有 Relay crypto/wire、P3.9 本机 Runtime 与
 > fixture UI 基线；P5.1–P5.9 production source、真实 Simulator Relay E2E 与 post-MVP slot runner 均未实现。
-> 这是历史起点，不能把可复用基线记为 P5 进度。**当前进度（2026-07-28）：P5.1–P5.7 automatic
-> Task 已完成，P5 为 7/9。P5.8–P5.9 与 P5 Phase Exit 仍未完成。**
+> 这是历史起点，不能把可复用基线记为 P5 进度。**当前事实（2026-07-30）：P5.1–P5.7 按本文完成；
+> P5.8-lite、P5.9 与 P5 automatic Phase Exit 由 rescue replacement 完成，P5 automatic scope 为 9/9。
+> 原 P5.8 扩展 UI 与 P6 仍未执行，也不因 replacement 被冒充完成。**
 
 ### Task P5.1：建立 AgentDeckSessionSource target 与强类型 facade
 
@@ -3390,7 +3393,7 @@ iOS Simulator `26/26`。首轮 Simulator 暴露 file-protection 两种 Foundatio
 `4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f` 上完整 `cargo test --locked`
 exit 0，Rust/cross-language/static gates 全绿。提交按 `34 Rust/fixture → 69 Swift + 6 docs` 有序堆叠；第一笔
 只承诺 Rust scoped-green，完整门禁属于第二笔落地后的组合候选。历史 Step 2 RED 未保留且不伪造。P5.4
-收口时 P5 为 4/9；后续 P5.5、P5.6、P5.7 已分别独立完成。当前 P5.8–P5.9 与 P5 Phase Exit 继续未完成。
+收口时 P5 为 4/9；后续 P5.5、P5.6、P5.7 与 rescue P5.8-lite/P5.9/Phase Exit 已分别完成。
 真实公网 WSS、production-signed Data Protection Keychain、物理 iPhone、第二台 Mac 与真实 Codex/Claude
 Code vendor 全部继续 post-MVP `BLOCKED`。
 
@@ -3459,7 +3462,7 @@ fail-close。retry 以 event-seq fence 拒绝旧 round，迟到 receipt 继续�
 winner，先保持 `.expired(nil)`；approvalID 或双方明确 winner 不一致统一 security fail-close。
 `.revoked/.incompatible/.securityError` 从 observation、prompt 或 approval 任一路到达都进入不可逆终态。
 P5.5 收口时 P5 进度为 5/9，`SceneDelegate` 仍注入 fixture，发行 composition/真实 pairing 留给 P5.6；
-后续 P5.6、P5.7 已按后续小节独立收口。当前 P5.8–P5.9 与 P5 Phase Exit 未完成；真实公网 WSS、production-signed
+后续 P5.6、P5.7 与 rescue P5.8-lite/P5.9/Phase Exit 已独立收口；真实公网 WSS、production-signed
 Data Protection Keychain、物理 iPhone、第二台 Mac 与真实 Codex/Claude Code vendor 继续 post-MVP `BLOCKED`。
 
 Runtime v5 Error 额外固定为：commandless Error 只记录 conversation diagnostic，不结束 active turn 或生成
@@ -3549,7 +3552,7 @@ capability、selected-scope generation、shutdown/join barrier、Genesis/busines
 dual-scope host integration，以及 typed snapshot recovery、observation reentrancy、`SessionModel` operation join
 与 Preview/AppRuntime pump barrier。AppDelegate 当前仍把 local composition model 交给既有
 `SessionViewController`；可见 machine picker、remote pairing/pending-device approval、receipt UI 由 P5.8
-完成。P5 当前为 7/9；P5.9 fixed-topology Simulator Relay E2E 与 P5 Phase Exit 继续未完成；真实公网、签名 Keychain、物理
+完成。P5.7 收口时 P5 为 7/9；后续 rescue P5.8-lite、P5.9 与 P5 automatic Phase Exit 已完成；真实公网、签名 Keychain、物理
 iPhone、第二台 Mac、真实 vendor 与 destructive purge 继续 post-MVP `BLOCKED`。
 
 ### Task P5.8：接入 AppKit machine scope、远程配对与 receipt UI
@@ -3569,6 +3572,10 @@ iPhone、第二台 Mac、真实 vendor 与 destructive purge 继续 post-MVP `BL
 - [ ] Step 6: 提交。 `git add Sources Tests && git commit -m "feat(macos): 加入远程机器 scope 与配对控制面"`
 
 ### Task P5.9：Simulator MVP 门禁与物理设备 post-MVP 证据槽位
+
+> 本节原步骤已被 rescue R4 replacement 取代，不再作为执行入口。replacement 已完成固定拓扑 Simulator
+> automatic 门禁、`p5` verifier 与外部 slot contract；下列历史 checkbox 保持原样，避免把未执行的原编排
+> 伪造为完成。
 
 **Files:**
 - Create: `ios/AgentDeckMobileUITests/RelayCompanionUITests.swift`
@@ -3638,14 +3645,14 @@ temp root 启动真实 daemon/Relay，以 ready probe、PID ownership、硬超�
 - [ ] Step 6: 提交。精确展开本 task pathspec 后执行
   `git commit -m "test(companion): 收口 Simulator 与实机证据槽位"`。
 
-### P5 Phase Exit（独立 checklist，未完成）
+### P5 Phase Exit（rescue replacement；automatic scope complete）
 
-- [ ] P5.1–P5.9 每个 Task 均从 0/9 基线完成 code/test、Task 门禁、文档与独立双路终审；不得以已有 P3/fixture/Relay wire 资产代替任一 Task checkbox。
-- [ ] `bash scripts/run-relay-companion-simulator-e2e.sh` 在固定 topology 下从 fresh temp root 自动完成 pair→same-UID local approve→list/open→prompt/approval→relaunch/reconnect→revoke，并证明真实 P4 daemon/PairingCoordinator/RemoteLink 与 production Swift client 均在路径上。
-- [ ] `bash scripts/verify-relay-companion-mvp.sh p5` 的全部自动项 PASS；Swift/iOS storage、counter/replay、WSS/SPKI、bounded stream、receipt/UI 与 macOS source registry 门禁均从已提交 candidate 运行并取得最终 exit 0。
-- [ ] 物理 iPhone/第二 Mac runner 在 MVP 只通过 slot-contract tests；缺输入时逐槽位输出 versioned `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，不主动访问设备/SSH/公网或生成 summary。
-- [ ] 在冻结 diff/hash 上完成独立 `spec/security` 与 `quality` phase review，清零 P0/P1/P2，并读回 docs/diff/status/cleanup；automatic 项未全 PASS 时 aggregator 不得因外部槽位 BLOCKED 而 exit 0。
-- [ ] 上述全部完成前不得标记 P5 Phase complete 或进入 P6 共享实现。
+- [x] P5.1–P5.7 保留本文逐 Task 证据；原 P5.8/P5.9 执行范围由 rescue R3/R4 明确替换，不把扩展 UI 或 P6 资产冒充完成。
+- [x] `bash scripts/run-relay-companion-simulator-e2e.sh` 在固定 topology 下从 fresh temp root 自动完成 pair→same-UID local approve→list/open→prompt/approval→relaunch/reconnect→revoke，并证明真实 P4 daemon/PairingCoordinator/RemoteLink 与 production Swift client 均在路径上。
+- [x] `bash scripts/verify-relay-companion-mvp.sh p5` 的全部自动项 PASS；Swift/iOS storage、counter/replay、WSS/SPKI、bounded stream、receipt/UI 与 macOS source registry 门禁均从已提交 candidate 运行并取得最终 exit 0。
+- [x] 物理 iPhone/第二 Mac runner 只通过 slot-contract tests；缺输入时逐槽位输出 versioned `BLOCKED/mutations=0/evidence=[]/summaryGenerated=false`，未主动访问设备/SSH/公网或生成 summary。
+- [x] replacement candidate 完成独立 `spec/security` 与 `quality` phase review，P0/P1/P2=0，并读回 docs/diff/status/cleanup；automatic aggregator 未把外部 BLOCKED 计为 PASS。
+- [x] P5 automatic scope complete；P6 不进入当前 MVP，外部真实证据继续 post-MVP BLOCKED。
 
 ---
 

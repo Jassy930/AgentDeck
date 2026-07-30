@@ -20,7 +20,7 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
-## Relay Web Test Companion W0–W3.5 与 W3.6 重复性门禁（2026-07-30）
+## Relay Web Test Companion W0–W3 automatic 门禁（2026-07-30）
 
 W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
 `web/relay-test-companion/` 后运行：
@@ -147,7 +147,7 @@ authorization 四项 SQLite 计数，并证明后到 resolve 与 Applied Retry �
 W2c PASS 关闭单轮 durable 正向链路，W2.7 PASS 关闭 negative/zero-mutation matrix。W2.8 还必须在同一
 candidate 上通过 `--all` 与 `verify-relay-companion-mvp.sh p5`；当前两者已 PASS，因此 W2 automatic overall
 complete。W3.1/W3.2 两类 deterministic crash cut、W3.3 第二 tab/generation 隔离、W3.4 真实 browser kill、
-W3.5 网络故障与 W3.6 三次 fresh run均已完成；W3.7 双路终审尚未完成。
+W3.5 网络故障、W3.6 三次 fresh run与 W3.7 双路终审均已完成；Web automatic scope complete。
 
 W3.1 独立门禁如下；它不会提前执行 W3.2 之后的 tab contention、故障代理或三次 fresh run：
 
@@ -235,13 +235,19 @@ cleanup。任一轮失败则本次入口无最终 PASS，下一次执行从第�
 六个 detail 还必须精确覆盖三种 crash cut 与三种 state cut各一次；aggregate 的 cut/recovery 列表、sibling
 quarantine 与恢复前零 frame 也必须逐项验证，不能只凭 3+3 数量通过。
 
-2026-07-30 冻结 candidate `9597c16e2f265bd41ca73d4760f329dcfd0900b6` / tree
-`b21c386b2002fa4052cabb9db1457153c30d4044` 连续三轮 fresh exit 0。最终 terminal 读回 W2b `3`、W3 detail
+2026-07-30 最终 code/test candidate `d4446ef1e26945458406e6811804a68fa617b7fd` / tree
+`2bb877b37c160d9c35f0f54a835b9451a764cc38` 连续三轮 fresh exit 0。最终 terminal 读回 W2b `3`、W3 detail
 `18`、W3 aggregate `6`、`allRunsConsistent=true`；每轮 command/completed 与 approval total/applied 各
-`1/1`，recovery revoke `1`、active grant `0`，plaintext 与 cleanup 全部 absent。W3.6 automatic complete；
-W3.7 仍须在后续 candidate 上执行完整门禁和双路终审。
+`1/1`，recovery revoke `1`、active grant `0`，plaintext 与 cleanup 全部 absent。该候选同时通过 `--all`、
+contention、browser kill、network fault、完整 Rust/Swift/iOS/P4/P5、release allocator 与静态门禁。
+完整 `p5` 首次在冷 Simulator 出现一次 UI observation timeout，runner 完整 cleanup；同候选 focused lifecycle
+和完整 aggregate 随后均 PASS，因此不把瞬时失败冒充最终证据，也不把它静默删除。
 
-W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED。
+W3.7 对 `1a74cf7..d4446ef` 整个增量完成 `spec/security` 与 `quality/Git` 双路终审，两路均 Approved，
+P0/P1/P2=0。Relay/Runtime/E2EE owner/schema 未变，TypeScript ownership、runner 正反例、plaintext、
+network/no-net、docs/diff/status 与 cleanup 均通过；当前状态为 `Implemented (Web automatic test scope)`。
+
+W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED，且不计 automatic PASS。
 
 本切片涉及的 daemon machine E2E 可用以下 scoped Clippy 复核：
 
@@ -1294,8 +1300,9 @@ recovery。P4.6 persistent remote CLI 已完成 automatic Task，current Runtime
 P4.7 automatic Task 与 P4 automatic Phase Exit 已完成，P4 按 Task 进度为 7/7。P5.1 shared facade、
 P5.2 crash-safe client storage、P5.3 WSS/pin/per-connection transfer primitive、P5.4
 MachineConnection/bounded source、P5.5 canonical fixture/receipt UI、P5.6 iOS production
-composition/pairing lifecycle 与 P5.7 macOS SessionSource registry automatic Task 已完成。P5/P6 当前进度为
-7/9、0/4；P5.8–P5.9 与 P5 Phase Exit 当时尚未完成。后续 rescue P5.8-lite 已完成，当前 P5 为 8/9。
+composition/pairing lifecycle 与 P5.7 macOS SessionSource registry automatic Task 已完成。上述 Task
+收口时 P5/P6 进度为 7/9、0/4；后续 rescue P5.8-lite、P5.9 与 P5 automatic Phase Exit 已完成，当前 P5
+automatic scope 为 9/9，P6 保持 0/4 且不进入当前 MVP。
 
 ## Relay Companion MVP P3.8-A local Runtime UDS transport primitives 门禁
 
@@ -3546,8 +3553,8 @@ Relay shutdown focused `56/56`（handler `14`、command client `7`、session sou
 `985 XCTest / 4 skipped + 35 Swift Testing / 0 failure`。Release generic Simulator build、strict format、
 fixture surface、agent docs 与 diff gates 通过。P5.6 收口时 P5 为 6/9；当时 P5.7–P5.9 与 P5 Phase Exit 未完成，真实
 公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实 vendor 与 destructive purge 继续
-post-MVP `BLOCKED`。后续 P5.7 与 rescue P5.8-lite 已独立收口，当前 P5 为 8/9；只剩 P5.9 与 P5 Phase
-Exit 未完成。
+post-MVP `BLOCKED`。后续 P5.7 与 rescue P5.8-lite、P5.9、P5 automatic Phase Exit 已独立收口；当前 P5
+automatic scope 为 9/9。
 
 ## Relay Companion MVP P5.7 macOS SessionSource registry 门禁
 
@@ -3771,8 +3778,8 @@ strict format（37 default + 2 个 4-space compatibility）、agent docs 与 dif
 前轮独立 `spec/security` 终审发现的 active-conversation Genesis snapshot recovery、observation handler 重入
 self-join、`SessionModel` 非结构化 task join 与 Preview/AppRuntime exact-pump barrier 已逐项修复并加入反例。
 最终 40-path prerequisite hash 与 23-path registry hash 已冻结；`spec/security`、`quality` 在最终 70-path
-候选上的结论均为 `P0=0 / P1=0 / P2=0`。P5.7 已独立收口，当时 P5 为 7/9。后续 rescue R3 已完成
-P5.8-lite；当前剩余范围只含 P5.9 fixed-topology Simulator Relay E2E 与 P5 automatic Phase Exit。旧 remote
+候选上的结论均为 `P0=0 / P1=0 / P2=0`。P5.7 已独立收口，当时 P5 为 7/9。后续 rescue R3/R4 已完成
+P5.8-lite、P5.9 fixed-topology Simulator Relay E2E 与 P5 automatic Phase Exit。旧 remote
 macOS picker/pairing/receipt UI、真实公网 WSS、production-signed Keychain、物理 iPhone、第二台 Mac、真实
 Codex/Claude Code vendor 与 destructive purge 全部 post-MVP `BLOCKED`，不计 PASS。
 
@@ -4861,10 +4868,10 @@ cargo install cargo-llvm-cov
 | Relay Companion MVP P5.2 Keychain / crash-safe CryptoState | 运行本页七组 Swift storage/state/counter/replay/paired tests、strict RelayClient/完整 Swift、iOS storage focused/全量 Simulator、格式/secret/docs/diff 与双路终审。只证明 typed account、ADCS v1 sealed file、counter Pending→state→Stable、non-counter statePending exact commitment、4096 replay window 与 paired marker；SwiftPM `-34018` SecItem 和 Simulator 非真实 Complete readback 均明确保留为 production-signed/物理设备 BLOCKED。该 Task 收口时 P5 只计 2/9；后续 P5.3 已独立完成，RelaySessionSource 与 P5 Phase Exit 仍未完成 |
 | Relay Companion MVP P5.3 WSS / SPKI pin / per-connection transfer | 运行本页三组 focused、strict RelayClient/完整 Swift、iOS Simulator、Rust transfer/Runtime/crypto、cross-language、format/static/docs/diff 与独立终审。只证明 generation-scoped WSS、三种 TLS policy、bounded writer/incoming 与 per-connection assembler；P5.4 process-global 512 MiB/8,192 coordinator、RelaySessionSource、真实公网/物理设备与 P5 Phase Exit 均未完成，P5 当前只计 3/9 |
 | Relay Companion MVP P5.4 MachineConnection / bounded source | 2026-07-27 automatic Task complete；冻结 69-path Swift candidate `42f47dc2eecfcd0ca312b9178583246aad48b9f59d6413fc9814052cb7e1cd1c` 与 Rust candidate `4815d82628992281c3e1e032c91364080237ca34e6d94398d376b75ec1f7c30f`，并以 34 Rust/fixture + 69 Swift + 6 docs 的 exact 109-path manifest 约束 `34 → 75` 有序提交栈；第一笔只承诺 Rust scoped-green，完整绿色证据属于组合候选。discovery/focused `225/225`、RelayClient `429/4 SKIP`、完整 Swift `958/4 SKIP + 35`、iOS `26/26`、完整 Rust/cross-language/static/docs/diff 与独立终审通过；历史 Step 2 RED 未保留且不伪造。只证明 automatic MachineConnection/key-sync、shared 512 MiB/8,192 budget、bounded broadcaster/reducers、RelaySessionSource 与 typed command/pairing；P5.4 收口时 P5 为 4/9，后续 P5.5 已独立完成。P5 Phase Exit 当时是 automatic 未完成项；真实外部门禁继续 post-MVP `BLOCKED` |
-| Relay Companion MVP P5.5 canonical fixture / receipt UI | 2026-07-27 automatic Task complete；52 code/test/fixture content manifest `8dd8610966430a5cf640617da53e34d91bf379fe0ad495ea2ef719a6fec9d5ba` + 10 docs = exact 62 paths；顶层 Swift `980 XCTest / 4 skipped + 35 Swift Testing / 0 failure`、warnings-as-errors focused `91/91`、iOS `91/91`，Rust protocol/producer/store integrity 与其余门禁见本节 fresh 证据。只证明共享 SessionSource 迁移、Core canonical reducer、Runtime v5 command-bound fixed Failed/commandless diagnostic、32 identity cap、snapshot mid-turn inference、canonical fixture、idempotent prompt/approval、event-seq retry fence、retired-operation 校验、receipt/canonical 乱序归并、terminal-before-receipt 收敛、旧 terminal 不消费下一 prompt receipt、terminal-only turn advance/direct-terminal fail-close、单 Failed 单资源广播、资源错误可见性与 fatal fail-close；fixture 仍为 preview/test，`SceneDelegate` 发行 composition 属 P5.6。P5.5 收口时 P5 为 5/9，P5.6–P5.9 与 P5 Phase Exit 当时是 automatic 未完成项；后续 P5.6、P5.7 与 rescue P5.8-lite 已完成，当前只剩 P5.9 与 Phase Exit。真实公网、物理 iPhone、production-signed Keychain、第二 Mac 与真实 vendor 继续 post-MVP `BLOCKED` |
+| Relay Companion MVP P5.5 canonical fixture / receipt UI | 2026-07-27 automatic Task complete；52 code/test/fixture content manifest `8dd8610966430a5cf640617da53e34d91bf379fe0ad495ea2ef719a6fec9d5ba` + 10 docs = exact 62 paths；顶层 Swift `980 XCTest / 4 skipped + 35 Swift Testing / 0 failure`、warnings-as-errors focused `91/91`、iOS `91/91`，Rust protocol/producer/store integrity 与其余门禁见本节 fresh 证据。只证明共享 SessionSource 迁移、Core canonical reducer、Runtime v5 command-bound fixed Failed/commandless diagnostic、32 identity cap、snapshot mid-turn inference、canonical fixture、idempotent prompt/approval、event-seq retry fence、retired-operation 校验、receipt/canonical 乱序归并、terminal-before-receipt 收敛、旧 terminal 不消费下一 prompt receipt、terminal-only turn advance/direct-terminal fail-close、单 Failed 单资源广播、资源错误可见性与 fatal fail-close；fixture 仍为 preview/test，`SceneDelegate` 发行 composition 属 P5.6。P5.5 收口时 P5 为 5/9，P5.6–P5.9 与 P5 Phase Exit 当时是 automatic 未完成项；后续 P5.6、P5.7 与 rescue P5.8-lite/P5.9/Phase Exit 已完成。真实公网、物理 iPhone、production-signed Keychain、第二 Mac 与真实 vendor 继续 post-MVP `BLOCKED` |
 | Relay Companion MVP P5.6 iOS production composition / pairing lifecycle | 2026-07-28 automatic Task complete；11 iOS code/test content manifest `8cf47be71709bcd4648341eaa5cd7b693a00f6e871dfb586fbda76ee8662a2fb` + 10 docs = exact 21 paths。Pairing/AppLifecycle focused `42/42`、pre-stream ABA 10 轮、Relay shutdown `56/56`、RelayClient `445/4 entitlement SKIP`、顶层 Swift `985/4 skipped + 35`、fresh iOS `133/133`、Release build/fixture scan、strict format/docs/diff 均通过。只证明 Release Relay composition、完整邀请扫码/粘贴与确认、exact pairing/capture generation/replacement、verified revoke/offline forget 和前后台 source generation；P5.6 收口时 P5 为 6/9，P5.7–P5.9 与 P5 Phase Exit 当时未完成；后续 P5.7 已独立完成。真实公网、物理 iPhone、production-signed Keychain、第二 Mac、真实 vendor 与 destructive purge 继续 post-MVP `BLOCKED` |
-| Relay Companion MVP P5.7 macOS SessionSource registry | 2026-07-28 automatic Task complete；`40 prerequisite + 23 registry + 7 docs = 70 paths`，content hash 分别为 `85a46da6d79e56f6da1efd2e67b8851b1b264d7e796ded50334a7769b0af680f` 与 `df38994a015d0bd7014618a75afb6988b9dfec926a19f92cc5e4c8843788bcf6`。完成唯一 local UDS source、per-machine remote registry、typed local capability、真实 dual-scope host、Genesis/business-ready、typed snapshot recovery、observation reentrancy、`SessionModel` operation join 与 Preview/AppRuntime exact-pump barrier；Swift `1061/4 skipped + 35`、Rust daemon lib `1683/3 ignored`、main `7/7`、慢组与双路终审均通过。P5.7 收口时 P5 为 7/9；后续 rescue P5.8-lite 已完成，当前只剩 P5.9 与 P5 Phase Exit。真实公网、物理设备、production-signed Keychain、第二 Mac、真实 vendor 与 destructive purge 继续 post-MVP `BLOCKED` |
-| Relay Companion MVP rescue R3 P5.8-lite 本机 pending-device 控制面 | 2026-07-28 automatic Task complete；冻结 5-path code/test manifest SHA-256 `9c3bd63c9e56ef244d0d72da3192cfe3ade31b80c7a41675ee804355b56720ba`。只增加 production local composition 的“本机配对请求…”入口和注入 `LocalPairingAdministration` 的 AppKit 面板；Preview/fixture 与 remote scope 无入口。focused `46/46`、顶层 warnings-as-errors `1161 XCTest / 4 skipped + 48 Swift Testing`、ownership、strict format、docs、diff 与双路终审均通过，P0/P1/P2=0；真实 bundle 读回菜单、完整 DeviceSign fingerprint 与 typed transport failure。stable canonical daemon 缺失保持环境 `BLOCKED`，不计 PASS；machine picker、remote pairing/receipt UI、协议变更、真实公网/设备/vendor/production signing 继续 post-MVP `BLOCKED`。R3 收口后 P5 为 8/9，只剩 P5.9 与 automatic Phase Exit |
+| Relay Companion MVP P5.7 macOS SessionSource registry | 2026-07-28 automatic Task complete；`40 prerequisite + 23 registry + 7 docs = 70 paths`，content hash 分别为 `85a46da6d79e56f6da1efd2e67b8851b1b264d7e796ded50334a7769b0af680f` 与 `df38994a015d0bd7014618a75afb6988b9dfec926a19f92cc5e4c8843788bcf6`。完成唯一 local UDS source、per-machine remote registry、typed local capability、真实 dual-scope host、Genesis/business-ready、typed snapshot recovery、observation reentrancy、`SessionModel` operation join 与 Preview/AppRuntime exact-pump barrier；Swift `1061/4 skipped + 35`、Rust daemon lib `1683/3 ignored`、main `7/7`、慢组与双路终审均通过。P5.7 收口时 P5 为 7/9；后续 rescue P5.8-lite、P5.9 与 P5 Phase Exit 已完成。真实公网、物理设备、production-signed Keychain、第二 Mac、真实 vendor 与 destructive purge 继续 post-MVP `BLOCKED` |
+| Relay Companion MVP rescue R3 P5.8-lite 本机 pending-device 控制面 | 2026-07-28 automatic Task complete；冻结 5-path code/test manifest SHA-256 `9c3bd63c9e56ef244d0d72da3192cfe3ade31b80c7a41675ee804355b56720ba`。只增加 production local composition 的“本机配对请求…”入口和注入 `LocalPairingAdministration` 的 AppKit 面板；Preview/fixture 与 remote scope 无入口。focused `46/46`、顶层 warnings-as-errors `1161 XCTest / 4 skipped + 48 Swift Testing`、ownership、strict format、docs、diff 与双路终审均通过，P0/P1/P2=0；真实 bundle 读回菜单、完整 DeviceSign fingerprint 与 typed transport failure。stable canonical daemon 缺失保持环境 `BLOCKED`，不计 PASS；machine picker、remote pairing/receipt UI、协议变更、真实公网/设备/vendor/production signing 继续 post-MVP `BLOCKED`。R3 收口后 P5 为 8/9；后续 R4 已完成 P5.9 与 automatic Phase Exit |
 | Relay Companion MVP rescue R4 fixed-topology Simulator E2E / P5 Phase Exit | 2026-07-30 automatic Task complete。replacement evidence candidate `e323a6c` / tree `a1d74dd`，dual-scope 2-path hash `e8a8ea6`。连续三次 fresh lifecycle 均在 daemon generation 2 读回 restart/history、command/approval/revoke、双拓扑 readiness 与完整 cleanup；完整 `p5` 为 SessionSource `25/25`、RelayClient `457 executed / 4 external skipped / 0 failed`，`p4-auto` machine E2E `3 passed / 1 interactive ignored`。完整 Rust daemon `1719/3 ignored`、Swift `1169/4 skip + 48`、iOS `134/134` 及全部静态门禁 PASS；双路 review Approved，P0/P1/P2=0。R4、P5.9 与 P5 automatic Phase Exit 重新 complete；外部槽位继续 post-MVP BLOCKED。最终 MVP 仍须在新的 R5 closeout candidate 上重新执行完整矩阵 |
 | 测试覆盖率回归怀疑 | `cargo llvm-cov --summary-only`；`swift test --enable-code-coverage` + `xcrun llvm-cov report ...`；对照 `当前基线` 表 |
 

@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | In execution；replacement R4.8/R4.9 已闭合；正在生成新的 R5.1 closeout candidate |
+| 状态 | In execution；P5/Web automatic 已闭合；正在生成新的 R5.1 closeout candidate |
 | 日期 | 2026-07-28 |
 | 基线 | `codex/relay-companion-mvp` / `e400c1c` |
 | 目标 | 保留已验证的 P0–P5.7 基础，只交付一条可重复、可读回、可收口的 Companion automatic MVP 纵向链路 |
@@ -978,6 +978,19 @@ test "$macos_rc" -eq 78
   与 `dist` 未清理；未创建 tag、远端、push、PR、运行数据库、证书或密钥。任何提交后的仓库修改都会使 R5
   candidate 失效并回到 R5.1。
 
+### R5.1 Web automatic closeout candidate（2026-07-30）
+
+- Web W3 code/test evidence 固定为 `d4446ef1e26945458406e6811804a68fa617b7fd` / tree
+  `2bb877b37c160d9c35f0f54a835b9451a764cc38`：W3.6 三次 fresh、`--all`、contention、browser kill、network
+  fault、完整 Rust/Swift/iOS/P4/P5、release allocator、静态门禁与双路终审均完成，P0/P1/P2=0；W3 状态为
+  `Implemented (Web automatic test scope)`，W4 继续 BLOCKED。
+- 本 Task 只同步 README、架构、质量、Web design/implementation、rescue/历史 implementation 共 7 份 tracked
+  文档，并同步 ignored 的本地 progress ledger；不修改 production、test、runner、协议、schema、storage 或
+  版本。本次 docs-only scoped commit 生成新的 R5 closeout candidate；R5.2 必须从提交后 clean 状态重新冻结
+  commit/tree/path hashes，并在同一 candidate 上从零执行全部最终门禁。
+- 该提交前未创建 tag、远端、push、PR、运行数据库、证书或密钥。R5.2–R5.6 未提前标记完成；任何提交后的
+  仓库修改都会使 candidate 失效并回到 R5.1。
+
 ### Final gates
 
 ```bash
@@ -1038,6 +1051,6 @@ post-MVP external evidence: BLOCKED by explicit slots
 | R2 协议治理 | complete | R1 `19d187a`；governance hash `14a0c95b` | ownership 正/反例、Rust protocol/crypto、Swift 817/4 skip、四 schema/docs/diff PASS | 治理阶段无 UI 行为变化；真实 verifier/CLI generator 读回 PASS | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact 7-path scoped commit；提交后 clean；未 push |
 | R3 P5.8-lite | complete | code/test hash `9c3bd63c` | focused 46/46；Swift 1161/4 skip + 48；ownership/format/diff PASS | real bundle/menu/typed failure + fixture AppKit state matrix PASS；stable daemon BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | exact scoped commit 后 clean；未 push |
 | R4 Simulator E2E | complete | evidence `e323a6c` / tree `a1d74dd`；implementation hash `e8a8ea6` | fresh lifecycle `3/3`、完整 `p5`/`p4-auto`、Rust/Swift/iOS、Clippy/schema/network/docs 全部 PASS | generation 2 restart/history、command/approval/revoke、双拓扑 readiness、Relay plaintext absent 与完整 cleanup 每轮读回一致；外部槽位 BLOCKED | spec/security 与 quality/Git Approved；P0/P1/P2=0 | candidate 全程未漂移；ignored 生成物已移入废纸篓；clean；未 push |
-| R5 MVP 收口 | in progress（R5.1） | 本 docs-only scoped commit 生成新的 closeout candidate | R4 结果只作前置事实；R5.2 必须在新 candidate 上从零运行 | 生成物已清理；无 Relay/daemon/runner/xcodebuild 或 Booted Simulator | R5.3 待新 candidate 全量门禁后执行 | R5.1 只含 2 个文档；提交后须读回 clean；未 push |
+| R5 MVP 收口 | in progress（R5.1） | 本 7-path docs-only scoped commit 生成新的 closeout candidate | R4/W3 结果只作前置事实；R5.2 必须在新 candidate 上从零运行 | 提交前生成物与运行态已清理；最终 cleanup 待 R5.5 读回 | R5.3 待新 candidate 全量门禁后执行 | 提交后须读回 clean；未 push |
 
 状态只能按实际证据更新。focused PASS 不得把 Phase 标为 complete；外部 BLOCKED 不得改写为 PASS。

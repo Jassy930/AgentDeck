@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2 automatic complete；W3.1–W3.6 complete，W3.7 未完成；W4 BLOCKED |
+| 状态 | Implemented (Web automatic test scope)；W0–W3 complete；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -387,7 +387,7 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 - [x] W3.4：在 prompt/approval/reconnect 各阶段强制 kill browser process，再以同 profile 冷恢复。
 - [x] W3.5：使用 runner-owned 故障代理注入断连/延迟/Relay restart；代理只转发 bytes，不解析协议。
 - [x] W3.6：同一 committed candidate 连续三次 fresh 完成 W2 business + W3 recovery；任一轮失败重新计数。
-- [ ] W3.7：执行 spec/security 与 quality/Git 双路 review，清零 P0/P1/P2，更新文档并形成 W3 scoped commit。
+- [x] W3.7：执行 spec/security 与 quality/Git 双路 review，清零 P0/P1/P2，更新文档并形成 W3 scoped commit。
 
 ### W3.1 evidence（2026-07-30）
 
@@ -399,8 +399,8 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 - 三轮均整块跳过未暴露的 `256→512`，冷恢复后 reservation 为 `512→768`、最终 revision `4`；
   command/completed、approval total/applied 各 `1/1`，revoke 后 active grant `0`，paired/KEK/guard 与所有
   runner artifact absent。
-- W3.2 已由下一节关闭；W3.3 tab contention 也已由其后独立阶段关闭。W3.4 browser kill、W3.5 故障
-  代理、W3.6 三次 candidate 重复与 W3.7 双路终审仍未完成，W3 overall 仍未完成。
+- W3.2 已由下一节关闭；W3.3 tab contention 也已由其后独立阶段关闭。本 Task 收口当时 W3.4–W3.7
+  尚未完成；后续均已按下节独立关闭。
 
 ### W3.2 evidence（2026-07-30）
 
@@ -448,7 +448,7 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 - prompt/reconnect 最终 revision `5`、reservation `512→768`；approval 最终 revision `3`、reservation
   `256→512`。三轮 host 均为 command/completed `1/1`、approval total/applied `1/1`、revoke `1`、active
   grant `0`，业务明文扫描与全部 cleanup 通过。
-- W3.5 已由下一节关闭；W3.6–W3.7 仍未完成，W3 overall 仍未完成；W4 外部槽位状态不变。
+- W3.5 已由下一节关闭；本 Task 收口当时 W3.6–W3.7 尚未完成，后续均已关闭；W4 外部槽位状态不变。
 
 ### W3.5 evidence（2026-07-30）
 
@@ -462,7 +462,7 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
   transition `0` 后第二次恢复，最终 revision `4`、reservation `512→768`。
 - 三轮 host 均为 command/completed `1/1`、approval total/applied `1/1`、revoke `1`、active grant `0`；
   Relay/browser plaintext 与 proxy/browser/host/root/invite/UDS/paired/KEK/guard cleanup 全部通过。
-- W3.6 已由下一节关闭；W3.7 仍未完成，W3 overall 仍未完成；W4 外部槽位状态不变。
+- W3.6 已由下一节关闭；本 Task 收口当时 W3.7 尚未完成，后续已关闭；W4 外部槽位状态不变。
 
 ### W3.6 evidence（2026-07-30）
 
@@ -476,18 +476,29 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
 - 最终 W3.6 terminal 读回 `freshRuns=3`、W2b terminal `3`、W3 detail terminal `18`、W3 aggregate
   terminal `6`、`allRunsConsistent=true`。三轮 command/completed 与 approval total/applied 各 `1/1`，
   recovery revoke `1`、active grant `0`，plaintext 与 cleanup 全部 absent。
-- W3.6 automatic complete；W3.7 双路终审仍未完成，W3 overall 仍未完成；W4 外部槽位状态不变。
+- W3.6 automatic complete；本 Task 收口当时 W3.7 尚未完成，后续已关闭；W4 外部槽位状态不变。
 
-### W3.7 review fixes candidate（2026-07-30）
+### W3.7 双路终审与 automatic closeout（2026-07-30）
 
 - spec/security 首轮发现 fault proxy 使用跨连接全局字节数证明 armed connection 2 KiB、delay 在 downstream
   backpressure 时提前 resume、stale writer generation 清理后仍抛旧错误，以及 paired/pending ciphertext 与
   revoked tombstone 缺少读前上界/结构校验；均已改为 fail-close，并补 W3.3/W3.5 行为回归。
 - quality/Git 首轮发现 W3.6 只验证 recovery detail 的 3+3 数量、没有验证六种 cut唯一覆盖，且本计划误写
   不存在的 `bun run test:e2e`；已增加 exact cut/aggregate 自检并改用真实 W0 browser 命令。
-- 修复后的 focused W0、W3.3 与 W3.5 已通过；这些结果只证明 review fixes candidate 可进入重新冻结，旧
-  W3.5/W3.6 运行证据已因代码变化失效。W3.7 仍未完成，必须在新 committed candidate 上从零重跑三次
-  fresh、完整门禁与双路复审。
+- review fixes 与 Simulator restart contract 修补后的 code/test candidate 固定为
+  `d4446ef1e26945458406e6811804a68fa617b7fd` / tree
+  `2bb877b37c160d9c35f0f54a835b9451a764cc38`。该候选重新通过 W3.6 三次 fresh：W2b terminal `3`、
+  W3 detail `18`、W3 aggregate `6`、`allRunsConsistent=true`；`--all`、`--contention`、
+  `--browser-kills` 与 `--network-faults` 也全部 PASS。
+- 同一候选通过完整 Rust workspace（daemon `1719 passed / 3 ignored / 0 failed`）、Swift warnings-as-errors
+  （`1169 executed / 4 external skips / 0 failed` + Swift Testing `48/48`）、iOS Simulator `134/134`、
+  `p4-auto`、完整 `p5`、release allocator `1/1` 与全部静态门禁。完整 `p5` 首次在冷 Simulator 出现一次
+  synthetic assistant UI observation timeout；runner 完整 cleanup，随后同候选 focused lifecycle 与完整
+  aggregate 均 PASS，因此该瞬时失败不计最终证据，也没有被静默省略。
+- 对 `1a74cf7..d4446ef` 整个 W3 增量重新执行 `spec/security` 与 `quality/Git` 终审，两路均 Approved，
+  P0/P1/P2=0。Relay/Runtime/E2EE owner/schema 未变，TypeScript ownership 正反例、runner 负例、明文扫描、
+  network/no-net、docs/diff/status 与 cleanup 均通过。本次 docs-only scoped commit 只同步事实源，不修改
+  production、test、runner、协议或版本；W3 automatic overall complete。
 
 ### Gates
 
@@ -547,7 +558,7 @@ W4 不由本机 automatic 结果自动解锁。进入前另建执行授权和证
 - [x] W1 浏览器直连真实 Relay v2/E2EE，无业务 bridge。
 - [x] W2 完成完整远程业务流，iOS E2E 不回归（W2a–W2.8 automatic overall complete）。
 - [x] W3 crash/restart/tab contention 与三次 fresh run 全绿。
-- [ ] TypeScript 无 wire/crypto owner；Relay/Runtime/E2EE 版本未变。
-- [ ] 文档、diagnostics、quality、runbook 与实际一致。
-- [ ] candidate 双路 review P0/P1/P2=0，cleanup absent，Git clean。
-- [ ] W4 外部 evidence 独立保持 BLOCKED 或由真实证据关闭。
+- [x] TypeScript 无 wire/crypto owner；Relay/Runtime/E2EE 版本未变。
+- [x] 文档、diagnostics、quality、runbook 与实际一致。
+- [x] candidate 双路 review P0/P1/P2=0，cleanup absent，Git clean。
+- [x] W4 外部 evidence 独立保持 BLOCKED，未被 automatic 结果冒充 PASS。

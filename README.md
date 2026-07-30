@@ -232,7 +232,7 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Web Test Companion（W0/W1/W2 complete；W3.1–W3.6 complete）
+## Relay Web Test Companion（Implemented；W0–W3 automatic complete）
 
 `agentdeck-web-core` 已证明现有 Relay v2 codec、Runtime v5 request contract 与 E2EE v1 crypto 可以复用同一
 Rust 实现编译为 browser WASM；`web/relay-test-companion` 是 Bun 管理的最小测试页面与 host adapter，
@@ -387,10 +387,11 @@ terminal。任一轮发生候选漂移、计数偏差、明文/cleanup 失败或
 scripts/run-relay-web-companion-e2e.sh --repeatability
 ```
 
-冻结候选 `9597c16` / tree `b21c386b2002fa4052cabb9db1457153c30d4044` 已产出最终
+最终 code/test 候选 `d4446ef` / tree `2bb877b37c160d9c35f0f54a835b9451a764cc38` 已重新产出
 `relay-web-companion-w3.6` PASS：`freshRuns=3`、W2b terminal `3`、W3 detail terminal `18`、W3 aggregate
-terminal `6`、`allRunsConsistent=true`，三轮明文与 cleanup 全部 absent。因此 W3.6 automatic 已关闭；该
-证据不替代 W3.7 双路终审。
+terminal `6`、`allRunsConsistent=true`，三轮明文与 cleanup 全部 absent。`--all`、contention、browser kill
+和 network fault 场景也全部通过。W3.7 已对整个 W3 增量完成 `spec/security` 与 `quality/Git` 双路终审，
+两路均 Approved，P0/P1/P2=0；TypeScript ownership、协议/crypto owner 不漂移和 cleanup 均已读回。
 
 本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
 `http://127.0.0.1:4173/`。该入口只用于查看测试壳；需要 paired durable state、隔离 profile 和完整 cleanup
@@ -400,17 +401,19 @@ terminal `6`、`allRunsConsistent=true`，三轮明文与 cleanup 全部 absent�
 W2.7 已关闭 approval loser 与 stale/replay/nonce-reuse 零 mutation 反例矩阵；W2.8 又在同一 candidate 上完成
 Web aggregate、fixed-topology iOS Simulator、SessionSource/RelayClient 回归和 runbook 收口，因此 W2 automatic
 overall complete。W3.1/W3.2 两类 crash cut、W3.3 tab contention/generation 隔离、W3.4 真实 browser kill、
-W3.5 网络故障与 W3.6 同一 candidate 三次 fresh run均已关闭；W3.7 双路终审尚未完成。公网 WSS、
-production SPKI pin/signing、物理设备、第二台 Mac 与真实 vendor 属于 W4，继续独立 BLOCKED。阶段事实源见
+W3.5 网络故障、W3.6 同一 candidate 三次 fresh run与 W3.7 双路终审均已关闭，因此当前状态为
+`Implemented (Web automatic test scope)`。公网 WSS、production SPKI pin/signing、物理设备、第二台 Mac 与
+真实 vendor 属于 W4，继续独立 BLOCKED。阶段事实源见
 [`Relay Web Test Companion 实施计划`](docs/plans/2026-07-30-relay-web-test-companion-implementation.md)。
 
-## Relay Companion MVP 实施状态（P5.8-lite automatic complete；P5 为 8/9）
+## Relay Companion MVP 实施状态（P5 automatic complete；R5 closeout candidate 生成中）
 
 2026-07-28 起，剩余 Relay 工作按
 [`Relay Companion MVP 救援实施计划`](docs/plans/2026-07-28-relay-companion-mvp-rescue-implementation.md)
-执行：基线冻结、`master` 同步、协议所有权治理与 P5.8-lite 被控 Mac 本机 pending-device 确认 UI 已完成；
-当前只剩固定拓扑 iOS Simulator E2E 与最终 `p5` verifier/三次 fresh run/双路 review 收口。原计划 P6、
-远程 macOS 完整控制面、真实设备/公网/vendor/production-signing 证据全部后置，不再进入当前 MVP。
+执行：基线冻结、`master` 同步、协议所有权治理、P5.8-lite 被控 Mac 本机 pending-device 确认 UI 与固定拓扑
+iOS Simulator/P5 automatic Phase Exit 已完成，P5 为 9/9 replacement scope。当前只剩 R5 在新的 docs-only
+closeout candidate 上从零重绑完整门禁、双路终审、外部 BLOCKED 与 cleanup。原计划 P6、远程 macOS 完整
+控制面、真实设备/公网/vendor/production-signing 证据全部后置，不再进入当前 MVP。
 
 2026-07-18 纠偏曾让主线恢复 Task 粒度门禁；Runtime store 的 P3 边界只承诺已有 committed artifact
 中缺 KEK 或无法通过当前 KEK/database/domain 认证的行/页改删及跨库移植 fail-close；整套 artifact
