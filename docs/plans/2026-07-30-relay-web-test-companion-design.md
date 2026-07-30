@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2a/W2b/W2c automatic complete；W2 overall 等待 W2.7/W2.8；W3 未开始；W4 BLOCKED |
+| 状态 | W0/W1/W2a/W2b/W2c/W2.7 automatic complete；W2 overall 等待 W2.8；W3 未开始；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
 | 目标 | 用浏览器直接复用 Relay v2 + E2EE v1，增加一条低成本、可重复的远程业务闭环 |
@@ -56,7 +56,12 @@ W2c 已把同一 paired material 以不可导出 WebCrypto KEK 加密后 promoti
 为 `0→256`，强制 reload 后先 exact CAS 提交新 reservation，再从 `256` 使用到 `512`；提交前零网络。
 daemon generation `1→2` 后恢复原身份与两条 subscription，Catalog backfill 观察到 restart marker，业务副作用
 仍保持 `1/1`。MachineRoot-signed revoke terminal 验证后删除 material/KEK、写 revision `3` tombstone，旧
-identity 重连在发送前失败。W2c automatic slice 已完成，但 W2.7 完整负例矩阵与 W2.8 overall 收口尚未完成。
+identity 重连在发送前失败。W2c automatic slice 已完成。
+
+W2.7 将 reply/stream replay set 的 COMMIT 推迟到完整密码学与语义准入成功之后，并抽取 approval receipt、
+stream exact-next、nonce uniqueness 与 durable reservation 的生产 helper。native 与 Chromium 共用 typed
+snapshot 关闭 12 项 negative/zero-mutation readback；daemon machine E2E 同时证明后到 approval resolve 与
+Applied Retry 前后 SQLite business counts 不变。W2.7 已完成，W2.8 overall 收口仍开放。
 
 ## 2. 目标与非目标
 
@@ -205,14 +210,15 @@ WebSocket API 不暴露 peer certificate，也不允许应用执行等价的 SPK
 | W2a 配对 | 浏览器能否在零 bridge 下完成本机批准的真实配对 | local inspect、确认前零网络、PairPending、same-UID approve、verified receipt/Closed | paired durability、业务 principal、物理/公网 |
 | W2b 业务 | paired principal 能否完成最小远程操作 | list/open/prompt/approval 与 exactly-once | reload/recovery/revoke、物理/公网 |
 | W2c 恢复 | paired state 能否跨页面与连接恢复并安全撤销 | IndexedDB promotion、reload/reconnect、cursor/backfill、revoke | crash-cut 三轮与外部证据 |
+| W2.7 负向准入 | loser/replay/stale/reservation 拒绝是否零业务 mutation | native/WASM typed matrix、daemon approval ledger frozen counts | crash-cut、tab contention 与外部证据 |
 | W3 恢复隔离 | 浏览器 crash/tab contention/Relay restart 是否可重复收敛 | 三个 durable cut、旧 generation、第二 tab、网络中断、三次 fresh run、cleanup | 跨物理网络和系统 Keychain |
 | W4 外部槽位 | 公网和独立设备是否真实可用 | 独立 runner 的真实输入、证据与 readback | automatic 本机结果不能代替 |
 
 W0–W3 每阶段必须独立 scoped commit、focused gate、integration gate、运行读回、负例、cleanup、文档更新和
 `git status --short --branch` clean。代码候选变化会使本阶段旧证据失效。
 
-当前只完成到 W2c automatic slice。W2.7 的 approval loser、完整 stale/replay/nonce-reuse 零 mutation 矩阵与
-W2.8 overall closeout 仍开放；W3 deterministic crash cuts、第二 tab、网络故障和三次 fresh run尚未开始。
+当前已完成 W2c automatic 正向链路与 W2.7 approval loser、stale/replay/nonce-reuse 零 mutation 矩阵；
+W2.8 overall closeout 仍开放。W3 deterministic crash cuts、第二 tab、网络故障和三次 fresh run尚未开始。
 W4 的公网、物理设备、production signing/pin、第二台 Mac 与真实 vendor继续独立 BLOCKED。
 
 ## 10. 验收边界

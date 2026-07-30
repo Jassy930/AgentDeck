@@ -85,6 +85,21 @@ declare global {
     recoveryStage: string | null;
   }>;
 
+  type W2NegativeEvidence = Readonly<{
+    approvalLoserRecognizedApplied: boolean;
+    approvalLoserZeroClaimMutation: boolean;
+    stalePublishRejected: boolean;
+    skippedPublishRejected: boolean;
+    rejectedPublishCursorUnchanged: boolean;
+    replyNonceReplayRejected: boolean;
+    replyCounterSetUnchanged: boolean;
+    streamNonceReuseRejected: boolean;
+    streamCounterSetUnchanged: boolean;
+    uncommittedReservationRejected: boolean;
+    reservationOverflowRejected: boolean;
+    rejectedReservationCounterUnchanged: boolean;
+  }>;
+
   type PairedStorageEvidence = Readonly<{
     pairedPresent: boolean;
     kekPresent: boolean;
@@ -133,6 +148,7 @@ declare global {
     runtimeRoundtrip: (input: readonly number[]) => Promise<number[]>;
     runtimeRejected: (input: readonly number[]) => Promise<boolean>;
     cryptoTamperRejected: () => Promise<boolean>;
+    w2NegativeSnapshot: () => Promise<W2NegativeEvidence>;
     runW1Transport: (
       origin: string,
       relayServerIdHex: string,

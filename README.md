@@ -232,7 +232,7 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Web Test Companion（W0/W1/W2a/W2b/W2c automatic complete）
+## Relay Web Test Companion（W0/W1/W2a/W2b/W2c/W2.7 automatic complete）
 
 `agentdeck-web-core` 已证明现有 Relay v2 codec、Runtime v5 request contract 与 E2EE v1 crypto 可以复用同一
 Rust 实现编译为 browser WASM；`web/relay-test-companion` 是 Bun 管理的最小测试页面与 host adapter，
@@ -303,18 +303,26 @@ KEK、写入 revision `3` revoked tombstone，旧 identity 的再次连接在发
 
 ```bash
 scripts/run-relay-web-companion-e2e.sh --durable
+scripts/run-relay-web-companion-e2e.sh --negative
 scripts/run-relay-web-companion-e2e.sh --all
 ```
 
-`--all` 现在依次执行 W0/W1 contract、W1 transport、W2a pairing、W2b business 与 W2c durable。
+W2.7 复用 Web business core 的生产准入函数，补齐 approval loser、stale/skipped outer sequence、directed reply
+nonce replay、stream nonce reuse，以及未提交/越过 reservation 的 counter 负例。WASM typed snapshot 的 12 项
+读回必须全部为 true；TypeScript 不解析 wire/crypto。daemon machine E2E 还会在 approval loser 与 Applied
+Retry 前后冻结 SQLite 的 completed command、approval total/applied、revoked authorization 四项计数，要求
+逐项不变。reply/stream nonce 只在完整验签、解密和语义接纳后才提交到 replay set，拒绝路径不消费 counter。
+
+`--all` 现在依次执行 W0/W1 contract、W1 transport、W2a pairing、W2b business、W2c durable 与 W2.7
+negative matrix。
 
 本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
 `http://127.0.0.1:4173/`。该入口只用于查看测试壳；需要 paired durable state、隔离 profile 和完整 cleanup
 时必须使用统一 runner，不在日常浏览器 profile 中手工保留测试身份。
 
 这仍不是完整网页版。W2c 已关闭单轮 automatic 的 pair→业务→reload/reconnect/backfill→revoke 正向链路，
-但 W2.7 的 approval loser、完整 stale/replay/nonce-reuse 零 mutation 反例矩阵尚未闭合，所以 W2 overall
-仍保持进行中；W3 的 crash-cut、tab contention 和同一 candidate 三次 fresh run 尚未开始。公网 WSS、
+W2.7 已关闭 approval loser 与 stale/replay/nonce-reuse 零 mutation 反例矩阵；W2 overall 仍等待 W2.8 总体
+runbook、回归与提交收口。W3 的 crash-cut、tab contention 和同一 candidate 三次 fresh run 尚未开始。公网 WSS、
 production SPKI pin/signing、物理设备、第二台 Mac 与真实 vendor 属于 W4，继续独立 BLOCKED。阶段事实源见
 [`Relay Web Test Companion 实施计划`](docs/plans/2026-07-30-relay-web-test-companion-implementation.md)。
 

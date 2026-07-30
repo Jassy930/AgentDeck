@@ -5,6 +5,7 @@
 //! 全部留在 Rust/WASM。
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 
 use agentdeck_crypto::PairResponseExpectedV1;
 use agentdeck_crypto::rand_core::TryRng as _;
@@ -91,6 +92,27 @@ pub struct W2BusinessEvidence {
     pub recovery_stage: Option<String>,
 }
 
+/// W2.7 负向准入矩阵的 typed readback。
+///
+/// 这些字段由 Web business core 与生产收包路径共用的 admission helper 计算；host 只读结果，
+/// 不解析 Relay/Runtime wire，也不自行实现 replay、cursor 或 counter 规则。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct W2NegativeSnapshot {
+    pub approval_loser_recognized_applied: bool,
+    pub approval_loser_zero_claim_mutation: bool,
+    pub stale_publish_rejected: bool,
+    pub skipped_publish_rejected: bool,
+    pub rejected_publish_cursor_unchanged: bool,
+    pub reply_nonce_replay_rejected: bool,
+    pub reply_counter_set_unchanged: bool,
+    pub stream_nonce_reuse_rejected: bool,
+    pub stream_counter_set_unchanged: bool,
+    pub uncommitted_reservation_rejected: bool,
+    pub reservation_overflow_rejected: bool,
+    pub rejected_reservation_counter_unchanged: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrincipalPhase {
     Initial,
@@ -146,6 +168,23 @@ enum DurabilityPhase {
     Volatile,
     AwaitingCommit { reserved_high_water: u64 },
     Active { reserved_high_water: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApprovalReceiptAdmission {
+    Claimed,
+    AppliedWinner,
+    AppliedLoser,
+}
+
+impl ApprovalReceiptAdmission {
+    const fn applied(self) -> bool {
+        matches!(self, Self::AppliedWinner | Self::AppliedLoser)
+    }
+
+    const fn creates_claim(self) -> bool {
+        matches!(self, Self::Claimed)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1003,8 +1042,8 @@ impl W2BusinessCore {
         if reply.device_route != self.grant.device_route || reply.request_route != request_route {
             return Err(self.fail(W2PairingError::BusinessFrameInvalid));
         }
-        let opened = self.open_directed_reply(request_route, &reply.sealed_blob.0)?;
-        if opened.payload_kind == SealedPayloadKind::KeyUpdate {
+        let (opened, counter) = self.open_directed_reply(request_route, &reply.sealed_blob.0)?;
+        let response = if opened.payload_kind == SealedPayloadKind::KeyUpdate {
             let control = KeyControlV1::from_canonical_bytes(&opened.payload)
                 .map_err(|_| self.fail(W2PairingError::BusinessFrameInvalid))?;
             let KeyControlV1::StreamBinding { binding, .. } = control else {
@@ -1029,19 +1068,24 @@ impl W2BusinessCore {
                 && failure.code == "daemon.remote.transition.business_fenced"
             {
                 self.accept_business_fence(request_route)?;
-                return Ok(Vec::new());
+                Ok(Vec::new())
+            } else {
+                self.accept_runtime_reply(opened.payload_kind, runtime_reply)?;
+                self.finish_pending_if_ready();
+                Ok(Vec::new())
             }
-            self.accept_runtime_reply(opened.payload_kind, runtime_reply)?;
-            self.finish_pending_if_ready();
-            Ok(Vec::new())
+        }?;
+        if !self.reply_counters.insert(counter) {
+            return Err(self.fail(W2PairingError::BusinessCryptoFailed));
         }
+        Ok(response)
     }
 
     fn open_directed_reply(
         &mut self,
         request_route: RequestRouteId,
         sealed_blob: &[u8],
-    ) -> Result<agentdeck_protocol::e2ee::SealedPayloadV1, W2PairingError> {
+    ) -> Result<(agentdeck_protocol::e2ee::SealedPayloadV1, u64), W2PairingError> {
         let signed = SignedSealedBlobV1::from_wire_bytes(sealed_blob)
             .map_err(|_| self.fail(W2PairingError::BusinessCryptoFailed))?;
         let header = &signed.inner;
@@ -1057,7 +1101,7 @@ impl W2BusinessCore {
                 .try_into()
                 .map_err(|_| self.fail(W2PairingError::BusinessCryptoFailed))?,
         );
-        if !self.reply_counters.insert(counter) {
+        if !nonce_counter_is_fresh(&self.reply_counters, &counter) {
             return Err(self.fail(W2PairingError::BusinessCryptoFailed));
         }
         let context = OuterContextV1::directed_reply(
@@ -1068,8 +1112,9 @@ impl W2BusinessCore {
         );
         let verified = verify_sealed(signed, &self.machine_data_verifying_key, &context)
             .map_err(|_| self.fail(W2PairingError::BusinessCryptoFailed))?;
-        open_sealed_payload(&self.reply_key, &context, verified)
-            .map_err(|_| self.fail(W2PairingError::BusinessCryptoFailed))
+        let opened = open_sealed_payload(&self.reply_key, &context, verified)
+            .map_err(|_| self.fail(W2PairingError::BusinessCryptoFailed))?;
+        Ok((opened, counter))
     }
 
     fn accept_business_fence(
@@ -1202,28 +1247,10 @@ impl W2BusinessCore {
                     .approval
                     .as_ref()
                     .ok_or(W2PairingError::BusinessStateInvalid)?;
-                let claimed = matches!(
-                    receipt,
-                    ApprovalReceipt::Claimed { ref approval_id }
-                        if approval_id == &approval.approval_id
-                );
-                let applied = matches!(
-                    receipt,
-                    ApprovalReceipt::Applied { ref approval_id }
-                        if approval_id == &approval.approval_id
-                ) || matches!(
-                    receipt,
-                    ApprovalReceipt::AlreadyHandled {
-                        ref approval_id,
-                        decision: ActionDecisionKind::Approve,
-                        state: ApprovalDeliveryState::Applied,
-                    } if approval_id == &approval.approval_id
-                );
-                if !claimed && !applied {
-                    return Err(W2PairingError::BusinessFrameInvalid);
-                }
+                let admission = classify_approval_receipt(&receipt, &approval.approval_id)
+                    .ok_or(W2PairingError::BusinessFrameInvalid)?;
                 *terminal = true;
-                *receipt_applied = applied;
+                *receipt_applied = admission.applied();
                 Ok(())
             }
             (
@@ -1521,7 +1548,7 @@ impl W2BusinessCore {
             .ok_or(W2PairingError::BusinessStateInvalid)?;
         if publish.stream_route != binding.stream_route
             || publish.generation != binding.stream_generation
-            || binding.stream_cursor.checked_next().ok() != Some(publish.stream_seq)
+            || !stream_seq_is_exact_next(binding.stream_cursor, publish.stream_seq)
         {
             return Err(W2PairingError::BusinessFrameInvalid);
         }
@@ -1545,7 +1572,8 @@ impl W2BusinessCore {
                 .try_into()
                 .map_err(|_| W2PairingError::BusinessCryptoFailed)?,
         );
-        if !self.stream_counters.insert((publish.stream_route, counter)) {
+        let counter_key = (publish.stream_route, counter);
+        if !nonce_counter_is_fresh(&self.stream_counters, &counter_key) {
             return Err(W2PairingError::BusinessCryptoFailed);
         }
         let context = OuterContextV1 {
@@ -1586,7 +1614,11 @@ impl W2BusinessCore {
             if stream_route != publish.stream_route {
                 return Err(W2PairingError::BusinessFrameInvalid);
             }
-            return self.start_stream_applied_ack(&binding, &publish, barrier);
+            let response = self.start_stream_applied_ack(&binding, &publish, barrier)?;
+            if !self.stream_counters.insert(counter_key) {
+                return Err(W2PairingError::BusinessCryptoFailed);
+            }
+            return Ok(response);
         }
         let envelope: RuntimeEnvelope = serde_json::from_slice(&opened.payload)
             .map_err(|_| W2PairingError::BusinessFrameInvalid)?;
@@ -1609,6 +1641,9 @@ impl W2BusinessCore {
                 RuntimeMessage::Stream(RuntimeStreamItem::Event(event)),
             ) => self.accept_live_conversation_event(&publish, event)?,
             _ => return Err(W2PairingError::BusinessFrameInvalid),
+        }
+        if !self.stream_counters.insert(counter_key) {
+            return Err(W2PairingError::BusinessCryptoFailed);
         }
         self.evidence.outer_ack_count = self
             .evidence
@@ -2163,14 +2198,7 @@ impl W2BusinessCore {
     }
 
     fn ensure_counter_reserved(&self, next_counter: u64) -> Result<(), W2PairingError> {
-        match self.durability {
-            DurabilityPhase::Volatile => Ok(()),
-            DurabilityPhase::AwaitingCommit { .. } => Err(W2PairingError::DurableCommitRequired),
-            DurabilityPhase::Active {
-                reserved_high_water,
-            } if next_counter <= reserved_high_water => Ok(()),
-            DurabilityPhase::Active { .. } => Err(W2PairingError::BusinessCounterExhausted),
-        }
+        counter_reservation_admission(self.durability, next_counter)
     }
 
     fn random_request_route(&mut self) -> Result<RequestRouteId, W2PairingError> {
@@ -2189,6 +2217,119 @@ impl W2BusinessCore {
     fn fail(&mut self, error: W2PairingError) -> W2PairingError {
         self.phase = PrincipalPhase::Failed;
         error
+    }
+}
+
+/// 生成 native/WASM 共用的 W2.7 负向准入证据。
+#[must_use]
+pub fn w2_negative_snapshot() -> W2NegativeSnapshot {
+    let approval_id = ApprovalId::new("web-w2-negative-approval");
+    let loser = ApprovalReceipt::AlreadyHandled {
+        approval_id: approval_id.clone(),
+        decision: ActionDecisionKind::Approve,
+        state: ApprovalDeliveryState::Applied,
+    };
+    let loser_admission = classify_approval_receipt(&loser, &approval_id);
+
+    let cursor = StreamCursor::At(9);
+    let stale_publish_rejected = !stream_seq_is_exact_next(cursor, 9);
+    let skipped_publish_rejected = !stream_seq_is_exact_next(cursor, 11);
+    let cursor_after_rejections = cursor;
+
+    let reply_counters = HashSet::from([7_u64]);
+    let reply_counter_count = reply_counters.len();
+    let reply_nonce_replay_rejected = !nonce_counter_is_fresh(&reply_counters, &7);
+
+    let stream_route = StreamRouteId::from_bytes([0x27; 16]);
+    let stream_counters = HashSet::from([(stream_route, 13_u64)]);
+    let stream_counter_count = stream_counters.len();
+    let stream_nonce_reuse_rejected =
+        !nonce_counter_is_fresh(&stream_counters, &(stream_route, 13));
+
+    let command_counter = W2_COUNTER_RESERVATION_BLOCK;
+    let uncommitted_reservation_rejected = matches!(
+        counter_reservation_admission(
+            DurabilityPhase::AwaitingCommit {
+                reserved_high_water: W2_COUNTER_RESERVATION_BLOCK,
+            },
+            1,
+        ),
+        Err(W2PairingError::DurableCommitRequired)
+    );
+    let reservation_overflow_rejected = matches!(
+        counter_reservation_admission(
+            DurabilityPhase::Active {
+                reserved_high_water: W2_COUNTER_RESERVATION_BLOCK,
+            },
+            W2_COUNTER_RESERVATION_BLOCK + 1,
+        ),
+        Err(W2PairingError::BusinessCounterExhausted)
+    );
+
+    W2NegativeSnapshot {
+        approval_loser_recognized_applied: loser_admission
+            == Some(ApprovalReceiptAdmission::AppliedLoser),
+        approval_loser_zero_claim_mutation: loser_admission
+            .is_some_and(|admission| !admission.creates_claim()),
+        stale_publish_rejected,
+        skipped_publish_rejected,
+        rejected_publish_cursor_unchanged: cursor_after_rejections == cursor,
+        reply_nonce_replay_rejected,
+        reply_counter_set_unchanged: reply_counters.len() == reply_counter_count,
+        stream_nonce_reuse_rejected,
+        stream_counter_set_unchanged: stream_counters.len() == stream_counter_count,
+        uncommitted_reservation_rejected,
+        reservation_overflow_rejected,
+        rejected_reservation_counter_unchanged: command_counter == W2_COUNTER_RESERVATION_BLOCK,
+    }
+}
+
+fn classify_approval_receipt(
+    receipt: &ApprovalReceipt,
+    expected_approval_id: &ApprovalId,
+) -> Option<ApprovalReceiptAdmission> {
+    match receipt {
+        ApprovalReceipt::Claimed { approval_id } if approval_id == expected_approval_id => {
+            Some(ApprovalReceiptAdmission::Claimed)
+        }
+        ApprovalReceipt::Applied { approval_id } if approval_id == expected_approval_id => {
+            Some(ApprovalReceiptAdmission::AppliedWinner)
+        }
+        ApprovalReceipt::AlreadyHandled {
+            approval_id,
+            decision: ActionDecisionKind::Approve,
+            state: ApprovalDeliveryState::Applied,
+        } if approval_id == expected_approval_id => Some(ApprovalReceiptAdmission::AppliedLoser),
+        ApprovalReceipt::Claimed { .. }
+        | ApprovalReceipt::Applied { .. }
+        | ApprovalReceipt::AlreadyHandled { .. }
+        | ApprovalReceipt::DeliveryFailed { .. }
+        | ApprovalReceipt::Expired { .. } => None,
+    }
+}
+
+fn nonce_counter_is_fresh<T>(seen: &HashSet<T>, counter: &T) -> bool
+where
+    T: Eq + Hash,
+{
+    !seen.contains(counter)
+}
+
+fn stream_seq_is_exact_next(cursor: StreamCursor, stream_seq: u64) -> bool {
+    cursor.checked_next().ok() == Some(stream_seq)
+}
+
+fn counter_reservation_admission(
+    durability: DurabilityPhase,
+    next_counter: u64,
+) -> Result<(), W2PairingError> {
+    match durability {
+        DurabilityPhase::Volatile => Ok(()),
+        DurabilityPhase::AwaitingCommit { .. } => Err(W2PairingError::DurableCommitRequired),
+        DurabilityPhase::Active {
+            reserved_high_water,
+        } if next_counter <= reserved_high_water => Ok(()),
+        DurabilityPhase::Active { .. } => Err(W2PairingError::BusinessCounterExhausted),
     }
 }
 

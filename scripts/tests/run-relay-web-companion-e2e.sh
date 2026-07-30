@@ -23,10 +23,16 @@ printf '%s\n' "$all_case" | grep -Fq 'run_business' \
   || { printf 'runner --all omitted business gate\n' >&2; exit 1; }
 printf '%s\n' "$all_case" | grep -Fq 'run_durable' \
   || { printf 'runner --all omitted durable gate\n' >&2; exit 1; }
+printf '%s\n' "$all_case" | grep -Fq 'run_negative' \
+  || { printf 'runner --all omitted negative gate\n' >&2; exit 1; }
 
 durable_case="$(sed -n '/^[[:space:]]*--durable)/,/^[[:space:]]*;;/p' "$runner")"
 printf '%s\n' "$durable_case" | grep -Fq 'run_durable' \
   || { printf 'runner --durable omitted durable gate\n' >&2; exit 1; }
+
+negative_case="$(sed -n '/^[[:space:]]*--negative)/,/^[[:space:]]*;;/p' "$runner")"
+printf '%s\n' "$negative_case" | grep -Fq 'run_negative' \
+  || { printf 'runner --negative omitted negative gate\n' >&2; exit 1; }
 
 if "$runner" --unknown >/dev/null 2>&1; then
   printf 'runner accepted an unknown mode\n' >&2

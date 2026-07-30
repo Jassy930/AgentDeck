@@ -24,6 +24,7 @@ type WebCoreModule = Readonly<{
   w0ValidateRelayFrame: (bytes: Uint8Array) => void;
   w0RuntimeRequestRoundtrip: (bytes: Uint8Array) => Uint8Array;
   w0CryptoTamperIsRejected: () => boolean;
+  w2NegativeSnapshot?: () => string;
   W1Session?: W1WasmSessionConstructor;
   W2PairingSession?: W2WasmSessionConstructor;
 }>;
@@ -77,6 +78,13 @@ const api: RelayTestApi = {
   },
   async cryptoTamperRejected() {
     return (await corePromise).w0CryptoTamperIsRejected();
+  },
+  async w2NegativeSnapshot() {
+    const snapshot = (await corePromise).w2NegativeSnapshot;
+    if (snapshot === undefined) {
+      throw new Error("web.remote.w2_fixture_unavailable");
+    }
+    return JSON.parse(snapshot()) as W2NegativeEvidence;
   },
   async runW1Transport(origin, relayServerIdHex, caseName) {
     const constructor = (await corePromise).W1Session;

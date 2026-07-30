@@ -41,7 +41,7 @@ mod w2_business;
 #[cfg(feature = "w2-test-fixture")]
 pub use w2::{W2PairingCore, W2PairingError, W2PairingEvidence, W2PairingPreview};
 #[cfg(feature = "w2-test-fixture")]
-pub use w2_business::W2BusinessEvidence;
+pub use w2_business::{W2BusinessEvidence, W2NegativeSnapshot, w2_negative_snapshot};
 
 const ED_SEED: [u8; 32] = [0x01; 32];
 const AEAD_KEY: [u8; 32] = [0x11; 32];
@@ -409,6 +409,17 @@ mod wasm {
         let snapshot = super::w0_negative_snapshot().map_err(js_error)?;
         serde_json::to_string(&snapshot)
             .map_err(|_| js_error(super::WebCoreError::SerializationFailed))
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "w2-test-fixture"))]
+mod w2_negative_wasm {
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen(js_name = w2NegativeSnapshot)]
+    pub fn negative_snapshot() -> Result<String, JsValue> {
+        serde_json::to_string(&super::w2_negative_snapshot())
+            .map_err(|_| JsValue::from_str("web.remote.pairing.serialization_failed"))
     }
 }
 

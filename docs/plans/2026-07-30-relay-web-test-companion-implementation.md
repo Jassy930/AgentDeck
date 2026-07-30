@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2a/W2b/W2c automatic complete；W2 overall 等待 W2.7/W2.8；W3 未开始；W4 BLOCKED |
+| 状态 | W0/W1/W2a/W2b/W2c/W2.7 automatic complete；W2 overall 等待 W2.8；W3 未开始；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -206,7 +206,7 @@ git status --short --branch
 2. **W2b business**：paired principal 的 list/open/prompt/approval。
 3. **W2c durability**：IndexedDB promotion、reload/reconnect/backfill 与 revoke。
 
-W2c 完成是标记 W2 complete 的必要条件；W2 overall 还必须关闭 W2.7 完整负例矩阵与 W2.8 总体收口。
+W2c 完成是标记 W2 complete 的必要条件；W2.7 完整负例矩阵现已关闭，W2 overall 还必须完成 W2.8 总体收口。
 
 ### Tasks
 
@@ -220,15 +220,16 @@ W2c 完成是标记 W2 complete 的必要条件；W2 overall 还必须关闭 W2.
   list/open/prompt/assistant/approval terminal。
 - [x] W2.5：强制 page reload + WebSocket reconnect，验证 durable cursor/backfill、counter 单调和副作用不重复。
 - [x] W2.6：执行 revoke-self，验证 signed terminal、浏览器材料清理、连接关闭和旧 identity 不可重连。
-- [ ] W2.7：加入 wrong invite/fingerprint、remote cannot-confirm pairing、approval loser、stale/replay/nonce reuse
-  反例和零 mutation 断言。已有 wrong invite/fingerprint、remote cannot-confirm、握手 replay、revoke 后旧身份
-  零发送证据；approval loser 与完整 stale/replay/nonce-reuse mutation matrix 仍缺，不能整体勾选。
+- [x] W2.7：加入 wrong invite/fingerprint、remote cannot-confirm pairing、approval loser、stale/replay/nonce reuse
+  反例和零 mutation 断言。wrong invite/fingerprint、remote cannot-confirm、握手 replay 与 revoke 后旧身份零发送
+  沿用 W2a/W2c 证据；新增生产 helper、native/WASM typed snapshot 与 daemon SQLite frozen counts 关闭剩余矩阵。
 - [ ] W2.8：更新 README/ARCHITECTURE/QUALITY/DIAGNOSTICS/runbook 中实际新增边界，形成 W2 overall scoped
-  commit。W2c 文档与独立提交不替代 W2.7 完成后的总体收口。
+  commit。W2.7 文档与独立提交不替代 W2 overall 的完整回归与收口。
 
 ### Gates
 
 ```bash
+bash scripts/run-relay-web-companion-e2e.sh --negative
 bash scripts/run-relay-web-companion-e2e.sh --durable
 bash scripts/run-relay-web-companion-e2e.sh --all
 cd web/relay-test-companion
@@ -312,9 +313,27 @@ git status --short --branch
 - daemon machine E2E scoped Clippy 在精确允许未修改 Codex adapter 的 `too_many_arguments`、
   `collapsible_if`、`collapsible_str_replace` 后通过；字面全目标 `-D warnings` 仍被这些既有 lint 阻断，且
   lib-test 另有既有 `cmp_owned`。本切片不夹带清理，不能写成全目标零 warning。
-- 本证据关闭 W2c automatic slice，不关闭 W2 overall。W2.7 尚缺 approval loser 与完整
-  stale/replay/nonce-reuse 零 mutation matrix；W3 crash-cut/tab contention/三次 fresh run未开始，W4 公网、
-  物理设备、production signing/pin、第二台 Mac 与真实 vendor继续 BLOCKED。
+- 本证据关闭 W2c automatic slice，不单独关闭 W2 overall；W2.7 的后续证据见下节。W3
+  crash-cut/tab contention/三次 fresh run未开始，W4 公网、物理设备、production signing/pin、第二台 Mac 与
+  真实 vendor继续 BLOCKED。
+
+### W2.7 完成证据（2026-07-30）
+
+- `agentdeck-web-core` 抽取 approval receipt 分类、stream outer exact-next、nonce uniqueness 与 counter
+  reservation 四组生产准入 helper。directed reply 与 stream publish 只在完整验签、解密及 Runtime/stream 语义
+  接纳成功后 COMMIT counter，replay/nonce reuse 拒绝不消费 replay slot。
+- `W2NegativeSnapshot` 由相同 helper 生成 12 项 typed evidence：approval loser 被识别为 Applied 且不创建第二
+  claim；stale/skipped publish 被拒绝且 cursor 不变；reply replay/stream nonce reuse 被拒绝且两个 counter set
+  不变；未提交 reservation 与越过 high-water 被拒绝且 command counter 不变。TypeScript 只读取 snapshot JSON，
+  不解析或构造 wire/crypto。
+- `agentdeckd` machine E2E 在 Codex 与 Claude Code 的后到 approval resolve 前冻结 completed command、approval
+  total/applied、revoked authorization 四项 SQLite 计数；`Applied/AlreadyHandled(Approve, Applied)` readback 与
+  随后 Applied Retry 后两次比较均逐项不变，证明 loser 与 terminal retry 零 durable ledger mutation。
+- `scripts/run-relay-web-companion-e2e.sh --negative` automatic PASS：Web core native contracts、真实 Chromium
+  W2.7 snapshot `1/1`、daemon machine E2E `1/1` 全绿。`--all` 已纳入该门禁，并再次读回 W2a/W2b/W2c 正向
+  计数 command/completed `1/1`、approval total/applied `1/1`、revoke 后 active grant `0` 与全部 cleanup。
+- W2.7 只关闭 negative/zero-mutation matrix；W2 overall 仍等待 W2.8 总体 runbook、iOS/全量回归与 scoped
+  closeout。W3/W4 的边界不变。
 
 ### Required readback
 
@@ -331,8 +350,8 @@ git status --short --branch
 
 ### Exit
 
-W2c 单轮 fresh durable E2E 与 iOS Simulator 权威回归已 PASS。W2 overall 仍等待 W2.7 完整负例矩阵和 W2.8
-总体收口；该阶段仍不能标记物理设备、公网、production signing/pin、第二台 Mac 或真实 vendor PASS。
+W2c 单轮 fresh durable E2E、W2.7 完整负例矩阵与既有 iOS Simulator 权威回归已 PASS。W2 overall 仍等待
+W2.8 总体收口；该阶段仍不能标记物理设备、公网、production signing/pin、第二台 Mac 或真实 vendor PASS。
 
 ## 7. Phase W3：durable recovery、隔离与重复性
 
@@ -409,7 +428,7 @@ W4 不由本机 automatic 结果自动解锁。进入前另建执行授权和证
 
 - [x] W0 证明 WASM parity 与 IndexedDB/Web Locks durable contract。
 - [x] W1 浏览器直连真实 Relay v2/E2EE，无业务 bridge。
-- [ ] W2 完成完整远程业务流，iOS E2E 不回归（W2c 正向 durable 已完成；W2.7/W2.8 仍开放）。
+- [ ] W2 完成完整远程业务流，iOS E2E 不回归（W2c 正向 durable 与 W2.7 负例已完成；W2.8 仍开放）。
 - [ ] W3 crash/restart/tab contention 与三次 fresh run 全绿。
 - [ ] TypeScript 无 wire/crypto owner；Relay/Runtime/E2EE 版本未变。
 - [ ] 文档、diagnostics、quality、runbook 与实际一致。

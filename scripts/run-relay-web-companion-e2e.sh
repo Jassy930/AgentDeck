@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 web_root="$repo_root/web/relay-test-companion"
 
 usage() {
-  printf 'usage: %s --contract|--transport|--pairing|--business|--durable|--all\n' "$0" >&2
+  printf 'usage: %s --contract|--transport|--pairing|--business|--durable|--negative|--all\n' "$0" >&2
   exit 64
 }
 
@@ -48,6 +48,26 @@ run_durable() {
   bash "$repo_root/scripts/run-relay-web-companion-durable-e2e.sh"
 }
 
+run_negative() {
+  (
+    cd "$web_root"
+    bun install --frozen-lockfile
+    bun run check
+  )
+  (
+    cd "$repo_root"
+    cargo test -p agentdeck-web-core --features w2-test-fixture
+    cargo test -p agentdeckd --test relay_v2_machine_e2e \
+      real_daemon_remote_link_runs_both_synthetic_agents_and_revokes_cleanly \
+      -- --exact --test-threads=1
+  )
+  (
+    cd "$web_root"
+    AGENTDECK_WEB_CORE_FEATURES=w2-test-fixture \
+      bun run test:browser -- --grep 'W2.7'
+  )
+}
+
 test "$#" -eq 1 || usage
 case "$1" in
   --contract)
@@ -65,12 +85,16 @@ case "$1" in
   --durable)
     run_durable
     ;;
+  --negative)
+    run_negative
+    ;;
   --all)
     run_contract
     run_transport
     run_pairing
     run_business
     run_durable
+    run_negative
     ;;
   *)
     usage

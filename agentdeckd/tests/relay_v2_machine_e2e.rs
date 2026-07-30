@@ -2161,6 +2161,7 @@ async fn smoke_persistent_mutations(
     composition: &PersistentRemoteComposition,
     selector: PersistentMachineSelector,
     evidence: AgentExerciseEvidence,
+    runtime_db: &Path,
     seed: u8,
 ) {
     let AgentExerciseEvidence {
@@ -2197,6 +2198,8 @@ async fn smoke_persistent_mutations(
         } if replayed_id == command_id
     ));
 
+    let counts_before_approval_loser = runtime_business_counts(runtime_db);
+
     let high_level_approval = tokio::time::timeout(
         IO_TIMEOUT,
         execute_persistent_remote_mutation(
@@ -2232,6 +2235,11 @@ async fn smoke_persistent_mutations(
         } => observed == approval_id,
         _ => false,
     });
+    assert_eq!(
+        runtime_business_counts(runtime_db),
+        counts_before_approval_loser,
+        "approval loser replay must not create a second claim or mutate the durable ledger"
+    );
 
     let high_level_retry = tokio::time::timeout(
         IO_TIMEOUT,
@@ -2257,6 +2265,11 @@ async fn smoke_persistent_mutations(
             },
         } if observed == approval_id
     ));
+    assert_eq!(
+        runtime_business_counts(runtime_db),
+        counts_before_approval_loser,
+        "retry readback after an Applied approval must remain zero-mutation"
+    );
 }
 
 #[derive(Debug, Deserialize)]
@@ -3321,6 +3334,7 @@ async fn real_daemon_remote_link_runs_both_synthetic_agents_and_revokes_cleanly(
             &composition,
             selector,
             codex_evidence,
+            &config.paths().runtime_db,
             0x71,
         ))
         .await;
@@ -3336,6 +3350,7 @@ async fn real_daemon_remote_link_runs_both_synthetic_agents_and_revokes_cleanly(
             &composition,
             selector,
             claude_code_evidence,
+            &config.paths().runtime_db,
             0x72,
         ))
         .await;

@@ -44,7 +44,7 @@ agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge
 stable UDS。diagnostics report 不启动 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志；不要把
 diagnostics override 当成 stable ownership 配置。
 
-## Relay Web Test Companion W0/W1/W2a/W2b/W2c failure codes
+## Relay Web Test Companion W0/W1/W2a/W2b/W2c/W2.7 failure codes
 
 W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，尚未连接 Relay。以下 code 只在本地
 测试 host 中出现；它们不进入 daemon diagnostic log，也不能解释为远端业务失败：
@@ -118,6 +118,18 @@ daemon diagnostic log：
 | `web.remote.durable.cleanup_readback_failed` | revoke cleanup 后没有读回 material/KEK absent + tombstone present + exact revision | 停止旧身份的任何重连并保留 profile 取证；不能只清内存或只删一层记录 |
 | `web.remote.durable.revoked` | reload 读到 revoked tombstone，旧 identity 被本地拒绝 | 这是 revoke 后重连负例的预期终态；必须同时确认零 binary frame 与 Relay active grant `0` |
 
+W2.7 不新增 wire failure code，而是用 `W2NegativeSnapshot` 对既有生产准入规则做 typed readback。运行
+`scripts/run-relay-web-companion-e2e.sh --negative` 时，任一 snapshot 字段为 false 都表示相应拒绝路径发生了
+mutation 或 admission 漂移：
+
+| snapshot 轴 | false 时的含义 | 下一步 |
+| --- | --- | --- |
+| `approvalLoserRecognizedApplied` / `approvalLoserZeroClaimMutation` | 后到 `AlreadyHandled(Approve, Applied)` 未按 loser readback，或被误计为第二 claim | 运行 daemon machine E2E，比较 resolve/Retry 前后的 approval total/applied；禁止重写 idempotency key 再抢一次 |
+| `stalePublishRejected` / `skippedPublishRejected` / `rejectedPublishCursorUnchanged` | outer sequence 接受了 stale/gap，或拒绝后 cursor 被推进 | 停止 generation；核对 binding cursor 的 exact-next admission，不补 ACK、不跳过缺帧 |
+| `replyNonceReplayRejected` / `replyCounterSetUnchanged` | directed reply replay 被接受，或拒绝时消费了 replay slot | 检查 counter 是否只在验签、解密、Runtime 语义接纳全部成功后提交；不清空 set 重试 |
+| `streamNonceReuseRejected` / `streamCounterSetUnchanged` | stream nonce reuse 被接受，或拒绝时污染 counter set | 同时核对 stream route + counter 复合键与 semantic admission；禁止仅凭 nonce prefix 推进状态 |
+| `uncommittedReservationRejected` / `reservationOverflowRejected` / `rejectedReservationCounterUnchanged` | 未 durable COMMIT 或越过 high-water 仍可 seal/send，或拒绝后 command counter 改变 | 保持零发送，先读回 exact IndexedDB revision/reservation；不得回卷或临时扩大 high-water |
+
 `W2BusinessEvidence.recoveryStage` 只记录脱敏阶段，不包含 wire、key、业务正文或 vendor 文本。典型值从
 `recovery.state.restored`、`recovery.catalog.requested` / `recovery.conversation.requested` 推进到各流的
 `subscription_receipt`、`backfill`、`sync_complete`、`stream_binding`、`epoch_barrier`、
@@ -130,7 +142,8 @@ W0 失败先运行 `bun run check` 和 `bun run test:browser -- --grep W0`。W1 
 Chrome→Relay 路径。W2a 失败用 `--pairing` 重放 fresh fixed-topology host，并以 runner 输出和 host NDJSON
 区分 pre-confirm、pending、local approve、receipt/Closed 或 cleanup 阶段；W2b 失败用 `--business` 查看脱敏
 Catalog/Conversation/Prompt/Approval evidence 和 host 精确计数；W2c 失败用 `--durable` 查看 exact
-revision/counter、`recoveryStage`、daemon generation 与 revoked readback。测试结束必须停止静态 server、关闭
+revision/counter、`recoveryStage`、daemon generation 与 revoked readback；W2.7 失败用 `--negative` 对照 typed
+snapshot 与 daemon SQLite frozen counts。测试结束必须停止静态 server、关闭
 tab/profile、Relay/daemon 并删除本轮精确临时 root；cleanup 不使用全局浏览器数据或全局进程名删除。
 
 ## Relay v1 历史 marker 与显式 reset

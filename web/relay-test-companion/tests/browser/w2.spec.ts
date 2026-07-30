@@ -1,6 +1,27 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { expect, test } from "@playwright/test";
 
+test("W2.7 WASM negative admission matrix is zero-mutation", async ({ page }) => {
+  await page.goto("/");
+  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.ready)).toBe("true");
+
+  const snapshot = await page.evaluate(() => globalThis.relayTestApi.w2NegativeSnapshot());
+  expect(snapshot).toEqual({
+    approvalLoserRecognizedApplied: true,
+    approvalLoserZeroClaimMutation: true,
+    stalePublishRejected: true,
+    skippedPublishRejected: true,
+    rejectedPublishCursorUnchanged: true,
+    replyNonceReplayRejected: true,
+    replyCounterSetUnchanged: true,
+    streamNonceReuseRejected: true,
+    streamCounterSetUnchanged: true,
+    uncommittedReservationRejected: true,
+    reservationOverflowRejected: true,
+    rejectedReservationCounterUnchanged: true,
+  });
+});
+
 test("W2a real browser pairing reaches durable terminal", async ({ page }) => {
   test.setTimeout(150_000);
   const invitePath = process.env.AGENTDECK_W2_INVITE_PATH;

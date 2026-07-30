@@ -764,7 +764,7 @@ conversation/key，不能伪造身份连续性。
   complete。该完成边界不覆盖 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理
   iPhone/第二台 Mac 或 destructive purge；这些真实槽位继续保持 post-MVP BLOCKED。
 
-### Relay Web Test Companion W2a/W2b/W2c pairing、业务与恢复不变量
+### Relay Web Test Companion W2a/W2b/W2c/W2.7 pairing、业务、恢复与负向准入不变量
 
 - 浏览器没有第二套 Runtime、daemon 或 UDS→HTTP bridge。`agentdeck-web-core` 直接复用
   `agentdeck-protocol` / `agentdeck-crypto`，TypeScript 只管理 WebSocket generation、deadline、opaque
@@ -786,6 +786,8 @@ conversation/key，不能伪造身份连续性。
   assistant/approval 匹配文本、Runtime envelope、E2EE counter/cursor 与 approval 决定全部只存在 Rust/WASM。
 - approval receipt 与 canonical event 是独立到达轴：首次合法 `Claimed` 不能冒充 Applied；只有认证观察
   `ApprovalResolved(Applied)` 后，才允许用现有 `RetryApproval` 读回 Applied，且 daemon ledger 仍须精确一条。
+  后到 `AlreadyHandled(Approve, Applied)` 必须显式归类为 loser 的 Applied readback，不能再创建 claim；daemon
+  E2E 必须冻结并比较 replay/Retry 前后的 approval ledger 计数。
 - W2c paired state 的唯一明文 owner 仍是 Rust/WASM。TypeScript 只把 opaque durable bytes 用 IndexedDB 中
   不可导出的 WebCrypto KEK 加密；promotion、普通状态提交与 revoke cleanup 都要求 exact revision CAS。
   任何业务 frame 发送前必须先提交 counter block reservation；reload 只从前一 reserved high-water 开始，
@@ -795,6 +797,11 @@ conversation/key，不能伪造身份连续性。
   只允许单调前进，后续 control ACK 只能推进 outer cursor，不能把 inner cursor 回退到旧 publication cut。
   Catalog 与 Conversation live publication 可与 backfill overlap；低于或等于 durable cursor 的 exact overlap
   只作为已应用数据忽略，出现 gap、target 变化或 cursor regression 必须 fail-close。
+- directed reply 与 stream publish 的 nonce/counter admission 必须先检查 replay set，再完成签名、AEAD 与语义
+  准入，成功后才提交 counter；replay、nonce reuse 或 malformed payload 不能提前消费 replay slot。stream outer
+  sequence 只接受当前 cursor 的 exact next，stale 与 skipped sequence 都保持 cursor 不变。
+- durable command counter 只有在 reservation 已提交且 next counter 不越过 high-water 时才可使用；
+  `AwaitingCommit` 与 overflow 都在 seal/send 前拒绝，并保持 command counter 不变。
 - W2c reload 前必须先 durable 提交 paired state，reload 后在建立网络前完成 KEK 解密、canonical state 校验、
   exact revision 与下一 counter reservation 提交。恢复沿用原 DeviceSign/DeviceHPKE、grant、authorization、
   key directory 和 cursor，不允许重配对、另造 identity 或产生第二 Runtime。
@@ -802,8 +809,9 @@ conversation/key，不能伪造身份连续性。
   committed receipt 不可见；只有完整验证 root signature、machine/device route、grant serial/trust epoch 后
   才能合成同义 committed receipt。随后原子删除 paired material/KEK 并写 revoked tombstone；旧 identity
   必须在发送前 fail-close，不能靠新配对掩盖失败。
-- W2c automatic complete 只关闭单轮 durable 正向链路。W2.7 的完整 negative/zero-mutation matrix 与 W3 的
-  crash-cut、第二 tab、网络故障和三次 fresh run仍未完成；公网、物理设备、production signing/pin、第二台
+- W2c automatic complete 关闭单轮 durable 正向链路，W2.7 automatic complete 关闭完整
+  negative/zero-mutation matrix；W2 overall 仍等待 W2.8 总体收口。W3 的 crash-cut、第二 tab、网络故障和
+  三次 fresh run仍未完成；公网、物理设备、production signing/pin、第二台
   Mac 与真实 vendor 继续是 W4 外部门禁。
 
 ### Relay Companion MVP P5.1 SessionSource facade 不变量

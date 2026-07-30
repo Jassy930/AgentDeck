@@ -20,7 +20,7 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
-## Relay Web Test Companion W0/W1/W2a/W2b/W2c 门禁（2026-07-30）
+## Relay Web Test Companion W0/W1/W2a/W2b/W2c/W2.7 门禁（2026-07-30）
 
 W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
 `web/relay-test-companion/` 后运行：
@@ -47,7 +47,7 @@ production SPKI pin、Keychain/FileProtection 和真实 vendor 仍不得由浏�
 `scripts/verify-agent-docs.sh`、`git diff --check` 和 Git 状态。
 
 W1 的统一入口如下；`--contract` 只跑 Rust/WASM contract、TypeScript ownership/unit，`--transport` 只跑
-真实 Chrome→临时 TLS Relay 集成；`--all` 会继续执行 W2a/W2b/W2c：
+真实 Chrome→临时 TLS Relay 集成；`--all` 会继续执行 W2a/W2b/W2c/W2.7：
 
 ```bash
 scripts/run-relay-web-companion-e2e.sh --contract
@@ -130,9 +130,23 @@ self-revoke 必须验证 MachineRoot-signed terminal、Relay revoke tombstone、
 browser log、DOM 与 Playwright output 的业务/marker明文必须 absent，本轮 browser/host/root/invite/UDS/profile
 和测试 artifacts 必须全部清理。
 
-W2c PASS 只关闭单轮 durable 正向链路。W2 overall 仍等待 W2.7 的 approval loser 与完整
-stale/replay/nonce-reuse 零 mutation 矩阵；W3 的 deterministic crash cuts、第二 tab、网络故障与三次 fresh
-run尚未开始。W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED。
+W2.7 的单命令与 aggregate 门禁如下：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --negative
+scripts/run-relay-web-companion-e2e.sh --all
+bash scripts/tests/run-relay-web-companion-e2e.sh
+```
+
+`--negative` 必须运行 W2 native contract、真实 Chromium WASM typed snapshot 与 daemon machine E2E。snapshot
+固定读回 12 项 true：approval loser 识别为 Applied 且零第二 claim、stale/skipped publish 拒绝且 cursor 不变、
+reply replay 与 stream nonce reuse 拒绝且 counter set 不变、未提交 reservation 与越界 counter 拒绝且 command
+counter 不变。daemon E2E 必须对 Codex/Claude Code 分别冻结 completed command、approval total/applied、revoked
+authorization 四项 SQLite 计数，并证明后到 resolve 与 Applied Retry 前后逐项不变。
+
+W2c PASS 关闭单轮 durable 正向链路，W2.7 PASS 关闭 negative/zero-mutation matrix。W2 overall 仍等待 W2.8
+总体 runbook、回归与提交收口；W3 的 deterministic crash cuts、第二 tab、网络故障与三次 fresh run尚未开始。
+W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED。
 
 本切片涉及的 daemon machine E2E 可用以下 scoped Clippy 复核：
 
