@@ -64,8 +64,13 @@ function failureCode(error: unknown): string {
 async function ensureWriterGeneration(profileId: string): Promise<WriterGeneration> {
   const current = writerGenerations.get(profileId);
   if (current !== undefined) {
-    current.assertCurrent();
-    return current;
+    try {
+      current.assertCurrent();
+      return current;
+    } catch {
+      writerGenerations.delete(profileId);
+      await current.close();
+    }
   }
   const generation = await acquireWriterGeneration(profileId);
   if (!generation.acquired) {

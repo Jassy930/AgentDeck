@@ -335,6 +335,9 @@ scripts/run-relay-web-companion-e2e.sh --state-cuts
 scripts/run-relay-web-companion-e2e.sh --recovery
 ```
 
+持久记录在解密前还会拒绝超过 256 KiB plaintext 上界加 AEAD tag 的 paired/pending ciphertext，以及非法
+revoked tombstone；本地 IndexedDB 损坏不能退化成无界分配或伪造 revoked 完成。
+
 W3.3 让 W2c durable 主链实际持有 profile 级 Web Lock writer generation；BroadcastChannel 只通知新
 generation，不承载 canonical state。第二 tab 在主 tab 持锁时被拒绝；交接后旧 tab 收到失效通知，锁拒绝与
 旧 generation 两条迟到探针均保持 paired revision/Stable guard 不变、binary frame 为 `0`：
@@ -342,6 +345,9 @@ generation，不承载 canonical state。第二 tab 在主 tab 持锁时被拒�
 ```bash
 scripts/run-relay-web-companion-e2e.sh --contention
 ```
+
+旧 generation 被 peer 失效后会先关闭自身 channel/lease，再重新竞争 Web Lock；新 tab仍持锁时只能返回
+locked，不允许 stale generation 留在内存中永久占锁或继续发送。
 
 W3.4 使用 runner-owned 系统 Chrome 与独立 process group，在 prompt、approval、reconnect 三个阶段精确
 `SIGKILL` Chrome 主进程，再以同一 user-data-dir、不同 PID 冷启动。prompt cut 必须先在 daemon restart 前
@@ -368,7 +374,9 @@ scripts/run-relay-web-companion-e2e.sh --network-faults
 
 disconnect/delay 最终 revision `3`、reservation `256→512`；Relay restart 首轮 outcome-unknown 后最终
 revision `4`、reservation `512→768`。三轮都要求 exactly-once host ledger、active grant `0`、代理
-`parsedProtocol=false`、业务明文 absent 与代理/浏览器/host 全部 cleanup。
+`parsedProtocol=false`、armed connection 自身字节计数达到门槛、业务明文 absent 与代理/浏览器/host 全部
+cleanup。disconnect 只允许本轮 `/v2/connect` 的一条预期 `ERR_CONNECTION_RESET` console error；其余
+console error 仍失败。
 
 W3.6 使用唯一重复性入口冻结 clean worktree 的 `HEAD commit + tree`，连续三轮执行 W2b business 与
 W3.1/W3.2 recovery；每轮解析一个 W2b terminal、六个 recovery detail terminal 和两个 recovery aggregate

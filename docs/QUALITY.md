@@ -174,6 +174,8 @@ scripts/run-relay-web-companion-e2e.sh --recovery
 各 `1/1`。独立 sibling 负例必须持久化 `quarantined(stateFork)`，返回
 `web.remote.storage.state_fork_quarantined`，保持零 frame；cleanup 后 profile 与 Playwright artifacts absent。
 `--recovery` 串行重跑 W3.1/W3.2，不执行 W3.3 之后的 tab/browser-kill/故障代理/三次 fresh 门禁。
+paired/pending ciphertext 在解密前必须受 256 KiB plaintext 上界加 AEAD tag约束，malformed revoked tombstone
+也必须 fail-close；不得让 IndexedDB 损坏进入无界解密分配或伪造 revoked readback。
 
 W3.3 独立门禁如下：
 
@@ -186,6 +188,8 @@ scripts/run-relay-web-companion-e2e.sh --contention
 BroadcastChannel activation，旧 tab必须读回 `relinquished=true`、`invalidatedByPeer=true`，迟到探针返回
 `web.remote.generation_stale`。两条探针均要求 binary frames `0`、canonical mutations `0`、revision/guard
 保持 `1`/Stable；随后 W2c recovery/revoke 仍精确一次并完整 cleanup。
+再次获取 writer 时必须先退休 stale generation；若新 tab仍持有 Web Lock，只能返回 locked/false，不能泄漏
+旧 channel/lease 或继续发送。
 
 W3.4 独立门禁如下：
 
@@ -211,7 +215,9 @@ scripts/run-relay-web-companion-e2e.sh --network-faults
 delay 对 client→Relay 每 chunk 注入 120 ms；relayRestart 必须真实关闭 generation `1`，以同
 bind/store/cert/signer 启动 generation `2`，并等 daemon machine link authenticated ready 后第二次恢复。
 前两轮 final revision `3`/reservation `256→512`，restart 为 revision `4`/`512→768`；全部要求 host
-exactly-once、active grant `0`、plaintext absent 与 proxy/browser/host artifact absent。
+exactly-once、active grant `0`、plaintext absent 与 proxy/browser/host artifact absent。disconnect 的 2 KiB
+门槛必须由 `faultConnectionClientToServerBytes + faultConnectionServerToClientBytes` 证明，不得使用历史连接的
+全局累计值；该模式只允许精确 localhost `/v2/connect` 的单条预期 reset console error。
 
 W3.6 的唯一重复性入口如下：
 
@@ -226,6 +232,8 @@ approval total/applied `1/1`、active grant `1`；每个 recovery detail 必须�
 approval total/applied `1/1`、revoke `1`、active grant `0`。所有 terminal 都要求 plaintext absent 和完整
 cleanup。任一轮失败则本次入口无最终 PASS，下一次执行从第一轮重新计数；只有最终 W3.6 terminal 的
 `freshRuns=3`、candidate commit/tree 相同且 `allRunsConsistent=true` 才能作为完成证据。
+六个 detail 还必须精确覆盖三种 crash cut 与三种 state cut各一次；aggregate 的 cut/recovery 列表、sibling
+quarantine 与恢复前零 frame 也必须逐项验证，不能只凭 3+3 数量通过。
 
 2026-07-30 冻结 candidate `9597c16e2f265bd41ca73d4760f329dcfd0900b6` / tree
 `b21c386b2002fa4052cabb9db1457153c30d4044` 连续三轮 fresh exit 0。最终 terminal 读回 W2b `3`、W3 detail

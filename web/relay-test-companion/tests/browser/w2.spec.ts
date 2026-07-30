@@ -504,6 +504,9 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page, c
       guardPhaseBefore: "stable",
       guardPhaseAfter: "stable",
     });
+    await expect(
+      page.evaluate((profile) => globalThis.relayTestApi.acquireWriterGeneration(profile), profileId),
+    ).resolves.toBe(false);
     await second.evaluate(
       (profile) => globalThis.relayTestApi.releaseWriterGeneration(profile),
       profileId,
@@ -706,5 +709,12 @@ test("W2c durable reload reconnect backfill and revoke closes", async ({ page, c
   expect(visibleText).not.toContain("synthetic Codex response");
   expect(visibleText).not.toContain("synthetic codex approval");
   expect(visibleText).not.toContain("R4.4 daemon restart marker");
-  expect(consoleErrors).toEqual([]);
+  if (networkFault === "disconnect") {
+    expect(consoleErrors).toHaveLength(1);
+    expect(consoleErrors[0]).toMatch(
+      /^WebSocket connection to 'wss:\/\/localhost:\d+\/v2\/connect' failed: Error during WebSocket handshake: net::ERR_CONNECTION_RESET$/u,
+    );
+  } else {
+    expect(consoleErrors).toEqual([]);
+  }
 });

@@ -478,6 +478,17 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
   recovery revoke `1`、active grant `0`，plaintext 与 cleanup 全部 absent。
 - W3.6 automatic complete；W3.7 双路终审仍未完成，W3 overall 仍未完成；W4 外部槽位状态不变。
 
+### W3.7 review fixes candidate（2026-07-30）
+
+- spec/security 首轮发现 fault proxy 使用跨连接全局字节数证明 armed connection 2 KiB、delay 在 downstream
+  backpressure 时提前 resume、stale writer generation 清理后仍抛旧错误，以及 paired/pending ciphertext 与
+  revoked tombstone 缺少读前上界/结构校验；均已改为 fail-close，并补 W3.3/W3.5 行为回归。
+- quality/Git 首轮发现 W3.6 只验证 recovery detail 的 3+3 数量、没有验证六种 cut唯一覆盖，且本计划误写
+  不存在的 `bun run test:e2e`；已增加 exact cut/aggregate 自检并改用真实 W0 browser 命令。
+- 修复后的 focused W0、W3.3 与 W3.5 已通过；这些结果只证明 review fixes candidate 可进入重新冻结，旧
+  W3.5/W3.6 运行证据已因代码变化失效。W3.7 仍未完成，必须在新 committed candidate 上从零重跑三次
+  fresh、完整门禁与双路复审。
+
 ### Gates
 
 ```bash
@@ -487,7 +498,7 @@ bash scripts/run-relay-web-companion-e2e.sh --repeatability
 cd web/relay-test-companion
 bun run check
 bun run test:unit
-bun run test:e2e
+bun run test:browser -- --grep W0
 cd ../..
 cargo test --locked --no-fail-fast -- --test-threads=1
 swift test -Xswiftc -warnings-as-errors

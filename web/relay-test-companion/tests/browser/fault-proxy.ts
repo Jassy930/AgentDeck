@@ -31,6 +31,8 @@ let faultConnectionId: number | null = null;
 let faultTriggered = false;
 let clientToServerBytes = 0;
 let serverToClientBytes = 0;
+let faultConnectionClientToServerBytes = 0;
+let faultConnectionServerToClientBytes = 0;
 let delayApplications = 0;
 const sockets = new Set<Socket>();
 
@@ -51,6 +53,8 @@ function writeEvidence(): void {
     faultTriggered,
     clientToServerBytes,
     serverToClientBytes,
+    faultConnectionClientToServerBytes,
+    faultConnectionServerToClientBytes,
     delayApplications,
   });
 }
@@ -64,7 +68,7 @@ function maybeTrigger(client: Socket, upstream: Socket, connectionId: number): v
   if (
     faultTriggered ||
     faultConnectionId !== connectionId ||
-    clientToServerBytes + serverToClientBytes < triggerBytes
+    faultConnectionClientToServerBytes + faultConnectionServerToClientBytes < triggerBytes
   ) {
     return;
   }
@@ -87,22 +91,33 @@ function forward(
   source.on("data", (chunk: Buffer) => {
     if (direction === "clientToServer") {
       clientToServerBytes += chunk.byteLength;
+      if (faultConnectionId === connectionId) {
+        faultConnectionClientToServerBytes += chunk.byteLength;
+      }
     } else {
       serverToClientBytes += chunk.byteLength;
+      if (faultConnectionId === connectionId) {
+        faultConnectionServerToClientBytes += chunk.byteLength;
+      }
     }
-    const deliver = (): void => {
-      if (!destination.destroyed && !destination.write(chunk)) {
+    const deliver = (): boolean => {
+      if (destination.destroyed) {
+        return false;
+      }
+      const accepted = destination.write(chunk);
+      if (!accepted) {
         source.pause();
         destination.once("drain", () => source.resume());
       }
       maybeTrigger(client, upstream, connectionId);
+      return accepted;
     };
     if (delayed) {
       source.pause();
       delayApplications += 1;
       setTimeout(() => {
-        deliver();
-        if (!source.destroyed) {
+        const accepted = deliver();
+        if (accepted && !source.destroyed) {
           source.resume();
         }
         writeEvidence();

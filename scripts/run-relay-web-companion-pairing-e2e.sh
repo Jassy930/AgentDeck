@@ -605,8 +605,14 @@ if [[ -n "$network_fault" ]]; then
       .schemaVersion == 1 and .mode == $mode and .parsedProtocol == false
       and .faultTriggered == true and (.faultConnectionId | type == "number" and . > 0)
       and (.connectionCount >= 4)
-      and (.clientToServerBytes + .serverToClientBytes >= 2048)
-      and (if $mode == "delay" then .delayApplications > 0 else .delayApplications == 0 end)
+      and (.faultConnectionClientToServerBytes | type == "number" and . > 0)
+      and (.faultConnectionServerToClientBytes | type == "number" and . >= 0)
+      and (if $mode == "delay" then
+             .delayApplications > 0
+           else
+             .delayApplications == 0
+             and (.faultConnectionClientToServerBytes + .faultConnectionServerToClientBytes >= 2048)
+           end)
     ' "$proxy_evidence" >/dev/null \
     || fail "network fault proxy evidence is not exact"
 fi

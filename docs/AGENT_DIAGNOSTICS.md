@@ -44,7 +44,7 @@ agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge
 stable UDS。diagnostics report 不启动 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志；不要把
 diagnostics override 当成 stable ownership 配置。
 
-## Relay Web Test Companion W0–W3.5 failure codes
+## Relay Web Test Companion W0–W3.7 failure codes
 
 W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，尚未连接 Relay。以下 code 只在本地
 测试 host 中出现；它们不进入 daemon diagnostic log，也不能解释为远端业务失败：
@@ -113,7 +113,7 @@ daemon diagnostic log：
 | `web.remote.storage.pairedPromotionConflict` / `pairedRevisionConflict` / `revocationConflict` | promotion、普通提交或 revoke cleanup 的 expected revision/terminal 条件不精确 | transaction 必须 abort；重新读取唯一 current record，禁止 blind overwrite 或 sibling 合并 |
 | `web.remote.storage.revisionInvalid` / `pairedStateIncomplete` | revision 非 safe integer，或 paired record/KEK 缺一部分 | 视为损坏状态；停止自动恢复，不得猜测缺失材料 |
 | `web.remote.storage.revokedMaterialPresent` | revoked tombstone 与 paired material/KEK 同时存在 | 视为安全失败并停止；不得选择任意一边继续连接 |
-| `web.remote.storage.counterGuardInvalid` / `pairedStateInvalid` | counter guard 或 encrypted paired record 的 phase、revision、commitment、IV/密文形状非法 | 保留隔离 profile，停止联网；不得修补字段或绕过 commitment/AAD 校验 |
+| `web.remote.storage.counterGuardInvalid` / `pairedStateInvalid` / `revokedStateInvalid` | counter guard、encrypted paired record 或 revoked tombstone 的 phase、revision、commitment、时间、IV/密文形状非法，或密文超过 256 KiB plaintext 上界加 AEAD tag | 保留隔离 profile，停止联网；不得无界解密、修补字段、伪造 revoked 完成或绕过 commitment/AAD 校验 |
 | `web.remote.storage.counterGuardConflict` / `counterGuardFork` | durable stage 的 exact guard 已变化，或 paired state 既不是 pending previous 也不是 exact next | fail-close 且零 frame；对照 raw phase/revision/commitment，禁止自动合并 sibling/fork |
 | `web.remote.storage.state_fork_quarantined` | `statePending` 观察到既非 previous、也非 staged exact next 的同 scope sibling/fork；已原子写入 `quarantined(stateFork)` | 预期为零 frame；保留隔离 profile 取证，不得用 revision +1 猜测、合并 sibling 或静默重配对 |
 | `web.remote.storage.state_quarantined` | 冷启动读到已持久化的 state fork quarantine | 这是持续 fail-close 终态；只有显式撤销/清理流程可移除材料，普通恢复不得重新激活 |
@@ -173,6 +173,9 @@ revision/reservation 与 host exactly-once 计数。若第二次 recovery 停在
 W3.5 失败用 `--network-faults`，核对 proxy `parsedProtocol=false`、armed connection/byte count、delay 次数、
 Relay generation 与 machine-link readiness。真实 Relay restart 后必须等 lifecycle active、catalog stream `1`、
 transition `0`，不能用固定 sleep；proxy 关闭时不得丢弃尚在延迟队列中的 signed terminal。
+W3.6 失败用 `--repeatability`；任一子轮失败后旧计数作废，必须从第一轮重跑。逐轮核对 candidate commit/tree、
+W2b terminal、三种 crash cut、三种 state cut、两份 aggregate、plaintext 与 cleanup，不能用 3+3 数量替代 exact
+cut覆盖。
 测试结束必须停止静态 server、关闭 tab/profile、Relay/daemon 并删除本轮精确临时 root；cleanup 不使用
 全局浏览器数据或全局进程名删除。
 

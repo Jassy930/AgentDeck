@@ -60,7 +60,11 @@ validate_business() {
     and .runtimeCompletedCommandCount == 1
     and .runtimeApprovalTotal == 1
     and .runtimeApprovalApplied == 1
+    and .preConfirmNetworkLocked == true
+    and .pendingPairingCount == 0
     and .relayGrantActive == 1
+    and .activeTransitionCount == 0
+    and .activeCatalogStreamCount == 1
     and .relayPlaintextAbsent == true
     and .browserPlaintextAbsent == true
     and .cleanup.browserAbsent == true
@@ -92,8 +96,14 @@ validate_recovery() {
     length == 6
     and (map(select(.gate == "relay-web-companion-w3-crash-cut")) | length == 3)
     and (map(select(.gate == "relay-web-companion-w3-state-cut")) | length == 3)
+    and ([.[] | select(.gate == "relay-web-companion-w3-crash-cut") | .crashCut] | sort
+      == ["guardPendingDurable", "guardStableDurable", "stateDurable"])
+    and ([.[] | select(.gate == "relay-web-companion-w3-state-cut") | .stateCut] | sort
+      == ["guardStableDurable", "stateDurable", "stateGuardPendingDurable"])
     and all(.[ ];
       .status == "PASS"
+      and .daemonGeneration == 2
+      and .catalogBackfillObserved == true
       and .runtimeCommandCount == 1
       and .runtimeCompletedCommandCount == 1
       and .runtimeApprovalTotal == 1
@@ -132,6 +142,14 @@ validate_recovery() {
     length == 2
     and (map(.gate) | sort == ["relay-web-companion-w3.1", "relay-web-companion-w3.2"])
     and all(.[ ]; .status == "PASS")
+    and (first(.[] | select(.gate == "relay-web-companion-w3.1"))
+      | .crashCuts == ["guardPendingDurable", "stateDurable", "guardStableDurable"]
+      and .binaryFramesBeforeRecovery == 0)
+    and (first(.[] | select(.gate == "relay-web-companion-w3.2"))
+      | .stateCuts == ["stateGuardPendingDurable", "stateDurable", "guardStableDurable"]
+      and .recovery == ["statePendingPreviousRetried", "statePendingNextFinalized", "stableExact"]
+      and .siblingForkQuarantined == true
+      and .binaryFramesBeforeRecovery == 0)
   ' >/dev/null || fail "recovery aggregate terminal violated W3 invariants"
 }
 
@@ -140,8 +158,9 @@ run_selfcheck() {
   local invalid_business_log="$temp_root/selfcheck-business-invalid.log"
   local recovery_log="$temp_root/selfcheck-recovery.log"
   local invalid_recovery_log="$temp_root/selfcheck-recovery-invalid.log"
+  local invalid_coverage_log="$temp_root/selfcheck-recovery-coverage-invalid.log"
 
-  printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2b","status":"PASS","runtimeCommandCount":1,"runtimeCompletedCommandCount":1,"runtimeApprovalTotal":1,"runtimeApprovalApplied":1,"relayGrantActive":1,"relayPlaintextAbsent":true,"browserPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}' >"$business_log"
+  printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2b","status":"PASS","preConfirmNetworkLocked":true,"pendingPairingCount":0,"activeTransitionCount":0,"activeCatalogStreamCount":1,"runtimeCommandCount":1,"runtimeCompletedCommandCount":1,"runtimeApprovalTotal":1,"runtimeApprovalApplied":1,"relayGrantActive":1,"relayPlaintextAbsent":true,"browserPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}' >"$business_log"
   validate_business "$business_log"
 
   sed 's/"runtimeCommandCount":1/"runtimeCommandCount":2/' \
@@ -150,18 +169,15 @@ run_selfcheck() {
     fail "selfcheck accepted a business terminal with duplicate commands"
   fi
 
-  for gate in \
-    relay-web-companion-w3-crash-cut \
-    relay-web-companion-w3-crash-cut \
-    relay-web-companion-w3-crash-cut \
-    relay-web-companion-w3-state-cut \
-    relay-web-companion-w3-state-cut \
-    relay-web-companion-w3-state-cut; do
-    jq -cn --arg gate "$gate" '{schemaVersion:1,gate:$gate,status:"PASS",runtimeCommandCount:1,runtimeCompletedCommandCount:1,runtimeApprovalTotal:1,runtimeApprovalApplied:1,runtimeRevokedAuthorizationCount:1,relayGrantActive:0,relayPlaintextAbsent:true,browserPlaintextAbsent:true,cleanup:{pairedMaterialAbsent:true,kekAbsent:true,revokedTombstonePresent:true,counterGuardAbsent:true,browserAbsent:true,proxyAbsent:true,hostPidAbsent:true,hostRootAbsent:true,inviteAbsent:true,socketAbsent:true,playwrightArtifactsAbsent:true}}' >>"$recovery_log"
+  for cut in guardPendingDurable stateDurable guardStableDurable; do
+    jq -cn --arg cut "$cut" '{schemaVersion:1,gate:"relay-web-companion-w3-crash-cut",status:"PASS",crashCut:$cut,stateCut:null,daemonGeneration:2,catalogBackfillObserved:true,runtimeCommandCount:1,runtimeCompletedCommandCount:1,runtimeApprovalTotal:1,runtimeApprovalApplied:1,runtimeRevokedAuthorizationCount:1,relayGrantActive:0,relayPlaintextAbsent:true,browserPlaintextAbsent:true,cleanup:{pairedMaterialAbsent:true,kekAbsent:true,revokedTombstonePresent:true,counterGuardAbsent:true,browserAbsent:true,proxyAbsent:true,hostPidAbsent:true,hostRootAbsent:true,inviteAbsent:true,socketAbsent:true,playwrightArtifactsAbsent:true}}' >>"$recovery_log"
+  done
+  for cut in stateGuardPendingDurable stateDurable guardStableDurable; do
+    jq -cn --arg cut "$cut" '{schemaVersion:1,gate:"relay-web-companion-w3-state-cut",status:"PASS",crashCut:null,stateCut:$cut,daemonGeneration:2,catalogBackfillObserved:true,runtimeCommandCount:1,runtimeCompletedCommandCount:1,runtimeApprovalTotal:1,runtimeApprovalApplied:1,runtimeRevokedAuthorizationCount:1,relayGrantActive:0,relayPlaintextAbsent:true,browserPlaintextAbsent:true,cleanup:{pairedMaterialAbsent:true,kekAbsent:true,revokedTombstonePresent:true,counterGuardAbsent:true,browserAbsent:true,proxyAbsent:true,hostPidAbsent:true,hostRootAbsent:true,inviteAbsent:true,socketAbsent:true,playwrightArtifactsAbsent:true}}' >>"$recovery_log"
   done
   printf '%s\n' \
-    '{"schemaVersion":1,"gate":"relay-web-companion-w3.1","status":"PASS"}' \
-    '{"schemaVersion":1,"gate":"relay-web-companion-w3.2","status":"PASS"}' \
+    '{"schemaVersion":1,"gate":"relay-web-companion-w3.1","status":"PASS","crashCuts":["guardPendingDurable","stateDurable","guardStableDurable"],"binaryFramesBeforeRecovery":0}' \
+    '{"schemaVersion":1,"gate":"relay-web-companion-w3.2","status":"PASS","stateCuts":["stateGuardPendingDurable","stateDurable","guardStableDurable"],"recovery":["statePendingPreviousRetried","statePendingNextFinalized","stableExact"],"siblingForkQuarantined":true,"binaryFramesBeforeRecovery":0}' \
     >>"$recovery_log"
   validate_recovery "$recovery_log"
 
@@ -171,7 +187,13 @@ run_selfcheck() {
     fail "selfcheck accepted recovery terminals without revoke"
   fi
 
-  printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w3.6-selfcheck","status":"PASS","positiveFixturesAccepted":true,"negativeBusinessFixtureRejected":true,"negativeRecoveryFixtureRejected":true}'
+  sed 's/"stateCut":"stateGuardPendingDurable"/"stateCut":"stateDurable"/' \
+    "$recovery_log" >"$invalid_coverage_log"
+  if (validate_recovery "$invalid_coverage_log" >/dev/null 2>&1); then
+    fail "selfcheck accepted duplicate recovery cut coverage"
+  fi
+
+  printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w3.6-selfcheck","status":"PASS","positiveFixturesAccepted":true,"negativeBusinessFixtureRejected":true,"negativeRecoveryFixtureRejected":true,"duplicateCutFixtureRejected":true}'
 }
 
 if [[ "$#" -eq 1 && "$1" == "--selfcheck" ]]; then

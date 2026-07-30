@@ -8,6 +8,7 @@ const PAIRED_KEY = "paired";
 const COUNTER_GUARD_KEY = "counterGuard";
 const REVOKED_KEY = "revoked";
 const PAIRED_AAD_DOMAIN = "AgentDeck/WebPairedStateV1\0";
+const MAX_PAIRED_STATE_BYTES = 256 * 1024;
 
 type DurableRecord = Readonly<{
   key: string;
@@ -407,7 +408,8 @@ function validatePaired(record: EncryptedPairedRecord): void {
     !validBytes(record.stateCommitment, 32) ||
     !validBytes(record.iv, 12) ||
     !validBytes(record.ciphertext) ||
-    record.ciphertext.byteLength <= 16
+    record.ciphertext.byteLength <= 16 ||
+    record.ciphertext.byteLength > MAX_PAIRED_STATE_BYTES + 16
   ) {
     throw new Error("web.remote.storage.pairedStateInvalid");
   }
@@ -443,9 +445,20 @@ function validateGuard(record: CounterGuardRecord): void {
     equalBytes(record.previousStateCommitment, record.nextStateCommitment) ||
     !validBytes(record.nextIv, 12) ||
     !validBytes(record.nextCiphertext) ||
-    record.nextCiphertext.byteLength <= 16
+    record.nextCiphertext.byteLength <= 16 ||
+    record.nextCiphertext.byteLength > MAX_PAIRED_STATE_BYTES + 16
   ) {
     throw new Error("web.remote.storage.counterGuardInvalid");
+  }
+}
+
+function validateRevoked(record: RevokedRecord): void {
+  if (
+    record.key !== REVOKED_KEY ||
+    !safeRevision(record.revision) ||
+    !safeRevision(record.committedAtMs)
+  ) {
+    throw new Error("web.remote.storage.revokedStateInvalid");
   }
 }
 
@@ -534,7 +547,7 @@ async function encryptPairedState(
   state: Uint8Array,
   kek: CryptoKey,
 ): Promise<EncryptedPairedRecord> {
-  if (state.byteLength === 0 || state.byteLength > 256 * 1024) {
+  if (state.byteLength === 0 || state.byteLength > MAX_PAIRED_STATE_BYTES) {
     throw new Error("web.remote.storage.pairedStateSizeInvalid");
   }
   const stateCommitment = await commitment(state);
@@ -790,6 +803,7 @@ async function recoverStatePending(
 export async function loadPairedState(profileId: string): Promise<PairedStateLoad> {
   let bundle = await readPairedBundle(profileId);
   if (bundle.revoked !== undefined) {
+    validateRevoked(bundle.revoked);
     if (bundle.paired !== undefined || bundle.guard !== undefined || bundle.kek !== undefined) {
       throw new Error("web.remote.storage.revokedMaterialPresent");
     }
@@ -902,12 +916,15 @@ export async function commitRevokedCleanup(
 export async function inspectReservationStorage(
   profileId: string,
 ): Promise<W3ReservationStorageEvidence> {
-  const { paired, guard } = await readPairedBundle(profileId);
+  const { paired, guard, revoked } = await readPairedBundle(profileId);
   if (paired !== undefined) {
     validatePaired(paired);
   }
   if (guard !== undefined) {
     validateGuard(guard);
+  }
+  if (revoked !== undefined) {
+    validateRevoked(revoked);
   }
   return {
     pairedRevision: paired?.revision ?? null,
@@ -923,6 +940,12 @@ export async function inspectReservationStorage(
 
 export async function inspectPairedStorage(profileId: string): Promise<PairedStorageEvidence> {
   const { paired, kek, revoked } = await readPairedBundle(profileId);
+  if (paired !== undefined) {
+    validatePaired(paired);
+  }
+  if (revoked !== undefined) {
+    validateRevoked(revoked);
+  }
   return {
     pairedPresent: paired !== undefined,
     kekPresent: kek !== undefined,
