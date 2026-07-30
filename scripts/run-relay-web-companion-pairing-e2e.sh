@@ -16,9 +16,14 @@ gate_label="W2a"
 crash_cut="${AGENTDECK_W3_CRASH_CUT:-}"
 state_cut="${AGENTDECK_W3_STATE_CUT:-}"
 contention_mode="${AGENTDECK_W3_CONTENTION:-0}"
+browser_kill_cut="${AGENTDECK_W3_BROWSER_KILL_CUT:-}"
 [[ "$contention_mode" == "0" || "$contention_mode" == "1" ]] \
   || { printf 'AGENTDECK_W3_CONTENTION must be 0 or 1\n' >&2; exit 64; }
-if (( (${#crash_cut} > 0) + (${#state_cut} > 0) + (contention_mode == 1) > 1 )); then
+case "$browser_kill_cut" in
+  ""|prompt|approval|reconnect) ;;
+  *) printf 'invalid AGENTDECK_W3_BROWSER_KILL_CUT: %s\n' "$browser_kill_cut" >&2; exit 64 ;;
+esac
+if (( (${#crash_cut} > 0) + (${#state_cut} > 0) + (contention_mode == 1) + (${#browser_kill_cut} > 0) > 1 )); then
   printf 'only one W3 fault family may be selected\n' >&2
   exit 64
 fi
@@ -44,6 +49,11 @@ if [[ "$contention_mode" == "1" ]]; then
   [[ "$run_mode" == "durable" ]] \
     || { printf 'AGENTDECK_W3_CONTENTION requires --durable\n' >&2; exit 64; }
   gate_label="W3.3/contention"
+fi
+if [[ -n "$browser_kill_cut" ]]; then
+  [[ "$run_mode" == "durable" ]] \
+    || { printf 'AGENTDECK_W3_BROWSER_KILL_CUT requires --durable\n' >&2; exit 64; }
+  gate_label="W3.4/$browser_kill_cut"
 fi
 
 fail() {
@@ -271,6 +281,7 @@ case "$host_root" in "$runner_root"/ad-p57-host-*) ;; *) fail "host root escaped
 browser_grep="W2a real browser pairing"
 [[ "$run_mode" != "business" ]] || browser_grep="W2b real browser business flow"
 [[ "$run_mode" != "durable" ]] || browser_grep="W2c durable reload reconnect backfill and revoke"
+[[ -z "$browser_kill_cut" ]] || browser_grep="W3.4 managed Chrome process kill cold-recovers"
 (
   cd "$web_root"
   browser_environment=(
@@ -284,6 +295,12 @@ browser_grep="W2a real browser pairing"
   [[ -z "$crash_cut" ]] || browser_environment+=("AGENTDECK_W3_CRASH_CUT=$crash_cut")
   [[ -z "$state_cut" ]] || browser_environment+=("AGENTDECK_W3_STATE_CUT=$state_cut")
   [[ "$contention_mode" != "1" ]] || browser_environment+=("AGENTDECK_W3_CONTENTION=1")
+  if [[ -n "$browser_kill_cut" ]]; then
+    browser_environment+=(
+      "AGENTDECK_W3_BROWSER_KILL_CUT=$browser_kill_cut"
+      "AGENTDECK_W3_BROWSER_PROFILE_ROOT=$runner_root/chrome-profile-$browser_kill_cut"
+    )
+  fi
   env "${browser_environment[@]}" \
     bun run test:browser:built -- \
     --grep "$browser_grep"
@@ -315,7 +332,8 @@ printf '%s\n' "$host_record" | jq -e '
   and .evidence.runtimeCommandCount == 0
 ' >/dev/null || fail "approval did not create exact grant"
 
-if [[ "$run_mode" == "business" || "$run_mode" == "durable" ]]; then
+if [[ "$run_mode" == "business" || "$run_mode" == "durable" ]] \
+  && [[ "$browser_kill_cut" != "prompt" ]]; then
   mutated_request="w2b-mutated-$generation"
   send_host_command \
     "{\"op\":\"waitFor\",\"requestId\":\"$mutated_request\",\"condition\":\"webBusinessMutated\",\"timeoutMs\":120000}" \
@@ -401,6 +419,36 @@ browser_pid=""
 grep -Fq "1 passed" "$browser_log" || fail "browser did not report one passing $gate_label test"
 if grep -aFq "agentdeck-pair:v1:" "$browser_log"; then
   fail "browser output leaked PairInvite"
+fi
+if [[ -n "$browser_kill_cut" ]]; then
+  browser_kill_evidence="$coordination_dir/browser-kill.evidence.json"
+  [[ -f "$browser_kill_evidence" && ! -L "$browser_kill_evidence" ]] \
+    || fail "browser kill evidence is missing"
+  [[ "$(stat -f '%Lp' "$browser_kill_evidence")" == "600" ]] \
+    || fail "browser kill evidence mode is not 0600"
+  expected_kill_revision=3
+  expected_kill_counter_start=256
+  expected_kill_counter_end=512
+  if [[ "$browser_kill_cut" == "prompt" || "$browser_kill_cut" == "reconnect" ]]; then
+    expected_kill_revision=5
+    expected_kill_counter_start=512
+    expected_kill_counter_end=768
+  fi
+  jq -e \
+    --arg cut "$browser_kill_cut" \
+    --argjson revision "$expected_kill_revision" \
+    --argjson counterStart "$expected_kill_counter_start" \
+    --argjson counterEnd "$expected_kill_counter_end" '
+      .schemaVersion == 1
+      and .cut == $cut
+      and .signal == "SIGKILL"
+      and .mainPidChanged == true
+      and .sameProfileColdRecovered == true
+      and .finalRevision == $revision
+      and .counterReservationStart == $counterStart
+      and .counterReservationEnd == $counterEnd
+    ' "$browser_kill_evidence" >/dev/null \
+    || fail "browser kill evidence is not exact"
 fi
 if [[ "$run_mode" != "pairing" ]] && grep -aEq \
   'web-w2b-prompt-7fb7f299|synthetic Codex response|synthetic codex approval|R4.4 daemon restart marker' "$browser_log"; then
@@ -501,16 +549,24 @@ if [[ "$run_mode" == "durable" ]]; then
     gate="relay-web-companion-w3-state-cut"
   elif [[ "$contention_mode" == "1" ]]; then
     gate="relay-web-companion-w3-contention"
+  elif [[ -n "$browser_kill_cut" ]]; then
+    gate="relay-web-companion-w3-browser-kill"
+    if [[ "$browser_kill_cut" == "prompt" || "$browser_kill_cut" == "reconnect" ]]; then
+      durable_revision=5
+      reservation_start=512
+      reservation_end=768
+    fi
   fi
   jq -cn \
     --arg gate "$gate" \
     --arg crashCut "$crash_cut" \
     --arg stateCut "$state_cut" \
     --argjson writerContention "$contention_mode" \
+    --arg browserKillCut "$browser_kill_cut" \
     --argjson durableRevision "$durable_revision" \
     --argjson counterReservationStart "$reservation_start" \
     --argjson counterReservationEnd "$reservation_end" \
-    '{schemaVersion:1,gate:$gate,status:"PASS",crashCut:(if ($crashCut | length) > 0 then $crashCut else null end),stateCut:(if ($stateCut | length) > 0 then $stateCut else null end),writerContention:($writerContention == 1),daemonGeneration:2,durableRevision:$durableRevision,counterReservationStart:$counterReservationStart,counterReservationEnd:$counterReservationEnd,catalogBackfillObserved:true,runtimeCommandCount:1,runtimeCompletedCommandCount:1,runtimeApprovalTotal:1,runtimeApprovalApplied:1,runtimeRevokedAuthorizationCount:1,relayGrantActive:0,relayPlaintextAbsent:true,browserPlaintextAbsent:true,cleanup:{pairedMaterialAbsent:true,kekAbsent:true,revokedTombstonePresent:true,counterGuardAbsent:true,browserAbsent:true,hostPidAbsent:true,hostRootAbsent:true,inviteAbsent:true,socketAbsent:true,playwrightArtifactsAbsent:true}}'
+    '{schemaVersion:1,gate:$gate,status:"PASS",crashCut:(if ($crashCut | length) > 0 then $crashCut else null end),stateCut:(if ($stateCut | length) > 0 then $stateCut else null end),writerContention:($writerContention == 1),browserKillCut:(if ($browserKillCut | length) > 0 then $browserKillCut else null end),daemonGeneration:2,durableRevision:$durableRevision,counterReservationStart:$counterReservationStart,counterReservationEnd:$counterReservationEnd,catalogBackfillObserved:true,runtimeCommandCount:1,runtimeCompletedCommandCount:1,runtimeApprovalTotal:1,runtimeApprovalApplied:1,runtimeRevokedAuthorizationCount:1,relayGrantActive:0,relayPlaintextAbsent:true,browserPlaintextAbsent:true,cleanup:{pairedMaterialAbsent:true,kekAbsent:true,revokedTombstonePresent:true,counterGuardAbsent:true,browserAbsent:true,hostPidAbsent:true,hostRootAbsent:true,inviteAbsent:true,socketAbsent:true,playwrightArtifactsAbsent:true}}'
 elif [[ "$run_mode" == "business" ]]; then
   printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2b","status":"PASS","preConfirmNetworkLocked":true,"pendingPairingCount":0,"relayGrantTotal":1,"relayGrantActive":1,"activeTransitionCount":0,"activeCatalogStreamCount":1,"runtimeCommandCount":1,"runtimeCompletedCommandCount":1,"runtimeApprovalTotal":1,"runtimeApprovalApplied":1,"relayPlaintextAbsent":true,"browserPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'
 else

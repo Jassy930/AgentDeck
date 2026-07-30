@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2 automatic complete；W3.1–W3.3 complete，W3.4–W3.7 未开始；W4 BLOCKED |
+| 状态 | W0/W1/W2 automatic complete；W3.1–W3.4 complete，W3.5–W3.7 未完成；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
 | 目标 | 用浏览器直接复用 Relay v2 + E2EE v1，增加一条低成本、可重复的远程业务闭环 |
@@ -224,7 +224,8 @@ W0–W3 每阶段必须独立 scoped commit、focused gate、integration gate、
 
 当前已完成 W2c automatic 正向链路、W2.7 approval loser/stale/replay/nonce-reuse 零 mutation 矩阵与 W2.8
 overall closeout，W2 automatic overall complete。W3.1/W3.2 两类 deterministic crash cut 与 W3.3 第二
-tab/Web Lock/generation 隔离均已关闭；W3.4–W3.7 的 browser kill、网络故障和三次 fresh run尚未开始。
+tab/Web Lock/generation 隔离与 W3.4 真实 browser kill 均已关闭；W3.5–W3.7 的网络故障、三次 fresh run与
+双路终审尚未完成。
 W4 的公网、物理设备、production signing/pin、第二台 Mac 与真实 vendor继续独立 BLOCKED。
 
 ## 10. 验收边界

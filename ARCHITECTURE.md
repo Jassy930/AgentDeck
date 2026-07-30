@@ -804,6 +804,10 @@ conversation/key，不能伪造身份连续性。
   opaque generation activation，不承载 durable/canonical state；第二 tab/worker 获取不到锁时必须在任何
   load→mutation→send 前拒绝。锁交接后旧 generation 必须因本地 relinquish 与 peer activation 双重失效，
   迟到 callback 每个 durable mutation/send 边界都要重新检查 generation，保持零 canonical mutation/零 frame。
+- W3.4 的 browser crash 必须由 runner-owned Chrome 主进程与独立 process group 执行真实 `SIGKILL`；恢复复用
+  exact user-data-dir，但主 PID 必须变化。prompt cut 在 daemon restart 前先从 encrypted projection 恢复并
+  完成 pending approval，避免把 daemon 合法 `Expired` 终态误报为 Applied。restart marker 是随 durable
+  catalog cursor 单调持久化的语义事实；后续 exact-next recovery 不得清零该事实或倒退 cursor 重放 marker。
 - `StreamBindingV1.inner_cursor` 表示 Relay publication cut，不是 reducer 已应用历史的唯一真相。directed
   bootstrap 的 `RuntimeSyncComplete.inner_cursor` 可在线性化窗口内高于该 cut；恢复时 durable reducer cursor
   只允许单调前进，后续 control ACK 只能推进 outer cursor，不能把 inner cursor 回退到旧 publication cut。
@@ -823,8 +827,8 @@ conversation/key，不能伪造身份连续性。
   必须在发送前 fail-close，不能靠新配对掩盖失败。
 - W2c automatic complete 关闭单轮 durable 正向链路，W2.7 automatic complete 关闭完整
   negative/zero-mutation matrix，W2.8 用同一 candidate 的 Web aggregate 与 fixed-topology iOS/P5 回归完成
-  W2 automatic overall closeout。W3.1/W3.2 两类 crash cut 与 W3.3 第二 tab/generation 隔离均已关闭；
-  W3.4–W3.7 的 browser kill、网络故障和三次 fresh run仍未完成；公网、
+  W2 automatic overall closeout。W3.1/W3.2 两类 crash cut、W3.3 第二 tab/generation 隔离与 W3.4 真实
+  browser kill 均已关闭；W3.5–W3.7 的网络故障、三次 fresh run 与双路终审仍未完成；公网、
   物理设备、production signing/pin、第二台
   Mac 与真实 vendor 继续是 W4 外部门禁。
 

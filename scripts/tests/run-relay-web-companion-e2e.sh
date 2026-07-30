@@ -9,6 +9,7 @@ durable_runner="$repo_root/scripts/run-relay-web-companion-durable-e2e.sh"
 crash_cuts_runner="$repo_root/scripts/run-relay-web-companion-crash-cuts-e2e.sh"
 state_cuts_runner="$repo_root/scripts/run-relay-web-companion-state-cuts-e2e.sh"
 contention_runner="$repo_root/scripts/run-relay-web-companion-contention-e2e.sh"
+browser_kills_runner="$repo_root/scripts/run-relay-web-companion-browser-kills-e2e.sh"
 
 bash -n "$runner"
 bash -n "$pairing_runner"
@@ -17,6 +18,7 @@ bash -n "$durable_runner"
 bash -n "$crash_cuts_runner"
 bash -n "$state_cuts_runner"
 bash -n "$contention_runner"
+bash -n "$browser_kills_runner"
 
 all_case="$(sed -n '/^[[:space:]]*--all)/,/^[[:space:]]*;;/p' "$runner")"
 printf '%s\n' "$all_case" | grep -Fq 'run_contract' \
@@ -62,6 +64,14 @@ printf '%s\n' "$contention_case" | grep -Fq 'run_contention' \
   || { printf 'runner --contention omitted contention gate\n' >&2; exit 1; }
 grep -Fq 'AGENTDECK_W3_CONTENTION=1' "$contention_runner" \
   || { printf 'contention runner omitted W3 mode\n' >&2; exit 1; }
+
+browser_kills_case="$(sed -n '/^[[:space:]]*--browser-kills)/,/^[[:space:]]*;;/p' "$runner")"
+printf '%s\n' "$browser_kills_case" | grep -Fq 'run_browser_kills' \
+  || { printf 'runner --browser-kills omitted browser-kill gate\n' >&2; exit 1; }
+for cut in prompt approval reconnect; do
+  grep -Fq "$cut" "$browser_kills_runner" \
+    || { printf 'browser-kill runner omitted %s\n' "$cut" >&2; exit 1; }
+done
 
 for cut in stateGuardPendingDurable stateDurable guardStableDurable; do
   grep -Fq "$cut" "$state_cuts_runner" \

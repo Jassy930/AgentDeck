@@ -204,6 +204,28 @@ declare global {
     failureCode: string | null;
   }>;
 
+  type W3BrowserKillCut = "prompt" | "approval" | "reconnect";
+
+  type W3BrowserKillStartEvidence = Readonly<{
+    generation: number;
+    cut: W3BrowserKillCut;
+    revision: number | null;
+    pairing: W2PairingEvidence;
+    business: W2BusinessEvidence | null;
+    storage: PairedStorageEvidence;
+    failureCode: string | null;
+  }>;
+
+  type W3ReconnectCheckpointEvidence = Readonly<{
+    generation: number;
+    revision: number | null;
+    reservationRecovery: W3ReservationRecovery | null;
+    business: W2BusinessEvidence | null;
+    binaryFramesSent: number;
+    storage: PairedStorageEvidence;
+    failureCode: string | null;
+  }>;
+
   type W2BusinessTransportEvidence = Readonly<{
     generation: number;
     preview: W2PairingPreview;
@@ -252,6 +274,15 @@ declare global {
     releaseWriterGeneration: (profileId: string) => Promise<void>;
     writerGenerationSnapshot: (profileId: string) => W3WriterGenerationSnapshot | null;
     runW3LateGenerationProbe: (profileId: string) => Promise<W3LateGenerationEvidence>;
+    runW3BrowserKillStart: (
+      encodedInvite: string,
+      profileId: string,
+      cut: W3BrowserKillCut,
+    ) => Promise<W3BrowserKillStartEvidence>;
+    runW3ReconnectCheckpoint: (profileId: string) => Promise<W3ReconnectCheckpointEvidence>;
+    runW3PendingBusinessCheckpoint: (
+      profileId: string,
+    ) => Promise<W3ReconnectCheckpointEvidence>;
     initializeState: (profileId: string, payload: string) => Promise<DurableStateRecord>;
     readState: (profileId: string) => Promise<DurableStateRecord | null>;
     commitExactRevision: (

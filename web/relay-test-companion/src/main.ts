@@ -21,6 +21,9 @@ import {
   runW2DurableStart,
   runW2Pairing,
   runW3ReservationCrash,
+  runW3BrowserKillStart,
+  runW3PendingBusinessCheckpoint,
+  runW3ReconnectCheckpoint,
   runW3StateCrashStart,
   runW3StateForkProbe,
   type W2WasmSessionConstructor,
@@ -319,6 +322,56 @@ const api: RelayTestApi = {
           ? null
           : "web.remote.durable.writer_contention_probe_failed",
     };
+  },
+  async runW3BrowserKillStart(encodedInvite, profileId, cut) {
+    const constructor = (await corePromise).W2PairingSession;
+    if (constructor === undefined) {
+      throw new Error("web.remote.w2_fixture_unavailable");
+    }
+    await ensureWriterGeneration(profileId);
+    const result = await runW3BrowserKillStart(
+      constructor,
+      encodedInvite,
+      profileId,
+      cut,
+    ).catch(async (error) => {
+      await closeWriterGeneration(profileId);
+      throw error;
+    });
+    if (result.failureCode !== null) {
+      await closeWriterGeneration(profileId);
+    }
+    return result;
+  },
+  async runW3ReconnectCheckpoint(profileId) {
+    const constructor = (await corePromise).W2PairingSession;
+    if (constructor === undefined) {
+      throw new Error("web.remote.w2_fixture_unavailable");
+    }
+    await ensureWriterGeneration(profileId);
+    const result = await runW3ReconnectCheckpoint(constructor, profileId).catch(async (error) => {
+      await closeWriterGeneration(profileId);
+      throw error;
+    });
+    if (result.failureCode !== null) {
+      await closeWriterGeneration(profileId);
+    }
+    return result;
+  },
+  async runW3PendingBusinessCheckpoint(profileId) {
+    const constructor = (await corePromise).W2PairingSession;
+    if (constructor === undefined) {
+      throw new Error("web.remote.w2_fixture_unavailable");
+    }
+    await ensureWriterGeneration(profileId);
+    const result = await runW3PendingBusinessCheckpoint(constructor, profileId).catch(async (error) => {
+      await closeWriterGeneration(profileId);
+      throw error;
+    });
+    if (result.failureCode !== null) {
+      await closeWriterGeneration(profileId);
+    }
+    return result;
   },
   initializeState,
   readState,

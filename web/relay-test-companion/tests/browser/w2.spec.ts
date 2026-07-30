@@ -1,5 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { expect, test } from "@playwright/test";
+import { launchManagedChrome, type ManagedChrome } from "./managed-chrome.ts";
 
 test("W2.7 WASM negative admission matrix is zero-mutation", async ({ page }) => {
   await page.goto("/");
@@ -47,6 +48,220 @@ test("W3.2 statePending sibling is durably quarantined without network", async (
   expect(
     await page.evaluate(async (profile) => globalThis.relayTestApi.readState(profile), profileId),
   ).toBeNull();
+});
+
+test("W3.4 managed Chrome process kill cold-recovers the same profile", async () => {
+  test.setTimeout(300_000);
+  const cut = process.env.AGENTDECK_W3_BROWSER_KILL_CUT as W3BrowserKillCut | undefined;
+  const invitePath = process.env.AGENTDECK_W2_INVITE_PATH;
+  const coordinationDir = process.env.AGENTDECK_W2_COORDINATION_DIR;
+  const profileId = process.env.AGENTDECK_W2_PROFILE_ID;
+  const profileRoot = process.env.AGENTDECK_W3_BROWSER_PROFILE_ROOT;
+  const spkiPin = process.env.AGENTDECK_WEB_TEST_SPKI_PIN;
+  const webPort = process.env.RELAY_WEB_TEST_PORT;
+  if (
+    cut === undefined ||
+    !["prompt", "approval", "reconnect"].includes(cut) ||
+    invitePath === undefined ||
+    coordinationDir === undefined ||
+    profileId === undefined ||
+    profileRoot === undefined ||
+    spkiPin === undefined ||
+    webPort === undefined
+  ) {
+    throw new Error("W3.4 runner contract is missing");
+  }
+  const invite = (await readFile(invitePath, "utf8")).trim();
+  const origin = `http://127.0.0.1:${webPort}/`;
+  let managed: ManagedChrome | null = null;
+  let firstPid = 0;
+  let secondPid = 0;
+  let killSignal: NodeJS.Signals | null = null;
+  const launch = async (): Promise<ManagedChrome> => {
+    const chrome = await launchManagedChrome(profileRoot, spkiPin);
+    await chrome.page.goto(origin);
+    await expect
+      .poll(() => chrome.page.evaluate(() => document.documentElement.dataset.ready))
+      .toBe("true");
+    return chrome;
+  };
+  const writeBusinessReady = async (): Promise<void> => {
+    await writeFile(`${coordinationDir}/business.ready`, "ready\n", { flag: "wx", mode: 0o600 });
+  };
+  const waitForRestart = async (): Promise<void> => {
+    await expect
+      .poll(
+        async () => {
+          try {
+            return JSON.parse(await readFile(`${coordinationDir}/restart.begin`, "utf8")) as Record<
+              string,
+              unknown
+            >;
+          } catch {
+            return null;
+          }
+        },
+        { timeout: 90_000 },
+      )
+      .not.toBeNull();
+  };
+
+  try {
+    managed = await launch();
+    firstPid = managed.mainPid;
+    const started = await managed.page.evaluate(
+      async ({ encodedInvite, profile, browserKillCut }) =>
+        globalThis.relayTestApi.runW3BrowserKillStart(
+          encodedInvite,
+          profile,
+          browserKillCut,
+        ),
+      { encodedInvite: invite, profile: profileId, browserKillCut: cut },
+    );
+    expect(started.failureCode, JSON.stringify(started)).toBeNull();
+    expect(started).toMatchObject({
+      cut,
+      revision: 1,
+      storage: {
+        pairedPresent: true,
+        kekPresent: true,
+        revokedPresent: false,
+        revision: 1,
+      },
+    });
+    expect(started.business).toMatchObject({
+      durablePromoted: true,
+      promptAccepted: true,
+      approvalPending: true,
+      approvalReceiptApplied: cut === "prompt" ? false : true,
+      approvalEventApplied: cut === "prompt" ? false : true,
+      commandCompleted: cut === "prompt" ? expect.any(Boolean) : true,
+      counterReservationStart: 0,
+      counterReservationEnd: 256,
+    });
+
+    if (cut === "reconnect") {
+      await writeBusinessReady();
+      await waitForRestart();
+      const checkpoint = await managed.page.evaluate(
+        (profile) => globalThis.relayTestApi.runW3ReconnectCheckpoint(profile),
+        profileId,
+      );
+      expect(checkpoint.failureCode, JSON.stringify(checkpoint)).toBeNull();
+      expect(checkpoint).toMatchObject({
+        revision: 3,
+        reservationRecovery: "stableExact",
+        business: {
+          durableRestored: true,
+          reconnectAuthenticated: true,
+          catalogSubscriptionActive: true,
+          relaySubscriptionActive: true,
+          restartMarkerObserved: true,
+          revocationTerminalVerified: false,
+          counterReservationStart: 256,
+          counterReservationEnd: 512,
+        },
+        storage: { revision: 3 },
+      });
+    }
+
+    const killed = await managed.kill();
+    killSignal = killed.signal;
+    expect(killed).toEqual({ code: null, signal: "SIGKILL" });
+    managed = null;
+    if (cut === "prompt") {
+      managed = await launch();
+      secondPid = managed.mainPid;
+      expect(secondPid).not.toBe(firstPid);
+      const checkpoint = await managed.page.evaluate(
+        (profile) => globalThis.relayTestApi.runW3PendingBusinessCheckpoint(profile),
+        profileId,
+      );
+      expect(checkpoint.failureCode, JSON.stringify(checkpoint)).toBeNull();
+      expect(checkpoint).toMatchObject({
+        revision: 3,
+        reservationRecovery: "stableExact",
+        business: {
+          durableRestored: true,
+          reconnectAuthenticated: true,
+          catalogSubscriptionActive: true,
+          relaySubscriptionActive: true,
+          approvalReceiptApplied: true,
+          approvalEventApplied: true,
+          commandCompleted: true,
+          revocationTerminalVerified: false,
+          counterReservationStart: 256,
+          counterReservationEnd: 512,
+        },
+        storage: { revision: 3 },
+      });
+      await writeBusinessReady();
+      await waitForRestart();
+    } else if (cut !== "reconnect") {
+      await writeBusinessReady();
+      await waitForRestart();
+    }
+
+    if (managed === null) {
+      managed = await launch();
+      secondPid = managed.mainPid;
+      expect(secondPid).not.toBe(firstPid);
+    }
+    const recovered = await managed.page.evaluate(
+      (profile) => globalThis.relayTestApi.runW2DurableRecover(profile),
+      profileId,
+    );
+    expect(recovered.failureCode, JSON.stringify(recovered)).toBeNull();
+    const hasIntermediateCheckpoint = cut === "prompt" || cut === "reconnect";
+    const expectedRevision = hasIntermediateCheckpoint ? 5 : 3;
+    const expectedCounterStart = hasIntermediateCheckpoint ? 512 : 256;
+    const expectedCounterEnd = hasIntermediateCheckpoint ? 768 : 512;
+    expect(recovered).toMatchObject({
+      revision: expectedRevision,
+      preActivationNetworkLocked: true,
+      reloadStatus: "revoked",
+      reservationRecovery: "stableExact",
+      business: {
+        durableRestored: true,
+        reconnectAuthenticated: true,
+        promptAccepted: true,
+        approvalReceiptApplied: true,
+        approvalEventApplied: true,
+        commandCompleted: true,
+        restartMarkerObserved: true,
+        revocationReceiptCommitted: true,
+        revocationTerminalVerified: true,
+        counterReservationStart: expectedCounterStart,
+        counterReservationEnd: expectedCounterEnd,
+      },
+      storage: {
+        pairedPresent: false,
+        kekPresent: false,
+        revokedPresent: true,
+        revision: expectedRevision,
+      },
+    });
+    await managed.page.evaluate(
+      (profile) => globalThis.relayTestApi.deleteProfile(profile),
+      profileId,
+    );
+    await writeFile(
+      `${coordinationDir}/browser-kill.evidence.json`,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        cut,
+        signal: killSignal,
+        mainPidChanged: firstPid !== secondPid,
+        sameProfileColdRecovered: true,
+        finalRevision: expectedRevision,
+        counterReservationStart: expectedCounterStart,
+        counterReservationEnd: expectedCounterEnd,
+      })}\n`,
+      { flag: "wx", mode: 0o600 },
+    );
+  } finally {
+    await managed?.close();
+  }
 });
 
 test("W2a real browser pairing reaches durable terminal", async ({ page }) => {

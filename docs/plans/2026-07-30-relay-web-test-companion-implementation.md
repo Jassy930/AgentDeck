@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2 automatic complete；W3.1–W3.3 complete，W3.4–W3.7 未开始；W4 BLOCKED |
+| 状态 | W0/W1/W2 automatic complete；W3.1–W3.4 complete，W3.5–W3.7 未完成；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -384,7 +384,7 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
   每个 cut 重启后只能整块跳号或 exact finalize。
 - [x] W3.2：覆盖 replay/cursor statePending 的 previous rollback、exact next finalize 与 sibling/fork quarantine。
 - [x] W3.3：启动第二 tab/worker，验证 Web Locks 排他、旧 generation/BroadcastChannel 失效和零重复发送。
-- [ ] W3.4：在 prompt/approval/reconnect 各阶段强制 kill browser process，再以同 profile 冷恢复。
+- [x] W3.4：在 prompt/approval/reconnect 各阶段强制 kill browser process，再以同 profile 冷恢复。
 - [ ] W3.5：使用 runner-owned 故障代理注入断连/延迟/Relay restart；代理只转发 bytes，不解析协议。
 - [ ] W3.6：同一 committed candidate 连续三次 fresh 完成 W2 business + W3 recovery；任一轮失败重新计数。
 - [ ] W3.7：执行 spec/security 与 quality/Git 双路 review，清零 P0/P1/P2，更新文档并形成 W3 scoped commit。
@@ -434,7 +434,21 @@ restart 和网络中断都能 fail-close 或恢复到唯一合法状态。
   `web.remote.generation_stale`，paired revision/guard 仍为 `1`/Stable，零 frame、零 mutation。
 - 随后正常 reload/reconnect/revoke 继续完成，最终 revision `3`、command/completed 与 approval
   total/applied 各 `1/1`、active grant `0`、全部 runner artifact absent。`--recovery` 重跑 W3.1/W3.2 全绿。
-- W3.4–W3.7 与 W4 外部槽位状态不变。
+- W3.4 已由下一节关闭；W3.5–W3.7 与 W4 外部槽位状态不变。
+
+### W3.4 evidence（2026-07-30）
+
+- 新增 runner-owned 系统 Chrome 与独立 process group；每轮精确 `SIGKILL` 主进程，readback 为
+  `code=null/signal=SIGKILL`，同 user-data-dir 冷启动后的主 PID 必须不同。
+- `scripts/run-relay-web-companion-e2e.sh --browser-kills` 对 prompt、approval、reconnect 三个 cut 聚合 PASS。
+  prompt cut 的新 Chrome 先在 daemon restart 前从 revision `1` 恢复未完成审批并提交 revision `3`，再经历
+  daemon restart、第二次 recovery 与 revoke；这避免把 daemon 合法 `Expired` 终态误写为 Applied。
+- reconnect cut 在 revision `3` checkpoint 后杀进程；第二次 cold-open 保留由 durable catalog cursor认证的
+  单调 restart-marker 事实，从 exact-next cursor 恢复两流，不倒退重放旧 marker。
+- prompt/reconnect 最终 revision `5`、reservation `512→768`；approval 最终 revision `3`、reservation
+  `256→512`。三轮 host 均为 command/completed `1/1`、approval total/applied `1/1`、revoke `1`、active
+  grant `0`，业务明文扫描与全部 cleanup 通过。
+- W3.5–W3.7 仍未完成，W3 overall 仍未完成；W4 外部槽位状态不变。
 
 ### Gates
 

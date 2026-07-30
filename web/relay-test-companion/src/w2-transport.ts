@@ -259,9 +259,26 @@ function businessComplete(evidence: W2BusinessEvidence): boolean {
   );
 }
 
+function businessReachedKillCut(
+  evidence: W2BusinessEvidence,
+  cut: "prompt" | "approval" | undefined,
+): boolean {
+  if (cut === "prompt") {
+    return (
+      evidence.promptRouteAccepted &&
+      evidence.promptAccepted &&
+      evidence.assistantObserved &&
+      evidence.approvalPending &&
+      evidence.approvalSummaryMatched
+    );
+  }
+  return businessComplete(evidence);
+}
+
 async function completeBusiness(
   session: W2WasmSession,
   generation: number,
+  stopAfter?: "prompt" | "approval",
 ): Promise<Readonly<{ evidence: W2BusinessEvidence; binaryFramesSent: number; failureCode: string | null }>> {
   const socket = new WebSocket(session.businessConnectUrl());
   socket.binaryType = "arraybuffer";
@@ -283,13 +300,16 @@ async function completeBusiness(
 
     await withDeadline(
       (async () => {
-        while (!businessComplete(businessEvidence(session))) {
+        while (!businessReachedKillCut(businessEvidence(session), stopAfter)) {
           const action = session.businessAcceptFrame(await receiveBinary(socket, generation));
           if (action.length > 0) {
             socket.send(action);
             binaryFramesSent += 1;
           }
           const evidence = businessEvidence(session);
+          if (businessReachedKillCut(evidence, stopAfter)) {
+            break;
+          }
           if (evidence.businessFenceCount > observedFenceCount) {
             observedFenceCount = evidence.businessFenceCount;
             if (observedFenceCount > 8) {
@@ -474,13 +494,84 @@ export async function runW2DurableStart(
   }
 }
 
+export async function runW3BrowserKillStart(
+  Session: W2WasmSessionConstructor,
+  encodedInvite: string,
+  profileId: string,
+  cut: W3BrowserKillCut,
+): Promise<W3BrowserKillStartEvidence> {
+  if (activeGeneration !== null) {
+    throw new Error("web.remote.single_flight");
+  }
+  if (cut !== "prompt" && cut !== "approval" && cut !== "reconnect") {
+    throw new Error("web.remote.durable.browser_kill_cut_invalid");
+  }
+  const generation = ++nextGeneration;
+  activeGeneration = generation;
+  const session = new Session(encodedInvite, nowMs());
+  try {
+    const pairing = await completePairing(session, generation);
+    if (pairing.failureCode !== null || !pairing.pairing.paired) {
+      throw new Error(pairing.failureCode ?? "web.remote.pairing.failed");
+    }
+    let revision = await promotePairedState(
+      profileId,
+      session.businessPrepareDurablePromotion(),
+    );
+    session.businessActivateDurableState();
+    const business = await completeBusiness(
+      session,
+      generation,
+      cut === "prompt" ? "prompt" : "approval",
+    );
+    if (
+      business.failureCode !== null ||
+      !businessReachedKillCut(business.evidence, cut === "prompt" ? "prompt" : "approval")
+    ) {
+      throw new Error(business.failureCode ?? "web.remote.business.incomplete");
+    }
+    revision = await commitPairedProjectionState(
+      profileId,
+      revision,
+      session.businessExportDurableState(),
+    );
+    return {
+      generation,
+      cut,
+      revision,
+      pairing: pairing.pairing,
+      business: business.evidence,
+      storage: await inspectPairedStorage(profileId),
+      failureCode: null,
+    };
+  } catch (error) {
+    return {
+      generation,
+      cut,
+      revision: null,
+      pairing: pairingEvidence(session),
+      business: session.paired() ? businessEvidence(session) : null,
+      storage: await inspectPairedStorage(profileId),
+      failureCode: failureCode(error),
+    };
+  } finally {
+    session.free();
+    if (activeGeneration === generation) {
+      activeGeneration = null;
+    }
+  }
+}
+
 async function completeRecovery(
   session: W2WasmSession,
   generation: number,
+  mode: "final" | "reconnectCheckpoint" | "pendingBusiness" = "final",
 ): Promise<Readonly<{ evidence: W2BusinessEvidence; binaryFramesSent: number }>> {
   const socket = await openWithBackoff(session.businessConnectUrl(), generation);
   let binaryFramesSent = 0;
   let conversationStarted = false;
+  let approvalStarted = false;
+  let approvalReadbackStarted = false;
   let revokeStarted = false;
   try {
     socket.send(session.businessStartHello());
@@ -501,6 +592,22 @@ async function completeRecovery(
           ) {
             break;
           }
+          if (
+            mode === "reconnectCheckpoint" &&
+            before.catalogSubscriptionActive &&
+            before.relaySubscriptionActive &&
+            before.restartMarkerObserved
+          ) {
+            break;
+          }
+          if (
+            mode === "pendingBusiness" &&
+            before.catalogSubscriptionActive &&
+            before.relaySubscriptionActive &&
+            businessComplete(before)
+          ) {
+            break;
+          }
           const action = session.businessAcceptFrame(await receiveBinary(socket, generation));
           if (action.length > 0) {
             socket.send(action);
@@ -510,19 +617,44 @@ async function completeRecovery(
           if (
             !conversationStarted &&
             evidence.catalogSubscriptionActive &&
-            evidence.restartMarkerObserved
+            (mode === "pendingBusiness" || evidence.restartMarkerObserved)
           ) {
             socket.send(session.businessStartRecoveryConversation());
             binaryFramesSent += 1;
             conversationStarted = true;
           } else if (
-            !revokeStarted &&
             evidence.relaySubscriptionActive &&
-            evidence.restartMarkerObserved
+            (mode === "pendingBusiness" || evidence.restartMarkerObserved)
           ) {
-            socket.send(session.businessStartRevokeSelf());
-            binaryFramesSent += 1;
-            revokeStarted = true;
+            if (mode === "reconnectCheckpoint") {
+              break;
+            }
+            if (!businessComplete(evidence)) {
+              if (
+                !approvalStarted &&
+                evidence.approvalPending &&
+                !evidence.approvalReceiptApplied
+              ) {
+                socket.send(session.businessStartApproval());
+                binaryFramesSent += 1;
+                approvalStarted = true;
+              } else if (
+                !approvalReadbackStarted &&
+                evidence.approvalRouteAccepted &&
+                evidence.approvalEventApplied &&
+                !evidence.approvalReceiptApplied
+              ) {
+                socket.send(session.businessStartApproval());
+                binaryFramesSent += 1;
+                approvalReadbackStarted = true;
+              }
+            } else if (mode === "pendingBusiness") {
+              break;
+            } else if (!revokeStarted) {
+              socket.send(session.businessStartRevokeSelf());
+              binaryFramesSent += 1;
+              revokeStarted = true;
+            }
           }
         }
       })(),
@@ -531,7 +663,141 @@ async function completeRecovery(
     );
     return { evidence: businessEvidence(session), binaryFramesSent };
   } finally {
-    await closeSocket(socket, "w2c revocation complete");
+    await closeSocket(socket, `w3 recovery ${mode}`);
+  }
+}
+
+export async function runW3PendingBusinessCheckpoint(
+  Session: W2WasmSessionConstructor,
+  profileId: string,
+): Promise<W3ReconnectCheckpointEvidence> {
+  if (activeGeneration !== null) {
+    throw new Error("web.remote.single_flight");
+  }
+  const generation = ++nextGeneration;
+  activeGeneration = generation;
+  let session: W2WasmSession | null = null;
+  let revision: number | null = null;
+  let reservationRecovery: W3ReservationRecovery | null = null;
+  try {
+    const loaded = await loadPairedState(profileId);
+    if (loaded.status !== "active") {
+      throw new Error(`web.remote.durable.${loaded.status}`);
+    }
+    revision = loaded.revision;
+    reservationRecovery = loaded.reservationRecovery;
+    session = Session.restore(loaded.state);
+    revision = await commitPairedState(
+      profileId,
+      revision,
+      session.businessExportDurableState(),
+    );
+    session.businessActivateDurableState();
+    const recovery = await completeRecovery(session, generation, "pendingBusiness");
+    if (
+      !recovery.evidence.catalogSubscriptionActive ||
+      !recovery.evidence.relaySubscriptionActive ||
+      !businessComplete(recovery.evidence) ||
+      recovery.evidence.revocationTerminalVerified
+    ) {
+      throw new Error("web.remote.durable.pending_business_checkpoint_incomplete");
+    }
+    revision = await commitPairedProjectionState(
+      profileId,
+      revision,
+      session.businessExportDurableState(),
+    );
+    return {
+      generation,
+      revision,
+      reservationRecovery,
+      business: recovery.evidence,
+      binaryFramesSent: recovery.binaryFramesSent,
+      storage: await inspectPairedStorage(profileId),
+      failureCode: null,
+    };
+  } catch (error) {
+    return {
+      generation,
+      revision,
+      reservationRecovery,
+      business: session === null ? null : businessEvidence(session),
+      binaryFramesSent: 0,
+      storage: await inspectPairedStorage(profileId),
+      failureCode: failureCode(error),
+    };
+  } finally {
+    session?.free();
+    if (activeGeneration === generation) {
+      activeGeneration = null;
+    }
+  }
+}
+
+export async function runW3ReconnectCheckpoint(
+  Session: W2WasmSessionConstructor,
+  profileId: string,
+): Promise<W3ReconnectCheckpointEvidence> {
+  if (activeGeneration !== null) {
+    throw new Error("web.remote.single_flight");
+  }
+  const generation = ++nextGeneration;
+  activeGeneration = generation;
+  let session: W2WasmSession | null = null;
+  let revision: number | null = null;
+  let reservationRecovery: W3ReservationRecovery | null = null;
+  try {
+    const loaded = await loadPairedState(profileId);
+    if (loaded.status !== "active") {
+      throw new Error(`web.remote.durable.${loaded.status}`);
+    }
+    revision = loaded.revision;
+    reservationRecovery = loaded.reservationRecovery;
+    session = Session.restore(loaded.state);
+    revision = await commitPairedState(
+      profileId,
+      revision,
+      session.businessExportDurableState(),
+    );
+    session.businessActivateDurableState();
+    const recovery = await completeRecovery(session, generation, "reconnectCheckpoint");
+    if (
+      !recovery.evidence.catalogSubscriptionActive ||
+      !recovery.evidence.relaySubscriptionActive ||
+      !recovery.evidence.restartMarkerObserved ||
+      recovery.evidence.revocationTerminalVerified
+    ) {
+      throw new Error("web.remote.durable.reconnect_checkpoint_incomplete");
+    }
+    revision = await commitPairedProjectionState(
+      profileId,
+      revision,
+      session.businessExportDurableState(),
+    );
+    return {
+      generation,
+      revision,
+      reservationRecovery,
+      business: recovery.evidence,
+      binaryFramesSent: recovery.binaryFramesSent,
+      storage: await inspectPairedStorage(profileId),
+      failureCode: null,
+    };
+  } catch (error) {
+    return {
+      generation,
+      revision,
+      reservationRecovery,
+      business: session === null ? null : businessEvidence(session),
+      binaryFramesSent: 0,
+      storage: await inspectPairedStorage(profileId),
+      failureCode: failureCode(error),
+    };
+  } finally {
+    session?.free();
+    if (activeGeneration === generation) {
+      activeGeneration = null;
+    }
   }
 }
 

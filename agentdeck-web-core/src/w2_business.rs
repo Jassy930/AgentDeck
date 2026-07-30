@@ -202,6 +202,9 @@ struct W2DurableStateV1 {
     conversation_inner_cursor: Option<RuntimeInnerCursor>,
     conversation_id: Option<ConversationId>,
     configuration_revision: Option<u64>,
+    prompt_command_id: Option<agentdeck_protocol::runtime::identity::CommandId>,
+    prompt_turn_id: Option<TurnId>,
+    approval: Option<ApprovalContext>,
     evidence: W2BusinessEvidence,
 }
 
@@ -221,6 +224,8 @@ struct PendingRequest {
     kind: PendingKind,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ApprovalContext {
     turn_id: TurnId,
     approval_id: ApprovalId,
@@ -491,6 +496,9 @@ impl W2BusinessCore {
             conversation_inner_cursor,
             conversation_id: self.conversation_id.clone(),
             configuration_revision: self.configuration_revision,
+            prompt_command_id: self.prompt_command_id.clone(),
+            prompt_turn_id: self.prompt_turn_id.clone(),
+            approval: self.approval.clone(),
             evidence: self.evidence.clone(),
         };
         let encoded =
@@ -586,6 +594,9 @@ impl W2BusinessCore {
         core.durable_conversation_cursor = state.conversation_inner_cursor.clone();
         core.conversation_id = state.conversation_id.clone();
         core.configuration_revision = state.configuration_revision;
+        core.prompt_command_id = state.prompt_command_id.clone();
+        core.prompt_turn_id = state.prompt_turn_id.clone();
+        core.approval = state.approval.clone();
         core.evidence = state.evidence.clone();
         core.evidence.principal_authenticated = false;
         core.evidence.catalog_route_accepted = false;
@@ -599,7 +610,6 @@ impl W2BusinessCore {
         core.evidence.counter_reservation_end = next_high_water;
         core.evidence.recovery_catalog_backfill_count = 0;
         core.evidence.recovery_conversation_backfill_count = 0;
-        core.evidence.restart_marker_observed = false;
         core.evidence.revoke_route_accepted = false;
         core.evidence.revocation_receipt_committed = false;
         core.evidence.revocation_terminal_verified = false;
@@ -1148,6 +1158,36 @@ impl W2BusinessCore {
             .pending
             .take()
             .ok_or(W2PairingError::BusinessStateInvalid)?;
+        if self.evidence.durable_restored {
+            let suffix = match (&pending.kind, &reply) {
+                (
+                    PendingKind::Approval { .. },
+                    RuntimeReply::Approval(ApprovalReceipt::Claimed { .. }),
+                ) => "approval.reply.claimed",
+                (
+                    PendingKind::Approval { .. },
+                    RuntimeReply::Approval(ApprovalReceipt::Applied { .. }),
+                ) => "approval.reply.applied",
+                (
+                    PendingKind::Approval { .. },
+                    RuntimeReply::Approval(ApprovalReceipt::AlreadyHandled { .. }),
+                ) => "approval.reply.already_handled",
+                (
+                    PendingKind::Approval { .. },
+                    RuntimeReply::Approval(ApprovalReceipt::DeliveryFailed { .. }),
+                ) => "approval.reply.delivery_failed",
+                (
+                    PendingKind::Approval { .. },
+                    RuntimeReply::Approval(ApprovalReceipt::Expired { .. }),
+                ) => "approval.reply.expired",
+                (PendingKind::Approval { .. }, RuntimeReply::Failure(_)) => {
+                    "approval.reply.failure"
+                }
+                (PendingKind::Approval { .. }, _) => "approval.reply.unexpected",
+                _ => "reply.received",
+            };
+            self.evidence.recovery_stage = Some(format!("recovery.{suffix}"));
+        }
         let result = match (&mut pending.kind, payload_kind, reply) {
             (
                 PendingKind::Subscribe(tracker),
@@ -2380,8 +2420,20 @@ fn validate_restored_projection(state: &W2DurableStateV1) -> Result<(), W2Pairin
         && (state.catalog_inner_cursor.is_none()
             || state.conversation_inner_cursor.is_none()
             || state.conversation_id.is_none()
-            || state.configuration_revision.is_none())
+            || state.configuration_revision.is_none()
+            || state.prompt_command_id.is_none()
+            || state.prompt_turn_id.is_none())
     {
+        return Err(W2PairingError::DurableStateInvalid);
+    }
+    if state.evidence.approval_pending
+        && (state.prompt_command_id.is_none()
+            || state.prompt_turn_id.is_none()
+            || state.approval.is_none())
+    {
+        return Err(W2PairingError::DurableStateInvalid);
+    }
+    if state.evidence.restart_marker_observed && state.catalog_inner_cursor.is_none() {
         return Err(W2PairingError::DurableStateInvalid);
     }
     Ok(())

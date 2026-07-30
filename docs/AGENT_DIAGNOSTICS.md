@@ -44,7 +44,7 @@ agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge
 stable UDS。diagnostics report 不启动 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志；不要把
 diagnostics override 当成 stable ownership 配置。
 
-## Relay Web Test Companion W0–W3.3 failure codes
+## Relay Web Test Companion W0–W3.4 failure codes
 
 W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，尚未连接 Relay。以下 code 只在本地
 测试 host 中出现；它们不进入 daemon diagnostic log，也不能解释为远端业务失败：
@@ -121,6 +121,9 @@ daemon diagnostic log：
 | `web.remote.writer_generation_missing` | 当前 tab 从未取得 profile writer generation，却触发 durable mutation/send | 视为编排错误并保持零 frame；先取得 Web Lock，不能仅凭 IndexedDB 可读就写入 |
 | `web.remote.generation_stale` | generation 已 relinquish、关闭或收到新 owner 的 BroadcastChannel activation | 丢弃迟到 callback/frame；不得提交 state、推进 cursor/counter 或发送响应 |
 | `web.remote.durable.writer_contention_probe_failed` | W3.3 探针未在锁拒绝/旧 generation 上保持 revision/guard 不变和零 frame | 保留隔离 profile 与 Playwright 证据；停止 W3，不能把单写者测试写成 PASS |
+| `web.remote.test.chrome_pid_missing` / `chrome_cdp_timeout` / `chrome_exited` | W3.4 runner-owned Chrome 未取得主 PID、CDP 未就绪或在连接前退出 | 核对系统 Chrome executable、独立 user-data-dir 和端口；不能退回 Playwright 普通 close 模拟 crash |
+| `web.remote.test.chrome_kill_timeout` / `chrome_already_terminal` | 精确 process-group `SIGKILL` 未在窗口内读回，或同一 managed process 被重复终止 | 保留 PID/PGID 证据并停止本轮；禁止按全局进程名杀浏览器或把 TERM/close 写成 crash PASS |
+| `web.remote.durable.pending_business_checkpoint_incomplete` | prompt cut 冷启动未在 daemon restart 前完成原 pending approval 与 command | 保留 encrypted profile 和 host ledger；不能先重启 daemon 后把合法 `Expired` 改写或伪报为 Applied |
 | `web.remote.storage.counterGuardRecoveryFailed` / `pairedCommitmentMismatch` | Pending 收口后未读回 Stable exact state，或解密 plaintext 的 SHA-256 与 sealed commitment 不一致 | 停止旧 identity；保留 profile 取证，不能回退旧 revision 或重新配对掩盖 |
 | `web.remote.durable.reconnect_timeout` / `recovery_timeout` | reload 后认证或 Catalog/Conversation recovery 未在有界窗口完成 | 读取 `recoveryStage` 与 host generation；不要用固定 sleep、无限重试或重新配对掩盖 cursor/gap 错误 |
 | `web.remote.durable.revocation_terminal_missing` | self-revoke 后未验证 MachineRoot-signed terminal | 保留材料，不执行删除；directed receipt 或 socket close 都不能单独充当权威 terminal |
@@ -162,6 +165,9 @@ W3.2 失败用 `--state-cuts` 定位 state cut，或用 `--recovery` 同时回�
 `quarantined(stateFork)` 与零 frame，不能把 quarantine 当作可恢复成功。
 W3.3 失败用 `--contention`，同时核对第二 tab acquire、主 tab relinquish、peer invalidation、两次 late probe
 和 paired revision/guard before/after；BroadcastChannel 只允许通知 generation，不得携带 canonical state。
+W3.4 失败用 `--browser-kills`，核对 prompt/approval/reconnect cut、主 PID、`SIGKILL` readback、同一 profile、
+revision/reservation 与 host exactly-once 计数。若第二次 recovery 停在 marker 之后，确认 durable
+`restartMarkerObserved` 随 catalog cursor 单调保留，不能倒退 cursor 重放旧 marker。
 测试结束必须停止静态 server、关闭 tab/profile、Relay/daemon 并删除本轮精确临时 root；cleanup 不使用
 全局浏览器数据或全局进程名删除。
 

@@ -232,7 +232,7 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Web Test Companion（W0/W1/W2 complete；W3.1–W3.3 complete）
+## Relay Web Test Companion（W0/W1/W2 complete；W3.1–W3.4 complete）
 
 `agentdeck-web-core` 已证明现有 Relay v2 codec、Runtime v5 request contract 与 E2EE v1 crypto 可以复用同一
 Rust 实现编译为 browser WASM；`web/relay-test-companion` 是 Bun 管理的最小测试页面与 host adapter，
@@ -343,6 +343,20 @@ generation，不承载 canonical state。第二 tab 在主 tab 持锁时被拒�
 scripts/run-relay-web-companion-e2e.sh --contention
 ```
 
+W3.4 使用 runner-owned 系统 Chrome 与独立 process group，在 prompt、approval、reconnect 三个阶段精确
+`SIGKILL` Chrome 主进程，再以同一 user-data-dir、不同 PID 冷启动。prompt cut 必须先在 daemon restart 前
+恢复并完成 pending approval；否则 daemon 会把未裁决审批合法收敛为 `Expired`，不能伪造为 Applied。
+reconnect cut 还要证明第二次恢复从已提交 cursor 继续时保留单调 restart-marker 事实，不倒退 cursor：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --browser-kills
+```
+
+三轮最终 host 都必须读回 command/completed 与 approval total/applied 各 `1/1`、revoke `1`、active grant
+`0`。prompt/reconnect 最终 revision `5`、reservation `512→768`；approval 最终 revision `3`、reservation
+`256→512`。每轮还必须读回 `SIGKILL`、主 PID 改变、profile 相同、业务明文 absent 与全部 runner artifact
+absent。
+
 本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
 `http://127.0.0.1:4173/`。该入口只用于查看测试壳；需要 paired durable state、隔离 profile 和完整 cleanup
 时必须使用统一 runner，不在日常浏览器 profile 中手工保留测试身份。
@@ -350,8 +364,8 @@ scripts/run-relay-web-companion-e2e.sh --contention
 这仍不是完整网页版。W2c 已关闭单轮 automatic 的 pair→业务→reload/reconnect/backfill→revoke 正向链路，
 W2.7 已关闭 approval loser 与 stale/replay/nonce-reuse 零 mutation 反例矩阵；W2.8 又在同一 candidate 上完成
 Web aggregate、fixed-topology iOS Simulator、SessionSource/RelayClient 回归和 runbook 收口，因此 W2 automatic
-overall complete。W3.1/W3.2 两类 crash cut 与 W3.3 tab contention/generation 隔离均已关闭；
-W3.4–W3.7 的真实 browser kill、网络故障与同一 candidate 三次 fresh run 尚未开始。公网 WSS、
+overall complete。W3.1/W3.2 两类 crash cut、W3.3 tab contention/generation 隔离与 W3.4 真实 browser kill
+均已关闭；W3.5–W3.7 的网络故障、同一 candidate 三次 fresh run 与双路终审尚未完成。公网 WSS、
 production SPKI pin/signing、物理设备、第二台 Mac 与真实 vendor 属于 W4，继续独立 BLOCKED。阶段事实源见
 [`Relay Web Test Companion 实施计划`](docs/plans/2026-07-30-relay-web-test-companion-implementation.md)。
 
