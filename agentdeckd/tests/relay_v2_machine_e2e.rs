@@ -2280,6 +2280,8 @@ enum P57HostCommand {
     RestartDaemon {
         #[serde(rename = "requestId")]
         request_id: String,
+        #[serde(rename = "markerBeforeReadiness", default)]
+        marker_before_readiness: bool,
     },
     Shutdown {
         #[serde(rename = "requestId")]
@@ -2296,6 +2298,7 @@ enum P57HostWaitCondition {
     WebBusinessMutated,
     BusinessMutated,
     Revoked,
+    RestartBaseReady,
 }
 
 #[derive(Serialize)]
@@ -2383,6 +2386,7 @@ impl P57HostEvidence {
                     && self.relay_grant_active == 0
                     && self.runtime_revoked_authorization_count == 1
             }
+            P57HostWaitCondition::RestartBaseReady => self.satisfies_business_ready_base(),
         }
     }
 
@@ -2513,6 +2517,16 @@ struct P57HostDaemonRestarted<'a> {
     request_id: &'a str,
     recovered_conversation_id: String,
     restart_marker_title: &'static str,
+    metadata_entry_revision: u64,
+    evidence: P57HostEvidence,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct P57HostDaemonRestartReady<'a> {
+    kind: &'static str,
+    protocol: &'static str,
+    request_id: &'a str,
     metadata_entry_revision: u64,
     evidence: P57HostEvidence,
 }
@@ -2876,6 +2890,35 @@ async fn wait_for_p57_host_evidence(
             return (false, evidence);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn apply_p57_host_restart_marker(
+    local: &RuntimeUnixClient,
+    conversation_id: &ConversationId,
+) -> u64 {
+    let marker = unary(
+        local,
+        RuntimeRequest::UpdateConversationMetadata(
+            ConversationMetadataMutationRequest::new(
+                conversation_id.clone(),
+                IdempotencyKey::new("r44-restart-marker"),
+                0,
+                ConversationMetadataMutation::rename(Some(
+                    P57_HOST_R44_RESTART_MARKER_TITLE.to_owned(),
+                ))
+                .expect("valid R4.4 restart marker title"),
+            )
+            .expect("valid R4.4 restart marker request"),
+        ),
+    )
+    .await;
+    match marker {
+        RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Applied {
+            conversation_id: observed,
+            entry_revision,
+        }) if observed == *conversation_id && entry_revision == 1 => entry_revision,
+        other => panic!("restarted daemon did not apply the exact marker metadata: {other:?}"),
     }
 }
 
@@ -3485,7 +3528,7 @@ async fn p57_real_dual_scope_ndjson_host() {
             P57HostCommand::Status { request_id }
             | P57HostCommand::WaitFor { request_id, .. }
             | P57HostCommand::ApprovePendingPairing { request_id }
-            | P57HostCommand::RestartDaemon { request_id }
+            | P57HostCommand::RestartDaemon { request_id, .. }
             | P57HostCommand::Shutdown { request_id } => request_id,
         };
         if request_id.is_empty()
@@ -3627,7 +3670,10 @@ async fn p57_real_dual_scope_ndjson_host() {
                     evidence,
                 });
             }
-            P57HostCommand::RestartDaemon { request_id } => {
+            P57HostCommand::RestartDaemon {
+                request_id,
+                marker_before_readiness,
+            } => {
                 if host_scenario != Some(P57_HOST_R44_SCENARIO) || daemon_generation != 1 {
                     emit_p57_host_record(&P57HostError {
                         kind: "error",
@@ -3658,6 +3704,59 @@ async fn p57_real_dual_scope_ndjson_host() {
                 );
                 daemon = Some(restarted);
                 let current = daemon.as_ref().expect("restarted P5.7 daemon is present");
+                let recovered_conversation_id = r43_conversation
+                    .as_ref()
+                    .expect("R4.4 lifecycle keeps the original conversation identity")
+                    .clone();
+                if marker_before_readiness {
+                    let metadata_entry_revision =
+                        apply_p57_host_restart_marker(&current.local, &recovered_conversation_id)
+                            .await;
+                    let (base_satisfied, evidence) = wait_for_p57_host_evidence(
+                        current.core.as_ref(),
+                        &current.local,
+                        &current.socket,
+                        &config.paths().runtime_db,
+                        &relay_db,
+                        P57HostWaitCondition::RestartBaseReady,
+                        60_000,
+                        daemon_generation,
+                    )
+                    .await;
+                    if !base_satisfied {
+                        emit_p57_host_record(&P57HostReadinessError {
+                            kind: "error",
+                            protocol: P57_HOST_PROTOCOL,
+                            request_id: Some(&request_id),
+                            code: "host.restart.base_not_ready",
+                            evidence,
+                        });
+                        continue;
+                    }
+                    let restart_evidence = evidence.clone();
+                    emit_p57_host_record(&P57HostDaemonRestartReady {
+                        kind: "restartReady",
+                        protocol: P57_HOST_PROTOCOL,
+                        request_id: &request_id,
+                        metadata_entry_revision,
+                        evidence,
+                    });
+                    // Web durable recovery 会在两条 subscription active 后立即 self-revoke；
+                    // host 若轮询 transient live-count，可能永远错过该窗口。这里冻结的是
+                    // daemon restart + marker COMMIT + active grant 的 base linearization evidence；
+                    // 两条 subscription 与 backfill 由浏览器的 authenticated evidence 断言，
+                    // revoke 由后续独立 `Revoked` readback 断言。
+                    emit_p57_host_record(&P57HostDaemonRestarted {
+                        kind: "restartDaemon",
+                        protocol: P57_HOST_PROTOCOL,
+                        request_id: &request_id,
+                        recovered_conversation_id: recovered_conversation_id.as_str().to_owned(),
+                        restart_marker_title: P57_HOST_R44_RESTART_MARKER_TITLE,
+                        metadata_entry_revision,
+                        evidence: restart_evidence,
+                    });
+                    continue;
+                }
                 let (satisfied, pre_marker_evidence) = wait_for_p57_host_evidence(
                     current.core.as_ref(),
                     &current.local,
@@ -3679,46 +3778,9 @@ async fn p57_real_dual_scope_ndjson_host() {
                     });
                     continue;
                 }
-                let recovered_conversation_id = r43_conversation
-                    .as_ref()
-                    .expect("R4.4 lifecycle keeps the original conversation identity")
-                    .clone();
-                let marker = unary(
-                    &current.local,
-                    RuntimeRequest::UpdateConversationMetadata(
-                        ConversationMetadataMutationRequest::new(
-                            recovered_conversation_id.clone(),
-                            IdempotencyKey::new("r44-restart-marker"),
-                            0,
-                            ConversationMetadataMutation::rename(Some(
-                                P57_HOST_R44_RESTART_MARKER_TITLE.to_owned(),
-                            ))
-                            .expect("valid R4.4 restart marker title"),
-                        )
-                        .expect("valid R4.4 restart marker request"),
-                    ),
-                )
-                .await;
-                let metadata_entry_revision = match marker {
-                    RuntimeReply::ConversationMetadata(ConversationMetadataReceipt::Applied {
-                        conversation_id,
-                        entry_revision,
-                    }) if conversation_id == recovered_conversation_id && entry_revision == 1 => {
-                        entry_revision
-                    }
-                    other => panic!(
-                        "restarted daemon did not apply the exact marker metadata: {other:?}"
-                    ),
-                };
-                let evidence = p57_host_evidence(
-                    current.core.as_ref(),
-                    &current.local,
-                    &current.socket,
-                    &config.paths().runtime_db,
-                    &relay_db,
-                    daemon_generation,
-                )
-                .await;
+                let metadata_entry_revision =
+                    apply_p57_host_restart_marker(&current.local, &recovered_conversation_id).await;
+                let evidence = pre_marker_evidence;
                 emit_p57_host_record(&P57HostDaemonRestarted {
                     kind: "restartDaemon",
                     protocol: P57_HOST_PROTOCOL,

@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { expect, test } from "@playwright/test";
 
 test("W2a real browser pairing reaches durable terminal", async ({ page }) => {
@@ -95,5 +95,135 @@ test("W2b real browser business flow closes prompt and approval", async ({ page 
   expect(visibleText).not.toContain("web-w2b-prompt-7fb7f299");
   expect(visibleText).not.toContain("synthetic Codex response");
   expect(visibleText).not.toContain("synthetic codex approval");
+  expect(consoleErrors).toEqual([]);
+});
+
+test("W2c durable reload reconnect backfill and revoke closes", async ({ page }) => {
+  test.setTimeout(240_000);
+  const invitePath = process.env.AGENTDECK_W2_INVITE_PATH;
+  const coordinationDir = process.env.AGENTDECK_W2_COORDINATION_DIR;
+  const profileId = process.env.AGENTDECK_W2_PROFILE_ID;
+  if (invitePath === undefined || coordinationDir === undefined || profileId === undefined) {
+    throw new Error("W2c runner contract is missing");
+  }
+  const invite = (await readFile(invitePath, "utf8")).trim();
+  const consoleErrors: string[] = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+
+  await page.goto("/");
+  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.ready)).toBe("true");
+  const started = await page.evaluate(
+    async ({ encodedInvite, profile }) =>
+      globalThis.relayTestApi.runW2DurableStart(encodedInvite, profile),
+    { encodedInvite: invite, profile: profileId },
+  );
+  expect(started.failureCode, JSON.stringify(started)).toBeNull();
+  expect(started.revision).toBe(1);
+  expect(started.business).toMatchObject({
+    durablePromoted: true,
+    commandCompleted: true,
+    approvalReceiptApplied: true,
+    approvalEventApplied: true,
+    counterReservationStart: 0,
+    counterReservationEnd: 256,
+  });
+  expect(started.storage).toMatchObject({
+    pairedPresent: true,
+    kekPresent: true,
+    revokedPresent: false,
+    revision: 1,
+  });
+  expect(started.storage.ciphertextBytes).toBeGreaterThan(16);
+  await writeFile(`${coordinationDir}/business.ready`, "ready\n", { flag: "wx", mode: 0o600 });
+
+  await expect
+    .poll(
+      async () => {
+        try {
+          return JSON.parse(await readFile(`${coordinationDir}/restart.begin`, "utf8")) as Record<
+            string,
+            unknown
+          >;
+        } catch {
+          return null;
+        }
+      },
+      { timeout: 90_000 },
+    )
+    .not.toBeNull();
+
+  await page.reload();
+  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.ready)).toBe("true");
+  const recovered = await page.evaluate(
+    async (profile) => globalThis.relayTestApi.runW2DurableRecover(profile),
+    profileId,
+  );
+  expect(recovered.failureCode, JSON.stringify(recovered)).toBeNull();
+  expect(recovered.revision).toBe(3);
+  expect(recovered.preActivationNetworkLocked).toBe(true);
+  expect(recovered.reloadStatus).toBe("revoked");
+  expect(recovered.business).toMatchObject({
+    durablePromoted: true,
+    durableRestored: true,
+    reconnectAuthenticated: true,
+    counterReservationStart: 256,
+    counterReservationEnd: 512,
+    restartMarkerObserved: true,
+    revocationReceiptCommitted: true,
+    revocationTerminalVerified: true,
+    commandCompleted: true,
+    approvalReceiptApplied: true,
+    approvalEventApplied: true,
+  });
+  expect(recovered.business?.recoveryCatalogBackfillCount).toBeGreaterThanOrEqual(1);
+  expect(recovered.storage).toEqual({
+    pairedPresent: false,
+    kekPresent: false,
+    revokedPresent: true,
+    revision: 3,
+    ciphertextBytes: 0,
+  });
+  expect(recovered.binaryFramesSent).toBeGreaterThanOrEqual(8);
+  await expect(page.locator("#w2-status")).toHaveText("W2c reload/reconnect/revoke 闭环通过");
+  await expect
+    .poll(
+      async () => {
+        try {
+          return JSON.parse(await readFile(`${coordinationDir}/restart.done`, "utf8")) as Record<
+            string,
+            unknown
+          >;
+        } catch {
+          return null;
+        }
+      },
+      { timeout: 30_000 },
+    )
+    .not.toBeNull();
+  const restartRecord = JSON.parse(
+    await readFile(`${coordinationDir}/restart.done`, "utf8"),
+  ) as Record<string, unknown>;
+  expect(restartRecord).toMatchObject({
+    daemonGeneration: 2,
+    restartMarkerTitle: "R4.4 daemon restart marker",
+    metadataEntryRevision: 1,
+  });
+
+  const rejectedReconnect = await page.evaluate(
+    async (profile) => globalThis.relayTestApi.runW2DurableRecover(profile),
+    profileId,
+  );
+  expect(rejectedReconnect.failureCode).toBe("web.remote.durable.revoked");
+  expect(rejectedReconnect.binaryFramesSent).toBe(0);
+  expect(rejectedReconnect.reloadStatus).toBe("revoked");
+  const visibleText = await page.locator("html").innerText();
+  expect(visibleText).not.toContain("web-w2b-prompt-7fb7f299");
+  expect(visibleText).not.toContain("synthetic Codex response");
+  expect(visibleText).not.toContain("synthetic codex approval");
+  expect(visibleText).not.toContain("R4.4 daemon restart marker");
   expect(consoleErrors).toEqual([]);
 });

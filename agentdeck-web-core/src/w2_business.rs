@@ -6,39 +6,43 @@
 
 use std::collections::{HashMap, HashSet};
 
+use agentdeck_crypto::PairResponseExpectedV1;
 use agentdeck_crypto::rand_core::TryRng as _;
 use agentdeck_crypto::{
-    AeadReceivingKey, AeadSendingKey, HpkePrivateKey, SenderCounter, SigningKey,
+    AeadReceivingKey, AeadSendingKey, HpkePrivateKey, SenderCounter, SignatureBytes, SigningKey,
     VerifiedPairResponseV1, VerifyingKey, derive_nonce_prefix, open_key_directory_entry,
-    open_sealed_payload, seal_symmetric, sign_authentication_transcript, sign_sealed,
-    verify_sealed,
+    open_pair_response_verified, open_sealed_payload, seal_symmetric,
+    sign_authentication_transcript, sign_sealed, verify_sealed, verify_tbs,
 };
 use agentdeck_protocol::e2ee::{
     AuthorizationCapabilityV1, AuthorizationPermissionV1, E2EE_FORMAT_VERSION, EpochBarrierV1,
     KeyControlRequestV1, KeyControlV1, KeyPurpose, KeyUpdateInfoV1, OuterContextV1, OuterFrameKind,
-    SealedPayloadKind, SignedSealedBlobV1, StreamAppliedAckV1, StreamBindingV1,
+    PairInviteV1, PairResponseV1, SealedPayloadKind, SignedSealedBlobV1, StreamAppliedAckV1,
+    StreamBindingV1,
 };
 use agentdeck_protocol::relay_v2::auth::{
     AuthenticationRole, AuthenticationTranscriptV1, RelayGrant,
 };
 use agentdeck_protocol::relay_v2::frame::{
     AcceptedRef, Ack, AuthProof, Authenticate, Challenge, Hello, Pong, Publish, ReplayComplete,
-    SealedBlob, Send, Subscribe,
+    RevocationCommitted, SealedBlob, Send, Subscribe,
 };
 use agentdeck_protocol::relay_v2::{
     KeyDirectoryRevision, OpaqueRouteFrame, RELAY_PROTOCOL_VERSION, RelayFrameBody, RequestRouteId,
     StreamCursor, StreamGenerationId, StreamRouteId, decode, encode,
 };
-use agentdeck_protocol::runtime::command::PromptPayload;
+use agentdeck_protocol::runtime::command::{PromptPayload, RevokeRequest, RevokeTarget};
 use agentdeck_protocol::runtime::identity::{ApprovalId, MessageId, TurnId};
 use agentdeck_protocol::runtime::{
-    ApprovalDeliveryState, ApprovalReceipt, CatalogSnapshot, CommandReceipt, ConversationId,
-    ConversationSnapshot, IdempotencyKey, RUNTIME_PROTOCOL_VERSION, RuntimeEnvelope, RuntimeEvent,
-    RuntimeEventBody, RuntimeInnerCursor, RuntimeMessage, RuntimeReply, RuntimeRequest,
-    RuntimeStreamItem, RuntimeSyncComplete, SendPromptRequest, SubscriptionReceipt,
+    ApprovalDeliveryState, ApprovalReceipt, BackfillChunk, CatalogChange, CatalogSnapshot,
+    CommandReceipt, ConversationId, ConversationSnapshot, IdempotencyKey, RUNTIME_PROTOCOL_VERSION,
+    RevocationReceipt, RuntimeEnvelope, RuntimeEvent, RuntimeEventBody, RuntimeInnerCursor,
+    RuntimeMessage, RuntimeReply, RuntimeRequest, RuntimeStreamItem, RuntimeSyncComplete,
+    SendPromptRequest, SubscriptionReceipt,
 };
 use agentdeck_protocol::trunk::{ActionDecision, ActionDecisionKind, AgentItem};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::DeterministicRng;
 use crate::w2::W2PairingError;
@@ -46,6 +50,10 @@ use crate::w2::W2PairingError;
 const EXPECTED_ASSISTANT_TEXT: &str = "synthetic Codex response";
 const EXPECTED_APPROVAL_SUMMARY: &str = "synthetic codex approval";
 const W2B_PROMPT_TEXT: &str = "web-w2b-prompt-7fb7f299";
+const W2C_RESTART_MARKER_TITLE: &str = "R4.4 daemon restart marker";
+const W2_DURABLE_STATE_VERSION: u16 = 1;
+const W2_COUNTER_RESERVATION_BLOCK: u64 = 256;
+const W2_MAX_DURABLE_STATE_BYTES: usize = 256 * 1_024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -69,6 +77,18 @@ pub struct W2BusinessEvidence {
     pub approval_event_applied: bool,
     pub command_completed: bool,
     pub outer_ack_count: u64,
+    pub durable_promoted: bool,
+    pub durable_restored: bool,
+    pub counter_reservation_start: u64,
+    pub counter_reservation_end: u64,
+    pub reconnect_authenticated: bool,
+    pub recovery_catalog_backfill_count: u64,
+    pub recovery_conversation_backfill_count: u64,
+    pub restart_marker_observed: bool,
+    pub revoke_route_accepted: bool,
+    pub revocation_receipt_committed: bool,
+    pub revocation_terminal_verified: bool,
+    pub recovery_stage: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,11 +114,16 @@ enum SubscriptionTarget {
 
 struct SubscriptionTracker {
     target: SubscriptionTarget,
+    requested: RuntimeInnerCursor,
+    delivered: RuntimeInnerCursor,
+    recovery: bool,
     subscription_generation: Option<agentdeck_protocol::runtime::identity::StreamGeneration>,
     snapshot_cursor: Option<StreamCursor>,
     configuration_revision: Option<u64>,
     sync_complete: Option<RuntimeSyncComplete>,
     binding: Option<StreamBindingV1>,
+    snapshot_seen: bool,
+    backfill_count: u64,
 }
 
 enum PendingKind {
@@ -110,6 +135,44 @@ enum PendingKind {
         terminal: bool,
         receipt_applied: bool,
     },
+    Revoke {
+        receipt_committed: bool,
+        terminal_verified: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DurabilityPhase {
+    Volatile,
+    AwaitingCommit { reserved_high_water: u64 },
+    Active { reserved_high_water: u64 },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct W2DurableStateV1 {
+    version: u16,
+    paired_at_ms: u64,
+    invite: Vec<u8>,
+    device_sign_seed: [u8; 32],
+    device_hpke_ikm: [u8; 32],
+    canonical_response: Vec<u8>,
+    reserved_high_water: u64,
+    request_sequence: u64,
+    catalog_inner_cursor: Option<RuntimeInnerCursor>,
+    conversation_inner_cursor: Option<RuntimeInnerCursor>,
+    conversation_id: Option<ConversationId>,
+    configuration_revision: Option<u64>,
+    evidence: W2BusinessEvidence,
+}
+
+impl Drop for W2DurableStateV1 {
+    fn drop(&mut self) {
+        self.device_sign_seed.fill(0);
+        self.device_hpke_ikm.fill(0);
+        self.invite.fill(0);
+        self.canonical_response.fill(0);
+    }
 }
 
 struct PendingRequest {
@@ -135,6 +198,10 @@ struct PendingControlAck {
 pub(crate) struct W2BusinessCore {
     connect_url: String,
     phase: PrincipalPhase,
+    invite: PairInviteV1,
+    paired_at_ms: u64,
+    device_sign_seed: Zeroizing<[u8; 32]>,
+    device_hpke_ikm: Zeroizing<[u8; 32]>,
     device_signing_key: SigningKey,
     _device_hpke_private_key: HpkePrivateKey,
     _verified_response: VerifiedPairResponseV1,
@@ -147,6 +214,7 @@ pub(crate) struct W2BusinessCore {
     stream_keys: Vec<StreamKey>,
     directory_revision: u64,
     command_counter: u64,
+    durability: DurabilityPhase,
     request_sequence: u64,
     reply_counters: HashSet<u64>,
     stream_counters: HashSet<(StreamRouteId, u64)>,
@@ -159,6 +227,8 @@ pub(crate) struct W2BusinessCore {
     configuration_revision: Option<u64>,
     catalog_binding: Option<StreamBindingV1>,
     conversation_binding: Option<StreamBindingV1>,
+    durable_catalog_cursor: Option<RuntimeInnerCursor>,
+    durable_conversation_cursor: Option<RuntimeInnerCursor>,
     prompt_command_id: Option<agentdeck_protocol::runtime::identity::CommandId>,
     prompt_turn_id: Option<TurnId>,
     approval: Option<ApprovalContext>,
@@ -176,8 +246,12 @@ impl std::fmt::Debug for W2BusinessCore {
 }
 
 impl W2BusinessCore {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        wss_url: &str,
+        invite: PairInviteV1,
+        paired_at_ms: u64,
+        device_sign_seed: Zeroizing<[u8; 32]>,
+        device_hpke_ikm: Zeroizing<[u8; 32]>,
         device_signing_key: SigningKey,
         device_hpke_private_key: HpkePrivateKey,
         verified_response: VerifiedPairResponseV1,
@@ -271,10 +345,14 @@ impl W2BusinessCore {
         let command_key = command_key.ok_or(W2PairingError::BusinessCryptoFailed)?;
         let (reply_key, reply_nonce_prefix) =
             reply_key.ok_or(W2PairingError::BusinessCryptoFailed)?;
-        let connect_url = format!("{wss_url}v2/connect");
+        let connect_url = format!("{}v2/connect", invite.wss_url);
         Ok(Self {
             connect_url,
             phase: PrincipalPhase::Initial,
+            invite,
+            paired_at_ms,
+            device_sign_seed,
+            device_hpke_ikm,
             device_signing_key,
             _device_hpke_private_key: device_hpke_private_key,
             _verified_response: verified_response,
@@ -287,6 +365,7 @@ impl W2BusinessCore {
             stream_keys,
             directory_revision,
             command_counter: 0,
+            durability: DurabilityPhase::Volatile,
             request_sequence: 0,
             reply_counters: HashSet::new(),
             stream_counters: HashSet::new(),
@@ -299,6 +378,8 @@ impl W2BusinessCore {
             configuration_revision: None,
             catalog_binding: None,
             conversation_binding: None,
+            durable_catalog_cursor: None,
+            durable_conversation_cursor: None,
             prompt_command_id: None,
             prompt_turn_id: None,
             approval: None,
@@ -306,7 +387,191 @@ impl W2BusinessCore {
         })
     }
 
+    pub(crate) fn prepare_durable_promotion(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        if self.phase != PrincipalPhase::Initial
+            || self.durability != DurabilityPhase::Volatile
+            || self.command_counter != 0
+            || self.request_sequence != 0
+        {
+            return Err(W2PairingError::DurableStateInvalid);
+        }
+        self.durability = DurabilityPhase::AwaitingCommit {
+            reserved_high_water: W2_COUNTER_RESERVATION_BLOCK,
+        };
+        self.evidence.durable_promoted = true;
+        self.evidence.counter_reservation_start = 0;
+        self.evidence.counter_reservation_end = W2_COUNTER_RESERVATION_BLOCK;
+        self.export_durable_state()
+    }
+
+    pub(crate) fn export_durable_state(&self) -> Result<Vec<u8>, W2PairingError> {
+        if self.pending.is_some() || self.phase == PrincipalPhase::Failed {
+            return Err(W2PairingError::DurableStateInvalid);
+        }
+        let reserved_high_water = match self.durability {
+            DurabilityPhase::Volatile => return Err(W2PairingError::DurableNotPrepared),
+            DurabilityPhase::AwaitingCommit {
+                reserved_high_water,
+            }
+            | DurabilityPhase::Active {
+                reserved_high_water,
+            } => reserved_high_water,
+        };
+        if reserved_high_water == 0
+            || !reserved_high_water.is_multiple_of(W2_COUNTER_RESERVATION_BLOCK)
+            || self.command_counter > reserved_high_water
+        {
+            return Err(W2PairingError::DurableStateInvalid);
+        }
+        // StreamBinding 的 inner cursor 是 Relay publication cut；directed bootstrap 的
+        // SyncComplete 可以在同一次线性化期间推进得更高。持久化 reducer 已应用的 cut，
+        // 不能被较旧的 publication cut 覆盖，否则 reload 会重复补拉已应用数据。
+        let catalog_inner_cursor = self.durable_catalog_cursor.clone().or_else(|| {
+            self.catalog_binding
+                .as_ref()
+                .map(|binding| binding.inner_cursor.clone())
+        });
+        let conversation_inner_cursor = self.durable_conversation_cursor.clone().or_else(|| {
+            self.conversation_binding
+                .as_ref()
+                .map(|binding| binding.inner_cursor.clone())
+        });
+        let state = W2DurableStateV1 {
+            version: W2_DURABLE_STATE_VERSION,
+            paired_at_ms: self.paired_at_ms,
+            invite: self
+                .invite
+                .canonical_bytes()
+                .map_err(|_| W2PairingError::DurableStateInvalid)?,
+            device_sign_seed: *self.device_sign_seed,
+            device_hpke_ikm: *self.device_hpke_ikm,
+            canonical_response: self._verified_response.canonical_response().to_vec(),
+            reserved_high_water,
+            request_sequence: self.request_sequence,
+            catalog_inner_cursor,
+            conversation_inner_cursor,
+            conversation_id: self.conversation_id.clone(),
+            configuration_revision: self.configuration_revision,
+            evidence: self.evidence.clone(),
+        };
+        let encoded =
+            serde_json::to_vec(&state).map_err(|_| W2PairingError::SerializationFailed)?;
+        if encoded.len() > W2_MAX_DURABLE_STATE_BYTES {
+            return Err(W2PairingError::DurableStateInvalid);
+        }
+        Ok(encoded)
+    }
+
+    pub(crate) fn activate_durable_state(&mut self) -> Result<(), W2PairingError> {
+        let DurabilityPhase::AwaitingCommit {
+            reserved_high_water,
+        } = self.durability
+        else {
+            return Err(W2PairingError::DurableNotPrepared);
+        };
+        self.durability = DurabilityPhase::Active {
+            reserved_high_water,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn restore(
+        bytes: &[u8],
+        rng: DeterministicRng,
+    ) -> Result<(Self, PairInviteV1), W2PairingError> {
+        if bytes.is_empty() || bytes.len() > W2_MAX_DURABLE_STATE_BYTES {
+            return Err(W2PairingError::DurableStateInvalid);
+        }
+        let state: W2DurableStateV1 =
+            serde_json::from_slice(bytes).map_err(|_| W2PairingError::DurableStateInvalid)?;
+        if serde_json::to_vec(&state).map_err(|_| W2PairingError::DurableStateInvalid)? != bytes
+            || state.version != W2_DURABLE_STATE_VERSION
+            || state.paired_at_ms == 0
+            || state.reserved_high_water == 0
+            || !state
+                .reserved_high_water
+                .is_multiple_of(W2_COUNTER_RESERVATION_BLOCK)
+        {
+            return Err(W2PairingError::DurableStateInvalid);
+        }
+        let next_high_water = state
+            .reserved_high_water
+            .checked_add(W2_COUNTER_RESERVATION_BLOCK)
+            .ok_or(W2PairingError::BusinessCounterExhausted)?;
+        let invite = PairInviteV1::from_canonical_bytes(&state.invite)
+            .map_err(|_| W2PairingError::DurableStateInvalid)?;
+        let response = PairResponseV1::from_canonical_bytes(&state.canonical_response)
+            .map_err(|_| W2PairingError::DurableStateInvalid)?;
+        let device_sign_seed = Zeroizing::new(state.device_sign_seed);
+        let device_hpke_ikm = Zeroizing::new(state.device_hpke_ikm);
+        let device_signing_key = SigningKey::from_seed(&device_sign_seed);
+        let (device_hpke_private_key, device_hpke_public_key) =
+            HpkePrivateKey::derive_keypair(device_hpke_ikm.as_ref());
+        let device_hpke_pubkey: [u8; 32] = device_hpke_public_key
+            .to_bytes()
+            .try_into()
+            .map_err(|_| W2PairingError::DurableStateInvalid)?;
+        let authorization =
+            super::w2::mvp_authorization().map_err(|_| W2PairingError::DurableStateInvalid)?;
+        let verified_response = open_pair_response_verified(
+            &device_hpke_private_key,
+            PairResponseExpectedV1::new(
+                &invite,
+                response.info.request_hash,
+                device_signing_key.verifying_key().to_bytes(),
+                device_hpke_pubkey,
+                &authorization,
+                state.paired_at_ms,
+            ),
+            &state.canonical_response,
+        )
+        .map_err(|_| W2PairingError::DurableStateInvalid)?;
+        let restored_invite = invite.clone();
+        let mut core = Self::new(
+            invite,
+            state.paired_at_ms,
+            device_sign_seed,
+            device_hpke_ikm,
+            device_signing_key,
+            device_hpke_private_key,
+            verified_response,
+            rng,
+        )?;
+        validate_restored_projection(&state)?;
+        core.command_counter = state.reserved_high_water;
+        core.request_sequence = state.request_sequence;
+        core.durability = DurabilityPhase::AwaitingCommit {
+            reserved_high_water: next_high_water,
+        };
+        core.durable_catalog_cursor = state.catalog_inner_cursor.clone();
+        core.durable_conversation_cursor = state.conversation_inner_cursor.clone();
+        core.conversation_id = state.conversation_id.clone();
+        core.configuration_revision = state.configuration_revision;
+        core.evidence = state.evidence.clone();
+        core.evidence.principal_authenticated = false;
+        core.evidence.catalog_route_accepted = false;
+        core.evidence.catalog_subscription_active = false;
+        core.evidence.conversation_route_accepted = false;
+        core.evidence.conversation_open = false;
+        core.evidence.relay_subscription_active = false;
+        core.evidence.durable_restored = true;
+        core.evidence.reconnect_authenticated = false;
+        core.evidence.counter_reservation_start = state.reserved_high_water;
+        core.evidence.counter_reservation_end = next_high_water;
+        core.evidence.recovery_catalog_backfill_count = 0;
+        core.evidence.recovery_conversation_backfill_count = 0;
+        core.evidence.restart_marker_observed = false;
+        core.evidence.revoke_route_accepted = false;
+        core.evidence.revocation_receipt_committed = false;
+        core.evidence.revocation_terminal_verified = false;
+        core.evidence.recovery_stage = Some("recovery.state.restored".to_owned());
+        Ok((core, restored_invite))
+    }
+
     pub(crate) fn connect_url(&self) -> Result<&str, W2PairingError> {
+        if matches!(self.durability, DurabilityPhase::AwaitingCommit { .. }) {
+            return Err(W2PairingError::DurableCommitRequired);
+        }
         if self.phase != PrincipalPhase::Initial {
             return Err(W2PairingError::BusinessStateInvalid);
         }
@@ -314,6 +579,9 @@ impl W2BusinessCore {
     }
 
     pub(crate) fn start_hello(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        if matches!(self.durability, DurabilityPhase::AwaitingCommit { .. }) {
+            return Err(W2PairingError::DurableCommitRequired);
+        }
         if self.phase != PrincipalPhase::Initial {
             return Err(W2PairingError::BusinessStateInvalid);
         }
@@ -372,6 +640,7 @@ impl W2BusinessCore {
             {
                 self.phase = PrincipalPhase::Active;
                 self.evidence.principal_authenticated = true;
+                self.evidence.reconnect_authenticated |= self.evidence.durable_restored;
                 Ok(())
             }
             _ => Err(self.fail(W2PairingError::BusinessHandshakeRejected)),
@@ -382,21 +651,7 @@ impl W2BusinessCore {
         let requested = RuntimeInnerCursor::Catalog {
             cursor: StreamCursor::BeforeFirst,
         };
-        self.start_request(
-            RuntimeRequest::Subscribe {
-                inner_cursor: requested,
-            },
-            AuthorizationCapabilityV1::Catalog,
-            AuthorizationPermissionV1::CatalogRead,
-            PendingKind::Subscribe(Box::new(SubscriptionTracker {
-                target: SubscriptionTarget::Catalog,
-                subscription_generation: None,
-                snapshot_cursor: None,
-                configuration_revision: None,
-                sync_complete: None,
-                binding: None,
-            })),
-        )
+        self.start_subscription(SubscriptionTarget::Catalog, requested, false)
     }
 
     pub(crate) fn start_conversation(&mut self) -> Result<Vec<u8>, W2PairingError> {
@@ -411,19 +666,70 @@ impl W2BusinessCore {
             conversation_id,
             cursor: StreamCursor::BeforeFirst,
         };
+        self.start_subscription(SubscriptionTarget::Conversation, requested, false)
+    }
+
+    pub(crate) fn start_recovery_catalog(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        if !self.evidence.durable_restored || self.evidence.catalog_subscription_active {
+            return Err(W2PairingError::BusinessStateInvalid);
+        }
+        let requested = self
+            .durable_catalog_cursor
+            .clone()
+            .ok_or(W2PairingError::DurableStateInvalid)?;
+        self.evidence.recovery_stage = Some("recovery.catalog.requested".to_owned());
+        self.start_subscription(SubscriptionTarget::Catalog, requested, true)
+    }
+
+    pub(crate) fn start_recovery_conversation(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        if !self.evidence.durable_restored
+            || !self.evidence.catalog_subscription_active
+            || self.evidence.relay_subscription_active
+        {
+            return Err(W2PairingError::BusinessStateInvalid);
+        }
+        let requested = self
+            .durable_conversation_cursor
+            .clone()
+            .ok_or(W2PairingError::DurableStateInvalid)?;
+        self.evidence.recovery_stage = Some("recovery.conversation.requested".to_owned());
+        self.start_subscription(SubscriptionTarget::Conversation, requested, true)
+    }
+
+    fn start_subscription(
+        &mut self,
+        target: SubscriptionTarget,
+        requested: RuntimeInnerCursor,
+        recovery: bool,
+    ) -> Result<Vec<u8>, W2PairingError> {
+        let (capability, permission) = match target {
+            SubscriptionTarget::Catalog => (
+                AuthorizationCapabilityV1::Catalog,
+                AuthorizationPermissionV1::CatalogRead,
+            ),
+            SubscriptionTarget::Conversation => (
+                AuthorizationCapabilityV1::Conversation,
+                AuthorizationPermissionV1::ConversationRead,
+            ),
+        };
         self.start_request(
             RuntimeRequest::Subscribe {
                 inner_cursor: requested.clone(),
             },
-            AuthorizationCapabilityV1::Conversation,
-            AuthorizationPermissionV1::ConversationRead,
+            capability,
+            permission,
             PendingKind::Subscribe(Box::new(SubscriptionTracker {
-                target: SubscriptionTarget::Conversation,
+                target,
+                requested: requested.clone(),
+                delivered: requested,
+                recovery,
                 subscription_generation: None,
                 snapshot_cursor: None,
                 configuration_revision: None,
                 sync_complete: None,
                 binding: None,
+                snapshot_seen: false,
+                backfill_count: 0,
             })),
         )
     }
@@ -509,6 +815,28 @@ impl W2BusinessCore {
         )
     }
 
+    pub(crate) fn start_revoke_self(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        if !self.evidence.durable_restored
+            || !self.evidence.catalog_subscription_active
+            || !self.evidence.relay_subscription_active
+            || !self.evidence.restart_marker_observed
+            || self.evidence.revocation_terminal_verified
+        {
+            return Err(W2PairingError::BusinessStateInvalid);
+        }
+        self.start_request(
+            RuntimeRequest::Revoke(RevokeRequest {
+                target: RevokeTarget::SelfDevice,
+            }),
+            AuthorizationCapabilityV1::SelfRevocation,
+            AuthorizationPermissionV1::RevokeSelf,
+            PendingKind::Revoke {
+                receipt_committed: false,
+                terminal_verified: false,
+            },
+        )
+    }
+
     pub(crate) fn accept_frame(&mut self, bytes: &[u8]) -> Result<Vec<u8>, W2PairingError> {
         if self.phase != PrincipalPhase::Active {
             return Err(W2PairingError::BusinessStateInvalid);
@@ -516,10 +844,13 @@ impl W2BusinessCore {
         let decoded = decode(bytes).map_err(|_| self.fail(W2PairingError::BusinessFrameInvalid))?;
         match decoded.body {
             RelayFrameBody::Ping(ping) => {
+                self.set_recovery_frame_stage("ping");
                 Ok(frame(RelayFrameBody::Pong(Pong { nonce: ping.nonce })))
             }
             RelayFrameBody::RouteAccepted(accepted) => {
+                self.set_recovery_frame_stage("route_accepted");
                 let AcceptedRef::Request { request_route } = accepted.accepted else {
+                    self.set_recovery_frame_stage("route_accepted.invalid_kind");
                     return Err(self.fail(W2PairingError::BusinessFrameInvalid));
                 };
                 if let Some(control) = self.pending_control_acks.remove(&request_route) {
@@ -538,27 +869,59 @@ impl W2BusinessCore {
                     .as_mut()
                     .ok_or(W2PairingError::BusinessStateInvalid)?;
                 if pending.request_route != request_route || pending.route_accepted {
+                    self.set_recovery_frame_stage("route_accepted.request_mismatch");
                     return Err(self.fail(W2PairingError::BusinessFrameInvalid));
                 }
                 pending.route_accepted = true;
                 self.finish_pending_if_ready();
                 Ok(Vec::new())
             }
-            RelayFrameBody::Reply(reply) => self.accept_reply(reply),
-            RelayFrameBody::Publish(publish) => self
-                .accept_publish(publish)
-                .map_err(|error| self.fail(error)),
-            RelayFrameBody::ReplayComplete(replay) => self.accept_replay_complete(replay),
-            RelayFrameBody::Error(_) => Err(self.fail(W2PairingError::BusinessRelayRejected)),
+            RelayFrameBody::Reply(reply) => {
+                self.set_recovery_frame_stage("reply");
+                self.accept_reply(reply)
+            }
+            RelayFrameBody::Publish(publish) => {
+                self.set_recovery_frame_stage("publish");
+                self.accept_publish(publish)
+                    .map_err(|error| self.fail(error))
+            }
+            RelayFrameBody::ReplayComplete(replay) => {
+                self.set_recovery_frame_stage("replay_complete");
+                self.accept_replay_complete(replay)
+            }
+            RelayFrameBody::RevocationCommitted(committed) => {
+                self.set_recovery_frame_stage("revocation_committed");
+                self.accept_revocation_terminal(bytes, committed)
+            }
+            RelayFrameBody::Error(_) => {
+                self.set_recovery_frame_stage("relay_error");
+                Err(self.fail(W2PairingError::BusinessRelayRejected))
+            }
             RelayFrameBody::ServerRestarting(_) => {
+                self.set_recovery_frame_stage("server_restarting");
                 Err(self.fail(W2PairingError::BusinessOutcomeUnknown))
             }
-            _ => Err(self.fail(W2PairingError::BusinessFrameInvalid)),
+            _ => {
+                self.set_recovery_frame_stage("unexpected");
+                Err(self.fail(W2PairingError::BusinessFrameInvalid))
+            }
         }
     }
 
     pub(crate) fn evidence(&self) -> W2BusinessEvidence {
         self.evidence.clone()
+    }
+
+    pub(crate) const fn machine_route(&self) -> agentdeck_protocol::relay_v2::MachineRouteId {
+        self.grant.machine_route
+    }
+
+    pub(crate) const fn device_route(&self) -> agentdeck_protocol::relay_v2::DeviceRouteId {
+        self.grant.device_route
+    }
+
+    pub(crate) const fn revocation_terminal_verified(&self) -> bool {
+        self.evidence.revocation_terminal_verified
     }
 
     fn start_request(
@@ -570,6 +933,9 @@ impl W2BusinessCore {
     ) -> Result<Vec<u8>, W2PairingError> {
         if self.phase != PrincipalPhase::Active || self.pending.is_some() {
             return Err(W2PairingError::BusinessStateInvalid);
+        }
+        if matches!(self.durability, DurabilityPhase::AwaitingCommit { .. }) {
+            return Err(W2PairingError::DurableCommitRequired);
         }
         if !self.authorization.capabilities.contains(&capability)
             || !self.authorization.permissions.contains(&permission)
@@ -594,6 +960,7 @@ impl W2BusinessCore {
             .command_counter
             .checked_add(1)
             .ok_or(W2PairingError::BusinessCounterExhausted)?;
+        self.ensure_counter_reserved(next_counter)?;
         let context = OuterContextV1::uplink_send(
             self.grant.machine_route,
             self.grant.device_route,
@@ -743,6 +1110,7 @@ impl W2BusinessCore {
                 RuntimeReply::Subscription(SubscriptionReceipt::Subscribed { stream_generation }),
             ) if tracker.subscription_generation.is_none() => {
                 tracker.subscription_generation = Some(stream_generation);
+                self.set_recovery_stage(tracker, "subscription_receipt.accepted");
                 Ok(())
             }
             (
@@ -751,7 +1119,8 @@ impl W2BusinessCore {
                 RuntimeReply::Catalog(snapshot),
             ) if tracker.target == SubscriptionTarget::Catalog
                 && tracker.subscription_generation.is_some()
-                && tracker.snapshot_cursor.is_none() =>
+                && !tracker.snapshot_seen
+                && tracker.backfill_count == 0 =>
             {
                 self.accept_catalog_snapshot(tracker, snapshot)
             }
@@ -761,44 +1130,51 @@ impl W2BusinessCore {
                 RuntimeReply::Snapshot(snapshot),
             ) if tracker.target == SubscriptionTarget::Conversation
                 && tracker.subscription_generation.is_some()
-                && tracker.snapshot_cursor.is_none() =>
+                && !tracker.snapshot_seen
+                && tracker.backfill_count == 0 =>
             {
                 self.accept_conversation_snapshot(tracker, snapshot)
             }
             (
                 PendingKind::Subscribe(tracker),
+                SealedPayloadKind::BackfillChunk,
+                RuntimeReply::Backfill(chunk),
+            ) if tracker.subscription_generation.is_some() && tracker.sync_complete.is_none() => {
+                self.set_recovery_stage(tracker, "backfill.received");
+                self.accept_backfill(tracker, chunk)?;
+                self.set_recovery_stage(tracker, "backfill.applied");
+                Ok(())
+            }
+            (
+                PendingKind::Subscribe(tracker),
                 SealedPayloadKind::CommandReceipt,
                 RuntimeReply::SyncComplete(sync),
-            ) if tracker.subscription_generation.is_some()
-                && tracker.snapshot_cursor.is_some()
-                && tracker.sync_complete.is_none() =>
-            {
+            ) if tracker.subscription_generation.is_some() && tracker.sync_complete.is_none() => {
+                self.set_recovery_stage(tracker, "sync_complete.received");
                 let generation = tracker
                     .subscription_generation
                     .as_ref()
                     .ok_or(W2PairingError::BusinessFrameInvalid)?;
-                let snapshot_cursor = tracker
-                    .snapshot_cursor
-                    .ok_or(W2PairingError::BusinessFrameInvalid)?;
-                let expected_inner = match tracker.target {
-                    SubscriptionTarget::Catalog => RuntimeInnerCursor::Catalog {
-                        cursor: snapshot_cursor,
-                    },
-                    SubscriptionTarget::Conversation => RuntimeInnerCursor::Conversation {
-                        conversation_id: self
-                            .conversation_id
-                            .clone()
-                            .ok_or(W2PairingError::BusinessStateInvalid)?,
-                        cursor: snapshot_cursor,
-                    },
-                };
-                if sync.stream_generation != *generation
-                    || sync.inner_cursor != expected_inner
-                    || sync.key_directory_revision != self.directory_revision
+                if sync.stream_generation != *generation {
+                    self.set_recovery_stage(tracker, "sync_complete.generation_mismatch");
+                    return Err(W2PairingError::BusinessFrameInvalid);
+                }
+                if sync.inner_cursor != tracker.delivered {
+                    self.set_recovery_stage(tracker, "sync_complete.inner_cursor_mismatch");
+                    return Err(W2PairingError::BusinessFrameInvalid);
+                }
+                if sync.key_directory_revision != self.directory_revision {
+                    self.set_recovery_stage(tracker, "sync_complete.directory_revision_mismatch");
+                    return Err(W2PairingError::BusinessFrameInvalid);
+                }
+                if inner_cursor_value(&tracker.requested) == StreamCursor::BeforeFirst
+                    && !tracker.snapshot_seen
                 {
+                    self.set_recovery_stage(tracker, "sync_complete.snapshot_missing");
                     return Err(W2PairingError::BusinessFrameInvalid);
                 }
                 tracker.sync_complete = Some(sync);
+                self.set_recovery_stage(tracker, "sync_complete.accepted");
                 Ok(())
             }
             (
@@ -850,6 +1226,18 @@ impl W2BusinessCore {
                 *receipt_applied = applied;
                 Ok(())
             }
+            (
+                PendingKind::Revoke {
+                    receipt_committed,
+                    terminal_verified: _,
+                },
+                SealedPayloadKind::CommandReceipt,
+                RuntimeReply::Revocation(RevocationReceipt::Committed { grant_serial }),
+            ) if grant_serial.0 == self.grant.grant_serial.value() => {
+                *receipt_committed = true;
+                self.evidence.revocation_receipt_committed = true;
+                Ok(())
+            }
             _ => Err(W2PairingError::BusinessFrameInvalid),
         };
         self.pending = Some(pending);
@@ -875,6 +1263,10 @@ impl W2BusinessCore {
         self.evidence.catalog_entry_count = 1;
         self.evidence.conversation_title = entry.title.clone();
         tracker.snapshot_cursor = Some(snapshot.base_catalog_cursor);
+        tracker.delivered = RuntimeInnerCursor::Catalog {
+            cursor: snapshot.base_catalog_cursor,
+        };
+        tracker.snapshot_seen = true;
         Ok(())
     }
 
@@ -897,6 +1289,115 @@ impl W2BusinessCore {
         }
         tracker.snapshot_cursor = Some(snapshot.base_event_cursor);
         tracker.configuration_revision = Some(revision);
+        tracker.delivered = RuntimeInnerCursor::Conversation {
+            conversation_id: snapshot.conversation_id,
+            cursor: snapshot.base_event_cursor,
+        };
+        tracker.snapshot_seen = true;
+        Ok(())
+    }
+
+    fn accept_backfill(
+        &mut self,
+        tracker: &mut SubscriptionTracker,
+        chunk: BackfillChunk,
+    ) -> Result<(), W2PairingError> {
+        match (tracker.target, chunk, &tracker.delivered) {
+            (
+                SubscriptionTarget::Catalog,
+                BackfillChunk::Catalog { range, deltas },
+                RuntimeInnerCursor::Catalog { cursor },
+            ) if range.after() == *cursor => {
+                for delta in deltas {
+                    self.accept_catalog_delta(&delta)?;
+                }
+                tracker.delivered = RuntimeInnerCursor::Catalog {
+                    cursor: range.through(),
+                };
+            }
+            (
+                SubscriptionTarget::Conversation,
+                BackfillChunk::Conversation {
+                    conversation_id,
+                    range,
+                    events,
+                    ..
+                },
+                RuntimeInnerCursor::Conversation {
+                    conversation_id: expected,
+                    cursor,
+                },
+            ) if &conversation_id == expected && range.after() == *cursor => {
+                let mut expected_seq = cursor
+                    .checked_next()
+                    .map_err(|_| W2PairingError::BusinessFrameInvalid)?;
+                for event in events {
+                    if event.conversation_id != conversation_id || event.event_seq != expected_seq {
+                        return Err(W2PairingError::BusinessFrameInvalid);
+                    }
+                    expected_seq = expected_seq
+                        .checked_add(1)
+                        .ok_or(W2PairingError::BusinessCounterExhausted)?;
+                }
+                tracker.delivered = RuntimeInnerCursor::Conversation {
+                    conversation_id,
+                    cursor: range.through(),
+                };
+            }
+            _ => return Err(W2PairingError::BusinessFrameInvalid),
+        }
+        tracker.backfill_count = tracker
+            .backfill_count
+            .checked_add(1)
+            .ok_or(W2PairingError::BusinessCounterExhausted)?;
+        if tracker.recovery {
+            match tracker.target {
+                SubscriptionTarget::Catalog => {
+                    self.evidence.recovery_catalog_backfill_count = self
+                        .evidence
+                        .recovery_catalog_backfill_count
+                        .checked_add(1)
+                        .ok_or(W2PairingError::BusinessCounterExhausted)?;
+                }
+                SubscriptionTarget::Conversation => {
+                    self.evidence.recovery_conversation_backfill_count = self
+                        .evidence
+                        .recovery_conversation_backfill_count
+                        .checked_add(1)
+                        .ok_or(W2PairingError::BusinessCounterExhausted)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn accept_catalog_delta(
+        &mut self,
+        delta: &agentdeck_protocol::runtime::CatalogDelta,
+    ) -> Result<(), W2PairingError> {
+        let conversation_id = self
+            .conversation_id
+            .as_ref()
+            .ok_or(W2PairingError::BusinessStateInvalid)?;
+        for change in &delta.changes {
+            match change {
+                CatalogChange::Upserted { entry } if &entry.conversation_id == conversation_id => {
+                    if entry.archived {
+                        return Err(W2PairingError::BusinessFrameInvalid);
+                    }
+                    self.evidence.conversation_title = entry.title.clone();
+                    if entry.title.as_deref() == Some(W2C_RESTART_MARKER_TITLE) {
+                        self.evidence.restart_marker_observed = true;
+                    }
+                }
+                CatalogChange::Removed {
+                    conversation_id: removed,
+                } if removed == conversation_id => {
+                    return Err(W2PairingError::BusinessFrameInvalid);
+                }
+                CatalogChange::Upserted { .. } | CatalogChange::Removed { .. } => {}
+            }
+        }
         Ok(())
     }
 
@@ -911,24 +1412,72 @@ impl W2BusinessCore {
         let PendingKind::Subscribe(tracker) = &mut pending.kind else {
             return Err(self.fail(W2PairingError::BusinessFrameInvalid));
         };
+        self.set_recovery_stage(tracker, "stream_binding.received");
         let sync = tracker
             .sync_complete
             .as_ref()
             .ok_or(W2PairingError::BusinessFrameInvalid)?;
-        if tracker.binding.is_some()
-            || binding.machine_route != self.grant.machine_route
-            || binding.device_route != self.grant.device_route
-            || binding.grant_serial != self.grant.grant_serial
-            || binding.root_trust_epoch != self.grant.trust_epoch
-            || binding.key_directory_revision.value() != self.directory_revision
-            || binding.stream_cursor != sync.stream_cursor
-            || binding.inner_cursor != sync.inner_cursor
-            || binding.key_id.purpose
-                != match tracker.target {
-                    SubscriptionTarget::Catalog => KeyPurpose::Catalog,
-                    SubscriptionTarget::Conversation => KeyPurpose::ConversationDek,
-                }
+        if tracker.binding.is_some() {
+            self.set_recovery_stage(tracker, "stream_binding.duplicate");
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        if binding.machine_route != self.grant.machine_route {
+            self.set_recovery_stage(tracker, "stream_binding.machine_route_mismatch");
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        if binding.device_route != self.grant.device_route {
+            self.set_recovery_stage(tracker, "stream_binding.device_route_mismatch");
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        if binding.grant_serial != self.grant.grant_serial {
+            self.set_recovery_stage(tracker, "stream_binding.grant_serial_mismatch");
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        if binding.root_trust_epoch != self.grant.trust_epoch {
+            self.set_recovery_stage(tracker, "stream_binding.trust_epoch_mismatch");
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        if binding.key_directory_revision.value() != self.directory_revision {
+            self.set_recovery_stage(tracker, "stream_binding.directory_revision_mismatch");
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        if binding.stream_cursor != sync.stream_cursor {
+            self.set_recovery_stage(tracker, "stream_binding.stream_cursor_mismatch");
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        if !same_inner_target(&binding.inner_cursor, &sync.inner_cursor) {
+            self.set_recovery_stage(tracker, "stream_binding.sync_target_mismatch");
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        if !same_inner_target(&tracker.requested, &binding.inner_cursor) {
+            self.set_recovery_stage(tracker, "stream_binding.target_mismatch");
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        if cursor_cmp(
+            inner_cursor_value(&binding.inner_cursor),
+            inner_cursor_value(&tracker.requested),
+        )
+        .is_lt()
         {
+            self.set_recovery_stage(tracker, "stream_binding.cursor_regressed");
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        if cursor_cmp(
+            inner_cursor_value(&sync.inner_cursor),
+            inner_cursor_value(&binding.inner_cursor),
+        )
+        .is_lt()
+        {
+            self.set_recovery_stage(tracker, "stream_binding.sync_cursor_regressed");
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        if binding.key_id.purpose
+            != match tracker.target {
+                SubscriptionTarget::Catalog => KeyPurpose::Catalog,
+                SubscriptionTarget::Conversation => KeyPurpose::ConversationDek,
+            }
+        {
+            self.set_recovery_stage(tracker, "stream_binding.key_purpose_mismatch");
             return Err(self.fail(W2PairingError::BusinessFrameInvalid));
         }
         let matching_keys = self
@@ -937,16 +1486,25 @@ impl W2BusinessCore {
             .filter(|key| stream_key_matches(key, &binding))
             .count();
         if matching_keys != 1 {
+            self.set_recovery_stage(tracker, "stream_binding.key_slot_mismatch");
             return Err(self.fail(W2PairingError::BusinessCryptoFailed));
         }
+        let synced_inner_cursor = sync.inner_cursor.clone();
         tracker.binding = Some(binding.clone());
         match tracker.target {
-            SubscriptionTarget::Catalog => self.catalog_binding = Some(binding.clone()),
+            SubscriptionTarget::Catalog => {
+                self.durable_catalog_cursor = Some(synced_inner_cursor);
+                self.catalog_binding = Some(binding.clone());
+            }
             SubscriptionTarget::Conversation => {
-                self.configuration_revision = tracker.configuration_revision;
+                if tracker.configuration_revision.is_some() {
+                    self.configuration_revision = tracker.configuration_revision;
+                }
+                self.durable_conversation_cursor = Some(synced_inner_cursor);
                 self.conversation_binding = Some(binding.clone());
             }
         }
+        self.set_recovery_stage(tracker, "stream_binding.accepted");
         self.pending = Some(pending);
         self.finish_pending_if_ready();
         Ok(frame(RelayFrameBody::Subscribe(Subscribe {
@@ -1030,9 +1588,6 @@ impl W2BusinessCore {
             }
             return self.start_stream_applied_ack(&binding, &publish, barrier);
         }
-        if opened.payload_kind != SealedPayloadKind::ConversationEvent {
-            return Err(W2PairingError::BusinessFrameInvalid);
-        }
         let envelope: RuntimeEnvelope = serde_json::from_slice(&opened.payload)
             .map_err(|_| W2PairingError::BusinessFrameInvalid)?;
         if envelope
@@ -1042,22 +1597,19 @@ impl W2BusinessCore {
         {
             return Err(W2PairingError::BusinessFrameInvalid);
         }
-        let RuntimeMessage::Stream(RuntimeStreamItem::Event(event)) = envelope.body else {
-            return Err(W2PairingError::BusinessFrameInvalid);
-        };
-        let event_seq = self.accept_event(event)?;
-        let binding = self
-            .conversation_binding
-            .as_mut()
-            .ok_or(W2PairingError::BusinessStateInvalid)?;
-        binding.stream_cursor = StreamCursor::At(publish.stream_seq);
-        binding.inner_cursor = RuntimeInnerCursor::Conversation {
-            conversation_id: self
-                .conversation_id
-                .clone()
-                .ok_or(W2PairingError::BusinessStateInvalid)?,
-            cursor: StreamCursor::At(event_seq),
-        };
+        match (binding.key_id.purpose, opened.payload_kind, envelope.body) {
+            (
+                KeyPurpose::Catalog,
+                SealedPayloadKind::CatalogDelta,
+                RuntimeMessage::Stream(RuntimeStreamItem::CatalogDelta(delta)),
+            ) => self.accept_live_catalog_delta(&publish, delta)?,
+            (
+                KeyPurpose::ConversationDek,
+                SealedPayloadKind::ConversationEvent,
+                RuntimeMessage::Stream(RuntimeStreamItem::Event(event)),
+            ) => self.accept_live_conversation_event(&publish, event)?,
+            _ => return Err(W2PairingError::BusinessFrameInvalid),
+        }
         self.evidence.outer_ack_count = self
             .evidence
             .outer_ack_count
@@ -1068,6 +1620,140 @@ impl W2BusinessCore {
             generation: publish.generation,
             up_to_seq: publish.stream_seq,
         })))
+    }
+
+    fn accept_live_catalog_delta(
+        &mut self,
+        publish: &Publish,
+        delta: agentdeck_protocol::runtime::CatalogDelta,
+    ) -> Result<(), W2PairingError> {
+        let binding_cursor = match self
+            .catalog_binding
+            .as_ref()
+            .ok_or(W2PairingError::BusinessStateInvalid)?
+            .inner_cursor
+        {
+            RuntimeInnerCursor::Catalog { cursor } => cursor,
+            RuntimeInnerCursor::Conversation { .. } => {
+                return Err(W2PairingError::BusinessFrameInvalid);
+            }
+        };
+        if binding_cursor.checked_next().ok() != Some(delta.catalog_revision) {
+            return Err(W2PairingError::BusinessFrameInvalid);
+        }
+        let durable_cursor = match self
+            .durable_catalog_cursor
+            .as_ref()
+            .ok_or(W2PairingError::DurableStateInvalid)?
+        {
+            RuntimeInnerCursor::Catalog { cursor } => *cursor,
+            RuntimeInnerCursor::Conversation { .. } => {
+                return Err(W2PairingError::DurableStateInvalid);
+            }
+        };
+        match cursor_cmp(StreamCursor::At(delta.catalog_revision), durable_cursor) {
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                self.set_recovery_stage_for_purpose(
+                    KeyPurpose::Catalog,
+                    "publication_overlap.acknowledged",
+                );
+            }
+            std::cmp::Ordering::Greater => {
+                if durable_cursor.checked_next().ok() != Some(delta.catalog_revision) {
+                    return Err(W2PairingError::BusinessFrameInvalid);
+                }
+                self.accept_catalog_delta(&delta)?;
+                self.durable_catalog_cursor = Some(RuntimeInnerCursor::Catalog {
+                    cursor: StreamCursor::At(delta.catalog_revision),
+                });
+                self.set_recovery_stage_for_purpose(KeyPurpose::Catalog, "live_delta.applied");
+            }
+        }
+        let binding = self
+            .catalog_binding
+            .as_mut()
+            .ok_or(W2PairingError::BusinessStateInvalid)?;
+        binding.stream_cursor = StreamCursor::At(publish.stream_seq);
+        binding.inner_cursor = RuntimeInnerCursor::Catalog {
+            cursor: StreamCursor::At(delta.catalog_revision),
+        };
+        Ok(())
+    }
+
+    fn accept_live_conversation_event(
+        &mut self,
+        publish: &Publish,
+        event: RuntimeEvent,
+    ) -> Result<(), W2PairingError> {
+        let conversation_id = self
+            .conversation_id
+            .clone()
+            .ok_or(W2PairingError::BusinessStateInvalid)?;
+        let binding_cursor = match &self
+            .conversation_binding
+            .as_ref()
+            .ok_or(W2PairingError::BusinessStateInvalid)?
+            .inner_cursor
+        {
+            RuntimeInnerCursor::Conversation {
+                conversation_id: bound,
+                cursor,
+            } if bound == &conversation_id => *cursor,
+            RuntimeInnerCursor::Catalog { .. } | RuntimeInnerCursor::Conversation { .. } => {
+                return Err(W2PairingError::BusinessFrameInvalid);
+            }
+        };
+        if event.conversation_id != conversation_id
+            || binding_cursor.checked_next().ok() != Some(event.event_seq)
+        {
+            return Err(W2PairingError::BusinessFrameInvalid);
+        }
+        let durable_cursor = match self
+            .durable_conversation_cursor
+            .as_ref()
+            .ok_or(W2PairingError::DurableStateInvalid)?
+        {
+            RuntimeInnerCursor::Conversation {
+                conversation_id: durable_conversation,
+                cursor,
+            } if durable_conversation == &conversation_id => *cursor,
+            RuntimeInnerCursor::Catalog { .. } | RuntimeInnerCursor::Conversation { .. } => {
+                return Err(W2PairingError::DurableStateInvalid);
+            }
+        };
+        let event_seq = event.event_seq;
+        match cursor_cmp(StreamCursor::At(event_seq), durable_cursor) {
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                self.set_recovery_stage_for_purpose(
+                    KeyPurpose::ConversationDek,
+                    "publication_overlap.acknowledged",
+                );
+            }
+            std::cmp::Ordering::Greater => {
+                if durable_cursor.checked_next().ok() != Some(event_seq) {
+                    return Err(W2PairingError::BusinessFrameInvalid);
+                }
+                self.accept_event(event)?;
+                self.durable_conversation_cursor = Some(RuntimeInnerCursor::Conversation {
+                    conversation_id: conversation_id.clone(),
+                    cursor: StreamCursor::At(event_seq),
+                });
+                self.set_recovery_stage_for_purpose(
+                    KeyPurpose::ConversationDek,
+                    "live_event.applied",
+                );
+            }
+        }
+        let binding = self
+            .conversation_binding
+            .as_mut()
+            .ok_or(W2PairingError::BusinessStateInvalid)?;
+        binding.stream_cursor = StreamCursor::At(publish.stream_seq);
+        binding.inner_cursor = RuntimeInnerCursor::Conversation {
+            conversation_id,
+            cursor: StreamCursor::At(event_seq),
+        };
+        Ok(())
     }
 
     fn accept_event(&mut self, event: RuntimeEvent) -> Result<u64, W2PairingError> {
@@ -1156,6 +1842,7 @@ impl W2BusinessCore {
         publish: &Publish,
         barrier: EpochBarrierV1,
     ) -> Result<Vec<u8>, W2PairingError> {
+        self.set_recovery_stage_for_purpose(binding.key_id.purpose, "epoch_barrier.received");
         if barrier.old_epoch != 0
             || barrier.new_epoch != binding.key_id.epoch
             || barrier.stream_generation != binding.stream_generation
@@ -1164,6 +1851,7 @@ impl W2BusinessCore {
             || barrier.key_directory_revision.value() != self.directory_revision
             || barrier.stream_cursor.checked_next().ok() != Some(publish.stream_seq)
         {
+            self.set_recovery_stage_for_purpose(binding.key_id.purpose, "epoch_barrier.mismatch");
             return Err(W2PairingError::BusinessFrameInvalid);
         }
         let request_route = self.random_request_route()?;
@@ -1174,6 +1862,7 @@ impl W2BusinessCore {
             .command_counter
             .checked_add(1)
             .ok_or(W2PairingError::BusinessCounterExhausted)?;
+        self.ensure_counter_reserved(next_counter)?;
         let ack = StreamAppliedAckV1 {
             format_version: E2EE_FORMAT_VERSION,
             runtime_protocol_version: RUNTIME_PROTOCOL_VERSION,
@@ -1223,6 +1912,7 @@ impl W2BusinessCore {
                 inner_cursor: barrier.inner_cursor,
             },
         );
+        self.set_recovery_stage_for_purpose(binding.key_id.purpose, "stream_applied_ack.sent");
         Ok(frame(RelayFrameBody::Send(Send {
             device_route: self.grant.device_route,
             request_route,
@@ -1241,11 +1931,21 @@ impl W2BusinessCore {
         }
         let purpose = binding.key_id.purpose;
         binding.stream_cursor = StreamCursor::At(control.up_to_seq);
+        match purpose {
+            // EpochBarrier 确认的是 publication cut；directed bootstrap 可能已经把 reducer
+            // 应用到更高的 SyncComplete cut，因此这里只推进 outer cursor，不能回退 durable
+            // inner cursor。
+            KeyPurpose::Catalog | KeyPurpose::ConversationDek => {}
+            KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => {
+                return Err(W2PairingError::BusinessFrameInvalid);
+            }
+        }
         self.evidence.outer_ack_count = self
             .evidence
             .outer_ack_count
             .checked_add(1)
             .ok_or(W2PairingError::BusinessCounterExhausted)?;
+        self.set_recovery_stage_for_purpose(purpose, "stream_applied_ack.committed");
         if self.pending_replay_completes.remove(&(
             control.stream_route,
             control.generation,
@@ -1287,10 +1987,14 @@ impl W2BusinessCore {
         &mut self,
         replay: ReplayComplete,
     ) -> Result<Vec<u8>, W2PairingError> {
-        let binding = self
-            .binding_for_stream(replay.stream_route, replay.generation)
-            .ok_or(W2PairingError::BusinessStateInvalid)?;
-        if replay.current_cursor != binding.stream_cursor {
+        let (purpose, binding_cursor) = {
+            let binding = self
+                .binding_for_stream(replay.stream_route, replay.generation)
+                .ok_or(W2PairingError::BusinessStateInvalid)?;
+            (binding.key_id.purpose, binding.stream_cursor)
+        };
+        self.set_recovery_stage_for_purpose(purpose, "replay_complete.received");
+        if replay.current_cursor != binding_cursor {
             let pending = self.pending_control_acks.values().find(|control| {
                 control.stream_route == replay.stream_route
                     && control.generation == replay.generation
@@ -1304,10 +2008,11 @@ impl W2BusinessCore {
                 pending.generation,
                 pending.up_to_seq,
             ));
+            self.set_recovery_stage_for_purpose(purpose, "replay_complete.awaiting_control_ack");
             return Ok(Vec::new());
         }
-        let purpose = binding.key_id.purpose;
         self.mark_subscription_active(purpose)?;
+        self.set_recovery_stage_for_purpose(purpose, "subscription.active");
         Ok(Vec::new())
     }
 
@@ -1322,6 +2027,35 @@ impl W2BusinessCore {
         Ok(())
     }
 
+    fn set_recovery_stage(&mut self, tracker: &SubscriptionTracker, suffix: &str) {
+        if !tracker.recovery {
+            return;
+        }
+        let target = match tracker.target {
+            SubscriptionTarget::Catalog => "catalog",
+            SubscriptionTarget::Conversation => "conversation",
+        };
+        self.evidence.recovery_stage = Some(format!("recovery.{target}.{suffix}"));
+    }
+
+    fn set_recovery_stage_for_purpose(&mut self, purpose: KeyPurpose, suffix: &str) {
+        if !self.evidence.durable_restored {
+            return;
+        }
+        let target = match purpose {
+            KeyPurpose::Catalog => "catalog",
+            KeyPurpose::ConversationDek => "conversation",
+            KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => "invalid",
+        };
+        self.evidence.recovery_stage = Some(format!("recovery.{target}.{suffix}"));
+    }
+
+    fn set_recovery_frame_stage(&mut self, frame: &str) {
+        if self.evidence.durable_restored {
+            self.evidence.recovery_stage = Some(format!("recovery.frame.{frame}"));
+        }
+    }
+
     fn finish_pending_if_ready(&mut self) {
         let Some(pending) = self.pending.as_ref() else {
             return;
@@ -1332,6 +2066,10 @@ impl W2BusinessCore {
                 terminal,
                 receipt_applied: _,
             } => *terminal,
+            PendingKind::Revoke {
+                receipt_committed,
+                terminal_verified,
+            } => *receipt_committed && *terminal_verified,
             PendingKind::Subscribe(tracker) => tracker.binding.is_some(),
         };
         if !pending.route_accepted || !terminal {
@@ -1355,8 +2093,84 @@ impl W2BusinessCore {
                 self.evidence.approval_route_accepted = true;
                 self.evidence.approval_receipt_applied |= *receipt_applied;
             }
+            PendingKind::Revoke { .. } => {
+                self.evidence.revoke_route_accepted = true;
+            }
         }
         self.pending = None;
+    }
+
+    fn accept_revocation_terminal(
+        &mut self,
+        canonical_bytes: &[u8],
+        committed: RevocationCommitted,
+    ) -> Result<Vec<u8>, W2PairingError> {
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or(W2PairingError::BusinessStateInvalid)?;
+        if !matches!(pending.kind, PendingKind::Revoke { .. }) {
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        let decoded = decode(canonical_bytes).map_err(|_| W2PairingError::BusinessFrameInvalid)?;
+        if encode(&decoded) != canonical_bytes
+            || committed.device_route != self.grant.device_route
+            || committed.grant_serial != self.grant.grant_serial
+            || committed.signed_revocation.machine_route != self.grant.machine_route
+            || committed.signed_revocation.device_route != self.grant.device_route
+            || committed.signed_revocation.grant_serial != self.grant.grant_serial
+            || committed.signed_revocation.root_key_id != self.grant.root_key_id
+            || committed.signed_revocation.trust_epoch != self.grant.trust_epoch
+        {
+            return Err(self.fail(W2PairingError::BusinessFrameInvalid));
+        }
+        let root = VerifyingKey::from_bytes(&self._verified_response.machine_root_pubkey().0)
+            .map_err(|_| W2PairingError::BusinessCryptoFailed)?;
+        if agentdeck_crypto::sha256(&root.to_bytes())
+            != self._verified_response.machine_root_fingerprint()
+        {
+            return Err(self.fail(W2PairingError::BusinessCryptoFailed));
+        }
+        verify_tbs(
+            &root,
+            &committed.signed_revocation.to_be_signed_v1(
+                self._verified_response.info().relay_server_id,
+                self._verified_response.machine_root_fingerprint(),
+            ),
+            &SignatureBytes::from(committed.signed_revocation.signature),
+        )
+        .map_err(|_| self.fail(W2PairingError::BusinessCryptoFailed))?;
+        let pending = self
+            .pending
+            .as_mut()
+            .ok_or(W2PairingError::BusinessStateInvalid)?;
+        let PendingKind::Revoke {
+            receipt_committed,
+            terminal_verified,
+        } = &mut pending.kind
+        else {
+            return Err(W2PairingError::BusinessStateInvalid);
+        };
+        // 与 production RemoteRuntime::revoke_self 对齐：root-signed terminal 本身就是
+        // Relay COMMIT 的权威证明。directed daemon receipt 与 RouteAccepted 可能因连接随
+        // revoke 关闭而不可见，此时从 verified terminal 合成相同的 committed receipt。
+        *receipt_committed = true;
+        *terminal_verified = true;
+        self.evidence.revocation_receipt_committed = true;
+        self.evidence.revocation_terminal_verified = true;
+        self.finish_pending_if_ready();
+        Ok(Vec::new())
+    }
+
+    fn ensure_counter_reserved(&self, next_counter: u64) -> Result<(), W2PairingError> {
+        match self.durability {
+            DurabilityPhase::Volatile => Ok(()),
+            DurabilityPhase::AwaitingCommit { .. } => Err(W2PairingError::DurableCommitRequired),
+            DurabilityPhase::Active {
+                reserved_high_water,
+            } if next_counter <= reserved_high_water => Ok(()),
+            DurabilityPhase::Active { .. } => Err(W2PairingError::BusinessCounterExhausted),
+        }
     }
 
     fn random_request_route(&mut self) -> Result<RequestRouteId, W2PairingError> {
@@ -1386,6 +2200,83 @@ fn stream_key_matches(key: &StreamKey, binding: &StreamBindingV1) -> bool {
             KeyPurpose::ConversationDek => key.stream_route == Some(binding.stream_route),
             KeyPurpose::DeviceCommandTx | KeyPurpose::DeviceReplyTx => false,
         }
+}
+
+fn validate_restored_projection(state: &W2DurableStateV1) -> Result<(), W2PairingError> {
+    if !state.evidence.durable_promoted
+        || state.evidence.counter_reservation_end != state.reserved_high_water
+        || state.evidence.counter_reservation_start >= state.evidence.counter_reservation_end
+        || state.request_sequence > state.reserved_high_water
+    {
+        return Err(W2PairingError::DurableStateInvalid);
+    }
+    if let Some(cursor) = &state.catalog_inner_cursor
+        && !matches!(cursor, RuntimeInnerCursor::Catalog { .. })
+    {
+        return Err(W2PairingError::DurableStateInvalid);
+    }
+    if let Some(cursor) = &state.conversation_inner_cursor {
+        let RuntimeInnerCursor::Conversation {
+            conversation_id,
+            cursor: stream_cursor,
+        } = cursor
+        else {
+            return Err(W2PairingError::DurableStateInvalid);
+        };
+        if state.conversation_id.as_ref() != Some(conversation_id)
+            || state
+                .configuration_revision
+                .is_none_or(|revision| revision == 0)
+            || stream_cursor.checked_next().is_err()
+            || state.catalog_inner_cursor.is_none()
+        {
+            return Err(W2PairingError::DurableStateInvalid);
+        }
+    } else if state.conversation_id.is_some() != state.configuration_revision.is_some() {
+        return Err(W2PairingError::DurableStateInvalid);
+    }
+    if state.evidence.command_completed
+        && (state.catalog_inner_cursor.is_none()
+            || state.conversation_inner_cursor.is_none()
+            || state.conversation_id.is_none()
+            || state.configuration_revision.is_none())
+    {
+        return Err(W2PairingError::DurableStateInvalid);
+    }
+    Ok(())
+}
+
+fn inner_cursor_value(cursor: &RuntimeInnerCursor) -> StreamCursor {
+    match cursor {
+        RuntimeInnerCursor::Catalog { cursor }
+        | RuntimeInnerCursor::Conversation { cursor, .. } => *cursor,
+    }
+}
+
+fn same_inner_target(left: &RuntimeInnerCursor, right: &RuntimeInnerCursor) -> bool {
+    match (left, right) {
+        (RuntimeInnerCursor::Catalog { .. }, RuntimeInnerCursor::Catalog { .. }) => true,
+        (
+            RuntimeInnerCursor::Conversation {
+                conversation_id: left,
+                ..
+            },
+            RuntimeInnerCursor::Conversation {
+                conversation_id: right,
+                ..
+            },
+        ) => left == right,
+        _ => false,
+    }
+}
+
+fn cursor_cmp(left: StreamCursor, right: StreamCursor) -> std::cmp::Ordering {
+    match (left, right) {
+        (StreamCursor::BeforeFirst, StreamCursor::BeforeFirst) => std::cmp::Ordering::Equal,
+        (StreamCursor::BeforeFirst, StreamCursor::At(_)) => std::cmp::Ordering::Less,
+        (StreamCursor::At(_), StreamCursor::BeforeFirst) => std::cmp::Ordering::Greater,
+        (StreamCursor::At(left), StreamCursor::At(right)) => left.cmp(&right),
+    }
 }
 
 fn frame(body: RelayFrameBody) -> Vec<u8> {

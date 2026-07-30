@@ -10,6 +10,8 @@ import {
 import { runW1Transport, type W1WasmSessionConstructor } from "./w1-transport.ts";
 import {
   runW2Business,
+  runW2DurableRecover,
+  runW2DurableStart,
   runW2Pairing,
   type W2WasmSessionConstructor,
 } from "./w2-transport.ts";
@@ -121,6 +123,40 @@ const api: RelayTestApi = {
       status.textContent = passed
         ? "W2b 真实业务闭环通过"
         : (result.failureCode ?? "W2b 业务闭环失败");
+    }
+    return result;
+  },
+  async runW2DurableStart(encodedInvite, profileId) {
+    const constructor = (await corePromise).W2PairingSession;
+    if (constructor === undefined) {
+      throw new Error("web.remote.w2_fixture_unavailable");
+    }
+    const result = await runW2DurableStart(constructor, encodedInvite, profileId);
+    const status = document.querySelector<HTMLElement>("#w2-status");
+    if (status !== null) {
+      status.dataset.state = result.failureCode === null ? "running" : "failed";
+      status.textContent = result.failureCode === null
+        ? "W2c 已持久化，等待 reload"
+        : result.failureCode;
+    }
+    return result;
+  },
+  async runW2DurableRecover(profileId) {
+    const constructor = (await corePromise).W2PairingSession;
+    if (constructor === undefined) {
+      throw new Error("web.remote.w2_fixture_unavailable");
+    }
+    const result = await runW2DurableRecover(constructor, profileId);
+    const passed =
+      result.failureCode === null &&
+      result.reloadStatus === "revoked" &&
+      result.business?.revocationTerminalVerified === true;
+    const status = document.querySelector<HTMLElement>("#w2-status");
+    if (status !== null) {
+      status.dataset.state = passed ? "passed" : "failed";
+      status.textContent = passed
+        ? "W2c reload/reconnect/revoke 闭环通过"
+        : (result.failureCode ?? "W2c 恢复闭环失败");
     }
     return result;
   },

@@ -7,10 +7,12 @@ run_mode="pairing"
 case "${1:-}" in
   "") ;;
   --business) run_mode="business" ;;
-  *) printf 'usage: %s [--business]\n' "$0" >&2; exit 64 ;;
+  --durable) run_mode="durable" ;;
+  *) printf 'usage: %s [--business|--durable]\n' "$0" >&2; exit 64 ;;
 esac
 gate_label="W2a"
 [[ "$run_mode" != "business" ]] || gate_label="W2b"
+[[ "$run_mode" != "durable" ]] || gate_label="W2c"
 
 fail() {
   printf 'relay web companion %s: FAIL: %s\n' "$gate_label" "$1" >&2
@@ -20,10 +22,13 @@ fail() {
   if [[ -n "${host_stderr:-}" && -f "$host_stderr" ]]; then
     tail -n 80 "$host_stderr" >&2 || true
   fi
+  if [[ -n "${host_transcript:-}" && -f "$host_transcript" ]]; then
+    tail -n 40 "$host_transcript" >&2 || true
+  fi
   exit 1
 }
 
-for dependency in bun cargo chmod date grep jq kill mkfifo mktemp pgrep ps rm sleep stat tail tr; do
+for dependency in bun cargo chmod date grep jq kill mkdir mkfifo mktemp mv pgrep ps rm sleep stat tail tr; do
   command -v "$dependency" >/dev/null 2>&1 || fail "missing dependency: $dependency"
 done
 
@@ -37,6 +42,9 @@ host_output="$runner_root/host.stdout"
 host_stderr="$runner_root/host.stderr"
 host_transcript="$runner_root/host-transcript.log"
 browser_log="$runner_root/browser.log"
+coordination_dir="$runner_root/w2c-coordination"
+profile_id="w2c-e2e"
+mkdir -m 700 "$coordination_dir"
 
 cargo_pid=""
 host_pid=""
@@ -172,6 +180,8 @@ host_environment=(
 )
 if [[ "$run_mode" == "business" ]]; then
   host_environment+=("AGENTDECK_P57_HOST_SCENARIO=r43-business")
+elif [[ "$run_mode" == "durable" ]]; then
+  host_environment+=("AGENTDECK_P57_HOST_SCENARIO=r44-lifecycle")
 fi
 env -u AGENTDECK_P57_HOST_SCENARIO "${host_environment[@]}" \
   cargo test -p agentdeckd --test relay_v2_machine_e2e \
@@ -198,15 +208,18 @@ web_port="$(bun -e '
 [[ "$web_port" =~ ^[0-9]+$ ]] && [[ "$web_port" -ge 1 && "$web_port" -le 65535 ]] \
   || fail "could not reserve Web test port"
 
-if [[ "$run_mode" == "business" ]]; then
-  printf '%s\n' "$host_record" | jq -e '
-    .scenario == "r43-business"
+if [[ "$run_mode" == "business" || "$run_mode" == "durable" ]]; then
+  expected_scenario="r43-business"
+  [[ "$run_mode" != "durable" ]] || expected_scenario="r44-lifecycle"
+  printf '%s\n' "$host_record" | jq -e --arg scenario "$expected_scenario" '
+    .scenario == $scenario
     and .daemonGeneration == 1
     and (.conversationId | type == "string" and length > 0)
     and .conversationTitle == "R4.3 synthetic Codex"
     and (.relayWssOrigin | test("^wss://localhost:[0-9]+/$"))
     and (.relaySpkiPinBase64 | test("^[A-Za-z0-9+/]{43}=$"))
-  ' >/dev/null || fail "business host ready topology is not exact"
+  ' >/dev/null \
+    || fail "business host ready topology is not exact"
 else
   printf '%s\n' "$host_record" | jq -e '
     .scenario == null
@@ -225,11 +238,14 @@ case "$host_root" in "$runner_root"/ad-p57-host-*) ;; *) fail "host root escaped
 
 browser_grep="W2a real browser pairing"
 [[ "$run_mode" != "business" ]] || browser_grep="W2b real browser business flow"
+[[ "$run_mode" != "durable" ]] || browser_grep="W2c durable reload reconnect backfill and revoke"
 (
   cd "$web_root"
   AGENTDECK_WEB_WSS_ORIGIN="$relay_origin" \
   AGENTDECK_WEB_TEST_SPKI_PIN="$relay_spki_pin" \
   AGENTDECK_W2_INVITE_PATH="$host_invite" \
+  AGENTDECK_W2_COORDINATION_DIR="$coordination_dir" \
+  AGENTDECK_W2_PROFILE_ID="$profile_id" \
   RELAY_WEB_TEST_PORT="$web_port" \
     bun run test:browser:built -- \
     --grep "$browser_grep"
@@ -261,7 +277,7 @@ printf '%s\n' "$host_record" | jq -e '
   and .evidence.runtimeCommandCount == 0
 ' >/dev/null || fail "approval did not create exact grant"
 
-if [[ "$run_mode" == "business" ]]; then
+if [[ "$run_mode" == "business" || "$run_mode" == "durable" ]]; then
   mutated_request="w2b-mutated-$generation"
   send_host_command \
     "{\"op\":\"waitFor\",\"requestId\":\"$mutated_request\",\"condition\":\"webBusinessMutated\",\"timeoutMs\":120000}" \
@@ -284,7 +300,56 @@ if [[ "$run_mode" == "business" ]]; then
   fi
 fi
 
-browser_deadline=$(( $(date +%s) + 150 ))
+if [[ "$run_mode" == "durable" ]]; then
+  coordination_deadline=$(( $(date +%s) + 150 ))
+  while [[ ! -f "$coordination_dir/business.ready" ]]; do
+    pid_is_running "$browser_pid" || fail "browser exited before durable checkpoint"
+    [[ "$(date +%s)" -lt "$coordination_deadline" ]] \
+      || fail "browser did not commit the durable business checkpoint"
+    sleep 0.1
+  done
+  [[ ! -L "$coordination_dir/business.ready" ]] || fail "durable checkpoint is a symlink"
+  [[ "$(stat -f '%Lp' "$coordination_dir/business.ready")" == "600" ]] \
+    || fail "durable checkpoint mode is not 0600"
+
+  restart_request="w2c-restart-$generation"
+  send_host_command \
+    "{\"op\":\"restartDaemon\",\"requestId\":\"$restart_request\",\"markerBeforeReadiness\":true}" \
+    || fail "could not request daemon restart"
+  read_host_json restartReady "$restart_request" 75 || fail "daemon base readiness failed"
+  printf '%s\n' "$host_record" | jq -e '
+    .evidence.daemonGeneration == 2
+    and .metadataEntryRevision == 1
+    and .evidence.machineRemoteLifecycle == "active"
+    and .evidence.relayGrantActive == 1
+  ' >/dev/null || fail "daemon base readiness was not exact"
+  printf '%s\n' '{"markerBeforeReadiness":true}' >"$coordination_dir/restart.begin.tmp"
+  chmod 600 "$coordination_dir/restart.begin.tmp"
+  mv "$coordination_dir/restart.begin.tmp" "$coordination_dir/restart.begin"
+  read_host_json restartDaemon "$restart_request" 90 || fail "daemon restart readback failed"
+  printf '%s\n' "$host_record" | jq -e '
+    .evidence.daemonGeneration == 2
+    and .restartMarkerTitle == "R4.4 daemon restart marker"
+    and .metadataEntryRevision == 1
+    and .evidence.runtimeCommandCount == 1
+    and .evidence.runtimeCompletedCommandCount == 1
+    and .evidence.runtimeApprovalTotal == 1
+    and .evidence.runtimeApprovalApplied == 1
+    and .evidence.relayGrantActive == 1
+  ' >/dev/null || fail "daemon restart did not preserve exact W2c state"
+  restart_tmp="$coordination_dir/restart.done.tmp"
+  printf '%s\n' "$host_record" | jq -c '{
+    daemonGeneration: .evidence.daemonGeneration,
+    restartMarkerTitle,
+    metadataEntryRevision
+  }' >"$restart_tmp"
+  chmod 600 "$restart_tmp"
+  mv "$restart_tmp" "$coordination_dir/restart.done"
+fi
+
+browser_timeout=150
+[[ "$run_mode" != "durable" ]] || browser_timeout=220
+browser_deadline=$(( $(date +%s) + browser_timeout ))
 while pid_is_running "$browser_pid"; do
   [[ "$(date +%s)" -lt "$browser_deadline" ]] || fail "browser pairing exceeded deadline"
   sleep 0.1
@@ -299,8 +364,8 @@ grep -Fq "1 passed" "$browser_log" || fail "browser did not report one passing $
 if grep -aFq "agentdeck-pair:v1:" "$browser_log"; then
   fail "browser output leaked PairInvite"
 fi
-if [[ "$run_mode" == "business" ]] && grep -aEq \
-  'web-w2b-prompt-7fb7f299|synthetic Codex response|synthetic codex approval' "$browser_log"; then
+if [[ "$run_mode" != "pairing" ]] && grep -aEq \
+  'web-w2b-prompt-7fb7f299|synthetic Codex response|synthetic codex approval|R4.4 daemon restart marker' "$browser_log"; then
   fail "browser output leaked business plaintext"
 fi
 
@@ -308,7 +373,24 @@ status_request="w2a-status-$generation"
 send_host_command "{\"op\":\"status\",\"requestId\":\"$status_request\"}" \
   || fail "could not request final status"
 read_host_json status "$status_request" 45 || fail "final status readback failed"
-if [[ "$run_mode" == "business" ]]; then
+if [[ "$run_mode" == "durable" ]]; then
+  revoked_request="w2c-revoked-$generation"
+  send_host_command \
+    "{\"op\":\"waitFor\",\"requestId\":\"$revoked_request\",\"condition\":\"revoked\",\"timeoutMs\":120000}" \
+    || fail "could not request revoke readback"
+  read_host_json waitFor "$revoked_request" 140 || fail "revoke readback failed"
+  printf '%s\n' "$host_record" | jq -e '
+    .satisfied == true
+    and .evidence.daemonGeneration == 2
+    and .evidence.relayGrantTotal == 1
+    and .evidence.relayGrantActive == 0
+    and .evidence.runtimeRevokedAuthorizationCount == 1
+    and .evidence.runtimeCommandCount == 1
+    and .evidence.runtimeCompletedCommandCount == 1
+    and .evidence.runtimeApprovalTotal == 1
+    and .evidence.runtimeApprovalApplied == 1
+  ' >/dev/null || fail "W2c revoke terminal did not settle exact host state"
+elif [[ "$run_mode" == "business" ]]; then
   printf '%s\n' "$host_record" | jq -e '
     .evidence.machineRemoteLifecycle == "active"
     and .evidence.pendingPairingCount == 0
@@ -338,8 +420,8 @@ for relay_path in "$relay_db" "$relay_db-wal" "$relay_db-shm"; do
   if grep -aFq "Relay Web Test Companion" "$relay_path"; then
     fail "Relay persistence contains Web device plaintext"
   fi
-  if [[ "$run_mode" == "business" ]] && grep -aEq \
-    'web-w2b-prompt-7fb7f299|synthetic Codex response|synthetic codex approval' "$relay_path"; then
+  if [[ "$run_mode" != "pairing" ]] && grep -aEq \
+    'web-w2b-prompt-7fb7f299|synthetic Codex response|synthetic codex approval|R4.4 daemon restart marker' "$relay_path"; then
     fail "Relay persistence contains business plaintext"
   fi
 done
@@ -367,7 +449,9 @@ host_graceful=1
 rm -rf "$runner_root"
 cleanup_started=1
 trap - EXIT HUP INT TERM
-if [[ "$run_mode" == "business" ]]; then
+if [[ "$run_mode" == "durable" ]]; then
+  printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2c","status":"PASS","daemonGeneration":2,"durableRevision":3,"counterReservationStart":256,"counterReservationEnd":512,"catalogBackfillObserved":true,"runtimeCommandCount":1,"runtimeCompletedCommandCount":1,"runtimeApprovalTotal":1,"runtimeApprovalApplied":1,"runtimeRevokedAuthorizationCount":1,"relayGrantActive":0,"relayPlaintextAbsent":true,"browserPlaintextAbsent":true,"cleanup":{"pairedMaterialAbsent":true,"kekAbsent":true,"revokedTombstonePresent":true,"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'
+elif [[ "$run_mode" == "business" ]]; then
   printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2b","status":"PASS","preConfirmNetworkLocked":true,"pendingPairingCount":0,"relayGrantTotal":1,"relayGrantActive":1,"activeTransitionCount":0,"activeCatalogStreamCount":1,"runtimeCommandCount":1,"runtimeCompletedCommandCount":1,"runtimeApprovalTotal":1,"runtimeApprovalApplied":1,"relayPlaintextAbsent":true,"browserPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'
 else
   printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2a","status":"PASS","preConfirmNetworkLocked":true,"pendingPairingCount":0,"relayGrantTotal":1,"relayGrantActive":1,"activeTransitionCount":0,"activeCatalogStreamCount":1,"runtimeCommandCount":0,"relayPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'

@@ -113,10 +113,11 @@ Keychain/LaunchAgent、真实 vendor、物理 iPhone/第二台 Mac、公网 WSS 
 post-MVP BLOCKED 槽位。
 
 `2026-07-30-relay-web-test-companion-design.md` 与配套 implementation 是 automatic MVP 收口后的已批准
-post-MVP 开发计划，未替换上述 Relay 架构或 rescue 事实源。当前 W0/W1/W2a/W2b automatic complete：
-Rust/WASM + 薄 Web host 已完成真实 Chrome 的直连、配对与同页最小业务闭环；W2c durable
-promotion/reload/reconnect/revoke 仍未开始。浏览器本机证据不得写成物理设备、公网 WSS、production
-signing、真实 vendor 或第二台 Mac PASS。
+post-MVP 开发计划，未替换上述 Relay 架构或 rescue 事实源。当前 W0/W1/W2a/W2b/W2c automatic complete：
+Rust/WASM + 薄 Web host 已完成真实 Chrome 的直连、配对、最小业务闭环，以及 IndexedDB paired
+promotion、reload/reconnect/backfill/revoke。W2 overall 仍等待 W2.7 完整 negative/zero-mutation matrix；
+W3 crash-cut/tab contention/三次 fresh run尚未开始。浏览器本机证据不得写成物理设备、公网 WSS、
+production signing、真实 vendor 或第二台 Mac PASS，这些 W4 槽位继续 BLOCKED。
 
 ```text
 docs/plans/

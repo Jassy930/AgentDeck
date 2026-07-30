@@ -23,6 +23,7 @@ use agentdeck_protocol::relay_v2::{
 };
 use agentdeck_protocol::runtime::RUNTIME_PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::DeterministicRng;
 use crate::w2_business::{W2BusinessCore, W2BusinessEvidence};
@@ -90,6 +91,12 @@ pub enum W2PairingError {
     BusinessAuthorizationDenied,
     #[error("web.remote.business.counter_exhausted")]
     BusinessCounterExhausted,
+    #[error("web.remote.durable.state_invalid")]
+    DurableStateInvalid,
+    #[error("web.remote.durable.commit_required")]
+    DurableCommitRequired,
+    #[error("web.remote.durable.not_prepared")]
+    DurableNotPrepared,
 }
 
 impl W2PairingError {
@@ -115,6 +122,9 @@ impl W2PairingError {
             Self::BusinessOutcomeUnknown => "web.remote.business.outcome_unknown",
             Self::BusinessAuthorizationDenied => "web.remote.business.authorization_denied",
             Self::BusinessCounterExhausted => "web.remote.business.counter_exhausted",
+            Self::DurableStateInvalid => "web.remote.durable.state_invalid",
+            Self::DurableCommitRequired => "web.remote.durable.commit_required",
+            Self::DurableNotPrepared => "web.remote.durable.not_prepared",
         }
     }
 }
@@ -132,6 +142,8 @@ enum PairingPhase {
 }
 
 struct PairingMaterial {
+    device_sign_seed: Zeroizing<[u8; 32]>,
+    device_hpke_ikm: Zeroizing<[u8; 32]>,
     device_signing_key: SigningKey,
     device_hpke_private_key: HpkePrivateKey,
     device_sign_pubkey: [u8; 32],
@@ -143,20 +155,7 @@ struct PairingMaterial {
     receipt_frame: Option<Vec<u8>>,
     response_hash: Option<[u8; 32]>,
     verified_response: Option<VerifiedPairResponseV1>,
-}
-
-struct W2SeedMaterial {
-    device_sign_seed: [u8; 32],
-    device_hpke_ikm: [u8; 32],
-    hpke_rng_seed: [u8; 32],
-}
-
-impl Drop for W2SeedMaterial {
-    fn drop(&mut self) {
-        self.device_sign_seed.fill(0);
-        self.device_hpke_ikm.fill(0);
-        self.hpke_rng_seed.fill(0);
-    }
+    paired_at_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for PairingMaterial {
@@ -233,11 +232,9 @@ impl W2PairingCore {
         device_hpke_ikm: [u8; 32],
         hpke_rng_seed: [u8; 32],
     ) -> Result<(), W2PairingError> {
-        let seeds = W2SeedMaterial {
-            device_sign_seed,
-            device_hpke_ikm,
-            hpke_rng_seed,
-        };
+        let device_sign_seed = Zeroizing::new(device_sign_seed);
+        let device_hpke_ikm = Zeroizing::new(device_hpke_ikm);
+        let hpke_rng_seed = Zeroizing::new(hpke_rng_seed);
         if self.phase != PairingPhase::Inspected {
             return Err(W2PairingError::StateInvalid);
         }
@@ -249,10 +246,10 @@ impl W2PairingCore {
         }
 
         let authorization = mvp_authorization().map_err(|_| W2PairingError::CryptoFailed)?;
-        let device_signing_key = SigningKey::from_seed(&seeds.device_sign_seed);
+        let device_signing_key = SigningKey::from_seed(&device_sign_seed);
         let device_sign_pubkey = device_signing_key.verifying_key().to_bytes();
         let (device_hpke_private_key, device_hpke_public_key) =
-            HpkePrivateKey::derive_keypair(&seeds.device_hpke_ikm);
+            HpkePrivateKey::derive_keypair(device_hpke_ikm.as_ref());
         let device_hpke_pubkey: [u8; 32] = device_hpke_public_key
             .to_bytes()
             .try_into()
@@ -271,7 +268,7 @@ impl W2PairingCore {
         };
         let invite_recipient = HpkePublicKey::from_bytes(&self.invite.invite_hpke_pubkey.0)
             .map_err(|_| W2PairingError::CryptoFailed)?;
-        let mut rng = DeterministicRng::new(seeds.hpke_rng_seed);
+        let mut rng = DeterministicRng::new(*hpke_rng_seed);
         let request = seal_pair_request(
             &invite_recipient,
             &request_info,
@@ -288,6 +285,8 @@ impl W2PairingCore {
         let request_frame = pair_data_frame(self.invite.pair_route, canonical_request);
 
         self.material = Some(PairingMaterial {
+            device_sign_seed,
+            device_hpke_ikm,
             device_signing_key,
             device_hpke_private_key,
             device_sign_pubkey,
@@ -299,6 +298,7 @@ impl W2PairingCore {
             receipt_frame: None,
             response_hash: None,
             verified_response: None,
+            paired_at_ms: None,
         });
         self.fingerprint_confirmed = true;
         self.phase = PairingPhase::Confirmed;
@@ -476,6 +476,58 @@ impl W2PairingCore {
         Ok(self.business()?.evidence())
     }
 
+    pub fn business_prepare_durable_promotion(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        self.business_mut()?.prepare_durable_promotion()
+    }
+
+    pub fn business_export_durable_state(&self) -> Result<Vec<u8>, W2PairingError> {
+        self.business()?.export_durable_state()
+    }
+
+    pub fn business_activate_durable_state(&mut self) -> Result<(), W2PairingError> {
+        self.business_mut()?.activate_durable_state()
+    }
+
+    pub fn business_start_recovery_catalog(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        self.business_mut()?.start_recovery_catalog()
+    }
+
+    pub fn business_start_recovery_conversation(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        self.business_mut()?.start_recovery_conversation()
+    }
+
+    pub fn business_start_revoke_self(&mut self) -> Result<Vec<u8>, W2PairingError> {
+        self.business_mut()?.start_revoke_self()
+    }
+
+    pub fn business_revocation_terminal_verified(&self) -> Result<bool, W2PairingError> {
+        Ok(self.business()?.revocation_terminal_verified())
+    }
+
+    pub fn restore_paired(
+        durable_state: &[u8],
+        rng_seed: [u8; 32],
+    ) -> Result<Self, W2PairingError> {
+        let (business, invite) =
+            W2BusinessCore::restore(durable_state, DeterministicRng::new(rng_seed))?;
+        let machine_route = Some(business.machine_route());
+        let device_route = Some(business.device_route());
+        Ok(Self {
+            connect_url: format!("{}v2/pair", invite.wss_url),
+            invite,
+            phase: PairingPhase::Paired,
+            fingerprint_confirmed: true,
+            material: None,
+            business: Some(business),
+            pending_observed: true,
+            response_verified: true,
+            receipt_sent: true,
+            route_accepted_observed: true,
+            machine_route,
+            device_route,
+        })
+    }
+
     fn accept_pair_data(&mut self, data: PairData, now_ms: u64) -> Result<Vec<u8>, W2PairingError> {
         if data.pair_route != self.invite.pair_route {
             return Err(self.fail(W2PairingError::RouteMismatch));
@@ -600,6 +652,7 @@ impl W2PairingCore {
         material.receipt_frame = Some(receipt_frame.clone());
         material.response_hash = Some(response_hash);
         material.verified_response = Some(verified_response);
+        material.paired_at_ms = Some(now_ms);
         self.machine_route = Some(machine_route);
         self.device_route = Some(device_route);
         self.response_verified = true;
@@ -611,15 +664,22 @@ impl W2PairingCore {
     fn promote_business(&mut self) -> Result<W2BusinessCore, W2PairingError> {
         let material = self.material.take().ok_or(W2PairingError::StateInvalid)?;
         let PairingMaterial {
+            device_sign_seed,
+            device_hpke_ikm,
             device_signing_key,
             device_hpke_private_key,
             rng,
             verified_response,
+            paired_at_ms,
             ..
         } = material;
         let verified_response = verified_response.ok_or(W2PairingError::StateInvalid)?;
+        let paired_at_ms = paired_at_ms.ok_or(W2PairingError::StateInvalid)?;
         W2BusinessCore::new(
-            &self.invite.wss_url,
+            self.invite.clone(),
+            paired_at_ms,
+            device_sign_seed,
+            device_hpke_ikm,
             device_signing_key,
             device_hpke_private_key,
             verified_response,
@@ -699,7 +759,8 @@ fn pair_context(
     }
 }
 
-fn mvp_authorization() -> Result<AuthorizationRequestV1, agentdeck_protocol::e2ee::PairingError> {
+pub(crate) fn mvp_authorization()
+-> Result<AuthorizationRequestV1, agentdeck_protocol::e2ee::PairingError> {
     let request = AuthorizationRequestV1 {
         format_version: E2EE_FORMAT_VERSION,
         device_display_name: WEB_DEVICE_DISPLAY_NAME.to_owned(),
@@ -866,6 +927,59 @@ mod wasm {
         pub fn business_evidence_json(&self) -> Result<String, JsValue> {
             serde_json::to_string(&self.core.business_evidence().map_err(js_error)?)
                 .map_err(|_| js_error(W2PairingError::SerializationFailed))
+        }
+
+        #[wasm_bindgen(js_name = businessPrepareDurablePromotion)]
+        pub fn business_prepare_durable_promotion(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core
+                .business_prepare_durable_promotion()
+                .map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessExportDurableState)]
+        pub fn business_export_durable_state(&self) -> Result<Vec<u8>, JsValue> {
+            self.core.business_export_durable_state().map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessActivateDurableState)]
+        pub fn business_activate_durable_state(&mut self) -> Result<(), JsValue> {
+            self.core
+                .business_activate_durable_state()
+                .map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessStartRecoveryCatalog)]
+        pub fn business_start_recovery_catalog(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core
+                .business_start_recovery_catalog()
+                .map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessStartRecoveryConversation)]
+        pub fn business_start_recovery_conversation(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core
+                .business_start_recovery_conversation()
+                .map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessStartRevokeSelf)]
+        pub fn business_start_revoke_self(&mut self) -> Result<Vec<u8>, JsValue> {
+            self.core.business_start_revoke_self().map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = businessRevocationTerminalVerified)]
+        pub fn business_revocation_terminal_verified(&self) -> Result<bool, JsValue> {
+            self.core
+                .business_revocation_terminal_verified()
+                .map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = restore)]
+        pub fn restore(durable_state: &[u8]) -> Result<W2PairingSession, JsValue> {
+            let core =
+                W2PairingCore::restore_paired(durable_state, random_seed().map_err(js_error)?)
+                    .map_err(js_error)?;
+            Ok(Self { core })
         }
     }
 }

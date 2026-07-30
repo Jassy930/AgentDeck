@@ -44,7 +44,7 @@ agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge
 stable UDS。diagnostics report 不启动 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志；不要把
 diagnostics override 当成 stable ownership 配置。
 
-## Relay Web Test Companion W0/W1/W2a/W2b failure codes
+## Relay Web Test Companion W0/W1/W2a/W2b/W2c failure codes
 
 W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，尚未连接 Relay。以下 code 只在本地
 测试 host 中出现；它们不进入 daemon diagnostic log，也不能解释为远端业务失败：
@@ -101,12 +101,37 @@ W2b paired principal 使用以下 code；它们仍只属于本地 automatic test
 | `web.remote.business.counter_exhausted` | request/counter/evidence 计数溢出 | 视为安全终态并停止发送；不得回卷、复用 nonce 或清零后续跑 |
 | `web.remote.business.timeout` / `fence_retry_exhausted` / `fence_stage_invalid` | 有界窗口内业务未收敛，或 transition fence 超过 8 次/出现在非法阶段 | 读取脱敏 business evidence 定位 Catalog、Conversation、Prompt 或 Approval；不得用固定 sleep 或无限重试绕过 fence |
 
+W2c durable recovery 继续使用以下本地 test-host code。它们描述浏览器 durable state 与恢复编排，不进入
+daemon diagnostic log：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `web.remote.durable.state_invalid` | Rust/WASM durable bytes 非 canonical、身份/授权/cursor/evidence 不一致，或恢复投影非法 | 停止联网并保留本轮隔离 profile；不能丢弃旧状态后静默重配对 |
+| `web.remote.durable.commit_required` | promotion、counter reservation 或 state mutation 尚未由 host exact CAS 提交 | 先完成 IndexedDB transaction 和 revision readback；提交前禁止发送任何 frame |
+| `web.remote.durable.not_prepared` | host 尝试激活尚未 prepare/export 的 durable state | 修正 promotion 顺序；不能把内存态 paired session 直接当作可恢复身份 |
+| `web.remote.storage.kekInvalid` / `pairedStateSizeInvalid` | KEK 不是不可导出的 AES-GCM key，或 opaque paired state 尺寸越界 | fail-close 并保留取证；禁止 extractable key、明文 state 或无界 payload |
+| `web.remote.storage.pairedPromotionConflict` / `pairedRevisionConflict` / `revocationConflict` | promotion、普通提交或 revoke cleanup 的 expected revision/terminal 条件不精确 | transaction 必须 abort；重新读取唯一 current record，禁止 blind overwrite 或 sibling 合并 |
+| `web.remote.storage.revisionInvalid` / `pairedStateIncomplete` | revision 非 safe integer，或 paired record/KEK 缺一部分 | 视为损坏状态；停止自动恢复，不得猜测缺失材料 |
+| `web.remote.storage.revokedMaterialPresent` | revoked tombstone 与 paired material/KEK 同时存在 | 视为安全失败并停止；不得选择任意一边继续连接 |
+| `web.remote.durable.reconnect_timeout` / `recovery_timeout` | reload 后认证或 Catalog/Conversation recovery 未在有界窗口完成 | 读取 `recoveryStage` 与 host generation；不要用固定 sleep、无限重试或重新配对掩盖 cursor/gap 错误 |
+| `web.remote.durable.revocation_terminal_missing` | self-revoke 后未验证 MachineRoot-signed terminal | 保留材料，不执行删除；directed receipt 或 socket close 都不能单独充当权威 terminal |
+| `web.remote.durable.cleanup_readback_failed` | revoke cleanup 后没有读回 material/KEK absent + tombstone present + exact revision | 停止旧身份的任何重连并保留 profile 取证；不能只清内存或只删一层记录 |
+| `web.remote.durable.revoked` | reload 读到 revoked tombstone，旧 identity 被本地拒绝 | 这是 revoke 后重连负例的预期终态；必须同时确认零 binary frame 与 Relay active grant `0` |
+
+`W2BusinessEvidence.recoveryStage` 只记录脱敏阶段，不包含 wire、key、业务正文或 vendor 文本。典型值从
+`recovery.state.restored`、`recovery.catalog.requested` / `recovery.conversation.requested` 推进到各流的
+`subscription_receipt`、`backfill`、`sync_complete`、`stream_binding`、`epoch_barrier`、
+`stream_applied_ack`、`replay_complete` 与 `subscription.active`；`recovery.frame.*` 用于指出最后收到的 outer
+frame。它是定位线索，不是 PASS 证明；PASS 仍须读回两条 active subscription、exact counter/revision、host
+计数、signed revoke terminal 与 cleanup。
+
 W0 失败先运行 `bun run check` 和 `bun run test:browser -- --grep W0`。W1 失败用
 `scripts/run-relay-web-companion-e2e.sh --contract` 区分 contract/ownership，再用 `--transport` 复现真实
 Chrome→Relay 路径。W2a 失败用 `--pairing` 重放 fresh fixed-topology host，并以 runner 输出和 host NDJSON
 区分 pre-confirm、pending、local approve、receipt/Closed 或 cleanup 阶段；W2b 失败用 `--business` 查看脱敏
-Catalog/Conversation/Prompt/Approval evidence 和 host 精确计数。测试结束必须停止静态 server、关闭 tab/profile、
-Relay/daemon 并删除本轮精确临时 root；cleanup 不使用全局浏览器数据或全局进程名删除。
+Catalog/Conversation/Prompt/Approval evidence 和 host 精确计数；W2c 失败用 `--durable` 查看 exact
+revision/counter、`recoveryStage`、daemon generation 与 revoked readback。测试结束必须停止静态 server、关闭
+tab/profile、Relay/daemon 并删除本轮精确临时 root；cleanup 不使用全局浏览器数据或全局进程名删除。
 
 ## Relay v1 历史 marker 与显式 reset
 

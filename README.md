@@ -232,7 +232,7 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
-## Relay Web Test Companion（W0/W1/W2a/W2b automatic complete）
+## Relay Web Test Companion（W0/W1/W2a/W2b/W2c automatic complete）
 
 `agentdeck-web-core` 已证明现有 Relay v2 codec、Runtime v5 request contract 与 E2EE v1 crypto 可以复用同一
 Rust 实现编译为 browser WASM；`web/relay-test-companion` 是 Bun 管理的最小测试页面与 host adapter，
@@ -287,16 +287,35 @@ scripts/run-relay-web-companion-e2e.sh --business
 ```
 
 fresh 门禁读回 command/completed `1/1`、approval total/applied `1/1`，并扫描 Relay DB/WAL/SHM、浏览器日志、
-DOM 与 Playwright output，确认 prompt、assistant、approval 明文 absent。`--all` 现在依次执行 W0/W1 contract、
-W1 transport、W2a pairing 与 W2b business。
+DOM 与 Playwright output，确认 prompt、assistant、approval 明文 absent。
+
+W2c 把同一 paired principal 提升到 IndexedDB：不可导出的 WebCrypto KEK 加密 Rust/WASM 导出的 paired
+state。promotion 创建 revision `0`，首轮业务 checkpoint exact CAS 为 `0→1`，reload 后联网前的 reservation
+提交为 `1→2`，最后以 revoke cleanup `2→3` 收敛。任何联网发送前先 durable 保留 counter block；首代使用
+`0→256`，reload 后从 `256` 开始并
+保留到 `512`。强制 reload 后恢复同一 DeviceSign/DeviceHPKE、grant、authorization、key directory 与
+cursor，daemon generation `1→2` 后重新鉴权并观察 Catalog restart marker backfill，同时恢复 Catalog 与
+Conversation subscription；Runtime command/completed 和 approval total/applied 始终保持 `1/1`，没有重复副作用。
+
+self-revoke 只以 MachineRoot-signed terminal 作为权威完成证明；directed committed receipt 因连接关闭不可见时，
+WASM 可从已验证 terminal 合成同义 committed 结果。随后同一 IndexedDB transaction 删除 paired material 与
+KEK、写入 revision `3` revoked tombstone，旧 identity 的再次连接在发送前被拒绝：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --durable
+scripts/run-relay-web-companion-e2e.sh --all
+```
+
+`--all` 现在依次执行 W0/W1 contract、W1 transport、W2a pairing、W2b business 与 W2c durable。
 
 本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
-`http://127.0.0.1:4173/`；停止 server 后不保留业务或配对状态。
+`http://127.0.0.1:4173/`。该入口只用于查看测试壳；需要 paired durable state、隔离 profile 和完整 cleanup
+时必须使用统一 runner，不在日常浏览器 profile 中手工保留测试身份。
 
-这仍不是完整网页版。W2b 只关闭同页内存态的 pair→list/open→prompt→approval；已验证的 grant、密钥、
-counter、cursor 与 outbox 尚未提升到 IndexedDB durable paired state。reload/reconnect/backfill/revoke 属于
-W2c，完成前不能标记 W2 overall complete。公网 WSS、production SPKI pin、物理设备、第二台 Mac 与真实 vendor
-继续独立 BLOCKED，不因 W0–W2b 通过而改变。阶段事实源见
+这仍不是完整网页版。W2c 已关闭单轮 automatic 的 pair→业务→reload/reconnect/backfill→revoke 正向链路，
+但 W2.7 的 approval loser、完整 stale/replay/nonce-reuse 零 mutation 反例矩阵尚未闭合，所以 W2 overall
+仍保持进行中；W3 的 crash-cut、tab contention 和同一 candidate 三次 fresh run 尚未开始。公网 WSS、
+production SPKI pin/signing、物理设备、第二台 Mac 与真实 vendor 属于 W4，继续独立 BLOCKED。阶段事实源见
 [`Relay Web Test Companion 实施计划`](docs/plans/2026-07-30-relay-web-test-companion-implementation.md)。
 
 ## Relay Companion MVP 实施状态（P5.8-lite automatic complete；P5 为 8/9）

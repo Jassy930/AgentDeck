@@ -20,7 +20,7 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
-## Relay Web Test Companion W0/W1/W2a/W2b 门禁（2026-07-30）
+## Relay Web Test Companion W0/W1/W2a/W2b/W2c 门禁（2026-07-30）
 
 W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
 `web/relay-test-companion/` 后运行：
@@ -47,7 +47,7 @@ production SPKI pin、Keychain/FileProtection 和真实 vendor 仍不得由浏�
 `scripts/verify-agent-docs.sh`、`git diff --check` 和 Git 状态。
 
 W1 的统一入口如下；`--contract` 只跑 Rust/WASM contract、TypeScript ownership/unit，`--transport` 只跑
-真实 Chrome→临时 TLS Relay 集成，阶段收口使用 `--all`：
+真实 Chrome→临时 TLS Relay 集成；`--all` 会继续执行 W2a/W2b/W2c：
 
 ```bash
 scripts/run-relay-web-companion-e2e.sh --contract
@@ -103,8 +103,50 @@ TurnCompleted。host 必须精确为 command/completed `1/1`、approval total/ap
 三项业务 sentinel 明文，browser/host PID、host root、invite、UDS 与 Playwright artifacts 必须 absent。
 
 W2b PASS 只关闭同页内存态 pair→list/open→prompt→approval；W2a evidence 中 `receiptSent` 在 material 提升后
-仍必须单调保持 true。IndexedDB paired promotion、reload/reconnect/backfill/revoke 和 crash cut 仍属 W2c/W3，
-不得把本节写成 W2 overall complete 或正式 Web 产品完成。
+仍必须单调保持 true。IndexedDB paired promotion、reload/reconnect/backfill/revoke 已由下述 W2c 关闭；
+crash cut、tab contention 与重复性仍属 W3。
+
+W2c 的单命令与 aggregate 门禁如下：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --durable
+scripts/run-relay-web-companion-e2e.sh --all
+bash scripts/tests/run-relay-web-companion-e2e.sh
+```
+
+`--durable` 必须读回 IndexedDB encrypted paired state 与 non-extractable KEK：promotion 创建 revision `0`，
+首轮业务 checkpoint 提交到 revision `1`，counter reservation 为 `0→256`。任何 reload 后网络动作前必须
+提交新 state/revision；真实 page reload 后必须从
+同一身份恢复，counter reservation 变为 `256→512`；daemon restart 后 generation 为 `2`，Catalog backfill
+观察到 restart marker，Catalog/Conversation 两条 subscription 均重新 active。Runtime command/completed 与
+approval total/applied 必须仍为 `1/1`。
+
+host 的 `restartDaemon` 记录只冻结 daemon restart、marker COMMIT、active grant 与既有业务计数的 base
+linearization evidence；两条 live subscription 与 backfill 由浏览器认证 evidence 负责。不能让 host 再轮询
+瞬时 live-count，因为浏览器满足两流 active 后会立即 self-revoke，轮询可能错过合法窗口并产生假失败。
+
+self-revoke 必须验证 MachineRoot-signed terminal、Relay revoke tombstone、active grant `0` 和旧 identity 重连
+拒绝；最终 durable revision 为 `3`，paired material 与 KEK absent、revoked tombstone present。Relay DB/WAL/SHM、
+browser log、DOM 与 Playwright output 的业务/marker明文必须 absent，本轮 browser/host/root/invite/UDS/profile
+和测试 artifacts 必须全部清理。
+
+W2c PASS 只关闭单轮 durable 正向链路。W2 overall 仍等待 W2.7 的 approval loser 与完整
+stale/replay/nonce-reuse 零 mutation 矩阵；W3 的 deterministic crash cuts、第二 tab、网络故障与三次 fresh
+run尚未开始。W4 的公网、物理设备、production SPKI/signing、第二台 Mac 与真实 vendor继续 BLOCKED。
+
+本切片涉及的 daemon machine E2E 可用以下 scoped Clippy 复核：
+
+```bash
+cargo clippy -p agentdeckd --test relay_v2_machine_e2e --no-deps -- -D warnings \
+  -A clippy::too-many-arguments \
+  -A clippy::collapsible-if \
+  -A clippy::collapsible-str-replace
+```
+
+三个 allow 只对应未修改的 Codex adapter 基线：`codex/app_server.rs` 的 `too_many_arguments`、
+`codex/translate.rs` 的 `collapsible_if` 与 `collapsible_str_replace`。字面 `--all-targets -D warnings` 还会命中
+未修改的 `codex/history.rs` lib-test `cmp_owned`；本阶段不夹带清理这些既有 lint，也不能把带 allow 的 scoped
+PASS 写成全目标零 warning。
 
 ## Relay Companion MVP Task 粒度门禁（2026-07-18）
 

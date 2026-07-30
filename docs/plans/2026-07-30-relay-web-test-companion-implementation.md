@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2a/W2b automatic complete；W2c 尚未开始 |
+| 状态 | W0/W1/W2a/W2b/W2c automatic complete；W2 overall 等待 W2.7/W2.8；W3 未开始；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -206,28 +206,31 @@ git status --short --branch
 2. **W2b business**：paired principal 的 list/open/prompt/approval。
 3. **W2c durability**：IndexedDB promotion、reload/reconnect/backfill 与 revoke。
 
-只有 W2c 完成后才能标记 W2 complete。
+W2c 完成是标记 W2 complete 的必要条件；W2 overall 还必须关闭 W2.7 完整负例矩阵与 W2.8 总体收口。
 
 ### Tasks
 
 - [x] W2.1：实现 PairInvite paste/inspect/trust preview；确认前零网络，确认后才连 `/v2/pair`。
-- [ ] W2.2：复用 WASM HPKE/签名和 durable state 完成 pair request/response/terminal；被控 Mac 仍只经
-  existing same-UID `LocalPairingAdministration` approve/cancel。W2a 已完成内存态 request/response/terminal
-  与 verified material 保留；IndexedDB paired promotion 和 reload recovery 留给 W2c，所以本项尚未整体勾选。
+- [x] W2.2：复用 WASM HPKE/签名和 durable state 完成 pair request/response/terminal；被控 Mac 仍只经
+  existing same-UID `LocalPairingAdministration` approve/cancel。W2a 完成内存态 terminal，W2c 已完成
+  IndexedDB paired promotion、reload recovery 与旧 identity revoke readback。
 - [x] W2.3：实现最小 machine/catalog/conversation 页面和 open/prompt/approval 操作；UI 只消费 typed
   WASM view state。
 - [x] W2.4：runner 串起真实 RuntimeCore/RemoteLink、synthetic Codex/Claude Code、Relay 和浏览器，读回
   list/open/prompt/assistant/approval terminal。
-- [ ] W2.5：强制 page reload + WebSocket reconnect，验证 durable cursor/backfill、counter 单调和副作用不重复。
-- [ ] W2.6：执行 revoke-self，验证 signed terminal、浏览器材料清理、连接关闭和旧 identity 不可重连。
+- [x] W2.5：强制 page reload + WebSocket reconnect，验证 durable cursor/backfill、counter 单调和副作用不重复。
+- [x] W2.6：执行 revoke-self，验证 signed terminal、浏览器材料清理、连接关闭和旧 identity 不可重连。
 - [ ] W2.7：加入 wrong invite/fingerprint、remote cannot-confirm pairing、approval loser、stale/replay/nonce reuse
-  反例和零 mutation 断言。
-- [ ] W2.8：更新 README/ARCHITECTURE/QUALITY/DIAGNOSTICS/runbook 中实际新增边界，形成 W2 scoped commit。
+  反例和零 mutation 断言。已有 wrong invite/fingerprint、remote cannot-confirm、握手 replay、revoke 后旧身份
+  零发送证据；approval loser 与完整 stale/replay/nonce-reuse mutation matrix 仍缺，不能整体勾选。
+- [ ] W2.8：更新 README/ARCHITECTURE/QUALITY/DIAGNOSTICS/runbook 中实际新增边界，形成 W2 overall scoped
+  commit。W2c 文档与独立提交不替代 W2.7 完成后的总体收口。
 
 ### Gates
 
 ```bash
-bash scripts/run-relay-web-companion-e2e.sh --business
+bash scripts/run-relay-web-companion-e2e.sh --durable
+bash scripts/run-relay-web-companion-e2e.sh --all
 cd web/relay-test-companion
 bun run check
 cd ../..
@@ -278,6 +281,41 @@ git status --short --branch
   承担；W2 overall、正式 Web 产品、物理设备、公网、production pin/signing 与真实 vendor 均未完成或继续
   BLOCKED。
 
+### W2c 完成证据（2026-07-30）
+
+- paired promotion 复用 W2b 的原 DeviceSign/DeviceHPKE、`VerifiedPairResponseV1`、grant、authorization 与
+  key directory。Rust/WASM 导出 opaque canonical state；TypeScript 只用 IndexedDB 中不可导出的 AES-GCM
+  KEK 加密并执行 exact revision CAS，private key、grant 与解密 Runtime wire不进入 UI owner。
+- promotion 创建 durable revision `0`；首轮业务 checkpoint 把 counter reservation `0→256` 与 state exact
+  CAS 提交到 revision `1`。reload 后先解密/验证 paired state，把下一 reservation `256→512` 提交到
+  revision `2`，完成前禁止任何网络发送。
+- daemon generation `1→2` 后浏览器以原 identity 重新 Authenticate；Catalog/Conversation subscription 恢复，
+  Catalog warm backfill 观察到 `R4.4 daemon restart marker`。`StreamBinding.inner_cursor` 按 publication cut
+  解释，允许 `SyncComplete.inner_cursor` 更高，control ACK 不再回退 durable reducer cursor；live publication
+  overlap 只接受 exact duplicate/连续 next。
+- host 的 restart record 冻结 restart + marker COMMIT + active grant 的 base linearization evidence；浏览器
+  authenticated evidence 独立证明两条 subscription/backfill。host 不轮询可能被即时 self-revoke 擦除的
+  transient live-count，最终 revoke 仍由独立 host `Revoked` readback 证明。
+- self-revoke 验证 MachineRoot-signed terminal。连接关闭使 directed committed receipt 不可见时，只从该
+  verified terminal 合成同义 committed receipt；随后 exact transaction 删除 paired material/KEK 并写
+  revision `3` revoked tombstone。旧 identity reload 后返回 `web.remote.durable.revoked`，binary frames sent
+  为 `0`；Relay active grant `0`、revoke tombstone `1`。
+- `scripts/run-relay-web-companion-e2e.sh --durable` fresh PASS：command/completed `1/1`、approval
+  total/applied `1/1`、runtime revoked authorization `1`，没有重复业务副作用；Relay DB/WAL/SHM、browser
+  log/DOM/Playwright output 中 prompt、assistant、approval 与 restart marker 明文 absent，全部本轮进程、
+  profile、root、invite、UDS 和 artifacts absent。
+- `scripts/run-relay-web-companion-e2e.sh --all` 已包含 W0、W1 transport、W2a、W2b、W2c；runner contract、
+  Web core 两组 feature tests/WASM build/Clippy、protocol/crypto 与四份 schema diff、daemon machine E2E、
+  daemon no-net/network boundary、agent docs 和 `verify-relay-companion-mvp.sh p5` 均已通过。fixed-topology iOS
+  Simulator lifecycle、SessionSource `25/25` 与 RelayClient 457 tests通过；4 个 production Keychain entitlement
+  用例按设计 skipped，物理 iPhone 与第二台 Mac继续外部 BLOCKED。
+- daemon machine E2E scoped Clippy 在精确允许未修改 Codex adapter 的 `too_many_arguments`、
+  `collapsible_if`、`collapsible_str_replace` 后通过；字面全目标 `-D warnings` 仍被这些既有 lint 阻断，且
+  lib-test 另有既有 `cmp_owned`。本切片不夹带清理，不能写成全目标零 warning。
+- 本证据关闭 W2c automatic slice，不关闭 W2 overall。W2.7 尚缺 approval loser 与完整
+  stale/replay/nonce-reuse 零 mutation matrix；W3 crash-cut/tab contention/三次 fresh run未开始，W4 公网、
+  物理设备、production signing/pin、第二台 Mac 与真实 vendor继续 BLOCKED。
+
 ### Required readback
 
 | 能力 | 必须读回 |
@@ -293,8 +331,8 @@ git status --short --branch
 
 ### Exit
 
-W2 单轮 fresh business E2E PASS，iOS Simulator 权威 E2E 不回归。该阶段仍不能标记物理设备、公网、
-production signing 或真实 vendor PASS。
+W2c 单轮 fresh durable E2E 与 iOS Simulator 权威回归已 PASS。W2 overall 仍等待 W2.7 完整负例矩阵和 W2.8
+总体收口；该阶段仍不能标记物理设备、公网、production signing/pin、第二台 Mac 或真实 vendor PASS。
 
 ## 7. Phase W3：durable recovery、隔离与重复性
 
@@ -371,7 +409,7 @@ W4 不由本机 automatic 结果自动解锁。进入前另建执行授权和证
 
 - [x] W0 证明 WASM parity 与 IndexedDB/Web Locks durable contract。
 - [x] W1 浏览器直连真实 Relay v2/E2EE，无业务 bridge。
-- [ ] W2 完成完整远程业务流，iOS E2E 不回归。
+- [ ] W2 完成完整远程业务流，iOS E2E 不回归（W2c 正向 durable 已完成；W2.7/W2.8 仍开放）。
 - [ ] W3 crash/restart/tab contention 与三次 fresh run 全绿。
 - [ ] TypeScript 无 wire/crypto owner；Relay/Runtime/E2EE 版本未变。
 - [ ] 文档、diagnostics、quality、runbook 与实际一致。

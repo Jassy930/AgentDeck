@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1/W2a/W2b automatic complete；W2c 尚未开始 |
+| 状态 | W0/W1/W2a/W2b/W2c automatic complete；W2 overall 等待 W2.7/W2.8；W3 未开始；W4 BLOCKED |
 | 日期 | 2026-07-30 |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
 | 目标 | 用浏览器直接复用 Relay v2 + E2EE v1，增加一条低成本、可重复的远程业务闭环 |
@@ -50,8 +50,13 @@ Rust/WASM 处理，TypeScript 仍只转发 opaque binary。
 W2b 已从同一 `W2PairingSession` 移交 verified response、原设备密钥、grant、authorization 与 key directory，
 建立真实 paired principal `/v2/connect`。Catalog/Conversation 复用现有 Subscribe、StreamBinding、EpochBarrier、
 StreamAppliedAck 与 outer ACK；随后完成 list/open/prompt/assistant/approval/TurnCompleted，daemon 读回
-command/completed `1/1`、approval total/applied `1/1`。这些材料仍只在 WASM 内存，尚未做 IndexedDB paired
-promotion；reload/reconnect/backfill/revoke 归 W2c，W2 整体仍未完成。
+command/completed `1/1`、approval total/applied `1/1`。
+
+W2c 已把同一 paired material 以不可导出 WebCrypto KEK 加密后 promotion 到 IndexedDB。首次 counter block
+为 `0→256`，强制 reload 后先 exact CAS 提交新 reservation，再从 `256` 使用到 `512`；提交前零网络。
+daemon generation `1→2` 后恢复原身份与两条 subscription，Catalog backfill 观察到 restart marker，业务副作用
+仍保持 `1/1`。MachineRoot-signed revoke terminal 验证后删除 material/KEK、写 revision `3` tombstone，旧
+identity 重连在发送前失败。W2c automatic slice 已完成，但 W2.7 完整负例矩阵与 W2.8 overall 收口尚未完成。
 
 ## 2. 目标与非目标
 
@@ -151,10 +156,16 @@ TypeScript 二次解释 Runtime wire。
   短暂解密，Debug/log/DOM/截图均不得出现秘密。
 - 每次发送先用单个 IndexedDB transaction durable 提交 counter reservation，再产生 wire；状态更新同样以
   previous revision + exact next commitment 做 CAS，禁止 blind overwrite。
+- `StreamBindingV1.inner_cursor` 是 Relay publication cut；directed bootstrap 的 `RuntimeSyncComplete.inner_cursor`
+  可以在同一线性化窗口内推进得更高。恢复持久化 reducer 已应用的更高 cut，control ACK 只能推进 outer
+  cursor，禁止用旧 publication cut 回退 durable inner cursor。backfill 与 live publication overlap 只允许
+  exact duplicate/已应用前缀，gap、fork 或 target 变化必须 fail-close。
 - 使用 Web Locks API 对 installation 取得单写者 lease；第二 tab、worker 或旧 generation 只能只读失败或
   typed fail-close，不能同时消费 counter。
 - `BroadcastChannel` 只做 generation invalidation 通知，不承载 canonical state。
-- revoke 后先持久化 terminal/cleanup journal，再删除 grant/private material；页面刷新不能恢复已撤销 identity。
+- revoke 后先验证 MachineRoot-signed terminal，再以一个 exact revision transaction 删除 paired material/KEK 并
+  写 revoked tombstone。连接关闭使 directed committed receipt 不可见时，只有 root-signed terminal 可合成
+  同义 committed 结果；页面刷新不能恢复已撤销 identity。
 
 W0 必须先验证当前目标 Chromium 对 non-extractable `CryptoKey` 的 IndexedDB structured clone、transaction
 rollback 和 Web Locks 行为。上述能力任一不可靠，W2 前停止。
@@ -199,6 +210,10 @@ WebSocket API 不暴露 peer certificate，也不允许应用执行等价的 SPK
 
 W0–W3 每阶段必须独立 scoped commit、focused gate、integration gate、运行读回、负例、cleanup、文档更新和
 `git status --short --branch` clean。代码候选变化会使本阶段旧证据失效。
+
+当前只完成到 W2c automatic slice。W2.7 的 approval loser、完整 stale/replay/nonce-reuse 零 mutation 矩阵与
+W2.8 overall closeout 仍开放；W3 deterministic crash cuts、第二 tab、网络故障和三次 fresh run尚未开始。
+W4 的公网、物理设备、production signing/pin、第二台 Mac 与真实 vendor继续独立 BLOCKED。
 
 ## 10. 验收边界
 

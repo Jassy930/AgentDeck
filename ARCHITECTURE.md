@@ -764,7 +764,7 @@ conversation/key，不能伪造身份连续性。
   complete。该完成边界不覆盖 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理
   iPhone/第二台 Mac 或 destructive purge；这些真实槽位继续保持 post-MVP BLOCKED。
 
-### Relay Web Test Companion W2a/W2b pairing 与业务不变量
+### Relay Web Test Companion W2a/W2b/W2c pairing、业务与恢复不变量
 
 - 浏览器没有第二套 Runtime、daemon 或 UDS→HTTP bridge。`agentdeck-web-core` 直接复用
   `agentdeck-protocol` / `agentdeck-crypto`，TypeScript 只管理 WebSocket generation、deadline、opaque
@@ -786,8 +786,25 @@ conversation/key，不能伪造身份连续性。
   assistant/approval 匹配文本、Runtime envelope、E2EE counter/cursor 与 approval 决定全部只存在 Rust/WASM。
 - approval receipt 与 canonical event 是独立到达轴：首次合法 `Claimed` 不能冒充 Applied；只有认证观察
   `ApprovalResolved(Applied)` 后，才允许用现有 `RetryApproval` 读回 Applied，且 daemon ledger 仍须精确一条。
-- W2b 仍是同页内存态，不写 IndexedDB、不承诺 reload/reconnect/backfill/revoke。上述 durable promotion 与
-  identity 清理属于 W2c，W2c 完成前不能标记 W2 overall complete。
+- W2c paired state 的唯一明文 owner 仍是 Rust/WASM。TypeScript 只把 opaque durable bytes 用 IndexedDB 中
+  不可导出的 WebCrypto KEK 加密；promotion、普通状态提交与 revoke cleanup 都要求 exact revision CAS。
+  任何业务 frame 发送前必须先提交 counter block reservation；reload 只从前一 reserved high-water 开始，
+  允许整块跳号但禁止 nonce/counter 回卷或复用。
+- `StreamBindingV1.inner_cursor` 表示 Relay publication cut，不是 reducer 已应用历史的唯一真相。directed
+  bootstrap 的 `RuntimeSyncComplete.inner_cursor` 可在线性化窗口内高于该 cut；恢复时 durable reducer cursor
+  只允许单调前进，后续 control ACK 只能推进 outer cursor，不能把 inner cursor 回退到旧 publication cut。
+  Catalog 与 Conversation live publication 可与 backfill overlap；低于或等于 durable cursor 的 exact overlap
+  只作为已应用数据忽略，出现 gap、target 变化或 cursor regression 必须 fail-close。
+- W2c reload 前必须先 durable 提交 paired state，reload 后在建立网络前完成 KEK 解密、canonical state 校验、
+  exact revision 与下一 counter reservation 提交。恢复沿用原 DeviceSign/DeviceHPKE、grant、authorization、
+  key directory 和 cursor，不允许重配对、另造 identity 或产生第二 Runtime。
+- self-revoke 的 MachineRoot-signed `RevocationCommittedV1` terminal 是权威完成证明。连接关闭可能使 directed
+  committed receipt 不可见；只有完整验证 root signature、machine/device route、grant serial/trust epoch 后
+  才能合成同义 committed receipt。随后原子删除 paired material/KEK 并写 revoked tombstone；旧 identity
+  必须在发送前 fail-close，不能靠新配对掩盖失败。
+- W2c automatic complete 只关闭单轮 durable 正向链路。W2.7 的完整 negative/zero-mutation matrix 与 W3 的
+  crash-cut、第二 tab、网络故障和三次 fresh run仍未完成；公网、物理设备、production signing/pin、第二台
+  Mac 与真实 vendor 继续是 W4 外部门禁。
 
 ### Relay Companion MVP P5.1 SessionSource facade 不变量
 

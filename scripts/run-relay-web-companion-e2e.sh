@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 web_root="$repo_root/web/relay-test-companion"
 
 usage() {
-  printf 'usage: %s --contract|--transport|--pairing|--business|--all\n' "$0" >&2
+  printf 'usage: %s --contract|--transport|--pairing|--business|--durable|--all\n' "$0" >&2
   exit 64
 }
 
@@ -44,6 +44,10 @@ run_business() {
   bash "$repo_root/scripts/run-relay-web-companion-business-e2e.sh"
 }
 
+run_durable() {
+  bash "$repo_root/scripts/run-relay-web-companion-durable-e2e.sh"
+}
+
 test "$#" -eq 1 || usage
 case "$1" in
   --contract)
@@ -58,11 +62,15 @@ case "$1" in
   --business)
     run_business
     ;;
+  --durable)
+    run_durable
+    ;;
   --all)
     run_contract
     run_transport
     run_pairing
     run_business
+    run_durable
     ;;
   *)
     usage

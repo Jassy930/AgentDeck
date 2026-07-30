@@ -71,6 +71,46 @@ declare global {
     approvalEventApplied: boolean;
     commandCompleted: boolean;
     outerAckCount: number;
+    durablePromoted: boolean;
+    durableRestored: boolean;
+    counterReservationStart: number;
+    counterReservationEnd: number;
+    reconnectAuthenticated: boolean;
+    recoveryCatalogBackfillCount: number;
+    recoveryConversationBackfillCount: number;
+    restartMarkerObserved: boolean;
+    revokeRouteAccepted: boolean;
+    revocationReceiptCommitted: boolean;
+    revocationTerminalVerified: boolean;
+    recoveryStage: string | null;
+  }>;
+
+  type PairedStorageEvidence = Readonly<{
+    pairedPresent: boolean;
+    kekPresent: boolean;
+    revokedPresent: boolean;
+    revision: number | null;
+    ciphertextBytes: number;
+  }>;
+
+  type W2DurableStartEvidence = Readonly<{
+    generation: number;
+    revision: number | null;
+    pairing: W2PairingEvidence;
+    business: W2BusinessEvidence | null;
+    storage: PairedStorageEvidence;
+    failureCode: string | null;
+  }>;
+
+  type W2DurableRecoveryEvidence = Readonly<{
+    generation: number;
+    revision: number | null;
+    preActivationNetworkLocked: boolean;
+    business: W2BusinessEvidence | null;
+    binaryFramesSent: number;
+    storage: PairedStorageEvidence;
+    reloadStatus: "active" | "revoked" | "missing";
+    failureCode: string | null;
   }>;
 
   type W2BusinessTransportEvidence = Readonly<{
@@ -100,6 +140,11 @@ declare global {
     ) => Promise<W1TransportEvidence>;
     runW2Pairing: (encodedInvite: string) => Promise<W2TransportEvidence>;
     runW2Business: (encodedInvite: string) => Promise<W2BusinessTransportEvidence>;
+    runW2DurableStart: (
+      encodedInvite: string,
+      profileId: string,
+    ) => Promise<W2DurableStartEvidence>;
+    runW2DurableRecover: (profileId: string) => Promise<W2DurableRecoveryEvidence>;
     initializeState: (profileId: string, payload: string) => Promise<DurableStateRecord>;
     readState: (profileId: string) => Promise<DurableStateRecord | null>;
     commitExactRevision: (
