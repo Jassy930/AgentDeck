@@ -66,8 +66,9 @@
   冻结、master 同步、协议治理与 P5.8-lite 本机确认 UI，当前只执行固定拓扑 Simulator E2E 和 automatic
   MVP 收口。每阶段都有入口、自动门禁、运行/UI 读回、证据、双路 review、cleanup 和 clean Git 状态退出
   条件；P6 与真实设备/公网/vendor 证据全部后置。
-- `plans/2026-07-30-relay-web-test-companion-design.md` 与配套 implementation：automatic MVP 收口后的候选
-  浏览器测试链路，状态为 Proposed。方案只允许 Rust/WASM 复用现有 Relay v2、Runtime v5 与 E2EE v1，
+- `plans/2026-07-30-relay-web-test-companion-design.md` 与配套 implementation：automatic MVP 收口后的
+  浏览器测试链路；W0 WASM/浏览器持久状态可行性已 automatic complete，W1 真实 Relay 直连尚未开始。
+  方案只允许 Rust/WASM 复用现有 Relay v2、Runtime v5 与 E2EE v1，
   TypeScript 只做 WebSocket/IndexedDB/UI host；按 W0–W3 关闭可行性、直连、业务与恢复 automatic 证据，
   W4 继续独立保留物理设备、公网与 production TLS 门禁。
 - `plans/2026-07-18-relay-companion-mvp-course-correction.md`：历史纠偏决策；其 Task 粒度门禁、Runtime

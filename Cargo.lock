@@ -143,6 +143,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentdeck-web-core"
+version = "0.1.0"
+dependencies = [
+ "agentdeck-crypto",
+ "agentdeck-protocol",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "agentdeckd"
 version = "0.1.0"
 dependencies = [
@@ -1089,8 +1103,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1112,9 +1128,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+ "wasm-bindgen",
 ]
 
 [[package]]

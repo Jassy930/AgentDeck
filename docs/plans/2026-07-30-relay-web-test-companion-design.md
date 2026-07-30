@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Proposed；仅完成方案评估，尚未进入代码实施 |
+| 状态 | W0 Implemented（automatic test scope）；W1 尚未开始 |
 | 日期 | 2026-07-30 |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
 | 目标 | 用浏览器直接复用 Relay v2 + E2EE v1，增加一条低成本、可重复的远程业务闭环 |
@@ -30,6 +30,11 @@ pair → list/open → prompt → approval → relaunch/reconnect → revoke
   `agentdeckd` 仍是唯一运行平台。
 - 本阶段只形成 automatic/test evidence。浏览器结果不能替代物理设备、公网、Keychain/FileProtection、
   第二台 Mac或 production-signed 证据。
+
+2026-07-30 已完成 W0：同一 Rust protocol/crypto 实现可原样编译为 browser WASM；Chrome 自动用例已关闭
+golden-vector parity、strict Relay/Runtime 负例、non-extractable WebCrypto KEK 的 IndexedDB structured clone、
+transaction abort rollback、exact revision CAS 与 Web Locks 第二 tab 拒绝。W0 没有新增业务 bridge、daemon、
+Relay/Runtime/E2EE 版本或 TypeScript wire/crypto owner；真实 Relay 连接仍属于 W1。
 
 ## 2. 目标与非目标
 

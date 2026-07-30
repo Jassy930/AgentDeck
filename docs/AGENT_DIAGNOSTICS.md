@@ -44,6 +44,25 @@ agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge
 stable UDS。diagnostics report 不启动 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志；不要把
 diagnostics override 当成 stable ownership 配置。
 
+## Relay Web Test Companion W0 failure codes
+
+W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，尚未连接 Relay。以下 code 只在本地
+测试 host 中出现；它们不进入 daemon diagnostic log，也不能解释为远端业务失败：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `web.remote.storage.invalidProfileId` | 测试 profile 不是 1–64 位小写字母、数字或连字符 | 修正测试隔离 ID；不要把用户输入或路径直接当 DB 名 |
+| `web.remote.storage.invalidActualRevision` | IndexedDB 中的 revision 不是非负 safe integer | 删除本轮隔离测试 profile 后重跑；真实实现进入 W2 前必须 fail-close 并保留取证 |
+| `web.remote.storage.revisionConflict` | current revision 与 expected 不同，出现 stale/sibling writer | 当前 transaction abort；重新读取唯一 current state，禁止 blind overwrite |
+| `web.remote.storage.nonExactNextRevision` | next 不是 `expected + 1` | 修正 state owner；不能跳号、回退或提交 sibling revision |
+| `web.remote.storage.stateMissing` | CAS 前没有初始化 state record | 重新执行本轮 fresh profile 初始化；不能在 CAS 中隐式创建 paired state |
+| `web.remote.storage.kekCloneFailed` | non-extractable `CryptoKey` 未能从 IndexedDB structured clone 读回 | 当前 Chromium 不满足 W0；停止 W1/W2，不得回退 extractable key 或明文 secret |
+| `web.remote.cleanup.unexpectedArtifacts` | PASS 后 Playwright output 除 `.last-run.json` 外仍有 trace/screenshot 等 artifact | 保留目录排查为何成功用例仍产出 artifact；不要让 cleanup 按目录递归删除证据 |
+
+若 W0 浏览器测试失败，先运行 `bun run check` 排除 TypeScript ownership 漂移，再用
+`bun run test:browser -- --grep W0` 复现。测试结束必须停止静态 server、关闭 tab/profile 并删除本轮
+IndexedDB profile；该 cleanup 不使用全局浏览器数据删除。
+
 ## Relay v1 历史 marker 与显式 reset
 
 当前 production binary 没有 v1 协议、兼容 feature 或自动迁移路径。CLI 只用

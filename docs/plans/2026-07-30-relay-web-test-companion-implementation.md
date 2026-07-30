@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Proposed；用户确认后从 W0 开始 |
+| 状态 | W0 automatic complete；W1 尚未开始 |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -33,7 +33,7 @@ pair → list/open → prompt → approval → reload/reconnect → revoke
 - E2E：Playwright Chromium；每轮隔离 user-data-dir、静态 server、Relay/daemon root 和测试证书。
 - 后端：既有 `agentdeck-relay` 与 `agentdeckd`；不得新增浏览器业务服务。
 
-拟新增路径：
+计划路径：
 
 ```text
 agentdeck-web-core/
@@ -42,6 +42,8 @@ scripts/run-relay-web-companion-e2e.sh
 scripts/tests/run-relay-web-companion-e2e.sh
 docs/plans/2026-07-30-relay-web-test-companion-*.md
 ```
+
+W0 已落地前两个目录和计划文档；Relay/daemon runner 只在 W1/W2 接入真实链路时新增，W0 不提前创建空壳。
 
 若 W0 发现必须大规模拆分 `agentdeck-cli`，先只抽取 transport-neutral state owner；不得把整个 CLI、Tokio
 transport、Keychain 或 filesystem adapter 编译进 WASM。
@@ -70,16 +72,16 @@ WebCrypto + Web Locks 能否支持 reload 所需的原子 durable state。
 
 ### Tasks
 
-- [ ] W0.1：建立 `agentdeck-web-core` 最小 crate，只暴露 Relay v2 codec、Runtime v5 envelope/KAT 和
+- [x] W0.1：建立 `agentdeck-web-core` 最小 crate，只暴露 Relay v2 codec、Runtime v5 envelope/KAT 和
   crypto golden-vector 测试入口；native 与 WASM 使用同一实现。
-- [ ] W0.2：建立 Bun workspace、TypeScript strict check、WASM build 和最小静态页面。
-- [ ] W0.3：在 Chromium 中逐字节核对 Relay codec、Runtime fixture、Ed25519、HPKE、AEAD KAT；加入
+- [x] W0.2：建立 Bun workspace、TypeScript strict check、WASM build 和最小静态页面。
+- [x] W0.3：在 Chromium 中逐字节核对 Relay codec、Runtime fixture、Ed25519、HPKE、AEAD KAT；加入
   wrong magic/version/length/signature/AAD 的负例。
-- [ ] W0.4：实现测试版 IndexedDB adapter，验证 non-extractable KEK structured clone、transaction rollback、
+- [x] W0.4：实现测试版 IndexedDB adapter，验证 non-extractable KEK structured clone、transaction rollback、
   exact revision CAS、Web Locks 单写者与第二 tab 拒绝。
-- [ ] W0.5：冻结 WASM host contract；静态扫描 TypeScript，确认不存在 wire kind 表、TBS、HPKE/AEAD 或
+- [x] W0.5：冻结 WASM host contract；静态扫描 TypeScript，确认不存在 wire kind 表、TBS、HPKE/AEAD 或
   private key解析实现。
-- [ ] W0.6：更新文档、读回 cleanup 和 Git，形成 W0 scoped commit。
+- [x] W0.6：更新文档、读回 cleanup 和 Git，形成 W0 scoped commit。
 
 ### Gates
 
@@ -113,6 +115,22 @@ git status --short --branch
 
 只有“无 TypeScript 协议/crypto 复制 + WASM KAT parity + storage 原子性”全部 PASS 才进入 W1。任一项失败，
 状态写为 `BLOCKED` 并回到设计评审；禁止改走 local bridge 或 TS 重写来伪造 W0 PASS。
+
+### W0 完成证据（2026-07-30）
+
+- 首个真实 WASM RED 为 `getrandom` browser backend 未启用；修复只在 `agentdeck-web-core` 的 wasm target
+  依赖图打开 `getrandom 0.2/js` 与 `getrandom 0.4/wasm_js`，native crate 行为未变。
+- `cargo test -p agentdeck-web-core`：1 个共享 contract integration test 通过；native 与 WASM 均由现有
+  `agentdeck-protocol` / `agentdeck-crypto` 产生 Relay Hello、Runtime request roundtrip 与 11 项 KAT 字节。
+- `bun run check` 与 `bun run test:unit`：strict TypeScript、protocol-owner 静态扫描和 exact revision 纯函数
+  2/2 通过。
+- `bun run test:browser -- --grep W0`：本机 Chrome 4/4 通过，覆盖 wrong magic/version/kind/length、Runtime
+  unknown field、Ed25519/HPKE ciphertext/info/AAD tamper、IndexedDB KEK structured clone、abort rollback、
+  sibling/skipped CAS、第二 tab writer 拒绝/交接与 CSP。
+- 浏览器页面自检读回 `W0 核心通过`、共享向量 `11`、密码学负例 `4/4`，console error 为空；测试页面、
+  静态 server、浏览器 tab/profile 与生成目录均由测试或 `.gitignore` 收口，不提交构建产物。
+- 该证据只关闭 W0 可行性；没有连接真实 Relay，也不改变物理设备、公网 WSS、production SPKI pin 和
+  iOS Simulator 权威路径的状态。
 
 ## 5. Phase W1：浏览器直连 Relay v2 / E2EE
 
@@ -287,7 +305,7 @@ W4 不由本机 automatic 结果自动解锁。进入前另建执行授权和证
 
 ## 9. 总体收口清单
 
-- [ ] W0 证明 WASM parity 与 IndexedDB/Web Locks durable contract。
+- [x] W0 证明 WASM parity 与 IndexedDB/Web Locks durable contract。
 - [ ] W1 浏览器直连真实 Relay v2/E2EE，无业务 bridge。
 - [ ] W2 完成完整远程业务流，iOS E2E 不回归。
 - [ ] W3 crash/restart/tab contention 与三次 fresh run 全绿。

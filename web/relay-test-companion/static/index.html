@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="codex">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AgentDeck Relay Test Companion</title>
+    <link rel="stylesheet" href="/tokens.css" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/main.js"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <span class="eyebrow">AGENTDECK · AUTOMATIC TEST SCOPE</span>
+        <h1>Relay Web Test Companion</h1>
+        <p>
+          浏览器只承载 UI、IndexedDB 与 Web Locks；Relay v2、Runtime v5 和 E2EE v1
+          由同一 Rust/WASM 核心负责。
+        </p>
+      </header>
+
+      <section class="gate" aria-labelledby="gate-title">
+        <div>
+          <span class="gate-label">当前门禁</span>
+          <h2 id="gate-title">W0 · 可行性闭环</h2>
+        </div>
+        <span id="w0-status" class="status" data-state="idle" aria-live="polite">等待验证</span>
+      </section>
+
+      <section class="cards" aria-label="验证边界">
+        <article>
+          <span class="ordinal">01</span>
+          <h3>共享核心</h3>
+          <p>同一份 Rust codec 与密码学实现编译为 WASM，不在 TypeScript 复制协议。</p>
+        </article>
+        <article>
+          <span class="ordinal">02</span>
+          <h3>持久状态</h3>
+          <p>验证不可导出 KEK、exact revision CAS、事务回滚和多标签页单写者。</p>
+        </article>
+        <article>
+          <span class="ordinal">03</span>
+          <h3>完成边界</h3>
+          <p>本页只形成自动化证据，不替代公网 WSS、物理设备或 production SPKI pin。</p>
+        </article>
+      </section>
+
+      <section class="runner">
+        <div>
+          <h2>本页核心自检</h2>
+          <p>运行共享向量与密码学篡改负例；完整 storage/locking 由浏览器测试执行。</p>
+        </div>
+        <button id="run-selfcheck" type="button">运行 W0 自检</button>
+        <pre id="evidence" aria-live="polite">尚未生成证据</pre>
+      </section>
+    </main>
+  </body>
+</html>

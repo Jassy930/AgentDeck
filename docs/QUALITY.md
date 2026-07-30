@@ -20,6 +20,32 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
+## Relay Web Test Companion W0 门禁（2026-07-30）
+
+W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
+`web/relay-test-companion/` 后运行：
+
+```bash
+cargo test -p agentdeck-web-core
+cargo build -p agentdeck-web-core --target wasm32-unknown-unknown
+
+cd web/relay-test-companion
+bun install --frozen-lockfile
+bun run check
+bun run test:unit
+bun run test:browser -- --grep W0
+```
+
+浏览器门禁固定使用本机 Chrome channel，不下载独立浏览器。4 个 W0 用例必须同时关闭：Rust/WASM
+Relay/Runtime/crypto byte parity 与变异负例、non-extractable WebCrypto KEK 的 IndexedDB structured clone、
+transaction abort rollback + exact revision CAS，以及 Web Locks 第二 tab 单写者拒绝与 lease 交接。
+`scripts/check-protocol-ownership.ts` 必须保持 TypeScript 无 Relay/Runtime wire、TBS、HPKE/AEAD owner。
+
+W0 PASS 只写为 `automatic test scope`：真实 Relay v2/WSS/E2EE 直连从 W1 开始；公网、物理设备、
+production SPKI pin、Keychain/FileProtection 和真实 vendor 仍不得由浏览器本机结果替代。生成的 `dist/`、
+`generated/`、Playwright profile/report 与测试结果不入库；阶段退出还须读回静态 server/browser 已停止、
+`scripts/verify-agent-docs.sh`、`git diff --check` 和 Git 状态。
+
 ## Relay Companion MVP Task 粒度门禁（2026-07-18）
 
 Relay Companion 主线恢复 Task 粒度执行。B3a、B3b、B4、B5、C0-C、P3.9-A/B/C3/D/E 及后续编号

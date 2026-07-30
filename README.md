@@ -232,6 +232,33 @@ paired records 构造真实 `RelaySessionSource`；fixture 参数和安装入口
 `agentdeck-pair:v1:` 邀请，本地 inspect 和信任预览完成前零网络，用户确认后才发起配对。以上自动证据
 不替代 P5.9 的真实 temp TLS Relay + P4 daemon + synthetic vendor 端到端编排，也不替代物理设备或公网验收。
 
+## Relay Web Test Companion（W0 automatic complete）
+
+`agentdeck-web-core` 已证明现有 Relay v2 codec、Runtime v5 request contract 与 E2EE v1 crypto 可以复用同一
+Rust 实现编译为 browser WASM；`web/relay-test-companion` 是 Bun 管理的最小测试页面与 host adapter，
+TypeScript 只负责页面、IndexedDB 与 Web Locks，不拥有 wire、TBS、HPKE/AEAD 或 private-key 解析逻辑。
+
+W0 的 Chrome 自动门禁已覆盖 11 项共享向量、Relay/Runtime/crypto 负例、不可导出 WebCrypto KEK 的
+IndexedDB structured clone、transaction rollback、exact revision CAS、第二 tab 单写者拒绝/交接与 CSP：
+
+```bash
+cargo test -p agentdeck-web-core
+cargo build -p agentdeck-web-core --target wasm32-unknown-unknown
+cd web/relay-test-companion
+bun install --frozen-lockfile
+bun run check
+bun run test:unit
+bun run test:browser -- --grep W0
+```
+
+本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
+`http://127.0.0.1:4173/`；停止 server 后不保留业务或配对状态。
+
+这仍不是完整网页版或真实远程链路。浏览器直连 Relay、pair/list/open/prompt/approval/reload/revoke 分别属于
+W1/W2；公网 WSS、production SPKI pin、物理设备、第二台 Mac 与真实 vendor 继续独立 BLOCKED，不因 W0
+通过而改变。阶段事实源见
+[`Relay Web Test Companion 实施计划`](docs/plans/2026-07-30-relay-web-test-companion-implementation.md)。
+
 ## Relay Companion MVP 实施状态（P5.8-lite automatic complete；P5 为 8/9）
 
 2026-07-28 起，剩余 Relay 工作按
