@@ -25,6 +25,32 @@ declare global {
     payload: string;
   }>;
 
+  type W2PairingPreview = Readonly<{
+    machineDisplayName: string;
+    machineRootFingerprint: string;
+  }>;
+
+  type W2PairingEvidence = Readonly<{
+    fingerprintConfirmed: boolean;
+    authenticated: boolean;
+    pendingObserved: boolean;
+    responseVerified: boolean;
+    receiptSent: boolean;
+    routeAcceptedObserved: boolean;
+    paired: boolean;
+    machineRoutePresent: boolean;
+    deviceRoutePresent: boolean;
+  }>;
+
+  type W2TransportEvidence = Readonly<{
+    generation: number;
+    preview: W2PairingPreview;
+    preConfirmNetworkLocked: boolean;
+    binaryFramesSent: number;
+    pairing: W2PairingEvidence;
+    failureCode: string | null;
+  }>;
+
   type RelayTestApi = Readonly<{
     contractSnapshot: () => Promise<Record<string, string>>;
     negativeSnapshot: () => Promise<Record<string, boolean>>;
@@ -38,6 +64,7 @@ declare global {
       relayServerIdHex: string,
       caseName: W1TransportCase,
     ) => Promise<W1TransportEvidence>;
+    runW2Pairing: (encodedInvite: string) => Promise<W2TransportEvidence>;
     initializeState: (profileId: string, payload: string) => Promise<DurableStateRecord>;
     readState: (profileId: string) => Promise<DurableStateRecord | null>;
     commitExactRevision: (

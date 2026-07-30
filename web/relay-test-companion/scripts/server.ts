@@ -6,7 +6,8 @@ const wasmOutput = resolve(webRoot, "generated/agentdeck-web-core");
 const port = Number.parseInt(process.env.RELAY_WEB_TEST_PORT ?? "4173", 10);
 
 function relayConnectSource(): string {
-  const configured = process.env.AGENTDECK_W1_WSS_ORIGIN;
+  const configured =
+    process.env.AGENTDECK_WEB_WSS_ORIGIN ?? process.env.AGENTDECK_W1_WSS_ORIGIN;
   if (configured === undefined) {
     return "'self'";
   }

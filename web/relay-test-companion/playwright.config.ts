@@ -1,6 +1,7 @@
 import { defineConfig } from "@playwright/test";
 
-const testSpkiPin = process.env.AGENTDECK_W1_TEST_SPKI_PIN;
+const testSpkiPin =
+  process.env.AGENTDECK_WEB_TEST_SPKI_PIN ?? process.env.AGENTDECK_W1_TEST_SPKI_PIN;
 if (testSpkiPin !== undefined && !/^[A-Za-z0-9+/]{43}=$/u.test(testSpkiPin)) {
   throw new Error("web.remote.test_spki_pin_invalid");
 }

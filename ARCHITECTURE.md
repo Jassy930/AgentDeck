@@ -764,6 +764,23 @@ conversation/key，不能伪造身份连续性。
   complete。该完成边界不覆盖 production-signed Keychain/LaunchAgent、真实 vendor、公网 WSS、物理
   iPhone/第二台 Mac 或 destructive purge；这些真实槽位继续保持 post-MVP BLOCKED。
 
+### Relay Web Test Companion W2a pairing 不变量
+
+- 浏览器没有第二套 Runtime、daemon 或 UDS→HTTP bridge。`agentdeck-web-core` 直接复用
+  `agentdeck-protocol` / `agentdeck-crypto`，TypeScript 只管理 WebSocket generation、deadline、opaque
+  binary forwarding 和脱敏 view state。
+- PairInvite inspect 完全本地执行，只投影 machine display name 与完整 MachineRoot fingerprint。exact
+  fingerprint 确认前 `connectUrl` 不可用；确认后 endpoint 只能是邀请固定 root WSS 下的 `/v2/pair`。
+- DeviceSign、DeviceHPKE、PairRequest proof、PairPending/PairResponse open 与
+  PairResponseReceived receipt 始终由 Rust/WASM 持有；private key、TBS、invite secret、grant 和 raw key
+  directory 不导出给 TypeScript。WASM 熵由 browser `getrandom` backend 提供，native contract 才允许固定 seed。
+- 被控 machine 的授权赢家仍只能来自 existing same-UID `LocalPairingAdministration`；浏览器受限 pairing
+  connection 不能远程 confirm。只有 verified response 后发出的 receipt 加 matching
+  `PairRouteClosed::Closed` 才是 paired terminal，`Authenticated` 或 `RouteAccepted` 均不能冒充成功。
+- W2a 会在内存中保留完整 `VerifiedPairResponseV1`，为 W2b paired principal promotion 提供能力；当前不写
+  IndexedDB、不承诺 reload/reconnect。W2b 才接 list/open/prompt/approval，W2c 再接 durable promotion、
+  reload/reconnect/revoke。
+
 ### Relay Companion MVP P5.1 SessionSource facade 不变量
 
 - 依赖方向固定为 `AgentDeckCore <- AgentDeckSessionSource <- AgentDeckRelayClient <- macOS/iOS app`；

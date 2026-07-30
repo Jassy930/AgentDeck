@@ -34,6 +34,11 @@ pub use w1::{
     w1_test_identity,
 };
 
+#[cfg(feature = "w2-test-fixture")]
+mod w2;
+#[cfg(feature = "w2-test-fixture")]
+pub use w2::{W2PairingCore, W2PairingError, W2PairingEvidence, W2PairingPreview};
+
 const ED_SEED: [u8; 32] = [0x01; 32];
 const AEAD_KEY: [u8; 32] = [0x11; 32];
 const NONCE_PREFIX: [u8; 4] = [0xaa, 0xbb, 0xcc, 0xdd];
@@ -138,6 +143,15 @@ impl TryRng for DeterministicRng {
 }
 
 impl TryCryptoRng for DeterministicRng {}
+
+impl Drop for DeterministicRng {
+    fn drop(&mut self) {
+        self.seed.fill(0);
+        self.buffer.fill(0);
+        self.counter = 0;
+        self.position = self.buffer.len();
+    }
+}
 
 fn hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);

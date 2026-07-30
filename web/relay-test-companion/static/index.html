@@ -22,9 +22,12 @@
       <section class="gate" aria-labelledby="gate-title">
         <div>
           <span class="gate-label">当前门禁</span>
-          <h2 id="gate-title">W1 · 真实 Relay 直连</h2>
+          <h2 id="gate-title">W2a · 浏览器真实配对</h2>
         </div>
-        <span id="w1-status" class="status" data-state="idle" aria-live="polite">等待验证</span>
+        <div class="gate-statuses">
+          <span id="w1-status" class="status" data-state="idle" aria-live="polite">W1 等待验证</span>
+          <span id="w2-status" class="status" data-state="idle" aria-live="polite">W2a 等待验证</span>
+        </div>
       </section>
 
       <section class="cards" aria-label="验证边界">
@@ -41,7 +44,7 @@
         <article>
           <span class="ordinal">03</span>
           <h3>完成边界</h3>
-          <p>直连临时 TLS Relay 并验证密封路由；不替代公网 WSS、物理设备或 production SPKI pin。</p>
+          <p>直连临时 TLS Relay，完成本机批准的配对终态；不替代公网 WSS、物理设备或 production SPKI pin。</p>
         </article>
       </section>
 

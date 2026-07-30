@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1 automatic complete；W2 尚未开始 |
+| 状态 | W0/W1/W2a automatic complete；W2b/W2c 尚未开始 |
 | 日期 | 2026-07-30 |
 | 设计事实源 | `2026-07-30-relay-web-test-companion-design.md` |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
@@ -200,11 +200,20 @@ git status --short --branch
 复用现有 R4 fixed-topology host，把远程 UI 从 iOS Simulator 扩展为独立浏览器 principal，完成一条完整
 业务闭环；iOS E2E 继续保留并作为回归门禁。
 
+为避免再次把大功能一次铺开，W2 固定拆成三个可独立提交、独立验证的子阶段：
+
+1. **W2a pairing**：invite inspect、确认前零网络、真实 `/v2/pair`、本机批准与 paired terminal。
+2. **W2b business**：paired principal 的 list/open/prompt/approval。
+3. **W2c durability**：IndexedDB promotion、reload/reconnect/backfill 与 revoke。
+
+只有 W2c 完成后才能标记 W2 complete。
+
 ### Tasks
 
-- [ ] W2.1：实现 PairInvite paste/inspect/trust preview；确认前零网络，确认后才连 `/v2/pair`。
+- [x] W2.1：实现 PairInvite paste/inspect/trust preview；确认前零网络，确认后才连 `/v2/pair`。
 - [ ] W2.2：复用 WASM HPKE/签名和 durable state 完成 pair request/response/terminal；被控 Mac 仍只经
-  existing same-UID `LocalPairingAdministration` approve/cancel。
+  existing same-UID `LocalPairingAdministration` approve/cancel。W2a 已完成内存态 request/response/terminal
+  与 verified material 保留；IndexedDB paired promotion 和 reload recovery 留给 W2c，所以本项尚未整体勾选。
 - [ ] W2.3：实现最小 machine/catalog/conversation 页面和 open/prompt/approval 操作；UI 只消费 typed
   WASM view state。
 - [ ] W2.4：runner 串起真实 RuntimeCore/RemoteLink、synthetic Codex/Claude Code、Relay 和浏览器，读回
@@ -230,6 +239,22 @@ scripts/verify-agent-docs.sh
 git diff --check
 git status --short --branch
 ```
+
+### W2a 完成证据（2026-07-30）
+
+- `W2PairingCore` native contract `2/2`：canonical invite 本地 inspect、完整 fingerprint preview、确认前
+  `connectUrl` 拒绝、wrong fingerprint 零解锁、确认后 endpoint 精确为 `/v2/pair`、Hello/PairingHello
+  类型正确，MachineRoot 绑定篡改和 Hello replay fail-close。
+- WASM 使用 browser `getrandom` 生成 DeviceSign/DeviceHPKE/HPKE RNG 材料；TypeScript 不取得 private key、
+  TBS、invite secret、grant 或 key directory，只创建 WebSocket、转发 opaque binary 并消费脱敏 evidence。
+- `scripts/run-relay-web-companion-e2e.sh --pairing` fresh PASS：真实 Chrome→temp Direct TLS Relay→唯一
+  daemon/RemoteLink→same-UID local approve，读回 PairPending、verified PairResponse、receipt 与
+  `PairRouteClosed::Closed`。批准前为 `pending=1/grant=0/runtimeCommand=0`，终态为
+  `pending=0/activeGrant=1/activeTransition=0/catalogStream=1/runtimeCommand=0`。
+- browser/host PID、host root、0600 invite、UDS 与 Playwright artifacts 全部 absent；Relay DB/WAL/SHM 中
+  Web device display name 明文 absent。没有新增 Web daemon、本地 bridge、UDS→HTTP 或第二 Runtime。
+- 本证据只关闭 W2a。verified response/key directory 仍只在 WASM 内存，W2b/W2c 与 W2 overall 保持未完成；
+  iOS regression、物理设备、公网、production pin 和真实 vendor 状态均未由本切片改变。
 
 ### Required readback
 

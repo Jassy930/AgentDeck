@@ -2308,6 +2308,8 @@ struct P57HostReady {
     invite_path: String,
     runtime_database_path: String,
     relay_database_path: String,
+    relay_wss_origin: String,
+    relay_spki_pin_base64: String,
     pid: u32,
     invite_file_mode: u32,
     daemon_generation: u64,
@@ -3374,6 +3376,8 @@ async fn p57_real_dual_scope_ndjson_host() {
         panic!("P5.7 host create PairInvite returned unrelated Runtime reply");
     };
     let invite_path = write_p57_host_invite(&root_path, invite_reply.invite.as_ref());
+    let relay_wss_origin = invite_reply.invite.wss_url.clone();
+    let relay_spki_pin_base64 = STANDARD.encode(invite_reply.invite.current_spki_pin);
     let invite_file_mode = fs::symlink_metadata(&invite_path)
         .expect("read P5.7 host invite mode")
         .permissions()
@@ -3403,6 +3407,8 @@ async fn p57_real_dual_scope_ndjson_host() {
         invite_path: invite_path.to_string_lossy().into_owned(),
         runtime_database_path: config.paths().runtime_db.to_string_lossy().into_owned(),
         relay_database_path: relay_db.to_string_lossy().into_owned(),
+        relay_wss_origin,
+        relay_spki_pin_base64,
         pid: std::process::id(),
         invite_file_mode,
         daemon_generation,

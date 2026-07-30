@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | W0/W1 automatic complete；W2 尚未开始 |
+| 状态 | W0/W1/W2a automatic complete；W2b/W2c 尚未开始 |
 | 日期 | 2026-07-30 |
 | 基线 | `codex/relay-mvp-rescue` / `2aec190` / tree `27c8fbb` |
 | 目标 | 用浏览器直接复用 Relay v2 + E2EE v1，增加一条低成本、可重复的远程业务闭环 |
@@ -42,6 +42,12 @@ SQLite frame，wrong identity、challenge/signature 篡改、Authenticate replay
 unavailable 均为零新增 frame；DB/WAL/SHM、浏览器输出和临时 root 未发现 sentinel 明文。该证据使用隔离
 Chrome 精确 SPKI 参数与 `w1-test-fixture` 固定 identity，只是 automatic test policy；`/v2/pair` 和完整业务
 链路仍属于 W2，不能外推为 production pin 或完整网页版。
+
+W2a 已继续复用 P5.9 fixed-topology host，关闭浏览器本地 PairInvite inspect、完整 fingerprint 确认前零网络、
+真实 `/v2/pair`、same-UID 本机批准和 matching Closed terminal。PairRequest/Pending/Response/receipt 均由
+Rust/WASM 处理，TypeScript 仍只转发 opaque binary。该切片把 verified response/key directory 留在 WASM
+内存，但尚未做 IndexedDB paired promotion，也未建立 principal connection；因此 list/open/prompt/approval
+归 W2b，reload/reconnect/revoke 归 W2c，W2 整体仍未完成。
 
 ## 2. 目标与非目标
 
@@ -181,7 +187,9 @@ WebSocket API 不暴露 peer certificate，也不允许应用执行等价的 SPK
 |---|---|---|---|
 | W0 可行性 | Rust codec/crypto 能否原样复用到 WASM；浏览器 storage 能否安全提交 | golden vector byte parity、WASM build、IndexedDB/Web Locks 正反例 | 真实 Relay 业务 |
 | W1 直连 | 浏览器能否直接完成真实 Relay v2 TLS/Hello/auth/E2EE 传输 | temp TLS Relay、binary WSS、challenge/auth、tamper/replay、明文扫描 | pairing/业务 UI、production pin |
-| W2 纵向业务 | 网页能否完成完整远程用户流 | pair/list/open/prompt/approval/reload/reconnect/revoke 与 exactly-once | 物理/公网/真实 vendor |
+| W2a 配对 | 浏览器能否在零 bridge 下完成本机批准的真实配对 | local inspect、确认前零网络、PairPending、same-UID approve、verified receipt/Closed | paired durability、业务 principal、物理/公网 |
+| W2b 业务 | paired principal 能否完成最小远程操作 | list/open/prompt/approval 与 exactly-once | reload/recovery/revoke、物理/公网 |
+| W2c 恢复 | paired state 能否跨页面与连接恢复并安全撤销 | IndexedDB promotion、reload/reconnect、cursor/backfill、revoke | crash-cut 三轮与外部证据 |
 | W3 恢复隔离 | 浏览器 crash/tab contention/Relay restart 是否可重复收敛 | 三个 durable cut、旧 generation、第二 tab、网络中断、三次 fresh run、cleanup | 跨物理网络和系统 Keychain |
 | W4 外部槽位 | 公网和独立设备是否真实可用 | 独立 runner 的真实输入、证据与 readback | automatic 本机结果不能代替 |
 

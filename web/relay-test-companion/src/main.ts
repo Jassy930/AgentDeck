@@ -8,6 +8,7 @@ import {
   type WriterLease,
 } from "./storage.ts";
 import { runW1Transport, type W1WasmSessionConstructor } from "./w1-transport.ts";
+import { runW2Pairing, type W2WasmSessionConstructor } from "./w2-transport.ts";
 
 type WebCoreModule = Readonly<{
   default: () => Promise<unknown>;
@@ -18,6 +19,7 @@ type WebCoreModule = Readonly<{
   w0RuntimeRequestRoundtrip: (bytes: Uint8Array) => Uint8Array;
   w0CryptoTamperIsRejected: () => boolean;
   W1Session?: W1WasmSessionConstructor;
+  W2PairingSession?: W2WasmSessionConstructor;
 }>;
 
 const wasmModuleUrl = "/wasm/agentdeck_web_core.js";
@@ -80,6 +82,21 @@ const api: RelayTestApi = {
     if (status !== null) {
       status.dataset.state = result.sentinelAccepted ? "passed" : "failed";
       status.textContent = result.sentinelAccepted ? "W1 真实 Relay 通过" : result.failureCode;
+    }
+    return result;
+  },
+  async runW2Pairing(encodedInvite) {
+    const constructor = (await corePromise).W2PairingSession;
+    if (constructor === undefined) {
+      throw new Error("web.remote.w2_fixture_unavailable");
+    }
+    const result = await runW2Pairing(constructor, encodedInvite);
+    const status = document.querySelector<HTMLElement>("#w2-status");
+    if (status !== null) {
+      status.dataset.state = result.pairing.paired ? "passed" : "failed";
+      status.textContent = result.pairing.paired
+        ? "W2a 真实配对通过"
+        : (result.failureCode ?? "W2a 配对失败");
     }
     return result;
   },

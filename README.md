@@ -265,12 +265,23 @@ W1 的负例覆盖 wrong server identity、challenge/signature 篡改、Authenti
 主动断开与 Relay unavailable；Relay 重启后的重复发布保持幂等，SQLite 中仍只有一条 sealed frame。测试还会
 扫描 Relay DB/WAL/SHM、浏览器输出与临时目录，拒绝 sentinel 明文落盘。
 
+W2a 已复用同一 fixed-topology host 完成浏览器真实配对：WASM 本地 inspect PairInvite，只展示机器名和完整
+MachineRoot fingerprint；确认前不能取得连接 URL，确认后只解锁 `/v2/pair`。PairRequest、PairPending、
+PairResponse 验证和 PairResponseReceived receipt 全由 Rust/WASM 持有，本机仍通过 existing same-UID
+`LocalPairingAdministration` 批准。统一 runner 会读回批准前 `pending=1/grant=0`，以及 paired terminal 后
+`pending=0/activeGrant=1/activeTransition=0/catalogStream=1`：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --pairing
+```
+
 本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
 `http://127.0.0.1:4173/`；停止 server 后不保留业务或配对状态。
 
-这仍不是完整网页版或完整远程业务链路。W1 只关闭 test TLS policy 下的 `/v2/connect` 鉴权与 sealed route；
-pair/list/open/prompt/approval/reload/revoke 仍属于 W2。公网 WSS、production SPKI pin、物理设备、第二台 Mac
-与真实 vendor 继续独立 BLOCKED，不因 W0/W1 通过而改变。阶段事实源见
+这仍不是完整网页版或完整远程业务链路。W2a 只关闭 test TLS policy 下的浏览器配对事务，已验证的
+grant/key directory 目前只保留在 WASM 内存；尚未写入 IndexedDB paired state，也没有建立 principal
+`/v2/connect`。list/open/prompt/approval 属于 W2b，reload/reconnect/revoke 属于 W2c。公网 WSS、production
+SPKI pin、物理设备、第二台 Mac 与真实 vendor 继续独立 BLOCKED，不因 W0/W1/W2a 通过而改变。阶段事实源见
 [`Relay Web Test Companion 实施计划`](docs/plans/2026-07-30-relay-web-test-companion-implementation.md)。
 
 ## Relay Companion MVP 实施状态（P5.8-lite automatic complete；P5 为 8/9）

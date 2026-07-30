@@ -108,6 +108,13 @@ h1 {
   background: var(--danger-weak);
 }
 
+.gate-statuses {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .cards {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -208,6 +215,10 @@ pre {
 
   .status {
     align-self: flex-start;
+  }
+
+  .gate-statuses {
+    justify-content: flex-start;
   }
 }
 

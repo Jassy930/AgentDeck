@@ -44,7 +44,7 @@ agentdeck remote trust-reset --admin-purge-receipt-file /secure/path/admin-purge
 stable UDS。diagnostics report 不启动 daemon，仍可用 `--profile dev` 或 `--data-dir` 读取旧日志；不要把
 diagnostics override 当成 stable ownership 配置。
 
-## Relay Web Test Companion W0/W1 failure codes
+## Relay Web Test Companion W0/W1/W2a failure codes
 
 W0 页面与 Playwright harness 只验证 browser storage/locking 可行性，尚未连接 Relay。以下 code 只在本地
 测试 host 中出现；它们不进入 daemon diagnostic log，也不能解释为远端业务失败：
@@ -73,10 +73,26 @@ W1 额外使用以下本地 test-host code；它们同样不进入 daemon diagno
 | `web.remote.sentinel_not_accepted` | 有界接收窗口内未见精确 stream receipt | 检查 Relay route/store 日志与 generation；不得仅凭 Authenticated 宣布 W1 PASS |
 | `web.remote.cleanup.unexpectedArtifacts` | PASS 后仍有 trace/screenshot/test result | 保留失败证据定位；成功收口必须让 `test-results/` absent |
 
+W2a 的 pairing core 使用以下 code。它们只证明 automatic 浏览器配对切片，不代表 paired state 已经可跨 reload
+恢复：
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `web.remote.pairing.invite_invalid` | PairInvite 非 canonical、过期、TTL/URL/identity 绑定非法 | 停止在本地 inspect；重新从被控 Mac 生成邀请，不建立 WebSocket |
+| `web.remote.pairing.root_fingerprint_mismatch` | 用户确认值与完整 MachineRoot fingerprint 不逐字相同 | 保持确认前零网络；重新核对带外 fingerprint，禁止短码或模糊匹配 |
+| `web.remote.pairing.state_invalid` | Hello/PairingHello/frame 在错误 phase 调用或发生重放 | 关闭当前 generation；不得跳阶段、补发或用 transport 状态伪造 paired |
+| `web.remote.pairing.handshake_rejected` / `relay_rejected` | `/v2/pair` 未返回有效 Authenticated，或 Relay 拒绝 route | 保留本轮邀请与 host 证据；核对 Relay identity、route expiry 和唯一 pairing writer |
+| `web.remote.pairing.frame_invalid` / `route_mismatch` | PairData carrier、request hash、route 或 terminal 不匹配 | 视为安全失败并关闭 generation；不产生 grant promotion 或业务连接 |
+| `web.remote.pairing.crypto_failed` | PairPending/PairResponse 的 HPKE、签名、证书、grant/authorization/key directory 任一验证失败 | 丢弃本轮内存材料；不得把裸 response 或部分字段降级为 paired state |
+| `web.remote.pairing.entropy_unavailable` | browser WASM 无法取得三组独立随机 seed | 确认后仍停止在网络前；不得使用固定 seed、Math.random 或 TypeScript 私钥生成 |
+| `web.remote.pairing.outcome_unknown` / `web.remote.pairing.timeout` | restart、AlreadyAbsent、EOF 或 deadline 前没有 matching Closed | W2a 不宣称成功；W2c durable recovery 接入前只能重新执行 fresh automatic run |
+| `web.remote.pairing.serialization_failed` | 脱敏 preview/evidence 无法序列化 | 关闭测试页并调查 Rust view model；不得把 raw wire/crypto bytes交给 UI 兜底 |
+
 W0 失败先运行 `bun run check` 和 `bun run test:browser -- --grep W0`。W1 失败用
 `scripts/run-relay-web-companion-e2e.sh --contract` 区分 contract/ownership，再用 `--transport` 复现真实
-Chrome→Relay 路径。测试结束必须停止静态 server、关闭 tab/profile、Relay 并删除本轮精确临时 root；
-cleanup 不使用全局浏览器数据或全局进程名删除。
+Chrome→Relay 路径。W2a 失败用 `--pairing` 重放 fresh fixed-topology host，并以 runner 输出和 host NDJSON
+区分 pre-confirm、pending、local approve、receipt/Closed 或 cleanup 阶段。测试结束必须停止静态 server、关闭
+tab/profile、Relay/daemon 并删除本轮精确临时 root；cleanup 不使用全局浏览器数据或全局进程名删除。
 
 ## Relay v1 历史 marker 与显式 reset
 

@@ -20,7 +20,7 @@ cargo test -p agentdeckd --test daemon_namespace --test storage_kek \
 cargo run -p agentdeckd -- --ephemeral --no-remote --profile dev --selfcheck
 ```
 
-## Relay Web Test Companion W0/W1 门禁（2026-07-30）
+## Relay Web Test Companion W0/W1/W2a 门禁（2026-07-30）
 
 W0 只验证 browser WASM 与 durable storage 可行性，不连接真实 Relay。改动 `agentdeck-web-core/` 或
 `web/relay-test-companion/` 后运行：
@@ -63,8 +63,28 @@ disconnect 和 unavailable 均须失败且不增加 frame。Relay DB/WAL/SHM、�
 
 `w1-test-fixture` 只允许进入 W1 automatic build；固定测试私钥、TBS 与 AEAD plaintext 不得导出给 TypeScript，
 普通 W0 build 不含该 feature。Chrome 的精确 SPKI 参数只信任本轮 fresh `localhost` 证书，是隔离测试策略，
-不是 production pin。W1 PASS 只关闭 `/v2/connect` 的 test TLS/Relay v2 鉴权与 sealed route；`/v2/pair`、
-pair/list/open/prompt/approval/reload/revoke 从 W2 开始。
+不是 production pin。W1 PASS 只关闭 `/v2/connect` 的 test TLS/Relay v2 鉴权与 sealed route。
+
+W2a 的单命令门禁如下：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --pairing
+cargo test -p agentdeck-web-core --features w1-test-fixture,w2-test-fixture
+cargo clippy -p agentdeck-web-core --all-targets \
+  --features w1-test-fixture,w2-test-fixture -- -D warnings
+cargo build -p agentdeck-web-core --target wasm32-unknown-unknown \
+  --features w2-test-fixture
+bash scripts/tests/run-relay-web-companion-e2e.sh
+```
+
+runner 必须复用 P5.9 fixed-topology host，依次读回本地 preview、确认前 `connectUrl` 拒绝、真实
+`/v2/pair`、pending=1/grant=0、same-UID approve、verified response/receipt/Closed，以及最终
+pending=0/active grant=1/active transition=0/catalog stream=1。browser/host PID、host root、邀请、UDS 和
+Playwright artifacts 必须 absent；Relay DB/WAL/SHM 不得出现 Web device display name 明文。
+
+W2a PASS 不代表 W2 complete。当前没有 IndexedDB paired promotion 或 principal `/v2/connect`；
+list/open/prompt/approval 属于 W2b，reload/reconnect/revoke 与 crash recovery 属于 W2c。物理设备、公网、
+production SPKI pin、真实 vendor 继续 BLOCKED。
 
 ## Relay Companion MVP Task 粒度门禁（2026-07-18）
 

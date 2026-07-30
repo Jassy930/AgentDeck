@@ -7,7 +7,11 @@ const repositoryRoot = resolve(webRoot, "../..");
 const wasmOutput = resolve(webRoot, "generated/agentdeck-web-core");
 const distribution = resolve(webRoot, "dist");
 const requestedFeatures = process.env.AGENTDECK_WEB_CORE_FEATURES;
-if (requestedFeatures !== undefined && requestedFeatures !== "w1-test-fixture") {
+if (
+  requestedFeatures !== undefined &&
+  requestedFeatures !== "w1-test-fixture" &&
+  requestedFeatures !== "w2-test-fixture"
+) {
   throw new Error("web.remote.build.features_invalid");
 }
 
