@@ -42,6 +42,7 @@ require_file ARCHITECTURE.md
 require_file docs/index.md
 require_file docs/AGENT_DIAGNOSTICS.md
 require_file docs/QUALITY.md
+require_file docs/RUST_BUILD_STORAGE.md
 require_file docs/plans/README.md
 require_file protocol/SPIKE_FINDINGS.md
 require_file protocol/CODEX_VERSION.txt
@@ -60,6 +61,8 @@ require_link README.md docs/index.md
 require_link README.md docs/QUALITY.md
 require_link docs/index.md QUALITY.md
 require_link docs/index.md plans/README.md
+require_link docs/index.md RUST_BUILD_STORAGE.md
+require_link docs/RUST_BUILD_STORAGE.md scripts/clean-rust-artifacts.sh
 require_link docs/QUALITY.md scripts/verify-agent-docs.sh
 
 legacy_tool="g""stack"

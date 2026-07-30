@@ -13,6 +13,7 @@
 
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、failure code 和排查流程。
 - `QUALITY.md`：按变更范围选择验证命令，以及文档结构检查入口。
+- `RUST_BUILD_STORAGE.md`：Rust 构建产物、sccache 容量上限和分 worktree 清理流程。
 
 ## 计划与历史
 
