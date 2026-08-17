@@ -45,6 +45,7 @@ type WebCoreModule = Readonly<{
 const wasmModuleUrl = "/wasm/agentdeck_web_core.js";
 const leases = new Map<string, WriterLease>();
 const writerGenerations = new Map<string, WriterGeneration>();
+let interactiveInvite: string | null = null;
 
 const corePromise = (async (): Promise<WebCoreModule> => {
   const core = (await import(wasmModuleUrl)) as WebCoreModule;
@@ -410,6 +411,194 @@ const api: RelayTestApi = {
 };
 
 globalThis.relayTestApi = api;
+
+function itemBody(item: W2ConversationItem): string {
+  if (typeof item.text === "string") {
+    return item.text;
+  }
+  if (typeof item.command === "string") {
+    const suffix = item.status === undefined ? "" : `\n状态：${item.status}`;
+    return `${item.command}${suffix}`;
+  }
+  if (Array.isArray(item.steps)) {
+    return item.steps.map((step) => `${step.status} · ${step.title}`).join("\n");
+  }
+  if (Array.isArray(item.files)) {
+    return item.files.map((file) => `${file.status} · ${file.path}`).join("\n");
+  }
+  if (typeof item.name === "string") {
+    return `工具：${item.name}`;
+  }
+  if (typeof item.rawPayload === "string") {
+    return item.rawPayload;
+  }
+  return "已收到结构化内容";
+}
+
+function itemLabel(kind: string): string {
+  switch (kind) {
+    case "userMessage":
+      return "用户";
+    case "assistantMessage":
+      return "助手";
+    case "reasoning":
+      return "推理";
+    case "shell":
+      return "命令";
+    case "diff":
+      return "代码变更";
+    case "plan":
+      return "计划";
+    case "toolCall":
+      return "工具调用";
+    default:
+      return kind;
+  }
+}
+
+function appendMessage(kind: string, label: string, body: string): void {
+  const transcript = document.querySelector<HTMLElement>("#interactive-transcript");
+  if (transcript === null) {
+    return;
+  }
+  const message = document.createElement("section");
+  message.className = "message";
+  message.dataset.kind = kind;
+  const heading = document.createElement("span");
+  heading.className = "message-label";
+  heading.textContent = label;
+  const content = document.createElement("p");
+  content.className = "message-body";
+  content.textContent = body;
+  message.append(heading, content);
+  transcript.append(message);
+}
+
+function renderInteractiveResult(result: W2BusinessTransportEvidence): void {
+  const business = result.business;
+  if (business === null) {
+    throw new Error(result.failureCode ?? "web.remote.interactive.business_missing");
+  }
+  const machine = document.querySelector<HTMLElement>("#interactive-machine");
+  const fingerprint = document.querySelector<HTMLElement>("#interactive-fingerprint");
+  const conversations = document.querySelector<HTMLOListElement>("#interactive-conversations");
+  const transcript = document.querySelector<HTMLElement>("#interactive-transcript");
+  const evidence = document.querySelector<HTMLElement>("#interactive-evidence");
+  if (
+    machine === null ||
+    fingerprint === null ||
+    conversations === null ||
+    transcript === null ||
+    evidence === null
+  ) {
+    throw new Error("web.remote.interactive.dom_missing");
+  }
+  machine.textContent = result.preview.machineDisplayName;
+  fingerprint.textContent = result.preview.machineRootFingerprint;
+  conversations.replaceChildren();
+  for (const conversation of business.conversations) {
+    const row = document.createElement("li");
+    row.className = "conversation-row";
+    const title = document.createElement("strong");
+    title.textContent = conversation.title ?? "未命名会话";
+    const meta = document.createElement("span");
+    meta.textContent = `${conversation.agentKind} · ${conversation.conversationId}`;
+    row.append(title, meta);
+    conversations.append(row);
+  }
+  transcript.replaceChildren();
+  for (const item of business.conversationItems) {
+    appendMessage(item.kind, itemLabel(item.kind), itemBody(item));
+  }
+  if (business.approvalSummary !== null) {
+    appendMessage("approval", "审批 · 已应用", business.approvalSummary);
+  }
+  if (business.conversationItems.length === 0 && business.approvalSummary === null) {
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = "会话已打开，但当前没有可显示内容。";
+    transcript.append(empty);
+  }
+  evidence.textContent = [
+    `Catalog: ${business.catalogEntryCount}`,
+    `命令完成: ${business.commandCompleted ? "1/1" : "未完成"}`,
+    `审批应用: ${business.approvalReceiptApplied && business.approvalEventApplied ? "1/1" : "未完成"}`,
+    `Relay 外层 ACK: ${business.outerAckCount}`,
+    `配对前网络锁定: ${result.preConfirmNetworkLocked ? "是" : "否"}`,
+  ].join("\n");
+}
+
+async function runInteractiveBusiness(): Promise<void> {
+  const status = document.querySelector<HTMLElement>("#interactive-status");
+  const run = document.querySelector<HTMLButtonElement>("#interactive-run");
+  const close = document.querySelector<HTMLButtonElement>("#interactive-close");
+  if (status === null || run === null || close === null || interactiveInvite === null) {
+    return;
+  }
+  const invite = interactiveInvite;
+  interactiveInvite = null;
+  run.disabled = true;
+  document.documentElement.dataset.interactiveStarted = "true";
+  status.dataset.state = "running";
+  status.textContent = "正在读取真实 Relay payload";
+  try {
+    const result = await api.runW2Business(invite);
+    if (result.failureCode !== null || result.business?.commandCompleted !== true) {
+      throw new Error(result.failureCode ?? "web.remote.interactive.incomplete");
+    }
+    renderInteractiveResult(result);
+    status.dataset.state = "passed";
+    status.textContent = "会话与内容读取通过";
+    document.documentElement.dataset.interactiveCompleted = "true";
+  } catch (error) {
+    status.dataset.state = "failed";
+    status.textContent = failureCode(error);
+    document.documentElement.dataset.interactiveFailed = "true";
+  } finally {
+    close.disabled = false;
+  }
+}
+
+const interactiveApi: RelayInteractiveApi = {
+  async configure(encodedInvite) {
+    const constructor = (await corePromise).W2PairingSession;
+    if (constructor === undefined) {
+      throw new Error("web.remote.w2_fixture_unavailable");
+    }
+    const session = new constructor(encodedInvite, BigInt(Date.now()));
+    try {
+      const preview = JSON.parse(session.previewJson()) as W2PairingPreview;
+      interactiveInvite = encodedInvite;
+      const viewer = document.querySelector<HTMLElement>("#interactive-viewer");
+      const machine = document.querySelector<HTMLElement>("#interactive-machine");
+      const fingerprint = document.querySelector<HTMLElement>("#interactive-fingerprint");
+      if (viewer === null || machine === null || fingerprint === null) {
+        throw new Error("web.remote.interactive.dom_missing");
+      }
+      viewer.hidden = false;
+      machine.textContent = preview.machineDisplayName;
+      fingerprint.textContent = preview.machineRootFingerprint;
+      document.documentElement.dataset.interactiveReady = "true";
+      return preview;
+    } finally {
+      session.free();
+    }
+  },
+};
+
+globalThis.relayInteractiveApi = interactiveApi;
+
+document.querySelector("#interactive-run")?.addEventListener("click", () => {
+  void runInteractiveBusiness();
+});
+document.querySelector("#interactive-close")?.addEventListener("click", () => {
+  document.documentElement.dataset.interactiveClosed = "true";
+  const status = document.querySelector<HTMLElement>("#interactive-status");
+  if (status !== null) {
+    status.dataset.state = "running";
+    status.textContent = "正在清理临时身份与进程";
+  }
+});
 
 async function runPageSelfcheck(): Promise<void> {
   const button = document.querySelector<HTMLButtonElement>("#run-selfcheck");

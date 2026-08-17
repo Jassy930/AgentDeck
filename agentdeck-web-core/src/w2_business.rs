@@ -41,7 +41,7 @@ use agentdeck_protocol::runtime::{
     RuntimeMessage, RuntimeReply, RuntimeRequest, RuntimeStreamItem, RuntimeSyncComplete,
     SendPromptRequest, SubscriptionReceipt,
 };
-use agentdeck_protocol::trunk::{ActionDecision, ActionDecisionKind, AgentItem};
+use agentdeck_protocol::trunk::{ActionDecision, ActionDecisionKind, AgentItem, AgentKind};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -56,13 +56,29 @@ const W2_DURABLE_STATE_VERSION: u16 = 1;
 const W2_COUNTER_RESERVATION_BLOCK: u64 = 256;
 const W2_MAX_DURABLE_STATE_BYTES: usize = 256 * 1_024;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct W2ConversationView {
+    pub conversation_id: String,
+    pub agent_kind: AgentKind,
+    pub title: Option<String>,
+    pub last_active_ms: u64,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct W2BusinessEvidence {
     pub principal_authenticated: bool,
     pub catalog_route_accepted: bool,
     pub catalog_entry_count: usize,
     pub conversation_title: Option<String>,
+    #[serde(default)]
+    pub conversations: Vec<W2ConversationView>,
+    #[serde(default)]
+    pub conversation_items: Vec<AgentItem>,
+    #[serde(default)]
+    pub approval_summary: Option<String>,
     pub catalog_subscription_active: bool,
     pub business_fence_count: u64,
     pub conversation_route_accepted: bool,
@@ -1329,6 +1345,13 @@ impl W2BusinessCore {
         self.conversation_id = Some(entry.conversation_id.clone());
         self.evidence.catalog_entry_count = 1;
         self.evidence.conversation_title = entry.title.clone();
+        self.evidence.conversations = vec![W2ConversationView {
+            conversation_id: entry.conversation_id.as_str().to_owned(),
+            agent_kind: entry.agent_kind,
+            title: entry.title.clone(),
+            last_active_ms: entry.last_active_ms,
+            archived: entry.archived,
+        }];
         tracker.snapshot_cursor = Some(snapshot.base_catalog_cursor);
         tracker.delivered = RuntimeInnerCursor::Catalog {
             cursor: snapshot.base_catalog_cursor,
@@ -1354,6 +1377,11 @@ impl W2BusinessCore {
         if revision == 0 {
             return Err(W2PairingError::BusinessFrameInvalid);
         }
+        self.evidence.conversation_items = snapshot
+            .items()
+            .iter()
+            .filter_map(|item| item.agent_item().cloned())
+            .collect();
         tracker.snapshot_cursor = Some(snapshot.base_event_cursor);
         tracker.configuration_revision = Some(revision);
         tracker.delivered = RuntimeInnerCursor::Conversation {
@@ -1853,6 +1881,10 @@ impl W2BusinessCore {
             .as_ref()
             .is_some_and(|command_id| event.command_id.as_ref() == Some(command_id));
         let event_seq = event.event_seq;
+        let visible_item = match &event.body {
+            RuntimeEventBody::Item { item } => Some(item.clone()),
+            _ => None,
+        };
         match event.body {
             RuntimeEventBody::TurnStarted { turn_id } if command_matches => {
                 self.prompt_turn_id = Some(turn_id);
@@ -1870,6 +1902,7 @@ impl W2BusinessCore {
                 && self.prompt_turn_id.as_ref() == Some(&turn_id)
                 && request.summary == EXPECTED_APPROVAL_SUMMARY =>
             {
+                self.evidence.approval_summary = Some(request.summary.clone());
                 self.approval = Some(ApprovalContext {
                     turn_id,
                     approval_id,
@@ -1907,6 +1940,9 @@ impl W2BusinessCore {
             | RuntimeEventBody::Error { .. } => {
                 return Err(W2PairingError::BusinessFrameInvalid);
             }
+        }
+        if let Some(item) = visible_item {
+            self.evidence.conversation_items.push(item);
         }
         Ok(event_seq)
     }

@@ -251,6 +251,17 @@ impl SnapshotItem {
         }
     }
 
+    /// 返回会话快照中的中立 AgentItem，供共享投影层消费。
+    ///
+    /// capability barrier 不是内容项，因此返回 `None`。调用方仍不能取得
+    /// vendor 私有 identity 或 adapter state。
+    pub fn agent_item(&self) -> Option<&AgentItem> {
+        match self {
+            Self::Capabilities { .. } => None,
+            Self::Item { item, .. } => Some(item),
+        }
+    }
+
     fn is_capabilities(&self) -> bool {
         matches!(self, SnapshotItem::Capabilities { .. })
     }

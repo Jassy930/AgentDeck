@@ -77,6 +77,10 @@
   方案只允许 Rust/WASM 复用现有 Relay v2、Runtime v5 与 E2EE v1，
   TypeScript 只做 WebSocket/IndexedDB/UI host；按 W0–W3 关闭可行性、直连、业务与恢复 automatic 证据，
   W4 继续独立保留物理设备、公网与 production TLS 门禁。
+- `plans/2026-07-31-relay-web-interactive-viewer-design.md` 与配套 implementation：在既有 Web Test
+  Companion 上增加显式 headed Chrome 交互入口，页面读取并显示真实 Relay/E2EE payload 的 Catalog、
+  Conversation item 与 approval summary。当前数据源固定为 synthetic adapter；个人真实历史和 production
+  remote identity 继续 W4 `BLOCKED`，禁止本地 HTTP/CLI 旁路冒充 Relay。
 - `plans/2026-07-18-relay-companion-mvp-course-correction.md`：历史纠偏决策；其 Task 粒度门禁、Runtime
   store 离线篡改 fail-close / 同 UID 在线 residual risk 继续约束已实现基线，未完成执行范围由 rescue
   计划覆盖。

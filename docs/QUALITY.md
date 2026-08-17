@@ -106,6 +106,23 @@ W2b PASS 只关闭同页内存态 pair→list/open→prompt→approval；W2a evi
 仍必须单调保持 true。IndexedDB paired promotion、reload/reconnect/backfill/revoke 已由下述 W2c 关闭；
 crash cut、tab contention 与重复性仍属 W3。
 
+W2 交互式会话查看门禁如下；它不是 `--business` 无明文门禁的替代品：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --interactive
+
+# 无人工点击的回归方式
+AGENTDECK_WEB_INTERACTIVE_AUTORUN=1 \
+  scripts/run-relay-web-companion-e2e.sh --interactive
+```
+
+页面必须明确显示 `fixed-topology synthetic adapter`，并从 Rust/WASM 已验证投影读取一个 Catalog 条目、
+canonical user/assistant item 与 approval summary。页面不得硬编码这些内容来伪造读回。正文只允许存在于
+当前页面 DOM；PairInvite 不得进入 URL/DOM/output，正文不得进入 Relay DB/WAL/SHM、browser output、
+localStorage、sessionStorage 或 IndexedDB。host 仍须读回 command/completed `1/1` 与 approval
+total/applied `1/1`，结束后 browser/host/root/invite/UDS/Playwright artifacts 全部 absent。该门禁只证明
+fixed-topology synthetic payload 的真实 Relay 展示；production signing、真实 vendor 与用户历史仍属 W4。
+
 W2c 的单命令与 aggregate 门禁如下：
 
 ```bash

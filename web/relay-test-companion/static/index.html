@@ -30,6 +30,53 @@
         </div>
       </section>
 
+      <section id="interactive-viewer" class="interactive-viewer" aria-labelledby="interactive-title" hidden>
+        <header class="interactive-header">
+          <div>
+            <span class="gate-label">本机交互模式 · 实际 Relay payload</span>
+            <h2 id="interactive-title">会话读取与内容查看</h2>
+            <p>
+              数据经过临时 TLS Relay、daemon、Runtime v5 与 E2EE v1；当前数据源为
+              <strong>fixed-topology synthetic adapter</strong>，不是个人生产历史。
+            </p>
+          </div>
+          <span id="interactive-status" class="status" data-state="idle" aria-live="polite">等待读取</span>
+        </header>
+
+        <div class="interactive-actions">
+          <button id="interactive-run" type="button">读取 Relay 会话</button>
+          <button id="interactive-close" class="secondary" type="button" disabled>结束并清理</button>
+        </div>
+
+        <dl class="machine-preview">
+          <div>
+            <dt>远端机器</dt>
+            <dd id="interactive-machine">等待安全预览</dd>
+          </div>
+          <div>
+            <dt>MachineRoot 指纹</dt>
+            <dd id="interactive-fingerprint">—</dd>
+          </div>
+        </dl>
+
+        <div class="session-browser">
+          <aside aria-labelledby="conversation-list-title">
+            <h3 id="conversation-list-title">会话</h3>
+            <ol id="interactive-conversations" class="conversation-list">
+              <li class="empty-state">尚未读取 Catalog</li>
+            </ol>
+          </aside>
+          <article aria-labelledby="conversation-content-title">
+            <h3 id="conversation-content-title">实际内容</h3>
+            <div id="interactive-transcript" class="transcript" aria-live="polite">
+              <p class="empty-state">选择“读取 Relay 会话”后显示真实返回内容。</p>
+            </div>
+          </article>
+        </div>
+
+        <pre id="interactive-evidence" aria-live="polite">尚未生成闭环证据</pre>
+      </section>
+
       <section class="cards" aria-label="验证边界">
         <article>
           <span class="ordinal">01</span>

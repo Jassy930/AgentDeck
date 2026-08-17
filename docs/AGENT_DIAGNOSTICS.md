@@ -176,6 +176,11 @@ transition `0`，不能用固定 sleep；proxy 关闭时不得丢弃尚在延迟
 W3.6 失败用 `--repeatability`；任一子轮失败后旧计数作废，必须从第一轮重跑。逐轮核对 candidate commit/tree、
 W2b terminal、三种 crash cut、三种 state cut、两份 aggregate、plaintext 与 cleanup，不能用 3+3 数量替代 exact
 cut覆盖。
+交互查看失败用 `--interactive`：`web.remote.interactive.dom_missing` 表示页面结构与脚本漂移，
+`web.remote.interactive.business_missing` / `incomplete` 表示 Relay 业务投影未形成完整 terminal；页面显示正文
+不等于持久化允许，仍须核对 Web Storage/IndexedDB 为零、browser output 与 Relay DB 无正文。若 production
+daemon socket 缺失或开发构建返回 `remote.persistent.unsupported`，只能说明个人真实历史入口未配置，不能
+回退到本地 HTTP/CLI 旁路并写成 Relay PASS。
 测试结束必须停止静态 server、关闭 tab/profile、Relay/daemon 并删除本轮精确临时 root；cleanup 不使用
 全局浏览器数据或全局进程名删除。
 

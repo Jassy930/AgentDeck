@@ -8,11 +8,13 @@ case "${1:-}" in
   "") ;;
   --business) run_mode="business" ;;
   --durable) run_mode="durable" ;;
-  *) printf 'usage: %s [--business|--durable]\n' "$0" >&2; exit 64 ;;
+  --interactive) run_mode="interactive" ;;
+  *) printf 'usage: %s [--business|--durable|--interactive]\n' "$0" >&2; exit 64 ;;
 esac
 gate_label="W2a"
 [[ "$run_mode" != "business" ]] || gate_label="W2b"
 [[ "$run_mode" != "durable" ]] || gate_label="W2c"
+[[ "$run_mode" != "interactive" ]] || gate_label="W2 interactive"
 crash_cut="${AGENTDECK_W3_CRASH_CUT:-}"
 state_cut="${AGENTDECK_W3_STATE_CUT:-}"
 contention_mode="${AGENTDECK_W3_CONTENTION:-0}"
@@ -287,7 +289,7 @@ host_environment=(
   "AGENTDECK_P57_HOST=1"
   "AGENTDECK_P57_HOST_PARENT=$runner_root"
 )
-if [[ "$run_mode" == "business" ]]; then
+if [[ "$run_mode" == "business" || "$run_mode" == "interactive" ]]; then
   host_environment+=("AGENTDECK_P57_HOST_SCENARIO=r43-business")
 elif [[ "$run_mode" == "durable" ]]; then
   host_environment+=("AGENTDECK_P57_HOST_SCENARIO=r44-lifecycle")
@@ -324,7 +326,7 @@ web_port="$(bun -e '
 [[ "$web_port" =~ ^[0-9]+$ ]] && [[ "$web_port" -ge 1 && "$web_port" -le 65535 ]] \
   || fail "could not reserve Web test port"
 
-if [[ "$run_mode" == "business" || "$run_mode" == "durable" ]]; then
+if [[ "$run_mode" == "business" || "$run_mode" == "durable" || "$run_mode" == "interactive" ]]; then
   expected_scenario="r43-business"
   [[ "$run_mode" != "durable" ]] || expected_scenario="r44-lifecycle"
   printf '%s\n' "$host_record" | jq -e --arg scenario "$expected_scenario" '
@@ -355,6 +357,7 @@ case "$host_root" in "$runner_root"/ad-p57-host-*) ;; *) fail "host root escaped
 browser_grep="W2a real browser pairing"
 [[ "$run_mode" != "business" ]] || browser_grep="W2b real browser business flow"
 [[ "$run_mode" != "durable" ]] || browser_grep="W2c durable reload reconnect backfill and revoke"
+[[ "$run_mode" != "interactive" ]] || browser_grep="W2 interactive viewer renders Relay catalog and conversation content"
 [[ -z "$browser_kill_cut" ]] || browser_grep="W3.4 managed Chrome process kill cold-recovers"
 (
   cd "$web_root"
@@ -376,17 +379,38 @@ browser_grep="W2a real browser pairing"
     )
   fi
   [[ -z "$network_fault" ]] || browser_environment+=("AGENTDECK_W3_NETWORK_FAULT=$network_fault")
+  browser_arguments=(--grep "$browser_grep")
+  if [[ "$run_mode" == "interactive" ]]; then
+    browser_environment+=("AGENTDECK_WEB_INTERACTIVE=1")
+    [[ "${AGENTDECK_WEB_INTERACTIVE_AUTORUN:-0}" != "1" ]] \
+      || browser_environment+=("AGENTDECK_WEB_INTERACTIVE_AUTORUN=1")
+    browser_arguments+=(--headed)
+  fi
   env "${browser_environment[@]}" \
     bun run test:browser:built -- \
-    --grep "$browser_grep"
+    "${browser_arguments[@]}"
 ) >"$browser_log" 2>&1 &
 browser_pid=$!
 
+if [[ "$run_mode" == "interactive" ]]; then
+  interactive_deadline=$(( $(date +%s) + 600 ))
+  while [[ ! -f "$coordination_dir/interactive.started" ]]; do
+    pid_is_running "$browser_pid" || fail "interactive browser exited before user started reading"
+    [[ "$(date +%s)" -lt "$interactive_deadline" ]] \
+      || fail "interactive viewer was not started within ten minutes"
+    sleep 0.1
+  done
+  [[ ! -L "$coordination_dir/interactive.started" ]] || fail "interactive start marker is a symlink"
+  [[ "$(stat -f '%Lp' "$coordination_dir/interactive.started")" == "600" ]] \
+    || fail "interactive start marker mode is not 0600"
+fi
+interaction_timeout_ms=120000
+interaction_read_timeout=140
 pending_request="w2a-pending-$generation"
 send_host_command \
-  "{\"op\":\"waitFor\",\"requestId\":\"$pending_request\",\"condition\":\"pendingPairing\",\"timeoutMs\":120000}" \
+  "{\"op\":\"waitFor\",\"requestId\":\"$pending_request\",\"condition\":\"pendingPairing\",\"timeoutMs\":$interaction_timeout_ms}" \
   || fail "could not request pending readback"
-read_host_json waitFor "$pending_request" 140 || fail "pending readback failed"
+read_host_json waitFor "$pending_request" "$interaction_read_timeout" || fail "pending readback failed"
 printf '%s\n' "$host_record" | jq -e '
   .satisfied == true
   and .evidence.pendingPairingCount == 1
@@ -407,13 +431,13 @@ printf '%s\n' "$host_record" | jq -e '
   and .evidence.runtimeCommandCount == 0
 ' >/dev/null || fail "approval did not create exact grant"
 
-if [[ "$run_mode" == "business" || "$run_mode" == "durable" ]] \
+if [[ "$run_mode" == "business" || "$run_mode" == "durable" || "$run_mode" == "interactive" ]] \
   && [[ "$browser_kill_cut" != "prompt" ]]; then
   mutated_request="w2b-mutated-$generation"
   send_host_command \
-    "{\"op\":\"waitFor\",\"requestId\":\"$mutated_request\",\"condition\":\"webBusinessMutated\",\"timeoutMs\":120000}" \
+    "{\"op\":\"waitFor\",\"requestId\":\"$mutated_request\",\"condition\":\"webBusinessMutated\",\"timeoutMs\":$interaction_timeout_ms}" \
     || fail "could not request business mutation readback"
-  read_host_json waitFor "$mutated_request" 140 || fail "business mutation readback failed"
+  read_host_json waitFor "$mutated_request" "$interaction_read_timeout" || fail "business mutation readback failed"
   if ! printf '%s\n' "$host_record" | jq -e '
     .satisfied == true
     and .evidence.runtimeCommandCount == 1
@@ -521,6 +545,7 @@ fi
 
 browser_timeout=150
 [[ "$run_mode" != "durable" ]] || browser_timeout=220
+[[ "$run_mode" != "interactive" ]] || browser_timeout=900
 browser_deadline=$(( $(date +%s) + browser_timeout ))
 while pid_is_running "$browser_pid"; do
   [[ "$(date +%s)" -lt "$browser_deadline" ]] || fail "browser pairing exceeded deadline"
@@ -642,7 +667,7 @@ if [[ "$run_mode" == "durable" ]]; then
     and .evidence.runtimeApprovalTotal == 1
     and .evidence.runtimeApprovalApplied == 1
   ' >/dev/null || fail "W2c revoke terminal did not settle exact host state"
-elif [[ "$run_mode" == "business" ]]; then
+elif [[ "$run_mode" == "business" || "$run_mode" == "interactive" ]]; then
   printf '%s\n' "$host_record" | jq -e '
     .evidence.machineRemoteLifecycle == "active"
     and .evidence.pendingPairingCount == 0
@@ -752,6 +777,8 @@ if [[ "$run_mode" == "durable" ]]; then
     --argjson counterReservationStart "$reservation_start" \
     --argjson counterReservationEnd "$reservation_end" \
     '{schemaVersion:1,gate:$gate,status:"PASS",crashCut:(if ($crashCut | length) > 0 then $crashCut else null end),stateCut:(if ($stateCut | length) > 0 then $stateCut else null end),writerContention:($writerContention == 1),browserKillCut:(if ($browserKillCut | length) > 0 then $browserKillCut else null end),networkFault:(if ($networkFault | length) > 0 then $networkFault else null end),daemonGeneration:2,relayGeneration:$relayGeneration,durableRevision:$durableRevision,counterReservationStart:$counterReservationStart,counterReservationEnd:$counterReservationEnd,catalogBackfillObserved:true,runtimeCommandCount:1,runtimeCompletedCommandCount:1,runtimeApprovalTotal:1,runtimeApprovalApplied:1,runtimeRevokedAuthorizationCount:1,relayGrantActive:0,relayPlaintextAbsent:true,browserPlaintextAbsent:true,cleanup:{pairedMaterialAbsent:true,kekAbsent:true,revokedTombstonePresent:true,counterGuardAbsent:true,browserAbsent:true,proxyAbsent:true,hostPidAbsent:true,hostRootAbsent:true,inviteAbsent:true,socketAbsent:true,playwrightArtifactsAbsent:true}}'
+elif [[ "$run_mode" == "interactive" ]]; then
+  printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-interactive","status":"PASS","dataSource":"fixed-topology-synthetic","preConfirmNetworkLocked":true,"catalogEntryCount":1,"conversationContentRendered":true,"runtimeCommandCount":1,"runtimeCompletedCommandCount":1,"runtimeApprovalTotal":1,"runtimeApprovalApplied":1,"relayPlaintextAbsent":true,"browserOutputPlaintextAbsent":true,"browserPersistentPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'
 elif [[ "$run_mode" == "business" ]]; then
   printf '%s\n' '{"schemaVersion":1,"gate":"relay-web-companion-w2b","status":"PASS","preConfirmNetworkLocked":true,"pendingPairingCount":0,"relayGrantTotal":1,"relayGrantActive":1,"activeTransitionCount":0,"activeCatalogStreamCount":1,"runtimeCommandCount":1,"runtimeCompletedCommandCount":1,"runtimeApprovalTotal":1,"runtimeApprovalApplied":1,"relayPlaintextAbsent":true,"browserPlaintextAbsent":true,"cleanup":{"browserAbsent":true,"hostPidAbsent":true,"hostRootAbsent":true,"inviteAbsent":true,"socketAbsent":true,"playwrightArtifactsAbsent":true}}'
 else

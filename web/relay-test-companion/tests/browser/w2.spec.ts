@@ -361,6 +361,81 @@ test("W2b real browser business flow closes prompt and approval", async ({ page 
   expect(consoleErrors).toEqual([]);
 });
 
+test("W2 interactive viewer renders Relay catalog and conversation content", async ({ page }) => {
+  test.skip(process.env.AGENTDECK_WEB_INTERACTIVE !== "1", "interactive runner only");
+  test.setTimeout(30 * 60_000);
+  const invitePath = process.env.AGENTDECK_W2_INVITE_PATH;
+  const coordinationDir = process.env.AGENTDECK_W2_COORDINATION_DIR;
+  if (invitePath === undefined || coordinationDir === undefined) {
+    throw new Error("W2 interactive runner contract is missing");
+  }
+  const invite = (await readFile(invitePath, "utf8")).trim();
+  const consoleErrors: string[] = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+
+  await page.goto("/");
+  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.ready)).toBe("true");
+  const preview = await page.evaluate(
+    async (encodedInvite) => globalThis.relayInteractiveApi.configure(encodedInvite),
+    invite,
+  );
+  expect(preview.machineDisplayName).toBe("P5.7 Swift dual-scope host");
+  await expect(page.locator("#interactive-viewer")).toBeVisible();
+  await expect(page.locator("#interactive-machine")).toHaveText(preview.machineDisplayName);
+  expect(page.url()).not.toContain("agentdeck-pair:v1:");
+  await expect(page.locator("html")).not.toContainText("agentdeck-pair:v1:");
+
+  if (process.env.AGENTDECK_WEB_INTERACTIVE_AUTORUN === "1") {
+    await page.locator("#interactive-run").click();
+  }
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.dataset.interactiveStarted), {
+      timeout: 10 * 60_000,
+    })
+    .toBe("true");
+  await writeFile(`${coordinationDir}/interactive.started`, "started\n", {
+    flag: "wx",
+    mode: 0o600,
+  });
+  await expect(page.locator("#interactive-status")).toHaveText(
+    "会话与内容读取通过",
+    { timeout: 10 * 60_000 },
+  );
+  await expect(page.locator(".conversation-row strong")).toHaveText("R4.3 synthetic Codex");
+  await expect(page.locator('.message[data-kind="userMessage"] .message-body')).toHaveText(
+    "web-w2b-prompt-7fb7f299",
+  );
+  await expect(page.locator('.message[data-kind="assistantMessage"] .message-body')).toHaveText(
+    "synthetic Codex response",
+  );
+  await expect(page.locator('.message[data-kind="approval"] .message-body')).toHaveText(
+    "synthetic codex approval",
+  );
+  const browserStorage = await page.evaluate(async () => ({
+    localStorageEntries: localStorage.length,
+    sessionStorageEntries: sessionStorage.length,
+    indexedDatabases: (await indexedDB.databases()).length,
+  }));
+  expect(browserStorage).toEqual({
+    localStorageEntries: 0,
+    sessionStorageEntries: 0,
+    indexedDatabases: 0,
+  });
+  expect(consoleErrors).toEqual([]);
+  if (process.env.AGENTDECK_WEB_INTERACTIVE_AUTORUN === "1") {
+    await page.locator("#interactive-close").click();
+  }
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.dataset.interactiveClosed), {
+      timeout: 10 * 60_000,
+    })
+    .toBe("true");
+});
+
 test("W2c durable reload reconnect backfill and revoke closes", async ({ page, context }) => {
   test.setTimeout(240_000);
   const invitePath = process.env.AGENTDECK_W2_INVITE_PATH;

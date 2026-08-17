@@ -289,6 +289,20 @@ scripts/run-relay-web-companion-e2e.sh --business
 fresh 门禁读回 command/completed `1/1`、approval total/applied `1/1`，并扫描 Relay DB/WAL/SHM、浏览器日志、
 DOM 与 Playwright output，确认 prompt、assistant、approval 明文 absent。
 
+需要人工查看 Relay 实际 payload 时使用独立交互入口：
+
+```bash
+scripts/run-relay-web-companion-e2e.sh --interactive
+```
+
+runner 会打开隔离的 headed Chrome。点击“读取 Relay 会话”后，页面展示从 Catalog 与 Conversation 解出的
+会话标题、user/assistant item 和 approval summary；查看完成后点击“结束并清理”。该模式明确标记
+`fixed-topology synthetic adapter`，验证真实 TLS Relay/daemon/Runtime/E2EE 数据路径，不代表用户本机
+Codex/Claude Code 历史或 production Relay。正文只允许存在于当前页面 DOM；PairInvite 不进入 URL/DOM，
+正文不得进入 Relay DB、browser output、localStorage、sessionStorage 或 IndexedDB。无人操作十分钟、任何
+typed failure 或 cleanup 不完整都会失败退出。自动回归可设置
+`AGENTDECK_WEB_INTERACTIVE_AUTORUN=1` 后运行同一命令。
+
 W2c 把同一 paired principal 提升到 IndexedDB：不可导出的 WebCrypto KEK 加密 Rust/WASM 导出的 paired
 state。promotion 创建 revision `0`，首轮业务 checkpoint exact CAS 为 `0→1`，reload 后联网前的 reservation
 提交为 `1→2`，最后以 revoke cleanup `2→3` 收敛。任何联网发送前先 durable 保留 counter block；首代使用
@@ -395,7 +409,10 @@ terminal `6`、`allRunsConsistent=true`，三轮明文与 cleanup 全部 absent�
 
 本地查看测试页面：先执行 `bun run build`，再执行 `bun run serve:test` 并打开
 `http://127.0.0.1:4173/`。该入口只用于查看测试壳；需要 paired durable state、隔离 profile 和完整 cleanup
-时必须使用统一 runner，不在日常浏览器 profile 中手工保留测试身份。
+时必须使用统一 runner，不在日常浏览器 profile 中手工保留测试身份。个人真实历史经 production Relay
+展示仍需要 release-signed daemon/helper 与 production remote identity；开发构建返回
+`remote.persistent.unsupported` 或 canonical daemon socket 缺失时必须保持 W4 `BLOCKED`，不得用本地
+HTTP/CLI 旁路冒充 Relay。
 
 这仍不是完整网页版。W2c 已关闭单轮 automatic 的 pair→业务→reload/reconnect/backfill→revoke 正向链路，
 W2.7 已关闭 approval loser 与 stale/replay/nonce-reuse 零 mutation 反例矩阵；W2.8 又在同一 candidate 上完成

@@ -41,7 +41,9 @@ mod w2_business;
 #[cfg(feature = "w2-test-fixture")]
 pub use w2::{W2PairingCore, W2PairingError, W2PairingEvidence, W2PairingPreview};
 #[cfg(feature = "w2-test-fixture")]
-pub use w2_business::{W2BusinessEvidence, W2NegativeSnapshot, w2_negative_snapshot};
+pub use w2_business::{
+    W2BusinessEvidence, W2ConversationView, W2NegativeSnapshot, w2_negative_snapshot,
+};
 
 const ED_SEED: [u8; 32] = [0x01; 32];
 const AEAD_KEY: [u8; 32] = [0x11; 32];

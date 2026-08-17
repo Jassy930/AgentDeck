@@ -56,6 +56,9 @@ declare global {
     catalogRouteAccepted: boolean;
     catalogEntryCount: number;
     conversationTitle: string | null;
+    conversations: readonly W2ConversationView[];
+    conversationItems: readonly W2ConversationItem[];
+    approvalSummary: string | null;
     catalogSubscriptionActive: boolean;
     businessFenceCount: number;
     conversationRouteAccepted: boolean;
@@ -83,6 +86,28 @@ declare global {
     revocationReceiptCommitted: boolean;
     revocationTerminalVerified: boolean;
     recoveryStage: string | null;
+  }>;
+
+  type W2ConversationView = Readonly<{
+    conversationId: string;
+    agentKind: "codex" | "claude_code";
+    title: string | null;
+    lastActiveMs: number;
+    archived: boolean;
+  }>;
+
+  type W2ConversationItem = Readonly<{
+    kind: string;
+    text?: string;
+    command?: string;
+    status?: string;
+    exitCode?: number | null;
+    durationMs?: number | null;
+    name?: string;
+    rawKind?: string;
+    rawPayload?: string;
+    steps?: readonly Readonly<{ title: string; status: string; detail?: string | null }>[];
+    files?: readonly Readonly<{ path: string; status: string; patch?: string | null }>[];
   }>;
 
   type W2NegativeEvidence = Readonly<{
@@ -303,7 +328,12 @@ declare global {
     deleteProfile: (profileId: string) => Promise<void>;
   }>;
 
+  type RelayInteractiveApi = Readonly<{
+    configure: (encodedInvite: string) => Promise<W2PairingPreview>;
+  }>;
+
   var relayTestApi: RelayTestApi;
+  var relayInteractiveApi: RelayInteractiveApi;
 }
 
 export {};
