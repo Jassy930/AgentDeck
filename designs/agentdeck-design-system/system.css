@@ -688,7 +688,7 @@ button:focus:not(:focus-visible) { outline: none; }
 .m-toggle::after { content: ""; position: absolute; top: 2px; left: 2px; width: 21px; height: 21px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.35); transition: left var(--dur) var(--ease); }
 .m-toggle.on::after { left: 19px; }
 
-/* —— 会话列表：项目为主体，机器 / relay 右侧小字（会话经 relay 连接）—— */
+/* —— 会话列表：项目为主体，机器 / 数据来源右侧小字 —— */
 .m-grp { display: flex; align-items: center; gap: 8px; padding: 13px 2px 8px; }
 .m-grp:first-child { padding-top: 4px; }
 .m-grp .chev { color: var(--text-3); }

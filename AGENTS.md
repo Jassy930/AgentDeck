@@ -10,13 +10,13 @@
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
 6. `docs/QUALITY.md`：GPUI P0、共享 Core、backend 和文档质量门禁。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前 macOS 实现只以 `docs/plans/2026-08-17-gpui-desktop-reset-design.md` / implementation 为事实源；旧 AppKit 与 Relay companion 计划是历史记录，不定义当前桌面迭代顺序。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前 macOS 实现只以 `docs/plans/2026-08-17-gpui-desktop-reset-design.md` / implementation 为事实源；旧 AppKit 计划是历史记录，不定义当前桌面迭代顺序。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
 
 - AgentDeck 是 Coding Agent 的统一原生桌面客户端，把 Codex 和 Claude Code 作为绝对一等公民，不是 IDE、不是 Codex Desktop 替代品、不是通用多 agent 聊天界面。
-- 当前 macOS 桌面端是 `agentdeck-desktop/` 下的 Rust/GPUI 最小壳；不接 daemon、IPC 或 Relay，也不恢复旧 AppKit 兼容层。
+- 当前 macOS 桌面端是 `agentdeck-desktop/` 下的 Rust/GPUI 最小壳；尚未连接 daemon 或 IPC，也不恢复旧 AppKit 兼容层。
 - 后续会话 UI 必须通过 Rust typed router 按 `SessionCapabilities` 路由，禁止硬编码 vendor 分支（N2）。
 - IPC 主干类型严禁出现 vendor 字样；vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 命名空间（N1）。
 - Codex 细节只能留在 `agentdeckd/src/codex/` 子模块；CC 细节只能留在 `agentdeckd/src/claude_code/` 子模块；两者互不知晓（N3）。
@@ -24,7 +24,6 @@
 - AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）；CC 历史走 CC 原生接口，不建 `cc-meta/` 目录（K9、N8）。
 - AgentDeck 管理的 run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`，不得写入用户项目 git（K5）。
 - `Sources/AgentDeckCore/` 是 iOS 使用的平台无关 Swift 层，禁止 import AppKit/UIKit；macOS GPUI target 不依赖它。`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是 `MobileSessionSource`，本期不含网络代码（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
-- Relay crates 保留但与 GPUI 桌面解耦；除非任务明确落在 Relay，不把 Relay 构建、设计或测试加入桌面切片。
 
 ## 工作规则
 
@@ -82,65 +81,6 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- --
 
 协议 schema 漂移测试随标准 `cargo test` 运行；改动 `agentdeck-protocol` 中的类型后须用以下命令重新生成快照：
 
-```bash
-UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
-```
-
-### Relay R1a（传输 + 鉴权骨架）
-
-以下命令只用于明确的 Relay 任务，不属于 GPUI 桌面默认门禁。
-
-```bash
-# Relay 服务端（server feature）测试
-cargo test -p agentdeck-relay --features server
-
-# Relay binary selfcheck（load + validate + build store/relay 后 exit）
-cargo run -p agentdeck-relay --features server -- --selfcheck --bootstrap-secret x
-
-# daemon 无 net/axum 不变量（R1a→R2 关键 invariant）
-bash scripts/check-daemon-no-net.sh
-
-# CLI remote pair + --relay 端到端（需先起 relay）
-agentdeck-relay --bootstrap-secret s &
-agentdeck-cli remote pair --relay ws://127.0.0.1:PORT --bootstrap-secret s
-agentdeck-cli remote machines --relay ws://127.0.0.1:PORT
-# （PORT 用 `agentdeck-relay` 启动时打印的实际端口替换；默认 config 里 bind 是
-#  127.0.0.1:8443，除非通过 --bind 或 AGENTDECK_RELAY_BIND 覆盖）
-
-# 用 TLS 起 relay（生产模式，非 loopback）
-cargo run -p agentdeck-relay --features server,tls -- \
-  --bind 0.0.0.0:8443 --tls-cert path/to/cert.pem --tls-key path/to/key.pem \
-  --bootstrap-secret <secret>
-```
-
-改动 `RELAY_PROTOCOL_VERSION`（`agentdeck-protocol/src/remote/mod.rs`）或 protocol schema 后须：
-```bash
-UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
-```
-
-### Relay R1b（SQLite 持久化 + Router 健壮化）
-
-```bash
-# R1b hardening e2e（SQLite tempdir 重启恢复 + 重放补拉 gap + AnnounceSession 幂等 + Revoke）
-cargo test -p agentdeck-relay --features server --test r1b_hardening_e2e -- --test-threads=1
-
-# 起 relay 指定 SQLite 存储路径（默认 ./agentdeck-relay-data/relay.db）
-cargo run -p agentdeck-relay --features server -- \
-  --bind 127.0.0.1:8443 \
-  --storage /var/lib/agentdeck-relay/relay.db \
-  --bootstrap-secret <secret>
-
-# 可选 tunable
---conv-buffer-cap 1000        # 每 conversation 硬上界（默认 1000）
---req-origin-ttl-ms 300000    # req_origin TTL（默认 5 分钟）
-
-# 或用 env
-AGENTDECK_RELAY_STORAGE=/path/to/relay.db
-AGENTDECK_RELAY_CONV_BUFFER_CAP=1000
-AGENTDECK_RELAY_REQ_ORIGIN_TTL_MS=300000
-```
-
-改动 `SubTarget::Events.since_seq` 字段或 `Ack.conversation_id` 类型后须：
 ```bash
 UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot
 ```

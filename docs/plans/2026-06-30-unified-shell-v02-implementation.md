@@ -1,5 +1,8 @@
 # 统一壳 v0.2 实施计划：Codex 与 Claude Code 一等公民
 
+> 2026-08-17 收敛说明：本文是旧 AppKit 路线的历史实施记录。N6 `Transport`
+> 预留及其测试已从主线删除，不得按本文对应任务恢复；当前工作以 GPUI reset 计划为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在 macOS AppKit 上端到端验证「统一壳」架构——Codex 和 Claude Code 作为双一等公民，通过 IPC 协议 v2 共享同一 UI 范式，vendor 特色语义保留。

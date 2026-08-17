@@ -10,11 +10,11 @@ cargo run -p agentdeck-desktop -- --selfcheck
 
 # backend：独立验证 daemon 与 adapter
 cargo run -p agentdeck-cli -- selfcheck
-cargo run -p agentdeckd -- --diagnostics-report --json
+cargo run -p agentdeckd -- --diagnostics-report
 ```
 
 当前 GPUI 桌面端没有连接 daemon，也没有 profile、run record 或 diagnostics report
-入口。桌面 selfcheck 成功不能证明 backend、vendor CLI 或 Relay 健康。
+入口。桌面 selfcheck 成功不能证明 backend 或 vendor CLI 健康。
 
 ## 日志位置
 
@@ -33,7 +33,7 @@ cargo run -p agentdeckd -- --diagnostics-report --json
 
 1. 跑 `cargo run -p agentdeck-desktop -- --selfcheck`，确认桌面基础是否可启动。
 2. 跑 `cargo run -p agentdeck-cli -- selfcheck`，独立确认 backend。
-3. 如果 backend 失败，跑 `cargo run -p agentdeckd -- --diagnostics-report --json`。
+3. 如果 backend 失败，跑 `cargo run -p agentdeckd -- --diagnostics-report`。
 4. 查看 `byLevel` / `byEvent` 和 `tail` 中最近的错误或告警。
 5. 按 `tail` 里的事件上下文继续执行只读检查。
 

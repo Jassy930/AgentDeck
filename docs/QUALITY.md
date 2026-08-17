@@ -22,9 +22,6 @@ cargo run -p agentdeck-cli -- selfcheck
 scripts/verify-agent-docs.sh
 ```
 
-Relay 测试只在改动 Relay crate 或对应计划时运行；它不再是 GPUI 桌面开发的默认
-门禁。
-
 ## GPUI 桌面 P0 门禁
 
 涉及 `agentdeck-desktop/`、Cargo workspace 或桌面打包脚本时至少运行：
@@ -40,11 +37,11 @@ bash -n script/build_and_run.sh
 selfcheck 的成功输出必须是单行 JSON，并明确包含：
 
 ```json
-{"status":"ok","surface":"desktop","ui":"gpui","relay":"disabled"}
+{"status":"ok","surface":"desktop","ui":"gpui"}
 ```
 
 该 selfcheck 只验证 GPUI application、Metal renderer、隐藏窗口、
-`gpui-component::init` 和 `Root`。它不能证明 daemon、IPC、vendor CLI 或 Relay
+`gpui-component::init` 和 `Root`。它不能证明 daemon、IPC 或 vendor CLI
 健康。
 
 `--verify` 必须读回：
@@ -63,7 +60,7 @@ selfcheck 的成功输出必须是单行 JSON，并明确包含：
 - [ ] 窗口能看到“AgentDeck”和“GPUI 桌面端已启动”。
 - [ ] “关闭”按钮能退出应用。
 - [ ] 重新运行统一脚本能停止旧 bundle 实例并启动最新二进制。
-- [ ] 未实现的 daemon、会话、历史和 Relay 能力没有伪 UI 或成功提示。
+- [ ] 未实现的 daemon、会话和历史能力没有伪 UI 或成功提示。
 
 只有实际检查过窗口后才能勾选；进程存在不能替代视觉和点击证据。
 
@@ -88,7 +85,6 @@ macOS 桌面不得重新依赖 Swift target；共享 Core 测试也不得重新�
 | Swift Core / iOS 共享模型 | `swift test`；涉及 iOS 时再跑 iOS Simulator 测试 |
 | daemon、adapter、record、diagnostics | 对应 focused test，再跑 `cargo test` 和 CLI selfcheck |
 | agentdeck-protocol | `cargo test`；漂移时按下文重生成 schema |
-| Relay crates | 对应 Relay focused tests；不把结果外推为桌面可用 |
 | 文档、AGENTS、计划规则 | `scripts/verify-agent-docs.sh` |
 | 全局依赖或 workspace | `cargo test`、`swift test`、desktop selfcheck、doc check |
 
@@ -220,4 +216,4 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- --
 2. 运行桌面测试、selfcheck、bundle verify 和 Swift Core 测试。
 3. 真实查看并点击新窗口。
 4. 运行 `git diff --check` 与 `git status --short --branch`。
-5. 报告未实现的 backend/Relay 边界，不把 P0 描述为完整客户端。
+5. 报告未实现的 backend 边界，不把 P0 描述为完整客户端。

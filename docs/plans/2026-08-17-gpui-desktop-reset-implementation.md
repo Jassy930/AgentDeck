@@ -5,7 +5,7 @@
 ## Goal
 
 把 macOS 桌面入口重置为一个可构建、可启动、可自检的 GPUI 最小应用，同时删掉
-旧 AppKit target，不接入 Relay 或 daemon。
+旧 AppKit target，不接入远程能力或 daemon。
 
 ## Architecture
 
@@ -57,17 +57,16 @@ git diff --check
 
 - 以上命令全部通过；iOS Simulator 为 20/20。
 - selfcheck 输出
-  `{"status":"ok","surface":"desktop","ui":"gpui","relay":"disabled"}`。
+  `{"status":"ok","surface":"desktop","ui":"gpui"}`。
 - bundle readback 确认进程来自当前 `dist/AgentDeck.app`，Info.plist 与 Mach-O 的
  最低系统版本均为 15.0。
 - 临时唯一 bundle 的窗口可见，并已实际点击“关闭”确认 GPUI handler 退出进程；
   同机另一 worktree 的旧实例保持运行。
 - 本轮改动文件通过 `cargo fmt --check -p agentdeck-desktop` 和对
-  `agentdeck-protocol/src/lib.rs` 的定向 rustfmt。协议 crate 内未修改的 Relay 文件
-  存在既有 rustfmt 差异，因此没有为通过 package-wide fmt 制造 Relay diff。
+  `agentdeck-protocol/src/lib.rs` 的定向 rustfmt。
 - `block 0.1.6` 会产生 future-incompatibility warning，不阻塞当前 P0 构建。
 
 ## 完成边界
 
-本计划完成只代表 GPUI 桌面基础可运行。daemon/IPC、单会话、历史、审批、Markdown、
-Relay 与真实产品交互均属于后续独立切片。
+本计划完成只代表 GPUI 桌面基础可运行。daemon/IPC、单会话、历史、审批、Markdown
+与真实产品交互均属于后续独立切片。

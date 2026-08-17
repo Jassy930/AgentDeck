@@ -48,5 +48,5 @@ AgentDeck 的桌面端使用 Rust + GPUI，优先把 macOS 做扎实，再评估
 1. GPUI + gpui-component 的真实 `.app` 能稳定构建、启动和自检。
 2. 桌面端只通过 typed local client 连接本机 `agentdeckd`，不嵌入 daemon。
 3. 先完成单会话 prompt → streaming → complete，再扩展历史和审批。
-4. Relay 与远程能力暂不接入桌面端，也不作为本地开发门禁。
+4. 远程能力不在当前桌面切片中，也不作为本地开发门禁。
 5. 不恢复旧 AppKit 的实现细节，只保留仍有效的产品和协议不变量。

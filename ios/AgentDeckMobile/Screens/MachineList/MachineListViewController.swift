@@ -5,7 +5,7 @@ final class MachineListViewController: UIViewController {
     private let viewModel: MachineListViewModel
     private var collectionView: UICollectionView!
     private var dataSource: UICollectionViewDiffableDataSource<Int, String>!
-    private let emptyView = MobileEmptyStateView(title: "还没有机器", subtitle: "用右上角「配对」把 Mac 接入")
+    private let emptyView = MobileEmptyStateView(title: "还没有机器", subtitle: "当前仅展示内置 Fixture 数据")
 
     init(source: MobileSessionSource) {
         self.source = source
@@ -20,8 +20,6 @@ final class MachineListViewController: UIViewController {
         title = "AgentDeck"
         view.backgroundColor = DesignTokens.bg
         navigationItem.rightBarButtonItems = [
-            UIBarButtonItem(image: UIImage(systemName: "qrcode.viewfinder"), style: .plain,
-                            target: self, action: #selector(openPairing)),
             UIBarButtonItem(image: UIImage(systemName: "tray"), style: .plain,
                             target: self, action: #selector(openInbox)),
         ]
@@ -102,10 +100,6 @@ final class MachineListViewController: UIViewController {
         })
         dataSource.apply(snapshot, animatingDifferences: false)
         emptyView.isHidden = !viewModel.machines.isEmpty
-    }
-
-    @objc private func openPairing() {
-        present(UINavigationController(rootViewController: PairingViewController()), animated: true)
     }
 
     @objc private func openInbox() {

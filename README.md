@@ -20,10 +20,10 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 - daemon / IPC 连接。
 - 会话、历史、composer、审批和富文本 transcript。
-- Relay、远程机器和配对流程。
+- 远程机器、网络数据源和配对流程。
 - 对旧 AppKit 界面或行为的兼容层。
 
-这些能力只按新的纵向切片逐步加入；Relay 不是桌面端启动或本地开发的前置条件。
+这些能力只按新的纵向切片逐步加入；当前仓库先收敛本地最小闭环。
 
 ## 仓库结构
 
@@ -32,15 +32,13 @@ agentdeck-desktop/       最小 Rust/GPUI macOS 客户端
 agentdeck-protocol/      AgentDeck 中立 IPC 类型与 schema 事实源
 agentdeckd/              Codex / Claude Code adapter daemon
 agentdeck-cli/           参考客户端与 E2E 驱动
-agentdeck-relay/         独立 Relay 服务端代码，当前不接入桌面端
-agentdeck-relay-client/  独立 Relay 客户端代码，当前不接入桌面端
 Sources/AgentDeckCore/   iOS 使用的平台无关 Swift 模型
 ios/                     UIKit companion
 protocol/                Codex 官方 schema 与 AgentDeck schema 快照
 docs/                    架构、诊断、质量规则与计划
 ```
 
-`agentdeck-desktop` 当前不依赖 daemon、protocol 或 Relay crate。下一阶段若接入
+`agentdeck-desktop` 当前不依赖 daemon 或 protocol crate。下一阶段若接入
 本地能力，只允许增加 `desktop → typed client → agentdeckd` 的单向依赖；UI 不直接
 解析 vendor JSON，也不把 daemon 嵌入 GUI 进程。
 
@@ -105,8 +103,7 @@ cargo run -q -p agentdeck-cli -- protocol schema \
 scripts/verify-agent-docs.sh
 ```
 
-只有改动对应层时才运行其门禁。Relay 测试属于 Relay 自身，不再是 GPUI 桌面迭代
-的默认门禁。
+只有改动对应层时才运行其门禁。
 
 ## 下一条纵向切片
 

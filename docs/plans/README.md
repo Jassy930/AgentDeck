@@ -40,8 +40,7 @@
 - `2026-08-17-gpui-desktop-reset-design.md`
 - `2026-08-17-gpui-desktop-reset-implementation.md`
 
-此前 AppKit 统一壳与 Relay companion 计划保留为历史记录，不再定义当前 macOS
-桌面实现或默认迭代顺序。
+此前 AppKit 统一壳计划保留为历史记录，不再定义当前 macOS 桌面实现或默认迭代顺序。
 
 现有计划暂时保留在 `docs/plans/` 根目录，避免为了归档制造大规模文件移动。后续当计划数量继续增长时，再引入：
 

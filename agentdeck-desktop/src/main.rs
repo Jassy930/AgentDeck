@@ -10,8 +10,7 @@ use gpui_component::{
     v_flex,
 };
 
-const SELFCHECK_REPORT: &str =
-    r#"{"status":"ok","surface":"desktop","ui":"gpui","relay":"disabled"}"#;
+const SELFCHECK_REPORT: &str = r#"{"status":"ok","surface":"desktop","ui":"gpui"}"#;
 
 struct AgentDeckView;
 
@@ -74,7 +73,7 @@ mod tests {
     fn selfcheck_report_declares_the_minimal_scope() {
         assert_eq!(
             SELFCHECK_REPORT,
-            r#"{"status":"ok","surface":"desktop","ui":"gpui","relay":"disabled"}"#
+            r#"{"status":"ok","surface":"desktop","ui":"gpui"}"#
         );
     }
 }

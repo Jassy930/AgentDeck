@@ -7,12 +7,10 @@
 //! Phase 2 / Phase 5 migrate downstream consumers.
 
 pub mod capabilities;
-pub mod transport;
 pub mod trunk;
 pub mod vendor;
 
 pub use capabilities::{CapabilityId, SessionCapabilities, VendorCapabilities};
-pub use transport::{AuthContext, Transport, TransportConfig, TransportError};
 pub use trunk::AgentKind;
 pub use trunk::ClientCommand;
 pub use trunk::{
@@ -60,12 +58,6 @@ pub fn protocol_schema() -> serde_json::Value {
             "HistoryListItem": serde_json::to_value(schema_for!(trunk::HistoryListItem)).unwrap(),
             "HistoryReadResponse": serde_json::to_value(schema_for!(trunk::HistoryReadResponse)).unwrap(),
             "HistoryResponse": serde_json::to_value(schema_for!(trunk::HistoryResponse)).unwrap(),
-            "RemoteFrame": serde_json::to_value(schema_for!(remote::RemoteFrame)).unwrap(),
-            "RelayControlMsg": serde_json::to_value(schema_for!(remote::RelayControlMsg)).unwrap(),
-            "DataEnvelope": serde_json::to_value(schema_for!(remote::DataEnvelope)).unwrap(),
-            "MachineDescriptor": serde_json::to_value(schema_for!(remote::MachineDescriptor)).unwrap(),
-            "SessionDescriptor": serde_json::to_value(schema_for!(remote::SessionDescriptor)).unwrap(),
-            "DeviceDescriptor": serde_json::to_value(schema_for!(remote::DeviceDescriptor)).unwrap(),
         }
     }))
 }
@@ -92,12 +84,6 @@ fn canonicalize_json_object_order(value: serde_json::Value) -> serde_json::Value
         other => other,
     }
 }
-
-pub mod remote;
-pub use remote::{
-    ClientRole, CommandTarget, DataEnvelope, DeviceDescriptor, DeviceKind, MachineDescriptor,
-    RELAY_PROTOCOL_VERSION, RelayControlMsg, RemoteFrame, SessionDescriptor, SubTarget,
-};
 
 #[cfg(test)]
 mod neutrality_tests;

@@ -1,12 +1,9 @@
 //! CLI-internal synchronous transport over a spawned `agentdeckd` subprocess.
 //!
-//! The protocol crate defines an *async* `Transport` trait for remote impls
-//! (v0.5+). For v0.2 the CLI always speaks to a local daemon child process;
-//! we keep a **synchronous** internal trait here to avoid pulling tokio into
-//! the sync read loop in `client.rs`. The async `ProcessTransport` wrapper is
-//! provided for callers that prefer async (session streaming).
+//! The CLI always speaks to a local daemon child process. Admin commands use a
+//! synchronous transport to keep their read loop small; session streaming uses
+//! the async process wrapper below.
 
-use agentdeck_protocol::AuthContext;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -191,7 +188,6 @@ struct AsyncTransportInner {
     child: tokio::process::Child,
     writer: tokio::process::ChildStdin,
     reader_task: tokio::task::JoinHandle<()>,
-    auth: AuthContext,
 }
 
 impl AsyncProcessTransport {
@@ -232,7 +228,6 @@ impl AsyncProcessTransport {
                 child,
                 writer,
                 reader_task,
-                auth: AuthContext::Anonymous,
             }),
             line_rx: Some(rx),
         })
@@ -254,7 +249,6 @@ impl AsyncProcessTransport {
                 child: inner.child,
                 _writer: inner.writer,
                 reader_task: inner.reader_task,
-                auth: inner.auth,
             },
             rx,
         )
@@ -284,15 +278,6 @@ pub struct AsyncTransportWriter {
     /// Stdin kept open so daemon doesn't get EOF until we drop.
     _writer: tokio::process::ChildStdin,
     reader_task: tokio::task::JoinHandle<()>,
-    #[allow(dead_code)]
-    auth: AuthContext,
-}
-
-impl AsyncTransportWriter {
-    #[allow(dead_code)]
-    pub fn auth_context(&self) -> &AuthContext {
-        &self.auth
-    }
 }
 
 impl Drop for AsyncTransportWriter {

@@ -3,8 +3,6 @@ members = [
     "agentdeckd",
     "agentdeck-protocol",
     "agentdeck-cli",
-    "agentdeck-relay",
-    "agentdeck-relay-client",
     "agentdeck-desktop",
 ]
 resolver = "3"
