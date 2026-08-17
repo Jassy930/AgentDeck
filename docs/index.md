@@ -31,7 +31,7 @@
 ### iOS 前端计划（2026-07-03）
 
 - `plans/2026-07-03-ios-uikit-frontend-design.md`：iOS UIKit companion 前端设计（fixture 驱动界面骨架，状态：Implemented）。
-- `plans/2026-07-03-ios-uikit-frontend-implementation.md`：iOS UIKit companion 前端实施计划（Task 1–15，含 AgentDeckCore 共享库抽取）。
+- `plans/2026-07-03-ios-uikit-frontend-implementation.md`：iOS UIKit companion 前端实施计划（Task 1–15；文中 `AgentDeckCore` 是实施时原名，现名为 `AgentDeckMobileCore`）。
 
 ### macOS AppKit 富文本渲染（2026-07-23，历史）
 

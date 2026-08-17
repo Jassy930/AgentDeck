@@ -1,5 +1,9 @@
 # AgentDeck iOS UIKit 前端实施计划
 
+> 2026-08-17 命名说明：本计划记录实施时的原名 `AgentDeckCore`。当前 SwiftPM
+> product/target 已更名为 `AgentDeckMobileCore`；以下历史命令、路径和提交叙述不做
+> 机械改写。
+>
 > 2026-08-17 收敛说明：本文保留已完成切片的实施记录；假配对屏、二维码入口及
 > 特定网络数据源承诺已从主线删除。当前 iOS 只保留 fixture 驱动的机器、会话、
 > 审批与收件箱闭环。

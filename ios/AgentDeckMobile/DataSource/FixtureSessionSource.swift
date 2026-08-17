@@ -1,5 +1,5 @@
 import Foundation
-import AgentDeckCore
+import AgentDeckMobileCore
 
 @MainActor
 final class FixtureSessionSource: MobileSessionSource {

@@ -66,8 +66,8 @@ selfcheck 的成功输出必须是单行 JSON，并明确包含：
 
 ## Swift Core 门禁
 
-`Package.swift` 只承载 iOS 使用的 `AgentDeckCore`。改动
-`Sources/AgentDeckCore/`、协议 Swift mirror 或 `Tests/AgentDeckCoreTests/` 时运行：
+`Package.swift` 只承载 iOS 使用的 `AgentDeckMobileCore`。改动
+`Sources/AgentDeckMobileCore/`、协议 Swift mirror 或 `Tests/AgentDeckMobileCoreTests/` 时运行：
 
 ```bash
 swift test

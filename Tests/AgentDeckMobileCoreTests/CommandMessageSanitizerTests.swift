@@ -1,5 +1,5 @@
 import XCTest
-import AgentDeckCore
+import AgentDeckMobileCore
 
 final class CommandMessageSanitizerTests: XCTestCase {
 

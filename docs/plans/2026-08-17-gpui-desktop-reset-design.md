@@ -13,7 +13,7 @@ Swift UI、旧 daemon transport 与远程路线。当前产品决策是停止在
 - 删除旧 AppKit executable、资源和桌面专属测试。
 - 用 Rust、GPUI 和 gpui-component 建立可启动的 macOS `.app`。
 - 保留统一 build/run 入口和机器可读 selfcheck。
-- 保留 Rust daemon/protocol/CLI、Swift `AgentDeckCore` 与 iOS。
+- 保留 Rust daemon/protocol/CLI、Swift `AgentDeckMobileCore` 与 iOS。
 - 后续优先做本机单会话纵向切片，远程能力不进入当前桌面启动路径。
 
 ## 非目标

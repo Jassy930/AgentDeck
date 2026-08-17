@@ -1,5 +1,5 @@
 import XCTest
-import AgentDeckCore
+import AgentDeckMobileCore
 @testable import AgentDeckMobile
 
 final class FixtureDecodingTests: XCTestCase {
@@ -12,7 +12,7 @@ final class FixtureDecodingTests: XCTestCase {
         XCTAssertEqual(deck.sessions.count, 4)
     }
 
-    /// 防漂移门禁：所有 stream fixture 的 event 必须能被 AgentDeckCore 的
+    /// 防漂移门禁：所有 stream fixture 的 event 必须能被 AgentDeckMobileCore 的
     /// ServerEvent 解码 —— fixture 本身就是对协议理解的检验。
     func testAllStreamFixturesDecodeAsServerEvents() throws {
         let urls = bundle.urls(forResourcesWithExtension: "json", subdirectory: nil) ?? []

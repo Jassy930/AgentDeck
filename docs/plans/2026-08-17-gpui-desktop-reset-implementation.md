@@ -11,7 +11,7 @@
 
 - `agentdeck-desktop/`：唯一 macOS GUI crate。
 - `script/build_and_run.sh`：唯一 build/run 和 `.app` 装配入口。
-- `Package.swift`：只保留 iOS 使用的 `AgentDeckCore` 与 Core 测试。
+- `Package.swift`：只保留 iOS 使用的 `AgentDeckMobileCore` 与 Core 测试。
 - 后端 crates 保持独立，本切片不改协议类型或 runtime 行为。GPUI 间接启用
   `serde_json/preserve_order` 后，`protocol_schema()` 会递归排序 JSON object key，保证
   聚合 schema 文本仍可复现；这是构建确定性修复，不改变 wire schema。
@@ -26,7 +26,7 @@
 ## Tasks
 
 - [x] 删除 `Sources/AgentDeck/` 和 `Tests/AgentDeckTests/`。
-- [x] 从旧测试中迁出仍只依赖 `AgentDeckCore` 的测试。
+- [x] 从旧测试中迁出仍只依赖 `AgentDeckMobileCore` 的测试。
 - [x] 新增 `agentdeck-desktop` workspace member、窗口、组件和 selfcheck。
 - [x] 把 `script/build_and_run.sh` 改为 Cargo build 与 Rust `.app` 装配；无效 mode
   在停止进程、构建或改写 bundle 前返回 exit 2。

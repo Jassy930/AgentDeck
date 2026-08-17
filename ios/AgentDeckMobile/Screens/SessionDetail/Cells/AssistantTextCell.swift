@@ -1,5 +1,5 @@
 import UIKit
-import AgentDeckCore
+import AgentDeckMobileCore
 
 final class AssistantTextCell: UICollectionViewCell {
     private let label = UILabel()

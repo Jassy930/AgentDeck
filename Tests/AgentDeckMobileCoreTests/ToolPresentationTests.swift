@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import AgentDeckCore
+import AgentDeckMobileCore
 
 // Unit coverage for platform-neutral presentation helpers. These tests pin the
 // user-visible strings produced for shell, tool-call, and web-search rows; a

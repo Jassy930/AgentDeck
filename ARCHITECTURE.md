@@ -20,7 +20,7 @@ AgentDeck.app
 agentdeckd / agentdeck-protocol / agentdeck-cli
 └─ 现有后端与协议，当前尚未接入 GPUI 桌面端
 
-AgentDeckCore + ios/
+AgentDeckMobileCore + ios/
 └─ iOS companion 使用的 Swift 共享模型和 UIKit 前端
 ```
 
@@ -31,7 +31,7 @@ selfcheck 都必须明确桌面端没有 backend 能力。
 ## 分层边界
 
 - `agentdeck-desktop/`：macOS GPUI executable。当前只负责窗口、组件根节点和桌面 selfcheck；不得解析 vendor JSON。
-- `Sources/AgentDeckCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
+- `Sources/AgentDeckMobileCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
 - `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合本地 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/agent.rs`：`Agent` trait + `AgentKind` 枚举。两个 adapter 共享的逻辑在此，不得让 adapter 相互引用。

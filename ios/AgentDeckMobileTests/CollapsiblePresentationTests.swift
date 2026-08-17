@@ -1,5 +1,5 @@
 import XCTest
-import AgentDeckCore
+import AgentDeckMobileCore
 @testable import AgentDeckMobile
 
 final class CollapsiblePresentationTests: XCTestCase {

@@ -32,7 +32,7 @@ agentdeck-desktop/       最小 Rust/GPUI macOS 客户端
 agentdeck-protocol/      AgentDeck 中立 IPC 类型与 schema 事实源
 agentdeckd/              Codex / Claude Code adapter daemon
 agentdeck-cli/           参考客户端与 E2E 驱动
-Sources/AgentDeckCore/   iOS 使用的平台无关 Swift 模型
+Sources/AgentDeckMobileCore/  iOS 使用的平台无关 Swift 模型
 ios/                     UIKit companion
 protocol/                Codex 官方 schema 与 AgentDeck schema 快照
 docs/                    架构、诊断、质量规则与计划

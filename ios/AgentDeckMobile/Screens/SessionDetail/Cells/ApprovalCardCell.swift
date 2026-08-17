@@ -1,5 +1,5 @@
 import UIKit
-import AgentDeckCore
+import AgentDeckMobileCore
 
 struct ApprovalCardPresentation: Equatable {
     let summary: String

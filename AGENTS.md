@@ -23,7 +23,7 @@
 - `protocol/` 中 Codex schema 必须来自官方 `codex app-server generate-json-schema`，不要手写或逆向猜测协议（K8）。
 - AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）；CC 历史走 CC 原生接口，不建 `cc-meta/` 目录（K9、N8）。
 - AgentDeck 管理的 run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`，不得写入用户项目 git（K5）。
-- `Sources/AgentDeckCore/` 是 iOS 使用的平台无关 Swift 层，禁止 import AppKit/UIKit；macOS GPUI target 不依赖它。`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是 `MobileSessionSource`，本期不含网络代码（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
+- `Sources/AgentDeckMobileCore/` 是 iOS 使用的平台无关 Swift 层，禁止 import AppKit/UIKit；macOS GPUI target 不依赖它。`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是 `MobileSessionSource`，本期不含网络代码（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
 
 ## 工作规则
 
@@ -46,7 +46,7 @@ swift test
 scripts/verify-agent-docs.sh
 ```
 
-涉及 GPUI 桌面时至少运行 desktop test、desktop selfcheck 和真实 bundle verify。涉及 daemon、IPC、记录、诊断、协议翻译时至少运行对应 focused test、`cargo test` 和 CLI selfcheck。涉及 `AgentDeckCore` 或 iOS 时运行 `swift test`；涉及诊断、日志或数据目录时同时运行 daemon diagnostics report。
+涉及 GPUI 桌面时至少运行 desktop test、desktop selfcheck 和真实 bundle verify。涉及 daemon、IPC、记录、诊断、协议翻译时至少运行对应 focused test、`cargo test` 和 CLI selfcheck。涉及 `AgentDeckMobileCore` 或 iOS 时运行 `swift test`；涉及诊断、日志或数据目录时同时运行 daemon diagnostics report。
 
 ### iOS 前端验证
 
@@ -57,7 +57,7 @@ cd ios && xcodegen generate && \
     -destination 'platform=iOS Simulator,name=iPhone 17' test
 ```
 
-涉及 `Sources/AgentDeckCore/` 或 `ios/` 时至少运行 `swift test` 与上述 iOS 测试。
+涉及 `Sources/AgentDeckMobileCore/` 或 `ios/` 时至少运行 `swift test` 与上述 iOS 测试。
 
 ### 统一接口层补充验证
 

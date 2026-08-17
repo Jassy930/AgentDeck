@@ -1,5 +1,5 @@
 import UIKit
-import AgentDeckCore
+import AgentDeckMobileCore
 
 final class SessionDetailViewController: UIViewController {
     private enum Section: Hashable { case conversation; case approval }

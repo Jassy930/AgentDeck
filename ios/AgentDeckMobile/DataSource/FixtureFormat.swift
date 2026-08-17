@@ -1,5 +1,5 @@
 import Foundation
-import AgentDeckCore
+import AgentDeckMobileCore
 
 struct FixtureMachine: Decodable {
     let id: String

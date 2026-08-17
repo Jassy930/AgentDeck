@@ -16,7 +16,7 @@
 
 - 在 iPhone 模拟器上跑通 companion 界面：机器列表、会话列表、会话详情（流式）、审批卡片、prompt 输入和事件收件箱。
 - 假数据用 `agentdeck-protocol` 语义的事件序列回放，接真实链路时 UI 层零迁移。
-- 把 iOS 使用的平台无关协议类型与会话模型收在 `AgentDeckCore` SPM 库中，边界由编译器保证。
+- 把 iOS 使用的平台无关协议类型与会话模型收在 `AgentDeckMobileCore` SPM 库中，边界由编译器保证。
 - iOS 视觉沿用 `designs/agentdeck-design-system` 同一份 token SSOT。
 
 ## 3. 非目标
@@ -32,16 +32,16 @@
 - 功能范围：fixture 驱动的机器、会话、审批与收件箱浏览。
 - Mock 方式：协议对齐 fixture 回放，经 `MobileSessionSource` 协议进入 UI。
 - 工程组织：同仓 `ios/` 目录 + XcodeGen（xcodeproj 不入库）。
-- 代码组织：使用 `AgentDeckCore` SPM 库承载 iOS 的平台无关协议类型与会话模型。
+- 代码组织：使用 `AgentDeckMobileCore` SPM 库承载 iOS 的平台无关协议类型与会话模型。
 - 设备目标：iPhone 竖屏优先，iOS 17+。
 
 ## 5. 架构方案与边界
 
 ```text
 仓库根
-├── Package.swift                    # AgentDeckCore library target（iOS 17）
+├── Package.swift                    # AgentDeckMobileCore library target（iOS 17）
 ├── Sources/
-│   └── AgentDeckCore/               # iOS 使用的平台无关 Swift 层
+│   └── AgentDeckMobileCore/         # iOS 使用的平台无关 Swift 层
 │       ├── Protocol/V2Types.swift   # 协议类型（agentdeck-protocol 的 Swift 镜像）
 │       ├── AgentItemReducer.swift   # 流式累积 reducer
 │       └── ConversationTurn.swift / HistoryModel.swift / ...（以实际依赖为准）
@@ -58,7 +58,7 @@
 
 边界约束：
 
-- `AgentDeckCore` 只含 Foundation/Observation 代码，不得 import AppKit/UIKit；当前 Rust/GPUI macOS 桌面端不依赖它。
+- `AgentDeckMobileCore` 只含 Foundation/Observation 代码，不得 import AppKit/UIKit；当前 Rust/GPUI macOS 桌面端不依赖它。
 - iOS app 的唯一数据入口是 `MobileSessionSource` 协议；当前唯一实现是 `FixtureSessionSource`。真实数据源须在对应功能切片中重新设计。
 - 会话渲染路径按 `SessionCapabilities` 路由，禁止 `if agentKind == .codex` 硬编码分支（沿用 N2）。
 - vendor 原词（审批文案、徽章）原样展示，不强行统一语义。
@@ -97,7 +97,7 @@ protocol MobileSessionSource {
 }
 ```
 
-fixture 直接用协议 payload，不自造格式：JSON 为 `agentdeck-protocol` 语义的事件序列，用 `AgentDeckCore` 的 `V2Types` 解码，外层只套薄回放信封：
+fixture 直接用协议 payload，不自造格式：JSON 为 `agentdeck-protocol` 语义的事件序列，用 `AgentDeckMobileCore` 的 `V2Types` 解码，外层只套薄回放信封：
 
 ```json
 { "delayMs": 400, "event": { /* 协议原样的事件 payload */ } }
@@ -134,7 +134,7 @@ fixture 场景清单（bundle 内按场景分文件）：
 验证命令：
 
 ```bash
-# AgentDeckCore 单元测试
+# AgentDeckMobileCore 单元测试
 swift test
 
 # iOS 工程生成 + 构建 + 测试

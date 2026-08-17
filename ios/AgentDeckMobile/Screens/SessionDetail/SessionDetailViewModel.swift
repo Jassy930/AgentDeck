@@ -1,5 +1,5 @@
 import Foundation
-import AgentDeckCore
+import AgentDeckMobileCore
 
 enum ApprovalState: Equatable { case none, pending, approved, denied }
 
