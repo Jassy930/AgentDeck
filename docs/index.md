@@ -12,6 +12,7 @@
 ## 运行与诊断
 
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、failure code 和排查流程。
+- `AGENTDECKD_STATUS.md`：daemon 当前能力矩阵、完整度、证据边界和 desktop 接入前缺口。
 - `QUALITY.md`：按变更范围选择验证命令，以及文档结构检查入口。
 - `RUST_BUILD_STORAGE.md`：Rust 构建产物、sccache 容量上限和分 worktree 清理流程。
 
@@ -27,6 +28,11 @@
 - `plans/2026-08-17-gpui-desktop-reset-implementation.md`：当前切片的逐文件实施与验证命令。
 
 此前 macOS AppKit 文档仅保留为历史事实，不再定义当前桌面实现或默认迭代顺序。
+
+### agentdeckd 最小稳定边界（2026-08-17，当前设计）
+
+- `plans/2026-08-17-codex-app-server-lifecycle-adr.md`：决定由 `agentdeckd` 直接持有 session-scoped Codex app-server stdio 子进程，不采用 managed daemon/proxy。
+- `plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md`：desktop 接入前必须完成的 Codex-only M0、生命周期、不变量和验收门禁；当前状态是设计基线，尚未落地。
 
 ### iOS 前端计划（2026-07-03）
 

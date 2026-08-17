@@ -9,14 +9,16 @@
 3. `ARCHITECTURE.md`：GPUI 重启基线、稳定分层边界和后端不变量。
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
-6. `docs/QUALITY.md`：GPUI P0、共享 Core、backend 和文档质量门禁。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前 macOS 实现只以 `docs/plans/2026-08-17-gpui-desktop-reset-design.md` / implementation 为事实源；旧 AppKit 计划是历史记录，不定义当前桌面迭代顺序。
-8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
+6. `docs/AGENTDECKD_STATUS.md`：daemon 当前功能完整度、证据边界和关键缺口。
+7. `docs/QUALITY.md`：GPUI P0、共享 Core、backend 和文档质量门禁。
+8. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前 macOS 实现只以 `docs/plans/2026-08-17-gpui-desktop-reset-design.md` / implementation 为事实源；desktop 接入前的 daemon 边界以 `docs/plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md` 和 Codex 生命周期 ADR 为事实源。旧 AppKit 计划是历史记录，不定义当前桌面迭代顺序。
+9. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
 
 - AgentDeck 是 Coding Agent 的统一原生桌面客户端，把 Codex 和 Claude Code 作为绝对一等公民，不是 IDE、不是 Codex Desktop 替代品、不是通用多 agent 聊天界面。
 - 当前 macOS 桌面端是 `agentdeck-desktop/` 下的 Rust/GPUI 最小壳；尚未连接 daemon 或 IPC，也不恢复旧 AppKit 兼容层。
+- `agentdeckd` 的 Codex 本地链路固定为由 daemon 直接持有 session-scoped `codex app-server --listen stdio://` 子进程，不依赖 Codex managed daemon/proxy；该 M0 边界尚待代码验收，不能描述成已完成能力。
 - 后续会话 UI 必须通过 Rust typed router 按 `SessionCapabilities` 路由，禁止硬编码 vendor 分支（N2）。
 - IPC 主干类型严禁出现 vendor 字样；vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 命名空间（N1）。
 - Codex 细节只能留在 `agentdeckd/src/codex/` 子模块；CC 细节只能留在 `agentdeckd/src/claude_code/` 子模块；两者互不知晓（N3）。
@@ -46,7 +48,7 @@ swift test
 scripts/verify-agent-docs.sh
 ```
 
-涉及 GPUI 桌面时至少运行 desktop test、desktop selfcheck 和真实 bundle verify。涉及 daemon、IPC、记录、诊断、协议翻译时至少运行对应 focused test、`cargo test` 和 CLI selfcheck。涉及 `AgentDeckMobileCore` 或 iOS 时运行 `swift test`；涉及诊断、日志或数据目录时同时运行 daemon diagnostics report。
+涉及 GPUI 桌面时至少运行 desktop test、desktop selfcheck 和真实 bundle verify。涉及 daemon、IPC、记录、诊断、协议翻译时至少运行对应 focused test、daemon lib test 和 CLI selfcheck。当前 daemon lib test 会执行本地 vendor `--version`，虽不创建 session 或发送 prompt，但不是零 vendor process；部分 adapter shape 测试还会直接启动真实 vendor CLI。统一补上严格 `AGENTDECK_E2E=1` 门控和可注入版本探测前，不得把裸 `cargo test` 当作完全离线门禁；需要真实模型调用时必须先取得用户确认。涉及 `AgentDeckMobileCore` 或 iOS 时运行 `swift test`；涉及诊断、日志或数据目录时同时运行 daemon diagnostics report。
 
 ### iOS 前端验证
 
@@ -78,6 +80,11 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
 AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_claude_code -- --nocapture
 AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- --nocapture --test-threads=1
 ```
+
+当前 `agentdeckd/tests/cc_adapter_shape.rs` 中仍有未统一门控的真实 Claude Code
+prompt 测试，`codex_adapter_shape.rs` 也会在 PATH 命中时启动 app-server。修复该测试
+基础设施缺口前，标准 `cargo test -p agentdeckd` / `cargo test` 不是离线安全命令；
+现状与安全替代入口见 `docs/AGENTDECKD_STATUS.md` 和 `docs/QUALITY.md`。
 
 协议 schema 漂移测试随标准 `cargo test` 运行；改动 `agentdeck-protocol` 中的类型后须用以下命令重新生成快照：
 

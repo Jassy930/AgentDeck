@@ -25,6 +25,10 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 
 这些能力只按新的纵向切片逐步加入；当前仓库先收敛本地最小闭环。
 
+后端 `agentdeckd` 已有 Codex / Claude Code adapter、history、approval、record 和
+diagnostics 等较宽的代码表面，但还没有形成 desktop 可依赖的稳定 session 闭环。
+当前完整度和缺口见 [docs/AGENTDECKD_STATUS.md](docs/AGENTDECKD_STATUS.md)。
+
 ## 仓库结构
 
 ```text
@@ -92,8 +96,9 @@ cargo run -p agentdeck-desktop -- --selfcheck
 # iOS 共用 Swift Core
 swift test
 
-# 现有 Rust backend / protocol
-cargo test
+# 当前不创建真实 vendor session 的 Rust 基础门禁
+cargo test -p agentdeck-protocol
+cargo test -p agentdeckd --lib
 
 # 协议 schema 漂移
 cargo run -q -p agentdeck-cli -- protocol schema \
@@ -105,22 +110,31 @@ scripts/verify-agent-docs.sh
 
 只有改动对应层时才运行其门禁。
 
+`cargo test -p agentdeckd --lib` 当前仍会对 PATH 中的 `codex` / `claude` 执行本地
+`--version`；它不创建 session 或发送 prompt，但还不是零 vendor process 的 hermetic
+测试。裸 `cargo test -p agentdeckd` / `cargo test` 风险更高：shape test 会启动真实
+app-server，其中一项 Claude Code 测试会发送模型 prompt。统一补齐门控前，不把这些
+命令统称为完全离线；当前边界见 [docs/QUALITY.md](docs/QUALITY.md)。
+
 ## 下一条纵向切片
 
-桌面端的下一目标是本机最小闭环，而不是恢复旧客户端的全部功能：
+下一目标是先稳定 daemon，再开始 desktop 的真实连接，而不是恢复旧客户端的全部功能：
 
-1. 抽出一个 typed local client。
-2. 连接本机 `agentdeckd`。
-3. 只完成一个会话的启动、prompt、流式文本和结束状态。
-4. 在该闭环稳定后再增加历史、审批、Markdown 和多 agent 能力。
+1. 先完成 Codex-only 的 `agentdeckd` M0：session-scoped app-server、顺序 turn、真实流式文本、可信终态、取消、清理与可观测闭环。
+2. 用连续两轮和 cancel 后续轮的门控 E2E 验收 daemon；desktop 首切片仍只消费首轮。
+3. 再抽出 typed local client，并连接本机 `agentdeckd`。
+4. 在该闭环稳定后再增加历史、审批、Markdown、Claude Code 和多 agent 能力。
 
 设计和实施边界见：
 
 - `docs/plans/2026-08-17-gpui-desktop-reset-design.md`
 - `docs/plans/2026-08-17-gpui-desktop-reset-implementation.md`
+- `docs/plans/2026-08-17-codex-app-server-lifecycle-adr.md`
+- `docs/plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md`
 
 ## 文档入口
 
 - [ARCHITECTURE.md](ARCHITECTURE.md)：稳定边界与依赖方向。
 - [docs/index.md](docs/index.md)：文档导航和历史计划。
+- [docs/AGENTDECKD_STATUS.md](docs/AGENTDECKD_STATUS.md)：daemon 能力完整度与缺口。
 - [docs/QUALITY.md](docs/QUALITY.md)：按变更范围选择验证。

@@ -29,6 +29,7 @@ schema；`generate-ts --out DIR` 可生成 TypeScript binding。**不需要逆�
 固化进项目的关键 schema（`protocol/`）：
 - `JSONRPCMessage.json` — 消息信封（Request/Notification/Response/Error）
 - `ClientRequest.json` — 客户端可发的请求（方法名见 client-methods.txt）
+- `ClientNotification.json` — 客户端通知；0.145.0 当前定义 `initialized`（仓库当前缺失，M0 必须从官方生成物补入）
 - `ServerNotification.json` — 服务端通知（item 事件流在这里）
 - `ServerRequest.json` — 服务端发起的请求（approval 在这里）
 - `codex_app_server_protocol.v2.schemas.json` — v2 完整 schema
@@ -40,6 +41,7 @@ schema；`generate-ts --out DIR` 可生成 TypeScript binding。**不需要逆�
 ## 关键方法确认
 
 - `initialize` — 握手（实测：传 clientInfo，返 userAgent/codexHome/platform）
+- `initialized` — 收到 initialize response 后必须发送的 client notification，再进入 thread 请求
 - `thread/start` — 启动会话
 - `turn/start` — 启动一轮
 - `turn/interrupt` / `turn/steer` — 打断/引导当前 turn（D9 状态机 cancel 用）
@@ -72,6 +74,7 @@ AgentDeck v0.1 只暴露一次性 approve / deny：命令和文件请求映射�
 
 - **D7 → 已验证**：framing = 逐行 JSONL，最简单分支。BufReader 按行读。
 - **C-protocol 待补 → 已解决**：方法名、版本、schema 全部锁定并固化。
+- **M0 握手缺口**：0.145.0 官方生成物包含 `ClientNotification.json`，但当前仓库尚未提交该文件，live 与 short-lived adapter 也未发送 `initialized`；desktop 接入前必须补齐快照、实现和 fake/真实 E2E。
 - **D8 → 强化**：approval 元数据结构化，中立 action 抽象有可靠数据源。
 - **D2 → 实现路径清晰**：daemon 用官方 schema 反序列化 Codex 消息，
   翻译成中立 AgentItem，IPC 传中立 JSON。

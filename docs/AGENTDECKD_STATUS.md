@@ -6,8 +6,12 @@
 - 首次盘点基线：`7bebadc`（2026-08-17）
 - 当前桌面边界：GPUI 桌面尚未连接 daemon；本页的 backend 能力不能直接视为
   桌面端可用能力。
-- 当前 Codex 接入：`agentdeckd` 启动并连接 `codex app-server`；没有连接或依赖一个
-  名为“Codex daemon”的独立公开服务。
+- 当前 Codex 接入：`agentdeckd` 直接启动 `codex app-server` 子进程；不使用 managed
+  daemon/proxy。
+- desktop 接入前的目标边界：
+  `docs/plans/2026-08-17-codex-app-server-lifecycle-adr.md` 与
+  `docs/plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md`；两者是已接受设计，
+  不是当前实现状态。
 
 ## 状态定义
 
@@ -47,12 +51,12 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 | daemon runtime | cancel | 部分 | 能中止 pump 并结束 vendor 进程组；语义是结束整个短生命周期 vendor 进程，不是 vendor 原生 turn interrupt，也没有 steer。 | 两个 adapter 的 `cancel` 实现 |
 | admin | ping、协议版本/schema、agent list/capabilities | 较完整 | 已有 typed command 和 CLI 入口，回复由单 writer 输出。 | `agentdeckd/src/runtime/hub.rs`、`agentdeck-cli/src/` |
 | admin | selfcheck | 部分 | `agentdeckd --selfcheck` 验证数据目录、诊断和 record 写入；CLI selfcheck 验证 daemon IPC 与静态 adapter 注册。两者都不证明 vendor CLI 登录、握手、真实 turn 或历史来源健康。 | `agentdeckd/src/main.rs`、`agentdeckd/src/runtime/hub.rs` |
-| Codex | app-server 进程与 JSON-RPC | 部分 | 已有二进制定位、独立进程组、initialize response 关联、timeout 和 stderr drain；但没有发送规范握手所需的 `initialized` notification，`turn/start` 只写 frame 而不等待 response，mid-turn EOF 可静默结束 pump，turn terminal 后也未完成 child wait 与 session 路由清理。 | `agentdeckd/src/codex/app_server.rs`、`agentdeckd/src/codex/adapter.rs` |
+| Codex | app-server 进程与 JSON-RPC | 部分 | 已有二进制定位、独立进程组、initialize response 关联、timeout 和 stderr drain；但没有发送规范握手所需的 `initialized` notification，`turn/start` 只写 frame 而不等待 response，mid-turn EOF 可静默结束 pump；当前也没有 Ready 后在同一 session 发起下一轮的命令路径，以及显式 SessionClose、child wait 和 session 路由清理闭环。 | `agentdeckd/src/codex/app_server.rs`、`agentdeckd/src/codex/adapter.rs` |
 | Codex | 新 session | 部分 | 能执行 `thread/start` 与 `turn/start` 并产出中立事件；真实链路仍需门控 E2E，部分协议终态字段尚未正确消费。 | `agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/codex/translate.rs` |
 | Codex | continue | 部分 | `thread/resume` 实际只传 `threadId`，随后 `turn/start` 只下发固定的 medium effort。workspace-write/on-request 只是本地 translator 的审批上下文假定，没有恢复或下发到已有 thread。 | `agentdeckd/src/codex/adapter.rs` |
 | Codex | 消息、reasoning、plan、shell、diff、tool 翻译 | 部分 | 常见 completed item 能映射到中立类型，未知 item 有受限 raw 降级；若干 progress、usage 和 vendor panel 信息未进入主干。 | `agentdeckd/src/codex/translate.rs` |
 | Codex | 客户端可见实时 delta | 未接通 | translator 在 daemon 内累积 delta，只在 item completed 时发一次完整 `AgentItem`；客户端看不到 token/tool progress 流。 | `agentdeckd/src/codex/translate.rs` |
-| Codex | turn 终态 | 部分 | 已发 `TurnComplete`，但官方 status 与 duration 位于 `params.turn`，当前 translator 却读取 `params` 顶层且没有可靠映射 failed/interrupted。usage 来自独立的 `thread/tokenUsage/updated` notification，不在 `params.turn`；该 notification 当前被忽略。 | `agentdeckd/src/codex/translate.rs`、`protocol/ServerNotification.json` |
+| Codex | turn 终态 | 部分 | 已发 `TurnComplete`，但官方 status 与 duration 位于 `params.turn`，当前 translator 却读取 `params` 顶层，也没有把 completed/interrupted/failed 可靠映射为 succeeded/canceled/failed。usage 来自独立的 `thread/tokenUsage/updated` notification，不在 `params.turn`；该 notification 当前被忽略。 | `agentdeckd/src/codex/translate.rs`、`protocol/ServerNotification.json` |
 | Codex | command/file/permission 审批 | 部分 | JSON-RPC request 可映射为 `ActionRequest`，approve/deny 可按 rpc id 回写；`persist` 未真正参与响应，用户输入类请求也未形成统一回答闭环。 | `agentdeckd/src/codex/adapter.rs`、`agentdeckd/src/codex/translate.rs` |
 | Codex | history list/read | 部分 | 使用官方 `thread/list`、`thread/read(includeTurns=true)`，短生命周期 app-server 有方法级和总 timeout；但同样只等待 initialize response，没有发送 `initialized` notification，尚不满足固定协议版本的完整握手。 | `agentdeckd/src/codex/history.rs`、`agentdeckd/src/codex/app_server.rs` |
 | Codex | history archive/unarchive/rename | 未接通 | 三项当前都返回明确的 `codex-*-not-supported` 错误。 | `agentdeckd/src/codex/history.rs` |
@@ -63,7 +67,7 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 | Claude Code | 客户端可见实时 delta | 未接通 | `stream_event` partial delta 明确不发给客户端，只消费最终 snapshot。 | `agentdeckd/src/claude_code/translate.rs` |
 | Claude Code | 审批 | 骨架 | 有 request route 与 decision 写回代码，但 `permission_response` wire shape 在源码中仍标为 speculative，缺真实 fixture 与 E2E 证明。 | `agentdeckd/src/claude_code/adapter.rs` |
 | Claude Code | history list/read | 部分 | 能扫描 CC 原生 JSONL 并构造列表和读取结果；这是本地格式解析，需随受支持 CC 版本持续验证保真性。 | `agentdeckd/src/claude_code/history.rs` |
-| Claude Code | history rename | 较完整 | 通过 CC 原生 resume/name 命令更新标题，已有真实版本验证说明及 focused test。 | `agentdeckd/src/claude_code/history.rs` |
+| Claude Code | history rename | 部分 | 通过 CC 原生 resume/name 命令更新标题；单测只覆盖 custom-title 解析，真实 rename 仅存在门控 E2E，本次盘点未记录该 E2E 的实跑回执。 | `agentdeckd/src/claude_code/history.rs`、`agentdeck-cli/tests/e2e_claude_code.rs` |
 | Claude Code | history archive/unarchive | 未接通 | archive 对普通 print session 没有稳定原生语义，可能返回不支持；unarchive 当前只是无效果 Ack。 | `agentdeckd/src/claude_code/history.rs`、`agentdeckd/src/claude_code/adapter.rs` |
 | shared history | 跨 agent list | 较完整 | 两个来源并发查询、独立 deadline、best-effort 合并、按最近活动排序并应用总 limit；全部失败与合法空结果可区分。 | `agentdeckd/src/runtime/router.rs` |
 | vendor control | session 内控制更新 | 骨架 | typed payload 与路由存在；Codex 返回 requires-new-turn，CC 多数控制返回 requires-new-turn 或 not-supported。 | 两个 adapter 的 `submit_vendor_control` |
@@ -96,7 +100,7 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 
 ## 证据与验证边界
 
-### 当前可安全执行的离线验证
+### 当前不创建真实 vendor session 的验证
 
 ```bash
 env -u AGENTDECK_E2E cargo test -p agentdeck-protocol --lib
@@ -110,7 +114,10 @@ env -u AGENTDECK_E2E cargo test -p agentdeckd --test cc_system_events
 ```
 
 - 上述 lib 和 focused targets 不包含已知会启动真实 vendor session 的 shape tests，能证明
-  协议序列化、fixture 翻译、router 行为、timeout 与本地 helper 的确定性行为。
+  协议序列化、fixture 翻译、router 行为、timeout 与本地 helper 的确定性行为。但
+  `agentdeckd --lib` 的 capability probe 当前仍会对 PATH 中的 `codex` / `claude` 执行
+  本地 `--version`；它不发 prompt、不建 session，也不读真实 history，但不是零 vendor
+  process 的 hermetic 验证。
 - 在“默认测试离线安全”修复前，不要把 `cargo test`、`cargo test -p agentdeckd` 或
   `cargo test --workspace` 作为默认离线验证入口。
 - daemon/CLI selfcheck 和 diagnostics report 仍可用于显式 plumbing 排查，但它们会访问
@@ -129,8 +136,8 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- \
   vendor 会话的环境运行。
 - 当前门控不统一：CLI E2E 用“环境变量存在”判断，`AGENTDECK_E2E=0` 也会启用；部分
   daemon E2E 要求值严格等于 `1`；两个 adapter shape 文件则只看 vendor binary 是否在
-  PATH，完全不看该变量。离线 focused 命令必须用 `env -u AGENTDECK_E2E`，真实验证统一
-  显式使用 `AGENTDECK_E2E=1`。
+  PATH，完全不看该变量。上述不创建 session/prompt 的 focused/lib 命令必须用
+  `env -u AGENTDECK_E2E`，真实验证统一显式使用 `AGENTDECK_E2E=1`。
 - 未启用真实门禁时显示 passed 可能只是测试提前返回；该结果不能作为真实 Codex 或
   Claude Code 链路证据。
 - E2E 当前主要验证响应契约形态，不证明流式 delta、审批、取消、配置恢复和所有历史
@@ -149,6 +156,7 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- \
 4. capabilities 必须与本页和真实实现一致；能力降级或暂未验证时，优先收紧声明。
 5. 每次更新记录新的审计提交和日期；已解决缺口从本页删除，设计取舍与实施步骤写入
    `docs/plans/`，不要把本页扩成实施日志。
-6. 在默认测试离线安全修复前，收口只运行明确审计为安全的 lib/focused targets；真实
-   vendor 验证必须显式授权并使用 `AGENTDECK_E2E=1`。随后运行
+6. 在默认测试离线安全修复前，收口只运行明确审计为不创建真实 session/prompt 的
+   lib/focused targets，并披露 lib 的本地 `--version` probe；真实 vendor 验证必须显式
+   授权并使用 `AGENTDECK_E2E=1`。随后运行
    `scripts/verify-agent-docs.sh` 和 `git diff --check`，只报告实际运行过的命令。

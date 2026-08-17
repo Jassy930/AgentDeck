@@ -35,12 +35,19 @@
 
 ## 当前目录状态
 
-当前桌面实现的目标事实源：
+当前桌面实现的事实源：
 
 - `2026-08-17-gpui-desktop-reset-design.md`
 - `2026-08-17-gpui-desktop-reset-implementation.md`
 
+desktop 接入前的 daemon 目标事实源（已接受设计，尚未完成代码验收）：
+
+- `2026-08-17-codex-app-server-lifecycle-adr.md`
+- `2026-08-17-agentdeckd-minimum-stable-boundary-design.md`
+
 此前 AppKit 统一壳计划保留为历史记录，不再定义当前 macOS 桌面实现或默认迭代顺序。
+其中出现的 `AgentDeckCore` 是当时的模块名；当前移动共享模块统一为
+`AgentDeckMobileCore`，历史代码片段不作为当前构建入口。
 
 现有计划暂时保留在 `docs/plans/` 根目录，避免为了归档制造大规模文件移动。后续当计划数量继续增长时，再引入：
 

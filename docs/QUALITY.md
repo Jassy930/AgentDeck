@@ -16,11 +16,28 @@ bash -n script/build_and_run.sh
 # iOS 共用 Swift Core
 swift test
 
-# backend / protocol（改到对应层时）
-cargo test
+# 当前不创建真实 vendor session 的 backend / protocol 基础门禁
+cargo test -p agentdeck-protocol
+cargo test -p agentdeckd --lib
+cargo test -p agentdeckd --test agent_router
+cargo test -p agentdeckd --test agent_trait_shape
+cargo test -p agentdeckd --test cc_fixture_replay
+cargo test -p agentdeckd --test cc_system_events
+cargo test -p agentdeckd --test cc_translate
+cargo test -p agentdeckd --test codex_translate
 cargo run -p agentdeck-cli -- selfcheck
 scripts/verify-agent-docs.sh
 ```
+
+`cargo test -p agentdeckd --lib` 中的 capability probe 测试当前会对 PATH 中的
+`codex` / `claude` 执行本地 `--version`。它不创建 session、不读真实 history，也不发
+prompt，但仍不是零 vendor process 的 hermetic 单测；M0 实现应改用可注入 fake binary。
+
+`agentdeckd/tests/cc_adapter_shape.rs` 的部分测试只在 PATH 找不到 `claude` 时跳过，
+其中一项会发送真实模型 prompt；`codex_adapter_shape.rs` 也会在 PATH 命中时启动真实
+app-server。它们尚未统一使用 `AGENTDECK_E2E=1`，因此裸
+`cargo test -p agentdeckd` / `cargo test` 目前不是离线安全门禁。实现侧补齐门控前，
+只运行上面的 lib/focused 列表；真实 vendor 测试须取得用户确认并单独记录。
 
 ## GPUI 桌面 P0 门禁
 
@@ -83,14 +100,15 @@ macOS 桌面不得重新依赖 Swift target；共享 Core 测试也不得重新�
 | GPUI 视图、状态或组件 | `cargo test -p agentdeck-desktop`、desktop selfcheck、真实窗口冒烟 |
 | 桌面 bundle 或启动脚本 | `bash -n script/build_and_run.sh`、`./script/build_and_run.sh --verify` |
 | Swift Core / iOS 共享模型 | `swift test`；涉及 iOS 时再跑 iOS Simulator 测试 |
-| daemon、adapter、record、diagnostics | 对应 focused test，再跑 `cargo test` 和 CLI selfcheck |
-| agentdeck-protocol | `cargo test`；漂移时按下文重生成 schema |
+| daemon、adapter、record、diagnostics | 对应不创建真实 session 的 focused test、`cargo test -p agentdeckd --lib` 和 CLI selfcheck；lib 当前仍会执行本地 vendor `--version`，不要裸跑全量测试 |
+| agentdeck-protocol | `cargo test -p agentdeck-protocol`；漂移时按下文重生成 schema |
 | 文档、AGENTS、计划规则 | `scripts/verify-agent-docs.sh` |
-| 全局依赖或 workspace | `cargo test`、`swift test`、desktop selfcheck、doc check |
+| 全局依赖或 workspace | 当前先跑上列不创建真实 session/prompt 的分层 Cargo 门禁、`swift test`、desktop selfcheck 和 doc check；统一 E2E gate 与版本 probe 注入后恢复 `cargo test` |
 
 ## Codex vendor schema 快照
 
-`protocol/ClientRequest.json` 等文件是 Codex app-server 的 vendor 协议快照，
+`protocol/ClientRequest.json` 等文件是 Codex app-server 的 vendor 协议快照；M0
+还必须从同一官方生成物补入当前缺失的 `protocol/ClientNotification.json`，
 与 AgentDeck 自身 schemars 生成的
 `protocol/agentdeck/agentdeck-protocol.schema.json` 是两套独立门禁。
 `cargo test` 通过不能证明本机 Codex 版本与 vendor 快照一致。
@@ -122,7 +140,7 @@ jq -er '
 ' "$SCHEMA_DIR/ClientRequest.json" > "$SCHEMA_DIR/client-methods.txt"
 ```
 
-升级刷新时，将 `ClientRequest.json`、`JSONRPCMessage.json`、
+升级刷新时，将 `ClientRequest.json`、`ClientNotification.json`、`JSONRPCMessage.json`、
 `ServerNotification.json`、`ServerRequest.json`、
 `codex_app_server_protocol.v2.schemas.json` 与 `client-methods.txt` 复制到
 `protocol/`，再把 `ACTUAL_VERSION` 写入 `CODEX_VERSION.txt`。同版本复验时先运行：
@@ -131,7 +149,7 @@ jq -er '
 test "$ACTUAL_VERSION" = "$(cat protocol/CODEX_VERSION.txt)"
 ```
 
-四个独立 schema 与 `client-methods.txt` 的输出顺序稳定，提交前逐文件运行
+五个独立 schema 与 `client-methods.txt` 的输出顺序稳定，提交前逐文件运行
 `cmp`。聚合的 `codex_app_server_protocol.v2.schemas.json` 中 definitions 顺序
 可能在相同版本的两次官方生成之间变化，必须用 `jq -S` 规范化后比较，不能把
 raw byte 顺序差异误判成协议漂移：
@@ -145,8 +163,9 @@ cmp "$SCHEMA_DIR/committed-v2.normalized.json" \
   "$SCHEMA_DIR/generated-v2.normalized.json"
 ```
 
-确认 method 表行数和内容一致后，再运行 `cargo test`、
-`scripts/verify-agent-docs.sh` 和 `git diff --check`。当前稳定合约不使用
+确认 method 表行数和内容一致后，当前先运行 `cargo test -p agentdeck-protocol`、
+`scripts/verify-agent-docs.sh` 和 `git diff --check`；只有全部 real-vendor tests 已统一受
+`AGENTDECK_E2E=1` 门控后，才恢复裸 `cargo test` 收口。当前稳定合约不使用
 `--experimental`；只有客户端显式启用 `experimentalApi` 时才建立独立实验基线。
 
 ## AgentDeck IPC schema 漂移测试
@@ -184,13 +203,23 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_claude_code -- --nocaptur
 AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- --nocapture --test-threads=1
 ```
 
-**门控机制：** 每个测试在未设置环境变量 `AGENTDECK_E2E` 时 `eprintln!("skipped...")` 后直接早返回（不是 `#[ignore]`，因此不能用 `--ignored` 启用；标准 `cargo test` 中显示为 passed 而非 ignored）。设 `AGENTDECK_E2E=1`（需 `codex login`）才真正运行。
+**当前门控机制：** 每个 CLI E2E 只检查环境变量 `AGENTDECK_E2E` 是否存在；未设置时
+`eprintln!("skipped...")` 后直接早返回（不是 `#[ignore]`，因此不能用 `--ignored`
+启用；标准 `cargo test` 中显示为 passed 而非 ignored）。任何已设置值，包括 `0`，当前
+都会启用真实路径。执行时统一显式使用 `AGENTDECK_E2E=1`；需要跳过时必须彻底 unset。
+M0 第一项测试基础设施工作是把判断收紧为值严格等于 `1`。
 
 **前置条件：** `codex login` 已完成（测试会真实 spawn daemon 并发送 IPC）。
 
 **断言策略：** E2E 测试只断言响应的契约形态（消息 kind、必要字段存在、退出码等），不断言 agent 返回的具体文本内容，以避免测试因模型输出变化而 flaky。
 
-**CI 默认跳过：** 不设置 `AGENTDECK_E2E=1` 时，标准 `cargo test` 不触发真实 E2E，不需要 `codex login`。
+**CI 默认跳过：** 完全未设置 `AGENTDECK_E2E` 时，这三组 CLI E2E 会早返回，不需要
+`codex login`。设置为 `0` 并不会跳过。
+
+上句目前只对 `agentdeck-cli/tests/e2e_*` 的“变量未设置”情况成立；adapter shape
+测试仍有上述门控缺口，lib capability probe 也会执行本地 vendor `--version`。把所有
+真实 Codex / Claude Code 测试统一迁到值严格等于 `AGENTDECK_E2E=1` 的门控，并把版本
+probe 改为可注入 fake 后，才能恢复“标准 `cargo test` 完全离线”的仓库级承诺。
 
 ## 文档结构检查
 
