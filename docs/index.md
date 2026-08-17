@@ -4,7 +4,7 @@
 
 ## 顶层文档
 
-- `../NORTH_STAR.md`：产品北极星、v0.1 双拍和不做什么。
+- `../NORTH_STAR.md`：产品北极星、当前必赢目标和不做什么。
 - `../README.md`：项目介绍、当前功能、构建运行和测试入口。
 - `../ARCHITECTURE.md`：稳定架构、分层边界、依赖方向和不变量。
 - `../AGENTS.md`：代理工作入口和仓库导航。
@@ -13,6 +13,7 @@
 
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、failure code 和排查流程。
 - `QUALITY.md`：按变更范围选择验证命令，以及文档结构检查入口。
+- `RUST_BUILD_STORAGE.md`：Rust 构建产物、sccache 容量上限和分 worktree 清理流程。
 
 ## 计划与历史
 
@@ -20,12 +21,20 @@
 - `plans/*-design.md`：功能设计、架构取舍和验收标准。
 - `plans/*-implementation.md`：可执行实施步骤、验证命令和收口记录。
 
+### GPUI 桌面端重启（2026-08-17，当前）
+
+- `plans/2026-08-17-gpui-desktop-reset-design.md`：删除旧 AppKit target、建立最小 GPUI 桌面壳的目标、边界和验收标准。
+- `plans/2026-08-17-gpui-desktop-reset-implementation.md`：当前切片的逐文件实施与验证命令。
+
+此前 macOS AppKit 和 Relay companion 文档保留为历史事实，不再定义当前桌面实现或
+默认迭代顺序。
+
 ### iOS 前端计划（2026-07-03）
 
 - `plans/2026-07-03-ios-uikit-frontend-design.md`：iOS UIKit companion 前端设计（fixture 驱动，R3 界面骨架，状态：Implemented）。
 - `plans/2026-07-03-ios-uikit-frontend-implementation.md`：iOS UIKit companion 前端实施计划（Task 1–15，含 AgentDeckCore 共享库抽取）。
 
-### macOS 富文本渲染（2026-07-23）
+### macOS AppKit 富文本渲染（2026-07-23，历史）
 
 - `plans/2026-07-23-native-markdown-table-rendering-implementation.md`：在现有 TextKit/NSAttributedString 管线中增加 GFM 表格识别、`NSTextTable` 原生布局、流式降级与像素快照门禁。
 

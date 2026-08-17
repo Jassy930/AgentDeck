@@ -12,18 +12,23 @@ APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_BINARY="$APP_MACOS/$APP_NAME"
-BUNDLED_DAEMON="$APP_MACOS/agentdeckd"
-RESOURCE_BUNDLE_NAME="${APP_NAME}_${APP_NAME}.bundle"
-BUNDLED_RESOURCE_BUNDLE="$APP_BUNDLE/$RESOURCE_BUNDLE_NAME"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
-DAEMON_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+DESKTOP_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 
-if [[ "$DAEMON_TARGET_DIR" != /* ]]; then
-  DAEMON_TARGET_DIR="$ROOT_DIR/$DAEMON_TARGET_DIR"
+if [[ "$DESKTOP_TARGET_DIR" != /* ]]; then
+  DESKTOP_TARGET_DIR="$ROOT_DIR/$DESKTOP_TARGET_DIR"
 fi
-DAEMON_BINARY="$DAEMON_TARGET_DIR/debug/agentdeckd"
+BUILD_BINARY="$DESKTOP_TARGET_DIR/debug/agentdeck-desktop"
 
 cd "$ROOT_DIR"
+
+case "$MODE" in
+  run|--debug|debug|--logs|logs|--telemetry|telemetry|--verify|verify) ;;
+  *)
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
+    exit 2
+    ;;
+esac
 
 process_executable_path() {
   local pid="$1"
@@ -64,27 +69,18 @@ stop_current_bundle_instances() {
 
 stop_current_bundle_instances
 
-cargo build -p agentdeckd --target-dir "$DAEMON_TARGET_DIR"
-swift build
-SWIFT_BIN_DIR="$(swift build --show-bin-path)"
-BUILD_BINARY="$SWIFT_BIN_DIR/$APP_NAME"
-BUILD_RESOURCE_BUNDLE="$SWIFT_BIN_DIR/$RESOURCE_BUNDLE_NAME"
+MACOSX_DEPLOYMENT_TARGET="$MIN_SYSTEM_VERSION" \
+  cargo build -p agentdeck-desktop --target-dir "$DESKTOP_TARGET_DIR"
 
-if [[ ! -x "$DAEMON_BINARY" ]]; then
-  echo "agentdeckd build output not found: $DAEMON_BINARY" >&2
-  exit 1
-fi
-if [[ ! -d "$BUILD_RESOURCE_BUNDLE" ]]; then
-  echo "SwiftPM resource bundle not found: $BUILD_RESOURCE_BUNDLE" >&2
+if [[ ! -x "$BUILD_BINARY" ]]; then
+  echo "agentdeck-desktop build output not found: $BUILD_BINARY" >&2
   exit 1
 fi
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS"
 cp "$BUILD_BINARY" "$APP_BINARY"
-cp "$DAEMON_BINARY" "$BUNDLED_DAEMON"
-cp -R "$BUILD_RESOURCE_BUNDLE" "$BUNDLED_RESOURCE_BUNDLE"
-chmod +x "$APP_BINARY" "$BUNDLED_DAEMON"
+chmod +x "$APP_BINARY"
 
 cat >"$INFO_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -113,23 +109,9 @@ open_app() {
 
 verify_running_bundle() {
   local app_pid=""
-  local daemon_pid=""
   local actual_min_system_version=""
   local binary_min_system_version=""
   local candidate_pid=""
-
-  [[ -x "$BUNDLED_DAEMON" ]] || {
-    echo "verify failed: bundled agentdeckd is missing or not executable" >&2
-    return 1
-  }
-  [[ -f "$BUNDLED_RESOURCE_BUNDLE/Assets.xcassets/CodexIcon.imageset/codex.svg" ]] || {
-    echo "verify failed: bundled Codex icon resource is missing" >&2
-    return 1
-  }
-  [[ -f "$BUNDLED_RESOURCE_BUNDLE/Assets.xcassets/ClaudeCodeIcon.imageset/claudecode.svg" ]] || {
-    echo "verify failed: bundled Claude Code icon resource is missing" >&2
-    return 1
-  }
 
   actual_min_system_version="$(
     /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$INFO_PLIST" 2>/dev/null || true
@@ -159,28 +141,15 @@ verify_running_bundle() {
     done < <(pgrep -x "$APP_NAME" || true)
 
     if [[ -n "$app_pid" ]]; then
-      daemon_pid=""
-      while IFS= read -r candidate_pid; do
-        [[ -n "$candidate_pid" ]] || continue
-        if [[ "$(process_executable_path "$candidate_pid")" == "$BUNDLED_DAEMON" ]]; then
-          daemon_pid="$candidate_pid"
-          break
-        fi
-      done < <(pgrep -P "$app_pid" -x agentdeckd || true)
-
-      if [[ -n "$daemon_pid" ]]; then
-        echo "verify OK: $APP_BINARY pid=$app_pid"
-        echo "verify OK: $BUNDLED_DAEMON pid=$daemon_pid"
-        echo "verify OK: $BUNDLED_RESOURCE_BUNDLE"
-        echo "verify OK: LSMinimumSystemVersion=$actual_min_system_version"
-        echo "verify OK: Mach-O minos=$binary_min_system_version"
-        return 0
-      fi
+      echo "verify OK: $APP_BINARY pid=$app_pid"
+      echo "verify OK: LSMinimumSystemVersion=$actual_min_system_version"
+      echo "verify OK: Mach-O minos=$binary_min_system_version"
+      return 0
     fi
     sleep 0.1
   done
 
-  echo "verify failed: $APP_NAME did not start a bundled agentdeckd child" >&2
+  echo "verify failed: $APP_NAME did not start from $APP_BINARY" >&2
   return 1
 }
 

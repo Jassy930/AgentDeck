@@ -7,13 +7,8 @@ import Foundation
 /// `firstInTurn`/`lastInTurn` carry the turn-boundary flags needed for
 /// visual grouping without requiring the table to look up neighbours.
 ///
-/// Approval (`pendingActionRequest`) is a separate field on `ThreadRuntimeModel`
-/// and is NOT represented here — it is rendered independently by the
-/// ConversationViewController (Task 8).
-///
-/// Error/warning messages (`errorMessage`/`warningMessage`) are also separate
-/// model fields, not `UIItem` kinds, so they are likewise excluded from the
-/// flattened stream.
+/// Approval, error and warning state are not `UIItem` kinds, so clients project
+/// them separately instead of synthesizing transcript rows here.
 public struct ConversationDisplayRow: Identifiable {
 
     public enum Role: Equatable {
@@ -24,9 +19,9 @@ public struct ConversationDisplayRow: Identifiable {
     public let role: Role
     public let turnId: String
     public let item: UIItem
-    /// Present only for the macOS opt-in collapsed execution summary. `item`
-    /// remains the first real activity item, so no synthetic `UIItem.kind`
-    /// leaks into the shared agent model or iOS renderer.
+    /// Present only when a client opts into collapsed execution summaries.
+    /// `item` remains the first real activity item, so no synthetic
+    /// `UIItem.kind` leaks into the shared agent model.
     public let toolActivityGroup: ConversationToolActivityGroup?
     public let firstInTurn: Bool
     public let lastInTurn: Bool
@@ -86,47 +81,6 @@ public enum ConversationToolGroupingPolicy {
     case consecutiveActivity
 }
 
-// MARK: - Reload decision
-
-/// The structural relationship between a previously displayed row sequence and a
-/// freshly rebuilt one, used by `ConversationViewController` to pick the cheapest
-/// correct table-view update.
-public enum ConversationRowsDiff: Equatable {
-    /// The `row.id` sequence is identical — the only thing that can have changed
-    /// is streaming text growth inside existing rows. No cell needs to be
-    /// reconfigured (each cell already streams its own buffer); the table only
-    /// needs row-height re-measurement. Carries the offsets whose content
-    /// version changed so the controller can `noteHeightOfRows` precisely.
-    case sameRows(changedIndexes: [Int])
-    /// The id sequence differs (append / remove / reorder). The controller falls
-    /// back to a full `reloadData()` for correctness; disclosure state (C1) is
-    /// restored from the persisted set and selection (C2) is protected by the
-    /// unchanged-guards, so a reload no longer destroys user state.
-    case structural
-
-    /// Decide how the table should update from `previous` to `next`.
-    ///
-    /// Pure function of the two id/version sequences so it is unit-testable
-    /// without any AppKit view. When the id sequence matches, only rows whose
-    /// content `version` changed are reported as needing height re-measurement.
-    public static func decide<Version: Equatable>(
-        previous: [(id: String, version: Version)],
-        next: [(id: String, version: Version)]
-    ) -> ConversationRowsDiff {
-        guard previous.count == next.count else { return .structural }
-        var changed: [Int] = []
-        for index in next.indices {
-            if previous[index].id != next[index].id {
-                return .structural
-            }
-            if previous[index].version != next[index].version {
-                changed.append(index)
-            }
-        }
-        return .sameRows(changedIndexes: changed)
-    }
-}
-
 // MARK: - Builder
 
 public enum ConversationDisplayRowBuilder {
@@ -144,8 +98,8 @@ public enum ConversationDisplayRowBuilder {
         var out: [ConversationDisplayRow] = []
         for turn in turns {
             // Collect presentation entries for this turn. Grouping defaults to
-            // off so existing shared/iOS callers retain the one-item-per-row
-            // contract; the macOS controller opts in explicitly.
+            // off so callers retain the one-item-per-row contract unless they
+            // explicitly opt into grouped presentation.
             var entries: [PendingRow] = []
             if let user = turn.user {
                 entries.append(PendingRow(role: .userPrompt, item: user, group: nil))

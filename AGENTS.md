@@ -4,26 +4,27 @@
 
 ## 必读顺序
 
-1. `NORTH_STAR.md`：产品北极星和 v0.2 必赢目标。
+1. `NORTH_STAR.md`：产品北极星和当前必赢目标。
 2. `README.md`：当前用户可见能力、架构摘要、构建与测试命令。
-3. `ARCHITECTURE.md`：稳定架构、分层边界、依赖方向和不变量（v0.2 含 N1–N8 新不变量）。
+3. `ARCHITECTURE.md`：GPUI 重启基线、稳定分层边界和后端不变量。
 4. `docs/index.md`：文档记录系统导航。
 5. `docs/AGENT_DIAGNOSTICS.md`：自检、诊断日志和 failure code（含 CC adapter failure codes）。
-6. `docs/QUALITY.md`：验证命令、质量门禁和文档结构检查（含 v0.2 手动 QA 清单）。
-7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前实现基线仍以 `docs/plans/2026-06-30-unified-shell-v02-design.md` / implementation 为准；Relay 下一阶段以已批准的 `docs/plans/2026-07-10-relay-companion-mvp-design.md` 和 `docs/plans/2026-07-10-relay-companion-mvp-implementation.md` 为目标事实源与执行清单。
+6. `docs/QUALITY.md`：GPUI P0、共享 Core、backend 和文档质量门禁。
+7. `docs/plans/README.md` 与 `docs/plans/`：设计文档和实施计划规则。当前 macOS 实现只以 `docs/plans/2026-08-17-gpui-desktop-reset-design.md` / implementation 为事实源；旧 AppKit 与 Relay companion 计划是历史记录，不定义当前桌面迭代顺序。
 8. `protocol/SPIKE_FINDINGS.md` 与 `protocol/`：Codex app-server 协议事实源。
 
 ## 项目边界
 
 - AgentDeck 是 Coding Agent 的统一原生桌面客户端，把 Codex 和 Claude Code 作为绝对一等公民，不是 IDE、不是 Codex Desktop 替代品、不是通用多 agent 聊天界面。
-- v0.2 核心：IPC v2 双层协议 + ClaudeCodeAdapter MVP + CapabilityRouter + 跨 agent 历史聚合。
-- UI 必须通过 `CapabilityRouter` 按 `SessionCapabilities` 路由渲染路径，禁止 `if agentKind == .codex` 硬编码分支（N2）。
+- 当前 macOS 桌面端是 `agentdeck-desktop/` 下的 Rust/GPUI 最小壳；不接 daemon、IPC 或 Relay，也不恢复旧 AppKit 兼容层。
+- 后续会话 UI 必须通过 Rust typed router 按 `SessionCapabilities` 路由，禁止硬编码 vendor 分支（N2）。
 - IPC 主干类型严禁出现 vendor 字样；vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 命名空间（N1）。
 - Codex 细节只能留在 `agentdeckd/src/codex/` 子模块；CC 细节只能留在 `agentdeckd/src/claude_code/` 子模块；两者互不知晓（N3）。
 - `protocol/` 中 Codex schema 必须来自官方 `codex app-server generate-json-schema`，不要手写或逆向猜测协议（K8）。
 - AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）；CC 历史走 CC 原生接口，不建 `cc-meta/` 目录（K9、N8）。
 - AgentDeck 管理的 run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`，不得写入用户项目 git（K5）。
-- `Sources/AgentDeckCore/` 是 macOS/iOS 共享的平台无关层，禁止 import AppKit/UIKit；`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是 `MobileSessionSource`，本期不含网络代码（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
+- `Sources/AgentDeckCore/` 是 iOS 使用的平台无关 Swift 层，禁止 import AppKit/UIKit；macOS GPUI target 不依赖它。`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是 `MobileSessionSource`，本期不含网络代码（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
+- Relay crates 保留但与 GPUI 桌面解耦；除非任务明确落在 Relay，不把 Relay 构建、设计或测试加入桌面切片。
 
 ## 工作规则
 
@@ -39,14 +40,14 @@
 按变更范围选择最小但足够的验证：
 
 ```bash
-cargo test
+cargo test -p agentdeck-desktop
+cargo run -p agentdeck-desktop -- --selfcheck
+./script/build_and_run.sh --verify
 swift test
-swift run AgentDeck -- --selfcheck
-swift run AgentDeck -- --diagnostics-report --json
 scripts/verify-agent-docs.sh
 ```
 
-涉及 daemon、IPC、记录、诊断、协议翻译时至少运行 `cargo test` 和自检。涉及 Swift UI、会话模型、历史回放、富文本渲染时至少运行 `swift test`。涉及诊断、日志或数据目录时同时运行 diagnostics report。
+涉及 GPUI 桌面时至少运行 desktop test、desktop selfcheck 和真实 bundle verify。涉及 daemon、IPC、记录、诊断、协议翻译时至少运行对应 focused test、`cargo test` 和 CLI selfcheck。涉及 `AgentDeckCore` 或 iOS 时运行 `swift test`；涉及诊断、日志或数据目录时同时运行 daemon diagnostics report。
 
 ### iOS 前端验证
 
@@ -86,6 +87,8 @@ UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapsh
 ```
 
 ### Relay R1a（传输 + 鉴权骨架）
+
+以下命令只用于明确的 Relay 任务，不属于 GPUI 桌面默认门禁。
 
 ```bash
 # Relay 服务端（server feature）测试

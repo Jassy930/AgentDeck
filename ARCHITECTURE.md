@@ -1,4 +1,4 @@
-# AgentDeck 架构（v0.2）
+# AgentDeck 架构（GPUI 重启基线）
 
 本文件记录稳定架构边界。产品定位、使用方式和构建命令见 `README.md`；具体功能设计和实施历史见 `docs/plans/`。
 
@@ -8,49 +8,33 @@ AgentDeck 是 Coding Agent 的统一原生桌面客户端。它把 OpenAI Codex 
 
 AgentDeck 不做 IDE，不做通用多 agent 聊天界面，不是 Codex Desktop 替代品。
 
-## 总体结构（v0.2）
+## 当前总体结构
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
-│  AgentDeck.app (macOS, AppKit)                                  │
-│                                                                 │
-│  SessionViewController                                          │
-│   ├─ StatusBarView（当前 agentKind + auth）                      │
-│   ├─ HistorySidebarVC（跨 agent 合并列表）                         │
-│   ├─ AgentControlBar（capability 路由 → vendor SubView）          │
-│   ├─ ConversationVC（虚拟化 NSTableView，中立 AgentItem）          │
-│   ├─ ApprovalCardView（主干壳 + vendor 高级区 SubView）            │
-│   └─ AgentTokenAuthMiniPanel                                    │
-│                                                                 │
-│  CapabilityRouter  ← 新增：UI 渲染按 SessionCapabilities 派发    │
-│  ObservationBinder ← 保留：@Observable 模型绑定                  │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ Layer A 中立事件主干（AgentItem）
-                           │ Layer B Vendor 控件命名空间
-                           │ Layer C 启动配置（SessionStart）
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  agentdeckd (Rust daemon)                                       │
-│  RuntimeHub（stdin loop, stdout writer, per-session lock）       │
-│       │                                                         │
-│       └─→ AgentRouter（按 sessionId.agentKind 路由）              │
-│            ├─ CodexAdapter      (capabilities = {...})          │
-│            └─ ClaudeCodeAdapter (capabilities = {...})          │
-│                                                                 │
-│  共享层：record / diag / profile / capabilities registry         │
-└─────────────────────────────────────────────────────────────────┘
-   ▼ spawn (turn-scoped)                  ▼ spawn (turn-scoped)
-codex app-server                       claude CLI (--print --stream-json)
+AgentDeck.app
+└─ agentdeck-desktop（Rust / GPUI / gpui-component）
+   ├─ Application + Window
+   ├─ Root + 最小组件树
+   └─ --selfcheck
 
-agentdeck-cli  (参考客户端 / 门控 E2E 驱动，不在 GUI 实时通路上)
-      │  通过 stdio JSONL 与 agentdeckd 交互（Transport trait）
-      ▼
-agentdeckd
+agentdeckd / agentdeck-protocol / agentdeck-cli
+└─ 现有后端与协议，当前尚未接入 GPUI 桌面端
+
+agentdeck-relay / agentdeck-relay-client
+└─ 独立代码线，不是桌面启动依赖或默认门禁
+
+AgentDeckCore + ios/
+└─ iOS companion 使用的 Swift 共享模型和 UIKit 前端
 ```
+
+下一阶段唯一允许的本机桌面通路是
+`agentdeck-desktop → typed local client → agentdeckd`。在该通路真正落地前，文档和
+selfcheck 都必须明确桌面端没有 backend 能力。
 
 ## 分层边界
 
-- `Sources/AgentDeck/`：macOS 原生 UI、会话模型、历史回放和本地交互。UI 只能通过 `CapabilityRouter` 消费 `SessionCapabilities` 决定渲染路径，禁止直接读 vendor 字段或硬编码 `if agentKind == .codex` 分支。
+- `agentdeck-desktop/`：macOS GPUI executable。当前只负责窗口、组件根节点和桌面 selfcheck；不得直接依赖 Relay 或解析 vendor JSON。
+- `Sources/AgentDeckCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
 - `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/agent.rs`：`Agent` trait + `AgentKind` 枚举。两个 adapter 共享的逻辑在此，不得让 adapter 相互引用。
@@ -59,7 +43,7 @@ agentdeckd
 - `agentdeckd/src/claude_code/`：ClaudeCodeAdapter。`claude` CLI 子进程接入，stream-json 解析，CC 特色能力（auth / history / permission / hooks）实现在此。
 - `agentdeckd/src/record.rs`：run record 写入与脱敏，写入包含 `agent_kind` 字段。
 - `agentdeckd/src/diag.rs`：诊断日志、自检和机器可读诊断报告，诊断事件带 `agent_kind`。
-- `agentdeck-cli/`：参考客户端与门控 E2E 驱动。提供 `agentdeck` 二进制，不在 Swift GUI 实时通路上。
+- `agentdeck-cli/`：参考客户端与门控 E2E 驱动。提供 `agentdeck` 二进制，不在 GUI 实时通路上。
 - `protocol/`：官方 Codex app-server schema 快照和 spike 事实源。
 - `protocol/agentdeck/`：AgentDeck 自身中立协议 JSON Schema 快照（schemars 派生，`cargo test` 漂移测试守护）。
 - `docs/plans/`：设计、实施计划和决策历史。
@@ -78,7 +62,7 @@ agentdeckd
 
 - **K1**：daemon 的 stdin 主循环不得被单个 turn 阻塞；长时间工作放到 worker。
 - **K2**：`RuntimeHub` 必须按 `sessionId` 阻止同一 runtime 并发 turn；session 创建时 `agentKind` 不可变，整个生命周期固定到一个 adapter。
-- **K3**：turn 成功完成时，worker 必须先释放 session 占用，再向 Swift 发出可触发下一条 prompt 的 ready / `turnComplete` 事件。
+- **K3**：turn 成功完成时，worker 必须先释放 session 占用，再向客户端发出可触发下一条 prompt 的 ready / `turnComplete` 事件。
 - **K4**（加强）：所有事件主干消息必须带 `agentKind` 字段。
 - **K5**：run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（stable）或 `AgentDeck-Dev/`（dev），不得写入用户项目 git。
 - **K6**：`AGENTDECK_DATA_DIR` / `--profile` / `AGENTDECK_PROFILE` 控制数据目录隔离，不影响 vendor 登录状态或 vendor 历史。
@@ -86,14 +70,14 @@ agentdeckd
 - **K8**：vendor schema 不手写，Codex 协议来自官方 `codex app-server generate-json-schema`。
 - **K9**：AgentDeck 不读取、不保存、不转发任何 vendor token（Codex 或 Claude Code）。
 - **K10**：`schema_matches_committed_snapshot` 漂移测试随 `cargo test` 运行；协议类型变更未重生成快照则失败。
-- **K11**：历史管理请求的 `requestId` 在线协议中保持可选以兼容旧客户端；当前 Swift 与 CLI 客户端必须始终发送唯一值，daemon 必须在成功和错误终态回复中原样回显。客户端只接受与当前请求严格匹配的回复，并忽略其他请求或已超时请求的迟到回复。
+- **K11**：历史管理请求的 `requestId` 在线协议中保持可选以兼容旧客户端；生产桌面与 CLI 客户端必须始终发送唯一值，daemon 必须在成功和错误终态回复中原样回显。客户端只接受与当前请求严格匹配的回复，并忽略其他请求或已超时请求的迟到回复。
 
 ### 新增不变量（N 系列，v0.2 起）
 
 | # | 不变量 | 守护方式 |
 |---|---|---|
 | **N1** | **两层协议**：`AgentItem` / `TurnComplete` / `SessionStarted` / `SessionCapabilities` / `Error` 主干必须 vendor 中立；vendor 字段默认只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 三个命名空间下。唯一例外是 `ActionRequest.vendor`，用于 typed approval detail，禁止任意 JSON 透传 | schemars 派生 + `neutrality_tests.rs` 静态断言 |
-| **N2** | **Capabilities Handshake**：每个 session 启动时 daemon 必须先发 `SessionCapabilities`；UI 必须按它路由控件渲染；禁止 UI 硬编码 `if agentKind == .codex` 分支 | Swift 端 `NoVendorBranchInUITests` grep + AST 扫描 |
+| **N2** | **Capabilities Handshake**：每个 session 启动时 daemon 必须先发 `SessionCapabilities`；UI 必须按它路由控件渲染；禁止 UI 硬编码 vendor 分支 | GPUI 会话切片落地时新增 Rust router 单测与静态边界测试；当前 P0 无 session UI |
 | **N3** | **Adapter 互不知晓**：`agentdeckd/src/codex/` 不依赖 `claude_code/` 任何类型，反之亦然；共享逻辑下沉到 `agent.rs` trait | cargo 模块依赖检查 |
 | **N4** | **Adapter 内 vendor JSON 不外泄**：被 IPC 推到 UI 的 vendor 字段必须经 adapter 显式建模，禁止 `serde_json::Value` 透传 | `capabilities_namespace_is_typed` 测试断言 |
 | **N5** | **一等公民对称约束**：`CodexAdapter` 实现的每个非独有 capability，`ClaudeCodeAdapter` 必须有等价实现或文档化"不适用"原因 | capability 矩阵文档 + cargo test |
@@ -126,11 +110,13 @@ agentdeckd
 ## 依赖方向
 
 ```text
-Swift UI
-  -> CapabilityRouter（按 SessionCapabilities 派发）
-  -> WorkbenchModel / ThreadRuntimeModel / SessionModel / HistoryModel
-  -> AgentDeck IPC models（来自 agentdeck-protocol v2）
-  -> daemon stdio
+agentdeck-desktop（当前）
+  -> GPUI / gpui-component
+
+agentdeck-desktop（下一阶段）
+  -> typed local client
+  -> agentdeck-protocol
+  -> agentdeckd
 
 daemon main
   -> ipc（re-export agentdeck-protocol）
@@ -145,7 +131,7 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 ```
 
 允许的跨层访问应沿上图向下：
-- UI 不允许跳过 `CapabilityRouter` 直读 vendor 字段。
+- UI 不允许跳过按 `SessionCapabilities` 建立的 typed capability routing 直读 vendor 字段。
 - `CodexAdapter` 不允许调 `ClaudeCodeAdapter`，反之亦然。
 - 新增功能如需反向依赖，先把接口下沉到 `agent.rs` trait 或 `agentdeck-protocol`。
 
@@ -161,9 +147,9 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 
 ## 变更指引
 
-- **改 UI 行为**：先看相关 `Sources/AgentDeck/*ViewController.swift` / `*Model.swift` 与最近的 `docs/plans/*design.md`。确认 `CapabilityRouter` 路由路径是否需同步更新。
-- **改 IPC**：同步更新 Swift/Rust 两侧模型、测试、schema 快照和 README/架构文档。
+- **改 UI 行为**：改 `agentdeck-desktop/`，并对照当前 GPUI 设计计划；不要从历史 AppKit 计划复制实现。
+- **改 IPC**：同步更新 Rust 协议、仍由 iOS 消费的 Swift Core mirror、测试、schema 快照和 README/架构文档。
 - **改 Codex 协议翻译**：先看 `protocol/SPIKE_FINDINGS.md` 和 `protocol/CODEX_VERSION.txt`，再改 `agentdeckd/src/codex/` 子模块。
 - **改 CC 协议翻译**：先看 `docs/plans/2026-06-30-unified-shell-v02-design.md` § 5，再改 `agentdeckd/src/claude_code/` 子模块。
 - **改诊断或记录**：同步更新 `docs/AGENT_DIAGNOSTICS.md` 和 `docs/QUALITY.md`。
-- **新增 adapter**：在 `agentdeckd/src/<vendor>/` 下建子模块，实现 `Agent` trait；在 `AgentRouter` 注册；在 `agentdeck-protocol` 的 `VendorCapabilities` / `VendorSessionOptions` 枚举中添加对应 variant；更新 `agentdeck-cli` 的 `--agent` 可选值。新 adapter 不得要求 Swift 侧知道该 adapter 的 vendor JSON（N2），也不得修改现有 adapter capability（N5）。
+- **新增 adapter**：在 `agentdeckd/src/<vendor>/` 下建子模块，实现 `Agent` trait；在 `AgentRouter` 注册；在 `agentdeck-protocol` 的 `VendorCapabilities` / `VendorSessionOptions` 枚举中添加对应 variant；更新 `agentdeck-cli` 的 `--agent` 可选值。新 adapter 不得要求 UI 知道该 adapter 的 vendor JSON（N2），也不得修改现有 adapter capability（N5）。

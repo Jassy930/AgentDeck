@@ -1,5 +1,8 @@
 # AgentDeck 设计系统
 
+> 2026-08-17：macOS AppKit 客户端及其 Swift 生成链已经删除。GPUI P0 只使用
+> gpui-component，尚未消费本设计系统；token、Web 预览和 iOS 生成物继续保留。
+
 面向 Coding Agent 工作台的**跨桌面/手机端**可视化设计系统展示页。以 Codex Desktop 视觉范式为主基调，并额外提供三种可一键切换的设计语言。
 
 ## 打开方式
@@ -37,7 +40,7 @@ python3 -m http.server 4311 --directory designs
 - **`AgentDeck Design System.html`** — 展示页主体，含真实 Codex / Claude Code 图标 SVG 精灵。
 - **`showcase.js`** — 主题切换（`?t=` 参数 / localStorage）、侧栏滚动高亮、Lucide 初始化。
 - **`assets/`** — 产品自带的真实 Agent 图标（`codex.svg`、`claudecode.svg`）。
-- **[`THEMING.md`](THEMING.md)** — **主题接口契约**：统一 vs 切换的接缝、结构开关清单、插槽机制、加新主题步骤、映射到 AppKit，以及 **iOS/Android 平台适配契约**（`data-platform` 轴，统一品牌化 + 薄平台层）。
+- **[`THEMING.md`](THEMING.md)** — **主题接口契约**：统一 vs 切换的接缝、结构开关清单、插槽机制、加新主题步骤，以及 **iOS/Android 平台适配契约**（`data-platform` 轴，统一品牌化 + 薄平台层）。
 
 > 依赖顺序：`tokens → system → interface → languages`。组件从不写 `if theme ==`，只读开关；加一套新主题 = 填 token + 从开关菜单选值，不改组件。详见 `THEMING.md`。
 
@@ -46,16 +49,16 @@ python3 -m http.server 4311 --directory designs
 设计系统不止"看"，还能被工程直接吃、被 CI 拦。
 
 ```bash
-bun run build   # tokens/tokens.json(SSOT) → generated/tokens.css · Theme.swift · DesignTokens.ts
+bun run build   # SSOT → generated/tokens.css · DesignTokens.ts + iOS DesignTokens.swift
 bun run lint    # 门禁：SSOT 一致 · 组件禁硬编码色 · 开关默认值齐全
 bun run a11y    # 六套主题关键对比度 ≥ AA
 bun run check   # 以上一步到位（可接 CI）
 ```
 
 - **[`tokens/tokens.json`](tokens/tokens.json)** — **单一数据源（SSOT）**：6 套主题的色板/圆角/字体/阴影/结构枚举，以及全局字号、行高与平台开关。改这里，其余生成。
-- **`generated/`** — 生成物（**禁手改**）：`Theme.swift`（AppKit：`Palette`/`Radii`/`Typography`/`Structure`/`Platform`，视图读契约、禁主题分支）、`tokens.css`、`DesignTokens.ts`；macOS 生产端的 `Sources/AgentDeck/DesignTokens.swift` 也由同一生成器写入字号与行高倍率。
+- **`generated/`** — Web / RN 生成物（**禁手改**）：`tokens.css`、`DesignTokens.ts`。同一生成器还更新 iOS 的 `ios/AgentDeckMobile/DesignTokens.swift`；不会写入任何 macOS 源码目录。
 - **`tools/`** — `build.mjs`（生成器）· `lint.mjs`（约束门禁）· `a11y.mjs`（对比度核验）。
-- **[`ENGINEERING.md`](ENGINEERING.md)** — **工程约束**（MUST/MUST NOT、分层、工作流、AppKit 落地、扩展手册）。
+- **[`ENGINEERING.md`](ENGINEERING.md)** — **工程约束**（MUST/MUST NOT、分层、工作流、GPUI/iOS 边界、扩展手册）。
 - **[`COMPONENTS.md`](COMPONENTS.md)** — 组件契约（变体/状态/token/无障碍/状态矩阵）。
 - **[`A11Y.md`](A11Y.md)** — 无障碍结果与最低规则。
 
@@ -71,7 +74,7 @@ bun run check   # 以上一步到位（可接 CI）
 
 - 字号阶梯：`display-xl 34pt`、`display 24pt`、`title 16pt`、`body 14pt`、`callout 13pt`、`caption 11pt`、`mono 12.5pt`。
 - 行高倍率：纯拉丁段落 `1.45`；包含中文、日文、韩文字符的段落（含中西混排）`1.72`。
-- macOS 会话流：assistant 正文使用 `body`，reasoning 正文使用 `callout + text2`，命令与 diff 使用 `mono`；Markdown 正文与 reasoning 必须各自用同一 attributed string 完成渲染和行高测量。
+- 桌面会话流目标规范：assistant 正文使用 `body`，reasoning 正文使用 `callout + text2`，命令与 diff 使用 `mono`；具体 GPUI 文本布局方案在对应纵向切片中决定。
 - Markdown：标题/列表/fenced code 必须隐藏语法标记并保留块级节奏；行内代码使用 `mono + surface2 + border + radius-sm` 的低对比圆角胶囊，fenced code 使用 `surface-inset + border + radius-sm` 独立容器，不能用 `text3` 画方形高亮条。
 
 ## 说明与替代

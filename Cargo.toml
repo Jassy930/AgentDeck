@@ -1,5 +1,12 @@
 [workspace]
-members = ["agentdeckd", "agentdeck-protocol", "agentdeck-cli", "agentdeck-relay", "agentdeck-relay-client"]
+members = [
+    "agentdeckd",
+    "agentdeck-protocol",
+    "agentdeck-cli",
+    "agentdeck-relay",
+    "agentdeck-relay-client",
+    "agentdeck-desktop",
+]
 resolver = "3"
 
 [workspace.package]
@@ -7,3 +14,20 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Jassy930/AgentDeck"
+
+# 本地开发与测试由 sccache 复用编译结果，因此关闭 Cargo incremental，避免
+# 每个 Git worktree 的 target/debug/incremental 独立增长。项目代码保留行表级
+# 调试信息，依赖不生成调试信息；项目代码需要完整调试时可临时用环境变量覆盖。
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test]
+debug = 1
+incremental = false
+
+[profile.test.package."*"]
+debug = 0

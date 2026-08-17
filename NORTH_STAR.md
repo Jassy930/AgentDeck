@@ -24,10 +24,9 @@ AgentDeck 是工作台、控制台、管理面。
 
 ## 多端形态
 
-AgentDeck 的"原生体验"意思是每个平台都用平台原生 UI 框架：
-- macOS：AppKit
-- iOS：UIKit
-- Windows / Linux / Web：Rust 壳 + Web UI（Tauri 风格）
+AgentDeck 的桌面端使用 Rust + GPUI，优先把 macOS 做扎实，再评估 GPUI 支持的
+其他桌面平台；iOS companion 继续使用 UIKit。桌面端不再维护 AppKit 实现，也不
+增加迁移兼容层。
 
 共享层是一个 Rust daemon `agentdeckd` + 中立 IPC 协议
 `agentdeck-protocol`。所有客户端通过统一协议消费同一个 daemon。
@@ -42,12 +41,12 @@ AgentDeck 的"原生体验"意思是每个平台都用平台原生 UI 框架：
 
 这些能力按版本路线图分阶段交付，不在 v0.2 范围内。
 
-## v0.2 必赢
+## 当前必赢
 
-在 macOS AppKit 上端到端验证「统一壳」架构：
-1. IPC 协议 v2 引入 agent capabilities，支持两层（控件 + 事件）。
-2. ClaudeCodeAdapter MVP 上线，CC 的特色能力（permission 模式、
-   hooks、output-style 等）完整可用。
-3. UI 整体范式统一，vendor-specific 控件保留原始语义。
-4. Codex Desktop 对标点：Approval + Sandbox + Persistence 完整
-   控件、Reasoning Effort + Token/Auth 小面板。
+先建立可快速迭代的 macOS 最小闭环：
+
+1. GPUI + gpui-component 的真实 `.app` 能稳定构建、启动和自检。
+2. 桌面端只通过 typed local client 连接本机 `agentdeckd`，不嵌入 daemon。
+3. 先完成单会话 prompt → streaming → complete，再扩展历史和审批。
+4. Relay 与远程能力暂不接入桌面端，也不作为本地开发门禁。
+5. 不恢复旧 AppKit 的实现细节，只保留仍有效的产品和协议不变量。
