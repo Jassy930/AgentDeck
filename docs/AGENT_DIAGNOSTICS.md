@@ -5,11 +5,16 @@
 ## 快速入口
 
 ```bash
-swift run AgentDeck -- --selfcheck
-swift run AgentDeck -- --diagnostics-report --json
-swift run AgentDeck -- --selfcheck --profile dev
-swift run AgentDeck -- --diagnostics-report --json --profile dev
+# GPUI 桌面壳：只验证 UI/Metal/隐藏窗口/Root 初始化
+cargo run -p agentdeck-desktop -- --selfcheck
+
+# backend：独立验证 daemon 与 adapter
+cargo run -p agentdeck-cli -- selfcheck
+cargo run -p agentdeckd -- --diagnostics-report --json
 ```
+
+当前 GPUI 桌面端没有连接 daemon，也没有 profile、run record 或 diagnostics report
+入口。桌面 selfcheck 成功不能证明 backend、vendor CLI 或 Relay 健康。
 
 ## 日志位置
 
@@ -26,15 +31,14 @@ swift run AgentDeck -- --diagnostics-report --json --profile dev
 
 ## 标准自查流程
 
-1. 跑 `swift run AgentDeck -- --selfcheck`。
-2. 如果失败，先看 stderr 的 failure code。
-3. 跑 `swift run AgentDeck -- --diagnostics-report --json`。
+1. 跑 `cargo run -p agentdeck-desktop -- --selfcheck`，确认桌面基础是否可启动。
+2. 跑 `cargo run -p agentdeck-cli -- selfcheck`，独立确认 backend。
+3. 如果 backend 失败，跑 `cargo run -p agentdeckd -- --diagnostics-report --json`。
 4. 查看 `byLevel` / `byEvent` 和 `tail` 中最近的错误或告警。
 5. 按 `tail` 里的事件上下文继续执行只读检查。
 
-排查开发调试实例时，在 selfcheck 和 diagnostics report 后加 `--profile dev`。
-SwiftPM/debug 构建未显式传 `--profile` 时也会默认使用 dev profile。
-`AGENTDECK_DATA_DIR` 仍优先于 profile，主要用于一次性测试覆盖目录。
+backend 的 profile 与 `AGENTDECK_DATA_DIR` 规则保持不变；它们不影响当前 GPUI
+桌面壳。
 
 ## Failure Codes
 
@@ -44,8 +48,8 @@ SwiftPM/debug 构建未显式传 `--profile` 时也会默认使用 dev profile�
 | `diagnostic_write_failed` | diagnostic log 写入失败 | 检查 data dir 路径和权限 |
 | `redaction_failed` | 测试 secret 明文落盘 | 停止分享日志，修 redaction |
 | `adapter_unhandled_method` | app-server 协议出现未识别事件 | 查看 raw record 和 schema |
-| `ipc_malformed_jsonl` | Swift/Rust IPC 收到坏 JSONL | 查看上一条 IPC line |
-| `daemon_spawn_failed` | Swift 无法启动 daemon | 检查 `agentdeckd` 路径 |
+| `ipc_malformed_jsonl` | client/daemon IPC 收到坏 JSONL | 查看上一条 IPC line |
+| `daemon_spawn_failed` | backend client 无法启动 daemon | 检查 `agentdeckd` 路径 |
 | `app_server_handshake_failed` | app-server 握手失败 | 检查 agent 登录、版本和 GUI 启动环境里的 `PATH` / `node` |
 | `turn_failed` | turn 执行失败 | 按 runId 查看 run record |
 | `approval_wait_stalled` | turn 正在等待用户审批 | 查看当前 runtime 的 `actionRequest`，确认 UI 是否已回写 `actionDecision` |
@@ -65,8 +69,7 @@ stdout / stderr 直接丢弃，非零退出只返回结构化 failure code、exi
 
 ## 真实 Codex / Claude Code 历史刷新
 
-侧栏默认发起不带 agent 和 cwd 过滤的跨 agent 历史查询。界面没有会话或只出现
-一家来源时，先用同样的全局查询复现，再分别探测两个来源：
+GPUI 桌面端当前没有历史界面。历史能力只通过 CLI/daemon 独立排查：
 
 ```bash
 agentdeck history list
@@ -78,7 +81,7 @@ agentdeck history list --agent claude-code --limit 20
 列表和读取分别调用官方 `thread/list`、`thread/read(includeTurns=true)`，不是扫描
 当前 AgentDeck 会话或猜测本地记录格式。
 
-当前 Swift 与 CLI 会为每次历史请求生成唯一 `requestId`；daemon 无论成功还是失败
+CLI 会为每次历史请求生成唯一 `requestId`；未来桌面接入时必须遵守同一契约。daemon 无论成功还是失败
 都在对应的 history admin 终态回复中原样回显。客户端只消费严格匹配当前
 `requestId` 的回复，忽略其他请求或已超时请求的迟到回复。wire 字段保持可选仅用于
 兼容旧客户端；当前客户端的请求或回复缺少该字段，应按关联链路回归排查。
@@ -93,7 +96,7 @@ agentdeck history list --agent claude-code --limit 20
 | `history-no-sources` | router 中没有注册任何历史来源 | 运行 `agentdeck selfcheck` 和 `agentdeck agent list`，确认 App 使用的是当前打包 daemon 且 adapter 已注册 |
 | `history-source-timeout` | 跨 agent list 中单一来源超过 router 的 30 秒独立 deadline；若另一来源成功，router 会保留其结果并完成 best-effort 回复 | 用带 `--agent` 的 list 命令单独探测慢来源；检查对应 vendor CLI 或 app-server 是否挂起 |
 | `history-all-sources-failed` | 已注册的所有来源都失败；错误消息会列出各来源及其底层 failure code | 分别运行两条带 `--agent` 的 list 命令，按各自底层 code 修复；该错误不能按“历史为空”处理 |
-| `history-request-timeout` | 包含双来源合并在内的完整历史请求超过 daemon 的 32 秒总 deadline；Swift 等待 35 秒，为终态回复穿过 stdout、完成 `requestId` 匹配与投递保留 3 秒余量 | 分别运行两条带 `--agent` 的 list 命令定位慢来源；该请求已被 daemon 终止，不会在下一次刷新中产生迟到 reply |
+| `history-request-timeout` | 包含双来源合并在内的完整历史请求超过 daemon 的总 deadline | 分别运行两条带 `--agent` 的 list 命令定位慢来源；该请求已被 daemon 终止，不会在下一次刷新中产生迟到 reply |
 
 跨 agent list 是 best-effort：每个来源有独立的 30 秒 deadline；只要至少一个来源
 成功，router 就合并并返回成功来源的数据，另一来源失败或超时不会阻断结果；成功
@@ -104,10 +107,10 @@ agentdeck history list --agent claude-code --limit 20
 
 ## Raw / Warning 可见性
 
-未知 adapter item 必须在 daemon 侧中立化为 `raw`，并继续进入 run record 与
-runtime UI。`rawKind` 只保留最长 64 字节的安全方法/类型标识，`rawPayload` 固定为
-`[vendor payload withheld]`，不携带 vendor 原始 JSON；如果 UI 看不到 `raw`，
-优先检查 `ThreadRuntimeModel` 的 agent item ingest 路径。
+未知 adapter item 必须在 daemon 侧中立化为 `raw`，并继续进入 run record。
+`rawKind` 只保留最长 64 字节的安全方法/类型标识，`rawPayload` 固定为
+`[vendor payload withheld]`，不携带 vendor 原始 JSON。GPUI 尚未接入 runtime，
+当前通过 CLI、测试和 record 排查。
 
 daemon 写入失败等非致命问题会发出 `warning` 事件。当前选中的 runtime 应显示
 自己的 warning；没有选中 runtime 时才回退显示 legacy session warning。
@@ -124,14 +127,8 @@ CC `stream-json` 中 `system.subtype=init` 只用于抓取原生 `session_id`。
 ## Approval 卡住排查
 
 Codex 的命令执行、文件变更和额外权限审批会先在 daemon adapter 层映射为中立
-`actionRequest`，再由 Swift 回写 `actionDecision`。如果 turn 停在
-`waitingApproval`：
-
-1. 先看当前 runtime 是否显示 approve / deny 控件。
-2. 如果没有控件，检查 `session/event` 中是否有 `kind=actionRequest`。
-3. 如果控件点击后没有继续，检查 Swift 是否发送 `kind=actionDecision` 且带
-   `sessionId`、`requestId` 和 `decision`。
-4. 如果 daemon 返回 error，按同一 `requestId` 查看 diagnostic log 和 run record。
+`actionRequest`。GPUI 当前没有审批 UI；涉及审批的 turn 只允许通过 backend 测试或
+CLI harness 验证，不能把桌面壳当成可用审批客户端。
 
 ## Claude Code Adapter Failure Codes（v0.2 新增）
 
@@ -151,8 +148,8 @@ Codex 的命令执行、文件变更和额外权限审批会先在 daemon adapte
 
 ## v0.2 双 adapter 探测
 
-v0.2 起 daemon 注册了 Codex 和 ClaudeCode 两个 adapter。`agentdeck selfcheck` 和
-`swift run AgentDeck -- --selfcheck` 会在响应中报告已注册的 adapter 列表：
+daemon 注册了 Codex 和 ClaudeCode 两个 adapter。`agentdeck selfcheck` 会在响应中
+报告已注册的 adapter 列表；GPUI desktop selfcheck 不报告 adapter：
 
 ```bash
 # CLI 探测（输出 JSON，含 adapters 数组）

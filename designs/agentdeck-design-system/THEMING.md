@@ -136,28 +136,15 @@ showcase.js     运行时：主题切换（?t= 参数 / localStorage）、导航
 
 ---
 
-## 7. 映射到 AppKit（原生落地）
+## 7. 映射到原生客户端
 
-同一契约可平移到 Swift，与现有 `CapabilityRouter`「禁止 vendor 分支」同philosophy——视图**读 theme 开关**，不写 `if theme == .terminal`：
+旧 AppKit 映射和 `generated/Theme.swift` 已随 macOS 桌面重启删除。当前 GPUI P0
+只使用 gpui-component 默认样式，不提前建立主题抽象。等第一个主题切片真正需要
+这些 token 时，再定义 Rust typed theme 和最小生成链；组件只读 typed 值，不写
+具体主题名分支，也不得重新生成 `Sources/AgentDeck/` 下的 Swift 文件。
 
-```swift
-struct Theme {
-    // L2 皮肤
-    let bg, surface, text, accent: NSColor
-    let radiusMd: CGFloat
-    let fontDisplay, fontMono: NSFont
-    // L3 结构开关（枚举，对应 --k-*）
-    let statusShape: StatusShape        // .dot | .square | .pill
-    let surfaceMode: SurfaceMode        // .float | .flat | .hairline | .tuiBox
-    let composerForm: ComposerForm      // .card | .cli | .editorial
-    let iconMode: IconMode              // .line | .glyph | .minimal
-    let affixes: Affixes                // title/reason/user/project 前后缀
-}
-```
-
-视图从 `Theme` 取开关渲染；新增主题 = 新增一个 `Theme` 值 + 可选插槽视图，零分支。
-
-**运行时范围**（待产品定）：全局唯一 / 跟随系统明暗（Warm ↔ Codex 自动）/ 每窗口或每会话可不同——建议至少支持「跟随系统明暗」。
+iOS 继续消费 `ios/AgentDeckMobile/DesignTokens.swift`。主题运行时范围（跟随系统、
+全局或每窗口）留到真实消费切片决定。
 
 ---
 
@@ -178,6 +165,6 @@ struct Theme {
 
 此外约定（不都用 CSS 表达）：返回手势（iOS 左滑 ↔ Android 系统返回）、默认字体栈（SF ↔ Roboto，由 `--font-ui` 切换）、触感与滚动回弹随平台。
 
-**落地**：`data-platform` 与 `data-theme` 正交，任意主题 × 任意平台自由组合；内容组件零改动。设备框（iPhone 刘海 / Android 打孔）与状态栏、底部导航消费上述开关。映射到原生：AppKit 走 iOS 值，未来 Android(Compose) 端复用同一 `Theme` + 一组 `Platform` 值。
+**落地**：`data-platform` 与 `data-theme` 正交，任意主题 × 任意平台自由组合；内容组件零改动。设备框（iPhone 刘海 / Android 打孔）与状态栏、底部导航消费上述开关。iOS 读取生成的 UIKit token；未来 Android 与 GPUI 桌面分别建立自己的 typed 平台值。
 
 > 规范已就位；Android 设备框与专属屏为后续工作，不影响现有 iOS 展示。

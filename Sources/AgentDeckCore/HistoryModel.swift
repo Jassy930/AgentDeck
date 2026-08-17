@@ -3,9 +3,7 @@ import Foundation
 /// Neutral summary for one persisted agent thread. Mirrors the daemon's
 /// history shape; Swift never parses vendor thread JSON directly.
 ///
-/// `Hashable`（而非仅 `Equatable`）是必需的：该值类型作为 `NSOutlineView` 的
-/// item 使用，AppKit 会对其调用 Obj-C `-hash` 做 O(1) 查找；只有 `Equatable`
-/// 时装箱值退化为恒定哈希，outline 内部映射退化成 O(n) 线性扫描。
+/// `Hashable` 保留该值模型在客户端集合中的稳定值语义。
 public struct HistoryThreadSummary: Identifiable, Codable, Hashable, Sendable {
     public let id: String
     public var name: String?
@@ -40,7 +38,7 @@ public struct HistoryThreadSummary: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-/// `Hashable` 同 `HistoryThreadSummary`：作为 `NSOutlineView` 顶层 item 被 AppKit 哈希。
+/// `Hashable` 同 `HistoryThreadSummary`，用于稳定的值集合语义。
 public struct HistoryProjectGroup: Identifiable, Hashable {
     public var id: String { cwd }
     public let cwd: String

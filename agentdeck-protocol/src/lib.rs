@@ -46,7 +46,7 @@ pub fn protocol_schema() -> serde_json::Value {
     use schemars::schema_for;
     use serde_json::json;
 
-    json!({
+    canonicalize_json_object_order(json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": format!("AgentDeck Protocol v{}", PROTOCOL_VERSION),
         "type": "object",
@@ -67,13 +67,36 @@ pub fn protocol_schema() -> serde_json::Value {
             "SessionDescriptor": serde_json::to_value(schema_for!(remote::SessionDescriptor)).unwrap(),
             "DeviceDescriptor": serde_json::to_value(schema_for!(remote::DeviceDescriptor)).unwrap(),
         }
-    })
+    }))
+}
+
+/// Keep emitted schema text stable even when another workspace member enables
+/// serde_json's `preserve_order` feature. JSON object order has no protocol
+/// meaning, but the committed pretty-printed snapshot must stay reproducible.
+fn canonicalize_json_object_order(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries = map
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_json_object_order(value)))
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            serde_json::Value::Object(entries.into_iter().collect())
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(canonicalize_json_object_order)
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 pub mod remote;
 pub use remote::{
     ClientRole, CommandTarget, DataEnvelope, DeviceDescriptor, DeviceKind, MachineDescriptor,
-    RelayControlMsg, RemoteFrame, SessionDescriptor, SubTarget, RELAY_PROTOCOL_VERSION,
+    RELAY_PROTOCOL_VERSION, RelayControlMsg, RemoteFrame, SessionDescriptor, SubTarget,
 };
 
 #[cfg(test)]

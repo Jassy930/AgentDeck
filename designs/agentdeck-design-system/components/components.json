@@ -2,7 +2,7 @@
   "$meta": {
     "name": "AgentDeck 组件视觉骨架 SSOT",
     "version": "0.1.0",
-    "note": "组件稳定视觉骨架的单一数据源：只描述设计自有的静态标签与禁止元素（不描述行为，也不含 fixture 数据）。改这里跑 tools/build.mjs 生成 Sources/AgentDeck/ComponentSpecs.swift。禁止手改生成物。"
+    "note": "组件稳定视觉骨架的数据记录：只描述设计自有的静态标签与禁止元素（不描述行为，也不含 fixture 数据）。旧 AppKit ComponentSpecs 生成链已删除；当前供设计预览和未来组件切片参考。"
   },
   "components": {
     "m-user": {

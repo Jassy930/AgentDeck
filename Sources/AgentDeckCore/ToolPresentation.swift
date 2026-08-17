@@ -1,11 +1,8 @@
 import Foundation
 
-/// Pure presentation helpers for tool / shell / web-search rows in
-/// `SessionView`. Extracted from `SessionView` so the string/metadata logic can
-/// be unit-tested without standing up a SwiftUI view tree. All functions are
-/// `static`, depend only on their parameters, and must remain free of any
-/// SwiftUI / `@State` / model access (Eng D2: UI side stays neutral, but here
-/// the stricter rule is "pure transform over a `UIItem`").
+/// Pure presentation helpers for tool / shell / web-search rows. All functions
+/// are `static`, depend only on their parameters, and remain free of platform
+/// view or mutable client-state access.
 public enum ToolPresentation {
 
     /// Render a "Show output (N lines)" style label for a disclosure trigger.

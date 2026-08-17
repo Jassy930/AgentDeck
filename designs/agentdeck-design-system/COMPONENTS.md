@@ -1,7 +1,7 @@
 # AgentDeck 设计系统 · 组件契约（COMPONENTS）
 
 每个组件的**契约**：变体 / 状态 / 所用 token / 无障碍 / do·don't。
-实现（Web CSS 类见 `system.css`；AppKit 按 `generated/Theme.swift` 落地）**必须**符合本契约。
+当前 Web CSS 实现见 `system.css`；未来 GPUI/iOS 组件消费本契约时也**必须**保持这些语义与状态边界。
 通用约束见 `ENGINEERING.md`：只读 token/开关、禁硬编码色、禁主题分支。
 
 图例：状态默认都含 `default / hover / active / disabled / focus-visible`（除非注明 N/A）。

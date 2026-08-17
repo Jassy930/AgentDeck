@@ -1,7 +1,7 @@
 [
   { "delayMs": 0, "event": { "type": "sessionStarted", "sessionId": "sess-cc-01", "threadId": "t2", "agentKind": "claude_code" } },
   { "delayMs": 100, "itemId": "c1", "event": { "type": "agentItem", "sessionId": "sess-cc-01", "threadId": "t2", "agentKind": "claude_code", "item": { "kind": "userMessage", "text": "给跨 agent 历史聚合补边界测试", "meta": { "vendorExtensions": {} } } } },
-  { "delayMs": 500, "itemId": "c2", "event": { "type": "agentItem", "sessionId": "sess-cc-01", "threadId": "t2", "agentKind": "claude_code", "item": { "kind": "toolCall", "name": "Read", "args": { "file_path": "Tests/AgentDeckTests/HistorySidebarUnifiedHistoryTests.swift" }, "result": "读取 220 行", "meta": { "vendorExtensions": {} } } } },
+  { "delayMs": 500, "itemId": "c2", "event": { "type": "agentItem", "sessionId": "sess-cc-01", "threadId": "t2", "agentKind": "claude_code", "item": { "kind": "toolCall", "name": "Read", "args": { "file_path": "Sources/AgentDeckCore/HistoryModel.swift" }, "result": "读取 220 行", "meta": { "vendorExtensions": {} } } } },
   { "delayMs": 600, "itemId": "c3", "event": { "type": "agentItem", "sessionId": "sess-cc-01", "threadId": "t2", "agentKind": "claude_code", "item": { "kind": "assistantMessage", "text": "已有测试覆盖了合并排序，缺空列表与重复 threadId 两个边界，我来补上。", "meta": { "vendorExtensions": {} } } } },
   { "delayMs": 400, "event": { "type": "turnComplete", "sessionId": "sess-cc-01", "threadId": "t2", "agentKind": "claude_code", "summary": { "totalInputTokens": 900, "totalOutputTokens": 310, "elapsedMs": 5200 } } }
 ]

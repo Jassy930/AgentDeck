@@ -5,13 +5,13 @@ public enum StreamingTextBufferChange: Equatable {
     case replace(String)
 }
 
-// Owned by the main-render path. Marked unchecked only so AppKit deinit can
+// Owned by the main-render path. Marked unchecked only so client deinit can
 // detach observers under Swift 6's nonisolated deinitializer rules.
 public final class StreamingTextBuffer: @unchecked Sendable {
     private var observers: [UUID: (StreamingTextBufferChange) -> Void] = [:]
     public private(set) var text = ""
-    /// 单调递增的内容版本。会话表格用它做 O(1) 行高缓存失效，避免仅按
-    /// UTF-8 字节数判断时漏掉 `abc` → `中` 这类等字节替换。
+    /// 单调递增的内容版本。客户端可据此失效派生缓存，避免仅按 UTF-8
+    /// 字节数判断时漏掉 `abc` → `中` 这类等字节替换。
     public private(set) var revision: UInt64 = 0
 
     public init() {}

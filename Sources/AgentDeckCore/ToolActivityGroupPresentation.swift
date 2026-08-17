@@ -23,8 +23,8 @@ public enum ExecutionActivityGroupKey: Hashable {
 }
 
 /// Pure, platform-neutral presentation rules for a collapsed tool-activity
-/// group. The macOS cell maps `primaryCategory` to an SF Symbol; iOS keeps the
-/// grouping policy disabled and is therefore unaffected.
+/// group. Clients choose whether to enable grouping and how to map categories
+/// to native icons.
 public enum ToolActivityGroupPresentation {
     private enum ActivityState: Equatable {
         case failed
@@ -179,7 +179,7 @@ public enum ToolActivityGroupPresentation {
         return result
     }
 
-    /// Semantic state used by the macOS cell for color. Failure always remains
+    /// Semantic state clients may use for presentation. Failure always remains
     /// visible even when other calls in the same burst are still running.
     public static func semanticStatus(_ items: [UIItem]) -> String {
         let activities = activityItems(in: items)
