@@ -2,41 +2,20 @@
 //! `claude` (with `claude auth login`) to be present in PATH.
 //!
 //! Run with:
-//!   AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history
+//!   cargo build --locked -p agentdeckd --bin agentdeckd
+//!   AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+//!     cargo test -p agentdeck-cli --test e2e_cross_agent_history -- --test-threads=1
 //!
 //! Tests cross-agent history aggregation: run one session of each agent type,
 //! then verify that `history list` (no filter) returns entries for both,
 //! while per-agent filters return only their respective entries.
 
-use std::io::{BufRead, BufReader};
-use std::process::Command;
-use std::time::Duration;
+mod support;
 
-fn gated() -> bool {
-    std::env::var("AGENTDECK_E2E").is_ok()
-}
-
-fn which_bin(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+use support::{HISTORY_TIMEOUT, SESSION_TIMEOUT, real_e2e_enabled, run_cli, vendor_available};
 
 fn both_vendors_available() -> bool {
-    which_bin("codex") && which_bin("claude")
-}
-
-fn cli_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_agentdeck")
-}
-
-fn run_cli(args: &[&str]) -> std::process::Output {
-    Command::new(cli_bin())
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn agentdeck {args:?}: {e}"))
+    vendor_available("codex") && vendor_available("claude")
 }
 
 /// Run a session and return `(thread_id, agent_kind_str)`.
@@ -46,31 +25,17 @@ fn run_session(agent: &str, extra_args: &[&str], prompt: &str) -> (String, Strin
         .to_string_lossy()
         .to_string();
 
-    let mut cmd_args = vec![
+    let mut command_args = vec![
         "session", "run", "--agent", agent, "--cwd", &cwd, "--prompt", prompt,
     ];
-    cmd_args.extend_from_slice(extra_args);
+    command_args.extend_from_slice(extra_args);
+    let output = run_cli(&command_args, SESSION_TIMEOUT);
 
-    let mut child = Command::new(cli_bin())
-        .args(&cmd_args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("failed to spawn agentdeck session run --agent {agent}: {e}"));
-
-    let stdout = child.stdout.take().expect("child stdout");
-    let reader = BufReader::new(stdout);
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut thread_id = String::new();
     let mut agent_kind_out = String::new();
+    let mut terminal_seen = false;
 
-    for line in reader.lines() {
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("session run --agent {agent} timed out after 60s");
-        }
-        let line = line.expect("readline failed");
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
         if line.trim().is_empty() {
             continue;
         }
@@ -93,14 +58,21 @@ fn run_session(agent: &str, extra_args: &[&str], prompt: &str) -> (String, Strin
         }
         let ev_type = val.get("type").and_then(|t| t.as_str());
         if ev_type == Some("turnComplete") || ev_type == Some("error") {
+            terminal_seen = true;
             break;
         }
     }
 
-    let status = child.wait().expect("wait failed");
     assert!(
-        status.success(),
-        "agentdeck session run --agent {agent} exited non-zero: {status}"
+        output.status.success(),
+        "agentdeck session run --agent {agent} exited non-zero: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        terminal_seen,
+        "session run --agent {agent} exited before turn terminal\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
     assert!(
         !thread_id.is_empty(),
@@ -113,7 +85,7 @@ fn run_session(agent: &str, extra_args: &[&str], prompt: &str) -> (String, Strin
 
 #[test]
 fn e2e_cross_history_merged_list_contains_both_agents() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1 to run cross-agent history E2E tests");
         return;
     }
@@ -151,7 +123,7 @@ fn e2e_cross_history_merged_list_contains_both_agents() {
     eprintln!("CC session done: thread_id={cc_tid}, agentKind={cc_kind}");
 
     // Fetch merged history (no --agent filter)
-    let out = run_cli(&["history", "list"]);
+    let out = run_cli(&["history", "list"], HISTORY_TIMEOUT);
     assert!(
         out.status.success(),
         "agentdeck history list (merged) failed\nstderr: {}",
@@ -181,7 +153,10 @@ fn e2e_cross_history_merged_list_contains_both_agents() {
     );
 
     for (thread_id, agent) in [(&codex_tid, "codex"), (&cc_tid, "claude-code")] {
-        let read = run_cli(&["history", "read", thread_id, "--agent", agent]);
+        let read = run_cli(
+            &["history", "read", thread_id, "--agent", agent],
+            HISTORY_TIMEOUT,
+        );
         assert!(
             read.status.success(),
             "history read failed for {agent} thread {thread_id}\nstderr: {}",
@@ -206,7 +181,7 @@ fn e2e_cross_history_merged_list_contains_both_agents() {
 
 #[test]
 fn e2e_cross_history_codex_filter_returns_only_codex() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
@@ -215,7 +190,7 @@ fn e2e_cross_history_codex_filter_returns_only_codex() {
         return;
     }
 
-    let out = run_cli(&["history", "list", "--agent", "codex"]);
+    let out = run_cli(&["history", "list", "--agent", "codex"], HISTORY_TIMEOUT);
     assert!(
         out.status.success(),
         "agentdeck history list --agent codex failed\nstderr: {}",
@@ -241,7 +216,7 @@ fn e2e_cross_history_codex_filter_returns_only_codex() {
 
 #[test]
 fn e2e_cross_history_cc_filter_returns_only_cc() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
@@ -250,7 +225,10 @@ fn e2e_cross_history_cc_filter_returns_only_cc() {
         return;
     }
 
-    let out = run_cli(&["history", "list", "--agent", "claude-code"]);
+    let out = run_cli(
+        &["history", "list", "--agent", "claude-code"],
+        HISTORY_TIMEOUT,
+    );
     assert!(
         out.status.success(),
         "agentdeck history list --agent claude-code failed\nstderr: {}",

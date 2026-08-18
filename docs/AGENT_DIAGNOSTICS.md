@@ -9,7 +9,12 @@
 cargo run -p agentdeck-desktop -- --selfcheck
 
 # backend：独立验证 daemon 与 adapter
-cargo run -p agentdeck-cli -- selfcheck
+cargo build --locked \
+  -p agentdeckd --bin agentdeckd \
+  -p agentdeck-cli --bin agentdeck
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
+  ./target/debug/agentdeck \
+  --data-dir /tmp/agentdeck-selfcheck selfcheck
 cargo run -p agentdeckd -- --diagnostics-report
 ```
 
@@ -32,7 +37,8 @@ cargo run -p agentdeckd -- --diagnostics-report
 ## 标准自查流程
 
 1. 跑 `cargo run -p agentdeck-desktop -- --selfcheck`，确认桌面基础是否可启动。
-2. 跑 `cargo run -p agentdeck-cli -- selfcheck`，独立确认 backend。
+2. 构建当前 checkout 的 daemon 与 CLI，再按上面的 `AGENTDECK_DAEMON_BIN` 绝对路径运行
+   selfcheck，独立确认 backend，避免命中旧 sibling 或系统安装。
 3. 如果 backend 失败，跑 `cargo run -p agentdeckd -- --diagnostics-report`。
 4. 查看 `byLevel` / `byEvent` 和 `tail` 中最近的错误或告警。
 5. 按 `tail` 里的事件上下文继续执行只读检查。

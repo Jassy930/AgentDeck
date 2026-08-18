@@ -2,14 +2,16 @@
 //!
 //! Symmetric to `tests/codex_adapter_shape.rs` (N5). Validates the v2
 //! `Agent` trait wiring without spawning a real `claude` child for the
-//! offline cases, then opt-in spawns a real `claude` (skipped when not
-//! on PATH) to verify the N7 invariant end-to-end.
+//! offline cases, then opt-in spawns a real `claude` only when
+//! `AGENTDECK_E2E=1` and the binary is on PATH.
 
 use agentdeck_protocol::*;
 use agentdeckd::agent::Agent;
 use agentdeckd::claude_code::ClaudeCodeAdapter;
 use agentdeckd::claude_code::auth::{AuthState, probe_auth_status};
 use agentdeckd::claude_code::history;
+
+mod support;
 
 fn cc_opts() -> ClaudeCodeSessionOptions {
     ClaudeCodeSessionOptions {
@@ -159,12 +161,16 @@ async fn cancel_on_unknown_session_is_idempotent_ok() {
     assert!(result.is_ok());
 }
 
-/// Opt-in smoke that spawns a real `claude`. Skips cleanly when the
-/// binary is missing (CI runners without CC installed). When present,
+/// Opt-in smoke that spawns a real `claude`. Requires `AGENTDECK_E2E=1`
+/// and skips cleanly when the binary is missing. When present,
 /// asserts the N7 invariant: SessionStarted + SessionCapabilities
 /// are the first two events on the wire, before any AgentItem.
 #[tokio::test]
 async fn real_claude_emits_started_then_capabilities() {
+    if !support::real_vendor_enabled() {
+        println!("SKIP real_claude_emits_started_then_capabilities: AGENTDECK_E2E != 1");
+        return;
+    }
     // Use `which` to skip cleanly on CI / contributor machines that
     // don't have `claude` installed. The events we assert on
     // (SessionStarted + SessionCapabilities) are emitted synchronously
@@ -231,11 +237,15 @@ async fn real_claude_emits_started_then_capabilities() {
     drop(rx);
 }
 
-/// Opt-in real-claude smoke for the auth probe. Skipped when claude
-/// is missing. Always succeeds — both authenticated and not-logged-in
+/// Opt-in real-claude smoke for the auth probe. Requires
+/// `AGENTDECK_E2E=1` and skips when claude is missing. Always succeeds — both authenticated and not-logged-in
 /// developers can run the suite.
 #[test]
 fn real_claude_auth_status_probe_returns_known_state() {
+    if !support::real_vendor_enabled() {
+        println!("SKIP real_claude_auth_status_probe: AGENTDECK_E2E != 1");
+        return;
+    }
     if which::which("claude").is_err() {
         println!("SKIP real_claude_auth_status_probe: `claude` not in PATH");
         return;
@@ -254,11 +264,16 @@ fn real_claude_auth_status_probe_returns_known_state() {
     eprintln!("real_claude_auth_status_probe: state={state:?}");
 }
 
-/// Opt-in real-claude smoke for `list_history` (jsonl enumeration).
+/// Opt-in real-claude smoke for `list_history` (jsonl enumeration), gated by
+/// `AGENTDECK_E2E=1`.
 /// Either succeeds with N items, or returns an empty list — both are
 /// acceptable. Should never panic / hang.
 #[tokio::test]
 async fn real_claude_list_history_returns_or_empty() {
+    if !support::real_vendor_enabled() {
+        println!("SKIP real_claude_list_history: AGENTDECK_E2E != 1");
+        return;
+    }
     if which::which("claude").is_err() {
         println!("SKIP real_claude_list_history: `claude` not in PATH");
         return;
@@ -277,9 +292,13 @@ async fn real_claude_list_history_returns_or_empty() {
 /// Slower end-to-end smoke that waits for the translator to emit at
 /// least one AssistantMessage or TurnComplete event from a real claude
 /// child — proves the stream-json mapping holds against the live CLI
-/// shape. Skipped when `claude` is not on PATH.
+/// shape. Requires `AGENTDECK_E2E=1` and `claude` on PATH.
 #[tokio::test]
 async fn real_claude_streams_at_least_one_assistant_or_turn_complete() {
+    if !support::real_vendor_enabled() {
+        println!("SKIP real_claude_streams_*: AGENTDECK_E2E != 1");
+        return;
+    }
     if which::which("claude").is_err() {
         println!("SKIP real_claude_streams_*: `claude` not in PATH");
         return;

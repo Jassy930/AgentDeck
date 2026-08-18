@@ -111,12 +111,16 @@ impl CodexAdapter {
         }
     }
 
-    /// Convenience constructor used by tests to make their intent
-    /// obvious. Functionally identical to `new`; the separate name
-    /// signals "I'm not going to spawn a real codex unless this test
-    /// guards on `which::which("codex")`."
+    /// Constructor for deterministic tests. Seeds a fixed capability
+    /// version so calling `capabilities()` never executes the user's
+    /// `codex --version`.
     pub fn new_for_test() -> Self {
-        Self::new()
+        let cli_version = OnceLock::new();
+        let _ = cli_version.set("codex test".to_string());
+        Self {
+            cli_version,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     fn capabilities_for_v2(&self) -> SessionCapabilities {

@@ -984,7 +984,7 @@ mod tests {
         command
             .arg("-c")
             .arg(
-                r#"(sleep 0.4; printf late > "$1") & helper=$!; printf '%s' "$helper" > "$2"; wait"#,
+                r#"(sleep 30; printf late > "$1") & helper=$!; printf '%s' "$helper" > "$2"; wait"#,
             )
             .arg("cancel-safe-vendor-test")
             .arg(&marker)
@@ -999,7 +999,7 @@ mod tests {
                 status: "test-vendor-status",
             },
         ));
-        let helper_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let helper_started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !ready.is_file() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -1491,12 +1491,16 @@ mod tests {
     }
 
     fn tempdir_unique() -> PathBuf {
+        static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let base = std::env::temp_dir().join(format!(
-            "agentdeck-cc-history-test-{}",
+            "agentdeck-cc-history-test-{}-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            sequence,
         ));
         std::fs::create_dir_all(&base).unwrap();
         base

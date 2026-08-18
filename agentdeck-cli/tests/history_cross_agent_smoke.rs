@@ -2,26 +2,17 @@
 //!
 //! Tests cross-agent history subcommands.
 
-use std::process::Command;
+mod support;
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_agentdeck")
-}
-
-fn gated() -> bool {
-    std::env::var("AGENTDECK_E2E").is_ok()
-}
+use support::{HISTORY_TIMEOUT, real_e2e_enabled, run_cli};
 
 #[test]
 fn history_list_default_returns_json() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1 to run");
         return;
     }
-    let out = Command::new(bin())
-        .args(["history", "list"])
-        .output()
-        .unwrap();
+    let out = run_cli(&["history", "list"], HISTORY_TIMEOUT);
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -33,13 +24,10 @@ fn history_list_default_returns_json() {
 
 #[test]
 fn history_list_with_codex_agent_filter_returns_json() {
-    if !gated() {
+    if !real_e2e_enabled() {
         return;
     }
-    let out = Command::new(bin())
-        .args(["history", "list", "--agent", "codex"])
-        .output()
-        .unwrap();
+    let out = run_cli(&["history", "list", "--agent", "codex"], HISTORY_TIMEOUT);
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -50,13 +38,13 @@ fn history_list_with_codex_agent_filter_returns_json() {
 
 #[test]
 fn history_list_with_cc_agent_filter_returns_json() {
-    if !gated() {
+    if !real_e2e_enabled() {
         return;
     }
-    let out = Command::new(bin())
-        .args(["history", "list", "--agent", "claude-code"])
-        .output()
-        .unwrap();
+    let out = run_cli(
+        &["history", "list", "--agent", "claude-code"],
+        HISTORY_TIMEOUT,
+    );
     assert!(
         out.status.success(),
         "stderr: {}",

@@ -4,6 +4,7 @@
 //! synchronous transport to keep their read loop small; session streaming uses
 //! the async process wrapper below.
 
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -51,18 +52,68 @@ impl SyncTransport for FakeTransport {
     }
 }
 
+const DAEMON_BIN_ENV: &str = "AGENTDECK_DAEMON_BIN";
+
 fn is_exec(p: &std::path::Path) -> bool {
-    std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
+    let Ok(metadata) = std::fs::metadata(p) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+    }
+    true
 }
 
-/// 定位 agentdeckd：优先当前可执行文件同目录（同一 target dir），再回退
-/// cwd 相对 dev 路径与常见安装位置（与 Swift DaemonClient.locateDaemon 同策略）。
-pub fn locate_daemon() -> Option<PathBuf> {
+fn explicit_daemon_path(value: OsString) -> std::io::Result<PathBuf> {
+    if value.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{DAEMON_BIN_ENV} is set but empty"),
+        ));
+    }
+
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{DAEMON_BIN_ENV} must be an absolute path: {}",
+                path.display()
+            ),
+        ));
+    }
+    if !is_exec(&path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "{DAEMON_BIN_ENV} does not point to an executable file: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(path)
+}
+
+fn locate_daemon_with_override(explicit: Option<OsString>) -> std::io::Result<PathBuf> {
+    if let Some(value) = explicit {
+        return explicit_daemon_path(value);
+    }
+
+    // Production discovery is only allowed when no explicit override was
+    // provided. In particular, an invalid test path must never fall through to
+    // an older sibling or system installation.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let sib = dir.join("agentdeckd");
             if is_exec(&sib) {
-                return Some(sib);
+                return Ok(sib);
             }
         }
     }
@@ -74,22 +125,26 @@ pub fn locate_daemon() -> Option<PathBuf> {
     ] {
         let p = PathBuf::from(c);
         if is_exec(&p) {
-            return Some(p);
+            return Ok(p);
         }
     }
-    None
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "agentdeckd not found (build it: cargo build -p agentdeckd)",
+    ))
+}
+
+/// 定位 agentdeckd。`AGENTDECK_DAEMON_BIN` 一旦存在就必须是有效的绝对
+/// executable 路径，失败时禁止回退；只有变量未设置时才使用 production locator。
+pub fn locate_daemon() -> std::io::Result<PathBuf> {
+    locate_daemon_with_override(std::env::var_os(DAEMON_BIN_ENV))
 }
 
 pub fn run_daemon_diagnostics_report(
     profile: &str,
     data_dir: Option<&str>,
 ) -> std::io::Result<String> {
-    let path = locate_daemon().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "agentdeckd not found (build it: cargo build -p agentdeckd)",
-        )
-    })?;
+    let path = locate_daemon()?;
     let mut cmd = Command::new(path);
     cmd.arg("--diagnostics-report")
         .arg("--profile")
@@ -120,12 +175,7 @@ pub struct ProcessTransport {
 
 impl ProcessTransport {
     pub fn spawn(profile: &str, data_dir: Option<&str>) -> std::io::Result<Self> {
-        let path = locate_daemon().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "agentdeckd not found (build it: cargo build -p agentdeckd)",
-            )
-        })?;
+        let path = locate_daemon()?;
         let mut cmd = Command::new(path);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
         cmd.env("AGENTDECK_PROFILE", profile);
@@ -192,12 +242,7 @@ struct AsyncTransportInner {
 
 impl AsyncProcessTransport {
     pub async fn spawn(profile: &str, data_dir: Option<&str>) -> std::io::Result<Self> {
-        let path = locate_daemon().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "agentdeckd not found (build it: cargo build -p agentdeckd)",
-            )
-        })?;
+        let path = locate_daemon()?;
         let mut cmd = TokioCommand::new(path);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -305,8 +350,42 @@ mod tests {
     }
 
     #[test]
-    fn locate_daemon_returns_some_or_none_without_panic() {
-        // Just ensure it doesn't panic; actual path depends on build state.
+    fn locate_daemon_returns_path_or_error_without_panic() {
+        // Actual fallback availability depends on build state.
         let _ = locate_daemon();
+    }
+
+    #[test]
+    fn explicit_daemon_path_accepts_current_executable() {
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let resolved = locate_daemon_with_override(Some(current_exe.clone().into_os_string()))
+            .expect("current test executable should be a valid explicit daemon path");
+        assert_eq!(resolved, current_exe);
+    }
+
+    #[test]
+    fn explicit_daemon_path_rejects_relative_path_without_fallback() {
+        let error = locate_daemon_with_override(Some(OsString::from("target/debug/agentdeckd")))
+            .expect_err("relative override must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(DAEMON_BIN_ENV));
+    }
+
+    #[test]
+    fn explicit_daemon_path_rejects_missing_absolute_path_without_fallback() {
+        let missing =
+            std::env::temp_dir().join(format!("agentdeck-missing-daemon-{}", std::process::id()));
+        let error = locate_daemon_with_override(Some(missing.into_os_string()))
+            .expect_err("missing override must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains(DAEMON_BIN_ENV));
+    }
+
+    #[test]
+    fn explicit_daemon_path_rejects_empty_value_without_fallback() {
+        let error = locate_daemon_with_override(Some(OsString::new()))
+            .expect_err("empty override must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(DAEMON_BIN_ENV));
     }
 }

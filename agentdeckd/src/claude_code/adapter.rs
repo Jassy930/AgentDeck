@@ -85,9 +85,16 @@ impl ClaudeCodeAdapter {
         }
     }
 
-    /// Test convenience constructor — functionally identical to `new`.
+    /// Constructor for deterministic tests. Seeds a fixed capability
+    /// version so calling `capabilities()` never executes the user's
+    /// `claude --version`.
     pub fn new_for_test() -> Self {
-        Self::new()
+        let cli_version = OnceLock::new();
+        let _ = cli_version.set("claude test".to_string());
+        Self {
+            cli_version,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Build a `SessionCapabilities` payload, caching the

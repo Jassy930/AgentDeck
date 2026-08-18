@@ -16,28 +16,51 @@ bash -n script/build_and_run.sh
 # iOS 共用 Swift Core
 swift test
 
-# 当前不创建真实 vendor session 的 backend / protocol 基础门禁
-cargo test -p agentdeck-protocol
-cargo test -p agentdeckd --lib
-cargo test -p agentdeckd --test agent_router
-cargo test -p agentdeckd --test agent_trait_shape
-cargo test -p agentdeckd --test cc_fixture_replay
-cargo test -p agentdeckd --test cc_system_events
-cargo test -p agentdeckd --test cc_translate
-cargo test -p agentdeckd --test codex_translate
-cargo run -p agentdeck-cli -- selfcheck
+# 默认离线的 Rust workspace 门禁
+scripts/verify-offline-tests.sh
+
+# 上述 tripwire 内执行的标准 Cargo 命令
+env -u AGENTDECK_E2E cargo test --workspace --locked
+
+# 绑定当前 checkout daemon 的 CLI selfcheck
+cargo build --locked \
+  -p agentdeckd --bin agentdeckd \
+  -p agentdeck-cli --bin agentdeck
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
+  ./target/debug/agentdeck \
+  --data-dir /tmp/agentdeck-selfcheck selfcheck
+
 scripts/verify-agent-docs.sh
 ```
 
-`cargo test -p agentdeckd --lib` 中的 capability probe 测试当前会对 PATH 中的
-`codex` / `claude` 执行本地 `--version`。它不创建 session、不读真实 history，也不发
-prompt，但仍不是零 vendor process 的 hermetic 单测；M0 实现应改用可注入 fake binary。
+`scripts/verify-offline-tests.sh` 在临时目录创建会写 marker 并失败的 `codex` / `claude`
+shim，把它们放到 PATH 首位，并使用临时 HOME 隔离用户 vendor history 与
+默认 AgentDeck data dir。脚本分别在
+`AGENTDECK_E2E` 未设置和等于 `0` 时运行完整 workspace 测试；空值、`false` 和其他值
+运行所有 gated integration targets，每次都断言 marker 不存在。Rust gate 单测另行覆盖
+纯值矩阵；version/auth probe 的普通单测使用可注入 fake，不探测用户 PATH 中的真实
+vendor。标准 Cargo 测试因此可作为默认离线门禁，但其中提前跳过的 E2E 显示 passed
+不构成真实 vendor 证据。
 
-`agentdeckd/tests/cc_adapter_shape.rs` 的部分测试只在 PATH 找不到 `claude` 时跳过，
-其中一项会发送真实模型 prompt；`codex_adapter_shape.rs` 也会在 PATH 命中时启动真实
-app-server。它们尚未统一使用 `AGENTDECK_E2E=1`，因此裸
-`cargo test -p agentdeckd` / `cargo test` 目前不是离线安全门禁。实现侧补齐门控前，
-只运行上面的 lib/focused 列表；真实 vendor 测试须取得用户确认并单独记录。
+## 默认离线 CI
+
+`.github/workflows/offline-ci.yml` 在 pull request 和 `master` push 上运行。稳定 required
+check 名称是 `Offline CI / offline`，使用 `macos-15`，按顺序执行：
+
+1. `cargo fmt --all -- --check`。
+2. `scripts/verify-offline-tests.sh`，且入口显式 unset `AGENTDECK_E2E`。
+3. 构建当前 checkout 的 `agentdeckd` 与 `agentdeck`。
+4. 显式 unset `AGENTDECK_E2E`，以
+   `AGENTDECK_DAEMON_BIN=$GITHUB_WORKSPACE/target/debug/agentdeckd` 和临时 data dir 运行
+   CLI selfcheck，禁止命中旧 sibling 或系统安装；显式路径无效时必须 fail fast，不得
+   fallback。
+5. 再次显式 unset gate，通过同一对当前 checkout 二进制输出 AgentDeck protocol schema
+   并与快照比较。
+6. `swift test` 和 `scripts/verify-agent-docs.sh`。
+
+该 workflow 不设置 `AGENTDECK_E2E=1`，不运行真实 Codex / Claude Code，也不运行 iOS
+Simulator。`swift test` 只覆盖平台无关的 `AgentDeckMobileCore`；UIKit Simulator 仍按
+iOS 变更范围在本地单独执行。
 
 ## GPUI 桌面 P0 门禁
 
@@ -100,10 +123,10 @@ macOS 桌面不得重新依赖 Swift target；共享 Core 测试也不得重新�
 | GPUI 视图、状态或组件 | `cargo test -p agentdeck-desktop`、desktop selfcheck、真实窗口冒烟 |
 | 桌面 bundle 或启动脚本 | `bash -n script/build_and_run.sh`、`./script/build_and_run.sh --verify` |
 | Swift Core / iOS 共享模型 | `swift test`；涉及 iOS 时再跑 iOS Simulator 测试 |
-| daemon、adapter、record、diagnostics | 对应不创建真实 session 的 focused test、`cargo test -p agentdeckd --lib` 和 CLI selfcheck；lib 当前仍会执行本地 vendor `--version`，不要裸跑全量测试 |
+| daemon、adapter、record、diagnostics | `scripts/verify-offline-tests.sh`、对应 focused test，以及通过 `AGENTDECK_DAEMON_BIN` 绑定当前 checkout 的 CLI selfcheck |
 | agentdeck-protocol | `cargo test -p agentdeck-protocol`；漂移时按下文重生成 schema |
 | 文档、AGENTS、计划规则 | `scripts/verify-agent-docs.sh` |
-| 全局依赖或 workspace | 当前先跑上列不创建真实 session/prompt 的分层 Cargo 门禁、`swift test`、desktop selfcheck 和 doc check；统一 E2E gate 与版本 probe 注入后恢复 `cargo test` |
+| 全局依赖或 workspace | `scripts/verify-offline-tests.sh`、`swift test`、desktop selfcheck 和 doc check；真实 vendor E2E 仍需单独授权和记录 |
 
 ## Codex vendor schema 快照
 
@@ -163,9 +186,8 @@ cmp "$SCHEMA_DIR/committed-v2.normalized.json" \
   "$SCHEMA_DIR/generated-v2.normalized.json"
 ```
 
-确认 method 表行数和内容一致后，当前先运行 `cargo test -p agentdeck-protocol`、
-`scripts/verify-agent-docs.sh` 和 `git diff --check`；只有全部 real-vendor tests 已统一受
-`AGENTDECK_E2E=1` 门控后，才恢复裸 `cargo test` 收口。当前稳定合约不使用
+确认 method 表行数和内容一致后，运行 `scripts/verify-offline-tests.sh`、
+`scripts/verify-agent-docs.sh` 和 `git diff --check`。当前稳定合约不使用
 `--experimental`；只有客户端显式启用 `experimentalApi` 时才建立独立实验基线。
 
 ## AgentDeck IPC schema 漂移测试
@@ -186,7 +208,12 @@ UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapsh
 核对快照与当前代码是否同步（独立验证，无需构建测试二进制）：
 
 ```bash
-cargo run -q -p agentdeck-cli -- protocol schema \
+cargo build --locked \
+  -p agentdeckd --bin agentdeckd \
+  -p agentdeck-cli --bin agentdeck
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
+  ./target/debug/agentdeck \
+  --data-dir /tmp/agentdeck-schema protocol schema \
   | diff - protocol/agentdeck/agentdeck-protocol.schema.json \
   && echo "schema in sync"
 ```
@@ -198,28 +225,28 @@ cargo run -q -p agentdeck-cli -- protocol schema \
 启用方式：
 
 ```bash
-AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
-AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_claude_code -- --nocapture
-AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- --nocapture --test-threads=1
+cargo build --locked -p agentdeckd --bin agentdeckd
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+  cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+  cargo test -p agentdeck-cli --test e2e_claude_code -- --nocapture
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+  cargo test -p agentdeck-cli --test e2e_cross_agent_history -- \
+  --nocapture --test-threads=1
 ```
 
-**当前门控机制：** 每个 CLI E2E 只检查环境变量 `AGENTDECK_E2E` 是否存在；未设置时
-`eprintln!("skipped...")` 后直接早返回（不是 `#[ignore]`，因此不能用 `--ignored`
-启用；标准 `cargo test` 中显示为 passed 而非 ignored）。任何已设置值，包括 `0`，当前
-都会启用真实路径。执行时统一显式使用 `AGENTDECK_E2E=1`；需要跳过时必须彻底 unset。
-M0 第一项测试基础设施工作是把判断收紧为值严格等于 `1`。
+**当前门控机制：** 所有真实 session、prompt、history、auth 和 vendor process 测试只在
+环境变量 `AGENTDECK_E2E` 的值严格等于 `1` 时进入。未设置、空值、`0`、`false` 和
+其他值都会在任何真实 vendor I/O 前提前返回；这些测试不是 `#[ignore]`，因此在标准
+Cargo 测试中显示为 passed 而非 ignored。
 
 **前置条件：** `codex login` 已完成（测试会真实 spawn daemon 并发送 IPC）。
 
 **断言策略：** E2E 测试只断言响应的契约形态（消息 kind、必要字段存在、退出码等），不断言 agent 返回的具体文本内容，以避免测试因模型输出变化而 flaky。
 
-**CI 默认跳过：** 完全未设置 `AGENTDECK_E2E` 时，这三组 CLI E2E 会早返回，不需要
-`codex login`。设置为 `0` 并不会跳过。
-
-上句目前只对 `agentdeck-cli/tests/e2e_*` 的“变量未设置”情况成立；adapter shape
-测试仍有上述门控缺口，lib capability probe 也会执行本地 vendor `--version`。把所有
-真实 Codex / Claude Code 测试统一迁到值严格等于 `AGENTDECK_E2E=1` 的门控，并把版本
-probe 改为可注入 fake 后，才能恢复“标准 `cargo test` 完全离线”的仓库级承诺。
+**CI 默认跳过：** workflow 显式 unset `AGENTDECK_E2E`；三组 CLI E2E 和 adapter
+real-vendor shape 路径都会在 vendor I/O 前返回，不需要 vendor 登录。普通 CI passed
+只证明默认路径保持离线，不证明真实 Codex / Claude Code 链路可用。
 
 ## 文档结构检查
 
@@ -231,7 +258,8 @@ probe 改为可注入 fake 后，才能恢复“标准 `cargo test` 完全离线
 - 项目没有重新引入已剥离的外部 skill 强制绑定。
 - `docs/plans/README.md` 存在，计划文档不再只是散落文件。
 
-后续接入 CI 时，先把这个脚本作为独立 job，再逐步增加更严格的结构检查。
+默认 `Offline CI / offline` check 会执行该脚本；新增或移动事实源文档时必须同步更新
+脚本及本页入口。
 
 ## 失败处理
 

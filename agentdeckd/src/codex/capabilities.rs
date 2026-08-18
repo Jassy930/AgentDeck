@@ -80,19 +80,15 @@ pub fn supported_approval_policies() -> Vec<CodexApprovalPolicy> {
     ]
 }
 
-/// Probe the local `codex` binary's version string. Falls back to a stable
-/// placeholder so capability emission never blocks on the probe.
-///
-/// Note: this is synchronous and shells out to `codex --version`. Task 3B's
-/// adapter calls it once at construction, not per-session, so the cost is
-/// negligible. If the binary is missing the placeholder makes it obvious
-/// in the SessionCapabilities event (which downstream diagnostics surface).
-pub fn probe_codex_version() -> String {
-    use std::process::Command;
-    match Command::new("codex").arg("--version").output() {
-        Ok(out) if out.status.success() => {
-            let raw = String::from_utf8_lossy(&out.stdout);
-            let trimmed = raw.trim();
+/// Classify an injected `codex --version` command result. Tests pass a fake
+/// runner so the default suite never executes the user's vendor binary.
+pub fn probe_codex_version_with_command<F>(run: F) -> String
+where
+    F: FnOnce() -> Result<(i32, String), String>,
+{
+    match run() {
+        Ok((0, stdout)) => {
+            let trimmed = stdout.trim();
             if trimmed.is_empty() {
                 "codex unknown".to_string()
             } else {
@@ -101,6 +97,29 @@ pub fn probe_codex_version() -> String {
         }
         _ => "codex unknown".to_string(),
     }
+}
+
+/// Probe the local `codex` binary's version string. Falls back to a stable
+/// placeholder so capability emission never blocks on the probe.
+///
+/// Note: this is synchronous and shells out to `codex --version`. Task 3B's
+/// adapter calls it once at construction, not per-session, so the cost is
+/// negligible. If the binary is missing the placeholder makes it obvious
+/// in the SessionCapabilities event (which downstream diagnostics surface).
+pub fn probe_codex_version() -> String {
+    probe_codex_version_with_command(|| {
+        use std::process::Command;
+        Command::new("codex")
+            .arg("--version")
+            .output()
+            .map(|out| {
+                (
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stdout).into_owned(),
+                )
+            })
+            .map_err(|error| error.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -195,12 +214,27 @@ mod tests {
     }
 
     #[test]
-    fn probe_codex_version_returns_non_empty_string() {
-        // Either we have codex installed and get a real version, or we get
-        // the "codex unknown" fallback — either way the function MUST NOT
-        // panic and MUST return a non-empty string the adapter can put on
-        // the wire.
-        let v = probe_codex_version();
-        assert!(!v.is_empty());
+    fn probe_codex_version_accepts_injected_success() {
+        let version =
+            probe_codex_version_with_command(|| Ok((0, "codex-cli 0.145.0\n".to_string())));
+        assert_eq!(version, "codex-cli 0.145.0");
+    }
+
+    #[test]
+    fn probe_codex_version_degrades_on_injected_spawn_failure() {
+        let version = probe_codex_version_with_command(|| Err("missing".to_string()));
+        assert_eq!(version, "codex unknown");
+    }
+
+    #[test]
+    fn probe_codex_version_degrades_on_injected_nonzero_or_empty_output() {
+        assert_eq!(
+            probe_codex_version_with_command(|| Ok((1, "codex-cli 0.145.0".to_string()))),
+            "codex unknown"
+        );
+        assert_eq!(
+            probe_codex_version_with_command(|| Ok((0, " \n".to_string()))),
+            "codex unknown"
+        );
     }
 }

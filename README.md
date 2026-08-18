@@ -96,12 +96,24 @@ cargo run -p agentdeck-desktop -- --selfcheck
 # iOS 共用 Swift Core
 swift test
 
-# 当前不创建真实 vendor session 的 Rust 基础门禁
-cargo test -p agentdeck-protocol
-cargo test -p agentdeckd --lib
+# 默认离线的 Rust workspace 门禁（含 vendor marker tripwire）
+scripts/verify-offline-tests.sh
+
+# 直接运行同一套标准 workspace 测试
+env -u AGENTDECK_E2E cargo test --workspace --locked
+
+# 用当前 checkout 构建的 daemon 执行 CLI selfcheck
+cargo build --locked \
+  -p agentdeckd --bin agentdeckd \
+  -p agentdeck-cli --bin agentdeck
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
+  ./target/debug/agentdeck \
+  --data-dir /tmp/agentdeck-selfcheck selfcheck
 
 # 协议 schema 漂移
-cargo run -q -p agentdeck-cli -- protocol schema \
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
+  ./target/debug/agentdeck \
+  --data-dir /tmp/agentdeck-schema protocol schema \
   | diff - protocol/agentdeck/agentdeck-protocol.schema.json
 
 # 文档结构
@@ -110,11 +122,13 @@ scripts/verify-agent-docs.sh
 
 只有改动对应层时才运行其门禁。
 
-`cargo test -p agentdeckd --lib` 当前仍会对 PATH 中的 `codex` / `claude` 执行本地
-`--version`；它不创建 session 或发送 prompt，但还不是零 vendor process 的 hermetic
-测试。裸 `cargo test -p agentdeckd` / `cargo test` 风险更高：shape test 会启动真实
-app-server，其中一项 Claude Code 测试会发送模型 prompt。统一补齐门控前，不把这些
-命令统称为完全离线；当前边界见 [docs/QUALITY.md](docs/QUALITY.md)。
+标准 `cargo test --workspace --locked` 默认不启动 `codex` / `claude`，也不读取用户
+vendor history；所有真实 vendor process、session、prompt、history 和 auth 路径只在
+`AGENTDECK_E2E` 的值严格等于 `1` 时启用。`scripts/verify-offline-tests.sh` 会把 marker
+shim 放到 PATH 首位，并使用临时 HOME 隔离用户 vendor history 与默认 AgentDeck data dir：unset 和 `0` 各跑完整
+workspace，空值、`false` 和其他值跑全部 gated integration targets，每次都断言 marker
+不存在。普通 Cargo 测试中的 E2E 提前跳过仍会显示 passed，因此该结果不等于真实
+Codex / Claude Code E2E 证据；完整边界见 [docs/QUALITY.md](docs/QUALITY.md)。
 
 ## 下一条纵向切片
 
