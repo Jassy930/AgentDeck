@@ -24,6 +24,9 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Install ripgrep
+        run: brew install ripgrep
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
