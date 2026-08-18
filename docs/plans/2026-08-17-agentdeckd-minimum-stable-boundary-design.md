@@ -1,7 +1,7 @@
 # agentdeckd 最小稳定边界设计
 
 日期：2026-08-17
-状态：设计基线，尚未完成代码验收
+状态：实施中；Issue #3 生命周期切片已落地，M0 尚未完成代码验收
 
 ## 决策摘要
 
@@ -26,19 +26,45 @@ M0 只证明 daemon、Codex app-server 和中立 IPC 之间最短且可复用的
 desktop 在此边界通过前不得连接 daemon；通过后，desktop 首切片可以只展示首轮，
 但 daemon 放行门禁必须实际跑通同一 session 的两轮复用。
 
+## 当前落地范围（Issue #3）
+
+Issue #3 已把 M0 的 session/turn 生命周期骨架落到 protocol v3 和 Codex runtime：
+
+- `SessionStart(sessionId,resumeThreadId?,initialTurn?)`、`TurnStart`、`TurnCancel`、
+  `SessionClose`，以及 `TurnStarted`、`TurnFinished`、`SessionClosed` 已进入 Rust 协议、
+  schema 和 Swift mirror；旧 `SessionContinue` / `SessionCancel` 已移除，`TurnComplete`
+  暂只留给 Claude Code。
+- Codex session owner 独占一个 app-server child、stdin/stdout、RPC allocator、threadId 和
+  turn 状态；完整执行 initialize response → initialized → thread/start|resume response，
+  再发 SessionStarted → SessionCapabilities。
+- owner 同时只接受一个 turn，支持同 connection 的顺序多轮；`TurnCancel` 使用
+  `turn/interrupt`，`SessionClose` 才关闭 stdin、必要时终止进程组并 wait。owner 报告
+  direct child wait、Unix 进程组有界轮询至 `ESRCH` 与 stderr pump join 完成后，RuntimeHub 先清路由和 handle，再发
+  `SessionClosed`。lifecycle command 由单一有序 worker 执行；stdin EOF 会 drain 已读
+  命令并关闭 retained session，cleanup 无法确认则 poison 并退出 daemon。
+- locator、版本探测和 spawn 绑定同一绝对 binary，严格要求固定 0.145.0；生产 argv 固定
+  为 `app-server --listen stdio://`。M0 options 固定为 never/read-only/medium、
+  `persist=false`、无 MCP，capabilities 不宣称尚未验收的 feature。
+
+这不是 M0 完成声明。#4 仍需实现稳定 `itemId` 与客户端可见累计 streaming；#5 仍需
+持有同一 daemon 连接的 CLI/test driver 和真实 Codex 多轮/cancel/close E2E；#6 仍需把
+RunRecord、lifecycle diagnostics 与可回读的 `diagnosticRef` 接入生产路径。本轮尚无真实
+Codex session/prompt 回执；固定版本的官方 `ClientNotification.json` 已随实现补齐。
+
 ## 背景
 
-当前 `agentdeckd` 已有 RuntimeHub、Codex/Claude Code adapter、history、approval、
-vendor control、run record 和 diagnostics 等较宽的代码表面，但 desktop 最先依赖的
-生命周期仍未闭环：
+`agentdeckd` 已有 RuntimeHub、Codex/Claude Code adapter、history、approval、vendor
+control、run record 和 diagnostics 等较宽的代码表面。Issue #3 已闭合 Codex
+session owner、握手、顺序 turn、interrupt 和 close/wait 的代码路径；desktop 最先依赖
+的完整 M0 仍有以下缺口：
 
 - Codex assistant delta 只在 daemon 内累计，客户端只在 item 完成后收到一次快照，
   不能支撑真实 streaming UI。
-- 当前 `TurnComplete` 不能无歧义表达 vendor 的成功、失败和中断状态，也没有稳定
-  `turnId`。
-- 当前一次 start/continue 创建一个 app-server，无法证明同一 live session 的第二轮。
-- cancel 主要依赖杀进程，会把 turn cancel 和 session close 混为一件事。
-- `initialize` 响应后尚未把官方 `initialized` notification 固化为握手必经步骤。
+- protocol v3 已有稳定 `turnId` 和 typed `TurnFinished`，但真实 vendor 的
+  completed/failed/interrupted 与 cancel 后恢复尚未由持久 E2E 验收。
+- owner 的 fake/duplex 测试可复用一个 connection；当前 one-shot CLI 会在首轮
+  `TurnFinished` 后自动 close，并等待 `SessionClosed` 与 daemon 回收，但仍无法驱动同一
+  live session 的第二轮或 cancel 后续轮。
 - run record 和 lifecycle diagnostics 基础设施存在，但尚未接到生产 session 事件流。
 
 如果先接 desktop，UI 会被迫补偿这些未稳定语义。M0 的目标不是完成整个 daemon，
@@ -152,7 +178,8 @@ TurnStart { sessionId, turnId, prompt }
 ```
 
 - 只在对应 session 为 Ready 时接受。
-- `turnId` 由 client 生成、在该 session 内唯一；daemon 负责映射官方 Codex turn id。
+- `turnId` 由 client 生成、在该 session 内唯一；daemon 记录所有已接受 ID，重复使用返回
+  `turn-id-already-used`，不会再次写入 vendor。daemon 负责映射官方 Codex turn id。
 - 已有 in-flight turn 时返回 `turn-already-running`；session 仍在 Initializing、Stopping
   或 Poisoned 时返回 `session-not-ready`。两种情况都不启动第二个 turn。
 - `TurnStarted` 表示 daemon 已接受该命令，在向 app-server 发 `turn/start` 前立即发出；
@@ -177,8 +204,8 @@ TurnCancel { sessionId, turnId }
 SessionClose { sessionId }
 ```
 
-- Ready 时关闭 app-server stdin 并有限等待；到期仍存活才终止其进程组，随后 `wait`，
-  再发 SessionClosed。
+- Ready 时关闭 app-server stdin 并有限等待；到期仍存活才终止其进程组，随后 `wait`
+  direct child，并有界等待进程组消失，再发 SessionClosed。
 - 初始化期间可以 close：终止并回收 child，不伪造 SessionStarted。
 - 有 in-flight turn 时先按 TurnCancel 收口并发唯一 TurnFinished，再关闭 session；事件
   顺序必须是 `TurnFinished` → `SessionClosed`。
@@ -344,7 +371,7 @@ stateDiagram-v2
 1. 停止接受该 session 的新 TurnStart。
 2. 若有 in-flight turn，先 interrupt 并发唯一 TurnFinished。
 3. 关闭 app-server stdin；有残留进程时终止其独立进程组。
-4. `wait` 回收直接 child，停止 stdout/stderr pump。
+4. `wait` 回收直接 child；Unix 上轮询 `kill(-pgid, 0)` 至 `ESRCH`，再停止 stdout/stderr pump。
 5. 清空 session 路由并回 Idle。
 6. 发唯一 SessionClosed：用户正常 close 为 closed；初始化或 session fatal 为 failed。
 
@@ -352,7 +379,7 @@ stateDiagram-v2
 
 cleanup failure 不能伪装成可恢复状态：
 
-- 一旦无法确认 child 已回收、pump 已停止或所有权已释放，立即进入 Poisoned。
+- 一旦无法确认 direct child 已回收、进程组已消失、pump 已停止或所有权已释放，立即进入 Poisoned。
 - 先停止 daemon intake，拒绝所有新 SessionStart/TurnStart；绝不回 Ready 或 Idle。
 - 若仍有 in-flight turn，先给它一个 failed TurnFinished。
 - 发 `SessionClosed(outcome=failed, error=codex-cleanup-failed)`，error 必须带
@@ -432,6 +459,7 @@ M0 通过以下不变量定义“完整”，而不是以文件或 trait 已存�
 | JSON 无法解析、参数无效、命令不在 M0 | 无；返回 Error | session 不受影响或不得 spawn |
 | daemon 非 Idle 收到新 SessionStart | 无；返回 session-busy | 当前 session 不受影响 |
 | 已有 in-flight turn 时收到 TurnStart | 无；返回 turn-already-running | 当前 turn/session 不受影响 |
+| 复用该 session 已接受的 turnId | 无；返回 turn-id-already-used | 当前 session 保持 Ready |
 | Initializing/Stopping/Poisoned 时收到 TurnStart | 无；返回 session-not-ready | 当前状态不变 |
 | 找不到 codex 或 spawn 失败 | 无；initial turn 尚未接受 | SessionClosed(failed)，清路由 |
 | initialize / initialized / thread request 失败 | 无；initial turn 尚未接受 | SessionClosed(failed)，回收 child |
@@ -493,6 +521,25 @@ streaming、terminal 或 cleanup 的 M0 状态；普通 Cargo passed 也不等�
 
 ### 确定性测试
 
+Issue #3 的 focused 离线入口是：
+
+```bash
+cargo test -p agentdeck-protocol
+cargo test -p agentdeck-cli --bin agentdeck
+cargo test -p agentdeckd --lib codex::
+cargo test -p agentdeckd --lib runtime::hub
+cargo test -p agentdeckd --lib runtime::router
+cargo test -p agentdeckd --test codex_adapter_shape
+swift test
+```
+
+该切片已有 protocol round-trip/schema、同 binary probe/spawn 与 argv/initialized 顺序、
+session owner 和 RuntimeHub/router 的 fake/duplex/stub 证据。Issue #3 当前还覆盖同
+connection 两轮、interrupt 后复用、running close、malformed/unmatched/EOF、handshake
+failure、unsupported request、terminal status、resume 固定参数、stderr pump join，以及
+stdin EOF/cleanup failure 的 poison→daemon exit。下面列表仍是完整 M0 验收要求；#4
+streaming 与 #6 record/diagnostics 不能因生命周期测试通过而视为完成。
+
 - production spawn 参数显式包含 `app-server --listen stdio://`；版本探测和 spawn 使用
   同一绝对 binary。版本缺失或不匹配在 SessionStarted 前稳定失败。
 - 协议 round-trip 与 schema 漂移覆盖 TurnStart、TurnCancel、SessionClose、
@@ -536,8 +583,8 @@ AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
 4. 第三轮在首个 streaming snapshot 后 TurnCancel，收到唯一 canceled TurnFinished，
    child 仍存活并回 Ready。
 5. 同一 session 再开第四轮并成功，PID 和 threadId 仍不变。
-6. 发送 SessionClose，收到唯一 SessionClosed(closed)，并确认 child 已 wait；同一个
-   run record 覆盖全部轮次和 close。
+6. 发送 SessionClose，收到唯一 SessionClosed(closed)，并确认 child 已 wait、Unix
+   进程组已消失；同一个 run record 覆盖全部轮次和 close。
 
 模型输出内容不作精确字符串断言。多-delta 的确定性由 fixture 负责；真实 E2E 只
 断言至少一份发生在 completed/terminal 前的 streaming snapshot。
@@ -573,8 +620,8 @@ scripts/verify-agent-docs.sh
 - focused 测试、完整 Cargo 测试、CLI selfcheck 与真实 Codex E2E 在同一提交通过。
 - 真实 E2E 证明同一 child PID、同一 threadId 连续完成两轮，并在 TurnCancel 后还能
   完成下一轮。
-- SessionClose 有 child wait 证据；cleanup failure 测试证明只会 Poisoned → failed
-  SessionClosed → daemon exit，不会回 Ready/Idle。
+- SessionClose 有 direct child wait 和 Unix 进程组消失证据；cleanup failure 测试证明
+  信号、探测或等待失败只会 Poisoned → failed SessionClosed → daemon exit，不会回 Ready/Idle。
 - run record 和 lifecycle diagnostics 已接线，失败 ProtocolError 有可定位的
   diagnosticRef。
 - capabilities 只声明已验收能力，`agentdeckd` 功能完整度文档把 M0 标为已验收并链接

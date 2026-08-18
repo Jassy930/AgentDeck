@@ -1,7 +1,7 @@
 # 协议 Spike 发现（Step 0,Eng D7）
 
 首次 framing 实测日期：2026-05-19
-schema 最近刷新日期：2026-07-22
+schema 最近刷新日期：2026-08-18
 codex 版本：codex-cli 0.145.0（已固定在 `CODEX_VERSION.txt`）
 
 ## D7 核心问题：wire framing 是什么？
@@ -29,7 +29,8 @@ schema；`generate-ts --out DIR` 可生成 TypeScript binding。**不需要逆�
 固化进项目的关键 schema（`protocol/`）：
 - `JSONRPCMessage.json` — 消息信封（Request/Notification/Response/Error）
 - `ClientRequest.json` — 客户端可发的请求（方法名见 client-methods.txt）
-- `ClientNotification.json` — 客户端通知；0.145.0 当前定义 `initialized`（仓库当前缺失，M0 必须从官方生成物补入）
+- `ClientNotification.json` — 客户端通知；0.145.0 当前定义 `initialized`。该官方生成
+  快照已提交，live session 与 short-lived history path 均实现该 notification。
 - `ServerNotification.json` — 服务端通知（item 事件流在这里）
 - `ServerRequest.json` — 服务端发起的请求（approval 在这里）
 - `codex_app_server_protocol.v2.schemas.json` — v2 完整 schema
@@ -73,8 +74,12 @@ AgentDeck v0.1 只暴露一次性 approve / deny：命令和文件请求映射�
 ## 对设计文档前提的影响
 
 - **D7 → 已验证**：framing = 逐行 JSONL，最简单分支。BufReader 按行读。
-- **C-protocol 待补 → 已解决**：方法名、版本、schema 全部锁定并固化。
-- **M0 握手缺口**：0.145.0 官方生成物包含 `ClientNotification.json`，但当前仓库尚未提交该文件，live 与 short-lived adapter 也未发送 `initialized`；desktop 接入前必须补齐快照、实现和 fake/真实 E2E。
+- **C-protocol 待补 → 已解决**：request/notification 方法名、版本和关键 schema 已锁定。
+- **M0 握手实现 → 已落地、待真实验收**：Issue #3 的 live session owner 与
+  `ShortLivedAppServer` 都在 initialize response 后、thread request 前发送
+  `initialized`，fake executable/duplex 测试守护顺序，官方 `ClientNotification.json`
+  同步固定该 wire。desktop 接入前仍须由 #5 的持久真实 Codex E2E 证明握手、多轮和
+  close 没有随 vendor 漂移。
 - **D8 → 强化**：approval 元数据结构化，中立 action 抽象有可靠数据源。
 - **D2 → 实现路径清晰**：daemon 用官方 schema 反序列化 Codex 消息，
   翻译成中立 AgentItem，IPC 传中立 JSON。

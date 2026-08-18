@@ -13,7 +13,7 @@ use std::path::PathBuf;
 // ── Top-level CLI ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "agentdeck", about = "AgentDeck unified interface CLI (v2)")]
+#[command(name = "agentdeck", about = "AgentDeck unified interface CLI (v3)")]
 struct Cli {
     /// AgentDeck profile (stable|dev)
     #[arg(long, global = true, default_value = "stable")]

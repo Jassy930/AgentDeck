@@ -1,4 +1,4 @@
-//! agentdeckd — AgentDeck daemon (v2 protocol).
+//! agentdeckd — AgentDeck daemon (v3 protocol).
 //!
 //! Architecture (Eng D2): the IPC protocol IS the agent-neutral boundary.
 //! `agentdeck-protocol` defines the neutral wire types; `codex` is the
@@ -12,8 +12,9 @@
 //!                                                  ◀── JSON-RPC (newline)
 //!
 //! Process boundary (Eng A1): every Codex child runs in its own process
-//! group (`process_group(0)`) so cancel / drop SIGKILLs the whole subtree
-//! (MCP servers, sandbox helpers) without orphans. See codex/adapter.rs.
+//! group (`process_group(0)`) so session cleanup / drop can terminate and
+//! confirm the whole subtree (MCP servers, sandbox helpers). Turn cancel uses
+//! the official `turn/interrupt`; see codex/app_server.rs and codex/session.rs.
 //!
 //! Phase 3 / Task 3C scope: this main is a thin CLI shell around
 //! `RuntimeHub::run(stdin, stdout)`. Admin flags (`--selfcheck`,
@@ -97,7 +98,7 @@ fn print_version() {
 
 fn print_help() {
     println!(
-        "agentdeckd — AgentDeck daemon (v2 protocol).\n\
+        "agentdeckd — AgentDeck daemon (v3 protocol).\n\
          \n\
          Usage: agentdeckd [OPTIONS]\n\
          \n\

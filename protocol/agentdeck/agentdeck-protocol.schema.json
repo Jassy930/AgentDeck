@@ -266,6 +266,22 @@
             }
           ]
         },
+        "InitialTurn": {
+          "additionalProperties": false,
+          "properties": {
+            "prompt": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "prompt",
+            "turnId"
+          ],
+          "type": "object"
+        },
         "McpOverride": {
           "additionalProperties": false,
           "properties": {
@@ -526,7 +542,17 @@
             "cwd": {
               "type": "string"
             },
-            "prompt": {
+            "initialTurn": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InitialTurn"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "resumeThreadId": {
               "type": [
                 "string",
                 "null"
@@ -543,6 +569,9 @@
                 "logVerbosity": null
               }
             },
+            "sessionId": {
+              "type": "string"
+            },
             "vendorOptions": {
               "$ref": "#/definitions/VendorSessionOptions"
             }
@@ -551,6 +580,7 @@
             "agentKind",
             "command",
             "cwd",
+            "sessionId",
             "vendorOptions"
           ],
           "type": "object"
@@ -558,31 +588,27 @@
         {
           "additionalProperties": false,
           "properties": {
-            "agentKind": {
-              "$ref": "#/definitions/AgentKind"
-            },
             "command": {
               "enum": [
-                "sessionContinue"
+                "turnStart"
               ],
-              "type": "string"
-            },
-            "cwd": {
               "type": "string"
             },
             "prompt": {
               "type": "string"
             },
-            "threadId": {
+            "sessionId": {
+              "type": "string"
+            },
+            "turnId": {
               "type": "string"
             }
           },
           "required": [
-            "agentKind",
             "command",
-            "cwd",
             "prompt",
-            "threadId"
+            "sessionId",
+            "turnId"
           ],
           "type": "object"
         },
@@ -591,7 +617,30 @@
           "properties": {
             "command": {
               "enum": [
-                "sessionCancel"
+                "turnCancel"
+              ],
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "sessionId",
+            "turnId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "enum": [
+                "sessionClose"
               ],
               "type": "string"
             },
@@ -3002,10 +3051,32 @@
           ],
           "type": "object"
         },
+        "SessionOutcome": {
+          "enum": [
+            "closed",
+            "failed"
+          ],
+          "type": "string"
+        },
         "ShellStatus": {
           "enum": [
             "running",
             "completed",
+            "failed",
+            "canceled"
+          ],
+          "type": "string"
+        },
+        "TurnNextState": {
+          "enum": [
+            "ready",
+            "closing"
+          ],
+          "type": "string"
+        },
+        "TurnOutcome": {
+          "enum": [
+            "succeeded",
             "failed",
             "canceled"
           ],
@@ -3324,6 +3395,140 @@
         },
         {
           "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "sessionId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "turnStarted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "sessionId",
+            "threadId",
+            "turnId",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ProtocolError"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "nextState": {
+              "$ref": "#/definitions/TurnNextState"
+            },
+            "outcome": {
+              "$ref": "#/definitions/TurnOutcome"
+            },
+            "sessionId": {
+              "type": "string"
+            },
+            "summary": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TurnSummary"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "threadId": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "turnFinished"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "nextState",
+            "outcome",
+            "sessionId",
+            "threadId",
+            "turnId",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agentKind": {
+              "$ref": "#/definitions/AgentKind"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ProtocolError"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "outcome": {
+              "$ref": "#/definitions/SessionOutcome"
+            },
+            "sessionId": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "sessionClosed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agentKind",
+            "outcome",
+            "sessionId",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Legacy Claude Code-only terminal. Codex M0 uses `TurnFinished`.",
           "properties": {
             "agentKind": {
               "$ref": "#/definitions/AgentKind"
@@ -3678,6 +3883,22 @@
           ],
           "type": "string"
         },
+        "InitialTurn": {
+          "additionalProperties": false,
+          "properties": {
+            "prompt": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "prompt",
+            "turnId"
+          ],
+          "type": "object"
+        },
         "McpOverride": {
           "additionalProperties": false,
           "properties": {
@@ -3857,7 +4078,17 @@
         "cwd": {
           "type": "string"
         },
-        "prompt": {
+        "initialTurn": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InitialTurn"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resumeThreadId": {
           "type": [
             "string",
             "null"
@@ -3874,6 +4105,9 @@
             "logVerbosity": null
           }
         },
+        "sessionId": {
+          "type": "string"
+        },
         "vendorOptions": {
           "$ref": "#/definitions/VendorSessionOptions"
         }
@@ -3881,12 +4115,13 @@
       "required": [
         "agentKind",
         "cwd",
+        "sessionId",
         "vendorOptions"
       ],
       "title": "SessionStart",
       "type": "object"
     }
   },
-  "title": "AgentDeck Protocol v2",
+  "title": "AgentDeck Protocol v3",
   "type": "object"
 }

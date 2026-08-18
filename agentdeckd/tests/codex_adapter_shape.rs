@@ -1,20 +1,18 @@
 //! Shape / contract tests for `CodexAdapter`.
 //!
-//! These verify the v2 `Agent` trait wiring without spawning a real
+//! These verify the v3 `Agent` trait wiring without spawning a real
 //! `codex app-server` (the optional real-codex test below requires both
 //! `AGENTDECK_E2E=1` and a binary on PATH). The goal is a fast unit-style
 //! safety net for Task 3B's adapter that:
 //!
 //!   1. Confirms the adapter is `dyn Agent`-compatible (Send + Sync +
 //!      'static + the right method set).
-//!   2. Confirms it advertises the right `AgentKind` + capability set
-//!      (CodexSandboxMode + Approval as the load-bearing features
-//!      downstream code keys off).
+//!   2. Confirms its pre-M0 capability claim stays empty until the
+//!      corresponding lifecycle/streaming gates are accepted.
 //!   3. Confirms it rejects wrong-vendor `VendorSessionOptions` /
 //!      `VendorControlPayload` with structured errors (N4 / N5 guard).
-//!   4. Confirms `submit_decision` / `cancel` against an unknown
-//!      session id return `session-not-found` (the hub will plumb
-//!      these directly to the client).
+//!   4. Confirms live commands reject an unknown session id while legacy
+//!      whole-session cancel stays idempotent for an already-closed session.
 //!   5. (gated) Confirms a real `codex app-server` start_session
 //!      emits SessionStarted then SessionCapabilities as its first
 //!      two events (N7).
@@ -33,18 +31,11 @@ fn codex_adapter_impls_agent_trait() {
 }
 
 #[test]
-fn capabilities_includes_codex_features() {
+fn capabilities_do_not_claim_unaccepted_features() {
     let a = CodexAdapter::new_for_test();
     let caps = a.capabilities();
     assert_eq!(caps.agent_kind, AgentKind::Codex);
-    assert!(caps.features.contains(&CapabilityId::CodexSandboxMode));
-    assert!(caps.features.contains(&CapabilityId::Approval));
-    // Sanity: the Claude-Code-only features did NOT leak in.
-    assert!(
-        !caps
-            .features
-            .contains(&CapabilityId::ClaudeCodePermissionMode)
-    );
+    assert!(caps.features.is_empty());
 }
 
 #[tokio::test]
@@ -52,9 +43,11 @@ async fn start_session_rejects_wrong_vendor_options() {
     let a = CodexAdapter::new_for_test();
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let start = SessionStart {
+        session_id: SessionId("wrong-vendor-session".into()),
         agent_kind: AgentKind::Codex,
         cwd: std::env::current_dir().unwrap(),
-        prompt: None,
+        resume_thread_id: None,
+        initial_turn: None,
         vendor_options: VendorSessionOptions::ClaudeCode(ClaudeCodeSessionOptions {
             permission_mode: ClaudeCodePermissionMode::Default,
             model: None,
@@ -140,6 +133,17 @@ async fn cancel_on_unknown_session_is_idempotent_ok() {
     assert!(result.is_ok());
 }
 
+#[tokio::test]
+async fn live_turn_commands_require_the_exact_active_session_id() {
+    let a = CodexAdapter::new_for_test();
+    let sid = SessionId("phantom".into());
+    let error = a
+        .start_turn(&sid, TurnId("turn-1".into()), "hello".into())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "session-not-found");
+}
+
 /// Optional smoke test that requires `AGENTDECK_E2E=1` and a real `codex`
 /// binary in PATH. We use `which::which` to skip cleanly when codex is absent (CI
 /// machines, contributor laptops without codex login). When present,
@@ -158,19 +162,21 @@ async fn real_codex_emits_started_then_capabilities() {
     let a = CodexAdapter::new_for_test();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let start = SessionStart {
+        session_id: SessionId("real-codex-shape-session".into()),
         agent_kind: AgentKind::Codex,
         cwd: std::env::current_dir().unwrap(),
-        prompt: None,
+        resume_thread_id: None,
+        initial_turn: None,
         vendor_options: VendorSessionOptions::Codex(CodexSessionOptions {
             approval_policy: CodexApprovalPolicy::Never,
             sandbox: CodexSandboxMode::ReadOnly,
             persist_approval: false,
-            reasoning_effort: CodexReasoningEffort::Minimal,
+            reasoning_effort: CodexReasoningEffort::Medium,
             mcp_overrides: vec![],
         }),
         runtime_options: Default::default(),
     };
-    let handle = tokio::time::timeout(
+    let mut handle = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         a.start_session(start, tx),
     )
@@ -199,6 +205,15 @@ async fn real_codex_emits_started_then_capabilities() {
             ..
         }
     ));
-    // Clean up: cancel the session so the codex child process dies.
-    a.cancel(&handle.session_id).await.expect("cancel ok");
+    // Clean up through the M0 close mailbox, then require owner-confirmed
+    // process cleanup rather than treating command acceptance as terminal.
+    a.close_session(&handle.session_id).await.expect("close ok");
+    let exit = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.exit.take().expect("Codex owner exit receiver"),
+    )
+    .await
+    .expect("owner cleanup timed out")
+    .expect("owner dropped cleanup signal");
+    assert_eq!(exit.outcome, SessionOutcome::Closed);
 }

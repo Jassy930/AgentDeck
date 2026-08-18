@@ -74,9 +74,19 @@ final class SessionDetailViewModel {
         case .error(_, let protocolError):
             errorText = protocolError.message
             isStreaming = false
+        case .turnFinished(_, _, _, _, let outcome, _, _, let error):
+            isStreaming = false
+            if outcome == .failed {
+                errorText = error?.message
+            }
+        case .sessionClosed(_, _, _, _, let error):
+            isStreaming = false
+            if let error {
+                errorText = error.message
+            }
         case .turnComplete:
             isStreaming = false
-        case .sessionStarted, .sessionCapabilities, .vendorControl, .vendorPanelEvent:
+        case .sessionStarted, .sessionCapabilities, .turnStarted, .vendorControl, .vendorPanelEvent:
             needsUpdate = false
         }
         rows = ConversationDisplayRowBuilder.rows(from: makeConversationTurns(from: store.items))

@@ -1,70 +1,54 @@
 //! Codex SessionCapabilities builder + version probe.
 //!
-//! Phase 3 Task 3A. The caller (Task 3B's CodexAdapter::capabilities) probes
-//! the local `codex` binary version once at adapter construction and then
-//! calls `build_codex_capabilities` to produce a `SessionCapabilities` that
-//! the daemon emits as `ServerEvent::SessionCapabilities` before any
-//! `AgentItem` (invariant N7).
+//! The session owner resolves and validates one exact `CodexBinary`, then
+//! passes its version to `build_codex_capabilities`. The daemon emits that
+//! payload as `ServerEvent::SessionCapabilities` before any `AgentItem`
+//! (invariant N7).
 //!
-//! The capability set here mirrors what Codex's app-server supports today:
-//! streaming messages + reasoning, shell execution, file diffs, approval
-//! requests, MCP tools, token usage, auth status, reasoning effort
-//! selection, image input, worktrees, plus Codex-only features
-//! (sandbox modes, approval persistence, skills, custom prompts).
+//! The feature set is intentionally narrower than what app-server can do.
+//! Capabilities describe AgentDeck's currently accepted product surface, not
+//! every method offered by the pinned vendor binary. Issue #3 establishes the
+//! lifecycle only; Issue #4 will add `StreamingMessages` after the translated
+//! stream has its own deterministic acceptance evidence.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use agentdeck_protocol::{
-    AgentKind, CapabilityId, CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort,
-    CodexSandboxMode, SessionCapabilities, VendorCapabilities,
+    AgentKind, CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort, CodexSandboxMode,
+    ProtocolError, SessionCapabilities, VendorCapabilities,
 };
+
+const CODEX_VERSION_FILE: &str = include_str!("../../../protocol/CODEX_VERSION.txt");
+
+fn unsupported_version_error(message: impl Into<String>) -> ProtocolError {
+    ProtocolError {
+        code: "codex-version-unsupported".into(),
+        message: message.into(),
+        diagnostic_ref: None,
+    }
+}
+
+pub(crate) fn supported_codex_version() -> &'static str {
+    CODEX_VERSION_FILE.trim()
+}
 
 /// Build the `SessionCapabilities` payload for a Codex session.
 ///
-/// `version` is the string returned by `codex --version` (or
-/// `probe_codex_version()` below for the default case). It is wire-visible
-/// to clients so they can route UI features by both `features` set and
-/// optional version-string heuristics.
+/// `version` is the already validated string returned by the same executable
+/// used to spawn app-server. It is wire-visible to clients so they can route
+/// UI features by both `features` set and optional version-string heuristics.
 pub fn build_codex_capabilities(version: String) -> SessionCapabilities {
-    let features: BTreeSet<CapabilityId> = [
-        // —— Shared (Codex side of the symmetry constraint N5) ——
-        CapabilityId::StreamingMessages,
-        CapabilityId::StreamingReasoning,
-        CapabilityId::Shell,
-        CapabilityId::Diff,
-        CapabilityId::Approval,
-        CapabilityId::Mcp,
-        CapabilityId::TokenCounters,
-        CapabilityId::AuthStatus,
-        CapabilityId::ReasoningEffort,
-        CapabilityId::ImageInput,
-        CapabilityId::Worktree,
-        // —— Codex-only ——
-        CapabilityId::CodexSandboxMode,
-        CapabilityId::CodexApprovalPersistence,
-        CapabilityId::CodexSkills,
-        CapabilityId::CodexCustomPrompts,
-    ]
-    .into_iter()
-    .collect();
+    let features = BTreeSet::new();
 
     SessionCapabilities {
         agent_kind: AgentKind::Codex,
         agent_version: version,
         features,
         vendor: VendorCapabilities::Codex(CodexCapabilities {
-            sandbox_modes: vec![
-                CodexSandboxMode::ReadOnly,
-                CodexSandboxMode::WorkspaceWrite,
-                CodexSandboxMode::FullAccess,
-            ],
-            persistence_supported: true,
-            reasoning_effort_levels: vec![
-                CodexReasoningEffort::Minimal,
-                CodexReasoningEffort::Low,
-                CodexReasoningEffort::Medium,
-                CodexReasoningEffort::High,
-            ],
+            sandbox_modes: vec![CodexSandboxMode::ReadOnly],
+            persistence_supported: false,
+            reasoning_effort_levels: vec![CodexReasoningEffort::Medium],
         }),
     }
 }
@@ -73,51 +57,54 @@ pub fn build_codex_capabilities(version: String) -> SessionCapabilities {
 /// build a picker without hard-coding the enum variants — keeps the wire
 /// shape and the picker in sync as the protocol grows).
 pub fn supported_approval_policies() -> Vec<CodexApprovalPolicy> {
-    vec![
-        CodexApprovalPolicy::OnRequest,
-        CodexApprovalPolicy::Never,
-        CodexApprovalPolicy::Always,
-    ]
+    vec![CodexApprovalPolicy::Never]
 }
 
-/// Classify an injected `codex --version` command result. Tests pass a fake
-/// runner so the default suite never executes the user's vendor binary.
-pub fn probe_codex_version_with_command<F>(run: F) -> String
+/// Validate an injected `<absolute codex binary> --version` command result.
+///
+/// The runner receives the already-resolved binary path. This keeps the
+/// version probe and app-server spawn tied to one executable and lets the
+/// default test suite use a fake binary without consulting the user's PATH.
+pub(crate) fn probe_codex_version_with_command<F>(
+    binary: &Path,
+    run: F,
+) -> Result<String, ProtocolError>
 where
-    F: FnOnce() -> Result<(i32, String), String>,
+    F: FnOnce(&Path) -> Result<(i32, Vec<u8>), String>,
 {
-    match run() {
+    match run(binary) {
         Ok((0, stdout)) => {
-            let trimmed = stdout.trim();
-            if trimmed.is_empty() {
-                "codex unknown".to_string()
+            let stdout = String::from_utf8(stdout).map_err(|_| {
+                unsupported_version_error("Codex CLI version output is not valid UTF-8")
+            })?;
+            let actual = stdout.trim();
+            let expected = supported_codex_version();
+            if actual == expected {
+                Ok(actual.to_string())
             } else {
-                trimmed.to_string()
+                Err(unsupported_version_error(format!(
+                    "unsupported Codex CLI version; expected {expected}"
+                )))
             }
         }
-        _ => "codex unknown".to_string(),
+        Ok((_status, _stdout)) => Err(unsupported_version_error(
+            "Codex CLI version probe exited unsuccessfully",
+        )),
+        Err(_error) => Err(unsupported_version_error(
+            "Codex CLI version probe could not be executed",
+        )),
     }
 }
 
-/// Probe the local `codex` binary's version string. Falls back to a stable
-/// placeholder so capability emission never blocks on the probe.
-///
-/// Note: this is synchronous and shells out to `codex --version`. Task 3B's
-/// adapter calls it once at construction, not per-session, so the cost is
-/// negligible. If the binary is missing the placeholder makes it obvious
-/// in the SessionCapabilities event (which downstream diagnostics surface).
-pub fn probe_codex_version() -> String {
-    probe_codex_version_with_command(|| {
+/// Probe one already-resolved Codex binary and require the exact version
+/// pinned by `protocol/CODEX_VERSION.txt`.
+pub(crate) fn probe_codex_version_at(binary: &Path) -> Result<String, ProtocolError> {
+    probe_codex_version_with_command(binary, |binary| {
         use std::process::Command;
-        Command::new("codex")
+        Command::new(binary)
             .arg("--version")
             .output()
-            .map(|out| {
-                (
-                    out.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&out.stdout).into_owned(),
-                )
-            })
+            .map(|out| (out.status.code().unwrap_or(-1), out.stdout))
             .map_err(|error| error.to_string())
     })
 }
@@ -134,61 +121,21 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_feature_set_includes_shared_and_codex_specific() {
+    fn capabilities_do_not_overclaim_post_lifecycle_features() {
         let caps = build_codex_capabilities("v".into());
-        // Shared
-        assert!(caps.features.contains(&CapabilityId::StreamingMessages));
-        assert!(caps.features.contains(&CapabilityId::StreamingReasoning));
-        assert!(caps.features.contains(&CapabilityId::Shell));
-        assert!(caps.features.contains(&CapabilityId::Diff));
-        assert!(caps.features.contains(&CapabilityId::Approval));
-        assert!(caps.features.contains(&CapabilityId::Mcp));
-        assert!(caps.features.contains(&CapabilityId::TokenCounters));
-        assert!(caps.features.contains(&CapabilityId::AuthStatus));
-        assert!(caps.features.contains(&CapabilityId::ReasoningEffort));
-        assert!(caps.features.contains(&CapabilityId::ImageInput));
-        assert!(caps.features.contains(&CapabilityId::Worktree));
-        // Codex-only
-        assert!(caps.features.contains(&CapabilityId::CodexSandboxMode));
-        assert!(
-            caps.features
-                .contains(&CapabilityId::CodexApprovalPersistence)
-        );
-        assert!(caps.features.contains(&CapabilityId::CodexSkills));
-        assert!(caps.features.contains(&CapabilityId::CodexCustomPrompts));
-        // No Claude-Code features leaked in.
-        assert!(
-            !caps
-                .features
-                .contains(&CapabilityId::ClaudeCodePermissionMode)
-        );
-        assert!(!caps.features.contains(&CapabilityId::ClaudeCodeHooks));
+        assert!(caps.features.is_empty());
     }
 
     #[test]
-    fn capabilities_vendor_block_is_codex_with_all_sandbox_modes() {
+    fn capabilities_vendor_block_reports_only_fixed_m0_options() {
         let caps = build_codex_capabilities("v".into());
         match caps.vendor {
             VendorCapabilities::Codex(codex) => {
-                assert!(codex.persistence_supported);
-                assert_eq!(codex.sandbox_modes.len(), 3);
-                assert!(codex.sandbox_modes.contains(&CodexSandboxMode::ReadOnly));
-                assert!(
-                    codex
-                        .sandbox_modes
-                        .contains(&CodexSandboxMode::WorkspaceWrite)
-                );
-                assert!(codex.sandbox_modes.contains(&CodexSandboxMode::FullAccess));
-                assert_eq!(codex.reasoning_effort_levels.len(), 4);
-                assert!(
-                    codex
-                        .reasoning_effort_levels
-                        .contains(&CodexReasoningEffort::Minimal)
-                );
-                assert!(
-                    codex
-                        .reasoning_effort_levels
-                        .contains(&CodexReasoningEffort::High)
+                assert!(!codex.persistence_supported);
+                assert_eq!(codex.sandbox_modes, vec![CodexSandboxMode::ReadOnly]);
+                assert_eq!(
+                    codex.reasoning_effort_levels,
+                    vec![CodexReasoningEffort::Medium]
                 );
             }
             VendorCapabilities::ClaudeCode(_) => panic!("expected codex vendor block"),
@@ -206,35 +153,47 @@ mod tests {
     }
 
     #[test]
-    fn supported_approval_policies_covers_all_three() {
+    fn supported_approval_policies_reports_fixed_m0_policy() {
         let p = supported_approval_policies();
-        assert!(p.contains(&CodexApprovalPolicy::OnRequest));
-        assert!(p.contains(&CodexApprovalPolicy::Never));
-        assert!(p.contains(&CodexApprovalPolicy::Always));
+        assert_eq!(p, vec![CodexApprovalPolicy::Never]);
     }
 
     #[test]
     fn probe_codex_version_accepts_injected_success() {
-        let version =
-            probe_codex_version_with_command(|| Ok((0, "codex-cli 0.145.0\n".to_string())));
+        let binary = Path::new("/fake/codex");
+        let version = probe_codex_version_with_command(binary, |actual_binary| {
+            assert_eq!(actual_binary, binary);
+            Ok((0, b"codex-cli 0.145.0\n".to_vec()))
+        })
+        .unwrap();
         assert_eq!(version, "codex-cli 0.145.0");
     }
 
     #[test]
-    fn probe_codex_version_degrades_on_injected_spawn_failure() {
-        let version = probe_codex_version_with_command(|| Err("missing".to_string()));
-        assert_eq!(version, "codex unknown");
+    fn probe_codex_version_rejects_injected_spawn_failure() {
+        let error = probe_codex_version_with_command(Path::new("/fake/codex"), |_| {
+            Err("missing".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "codex-version-unsupported");
     }
 
     #[test]
-    fn probe_codex_version_degrades_on_injected_nonzero_or_empty_output() {
-        assert_eq!(
-            probe_codex_version_with_command(|| Ok((1, "codex-cli 0.145.0".to_string()))),
-            "codex unknown"
-        );
-        assert_eq!(
-            probe_codex_version_with_command(|| Ok((0, " \n".to_string()))),
-            "codex unknown"
-        );
+    fn probe_codex_version_rejects_nonzero_empty_malformed_and_mismatch() {
+        for result in [
+            Ok((1, b"codex-cli 0.145.0".to_vec())),
+            Ok((0, b" \n".to_vec())),
+            Ok((0, vec![0xff])),
+            Ok((0, b"codex-cli 0.146.0\n".to_vec())),
+        ] {
+            let error =
+                probe_codex_version_with_command(Path::new("/fake/codex"), |_| result).unwrap_err();
+            assert_eq!(error.code, "codex-version-unsupported");
+        }
+    }
+
+    #[test]
+    fn pinned_version_comes_from_protocol_snapshot() {
+        assert_eq!(supported_codex_version(), "codex-cli 0.145.0");
     }
 }

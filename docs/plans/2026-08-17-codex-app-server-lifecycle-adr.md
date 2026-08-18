@@ -1,7 +1,7 @@
 # ADR：Codex app-server 连接方式与生命周期
 
 - 日期：2026-08-17
-- 状态：已接受，待代码验收
+- 状态：已接受；Issue #3 生命周期实现已落地，M0 仍待 #4/#5/#6 与真实门禁
 
 ## 决策摘要
 
@@ -147,6 +147,8 @@ stateDiagram-v2
 - 每个 session 同时至多一个 in-flight turn；已有 in-flight turn 时收到第二个
   `TurnStart` 返回 `turn-already-running`，不能排队或覆盖。Initializing、Stopping 或
   Poisoned 时收到 TurnStart 返回 `session-not-ready`。
+- caller-owned `turnId` 在 session 内一次性使用；完成后复用同一 ID 返回
+  `turn-id-already-used`，不产生第二组 wire frame 或 lifecycle event。
 - 每个 accepted `TurnStart` 必须且只能收到一个 `TurnFinished`。它是 turn terminal，
   不是 session terminal。
 - 对正常完成、vendor turn failed 和已确认 interrupt 的可恢复 turn，`TurnFinished` 发出
@@ -161,7 +163,7 @@ stateDiagram-v2
 - 正常情况下只有 `SessionClose` 回收 child。不可恢复的 transport/protocol failure 和
   daemon 退出属于异常清理，不得假装仍为 `Ready`。
 - `SessionClose` 在 turn 运行时先 interrupt，再停止 pump、关闭或终止进程组并 wait；
-  cleanup 完成后才确认 close。
+  Unix 上还要有界轮询 `kill(-pgid, 0)` 至 `ESRCH`，cleanup 完成后才确认 close。
 
 ### 请求与事件关联
 
@@ -263,8 +265,8 @@ M0 只支持 [protocol/CODEX_VERSION.txt](../../protocol/CODEX_VERSION.txt) 固�
 ### cleanup 失败
 
 `TurnFinished` 不触发 child cleanup，只清理本 turn 状态。`SessionClose`、不可恢复的
-transport/protocol failure 或 daemon 退出时，如果不能确认直接 child 已退出，daemon
-不能确认 session 已关闭。M0 进入 Poisoned：先停止 intake，给仍在运行的 turn 发唯一
+transport/protocol failure 或 daemon 退出时，如果不能确认 direct child 已退出、Unix
+进程组已消失或 pump 已停止，daemon 不能确认 session 已关闭。M0 进入 Poisoned：先停止 intake，给仍在运行的 turn 发唯一
 failed terminal，再发 `SessionClosed(failed, codex-cleanup-failed)` 并退出
 `agentdeckd`；绝不回到 Ready/Idle，避免新 child 与失去所有权的旧 child 并存。
 
@@ -293,46 +295,82 @@ M0 必须把现有可观测基础设施接入生产 session，但不扩展已有
 M0 验收必须证明一次多轮 session 的 header、各轮事件、失败关联和 footer 落在同一个
 `runId` 下，并且 `diagnosticRef` 可以在对应 diagnostic 行的 `runId` 中找到。
 
-## 当前实现差距
+## 实施进展与剩余差距
 
-以下是本 ADR 被接受时的已知差距，不代表已经落地：
+Issue #3 已把本 ADR 的 transport 与生命周期主路径落到代码：
 
-1. `agentdeckd/src/codex/app_server.rs::spawn_child` 已具备直接 child、pipe、独立进程组
-   和 kill-on-drop 基础，方向正确；命令尚未显式传 `--listen stdio://`。
-2. `CodexAdapter::start_inner` 在 spawn 和 handshake 前发送 `SessionStarted` /
-   `SessionCapabilities`，启动失败会留下 phantom lifecycle。
-3. live session 和 `ShortLivedAppServer` 都只等待 `initialize` response，没有发送
-   0.145.0 schema 要求的 `initialized` notification。
-4. `turn/start` 当前只写 frame，不等待并关联 response；启动拒绝可能没有可靠失败
-   terminal。
-5. stdout pump、RPC response 等待和 translator 的职责尚未形成一个连接级 dispatcher；
-   后续多请求会放大丢 response 或错路由风险。
-6. 当前没有稳定的 `TurnStart` / `TurnCancel` / `SessionClose` 命令及
-   `Ready → Running → Ready` 状态机；child 虽在 turn complete 后留在 adapter map，却
-   无法在同 session 发起下一轮或被显式正常关闭。
-7. `cancel` 直接终止整个进程，没有先走 `turn/interrupt`，因此取消后不能保留 session
-   并继续下一轮。
-8. `probe_codex_version` 直接使用 PATH 上的 `codex`，与 spawn 的 locator/PATH 修复不是
-   同一事实源，GUI 环境下可能探测和启动不同 binary。
-9. app-server EOF 可以静默结束 stdout pump，未保证当前 session 收到唯一失败 terminal。
-10. 未支持的 server request 可能被 translator 忽略，没有 fail/interrupt 闭环，会让
-    app-server 等待一个永远不会到达的 response。
-11. `RunRecord`、结构化 diagnostics 和 `diagnosticRef` 尚未贯穿 RuntimeHub、adapter 和
-    多轮 session；大量生产错误的 `diagnostic_ref` 仍是 `None`。
-12. 本 ADR 被接受时，标准测试尚未 offline-safe；Issue #7 已将 real-vendor
-    tests 收紧为仅 `AGENTDECK_E2E=1` 启用，并用可注入 probe 和 marker tripwire
-    守住默认离线路径。这只解决测试基础设施阻断：生产 Codex 版本匹配、真实
-    vendor E2E 与 M0 lifecycle 证据仍需本 ADR 后续实现。
-13. streaming delta、vendor terminal 状态和 session cleanup 的完整差距由
-    [agentdeckd 最小稳定边界设计](2026-08-17-agentdeckd-minimum-stable-boundary-design.md)
-    继续定义。
-14. 现有 CLI `session run` / `session continue` 是分开的 one-shot 进程调用，无法证明同一
-    `agentdeckd`、同一 app-server PID 和同一 `threadId` 的多轮复用；M0 真实门禁需要一个
-    持久 transport 测试驱动。
+1. `CodexBinary` 解析一个规范绝对路径，使用同一路径做 `--version` probe 和 spawn，
+   严格要求 `protocol/CODEX_VERSION.txt` 固定的 0.145.0；生产 argv 明确为
+   `app-server --listen stdio://`。fake executable 覆盖 binary、版本、argv 和握手帧顺序。
+2. protocol v3 引入 caller-owned `sessionId` / `turnId`、`TurnStart`、`TurnCancel`、
+   `SessionClose`、`TurnStarted`、`TurnFinished` 和 `SessionClosed`。Rust schema 与 Swift
+   mirror 已同步；旧 `SessionContinue` / `SessionCancel` 已移除，`TurnComplete` 暂只留给
+   Claude Code。
+3. `CodexSessionOwner` 独占 child、stdin/stdout、RPC allocator/correlation、threadId 和
+   当前 turn。它完成 initialize response → initialized → thread/start|resume response，
+   然后才发 SessionStarted → SessionCapabilities；`turn/start` / `turn/interrupt` 都等待
+   匹配 response，一个 connection 只有一个 reader。
+4. adapter 同时只登记一个 Codex session，owner 同时只接受一个 in-flight turn；Ready
+   后可在同一 connection/thread 发起顺序下一轮。terminal 从 `params.turn` 读取并映射为
+   typed outcome；`inProgress`、malformed、unmatched response 和 EOF 走 fatal close。
+5. `TurnCancel` 记录 pending cancel，并在取得 vendor turn id 后调用 `turn/interrupt`；
+   若权威 terminal 先到而 interrupt response 随后报告 turn 已结束，owner 优先消费缓存的
+   terminal，cancel/close 都只发一个 `TurnFinished`。
+   `SessionClose` 才关闭 stdin、必要时终止进程组并 wait。owner 仅在 direct child wait、
+   Unix 进程组有界轮询至 `ESRCH` 和 stderr pump join 完成后报告 exit。cleanup confirmed
+   时 RuntimeHub 在共享 session-admission 临界区内登记 terminal tombstone、移除
+   router/session handle、释放 active slot 并入队唯一 `SessionClosed`，随后才允许新的
+   `SessionStart` 进入；replacement session 不能越过旧 terminal 或撞到旧 slot。
+6. unsupported server request 会收到匹配 id 的 JSON-RPC not-supported error；有 active
+   turn 时继续 interrupt 并以 failed 收口，不再静默等待。M0 option 固定为
+   never/read-only/medium、`persist=false`、无 MCP，capabilities 不声明尚未验收 feature。
+7. RuntimeHub 用单一有序 worker 执行 lifecycle command，避免 start/control 互相越过；
+   stdin EOF 会 drain 已读命令、关闭并等待 retained session。cleanup 无法确认时先
+   poison 并停止 intake，再发 failed `SessionClosed`，随后退出 daemon。stdout writer
+   失败会先发 stop、丢弃排队 lifecycle，再关闭/等待已 retained session，并把原始 I/O
+   error 返回给 daemon caller。
+
+以上只表示 Issue #3 生命周期实现存在，不等于 M0 已验收。剩余边界是：
+
+1. **#4 streaming/item identity**：translator 仍只在 item completed 时发快照，协议尚无
+   稳定 `itemId` / streaming state；desktop 不能据此消费真实流。
+2. **#5 持久 CLI 与真实 E2E**：当前 `agentdeck session run/continue` 各自新建 daemon；
+   one-shot 会在 `TurnFinished` 后自动发送 `SessionClose`，等待 clean `SessionClosed` 和
+   daemon wait，但没有顶层 live `TurnStart` / `TurnCancel` / 手动 `SessionClose` 驱动。
+   本轮未运行真实 Codex session/prompt，尚无真实同 PID/threadId 两轮、cancel 后继续和
+   持久连接最终回收回执。
+3. **#6 RunRecord/diagnostics**：生命周期事件尚未进入同一个生产 run record，现有部分
+   `diagnosticRef` 只是 session-scoped reference，不能回读关联到实际 diagnostic line。
+
+固定版本官方 `ClientNotification.json` 已提交。Issue #3 的确定性测试已覆盖同
+connection 两轮、cancel 后续轮、running close、pending cancel、malformed、EOF、
+unmatched response、handshake failure、unsupported request、terminal status、resume 固定
+参数、进程组消失确认、stderr pump join 和 cleanup failure/Poisoned→daemon exit；这些证据仍不能替代 #5
+真实 vendor，也不覆盖 #4 streaming 或 #6 record/diagnostics。
+
+Issue #7 已把 real-vendor tests 收紧为仅 `AGENTDECK_E2E=1` 启用，并用可注入 probe 和
+marker tripwire 守住默认离线路径。普通 Cargo passed 仍不构成上述真实 vendor 证据。
 
 ## 验收条件
 
 ### 确定性测试
+
+Issue #3 的 focused 离线入口：
+
+```bash
+cargo test -p agentdeck-protocol
+cargo test -p agentdeck-cli --bin agentdeck
+cargo test -p agentdeckd --lib codex::
+cargo test -p agentdeckd --lib runtime::hub
+cargo test -p agentdeckd --lib runtime::router
+cargo test -p agentdeckd --test codex_adapter_shape
+swift test
+```
+
+这些命令应只使用 fake executable、duplex connection 或 stub adapter；任何命中真实
+`codex` 的路径都属于离线门禁回归。它们验证 Issue #3 的协议、binary/argv、握手、owner、
+RPC 关联、路由和 terminal 顺序，但不能替代后文真实门禁，也不能把 #4/#6 的缺口视为
+已通过。
 
 - 断言生产 spawn 参数显式包含 `app-server --listen stdio://`，且版本探测与 spawn 使用
   同一个绝对 binary。

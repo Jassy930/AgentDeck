@@ -58,6 +58,7 @@ backend 的 profile 与 `AGENTDECK_DATA_DIR` 规则保持不变；它们不影�
 | `daemon_spawn_failed` | backend client 无法启动 daemon | 检查 `agentdeckd` 路径 |
 | `app_server_handshake_failed` | app-server 握手失败 | 检查 agent 登录、版本和 GUI 启动环境里的 `PATH` / `node` |
 | `turn_failed` | turn 执行失败 | 按 runId 查看 run record |
+| `daemon-shutdown-failed` | CLI 已收到成功 terminal，但 daemon 随后非零退出、超时或未能确认回收 | 将本次命令视为失败；检查 daemon exit status、cleanup failure 与残留进程，不要只采信先到的 turn terminal |
 | `approval_wait_stalled` | turn 正在等待用户审批 | 查看当前 runtime 的 `actionRequest`，确认 UI 是否已回写 `actionDecision` |
 
 ## Codex app-server stderr
@@ -67,6 +68,20 @@ daemon 会持续 drain Codex app-server 子进程 stderr，避免管道回压卡
 `stderr ... content withheld` 标记，stderr 正文不会进入 IPC、UI、
 `diagnostic.log` 或 run record。排障以结构化 failure code、Codex 版本与可复现
 命令为准，不要求用户把可能含凭据的 vendor stderr 交给 AgentDeck。
+
+### Codex live session failure codes
+
+| code | 含义 | 下一步 |
+| --- | --- | --- |
+| `codex-handshake-timeout` | `initialize` 或 `thread/start|resume` 未在握手 deadline 内完成 | 核对固定 Codex 版本与登录状态；暂时禁用异常 MCP 配置后复测 |
+| `codex-rpc-timeout` | live session 的 turn/interrupt RPC 未在 deadline 内返回 | 按当前 session/turn 定位卡住的方法；连接会进入不可恢复关闭，不要重放 prompt |
+| `codex-interrupt-timeout` | `turn/interrupt` 后未在 grace period 内收到权威 terminal | 等待 failed `SessionClosed` 与 daemon 退出；从保留的 threadId 显式恢复，不要自动重放 |
+| `codex-close-timeout` | close 已开始，但 active turn 未在 close deadline 内收口 | 等待 daemon 执行强制 cleanup；若随后是 failed close，按 cleanup failure 排查 |
+| `codex-disconnected` / `codex-stdout-read-failed` / `codex-stdin-write-failed` | app-server transport 在 terminal 前断开或读写失败 | 将当前 session 视为不可继续；核对 Codex 版本、进程退出原因与对应 diagnosticRef |
+| `codex-malformed-json` / `codex-unmatched-response` / `codex-protocol-error` | vendor frame 无法按固定 schema 解码、response 无对应 request，或 JSON-RPC error | 与 `protocol/` 中 0.145.0 官方 schema 对照；不要把该 session 恢复为 Ready |
+| `codex-unsupported-server-request` / `codex-terminal-status-invalid` | app-server 发出 M0 不支持的 server request，或 terminal status 仍是 `inProgress` | 记录可复现方法与固定版本；该 turn/session 会按 protocol failure 收口 |
+| `codex-cleanup-failed` | 无法确认 direct child 已 wait、Unix 进程组已消失或 stderr pump 已停止 | 不再向该 daemon 发新 session；等待 failed `SessionClosed` 后 daemon 退出，检查残留 app-server/helper 进程 |
+| `turn-id-already-used` | client 在同一 session 内复用了已接受的 caller-owned `turnId` | 生成新的 `turnId` 后重试；该拒绝不会写入 vendor 或改变 Ready session |
 
 Claude Code 历史 archive / rename 子进程遵守同一 K9 边界：daemon 将其
 stdout / stderr 直接丢弃，非零退出只返回结构化 failure code、exit status 和
@@ -94,7 +109,7 @@ CLI 会为每次历史请求生成唯一 `requestId`；未来桌面接入时必�
 
 | code | 含义 | 下一步 |
 | --- | --- | --- |
-| `codex-not-found` | daemon 在继承的 `PATH` 和常见安装位置中都找不到 `codex` | 运行 `/usr/bin/which codex` 和 `codex --version`；修复 GUI 启动环境的安装或路径后重启 App |
+| `codex-version-unsupported` | daemon 找不到可规范化的 `codex` executable、`--version` 探测失败，或版本不等于 `protocol/CODEX_VERSION.txt` 固定值 | 运行 `/usr/bin/which codex` 和 `codex --version`；修复 GUI 启动环境的安装/路径，或安装固定版本后重启 App |
 | `codex-spawn-failed` | 已定位 `codex`，但无法启动 `codex app-server`，或子进程标准管道不可用 | 运行 `codex app-server --help`；结合错误中的系统原因检查可执行权限、隔离属性和启动环境 |
 | `codex-rpc-timeout` | 单次 `initialize` / `thread/list` / `thread/read` RPC 超过 20 秒 | 分别执行 Codex list/read 定位卡住的方法；核对 Codex 版本，并暂时禁用异常 MCP 配置后复测 |
 | `codex-history-timeout` | Codex 历史 list/read 的 30 秒总预算内会为进程清理预留 2 秒；工作阶段超时后 daemon 清理短生命周期 app-server 进程组 | 分别执行 Codex list/read 定位卡住的操作；优先排查 app-server 或 MCP helper 卡住 |
@@ -150,7 +165,7 @@ CLI harness 验证，不能把桌面壳当成可用审批客户端。
 | `cc-archive-failed` | `claude rm` 执行失败（非 0 退出） | 按结构化 code 与 exit status 复现 `claude rm`；AgentDeck 不保留 vendor stderr 正文 |
 | `cc-rename-failed` | `claude --resume <id> --name <title>` 执行失败 | 确认 session_id 存在且 `claude` 版本支持 `--name` 参数；AgentDeck 不保留 vendor stderr 正文 |
 | `cc-vendor-control-requires-new-turn` | CC 的 permission mode 等 vendor 控件变更需通过新 turn 生效，不支持会话内即时切换 | 下次启动新 session 或新 turn 时携带更新后的 `ClaudeCodeSessionOptions` |
-| `cc-vendor-control-not-supported` | 收到不支持的 ClaudeCodeVendorControl variant | 检查 client 与 daemon 协议版本是否匹配（v2）；升级 client 到最新版 |
+| `cc-vendor-control-not-supported` | 收到不支持的 ClaudeCodeVendorControl variant | 检查 client 与 daemon 协议版本是否匹配（v3）；升级 client 到最新版 |
 
 ## v0.2 双 adapter 探测
 

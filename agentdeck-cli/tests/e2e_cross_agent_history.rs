@@ -57,7 +57,7 @@ fn run_session(agent: &str, extra_args: &[&str], prompt: &str) -> (String, Strin
             }
         }
         let ev_type = val.get("type").and_then(|t| t.as_str());
-        if ev_type == Some("turnComplete") || ev_type == Some("error") {
+        if matches!(ev_type, Some("turnFinished" | "turnComplete" | "error")) {
             terminal_seen = true;
             break;
         }
@@ -103,7 +103,7 @@ fn e2e_cross_history_merged_list_contains_both_agents() {
             "--approval",
             "never",
             "--reasoning-effort",
-            "minimal",
+            "medium",
         ],
         "say hi",
     );

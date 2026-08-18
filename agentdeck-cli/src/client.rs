@@ -1,4 +1,4 @@
-//! v2 client API — sends `ClientCommand` JSONL, reads `ServerEvent` JSONL
+//! v3 client API — sends `ClientCommand` JSONL, reads `ServerEvent` JSONL
 //! and admin reply side-channel.
 //!
 //! ## Admin reply parsing
@@ -23,9 +23,12 @@
 use crate::output::CliError;
 use crate::transport::{AsyncProcessTransport, ProcessTransport, SyncTransport, split_async};
 use agentdeck_protocol::{
-    ActionDecision, AgentKind, ClientCommand, HistoryRequest, HistoryResponse, ProtocolError,
-    ServerEvent, SessionCapabilities, SessionId, SessionStart, ThreadId, VendorControlPayload,
+    ActionDecision, AgentKind, ClientCommand, HistoryRequest, HistoryResponse, InitialTurn,
+    ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart, ThreadId, TurnId,
+    VendorControlPayload, VendorSessionOptions,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 // ── Envelope discriminant ─────────────────────────────────────────────────────
@@ -36,6 +39,76 @@ enum DaemonLine {
     AdminReply(serde_json::Value),
     /// Unparseable — skip silently.
     Unknown,
+}
+
+enum SessionStreamAction {
+    Forward(ServerEvent),
+    RequestClose(SessionId),
+    Finish(ServerEvent),
+    Ignore,
+}
+
+#[derive(Default)]
+struct SessionStreamState {
+    closing_session: Option<SessionId>,
+    pending_turn_terminal: Option<ServerEvent>,
+    client_close_sent: bool,
+}
+
+impl SessionStreamState {
+    fn accept(&mut self, event: ServerEvent) -> SessionStreamAction {
+        if let Some(expected_session) = &self.closing_session {
+            return match &event {
+                ServerEvent::SessionClosed {
+                    session_id,
+                    outcome,
+                    ..
+                } if session_id == expected_session => {
+                    let terminal = if matches!(outcome, agentdeck_protocol::SessionOutcome::Failed)
+                    {
+                        event
+                    } else {
+                        self.pending_turn_terminal.take().unwrap_or(event)
+                    };
+                    SessionStreamAction::Finish(terminal)
+                }
+                ServerEvent::Error {
+                    session_id: Some(session_id),
+                    ..
+                } if session_id == expected_session && self.client_close_sent => {
+                    SessionStreamAction::Finish(event)
+                }
+                _ => SessionStreamAction::Ignore,
+            };
+        }
+
+        match &event {
+            ServerEvent::TurnFinished {
+                session_id,
+                next_state,
+                ..
+            } => {
+                let session_id = session_id.clone();
+                let should_request_close =
+                    matches!(next_state, agentdeck_protocol::TurnNextState::Ready);
+                self.pending_turn_terminal = Some(event);
+                self.closing_session = Some(session_id.clone());
+                if should_request_close {
+                    self.client_close_sent = true;
+                    SessionStreamAction::RequestClose(session_id)
+                } else {
+                    // Fatal/running-close paths have already committed the
+                    // owner to cleanup. Wait for its authoritative terminal;
+                    // a duplicate SessionClose can race with route removal.
+                    SessionStreamAction::Ignore
+                }
+            }
+            ServerEvent::TurnComplete { .. }
+            | ServerEvent::SessionClosed { .. }
+            | ServerEvent::Error { .. } => SessionStreamAction::Finish(event),
+            _ => SessionStreamAction::Forward(event),
+        }
+    }
 }
 
 fn parse_daemon_line(raw: &str) -> DaemonLine {
@@ -251,9 +324,9 @@ impl Client {
 // ── Async streaming session (session run / continue) ──────────────────────────
 
 /// Run a streaming session (start or continue) via an async daemon transport.
-/// Sends the given `cmd` (must be `SessionStart` or `SessionContinue`), then
+/// Sends the given `SessionStart` command, then
 /// reads `ServerEvent` lines from stdout and forwards them to the returned
-/// mpsc receiver until `TurnComplete` or `Error` is received.
+/// mpsc receiver until a turn/session terminal or `Error` is received.
 ///
 /// Admin reply lines encountered on the shared stdout are skipped (they
 /// belong to a different logical channel).
@@ -262,6 +335,10 @@ pub async fn stream_session(
     profile: &str,
     data_dir: Option<&str>,
 ) -> Result<mpsc::Receiver<ServerEvent>, CliError> {
+    let requested_session_id = match &cmd {
+        ClientCommand::SessionStart(start) => Some(start.session_id.clone()),
+        _ => None,
+    };
     let mut transport = AsyncProcessTransport::spawn(profile, data_dir)
         .await
         .map_err(|e| CliError::Transport(e.to_string()))?;
@@ -273,39 +350,105 @@ pub async fn stream_session(
         .map_err(|e| CliError::Transport(e.to_string()))?;
 
     // Split into writer (keeps child alive) + line receiver channel.
-    let (writer, mut line_rx) = split_async(transport);
+    let (mut writer, mut line_rx) = split_async(transport);
 
     let (tx, rx) = mpsc::channel::<ServerEvent>(64);
 
     tokio::spawn(async move {
         // Keep writer (and child process) alive for the duration of streaming.
-        let _writer = writer;
+        // On every terminal path, graceful shutdown closes stdin so the Hub
+        // can request SessionClose and wait for owner cleanup before daemon
+        // exit; the transport's Drop kill is only a cancellation fallback.
+        let mut state = SessionStreamState::default();
+        let mut terminal = None;
         loop {
             let Some(raw) = line_rx.recv().await else {
                 break;
             };
             match parse_daemon_line(&raw) {
-                DaemonLine::Event(ev) => {
-                    let is_terminal = matches!(&ev, ServerEvent::TurnComplete { .. })
-                        || matches!(&ev, ServerEvent::Error { .. });
-                    let _ = tx.send(ev).await;
-                    if is_terminal {
+                DaemonLine::Event(ev) => match state.accept(ev) {
+                    SessionStreamAction::Forward(ev) => {
+                        if tx.send(ev).await.is_err() {
+                            break;
+                        }
+                    }
+                    SessionStreamAction::RequestClose(session_id) => {
+                        let close = ClientCommand::SessionClose {
+                            session_id: session_id.clone(),
+                        };
+                        let line = serde_json::to_string(&close)
+                            .expect("SessionClose serialization is infallible");
+                        if let Err(error) = writer.send_line(&line).await {
+                            terminal = Some(ServerEvent::Error {
+                                session_id: Some(session_id),
+                                error: ProtocolError {
+                                    code: "daemon-session-close-write-failed".into(),
+                                    message: format!("write SessionClose to agentdeckd: {error}"),
+                                    diagnostic_ref: None,
+                                },
+                            });
+                            break;
+                        }
+                    }
+                    SessionStreamAction::Finish(ev) => {
+                        terminal = Some(ev);
                         break;
                     }
-                }
+                    SessionStreamAction::Ignore => {}
+                },
                 DaemonLine::AdminReply(_) => continue,
                 DaemonLine::Unknown => continue,
             }
+        }
+        // Stop the stdout pump before waiting so it cannot block on a full
+        // channel after this task has stopped consuming lines.
+        drop(line_rx);
+        if let Err(error) = writer.shutdown().await
+            && terminal.as_ref().is_none_or(terminal_reports_success)
+        {
+            terminal = Some(ServerEvent::Error {
+                session_id: requested_session_id,
+                error: ProtocolError {
+                    code: "daemon-shutdown-failed".into(),
+                    message: error.to_string(),
+                    diagnostic_ref: None,
+                },
+            });
+        }
+        // Deliver the terminal only after daemon stdin is closed and the child
+        // has been reaped. This prevents the CLI runtime from exiting while its
+        // cleanup task is still in flight.
+        if let Some(terminal) = terminal {
+            let _ = tx.send(terminal).await;
         }
     });
 
     Ok(rx)
 }
 
+fn terminal_reports_success(event: &ServerEvent) -> bool {
+    matches!(
+        event,
+        ServerEvent::TurnFinished {
+            outcome: agentdeck_protocol::TurnOutcome::Succeeded,
+            ..
+        } | ServerEvent::TurnComplete { .. }
+            | ServerEvent::SessionClosed {
+                outcome: agentdeck_protocol::SessionOutcome::Closed,
+                ..
+            }
+    )
+}
+
 // ── Convenience constructors for session commands ─────────────────────────────
 
-pub fn session_start_cmd(start: SessionStart) -> ClientCommand {
-    ClientCommand::SessionStart(start)
+pub fn session_start_cmd(
+    agent_kind: AgentKind,
+    cwd: std::path::PathBuf,
+    prompt: String,
+    vendor_options: VendorSessionOptions,
+) -> ClientCommand {
+    session_start_or_resume_cmd(agent_kind, cwd, prompt, vendor_options, None)
 }
 
 pub fn session_continue_cmd(
@@ -313,20 +456,70 @@ pub fn session_continue_cmd(
     agent_kind: AgentKind,
     cwd: std::path::PathBuf,
     prompt: String,
+    vendor_options: VendorSessionOptions,
 ) -> ClientCommand {
-    ClientCommand::SessionContinue {
-        thread_id: ThreadId(thread_id),
+    session_start_or_resume_cmd(
         agent_kind,
         cwd,
+        prompt,
+        vendor_options,
+        Some(ThreadId(thread_id)),
+    )
+}
+
+#[allow(dead_code)]
+pub fn turn_start_cmd(session_id: String, turn_id: String, prompt: String) -> ClientCommand {
+    ClientCommand::TurnStart {
+        session_id: SessionId(session_id),
+        turn_id: TurnId(turn_id),
         prompt,
     }
 }
 
 #[allow(dead_code)]
-pub fn session_cancel_cmd(session_id: String) -> ClientCommand {
-    ClientCommand::SessionCancel {
+pub fn turn_cancel_cmd(session_id: String, turn_id: String) -> ClientCommand {
+    ClientCommand::TurnCancel {
+        session_id: SessionId(session_id),
+        turn_id: TurnId(turn_id),
+    }
+}
+
+#[allow(dead_code)]
+pub fn session_close_cmd(session_id: String) -> ClientCommand {
+    ClientCommand::SessionClose {
         session_id: SessionId(session_id),
     }
+}
+
+fn session_start_or_resume_cmd(
+    agent_kind: AgentKind,
+    cwd: std::path::PathBuf,
+    prompt: String,
+    vendor_options: VendorSessionOptions,
+    resume_thread_id: Option<ThreadId>,
+) -> ClientCommand {
+    ClientCommand::SessionStart(SessionStart {
+        session_id: SessionId(next_cli_id("session")),
+        agent_kind,
+        cwd,
+        resume_thread_id,
+        initial_turn: Some(InitialTurn {
+            turn_id: TurnId(next_cli_id("turn")),
+            prompt,
+        }),
+        vendor_options,
+        runtime_options: Default::default(),
+    })
+}
+
+fn next_cli_id(kind: &str) -> String {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    format!("cli-{kind}-{}-{timestamp}-{sequence}", std::process::id())
 }
 
 #[allow(dead_code)]
@@ -350,12 +543,25 @@ mod tests {
     use super::*;
     use crate::transport::FakeTransport;
 
+    fn turn_finished() -> ServerEvent {
+        ServerEvent::TurnFinished {
+            session_id: SessionId("session-1".into()),
+            thread_id: ThreadId("thread-1".into()),
+            agent_kind: AgentKind::Codex,
+            turn_id: TurnId("turn-1".into()),
+            outcome: agentdeck_protocol::TurnOutcome::Succeeded,
+            next_state: agentdeck_protocol::TurnNextState::Ready,
+            summary: None,
+            error: None,
+        }
+    }
+
     fn ping_reply() -> String {
         r#"{"reply":"ping","ok":true}"#.to_string()
     }
 
     fn selfcheck_reply() -> String {
-        r#"{"reply":"selfcheck","ok":true,"protocolVersion":2,"agents":["codex","claude_code"]}"#
+        r#"{"reply":"selfcheck","ok":true,"protocolVersion":3,"agents":["codex","claude_code"]}"#
             .to_string()
     }
 
@@ -386,12 +592,121 @@ mod tests {
     }
 
     #[test]
+    fn typed_turn_terminal_is_held_until_clean_matching_session_close() {
+        let mut state = SessionStreamState::default();
+        assert!(matches!(
+            state.accept(turn_finished()),
+            SessionStreamAction::RequestClose(SessionId(ref id)) if id == "session-1"
+        ));
+        assert!(matches!(
+            state.accept(ServerEvent::SessionClosed {
+                session_id: SessionId("other-session".into()),
+                thread_id: None,
+                agent_kind: AgentKind::Codex,
+                outcome: agentdeck_protocol::SessionOutcome::Closed,
+                error: None,
+            }),
+            SessionStreamAction::Ignore
+        ));
+        let action = state.accept(ServerEvent::SessionClosed {
+            session_id: SessionId("session-1".into()),
+            thread_id: Some(ThreadId("thread-1".into())),
+            agent_kind: AgentKind::Codex,
+            outcome: agentdeck_protocol::SessionOutcome::Closed,
+            error: None,
+        });
+        assert!(matches!(
+            action,
+            SessionStreamAction::Finish(ServerEvent::TurnFinished { .. })
+        ));
+    }
+
+    #[test]
+    fn failed_session_close_replaces_pending_success_terminal() {
+        let mut state = SessionStreamState::default();
+        assert!(matches!(
+            state.accept(turn_finished()),
+            SessionStreamAction::RequestClose(_)
+        ));
+        let action = state.accept(ServerEvent::SessionClosed {
+            session_id: SessionId("session-1".into()),
+            thread_id: Some(ThreadId("thread-1".into())),
+            agent_kind: AgentKind::Codex,
+            outcome: agentdeck_protocol::SessionOutcome::Failed,
+            error: Some(ProtocolError {
+                code: "codex-cleanup-failed".into(),
+                message: "cleanup failed".into(),
+                diagnostic_ref: None,
+            }),
+        });
+        assert!(matches!(
+            action,
+            SessionStreamAction::Finish(ServerEvent::SessionClosed {
+                outcome: agentdeck_protocol::SessionOutcome::Failed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn closing_turn_waits_for_authoritative_session_terminal_without_duplicate_close() {
+        let mut state = SessionStreamState::default();
+        let closing_turn = ServerEvent::TurnFinished {
+            session_id: SessionId("session-1".into()),
+            thread_id: ThreadId("thread-1".into()),
+            agent_kind: AgentKind::Codex,
+            turn_id: TurnId("turn-1".into()),
+            outcome: agentdeck_protocol::TurnOutcome::Failed,
+            next_state: agentdeck_protocol::TurnNextState::Closing,
+            summary: None,
+            error: Some(ProtocolError {
+                code: "codex-protocol-error".into(),
+                message: "fatal turn failure".into(),
+                diagnostic_ref: None,
+            }),
+        };
+        assert!(matches!(
+            state.accept(closing_turn),
+            SessionStreamAction::Ignore
+        ));
+        assert!(matches!(
+            state.accept(ServerEvent::Error {
+                session_id: Some(SessionId("session-1".into())),
+                error: ProtocolError {
+                    code: "session-not-found".into(),
+                    message: "route already retired".into(),
+                    diagnostic_ref: None,
+                },
+            }),
+            SessionStreamAction::Ignore
+        ));
+        let action = state.accept(ServerEvent::SessionClosed {
+            session_id: SessionId("session-1".into()),
+            thread_id: Some(ThreadId("thread-1".into())),
+            agent_kind: AgentKind::Codex,
+            outcome: agentdeck_protocol::SessionOutcome::Failed,
+            error: Some(ProtocolError {
+                code: "codex-protocol-error".into(),
+                message: "fatal session failure".into(),
+                diagnostic_ref: None,
+            }),
+        });
+        assert!(matches!(
+            action,
+            SessionStreamAction::Finish(ServerEvent::SessionClosed {
+                outcome: agentdeck_protocol::SessionOutcome::Failed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn admin_round_trip_fake_skips_event_lines_and_matches_reply() {
         // Use a non-error ServerEvent (agentItem etc.) — those should be
         // skipped while waiting for the matching admin reply.
         // We can't construct a full AgentItem without all fields, so we
         // use a stray admin reply with a different key first.
-        let different_reply = r#"{"reply":"protocolVersion","protocolVersion":2}"#.to_string();
+        let different_reply = r#"{"reply":"protocolVersion","protocolVersion":3}"#.to_string();
         let mut fake = FakeTransport::new(vec![
             // stray admin reply with different key — skip and keep looking
             different_reply,
@@ -422,7 +737,7 @@ mod tests {
         let mut fake = FakeTransport::new(vec![selfcheck_reply()]);
         let v = admin_round_trip(&mut fake, &ClientCommand::Selfcheck, "selfcheck").unwrap();
         assert_eq!(v["ok"], true);
-        assert_eq!(v["protocolVersion"], 2);
+        assert_eq!(v["protocolVersion"], 3);
     }
 
     #[test]
@@ -509,20 +824,45 @@ mod tests {
 
     #[test]
     fn session_continue_cmd_builds_correct_variant() {
+        let options =
+            VendorSessionOptions::ClaudeCode(agentdeck_protocol::ClaudeCodeSessionOptions {
+                permission_mode: agentdeck_protocol::ClaudeCodePermissionMode::Default,
+                model: None,
+                effort: None,
+                hooks: vec![],
+                output_style: None,
+                allowed_tools: None,
+                disallowed_tools: None,
+                mcp_config_path: None,
+                plugin_dirs: vec![],
+                worktree: None,
+                session_name: None,
+                session_id: None,
+            });
         let cmd = session_continue_cmd(
             "tid-1".into(),
             AgentKind::ClaudeCode,
             std::path::PathBuf::from("/tmp/work"),
             "continue this".into(),
+            options,
         );
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("sessionContinue"));
-        assert!(json.contains("claude_code"));
-        // C3 fix: cwd is now part of the on-wire SessionContinue payload
-        // so adapter `continue_thread` no longer falls back to
-        // `std::env::current_dir()` (which broke CC `--resume` and
-        // tool_use cwd).
-        assert!(json.contains("/tmp/work"));
+        let ClientCommand::SessionStart(start) = cmd else {
+            panic!("continue must use SessionStart with resumeThreadId");
+        };
+        assert_eq!(start.agent_kind, AgentKind::ClaudeCode);
+        assert_eq!(start.cwd, std::path::PathBuf::from("/tmp/work"));
+        assert_eq!(start.resume_thread_id, Some(ThreadId("tid-1".into())));
+        assert_eq!(
+            start.initial_turn.as_ref().map(|turn| turn.prompt.as_str()),
+            Some("continue this")
+        );
+        assert!(!start.session_id.0.is_empty());
+        assert!(
+            start
+                .initial_turn
+                .as_ref()
+                .is_some_and(|turn| !turn.turn_id.0.is_empty())
+        );
     }
 
     /// C5 fix: when the daemon emits a `ServerEvent::Error` with a

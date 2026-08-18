@@ -1,7 +1,7 @@
-//! Codex JSON-RPC → v2 `ServerEvent` translation.
+//! Codex JSON-RPC → v3 `ServerEvent` translation.
 //!
 //! Phase 3 Task 3A. This is the entire vendor-coupling surface for Codex on
-//! the v2 protocol: a stateful translator owned per-session by Task 3B's
+//! the current protocol: a stateful translator owned per-session by Task 3B's
 //! `CodexAdapter`. It consumes one newline-delimited JSON message from the
 //! `codex app-server` stdout pipe at a time and produces 0..N neutral
 //! `ServerEvent`s.
@@ -80,7 +80,7 @@ pub struct TranslateOutput {
 }
 
 /// Pairing between the public `ActionRequest.request_id` (string, travels
-/// the v2 protocol) and the underlying Codex JSON-RPC numeric id (the
+/// the AgentDeck protocol) and the underlying Codex JSON-RPC numeric id (the
 /// frame-level `id` field the adapter must echo when writing the response).
 #[derive(Debug, Clone)]
 pub struct RpcRouteHint {

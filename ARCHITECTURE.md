@@ -30,14 +30,20 @@ selfcheck 都必须明确桌面端没有 backend 能力。
 
 Codex 本地 transport 已决定为 `agentdeckd` 直接持有 session-scoped
 `codex app-server --listen stdio://` 子进程；不依赖用户全局 managed daemon/proxy。
-该生命周期和 desktop 解锁门禁仍是已接受、未落地的设计，现状以
+Issue #3 已把该 transport 的 protocol v3 生命周期落到代码：单 owner 持有 child 与
+RPC correlation，完成规范握手、顺序 turn、interrupt、close/wait、Unix 进程组消失确认
+和 stderr pump join。
+RuntimeHub 通过单一有序 worker 处理 lifecycle command，在清除路由后发
+`SessionClosed`；stdin EOF 会 drain 已读命令并关闭 retained session，cleanup 无法确认则
+poison 并退出 daemon。desktop 解锁门禁仍未通过：#4 streaming/item identity、#5 持久
+连接 CLI 与真实 vendor E2E、#6 RunRecord/diagnostics 尚未收口，现状以
 `docs/AGENTDECKD_STATUS.md` 为准。
 
 ## 分层边界
 
 - `agentdeck-desktop/`：macOS GPUI executable。当前只负责窗口、组件根节点和桌面 selfcheck；不得解析 vendor JSON。
 - `Sources/AgentDeckMobileCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
-- `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合本地 v2 类型。
+- `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 3，`protocol_schema()` 聚合本地 v3 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/agent.rs`：`Agent` trait + `AgentKind` 枚举。两个 adapter 共享的逻辑在此，不得让 adapter 相互引用。
 - `agentdeckd/src/runtime/`：`RuntimeHub`（stdin loop + stdout writer）+ `AgentRouter`（sessionId → agentKind → adapter）。
@@ -64,7 +70,7 @@ Codex 本地 transport 已决定为 `agentdeckd` 直接持有 session-scoped
 
 - **K1**：daemon 的 stdin 主循环不得被单个 turn 阻塞；长时间工作放到 worker。
 - **K2**：`RuntimeHub` 必须按 `sessionId` 阻止同一 runtime 并发 turn；session 创建时 `agentKind` 不可变，整个生命周期固定到一个 adapter。
-- **K3**：每个 turn 的成功、失败或取消 terminal 发出前，worker 必须先释放 turn-local 占用；连接仍健康时 session 回到 Ready 并保留 session-scoped child。只有 `SessionClosed` 表示 session 已结束，且必须在 child wait 和路由清理后发送。
+- **K3**：每个 turn 的成功、失败或取消 terminal 发出前，worker 必须先释放 turn-local 占用；连接仍健康时 session 回到 Ready 并保留 session-scoped child。只有 `SessionClosed` 表示 session 已结束，且必须在 direct child wait、Unix 进程组消失确认、pump 停止和路由清理后发送。
 - **K4**（加强）：所有事件主干消息必须带 `agentKind` 字段。
 - **K5**：run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（stable）或 `AgentDeck-Dev/`（dev），不得写入用户项目 git。
 - **K6**：`AGENTDECK_DATA_DIR` / `--profile` / `AGENTDECK_PROFILE` 控制数据目录隔离，不影响 vendor 登录状态或 vendor 历史。
@@ -117,8 +123,10 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 
 `agentdeck-protocol` crate 是 IPC 协议的唯一事实源：
 
-- `PROTOCOL_VERSION`：当前为 2（v0.2 起）。
-- `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v2 公共类型。
+- `PROTOCOL_VERSION`：当前为 3。v3 引入 caller-owned `sessionId` / `turnId`、显式
+  `TurnStart` / `TurnCancel` / `SessionClose` 和两级 terminal；`TurnComplete` 暂只保留给
+  尚未迁移的 Claude Code 路径。
+- `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v3 公共类型。
 - 快照：`protocol/agentdeck/agentdeck-protocol.schema.json`（`UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` 重生成）。
 - 漂移测试随 `cargo test` 运行。
 - 中立性测试（`neutrality_tests.rs`）守护 N1/N4。

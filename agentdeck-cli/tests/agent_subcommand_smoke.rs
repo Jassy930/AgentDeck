@@ -34,7 +34,7 @@ fn agent_list_returns_both_kinds() {
 }
 
 #[test]
-fn agent_capabilities_codex_is_non_empty() {
+fn agent_capabilities_codex_matches_lifecycle_only_boundary() {
     if !real_e2e_enabled() {
         return;
     }
@@ -49,11 +49,17 @@ fn agent_capabilities_codex_is_non_empty() {
     );
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let features = json["features"].as_array().expect("features array");
-    assert!(
-        !features.is_empty(),
-        "expected non-empty features for codex"
-    );
+    assert!(features.is_empty(), "Issue #3 must not overclaim features");
     assert_eq!(json["agentKind"], "codex");
+    assert_eq!(
+        json["vendor"]["sandboxModes"],
+        serde_json::json!(["read-only"])
+    );
+    assert_eq!(json["vendor"]["persistenceSupported"], false);
+    assert_eq!(
+        json["vendor"]["reasoningEffortLevels"],
+        serde_json::json!(["medium"])
+    );
 }
 
 #[test]
