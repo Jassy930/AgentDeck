@@ -472,31 +472,24 @@ M0 必须接通已有基础设施，不新增 record/diagnostic schema：
 
 ### 先修测试门控
 
-当前标准 `cargo test` 不是已确认的 offline-safe 入口：仓库仍存在会运行真实 vendor
-session/prompt 的测试路径；`agentdeckd --lib` 的 capability probe 也会对 PATH 中的
-真实 binary 执行 `--version`。不能把当前一次 full test 结果当成 hermetic 单元门禁。
+Issue #7 已把该前置门禁落到代码和 CI：所有会 spawn `codex` / `claude`、读取真实
+vendor history 或依赖登录态的测试，统一要求 **`AGENTDECK_E2E=1`** 严格等值
+才进入；未设置、空值、`0`、`false` 或其他值都在真实 vendor I/O 前 skip。version/auth
+probe 单测使用可注入 fake binary，不执行用户 PATH 中的 vendor。
 
-实现 M0 前先审计所有会 spawn `codex`、`claude`、真实 daemon，读取真实 vendor history
-或依赖登录态的测试。真实 session/history/prompt 路径统一要求
-**`AGENTDECK_E2E=1`** 严格等值才进入；未设置或其他值必须在任何真实 vendor I/O 前
-skip。版本 probe 单测改用可注入 fake binary，不执行用户 PATH 中的 vendor。修完后
-必须证明：即使 PATH 中存在会写 marker 并失败的 `codex` / `claude` shim，标准
-`cargo test` 也不执行 shim、不访问真实历史且完整通过。
-
-在该门控修复完成前，设计与实现过程只运行以下不创建真实 session/prompt 的
-focused/lib 测试；其中 `agentdeckd --lib` 仍会执行本地 vendor `--version`，必须在验证
-记录中披露：
+默认入口是：
 
 ```bash
-cargo test -p agentdeck-protocol --lib
-cargo test -p agentdeckd --lib
-cargo test -p agentdeckd --test codex_translate
-cargo test -p agentdeckd --test agent_router
+scripts/verify-offline-tests.sh
 scripts/verify-agent-docs.sh
 ```
 
-不得在门控修复前把 `cargo test`、`cargo test -p agentdeckd` 或 CLI vendor smoke 写成
-当前安全验证入口。
+offline 脚本使用临时 HOME 隔离用户 vendor history 与默认 AgentDeck data dir，并在 PATH
+首位放置 marker shim；在变量 unset 与 `0` 时
+执行完整 workspace tests；空值、`false` 和其他值执行全部 gated integration targets，
+每次都断言 shim 未被执行。该先修项完成只移除测试基础设施阻断，不提升本文 session、
+streaming、terminal 或 cleanup 的 M0 状态；普通 Cargo passed 也不等于真实 vendor E2E
+证据。
 
 ### 确定性测试
 
@@ -525,10 +518,12 @@ scripts/verify-agent-docs.sh
 
 ### 真实 Codex 门禁
 
-门控修复后，在与 `protocol/CODEX_VERSION.txt` 一致且已 `codex login` 的环境中运行：
+在与 `protocol/CODEX_VERSION.txt` 一致且已 `codex login` 的环境中运行：
 
 ```bash
-AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
+cargo build --locked -p agentdeckd --bin agentdeckd
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+  cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
 ```
 
 同一个 E2E session 必须完成：
@@ -549,14 +544,19 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
 
 ### 最终代码验收
 
-只有真实 vendor 测试已统一门控、标准 Cargo 测试已证明 offline-safe 后，才运行完整
-门禁：
+完整门禁为：
 
 ```bash
-cargo test
-cargo run -p agentdeck-cli -- selfcheck
-cargo run -p agentdeck-cli -- diagnostics report
-AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
+scripts/verify-offline-tests.sh
+cargo build --locked \
+  -p agentdeckd --bin agentdeckd \
+  -p agentdeck-cli --bin agentdeck
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
+  ./target/debug/agentdeck --data-dir /tmp/agentdeck-m0 selfcheck
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
+  ./target/debug/agentdeck --data-dir /tmp/agentdeck-m0 diagnostics report
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+  cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
 scripts/verify-agent-docs.sh
 ```
 

@@ -73,7 +73,7 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 | vendor control | session 内控制更新 | 骨架 | typed payload 与路由存在；Codex 返回 requires-new-turn，CC 多数控制返回 requires-new-turn 或 not-supported。 | 两个 adapter 的 `submit_vendor_control` |
 | observability | run record | 骨架 | JSONL、脱敏、header/event/footer helper 与测试存在；生产 RuntimeHub 和 adapter 事件流尚未调用 `RunRecord`。 | `agentdeckd/src/record.rs` |
 | observability | diagnostic log/report | 骨架 | 有结构化日志、数据目录和聚合报告；生产写入主要覆盖 daemon 启停/selfcheck，尚未贯穿 session、adapter、approval、history，`diagnosticRef` 多为空。 | `agentdeckd/src/diag.rs`、`agentdeckd/src/main.rs` |
-| quality | 默认测试离线安全 | 未接通 | `cargo test -p agentdeckd` 会发现 shape integration tests；`cc_adapter_shape` 只按 `claude` 是否在 PATH 决定是否发送真实 prompt，`codex_adapter_shape` 也只按 PATH 决定是否 spawn 真实 app-server/thread，均未统一受 `AGENTDECK_E2E` 门控。 | `agentdeckd/tests/cc_adapter_shape.rs`、`agentdeckd/tests/codex_adapter_shape.rs` |
+| quality | 默认测试离线安全 | 较完整 | 真实 session、prompt、history、auth 和 vendor process 测试统一只认 `AGENTDECK_E2E=1`；普通 version/auth probe 使用可注入 fake。marker tripwire 通过临时 HOME 隔离用户 vendor history 与默认 AgentDeck data dir，并验证标准 workspace tests 不执行 PATH 中的 vendor shim；macOS workflow 已配置该门禁，首个 hosted run 已在 2026-08-18 通过。普通 passed 仍不代表真实 E2E 已执行。 | `agentdeckd/tests/support/mod.rs`、`scripts/verify-offline-tests.sh`、`.github/workflows/offline-ci.yml` |
 | CLI | admin、session、history | 部分 | ping/selfcheck、协议、agent、run/continue 和 history 已暴露；没有完整的顶层 cancel、交互审批和 vendor-control 使用闭环。 | `agentdeck-cli/src/main.rs`、`agentdeck-cli/src/commands.rs` |
 | product integration | GPUI desktop → daemon | 未接通 | 当前桌面 bundle 不携带、不启动、不连接 `agentdeckd`，也没有会话、审批或历史 UI。 | `README.md`、`docs/QUALITY.md`、`agentdeck-desktop/` |
 
@@ -93,51 +93,58 @@ README、架构、诊断和计划文档用于解释目标与不变量；当文�
 5. **可观测链没有接入运行路径。** 发生 vendor 启动、翻译、审批或历史错误时，run
    record 和 `diagnosticRef` 还不能提供完整关联证据。新的 M0 边界已经把可回放 record
    与关联 diagnostics 纳入验收，因此两项都是 M0 阻断，不是可推迟的增强。
-6. **默认测试不是离线安全门禁。** 安装了 `claude` 或 `codex` 时，broad daemon test
-   可能启动真实 vendor、创建 thread 或发送 prompt；这会让默认验证产生外部副作用。
-7. **当前操作入口不能覆盖协议表面。** CLI 缺少可交互的 cancel、审批回写和 vendor
+6. **当前操作入口不能覆盖协议表面。** CLI 缺少可交互的 cancel、审批回写和 vendor
    control；GPUI desktop 仍完全未接入。
 
 ## 证据与验证边界
 
-### 当前不创建真实 vendor session 的验证
+### 默认离线验证
 
 ```bash
-env -u AGENTDECK_E2E cargo test -p agentdeck-protocol --lib
-env -u AGENTDECK_E2E cargo test -p agentdeckd --lib
-env -u AGENTDECK_E2E cargo test -p agentdeckd --test agent_trait_shape
-env -u AGENTDECK_E2E cargo test -p agentdeckd --test agent_router
-env -u AGENTDECK_E2E cargo test -p agentdeckd --test codex_translate
-env -u AGENTDECK_E2E cargo test -p agentdeckd --test cc_translate
-env -u AGENTDECK_E2E cargo test -p agentdeckd --test cc_fixture_replay
-env -u AGENTDECK_E2E cargo test -p agentdeckd --test cc_system_events
+scripts/verify-offline-tests.sh
+
+# tripwire 内的标准 Cargo 入口
+env -u AGENTDECK_E2E cargo test --workspace --locked
+
+# 单独复验当前 checkout 的 daemon / CLI plumbing
+cargo build --locked \
+  -p agentdeckd --bin agentdeckd \
+  -p agentdeck-cli --bin agentdeck
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
+  ./target/debug/agentdeck \
+  --data-dir /tmp/agentdeck-selfcheck selfcheck
 ```
 
-- 上述 lib 和 focused targets 不包含已知会启动真实 vendor session 的 shape tests，能证明
-  协议序列化、fixture 翻译、router 行为、timeout 与本地 helper 的确定性行为。但
-  `agentdeckd --lib` 的 capability probe 当前仍会对 PATH 中的 `codex` / `claude` 执行
-  本地 `--version`；它不发 prompt、不建 session，也不读真实 history，但不是零 vendor
-  process 的 hermetic 验证。
-- 在“默认测试离线安全”修复前，不要把 `cargo test`、`cargo test -p agentdeckd` 或
-  `cargo test --workspace` 作为默认离线验证入口。
-- daemon/CLI selfcheck 和 diagnostics report 仍可用于显式 plumbing 排查，但它们会访问
-  AgentDeck 数据目录，也不证明 vendor 可用、M0 record 已接线或真实 session 已闭环。
+- tripwire 在临时目录放置会写 marker 并失败的 `codex` / `claude` shim，把它们置于 PATH
+  首位，并使用临时 HOME 隔离用户 vendor history 与默认 AgentDeck data dir；未设置和 `0`
+  各跑完整 workspace tests，空值、`false` 和其他值跑全部 gated integration targets，每次都断言
+  marker 不存在。
+  Rust gate 单测另行覆盖纯值矩阵。
+- CLI selfcheck 必须用绝对 `AGENTDECK_DAEMON_BIN` 绑定当前 checkout 构建物；变量一旦
+  存在但为空、相对、不可执行或不存在就立即失败，不得回退到旧 sibling 或系统安装。
+- 本轮只把 version/auth probe 的测试替换为可注入 fake；生产 Codex 的“probe 与 spawn
+  使用同一绝对 binary，并拒绝与 `protocol/CODEX_VERSION.txt` 不匹配的版本”仍属于
+  M0 session lifecycle（GitHub #3），尚未实现。
+- daemon/CLI selfcheck 和 diagnostics report 仍只用于 plumbing 排查。它们不证明 vendor
+  可用、M0 record 已接线或真实 session 已闭环。
 
 ### 真实链路必须额外证明什么
 
 ```bash
-AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
-AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_claude_code -- --nocapture
-AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- \
+cargo build --locked -p agentdeckd --bin agentdeckd
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+  cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+  cargo test -p agentdeck-cli --test e2e_claude_code -- --nocapture
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+  cargo test -p agentdeck-cli --test e2e_cross_agent_history -- \
   --nocapture --test-threads=1
 ```
 
 - 这些测试会真实使用本机 vendor CLI、登录状态和用户配置，只能在明确允许创建真实
   vendor 会话的环境运行。
-- 当前门控不统一：CLI E2E 用“环境变量存在”判断，`AGENTDECK_E2E=0` 也会启用；部分
-  daemon E2E 要求值严格等于 `1`；两个 adapter shape 文件则只看 vendor binary 是否在
-  PATH，完全不看该变量。上述不创建 session/prompt 的 focused/lib 命令必须用
-  `env -u AGENTDECK_E2E`，真实验证统一显式使用 `AGENTDECK_E2E=1`。
+- 所有真实路径统一要求 `AGENTDECK_E2E=1` 严格等值；unset、空值、`0`、`false` 或其他
+  值都在 vendor I/O 前提前返回。真实验证仍必须单独授权并显式使用 `1`。
 - 未启用真实门禁时显示 passed 可能只是测试提前返回；该结果不能作为真实 Codex 或
   Claude Code 链路证据。
 - E2E 当前主要验证响应契约形态，不证明流式 delta、审批、取消、配置恢复和所有历史
@@ -156,7 +163,6 @@ AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_cross_agent_history -- \
 4. capabilities 必须与本页和真实实现一致；能力降级或暂未验证时，优先收紧声明。
 5. 每次更新记录新的审计提交和日期；已解决缺口从本页删除，设计取舍与实施步骤写入
    `docs/plans/`，不要把本页扩成实施日志。
-6. 在默认测试离线安全修复前，收口只运行明确审计为不创建真实 session/prompt 的
-   lib/focused targets，并披露 lib 的本地 `--version` probe；真实 vendor 验证必须显式
-   授权并使用 `AGENTDECK_E2E=1`。随后运行
-   `scripts/verify-agent-docs.sh` 和 `git diff --check`，只报告实际运行过的命令。
+6. 默认收口运行 `scripts/verify-offline-tests.sh`；真实 vendor 验证必须显式授权并使用
+   `AGENTDECK_E2E=1`。随后运行 `scripts/verify-agent-docs.sh` 和 `git diff --check`，只报告
+   实际运行过的命令；普通 Cargo passed 不得记录成真实 E2E 证据。

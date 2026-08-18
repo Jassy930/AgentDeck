@@ -2,26 +2,17 @@
 //!
 //! Tests `agentdeck agent list` and `agentdeck agent capabilities`.
 
-use std::process::Command;
+mod support;
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_agentdeck")
-}
-
-fn gated() -> bool {
-    std::env::var("AGENTDECK_E2E").is_ok()
-}
+use support::{ADMIN_TIMEOUT, real_e2e_enabled, run_cli};
 
 #[test]
 fn agent_list_returns_both_kinds() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1 to run");
         return;
     }
-    let out = Command::new(bin())
-        .args(["agent", "list"])
-        .output()
-        .unwrap();
+    let out = run_cli(&["agent", "list"], ADMIN_TIMEOUT);
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -44,13 +35,13 @@ fn agent_list_returns_both_kinds() {
 
 #[test]
 fn agent_capabilities_codex_is_non_empty() {
-    if !gated() {
+    if !real_e2e_enabled() {
         return;
     }
-    let out = Command::new(bin())
-        .args(["agent", "capabilities", "--agent", "codex"])
-        .output()
-        .unwrap();
+    let out = run_cli(
+        &["agent", "capabilities", "--agent", "codex"],
+        ADMIN_TIMEOUT,
+    );
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -67,13 +58,13 @@ fn agent_capabilities_codex_is_non_empty() {
 
 #[test]
 fn agent_capabilities_claude_code_is_non_empty() {
-    if !gated() {
+    if !real_e2e_enabled() {
         return;
     }
-    let out = Command::new(bin())
-        .args(["agent", "capabilities", "--agent", "claude-code"])
-        .output()
-        .unwrap();
+    let out = run_cli(
+        &["agent", "capabilities", "--agent", "claude-code"],
+        ADMIN_TIMEOUT,
+    );
     assert!(
         out.status.success(),
         "stderr: {}",

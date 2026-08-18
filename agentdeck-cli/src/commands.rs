@@ -153,7 +153,10 @@ async fn drain_events(
             _ => {}
         }
     }
-    Ok(())
+    Err(CliError::Session {
+        code: Some("daemon-eof-before-terminal".into()),
+        message: "daemon event stream closed before a turn terminal".into(),
+    })
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
@@ -314,6 +317,7 @@ pub fn resolve_action_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentdeck_protocol::{SessionId, ThreadId, TurnSummary};
     use std::path::PathBuf;
 
     fn make_run_args(agent: AgentKindArg) -> SessionRunArgs {
@@ -332,6 +336,52 @@ mod tests {
             worktree: None,
             session_name: None,
         }
+    }
+
+    #[tokio::test]
+    async fn drain_events_rejects_eof_before_terminal() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        tx.send(ServerEvent::SessionStarted {
+            session_id: SessionId("session-1".into()),
+            thread_id: Some(ThreadId("thread-1".into())),
+            agent_kind: AgentKind::Codex,
+        })
+        .await
+        .expect("receiver is open");
+        drop(tx);
+
+        let error = drain_events(&mut rx, false)
+            .await
+            .expect_err("EOF before terminal must fail");
+        match error {
+            CliError::Session { code, message } => {
+                assert_eq!(code.as_deref(), Some("daemon-eof-before-terminal"));
+                assert!(message.contains("before a turn terminal"));
+            }
+            other => panic!("expected structured session error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_events_accepts_turn_terminal_before_channel_close() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(ServerEvent::TurnComplete {
+            session_id: SessionId("session-1".into()),
+            thread_id: ThreadId("thread-1".into()),
+            agent_kind: AgentKind::Codex,
+            summary: TurnSummary {
+                total_input_tokens: None,
+                total_output_tokens: None,
+                elapsed_ms: 1,
+            },
+        })
+        .await
+        .expect("receiver is open");
+        drop(tx);
+
+        drain_events(&mut rx, false)
+            .await
+            .expect("turn terminal must complete the stream successfully");
     }
 
     #[test]

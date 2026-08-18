@@ -91,17 +91,15 @@ pub fn build_claude_code_capabilities(cli_version: String) -> SessionCapabilitie
     }
 }
 
-/// Probe the local `claude` binary's version string. Falls back to a
-/// stable placeholder so capability emission never blocks on the probe.
-///
-/// Synchronous — the adapter caches the result behind a `OnceLock`, so
-/// the shell-out happens at most once per process.
-pub fn probe_claude_code_version() -> String {
-    use std::process::Command;
-    match Command::new("claude").arg("--version").output() {
-        Ok(out) if out.status.success() => {
-            let raw = String::from_utf8_lossy(&out.stdout);
-            let trimmed = raw.trim();
+/// Classify an injected `claude --version` command result. Tests pass a fake
+/// runner so the default suite never executes the user's vendor binary.
+pub fn probe_claude_code_version_with_command<F>(run: F) -> String
+where
+    F: FnOnce() -> Result<(i32, String), String>,
+{
+    match run() {
+        Ok((0, stdout)) => {
+            let trimmed = stdout.trim();
             if trimmed.is_empty() {
                 "claude unknown".to_string()
             } else {
@@ -110,6 +108,27 @@ pub fn probe_claude_code_version() -> String {
         }
         _ => "claude unknown".to_string(),
     }
+}
+
+/// Probe the local `claude` binary's version string. Falls back to a
+/// stable placeholder so capability emission never blocks on the probe.
+///
+/// Synchronous — the adapter caches the result behind a `OnceLock`, so
+/// the shell-out happens at most once per process.
+pub fn probe_claude_code_version() -> String {
+    probe_claude_code_version_with_command(|| {
+        use std::process::Command;
+        Command::new("claude")
+            .arg("--version")
+            .output()
+            .map(|out| {
+                (
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stdout).into_owned(),
+                )
+            })
+            .map_err(|error| error.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -205,10 +224,30 @@ mod tests {
     }
 
     #[test]
-    fn probe_claude_code_version_returns_non_empty_string() {
-        // Either claude is installed and we get a real version, or we
-        // get "claude unknown". Both are non-empty.
-        let v = probe_claude_code_version();
-        assert!(!v.is_empty());
+    fn probe_claude_code_version_accepts_injected_success() {
+        let version = probe_claude_code_version_with_command(|| {
+            Ok((0, "2.1.191 (Claude Code)\n".to_string()))
+        });
+        assert_eq!(version, "2.1.191 (Claude Code)");
+    }
+
+    #[test]
+    fn probe_claude_code_version_degrades_on_injected_spawn_failure() {
+        let version = probe_claude_code_version_with_command(|| Err("missing".to_string()));
+        assert_eq!(version, "claude unknown");
+    }
+
+    #[test]
+    fn probe_claude_code_version_degrades_on_injected_nonzero_or_empty_output() {
+        assert_eq!(
+            probe_claude_code_version_with_command(|| {
+                Ok((1, "2.1.191 (Claude Code)".to_string()))
+            }),
+            "claude unknown"
+        );
+        assert_eq!(
+            probe_claude_code_version_with_command(|| Ok((0, " \n".to_string()))),
+            "claude unknown"
+        );
     }
 }

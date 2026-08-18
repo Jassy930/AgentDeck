@@ -15,10 +15,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Barrier;
 
+mod support;
+
 fn router_with_both() -> AgentRouter {
     let mut r = AgentRouter::new();
-    r.register(Arc::new(CodexAdapter::new()) as DynAgent);
-    r.register(Arc::new(ClaudeCodeAdapter::new()) as DynAgent);
+    r.register(Arc::new(CodexAdapter::new_for_test()) as DynAgent);
+    r.register(Arc::new(ClaudeCodeAdapter::new_for_test()) as DynAgent);
     r
 }
 
@@ -87,10 +89,6 @@ impl Agent for DelayedHistoryAgent {
     }
 }
 
-fn real_history_enabled() -> bool {
-    std::env::var("AGENTDECK_E2E").as_deref() == Ok("1")
-}
-
 #[test]
 fn router_lists_both_codex_and_cc() {
     let r = router_with_both();
@@ -154,7 +152,7 @@ async fn router_queries_both_history_sources_concurrently() {
 /// history sources are queried and merged newest-first.
 #[tokio::test]
 async fn router_cross_agent_history_list_merges_without_error() {
-    if !real_history_enabled() {
+    if !support::real_vendor_enabled() {
         eprintln!("SKIP router_cross_agent_history_list_merges_without_error: AGENTDECK_E2E != 1");
         return;
     }
@@ -187,7 +185,7 @@ async fn router_cross_agent_history_list_merges_without_error() {
 /// with the neutral Codex agent kind.
 #[tokio::test]
 async fn router_codex_list_returns_real_history_or_empty() {
-    if !real_history_enabled() {
+    if !support::real_vendor_enabled() {
         eprintln!("SKIP router_codex_list_returns_real_history_or_empty: AGENTDECK_E2E != 1");
         return;
     }
@@ -215,7 +213,7 @@ async fn router_codex_list_returns_real_history_or_empty() {
 /// id when at least one persisted local history exists.
 #[tokio::test]
 async fn router_codex_read_returns_real_history_when_available() {
-    if !real_history_enabled() {
+    if !support::real_vendor_enabled() {
         eprintln!("SKIP router_codex_read_returns_real_history_when_available: AGENTDECK_E2E != 1");
         return;
     }

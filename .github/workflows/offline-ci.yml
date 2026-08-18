@@ -1,0 +1,66 @@
+name: Offline CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    name: offline
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.96.0
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt
+
+      - name: Install ripgrep
+        run: brew install ripgrep
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run offline Cargo tests
+        run: env -u AGENTDECK_E2E scripts/verify-offline-tests.sh
+
+      - name: Build current daemon and CLI
+        run: >-
+          cargo build --locked
+          -p agentdeckd --bin agentdeckd
+          -p agentdeck-cli --bin agentdeck
+
+      - name: Run CLI selfcheck against current daemon
+        run: |
+          data_dir="$RUNNER_TEMP/agentdeck-selfcheck"
+          mkdir -p "$data_dir"
+          env -u AGENTDECK_E2E \
+            AGENTDECK_DAEMON_BIN="$GITHUB_WORKSPACE/target/debug/agentdeckd" \
+            "$GITHUB_WORKSPACE/target/debug/agentdeck" \
+            --data-dir "$data_dir" selfcheck
+
+      - name: Check AgentDeck protocol schema
+        run: |
+          data_dir="$RUNNER_TEMP/agentdeck-schema-data"
+          schema_output="$RUNNER_TEMP/agentdeck-protocol.schema.json"
+          mkdir -p "$data_dir"
+          env -u AGENTDECK_E2E \
+            AGENTDECK_DAEMON_BIN="$GITHUB_WORKSPACE/target/debug/agentdeckd" \
+            "$GITHUB_WORKSPACE/target/debug/agentdeck" \
+            --data-dir "$data_dir" protocol schema > "$schema_output"
+          diff -u protocol/agentdeck/agentdeck-protocol.schema.json "$schema_output"
+
+      - name: Test AgentDeckMobileCore
+        run: swift test
+
+      - name: Check documentation structure
+        run: scripts/verify-agent-docs.sh

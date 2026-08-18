@@ -1,8 +1,8 @@
 //! Shape / contract tests for `CodexAdapter`.
 //!
 //! These verify the v2 `Agent` trait wiring without spawning a real
-//! `codex app-server` (the optional real-codex test below skips itself
-//! when the binary is not on PATH). The goal is a fast unit-style
+//! `codex app-server` (the optional real-codex test below requires both
+//! `AGENTDECK_E2E=1` and a binary on PATH). The goal is a fast unit-style
 //! safety net for Task 3B's adapter that:
 //!
 //!   1. Confirms the adapter is `dyn Agent`-compatible (Send + Sync +
@@ -22,6 +22,8 @@
 use agentdeck_protocol::*;
 use agentdeckd::agent::Agent;
 use agentdeckd::codex::adapter::CodexAdapter;
+
+mod support;
 
 #[test]
 fn codex_adapter_impls_agent_trait() {
@@ -138,13 +140,17 @@ async fn cancel_on_unknown_session_is_idempotent_ok() {
     assert!(result.is_ok());
 }
 
-/// Optional smoke test that requires a real `codex` binary in PATH.
-/// We use `which::which` to skip cleanly when codex is absent (CI
+/// Optional smoke test that requires `AGENTDECK_E2E=1` and a real `codex`
+/// binary in PATH. We use `which::which` to skip cleanly when codex is absent (CI
 /// machines, contributor laptops without codex login). When present,
 /// the test asserts the N7 invariant: SessionStarted + SessionCapabilities
 /// are the first two events on the wire, before any AgentItem.
 #[tokio::test]
 async fn real_codex_emits_started_then_capabilities() {
+    if !support::real_vendor_enabled() {
+        eprintln!("SKIP real_codex_emits_started_then_capabilities: AGENTDECK_E2E != 1");
+        return;
+    }
     if which::which("codex").is_err() {
         eprintln!("SKIP real_codex_emits_started_then_capabilities: codex binary not in PATH");
         return;

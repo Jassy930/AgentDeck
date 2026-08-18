@@ -66,7 +66,12 @@ git add protocol/agentdeck/agentdeck-protocol.schema.json
 独立验证 schema 与当前代码同步（无需运行 test）：
 
 ```bash
-cargo run -q -p agentdeck-cli -- protocol schema \
+cargo build --locked \
+  -p agentdeckd --bin agentdeckd \
+  -p agentdeck-cli --bin agentdeck
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
+  ./target/debug/agentdeck \
+  --data-dir /tmp/agentdeck-schema protocol schema \
   | diff - protocol/agentdeck/agentdeck-protocol.schema.json \
   && echo "schema in sync"
 ```

@@ -319,13 +319,10 @@ M0 验收必须证明一次多轮 session 的 header、各轮事件、失败关�
     app-server 等待一个永远不会到达的 response。
 11. `RunRecord`、结构化 diagnostics 和 `diagnosticRef` 尚未贯穿 RuntimeHub、adapter 和
     多轮 session；大量生产错误的 `diagnostic_ref` 仍是 `None`。
-12. 当前标准测试并非 offline-safe：例如
-    `agentdeckd/tests/codex_adapter_shape.rs` 和
-    `agentdeckd/tests/cc_adapter_shape.rs` 中的 real-vendor tests 只按 PATH 是否存在决定是否
-    启动 vendor CLI；部分 CLI E2E 又只检查 `AGENTDECK_E2E` 是否存在而不是值是否为
-    `1`。这些入口没有统一门控。开发机安装了 Codex/Claude 时，普通 `cargo test` 可能
-    启动真实进程、发送模型 prompt 或访问登录/网络状态；lib capability probe 还会直接
-    对用户 PATH 中的 vendor 执行 `--version`，尚未通过 fake binary 注入实现 hermetic。
+12. 本 ADR 被接受时，标准测试尚未 offline-safe；Issue #7 已将 real-vendor
+    tests 收紧为仅 `AGENTDECK_E2E=1` 启用，并用可注入 probe 和 marker tripwire
+    守住默认离线路径。这只解决测试基础设施阻断：生产 Codex 版本匹配、真实
+    vendor E2E 与 M0 lifecycle 证据仍需本 ADR 后续实现。
 13. streaming delta、vendor terminal 状态和 session cleanup 的完整差距由
     [agentdeckd 最小稳定边界设计](2026-08-17-agentdeckd-minimum-stable-boundary-design.md)
     继续定义。
@@ -376,7 +373,9 @@ M0 验收必须证明一次多轮 session 的 header、各轮事件、失败关�
 在本机 Codex 版本与 `protocol/CODEX_VERSION.txt` 一致且已完成 `codex login` 时运行：
 
 ```bash
-AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
+cargo build --locked -p agentdeckd --bin agentdeckd
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+  cargo test -p agentdeck-cli --test e2e_codex -- --nocapture
 ```
 
 真实 E2E 必须通过同一个持久 `agentdeckd` client connection 驱动同一 session，至少
@@ -403,14 +402,18 @@ record 写失败由 fake/fixture 测试确定性覆盖，真实 E2E 只验证真
 
 ```bash
 cargo test -p agentdeck-protocol
-cargo test -p agentdeckd
-cargo test
-cargo run -p agentdeck-cli -- selfcheck
-cargo run -p agentdeck-cli -- diagnostics report
+scripts/verify-offline-tests.sh
+cargo build --locked \
+  -p agentdeckd --bin agentdeckd \
+  -p agentdeck-cli --bin agentdeck
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
+  ./target/debug/agentdeck --data-dir /tmp/agentdeck-lifecycle selfcheck
+AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" \
+  ./target/debug/agentdeck --data-dir /tmp/agentdeck-lifecycle diagnostics report
 scripts/verify-agent-docs.sh
 ```
 
-其中前三条在未设置 `AGENTDECK_E2E` 时必须完全离线；真实 vendor 只允许出现在单独、
+其中 Cargo 门禁在未设置 `AGENTDECK_E2E` 时必须完全离线；真实 vendor 只允许出现在单独、
 显式设置 gate 的命令中。
 
 ## 未选方案

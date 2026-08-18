@@ -46,6 +46,8 @@ require_file docs/RUST_BUILD_STORAGE.md
 require_file docs/plans/README.md
 require_file protocol/SPIKE_FINDINGS.md
 require_file protocol/CODEX_VERSION.txt
+require_file scripts/verify-offline-tests.sh
+require_file .github/workflows/offline-ci.yml
 
 require_link AGENTS.md NORTH_STAR.md
 require_link AGENTS.md README.md
@@ -64,6 +66,9 @@ require_link docs/index.md plans/README.md
 require_link docs/index.md RUST_BUILD_STORAGE.md
 require_link docs/RUST_BUILD_STORAGE.md scripts/clean-rust-artifacts.sh
 require_link docs/QUALITY.md scripts/verify-agent-docs.sh
+require_link docs/QUALITY.md scripts/verify-offline-tests.sh
+require_link docs/QUALITY.md .github/workflows/offline-ci.yml
+require_link .github/workflows/offline-ci.yml scripts/verify-offline-tests.sh
 
 legacy_tool="g""stack"
 legacy_tool_upper="G""STACK"

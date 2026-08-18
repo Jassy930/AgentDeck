@@ -2,27 +2,18 @@
 //!
 //! Tests `agentdeck diagnostics report`.
 
-use std::process::Command;
+mod support;
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_agentdeck")
-}
-
-fn gated() -> bool {
-    std::env::var("AGENTDECK_E2E").is_ok()
-}
+use support::{ADMIN_TIMEOUT, real_e2e_enabled, run_cli};
 
 #[test]
 fn diagnostics_report_returns_report_shape_not_protocol_schema() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1 to run");
         return;
     }
 
-    let out = Command::new(bin())
-        .args(["diagnostics", "report"])
-        .output()
-        .unwrap();
+    let out = run_cli(&["diagnostics", "report"], ADMIN_TIMEOUT);
     assert!(
         out.status.success(),
         "stderr: {}",

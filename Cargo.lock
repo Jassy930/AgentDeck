@@ -26,6 +26,7 @@ version = "0.1.0"
 dependencies = [
  "agentdeck-protocol",
  "clap",
+ "libc",
  "serde_json",
  "tokio",
 ]

@@ -1,46 +1,29 @@
 //! Gate: `AGENTDECK_E2E=1` — requires real `claude` binary in PATH and `claude auth login`.
 //!
 //! Run with:
-//!   AGENTDECK_E2E=1 cargo test -p agentdeck-cli --test e2e_claude_code
+//!   cargo build --locked -p agentdeckd --bin agentdeckd
+//!   AGENTDECK_DAEMON_BIN="$PWD/target/debug/agentdeckd" AGENTDECK_E2E=1 \
+//!     cargo test -p agentdeck-cli --test e2e_claude_code
 //!
 //! All tests double-gated: skip cleanly when `AGENTDECK_E2E` is unset OR
 //! when the `claude` binary is absent.
 
-use std::process::Command;
-use std::time::Duration;
+mod support;
 
-fn gated() -> bool {
-    std::env::var("AGENTDECK_E2E").is_ok()
-}
+use support::{
+    ADMIN_TIMEOUT, HISTORY_TIMEOUT, SESSION_TIMEOUT, cli_command, real_e2e_enabled, run_cli,
+    run_command, vendor_available,
+};
 
 fn claude_available() -> bool {
-    which_bin("claude")
-}
-
-fn which_bin(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn cli_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_agentdeck")
-}
-
-fn run_cli(args: &[&str]) -> std::process::Output {
-    Command::new(cli_bin())
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn agentdeck {args:?}: {e}"))
+    vendor_available("claude")
 }
 
 // ── Basic plumbing ─────────────────────────────────────────────────────────────
 
 #[test]
 fn e2e_cc_ping() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1 to run Claude Code E2E tests");
         return;
     }
@@ -48,7 +31,7 @@ fn e2e_cc_ping() {
         eprintln!("SKIP: claude not in PATH");
         return;
     }
-    let out = run_cli(&["ping"]);
+    let out = run_cli(&["ping"], ADMIN_TIMEOUT);
     assert!(
         out.status.success(),
         "agentdeck ping failed\nstderr: {}",
@@ -61,7 +44,7 @@ fn e2e_cc_ping() {
 
 #[test]
 fn e2e_cc_selfcheck() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
@@ -69,7 +52,7 @@ fn e2e_cc_selfcheck() {
         eprintln!("SKIP: claude not in PATH");
         return;
     }
-    let out = run_cli(&["selfcheck"]);
+    let out = run_cli(&["selfcheck"], ADMIN_TIMEOUT);
     assert!(
         out.status.success(),
         "agentdeck selfcheck failed\nstderr: {}",
@@ -84,7 +67,7 @@ fn e2e_cc_selfcheck() {
 
 #[test]
 fn e2e_cc_agent_list_contains_claude_code() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
@@ -92,7 +75,7 @@ fn e2e_cc_agent_list_contains_claude_code() {
         eprintln!("SKIP: claude not in PATH");
         return;
     }
-    let out = run_cli(&["agent", "list"]);
+    let out = run_cli(&["agent", "list"], ADMIN_TIMEOUT);
     assert!(
         out.status.success(),
         "agentdeck agent list failed\nstderr: {}",
@@ -114,7 +97,7 @@ fn e2e_cc_agent_list_contains_claude_code() {
 
 #[test]
 fn e2e_cc_agent_capabilities_has_permission_mode() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
@@ -122,7 +105,10 @@ fn e2e_cc_agent_capabilities_has_permission_mode() {
         eprintln!("SKIP: claude not in PATH");
         return;
     }
-    let out = run_cli(&["agent", "capabilities", "--agent", "claude-code"]);
+    let out = run_cli(
+        &["agent", "capabilities", "--agent", "claude-code"],
+        ADMIN_TIMEOUT,
+    );
     assert!(
         out.status.success(),
         "agentdeck agent capabilities --agent claude-code failed\nstderr: {}",
@@ -154,15 +140,13 @@ fn e2e_cc_agent_capabilities_has_permission_mode() {
 
 /// Run a CC session and return `(thread_id, all_event_values)`.
 fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
-    use std::io::{BufRead, BufReader};
-
     let cwd = std::env::current_dir()
         .unwrap()
         .to_string_lossy()
         .to_string();
 
-    let mut child = Command::new(cli_bin())
-        .args([
+    let output = run_cli(
+        &[
             "session",
             "run",
             "--agent",
@@ -175,25 +159,14 @@ fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
             "bypass-permissions",
             "--model",
             "claude-haiku-4-5",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("failed to spawn agentdeck session run (claude-code)");
+        ],
+        SESSION_TIMEOUT,
+    );
 
-    let stdout = child.stdout.take().expect("child stdout");
-    let reader = BufReader::new(stdout);
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut events: Vec<serde_json::Value> = Vec::new();
     let mut thread_id = String::new();
 
-    for line in reader.lines() {
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("CC session run timed out after 60s\nevents so far: {events:?}");
-        }
-        let line = line.expect("readline failed");
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
         if line.trim().is_empty() {
             continue;
         }
@@ -211,7 +184,6 @@ fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
         let is_error = ev_type == Some("error");
         events.push(val.clone());
         if is_error {
-            let _ = child.kill();
             panic!("CC session produced error event: {val}");
         }
         if is_complete {
@@ -219,10 +191,11 @@ fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
         }
     }
 
-    let status = child.wait().expect("wait failed");
     assert!(
-        status.success(),
-        "agentdeck session run (claude-code) exited non-zero: {status}"
+        output.status.success(),
+        "agentdeck session run (claude-code) exited non-zero: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
 
     // Assert N7: sessionCapabilities before first agentItem
@@ -257,7 +230,7 @@ fn run_cc_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
 
 #[test]
 fn e2e_cc_session_run_to_completion() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
@@ -290,7 +263,7 @@ fn e2e_cc_session_run_to_completion() {
 
 #[test]
 fn e2e_cc_session_continue_to_completion() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
@@ -310,8 +283,8 @@ fn e2e_cc_session_continue_to_completion() {
         .unwrap()
         .to_string_lossy()
         .to_string();
-    let out = Command::new(cli_bin())
-        .args([
+    let out = run_cli(
+        &[
             "session",
             "continue",
             "--thread-id",
@@ -322,9 +295,9 @@ fn e2e_cc_session_continue_to_completion() {
             &cwd,
             "--prompt",
             "ok",
-        ])
-        .output()
-        .expect("failed to spawn agentdeck session continue (claude-code)");
+        ],
+        SESSION_TIMEOUT,
+    );
 
     assert!(
         out.status.success(),
@@ -354,7 +327,7 @@ fn e2e_cc_session_continue_to_completion() {
 
 #[test]
 fn e2e_cc_history_list_returns_items() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
@@ -363,7 +336,10 @@ fn e2e_cc_history_list_returns_items() {
         return;
     }
 
-    let out = run_cli(&["history", "list", "--agent", "claude-code"]);
+    let out = run_cli(
+        &["history", "list", "--agent", "claude-code"],
+        HISTORY_TIMEOUT,
+    );
     assert!(
         out.status.success(),
         "agentdeck history list --agent claude-code failed\nstderr: {}",
@@ -382,7 +358,7 @@ fn e2e_cc_history_list_returns_items() {
 
 #[test]
 fn e2e_cc_history_archive_then_rename() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
@@ -399,7 +375,10 @@ fn e2e_cc_history_archive_then_rename() {
     // `claude rm` only works for background-agent sessions; for regular interactive sessions
     // it returns "No job matching <id>" with exit 1. Both outcomes (success and this
     // specific error) are acceptable per spec § 4.9 / Task 4B findings.
-    let archive_out = run_cli(&["history", "archive", &thread_id, "--agent", "claude-code"]);
+    let archive_out = run_cli(
+        &["history", "archive", &thread_id, "--agent", "claude-code"],
+        HISTORY_TIMEOUT,
+    );
     if !archive_out.status.success() {
         let stderr = String::from_utf8_lossy(&archive_out.stderr);
         let stdout = String::from_utf8_lossy(&archive_out.stdout);
@@ -414,14 +393,17 @@ fn e2e_cc_history_archive_then_rename() {
     }
 
     // Rename it — should always succeed (CC supports --name on resume)
-    let rename_out = run_cli(&[
-        "history",
-        "rename",
-        &thread_id,
-        "renamed-by-e2e",
-        "--agent",
-        "claude-code",
-    ]);
+    let rename_out = run_cli(
+        &[
+            "history",
+            "rename",
+            &thread_id,
+            "renamed-by-e2e",
+            "--agent",
+            "claude-code",
+        ],
+        HISTORY_TIMEOUT,
+    );
     assert!(
         rename_out.status.success(),
         "history rename failed\nstdout: {}\nstderr: {}",
@@ -442,7 +424,7 @@ fn e2e_cc_history_archive_then_rename() {
 
 #[test]
 fn e2e_cc_not_installed_returns_error_code() {
-    if !gated() {
+    if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
     }
@@ -455,22 +437,22 @@ fn e2e_cc_not_installed_returns_error_code() {
         .to_string();
 
     // Run with a PATH that cannot find `claude`
-    let result = Command::new(cli_bin())
-        .env("PATH", "/tmp/no-such-dir-agentdeck-e2e")
-        .args([
-            "session",
-            "run",
-            "--agent",
-            "claude-code",
-            "--cwd",
-            &cwd,
-            "--prompt",
-            "x",
-            "--permission",
-            "default",
-        ])
-        .output()
-        .expect("failed to spawn agentdeck with masked PATH");
+    let args = [
+        "session",
+        "run",
+        "--agent",
+        "claude-code",
+        "--cwd",
+        &cwd,
+        "--prompt",
+        "x",
+        "--permission",
+        "default",
+    ];
+    let mut command = cli_command(&args);
+    command.env("PATH", "/tmp/no-such-dir-agentdeck-e2e");
+    let result = run_command(command, SESSION_TIMEOUT)
+        .unwrap_or_else(|error| panic!("failed to run agentdeck with masked PATH: {error}"));
 
     assert!(
         !result.status.success(),
