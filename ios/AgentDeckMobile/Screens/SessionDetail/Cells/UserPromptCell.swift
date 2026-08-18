@@ -1,5 +1,5 @@
 import UIKit
-import AgentDeckCore
+import AgentDeckMobileCore
 
 final class UserPromptCell: UICollectionViewCell {
     private let bubble = UIView()

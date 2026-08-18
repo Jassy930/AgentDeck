@@ -18,7 +18,7 @@ targets:
         optional: true
     dependencies:
       - package: AgentDeck
-        product: AgentDeckCore
+        product: AgentDeckMobileCore
     info:
       path: AgentDeckMobile/Info.plist
       properties:

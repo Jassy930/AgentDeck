@@ -8,8 +8,9 @@
 - 或：`UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot`
 
 ## 版本
-`protocolVersion` = `agentdeck-protocol::PROTOCOL_VERSION`。改动协议形态时 +1 并重生成快照，
-`cargo test` 的 drift 测试会在类型与快照脱节时失败。
+`protocolVersion` = `agentdeck-protocol::PROTOCOL_VERSION`。改动本地 wire 形态时 +1 并
+重生成快照；仅清除不属于本地 IPC 的聚合根不改变版本。`cargo test` 的 drift 测试
+会在类型与快照脱节时失败。
 
 ## actionDecision 线形态（非 typed 结构，故不在 schema）
 `{ "kind": "actionDecision", "id": <u64>, "sessionId": <string>,
@@ -40,7 +41,7 @@ vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel
 
 ### 四道守护测试
 
-`agentdeck-protocol` 共有 30 个测试守护协议正确性，其中四道核心守护：
+`agentdeck-protocol` 通过一组测试守护协议正确性，其中四道核心守护：
 
 1. `schema_matches_committed_snapshot` — 协议类型变更必须重生成 schema 快照（K10）
 2. `protocol_neutrality_main_trunk` — 主干类型不出现 vendor 字样（N1）

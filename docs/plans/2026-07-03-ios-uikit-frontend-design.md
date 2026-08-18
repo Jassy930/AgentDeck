@@ -5,46 +5,46 @@
 | 状态 | Implemented |
 | 日期 | 2026-07-03 |
 | 主题 | iOS UIKit companion 前端骨架，用协议对齐 fixture 回放代替真实链路 |
-| 关联 | `NORTH_STAR.md`、`docs/plans/2026-07-01-agentdeck-mobile-relay-design.md`、`designs/agentdeck-design-system/` |
+| 关联 | `NORTH_STAR.md`、`designs/agentdeck-design-system/` |
 
 ## 1. 背景和用户问题
 
-`2026-07-01-agentdeck-mobile-relay-design.md` 已确认手机端方向：薄 Relay + `agentdeckd` remote mode + iOS UIKit companion，原路线是 R0-R2 先做服务端、R3 再做 iOS。本设计把 R3 的**前端部分提前**：不等 Relay 与 remote mode，先用协议对齐的 fixture 回放把 iOS UIKit 界面骨架完整跑起来，验证产品形态与渲染语义；真实链路（配对、网络、通知、实机）后置。
+本设计先用协议对齐的 fixture 回放把 iOS UIKit 界面骨架跑起来，验证产品形态与
+渲染语义；网络、通知和实机链路不在当前实现中。
 
 ## 2. 目标
 
-- 在 iPhone 模拟器上跑通 R3 companion 全部界面：机器列表、会话列表、会话详情（流式）、审批卡片、prompt 输入、配对入口、事件收件箱。
+- 在 iPhone 模拟器上跑通 companion 界面：机器列表、会话列表、会话详情（流式）、审批卡片、prompt 输入和事件收件箱。
 - 假数据用 `agentdeck-protocol` 语义的事件序列回放，接真实链路时 UI 层零迁移。
-- 把平台无关的协议类型与会话模型抽成共享 SPM 库，macOS / iOS 共同依赖，边界由编译器保证。
+- 把 iOS 使用的平台无关协议类型与会话模型收在 `AgentDeckMobileCore` SPM 库中，边界由编译器保证。
 - iOS 视觉沿用 `designs/agentdeck-design-system` 同一份 token SSOT。
 
 ## 3. 非目标
 
-- 不做 Relay、remote mode、任何网络代码或 daemon 直连。
-- 不做真实扫码配对、相机权限、APNs 推送。
+- 不做任何网络代码或 daemon 直连。
+- 不做相机权限、APNs 推送。
 - 不做数据持久化（杀 app 重置 fixture 状态）。
 - 不做 iPad 适配、横屏、明暗主题切换。
-- 不做 iOS 端编辑器、文件浏览器、Git 面板（沿用 relay 设计的 companion 边界）。
+- 不做 iOS 端编辑器、文件浏览器或 Git 面板。
 
 ## 4. 已确认的决策
 
-- 功能范围：按 relay 设计 R3 companion 范围。
+- 功能范围：fixture 驱动的机器、会话、审批与收件箱浏览。
 - Mock 方式：协议对齐 fixture 回放，经 `MobileSessionSource` 协议进入 UI。
 - 工程组织：同仓 `ios/` 目录 + XcodeGen（xcodeproj 不入库）。
-- 代码共享：抽 `AgentDeckCore` SPM 共享库（方案 A，优于零侵入 source glob 与只共享协议类型两个备选）。
+- 代码组织：使用 `AgentDeckMobileCore` SPM 库承载 iOS 的平台无关协议类型与会话模型。
 - 设备目标：iPhone 竖屏优先，iOS 17+。
 
 ## 5. 架构方案与边界
 
 ```text
 仓库根
-├── Package.swift                    # 新增 AgentDeckCore library target（macOS 14 + iOS 17）
+├── Package.swift                    # AgentDeckMobileCore library target（iOS 17）
 ├── Sources/
-│   ├── AgentDeckCore/               # 新：平台无关共享层（从 AgentDeck 移入，零逻辑改动）
-│   │   ├── Protocol/V2Types.swift   # 协议类型（agentdeck-protocol 的 Swift 镜像）
-│   │   ├── AgentItemReducer.swift   # 流式累积 reducer
-│   │   └── ConversationTurn.swift / HistoryModel.swift / ...（以实际依赖为准）
-│   └── AgentDeck/                   # 现有 macOS AppKit 前端，改为依赖 AgentDeckCore
+│   └── AgentDeckMobileCore/         # iOS 使用的平台无关 Swift 层
+│       ├── Protocol/V2Types.swift   # 协议类型（agentdeck-protocol 的 Swift 镜像）
+│       ├── AgentItemReducer.swift   # 流式累积 reducer
+│       └── ConversationTurn.swift / HistoryModel.swift / ...（以实际依赖为准）
 ├── ios/
 │   ├── project.yml                  # XcodeGen 声明式工程
 │   ├── AgentDeckMobile/
@@ -58,8 +58,8 @@
 
 边界约束：
 
-- `AgentDeckCore` 只含 Foundation/Observation 代码，不得 import AppKit/UIKit；macOS 端迁移只做文件移动与必要的 `public` 化，零逻辑改动。
-- iOS app 的唯一数据入口是 `MobileSessionSource` 协议；本期唯一实现是 `FixtureSessionSource`。未来 Relay 就绪时新增 `RelaySessionSource`，视图层不动。
+- `AgentDeckMobileCore` 只含 Foundation/Observation 代码，不得 import AppKit/UIKit；当前 Rust/GPUI macOS 桌面端不依赖它。
+- iOS app 的唯一数据入口是 `MobileSessionSource` 协议；当前唯一实现是 `FixtureSessionSource`。真实数据源须在对应功能切片中重新设计。
 - 会话渲染路径按 `SessionCapabilities` 路由，禁止 `if agentKind == .codex` 硬编码分支（沿用 N2）。
 - vendor 原词（审批文案、徽章）原样展示，不强行统一语义。
 
@@ -69,7 +69,6 @@
 
 ```text
 机器列表 (根屏)
- ├─→ 配对 (右上角入口, modal)
  ├─→ 收件箱 (待审批/完成/失败聚合, 右上角入口)
  └─→ 会话列表 (选中某机器)
        └─→ 会话详情 (流式)
@@ -82,8 +81,7 @@
 3. **会话详情**：`UICollectionView`（compositional list layout + diffable data source）。cell 类型：用户消息、assistant markdown（流式增量）、reasoning（默认折叠）、工具调用/shell（折叠，与 macOS 折叠规范一致）、diff 摘要、错误状态。数据由共享 `AgentItemReducer` 驱动。Markdown 第一期用系统 `AttributedString(markdown:)`，不移植 macOS 的 AppKit builder，效果不足再评估。
 4. **审批卡片**：详情流内嵌 cell，显示 vendor 原词 + 风险上下文（命令/路径摘要），approve / deny 两键；fixture 模式下走假状态机，决议后流继续回放。
 5. **prompt 输入栏**：固定底部、多行增高；发送后乐观插入用户消息，fixture 回一条假 assistant 响应。
-6. **配对屏**（modal）：扫码区域 UI 占位（不接相机）+ 手动粘贴配对码 + 已配对设备列表与注销按钮，全部假数据。
-7. **收件箱**：app 内事件列表（等待审批、turn 完成、失败），点击跳转对应会话。不做 APNs。
+6. **收件箱**：app 内事件列表（等待审批、turn 完成、失败），点击跳转对应会话。不做 APNs。
 
 ## 7. 数据流与 fixture
 
@@ -99,7 +97,7 @@ protocol MobileSessionSource {
 }
 ```
 
-fixture 直接用协议 payload，不自造格式：JSON 为 `agentdeck-protocol` 语义的事件序列，用 `AgentDeckCore` 的 `V2Types` 解码，外层只套薄回放信封：
+fixture 直接用协议 payload，不自造格式：JSON 为 `agentdeck-protocol` 语义的事件序列，用 `AgentDeckMobileCore` 的 `V2Types` 解码，外层只套薄回放信封：
 
 ```json
 { "delayMs": 400, "event": { /* 协议原样的事件 payload */ } }
@@ -136,7 +134,7 @@ fixture 场景清单（bundle 内按场景分文件）：
 验证命令：
 
 ```bash
-# macOS 零回归（AgentDeckCore 抽取后必须全绿）
+# AgentDeckMobileCore 单元测试
 swift test
 
 # iOS 工程生成 + 构建 + 测试
@@ -160,7 +158,7 @@ iOS 单测重点：
 - Codex 与 Claude Code 两条会话流均能流式回放，折叠元素可展开。
 - 审批卡可 approve / deny，卡片状态变化且流继续。
 - prompt 输入后用户消息乐观出现，假响应回流。
-- 配对屏与收件箱骨架可进入、可返回。
+- 收件箱骨架可进入、可返回。
 - `swift test` 全绿（macOS 无回归），iOS 单测全绿，`scripts/verify-agent-docs.sh` 通过。
 
 ## 11. 实现偏差记录
@@ -171,12 +169,13 @@ iOS 单测重点：
 2. **DesignTokens 实名**：iOS `DesignTokens.swift` 生成的语义色实名为 `text`、`text2`、`surface`（来自设计 SSOT `tokens.json` 的实际 key），设计期草案内文描述曾引用 `fg`/`fgMuted`/`bgRaised` 作为占位名称，以生成物为准。
 3. **强制暗色**：iOS app 在 `SceneDelegate` 中对 `UIWindow` 设置 `overrideUserInterfaceStyle = .dark`，与 macOS 端设计风格一致（纯暗色 token 设计，本期不做明暗切换）。
 4. **VM 未用 @Observable**：实现为普通 `@MainActor` class + `onUpdate` 闭包（UIKit 无自动观察，四屏一致），设计文档 §7 中"每屏一个 `@Observable` view model"的描述属于草案占位，以实现为准。
-5. **§9 断流重连占位态未实现**：fixture 流总是正常结束、无法模拟断流，该功能后置到 `RelaySessionSource` 接入时实现（届时真实网络可断流）。
-6. **机器卡片「最近心跳」字段本期未在 UI 展示**：`MachineSummary` 中已计算 `lastHeartbeat` 字段，但本期 UI 未展示，待 Relay 接入后随真实心跳数据一起在机器卡片显示。
+5. **§9 断流重连占位态未实现**：fixture 流总是正常结束、无法模拟断流；真实网络数据源落地时再设计。
+6. **机器卡片「最近心跳」字段本期未在 UI 展示**：`MachineSummary` 中已计算 `lastHeartbeat` 字段，但当前 fixture UI 不展示。
+7. **假配对入口已移除**：2026-08-17 收敛主线时删除无真实链路支撑的配对屏、二维码按钮和相关占位文案；机器、会话与收件箱 fixture 闭环保留。
 
 ## 12. 后续衔接
 
-- R1/R2（Relay 与 remote mode）落地后，新增 `RelaySessionSource` 实现 `MobileSessionSource`，替换 fixture 数据源；配对屏接真实扫码与 credential 流程。
-- 收件箱升级为 APNs 通知入口（沿用 relay 设计的通知 hook）。
-- `RelaySessionSource` 接入时，`sendPrompt` 应改为 VM 本地乐观插入（当前 fixture 模式为回声后插入，网络延迟下体验不可接受）。
+- 新增真实数据源前，先为传输、认证和错误语义单独立项，不从已删除的占位入口恢复实现。
+- 收件箱如升级为 APNs 通知入口，需要独立设计通知来源和授权流程。
+- 真实数据源接入时，`sendPrompt` 应改为 VM 本地乐观插入（当前 fixture 模式为回声后插入，网络延迟下体验不可接受）。
 - （已完成：AGENTS.md、README.md、docs/index.md 已补 iOS 入口与验证命令。）

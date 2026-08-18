@@ -1,5 +1,5 @@
 import Foundation
-import AgentDeckCore
+import AgentDeckMobileCore
 
 struct MachineSummary: Identifiable, Equatable {
     let id: String

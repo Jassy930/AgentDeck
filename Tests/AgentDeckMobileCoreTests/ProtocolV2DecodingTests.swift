@@ -1,4 +1,4 @@
-import AgentDeckCore
+import AgentDeckMobileCore
 import Foundation
 import XCTest
 

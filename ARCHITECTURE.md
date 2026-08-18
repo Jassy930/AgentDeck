@@ -20,10 +20,7 @@ AgentDeck.app
 agentdeckd / agentdeck-protocol / agentdeck-cli
 └─ 现有后端与协议，当前尚未接入 GPUI 桌面端
 
-agentdeck-relay / agentdeck-relay-client
-└─ 独立代码线，不是桌面启动依赖或默认门禁
-
-AgentDeckCore + ios/
+AgentDeckMobileCore + ios/
 └─ iOS companion 使用的 Swift 共享模型和 UIKit 前端
 ```
 
@@ -31,11 +28,16 @@ AgentDeckCore + ios/
 `agentdeck-desktop → typed local client → agentdeckd`。在该通路真正落地前，文档和
 selfcheck 都必须明确桌面端没有 backend 能力。
 
+Codex 本地 transport 已决定为 `agentdeckd` 直接持有 session-scoped
+`codex app-server --listen stdio://` 子进程；不依赖用户全局 managed daemon/proxy。
+该生命周期和 desktop 解锁门禁仍是已接受、未落地的设计，现状以
+`docs/AGENTDECKD_STATUS.md` 为准。
+
 ## 分层边界
 
-- `agentdeck-desktop/`：macOS GPUI executable。当前只负责窗口、组件根节点和桌面 selfcheck；不得直接依赖 Relay 或解析 vendor JSON。
-- `Sources/AgentDeckCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
-- `agentdeck-protocol/`：IPC 协议事实源 crate。分 trunk / capabilities / vendor / transport 四个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合所有 v2 类型。
+- `agentdeck-desktop/`：macOS GPUI executable。当前只负责窗口、组件根节点和桌面 selfcheck；不得解析 vendor JSON。
+- `Sources/AgentDeckMobileCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
+- `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 2，`protocol_schema()` 聚合本地 v2 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/agent.rs`：`Agent` trait + `AgentKind` 枚举。两个 adapter 共享的逻辑在此，不得让 adapter 相互引用。
 - `agentdeckd/src/runtime/`：`RuntimeHub`（stdin loop + stdout writer）+ `AgentRouter`（sessionId → agentKind → adapter）。
@@ -62,7 +64,7 @@ selfcheck 都必须明确桌面端没有 backend 能力。
 
 - **K1**：daemon 的 stdin 主循环不得被单个 turn 阻塞；长时间工作放到 worker。
 - **K2**：`RuntimeHub` 必须按 `sessionId` 阻止同一 runtime 并发 turn；session 创建时 `agentKind` 不可变，整个生命周期固定到一个 adapter。
-- **K3**：turn 成功完成时，worker 必须先释放 session 占用，再向客户端发出可触发下一条 prompt 的 ready / `turnComplete` 事件。
+- **K3**：每个 turn 的成功、失败或取消 terminal 发出前，worker 必须先释放 turn-local 占用；连接仍健康时 session 回到 Ready 并保留 session-scoped child。只有 `SessionClosed` 表示 session 已结束，且必须在 child wait 和路由清理后发送。
 - **K4**（加强）：所有事件主干消息必须带 `agentKind` 字段。
 - **K5**：run record 与 diagnostic log 写入 `~/Library/Application Support/AgentDeck/`（stable）或 `AgentDeck-Dev/`（dev），不得写入用户项目 git。
 - **K6**：`AGENTDECK_DATA_DIR` / `--profile` / `AGENTDECK_PROFILE` 控制数据目录隔离，不影响 vendor 登录状态或 vendor 历史。
@@ -76,36 +78,13 @@ selfcheck 都必须明确桌面端没有 backend 能力。
 
 | # | 不变量 | 守护方式 |
 |---|---|---|
-| **N1** | **两层协议**：`AgentItem` / `TurnComplete` / `SessionStarted` / `SessionCapabilities` / `Error` 主干必须 vendor 中立；vendor 字段默认只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 三个命名空间下。唯一例外是 `ActionRequest.vendor`，用于 typed approval detail，禁止任意 JSON 透传 | schemars 派生 + `neutrality_tests.rs` 静态断言 |
-| **N2** | **Capabilities Handshake**：每个 session 启动时 daemon 必须先发 `SessionCapabilities`；UI 必须按它路由控件渲染；禁止 UI 硬编码 vendor 分支 | GPUI 会话切片落地时新增 Rust router 单测与静态边界测试；当前 P0 无 session UI |
+| **N1** | **两层协议**：`AgentItem`、turn/session terminal、`SessionStarted`、`SessionCapabilities`、`Error` 等主干必须 vendor 中立；vendor 字段默认只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 三个命名空间下。唯一例外是 `ActionRequest.vendor`，用于 typed approval detail，禁止任意 JSON 透传 | schemars 派生 + `neutrality_tests.rs` 静态断言 |
+| **N2** | **Capabilities Handshake**：daemon 在 `SessionStarted` 后必须立即发 `SessionCapabilities`，且早于该 session 的 `TurnStarted` / `AgentItem` / approval 等运行事件；UI 必须按它路由控件渲染；禁止 UI 硬编码 vendor 分支 | daemon M0 集成测试 + GPUI 会话切片的 Rust router 单测与静态边界测试；当前 P0 无 session UI |
 | **N3** | **Adapter 互不知晓**：`agentdeckd/src/codex/` 不依赖 `claude_code/` 任何类型，反之亦然；共享逻辑下沉到 `agent.rs` trait | cargo 模块依赖检查 |
 | **N4** | **Adapter 内 vendor JSON 不外泄**：被 IPC 推到 UI 的 vendor 字段必须经 adapter 显式建模，禁止 `serde_json::Value` 透传 | `capabilities_namespace_is_typed` 测试断言 |
 | **N5** | **一等公民对称约束**：`CodexAdapter` 实现的每个非独有 capability，`ClaudeCodeAdapter` 必须有等价实现或文档化"不适用"原因 | capability 矩阵文档 + cargo test |
-| **N6** | **Transport trait 远程预留**：v0.2 实现 `Transport` trait（仅 stdio），但 trait 必须能支持 remote（异步、可重连、可携带 auth context） | 编译期 trait 定义 |
 | **N7** | **`SessionCapabilities` 必须先于该 session 任何 `AgentItem`** | 集成测试断言序 |
 | **N8** | **CC 数据事实唯一来源**：AgentDeck 不为 CC 维护任何元数据层；不在 `~/Library/Application Support/AgentDeck/` 下创建 `cc-meta/` 目录 | code review + 文件存在性断言 |
-
-### Relay R1a 不变量（传输 + 鉴权骨架）
-
-- **R1a-1**：`agentdeckd` 依赖树无 `tokio net` 或 `axum`——保证 daemon 至 R2 前始终无网络代码；guard `scripts/check-daemon-no-net.sh`
-- **R1a-2**：`agentdeck-cli` 依赖树无 `axum`——CLI 只走 WS client 不做 server
-- **R1a-3**：net/axum 仅限 `agentdeck-relay` 的 `server` feature + `agentdeck-relay-client` crate
-- **R1a-4**：`relay` 数据目录独立于 daemon/CLI，只存不透明数据 + 公钥材料 + credential 哈希（**不**存明文 credential）
-- **R1a-5**：非 loopback 绑定强制 TLS（`RelayConfig::validate_transport_gate`），除非显式 `--allow-plaintext` 明文告警
-- **R1a-6**：`thiserror` 单版本 1.x、`rand_core` 单版本 0.6（与 dalek 2.x 对齐）
-- **R1a-7**：一条 `RemoteFrame` = 一条 WS text 帧（`serde_json` 序列化）；`RELAY_PROTOCOL_VERSION` 变更需协商
-- **R1a-8**：`DataEnvelope` bytes wire 为 base64 string（**不**是数字数组）
-
-### Relay R1b 不变量（SQLite 持久化 + Router 健壮化）
-
-- **R1b-1**：relay 持久化状态（accounts/devices/challenges/seq 高水位/事件元数据）全部落 SQLite（`rusqlite` + `bundled`），单一 `--storage` 路径文件；**事件内容（`payload`）本期恒为 NULL，不落盘明文**（R1c 引入加密后翻转）。
-- **R1b-2**：`conv_buffer` 每 conversation 有硬上界（默认 1000，可配置），独立于 Ack 生效，防 OOM。
-- **R1b-3**：重放补拉（`since_seq`）语义为 **relay 进程存活期内** 的有界补拉，不是跨重启完整历史重放；窗口外返回 `relay.replay.gap`。
-- **R1b-4**：`RelayLink::recv` 仍不返回 `Result`（R2 defer，见 R1b 设计 §4.1）。
-
-### R1a 隐含约束（供 R2 参考）
-
-- **R1a machine_id ≡ device_id**：`server/ws.rs::connect` 用 `device.device_id` 作 `ConnRole::Machine.machine_id`，`router.rs` RegisterMachine 授权强制 `machine.machine_id == connection.machine_id`——**enrolled 的 machine 设备的 `machine_id` 严格等于 `device_id`**。CLI 生成的随机 `device_id = "cli-<profile>-<random>"` 会锁定 R2 daemon remote-mode 里对应 machine 的 identifier；R2 设计需评估是否解耦 machine_id 与 device_id（例如 machine 元数据里显式携带独立 machine_id）。
 
 ## 依赖方向
 
@@ -126,8 +105,7 @@ daemon main
 
 agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
   -> agentdeck-protocol（共享类型）
-  -> Transport trait（ProcessTransport → daemon stdio）
-  -> daemon child process
+  -> ProcessTransport → daemon stdio child process
 ```
 
 允许的跨层访问应沿上图向下：
@@ -150,6 +128,7 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 - **改 UI 行为**：改 `agentdeck-desktop/`，并对照当前 GPUI 设计计划；不要从历史 AppKit 计划复制实现。
 - **改 IPC**：同步更新 Rust 协议、仍由 iOS 消费的 Swift Core mirror、测试、schema 快照和 README/架构文档。
 - **改 Codex 协议翻译**：先看 `protocol/SPIKE_FINDINGS.md` 和 `protocol/CODEX_VERSION.txt`，再改 `agentdeckd/src/codex/` 子模块。
+- **改 daemon session 生命周期**：先看 `docs/AGENTDECKD_STATUS.md`、Codex 生命周期 ADR 和 agentdeckd M0 设计；状态升级必须同步更新能力矩阵。
 - **改 CC 协议翻译**：先看 `docs/plans/2026-06-30-unified-shell-v02-design.md` § 5，再改 `agentdeckd/src/claude_code/` 子模块。
 - **改诊断或记录**：同步更新 `docs/AGENT_DIAGNOSTICS.md` 和 `docs/QUALITY.md`。
 - **新增 adapter**：在 `agentdeckd/src/<vendor>/` 下建子模块，实现 `Agent` trait；在 `AgentRouter` 注册；在 `agentdeck-protocol` 的 `VendorCapabilities` / `VendorSessionOptions` 枚举中添加对应 variant；更新 `agentdeck-cli` 的 `--agent` 可选值。新 adapter 不得要求 UI 知道该 adapter 的 vendor JSON（N2），也不得修改现有 adapter capability（N5）。

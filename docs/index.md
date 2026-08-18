@@ -12,6 +12,7 @@
 ## 运行与诊断
 
 - `AGENT_DIAGNOSTICS.md`：自检命令、诊断日志位置、failure code 和排查流程。
+- `AGENTDECKD_STATUS.md`：daemon 当前能力矩阵、完整度、证据边界和 desktop 接入前缺口。
 - `QUALITY.md`：按变更范围选择验证命令，以及文档结构检查入口。
 - `RUST_BUILD_STORAGE.md`：Rust 构建产物、sccache 容量上限和分 worktree 清理流程。
 
@@ -26,38 +27,21 @@
 - `plans/2026-08-17-gpui-desktop-reset-design.md`：删除旧 AppKit target、建立最小 GPUI 桌面壳的目标、边界和验收标准。
 - `plans/2026-08-17-gpui-desktop-reset-implementation.md`：当前切片的逐文件实施与验证命令。
 
-此前 macOS AppKit 和 Relay companion 文档保留为历史事实，不再定义当前桌面实现或
-默认迭代顺序。
+此前 macOS AppKit 文档仅保留为历史事实，不再定义当前桌面实现或默认迭代顺序。
+
+### agentdeckd 最小稳定边界（2026-08-17，当前设计）
+
+- `plans/2026-08-17-codex-app-server-lifecycle-adr.md`：决定由 `agentdeckd` 直接持有 session-scoped Codex app-server stdio 子进程，不采用 managed daemon/proxy。
+- `plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md`：desktop 接入前必须完成的 Codex-only M0、生命周期、不变量和验收门禁；当前状态是设计基线，尚未落地。
 
 ### iOS 前端计划（2026-07-03）
 
-- `plans/2026-07-03-ios-uikit-frontend-design.md`：iOS UIKit companion 前端设计（fixture 驱动，R3 界面骨架，状态：Implemented）。
-- `plans/2026-07-03-ios-uikit-frontend-implementation.md`：iOS UIKit companion 前端实施计划（Task 1–15，含 AgentDeckCore 共享库抽取）。
+- `plans/2026-07-03-ios-uikit-frontend-design.md`：iOS UIKit companion 前端设计（fixture 驱动界面骨架，状态：Implemented）。
+- `plans/2026-07-03-ios-uikit-frontend-implementation.md`：iOS UIKit companion 前端实施计划（Task 1–15；文中 `AgentDeckCore` 是实施时原名，现名为 `AgentDeckMobileCore`）。
 
 ### macOS AppKit 富文本渲染（2026-07-23，历史）
 
 - `plans/2026-07-23-native-markdown-table-rendering-implementation.md`：在现有 TextKit/NSAttributedString 管线中增加 GFM 表格识别、`NSTextTable` 原生布局、流式降级与像素快照门禁。
-
-### Relay R0 契约 spike（2026-07-07）
-
-- `plans/2026-07-07-relay-r0-contract-spike-design.md`：Relay R0 契约 spike 设计（控制面/数据面分层、fleet 协议、内存 FakeRelay + 真实 daemon 组合、CLI remote 接口基线）。
-- `plans/2026-07-07-relay-r0-contract-spike-implementation.md`：Relay R0 契约 spike 实施计划（Task 1–9，含 T1–T4 测试矩阵与文档收口）。
-
-### Relay R1a 传输 + 鉴权骨架（2026-07-08）
-
-- `plans/2026-07-08-relay-r1-design-review.md`：Relay R1 设计评审（就绪度评估、决策拍板、R1a/R1b/R1c 切分）。
-- `plans/2026-07-08-relay-r1a-transport-auth-design.md`：Relay R1a 传输+鉴权骨架设计。
-- `plans/2026-07-08-relay-r1a-transport-auth-implementation.md`：Relay R1a 12 任务 TDD 实施计划（已全部落地）。
-
-### Relay R1b 存储 + Router 健壮化（2026-07-09）
-
-- `plans/2026-07-09-relay-r1b-storage-hardening-design.md`
-- `plans/2026-07-09-relay-r1b-storage-hardening-implementation.md`
-
-### Relay Companion MVP（2026-07-10）
-
-- `plans/2026-07-10-relay-companion-mvp-design.md`：已批准的目标架构；固定 singleton daemon、多读者/多写者串行裁决、按机器独立配对、Relay 严格最小可见与真实 iOS Companion 边界。
-- `plans/2026-07-10-relay-companion-mvp-implementation.md`：P0–P6、48 个逐文件 TDD task；覆盖 Relay v2、RuntimeCore、UDS/LaunchAgent、E2EE/Keychain、iOS/远程 macOS 与真实跨网 DoD。
 
 ## 协议资料
 

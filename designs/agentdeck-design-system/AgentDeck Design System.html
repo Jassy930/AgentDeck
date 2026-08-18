@@ -714,7 +714,7 @@ src/api/session.ts</div></div></div></div>
           <div class="setrow"><span class="lbl">头像</span><span class="avatar avatar--lg">J</span><button class="btn btn--secondary">更换</button></div>
           <div class="setrow"><span class="lbl">显示名称</span><span class="field" style="flex:1;max-width:300px">Jassy</span></div>
           <div class="setrow"><span class="lbl">身份标识</span><span class="field mono" style="flex:1;max-width:300px">ad_live_8f3k…q2b</span><button class="btn btn--secondary"><i data-lucide="copy"></i>复制</button><button class="btn btn--ghost"><i data-lucide="refresh-cw"></i>重置</button></div>
-          <div class="note" style="margin-top:18px">AgentDeck 不管理鉴权——各机器 / relay 各自鉴权；此处仅保存本地身份标识与偏好。</div>
+          <div class="note" style="margin-top:18px">AgentDeck 不管理 vendor 鉴权；此处仅保存本地身份标识与偏好。</div>
         </div>
       </div>
         </div><!-- /.wbscene__view -->
@@ -725,7 +725,7 @@ src/api/session.ts</div></div></div></div>
     <section id="mobile" class="section">
       <div class="section__head">
         <h2>移动端 · Mobile</h2>
-        <p>三屏 · 列表 ↔ 详情导航：<b>会话列表</b>（机器 + 项目平铺分组，会话经 relay 连接，标注 relay 名）、<b>会话页</b>（不输入即监控、一输入即介入，不再显式标注状态；审批以流内卡片就地选择；去底部 tab、最大化工作区、返回列表）、<b>我的</b>（身份标识 / 主机管理 / 用量热力图）。所有触控目标 ≥ 44pt。</p>
+        <p>三屏 · 列表 ↔ 详情导航：<b>会话列表</b>（机器 + 项目平铺分组，标注 fixture 数据来源）、<b>会话页</b>（输入消息并查看 fixture 回放；审批以流内卡片就地选择；去底部 tab、最大化工作区、返回列表）、<b>我的</b>（身份标识 / fixture 数据概览 / 用量热力图）。所有触控目标 ≥ 44pt。</p>
       </div>
 
       <div class="wbscene__bar"><span class="eyebrow">屏幕参考 · iPhone 390 × 844 pt · 显示 80%</span></div>
@@ -740,7 +740,7 @@ src/api/session.ts</div></div></div></div>
               <div class="m-status"><span>9:41</span><span class="r"><i data-lucide="signal"></i><i data-lucide="wifi"></i><i data-lucide="battery-full" style="width:19px"></i></span></div>
               <div class="m-top"><h1>会话</h1><span class="sp"></span><span class="iconbtn"><i data-lucide="search"></i></span><span class="iconbtn"><i data-lucide="square-pen"></i></span><span class="avatar avatar--sm" style="margin-left:4px">J</span></div>
               <div class="m-body m-sessions">
-                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>refactor-auth</b><span class="meta">dev-box · sf-1</span></div>
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>refactor-auth</b><span class="meta">Mac Studio · fixture</span></div>
                 <div class="m-thread">
                   <span class="sdot sdot--run" style="margin-top:4px"></span>
                   <div class="m-thread__main"><div class="m-thread__title">把登录模块拆分为独立的 service 并补齐测试</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>运行中 · 刚刚</div></div>
@@ -749,12 +749,12 @@ src/api/session.ts</div></div></div></div>
                   <span class="sdot sdot--wait" style="margin-top:4px"></span>
                   <div class="m-thread__main"><div class="m-thread__title">修复 token 刷新的竞态条件</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-claude"/></svg>等待审批 · 3 分钟前</div></div>
                 </div>
-                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>agentdeck-docs</b><span class="meta">dev-box · sf-1</span></div>
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>agentdeck-docs</b><span class="meta">Mac Studio · fixture</span></div>
                 <div class="m-thread">
                   <span class="sdot sdot--done" style="margin-top:4px"></span>
                   <div class="m-thread__main"><div class="m-thread__title">补充 README 的部署章节</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>已完成 · 昨天</div></div>
                 </div>
-                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>api-gateway</b><span class="meta">prod-box · tokyo-2</span></div>
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>api-gateway</b><span class="meta">MacBook Air · fixture</span></div>
                 <div class="m-thread">
                   <span class="sdot sdot--done" style="margin-top:4px"></span>
                   <div class="m-thread__main"><div class="m-thread__title">给限流中间件加 Redis 后端</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>已完成 · 2 天前</div></div>
@@ -812,7 +812,7 @@ src/api/session.ts</div></div></div></div>
               </div>
             </div>
           </div>
-          <div class="phone-cap"><b>会话页</b><span>未接管即监控，输入即介入 · 流内审批 · 返回列表</span></div>
+          <div class="phone-cap"><b>会话页</b><span>输入消息 · fixture 回放 · 流内审批 · 返回列表</span></div>
         </div>
 
         <!-- 手机 3：我的（主机管理 · 用量 · 设置）-->
@@ -836,11 +836,10 @@ src/api/session.ts</div></div></div></div>
                   <div style="display:flex;justify-content:flex-end;align-items:center;gap:6px;margin-top:11px"><span class="spec__meta">少</span><span class="hm-legend"><span class="hm hm-1"></span><span class="hm hm-2"></span><span class="hm hm-3"></span><span class="hm hm-4"></span></span><span class="spec__meta">多</span></div>
                 </div>
 
-                <span class="eyebrow m-seth">主机管理</span>
+                <span class="eyebrow m-seth">fixture 数据</span>
                 <div class="m-set">
-                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>dev-box<span class="val">relay · sf-1 <span class="sdot sdot--done"></span></span></div>
-                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>prod-box<span class="val">relay · tokyo-2 <span class="sdot sdot--done"></span></span></div>
-                  <div class="m-set__row" style="color:var(--accent)"><span class="ico" style="background:var(--accent-weak);color:var(--accent)"><i data-lucide="plus"></i></span>添加主机</div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>dev-box<span class="val">本地 · fixture <span class="sdot sdot--done"></span></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>prod-box<span class="val">本地 · sample <span class="sdot sdot--done"></span></span></div>
                 </div>
 
                 <span class="eyebrow m-seth">Agent 连接</span>
@@ -892,12 +891,12 @@ src/api/session.ts</div></div></div></div>
               <div class="m-status"><span>9:41</span><span class="r"><i data-lucide="signal"></i><i data-lucide="wifi"></i><i data-lucide="battery-full" style="width:19px"></i></span></div>
               <div class="m-top"><h1>会话</h1><span class="sp"></span><span class="iconbtn"><i data-lucide="search"></i></span><span class="iconbtn"><i data-lucide="square-pen"></i></span><span class="avatar avatar--sm" style="margin-left:4px">J</span></div>
               <div class="m-body m-sessions">
-                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>refactor-auth</b><span class="meta">dev-box · sf-1</span></div>
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>refactor-auth</b><span class="meta">Mac Studio · fixture</span></div>
                 <div class="m-thread"><span class="sdot sdot--run" style="margin-top:4px"></span><div class="m-thread__main"><div class="m-thread__title">把登录模块拆分为独立的 service 并补齐测试</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>运行中 · 刚刚</div></div></div>
                 <div class="m-thread"><span class="sdot sdot--wait" style="margin-top:4px"></span><div class="m-thread__main"><div class="m-thread__title">修复 token 刷新的竞态条件</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-claude"/></svg>等待审批 · 3 分钟前</div></div></div>
-                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>agentdeck-docs</b><span class="meta">dev-box · sf-1</span></div>
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>agentdeck-docs</b><span class="meta">Mac Studio · fixture</span></div>
                 <div class="m-thread"><span class="sdot sdot--done" style="margin-top:4px"></span><div class="m-thread__main"><div class="m-thread__title">补充 README 的部署章节</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>已完成 · 昨天</div></div></div>
-                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>api-gateway</b><span class="meta">prod-box · tokyo-2</span></div>
+                <div class="m-grp"><i class="chev" data-lucide="chevron-down"></i><b>api-gateway</b><span class="meta">MacBook Air · fixture</span></div>
                 <div class="m-thread"><span class="sdot sdot--done" style="margin-top:4px"></span><div class="m-thread__main"><div class="m-thread__title">给限流中间件加 Redis 后端</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-codex"/></svg>已完成 · 2 天前</div></div></div>
                 <div class="m-thread"><span class="sdot sdot--fail" style="margin-top:4px"></span><div class="m-thread__main"><div class="m-thread__title">升级到 Node 20 并修复告警</div><div class="m-thread__meta"><svg class="agent"><use href="#ic-claude"/></svg>已中断 · 3 天前</div></div></div>
               </div>
@@ -958,11 +957,10 @@ src/api/session.ts</div></div></div></div>
                 <div class="m-profile"><div class="av">J</div><div style="flex:1;min-width:0"><b>Jassy</b><div class="sub mono" style="font-size:12px">身份 · ad_8f3k…q2b</div></div><i data-lucide="chevron-right" class="chev" style="color:var(--text-3)"></i></div>
                 <span class="eyebrow m-seth">用量统计</span>
                 <div class="m-set" style="padding:14px;cursor:pointer"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b style="font-size:14px;font-weight:600">近 4 个月活跃</b><span class="val" style="font-size:12.5px">详情<i data-lucide="chevron-right" class="chev"></i></span></div><div class="heatmap" data-weeks="17"></div><div style="display:flex;justify-content:flex-end;align-items:center;gap:6px;margin-top:11px"><span class="spec__meta">少</span><span class="hm-legend"><span class="hm hm-1"></span><span class="hm hm-2"></span><span class="hm hm-3"></span><span class="hm hm-4"></span></span><span class="spec__meta">多</span></div></div>
-                <span class="eyebrow m-seth">主机管理</span>
+                <span class="eyebrow m-seth">fixture 数据</span>
                 <div class="m-set">
-                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>dev-box<span class="val">relay · sf-1 <span class="sdot sdot--done"></span></span></div>
-                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>prod-box<span class="val">relay · tokyo-2 <span class="sdot sdot--done"></span></span></div>
-                  <div class="m-set__row" style="color:var(--accent)"><span class="ico" style="background:var(--accent-weak);color:var(--accent)"><i data-lucide="plus"></i></span>添加主机</div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>dev-box<span class="val">本地 · fixture <span class="sdot sdot--done"></span></span></div>
+                  <div class="m-set__row"><span class="ico" style="background:var(--surface-2)"><i data-lucide="server"></i></span>prod-box<span class="val">本地 · sample <span class="sdot sdot--done"></span></span></div>
                 </div>
                 <span class="eyebrow m-seth">Agent 连接</span>
                 <div class="m-set">

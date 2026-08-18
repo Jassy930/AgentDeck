@@ -2,7 +2,6 @@ mod client;
 mod commands;
 mod main_types;
 mod output;
-mod remote;
 mod transport;
 
 use agentdeck_protocol::{HistoryRequest, ThreadId};
@@ -59,11 +58,6 @@ enum Cmd {
     History {
         #[command(subcommand)]
         op: HistoryOp,
-    },
-    /// Remote relay 客户端（R0：仅 `smoke` 可执行；其余为接口基线占位）
-    Remote {
-        #[command(subcommand)]
-        op: RemoteOp,
     },
 }
 
@@ -185,73 +179,6 @@ enum HistoryOp {
     },
 }
 
-#[derive(Subcommand)]
-enum RemoteOp {
-    /// 单进程 R0 冒烟：内存 FakeRelay + 真实 daemon bridge + device 驱动
-    Smoke,
-    /// 用 bootstrap secret 向 relay 注册本机身份，写入凭据文件
-    Pair {
-        #[arg(long)]
-        relay: String,
-        #[arg(long)]
-        bootstrap_secret: String,
-        #[arg(long, value_enum, default_value = "device")]
-        role: RoleArg,
-    },
-    /// 列出机器
-    Machines {
-        #[arg(long)]
-        relay: String,
-    },
-    /// 列出某机器的会话
-    Sessions {
-        #[arg(long)]
-        relay: String,
-        machine_id: String,
-    },
-    /// 流式查看某 conversation
-    Watch {
-        #[arg(long)]
-        relay: String,
-        conversation_id: String,
-    },
-    /// 向 conversation 发 prompt
-    Send {
-        #[arg(long)]
-        relay: String,
-        conversation_id: String,
-        text: String,
-    },
-    /// 批准某 turn 的审批
-    Approve {
-        #[arg(long)]
-        relay: String,
-        turn_session_id: String,
-        request_id: String,
-    },
-    /// 拒绝某 turn 的审批
-    Deny {
-        #[arg(long)]
-        relay: String,
-        turn_session_id: String,
-        request_id: String,
-    },
-    /// 机器级 admin 往返
-    Ping {
-        #[arg(long)]
-        relay: String,
-        machine_id: String,
-    },
-}
-
-/// `Pair` 的 `--role` clap 值枚举；`remote::PairRole` 是逻辑层的对应类型
-/// （窄化映射见 dispatch 处），避免 clap 派生类型泄漏进 remote 模块。
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-enum RoleArg {
-    Machine,
-    Device,
-}
-
 // ── Main dispatcher ───────────────────────────────────────────────────────────
 
 fn run_sync(cli: &Cli) -> Result<(), CliError> {
@@ -333,10 +260,6 @@ fn run_sync(cli: &Cli) -> Result<(), CliError> {
             // Should not reach here in sync path
             unreachable!("session commands handled in async path")
         }
-        // Remote commands need async — handled below in main()
-        Cmd::Remote { .. } => {
-            unreachable!("remote commands handled in async path")
-        }
     }
 }
 
@@ -346,55 +269,6 @@ async fn main() {
     let pretty = cli.pretty;
     let profile = cli.profile.clone();
     let data_dir = cli.data_dir.clone();
-
-    // Remote commands have their own (non-CliError) exit contract — dispatch and
-    // exit here rather than folding into the `Result<(), CliError>` path below.
-    if let Cmd::Remote { op } = &cli.command {
-        let arg = match op {
-            RemoteOp::Smoke => remote::RemoteOpArg::Smoke,
-            RemoteOp::Pair { relay, bootstrap_secret, role } => remote::RemoteOpArg::Pair {
-                relay: relay.clone(),
-                bootstrap_secret: bootstrap_secret.clone(),
-                role: match role {
-                    RoleArg::Machine => remote::PairRole::Machine,
-                    RoleArg::Device => remote::PairRole::Device,
-                },
-            },
-            RemoteOp::Machines { relay } => remote::RemoteOpArg::Machines { relay: relay.clone() },
-            RemoteOp::Sessions { relay, machine_id } => remote::RemoteOpArg::Sessions {
-                relay: relay.clone(),
-                machine_id: machine_id.clone(),
-            },
-            RemoteOp::Watch { relay, conversation_id } => remote::RemoteOpArg::Watch {
-                relay: relay.clone(),
-                conversation_id: conversation_id.clone(),
-            },
-            RemoteOp::Send { relay, conversation_id, text } => remote::RemoteOpArg::Send {
-                relay: relay.clone(),
-                conversation_id: conversation_id.clone(),
-                text: text.clone(),
-            },
-            RemoteOp::Approve { relay, turn_session_id, request_id } => remote::RemoteOpArg::Approve {
-                relay: relay.clone(),
-                turn_session_id: turn_session_id.clone(),
-                request_id: request_id.clone(),
-            },
-            RemoteOp::Deny { relay, turn_session_id, request_id } => remote::RemoteOpArg::Deny {
-                relay: relay.clone(),
-                turn_session_id: turn_session_id.clone(),
-                request_id: request_id.clone(),
-            },
-            RemoteOp::Ping { relay, machine_id } => remote::RemoteOpArg::Ping {
-                relay: relay.clone(),
-                machine_id: machine_id.clone(),
-            },
-        };
-        let code = remote::run(arg, &profile, data_dir.as_deref()).await;
-        if code == std::process::ExitCode::SUCCESS {
-            return;
-        }
-        std::process::exit(1);
-    }
 
     let result: Result<(), CliError> = match &cli.command {
         Cmd::Session { op } => match op {

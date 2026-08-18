@@ -1,4 +1,4 @@
-import AgentDeckCore
+import AgentDeckMobileCore
 import XCTest
 
 final class ToolActivityGroupPresentationTests: XCTestCase {

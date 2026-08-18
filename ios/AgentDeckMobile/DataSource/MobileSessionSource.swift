@@ -1,8 +1,8 @@
 import Foundation
-import AgentDeckCore
+import AgentDeckMobileCore
 
-/// iOS 端唯一数据入口。本期唯一实现是 FixtureSessionSource（bundle 内
-/// JSON 回放）；R2 Relay 就绪后新增 RelaySessionSource，视图层不动。
+/// iOS 端唯一数据入口。当前唯一实现是 FixtureSessionSource（bundle 内
+/// JSON 回放）；真实数据源不在本轮范围内。
 @MainActor
 protocol MobileSessionSource: AnyObject {
     func machines() -> AsyncStream<[MachineSummary]>

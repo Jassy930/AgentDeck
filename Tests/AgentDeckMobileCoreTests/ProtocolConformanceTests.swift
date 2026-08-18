@@ -4,7 +4,7 @@ import XCTest
 final class ProtocolConformanceTests: XCTestCase {
     private func loadSchema() throws -> [String: Any] {
         let repoRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()   // AgentDeckCoreTests/
+            .deletingLastPathComponent()   // AgentDeckMobileCoreTests/
             .deletingLastPathComponent()   // Tests/
             .deletingLastPathComponent()   // <repo>/
         let url = repoRoot

@@ -1,10 +1,18 @@
 # AgentDeck iOS UIKit 前端实施计划
 
+> 2026-08-17 命名说明：本计划记录实施时的原名 `AgentDeckCore`。当前 SwiftPM
+> product/target 已更名为 `AgentDeckMobileCore`；以下历史命令、路径和提交叙述不做
+> 机械改写。
+>
+> 2026-08-17 收敛说明：本文保留已完成切片的实施记录；假配对屏、二维码入口及
+> 特定网络数据源承诺已从主线删除。当前 iOS 只保留 fixture 驱动的机器、会话、
+> 审批与收件箱闭环。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在 iPhone 模拟器上跑通 R3 companion 全部界面（机器列表、会话列表、会话详情流式、审批卡、prompt 输入、配对、收件箱），数据用协议对齐 fixture 回放；同时把平台无关代码抽成 `AgentDeckCore` SPM 共享库。
+**Goal:** 在 iPhone 模拟器上跑通 companion 界面（机器列表、会话列表、会话详情流式、审批卡、prompt 输入、收件箱），数据用协议对齐 fixture 回放；同时把平台无关代码抽成 `AgentDeckCore` SPM 共享库。
 
-**Architecture:** 先做两步无逻辑改动的重构（剥离 `StreamingTextBuffer`、抽 `AgentDeckCore` target），让 macOS/iOS 共享协议类型与会话模型；再用 XcodeGen 建 `ios/` 工程，iOS 端唯一数据入口是 `MobileSessionSource` 协议，本期唯一实现 `FixtureSessionSource` 按 `delayMs` 回放 `ServerEvent` JSON。
+**Architecture:** 实施时先从旧 macOS 前端抽出 `AgentDeckCore` target，再用 XcodeGen 建 `ios/` 工程。当前 `AgentDeckCore` 只供 iOS 使用，Rust/GPUI macOS 桌面端不依赖它；iOS 唯一数据入口是 `MobileSessionSource`，当前唯一实现 `FixtureSessionSource` 按 `delayMs` 回放 `ServerEvent` JSON。
 
 **Tech Stack:** Swift 6 / SPM、UIKit（UICollectionView compositional list + diffable data source）、XcodeGen、XCTest、node（设计系统生成脚本，沿用现状）。
 
@@ -17,7 +25,7 @@
 - iOS app 不含任何网络代码、不直连 daemon；所有数据经 `MobileSessionSource` 协议；无磁盘持久化（杀 app 重置）。
 - 渲染路径按数据/`SessionCapabilities` 路由，禁止 `if agentKind == .codex` 之类分支决定渲染路径（不变量 N2）；`vendorDisplayName(_:)` 这类纯展示文案映射不算渲染路径分支。vendor 原词（审批 summary、policy/sandbox/permissionMode/toolName）原样展示。
 - fixture JSON 的 `event` 字段必须能被 `AgentDeckCore` 的 `ServerEvent`（Codable）解码——这是防漂移门禁，有专门单测。
-- macOS 零回归：每个动到 `Sources/`、`Package.swift` 的任务结束时 `swift test` 必须全绿（当前 126 个）。
+- Swift Core 回归：每个动到 `Sources/`、`Package.swift` 的任务结束时 `swift test` 必须全绿。
 - 生成物不手改：`ios/AgentDeckMobile/DesignTokens.swift` 由 `designs/agentdeck-design-system/tools/build.mjs` 生成。
 - `ios/AgentDeckMobile.xcodeproj/`、`ios/AgentDeckMobile/Info.plist` 是 xcodegen 生成物，不入库（加 .gitignore）。
 - 提交信息不加 co-author；文档一律中文。
@@ -779,8 +787,8 @@ protocol MobileSessionSource: AnyObject {
 import Foundation
 import AgentDeckCore
 
-/// iOS 端唯一数据入口。本期唯一实现是 FixtureSessionSource（bundle 内
-/// JSON 回放）；R2 Relay 就绪后新增 RelaySessionSource，视图层不动。
+/// iOS 端唯一数据入口。当前唯一实现是 FixtureSessionSource（bundle 内
+/// JSON 回放）；真实数据源不在本轮范围内。
 @MainActor
 protocol MobileSessionSource: AnyObject {
     func machines() -> AsyncStream<[MachineSummary]>
@@ -1162,7 +1170,7 @@ git commit -m "feat(ios): MobileSessionSource 协议与 FixtureSessionSource 回
 - Consumes: `MobileSessionSource.machines()`
 - Produces:
   - `@MainActor final class MachineListViewModel { init(source: MobileSessionSource); private(set) var machines: [MachineSummary]; var onUpdate: (() -> Void)?; func start() }`
-  - `final class MachineListViewController: UIViewController { init(source: MobileSessionSource) }`（右上角两个 bar button：收件箱、配对，Task 14 前先留空动作）
+  - `final class MachineListViewController: UIViewController { init(source: MobileSessionSource) }`（右上角收件箱入口，Task 14 前先留空动作）
   - `final class MobileEmptyStateView: UIView { init(title: String, subtitle: String?); func update(title:subtitle:) }`
 
 - [ ] **Step 1: 失败测试**
@@ -1277,7 +1285,7 @@ final class MachineListViewController: UIViewController {
     private let viewModel: MachineListViewModel
     private var collectionView: UICollectionView!
     private var dataSource: UICollectionViewDiffableDataSource<Int, String>!
-    private let emptyView = MobileEmptyStateView(title: "还没有机器", subtitle: "用右上角「配对」把 Mac 接入")
+    private let emptyView = MobileEmptyStateView(title: "fixture 中没有机器", subtitle: "检查 ios/Fixtures/deck.json")
 
     init(source: MobileSessionSource) {
         self.source = source
@@ -1291,12 +1299,9 @@ final class MachineListViewController: UIViewController {
         super.viewDidLoad()
         title = "AgentDeck"
         view.backgroundColor = DesignTokens.bg
-        navigationItem.rightBarButtonItems = [
-            UIBarButtonItem(image: UIImage(systemName: "qrcode.viewfinder"), style: .plain,
-                            target: self, action: #selector(openPairing)),
-            UIBarButtonItem(image: UIImage(systemName: "tray"), style: .plain,
-                            target: self, action: #selector(openInbox)),
-        ]
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            image: UIImage(systemName: "tray"), style: .plain,
+            target: self, action: #selector(openInbox))
         configureCollectionView()
         view.addSubview(emptyView)
         emptyView.translatesAutoresizingMaskIntoConstraints = false
@@ -1367,7 +1372,6 @@ final class MachineListViewController: UIViewController {
         emptyView.isHidden = !viewModel.machines.isEmpty
     }
 
-    @objc private func openPairing() { /* Task 14 接 PairingViewController */ }
     @objc private func openInbox() { /* Task 14 接 InboxViewController */ }
 }
 
@@ -2423,18 +2427,16 @@ git commit -m "feat(ios): prompt 输入栏与乐观插入"
 
 ---
 
-### Task 14: 配对屏与收件箱
+### Task 14: 收件箱
 
 **Files:**
-- Create: `ios/AgentDeckMobile/Screens/Pairing/PairingViewController.swift`
 - Create: `ios/AgentDeckMobile/Screens/Inbox/InboxViewController.swift`、`ios/AgentDeckMobile/Screens/Inbox/InboxViewModel.swift`
-- Modify: `MachineListViewController.swift`（接上两个入口）
+- Modify: `MachineListViewController.swift`（接上收件箱入口）
 - Test: `ios/AgentDeckMobileTests/InboxViewModelTests.swift`
 
 **Interfaces:**
 - Consumes: `MobileSessionSource.inbox()`
 - Produces:
-  - `PairingViewController()`：modal（包 UINavigationController），扫码占位 + 粘贴配对码 + 已配对设备列表（内存假数据）+ 逐行「撤销」
   - `@MainActor final class InboxViewModel { init(source: MobileSessionSource); private(set) var items: [InboxItem]; var onUpdate: (() -> Void)?; func start() }`
   - `InboxViewController(source:)`：列表 + 点击跳会话详情
 
@@ -2478,104 +2480,9 @@ func kindLabel(_ kind: InboxItem.Kind) -> (text: String, symbol: String) {
 
 didSelect：`navigationController?.pushViewController(SessionDetailViewController(source: source, sessionID: item.sessionID, title: item.title), animated: true)`。
 
-`PairingViewController.swift`：
+`MachineListViewController` 接通收件箱入口：
 
 ```swift
-import UIKit
-
-/// 全假数据的配对骨架：扫码区域是占位（相机与真实配对在 Relay/R2 后接入）。
-final class PairingViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
-    private struct PairedDevice { let id: String; let name: String }
-    private var devices: [PairedDevice] = [.init(id: "dev-1", name: "Mac Studio · agentdeckd")]
-    private let codeField = UITextField()
-    private let tableView = UITableView(frame: .zero, style: .insetGrouped)
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        title = "配对"
-        view.backgroundColor = DesignTokens.bg
-        navigationItem.leftBarButtonItem = UIBarButtonItem(systemItem: .close, primaryAction:
-            UIAction { [weak self] _ in self?.dismiss(animated: true) })
-
-        let scanPlaceholder = UIView()
-        scanPlaceholder.layer.borderWidth = 2
-        scanPlaceholder.layer.borderColor = DesignTokens.fgMuted.cgColor
-        scanPlaceholder.layer.cornerRadius = DesignTokens.radiusLg
-        let scanLabel = UILabel()
-        scanLabel.text = "扫码配对\n（实机功能后置）"
-        scanLabel.numberOfLines = 0
-        scanLabel.textAlignment = .center
-        scanLabel.textColor = DesignTokens.fgMuted
-        scanLabel.translatesAutoresizingMaskIntoConstraints = false
-        scanPlaceholder.addSubview(scanLabel)
-
-        codeField.placeholder = "或粘贴配对码"
-        codeField.borderStyle = .roundedRect
-        let pairButton = UIButton(configuration: .filled())
-        pairButton.setTitle("配对", for: .normal)
-        pairButton.addAction(UIAction { [weak self] _ in self?.pairFromCode() }, for: .touchUpInside)
-        let codeRow = UIStackView(arrangedSubviews: [codeField, pairButton])
-        codeRow.spacing = DesignTokens.sp2
-
-        tableView.dataSource = self
-        tableView.delegate = self
-        tableView.register(UITableViewCell.self, forCellReuseIdentifier: "device")
-
-        let stack = UIStackView(arrangedSubviews: [scanPlaceholder, codeRow, tableView])
-        stack.axis = .vertical
-        stack.spacing = DesignTokens.sp4
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
-        NSLayoutConstraint.activate([
-            scanPlaceholder.heightAnchor.constraint(equalToConstant: 180),
-            scanLabel.centerXAnchor.constraint(equalTo: scanPlaceholder.centerXAnchor),
-            scanLabel.centerYAnchor.constraint(equalTo: scanPlaceholder.centerYAnchor),
-            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: DesignTokens.sp4),
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: DesignTokens.sp4),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -DesignTokens.sp4),
-            stack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
-        ])
-    }
-
-    private func pairFromCode() {
-        guard let code = codeField.text, !code.isEmpty else { return }
-        devices.append(.init(id: UUID().uuidString, name: "机器 \(code.prefix(6))"))
-        codeField.text = ""
-        tableView.reloadData()
-    }
-
-    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { devices.count }
-
-    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "device", for: indexPath)
-        var content = cell.defaultContentConfiguration()
-        content.text = devices[indexPath.row].name
-        content.secondaryText = "已配对"
-        cell.contentConfiguration = content
-        return cell
-    }
-
-    func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? { "已配对设备" }
-
-    func tableView(_ tableView: UITableView,
-                   trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
-        let revoke = UIContextualAction(style: .destructive, title: "撤销") { [weak self] _, _, done in
-            self?.devices.remove(at: indexPath.row)
-            self?.tableView.deleteRows(at: [indexPath], with: .automatic)
-            done(true)
-        }
-        return UISwipeActionsConfiguration(actions: [revoke])
-    }
-}
-```
-
-`MachineListViewController` 的两个占位 action 接通：
-
-```swift
-@objc private func openPairing() {
-    present(UINavigationController(rootViewController: PairingViewController()), animated: true)
-}
-
 @objc private func openInbox() {
     navigationController?.pushViewController(InboxViewController(source: source), animated: true)
 }
@@ -2583,11 +2490,11 @@ final class PairingViewController: UIViewController, UITableViewDataSource, UITa
 
 - [ ] **Step 3: 测试 + 目检 + Commit**
 
-Run: `xcodebuild ... test` → `** TEST SUCCEEDED **`；模拟器：收件箱有 1 条「等待审批」，点击跳详情；配对屏可粘贴假码新增设备并左滑撤销。
+Run: `xcodebuild ... test` → `** TEST SUCCEEDED **`；模拟器：收件箱有 1 条「等待审批」，点击可进入会话详情。
 
 ```bash
 git add ios/AgentDeckMobile/Screens ios/AgentDeckMobileTests/InboxViewModelTests.swift
-git commit -m "feat(ios): 配对屏骨架与收件箱"
+git commit -m "feat(ios): 收件箱"
 ```
 
 ---
@@ -2620,7 +2527,7 @@ cd ios && xcodegen generate && \
 「项目边界」追加一条：
 
 ```markdown
-- `Sources/AgentDeckCore/` 是 macOS/iOS 共享的平台无关层，禁止 import AppKit/UIKit；`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是 `MobileSessionSource`，本期不含网络代码（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
+- `Sources/AgentDeckCore/` 是 iOS 使用的平台无关 Swift 层，禁止 import AppKit/UIKit；`ios/` 是 fixture 驱动的 UIKit companion 前端，唯一数据入口是 `MobileSessionSource`，本期不含网络代码（设计见 `docs/plans/2026-07-03-ios-uikit-frontend-design.md`）。
 ```
 
 - [ ] **Step 2: README.md 增加 iOS 小节**（位置放在 macOS 构建说明之后；内容：companion 定位一句、`ios/` 目录说明、xcodegen 依赖、上面同款构建命令、fixture 模式说明一句）
@@ -2649,6 +2556,6 @@ git commit -m "docs: iOS UIKit 前端收口（验证入口 + 边界 + README）"
 - [ ] Codex 与 Claude Code 两条会话流均能流式回放，折叠元素可展开
 - [ ] 审批卡可 approve / deny，卡片状态变化且流继续，会话分组同步
 - [ ] prompt 输入后用户消息乐观出现，假响应回流
-- [ ] 配对屏与收件箱骨架可进入、可返回
+- [ ] 收件箱骨架可进入、可返回
 - [ ] `swift test` 全绿（macOS 无回归）、iOS 单测全绿、`scripts/verify-agent-docs.sh` 通过
 - [ ] `Sources/AgentDeckCore/` 无 AppKit/UIKit import；`ios/` 无 SwiftUI import；渲染路径无 agentKind 分支

@@ -1,7 +1,7 @@
 import XCTest
-import AgentDeckCore
+import AgentDeckMobileCore
 
-final class CoreLinkTests: XCTestCase {
+final class MobileCoreLinkTests: XCTestCase {
     func testServerEventDecodesOnIOS() throws {
         let json = #"{"type":"sessionStarted","sessionId":"s1","threadId":null,"agentKind":"codex"}"#
         let event = try JSONDecoder().decode(ServerEvent.self, from: Data(json.utf8))

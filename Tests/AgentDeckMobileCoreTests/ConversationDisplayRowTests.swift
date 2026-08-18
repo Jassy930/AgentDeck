@@ -1,5 +1,5 @@
 import XCTest
-import AgentDeckCore
+import AgentDeckMobileCore
 
 // MARK: - Test support
 
