@@ -30,20 +30,21 @@ selfcheck 都必须明确桌面端没有 backend 能力。
 
 Codex 本地 transport 已决定为 `agentdeckd` 直接持有 session-scoped
 `codex app-server --listen stdio://` 子进程；不依赖用户全局 managed daemon/proxy。
-Issue #3 已把该 transport 的 protocol v3 生命周期落到代码：单 owner 持有 child 与
-RPC correlation，完成规范握手、顺序 turn、interrupt、close/wait、Unix 进程组消失确认
-和 stderr pump join。
+Issue #3 已把该 transport 的 session 生命周期落到代码；Issue #4 随后把协议升级为
+v4，并加入带 `turnId`、稳定 `itemId` 与 `streaming|completed` state 的累计 assistant
+message 快照。单 owner 持有 child 与 RPC correlation，完成规范握手、顺序 turn、
+interrupt、close/wait、Unix 进程组消失确认和 stderr pump join。
 RuntimeHub 通过单一有序 worker 处理 lifecycle command，在清除路由后发
 `SessionClosed`；stdin EOF 会 drain 已读命令并关闭 retained session，cleanup 无法确认则
-poison 并退出 daemon。desktop 解锁门禁仍未通过：#4 streaming/item identity、#5 持久
-连接 CLI 与真实 vendor E2E、#6 RunRecord/diagnostics 尚未收口，现状以
+poison 并退出 daemon。desktop 解锁门禁仍未通过：#5 持久连接 CLI 与真实 vendor E2E、
+#6 RunRecord/diagnostics 尚未收口，现状以
 `docs/AGENTDECKD_STATUS.md` 为准。
 
 ## 分层边界
 
 - `agentdeck-desktop/`：macOS GPUI executable。当前只负责窗口、组件根节点和桌面 selfcheck；不得解析 vendor JSON。
 - `Sources/AgentDeckMobileCore/`：iOS 使用的平台无关 Swift 模型，禁止 import AppKit/UIKit。
-- `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 3，`protocol_schema()` 聚合本地 v3 类型。
+- `agentdeck-protocol/`：本地 IPC 协议事实源 crate。分 trunk / capabilities / vendor 三个模块，`PROTOCOL_VERSION` = 4，`protocol_schema()` 聚合本地 v4 类型。
 - `agentdeckd/src/ipc.rs`：re-export `agentdeck-protocol::*` 壳，保持 daemon 内 `crate::ipc::X` 引用不变。
 - `agentdeckd/src/agent.rs`：`Agent` trait + `AgentKind` 枚举。两个 adapter 共享的逻辑在此，不得让 adapter 相互引用。
 - `agentdeckd/src/runtime/`：`RuntimeHub`（stdin loop + stdout writer）+ `AgentRouter`（sessionId → agentKind → adapter）。
@@ -123,10 +124,12 @@ agentdeck-cli（参考客户端 / E2E 驱动，与 GUI 互相独立）
 
 `agentdeck-protocol` crate 是 IPC 协议的唯一事实源：
 
-- `PROTOCOL_VERSION`：当前为 3。v3 引入 caller-owned `sessionId` / `turnId`、显式
-  `TurnStart` / `TurnCancel` / `SessionClose` 和两级 terminal；`TurnComplete` 暂只保留给
-  尚未迁移的 Claude Code 路径。
-- `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v3 公共类型。
+- `PROTOCOL_VERSION`：当前为 4。v3 引入 caller-owned `sessionId` / `turnId`、显式
+  `TurnStart` / `TurnCancel` / `SessionClose` 和两级 terminal；v4 为每个
+  `ServerEvent::AgentItem` 增加必填 `turnId`、稳定 `itemId` 与
+  `state=streaming|completed`。客户端按 `itemId` 替换累计快照，不拼接 vendor delta。
+  `TurnComplete` 暂只保留给尚未迁移的 Claude Code 路径。
+- `protocol_schema()`：schemars 从 Rust 类型派生的 JSON Schema，聚合所有 v4 公共类型。
 - 快照：`protocol/agentdeck/agentdeck-protocol.schema.json`（`UPDATE_SCHEMA=1 cargo test -p agentdeck-protocol schema_matches_committed_snapshot` 重生成）。
 - 漂移测试随 `cargo test` 运行。
 - 中立性测试（`neutrality_tests.rs`）守护 N1/N4。

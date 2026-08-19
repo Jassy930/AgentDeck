@@ -14,7 +14,6 @@ final class SessionDetailViewModel {
     private(set) var isStreaming = true
     var onUpdate: (() -> Void)?
     private var store = AgentItemStore()
-    private var autoItemSeq = 0
     private var task: Task<Void, Never>?
 
     init(source: MobileSessionSource, sessionID: String) {
@@ -51,8 +50,9 @@ final class SessionDetailViewModel {
 
     func sendPrompt(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty, !isStreaming else { return }
         isStreaming = true
+        onUpdate?()
         Task { [weak self] in
             guard let self else { return }
             await source.sendPrompt(sessionID: sessionID, text: trimmed)
@@ -65,9 +65,8 @@ final class SessionDetailViewModel {
     private func handle(_ element: SessionStreamElement) {
         var needsUpdate = true
         switch element.event {
-        case .agentItem(_, _, _, let item):
-            let itemId = element.itemId ?? nextAutoItemId()
-            AgentItemReducer.apply(item, itemId: itemId, into: &store)
+        case .agentItem(_, _, _, _, let itemId, let state, let item):
+            AgentItemReducer.apply(item, itemId: itemId, state: state, into: &store)
         case .actionRequest(_, _, _, let request):
             pendingApproval = request
             approvalState = .pending
@@ -93,11 +92,6 @@ final class SessionDetailViewModel {
         if needsUpdate {
             onUpdate?()
         }
-    }
-
-    private func nextAutoItemId() -> String {
-        autoItemSeq += 1
-        return "auto-\(autoItemSeq)"
     }
 
     deinit { task?.cancel() }

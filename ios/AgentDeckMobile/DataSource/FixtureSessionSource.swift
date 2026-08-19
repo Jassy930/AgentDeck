@@ -8,6 +8,7 @@ final class FixtureSessionSource: MobileSessionSource {
         var transcript: [SessionStreamElement] = []
         var subscribers: [UUID: AsyncStream<SessionStreamElement>.Continuation] = [:]
         var approvalGate: CheckedContinuation<Void, Never>?
+        var threadId: String?
         var started = false
         var finished = false
     }
@@ -130,27 +131,57 @@ final class FixtureSessionSource: MobileSessionSource {
         guard let session = sessionRows.first(where: { $0.id == sessionID }) else { return }
         promptSeq += 1
         let seq = promptSeq
-        playback.finished = false
         let kind = session.agentKind
-        let threadId = "t-prompt-\(seq)"
+        guard let threadId = playback.threadId else {
+            assertionFailure("session \(sessionID) 尚未收到带 threadId 的 SessionStarted")
+            return
+        }
+        playback.finished = false
+        let turnId = "turn-prompt-\(seq)"
+        if kind == .codex {
+            emit(SessionStreamElement(
+                event: .turnStarted(
+                    sessionId: sessionID,
+                    threadId: threadId,
+                    agentKind: kind,
+                    turnId: turnId
+                )
+            ), sessionID: sessionID, playback: playback)
+        }
         emit(SessionStreamElement(
-            itemId: "prompt-user-\(seq)",
             event: .agentItem(sessionId: sessionID, threadId: threadId, agentKind: kind,
+                              turnId: turnId, itemId: "prompt-user-\(seq)", state: .completed,
                               item: .userMessage(text: text, meta: AgentItemMeta()))
         ), sessionID: sessionID, playback: playback)
         let reply = "（fixture 回声）收到：\(text)。真实链路接入后此处为 agent 输出。"
         await sleepTicks(600)
         emit(SessionStreamElement(
-            itemId: "prompt-reply-\(seq)",
             event: .agentItem(sessionId: sessionID, threadId: threadId, agentKind: kind,
+                              turnId: turnId, itemId: "prompt-reply-\(seq)", state: .completed,
                               item: .assistantMessage(text: reply, meta: AgentItemMeta()))
         ), sessionID: sessionID, playback: playback)
         await sleepTicks(200)
-        emit(SessionStreamElement(
-            itemId: nil,
-            event: .turnComplete(sessionId: sessionID, threadId: threadId, agentKind: kind,
-                                 summary: TurnSummary(elapsedMs: 800))
-        ), sessionID: sessionID, playback: playback)
+        let terminal: ServerEvent = switch kind {
+        case .codex:
+            .turnFinished(
+                sessionId: sessionID,
+                threadId: threadId,
+                agentKind: kind,
+                turnId: turnId,
+                outcome: .succeeded,
+                nextState: .ready,
+                summary: TurnSummary(elapsedMs: 800),
+                error: nil
+            )
+        case .claudeCode:
+            .turnComplete(
+                sessionId: sessionID,
+                threadId: threadId,
+                agentKind: kind,
+                summary: TurnSummary(elapsedMs: 800)
+            )
+        }
+        emit(SessionStreamElement(event: terminal), sessionID: sessionID, playback: playback)
         appendInbox(.init(id: "inbox-turn-\(sessionID)-\(seq)", sessionID: sessionID,
                           machineID: session.machineID, kind: .turnCompleted, title: session.title))
         // sendPrompt 发完后标记完成，允许当前订阅者及后续二次订阅拿到完整 transcript。
@@ -183,11 +214,17 @@ final class FixtureSessionSource: MobileSessionSource {
             playback.finished = true
             return
         }
+        if playback.threadId == nil {
+            playback.threadId = steps.lazy.compactMap { step -> String? in
+                guard case let .sessionStarted(_, threadId, _) = step.event else { return nil }
+                return threadId
+            }.first
+        }
         Task { [weak self] in
             for step in steps {
                 await self?.sleepTicks(step.delayMs)
                 guard let self else { return }
-                self.emit(SessionStreamElement(itemId: step.itemId, event: step.event),
+                self.emit(SessionStreamElement(event: step.event),
                           sessionID: sessionID, playback: playback)
                 self.noteSideEffects(of: step.event, sessionID: sessionID)
                 if step.awaitApproval == true {
@@ -203,6 +240,9 @@ final class FixtureSessionSource: MobileSessionSource {
     }
 
     private func emit(_ element: SessionStreamElement, sessionID: String, playback: Playback) {
+        if case let .sessionStarted(_, threadId?, _) = element.event {
+            playback.threadId = playback.threadId ?? threadId
+        }
         playback.transcript.append(element)
         for cont in playback.subscribers.values { cont.yield(element) }
     }
@@ -219,9 +259,11 @@ final class FixtureSessionSource: MobileSessionSource {
                                         machineID: session.machineID, kind: .waitingApproval, title: session.title))
             }
             broadcastState()
-        case .turnComplete:
-            appendInbox(.init(id: "inbox-done-\(sessionID)", sessionID: sessionID,
-                              machineID: session.machineID, kind: .turnCompleted, title: session.title))
+        case .turnComplete, .turnFinished:
+            if session.group != .recent {
+                appendInbox(.init(id: "inbox-done-\(sessionID)", sessionID: sessionID,
+                                  machineID: session.machineID, kind: .turnCompleted, title: session.title))
+            }
         case .error:
             if let index = sessionRows.firstIndex(where: { $0.id == sessionID }) {
                 sessionRows[index].group = .recent

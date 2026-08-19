@@ -14,7 +14,8 @@
 
 ## actionDecision wire 形态
 
-`ActionDecision` 是 protocol v3 `ClientCommand` 的 typed variant，并包含在 schema：
+`ActionDecision` 自 protocol v3 起就是 `ClientCommand` 的 typed variant；当前 protocol
+v4 继续保留该 wire 形态，并包含在 schema：
 
 ```json
 {
@@ -46,6 +47,10 @@ v0.2 引入了严格的两层协议结构：
 
 每条主干事件必须带 `agentKind` 字段（K4 升级）。`SessionCapabilities` 必须
 先于该 session 的任何 `AgentItem`（N7 不变量）。
+
+protocol v4 的每个 `AgentItem` envelope 还必须带 `turnId`、稳定 `itemId` 和
+`state=streaming|completed`。同一个 `itemId` 的后续事件是截至当前的完整快照，客户端
+按 ID 替换；不得把它重新当作裸 delta 拼接。
 
 ### Layer B — Vendor 控件命名空间
 

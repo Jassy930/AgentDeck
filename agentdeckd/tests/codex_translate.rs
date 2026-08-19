@@ -1,4 +1,4 @@
-//! Integration tests for `CodexTranslator` — verify the v2 wire shape
+//! Integration tests for `CodexTranslator` — verify the v4 wire shape
 //! produced by the translator, end-to-end via the public `translate_line`
 //! entry point (the same surface Task 3B's `CodexAdapter` will call).
 //!
@@ -7,25 +7,30 @@
 //! by replaying realistic short Codex turn sequences.
 
 use agentdeck_protocol::{
-    ActionKind, ActionRequestVendor, AgentItem, AgentKind, CodexApprovalPolicy, CodexSandboxMode,
-    DiffStatus, ServerEvent, SessionId, ShellStatus, ThreadId,
+    ActionKind, ActionRequestVendor, AgentItem, AgentItemState, AgentKind, CodexApprovalPolicy,
+    CodexSandboxMode, DiffStatus, ServerEvent, SessionId, ShellStatus, ThreadId, TurnId,
 };
 use agentdeckd::codex::translate::CodexTranslator;
+
+const CLIENT_TURN_ID: &str = "client-turn-1";
+const VENDOR_TURN_ID: &str = "vendor-turn-1";
 
 fn new_translator() -> CodexTranslator {
     let mut t = CodexTranslator::new(SessionId("session-test".into()), None);
     t.set_thread_id(ThreadId("thread-1".into()));
+    t.begin_turn(TurnId(CLIENT_TURN_ID.into()));
+    t.set_vendor_turn_id(VENDOR_TURN_ID);
     t
 }
 
 #[test]
-fn fixture_replay_basic_assistant_message_emits_one_cumulative_item() {
+fn fixture_replay_basic_assistant_message_emits_cumulative_snapshots() {
     let mut t = new_translator();
     let lines = vec![
-        r#"{"method":"item/started","params":{"item":{"id":"msg1","type":"agentMessage","text":""},"threadId":"thread-1"}}"#,
-        r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg1","delta":"Hel","threadId":"thread-1"}}"#,
-        r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg1","delta":"lo!","threadId":"thread-1"}}"#,
-        r#"{"method":"item/completed","params":{"item":{"id":"msg1","type":"agentMessage","text":"Hello!"},"threadId":"thread-1"}}"#,
+        r#"{"method":"item/started","params":{"item":{"id":"msg1","type":"agentMessage","text":""},"threadId":"thread-1","turnId":"vendor-turn-1"}}"#,
+        r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg1","delta":"Hel","threadId":"thread-1","turnId":"vendor-turn-1"}}"#,
+        r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg1","delta":"lo!","threadId":"thread-1","turnId":"vendor-turn-1"}}"#,
+        r#"{"method":"item/completed","params":{"item":{"id":"msg1","type":"agentMessage","text":"Hello!"},"threadId":"thread-1","turnId":"vendor-turn-1"}}"#,
     ];
     let mut events = Vec::new();
     for l in lines {
@@ -43,23 +48,31 @@ fn fixture_replay_basic_assistant_message_emits_one_cumulative_item() {
             )
         })
         .collect();
-    assert_eq!(
-        messages.len(),
-        1,
-        "expected exactly one cumulative AssistantMessage emit; got {events:?}"
-    );
-    if let ServerEvent::AgentItem {
-        item: AgentItem::AssistantMessage { text, .. },
-        agent_kind,
-        thread_id,
-        session_id,
-        ..
-    } = messages[0]
-    {
-        assert_eq!(text, "Hello!");
-        assert_eq!(*agent_kind, AgentKind::Codex);
-        assert_eq!(thread_id.0, "thread-1");
-        assert_eq!(session_id.0, "session-test");
+    assert_eq!(messages.len(), 3, "expected 2 streaming + 1 completed");
+    let expected = [
+        ("Hel", AgentItemState::Streaming),
+        ("Hello!", AgentItemState::Streaming),
+        ("Hello!", AgentItemState::Completed),
+    ];
+    for (event, (expected_text, expected_state)) in messages.into_iter().zip(expected) {
+        if let ServerEvent::AgentItem {
+            item: AgentItem::AssistantMessage { text, .. },
+            agent_kind,
+            thread_id,
+            session_id,
+            turn_id,
+            item_id,
+            state,
+        } = event
+        {
+            assert_eq!(text, expected_text);
+            assert_eq!(*agent_kind, AgentKind::Codex);
+            assert_eq!(thread_id.0, "thread-1");
+            assert_eq!(session_id.0, "session-test");
+            assert_eq!(turn_id.0, CLIENT_TURN_ID);
+            assert_eq!(item_id, "msg1");
+            assert_eq!(*state, expected_state);
+        }
     }
 }
 
@@ -68,11 +81,11 @@ fn fixture_replay_full_shell_turn() {
     let mut t = new_translator();
     let lines = vec![
         r#"{"method":"thread/started","params":{"threadId":"thread-1"}}"#,
-        r#"{"method":"turn/started","params":{"threadId":"thread-1","turnId":"turn-1"}}"#,
-        r#"{"method":"item/started","params":{"item":{"id":"sh1","type":"commandExecution","command":"echo hi"},"threadId":"thread-1"}}"#,
-        r#"{"method":"item/commandExecution/outputDelta","params":{"itemId":"sh1","deltaBase64":"aGk=","threadId":"thread-1"}}"#,
-        r#"{"method":"item/completed","params":{"item":{"id":"sh1","type":"commandExecution","command":"echo hi","status":"completed","exitCode":0,"durationMs":5,"aggregatedOutput":"hi"},"threadId":"thread-1"}}"#,
-        r#"{"method":"turn/completed","params":{"threadId":"thread-1","durationMs":42,"usage":{"inputTokens":5,"outputTokens":7}}}"#,
+        r#"{"method":"turn/started","params":{"threadId":"thread-1","turnId":"vendor-turn-1"}}"#,
+        r#"{"method":"item/started","params":{"item":{"id":"sh1","type":"commandExecution","command":"echo hi"},"threadId":"thread-1","turnId":"vendor-turn-1"}}"#,
+        r#"{"method":"item/commandExecution/outputDelta","params":{"itemId":"sh1","deltaBase64":"aGk=","threadId":"thread-1","turnId":"vendor-turn-1"}}"#,
+        r#"{"method":"item/completed","params":{"item":{"id":"sh1","type":"commandExecution","command":"echo hi","status":"completed","exitCode":0,"durationMs":5,"aggregatedOutput":"hi"},"threadId":"thread-1","turnId":"vendor-turn-1"}}"#,
+        r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"vendor-turn-1","status":"completed"}}}"#,
     ];
     let mut events = Vec::new();
     for l in lines {
@@ -82,8 +95,8 @@ fn fixture_replay_full_shell_turn() {
     //   - 1 SessionStarted (from thread/started)
     //   - 1 AgentItem(Shell, Running) on item/started
     //   - 1 AgentItem(Shell, Completed) on item/completed
-    //   - 1 TurnComplete
-    // turn/started + commandExecution/outputDelta emit nothing.
+    // turn/started + commandExecution/outputDelta + turn/completed emit
+    // nothing here; the session owner alone emits TurnFinished.
     let kinds: Vec<&str> = events
         .iter()
         .map(|e| match e {
@@ -107,18 +120,12 @@ fn fixture_replay_full_shell_turn() {
                 } => "Shell(Canceled)",
                 _ => "AgentItem(other)",
             },
-            ServerEvent::TurnComplete { .. } => "TurnComplete",
             _ => "other",
         })
         .collect();
     assert_eq!(
         kinds,
-        vec![
-            "SessionStarted",
-            "Shell(Running)",
-            "Shell(Completed)",
-            "TurnComplete"
-        ],
+        vec!["SessionStarted", "Shell(Running)", "Shell(Completed)"],
         "shell turn event sequence drifted: {events:?}"
     );
 }
@@ -168,7 +175,7 @@ fn fixture_replay_approval_request_with_codex_vendor_block() {
 fn fixture_replay_unknown_item_type_falls_back_to_raw_not_silently_dropped() {
     let mut t = new_translator();
     let events = t.translate_line(
-        r#"{"method":"item/completed","params":{"item":{"id":"x","type":"someBrandNewCodexThing","vendorSecret":"hidden"}}}"#,
+        r#"{"method":"item/completed","params":{"turnId":"vendor-turn-1","threadId":"thread-1","item":{"id":"x","type":"someBrandNewCodexThing","vendorSecret":"hidden"}}}"#,
     );
     assert_eq!(events.len(), 1);
     match &events[0] {
@@ -198,9 +205,11 @@ fn fixture_replay_subagent_activity_is_visible_once_after_started_completed_pair
     let mut t = new_translator();
     let item = r#"{"id":"activity-1","type":"subAgentActivity","kind":"started","agentThreadId":"child-1","agentPath":"/root/tool_ui_trace"}"#;
     let lines = [
-        format!(r#"{{"method":"item/started","params":{{"item":{item},"threadId":"thread-1"}}}}"#),
         format!(
-            r#"{{"method":"item/completed","params":{{"item":{item},"threadId":"thread-1"}}}}"#
+            r#"{{"method":"item/started","params":{{"item":{item},"threadId":"thread-1","turnId":"vendor-turn-1"}}}}"#
+        ),
+        format!(
+            r#"{{"method":"item/completed","params":{{"item":{item},"threadId":"thread-1","turnId":"vendor-turn-1"}}}}"#
         ),
     ];
     let events: Vec<_> = lines
@@ -236,7 +245,7 @@ fn fixture_replay_subagent_activity_is_visible_once_after_started_completed_pair
 
     let mut completed_only = new_translator();
     let events = completed_only.translate_line(&format!(
-        r#"{{"method":"item/completed","params":{{"item":{item},"threadId":"thread-1"}}}}"#
+        r#"{{"method":"item/completed","params":{{"item":{item},"threadId":"thread-1","turnId":"vendor-turn-1"}}}}"#
     ));
     assert_eq!(
         events.len(),
@@ -257,9 +266,9 @@ fn fixture_replay_context_compaction_is_a_neutral_activity_not_raw_error() {
     let mut t = new_translator();
     let item = r#"{"id":"compact-1","type":"contextCompaction"}"#;
     let events = [
-        format!(r#"{{"method":"item/started","params":{{"item":{item},"threadId":"thread-1"}}}}"#),
+        format!(r#"{{"method":"item/started","params":{{"item":{item},"threadId":"thread-1","turnId":"vendor-turn-1"}}}}"#),
         format!(
-            r#"{{"method":"item/completed","params":{{"item":{item},"threadId":"thread-1"}}}}"#
+            r#"{{"method":"item/completed","params":{{"item":{item},"threadId":"thread-1","turnId":"vendor-turn-1"}}}}"#
         ),
     ]
     .iter()
@@ -297,8 +306,8 @@ fn fixture_replay_malformed_line_yields_error_event_with_session_id() {
 fn fixture_replay_file_change_emits_diff_with_per_file_status() {
     let mut t = new_translator();
     let lines = vec![
-        r#"{"method":"item/started","params":{"item":{"id":"f1","type":"fileChange"}}}"#,
-        r#"{"method":"item/completed","params":{"item":{"id":"f1","type":"fileChange","changes":[{"path":"src/a.rs","diff":"+a\n","kind":"add"},{"path":"src/b.rs","diff":"-b\n","kind":"delete"},{"path":"src/c.rs","diff":"+c\n","kind":"update"}]}}}"#,
+        r#"{"method":"item/started","params":{"turnId":"vendor-turn-1","threadId":"thread-1","item":{"id":"f1","type":"fileChange"}}}"#,
+        r#"{"method":"item/completed","params":{"turnId":"vendor-turn-1","threadId":"thread-1","item":{"id":"f1","type":"fileChange","changes":[{"path":"src/a.rs","diff":"+a\n","kind":"add"},{"path":"src/b.rs","diff":"-b\n","kind":"delete"},{"path":"src/c.rs","diff":"+c\n","kind":"update"}]}}}"#,
     ];
     let mut events = Vec::new();
     for l in lines {

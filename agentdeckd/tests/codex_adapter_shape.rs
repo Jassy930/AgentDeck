@@ -1,14 +1,14 @@
 //! Shape / contract tests for `CodexAdapter`.
 //!
-//! These verify the v3 `Agent` trait wiring without spawning a real
+//! These verify the v4 `Agent` trait wiring without spawning a real
 //! `codex app-server` (the optional real-codex test below requires both
 //! `AGENTDECK_E2E=1` and a binary on PATH). The goal is a fast unit-style
 //! safety net for Task 3B's adapter that:
 //!
 //!   1. Confirms the adapter is `dyn Agent`-compatible (Send + Sync +
 //!      'static + the right method set).
-//!   2. Confirms its pre-M0 capability claim stays empty until the
-//!      corresponding lifecycle/streaming gates are accepted.
+//!   2. Confirms it claims only the cumulative assistant streaming surface
+//!      accepted by Issue #4.
 //!   3. Confirms it rejects wrong-vendor `VendorSessionOptions` /
 //!      `VendorControlPayload` with structured errors (N4 / N5 guard).
 //!   4. Confirms live commands reject an unknown session id while legacy
@@ -31,11 +31,14 @@ fn codex_adapter_impls_agent_trait() {
 }
 
 #[test]
-fn capabilities_do_not_claim_unaccepted_features() {
+fn capabilities_claim_only_verified_message_streaming() {
     let a = CodexAdapter::new_for_test();
     let caps = a.capabilities();
     assert_eq!(caps.agent_kind, AgentKind::Codex);
-    assert!(caps.features.is_empty());
+    assert_eq!(
+        caps.features,
+        [CapabilityId::StreamingMessages].into_iter().collect()
+    );
 }
 
 #[tokio::test]

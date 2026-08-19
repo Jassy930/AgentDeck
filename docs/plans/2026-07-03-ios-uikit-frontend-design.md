@@ -165,7 +165,7 @@ iOS 单测重点：
 
 实现阶段与本设计的差异如下，均属有意决策：
 
-1. **FixtureSessionSource 状态保持**：`FixtureSessionSource` 在内存中维护完整 transcript 缓冲区（`Playback.transcript`），切屏返回时新订阅者立即收到全量 transcript 回放，与设计文档「切屏返回状态保持」一致。prompt 回声后流式 `turnComplete` 正常收尾，回放 transcript 不截断。
+1. **FixtureSessionSource 状态保持与 terminal 边界**：`FixtureSessionSource` 在内存中维护完整 transcript 缓冲区（`Playback.transcript`），切屏返回时新订阅者立即收到全量 transcript 回放，与设计文档「切屏返回状态保持」一致。bundle fixture 均先发 `SessionStarted` 与 `SessionCapabilities`；Codex turn 按 protocol v4 使用同一 thread 的 `TurnStarted → AgentItem* → TurnFinished`，prompt 回声也复用该 thread。Claude Code 当前实现仍以 legacy `TurnComplete` 收尾，待其 session owner 迁移后再切换。输入栏按 `isStreaming` 禁用，ViewModel 同时拒绝重入，避免同 session 出现重叠 fixture turn；回放 transcript 不截断。
 2. **DesignTokens 实名**：iOS `DesignTokens.swift` 生成的语义色实名为 `text`、`text2`、`surface`（来自设计 SSOT `tokens.json` 的实际 key），设计期草案内文描述曾引用 `fg`/`fgMuted`/`bgRaised` 作为占位名称，以生成物为准。
 3. **强制暗色**：iOS app 在 `SceneDelegate` 中对 `UIWindow` 设置 `overrideUserInterfaceStyle = .dark`，与 macOS 端设计风格一致（纯暗色 token 设计，本期不做明暗切换）。
 4. **VM 未用 @Observable**：实现为普通 `@MainActor` class + `onUpdate` 闭包（UIKit 无自动观察，四屏一致），设计文档 §7 中"每屏一个 `@Observable` view model"的描述属于草案占位，以实现为准。

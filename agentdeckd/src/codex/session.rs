@@ -362,7 +362,6 @@ struct TurnContext {
 struct VendorTerminal {
     vendor_id: String,
     status: String,
-    duration_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -1024,6 +1023,9 @@ impl RunningOwner {
                     }
                 }
                 turn.vendor_id = Some(vendor_turn_id.to_string());
+                if let Some(translator) = &mut self.translator {
+                    translator.set_vendor_turn_id(vendor_turn_id);
+                }
                 self.state = OwnerState::Running;
                 if turn.cancel_requested || turn.close_requested || turn.failure_override.is_some()
                 {
@@ -1106,6 +1108,9 @@ impl RunningOwner {
             } else {
                 turn.vendor_id = Some(vendor_id.to_string());
             }
+            if let Some(translator) = &mut self.translator {
+                translator.set_vendor_turn_id(vendor_id);
+            }
         }
         None
     }
@@ -1153,14 +1158,9 @@ impl RunningOwner {
                 .await,
             );
         };
-        let duration_ms = turn
-            .get("durationMs")
-            .and_then(Value::as_i64)
-            .and_then(|value| u64::try_from(value).ok());
         let terminal = VendorTerminal {
             vendor_id: vendor_id.to_string(),
             status: status.to_string(),
-            duration_ms,
         };
         if matches!(
             self.pending.as_ref().map(|pending| pending.kind),
@@ -1168,6 +1168,9 @@ impl RunningOwner {
         ) {
             if let Some(active) = &mut self.turn {
                 active.pending_terminal = Some(terminal);
+                if let Some(translator) = &mut self.translator {
+                    translator.finish_turn();
+                }
                 return None;
             }
         }
@@ -1221,6 +1224,9 @@ impl RunningOwner {
             failure_override: None,
             pending_terminal: None,
         });
+        if let Some(translator) = &mut self.translator {
+            translator.begin_turn(turn_id.clone());
+        }
         self.state = OwnerState::StartingTurn;
         let _ = self
             .events
@@ -1341,9 +1347,9 @@ impl RunningOwner {
         }
 
         let closing = turn.close_requested;
-        let elapsed_ms = terminal.duration_ms.unwrap_or_else(|| {
-            u64::try_from(turn.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
-        });
+        // The wire value is daemon-owned monotonic time and never uses the
+        // vendor-reported duration.
+        let elapsed_ms = u64::try_from(turn.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let (outcome, error) = if let Some(error) = turn.failure_override.clone() {
             (TurnOutcome::Failed, Some(error))
         } else if closing || turn.cancel_requested {
@@ -1404,6 +1410,11 @@ impl RunningOwner {
         let Some(turn) = self.turn.take() else {
             return;
         };
+        let error = if outcome == TurnOutcome::Failed {
+            error.map(|error| with_diagnostic_ref(error, &self.session_id))
+        } else {
+            error
+        };
         self.pending = None;
         self.close_deadline = None;
         self.interrupt_terminal_deadline = None;
@@ -1413,9 +1424,7 @@ impl RunningOwner {
             OwnerState::Stopping
         };
         if let Some(translator) = &mut self.translator {
-            // Keep the same translator/session identity; Issue #4 adds an
-            // explicit per-turn buffer reset while implementing streaming.
-            let _ = translator.thread_id();
+            translator.finish_turn();
         }
         let Some(thread_id) = self.thread_id.clone() else {
             return;
@@ -1600,7 +1609,9 @@ async fn read_line(reader: &mut BufReader<BoxReader>) -> Result<Option<Value>, P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentdeck_protocol::{CodexSessionOptions, RuntimeOptions, VendorSessionOptions};
+    use agentdeck_protocol::{
+        AgentItem, AgentItemState, CodexSessionOptions, RuntimeOptions, VendorSessionOptions,
+    };
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, DuplexStream, duplex};
@@ -2040,6 +2051,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_orders_cumulative_items_before_terminal_and_ignores_late_frames() {
+        let (connection, mut server_input, mut server_output, cleaned) = test_connection(None);
+        let factory = Arc::new(TestFactory::new(connection));
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let (commands_tx, commands_rx) = mpsc::channel(4);
+        let owner = CodexSessionOwner::new(
+            start(Some(InitialTurn {
+                turn_id: TurnId("turn-stream".into()),
+                prompt: "stream".into(),
+            })),
+            events_tx,
+            commands_rx,
+            factory,
+        );
+        let (late_frames_sent_tx, late_frames_sent_rx) = oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            accept_new_thread_handshake(&mut server_input, &mut server_output).await;
+            let turn_start = read_json(&mut server_input).await;
+            assert_eq!(turn_start["id"], 3);
+            assert_eq!(turn_start["method"], "turn/start");
+            write_json(
+                &mut server_output,
+                json!({"id": 3, "result": {"turn": {"id": "vendor-stream"}}}),
+            )
+            .await;
+
+            for frame in [
+                json!({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "vendor-stream",
+                        "item": {"id": "message-1", "type": "agentMessage", "text": ""}
+                    }
+                }),
+                json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-1", "turnId": "vendor-stream",
+                        "itemId": "message-1", "delta": "Hel"
+                    }
+                }),
+                json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-1", "turnId": "vendor-stream",
+                        "itemId": "message-1", "delta": "lo"
+                    }
+                }),
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "vendor-stream",
+                        "item": {
+                            "id": "message-1", "type": "agentMessage", "text": "Hello"
+                        }
+                    }
+                }),
+                // A duplicate completion must not produce a second terminal snapshot.
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "vendor-stream",
+                        "item": {
+                            "id": "message-1", "type": "agentMessage", "text": "Hello"
+                        }
+                    }
+                }),
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "vendor-stream", "status": "completed"}
+                    }
+                }),
+                // Once the terminal is accepted, even otherwise valid frames for
+                // that vendor turn must stay invisible.
+                json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-1", "turnId": "vendor-stream",
+                        "itemId": "message-1", "delta": " late"
+                    }
+                }),
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "vendor-stream",
+                        "item": {
+                            "id": "message-1", "type": "agentMessage", "text": "Hello late"
+                        }
+                    }
+                }),
+            ] {
+                write_json(&mut server_output, frame).await;
+            }
+            let _ = late_frames_sent_tx.send(());
+
+            let mut rest = Vec::new();
+            server_input.read_to_end(&mut rest).await.unwrap();
+        });
+        let run = tokio::spawn(owner.run());
+
+        assert!(matches!(
+            next_event(&mut events_rx).await,
+            ServerEvent::SessionStarted { .. }
+        ));
+        assert!(matches!(
+            next_event(&mut events_rx).await,
+            ServerEvent::SessionCapabilities { .. }
+        ));
+        assert!(matches!(
+            next_event(&mut events_rx).await,
+            ServerEvent::TurnStarted { ref turn_id, .. }
+                if turn_id == &TurnId("turn-stream".into())
+        ));
+
+        for (expected_text, expected_state) in [
+            ("Hel", AgentItemState::Streaming),
+            ("Hello", AgentItemState::Streaming),
+            ("Hello", AgentItemState::Completed),
+        ] {
+            match next_event(&mut events_rx).await {
+                ServerEvent::AgentItem {
+                    turn_id,
+                    item_id,
+                    state,
+                    item: AgentItem::AssistantMessage { text, .. },
+                    ..
+                } => {
+                    assert_eq!(turn_id, TurnId("turn-stream".into()));
+                    assert_eq!(item_id, "message-1");
+                    assert_eq!(state, expected_state);
+                    assert_eq!(text, expected_text);
+                }
+                other => panic!("expected cumulative assistant snapshot, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            next_event(&mut events_rx).await,
+            ServerEvent::TurnFinished {
+                turn_id,
+                outcome: TurnOutcome::Succeeded,
+                next_state: TurnNextState::Ready,
+                ..
+            } if turn_id == TurnId("turn-stream".into())
+        ));
+
+        late_frames_sent_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            events_rx.try_recv().is_err(),
+            "terminal must be the final event for its turn"
+        );
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands_tx
+            .send(SessionCommand::Close { reply: reply_tx })
+            .await
+            .unwrap();
+        command_reply(reply_rx).await;
+        let exit = run.await.unwrap();
+        assert_eq!(exit.outcome, SessionOutcome::Closed);
+        server.await.unwrap();
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn owner_rejects_turn_while_factory_is_initializing_and_close_skips_spawn() {
         let (events_tx, mut events_rx) = mpsc::channel(4);
         let (commands_tx, commands_rx) = mpsc::channel(4);
@@ -2414,6 +2597,31 @@ mod tests {
                 }),
             )
             .await;
+            for late_frame in [
+                json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "vendor-cancel-race",
+                        "itemId": "message-late",
+                        "delta": "late"
+                    }
+                }),
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "vendor-cancel-race",
+                        "item": {
+                            "id": "message-late",
+                            "type": "agentMessage",
+                            "text": "late"
+                        }
+                    }
+                }),
+            ] {
+                write_json(&mut server_output, late_frame).await;
+            }
             write_json(
                 &mut server_output,
                 json!({
@@ -3516,7 +3724,6 @@ mod tests {
                 .finish_vendor_turn(VendorTerminal {
                     vendor_id: "vendor-failed".into(),
                     status: "failed".into(),
-                    duration_ms: Some(1),
                 })
                 .await
                 .is_none()
@@ -3556,7 +3763,6 @@ mod tests {
             .finish_vendor_turn(VendorTerminal {
                 vendor_id: "vendor-invalid".into(),
                 status: "inProgress".into(),
-                duration_ms: None,
             })
             .await
             .expect("inProgress terminal must be fatal");
@@ -3570,6 +3776,154 @@ mod tests {
                 ..
             } => assert_eq!(error.code, "codex-terminal-status-invalid"),
             other => panic!("expected invalid-status terminal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_status_mapping_maps_vendor_interrupted_without_local_override() {
+        let (events_tx, mut events_rx) = mpsc::channel(2);
+        let (_commands_tx, commands_rx) = mpsc::channel(1);
+        let mut owner = RunningOwner::new(
+            start(None),
+            events_tx,
+            commands_rx,
+            "codex-cli 0.145.0".into(),
+            INTERRUPT_TERMINAL_TIMEOUT,
+        );
+        owner.state = OwnerState::Running;
+        owner.thread_id = Some(ThreadId("thread-1".into()));
+        owner.turn = Some(TurnContext {
+            client_id: TurnId("turn-interrupted".into()),
+            vendor_id: Some("vendor-interrupted".into()),
+            started_at: Instant::now(),
+            cancel_requested: false,
+            close_requested: false,
+            interrupt_sent: false,
+            failure_override: None,
+            pending_terminal: None,
+        });
+
+        assert!(
+            owner
+                .finish_vendor_turn(VendorTerminal {
+                    vendor_id: "vendor-interrupted".into(),
+                    status: "interrupted".into(),
+                })
+                .await
+                .is_none()
+        );
+        assert_eq!(owner.state, OwnerState::Ready);
+        assert!(matches!(
+            next_event(&mut events_rx).await,
+            ServerEvent::TurnFinished {
+                outcome: TurnOutcome::Canceled,
+                next_state: TurnNextState::Ready,
+                error: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_elapsed_uses_daemon_monotonic_clock_not_vendor_duration() {
+        let (events_tx, mut events_rx) = mpsc::channel(2);
+        let (_commands_tx, commands_rx) = mpsc::channel(1);
+        let mut owner = RunningOwner::new(
+            start(None),
+            events_tx,
+            commands_rx,
+            "codex-cli 0.145.0".into(),
+            INTERRUPT_TERMINAL_TIMEOUT,
+        );
+        owner.state = OwnerState::Running;
+        owner.thread_id = Some(ThreadId("thread-1".into()));
+        owner.turn = Some(TurnContext {
+            client_id: TurnId("turn-monotonic".into()),
+            vendor_id: Some("vendor-monotonic".into()),
+            started_at: Instant::now() - Duration::from_millis(25),
+            cancel_requested: false,
+            close_requested: false,
+            interrupt_sent: false,
+            failure_override: None,
+            pending_terminal: None,
+        });
+        let (mut connection, _server_input, _server_output, _cleaned) = test_connection(None);
+
+        assert!(
+            owner
+                .handle_turn_completed(
+                    &mut connection,
+                    &json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "turn": {
+                                "id": "vendor-monotonic",
+                                "status": "completed",
+                                "durationMs": 900_000
+                            }
+                        }
+                    }),
+                )
+                .await
+                .is_none()
+        );
+        match next_event(&mut events_rx).await {
+            ServerEvent::TurnFinished {
+                outcome: TurnOutcome::Succeeded,
+                summary: Some(summary),
+                ..
+            } => {
+                assert!(summary.elapsed_ms >= 25);
+                assert_ne!(summary.elapsed_ms, 900_000);
+            }
+            other => panic!("expected successful terminal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_turn_fills_missing_diagnostic_ref() {
+        let (events_tx, mut events_rx) = mpsc::channel(2);
+        let (_commands_tx, commands_rx) = mpsc::channel(1);
+        let mut owner = RunningOwner::new(
+            start(None),
+            events_tx,
+            commands_rx,
+            "codex-cli 0.145.0".into(),
+            INTERRUPT_TERMINAL_TIMEOUT,
+        );
+        owner.state = OwnerState::Running;
+        owner.thread_id = Some(ThreadId("thread-1".into()));
+        owner.turn = Some(TurnContext {
+            client_id: TurnId("turn-failed-ref".into()),
+            vendor_id: Some("vendor-failed-ref".into()),
+            started_at: Instant::now(),
+            cancel_requested: false,
+            close_requested: false,
+            interrupt_sent: false,
+            failure_override: None,
+            pending_terminal: None,
+        });
+
+        owner
+            .finish_turn(
+                TurnOutcome::Failed,
+                TurnNextState::Ready,
+                None,
+                Some(ProtocolError {
+                    code: "test-failed".into(),
+                    message: "test failure".into(),
+                    diagnostic_ref: None,
+                }),
+            )
+            .await;
+
+        match next_event(&mut events_rx).await {
+            ServerEvent::TurnFinished {
+                outcome: TurnOutcome::Failed,
+                error: Some(error),
+                ..
+            } => assert_eq!(error.diagnostic_ref.as_deref(), Some("session-1")),
+            other => panic!("expected failed terminal, got {other:?}"),
         }
     }
 }

@@ -11,8 +11,11 @@ use agentdeckd::claude_code::translate::ClaudeCodeTranslator;
 use serde_json::json;
 
 fn tr() -> ClaudeCodeTranslator {
-    let mut t =
-        ClaudeCodeTranslator::new(SessionId("s1".into()), ClaudeCodePermissionMode::Default);
+    let mut t = ClaudeCodeTranslator::new_for_turn(
+        SessionId("s1".into()),
+        ClaudeCodePermissionMode::Default,
+        TurnId("turn-1".into()),
+    );
     t.set_thread_id(ThreadId("thread_1".into()));
     t
 }
@@ -32,11 +35,17 @@ fn assistant_text_becomes_assistant_message() {
             item: AgentItem::AssistantMessage { text, .. },
             agent_kind,
             thread_id,
+            turn_id,
+            item_id,
+            state,
             ..
         } => {
             assert_eq!(text, "hi");
             assert_eq!(*agent_kind, AgentKind::ClaudeCode);
             assert_eq!(thread_id.0, "thread_1");
+            assert_eq!(turn_id.0, "turn-1");
+            assert_eq!(item_id, "cc-item-1");
+            assert_eq!(*state, AgentItemState::Completed);
         }
         other => panic!("expected AssistantMessage, got {other:?}"),
     }
@@ -86,12 +95,18 @@ fn bash_tool_use_becomes_shell_running() {
                     ..
                 },
             agent_kind,
+            turn_id,
+            item_id,
+            state,
             ..
         } => {
             assert_eq!(command, "ls -la");
             assert!(matches!(status, ShellStatus::Running));
             assert_eq!(meta.vendor_extensions["toolUseId"], json!("tu_b1"));
             assert_eq!(*agent_kind, AgentKind::ClaudeCode);
+            assert_eq!(turn_id.0, "turn-1");
+            assert_eq!(item_id, "cc-tool-tu_b1");
+            assert_eq!(*state, AgentItemState::Streaming);
         }
         other => panic!("expected Shell(Running), got {other:?}"),
     }
@@ -111,7 +126,11 @@ fn tool_result_after_bash_emits_shell_completion() {
             "input": { "command": "echo ok" }
         }] }
     });
-    let _ = t.translate_line(&tu.to_string());
+    let started = t.translate_line(&tu.to_string());
+    let (started_item_id, started_state) = match &started.events[0] {
+        ServerEvent::AgentItem { item_id, state, .. } => (item_id.clone(), *state),
+        other => panic!("expected Shell(Running), got {other:?}"),
+    };
     // 2) tool_result → Completed
     let tr_line = json!({
         "type": "user",
@@ -135,12 +154,17 @@ fn tool_result_after_bash_emits_shell_completion() {
                     meta,
                     ..
                 },
+            item_id,
+            state,
             ..
         } => {
             assert_eq!(command, "echo ok");
             assert!(matches!(status, ShellStatus::Completed));
             assert_eq!(*exit_code, Some(0));
             assert_eq!(meta.vendor_extensions["toolUseId"], json!("tu_b1"));
+            assert_eq!(started_item_id, *item_id);
+            assert_eq!(started_state, AgentItemState::Streaming);
+            assert_eq!(*state, AgentItemState::Completed);
         }
         other => panic!("expected Shell(Completed), got {other:?}"),
     }

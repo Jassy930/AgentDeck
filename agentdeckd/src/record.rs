@@ -371,7 +371,8 @@ mod tests {
     #[test]
     fn run_record_writes_header_and_appends_events_with_agent_kind() {
         use agentdeck_protocol::{
-            AgentItem, AgentItemMeta, AgentKind, ServerEvent, SessionId, ThreadId,
+            AgentItem, AgentItemMeta, AgentItemState, AgentKind, ServerEvent, SessionId, ThreadId,
+            TurnId,
         };
         let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -402,6 +403,9 @@ mod tests {
             session_id: SessionId("sid".into()),
             thread_id: ThreadId("tid".into()),
             agent_kind: AgentKind::Codex,
+            turn_id: TurnId("turn-1".into()),
+            item_id: "message-1".into(),
+            state: AgentItemState::Completed,
             item: AgentItem::AssistantMessage {
                 text: "hello".into(),
                 meta: AgentItemMeta::default(),
@@ -424,6 +428,9 @@ mod tests {
         let event_line: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(event_line["type"], "agentItem");
         assert_eq!(event_line["agentKind"], "codex");
+        assert_eq!(event_line["turnId"], "turn-1");
+        assert_eq!(event_line["itemId"], "message-1");
+        assert_eq!(event_line["state"], "completed");
         let footer: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(footer["kind"], "runFooter");
 

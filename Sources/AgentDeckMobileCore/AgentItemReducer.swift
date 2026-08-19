@@ -1,7 +1,7 @@
 import Foundation
 
-/// Cumulative-semantics agent item store. v2 (Task 6A) ingests typed
-/// `AgentItem` values from the daemon's `ServerEvent::AgentItem` and
+/// Cumulative-semantics agent item store. It ingests typed `AgentItem`
+/// envelopes from the daemon's `ServerEvent::AgentItem` and
 /// translates them into the existing `UIItem` rendering shape (kept stable
 /// to preserve all rendering work from v0.1).
 ///
@@ -16,17 +16,20 @@ public struct AgentItemStore {
 }
 
 public enum AgentItemReducer {
-    /// Apply a typed v2 AgentItem to the store. The store key is a stable id
-    /// derived from item content + a monotonic per-store sequence — since
-    /// daemon AgentItems don't carry their own id we synthesize one per
-    /// (kind, position) pair using the caller-provided `itemId`.
-    public static func apply(_ item: AgentItem, itemId: String, into store: inout AgentItemStore) {
+    /// Apply a cumulative AgentItem snapshot. `itemId` and `state` come from
+    /// the daemon envelope; repeated snapshots replace the same store slot.
+    public static func apply(
+        _ item: AgentItem,
+        itemId: String,
+        state: AgentItemState,
+        into store: inout AgentItemStore
+    ) {
         var ui = store.itemIndexById[itemId].flatMap { idx in
             store.items.indices.contains(idx) ? store.items[idx] : nil
-        } ?? UIItem(id: itemId, lifecycle: "completed", kind: kindLabel(for: item))
+        } ?? UIItem(id: itemId, lifecycle: state.rawValue, kind: kindLabel(for: item))
         ui.id = itemId
         ui.kind = kindLabel(for: item)
-        ui.lifecycle = "completed"
+        ui.lifecycle = state.rawValue
         populate(&ui, from: item)
         if let idx = store.itemIndexById[itemId], store.items.indices.contains(idx) {
             store.items[idx] = ui

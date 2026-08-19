@@ -1,4 +1,4 @@
-//! v3 client API — sends `ClientCommand` JSONL, reads `ServerEvent` JSONL
+//! v4 client API — sends `ClientCommand` JSONL, reads `ServerEvent` JSONL
 //! and admin reply side-channel.
 //!
 //! ## Admin reply parsing
@@ -561,8 +561,13 @@ mod tests {
     }
 
     fn selfcheck_reply() -> String {
-        r#"{"reply":"selfcheck","ok":true,"protocolVersion":3,"agents":["codex","claude_code"]}"#
-            .to_string()
+        serde_json::json!({
+            "reply": "selfcheck",
+            "ok": true,
+            "protocolVersion": agentdeck_protocol::PROTOCOL_VERSION,
+            "agents": ["codex", "claude_code"]
+        })
+        .to_string()
     }
 
     fn error_event(msg: &str) -> String {
@@ -706,7 +711,11 @@ mod tests {
         // skipped while waiting for the matching admin reply.
         // We can't construct a full AgentItem without all fields, so we
         // use a stray admin reply with a different key first.
-        let different_reply = r#"{"reply":"protocolVersion","protocolVersion":3}"#.to_string();
+        let different_reply = serde_json::json!({
+            "reply": "protocolVersion",
+            "protocolVersion": agentdeck_protocol::PROTOCOL_VERSION
+        })
+        .to_string();
         let mut fake = FakeTransport::new(vec![
             // stray admin reply with different key — skip and keep looking
             different_reply,
@@ -737,7 +746,7 @@ mod tests {
         let mut fake = FakeTransport::new(vec![selfcheck_reply()]);
         let v = admin_round_trip(&mut fake, &ClientCommand::Selfcheck, "selfcheck").unwrap();
         assert_eq!(v["ok"], true);
-        assert_eq!(v["protocolVersion"], 3);
+        assert_eq!(v["protocolVersion"], agentdeck_protocol::PROTOCOL_VERSION);
     }
 
     #[test]
