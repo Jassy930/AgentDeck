@@ -2,7 +2,7 @@ import AgentDeckMobileCore
 import Foundation
 import XCTest
 
-/// Verifies the v2 wire shapes decode correctly on the Swift side. These
+/// Verifies the v3 wire shapes decode correctly on the Swift side. These
 /// are guardrails for the cross-language IPC seam — daemon emits Rust
 /// `serde_json` output, Swift decodes via `JSONDecoder`; both must agree
 /// on field names, tag discriminators, and enum value renames.
@@ -128,6 +128,61 @@ final class ProtocolV2DecodingTests: XCTestCase {
         XCTAssertEqual(summary.elapsedMs, 1500)
     }
 
+    func testDecodeTurnStarted() throws {
+        let json = #"{"type":"turnStarted","sessionId":"s1","threadId":"t1","agentKind":"codex","turnId":"turn-1"}"#
+        let event = try decodeServerEvent(json)
+        guard case let .turnStarted(sid, tid, kind, turnId) = event else {
+            return XCTFail("expected turnStarted")
+        }
+        XCTAssertEqual(sid, "s1")
+        XCTAssertEqual(tid, "t1")
+        XCTAssertEqual(kind, .codex)
+        XCTAssertEqual(turnId, "turn-1")
+    }
+
+    func testDecodeTurnFinished() throws {
+        let json = """
+        {"type":"turnFinished","sessionId":"s1","threadId":"t1","agentKind":"codex",
+         "turnId":"turn-1","outcome":"failed","nextState":"closing",
+         "summary":{"totalInputTokens":10,"totalOutputTokens":20,"elapsedMs":30},
+         "error":{"code":"turn-failed","message":"failed","diagnosticRef":"diag-1"}}
+        """
+        let event = try decodeServerEvent(json)
+        guard case let .turnFinished(
+            sid,
+            tid,
+            kind,
+            turnId,
+            outcome,
+            nextState,
+            summary,
+            error
+        ) = event else {
+            return XCTFail("expected turnFinished")
+        }
+        XCTAssertEqual(sid, "s1")
+        XCTAssertEqual(tid, "t1")
+        XCTAssertEqual(kind, .codex)
+        XCTAssertEqual(turnId, "turn-1")
+        XCTAssertEqual(outcome, .failed)
+        XCTAssertEqual(nextState, .closing)
+        XCTAssertEqual(summary?.elapsedMs, 30)
+        XCTAssertEqual(error?.diagnosticRef, "diag-1")
+    }
+
+    func testDecodeSessionClosedWithoutThread() throws {
+        let json = #"{"type":"sessionClosed","sessionId":"s1","agentKind":"codex","outcome":"closed","error":null}"#
+        let event = try decodeServerEvent(json)
+        guard case let .sessionClosed(sid, tid, kind, outcome, error) = event else {
+            return XCTFail("expected sessionClosed")
+        }
+        XCTAssertEqual(sid, "s1")
+        XCTAssertNil(tid)
+        XCTAssertEqual(kind, .codex)
+        XCTAssertEqual(outcome, .closed)
+        XCTAssertNil(error)
+    }
+
     func testDecodeError() throws {
         let json = #"{"type":"error","sessionId":null,"error":{"code":"x","message":"boom","diagnosticRef":null}}"#
         let event = try decodeServerEvent(json)
@@ -202,9 +257,11 @@ final class ProtocolV2DecodingTests: XCTestCase {
 
     func testEncodeClientCommandSessionStartCodex() throws {
         let cmd: ClientCommand = .sessionStart(SessionStart(
+            sessionId: "session-1",
             agentKind: .codex,
             cwd: "/tmp",
-            prompt: "hi",
+            resumeThreadId: "thread-1",
+            initialTurn: InitialTurn(turnId: "turn-1", prompt: "hi"),
             vendorOptions: .codex(CodexSessionOptions(
                 approvalPolicy: .onRequest, sandbox: .readOnly,
                 persistApproval: false, reasoningEffort: .medium
@@ -212,37 +269,66 @@ final class ProtocolV2DecodingTests: XCTestCase {
         ))
         let line = try encodeClientCommand(cmd)
         XCTAssertTrue(line.contains("\"command\":\"sessionStart\""))
+        XCTAssertTrue(line.contains("\"sessionId\":\"session-1\""))
         XCTAssertTrue(line.contains("\"agentKind\":\"codex\""))
+        XCTAssertTrue(line.contains("\"resumeThreadId\":\"thread-1\""))
+        XCTAssertTrue(line.contains("\"turnId\":\"turn-1\""))
+        XCTAssertTrue(line.contains("\"prompt\":\"hi\""))
         // The vendorOptions.codex variant should serialise the inner options
         // alongside the agentKind tag.
         XCTAssertTrue(line.contains("\"approvalPolicy\":\"on-request\""))
         XCTAssertTrue(line.contains("\"sandbox\":\"read-only\""))
     }
 
-    /// C3 fix (v0.2 final review): sessionContinue now carries `cwd`
-    /// on the wire so the daemon adapter can resume CC from the
-    /// right `~/.claude/projects/<encoded_cwd>/<id>.jsonl` and run
-    /// tool_use in the same directory as the original session.
-    /// Without this the adapter fell back to `std::env::current_dir()`,
-    /// which is the daemon's spawn directory — not the user's.
-    func testEncodeClientCommandSessionContinueIncludesCwd() throws {
-        let cmd: ClientCommand = .sessionContinue(
-            threadId: "tid-1",
-            agentKind: .claudeCode,
-            cwd: "/Users/me/work/proj",
-            prompt: "continue please"
+    func testDecodeSessionStartDefaultsMissingRuntimeOptions() throws {
+        let json = """
+        {"command":"sessionStart","sessionId":"session-1","agentKind":"codex","cwd":"/tmp",
+         "resumeThreadId":null,"initialTurn":null,
+         "vendorOptions":{"agentKind":"codex","approvalPolicy":"never","sandbox":"read-only",
+                          "persistApproval":false,"reasoningEffort":"medium","mcpOverrides":[]}}
+        """
+
+        let command = try JSONDecoder().decode(ClientCommand.self, from: Data(json.utf8))
+        guard case let .sessionStart(start) = command else {
+            return XCTFail("expected sessionStart")
+        }
+
+        XCTAssertEqual(start.runtimeOptions.idleTimeoutSecs, 0)
+        XCTAssertNil(start.runtimeOptions.logVerbosity)
+    }
+
+    func testEncodeLifecycleCommands() throws {
+        let turnStart = try encodeClientCommand(
+            .turnStart(sessionId: "session-1", turnId: "turn-1", prompt: "continue please")
         )
-        let line = try encodeClientCommand(cmd)
-        XCTAssertTrue(line.contains("\"command\":\"sessionContinue\""), "got: \(line)")
-        XCTAssertTrue(line.contains("\"agentKind\":\"claude_code\""), "got: \(line)")
-        XCTAssertTrue(line.contains("\"threadId\":\"tid-1\""), "got: \(line)")
-        // JSONEncoder escapes forward slashes by default (`\/`), so
-        // match the encoded form rather than the literal path.
-        XCTAssertTrue(
-            line.contains("\"cwd\":\"\\/Users\\/me\\/work\\/proj\""),
-            "got: \(line)"
+        XCTAssertTrue(turnStart.contains("\"command\":\"turnStart\""), "got: \(turnStart)")
+        XCTAssertTrue(turnStart.contains("\"sessionId\":\"session-1\""), "got: \(turnStart)")
+        XCTAssertTrue(turnStart.contains("\"turnId\":\"turn-1\""), "got: \(turnStart)")
+
+        let turnCancel = try encodeClientCommand(
+            .turnCancel(sessionId: "session-1", turnId: "turn-1")
         )
-        XCTAssertTrue(line.contains("\"prompt\":\"continue please\""), "got: \(line)")
+        XCTAssertTrue(turnCancel.contains("\"command\":\"turnCancel\""), "got: \(turnCancel)")
+        XCTAssertTrue(turnCancel.contains("\"turnId\":\"turn-1\""), "got: \(turnCancel)")
+
+        let sessionClose = try encodeClientCommand(.sessionClose(sessionId: "session-1"))
+        XCTAssertTrue(sessionClose.contains("\"command\":\"sessionClose\""), "got: \(sessionClose)")
+        XCTAssertTrue(sessionClose.contains("\"sessionId\":\"session-1\""), "got: \(sessionClose)")
+    }
+
+    func testLegacyLifecycleCommandsAreRejected() throws {
+        let decoder = JSONDecoder()
+        let legacyCommands = [
+            #"{"command":"sessionContinue","threadId":"thread-1","agentKind":"codex","cwd":"/tmp","prompt":"continue"}"#,
+            #"{"command":"sessionCancel","sessionId":"session-1"}"#,
+        ]
+
+        for json in legacyCommands {
+            XCTAssertThrowsError(
+                try decoder.decode(ClientCommand.self, from: Data(json.utf8)),
+                "legacy command should be rejected: \(json)"
+            )
+        }
     }
 
     func testEncodeClientCommandHistoryList() throws {

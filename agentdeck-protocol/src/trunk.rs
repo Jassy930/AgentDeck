@@ -61,9 +61,11 @@ pub enum VendorSessionOptions {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionStart {
+    pub session_id: SessionId,
     pub agent_kind: AgentKind,
     pub cwd: PathBuf,
-    pub prompt: Option<String>,
+    pub resume_thread_id: Option<ThreadId>,
+    pub initial_turn: Option<InitialTurn>,
     pub vendor_options: VendorSessionOptions,
     #[serde(default)]
     pub runtime_options: RuntimeOptions,
@@ -78,6 +80,39 @@ pub struct SessionId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct ThreadId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct TurnId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InitialTurn {
+    pub turn_id: TurnId,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum TurnOutcome {
+    Succeeded,
+    Failed,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum TurnNextState {
+    Ready,
+    Closing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum SessionOutcome {
+    Closed,
+    Failed,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -438,7 +473,7 @@ pub enum HistoryResponse {
     Ack,
 }
 
-// ── T1.9: ClientCommand — all v2 client-to-server commands ──────────────────
+// ── ClientCommand — all v3 client-to-server commands ────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "command", rename_all = "camelCase", deny_unknown_fields)]
@@ -446,15 +481,20 @@ pub enum ClientCommand {
     Ping,
     Selfcheck,
     SessionStart(SessionStart),
-    SessionContinue {
-        #[serde(rename = "threadId")]
-        thread_id: ThreadId,
-        #[serde(rename = "agentKind")]
-        agent_kind: AgentKind,
-        cwd: PathBuf,
+    TurnStart {
+        #[serde(rename = "sessionId")]
+        session_id: SessionId,
+        #[serde(rename = "turnId")]
+        turn_id: TurnId,
         prompt: String,
     },
-    SessionCancel {
+    TurnCancel {
+        #[serde(rename = "sessionId")]
+        session_id: SessionId,
+        #[serde(rename = "turnId")]
+        turn_id: TurnId,
+    },
+    SessionClose {
         #[serde(rename = "sessionId")]
         session_id: SessionId,
     },
@@ -515,6 +555,42 @@ pub enum ServerEvent {
         agent_kind: AgentKind,
         request: ActionRequest,
     },
+    TurnStarted {
+        #[serde(rename = "sessionId")]
+        session_id: SessionId,
+        #[serde(rename = "threadId")]
+        thread_id: ThreadId,
+        #[serde(rename = "agentKind")]
+        agent_kind: AgentKind,
+        #[serde(rename = "turnId")]
+        turn_id: TurnId,
+    },
+    TurnFinished {
+        #[serde(rename = "sessionId")]
+        session_id: SessionId,
+        #[serde(rename = "threadId")]
+        thread_id: ThreadId,
+        #[serde(rename = "agentKind")]
+        agent_kind: AgentKind,
+        #[serde(rename = "turnId")]
+        turn_id: TurnId,
+        outcome: TurnOutcome,
+        #[serde(rename = "nextState")]
+        next_state: TurnNextState,
+        summary: Option<TurnSummary>,
+        error: Option<ProtocolError>,
+    },
+    SessionClosed {
+        #[serde(rename = "sessionId")]
+        session_id: SessionId,
+        #[serde(rename = "threadId")]
+        thread_id: Option<ThreadId>,
+        #[serde(rename = "agentKind")]
+        agent_kind: AgentKind,
+        outcome: SessionOutcome,
+        error: Option<ProtocolError>,
+    },
+    /// Legacy Claude Code-only terminal. Codex M0 uses `TurnFinished`.
     TurnComplete {
         #[serde(rename = "sessionId")]
         session_id: SessionId,

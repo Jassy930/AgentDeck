@@ -41,8 +41,8 @@ use crate::claude_code::translate::ClaudeCodeTranslator;
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode,
     ClaudeCodeSessionOptions, ClaudeCodeVendorControl, HistoryRequest, HistoryResponse,
-    ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart, ThreadId,
-    VendorControlPayload, VendorSessionOptions,
+    InitialTurn, ProtocolError, ServerEvent, SessionCapabilities, SessionId, SessionStart,
+    ThreadId, TurnId, VendorControlPayload, VendorSessionOptions,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -116,7 +116,6 @@ impl ClaudeCodeAdapter {
     /// `start_session` and `continue_thread` agree on encoding.
     fn build_command(
         start: &SessionStart,
-        resume_thread_id: Option<&ThreadId>,
     ) -> Result<(Command, ClaudeCodePermissionMode), ProtocolError> {
         let opts = match &start.vendor_options {
             VendorSessionOptions::ClaudeCode(o) => o.clone(),
@@ -172,7 +171,7 @@ impl ClaudeCodeAdapter {
         if let Some(n) = &opts.session_name {
             cmd.arg("--name").arg(n);
         }
-        if let Some(id) = resume_thread_id {
+        if let Some(id) = &start.resume_thread_id {
             cmd.arg("--resume").arg(&id.0);
         } else if let Some(id) = &opts.session_id {
             cmd.arg("--session-id").arg(id);
@@ -284,17 +283,16 @@ impl ClaudeCodeAdapter {
         &self,
         start: SessionStart,
         events: AgentEventSender,
-        resume_thread_id: Option<ThreadId>,
-        prompt_override: Option<String>,
     ) -> Result<AgentSessionHandle, ProtocolError> {
-        // Preflight per spec § 5.8 — run BEFORE we mint a session id
-        // or emit SessionStarted, so a missing binary / bad version /
-        // logged-out user surfaces as a single clean error rather than
-        // a half-started session.
-        self.preflight(&events, None).await?;
+        // Preflight per spec § 5.8 — run before SessionStarted, so a
+        // missing binary / bad version / logged-out user surfaces as a
+        // single clean error attached to the caller-provided session id
+        // rather than a half-started session.
+        let session_id = start.session_id.clone();
+        let resume_thread_id = start.resume_thread_id.clone();
+        self.preflight(&events, Some(&session_id)).await?;
 
-        let (mut cmd, permission_mode) = Self::build_command(&start, resume_thread_id.as_ref())?;
-        let session_id = SessionId(uuid::Uuid::new_v4().to_string());
+        let (mut cmd, permission_mode) = Self::build_command(&start)?;
 
         // N7: SessionStarted + SessionCapabilities BEFORE any AgentItem.
         let caps = self.capabilities_for_v2();
@@ -331,11 +329,10 @@ impl ClaudeCodeAdapter {
         let _ = child.stderr.take();
 
         // Write the initial prompt (if any) as a stream-json user line.
-        let prompt = prompt_override.or(start.prompt.clone());
-        if let Some(prompt) = prompt {
+        if let Some(initial_turn) = &start.initial_turn {
             let line = serde_json::to_string(&serde_json::json!({
                 "type": "user",
-                "message": { "role": "user", "content": prompt },
+                "message": { "role": "user", "content": initial_turn.prompt },
             }))
             .unwrap_or_default();
             if stdin.write_all(line.as_bytes()).await.is_err() {
@@ -426,6 +423,7 @@ impl ClaudeCodeAdapter {
             thread_id: resume_thread_id,
             agent_kind: AgentKind::ClaudeCode,
             abort_handle: pump_abort,
+            exit: None,
         })
     }
 }
@@ -481,7 +479,7 @@ impl Agent for ClaudeCodeAdapter {
                 diagnostic_ref: None,
             });
         }
-        self.start_inner(start, events, None, None).await
+        self.start_inner(start, events).await
     }
 
     async fn continue_thread(
@@ -514,14 +512,18 @@ impl Agent for ClaudeCodeAdapter {
             session_id: Some(thread_id.0.clone()),
         };
         let synth_start = SessionStart {
+            session_id: SessionId(uuid::Uuid::new_v4().to_string()),
             agent_kind: AgentKind::ClaudeCode,
             cwd,
-            prompt: Some(prompt.clone()),
+            resume_thread_id: Some(thread_id),
+            initial_turn: Some(InitialTurn {
+                turn_id: TurnId(uuid::Uuid::new_v4().to_string()),
+                prompt,
+            }),
             vendor_options: VendorSessionOptions::ClaudeCode(opts),
             runtime_options: Default::default(),
         };
-        self.start_inner(synth_start, events, Some(thread_id), Some(prompt))
-            .await
+        self.start_inner(synth_start, events).await
     }
 
     async fn submit_decision(

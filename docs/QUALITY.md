@@ -128,11 +128,34 @@ macOS 桌面不得重新依赖 Swift target；共享 Core 测试也不得重新�
 | 文档、AGENTS、计划规则 | `scripts/verify-agent-docs.sh` |
 | 全局依赖或 workspace | `scripts/verify-offline-tests.sh`、`swift test`、desktop selfcheck 和 doc check；真实 vendor E2E 仍需单独授权和记录 |
 
+Issue #3 Codex 生命周期切片的 focused 离线入口为：
+
+```bash
+cargo test -p agentdeck-protocol
+cargo test -p agentdeck-cli --bin agentdeck
+cargo test -p agentdeckd --lib codex::
+cargo test -p agentdeckd --lib runtime::hub
+cargo test -p agentdeckd --lib runtime::router
+cargo test -p agentdeckd --test codex_adapter_shape
+swift test
+```
+
+它们具体检测 protocol v3/schema 与 Swift mirror 漂移、不同 binary probe/spawn、错误
+`app-server --listen stdio://` argv、`initialized` 乱序、RPC/turn/session 状态机和
+`SessionClosed` 清理顺序。当前确定性覆盖还包括同 connection 两轮、interrupt 后复用、
+running close、malformed/unmatched/EOF、handshake failure、unsupported request、terminal
+status、resume 固定参数、terminal 先于 rejected interrupt response 的 cancel/close 竞态、
+accepted turnId 不可复用、session-admission 守住旧 `SessionClosed` 与 replacement start 的
+先后、Initializing/Stopping 命令及时拒绝、direct child wait 后进程组消失确认与 stderr pump join，
+stdin EOF、stdout writer failure，以及 cleanup failure 的 poison→daemon exit。出现失败时应分别回到协议类型、Codex factory/session owner 或
+RuntimeHub/router 修正；这些离线证据不能升级为真实 Codex E2E。
+
 ## Codex vendor schema 快照
 
-`protocol/ClientRequest.json` 等文件是 Codex app-server 的 vendor 协议快照；M0
-还必须从同一官方生成物补入当前缺失的 `protocol/ClientNotification.json`，
-与 AgentDeck 自身 schemars 生成的
+`protocol/ClientRequest.json` 等文件是 Codex app-server 的 vendor 协议快照。Issue #3
+已从固定 0.145.0 官方生成物补入 `protocol/ClientNotification.json`；live session 与
+short-lived history path 都发送规范的 `initialized`，fake 测试守护 initialize response
+→ initialized → thread request 顺序。这套 vendor 快照与 AgentDeck 自身 schemars 生成的
 `protocol/agentdeck/agentdeck-protocol.schema.json` 是两套独立门禁。
 `cargo test` 通过不能证明本机 Codex 版本与 vendor 快照一致。
 
@@ -243,6 +266,13 @@ Cargo 测试中显示为 passed 而非 ignored。
 **前置条件：** `codex login` 已完成（测试会真实 spawn daemon 并发送 IPC）。
 
 **断言策略：** E2E 测试只断言响应的契约形态（消息 kind、必要字段存在、退出码等），不断言 agent 返回的具体文本内容，以避免测试因模型输出变化而 flaky。
+
+**Issue #3 边界：** 当前 CLI `session run` / `session continue` 每次都会启动新的 CLI、
+daemon 和 vendor session-scoped child；continue 只证明新 session 能按已知 `threadId`
+resume。Codex one-shot 在 `TurnFinished` 后会自动发送 `SessionClose`，等到 clean
+`SessionClosed` 和 daemon wait 才返回，但仍不能在同一 live session 发送第二个
+`TurnStart` 或 `TurnCancel`。因此即使真实 `e2e_codex` 通过，也不构成同 PID/threadId
+多轮或 cancel 后继续的 M0 证据；该持久 driver 与真实生命周期验收归 #5。
 
 **CI 默认跳过：** workflow 显式 unset `AGENTDECK_E2E`；三组 CLI E2E 和 adapter
 real-vendor shape 路径都会在 vendor I/O 前返回，不需要 vendor 登录。普通 CI passed

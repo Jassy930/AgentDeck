@@ -95,7 +95,7 @@ fn e2e_codex_agent_list_contains_codex() {
 }
 
 #[test]
-fn e2e_codex_agent_capabilities_has_sandbox_mode() {
+fn e2e_codex_agent_capabilities_matches_lifecycle_only_boundary() {
     if !real_e2e_enabled() {
         eprintln!("SKIP: set AGENTDECK_E2E=1");
         return;
@@ -115,29 +115,31 @@ fn e2e_codex_agent_capabilities_has_sandbox_mode() {
     );
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("capabilities output must be valid JSON");
-    let features: Vec<&str> = json["features"]
+    let features = json["features"]
         .as_array()
-        .expect("features must be an array")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
+        .expect("features must be an array");
     assert!(
-        !features.is_empty(),
-        "Codex capabilities must contain at least one feature"
-    );
-    assert!(
-        features.contains(&"codexSandboxMode"),
-        "Codex capabilities must include 'codexSandboxMode', got: {features:?}"
+        features.is_empty(),
+        "Issue #3 must not advertise streaming or interaction features before their own gates"
     );
     assert_eq!(
         json["agentKind"], "codex",
         "agentKind in capabilities reply must be 'codex'"
     );
+    assert_eq!(
+        json["vendor"]["sandboxModes"],
+        serde_json::json!(["read-only"])
+    );
+    assert_eq!(json["vendor"]["persistenceSupported"], false);
+    assert_eq!(
+        json["vendor"]["reasoningEffortLevels"],
+        serde_json::json!(["medium"])
+    );
 }
 
 // ── Session run / continue ─────────────────────────────────────────────────────
 
-/// Run a Codex session and collect all JSONL event lines until TurnComplete.
+/// Run a Codex session and collect all JSONL event lines until TurnFinished.
 /// Returns `(thread_id, events)`. Panics on hard timeout or error event.
 fn run_codex_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
     let cwd = std::env::current_dir()
@@ -160,7 +162,7 @@ fn run_codex_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
             "--approval",
             "never",
             "--reasoning-effort",
-            "minimal",
+            "medium",
         ],
         SESSION_TIMEOUT,
     );
@@ -181,7 +183,7 @@ fn run_codex_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
                 thread_id = tid.to_string();
             }
         }
-        let is_complete = val.get("type").and_then(|t| t.as_str()) == Some("turnComplete");
+        let is_complete = val.get("type").and_then(|t| t.as_str()) == Some("turnFinished");
         let is_error = val.get("type").and_then(|t| t.as_str()) == Some("error");
         events.push(val.clone());
         if is_error {
@@ -217,13 +219,13 @@ fn run_codex_session(prompt: &str) -> (String, Vec<serde_json::Value>) {
         );
     }
 
-    // Assert turnComplete is present
+    // Assert the typed Codex lifecycle terminal is present.
     let has_complete = events
         .iter()
-        .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("turnComplete"));
+        .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("turnFinished"));
     assert!(
         has_complete,
-        "session must end with turnComplete; events: {events:?}"
+        "session must end with turnFinished; events: {events:?}"
     );
 
     (thread_id, events)
@@ -313,13 +315,13 @@ fn e2e_codex_session_continue_to_completion() {
             .and_then(|v| {
                 v.get("type")
                     .and_then(|t| t.as_str())
-                    .map(|s| s == "turnComplete")
+                    .map(|s| s == "turnFinished")
             })
             .unwrap_or(false)
     });
     assert!(
         has_complete,
-        "session continue must produce turnComplete event\nstdout: {stdout_str}"
+        "session continue must produce turnFinished event\nstdout: {stdout_str}"
     );
     eprintln!("codex session continue OK (thread_id={thread_id})");
 }

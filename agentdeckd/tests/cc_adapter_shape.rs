@@ -64,9 +64,11 @@ async fn start_session_rejects_wrong_vendor_options() {
     let a = ClaudeCodeAdapter::new_for_test();
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let start = SessionStart {
+        session_id: SessionId("cc-wrong-vendor".into()),
         agent_kind: AgentKind::ClaudeCode,
         cwd: std::env::current_dir().unwrap(),
-        prompt: None,
+        resume_thread_id: None,
+        initial_turn: None,
         vendor_options: VendorSessionOptions::Codex(CodexSessionOptions {
             approval_policy: CodexApprovalPolicy::Never,
             sandbox: CodexSandboxMode::ReadOnly,
@@ -187,9 +189,14 @@ async fn real_claude_emits_started_then_capabilities() {
     let a = ClaudeCodeAdapter::new_for_test();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let start = SessionStart {
+        session_id: SessionId("cc-real-start".into()),
         agent_kind: AgentKind::ClaudeCode,
         cwd: std::env::current_dir().unwrap(),
-        prompt: Some("just say hi in 3 words and stop".into()),
+        resume_thread_id: None,
+        initial_turn: Some(InitialTurn {
+            turn_id: TurnId("cc-real-turn".into()),
+            prompt: "just say hi in 3 words and stop".into(),
+        }),
         vendor_options: VendorSessionOptions::ClaudeCode(cc_opts()),
         runtime_options: Default::default(),
     };
@@ -306,9 +313,14 @@ async fn real_claude_streams_at_least_one_assistant_or_turn_complete() {
     let a = ClaudeCodeAdapter::new_for_test();
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let start = SessionStart {
+        session_id: SessionId("cc-real-stream".into()),
         agent_kind: AgentKind::ClaudeCode,
         cwd: std::env::current_dir().unwrap(),
-        prompt: Some("reply with the single word: pong".into()),
+        resume_thread_id: None,
+        initial_turn: Some(InitialTurn {
+            turn_id: TurnId("cc-real-stream-turn".into()),
+            prompt: "reply with the single word: pong".into(),
+        }),
         vendor_options: VendorSessionOptions::ClaudeCode(cc_opts()),
         runtime_options: Default::default(),
     };

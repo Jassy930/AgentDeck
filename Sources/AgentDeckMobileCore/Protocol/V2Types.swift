@@ -458,6 +458,26 @@ extension AgentItem: Codable {
 
 // MARK: - TurnSummary / ProtocolError
 
+/// Mirrors Rust's transparent `TurnId` newtype while keeping Swift's existing
+/// string-based ID ergonomics.
+public typealias TurnId = String
+
+public enum TurnOutcome: String, Codable, Hashable, Sendable {
+    case succeeded
+    case failed
+    case canceled
+}
+
+public enum TurnNextState: String, Codable, Hashable, Sendable {
+    case ready
+    case closing
+}
+
+public enum SessionOutcome: String, Codable, Hashable, Sendable {
+    case closed
+    case failed
+}
+
 public struct TurnSummary: Codable, Sendable {
     public let totalInputTokens: UInt64?
     public let totalOutputTokens: UInt64?
@@ -821,6 +841,16 @@ public enum VendorPanelPayload: Codable, Sendable {
 
 // MARK: - SessionStart / VendorSessionOptions / RuntimeOptions
 
+public struct InitialTurn: Codable, Sendable {
+    public let turnId: TurnId
+    public let prompt: String
+
+    public init(turnId: TurnId, prompt: String) {
+        self.turnId = turnId
+        self.prompt = prompt
+    }
+}
+
 public struct RuntimeOptions: Codable, Sendable {
     public let idleTimeoutSecs: UInt32
     public let logVerbosity: String?
@@ -863,24 +893,54 @@ public enum VendorSessionOptions: Codable, Sendable {
 }
 
 public struct SessionStart: Codable, Sendable {
+    public let sessionId: String
     public let agentKind: AgentKind
     public let cwd: String
-    public let prompt: String?
+    public let resumeThreadId: String?
+    public let initialTurn: InitialTurn?
     public let vendorOptions: VendorSessionOptions
     public let runtimeOptions: RuntimeOptions
 
+    private enum CodingKeys: String, CodingKey {
+        case sessionId
+        case agentKind
+        case cwd
+        case resumeThreadId
+        case initialTurn
+        case vendorOptions
+        case runtimeOptions
+    }
+
     public init(
+        sessionId: String,
         agentKind: AgentKind,
         cwd: String,
-        prompt: String? = nil,
+        resumeThreadId: String? = nil,
+        initialTurn: InitialTurn? = nil,
         vendorOptions: VendorSessionOptions,
         runtimeOptions: RuntimeOptions = RuntimeOptions()
     ) {
+        self.sessionId = sessionId
         self.agentKind = agentKind
         self.cwd = cwd
-        self.prompt = prompt
+        self.resumeThreadId = resumeThreadId
+        self.initialTurn = initialTurn
         self.vendorOptions = vendorOptions
         self.runtimeOptions = runtimeOptions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.sessionId = try container.decode(String.self, forKey: .sessionId)
+        self.agentKind = try container.decode(AgentKind.self, forKey: .agentKind)
+        self.cwd = try container.decode(String.self, forKey: .cwd)
+        self.resumeThreadId = try container.decodeIfPresent(String.self, forKey: .resumeThreadId)
+        self.initialTurn = try container.decodeIfPresent(InitialTurn.self, forKey: .initialTurn)
+        self.vendorOptions = try container.decode(VendorSessionOptions.self, forKey: .vendorOptions)
+        self.runtimeOptions = try container.decodeIfPresent(
+            RuntimeOptions.self,
+            forKey: .runtimeOptions
+        ) ?? RuntimeOptions()
     }
 }
 
@@ -1084,12 +1144,9 @@ public enum ClientCommand: Codable, Sendable {
     case ping
     case selfcheck
     case sessionStart(SessionStart)
-    /// `cwd` is now part of the on-wire payload (C3 fix, v0.2 final
-    /// review). The daemon adapter uses it to point CC `--resume` at
-    /// `~/.claude/projects/<encoded_cwd>/<id>.jsonl` and to run vendor
-    /// tool_use in the same directory as the original session.
-    case sessionContinue(threadId: String, agentKind: AgentKind, cwd: String, prompt: String)
-    case sessionCancel(sessionId: String)
+    case turnStart(sessionId: String, turnId: TurnId, prompt: String)
+    case turnCancel(sessionId: String, turnId: TurnId)
+    case sessionClose(sessionId: String)
     case actionDecision(sessionId: String, decision: ActionDecision)
     case vendorControl(sessionId: String, payload: VendorControlPayload)
     case history(HistoryRequest)
@@ -1099,7 +1156,7 @@ public enum ClientCommand: Codable, Sendable {
     case agentCapabilities(agentKind: AgentKind)
 
     private enum CodingKeys: String, CodingKey {
-        case command, threadId, agentKind, cwd, prompt, sessionId, decision, payload
+        case command, agentKind, prompt, sessionId, turnId, decision, payload
     }
 
     public init(from decoder: Decoder) throws {
@@ -1110,15 +1167,18 @@ public enum ClientCommand: Codable, Sendable {
         case "selfcheck": self = .selfcheck
         case "sessionStart":
             self = .sessionStart(try SessionStart(from: decoder))
-        case "sessionContinue":
-            let tid = try c.decode(String.self, forKey: .threadId)
-            let kind = try c.decode(AgentKind.self, forKey: .agentKind)
-            let cwd = try c.decode(String.self, forKey: .cwd)
-            let prompt = try c.decode(String.self, forKey: .prompt)
-            self = .sessionContinue(threadId: tid, agentKind: kind, cwd: cwd, prompt: prompt)
-        case "sessionCancel":
+        case "turnStart":
             let sid = try c.decode(String.self, forKey: .sessionId)
-            self = .sessionCancel(sessionId: sid)
+            let tid = try c.decode(TurnId.self, forKey: .turnId)
+            let prompt = try c.decode(String.self, forKey: .prompt)
+            self = .turnStart(sessionId: sid, turnId: tid, prompt: prompt)
+        case "turnCancel":
+            let sid = try c.decode(String.self, forKey: .sessionId)
+            let tid = try c.decode(TurnId.self, forKey: .turnId)
+            self = .turnCancel(sessionId: sid, turnId: tid)
+        case "sessionClose":
+            let sid = try c.decode(String.self, forKey: .sessionId)
+            self = .sessionClose(sessionId: sid)
         case "actionDecision":
             let sid = try c.decode(String.self, forKey: .sessionId)
             let d = try c.decode(ActionDecision.self, forKey: .decision)
@@ -1150,14 +1210,17 @@ public enum ClientCommand: Codable, Sendable {
         case .sessionStart(let s):
             try c.encode("sessionStart", forKey: .command)
             try s.encode(to: encoder)
-        case .sessionContinue(let tid, let kind, let cwd, let prompt):
-            try c.encode("sessionContinue", forKey: .command)
-            try c.encode(tid, forKey: .threadId)
-            try c.encode(kind, forKey: .agentKind)
-            try c.encode(cwd, forKey: .cwd)
+        case .turnStart(let sid, let tid, let prompt):
+            try c.encode("turnStart", forKey: .command)
+            try c.encode(sid, forKey: .sessionId)
+            try c.encode(tid, forKey: .turnId)
             try c.encode(prompt, forKey: .prompt)
-        case .sessionCancel(let sid):
-            try c.encode("sessionCancel", forKey: .command)
+        case .turnCancel(let sid, let tid):
+            try c.encode("turnCancel", forKey: .command)
+            try c.encode(sid, forKey: .sessionId)
+            try c.encode(tid, forKey: .turnId)
+        case .sessionClose(let sid):
+            try c.encode("sessionClose", forKey: .command)
             try c.encode(sid, forKey: .sessionId)
         case .actionDecision(let sid, let d):
             try c.encode("actionDecision", forKey: .command)
@@ -1188,6 +1251,25 @@ public enum ServerEvent: Sendable {
     case sessionCapabilities(sessionId: String, agentKind: AgentKind, capabilities: SessionCapabilities)
     case agentItem(sessionId: String, threadId: String, agentKind: AgentKind, item: AgentItem)
     case actionRequest(sessionId: String, threadId: String, agentKind: AgentKind, request: ActionRequest)
+    case turnStarted(sessionId: String, threadId: String, agentKind: AgentKind, turnId: TurnId)
+    case turnFinished(
+        sessionId: String,
+        threadId: String,
+        agentKind: AgentKind,
+        turnId: TurnId,
+        outcome: TurnOutcome,
+        nextState: TurnNextState,
+        summary: TurnSummary?,
+        error: ProtocolError?
+    )
+    case sessionClosed(
+        sessionId: String,
+        threadId: String?,
+        agentKind: AgentKind,
+        outcome: SessionOutcome,
+        error: ProtocolError?
+    )
+    /// Legacy Claude Code-only terminal. Codex M0 uses `turnFinished`.
     case turnComplete(sessionId: String, threadId: String, agentKind: AgentKind, summary: TurnSummary)
     case error(sessionId: String?, error: ProtocolError)
     case vendorControl(sessionId: String, agentKind: AgentKind, payload: VendorControlPayload)
@@ -1199,6 +1281,9 @@ public enum ServerEvent: Sendable {
              .sessionCapabilities(let sid, _, _),
              .agentItem(let sid, _, _, _),
              .actionRequest(let sid, _, _, _),
+             .turnStarted(let sid, _, _, _),
+             .turnFinished(let sid, _, _, _, _, _, _, _),
+             .sessionClosed(let sid, _, _, _, _),
              .turnComplete(let sid, _, _, _),
              .vendorControl(let sid, _, _),
              .vendorPanelEvent(let sid, _, _):
@@ -1214,6 +1299,9 @@ public enum ServerEvent: Sendable {
              .sessionCapabilities(_, let k, _),
              .agentItem(_, _, let k, _),
              .actionRequest(_, _, let k, _),
+             .turnStarted(_, _, let k, _),
+             .turnFinished(_, _, let k, _, _, _, _, _),
+             .sessionClosed(_, _, let k, _, _),
              .turnComplete(_, _, let k, _),
              .vendorControl(_, let k, _),
              .vendorPanelEvent(_, let k, _):
@@ -1225,7 +1313,8 @@ public enum ServerEvent: Sendable {
 
 extension ServerEvent: Codable {
     private enum CodingKeys: String, CodingKey {
-        case type, sessionId, threadId, agentKind, capabilities, item, request, summary, error, payload
+        case type, sessionId, threadId, agentKind, turnId, capabilities, item, request
+        case outcome, nextState, summary, error, payload
     }
 
     public init(from decoder: Decoder) throws {
@@ -1254,6 +1343,44 @@ extension ServerEvent: Codable {
             let kind = try c.decode(AgentKind.self, forKey: .agentKind)
             let req = try c.decode(ActionRequest.self, forKey: .request)
             self = .actionRequest(sessionId: sid, threadId: tid, agentKind: kind, request: req)
+        case "turnStarted":
+            let sid = try c.decode(String.self, forKey: .sessionId)
+            let tid = try c.decode(String.self, forKey: .threadId)
+            let kind = try c.decode(AgentKind.self, forKey: .agentKind)
+            let turnId = try c.decode(TurnId.self, forKey: .turnId)
+            self = .turnStarted(sessionId: sid, threadId: tid, agentKind: kind, turnId: turnId)
+        case "turnFinished":
+            let sid = try c.decode(String.self, forKey: .sessionId)
+            let tid = try c.decode(String.self, forKey: .threadId)
+            let kind = try c.decode(AgentKind.self, forKey: .agentKind)
+            let turnId = try c.decode(TurnId.self, forKey: .turnId)
+            let outcome = try c.decode(TurnOutcome.self, forKey: .outcome)
+            let nextState = try c.decode(TurnNextState.self, forKey: .nextState)
+            let summary = try c.decodeIfPresent(TurnSummary.self, forKey: .summary)
+            let error = try c.decodeIfPresent(ProtocolError.self, forKey: .error)
+            self = .turnFinished(
+                sessionId: sid,
+                threadId: tid,
+                agentKind: kind,
+                turnId: turnId,
+                outcome: outcome,
+                nextState: nextState,
+                summary: summary,
+                error: error
+            )
+        case "sessionClosed":
+            let sid = try c.decode(String.self, forKey: .sessionId)
+            let tid = try c.decodeIfPresent(String.self, forKey: .threadId)
+            let kind = try c.decode(AgentKind.self, forKey: .agentKind)
+            let outcome = try c.decode(SessionOutcome.self, forKey: .outcome)
+            let error = try c.decodeIfPresent(ProtocolError.self, forKey: .error)
+            self = .sessionClosed(
+                sessionId: sid,
+                threadId: tid,
+                agentKind: kind,
+                outcome: outcome,
+                error: error
+            )
         case "turnComplete":
             let sid = try c.decode(String.self, forKey: .sessionId)
             let tid = try c.decode(String.self, forKey: .threadId)
@@ -1306,6 +1433,38 @@ extension ServerEvent: Codable {
             try c.encode(tid, forKey: .threadId)
             try c.encode(kind, forKey: .agentKind)
             try c.encode(req, forKey: .request)
+        case .turnStarted(let sid, let tid, let kind, let turnId):
+            try c.encode("turnStarted", forKey: .type)
+            try c.encode(sid, forKey: .sessionId)
+            try c.encode(tid, forKey: .threadId)
+            try c.encode(kind, forKey: .agentKind)
+            try c.encode(turnId, forKey: .turnId)
+        case .turnFinished(
+            let sid,
+            let tid,
+            let kind,
+            let turnId,
+            let outcome,
+            let nextState,
+            let summary,
+            let error
+        ):
+            try c.encode("turnFinished", forKey: .type)
+            try c.encode(sid, forKey: .sessionId)
+            try c.encode(tid, forKey: .threadId)
+            try c.encode(kind, forKey: .agentKind)
+            try c.encode(turnId, forKey: .turnId)
+            try c.encode(outcome, forKey: .outcome)
+            try c.encode(nextState, forKey: .nextState)
+            try c.encodeIfPresent(summary, forKey: .summary)
+            try c.encodeIfPresent(error, forKey: .error)
+        case .sessionClosed(let sid, let tid, let kind, let outcome, let error):
+            try c.encode("sessionClosed", forKey: .type)
+            try c.encode(sid, forKey: .sessionId)
+            try c.encodeIfPresent(tid, forKey: .threadId)
+            try c.encode(kind, forKey: .agentKind)
+            try c.encode(outcome, forKey: .outcome)
+            try c.encodeIfPresent(error, forKey: .error)
         case .turnComplete(let sid, let tid, let kind, let summary):
             try c.encode("turnComplete", forKey: .type)
             try c.encode(sid, forKey: .sessionId)

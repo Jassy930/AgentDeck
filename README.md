@@ -26,8 +26,13 @@ macOS 旧 AppKit 客户端已经移除。新的 `agentdeck-desktop` 使用 Rust�
 这些能力只按新的纵向切片逐步加入；当前仓库先收敛本地最小闭环。
 
 后端 `agentdeckd` 已有 Codex / Claude Code adapter、history、approval、record 和
-diagnostics 等较宽的代码表面，但还没有形成 desktop 可依赖的稳定 session 闭环。
-当前完整度和缺口见 [docs/AGENTDECKD_STATUS.md](docs/AGENTDECKD_STATUS.md)。
+diagnostics 等较宽的代码表面。Codex 路径已经落地 protocol v3 的 session-scoped
+生命周期切片：规范握手、顺序多轮、原生 turn interrupt、显式 close/wait，以及 Unix
+进程组消失与路由清除后的 `SessionClosed`；stdin EOF 会有序关闭并等待 retained session，
+无法确认 cleanup 时 daemon 会 poison 并退出。这仍不是 desktop 可依赖的完整 M0：客户端可见 streaming、
+持久连接 CLI/真实 vendor 验收和生产 RunRecord/diagnostics 分别留在 #4、#5、#6，且
+本轮没有运行真实 Codex session/prompt。当前完整度和证据边界见
+[docs/AGENTDECKD_STATUS.md](docs/AGENTDECKD_STATUS.md)。
 
 ## 仓库结构
 
@@ -134,10 +139,15 @@ Codex / Claude Code E2E 证据；完整边界见 [docs/QUALITY.md](docs/QUALITY.
 
 下一目标是先稳定 daemon，再开始 desktop 的真实连接，而不是恢复旧客户端的全部功能：
 
-1. 先完成 Codex-only 的 `agentdeckd` M0：session-scoped app-server、顺序 turn、真实流式文本、可信终态、取消、清理与可观测闭环。
-2. 用连续两轮和 cancel 后续轮的门控 E2E 验收 daemon；desktop 首切片仍只消费首轮。
-3. 再抽出 typed local client，并连接本机 `agentdeckd`。
-4. 在该闭环稳定后再增加历史、审批、Markdown、Claude Code 和多 agent 能力。
+1. 以已落地的 Issue #3 生命周期切片为底座，在 #4 补齐稳定 `itemId` 和客户端可见的
+   累计 streaming。
+2. 在 #5 增加持有同一 daemon 连接的 CLI/test driver，并用连续两轮、cancel 后续轮和
+   `SessionClose` 的真实 Codex E2E 验收同 PID/threadId 复用。
+3. 在 #6 把 RunRecord、lifecycle diagnostics 和可定位的 `diagnosticRef` 接入生产路径，
+   完成 M0 可观测闭环。
+4. M0 全部门禁通过后，再抽出 typed local client 并连接本机 `agentdeckd`；desktop 首
+   切片仍只消费首轮。
+5. 在该闭环稳定后再增加历史、审批、Markdown、Claude Code 和多 agent 能力。
 
 设计和实施边界见：
 

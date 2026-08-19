@@ -12,9 +12,24 @@
 重生成快照；仅清除不属于本地 IPC 的聚合根不改变版本。`cargo test` 的 drift 测试
 会在类型与快照脱节时失败。
 
-## actionDecision 线形态（非 typed 结构，故不在 schema）
-`{ "kind": "actionDecision", "id": <u64>, "sessionId": <string>,
-   "payload": { "requestId": <u64>, "decision": "approve"|"deny"|"cancel" } }`
+## actionDecision wire 形态
+
+`ActionDecision` 是 protocol v3 `ClientCommand` 的 typed variant，并包含在 schema：
+
+```json
+{
+  "command": "actionDecision",
+  "sessionId": "<string>",
+  "decision": {
+    "requestId": "<string>",
+    "decision": "approve",
+    "persist": false
+  }
+}
+```
+
+`decision.decision` 只接受 `approve` / `deny`；协议没有顶层 numeric `id`、`payload`
+包装或 `cancel` decision。
 
 ## v0.2 起：两层协议
 
@@ -22,8 +37,9 @@ v0.2 引入了严格的两层协议结构：
 
 ### Layer A — 事件主干（中立，vendor 中性）
 
-包含：`AgentItem` / `ActionRequest` / `TurnComplete` / `SessionStarted` /
-`SessionCapabilities` / `Error`。
+包含：`AgentItem` / `ActionRequest` / `SessionStarted` / `SessionCapabilities` /
+`TurnStarted` / `TurnFinished` / `SessionClosed` / `Error`。`TurnComplete` 暂只作为
+尚未迁移的 Claude Code legacy terminal 保留。
 
 **守护规则**：主干类型严禁出现 `Codex`、`OpenAI`、`Anthropic`、`Claude` 字样。
 由 `agentdeck-protocol/src/neutrality_tests.rs` 中的静态断言守护（N1 不变量）。

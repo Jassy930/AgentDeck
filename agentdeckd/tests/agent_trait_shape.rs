@@ -79,3 +79,22 @@ async fn default_handle_history_returns_history_not_supported() {
     let err = a.handle_history(req).await.unwrap_err();
     assert_eq!(err.code, "history-not-supported");
 }
+
+#[tokio::test]
+async fn default_live_lifecycle_methods_return_structured_not_supported_errors() {
+    let agent = DefaultHistoryStub;
+    let session_id = SessionId("legacy-session".into());
+    let turn_id = TurnId("legacy-turn".into());
+
+    let start_error = agent
+        .start_turn(&session_id, turn_id.clone(), "hello".into())
+        .await
+        .unwrap_err();
+    assert_eq!(start_error.code, "turn-start-not-supported");
+
+    let cancel_error = agent.cancel_turn(&session_id, &turn_id).await.unwrap_err();
+    assert_eq!(cancel_error.code, "turn-cancel-not-supported");
+
+    let close_error = agent.close_session(&session_id).await.unwrap_err();
+    assert_eq!(close_error.code, "session-close-not-supported");
+}

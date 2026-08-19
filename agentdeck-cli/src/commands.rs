@@ -13,7 +13,8 @@ use crate::transport;
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode,
     ClaudeCodeSessionOptions, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
-    CodexSessionOptions, HistoryRequest, ServerEvent, SessionStart, VendorSessionOptions,
+    CodexSessionOptions, HistoryRequest, ProtocolError, ServerEvent, SessionOutcome, TurnOutcome,
+    VendorSessionOptions,
 };
 
 // ── Ping ──────────────────────────────────────────────────────────────────────
@@ -102,14 +103,7 @@ pub async fn handle_session_run(
     pretty: bool,
 ) -> Result<(), CliError> {
     let vendor_options = build_vendor_options(&args)?;
-    let start = SessionStart {
-        agent_kind: args.agent.into(),
-        cwd: args.cwd,
-        prompt: Some(args.prompt),
-        vendor_options,
-        runtime_options: Default::default(),
-    };
-    let cmd = session_start_cmd(start);
+    let cmd = session_start_cmd(args.agent.into(), args.cwd, args.prompt, vendor_options);
     let mut events = client::stream_session(cmd, profile, data_dir).await?;
     drain_events(&mut events, pretty).await
 }
@@ -126,7 +120,9 @@ pub async fn handle_session_continue(
     // C3 fix: `cwd` now flows from CLI flag → daemon → vendor adapter,
     // so CC `--resume` and tool_use run in the original session's
     // directory rather than the daemon's `std::env::current_dir()`.
-    let cmd = session_continue_cmd(thread_id, agent.into(), cwd, prompt);
+    let agent_kind = agent.into();
+    let vendor_options = build_continue_vendor_options(agent_kind);
+    let cmd = session_continue_cmd(thread_id, agent_kind, cwd, prompt, vendor_options);
     let mut events = client::stream_session(cmd, profile, data_dir).await?;
     drain_events(&mut events, pretty).await
 }
@@ -139,7 +135,21 @@ async fn drain_events(
         let v = serde_json::to_value(&ev)?;
         println!("{}", render(&v, pretty));
         match &ev {
+            ServerEvent::TurnFinished {
+                outcome: TurnOutcome::Succeeded,
+                ..
+            } => return Ok(()),
+            ServerEvent::TurnFinished { outcome, error, .. } => {
+                return Err(turn_terminal_error(*outcome, error.as_ref()));
+            }
             ServerEvent::TurnComplete { .. } => return Ok(()),
+            ServerEvent::SessionClosed { outcome, error, .. } => {
+                let default_code = match outcome {
+                    SessionOutcome::Failed => "session-failed-before-turn-terminal",
+                    SessionOutcome::Closed => "session-closed-before-turn-terminal",
+                };
+                return Err(protocol_error_or_default(error.as_ref(), default_code));
+            }
             ServerEvent::Error { error, .. } => {
                 // C5 fix: surface the daemon's structured `error.code`
                 // (e.g. `cc-not-installed`) so callers / tests can
@@ -159,6 +169,28 @@ async fn drain_events(
     })
 }
 
+fn turn_terminal_error(outcome: TurnOutcome, error: Option<&ProtocolError>) -> CliError {
+    let default_code = match outcome {
+        TurnOutcome::Succeeded => "turn-finished-unexpectedly",
+        TurnOutcome::Failed => "turn-failed",
+        TurnOutcome::Canceled => "turn-canceled",
+    };
+    protocol_error_or_default(error, default_code)
+}
+
+fn protocol_error_or_default(error: Option<&ProtocolError>, default_code: &str) -> CliError {
+    match error {
+        Some(error) => CliError::Session {
+            code: Some(error.code.clone()),
+            message: error.message.clone(),
+        },
+        None => CliError::Session {
+            code: Some(default_code.into()),
+            message: default_code.replace('-', " "),
+        },
+    }
+}
+
 // ── History ───────────────────────────────────────────────────────────────────
 
 pub fn handle_history(c: &mut Client, req: HistoryRequest, pretty: bool) -> Result<(), CliError> {
@@ -176,11 +208,11 @@ fn build_vendor_options(args: &SessionRunArgs) -> Result<VendorSessionOptions, C
             approval_policy: args
                 .approval
                 .map(Into::into)
-                .unwrap_or(CodexApprovalPolicy::OnRequest),
+                .unwrap_or(CodexApprovalPolicy::Never),
             sandbox: args
                 .sandbox
                 .map(Into::into)
-                .unwrap_or(CodexSandboxMode::WorkspaceWrite),
+                .unwrap_or(CodexSandboxMode::ReadOnly),
             persist_approval: args.persist_approval,
             reasoning_effort: args
                 .reasoning_effort
@@ -207,6 +239,43 @@ fn build_vendor_options(args: &SessionRunArgs) -> Result<VendorSessionOptions, C
                 session_id: None,
             }))
         }
+    }
+}
+
+fn build_continue_vendor_options(agent_kind: AgentKind) -> VendorSessionOptions {
+    match agent_kind {
+        AgentKind::Codex => VendorSessionOptions::Codex(CodexSessionOptions {
+            approval_policy: CodexApprovalPolicy::Never,
+            sandbox: CodexSandboxMode::ReadOnly,
+            persist_approval: false,
+            reasoning_effort: CodexReasoningEffort::Medium,
+            mcp_overrides: vec![],
+        }),
+        AgentKind::ClaudeCode => {
+            let mut options = default_claude_code_options();
+            // The one-shot CLI has no live approval-response channel. Preserve
+            // the established resume posture so a continued turn cannot block
+            // waiting for an approval the caller has no way to answer.
+            options.permission_mode = ClaudeCodePermissionMode::BypassPermissions;
+            VendorSessionOptions::ClaudeCode(options)
+        }
+    }
+}
+
+fn default_claude_code_options() -> ClaudeCodeSessionOptions {
+    ClaudeCodeSessionOptions {
+        permission_mode: ClaudeCodePermissionMode::Default,
+        model: None,
+        effort: None,
+        hooks: vec![],
+        output_style: None,
+        allowed_tools: None,
+        disallowed_tools: None,
+        mcp_config_path: None,
+        plugin_dirs: vec![],
+        worktree: None,
+        session_name: None,
+        session_id: None,
     }
 }
 
@@ -317,7 +386,7 @@ pub fn resolve_action_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentdeck_protocol::{SessionId, ThreadId, TurnSummary};
+    use agentdeck_protocol::{SessionId, ThreadId, TurnId, TurnNextState, TurnSummary};
     use std::path::PathBuf;
 
     fn make_run_args(agent: AgentKindArg) -> SessionRunArgs {
@@ -365,15 +434,19 @@ mod tests {
     #[tokio::test]
     async fn drain_events_accepts_turn_terminal_before_channel_close() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tx.send(ServerEvent::TurnComplete {
+        tx.send(ServerEvent::TurnFinished {
             session_id: SessionId("session-1".into()),
             thread_id: ThreadId("thread-1".into()),
             agent_kind: AgentKind::Codex,
-            summary: TurnSummary {
+            turn_id: TurnId("turn-1".into()),
+            outcome: TurnOutcome::Succeeded,
+            next_state: TurnNextState::Ready,
+            summary: Some(TurnSummary {
                 total_input_tokens: None,
                 total_output_tokens: None,
                 elapsed_ms: 1,
-            },
+            }),
+            error: None,
         })
         .await
         .expect("receiver is open");
@@ -390,8 +463,8 @@ mod tests {
         let opts = build_vendor_options(&args).unwrap();
         match opts {
             VendorSessionOptions::Codex(co) => {
-                assert_eq!(co.sandbox, CodexSandboxMode::WorkspaceWrite);
-                assert_eq!(co.approval_policy, CodexApprovalPolicy::OnRequest);
+                assert_eq!(co.sandbox, CodexSandboxMode::ReadOnly);
+                assert_eq!(co.approval_policy, CodexApprovalPolicy::Never);
                 assert_eq!(co.reasoning_effort, CodexReasoningEffort::Medium);
                 assert!(!co.persist_approval);
             }
@@ -446,6 +519,18 @@ mod tests {
             }
             _ => panic!("expected ClaudeCode"),
         }
+    }
+
+    #[test]
+    fn build_continue_vendor_options_cc_bypasses_unanswerable_approvals() {
+        let options = build_continue_vendor_options(AgentKind::ClaudeCode);
+        let VendorSessionOptions::ClaudeCode(options) = options else {
+            panic!("expected Claude Code options");
+        };
+        assert_eq!(
+            options.permission_mode,
+            ClaudeCodePermissionMode::BypassPermissions
+        );
     }
 
     #[test]

@@ -291,9 +291,9 @@ impl AsyncProcessTransport {
         let rx = self.line_rx.take().expect("only call into_parts once");
         (
             AsyncTransportWriter {
-                child: inner.child,
-                _writer: inner.writer,
-                reader_task: inner.reader_task,
+                child: Some(inner.child),
+                writer: Some(inner.writer),
+                reader_task: Some(inner.reader_task),
             },
             rx,
         )
@@ -319,22 +319,196 @@ impl Drop for AsyncProcessTransport {
 /// Writer half after splitting an `AsyncProcessTransport`.
 /// Keeps the daemon child alive until dropped.
 pub struct AsyncTransportWriter {
-    child: tokio::process::Child,
+    child: Option<tokio::process::Child>,
     /// Stdin kept open so daemon doesn't get EOF until we drop.
-    _writer: tokio::process::ChildStdin,
-    reader_task: tokio::task::JoinHandle<()>,
+    writer: Option<tokio::process::ChildStdin>,
+    reader_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AsyncTransportWriter {
+    pub async fn send_line(&mut self, line: &str) -> std::io::Result<()> {
+        let writer = self.writer.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "daemon stdin is closed")
+        })?;
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await
+    }
+
+    /// Close daemon stdin, let RuntimeHub close/reap its live session, and
+    /// wait for the daemon to exit. `Drop` remains a kill-only fallback for a
+    /// canceled runtime task; normal CLI terminals must use this path.
+    pub async fn shutdown(self) -> std::io::Result<()> {
+        self.shutdown_with_timeouts(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+    }
+
+    async fn shutdown_with_timeouts(
+        mut self,
+        graceful_timeout: std::time::Duration,
+        forced_timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        self.writer.take();
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+
+        let wait_result = match tokio::time::timeout(graceful_timeout, child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(Ok(status)) => Err(std::io::Error::other(format!(
+                "agentdeckd exited unsuccessfully during shutdown: {status}"
+            ))),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                let _ = child.start_kill();
+                match tokio::time::timeout(forced_timeout, child.wait()).await {
+                    Ok(Ok(_)) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for clean agentdeckd shutdown; child was killed and reaped",
+                    )),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(std::io::Error::other(
+                        "timed out reaping agentdeckd after forced shutdown",
+                    )),
+                }
+            }
+        };
+
+        if let Some(reader_task) = self.reader_task.take() {
+            let _ = reader_task.await;
+        }
+        wait_result
+    }
 }
 
 impl Drop for AsyncTransportWriter {
     fn drop(&mut self) {
-        self.reader_task.abort();
-        let _ = self.child.start_kill();
+        if let Some(reader_task) = self.reader_task.take() {
+            reader_task.abort();
+        }
+        if let Some(child) = &mut self.child {
+            let _ = child.start_kill();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_writer_shutdown_closes_stdin_and_waits_for_daemon_exit() {
+        use tokio::io::AsyncReadExt;
+
+        let marker = std::env::temp_dir().join(format!(
+            "agentdeck-async-shutdown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut child = TokioCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("while IFS= read -r _; do :; done; : > \"$1\"")
+            .arg("agentdeck-test")
+            .arg(&marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let reader_task = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            let _ = stdout.read_to_end(&mut sink).await;
+        });
+        let transport = AsyncTransportWriter {
+            child: Some(child),
+            writer: Some(writer),
+            reader_task: Some(reader_task),
+        };
+
+        transport.shutdown().await.unwrap();
+        assert!(
+            marker.is_file(),
+            "daemon must observe stdin EOF and finish before shutdown returns"
+        );
+        std::fs::remove_file(marker).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_writer_shutdown_reports_when_graceful_exit_times_out() {
+        use tokio::io::AsyncReadExt;
+
+        let mut child = TokioCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("while :; do :; done")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let reader_task = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            let _ = stdout.read_to_end(&mut sink).await;
+        });
+        let transport = AsyncTransportWriter {
+            child: Some(child),
+            writer: Some(writer),
+            reader_task: Some(reader_task),
+        };
+
+        let error = transport
+            .shutdown_with_timeouts(
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect_err("forced reap must not be reported as a clean shutdown");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_writer_shutdown_reports_nonzero_graceful_exit_status() {
+        use tokio::io::AsyncReadExt;
+
+        let mut child = TokioCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("while IFS= read -r _; do :; done; exit 7")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let reader_task = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            let _ = stdout.read_to_end(&mut sink).await;
+        });
+        let transport = AsyncTransportWriter {
+            child: Some(child),
+            writer: Some(writer),
+            reader_task: Some(reader_task),
+        };
+
+        let error = transport
+            .shutdown()
+            .await
+            .expect_err("a nonzero daemon exit must fail graceful shutdown");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(
+            error.to_string().contains("exit status: 7"),
+            "shutdown error must preserve the daemon exit status: {error}"
+        );
+    }
 
     #[test]
     fn fake_records_sent_and_replays_incoming() {
