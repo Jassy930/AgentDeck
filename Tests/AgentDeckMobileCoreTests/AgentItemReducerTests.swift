@@ -18,7 +18,7 @@ final class AgentItemReducerTests: XCTestCase {
         )
         var store = AgentItemStore()
 
-        AgentItemReducer.apply(agentItem, itemId: "tool-1", into: &store)
+        AgentItemReducer.apply(agentItem, itemId: "tool-1", state: .completed, into: &store)
 
         let item = try XCTUnwrap(store.items.first)
         XCTAssertEqual(item.server, "node_repl")
@@ -54,7 +54,7 @@ final class AgentItemReducerTests: XCTestCase {
         )
         var store = AgentItemStore()
 
-        AgentItemReducer.apply(agentItem, itemId: "collab-1", into: &store)
+        AgentItemReducer.apply(agentItem, itemId: "collab-1", state: .completed, into: &store)
 
         let item = try XCTUnwrap(store.items.first)
         XCTAssertEqual(item.activityKind, "collaboration")
@@ -79,7 +79,7 @@ final class AgentItemReducerTests: XCTestCase {
         )
         var store = AgentItemStore()
 
-        AgentItemReducer.apply(agentItem, itemId: "compact-1", into: &store)
+        AgentItemReducer.apply(agentItem, itemId: "compact-1", state: .completed, into: &store)
 
         let item = try XCTUnwrap(store.items.first)
         let row = ConversationDisplayRow(
@@ -107,7 +107,7 @@ final class AgentItemReducerTests: XCTestCase {
         )
         var store = AgentItemStore()
 
-        AgentItemReducer.apply(agentItem, itemId: "tool-cc-1", into: &store)
+        AgentItemReducer.apply(agentItem, itemId: "tool-cc-1", state: .completed, into: &store)
 
         let item = try XCTUnwrap(store.items.first)
         XCTAssertEqual(item.success, false)
@@ -130,11 +130,34 @@ final class AgentItemReducerTests: XCTestCase {
         )
         var store = AgentItemStore()
 
-        AgentItemReducer.apply(agentItem, itemId: "tool-canonical", into: &store)
+        AgentItemReducer.apply(agentItem, itemId: "tool-canonical", state: .completed, into: &store)
 
         let item = try XCTUnwrap(store.items.first)
         XCTAssertEqual(item.resourceUri, "app://canonical-agentdeck")
         XCTAssertEqual(item.action, "确认 AgentDeck 窗口")
         XCTAssertEqual(ToolPresentation.toolContextSummary(item), "确认 AgentDeck 窗口")
+    }
+
+    func testCumulativeSnapshotsReplaceByEnvelopeIdentityAndState() throws {
+        var store = AgentItemStore()
+
+        AgentItemReducer.apply(
+            .assistantMessage(text: "Hel", meta: AgentItemMeta()),
+            itemId: "message-1",
+            state: .streaming,
+            into: &store
+        )
+        AgentItemReducer.apply(
+            .assistantMessage(text: "Hello", meta: AgentItemMeta()),
+            itemId: "message-1",
+            state: .completed,
+            into: &store
+        )
+
+        let item = try XCTUnwrap(store.items.first)
+        XCTAssertEqual(store.items.count, 1)
+        XCTAssertEqual(item.id, "message-1")
+        XCTAssertEqual(item.text, "Hello")
+        XCTAssertEqual(item.lifecycle, "completed")
     }
 }

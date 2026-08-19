@@ -1,4 +1,4 @@
-//! Codex JSON-RPC → v3 `ServerEvent` translation.
+//! Codex JSON-RPC → protocol v4 `ServerEvent` translation.
 //!
 //! Phase 3 Task 3A. This is the entire vendor-coupling surface for Codex on
 //! the current protocol: a stateful translator owned per-session by Task 3B's
@@ -6,31 +6,19 @@
 //! `codex app-server` stdout pipe at a time and produces 0..N neutral
 //! `ServerEvent`s.
 //!
-//! ## Cumulative semantics (replaces v1 Lifecycle)
+//! ## Cumulative streaming semantics
 //!
-//! v1 surfaced Codex's streaming pattern as three lifecycle phases
-//! (`Started` / `Delta` / `Completed`) on every `AgentItem`. The UI was
-//! responsible for accumulation (e.g. concatenating `agentMessage` deltas).
-//!
-//! v2 inverts that: the translator accumulates deltas internally in
-//! `in_flight`, keyed by Codex's item id, and emits exactly ONE
-//! `ServerEvent::AgentItem` when the corresponding `item/completed`
-//! notification arrives. The UI sees only complete items — no fragmentary
-//! state, no lifecycle bookkeeping (decision A in the SDD progress block
-//! "Lifecycle 替代方案").
-//!
-//! Side effect: streaming `agentMessage` text no longer arrives token-by-token
-//! at the UI. Codex emits a `text` snapshot on `item/agentMessage/started`
-//! that's empty, accumulates via deltas, and ships the final string in the
-//! `item/completed` payload. We use the completed payload's `text` as the
-//! source of truth (Codex itself does the cumulative join), with a fallback
-//! to our delta accumulator if the completed payload is missing.
+//! The translator owns the delta accumulator keyed by Codex's official item
+//! id. Every non-empty assistant-message delta appends to that buffer and
+//! emits the complete text-so-far as `state=streaming`; `item/completed`
+//! emits the same `itemId` once with `state=completed`. Clients replace by
+//! item id and never concatenate raw vendor deltas.
 //!
 //! ## Approvals
 //!
 //! Approvals arrive as JSON-RPC **requests** (have an `id` AND a `method`).
-//! The v1 codex/mod.rs handled them out-of-band in `turn_start`; in v2 the
-//! translator surfaces them as `ServerEvent::ActionRequest`. Task 3B's
+//! The legacy codex/mod.rs handled them out-of-band in `turn_start`; the
+//! current translator surfaces them as `ServerEvent::ActionRequest`. Task 3B's
 //! adapter is responsible for storing the original `id` (so it can route
 //! the client's `ActionDecision` back to Codex as a JSON-RPC response) —
 //! the translator only emits the neutral event.
@@ -53,14 +41,14 @@
 //! (`thread/tokenUsage/updated`, `turn/diff/updated`, etc.) yield no
 //! events — Task 3B can wire those into vendor panel events later.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
 use agentdeck_protocol::{
-    ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentKind,
-    CodexApprovalPolicy, CodexSandboxMode, DiffFile, DiffStatus, PlanStep, PlanStepStatus,
-    ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnSummary,
+    ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentItemState,
+    AgentKind, CodexApprovalPolicy, CodexSandboxMode, DiffFile, DiffStatus, PlanStep,
+    PlanStepStatus, ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnId,
 };
 
 /// One translator output. Carries the neutral `ServerEvent` plus an
@@ -100,9 +88,12 @@ pub struct RpcRouteHint {
 pub struct CodexTranslator {
     session_id: SessionId,
     thread_id: Option<ThreadId>,
+    active_turn_id: Option<TurnId>,
+    active_vendor_turn_id: Option<String>,
     /// In-flight items keyed by Codex item id; updated by delta events,
     /// flushed to `ServerEvent::AgentItem` when Codex emits `item/completed`.
     in_flight: HashMap<String, InFlightItem>,
+    completed_item_ids: HashSet<String>,
     /// Codex sometimes omits an approval id on `item/permissions/...`
     /// requests; we synthesize one off this counter so the daemon can
     /// route the matching decision back.
@@ -179,7 +170,10 @@ impl CodexTranslator {
         Self {
             session_id,
             thread_id,
+            active_turn_id: None,
+            active_vendor_turn_id: None,
             in_flight: HashMap::new(),
+            completed_item_ids: HashSet::new(),
             next_request_id: 1,
             approval_policy,
             sandbox,
@@ -197,6 +191,24 @@ impl CodexTranslator {
 
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    pub fn begin_turn(&mut self, turn_id: TurnId) {
+        self.active_turn_id = Some(turn_id);
+        self.active_vendor_turn_id = None;
+        self.in_flight.clear();
+        self.completed_item_ids.clear();
+    }
+
+    pub fn set_vendor_turn_id(&mut self, turn_id: impl Into<String>) {
+        self.active_vendor_turn_id = Some(turn_id.into());
+    }
+
+    pub fn finish_turn(&mut self) {
+        self.active_turn_id = None;
+        self.active_vendor_turn_id = None;
+        self.in_flight.clear();
+        self.completed_item_ids.clear();
     }
 
     /// Translate one line of Codex app-server JSONL output.
@@ -227,13 +239,13 @@ impl CodexTranslator {
     /// routing entries before forwarding the event downstream.
     ///
     /// Returns 0..N `TranslateOutput`s. The shape is:
-    /// - Empty for lifecycle-only frames (`thread/started`,
-    ///   `item/*/delta` while accumulating, plain JSON-RPC responses to
-    ///   our outbound requests).
-    /// - One `AgentItem` for each `item/completed`.
+    /// - Empty for lifecycle-only frames and plain JSON-RPC responses.
+    /// - One cumulative streaming `AgentItem` for each non-empty assistant
+    ///   delta, then one completed `AgentItem` for `item/completed`.
     /// - One `ActionRequest` + populated `RpcRouteHint` for each Codex
     ///   approval request.
-    /// - One `TurnComplete` for each `turn/completed`.
+    /// - No turn terminal; the session owner alone maps `turn/completed` to
+    ///   the authoritative `TurnFinished` event.
     /// - One `Error` for any malformed input or Codex-reported error frame.
     pub fn translate_line_with_routes(&mut self, line: &str) -> Vec<TranslateOutput> {
         let trimmed = line.trim();
@@ -302,10 +314,14 @@ impl CodexTranslator {
                 // Unknown server-request method — surface as Raw so it
                 // doesn't disappear, but tag as Raw `AgentItem` (not
                 // `Error`, since Codex might add benign future requests).
-                return vec![TranslateOutput {
-                    event: self.raw_event_for_unknown_method(m, frame),
-                    rpc_route_hint: None,
-                }];
+                return self
+                    .raw_event_for_unknown_method(m, frame)
+                    .into_iter()
+                    .map(|event| TranslateOutput {
+                        event,
+                        rpc_route_hint: None,
+                    })
+                    .collect();
             }
             return Vec::new();
         }
@@ -340,7 +356,7 @@ impl CodexTranslator {
                 }
             }
             "turn/started" => {
-                // Pure lifecycle, no neutral counterpart in v2. Capture
+                // Pure lifecycle, with no neutral event counterpart. Capture
                 // the threadId opportunistically.
                 if let Some(id) = params.get("threadId").and_then(Value::as_str) {
                     if self.thread_id.is_none() {
@@ -349,7 +365,7 @@ impl CodexTranslator {
                 }
                 Vec::new()
             }
-            "turn/completed" => vec![self.turn_complete_event(&params)],
+            "turn/completed" => Vec::new(),
             "thread/closed"
             | "thread/archived"
             | "thread/unarchived"
@@ -367,18 +383,17 @@ impl CodexTranslator {
             }
             "item/started" => self.handle_item_started(&params),
             "item/completed" => self.handle_item_completed(&params),
-            // Streaming deltas — accumulate, do not emit.
-            "item/agentMessage/delta" => {
-                self.accumulate_text_delta(&params, InFlightKind::AssistantMessage, "delta");
-                Vec::new()
-            }
+            "item/agentMessage/delta" => self
+                .accumulate_text_delta(&params, InFlightKind::AssistantMessage, "delta")
+                .into_iter()
+                .collect(),
             "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
-                self.accumulate_text_delta(&params, InFlightKind::Reasoning, "delta");
+                let _ = self.accumulate_text_delta(&params, InFlightKind::Reasoning, "delta");
                 Vec::new()
             }
             "item/reasoning/summaryPartAdded" => {
                 // The summary stream uses discrete parts ({summary: string}).
-                self.accumulate_text_delta(&params, InFlightKind::Reasoning, "summary");
+                let _ = self.accumulate_text_delta(&params, InFlightKind::Reasoning, "summary");
                 Vec::new()
             }
             "item/commandExecution/outputDelta" => {
@@ -392,7 +407,7 @@ impl CodexTranslator {
                 Vec::new()
             }
             "item/plan/delta" => {
-                self.accumulate_text_delta(&params, InFlightKind::Plan, "delta");
+                let _ = self.accumulate_text_delta(&params, InFlightKind::Plan, "delta");
                 Vec::new()
             }
             "item/mcpToolCall/progress" => Vec::new(),
@@ -401,7 +416,9 @@ impl CodexTranslator {
                 // Unknown item-level notification. Don't drop; produce a Raw
                 // item carrying only a bounded identifier and fixed withheld
                 // placeholder so the issue stays visible without vendor JSON.
-                vec![self.raw_event_for_unknown_method(other, &json!({"params": params}))]
+                self.raw_event_for_unknown_method(other, &json!({"params": params}))
+                    .into_iter()
+                    .collect()
             }
             _ => Vec::new(),
         };
@@ -417,6 +434,9 @@ impl CodexTranslator {
     // ── item/started ────────────────────────────────────────────────────────
 
     fn handle_item_started(&mut self, params: &Value) -> Vec<ServerEvent> {
+        if !self.matches_active_turn(params) {
+            return Vec::new();
+        }
         let Some(item) = params.get("item") else {
             return Vec::new();
         };
@@ -441,7 +461,7 @@ impl CodexTranslator {
             _ => String::new(),
         };
         self.in_flight.insert(
-            id,
+            id.clone(),
             InFlightItem {
                 kind,
                 accumulated_text: initial_text,
@@ -451,7 +471,10 @@ impl CodexTranslator {
         // For shell, emit a Running snapshot immediately so the UI can
         // surface "currently executing" feedback before completion.
         if matches!(kind, InFlightKind::Shell) {
-            return vec![self.shell_event(item, ShellStatus::Running)];
+            return self
+                .shell_event(&id, AgentItemState::Streaming, item, ShellStatus::Running)
+                .into_iter()
+                .collect();
         }
         Vec::new()
     }
@@ -459,6 +482,9 @@ impl CodexTranslator {
     // ── item/completed ──────────────────────────────────────────────────────
 
     fn handle_item_completed(&mut self, params: &Value) -> Vec<ServerEvent> {
+        if !self.matches_active_turn(params) {
+            return Vec::new();
+        }
         let Some(item) = params.get("item") else {
             return Vec::new();
         };
@@ -467,6 +493,9 @@ impl CodexTranslator {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_default();
+        if id.is_empty() || !self.completed_item_ids.insert(id.clone()) {
+            return Vec::new();
+        }
         // If we never saw `started`, classify on the fly so completed-only
         // streams (some panel-style items) still surface.
         let prior = self.in_flight.remove(&id);
@@ -479,64 +508,72 @@ impl CodexTranslator {
             .map(|p| p.accumulated_text.clone())
             .unwrap_or_default();
         if matches!(kind, InFlightKind::Shell) {
-            return vec![self.shell_event(item, shell_status_from(item))];
+            return self
+                .shell_event(
+                    &id,
+                    AgentItemState::Completed,
+                    item,
+                    shell_status_from(item),
+                )
+                .into_iter()
+                .collect();
         }
         let agent_item = completed_item_to_agent_item(item, kind, &accumulated);
 
-        vec![self.agent_item_event(agent_item, params)]
+        self.agent_item_event(&id, AgentItemState::Completed, agent_item, params)
+            .into_iter()
+            .collect()
     }
 
     // ── shell event builder (used for both Running + Completed/Failed) ─────
 
-    fn shell_event(&self, item: &Value, status: ShellStatus) -> ServerEvent {
-        ServerEvent::AgentItem {
-            session_id: self.session_id.clone(),
-            thread_id: self.resolve_thread_id(item),
-            agent_kind: AgentKind::Codex,
-            item: shell_agent_item(item, status),
-        }
+    fn shell_event(
+        &self,
+        item_id: &str,
+        state: AgentItemState,
+        item: &Value,
+        status: ShellStatus,
+    ) -> Option<ServerEvent> {
+        self.agent_item_event(item_id, state, shell_agent_item(item, status), item)
     }
 
-    fn agent_item_event(&self, item: AgentItem, params: &Value) -> ServerEvent {
-        ServerEvent::AgentItem {
+    fn agent_item_event(
+        &self,
+        item_id: &str,
+        state: AgentItemState,
+        item: AgentItem,
+        params: &Value,
+    ) -> Option<ServerEvent> {
+        let turn_id = self.active_turn_id.clone()?;
+        (!item_id.is_empty()).then(|| ServerEvent::AgentItem {
             session_id: self.session_id.clone(),
             thread_id: self.resolve_thread_id(params),
             agent_kind: AgentKind::Codex,
+            turn_id,
+            item_id: item_id.to_string(),
+            state,
             item,
-        }
-    }
-
-    // ── turn complete ──────────────────────────────────────────────────────
-
-    fn turn_complete_event(&self, params: &Value) -> ServerEvent {
-        let usage = params.get("usage");
-        let summary = TurnSummary {
-            total_input_tokens: usage
-                .and_then(|u| u.get("inputTokens"))
-                .and_then(Value::as_u64),
-            total_output_tokens: usage
-                .and_then(|u| u.get("outputTokens"))
-                .and_then(Value::as_u64),
-            elapsed_ms: params
-                .get("durationMs")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        };
-        ServerEvent::TurnComplete {
-            session_id: self.session_id.clone(),
-            thread_id: self.resolve_thread_id(params),
-            agent_kind: AgentKind::Codex,
-            summary,
-        }
+        })
     }
 
     // ── delta accumulators ─────────────────────────────────────────────────
 
-    fn accumulate_text_delta(&mut self, params: &Value, kind: InFlightKind, field: &str) {
+    fn accumulate_text_delta(
+        &mut self,
+        params: &Value,
+        kind: InFlightKind,
+        field: &str,
+    ) -> Option<ServerEvent> {
+        if !self.matches_active_turn(params) {
+            return None;
+        }
         let Some(id) = params.get("itemId").and_then(Value::as_str) else {
-            return;
+            return None;
         };
         let delta = params.get(field).and_then(Value::as_str).unwrap_or("");
+        if delta.is_empty() || self.completed_item_ids.contains(id) {
+            return None;
+        }
         let slot = self
             .in_flight
             .entry(id.to_string())
@@ -550,9 +587,20 @@ impl CodexTranslator {
             slot.kind = kind;
         }
         slot.accumulated_text.push_str(delta);
+        if !matches!(kind, InFlightKind::AssistantMessage) {
+            return None;
+        }
+        let item = AgentItem::AssistantMessage {
+            text: slot.accumulated_text.clone(),
+            meta: assistant_meta(&slot.last_payload),
+        };
+        self.agent_item_event(id, AgentItemState::Streaming, item, params)
     }
 
     fn accumulate_command_output(&mut self, params: &Value) {
+        if !self.matches_active_turn(params) {
+            return;
+        }
         let Some(id) = params.get("itemId").and_then(Value::as_str) else {
             return;
         };
@@ -673,6 +721,16 @@ impl CodexTranslator {
             .unwrap_or_else(|| ThreadId(String::new()))
     }
 
+    fn matches_active_turn(&self, params: &Value) -> bool {
+        let Some(_) = self.active_turn_id else {
+            return false;
+        };
+        let Some(expected) = self.active_vendor_turn_id.as_deref() else {
+            return false;
+        };
+        params.get("turnId").and_then(Value::as_str) == Some(expected)
+    }
+
     fn error_event(&self, code: &str, message: String) -> ServerEvent {
         ServerEvent::Error {
             session_id: Some(self.session_id.clone()),
@@ -684,17 +742,27 @@ impl CodexTranslator {
         }
     }
 
-    fn raw_event_for_unknown_method(&self, method: &str, frame: &Value) -> ServerEvent {
-        ServerEvent::AgentItem {
-            session_id: self.session_id.clone(),
-            thread_id: self.resolve_thread_id(frame),
-            agent_kind: AgentKind::Codex,
-            item: AgentItem::Raw {
+    fn raw_event_for_unknown_method(&self, method: &str, frame: &Value) -> Option<ServerEvent> {
+        let params = frame.get("params").unwrap_or(frame);
+        if !self.matches_active_turn(params) {
+            return None;
+        }
+        let item_id = params.get("itemId").and_then(Value::as_str).or_else(|| {
+            params
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+        })?;
+        self.agent_item_event(
+            item_id,
+            AgentItemState::Completed,
+            AgentItem::Raw {
                 raw_kind: safe_vendor_identifier(method),
                 raw_payload: WITHHELD_VENDOR_RAW_PAYLOAD.into(),
                 meta: AgentItemMeta::default(),
             },
-        }
+            params,
+        )
     }
 }
 
@@ -744,14 +812,16 @@ pub(super) fn history_item_to_agent_item(item: &Value) -> AgentItem {
 fn completed_item_to_agent_item(item: &Value, kind: InFlightKind, accumulated: &str) -> AgentItem {
     match kind {
         InFlightKind::AssistantMessage => {
-            // Prefer Codex's authoritative final text; fall back to the live
-            // delta accumulator when an item/completed payload is sparse.
-            let text = item
-                .get("text")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .unwrap_or(accumulated)
-                .to_string();
+            // The completed payload is authoritative when it preserves the
+            // already-emitted cumulative prefix. A sparse, shorter, or
+            // divergent payload must not make client-visible text regress.
+            let completed = item.get("text").and_then(Value::as_str).unwrap_or("");
+            let text = if accumulated.is_empty() || completed.starts_with(accumulated) {
+                completed
+            } else {
+                accumulated
+            }
+            .to_string();
             AgentItem::AssistantMessage {
                 text,
                 meta: assistant_meta(item),
@@ -1162,57 +1232,92 @@ fn decode_base64(s: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    const CLIENT_TURN_ID: &str = "client-turn-1";
+    const VENDOR_TURN_ID: &str = "vendor-turn-1";
+
     fn tr() -> CodexTranslator {
         let mut t = CodexTranslator::new(SessionId("s1".into()), None);
         t.set_thread_id(ThreadId("thread_1".into()));
+        t.begin_turn(TurnId(CLIENT_TURN_ID.into()));
+        t.set_vendor_turn_id(VENDOR_TURN_ID);
         t
     }
 
+    fn assert_assistant_snapshot(
+        event: &ServerEvent,
+        expected_text: &str,
+        expected_state: AgentItemState,
+    ) {
+        match event {
+            ServerEvent::AgentItem {
+                session_id,
+                thread_id,
+                agent_kind,
+                turn_id,
+                item_id,
+                state,
+                item: AgentItem::AssistantMessage { text, .. },
+            } => {
+                assert_eq!(session_id.0, "s1");
+                assert_eq!(thread_id.0, "thread_1");
+                assert_eq!(*agent_kind, AgentKind::Codex);
+                assert_eq!(turn_id.0, CLIENT_TURN_ID);
+                assert_eq!(item_id, "msg1");
+                assert_eq!(*state, expected_state);
+                assert_eq!(text, expected_text);
+            }
+            other => panic!("expected AssistantMessage snapshot, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn assistant_message_delta_does_not_emit_until_completed() {
+    fn assistant_message_deltas_emit_cumulative_snapshots_then_one_completion() {
         let mut t = tr();
         let started = json!({
             "method": "item/started",
             "params": {
                 "item": {"id": "msg1", "type": "agentMessage", "text": ""},
-                "threadId": "thread_1"
+                "threadId": "thread_1",
+                "turnId": VENDOR_TURN_ID
             }
         });
         let d1 = json!({
             "method": "item/agentMessage/delta",
-            "params": {"itemId": "msg1", "delta": "Hel", "threadId": "thread_1"}
+            "params": {
+                "itemId": "msg1", "delta": "Hel",
+                "threadId": "thread_1", "turnId": VENDOR_TURN_ID
+            }
         });
         let d2 = json!({
             "method": "item/agentMessage/delta",
-            "params": {"itemId": "msg1", "delta": "lo!", "threadId": "thread_1"}
+            "params": {
+                "itemId": "msg1", "delta": "lo!",
+                "threadId": "thread_1", "turnId": VENDOR_TURN_ID
+            }
         });
-        // Started + deltas emit nothing.
         assert!(t.translate_value(&started).is_empty());
-        assert!(t.translate_value(&d1).is_empty());
-        assert!(t.translate_value(&d2).is_empty());
-        // Completion emits exactly one AssistantMessage with cumulative text.
+        let first = t.translate_value(&d1);
+        let second = t.translate_value(&d2);
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_assistant_snapshot(&first[0], "Hel", AgentItemState::Streaming);
+        assert_assistant_snapshot(&second[0], "Hello!", AgentItemState::Streaming);
+
         let completed = json!({
             "method": "item/completed",
             "params": {
                 "item": {"id": "msg1", "type": "agentMessage", "text": "Hello!"},
-                "threadId": "thread_1"
+                "threadId": "thread_1",
+                "turnId": VENDOR_TURN_ID
             }
         });
         let events = t.translate_value(&completed);
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            ServerEvent::AgentItem {
-                item: AgentItem::AssistantMessage { text, .. },
-                agent_kind,
-                thread_id,
-                ..
-            } => {
-                assert_eq!(text, "Hello!");
-                assert_eq!(*agent_kind, AgentKind::Codex);
-                assert_eq!(thread_id.0, "thread_1");
-            }
-            other => panic!("expected AssistantMessage, got {other:?}"),
-        }
+        assert_assistant_snapshot(&events[0], "Hello!", AgentItemState::Completed);
+        assert!(
+            t.translate_value(&completed).is_empty(),
+            "completed snapshot must be emitted at most once"
+        );
     }
 
     #[test]
@@ -1220,15 +1325,24 @@ mod tests {
         let mut t = tr();
         t.translate_value(&json!({
             "method": "item/started",
-            "params": {"item": {"id": "m", "type": "agentMessage", "text": ""}}
+            "params": {
+                "turnId": VENDOR_TURN_ID,
+                "item": {"id": "m", "type": "agentMessage", "text": ""}
+            }
         }));
         t.translate_value(&json!({
             "method": "item/agentMessage/delta",
-            "params": {"itemId": "m", "delta": "from-delta"}
+            "params": {
+                "turnId": VENDOR_TURN_ID,
+                "itemId": "m", "delta": "from-delta"
+            }
         }));
         let events = t.translate_value(&json!({
             "method": "item/completed",
-            "params": {"item": {"id": "m", "type": "agentMessage", "text": ""}}
+            "params": {
+                "turnId": VENDOR_TURN_ID,
+                "item": {"id": "m", "type": "agentMessage", "text": ""}
+            }
         }));
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -1241,21 +1355,55 @@ mod tests {
     }
 
     #[test]
+    fn assistant_message_completed_only_emits_one_completed_snapshot() {
+        let mut t = tr();
+        let events = t.translate_value(&json!({
+            "method": "item/completed",
+            "params": {
+                "turnId": VENDOR_TURN_ID,
+                "threadId": "thread_1",
+                "item": {"id": "msg1", "type": "agentMessage", "text": "complete"}
+            }
+        }));
+        assert_eq!(events.len(), 1);
+        assert_assistant_snapshot(&events[0], "complete", AgentItemState::Completed);
+    }
+
+    #[test]
+    fn finished_turn_ignores_late_item_notifications() {
+        let mut t = tr();
+        t.finish_turn();
+
+        let events = t.translate_value(&json!({
+            "method": "item/completed",
+            "params": {
+                "turnId": VENDOR_TURN_ID,
+                "threadId": "thread_1",
+                "item": {"id": "msg1", "type": "agentMessage", "text": "late"}
+            }
+        }));
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn reasoning_stream_uses_summary_then_content() {
         let mut t = tr();
         t.translate_value(&json!({
             "method": "item/started",
-            "params": {"item": {"id": "r1", "type": "reasoning",
+            "params": {"turnId": VENDOR_TURN_ID,
+                       "item": {"id": "r1", "type": "reasoning",
                                 "summary": [], "content": []}}
         }));
         t.translate_value(&json!({
             "method": "item/reasoning/textDelta",
-            "params": {"itemId": "r1", "delta": "thinking..."}
+            "params": {"turnId": VENDOR_TURN_ID,
+                       "itemId": "r1", "delta": "thinking..."}
         }));
         // completed payload provides authoritative summary
         let events = t.translate_value(&json!({
             "method": "item/completed",
-            "params": {"item": {"id": "r1", "type": "reasoning",
+            "params": {"turnId": VENDOR_TURN_ID,
+                       "item": {"id": "r1", "type": "reasoning",
                                 "summary": ["A digest"], "content": ["full chain"]}}
         }));
         assert_eq!(events.len(), 1);
@@ -1273,7 +1421,8 @@ mod tests {
         let mut t = tr();
         let started = t.translate_value(&json!({
             "method": "item/started",
-            "params": {"item": {"id": "c1", "type": "commandExecution",
+            "params": {"turnId": VENDOR_TURN_ID,
+                       "item": {"id": "c1", "type": "commandExecution",
                                 "command": "ls -la"}}
         }));
         // Running snapshot on `started`.
@@ -1292,7 +1441,7 @@ mod tests {
         }
         let completed = t.translate_value(&json!({
             "method": "item/completed",
-            "params": {"item": {
+            "params": {"turnId": VENDOR_TURN_ID, "item": {
                 "id": "c1", "type": "commandExecution",
                 "command": "ls -la", "status": "completed",
                 "exitCode": 0, "durationMs": 12
@@ -1593,7 +1742,8 @@ mod tests {
         let mut t = tr();
         let events = t.translate_value(&json!({
             "method": "item/completed",
-            "params": {"item": {"id": "x", "type": "newFutureItem",
+            "params": {"turnId": VENDOR_TURN_ID,
+                       "item": {"id": "x", "type": "newFutureItem",
                                 "vendorSecret": "sk-history-secret-must-not-cross-k9"}}
         }));
         assert_eq!(events.len(), 1);
@@ -1702,25 +1852,16 @@ mod tests {
     }
 
     #[test]
-    fn turn_completed_emits_turn_complete_with_usage() {
+    fn turn_completed_is_owned_by_session_lifecycle_and_emits_nothing() {
         let mut t = tr();
         let events = t.translate_value(&json!({
             "method": "turn/completed",
             "params": {
                 "threadId": "thread_1",
-                "durationMs": 1234,
-                "usage": {"inputTokens": 100, "outputTokens": 50}
+                "turn": {"id": VENDOR_TURN_ID, "status": "completed"}
             }
         }));
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ServerEvent::TurnComplete { summary, .. } => {
-                assert_eq!(summary.elapsed_ms, 1234);
-                assert_eq!(summary.total_input_tokens, Some(100));
-                assert_eq!(summary.total_output_tokens, Some(50));
-            }
-            other => panic!("expected TurnComplete, got {other:?}"),
-        }
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1762,11 +1903,12 @@ mod tests {
         let mut t = tr();
         t.translate_value(&json!({
             "method": "item/started",
-            "params": {"item": {"id": "f1", "type": "fileChange"}}
+            "params": {"turnId": VENDOR_TURN_ID,
+                       "item": {"id": "f1", "type": "fileChange"}}
         }));
         let events = t.translate_value(&json!({
             "method": "item/completed",
-            "params": {"item": {
+            "params": {"turnId": VENDOR_TURN_ID, "item": {
                 "id": "f1", "type": "fileChange",
                 "changes": [
                     {"path": "a.txt", "diff": "+a\n", "kind": "add"},

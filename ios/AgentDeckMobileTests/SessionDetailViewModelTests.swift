@@ -42,13 +42,16 @@ final class SessionDetailViewModelTests: XCTestCase {
     func testErrorSurfaces() async {
         let vm = makeVM("sess-failed-01")
         let errored = expectation(description: "error surfaced")
+        // The stream-finished update legitimately fires after the error update
+        // while errorText remains populated.
+        errored.assertForOverFulfill = false
         vm.onUpdate = { if vm.errorText != nil { errored.fulfill() } }
         vm.start()
         await fulfillment(of: [errored], timeout: 3)
         XCTAssertTrue(vm.errorText?.contains("peer dependency") == true)
     }
 
-    func testSendPromptAppendsOptimisticUserRow() async {
+    func testSendPromptAppendsOneUserRowAndRejectsReentry() async {
         let vm = makeVM("sess-cc-01")
         let done = expectation(description: "initial stream done")
         vm.onUpdate = { if !vm.isStreaming { done.fulfill() } }
@@ -64,6 +67,8 @@ final class SessionDetailViewModelTests: XCTestCase {
             }
         }
         vm.sendPrompt("再补一个空输入的用例")
+        vm.sendPrompt("这条重入消息不应发送")
         await fulfillment(of: [echoed], timeout: 3)
+        XCTAssertFalse(vm.rows.contains(where: { $0.item.text == "这条重入消息不应发送" }))
     }
 }

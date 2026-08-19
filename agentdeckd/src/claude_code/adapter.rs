@@ -356,11 +356,20 @@ impl ClaudeCodeAdapter {
         let permission_routes: PermissionRoutes = Arc::new(Mutex::new(HashMap::new()));
 
         let translator_thread_id = resume_thread_id.clone();
+        let translator_turn_id = start
+            .initial_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.clone())
+            .unwrap_or_else(|| TurnId(format!("{}-legacy-turn", session_id.0)));
         let pump_session = session_id.clone();
         let pump_events = events.clone();
         let pump_routes = Arc::clone(&permission_routes);
         let pump_handle = tokio::spawn(async move {
-            let mut translator = ClaudeCodeTranslator::new(pump_session.clone(), permission_mode);
+            let mut translator = ClaudeCodeTranslator::new_for_turn(
+                pump_session.clone(),
+                permission_mode,
+                translator_turn_id,
+            );
             if let Some(tid) = translator_thread_id {
                 translator.set_thread_id(tid);
             }

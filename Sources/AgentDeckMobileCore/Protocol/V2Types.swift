@@ -298,6 +298,10 @@ public enum ShellStatus: String, Codable, Sendable {
     case running, completed, failed, canceled
 }
 
+public enum AgentItemState: String, Codable, Sendable {
+    case streaming, completed
+}
+
 public enum DiffStatus: String, Codable, Sendable {
     case added, modified, deleted, renamed
 }
@@ -1249,7 +1253,15 @@ public enum ClientCommand: Codable, Sendable {
 public enum ServerEvent: Sendable {
     case sessionStarted(sessionId: String, threadId: String?, agentKind: AgentKind)
     case sessionCapabilities(sessionId: String, agentKind: AgentKind, capabilities: SessionCapabilities)
-    case agentItem(sessionId: String, threadId: String, agentKind: AgentKind, item: AgentItem)
+    case agentItem(
+        sessionId: String,
+        threadId: String,
+        agentKind: AgentKind,
+        turnId: TurnId,
+        itemId: String,
+        state: AgentItemState,
+        item: AgentItem
+    )
     case actionRequest(sessionId: String, threadId: String, agentKind: AgentKind, request: ActionRequest)
     case turnStarted(sessionId: String, threadId: String, agentKind: AgentKind, turnId: TurnId)
     case turnFinished(
@@ -1279,7 +1291,7 @@ public enum ServerEvent: Sendable {
         switch self {
         case .sessionStarted(let sid, _, _),
              .sessionCapabilities(let sid, _, _),
-             .agentItem(let sid, _, _, _),
+             .agentItem(let sid, _, _, _, _, _, _),
              .actionRequest(let sid, _, _, _),
              .turnStarted(let sid, _, _, _),
              .turnFinished(let sid, _, _, _, _, _, _, _),
@@ -1297,7 +1309,7 @@ public enum ServerEvent: Sendable {
         switch self {
         case .sessionStarted(_, _, let k),
              .sessionCapabilities(_, let k, _),
-             .agentItem(_, _, let k, _),
+             .agentItem(_, _, let k, _, _, _, _),
              .actionRequest(_, _, let k, _),
              .turnStarted(_, _, let k, _),
              .turnFinished(_, _, let k, _, _, _, _, _),
@@ -1313,7 +1325,7 @@ public enum ServerEvent: Sendable {
 
 extension ServerEvent: Codable {
     private enum CodingKeys: String, CodingKey {
-        case type, sessionId, threadId, agentKind, turnId, capabilities, item, request
+        case type, sessionId, threadId, agentKind, turnId, itemId, state, capabilities, item, request
         case outcome, nextState, summary, error, payload
     }
 
@@ -1335,8 +1347,19 @@ extension ServerEvent: Codable {
             let sid = try c.decode(String.self, forKey: .sessionId)
             let tid = try c.decode(String.self, forKey: .threadId)
             let kind = try c.decode(AgentKind.self, forKey: .agentKind)
+            let turnId = try c.decode(TurnId.self, forKey: .turnId)
+            let itemId = try c.decode(String.self, forKey: .itemId)
+            let state = try c.decode(AgentItemState.self, forKey: .state)
             let item = try c.decode(AgentItem.self, forKey: .item)
-            self = .agentItem(sessionId: sid, threadId: tid, agentKind: kind, item: item)
+            self = .agentItem(
+                sessionId: sid,
+                threadId: tid,
+                agentKind: kind,
+                turnId: turnId,
+                itemId: itemId,
+                state: state,
+                item: item
+            )
         case "actionRequest":
             let sid = try c.decode(String.self, forKey: .sessionId)
             let tid = try c.decode(String.self, forKey: .threadId)
@@ -1421,11 +1444,14 @@ extension ServerEvent: Codable {
             try c.encode(sid, forKey: .sessionId)
             try c.encode(kind, forKey: .agentKind)
             try c.encode(caps, forKey: .capabilities)
-        case .agentItem(let sid, let tid, let kind, let item):
+        case .agentItem(let sid, let tid, let kind, let turnId, let itemId, let state, let item):
             try c.encode("agentItem", forKey: .type)
             try c.encode(sid, forKey: .sessionId)
             try c.encode(tid, forKey: .threadId)
             try c.encode(kind, forKey: .agentKind)
+            try c.encode(turnId, forKey: .turnId)
+            try c.encode(itemId, forKey: .itemId)
+            try c.encode(state, forKey: .state)
             try c.encode(item, forKey: .item)
         case .actionRequest(let sid, let tid, let kind, let req):
             try c.encode("actionRequest", forKey: .type)

@@ -1,6 +1,6 @@
 //! Shape / contract tests for `ClaudeCodeAdapter`.
 //!
-//! Symmetric to `tests/codex_adapter_shape.rs` (N5). Validates the v2
+//! Parallel to `tests/codex_adapter_shape.rs` (N5). Validates the v4
 //! `Agent` trait wiring without spawning a real `claude` child for the
 //! offline cases, then opt-in spawns a real `claude` only when
 //! `AGENTDECK_E2E=1` and the binary is on PATH.
@@ -38,7 +38,7 @@ fn cc_adapter_impls_agent_trait() {
 }
 
 #[test]
-fn capabilities_advertise_cc_agent_kind_and_full_feature_set() {
+fn capabilities_advertise_cc_agent_kind_and_only_verified_features() {
     // Task 4B: capabilities() returns the real builder result.
     let a = ClaudeCodeAdapter::new_for_test();
     let caps = a.capabilities();
@@ -52,8 +52,11 @@ fn capabilities_advertise_cc_agent_kind_and_full_feature_set() {
             .contains(&CapabilityId::ClaudeCodePermissionMode)
     );
     assert!(caps.features.contains(&CapabilityId::ClaudeCodeHooks));
-    // Shared features symmetric with Codex (N5).
-    assert!(caps.features.contains(&CapabilityId::StreamingMessages));
+    // CC still drops partial message and reasoning deltas, so it must not
+    // advertise either streaming capability.
+    assert!(!caps.features.contains(&CapabilityId::StreamingMessages));
+    assert!(!caps.features.contains(&CapabilityId::StreamingReasoning));
+    assert!(!caps.features.contains(&CapabilityId::Approval));
     assert!(caps.features.contains(&CapabilityId::Worktree));
     // No Codex-only features leaked.
     assert!(!caps.features.contains(&CapabilityId::CodexSandboxMode));

@@ -114,6 +114,13 @@ pub enum SessionOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum AgentItemState {
+    Streaming,
+    Completed,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentItemMeta {
@@ -544,6 +551,11 @@ pub enum ServerEvent {
         thread_id: ThreadId,
         #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
+        #[serde(rename = "turnId")]
+        turn_id: TurnId,
+        #[serde(rename = "itemId")]
+        item_id: String,
+        state: AgentItemState,
         item: AgentItem,
     },
     ActionRequest {

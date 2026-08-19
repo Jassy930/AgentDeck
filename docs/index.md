@@ -29,10 +29,10 @@
 
 此前 macOS AppKit 文档仅保留为历史事实，不再定义当前桌面实现或默认迭代顺序。
 
-### agentdeckd 最小稳定边界（2026-08-17，当前设计）
+### agentdeckd 最小稳定边界（2026-08-17，实施中）
 
 - `plans/2026-08-17-codex-app-server-lifecycle-adr.md`：决定由 `agentdeckd` 直接持有 session-scoped Codex app-server stdio 子进程，不采用 managed daemon/proxy。
-- `plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md`：desktop 接入前必须完成的 Codex-only M0、生命周期、不变量和验收门禁；当前状态是设计基线，尚未落地。
+- `plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md`：desktop 接入前必须完成的 Codex-only M0、生命周期、不变量和验收门禁；Issue #3 生命周期与 #4 protocol v4 累计 streaming 已落地，#5 持久真实 E2E 与 #6 可观测闭环仍未完成。
 
 ### iOS 前端计划（2026-07-03）
 

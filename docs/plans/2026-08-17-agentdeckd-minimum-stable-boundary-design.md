@@ -1,7 +1,8 @@
 # agentdeckd 最小稳定边界设计
 
 日期：2026-08-17
-状态：实施中；Issue #3 生命周期切片已落地，M0 尚未完成代码验收
+状态：实施中；Issue #3 生命周期与 #4 累计 streaming 切片已落地，M0 仍待 #5/#6
+及真实门禁
 
 ## 决策摘要
 
@@ -26,9 +27,10 @@ M0 只证明 daemon、Codex app-server 和中立 IPC 之间最短且可复用的
 desktop 在此边界通过前不得连接 daemon；通过后，desktop 首切片可以只展示首轮，
 但 daemon 放行门禁必须实际跑通同一 session 的两轮复用。
 
-## 当前落地范围（Issue #3）
+## 当前落地范围（Issue #3 / #4）
 
-Issue #3 已把 M0 的 session/turn 生命周期骨架落到 protocol v3 和 Codex runtime：
+Issue #3 已把 M0 的 session/turn 生命周期骨架落到 Codex runtime；Issue #4 在该骨架上
+把当前协议升级为 v4：
 
 - `SessionStart(sessionId,resumeThreadId?,initialTurn?)`、`TurnStart`、`TurnCancel`、
   `SessionClose`，以及 `TurnStarted`、`TurnFinished`、`SessionClosed` 已进入 Rust 协议、
@@ -44,23 +46,28 @@ Issue #3 已把 M0 的 session/turn 生命周期骨架落到 protocol v3 和 Cod
   命令并关闭 retained session，cleanup 无法确认则 poison 并退出 daemon。
 - locator、版本探测和 spawn 绑定同一绝对 binary，严格要求固定 0.145.0；生产 argv 固定
   为 `app-server --listen stdio://`。M0 options 固定为 never/read-only/medium、
-  `persist=false`、无 MCP，capabilities 不宣称尚未验收的 feature。
+  `persist=false`、无 MCP。
+- protocol v4 为每个 `AgentItem` 增加必填 `turnId`、稳定 `itemId` 和
+  `state=streaming|completed`；Rust schema、CLI 与 Swift mirror 同步消费该形态。
+- Codex translator 按官方 item id 累积 assistant delta，每个非空 delta 发完整文本快照，
+  completed 复用同一 ID 且至多一次；跨 turn、重复 completed 和 terminal 后 delta 不会
+  污染下一轮。Codex 只声明 `StreamingMessages`，Claude Code 因仍丢弃 partial message
+  delta 明确不声明该 capability。
 
-这不是 M0 完成声明。#4 仍需实现稳定 `itemId` 与客户端可见累计 streaming；#5 仍需
-持有同一 daemon 连接的 CLI/test driver 和真实 Codex 多轮/cancel/close E2E；#6 仍需把
-RunRecord、lifecycle diagnostics 与可回读的 `diagnosticRef` 接入生产路径。本轮尚无真实
-Codex session/prompt 回执；固定版本的官方 `ClientNotification.json` 已随实现补齐。
+这不是 M0 完成声明。#5 仍需持有同一 daemon 连接的 CLI/test driver 和真实 Codex
+多轮/cancel/close E2E；#6 仍需把 RunRecord、lifecycle diagnostics 与可回读的
+`diagnosticRef` 接入生产路径。本轮尚无真实 Codex session/prompt 回执；固定版本的官方
+`ClientNotification.json` 已随实现补齐。
 
 ## 背景
 
 `agentdeckd` 已有 RuntimeHub、Codex/Claude Code adapter、history、approval、vendor
 control、run record 和 diagnostics 等较宽的代码表面。Issue #3 已闭合 Codex
-session owner、握手、顺序 turn、interrupt 和 close/wait 的代码路径；desktop 最先依赖
-的完整 M0 仍有以下缺口：
+session owner、握手、顺序 turn、interrupt、close/wait 和累计 assistant streaming 的
+代码路径；desktop 最先依赖的完整 M0 仍有以下缺口：
 
-- Codex assistant delta 只在 daemon 内累计，客户端只在 item 完成后收到一次快照，
-  不能支撑真实 streaming UI。
-- protocol v3 已有稳定 `turnId` 和 typed `TurnFinished`，但真实 vendor 的
+- protocol v4 已有稳定 `turnId` / `itemId`、streaming state 和 typed `TurnFinished`，
+  但真实 vendor 的
   completed/failed/interrupted 与 cancel 后恢复尚未由持久 E2E 验收。
 - owner 的 fake/duplex 测试可复用一个 connection；当前 one-shot CLI 会在首轮
   `TurnFinished` 后自动 close，并等待 `SessionClosed` 与 daemon 回收，但仍无法驱动同一
@@ -241,7 +248,7 @@ sessionId + agentKind + threadId + turnId
 同一 turn 的四个关联字段必须完全一致。初始 prompt 也必须发 TurnStarted，不能因它
 来自 SessionStart 就省略 turn lifecycle。
 
-为了建立可消费的 streaming 契约，`ServerEvent::AgentItem` envelope 还必须增加：
+protocol v4 已为 `ServerEvent::AgentItem` envelope 增加：
 
 ```text
 itemId: String
@@ -253,8 +260,9 @@ M0 只承诺 `AgentItem::AssistantMessage`：
 - `itemId` 使用 app-server 官方 item id，同一消息从开始到完成保持不变。
 - 每个非空 `item/agentMessage/delta` 先追加到 daemon buffer，再发送截至当前全部文本的
   `state=streaming` 快照；不把裸 delta 交给客户端累计。
-- `item/completed` 发同一 itemId 的 `state=completed` 最终快照。若 completed payload
-  带完整文本，以它为最终事实；否则使用已累计文本。
+- `item/completed` 发同一 itemId 的 `state=completed` 最终快照。completed payload 只有
+  在保留已发累计前缀时才可作为最终文本；稀疏、变短或分叉的 payload 使用已累计文本，
+  避免客户端可见内容回退。
 - 同一 item 文本只能保持不变或追加，不能回退；completed 至多一次。
 - completed-only 消息合法：直接发一份 completed 快照。
 
@@ -521,24 +529,29 @@ streaming、terminal 或 cleanup 的 M0 状态；普通 Cargo passed 也不等�
 
 ### 确定性测试
 
-Issue #3 的 focused 离线入口是：
+Issue #3/#4 的 focused 离线入口是：
 
 ```bash
 cargo test -p agentdeck-protocol
 cargo test -p agentdeck-cli --bin agentdeck
 cargo test -p agentdeckd --lib codex::
+cargo test -p agentdeckd --test codex_translate
 cargo test -p agentdeckd --lib runtime::hub
 cargo test -p agentdeckd --lib runtime::router
 cargo test -p agentdeckd --test codex_adapter_shape
+cargo test -p agentdeckd --test cc_fixture_replay
 swift test
 ```
 
-该切片已有 protocol round-trip/schema、同 binary probe/spawn 与 argv/initialized 顺序、
-session owner 和 RuntimeHub/router 的 fake/duplex/stub 证据。Issue #3 当前还覆盖同
+这些切片已有 protocol v4 round-trip/schema、累计 assistant snapshot、同 binary
+probe/spawn 与 argv/initialized 顺序、session owner 和 RuntimeHub/router 的
+fake/duplex/stub 证据。Issue #3 当前还覆盖同
 connection 两轮、interrupt 后复用、running close、malformed/unmatched/EOF、handshake
 failure、unsupported request、terminal status、resume 固定参数、stderr pump join，以及
-stdin EOF/cleanup failure 的 poison→daemon exit。下面列表仍是完整 M0 验收要求；#4
-streaming 与 #6 record/diagnostics 不能因生命周期测试通过而视为完成。
+stdin EOF/cleanup failure 的 poison→daemon exit；Issue #4 覆盖多 delta 累计、ID/turn
+隔离、文本不回退、completed-only/duplicate completed、terminal 后 delta 丢弃及
+`AgentItem` 先于 `TurnFinished`。下面列表仍是完整 M0 验收要求；#5 真实持久链路与 #6
+record/diagnostics 不能因离线测试通过而视为完成。
 
 - production spawn 参数显式包含 `app-server --listen stdio://`；版本探测和 spawn 使用
   同一绝对 binary。版本缺失或不匹配在 SessionStarted 前稳定失败。

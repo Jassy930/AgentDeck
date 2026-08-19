@@ -1,4 +1,4 @@
-//! Translates Claude Code stream-json output → v2 `ServerEvent`s.
+//! Translates Claude Code stream-json output into neutral `ServerEvent`s.
 //!
 //! Phase 4 Task 4A. Pure per-line function; the translator owns no I/O,
 //! the adapter (`adapter.rs`) drives the child process and feeds lines in.
@@ -56,7 +56,7 @@
 //!
 //! ## ThreadId
 //!
-//! CC's `session_id` is the ThreadId in v2 terms. Captured from
+//! CC's `session_id` is the neutral `ThreadId`. Captured from
 //! `system.subtype=init` (preferred) or any line's top-level `session_id`
 //! field as fallback.
 
@@ -67,9 +67,9 @@ use serde_json::{Value, json};
 
 use super::is_collaboration_tool_name;
 use agentdeck_protocol::{
-    ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentKind,
-    ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, DiffFile, DiffStatus, ServerEvent,
-    SessionId, ShellStatus, ThreadId, TurnSummary, VendorPanelPayload,
+    ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentItemState,
+    AgentKind, ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, DiffFile, DiffStatus,
+    ServerEvent, SessionId, ShellStatus, ThreadId, TurnId, TurnSummary, VendorPanelPayload,
 };
 
 /// One translator-output batch: 0..N ServerEvents from one input line,
@@ -92,6 +92,8 @@ pub struct TranslateOutput {
 pub struct ClaudeCodeTranslator {
     session_id: SessionId,
     thread_id: Option<ThreadId>,
+    turn_id: TurnId,
+    next_item_id: u64,
     /// `tool_use.id` → snapshot of the originating tool_use; consumed
     /// when the matching `tool_result` arrives on a `user` snapshot.
     in_flight_tools: HashMap<String, ToolUseRecord>,
@@ -109,9 +111,20 @@ struct ToolUseRecord {
 
 impl ClaudeCodeTranslator {
     pub fn new(session_id: SessionId, permission_mode: ClaudeCodePermissionMode) -> Self {
+        let turn_id = TurnId(format!("{}-legacy-turn", session_id.0));
+        Self::new_for_turn(session_id, permission_mode, turn_id)
+    }
+
+    pub fn new_for_turn(
+        session_id: SessionId,
+        permission_mode: ClaudeCodePermissionMode,
+        turn_id: TurnId,
+    ) -> Self {
         Self {
             session_id,
             thread_id: None,
+            turn_id,
+            next_item_id: 1,
             in_flight_tools: HashMap::new(),
             permission_mode,
         }
@@ -333,10 +346,10 @@ impl ClaudeCodeTranslator {
             }
             "Edit" | "Write" | "MultiEdit" => {
                 let files = diff_files_from_tool_use(&name, &input);
-                self.agent_item_event(AgentItem::Diff {
-                    files,
-                    meta: tool_meta(&id, &name),
-                })
+                let mut meta = tool_meta(&id, &name);
+                meta.vendor_extensions
+                    .insert("status".into(), json!("inProgress"));
+                self.agent_item_event(AgentItem::Diff { files, meta })
             }
             _ => {
                 let mut meta = tool_meta(&id, &name);
@@ -425,10 +438,10 @@ impl ClaudeCodeTranslator {
                     // Diff already emitted on tool_use; emit a finalized
                     // snapshot so the UI can flip "pending" → "applied".
                     let files = diff_files_from_tool_use(&record.name, &record.input);
-                    self.agent_item_event(AgentItem::Diff {
-                        files,
-                        meta: tool_meta(tool_use_id, &record.name),
-                    })
+                    let mut meta = tool_meta(tool_use_id, &record.name);
+                    meta.vendor_extensions
+                        .insert("status".into(), json!("completed"));
+                    self.agent_item_event(AgentItem::Diff { files, meta })
                 }
                 _ => {
                     let mut meta = tool_meta(tool_use_id, &record.name);
@@ -532,16 +545,25 @@ impl ClaudeCodeTranslator {
 
     // ── helpers ────────────────────────────────────────────────────────────
 
-    fn agent_item_event(&self, item: AgentItem) -> ServerEvent {
+    fn agent_item_event(&mut self, item: AgentItem) -> ServerEvent {
+        let item_id = agent_item_tool_id(&item).unwrap_or_else(|| {
+            let id = format!("cc-item-{}", self.next_item_id);
+            self.next_item_id = self.next_item_id.saturating_add(1);
+            id
+        });
+        let state = agent_item_state(&item);
         ServerEvent::AgentItem {
             session_id: self.session_id.clone(),
             thread_id: self.resolved_thread_id(),
             agent_kind: AgentKind::ClaudeCode,
+            turn_id: self.turn_id.clone(),
+            item_id,
+            state,
             item,
         }
     }
 
-    fn raw_event(&self, kind: &str, raw_payload: &str) -> TranslateOutput {
+    fn raw_event(&mut self, kind: &str, raw_payload: &str) -> TranslateOutput {
         TranslateOutput {
             events: vec![self.agent_item_event(AgentItem::Raw {
                 raw_kind: kind.to_string(),
@@ -556,6 +578,41 @@ impl ClaudeCodeTranslator {
         self.thread_id
             .clone()
             .unwrap_or_else(|| ThreadId(String::new()))
+    }
+}
+
+fn agent_item_tool_id(item: &AgentItem) -> Option<String> {
+    let meta = match item {
+        AgentItem::UserMessage { meta, .. }
+        | AgentItem::AssistantMessage { meta, .. }
+        | AgentItem::Reasoning { meta, .. }
+        | AgentItem::Shell { meta, .. }
+        | AgentItem::Diff { meta, .. }
+        | AgentItem::Plan { meta, .. }
+        | AgentItem::ImageReference { meta, .. }
+        | AgentItem::ToolCall { meta, .. }
+        | AgentItem::Raw { meta, .. } => meta,
+    };
+    meta.vendor_extensions
+        .get("toolUseId")
+        .and_then(Value::as_str)
+        .map(|id| format!("cc-tool-{id}"))
+}
+
+fn agent_item_state(item: &AgentItem) -> AgentItemState {
+    match item {
+        AgentItem::Shell {
+            status: ShellStatus::Running,
+            ..
+        }
+        | AgentItem::ToolCall { result: None, .. } => AgentItemState::Streaming,
+        AgentItem::Diff { meta, .. }
+            if meta.vendor_extensions.get("status").and_then(Value::as_str)
+                == Some("inProgress") =>
+        {
+            AgentItemState::Streaming
+        }
+        _ => AgentItemState::Completed,
     }
 }
 

@@ -115,6 +115,7 @@ final class SessionDetailViewController: UIViewController {
             collectionView.bottomAnchor.constraint(equalTo: inputBar.topAnchor, constant: -DesignTokens.sp2),
         ])
         inputBar.onSend = { [weak self] text in self?.viewModel.sendPrompt(text) }
+        inputBar.setEnabled(!viewModel.isStreaming)
     }
 
     private func configureErrorBanner() {
@@ -154,5 +155,6 @@ final class SessionDetailViewController: UIViewController {
         } else {
             errorBanner.hide()
         }
+        inputBar.setEnabled(!viewModel.isStreaming)
     }
 }

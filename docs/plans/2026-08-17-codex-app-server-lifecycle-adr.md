@@ -1,7 +1,8 @@
 # ADR：Codex app-server 连接方式与生命周期
 
 - 日期：2026-08-17
-- 状态：已接受；Issue #3 生命周期实现已落地，M0 仍待 #4/#5/#6 与真实门禁
+- 状态：已接受；Issue #3 生命周期与 #4 累计 streaming 已落地，M0 仍待 #5/#6 与
+  真实门禁
 
 ## 决策摘要
 
@@ -304,8 +305,9 @@ Issue #3 已把本 ADR 的 transport 与生命周期主路径落到代码：
    `app-server --listen stdio://`。fake executable 覆盖 binary、版本、argv 和握手帧顺序。
 2. protocol v3 引入 caller-owned `sessionId` / `turnId`、`TurnStart`、`TurnCancel`、
    `SessionClose`、`TurnStarted`、`TurnFinished` 和 `SessionClosed`。Rust schema 与 Swift
-   mirror 已同步；旧 `SessionContinue` / `SessionCancel` 已移除，`TurnComplete` 暂只留给
-   Claude Code。
+   mirror 已同步；Issue #4 随后升级到 protocol v4，为每个 `AgentItem` 增加必填
+   `turnId`、稳定 `itemId` 和 `state=streaming|completed`。旧 `SessionContinue` /
+   `SessionCancel` 已移除，`TurnComplete` 暂只留给 Claude Code。
 3. `CodexSessionOwner` 独占 child、stdin/stdout、RPC allocator/correlation、threadId 和
    当前 turn。它完成 initialize response → initialized → thread/start|resume response，
    然后才发 SessionStarted → SessionCapabilities；`turn/start` / `turn/interrupt` 都等待
@@ -323,30 +325,34 @@ Issue #3 已把本 ADR 的 transport 与生命周期主路径落到代码：
    `SessionStart` 进入；replacement session 不能越过旧 terminal 或撞到旧 slot。
 6. unsupported server request 会收到匹配 id 的 JSON-RPC not-supported error；有 active
    turn 时继续 interrupt 并以 failed 收口，不再静默等待。M0 option 固定为
-   never/read-only/medium、`persist=false`、无 MCP，capabilities 不声明尚未验收 feature。
+   never/read-only/medium、`persist=false`、无 MCP。
 7. RuntimeHub 用单一有序 worker 执行 lifecycle command，避免 start/control 互相越过；
    stdin EOF 会 drain 已读命令、关闭并等待 retained session。cleanup 无法确认时先
    poison 并停止 intake，再发 failed `SessionClosed`，随后退出 daemon。stdout writer
    失败会先发 stop、丢弃排队 lifecycle，再关闭/等待已 retained session，并把原始 I/O
    error 返回给 daemon caller。
+8. Codex translator 以官方 item id 为键累计 assistant delta，每个非空 delta 发截至当前的
+   完整文本快照，completed 复用同一 item id 且至多一次；新 turn 会清空 accumulator，
+   duplicate completed 与 terminal 后 delta 不再外发。Codex capability 只声明
+   `StreamingMessages`；Claude Code 仍丢弃 partial message delta，因此明确不声明该能力。
 
-以上只表示 Issue #3 生命周期实现存在，不等于 M0 已验收。剩余边界是：
+以上表示 Issue #3 生命周期与 #4 累计 streaming 的确定性实现存在，不等于 M0 已验收。
+剩余边界是：
 
-1. **#4 streaming/item identity**：translator 仍只在 item completed 时发快照，协议尚无
-   稳定 `itemId` / streaming state；desktop 不能据此消费真实流。
-2. **#5 持久 CLI 与真实 E2E**：当前 `agentdeck session run/continue` 各自新建 daemon；
+1. **#5 持久 CLI 与真实 E2E**：当前 `agentdeck session run/continue` 各自新建 daemon；
    one-shot 会在 `TurnFinished` 后自动发送 `SessionClose`，等待 clean `SessionClosed` 和
    daemon wait，但没有顶层 live `TurnStart` / `TurnCancel` / 手动 `SessionClose` 驱动。
    本轮未运行真实 Codex session/prompt，尚无真实同 PID/threadId 两轮、cancel 后继续和
    持久连接最终回收回执。
-3. **#6 RunRecord/diagnostics**：生命周期事件尚未进入同一个生产 run record，现有部分
+2. **#6 RunRecord/diagnostics**：生命周期事件尚未进入同一个生产 run record，现有部分
    `diagnosticRef` 只是 session-scoped reference，不能回读关联到实际 diagnostic line。
 
 固定版本官方 `ClientNotification.json` 已提交。Issue #3 的确定性测试已覆盖同
 connection 两轮、cancel 后续轮、running close、pending cancel、malformed、EOF、
 unmatched response、handshake failure、unsupported request、terminal status、resume 固定
-参数、进程组消失确认、stderr pump join 和 cleanup failure/Poisoned→daemon exit；这些证据仍不能替代 #5
-真实 vendor，也不覆盖 #4 streaming 或 #6 record/diagnostics。
+参数、进程组消失确认、stderr pump join 和 cleanup failure/Poisoned→daemon exit；Issue #4
+的 fixture 另外覆盖累计快照、稳定关联、completed 去重与 terminal 顺序。这些证据仍不能
+替代 #5 真实 vendor，也不覆盖 #6 record/diagnostics。
 
 Issue #7 已把 real-vendor tests 收紧为仅 `AGENTDECK_E2E=1` 启用，并用可注入 probe 和
 marker tripwire 守住默认离线路径。普通 Cargo passed 仍不构成上述真实 vendor 证据。
@@ -355,22 +361,24 @@ marker tripwire 守住默认离线路径。普通 Cargo passed 仍不构成上�
 
 ### 确定性测试
 
-Issue #3 的 focused 离线入口：
+Issue #3/#4 的 focused 离线入口：
 
 ```bash
 cargo test -p agentdeck-protocol
 cargo test -p agentdeck-cli --bin agentdeck
 cargo test -p agentdeckd --lib codex::
+cargo test -p agentdeckd --test codex_translate
 cargo test -p agentdeckd --lib runtime::hub
 cargo test -p agentdeckd --lib runtime::router
 cargo test -p agentdeckd --test codex_adapter_shape
+cargo test -p agentdeckd --test cc_fixture_replay
 swift test
 ```
 
 这些命令应只使用 fake executable、duplex connection 或 stub adapter；任何命中真实
 `codex` 的路径都属于离线门禁回归。它们验证 Issue #3 的协议、binary/argv、握手、owner、
-RPC 关联、路由和 terminal 顺序，但不能替代后文真实门禁，也不能把 #4/#6 的缺口视为
-已通过。
+RPC 关联、路由、累计 assistant streaming 和 terminal 顺序，但不能替代后文真实门禁，
+也不能把 #5/#6 的缺口视为已通过。
 
 - 断言生产 spawn 参数显式包含 `app-server --listen stdio://`，且版本探测与 spawn 使用
   同一个绝对 binary。

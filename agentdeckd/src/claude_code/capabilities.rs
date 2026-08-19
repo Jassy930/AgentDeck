@@ -6,11 +6,13 @@
 //! ## CC capability surface
 //!
 //! `features` is a typed `BTreeSet<CapabilityId>` (deterministic
-//! serialization). The CC set includes **every** Shared CapabilityId that
-//! Codex has (N5 对称约束) plus the CC-only capabilities the spec § 4.4
-//! enumerated. The vendor block carries the 6 permission modes, a small
-//! curated `output_styles` list, and the hook names CC accepts on
-//! `--include-hook-events` lifecycle output.
+//! serialization). Each vendor advertises only its verified surface: CC
+//! still drops partial assistant and reasoning deltas, so it does not claim
+//! `StreamingMessages` or `StreamingReasoning` merely because Codex now streams
+//! messages. The approval response wire is still speculative, so `Approval`
+//! is also withheld. The vendor block
+//! carries the 6 permission modes, a small curated `output_styles` list,
+//! and the hook names CC accepts on `--include-hook-events` lifecycle output.
 //!
 //! ## Version probe
 //!
@@ -33,12 +35,9 @@ use agentdeck_protocol::{
 /// block (for vendor-specific routing / debugging).
 pub fn build_claude_code_capabilities(cli_version: String) -> SessionCapabilities {
     let features: BTreeSet<CapabilityId> = [
-        // —— Shared (N5 对称约束: every Shared id Codex has) ——
-        CapabilityId::StreamingMessages,
-        CapabilityId::StreamingReasoning,
+        // —— Shared capabilities currently exposed by the CC adapter ——
         CapabilityId::Shell,
         CapabilityId::Diff,
-        CapabilityId::Approval,
         CapabilityId::Mcp,
         CapabilityId::TokenCounters,
         CapabilityId::AuthStatus,
@@ -147,11 +146,8 @@ mod tests {
         let caps = build_claude_code_capabilities("v".into());
         // Shared
         for id in [
-            CapabilityId::StreamingMessages,
-            CapabilityId::StreamingReasoning,
             CapabilityId::Shell,
             CapabilityId::Diff,
-            CapabilityId::Approval,
             CapabilityId::Mcp,
             CapabilityId::TokenCounters,
             CapabilityId::AuthStatus,
@@ -161,6 +157,18 @@ mod tests {
         ] {
             assert!(caps.features.contains(&id), "missing shared {id:?}");
         }
+        assert!(
+            !caps.features.contains(&CapabilityId::StreamingMessages),
+            "CC drops partial message deltas and must not advertise message streaming"
+        );
+        assert!(
+            !caps.features.contains(&CapabilityId::StreamingReasoning),
+            "CC drops partial reasoning deltas and must not advertise reasoning streaming"
+        );
+        assert!(
+            !caps.features.contains(&CapabilityId::Approval),
+            "CC approval response wire is speculative and must not be advertised"
+        );
         // CC-only
         for id in [
             CapabilityId::ClaudeCodePermissionMode,

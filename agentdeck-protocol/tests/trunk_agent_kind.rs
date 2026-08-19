@@ -1,6 +1,6 @@
 use agentdeck_protocol::{
-    AgentItem, AgentItemMeta, AgentKind, ServerEvent, SessionCapabilities, SessionId, ShellStatus,
-    ThreadId,
+    AgentItem, AgentItemMeta, AgentItemState, AgentKind, ServerEvent, SessionCapabilities,
+    SessionId, ShellStatus, ThreadId, TurnId,
 };
 use std::collections::BTreeSet;
 
@@ -9,6 +9,9 @@ fn ek(agent_kind: AgentKind) -> ServerEvent {
         session_id: SessionId("s1".into()),
         thread_id: ThreadId("t1".into()),
         agent_kind,
+        turn_id: TurnId("turn-1".into()),
+        item_id: "message-1".into(),
+        state: AgentItemState::Completed,
         item: AgentItem::AssistantMessage {
             text: "hi".into(),
             meta: AgentItemMeta::default(),
@@ -47,6 +50,9 @@ fn agent_item_shell_fields_camel_case() {
         session_id: SessionId("s1".into()),
         thread_id: ThreadId("t1".into()),
         agent_kind: AgentKind::ClaudeCode,
+        turn_id: TurnId("turn-1".into()),
+        item_id: "shell-1".into(),
+        state: AgentItemState::Completed,
         item: AgentItem::Shell {
             command: "ls".into(),
             status: ShellStatus::Completed,

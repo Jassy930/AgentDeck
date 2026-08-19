@@ -128,7 +128,7 @@ macOS 桌面不得重新依赖 Swift target；共享 Core 测试也不得重新�
 | 文档、AGENTS、计划规则 | `scripts/verify-agent-docs.sh` |
 | 全局依赖或 workspace | `scripts/verify-offline-tests.sh`、`swift test`、desktop selfcheck 和 doc check；真实 vendor E2E 仍需单独授权和记录 |
 
-Issue #3 Codex 生命周期切片的 focused 离线入口为：
+Issue #3/#4 Codex 生命周期与累计 streaming 切片的 focused 离线入口为：
 
 ```bash
 cargo test -p agentdeck-protocol
@@ -140,11 +140,11 @@ cargo test -p agentdeckd --test codex_adapter_shape
 swift test
 ```
 
-它们具体检测 protocol v3/schema 与 Swift mirror 漂移、不同 binary probe/spawn、错误
+它们具体检测 protocol v4/schema 与 Swift mirror 漂移、不同 binary probe/spawn、错误
 `app-server --listen stdio://` argv、`initialized` 乱序、RPC/turn/session 状态机和
 `SessionClosed` 清理顺序。当前确定性覆盖还包括同 connection 两轮、interrupt 后复用、
 running close、malformed/unmatched/EOF、handshake failure、unsupported request、terminal
-status、resume 固定参数、terminal 先于 rejected interrupt response 的 cancel/close 竞态、
+status、累计 assistant snapshot 的稳定 turn/item identity 与 completed 去重、resume 固定参数、terminal 先于 rejected interrupt response 的 cancel/close 竞态、
 accepted turnId 不可复用、session-admission 守住旧 `SessionClosed` 与 replacement start 的
 先后、Initializing/Stopping 命令及时拒绝、direct child wait 后进程组消失确认与 stderr pump join，
 stdin EOF、stdout writer failure，以及 cleanup failure 的 poison→daemon exit。出现失败时应分别回到协议类型、Codex factory/session owner 或

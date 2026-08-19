@@ -1,6 +1,7 @@
 use agentdeck_protocol::{
-    AgentKind, ClientCommand, ProtocolError, ServerEvent, SessionId, SessionOutcome, SessionStart,
-    ThreadId, TurnId, TurnNextState, TurnOutcome, TurnSummary,
+    AgentItem, AgentItemMeta, AgentItemState, AgentKind, ClientCommand, ProtocolError, ServerEvent,
+    SessionId, SessionOutcome, SessionStart, ThreadId, TurnId, TurnNextState, TurnOutcome,
+    TurnSummary,
 };
 use schemars::schema_for;
 use serde_json::Value;
@@ -130,7 +131,32 @@ fn lifecycle_events_round_trip() {
 }
 
 #[test]
-fn v3_schema_marks_lifecycle_correlation_fields_required() {
+fn agent_item_round_trip_preserves_streaming_identity() {
+    let item = event_round_trip(ServerEvent::AgentItem {
+        session_id: SessionId("session-1".into()),
+        thread_id: ThreadId("thread-1".into()),
+        agent_kind: AgentKind::Codex,
+        turn_id: TurnId("turn-1".into()),
+        item_id: "message-1".into(),
+        state: AgentItemState::Streaming,
+        item: AgentItem::AssistantMessage {
+            text: "hello".into(),
+            meta: AgentItemMeta::default(),
+        },
+    });
+    assert!(matches!(
+        item,
+        ServerEvent::AgentItem {
+            turn_id: TurnId(ref turn_id),
+            ref item_id,
+            state: AgentItemState::Streaming,
+            ..
+        } if turn_id == "turn-1" && item_id == "message-1"
+    ));
+}
+
+#[test]
+fn v4_schema_marks_lifecycle_and_item_correlation_fields_required() {
     let session_start = serde_json::to_value(schema_for!(SessionStart)).unwrap();
     let session_start_required = required_fields(&session_start);
     assert!(session_start_required.contains(&"sessionId"));
@@ -179,5 +205,22 @@ fn v3_schema_marks_lifecycle_correlation_fields_required() {
         for field in fields {
             assert!(required.contains(field), "{tag} should require {field}");
         }
+    }
+
+    let agent_item_required = required_fields(variant_with_tag(&events, "type", "agentItem"));
+    for field in [
+        "type",
+        "sessionId",
+        "threadId",
+        "agentKind",
+        "turnId",
+        "itemId",
+        "state",
+        "item",
+    ] {
+        assert!(
+            agent_item_required.contains(&field),
+            "agentItem should require {field}"
+        );
     }
 }

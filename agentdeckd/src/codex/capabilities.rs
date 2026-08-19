@@ -7,16 +7,15 @@
 //!
 //! The feature set is intentionally narrower than what app-server can do.
 //! Capabilities describe AgentDeck's currently accepted product surface, not
-//! every method offered by the pinned vendor binary. Issue #3 establishes the
-//! lifecycle only; Issue #4 will add `StreamingMessages` after the translated
-//! stream has its own deterministic acceptance evidence.
+//! every method offered by the pinned vendor binary. Issue #4's cumulative
+//! assistant snapshot tests are the evidence for the sole shared feature now
+//! advertised here: `StreamingMessages`.
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use agentdeck_protocol::{
-    AgentKind, CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort, CodexSandboxMode,
-    ProtocolError, SessionCapabilities, VendorCapabilities,
+    AgentKind, CapabilityId, CodexApprovalPolicy, CodexCapabilities, CodexReasoningEffort,
+    CodexSandboxMode, ProtocolError, SessionCapabilities, VendorCapabilities,
 };
 
 const CODEX_VERSION_FILE: &str = include_str!("../../../protocol/CODEX_VERSION.txt");
@@ -39,7 +38,7 @@ pub(crate) fn supported_codex_version() -> &'static str {
 /// used to spawn app-server. It is wire-visible to clients so they can route
 /// UI features by both `features` set and optional version-string heuristics.
 pub fn build_codex_capabilities(version: String) -> SessionCapabilities {
-    let features = BTreeSet::new();
+    let features = [CapabilityId::StreamingMessages].into_iter().collect();
 
     SessionCapabilities {
         agent_kind: AgentKind::Codex,
@@ -121,9 +120,12 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_do_not_overclaim_post_lifecycle_features() {
+    fn capabilities_advertise_only_verified_cumulative_message_streaming() {
         let caps = build_codex_capabilities("v".into());
-        assert!(caps.features.is_empty());
+        assert_eq!(
+            caps.features,
+            [CapabilityId::StreamingMessages].into_iter().collect()
+        );
     }
 
     #[test]

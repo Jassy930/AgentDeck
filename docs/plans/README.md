@@ -40,7 +40,8 @@
 - `2026-08-17-gpui-desktop-reset-design.md`
 - `2026-08-17-gpui-desktop-reset-implementation.md`
 
-desktop 接入前的 daemon 目标事实源（已接受设计，尚未完成代码验收）：
+desktop 接入前的 daemon 目标事实源（已接受设计，实施中；Issue #3/#4 切片已落地，
+#5/#6 与完整 M0 验收仍未完成）：
 
 - `2026-08-17-codex-app-server-lifecycle-adr.md`
 - `2026-08-17-agentdeckd-minimum-stable-boundary-design.md`
