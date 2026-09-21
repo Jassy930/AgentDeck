@@ -36,10 +36,10 @@ final class FixtureSessionSourceTests: XCTestCase {
             return false
         }
         let first = await collect(source.events(sessionID: "sess-codex-01"), until: isTurnComplete)
-        XCTAssertEqual(first.count, 9)
+        XCTAssertEqual(first.count, 10)
         // 二次订阅（模拟切屏返回）应立刻拿到完整 transcript。
         let second = await collect(source.events(sessionID: "sess-codex-01"), until: isTurnComplete)
-        XCTAssertEqual(second.count, 9)
+        XCTAssertEqual(second.count, 10)
     }
 
     func testApprovalGatePausesUntilResolved() async {
@@ -75,7 +75,7 @@ final class FixtureSessionSourceTests: XCTestCase {
         await source.sendPrompt(sessionID: "sess-cc-01", text: "继续，补第三个边界")
         let after = await collect(source.events(sessionID: "sess-cc-01"), until: isPromptTurnComplete)
         let texts: [String] = after.compactMap { element in
-            if case .agentItem(_, _, _, let item) = element.event,
+            if case .agentItem(_, _, _, _, _, _, let item) = element.event,
                case .userMessage(let text, _) = item { return text }
             return nil
         }

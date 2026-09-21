@@ -15,6 +15,7 @@
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentdeck_protocol::AgentKind;
 
@@ -177,16 +178,32 @@ pub fn log(event: &str, detail: &str) {
     log_event(DiagnosticEvent::new(event).detail(detail));
 }
 
-pub fn log_event(event: DiagnosticEvent) {
+pub fn log_event(event: DiagnosticEvent) -> bool {
     let line = event.to_json_line();
-    if let Some(path) = diagnostic_log_path() {
+    let result = (|| -> std::io::Result<()> {
+        let path = diagnostic_log_path()
+            .ok_or_else(|| std::io::Error::other("AgentDeck data directory unavailable"))?;
         if let Some(dir) = path.parent() {
-            let _ = create_dir_all(dir);
+            create_dir_all(dir)?;
         }
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "{line}");
-        }
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(format!("{line}\n").as_bytes())
+    })();
+    if let Err(error) = result {
+        eprintln!(
+            "[agentdeckd] diagnostic_write_failed: {}: {line}",
+            redact(&error.to_string())
+        );
+        return false;
     }
+    true
+}
+
+/// Only a successfully written entry can be referenced in diagnostic.log.
+pub fn log_session(run_id: &str, event: DiagnosticEvent) -> Option<String> {
+    static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    log_event(event.run_id(run_id).event_seq(sequence)).then(|| format!("{run_id}:{sequence}"))
 }
 
 /// Minimal RFC3339-ish UTC timestamp without pulling the `chrono` crate
@@ -209,7 +226,7 @@ mod tests {
 
     #[test]
     fn log_path_is_app_support() {
-        let p = diagnostic_log_path().unwrap();
+        let p = log_path_from(None, None, Some(std::ffi::OsStr::new("/Users/example"))).unwrap();
         assert!(
             p.to_string_lossy()
                 .contains("Application Support/AgentDeck")

@@ -18,7 +18,7 @@
 
 - AgentDeck 是 Coding Agent 的统一原生桌面客户端，把 Codex 和 Claude Code 作为绝对一等公民，不是 IDE、不是 Codex Desktop 替代品、不是通用多 agent 聊天界面。
 - 当前 macOS 桌面端是 `agentdeck-desktop/` 下的 Rust/GPUI 最小壳；尚未连接 daemon 或 IPC，也不恢复旧 AppKit 兼容层。
-- `agentdeckd` 的 Codex 本地链路固定为由 daemon 直接持有 session-scoped `codex app-server --listen stdio://` 子进程，不依赖 Codex managed daemon/proxy；该 M0 边界尚待代码验收，不能描述成已完成能力。
+- `agentdeckd` 的 Codex 本地链路固定为由 daemon 直接持有 session-scoped `codex app-server --listen stdio://` 子进程，不依赖 Codex managed daemon/proxy；M0 已完成限定环境验收，证据与剩余边界见 `docs/AGENTDECKD_STATUS.md`，GPUI desktop 尚未接入。
 - 后续会话 UI 必须通过 Rust typed router 按 `SessionCapabilities` 路由，禁止硬编码 vendor 分支（N2）。
 - IPC 主干类型严禁出现 vendor 字样；vendor 字段只能出现在 `capabilities.*` / `vendorControl.*` / `vendorPanel.*` 命名空间（N1）。
 - Codex 细节只能留在 `agentdeckd/src/codex/` 子模块；CC 细节只能留在 `agentdeckd/src/claude_code/` 子模块；两者互不知晓（N3）。

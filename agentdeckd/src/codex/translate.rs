@@ -1,4 +1,4 @@
-//! Codex JSON-RPC → v3 `ServerEvent` translation.
+//! Codex JSON-RPC → v4 `ServerEvent` translation.
 //!
 //! Phase 3 Task 3A. This is the entire vendor-coupling surface for Codex on
 //! the current protocol: a stateful translator owned per-session by Task 3B's
@@ -6,25 +6,11 @@
 //! `codex app-server` stdout pipe at a time and produces 0..N neutral
 //! `ServerEvent`s.
 //!
-//! ## Cumulative semantics (replaces v1 Lifecycle)
+//! ## Cumulative streaming
 //!
-//! v1 surfaced Codex's streaming pattern as three lifecycle phases
-//! (`Started` / `Delta` / `Completed`) on every `AgentItem`. The UI was
-//! responsible for accumulation (e.g. concatenating `agentMessage` deltas).
-//!
-//! v2 inverts that: the translator accumulates deltas internally in
-//! `in_flight`, keyed by Codex's item id, and emits exactly ONE
-//! `ServerEvent::AgentItem` when the corresponding `item/completed`
-//! notification arrives. The UI sees only complete items — no fragmentary
-//! state, no lifecycle bookkeeping (decision A in the SDD progress block
-//! "Lifecycle 替代方案").
-//!
-//! Side effect: streaming `agentMessage` text no longer arrives token-by-token
-//! at the UI. Codex emits a `text` snapshot on `item/agentMessage/started`
-//! that's empty, accumulates via deltas, and ships the final string in the
-//! `item/completed` payload. We use the completed payload's `text` as the
-//! source of truth (Codex itself does the cumulative join), with a fallback
-//! to our delta accumulator if the completed payload is missing.
+//! Assistant deltas produce cumulative snapshots keyed by the official item id.
+//! Completion emits that same id once with the final text. A final payload that
+//! would retract streamed text is a protocol error, never a shorter snapshot.
 //!
 //! ## Approvals
 //!
@@ -53,14 +39,15 @@
 //! (`thread/tokenUsage/updated`, `turn/diff/updated`, etc.) yield no
 //! events — Task 3B can wire those into vendor panel events later.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
 use agentdeck_protocol::{
-    ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentKind,
-    CodexApprovalPolicy, CodexSandboxMode, DiffFile, DiffStatus, PlanStep, PlanStepStatus,
-    ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnSummary,
+    ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentItemState,
+    AgentKind, CodexApprovalPolicy, CodexSandboxMode, DiffFile, DiffStatus, PlanStep,
+    PlanStepStatus, ProtocolError, ServerEvent, SessionId, ShellStatus, ThreadId, TurnId,
+    TurnSummary,
 };
 
 /// One translator output. Carries the neutral `ServerEvent` plus an
@@ -95,18 +82,15 @@ pub struct RpcRouteHint {
 }
 
 /// Per-session Codex translator. Owns the in-flight item accumulators and
-/// a monotonic counter for synthetic request ids.
+/// a monotonic counter for synthetic request and raw item ids.
 #[derive(Debug)]
 pub struct CodexTranslator {
     session_id: SessionId,
     thread_id: Option<ThreadId>,
-    /// In-flight items keyed by Codex item id; updated by delta events,
-    /// flushed to `ServerEvent::AgentItem` when Codex emits `item/completed`.
+    /// In-flight cumulative snapshots keyed by the official item id.
     in_flight: HashMap<String, InFlightItem>,
-    /// Codex sometimes omits an approval id on `item/permissions/...`
-    /// requests; we synthesize one off this counter so the daemon can
-    /// route the matching decision back.
-    next_request_id: u64,
+    completed_items: HashSet<String>,
+    next_synthetic_id: u64,
     /// Snapshot of the session-level approval policy + sandbox the adapter
     /// negotiated at `newSession`. These are stamped into every
     /// `ActionRequest.vendor` so the UI can render the "at decision time"
@@ -128,10 +112,6 @@ struct InFlightItem {
     accumulated_text: String,
     /// Snapshot of the most recent `item` payload, kept so `item/completed`
     /// can use authoritative final fields rather than reconstructed ones.
-    /// Snapshot of the last `item` payload seen for this id; reserved for
-    /// Task 3B (vendor extension extraction at completion time). Allow
-    /// dead_code so the rustc warning doesn't fail CI before 3B lands.
-    #[allow(dead_code)]
     last_payload: Value,
 }
 
@@ -180,7 +160,8 @@ impl CodexTranslator {
             session_id,
             thread_id,
             in_flight: HashMap::new(),
-            next_request_id: 1,
+            completed_items: HashSet::new(),
+            next_synthetic_id: 1,
             approval_policy,
             sandbox,
             persist_supported,
@@ -189,6 +170,11 @@ impl CodexTranslator {
 
     pub fn set_thread_id(&mut self, thread_id: ThreadId) {
         self.thread_id = Some(thread_id);
+    }
+
+    pub fn clear_turn(&mut self) {
+        self.in_flight.clear();
+        self.completed_items.clear();
     }
 
     pub fn thread_id(&self) -> Option<&ThreadId> {
@@ -228,9 +214,9 @@ impl CodexTranslator {
     ///
     /// Returns 0..N `TranslateOutput`s. The shape is:
     /// - Empty for lifecycle-only frames (`thread/started`,
-    ///   `item/*/delta` while accumulating, plain JSON-RPC responses to
+    ///   non-assistant deltas, plain JSON-RPC responses to
     ///   our outbound requests).
-    /// - One `AgentItem` for each `item/completed`.
+    /// - A cumulative `AgentItem` for each assistant delta and completion.
     /// - One `ActionRequest` + populated `RpcRouteHint` for each Codex
     ///   approval request.
     /// - One `TurnComplete` for each `turn/completed`.
@@ -367,11 +353,7 @@ impl CodexTranslator {
             }
             "item/started" => self.handle_item_started(&params),
             "item/completed" => self.handle_item_completed(&params),
-            // Streaming deltas — accumulate, do not emit.
-            "item/agentMessage/delta" => {
-                self.accumulate_text_delta(&params, InFlightKind::AssistantMessage, "delta");
-                Vec::new()
-            }
+            "item/agentMessage/delta" => self.handle_assistant_delta(&params),
             "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
                 self.accumulate_text_delta(&params, InFlightKind::Reasoning, "delta");
                 Vec::new()
@@ -423,6 +405,9 @@ impl CodexTranslator {
         let Some(id) = item.get("id").and_then(Value::as_str).map(str::to_string) else {
             return Vec::new();
         };
+        if self.completed_items.contains(&id) || self.in_flight.contains_key(&id) {
+            return Vec::new();
+        }
         let kind = classify(item);
         let initial_text = match kind {
             InFlightKind::AssistantMessage | InFlightKind::Reasoning => {
@@ -451,7 +436,11 @@ impl CodexTranslator {
         // For shell, emit a Running snapshot immediately so the UI can
         // surface "currently executing" feedback before completion.
         if matches!(kind, InFlightKind::Shell) {
-            return vec![self.shell_event(item, ShellStatus::Running)];
+            return vec![self.agent_item_event(
+                shell_agent_item(item, ShellStatus::Running),
+                params,
+                AgentItemState::Streaming,
+            )];
         }
         Vec::new()
     }
@@ -462,46 +451,100 @@ impl CodexTranslator {
         let Some(item) = params.get("item") else {
             return Vec::new();
         };
-        let id = item
+        let Some(id) = item
             .get("id")
             .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_default();
-        // If we never saw `started`, classify on the fly so completed-only
-        // streams (some panel-style items) still surface.
-        let prior = self.in_flight.remove(&id);
+            .filter(|id| !id.is_empty())
+        else {
+            return vec![self.error_event(
+                "codex-protocol-error",
+                "item/completed omitted item.id".into(),
+            )];
+        };
+        if self.completed_items.contains(id) {
+            return Vec::new();
+        }
+        let prior = self.in_flight.remove(id);
         let kind = prior
             .as_ref()
             .map(|p| p.kind)
             .unwrap_or_else(|| classify(item));
         let accumulated = prior
             .as_ref()
-            .map(|p| p.accumulated_text.clone())
-            .unwrap_or_default();
-        if matches!(kind, InFlightKind::Shell) {
-            return vec![self.shell_event(item, shell_status_from(item))];
+            .map(|p| p.accumulated_text.as_str())
+            .unwrap_or("");
+        let agent_item = completed_item_to_agent_item(item, kind, accumulated);
+        if let AgentItem::AssistantMessage { text, .. } = &agent_item {
+            if !text.starts_with(accumulated) {
+                return vec![self.error_event(
+                    "codex-protocol-error",
+                    "completed assistant text retracted streamed text".into(),
+                )];
+            }
         }
-        let agent_item = completed_item_to_agent_item(item, kind, &accumulated);
-
-        vec![self.agent_item_event(agent_item, params)]
+        self.completed_items.insert(id.to_string());
+        vec![self.agent_item_event(agent_item, params, AgentItemState::Completed)]
     }
 
-    // ── shell event builder (used for both Running + Completed/Failed) ─────
-
-    fn shell_event(&self, item: &Value, status: ShellStatus) -> ServerEvent {
-        ServerEvent::AgentItem {
-            session_id: self.session_id.clone(),
-            thread_id: self.resolve_thread_id(item),
-            agent_kind: AgentKind::Codex,
-            item: shell_agent_item(item, status),
+    fn handle_assistant_delta(&mut self, params: &Value) -> Vec<ServerEvent> {
+        let Some(id) = params
+            .get("itemId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return vec![self.error_event(
+                "codex-protocol-error",
+                "assistant delta omitted itemId".into(),
+            )];
+        };
+        if self.completed_items.contains(id) {
+            return Vec::new();
         }
+        let Some(delta) = params.get("delta").and_then(Value::as_str) else {
+            return vec![self.error_event(
+                "codex-protocol-error",
+                "assistant delta omitted delta text".into(),
+            )];
+        };
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        self.accumulate_text_delta(params, InFlightKind::AssistantMessage, "delta");
+        let slot = &self.in_flight[id];
+        vec![self.agent_item_event(
+            AgentItem::AssistantMessage {
+                text: slot.accumulated_text.clone(),
+                meta: assistant_meta(&slot.last_payload),
+            },
+            params,
+            AgentItemState::Streaming,
+        )]
     }
 
-    fn agent_item_event(&self, item: AgentItem, params: &Value) -> ServerEvent {
+    fn agent_item_event(
+        &self,
+        item: AgentItem,
+        params: &Value,
+        state: AgentItemState,
+    ) -> ServerEvent {
         ServerEvent::AgentItem {
             session_id: self.session_id.clone(),
             thread_id: self.resolve_thread_id(params),
             agent_kind: AgentKind::Codex,
+            turn_id: TurnId(
+                params
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .into(),
+            ),
+            item_id: params
+                .get("itemId")
+                .or_else(|| params.get("item").and_then(|item| item.get("id")))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .into(),
+            state,
             item,
         }
     }
@@ -638,8 +681,8 @@ impl CodexTranslator {
             .or_else(|| id_hint.and_then(|v| v.as_str().map(str::to_string)))
             .or_else(|| id_hint.and_then(|v| v.as_u64().map(|n| n.to_string())))
             .unwrap_or_else(|| {
-                let n = self.next_request_id;
-                self.next_request_id += 1;
+                let n = self.next_synthetic_id;
+                self.next_synthetic_id += 1;
                 format!("codex-req-{n}")
             });
 
@@ -684,17 +727,24 @@ impl CodexTranslator {
         }
     }
 
-    fn raw_event_for_unknown_method(&self, method: &str, frame: &Value) -> ServerEvent {
-        ServerEvent::AgentItem {
-            session_id: self.session_id.clone(),
-            thread_id: self.resolve_thread_id(frame),
-            agent_kind: AgentKind::Codex,
-            item: AgentItem::Raw {
+    fn raw_event_for_unknown_method(&mut self, method: &str, frame: &Value) -> ServerEvent {
+        let params = frame.get("params").unwrap_or(frame);
+        let mut event = self.agent_item_event(
+            AgentItem::Raw {
                 raw_kind: safe_vendor_identifier(method),
                 raw_payload: WITHHELD_VENDOR_RAW_PAYLOAD.into(),
                 meta: AgentItemMeta::default(),
             },
+            params,
+            AgentItemState::Completed,
+        );
+        if let ServerEvent::AgentItem { item_id, .. } = &mut event
+            && item_id.is_empty()
+        {
+            *item_id = format!("codex-raw-{}", self.next_synthetic_id);
+            self.next_synthetic_id += 1;
         }
+        event
     }
 }
 
@@ -1169,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_message_delta_does_not_emit_until_completed() {
+    fn assistant_message_deltas_emit_cumulative_snapshots() {
         let mut t = tr();
         let started = json!({
             "method": "item/started",
@@ -1186,10 +1236,14 @@ mod tests {
             "method": "item/agentMessage/delta",
             "params": {"itemId": "msg1", "delta": "lo!", "threadId": "thread_1"}
         });
-        // Started + deltas emit nothing.
         assert!(t.translate_value(&started).is_empty());
-        assert!(t.translate_value(&d1).is_empty());
-        assert!(t.translate_value(&d2).is_empty());
+        for (frame, expected) in [(&d1, "Hel"), (&d2, "Hello!")] {
+            let events = t.translate_value(frame);
+            assert!(matches!(&events[..], [ServerEvent::AgentItem {
+                item_id, state: AgentItemState::Streaming,
+                item: AgentItem::AssistantMessage { text, .. }, ..
+            }] if item_id == "msg1" && text == expected));
+        }
         // Completion emits exactly one AssistantMessage with cumulative text.
         let completed = json!({
             "method": "item/completed",
@@ -1238,6 +1292,52 @@ mod tests {
             } => assert_eq!(text, "from-delta"),
             other => panic!("expected AssistantMessage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn assistant_completion_is_once_and_cannot_retract_streamed_text() {
+        for final_text in ["Hello", "Hello!", ""] {
+            let mut t = tr();
+            let delta = json!({"method":"item/agentMessage/delta", "params":{"itemId":"m", "delta":"Hello"}});
+            t.translate_value(&delta);
+            let final_frame = json!({"method":"item/completed", "params":{"item":{"id":"m", "type":"agentMessage", "text":final_text}}});
+            assert!(
+                matches!(&t.translate_value(&final_frame)[..], [ServerEvent::AgentItem {
+                state: AgentItemState::Completed, item: AgentItem::AssistantMessage { text, .. }, ..
+            }] if text.starts_with("Hello"))
+            );
+            assert!(t.translate_value(&final_frame).is_empty());
+            assert!(t.translate_value(&delta).is_empty());
+            t.clear_turn();
+            assert_eq!(t.translate_value(&delta).len(), 1);
+        }
+        let mut t = tr();
+        t.translate_value(
+            &json!({"method":"item/agentMessage/delta", "params":{"itemId":"m", "delta":"Hello"}}),
+        );
+        assert!(
+            matches!(&t.translate_value(&json!({"method":"item/completed", "params":{"item":{"id":"m", "type":"agentMessage", "text":"He"}}}))[..],
+            [ServerEvent::Error { error, .. }] if error.code == "codex-protocol-error")
+        );
+    }
+
+    #[test]
+    fn assistant_completed_only_and_started_prefix_are_supported() {
+        let mut t = tr();
+        assert!(
+            matches!(&t.translate_value(&json!({"method":"item/completed", "params":{"item":{"id":"only", "type":"agentMessage", "text":"Final"}}}))[..],
+            [ServerEvent::AgentItem { item_id, state: AgentItemState::Completed, .. }] if item_id == "only")
+        );
+        let start = json!({"method":"item/started", "params":{"item":{"id":"prefix", "type":"agentMessage", "text":"Hi"}}});
+        t.translate_value(&start);
+        let delta =
+            json!({"method":"item/agentMessage/delta", "params":{"itemId":"prefix", "delta":"!"}});
+        t.translate_value(&delta);
+        t.translate_value(&start);
+        assert!(
+            matches!(&t.translate_value(&delta)[..], [ServerEvent::AgentItem { item: AgentItem::AssistantMessage { text, .. }, .. }] if text == "Hi!!")
+        );
+        assert!(t.translate_value(&json!({"method":"item/agentMessage/delta", "params":{"itemId":"prefix", "delta":""}})).is_empty());
     }
 
     #[test]

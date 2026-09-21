@@ -67,9 +67,9 @@ use serde_json::{Value, json};
 
 use super::is_collaboration_tool_name;
 use agentdeck_protocol::{
-    ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentKind,
-    ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, DiffFile, DiffStatus, ServerEvent,
-    SessionId, ShellStatus, ThreadId, TurnSummary, VendorPanelPayload,
+    ActionKind, ActionRequest, ActionRequestVendor, AgentItem, AgentItemMeta, AgentItemState,
+    AgentKind, ClaudeCodePermissionMode, ClaudeCodeVendorPanelEvent, DiffFile, DiffStatus,
+    ServerEvent, SessionId, ShellStatus, ThreadId, TurnId, TurnSummary, VendorPanelPayload,
 };
 
 /// One translator-output batch: 0..N ServerEvents from one input line,
@@ -92,6 +92,8 @@ pub struct TranslateOutput {
 pub struct ClaudeCodeTranslator {
     session_id: SessionId,
     thread_id: Option<ThreadId>,
+    turn_id: TurnId,
+    next_item_id: u64,
     /// `tool_use.id` → snapshot of the originating tool_use; consumed
     /// when the matching `tool_result` arrives on a `user` snapshot.
     in_flight_tools: HashMap<String, ToolUseRecord>,
@@ -112,6 +114,8 @@ impl ClaudeCodeTranslator {
         Self {
             session_id,
             thread_id: None,
+            turn_id: TurnId(String::new()),
+            next_item_id: 0,
             in_flight_tools: HashMap::new(),
             permission_mode,
         }
@@ -119,6 +123,10 @@ impl ClaudeCodeTranslator {
 
     pub fn set_thread_id(&mut self, thread_id: ThreadId) {
         self.thread_id = Some(thread_id);
+    }
+
+    pub fn set_turn_id(&mut self, turn_id: TurnId) {
+        self.turn_id = turn_id;
     }
 
     pub fn thread_id(&self) -> Option<&ThreadId> {
@@ -316,7 +324,7 @@ impl ClaudeCodeTranslator {
         let name = block.get("name").and_then(Value::as_str)?.to_string();
         let input = block.get("input").cloned().unwrap_or(Value::Null);
 
-        let event = match name.as_str() {
+        let mut event = match name.as_str() {
             "Bash" => {
                 let command = input
                     .get("command")
@@ -350,6 +358,9 @@ impl ClaudeCodeTranslator {
                 })
             }
         };
+        if let ServerEvent::AgentItem { state, .. } = &mut event {
+            *state = AgentItemState::Streaming;
+        }
 
         self.in_flight_tools.insert(
             id,
@@ -532,16 +543,32 @@ impl ClaudeCodeTranslator {
 
     // ── helpers ────────────────────────────────────────────────────────────
 
-    fn agent_item_event(&self, item: AgentItem) -> ServerEvent {
+    fn agent_item_event(&mut self, item: AgentItem) -> ServerEvent {
+        self.next_item_id += 1;
+        let tool_id = match &item {
+            AgentItem::Shell { meta, .. }
+            | AgentItem::Diff { meta, .. }
+            | AgentItem::ToolCall { meta, .. } => meta
+                .vendor_extensions
+                .get("toolUseId")
+                .and_then(Value::as_str),
+            _ => None,
+        };
+        let item_id = tool_id
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}:{}", self.session_id.0, self.next_item_id));
         ServerEvent::AgentItem {
             session_id: self.session_id.clone(),
             thread_id: self.resolved_thread_id(),
             agent_kind: AgentKind::ClaudeCode,
+            turn_id: self.turn_id.clone(),
+            item_id,
+            state: AgentItemState::Completed,
             item,
         }
     }
 
-    fn raw_event(&self, kind: &str, raw_payload: &str) -> TranslateOutput {
+    fn raw_event(&mut self, kind: &str, raw_payload: &str) -> TranslateOutput {
         TranslateOutput {
             events: vec![self.agent_item_event(AgentItem::Raw {
                 raw_kind: kind.to_string(),

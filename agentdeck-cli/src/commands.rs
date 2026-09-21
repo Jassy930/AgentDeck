@@ -12,9 +12,9 @@ use crate::output::{CliError, render};
 use crate::transport;
 use agentdeck_protocol::{
     ActionDecision, ActionDecisionKind, AgentKind, ClaudeCodePermissionMode,
-    ClaudeCodeSessionOptions, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode,
-    CodexSessionOptions, HistoryRequest, ProtocolError, ServerEvent, SessionOutcome, TurnOutcome,
-    VendorSessionOptions,
+    ClaudeCodeSessionOptions, ClientCommand, CodexApprovalPolicy, CodexReasoningEffort,
+    CodexSandboxMode, CodexSessionOptions, HistoryRequest, ProtocolError, ServerEvent,
+    SessionOutcome, TurnOutcome, VendorSessionOptions,
 };
 
 // ── Ping ──────────────────────────────────────────────────────────────────────
@@ -96,6 +96,105 @@ pub fn handle_agent_capabilities(
 
 // ── Session run / continue ────────────────────────────────────────────────────
 
+pub async fn handle_session_live(
+    profile: &str,
+    data_dir: Option<&str>,
+    pretty: bool,
+) -> Result<(), CliError> {
+    use std::io::{BufRead, Write};
+
+    let transport = transport::AsyncProcessTransport::spawn(profile, data_dir).await?;
+    let (mut writer, mut output) = transport::split_async(transport);
+    let (input_tx, mut input) = tokio::sync::mpsc::channel(32);
+    // A dedicated stdin thread does not keep the Tokio runtime alive if the
+    // daemon exits while an interactive caller still has stdin open.
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            if input_tx.blocking_send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut failure = None;
+    let mut emit = |raw: String| -> Result<(), CliError> {
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        if value.get("type").is_some() {
+            match serde_json::from_value::<ServerEvent>(value.clone())? {
+                ServerEvent::TurnFinished {
+                    outcome: TurnOutcome::Failed,
+                    error,
+                    ..
+                }
+                | ServerEvent::SessionClosed {
+                    outcome: SessionOutcome::Failed,
+                    error,
+                    ..
+                } => {
+                    failure = Some(protocol_error_or_default(error.as_ref(), "session-failed"));
+                }
+                ServerEvent::Error { error, .. } if error.code != "record_write_failed" => {
+                    failure = Some(protocol_error_or_default(Some(&error), "session-error"));
+                }
+                _ => {}
+            }
+        } else if value.get("reply").is_none() {
+            return Err(CliError::Protocol {
+                code: None,
+                message: "invalid daemon response in live session".into(),
+            });
+        }
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{}", render(&value, pretty))?;
+        stdout.flush()?;
+        Ok(())
+    };
+    let mut output_failed = false;
+    let result = loop {
+        tokio::select! {
+            line = input.recv() => {
+                let Some(line) = line else { break Ok(()); };
+                let command = line.map_err(CliError::from).and_then(|line| {
+                    serde_json::from_str::<ClientCommand>(&line).map_err(CliError::from)
+                });
+                match command {
+                    Ok(command) => {
+                        if let Err(error) = writer.send_line(&serde_json::to_string(&command)?).await {
+                            break Err(error.into());
+                        }
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+            line = output.recv() => {
+                let Some(line) = line else { break Err(CliError::NoResponse); };
+                if let Err(error) = emit(line) {
+                    output_failed = true;
+                    break Err(error);
+                }
+            }
+        }
+    };
+    drop(input);
+    let drain = async {
+        let mut failure = None;
+        while let Some(line) = output.recv().await {
+            if !output_failed && let Err(error) = emit(line) {
+                output_failed = true;
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    };
+    let (shutdown, drained) = tokio::join!(writer.shutdown(), drain);
+    result?;
+    shutdown?;
+    drained?;
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 pub async fn handle_session_run(
     args: SessionRunArgs,
     profile: &str,
@@ -150,7 +249,7 @@ async fn drain_events(
                 };
                 return Err(protocol_error_or_default(error.as_ref(), default_code));
             }
-            ServerEvent::Error { error, .. } => {
+            ServerEvent::Error { error, .. } if error.code != "record_write_failed" => {
                 // C5 fix: surface the daemon's structured `error.code`
                 // (e.g. `cc-not-installed`) so callers / tests can
                 // discriminate failure modes without scraping the

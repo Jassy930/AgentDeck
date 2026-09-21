@@ -48,6 +48,37 @@ final class SessionDetailViewModelTests: XCTestCase {
         XCTAssertTrue(vm.errorText?.contains("peer dependency") == true)
     }
 
+    func testRecordWarningKeepsStreamingAndDoesNotMarkSessionFailed() async {
+        let source = FixtureSessionSource(bundle: Bundle(for: MachineListViewController.self), tickScale: 0)
+        let sessionID = "sess-codex-01"
+        let vm = SessionDetailViewModel(source: source, sessionID: sessionID)
+        let warning = expectation(description: "nonterminal record warning")
+        let done = expectation(description: "stream completes after warning")
+        var sawWarning = false
+        vm.onUpdate = {
+            if !sawWarning, vm.errorText == "运行记录暂时无法写入，会话继续。" {
+                sawWarning = true
+                XCTAssertTrue(vm.isStreaming, "记录告警到达时不能结束健康 turn")
+                let sessions = source.sessions(machineID: "mac-studio")
+                let inbox = source.inbox()
+                Task { @MainActor in
+                    var sessionIterator = sessions.makeAsyncIterator()
+                    var inboxIterator = inbox.makeAsyncIterator()
+                    let snapshot = await sessionIterator.next() ?? []
+                    let items = await inboxIterator.next() ?? []
+                    XCTAssertEqual(snapshot.first { $0.id == sessionID }?.group, .active)
+                    XCTAssertFalse(items.contains { $0.sessionID == sessionID && $0.kind == .failed })
+                    warning.fulfill()
+                }
+            }
+            if !vm.isStreaming { done.fulfill() }
+        }
+        vm.start()
+        await fulfillment(of: [warning, done], timeout: 3)
+        XCTAssertEqual(vm.rows.count, 5)
+        XCTAssertTrue(vm.rows.contains { $0.item.text.hasSuffix("避免雪崩重连。") })
+    }
+
     func testSendPromptAppendsOptimisticUserRow() async {
         let vm = makeVM("sess-cc-01")
         let done = expectation(description: "initial stream done")

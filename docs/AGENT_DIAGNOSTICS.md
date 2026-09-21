@@ -34,6 +34,19 @@ cargo run -p agentdeckd -- --diagnostics-report
 同一个 `runId` 内用 `eventSeq` 排序。
 没有 `runId` 的诊断只作为进程级问题处理。
 
+生产会话使用 `runId=sessionId`；Codex 的同一个 run record 包含多轮事件、
+`SessionClosed` 和一个 footer。CC 仍使用 one-shot `TurnComplete` 收尾；启动失败或
+legacy EOF/cancel 缺少终态时，writer 排空全部事件后补 footer，连接保持期间暂不关闭记录。`diagnosticRef` 为 `runId:eventSeq`，按这两个字段可在 `diagnostic.log`
+定位实际条目；report 默认只返回最近 20 条，较早引用需读取日志文件。
+`codex_child_spawned` / `codex_turn_started` 的 detail JSON 包含 `childPid`，
+`codex_cleanup_completed` 包含 child wait 与进程组清理结果。自由文本 prompt、vendor
+frame 和 stderr 不写入生命周期诊断。
+
+记录 open/append/close 失败会发非 terminal `record_write_failed`，CLI 显示告警并继续
+等待真实 turn/session terminal；连续 append 失败仅首次告警，终态写入仍失败时再告警。
+iOS fixture 消费方同样保留 warning 后的 streaming 和会话状态。诊断写入失败使用
+stderr fallback，省略 `diagnosticRef`，不返回无法定位的引用，也不改变会话结果。
+
 ## 标准自查流程
 
 1. 跑 `cargo run -p agentdeck-desktop -- --selfcheck`，确认桌面基础是否可启动。
@@ -82,6 +95,8 @@ daemon 会持续 drain Codex app-server 子进程 stderr，避免管道回压卡
 | `codex-unsupported-server-request` / `codex-terminal-status-invalid` | app-server 发出 M0 不支持的 server request，或 terminal status 仍是 `inProgress` | 记录可复现方法与固定版本；该 turn/session 会按 protocol failure 收口 |
 | `codex-cleanup-failed` | 无法确认 direct child 已 wait、Unix 进程组已消失或 stderr pump 已停止 | 不再向该 daemon 发新 session；等待 failed `SessionClosed` 后 daemon 退出，检查残留 app-server/helper 进程 |
 | `turn-id-already-used` | client 在同一 session 内复用了已接受的 caller-owned `turnId` | 生成新的 `turnId` 后重试；该拒绝不会写入 vendor 或改变 Ready session |
+
+`initialize` 成功仍可能在 `thread/start` 因用户配置类型不兼容而返回 `codex-protocol-error`；本轮 0.145.0 遇到 `features.context_management` 的 table/bool 冲突，仅用进程级 `-c features.context_management=false` 覆盖完成真实验收，未修改全局配置，详见 [当前验收边界](AGENTDECKD_STATUS.md#当前验收边界)。
 
 Claude Code 历史 archive / rename 子进程遵守同一 K9 边界：daemon 将其
 stdout / stderr 直接丢弃，非零退出只返回结构化 failure code、exit status 和
@@ -165,7 +180,7 @@ CLI harness 验证，不能把桌面壳当成可用审批客户端。
 | `cc-archive-failed` | `claude rm` 执行失败（非 0 退出） | 按结构化 code 与 exit status 复现 `claude rm`；AgentDeck 不保留 vendor stderr 正文 |
 | `cc-rename-failed` | `claude --resume <id> --name <title>` 执行失败 | 确认 session_id 存在且 `claude` 版本支持 `--name` 参数；AgentDeck 不保留 vendor stderr 正文 |
 | `cc-vendor-control-requires-new-turn` | CC 的 permission mode 等 vendor 控件变更需通过新 turn 生效，不支持会话内即时切换 | 下次启动新 session 或新 turn 时携带更新后的 `ClaudeCodeSessionOptions` |
-| `cc-vendor-control-not-supported` | 收到不支持的 ClaudeCodeVendorControl variant | 检查 client 与 daemon 协议版本是否匹配（v3）；升级 client 到最新版 |
+| `cc-vendor-control-not-supported` | 收到不支持的 ClaudeCodeVendorControl variant | 检查 client 与 daemon 协议版本是否匹配（v4）；升级 client 到最新版 |
 
 ## v0.2 双 adapter 探测
 

@@ -32,7 +32,8 @@
 ### agentdeckd 最小稳定边界（2026-08-17，当前设计）
 
 - `plans/2026-08-17-codex-app-server-lifecycle-adr.md`：决定由 `agentdeckd` 直接持有 session-scoped Codex app-server stdio 子进程，不采用 managed daemon/proxy。
-- `plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md`：desktop 接入前必须完成的 Codex-only M0、生命周期、不变量和验收门禁；当前状态是设计基线，尚未落地。
+- `plans/2026-08-17-agentdeckd-minimum-stable-boundary-design.md`：desktop 接入前的 Codex-only M0、生命周期、不变量和验收门禁；代码及验证状态见 `AGENTDECKD_STATUS.md`。
+- `plans/2026-09-21-backend-m0-cli-implementation.md`：累计 streaming、持久 CLI、生产记录/诊断与本地验证证据。
 
 ### iOS 前端计划（2026-07-03）
 

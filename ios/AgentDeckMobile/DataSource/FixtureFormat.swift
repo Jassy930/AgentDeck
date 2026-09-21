@@ -25,12 +25,11 @@ struct FixtureDeck: Decodable {
     let sessions: [FixtureSession]
 }
 
-/// 回放信封：event 是协议原样的 ServerEvent JSON；itemId 供 AgentItemReducer
-/// 做累积语义槽位（同一 itemId 的后续事件替换同一槽位，模拟流式增长）；
+/// 回放信封：event 是协议原样的 ServerEvent JSON；
+/// transcript 使用 event 内的 turnId / itemId 做累计快照槽位；
 /// awaitApproval=true 表示回放在该事件后暂停，直到 resolveApproval。
 struct FixtureStreamStep: Decodable {
     let delayMs: Int
-    let itemId: String?
     let awaitApproval: Bool?
     let event: ServerEvent
 }

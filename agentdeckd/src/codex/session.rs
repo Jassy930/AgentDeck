@@ -12,6 +12,7 @@ use crate::codex::app_server::{
 };
 use crate::codex::capabilities::build_codex_capabilities;
 use crate::codex::translate::CodexTranslator;
+use crate::diag::{self, DiagnosticEvent};
 use agentdeck_protocol::{
     AgentKind, CodexApprovalPolicy, CodexReasoningEffort, CodexSandboxMode, InitialTurn,
     ProtocolError, ServerEvent, SessionId, SessionOutcome, SessionStart, ThreadId, TurnId,
@@ -451,7 +452,7 @@ impl CodexSessionOwner {
                 };
             }
         };
-        let _process_id = connection.process.pid();
+        let child_pid = connection.process.pid();
 
         let mut running = RunningOwner::new(
             self.start,
@@ -460,23 +461,50 @@ impl CodexSessionOwner {
             connection.version.clone(),
             self.interrupt_terminal_timeout,
         );
+        running.child_pid = child_pid;
+        running.diagnostic(
+            "codex_child_spawned",
+            json!({"version": connection.version}),
+        );
         let logical_exit = running.run(&mut connection).await;
         let thread_id = running.thread_id.clone();
+        running.diagnostic("codex_cleanup_started", json!({}));
         let cleanup_result = running.shutdown_connection(&mut connection).await;
 
         match cleanup_result {
-            Ok(()) => AgentSessionExit {
-                thread_id,
-                outcome: logical_exit.outcome,
-                error: logical_exit.error,
-                cleanup_confirmed: true,
-            },
-            Err(error) => AgentSessionExit {
-                thread_id,
-                outcome: SessionOutcome::Failed,
-                error: Some(with_diagnostic_ref(error, &session_id)),
-                cleanup_confirmed: false,
-            },
+            Ok(()) => {
+                running.diagnostic(
+                    "codex_cleanup_completed",
+                    json!({
+                        "childWaited": true,
+                        "processGroupGone": cfg!(unix),
+                        "stderrPumpJoined": true,
+                        "outcome": logical_exit.outcome,
+                    }),
+                );
+                AgentSessionExit {
+                    thread_id,
+                    outcome: logical_exit.outcome,
+                    error: logical_exit.error,
+                    cleanup_confirmed: true,
+                }
+            }
+            Err(error) => {
+                let error = running.correlate_error(error);
+                running.diagnostic(
+                    "codex_cleanup_failed",
+                    json!({
+                        "failureCode": error.code,
+                        "outcome": SessionOutcome::Failed,
+                    }),
+                );
+                AgentSessionExit {
+                    thread_id,
+                    outcome: SessionOutcome::Failed,
+                    error: Some(error),
+                    cleanup_confirmed: false,
+                }
+            }
         }
     }
 }
@@ -534,6 +562,7 @@ struct RunningOwner {
     events: AgentEventSender,
     commands: mpsc::Receiver<SessionCommand>,
     version: String,
+    child_pid: Option<u32>,
     state: OwnerState,
     thread_id: Option<ThreadId>,
     translator: Option<CodexTranslator>,
@@ -562,6 +591,7 @@ impl RunningOwner {
             events,
             commands,
             version,
+            child_pid: None,
             state: OwnerState::Initializing,
             thread_id: None,
             translator: None,
@@ -720,6 +750,7 @@ impl RunningOwner {
                 }
             }
             SessionCommand::Close { reply } => {
+                self.diagnostic("codex_session_close_requested", json!({}));
                 let _ = reply.send(Ok(()));
                 if let Some(turn) = &mut self.turn {
                     turn.close_requested = true;
@@ -782,12 +813,45 @@ impl RunningOwner {
             "thread/started" => None,
             _ => {
                 if let Some(translator) = &mut self.translator {
-                    for output in translator.translate_value_with_routes(&frame) {
+                    let outputs = translator.translate_value_with_routes(&frame);
+                    for output in outputs {
                         match output.event {
                             ServerEvent::SessionStarted { .. }
-                            | ServerEvent::TurnComplete { .. }
-                            | ServerEvent::Error { .. } => {}
-                            event => {
+                            | ServerEvent::TurnComplete { .. } => {}
+                            ServerEvent::Error { error, .. } => {
+                                return Some(self.fatal(error).await);
+                            }
+                            mut event => {
+                                if let ServerEvent::AgentItem {
+                                    turn_id, thread_id, ..
+                                } = &mut event
+                                {
+                                    let Some(active) = &self.turn else {
+                                        return Some(
+                                            self.fatal(self.error(
+                                                "codex-protocol-error",
+                                                "Codex item arrived without an active turn",
+                                            ))
+                                            .await,
+                                        );
+                                    };
+                                    if self.thread_id.as_ref() != Some(thread_id)
+                                        || turn_id.0.is_empty()
+                                        || active
+                                            .vendor_id
+                                            .as_ref()
+                                            .is_some_and(|id| id != &turn_id.0)
+                                    {
+                                        return Some(
+                                            self.fatal(self.error(
+                                                "codex-protocol-error",
+                                                "Codex item used a different turn id",
+                                            ))
+                                            .await,
+                                        );
+                                    }
+                                    *turn_id = active.client_id.clone();
+                                }
                                 let _ = self.events.send(event).await;
                             }
                         }
@@ -848,6 +912,15 @@ impl RunningOwner {
             );
         }
 
+        self.diagnostic(
+            "codex_rpc_response",
+            json!({
+                "method": pending.kind.method(),
+                "requestId": id,
+                "accepted": !frame.get("error").is_some_and(|value| !value.is_null()),
+            }),
+        );
+
         if frame.get("error").is_some_and(|value| !value.is_null()) {
             // A turn may reach its authoritative terminal while the correlated
             // interrupt response is still in flight. If that response then
@@ -863,10 +936,12 @@ impl RunningOwner {
             {
                 return self.finish_vendor_turn(terminal).await;
             }
-            let error = self.error(
-                "codex-protocol-error",
-                format!("Codex rejected {}", pending.kind.method()),
-            );
+            let rejected_request = || {
+                self.error(
+                    "codex-protocol-error",
+                    format!("Codex rejected {}", pending.kind.method()),
+                )
+            };
             return match pending.kind {
                 PendingKind::TurnStart => {
                     let closing = self.turn.as_ref().is_some_and(|turn| turn.close_requested);
@@ -874,7 +949,7 @@ impl RunningOwner {
                         .turn
                         .as_ref()
                         .and_then(|turn| turn.failure_override.clone())
-                        .unwrap_or(error);
+                        .unwrap_or_else(rejected_request);
                     self.finish_turn(
                         TurnOutcome::Failed,
                         if closing {
@@ -891,7 +966,7 @@ impl RunningOwner {
                         error: None,
                     })
                 }
-                _ => Some(self.fatal(error).await),
+                _ => Some(self.fatal(rejected_request()).await),
             };
         }
         let result = frame.get("result").cloned().unwrap_or(Value::Null);
@@ -904,6 +979,7 @@ impl RunningOwner {
                 {
                     return Some(self.fatal(error).await);
                 }
+                self.diagnostic("codex_notification_sent", json!({"method": "initialized"}));
                 let (kind, params) = if let Some(thread_id) = &self.resume_thread_id {
                     (
                         PendingKind::ThreadResume,
@@ -979,6 +1055,7 @@ impl RunningOwner {
                     })
                     .await;
                 self.state = OwnerState::Ready;
+                self.diagnostic("codex_session_ready", json!({}));
                 if let Some(initial_turn) = self.initial_turn.take() {
                     if let Err(error) = self
                         .accept_turn(connection, initial_turn.turn_id, initial_turn.prompt)
@@ -1266,6 +1343,7 @@ impl RunningOwner {
             return Ok(());
         }
         turn.cancel_requested = true;
+        self.diagnostic("codex_turn_cancel_requested", json!({}));
         self.ensure_interrupt(connection).await
     }
 
@@ -1413,10 +1491,19 @@ impl RunningOwner {
             OwnerState::Stopping
         };
         if let Some(translator) = &mut self.translator {
-            // Keep the same translator/session identity; Issue #4 adds an
-            // explicit per-turn buffer reset while implementing streaming.
-            let _ = translator.thread_id();
+            translator.clear_turn();
         }
+        let error = error.map(|error| self.correlate_error(error));
+        self.diagnostic(
+            "codex_turn_finished",
+            json!({
+                "turnId": turn.client_id.0,
+                "vendorTurnId": turn.vendor_id,
+                "outcome": outcome,
+                "nextState": next_state,
+                "failureCode": error.as_ref().map(|error| &error.code),
+            }),
+        );
         let Some(thread_id) = self.thread_id.clone() else {
             return;
         };
@@ -1436,7 +1523,8 @@ impl RunningOwner {
     }
 
     async fn fatal(&mut self, error: ProtocolError) -> LogicalExit {
-        let error = with_diagnostic_ref(error, &self.session_id);
+        let error = self.correlate_error(error);
+        self.diagnostic("codex_session_failed", json!({"failureCode": error.code}));
         if self.turn.is_some() {
             self.finish_turn(
                 TurnOutcome::Failed,
@@ -1474,6 +1562,16 @@ impl RunningOwner {
             &json!({ "id": id, "method": kind.method(), "params": params }),
         )
         .await?;
+        self.diagnostic(
+            "codex_rpc_request",
+            json!({"method": kind.method(), "requestId": id}),
+        );
+        if kind == PendingKind::TurnStart {
+            self.diagnostic(
+                "codex_turn_started",
+                json!({"method": kind.method(), "requestId": id}),
+            );
+        }
         self.pending = Some(PendingRpc {
             id,
             kind,
@@ -1519,11 +1617,38 @@ impl RunningOwner {
     }
 
     fn error(&self, code: &str, message: impl Into<String>) -> ProtocolError {
-        ProtocolError {
+        self.correlate_error(ProtocolError {
             code: code.into(),
             message: message.into(),
-            diagnostic_ref: Some(self.session_id.0.clone()),
+            diagnostic_ref: None,
+        })
+    }
+
+    fn correlate_error(&self, mut error: ProtocolError) -> ProtocolError {
+        if error.diagnostic_ref.is_none() {
+            error.diagnostic_ref =
+                self.diagnostic("codex_session_error", json!({"failureCode": error.code}));
         }
+        error
+    }
+
+    fn diagnostic(&self, event: &str, mut detail: Value) -> Option<String> {
+        detail["childPid"] = json!(self.child_pid);
+        detail["state"] = json!(format!("{:?}", self.state));
+        if let Some(turn) = &self.turn {
+            detail["turnId"] = json!(turn.client_id.0);
+            detail["vendorTurnId"] = json!(turn.vendor_id);
+        }
+        let mut diagnostic = DiagnosticEvent::new(event)
+            .agent_kind(AgentKind::Codex)
+            .detail(detail.to_string());
+        if let Some(code) = detail.get("failureCode").and_then(Value::as_str) {
+            diagnostic = diagnostic.level("error").code(code);
+        }
+        if let Some(thread_id) = &self.thread_id {
+            diagnostic = diagnostic.thread_id(&thread_id.0);
+        }
+        diag::log_session(&self.session_id.0, diagnostic)
     }
 }
 
@@ -1547,7 +1672,14 @@ fn is_command_rejection(error: &ProtocolError) -> bool {
 
 fn with_diagnostic_ref(mut error: ProtocolError, session_id: &SessionId) -> ProtocolError {
     if error.diagnostic_ref.is_none() {
-        error.diagnostic_ref = Some(session_id.0.clone());
+        error.diagnostic_ref = diag::log_session(
+            &session_id.0,
+            DiagnosticEvent::new("codex_session_error")
+                .level("error")
+                .code(&error.code)
+                .agent_kind(AgentKind::Codex)
+                .detail(json!({"failureCode": error.code}).to_string()),
+        );
     }
     error
 }
@@ -1713,6 +1845,30 @@ mod tests {
         bytes.push(b'\n');
         stream.write_all(&bytes).await.unwrap();
         stream.flush().await.unwrap();
+    }
+
+    fn session_diagnostics(run_id: &str) -> Vec<Value> {
+        std::fs::read_to_string(diag::diagnostic_log_path().unwrap())
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|line| line["runId"] == run_id)
+            .collect()
+    }
+
+    fn assert_diagnostic_ref(error: &ProtocolError) {
+        let reference = error
+            .diagnostic_ref
+            .as_deref()
+            .expect("diagnostic reference");
+        let (run_id, sequence) = reference.rsplit_once(':').expect("runId:eventSeq");
+        let sequence: u64 = sequence.parse().unwrap();
+        assert!(
+            session_diagnostics(run_id)
+                .iter()
+                .any(|line| { line["eventSeq"] == sequence && line["code"] == error.code }),
+            "{reference} must locate the failure diagnostic"
+        );
     }
 
     fn test_connection(
@@ -1927,15 +2083,13 @@ mod tests {
         let factory = Arc::new(TestFactory::new(connection));
         let (events_tx, mut events_rx) = mpsc::channel(32);
         let (commands_tx, commands_rx) = mpsc::channel(8);
-        let owner = CodexSessionOwner::new(
-            start(Some(InitialTurn {
-                turn_id: TurnId("turn-1".into()),
-                prompt: "first".into(),
-            })),
-            events_tx,
-            commands_rx,
-            factory.clone(),
-        );
+        let run_id = format!("session-diag-{}", uuid::Uuid::new_v4());
+        let mut request = start(Some(InitialTurn {
+            turn_id: TurnId("turn-1".into()),
+            prompt: "first".into(),
+        }));
+        request.session_id = SessionId(run_id.clone());
+        let owner = CodexSessionOwner::new(request, events_tx, commands_rx, factory.clone());
 
         let server = tokio::spawn(async move {
             let initialize = read_json(&mut server_input).await;
@@ -1965,6 +2119,22 @@ mod tests {
                     json!({"id": rpc_id, "result": {"turn": {"id": vendor_turn}}}),
                 )
                 .await;
+                for delta in ["Hel", "lo"] {
+                    write_json(
+                        &mut server_output,
+                        json!({
+                            "method": "item/agentMessage/delta",
+                            "params": {"threadId": "thread-1", "turnId": vendor_turn,
+                                "itemId": "same-item-id-each-turn", "delta": delta}
+                        }),
+                    )
+                    .await;
+                }
+                write_json(&mut server_output, json!({
+                    "method": "item/completed",
+                    "params": {"threadId": "thread-1", "turnId": vendor_turn,
+                        "item": {"id": "same-item-id-each-turn", "type": "agentMessage", "text": "Hello"}}
+                })).await;
                 write_json(
                     &mut server_output,
                     json!({
@@ -1993,6 +2163,7 @@ mod tests {
         assert!(
             matches!(events_rx.recv().await, Some(ServerEvent::TurnStarted { turn_id, .. }) if turn_id == TurnId("turn-1".into()))
         );
+        assert_streamed_turn(&mut events_rx, &run_id, "turn-1").await;
         assert!(
             matches!(events_rx.recv().await, Some(ServerEvent::TurnFinished { turn_id, outcome: TurnOutcome::Succeeded, next_state: TurnNextState::Ready, .. }) if turn_id == TurnId("turn-1".into()))
         );
@@ -2022,6 +2193,7 @@ mod tests {
         assert!(
             matches!(events_rx.recv().await, Some(ServerEvent::TurnStarted { turn_id, .. }) if turn_id == TurnId("turn-2".into()))
         );
+        assert_streamed_turn(&mut events_rx, &run_id, "turn-2").await;
         assert!(
             matches!(events_rx.recv().await, Some(ServerEvent::TurnFinished { turn_id, outcome: TurnOutcome::Succeeded, next_state: TurnNextState::Ready, .. }) if turn_id == TurnId("turn-2".into()))
         );
@@ -2037,6 +2209,138 @@ mod tests {
         server.await.unwrap();
         assert!(cleaned.load(Ordering::SeqCst));
         assert_eq!(factory.opens.load(Ordering::SeqCst), 1);
+        let diagnostics = session_diagnostics(&run_id);
+        let spawned: Vec<_> = diagnostics
+            .iter()
+            .filter(|line| line["event"] == "codex_child_spawned")
+            .collect();
+        assert_eq!(spawned.len(), 1);
+        let spawn_detail: Value =
+            serde_json::from_str(spawned[0]["detail"].as_str().unwrap()).unwrap();
+        assert_eq!(spawn_detail["childPid"], 4242);
+        assert_eq!(spawn_detail["version"], "codex-cli 0.145.0");
+        let turns: Vec<_> = diagnostics
+            .iter()
+            .filter(|line| line["event"] == "codex_turn_started")
+            .collect();
+        assert_eq!(turns.len(), 2);
+        for (line, turn_id) in turns.iter().zip(["turn-1", "turn-2"]) {
+            let detail: Value = serde_json::from_str(line["detail"].as_str().unwrap()).unwrap();
+            assert_eq!(detail["childPid"], 4242);
+            assert_eq!(detail["turnId"], turn_id);
+        }
+        let cleanup: Vec<_> = diagnostics
+            .iter()
+            .filter(|line| line["event"] == "codex_cleanup_completed")
+            .collect();
+        assert_eq!(cleanup.len(), 1);
+        let detail: Value = serde_json::from_str(cleanup[0]["detail"].as_str().unwrap()).unwrap();
+        assert_eq!(detail["childWaited"], true);
+        assert_eq!(detail["processGroupGone"], cfg!(unix));
+        assert_eq!(detail["stderrPumpJoined"], true);
+    }
+
+    async fn assert_streamed_turn(
+        events: &mut mpsc::Receiver<ServerEvent>,
+        run_id: &str,
+        expected_turn: &str,
+    ) {
+        for (expected_text, expected_state) in [
+            ("Hel", agentdeck_protocol::AgentItemState::Streaming),
+            ("Hello", agentdeck_protocol::AgentItemState::Streaming),
+            ("Hello", agentdeck_protocol::AgentItemState::Completed),
+        ] {
+            match next_event(events).await {
+                ServerEvent::AgentItem {
+                    session_id,
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    state,
+                    item: agentdeck_protocol::AgentItem::AssistantMessage { text, .. },
+                    ..
+                } => {
+                    assert_eq!(session_id.0, run_id);
+                    assert_eq!(thread_id.0, "thread-1");
+                    assert_eq!(turn_id.0, expected_turn);
+                    assert_eq!(item_id, "same-item-id-each-turn");
+                    assert_eq!(text, expected_text);
+                    assert_eq!(state, expected_state);
+                }
+                event => panic!("expected cumulative item, got {event:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_item_correlation_or_translation_fails_the_active_turn() {
+        let invalid_deltas = [
+            json!({"threadId":"thread-1", "turnId":"wrong-turn", "itemId":"m", "delta":"hello"}),
+            json!({"threadId":"wrong-thread", "turnId":"vendor-1", "itemId":"m", "delta":"hello"}),
+            json!({"threadId":"thread-1", "itemId":"m", "delta":"hello"}),
+            json!({"threadId":"thread-1", "turnId":"vendor-1", "delta":"hello"}),
+        ]
+        .map(|params| ("item/agentMessage/delta", params));
+        let invalid_other_items = [
+            (
+                "item/started",
+                json!({"threadId":"thread-1", "item":{"id":"shell", "type":"commandExecution", "command":"pwd"}}),
+            ),
+            (
+                "item/completed",
+                json!({"threadId":"thread-1", "turnId":"", "item":{"id":"reasoning", "type":"reasoning", "summary":[]}}),
+            ),
+            (
+                "item/completed",
+                json!({"threadId":"thread-1", "turnId":"wrong-turn", "item":{"id":"reasoning", "type":"reasoning", "summary":[]}}),
+            ),
+        ];
+        for (method, params) in invalid_deltas.into_iter().chain(invalid_other_items) {
+            let (events_tx, mut events_rx) = mpsc::channel(4);
+            let (_commands_tx, commands_rx) = mpsc::channel(2);
+            let mut owner = RunningOwner::new(
+                start(None),
+                events_tx,
+                commands_rx,
+                "codex-cli 0.145.0".into(),
+                INTERRUPT_TERMINAL_TIMEOUT,
+            );
+            owner.state = OwnerState::Running;
+            owner.thread_id = Some(ThreadId("thread-1".into()));
+            owner.translator = Some(CodexTranslator::with_policy(
+                owner.session_id.clone(),
+                owner.thread_id.clone(),
+                CodexApprovalPolicy::Never,
+                CodexSandboxMode::ReadOnly,
+                false,
+            ));
+            owner.turn = Some(TurnContext {
+                client_id: TurnId("caller-1".into()),
+                vendor_id: Some("vendor-1".into()),
+                started_at: Instant::now(),
+                cancel_requested: false,
+                close_requested: false,
+                interrupt_sent: false,
+                failure_override: None,
+                pending_terminal: None,
+            });
+            let (mut connection, _input, _output, _) = test_connection(None);
+            let exit = owner
+                .handle_frame(
+                    &mut connection,
+                    json!({
+                        "method": method, "params": params,
+                    }),
+                )
+                .await
+                .expect("invalid item must fail the session");
+            assert_eq!(exit.outcome, SessionOutcome::Failed);
+            assert_diagnostic_ref(exit.error.as_ref().unwrap());
+            assert!(matches!(next_event(&mut events_rx).await,
+                ServerEvent::TurnFinished { turn_id, outcome: TurnOutcome::Failed,
+                    next_state: TurnNextState::Closing, .. } if turn_id.0 == "caller-1"));
+            assert!(events_rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]
@@ -3087,7 +3391,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(error.code, "codex-malformed-json");
-                assert_eq!(error.diagnostic_ref.as_deref(), Some("session-1"));
+                assert_diagnostic_ref(&error);
             }
             other => panic!("expected fatal turn terminal, got {other:?}"),
         }
@@ -3199,12 +3503,7 @@ mod tests {
             exit.error.as_ref().map(|error| error.code.as_str()),
             Some("codex-protocol-error")
         );
-        assert_eq!(
-            exit.error
-                .as_ref()
-                .and_then(|error| error.diagnostic_ref.as_deref()),
-            Some("session-1")
-        );
+        assert_diagnostic_ref(exit.error.as_ref().unwrap());
         assert!(events_rx.recv().await.is_none());
         assert!(cleaned.load(Ordering::SeqCst));
         tokio::time::timeout(Duration::from_secs(2), server)
@@ -3254,7 +3553,7 @@ mod tests {
         assert_eq!(exit.outcome, SessionOutcome::Failed);
         let error = exit.error.expect("cleanup error");
         assert_eq!(error.code, "codex-cleanup-failed");
-        assert_eq!(error.diagnostic_ref.as_deref(), Some("session-1"));
+        assert_diagnostic_ref(&error);
         assert!(cleaned.load(Ordering::SeqCst));
         tokio::time::timeout(Duration::from_secs(2), server)
             .await

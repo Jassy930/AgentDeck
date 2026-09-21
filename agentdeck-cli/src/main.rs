@@ -13,7 +13,7 @@ use std::path::PathBuf;
 // ── Top-level CLI ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "agentdeck", about = "AgentDeck unified interface CLI (v3)")]
+#[command(name = "agentdeck", about = "AgentDeck unified interface CLI (v4)")]
 struct Cli {
     /// AgentDeck profile (stable|dev)
     #[arg(long, global = true, default_value = "stable")]
@@ -49,7 +49,7 @@ enum Cmd {
         #[command(subcommand)]
         op: AgentOp,
     },
-    /// Session operations (run, continue)
+    /// Session operations (run, continue, live)
     Session {
         #[command(subcommand)]
         op: SessionOp,
@@ -90,6 +90,8 @@ enum AgentOp {
 
 #[derive(Subcommand)]
 enum SessionOp {
+    /// Keep one daemon connection; read ClientCommand JSONL from stdin until EOF
+    Live,
     /// Start a new agent session
     Run {
         #[arg(long)]
@@ -272,6 +274,9 @@ async fn main() {
 
     let result: Result<(), CliError> = match &cli.command {
         Cmd::Session { op } => match op {
+            SessionOp::Live => {
+                commands::handle_session_live(&profile, data_dir.as_deref(), pretty).await
+            }
             SessionOp::Run {
                 agent,
                 cwd,
@@ -327,7 +332,21 @@ async fn main() {
 
     if let Err(err) = result {
         eprintln!("agentdeck: {}", err.message());
-        println!("{}", render(&output::error_envelope(&err), pretty));
+        if matches!(
+            cli.command,
+            Cmd::Session {
+                op: SessionOp::Live
+            }
+        ) {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stdout().lock(),
+                "{}",
+                render(&output::error_envelope(&err), pretty)
+            );
+        } else {
+            println!("{}", render(&output::error_envelope(&err), pretty));
+        }
         std::process::exit(err.exit_code());
     }
 }

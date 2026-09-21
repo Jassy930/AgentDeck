@@ -23,11 +23,29 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// AgentDeck's own data directory. Never the project tree (premise 5).
+#[cfg(not(test))]
 pub fn app_data_dir() -> Option<PathBuf> {
     app_data_dir_from(
         std::env::var_os("AGENTDECK_DATA_DIR").as_deref(),
         std::env::var_os("AGENTDECK_PROFILE").as_deref(),
         std::env::var_os("HOME").as_deref(),
+    )
+}
+
+#[cfg(test)]
+pub fn app_data_dir() -> Option<PathBuf> {
+    // Tokio test tasks share process-wide environment, so all unit-test I/O
+    // uses one stable temporary root without changing HOME or data-dir env.
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    Some(
+        ROOT.get_or_init(|| {
+            std::env::temp_dir().join(format!(
+                "agentdeckd-unit-tests-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ))
+        })
+        .clone(),
     )
 }
 
@@ -167,6 +185,9 @@ fn is_secret_delimiter(c: char) -> bool {
 /// Append one redacted JSONL line to today's run log. Returns the reason on
 /// failure so the caller can surface a VISIBLE warning (E2) — never silent.
 pub fn try_append(run_id: &str, line: &str) -> Result<(), String> {
+    if std::path::Path::new(run_id).file_name() != Some(OsStr::new(run_id)) {
+        return Err("runId must be a single file name".into());
+    }
     let dir = record_dir().ok_or_else(|| "HOME not set".to_string())?;
     create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let mut path = dir;
@@ -177,7 +198,8 @@ pub fn try_append(run_id: &str, line: &str) -> Result<(), String> {
         .open(&path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     let safe = redact(line);
-    writeln!(f, "{safe}").map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.write_all(format!("{safe}\n").as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -267,12 +289,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn record_id_cannot_escape_the_runs_directory() {
+        for id in ["../outside", "/tmp/outside", "nested/run", ".", ""] {
+            assert!(try_append(id, "{}").is_err());
+        }
+    }
+
+    #[test]
     fn record_dir_is_app_support_not_project_tree() {
         // Premise 5: must be AgentDeck's own dir, never the cwd / repo.
-        let d = record_dir().unwrap();
+        let d = record_dir_from(None, None, Some(OsStr::new("/Users/example"))).unwrap();
         let s = d.to_string_lossy();
         assert!(s.contains("Library/Application Support/AgentDeck"));
         assert!(!s.contains(".agentdeck")); // deprecated repo-native path
+    }
+
+    #[test]
+    fn unit_test_data_directory_is_stable_and_separate_from_user_settings() {
+        let root = app_data_dir().unwrap();
+        assert_eq!(app_data_dir(), Some(root.clone()));
+        assert!(root.starts_with(std::env::temp_dir()));
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("agentdeckd-unit-tests-")
+        );
+        assert_ne!(
+            Some(root.clone()),
+            app_data_dir_from(
+                std::env::var_os("AGENTDECK_DATA_DIR").as_deref(),
+                std::env::var_os("AGENTDECK_PROFILE").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            )
+        );
+        assert_eq!(record_dir(), Some(root.join("runs")));
+        assert_eq!(
+            crate::diag::diagnostic_log_path(),
+            Some(root.join("diagnostic.log"))
+        );
     }
 
     #[test]
@@ -321,6 +377,11 @@ mod tests {
     }
 
     #[test]
+    fn app_data_dir_requires_home_without_an_override() {
+        assert_eq!(app_data_dir_from(None, None, None), None);
+    }
+
+    #[test]
     fn redact_masks_api_keys_and_tokens() {
         let r = redact("running with sk-abc123DEF456ghi789jkl and Bearer xyzToken99");
         assert!(!r.contains("sk-abc123DEF456ghi789jkl"));
@@ -364,31 +425,12 @@ mod tests {
         assert_eq!(r, "line one\nline two\n");
     }
 
-    /// Mutex used by env-mutating tests so they don't race with each
-    /// other (HOME / AGENTDECK_DATA_DIR are process-global).
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn run_record_writes_header_and_appends_events_with_agent_kind() {
         use agentdeck_protocol::{
             AgentItem, AgentItemMeta, AgentKind, ServerEvent, SessionId, ThreadId,
         };
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-
-        let dir = std::env::temp_dir().join(format!(
-            "agentdeck-runrec-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        // Drive RunRecord via the AGENTDECK_DATA_DIR override.
-        let prev = std::env::var_os("AGENTDECK_DATA_DIR");
-        unsafe {
-            std::env::set_var("AGENTDECK_DATA_DIR", &dir);
-        }
-
+        let dir = app_data_dir().unwrap();
         let cwd = std::path::PathBuf::from("/tmp/example");
         let rec = RunRecord::open(
             "run_test_123",
@@ -402,6 +444,9 @@ mod tests {
             session_id: SessionId("sid".into()),
             thread_id: ThreadId("tid".into()),
             agent_kind: AgentKind::Codex,
+            turn_id: agentdeck_protocol::TurnId("turn".into()),
+            item_id: "message".into(),
+            state: agentdeck_protocol::AgentItemState::Completed,
             item: AgentItem::AssistantMessage {
                 text: "hello".into(),
                 meta: AgentItemMeta::default(),
@@ -427,30 +472,16 @@ mod tests {
         let footer: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(footer["kind"], "runFooter");
 
-        // Restore env.
-        if let Some(p) = prev {
-            unsafe {
-                std::env::set_var("AGENTDECK_DATA_DIR", p);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("AGENTDECK_DATA_DIR");
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_file(log).unwrap();
     }
 
     #[test]
     fn try_append_failure_returns_reason_not_panic() {
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        // E2: a bad HOME yields a visible reason, never a panic / silent drop.
-        let saved = std::env::var_os("HOME");
-        unsafe { std::env::remove_var("HOME") }
-        let res = try_append("test-run", "{}");
-        if let Some(h) = saved {
-            unsafe { std::env::set_var("HOME", h) }
-        }
-        assert!(res.is_err());
-        assert!(res.unwrap_err().contains("HOME"));
+        let run_id = "blocked-record";
+        let path = record_dir().unwrap().join(format!("{run_id}.jsonl"));
+        std::fs::create_dir_all(&path).unwrap();
+        let error = try_append(run_id, "{}").expect_err("a directory cannot be a run file");
+        assert!(error.starts_with("open "));
+        std::fs::remove_dir(path).unwrap();
     }
 }

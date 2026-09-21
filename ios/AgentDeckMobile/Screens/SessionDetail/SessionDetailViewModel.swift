@@ -14,7 +14,6 @@ final class SessionDetailViewModel {
     private(set) var isStreaming = true
     var onUpdate: (() -> Void)?
     private var store = AgentItemStore()
-    private var autoItemSeq = 0
     private var task: Task<Void, Never>?
 
     init(source: MobileSessionSource, sessionID: String) {
@@ -65,15 +64,16 @@ final class SessionDetailViewModel {
     private func handle(_ element: SessionStreamElement) {
         var needsUpdate = true
         switch element.event {
-        case .agentItem(_, _, _, let item):
-            let itemId = element.itemId ?? nextAutoItemId()
-            AgentItemReducer.apply(item, itemId: itemId, into: &store)
+        case .agentItem(_, _, _, let turnId, let itemId, let state, let item):
+            AgentItemReducer.apply(item, itemId: "\(turnId):\(itemId)", state: state, into: &store)
         case .actionRequest(_, _, _, let request):
             pendingApproval = request
             approvalState = .pending
         case .error(_, let protocolError):
             errorText = protocolError.message
-            isStreaming = false
+            if protocolError.code != "record_write_failed" {
+                isStreaming = false
+            }
         case .turnFinished(_, _, _, _, let outcome, _, _, let error):
             isStreaming = false
             if outcome == .failed {
@@ -93,11 +93,6 @@ final class SessionDetailViewModel {
         if needsUpdate {
             onUpdate?()
         }
-    }
-
-    private func nextAutoItemId() -> String {
-        autoItemSeq += 1
-        return "auto-\(autoItemSeq)"
     }
 
     deinit { task?.cancel() }

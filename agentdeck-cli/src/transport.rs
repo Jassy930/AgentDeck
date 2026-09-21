@@ -246,7 +246,7 @@ impl AsyncProcessTransport {
         let mut cmd = TokioCommand::new(path);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::inherit());
         cmd.env("AGENTDECK_PROFILE", profile);
         if let Some(d) = data_dir {
             cmd.env("AGENTDECK_DATA_DIR", d);

@@ -2558,6 +2558,13 @@
           },
           "type": "object"
         },
+        "AgentItemState": {
+          "enum": [
+            "streaming",
+            "completed"
+          ],
+          "type": "string"
+        },
         "AgentKind": {
           "enum": [
             "codex",
@@ -3340,10 +3347,19 @@
             "item": {
               "$ref": "#/definitions/AgentItem"
             },
+            "itemId": {
+              "type": "string"
+            },
             "sessionId": {
               "type": "string"
             },
+            "state": {
+              "$ref": "#/definitions/AgentItemState"
+            },
             "threadId": {
+              "type": "string"
+            },
+            "turnId": {
               "type": "string"
             },
             "type": {
@@ -3356,8 +3372,11 @@
           "required": [
             "agentKind",
             "item",
+            "itemId",
             "sessionId",
+            "state",
             "threadId",
+            "turnId",
             "type"
           ],
           "type": "object"
@@ -4122,6 +4141,6 @@
       "type": "object"
     }
   },
-  "title": "AgentDeck Protocol v3",
+  "title": "AgentDeck Protocol v4",
   "type": "object"
 }

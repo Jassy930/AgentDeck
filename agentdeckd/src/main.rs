@@ -1,4 +1,4 @@
-//! agentdeckd — AgentDeck daemon (v3 protocol).
+//! agentdeckd — AgentDeck daemon (v4 protocol).
 //!
 //! Architecture (Eng D2): the IPC protocol IS the agent-neutral boundary.
 //! `agentdeck-protocol` defines the neutral wire types; `codex` is the
@@ -98,7 +98,7 @@ fn print_version() {
 
 fn print_help() {
     println!(
-        "agentdeckd — AgentDeck daemon (v3 protocol).\n\
+        "agentdeckd — AgentDeck daemon (v4 protocol).\n\
          \n\
          Usage: agentdeckd [OPTIONS]\n\
          \n\

@@ -1,7 +1,7 @@
 # agentdeckd 最小稳定边界设计
 
 日期：2026-08-17
-状态：实施中；Issue #3 生命周期切片已落地，M0 尚未完成代码验收
+状态：生命周期、累计 streaming、持久 CLI 与运行记录已实现；验收证据见 docs/AGENTDECKD_STATUS.md
 
 ## 决策摘要
 
@@ -46,29 +46,16 @@ Issue #3 已把 M0 的 session/turn 生命周期骨架落到 protocol v3 和 Cod
   为 `app-server --listen stdio://`。M0 options 固定为 never/read-only/medium、
   `persist=false`、无 MCP，capabilities 不宣称尚未验收的 feature。
 
-这不是 M0 完成声明。#4 仍需实现稳定 `itemId` 与客户端可见累计 streaming；#5 仍需
-持有同一 daemon 连接的 CLI/test driver 和真实 Codex 多轮/cancel/close E2E；#6 仍需把
-RunRecord、lifecycle diagnostics 与可回读的 `diagnosticRef` 接入生产路径。本轮尚无真实
-Codex session/prompt 回执；固定版本的官方 `ClientNotification.json` 已随实现补齐。
+后续 M0 代码现已接通：protocol v4 的 AgentItem 带 caller-owned turnId、官方 itemId
+和 streaming/completed；session live 持有一个 daemon 连接；生产事件按序写入 RunRecord，
+错误 diagnosticRef 可定位实际日志。完整验收还必须分别记录离线与真实 vendor 证据，
+不能把模拟 app-server 的成功当成真实登录环境已经可用。
 
 ## 背景
 
-`agentdeckd` 已有 RuntimeHub、Codex/Claude Code adapter、history、approval、vendor
-control、run record 和 diagnostics 等较宽的代码表面。Issue #3 已闭合 Codex
-session owner、握手、顺序 turn、interrupt 和 close/wait 的代码路径；desktop 最先依赖
-的完整 M0 仍有以下缺口：
-
-- Codex assistant delta 只在 daemon 内累计，客户端只在 item 完成后收到一次快照，
-  不能支撑真实 streaming UI。
-- protocol v3 已有稳定 `turnId` 和 typed `TurnFinished`，但真实 vendor 的
-  completed/failed/interrupted 与 cancel 后恢复尚未由持久 E2E 验收。
-- owner 的 fake/duplex 测试可复用一个 connection；当前 one-shot CLI 会在首轮
-  `TurnFinished` 后自动 close，并等待 `SessionClosed` 与 daemon 回收，但仍无法驱动同一
-  live session 的第二轮或 cancel 后续轮。
-- run record 和 lifecycle diagnostics 基础设施存在，但尚未接到生产 session 事件流。
-
-如果先接 desktop，UI 会被迫补偿这些未稳定语义。M0 的目标不是完成整个 daemon，
-而是先把 desktop 最早依赖的 session/turn 契约做完整。
+桌面最先依赖的是稳定的 session/turn 契约。后端先通过 CLI 验证同一 child/thread 多轮、
+累计消息、取消恢复和关闭回收，再允许 desktop 接入。Claude Code、审批、历史管理和远程
+能力不进入该最小闭环；已有接口不自动成为 desktop 的稳定依赖。
 
 ## 目标
 
@@ -273,7 +260,7 @@ TurnFinished {
 }
 ```
 
-- `error` 在 failed 时必填，并携带有效 `diagnosticRef`。
+- `error` 在 failed 时必填；诊断成功落盘时携带有效 `diagnosticRef`，写失败时省略引用并回退 stderr。
 - token 可以为空；`elapsedMs` 用 daemon 单调时钟计算，不依赖 vendor 是否提供耗时。
 - 每个已接受的 turn 必须且只能收到一个 TurnFinished；之后不得再有该 turn 事件。
 - `nextState=ready` 表示发出前已经清空 turn-local buffer、server-request route 和 cancel
@@ -382,8 +369,8 @@ cleanup failure 不能伪装成可恢复状态：
 - 一旦无法确认 direct child 已回收、进程组已消失、pump 已停止或所有权已释放，立即进入 Poisoned。
 - 先停止 daemon intake，拒绝所有新 SessionStart/TurnStart；绝不回 Ready 或 Idle。
 - 若仍有 in-flight turn，先给它一个 failed TurnFinished。
-- 发 `SessionClosed(outcome=failed, error=codex-cleanup-failed)`，error 必须带
-  diagnosticRef。
+- 发 `SessionClosed(outcome=failed, error=codex-cleanup-failed)`，error 在诊断成功落盘时带
+  diagnosticRef；写失败时省略引用并回退 stderr。
 - 随后 daemon 退出；不能继续服务另一个 session。
 
 完成、取消和 close 的竞态由单一 owner 串行决定：先进入 FinishingTurn/Stopping 的
@@ -491,9 +478,9 @@ M0 必须接通已有基础设施，不新增 record/diagnostic schema：
   initialize/initialized/thread/turn request、interrupt、child exit/wait、turn outcome、
   session outcome 和 cleanup 结果。
 - 复用现有 DiagnosticEvent 字段；PID 等放已有 detail，不扩日志 schema。
-- session/turn failure 的 ProtocolError 必须设置 diagnosticRef。引用可由现有 runId +
+- session/turn failure 的 ProtocolError 在诊断成功落盘时设置 diagnosticRef。引用可由现有 runId +
   eventSeq 组成，能在 diagnostic report 中定位同一条事件；desktop 不解析自由文本。
-- diagnostic 写失败沿用现有 stderr fallback，不把观测系统失败升级成 vendor session
+- diagnostic 写失败时省略 diagnosticRef，沿用现有 stderr fallback，不把观测系统失败升级成 vendor session
   failure。
 
 ## 测试与验收
@@ -537,8 +524,9 @@ swift test
 session owner 和 RuntimeHub/router 的 fake/duplex/stub 证据。Issue #3 当前还覆盖同
 connection 两轮、interrupt 后复用、running close、malformed/unmatched/EOF、handshake
 failure、unsupported request、terminal status、resume 固定参数、stderr pump join，以及
-stdin EOF/cleanup failure 的 poison→daemon exit。下面列表仍是完整 M0 验收要求；#4
-streaming 与 #6 record/diagnostics 不能因生命周期测试通过而视为完成。
+stdin EOF/cleanup failure 的 poison→daemon exit。新增 `session_live` actual CLI 离线用例
+覆盖累计消息、四轮复用、Ping、取消恢复、记录全序及写失败；stdout 失联后的记录收口由
+RuntimeHub focused 测试覆盖。下面列表仍是完整 M0 验收要求。
 
 - production spawn 参数显式包含 `app-server --listen stdio://`；版本探测和 spawn 使用
   同一绝对 binary。版本缺失或不匹配在 SessionStarted 前稳定失败。
@@ -558,7 +546,7 @@ streaming 与 #6 record/diagnostics 不能因生命周期测试通过而视为�
 - 两轮确定性集成测试断言 child PID、sessionId、threadId 相同而 turnId 不同；第二轮前
   没有 spawn。
 - run record 测试断言一个文件包含两轮有序事件和一个 footer；record 写失败有可见
-  Error 与 diagnosticRef，session 仍可继续。
+  Error，诊断成功落盘时有 diagnosticRef，session 仍可继续。
 - lifecycle diagnostic 测试断言成功、cancel、close、Poisoned 都能按 session/turn id
   关联；Poisoned 后没有新 intake。
 - RuntimeHub 在 turn 运行时仍能处理 Ping、TurnCancel 和 SessionClose。
@@ -622,8 +610,8 @@ scripts/verify-agent-docs.sh
   完成下一轮。
 - SessionClose 有 direct child wait 和 Unix 进程组消失证据；cleanup failure 测试证明
   信号、探测或等待失败只会 Poisoned → failed SessionClosed → daemon exit，不会回 Ready/Idle。
-- run record 和 lifecycle diagnostics 已接线，失败 ProtocolError 有可定位的
-  diagnosticRef。
+- run record 和 lifecycle diagnostics 已接线，失败 ProtocolError 在诊断成功落盘时有可定位的
+  diagnosticRef；写失败时省略引用并回退 stderr。
 - capabilities 只声明已验收能力，`agentdeckd` 功能完整度文档把 M0 标为已验收并链接
   实际证据。
 

@@ -473,7 +473,7 @@ pub enum HistoryResponse {
     Ack,
 }
 
-// ── ClientCommand — all v3 client-to-server commands ────────────────────────
+// ── ClientCommand — all v4 client-to-server commands ────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "command", rename_all = "camelCase", deny_unknown_fields)]
@@ -518,6 +518,13 @@ pub enum ClientCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentItemState {
+    Streaming,
+    Completed,
+}
+
 // ServerEvent — main trunk
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
@@ -544,6 +551,11 @@ pub enum ServerEvent {
         thread_id: ThreadId,
         #[serde(rename = "agentKind")]
         agent_kind: AgentKind,
+        #[serde(rename = "turnId")]
+        turn_id: TurnId,
+        #[serde(rename = "itemId")]
+        item_id: String,
+        state: AgentItemState,
         item: AgentItem,
     },
     ActionRequest {

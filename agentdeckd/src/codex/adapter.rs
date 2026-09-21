@@ -60,7 +60,7 @@ impl CodexAdapter {
         }
     }
 
-    fn capabilities_for_v3(&self) -> SessionCapabilities {
+    fn capabilities_for_session(&self) -> SessionCapabilities {
         build_codex_capabilities(supported_codex_version().to_string())
     }
 
@@ -137,7 +137,7 @@ impl Agent for CodexAdapter {
     }
 
     fn capabilities(&self) -> SessionCapabilities {
-        self.capabilities_for_v3()
+        self.capabilities_for_session()
     }
 
     async fn start_session(

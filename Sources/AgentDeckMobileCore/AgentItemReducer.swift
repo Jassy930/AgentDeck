@@ -16,17 +16,14 @@ public struct AgentItemStore {
 }
 
 public enum AgentItemReducer {
-    /// Apply a typed v2 AgentItem to the store. The store key is a stable id
-    /// derived from item content + a monotonic per-store sequence — since
-    /// daemon AgentItems don't carry their own id we synthesize one per
-    /// (kind, position) pair using the caller-provided `itemId`.
-    public static func apply(_ item: AgentItem, itemId: String, into store: inout AgentItemStore) {
+    /// Replace the cumulative snapshot in the slot identified by the wire item id.
+    public static func apply(_ item: AgentItem, itemId: String, state: AgentItemState = .completed, into store: inout AgentItemStore) {
         var ui = store.itemIndexById[itemId].flatMap { idx in
             store.items.indices.contains(idx) ? store.items[idx] : nil
         } ?? UIItem(id: itemId, lifecycle: "completed", kind: kindLabel(for: item))
         ui.id = itemId
         ui.kind = kindLabel(for: item)
-        ui.lifecycle = "completed"
+        ui.lifecycle = state.rawValue
         populate(&ui, from: item)
         if let idx = store.itemIndexById[itemId], store.items.indices.contains(idx) {
             store.items[idx] = ui

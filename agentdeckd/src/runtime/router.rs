@@ -3,6 +3,8 @@
 //! run concurrent turns; agentKind is immutable per session).
 
 use crate::agent::{AgentEventSender, AgentSessionHandle, DynAgent};
+use crate::diag::{self, DiagnosticEvent};
+use crate::record::RunRecord;
 use agentdeck_protocol::{
     ActionDecision, AgentKind, HistoryRequest, HistoryResponse, ProtocolError, SessionCapabilities,
     SessionId, SessionStart, ThreadId, TurnId, VendorControlPayload, effective_history_list_limit,
@@ -21,6 +23,7 @@ const HISTORY_SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct AgentRouter {
     agents: BTreeMap<AgentKind, DynAgent>,
     sessions: Arc<Mutex<HashMap<SessionId, AgentKind>>>,
+    pub(super) records: Mutex<HashMap<SessionId, RunRecord>>,
 }
 
 impl AgentRouter {
@@ -28,6 +31,7 @@ impl AgentRouter {
         Self {
             agents: BTreeMap::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            records: Mutex::new(HashMap::new()),
         }
     }
 
@@ -72,10 +76,25 @@ impl AgentRouter {
             sessions.insert(session_id.clone(), agent_kind);
         }
 
-        match agent.start_session(start, events).await {
+        match RunRecord::open(
+            session_id.0.clone(),
+            agent_kind,
+            agent.capabilities().agent_version,
+            &start.cwd,
+        ) {
+            Ok(record) => {
+                self.records.lock().await.insert(session_id.clone(), record);
+            }
+            Err(reason) => {
+                let _ = events.send(record_warning(&session_id, reason)).await;
+            }
+        }
+        match agent.start_session(start, events.clone()).await {
             Ok(handle) => Ok(handle),
             Err(error) => {
                 self.unregister_session(&session_id).await;
+                // The writer must consume queued startup events and the hub's
+                // failure event before it closes this record during drain.
                 Err(error)
             }
         }
@@ -365,6 +384,26 @@ impl AgentRouter {
                 message: format!("session {:?} unknown to router", sid),
                 diagnostic_ref: None,
             })
+    }
+}
+
+pub(super) fn record_warning(
+    session_id: &SessionId,
+    reason: String,
+) -> agentdeck_protocol::ServerEvent {
+    let diagnostic_ref = diag::log_session(
+        &session_id.0,
+        DiagnosticEvent::new("record_write_failed")
+            .level("warning")
+            .detail(reason),
+    );
+    agentdeck_protocol::ServerEvent::Error {
+        session_id: Some(session_id.clone()),
+        error: ProtocolError {
+            code: "record_write_failed".into(),
+            message: "run record could not be written; the session can continue".into(),
+            diagnostic_ref,
+        },
     }
 }
 
